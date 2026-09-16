@@ -1,0 +1,17 @@
+# Stack: Rust + Aya proposed (decided at P0 gate); ignores assume that stack.
+/target/
+/dist/
+*.o
+*.bpf.o
+vmlinux.h
+# P0 spike throwaways (deleted or promoted at P0 exit).
+spike/work/
+crates/ebpf/target/
+__pycache__/
+# Agent state: these must be ignored by a rule that travels with the repo,
+# not by .git/info/exclude, which a fresh clone never inherits.
+/.claude/
+/.superpowers/
+# Root build outputs.
+/osslscope
+/.worktrees/
