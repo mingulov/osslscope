@@ -800,7 +800,22 @@ pub fn run(cfg: &Config) -> anyhow::Result<serde_json::Value> {
         return Ok(doc);
     }
 
-    let live = maps::read_maps(cfg.pid).unwrap_or_default();
+    // Post-drain maps for attribution. A target that exits after the
+    // trigger (fallback cell: driver gone by drain end) leaves an
+    // empty re-read — attributing against that drops every row as
+    // foreign. Mappings are stable within a run (providers stay
+    // loaded), so an empty re-read falls back to the pre-drain
+    // snapshot. Live targets are unaffected (non-empty re-read wins,
+    // covering mid-run provider loads the snapshot misses).
+    let live = {
+        let reread = maps::read_maps(cfg.pid).unwrap_or_default();
+        if reread.is_empty() {
+            eprintln!("INSPECT maps: target gone, attributing against pre-drain snapshot");
+            early_maps.clone()
+        } else {
+            reread
+        }
+    };
     // Legacy partition FIRST: legacy-array rows are attributed (to
     // legacy_provider.algs), not foreign, so they leave before the
     // builtin filter counts drops.
