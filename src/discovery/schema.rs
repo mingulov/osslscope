@@ -38,8 +38,12 @@ pub struct Stats {
     /// Non-default resolution label (`symtab`, `anchor+delta`, `force`).
     pub resolution: Option<String>,
     /// Explicit PARTIAL reason (frozen vocabulary: `anchor-unresolved`,
-    /// `no-query-trigger`, `zero-rows`, `zero-row-ops`, `truncated-walk`).
+    /// `no-query-trigger`, `zero-rows`, `zero-row-ops`, `truncated-walk`,
+    /// `pid-recycled`).
     pub reason: Option<String>,
+    /// Pid-recycle detections this run (exit-6 pin): rows are always
+    /// discarded on recycle, so this only ever reads 1.
+    pub pid_recycled: u64,
     /// Builtin rows dropped (other providers' arrays — they share
     /// the core wrapper; attributed by array mapping, by
     /// implementation for runtime-built anonymous arrays).
@@ -209,6 +213,9 @@ pub fn emit(
         }
         if stats.foreign_dropped > 0 {
             doc["foreign_rows_dropped"] = stats.foreign_dropped.into();
+        }
+        if stats.pid_recycled > 0 {
+            doc["pid_recycled"] = stats.pid_recycled.into();
         }
         if fenced > 0 {
             doc["fenced_rows"] = fenced.into();
@@ -627,6 +634,7 @@ mod tests {
             resolution: Some("anchor+delta".into()),
             reason: None,
             foreign_dropped: 2,
+            pid_recycled: 1,
         };
         let rows: Vec<Row> = sample_rows()
             .into_iter()
@@ -645,6 +653,7 @@ mod tests {
         assert_eq!(doc["zero_row_ops"], serde_json::json!([3]));
         assert_eq!(doc["truncated_ops"], serde_json::json!({"12": 1}));
         assert_eq!(doc["foreign_rows_dropped"], 2);
+        assert_eq!(doc["pid_recycled"], 1);
         // Sample rows cover op 1 only → 13 of 14 registry ops rowless.
         assert_eq!(doc["uninstrumented_ops"], crate::kinds::OPS.len() - 1);
     }

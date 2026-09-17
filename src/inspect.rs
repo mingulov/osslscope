@@ -75,20 +75,34 @@ pub fn run(args: &[String]) -> ExitCode {
         table,
         force_offset,
     };
+    let emit = |doc: &serde_json::Value| {
+        let text = serde_json::to_string_pretty(doc).unwrap();
+        if let Some(path) = &out {
+            std::fs::write(path, &text).map_err(|e| format!("write {}: {e}", path.display()))
+        } else {
+            println!("{text}");
+            Ok(())
+        }
+    };
     match harvest::run(&cfg) {
         Ok(doc) => {
-            let text = serde_json::to_string_pretty(&doc).unwrap();
-            if let Some(path) = out {
-                if let Err(e) = std::fs::write(&path, &text) {
-                    eprintln!("osslscope inspect: write {}: {e}", path.display());
-                    return ExitCode::FAILURE;
-                }
-            } else {
-                println!("{text}");
+            if let Err(e) = emit(&doc) {
+                eprintln!("osslscope inspect: {e}");
+                return ExitCode::FAILURE;
             }
             ExitCode::SUCCESS
         }
         Err(e) => {
+            // Pin recycle: the PARTIAL(pid-recycled) discard doc still
+            // travels (never rows), flagged by exit 4.
+            if let Some(r) = e.downcast_ref::<harvest::Recycled>() {
+                if let Err(e) = emit(&r.doc) {
+                    eprintln!("osslscope inspect: {e}");
+                    return ExitCode::FAILURE;
+                }
+                eprintln!("osslscope inspect: {r}");
+                return ExitCode::from(4);
+            }
             eprintln!("osslscope inspect: {e:#}");
             ExitCode::FAILURE
         }

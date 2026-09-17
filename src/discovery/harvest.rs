@@ -200,6 +200,7 @@ fn legacy_candidates(pid: u32, libcrypto: &str) -> Vec<PathBuf> {
 /// Never a bare "none": the reason + uninstrumented depth travel in-band.
 /// With `--legacy`, the blind legacy section travels too (computed by
 /// the caller — no tripwire attach was possible).
+#[allow(clippy::too_many_arguments, reason = "one coherent doc identity")]
 fn partial_doc(
     provider_name: &str,
     provider: &Path,
@@ -208,6 +209,7 @@ fn partial_doc(
     reason: &str,
     builtin: bool,
     legacy_section: Option<serde_json::Value>,
+    pid_recycled: u64,
 ) -> anyhow::Result<serde_json::Value> {
     let mut doc = schema::emit(
         provider_name,
@@ -220,6 +222,7 @@ fn partial_doc(
         &schema::Stats {
             builtin,
             reason: Some(reason.to_string()),
+            pid_recycled,
             ..schema::Stats::trivial()
         },
     )?;
@@ -227,6 +230,55 @@ fn partial_doc(
         doc["legacy"] = l;
     }
     Ok(doc)
+}
+
+/// Pid recycle mid-run: carries the pre-built PARTIAL(pid-recycled)
+/// discard doc (`inspect` prints it and exits 4 — evidence paths
+/// never emit rows for the wrong task).
+#[derive(Debug)]
+pub struct Recycled {
+    pub doc: serde_json::Value,
+}
+
+impl std::fmt::Display for Recycled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "target recycled mid-run (evidence discarded; see PARTIAL doc)"
+        )
+    }
+}
+
+impl std::error::Error for Recycled {}
+
+/// Re-verify the target pin; on recycle build the discard doc (zero
+/// rows; blind legacy at most — trip data is pid-scoped, hence
+/// tainted too) and return it as `Recycled`.
+#[allow(clippy::too_many_arguments, reason = "one coherent doc identity")]
+fn check_pin(
+    pin: &crate::pin::TargetPin,
+    provider_name: &str,
+    provider: &Path,
+    canon: &str,
+    elf_bytes: &[u8],
+    builtin: bool,
+    legacy: bool,
+) -> anyhow::Result<()> {
+    if pin.verify().is_err() {
+        let blind = legacy.then(blind_legacy_section);
+        let doc = partial_doc(
+            provider_name,
+            provider,
+            canon,
+            elf_bytes,
+            "pid-recycled",
+            builtin,
+            blind,
+            1,
+        )?;
+        return Err(anyhow::Error::new(Recycled { doc }));
+    }
+    Ok(())
 }
 
 /// Blind legacy section: no tripwire attach was possible (no
@@ -289,6 +341,9 @@ fn read_lgcalls(bpf: &mut Ebpf) -> u64 {
 /// Run the harvest; returns the emitted document on success.
 pub fn run(cfg: &Config) -> anyhow::Result<serde_json::Value> {
     let pid = NonZeroU32::new(cfg.pid).ok_or_else(|| anyhow!("pid must be non-zero"))?;
+    // Pin FIRST: every later /proc/<pid> read and every pid-scoped
+    // attach is verified against this identity (exit-6).
+    let pin = crate::pin::pin(cfg.pid)?;
     if let Some(marker) = &cfg.cmdline_marker {
         let cmdline = std::fs::read(format!("/proc/{}/cmdline", cfg.pid))?;
         let m = marker.as_bytes();
@@ -301,18 +356,33 @@ pub fn run(cfg: &Config) -> anyhow::Result<serde_json::Value> {
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
     let obj_bytes = std::fs::read(&cfg.object)?;
+    let provider_name: String = if cfg.builtin {
+        "default".to_string()
+    } else {
+        cfg.provider
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "unknown".to_string())
+    };
+    check_pin(
+        &pin,
+        &provider_name,
+        &cfg.provider,
+        &canon,
+        &elf_bytes,
+        cfg.builtin,
+        cfg.legacy,
+    )?;
 
     let mut bpf = EbpfLoader::new().load(&obj_bytes)?;
     load_programs(&mut bpf)?;
     // Owns every uprobe link (parallel detach on drop, all paths).
     let mut links = Links::default();
-    let provider_name: String;
     let mut resolution: Option<String> = None;
     // Dispatch-blind runs preset their PARTIAL reason but still drain
     // for legacy tripwires (dispatch and legacy observe independently).
     let mut preset_reason: Option<String> = None;
     if cfg.builtin {
-        provider_name = "default".to_string();
         let table = match &cfg.table {
             Some(path) => {
                 let text = std::fs::read_to_string(path)?;
@@ -343,11 +413,6 @@ pub fn run(cfg: &Config) -> anyhow::Result<serde_json::Value> {
             }
         }
     } else {
-        provider_name = cfg
-            .provider
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "unknown".to_string());
         // Init ladder: load-mandated dynsym first, debug symtab second.
         let init_off = elf::dynsym_file_offset(&elf_bytes, INIT_ANCHOR)
             .map(|off| (off, None))
@@ -460,8 +525,20 @@ pub fn run(cfg: &Config) -> anyhow::Result<serde_json::Value> {
             &reason,
             cfg.builtin,
             blind,
+            0,
         );
     }
+    // Post-attach verify: every maps read and attach above resolved
+    // through /proc/<pid> — confirm the identity before draining.
+    check_pin(
+        &pin,
+        &provider_name,
+        &cfg.provider,
+        &canon,
+        &elf_bytes,
+        cfg.builtin,
+        cfg.legacy,
+    )?;
 
     let map = bpf
         .take_map("EVENTS")
@@ -527,6 +604,17 @@ pub fn run(cfg: &Config) -> anyhow::Result<serde_json::Value> {
                     if cookie == 0 {
                         primary_init_observed = true;
                     }
+                    // Tainted events (post-recycle firings from the new
+                    // occupant) must not drive stage-2 attaches.
+                    check_pin(
+                        &pin,
+                        &provider_name,
+                        &cfg.provider,
+                        &canon,
+                        &elf_bytes,
+                        cfg.builtin,
+                        cfg.legacy,
+                    )?;
                     let addr = u64at(16);
                     let live = maps::read_maps(cfg.pid).with_context(|| {
                         format!("read maps of {} (target may have exited)", cfg.pid)
@@ -639,6 +727,17 @@ pub fn run(cfg: &Config) -> anyhow::Result<serde_json::Value> {
             std::thread::sleep(Duration::from_millis(5));
         }
     }
+    // Post-drain backstop: discards ALL observations (rows and trips
+    // alike) when the pid recycled under the drain.
+    check_pin(
+        &pin,
+        &provider_name,
+        &cfg.provider,
+        &canon,
+        &elf_bytes,
+        cfg.builtin,
+        cfg.legacy,
+    )?;
     // Tripwire observations (read before the no-trigger decision:
     // loads distinguish "wrong attach" from "quiet target").
     let trip = read_trip(&mut bpf);
@@ -710,6 +809,7 @@ pub fn run(cfg: &Config) -> anyhow::Result<serde_json::Value> {
                 &reason,
                 cfg.builtin,
                 legacy_live,
+                0,
             );
         }
         if !cfg.builtin {
@@ -893,6 +993,7 @@ pub fn run(cfg: &Config) -> anyhow::Result<serde_json::Value> {
             resolution,
             reason,
             foreign_dropped,
+            pid_recycled: 0,
         },
     )?;
     if cfg.legacy {
