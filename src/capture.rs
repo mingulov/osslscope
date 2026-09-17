@@ -240,6 +240,16 @@ fn child_status(pid: u32) -> Option<i32> {
     }
 }
 
+/// Corpse-close rule: a spawn target whose maps read empty AND whose
+/// exit code is now available is DONE (clean close). Without this the
+/// pre-poll liveness check can straddle the child's exit: the corpse
+/// reads empty maps + dead exe link, which fences [MappingsChanged,
+/// Exec] and PARTIALs a clean EOF-close (exit-6 lane-a). Live targets
+/// (code unavailable) and --pid targets never close here.
+fn corpse_close(spawn: bool, maps_empty: bool, status: Option<i32>) -> Option<i32> {
+    if spawn && maps_empty { status } else { None }
+}
+
 // ---------------------------------------------------------------- ppid scan
 
 /// Parse (pid, ppid) from a `/proc/<pid>/stat` line; comm may hold
@@ -1194,6 +1204,13 @@ pub fn run(cfg: &Config, target: Target) -> anyhow::Result<Capture> {
         let t0 = Instant::now();
         let live = maps::read_maps(pid).unwrap_or_default();
         let next = snapshot(pid, &engine.planned_paths(), &live);
+        // Post-read liveness: close corpses, never fence them.
+        if spawn {
+            if let Some(code) = corpse_close(true, live.is_empty(), child_status(pid)) {
+                engine.child_exit = Some(code);
+                break;
+            }
+        }
         if t0.elapsed() > POLL_BUDGET {
             engine.counters.scan_budget_exhaustions += 1;
         } else {
@@ -1399,6 +1416,20 @@ mod tests {
         // Version-suffixed stem trips; near-misses must not.
         assert!(fips_touched(&[row("fips.so")]));
         assert!(!fips_touched(&[row("FIPS"), row("fipsy"), row("myfips")]));
+    }
+
+    #[test]
+    fn corpse_close_truth_table() {
+        // Dead + empty maps => close with the code (never fence).
+        assert_eq!(corpse_close(true, true, Some(0)), Some(0));
+        assert_eq!(corpse_close(true, true, Some(137)), Some(137));
+        // Live (no code yet) => no close even with empty maps.
+        assert_eq!(corpse_close(true, true, None), None);
+        // Mapped (racing read success) => no close even when reaped.
+        assert_eq!(corpse_close(true, false, Some(0)), None);
+        // --pid path never corpse-closes (pin verdict owns it).
+        assert_eq!(corpse_close(false, true, Some(0)), None);
+        assert_eq!(corpse_close(false, false, None), None);
     }
 
     #[test]
