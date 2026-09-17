@@ -795,15 +795,6 @@ impl<'a> Engine<'a> {
         if kinds.contains(&FenceKind::ProviderChanged) {
             self.counters.provider_changed += 1;
         }
-        // Dead target: the window is about to close via child-exit
-        // (spawn) or recycle (`--pid`) — re-harvesting a corpse
-        // observes nothing and re-planning against a zombie's empty
-        // maps cries false "unmapped" missed. Skip both LOUDLY (the
-        // new paths stay unobserved — never silent).
-        if self.target_gone() {
-            self.reason("reharvest-skipped");
-            return Ok(());
-        }
         // Targeted re-harvest: new X files only (cached hits skip).
         let mut fresh: Vec<(String, String, u64)> = next
             .mapset
@@ -813,6 +804,15 @@ impl<'a> Engine<'a> {
             .collect();
         fresh.sort();
         fresh.dedup();
+        // Dead target with actual re-harvest work pending (TOCTOU
+        // past the loop's pre-poll check): a corpse observes nothing
+        // — skip LOUDLY (the new paths stay unobserved — never
+        // silent). Empty-fresh fences (pure unmaps) proceed: their
+        // re-plan filters to a no-op.
+        if !fresh.is_empty() && self.target_gone() {
+            self.reason("reharvest-skipped");
+            return Ok(());
+        }
         let live_now = maps::read_maps(self.pid).unwrap_or_default();
         for (path, dev, ino) in fresh {
             if !self.harvested.insert((dev.clone(), ino)) {
@@ -1154,6 +1154,21 @@ pub fn run(cfg: &Config, target: Target) -> anyhow::Result<Capture> {
         let wait = POLL_INTERVAL.min(engine.window_end.saturating_duration_since(now));
         if !wait.is_zero() {
             std::thread::sleep(wait);
+        }
+        // Pre-poll liveness: a child that died during the sleep must
+        // close the window, not fence on its own corpse (zombie maps
+        // read empty — fencing would record a bogus exit fence and
+        // re-plan against nothing).
+        if spawn {
+            if let Some(code) = child_status(pid) {
+                engine.child_exit = Some(code);
+                break;
+            }
+        } else if let Some(p) = &engine.pin {
+            if p.verify().is_err() {
+                let actual = engine.window_start.elapsed();
+                return Ok(engine.discarded(actual));
+            }
         }
         // Budgeted fence poll (overruns skip the round, §5).
         let t0 = Instant::now();
