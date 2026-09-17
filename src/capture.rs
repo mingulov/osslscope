@@ -662,6 +662,12 @@ impl<'a> Engine<'a> {
         if !p.missed.is_empty() {
             self.counters.missed_attaches += p.missed.len() as u64;
             self.reason("missed-attaches");
+            for m in &p.missed {
+                eprintln!(
+                    "CAPTURE missed gen={} dev={} ino={} off={:#x} reason={}",
+                    self.generation, m.dev, m.ino, m.offset, m.reason
+                );
+            }
         }
         let prog_fd = self
             .loaded
@@ -813,6 +819,14 @@ impl<'a> Engine<'a> {
                 Ok((doc, totals)) => {
                     // Every re-harvest query predates its rows'
                     // count-attach: cold by construction (§6).
+                    eprintln!(
+                        "CAPTURE re-harvest {path} rows={} queries={}",
+                        doc.get("rows")
+                            .and_then(|r| r.as_array())
+                            .map(|r| r.len())
+                            .unwrap_or(0),
+                        totals.queries_observed
+                    );
                     self.counters.cold_gap_calls += totals.queries_observed;
                     if totals.queries_observed > 0 {
                         self.reason("cold-gap");
