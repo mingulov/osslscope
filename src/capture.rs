@@ -377,10 +377,11 @@ fn debug_drain() -> bool {
     std::env::var("OSSL_DEBUG_DRAIN").is_ok()
 }
 
-/// Drain COUNTS + DROPFAIL, routing keys by (cookie, generation): current
-/// known keys fold per cookie; superseded-generation keys feed
-/// `table_staleness_events` (the GEN-vs-current race, counted never
-/// hidden); unknown cookies are `unattributed` (PARTIAL by
+/// Drain COUNTS + DROPFAIL, routing keys by (cookie, generation):
+/// known cookies fold per cookie whatever their generation (a
+/// superseded generation only memos `table_staleness_events` — the
+/// GEN-vs-current race, counted never hidden — without diverting
+/// the count); unknown cookies are `unattributed` (PARTIAL by
 /// construction — unreachable on multi, defensive). Hard error on
 /// unreadable maps (a failed drain must never silently fence).
 /// Drains are DELTA-reads: `seen`/`last_drop` carry the previous
@@ -455,7 +456,25 @@ fn drain_counts(
         if delta == 0 {
             continue;
         }
+        if !known.contains(&cookie) {
+            // Unknown cookie (any generation): truly unattributable
+            // (PARTIAL by construction — unreachable on multi).
+            out.unattributed += delta;
+            if debug_drain() {
+                eprintln!(
+                    "DRAINDBG unattributed cookie={cookie} generation={generation} delta={delta} total={}",
+                    total.count
+                );
+            }
+            continue;
+        }
         if generation != current_gen {
+            // Straggler: a known cookie's old-gen events landing after
+            // their fence drain (the §3 GEN-vs-current race). The
+            // count stays ATTRIBUTED (conservation-exact — the cookie
+            // identity can't express builds anyway) while
+            // table_staleness_events memos the fence crossing (a
+            // memo, NOT a conservation addend — never double-added).
             out.stale_events += delta;
             out.stale_keys += 1;
             if debug_drain() {
@@ -464,22 +483,13 @@ fn drain_counts(
                     total.count
                 );
             }
-        } else if !known.contains(&cookie) {
-            out.unattributed += delta;
-            if debug_drain() {
-                eprintln!(
-                    "DRAINDBG unattributed cookie={cookie} delta={delta} total={}",
-                    total.count
-                );
-            }
-        } else {
-            let piece = CountValue {
-                count: delta,
-                first_ns: total.first_ns,
-                last_ns: total.last_ns,
-            };
-            out.folded.entry(cookie).or_default().fold(&piece);
         }
+        let piece = CountValue {
+            count: delta,
+            first_ns: total.first_ns,
+            last_ns: total.last_ns,
+        };
+        out.folded.entry(cookie).or_default().fold(&piece);
     }
     let drops = dup("DROPFAIL")?;
     let drops = aya::maps::PerCpuArray::<_, u64>::try_from(drops)
