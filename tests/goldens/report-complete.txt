@@ -1,0 +1,29 @@
+osslscope report: pid=7 (t) window=2023-11-14T22:13:20Z - 2023-11-14T22:13:21Z (1.0s/1.0s planned)
+provider: /p/provider.so build-id=unknown kernel=test-kernel
+cmdline: t
+
+ASYM_CIPHER
+  RSA provider=default funcid=31 7 calls
+CIPHER
+  DES provider=default funcid=21 500 calls
+  other provider=default funcid=22 9 calls
+DIGEST
+  SHA256 provider=default funcid=11 1,204,033 calls
+
+Fenced generations
+  gen 0: 450 events, 2 keys (detail in JSON)
+
+Legacy paths
+  entries: 1 observed, 1 absent (1 probed-quiet, 0 not in target), 1 uninstrumented
+  observed: ENGINE_init
+  uninstrumented: RSA_meth_new
+  ENGINE calls: 5
+  engine ids: dynamic=1
+  legacy provider: loads=1 executed=4 algs=[MD4]
+  weak legacy algs: [MD4] executed=500 (algs=[DES]) unknown=9
+  tripwires: 8 attached, 2 missed of 10 syms
+  flags: engine-api-absent
+
+status=COMPLETE child_exit=0
+absence = not-observed in window (never "not present / never used")
+note: alg-name-only strength (key sizes unobservable); window-only claims

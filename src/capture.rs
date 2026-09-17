@@ -904,6 +904,25 @@ struct Engine<'a> {
     legacy: serde_json::Value,
 }
 
+/// PRD §6 byte-stability: identity order, not cookie order
+/// (cookies are attach-sequence numbers).
+fn sort_executions(executions: &mut [Execution]) {
+    executions.sort_by(|a, b| {
+        (
+            a.id.op,
+            &a.id.provider,
+            &a.id.alg_class,
+            a.id.funcid,
+        )
+            .cmp(&(
+                b.id.op,
+                &b.id.provider,
+                &b.id.alg_class,
+                b.id.funcid,
+            ))
+    });
+}
+
 impl<'a> Engine<'a> {
     fn reason(&mut self, r: impl Into<String>) {
         self.reasons.insert(r.into());
@@ -1206,22 +1225,7 @@ impl<'a> Engine<'a> {
                 })
             })
             .collect();
-        // PRD §6 byte-stability: identity order, not cookie order
-        // (cookies are attach-sequence numbers).
-        executions.sort_by(|a, b| {
-            (
-                a.id.op,
-                &a.id.provider,
-                &a.id.alg_class,
-                a.id.funcid,
-            )
-                .cmp(&(
-                    b.id.op,
-                    &b.id.provider,
-                    &b.id.alg_class,
-                    b.id.funcid,
-                ))
-        });
+        sort_executions(&mut executions);
         // P1 inventory depth carried over the mapped union: current
         // executions PLUS fenced detail (a window that closes
         // mid-churn holds most of its coverage in stale buckets).
@@ -1440,11 +1444,13 @@ pub fn run(cfg: &Config, target: Target) -> anyhow::Result<Capture> {
     }
     if !triggered || rows.is_empty() {
         // No trigger → PARTIAL (no-query), never COMPLETE-zero (§6).
-        engine.reason(if triggered {
-            "empty-inventory"
+        // Two call sites (not one if/else expression) so the
+        // reason-taxonomy test can scan every literal.
+        if triggered {
+            engine.reason("empty-inventory");
         } else {
-            "no-query"
-        });
+            engine.reason("no-query");
+        }
         let c = engine.finish(Outcome::Partial, Duration::ZERO);
         return Ok(c);
     }
@@ -1871,6 +1877,46 @@ mod tests {
                 ]
             )
         );
+    }
+
+    #[test]
+    fn executions_sort_by_identity() {
+        // PRD §6 byte-stability: (op, provider, alg, funcid) —
+        // input order must not leak into output order.
+        let mut v = vec![
+            Execution {
+                cookie: 1,
+                id: plan::Identity {
+                    provider: "default".into(),
+                    op: 12,
+                    funcid: 1,
+                    alg_class: "RSA".into(),
+                    offset: 0,
+                },
+                aliases: Vec::new(),
+                count: 1,
+                first_ns: 0,
+                last_ns: 0,
+            },
+            Execution {
+                cookie: 0,
+                id: plan::Identity {
+                    provider: "default".into(),
+                    op: 1,
+                    funcid: 1,
+                    alg_class: "SHA256".into(),
+                    offset: 0,
+                },
+                aliases: Vec::new(),
+                count: 2,
+                first_ns: 0,
+                last_ns: 0,
+            },
+        ];
+        sort_executions(&mut v);
+        assert_eq!(v[0].id.op, 1);
+        assert_eq!(v[1].id.op, 12);
+        assert_eq!(v[0].cookie, 0);
     }
 
     #[test]

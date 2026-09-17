@@ -1,0 +1,17 @@
+osslscope report: pid=7 (t) window=2023-11-14T22:13:20Z - 2023-11-14T22:13:21Z (1.0s/1.0s planned)
+provider: /p/provider.so build-id=unknown kernel=test-kernel
+cmdline: t
+
+Legacy paths
+  entries: 1 observed, 0 absent (0 probed-quiet, 0 not in target), 1 uninstrumented
+  observed: ENGINE_init
+  uninstrumented: RSA_meth_new
+  ENGINE calls: 2
+  legacy provider: loads=0 executed=0 algs=[]
+  weak legacy algs: none
+  tripwires: 2 attached, 3 missed of 5 syms
+  flags: engine-fallback-uninstrumented
+
+status=PARTIAL reasons=engine-fallback-uninstrumented counters[eng_fallback=2]
+absence = not-observed in window (never "not present / never used")
+note: alg-name-only strength (key sizes unobservable); window-only claims

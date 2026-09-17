@@ -369,7 +369,9 @@ fn human(c: &capture::Capture) -> String {
         }
         s.push('\n');
     }
-    human_legacy(c, &mut s);
+    // Same adopted block as the JSON (weak rollup recomputed —
+    // the formats must never disagree).
+    human_legacy(&legacy_with_executed_weak(c), &mut s);
     s.push('\n');
     let status = match &c.outcome {
         capture::Outcome::Complete => "COMPLETE",
@@ -417,9 +419,9 @@ fn human(c: &capture::Capture) -> String {
 
 /// Legacy section: entry states, ENGINE/legacy-provider activity,
 /// weak rollup, tripwire capability, flags.
-fn human_legacy(c: &capture::Capture, s: &mut String) {
+fn human_legacy(legacy: &serde_json::Value, s: &mut String) {
     s.push_str("Legacy paths\n");
-    if c.legacy.is_null() {
+    if legacy.is_null() {
         s.push_str("  not harvested (no harvest produced a block)\n");
         return;
     }
@@ -432,7 +434,7 @@ fn human_legacy(c: &capture::Capture, s: &mut String) {
     let (mut obs, mut abs, mut un) = (0u64, 0u64, 0u64);
     let (mut obs_names, mut un_names) = (Vec::new(), Vec::new());
     let mut probed_quiet = 0u64;
-    if let Some(list) = c.legacy.pointer("/entries").and_then(|v| v.as_array()) {
+    if let Some(list) = legacy.pointer("/entries").and_then(|v| v.as_array()) {
         for e in list {
             match e.pointer("/state").and_then(|v| v.as_str()).unwrap_or("") {
                 "observed" => {
@@ -463,17 +465,17 @@ fn human_legacy(c: &capture::Capture, s: &mut String) {
         s.push_str(&format!("  uninstrumented: {}\n", un_names.join(", ")));
     }
     let map_sum = |ptr: &str| -> u64 {
-        c.legacy
+        legacy
             .pointer(ptr)
             .and_then(|v| v.as_object())
             .map(|m| m.values().map(|v| v.as_u64().unwrap_or(0)).sum())
             .unwrap_or(0)
     };
     let num = |ptr: &str| -> u64 {
-        c.legacy.pointer(ptr).and_then(|v| v.as_u64()).unwrap_or(0)
+        legacy.pointer(ptr).and_then(|v| v.as_u64()).unwrap_or(0)
     };
     let strs = |ptr: &str| -> Vec<String> {
-        c.legacy
+        legacy
             .pointer(ptr)
             .and_then(|v| v.as_array())
             .map(|a| {
@@ -654,7 +656,8 @@ mod tests {
         // regroups by op display name.
         c.executions = vec![
             exec(1, "SHA256", 11, 1_204_033),
-            exec(2, "AES-256-GCM", 21, 500),
+            exec(2, "DES", 21, 500),
+            exec(2, "other", 22, 9),
             exec(13, "RSA", 31, 7),
         ];
         c.stale = vec![capture::StaleBucket {
@@ -672,8 +675,7 @@ mod tests {
             "engine": {"calls_by_entrypoint": {"ENGINE_init": 5},
                        "engine_id_class": {"dynamic": 1, "builtin": 0, "other": 0}},
             "legacy_provider": {"loads": {"legacy": 1}, "executed_calls": 4, "algs": ["MD4"]},
-            "weak": {"legacy_algs": ["MD4"], "executed_calls": 3,
-                     "executed_algs": ["MD4"], "unknown_calls": 0},
+            "weak": {"legacy_algs": ["MD4"]},
             "capability": {"syms_present": 10, "tripwires_attached": 8, "tripwires_missed": 2},
             "flags": ["engine-api-absent"],
         });
@@ -687,12 +689,12 @@ provider: /p/provider.so build-id=unknown kernel=test-kernel\n\
 cmdline: t\n\
 \n\
 ASYM_CIPHER\n  RSA provider=default funcid=31 7 calls\n\
-CIPHER\n  AES-256-GCM provider=default funcid=21 500 calls\n\
+CIPHER\n  DES provider=default funcid=21 500 calls\n  other provider=default funcid=22 9 calls\n\
 DIGEST\n  SHA256 provider=default funcid=11 1,204,033 calls\n\
 \n\
 Fenced generations\n  gen 0: 450 events, 2 keys (detail in JSON)\n\
 \n\
-Legacy paths\n  entries: 1 observed, 1 absent (1 probed-quiet, 0 not in target), 1 uninstrumented\n  observed: ENGINE_init\n  uninstrumented: RSA_meth_new\n  ENGINE calls: 5\n  engine ids: dynamic=1\n  legacy provider: loads=1 executed=4 algs=[MD4]\n  weak legacy algs: [MD4] executed=3 (algs=[MD4]) unknown=0\n  tripwires: 8 attached, 2 missed of 10 syms\n  flags: engine-api-absent\n\
+Legacy paths\n  entries: 1 observed, 1 absent (1 probed-quiet, 0 not in target), 1 uninstrumented\n  observed: ENGINE_init\n  uninstrumented: RSA_meth_new\n  ENGINE calls: 5\n  engine ids: dynamic=1\n  legacy provider: loads=1 executed=4 algs=[MD4]\n  weak legacy algs: [MD4] executed=500 (algs=[DES]) unknown=9\n  tripwires: 8 attached, 2 missed of 10 syms\n  flags: engine-api-absent\n\
 \n\
 status=COMPLETE child_exit=0\n\
 absence = not-observed in window (never \"not present / never used\")\n\
@@ -756,6 +758,245 @@ note: alg-name-only strength (key sizes unobservable); window-only claims\n";
         assert_eq!(iso8601_utc(1_700_000_001), "2023-11-14T22:13:21Z");
         assert_eq!(iso8601_utc(1_767_225_600), "2026-01-01T00:00:00Z");
         assert_eq!(iso8601_utc(2_147_483_647), "2038-01-19T03:14:07Z");
+    }
+
+    /// PARTIAL reason taxonomy (P3 exit-1: reasons distinguish
+    /// blind vs clean). blind = may have missed executions;
+    /// clean = fully observed, nothing unexpected found.
+    /// `harvest-*` flow from the harvest doc reason (frozen
+    /// bootstrap vocabulary — see locations below — plus the
+    /// fail-closed `harvest-partial` fallback).
+    const REASON_TAXONOMY: &[(&str, &str)] = &[
+        ("no-query", "clean"),
+        ("empty-inventory", "clean"),
+        ("harvest-no-query-trigger", "clean"),
+        ("missed-attaches", "blind"),
+        ("unresolved-offsets", "blind"),
+        ("unattributed", "blind"),
+        ("drain-shortfall", "blind"),
+        ("reharvest-skipped", "blind"),
+        ("cold-gap", "blind"),
+        ("reharvest-no-query", "blind"),
+        ("fips-unlabeled", "blind"),
+        ("reharvest-failed", "blind"),
+        ("replan-skipped", "blind"),
+        ("pid-recycled", "blind"),
+        ("fork-exec-ignored", "blind"),
+        ("over-budget", "blind"),
+        ("interrupted", "blind"),
+        ("engine-fallback-uninstrumented", "blind"),
+        ("meth-fallback-uninstrumented", "blind"),
+        ("lowlevel-fallback-uninstrumented", "blind"),
+        ("harvest-pid-recycled", "blind"),
+        ("harvest-anchor-unresolved", "blind"),
+        ("harvest-zero-rows", "blind"),
+        ("harvest-fenced-rows", "blind"),
+        ("harvest-zero-row-ops", "blind"),
+        ("harvest-truncated-walk", "blind"),
+        ("harvest-partial", "blind"),
+    ];
+
+    fn reason_class(r: &str) -> Option<&'static str> {
+        REASON_TAXONOMY
+            .iter()
+            .find(|(name, _)| *name == r)
+            .map(|(_, c)| *c)
+    }
+
+    /// Extract string literals following a marker (reason-scan).
+    fn scan_lits(src: &str, marker: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut rest = src;
+        while let Some(i) = rest.find(marker) {
+            rest = &rest[i + marker.len()..];
+            if let Some(end) = rest.find('"') {
+                out.push(rest[..end].to_string());
+                rest = &rest[end + 1..];
+            } else {
+                break;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn reason_taxonomy_complete() {
+        // Every static capture reason is classified; a novel
+        // literal breaks this test until deliberately placed.
+        let src = include_str!("capture.rs");
+        let mut found = scan_lits(src, ".reason(\"");
+        found.extend(scan_lits(src, "reasons.push(\""));
+        found.sort();
+        found.dedup();
+        assert!(!found.is_empty(), "scan found nothing — patterns rotted");
+        for r in &found {
+            assert!(reason_class(r).is_some(), "unclassified reason: {r}");
+        }
+        // Both directions: no table rot (every static table entry
+        // still exists in source).
+        for (name, _) in REASON_TAXONOMY
+            .iter()
+            .filter(|(n, _)| !n.starts_with("harvest-"))
+        {
+            assert!(
+                found.iter().any(|f| f == name),
+                "table rot (not in source): {name}"
+            );
+        }
+        // Frozen harvest vocabulary (harvest.rs: anchor-unresolved
+        // ×2 preset, no-query-trigger ×2, zero-rows, pid-recycled;
+        // schema.rs fallback: fenced-rows, zero-row-ops,
+        // truncated-walk; capture fallback: harvest-partial).
+        // Novel harvest reasons need table updates by review.
+        for (name, _) in REASON_TAXONOMY
+            .iter()
+            .filter(|(n, _)| n.starts_with("harvest-"))
+        {
+            assert!(reason_class(name).is_some(), "unclassified: {name}");
+        }
+        // Blind and clean both exist (the distinction is real).
+        assert!(found.iter().any(|r| reason_class(r) == Some("blind")));
+        assert!(found.iter().any(|r| reason_class(r) == Some("clean")));
+    }
+
+    /// Pin a rendered artifact against `tests/goldens/`.
+    /// Mismatch → FAIL with a line diff (never auto-update).
+    /// Regenerate explicitly with OSSLSCOPE_REGENERATE_GOLDENS=1,
+    /// then REVIEW THE DIFF before committing.
+    fn assert_golden(name: &str, actual: &str) {
+        let path = format!("{}/tests/goldens/{name}", env!("CARGO_MANIFEST_DIR"));
+        if std::env::var("OSSLSCOPE_REGENERATE_GOLDENS").is_ok() {
+            std::fs::write(&path, actual).unwrap();
+            return;
+        }
+        let want = std::fs::read_to_string(&path)
+            .unwrap_or_else(|_| panic!("missing golden {name} (regenerate explicitly)"));
+        if want != actual {
+            let mut diff = format!("golden {name} mismatch:\n");
+            let w: Vec<&str> = want.lines().collect();
+            let a: Vec<&str> = actual.lines().collect();
+            let mut shown = 0;
+            for (i, (x, y)) in w.iter().zip(a.iter()).enumerate() {
+                if x != y {
+                    diff.push_str(&format!("line {}:\n  want: {x}\n  got:  {y}\n", i + 1));
+                    shown += 1;
+                    if shown >= 10 {
+                        break;
+                    }
+                }
+            }
+            if w.len() != a.len() {
+                diff.push_str(&format!("lengths: want {} got {}\n", w.len(), a.len()));
+            }
+            panic!("{diff}");
+        }
+    }
+
+    fn json_of(c: &capture::Capture) -> String {
+        serde_json::to_string_pretty(&doc(c)).unwrap() + "\n"
+    }
+
+    fn partial(reasons: &[&str]) -> capture::Capture {
+        let mut c = cap(capture::Outcome::Partial, None);
+        c.reasons = reasons.iter().map(|r| r.to_string()).collect();
+        c
+    }
+
+    fn blind_legacy(engine_un: u64, meth_un: u64, low_un: u64) -> serde_json::Value {
+        let mut l = serde_json::json!({
+            "entries": [
+                {"name": "ENGINE_init", "class": "engine", "state": "observed", "probed": true},
+                {"name": "RSA_meth_new", "class": "meth", "state": "uninstrumented", "probed": false},
+            ],
+            "engine": {"calls_by_entrypoint": {"ENGINE_init": 2}, "engine_id_class": {}},
+            "legacy_provider": {"loads": {}, "executed_calls": 0, "algs": []},
+            "weak": {"legacy_algs": [], "executed_calls": 0, "executed_algs": [], "unknown_calls": 0},
+            "capability": {"syms_present": 5, "tripwires_attached": 2, "tripwires_missed": 3},
+            "flags": ["engine-fallback-uninstrumented"],
+        });
+        if engine_un > 0 {
+            l["engine"]["uninstrumented"] = engine_un.into();
+        }
+        if meth_un > 0 {
+            l["meth_new"]["uninstrumented"] = meth_un.into();
+        }
+        if low_un > 0 {
+            l["lowlevel"]["uninstrumented"] = low_un.into();
+        }
+        l
+    }
+
+    #[test]
+    fn goldens_complete() {
+        assert_golden("report-complete.json", &json_of(&full_cap()));
+        assert_golden("report-complete.txt", &human(&full_cap()));
+    }
+
+    #[test]
+    fn goldens_partial_cells() {
+        assert_golden("report-partial-no-query.json", &json_of(&partial(&["no-query"])));
+        let interrupted = partial(&["interrupted"]);
+        assert_golden("report-partial-interrupted.json", &json_of(&interrupted));
+        assert_golden("report-partial-interrupted.txt", &human(&interrupted));
+        let mut over = partial(&["over-budget"]);
+        over.counters.over_budget = 1;
+        assert_golden("report-partial-over-budget.json", &json_of(&over));
+        let mut fork = partial(&["fork-exec-ignored"]);
+        fork.counters.fork_exec_ignored = 2;
+        assert_golden("report-partial-fork-ignored.json", &json_of(&fork));
+        let mut cold = partial(&["cold-gap"]);
+        cold.counters.cold_gap_calls = 5;
+        assert_golden("report-partial-cold-gap.json", &json_of(&cold));
+        assert_golden(
+            "report-partial-fips-unlabeled.json",
+            &json_of(&partial(&["fips-unlabeled"])),
+        );
+        assert_golden(
+            "report-partial-fips-unlabeled.txt",
+            &human(&partial(&["fips-unlabeled"])),
+        );
+    }
+
+    #[test]
+    fn goldens_legacy_cells() {
+        // PRD §6: engine_fallback_uninstrumented > 0 → PARTIAL mandatory.
+        let mut c = partial(&["engine-fallback-uninstrumented"]);
+        c.counters.engine_fallback_uninstrumented = 2;
+        c.legacy = blind_legacy(2, 0, 0);
+        assert_eq!(exit_for(&c), 3);
+        assert_golden("report-partial-engine-fallback.json", &json_of(&c));
+        assert_golden("report-partial-engine-fallback.txt", &human(&c));
+        // Static / no-engine target: clean COMPLETE with an
+        // all-absent block (probed=false = not in target).
+        let mut s = cap(capture::Outcome::Complete, Some(0));
+        s.legacy = serde_json::json!({
+            "entries": [
+                {"name": "ENGINE_init", "class": "engine", "state": "absent", "probed": false},
+                {"name": "SHA256_Update", "class": "lowlevel", "state": "absent", "probed": false},
+            ],
+            "engine": {"calls_by_entrypoint": {}, "engine_id_class": {}},
+            "legacy_provider": {"loads": {}, "executed_calls": 0, "algs": []},
+            "weak": {"legacy_algs": [], "executed_calls": 0, "executed_algs": [], "unknown_calls": 0},
+            "capability": {"syms_present": 0, "tripwires_attached": 0, "tripwires_missed": 0},
+            "flags": ["engine-api-absent"],
+        });
+        assert_golden("report-legacy-static.json", &json_of(&s));
+        assert_golden("report-legacy-static.txt", &human(&s));
+    }
+
+    #[test]
+    fn goldens_determinism_and_signals() {
+        // Byte-stable for identical input (BTreeMap keys + sorted
+        // executions — PRD §6 determinism test).
+        let (a, b) = (json_of(&full_cap()), json_of(&full_cap()));
+        assert_eq!(a, b);
+        // Signals golden, unit half (P3 exit-7): signal-cut windows
+        // are PARTIAL with exit 3; drain_shortfall == 0 when the
+        // drain completes. (Live SIGTERM e2e runs on lane B, Task 10.)
+        let c = partial(&["interrupted"]);
+        assert_eq!(c.counters.drain_shortfall, 0);
+        assert_eq!(exit_for(&c), 3);
+        assert_eq!(doc(&c)["completeness"]["status"], "PARTIAL");
     }
 
     #[test]
