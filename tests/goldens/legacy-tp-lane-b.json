@@ -7,20 +7,20 @@
         "builtin": 0,
         "dynamic": 0,
         "other": 0
-      },
-      "uninstrumented": 32
+      }
     },
-    "engine_fallback_uninstrumented": 35,
     "findings": [
       "ENGINE API absent"
     ],
     "legacy_provider": {
-      "algs": [],
-      "executed_calls": 0,
+      "algs": [
+        "MD4"
+      ],
+      "executed_calls": 1,
       "loads": {
         "default": 0,
         "fips": 0,
-        "legacy": 0,
+        "legacy": 1,
         "other": 2
       }
     },
@@ -32,7 +32,7 @@
         "cipher/stream": 0,
         "digest/legacy": 0,
         "digest/md": 0,
-        "digest/sha": 0,
+        "digest/sha": 3,
         "mac": 0,
         "pkey/dh": 0,
         "pkey/dsa": 0,
@@ -44,11 +44,8 @@
     },
     "meth_new": {
       "calls_by_entrypoint": {
-        "DH_meth_new": 0,
-        "DSA_meth_new": 0,
-        "RSA_meth_new": 0
-      },
-      "uninstrumented": 3
+        "RSA_meth_new": 1
+      }
     }
   },
   "provider": "spike",
@@ -151,6 +148,111 @@
         "dev": "00:23",
         "ino": 6913610,
         "offset": 5186
+      },
+      "funcid": 8,
+      "gen": 0,
+      "op": 1,
+      "provider": "spike",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "2195f66c75fb8284",
+      "alg_class": "other",
+      "backing": {
+        "dev": "00:23",
+        "ino": 6913610,
+        "offset": 5358
+      },
+      "funcid": 1,
+      "gen": 0,
+      "op": 1,
+      "provider": "spike",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "aa44f1bed076688e",
+      "alg_class": "other",
+      "backing": {
+        "dev": "00:23",
+        "ino": 6913610,
+        "offset": 5413
+      },
+      "funcid": 6,
+      "gen": 0,
+      "op": 1,
+      "provider": "spike",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "81fc61add98d6811",
+      "alg_class": "other",
+      "backing": {
+        "dev": "00:23",
+        "ino": 6913610,
+        "offset": 5470
+      },
+      "funcid": 2,
+      "gen": 0,
+      "op": 1,
+      "provider": "spike",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "97f22965ff71ad65",
+      "alg_class": "other",
+      "backing": {
+        "dev": "00:23",
+        "ino": 6913610,
+        "offset": 5524
+      },
+      "funcid": 3,
+      "gen": 0,
+      "op": 1,
+      "provider": "spike",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "456bad0d88508c3e",
+      "alg_class": "other",
+      "backing": {
+        "dev": "00:23",
+        "ino": 6913610,
+        "offset": 5587
+      },
+      "funcid": 4,
+      "gen": 0,
+      "op": 1,
+      "provider": "spike",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "a691f90bddf7f5b1",
+      "alg_class": "other",
+      "backing": {
+        "dev": "00:23",
+        "ino": 6913610,
+        "offset": 5660
+      },
+      "funcid": 11,
+      "gen": 0,
+      "op": 1,
+      "provider": "spike",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "0a23e307c5879a3d",
+      "alg_class": "other",
+      "backing": {
+        "dev": "00:23",
+        "ino": 6913610,
+        "offset": 5712
       },
       "funcid": 8,
       "gen": 0,

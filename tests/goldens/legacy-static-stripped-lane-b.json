@@ -7,10 +7,8 @@
         "builtin": 0,
         "dynamic": 0,
         "other": 0
-      },
-      "uninstrumented": 32
+      }
     },
-    "engine_fallback_uninstrumented": 35,
     "findings": [
       "ENGINE API absent"
     ],
@@ -43,12 +41,7 @@
       }
     },
     "meth_new": {
-      "calls_by_entrypoint": {
-        "DH_meth_new": 0,
-        "DSA_meth_new": 0,
-        "RSA_meth_new": 0
-      },
-      "uninstrumented": 3
+      "calls_by_entrypoint": {}
     }
   },
   "provider": "static_driver_stripped",

@@ -12,7 +12,6 @@
     },
     "engine_fallback_uninstrumented": 38,
     "findings": [
-      "ENGINE API absent",
       "low-level coverage unavailable (no .dynsym)"
     ],
     "legacy_provider": {
@@ -41,7 +40,8 @@
         "pkey/rsa": 0,
         "rand": 0,
         "srp": 0
-      }
+      },
+      "uninstrumented": 14
     },
     "meth_new": {
       "calls_by_entrypoint": {},
