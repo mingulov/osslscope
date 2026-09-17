@@ -232,6 +232,7 @@ dependencies = [
  "aya-obj",
  "goblin",
  "libc",
+ "ossl-bpf-sys",
  "serde",
  "serde_json",
  "sha2",

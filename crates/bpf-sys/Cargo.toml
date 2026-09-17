@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
-description = "Minimal raw BPF syscalls: multi link_create + map/prog_load + probes (P2 promotes spike/bpf-sys)"
+description = "Minimal raw BPF syscalls: multi link_create + map/prog_load + probes (promoted from spike/bpf-sys at P1 exit-5)"
 publish = false
 
 [lib]
