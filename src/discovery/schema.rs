@@ -1,5 +1,6 @@
 //! Harvest document schema: one row per (op, alg, funcid, addr)
-//! plus relocation backing. `addr_hash` is the golden-comparable
+//! plus relocation backing. `addr_hash` (frozen preimage: the attested
+//! backing triple, NOT the runtime address) is the golden-comparable
 //! identity; raw `addr` is redacted before golden comparison.
 use crate::discovery::{elf, maps};
 use std::path::Path;
@@ -47,7 +48,7 @@ pub fn emit(
             "alg": r.alg,
             "funcid": r.funcid,
             "addr": r.addr,
-            "addr_hash": crate::kinds::addr_hash(r.addr),
+            "addr_hash": crate::kinds::addr_hash(&dev, ino, off),
             "addr_backed": backed,
             "backing": {"dev": dev, "ino": ino, "offset": off},
             "gen": 0,
@@ -79,7 +80,8 @@ mod tests {
         assert_eq!(doc["rows"].as_array().unwrap().len(), 1);
         let r = &doc["rows"][0];
         assert_eq!(r["addr_backed"], false);
-        assert_eq!(r["addr_hash"], crate::kinds::addr_hash(0x1000));
+        // Unbacked triple → the documented degenerate hash.
+        assert_eq!(r["addr_hash"], crate::kinds::addr_hash("", 0, 0));
         assert!(r.get("backing").unwrap().get("offset").is_some());
         assert_eq!(doc["trigger_observed"], true);
     }

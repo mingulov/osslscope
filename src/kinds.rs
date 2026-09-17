@@ -21,16 +21,49 @@ pub const REGISTRY_VERSION: u32 = 1;
 /// (major, minor) OpenSSL version key.
 pub type Version = (u32, u32);
 
-/// `addr_hash` preimage (frozen P1-0): the 8-byte little-endian
-/// dispatch-callback address, hashed with FNV-1a/64. Goldens compare
-/// hash fields after redacting raw `addr` (P1 exit 1).
-pub fn addr_hash(addr: u64) -> u64 {
-    let mut h = 0xcbf29ce484222325u64;
-    for b in addr.to_le_bytes() {
-        h ^= u64::from(b);
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    h
+/// `addr_hash` (frozen P1-0): low 64 bits of SHA-256 over the ATTESTED
+/// backing triple — NOT the runtime address (ASLR-unstable) — rendered
+/// as 16 lowercase hex chars.
+///
+/// Preimage: `b"osslscope-addr-v1" || dev_str || 0x00 || le64(ino) ||
+/// le64(file_offset)`, where `dev_str` is the `/proc/pid/maps` device
+/// field verbatim (e.g. `"08:01"`). Output: the LAST 8 digest bytes hex
+/// (low 64 bits of the big-endian digest integer).
+///
+/// Properties: stable across runs for the same provider build (goldens
+/// compare it byte-exact after redacting raw `addr`); one-way (no ASLR
+/// slide leaks); 64-bit collision space is ample for inventory row
+/// counts. Unbacked rows (`dev=""`, `ino=0`, `off=0`) share one
+/// degenerate hash by construction — standard-fixture goldens require
+/// `addr_backed=true` (P1 exit 1), so the degenerate value never
+/// decides a gate.
+pub fn addr_hash(dev: &str, ino: u64, file_offset: u64) -> String {
+    use sha2::Digest as _;
+    let mut h = sha2::Sha256::new();
+    h.update(b"osslscope-addr-v1");
+    h.update(dev.as_bytes());
+    h.update([0u8]);
+    h.update(ino.to_le_bytes());
+    h.update(file_offset.to_le_bytes());
+    let d = h.finalize();
+    hex_low64(&d)
+}
+
+/// `prov_hash` (frozen P1-0): hex SHA-256 of the provider FILE bytes
+/// (64 lowercase chars; p11scope whole-file precedent). Binds emitted
+/// rows to exact object bytes; a build-id→offset table mismatch fails
+/// closed to count-only + PARTIAL (P1 exit 2), never a wrong hash.
+pub fn prov_hash(file_bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    let d = sha2::Sha256::digest(file_bytes);
+    d.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn hex_low64(digest: &[u8]) -> String {
+    digest[digest.len() - 8..]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 // --- Operation + function-id tables (generated; see header) ---
@@ -2592,6 +2625,10 @@ pub const LOWLEVEL: &[FamilyDef] = &[
         family: "srp",
         prefixes: &["SRP_"],
     },
+    FamilyDef {
+        family: "bn",
+        prefixes: &["BN_"],
+    },
 ];
 
 /// Low-level symbols removed in 4.x (all ENGINE-bound).
@@ -2608,6 +2645,13 @@ pub const LOWLEVEL_ADDED: &[(&str, Version)] = &[
     ("RAND_set0_private", (3, 1)),
     ("RAND_set0_public", (3, 1)),
     ("EC_GROUP_to_params", (3, 2)),
+    ("BN_are_coprime", (3, 5)),
+    ("BN_signed_bin2bn", (3, 5)),
+    ("BN_signed_bn2bin", (3, 5)),
+    ("BN_signed_bn2lebin", (3, 5)),
+    ("BN_signed_bn2native", (3, 5)),
+    ("BN_signed_lebin2bn", (3, 5)),
+    ("BN_signed_native2bn", (3, 5)),
     ("RAND_set1_random_provider", (3, 5)),
     ("EC_GROUP_security_bits", (4, 0)),
 ];
@@ -2925,6 +2969,8 @@ mod tests {
         assert_eq!(lowlevel_family("SHA256_Init"), Some("digest/sha"));
         assert_eq!(lowlevel_family("RSA_new"), Some("pkey/rsa"));
         assert_eq!(lowlevel_family("EC_KEY_new"), Some("pkey/ec"));
+        assert_eq!(lowlevel_family("BN_new"), Some("bn"));
+        assert_eq!(LOWLEVEL.len(), 14);
         assert_eq!(lowlevel_family("EVP_MD_fetch"), None);
         assert_eq!(lowlevel_family("printf"), None);
         assert!(LOWLEVEL_REMOVED_40.contains(&"RSA_get0_engine"));
@@ -2958,9 +3004,22 @@ mod tests {
     }
 
     #[test]
-    fn addr_hash_stable() {
-        // Preimage lock: le64(0x1000) under FNV-1a/64.
-        assert_eq!(addr_hash(0x1000), 0x53a03f8d0add0c15);
+    fn addr_hash_vector() {
+        // Independent vector (python hashlib): tag || "08:01" || 0x00 ||
+        // le64(1234) || le64(0x1000) → low64 hex.
+        assert_eq!(addr_hash("08:01", 1234, 0x1000), "80d7552b021f6097");
+        // Shape: 16 lowercase hex chars, and the degenerate triple hashes.
+        let d = addr_hash("", 0, 0);
+        assert_eq!(d.len(), 16);
+        assert!(d.bytes().all(|b| b.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn prov_hash_vector() {
+        assert_eq!(
+            prov_hash(b"test"),
+            "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+        );
     }
 
     /// Lane-anchored invariant: the local 4.0 libcrypto exports zero
