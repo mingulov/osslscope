@@ -24,6 +24,9 @@ pub const BPF_MAP_TYPE_RINGBUF: u32 = 27;
 pub const BPF_TRACE_UPROBE_MULTI: u32 = 48;
 pub const BPF_FUNC_PROBE_READ_USER: u64 = 112;
 pub const BPF_F_TOKEN_FD: u32 = 1 << 16;
+/// uprobe_multi link flag: return probes (verified in
+/// `linux/bpf.h`: `BPF_F_UPROBE_MULTI_RETURN = (1U << 0)`).
+pub const BPF_F_UPROBE_MULTI_RETURN: u32 = 1;
 
 #[repr(C)]
 struct MapAttr {
@@ -180,10 +183,41 @@ pub fn link_create_uprobe_multi(
     cookies: &[u64],
     pid: u32,
 ) -> io::Result<OwnedFd> {
+    link_create_multi(prog_fd, path, offsets, cookies, pid, 0)
+}
+
+/// One uretprobe_multi link (return probes): same shape, the
+/// `BPF_F_UPROBE_MULTI_RETURN` flag set.
+pub fn link_create_uretprobe_multi(
+    prog_fd: RawFd,
+    path: &CStr,
+    offsets: &[u64],
+    cookies: &[u64],
+    pid: u32,
+) -> io::Result<OwnedFd> {
+    link_create_multi(
+        prog_fd,
+        path,
+        offsets,
+        cookies,
+        pid,
+        BPF_F_UPROBE_MULTI_RETURN,
+    )
+}
+
+fn link_create_multi(
+    prog_fd: RawFd,
+    path: &CStr,
+    offsets: &[u64],
+    cookies: &[u64],
+    pid: u32,
+    flags: u32,
+) -> io::Result<OwnedFd> {
     assert!(offsets.len() == cookies.len() && !offsets.is_empty());
     let mut attr: LinkAttr = zeroed();
     attr.prog_fd = prog_fd as u32;
     attr.attach_type = BPF_TRACE_UPROBE_MULTI;
+    attr.flags = flags;
     attr.path = path.as_ptr() as u64;
     attr.offsets = offsets.as_ptr() as u64;
     attr.cookies = cookies.as_ptr() as u64;

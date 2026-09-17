@@ -10,4 +10,5 @@ pub mod discovery;
 pub mod doctor;
 pub mod inspect;
 pub mod kinds;
+pub mod loader;
 pub mod pin;
