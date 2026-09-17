@@ -40,6 +40,38 @@ static void spike_work(void)
         ;
 }
 
+/* Shared digest metadata readers (ONE address for every digest alg —
+ * real providers share these across SHA2/SHA3 families (P1-exit-2
+ * alias precedent); per-alg-private copies would leave the fetch
+ * walk's sibling-alg calls unprobed and break P2 churn conservation.
+ * Oracle labels shared calls SPIKE-SHA (per-alg attribution of a
+ * shared address is impossible — the alias audit says so). */
+static const OSSL_PARAM *spike_digest_gettable(void *provctx)
+{
+    (void)provctx;
+    spike_count("SPIKE-SHA", OSSL_FUNC_DIGEST_GETTABLE_PARAMS,
+        "gettable_params");
+    static const OSSL_PARAM known[] = {
+        OSSL_PARAM_size_t(OSSL_DIGEST_PARAM_BLOCK_SIZE, NULL),
+        OSSL_PARAM_size_t(OSSL_DIGEST_PARAM_SIZE, NULL),
+        OSSL_PARAM_END
+    };
+    return known;
+}
+
+static int spike_digest_get_params(OSSL_PARAM params[])
+{
+    OSSL_PARAM *p;
+    spike_count("SPIKE-SHA", OSSL_FUNC_DIGEST_GET_PARAMS, "get_params");
+    p = OSSL_PARAM_locate(params, OSSL_DIGEST_PARAM_BLOCK_SIZE);
+    if (p != NULL && !OSSL_PARAM_set_size_t(p, 64))
+        return 0;
+    p = OSSL_PARAM_locate(params, OSSL_DIGEST_PARAM_SIZE);
+    if (p != NULL && !OSSL_PARAM_set_size_t(p, 32))
+        return 0;
+    return 1;
+}
+
 #define SPIKE_DIGEST_ALG(id, disp) \
     static void *id##_newctx(void *provctx) \
     { (void)provctx; spike_count(disp, OSSL_FUNC_DIGEST_NEWCTX, "newctx"); return malloc(1); } \
@@ -53,29 +85,14 @@ static void spike_work(void)
                           size_t outsz) \
     { (void)ctx; (void)out; (void)outsz; spike_count(disp, OSSL_FUNC_DIGEST_FINAL, "final"); \
       *outl = 0; return 1; } \
-    static const OSSL_PARAM *id##_gettable(void *provctx) \
-    { (void)provctx; spike_count(disp, OSSL_FUNC_DIGEST_GETTABLE_PARAMS, "gettable_params"); \
-      static const OSSL_PARAM known[] = { \
-          OSSL_PARAM_size_t(OSSL_DIGEST_PARAM_BLOCK_SIZE, NULL), \
-          OSSL_PARAM_size_t(OSSL_DIGEST_PARAM_SIZE, NULL), \
-          OSSL_PARAM_END \
-      }; \
-      return known; } \
-    static int id##_get_params(OSSL_PARAM params[]) \
-    { OSSL_PARAM *p; spike_count(disp, OSSL_FUNC_DIGEST_GET_PARAMS, "get_params"); \
-      p = OSSL_PARAM_locate(params, OSSL_DIGEST_PARAM_BLOCK_SIZE); \
-      if (p != NULL && !OSSL_PARAM_set_size_t(p, 64)) return 0; \
-      p = OSSL_PARAM_locate(params, OSSL_DIGEST_PARAM_SIZE); \
-      if (p != NULL && !OSSL_PARAM_set_size_t(p, 32)) return 0; \
-      return 1; } \
     static const OSSL_DISPATCH id##_dispatch[] = { \
         { OSSL_FUNC_DIGEST_NEWCTX, (void (*)(void))id##_newctx }, \
         { OSSL_FUNC_DIGEST_FREECTX, (void (*)(void))id##_freectx }, \
         { OSSL_FUNC_DIGEST_INIT, (void (*)(void))id##_init }, \
         { OSSL_FUNC_DIGEST_UPDATE, (void (*)(void))id##_update }, \
         { OSSL_FUNC_DIGEST_FINAL, (void (*)(void))id##_final }, \
-        { OSSL_FUNC_DIGEST_GETTABLE_PARAMS, (void (*)(void))id##_gettable }, \
-        { OSSL_FUNC_DIGEST_GET_PARAMS, (void (*)(void))id##_get_params }, \
+        { OSSL_FUNC_DIGEST_GETTABLE_PARAMS, (void (*)(void))spike_digest_gettable }, \
+        { OSSL_FUNC_DIGEST_GET_PARAMS, (void (*)(void))spike_digest_get_params }, \
         { 0, NULL } \
     };
 
