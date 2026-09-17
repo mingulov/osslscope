@@ -1,0 +1,10 @@
+{
+  "gen": 0,
+  "provider": "default",
+  "reason": "no-query-trigger",
+  "resolution": "force",
+  "rows": [],
+  "status": "PARTIAL",
+  "trigger_observed": false,
+  "uninstrumented_ops": 14
+}

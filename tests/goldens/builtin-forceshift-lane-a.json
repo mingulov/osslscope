@@ -1,0 +1,15 @@
+{
+  "gen": 0,
+  "provider": "default",
+  "queries_observed": 6,
+  "reason": "zero-rows",
+  "resolution": "force",
+  "rows": [],
+  "status": "PARTIAL",
+  "trigger_observed": true,
+  "uninstrumented_ops": 14,
+  "zero_row_ops": [
+    1,
+    12
+  ]
+}
