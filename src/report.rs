@@ -648,14 +648,24 @@ fn cbom(c: &capture::Capture) -> serde_json::Value {
     })
 }
 
+const USAGE: &str = "usage: report [--duration S] --provider P --object O --count-object C [--format human|json] [--out F] [--cbom FILE] [--builtin] [--settle S] [--timeout S] [--grace S] [--image-digest D] {--pid P | run -- <cmd>}";
+
 pub fn run(argv: &[String]) -> ExitCode {
+    // --help anywhere on the osslscope side (a target command after
+    // run -- may legitimately contain --help).
+    if argv
+        .iter()
+        .take_while(|a| a.as_str() != "run")
+        .any(|a| a == "--help" || a == "-h")
+    {
+        println!("{USAGE}");
+        return ExitCode::from(0);
+    }
     let args = match parse(argv) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("osslscope report: {e}");
-            eprintln!(
-                "usage: report [--duration S] --provider P --object O --count-object C [--format human|json] [--out F] [--cbom FILE] [--builtin] [--settle S] [--timeout S] [--grace S] [--image-digest D] {{--pid P | run -- <cmd>}}"
-            );
+            eprintln!("{USAGE}");
             return ExitCode::from(2);
         }
     };
@@ -663,6 +673,7 @@ pub fn run(argv: &[String]) -> ExitCode {
         Ok(c) => c,
         Err(e) => {
             eprintln!("osslscope report: {e:#}");
+            eprintln!("osslscope report: run 'osslscope doctor' to diagnose environment failures");
             return ExitCode::from(4);
         }
     };
@@ -1268,6 +1279,16 @@ note: alg-name-only strength (key sizes unobservable); window-only claims\n";
         assert_eq!(a.cbom, Some("/tmp/x.cdx.json".to_string()));
         let a = parse(&v(vec!["--provider", "p", "--object", "o", "--count-object", "c", "--pid", "9"])).unwrap();
         assert_eq!(a.cbom, None);
+    }
+
+    #[test]
+    fn help_exits_zero_before_run_only() {
+        use std::process::ExitCode;
+        let v = |s: Vec<&str>| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(run(&v(vec!["--help"])), ExitCode::from(0));
+        assert_eq!(run(&v(vec!["-h"])), ExitCode::from(0));
+        // A target command after run -- may contain --help.
+        assert_eq!(run(&v(vec!["run", "--", "--help"])), ExitCode::from(2));
     }
 
     #[test]

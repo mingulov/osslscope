@@ -606,13 +606,31 @@ fn human(c: &capture::Capture, v: &Verdict) -> String {
     s
 }
 
+const USAGE: [&str; 2] = [
+    "usage: check [--duration S] --provider P --object O --count-object C [rules] [--format human|json] [--out F] [--builtin] [--settle S] [--timeout S] [--grace S] [--image-digest D] {--pid P | run -- <cmd>}",
+    "rules: [--require-provider P] [--deny-provider P] [--deny-engine] [--deny-algorithm X] [--deny-weak] [--require-executed X] (repeatable; at least one required)",
+];
+
 pub fn run(argv: &[String]) -> ExitCode {
+    // --help anywhere on the osslscope side (a target command after
+    // run -- may legitimately contain --help).
+    if argv
+        .iter()
+        .take_while(|a| a.as_str() != "run")
+        .any(|a| a == "--help" || a == "-h")
+    {
+        for l in USAGE {
+            println!("{l}");
+        }
+        return ExitCode::from(0);
+    }
     let args = match parse(argv) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("osslscope check: {e}");
-            eprintln!("usage: check [--duration S] --provider P --object O --count-object C [rules] [--format human|json] [--out F] [--builtin] [--settle S] [--timeout S] [--grace S] [--image-digest D] {{--pid P | run -- <cmd>}}");
-            eprintln!("rules: [--require-provider P] [--deny-provider P] [--deny-engine] [--deny-algorithm X] [--deny-weak] [--require-executed X] (repeatable; at least one required)");
+            for l in USAGE {
+                eprintln!("{l}");
+            }
             return ExitCode::from(2);
         }
     };
@@ -620,6 +638,7 @@ pub fn run(argv: &[String]) -> ExitCode {
         Ok(c) => c,
         Err(e) => {
             eprintln!("osslscope check: {e:#}");
+            eprintln!("osslscope check: run 'osslscope doctor' to diagnose environment failures");
             return ExitCode::from(4);
         }
     };
@@ -987,6 +1006,14 @@ mod tests {
         )
         .unwrap();
         crate::schema::assert_required_keys(&schema, &d);
+    }
+
+    #[test]
+    fn help_exits_zero_before_run_only() {
+        let v = |s: Vec<&str>| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(run(&v(vec!["--help"])), ExitCode::from(0));
+        assert_eq!(run(&v(vec!["--deny-weak", "-h"])), ExitCode::from(0));
+        assert_eq!(run(&v(vec!["run", "--", "--help"])), ExitCode::from(2));
     }
 
     #[test]
