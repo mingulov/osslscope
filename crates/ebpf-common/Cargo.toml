@@ -1,0 +1,15 @@
+[package]
+name = "osslscope-ebpf-common"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+description = "Shared eBPF/user key + event structs (P2 owns content)"
+publish = false
+
+[lib]
+name = "osslscope_ebpf_common"
+path = "src/lib.rs"
+
+[features]
+user = []

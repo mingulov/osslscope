@@ -20,7 +20,8 @@ installed
     ≠ EXECUTED
 ```
 
-> **Status: pre-implementation; scope defined, no code yet.** Stack: Rust + Aya proposed (owner: P0 phase gate).
+> **Status: P1-0 scaffolding; workspace + fixtures land, discovery in progress.**
+> Stack: Rust 1.88 + Aya 0.14 (raw multi-link primary) — confirmed at the P0 gate.
 > Specs appear under `docs/`; see `docs/README.md`.
 
 ## Why

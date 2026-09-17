@@ -32,4 +32,10 @@ Public product repository for `osslscope`. Only public material here.
 
 ## Checks
 
-Stack: Rust + Aya proposed (owner: P0 phase gate). Once confirmed, this section must name the exact gates (format, check, test, lint) with pinned versions.
+Stack confirmed at the P0 gate (Rust 1.88.0 + Aya 0.14, raw multi-link
+primary). Gates, pinned toolchain (`rust-toolchain.toml`):
+
+- `cargo fmt --check`
+- `cargo check --workspace --locked`
+- `cargo test --workspace --locked`
+- `cargo clippy --workspace --locked -- -D warnings` (from first lint-clean commit)
