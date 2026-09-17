@@ -6091,13 +6091,12 @@ mod tests {
     fn engine_classes_shaped() {
         let n = |c| ENGINE.iter().filter(|e| e.class == c).count();
         assert_eq!(n(EngineClass::Tripwire), 2);
-        assert_eq!(
+        assert!(
             ENGINE
                 .iter()
                 .filter(|e| e.class == EngineClass::Register)
                 .count()
-                > 0,
-            true
+                > 0
         );
         assert_eq!(n(EngineClass::Interception), 10);
         assert_eq!(ENGINE.len(), 132);

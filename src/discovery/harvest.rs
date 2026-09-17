@@ -2,13 +2,18 @@
 //! promoted behavior-identical from the P0-4 spike. The fixture-only
 //! `evp_driver` cmdline guard is now a caller-supplied marker
 //! (`None` = any target — what `inspect --pid` uses at P1 exit 1).
-use crate::discovery::{elf, maps, schema};
+//!
+//! P1 exit 2 adds builtin mode (`--builtin`): single-stage attach to
+//! the core-static `ossl_provider_query_operation` resolved via the
+//! build-id ladder (no init anchor exists for the in-libcrypto
+//! default provider), coverage counters, and PARTIAL documents.
+use crate::discovery::{builtin, elf, maps, schema};
 use anyhow::{Context as _, anyhow, bail};
 use aya::maps::RingBuf;
 use aya::programs::UProbe;
 use aya::programs::uprobe::{UProbeAttachLocation, UProbeAttachPoint, UProbeScope};
 use aya::{Ebpf, EbpfLoader};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -16,7 +21,11 @@ use std::time::{Duration, Instant};
 const KIND_INIT_RET: u32 = 1;
 const KIND_QUERY_RET: u32 = 2;
 const KIND_ROW: u32 = 3;
-const EVENT_LEN: usize = 96;
+const KIND_ALG: u32 = 4;
+const EVENT_LEN: usize = 160;
+const ROW_EVENT_LEN: usize = 40;
+const NAME_OFF: usize = 32;
+const NAME_LEN: usize = 128;
 
 /// Load-mandated init anchor, present even in stripped modules.
 const INIT_ANCHOR: &str = "OSSL_provider_init";
@@ -30,6 +39,12 @@ pub struct Config {
     pub timeout: Duration,
     /// Required cmdline marker (fixture guard), or None for any target.
     pub cmdline_marker: Option<String>,
+    /// Builtin mode: harvest the in-libcrypto default provider.
+    pub builtin: bool,
+    /// Override build-id table (forensics/redacted-table gates).
+    pub table: Option<PathBuf>,
+    /// Forced query-fn file offset (forensics escape hatch).
+    pub force_offset: Option<u64>,
 }
 
 fn attach_pair(
@@ -56,6 +71,51 @@ fn attach_pair(
     Ok(())
 }
 
+/// Emit a PARTIAL document for a failed bootstrap (anchor unresolvable).
+/// Never a bare "none": the reason + uninstrumented depth travel in-band.
+fn partial_doc(
+    provider_name: &str,
+    provider: &Path,
+    canon: &str,
+    elf_bytes: &[u8],
+    reason: &str,
+    builtin: bool,
+) -> anyhow::Result<serde_json::Value> {
+    schema::emit(
+        provider_name,
+        provider,
+        canon,
+        elf_bytes,
+        &[],
+        &[],
+        false,
+        &schema::Stats {
+            builtin,
+            reason: Some(reason.to_string()),
+            ..schema::Stats::trivial()
+        },
+    )
+}
+
+/// Drain the TRUNC overflow map (missing on pre-exit-2 objects → empty).
+fn read_trunc(bpf: &mut Ebpf) -> Vec<(u32, u64)> {
+    let Some(map) = bpf.take_map("TRUNC") else {
+        return Vec::new();
+    };
+    let Ok(map) = aya::maps::HashMap::<_, u32, u64>::try_from(map) else {
+        return Vec::new();
+    };
+    map.iter().filter_map(|r| r.ok()).collect()
+}
+
+/// Sum the CALLS per-op map (missing on pre-exit-2 objects → the
+/// caller falls back to the QUERY_RET event count).
+fn read_calls(bpf: &mut Ebpf) -> Option<u64> {
+    let map = bpf.take_map("CALLS")?;
+    let map = aya::maps::HashMap::<_, u32, u64>::try_from(map).ok()?;
+    Some(map.iter().filter_map(|r| r.ok()).map(|(_, n)| n).sum())
+}
+
 /// Run the harvest; returns the emitted document on success.
 pub fn run(cfg: &Config) -> anyhow::Result<serde_json::Value> {
     let pid = NonZeroU32::new(cfg.pid).ok_or_else(|| anyhow!("pid must be non-zero"))?;
@@ -73,18 +133,85 @@ pub fn run(cfg: &Config) -> anyhow::Result<serde_json::Value> {
     let obj_bytes = std::fs::read(&cfg.object)?;
 
     let mut bpf = EbpfLoader::new().load(&obj_bytes)?;
-    let init_off = elf::dynsym_file_offset(&elf_bytes, INIT_ANCHOR)?;
-    attach_pair(
-        &mut bpf,
-        "init_entry",
-        "init_return",
-        init_off,
-        &cfg.provider,
-        pid,
-    )?;
-    // Machine-readable progress on stderr (stdout stays pure JSON):
-    // harnesses gate fixture GO lines on these.
-    eprintln!("INSPECT stage=init attached=2");
+    let provider_name: String;
+    let mut resolution: Option<String> = None;
+    if cfg.builtin {
+        provider_name = "default".to_string();
+        let table = match &cfg.table {
+            Some(path) => {
+                let text = std::fs::read_to_string(path)?;
+                builtin::load_table_str(&text)?
+            }
+            None => builtin::shipped_table(),
+        };
+        match builtin::resolve_query_offset(&elf_bytes, &table, cfg.force_offset) {
+            Ok((off, r)) => {
+                if r != builtin::Resolution::Table {
+                    resolution = Some(r.as_str().to_string());
+                }
+                attach_pair(
+                    &mut bpf,
+                    "query_entry",
+                    "query_return",
+                    off,
+                    &cfg.provider,
+                    pid,
+                )?;
+                eprintln!("INSPECT stage=builtin off={off:#x} via={}", r.as_str());
+            }
+            Err(e) => {
+                eprintln!("INSPECT builtin unresolved: {e:#}");
+                return partial_doc(
+                    &provider_name,
+                    &cfg.provider,
+                    &canon,
+                    &elf_bytes,
+                    "anchor-unresolved",
+                    true,
+                );
+            }
+        }
+    } else {
+        provider_name = cfg
+            .provider
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "unknown".to_string());
+        // Init ladder: load-mandated dynsym first, debug symtab second.
+        let init_off = elf::dynsym_file_offset(&elf_bytes, INIT_ANCHOR)
+            .map(|off| (off, None))
+            .or_else(|_| {
+                elf::symtab_file_offset(&elf_bytes, INIT_ANCHOR)
+                    .map(|off| (off, Some("symtab".to_string())))
+            });
+        match init_off {
+            Ok((off, res)) => {
+                resolution = res;
+                attach_pair(
+                    &mut bpf,
+                    "init_entry",
+                    "init_return",
+                    off,
+                    &cfg.provider,
+                    pid,
+                )?;
+            }
+            Err(e) => {
+                eprintln!("INSPECT anchor unresolved: {e:#}");
+                return partial_doc(
+                    &provider_name,
+                    &cfg.provider,
+                    &canon,
+                    &elf_bytes,
+                    "anchor-unresolved",
+                    false,
+                );
+            }
+        }
+        // Machine-readable progress on stderr (stdout stays pure JSON):
+        // harnesses gate fixture GO lines on these.
+        eprintln!("INSPECT stage=init attached=2");
+    }
 
     let map = bpf
         .take_map("EVENTS")
@@ -93,11 +220,22 @@ pub fn run(cfg: &Config) -> anyhow::Result<serde_json::Value> {
     let start = Instant::now();
     let mut last_event = None;
     let mut trigger_observed = false;
-    let mut query_attached = false;
+    let mut query_attached = cfg.builtin;
     let mut rows: Vec<schema::Row> = Vec::new();
     // Identity includes addr: scaled tables cycle funcids, so the triple
     // alone collapses distinct dispatch entries (72 vs 504 observed).
-    let mut seen: HashSet<(u32, String, u32, u64)> = HashSet::new();
+    // Index (not unit): duplicate keys arbitrate the stored array below.
+    let mut seen: HashMap<(u32, String, u32, u64), usize> = HashMap::new();
+    // Pre-drain maps snapshot for duplicate arbitration (mappings are
+    // stable — providers stay loaded for the whole harvest; a failed
+    // read degrades to first-seen-wins).
+    let early_maps = maps::read_maps(cfg.pid).unwrap_or_default();
+    let mut queries_observed: u64 = 0;
+    let mut ops_hit: HashSet<u32> = HashSet::new();
+    // (Array address, alg index) → names; ROW events join here (BPF
+    // emits the 128B name once per walked alg; the array disambiguates
+    // providers sharing (op, index)).
+    let mut alg_names: HashMap<(u64, u64), String> = HashMap::new();
 
     while start.elapsed() < cfg.timeout {
         let mut fresh = false;
@@ -105,12 +243,21 @@ pub fn run(cfg: &Config) -> anyhow::Result<serde_json::Value> {
             fresh = true;
             last_event = Some(Instant::now());
             let b: &[u8] = &item;
-            if b.len() < EVENT_LEN {
+            if b.len() < 8 {
                 eprintln!("short event: {} bytes", b.len());
                 continue;
             }
             let u32at = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
             let u64at = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+            let want = if u32at(0) == KIND_ROW || u32at(0) == KIND_QUERY_RET {
+                ROW_EVENT_LEN
+            } else {
+                EVENT_LEN
+            };
+            if b.len() < want {
+                eprintln!("short event: {} bytes", b.len());
+                continue;
+            }
             match u32at(0) {
                 KIND_INIT_RET => {
                     if query_attached {
@@ -136,19 +283,51 @@ pub fn run(cfg: &Config) -> anyhow::Result<serde_json::Value> {
                 }
                 KIND_QUERY_RET if u32at(8) == 0 => {
                     trigger_observed = true;
+                    queries_observed += 1;
+                    ops_hit.insert(u32at(4));
+                }
+                KIND_ALG => {
+                    trigger_observed = true;
+                    let name = &b[NAME_OFF..NAME_OFF + NAME_LEN];
+                    let len = name.iter().position(|c| *c == 0).unwrap_or(name.len());
+                    let alg = String::from_utf8_lossy(&name[..len]).into_owned();
+                    alg_names.insert((u64at(16), u64at(24)), alg);
                 }
                 KIND_ROW => {
                     trigger_observed = true;
-                    let name = &b[32..96];
-                    let len = name.iter().position(|c| *c == 0).unwrap_or(name.len());
-                    let alg = String::from_utf8_lossy(&name[..len]).into_owned();
+                    let arr = u64at(24);
+                    let Some(alg) = alg_names.get(&(arr, u64at(32))).cloned() else {
+                        eprintln!("orphan row: op={} arr={arr:#x} idx={}", u32at(4), u64at(32));
+                        continue;
+                    };
                     let key = (u32at(4), alg.clone(), u32at(8), u64at(16));
-                    if seen.insert(key) {
+                    if let Some(&i) = seen.get(&key) {
+                        // Duplicate key: multi-libctx re-query, or two
+                        // providers sharing one implementation (default +
+                        // legacy both expose RIPEMD-160 funcid 3). Prefer
+                        // a provider-owned array so keep/drop is
+                        // arrival-order independent.
+                        if cfg.builtin
+                            && maps::provider_mapping(
+                                &early_maps,
+                                &cfg.provider,
+                                &canon,
+                                rows[i].arr,
+                            )
+                            .is_none()
+                            && maps::provider_mapping(&early_maps, &cfg.provider, &canon, arr)
+                                .is_some()
+                        {
+                            rows[i].arr = arr;
+                        }
+                    } else {
+                        seen.insert(key, rows.len());
                         rows.push(schema::Row {
                             op: u32at(4),
                             alg,
                             funcid: u32at(8),
                             addr: u64at(16),
+                            arr,
                         });
                     }
                 }
@@ -162,18 +341,81 @@ pub fn run(cfg: &Config) -> anyhow::Result<serde_json::Value> {
                 }
             }
         }
-        std::thread::sleep(Duration::from_millis(5));
+        // Sleep only when idle: the inventory trigger bursts ~1MB in
+        // milliseconds and the drain must not lag a fixed quantum.
+        if !fresh {
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
     if !trigger_observed {
+        if cfg.builtin {
+            eprintln!("INSPECT builtin: no query trigger before timeout");
+            let mut stats = schema::Stats {
+                builtin: true,
+                queries_observed,
+                resolution,
+                reason: Some("no-query-trigger".to_string()),
+                ..schema::Stats::trivial()
+            };
+            stats.zero_row_ops = ops_hit.into_iter().collect();
+            return schema::emit(
+                &provider_name,
+                &cfg.provider,
+                &canon,
+                &elf_bytes,
+                &[],
+                &[],
+                false,
+                &stats,
+            );
+        }
         bail!("no query trigger observed before timeout");
     }
 
     let live = maps::read_maps(cfg.pid).unwrap_or_default();
-    let provider_name = cfg
-        .provider
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "unknown".to_string());
+    // Builtin mode shares the core wrapper with every provider in the
+    // target: attribute by ARRAY mapping, not implementation address —
+    // legacy rows can point at shared libcrypto code (MD4/MDC2 proved
+    // it) while their arrays sit in legacy.so.
+    let mut foreign_dropped: u64 = 0;
+    if cfg.builtin {
+        let before = rows.len();
+        rows.retain(|r| {
+            if maps::provider_mapping(&live, &cfg.provider, &canon, r.arr).is_some() {
+                // Array owned by the provider file.
+                return true;
+            }
+            if live
+                .iter()
+                .any(|m| m.start <= r.arr && r.arr < m.end && m.ino != 0)
+            {
+                // Array owned by another FILE (ino != 0): definitively
+                // foreign. Anonymous mappings (heap/malloc, ino == 0 —
+                // the 4.0 default cipher array lives in one) fall
+                // through to implementation attribution below.
+                return false;
+            }
+            // Anonymous or unmapped array: attribute by implementation
+            // address instead.
+            maps::provider_mapping(&live, &cfg.provider, &canon, r.addr).is_some()
+        });
+        foreign_dropped = (before - rows.len()) as u64;
+    }
+    let ops_with_rows: HashSet<u32> = rows.iter().map(|r| r.op).collect();
+    let mut zero_row_ops: Vec<u32> = ops_hit.difference(&ops_with_rows).copied().collect();
+    zero_row_ops.sort_unstable();
+    let truncated = read_trunc(&mut bpf);
+    // Exact call volume from the CALLS map (QUERY_RET events are
+    // first-hit-only; the event count is the pre-exit-2 fallback).
+    if let Some(calls) = read_calls(&mut bpf) {
+        queries_observed = calls;
+    }
+    // Validation: the known-op trigger must yield rows.
+    let reason = if cfg.builtin && rows.is_empty() {
+        Some("zero-rows".to_string())
+    } else {
+        None
+    };
     schema::emit(
         &provider_name,
         &cfg.provider,
@@ -182,5 +424,30 @@ pub fn run(cfg: &Config) -> anyhow::Result<serde_json::Value> {
         &live,
         &rows,
         trigger_observed,
+        &schema::Stats {
+            builtin: cfg.builtin,
+            queries_observed,
+            zero_row_ops,
+            truncated,
+            resolution,
+            reason,
+            foreign_dropped,
+        },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn row_key_includes_addr() {
+        // Regression pin for the scaled-table collapse (72 vs 504):
+        // same (op, alg, funcid) at distinct addrs are distinct rows.
+        let a = (1u32, "X".to_string(), 7u32, 0x1000u64);
+        let b = (1u32, "X".to_string(), 7u32, 0x2000u64);
+        let mut s: std::collections::HashSet<(u32, String, u32, u64)> =
+            std::collections::HashSet::new();
+        assert!(s.insert(a));
+        assert!(s.insert(b));
+        assert_eq!(s.len(), 2);
+    }
 }

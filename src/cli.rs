@@ -8,6 +8,7 @@ pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
     match cmd {
         "doctor" => crate::doctor::run(&argv[1..]),
         "inspect" => crate::inspect::run(&argv[1..]),
+        "alias-audit" => crate::aliases::run(&argv[1..]),
         "report" => crate::doctor::unimplemented("report"),
         "check" => crate::doctor::unimplemented("check"),
         "help" | "--help" | "-h" => {

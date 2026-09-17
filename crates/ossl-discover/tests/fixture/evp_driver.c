@@ -18,7 +18,14 @@
  * fetch pairs (concurrent query_operation storm for the harvest uretprobe
  * proof) and prints STORMDONE threads=T iters=50 fail=F.
  * Env: SPIKE_PROV (default spike), SPIKE_DIGEST (default SPIKE-SHA),
- * SPIKE_SIG (default SPIKE-SIG) select provider + fetched algs. */
+ * SPIKE_SIG (default SPIKE-SIG) select provider + fetched algs.
+ * SPIKE_SIG="" skips the signature fetch (digest-only providers such as
+ * legacy/alias). SPIKE_QUERY_ALL=1 fires the M2 re-query trigger for
+ * inventory completeness: direct OSSL_PROVIDER_query_operation calls
+ * for every op x SPIKE_QUERY_ROUNDS (default 256) on the loaded
+ * provider + default + legacy after GO1 and in the GO2 fresh libctx
+ * (P1 exit 2; one alg walked per query-return hit, 256/op covers the
+ * BPF bound). */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -64,6 +71,45 @@ struct sig_fns {
 static const char *storm_prov;
 static const char *storm_dig;
 static const char *storm_sig;
+
+/* P1 exit 2: inventory-completeness trigger. Harvest only observes ops
+ * the target queries, one alg per query-return hit; direct
+ * query_operation calls (public API, same function the harvest uprobe
+ * attaches to) cover every op without an alg-name matrix. 256
+ * rounds/op cover the BPF alg bound. */
+static void query_all_rounds(OSSL_LIB_CTX *ctx, const char *prov)
+{
+    const char *targets[3];
+    const char *er = getenv("SPIKE_QUERY_ROUNDS");
+    int rounds = er != NULL ? atoi(er) : 256;
+    int r, op, t;
+
+    if (getenv("SPIKE_QUERY_ALL") == NULL)
+        return;
+    if (rounds < 1)
+        rounds = 1;
+    if (rounds > 1024)
+        rounds = 1024;
+    targets[0] = prov;
+    targets[1] = "default";
+    targets[2] = "legacy";
+    for (t = 0; t < 3; t++) {
+        OSSL_PROVIDER *p = OSSL_PROVIDER_load(ctx, targets[t]);
+
+        if (p == NULL)
+            continue;
+        for (op = 1; op <= OSSL_OP__HIGHEST; op++) {
+            for (r = 0; r < rounds; r++) {
+                const OSSL_ALGORITHM *a;
+                int no = 0;
+
+                a = OSSL_PROVIDER_query_operation(p, op, &no);
+                OSSL_PROVIDER_unquery_operation(p, op, a);
+            }
+        }
+    }
+    fprintf(stderr, "QUERYALL=ok rounds=%d\n", rounds);
+}
 static char storm_propquery[128];
 static long storm_fail;
 #define STORM_ITERS 50
@@ -371,6 +417,7 @@ int main(int argc, char **argv)
     EVP_MD *md;
     EVP_SIGNATURE *sig;
     const char *n1, *n2;
+    int want_sig;
 
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
@@ -445,8 +492,9 @@ int main(int argc, char **argv)
     if (dig_name == NULL || *dig_name == '\0')
         dig_name = "SPIKE-SHA";
     sig_name = getenv("SPIKE_SIG");
-    if (sig_name == NULL || *sig_name == '\0')
+    if (sig_name == NULL)
         sig_name = "SPIKE-SIG";
+    want_sig = *sig_name != '\0';
     snprintf(propquery, sizeof propquery, "provider=%s", prov);
     storm_prov = prov;
     storm_dig = dig_name;
@@ -458,16 +506,22 @@ int main(int argc, char **argv)
         return 2;
     }
     md = EVP_MD_fetch(NULL, dig_name, propquery);
-    sig = EVP_SIGNATURE_fetch(NULL, sig_name, propquery);
-    if (md == NULL || sig == NULL) {
+    sig = want_sig ? EVP_SIGNATURE_fetch(NULL, sig_name, propquery) : NULL;
+    if (md == NULL || (want_sig && sig == NULL)) {
         fprintf(stderr, "evp_driver: spike fetch failed\n");
         return 2;
     }
     n1 = OSSL_PROVIDER_get0_name(EVP_MD_get0_provider(md));
-    n2 = OSSL_PROVIDER_get0_name(EVP_SIGNATURE_get0_provider(sig));
-    fprintf(stderr, "provider[digest]=%s\nprovider[sign]=%s\n", n1, n2);
-    if (strcmp(n1, prov) != 0 || strcmp(n2, prov) != 0)
+    fprintf(stderr, "provider[digest]=%s\n", n1);
+    if (strcmp(n1, prov) != 0)
         return 2;
+    if (want_sig) {
+        n2 = OSSL_PROVIDER_get0_name(EVP_SIGNATURE_get0_provider(sig));
+        fprintf(stderr, "provider[sign]=%s\n", n2);
+        if (strcmp(n2, prov) != 0)
+            return 2;
+    }
+    query_all_rounds(NULL, prov);
 
     memset(input, 0xA5, sizeof input);
     if (strcmp(alg, "digest") == 0)
@@ -504,13 +558,16 @@ int main(int argc, char **argv)
             return 2;
         p2 = OSSL_PROVIDER_load(ctx2, prov);
         md2 = EVP_MD_fetch(ctx2, dig_name, propquery);
-        sig2 = EVP_SIGNATURE_fetch(ctx2, sig_name, propquery);
-        if (p2 == NULL || md2 == NULL || sig2 == NULL) {
+        sig2 = want_sig
+            ? EVP_SIGNATURE_fetch(ctx2, sig_name, propquery)
+            : NULL;
+        if (p2 == NULL || md2 == NULL || (want_sig && sig2 == NULL)) {
             fprintf(stderr, "evp_driver: ctx2 refetch failed\n");
             return 2;
         }
         EVP_MD_free(md2);
         EVP_SIGNATURE_free(sig2);
+        query_all_rounds(ctx2, prov);
         /* ctx2/provider intentionally alive: addresses must stay stable. */
         fprintf(stderr, "REFETCH2=ok\n");
     }

@@ -1,0 +1,67 @@
+{
+  "table_version": 1,
+  "entries": [
+    {
+      "build_id": "b12cd44337cb70619dd290b2396ab5dfcaea230f",
+      "openssl": "4.0.2",
+      "lane": "lane-b",
+      "path": "/opt/openssl-4.0.2/lib64/libcrypto.so",
+      "query_offset": 2402144,
+      "anchor": "OSSL_PROVIDER_available",
+      "anchor_offset": 2401648
+    },
+    {
+      "build_id": "fe2b23167d1c1bfa19c9bb66e93f3d9853c80d65",
+      "openssl": "3.0.22",
+      "lane": "lane-b",
+      "path": "/opt/openssl-3.0.22-x/lib64/libcrypto.so",
+      "query_offset": 2329872,
+      "anchor": "OSSL_PROVIDER_available",
+      "anchor_offset": 2329424
+    },
+    {
+      "build_id": "ac90940e06ba87e5d898c665dd9aea65a8867825",
+      "openssl": "3.0.22",
+      "lane": "lane-a",
+      "path": "/opt/openssl-3.0.22/lib64/libcrypto.so",
+      "query_offset": 2257088,
+      "anchor": "OSSL_PROVIDER_available",
+      "anchor_offset": 2256704
+    },
+    {
+      "build_id": "d9d8c1561b93b54f407968b22c83fbbaefcf6818",
+      "openssl": "4.0.2",
+      "lane": "lane-a",
+      "path": "/opt/openssl-4.0.2-x/lib64/libcrypto.so",
+      "query_offset": 2330640,
+      "anchor": "OSSL_PROVIDER_available",
+      "anchor_offset": 2330240
+    },
+    {
+      "build_id": "b0fbca03b320a88dac2274b371c4e8bd04b9e204",
+      "openssl": "3.5.8",
+      "lane": "lane-c",
+      "path": "/opt/openssl-3.5.8/lib64/libcrypto.so",
+      "query_offset": 2503696,
+      "anchor": "OSSL_PROVIDER_available",
+      "anchor_offset": 2503216
+    }
+  ],
+  "fallback": [
+    {
+      "openssl": "4.0",
+      "anchor": "OSSL_PROVIDER_available",
+      "delta": 496
+    },
+    {
+      "openssl": "3.0",
+      "anchor": "OSSL_PROVIDER_available",
+      "delta": 384
+    },
+    {
+      "openssl": "3.5",
+      "anchor": "OSSL_PROVIDER_available",
+      "delta": 480
+    }
+  ]
+}

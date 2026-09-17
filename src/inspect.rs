@@ -16,6 +16,9 @@ pub fn run(args: &[String]) -> ExitCode {
     let mut settle = 2u64;
     let mut timeout = 30u64;
     let mut marker: Option<String> = None;
+    let mut builtin = false;
+    let mut table: Option<std::path::PathBuf> = None;
+    let mut force_offset: Option<u64> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let val = |it: &mut std::slice::Iter<String>| {
@@ -32,6 +35,17 @@ pub fn run(args: &[String]) -> ExitCode {
                 "--settle" => settle = val(&mut it)?.parse().map_err(|_| "bad --settle")?,
                 "--timeout" => timeout = val(&mut it)?.parse().map_err(|_| "bad --timeout")?,
                 "--marker" => marker = Some(val(&mut it)?),
+                "--builtin" => builtin = true,
+                "--table" => table = Some(val(&mut it)?.into()),
+                "--force-offset" => {
+                    let s = val(&mut it)?;
+                    let n = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X"));
+                    let v = match n {
+                        Some(h) => u64::from_str_radix(h, 16),
+                        None => s.parse::<u64>(),
+                    };
+                    force_offset = Some(v.map_err(|_| "bad --force-offset")?);
+                }
                 _ => return Err(format!("unknown arg {a}")),
             }
             Ok(())
@@ -43,7 +57,7 @@ pub fn run(args: &[String]) -> ExitCode {
     }
     let (Some(pid), Some(provider), Some(object)) = (pid, provider, object) else {
         eprintln!(
-            "usage: osslscope inspect --pid PID --provider SO --object BPF [--out FILE] [--marker M]"
+            "usage: osslscope inspect --pid PID --provider SO --object BPF [--out FILE] [--marker M] [--builtin [--table FILE] [--force-offset N]]"
         );
         return ExitCode::from(2);
     };
@@ -54,6 +68,9 @@ pub fn run(args: &[String]) -> ExitCode {
         settle: Duration::from_secs(settle),
         timeout: Duration::from_secs(timeout),
         cmdline_marker: marker,
+        builtin,
+        table,
+        force_offset,
     };
     match harvest::run(&cfg) {
         Ok(doc) => {

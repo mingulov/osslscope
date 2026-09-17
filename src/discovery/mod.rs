@@ -10,6 +10,7 @@
 //! migrates harvest to multi-link or documents admin for discovery;
 //! the relocation + schema legs are mechanism-independent either way.
 
+pub mod builtin;
 pub mod elf;
 pub mod flavor;
 pub mod harvest;

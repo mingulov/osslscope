@@ -15,6 +15,18 @@
 - R12 layout asserts (`layout_assert.c`) green on all four versions.
 - `inspect --pid` discovery (P1 exit 1): 625-name algorithm registry,
   class-only emission, per-lane goldens (`tests/goldens/`).
+- Built-in provider harvest (P1 exit 2): `inspect --builtin` resolves
+  the core-static query fn via a frozen build-id table with
+  symtab and dynsym-anchor+delta fallback rungs; array-mapped
+  attribution across providers sharing the core wrapper (anonymous
+  runtime-built arrays attributed by implementation; cross-provider
+  twin dedup arbitrated arrival-order-free); containing-file
+  relocation for shared-code rows; PARTIAL docs with coverage
+  counters (`queries_observed`, `zero_row_ops`, `foreign_rows_dropped`,
+  `uninstrumented_ops`) and a frozen reason vocabulary; `alias-audit`
+  grouping by implementation hash. Gate: 100% dumper parity on
+  3.0/3.5/4.0 incl. stripped libs, forced/natural shift cells go
+  PARTIAL with zero rows, per-lane goldens.
 
 ## Initial scaffolding
 
