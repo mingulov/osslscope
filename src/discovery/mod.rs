@@ -14,5 +14,6 @@ pub mod builtin;
 pub mod elf;
 pub mod flavor;
 pub mod harvest;
+pub mod legacy;
 pub mod maps;
 pub mod schema;

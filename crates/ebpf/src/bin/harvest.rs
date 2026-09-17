@@ -29,6 +29,14 @@
 //! Layout constants mirror `kinds::SHAPES` (R12; asserted fail-closed by
 //! `layout_assert.c` against real headers): OSSL_DISPATCH = {u32, pad,
 //! u64} @16B; OSSL_ALGORITHM = 4×u64 @32B.
+//!
+//! P1 exit 3 adds legacy tripwires: `trip_count` (cookie++ only, hot
+//! symbols) and `trip_str` (cookie++ plus the arg0 string, cold
+//! string-bearing entrypoints) share one `TRIP` map keyed by attach
+//! cookie (userspace-defined id space; kernels ≥5.15). Query programs
+//! read their own cookie to count `CALLS` (0) vs `LGCALLS` (1): the
+//! legacy provider's query fn is stage-attached alongside the target
+//! provider's, and userspace partitions rows by array mapping.
 #![no_std]
 #![no_main]
 
@@ -37,6 +45,7 @@ use aya_ebpf::{
     macros::{map, uprobe, uretprobe},
     maps::{HashMap, RingBuf},
     programs::{ProbeContext, RetProbeContext},
+    EbpfContext as _,
 };
 
 /// Must match discovery::harvest Event. 160 bytes, align 8.
@@ -74,6 +83,17 @@ const KIND_INIT_RET: u32 = 1;
 const KIND_QUERY_RET: u32 = 2;
 const KIND_ROW: u32 = 3;
 const KIND_ALG: u32 = 4;
+const KIND_TRIP: u32 = 5;
+
+/// Cold-path tripwire hit: attach cookie + arg0 string (bounded 32B).
+/// 40 bytes; must match discovery::harvest TRIP layout.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct TripEvent {
+    kind: u32,
+    cookie: u32,
+    arg: [u8; 32],
+}
 
 /// core_dispatch.h: provider codes live at 1024+; verified 2026-09-16.
 const OSSL_FUNC_PROVIDER_QUERY_OPERATION: u32 = 1027;
@@ -110,6 +130,14 @@ static TRUNC: HashMap<u32, u64> = HashMap::with_max_entries(64, 0);
 /// emitted on the first hit per array only (liveness + ops-hit).
 #[map]
 static CALLS: HashMap<u32, u64> = HashMap::with_max_entries(64, 0);
+/// Tripwire hits per attach cookie (userspace id space: ENGINE /
+/// meth_new / provider-load / low-level-family probes).
+#[map]
+static TRIP: HashMap<u64, u64> = HashMap::with_max_entries(128, 0);
+/// Non-null query calls per op id on the legacy attachment
+/// (cookie 1); the target provider's stay in CALLS.
+#[map]
+static LGCALLS: HashMap<u32, u64> = HashMap::with_max_entries(64, 0);
 
 fn emit(ev: &Event) {
     if let Some(mut e) = EVENTS.reserve::<Event>(0) {
@@ -125,11 +153,32 @@ fn emit_row(ev: &RowEvent) {
     }
 }
 
-fn take(map: &HashMap<u64, u64>) -> Option<u64> {
-    let key = helpers::bpf_get_current_pid_tgid();
+fn emit_trip(ev: &TripEvent) {
+    if let Some(mut e) = EVENTS.reserve::<TripEvent>(0) {
+        e.write(*ev);
+        e.submit(0);
+    }
+}
+
+fn cookie_of(ctx: &ProbeContext) -> u64 {
+    unsafe { helpers::bpf_get_attach_cookie(ctx.as_ptr()) }
+}
+
+fn bump_trip(cookie: u64) {
+    let cur = unsafe { TRIP.get_ptr(&cookie).map(|p| *p).unwrap_or(0) };
+    let _ = TRIP.insert(cookie, cur.wrapping_add(1), 0);
+}
+
+fn take_key(map: &HashMap<u64, u64>, key: u64) -> Option<u64> {
     let val = unsafe { *map.get_ptr(&key)? };
     let _ = map.remove(&key);
     Some(val)
+}
+
+/// PENDING key namespaced by attach cookie: primary (0) and legacy
+/// (1) attachments share the maps (pid_tgid never sets bit 56+).
+fn pend_key(cookie: u64) -> u64 {
+    helpers::bpf_get_current_pid_tgid() ^ ((cookie + 1) << 56)
 }
 
 fn flag_trunc(op: u32, bit: u64) {
@@ -144,14 +193,17 @@ pub fn init_entry(ctx: ProbeContext) -> u32 {
         Some(v) => v,
         None => return 0,
     };
-    let _ = PENDING_INIT.insert(helpers::bpf_get_current_pid_tgid(), out, 0);
+    let _ = PENDING_INIT.insert(pend_key(cookie_of(&ctx)), out, 0);
     0
 }
 
 /// At init-return walk *out for the query op; report its address.
+/// `aux` carries the attach cookie (0 = target provider, 1 = legacy)
+/// so userspace routes stage-2 attaches with the matching cookie.
 #[uretprobe]
 pub fn init_return(ctx: RetProbeContext) -> u32 {
-    let out = match take(&PENDING_INIT) {
+    let cookie = unsafe { helpers::bpf_get_attach_cookie(ctx.as_ptr()) };
+    let out = match take_key(&PENDING_INIT, pend_key(cookie)) {
         Some(v) => v,
         None => return 0,
     };
@@ -184,12 +236,55 @@ pub fn init_return(ctx: RetProbeContext) -> u32 {
                 funcid: fid,
                 _pad: 0,
                 addr: fptr,
-                aux: 0,
+                aux: cookie,
                 name: [0; 128],
             });
             return 0;
         }
     }
+    0
+}
+
+/// Hot tripwire: count the hit, no ring traffic.
+#[uprobe]
+pub fn trip_count(ctx: ProbeContext) -> u32 {
+    bump_trip(cookie_of(&ctx));
+    0
+}
+
+fn trip_str_at(ctx: &ProbeContext, n: usize) {
+    let c = cookie_of(ctx);
+    bump_trip(c);
+    let s: u64 = match ctx.arg(n) {
+        Some(v) => v,
+        None => return,
+    };
+    if s == 0 {
+        return;
+    }
+    let mut arg = [0u8; 32];
+    if unsafe { helpers::bpf_probe_read_user_str_bytes(s as *const u8, &mut arg) }.is_err() {
+        return;
+    }
+    emit_trip(&TripEvent {
+        kind: KIND_TRIP,
+        cookie: c as u32,
+        arg,
+    });
+}
+
+/// Cold string-bearing tripwire, arg0 flavor (`ENGINE_by_id(id)`).
+#[uprobe]
+pub fn trip_str0(ctx: ProbeContext) -> u32 {
+    trip_str_at(&ctx, 0);
+    0
+}
+
+/// Cold string-bearing tripwire, arg1 flavor
+/// (`OSSL_PROVIDER_load(libctx, name)`).
+#[uprobe]
+pub fn trip_str1(ctx: ProbeContext) -> u32 {
+    trip_str_at(&ctx, 1);
     0
 }
 
@@ -202,7 +297,7 @@ pub fn query_entry(ctx: ProbeContext) -> u32 {
         Some(v) => v,
         None => return 0,
     };
-    let _ = PENDING_QUERY.insert(helpers::bpf_get_current_pid_tgid(), op, 0);
+    let _ = PENDING_QUERY.insert(pend_key(cookie_of(&ctx)), op, 0);
     0
 }
 
@@ -243,7 +338,9 @@ fn walk_dispatch(imp: u64, op: u32, arr: u64, j: u64) -> bool {
 /// mid-array). OSSL_ALGORITHM = { names, props, impl, desc } @32B.
 #[uretprobe]
 pub fn query_return(ctx: RetProbeContext) -> u32 {
-    let op = match take(&PENDING_QUERY) {
+    // Cookie 1 = legacy attachment: its calls stay out of CALLS.
+    let cookie = unsafe { helpers::bpf_get_attach_cookie(ctx.as_ptr()) };
+    let op = match take_key(&PENDING_QUERY, pend_key(cookie)) {
         Some(v) => v,
         None => return 0,
     };
@@ -251,8 +348,14 @@ pub fn query_return(ctx: RetProbeContext) -> u32 {
     if rv == 0 {
         return 0;
     }
-    let calls = unsafe { CALLS.get_ptr(&(op as u32)).map(|p| *p).unwrap_or(0) };
-    let _ = CALLS.insert(op as u32, calls.wrapping_add(1), 0);
+    let legacy = cookie == 1;
+    if legacy {
+        let calls = unsafe { LGCALLS.get_ptr(&(op as u32)).map(|p| *p).unwrap_or(0) };
+        let _ = LGCALLS.insert(op as u32, calls.wrapping_add(1), 0);
+    } else {
+        let calls = unsafe { CALLS.get_ptr(&(op as u32)).map(|p| *p).unwrap_or(0) };
+        let _ = CALLS.insert(op as u32, calls.wrapping_add(1), 0);
+    }
     let key = helpers::bpf_get_current_pid_tgid() ^ rv;
     let count = unsafe { QUERY_NEXT.get_ptr(&key).map(|p| *p).unwrap_or(0) };
     let j = count % MAX_ALGS;

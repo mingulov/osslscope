@@ -17,6 +17,7 @@ pub fn run(args: &[String]) -> ExitCode {
     let mut timeout = 30u64;
     let mut marker: Option<String> = None;
     let mut builtin = false;
+    let mut legacy = false;
     let mut table: Option<std::path::PathBuf> = None;
     let mut force_offset: Option<u64> = None;
     let mut it = args.iter();
@@ -36,6 +37,7 @@ pub fn run(args: &[String]) -> ExitCode {
                 "--timeout" => timeout = val(&mut it)?.parse().map_err(|_| "bad --timeout")?,
                 "--marker" => marker = Some(val(&mut it)?),
                 "--builtin" => builtin = true,
+                "--legacy" => legacy = true,
                 "--table" => table = Some(val(&mut it)?.into()),
                 "--force-offset" => {
                     let s = val(&mut it)?;
@@ -57,7 +59,7 @@ pub fn run(args: &[String]) -> ExitCode {
     }
     let (Some(pid), Some(provider), Some(object)) = (pid, provider, object) else {
         eprintln!(
-            "usage: osslscope inspect --pid PID --provider SO --object BPF [--out FILE] [--marker M] [--builtin [--table FILE] [--force-offset N]]"
+            "usage: osslscope inspect --pid PID --provider SO --object BPF [--out FILE] [--marker M] [--builtin [--table FILE] [--force-offset N]] [--legacy]"
         );
         return ExitCode::from(2);
     };
@@ -69,6 +71,7 @@ pub fn run(args: &[String]) -> ExitCode {
         timeout: Duration::from_secs(timeout),
         cmdline_marker: marker,
         builtin,
+        legacy,
         table,
         force_offset,
     };

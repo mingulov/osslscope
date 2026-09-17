@@ -27,6 +27,33 @@ pub fn dynsym_file_offset(elf_bytes: &[u8], want: &str) -> anyhow::Result<u64> {
         .ok_or_else(|| anyhow::anyhow!("{want} vaddr {vaddr:#x} outside PT_LOAD"))
 }
 
+/// Defined dynamic FUNC symbols as (name, file offset), sorted and
+/// deduped. Tripwire building block: prefix matching needs the full
+/// set, and uprobes only fire on code (OBJECT/NOTYPE matches would
+/// attach to data that can never execute).
+pub fn dynsym_func_entries(elf_bytes: &[u8]) -> anyhow::Result<Vec<(String, u64)>> {
+    let obj = goblin::Object::parse(elf_bytes)?;
+    let goblin::Object::Elf(elf) = obj else {
+        bail!("object is not an ELF object")
+    };
+    let mut out = Vec::new();
+    for sym in elf.dynsyms.iter() {
+        if sym.st_shndx == 0 || sym.st_type() != goblin::elf::sym::STT_FUNC {
+            continue;
+        }
+        let (Some(name), Some(off)) = (
+            elf.dynstrtab.get_at(sym.st_name),
+            vaddr_to_offset(&elf, sym.st_value),
+        ) else {
+            continue;
+        };
+        out.push((name.to_string(), off));
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
 /// Translate a link-time vaddr to a file offset via the LOAD map.
 pub fn vaddr_to_offset(elf: &goblin::elf::Elf, vaddr: u64) -> Option<u64> {
     elf.program_headers
@@ -257,5 +284,15 @@ mod tests {
         assert_eq!(max_openssl_version(s.iter().copied()), None);
         let s: [&str; 0] = [];
         assert_eq!(max_openssl_version(s.iter().copied()), None);
+    }
+
+    #[test]
+    fn dynsym_func_entries_sorted_unique_bounded() {
+        let b = libc_bytes();
+        let entries = super::dynsym_func_entries(&b).unwrap();
+        assert!(!entries.is_empty());
+        assert!(entries.windows(2).all(|w| w[0] <= w[1]));
+        assert!(entries.iter().all(|(_, o)| *o < b.len() as u64));
+        assert!(entries.iter().any(|(n, _)| n == "printf"));
     }
 }
