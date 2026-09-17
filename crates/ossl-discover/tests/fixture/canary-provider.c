@@ -2,21 +2,49 @@
  * names that must NEVER appear in inspect output (registry-class at
  * emission maps them to "other"). 13 dispatch entries total (7+6).
  * Digest: "canary-DOOM-7QZ". Signature: "SPIKE-SECRET-9QZ".
- * Dispatch sets mirror min-provider (fetch requires them complete). */
+ * Dispatch sets mirror min-provider (fetch requires them complete).
+ * Every callback appends "ALG:funcid:FUNC" to $SPIKE_COUNTER_FILE
+ * (same oracle as min-provider; P2 exactness gates join on funcid).
+ * -DCANARY_NO_COUNT compiles the counting out (overhead runs). */
+#include <stdio.h>
 #include <stdlib.h>
 #include <openssl/core.h>
 #include <openssl/core_dispatch.h>
 #include <openssl/core_names.h>
 #include <openssl/params.h>
 
+static void canary_count(const char *alg, int funcid, const char *func)
+{
+#ifdef CANARY_NO_COUNT
+    (void)alg; (void)funcid; (void)func;
+    return;
+#else
+    const char *path = getenv("SPIKE_COUNTER_FILE");
+    FILE *f;
+
+    if (path == NULL || *path == '\0')
+        path = "/tmp/spike-counters.log";
+    f = fopen(path, "a");
+    if (f == NULL)
+        return;
+    fprintf(f, "%s:%d:%s\n", alg, funcid, func);
+    fclose(f);
+#endif
+}
+
+#define CANARY_DIGEST "canary-DOOM-7QZ"
+#define CANARY_SIG "SPIKE-SECRET-9QZ"
+
 static void *c_newctx(void *provctx)
 {
     (void)provctx;
+    canary_count(CANARY_DIGEST, OSSL_FUNC_DIGEST_NEWCTX, "newctx");
     return malloc(1);
 }
 
 static void c_freectx(void *ctx)
 {
+    canary_count(CANARY_DIGEST, OSSL_FUNC_DIGEST_FREECTX, "freectx");
     free(ctx);
 }
 
@@ -24,6 +52,7 @@ static int c_init(void *ctx, const OSSL_PARAM params[])
 {
     (void)ctx;
     (void)params;
+    canary_count(CANARY_DIGEST, OSSL_FUNC_DIGEST_INIT, "init");
     return 1;
 }
 
@@ -32,6 +61,7 @@ static int c_update(void *ctx, const unsigned char *in, size_t len)
     (void)ctx;
     (void)in;
     (void)len;
+    canary_count(CANARY_DIGEST, OSSL_FUNC_DIGEST_UPDATE, "update");
     return 1;
 }
 
@@ -41,6 +71,7 @@ static int c_final(void *ctx, unsigned char *out, size_t *outl, size_t outsz)
     (void)out;
     (void)outsz;
     *outl = 0;
+    canary_count(CANARY_DIGEST, OSSL_FUNC_DIGEST_FINAL, "final");
     return 1;
 }
 
@@ -53,12 +84,14 @@ static const OSSL_PARAM c_gettable[] = {
 static const OSSL_PARAM *c_gettable_params(void *provctx)
 {
     (void)provctx;
+    canary_count(CANARY_DIGEST, OSSL_FUNC_DIGEST_GETTABLE_PARAMS, "gettable_params");
     return c_gettable;
 }
 
 static int c_get_params(OSSL_PARAM params[])
 {
     OSSL_PARAM *p;
+    canary_count(CANARY_DIGEST, OSSL_FUNC_DIGEST_GET_PARAMS, "get_params");
     p = OSSL_PARAM_locate(params, OSSL_DIGEST_PARAM_BLOCK_SIZE);
     if (p != NULL && !OSSL_PARAM_set_size_t(p, 64))
         return 0;
@@ -72,11 +105,13 @@ static void *c_sig_newctx(void *provctx, const char *propq)
 {
     (void)provctx;
     (void)propq;
+    canary_count(CANARY_SIG, OSSL_FUNC_SIGNATURE_NEWCTX, "newctx");
     return malloc(1);
 }
 
 static void c_sig_freectx(void *ctx)
 {
+    canary_count(CANARY_SIG, OSSL_FUNC_SIGNATURE_FREECTX, "freectx");
     free(ctx);
 }
 
@@ -85,6 +120,7 @@ static int c_sign_init(void *ctx, void *provkey, const OSSL_PARAM params[])
     (void)ctx;
     (void)provkey;
     (void)params;
+    canary_count(CANARY_SIG, OSSL_FUNC_SIGNATURE_SIGN_INIT, "sign_init");
     return 1;
 }
 
@@ -97,6 +133,7 @@ static int c_sign(void *ctx, unsigned char *sig, size_t *siglen,
     (void)tbs;
     (void)tbslen;
     *siglen = 0;
+    canary_count(CANARY_SIG, OSSL_FUNC_SIGNATURE_SIGN, "sign");
     return 1;
 }
 
@@ -105,6 +142,7 @@ static int c_verify_init(void *ctx, void *provkey, const OSSL_PARAM params[])
     (void)ctx;
     (void)provkey;
     (void)params;
+    canary_count(CANARY_SIG, OSSL_FUNC_SIGNATURE_VERIFY_INIT, "verify_init");
     return 1;
 }
 
@@ -116,6 +154,7 @@ static int c_verify(void *ctx, const unsigned char *sig, size_t siglen,
     (void)siglen;
     (void)tbs;
     (void)tbslen;
+    canary_count(CANARY_SIG, OSSL_FUNC_SIGNATURE_VERIFY, "verify");
     return 1;
 }
 
