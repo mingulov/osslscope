@@ -707,6 +707,26 @@ pub fn run_detailed(
                     // provider, 1 = legacy.
                     let cookie = u64at(24);
                     if attached_queries.contains(&cookie) {
+                        // Re-pretouch on repeat inits (unload/reload
+                        // cycles): the new mapping's pages are cold and
+                        // nofault BPF reads fail on them (exit-8 P4:
+                        // 3.x TRUNC_WALK_NAME on the reload query).
+                        // Best-effort, never fatal.
+                        let addr = u64at(16);
+                        if let Ok(live) = maps::read_maps(cfg.pid) {
+                            let path = if cookie == LEGACY_COOKIE {
+                                live.iter()
+                                    .find(|m| {
+                                        m.start <= addr && addr < m.end && m.ino != 0
+                                    })
+                                    .map(|m| PathBuf::from(&m.path))
+                            } else {
+                                Some(cfg.provider.clone())
+                            };
+                            if let Some(p) = path {
+                                pretouch_mappings(pid.get(), &live, &p, &canon);
+                            }
+                        }
                         continue;
                     }
                     if cookie == 0 {
