@@ -438,18 +438,29 @@ static int read_go(void)
 int main(int argc, char **argv)
 {
     int nthreads = 4;
-    int i;
+    int rounds = 1;
+    int i, r;
 
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-threads") == 0 && i + 1 < argc)
             nthreads = atoi(argv[++i]);
+    }
+    /* Spawn-mode looping: run the lanes N rounds so count windows
+     * observe executions (one-shot lanes would all land pre-window
+     * and the spawn cell would be vacuous). */
+    if (getenv("CANARY_ROUNDS") != NULL) {
+        rounds = atoi(getenv("CANARY_ROUNDS"));
+        if (rounds < 1)
+            rounds = 1;
+        if (rounds > 999)
+            rounds = 999;
     }
     printf("PID=%d\n", (int)getpid());
     fflush(stdout);
     if (!read_go())
         return 0;
     /* Workers first: main lanes run while stack sentinels are live. */
-    {
+    for (r = 0; r < rounds; r++) {
         pthread_t *tids = calloc((size_t)(nthreads > 0 ? nthreads : 1),
                                  sizeof *tids);
         int n = nthreads < 1 ? 1 : (nthreads > 16 ? 16 : nthreads);
@@ -486,9 +497,9 @@ int main(int argc, char **argv)
             LANE_FAIL("threads");
         else
             LANE_OK("threads");
+        printf("CANARYDONE fails=%d round=%d\n", fails, r);
+        fflush(stdout);
     }
-    printf("CANARYDONE fails=%d\n", fails);
-    fflush(stdout);
     read_go();
     return fails ? 2 : 0;
 }
