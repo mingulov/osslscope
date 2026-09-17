@@ -76,7 +76,7 @@ fn pretouch_mappings(pid: u32, live: &[maps::Mapping], path: &Path, canon: &str)
                 &local,
                 1,
                 remote.as_ptr(),
-                remote.len(),
+                remote.len() as libc::c_ulong,
                 0,
             )
         };
