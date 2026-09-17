@@ -88,6 +88,9 @@ pub struct Counters {
     pub drain_shortfall: u64,
     pub uninstrumented_ops: u64,
     pub fork_exec_ignored: u64,
+    /// Windows expired while the target lived (0/1): post-window
+    /// executions unobserved — over-budget PARTIAL (P2 exit-3).
+    pub over_budget: u64,
 }
 
 /// One counted identity (current generation, all CPUs folded).
@@ -950,9 +953,11 @@ pub fn run(cfg: &Config, target: Target) -> anyhow::Result<Capture> {
 
     // Poll loop: expiry / signal / death / fence.
     let mut interrupted_flag = false;
+    let mut expired = false;
     loop {
         let now = Instant::now();
         if now >= engine.window_end {
+            expired = true;
             break;
         }
         if interrupted() {
@@ -1006,6 +1011,32 @@ pub fn run(cfg: &Config, target: Target) -> anyhow::Result<Capture> {
     program(&engine.loaded, "TARGET", &0u64.to_le_bytes())?;
     let actual = engine.window_start.elapsed();
     eprintln!("CAPTURE window closed after={:.1}s", actual.as_secs_f64());
+    // Over-budget (P2 exit-3): the window expired while the target
+    // lived → PARTIAL + counter, never silent truncation. A spawn
+    // reaped here died in the last poll slice — its full lifetime
+    // was observed, so it is NOT over-budget (child_exit records
+    // the code as usual).
+    if expired {
+        let alive = if spawn {
+            match child_status(pid) {
+                Some(code) => {
+                    engine.child_exit = Some(code);
+                    false
+                }
+                None => true,
+            }
+        } else {
+            engine
+                .pin
+                .as_ref()
+                .map(|p| p.verify().is_ok())
+                .unwrap_or(false)
+        };
+        if alive {
+            engine.counters.over_budget += 1;
+            engine.reason("over-budget");
+        }
+    }
     // One last ppid sweep at window end (§7).
     for kid in children_of(pid) {
         if engine.children_seen.insert(kid) {

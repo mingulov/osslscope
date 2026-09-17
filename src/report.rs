@@ -173,6 +173,7 @@ fn doc(c: &capture::Capture) -> serde_json::Value {
                 "drain_shortfall": k.drain_shortfall,
                 "uninstrumented_ops": k.uninstrumented_ops,
                 "fork_exec_ignored": k.fork_exec_ignored,
+                "over_budget": k.over_budget,
             },
         },
         "executions": executions,
@@ -226,6 +227,7 @@ fn human(c: &capture::Capture) -> String {
         ("shortfall", k.drain_shortfall),
         ("uninstrumented_ops", k.uninstrumented_ops),
         ("fork_ignored", k.fork_exec_ignored),
+        ("over_budget", k.over_budget),
     ] {
         if v > 0 {
             nz.push(format!("{name}={v}"));
