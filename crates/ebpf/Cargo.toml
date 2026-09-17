@@ -23,3 +23,7 @@ codegen-units = 1
 [[bin]]
 name = "osslscope-harvest"
 path = "src/bin/harvest.rs"
+
+[[bin]]
+name = "osslscope-count"
+path = "src/bin/count.rs"

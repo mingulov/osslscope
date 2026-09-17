@@ -15,9 +15,13 @@ use std::io;
 use std::os::fd::{FromRawFd as _, OwnedFd, RawFd};
 
 pub const BPF_MAP_CREATE: u32 = 0;
+pub const BPF_MAP_UPDATE_ELEM: u32 = 2;
 pub const BPF_PROG_LOAD: u32 = 5;
 pub const BPF_LINK_CREATE: u32 = 28;
 pub const BPF_TOKEN_CREATE: u32 = 36;
+/// `BPF_MAP_UPDATE_ELEM` flags (create-or-update / must-create).
+pub const BPF_ANY: u64 = 0;
+pub const BPF_NOEXIST: u64 = 1;
 pub const BPF_PROG_TYPE_KPROBE: u32 = 2;
 pub const BPF_MAP_TYPE_ARRAY: u32 = 2;
 pub const BPF_MAP_TYPE_RINGBUF: u32 = 27;
@@ -105,6 +109,17 @@ struct TokenAttr {
     bpffs_fd: u32,
 }
 
+/// `BPF_MAP_*_ELEM` attr: map_fd@0, key@8, value@16, flags@24
+/// (offsets verified against `linux/bpf.h`).
+#[repr(C)]
+struct ElemAttr {
+    map_fd: u32,
+    _pad: u32,
+    key: u64,
+    value: u64,
+    flags: u64,
+}
+
 fn bpf(cmd: u32, attr: *mut std::ffi::c_void, size: usize) -> io::Result<i32> {
     // SAFETY: raw bpf() with a caller-sized attr; exactly what libbpf does.
     let ret = unsafe { libc::syscall(libc::SYS_bpf, cmd as libc::c_long, attr, size) };
@@ -144,6 +159,26 @@ pub fn map_create(
     )?;
     // SAFETY: bpf() returned a fresh owned fd.
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Update one map element (`GEN`/`TARGET` programming). `flags` is
+/// `BPF_ANY` (create-or-update) or `BPF_NOEXIST` (must-create).
+pub fn map_update_elem(map_fd: RawFd, key: &[u8], value: &[u8], flags: u64) -> io::Result<()> {
+    let mut attr: ElemAttr = zeroed();
+    debug_assert_eq!(size_of::<ElemAttr>(), 32);
+    debug_assert_eq!(std::mem::offset_of!(ElemAttr, key), 8);
+    debug_assert_eq!(std::mem::offset_of!(ElemAttr, value), 16);
+    debug_assert_eq!(std::mem::offset_of!(ElemAttr, flags), 24);
+    attr.map_fd = map_fd as u32;
+    attr.key = key.as_ptr() as u64;
+    attr.value = value.as_ptr() as u64;
+    attr.flags = flags;
+    bpf(
+        BPF_MAP_UPDATE_ELEM,
+        std::ptr::addr_of_mut!(attr).cast(),
+        size_of::<ElemAttr>(),
+    )?;
+    Ok(())
 }
 
 /// Load a KPROBE-typed program (uprobe family). `insns` is raw 8B-stride

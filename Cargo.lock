@@ -233,6 +233,7 @@ dependencies = [
  "goblin",
  "libc",
  "ossl-bpf-sys",
+ "osslscope-ebpf-common",
  "serde",
  "serde_json",
  "sha2",

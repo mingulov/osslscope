@@ -118,6 +118,50 @@ pub const HARVEST_MAPS: [MapSpec; 8] = [
     },
 ];
 
+/// Frozen capture shape (keyed-design §2): dims asserted vs the
+/// object by `prepare`, fail-closed on drift. Read off the built
+/// `osslscope-count` object (maps-section records).
+pub const COUNT_MAPS: [MapSpec; 4] = [
+    MapSpec {
+        name: "COUNTS",
+        map_type: 5,
+        key_size: 8,
+        value_size: 24,
+        max_entries: 8192,
+        flags: 0,
+    },
+    MapSpec {
+        name: "GEN",
+        map_type: 2,
+        key_size: 4,
+        value_size: 4,
+        max_entries: 1,
+        flags: 0,
+    },
+    MapSpec {
+        name: "TARGET",
+        map_type: 2,
+        key_size: 4,
+        value_size: 8,
+        max_entries: 1,
+        flags: 0,
+    },
+    MapSpec {
+        name: "DROPFAIL",
+        map_type: 6,
+        key_size: 4,
+        value_size: 8,
+        max_entries: 1,
+        flags: 0,
+    },
+];
+
+/// Frozen capture programs: entry-only counting (v1).
+pub const COUNT_PROGS: [ProgSpec; 1] = [ProgSpec {
+    name: "count_entry",
+    section: "uprobe",
+}];
+
 /// Frozen harvest programs: the init/query entry+return pairs plus
 /// the three entry-only tripwire counters.
 pub const HARVEST_PROGS: [ProgSpec; 7] = [
