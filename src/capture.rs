@@ -563,6 +563,14 @@ fn read_files(live: &[maps::Mapping]) -> HashMap<String, Vec<u8>> {
     out
 }
 
+/// (dev, ino) backing of a harvest row, if present.
+fn backing_of(r: &serde_json::Value) -> Option<(String, u64)> {
+    let b = r.get("backing")?;
+    let dev = b.get("dev")?.as_str()?.to_string();
+    let ino = b.get("ino")?.as_u64()?;
+    Some((dev, ino))
+}
+
 fn comm_of(pid: u32) -> String {
     std::fs::read_to_string(format!("/proc/{pid}/comm"))
         .map(|s| s.trim().to_string())
@@ -832,14 +840,21 @@ impl<'a> Engine<'a> {
             }
         }
         // Re-plan over the mapped union (initial + cached rows).
+        // Rows whose file is currently UNMAPPED are dormant, not
+        // missed (their probes persist on the inode; the load fence
+        // re-adds them) — excluding them here is what keeps
+        // unload-fence re-plans from crying missed-attaches.
+        let mapped: HashSet<(String, u64)> =
+            live_now.iter().map(|m| (m.dev.clone(), m.ino)).collect();
         let mut basis_rows: Vec<serde_json::Value> = self
             .harvest_doc
             .get("rows")
             .and_then(|r| r.as_array())
             .cloned()
-            .unwrap_or_default();
-        let mapped: HashSet<(String, u64)> =
-            live_now.iter().map(|m| (m.dev.clone(), m.ino)).collect();
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| backing_of(r).is_some_and(|b| mapped.contains(&b)))
+            .collect();
         for ((dev, ino), rows) in &self.row_cache {
             if mapped.contains(&(dev.clone(), *ino)) {
                 basis_rows.extend(rows.iter().cloned());
@@ -869,8 +884,15 @@ impl<'a> Engine<'a> {
             })
             .collect();
         executions.sort_by_key(|e| e.cookie);
-        // P1 inventory depth carried over the mapped union.
-        let covered: HashSet<u32> = executions.iter().map(|e| e.id.op).collect();
+        // P1 inventory depth carried over the mapped union: current
+        // executions PLUS fenced detail (a window that closes
+        // mid-churn holds most of its coverage in stale buckets).
+        let mut covered: HashSet<u32> = executions.iter().map(|e| e.id.op).collect();
+        for s in &self.stale {
+            for d in &s.detail {
+                covered.insert(d.id.op);
+            }
+        }
         let uninstrumented = kinds::OPS
             .iter()
             .filter(|op| !covered.contains(&op.id))
@@ -1044,13 +1066,7 @@ pub fn run(cfg: &Config, target: Target) -> anyhow::Result<Capture> {
     }
     // Seed the row cache with the initial rows per backing file.
     for r in &rows {
-        if let Some(b) = r.get("backing") {
-            let dev = b
-                .get("dev")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let ino = b.get("ino").and_then(|v| v.as_u64()).unwrap_or(0);
+        if let Some((dev, ino)) = backing_of(r) {
             engine.harvested.insert((dev.clone(), ino));
             engine
                 .row_cache
