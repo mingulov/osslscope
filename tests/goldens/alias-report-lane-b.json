@@ -3,22 +3,22 @@
   "grouped_rows": 14,
   "groups": [
     {
-      "addr_hash": "0152b73c355439c7",
+      "addr_hash": "512b3c194b1a318f",
       "members": [
         {
           "alg_class": "other",
-          "funcid": 3,
+          "funcid": 11,
           "op": 1
         },
         {
           "alg_class": "other",
-          "funcid": 3,
+          "funcid": 11,
           "op": 1
         }
       ]
     },
     {
-      "addr_hash": "10093617fb4f9987",
+      "addr_hash": "5e7857de6844a219",
       "members": [
         {
           "alg_class": "other",
@@ -33,52 +33,7 @@
       ]
     },
     {
-      "addr_hash": "3305d0d24d4bf121",
-      "members": [
-        {
-          "alg_class": "other",
-          "funcid": 8,
-          "op": 1
-        },
-        {
-          "alg_class": "other",
-          "funcid": 8,
-          "op": 1
-        }
-      ]
-    },
-    {
-      "addr_hash": "69d65b7675483816",
-      "members": [
-        {
-          "alg_class": "other",
-          "funcid": 1,
-          "op": 1
-        },
-        {
-          "alg_class": "other",
-          "funcid": 1,
-          "op": 1
-        }
-      ]
-    },
-    {
-      "addr_hash": "925fcac10e2a13f4",
-      "members": [
-        {
-          "alg_class": "other",
-          "funcid": 2,
-          "op": 1
-        },
-        {
-          "alg_class": "other",
-          "funcid": 2,
-          "op": 1
-        }
-      ]
-    },
-    {
-      "addr_hash": "b5a1465bf721769b",
+      "addr_hash": "6db3f5bd6b89b33f",
       "members": [
         {
           "alg_class": "other",
@@ -93,16 +48,61 @@
       ]
     },
     {
-      "addr_hash": "f101b32e222acdfd",
+      "addr_hash": "870b5dbc75cf175a",
       "members": [
         {
           "alg_class": "other",
-          "funcid": 11,
+          "funcid": 2,
           "op": 1
         },
         {
           "alg_class": "other",
-          "funcid": 11,
+          "funcid": 2,
+          "op": 1
+        }
+      ]
+    },
+    {
+      "addr_hash": "8f6861936d621a76",
+      "members": [
+        {
+          "alg_class": "other",
+          "funcid": 3,
+          "op": 1
+        },
+        {
+          "alg_class": "other",
+          "funcid": 3,
+          "op": 1
+        }
+      ]
+    },
+    {
+      "addr_hash": "b72d0581ba5a6034",
+      "members": [
+        {
+          "alg_class": "other",
+          "funcid": 1,
+          "op": 1
+        },
+        {
+          "alg_class": "other",
+          "funcid": 1,
+          "op": 1
+        }
+      ]
+    },
+    {
+      "addr_hash": "fdf69218860ec6c1",
+      "members": [
+        {
+          "alg_class": "other",
+          "funcid": 8,
+          "op": 1
+        },
+        {
+          "alg_class": "other",
+          "funcid": 8,
           "op": 1
         }
       ]
