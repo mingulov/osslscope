@@ -48,7 +48,7 @@ int main(void)
 {
     OSSL_LIB_CTX *ctx2;
     OSSL_PROVIDER *p2;
-    int rc;
+    int rc, i;
 
     fprintf(stderr, "PID=%d\n", (int)getpid());
     rc = want_go("GO1");
@@ -66,22 +66,27 @@ int main(void)
         return 0;
     if (rc != 0)
         return 1;
-    /* Fresh-libctx refetch (re-query deterministically post-attach;
-     * same addrs — deduped, proving observation stability). */
-    ctx2 = OSSL_LIB_CTX_new();
-    if (ctx2 == NULL)
-        return 2;
-    p2 = OSSL_PROVIDER_load(ctx2, "lying");
-    if (p2 == NULL) {
-        fprintf(stderr, "lying_driver: GO2 load failed\n");
+    /* Fresh-libctx refetches (re-query deterministically
+     * post-attach; same addrs — deduped, proving observation
+     * stability). TWO rounds (6 queries): GO1 races the stage-2
+     * attach and is routinely missed, and the 4-alg array needs 4+
+     * post-attach queries for full rotation coverage on its own. */
+    for (i = 0; i < 2; i++) {
+        ctx2 = OSSL_LIB_CTX_new();
+        if (ctx2 == NULL)
+            return 2;
+        p2 = OSSL_PROVIDER_load(ctx2, "lying");
+        if (p2 == NULL) {
+            fprintf(stderr, "lying_driver: GO2 load failed\n");
+            OSSL_LIB_CTX_free(ctx2);
+            return 2;
+        }
+        if (fetch_all(ctx2, "GO2") != 0) {
+            OSSL_LIB_CTX_free(ctx2);
+            return 2;
+        }
         OSSL_LIB_CTX_free(ctx2);
-        return 2;
     }
-    if (fetch_all(ctx2, "GO2") != 0) {
-        OSSL_LIB_CTX_free(ctx2);
-        return 2;
-    }
-    OSSL_LIB_CTX_free(ctx2);
     fprintf(stderr, "REFETCH2=ok\n");
     if (want_go("EOF") < 0)
         return 0;

@@ -412,6 +412,7 @@ int main(int argc, char **argv)
     const char *alg = NULL;
     const char *prov;
     const char *dig_name, *sig_name;
+    const char *dig2_name, *sig2_name;
     char propquery[128];
     int i, times, rc;
     EVP_MD *md;
@@ -495,6 +496,17 @@ int main(int argc, char **argv)
     if (sig_name == NULL)
         sig_name = "SPIKE-SIG";
     want_sig = *sig_name != '\0';
+    /* Second-alg names for the GO2 refetch (empty = skip): distinct
+     * names miss the method store, forcing one more post-attach
+     * query per op so GO2 alone covers multi-alg arrays (GO1 races
+     * the stage-2 attach and is routinely missed — exit-1
+     * hardening, 2026-09-17). */
+    dig2_name = getenv("SPIKE_DIGEST2");
+    if (dig2_name == NULL)
+        dig2_name = "";
+    sig2_name = getenv("SPIKE_SIG2");
+    if (sig2_name == NULL)
+        sig2_name = "";
     snprintf(propquery, sizeof propquery, "provider=%s", prov);
     storm_prov = prov;
     storm_dig = dig_name;
@@ -567,6 +579,25 @@ int main(int argc, char **argv)
         }
         EVP_MD_free(md2);
         EVP_SIGNATURE_free(sig2);
+        if (*dig2_name != '\0') {
+            EVP_MD *md2b = EVP_MD_fetch(ctx2, dig2_name, propquery);
+
+            if (md2b == NULL) {
+                fprintf(stderr, "evp_driver: ctx2 refetch2 digest failed\n");
+                return 2;
+            }
+            EVP_MD_free(md2b);
+        }
+        if (want_sig && *sig2_name != '\0') {
+            EVP_SIGNATURE *sig2b =
+                EVP_SIGNATURE_fetch(ctx2, sig2_name, propquery);
+
+            if (sig2b == NULL) {
+                fprintf(stderr, "evp_driver: ctx2 refetch2 sign failed\n");
+                return 2;
+            }
+            EVP_SIGNATURE_free(sig2b);
+        }
         query_all_rounds(ctx2, prov);
         /* ctx2/provider intentionally alive: addresses must stay stable. */
         fprintf(stderr, "REFETCH2=ok\n");

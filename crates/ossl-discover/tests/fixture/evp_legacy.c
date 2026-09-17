@@ -237,6 +237,7 @@ int main(int argc, char **argv)
         OSSL_LIB_CTX *ctx2 = OSSL_LIB_CTX_new();
         OSSL_PROVIDER *p2 = NULL;
         EVP_MD *md2 = NULL;
+        const char *dig2_name = getenv("SPIKE_DIGEST2");
 
         if (ctx2 != NULL) {
             p2 = OSSL_PROVIDER_load(ctx2, prov);
@@ -249,6 +250,19 @@ int main(int argc, char **argv)
             return 2;
         }
         EVP_MD_free(md2);
+        /* Second-alg refetch (skip when unset): one more post-attach
+         * digest query so GO2 alone covers multi-alg arrays (GO1
+         * races the stage-2 attach — same hardening as evp_driver). */
+        if (dig2_name != NULL && *dig2_name != '\0') {
+            EVP_MD *md2b = EVP_MD_fetch(ctx2, dig2_name, propquery);
+
+            if (md2b == NULL) {
+                fprintf(stderr, "evp_legacy: GO2 refetch2 failed\n");
+                OSSL_LIB_CTX_free(ctx2);
+                return 2;
+            }
+            EVP_MD_free(md2b);
+        }
         OSSL_LIB_CTX_free(ctx2);
     }
     if (run_digest(md, 1) != 0 || run_des(1) != 0)
