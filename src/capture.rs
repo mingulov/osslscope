@@ -104,12 +104,25 @@ pub struct Execution {
     pub last_ns: u64,
 }
 
+/// One fenced key's conserved counts (§3 extension: per-key detail
+/// rides WITH the aggregate so exit-2 conservation joins per
+/// identity instead of trusting bare totals).
+#[derive(Debug, Clone)]
+pub struct StaleDetail {
+    pub cookie: u32,
+    pub id: plan::Identity,
+    pub count: u64,
+    pub first_ns: u64,
+    pub last_ns: u64,
+}
+
 /// Fenced generation's counts (aggregate with the generation label, §3).
 #[derive(Debug, Clone)]
 pub struct StaleBucket {
     pub generation: u32,
     pub events: u64,
     pub keys: u64,
+    pub detail: Vec<StaleDetail>,
 }
 
 /// Finished capture window.
@@ -716,15 +729,33 @@ impl<'a> Engine<'a> {
             None,
         )?;
         self.absorb(d);
-        let events = self.current.values().map(|v| v.count).sum();
         eprintln!(
-            "CAPTURE fence kinds={kinds:?} generation={} events={events}",
-            self.generation
+            "CAPTURE fence kinds={kinds:?} generation={} keys={}",
+            self.generation,
+            self.current.len()
         );
+        let mut detail: Vec<StaleDetail> = self
+            .current
+            .iter()
+            .filter_map(|(cookie, v)| {
+                let (id, _) = self.identities.get(cookie)?.clone();
+                Some(StaleDetail {
+                    cookie: *cookie,
+                    id,
+                    count: v.count,
+                    first_ns: v.first_ns,
+                    last_ns: v.last_ns,
+                })
+            })
+            .collect();
+        detail.sort_by_key(|d| d.cookie);
+        // Aggregate FROM the detail (self-consistent by construction).
+        let events = detail.iter().map(|d| d.count).sum();
         self.stale.push(StaleBucket {
             generation: self.generation,
             events,
-            keys: self.current.len() as u64,
+            keys: detail.len() as u64,
+            detail,
         });
         self.current.clear();
         self.generation += 1;

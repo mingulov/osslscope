@@ -180,6 +180,12 @@ fn doc(c: &capture::Capture) -> serde_json::Value {
         "legacy": null,
         "stale": c.stale.iter().map(|s| serde_json::json!({
             "generation": s.generation, "events": s.events, "keys": s.keys,
+            "detail": s.detail.iter().map(|d| serde_json::json!({
+                "cookie": d.cookie,
+                "provider": d.id.provider, "op": d.id.op, "funcid": d.id.funcid,
+                "alg_class": d.id.alg_class, "offset": d.id.offset,
+                "count": d.count, "first_ns": d.first_ns, "last_ns": d.last_ns,
+            })).collect::<Vec<_>>(),
         })).collect::<Vec<_>>(),
         "drain_wall_us": c.drain_wall_us,
     });
