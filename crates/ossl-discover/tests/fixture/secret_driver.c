@@ -499,6 +499,10 @@ int main(int argc, char **argv)
             LANE_OK("threads");
         printf("CANARYDONE fails=%d round=%d\n", fails, r);
         fflush(stdout);
+        /* Pace looped rounds: the gap lets harvest settle after round
+         * 0 (fast cells) while later rounds land inside the window. */
+        if (rounds > 1 && r < rounds - 1)
+            sleep(3);
     }
     read_go();
     return fails ? 2 : 0;
