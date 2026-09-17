@@ -7,6 +7,10 @@
   "rows": [],
   "status": "PARTIAL",
   "trigger_observed": true,
+  "truncated_ops": {
+    "1": 4,
+    "12": 4
+  },
   "uninstrumented_ops": 14,
   "zero_row_ops": [
     1,
