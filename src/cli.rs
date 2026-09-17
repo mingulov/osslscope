@@ -9,15 +9,16 @@ pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
         "doctor" => crate::doctor::run(&argv[1..]),
         "inspect" => crate::inspect::run(&argv[1..]),
         "alias-audit" => crate::aliases::run(&argv[1..]),
-        "report" => crate::doctor::unimplemented("report"),
+        "report" => crate::report::run(&argv[1..]),
         "check" => crate::doctor::unimplemented("check"),
         "help" | "--help" | "-h" => {
             println!("osslscope — non-interposing OpenSSL observer");
-            println!("usage: osslscope <doctor|inspect|alias-audit> [args]");
+            println!("usage: osslscope <doctor|inspect|report|alias-audit> [args]");
             println!("  doctor       preflight: kernel, caps, LSM, target suitability");
             println!("  inspect      dispatch inventory of a live --pid target");
+            println!("  report       keyed execution counts over a window (--pid or run --)");
             println!("  alias-audit  group a harvest doc's rows by shared address");
-            println!("planned: report, check (policy gates land next)");
+            println!("planned: check (policy gates land next)");
             ExitCode::SUCCESS
         }
         "--version" | "-V" => {

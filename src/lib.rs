@@ -14,3 +14,4 @@ pub mod kinds;
 pub mod loader;
 pub mod pin;
 pub mod plan;
+pub mod report;
