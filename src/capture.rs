@@ -571,6 +571,17 @@ fn backing_of(r: &serde_json::Value) -> Option<(String, u64)> {
     Some((dev, ino))
 }
 
+// Exit-4 KAT downgrade: v1 has no KAT discriminator, so any FIPS
+// provider row makes counts unlabeled (self-test calls included).
+fn fips_touched(rows: &[serde_json::Value]) -> bool {
+    // Provider names are .so file stems ("fips.so" -> "fips");
+    // accept a version suffix ("fips.so.3" -> "fips.so").
+    rows.iter().any(|r| {
+        matches!(r.get("provider").and_then(|p| p.as_str()),
+            Some("fips") | Some("fips.so"))
+    })
+}
+
 fn comm_of(pid: u32) -> String {
     std::fs::read_to_string(format!("/proc/{pid}/comm"))
         .map(|s| s.trim().to_string())
@@ -859,6 +870,9 @@ impl<'a> Engine<'a> {
                     if rows.is_empty() {
                         self.reason("reharvest-no-query");
                     } else {
+                        if fips_touched(&rows) {
+                            self.reason("fips-unlabeled");
+                        }
                         self.row_cache.insert((dev, ino), rows);
                     }
                 }
@@ -1105,6 +1119,9 @@ pub fn run(cfg: &Config, target: Target) -> anyhow::Result<Capture> {
         });
         let c = engine.finish(Outcome::Partial, Duration::ZERO);
         return Ok(c);
+    }
+    if fips_touched(&rows) {
+        engine.reason("fips-unlabeled");
     }
     // Seed the row cache with the initial rows per backing file.
     for r in &rows {
@@ -1370,6 +1387,18 @@ mod tests {
             vec![("/lib/x.so", "08:01", 7, Some(99))],
         );
         assert_eq!(detect_fence(&base, &execd), vec![FenceKind::Exec]);
+    }
+
+    #[test]
+    fn fips_caveat_triggers_on_fips_rows_only() {
+        let row = |prov: &str| serde_json::json!({"provider": prov, "op": 1});
+        assert!(fips_touched(&[row("default"), row("fips")]));
+        assert!(!fips_touched(&[row("default"), row("legacy")]));
+        assert!(!fips_touched(&[]));
+        assert!(!fips_touched(&[serde_json::json!({"op": 1})]));
+        // Version-suffixed stem trips; near-misses must not.
+        assert!(fips_touched(&[row("fips.so")]));
+        assert!(!fips_touched(&[row("FIPS"), row("fipsy"), row("myfips")]));
     }
 
     #[test]
