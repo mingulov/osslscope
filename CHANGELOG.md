@@ -13,6 +13,8 @@
 - libcrypto flavor classifier (`discovery/flavor.rs`): OpenSSL 3.x/4.x
   vs BoringSSL/AWS-LC lookalikes from ELF bytes.
 - R12 layout asserts (`layout_assert.c`) green on all four versions.
+- `inspect --pid` discovery (P1 exit 1): 625-name algorithm registry,
+  class-only emission, per-lane goldens (`tests/goldens/`).
 
 ## Initial scaffolding
 
