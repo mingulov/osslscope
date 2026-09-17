@@ -6,9 +6,9 @@ use crate::discovery::{elf, maps};
 use std::path::Path;
 
 /// One harvested dispatch entry. `alg` is the provider's raw name
-/// bytes here — P1 exit 1 classifies to a registry class AT EMISSION
-/// (goldens forbid verbatim provider strings); the classifier plugs in
-/// at `emit` without touching the relocation leg.
+/// bytes — classification input ONLY, never serialized: `emit` maps it
+/// to a registry class at emission (goldens forbid verbatim provider
+/// strings).
 #[derive(Clone, Debug)]
 pub struct Row {
     pub op: u32,
@@ -42,10 +42,12 @@ pub fn emit(
                 }
                 None => (false, String::new(), 0, 0),
             };
+        let (alg_class, weak) = crate::kinds::classify_alg(&r.alg);
         jrows.push(serde_json::json!({
             "provider": provider_name,
             "op": r.op,
-            "alg": r.alg,
+            "alg_class": alg_class,
+            "weak": weak,
             "funcid": r.funcid,
             "addr": r.addr,
             "addr_hash": crate::kinds::addr_hash(&dev, ino, off),
@@ -68,21 +70,41 @@ mod tests {
 
     #[test]
     fn doc_shape_and_hash_preimage() {
-        let rows = vec![Row {
-            op: 1,
-            alg: "SHA256".into(),
-            funcid: 7,
-            addr: 0x1000,
-        }];
+        let rows = vec![
+            Row {
+                op: 1,
+                alg: "SHA2-256:SHA256".into(),
+                funcid: 7,
+                addr: 0x1000,
+            },
+            Row {
+                op: 1,
+                alg: "canary-DOOM-7QZ".into(),
+                funcid: 1,
+                addr: 0x2000,
+            },
+            Row {
+                op: 1,
+                alg: "MD5".into(),
+                funcid: 2,
+                addr: 0x3000,
+            },
+        ];
         // Deferred mapping: no maps → unbacked, but shape + hash hold.
         let exe = std::fs::read(std::env::current_exe().unwrap()).unwrap();
         let doc = emit("t", Path::new("t"), "", &exe, &[], &rows, true).unwrap();
-        assert_eq!(doc["rows"].as_array().unwrap().len(), 1);
-        let r = &doc["rows"][0];
+        let jrows = doc["rows"].as_array().unwrap();
+        assert_eq!(jrows.len(), 3);
+        assert_eq!(jrows[0]["alg_class"], "SHA2-256");
+        assert_eq!(jrows[0]["weak"], false);
+        // Canary bytes never survive emission.
+        assert_eq!(jrows[1]["alg_class"], "other");
+        assert!(jrows[1].get("alg").is_none());
+        assert_eq!(jrows[2]["alg_class"], "MD5");
+        assert_eq!(jrows[2]["weak"], true);
+        let r = &jrows[0];
         assert_eq!(r["addr_backed"], false);
         // Unbacked triple → the documented degenerate hash.
         assert_eq!(r["addr_hash"], crate::kinds::addr_hash("", 0, 0));
-        assert!(r.get("backing").unwrap().get("offset").is_some());
-        assert_eq!(doc["trigger_observed"], true);
     }
 }

@@ -82,6 +82,9 @@ pub fn run(cfg: &Config) -> anyhow::Result<serde_json::Value> {
         &cfg.provider,
         pid,
     )?;
+    // Machine-readable progress on stderr (stdout stays pure JSON):
+    // harnesses gate fixture GO lines on these.
+    eprintln!("INSPECT stage=init attached=2");
 
     let map = bpf
         .take_map("EVENTS")
@@ -114,7 +117,9 @@ pub fn run(cfg: &Config) -> anyhow::Result<serde_json::Value> {
                         continue;
                     }
                     let addr = u64at(16);
-                    let live = maps::read_maps(cfg.pid)?;
+                    let live = maps::read_maps(cfg.pid).with_context(|| {
+                        format!("read maps of {} (target may have exited)", cfg.pid)
+                    })?;
                     let m = maps::provider_mapping(&live, &cfg.provider, &canon, addr)
                         .ok_or_else(|| anyhow!("query addr {addr:#x} outside provider mappings"))?;
                     let off = addr - m.start + m.offset;
@@ -127,6 +132,7 @@ pub fn run(cfg: &Config) -> anyhow::Result<serde_json::Value> {
                         pid,
                     )?;
                     query_attached = true;
+                    eprintln!("INSPECT stage=query addr={addr:#x} off={off:#x}");
                 }
                 KIND_QUERY_RET if u32at(8) == 0 => {
                     trigger_observed = true;

@@ -7,4 +7,5 @@
 pub mod cli;
 pub mod discovery;
 pub mod doctor;
+pub mod inspect;
 pub mod kinds;

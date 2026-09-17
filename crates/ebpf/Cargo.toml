@@ -19,3 +19,7 @@ lto = true
 codegen-units = 1
 
 [workspace]
+
+[[bin]]
+name = "osslscope-harvest"
+path = "src/bin/harvest.rs"

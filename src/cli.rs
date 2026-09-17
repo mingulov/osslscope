@@ -7,7 +7,7 @@ pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
     let cmd = argv.first().map(String::as_str).unwrap_or("help");
     match cmd {
         "doctor" => crate::doctor::run(&argv[1..]),
-        "inspect" => crate::doctor::unimplemented("inspect"),
+        "inspect" => crate::inspect::run(&argv[1..]),
         "report" => crate::doctor::unimplemented("report"),
         "check" => crate::doctor::unimplemented("check"),
         "help" | "--help" | "-h" => {

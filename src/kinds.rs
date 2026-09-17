@@ -2823,6 +2823,3147 @@ pub const SHAPES: &[ShapeDef] = &[
     },
 ];
 
+/// One provider algorithm-name segment: exact registry spelling, the
+/// `PROV_NAMES_*` family it came from (`group` is a macro family, NOT an
+/// `OSSL_OP_*` — op/name consistency rules are P1 exit 4's job), and the
+/// first version whose tree contains it. Union across 3.0/3.5/3.6/4.0
+/// (`names.h` + public `core_names.h`); 625 entries, generated — see the
+/// module header for the re-freeze procedure.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct AlgDef {
+    pub name: &'static str,
+    pub group: &'static str,
+    pub since: Version,
+}
+
+pub const ALG_NAMES: &[AlgDef] = &[
+    AlgDef {
+        name: "0.3.4401.5.3.1.9.1",
+        group: "CAMELLIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "0.3.4401.5.3.1.9.21",
+        group: "CAMELLIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "0.3.4401.5.3.1.9.23",
+        group: "CAMELLIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "0.3.4401.5.3.1.9.24",
+        group: "CAMELLIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "0.3.4401.5.3.1.9.29",
+        group: "CAMELLIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "0.3.4401.5.3.1.9.3",
+        group: "CAMELLIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "0.3.4401.5.3.1.9.4",
+        group: "CAMELLIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "0.3.4401.5.3.1.9.41",
+        group: "CAMELLIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "0.3.4401.5.3.1.9.43",
+        group: "CAMELLIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "0.3.4401.5.3.1.9.44",
+        group: "CAMELLIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "0.3.4401.5.3.1.9.49",
+        group: "CAMELLIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "0.3.4401.5.3.1.9.9",
+        group: "CAMELLIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "1.2.156.10197.1.104.1",
+        group: "SM4",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "1.2.156.10197.1.104.10",
+        group: "SM4",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "1.2.156.10197.1.104.2",
+        group: "SM4",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "1.2.156.10197.1.104.3",
+        group: "SM4",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "1.2.156.10197.1.104.4",
+        group: "SM4",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "1.2.156.10197.1.104.7",
+        group: "SM4",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "1.2.156.10197.1.104.8",
+        group: "SM4",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "1.2.156.10197.1.104.9",
+        group: "SM4",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "1.2.156.10197.1.504",
+        group: "RSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "1.2.392.200011.61.1.1.1.2",
+        group: "CAMELLIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "1.2.392.200011.61.1.1.1.3",
+        group: "CAMELLIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "1.2.392.200011.61.1.1.1.4",
+        group: "CAMELLIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "1.2.410.200004.1.3",
+        group: "SEED",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "1.2.410.200004.1.4",
+        group: "SEED",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "1.2.410.200004.1.5",
+        group: "SEED",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "1.2.410.200004.1.6",
+        group: "SEED",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "1.2.410.200046.1.1.1",
+        group: "ARIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "1.2.410.200046.1.1.10",
+        group: "ARIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "1.2.410.200046.1.1.11",
+        group: "ARIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "1.2.410.200046.1.1.12",
+        group: "ARIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "1.2.410.200046.1.1.13",
+        group: "ARIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "1.2.410.200046.1.1.14",
+        group: "ARIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "1.2.410.200046.1.1.15",
+        group: "ARIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "1.2.410.200046.1.1.2",
+        group: "ARIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "1.2.410.200046.1.1.3",
+        group: "ARIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "1.2.410.200046.1.1.34",
+        group: "ARIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "1.2.410.200046.1.1.35",
+        group: "ARIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "1.2.410.200046.1.1.36",
+        group: "ARIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "1.2.410.200046.1.1.37",
+        group: "ARIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "1.2.410.200046.1.1.38",
+        group: "ARIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "1.2.410.200046.1.1.39",
+        group: "ARIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "1.2.410.200046.1.1.4",
+        group: "ARIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "1.2.410.200046.1.1.5",
+        group: "ARIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "1.2.410.200046.1.1.6",
+        group: "ARIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "1.2.410.200046.1.1.7",
+        group: "ARIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "1.2.410.200046.1.1.8",
+        group: "ARIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "1.2.410.200046.1.1.9",
+        group: "ARIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "1.2.840.1.101.3.4.3.3",
+        group: "DSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "1.2.840.1.101.3.4.3.4",
+        group: "DSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "1.2.840.10040.4.3",
+        group: "DSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "1.2.840.10045.4.1",
+        group: "ECDSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "1.2.840.10045.4.3.1",
+        group: "ECDSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "1.2.840.10045.4.3.2",
+        group: "ECDSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "1.2.840.10045.4.3.3",
+        group: "ECDSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "1.2.840.10045.4.3.4",
+        group: "ECDSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "1.2.840.113533.7.66.10",
+        group: "CAST5",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "1.2.840.113549.1.1.10",
+        group: "RSA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "1.2.840.113549.1.1.11",
+        group: "RSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "1.2.840.113549.1.1.12",
+        group: "RSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "1.2.840.113549.1.1.13",
+        group: "RSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "1.2.840.113549.1.1.14",
+        group: "RSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "1.2.840.113549.1.1.15",
+        group: "RSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "1.2.840.113549.1.1.16",
+        group: "RSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "1.2.840.113549.1.1.2",
+        group: "RSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "1.2.840.113549.1.1.3",
+        group: "RSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "1.2.840.113549.1.1.4",
+        group: "RSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "1.2.840.113549.1.1.5",
+        group: "RSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "1.2.840.113549.1.9.16.3.28",
+        group: "HKDF",
+        since: (3, 6),
+    },
+    AlgDef {
+        name: "1.2.840.113549.1.9.16.3.29",
+        group: "HKDF",
+        since: (3, 6),
+    },
+    AlgDef {
+        name: "1.2.840.113549.1.9.16.3.30",
+        group: "HKDF",
+        since: (3, 6),
+    },
+    AlgDef {
+        name: "1.2.840.113549.1.9.16.3.6",
+        group: "DES3",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "1.2.840.113549.3.2",
+        group: "RC2",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "1.2.840.113549.3.7",
+        group: "DES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "1.2.840.113549.3.8",
+        group: "RC5",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "1.3.111.2.1619.0.1.1",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "1.3.111.2.1619.0.1.2",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "1.3.14.3.2.17",
+        group: "DES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "1.3.14.3.2.6",
+        group: "DES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "1.3.14.3.2.7",
+        group: "DES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "1.3.14.3.2.8",
+        group: "DES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "1.3.14.3.2.9",
+        group: "DES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "1.3.36.3.2.1",
+        group: "RIPEMD",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "1.3.36.3.3.1.2",
+        group: "RSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "1.3.6.1.4.1.1722.12.2.1.16",
+        group: "BLAKE2B",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "1.3.6.1.4.1.1722.12.2.2.8",
+        group: "BLAKE2S",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "1.3.6.1.4.1.188.7.1.1.2",
+        group: "IDEA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "1.3.6.1.4.1.3029.1.2",
+        group: "BF",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.1.1",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.1.2",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.1.21",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.1.22",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.1.23",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.1.24",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.1.25",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.1.26",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.1.27",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.1.28",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.1.3",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.1.4",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.1.41",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.1.42",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.1.43",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.1.44",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.1.45",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.1.46",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.1.47",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.1.48",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.1.5",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.1.6",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.1.7",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.1.8",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.2.1",
+        group: "SHA2",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.2.10",
+        group: "SHA3",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.2.11",
+        group: "SHAKE",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.2.12",
+        group: "SHAKE",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.2.19",
+        group: "KMAC",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.2.2",
+        group: "SHA2",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.2.20",
+        group: "KMAC",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.2.3",
+        group: "SHA2",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.2.4",
+        group: "SHA2",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.2.5",
+        group: "SHA2",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.2.6",
+        group: "SHA2",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.2.7",
+        group: "SHA3",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.2.8",
+        group: "SHA3",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.2.9",
+        group: "SHA3",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.3.1",
+        group: "DSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.3.10",
+        group: "ECDSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.3.11",
+        group: "ECDSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.3.12",
+        group: "ECDSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.3.13",
+        group: "RSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.3.14",
+        group: "RSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.3.15",
+        group: "RSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.3.16",
+        group: "RSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.3.17",
+        group: "ML",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.3.18",
+        group: "ML",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.3.19",
+        group: "ML",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.3.2",
+        group: "DSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.3.20",
+        group: "SLH",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.3.21",
+        group: "SLH",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.3.22",
+        group: "SLH",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.3.23",
+        group: "SLH",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.3.24",
+        group: "SLH",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.3.25",
+        group: "SLH",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.3.26",
+        group: "SLH",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.3.27",
+        group: "SLH",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.3.28",
+        group: "SLH",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.3.29",
+        group: "SLH",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.3.30",
+        group: "SLH",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.3.31",
+        group: "SLH",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.3.5",
+        group: "DSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.3.6",
+        group: "DSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.3.7",
+        group: "DSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.3.8",
+        group: "DSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.3.9",
+        group: "ECDSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.4.1",
+        group: "ML",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.4.2",
+        group: "ML",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.4.3",
+        group: "ML",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "AES-128-CBC",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES-128-CBC-CTS",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES-128-CBC-HMAC-SHA1",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES-128-CBC-HMAC-SHA1-ETM",
+        group: "AES",
+        since: (3, 6),
+    },
+    AlgDef {
+        name: "AES-128-CBC-HMAC-SHA256",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES-128-CBC-HMAC-SHA256-ETM",
+        group: "AES",
+        since: (3, 6),
+    },
+    AlgDef {
+        name: "AES-128-CBC-HMAC-SHA512-ETM",
+        group: "AES",
+        since: (3, 6),
+    },
+    AlgDef {
+        name: "AES-128-CCM",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES-128-CFB",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES-128-CFB1",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES-128-CFB8",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES-128-CTR",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES-128-ECB",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES-128-GCM",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES-128-GCM-SIV",
+        group: "AES",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "AES-128-OCB",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES-128-OFB",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES-128-SIV",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES-128-WRAP",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES-128-WRAP-INV",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES-128-WRAP-PAD",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES-128-WRAP-PAD-INV",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES-128-XTS",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES-192-CBC",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES-192-CBC-CTS",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES-192-CBC-HMAC-SHA1-ETM",
+        group: "AES",
+        since: (3, 6),
+    },
+    AlgDef {
+        name: "AES-192-CBC-HMAC-SHA256-ETM",
+        group: "AES",
+        since: (3, 6),
+    },
+    AlgDef {
+        name: "AES-192-CBC-HMAC-SHA512-ETM",
+        group: "AES",
+        since: (3, 6),
+    },
+    AlgDef {
+        name: "AES-192-CCM",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES-192-CFB",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES-192-CFB1",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES-192-CFB8",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES-192-CTR",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES-192-ECB",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES-192-GCM",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES-192-GCM-SIV",
+        group: "AES",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "AES-192-OCB",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES-192-OFB",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES-192-SIV",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES-192-WRAP",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES-192-WRAP-INV",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES-192-WRAP-PAD",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES-192-WRAP-PAD-INV",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES-256-CBC",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES-256-CBC-CTS",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES-256-CBC-HMAC-SHA1",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES-256-CBC-HMAC-SHA1-ETM",
+        group: "AES",
+        since: (3, 6),
+    },
+    AlgDef {
+        name: "AES-256-CBC-HMAC-SHA256",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES-256-CBC-HMAC-SHA256-ETM",
+        group: "AES",
+        since: (3, 6),
+    },
+    AlgDef {
+        name: "AES-256-CBC-HMAC-SHA512-ETM",
+        group: "AES",
+        since: (3, 6),
+    },
+    AlgDef {
+        name: "AES-256-CCM",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES-256-CFB",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES-256-CFB1",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES-256-CFB8",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES-256-CTR",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES-256-ECB",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES-256-GCM",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES-256-GCM-SIV",
+        group: "AES",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "AES-256-OCB",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES-256-OFB",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES-256-SIV",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES-256-WRAP",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES-256-WRAP-INV",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES-256-WRAP-PAD",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES-256-WRAP-PAD-INV",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES-256-XTS",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES128",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES128-WRAP",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES128-WRAP-INV",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES128-WRAP-PAD",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES128-WRAP-PAD-INV",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES192",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES192-WRAP",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES192-WRAP-INV",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES192-WRAP-PAD",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES192-WRAP-PAD-INV",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES256",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES256-WRAP",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES256-WRAP-INV",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES256-WRAP-PAD",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "AES256-WRAP-PAD-INV",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "ARIA-128-CBC",
+        group: "ARIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "ARIA-128-CCM",
+        group: "ARIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "ARIA-128-CFB",
+        group: "ARIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "ARIA-128-CFB1",
+        group: "ARIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "ARIA-128-CFB8",
+        group: "ARIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "ARIA-128-CTR",
+        group: "ARIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "ARIA-128-ECB",
+        group: "ARIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "ARIA-128-GCM",
+        group: "ARIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "ARIA-128-OFB",
+        group: "ARIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "ARIA-192-CBC",
+        group: "ARIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "ARIA-192-CCM",
+        group: "ARIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "ARIA-192-CFB",
+        group: "ARIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "ARIA-192-CFB1",
+        group: "ARIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "ARIA-192-CFB8",
+        group: "ARIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "ARIA-192-CTR",
+        group: "ARIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "ARIA-192-ECB",
+        group: "ARIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "ARIA-192-GCM",
+        group: "ARIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "ARIA-192-OFB",
+        group: "ARIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "ARIA-256-CBC",
+        group: "ARIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "ARIA-256-CCM",
+        group: "ARIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "ARIA-256-CFB",
+        group: "ARIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "ARIA-256-CFB1",
+        group: "ARIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "ARIA-256-CFB8",
+        group: "ARIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "ARIA-256-CTR",
+        group: "ARIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "ARIA-256-ECB",
+        group: "ARIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "ARIA-256-GCM",
+        group: "ARIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "ARIA-256-OFB",
+        group: "ARIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "ARIA128",
+        group: "ARIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "ARIA192",
+        group: "ARIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "ARIA256",
+        group: "ARIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "BF",
+        group: "BF",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "BF-CBC",
+        group: "BF",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "BF-CFB",
+        group: "BF",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "BF-ECB",
+        group: "BF",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "BF-OFB",
+        group: "BF",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "BLAKE2B-512",
+        group: "BLAKE2B",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "BLAKE2BMAC",
+        group: "MAC",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "BLAKE2S-256",
+        group: "BLAKE2S",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "BLAKE2SMAC",
+        group: "MAC",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "BLAKE2b512",
+        group: "BLAKE2B",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "BLAKE2s256",
+        group: "BLAKE2S",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "BLOWFISH",
+        group: "BF",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "CAMELLIA-128-CBC",
+        group: "CAMELLIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "CAMELLIA-128-CBC-CTS",
+        group: "CAMELLIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "CAMELLIA-128-CFB",
+        group: "CAMELLIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "CAMELLIA-128-CFB1",
+        group: "CAMELLIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "CAMELLIA-128-CFB8",
+        group: "CAMELLIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "CAMELLIA-128-CTR",
+        group: "CAMELLIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "CAMELLIA-128-ECB",
+        group: "CAMELLIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "CAMELLIA-128-OFB",
+        group: "CAMELLIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "CAMELLIA-192-CBC",
+        group: "CAMELLIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "CAMELLIA-192-CBC-CTS",
+        group: "CAMELLIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "CAMELLIA-192-CFB",
+        group: "CAMELLIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "CAMELLIA-192-CFB1",
+        group: "CAMELLIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "CAMELLIA-192-CFB8",
+        group: "CAMELLIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "CAMELLIA-192-CTR",
+        group: "CAMELLIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "CAMELLIA-192-ECB",
+        group: "CAMELLIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "CAMELLIA-192-OFB",
+        group: "CAMELLIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "CAMELLIA-256-CBC",
+        group: "CAMELLIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "CAMELLIA-256-CBC-CTS",
+        group: "CAMELLIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "CAMELLIA-256-CFB",
+        group: "CAMELLIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "CAMELLIA-256-CFB1",
+        group: "CAMELLIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "CAMELLIA-256-CFB8",
+        group: "CAMELLIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "CAMELLIA-256-CTR",
+        group: "CAMELLIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "CAMELLIA-256-ECB",
+        group: "CAMELLIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "CAMELLIA-256-OFB",
+        group: "CAMELLIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "CAMELLIA128",
+        group: "CAMELLIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "CAMELLIA192",
+        group: "CAMELLIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "CAMELLIA256",
+        group: "CAMELLIA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "CAST",
+        group: "CAST5",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "CAST-CBC",
+        group: "CAST5",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "CAST5-CBC",
+        group: "CAST5",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "CAST5-CFB",
+        group: "CAST5",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "CAST5-ECB",
+        group: "CAST5",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "CAST5-OFB",
+        group: "CAST5",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "CMAC",
+        group: "MAC",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "CRNG-TEST",
+        group: "CRNG",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "CSHAKE-128",
+        group: "CSHAKE",
+        since: (4, 0),
+    },
+    AlgDef {
+        name: "CSHAKE-256",
+        group: "CSHAKE",
+        since: (4, 0),
+    },
+    AlgDef {
+        name: "CSHAKE-KECCAK-128",
+        group: "CSHAKE",
+        since: (4, 0),
+    },
+    AlgDef {
+        name: "CSHAKE-KECCAK-256",
+        group: "CSHAKE",
+        since: (4, 0),
+    },
+    AlgDef {
+        name: "CSHAKE128",
+        group: "CSHAKE",
+        since: (4, 0),
+    },
+    AlgDef {
+        name: "CSHAKE256",
+        group: "CSHAKE",
+        since: (4, 0),
+    },
+    AlgDef {
+        name: "CTR-DRBG",
+        group: "CTR",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "DES",
+        group: "DES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "DES-CBC",
+        group: "DES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "DES-CFB",
+        group: "DES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "DES-CFB1",
+        group: "DES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "DES-CFB8",
+        group: "DES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "DES-ECB",
+        group: "DES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "DES-EDE",
+        group: "DES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "DES-EDE-CBC",
+        group: "DES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "DES-EDE-CFB",
+        group: "DES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "DES-EDE-ECB",
+        group: "DES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "DES-EDE-OFB",
+        group: "DES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "DES-EDE3",
+        group: "DES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "DES-EDE3-CBC",
+        group: "DES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "DES-EDE3-CFB",
+        group: "DES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "DES-EDE3-CFB1",
+        group: "DES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "DES-EDE3-CFB8",
+        group: "DES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "DES-EDE3-ECB",
+        group: "DES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "DES-EDE3-OFB",
+        group: "DES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "DES-OFB",
+        group: "DES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "DES3",
+        group: "DES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "DES3-WRAP",
+        group: "DES3",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "DESX",
+        group: "DESX",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "DESX-CBC",
+        group: "DESX",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "DSA-SHA-1",
+        group: "DSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "DSA-SHA1",
+        group: "DSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "DSA-SHA2-224",
+        group: "DSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "DSA-SHA2-256",
+        group: "DSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "DSA-SHA2-384",
+        group: "DSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "DSA-SHA2-512",
+        group: "DSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "DSA-SHA224",
+        group: "DSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "DSA-SHA256",
+        group: "DSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "DSA-SHA3-224",
+        group: "DSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "DSA-SHA3-256",
+        group: "DSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "DSA-SHA3-384",
+        group: "DSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "DSA-SHA3-512",
+        group: "DSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "DSA-SHA384",
+        group: "DSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "DSA-SHA512",
+        group: "DSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "ECDSA-SHA-1",
+        group: "ECDSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "ECDSA-SHA1",
+        group: "ECDSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "ECDSA-SHA2-224",
+        group: "ECDSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "ECDSA-SHA2-256",
+        group: "ECDSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "ECDSA-SHA2-384",
+        group: "ECDSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "ECDSA-SHA2-512",
+        group: "ECDSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "ECDSA-SHA224",
+        group: "ECDSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "ECDSA-SHA256",
+        group: "ECDSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "ECDSA-SHA3-224",
+        group: "ECDSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "ECDSA-SHA3-256",
+        group: "ECDSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "ECDSA-SHA3-384",
+        group: "ECDSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "ECDSA-SHA3-512",
+        group: "ECDSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "ECDSA-SHA384",
+        group: "ECDSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "ECDSA-SHA512",
+        group: "ECDSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "GMAC",
+        group: "MAC",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "HASH-DRBG",
+        group: "HASH",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "HKDF",
+        group: "KDF",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "HKDF-SHA256",
+        group: "HKDF",
+        since: (3, 6),
+    },
+    AlgDef {
+        name: "HKDF-SHA384",
+        group: "HKDF",
+        since: (3, 6),
+    },
+    AlgDef {
+        name: "HKDF-SHA512",
+        group: "HKDF",
+        since: (3, 6),
+    },
+    AlgDef {
+        name: "HMAC",
+        group: "MAC",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "HMAC-DRBG",
+        group: "HMAC",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "HMAC-DRBG-KDF",
+        group: "HMAC",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "IDEA",
+        group: "IDEA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "IDEA-CBC",
+        group: "IDEA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "IDEA-CFB",
+        group: "IDEA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "IDEA-CFB64",
+        group: "IDEA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "IDEA-ECB",
+        group: "IDEA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "IDEA-OFB",
+        group: "IDEA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "IDEA-OFB64",
+        group: "IDEA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "KBKDF",
+        group: "KDF",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "KECCAK-224",
+        group: "KECCAK",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "KECCAK-256",
+        group: "KECCAK",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "KECCAK-384",
+        group: "KECCAK",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "KECCAK-512",
+        group: "KECCAK",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "KECCAK-KMAC-128",
+        group: "KECCAK",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "KECCAK-KMAC-256",
+        group: "KECCAK",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "KECCAK-KMAC128",
+        group: "KECCAK",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "KECCAK-KMAC256",
+        group: "KECCAK",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "KMAC-128",
+        group: "KMAC",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "KMAC-256",
+        group: "KMAC",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "KMAC128",
+        group: "KMAC",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "KMAC256",
+        group: "KMAC",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "KRB5KDF",
+        group: "KDF",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "MD2",
+        group: "DIGEST",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "MD4",
+        group: "DIGEST",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "MD5",
+        group: "DIGEST",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "MD5-SHA1",
+        group: "MD5",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "MDC2",
+        group: "DIGEST",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "ML-DSA-44",
+        group: "ML",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "ML-DSA-65",
+        group: "ML",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "ML-DSA-87",
+        group: "ML",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "ML-DSA-MU",
+        group: "ML",
+        since: (4, 0),
+    },
+    AlgDef {
+        name: "ML-KEM-1024",
+        group: "ML",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "ML-KEM-512",
+        group: "ML",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "ML-KEM-768",
+        group: "ML",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "MLDSA44",
+        group: "ML",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "MLDSA65",
+        group: "ML",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "MLDSA87",
+        group: "ML",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "MLKEM1024",
+        group: "ML",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "MLKEM512",
+        group: "ML",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "MLKEM768",
+        group: "ML",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "PBKDF1",
+        group: "KDF",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "PBKDF2",
+        group: "KDF",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "POLY1305",
+        group: "MAC",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "RC2",
+        group: "RC2",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "RC2-128",
+        group: "RC2",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "RC2-40",
+        group: "RC2",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "RC2-40-CBC",
+        group: "RC2",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "RC2-64",
+        group: "RC2",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "RC2-64-CBC",
+        group: "RC2",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "RC2-CBC",
+        group: "RC2",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "RC2-CFB",
+        group: "RC2",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "RC2-ECB",
+        group: "RC2",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "RC2-OFB",
+        group: "RC2",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "RC4-40",
+        group: "RC4",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "RC4-HMAC-MD5",
+        group: "RC4",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "RC5",
+        group: "RC5",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "RC5-CBC",
+        group: "RC5",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "RC5-CFB",
+        group: "RC5",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "RC5-ECB",
+        group: "RC5",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "RC5-OFB",
+        group: "RC5",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "RIPEMD",
+        group: "RIPEMD",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "RIPEMD-160",
+        group: "RIPEMD",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "RIPEMD160",
+        group: "RIPEMD",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "RMD160",
+        group: "RIPEMD",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "RSA-MD2",
+        group: "RSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "RSA-MD4",
+        group: "RSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "RSA-MD5",
+        group: "RSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "RSA-PSS",
+        group: "RSA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "RSA-RIPEMD160",
+        group: "RSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "RSA-SHA-1",
+        group: "RSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "RSA-SHA1",
+        group: "RSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "RSA-SHA2-224",
+        group: "RSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "RSA-SHA2-256",
+        group: "RSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "RSA-SHA2-384",
+        group: "RSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "RSA-SHA2-512",
+        group: "RSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "RSA-SHA2-512/224",
+        group: "RSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "RSA-SHA2-512/256",
+        group: "RSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "RSA-SHA224",
+        group: "RSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "RSA-SHA256",
+        group: "RSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "RSA-SHA3-224",
+        group: "RSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "RSA-SHA3-256",
+        group: "RSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "RSA-SHA3-384",
+        group: "RSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "RSA-SHA3-512",
+        group: "RSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "RSA-SHA384",
+        group: "RSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "RSA-SHA512",
+        group: "RSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "RSA-SHA512-224",
+        group: "RSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "RSA-SHA512-256",
+        group: "RSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "RSA-SM3",
+        group: "RSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "RSASSA-PSS",
+        group: "RSA",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "SCRYPT",
+        group: "KDF",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "SEED",
+        group: "SEED",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "SEED-CBC",
+        group: "SEED",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "SEED-CFB",
+        group: "SEED",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "SEED-CFB128",
+        group: "SEED",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "SEED-ECB",
+        group: "SEED",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "SEED-OFB",
+        group: "SEED",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "SEED-OFB128",
+        group: "SEED",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "SEED-SRC",
+        group: "SEED",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "SHA-224",
+        group: "SHA2",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "SHA-256",
+        group: "SHA2",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "SHA-256/192",
+        group: "SHA2",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "SHA-384",
+        group: "SHA2",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "SHA-512",
+        group: "SHA2",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "SHA-512/224",
+        group: "SHA2",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "SHA-512/256",
+        group: "SHA2",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "SHA1",
+        group: "DIGEST",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "SHA2-224",
+        group: "SHA2",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "SHA2-256",
+        group: "SHA2",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "SHA2-256/192",
+        group: "SHA2",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "SHA2-384",
+        group: "SHA2",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "SHA2-512",
+        group: "SHA2",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "SHA2-512/224",
+        group: "SHA2",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "SHA2-512/256",
+        group: "SHA2",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "SHA224",
+        group: "SHA2",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "SHA256",
+        group: "SHA2",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "SHA256-192",
+        group: "SHA2",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "SHA3-224",
+        group: "SHA3",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "SHA3-256",
+        group: "SHA3",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "SHA3-384",
+        group: "SHA3",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "SHA3-512",
+        group: "SHA3",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "SHA384",
+        group: "SHA2",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "SHA512",
+        group: "SHA2",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "SHA512-224",
+        group: "SHA2",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "SHA512-256",
+        group: "SHA2",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "SHAKE-128",
+        group: "SHAKE",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "SHAKE-256",
+        group: "SHAKE",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "SHAKE128",
+        group: "SHAKE",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "SHAKE256",
+        group: "SHAKE",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "SIPHASH",
+        group: "MAC",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "SLH-DSA-SHA2-128f",
+        group: "SLH",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "SLH-DSA-SHA2-128s",
+        group: "SLH",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "SLH-DSA-SHA2-192f",
+        group: "SLH",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "SLH-DSA-SHA2-192s",
+        group: "SLH",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "SLH-DSA-SHA2-256f",
+        group: "SLH",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "SLH-DSA-SHA2-256s",
+        group: "SLH",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "SLH-DSA-SHAKE-128f",
+        group: "SLH",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "SLH-DSA-SHAKE-128s",
+        group: "SLH",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "SLH-DSA-SHAKE-192f",
+        group: "SLH",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "SLH-DSA-SHAKE-192s",
+        group: "SLH",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "SLH-DSA-SHAKE-256f",
+        group: "SLH",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "SLH-DSA-SHAKE-256s",
+        group: "SLH",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "SM3",
+        group: "DIGEST",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "SM4",
+        group: "SM4",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "SM4-CBC",
+        group: "SM4",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "SM4-CCM",
+        group: "SM4",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "SM4-CFB",
+        group: "SM4",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "SM4-CFB128",
+        group: "SM4",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "SM4-CTR",
+        group: "SM4",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "SM4-ECB",
+        group: "SM4",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "SM4-GCM",
+        group: "SM4",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "SM4-OFB",
+        group: "SM4",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "SM4-OFB128",
+        group: "SM4",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "SM4-XTS",
+        group: "SM4",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "SNMPKDF",
+        group: "KDF",
+        since: (4, 0),
+    },
+    AlgDef {
+        name: "SRTPKDF",
+        group: "KDF",
+        since: (4, 0),
+    },
+    AlgDef {
+        name: "SSHKDF",
+        group: "KDF",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "SSKDF",
+        group: "KDF",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "TLS1-PRF",
+        group: "TLS1",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "TLS13-KDF",
+        group: "TLS1",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "X942KDF",
+        group: "X942KDF",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "X942KDF-ASN1",
+        group: "X942KDF",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "X942KDF-CONCAT",
+        group: "KDF",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "X963KDF",
+        group: "KDF",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "dsaWithSHA1",
+        group: "DSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "dsa_with_SHA224",
+        group: "DSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "dsa_with_SHA256",
+        group: "DSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "dsa_with_SHA3-224",
+        group: "DSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "dsa_with_SHA3-256",
+        group: "DSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "dsa_with_SHA3-384",
+        group: "DSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "dsa_with_SHA3-512",
+        group: "DSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "dsa_with_SHA384",
+        group: "DSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "dsa_with_SHA512",
+        group: "DSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "ecdsa-with-SHA1",
+        group: "ECDSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "ecdsa-with-SHA224",
+        group: "ECDSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "ecdsa-with-SHA256",
+        group: "ECDSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "ecdsa-with-SHA384",
+        group: "ECDSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "ecdsa-with-SHA512",
+        group: "ECDSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "ecdsa_with_SHA3-224",
+        group: "ECDSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "ecdsa_with_SHA3-256",
+        group: "ECDSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "ecdsa_with_SHA3-384",
+        group: "ECDSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "ecdsa_with_SHA3-512",
+        group: "ECDSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "id-aes128-CCM",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "id-aes128-GCM",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "id-aes128-wrap",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "id-aes128-wrap-pad",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "id-aes192-CCM",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "id-aes192-GCM",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "id-aes192-wrap",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "id-aes192-wrap-pad",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "id-aes256-CCM",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "id-aes256-GCM",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "id-aes256-wrap",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "id-aes256-wrap-pad",
+        group: "AES",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "id-alg-hkdf-with-sha256",
+        group: "HKDF",
+        since: (3, 6),
+    },
+    AlgDef {
+        name: "id-alg-hkdf-with-sha384",
+        group: "HKDF",
+        since: (3, 6),
+    },
+    AlgDef {
+        name: "id-alg-hkdf-with-sha512",
+        group: "HKDF",
+        since: (3, 6),
+    },
+    AlgDef {
+        name: "id-alg-ml-kem-1024",
+        group: "ML",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "id-alg-ml-kem-512",
+        group: "ML",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "id-alg-ml-kem-768",
+        group: "ML",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "id-dsa-with-sha3-224",
+        group: "DSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "id-dsa-with-sha3-256",
+        group: "DSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "id-dsa-with-sha3-384",
+        group: "DSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "id-dsa-with-sha3-512",
+        group: "DSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "id-dsa-with-sha384",
+        group: "DSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "id-dsa-with-sha512",
+        group: "DSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "id-ecdsa-with-sha3-224",
+        group: "ECDSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "id-ecdsa-with-sha3-256",
+        group: "ECDSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "id-ecdsa-with-sha3-384",
+        group: "ECDSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "id-ecdsa-with-sha3-512",
+        group: "ECDSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "id-ml-dsa-44",
+        group: "ML",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "id-ml-dsa-65",
+        group: "ML",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "id-ml-dsa-87",
+        group: "ML",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "id-rsassa-pkcs1-v1_5-with-sha3-224",
+        group: "RSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "id-rsassa-pkcs1-v1_5-with-sha3-256",
+        group: "RSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "id-rsassa-pkcs1-v1_5-with-sha3-384",
+        group: "RSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "id-rsassa-pkcs1-v1_5-with-sha3-512",
+        group: "RSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "id-slh-dsa-sha2-128f",
+        group: "SLH",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "id-slh-dsa-sha2-128s",
+        group: "SLH",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "id-slh-dsa-sha2-192f",
+        group: "SLH",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "id-slh-dsa-sha2-192s",
+        group: "SLH",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "id-slh-dsa-sha2-256f",
+        group: "SLH",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "id-slh-dsa-sha2-256s",
+        group: "SLH",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "id-slh-dsa-shake-128f",
+        group: "SLH",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "id-slh-dsa-shake-128s",
+        group: "SLH",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "id-slh-dsa-shake-192f",
+        group: "SLH",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "id-slh-dsa-shake-192s",
+        group: "SLH",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "id-slh-dsa-shake-256f",
+        group: "SLH",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "id-slh-dsa-shake-256s",
+        group: "SLH",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "id-smime-alg-CMS3DESwrap",
+        group: "DES3",
+        since: (3, 0),
+    },
+    AlgDef {
+        name: "md2WithRSAEncryption",
+        group: "RSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "md4WithEncryption",
+        group: "RSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "md5WithRSAEncryption",
+        group: "RSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "ripemd160WithRSA",
+        group: "RSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "rsassaPss",
+        group: "RSA",
+        since: (3, 6),
+    },
+    AlgDef {
+        name: "sha1WithRSAEncryption",
+        group: "RSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "sha224WithRSAEncryption",
+        group: "RSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "sha256WithRSAEncryption",
+        group: "RSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "sha384WithRSAEncryption",
+        group: "RSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "sha512-224WithRSAEncryption",
+        group: "RSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "sha512-256WithRSAEncryption",
+        group: "RSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "sha512WithRSAEncryption",
+        group: "RSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "sm3WithRSAEncryption",
+        group: "RSA",
+        since: (3, 5),
+    },
+];
+
 // --- Lookups (linear; discovery-time only, never hot) ---
 
 /// Operation id by `OSSL_OP_*` name.
@@ -2869,6 +6010,34 @@ pub fn lowlevel_family(symbol: &str) -> Option<&'static str> {
 /// Exact weak-name match. Callers split provider alias lists first.
 pub fn is_weak_alg(base_name: &str) -> bool {
     WEAK_ALGS.contains(&base_name)
+}
+
+/// Emission classifier: split a provider `algorithm_names` alias list on
+/// `:` and classify. Returns `(class, weak)` where `class` is the primary
+/// (first) segment iff it is an exact registry spelling, else `"other"`;
+/// `weak` is true iff ANY segment exactly matches [`WEAK_ALGS`]. Raw
+/// provider bytes never leave this function except as `"other"`.
+pub fn classify_alg(names: &str) -> (&'static str, bool) {
+    let mut primary = "other";
+    let mut weak = false;
+    for (i, seg) in names.split(':').enumerate() {
+        if ALG_NAMES.iter().any(|a| a.name == seg) {
+            if i == 0 {
+                primary = ALG_NAMES.iter().find(|a| a.name == seg).unwrap().name;
+            }
+        } else if i == 0 {
+            primary = "other";
+        }
+        if is_weak_alg(seg) {
+            weak = true;
+        }
+    }
+    (primary, weak)
+}
+
+/// True iff the exact spelling is a registered algorithm name.
+pub fn is_known_alg(name: &str) -> bool {
+    ALG_NAMES.iter().any(|a| a.name == name)
 }
 
 /// Struct shape by type name.
@@ -3001,6 +6170,29 @@ mod tests {
         let a = shape("OSSL_ALGORITHM").unwrap();
         assert_eq!((a.size, a.fields.len()), (32, 4));
         assert_eq!(shape("OSSL_NOPE"), None);
+    }
+
+    #[test]
+    fn alg_table_shaped_and_spotted() {
+        assert_eq!(ALG_NAMES.len(), 625);
+        assert!(is_known_alg("SHA2-256"));
+        assert!(is_known_alg("AES-256-GCM"));
+        assert!(is_known_alg("CSHAKE-128"));
+        assert!(is_known_alg("SNMPKDF"));
+        assert!(!is_known_alg("SPIKE-SHA"));
+        assert!(!is_known_alg("TEST-RAND"));
+        assert!(!is_known_alg(""));
+    }
+
+    #[test]
+    fn classify_alg_rules() {
+        assert_eq!(classify_alg("SHA2-256:SHA256"), ("SHA2-256", false));
+        assert_eq!(classify_alg("SHA1:SHA-1"), ("SHA1", true));
+        assert_eq!(classify_alg("MD5"), ("MD5", true));
+        assert_eq!(classify_alg("SPIKE-SHA"), ("other", false));
+        assert_eq!(classify_alg("canary-DOOM-7QZ"), ("other", false));
+        assert_eq!(classify_alg("AES-256-GCM:MD5"), ("AES-256-GCM", true));
+        assert_eq!(classify_alg(""), ("other", false));
     }
 
     #[test]
