@@ -184,6 +184,10 @@ static void *find_fn(const OSSL_DISPATCH *d, int id)
 
 static unsigned char input[16384];
 
+/* P2 exit-6: spin-pace every digest iter to this period (0 = off).
+ * Set once from -pace-us; nanosleep overshoots at 10us scale. */
+static unsigned long long pace_ns;
+
 static int cmp_u64(const void *a, const void *b)
 {
     unsigned long long x = *(const unsigned long long *)a;
@@ -210,7 +214,7 @@ static int run_digest_1(EVP_MD *md, long n, int times, long tag, long updates)
         }
     }
     for (i = 0; i < n; i++) {
-        unsigned long long t0 = times ? now_ns() : 0;
+        unsigned long long t0 = (times || pace_ns) ? now_ns() : 0;
 
         if (!EVP_DigestInit_ex2(ctx, md, NULL)) {
             fprintf(stderr, "digest iter %ld init failed (tag %ld)\n", i, tag);
@@ -237,6 +241,12 @@ static int run_digest_1(EVP_MD *md, long n, int times, long tag, long updates)
             fprintf(stderr, "t[%ld]=%llu\n", i, now_ns() - t0);
         else if (times == 2)
             ts[i] = now_ns() - t0;
+        if (pace_ns) {
+            unsigned long long deadline = t0 + pace_ns;
+
+            while (now_ns() < deadline)
+                ;
+        }
     }
     EVP_MD_CTX_free(ctx);
     if (times == 2) {
@@ -433,8 +443,10 @@ int main(int argc, char **argv)
             updates = atol(argv[++i]);
         } else if (strcmp(argv[i], "-fallback") == 0) {
             fallback = 1;
+        } else if (strcmp(argv[i], "-pace-us") == 0 && i + 1 < argc) {
+            pace_ns = (unsigned long long)atol(argv[++i]) * 1000ull;
         } else {
-            fprintf(stderr, "usage: evp_driver -n N -alg {digest|sign} [-storm T] [-threads T] [-updates K] [-fallback]\n");
+            fprintf(stderr, "usage: evp_driver -n N -alg {digest|sign} [-storm T] [-threads T] [-updates K] [-pace-us P] [-fallback]\n");
             return 1;
         }
     }
@@ -472,7 +484,7 @@ int main(int argc, char **argv)
     }
     if (n < 0 || alg == NULL
         || (strcmp(alg, "digest") != 0 && strcmp(alg, "sign") != 0)) {
-        fprintf(stderr, "usage: evp_driver -n N -alg {digest|sign} [-storm T] [-threads T] [-updates K] [-fallback]\n");
+        fprintf(stderr, "usage: evp_driver -n N -alg {digest|sign} [-storm T] [-threads T] [-updates K] [-pace-us P] [-fallback]\n");
         return 1;
     }
     if (updates < 1 || updates > 16) {
