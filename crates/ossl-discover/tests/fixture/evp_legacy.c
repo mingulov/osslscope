@@ -1,17 +1,38 @@
-/* P1 exit-3 TP driver: spike EVP fetch (dispatch trigger) plus direct
- * low-level DES calls (legacy tripwire ground truth).
- * Usage: evp_legacy -n N -legacy K (GO1: work, GO2: retrigger, EOF: exit 0).
+/* P1 exit-3 TP driver: spike EVP fetch (dispatch trigger) plus the
+ * full legacy-tripwire ground truth, all through this binary's PLT
+ * (caller-attributed probes must observe exactly these calls):
+ *   - low-level DES x K(+1) + SHA256 Init/Update/Final x1 (all lanes)
+ *   - RSA_meth_new x1 (all lanes; survives 4.0)
+ *   - legacy provider load x1 + MD4 fetch + digest run (all lanes)
+ *   - ENGINE_by_id/init/register_digests/set_default_digests x1 (3.x
+ *     only; 4.0 has no ENGINE API → deterministic engine-less TP
+ *     with an ENGINE-SKIP diagnostic, same #if precedent as
+ *     fallback_provider.c).
+ * Usage: evp_legacy -n N -legacy K (GO1: work, GO2: retrigger +
+ * ENGINE block, EOF: exit 0).
  * stdout: exactly "%ld\n" with N. stderr: PID=/provider/N=/CALLBACKS=/
- * LEGACYDONE markers. Env: SPIKE_PROV/SPIKE_DIGEST select provider + alg.
- * The DES calls go through this binary's PLT: caller-attributed
- * low-level probes must observe exactly the K(+1) cipher/block calls. */
+ * LEGACYDONE/ENGINE-DONE (or ENGINE-SKIP) markers. Env:
+ * SPIKE_PROV/SPIKE_DIGEST select provider + alg.
+ * The ENGINE block runs LAST (after GO2 work): ENGINE_set_default
+ * can redirect subsequent EVP digest execution, so nothing crypto
+ * follows it. Tripwire counts are call counts, not success counts —
+ * only a NULL ENGINE_by_id fails the fixture. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <openssl/des.h>
 #include <openssl/evp.h>
+#include <openssl/opensslv.h>
 #include <openssl/provider.h>
+#include <openssl/rsa.h>
+#include <openssl/sha.h>
+#if OPENSSL_VERSION_MAJOR < 4
+#include <openssl/engine.h>
+#define HAVE_ENGINE 1
+#else
+#define HAVE_ENGINE 0
+#endif
 
 static unsigned char input[1024];
 
@@ -54,6 +75,74 @@ static int run_des(long k)
     }
     return 0;
 }
+
+static int run_sha256(void)
+{
+    SHA256_CTX c;
+    unsigned char out[32];
+
+    SHA256_Init(&c);
+    SHA256_Update(&c, input, sizeof input);
+    SHA256_Final(out, &c);
+    if (out[0] == 0 && out[31] == 0) {
+        fprintf(stderr, "legacy: SHA256 zero (no-op call?)\n");
+        return 1;
+    }
+    return 0;
+}
+
+static int run_meth(void)
+{
+    RSA_METHOD *m = RSA_meth_new("OSSLSCOPE-RSA", 0);
+
+    if (m == NULL) {
+        fprintf(stderr, "legacy: RSA_meth_new failed\n");
+        return 1;
+    }
+    RSA_meth_free(m);
+    return 0;
+}
+
+static int run_legacy_md4(void)
+{
+    OSSL_PROVIDER *lp = OSSL_PROVIDER_load(NULL, "legacy");
+    EVP_MD *md4;
+    int rc;
+
+    if (lp == NULL) {
+        fprintf(stderr, "legacy: legacy provider unavailable\n");
+        return 1;
+    }
+    md4 = EVP_MD_fetch(NULL, "MD4", "provider=legacy");
+    if (md4 == NULL) {
+        fprintf(stderr, "legacy: MD4 fetch failed\n");
+        return 1;
+    }
+    rc = run_digest(md4, 1);
+    EVP_MD_free(md4);
+    return rc;
+}
+
+#if HAVE_ENGINE
+static int run_engine(void)
+{
+    ENGINE *e = ENGINE_by_id("dynamic");
+
+    if (e == NULL) {
+        fprintf(stderr, "legacy: ENGINE_by_id(dynamic) failed\n");
+        return 1;
+    }
+    /* Tripwire counts calls, not success: failures here still fired
+     * the probes, so the fixture continues regardless. The engine
+     * reference is deliberately leaked (no finish/free): ENGINE_free
+     * on the by_id'd dynamic engine double-frees on 3.0.22, and
+     * finish/free are class-Other (unprobed) anyway. */
+    ENGINE_init(e);
+    ENGINE_register_digests(e);
+    ENGINE_set_default_digests(e);
+    return 0;
+}
+#endif
 
 static int want_go(const char *want)
 {
@@ -116,6 +205,10 @@ int main(int argc, char **argv)
     memset(input, 0xA5, sizeof input);
     if (run_digest(md, n) != 0 || run_des(k) != 0)
         return 1;
+    if (run_sha256() != 0 || run_meth() != 0)
+        return 1;
+    if (run_legacy_md4() != 0)
+        return 1;
     fprintf(stderr, "N=%ld\nCALLBACKS=%ld\nLEGACYDONE ops=%ld\n",
         n, 3L * n, k);
 
@@ -123,7 +216,7 @@ int main(int argc, char **argv)
     fflush(stdout);
     /* GO2 retrigger: refetch in a fresh libctx (re-fires the provider
      * query deterministically post-attach) + one more digest iter and
-     * DES call, then EOF. */
+     * DES call, then the ENGINE block (3.x), then EOF. */
     rc = want_go("GO2");
     if (rc < 0)
         return 0;
@@ -149,6 +242,13 @@ int main(int argc, char **argv)
     }
     if (run_digest(md, 1) != 0 || run_des(1) != 0)
         return 1;
+#if HAVE_ENGINE
+    if (run_engine() != 0)
+        return 1;
+    fprintf(stderr, "ENGINE-DONE by_id=1\n");
+#else
+    fprintf(stderr, "ENGINE-SKIP=absent (no ENGINE API)\n");
+#endif
     fprintf(stderr, "REFETCH2=ok\n");
     if (want_go("EOF") < 0)
         return 0;
