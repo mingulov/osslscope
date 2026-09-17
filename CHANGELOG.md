@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased — P3 semantics + policy
+
+- `report`: bounded-window execution counts (human + `observed-crypto-v1.0`
+  JSON, byte-stable), legacy-path section, PARTIAL taxonomy (blind vs
+  clean), exit codes 0/3/4 (+1 child failure, 2 usage), 30 s default
+  window, `--cbom FILE` CycloneDX 1.6 export.
+- `check`: CI policy gate (6 rules: require/deny-provider, deny-engine,
+  deny-algorithm, deny-weak, require-executed) with exit 10 on violation
+  and per-violation actionability tuple (window/cmdline/container/image/
+  provider build-id).
+- `schemas/observed-crypto-v1.json` + reader compat (`v1.x` accepts,
+  other majors reject); 16 report/CBOM goldens; `--help` everywhere.
+- Capture: legacy blind-spot PARTIAL wiring, wall-clock window edges,
+  cmdline/container/build-id identity, signal-graceful drain (exit 3).
+
+## P2 capture engine (gated)
+
+- Keyed exactness (hotkey 100k), fenced remaps/re-harvest, bounded
+  windows, no-eviction DROPFAIL discipline, wall-clock budgets,
+  trigger matrix, allowlist draft, capture-semantics record.
+
+## P1 discovery (gated)
+
+- Privilege model + pid pinning, OSSL_TRACE gap matrix, frozen
+  registries, libcrypto flavor classifier, `inspect --pid/--builtin`,
+  built-in harvest with dumper parity, legacy tripwire design.
+
 ## Unreleased — P1-0 scaffolding
 
 - Workspace layout (`src/`, `crates/{ossl-discover,manifest,ebpf-common,bpf-sys,ebpf}`)

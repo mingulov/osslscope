@@ -20,7 +20,7 @@ installed
     ≠ EXECUTED
 ```
 
-> **Status: P1-0 scaffolding; workspace + fixtures land, discovery in progress.**
+> **Status: P3 semantics + policy done (report/check/CBOM work end to end).**
 > Stack: Rust 1.88 + Aya 0.14 (raw multi-link primary) — confirmed at the P0 gate.
 > Specs appear under `docs/`; see `docs/README.md`.
 
@@ -47,15 +47,39 @@ the eBPF object.
 
 ```sh
 cargo build --locked
-(cd crates/ebpf && cargo build -Z build-std=core \
-    --target bpfel-unknown-none --release --bin osslscope-harvest)
+(cd crates/ebpf && cargo +nightly-2026-05-20 build -Z build-std=core \
+    --target bpfel-unknown-none --release \
+    --bin osslscope-harvest --bin osslscope-count)
 ```
+
+This produces the two BPF objects `report`/`check` need via flags:
+
+- `--object crates/ebpf/target/bpfel-unknown-none/release/osslscope-harvest`
+- `--count-object crates/ebpf/target/bpfel-unknown-none/release/osslscope-count`
 
 First run (one-time setup, then least-privilege runs):
 
 ```sh
 sudo setcap 'cap_bpf,cap_perfmon=ep' target/debug/osslscope
 ./target/debug/osslscope doctor   # preflight; must print verdict: ok
+```
+
+Observe a command (30 s default window, human report):
+
+```sh
+./target/debug/osslscope report --provider /path/to/provider.so \
+    --object <harvest above> --count-object <count above> \
+    run -- my-app --serve
+```
+
+Gate a window in CI (exit 10 on violation; `--help` lists all rules):
+
+```sh
+./target/debug/osslscope check --provider /path/to/provider.so \
+    --object <harvest> --count-object <count> \
+    --deny-weak --deny-provider legacy --format json --out gate.json \
+    run -- my-app --smoke-test
+echo $?  # 0 clean · 10 violation · 3 PARTIAL · 4 environment · 2 usage
 ```
 
 Installable packages (deb/rpm) land with the release.
