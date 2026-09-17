@@ -35,6 +35,10 @@ installed
   but this code path still drops into an old `ENGINE` or the legacy
   provider." (OpenSSL 3.x; `ENGINE` was removed in 4.x.)
 
+Built-in `OSSL_TRACE` cannot answer these: it needs app cooperation,
+ships inert on stock builds, and never proves per-call execution.
+See [the side-by-side gap matrix](docs/trace-gap.md).
+
 ## What it will NOT do
 
 No `SSL_read`/`SSL_write` tracing, no TLS handshake observation, no

@@ -8,3 +8,4 @@ Product documentation. Planned layout (directories appear as their first spec la
 - `schema/` — output schemas (report/profile formats)
 - `notes/` — dated engineering notes
 - `usage.md` — operator's guide (once behavior exists to document)
+- `trace-gap.md` — osslscope vs OSSL_TRACE side-by-side (P1 exit-7)
