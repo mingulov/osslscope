@@ -7,6 +7,8 @@
   rule) with `tests/privacy_allowlist.rs` pins.
 - `HARVESTDBG` now logs classified alg classes, never raw provider
   names.
+- Test-only `OSSL_CANARY_DUMP` ring tap for the P4 canary suite
+  (capped raw-payload dump, never enabled in production).
 
 ## Unreleased — P3 semantics + policy
 

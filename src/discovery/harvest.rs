@@ -29,6 +29,50 @@ fn debug_harvest() -> bool {
     std::env::var("OSSL_DEBUG_HARVEST").is_ok()
 }
 
+/// Test-only ring tap (P4 canary suite): when `OSSL_CANARY_DUMP`
+/// names a file, every raw ring payload is appended there (capped
+/// at 32 MiB). The dump is the ringbuf artifact the canary scanner
+/// checks for secret bytes — it holds raw target strings by design
+/// (non-secret provider names), so it is never set in production.
+struct CanaryDump {
+    file: Option<std::fs::File>,
+    remaining: u64,
+}
+
+impl CanaryDump {
+    fn open_from_env() -> Self {
+        let mut d = CanaryDump {
+            file: None,
+            remaining: 32 << 20,
+        };
+        if let Ok(path) = std::env::var("OSSL_CANARY_DUMP") {
+            if !path.is_empty() {
+                match std::fs::File::create(&path) {
+                    Ok(f) => d.file = Some(f),
+                    Err(e) => eprintln!("canary dump: cannot create {path}: {e}"),
+                }
+            }
+        }
+        d
+    }
+
+    fn write(&mut self, b: &[u8]) {
+        let Some(f) = self.file.as_mut() else {
+            return;
+        };
+        if self.remaining == 0 {
+            return;
+        }
+        let n = b.len().min(self.remaining as usize);
+        use std::io::Write as _;
+        if f.write_all(&b[..n]).is_err() {
+            self.file = None;
+            return;
+        }
+        self.remaining -= n as u64;
+    }
+}
+
 /// Debug-only alg line: classify before printing (logs are
 /// artifacts — raw target strings never serialize, even under the
 /// debug flag).
@@ -678,6 +722,7 @@ pub fn run_detailed(
     let ev_data = MapData::from_fd(ev_fd).map_err(|e| anyhow!("EVENTS mapdata: {e}"))?;
     let ev_map = Map::from_map_data(ev_data).map_err(|e| anyhow!("EVENTS map: {e}"))?;
     let mut ring = RingBuf::try_from(ev_map)?;
+    let mut canary = CanaryDump::open_from_env();
     let start = Instant::now();
     let mut last_event = None;
     let mut trigger_observed = false;
@@ -729,6 +774,7 @@ pub fn run_detailed(
             fresh = true;
             last_event = Some(Instant::now());
             let b: &[u8] = &item;
+            canary.write(b);
             if b.len() < 8 {
                 eprintln!("short event: {} bytes", b.len());
                 continue;
@@ -1251,5 +1297,22 @@ mod tests {
             line,
             "HARVESTDBG alg op=1 arr=0x1000 idx=0 class=SHA2-256 weak=0 len=13"
         );
+    }
+
+    #[test]
+    fn canary_dump_appends_and_caps() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("canary-dump-test-{}", std::process::id()));
+        let mut d = super::CanaryDump {
+            file: Some(std::fs::File::create(&path).unwrap()),
+            remaining: 4,
+        };
+        d.write(b"ab");
+        d.write(b"cdef");
+        d.write(b"GH");
+        drop(d);
+        assert_eq!(std::fs::read(&path).unwrap(), b"abcd");
+        std::fs::remove_file(&path).ok();
     }
 }

@@ -176,6 +176,10 @@ stderr diagnostics:
   never print raw target strings.
 - Errors may echo observer inputs such as paths and CLI options;
   they never carry target memory.
+- Test-only ring dump: `OSSL_CANARY_DUMP=path` appends raw ring
+  payloads (capped at 32 MiB) for the canary suite's ringbuf scan.
+  The dump holds raw target strings by design; it is never enabled
+  in production and never replaces classified emission.
 
 ## 6. Not captured
 
