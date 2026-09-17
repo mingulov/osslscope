@@ -370,13 +370,21 @@ fn debug_drain() -> bool {
 /// hidden); unknown cookies are `unattributed` (PARTIAL by
 /// construction — unreachable on multi, defensive). Hard error on
 /// unreadable maps (a failed drain must never silently fence).
+/// Drains are DELTA-reads: `seen`/`last_drop` carry the previous
+/// totals (map keys persist across fence drains — folding totals
+/// twice would double-count; deleting keys mid-window would race
+/// in-flight increments). Only the delta routes anywhere.
 /// `deadline` bounds grace drains: on expiry the REST is counted
-/// exactly (keys-only tail, no fold) into `shortfall` — past-grace
-/// bookkeeping by design (exactness > grace to the microsecond).
+/// exactly (keys-only tail, no fold, no `seen` record — grace expiry
+/// happens at the final drain only, so no later drain re-adds) into
+/// `shortfall` — past-grace bookkeeping by design (exactness >
+/// grace to the microsecond).
 fn drain_counts(
     loaded: &Loaded,
     current_gen: u32,
     known: &HashSet<u32>,
+    seen: &mut HashMap<(u32, u32), u64>,
+    last_drop: &mut u64,
     deadline: Option<Instant>,
 ) -> anyhow::Result<DrainOut> {
     use anyhow::Context as _;
@@ -429,34 +437,47 @@ fn drain_counts(
             continue;
         }
         let (cookie, generation) = split_key(key);
+        let prev = seen.insert((cookie, generation), total.count);
+        let delta = total.count.saturating_sub(prev.unwrap_or(0));
+        if delta == 0 {
+            continue;
+        }
         if generation != current_gen {
-            out.stale_events += total.count;
+            out.stale_events += delta;
             out.stale_keys += 1;
             if debug_drain() {
                 eprintln!(
-                    "DRAINDBG stale cookie={cookie} generation={generation} count={}",
+                    "DRAINDBG stale cookie={cookie} generation={generation} delta={delta} total={}",
                     total.count
                 );
             }
         } else if !known.contains(&cookie) {
-            out.unattributed += total.count;
+            out.unattributed += delta;
             if debug_drain() {
                 eprintln!(
-                    "DRAINDBG unattributed cookie={cookie} count={}",
+                    "DRAINDBG unattributed cookie={cookie} delta={delta} total={}",
                     total.count
                 );
             }
         } else {
-            out.folded.entry(cookie).or_default().fold(&total);
+            let piece = CountValue {
+                count: delta,
+                first_ns: total.first_ns,
+                last_ns: total.last_ns,
+            };
+            out.folded.entry(cookie).or_default().fold(&piece);
         }
     }
     let drops = dup("DROPFAIL")?;
     let drops = aya::maps::PerCpuArray::<_, u64>::try_from(drops)
         .map_err(|e| anyhow::anyhow!("DROPFAIL typed: {e}"))?;
+    let mut total_drop = 0u64;
     for r in drops.iter() {
         let per_cpu = r.map_err(|e| anyhow::anyhow!("DROPFAIL iter: {e}"))?;
-        out.dropfail += per_cpu.iter().sum::<u64>();
+        total_drop += per_cpu.iter().sum::<u64>();
     }
+    out.dropfail = total_drop.saturating_sub(*last_drop);
+    *last_drop = total_drop;
     out.wall_us = t0.elapsed().as_micros() as u64;
     Ok(out)
 }
@@ -527,13 +548,39 @@ fn comm_of(pid: u32) -> String {
 
 // ---------------------------------------------------------------- engine
 
+/// Attached probe site: path + backing identity + file offset. The
+/// (dev, ino) half re-arms same-path upgrades (a new build at an old
+/// path is a NEW site); the path+offset half keeps same-file reloads
+/// on their surviving links (inode probes persist across remap —
+/// re-attaching would double-fire every hit).
+type AttachedSite = (String, String, u64, u64);
+
+/// Sites of one group not yet attached (pure — unit-tested).
+/// Returns (index-in-group, offset, cookie) for the pending sites.
+fn pending_sites(
+    attached: &HashSet<AttachedSite>,
+    path: &str,
+    dev: &str,
+    ino: u64,
+    sites: &[(u64, u64)],
+) -> Vec<(usize, u64, u64)> {
+    sites
+        .iter()
+        .enumerate()
+        .filter(|(_, (off, _))| {
+            !attached.contains(&(path.to_string(), dev.to_string(), ino, *off))
+        })
+        .map(|(i, (off, ck))| (i, *off, *ck))
+        .collect()
+}
+
 struct Engine<'a> {
     cfg: &'a Config,
     pid: u32,
     pin: Option<pin::TargetPin>,
     loaded: Loaded,
     links: Vec<OwnedFd>,
-    attached: HashSet<(String, u64)>,
+    attached: HashSet<AttachedSite>,
     stable: plan::StableCookies,
     known: HashSet<u32>,
     identities: HashMap<u32, (plan::Identity, Vec<plan::Identity>)>,
@@ -547,6 +594,13 @@ struct Engine<'a> {
     children_seen: HashSet<u32>,
     snapshot: Snapshot,
     drain_wall_us: u64,
+    /// Last folded total per (cookie, generation): drains are
+    /// delta-reads (map keys persist across fence drains — folding
+    /// totals twice would double-count, and deleting keys mid-window
+    /// would race in-flight increments).
+    seen: HashMap<(u32, u32), u64>,
+    /// Last observed DROPFAIL total (same delta discipline).
+    last_dropfail: u64,
     child_exit: Option<i32>,
     window_start: Instant,
     window_end: Instant,
@@ -559,15 +613,17 @@ impl<'a> Engine<'a> {
     }
 
     fn planned_paths(&self) -> Vec<String> {
-        let mut v: Vec<String> = self.attached.iter().map(|(p, _)| p.clone()).collect();
+        let mut v: Vec<String> = self.attached.iter().map(|(p, _, _, _)| p.clone()).collect();
         v.sort();
         v.dedup();
         v
     }
 
-    /// Plan + attach all unattached sites of the basis rows at the
-    /// current generation. Returns false when nothing is attached
-    /// after this call (fatal AttachZero for the caller to raise).
+    /// Plan + attach the basis rows' not-yet-attached sites at the
+    /// current generation. Re-plans skip surviving sites (their links
+    /// persist across remaps — re-attaching would double-fire).
+    /// Returns false when nothing is attached after this call
+    /// (fatal AttachZero for the caller to raise).
     fn plan_and_attach(&mut self, basis: &serde_json::Value) -> anyhow::Result<bool> {
         let live = maps::read_maps(self.pid)?;
         let files = read_files(&live);
@@ -583,19 +639,31 @@ impl<'a> Engine<'a> {
             .ok_or_else(|| anyhow::anyhow!("no count_entry prog"))?
             .as_raw_fd();
         for g in plan::groups(&p) {
+            // First X mapping wins (same rule as snapshot()).
+            let (dev, ino) = live
+                .iter()
+                .filter(|m| m.path == g.path && m.x)
+                .map(|m| (m.dev.clone(), m.ino))
+                .next()
+                .unwrap_or_default();
             let sites: Vec<(u64, u64)> = g
                 .offsets
                 .iter()
                 .zip(g.cookies.iter())
                 .map(|(o, c)| (*o, *c))
                 .collect();
+            let pending = pending_sites(&self.attached, &g.path, &dev, ino, &sites);
+            if pending.is_empty() {
+                continue;
+            }
+            let work: Vec<(u64, u64)> = pending.iter().map(|(_, o, c)| (*o, *c)).collect();
             let (links, bad) = plan::bisect_attach(
                 &|s| {
                     let offs: Vec<u64> = s.iter().map(|t| t.0).collect();
                     let cks: Vec<u64> = s.iter().map(|t| t.1).collect();
                     plan::attach_group(prog_fd, self.pid, &g.path, &offs, &cks)
                 },
-                &sites,
+                &work,
             );
             if !bad.is_empty() {
                 self.counters.unresolved_offsets += bad.len() as u64;
@@ -603,9 +671,10 @@ impl<'a> Engine<'a> {
                 self.reason("unresolved-offsets");
             }
             self.links.extend(links);
-            for (i, (off, _)) in sites.iter().enumerate() {
-                if bad.binary_search(&i).is_err() {
-                    self.attached.insert((g.path.clone(), *off));
+            for (j, (_, off, _)) in pending.iter().enumerate() {
+                if bad.binary_search(&j).is_err() {
+                    self.attached
+                        .insert((g.path.clone(), dev.clone(), ino, *off));
                 }
             }
         }
@@ -638,7 +707,14 @@ impl<'a> Engine<'a> {
     /// §3 drain-then-fence: drain fully, bucket the generation,
     /// bump GEN, re-harvest new files, re-plan, re-attach.
     fn fence(&mut self, kinds: Vec<FenceKind>, next: &Snapshot) -> anyhow::Result<()> {
-        let d = drain_counts(&self.loaded, self.generation, &self.known, None)?;
+        let d = drain_counts(
+            &self.loaded,
+            self.generation,
+            &self.known,
+            &mut self.seen,
+            &mut self.last_dropfail,
+            None,
+        )?;
         self.absorb(d);
         let events = self.current.values().map(|v| v.count).sum();
         eprintln!(
@@ -857,6 +933,8 @@ pub fn run(cfg: &Config, target: Target) -> anyhow::Result<Capture> {
                 children_seen: HashSet::new(),
                 snapshot: Snapshot::default(),
                 drain_wall_us: 0,
+                seen: HashMap::new(),
+                last_dropfail: 0,
                 child_exit: None,
                 window_start: Instant::now(),
                 window_end: Instant::now(),
@@ -899,6 +977,8 @@ pub fn run(cfg: &Config, target: Target) -> anyhow::Result<Capture> {
         children_seen: HashSet::new(),
         snapshot: Snapshot::default(),
         drain_wall_us: 0,
+        seen: HashMap::new(),
+        last_dropfail: 0,
         child_exit: None,
         window_start: Instant::now(),
         window_end: Instant::now(),
@@ -1044,8 +1124,23 @@ pub fn run(cfg: &Config, target: Target) -> anyhow::Result<Capture> {
             engine.reason("fork-exec-ignored");
         }
     }
+    // TEST HOOK (exit-3 kernel-proof): hold the final drain past
+    // close so a still-counting kernel would advance last_ns beyond
+    // the window edge. Production behavior unchanged when unset.
+    if let Ok(ms) = std::env::var("OSSLSCOPE_DRAIN_DELAY_MS") {
+        if let Ok(ms) = ms.parse::<u64>() {
+            std::thread::sleep(Duration::from_millis(ms));
+        }
+    }
     let deadline = interrupted_flag.then(|| Instant::now() + cfg.grace);
-    let d = drain_counts(&engine.loaded, engine.generation, &engine.known, deadline)?;
+    let d = drain_counts(
+        &engine.loaded,
+        engine.generation,
+        &engine.known,
+        &mut engine.seen,
+        &mut engine.last_dropfail,
+        deadline,
+    )?;
     engine.absorb(d);
     if interrupted_flag {
         engine.reason("interrupted");
@@ -1161,5 +1256,25 @@ mod tests {
             vec![("/lib/x.so", "08:01", 7, Some(99))],
         );
         assert_eq!(detect_fence(&base, &execd), vec![FenceKind::Exec]);
+    }
+
+    #[test]
+    fn replan_skips_attached_sites() {
+        let mut attached: HashSet<AttachedSite> = HashSet::new();
+        attached.insert(("/lib/x.so".to_string(), "08:01".to_string(), 7, 0x100));
+        let sites = vec![(0x100u64, 0u64), (0x200u64, 1u64)];
+        // Same file: only the new offset pends (no double-fire).
+        assert_eq!(
+            pending_sites(&attached, "/lib/x.so", "08:01", 7, &sites),
+            vec![(1, 0x200, 1)]
+        );
+        // Same path, new build: everything pends (re-arm).
+        assert_eq!(
+            pending_sites(&attached, "/lib/x.so", "08:01", 9, &sites),
+            vec![(0, 0x100, 0), (1, 0x200, 1)]
+        );
+        // Fully attached: empty (re-plan attaches nothing).
+        attached.insert(("/lib/x.so".to_string(), "08:01".to_string(), 7, 0x200));
+        assert!(pending_sites(&attached, "/lib/x.so", "08:01", 7, &sites).is_empty());
     }
 }
