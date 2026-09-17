@@ -70,11 +70,35 @@ pub fn emit(
     stats: &Stats,
 ) -> anyhow::Result<serde_json::Value> {
     let elf = elf::parse_elf(elf_bytes)?;
+    // M4 fence (P1 exit 4): discovery tables are not semantic
+    // authority. Same (op, claimed-name, funcid) at >1 distinct impl
+    // address = the provider contradicts itself (shifting tables; P1
+    // conflates churn with lying — P2 generations will distinguish).
+    // Disagreeing rows are fenced (count-only, never attributed).
+    let mut claim_addrs: std::collections::HashMap<(u32, &str, u32), Vec<u64>> =
+        std::collections::HashMap::new();
+    for r in rows {
+        claim_addrs
+            .entry((r.op, r.alg.as_str(), r.funcid))
+            .or_default()
+            .push(r.addr);
+    }
+    let disagreeing: std::collections::HashSet<(u32, &str, u32)> = claim_addrs
+        .iter()
+        .filter(|(_, addrs)| {
+            let mut sorted = (*addrs).clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            sorted.len() > 1
+        })
+        .map(|(k, _)| *k)
+        .collect();
     // Foreign-file ELF bytes (shared-code rows): path → bytes, failures
     // cached as empty (parse then fails → unbacked, no repeated reads).
     let mut elf_cache: std::collections::HashMap<String, Vec<u8>> =
         std::collections::HashMap::new();
     let mut jrows = Vec::with_capacity(rows.len());
+    let mut fenced: u64 = 0;
     for r in rows {
         let (backed, dev, ino, off) =
             match maps::provider_mapping(live_maps, provider, canon, r.addr) {
@@ -104,6 +128,17 @@ pub fn emit(
                     None => (false, String::new(), 0, 0),
                 },
             };
+        // Fence: disagreeing claims, or impl in no file-backed x
+        // mapping (forged pointer; JIT/anon-x equally un-pinnable —
+        // PRD no_attribution: no stable store → count-only).
+        // Shared-code rows (impl in ANOTHER file) stay: their
+        // backing triple is truthful, and alias-audit reports the
+        // sharing. Fenced rows leave no attribution (no class, no
+        // backing) — the count is the whole signal.
+        if disagreeing.contains(&(r.op, r.alg.as_str(), r.funcid)) || !backed {
+            fenced += 1;
+            continue;
+        }
         let (alg_class, weak) = crate::kinds::classify_alg(&r.alg);
         jrows.push(serde_json::json!({
             "provider": provider_name,
@@ -124,14 +159,19 @@ pub fn emit(
         "gen": 0,
         "rows": jrows,
     });
-    // PARTIAL iff an explicit reason, a zero-row op, or a walk
-    // overflow; derived reason ranks truncation above zero-row-ops.
-    let partial =
-        stats.reason.is_some() || !stats.zero_row_ops.is_empty() || !stats.truncated.is_empty();
+    // PARTIAL iff an explicit reason, a fenced row, a zero-row op,
+    // or a walk overflow; derived reason ranks fence above
+    // truncation above zero-row-ops (integrity > completeness).
+    let partial = stats.reason.is_some()
+        || fenced > 0
+        || !stats.zero_row_ops.is_empty()
+        || !stats.truncated.is_empty();
     let counts = stats.builtin || partial;
     if partial {
         let reason = stats.reason.clone().unwrap_or_else(|| {
-            if stats.truncated.is_empty() {
+            if fenced > 0 {
+                "fenced-rows".to_string()
+            } else if stats.truncated.is_empty() {
                 "zero-row-ops".to_string()
             } else {
                 "truncated-walk".to_string()
@@ -161,6 +201,9 @@ pub fn emit(
         }
         if stats.foreign_dropped > 0 {
             doc["foreign_rows_dropped"] = stats.foreign_dropped.into();
+        }
+        if fenced > 0 {
+            doc["fenced_rows"] = fenced.into();
         }
         // Registry ops without rows (inventory scope / PARTIAL depth).
         let covered: std::collections::HashSet<u32> = rows.iter().map(|r| r.op).collect();
@@ -205,6 +248,35 @@ mod tests {
         ]
     }
 
+    /// Backed maps into the test exe: addrs land in a real x
+    /// PT_LOAD (computed, never hardcoded) so rows back.
+    fn backed_maps() -> (Vec<u8>, Vec<crate::discovery::maps::Mapping>) {
+        let exe = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+        let elf = crate::discovery::elf::parse_elf(&exe).unwrap();
+        let ph = elf
+            .program_headers
+            .iter()
+            .find(|ph| {
+                ph.p_type == goblin::elf::program_header::PT_LOAD
+                    && ph.p_flags & goblin::elf::program_header::PF_X != 0
+            })
+            .unwrap();
+        let maps = vec![crate::discovery::maps::Mapping {
+            start: 0x1000,
+            end: 0x1000 + ph.p_filesz,
+            x: true,
+            offset: ph.p_offset,
+            dev: "08:01".to_string(),
+            ino: 42,
+            path: "t".to_string(),
+        }];
+        (exe, maps)
+    }
+
+    fn backed_addr(i: u64) -> u64 {
+        0x1000 + i * 0x10
+    }
+
     #[test]
     fn doc_shape_and_hash_preimage() {
         let rows = vec![
@@ -212,32 +284,31 @@ mod tests {
                 op: 1,
                 alg: "SHA2-256:SHA256".into(),
                 funcid: 7,
-                addr: 0x1000,
+                addr: backed_addr(0),
                 arr: 0,
             },
             Row {
                 op: 1,
                 alg: "canary-DOOM-7QZ".into(),
                 funcid: 1,
-                addr: 0x2000,
+                addr: backed_addr(1),
                 arr: 0,
             },
             Row {
                 op: 1,
                 alg: "MD5".into(),
                 funcid: 2,
-                addr: 0x3000,
+                addr: backed_addr(2),
                 arr: 0,
             },
         ];
-        // Deferred mapping: no maps → unbacked, but shape + hash hold.
-        let exe = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+        let (exe, maps) = backed_maps();
         let doc = emit(
             "t",
             Path::new("t"),
             "",
             &exe,
-            &[],
+            &maps,
             &rows,
             true,
             &Stats::trivial(),
@@ -253,9 +324,11 @@ mod tests {
         assert_eq!(jrows[2]["alg_class"], "MD5");
         assert_eq!(jrows[2]["weak"], true);
         let r = &jrows[0];
-        assert_eq!(r["addr_backed"], false);
-        // Unbacked triple → the documented degenerate hash.
-        assert_eq!(r["addr_hash"], crate::kinds::addr_hash("", 0, 0));
+        assert_eq!(r["addr_backed"], true);
+        assert_eq!(
+            r["addr_hash"],
+            crate::kinds::addr_hash("08:01", 42, r["backing"]["offset"].as_u64().unwrap())
+        );
     }
 
     fn emit_with(rows: &[Row], stats: &Stats) -> serde_json::Value {
@@ -263,10 +336,23 @@ mod tests {
         emit("t", Path::new("t"), "", &exe, &[], rows, true, stats).unwrap()
     }
 
+    fn emit_backed(rows: &[Row], stats: &Stats) -> serde_json::Value {
+        let (exe, maps) = backed_maps();
+        emit("t", Path::new("t"), "", &exe, &maps, rows, true, stats).unwrap()
+    }
+
     #[test]
     fn trivial_stats_preserves_exit1_shape() {
         // P1-exit-1 byte-compat: COMPLETE provider docs gain NO keys.
-        let doc = emit_with(&sample_rows(), &Stats::trivial());
+        let rows: Vec<Row> = sample_rows()
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut r)| {
+                r.addr = backed_addr(i as u64);
+                r
+            })
+            .collect();
+        let doc = emit_backed(&rows, &Stats::trivial());
         for k in [
             "status",
             "reason",
@@ -276,10 +362,98 @@ mod tests {
             "uninstrumented_ops",
             "truncated_ops",
             "foreign_rows_dropped",
+            "fenced_rows",
         ] {
             assert!(doc.get(k).is_none(), "leaked key {k}");
         }
         assert_eq!(doc["rows"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn fence_disagreeing_claims_are_count_only() {
+        // Same (op, name, funcid) at two addrs (shifting tables):
+        // BOTH rows fenced — neither attribution is trustworthy.
+        let rows = vec![
+            Row {
+                op: 1,
+                alg: "LYING-SHA".into(),
+                funcid: 3,
+                addr: backed_addr(0),
+                arr: 0,
+            },
+            Row {
+                op: 1,
+                alg: "LYING-SHA".into(),
+                funcid: 3,
+                addr: backed_addr(1),
+                arr: 0,
+            },
+            Row {
+                op: 1,
+                alg: "HONEST-SHA".into(),
+                funcid: 3,
+                addr: backed_addr(2),
+                arr: 0,
+            },
+        ];
+        let doc = emit_backed(&rows, &Stats::trivial());
+        assert_eq!(doc["status"], "PARTIAL");
+        assert_eq!(doc["reason"], "fenced-rows");
+        assert_eq!(doc["fenced_rows"], 2);
+        let jrows = doc["rows"].as_array().unwrap();
+        assert_eq!(jrows.len(), 1);
+        // Fenced rows leave no attribution (no class, no backing).
+        let txt = serde_json::to_string(&doc).unwrap();
+        assert!(!txt.contains("LYING-SHA"));
+    }
+
+    #[test]
+    fn fence_unbacked_impls() {
+        // Impl in no file mapping (forged pointer): fenced even
+        // with a unique claim.
+        let rows = vec![Row {
+            op: 1,
+            alg: "LYING-UNBACKED".into(),
+            funcid: 3,
+            addr: 0x7f00_0000_0000,
+            arr: 0,
+        }];
+        let doc = emit_backed(&rows, &Stats::trivial());
+        assert_eq!(doc["reason"], "fenced-rows");
+        assert_eq!(doc["fenced_rows"], 1);
+        assert!(doc["rows"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn fence_reason_yields_to_explicit() {
+        // Explicit PARTIAL reasons (blind dispatch, empty rows)
+        // keep their name; fence ranks above walk-completeness.
+        let row = Row {
+            op: 1,
+            alg: "LYING-SHA".into(),
+            funcid: 3,
+            addr: backed_addr(0),
+            arr: 0,
+        };
+        let dupe = vec![
+            row.clone(),
+            Row {
+                addr: backed_addr(1),
+                ..row
+            },
+        ];
+        let stats = Stats {
+            reason: Some("anchor-unresolved".into()),
+            ..Stats::trivial()
+        };
+        let doc = emit_backed(&dupe, &stats);
+        assert_eq!(doc["reason"], "anchor-unresolved");
+        let stats = Stats {
+            truncated: vec![(1, 1)],
+            ..Stats::trivial()
+        };
+        let doc = emit_backed(&dupe, &stats);
+        assert_eq!(doc["reason"], "fenced-rows");
     }
 
     #[test]
@@ -296,6 +470,7 @@ mod tests {
         assert!(doc.get("queries_observed").is_none());
         assert!(doc.get("zero_row_ops").is_none());
         assert!(doc.get("truncated_ops").is_none());
+        assert!(doc.get("fenced_rows").is_none());
     }
 
     #[test]
@@ -309,7 +484,15 @@ mod tests {
             reason: None,
             foreign_dropped: 2,
         };
-        let doc = emit_with(&sample_rows(), &stats);
+        let rows: Vec<Row> = sample_rows()
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut r)| {
+                r.addr = backed_addr(i as u64);
+                r
+            })
+            .collect();
+        let doc = emit_backed(&rows, &stats);
         assert_eq!(doc["status"], "PARTIAL");
         // Truncation outranks zero-row-ops in the derived reason.
         assert_eq!(doc["reason"], "truncated-walk");
@@ -329,7 +512,15 @@ mod tests {
             queries_observed: 9,
             ..Stats::trivial()
         };
-        let doc = emit_with(&sample_rows(), &stats);
+        let rows: Vec<Row> = sample_rows()
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut r)| {
+                r.addr = backed_addr(i as u64);
+                r
+            })
+            .collect();
+        let doc = emit_backed(&rows, &stats);
         assert!(doc.get("status").is_none());
         assert!(doc.get("reason").is_none());
         assert_eq!(doc["queries_observed"], 9);
@@ -366,7 +557,7 @@ mod tests {
             },
             Row {
                 op: 1,
-                alg: "SHA1".into(),
+                alg: "SHA1-UNMAPPED".into(),
                 funcid: 3,
                 addr: 0x1234,
                 arr: 0,
@@ -390,8 +581,10 @@ mod tests {
             jrows[0]["addr_hash"],
             crate::kinds::addr_hash("08:01", 999, off)
         );
-        // Unmapped rows keep the degenerate triple.
-        assert_eq!(jrows[1]["addr_backed"], false);
-        assert_eq!(jrows[1]["backing"]["offset"], 0);
+        // Unmapped rows are fenced (count-only, never attributed).
+        assert_eq!(jrows.len(), 1);
+        assert_eq!(doc["status"], "PARTIAL");
+        assert_eq!(doc["reason"], "fenced-rows");
+        assert_eq!(doc["fenced_rows"], 1);
     }
 }
