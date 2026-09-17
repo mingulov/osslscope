@@ -43,6 +43,9 @@ pub struct Config {
     pub settle: Duration,
     pub harvest_timeout: Duration,
     pub grace: Duration,
+    /// CI-supplied container image digest for the check
+    /// actionability tuple ("" when unknown — bare metal).
+    pub image_digest: String,
 }
 
 /// Capture target: spawned child (`run --`) or live pid (staging).
@@ -150,6 +153,8 @@ pub struct Capture {
     pub target_cmdline: String,
     pub target_container_id: String,
     pub provider_build_id: String,
+    pub provider_path: String,
+    pub image_digest: String,
 }
 
 // ---------------------------------------------------------------- signals
@@ -890,6 +895,8 @@ struct Engine<'a> {
     target_cmdline: String,
     target_container_id: String,
     provider_build_id: String,
+    provider_path: String,
+    image_digest: String,
     harvest_doc: serde_json::Value,
     /// Merged `legacy` subtree (initial + re-harvests, disjoint
     /// harvest phases — merge_legacy sums/unions; Null when no
@@ -1249,6 +1256,8 @@ impl<'a> Engine<'a> {
             target_cmdline: self.target_cmdline,
             target_container_id: self.target_container_id,
             provider_build_id: self.provider_build_id,
+            provider_path: self.provider_path,
+            image_digest: self.image_digest,
         }
     }
 
@@ -1301,6 +1310,8 @@ pub fn run(cfg: &Config, target: Target) -> anyhow::Result<Capture> {
         .ok()
         .and_then(|b| elf::read_build_id(&b))
         .unwrap_or_else(|| "unknown".to_string());
+    let provider_path = cfg.provider.to_string_lossy().into_owned();
+    let image_digest = cfg.image_digest.clone();
     // Non-reaping death probe during harvest (reaping would race
     // harvest's own pin); the poll loop reaps via waitpid.
     let should_stop = || interrupted() || (spawn && child_gone(pid));
@@ -1356,6 +1367,8 @@ pub fn run(cfg: &Config, target: Target) -> anyhow::Result<Capture> {
                 target_cmdline: cmdline.clone(),
                 target_container_id: container_id.clone(),
                 provider_build_id: provider_build_id.clone(),
+                provider_path: provider_path.clone(),
+                image_digest: image_digest.clone(),
                 harvest_doc: serde_json::json!({}),
                 legacy: serde_json::Value::Null,
             };
@@ -1407,6 +1420,8 @@ pub fn run(cfg: &Config, target: Target) -> anyhow::Result<Capture> {
         target_cmdline: cmdline,
         target_container_id: container_id,
         provider_build_id,
+        provider_path,
+        image_digest,
         harvest_doc: doc.clone(),
         legacy: doc.get("legacy").cloned().unwrap_or(serde_json::Value::Null),
     };

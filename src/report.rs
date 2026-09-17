@@ -33,6 +33,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
     let mut timeout = 60.0f64;
     let mut grace = 5.0f64;
     let mut pid: Option<u32> = None;
+    let mut image_digest = String::new();
     let mut run_at: Option<usize> = None;
     let mut i = 0;
     while i < argv.len() {
@@ -60,6 +61,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             "--timeout" => timeout = val(a)?.parse().map_err(|_| "--timeout needs seconds")?,
             "--grace" => grace = val(a)?.parse().map_err(|_| "--grace needs seconds")?,
             "--pid" => pid = Some(val(a)?.parse().map_err(|_| "--pid needs an integer")?),
+            "--image-digest" => image_digest = val(a)?,
             x => return Err(format!("unknown flag {x}")),
         }
         i += 2;
@@ -105,6 +107,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             settle: Duration::from_secs_f64(settle),
             harvest_timeout: Duration::from_secs_f64(timeout),
             grace: Duration::from_secs_f64(grace),
+            image_digest,
         },
         target,
         format,
@@ -122,6 +125,12 @@ fn exit_for(c: &capture::Capture) -> u8 {
         capture::Outcome::Partial => 3,
         capture::Outcome::Complete => 0,
     }
+}
+
+fn epoch_of(t: std::time::SystemTime) -> f64 {
+    t.duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
 }
 
 fn doc(c: &capture::Capture) -> serde_json::Value {
@@ -153,9 +162,13 @@ fn doc(c: &capture::Capture) -> serde_json::Value {
         })
         .collect();
     let mut d = serde_json::json!({
-        "schema_version": "0.2-provisional",
-        "target": {"pid": c.target_pid, "comm": c.target_comm},
-        "window": {"planned_s": c.window_planned.as_secs_f64(), "actual_s": c.window_actual.as_secs_f64()},
+        "schema_version": "observed-crypto-v1.0",
+        "target": {"pid": c.target_pid, "comm": c.target_comm, "cmdline": c.target_cmdline,
+                   "container_id": c.target_container_id, "image_digest": c.image_digest},
+        "window": {"planned_s": c.window_planned.as_secs_f64(), "actual_s": c.window_actual.as_secs_f64(),
+                   "start_epoch": epoch_of(c.window_start_wall), "end_epoch": epoch_of(c.window_end_wall)},
+        "kernel": c.kernel_release,
+        "provider": {"path": c.provider_path, "build_id": c.provider_build_id},
         "completeness": {
             "status": status,
             "reasons": c.reasons,
@@ -290,7 +303,7 @@ pub fn run(argv: &[String]) -> ExitCode {
         Err(e) => {
             eprintln!("osslscope report: {e}");
             eprintln!(
-                "usage: report --duration S --provider P --object O --count-object C [--format human|json] [--out F] [--builtin] [--settle S] [--timeout S] [--grace S] {{--pid P | run -- <cmd>}}"
+                "usage: report --duration S --provider P --object O --count-object C [--format human|json] [--out F] [--builtin] [--settle S] [--timeout S] [--grace S] [--image-digest D] {{--pid P | run -- <cmd>}}"
             );
             return ExitCode::from(2);
         }
@@ -343,6 +356,8 @@ mod tests {
             target_cmdline: "t".to_string(),
             target_container_id: String::new(),
             provider_build_id: "unknown".to_string(),
+            provider_path: "/p/provider.so".to_string(),
+            image_digest: String::new(),
         }
     }
 
@@ -368,11 +383,22 @@ mod tests {
     #[test]
     fn doc_shape() {
         let d = doc(&cap(capture::Outcome::Complete, Some(0)));
-        assert_eq!(d["schema_version"], "0.2-provisional");
+        assert_eq!(d["schema_version"], "observed-crypto-v1.0");
         assert_eq!(d["completeness"]["status"], "COMPLETE");
         assert!(d["completeness"]["counters"]["dropped_events"].is_number());
         assert!(d["executions"].as_array().unwrap().is_empty());
         assert_eq!(d["child_exit"], 0);
+        // P3 window/target enrichment (fixed stamps in cap()).
+        assert_eq!(d["window"]["start_epoch"], 1_700_000_000.0);
+        assert_eq!(d["window"]["end_epoch"], 1_700_000_001.0);
+        assert_eq!(d["target"]["cmdline"], "t");
+        assert_eq!(d["target"]["container_id"], "");
+        assert_eq!(d["target"]["image_digest"], "");
+        assert_eq!(d["kernel"], "test-kernel");
+        assert_eq!(d["provider"]["path"], "/p/provider.so");
+        assert_eq!(d["provider"]["build_id"], "unknown");
+        assert!(d.get("policy").is_none(), "report omits policy (check adds it)");
+        assert!(d.get("kat").is_none(), "v1 has no KAT discriminator");
         let d = doc(&cap(capture::Outcome::Partial, None));
         assert!(d.get("child_exit").is_none());
     }
@@ -404,5 +430,11 @@ mod tests {
         let mut yaml = base.clone();
         yaml.extend(["--pid", "9", "--format", "yaml"]);
         assert!(parse(&v(yaml)).is_err());
+        let mut digest = base.clone();
+        digest.extend(["--pid", "9", "--image-digest", "sha256:abc"]);
+        assert_eq!(parse(&v(digest)).unwrap().cfg.image_digest, "sha256:abc");
+        let mut no_digest = base.clone();
+        no_digest.extend(["--pid", "9"]);
+        assert_eq!(parse(&v(no_digest)).unwrap().cfg.image_digest, "");
     }
 }
