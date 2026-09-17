@@ -177,7 +177,7 @@ fn doc(c: &capture::Capture) -> serde_json::Value {
             },
         },
         "executions": executions,
-        "legacy": null,
+        "legacy": legacy_with_executed_weak(c),
         "stale": c.stale.iter().map(|s| serde_json::json!({
             "generation": s.generation, "events": s.events, "keys": s.keys,
             "detail": s.detail.iter().map(|d| serde_json::json!({
@@ -193,6 +193,41 @@ fn doc(c: &capture::Capture) -> serde_json::Value {
         d["child_exit"] = code.into();
     }
     d
+}
+
+/// Adopted harvest `legacy` block plus window-executed weak rollup:
+/// `weak.executed_calls`/`weak.executed_algs` count executions (and
+/// fenced detail) whose class is registry-weak; `weak.unknown_calls`
+/// counts `other`-class executions (custom spellings — triage, never
+/// auto-deny). Null legacy stays null (no harvest produced one).
+fn legacy_with_executed_weak(c: &capture::Capture) -> serde_json::Value {
+    let mut legacy = c.legacy.clone();
+    if legacy.is_null() {
+        return legacy;
+    }
+    let mut calls = 0u64;
+    let mut unknown = 0u64;
+    let mut algs = std::collections::BTreeSet::new();
+    let mut fold = |class: &str, n: u64| {
+        if crate::kinds::is_weak_alg(class) {
+            calls += n;
+            algs.insert(class.to_string());
+        } else if class == "other" {
+            unknown += n;
+        }
+    };
+    for e in &c.executions {
+        fold(&e.id.alg_class, e.count);
+    }
+    for s in &c.stale {
+        for d in &s.detail {
+            fold(&d.id.alg_class, d.count);
+        }
+    }
+    legacy["weak"]["executed_calls"] = calls.into();
+    legacy["weak"]["executed_algs"] = algs.into_iter().collect::<Vec<_>>().into();
+    legacy["weak"]["unknown_calls"] = unknown.into();
+    legacy
 }
 
 fn human(c: &capture::Capture) -> String {
@@ -301,6 +336,7 @@ mod tests {
             child_exit,
             drain_wall_us: 0,
             harvest_doc: serde_json::json!({}),
+            legacy: serde_json::Value::Null,
         }
     }
 

@@ -228,6 +228,64 @@ fn attach_trips(
     Ok(())
 }
 
+/// Plan + attach legacy tripwires against the CURRENT image.
+/// Returns `(None, None)` when libcrypto isn't mapped (pre-exec or
+/// statically linked) — the caller defers or goes blind.
+fn plan_legacy_trips(
+    cfg: &Config,
+    loaded: &Loaded,
+    links: &mut Links,
+    pid: u32,
+) -> anyhow::Result<(Option<legacy::ProbeSet>, Option<String>)> {
+    let maps0 = maps::read_maps(cfg.pid).unwrap_or_default();
+    let Some(lc_path) = legacy::find_libcrypto(&maps0) else {
+        return Ok((None, None));
+    };
+    let lc_bytes =
+        std::fs::read(&lc_path).with_context(|| format!("read target libcrypto {lc_path}"))?;
+    // Caller modules for low-level PLT planning. Unreadable
+    // files (deleted-but-mapped, permissions) are loud
+    // findings: their imports stay unknown.
+    let mut mod_bytes: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut unreadable: Vec<String> = Vec::new();
+    for path in legacy::target_modules(&maps0, &lc_path) {
+        match std::fs::read(&path) {
+            Ok(bytes) => mod_bytes.push((path, bytes)),
+            Err(_) => unreadable.push(path),
+        }
+    }
+    let modules: Vec<legacy::Module> = mod_bytes
+        .iter()
+        .map(|(p, b)| legacy::Module { path: p, bytes: b })
+        .collect();
+    let mut set = legacy::probes_for(&lc_path, &lc_bytes, &modules)?;
+    for path in &unreadable {
+        set.findings
+            .push(format!("unreadable module: {path} (imports unknown)"));
+    }
+    attach_trips(loaded, links, &set, pid)?;
+    eprintln!("INSPECT stage=legacy trips={}", set.probes.len());
+    let mut note = None;
+    for cand in legacy_candidates(cfg.pid, &lc_path) {
+        let off = std::fs::read(&cand)
+            .ok()
+            .and_then(|b| elf::dynsym_file_offset(&b, INIT_ANCHOR).ok());
+        // No init anchor in the candidate: a pre-loaded
+        // legacy stays unattributed (documented edge).
+        if let Some(off) = off {
+            if let Err(e) = attach_pair(
+                loaded, links, "init_entry", "init_return", off, &cand, pid, LEGACY_COOKIE,
+            ) {
+                // Loud in-doc (executed_calls would read a
+                // false 0); the run continues for tripwires.
+                note = Some(format!("legacy tripwire attach failed: {e:#}"));
+                eprintln!("INSPECT legacy attach failed: {e:#}");
+            }
+        }
+    }
+    Ok((Some(set), note))
+}
+
 /// Candidate legacy.so paths for pre-mapping init attach: the
 /// target's OPENSSL_MODULES dir plus libcrypto's ossl-modules dir
 /// (existing files only; whichever loads fires the cookie-1 init).
@@ -542,61 +600,16 @@ pub fn run_detailed(
     // Legacy tripwires (dispatch-independent: attach even when the
     // dispatch anchor failed — a blind dispatch can still observe
     // legacy calls; only a missing libcrypto mapping is truly blind).
+    // Planned now when libcrypto is already mapped (--pid, re-harvest)
+    // and deferred to the first post-exec drain round otherwise
+    // (run-mode pre-exec images can't plan them — P3).
     let mut probe_set: Option<legacy::ProbeSet> = None;
     let mut legacy_note: Option<String> = None;
     if cfg.legacy {
-        let maps0 = maps::read_maps(cfg.pid).unwrap_or_default();
-        if let Some(lc_path) = legacy::find_libcrypto(&maps0) {
-            let lc_bytes = std::fs::read(&lc_path)
-                .with_context(|| format!("read target libcrypto {lc_path}"))?;
-            // Caller modules for low-level PLT planning. Unreadable
-            // files (deleted-but-mapped, permissions) are loud
-            // findings: their imports stay unknown.
-            let mut mod_bytes: Vec<(String, Vec<u8>)> = Vec::new();
-            let mut unreadable: Vec<String> = Vec::new();
-            for path in legacy::target_modules(&maps0, &lc_path) {
-                match std::fs::read(&path) {
-                    Ok(bytes) => mod_bytes.push((path, bytes)),
-                    Err(_) => unreadable.push(path),
-                }
-            }
-            let modules: Vec<legacy::Module> = mod_bytes
-                .iter()
-                .map(|(p, b)| legacy::Module { path: p, bytes: b })
-                .collect();
-            let mut set = legacy::probes_for(&lc_path, &lc_bytes, &modules)?;
-            for path in &unreadable {
-                set.findings
-                    .push(format!("unreadable module: {path} (imports unknown)"));
-            }
-            attach_trips(&loaded, &mut links, &set, pid.get())?;
-            eprintln!("INSPECT stage=legacy trips={}", set.probes.len());
-            for cand in legacy_candidates(cfg.pid, &lc_path) {
-                let off = std::fs::read(&cand)
-                    .ok()
-                    .and_then(|b| elf::dynsym_file_offset(&b, INIT_ANCHOR).ok());
-                // No init anchor in the candidate: a pre-loaded
-                // legacy stays unattributed (documented edge).
-                if let Some(off) = off {
-                    if let Err(e) = attach_pair(
-                        &loaded,
-                        &mut links,
-                        "init_entry",
-                        "init_return",
-                        off,
-                        &cand,
-                        pid.get(),
-                        LEGACY_COOKIE,
-                    ) {
-                        // Loud in-doc (executed_calls would read a
-                        // false 0); the run continues for tripwires.
-                        legacy_note = Some(format!("legacy tripwire attach failed: {e:#}"));
-                        eprintln!("INSPECT legacy attach failed: {e:#}");
-                    }
-                }
-            }
-            probe_set = Some(set);
-        } else {
+        let (set, note) = plan_legacy_trips(cfg, &loaded, &mut links, pid.get())?;
+        probe_set = set;
+        legacy_note = note;
+        if probe_set.is_none() {
             eprintln!("INSPECT stage=legacy blind=no-libcrypto-mapping");
         }
     }
@@ -679,6 +692,19 @@ pub fn run_detailed(
         // arrive — end the drain instead of idling out the settle.
         if should_stop() {
             break;
+        }
+        // Deferred legacy planning (P3): run-mode pre-exec images
+        // have no libcrypto; plan at the first round where it
+        // appears (post-exec). One attempt per round, attach once.
+        if cfg.legacy && probe_set.is_none() {
+            let maps_now = maps::read_maps(cfg.pid).unwrap_or_default();
+            if legacy::find_libcrypto(&maps_now).is_some() {
+                let (set, note) = plan_legacy_trips(cfg, &loaded, &mut links, pid.get())?;
+                probe_set = set;
+                if legacy_note.is_none() {
+                    legacy_note = note;
+                }
+            }
         }
         let mut fresh = false;
         while let Some(item) = ring.next() {

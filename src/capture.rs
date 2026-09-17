@@ -140,6 +140,7 @@ pub struct Capture {
     pub child_exit: Option<i32>,
     pub drain_wall_us: u64,
     pub harvest_doc: serde_json::Value,
+    pub legacy: serde_json::Value,
 }
 
 // ---------------------------------------------------------------- signals
@@ -543,9 +544,9 @@ fn program(loaded: &Loaded, map: &str, value: &[u8]) -> anyhow::Result<()> {
 
 // ---------------------------------------------------------------- harvest
 
-/// Dispatch-only harvest for capture (legacy tripwires stay a P1
-/// `inspect` concern: pre-exec images can't plan them, and live
-/// re-harvests would burn the window).
+/// Harvest for capture, legacy tripwires included (P3: the report
+/// adopts the legacy block; run-mode pre-exec images defer trip
+/// planning to the first post-exec drain round).
 fn harvest_target(
     cfg: &Config,
     pid: u32,
@@ -564,7 +565,7 @@ fn harvest_target(
             timeout,
             cmdline_marker: None,
             builtin,
-            legacy: false,
+            legacy: true,
             table: None,
             force_offset: None,
         },
@@ -609,6 +610,162 @@ fn comm_of(pid: u32) -> String {
     std::fs::read_to_string(format!("/proc/{pid}/comm"))
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|_| "unknown".to_string())
+}
+
+/// Blind legacy entrypoints: (engine misses, PARTIAL reasons).
+/// The merged block holds per-family MAX across harvest phases,
+/// so read-through after each merge is the window total. ENGINE
+/// misses drive the PRD `engine_fallback_uninstrumented` counter;
+/// METH/low-level misses surface as reasons (+ entries states).
+fn legacy_blind(legacy: &serde_json::Value) -> (u64, Vec<&'static str>) {
+    let n = |ptr: &str| legacy.pointer(ptr).and_then(|v| v.as_u64()).unwrap_or(0);
+    let engine = n("/engine/uninstrumented");
+    let mut reasons = Vec::new();
+    if engine > 0 {
+        reasons.push("engine-fallback-uninstrumented");
+    }
+    if n("/meth_new/uninstrumented") > 0 {
+        reasons.push("meth-fallback-uninstrumented");
+    }
+    if n("/lowlevel/uninstrumented") > 0 {
+        reasons.push("lowlevel-fallback-uninstrumented");
+    }
+    (engine, reasons)
+}
+
+/// Merge a re-harvest `legacy` subtree into the accumulator.
+/// Harvest phases are disjoint in time: numeric leaves (calls,
+/// loads, queries, unreadable) SUM; findings/flags/algs UNION
+/// (sorted, deduped); entries merge by (class, name) with
+/// observed > uninstrumented > absent and OR'd `probed`;
+/// capability takes element-wise MAX (coverage achieved).
+fn merge_legacy(acc: &mut serde_json::Value, next: &serde_json::Value) {
+    if acc.is_null() {
+        *acc = next.clone();
+        return;
+    }
+    if next.is_null() {
+        return;
+    }
+    fn sum_map(acc: &mut serde_json::Value, next: &serde_json::Value, ptr: &str) {
+        let Some(next_map) = next.pointer(ptr).and_then(|v| v.as_object()) else {
+            return;
+        };
+        let Some(acc_map) = acc.pointer_mut(ptr).and_then(|v| v.as_object_mut()) else {
+            return;
+        };
+        for (k, v) in next_map {
+            let add = v.as_u64().unwrap_or(0);
+            let slot = acc_map.entry(k.clone()).or_insert(serde_json::json!(0));
+            let cur = slot.as_u64().unwrap_or(0);
+            *slot = serde_json::json!(cur + add);
+        }
+    }
+    fn union_list(acc: &mut serde_json::Value, next: &serde_json::Value, ptr: &str) {
+        let Some(next_list) = next.pointer(ptr).and_then(|v| v.as_array()) else {
+            return;
+        };
+        let Some(acc_list) = acc.pointer_mut(ptr).and_then(|v| v.as_array_mut()) else {
+            return;
+        };
+        for v in next_list {
+            if !acc_list.contains(v) {
+                acc_list.push(v.clone());
+            }
+        }
+        acc_list.sort_by_key(|v| serde_json::to_string(v).unwrap_or_default());
+    }
+    fn max_scalar(acc: &mut serde_json::Value, next: &serde_json::Value, ptr: &str) {
+        let (Some(a), Some(n)) = (
+            acc.pointer(ptr).and_then(|v| v.as_u64()),
+            next.pointer(ptr).and_then(|v| v.as_u64()),
+        ) else {
+            return;
+        };
+        if n > a {
+            *acc.pointer_mut(ptr).unwrap() = serde_json::json!(n);
+        }
+    }
+    for ptr in [
+        "/engine/calls_by_entrypoint",
+        "/engine/engine_id_class",
+        "/meth_new/calls_by_entrypoint",
+        "/lowlevel/calls_by_family",
+        "/legacy_provider/loads",
+        "/unreadable",
+    ] {
+        sum_map(acc, next, ptr);
+    }
+    if let (Some(a), Some(n)) = (
+        acc.pointer("/legacy_provider/executed_calls")
+            .and_then(|v| v.as_u64()),
+        next
+            .pointer("/legacy_provider/executed_calls")
+            .and_then(|v| v.as_u64()),
+    ) {
+        *acc.pointer_mut("/legacy_provider/executed_calls").unwrap() = serde_json::json!(a + n);
+    }
+    for ptr in [
+        "/legacy_provider/algs",
+        "/findings",
+        "/flags",
+        "/weak/legacy_algs",
+    ] {
+        union_list(acc, next, ptr);
+    }
+    for ptr in [
+        "/capability/syms_present",
+        "/capability/tripwires_attached",
+        "/capability/tripwires_missed",
+        "/engine/uninstrumented",
+        "/meth_new/uninstrumented",
+        "/lowlevel/uninstrumented",
+        "/engine_fallback_uninstrumented",
+    ] {
+        max_scalar(acc, next, ptr);
+    }
+    // Entries: merge by (class, name), observed wins.
+    let rank = |s: &str| match s {
+        "observed" => 2,
+        "uninstrumented" => 1,
+        _ => 0,
+    };
+    if let (Some(a_list), Some(n_list)) = (
+        acc.pointer_mut("/entries").and_then(|v| v.as_array_mut()),
+        next.pointer("/entries").and_then(|v| v.as_array()),
+    ) {
+        for n in n_list {
+            let key = (
+                n.pointer("/class").and_then(|v| v.as_str()).unwrap_or(""),
+                n.pointer("/name").and_then(|v| v.as_str()).unwrap_or(""),
+            );
+            match a_list.iter_mut().find(|a| {
+                (a.pointer("/class").and_then(|v| v.as_str()).unwrap_or(""),
+                 a.pointer("/name").and_then(|v| v.as_str()).unwrap_or(""))
+                    == key
+            }) {
+                Some(a) => {
+                    let (a_rank, n_rank) = (
+                        rank(a.pointer("/state").and_then(|v| v.as_str()).unwrap_or("")),
+                        rank(n.pointer("/state").and_then(|v| v.as_str()).unwrap_or("")),
+                    );
+                    if n_rank > a_rank {
+                        a["state"] = n["state"].clone();
+                    }
+                    let probed = a["probed"].as_bool().unwrap_or(false)
+                        || n["probed"].as_bool().unwrap_or(false);
+                    a["probed"] = serde_json::json!(probed);
+                }
+                None => a_list.push(n.clone()),
+            }
+        }
+        a_list.sort_by_key(|v| {
+            (
+                v.pointer("/class").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                v.pointer("/name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            )
+        });
+    }
 }
 
 // ---------------------------------------------------------------- engine
@@ -670,6 +827,10 @@ struct Engine<'a> {
     window_start: Instant,
     window_end: Instant,
     harvest_doc: serde_json::Value,
+    /// Merged `legacy` subtree (initial + re-harvests, disjoint
+    /// harvest phases — merge_legacy sums/unions; Null when no
+    /// harvest produced one).
+    legacy: serde_json::Value,
 }
 
 impl<'a> Engine<'a> {
@@ -885,6 +1046,18 @@ impl<'a> Engine<'a> {
                     if totals.queries_observed > 0 {
                         self.reason("cold-gap");
                     }
+                    merge_legacy(
+                        &mut self.legacy,
+                        doc.get("legacy").unwrap_or(&serde_json::Value::Null),
+                    );
+                    // Blind legacy entrypoints downgrade to PARTIAL
+                    // (PRD §6: engine_fallback_uninstrumented > 0
+                    // is mandatory PARTIAL).
+                    let (misses, blind) = legacy_blind(&self.legacy);
+                    self.counters.engine_fallback_uninstrumented = misses;
+                    for r in blind {
+                        self.reason(r);
+                    }
                     let rows = doc
                         .get("rows")
                         .and_then(|r| r.as_array())
@@ -962,7 +1135,22 @@ impl<'a> Engine<'a> {
                 })
             })
             .collect();
-        executions.sort_by_key(|e| e.cookie);
+        // PRD §6 byte-stability: identity order, not cookie order
+        // (cookies are attach-sequence numbers).
+        executions.sort_by(|a, b| {
+            (
+                a.id.op,
+                &a.id.provider,
+                &a.id.alg_class,
+                a.id.funcid,
+            )
+                .cmp(&(
+                    b.id.op,
+                    &b.id.provider,
+                    &b.id.alg_class,
+                    b.id.funcid,
+                ))
+        });
         // P1 inventory depth carried over the mapped union: current
         // executions PLUS fenced detail (a window that closes
         // mid-churn holds most of its coverage in stale buckets).
@@ -990,6 +1178,7 @@ impl<'a> Engine<'a> {
             child_exit: self.child_exit,
             drain_wall_us: self.drain_wall_us,
             harvest_doc: self.harvest_doc,
+            legacy: self.legacy,
         }
     }
 
@@ -999,6 +1188,7 @@ impl<'a> Engine<'a> {
         self.stale.clear();
         self.counters = Counters::default();
         self.reasons.clear();
+        self.legacy = serde_json::Value::Null;
         self.reason("pid-recycled");
         self.finish(Outcome::Fatal(FatalKind::Recycled), window_actual)
     }
@@ -1081,6 +1271,7 @@ pub fn run(cfg: &Config, target: Target) -> anyhow::Result<Capture> {
                 window_start: Instant::now(),
                 window_end: Instant::now(),
                 harvest_doc: serde_json::json!({}),
+                legacy: serde_json::Value::Null,
             };
             return Ok(empty.discarded(Duration::ZERO));
         }
@@ -1125,7 +1316,14 @@ pub fn run(cfg: &Config, target: Target) -> anyhow::Result<Capture> {
         window_start: Instant::now(),
         window_end: Instant::now(),
         harvest_doc: doc.clone(),
+        legacy: doc.get("legacy").cloned().unwrap_or(serde_json::Value::Null),
     };
+    // Initial-harvest blind spots (same PARTIAL rule as re-harvests).
+    let (misses, blind) = legacy_blind(&engine.legacy);
+    engine.counters.engine_fallback_uninstrumented = misses;
+    for r in blind {
+        engine.reason(r);
+    }
     if doc.get("status").and_then(|v| v.as_str()) == Some("PARTIAL") {
         let r = doc
             .get("reason")
@@ -1453,6 +1651,66 @@ mod tests {
     }
 
     #[test]
+    fn merge_legacy_sums_unions_and_maxes() {
+        let mut acc = serde_json::json!({
+            "engine": {"calls_by_entrypoint": {"ENGINE_init": 2}, "engine_id_class": {"dynamic": 1}},
+            "meth_new": {"calls_by_entrypoint": {}},
+            "lowlevel": {"calls_by_family": {"digest/sha": 3}},
+            "legacy_provider": {"loads": {"legacy": 1}, "executed_calls": 4, "algs": ["MD4"]},
+            "entries": [
+                {"name": "ENGINE_init", "class": "engine", "state": "observed", "probed": true},
+                {"name": "DH_meth_new", "class": "meth", "state": "absent", "probed": false},
+            ],
+            "capability": {"syms_present": 10, "tripwires_attached": 8, "tripwires_missed": 2},
+            "findings": ["ENGINE API absent"],
+            "flags": ["engine-api-absent"],
+            "weak": {"legacy_algs": ["MD4"]},
+            "unreadable": {"load_names": 1, "engine_ids": 0},
+        });
+        let next = serde_json::json!({
+            "engine": {"calls_by_entrypoint": {"ENGINE_init": 5}, "engine_id_class": {"dynamic": 2}},
+            "meth_new": {"calls_by_entrypoint": {}},
+            "lowlevel": {"calls_by_family": {"digest/sha": 7}},
+            "legacy_provider": {"loads": {"legacy": 2}, "executed_calls": 6, "algs": ["MD4", "DES"]},
+            "entries": [
+                {"name": "ENGINE_init", "class": "engine", "state": "observed", "probed": true},
+                {"name": "DH_meth_new", "class": "meth", "state": "observed", "probed": true},
+            ],
+            "capability": {"syms_present": 12, "tripwires_attached": 9, "tripwires_missed": 3},
+            "findings": ["ENGINE API absent", "low-level coverage unavailable (no .dynsym)"],
+            "flags": ["engine-api-absent", "lowlevel-no-dynsym"],
+            "weak": {"legacy_algs": ["MD4", "DES"]},
+            "unreadable": {"load_names": 2, "engine_ids": 1},
+        });
+        merge_legacy(&mut acc, &next);
+        assert_eq!(acc["engine"]["calls_by_entrypoint"]["ENGINE_init"], 7);
+        assert_eq!(acc["lowlevel"]["calls_by_family"]["digest/sha"], 10);
+        assert_eq!(acc["legacy_provider"]["executed_calls"], 10);
+        assert_eq!(acc["legacy_provider"]["loads"]["legacy"], 3);
+        assert_eq!(acc["unreadable"]["load_names"], 3);
+        assert_eq!(
+            acc["legacy_provider"]["algs"],
+            serde_json::json!(["DES", "MD4"])
+        );
+        assert_eq!(acc["findings"].as_array().unwrap().len(), 2);
+        assert_eq!(acc["flags"].as_array().unwrap().len(), 2);
+        // Entries: observed wins, probed ORs, order deterministic.
+        let dh = acc["entries"].as_array().unwrap().iter()
+            .find(|e| e["name"] == "DH_meth_new").unwrap();
+        assert_eq!(dh["state"], "observed");
+        assert_eq!(dh["probed"], true);
+        // Capability: max, not sum.
+        assert_eq!(acc["capability"]["syms_present"], 12);
+        assert_eq!(acc["capability"]["tripwires_attached"], 9);
+        // Null legs: adopt / keep.
+        let mut n = serde_json::Value::Null;
+        merge_legacy(&mut n, &next);
+        assert_eq!(n["legacy_provider"]["executed_calls"], 6);
+        merge_legacy(&mut acc, &serde_json::Value::Null);
+        assert_eq!(acc["legacy_provider"]["executed_calls"], 10);
+    }
+
+    #[test]
     fn replan_skips_attached_sites() {
         let mut attached: HashSet<AttachedSite> = HashSet::new();
         attached.insert(("/lib/x.so".to_string(), "08:01".to_string(), 7, 0x100));
@@ -1470,5 +1728,39 @@ mod tests {
         // Fully attached: empty (re-plan attaches nothing).
         attached.insert(("/lib/x.so".to_string(), "08:01".to_string(), 7, 0x200));
         assert!(pending_sites(&attached, "/lib/x.so", "08:01", 7, &sites).is_empty());
+    }
+
+    #[test]
+    fn legacy_blind_counts_engine_and_reasons() {
+        // Null / clean legacy: no misses, no reasons.
+        assert_eq!(
+            legacy_blind(&serde_json::Value::Null),
+            (0, Vec::new())
+        );
+        assert_eq!(
+            legacy_blind(&serde_json::json!({"engine": {}, "capability": {}})),
+            (0, Vec::new())
+        );
+        // ENGINE misses drive the PRD counter + reason.
+        assert_eq!(
+            legacy_blind(&serde_json::json!({"engine": {"uninstrumented": 2}})),
+            (2, vec!["engine-fallback-uninstrumented"])
+        );
+        // METH/low-level blind spots add reasons (no PRD counter).
+        assert_eq!(
+            legacy_blind(&serde_json::json!({
+                "engine": {"uninstrumented": 1},
+                "meth_new": {"uninstrumented": 3},
+                "lowlevel": {"uninstrumented": 4},
+            })),
+            (
+                1,
+                vec![
+                    "engine-fallback-uninstrumented",
+                    "meth-fallback-uninstrumented",
+                    "lowlevel-fallback-uninstrumented",
+                ]
+            )
+        );
     }
 }
