@@ -341,6 +341,22 @@ static void lane_propquery(void)
         LANE_FAIL("propquery");
 }
 
+/* FIPS-load lane: loading fips.so runs its KAT self-tests at
+ * load with sentinel buffers resident (true KAT lane wherever a
+ * FIPS module exists; skip elsewhere — the KAT-shape proxy is the
+ * fresh-load default-provider cell). */
+static void lane_fips(void)
+{
+    OSSL_PROVIDER *p = OSSL_PROVIDER_load(NULL, "fips");
+
+    if (p == NULL) {
+        LANE_SKIP("fips", "no-fips-module");
+        return;
+    }
+    OSSL_PROVIDER_unload(p);
+    LANE_OK("fips");
+}
+
 /* ENGINE_by_id alias lane (3.x only; 4.x removed ENGINE). */
 static void lane_engine(void)
 {
@@ -455,6 +471,7 @@ int main(int argc, char **argv)
         lane_kem();
         lane_propquery();
         lane_engine();
+        lane_fips();
         for (i = 0; i < n; i++) {
             void *rc = NULL;
 
