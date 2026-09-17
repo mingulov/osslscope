@@ -32,6 +32,7 @@ const KIND_QUERY_RET: u32 = 2;
 const KIND_ROW: u32 = 3;
 const KIND_ALG: u32 = 4;
 const KIND_TRIP: u32 = 5;
+const KIND_WALKDBG: u32 = 6;
 const EVENT_LEN: usize = 160;
 const ROW_EVENT_LEN: usize = 40;
 const NAME_OFF: usize = 32;
@@ -773,6 +774,29 @@ pub fn run_detailed(
                         u32at(4) as u64,
                         String::from_utf8_lossy(&s[..len]).into_owned(),
                     ));
+                }
+                KIND_WALKDBG => {
+                    // Walk-abort forensics (never a trigger, never a
+                    // row — diagnostic only, printed under the debug
+                    // flag, rare by construction).
+                    if debug_harvest() {
+                        let aux = u64at(24);
+                        let nv = u64::from_le_bytes(
+                            b[NAME_OFF..NAME_OFF + 8].try_into().unwrap_or([0; 8]),
+                        );
+                        let iv = u64::from_le_bytes(
+                            b[NAME_OFF + 8..NAME_OFF + 16].try_into().unwrap_or([0; 8]),
+                        );
+                        eprintln!(
+                            "HARVESTDBG walkdbg op={} rv={:#x} j={} reason={} names={:#x} imp={:#x}",
+                            u32at(4),
+                            u64at(16),
+                            aux >> 32,
+                            aux & 0xffff_ffff,
+                            nv,
+                            iv
+                        );
+                    }
                 }
                 k => eprintln!("unknown event kind {k}"),
             }

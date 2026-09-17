@@ -84,6 +84,7 @@ const KIND_QUERY_RET: u32 = 2;
 const KIND_ROW: u32 = 3;
 const KIND_ALG: u32 = 4;
 const KIND_TRIP: u32 = 5;
+const KIND_WALKDBG: u32 = 6;
 
 /// Cold-path tripwire hit: attach cookie + arg0 string (bounded 32B).
 /// 40 bytes; must match discovery::harvest TRIP layout.
@@ -166,6 +167,25 @@ fn emit_trip(ev: &TripEvent) {
         e.write(*ev);
         e.submit(0);
     }
+}
+
+/// Walk-abort forensics: WHY slot j of array rv failed. `aux` packs
+/// j (high) + reason (low: 1 read, 2 empty, 3 noimp, 4 name);
+/// `name[..16]` packs the names+imp slot values. Emitted alongside
+/// the TRUNC bit on slot-0 aborts only (rare by construction).
+fn emit_walkdbg(op: u32, rv: u64, j: u64, reason: u64, names: u64, imp: u64) {
+    let mut payload = [0u8; 128];
+    payload[..8].copy_from_slice(&names.to_le_bytes());
+    payload[8..16].copy_from_slice(&imp.to_le_bytes());
+    emit(&Event {
+        kind: KIND_WALKDBG,
+        op,
+        funcid: 0,
+        _pad: 0,
+        addr: rv,
+        aux: (j << 32) | reason,
+        name: payload,
+    });
 }
 
 fn cookie_of(ctx: &ProbeContext) -> u64 {
@@ -384,6 +404,7 @@ pub fn query_return(ctx: RetProbeContext) -> u32 {
     let (Ok(names), Ok(imp)) = (names, imp) else {
         if j == 0 {
             flag_trunc(op as u32, TRUNC_WALK_READ);
+            emit_walkdbg(op as u32, rv, j, 1, 0, 0);
         }
         return 0;
     };
@@ -392,6 +413,7 @@ pub fn query_return(ctx: RetProbeContext) -> u32 {
         // empty = the query returned a table with no first alg.
         if j == 0 {
             flag_trunc(op as u32, TRUNC_WALK_EMPTY);
+            emit_walkdbg(op as u32, rv, j, 2, names, imp);
         }
         return 0;
     }
@@ -400,6 +422,7 @@ pub fn query_return(ctx: RetProbeContext) -> u32 {
         // Alg without implementation: skipped, like the dumper.
         if j == 0 {
             flag_trunc(op as u32, TRUNC_WALK_NOIMP);
+            emit_walkdbg(op as u32, rv, j, 3, names, imp);
         }
         return 0;
     }
@@ -417,6 +440,7 @@ pub fn query_return(ctx: RetProbeContext) -> u32 {
     if unsafe { helpers::bpf_probe_read_user_str_bytes(names as *const u8, &mut name) }.is_err() {
         if j == 0 {
             flag_trunc(op as u32, TRUNC_WALK_NAME);
+            emit_walkdbg(op as u32, rv, j, 4, names, imp);
         }
         return 0;
     }
