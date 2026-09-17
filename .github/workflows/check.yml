@@ -12,3 +12,16 @@ jobs:
       - run: cargo check --workspace --locked
       - run: cargo test --workspace --locked
       - run: cargo clippy --workspace --locked -- -D warnings
+  beachhead:
+    # P1 exit-6: stock ubuntu-24.04 + sudo file-caps bootstrap, then a
+    # least-priv doctor run (exit 0). Ubuntu-class behaves like lanes
+    # B/C (green), not Debian-class. Procedure proven identical on
+    # 6.9/6.12/7.0 lane kernels (spike-filecaps.sh gate evidence).
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - run: cargo build --locked --bin osslscope
+      - run: sudo setcap 'cap_bpf,cap_perfmon=ep' target/debug/osslscope
+      - run: ./target/debug/osslscope doctor | tee doctor.log; test ${PIPESTATUS[0]} -eq 0
+      - run: grep -q 'verdict: ok' doctor.log && ! grep -E 'can_issue|cap_mint_ok' doctor.log
