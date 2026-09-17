@@ -39,6 +39,27 @@ Built-in `OSSL_TRACE` cannot answer these: it needs app cooperation,
 ships inert on stock builds, and never proves per-call execution.
 See [the side-by-side gap matrix](docs/trace-gap.md).
 
+## Build
+
+Prerequisites: Linux x86-64, kernel ≥ 6.9, Rust 1.88 (pinned by
+`rust-toolchain.toml`) plus nightly-2026-05-20 with `rust-src` for
+the eBPF object.
+
+```sh
+cargo build --locked
+(cd crates/ebpf && cargo build -Z build-std=core \
+    --target bpfel-unknown-none --release --bin osslscope-harvest)
+```
+
+First run (one-time setup, then least-privilege runs):
+
+```sh
+sudo setcap 'cap_bpf,cap_perfmon=ep' target/debug/osslscope
+./target/debug/osslscope doctor   # preflight; must print verdict: ok
+```
+
+Installable packages (deb/rpm) land with the release.
+
 ## What it will NOT do
 
 No `SSL_read`/`SSL_write` tracing, no TLS handshake observation, no

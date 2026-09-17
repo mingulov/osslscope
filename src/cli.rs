@@ -13,7 +13,15 @@ pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
         "check" => crate::doctor::unimplemented("check"),
         "help" | "--help" | "-h" => {
             println!("osslscope — non-interposing OpenSSL observer");
-            println!("usage: osslscope <doctor|inspect|report|check> [args]");
+            println!("usage: osslscope <doctor|inspect|alias-audit> [args]");
+            println!("  doctor       preflight: kernel, caps, LSM, target suitability");
+            println!("  inspect      dispatch inventory of a live --pid target");
+            println!("  alias-audit  group a harvest doc's rows by shared address");
+            println!("planned: report, check (policy gates land next)");
+            ExitCode::SUCCESS
+        }
+        "--version" | "-V" => {
+            println!("osslscope {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
         other => {

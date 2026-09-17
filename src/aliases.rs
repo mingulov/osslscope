@@ -78,6 +78,12 @@ pub fn run(args: &[String]) -> ExitCode {
                     return ExitCode::from(2);
                 }
             },
+            "--help" | "-h" => {
+                println!("usage: osslscope alias-audit [--in FILE] < doc.json");
+                println!("  groups a harvest doc's rows by shared addr_hash,");
+                println!("  reporting addresses claimed by several triples.");
+                return ExitCode::SUCCESS;
+            }
             _ => {
                 eprintln!("usage: osslscope alias-audit [--in FILE] < doc.json");
                 return ExitCode::from(2);
@@ -99,6 +105,11 @@ pub fn run(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if text.trim().is_empty() {
+        eprintln!("osslscope alias-audit: empty input (want a harvest doc)");
+        eprintln!("usage: osslscope alias-audit [--in FILE] < doc.json");
+        return ExitCode::from(2);
+    }
     let doc: serde_json::Value = match serde_json::from_str(&text) {
         Ok(d) => d,
         Err(e) => {

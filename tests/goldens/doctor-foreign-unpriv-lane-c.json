@@ -3,7 +3,7 @@
     {
       "id": "kernel",
       "message": "kernel features unverifiable without CAP_BPF (release 6.9.12-060912-generic informational)",
-      "remediation": "grant file caps (exit-6 model): sudo setcap cap_bpf,cap_perfmon+ep $(command -v osslscope) [+cap_sys_ptrace for foreign-uid targets], then re-run",
+      "remediation": "grant file caps: sudo setcap cap_bpf,cap_perfmon+ep $(command -v osslscope) [+cap_sys_ptrace for foreign-uid targets], then re-run",
       "status": "degraded"
     },
     {
@@ -14,7 +14,7 @@
     {
       "id": "caps",
       "message": "missing caps: CAP_BPF+CAP_PERFMON (have neither file caps nor root)",
-      "remediation": "grant file caps (exit-6 model): sudo setcap cap_bpf,cap_perfmon+ep $(command -v osslscope) [+cap_sys_ptrace for foreign-uid targets], then re-run",
+      "remediation": "grant file caps: sudo setcap cap_bpf,cap_perfmon+ep $(command -v osslscope) [+cap_sys_ptrace for foreign-uid targets], then re-run",
       "status": "fail"
     },
     {
@@ -35,7 +35,7 @@
     {
       "id": "lsm",
       "message": "LSM denial unverifiable without caps (active: lockdown,capability,landlock,yama,apparmor,ima,evm)",
-      "remediation": "grant file caps (exit-6 model): sudo setcap cap_bpf,cap_perfmon+ep $(command -v osslscope) [+cap_sys_ptrace for foreign-uid targets], then re-run",
+      "remediation": "grant file caps: sudo setcap cap_bpf,cap_perfmon+ep $(command -v osslscope) [+cap_sys_ptrace for foreign-uid targets], then re-run",
       "status": "degraded"
     },
     {
@@ -52,7 +52,7 @@
     {
       "id": "foreign-uid",
       "message": "target uid 65534: need caps to probe the carve-out (unverifiable unprivileged)",
-      "remediation": "grant file caps (exit-6 model): sudo setcap cap_bpf,cap_perfmon+ep $(command -v osslscope) [+cap_sys_ptrace for foreign-uid targets], then re-run",
+      "remediation": "grant file caps: sudo setcap cap_bpf,cap_perfmon+ep $(command -v osslscope) [+cap_sys_ptrace for foreign-uid targets], then re-run",
       "status": "degraded"
     },
     {

@@ -22,6 +22,17 @@ pub fn run(args: &[String]) -> ExitCode {
     let mut force_offset: Option<u64> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
+        if a == "--help" || a == "-h" {
+            println!(
+                "usage: osslscope inspect --pid PID --provider SO --object BPF [--out FILE] [--marker M] [--builtin [--table FILE] [--force-offset N]] [--legacy]"
+            );
+            println!("  --pid PID: live target to inventory (pinned against pid reuse)");
+            println!("  --provider SO: provider .so (or libcrypto with --builtin)");
+            println!("  --object BPF: harvest eBPF object (built from crates/ebpf)");
+            println!("  --legacy: also attach ENGINE/low-level tripwires");
+            println!("  needs CAP_BPF+CAP_PERFMON (run: osslscope doctor)");
+            return ExitCode::SUCCESS;
+        }
         let val = |it: &mut std::slice::Iter<String>| {
             it.next()
                 .cloned()

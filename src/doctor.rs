@@ -23,8 +23,8 @@ use std::process::ExitCode;
 
 /// Shared "not yet implemented" exit for later-phase subcommands.
 pub fn unimplemented(cmd: &str) -> ExitCode {
-    eprintln!("osslscope {cmd}: not yet implemented (see PLAN phase gates)");
-    ExitCode::from(4)
+    eprintln!("osslscope {cmd}: planned for a later release (policy gates land next)");
+    ExitCode::from(2)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -192,7 +192,7 @@ fn ima_state() -> String {
     }
 }
 
-const SETCAP_RECIPE: &str = "grant file caps (exit-6 model): sudo setcap cap_bpf,cap_perfmon+ep $(command -v osslscope) [+cap_sys_ptrace for foreign-uid targets], then re-run";
+const SETCAP_RECIPE: &str = "grant file caps: sudo setcap cap_bpf,cap_perfmon+ep $(command -v osslscope) [+cap_sys_ptrace for foreign-uid targets], then re-run";
 
 // ---- functional BPF probes (kernel feature set + caps) ----
 
@@ -1284,6 +1284,13 @@ pub fn run(args: &[String]) -> ExitCode {
     let mut format = "human".to_string();
     let mut it = args.iter();
     while let Some(a) = it.next() {
+        if a == "--help" || a == "-h" {
+            println!("{USAGE}");
+            println!("  no target: environment preflight (kernel, caps, LSM, lockdown)");
+            println!("  --pid PID | --libcrypto PATH: also vet the target");
+            println!("  --format human|json (default human)");
+            return ExitCode::SUCCESS;
+        }
         let val = |it: &mut std::slice::Iter<String>| {
             it.next()
                 .cloned()
