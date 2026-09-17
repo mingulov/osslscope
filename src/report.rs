@@ -19,7 +19,7 @@ use std::time::Duration;
 /// went COMPLETE on all lanes (spawn + first crypto + loop ops all
 /// observed) — comfortably exceeds seconds-scale target warmup
 /// (attach runs pre-window) while keeping CI windows cheap.
-const DEFAULT_DURATION_SECS: f64 = 30.0;
+pub(crate) const DEFAULT_DURATION_SECS: f64 = 30.0;
 
 struct Args {
     cfg: capture::Config,
@@ -61,7 +61,11 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             "--format" => format = val(a)?,
             "--out" => out = Some(val(a)?),
             "--provider" => provider = Some(val(a)?),
-            "--builtin" => builtin = true,
+            "--builtin" => {
+                builtin = true;
+                i += 1;
+                continue;
+            }
             "--object" => object = Some(val(a)?),
             "--count-object" => count_object = Some(val(a)?),
             "--settle" => settle = val(a)?.parse().map_err(|_| "--settle needs seconds")?,
@@ -133,13 +137,13 @@ fn exit_for(c: &capture::Capture) -> u8 {
     }
 }
 
-fn epoch_of(t: std::time::SystemTime) -> f64 {
+pub(crate) fn epoch_of(t: std::time::SystemTime) -> f64 {
     t.duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64()
 }
 
-fn doc(c: &capture::Capture) -> serde_json::Value {
+pub(crate) fn doc(c: &capture::Capture) -> serde_json::Value {
     let status = match &c.outcome {
         capture::Outcome::Complete => "COMPLETE",
         capture::Outcome::Partial => "PARTIAL",
@@ -273,14 +277,14 @@ pub(crate) fn iso8601_utc(epoch: u64) -> String {
     )
 }
 
-fn epoch_secs(t: std::time::SystemTime) -> u64 {
+pub(crate) fn epoch_secs(t: std::time::SystemTime) -> u64 {
     t.duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
 }
 
 /// Thousands separator for call counts.
-fn grouped(n: u64) -> String {
+pub(crate) fn grouped(n: u64) -> String {
     let s = n.to_string();
     let mut out = String::with_capacity(s.len() + s.len() / 3);
     for (i, ch) in s.bytes().enumerate() {
@@ -293,12 +297,54 @@ fn grouped(n: u64) -> String {
 }
 
 /// Op id → display name (`OSSL_OP_DIGEST` → `DIGEST`).
-fn op_display(id: u32) -> String {
+pub(crate) fn op_display(id: u32) -> String {
     crate::kinds::OPS
         .iter()
         .find(|o| o.id == id)
         .map(|o| o.name.strip_prefix("OSSL_OP_").unwrap_or(o.name).to_string())
         .unwrap_or_else(|| format!("OP{id}"))
+}
+
+/// Footer status line, no trailing newline (shared with check's
+/// evidence line — goldens pin the bytes, so extraction is exact).
+pub(crate) fn status_line(c: &capture::Capture) -> String {
+    let mut s = String::new();
+    let status = match &c.outcome {
+        capture::Outcome::Complete => "COMPLETE",
+        capture::Outcome::Partial => "PARTIAL",
+        capture::Outcome::Fatal(_) => "FATAL",
+    };
+    s.push_str(&format!("status={status}"));
+    if !c.reasons.is_empty() {
+        s.push_str(&format!(" reasons={}", c.reasons.join(",")));
+    }
+    let k = &c.counters;
+    let mut nz = Vec::new();
+    for (name, v) in [
+        ("dropped", k.dropped_bpf + k.dropped_userspace),
+        ("missed", k.missed_attaches),
+        ("unresolved", k.unresolved_offsets),
+        ("staleness", k.table_staleness_events),
+        ("cold_gap", k.cold_gap_calls),
+        ("prov_changed", k.provider_changed),
+        ("scan_overruns", k.scan_budget_exhaustions),
+        ("eng_fallback", k.engine_fallback_uninstrumented),
+        ("shortfall", k.drain_shortfall),
+        ("uninstrumented_ops", k.uninstrumented_ops),
+        ("fork_ignored", k.fork_exec_ignored),
+        ("over_budget", k.over_budget),
+    ] {
+        if v > 0 {
+            nz.push(format!("{name}={v}"));
+        }
+    }
+    if !nz.is_empty() {
+        s.push_str(&format!(" counters[{}]", nz.join(" ")));
+    }
+    if let Some(code) = c.child_exit {
+        s.push_str(&format!(" child_exit={code}"));
+    }
+    s
 }
 
 /// Build-id short form for the header (hex is ASCII: byte cut safe).
@@ -373,41 +419,7 @@ fn human(c: &capture::Capture) -> String {
     // the formats must never disagree).
     human_legacy(&legacy_with_executed_weak(c), &mut s);
     s.push('\n');
-    let status = match &c.outcome {
-        capture::Outcome::Complete => "COMPLETE",
-        capture::Outcome::Partial => "PARTIAL",
-        capture::Outcome::Fatal(_) => "FATAL",
-    };
-    s.push_str(&format!("status={status}"));
-    if !c.reasons.is_empty() {
-        s.push_str(&format!(" reasons={}", c.reasons.join(",")));
-    }
-    let k = &c.counters;
-    let mut nz = Vec::new();
-    for (name, v) in [
-        ("dropped", k.dropped_bpf + k.dropped_userspace),
-        ("missed", k.missed_attaches),
-        ("unresolved", k.unresolved_offsets),
-        ("staleness", k.table_staleness_events),
-        ("cold_gap", k.cold_gap_calls),
-        ("prov_changed", k.provider_changed),
-        ("scan_overruns", k.scan_budget_exhaustions),
-        ("eng_fallback", k.engine_fallback_uninstrumented),
-        ("shortfall", k.drain_shortfall),
-        ("uninstrumented_ops", k.uninstrumented_ops),
-        ("fork_ignored", k.fork_exec_ignored),
-        ("over_budget", k.over_budget),
-    ] {
-        if v > 0 {
-            nz.push(format!("{name}={v}"));
-        }
-    }
-    if !nz.is_empty() {
-        s.push_str(&format!(" counters[{}]", nz.join(" ")));
-    }
-    if let Some(code) = c.child_exit {
-        s.push_str(&format!(" child_exit={code}"));
-    }
+    s.push_str(&status_line(c));
     s.push('\n');
     s.push_str("absence = not-observed in window (never \"not present / never used\")\n");
     if c.reasons.iter().any(|r| r == "fips-unlabeled") {
@@ -655,10 +667,10 @@ mod tests {
         // Identity-sorted input (as finish() produces); human
         // regroups by op display name.
         c.executions = vec![
-            exec(1, "SHA256", 11, 1_204_033),
+            exec(1, "SHA-256", 11, 1_204_033),
             exec(2, "DES", 21, 500),
             exec(2, "other", 22, 9),
-            exec(13, "RSA", 31, 7),
+            exec(13, "ML-DSA-65", 31, 7),
         ];
         c.stale = vec![capture::StaleBucket {
             generation: 0,
@@ -688,9 +700,9 @@ mod tests {
 provider: /p/provider.so build-id=unknown kernel=test-kernel\n\
 cmdline: t\n\
 \n\
-ASYM_CIPHER\n  RSA provider=default funcid=31 7 calls\n\
+ASYM_CIPHER\n  ML-DSA-65 provider=default funcid=31 7 calls\n\
 CIPHER\n  DES provider=default funcid=21 500 calls\n  other provider=default funcid=22 9 calls\n\
-DIGEST\n  SHA256 provider=default funcid=11 1,204,033 calls\n\
+DIGEST\n  SHA-256 provider=default funcid=11 1,204,033 calls\n\
 \n\
 Fenced generations\n  gen 0: 450 events, 2 keys (detail in JSON)\n\
 \n\
@@ -1044,5 +1056,11 @@ note: alg-name-only strength (key sizes unobservable); window-only claims\n";
         let mut no_digest = base.clone();
         no_digest.extend(["--pid", "9"]);
         assert_eq!(parse(&v(no_digest)).unwrap().cfg.image_digest, "");
+        // Valueless flags consume one slot (mid-argv position).
+        let mut bi = base.clone();
+        bi.extend(["--builtin", "--pid", "9"]);
+        let a = parse(&v(bi)).unwrap();
+        assert!(a.cfg.builtin);
+        assert!(matches!(a.target, capture::Target::Pid(9)));
     }
 }

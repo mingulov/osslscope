@@ -6,6 +6,7 @@
 
 pub mod aliases;
 pub mod capture;
+pub mod check;
 pub mod cli;
 pub mod discovery;
 pub mod doctor;

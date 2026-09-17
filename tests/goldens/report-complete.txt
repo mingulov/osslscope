@@ -3,12 +3,12 @@ provider: /p/provider.so build-id=unknown kernel=test-kernel
 cmdline: t
 
 ASYM_CIPHER
-  RSA provider=default funcid=31 7 calls
+  ML-DSA-65 provider=default funcid=31 7 calls
 CIPHER
   DES provider=default funcid=21 500 calls
   other provider=default funcid=22 9 calls
 DIGEST
-  SHA256 provider=default funcid=11 1,204,033 calls
+  SHA-256 provider=default funcid=11 1,204,033 calls
 
 Fenced generations
   gen 0: 450 events, 2 keys (detail in JSON)

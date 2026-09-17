@@ -23,7 +23,7 @@
   "drain_wall_us": 0,
   "executions": [
     {
-      "alg_class": "SHA256",
+      "alg_class": "SHA-256",
       "aliases": [],
       "cookie": 1,
       "count": 1204033,
@@ -59,7 +59,7 @@
       "provider": "default"
     },
     {
-      "alg_class": "RSA",
+      "alg_class": "ML-DSA-65",
       "aliases": [],
       "cookie": 13,
       "count": 7,

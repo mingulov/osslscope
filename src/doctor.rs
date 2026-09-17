@@ -21,12 +21,6 @@
 //!   internal errors exit 1 via anyhow.
 use std::process::ExitCode;
 
-/// Shared "not yet implemented" exit for later-phase subcommands.
-pub fn unimplemented(cmd: &str) -> ExitCode {
-    eprintln!("osslscope {cmd}: planned for a later release (policy gates land next)");
-    ExitCode::from(2)
-}
-
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Status {
     Pass,
