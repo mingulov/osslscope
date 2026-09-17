@@ -70,6 +70,11 @@ pub fn count_entry(ctx: ProbeContext) -> u32 {
     let now = unsafe { helpers::bpf_ktime_get_ns() };
     if let Some(slot) = COUNTS.get_ptr_mut(&key) {
         let v = unsafe { &mut *slot };
+        // Fresh CPU slot (post-migration): stamp first touch — an
+        // ever-zero first_ns poisons the userspace min-fold.
+        if v.count == 0 {
+            v.first_ns = now;
+        }
         v.count = v.count.saturating_add(1);
         v.last_ns = now;
         return 0;
