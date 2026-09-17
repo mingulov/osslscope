@@ -6,7 +6,7 @@
 //! lowlevel); userspace decodes via the same `ProbeSet` (consistent
 //! within a run — no fixed id space to version).
 use crate::discovery::{elf, maps};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 /// Frozen finding: libcrypto mapped but zero ENGINE symbols (4.0 and
 /// no-engine 3.x). COMPLETE doc, never an error.
@@ -50,6 +50,11 @@ pub struct ProbeSet {
     pub engine_uninstrumented: u64,
     pub meth_uninstrumented: u64,
     pub lowlevel_uninstrumented: u64,
+    /// Unprobed symbols per class (sorted, deduped): matched in the
+    /// target but stub-less (per-entry `uninstrumented` states).
+    pub unprobed_engine_syms: Vec<String>,
+    pub unprobed_meth_syms: Vec<String>,
+    pub unprobed_lowlevel_syms: Vec<String>,
     pub findings: Vec<String>,
     by_id_cookies: HashSet<u64>,
     load_cookies: HashSet<u64>,
@@ -206,6 +211,44 @@ fn lowlevel_family(name: &str) -> Option<&'static str> {
         .map(|f| f.family)
 }
 
+/// Machine slug for a finding string (check/CI consume `flags`;
+/// humans read `findings`). Exact/prefix rules for the six producer
+/// templates; slugify fallback (lowercase alnum runs joined by `-`,
+/// capped at 40 chars) never fails.
+pub fn flag_for(finding: &str) -> String {
+    if finding == FINDING_ENGINE_ABSENT {
+        return "engine-api-absent".to_string();
+    }
+    if finding == FINDING_LOWLEVEL_NODYNSYM {
+        return "lowlevel-no-dynsym".to_string();
+    }
+    for (prefix, slug) in [
+        ("unreadable module: ", "unreadable-module"),
+        ("tripwire cap (", "tripwire-cap-exceeded"),
+        ("unprobed import: ", "unprobed-imports"),
+        ("…and ", "unprobed-imports"),
+        ("legacy tripwire attach failed: ", "legacy-attach-failed"),
+        ("provider loads with unreadable names", "unreadable-load-names"),
+        ("engine-id lookups with unreadable ids", "unreadable-engine-ids"),
+    ] {
+        if finding.starts_with(prefix) {
+            return slug.to_string();
+        }
+    }
+    let mut slug = String::new();
+    let mut dash = false;
+    for c in finding.chars().take(60) {
+        if c.is_ascii_alphanumeric() {
+            slug.push(c.to_ascii_lowercase());
+            dash = false;
+        } else if !dash && !slug.is_empty() {
+            slug.push('-');
+            dash = true;
+        }
+    }
+    slug.trim_matches('-').chars().take(40).collect()
+}
+
 /// Named findings for unprobed (symbol, module) pairs, sorted for
 /// determinism, capped at 16 with an exact overflow line (bounded
 /// docs; totals stay exact in the counters).
@@ -296,14 +339,28 @@ pub fn apply_trip_cap(probes: &mut Vec<Probe>) -> Vec<Probe> {
 /// registry-size gaps, the single coverage finding. ENGINE-absent is
 /// deliberately NOT claimed — presence in unscanned code is unknown.
 pub fn blind_probe_set() -> ProbeSet {
-    let engine = crate::kinds::ENGINE
+    let eng: Vec<String> = crate::kinds::ENGINE
         .iter()
         .filter(|e| !matches!(e.class, crate::kinds::EngineClass::Other))
-        .count() as u64;
+        .map(|e| e.name.to_string())
+        .collect();
+    let meth: Vec<String> = crate::kinds::METH_NEW
+        .iter()
+        .map(|m| m.name.to_string())
+        .collect();
+    // Lowlevel entries are per-family: one sentinel symbol per family
+    // (entries map unprobed symbols back to families by prefix).
+    let low: Vec<String> = crate::kinds::LOWLEVEL
+        .iter()
+        .map(|f| f.prefixes[0].to_string())
+        .collect();
     ProbeSet {
-        engine_uninstrumented: engine,
-        meth_uninstrumented: crate::kinds::METH_NEW.len() as u64,
-        lowlevel_uninstrumented: crate::kinds::LOWLEVEL.len() as u64,
+        engine_uninstrumented: eng.len() as u64,
+        meth_uninstrumented: meth.len() as u64,
+        lowlevel_uninstrumented: low.len() as u64,
+        unprobed_engine_syms: eng,
+        unprobed_meth_syms: meth,
+        unprobed_lowlevel_syms: low,
         findings: vec![FINDING_LOWLEVEL_NODYNSYM.to_string()],
         ..Default::default()
     }
@@ -428,6 +485,15 @@ pub fn probes_for(
     set.engine_uninstrumented = gaps_engine.len() as u64;
     set.meth_uninstrumented = gaps_meth.len() as u64;
     set.lowlevel_uninstrumented = gaps_lowlevel.len() as u64;
+    let syms = |gaps: &[(String, String)]| {
+        let mut v: Vec<String> = gaps.iter().map(|(s, _)| s.clone()).collect();
+        v.sort();
+        v.dedup();
+        v
+    };
+    set.unprobed_engine_syms = syms(&gaps_engine);
+    set.unprobed_meth_syms = syms(&gaps_meth);
+    set.unprobed_lowlevel_syms = syms(&gaps_lowlevel);
     let mut gaps = gaps_engine;
     gaps.extend(gaps_meth);
     gaps.extend(gaps_lowlevel);
@@ -517,6 +583,8 @@ pub fn section(inp: &SectionInputs) -> serde_json::Value {
     // String-bearing probes fire TRIP always but emit strings only for
     // readable args: a TRIP/string delta means calls with NULL or
     // unreadable names happened — findings, not silent undercount.
+    // Counts live in `unreadable` (merge-summable); finding strings
+    // stay count-free so cross-harvest merges dedupe exactly.
     let fires = |cookies: &HashSet<u64>| cookies.iter().map(|c| count(*c)).sum::<u64>();
     let strs = |cookies: &HashSet<u64>| {
         inp.trip_strs
@@ -526,18 +594,125 @@ pub fn section(inp: &SectionInputs) -> serde_json::Value {
     };
     let load_delta = fires(&inp.set.load_cookies).saturating_sub(strs(&inp.set.load_cookies));
     if load_delta > 0 {
-        findings.push(format!("{load_delta} provider loads with unreadable names"));
+        findings.push("provider loads with unreadable names".to_string());
     }
     let id_delta = fires(&inp.set.by_id_cookies).saturating_sub(strs(&inp.set.by_id_cookies));
     if id_delta > 0 {
-        findings.push(format!("{id_delta} engine-id lookups with unreadable ids"));
+        findings.push("engine-id lookups with unreadable ids".to_string());
     }
+    // Machine flags: one slug per finding (check/CI consume these;
+    // humans read `findings`). Deltas map directly; the rest via
+    // flag_for (exact/prefix rules + slugify fallback, all tested).
+    let mut flags: BTreeSet<String> = findings.iter().map(|f| flag_for(f)).collect();
+    if load_delta > 0 {
+        flags.insert("unreadable-load-names".to_string());
+    }
+    if id_delta > 0 {
+        flags.insert("unreadable-engine-ids".to_string());
+    }
+    // Per-entry states over the CONSIDERED set (registry order =
+    // byte-stable): exact-name ENGINE (non-Other) + METH_NEW
+    // symbols, LOWLEVEL families (prefix taxonomy), LOAD classes.
+    // observed = calls attributed; uninstrumented = matched but
+    // stub-less; absent = not observed (probed-quiet or not in
+    // target — `probed` disambiguates; PRD absence doctrine).
+    let eng_fired: HashSet<&str> = engine_calls
+        .iter()
+        .filter(|(_, n)| **n > 0)
+        .map(|(s, _)| s.as_str())
+        .collect();
+    let meth_fired: HashSet<&str> = meth_calls
+        .iter()
+        .filter(|(_, n)| **n > 0)
+        .map(|(s, _)| s.as_str())
+        .collect();
+    let eng_un: HashSet<&str> = inp.set.unprobed_engine_syms.iter().map(|s| s.as_str()).collect();
+    let meth_un: HashSet<&str> = inp.set.unprobed_meth_syms.iter().map(|s| s.as_str()).collect();
+    let mut entries: Vec<serde_json::Value> = Vec::new();
+    for e in crate::kinds::ENGINE {
+        if matches!(e.class, crate::kinds::EngineClass::Other) {
+            continue; // out of tripwire scope (P1 exit-3 design)
+        }
+        let state = if eng_fired.contains(e.name) {
+            "observed"
+        } else if eng_un.contains(e.name) {
+            "uninstrumented"
+        } else {
+            "absent"
+        };
+        entries.push(serde_json::json!({
+            "name": e.name, "class": "engine", "state": state,
+            "probed": engine_calls.contains_key(e.name),
+        }));
+    }
+    for m in crate::kinds::METH_NEW {
+        let state = if meth_fired.contains(m.name) {
+            "observed"
+        } else if meth_un.contains(m.name) {
+            "uninstrumented"
+        } else {
+            "absent"
+        };
+        entries.push(serde_json::json!({
+            "name": m.name, "class": "meth", "state": state,
+            "probed": meth_calls.contains_key(m.name),
+        }));
+    }
+    for f in crate::kinds::LOWLEVEL {
+        let fam_probed = inp.set.probes.iter().any(|p| p.family == Some(f.family));
+        let fam_un = inp
+            .set
+            .unprobed_lowlevel_syms
+            .iter()
+            .any(|s| lowlevel_family(s) == Some(f.family));
+        let state = if fam_calls.get(f.family).copied().unwrap_or(0) > 0 {
+            "observed"
+        } else if fam_un {
+            "uninstrumented"
+        } else {
+            "absent"
+        };
+        entries.push(serde_json::json!({
+            "name": f.family, "class": "lowlevel", "state": state, "probed": fam_probed,
+        }));
+    }
+    let loads_probed = !inp.set.load_cookies.is_empty();
+    for class in ["legacy", "default", "fips", "other"] {
+        let state = if loads.get(class).copied().unwrap_or(0) > 0 {
+            "observed"
+        } else if !loads_probed {
+            "uninstrumented"
+        } else {
+            "absent"
+        };
+        entries.push(serde_json::json!({
+            "name": class, "class": "load", "state": state, "probed": loads_probed,
+        }));
+    }
+    let attached = inp.set.probes.len() as u64;
+    let missed = inp.set.engine_uninstrumented
+        + inp.set.meth_uninstrumented
+        + inp.set.lowlevel_uninstrumented;
+    let mut weak_algs: Vec<String> = inp
+        .legacy_classes
+        .iter()
+        .filter(|c| crate::kinds::is_weak_alg(c))
+        .cloned()
+        .collect();
+    weak_algs.sort();
+    weak_algs.dedup();
     let mut legacy = serde_json::json!({
         "engine": {"calls_by_entrypoint": engine_calls, "engine_id_class": id_class},
         "meth_new": {"calls_by_entrypoint": meth_calls},
         "lowlevel": {"calls_by_family": fam_calls},
         "legacy_provider": {"loads": loads, "executed_calls": inp.legacy_queries,
                             "algs": classes},
+        "entries": entries,
+        "capability": {"syms_present": attached + missed,
+                       "tripwires_attached": attached, "tripwires_missed": missed},
+        "flags": flags.into_iter().collect::<Vec<_>>(),
+        "weak": {"legacy_algs": weak_algs},
+        "unreadable": {"load_names": load_delta, "engine_ids": id_delta},
     });
     if inp.set.engine_uninstrumented > 0 {
         legacy["engine"]["uninstrumented"] = inp.set.engine_uninstrumented.into();
@@ -770,17 +945,107 @@ mod tests {
         let findings = doc["findings"].as_array().unwrap();
         let texts: Vec<&str> = findings.iter().map(|v| v.as_str().unwrap()).collect();
         assert!(
-            texts
-                .iter()
-                .any(|t| t.contains("1 provider loads") && t.contains("unreadable")),
+            texts.contains(&"provider loads with unreadable names"),
             "load delta finding missing: {texts:?}"
         );
         assert!(
-            texts
-                .iter()
-                .any(|t| t.contains("2 engine-id lookups") && t.contains("unreadable")),
+            texts.contains(&"engine-id lookups with unreadable ids"),
             "by_id delta finding missing: {texts:?}"
         );
+        // Counts ride merge-summable in `unreadable`, not in strings.
+        assert_eq!(doc["unreadable"]["load_names"], 1);
+        assert_eq!(doc["unreadable"]["engine_ids"], 2);
+        let flags = doc["flags"].as_array().unwrap();
+        let slugs: Vec<&str> = flags.iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(slugs.contains(&"unreadable-load-names"), "{slugs:?}");
+        assert!(slugs.contains(&"unreadable-engine-ids"), "{slugs:?}");
+    }
+
+    #[test]
+    fn flag_for_pins_all_producer_templates() {
+        assert_eq!(flag_for(FINDING_ENGINE_ABSENT), "engine-api-absent");
+        assert_eq!(flag_for(FINDING_LOWLEVEL_NODYNSYM), "lowlevel-no-dynsym");
+        assert_eq!(
+            flag_for("unreadable module: /x.so (imports unknown)"),
+            "unreadable-module"
+        );
+        assert_eq!(
+            flag_for("tripwire cap (120) exceeded: 5 imports unprobed"),
+            "tripwire-cap-exceeded"
+        );
+        assert_eq!(
+            flag_for("unprobed import: FOO (/app)"),
+            "unprobed-imports"
+        );
+        assert_eq!(
+            flag_for("…and 3 more unprobed imports"),
+            "unprobed-imports"
+        );
+        assert_eq!(
+            flag_for("legacy tripwire attach failed: EINVAL"),
+            "legacy-attach-failed"
+        );
+        assert_eq!(flag_for("Some New Finding! 123"), "some-new-finding-123");
+        assert_eq!(flag_for(""), "");
+    }
+
+    #[test]
+    fn entries_cover_considered_set_with_states() {
+        // ENGINE_by_id observed + RSA_meth_new uninstrumented + the
+        // rest absent; blind set is all-uninstrumented.
+        let set = ProbeSet {
+            probes: vec![Probe {
+                cookie: 1,
+                symbol: "ENGINE_by_id".into(),
+                offset: 0x100,
+                module: "/app".into(),
+                family: None,
+                str_arg: Some(0),
+                program: "trip_str0",
+            }],
+            unprobed_meth_syms: vec!["RSA_meth_new".into()],
+            by_id_cookies: HashSet::from([1]),
+            ..Default::default()
+        };
+        let doc = section(&SectionInputs {
+            set: &set,
+            trip: &HashMap::from([(1u64, 4u64)]),
+            trip_strs: &[(1u64, "dynamic".into())],
+            legacy_queries: 0,
+            legacy_classes: vec!["MD4".into()],
+            extra_findings: &[],
+        });
+        let entries = doc["entries"].as_array().unwrap();
+        let get = |name: &str| {
+            entries
+                .iter()
+                .find(|e| e["name"] == name)
+                .unwrap_or_else(|| panic!("{name} missing"))
+        };
+        assert_eq!(get("ENGINE_by_id")["state"], "observed");
+        assert_eq!(get("ENGINE_by_id")["class"], "engine");
+        assert_eq!(get("ENGINE_by_id")["probed"], true);
+        assert_eq!(get("RSA_meth_new")["state"], "uninstrumented");
+        assert_eq!(get("RSA_meth_new")["probed"], false);
+        assert_eq!(get("ENGINE_init")["state"], "absent");
+        assert_eq!(get("digest/sha")["class"], "lowlevel");
+        assert_eq!(get("legacy")["class"], "load");
+        assert_eq!(doc["weak"]["legacy_algs"], serde_json::json!(["MD4"]));
+        assert_eq!(doc["capability"]["tripwires_attached"], 1);
+
+        let blind = blind_probe_set();
+        let bdoc = section(&SectionInputs {
+            set: &blind,
+            trip: &HashMap::new(),
+            trip_strs: &[],
+            legacy_queries: 0,
+            legacy_classes: Vec::new(),
+            extra_findings: &[],
+        });
+        let bentries = bdoc["entries"].as_array().unwrap();
+        assert!(!bentries.is_empty());
+        assert!(bentries.iter().all(|e| e["state"] == "uninstrumented"));
+        assert_eq!(bdoc["capability"]["tripwires_attached"], 0);
     }
 
     #[test]
@@ -901,6 +1166,9 @@ mod tests {
             engine_uninstrumented: 0,
             meth_uninstrumented: 2,
             lowlevel_uninstrumented: 0,
+            unprobed_engine_syms: vec![],
+            unprobed_meth_syms: vec!["RSA_meth_new".into(), "DSA_meth_new".into()],
+            unprobed_lowlevel_syms: vec![],
             findings: vec![],
             by_id_cookies: [0].into_iter().collect(),
             load_cookies: [2].into_iter().collect(),
