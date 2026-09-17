@@ -48,6 +48,109 @@ pub struct ProgSpec {
     pub section: &'static str,
 }
 
+/// Frozen harvest shape (keyed-design §1): dims asserted vs the
+/// object by `prepare`, fail-closed on drift. Proven by the P2
+/// task-0 spike (spike-uret.sh GREEN 3/3).
+pub const HARVEST_MAPS: [MapSpec; 8] = [
+    MapSpec {
+        name: "EVENTS",
+        map_type: 27,
+        key_size: 0,
+        value_size: 0,
+        max_entries: 1 << 21,
+        flags: 0,
+    },
+    MapSpec {
+        name: "PENDING_INIT",
+        map_type: 1,
+        key_size: 8,
+        value_size: 8,
+        max_entries: 1024,
+        flags: 0,
+    },
+    MapSpec {
+        name: "PENDING_QUERY",
+        map_type: 1,
+        key_size: 8,
+        value_size: 8,
+        max_entries: 1024,
+        flags: 0,
+    },
+    MapSpec {
+        name: "QUERY_NEXT",
+        map_type: 1,
+        key_size: 8,
+        value_size: 8,
+        max_entries: 4096,
+        flags: 0,
+    },
+    MapSpec {
+        name: "TRUNC",
+        map_type: 1,
+        key_size: 4,
+        value_size: 8,
+        max_entries: 64,
+        flags: 0,
+    },
+    MapSpec {
+        name: "CALLS",
+        map_type: 1,
+        key_size: 4,
+        value_size: 8,
+        max_entries: 64,
+        flags: 0,
+    },
+    MapSpec {
+        name: "TRIP",
+        map_type: 1,
+        key_size: 8,
+        value_size: 8,
+        max_entries: 128,
+        flags: 0,
+    },
+    MapSpec {
+        name: "LGCALLS",
+        map_type: 1,
+        key_size: 4,
+        value_size: 8,
+        max_entries: 64,
+        flags: 0,
+    },
+];
+
+/// Frozen harvest programs: the init/query entry+return pairs plus
+/// the three entry-only tripwire counters.
+pub const HARVEST_PROGS: [ProgSpec; 7] = [
+    ProgSpec {
+        name: "init_entry",
+        section: "uprobe",
+    },
+    ProgSpec {
+        name: "init_return",
+        section: "uretprobe",
+    },
+    ProgSpec {
+        name: "query_entry",
+        section: "uprobe",
+    },
+    ProgSpec {
+        name: "query_return",
+        section: "uretprobe",
+    },
+    ProgSpec {
+        name: "trip_count",
+        section: "uprobe",
+    },
+    ProgSpec {
+        name: "trip_str0",
+        section: "uprobe",
+    },
+    ProgSpec {
+        name: "trip_str1",
+        section: "uprobe",
+    },
+];
+
 /// A map-fd fixup site: byte offset of the insn + map name.
 pub struct MapFixup {
     pub insn_off: usize,
@@ -92,6 +195,7 @@ struct Sym {
     shndx: usize,
     is_func: bool,
     is_obj: bool,
+    is_section: bool,
 }
 
 struct Reloc {
@@ -129,13 +233,23 @@ fn parse_syms(elf: &goblin::elf::Elf) -> Vec<Sym> {
     let mut out = Vec::new();
     for s in elf.syms.iter() {
         let ty = s.st_type();
+        // Section symbols name via shstrtab, not strtab.
+        let name = if ty == goblin::elf::sym::STT_SECTION {
+            elf.section_headers
+                .get(s.st_shndx)
+                .map(|h| elf.shdr_strtab[h.sh_name].to_string())
+                .unwrap_or_default()
+        } else {
+            elf.strtab.get_at(s.st_name).unwrap_or("").to_string()
+        };
         out.push(Sym {
-            name: elf.strtab.get_at(s.st_name).unwrap_or("").to_string(),
+            name,
             value: s.st_value as usize,
             size: s.st_size as usize,
             shndx: s.st_shndx,
             is_func: ty == goblin::elf::sym::STT_FUNC,
             is_obj: ty == goblin::elf::sym::STT_OBJECT,
+            is_section: ty == goblin::elf::sym::STT_SECTION,
         });
     }
     out
@@ -166,6 +280,57 @@ fn sec_index(elf: &goblin::elf::Elf, want: &str) -> anyhow::Result<usize> {
         }
     }
     anyhow::bail!("section {want} missing")
+}
+
+/// BPF static-call opcode (sites carry src=1 + a reloc).
+const BPF_CALL: u8 = 0x85;
+
+/// Resolve an `R_BPF_64_32` call reloc to a `.text` function name.
+/// Named FUNC syms resolve by (value, name); STT_SECTION syms (the
+/// toolchain's reduction for LOCAL callees — `call -1` + section
+/// reloc, as in query_return→walk_dispatch) resolve as
+/// section_base + (imm+1)*8, the aya-obj rule. Either way the
+/// target MUST be a `.text` entry: mid-function landings are drift,
+/// never a guess.
+fn call_target(
+    syms: &[Sym],
+    text_fns: &[(usize, usize, String)],
+    text_idx: usize,
+    site_sec: &[u8],
+    r: &Reloc,
+    prog: &str,
+) -> anyhow::Result<String> {
+    let rsym = syms
+        .get(r.sym)
+        .ok_or_else(|| anyhow::anyhow!("prog {prog}: bad reloc sym"))?;
+    let site = site_sec
+        .get(r.off..r.off + 8)
+        .ok_or_else(|| anyhow::anyhow!("prog {prog}: call reloc out of range"))?;
+    if site[0] != BPF_CALL {
+        anyhow::bail!("prog {prog}: call reloc vs non-call insn");
+    }
+    if !rsym.is_section {
+        if !rsym.is_func || rsym.shndx != text_idx {
+            anyhow::bail!("prog {prog}: call reloc vs non-entry {}", rsym.name);
+        }
+        return text_fns
+            .iter()
+            .find(|(v, _, n)| *v == rsym.value && *n == rsym.name)
+            .map(|(_, _, n)| n.clone())
+            .ok_or_else(|| anyhow::anyhow!("prog {prog}: call reloc vs non-entry {}", rsym.name));
+    }
+    if rsym.shndx != text_idx {
+        anyhow::bail!("prog {prog}: call reloc vs non-.text section {}", rsym.name);
+    }
+    let imm = i32::from_le_bytes(site[4..8].try_into().unwrap()) as i64;
+    let addr = rsym.value as i64 + (imm + 1) * 8;
+    let addr = usize::try_from(addr)
+        .map_err(|_| anyhow::anyhow!("prog {prog}: call target out of range"))?;
+    text_fns
+        .iter()
+        .find(|(v, _, _)| *v == addr)
+        .map(|(_, _, n)| n.clone())
+        .ok_or_else(|| anyhow::anyhow!("prog {prog}: call lands mid-function at {addr:#x}"))
 }
 
 /// Rewrite one static-call imm: call site at `rel_off` (in the final
@@ -355,18 +520,11 @@ pub fn prepare(obj: &[u8], maps: &[MapSpec], progs: &[ProgSpec]) -> anyhow::Resu
                     });
                 }
                 R_BPF_64_32 => {
-                    if text_idx.is_none() {
-                        anyhow::bail!("prog {}: call reloc but no .text", p.name);
-                    }
-                    if !rsym.is_func
-                        || Some(rsym.shndx) != text_idx
-                        || !text_fns
-                            .iter()
-                            .any(|(v, _, n)| *v == rsym.value && *n == rsym.name)
-                    {
-                        anyhow::bail!("prog {}: call reloc vs non-entry {}", p.name, rsym.name);
-                    }
-                    roots.push((local, rsym.name.clone()));
+                    let tidx = text_idx.ok_or_else(|| {
+                        anyhow::anyhow!("prog {}: call reloc but no .text", p.name)
+                    })?;
+                    let target = call_target(&syms, &text_fns, tidx, sec, r, p.name)?;
+                    roots.push((local, target));
                 }
                 t => anyhow::bail!("prog {}: reloc type {t} unsupported", p.name),
             }
@@ -387,10 +545,10 @@ pub fn prepare(obj: &[u8], maps: &[MapSpec], progs: &[ProgSpec]) -> anyhow::Resu
                 .ok_or_else(|| anyhow::anyhow!("prog {}: call vs unknown {next}", p.name))?;
             for r in relocs.get(".text").map(Vec::as_slice).unwrap_or(&[]) {
                 if *f0 <= r.off && r.off < *f1 && r.typ == R_BPF_64_32 {
-                    let rsym = syms
-                        .get(r.sym)
-                        .ok_or_else(|| anyhow::anyhow!("prog {}: bad text reloc sym", p.name))?;
-                    work.push(rsym.name.clone());
+                    let tidx = text_idx.ok_or_else(|| {
+                        anyhow::anyhow!("prog {}: call reloc but no .text", p.name)
+                    })?;
+                    work.push(call_target(&syms, &text_fns, tidx, text, r, p.name)?);
                 }
             }
         }
@@ -440,11 +598,16 @@ pub fn prepare(obj: &[u8], maps: &[MapSpec], progs: &[ProgSpec]) -> anyhow::Resu
                     });
                 }
                 R_BPF_64_32 => {
-                    if !rsym.is_func || Some(rsym.shndx) != text_idx {
-                        anyhow::bail!("prog {}: text call reloc vs non-.text", p.name);
+                    let tidx = text_idx.ok_or_else(|| {
+                        anyhow::anyhow!("prog {}: call reloc but no .text", p.name)
+                    })?;
+                    let target = call_target(&syms, &text_fns, tidx, text, r, p.name)?;
+                    // Call targets must be entries (closure invariant).
+                    if !included.contains(&target) {
+                        anyhow::bail!("prog {}: call vs excluded {}", p.name, target);
                     }
-                    let t = base.get(&rsym.name).ok_or_else(|| {
-                        anyhow::anyhow!("prog {}: call vs unlinked {}", p.name, rsym.name)
+                    let t = base.get(&target).ok_or_else(|| {
+                        anyhow::anyhow!("prog {}: call vs unlinked {}", p.name, target)
                     })?;
                     let site = obase
                         + (r.off
@@ -453,10 +616,6 @@ pub fn prepare(obj: &[u8], maps: &[MapSpec], progs: &[ProgSpec]) -> anyhow::Resu
                                 .find(|(_, _, n)| n == &owner)
                                 .map(|(v, _, _)| *v)
                                 .unwrap());
-                    // Call targets must be entries (closure invariant).
-                    if !included.contains(&rsym.name) {
-                        anyhow::bail!("prog {}: call vs excluded {}", p.name, rsym.name);
-                    }
                     apply_call(&mut insns, site, *t, p.name)?;
                 }
                 t => anyhow::bail!("prog {}: text reloc type {t} unsupported", p.name),
@@ -714,5 +873,78 @@ mod tests {
             }],
         );
         assert!(r.is_err());
+    }
+
+    fn t_sym(name: &str, value: usize, shndx: usize, func: bool, sec: bool) -> Sym {
+        Sym {
+            name: name.to_string(),
+            value,
+            size: 8,
+            shndx,
+            is_func: func,
+            is_obj: false,
+            is_section: sec,
+        }
+    }
+
+    fn call_site(imm: i32) -> Vec<u8> {
+        let mut b = vec![0x95u8; 16]; // exit padding
+        b[0] = 0x85;
+        b[4..8].copy_from_slice(&imm.to_le_bytes());
+        b
+    }
+
+    #[test]
+    fn call_target_section_rule() {
+        // Mirrors the real shape: .text[0] = local callee, .text[0x330]
+        // = named builtin; section sym value 0.
+        let fns = vec![
+            (0usize, 528usize, "walk".to_string()),
+            (0x330usize, 0x370usize, "memset".to_string()),
+        ];
+        let syms = vec![
+            t_sym(".text", 0, 2, false, true),
+            t_sym("memset", 0x330, 2, true, false),
+            t_sym("uprobe_func", 0, 4, true, false),
+        ];
+        // Named path: (value, name) entry.
+        let site = call_site(-1);
+        let r = Reloc {
+            off: 0,
+            typ: R_BPF_64_32,
+            sym: 1,
+        };
+        assert_eq!(
+            call_target(&syms, &fns, 2, &site, &r, "p").unwrap(),
+            "memset"
+        );
+        // Section path, placeholder imm: base + 0 = entry@0.
+        let r = Reloc {
+            off: 0,
+            typ: R_BPF_64_32,
+            sym: 0,
+        };
+        assert_eq!(call_target(&syms, &fns, 2, &site, &r, "p").unwrap(), "walk");
+        // Section path, folded offset: imm = X/8 - 1 lands on memset.
+        let site = call_site(0x330 / 8 - 1);
+        assert_eq!(
+            call_target(&syms, &fns, 2, &site, &r, "p").unwrap(),
+            "memset"
+        );
+        // Mid-function landing is drift, never a guess.
+        let site = call_site(8 / 8 - 1);
+        assert!(call_target(&syms, &fns, 2, &site, &r, "p").is_err());
+        // Non-call site is drift.
+        let mut site = call_site(-1);
+        site[0] = 0x95;
+        assert!(call_target(&syms, &fns, 2, &site, &r, "p").is_err());
+        // Named non-.text func is drift.
+        let r = Reloc {
+            off: 0,
+            typ: R_BPF_64_32,
+            sym: 2,
+        };
+        let site = call_site(-1);
+        assert!(call_target(&syms, &fns, 2, &site, &r, "p").is_err());
     }
 }

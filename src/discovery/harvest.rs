@@ -7,14 +7,19 @@
 //! the core-static `ossl_provider_query_operation` resolved via the
 //! build-id ladder (no init anchor exists for the in-libcrypto
 //! default provider), coverage counters, and PARTIAL documents.
+//!
+//! P2 migrates load+attach to the raw multi loader (same BPF
+//! programs, same cookie id space — P1 goldens match byte-for-byte).
+//! Aya stays only for typed map/ringbuf reads over dup'd fds.
 use crate::discovery::{builtin, elf, legacy, maps, schema};
+use crate::loader::Loaded;
 use anyhow::{Context as _, anyhow, bail};
-use aya::maps::RingBuf;
-use aya::programs::UProbe;
-use aya::programs::uprobe::{UProbeAttachLocation, UProbeAttachPoint, UProbeLink, UProbeScope};
-use aya::{Ebpf, EbpfLoader};
+use aya::maps::{Map, MapData, RingBuf};
 use std::collections::{HashMap, HashSet};
+use std::ffi::CString;
 use std::num::NonZeroU32;
+use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -57,113 +62,102 @@ pub struct Config {
     pub force_offset: Option<u64>,
 }
 
-/// Load every harvest program once, up front (verifier failures
-/// surface before any attach; aya refuses a second load of the same
-/// program, so attach sites must never load).
-fn load_programs(bpf: &mut Ebpf) -> anyhow::Result<()> {
-    for name in [
-        "init_entry",
-        "init_return",
-        "query_entry",
-        "query_return",
-        "trip_count",
-        "trip_str0",
-        "trip_str1",
-    ] {
-        let prog: &mut UProbe = bpf
-            .program_mut(name)
-            .ok_or_else(|| anyhow!("missing program {name}"))?
-            .try_into()?;
-        prog.load().with_context(|| format!("load {name}"))?;
-    }
-    Ok(())
+/// Load the frozen harvest shape: `prepare` asserts dims vs the
+/// object (fail-closed on drift), `load` creates maps + progs raw
+/// with `expected_attach_type=UPROBE_MULTI`. Verifier failures
+/// surface before any attach.
+fn load_frozen(obj_bytes: &[u8]) -> anyhow::Result<Loaded> {
+    let prep = crate::loader::prepare(
+        obj_bytes,
+        &crate::loader::HARVEST_MAPS,
+        &crate::loader::HARVEST_PROGS,
+    )?;
+    crate::loader::load(&prep)
 }
 
-/// Owned uprobe links, detached in parallel on drop. Each link
-/// close pays a kernel SRCU/RCU grace period (~90ms in CI VMs), so
-/// ~830 sequential detaches stall exit by ~75s; concurrent closes
-/// share grace periods (~2s). Taken out of aya's managed links at
-/// attach time so every return path detaches via this guard.
+/// Owned multi links (drop = detach; a handful per run, so the P1
+/// parallel-detach guard retired with the ~830 perf pairs).
 #[derive(Default)]
-struct Links(Vec<UProbeLink>);
+struct Links(Vec<OwnedFd>);
 
-impl Drop for Links {
-    fn drop(&mut self) {
-        let links = std::mem::take(&mut self.0);
-        if links.len() < 2 {
-            return;
-        }
-        // Round-robin buckets: drops only sleep in kernel, so
-        // oversubscription is fine and grace periods overlap.
-        let n = 16usize.min(links.len());
-        let mut buckets: Vec<Vec<UProbeLink>> = (0..n).map(|_| Vec::new()).collect();
-        for (i, l) in links.into_iter().enumerate() {
-            buckets[i % n].push(l);
-        }
-        std::thread::scope(|s| {
-            for b in buckets {
-                s.spawn(|| drop(b));
-            }
-        });
-    }
+/// Path for a multi link: the kernel resolves it per mapping, so
+/// the caller's (possibly relative) path is passed through as-is.
+fn link_path(path: &Path) -> anyhow::Result<CString> {
+    CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| anyhow!("attach path contains NUL: {}", path.display()))
+}
+
+fn prog_fd(loaded: &Loaded, name: &str) -> anyhow::Result<std::os::fd::RawFd> {
+    loaded
+        .progs
+        .get(name)
+        .map(AsRawFd::as_raw_fd)
+        .ok_or_else(|| anyhow!("missing program {name}"))
 }
 
 #[allow(clippy::too_many_arguments, reason = "one coherent attach spec")]
 fn attach_pair(
-    bpf: &mut Ebpf,
+    loaded: &Loaded,
     links: &mut Links,
     entry: &str,
     ret: &str,
     offset: u64,
     path: &Path,
-    pid: NonZeroU32,
-    cookie: Option<u64>,
+    pid: u32,
+    cookie: u64,
 ) -> anyhow::Result<()> {
-    for name in [entry, ret] {
-        let prog: &mut UProbe = bpf
-            .program_mut(name)
-            .ok_or_else(|| anyhow!("missing program {name}"))?
-            .try_into()?;
-        let point = UProbeAttachPoint {
-            location: UProbeAttachLocation::AbsoluteOffset(offset),
-            cookie,
-        };
-        let id = prog
-            .attach(point, path, UProbeScope::OneProcess(pid))
-            .map_err(|e| anyhow!("attach {name}@{offset:#x}: {e}"))?;
-        links.0.push(prog.take_link(id)?);
-    }
+    let cpath = link_path(path)?;
+    let entry_link = ossl_bpf_sys::link_create_uprobe_multi(
+        prog_fd(loaded, entry)?,
+        &cpath,
+        &[offset],
+        &[cookie],
+        pid,
+    )
+    .map_err(|e| anyhow!("attach {entry}@{offset:#x}: {e}"))?;
+    links.0.push(entry_link);
+    let ret_link = ossl_bpf_sys::link_create_uretprobe_multi(
+        prog_fd(loaded, ret)?,
+        &cpath,
+        &[offset],
+        &[cookie],
+        pid,
+    )
+    .map_err(|e| anyhow!("attach {ret}@{offset:#x}: {e}"))?;
+    links.0.push(ret_link);
     Ok(())
 }
 
-/// Attach legacy tripwires: each probe = its program at its offset
-/// in its module with its cookie (programs loaded once; API-surface
-/// probes live in libcrypto, low-level probes in caller PLTs).
+/// Attach legacy tripwires: one multi link per (module, program)
+/// with the probes' offsets + cookies batched (same cookie id
+/// space as the P1 perf singles — goldens unaffected).
 fn attach_trips(
-    bpf: &mut Ebpf,
+    loaded: &Loaded,
     links: &mut Links,
     set: &legacy::ProbeSet,
-    pid: NonZeroU32,
+    pid: u32,
 ) -> anyhow::Result<()> {
-    let mut by_prog: HashMap<&str, Vec<&legacy::Probe>> = HashMap::new();
+    type OffsetsCookies = (Vec<u64>, Vec<u64>);
+    let mut groups: HashMap<(&str, &str), OffsetsCookies> = HashMap::new();
     for p in &set.probes {
-        by_prog.entry(p.program).or_default().push(p);
+        let (offs, cookies) = groups.entry((p.module.as_str(), p.program)).or_default();
+        offs.push(p.offset);
+        cookies.push(p.cookie);
     }
-    for (prog_name, probes) in &by_prog {
-        let prog: &mut UProbe = bpf
-            .program_mut(prog_name)
-            .ok_or_else(|| anyhow!("missing program {prog_name}"))?
-            .try_into()?;
-        for p in probes {
-            let point = UProbeAttachPoint {
-                location: UProbeAttachLocation::AbsoluteOffset(p.offset),
-                cookie: Some(p.cookie),
-            };
-            let id = prog
-                .attach(point, Path::new(&p.module), UProbeScope::OneProcess(pid))
-                .map_err(|e| anyhow!("attach {}@{:#x}: {e}", p.symbol, p.offset))?;
-            links.0.push(prog.take_link(id)?);
-        }
+    let mut keys: Vec<(&str, &str)> = groups.keys().copied().collect();
+    keys.sort_unstable();
+    for (module, prog_name) in keys {
+        let (offsets, cookies) = &groups[&(module, prog_name)];
+        let cpath = link_path(Path::new(module))?;
+        let link = ossl_bpf_sys::link_create_uprobe_multi(
+            prog_fd(loaded, prog_name)?,
+            &cpath,
+            offsets,
+            cookies,
+            pid,
+        )
+        .map_err(|e| anyhow!("attach {prog_name}@{module}+{}: {e}", offsets.len()))?;
+        links.0.push(link);
     }
     Ok(())
 }
@@ -297,45 +291,59 @@ fn blind_legacy_section() -> serde_json::Value {
     })
 }
 
-/// Drain the TRUNC overflow map (missing on pre-exit-2 objects → empty).
-fn read_trunc(bpf: &mut Ebpf) -> Vec<(u32, u64)> {
-    let Some(map) = bpf.take_map("TRUNC") else {
-        return Vec::new();
+/// Typed hash-map read over a dup'd raw fd (aya in its P2 role:
+/// typed reads only — load/attach went raw). Missing/foreign maps
+/// read as empty (frozen shape always carries them; the fallback is
+/// for shape drift, which `prepare` already refused).
+fn read_kv<K, V>(maps: &HashMap<String, OwnedFd>, name: &str) -> Vec<(K, V)>
+where
+    K: aya::Pod + Eq + std::hash::Hash,
+    V: aya::Pod,
+{
+    let fd = match maps.get(name).and_then(|f| f.try_clone().ok()) {
+        Some(fd) => fd,
+        None => return Vec::new(),
     };
-    let Ok(map) = aya::maps::HashMap::<_, u32, u64>::try_from(map) else {
+    let data = match MapData::from_fd(fd) {
+        Ok(d) => d,
+        Err(_) => return Vec::new(),
+    };
+    let map = match Map::from_map_data(data) {
+        Ok(m) => m,
+        Err(_) => return Vec::new(),
+    };
+    let Ok(map) = aya::maps::HashMap::<_, K, V>::try_from(map) else {
         return Vec::new();
     };
     map.iter().filter_map(|r| r.ok()).collect()
 }
 
-/// Sum the CALLS per-op map (missing on pre-exit-2 objects → the
-/// caller falls back to the QUERY_RET event count).
-fn read_calls(bpf: &mut Ebpf) -> Option<u64> {
-    let map = bpf.take_map("CALLS")?;
-    let map = aya::maps::HashMap::<_, u32, u64>::try_from(map).ok()?;
-    Some(map.iter().filter_map(|r| r.ok()).map(|(_, n)| n).sum())
+/// Drain the TRUNC overflow map.
+fn read_trunc(maps: &HashMap<String, OwnedFd>) -> Vec<(u32, u64)> {
+    read_kv(maps, "TRUNC")
 }
 
-/// TRIP map contents (missing on pre-exit-3 objects → empty).
-fn read_trip(bpf: &mut Ebpf) -> HashMap<u64, u64> {
-    let Some(map) = bpf.take_map("TRIP") else {
-        return HashMap::new();
-    };
-    let Ok(map) = aya::maps::HashMap::<_, u64, u64>::try_from(map) else {
-        return HashMap::new();
-    };
-    map.iter().filter_map(|r| r.ok()).collect()
+/// Sum the CALLS per-op map (empty → the caller falls back to the
+/// QUERY_RET event count).
+fn read_calls(maps: &HashMap<String, OwnedFd>) -> Option<u64> {
+    let rows: Vec<(u32, u64)> = read_kv(maps, "CALLS");
+    if rows.is_empty() && !maps.contains_key("CALLS") {
+        return None;
+    }
+    Some(rows.iter().map(|(_, n)| n).sum())
 }
 
-/// Sum the LGCALLS per-op map (missing on pre-exit-3 objects → 0).
-fn read_lgcalls(bpf: &mut Ebpf) -> u64 {
-    let Some(map) = bpf.take_map("LGCALLS") else {
-        return 0;
-    };
-    let Ok(map) = aya::maps::HashMap::<_, u32, u64>::try_from(map) else {
-        return 0;
-    };
-    map.iter().filter_map(|r| r.ok()).map(|(_, n)| n).sum()
+/// TRIP map contents.
+fn read_trip(maps: &HashMap<String, OwnedFd>) -> HashMap<u64, u64> {
+    read_kv::<u64, u64>(maps, "TRIP").into_iter().collect()
+}
+
+/// Sum the LGCALLS per-op map.
+fn read_lgcalls(maps: &HashMap<String, OwnedFd>) -> u64 {
+    read_kv::<u32, u64>(maps, "LGCALLS")
+        .iter()
+        .map(|(_, n)| n)
+        .sum()
 }
 
 /// Run the harvest; returns the emitted document on success.
@@ -374,9 +382,8 @@ pub fn run(cfg: &Config) -> anyhow::Result<serde_json::Value> {
         cfg.legacy,
     )?;
 
-    let mut bpf = EbpfLoader::new().load(&obj_bytes)?;
-    load_programs(&mut bpf)?;
-    // Owns every uprobe link (parallel detach on drop, all paths).
+    let loaded = load_frozen(&obj_bytes)?;
+    // Owns every multi link (drop = detach, all paths).
     let mut links = Links::default();
     let mut resolution: Option<String> = None;
     // Dispatch-blind runs preset their PARTIAL reason but still drain
@@ -396,14 +403,14 @@ pub fn run(cfg: &Config) -> anyhow::Result<serde_json::Value> {
                     resolution = Some(r.as_str().to_string());
                 }
                 attach_pair(
-                    &mut bpf,
+                    &loaded,
                     &mut links,
                     "query_entry",
                     "query_return",
                     off,
                     &cfg.provider,
-                    pid,
-                    Some(0),
+                    pid.get(),
+                    0,
                 )?;
                 eprintln!("INSPECT stage=builtin off={off:#x} via={}", r.as_str());
             }
@@ -424,14 +431,14 @@ pub fn run(cfg: &Config) -> anyhow::Result<serde_json::Value> {
             Ok((off, res)) => {
                 resolution = res;
                 attach_pair(
-                    &mut bpf,
+                    &loaded,
                     &mut links,
                     "init_entry",
                     "init_return",
                     off,
                     &cfg.provider,
-                    pid,
-                    Some(0),
+                    pid.get(),
+                    0,
                 )?;
             }
             Err(e) => {
@@ -474,7 +481,7 @@ pub fn run(cfg: &Config) -> anyhow::Result<serde_json::Value> {
                 set.findings
                     .push(format!("unreadable module: {path} (imports unknown)"));
             }
-            attach_trips(&mut bpf, &mut links, &set, pid)?;
+            attach_trips(&loaded, &mut links, &set, pid.get())?;
             eprintln!("INSPECT stage=legacy trips={}", set.probes.len());
             for cand in legacy_candidates(cfg.pid, &lc_path) {
                 let off = std::fs::read(&cand)
@@ -484,14 +491,14 @@ pub fn run(cfg: &Config) -> anyhow::Result<serde_json::Value> {
                 // legacy stays unattributed (documented edge).
                 if let Some(off) = off {
                     if let Err(e) = attach_pair(
-                        &mut bpf,
+                        &loaded,
                         &mut links,
                         "init_entry",
                         "init_return",
                         off,
                         &cand,
-                        pid,
-                        Some(LEGACY_COOKIE),
+                        pid.get(),
+                        LEGACY_COOKIE,
                     ) {
                         // Loud in-doc (executed_calls would read a
                         // false 0); the run continues for tripwires.
@@ -540,10 +547,14 @@ pub fn run(cfg: &Config) -> anyhow::Result<serde_json::Value> {
         cfg.legacy,
     )?;
 
-    let map = bpf
-        .take_map("EVENTS")
-        .ok_or_else(|| anyhow!("no EVENTS map"))?;
-    let mut ring = RingBuf::try_from(map)?;
+    let ev_fd = loaded
+        .maps
+        .get("EVENTS")
+        .context("no EVENTS map")?
+        .try_clone()?;
+    let ev_data = MapData::from_fd(ev_fd).map_err(|e| anyhow!("EVENTS mapdata: {e}"))?;
+    let ev_map = Map::from_map_data(ev_data).map_err(|e| anyhow!("EVENTS map: {e}"))?;
+    let mut ring = RingBuf::try_from(ev_map)?;
     let start = Instant::now();
     let mut last_event = None;
     let mut trigger_observed = false;
@@ -638,14 +649,14 @@ pub fn run(cfg: &Config) -> anyhow::Result<serde_json::Value> {
                         (addr - m.start + m.offset, cfg.provider.clone())
                     };
                     attach_pair(
-                        &mut bpf,
+                        &loaded,
                         &mut links,
                         "query_entry",
                         "query_return",
                         off,
                         Path::new(&path),
-                        pid,
-                        Some(cookie),
+                        pid.get(),
+                        cookie,
                     )?;
                     attached_queries.insert(cookie);
                     eprintln!("INSPECT stage=query addr={addr:#x} off={off:#x} cookie={cookie}");
@@ -740,8 +751,8 @@ pub fn run(cfg: &Config) -> anyhow::Result<serde_json::Value> {
     )?;
     // Tripwire observations (read before the no-trigger decision:
     // loads distinguish "wrong attach" from "quiet target").
-    let trip = read_trip(&mut bpf);
-    let lgcalls = read_lgcalls(&mut bpf);
+    let trip = read_trip(&loaded.maps);
+    let lgcalls = read_lgcalls(&loaded.maps);
     // Per-cookie trip dump (all paths: the no-trigger path needs it
     // most — a quiet dispatch with firing tripwires).
     if cfg.legacy && std::env::var("OSSL_DEBUG_TRIP").is_ok() {
@@ -965,10 +976,10 @@ pub fn run(cfg: &Config) -> anyhow::Result<serde_json::Value> {
     ops_with_rows.extend(legacy_rows.iter().map(|r| r.op));
     let mut zero_row_ops: Vec<u32> = ops_hit.difference(&ops_with_rows).copied().collect();
     zero_row_ops.sort_unstable();
-    let truncated = read_trunc(&mut bpf);
+    let truncated = read_trunc(&loaded.maps);
     // Exact call volume from the CALLS map (QUERY_RET events are
     // first-hit-only; the event count is the pre-exit-2 fallback).
-    if let Some(calls) = read_calls(&mut bpf) {
+    if let Some(calls) = read_calls(&loaded.maps) {
         queries_observed = calls;
     }
     // Validation: the known-op trigger must yield rows.

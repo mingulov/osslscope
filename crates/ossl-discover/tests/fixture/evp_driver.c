@@ -458,6 +458,16 @@ int main(int argc, char **argv)
         frc = fallback_run(n);
         if (frc == 0)
             fprintf(stderr, "FALLBACKDONE ops=%ld\n", n);
+        /* Linger until stdin EOF (sibling GO2/EOF protocol): the
+         * harvester's settle window outlives the ~1s fallback burst,
+         * and an exited target fails the pid pin (drain-end verify
+         * races driver exit — settle must observe a live task). */
+        {
+            char line[16];
+
+            while (fgets(line, sizeof line, stdin) != NULL) {
+            }
+        }
         return frc;
     }
     if (n < 0 || alg == NULL
