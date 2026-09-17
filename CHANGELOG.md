@@ -9,6 +9,10 @@
   names.
 - Test-only `OSSL_CANARY_DUMP` ring tap for the P4 canary suite
   (capped raw-payload dump, never enabled in production).
+- P4 canary fixtures: `secret_driver` (sentinel buffers through
+  digest/sign/cipher/MAC/KEM/KDF/RAND/password/salt/propquery
+  paths, threaded stack lanes) and `sentinel` provider (hostile
+  alg names + 264-entry overlong array).
 
 ## Unreleased — P3 semantics + policy
 
