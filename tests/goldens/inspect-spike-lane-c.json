@@ -19,21 +19,6 @@
     },
     {
       "addr_backed": true,
-      "addr_hash": "c8f235266ae0a77a",
-      "alg_class": "other",
-      "backing": {
-        "dev": "fd:01",
-        "ino": 803225,
-        "offset": 4890
-      },
-      "funcid": 6,
-      "gen": 0,
-      "op": 1,
-      "provider": "spike",
-      "weak": false
-    },
-    {
-      "addr_backed": true,
       "addr_hash": "e47a389811a78a6e",
       "alg_class": "other",
       "backing": {
@@ -79,14 +64,14 @@
     },
     {
       "addr_backed": true,
-      "addr_hash": "e764ada664497a13",
+      "addr_hash": "c8f235266ae0a77a",
       "alg_class": "other",
       "backing": {
         "dev": "fd:01",
         "ino": 803225,
-        "offset": 5149
+        "offset": 4890
       },
-      "funcid": 11,
+      "funcid": 6,
       "gen": 0,
       "op": 1,
       "provider": "spike",
@@ -109,6 +94,21 @@
     },
     {
       "addr_backed": true,
+      "addr_hash": "e764ada664497a13",
+      "alg_class": "other",
+      "backing": {
+        "dev": "fd:01",
+        "ino": 803225,
+        "offset": 5149
+      },
+      "funcid": 11,
+      "gen": 0,
+      "op": 1,
+      "provider": "spike",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
       "addr_hash": "fd55593181c2cb23",
       "alg_class": "other",
       "backing": {
@@ -117,21 +117,6 @@
         "offset": 5379
       },
       "funcid": 1,
-      "gen": 0,
-      "op": 1,
-      "provider": "spike",
-      "weak": false
-    },
-    {
-      "addr_backed": true,
-      "addr_hash": "1ca3cc4f73f80ef2",
-      "alg_class": "other",
-      "backing": {
-        "dev": "fd:01",
-        "ino": 803225,
-        "offset": 5437
-      },
-      "funcid": 6,
       "gen": 0,
       "op": 1,
       "provider": "spike",
@@ -184,14 +169,14 @@
     },
     {
       "addr_backed": true,
-      "addr_hash": "303f557bdb4d1777",
+      "addr_hash": "1ca3cc4f73f80ef2",
       "alg_class": "other",
       "backing": {
         "dev": "fd:01",
         "ino": 803225,
-        "offset": 5696
+        "offset": 5437
       },
-      "funcid": 11,
+      "funcid": 6,
       "gen": 0,
       "op": 1,
       "provider": "spike",
@@ -214,6 +199,21 @@
     },
     {
       "addr_backed": true,
+      "addr_hash": "303f557bdb4d1777",
+      "alg_class": "other",
+      "backing": {
+        "dev": "fd:01",
+        "ino": 803225,
+        "offset": 5696
+      },
+      "funcid": 11,
+      "gen": 0,
+      "op": 1,
+      "provider": "spike",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
       "addr_hash": "503556452a6396df",
       "alg_class": "other",
       "backing": {
@@ -222,21 +222,6 @@
         "offset": 5926
       },
       "funcid": 1,
-      "gen": 0,
-      "op": 12,
-      "provider": "spike",
-      "weak": false
-    },
-    {
-      "addr_backed": true,
-      "addr_hash": "24a2ff2fa8581f27",
-      "alg_class": "other",
-      "backing": {
-        "dev": "fd:01",
-        "ino": 803225,
-        "offset": 5988
-      },
-      "funcid": 16,
       "gen": 0,
       "op": 12,
       "provider": "spike",
@@ -304,6 +289,21 @@
     },
     {
       "addr_backed": true,
+      "addr_hash": "24a2ff2fa8581f27",
+      "alg_class": "other",
+      "backing": {
+        "dev": "fd:01",
+        "ino": 803225,
+        "offset": 5988
+      },
+      "funcid": 16,
+      "gen": 0,
+      "op": 12,
+      "provider": "spike",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
       "addr_hash": "c7df194a9a9a037b",
       "alg_class": "other",
       "backing": {
@@ -312,21 +312,6 @@
         "offset": 6344
       },
       "funcid": 1,
-      "gen": 0,
-      "op": 12,
-      "provider": "spike",
-      "weak": false
-    },
-    {
-      "addr_backed": true,
-      "addr_hash": "cddea1c58380fa31",
-      "alg_class": "other",
-      "backing": {
-        "dev": "fd:01",
-        "ino": 803225,
-        "offset": 6406
-      },
-      "funcid": 16,
       "gen": 0,
       "op": 12,
       "provider": "spike",
@@ -387,6 +372,21 @@
         "offset": 6693
       },
       "funcid": 5,
+      "gen": 0,
+      "op": 12,
+      "provider": "spike",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "cddea1c58380fa31",
+      "alg_class": "other",
+      "backing": {
+        "dev": "fd:01",
+        "ino": 803225,
+        "offset": 6406
+      },
+      "funcid": 16,
       "gen": 0,
       "op": 12,
       "provider": "spike",

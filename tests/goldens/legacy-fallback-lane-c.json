@@ -66,6 +66,21 @@
     },
     {
       "addr_backed": true,
+      "addr_hash": "754b35ce10d5adae",
+      "alg_class": "SHA1",
+      "backing": {
+        "dev": "fd:01",
+        "ino": 794054,
+        "offset": 4217536
+      },
+      "funcid": 2,
+      "gen": 0,
+      "op": 1,
+      "provider": "default",
+      "weak": true
+    },
+    {
+      "addr_backed": true,
       "addr_hash": "dd121d79e30ea116",
       "alg_class": "SHA1",
       "backing": {
@@ -126,21 +141,6 @@
     },
     {
       "addr_backed": true,
-      "addr_hash": "ef5636e66c2e719c",
-      "alg_class": "SHA1",
-      "backing": {
-        "dev": "fd:01",
-        "ino": 794054,
-        "offset": 4212960
-      },
-      "funcid": 15,
-      "gen": 0,
-      "op": 1,
-      "provider": "default",
-      "weak": true
-    },
-    {
-      "addr_backed": true,
       "addr_hash": "e2061890cb4754ff",
       "alg_class": "SHA1",
       "backing": {
@@ -149,6 +149,21 @@
         "offset": 4213376
       },
       "funcid": 8,
+      "gen": 0,
+      "op": 1,
+      "provider": "default",
+      "weak": true
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "0121e35aa2a84103",
+      "alg_class": "SHA1",
+      "backing": {
+        "dev": "fd:01",
+        "ino": 794054,
+        "offset": 4213280
+      },
+      "funcid": 9,
       "gen": 0,
       "op": 1,
       "provider": "default",
@@ -171,21 +186,6 @@
     },
     {
       "addr_backed": true,
-      "addr_hash": "754b35ce10d5adae",
-      "alg_class": "SHA1",
-      "backing": {
-        "dev": "fd:01",
-        "ino": 794054,
-        "offset": 4217536
-      },
-      "funcid": 2,
-      "gen": 0,
-      "op": 1,
-      "provider": "default",
-      "weak": true
-    },
-    {
-      "addr_backed": true,
       "addr_hash": "486cbb250bfb85ef",
       "alg_class": "SHA1",
       "backing": {
@@ -201,14 +201,14 @@
     },
     {
       "addr_backed": true,
-      "addr_hash": "0121e35aa2a84103",
+      "addr_hash": "ef5636e66c2e719c",
       "alg_class": "SHA1",
       "backing": {
         "dev": "fd:01",
         "ino": 794054,
-        "offset": 4213280
+        "offset": 4212960
       },
-      "funcid": 9,
+      "funcid": 15,
       "gen": 0,
       "op": 1,
       "provider": "default",

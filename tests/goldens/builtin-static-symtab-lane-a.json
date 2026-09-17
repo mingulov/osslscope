@@ -20,21 +20,6 @@
     },
     {
       "addr_backed": true,
-      "addr_hash": "ed7224bac2a78f0f",
-      "alg_class": "other",
-      "backing": {
-        "dev": "fe:01",
-        "ino": 270717,
-        "offset": 10389
-      },
-      "funcid": 6,
-      "gen": 0,
-      "op": 1,
-      "provider": "static_driver",
-      "weak": false
-    },
-    {
-      "addr_backed": true,
       "addr_hash": "0f8d7c35a2ebe208",
       "alg_class": "other",
       "backing": {
@@ -80,14 +65,14 @@
     },
     {
       "addr_backed": true,
-      "addr_hash": "bd5fa8d49f9ee453",
+      "addr_hash": "ed7224bac2a78f0f",
       "alg_class": "other",
       "backing": {
         "dev": "fe:01",
         "ino": 270717,
-        "offset": 10632
+        "offset": 10389
       },
-      "funcid": 11,
+      "funcid": 6,
       "gen": 0,
       "op": 1,
       "provider": "static_driver",
@@ -110,6 +95,126 @@
     },
     {
       "addr_backed": true,
+      "addr_hash": "bd5fa8d49f9ee453",
+      "alg_class": "other",
+      "backing": {
+        "dev": "fe:01",
+        "ino": 270717,
+        "offset": 10632
+      },
+      "funcid": 11,
+      "gen": 0,
+      "op": 1,
+      "provider": "static_driver",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "03d7b153762293b7",
+      "alg_class": "other",
+      "backing": {
+        "dev": "fe:01",
+        "ino": 270717,
+        "offset": 10854
+      },
+      "funcid": 1,
+      "gen": 0,
+      "op": 1,
+      "provider": "static_driver",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "e9b9b66d34f65187",
+      "alg_class": "other",
+      "backing": {
+        "dev": "fe:01",
+        "ino": 270717,
+        "offset": 10964
+      },
+      "funcid": 2,
+      "gen": 0,
+      "op": 1,
+      "provider": "static_driver",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "82217edf084a5d20",
+      "alg_class": "other",
+      "backing": {
+        "dev": "fe:01",
+        "ino": 270717,
+        "offset": 11017
+      },
+      "funcid": 3,
+      "gen": 0,
+      "op": 1,
+      "provider": "static_driver",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "857daddd7f6b4604",
+      "alg_class": "other",
+      "backing": {
+        "dev": "fe:01",
+        "ino": 270717,
+        "offset": 11079
+      },
+      "funcid": 4,
+      "gen": 0,
+      "op": 1,
+      "provider": "static_driver",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "db6a00ca9bec8edf",
+      "alg_class": "other",
+      "backing": {
+        "dev": "fe:01",
+        "ino": 270717,
+        "offset": 10908
+      },
+      "funcid": 6,
+      "gen": 0,
+      "op": 1,
+      "provider": "static_driver",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "72421e162be20879",
+      "alg_class": "other",
+      "backing": {
+        "dev": "fe:01",
+        "ino": 270717,
+        "offset": 11202
+      },
+      "funcid": 8,
+      "gen": 0,
+      "op": 1,
+      "provider": "static_driver",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "cda83f72078b9f36",
+      "alg_class": "other",
+      "backing": {
+        "dev": "fe:01",
+        "ino": 270717,
+        "offset": 11151
+      },
+      "funcid": 11,
+      "gen": 0,
+      "op": 1,
+      "provider": "static_driver",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
       "addr_hash": "5ffc83aaddc31a15",
       "alg_class": "other",
       "backing": {
@@ -118,21 +223,6 @@
         "offset": 11373
       },
       "funcid": 1,
-      "gen": 0,
-      "op": 12,
-      "provider": "static_driver",
-      "weak": false
-    },
-    {
-      "addr_backed": true,
-      "addr_hash": "a6668910829e1cae",
-      "alg_class": "other",
-      "backing": {
-        "dev": "fe:01",
-        "ino": 270717,
-        "offset": 11431
-      },
-      "funcid": 16,
       "gen": 0,
       "op": 12,
       "provider": "static_driver",
@@ -200,106 +290,16 @@
     },
     {
       "addr_backed": true,
-      "addr_hash": "03d7b153762293b7",
+      "addr_hash": "a6668910829e1cae",
       "alg_class": "other",
       "backing": {
         "dev": "fe:01",
         "ino": 270717,
-        "offset": 10854
+        "offset": 11431
       },
-      "funcid": 1,
+      "funcid": 16,
       "gen": 0,
-      "op": 1,
-      "provider": "static_driver",
-      "weak": false
-    },
-    {
-      "addr_backed": true,
-      "addr_hash": "db6a00ca9bec8edf",
-      "alg_class": "other",
-      "backing": {
-        "dev": "fe:01",
-        "ino": 270717,
-        "offset": 10908
-      },
-      "funcid": 6,
-      "gen": 0,
-      "op": 1,
-      "provider": "static_driver",
-      "weak": false
-    },
-    {
-      "addr_backed": true,
-      "addr_hash": "e9b9b66d34f65187",
-      "alg_class": "other",
-      "backing": {
-        "dev": "fe:01",
-        "ino": 270717,
-        "offset": 10964
-      },
-      "funcid": 2,
-      "gen": 0,
-      "op": 1,
-      "provider": "static_driver",
-      "weak": false
-    },
-    {
-      "addr_backed": true,
-      "addr_hash": "82217edf084a5d20",
-      "alg_class": "other",
-      "backing": {
-        "dev": "fe:01",
-        "ino": 270717,
-        "offset": 11017
-      },
-      "funcid": 3,
-      "gen": 0,
-      "op": 1,
-      "provider": "static_driver",
-      "weak": false
-    },
-    {
-      "addr_backed": true,
-      "addr_hash": "857daddd7f6b4604",
-      "alg_class": "other",
-      "backing": {
-        "dev": "fe:01",
-        "ino": 270717,
-        "offset": 11079
-      },
-      "funcid": 4,
-      "gen": 0,
-      "op": 1,
-      "provider": "static_driver",
-      "weak": false
-    },
-    {
-      "addr_backed": true,
-      "addr_hash": "cda83f72078b9f36",
-      "alg_class": "other",
-      "backing": {
-        "dev": "fe:01",
-        "ino": 270717,
-        "offset": 11151
-      },
-      "funcid": 11,
-      "gen": 0,
-      "op": 1,
-      "provider": "static_driver",
-      "weak": false
-    },
-    {
-      "addr_backed": true,
-      "addr_hash": "72421e162be20879",
-      "alg_class": "other",
-      "backing": {
-        "dev": "fe:01",
-        "ino": 270717,
-        "offset": 11202
-      },
-      "funcid": 8,
-      "gen": 0,
-      "op": 1,
+      "op": 12,
       "provider": "static_driver",
       "weak": false
     },
@@ -313,21 +313,6 @@
         "offset": 11767
       },
       "funcid": 1,
-      "gen": 0,
-      "op": 12,
-      "provider": "static_driver",
-      "weak": false
-    },
-    {
-      "addr_backed": true,
-      "addr_hash": "090a3d332fcee158",
-      "alg_class": "other",
-      "backing": {
-        "dev": "fe:01",
-        "ino": 270717,
-        "offset": 11825
-      },
-      "funcid": 16,
       "gen": 0,
       "op": 12,
       "provider": "static_driver",
@@ -388,6 +373,21 @@
         "offset": 12096
       },
       "funcid": 5,
+      "gen": 0,
+      "op": 12,
+      "provider": "static_driver",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "090a3d332fcee158",
+      "alg_class": "other",
+      "backing": {
+        "dev": "fe:01",
+        "ino": 270717,
+        "offset": 11825
+      },
+      "funcid": 16,
       "gen": 0,
       "op": 12,
       "provider": "static_driver",

@@ -1,5 +1,5 @@
 {
-  "fenced_rows": 19,
+  "fenced_rows": 5,
   "gen": 0,
   "provider": "lying",
   "queries_observed": 6,
@@ -7,12 +7,207 @@
   "rows": [
     {
       "addr_backed": true,
-      "addr_hash": "871ce211318d2cbe",
+      "addr_hash": "ff997038a1076b1a",
       "alg_class": "other",
       "backing": {
         "dev": "fe:01",
         "ino": 272695,
-        "offset": 5419
+        "offset": 4425
+      },
+      "funcid": 1,
+      "gen": 0,
+      "op": 1,
+      "provider": "lying",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "8029ac9a884ee87a",
+      "alg_class": "other",
+      "backing": {
+        "dev": "fe:01",
+        "ino": 272695,
+        "offset": 4713
+      },
+      "funcid": 1,
+      "gen": 0,
+      "op": 1,
+      "provider": "lying",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "8a6249bb169a877d",
+      "alg_class": "other",
+      "backing": {
+        "dev": "fe:01",
+        "ino": 272695,
+        "offset": 4475
+      },
+      "funcid": 2,
+      "gen": 0,
+      "op": 1,
+      "provider": "lying",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "9da2f80f1b81fcb3",
+      "alg_class": "other",
+      "backing": {
+        "dev": "fe:01",
+        "ino": 272695,
+        "offset": 4763
+      },
+      "funcid": 2,
+      "gen": 0,
+      "op": 1,
+      "provider": "lying",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "4479b386ebb22404",
+      "alg_class": "other",
+      "backing": {
+        "dev": "fe:01",
+        "ino": 272695,
+        "offset": 4494
+      },
+      "funcid": 3,
+      "gen": 0,
+      "op": 1,
+      "provider": "lying",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "800a928bb5aaee11",
+      "alg_class": "other",
+      "backing": {
+        "dev": "fe:01",
+        "ino": 272695,
+        "offset": 4782
+      },
+      "funcid": 3,
+      "gen": 0,
+      "op": 1,
+      "provider": "lying",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "5faacee1c176d316",
+      "alg_class": "other",
+      "backing": {
+        "dev": "fe:01",
+        "ino": 272695,
+        "offset": 4517
+      },
+      "funcid": 4,
+      "gen": 0,
+      "op": 1,
+      "provider": "lying",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "498bfaa065b4a668",
+      "alg_class": "other",
+      "backing": {
+        "dev": "fe:01",
+        "ino": 272695,
+        "offset": 4805
+      },
+      "funcid": 4,
+      "gen": 0,
+      "op": 1,
+      "provider": "lying",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "93185ef291cd1885",
+      "alg_class": "other",
+      "backing": {
+        "dev": "fe:01",
+        "ino": 272695,
+        "offset": 4449
+      },
+      "funcid": 6,
+      "gen": 0,
+      "op": 1,
+      "provider": "lying",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "2bb73e49d82e5fa2",
+      "alg_class": "other",
+      "backing": {
+        "dev": "fe:01",
+        "ino": 272695,
+        "offset": 4737
+      },
+      "funcid": 6,
+      "gen": 0,
+      "op": 1,
+      "provider": "lying",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "e4df013dabd9b97d",
+      "alg_class": "other",
+      "backing": {
+        "dev": "fe:01",
+        "ino": 272695,
+        "offset": 4572
+      },
+      "funcid": 8,
+      "gen": 0,
+      "op": 1,
+      "provider": "lying",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "5530dc4fb9cfde9f",
+      "alg_class": "other",
+      "backing": {
+        "dev": "fe:01",
+        "ino": 272695,
+        "offset": 4860
+      },
+      "funcid": 8,
+      "gen": 0,
+      "op": 1,
+      "provider": "lying",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "ddbebb2fed05834d",
+      "alg_class": "other",
+      "backing": {
+        "dev": "fe:01",
+        "ino": 272695,
+        "offset": 4555
+      },
+      "funcid": 11,
+      "gen": 0,
+      "op": 1,
+      "provider": "lying",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "df0606f33a06839a",
+      "alg_class": "other",
+      "backing": {
+        "dev": "fe:01",
+        "ino": 272695,
+        "offset": 4843
       },
       "funcid": 11,
       "gen": 0,
@@ -37,6 +232,21 @@
     },
     {
       "addr_backed": true,
+      "addr_hash": "871ce211318d2cbe",
+      "alg_class": "other",
+      "backing": {
+        "dev": "fe:01",
+        "ino": 272695,
+        "offset": 5419
+      },
+      "funcid": 11,
+      "gen": 0,
+      "op": 1,
+      "provider": "lying",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
       "addr_hash": "767eaff9f5de1200",
       "alg_class": "SHA256",
       "backing": {
@@ -45,21 +255,6 @@
         "offset": 5001
       },
       "funcid": 1,
-      "gen": 0,
-      "op": 1,
-      "provider": "lying",
-      "weak": false
-    },
-    {
-      "addr_backed": true,
-      "addr_hash": "71312be51d0cd3fb",
-      "alg_class": "SHA256",
-      "backing": {
-        "dev": "fe:01",
-        "ino": 272695,
-        "offset": 5025
-      },
-      "funcid": 6,
       "gen": 0,
       "op": 1,
       "provider": "lying",
@@ -112,14 +307,14 @@
     },
     {
       "addr_backed": true,
-      "addr_hash": "9d1e3e5758227215",
+      "addr_hash": "71312be51d0cd3fb",
       "alg_class": "SHA256",
       "backing": {
         "dev": "fe:01",
         "ino": 272695,
-        "offset": 5131
+        "offset": 5025
       },
-      "funcid": 11,
+      "funcid": 6,
       "gen": 0,
       "op": 1,
       "provider": "lying",
@@ -135,6 +330,21 @@
         "offset": 5148
       },
       "funcid": 8,
+      "gen": 0,
+      "op": 1,
+      "provider": "lying",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "9d1e3e5758227215",
+      "alg_class": "SHA256",
+      "backing": {
+        "dev": "fe:01",
+        "ino": 272695,
+        "offset": 5131
+      },
+      "funcid": 11,
       "gen": 0,
       "op": 1,
       "provider": "lying",

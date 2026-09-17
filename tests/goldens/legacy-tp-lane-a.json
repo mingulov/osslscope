@@ -69,21 +69,6 @@
     },
     {
       "addr_backed": true,
-      "addr_hash": "de7fbdaa515b0cd7",
-      "alg_class": "other",
-      "backing": {
-        "dev": "fe:01",
-        "ino": 270713,
-        "offset": 4734
-      },
-      "funcid": 6,
-      "gen": 0,
-      "op": 1,
-      "provider": "spike",
-      "weak": false
-    },
-    {
-      "addr_backed": true,
       "addr_hash": "a48e56ddccb2edde",
       "alg_class": "other",
       "backing": {
@@ -129,14 +114,14 @@
     },
     {
       "addr_backed": true,
-      "addr_hash": "8e6c5fda7f011efa",
+      "addr_hash": "de7fbdaa515b0cd7",
       "alg_class": "other",
       "backing": {
         "dev": "fe:01",
         "ino": 270713,
-        "offset": 4977
+        "offset": 4734
       },
-      "funcid": 11,
+      "funcid": 6,
       "gen": 0,
       "op": 1,
       "provider": "spike",
@@ -159,6 +144,21 @@
     },
     {
       "addr_backed": true,
+      "addr_hash": "8e6c5fda7f011efa",
+      "alg_class": "other",
+      "backing": {
+        "dev": "fe:01",
+        "ino": 270713,
+        "offset": 4977
+      },
+      "funcid": 11,
+      "gen": 0,
+      "op": 1,
+      "provider": "spike",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
       "addr_hash": "87d5a28b350c474b",
       "alg_class": "other",
       "backing": {
@@ -167,21 +167,6 @@
         "offset": 5199
       },
       "funcid": 1,
-      "gen": 0,
-      "op": 1,
-      "provider": "spike",
-      "weak": false
-    },
-    {
-      "addr_backed": true,
-      "addr_hash": "c3b671a75496ee07",
-      "alg_class": "other",
-      "backing": {
-        "dev": "fe:01",
-        "ino": 270713,
-        "offset": 5253
-      },
-      "funcid": 6,
       "gen": 0,
       "op": 1,
       "provider": "spike",
@@ -234,14 +219,14 @@
     },
     {
       "addr_backed": true,
-      "addr_hash": "0dc882e4445ac321",
+      "addr_hash": "c3b671a75496ee07",
       "alg_class": "other",
       "backing": {
         "dev": "fe:01",
         "ino": 270713,
-        "offset": 5496
+        "offset": 5253
       },
-      "funcid": 11,
+      "funcid": 6,
       "gen": 0,
       "op": 1,
       "provider": "spike",
@@ -257,6 +242,21 @@
         "offset": 5547
       },
       "funcid": 8,
+      "gen": 0,
+      "op": 1,
+      "provider": "spike",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "0dc882e4445ac321",
+      "alg_class": "other",
+      "backing": {
+        "dev": "fe:01",
+        "ino": 270713,
+        "offset": 5496
+      },
+      "funcid": 11,
       "gen": 0,
       "op": 1,
       "provider": "spike",

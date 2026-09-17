@@ -19,21 +19,6 @@
     },
     {
       "addr_backed": true,
-      "addr_hash": "935745442a904193",
-      "alg_class": "other",
-      "backing": {
-        "dev": "fd:01",
-        "ino": 803226,
-        "offset": 4501
-      },
-      "funcid": 6,
-      "gen": 0,
-      "op": 1,
-      "provider": "canary",
-      "weak": false
-    },
-    {
-      "addr_backed": true,
       "addr_hash": "1e65d50eda7668c6",
       "alg_class": "other",
       "backing": {
@@ -79,14 +64,14 @@
     },
     {
       "addr_backed": true,
-      "addr_hash": "b33c84e9165ba4d3",
+      "addr_hash": "935745442a904193",
       "alg_class": "other",
       "backing": {
         "dev": "fd:01",
         "ino": 803226,
-        "offset": 4624
+        "offset": 4501
       },
-      "funcid": 11,
+      "funcid": 6,
       "gen": 0,
       "op": 1,
       "provider": "canary",
@@ -109,6 +94,21 @@
     },
     {
       "addr_backed": true,
+      "addr_hash": "b33c84e9165ba4d3",
+      "alg_class": "other",
+      "backing": {
+        "dev": "fd:01",
+        "ino": 803226,
+        "offset": 4624
+      },
+      "funcid": 11,
+      "gen": 0,
+      "op": 1,
+      "provider": "canary",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
       "addr_hash": "1af407eb04dc507b",
       "alg_class": "other",
       "backing": {
@@ -117,21 +117,6 @@
         "offset": 4790
       },
       "funcid": 1,
-      "gen": 0,
-      "op": 12,
-      "provider": "canary",
-      "weak": false
-    },
-    {
-      "addr_backed": true,
-      "addr_hash": "2eb8a207063b8896",
-      "alg_class": "other",
-      "backing": {
-        "dev": "fd:01",
-        "ino": 803226,
-        "offset": 4822
-      },
-      "funcid": 16,
       "gen": 0,
       "op": 12,
       "provider": "canary",
@@ -192,6 +177,21 @@
         "offset": 4957
       },
       "funcid": 5,
+      "gen": 0,
+      "op": 12,
+      "provider": "canary",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "2eb8a207063b8896",
+      "alg_class": "other",
+      "backing": {
+        "dev": "fd:01",
+        "ino": 803226,
+        "offset": 4822
+      },
+      "funcid": 16,
       "gen": 0,
       "op": 12,
       "provider": "canary",
