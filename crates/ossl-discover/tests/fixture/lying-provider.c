@@ -1,10 +1,16 @@
-/* Lying provider (P1 exit 4 M4-fence fixture): forged ALGORITHM /
- * DISPATCH tables the harvester must fence (count-only), never
- * attribute. Three digest algs, all fetched with provider=lying:
+/* Lying provider (P1 exit 4 M4-fence fixture): a forged DISPATCH
+ * table the harvester must fence (count-only), never attribute —
+ * plus multi-impl entries it must EMIT (revised doctrine: a
+ * same-name second table is legitimate multi-impl, dumper-proven
+ * on the default provider — DH ×4 impls, 255 such keys — and
+ * libcrypto resolves it first-wins, so every backed row is a
+ * true, attributable claim). Three digest algs, all fetched with
+ * provider=lying:
  *   LYING-SHA      — the SAME name twice in one array with DIFFERENT
- *                    dispatch tables (self-contradictory claim: every
- *                    (op,name,funcid) at two impl addrs → disagreement
- *                    fence; multi-query shifting hits the same rule).
+ *                    dispatch tables: honest multi-impl, both tables
+ *                    backed → all 14 rows EMIT (proves the fence no
+ *                    longer eats legitimate multi-impl — the old
+ *                    disagreement rule cost exit-2 parity 0.79).
  *   LYING-UNBACKED — newctx/freectx/init/update/final are garbage
  *                    constants (unmapped, deterministic): forged
  *                    DISPATCH → unbacked fence. gettable/get_params
@@ -20,10 +26,11 @@
  *                    name-trust without a manifest (P3 owns it) and
  *                    must NOT fence it: emitted with truthful backing
  *                    (proves the fence doesn't over-fire).
- * Expected harvest: 9 rows (7 control + 2 real UNBACKED
- * gettable/get_params) + fenced_rows=19 (14 shifting LYING-SHA +
- * 5 garbage), PARTIAL with reason fenced-rows. No signature algs
- * (one op suffices).
+ * Expected harvest: 23 rows (14 LYING-SHA + 7 control + 2 real
+ * UNBACKED gettable/get_params) + fenced_rows=5 (garbage only),
+ * PARTIAL with reason fenced-rows. No signature algs (one op
+ * suffices). Cross-query table shifting is out of P1 scope (no
+ * wild incidence; catching it needs per-query row tags).
  * NOTE: libcrypto tolerates the duplicate LYING-SHA entries (first-
  * wins store; fetch succeeds) — verified on 3.0/3.5/4.0 by smoke.
  * If a future libcrypto hard-fails dup names, this fixture fails

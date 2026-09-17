@@ -72,45 +72,32 @@ pub fn emit(
     let elf = elf::parse_elf(elf_bytes)?;
     // Deterministic row order (exit-1 hardening): arrival order is
     // race-dependent (GO1 queries may predate the stage-2 attach, so
-    // rotation starts mid-array). Sort by (op, claimed name,
-    // funcid) so identical row sets emit identical bytes. Emitted
-    // rows are unique on that triple (disagreements fence, exact
-    // dupes dedupe upstream); the addr tiebreak only orders
-    // same-key rows, which never emit — its ASLR instability is
-    // therefore unobservable. Sorted before fencing.
-    let mut rows_sorted: Vec<Row> = rows.to_vec();
-    rows_sorted
-        .sort_by(|a, b| (a.op, &a.alg, a.funcid, a.addr).cmp(&(b.op, &b.alg, b.funcid, b.addr)));
-    let rows: &[Row] = &rows_sorted;
-    // M4 fence (P1 exit 4): discovery tables are not semantic
-    // authority. Same (op, claimed-name, funcid) at >1 distinct impl
-    // address = the provider contradicts itself (shifting tables; P1
-    // conflates churn with lying — P2 generations will distinguish).
-    // Disagreeing rows are fenced (count-only, never attributed).
-    let mut claim_addrs: std::collections::HashMap<(u32, &str, u32), Vec<u64>> =
-        std::collections::HashMap::new();
-    for r in rows {
-        claim_addrs
-            .entry((r.op, r.alg.as_str(), r.funcid))
-            .or_default()
-            .push(r.addr);
-    }
-    let disagreeing: std::collections::HashSet<(u32, &str, u32)> = claim_addrs
-        .iter()
-        .filter(|(_, addrs)| {
-            let mut sorted = (*addrs).clone();
-            sorted.sort_unstable();
-            sorted.dedup();
-            sorted.len() > 1
-        })
-        .map(|(k, _)| *k)
-        .collect();
+    // rotation starts mid-array). Rows sort by (op, claimed name,
+    // funcid, attested backing triple) — never by runtime addr:
+    // same-key multi-impl rows span files (provider + shared
+    // libcrypto), whose ASLR slides differ, so an addr tiebreak
+    // would flip run to run. Upstream seen-set keys (op, name,
+    // funcid, addr) uniquely, and one file maps once per process
+    // (dlopen dedupes by (dev, ino)), so the key is total in
+    // practice. Backing resolves before the sort so the tiebreak
+    // sees stable triples.
+    //
+    // M4 fence (P1 exit 4, revised per exit-2 parity): ONLY impls in
+    // no file-backed x mapping fence (forged pointers — the claim
+    // "provider offers this addr" is unverifiable there). Same
+    // (op, name, funcid) at several BACKED addrs is legitimate
+    // multi-impl (default provider: DH ×4 impls, 255 such keys) or
+    // property-dependent dispatch — every such row is a true,
+    // attributable claim, so all emit. A same-name second table is
+    // not a lie (libcrypto resolves first-wins); cross-query table
+    // shifting is out of P1 scope (no wild incidence; catching it
+    // needs per-query row tags).
+    //
     // Foreign-file ELF bytes (shared-code rows): path → bytes, failures
     // cached as empty (parse then fails → unbacked, no repeated reads).
     let mut elf_cache: std::collections::HashMap<String, Vec<u8>> =
         std::collections::HashMap::new();
-    let mut jrows = Vec::with_capacity(rows.len());
-    let mut fenced: u64 = 0;
+    let mut resolved: Vec<(&Row, bool, String, u64, u64)> = Vec::with_capacity(rows.len());
     for r in rows {
         let (backed, dev, ino, off) =
             match maps::provider_mapping(live_maps, provider, canon, r.addr) {
@@ -140,14 +127,23 @@ pub fn emit(
                     None => (false, String::new(), 0, 0),
                 },
             };
-        // Fence: disagreeing claims, or impl in no file-backed x
-        // mapping (forged pointer; JIT/anon-x equally un-pinnable —
-        // PRD no_attribution: no stable store → count-only).
-        // Shared-code rows (impl in ANOTHER file) stay: their
-        // backing triple is truthful, and alias-audit reports the
-        // sharing. Fenced rows leave no attribution (no class, no
-        // backing) — the count is the whole signal.
-        if disagreeing.contains(&(r.op, r.alg.as_str(), r.funcid)) || !backed {
+        resolved.push((r, backed, dev, ino, off));
+    }
+    resolved.sort_by(|a, b| {
+        (a.0.op, &a.0.alg, a.0.funcid, &a.2, a.3, a.4)
+            .cmp(&(b.0.op, &b.0.alg, b.0.funcid, &b.2, b.3, b.4))
+    });
+    let mut jrows = Vec::with_capacity(resolved.len());
+    let mut fenced: u64 = 0;
+    for (r, backed, dev, ino, off) in resolved {
+        // Fence: impl in no file-backed x mapping (forged pointer;
+        // JIT/anon-x equally un-pinnable — PRD no_attribution: no
+        // stable store → count-only). Shared-code rows (impl in
+        // ANOTHER file) stay: their backing triple is truthful, and
+        // alias-audit reports the sharing. Fenced rows leave no
+        // attribution (no class, no backing) — the count is the
+        // whole signal.
+        if !backed {
             fenced += 1;
             continue;
         }
@@ -386,21 +382,17 @@ mod tests {
     }
 
     #[test]
-    fn fence_disagreeing_claims_are_count_only() {
-        // Same (op, name, funcid) at two addrs (shifting tables):
-        // BOTH rows fenced — neither attribution is trustworthy.
+    fn multi_impl_rows_all_emit() {
+        // Same (op, name, funcid) at two BACKED addrs (DH-style
+        // multi-impl — dumper-proven legitimate on the default
+        // provider): every row is a true, attributable claim, so
+        // all emit and nothing fences. (The old disagreement
+        // fence ate 1260 such real rows — exit-2 parity 0.79.)
         let rows = vec![
             Row {
                 op: 1,
-                alg: "LYING-SHA".into(),
-                funcid: 3,
-                addr: backed_addr(0),
-                arr: 0,
-            },
-            Row {
-                op: 1,
-                alg: "LYING-SHA".into(),
-                funcid: 3,
+                alg: "DH".into(),
+                funcid: 10,
                 addr: backed_addr(1),
                 arr: 0,
             },
@@ -411,16 +403,159 @@ mod tests {
                 addr: backed_addr(2),
                 arr: 0,
             },
+            Row {
+                op: 1,
+                alg: "DH".into(),
+                funcid: 10,
+                addr: backed_addr(0),
+                arr: 0,
+            },
         ];
         let doc = emit_backed(&rows, &Stats::trivial());
-        assert_eq!(doc["status"], "PARTIAL");
-        assert_eq!(doc["reason"], "fenced-rows");
-        assert_eq!(doc["fenced_rows"], 2);
+        assert!(doc.get("status").is_none());
+        assert!(doc.get("fenced_rows").is_none());
         let jrows = doc["rows"].as_array().unwrap();
-        assert_eq!(jrows.len(), 1);
-        // Fenced rows leave no attribution (no class, no backing).
-        let txt = serde_json::to_string(&doc).unwrap();
-        assert!(!txt.contains("LYING-SHA"));
+        assert_eq!(jrows.len(), 3);
+        // DH pair first (name order), ascending file offset (NOT
+        // arrival order — the pair arrived reversed above).
+        let offs: Vec<u64> = jrows
+            .iter()
+            .map(|r| r["backing"]["offset"].as_u64().unwrap())
+            .collect();
+        assert_eq!(offs[1] - offs[0], 0x10);
+        assert_eq!(offs[2] - offs[1], 0x10);
+    }
+
+    #[test]
+    fn multi_impl_order_ignores_arrival_and_slide() {
+        // Same-key rows arrive in race order under a random ASLR
+        // slide, but must emit byte-identically: reversed arrival
+        // and a re-slid mapping both converge on offset order.
+        let mk = |addrs: &[u64]| -> Vec<Row> {
+            addrs
+                .iter()
+                .map(|&a| Row {
+                    op: 1,
+                    alg: "DH".into(),
+                    funcid: 10,
+                    addr: a,
+                    arr: 0,
+                })
+                .collect()
+        };
+        let fwd = mk(&[backed_addr(0), backed_addr(1), backed_addr(2)]);
+        let rev = mk(&[backed_addr(2), backed_addr(0), backed_addr(1)]);
+        let a = emit_backed(&fwd, &Stats::trivial());
+        let b = emit_backed(&rev, &Stats::trivial());
+        assert_eq!(a, b);
+        // Re-slide: same triples at moved addrs → same doc modulo
+        // raw addr (hashes derive from triples, so they hold too).
+        let (exe, mut maps) = backed_maps();
+        for m in maps.iter_mut() {
+            let len = m.end - m.start;
+            m.start += 0x5000;
+            m.end = m.start + len;
+        }
+        let slid: Vec<Row> = fwd
+            .iter()
+            .map(|r| Row {
+                addr: r.addr + 0x5000,
+                ..r.clone()
+            })
+            .collect();
+        let c = emit(
+            "t",
+            Path::new("t"),
+            "",
+            &exe,
+            &maps,
+            &slid,
+            true,
+            &Stats::trivial(),
+        )
+        .unwrap();
+        let strip = |d: &serde_json::Value| {
+            let mut d = d.clone();
+            for r in d["rows"].as_array_mut().unwrap() {
+                r.as_object_mut().unwrap().remove("addr");
+            }
+            d
+        };
+        assert_eq!(strip(&a), strip(&c));
+    }
+
+    #[test]
+    fn multi_impl_order_uses_backing_not_addr() {
+        // Cross-file same-key rows (provider + shared libcrypto):
+        // runtime addr order follows per-file ASLR slides, so the
+        // tiebreak must use the backing triple instead. Here addr
+        // order and triple order INVERT: the smaller addr sits in
+        // the larger (dev, ino, offset).
+        let exe = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+        let elf = crate::discovery::elf::parse_elf(&exe).unwrap();
+        let base = elf
+            .program_headers
+            .iter()
+            .find(|ph| {
+                ph.p_type == goblin::elf::program_header::PT_LOAD
+                    && ph.p_flags & goblin::elf::program_header::PF_X != 0
+            })
+            .unwrap()
+            .p_offset;
+        let maps = vec![
+            crate::discovery::maps::Mapping {
+                start: 0x1000,
+                end: 0x2000,
+                x: true,
+                offset: base,
+                dev: "08:02".to_string(),
+                ino: 43,
+                path: "t".to_string(),
+            },
+            crate::discovery::maps::Mapping {
+                start: 0x8000,
+                end: 0x9000,
+                x: true,
+                offset: base,
+                dev: "08:01".to_string(),
+                ino: 42,
+                path: "t".to_string(),
+            },
+        ];
+        let rows = vec![
+            Row {
+                op: 1,
+                alg: "DH".into(),
+                funcid: 10,
+                addr: 0x1000,
+                arr: 0,
+            },
+            Row {
+                op: 1,
+                alg: "DH".into(),
+                funcid: 10,
+                addr: 0x8010,
+                arr: 0,
+            },
+        ];
+        let doc = emit(
+            "t",
+            Path::new("t"),
+            "",
+            &exe,
+            &maps,
+            &rows,
+            true,
+            &Stats::trivial(),
+        )
+        .unwrap();
+        let jrows = doc["rows"].as_array().unwrap();
+        assert_eq!(jrows.len(), 2);
+        // ("08:01", 42, base+0x10) < ("08:02", 43, base): the
+        // LARGER addr emits first. An addr tiebreak would flip this
+        // whenever the slides invert.
+        assert_eq!(jrows[0]["backing"]["dev"], "08:01");
+        assert_eq!(jrows[1]["backing"]["dev"], "08:02");
     }
 
     #[test]
@@ -444,31 +579,24 @@ mod tests {
     fn fence_reason_yields_to_explicit() {
         // Explicit PARTIAL reasons (blind dispatch, empty rows)
         // keep their name; fence ranks above walk-completeness.
-        let row = Row {
+        let rows = vec![Row {
             op: 1,
-            alg: "LYING-SHA".into(),
+            alg: "LYING-UNBACKED".into(),
             funcid: 3,
-            addr: backed_addr(0),
+            addr: 0x7f00_0000_0000,
             arr: 0,
-        };
-        let dupe = vec![
-            row.clone(),
-            Row {
-                addr: backed_addr(1),
-                ..row
-            },
-        ];
+        }];
         let stats = Stats {
             reason: Some("anchor-unresolved".into()),
             ..Stats::trivial()
         };
-        let doc = emit_backed(&dupe, &stats);
+        let doc = emit_backed(&rows, &stats);
         assert_eq!(doc["reason"], "anchor-unresolved");
         let stats = Stats {
             truncated: vec![(1, 1)],
             ..Stats::trivial()
         };
-        let doc = emit_backed(&dupe, &stats);
+        let doc = emit_backed(&rows, &stats);
         assert_eq!(doc["reason"], "fenced-rows");
     }
 
