@@ -16,7 +16,8 @@ use std::os::fd::{AsRawFd as _, OwnedFd};
 /// BPF relocation types (from `readelf -r` on the real object).
 const R_BPF_64_64: u32 = 1;
 const R_BPF_64_32: u32 = 10;
-/// `ld_imm64` src reg marking a map-fd site.
+/// `ld_imm64` src reg the loader sets at a map-fd site (the
+/// compiler emits src=0; anything else pre-patch is corruption).
 const BPF_PSEUDO_MAP_FD: u8 = 1;
 /// aya legacy map-def record size (7×u32; first 5 are dims).
 const MAP_DEF_SIZE: usize = 28;
@@ -167,24 +168,22 @@ fn sec_index(elf: &goblin::elf::Elf, want: &str) -> anyhow::Result<usize> {
     anyhow::bail!("section {want} missing")
 }
 
-/// Apply one `R_BPF_64_32` static-call reloc: sym must live in
-/// `.text` (appended at `text_base`); rewrites the call imm.
+/// Rewrite one static-call imm: call site at `rel_off` (in the final
+/// layout) targets `target_off` (in the final layout).
 fn apply_call(
     insns: &mut [u8],
     rel_off: usize,
-    sym_val: usize,
-    text_base: usize,
+    target_off: usize,
     prog: &str,
 ) -> anyhow::Result<()> {
     let insn = insns
         .get_mut(rel_off..rel_off + 8)
         .ok_or_else(|| anyhow::anyhow!("{prog}: call reloc out of range"))?;
-    let target = text_base + sym_val;
-    if target % 8 != 0 {
+    if target_off % 8 != 0 {
         anyhow::bail!("{prog}: call target unaligned");
     }
     let pc = rel_off / 8;
-    let imm = target as i64 / 8 - (pc as i64 + 1);
+    let imm = target_off as i64 / 8 - (pc as i64 + 1);
     let imm32: i32 = imm
         .try_into()
         .map_err(|_| anyhow::anyhow!("{prog}: call target out of range"))?;
@@ -222,7 +221,6 @@ pub fn prepare(obj: &[u8], maps: &[MapSpec], progs: &[ProgSpec]) -> anyhow::Resu
         }
     }
     let syms = parse_syms(&elf);
-    let text = sec_bytes(&elf, obj, ".text").unwrap_or(&[]);
     let maps_sec = sec_bytes(&elf, obj, "maps")?;
     let maps_idx = sec_index(&elf, "maps")?;
 
@@ -291,6 +289,24 @@ pub fn prepare(obj: &[u8], maps: &[MapSpec], progs: &[ProgSpec]) -> anyhow::Resu
             funcs.insert(n.to_string(), v);
         }
     }
+    // `.text` subprograms (link candidates; may be absent).
+    let text = sec_bytes_opt(&elf, obj, ".text").unwrap_or(&[]);
+    let text_idx = sec_index(&elf, ".text").ok();
+    let mut text_fns: Vec<(usize, usize, String)> = Vec::new();
+    if let Some(tidx) = text_idx {
+        for f in syms.iter().filter(|f| f.is_func && f.shndx == tidx) {
+            if f.size == 0 || f.size % 8 != 0 {
+                anyhow::bail!(".text fn {}: bad size {}", f.name, f.size);
+            }
+            text_fns.push((f.value, f.value + f.size, f.name.clone()));
+        }
+    }
+    let text_owner = |off: usize| {
+        text_fns
+            .iter()
+            .find(|(a, b, _)| *a <= off && off < *b)
+            .map(|(_, _, n)| n.clone())
+    };
 
     let mut out = Vec::new();
     for p in progs {
@@ -311,11 +327,9 @@ pub fn prepare(obj: &[u8], maps: &[MapSpec], progs: &[ProgSpec]) -> anyhow::Resu
         let main = sec
             .get(sym.value..sym.value + sym.size)
             .ok_or_else(|| anyhow::anyhow!("prog {} out of range", p.name))?;
-        let mut insns = main.to_vec();
-        insns.extend_from_slice(text);
-        let text_base = main.len();
         let mut fixups = Vec::new();
-        // Section relocs owned by this prog.
+        // Main's owned relocs: map sites recorded, call targets rooted.
+        let mut roots: Vec<(usize, String)> = Vec::new(); // (local off, fn)
         for r in relocs.get(p.section).map(Vec::as_slice).unwrap_or(&[]) {
             let owner = funcs
                 .get(p.section)
@@ -341,17 +355,71 @@ pub fn prepare(obj: &[u8], maps: &[MapSpec], progs: &[ProgSpec]) -> anyhow::Resu
                     });
                 }
                 R_BPF_64_32 => {
-                    let tidx = sec_index(&elf, ".text")?;
-                    if !rsym.is_func || rsym.shndx != tidx {
-                        anyhow::bail!("prog {}: call reloc vs non-.text", p.name);
+                    if text_idx.is_none() {
+                        anyhow::bail!("prog {}: call reloc but no .text", p.name);
                     }
-                    apply_call(&mut insns, local, rsym.value, text_base, p.name)?;
+                    if !rsym.is_func
+                        || Some(rsym.shndx) != text_idx
+                        || !text_fns
+                            .iter()
+                            .any(|(v, _, n)| *v == rsym.value && *n == rsym.name)
+                    {
+                        anyhow::bail!("prog {}: call reloc vs non-entry {}", p.name, rsym.name);
+                    }
+                    roots.push((local, rsym.name.clone()));
                 }
                 t => anyhow::bail!("prog {}: reloc type {t} unsupported", p.name),
             }
         }
-        // .text relocs (shifted by the appended base).
+        // Reachable closure over `.text` call relocs (transitive).
+        // Only reachable subprograms are linked: the verifier rejects
+        // unreachable trailing insns, so blind `.text` appends fail.
+        let mut included: Vec<String> = Vec::new();
+        let mut work: Vec<String> = roots.iter().map(|(_, n)| n.clone()).collect();
+        while let Some(next) = work.pop() {
+            if included.contains(&next) {
+                continue;
+            }
+            included.push(next.clone());
+            let (f0, f1, _) = text_fns
+                .iter()
+                .find(|(_, _, n)| *n == next)
+                .ok_or_else(|| anyhow::anyhow!("prog {}: call vs unknown {next}", p.name))?;
+            for r in relocs.get(".text").map(Vec::as_slice).unwrap_or(&[]) {
+                if *f0 <= r.off && r.off < *f1 && r.typ == R_BPF_64_32 {
+                    let rsym = syms
+                        .get(r.sym)
+                        .ok_or_else(|| anyhow::anyhow!("prog {}: bad text reloc sym", p.name))?;
+                    work.push(rsym.name.clone());
+                }
+            }
+        }
+        included.sort_by_key(|n| text_fns.iter().find(|(_, _, m)| m == n).map(|(v, _, _)| *v));
+        // Layout: main + included subprograms in `.text` order.
+        let mut insns = main.to_vec();
+        let mut base: HashMap<String, usize> = HashMap::new();
+        for name in &included {
+            let (f0, f1, _) = text_fns.iter().find(|(_, _, n)| n == name).unwrap();
+            let bytes = text
+                .get(*f0..*f1)
+                .ok_or_else(|| anyhow::anyhow!("prog {}: .text fn {name} out of range", p.name))?;
+            base.insert(name.clone(), insns.len());
+            insns.extend_from_slice(bytes);
+        }
+        // Apply calls (main + included) and included map sites.
+        for (local, target) in &roots {
+            let t = base
+                .get(target)
+                .ok_or_else(|| anyhow::anyhow!("prog {}: call vs unlinked {target}", p.name))?;
+            apply_call(&mut insns, *local, *t, p.name)?;
+        }
         for r in relocs.get(".text").map(Vec::as_slice).unwrap_or(&[]) {
+            let Some(owner) = text_owner(r.off) else {
+                anyhow::bail!("prog {}: text reloc @{} ownerless (drift)", p.name, r.off);
+            };
+            let Some(obase) = base.get(&owner) else {
+                continue; // subprogram unreachable from this prog
+            };
             let rsym = syms
                 .get(r.sym)
                 .ok_or_else(|| anyhow::anyhow!("prog {}: bad text reloc sym", p.name))?;
@@ -361,16 +429,35 @@ pub fn prepare(obj: &[u8], maps: &[MapSpec], progs: &[ProgSpec]) -> anyhow::Resu
                         anyhow::bail!("prog {}: text map reloc vs {}", p.name, rsym.name);
                     }
                     fixups.push(MapFixup {
-                        insn_off: text_base + r.off,
+                        insn_off: obase
+                            + (r.off
+                                - text_fns
+                                    .iter()
+                                    .find(|(_, _, n)| n == &owner)
+                                    .map(|(v, _, _)| *v)
+                                    .unwrap()),
                         map: rsym.name.clone(),
                     });
                 }
                 R_BPF_64_32 => {
-                    let tidx = sec_index(&elf, ".text")?;
-                    if !rsym.is_func || rsym.shndx != tidx {
+                    if !rsym.is_func || Some(rsym.shndx) != text_idx {
                         anyhow::bail!("prog {}: text call reloc vs non-.text", p.name);
                     }
-                    apply_call(&mut insns, text_base + r.off, rsym.value, text_base, p.name)?;
+                    let t = base.get(&rsym.name).ok_or_else(|| {
+                        anyhow::anyhow!("prog {}: call vs unlinked {}", p.name, rsym.name)
+                    })?;
+                    let site = obase
+                        + (r.off
+                            - text_fns
+                                .iter()
+                                .find(|(_, _, n)| n == &owner)
+                                .map(|(v, _, _)| *v)
+                                .unwrap());
+                    // Call targets must be entries (closure invariant).
+                    if !included.contains(&rsym.name) {
+                        anyhow::bail!("prog {}: call vs excluded {}", p.name, rsym.name);
+                    }
+                    apply_call(&mut insns, site, *t, p.name)?;
                 }
                 t => anyhow::bail!("prog {}: text reloc type {t} unsupported", p.name),
             }
@@ -407,12 +494,16 @@ pub fn load(prep: &Prepared) -> anyhow::Result<Loaded> {
             let insn = insns
                 .get_mut(f.insn_off..f.insn_off + 8)
                 .ok_or_else(|| anyhow::anyhow!("{}: fixup out of range", p.name))?;
-            if insn[1] >> 4 != BPF_PSEUDO_MAP_FD {
-                anyhow::bail!("{}: fixup site not a map-fd insn", p.name);
+            // The compiler emits map sites with src=0; the reloc means
+            // "this imm64 is a map" — the loader sets src AND fd.
+            // Anything else is an already-relocated (or corrupt) object.
+            if insn[0] != 0x18 || insn[1] >> 4 != 0 {
+                anyhow::bail!("{}: fixup site not an unrelocated ld_imm64", p.name);
             }
             let fd = maps
                 .get(&f.map)
                 .ok_or_else(|| anyhow::anyhow!("{}: unknown map {}", p.name, f.map))?;
+            insn[1] = (insn[1] & 0x0f) | (BPF_PSEUDO_MAP_FD << 4);
             insn[4..8].copy_from_slice(&(fd.as_raw_fd() as u32).to_le_bytes());
         }
         let mut log = vec![0u8; 1 << 20];
@@ -463,11 +554,11 @@ mod tests {
         b[60..62].copy_from_slice(&u16(9)); // shnum
         b[62..64].copy_from_slice(&u16(8)); // shstrndx
         // uprobe: ld_imm64 r1,map + call + exit.
-        b[64..80].copy_from_slice(&[0x18, 0x11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        b[64..80].copy_from_slice(&[0x18, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         b[80..88].copy_from_slice(&[0x85, 0, 0, 0, 0, 0, 0, 0]);
         b[88..96].copy_from_slice(&[0x95, 0, 0, 0, 0, 0, 0, 0]);
         // .text: ld_imm64 r1,map + exit.
-        b[96..112].copy_from_slice(&[0x18, 0x11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        b[96..112].copy_from_slice(&[0x18, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         b[112..120].copy_from_slice(&[0x95, 0, 0, 0, 0, 0, 0, 0]);
         // maps: ARRAY u32->u64 max 1.
         for (i, v) in [2u32, 4, 8, 1, 0, 0, 0].iter().enumerate() {

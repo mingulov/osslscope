@@ -80,18 +80,22 @@ struct ProgAttr {
     fd_array_cnt: u32,
 }
 
+/// `BPF_LINK_CREATE` attr, `uprobe_multi` member layout (field offsets
+/// verified against `linux/bpf.h`: the member flags live at 52, NOT in
+/// the common flags at 12 — setting 12 EINVALs, which is how the
+/// return-flag bug announced itself).
 #[repr(C)]
 struct LinkAttr {
     prog_fd: u32,
     target_fd: u32,
     attach_type: u32,
-    flags: u32,
+    common_flags: u32, // 12: must stay 0 for multi
     path: u64,
     offsets: u64,
-    ref_ctr_offsets: u64,
+    ref_ctr_offsets: u64, // 32: 0 = none
     cookies: u64,
     cnt: u32,
-    mflags: u32,
+    flags: u32, // 52: BPF_F_UPROBE_MULTI_RETURN goes here
     pid: u32,
 }
 
@@ -214,6 +218,8 @@ fn link_create_multi(
     flags: u32,
 ) -> io::Result<OwnedFd> {
     assert!(offsets.len() == cookies.len() && !offsets.is_empty());
+    debug_assert_eq!(size_of::<LinkAttr>(), 64);
+    debug_assert_eq!(std::mem::offset_of!(LinkAttr, flags), 52);
     let mut attr: LinkAttr = zeroed();
     attr.prog_fd = prog_fd as u32;
     attr.attach_type = BPF_TRACE_UPROBE_MULTI;
