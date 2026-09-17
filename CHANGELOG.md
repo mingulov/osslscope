@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased — P4 privacy hardening
+
+- `docs/privacy/allowlist-v1.md`: finalized capture allowlist (complete
+  eBPF/userspace emission set, BPF map inventory, classifiers, change
+  rule) with `tests/privacy_allowlist.rs` pins.
+- `HARVESTDBG` now logs classified alg classes, never raw provider
+  names.
+
 ## Unreleased — P3 semantics + policy
 
 - `report`: bounded-window execution counts (human + `observed-crypto-v1.0`

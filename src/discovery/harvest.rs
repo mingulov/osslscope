@@ -29,6 +29,17 @@ fn debug_harvest() -> bool {
     std::env::var("OSSL_DEBUG_HARVEST").is_ok()
 }
 
+/// Debug-only alg line: classify before printing (logs are
+/// artifacts — raw target strings never serialize, even under the
+/// debug flag).
+fn debug_alg_line(op: u32, arr: u64, idx: u64, alg: &str, len: usize) -> String {
+    let (class, weak) = crate::kinds::classify_alg(alg);
+    format!(
+        "HARVESTDBG alg op={op} arr={arr:#x} idx={idx} class={class} weak={} len={len}",
+        u8::from(weak)
+    )
+}
+
 /// Fault in the provider file's mapped pages (best-effort, one byte
 /// per page via process_vm_readv). BPF probe reads are nofault: a
 /// query whose alg tables were never touched aborts the walk
@@ -830,11 +841,8 @@ pub fn run_detailed(
                     let alg = String::from_utf8_lossy(&name[..len]).into_owned();
                     if debug_harvest() {
                         eprintln!(
-                            "HARVESTDBG alg op={} arr={:#x} idx={} name={}",
-                            u32at(4),
-                            u64at(16),
-                            u64at(24),
-                            alg
+                            "{}",
+                            debug_alg_line(u32at(4), u64at(16), u64at(24), &alg, len)
                         );
                     }
                     alg_names.insert((u64at(16), u64at(24)), alg);
@@ -1231,5 +1239,17 @@ mod tests {
         assert!(s.insert(a));
         assert!(s.insert(b));
         assert_eq!(s.len(), 2);
+    }
+
+    #[test]
+    fn debug_alg_line_never_prints_raw_names() {
+        let line = super::debug_alg_line(1, 0x1000, 0, "canary-DOOM-7QZ", 14);
+        assert!(!line.contains("canary-DOOM-7QZ"), "raw name leaked: {line}");
+        assert!(line.contains("class=other"), "missing class: {line}");
+        let line = super::debug_alg_line(1, 0x1000, 0, "SHA2-256:SHA256", 13);
+        assert_eq!(
+            line,
+            "HARVESTDBG alg op=1 arr=0x1000 idx=0 class=SHA2-256 weak=0 len=13"
+        );
     }
 }
