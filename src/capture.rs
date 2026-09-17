@@ -837,12 +837,15 @@ impl<'a> Engine<'a> {
                     // Every re-harvest query predates its rows'
                     // count-attach: cold by construction (§6).
                     eprintln!(
-                        "CAPTURE re-harvest {path} rows={} queries={}",
+                        "CAPTURE re-harvest {path} rows={} queries={} truncated={}",
                         doc.get("rows")
                             .and_then(|r| r.as_array())
                             .map(|r| r.len())
                             .unwrap_or(0),
-                        totals.queries_observed
+                        totals.queries_observed,
+                        doc.get("truncated")
+                            .map(|t| serde_json::to_string(t).unwrap_or_default())
+                            .unwrap_or_default()
                     );
                     self.counters.cold_gap_calls += totals.queries_observed;
                     if totals.queries_observed > 0 {

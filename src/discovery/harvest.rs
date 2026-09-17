@@ -24,6 +24,10 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const KIND_INIT_RET: u32 = 1;
+
+fn debug_harvest() -> bool {
+    std::env::var("OSSL_DEBUG_HARVEST").is_ok()
+}
 const KIND_QUERY_RET: u32 = 2;
 const KIND_ROW: u32 = 3;
 const KIND_ALG: u32 = 4;
@@ -696,12 +700,29 @@ pub fn run_detailed(
                     trigger_observed = true;
                     queries_observed += 1;
                     ops_hit.insert(u32at(4));
+                    if debug_harvest() {
+                        eprintln!(
+                            "HARVESTDBG query_ret op={} rv={:#x} aux={}",
+                            u32at(4),
+                            u64at(16),
+                            u64at(24)
+                        );
+                    }
                 }
                 KIND_ALG => {
                     trigger_observed = true;
                     let name = &b[NAME_OFF..NAME_OFF + NAME_LEN];
                     let len = name.iter().position(|c| *c == 0).unwrap_or(name.len());
                     let alg = String::from_utf8_lossy(&name[..len]).into_owned();
+                    if debug_harvest() {
+                        eprintln!(
+                            "HARVESTDBG alg op={} arr={:#x} idx={} name={}",
+                            u32at(4),
+                            u64at(16),
+                            u64at(24),
+                            alg
+                        );
+                    }
                     alg_names.insert((u64at(16), u64at(24)), alg);
                 }
                 KIND_ROW => {

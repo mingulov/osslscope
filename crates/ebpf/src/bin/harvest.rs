@@ -104,9 +104,17 @@ const MAX_ALGS: u64 = 256;
 /// across 3.0/3.5/4.0; 128 keeps the verifier under its 1M processed-insn
 /// ceiling with ~2x margin — overflow fails closed via TRUNC).
 const MAX_DISPATCH: u64 = 128;
-/// TRUNC[op] bits: alg-array overflow | dispatch-table overflow.
+/// TRUNC[op] bits: alg-array overflow | dispatch-table overflow |
+/// walk aborts (entry unreadable | empty table at slot 0 |
+/// implementation-less alg at slot 0 | alg-name unreadable). The
+/// slot-0 aborts are suspicious (a live query returning an
+/// unwalkable first entry); later-slot terminators stay silent.
 const TRUNC_ALGS: u64 = 1;
 const TRUNC_DISPATCH: u64 = 2;
+const TRUNC_WALK_READ: u64 = 4;
+const TRUNC_WALK_EMPTY: u64 = 8;
+const TRUNC_WALK_NOIMP: u64 = 16;
+const TRUNC_WALK_NAME: u64 = 32;
 
 #[map]
 static EVENTS: RingBuf = RingBuf::with_byte_size(1 << 21, 0);
@@ -374,15 +382,25 @@ pub fn query_return(ctx: RetProbeContext) -> u32 {
     let names = unsafe { helpers::bpf_probe_read_user(base as *const u64) };
     let imp = unsafe { helpers::bpf_probe_read_user((base + 16) as *const u64) };
     let (Ok(names), Ok(imp)) = (names, imp) else {
+        if j == 0 {
+            flag_trunc(op as u32, TRUNC_WALK_READ);
+        }
         return 0;
     };
     if names == 0 {
-        // Terminator: freeze the counter (no insert), stop.
+        // Terminator: freeze the counter (no insert), stop. Slot 0
+        // empty = the query returned a table with no first alg.
+        if j == 0 {
+            flag_trunc(op as u32, TRUNC_WALK_EMPTY);
+        }
         return 0;
     }
     let _ = QUERY_NEXT.insert(key, count.wrapping_add(1), 0);
     if imp == 0 {
         // Alg without implementation: skipped, like the dumper.
+        if j == 0 {
+            flag_trunc(op as u32, TRUNC_WALK_NOIMP);
+        }
         return 0;
     }
     // Overrun guard on the last slot: entries 0..=255 all live means
@@ -397,6 +415,9 @@ pub fn query_return(ctx: RetProbeContext) -> u32 {
     }
     let mut name = [0u8; 128];
     if unsafe { helpers::bpf_probe_read_user_str_bytes(names as *const u8, &mut name) }.is_err() {
+        if j == 0 {
+            flag_trunc(op as u32, TRUNC_WALK_NAME);
+        }
         return 0;
     }
     emit(&Event {
