@@ -1,0 +1,226 @@
+{
+  "bomFormat": "CycloneDX",
+  "components": [
+    {
+      "bom-ref": "urn:osslscope:exec:current:1:1:11:default:SHA-256",
+      "cryptoProperties": {
+        "assetType": "algorithm"
+      },
+      "name": "SHA-256 (DIGEST) via default",
+      "properties": [
+        {
+          "name": "osslscope:algorithm",
+          "value": "SHA-256"
+        },
+        {
+          "name": "osslscope:provider",
+          "value": "default"
+        },
+        {
+          "name": "osslscope:provider-object",
+          "value": "/p/provider.so"
+        },
+        {
+          "name": "osslscope:provider-build-id",
+          "value": "unknown"
+        },
+        {
+          "name": "osslscope:op",
+          "value": "DIGEST"
+        },
+        {
+          "name": "osslscope:funcid",
+          "value": "11"
+        },
+        {
+          "name": "osslscope:calls",
+          "value": "1204033"
+        },
+        {
+          "name": "osslscope:generation",
+          "value": "current"
+        },
+        {
+          "name": "osslscope:window-start",
+          "value": "2023-11-14T22:13:20Z"
+        },
+        {
+          "name": "osslscope:window-end",
+          "value": "2023-11-14T22:13:21Z"
+        },
+        {
+          "name": "osslscope:execution-evidence-completeness",
+          "value": "COMPLETE"
+        }
+      ],
+      "type": "cryptographic-asset"
+    },
+    {
+      "bom-ref": "urn:osslscope:exec:current:2:2:21:default:DES",
+      "cryptoProperties": {
+        "assetType": "algorithm"
+      },
+      "name": "DES (CIPHER) via default",
+      "properties": [
+        {
+          "name": "osslscope:algorithm",
+          "value": "DES"
+        },
+        {
+          "name": "osslscope:provider",
+          "value": "default"
+        },
+        {
+          "name": "osslscope:provider-object",
+          "value": "/p/provider.so"
+        },
+        {
+          "name": "osslscope:provider-build-id",
+          "value": "unknown"
+        },
+        {
+          "name": "osslscope:op",
+          "value": "CIPHER"
+        },
+        {
+          "name": "osslscope:funcid",
+          "value": "21"
+        },
+        {
+          "name": "osslscope:calls",
+          "value": "500"
+        },
+        {
+          "name": "osslscope:generation",
+          "value": "current"
+        },
+        {
+          "name": "osslscope:window-start",
+          "value": "2023-11-14T22:13:20Z"
+        },
+        {
+          "name": "osslscope:window-end",
+          "value": "2023-11-14T22:13:21Z"
+        },
+        {
+          "name": "osslscope:execution-evidence-completeness",
+          "value": "COMPLETE"
+        }
+      ],
+      "type": "cryptographic-asset"
+    },
+    {
+      "bom-ref": "urn:osslscope:exec:current:2:2:22:default:other",
+      "cryptoProperties": {
+        "assetType": "algorithm"
+      },
+      "name": "other (CIPHER) via default",
+      "properties": [
+        {
+          "name": "osslscope:algorithm",
+          "value": "other"
+        },
+        {
+          "name": "osslscope:provider",
+          "value": "default"
+        },
+        {
+          "name": "osslscope:provider-object",
+          "value": "/p/provider.so"
+        },
+        {
+          "name": "osslscope:provider-build-id",
+          "value": "unknown"
+        },
+        {
+          "name": "osslscope:op",
+          "value": "CIPHER"
+        },
+        {
+          "name": "osslscope:funcid",
+          "value": "22"
+        },
+        {
+          "name": "osslscope:calls",
+          "value": "9"
+        },
+        {
+          "name": "osslscope:generation",
+          "value": "current"
+        },
+        {
+          "name": "osslscope:window-start",
+          "value": "2023-11-14T22:13:20Z"
+        },
+        {
+          "name": "osslscope:window-end",
+          "value": "2023-11-14T22:13:21Z"
+        },
+        {
+          "name": "osslscope:execution-evidence-completeness",
+          "value": "COMPLETE"
+        }
+      ],
+      "type": "cryptographic-asset"
+    },
+    {
+      "bom-ref": "urn:osslscope:exec:current:13:13:31:default:ML-DSA-65",
+      "cryptoProperties": {
+        "assetType": "algorithm"
+      },
+      "name": "ML-DSA-65 (ASYM_CIPHER) via default",
+      "properties": [
+        {
+          "name": "osslscope:algorithm",
+          "value": "ML-DSA-65"
+        },
+        {
+          "name": "osslscope:provider",
+          "value": "default"
+        },
+        {
+          "name": "osslscope:provider-object",
+          "value": "/p/provider.so"
+        },
+        {
+          "name": "osslscope:provider-build-id",
+          "value": "unknown"
+        },
+        {
+          "name": "osslscope:op",
+          "value": "ASYM_CIPHER"
+        },
+        {
+          "name": "osslscope:funcid",
+          "value": "31"
+        },
+        {
+          "name": "osslscope:calls",
+          "value": "7"
+        },
+        {
+          "name": "osslscope:generation",
+          "value": "current"
+        },
+        {
+          "name": "osslscope:window-start",
+          "value": "2023-11-14T22:13:20Z"
+        },
+        {
+          "name": "osslscope:window-end",
+          "value": "2023-11-14T22:13:21Z"
+        },
+        {
+          "name": "osslscope:execution-evidence-completeness",
+          "value": "COMPLETE"
+        }
+      ],
+      "type": "cryptographic-asset"
+    }
+  ],
+  "metadata": {
+    "timestamp": "2023-11-14T22:13:21Z"
+  },
+  "specVersion": "1.6",
+  "version": 1
+}

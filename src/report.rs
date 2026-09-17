@@ -26,6 +26,7 @@ struct Args {
     target: capture::Target,
     format: String,
     out: Option<String>,
+    cbom: Option<String>,
 }
 
 fn parse(argv: &[String]) -> Result<Args, String> {
@@ -41,6 +42,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
     let mut grace = 5.0f64;
     let mut pid: Option<u32> = None;
     let mut image_digest = String::new();
+    let mut cbom: Option<String> = None;
     let mut run_at: Option<usize> = None;
     let mut i = 0;
     while i < argv.len() {
@@ -73,6 +75,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             "--grace" => grace = val(a)?.parse().map_err(|_| "--grace needs seconds")?,
             "--pid" => pid = Some(val(a)?.parse().map_err(|_| "--pid needs an integer")?),
             "--image-digest" => image_digest = val(a)?,
+            "--cbom" => cbom = Some(val(a)?),
             x => return Err(format!("unknown flag {x}")),
         }
         i += 2;
@@ -122,6 +125,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         target,
         format,
         out,
+        cbom,
     })
 }
 
@@ -542,13 +546,115 @@ fn human_legacy(legacy: &serde_json::Value, s: &mut String) {
     }
 }
 
+/// CycloneDX 1.6 CBOM (P3 exit-4): one `cryptographic-asset`
+/// component per executed identity (current + fenced detail).
+/// Minimal field map (P3 gate record documents it): algorithm,
+/// provider (+object/build-id), op, funcid, calls, generation,
+/// window edges, per-component completeness. PARTIAL/FATAL ride a
+/// metadata disclaimer; FATAL has zero components. No
+/// `algorithmProperties` in v1 (primitive/mode are not reliably
+/// known — never fabricate crypto metadata).
+fn cbom(c: &capture::Capture) -> serde_json::Value {
+    let status = match &c.outcome {
+        capture::Outcome::Complete => "COMPLETE",
+        capture::Outcome::Partial => "PARTIAL",
+        capture::Outcome::Fatal(_) => "FATAL",
+    };
+    let start = iso8601_utc(epoch_secs(c.window_start_wall));
+    let end = iso8601_utc(epoch_secs(c.window_end_wall));
+    let prop = |name: &str, value: String| serde_json::json!({"name": name, "value": value});
+    let mut comps: Vec<serde_json::Value> = Vec::new();
+    if !matches!(c.outcome, capture::Outcome::Fatal(_)) {
+        let mut one = |cookie: u32,
+                       provider: &str,
+                       op: u32,
+                       funcid: u32,
+                       alg: &str,
+                       count: u64,
+                       generation: &str| {
+            comps.push(serde_json::json!({
+                "bom-ref": format!("urn:osslscope:exec:{generation}:{cookie}:{op}:{funcid}:{provider}:{alg}"),
+                "type": "cryptographic-asset",
+                "name": format!("{alg} ({}) via {provider}", op_display(op)),
+                "cryptoProperties": {"assetType": "algorithm"},
+                "properties": [
+                    prop("osslscope:algorithm", alg.to_string()),
+                    prop("osslscope:provider", provider.to_string()),
+                    prop("osslscope:provider-object", c.provider_path.clone()),
+                    prop("osslscope:provider-build-id", c.provider_build_id.clone()),
+                    prop("osslscope:op", op_display(op)),
+                    prop("osslscope:funcid", funcid.to_string()),
+                    prop("osslscope:calls", count.to_string()),
+                    prop("osslscope:generation", generation.to_string()),
+                    prop("osslscope:window-start", start.clone()),
+                    prop("osslscope:window-end", end.clone()),
+                    prop("osslscope:execution-evidence-completeness", status.to_string()),
+                ],
+            }));
+        };
+        for e in &c.executions {
+            one(
+                e.cookie,
+                &e.id.provider,
+                e.id.op,
+                e.id.funcid,
+                &e.id.alg_class,
+                e.count,
+                "current",
+            );
+        }
+        for s in &c.stale {
+            let generation = s.generation.to_string();
+            for d in &s.detail {
+                one(
+                    d.cookie,
+                    &d.id.provider,
+                    d.id.op,
+                    d.id.funcid,
+                    &d.id.alg_class,
+                    d.count,
+                    &generation,
+                );
+            }
+        }
+    }
+    let mut metadata = serde_json::json!({"timestamp": end});
+    let why = if c.reasons.is_empty() {
+        "unknown".to_string()
+    } else {
+        c.reasons.join(",")
+    };
+    match &c.outcome {
+        capture::Outcome::Complete => {}
+        capture::Outcome::Partial => {
+            metadata["properties"] = serde_json::json!([{
+                "name": "osslscope:completeness-disclaimer",
+                "value": format!("PARTIAL evidence ({why}); absence = not-observed in window"),
+            }]);
+        }
+        capture::Outcome::Fatal(_) => {
+            metadata["properties"] = serde_json::json!([{
+                "name": "osslscope:completeness-disclaimer",
+                "value": format!("FATAL: no usable evidence ({why})"),
+            }]);
+        }
+    }
+    serde_json::json!({
+        "bomFormat": "CycloneDX",
+        "specVersion": "1.6",
+        "version": 1,
+        "metadata": metadata,
+        "components": comps,
+    })
+}
+
 pub fn run(argv: &[String]) -> ExitCode {
     let args = match parse(argv) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("osslscope report: {e}");
             eprintln!(
-                "usage: report [--duration S] --provider P --object O --count-object C [--format human|json] [--out F] [--builtin] [--settle S] [--timeout S] [--grace S] [--image-digest D] {{--pid P | run -- <cmd>}}"
+                "usage: report [--duration S] --provider P --object O --count-object C [--format human|json] [--out F] [--cbom FILE] [--builtin] [--settle S] [--timeout S] [--grace S] [--image-digest D] {{--pid P | run -- <cmd>}}"
             );
             return ExitCode::from(2);
         }
@@ -572,6 +678,15 @@ pub fn run(argv: &[String]) -> ExitCode {
         }
     } else {
         print!("{text}");
+    }
+    // --cbom additionally writes, never replaces stdout (written
+    // even on PARTIAL/FATAL — the disclaimer travels in-band).
+    if let Some(path) = &args.cbom {
+        let text = serde_json::to_string_pretty(&cbom(&c)).unwrap() + "\n";
+        if let Err(e) = std::fs::write(path, &text) {
+            eprintln!("osslscope report: write {path}: {e}");
+            return ExitCode::from(4);
+        }
     }
     ExitCode::from(exit_for(&c))
 }
@@ -908,6 +1023,10 @@ note: alg-name-only strength (key sizes unobservable); window-only claims\n";
         serde_json::to_string_pretty(&doc(c)).unwrap() + "\n"
     }
 
+    fn cbom_json(c: &capture::Capture) -> String {
+        serde_json::to_string_pretty(&cbom(c)).unwrap() + "\n"
+    }
+
     fn partial(reasons: &[&str]) -> capture::Capture {
         let mut c = cap(capture::Outcome::Partial, None);
         c.reasons = reasons.iter().map(|r| r.to_string()).collect();
@@ -997,6 +1116,31 @@ note: alg-name-only strength (key sizes unobservable); window-only claims\n";
     }
 
     #[test]
+    fn goldens_cbom() {
+        assert_golden("cbom-complete.json", &cbom_json(&full_cap()));
+        let mut p = partial(&["cold-gap"]);
+        p.counters.cold_gap_calls = 5;
+        p.executions = vec![capture::Execution {
+            cookie: 0,
+            id: crate::plan::Identity {
+                provider: "default".to_string(),
+                op: 2,
+                funcid: 21,
+                alg_class: "DES".to_string(),
+                offset: 0,
+            },
+            aliases: Vec::new(),
+            count: 500,
+            first_ns: 0,
+            last_ns: 0,
+        }];
+        assert_golden("cbom-partial.json", &cbom_json(&p));
+        let mut f = cap(capture::Outcome::Fatal(capture::FatalKind::AttachZero), None);
+        f.reasons = vec!["pid-recycled".to_string()];
+        assert_golden("cbom-fatal.json", &cbom_json(&f));
+    }
+
+    #[test]
     fn goldens_determinism_and_signals() {
         // Byte-stable for identical input (BTreeMap keys + sorted
         // executions — PRD §6 determinism test).
@@ -1009,6 +1153,121 @@ note: alg-name-only strength (key sizes unobservable); window-only claims\n";
         assert_eq!(c.counters.drain_shortfall, 0);
         assert_eq!(exit_for(&c), 3);
         assert_eq!(doc(&c)["completeness"]["status"], "PARTIAL");
+    }
+
+    fn cbom_props(c: &serde_json::Value) -> std::collections::BTreeMap<String, String> {
+        c["properties"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| {
+                (
+                    p["name"].as_str().unwrap().to_string(),
+                    p["value"].as_str().unwrap_or("").to_string(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cbom_complete_shape() {
+        let b = cbom(&full_cap());
+        assert_eq!(b["bomFormat"], "CycloneDX");
+        assert_eq!(b["specVersion"], "1.6");
+        assert_eq!(b["version"], 1);
+        assert_eq!(b["metadata"]["timestamp"], "2023-11-14T22:13:21Z");
+        assert!(b["metadata"].get("properties").is_none(), "clean: no disclaimer");
+        let comps = b["components"].as_array().unwrap();
+        assert_eq!(comps.len(), 4, "one component per execution (stale detail empty)");
+        let c0 = &comps[0];
+        assert_eq!(c0["type"], "cryptographic-asset");
+        assert_eq!(c0["cryptoProperties"]["assetType"], "algorithm");
+        assert!(c0["bom-ref"].as_str().unwrap().contains("SHA-256"));
+        let p = cbom_props(c0);
+        assert_eq!(p["osslscope:algorithm"], "SHA-256");
+        assert_eq!(p["osslscope:provider"], "default");
+        assert_eq!(p["osslscope:op"], "DIGEST");
+        assert_eq!(p["osslscope:funcid"], "11");
+        assert_eq!(p["osslscope:calls"], "1204033");
+        assert_eq!(p["osslscope:generation"], "current");
+        assert_eq!(p["osslscope:provider-object"], "/p/provider.so");
+        assert_eq!(p["osslscope:provider-build-id"], "unknown");
+        assert_eq!(p["osslscope:execution-evidence-completeness"], "COMPLETE");
+        assert_eq!(p["osslscope:window-start"], "2023-11-14T22:13:20Z");
+        assert_eq!(p["osslscope:window-end"], "2023-11-14T22:13:21Z");
+    }
+
+    #[test]
+    fn cbom_covers_fenced_detail() {
+        let mut c = cap(capture::Outcome::Complete, None);
+        c.executions = vec![capture::Execution {
+            cookie: 0,
+            id: crate::plan::Identity {
+                provider: "default".to_string(),
+                op: 1,
+                funcid: 11,
+                alg_class: "SHA-256".to_string(),
+                offset: 0,
+            },
+            aliases: Vec::new(),
+            count: 5,
+            first_ns: 0,
+            last_ns: 0,
+        }];
+        c.stale = vec![capture::StaleBucket {
+            generation: 3,
+            events: 9,
+            keys: 1,
+            detail: vec![capture::StaleDetail {
+                cookie: 0,
+                id: crate::plan::Identity {
+                    provider: "spike".to_string(),
+                    op: 2,
+                    funcid: 21,
+                    alg_class: "DES".to_string(),
+                    offset: 0,
+                },
+                count: 9,
+                first_ns: 0,
+                last_ns: 0,
+            }],
+        }];
+        let comps = cbom(&c)["components"].as_array().unwrap().clone();
+        assert_eq!(comps.len(), 2);
+        assert_eq!(cbom_props(&comps[0])["osslscope:generation"], "current");
+        assert_eq!(cbom_props(&comps[1])["osslscope:generation"], "3");
+        assert_eq!(cbom_props(&comps[1])["osslscope:algorithm"], "DES");
+    }
+
+    #[test]
+    fn cbom_partial_and_fatal_disclaimers() {
+        let mut c = cap(capture::Outcome::Partial, None);
+        c.reasons = vec!["cold-gap".to_string()];
+        let b = cbom(&c);
+        let dis = b["metadata"]["properties"].as_array().unwrap();
+        assert_eq!(dis.len(), 1);
+        assert_eq!(dis[0]["name"], "osslscope:completeness-disclaimer");
+        assert!(dis[0]["value"].as_str().unwrap().contains("cold-gap"));
+        assert_eq!(b["components"].as_array().unwrap().len(), 0);
+        // FATAL: empty components + FATAL disclaimer (uniform shape).
+        let f = cap(capture::Outcome::Fatal(capture::FatalKind::AttachZero), None);
+        let b = cbom(&f);
+        assert_eq!(b["components"].as_array().unwrap().len(), 0);
+        let v = b["metadata"]["properties"][0]["value"].as_str().unwrap();
+        assert!(v.contains("FATAL"), "{v}");
+    }
+
+    #[test]
+    fn cbom_flag_parses() {
+        let v = |s: Vec<&str>| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let a = parse(&v(vec![
+            "--provider", "p", "--object", "o", "--count-object", "c", "--pid", "9",
+            "--cbom", "/tmp/x.cdx.json",
+        ]))
+        .unwrap();
+        assert_eq!(a.cbom, Some("/tmp/x.cdx.json".to_string()));
+        let a = parse(&v(vec!["--provider", "p", "--object", "o", "--count-object", "c", "--pid", "9"])).unwrap();
+        assert_eq!(a.cbom, None);
     }
 
     #[test]

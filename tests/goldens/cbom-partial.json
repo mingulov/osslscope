@@ -1,0 +1,70 @@
+{
+  "bomFormat": "CycloneDX",
+  "components": [
+    {
+      "bom-ref": "urn:osslscope:exec:current:0:2:21:default:DES",
+      "cryptoProperties": {
+        "assetType": "algorithm"
+      },
+      "name": "DES (CIPHER) via default",
+      "properties": [
+        {
+          "name": "osslscope:algorithm",
+          "value": "DES"
+        },
+        {
+          "name": "osslscope:provider",
+          "value": "default"
+        },
+        {
+          "name": "osslscope:provider-object",
+          "value": "/p/provider.so"
+        },
+        {
+          "name": "osslscope:provider-build-id",
+          "value": "unknown"
+        },
+        {
+          "name": "osslscope:op",
+          "value": "CIPHER"
+        },
+        {
+          "name": "osslscope:funcid",
+          "value": "21"
+        },
+        {
+          "name": "osslscope:calls",
+          "value": "500"
+        },
+        {
+          "name": "osslscope:generation",
+          "value": "current"
+        },
+        {
+          "name": "osslscope:window-start",
+          "value": "2023-11-14T22:13:20Z"
+        },
+        {
+          "name": "osslscope:window-end",
+          "value": "2023-11-14T22:13:21Z"
+        },
+        {
+          "name": "osslscope:execution-evidence-completeness",
+          "value": "PARTIAL"
+        }
+      ],
+      "type": "cryptographic-asset"
+    }
+  ],
+  "metadata": {
+    "properties": [
+      {
+        "name": "osslscope:completeness-disclaimer",
+        "value": "PARTIAL evidence (cold-gap); absence = not-observed in window"
+      }
+    ],
+    "timestamp": "2023-11-14T22:13:21Z"
+  },
+  "specVersion": "1.6",
+  "version": 1
+}

@@ -1,0 +1,15 @@
+{
+  "bomFormat": "CycloneDX",
+  "components": [],
+  "metadata": {
+    "properties": [
+      {
+        "name": "osslscope:completeness-disclaimer",
+        "value": "FATAL: no usable evidence (pid-recycled)"
+      }
+    ],
+    "timestamp": "2023-11-14T22:13:21Z"
+  },
+  "specVersion": "1.6",
+  "version": 1
+}
