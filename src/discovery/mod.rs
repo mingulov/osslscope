@@ -11,6 +11,7 @@
 //! the relocation + schema legs are mechanism-independent either way.
 
 pub mod elf;
+pub mod flavor;
 pub mod harvest;
 pub mod maps;
 pub mod schema;
