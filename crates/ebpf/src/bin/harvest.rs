@@ -417,9 +417,10 @@ pub fn query_return(ctx: RetProbeContext) -> u32 {
         }
         return 0;
     }
-    let _ = QUERY_NEXT.insert(key, count.wrapping_add(1), 0);
     if imp == 0 {
         // Alg without implementation: skipped, like the dumper.
+        // Counter NOT advanced (same as every abort below): the
+        // next hit re-walks this slot instead of sliding past it.
         if j == 0 {
             flag_trunc(op as u32, TRUNC_WALK_NOIMP);
             emit_walkdbg(op as u32, rv, j, 3, names, imp);
@@ -444,6 +445,12 @@ pub fn query_return(ctx: RetProbeContext) -> u32 {
         }
         return 0;
     }
+    // Advance past this slot ONLY on a fully-walked alg: BPF probe
+    // reads are nofault, so a cold (never-touched) page aborts the
+    // walk even though the table is valid — freezing the counter
+    // lets the next query re-walk this slot instead of losing the
+    // alg forever (the terminator path above still freezes too).
+    let _ = QUERY_NEXT.insert(key, count.wrapping_add(1), 0);
     emit(&Event {
         kind: KIND_ALG,
         op: op as u32,

@@ -28,6 +28,67 @@ const KIND_INIT_RET: u32 = 1;
 fn debug_harvest() -> bool {
     std::env::var("OSSL_DEBUG_HARVEST").is_ok()
 }
+
+/// Fault in the provider file's mapped pages (best-effort, one byte
+/// per page via process_vm_readv). BPF probe reads are nofault: a
+/// query whose alg tables were never touched aborts the walk
+/// (TRUNC_WALK_*) even though the table is valid — reloading a
+/// provider is exactly the cold-page case (lane-A proven). Called at
+/// stage-2 attach, before any query the pair can see; failures only
+/// degrade to abort-retry + loud TRUNC, never to silence.
+fn pretouch_mappings(pid: u32, live: &[maps::Mapping], path: &Path, canon: &str) {
+    let arg = path.to_string_lossy();
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as u64;
+    let mut pages: Vec<u64> = Vec::new();
+    for m in live {
+        if m.ino == 0
+            || !(m.path == arg || m.path == canon || (!canon.is_empty() && m.path.ends_with(canon)))
+        {
+            continue;
+        }
+        let mut p = m.start & !(page - 1);
+        while p < m.end {
+            pages.push(p);
+            p += page;
+        }
+    }
+    if pages.is_empty() {
+        return;
+    }
+    // One local byte per remote page; chunk under UIO_MAXIOV (1024).
+    let mut sink = vec![0u8; pages.len().min(1000)];
+    for chunk in pages.chunks(1000) {
+        sink.resize(chunk.len(), 0);
+        let local = libc::iovec {
+            iov_base: sink.as_mut_ptr() as *mut libc::c_void,
+            iov_len: chunk.len(),
+        };
+        let remote: Vec<libc::iovec> = chunk
+            .iter()
+            .map(|p| libc::iovec {
+                iov_base: *p as *mut libc::c_void,
+                iov_len: 1,
+            })
+            .collect();
+        let n = unsafe {
+            libc::process_vm_readv(
+                pid as libc::pid_t,
+                &local,
+                1,
+                remote.as_ptr(),
+                remote.len(),
+                0,
+            )
+        };
+        if n < 0 && debug_harvest() {
+            eprintln!(
+                "HARVESTDBG pretouch pid={pid} pages={} err={}",
+                chunk.len(),
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+}
 const KIND_QUERY_RET: u32 = 2;
 const KIND_ROW: u32 = 3;
 const KIND_ALG: u32 = 4;
@@ -695,6 +756,7 @@ pub fn run_detailed(
                         cookie,
                     )?;
                     attached_queries.insert(cookie);
+                    pretouch_mappings(pid.get(), &live, &path, &canon);
                     eprintln!("INSPECT stage=query addr={addr:#x} off={off:#x} cookie={cookie}");
                 }
                 KIND_QUERY_RET if u32at(8) == 0 => {
