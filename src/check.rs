@@ -977,6 +977,16 @@ mod tests {
         assert_eq!(d["schema_version"], "observed-crypto-v1.0");
         assert_eq!(d["policy"]["verdict"], "pass");
         assert_eq!(d["policy"]["rules"].as_array().unwrap().len(), 1);
+        // Check documents conform too (policy required-keys).
+        let schema: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(format!(
+                "{}/schemas/observed-crypto-v1.json",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        crate::schema::assert_required_keys(&schema, &d);
     }
 
     #[test]

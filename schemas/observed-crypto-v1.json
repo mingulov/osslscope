@@ -1,0 +1,116 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://osslscope.dev/schemas/observed-crypto-v1.json",
+  "title": "observed-crypto v1",
+  "description": "osslscope report/check window document (P3 exit-3). Producers: report (no policy key), check (adds policy). Minor versions add OPTIONAL keys only; readers must ignore unknown keys and gate on check_version (major 1).",
+  "type": "object",
+  "required": ["schema_version", "target", "window", "completeness", "executions", "legacy", "kernel", "provider", "stale", "drain_wall_us"],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "pattern": "^observed-crypto-v1(\\.\\d+)?$"
+    },
+    "target": {
+      "type": "object",
+      "required": ["pid", "comm", "cmdline", "container_id", "image_digest"],
+      "properties": {
+        "pid": {"type": "integer"},
+        "comm": {"type": "string"},
+        "cmdline": {"type": "string"},
+        "container_id": {"type": "string"},
+        "image_digest": {"type": "string"}
+      }
+    },
+    "window": {
+      "type": "object",
+      "required": ["planned_s", "actual_s", "start_epoch", "end_epoch"],
+      "properties": {
+        "planned_s": {"type": "number"},
+        "actual_s": {"type": "number"},
+        "start_epoch": {"type": "number"},
+        "end_epoch": {"type": "number"}
+      }
+    },
+    "completeness": {
+      "type": "object",
+      "required": ["status", "reasons", "counters"],
+      "properties": {
+        "status": {"enum": ["COMPLETE", "PARTIAL", "FATAL"]},
+        "reasons": {"type": "array", "items": {"type": "string"}},
+        "counters": {
+          "type": "object",
+          "required": ["dropped_events", "dropped_events_bpf", "dropped_events_userspace", "missed_attaches", "unresolved_offsets", "table_staleness_events", "cold_gap_calls", "provider_changed", "scan_budget_exhaustions", "engine_fallback_uninstrumented", "drain_shortfall", "uninstrumented_ops", "fork_exec_ignored", "over_budget"]
+        }
+      }
+    },
+    "executions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["cookie", "provider", "op", "funcid", "alg_class", "offset", "count", "first_ns", "last_ns", "aliases"],
+        "properties": {
+          "aliases": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["provider", "op", "funcid", "alg_class", "offset"]
+            }
+          }
+        }
+      }
+    },
+    "legacy": {
+      "description": "Adopted harvest legacy block (entries/capability/flags/weak + executed rollup), or null when no harvest produced one.",
+      "type": ["object", "null"]
+    },
+    "kernel": {"type": "string"},
+    "provider": {
+      "type": "object",
+      "required": ["path", "build_id"],
+      "properties": {
+        "path": {"type": "string"},
+        "build_id": {"type": "string"}
+      }
+    },
+    "stale": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["generation", "events", "keys", "detail"],
+        "properties": {
+          "detail": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["cookie", "provider", "op", "funcid", "alg_class", "offset", "count", "first_ns", "last_ns"]
+            }
+          }
+        }
+      }
+    },
+    "drain_wall_us": {"type": "integer"},
+    "child_exit": {"type": "integer"},
+    "policy": {
+      "description": "check-only section (absent in report documents).",
+      "type": "object",
+      "required": ["verdict", "rules", "violations", "unseen_deny_providers", "param_blind", "kat_excluded", "kat_note"],
+      "properties": {
+        "verdict": {"enum": ["pass", "violation", "no-verdict"]},
+        "rules": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["rule", "value", "result", "matches"]
+          }
+        },
+        "violations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["rule", "matcher", "provider_label", "op", "op_name", "alg", "funcid", "count", "first_ns", "last_ns", "fenced_gen", "absent", "window", "cmdline", "container_id", "image_digest", "provider"]
+          }
+        }
+      }
+    }
+  }
+}
