@@ -1,0 +1,163 @@
+{
+  "gen": 0,
+  "legacy": {
+    "engine": {
+      "calls_by_entrypoint": {},
+      "engine_id_class": {
+        "builtin": 0,
+        "dynamic": 0,
+        "other": 0
+      },
+      "uninstrumented": 32
+    },
+    "engine_fallback_uninstrumented": 35,
+    "findings": [
+      "ENGINE API absent"
+    ],
+    "legacy_provider": {
+      "algs": [],
+      "executed_calls": 0,
+      "loads": {
+        "default": 0,
+        "fips": 0,
+        "legacy": 0,
+        "other": 2
+      }
+    },
+    "lowlevel": {
+      "calls_by_family": {
+        "bn": 0,
+        "cipher/aes": 0,
+        "cipher/block": 6,
+        "cipher/stream": 0,
+        "digest/legacy": 0,
+        "digest/md": 0,
+        "digest/sha": 0,
+        "mac": 0,
+        "pkey/dh": 0,
+        "pkey/dsa": 0,
+        "pkey/ec": 0,
+        "pkey/rsa": 0,
+        "rand": 0,
+        "srp": 0
+      }
+    },
+    "meth_new": {
+      "calls_by_entrypoint": {
+        "DH_meth_new": 0,
+        "DSA_meth_new": 0,
+        "RSA_meth_new": 0
+      },
+      "uninstrumented": 3
+    }
+  },
+  "provider": "spike",
+  "rows": [
+    {
+      "addr_backed": true,
+      "addr_hash": "b6ceda8541bbe41c",
+      "alg_class": "other",
+      "backing": {
+        "dev": "00:23",
+        "ino": 6913610,
+        "offset": 4832
+      },
+      "funcid": 1,
+      "gen": 0,
+      "op": 1,
+      "provider": "spike",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "44497303ad01fce9",
+      "alg_class": "other",
+      "backing": {
+        "dev": "00:23",
+        "ino": 6913610,
+        "offset": 4887
+      },
+      "funcid": 6,
+      "gen": 0,
+      "op": 1,
+      "provider": "spike",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "477436d64533404c",
+      "alg_class": "other",
+      "backing": {
+        "dev": "00:23",
+        "ino": 6913610,
+        "offset": 4944
+      },
+      "funcid": 2,
+      "gen": 0,
+      "op": 1,
+      "provider": "spike",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "a72488c91941a875",
+      "alg_class": "other",
+      "backing": {
+        "dev": "00:23",
+        "ino": 6913610,
+        "offset": 4998
+      },
+      "funcid": 3,
+      "gen": 0,
+      "op": 1,
+      "provider": "spike",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "9cfb3886d835bebf",
+      "alg_class": "other",
+      "backing": {
+        "dev": "00:23",
+        "ino": 6913610,
+        "offset": 5061
+      },
+      "funcid": 4,
+      "gen": 0,
+      "op": 1,
+      "provider": "spike",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "68e528961b8f3b14",
+      "alg_class": "other",
+      "backing": {
+        "dev": "00:23",
+        "ino": 6913610,
+        "offset": 5134
+      },
+      "funcid": 11,
+      "gen": 0,
+      "op": 1,
+      "provider": "spike",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "b9a80f621a834867",
+      "alg_class": "other",
+      "backing": {
+        "dev": "00:23",
+        "ino": 6913610,
+        "offset": 5186
+      },
+      "funcid": 8,
+      "gen": 0,
+      "op": 1,
+      "provider": "spike",
+      "weak": false
+    }
+  ],
+  "trigger_observed": true
+}
