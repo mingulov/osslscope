@@ -346,8 +346,30 @@ fn read_lgcalls(maps: &HashMap<String, OwnedFd>) -> u64 {
         .sum()
 }
 
+/// Exact in-memory harvest totals for capture callers (the doc
+/// only carries them when builtin/PARTIAL — cold-gap accounting
+/// needs them always).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HarvestTotals {
+    pub queries_observed: u64,
+}
+
 /// Run the harvest; returns the emitted document on success.
 pub fn run(cfg: &Config) -> anyhow::Result<serde_json::Value> {
+    Ok(run_detailed(cfg, &|| Ok(()), &|| false)?.0)
+}
+
+/// `run` with spawn-mode hooks: `on_attached` fires after the
+/// post-attach pin check (SIGCONT goes here — the child stays
+/// stopped until every attach is installed); `should_stop` is
+/// polled each drain iteration (child-death short-circuits the
+/// settle wait for short-lived targets). Returns the document +
+/// exact in-memory totals.
+pub fn run_detailed(
+    cfg: &Config,
+    on_attached: &dyn Fn() -> anyhow::Result<()>,
+    should_stop: &dyn Fn() -> bool,
+) -> anyhow::Result<(serde_json::Value, HarvestTotals)> {
     let pid = NonZeroU32::new(cfg.pid).ok_or_else(|| anyhow!("pid must be non-zero"))?;
     // Pin FIRST: every later /proc/<pid> read and every pid-scoped
     // attach is verified against this identity (exit-6).
@@ -533,7 +555,8 @@ pub fn run(cfg: &Config) -> anyhow::Result<serde_json::Value> {
             cfg.builtin,
             blind,
             0,
-        );
+        )
+        .map(|d| (d, HarvestTotals::default()));
     }
     // Post-attach verify: every maps read and attach above resolved
     // through /proc/<pid> — confirm the identity before draining.
@@ -546,6 +569,9 @@ pub fn run(cfg: &Config) -> anyhow::Result<serde_json::Value> {
         cfg.builtin,
         cfg.legacy,
     )?;
+    // Spawn mode releases the stopped child here: every attach is
+    // installed, so the post-exec query wave is fully observed.
+    on_attached()?;
 
     let ev_fd = loaded
         .maps
@@ -583,6 +609,11 @@ pub fn run(cfg: &Config) -> anyhow::Result<serde_json::Value> {
     let mut alg_names: HashMap<(u64, u64), String> = HashMap::new();
 
     while start.elapsed() < cfg.timeout {
+        // Short-lived targets (and signals): no more events can
+        // arrive — end the drain instead of idling out the settle.
+        if should_stop() {
+            break;
+        }
         let mut fresh = false;
         while let Some(item) = ring.next() {
             fresh = true;
@@ -821,7 +852,8 @@ pub fn run(cfg: &Config) -> anyhow::Result<serde_json::Value> {
                 cfg.builtin,
                 legacy_live,
                 0,
-            );
+            )
+            .map(|d| (d, HarvestTotals { queries_observed }));
         }
         if !cfg.builtin {
             let arg = cfg.provider.to_string_lossy().into_owned();
@@ -847,7 +879,7 @@ pub fn run(cfg: &Config) -> anyhow::Result<serde_json::Value> {
                 if let Some(l) = legacy_live {
                     doc["legacy"] = l;
                 }
-                return Ok(doc);
+                return Ok((doc, HarvestTotals { queries_observed }));
             }
             let mut doc = schema::emit(
                 &provider_name,
@@ -862,7 +894,7 @@ pub fn run(cfg: &Config) -> anyhow::Result<serde_json::Value> {
             if let Some(l) = legacy_live {
                 doc["legacy"] = l;
             }
-            return Ok(doc);
+            return Ok((doc, HarvestTotals { queries_observed }));
         }
         let loads_observed = probe_set
             .as_ref()
@@ -884,7 +916,7 @@ pub fn run(cfg: &Config) -> anyhow::Result<serde_json::Value> {
             if let Some(l) = legacy_live {
                 doc["legacy"] = l;
             }
-            return Ok(doc);
+            return Ok((doc, HarvestTotals { queries_observed }));
         }
         eprintln!("INSPECT builtin: no query trigger before timeout");
         let mut stats = schema::Stats {
@@ -908,7 +940,7 @@ pub fn run(cfg: &Config) -> anyhow::Result<serde_json::Value> {
         if let Some(l) = legacy_live {
             doc["legacy"] = l;
         }
-        return Ok(doc);
+        return Ok((doc, HarvestTotals { queries_observed }));
     }
 
     // Post-drain maps for attribution. A target that exits after the
@@ -1025,7 +1057,7 @@ pub fn run(cfg: &Config) -> anyhow::Result<serde_json::Value> {
         };
         doc["legacy"] = l;
     }
-    Ok(doc)
+    Ok((doc, HarvestTotals { queries_observed }))
 }
 
 #[cfg(test)]

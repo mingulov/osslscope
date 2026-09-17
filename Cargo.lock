@@ -242,6 +242,9 @@ dependencies = [
 [[package]]
 name = "osslscope-ebpf-common"
 version = "0.1.0"
+dependencies = [
+ "aya",
+]
 
 [[package]]
 name = "osslscope-manifest"

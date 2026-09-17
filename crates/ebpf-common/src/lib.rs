@@ -31,6 +31,11 @@ pub struct CountValue {
 const _: () = assert!(size_of::<CountValue>() == 24);
 const _: () = assert!(align_of::<CountValue>() == 8);
 
+/// Typed map reads over the drain path. Sound: `repr(C)`, all-`u64`,
+/// zero padding (size 24 = 3×8, asserted above), `Copy`.
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for CountValue {}
+
 /// Userspace drain-side fold: saturating sum + min/max bounds.
 #[cfg(feature = "user")]
 impl CountValue {

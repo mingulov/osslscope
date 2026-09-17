@@ -85,6 +85,32 @@ fn u64_at(r: &serde_json::Value, k: &str) -> anyhow::Result<u64> {
         .ok_or_else(|| anyhow::anyhow!("harvest row lacks numeric {k:?}"))
 }
 
+/// Stable cookie allocator across fence re-plans. Cookies identify
+/// (path, offset) for the whole run — old links keep firing with
+/// correct cookies under new generations (the gen half of the key
+/// separates pre/post-fence counts), so re-plans never detach.
+/// Single-shot `plan` is the fresh-allocator case (cookies 0..n).
+#[derive(Debug, Default)]
+pub struct StableCookies {
+    next: u32,
+    ids: HashMap<(String, u64), u32>,
+}
+
+impl StableCookies {
+    fn cookie_for(&mut self, path: &str, offset: u64) -> anyhow::Result<u32> {
+        if let Some(&c) = self.ids.get(&(path.to_string(), offset)) {
+            return Ok(c);
+        }
+        if self.next == u32::MAX {
+            anyhow::bail!("cookie space exhausted");
+        }
+        let c = self.next;
+        self.next += 1;
+        self.ids.insert((path.to_string(), offset), c);
+        Ok(c)
+    }
+}
+
 /// Plan every doc row against live mappings. `files` maps link-path
 /// → file bytes (caller pre-reads each distinct mapped path once).
 /// Fail-closed: malformed rows are an error, never a skip.
@@ -93,6 +119,18 @@ pub fn plan(
     live: &[maps::Mapping],
     files: &HashMap<String, Vec<u8>>,
     generation: u32,
+) -> anyhow::Result<Plan> {
+    plan_stable(doc, live, files, generation, &mut StableCookies::default())
+}
+
+/// `plan` with caller-held cookie stability (fence re-plans reuse
+/// cookies for surviving sites; fresh sites mint new ones).
+pub fn plan_stable(
+    doc: &serde_json::Value,
+    live: &[maps::Mapping],
+    files: &HashMap<String, Vec<u8>>,
+    generation: u32,
+    stable: &mut StableCookies,
 ) -> anyhow::Result<Plan> {
     let rows = doc
         .get("rows")
@@ -169,7 +207,7 @@ pub fn plan(
             out.entries[i].aliases.push(id);
             continue;
         }
-        let cookie = out.entries.len() as u32;
+        let cookie = stable.cookie_for(path, id.offset)?;
         seen.insert(key, out.entries.len());
         out.entries.push(Entry {
             path: path.to_string(),
@@ -225,12 +263,9 @@ pub fn attach_group(
 /// live links + refused site indices (→ `unresolved_offsets`).
 /// Generic over the link handle so the isolation logic unit-tests
 /// without caps or fds; production passes `attach_group`.
-pub type TryAttach<T> = dyn Fn(&[(u64, u64)]) -> std::io::Result<T>;
+pub type TryAttach<'a, T> = dyn Fn(&[(u64, u64)]) -> std::io::Result<T> + 'a;
 
-pub fn bisect_attach<T>(
-    attach: &TryAttach<T>,
-    sites: &[(u64, u64)],
-) -> (Vec<T>, Vec<usize>) {
+pub fn bisect_attach<T>(attach: &TryAttach<'_, T>, sites: &[(u64, u64)]) -> (Vec<T>, Vec<usize>) {
     let mut links = Vec::new();
     let mut bad = Vec::new();
     let mut stack: Vec<Vec<usize>> = vec![(0..sites.len()).collect()];
@@ -384,6 +419,41 @@ mod tests {
         let (links, bad) = bisect_attach(&poisoned(vec![]), &sites);
         assert_eq!(links.len(), 1);
         assert!(bad.is_empty());
+    }
+
+    #[test]
+    fn stable_cookies_survive_replan() {
+        let bytes = self_bytes();
+        let (x_off, _) = probe_offsets(&bytes);
+        let live = vec![mapping("08:01", 99, "/lib/spike.so")];
+        let files = HashMap::from([("/lib/spike.so".to_string(), bytes)]);
+        let mut stable = StableCookies::default();
+        let p0 = plan_stable(
+            &doc(vec![
+                row(1, 7, "08:01", 99, x_off),
+                row(1, 9, "08:01", 99, x_off + 0x40),
+            ]),
+            &live,
+            &files,
+            0,
+            &mut stable,
+        )
+        .unwrap();
+        assert_eq!((p0.entries[0].cookie, p0.entries[1].cookie), (0, 1));
+        // Re-plan: one survivor (reordered), one fresh site.
+        let p1 = plan_stable(
+            &doc(vec![
+                row(1, 9, "08:01", 99, x_off + 0x40),
+                row(3, 1, "08:01", 99, x_off + 0x80),
+            ]),
+            &live,
+            &files,
+            1,
+            &mut stable,
+        )
+        .unwrap();
+        assert_eq!(p1.entries[0].cookie, 1); // survivor keeps 1
+        assert_eq!(p1.entries[1].cookie, 2); // fresh mints 2
     }
 
     #[test]

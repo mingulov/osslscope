@@ -11,5 +11,8 @@ publish = false
 name = "osslscope_ebpf_common"
 path = "src/lib.rs"
 
+[dependencies]
+aya = { version = "=0.14.0", optional = true }
+
 [features]
-user = []
+user = ["dep:aya"]

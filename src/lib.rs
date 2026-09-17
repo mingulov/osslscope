@@ -5,6 +5,7 @@
 //! semantics (P3), hardening (P4+) — no stub modules until owned.
 
 pub mod aliases;
+pub mod capture;
 pub mod cli;
 pub mod discovery;
 pub mod doctor;
