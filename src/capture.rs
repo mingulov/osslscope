@@ -843,7 +843,7 @@ impl<'a> Engine<'a> {
                             .map(|r| r.len())
                             .unwrap_or(0),
                         totals.queries_observed,
-                        doc.get("truncated")
+                        doc.get("truncated_ops")
                             .map(|t| serde_json::to_string(t).unwrap_or_default())
                             .unwrap_or_default()
                     );
