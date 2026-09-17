@@ -3,7 +3,8 @@
  * (caller-attributed probes must observe exactly these calls):
  *   - low-level DES x K(+1) + SHA256 Init/Update/Final x1 (all lanes)
  *   - RSA_meth_new x1 (all lanes; survives 4.0)
- *   - legacy provider load x1 + MD4 fetch + digest run (all lanes)
+ *   - legacy provider load x1 + MD4 fetch (GO1) + RIPEMD160 fetch
+ *     (GO2, deterministically post stage-attach) + digest runs
  *   - ENGINE_by_id/init/register_digests/set_default_digests x1 (3.x
  *     only; 4.0 has no ENGINE API → deterministic engine-less TP
  *     with an ENGINE-SKIP diagnostic, same #if precedent as
@@ -103,24 +104,32 @@ static int run_meth(void)
     return 0;
 }
 
+static int run_legacy_fetch(const char *alg)
+{
+    char propquery[64];
+    EVP_MD *md;
+    int rc;
+
+    snprintf(propquery, sizeof propquery, "provider=legacy");
+    md = EVP_MD_fetch(NULL, alg, propquery);
+    if (md == NULL) {
+        fprintf(stderr, "legacy: %s fetch failed\n", alg);
+        return 1;
+    }
+    rc = run_digest(md, 1);
+    EVP_MD_free(md);
+    return rc;
+}
+
 static int run_legacy_md4(void)
 {
     OSSL_PROVIDER *lp = OSSL_PROVIDER_load(NULL, "legacy");
-    EVP_MD *md4;
-    int rc;
 
     if (lp == NULL) {
         fprintf(stderr, "legacy: legacy provider unavailable\n");
         return 1;
     }
-    md4 = EVP_MD_fetch(NULL, "MD4", "provider=legacy");
-    if (md4 == NULL) {
-        fprintf(stderr, "legacy: MD4 fetch failed\n");
-        return 1;
-    }
-    rc = run_digest(md4, 1);
-    EVP_MD_free(md4);
-    return rc;
+    return run_legacy_fetch("MD4");
 }
 
 #if HAVE_ENGINE
@@ -241,6 +250,15 @@ int main(int argc, char **argv)
         OSSL_LIB_CTX_free(ctx2);
     }
     if (run_digest(md, 1) != 0 || run_des(1) != 0)
+        return 1;
+    /* GO2 legacy re-query (a DIFFERENT legacy-only alg — same-alg
+     * fetch would hit the method-store cache without querying): the
+     * GO1 MD4 query races the legacy query stage-attach and is
+     * routinely missed; GO2 is deterministically post-attach, so
+     * executed_calls/algs observe this fetch. No provider load here
+     * (loads stay exact). RIPEMD160: legacy-only on 3.x AND 4.x
+     * (MD5/SHA1 live in the default provider — verified by fetch). */
+    if (run_legacy_fetch("RIPEMD160") != 0)
         return 1;
 #if HAVE_ENGINE
     if (run_engine() != 0)
