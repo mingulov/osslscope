@@ -15,7 +15,7 @@
 //! stay pid-filtered (system-wide harvest firing would observe
 //! foreign tasks' crypto — the pid=0 text predates the P4 review).
 //! `TARGET=0` at expiry is the §8 mechanism, unchanged.
-use crate::discovery::{harvest, maps};
+use crate::discovery::{elf, harvest, maps};
 use crate::loader::Loaded;
 use crate::{kinds, pin, plan};
 use osslscope_ebpf_common::{CountValue, split_key};
@@ -24,7 +24,7 @@ use std::ffi::CString;
 use std::os::fd::{AsRawFd as _, OwnedFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 /// Maps-fence poll cadence (frozen §5).
 pub const POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -141,6 +141,15 @@ pub struct Capture {
     pub drain_wall_us: u64,
     pub harvest_doc: serde_json::Value,
     pub legacy: serde_json::Value,
+    /// Window wall-clock edges (PRD §5 window-only claims).
+    /// Pre-window FATAL captures carry the acquisition instant in
+    /// both (window_actual == 0 marks "no window opened").
+    pub window_start_wall: SystemTime,
+    pub window_end_wall: SystemTime,
+    pub kernel_release: String,
+    pub target_cmdline: String,
+    pub target_container_id: String,
+    pub provider_build_id: String,
 }
 
 // ---------------------------------------------------------------- signals
@@ -612,6 +621,55 @@ fn comm_of(pid: u32) -> String {
         .unwrap_or_else(|_| "unknown".to_string())
 }
 
+/// Container id from `/proc/<pid>/cgroup` content: the first
+/// 64-hex path segment or runtime scope name (docker/crio/libpod),
+/// else "" (bare metal). Best-effort identity for the check
+/// actionability tuple — never a security boundary.
+fn parse_container_id(cgroup: &str) -> String {
+    for line in cgroup.lines() {
+        let path = line.rsplit(':').next().unwrap_or("");
+        for mut seg in path.split('/') {
+            seg = seg.strip_suffix(".scope").unwrap_or(seg);
+            for prefix in ["docker-", "crio-", "libpod-"] {
+                seg = seg.strip_prefix(prefix).unwrap_or(seg);
+            }
+            if seg.len() == 64 && seg.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return seg.to_string();
+            }
+        }
+    }
+    String::new()
+}
+
+fn container_id_of(pid: u32) -> String {
+    std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
+        .map(|s| parse_container_id(&s))
+        .unwrap_or_default()
+}
+
+/// Render `/proc/<pid>/cmdline` bytes: NUL-joined argv → spaces,
+/// lossy, capped at 8 KiB with a truncation marker (argv can be
+/// huge and can carry secrets; the cap bounds artifact size).
+fn render_cmdline(raw: &[u8]) -> String {
+    const CAP: usize = 8192;
+    let s = String::from_utf8_lossy(raw);
+    let s = s.trim_matches('\0').replace('\0', " ");
+    if s.len() <= CAP {
+        return s;
+    }
+    let mut end = CAP;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}[truncated]", &s[..end])
+}
+
+fn cmdline_of(pid: u32) -> String {
+    std::fs::read(format!("/proc/{pid}/cmdline"))
+        .map(|b| render_cmdline(&b))
+        .unwrap_or_default()
+}
+
 /// Blind legacy entrypoints: (engine misses, PARTIAL reasons).
 /// The merged block holds per-family MAX across harvest phases,
 /// so read-through after each merge is the window total. ENGINE
@@ -826,6 +884,12 @@ struct Engine<'a> {
     child_exit: Option<i32>,
     window_start: Instant,
     window_end: Instant,
+    window_start_wall: SystemTime,
+    window_end_wall: SystemTime,
+    kernel_release: String,
+    target_cmdline: String,
+    target_container_id: String,
+    provider_build_id: String,
     harvest_doc: serde_json::Value,
     /// Merged `legacy` subtree (initial + re-harvests, disjoint
     /// harvest phases — merge_legacy sums/unions; Null when no
@@ -1179,6 +1243,12 @@ impl<'a> Engine<'a> {
             drain_wall_us: self.drain_wall_us,
             harvest_doc: self.harvest_doc,
             legacy: self.legacy,
+            window_start_wall: self.window_start_wall,
+            window_end_wall: self.window_end_wall,
+            kernel_release: self.kernel_release,
+            target_cmdline: self.target_cmdline,
+            target_container_id: self.target_container_id,
+            provider_build_id: self.provider_build_id,
         }
     }
 
@@ -1211,16 +1281,26 @@ pub fn run(cfg: &Config, target: Target) -> anyhow::Result<Capture> {
     program(&loaded, "TARGET", &0u64.to_le_bytes())?;
 
     // Acquire the target (spawn stopped; --pid pinned).
-    let (pid, pin, spawn) = match target {
+    let (pid, pin, spawn, cmdline) = match target {
         Target::Spawn { argv } => {
+            let cmdline = argv.join(" ");
             let pid = spawn_stopped(&argv).map_err(|e| anyhow::anyhow!("spawn: {e:#}"))?;
-            (pid, None, true)
+            (pid, None, true, cmdline)
         }
         Target::Pid(p) => {
             let pin = pin::pin(p).map_err(|e| anyhow::anyhow!("pin: {e:#}"))?;
-            (p, Some(pin), false)
+            (p, Some(pin), false, cmdline_of(p))
         }
     };
+    // Target-identity snapshot at acquisition (the target may be
+    // dead by report time — /proc reads then would miss).
+    let acq_wall = SystemTime::now();
+    let container_id = container_id_of(pid);
+    let kernel = crate::doctor::uname_release();
+    let provider_build_id = std::fs::read(&cfg.provider)
+        .ok()
+        .and_then(|b| elf::read_build_id(&b))
+        .unwrap_or_else(|| "unknown".to_string());
     // Non-reaping death probe during harvest (reaping would race
     // harvest's own pin); the poll loop reaps via waitpid.
     let should_stop = || interrupted() || (spawn && child_gone(pid));
@@ -1270,6 +1350,12 @@ pub fn run(cfg: &Config, target: Target) -> anyhow::Result<Capture> {
                 child_exit: None,
                 window_start: Instant::now(),
                 window_end: Instant::now(),
+                window_start_wall: acq_wall,
+                window_end_wall: acq_wall,
+                kernel_release: kernel.clone(),
+                target_cmdline: cmdline.clone(),
+                target_container_id: container_id.clone(),
+                provider_build_id: provider_build_id.clone(),
                 harvest_doc: serde_json::json!({}),
                 legacy: serde_json::Value::Null,
             };
@@ -1315,6 +1401,12 @@ pub fn run(cfg: &Config, target: Target) -> anyhow::Result<Capture> {
         child_exit: None,
         window_start: Instant::now(),
         window_end: Instant::now(),
+        window_start_wall: acq_wall,
+        window_end_wall: acq_wall,
+        kernel_release: kernel,
+        target_cmdline: cmdline,
+        target_container_id: container_id,
+        provider_build_id,
         harvest_doc: doc.clone(),
         legacy: doc.get("legacy").cloned().unwrap_or(serde_json::Value::Null),
     };
@@ -1365,6 +1457,7 @@ pub fn run(cfg: &Config, target: Target) -> anyhow::Result<Capture> {
     eprintln!("CAPTURE window open pid={pid} links={}", engine.links.len());
     engine.window_start = Instant::now();
     engine.window_end = engine.window_start + cfg.duration;
+    engine.window_start_wall = SystemTime::now();
     let live0 = maps::read_maps(pid).unwrap_or_default();
     engine.snapshot = snapshot(pid, &engine.planned_paths(), &live0);
 
@@ -1446,6 +1539,7 @@ pub fn run(cfg: &Config, target: Target) -> anyhow::Result<Capture> {
     }
     // Window close: in-kernel FIRST, then the final drain.
     program(&engine.loaded, "TARGET", &0u64.to_le_bytes())?;
+    engine.window_end_wall = SystemTime::now();
     let actual = engine.window_start.elapsed();
     eprintln!("CAPTURE window closed after={:.1}s", actual.as_secs_f64());
     // Over-budget (P2 exit-3): the window expired while the target
@@ -1762,5 +1856,50 @@ mod tests {
                 ]
             )
         );
+    }
+
+    #[test]
+    fn container_id_parses_runtimes() {
+        let id = "9".repeat(64);
+        // Docker cgroupfs path segment.
+        assert_eq!(
+            parse_container_id(&format!("12:pids:/docker/{id}\n11:memory:/docker/{id}\n")),
+            id
+        );
+        // K8s systemd scope (docker + crio runtimes).
+        assert_eq!(
+            parse_container_id(&format!(
+                "0::/kubepods/burstable/podabc123/docker-{id}.scope\n"
+            )),
+            id
+        );
+        assert_eq!(
+            parse_container_id(&format!(
+                "0::/kubepods-besteffort.slice/kubepods-besteffort-poddef.slice/crio-{id}.scope\n"
+            )),
+            id
+        );
+        // Bare metal / user slice: no id.
+        assert_eq!(parse_container_id("0::/user.slice/user-1000.slice\n"), "");
+        assert_eq!(parse_container_id(""), "");
+        // Short hex is not an id (64 required).
+        assert_eq!(parse_container_id("0::/docker/abc123\n"), "");
+    }
+
+    #[test]
+    fn cmdline_renders_and_truncates() {
+        assert_eq!(render_cmdline(b"nginx\0-g\0daemon off;\0"), "nginx -g daemon off;");
+        assert_eq!(render_cmdline(b""), "");
+        // Kernel threads read empty: no crash, empty string.
+        assert_eq!(render_cmdline(b"\0"), "");
+        let big = vec![b'x'; 9000];
+        let out = render_cmdline(&big);
+        assert!(out.ends_with("[truncated]"), "tail: {}", &out[out.len() - 20..]);
+        assert!(out.len() <= 8192 + "[truncated]".len() + 1);
+    }
+
+    #[test]
+    fn kernel_release_nonempty() {
+        assert!(!crate::doctor::uname_release().is_empty());
     }
 }

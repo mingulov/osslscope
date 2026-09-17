@@ -337,6 +337,12 @@ mod tests {
             drain_wall_us: 0,
             harvest_doc: serde_json::json!({}),
             legacy: serde_json::Value::Null,
+            window_start_wall: std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+            window_end_wall: std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_001),
+            kernel_release: "test-kernel".to_string(),
+            target_cmdline: "t".to_string(),
+            target_container_id: String::new(),
+            provider_build_id: "unknown".to_string(),
         }
     }
 

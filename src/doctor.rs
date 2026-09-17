@@ -129,7 +129,7 @@ fn status_field(status: &str, key: &str) -> Option<String> {
     })
 }
 
-fn uname_release() -> String {
+pub(crate) fn uname_release() -> String {
     // SAFETY: uname writes a fresh struct; read-only after.
     unsafe {
         let mut u: libc::utsname = std::mem::zeroed();
