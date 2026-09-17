@@ -70,6 +70,18 @@ pub fn emit(
     stats: &Stats,
 ) -> anyhow::Result<serde_json::Value> {
     let elf = elf::parse_elf(elf_bytes)?;
+    // Deterministic row order (exit-1 hardening): arrival order is
+    // race-dependent (GO1 queries may predate the stage-2 attach, so
+    // rotation starts mid-array). Sort by (op, claimed name,
+    // funcid) so identical row sets emit identical bytes. Emitted
+    // rows are unique on that triple (disagreements fence, exact
+    // dupes dedupe upstream); the addr tiebreak only orders
+    // same-key rows, which never emit — its ASLR instability is
+    // therefore unobservable. Sorted before fencing.
+    let mut rows_sorted: Vec<Row> = rows.to_vec();
+    rows_sorted
+        .sort_by(|a, b| (a.op, &a.alg, a.funcid, a.addr).cmp(&(b.op, &b.alg, b.funcid, b.addr)));
+    let rows: &[Row] = &rows_sorted;
     // M4 fence (P1 exit 4): discovery tables are not semantic
     // authority. Same (op, claimed-name, funcid) at >1 distinct impl
     // address = the provider contradicts itself (shifting tables; P1
@@ -316,14 +328,18 @@ mod tests {
         .unwrap();
         let jrows = doc["rows"].as_array().unwrap();
         assert_eq!(jrows.len(), 3);
-        assert_eq!(jrows[0]["alg_class"], "SHA2-256");
-        assert_eq!(jrows[0]["weak"], false);
+        // Sorted by (op, claimed name, funcid): MD5 < SHA2-256 <
+        // canary-DOOM-7QZ in byte order.
+        let classes: Vec<&str> = jrows
+            .iter()
+            .map(|r| r["alg_class"].as_str().unwrap())
+            .collect();
+        assert_eq!(classes, vec!["MD5", "SHA2-256", "other"]);
+        assert_eq!(jrows[1]["weak"], false);
         // Canary bytes never survive emission.
-        assert_eq!(jrows[1]["alg_class"], "other");
-        assert!(jrows[1].get("alg").is_none());
-        assert_eq!(jrows[2]["alg_class"], "MD5");
-        assert_eq!(jrows[2]["weak"], true);
-        let r = &jrows[0];
+        assert!(jrows[2].get("alg").is_none());
+        assert_eq!(jrows[0]["weak"], true);
+        let r = &jrows[1];
         assert_eq!(r["addr_backed"], true);
         assert_eq!(
             r["addr_hash"],
