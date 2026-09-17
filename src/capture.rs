@@ -650,6 +650,14 @@ impl<'a> Engine<'a> {
         v
     }
 
+    /// Target liveness: pin for `--pid`, non-reaping probe for spawn.
+    fn target_gone(&self) -> bool {
+        match &self.pin {
+            Some(p) => p.verify().is_err(),
+            None => child_gone(self.pid),
+        }
+    }
+
     /// Plan + attach the basis rows' not-yet-attached sites at the
     /// current generation. Re-plans skip surviving sites (their links
     /// persist across remaps — re-attaching would double-fire).
@@ -787,6 +795,15 @@ impl<'a> Engine<'a> {
         if kinds.contains(&FenceKind::ProviderChanged) {
             self.counters.provider_changed += 1;
         }
+        // Dead target: the window is about to close via child-exit
+        // (spawn) or recycle (`--pid`) — re-harvesting a corpse
+        // observes nothing and re-planning against a zombie's empty
+        // maps cries false "unmapped" missed. Skip both LOUDLY (the
+        // new paths stay unobserved — never silent).
+        if self.target_gone() {
+            self.reason("reharvest-skipped");
+            return Ok(());
+        }
         // Targeted re-harvest: new X files only (cached hits skip).
         let mut fresh: Vec<(String, String, u64)> = next
             .mapset
@@ -852,6 +869,14 @@ impl<'a> Engine<'a> {
                     self.reason("reharvest-failed");
                 }
             }
+        }
+        // The child may have exited DURING a long re-harvest (its
+        // drain breaks early via should_stop): re-planning against a
+        // zombie's empty maps would cry false "unmapped" missed for
+        // healthy rows. Skip LOUDLY instead.
+        if self.target_gone() {
+            self.reason("replan-skipped");
+            return Ok(());
         }
         // Re-plan over the mapped union (initial + cached rows).
         // Rows whose file is currently UNMAPPED are dormant, not
