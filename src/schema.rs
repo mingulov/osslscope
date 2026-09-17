@@ -100,10 +100,9 @@ mod tests {
             .collect();
         entries.sort();
         for f in entries {
-            let doc: serde_json::Value = serde_json::from_str(
-                &std::fs::read_to_string(format!("{dir}/{f}")).unwrap(),
-            )
-            .unwrap();
+            let doc: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(format!("{dir}/{f}")).unwrap())
+                    .unwrap();
             let v = doc["schema_version"].as_str().unwrap();
             assert!(check_version(v), "{f}: reader rejects {v}");
             assert_required_keys(&schema, &doc);

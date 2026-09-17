@@ -615,8 +615,10 @@ fn fips_touched(rows: &[serde_json::Value]) -> bool {
     // Provider names are .so file stems ("fips.so" -> "fips");
     // accept a version suffix ("fips.so.3" -> "fips.so").
     rows.iter().any(|r| {
-        matches!(r.get("provider").and_then(|p| p.as_str()),
-            Some("fips") | Some("fips.so"))
+        matches!(
+            r.get("provider").and_then(|p| p.as_str()),
+            Some("fips") | Some("fips.so")
+        )
     })
 }
 
@@ -762,8 +764,7 @@ fn merge_legacy(acc: &mut serde_json::Value, next: &serde_json::Value) {
     if let (Some(a), Some(n)) = (
         acc.pointer("/legacy_provider/executed_calls")
             .and_then(|v| v.as_u64()),
-        next
-            .pointer("/legacy_provider/executed_calls")
+        next.pointer("/legacy_provider/executed_calls")
             .and_then(|v| v.as_u64()),
     ) {
         *acc.pointer_mut("/legacy_provider/executed_calls").unwrap() = serde_json::json!(a + n);
@@ -803,9 +804,10 @@ fn merge_legacy(acc: &mut serde_json::Value, next: &serde_json::Value) {
                 n.pointer("/name").and_then(|v| v.as_str()).unwrap_or(""),
             );
             match a_list.iter_mut().find(|a| {
-                (a.pointer("/class").and_then(|v| v.as_str()).unwrap_or(""),
-                 a.pointer("/name").and_then(|v| v.as_str()).unwrap_or(""))
-                    == key
+                (
+                    a.pointer("/class").and_then(|v| v.as_str()).unwrap_or(""),
+                    a.pointer("/name").and_then(|v| v.as_str()).unwrap_or(""),
+                ) == key
             }) {
                 Some(a) => {
                     let (a_rank, n_rank) = (
@@ -824,8 +826,14 @@ fn merge_legacy(acc: &mut serde_json::Value, next: &serde_json::Value) {
         }
         a_list.sort_by_key(|v| {
             (
-                v.pointer("/class").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                v.pointer("/name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                v.pointer("/class")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                v.pointer("/name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
             )
         });
     }
@@ -852,9 +860,7 @@ fn pending_sites(
     sites
         .iter()
         .enumerate()
-        .filter(|(_, (off, _))| {
-            !attached.contains(&(path.to_string(), dev.to_string(), ino, *off))
-        })
+        .filter(|(_, (off, _))| !attached.contains(&(path.to_string(), dev.to_string(), ino, *off)))
         .map(|(i, (off, ck))| (i, *off, *ck))
         .collect()
 }
@@ -908,18 +914,12 @@ struct Engine<'a> {
 /// (cookies are attach-sequence numbers).
 fn sort_executions(executions: &mut [Execution]) {
     executions.sort_by(|a, b| {
-        (
-            a.id.op,
-            &a.id.provider,
-            &a.id.alg_class,
-            a.id.funcid,
-        )
-            .cmp(&(
-                b.id.op,
-                &b.id.provider,
-                &b.id.alg_class,
-                b.id.funcid,
-            ))
+        (a.id.op, &a.id.provider, &a.id.alg_class, a.id.funcid).cmp(&(
+            b.id.op,
+            &b.id.provider,
+            &b.id.alg_class,
+            b.id.funcid,
+        ))
     });
 }
 
@@ -1427,7 +1427,10 @@ pub fn run(cfg: &Config, target: Target) -> anyhow::Result<Capture> {
         provider_path,
         image_digest,
         harvest_doc: doc.clone(),
-        legacy: doc.get("legacy").cloned().unwrap_or(serde_json::Value::Null),
+        legacy: doc
+            .get("legacy")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
     };
     // Initial-harvest blind spots (same PARTIAL rule as re-harvests).
     let (misses, blind) = legacy_blind(&engine.legacy);
@@ -1810,8 +1813,12 @@ mod tests {
         assert_eq!(acc["findings"].as_array().unwrap().len(), 2);
         assert_eq!(acc["flags"].as_array().unwrap().len(), 2);
         // Entries: observed wins, probed ORs, order deterministic.
-        let dh = acc["entries"].as_array().unwrap().iter()
-            .find(|e| e["name"] == "DH_meth_new").unwrap();
+        let dh = acc["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["name"] == "DH_meth_new")
+            .unwrap();
         assert_eq!(dh["state"], "observed");
         assert_eq!(dh["probed"], true);
         // Capability: max, not sum.
@@ -1848,10 +1855,7 @@ mod tests {
     #[test]
     fn legacy_blind_counts_engine_and_reasons() {
         // Null / clean legacy: no misses, no reasons.
-        assert_eq!(
-            legacy_blind(&serde_json::Value::Null),
-            (0, Vec::new())
-        );
+        assert_eq!(legacy_blind(&serde_json::Value::Null), (0, Vec::new()));
         assert_eq!(
             legacy_blind(&serde_json::json!({"engine": {}, "capability": {}})),
             (0, Vec::new())
@@ -1949,13 +1953,20 @@ mod tests {
 
     #[test]
     fn cmdline_renders_and_truncates() {
-        assert_eq!(render_cmdline(b"nginx\0-g\0daemon off;\0"), "nginx -g daemon off;");
+        assert_eq!(
+            render_cmdline(b"nginx\0-g\0daemon off;\0"),
+            "nginx -g daemon off;"
+        );
         assert_eq!(render_cmdline(b""), "");
         // Kernel threads read empty: no crash, empty string.
         assert_eq!(render_cmdline(b"\0"), "");
         let big = vec![b'x'; 9000];
         let out = render_cmdline(&big);
-        assert!(out.ends_with("[truncated]"), "tail: {}", &out[out.len() - 20..]);
+        assert!(
+            out.ends_with("[truncated]"),
+            "tail: {}",
+            &out[out.len() - 20..]
+        );
         assert!(out.len() <= 8192 + "[truncated]".len() + 1);
     }
 

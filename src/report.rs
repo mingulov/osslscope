@@ -305,7 +305,12 @@ pub(crate) fn op_display(id: u32) -> String {
     crate::kinds::OPS
         .iter()
         .find(|o| o.id == id)
-        .map(|o| o.name.strip_prefix("OSSL_OP_").unwrap_or(o.name).to_string())
+        .map(|o| {
+            o.name
+                .strip_prefix("OSSL_OP_")
+                .unwrap_or(o.name)
+                .to_string()
+        })
         .unwrap_or_else(|| format!("OP{id}"))
 }
 
@@ -463,7 +468,10 @@ fn human_legacy(legacy: &serde_json::Value, s: &mut String) {
                 }
                 _ => {
                     abs += 1;
-                    if e.pointer("/probed").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    if e.pointer("/probed")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                    {
                         probed_quiet += 1;
                     }
                 }
@@ -487,9 +495,7 @@ fn human_legacy(legacy: &serde_json::Value, s: &mut String) {
             .map(|m| m.values().map(|v| v.as_u64().unwrap_or(0)).sum())
             .unwrap_or(0)
     };
-    let num = |ptr: &str| -> u64 {
-        legacy.pointer(ptr).and_then(|v| v.as_u64()).unwrap_or(0)
-    };
+    let num = |ptr: &str| -> u64 { legacy.pointer(ptr).and_then(|v| v.as_u64()).unwrap_or(0) };
     let strs = |ptr: &str| -> Vec<String> {
         legacy
             .pointer(ptr)
@@ -501,7 +507,10 @@ fn human_legacy(legacy: &serde_json::Value, s: &mut String) {
             })
             .unwrap_or_default()
     };
-    s.push_str(&format!("  ENGINE calls: {}\n", grouped(map_sum("/engine/calls_by_entrypoint"))));
+    s.push_str(&format!(
+        "  ENGINE calls: {}\n",
+        grouped(map_sum("/engine/calls_by_entrypoint"))
+    ));
     let ids: Vec<String> = ["dynamic", "builtin", "other"]
         .iter()
         .filter_map(|k| {
@@ -768,7 +777,10 @@ mod tests {
         assert_eq!(d["kernel"], "test-kernel");
         assert_eq!(d["provider"]["path"], "/p/provider.so");
         assert_eq!(d["provider"]["build_id"], "unknown");
-        assert!(d.get("policy").is_none(), "report omits policy (check adds it)");
+        assert!(
+            d.get("policy").is_none(),
+            "report omits policy (check adds it)"
+        );
         assert!(d.get("kat").is_none(), "v1 has no KAT discriminator");
         let d = doc(&cap(capture::Outcome::Partial, None));
         assert!(d.get("child_exit").is_none());
@@ -1076,7 +1088,10 @@ note: alg-name-only strength (key sizes unobservable); window-only claims\n";
 
     #[test]
     fn goldens_partial_cells() {
-        assert_golden("report-partial-no-query.json", &json_of(&partial(&["no-query"])));
+        assert_golden(
+            "report-partial-no-query.json",
+            &json_of(&partial(&["no-query"])),
+        );
         let interrupted = partial(&["interrupted"]);
         assert_golden("report-partial-interrupted.json", &json_of(&interrupted));
         assert_golden("report-partial-interrupted.txt", &human(&interrupted));
@@ -1146,7 +1161,10 @@ note: alg-name-only strength (key sizes unobservable); window-only claims\n";
             last_ns: 0,
         }];
         assert_golden("cbom-partial.json", &cbom_json(&p));
-        let mut f = cap(capture::Outcome::Fatal(capture::FatalKind::AttachZero), None);
+        let mut f = cap(
+            capture::Outcome::Fatal(capture::FatalKind::AttachZero),
+            None,
+        );
         f.reasons = vec!["pid-recycled".to_string()];
         assert_golden("cbom-fatal.json", &cbom_json(&f));
     }
@@ -1187,9 +1205,16 @@ note: alg-name-only strength (key sizes unobservable); window-only claims\n";
         assert_eq!(b["specVersion"], "1.6");
         assert_eq!(b["version"], 1);
         assert_eq!(b["metadata"]["timestamp"], "2023-11-14T22:13:21Z");
-        assert!(b["metadata"].get("properties").is_none(), "clean: no disclaimer");
+        assert!(
+            b["metadata"].get("properties").is_none(),
+            "clean: no disclaimer"
+        );
         let comps = b["components"].as_array().unwrap();
-        assert_eq!(comps.len(), 4, "one component per execution (stale detail empty)");
+        assert_eq!(
+            comps.len(),
+            4,
+            "one component per execution (stale detail empty)"
+        );
         let c0 = &comps[0];
         assert_eq!(c0["type"], "cryptographic-asset");
         assert_eq!(c0["cryptoProperties"]["assetType"], "algorithm");
@@ -1261,7 +1286,10 @@ note: alg-name-only strength (key sizes unobservable); window-only claims\n";
         assert!(dis[0]["value"].as_str().unwrap().contains("cold-gap"));
         assert_eq!(b["components"].as_array().unwrap().len(), 0);
         // FATAL: empty components + FATAL disclaimer (uniform shape).
-        let f = cap(capture::Outcome::Fatal(capture::FatalKind::AttachZero), None);
+        let f = cap(
+            capture::Outcome::Fatal(capture::FatalKind::AttachZero),
+            None,
+        );
         let b = cbom(&f);
         assert_eq!(b["components"].as_array().unwrap().len(), 0);
         let v = b["metadata"]["properties"][0]["value"].as_str().unwrap();
@@ -1272,12 +1300,30 @@ note: alg-name-only strength (key sizes unobservable); window-only claims\n";
     fn cbom_flag_parses() {
         let v = |s: Vec<&str>| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
         let a = parse(&v(vec![
-            "--provider", "p", "--object", "o", "--count-object", "c", "--pid", "9",
-            "--cbom", "/tmp/x.cdx.json",
+            "--provider",
+            "p",
+            "--object",
+            "o",
+            "--count-object",
+            "c",
+            "--pid",
+            "9",
+            "--cbom",
+            "/tmp/x.cdx.json",
         ]))
         .unwrap();
         assert_eq!(a.cbom, Some("/tmp/x.cdx.json".to_string()));
-        let a = parse(&v(vec!["--provider", "p", "--object", "o", "--count-object", "c", "--pid", "9"])).unwrap();
+        let a = parse(&v(vec![
+            "--provider",
+            "p",
+            "--object",
+            "o",
+            "--count-object",
+            "c",
+            "--pid",
+            "9",
+        ]))
+        .unwrap();
         assert_eq!(a.cbom, None);
     }
 
@@ -1294,13 +1340,36 @@ note: alg-name-only strength (key sizes unobservable); window-only claims\n";
     #[test]
     fn duration_defaults_to_30s() {
         let v = |s: Vec<&str>| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
-        let no_dur = vec!["--provider", "p", "--object", "o", "--count-object", "c", "--pid", "9"];
-        assert_eq!(parse(&v(no_dur)).unwrap().cfg.duration, Duration::from_secs(30));
-        let explicit = vec![
-            "--duration", "5", "--provider", "p", "--object", "o", "--count-object", "c",
-            "--pid", "9",
+        let no_dur = vec![
+            "--provider",
+            "p",
+            "--object",
+            "o",
+            "--count-object",
+            "c",
+            "--pid",
+            "9",
         ];
-        assert_eq!(parse(&v(explicit)).unwrap().cfg.duration, Duration::from_secs(5));
+        assert_eq!(
+            parse(&v(no_dur)).unwrap().cfg.duration,
+            Duration::from_secs(30)
+        );
+        let explicit = vec![
+            "--duration",
+            "5",
+            "--provider",
+            "p",
+            "--object",
+            "o",
+            "--count-object",
+            "c",
+            "--pid",
+            "9",
+        ];
+        assert_eq!(
+            parse(&v(explicit)).unwrap().cfg.duration,
+            Duration::from_secs(5)
+        );
     }
 
     #[test]

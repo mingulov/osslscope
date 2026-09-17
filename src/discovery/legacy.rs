@@ -228,8 +228,14 @@ pub fn flag_for(finding: &str) -> String {
         ("unprobed import: ", "unprobed-imports"),
         ("…and ", "unprobed-imports"),
         ("legacy tripwire attach failed: ", "legacy-attach-failed"),
-        ("provider loads with unreadable names", "unreadable-load-names"),
-        ("engine-id lookups with unreadable ids", "unreadable-engine-ids"),
+        (
+            "provider loads with unreadable names",
+            "unreadable-load-names",
+        ),
+        (
+            "engine-id lookups with unreadable ids",
+            "unreadable-engine-ids",
+        ),
     ] {
         if finding.starts_with(prefix) {
             return slug.to_string();
@@ -626,8 +632,18 @@ pub fn section(inp: &SectionInputs) -> serde_json::Value {
         .filter(|(_, n)| **n > 0)
         .map(|(s, _)| s.as_str())
         .collect();
-    let eng_un: HashSet<&str> = inp.set.unprobed_engine_syms.iter().map(|s| s.as_str()).collect();
-    let meth_un: HashSet<&str> = inp.set.unprobed_meth_syms.iter().map(|s| s.as_str()).collect();
+    let eng_un: HashSet<&str> = inp
+        .set
+        .unprobed_engine_syms
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
+    let meth_un: HashSet<&str> = inp
+        .set
+        .unprobed_meth_syms
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
     let mut entries: Vec<serde_json::Value> = Vec::new();
     for e in crate::kinds::ENGINE {
         if matches!(e.class, crate::kinds::EngineClass::Other) {
@@ -973,14 +989,8 @@ mod tests {
             flag_for("tripwire cap (120) exceeded: 5 imports unprobed"),
             "tripwire-cap-exceeded"
         );
-        assert_eq!(
-            flag_for("unprobed import: FOO (/app)"),
-            "unprobed-imports"
-        );
-        assert_eq!(
-            flag_for("…and 3 more unprobed imports"),
-            "unprobed-imports"
-        );
+        assert_eq!(flag_for("unprobed import: FOO (/app)"), "unprobed-imports");
+        assert_eq!(flag_for("…and 3 more unprobed imports"), "unprobed-imports");
         assert_eq!(
             flag_for("legacy tripwire attach failed: EINVAL"),
             "legacy-attach-failed"

@@ -274,7 +274,14 @@ fn plan_legacy_trips(
         // legacy stays unattributed (documented edge).
         if let Some(off) = off {
             if let Err(e) = attach_pair(
-                loaded, links, "init_entry", "init_return", off, &cand, pid, LEGACY_COOKIE,
+                loaded,
+                links,
+                "init_entry",
+                "init_return",
+                off,
+                &cand,
+                pid,
+                LEGACY_COOKIE,
             ) {
                 // Loud in-doc (executed_calls would read a
                 // false 0); the run continues for tripwires.
@@ -742,9 +749,7 @@ pub fn run_detailed(
                         if let Ok(live) = maps::read_maps(cfg.pid) {
                             let path = if cookie == LEGACY_COOKIE {
                                 live.iter()
-                                    .find(|m| {
-                                        m.start <= addr && addr < m.end && m.ino != 0
-                                    })
+                                    .find(|m| m.start <= addr && addr < m.end && m.ino != 0)
                                     .map(|m| PathBuf::from(&m.path))
                             } else {
                                 Some(cfg.provider.clone())

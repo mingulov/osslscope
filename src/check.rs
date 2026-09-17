@@ -414,7 +414,10 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         }
     }
     if rules.is_empty() {
-        return Err("check needs at least one rule (a ruleness pass would mask a misconfigured gate)".to_string());
+        return Err(
+            "check needs at least one rule (a ruleness pass would mask a misconfigured gate)"
+                .to_string(),
+        );
     }
     Ok(Args {
         cfg: capture::Config {
@@ -577,7 +580,11 @@ fn human(c: &capture::Capture, v: &Verdict) -> String {
         }
         for r in v.results.iter().filter(|r| r.passed) {
             if r.value.is_empty() {
-                s.push_str(&format!("  [{}] pass ({} calls)\n", r.rule, grouped(r.matches)));
+                s.push_str(&format!(
+                    "  [{}] pass ({} calls)\n",
+                    r.rule,
+                    grouped(r.matches)
+                ));
             } else {
                 s.push_str(&format!(
                     "  [{} {}] pass ({} calls)\n",
@@ -831,7 +838,10 @@ mod tests {
         let v = evaluate(&c, &r);
         assert_eq!(v.violations.len(), 1);
         let x = &v.violations[0];
-        assert_eq!((x.rule.as_str(), x.matcher.as_str()), ("deny-engine", "ENGINE_init"));
+        assert_eq!(
+            (x.rule.as_str(), x.matcher.as_str()),
+            ("deny-engine", "ENGINE_init")
+        );
         assert_eq!(x.op_name, "ENGINE");
         assert_eq!(x.count, 2);
         assert_eq!((x.first_ns, x.last_ns), (None, None));
@@ -846,20 +856,44 @@ mod tests {
     fn parse_rules_matrix() {
         let v = |s: Vec<&str>| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
         let base = vec![
-            "--provider", "p", "--object", "o", "--count-object", "c", "--pid", "9",
+            "--provider",
+            "p",
+            "--object",
+            "o",
+            "--count-object",
+            "c",
+            "--pid",
+            "9",
         ];
         // Full ruleset, repeatable flags accumulate.
         let mut full = base.clone();
         full.extend([
-            "--require-provider", "default", "--deny-provider", "fips",
-            "--deny-provider", "acme", "--deny-engine", "--deny-algorithm", "DES",
-            "--deny-algorithm", "RC2", "--deny-weak", "--require-executed", "SHA-256",
+            "--require-provider",
+            "default",
+            "--deny-provider",
+            "fips",
+            "--deny-provider",
+            "acme",
+            "--deny-engine",
+            "--deny-algorithm",
+            "DES",
+            "--deny-algorithm",
+            "RC2",
+            "--deny-weak",
+            "--require-executed",
+            "SHA-256",
         ]);
         let a = parse(&v(full)).unwrap();
         assert_eq!(a.rules.require_provider, vec!["default".to_string()]);
-        assert_eq!(a.rules.deny_provider, vec!["fips".to_string(), "acme".to_string()]);
+        assert_eq!(
+            a.rules.deny_provider,
+            vec!["fips".to_string(), "acme".to_string()]
+        );
         assert!(a.rules.deny_engine);
-        assert_eq!(a.rules.deny_algorithm, vec!["DES".to_string(), "RC2".to_string()]);
+        assert_eq!(
+            a.rules.deny_algorithm,
+            vec!["DES".to_string(), "RC2".to_string()]
+        );
         assert!(a.rules.deny_weak);
         assert_eq!(a.rules.require_executed, vec!["SHA-256".to_string()]);
         assert_eq!(a.cfg.duration, Duration::from_secs(30));
@@ -899,8 +933,12 @@ mod tests {
         r.require_executed = vec!["SHA-256".to_string()];
         let v = evaluate(&c, &r);
         let w = "1970-01-01T00:00:00Z - 1970-01-01T00:00:00Z";
-        let tup = "window=".to_string() + w + " cmdline=\"t\" container=(none) image=(none) provider=/p build=unknown";
-        let want = format!("osslscope check: VIOLATION (2 rules violated, 0 passed) pid=7 (t)\n  [deny-algorithm DES] DES via default: 500 calls (CIPHER funcid=21) {tup}\n  [require-executed SHA-256] not observed in window {tup}\nevidence: status=PARTIAL reasons=cold-gap counters[cold_gap=5]\nabsence = not-observed in window (never \"not present / never used\")\nnote: --deny-algorithm is blind to SIGN/MAC/KDF digest selection (param values never captured)\nnote: alg-name-only strength (key sizes unobservable); window-only claims\n");
+        let tup = "window=".to_string()
+            + w
+            + " cmdline=\"t\" container=(none) image=(none) provider=/p build=unknown";
+        let want = format!(
+            "osslscope check: VIOLATION (2 rules violated, 0 passed) pid=7 (t)\n  [deny-algorithm DES] DES via default: 500 calls (CIPHER funcid=21) {tup}\n  [require-executed SHA-256] not observed in window {tup}\nevidence: status=PARTIAL reasons=cold-gap counters[cold_gap=5]\nabsence = not-observed in window (never \"not present / never used\")\nnote: --deny-algorithm is blind to SIGN/MAC/KDF digest selection (param values never captured)\nnote: alg-name-only strength (key sizes unobservable); window-only claims\n"
+        );
         assert_eq!(human(&c, &v), want);
     }
 
@@ -914,9 +952,15 @@ mod tests {
         r.deny_weak = true;
         let v = evaluate(&c, &r);
         let out = human(&c, &v);
-        assert!(out.starts_with("osslscope check: PASS (2 passed) pid=7 (t)\n"), "{out}");
+        assert!(
+            out.starts_with("osslscope check: PASS (2 passed) pid=7 (t)\n"),
+            "{out}"
+        );
         assert!(out.contains("  [deny-weak] pass (0 calls)\n"), "{out}");
-        assert!(out.contains("  [require-executed SHA-256] pass (5 calls)\n"), "{out}");
+        assert!(
+            out.contains("  [require-executed SHA-256] pass (5 calls)\n"),
+            "{out}"
+        );
         assert!(out.contains("evidence: status=COMPLETE\n"), "{out}");
         // Mixed: violations first, then passes (rule order within).
         let mut r = rules();
@@ -938,14 +982,20 @@ mod tests {
         r.deny_weak = true;
         let v = evaluate(&c, &r);
         let out = human(&c, &v);
-        assert!(out.starts_with("osslscope check: NO VERDICT (FATAL evidence; run doctor) pid=7 (t)\n"), "{out}");
+        assert!(
+            out.starts_with("osslscope check: NO VERDICT (FATAL evidence; run doctor) pid=7 (t)\n"),
+            "{out}"
+        );
         // Unseen deny-provider note.
         let c = cap(capture::Outcome::Complete);
         let mut r = rules();
         r.deny_provider = vec!["fips".to_string()];
         let v = evaluate(&c, &r);
         let out = human(&c, &v);
-        assert!(out.contains("note: --deny-provider matched nothing (verify spelling): fips\n"), "{out}");
+        assert!(
+            out.contains("note: --deny-provider matched nothing (verify spelling): fips\n"),
+            "{out}"
+        );
     }
 
     #[test]
@@ -984,7 +1034,10 @@ mod tests {
         r2.deny_weak = true;
         assert_eq!(policy_json(&c2, &evaluate(&c2, &r2))["verdict"], "pass");
         let c3 = cap(capture::Outcome::Fatal(capture::FatalKind::AttachZero));
-        assert_eq!(policy_json(&c3, &evaluate(&c3, &r2))["verdict"], "no-verdict");
+        assert_eq!(
+            policy_json(&c3, &evaluate(&c3, &r2))["verdict"],
+            "no-verdict"
+        );
     }
 
     #[test]
@@ -1071,7 +1124,10 @@ mod tests {
         r.deny_weak = true;
         let v = evaluate(&c, &r);
         assert!(v.no_verdict);
-        assert!(v.violations.is_empty(), "never a violation without evidence");
+        assert!(
+            v.violations.is_empty(),
+            "never a violation without evidence"
+        );
         assert!(v.results.is_empty());
     }
 }
