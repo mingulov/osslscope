@@ -942,6 +942,7 @@ pub fn run(cfg: &Config, target: Target) -> anyhow::Result<Capture> {
     }
     // Window open (in-kernel first).
     program(&engine.loaded, "TARGET", &(pid as u64).to_le_bytes())?;
+    eprintln!("CAPTURE window open pid={pid} links={}", engine.links.len());
     engine.window_start = Instant::now();
     engine.window_end = engine.window_start + cfg.duration;
     let live0 = maps::read_maps(pid).unwrap_or_default();
@@ -1004,6 +1005,7 @@ pub fn run(cfg: &Config, target: Target) -> anyhow::Result<Capture> {
     // Window close: in-kernel FIRST, then the final drain.
     program(&engine.loaded, "TARGET", &0u64.to_le_bytes())?;
     let actual = engine.window_start.elapsed();
+    eprintln!("CAPTURE window closed after={:.1}s", actual.as_secs_f64());
     // One last ppid sweep at window end (§7).
     for kid in children_of(pid) {
         if engine.children_seen.insert(kid) {
