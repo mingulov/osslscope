@@ -1,0 +1,74 @@
+{
+  "checks": [
+    {
+      "id": "kernel",
+      "message": "features ok (kprobe-load, ringbuf, uprobe-multi+cookies, probe_read_user) on 6.9.12-060912-generic (informational)",
+      "status": "pass"
+    },
+    {
+      "id": "token-support",
+      "message": "BPF_TOKEN_CREATE present (6.9+ floor signal; tokens debug-only, never used for privilege)",
+      "status": "info"
+    },
+    {
+      "id": "caps",
+      "message": "CAP_SYS_ADMIN effective",
+      "status": "pass"
+    },
+    {
+      "id": "btf",
+      "message": "BTF present (optional — probe path has zero BTF dependence)",
+      "status": "info"
+    },
+    {
+      "id": "lockdown",
+      "message": "lockdown=none (BPF allowed)",
+      "status": "pass"
+    },
+    {
+      "id": "ima",
+      "message": "IMA active (informational — no known BPF interaction)",
+      "status": "info"
+    },
+    {
+      "id": "lsm",
+      "message": "no LSM denial (BPF+perf ops succeed; active: lockdown,capability,landlock,yama,apparmor,ima,evm)",
+      "status": "pass"
+    },
+    {
+      "id": "seccomp",
+      "message": "no seccomp filter (NNP=0)",
+      "status": "info"
+    },
+    {
+      "id": "pidns",
+      "message": "target is in a different pid namespace — attach sees wrong PIDs",
+      "remediation": "nsenter -t <pid> -p -- osslscope <cmd> ...",
+      "status": "fail"
+    },
+    {
+      "id": "foreign-uid",
+      "message": "same-uid target (uid 0) — no foreign-uid probe needed",
+      "status": "info"
+    },
+    {
+      "id": "target-access",
+      "message": "target maps readable",
+      "status": "pass"
+    },
+    {
+      "id": "libcrypto-found",
+      "message": "no libcrypto.so mapped in target (static link? non-crypto process?)",
+      "remediation": "inspect needs a dynamically-linked libcrypto target",
+      "status": "fail"
+    }
+  ],
+  "exit": 4,
+  "target": {
+    "exe": "sleep",
+    "libcrypto": null,
+    "self_uid": 0,
+    "uid": 0
+  },
+  "verdict": "fail-closed"
+}

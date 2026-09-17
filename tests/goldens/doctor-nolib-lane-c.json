@@ -1,0 +1,73 @@
+{
+  "checks": [
+    {
+      "id": "kernel",
+      "message": "features ok (kprobe-load, ringbuf, uprobe-multi+cookies, probe_read_user) on 6.9.12-060912-generic (informational)",
+      "status": "pass"
+    },
+    {
+      "id": "token-support",
+      "message": "BPF_TOKEN_CREATE present (6.9+ floor signal; tokens debug-only, never used for privilege)",
+      "status": "info"
+    },
+    {
+      "id": "caps",
+      "message": "CAP_SYS_ADMIN effective",
+      "status": "pass"
+    },
+    {
+      "id": "btf",
+      "message": "BTF present (optional — probe path has zero BTF dependence)",
+      "status": "info"
+    },
+    {
+      "id": "lockdown",
+      "message": "lockdown=none (BPF allowed)",
+      "status": "pass"
+    },
+    {
+      "id": "ima",
+      "message": "IMA active (informational — no known BPF interaction)",
+      "status": "info"
+    },
+    {
+      "id": "lsm",
+      "message": "no LSM denial (BPF+perf ops succeed; active: lockdown,capability,landlock,yama,apparmor,ima,evm)",
+      "status": "pass"
+    },
+    {
+      "id": "seccomp",
+      "message": "no seccomp filter (NNP=0)",
+      "status": "info"
+    },
+    {
+      "id": "pidns",
+      "message": "same pid namespace",
+      "status": "pass"
+    },
+    {
+      "id": "foreign-uid",
+      "message": "target uid 1000: maps readable via PTRACE; PERFMON-only child denied → carve-out absent (PTRACE required)",
+      "status": "pass"
+    },
+    {
+      "id": "target-access",
+      "message": "target maps readable",
+      "status": "pass"
+    },
+    {
+      "id": "libcrypto-found",
+      "message": "no libcrypto.so mapped in target (static link? non-crypto process?)",
+      "remediation": "inspect needs a dynamically-linked libcrypto target",
+      "status": "fail"
+    }
+  ],
+  "exit": 4,
+  "target": {
+    "exe": "sleep",
+    "libcrypto": null,
+    "self_uid": 0,
+    "uid": 1000
+  },
+  "verdict": "fail-closed"
+}

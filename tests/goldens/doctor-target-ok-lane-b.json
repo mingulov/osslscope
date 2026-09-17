@@ -1,0 +1,87 @@
+{
+  "checks": [
+    {
+      "id": "kernel",
+      "message": "features ok (kprobe-load, ringbuf, uprobe-multi+cookies, probe_read_user) on 7.0.0-31-generic (informational)",
+      "status": "pass"
+    },
+    {
+      "id": "token-support",
+      "message": "BPF_TOKEN_CREATE present (6.9+ floor signal; tokens debug-only, never used for privilege)",
+      "status": "info"
+    },
+    {
+      "id": "caps",
+      "message": "CAP_SYS_ADMIN effective",
+      "status": "pass"
+    },
+    {
+      "id": "btf",
+      "message": "BTF present (optional — probe path has zero BTF dependence)",
+      "status": "info"
+    },
+    {
+      "id": "lockdown",
+      "message": "lockdown=integrity (BPF allowed)",
+      "status": "pass"
+    },
+    {
+      "id": "ima",
+      "message": "IMA active (informational — no known BPF interaction)",
+      "status": "info"
+    },
+    {
+      "id": "lsm",
+      "message": "no LSM denial (BPF+perf ops succeed; active: lockdown,capability,landlock,yama,apparmor,ima,evm)",
+      "status": "pass"
+    },
+    {
+      "id": "seccomp",
+      "message": "no seccomp filter (NNP=0)",
+      "status": "info"
+    },
+    {
+      "id": "pidns",
+      "message": "same pid namespace",
+      "status": "pass"
+    },
+    {
+      "id": "foreign-uid",
+      "message": "target uid 1000: maps readable via PTRACE; PERFMON-only child also readable → 6.14+ carve-out CONFIRMED on this kernel",
+      "status": "pass"
+    },
+    {
+      "id": "target-access",
+      "message": "target maps readable",
+      "status": "pass"
+    },
+    {
+      "id": "libcrypto-found",
+      "message": "libcrypto: /opt/openssl-4.0.2/lib64/libcrypto.so.4",
+      "status": "pass"
+    },
+    {
+      "id": "arch",
+      "message": "x86-64 (ELFCLASS64, EM_X86_64)",
+      "status": "pass"
+    },
+    {
+      "id": "flavor",
+      "message": "OpenSSL 4.0 (4.x)",
+      "status": "pass"
+    },
+    {
+      "id": "build-id",
+      "message": "known build b12cd44337cb70619dd290b2396ab5dfcaea230f (OpenSSL 4.0.2, query_offset 2402144)",
+      "status": "pass"
+    }
+  ],
+  "exit": 0,
+  "target": {
+    "exe": "map_sleeper",
+    "libcrypto": "/opt/openssl-4.0.2/lib64/libcrypto.so.4",
+    "self_uid": 0,
+    "uid": 1000
+  },
+  "verdict": "ok"
+}
