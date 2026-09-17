@@ -137,12 +137,12 @@ fn attach_pair(
 }
 
 /// Attach legacy tripwires: each probe = its program at its offset
-/// with its cookie (programs loaded once, attached ~800× total).
+/// in its module with its cookie (programs loaded once; API-surface
+/// probes live in libcrypto, low-level probes in caller PLTs).
 fn attach_trips(
     bpf: &mut Ebpf,
     links: &mut Links,
     set: &legacy::ProbeSet,
-    libcrypto: &Path,
     pid: NonZeroU32,
 ) -> anyhow::Result<()> {
     let mut by_prog: HashMap<&str, Vec<&legacy::Probe>> = HashMap::new();
@@ -160,7 +160,7 @@ fn attach_trips(
                 cookie: Some(p.cookie),
             };
             let id = prog
-                .attach(point, libcrypto, UProbeScope::OneProcess(pid))
+                .attach(point, Path::new(&p.module), UProbeScope::OneProcess(pid))
                 .map_err(|e| anyhow!("attach {}@{}: {e}", p.symbol, p.offset))?;
             links.0.push(prog.take_link(id)?);
         }
@@ -233,8 +233,8 @@ fn partial_doc(
 /// linked target — no libcrypto mapping). Pure userspace: the probe
 /// plan over the provider file resolves nothing, and the mandated
 /// finding records the blind spot.
-fn blind_legacy_section(elf_bytes: &[u8]) -> anyhow::Result<serde_json::Value> {
-    let set = legacy::probes_for(elf_bytes)?;
+fn blind_legacy_section(provider: &Path, elf_bytes: &[u8]) -> anyhow::Result<serde_json::Value> {
+    let set = legacy::probes_for(&provider.to_string_lossy(), elf_bytes, &[])?;
     Ok(legacy::section(&legacy::SectionInputs {
         set: &set,
         trip: &HashMap::new(),
@@ -389,8 +389,26 @@ pub fn run(cfg: &Config) -> anyhow::Result<serde_json::Value> {
         if let Some(lc_path) = legacy::find_libcrypto(&maps0) {
             let lc_bytes = std::fs::read(&lc_path)
                 .with_context(|| format!("read target libcrypto {lc_path}"))?;
-            let set = legacy::probes_for(&lc_bytes)?;
-            attach_trips(&mut bpf, &mut links, &set, Path::new(&lc_path), pid)?;
+            // Caller modules for low-level PLT planning. Unreadable
+            // files (deleted-but-mapped, permissions) are loud
+            // findings: their imports stay unknown.
+            let mut mod_bytes: Vec<(String, Vec<u8>)> = Vec::new();
+            let mut unreadable: Vec<String> = Vec::new();
+            for path in legacy::target_modules(&maps0, &lc_path) {
+                match std::fs::read(&path) {
+                    Ok(bytes) => mod_bytes.push((path, bytes)),
+                    Err(_) => unreadable.push(path),
+                }
+            }
+            let modules: Vec<legacy::Module> = mod_bytes
+                .iter()
+                .map(|(p, b)| legacy::Module { path: p, bytes: b })
+                .collect();
+            let mut set = legacy::probes_for(&lc_path, &lc_bytes, &modules)?;
+            for path in &unreadable {
+                set.findings.push(format!("unreadable module: {path}"));
+            }
+            attach_trips(&mut bpf, &mut links, &set, pid)?;
             eprintln!("INSPECT stage=legacy trips={}", set.probes.len());
             for cand in legacy_candidates(cfg.pid, &lc_path) {
                 let off = std::fs::read(&cand)
@@ -428,7 +446,7 @@ pub fn run(cfg: &Config) -> anyhow::Result<serde_json::Value> {
     // (exit-1/2 behavior identical).
     if preset_reason.is_some() && probe_set.is_none() {
         let blind = if cfg.legacy {
-            Some(blind_legacy_section(&elf_bytes)?)
+            Some(blind_legacy_section(&cfg.provider, &elf_bytes)?)
         } else {
             None
         };
@@ -641,7 +659,7 @@ pub fn run(cfg: &Config) -> anyhow::Result<serde_json::Value> {
                 legacy_classes: Vec::new(),
                 extra_findings: &extra_findings,
             })),
-            None => Some(blind_legacy_section(&elf_bytes)?),
+            None => Some(blind_legacy_section(&cfg.provider, &elf_bytes)?),
         }
     } else {
         None
@@ -871,7 +889,7 @@ pub fn run(cfg: &Config) -> anyhow::Result<serde_json::Value> {
                 legacy_classes: classes,
                 extra_findings: &extra_findings,
             }),
-            None => blind_legacy_section(&elf_bytes)?,
+            None => blind_legacy_section(&cfg.provider, &elf_bytes)?,
         };
         doc["legacy"] = l;
     }

@@ -5,6 +5,7 @@
 use crate::kinds::Version;
 use anyhow::{Context as _, bail};
 use goblin::elf::program_header::{PF_X, PT_LOAD, PT_NOTE};
+use std::collections::HashMap;
 
 /// Note type `NT_GNU_BUILD_ID` (3); owner name is `GNU\0`.
 const NT_GNU_BUILD_ID: u32 = 3;
@@ -51,6 +52,80 @@ pub fn dynsym_func_entries(elf_bytes: &[u8]) -> anyhow::Result<Vec<(String, u64)
     }
     out.sort();
     out.dedup();
+    Ok(out)
+}
+
+/// Undefined (imported) FUNC/NOTYPE names from `.dynsym`: the
+/// module's external calls. NOTYPE included (a missed import is a
+/// silent tripwire gap; data imports never match the call-only
+/// taxonomy anyway).
+pub fn und_imports(elf_bytes: &[u8]) -> anyhow::Result<Vec<String>> {
+    use goblin::elf::sym::{STT_FUNC, STT_NOTYPE};
+    let elf = parse_elf(elf_bytes)?;
+    let mut out = Vec::new();
+    for sym in elf.dynsyms.iter() {
+        if sym.st_shndx != 0 {
+            continue;
+        }
+        if sym.st_type() != STT_FUNC && sym.st_type() != STT_NOTYPE {
+            continue;
+        }
+        if let Some(name) = elf.dynstrtab.get_at(sym.st_name) {
+            out.push(name.to_string());
+        }
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+/// PLT stub file offsets for x86-64 imports, by name. JMPREL order
+/// selects the stub: 16B PLT0 + 16B entries in `.plt.sec` (old-style
+/// `.plt` fallback). Empty (not an error) when the object has no PLT
+/// machinery — static, section-less, or non-x86-64 — so the caller
+/// counts those imports as uninstrumented instead of failing.
+pub fn plt_stub_offsets(elf_bytes: &[u8]) -> anyhow::Result<HashMap<String, u64>> {
+    use goblin::elf::header::EM_X86_64;
+    use goblin::elf::reloc::R_X86_64_JUMP_SLOT;
+    let elf = parse_elf(elf_bytes)?;
+    let mut out = HashMap::new();
+    if elf.header.e_machine != EM_X86_64 {
+        return Ok(out);
+    }
+    let mut plt_addr = None;
+    for sh in elf.section_headers.iter() {
+        if let Some(name) = elf.shdr_strtab.get_at(sh.sh_name) {
+            if name == ".plt.sec" {
+                plt_addr = Some(sh.sh_addr);
+                break;
+            }
+            if name == ".plt" {
+                plt_addr = Some(sh.sh_addr);
+            }
+        }
+    }
+    let Some(plt_addr) = plt_addr else {
+        return Ok(out);
+    };
+    let mut idx = 0u64;
+    for reloc in elf.pltrelocs.iter() {
+        if reloc.r_type != R_X86_64_JUMP_SLOT {
+            continue;
+        }
+        let name = elf
+            .dynsyms
+            .get(reloc.r_sym)
+            .and_then(|s| elf.dynstrtab.get_at(s.st_name));
+        // Slot consumed even when the name is unresolvable.
+        let stub = plt_addr + 16 + idx * 16;
+        idx += 1;
+        let (Some(name), Some(off)) = (name, vaddr_to_offset(&elf, stub)) else {
+            continue;
+        };
+        if offset_in_x_segment(&elf, off) {
+            out.insert(name.to_string(), off);
+        }
+    }
     Ok(out)
 }
 
@@ -284,6 +359,56 @@ mod tests {
         assert_eq!(max_openssl_version(s.iter().copied()), None);
         let s: [&str; 0] = [];
         assert_eq!(max_openssl_version(s.iter().copied()), None);
+    }
+
+    #[test]
+    fn plt_resolves_self_imports_in_x() {
+        // Dynamic test binary: every PLT stub is file-backed in X.
+        // (PLT names are NOT all UND: self-interposition stubs like
+        // libc's realloc resolve locally-defined symbols.)
+        let b = self_bytes();
+        let elf = parse_elf(&b).unwrap();
+        let plt = super::plt_stub_offsets(&b).unwrap();
+        assert!(!plt.is_empty(), "dynamic binary without PLT?");
+        let und = super::und_imports(&b).unwrap();
+        assert!(
+            plt.keys().any(|k| und.contains(k)),
+            "no PLT stub serves an actual import?"
+        );
+        for (name, off) in &plt {
+            assert!(*off < b.len() as u64, "{name} stub past EOF");
+            assert!(offset_in_x_segment(&elf, *off), "{name} stub not in X");
+        }
+    }
+
+    #[test]
+    fn plt_stubs_valid_on_libc() {
+        let b = libc_bytes();
+        let elf = parse_elf(&b).unwrap();
+        let plt = super::plt_stub_offsets(&b).unwrap();
+        for (name, off) in &plt {
+            assert!(*off < b.len() as u64, "{name} stub past EOF");
+            assert!(offset_in_x_segment(&elf, *off), "{name} stub not in X");
+        }
+    }
+
+    #[test]
+    fn header_only_elf_has_no_imports() {
+        // No program headers → no dynamic section → no imports, and
+        // crucially no error (statically linked shape).
+        let mut hdr = vec![0u8; 64];
+        hdr[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+        hdr[4] = 2; // 64-bit
+        hdr[5] = 1; // little-endian
+        hdr[6] = 1; // version
+        assert_eq!(super::und_imports(&hdr).unwrap(), Vec::<String>::new());
+        assert!(super::plt_stub_offsets(&hdr).unwrap().is_empty());
+    }
+
+    #[test]
+    fn import_scan_fails_closed_on_non_elf() {
+        assert!(super::und_imports(b"definitely not an ELF file").is_err());
+        assert!(super::plt_stub_offsets(b"definitely not an ELF file").is_err());
     }
 
     #[test]
