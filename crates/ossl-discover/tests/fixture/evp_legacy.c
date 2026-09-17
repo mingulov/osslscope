@@ -94,13 +94,15 @@ static int run_sha256(void)
 
 static int run_meth(void)
 {
+    /* Deliberately leaked (no RSA_meth_free): the free call matches
+     * the RSA_ low-level prefix and would add a pkey/rsa=1 tripwire
+     * hit — noise on top of the single meth_new ground-truth call. */
     RSA_METHOD *m = RSA_meth_new("OSSLSCOPE-RSA", 0);
 
     if (m == NULL) {
         fprintf(stderr, "legacy: RSA_meth_new failed\n");
         return 1;
     }
-    RSA_meth_free(m);
     return 0;
 }
 
