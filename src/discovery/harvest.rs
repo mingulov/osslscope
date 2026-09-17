@@ -161,7 +161,7 @@ fn attach_trips(
             };
             let id = prog
                 .attach(point, Path::new(&p.module), UProbeScope::OneProcess(pid))
-                .map_err(|e| anyhow!("attach {}@{}: {e}", p.symbol, p.offset))?;
+                .map_err(|e| anyhow!("attach {}@{:#x}: {e}", p.symbol, p.offset))?;
             links.0.push(prog.take_link(id)?);
         }
     }
@@ -229,20 +229,20 @@ fn partial_doc(
     Ok(doc)
 }
 
-/// Blind legacy section: no tripwire attach was possible (statically
-/// linked target — no libcrypto mapping). Pure userspace: the probe
-/// plan over the provider file resolves nothing, and the mandated
-/// finding records the blind spot.
-fn blind_legacy_section(provider: &Path, elf_bytes: &[u8]) -> anyhow::Result<serde_json::Value> {
-    let set = legacy::probes_for(&provider.to_string_lossy(), elf_bytes, &[])?;
-    Ok(legacy::section(&legacy::SectionInputs {
+/// Blind legacy section: no tripwire attach was possible (no
+/// libcrypto mapping — statically linked or crypto-free target).
+/// Pure userspace: full registry-size gaps plus the mandated
+/// finding (which lives in the blind set itself).
+fn blind_legacy_section() -> serde_json::Value {
+    let set = legacy::blind_probe_set();
+    legacy::section(&legacy::SectionInputs {
         set: &set,
         trip: &HashMap::new(),
         trip_strs: &[],
         legacy_queries: 0,
         legacy_classes: Vec::new(),
-        extra_findings: &[legacy::FINDING_LOWLEVEL_NODYNSYM],
-    }))
+        extra_findings: &[],
+    })
 }
 
 /// Drain the TRUNC overflow map (missing on pre-exit-2 objects → empty).
@@ -406,7 +406,8 @@ pub fn run(cfg: &Config) -> anyhow::Result<serde_json::Value> {
                 .collect();
             let mut set = legacy::probes_for(&lc_path, &lc_bytes, &modules)?;
             for path in &unreadable {
-                set.findings.push(format!("unreadable module: {path}"));
+                set.findings
+                    .push(format!("unreadable module: {path} (imports unknown)"));
             }
             attach_trips(&mut bpf, &mut links, &set, pid)?;
             eprintln!("INSPECT stage=legacy trips={}", set.probes.len());
@@ -446,7 +447,7 @@ pub fn run(cfg: &Config) -> anyhow::Result<serde_json::Value> {
     // (exit-1/2 behavior identical).
     if preset_reason.is_some() && probe_set.is_none() {
         let blind = if cfg.legacy {
-            Some(blind_legacy_section(&cfg.provider, &elf_bytes)?)
+            Some(blind_legacy_section())
         } else {
             None
         };
@@ -680,7 +681,7 @@ pub fn run(cfg: &Config) -> anyhow::Result<serde_json::Value> {
                 legacy_classes: Vec::new(),
                 extra_findings: &extra_findings,
             })),
-            None => Some(blind_legacy_section(&cfg.provider, &elf_bytes)?),
+            None => Some(blind_legacy_section()),
         }
     } else {
         None
@@ -893,7 +894,7 @@ pub fn run(cfg: &Config) -> anyhow::Result<serde_json::Value> {
                 legacy_classes: classes,
                 extra_findings: &extra_findings,
             }),
-            None => blind_legacy_section(&cfg.provider, &elf_bytes)?,
+            None => blind_legacy_section(),
         };
         doc["legacy"] = l;
     }

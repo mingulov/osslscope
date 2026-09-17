@@ -400,9 +400,12 @@ mod tests {
     /// Independent oracle: decode one 16B PLT stub's GOT target
     /// (endbr64 + jmp *GOTPCREL, or bare jmp *GOTPCREL). Returns the
     /// GOT address the stub jumps through, or None when the bytes
-    /// are not a recognized stub shape. Deliberately NOT shared with
-    /// production `plt_chunk_got`: the oracle must not verify
-    /// production against itself.
+    /// are not a recognized stub shape. Duplicates production
+    /// `plt_chunk_got` line-for-line on purpose: the independence
+    /// that catches decode bugs is the GOT→name reloc map below, not
+    /// the decoder — sharing the decoder would still verify the
+    /// chunking, mapping, and naming, but an independent copy also
+    /// guards the decode itself.
     fn stub_got_target(stub: &[u8], stub_vaddr: u64) -> Option<u64> {
         if stub.len() < 16 {
             return None;
@@ -429,6 +432,15 @@ mod tests {
             .find(|ph| off >= ph.p_offset && off < ph.p_offset + ph.p_filesz)
             .map(|ph| off - ph.p_offset + ph.p_vaddr)
             .unwrap()
+    }
+
+    /// Section-name set (layout pinning: combined vs split PLT).
+    fn section_names(elf: &goblin::elf::Elf) -> std::collections::HashSet<String> {
+        elf.section_headers
+            .iter()
+            .filter_map(|sh| elf.shdr_strtab.get_at(sh.sh_name))
+            .map(str::to_string)
+            .collect()
     }
 
     /// Closed-loop oracle: every resolved stub's bytes must jump to
@@ -464,6 +476,12 @@ mod tests {
         // libc's realloc resolve locally-defined symbols.)
         let b = self_bytes();
         let elf = parse_elf(&b).unwrap();
+        // Layout pin: this test covers combined .plt (PLT0 first).
+        // If the toolchain switches self to split .plt.sec, add a
+        // synthetic combined fixture instead of weakening this.
+        let secs = section_names(&elf);
+        assert!(secs.contains(".plt"), "self lost combined .plt?");
+        assert!(!secs.contains(".plt.sec"), "self went split: add fixture");
         let plt = super::plt_stub_offsets(&b).unwrap();
         assert!(!plt.is_empty(), "dynamic binary without PLT?");
         let und = super::und_imports(&b).unwrap();
@@ -515,6 +533,11 @@ mod tests {
     fn plt_stubs_valid_on_libc() {
         let b = libc_bytes();
         let elf = parse_elf(&b).unwrap();
+        // Layout pin: this test covers split .plt.sec (entries only).
+        assert!(
+            section_names(&elf).contains(".plt.sec"),
+            "libc lost split .plt.sec?"
+        );
         let plt = super::plt_stub_offsets(&b).unwrap();
         for (name, off) in &plt {
             assert!(*off < b.len() as u64, "{name} stub past EOF");

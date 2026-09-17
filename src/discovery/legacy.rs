@@ -94,54 +94,219 @@ pub struct Module<'a> {
     pub bytes: &'a [u8],
 }
 
-/// Per-module low-level plan: probes plus the family sets for
-/// cross-module gap accounting (imported anywhere, probed nowhere).
-pub struct LowlevelPlan {
+/// Per-module plan: caller-attributed probes for all three
+/// call-site classes (ENGINE, meth_new, low-level) plus per-symbol
+/// gaps (imported but without a stub in THIS module — a probed
+/// sibling elsewhere must not mask a missed import here).
+pub struct ModulePlan {
     pub probes: Vec<Probe>,
-    /// Families with ≥1 undefined import in the module.
-    pub imported: HashSet<&'static str>,
-    /// Families with ≥1 probe in the module.
-    pub probed: HashSet<&'static str>,
+    pub unprobed_engine: Vec<String>,
+    pub unprobed_meth: Vec<String>,
+    pub unprobed_lowlevel: Vec<String>,
 }
 
-/// Plan one module's low-level probes: taxonomy-matching PLT stubs
-/// become probes (deterministic cookie order by stub offset);
-/// taxonomy-matching imports without a stub (-fno-plt calls, data
-/// refs, section-less objects) surface as gaps, never silent misses.
-pub fn lowlevel_module_plan(
+/// Plan one module's probes: taxonomy-matching PLT stubs become
+/// probes (ENGINE, then meth, then low-level by stub offset —
+/// deterministic cookie order); taxonomy-matching imports without a
+/// stub (-fno-plt calls, data refs) surface as per-symbol gaps.
+/// Same-offset aliases keep the first probe (two cookies on one stub
+/// would double-count every call).
+pub fn module_plan(
     module: &str,
     und: &HashSet<String>,
     plt: &HashMap<String, u64>,
     cookie_start: u64,
-) -> (LowlevelPlan, u64) {
-    let mut plan = LowlevelPlan {
+) -> (ModulePlan, u64) {
+    let mut plan = ModulePlan {
         probes: Vec::new(),
-        imported: HashSet::new(),
-        probed: HashSet::new(),
+        unprobed_engine: Vec::new(),
+        unprobed_meth: Vec::new(),
+        unprobed_lowlevel: Vec::new(),
     };
     let mut cookie = cookie_start;
-    for fam in crate::kinds::LOWLEVEL {
-        let matches = |n: &str| fam.prefixes.iter().any(|p| n.starts_with(p));
-        if und.iter().any(|n| matches(n)) {
-            plan.imported.insert(fam.family);
+    let mut seen_off: HashSet<u64> = HashSet::new();
+    // family is explicit per class: ENGINE/METH probes carry None even
+    // when the symbol text matches a low-level prefix (RSA_meth_new vs
+    // RSA_) — section() routes family=None to engine/meth calls.
+    let mut push = |plan: &mut ModulePlan,
+                    symbol: &str,
+                    off: u64,
+                    family: Option<&'static str>,
+                    cookie: &mut u64| {
+        if !seen_off.insert(off) {
+            return;
         }
-        let mut hits: Vec<(&String, &u64)> = plt.iter().filter(|(n, _)| matches(n)).collect();
-        hits.sort_by(|a, b| a.1.cmp(b.1).then(a.0.cmp(b.0)));
-        for (name, off) in hits {
-            plan.probed.insert(fam.family);
-            plan.probes.push(Probe {
-                cookie,
-                symbol: name.to_string(),
-                offset: *off,
-                module: module.to_string(),
-                family: Some(fam.family),
-                str_arg: None,
-                program: "trip_count",
-            });
-            cookie += 1;
+        let (program, str_arg) = if symbol == "ENGINE_by_id" {
+            ("trip_str0", Some(0))
+        } else {
+            ("trip_count", None)
+        };
+        plan.probes.push(Probe {
+            cookie: *cookie,
+            symbol: symbol.to_string(),
+            offset: off,
+            module: module.to_string(),
+            family,
+            str_arg,
+            program,
+        });
+        *cookie += 1;
+    };
+    for e in crate::kinds::ENGINE {
+        if matches!(e.class, crate::kinds::EngineClass::Other) {
+            continue;
+        }
+        match plt.get(e.name) {
+            Some(&off) => push(&mut plan, e.name, off, None, &mut cookie),
+            None if und.contains(e.name) => plan.unprobed_engine.push(e.name.to_string()),
+            None => {}
         }
     }
+    for m in crate::kinds::METH_NEW {
+        match plt.get(m.name) {
+            Some(&off) => push(&mut plan, m.name, off, None, &mut cookie),
+            None if und.contains(m.name) => plan.unprobed_meth.push(m.name.to_string()),
+            None => {}
+        }
+    }
+    // Exact-class symbols (ENGINE/METH) are claimed above even when
+    // their text matches a low-level prefix (RSA_meth_new vs RSA_):
+    // one probe, one section, no double route.
+    let exact_class = |n: &str| {
+        crate::kinds::ENGINE.iter().any(|e| e.name == n)
+            || crate::kinds::METH_NEW.iter().any(|m| m.name == n)
+    };
+    // PLT entries that are taxonomy imports but match no exact name:
+    // low-level prefix scan (offset-sorted for determinism).
+    let mut hits: Vec<(&String, &u64)> = plt
+        .iter()
+        .filter(|(n, _)| lowlevel_family(n).is_some() && !exact_class(n))
+        .collect();
+    hits.sort_by(|a, b| a.1.cmp(b.1).then(a.0.cmp(b.0)));
+    for (name, off) in hits {
+        let family = lowlevel_family(name);
+        push(&mut plan, name, *off, family, &mut cookie);
+    }
+    let mut und_hits: Vec<&String> = und
+        .iter()
+        .filter(|n| lowlevel_family(n).is_some() && !plt.contains_key(*n) && !exact_class(n))
+        .collect();
+    und_hits.sort();
+    plan.unprobed_lowlevel.extend(und_hits.into_iter().cloned());
+    plan.unprobed_engine.sort();
+    plan.unprobed_meth.sort();
     (plan, cookie)
+}
+
+/// Low-level family for a symbol, if any taxonomy prefix matches.
+fn lowlevel_family(name: &str) -> Option<&'static str> {
+    crate::kinds::LOWLEVEL
+        .iter()
+        .find(|f| f.prefixes.iter().any(|p| name.starts_with(p)))
+        .map(|f| f.family)
+}
+
+/// Named findings for unprobed (symbol, module) pairs, sorted for
+/// determinism, capped at 16 with an exact overflow line (bounded
+/// docs; totals stay exact in the counters).
+pub fn gap_findings(pairs: &[(String, String)]) -> Vec<String> {
+    let mut sorted = pairs.to_vec();
+    sorted.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+    let mut out: Vec<String> = sorted
+        .iter()
+        .take(16)
+        .map(|(sym, module)| format!("unprobed import: {sym} ({module})"))
+        .collect();
+    if sorted.len() > 16 {
+        out.push(format!("…and {} more unprobed imports", sorted.len() - 16));
+    }
+    out
+}
+
+/// Max tripwire probes per run. The BPF TRIP map holds 128 entries;
+/// 120 leaves margin 8 and keeps cookies far below the u32 TripEvent
+/// field. Overflow drops low-priority probes (never loads/by_id) and
+/// returns them for gap accounting — never silent.
+pub const MAX_TRIP_PROBES: usize = 120;
+
+/// Probe class (exact: program + family + registry lookup — never
+/// symbol-text heuristics).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeClass {
+    Load,
+    Engine,
+    Meth,
+    Lowlevel,
+}
+
+/// Classify a planned probe for cap priority and gap routing.
+pub fn probe_class(p: &Probe) -> ProbeClass {
+    if p.program == "trip_str1" {
+        ProbeClass::Load
+    } else if p.family.is_some() {
+        ProbeClass::Lowlevel
+    } else if crate::kinds::METH_NEW.iter().any(|m| m.name == p.symbol) {
+        ProbeClass::Meth
+    } else {
+        // ENGINE entries incl. by_id (exact-class probes carry
+        // family=None by construction; see module_plan).
+        ProbeClass::Engine
+    }
+}
+
+/// Enforce [`MAX_TRIP_PROBES`] (stable priority: loads pinned, then
+/// by_id, ENGINE, meth, low-level). Returns dropped probes for gap
+/// accounting — never silent. Priority is drop-order only; any kept
+/// subset is still exact.
+pub fn apply_trip_cap(probes: &mut Vec<Probe>) -> Vec<Probe> {
+    if probes.len() <= MAX_TRIP_PROBES {
+        return Vec::new();
+    }
+    // Loads pinned: PROVIDER_LOAD holds 2 entries (registry fact),
+    // so loads can never overflow the cap alone.
+    let (loads, mut rest): (Vec<Probe>, Vec<Probe>) =
+        probes.drain(..).partition(|p| p.program == "trip_str1");
+    let rank = |p: &Probe| -> u8 {
+        match probe_class(p) {
+            ProbeClass::Load => 0,
+            ProbeClass::Engine if p.symbol == "ENGINE_by_id" => 1,
+            ProbeClass::Engine => 2,
+            ProbeClass::Meth => 3,
+            ProbeClass::Lowlevel => 4,
+        }
+    };
+    let mut idx: Vec<usize> = (0..rest.len()).collect();
+    idx.sort_by_key(|&i| rank(&rest[i]));
+    let keep_rest = MAX_TRIP_PROBES.saturating_sub(loads.len());
+    let drop: HashSet<usize> = idx[keep_rest.min(idx.len())..].iter().copied().collect();
+    let mut kept = loads;
+    let mut dropped = Vec::new();
+    for (i, p) in rest.drain(..).enumerate() {
+        if drop.contains(&i) {
+            dropped.push(p);
+        } else {
+            kept.push(p);
+        }
+    }
+    *probes = kept;
+    dropped
+}
+
+/// Blind probe set (no libcrypto scanned): no probes, full
+/// registry-size gaps, the single coverage finding. ENGINE-absent is
+/// deliberately NOT claimed — presence in unscanned code is unknown.
+pub fn blind_probe_set() -> ProbeSet {
+    let engine = crate::kinds::ENGINE
+        .iter()
+        .filter(|e| !matches!(e.class, crate::kinds::EngineClass::Other))
+        .count() as u64;
+    ProbeSet {
+        engine_uninstrumented: engine,
+        meth_uninstrumented: crate::kinds::METH_NEW.len() as u64,
+        lowlevel_uninstrumented: crate::kinds::LOWLEVEL.len() as u64,
+        findings: vec![FINDING_LOWLEVEL_NODYNSYM.to_string()],
+        ..Default::default()
+    }
 }
 
 /// Target modules to scan: file-backed executable mappings except
@@ -173,12 +338,13 @@ pub fn find_libcrypto(maps: &[maps::Mapping]) -> Option<String> {
         .map(|m| m.path.clone())
 }
 
-/// Build the probe plan: API-surface probes on libcrypto
-/// (Tripwire/Register/Interception ENGINE + all meth_new + both load
-/// entrypoints, × dynsym — TN-proven noise-free) plus
-/// caller-attributed low-level probes (per-module PLT stubs for
-/// taxonomy-matching imports — libcrypto's internal direct calls are
-/// implementation, not usage, and stay invisible by construction).
+/// Build the probe plan. Provider loads stay on libcrypto (global
+/// events — internal auto-loads are real loads and must count);
+/// ENGINE, meth_new, and low-level are caller-attributed per-module
+/// PLT probes (libcrypto's internal direct calls are implementation,
+/// not usage — on 3.x they fire ENGINE_register_* during init).
+/// Gaps count (symbol, module) pairs among SCANNED modules; skipped
+/// modules say so loudly (their imports are unknown).
 /// dlsym/JIT callers are a known gap (no PLT to probe).
 pub fn probes_for(
     libcrypto_path: &str,
@@ -189,93 +355,95 @@ pub fn probes_for(
     let by_name: HashMap<&str, u64> = entries.iter().map(|(n, o)| (n.as_str(), *o)).collect();
     let mut set = ProbeSet::default();
     let mut cookie = 0u64;
-    let mut push = |set: &mut ProbeSet,
-                    module: &str,
-                    symbol: &str,
-                    offset: u64,
-                    family: Option<&'static str>,
-                    str_arg: Option<usize>| {
-        let program = match str_arg {
-            None => "trip_count",
-            Some(0) => "trip_str0",
-            Some(_) => "trip_str1",
-        };
-        if symbol == "ENGINE_by_id" {
-            set.by_id_cookies.insert(cookie);
-        } else if str_arg.is_some() {
-            set.load_cookies.insert(cookie);
-        }
-        set.probes.push(Probe {
-            cookie,
-            symbol: symbol.to_string(),
-            offset,
-            module: module.to_string(),
-            family,
-            str_arg,
-            program,
-        });
-        cookie += 1;
-    };
-    for e in crate::kinds::ENGINE.iter().filter(|e| {
-        matches!(
-            e.class,
-            crate::kinds::EngineClass::Tripwire
-                | crate::kinds::EngineClass::Register
-                | crate::kinds::EngineClass::Interception
-        )
-    }) {
-        match by_name.get(e.name) {
-            Some(&off) => push(
-                &mut set,
-                libcrypto_path,
-                e.name,
-                off,
-                None,
-                (e.name == "ENGINE_by_id").then_some(0),
-            ),
-            None => set.engine_uninstrumented += 1,
-        }
-    }
-    for m in crate::kinds::METH_NEW {
-        match by_name.get(m.name) {
-            Some(&off) => push(&mut set, libcrypto_path, m.name, off, None, None),
-            None => set.meth_uninstrumented += 1,
-        }
-    }
+    // Loads first (cookies 0..2, pinned under the cap).
+    let mut seen_load = HashSet::new();
     for name in crate::kinds::PROVIDER_LOAD {
         if let Some(&off) = by_name.get(*name) {
-            push(&mut set, libcrypto_path, name, off, None, Some(1));
+            if !seen_load.insert(off) {
+                continue;
+            }
+            set.probes.push(Probe {
+                cookie,
+                symbol: name.to_string(),
+                offset: off,
+                module: libcrypto_path.to_string(),
+                family: None,
+                str_arg: Some(1),
+                program: "trip_str1",
+            });
+            cookie += 1;
         }
     }
-    // Caller-attributed low-level: each module's taxonomy-matching
-    // PLT stubs become probes; families imported anywhere but probed
-    // nowhere are gaps.
-    let mut imported: HashSet<&'static str> = HashSet::new();
-    let mut probed: HashSet<&'static str> = HashSet::new();
+    let mut gaps_engine: Vec<(String, String)> = Vec::new();
+    let mut gaps_meth: Vec<(String, String)> = Vec::new();
+    let mut gaps_lowlevel: Vec<(String, String)> = Vec::new();
     for m in modules {
         let (und, plt) = match (elf::und_imports(m.bytes), elf::plt_stub_offsets(m.bytes)) {
             (Ok(u), Ok(p)) => (u, p),
             _ => {
-                set.findings.push(format!("unscannable module: {}", m.path));
+                set.findings
+                    .push(format!("unscannable module: {} (imports unknown)", m.path));
                 continue;
             }
         };
         let und: HashSet<String> = und.into_iter().collect();
-        let (plan, next) = lowlevel_module_plan(m.path, &und, &plt, cookie);
+        let (plan, next) = module_plan(m.path, &und, &plt, cookie);
         cookie = next;
-        imported.extend(plan.imported);
-        probed.extend(plan.probed);
+        gaps_engine.extend(
+            plan.unprobed_engine
+                .into_iter()
+                .map(|s| (s, m.path.to_string())),
+        );
+        gaps_meth.extend(
+            plan.unprobed_meth
+                .into_iter()
+                .map(|s| (s, m.path.to_string())),
+        );
+        gaps_lowlevel.extend(
+            plan.unprobed_lowlevel
+                .into_iter()
+                .map(|s| (s, m.path.to_string())),
+        );
         set.probes.extend(plan.probes);
     }
-    set.lowlevel_uninstrumented = imported.difference(&probed).count() as u64;
+    // Cap overflow rejoins the gaps (classified exactly).
+    let dropped = apply_trip_cap(&mut set.probes);
+    if !dropped.is_empty() {
+        set.findings.push(format!(
+            "tripwire cap ({}) exceeded: {} imports unprobed",
+            MAX_TRIP_PROBES,
+            dropped.len()
+        ));
+    }
+    for p in &dropped {
+        let pair = (p.symbol.clone(), p.module.clone());
+        match probe_class(p) {
+            // Loads pinned by the cap: unreachable (see apply_trip_cap).
+            ProbeClass::Load => gaps_engine.push(pair),
+            ProbeClass::Engine => gaps_engine.push(pair),
+            ProbeClass::Meth => gaps_meth.push(pair),
+            ProbeClass::Lowlevel => gaps_lowlevel.push(pair),
+        }
+    }
+    set.engine_uninstrumented = gaps_engine.len() as u64;
+    set.meth_uninstrumented = gaps_meth.len() as u64;
+    set.lowlevel_uninstrumented = gaps_lowlevel.len() as u64;
+    let mut gaps = gaps_engine;
+    gaps.extend(gaps_meth);
+    gaps.extend(gaps_lowlevel);
+    set.findings.extend(gap_findings(&gaps));
+    // Cookie sets from KEPT probes only (no post-hoc removal exists,
+    // so the sets cannot go stale).
+    for p in &set.probes {
+        if p.symbol == "ENGINE_by_id" {
+            set.by_id_cookies.insert(p.cookie);
+        } else if p.str_arg.is_some() {
+            set.load_cookies.insert(p.cookie);
+        }
+    }
     if !entries.iter().any(|(n, _)| n.starts_with("ENGINE_")) {
         set.findings.push(FINDING_ENGINE_ABSENT.to_string());
     }
-    // Same-file same-offset aliases would double-count (two cookies
-    // fire per call): keep the first probe per (module, offset).
-    let mut seen_off = HashSet::new();
-    set.probes
-        .retain(|p| seen_off.insert((p.module.clone(), p.offset)));
     Ok(set)
 }
 
@@ -306,12 +474,16 @@ pub fn section(inp: &SectionInputs) -> serde_json::Value {
         .filter(|p| p.family.is_none() && !inp.set.load_cookies.contains(&p.cookie))
     {
         let is_meth = crate::kinds::METH_NEW.iter().any(|m| m.name == p.symbol);
-        (if is_meth {
+        // Sum across modules: the same symbol probed in two callers
+        // is two cookies for one entrypoint (insert would silently
+        // drop every module but the last).
+        *(if is_meth {
             &mut meth_calls
         } else {
             &mut engine_calls
         })
-        .insert(p.symbol.clone(), count(p.cookie));
+        .entry(p.symbol.clone())
+        .or_insert(0) += count(p.cookie);
     }
     let mut id_class: BTreeMap<&str, u64> = [("dynamic", 0), ("builtin", 0), ("other", 0)]
         .into_iter()
@@ -342,6 +514,24 @@ pub fn section(inp: &SectionInputs) -> serde_json::Value {
     classes.dedup();
     let mut findings: Vec<String> = inp.set.findings.clone();
     findings.extend(inp.extra_findings.iter().map(|s| s.to_string()));
+    // String-bearing probes fire TRIP always but emit strings only for
+    // readable args: a TRIP/string delta means calls with NULL or
+    // unreadable names happened — findings, not silent undercount.
+    let fires = |cookies: &HashSet<u64>| cookies.iter().map(|c| count(*c)).sum::<u64>();
+    let strs = |cookies: &HashSet<u64>| {
+        inp.trip_strs
+            .iter()
+            .filter(|(c, _)| cookies.contains(c))
+            .count() as u64
+    };
+    let load_delta = fires(&inp.set.load_cookies).saturating_sub(strs(&inp.set.load_cookies));
+    if load_delta > 0 {
+        findings.push(format!("{load_delta} provider loads with unreadable names"));
+    }
+    let id_delta = fires(&inp.set.by_id_cookies).saturating_sub(strs(&inp.set.by_id_cookies));
+    if id_delta > 0 {
+        findings.push(format!("{id_delta} engine-id lookups with unreadable ids"));
+    }
     let mut legacy = serde_json::json!({
         "engine": {"calls_by_entrypoint": engine_calls, "engine_id_class": id_class},
         "meth_new": {"calls_by_entrypoint": meth_calls},
@@ -399,37 +589,237 @@ mod tests {
     }
 
     #[test]
-    fn lowlevel_plan_probes_plt_matches() {
-        let und = ["DES_ecb_encrypt", "malloc", "SHA256_Init"]
-            .into_iter()
-            .map(str::to_string)
-            .collect();
-        let plt = HashMap::from([("DES_ecb_encrypt".to_string(), 0x1000u64)]);
-        let (plan, next) = lowlevel_module_plan("/app", &und, &plt, 7);
-        assert_eq!(next, 8);
-        assert_eq!(plan.probes.len(), 1);
-        let p = &plan.probes[0];
-        assert_eq!(p.cookie, 7);
-        assert_eq!(p.symbol, "DES_ecb_encrypt");
-        assert_eq!(p.offset, 0x1000);
-        assert_eq!(p.module, "/app");
-        assert_eq!(p.family, Some("cipher/block"));
-        assert_eq!(p.program, "trip_count");
-        assert_eq!(plan.imported, HashSet::from(["cipher/block", "digest/sha"]));
-        assert_eq!(plan.probed, HashSet::from(["cipher/block"]));
+    fn module_plan_probes_all_classes() {
+        let und = [
+            "ENGINE_by_id",
+            "ENGINE_init",
+            "RSA_meth_new",
+            "DES_ecb_encrypt",
+            "malloc",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let plt = HashMap::from([
+            ("ENGINE_by_id".to_string(), 0x1000u64),
+            ("ENGINE_init".to_string(), 0x1010u64),
+            ("RSA_meth_new".to_string(), 0x1020u64),
+            ("DES_ecb_encrypt".to_string(), 0x1030u64),
+        ]);
+        let (plan, next) = module_plan("/app", &und, &plt, 7);
+        assert_eq!(next, 11);
+        assert_eq!(plan.probes.len(), 4);
+        // ENGINE_by_id captures arg0 (id string) via trip_str0.
+        let by_id = &plan.probes[0];
+        assert_eq!(by_id.cookie, 7);
+        assert_eq!(by_id.symbol, "ENGINE_by_id");
+        assert_eq!(by_id.offset, 0x1000);
+        assert_eq!(by_id.module, "/app");
+        assert_eq!(by_id.program, "trip_str0");
+        assert_eq!(by_id.str_arg, Some(0));
+        assert_eq!(by_id.family, None);
+        // Plain counters for the rest.
+        assert_eq!(plan.probes[1].program, "trip_count");
+        assert_eq!(plan.probes[1].symbol, "ENGINE_init");
+        assert_eq!(plan.probes[2].symbol, "RSA_meth_new");
+        assert_eq!(plan.probes[3].symbol, "DES_ecb_encrypt");
+        assert_eq!(plan.probes[3].family, Some("cipher/block"));
+        assert!(plan.unprobed_engine.is_empty());
+        assert!(plan.unprobed_meth.is_empty());
+        assert!(plan.unprobed_lowlevel.is_empty());
     }
 
     #[test]
-    fn lowlevel_plan_gap_when_no_plt() {
-        // Imported but no stub (-fno-plt call or data ref): a gap,
-        // not a silent miss.
-        let und = HashSet::from(["BN_new".to_string()]);
-        let plt = HashMap::new();
-        let (plan, next) = lowlevel_module_plan("/app", &und, &plt, 0);
-        assert_eq!(next, 0);
-        assert!(plan.probes.is_empty());
-        assert_eq!(plan.imported, HashSet::from(["bn"]));
-        assert!(plan.probed.is_empty());
+    fn module_plan_gaps_are_per_symbol() {
+        // Imported but no stub (-fno-plt call or data ref): a gap
+        // per symbol, not per family (a probed sibling must not mask
+        // a missed import).
+        let und = ["BN_new", "BN_free", "ENGINE_init"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let plt = HashMap::from([("BN_new".to_string(), 0x2000u64)]);
+        let (plan, next) = module_plan("/app", &und, &plt, 0);
+        assert_eq!(next, 1);
+        assert_eq!(plan.probes.len(), 1);
+        assert_eq!(plan.probes[0].symbol, "BN_new");
+        assert_eq!(plan.unprobed_engine, vec!["ENGINE_init".to_string()]);
+        assert!(plan.unprobed_meth.is_empty());
+        assert_eq!(plan.unprobed_lowlevel, vec!["BN_free".to_string()]);
+    }
+
+    #[test]
+    fn gap_findings_capped_with_overflow() {
+        // 17 unprobed pairs: 16 named findings + one overflow line
+        // (bounded docs; totals stay exact in the counters).
+        let pairs: Vec<(String, String)> = (0..17)
+            .map(|i| (format!("SYM_{i:02}"), "/app".to_string()))
+            .collect();
+        let out = gap_findings(&pairs);
+        assert_eq!(out.len(), 17);
+        assert!(out[0].contains("SYM_00"));
+        assert!(out[15].contains("SYM_15"));
+        assert_eq!(out[16], "…and 1 more unprobed imports");
+        let out0 = gap_findings(&[]);
+        assert!(out0.is_empty());
+    }
+
+    #[test]
+    fn trip_cap_drops_lowlevel_first() {
+        // 120 cap (TRIP map holds 128): loads/by_id pinned, engine
+        // and meth next, lowlevel truncated. Dropped probes return
+        // for gap accounting (never silent).
+        let mut probes: Vec<Probe> = Vec::new();
+        for i in 0..2u64 {
+            probes.push(Probe {
+                cookie: i,
+                symbol: "OSSL_PROVIDER_load".into(),
+                offset: i,
+                module: "lc".into(),
+                family: None,
+                str_arg: Some(1),
+                program: "trip_str1",
+            });
+        }
+        probes.push(Probe {
+            cookie: 2,
+            symbol: "ENGINE_by_id".into(),
+            offset: 2,
+            module: "/app".into(),
+            family: None,
+            str_arg: Some(0),
+            program: "trip_str0",
+        });
+        for i in 0..200u64 {
+            probes.push(Probe {
+                cookie: 3 + i,
+                symbol: format!("BN_fake_{i}"),
+                offset: 0x1000 + i,
+                module: "/app".into(),
+                family: Some("bn"),
+                str_arg: None,
+                program: "trip_count",
+            });
+        }
+        let dropped = apply_trip_cap(&mut probes);
+        assert_eq!(probes.len(), 120);
+        assert_eq!(dropped.len(), 83);
+        assert!(probes.iter().any(|p| p.program == "trip_str1"));
+        assert!(probes.iter().any(|p| p.symbol == "ENGINE_by_id"));
+        assert!(dropped.iter().all(|p| p.family == Some("bn")));
+    }
+
+    #[test]
+    fn blind_set_is_full_gaps_single_finding() {
+        // Blind (no libcrypto scanned): full registry-size gaps, the
+        // single coverage finding — never ENGINE-absent (presence in
+        // unscanned code is unknown, not absent).
+        let set = blind_probe_set();
+        assert!(set.probes.is_empty());
+        let want_engine = crate::kinds::ENGINE
+            .iter()
+            .filter(|e| !matches!(e.class, crate::kinds::EngineClass::Other))
+            .count() as u64;
+        assert_eq!(set.engine_uninstrumented, want_engine);
+        assert_eq!(set.meth_uninstrumented, crate::kinds::METH_NEW.len() as u64);
+        assert_eq!(
+            set.lowlevel_uninstrumented,
+            crate::kinds::LOWLEVEL.len() as u64
+        );
+        assert_eq!(set.findings, vec![FINDING_LOWLEVEL_NODYNSYM.to_string()]);
+    }
+
+    #[test]
+    fn null_names_are_loud_findings() {
+        // TRIP fires without string events (NULL/unreadable args):
+        // the calls happened — findings, not silent undercount.
+        let set = ProbeSet {
+            probes: vec![
+                Probe {
+                    cookie: 9,
+                    symbol: "OSSL_PROVIDER_load".into(),
+                    offset: 1,
+                    module: "lc".into(),
+                    family: None,
+                    str_arg: Some(1),
+                    program: "trip_str1",
+                },
+                Probe {
+                    cookie: 10,
+                    symbol: "ENGINE_by_id".into(),
+                    offset: 2,
+                    module: "/app".into(),
+                    family: None,
+                    str_arg: Some(0),
+                    program: "trip_str0",
+                },
+            ],
+            load_cookies: HashSet::from([9]),
+            by_id_cookies: HashSet::from([10]),
+            ..Default::default()
+        };
+        let trip = HashMap::from([(9u64, 2u64), (10u64, 3u64)]);
+        let doc = section(&SectionInputs {
+            set: &set,
+            trip: &trip,
+            trip_strs: &[(9u64, "spike".into()), (10u64, "dynamic".into())],
+            legacy_queries: 0,
+            legacy_classes: Vec::new(),
+            extra_findings: &[],
+        });
+        let findings = doc["findings"].as_array().unwrap();
+        let texts: Vec<&str> = findings.iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.contains("1 provider loads") && t.contains("unreadable")),
+            "load delta finding missing: {texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.contains("2 engine-id lookups") && t.contains("unreadable")),
+            "by_id delta finding missing: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn entrypoint_calls_sum_across_modules() {
+        // Same entrypoint probed in two caller modules: the section
+        // sums both cookies (per-module insert would drop one).
+        let set = ProbeSet {
+            probes: vec![
+                Probe {
+                    cookie: 1,
+                    symbol: "ENGINE_init".into(),
+                    offset: 0x100,
+                    module: "/app".into(),
+                    family: None,
+                    str_arg: None,
+                    program: "trip_count",
+                },
+                Probe {
+                    cookie: 2,
+                    symbol: "ENGINE_init".into(),
+                    offset: 0x200,
+                    module: "/lib/spike.so".into(),
+                    family: None,
+                    str_arg: None,
+                    program: "trip_count",
+                },
+            ],
+            ..Default::default()
+        };
+        let trip = HashMap::from([(1u64, 3u64), (2u64, 5u64)]);
+        let doc = section(&SectionInputs {
+            set: &set,
+            trip: &trip,
+            trip_strs: &[],
+            legacy_queries: 0,
+            legacy_classes: Vec::new(),
+            extra_findings: &[],
+        });
+        assert_eq!(doc["engine"]["calls_by_entrypoint"]["ENGINE_init"], 8);
     }
 
     #[test]
@@ -450,28 +840,21 @@ mod tests {
 
     #[test]
     fn probes_vacuous_without_callers() {
-        // libc as libcrypto, no caller modules: no ENGINE/METH/LOAD
-        // symbols → empty plan, full API-surface gaps, absent finding;
-        // low-level is vacuous (no imports known → no gaps). Real
-        // libcrypto plans are gate-proven.
+        // libc as libcrypto, no caller modules: no loads resolve,
+        // nothing imported → empty plan, zero gaps (nothing missed),
+        // absent finding (libc has no ENGINE API). Real libcrypto
+        // plans are gate-proven.
         let b = ["/lib/x86_64-linux-gnu/libc.so.6", "/usr/lib/libc.so.6"]
             .into_iter()
             .find_map(|p| std::fs::read(p).ok())
             .expect("no libc — broken test env");
         let set = probes_for("libc.so.6", &b, &[]).unwrap();
         assert!(set.probes.is_empty());
-        let want_engine = crate::kinds::ENGINE
-            .iter()
-            .filter(|e| !matches!(e.class, crate::kinds::EngineClass::Other))
-            .count() as u64;
-        assert_eq!(set.engine_uninstrumented, want_engine);
-        assert_eq!(set.meth_uninstrumented, crate::kinds::METH_NEW.len() as u64);
+        assert_eq!(set.engine_uninstrumented, 0);
+        assert_eq!(set.meth_uninstrumented, 0);
         assert_eq!(set.lowlevel_uninstrumented, 0);
         assert_eq!(set.findings, vec![FINDING_ENGINE_ABSENT.to_string()]);
-        assert_eq!(
-            set.engine_fallback_uninstrumented(),
-            want_engine + crate::kinds::METH_NEW.len() as u64
-        );
+        assert_eq!(set.engine_fallback_uninstrumented(), 0);
     }
 
     #[test]
