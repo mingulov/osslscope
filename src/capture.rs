@@ -240,14 +240,27 @@ fn child_status(pid: u32) -> Option<i32> {
     }
 }
 
-/// Corpse-close rule: a spawn target whose maps read empty AND whose
-/// exit code is now available is DONE (clean close). Without this the
-/// pre-poll liveness check can straddle the child's exit: the corpse
-/// reads empty maps + dead exe link, which fences [MappingsChanged,
-/// Exec] and PARTIALs a clean EOF-close (exit-6 lane-a). Live targets
-/// (code unavailable) and --pid targets never close here.
-fn corpse_close(spawn: bool, maps_empty: bool, status: Option<i32>) -> Option<i32> {
-    if spawn && maps_empty { status } else { None }
+/// Corpse-close: a spawn target whose maps read empty is dead or
+/// mid-`do_exit` (a live process always maps something — exe, stack,
+/// vdso) — reap it and close cleanly. A bounded blocking wait covers
+/// the `exit_mm`-to-zombie window, where maps are already empty but
+/// `waitpid` still sees nothing (the pre-poll check straddles it and
+/// the corpse would fence [MappingsChanged, Exec], PARTIALing a clean
+/// EOF-close — exit-6 lane-a). Returns the exit code when reaped;
+/// `None` (impossibly alive, or --pid) falls through to the fence.
+fn reap_corpse(spawn: bool, maps_empty: bool, pid: u32) -> Option<i32> {
+    if !(spawn && maps_empty) {
+        return None;
+    }
+    let mut code = child_status(pid);
+    if code.is_none() {
+        let t0 = Instant::now();
+        while code.is_none() && t0.elapsed() < Duration::from_millis(100) {
+            std::thread::sleep(Duration::from_millis(1));
+            code = child_status(pid);
+        }
+    }
+    code
 }
 
 // ---------------------------------------------------------------- ppid scan
@@ -1205,11 +1218,9 @@ pub fn run(cfg: &Config, target: Target) -> anyhow::Result<Capture> {
         let live = maps::read_maps(pid).unwrap_or_default();
         let next = snapshot(pid, &engine.planned_paths(), &live);
         // Post-read liveness: close corpses, never fence them.
-        if spawn {
-            if let Some(code) = corpse_close(true, live.is_empty(), child_status(pid)) {
-                engine.child_exit = Some(code);
-                break;
-            }
+        if let Some(code) = reap_corpse(spawn, live.is_empty(), pid) {
+            engine.child_exit = Some(code);
+            break;
         }
         if t0.elapsed() > POLL_BUDGET {
             engine.counters.scan_budget_exhaustions += 1;
@@ -1419,17 +1430,26 @@ mod tests {
     }
 
     #[test]
-    fn corpse_close_truth_table() {
-        // Dead + empty maps => close with the code (never fence).
-        assert_eq!(corpse_close(true, true, Some(0)), Some(0));
-        assert_eq!(corpse_close(true, true, Some(137)), Some(137));
-        // Live (no code yet) => no close even with empty maps.
-        assert_eq!(corpse_close(true, true, None), None);
-        // Mapped (racing read success) => no close even when reaped.
-        assert_eq!(corpse_close(true, false, Some(0)), None);
-        // --pid path never corpse-closes (pin verdict owns it).
-        assert_eq!(corpse_close(false, true, Some(0)), None);
-        assert_eq!(corpse_close(false, false, None), None);
+    fn reap_corpse_gating() {
+        // --pid path and mapped targets never corpse-close (no wait).
+        assert_eq!(reap_corpse(false, true, std::process::id()), None);
+        assert_eq!(reap_corpse(true, false, std::process::id()), None);
+        // Unwaitable pid (ourselves): bounded wait, then None.
+        let t0 = Instant::now();
+        assert_eq!(reap_corpse(true, true, std::process::id()), None);
+        assert!(t0.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn reap_corpse_reaps_exited_child() {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            unsafe { libc::_exit(7) };
+        }
+        // Exited child (empty maps by kernel construction): reaped
+        // with its code, well inside the bound.
+        assert_eq!(reap_corpse(true, true, pid as u32), Some(7));
     }
 
     #[test]
