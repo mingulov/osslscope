@@ -79,11 +79,33 @@ pub fn und_imports(elf_bytes: &[u8]) -> anyhow::Result<Vec<String>> {
     Ok(out)
 }
 
-/// PLT stub file offsets for x86-64 imports, by name. JMPREL order
-/// selects the stub: 16B PLT0 + 16B entries in `.plt.sec` (old-style
-/// `.plt` fallback). Empty (not an error) when the object has no PLT
-/// machinery — static, section-less, or non-x86-64 — so the caller
-/// counts those imports as uninstrumented instead of failing.
+/// Decode one 16B x86-64 PLT chunk's GOT target (endbr64 + jmp
+/// *GOTPCREL, or bare jmp *GOTPCREL). None for PLT0 and unrecognized
+/// shapes (fail-closed per chunk — an unrecognized stub is a gap,
+/// never a misattributed probe).
+fn plt_chunk_got(chunk: &[u8], chunk_vaddr: u64) -> Option<u64> {
+    if chunk.len() < 16 {
+        return None;
+    }
+    let jmp_at = if chunk[0..4] == [0xf3, 0x0f, 0x1e, 0xfa] {
+        4
+    } else {
+        0
+    };
+    if chunk[jmp_at..jmp_at + 2] != [0xff, 0x25] {
+        return None;
+    }
+    let disp = i32::from_le_bytes(chunk[jmp_at + 2..jmp_at + 6].try_into().ok()?);
+    Some(chunk_vaddr + jmp_at as u64 + 6 + disp as i64 as u64)
+}
+
+/// PLT stub file offsets for x86-64 imports, by name. Entries are
+/// derived from stub bytes (chunk jmp → GOT slot → JUMP_SLOT name),
+/// never positional math: split `.plt.sec` holds entries only (no
+/// PLT0) while old combined `.plt` holds PLT0 first, and only the
+/// bytes distinguish the layouts. Empty (not an error) when the
+/// object has no PLT machinery — static, section-less, or non-x86-64
+/// — so the caller counts those imports as uninstrumented instead.
 pub fn plt_stub_offsets(elf_bytes: &[u8]) -> anyhow::Result<HashMap<String, u64>> {
     use goblin::elf::header::EM_X86_64;
     use goblin::elf::reloc::R_X86_64_JUMP_SLOT;
@@ -92,38 +114,52 @@ pub fn plt_stub_offsets(elf_bytes: &[u8]) -> anyhow::Result<HashMap<String, u64>
     if elf.header.e_machine != EM_X86_64 {
         return Ok(out);
     }
-    let mut plt_addr = None;
-    for sh in elf.section_headers.iter() {
-        if let Some(name) = elf.shdr_strtab.get_at(sh.sh_name) {
-            if name == ".plt.sec" {
-                plt_addr = Some(sh.sh_addr);
-                break;
-            }
-            if name == ".plt" {
-                plt_addr = Some(sh.sh_addr);
+    // GOT slot → imported name (jump slots only: data relocs are
+    // never PLT-jmp targets).
+    let mut got_name: HashMap<u64, &str> = HashMap::new();
+    for r in elf.pltrelocs.iter() {
+        if r.r_type != R_X86_64_JUMP_SLOT {
+            continue;
+        }
+        if let Some(s) = elf.dynsyms.get(r.r_sym) {
+            if let Some(n) = elf.dynstrtab.get_at(s.st_name) {
+                got_name.insert(r.r_offset, n);
             }
         }
     }
-    let Some(plt_addr) = plt_addr else {
+    if got_name.is_empty() {
+        return Ok(out);
+    }
+    let mut plt_sec = None;
+    for sh in elf.section_headers.iter() {
+        if let Some(name) = elf.shdr_strtab.get_at(sh.sh_name) {
+            if name == ".plt.sec" {
+                plt_sec = Some(sh);
+                break;
+            }
+            if name == ".plt" {
+                plt_sec = Some(sh);
+            }
+        }
+    }
+    let Some(sh) = plt_sec else {
         return Ok(out);
     };
-    let mut idx = 0u64;
-    for reloc in elf.pltrelocs.iter() {
-        if reloc.r_type != R_X86_64_JUMP_SLOT {
-            continue;
-        }
-        let name = elf
-            .dynsyms
-            .get(reloc.r_sym)
-            .and_then(|s| elf.dynstrtab.get_at(s.st_name));
-        // Slot consumed even when the name is unresolvable.
-        let stub = plt_addr + 16 + idx * 16;
-        idx += 1;
-        let (Some(name), Some(off)) = (name, vaddr_to_offset(&elf, stub)) else {
+    for k in 0..sh.sh_size / 16 {
+        let vaddr = sh.sh_addr + k * 16;
+        let off = sh.sh_offset + k * 16;
+        let Some(bytes) = elf_bytes.get(off as usize..(off + 16) as usize) else {
+            break;
+        };
+        let Some(got) = plt_chunk_got(bytes, vaddr) else {
             continue;
         };
-        if offset_in_x_segment(&elf, off) {
-            out.insert(name.to_string(), off);
+        let (Some(name), Some(file_off)) = (got_name.get(&got), vaddr_to_offset(&elf, vaddr))
+        else {
+            continue;
+        };
+        if offset_in_x_segment(&elf, file_off) {
+            out.insert(name.to_string(), file_off);
         }
     }
     Ok(out)
@@ -361,6 +397,66 @@ mod tests {
         assert_eq!(max_openssl_version(s.iter().copied()), None);
     }
 
+    /// Independent oracle: decode one 16B PLT stub's GOT target
+    /// (endbr64 + jmp *GOTPCREL, or bare jmp *GOTPCREL). Returns the
+    /// GOT address the stub jumps through, or None when the bytes
+    /// are not a recognized stub shape. Deliberately NOT shared with
+    /// production `plt_chunk_got`: the oracle must not verify
+    /// production against itself.
+    fn stub_got_target(stub: &[u8], stub_vaddr: u64) -> Option<u64> {
+        if stub.len() < 16 {
+            return None;
+        }
+        let jmp_at = if stub[0..4] == [0xf3, 0x0f, 0x1e, 0xfa] {
+            4
+        } else {
+            0
+        };
+        if stub[jmp_at..jmp_at + 2] != [0xff, 0x25] {
+            return None;
+        }
+        let disp = i32::from_le_bytes(stub[jmp_at + 2..jmp_at + 6].try_into().ok()?);
+        Some(stub_vaddr + jmp_at as u64 + 6 + disp as i64 as u64)
+    }
+
+    /// Test-only file-offset → link-time-vaddr (inverse of
+    /// `vaddr_to_offset`) for stub-byte decoding.
+    fn off_to_vaddr(elf: &goblin::elf::Elf, off: u64) -> u64 {
+        use goblin::elf::program_header::PT_LOAD;
+        elf.program_headers
+            .iter()
+            .filter(|ph| ph.p_type == PT_LOAD)
+            .find(|ph| off >= ph.p_offset && off < ph.p_offset + ph.p_filesz)
+            .map(|ph| off - ph.p_offset + ph.p_vaddr)
+            .unwrap()
+    }
+
+    /// Closed-loop oracle: every resolved stub's bytes must jump to
+    /// the GOT slot whose JUMP_SLOT reloc names it (an off-by-one
+    /// still lands in-X on a neighbor stub, so validity alone never
+    /// proves the slot math).
+    fn assert_closed_loop(b: &[u8], elf: &goblin::elf::Elf, plt: &HashMap<String, u64>) {
+        let mut got_name: HashMap<u64, &str> = HashMap::new();
+        for r in elf.pltrelocs.iter() {
+            if let Some(s) = elf.dynsyms.get(r.r_sym) {
+                if let Some(n) = elf.dynstrtab.get_at(s.st_name) {
+                    got_name.insert(r.r_offset, n);
+                }
+            }
+        }
+        for (name, off) in plt {
+            let stub_vaddr = off_to_vaddr(elf, *off);
+            let bytes = &b[*off as usize..*off as usize + 16];
+            let got = stub_got_target(bytes, stub_vaddr)
+                .unwrap_or_else(|| panic!("{name} stub bytes unrecognized"));
+            assert_eq!(
+                got_name.get(&got).copied(),
+                Some(name.as_str()),
+                "{name} stub jumps to GOT {got:#x} of another symbol"
+            );
+        }
+    }
+
     #[test]
     fn plt_resolves_self_imports_in_x() {
         // Dynamic test binary: every PLT stub is file-backed in X.
@@ -379,6 +475,40 @@ mod tests {
             assert!(*off < b.len() as u64, "{name} stub past EOF");
             assert!(offset_in_x_segment(&elf, *off), "{name} stub not in X");
         }
+        assert_closed_loop(&b, &elf, &plt);
+    }
+
+    #[test]
+    fn plt_chunk_decode_shapes() {
+        // CET entry: endbr64 + jmp *[rip+disp]; rip = vaddr+10.
+        let cet = [
+            0xf3, 0x0f, 0x1e, 0xfa, 0xff, 0x25, 0xf6, 0x2c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00,
+        ];
+        assert_eq!(
+            super::plt_chunk_got(&cet, 0x1210),
+            Some(0x1210 + 10 + 0x2cf6)
+        );
+        // Bare entry: jmp *[rip+disp]; rip = vaddr+6.
+        let bare = [
+            0xff, 0x25, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00,
+        ];
+        assert_eq!(super::plt_chunk_got(&bare, 0x1000), Some(0x1000 + 6 + 0x10));
+        // PLT0 shapes (push+jmp): not entries.
+        let plt0 = [
+            0xff, 0x35, 0x00, 0x00, 0x00, 0x00, 0xff, 0x25, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00,
+        ];
+        assert_eq!(super::plt_chunk_got(&plt0, 0x1000), None);
+        let cet0 = [
+            0xf3, 0x0f, 0x1e, 0xfa, 0xff, 0x35, 0x00, 0x00, 0x00, 0x00, 0xff, 0x25, 0x00, 0x00,
+            0x00, 0x00,
+        ];
+        assert_eq!(super::plt_chunk_got(&cet0, 0x1000), None);
+        // Short buffer / NOP sled: unrecognized.
+        assert_eq!(super::plt_chunk_got(&[0xff], 0x1000), None);
+        assert_eq!(super::plt_chunk_got(&[0x90; 16], 0x1000), None);
     }
 
     #[test]
@@ -390,6 +520,9 @@ mod tests {
             assert!(*off < b.len() as u64, "{name} stub past EOF");
             assert!(offset_in_x_segment(&elf, *off), "{name} stub not in X");
         }
+        // libc uses split .plt.sec (no PLT0 at base): the layout the
+        // positional math gets wrong.
+        assert_closed_loop(&b, &elf, &plt);
     }
 
     #[test]

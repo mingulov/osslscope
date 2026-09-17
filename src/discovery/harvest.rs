@@ -642,6 +642,27 @@ pub fn run(cfg: &Config) -> anyhow::Result<serde_json::Value> {
     // loads distinguish "wrong attach" from "quiet target").
     let trip = read_trip(&mut bpf);
     let lgcalls = read_lgcalls(&mut bpf);
+    // Per-cookie trip dump (all paths: the no-trigger path needs it
+    // most — a quiet dispatch with firing tripwires).
+    if cfg.legacy && std::env::var("OSSL_DEBUG_TRIP").is_ok() {
+        if let Some(set) = &probe_set {
+            let by_cookie: HashMap<u64, &legacy::Probe> =
+                set.probes.iter().map(|p| (p.cookie, p)).collect();
+            let mut keys: Vec<u64> = trip.keys().copied().collect();
+            keys.sort_unstable();
+            for k in keys {
+                let p = by_cookie.get(&k);
+                eprintln!(
+                    "TRIPDBG cookie={k} n={} sym={} fam={:?} mod={} off={}",
+                    trip[&k],
+                    p.map(|p| p.symbol.as_str()).unwrap_or("??"),
+                    p.and_then(|p| p.family),
+                    p.map(|p| p.module.as_str()).unwrap_or("??"),
+                    p.map(|p| format!("{:#x}", p.offset)).unwrap_or("??".into()),
+                );
+            }
+        }
+    }
     let mut extra_findings: Vec<&str> = Vec::new();
     if let Some(n) = &legacy_note {
         extra_findings.push(n);
@@ -859,23 +880,6 @@ pub fn run(cfg: &Config) -> anyhow::Result<serde_json::Value> {
         },
     )?;
     if cfg.legacy {
-        if std::env::var("OSSL_DEBUG_TRIP").is_ok() {
-            if let Some(set) = &probe_set {
-                let by_cookie: HashMap<u64, &legacy::Probe> =
-                    set.probes.iter().map(|p| (p.cookie, p)).collect();
-                let mut keys: Vec<u64> = trip.keys().copied().collect();
-                keys.sort_unstable();
-                for k in keys {
-                    let p = by_cookie.get(&k);
-                    eprintln!(
-                        "TRIPDBG cookie={k} n={} sym={} fam={:?}",
-                        trip[&k],
-                        p.map(|p| p.symbol.as_str()).unwrap_or("??"),
-                        p.and_then(|p| p.family)
-                    );
-                }
-            }
-        }
         let classes: Vec<String> = legacy_rows
             .iter()
             .map(|r| crate::kinds::classify_alg(&r.alg).0.to_string())
