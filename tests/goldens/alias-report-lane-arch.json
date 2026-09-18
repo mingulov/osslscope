@@ -1,0 +1,113 @@
+{
+  "group_count": 7,
+  "grouped_rows": 14,
+  "groups": [
+    {
+      "addr_hash": "094a22347392ceb3",
+      "members": [
+        {
+          "alg_class": "other",
+          "funcid": 3,
+          "op": 1
+        },
+        {
+          "alg_class": "other",
+          "funcid": 3,
+          "op": 1
+        }
+      ]
+    },
+    {
+      "addr_hash": "639d9df4e5410b40",
+      "members": [
+        {
+          "alg_class": "other",
+          "funcid": 6,
+          "op": 1
+        },
+        {
+          "alg_class": "other",
+          "funcid": 6,
+          "op": 1
+        }
+      ]
+    },
+    {
+      "addr_hash": "8802b0c8a6623afa",
+      "members": [
+        {
+          "alg_class": "other",
+          "funcid": 2,
+          "op": 1
+        },
+        {
+          "alg_class": "other",
+          "funcid": 2,
+          "op": 1
+        }
+      ]
+    },
+    {
+      "addr_hash": "a4ceb694afdcc917",
+      "members": [
+        {
+          "alg_class": "other",
+          "funcid": 11,
+          "op": 1
+        },
+        {
+          "alg_class": "other",
+          "funcid": 11,
+          "op": 1
+        }
+      ]
+    },
+    {
+      "addr_hash": "ae0b025a2afced53",
+      "members": [
+        {
+          "alg_class": "other",
+          "funcid": 1,
+          "op": 1
+        },
+        {
+          "alg_class": "other",
+          "funcid": 1,
+          "op": 1
+        }
+      ]
+    },
+    {
+      "addr_hash": "c43a2ae30151b18d",
+      "members": [
+        {
+          "alg_class": "other",
+          "funcid": 8,
+          "op": 1
+        },
+        {
+          "alg_class": "other",
+          "funcid": 8,
+          "op": 1
+        }
+      ]
+    },
+    {
+      "addr_hash": "df004f1e1b6f8a7c",
+      "members": [
+        {
+          "alg_class": "other",
+          "funcid": 4,
+          "op": 1
+        },
+        {
+          "alg_class": "other",
+          "funcid": 4,
+          "op": 1
+        }
+      ]
+    }
+  ],
+  "provider": "alias",
+  "total_rows": 21
+}
