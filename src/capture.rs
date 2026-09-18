@@ -1450,6 +1450,14 @@ pub fn run(cfg: &Config, target: Target) -> anyhow::Result<Capture> {
             .unwrap_or("partial");
         engine.reason(format!("harvest-{r}"));
     }
+    if !spawn {
+        // --pid windows can never prove zero pre-window executions:
+        // the target runs unobserved during the multi-second
+        // harvest→plan→attach (spawn-mode is provably clean via
+        // pre-exec SIGSTOP). Blind by architecture — verdict
+        // 2026-09-18; --pid COMPLETE is unreachable by design.
+        engine.reason("pid-prewindow-blind");
+    }
     if !triggered || rows.is_empty() {
         // No trigger → PARTIAL (no-query), never COMPLETE-zero (§6).
         // Two call sites (not one if/else expression) so the

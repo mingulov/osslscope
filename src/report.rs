@@ -434,6 +434,9 @@ fn human(c: &capture::Capture) -> String {
     if c.reasons.iter().any(|r| r == "fips-unlabeled") {
         s.push_str("note: FIPS executions unlabeled in v1 (self-test calls not distinguished)\n");
     }
+    if c.reasons.iter().any(|r| r == "pid-prewindow-blind") {
+        s.push_str("note: --pid misses pre-window executions (target ran during attach); use run -- for completeness\n");
+    }
     s.push_str("note: alg-name-only strength (key sizes unobservable); window-only claims\n");
     s
 }
@@ -924,6 +927,7 @@ note: alg-name-only strength (key sizes unobservable); window-only claims\n";
         ("unresolved-offsets", "blind"),
         ("unattributed", "blind"),
         ("dropped-events", "blind"),
+        ("pid-prewindow-blind", "blind"),
         ("drain-shortfall", "blind"),
         ("reharvest-skipped", "blind"),
         ("cold-gap", "blind"),

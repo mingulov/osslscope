@@ -1046,6 +1046,10 @@ pub fn run_detailed(
         // - provider mapped but primary init never fired → PARTIAL
         //   (no-query-trigger): pre-loaded provider (dlopen/config
         //   blindness) + legacy.
+        // - provider mapped and primary init fired, but zero rows
+        //   (queries raced the stage-2 attach) → PARTIAL
+        //   (init-without-queries): the trigger was observed, so
+        //   silence fails loud (verdict 2026-09-18).
         // - provider never mapped (provider mode) → COMPLETE-EMPTY.
         // - builtin mode → PARTIAL(no-query-trigger), UNLESS legacy
         //   mode with zero loads observed (quiet/engine-only target)
@@ -1076,6 +1080,33 @@ pub fn run_detailed(
                 let stats = schema::Stats {
                     resolution: resolution.clone(),
                     reason: Some("no-query-trigger".to_string()),
+                    ..schema::Stats::trivial()
+                };
+                let mut doc = schema::emit(
+                    &provider_name,
+                    &cfg.provider,
+                    &canon,
+                    &elf_bytes,
+                    &[],
+                    &[],
+                    false,
+                    &stats,
+                )?;
+                if let Some(l) = legacy_live {
+                    doc["legacy"] = l;
+                }
+                return Ok((doc, HarvestTotals { queries_observed }));
+            }
+            if provider_mapped && primary_init_observed {
+                // Init fired post-attach but its queries raced the
+                // stage-2 attach (trig P2/P3 shape): the evidence is
+                // NOT whole — blind PARTIAL, never COMPLETE-EMPTY
+                // (verdict 2026-09-18; race-miss vs idle is
+                // indistinguishable post-hoc, and the trigger was
+                // observed, so silence fails loud).
+                let stats = schema::Stats {
+                    resolution: resolution.clone(),
+                    reason: Some("init-without-queries".to_string()),
                     ..schema::Stats::trivial()
                 };
                 let mut doc = schema::emit(
