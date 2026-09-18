@@ -293,8 +293,8 @@ mod tests {
     #[test]
     fn shipped_table_loads_with_spot_checks() {
         let t = shipped_table();
-        assert_eq!(t.entry_count(), 6);
-        assert_eq!(t.fallback_count(), 3);
+        assert_eq!(t.entry_count(), 7);
+        assert_eq!(t.fallback_count(), 4);
         let e = t
             .by_build_id("b12cd44337cb70619dd290b2396ab5dfcaea230f")
             .unwrap();
@@ -305,9 +305,15 @@ mod tests {
             .unwrap();
         assert_eq!(r.query_offset, 0x25c870);
         assert_eq!(r.anchor_offset, 0x25c6e0);
+        let a = t
+            .by_build_id("dd9d645699b0c01198228b42ae8092374ff539a5")
+            .unwrap();
+        assert_eq!(a.query_offset, 0x2824b0);
+        assert_eq!(a.anchor_offset, 0x282300);
         assert_eq!(t.fallback((4, 0)).unwrap().delta, 0x1f0);
         assert_eq!(t.fallback((3, 0)).unwrap().delta, 0x180);
         assert_eq!(t.fallback((3, 5)).unwrap().delta, 0x1e0);
+        assert_eq!(t.fallback((3, 6)).unwrap().delta, 0x1b0);
     }
 
     #[test]

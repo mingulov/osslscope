@@ -54,6 +54,15 @@
       "query_offset": 2476144,
       "anchor": "OSSL_PROVIDER_available",
       "anchor_offset": 2475744
+    },
+    {
+      "build_id": "dd9d645699b0c01198228b42ae8092374ff539a5",
+      "openssl": "3.6.4",
+      "lane": "lane-arch",
+      "path": "/opt/openssl-3.6.4/lib64/libcrypto.so",
+      "query_offset": 2630832,
+      "anchor": "OSSL_PROVIDER_available",
+      "anchor_offset": 2630400
     }
   ],
   "fallback": [
@@ -71,6 +80,11 @@
       "openssl": "3.5",
       "anchor": "OSSL_PROVIDER_available",
       "delta": 480
+    },
+    {
+      "openssl": "3.6",
+      "anchor": "OSSL_PROVIDER_available",
+      "delta": 432
     }
   ]
 }

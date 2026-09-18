@@ -1,0 +1,202 @@
+{
+  "gen": 0,
+  "provider": "canary",
+  "rows": [
+    {
+      "addr_backed": true,
+      "addr_hash": "6714a12451ad9f37",
+      "alg_class": "other",
+      "backing": {
+        "dev": "00:21",
+        "ino": 83774,
+        "offset": 4628
+      },
+      "funcid": 1,
+      "gen": 0,
+      "op": 1,
+      "provider": "canary",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "69fd89f36531156b",
+      "alg_class": "other",
+      "backing": {
+        "dev": "00:21",
+        "ino": 83774,
+        "offset": 4733
+      },
+      "funcid": 2,
+      "gen": 0,
+      "op": 1,
+      "provider": "canary",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "76f7df9bad862972",
+      "alg_class": "other",
+      "backing": {
+        "dev": "00:21",
+        "ino": 83774,
+        "offset": 4783
+      },
+      "funcid": 3,
+      "gen": 0,
+      "op": 1,
+      "provider": "canary",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "67031d5035a6c49f",
+      "alg_class": "other",
+      "backing": {
+        "dev": "00:21",
+        "ino": 83774,
+        "offset": 4837
+      },
+      "funcid": 4,
+      "gen": 0,
+      "op": 1,
+      "provider": "canary",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "d8db8c40d93f5682",
+      "alg_class": "other",
+      "backing": {
+        "dev": "00:21",
+        "ino": 83774,
+        "offset": 4679
+      },
+      "funcid": 6,
+      "gen": 0,
+      "op": 1,
+      "provider": "canary",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "b5bfae5762e620ee",
+      "alg_class": "other",
+      "backing": {
+        "dev": "00:21",
+        "ino": 83774,
+        "offset": 4954
+      },
+      "funcid": 8,
+      "gen": 0,
+      "op": 1,
+      "provider": "canary",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "8355cbe4a2b637f6",
+      "alg_class": "other",
+      "backing": {
+        "dev": "00:21",
+        "ino": 83774,
+        "offset": 4906
+      },
+      "funcid": 11,
+      "gen": 0,
+      "op": 1,
+      "provider": "canary",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "f15c63eaff1cae99",
+      "alg_class": "other",
+      "backing": {
+        "dev": "00:21",
+        "ino": 83774,
+        "offset": 5122
+      },
+      "funcid": 1,
+      "gen": 0,
+      "op": 12,
+      "provider": "canary",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "c41325d923f650aa",
+      "alg_class": "other",
+      "backing": {
+        "dev": "00:21",
+        "ino": 83774,
+        "offset": 5231
+      },
+      "funcid": 2,
+      "gen": 0,
+      "op": 12,
+      "provider": "canary",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "8c6668ef37eadbf4",
+      "alg_class": "other",
+      "backing": {
+        "dev": "00:21",
+        "ino": 83774,
+        "offset": 5285
+      },
+      "funcid": 3,
+      "gen": 0,
+      "op": 12,
+      "provider": "canary",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "b532c358f96846f7",
+      "alg_class": "other",
+      "backing": {
+        "dev": "00:21",
+        "ino": 83774,
+        "offset": 5362
+      },
+      "funcid": 4,
+      "gen": 0,
+      "op": 12,
+      "provider": "canary",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "935cc1d4381b96c1",
+      "alg_class": "other",
+      "backing": {
+        "dev": "00:21",
+        "ino": 83774,
+        "offset": 5416
+      },
+      "funcid": 5,
+      "gen": 0,
+      "op": 12,
+      "provider": "canary",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "f8961df843f799ac",
+      "alg_class": "other",
+      "backing": {
+        "dev": "00:21",
+        "ino": 83774,
+        "offset": 5177
+      },
+      "funcid": 16,
+      "gen": 0,
+      "op": 12,
+      "provider": "canary",
+      "weak": false
+    }
+  ],
+  "trigger_observed": true
+}
