@@ -12,7 +12,7 @@ them at the needed level.
 | Per-call execution proof | no, fetch-time only | yes, tripwired |
 | Low-level / ENGINE calls | no coverage | counted + fenced |
 | Machine-readable verdict | no, free text + pointers | JSON + exit codes |
-| CI gate signal | none (app's exit 0) | PARTIAL + exit 4 (P1) |
+| CI gate signal | none (app's exit 0) | `check` verdict, exit 10 on violation |
 
 ## Case by case
 
@@ -35,8 +35,9 @@ blind. Fetch-time naming is not execution proof.
 **CI exit code.** TRACE output is voluminous free text; the process
 exit code is always the application's. There is no verdict to gate
 on. osslscope emits `COMPLETE`/`PARTIAL` JSON with a frozen reason
-vocabulary and refuses unsuitable targets with exit 4 (`doctor`); a
-full check verdict with its own exit codes follows at P3.
+vocabulary, refuses unsuitable targets with exit 4 (`doctor`),
+and gates policy with `check` (exit 10 on violation, exit 0
+clean — at least one rule required).
 
 ## Reproduction
 
