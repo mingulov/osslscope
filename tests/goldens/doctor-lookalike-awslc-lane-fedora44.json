@@ -1,0 +1,83 @@
+{
+  "checks": [
+    {
+      "id": "kernel",
+      "message": "features ok (kprobe-load, ringbuf, uprobe-multi+cookies, probe_read_user) on 6.19.10-300.fc44.x86_64 (informational)",
+      "status": "pass"
+    },
+    {
+      "id": "token-support",
+      "message": "BPF_TOKEN_CREATE present (6.9+ floor signal; tokens debug-only, never used for privilege)",
+      "status": "info"
+    },
+    {
+      "id": "caps",
+      "message": "CAP_SYS_ADMIN effective",
+      "status": "pass"
+    },
+    {
+      "id": "btf",
+      "message": "BTF present (optional \u2014 probe path has zero BTF dependence)",
+      "status": "info"
+    },
+    {
+      "id": "lockdown",
+      "message": "lockdown=none (BPF allowed)",
+      "status": "pass"
+    },
+    {
+      "id": "ima",
+      "message": "IMA active (informational \u2014 no known BPF interaction)",
+      "status": "info"
+    },
+    {
+      "id": "lsm",
+      "message": "no LSM denial (BPF ops succeed; active: lockdown,capability,yama,selinux,bpf,landlock,ipe,ima,evm)",
+      "status": "pass"
+    },
+    {
+      "id": "seccomp",
+      "message": "no seccomp filter (NNP=0)",
+      "status": "info"
+    },
+    {
+      "id": "pidns",
+      "message": "same pid namespace",
+      "status": "pass"
+    },
+    {
+      "id": "foreign-uid",
+      "message": "target uid 1000: maps readable via PTRACE; PERFMON-only child also readable \u2192 6.14+ carve-out CONFIRMED on this kernel",
+      "status": "pass"
+    },
+    {
+      "id": "target-access",
+      "message": "target maps readable",
+      "status": "pass"
+    },
+    {
+      "id": "libcrypto-found",
+      "message": "libcrypto: /home/ossl/inspect-fixtures/libcrypto.so.awslc",
+      "status": "pass"
+    },
+    {
+      "id": "arch",
+      "message": "x86-64 (ELFCLASS64, EM_X86_64)",
+      "status": "pass"
+    },
+    {
+      "id": "flavor",
+      "message": "lookalike libcrypto (AwsLc): provider model absent \u2014 harvest REFUSED (anchors: provider_load=0 version_major=0 engine=0 boring_prefix=0 awslc_prefix=1)",
+      "remediation": "v1 supports genuine OpenSSL only (P5 qualifies forks)",
+      "status": "fail"
+    }
+  ],
+  "exit": 4,
+  "target": {
+    "exe": "map_sleeper",
+    "libcrypto": "/home/ossl/inspect-fixtures/libcrypto.so.awslc",
+    "self_uid": 0,
+    "uid": 1000
+  },
+  "verdict": "fail-closed"
+}
