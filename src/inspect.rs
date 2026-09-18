@@ -24,11 +24,13 @@ pub fn run(args: &[String]) -> ExitCode {
     while let Some(a) = it.next() {
         if a == "--help" || a == "-h" {
             println!(
-                "usage: osslscope inspect --pid PID --provider SO --object BPF [--out FILE] [--marker M] [--builtin [--table FILE] [--force-offset N]] [--legacy]"
+                "usage: osslscope inspect --pid PID --provider SO --object BPF [--out FILE] [--marker M] [--settle S] [--timeout S] [--builtin [--table FILE] [--force-offset N]] [--legacy]"
             );
             println!("  --pid PID: live target to inventory (pinned against pid reuse)");
             println!("  --provider SO: provider .so (or libcrypto with --builtin)");
             println!("  --object BPF: harvest eBPF object (built from crates/ebpf)");
+            println!("  --settle S: attach-settle seconds (default 2)");
+            println!("  --timeout S: trigger-wait seconds (default 30)");
             println!("  --legacy: also attach ENGINE/low-level tripwires");
             println!("  needs CAP_BPF+CAP_PERFMON (run: osslscope doctor)");
             return ExitCode::SUCCESS;
@@ -70,7 +72,7 @@ pub fn run(args: &[String]) -> ExitCode {
     }
     let (Some(pid), Some(provider), Some(object)) = (pid, provider, object) else {
         eprintln!(
-            "usage: osslscope inspect --pid PID --provider SO --object BPF [--out FILE] [--marker M] [--builtin [--table FILE] [--force-offset N]] [--legacy]"
+            "usage: osslscope inspect --pid PID --provider SO --object BPF [--out FILE] [--marker M] [--settle S] [--timeout S] [--builtin [--table FILE] [--force-offset N]] [--legacy]"
         );
         return ExitCode::from(2);
     };
