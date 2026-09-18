@@ -1,0 +1,50 @@
+{
+  "checks": [
+    {
+      "id": "kernel",
+      "message": "kernel features unverifiable without CAP_BPF (release 6.12.0-211.47.1.el10_2.x86_64 informational)",
+      "remediation": "grant file caps: sudo setcap cap_bpf,cap_perfmon+ep $(command -v osslscope) [+cap_sys_ptrace for foreign-uid targets], then re-run",
+      "status": "degraded"
+    },
+    {
+      "id": "token-support",
+      "message": "BPF_TOKEN_CREATE present (6.9+ floor signal; tokens debug-only, never used for privilege)",
+      "status": "info"
+    },
+    {
+      "id": "caps",
+      "message": "missing caps: CAP_BPF+CAP_PERFMON (have neither file caps nor root)",
+      "remediation": "grant file caps: sudo setcap cap_bpf,cap_perfmon+ep $(command -v osslscope) [+cap_sys_ptrace for foreign-uid targets], then re-run",
+      "status": "fail"
+    },
+    {
+      "id": "btf",
+      "message": "BTF present (optional — probe path has zero BTF dependence)",
+      "status": "info"
+    },
+    {
+      "id": "lockdown",
+      "message": "lockdown=none (BPF allowed)",
+      "status": "pass"
+    },
+    {
+      "id": "ima",
+      "message": "IMA active (informational — no known BPF interaction)",
+      "status": "info"
+    },
+    {
+      "id": "lsm",
+      "message": "LSM denial unverifiable without caps (active: lockdown,capability,yama,selinux,bpf,landlock,ima,evm)",
+      "remediation": "grant file caps: sudo setcap cap_bpf,cap_perfmon+ep $(command -v osslscope) [+cap_sys_ptrace for foreign-uid targets], then re-run",
+      "status": "degraded"
+    },
+    {
+      "id": "seccomp",
+      "message": "no seccomp filter (NNP=0)",
+      "status": "info"
+    }
+  ],
+  "exit": 4,
+  "target": null,
+  "verdict": "fail-closed"
+}
