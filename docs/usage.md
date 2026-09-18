@@ -18,7 +18,7 @@ osslscope inspect --pid 1234 --provider /opt/openssl/lib64/ossl-modules/legacy.s
 
 - `--builtin` inventories libcrypto's built-in provider instead
   of a `.so` (with `--table`/`--force-offset` for stripped
-  binaries — see the built-in runbook).
+  binaries — see [the built-in runbook](builtin-runbook.md)).
 - `--legacy` additionally attaches ENGINE/low-level tripwires
   (fails loud if the target lacks them).
 - The pid is pinned against reuse: if the process exits and
@@ -123,6 +123,7 @@ addresses claimed by several (provider, op, funcid) triples.
   drop events; drops are counted and reported (PARTIAL),
   never silent — but size `--duration` windows accordingly.
 - Stripped libcrypto needs `--table`/`--force-offset` help
-  for built-in inventory (the runbook has the recipe).
+  for built-in inventory
+  ([recipe](builtin-runbook.md)).
 - FIPS-provider builds change dispatch shapes; support is
   best-effort and explicitly versioned per release.
