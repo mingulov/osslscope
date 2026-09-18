@@ -204,7 +204,10 @@ fn take_key(map: &HashMap<u64, u64>, key: u64) -> Option<u64> {
 }
 
 /// PENDING key namespaced by attach cookie: primary (0) and legacy
-/// (1) attachments share the maps (pid_tgid never sets bit 56+).
+/// (1) attachments share the maps. Bits 56+ carry the namespace,
+/// which is collision-free only while pid_tgid leaves them clear —
+/// true under default pid_max (2^22); a >2^24 TGID namespace would
+/// need a wider key (P5 stretch, never observed).
 fn pend_key(cookie: u64) -> u64 {
     helpers::bpf_get_current_pid_tgid() ^ ((cookie + 1) << 56)
 }
@@ -333,17 +336,19 @@ pub fn query_entry(ctx: ProbeContext) -> u32 {
 /// scope). Emits one ROW event per entry (`aux`/`idx` = array address
 /// + alg index, the userspace ALG-join key); returns true when the
 /// table runs past MAX_DISPATCH without a terminator (TRUNC).
+/// Returns 0 (terminator), 1 (overflow), or 2 (read abort — the
+/// caller freezes the counter so the next query re-walks).
 #[inline(never)]
-fn walk_dispatch(imp: u64, op: u32, arr: u64, j: u64) -> bool {
+fn walk_dispatch(imp: u64, op: u32, arr: u64, j: u64) -> u64 {
     for k in 0..MAX_DISPATCH {
         let base = imp + k * 16;
         let fid = unsafe { helpers::bpf_probe_read_user(base as *const u32) };
         let fptr = unsafe { helpers::bpf_probe_read_user((base + 8) as *const u64) };
         let (Ok(fid), Ok(fptr)) = (fid, fptr) else {
-            return false;
+            return 2;
         };
         if fid == 0 {
-            return false;
+            return 0;
         }
         emit_row(&RowEvent {
             kind: KIND_ROW,
@@ -355,7 +360,7 @@ fn walk_dispatch(imp: u64, op: u32, arr: u64, j: u64) -> bool {
             idx: j,
         });
     }
-    true
+    1
 }
 
 /// At query-return walk exactly one alg of the OSSL_ALGORITHM array
@@ -445,12 +450,8 @@ pub fn query_return(ctx: RetProbeContext) -> u32 {
         }
         return 0;
     }
-    // Advance past this slot ONLY on a fully-walked alg: BPF probe
-    // reads are nofault, so a cold (never-touched) page aborts the
-    // walk even though the table is valid — freezing the counter
-    // lets the next query re-walk this slot instead of losing the
-    // alg forever (the terminator path above still freezes too).
-    let _ = QUERY_NEXT.insert(key, count.wrapping_add(1), 0);
+    // ALG first: userspace drops rows whose (array, index) has no
+    // ALG record yet (orphan rule), so rows must follow their ALG.
     emit(&Event {
         kind: KIND_ALG,
         op: op as u32,
@@ -460,8 +461,25 @@ pub fn query_return(ctx: RetProbeContext) -> u32 {
         aux: j,
         name,
     });
-    if walk_dispatch(imp, op as u32, rv, j) {
-        flag_trunc(op as u32, TRUNC_DISPATCH);
+    // Advance past this slot ONLY on a fully-walked alg: BPF probe
+    // reads are nofault, so a cold (never-touched) page aborts the
+    // walk even though the table is valid — freezing the counter
+    // lets the next query re-walk this slot instead of losing the
+    // alg forever (the terminator path above still freezes too, and
+    // a dispatch read-abort freezes as well: ALG/ROW re-emits
+    // dedupe userside via the alg_names overwrite + rows seen-map).
+    match walk_dispatch(imp, op as u32, rv, j) {
+        // Overflow: rows 0..127 are kept, the rest is unwalkable —
+        // advance past like a success, but flag the truncation.
+        1 => {
+            let _ = QUERY_NEXT.insert(key, count.wrapping_add(1), 0);
+            flag_trunc(op as u32, TRUNC_DISPATCH);
+        }
+        0 => {
+            let _ = QUERY_NEXT.insert(key, count.wrapping_add(1), 0);
+        }
+        // Read abort: no insert (freeze for re-walk).
+        _ => {}
     }
     0
 }

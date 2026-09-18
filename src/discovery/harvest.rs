@@ -1221,8 +1221,12 @@ pub fn run_detailed(
     let mut zero_row_ops: Vec<u32> = ops_hit.difference(&ops_with_rows).copied().collect();
     zero_row_ops.sort_unstable();
     let truncated = read_trunc(&loaded.maps);
-    // Exact call volume from the CALLS map (QUERY_RET events are
+    // Call volume from the CALLS map (QUERY_RET events are
     // first-hit-only; the event count is the pre-exit-2 fallback).
+    // Best-effort under threads: shared-map increments are
+    // read-modify-write, so concurrent hits may undercount; the
+    // cold-gap trigger (>0) is robust to that, only the counter
+    // value may read low.
     if let Some(calls) = read_calls(&loaded.maps) {
         queries_observed = calls;
     }
