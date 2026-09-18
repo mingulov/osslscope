@@ -1,0 +1,89 @@
+{
+  "checks": [
+    {
+      "id": "kernel",
+      "message": "features ok (kprobe-load, ringbuf, uprobe-multi+cookies, probe_read_user) on 6.18.52-0-lts (informational)",
+      "status": "pass"
+    },
+    {
+      "id": "token-support",
+      "message": "BPF_TOKEN_CREATE present (6.9+ floor signal; tokens debug-only, never used for privilege)",
+      "status": "info"
+    },
+    {
+      "id": "caps",
+      "message": "CAP_SYS_ADMIN effective",
+      "status": "pass"
+    },
+    {
+      "id": "btf",
+      "message": "BTF present (optional \u2014 probe path has zero BTF dependence)",
+      "status": "info"
+    },
+    {
+      "id": "lockdown",
+      "message": "lockdown=none (BPF allowed)",
+      "status": "pass"
+    },
+    {
+      "id": "ima",
+      "message": "IMA absent-or-disabled (informational \u2014 no known BPF interaction)",
+      "status": "info"
+    },
+    {
+      "id": "lsm",
+      "message": "no LSM denial (BPF ops succeed; active: lockdown,capability,landlock,yama)",
+      "status": "pass"
+    },
+    {
+      "id": "seccomp",
+      "message": "no seccomp filter (NNP=0)",
+      "status": "info"
+    },
+    {
+      "id": "pidns",
+      "message": "target is in a different pid namespace \u2014 attach sees wrong PIDs",
+      "remediation": "nsenter -t <pid> -p -- osslscope <cmd> ...",
+      "status": "fail"
+    },
+    {
+      "id": "foreign-uid",
+      "message": "same-uid target (uid 0) \u2014 no foreign-uid probe needed",
+      "status": "info"
+    },
+    {
+      "id": "target-access",
+      "message": "target maps readable",
+      "status": "pass"
+    },
+    {
+      "id": "libcrypto-found",
+      "message": "libcrypto: /usr/lib/libcrypto.so.3",
+      "status": "pass"
+    },
+    {
+      "id": "arch",
+      "message": "x86-64 (ELFCLASS64, EM_X86_64)",
+      "status": "pass"
+    },
+    {
+      "id": "flavor",
+      "message": "OpenSSL 3.5 (3.x)",
+      "status": "pass"
+    },
+    {
+      "id": "build-id",
+      "message": "unknown build-id c07132f5e3525ae1768f8374d94b00cc9b77832c (not in frozen table of 10 entries) \u2014 custom libcrypto build?",
+      "remediation": "anchor+delta fallback may work (inspect tries it); enroll via etc/build-id-table.json",
+      "status": "fail"
+    }
+  ],
+  "exit": 4,
+  "target": {
+    "exe": "coreutils",
+    "libcrypto": "/usr/lib/libcrypto.so.3",
+    "self_uid": 0,
+    "uid": 0
+  },
+  "verdict": "fail-closed"
+}

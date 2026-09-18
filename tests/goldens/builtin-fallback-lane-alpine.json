@@ -1,0 +1,19 @@
+{
+  "gen": 0,
+  "provider": "default",
+  "queries_observed": 6,
+  "reason": "zero-rows",
+  "resolution": "anchor+delta",
+  "rows": [],
+  "status": "PARTIAL",
+  "trigger_observed": true,
+  "truncated_ops": {
+    "1": 4,
+    "12": 4
+  },
+  "uninstrumented_ops": 14,
+  "zero_row_ops": [
+    1,
+    12
+  ]
+}

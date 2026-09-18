@@ -81,6 +81,15 @@
       "query_offset": 2612992,
       "anchor": "OSSL_PROVIDER_available",
       "anchor_offset": 2612560
+    },
+    {
+      "build_id": "2e6dcb930add37354c6de6b8edb5c5240b0e1277",
+      "openssl": "4.0.2",
+      "lane": "lane-alpine",
+      "path": "/opt/openssl-4.0.2/lib64/libcrypto.so",
+      "query_offset": 2401648,
+      "anchor": "OSSL_PROVIDER_available",
+      "anchor_offset": 2401216
     }
   ],
   "fallback": [
