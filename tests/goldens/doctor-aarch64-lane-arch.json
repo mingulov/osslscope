@@ -1,0 +1,78 @@
+{
+  "checks": [
+    {
+      "id": "kernel",
+      "message": "features ok (kprobe-load, ringbuf, uprobe-multi+cookies, probe_read_user) on 7.2.6-arch2-1 (informational)",
+      "status": "pass"
+    },
+    {
+      "id": "token-support",
+      "message": "BPF_TOKEN_CREATE present (6.9+ floor signal; tokens debug-only, never used for privilege)",
+      "status": "info"
+    },
+    {
+      "id": "caps",
+      "message": "CAP_SYS_ADMIN effective",
+      "status": "pass"
+    },
+    {
+      "id": "btf",
+      "message": "BTF present (optional \u2014 probe path has zero BTF dependence)",
+      "status": "info"
+    },
+    {
+      "id": "lockdown",
+      "message": "lockdown=none (BPF allowed)",
+      "status": "pass"
+    },
+    {
+      "id": "ima",
+      "message": "IMA absent-or-disabled (informational \u2014 no known BPF interaction)",
+      "status": "info"
+    },
+    {
+      "id": "lsm",
+      "message": "no LSM denial (BPF ops succeed; active: capability,landlock,lockdown,yama,bpf)",
+      "status": "pass"
+    },
+    {
+      "id": "seccomp",
+      "message": "no seccomp filter (NNP=0)",
+      "status": "info"
+    },
+    {
+      "id": "pidns",
+      "message": "no process target (--libcrypto is bytes-only)",
+      "status": "info"
+    },
+    {
+      "id": "foreign-uid",
+      "message": "no process target (--libcrypto is bytes-only)",
+      "status": "info"
+    },
+    {
+      "id": "target-access",
+      "message": "libcrypto file given directly (--libcrypto)",
+      "status": "pass"
+    },
+    {
+      "id": "libcrypto-found",
+      "message": "libcrypto: /tmp/doctor/doctor-aarch64",
+      "status": "pass"
+    },
+    {
+      "id": "arch",
+      "message": "arch AArch64 \u2014 v1 x86-64 only",
+      "remediation": "run against a 64-bit x86-64 OpenSSL build",
+      "status": "fail"
+    }
+  ],
+  "exit": 4,
+  "target": {
+    "exe": "doctor-aarch64",
+    "libcrypto": "/tmp/doctor/doctor-aarch64",
+    "self_uid": 0,
+    "uid": null
+  },
+  "verdict": "fail-closed"
+}
