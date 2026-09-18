@@ -256,11 +256,19 @@ pub fn attach_group(
     ossl_bpf_sys::link_create_uprobe_multi(prog_fd, &cpath, offsets, cookies, pid)
 }
 
-/// Attach one group's sites, bisecting EINVALs to isolate
+/// Permission-class failures are systemic (caps/LSM), never
+/// per-offset: fail the whole slice without a retry storm.
+fn is_permission_err(e: &std::io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(libc::EACCES) | Some(libc::EPERM))
+}
+
+/// Attach one group's sites, bisecting attach errors to isolate
 /// kernel-rejected offsets (bounded: ≤ 2n−1 attempts, log n depth).
-/// `attach` tries a slice as ONE multi link. Non-EINVAL errors fail
-/// the whole slice (no retry storm on EPERM-class faults). Returns
-/// live links + refused site indices (→ `unresolved_offsets`).
+/// `attach` tries a slice as ONE multi link. Only permission-class
+/// errors fail the whole slice; anything else (EINVAL, unknown
+/// kernel errnos — RHEL returns 524 for un-attachable offsets)
+/// bisects, so one poison offset cannot sink good siblings.
+/// Returns live links + refused site indices (→ `unresolved_offsets`).
 /// Generic over the link handle so the isolation logic unit-tests
 /// without caps or fds; production passes `attach_group`.
 pub type TryAttach<'a, T> = dyn Fn(&[(u64, u64)]) -> std::io::Result<T> + 'a;
@@ -276,7 +284,7 @@ pub fn bisect_attach<T>(attach: &TryAttach<'_, T>, sites: &[(u64, u64)]) -> (Vec
         let slice: Vec<(u64, u64)> = idxs.iter().map(|&i| sites[i]).collect();
         match attach(&slice) {
             Ok(l) => links.push(l),
-            Err(e) if e.raw_os_error() == Some(libc::EINVAL) && idxs.len() > 1 => {
+            Err(e) if !is_permission_err(&e) && idxs.len() > 1 => {
                 let mid = idxs.len() / 2;
                 stack.push(idxs[mid..].to_vec());
                 stack.push(idxs[..mid].to_vec());
@@ -399,15 +407,23 @@ mod tests {
         assert!(plan(&doc(vec![bad]), &live, &files, 0).is_err());
     }
 
-    /// Stub multi attach: EINVAL iff the slice holds a poison offset.
-    fn poisoned(poison: Vec<u64>) -> impl Fn(&[(u64, u64)]) -> std::io::Result<()> {
+    /// Stub multi attach: `errno` iff the slice holds a poison offset.
+    fn poisoned_with(
+        poison: Vec<u64>,
+        errno: i32,
+    ) -> impl Fn(&[(u64, u64)]) -> std::io::Result<()> {
         move |slice: &[(u64, u64)]| {
             if slice.iter().any(|(o, _)| poison.contains(o)) {
-                Err(std::io::Error::from_raw_os_error(libc::EINVAL))
+                Err(std::io::Error::from_raw_os_error(errno))
             } else {
                 Ok(())
             }
         }
+    }
+
+    /// Stub multi attach: EINVAL iff the slice holds a poison offset.
+    fn poisoned(poison: Vec<u64>) -> impl Fn(&[(u64, u64)]) -> std::io::Result<()> {
+        poisoned_with(poison, libc::EINVAL)
     }
 
     #[test]
@@ -419,6 +435,32 @@ mod tests {
         let (links, bad) = bisect_attach(&poisoned(vec![]), &sites);
         assert_eq!(links.len(), 1);
         assert!(bad.is_empty());
+    }
+
+    #[test]
+    fn bisect_isolates_nonstandard_errno() {
+        // RHEL returns 524 (no libc string) for un-attachable
+        // offsets; it must bisect like EINVAL, not sink the batch.
+        let sites: Vec<(u64, u64)> = (0..8u64).map(|i| (0x1000 + i * 8, i)).collect();
+        let (links, bad) = bisect_attach(&poisoned_with(vec![0x1018, 0x1030], 524), &sites);
+        assert_eq!(links.len(), 4);
+        assert_eq!(bad, vec![3, 6]);
+    }
+
+    #[test]
+    fn bisect_fails_fast_on_permission_err() {
+        // Systemic EPERM: one attempt, whole slice condemned, no storm.
+        use std::cell::Cell;
+        let sites: Vec<(u64, u64)> = (0..8u64).map(|i| (0x1000 + i * 8, i)).collect();
+        let calls = Cell::new(0u32);
+        let stub = |_slice: &[(u64, u64)]| -> std::io::Result<()> {
+            calls.set(calls.get() + 1);
+            Err(std::io::Error::from_raw_os_error(libc::EPERM))
+        };
+        let (links, bad) = bisect_attach(&stub, &sites);
+        assert!(links.is_empty());
+        assert_eq!(bad, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(calls.get(), 1);
     }
 
     #[test]
