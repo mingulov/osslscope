@@ -72,7 +72,7 @@
     },
     {
       "id": "build-id",
-      "message": "unknown build-id 5390940e06ba87e5d898c665dd9aea65a8867825 (not in frozen table of 5 entries) — custom libcrypto build?",
+      "message": "unknown build-id 5390940e06ba87e5d898c665dd9aea65a8867825 (not in frozen table of 6 entries) — custom libcrypto build?",
       "remediation": "anchor+delta fallback may work (inspect tries it); enroll via etc/build-id-table.json",
       "status": "fail"
     }
