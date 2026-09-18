@@ -25,7 +25,7 @@ int OSSL_provider_init(const OSSL_CORE_HANDLE *handle,
 static void query_all_rounds(OSSL_PROVIDER *p)
 {
     const char *er = getenv("SPIKE_QUERY_ROUNDS");
-    int rounds = er != NULL ? atoi(er) : 256;
+    int rounds = er != NULL ? atoi(er) : 512;
     int r, op;
 
     if (getenv("SPIKE_QUERY_ALL") == NULL)

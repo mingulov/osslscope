@@ -2,7 +2,7 @@
   "foreign_rows_dropped": 515,
   "gen": 0,
   "provider": "default",
-  "queries_observed": 9222,
+  "queries_observed": 18438,
   "resolution": "anchor+delta",
   "rows": [
     {

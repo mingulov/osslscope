@@ -2,7 +2,7 @@
   "foreign_rows_dropped": 567,
   "gen": 0,
   "provider": "default",
-  "queries_observed": 10246,
+  "queries_observed": 20486,
   "rows": [
     {
       "addr_backed": true,

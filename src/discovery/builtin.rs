@@ -293,7 +293,7 @@ mod tests {
     #[test]
     fn shipped_table_loads_with_spot_checks() {
         let t = shipped_table();
-        assert_eq!(t.entry_count(), 8);
+        assert_eq!(t.entry_count(), 10);
         assert_eq!(t.fallback_count(), 4);
         let e = t
             .by_build_id("b12cd44337cb70619dd290b2396ab5dfcaea230f")

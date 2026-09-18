@@ -1,8 +1,9 @@
 /* Sentinel provider (P4 exit 2): hostile algorithm names + an
  * overlong digest array. The query fn returns a runtime-built
  * OSSL_ALGORITHM array: 4 sentinel-named algs (short, exact-128,
- * overlong-200, unterminated) + 260 filler algs = 264 entries, one
- * past the 256 walk bound (TRUNC_ALGS must fire). All names carry
+ * overlong-200, unterminated) + 516 filler algs = 520 entries:
+ * slots 0..511 walk, the guard at slot 512 sees live entries
+ * (TRUNC_ALGS must fire). All names carry
  * the CNRY7QN- prefix: the canary scanner asserts the prefix is
  * PRESENT in the raw ring dump (alias lanes really traversed the
  * string-read site) and ABSENT from every classified artifact.
@@ -19,7 +20,7 @@
 #define N_ALG_LONG_PFX "CNRY7QN-ALG-LONG-27-"
 #define N_ALG_UNTERM_PFX "CNRY7QN-ALG-UNTERM-28-"
 #define N_FILLER_PFX "CNRY7QN-FILLER-"
-#define N_FILLERS 260
+#define N_FILLERS 516
 
 static void *sn_newctx(void *provctx)
 {

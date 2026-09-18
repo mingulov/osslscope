@@ -23,10 +23,10 @@
  * SPIKE_SIG="" skips the signature fetch (digest-only providers such as
  * legacy/alias). SPIKE_QUERY_ALL=1 fires the M2 re-query trigger for
  * inventory completeness: direct OSSL_PROVIDER_query_operation calls
- * for every op x SPIKE_QUERY_ROUNDS (default 256) on the loaded
+ * for every op x SPIKE_QUERY_ROUNDS (default 512) on the loaded
  * provider + default + legacy after GO1 and in the GO2 fresh libctx
- * (P1 exit 2; one alg walked per query-return hit, 256/op covers the
- * BPF bound). */
+ * (P1 exit 2; one alg walked per query-return hit, 512/op covers the
+ * BPF bound — LOCKSTEP with MAX_ALGS, never below it). */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -76,13 +76,13 @@ static const char *storm_sig;
 /* P1 exit 2: inventory-completeness trigger. Harvest only observes ops
  * the target queries, one alg per query-return hit; direct
  * query_operation calls (public API, same function the harvest uprobe
- * attaches to) cover every op without an alg-name matrix. 256
+ * attaches to) cover every op without an alg-name matrix. 512
  * rounds/op cover the BPF alg bound. */
 static void query_all_rounds(OSSL_LIB_CTX *ctx, const char *prov)
 {
     const char *targets[3];
     const char *er = getenv("SPIKE_QUERY_ROUNDS");
-    int rounds = er != NULL ? atoi(er) : 256;
+    int rounds = er != NULL ? atoi(er) : 512;
     int r, op, t;
 
     if (getenv("SPIKE_QUERY_ALL") == NULL)

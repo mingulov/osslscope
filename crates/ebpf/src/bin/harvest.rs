@@ -14,9 +14,9 @@
 //! Walk bounds (P1 exit 2, default-provider census 4.0.2: 241 algs/op
 //! max, 115 dispatch entries/alg max, 81-char names max): each
 //! query-return hit walks exactly ONE alg — index = per-(thread, op)
-//! query count mod 256 — so an op queried N times covers algs 0..N
-//! (order-independent; single-shot triggers walk alg 0). The 256-call
-//! inventory trigger covers 256 algs/op; array overrun is detected by
+//! query count mod 512 — so an op queried N times covers algs 0..N
+//! (order-independent; single-shot triggers walk alg 0). The 512-call
+//! inventory trigger covers 512 algs/op; array overrun is detected by
 //! reading one past the last slot (sets TRUNC[op] bit 1) and dispatch
 //! tables past 128 entries set bit 2 — userspace degrades to PARTIAL,
 //! so growth fails closed, never truncates silently. The single-alg
@@ -99,8 +99,14 @@ struct TripEvent {
 /// core_dispatch.h: provider codes live at 1024+; verified 2026-09-16.
 const OSSL_FUNC_PROVIDER_QUERY_OPERATION: u32 = 1027;
 
-/// Alg-array bound per op (measured max 241, 4.0.2 encoders).
-const MAX_ALGS: u64 = 256;
+/// Alg-array bound per op (measured max 364, oqsprovider encoder;
+/// 512 is the next power of two with headroom). No BPF loop runs
+/// on this bound — one alg slot per query-return hit — so the
+/// raise costs the verifier nothing. LOCKSTEP: the inventory
+/// trigger rounds (SPIKE_QUERY_ROUNDS, fixture default) must stay
+/// >= this bound, or arrays past the round count go silently
+/// unflagged (the overrun guard only fires at the last slot).
+const MAX_ALGS: u64 = 512;
 /// Dispatch-table bound per alg (measured max 115, RSA encoder, stable
 /// across 3.0/3.5/4.0; 128 keeps the verifier under its 1M processed-insn
 /// ceiling with ~2x margin — overflow fails closed via TRUNC).
@@ -133,8 +139,8 @@ static QUERY_NEXT: HashMap<u64, u64> = HashMap::with_max_entries(4096, 0);
 /// Walk-overflow flags per op id; userspace degrades to PARTIAL.
 #[map]
 static TRUNC: HashMap<u32, u64> = HashMap::with_max_entries(64, 0);
-/// Non-null query calls per op id. The 256-round inventory trigger
-/// fires ~34K calls in milliseconds; counting in-map (instead of a
+/// Non-null query calls per op id. The 512-round inventory trigger
+/// fires ~68K calls in milliseconds; counting in-map (instead of a
 /// ring event per call) keeps the ring burst under 1MB. QUERY_RET is
 /// emitted on the first hit per array only (liveness + ops-hit).
 #[map]
@@ -364,7 +370,7 @@ fn walk_dispatch(imp: u64, op: u32, arr: u64, j: u64) -> u64 {
 }
 
 /// At query-return walk exactly one alg of the OSSL_ALGORITHM array
-/// (index = per-(thread, array) query count mod 256) plus its dispatch
+/// (index = per-(thread, array) query count mod 512) plus its dispatch
 /// table. The counter freezes at the first terminator (names == 0):
 /// later hits re-read the terminator and stop, so short arrays never
 /// walk past their end (impl-less algs still advance — they can sit
@@ -432,8 +438,8 @@ pub fn query_return(ctx: RetProbeContext) -> u32 {
         }
         return 0;
     }
-    // Overrun guard on the last slot: entries 0..=255 all live means
-    // the array may extend past the bound — slot 256 decides (live or
+    // Overrun guard on the last slot: entries 0..=511 all live means
+    // the array may extend past the bound — slot 512 decides (live or
     // unreadable = TRUNC, terminator = clean).
     if j == MAX_ALGS - 1 {
         let tail = unsafe { helpers::bpf_probe_read_user((rv + MAX_ALGS * 32) as *const u64) };
