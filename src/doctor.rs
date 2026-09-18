@@ -908,13 +908,20 @@ fn check_caps(env: &Env) -> Check {
         } else {
             "CAP_BPF+CAP_PERFMON"
         };
-        // Corroborate the perf path (LSM can block perf with caps held).
+        // Perf corroboration is INFORMATIONAL only (reunification
+        // 2026-09-18): the raw-multi attach path uses zero
+        // perf_events (proven: full attach works with perf denied),
+        // and the kernel row functionally proves the BPF ops. A
+        // perf denial with caps held is an LSM curiosity about an
+        // unused interface — never a verdict.
         let perf = run_perf_self();
         if !perf.ok && is_perm_errno(perf.errno) {
-            let ctx = env.deny_ctx();
-            if let ProbeVerdict::Denied(m, r) = classify_probe("perf", &perf, &ctx, true) {
-                return Check::fail("caps", format!("{via} held but perf denied: {m}"), r);
-            }
+            return Check::pass(
+                "caps",
+                format!(
+                    "{via} effective (perf_event_open denied — unused by the attach path; informational)"
+                ),
+            );
         }
         return Check::pass("caps", format!("{via} effective"));
     }
@@ -976,8 +983,10 @@ fn check_ima() -> Check {
 
 fn check_lsm(env: &Env) -> Check {
     // Distinguished probe: BPF ops attempted above would have failed
-    // with caps held iff LSM (or lockdown/seccomp) denies. Re-run one
-    // cheap op to attribute the perf path too.
+    // with caps held iff LSM (or lockdown/seccomp) denies. Perf is
+    // probed for context only — the attach path never uses it
+    // (reunification 2026-09-18), so a perf denial alone is not a
+    // denial of anything we do.
     let bpf_ok = run_map_create(ossl_bpf_sys::BPF_MAP_TYPE_ARRAY, 4, 8, 1).ok;
     let perf_ok = run_perf_self().ok;
     let mods = if env.lsm.is_empty() {
@@ -985,10 +994,15 @@ fn check_lsm(env: &Env) -> Check {
     } else {
         env.lsm.join(",")
     };
-    if bpf_ok && perf_ok {
+    if bpf_ok {
+        let perf_note = if perf_ok {
+            ""
+        } else {
+            " (perf_event_open denied — unused; informational)"
+        };
         return Check::pass(
             "lsm",
-            format!("no LSM denial (BPF+perf ops succeed; active: {mods})"),
+            format!("no LSM denial (BPF ops succeed; active: {mods}){perf_note}"),
         );
     }
     if !has_cap(env.eff, CAP_BPF) {
@@ -998,11 +1012,11 @@ fn check_lsm(env: &Env) -> Check {
             SETCAP_RECIPE.into(),
         );
     }
-    // Caps held but an op failed: attribute via the classifier inputs.
+    // Caps held but the BPF op failed: attribute via the classifier inputs.
     if env.lockdown == "confidentiality" {
         return Check::fail(
             "lsm",
-            "BPF/perf denied with caps held — lockdown=confidentiality, not LSM".into(),
+            "BPF denied with caps held — lockdown=confidentiality, not LSM".into(),
             "see the lockdown check".into(),
         );
     }
@@ -1016,13 +1030,13 @@ fn check_lsm(env: &Env) -> Check {
     if env.seccomp == 2 {
         return Check::fail(
             "lsm",
-            "BPF/perf denied with caps held, no enforcing LSM — suspect the seccomp filter".into(),
+            "BPF denied with caps held, no enforcing LSM — suspect the seccomp filter".into(),
             "see the seccomp check".into(),
         );
     }
     Check::fail(
         "lsm",
-        "BPF/perf denied with caps held, no lockdown/LSM/seccomp attribution".into(),
+        "BPF denied with caps held, no lockdown/LSM/seccomp attribution".into(),
         "unexplained denial — see dmesg + audit log; file it with the doctor JSON".into(),
     )
 }

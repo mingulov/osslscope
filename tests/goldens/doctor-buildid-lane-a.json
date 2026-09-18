@@ -32,7 +32,7 @@
     },
     {
       "id": "lsm",
-      "message": "no LSM denial (BPF+perf ops succeed; active: lockdown,capability,landlock,yama,apparmor,tomoyo,bpf,ipe,ima,evm)",
+      "message": "no LSM denial (BPF ops succeed; active: lockdown,capability,landlock,yama,apparmor,tomoyo,bpf,ipe,ima,evm)",
       "status": "pass"
     },
     {
