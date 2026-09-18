@@ -685,9 +685,15 @@ pub fn load(prep: &Prepared) -> anyhow::Result<Loaded> {
     use anyhow::Context as _;
     let mut maps = HashMap::new();
     for m in &prep.maps {
-        let fd =
-            ossl_bpf_sys::map_create(m.map_type, m.key_size, m.value_size, m.max_entries, None)
-                .with_context(|| format!("map_create {}", m.name))?;
+        let fd = ossl_bpf_sys::map_create(
+            m.map_type,
+            m.key_size,
+            m.value_size,
+            m.max_entries,
+            None,
+            &m.name,
+        )
+        .with_context(|| format!("map_create {}", m.name))?;
         maps.insert(m.name.clone(), fd);
     }
     let mut progs = HashMap::new();
@@ -711,14 +717,16 @@ pub fn load(prep: &Prepared) -> anyhow::Result<Loaded> {
         }
         let mut log = vec![0u8; 1 << 20];
         let license = c"GPL";
-        let fd = ossl_bpf_sys::prog_load_kprobe(&insns, license, None, &mut log).map_err(|e| {
-            let detail = String::from_utf8_lossy(&log)
-                .trim_end_matches('\0')
-                .chars()
-                .take(2000)
-                .collect::<String>();
-            anyhow::anyhow!("prog_load {}: {e}\n{detail}", p.name)
-        })?;
+        let fd = ossl_bpf_sys::prog_load_kprobe(&insns, license, None, &mut log, &p.name).map_err(
+            |e| {
+                let detail = String::from_utf8_lossy(&log)
+                    .trim_end_matches('\0')
+                    .chars()
+                    .take(2000)
+                    .collect::<String>();
+                anyhow::anyhow!("prog_load {}: {e}\n{detail}", p.name)
+            },
+        )?;
         progs.insert(p.name.clone(), fd);
     }
     Ok(Loaded { progs, maps })

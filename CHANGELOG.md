@@ -13,6 +13,10 @@
   digest/sign/cipher/MAC/KEM/KDF/RAND/password/salt/propquery
   paths, threaded stack lanes) and `sentinel` provider (hostile
   alg names + 264-entry overlong array).
+- Raw loader names kernel programs and maps (bpftool-visible;
+  enables name-based map inventory); `evp_driver` gains
+  `SPIKE_PROPQ` to decouple the fetch propquery name from the
+  provider load name.
 
 ## Unreleased — P3 semantics + policy
 

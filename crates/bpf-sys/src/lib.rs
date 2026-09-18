@@ -136,15 +136,22 @@ fn zeroed<T>() -> T {
 }
 
 /// Create a map from raw dimensions, authorized by `token` when set.
+/// `name` lands in the kernel map name (truncated to 15 bytes) so
+/// operators and the canary map poller can inventory our maps via
+/// bpftool; unnamed maps are invisible to name-based inventory.
 pub fn map_create(
     map_type: u32,
     key_size: u32,
     value_size: u32,
     max_entries: u32,
     token: Option<RawFd>,
+    name: &str,
 ) -> io::Result<OwnedFd> {
     let mut attr: MapAttr = zeroed();
     attr.map_type = map_type;
+    let bytes = name.as_bytes();
+    let n = bytes.len().min(15);
+    attr.map_name[..n].copy_from_slice(&bytes[..n]);
     attr.key_size = key_size;
     attr.value_size = value_size;
     attr.max_entries = max_entries;
@@ -183,15 +190,22 @@ pub fn map_update_elem(map_fd: RawFd, key: &[u8], value: &[u8], flags: u64) -> i
 
 /// Load a KPROBE-typed program (uprobe family). `insns` is raw 8B-stride
 /// BPF bytecode; verifier output lands in `log_buf` on failure.
+/// `name` lands in the kernel prog name (truncated to 15 bytes) so
+/// operators and the canary map poller can identify our programs via
+/// bpftool; unnamed programs are invisible to name-based inventory.
 pub fn prog_load_kprobe(
     insns: &[u8],
     license: &CStr,
     token: Option<RawFd>,
     log_buf: &mut [u8],
+    name: &str,
 ) -> io::Result<OwnedFd> {
     assert!(insns.len() % 8 == 0, "BPF insn stride is 8 bytes");
     let mut attr: ProgAttr = zeroed();
     attr.prog_type = BPF_PROG_TYPE_KPROBE;
+    let bytes = name.as_bytes();
+    let n = bytes.len().min(15);
+    attr.prog_name[..n].copy_from_slice(&bytes[..n]);
     // Multi attach requires this at load (is_uprobe_multi checks
     // expected_attach_type, not the link's attach_type); 0 yields EINVAL.
     attr.expected_attach_type = BPF_TRACE_UPROBE_MULTI;

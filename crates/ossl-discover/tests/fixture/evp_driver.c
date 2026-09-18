@@ -17,7 +17,8 @@
  * With -storm T (P0-13), GO3 instead runs T threads x 50 fresh-libctx
  * fetch pairs (concurrent query_operation storm for the harvest uretprobe
  * proof) and prints STORMDONE threads=T iters=50 fail=F.
- * Env: SPIKE_PROV (default spike), SPIKE_DIGEST (default SPIKE-SHA),
+ * Env: SPIKE_PROV (default spike), SPIKE_PROPQ (default SPIKE_PROV),
+ * SPIKE_DIGEST (default SPIKE-SHA),
  * SPIKE_SIG (default SPIKE-SIG) select provider + fetched algs.
  * SPIKE_SIG="" skips the signature fetch (digest-only providers such as
  * legacy/alias). SPIKE_QUERY_ALL=1 fires the M2 re-query trigger for
@@ -421,6 +422,7 @@ int main(int argc, char **argv)
     int fallback = 0;
     const char *alg = NULL;
     const char *prov;
+    const char *propq;
     const char *dig_name, *sig_name;
     const char *dig2_name, *sig2_name;
     char propquery[128];
@@ -529,11 +531,19 @@ int main(int argc, char **argv)
     sig2_name = getenv("SPIKE_SIG2");
     if (sig2_name == NULL)
         sig2_name = "";
-    snprintf(propquery, sizeof propquery, "provider=%s", prov);
+    /* Fetch-side provider name: fetch matches provider=X against
+     * per-algorithm property_definition strings, NOT the load name
+     * (e.g. the stripped sentinel cell loads file sentinel_strip.so
+     * whose algs carry provider=sentinel). Default keeps the
+     * historical load-name == properties-name coincidence. */
+    propq = getenv("SPIKE_PROPQ");
+    if (propq == NULL || *propq == '\0')
+        propq = prov;
+    snprintf(propquery, sizeof propquery, "provider=%s", propq);
     storm_prov = prov;
     storm_dig = dig_name;
     storm_sig = sig_name;
-    snprintf(storm_propquery, sizeof storm_propquery, "provider=%s", prov);
+    snprintf(storm_propquery, sizeof storm_propquery, "provider=%s", propq);
     if (!OSSL_PROVIDER_available(NULL, prov)
         && OSSL_PROVIDER_load(NULL, prov) == NULL) {
         fprintf(stderr, "evp_driver: %s provider unavailable\n", prov);
