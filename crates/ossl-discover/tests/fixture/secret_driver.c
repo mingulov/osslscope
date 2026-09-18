@@ -288,9 +288,21 @@ static void lane_kem(void)
         LANE_SKIP("kem", "encapsulate_init-unsupported");
         goto done;
     }
-    ok = EVP_PKEY_encapsulate(ctx, NULL, &ctlen, NULL, &sslen) > 0
-        && (ct = malloc(ctlen)) != NULL
-        && (ss1 = malloc(sslen)) != NULL
+    {
+        int er = EVP_PKEY_encapsulate(ctx, NULL, &ctlen, NULL, &sslen);
+
+        if (er == -2) {
+            /* Op unsupported by this provider build (3.0 RSA
+             * carries the KEM name but no encapsulate op):
+             * loud skip, same doctrine as init. */
+            LANE_SKIP("kem", "encapsulate-unsupported");
+            goto done;
+        }
+        ok = er > 0;
+    }
+    ok = ok
+        && (ct = malloc(ctlen ? ctlen : 1)) != NULL
+        && (ss1 = malloc(sslen ? sslen : 1)) != NULL
         && EVP_PKEY_encapsulate(ctx, ct, &ctlen, ss1, &sslen) > 0
         && EVP_PKEY_decapsulate_init(ctx, NULL) > 0
         && EVP_PKEY_decapsulate(ctx, NULL, &ss2len, ct, ctlen) > 0
