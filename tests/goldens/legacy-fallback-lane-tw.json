@@ -1,0 +1,571 @@
+{
+  "gen": 0,
+  "legacy": {
+    "capability": {
+      "syms_present": 5,
+      "tripwires_attached": 5,
+      "tripwires_missed": 0
+    },
+    "engine": {
+      "calls_by_entrypoint": {
+        "ENGINE_init": 1,
+        "ENGINE_set_default_digests": 1
+      },
+      "engine_id_class": {
+        "builtin": 0,
+        "dynamic": 0,
+        "other": 0
+      }
+    },
+    "entries": [
+      {
+        "class": "engine",
+        "name": "ENGINE_by_id",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_init",
+        "probed": true,
+        "state": "observed"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_register_DH",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_register_DSA",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_register_EC",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_register_RAND",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_register_RSA",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_register_all_DH",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_register_all_DSA",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_register_all_EC",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_register_all_RAND",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_register_all_RSA",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_register_all_ciphers",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_register_all_complete",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_register_all_digests",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_register_all_pkey_asn1_meths",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_register_all_pkey_meths",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_register_ciphers",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_register_complete",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_register_digests",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_register_pkey_asn1_meths",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_register_pkey_meths",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_set_default_DH",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_set_default_DSA",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_set_default_EC",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_set_default_RAND",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_set_default_RSA",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_set_default_ciphers",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_set_default_digests",
+        "probed": true,
+        "state": "observed"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_set_default_pkey_asn1_meths",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_set_default_pkey_meths",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_set_default_string",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "meth",
+        "name": "DH_meth_new",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "meth",
+        "name": "DSA_meth_new",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "meth",
+        "name": "EVP_CIPHER_meth_new",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "meth",
+        "name": "EVP_MD_meth_new",
+        "probed": true,
+        "state": "observed"
+      },
+      {
+        "class": "meth",
+        "name": "EVP_PKEY_meth_new",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "meth",
+        "name": "RSA_meth_new",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "lowlevel",
+        "name": "digest/sha",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "lowlevel",
+        "name": "digest/md",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "lowlevel",
+        "name": "digest/legacy",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "lowlevel",
+        "name": "cipher/block",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "lowlevel",
+        "name": "cipher/stream",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "lowlevel",
+        "name": "cipher/aes",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "lowlevel",
+        "name": "pkey/rsa",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "lowlevel",
+        "name": "pkey/dsa",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "lowlevel",
+        "name": "pkey/dh",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "lowlevel",
+        "name": "pkey/ec",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "lowlevel",
+        "name": "mac",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "lowlevel",
+        "name": "rand",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "lowlevel",
+        "name": "srp",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "lowlevel",
+        "name": "bn",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "load",
+        "name": "legacy",
+        "probed": true,
+        "state": "absent"
+      },
+      {
+        "class": "load",
+        "name": "default",
+        "probed": true,
+        "state": "absent"
+      },
+      {
+        "class": "load",
+        "name": "fips",
+        "probed": true,
+        "state": "absent"
+      },
+      {
+        "class": "load",
+        "name": "other",
+        "probed": true,
+        "state": "absent"
+      }
+    ],
+    "flags": [],
+    "legacy_provider": {
+      "algs": [],
+      "executed_calls": 0,
+      "loads": {
+        "default": 0,
+        "fips": 0,
+        "legacy": 0,
+        "other": 0
+      }
+    },
+    "lowlevel": {
+      "calls_by_family": {
+        "bn": 0,
+        "cipher/aes": 0,
+        "cipher/block": 0,
+        "cipher/stream": 0,
+        "digest/legacy": 0,
+        "digest/md": 0,
+        "digest/sha": 0,
+        "mac": 0,
+        "pkey/dh": 0,
+        "pkey/dsa": 0,
+        "pkey/ec": 0,
+        "pkey/rsa": 0,
+        "rand": 0,
+        "srp": 0
+      }
+    },
+    "meth_new": {
+      "calls_by_entrypoint": {
+        "EVP_MD_meth_new": 1
+      }
+    },
+    "unreadable": {
+      "engine_ids": 0,
+      "load_names": 0
+    },
+    "weak": {
+      "legacy_algs": []
+    }
+  },
+  "provider": "default",
+  "queries_observed": 1,
+  "rows": [
+    {
+      "addr_backed": true,
+      "addr_hash": "50e70d10f5f2046d",
+      "alg_class": "SHA1",
+      "backing": {
+        "dev": "00:2f",
+        "ino": 259,
+        "offset": 4365712
+      },
+      "funcid": 1,
+      "gen": 0,
+      "op": 1,
+      "provider": "default",
+      "weak": true
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "78d393f1fb049ac4",
+      "alg_class": "SHA1",
+      "backing": {
+        "dev": "00:2f",
+        "ino": 259,
+        "offset": 4366560
+      },
+      "funcid": 2,
+      "gen": 0,
+      "op": 1,
+      "provider": "default",
+      "weak": true
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "2ecc823a659fd620",
+      "alg_class": "SHA1",
+      "backing": {
+        "dev": "00:2f",
+        "ino": 259,
+        "offset": 3783216
+      },
+      "funcid": 3,
+      "gen": 0,
+      "op": 1,
+      "provider": "default",
+      "weak": true
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "f81d76dee95f5295",
+      "alg_class": "SHA1",
+      "backing": {
+        "dev": "00:2f",
+        "ino": 259,
+        "offset": 4368064
+      },
+      "funcid": 4,
+      "gen": 0,
+      "op": 1,
+      "provider": "default",
+      "weak": true
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "787079321928fa15",
+      "alg_class": "SHA1",
+      "backing": {
+        "dev": "00:2f",
+        "ino": 259,
+        "offset": 4365456
+      },
+      "funcid": 6,
+      "gen": 0,
+      "op": 1,
+      "provider": "default",
+      "weak": true
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "16fe2af9382cf519",
+      "alg_class": "SHA1",
+      "backing": {
+        "dev": "00:2f",
+        "ino": 259,
+        "offset": 4366720
+      },
+      "funcid": 7,
+      "gen": 0,
+      "op": 1,
+      "provider": "default",
+      "weak": true
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "6b2af68963a9bbb4",
+      "alg_class": "SHA1",
+      "backing": {
+        "dev": "00:2f",
+        "ino": 259,
+        "offset": 4365200
+      },
+      "funcid": 8,
+      "gen": 0,
+      "op": 1,
+      "provider": "default",
+      "weak": true
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "d5e3a8f7f685d821",
+      "alg_class": "SHA1",
+      "backing": {
+        "dev": "00:2f",
+        "ino": 259,
+        "offset": 4369440
+      },
+      "funcid": 9,
+      "gen": 0,
+      "op": 1,
+      "provider": "default",
+      "weak": true
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "8f207cd3562a0874",
+      "alg_class": "SHA1",
+      "backing": {
+        "dev": "00:2f",
+        "ino": 259,
+        "offset": 4839776
+      },
+      "funcid": 11,
+      "gen": 0,
+      "op": 1,
+      "provider": "default",
+      "weak": true
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "835da2cfc51e941a",
+      "alg_class": "SHA1",
+      "backing": {
+        "dev": "00:2f",
+        "ino": 259,
+        "offset": 4364896
+      },
+      "funcid": 12,
+      "gen": 0,
+      "op": 1,
+      "provider": "default",
+      "weak": true
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "53ea4b6710b3b732",
+      "alg_class": "SHA1",
+      "backing": {
+        "dev": "00:2f",
+        "ino": 259,
+        "offset": 4364912
+      },
+      "funcid": 15,
+      "gen": 0,
+      "op": 1,
+      "provider": "default",
+      "weak": true
+    }
+  ],
+  "trigger_observed": true,
+  "uninstrumented_ops": 13
+}
