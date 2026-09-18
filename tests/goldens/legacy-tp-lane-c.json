@@ -1,6 +1,11 @@
 {
   "gen": 0,
   "legacy": {
+    "capability": {
+      "syms_present": 12,
+      "tripwires_attached": 12,
+      "tripwires_missed": 0
+    },
     "engine": {
       "calls_by_entrypoint": {
         "ENGINE_by_id": 1,
@@ -14,6 +19,345 @@
         "other": 0
       }
     },
+    "entries": [
+      {
+        "class": "engine",
+        "name": "ENGINE_by_id",
+        "probed": true,
+        "state": "observed"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_init",
+        "probed": true,
+        "state": "observed"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_register_DH",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_register_DSA",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_register_EC",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_register_RAND",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_register_RSA",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_register_all_DH",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_register_all_DSA",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_register_all_EC",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_register_all_RAND",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_register_all_RSA",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_register_all_ciphers",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_register_all_complete",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_register_all_digests",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_register_all_pkey_asn1_meths",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_register_all_pkey_meths",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_register_ciphers",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_register_complete",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_register_digests",
+        "probed": true,
+        "state": "observed"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_register_pkey_asn1_meths",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_register_pkey_meths",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_set_default_DH",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_set_default_DSA",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_set_default_EC",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_set_default_RAND",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_set_default_RSA",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_set_default_ciphers",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_set_default_digests",
+        "probed": true,
+        "state": "observed"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_set_default_pkey_asn1_meths",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_set_default_pkey_meths",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_set_default_string",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "meth",
+        "name": "DH_meth_new",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "meth",
+        "name": "DSA_meth_new",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "meth",
+        "name": "EVP_CIPHER_meth_new",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "meth",
+        "name": "EVP_MD_meth_new",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "meth",
+        "name": "EVP_PKEY_meth_new",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "meth",
+        "name": "RSA_meth_new",
+        "probed": true,
+        "state": "observed"
+      },
+      {
+        "class": "lowlevel",
+        "name": "digest/sha",
+        "probed": true,
+        "state": "observed"
+      },
+      {
+        "class": "lowlevel",
+        "name": "digest/md",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "lowlevel",
+        "name": "digest/legacy",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "lowlevel",
+        "name": "cipher/block",
+        "probed": true,
+        "state": "observed"
+      },
+      {
+        "class": "lowlevel",
+        "name": "cipher/stream",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "lowlevel",
+        "name": "cipher/aes",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "lowlevel",
+        "name": "pkey/rsa",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "lowlevel",
+        "name": "pkey/dsa",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "lowlevel",
+        "name": "pkey/dh",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "lowlevel",
+        "name": "pkey/ec",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "lowlevel",
+        "name": "mac",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "lowlevel",
+        "name": "rand",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "lowlevel",
+        "name": "srp",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "lowlevel",
+        "name": "bn",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "load",
+        "name": "legacy",
+        "probed": true,
+        "state": "observed"
+      },
+      {
+        "class": "load",
+        "name": "default",
+        "probed": true,
+        "state": "absent"
+      },
+      {
+        "class": "load",
+        "name": "fips",
+        "probed": true,
+        "state": "absent"
+      },
+      {
+        "class": "load",
+        "name": "other",
+        "probed": true,
+        "state": "observed"
+      }
+    ],
+    "flags": [],
     "legacy_provider": {
       "algs": [
         "MD4"
@@ -48,17 +392,26 @@
       "calls_by_entrypoint": {
         "RSA_meth_new": 1
       }
+    },
+    "unreadable": {
+      "engine_ids": 0,
+      "load_names": 0
+    },
+    "weak": {
+      "legacy_algs": [
+        "MD4"
+      ]
     }
   },
   "provider": "spike",
   "rows": [
     {
       "addr_backed": true,
-      "addr_hash": "2f1cd501d6d1ce9c",
+      "addr_hash": "3d121e24e4d6f253",
       "alg_class": "other",
       "backing": {
         "dev": "fd:01",
-        "ino": 803225,
+        "ino": 795895,
         "offset": 5062
       },
       "funcid": 1,
@@ -69,11 +422,11 @@
     },
     {
       "addr_backed": true,
-      "addr_hash": "bc16d37b963cf155",
+      "addr_hash": "cf99852967f141a2",
       "alg_class": "other",
       "backing": {
         "dev": "fd:01",
-        "ino": 803225,
+        "ino": 795895,
         "offset": 5180
       },
       "funcid": 2,
@@ -84,11 +437,11 @@
     },
     {
       "addr_backed": true,
-      "addr_hash": "92299c8231fbf8df",
+      "addr_hash": "a2a402d6a6d80c2e",
       "alg_class": "other",
       "backing": {
         "dev": "fd:01",
-        "ino": 803225,
+        "ino": 795895,
         "offset": 5237
       },
       "funcid": 3,
@@ -99,11 +452,11 @@
     },
     {
       "addr_backed": true,
-      "addr_hash": "5dfb29e1c1241aa0",
+      "addr_hash": "aabaca95462c0bbc",
       "alg_class": "other",
       "backing": {
         "dev": "fd:01",
-        "ino": 803225,
+        "ino": 795895,
         "offset": 5303
       },
       "funcid": 4,
@@ -114,11 +467,11 @@
     },
     {
       "addr_backed": true,
-      "addr_hash": "a671408cf9e20032",
+      "addr_hash": "f9cecc12d1d94bcb",
       "alg_class": "other",
       "backing": {
         "dev": "fd:01",
-        "ino": 803225,
+        "ino": 795895,
         "offset": 5120
       },
       "funcid": 6,
@@ -129,11 +482,11 @@
     },
     {
       "addr_backed": true,
-      "addr_hash": "8a4828f4ce8766b4",
+      "addr_hash": "d50edfa4c468c9c8",
       "alg_class": "other",
       "backing": {
         "dev": "fd:01",
-        "ino": 803225,
+        "ino": 795895,
         "offset": 4887
       },
       "funcid": 8,
@@ -144,11 +497,11 @@
     },
     {
       "addr_backed": true,
-      "addr_hash": "ae9126705e444d44",
+      "addr_hash": "da96f19bf27c4070",
       "alg_class": "other",
       "backing": {
         "dev": "fd:01",
-        "ino": 803225,
+        "ino": 795895,
         "offset": 4832
       },
       "funcid": 11,
@@ -159,11 +512,11 @@
     },
     {
       "addr_backed": true,
-      "addr_hash": "fd55593181c2cb23",
+      "addr_hash": "7f11430df31f9069",
       "alg_class": "other",
       "backing": {
         "dev": "fd:01",
-        "ino": 803225,
+        "ino": 795895,
         "offset": 5379
       },
       "funcid": 1,
@@ -174,11 +527,11 @@
     },
     {
       "addr_backed": true,
-      "addr_hash": "102552a26cf5534f",
+      "addr_hash": "a38f2f24e0e78616",
       "alg_class": "other",
       "backing": {
         "dev": "fd:01",
-        "ino": 803225,
+        "ino": 795895,
         "offset": 5497
       },
       "funcid": 2,
@@ -189,11 +542,11 @@
     },
     {
       "addr_backed": true,
-      "addr_hash": "87b6dfe7338dc145",
+      "addr_hash": "2f5c4a2bfc8c5eec",
       "alg_class": "other",
       "backing": {
         "dev": "fd:01",
-        "ino": 803225,
+        "ino": 795895,
         "offset": 5554
       },
       "funcid": 3,
@@ -204,11 +557,11 @@
     },
     {
       "addr_backed": true,
-      "addr_hash": "9ae739d51ce03ace",
+      "addr_hash": "671ff3571f516fe2",
       "alg_class": "other",
       "backing": {
         "dev": "fd:01",
-        "ino": 803225,
+        "ino": 795895,
         "offset": 5620
       },
       "funcid": 4,
@@ -219,11 +572,11 @@
     },
     {
       "addr_backed": true,
-      "addr_hash": "1ca3cc4f73f80ef2",
+      "addr_hash": "9ebb18ca237c0c7f",
       "alg_class": "other",
       "backing": {
         "dev": "fd:01",
-        "ino": 803225,
+        "ino": 795895,
         "offset": 5437
       },
       "funcid": 6,
@@ -234,11 +587,11 @@
     },
     {
       "addr_backed": true,
-      "addr_hash": "8a4828f4ce8766b4",
+      "addr_hash": "d50edfa4c468c9c8",
       "alg_class": "other",
       "backing": {
         "dev": "fd:01",
-        "ino": 803225,
+        "ino": 795895,
         "offset": 4887
       },
       "funcid": 8,
@@ -249,11 +602,11 @@
     },
     {
       "addr_backed": true,
-      "addr_hash": "ae9126705e444d44",
+      "addr_hash": "da96f19bf27c4070",
       "alg_class": "other",
       "backing": {
         "dev": "fd:01",
-        "ino": 803225,
+        "ino": 795895,
         "offset": 4832
       },
       "funcid": 11,
