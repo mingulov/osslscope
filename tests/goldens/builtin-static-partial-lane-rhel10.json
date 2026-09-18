@@ -1,0 +1,9 @@
+{
+  "gen": 0,
+  "provider": "static_driver_stripped",
+  "reason": "anchor-unresolved",
+  "rows": [],
+  "status": "PARTIAL",
+  "trigger_observed": false,
+  "uninstrumented_ops": 14
+}
