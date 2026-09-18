@@ -1089,22 +1089,24 @@ note: alg-name-only strength (key sizes unobservable); window-only claims\n";
 
     #[test]
     fn goldens_partial_cells() {
-        assert_golden(
-            "report-partial-no-query.json",
-            &json_of(&partial(&["no-query"])),
-        );
+        let noq = partial(&["no-query"]);
+        assert_golden("report-partial-no-query.json", &json_of(&noq));
+        assert_golden("report-partial-no-query.txt", &human(&noq));
         let interrupted = partial(&["interrupted"]);
         assert_golden("report-partial-interrupted.json", &json_of(&interrupted));
         assert_golden("report-partial-interrupted.txt", &human(&interrupted));
         let mut over = partial(&["over-budget"]);
         over.counters.over_budget = 1;
         assert_golden("report-partial-over-budget.json", &json_of(&over));
+        assert_golden("report-partial-over-budget.txt", &human(&over));
         let mut fork = partial(&["fork-exec-ignored"]);
         fork.counters.fork_exec_ignored = 2;
         assert_golden("report-partial-fork-ignored.json", &json_of(&fork));
+        assert_golden("report-partial-fork-ignored.txt", &human(&fork));
         let mut cold = partial(&["cold-gap"]);
         cold.counters.cold_gap_calls = 5;
         assert_golden("report-partial-cold-gap.json", &json_of(&cold));
+        assert_golden("report-partial-cold-gap.txt", &human(&cold));
         assert_golden(
             "report-partial-fips-unlabeled.json",
             &json_of(&partial(&["fips-unlabeled"])),

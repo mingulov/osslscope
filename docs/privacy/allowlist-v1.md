@@ -171,9 +171,13 @@ CBOM:
 stderr diagnostics:
 
 - fixed labels plus allowlisted values: pids, counts, op/kind ids,
-  reasons, paths, and observer errors.
+  reasons, paths, observer errors, and (debug-only) runtime code
+  addresses.
 - `HARVESTDBG` debug logs classify names before printing; they
-  never print raw target strings.
+  never print raw target strings. Debug address prints (`arr`,
+  `rv`, walk-dbg join values) are ASLR-varying code pointers for
+  attribution forensics, gated on `OSSL_DEBUG_HARVEST`, never
+  enabled in production runs or the canary gate.
 - Errors may echo observer inputs such as paths and CLI options;
   they never carry target memory.
 - Test-only ring dump: `OSSL_CANARY_DUMP=path` appends raw ring
