@@ -1,0 +1,790 @@
+{
+  "gen": 0,
+  "legacy": {
+    "capability": {
+      "syms_present": 2,
+      "tripwires_attached": 2,
+      "tripwires_missed": 0
+    },
+    "engine": {
+      "calls_by_entrypoint": {},
+      "engine_id_class": {
+        "builtin": 0,
+        "dynamic": 0,
+        "other": 0
+      }
+    },
+    "entries": [
+      {
+        "class": "engine",
+        "name": "ENGINE_by_id",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_init",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_register_DH",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_register_DSA",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_register_EC",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_register_RAND",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_register_RSA",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_register_all_DH",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_register_all_DSA",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_register_all_EC",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_register_all_RAND",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_register_all_RSA",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_register_all_ciphers",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_register_all_complete",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_register_all_digests",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_register_all_pkey_asn1_meths",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_register_all_pkey_meths",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_register_ciphers",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_register_complete",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_register_digests",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_register_pkey_asn1_meths",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_register_pkey_meths",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_set_default_DH",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_set_default_DSA",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_set_default_EC",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_set_default_RAND",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_set_default_RSA",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_set_default_ciphers",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_set_default_digests",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_set_default_pkey_asn1_meths",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_set_default_pkey_meths",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "engine",
+        "name": "ENGINE_set_default_string",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "meth",
+        "name": "DH_meth_new",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "meth",
+        "name": "DSA_meth_new",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "meth",
+        "name": "EVP_CIPHER_meth_new",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "meth",
+        "name": "EVP_MD_meth_new",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "meth",
+        "name": "EVP_PKEY_meth_new",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "meth",
+        "name": "RSA_meth_new",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "lowlevel",
+        "name": "digest/sha",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "lowlevel",
+        "name": "digest/md",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "lowlevel",
+        "name": "digest/legacy",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "lowlevel",
+        "name": "cipher/block",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "lowlevel",
+        "name": "cipher/stream",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "lowlevel",
+        "name": "cipher/aes",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "lowlevel",
+        "name": "pkey/rsa",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "lowlevel",
+        "name": "pkey/dsa",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "lowlevel",
+        "name": "pkey/dh",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "lowlevel",
+        "name": "pkey/ec",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "lowlevel",
+        "name": "mac",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "lowlevel",
+        "name": "rand",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "lowlevel",
+        "name": "srp",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "lowlevel",
+        "name": "bn",
+        "probed": false,
+        "state": "absent"
+      },
+      {
+        "class": "load",
+        "name": "legacy",
+        "probed": true,
+        "state": "absent"
+      },
+      {
+        "class": "load",
+        "name": "default",
+        "probed": true,
+        "state": "absent"
+      },
+      {
+        "class": "load",
+        "name": "fips",
+        "probed": true,
+        "state": "absent"
+      },
+      {
+        "class": "load",
+        "name": "other",
+        "probed": true,
+        "state": "observed"
+      }
+    ],
+    "flags": [],
+    "legacy_provider": {
+      "algs": [],
+      "executed_calls": 0,
+      "loads": {
+        "default": 0,
+        "fips": 0,
+        "legacy": 0,
+        "other": 2
+      }
+    },
+    "lowlevel": {
+      "calls_by_family": {
+        "bn": 0,
+        "cipher/aes": 0,
+        "cipher/block": 0,
+        "cipher/stream": 0,
+        "digest/legacy": 0,
+        "digest/md": 0,
+        "digest/sha": 0,
+        "mac": 0,
+        "pkey/dh": 0,
+        "pkey/dsa": 0,
+        "pkey/ec": 0,
+        "pkey/rsa": 0,
+        "rand": 0,
+        "srp": 0
+      }
+    },
+    "meth_new": {
+      "calls_by_entrypoint": {}
+    },
+    "unreadable": {
+      "engine_ids": 0,
+      "load_names": 0
+    },
+    "weak": {
+      "legacy_algs": []
+    }
+  },
+  "provider": "static_driver",
+  "resolution": "symtab",
+  "rows": [
+    {
+      "addr_backed": true,
+      "addr_hash": "9f2e244e06104edf",
+      "alg_class": "other",
+      "backing": {
+        "dev": "fc:04",
+        "ino": 475270,
+        "offset": 6257
+      },
+      "funcid": 1,
+      "gen": 0,
+      "op": 1,
+      "provider": "static_driver",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "4996912d7acd6d26",
+      "alg_class": "other",
+      "backing": {
+        "dev": "fc:04",
+        "ino": 475270,
+        "offset": 6347
+      },
+      "funcid": 2,
+      "gen": 0,
+      "op": 1,
+      "provider": "static_driver",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "2877928ece7a53d1",
+      "alg_class": "other",
+      "backing": {
+        "dev": "fc:04",
+        "ino": 475270,
+        "offset": 6390
+      },
+      "funcid": 3,
+      "gen": 0,
+      "op": 1,
+      "provider": "static_driver",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "e03f0591996c2971",
+      "alg_class": "other",
+      "backing": {
+        "dev": "fc:04",
+        "ino": 475270,
+        "offset": 6442
+      },
+      "funcid": 4,
+      "gen": 0,
+      "op": 1,
+      "provider": "static_driver",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "b84369c828b06979",
+      "alg_class": "other",
+      "backing": {
+        "dev": "fc:04",
+        "ino": 475270,
+        "offset": 6301
+      },
+      "funcid": 6,
+      "gen": 0,
+      "op": 1,
+      "provider": "static_driver",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "76a132b6ea23eb6b",
+      "alg_class": "other",
+      "backing": {
+        "dev": "fc:04",
+        "ino": 475270,
+        "offset": 6106
+      },
+      "funcid": 8,
+      "gen": 0,
+      "op": 1,
+      "provider": "static_driver",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "1c7d35d6e0ca2b0d",
+      "alg_class": "other",
+      "backing": {
+        "dev": "fc:04",
+        "ino": 475270,
+        "offset": 6067
+      },
+      "funcid": 11,
+      "gen": 0,
+      "op": 1,
+      "provider": "static_driver",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "bc68f5f79916a7e9",
+      "alg_class": "other",
+      "backing": {
+        "dev": "fc:04",
+        "ino": 475270,
+        "offset": 6504
+      },
+      "funcid": 1,
+      "gen": 0,
+      "op": 1,
+      "provider": "static_driver",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "35d53562aa302a11",
+      "alg_class": "other",
+      "backing": {
+        "dev": "fc:04",
+        "ino": 475270,
+        "offset": 6594
+      },
+      "funcid": 2,
+      "gen": 0,
+      "op": 1,
+      "provider": "static_driver",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "5ba49e15f24a2ae4",
+      "alg_class": "other",
+      "backing": {
+        "dev": "fc:04",
+        "ino": 475270,
+        "offset": 6637
+      },
+      "funcid": 3,
+      "gen": 0,
+      "op": 1,
+      "provider": "static_driver",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "2b69be9589bfdab3",
+      "alg_class": "other",
+      "backing": {
+        "dev": "fc:04",
+        "ino": 475270,
+        "offset": 6689
+      },
+      "funcid": 4,
+      "gen": 0,
+      "op": 1,
+      "provider": "static_driver",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "94eb5b531ec4c400",
+      "alg_class": "other",
+      "backing": {
+        "dev": "fc:04",
+        "ino": 475270,
+        "offset": 6548
+      },
+      "funcid": 6,
+      "gen": 0,
+      "op": 1,
+      "provider": "static_driver",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "76a132b6ea23eb6b",
+      "alg_class": "other",
+      "backing": {
+        "dev": "fc:04",
+        "ino": 475270,
+        "offset": 6106
+      },
+      "funcid": 8,
+      "gen": 0,
+      "op": 1,
+      "provider": "static_driver",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "1c7d35d6e0ca2b0d",
+      "alg_class": "other",
+      "backing": {
+        "dev": "fc:04",
+        "ino": 475270,
+        "offset": 6067
+      },
+      "funcid": 11,
+      "gen": 0,
+      "op": 1,
+      "provider": "static_driver",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "daaade634aff1732",
+      "alg_class": "other",
+      "backing": {
+        "dev": "fc:04",
+        "ino": 475270,
+        "offset": 6751
+      },
+      "funcid": 1,
+      "gen": 0,
+      "op": 12,
+      "provider": "static_driver",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "8b8805e0253992b4",
+      "alg_class": "other",
+      "backing": {
+        "dev": "fc:04",
+        "ino": 475270,
+        "offset": 6845
+      },
+      "funcid": 2,
+      "gen": 0,
+      "op": 12,
+      "provider": "static_driver",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "5a923c3bf4f65f9a",
+      "alg_class": "other",
+      "backing": {
+        "dev": "fc:04",
+        "ino": 475270,
+        "offset": 6892
+      },
+      "funcid": 3,
+      "gen": 0,
+      "op": 12,
+      "provider": "static_driver",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "7bacc14c59bec5de",
+      "alg_class": "other",
+      "backing": {
+        "dev": "fc:04",
+        "ino": 475270,
+        "offset": 6983
+      },
+      "funcid": 4,
+      "gen": 0,
+      "op": 12,
+      "provider": "static_driver",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "bfac71cbca2887c3",
+      "alg_class": "other",
+      "backing": {
+        "dev": "fc:04",
+        "ino": 475270,
+        "offset": 7030
+      },
+      "funcid": 5,
+      "gen": 0,
+      "op": 12,
+      "provider": "static_driver",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "98be80ddb875d7f7",
+      "alg_class": "other",
+      "backing": {
+        "dev": "fc:04",
+        "ino": 475270,
+        "offset": 6799
+      },
+      "funcid": 16,
+      "gen": 0,
+      "op": 12,
+      "provider": "static_driver",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "cebe98fc770ac7c8",
+      "alg_class": "other",
+      "backing": {
+        "dev": "fc:04",
+        "ino": 475270,
+        "offset": 7085
+      },
+      "funcid": 1,
+      "gen": 0,
+      "op": 12,
+      "provider": "static_driver",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "b64675e2e6d08fbc",
+      "alg_class": "other",
+      "backing": {
+        "dev": "fc:04",
+        "ino": 475270,
+        "offset": 7179
+      },
+      "funcid": 2,
+      "gen": 0,
+      "op": 12,
+      "provider": "static_driver",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "67a699f530771e7a",
+      "alg_class": "other",
+      "backing": {
+        "dev": "fc:04",
+        "ino": 475270,
+        "offset": 7226
+      },
+      "funcid": 3,
+      "gen": 0,
+      "op": 12,
+      "provider": "static_driver",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "0d33a2733106c812",
+      "alg_class": "other",
+      "backing": {
+        "dev": "fc:04",
+        "ino": 475270,
+        "offset": 7317
+      },
+      "funcid": 4,
+      "gen": 0,
+      "op": 12,
+      "provider": "static_driver",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "fd7dab77b4b808b5",
+      "alg_class": "other",
+      "backing": {
+        "dev": "fc:04",
+        "ino": 475270,
+        "offset": 7364
+      },
+      "funcid": 5,
+      "gen": 0,
+      "op": 12,
+      "provider": "static_driver",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "b53f5e378a9bc218",
+      "alg_class": "other",
+      "backing": {
+        "dev": "fc:04",
+        "ino": 475270,
+        "offset": 7133
+      },
+      "funcid": 16,
+      "gen": 0,
+      "op": 12,
+      "provider": "static_driver",
+      "weak": false
+    }
+  ],
+  "trigger_observed": true
+}
