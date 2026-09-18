@@ -1024,6 +1024,11 @@ impl<'a> Engine<'a> {
         }
         self.counters.table_staleness_events += d.stale_events;
         self.counters.dropped_bpf += d.dropfail;
+        if d.dropfail > 0 {
+            // BPF insert drops (map-full) lose executions: blind
+            // PARTIAL (PRD §8: above budget → PARTIAL + counters).
+            self.reason("dropped-events");
+        }
         if d.unattributed > 0 {
             self.counters.dropped_userspace += d.unattributed;
             self.reason("unattributed");
@@ -1656,6 +1661,89 @@ mod tests {
         let stat = std::fs::read_to_string(format!("/proc/{me}/stat")).unwrap();
         let (pid, _) = parse_stat_ppid(&stat).unwrap();
         assert_eq!(pid, me);
+    }
+
+    fn absorb_engine(cfg: &Config) -> Engine<'_> {
+        Engine {
+            cfg,
+            pid: 0,
+            pin: None,
+            loaded: Loaded {
+                progs: HashMap::new(),
+                maps: HashMap::new(),
+            },
+            links: Vec::new(),
+            attached: HashSet::new(),
+            stable: plan::StableCookies::default(),
+            known: HashSet::new(),
+            identities: HashMap::new(),
+            current: HashMap::new(),
+            generation: 0,
+            counters: Counters::default(),
+            reasons: HashSet::new(),
+            stale: Vec::new(),
+            row_cache: HashMap::new(),
+            harvested: HashSet::new(),
+            children_seen: HashSet::new(),
+            snapshot: Snapshot::default(),
+            drain_wall_us: 0,
+            seen: HashMap::new(),
+            last_dropfail: 0,
+            child_exit: None,
+            window_start: Instant::now(),
+            window_end: Instant::now(),
+            window_start_wall: SystemTime::now(),
+            window_end_wall: SystemTime::now(),
+            kernel_release: String::new(),
+            target_cmdline: String::new(),
+            target_container_id: String::new(),
+            provider_build_id: String::new(),
+            provider_path: String::new(),
+            image_digest: String::new(),
+            harvest_doc: serde_json::Value::Null,
+            legacy: serde_json::Value::Null,
+        }
+    }
+
+    fn absorb_cfg() -> Config {
+        Config {
+            harvest_object: PathBuf::new(),
+            count_object: PathBuf::new(),
+            provider: PathBuf::new(),
+            builtin: false,
+            duration: Duration::from_secs(1),
+            settle: Duration::from_secs(1),
+            harvest_timeout: Duration::from_secs(1),
+            grace: Duration::from_secs(1),
+            image_digest: String::new(),
+        }
+    }
+
+    fn drain_with(dropfail: u64) -> DrainOut {
+        DrainOut {
+            folded: HashMap::new(),
+            stale_events: 0,
+            stale_keys: 0,
+            unattributed: 0,
+            dropfail,
+            shortfall: 0,
+            wall_us: 0,
+        }
+    }
+
+    #[test]
+    fn absorb_dropfail_reasons_partial() {
+        // BPF insert drops must degrade to PARTIAL (PRD §8), not
+        // ride a COMPLETE with a nonzero drop counter.
+        let cfg = absorb_cfg();
+        let mut e = absorb_engine(&cfg);
+        e.absorb(drain_with(4));
+        assert_eq!(e.counters.dropped_bpf, 4);
+        assert!(e.reasons.contains("dropped-events"));
+        // Clean drains stay reason-free.
+        let mut c = absorb_engine(&cfg);
+        c.absorb(drain_with(0));
+        assert!(c.reasons.is_empty());
     }
 
     fn snap(

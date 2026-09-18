@@ -923,6 +923,7 @@ note: alg-name-only strength (key sizes unobservable); window-only claims\n";
         ("missed-attaches", "blind"),
         ("unresolved-offsets", "blind"),
         ("unattributed", "blind"),
+        ("dropped-events", "blind"),
         ("drain-shortfall", "blind"),
         ("reharvest-skipped", "blind"),
         ("cold-gap", "blind"),
