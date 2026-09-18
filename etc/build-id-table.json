@@ -63,6 +63,15 @@
       "query_offset": 2630832,
       "anchor": "OSSL_PROVIDER_available",
       "anchor_offset": 2630400
+    },
+    {
+      "build_id": "8b1a3899602a4001a02b1dd2e0ada063db39a92d",
+      "openssl": "3.5.8",
+      "lane": "lane-fedora44",
+      "path": "/opt/openssl-3.5.8/lib64/libcrypto.so",
+      "query_offset": 1647168,
+      "anchor": "OSSL_PROVIDER_available",
+      "anchor_offset": 1646736
     }
   ],
   "fallback": [
