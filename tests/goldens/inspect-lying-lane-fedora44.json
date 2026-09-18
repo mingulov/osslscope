@@ -1,0 +1,357 @@
+{
+  "fenced_rows": 5,
+  "gen": 0,
+  "provider": "lying",
+  "queries_observed": 6,
+  "reason": "fenced-rows",
+  "rows": [
+    {
+      "addr_backed": true,
+      "addr_hash": "3c98db7cedc09ddc",
+      "alg_class": "other",
+      "backing": {
+        "dev": "00:20",
+        "ino": 65925,
+        "offset": 985
+      },
+      "funcid": 1,
+      "gen": 0,
+      "op": 1,
+      "provider": "lying",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "3c8964423f73e030",
+      "alg_class": "other",
+      "backing": {
+        "dev": "00:20",
+        "ino": 65925,
+        "offset": 1273
+      },
+      "funcid": 1,
+      "gen": 0,
+      "op": 1,
+      "provider": "lying",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "f93cbd675c0d3eb3",
+      "alg_class": "other",
+      "backing": {
+        "dev": "00:20",
+        "ino": 65925,
+        "offset": 1035
+      },
+      "funcid": 2,
+      "gen": 0,
+      "op": 1,
+      "provider": "lying",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "d690bc50379ae59a",
+      "alg_class": "other",
+      "backing": {
+        "dev": "00:20",
+        "ino": 65925,
+        "offset": 1323
+      },
+      "funcid": 2,
+      "gen": 0,
+      "op": 1,
+      "provider": "lying",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "d4064684a3d1a06f",
+      "alg_class": "other",
+      "backing": {
+        "dev": "00:20",
+        "ino": 65925,
+        "offset": 1054
+      },
+      "funcid": 3,
+      "gen": 0,
+      "op": 1,
+      "provider": "lying",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "fc8c78f473b7af17",
+      "alg_class": "other",
+      "backing": {
+        "dev": "00:20",
+        "ino": 65925,
+        "offset": 1342
+      },
+      "funcid": 3,
+      "gen": 0,
+      "op": 1,
+      "provider": "lying",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "98b69453be6602b9",
+      "alg_class": "other",
+      "backing": {
+        "dev": "00:20",
+        "ino": 65925,
+        "offset": 1077
+      },
+      "funcid": 4,
+      "gen": 0,
+      "op": 1,
+      "provider": "lying",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "f1c279c8a64803cf",
+      "alg_class": "other",
+      "backing": {
+        "dev": "00:20",
+        "ino": 65925,
+        "offset": 1365
+      },
+      "funcid": 4,
+      "gen": 0,
+      "op": 1,
+      "provider": "lying",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "879d0e725951a9a0",
+      "alg_class": "other",
+      "backing": {
+        "dev": "00:20",
+        "ino": 65925,
+        "offset": 1009
+      },
+      "funcid": 6,
+      "gen": 0,
+      "op": 1,
+      "provider": "lying",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "de7ee6feaba9d165",
+      "alg_class": "other",
+      "backing": {
+        "dev": "00:20",
+        "ino": 65925,
+        "offset": 1297
+      },
+      "funcid": 6,
+      "gen": 0,
+      "op": 1,
+      "provider": "lying",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "5a978c45d250cf63",
+      "alg_class": "other",
+      "backing": {
+        "dev": "00:20",
+        "ino": 65925,
+        "offset": 1132
+      },
+      "funcid": 8,
+      "gen": 0,
+      "op": 1,
+      "provider": "lying",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "06eb3ac55a29f847",
+      "alg_class": "other",
+      "backing": {
+        "dev": "00:20",
+        "ino": 65925,
+        "offset": 1420
+      },
+      "funcid": 8,
+      "gen": 0,
+      "op": 1,
+      "provider": "lying",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "5b7744f19c578e4c",
+      "alg_class": "other",
+      "backing": {
+        "dev": "00:20",
+        "ino": 65925,
+        "offset": 1115
+      },
+      "funcid": 11,
+      "gen": 0,
+      "op": 1,
+      "provider": "lying",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "bfa645ddd4a545e7",
+      "alg_class": "other",
+      "backing": {
+        "dev": "00:20",
+        "ino": 65925,
+        "offset": 1403
+      },
+      "funcid": 11,
+      "gen": 0,
+      "op": 1,
+      "provider": "lying",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "e15cadb3a9c84fca",
+      "alg_class": "other",
+      "backing": {
+        "dev": "00:20",
+        "ino": 65925,
+        "offset": 1996
+      },
+      "funcid": 8,
+      "gen": 0,
+      "op": 1,
+      "provider": "lying",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "41de4e708cc08d52",
+      "alg_class": "other",
+      "backing": {
+        "dev": "00:20",
+        "ino": 65925,
+        "offset": 1979
+      },
+      "funcid": 11,
+      "gen": 0,
+      "op": 1,
+      "provider": "lying",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "4187a6e155191081",
+      "alg_class": "SHA256",
+      "backing": {
+        "dev": "00:20",
+        "ino": 65925,
+        "offset": 1561
+      },
+      "funcid": 1,
+      "gen": 0,
+      "op": 1,
+      "provider": "lying",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "3ba1dd6ea27e1ba8",
+      "alg_class": "SHA256",
+      "backing": {
+        "dev": "00:20",
+        "ino": 65925,
+        "offset": 1611
+      },
+      "funcid": 2,
+      "gen": 0,
+      "op": 1,
+      "provider": "lying",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "8a7bc61ef998c859",
+      "alg_class": "SHA256",
+      "backing": {
+        "dev": "00:20",
+        "ino": 65925,
+        "offset": 1630
+      },
+      "funcid": 3,
+      "gen": 0,
+      "op": 1,
+      "provider": "lying",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "c0f9f0b31d7c9beb",
+      "alg_class": "SHA256",
+      "backing": {
+        "dev": "00:20",
+        "ino": 65925,
+        "offset": 1653
+      },
+      "funcid": 4,
+      "gen": 0,
+      "op": 1,
+      "provider": "lying",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "fbd95ef9893e56ee",
+      "alg_class": "SHA256",
+      "backing": {
+        "dev": "00:20",
+        "ino": 65925,
+        "offset": 1585
+      },
+      "funcid": 6,
+      "gen": 0,
+      "op": 1,
+      "provider": "lying",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "4cea222de6dc6670",
+      "alg_class": "SHA256",
+      "backing": {
+        "dev": "00:20",
+        "ino": 65925,
+        "offset": 1708
+      },
+      "funcid": 8,
+      "gen": 0,
+      "op": 1,
+      "provider": "lying",
+      "weak": false
+    },
+    {
+      "addr_backed": true,
+      "addr_hash": "49519aedf6bb06fe",
+      "alg_class": "SHA256",
+      "backing": {
+        "dev": "00:20",
+        "ino": 65925,
+        "offset": 1691
+      },
+      "funcid": 11,
+      "gen": 0,
+      "op": 1,
+      "provider": "lying",
+      "weak": false
+    }
+  ],
+  "status": "PARTIAL",
+  "trigger_observed": true,
+  "uninstrumented_ops": 13
+}
