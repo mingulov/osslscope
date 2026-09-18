@@ -399,7 +399,6 @@
   },
   "provider": "default",
   "queries_observed": 1,
-  "resolution": "symtab",
   "rows": [
     {
       "addr_backed": true,
