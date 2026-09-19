@@ -51,6 +51,8 @@ See [the side-by-side gap matrix](docs/trace-gap.md).
 - [Attach failures](docs/attach-failures.md) -- exit-4 decision tree
 - [Violation triage](docs/violation-triage.md) --
   from violation to fix to re-verify
+- [Auditor story](docs/auditor-story.md) --
+  evidence to verdict, worked example
 - [Staging deploy](docs/staging-deploy.md) --
   debug-container observation, gate-disable procedure
 - [FIPS interim rule](docs/fips-interim.md) --

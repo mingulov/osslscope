@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased - P6 auditor story
+
+- `docs/auditor-story.md`: end-to-end auditor walk (report + CBOM,
+  golden conformance check, violation-detection gating,
+  declared-vs-executed, Dependency-Track status).
+- `tests/auditor_golden.json` + `tests/auditor_report.rs`: frozen
+  auditor-report shape + conformance test (strict key/type/
+  vocabulary checks, tamper rejections, live-story validation via
+  `OSSLSCOPE_AUDITOR_STORY`).
+- `README.md`: docs index.
+
 ## Unreleased - P6 public docs
 
 - `docs/`: what-it-proves (claim chain, non-goals, who-should-NOT-adopt
