@@ -1,7 +1,28 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Changelog
 
-## Unreleased - P6 auditor story
+## 1.0.0
+
+First release. Execution-backed OpenSSL crypto inventory on eBPF
+uprobes: `doctor`, `inspect`, `report`, `check`, `alias-audit`.
+
+- License: GPL-3.0-or-later for userspace, docs, and scripts
+  (`LICENSE`); GPL-2.0-only for BPF programs in `crates/ebpf/`
+  (`LICENSES/GPL-2.0-only.txt`); per-file SPDX tags. Contributions
+  under `CONTRIBUTING.md` (broad sublicensing/relicensing grant).
+- Version 1.0.0 across the root crate and
+  `crates/{ossl-discover,manifest,ebpf-common,bpf-sys}`.
+  `crates/ebpf` stays 0.0.0 by design: unpublished-internal (own
+  workspace + lockfile + nightly toolchain, `publish = false`),
+  its BPF objects are operator-built and never shipped, so it sits
+  off the release line.
+- Packaging: deb + rpm with file-caps default install
+  (`packaging/`); version read from `Cargo.toml` at build time.
+- Docs: claim chain + who-should-NOT-adopt, overhead matrix, CI
+  recipes, PARTIAL/attach/violation runbooks, install guide
+  (see `docs/`).
+
+### P6 auditor story
 
 - `docs/auditor-story.md`: end-to-end auditor walk (report + CBOM,
   golden conformance check, violation-detection gating,
@@ -12,7 +33,7 @@
   `OSSLSCOPE_AUDITOR_STORY`).
 - `README.md`: docs index.
 
-## Unreleased - P6 public docs
+### P6 public docs
 
 - `docs/`: what-it-proves (claim chain, non-goals, who-should-NOT-adopt
   headline incl. no CI gating on COMPLETE), overhead-matrix
@@ -21,7 +42,7 @@
   promotion-checklist, privacy/residuals.
 - `README.md`: docs index.
 
-## Unreleased - P4 privacy hardening
+### P4 privacy hardening
 
 - `docs/privacy/allowlist-v1.md`: finalized capture allowlist (complete
   eBPF/userspace emission set, BPF map inventory, classifiers, change
@@ -39,7 +60,7 @@
   `SPIKE_PROPQ` to decouple the fetch propquery name from the
   provider load name.
 
-## Unreleased - P3 semantics + policy
+### P3 semantics + policy
 
 - `report`: bounded-window execution counts (human + `observed-crypto-v1.0`
   JSON, byte-stable), legacy-path section, PARTIAL taxonomy (blind vs
@@ -54,19 +75,19 @@
 - Capture: legacy blind-spot PARTIAL wiring, wall-clock window edges,
   cmdline/container/build-id identity, signal-graceful drain (exit 3).
 
-## P2 capture engine (gated)
+### P2 capture engine (gated)
 
 - Keyed exactness (hotkey 100k), fenced remaps/re-harvest, bounded
   windows, no-eviction DROPFAIL discipline, wall-clock budgets,
   trigger matrix, allowlist draft, capture-semantics record.
 
-## P1 discovery (gated)
+### P1 discovery (gated)
 
 - Privilege model + pid pinning, OSSL_TRACE gap matrix, frozen
   registries, libcrypto flavor classifier, `inspect --pid/--builtin`,
   built-in harvest with dumper parity, legacy tripwire design.
 
-## Unreleased - P1-0 scaffolding
+### P1-0 scaffolding
 
 - Workspace layout (`src/`, `crates/{ossl-discover,manifest,ebpf-common,bpf-sys,ebpf}`)
   with pinned toolchains (host 1.88.0, eBPF nightly-2026-05-20 + rust-src).
@@ -94,7 +115,7 @@
   3.0/3.5/4.0 incl. stripped libs, forced/natural shift cells go
   PARTIAL with zero rows, per-lane goldens.
 
-## Initial scaffolding
+### Initial scaffolding
 
 Repository created. Scope defined: eBPF-based runtime proof of executed
 OpenSSL provider dispatch callbacks. No implementation yet.

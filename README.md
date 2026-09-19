@@ -113,7 +113,9 @@ Gate a window in CI (exit 10 on violation; `--help` lists all rules):
 echo $?  # 0 clean, 10 violation, 3 PARTIAL, 4 environment, 2 usage
 ```
 
-Installable packages (deb/rpm) land with the release.
+Installable packages (deb/rpm): build per
+[packaging/README.md](packaging/README.md), then follow
+[docs/install.md](docs/install.md) (doctor-first).
 
 ## What it will NOT do
 
