@@ -19,7 +19,7 @@ CI: pid attach is racy and staging-only by contract.
 ```sh
 sudo apt-get install -y linux-generic-hwe-24.04
 sudo reboot
-# after reboot: uname -r must show a 7.x kernel
+# after reboot: uname -r must show a 6.9+ kernel
 ```
 
 <!-- source: Server-defaults-GA + HWE recipe: ebpf-privileges note -->
