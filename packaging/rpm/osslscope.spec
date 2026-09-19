@@ -51,4 +51,5 @@ exit 0
 
 %files
 /usr/bin/osslscope
+%dir /usr/share/doc/%{name}
 /usr/share/doc/%{name}/install.md
