@@ -1,6 +1,15 @@
 # Changelog
 
-## Unreleased — P4 privacy hardening
+## Unreleased - P6 public docs
+
+- `docs/`: what-it-proves (claim chain, non-goals, who-should-NOT-adopt
+  headline incl. no CI gating on COMPLETE), overhead-matrix
+  (worst-cell numbers + support matrix), ci-recipes, partial-runbook,
+  attach-failures, violation-triage, staging-deploy, fips-interim,
+  promotion-checklist, privacy/residuals.
+- `README.md`: docs index.
+
+## Unreleased - P4 privacy hardening
 
 - `docs/privacy/allowlist-v1.md`: finalized capture allowlist (complete
   eBPF/userspace emission set, BPF map inventory, classifiers, change
@@ -18,7 +27,7 @@
   `SPIKE_PROPQ` to decouple the fetch propquery name from the
   provider load name.
 
-## Unreleased — P3 semantics + policy
+## Unreleased - P3 semantics + policy
 
 - `report`: bounded-window execution counts (human + `observed-crypto-v1.0`
   JSON, byte-stable), legacy-path section, PARTIAL taxonomy (blind vs
@@ -45,7 +54,7 @@
   registries, libcrypto flavor classifier, `inspect --pid/--builtin`,
   built-in harvest with dumper parity, legacy tripwire design.
 
-## Unreleased — P1-0 scaffolding
+## Unreleased - P1-0 scaffolding
 
 - Workspace layout (`src/`, `crates/{ossl-discover,manifest,ebpf-common,bpf-sys,ebpf}`)
   with pinned toolchains (host 1.88.0, eBPF nightly-2026-05-20 + rust-src).
@@ -53,7 +62,7 @@
 - Discovery fixtures promoted into `crates/ossl-discover/tests/fixture/`.
 - Frozen registries (`src/kinds.rs` v1): 14 ops, 280 funcids, 132 ENGINE
   symbols + 6 `*_meth_new`, 13 fetch entry points, 13 SKEY fns, 14
-  low-level families, weak-alg list, 4 struct shapes — all
+  low-level families, weak-alg list, 4 struct shapes -- all
   version-keyed from 3.0/3.5/3.6/4.0 headers and lane dynsyms.
 - libcrypto flavor classifier (`discovery/flavor.rs`): OpenSSL 3.x/4.x
   vs BoringSSL/AWS-LC lookalikes from ELF bytes.
