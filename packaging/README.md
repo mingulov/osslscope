@@ -25,7 +25,9 @@ Prerequisites: a cargo-built release binary, `dpkg-deb`.
 cargo build --locked --release
 ./packaging/build-deb.sh            # or: ./packaging/build-deb.sh /path/to/osslscope
 # -> osslscope_<ver>-1_amd64.deb
-sudo dpkg -i osslscope_<ver>-1_amd64.deb   # pulls libcap2-bin via Depends
+sudo dpkg -i osslscope_<ver>-1_amd64.deb
+# NB: dpkg alone does not resolve Depends; if libcap2-bin is missing:
+sudo apt-get install -f
 ```
 
 The control file is `packaging/deb/DEBIAN/control.in`

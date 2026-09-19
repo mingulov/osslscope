@@ -31,7 +31,7 @@ unprivileged.
 ## Verify (doctor-first)
 
 ```sh
-getcap /usr/bin/osslscope   # expect: cap_bpf,cap_perfmon+ep
+getcap /usr/bin/osslscope   # expect: cap_perfmon,cap_bpf=ep
 osslscope doctor            # expect: verdict: ok
 osslscope --help            # lists doctor|inspect|report|check|alias-audit
 ```

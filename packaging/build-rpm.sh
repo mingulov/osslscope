@@ -5,7 +5,7 @@
 # Version is read from Cargo.toml at build time, never hardcoded.
 set -eu
 cd "$(dirname "$0")/.."
-ver=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+ver=$(sed -n '/^\[package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 [ -n "$ver" ] || { echo "build-rpm: cannot read version from Cargo.toml" >&2; exit 1; }
 bin=${1:-target/release/osslscope}
 [ -x "$bin" ] || { echo "build-rpm: binary not found: $bin (build with: cargo build --locked --release)" >&2; exit 1; }
@@ -20,4 +20,9 @@ cp docs/install.md "$st/osslscope-$ver/install.md"
 tar -czf "$top/SOURCES/osslscope-$ver.tar.gz" -C "$st" "osslscope-$ver"
 cp packaging/rpm/osslscope.spec "$top/SPECS/osslscope.spec"
 rpmbuild -bb --define "pkg_version $ver" --define "_topdir $top" "$top/SPECS/osslscope.spec"
-echo "built $(ls -t "$top"/RPMS/x86_64/osslscope-$ver-*.x86_64.rpm | head -1)"
+found=
+for f in "$top"/RPMS/x86_64/osslscope-"$ver"-*.x86_64.rpm; do
+  [ -f "$f" ] && { found=$f; break; }
+done
+[ -n "$found" ] || { echo "build-rpm: no rpm for $ver under $top/RPMS" >&2; exit 1; }
+echo "built $found"

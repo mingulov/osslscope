@@ -5,7 +5,7 @@
 # Version is read from Cargo.toml at build time, never hardcoded.
 set -eu
 cd "$(dirname "$0")/.."
-ver=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+ver=$(sed -n '/^\[package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 [ -n "$ver" ] || { echo "build-deb: cannot read version from Cargo.toml" >&2; exit 1; }
 bin=${1:-target/release/osslscope}
 [ -x "$bin" ] || { echo "build-deb: binary not found: $bin (build with: cargo build --locked --release)" >&2; exit 1; }

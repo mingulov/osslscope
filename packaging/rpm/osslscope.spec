@@ -9,6 +9,7 @@ Version:        %{pkg_version}
 Release:        1%{?dist}
 Summary:        Non-interposing OpenSSL observer on eBPF uprobes
 License:        GPL-3.0-or-later
+Packager:       Denis Mingulov <denis@mingulov.com>
 Source0:        %{name}-%{pkg_version}.tar.gz
 Requires:       libcap
 BuildArch:      x86_64
@@ -17,7 +18,7 @@ BuildArch:      x86_64
 Prove which OpenSSL crypto implementations actually execute in a
 running Linux application, without changing the application.
 The %%post script grants CAP_BPF+CAP_PERFMON file capabilities so that
-doctor, inspect, report, and check run unprivileged.
+the tool runs unprivileged.
 
 %prep
 %setup -q -n %{name}-%{pkg_version}
@@ -54,3 +55,7 @@ exit 0
 /usr/bin/osslscope
 %dir /usr/share/doc/%{name}
 /usr/share/doc/%{name}/install.md
+
+%changelog
+* Sat Sep 19 2026 Denis Mingulov <denis@mingulov.com> - 1.0.0-1
+- 1.0.0 release: GPL-3.0-or-later, deb/rpm file-caps install.
