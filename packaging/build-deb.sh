@@ -11,6 +11,7 @@ bin=${1:-target/release/osslscope}
 command -v dpkg-deb >/dev/null 2>&1 || { echo "build-deb: dpkg-deb not found" >&2; exit 1; }
 st=$(mktemp -d)
 trap 'rm -rf "$st"' EXIT INT TERM
+chmod 755 "$st"
 mkdir -p "$st/DEBIAN" "$st/usr/bin" "$st/usr/share/doc/osslscope"
 sed "s/@VERSION@/$ver/" packaging/deb/DEBIAN/control.in > "$st/DEBIAN/control"
 cp packaging/deb/DEBIAN/postinst packaging/deb/DEBIAN/prerm "$st/DEBIAN/"
