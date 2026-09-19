@@ -1,0 +1,12 @@
+#!/bin/sh
+# Caps live on the binary inode and vanish with the file; clear
+# best-effort anyway. Never fail uninstall.
+set -e
+case "$1" in
+  remove|deconfigure)
+    if command -v setcap >/dev/null 2>&1; then
+      setcap -r /usr/bin/osslscope 2>/dev/null || true
+    fi
+    ;;
+esac
+exit 0

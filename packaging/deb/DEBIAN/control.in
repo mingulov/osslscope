@@ -1,0 +1,13 @@
+Package: osslscope
+Version: @VERSION@
+Section: utils
+Priority: optional
+Architecture: amd64
+Depends: libcap2-bin
+Maintainer: osslscope project <osslscope@localhost>
+Description: Non-interposing OpenSSL observer on eBPF uprobes
+ Prove which OpenSSL crypto implementations actually execute in a
+ running Linux application, without changing the application.
+ .
+ The postinst grants CAP_BPF+CAP_PERFMON file capabilities so that
+ doctor, inspect, report, and check run unprivileged.
