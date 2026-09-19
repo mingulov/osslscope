@@ -18,6 +18,8 @@ Absolute means absolute: the per-call baseline is reported
 alongside, never folded into the budget. (The uprobe trap floor of
 about 0.5 us exceeds typical sub-microsecond baselines, so a
 relative budget would be unachievable by construction.)
+<!-- source: uprobe trap floor (any uprobe costs >=0.5us):
+     wallclock-record.md section 2 -->
 
 ## Worst-cell numbers
 
@@ -67,10 +69,10 @@ attach 26/26 or via canary/capture/fence cells, builtin parity
 
 | Platform | Kernel | OpenSSL | Notes |
 |---|---|---|---|
-| Debian 13 | 6.12-LTS | 3.0 | reference 6.12 lane |
-| Ubuntu host | 7.x | 4.0 | FIPS-provider cell runs here |
+| Debian 13 | 6.12 | 3.0 | reference 6.12 lane |
+| Ubuntu host | 7.0 | 4.0 | FIPS-provider cell runs here |
 | Ubuntu 24.04 | 6.9 HWE | 3.5 | correctness green; overhead report-only |
-| AlmaLinux 10.2 | 6.12 (RHEL 10) | 3.5 | SELinux Enforcing cell green |
+| AlmaLinux 10.2 | 6.12 | 3.5 | SELinux Enforcing cell green |
 | Fedora 44 | 6.19 | 3.5 | rpm-family lane |
 | Arch rolling | 7.2 | 3.6 | first 3.6 signal |
 | openSUSE Tumbleweed | 7.2 | 3.5 | rolling newest-kernel lane |

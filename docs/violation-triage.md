@@ -18,9 +18,10 @@ Every violation carries the actionability tuple:
 - `rule` + `matcher` (which rule, which name matched or was absent)
 - identity: provider label, op, `alg_class`, funcid, count,
   first/last-seen window position
-- target: pid, `comm`, full `cmdline` (capped with a truncation
-  marker), container id, image digest (empty on bare metal)
-- provider object path + libcrypto build-id
+- target: pid, `target.comm`, full `target.cmdline` (capped with a
+  truncation marker), `target.container_id`, `image_digest` (empty
+  on bare metal)
+- provider object path + `provider.build_id`
 
 <!-- source: violation shape + actionability tuple: src/check.rs,
      field tokens: docs/privacy/allowlist-v1.md -->
@@ -38,12 +39,12 @@ Two fail-closed shapes to recognize immediately:
 
 ## 2. Walk to the owning service
 
-`comm` names the process image; `cmdline` names the invocation;
-container id + image digest name the deployed unit. Map that
-tuple to the owning service and config in your inventory (the
-image digest is the join key in container fleets). On bare
-metal, pid/`comm`/`cmdline` plus the provider path/build-id
-identify the deployment.
+`target.comm` names the process image; `target.cmdline` names the
+invocation; `target.container_id` + `image_digest` name the
+deployed unit. Map that tuple to the owning service and config
+in your inventory (the image digest is the join key in container
+fleets). On bare metal, pid/`target.comm`/`target.cmdline` plus
+the provider path/`provider.build_id` identify the deployment.
 
 ## 3. Reproduce with `report`
 

@@ -66,7 +66,7 @@ failure and exits 4. The checks, in the order to fix them:
 - **Static binary as `--libcrypto`:** `doctor` exits 4 with a
   flavor/path-confusion failure -- a static server is not a
   library. Observe it in `--builtin` provider mode instead (see
-  [the design-partner static shape](staging-deploy.md)); a
+  [the static-target recipe](staging-deploy.md#observe)); a
   *stripped* static binary yields disclosed zero-row blindness.
 - **Static target under `doctor --pid`:** `no libcrypto.so
   mapped in target` is the designed refusal; same `--builtin`
