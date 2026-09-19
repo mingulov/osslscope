@@ -20,7 +20,7 @@
       "anchor_offset": 2329424
     },
     {
-      "build_id": "ac90940e06ba87e5d898c665dd9aea65a8867825",
+      "build_id": "82ed3029c5e6d0cc2a468b0657aab9f1aef4129e",
       "openssl": "3.0.22",
       "lane": "lane-a",
       "path": "/opt/openssl-3.0.22/lib64/libcrypto.so",
@@ -38,7 +38,7 @@
       "anchor_offset": 2330240
     },
     {
-      "build_id": "b0fbca03b320a88dac2274b371c4e8bd04b9e204",
+      "build_id": "270876ac679d2a198d17a552deb6257bd324fb41",
       "openssl": "3.5.8",
       "lane": "lane-c",
       "path": "/opt/openssl-3.5.8/lib64/libcrypto.so",

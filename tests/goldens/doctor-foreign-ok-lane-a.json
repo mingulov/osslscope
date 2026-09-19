@@ -72,7 +72,7 @@
     },
     {
       "id": "build-id",
-      "message": "known build ac90940e06ba87e5d898c665dd9aea65a8867825 (OpenSSL 3.0.22, query_offset 2257088)",
+      "message": "known build 82ed3029c5e6d0cc2a468b0657aab9f1aef4129e (OpenSSL 3.0.22, query_offset 2257088)",
       "status": "pass"
     }
   ],
