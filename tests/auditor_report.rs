@@ -636,8 +636,9 @@ fn golden_exercises_branches() {
 fn tampered_documents_rejected() {
     // Negative proof: every tamper below must fail the checker. A
     // conformance test that cannot say NO is a golden-match ritual.
+    type Tamper = (&'static str, Box<dyn Fn(&mut Value)>);
     let (_, v) = load_golden();
-    let mut cases: Vec<(&str, Box<dyn Fn(&mut Value)>)> = Vec::new();
+    let mut cases: Vec<Tamper> = Vec::new();
     cases.push((
         "drop completeness",
         Box::new(|d: &mut Value| {
