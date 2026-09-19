@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! Discovery harness: builds + drives `tests/fixture/` C fixtures
 //! for the P1 golden suites. (P1 exit 1 owns the harness API.)
 

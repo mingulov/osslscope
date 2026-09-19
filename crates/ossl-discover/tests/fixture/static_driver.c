@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* static_driver.c — statically-linked provider target (P1 exit-2
  * static-provider fixture). Links min-provider.c INTO the executable
  * (no .so); the provider registers via OSSL_PROVIDER_add_builtin.

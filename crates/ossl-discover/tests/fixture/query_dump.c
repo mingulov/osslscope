@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* query_dump.c — ground-truth provider-table census (P1 exit-2 test tool).
  * Loads one provider, calls OSSL_PROVIDER_query_operation per op id, and
  * prints every (op, alg-names, funcid, impl-file-offset) row as TSV.

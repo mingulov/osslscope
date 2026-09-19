@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! Provisional P2 `report` (JSON doc + minimal human table; P3
 //! freezes the schema, adds `check`, and narrows exits).
 //!

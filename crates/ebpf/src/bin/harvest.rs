@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-2.0-only
 //! Harvest probes: two-stage provider table walk in BPF (promoted
 //! from the P0-4 spike at P1 exit 1; P1 exit 2 raises the walk bounds
 //! for the built-in default provider: 241-encoder census).

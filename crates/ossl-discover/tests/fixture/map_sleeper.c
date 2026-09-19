@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* map_sleeper (P1 exit-5 doctor fixture): dlopen every argv entry,
  * print PID= + MAPOK=n, sleep 60. No GO protocol, no fetch —
  * doctor inspects the mappings directly. Multiple paths exercise

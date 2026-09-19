@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! `inspect` — dispatch discovery against a live PID (P1 exit 1).
 //!
 //! Runs the two-stage harvest and prints the harvest document (P1 schema:

@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Packaging (deb + rpm)
 
 File-caps default install: both packages ship the `osslscope` binary

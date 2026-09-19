@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Attach failures: exit-4 decision tree
 
 Exit 4 means the evidence is unusable (or there is no evidence at

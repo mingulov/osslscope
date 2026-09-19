@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* SPIKE test provider: 2 DIGEST + 2 SIGNATURE algs, 26 dispatch entries.
  * Every callback appends "ALG:funcid:FUNC" to $SPIKE_COUNTER_FILE (default
  * /tmp/spike-counters.log) and returns success. -DSPIKE_NO_COUNT compiles

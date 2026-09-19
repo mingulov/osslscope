@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! Dispatch discovery (P1). Promoted from `spike/src/bin/harvest.rs`
 //! (P0-4): two-stage provider-table harvest — init-return walk finds
 //! `query_operation` (funcid 1027), query-return walks hand back one ROW

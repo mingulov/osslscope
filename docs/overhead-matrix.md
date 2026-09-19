@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Overhead and support matrix
 
 Overhead claims match the worst passing cell, never the best case.

@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # FIPS interim rule
 
 v1 has no KAT discriminator: it cannot distinguish the FIPS

@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # osslscope CLI usage
 
 Current commands: `inspect` / `report` / `check` / `doctor` /

@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # osslscope capture allowlist v1
 
 Rule: this is the complete set the eBPF programs and the userspace

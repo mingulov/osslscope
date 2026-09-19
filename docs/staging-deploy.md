@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Staging deploy
 
 CI gates with `run --`. Staging observes already-running

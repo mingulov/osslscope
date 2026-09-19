@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! Auditor-report conformance (P6): the checked-in golden pins the
 //! auditor-visible `report` document byte-shape; the same checker
 //! validates live story output (environment-private, via

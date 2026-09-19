@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* P0-9 churn driver: provider load/unload generation windows as oracle.
  * Usage: churn -n N -gens G [-reuse]
  * Fresh OSSL_LIB_CTX per phase and per generation (default ctx untouched,

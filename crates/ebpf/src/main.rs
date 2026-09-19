@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-2.0-only
 //! Entry-only probes + keyed count maps (P2 promotes the spike
 //! `count` program here). Skeleton: compiles for bpfel, attaches nothing.
 #![no_std]

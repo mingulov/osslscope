@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! Capture planner (P2): harvest doc + live maps → multi-link plan.
 //!
 //! Plans are ASLR-immune: doc rows carry the stable

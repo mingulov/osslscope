@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! Live harvest driver: two-stage attach + ring drain + settle,
 //! promoted behavior-identical from the P0-4 spike. The fixture-only
 //! `evp_driver` cmdline guard is now a caller-supplied marker

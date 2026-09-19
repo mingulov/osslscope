@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! libcrypto flavor classifier (P1-0): OpenSSL vs BoringSSL/AWS-LC
 //! lookalikes, from disk-ELF bytes only (dynsym + rodata scan; the tool
 //! never links libcrypto).

@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Repository guide
 
 Public product repository for `osslscope`. Only public material here.

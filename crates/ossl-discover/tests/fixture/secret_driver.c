@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Secret-canary driver (P4 exit 2): pushes KNOWN sentinel buffers
  * through digest/sign/cipher/MAC/KEM/KDF/RAND/password/salt paths
  * while the observer watches. Two sentinel classes (by prefix):

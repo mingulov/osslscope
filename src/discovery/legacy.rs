@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! Legacy tripwires (P1 exit 3): ENGINE / meth_new / provider-load /
 //! low-level-family uprobe plan from the frozen registry × target
 //! dynsym, string-argument taxonomy, and the `legacy` doc section.

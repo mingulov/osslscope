@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! CLI dispatch (P1-0 skeleton). Full contract: PRD §6; exit-code
 //! taxonomy 0/1/2/3/4/10 (see usage.md).
 use std::process::ExitCode;

@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Grant least-privilege file caps so osslscope runs unprivileged.
 # On any failure: warn with the labeled-sudo fallback, never fail install.
 set -e

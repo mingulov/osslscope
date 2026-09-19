@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! `doctor` preflight (P1 exit 5): fail-closed environment + target matrix.
 //!
 //! Doctrine (PLAN exit 5 + PRD §6, post-STOP#6 file-caps pivot):

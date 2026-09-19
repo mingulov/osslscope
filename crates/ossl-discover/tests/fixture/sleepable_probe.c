@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 // sleepable_probe.c — P0-14 availability probe: is BPF_F_SLEEPABLE
 // accepted on uprobe_multi link_create for this kernel? Loads a trivial
 // kprobe-type prog, then attempts the link twice: control (flags=0, must

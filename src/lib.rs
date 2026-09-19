@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! osslscope — non-interposing OpenSSL observer on eBPF uprobes.
 //!
 //! Module build order per PLAN §4: P1 owns `cli`, `doctor`, `kinds`,

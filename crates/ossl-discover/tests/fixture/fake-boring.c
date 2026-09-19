@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Fake BoringSSL-flavored libcrypto (P1 exit-5 doctor fixture):
  * BORINGSSL_-prefixed + EVP_ dynamic exports, no OpenSSL anchors
  * (no OSSL_provider_init, no OPENSSL_version_major) — the flavor

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Sentinel provider (P4 exit 2): hostile algorithm names + an
  * overlong digest array. The query fn returns a runtime-built
  * OSSL_ALGORITHM array: 4 sentinel-named algs (short, exact-128,

@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # CI gate recipes
 
 CI gates use `check` in spawn mode (`run --`). Never `--pid` in

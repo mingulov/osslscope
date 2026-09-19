@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! Disk-ELF helpers: `.dynsym` lookup + vaddr↔offset translation.
 //! No symbols are used past the `OSSL_provider_init` anchor, which is
 //! load-mandated and present even in stripped modules. The built-in

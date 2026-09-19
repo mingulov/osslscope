@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* layout_assert.c — R12 fail-closed struct-shape + funcid-spot assertions.
  * Compiled against EACH lane's real OpenSSL headers (P1-0 lane pass):
  * any drift in a touched struct or transcribed id is a compile error.

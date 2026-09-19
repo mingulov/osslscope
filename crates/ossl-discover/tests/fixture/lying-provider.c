@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Lying provider (P1 exit 4 M4-fence fixture): a forged DISPATCH
  * table the harvester must fence (count-only), never attribute —
  * plus multi-impl entries it must EMIT (revised doctrine: a

@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Built-in provider runbook: stripped or unknown libcrypto
 
 `inspect --builtin` (and `report --builtin`) must find one file

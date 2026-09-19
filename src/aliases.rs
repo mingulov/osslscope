@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! `alias-audit` — group harvest rows by shared implementation address
 //! (P1 exit 2 alias audit). Pure post-processor: reads a harvest
 //! document, groups rows by `addr_hash`, and reports multi-member

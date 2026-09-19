@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! osslscope CLI entry. Subcommand set mirrors p11scope
 //! (`doctor/inspect/report/check`); argument-parsing crate chosen in P1
 //! (positional parsing until then — PLAN §3 YAGNI).

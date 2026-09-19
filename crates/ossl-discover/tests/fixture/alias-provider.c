@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Deliberate-alias provider (P1 exit-2 alias-audit fixture): 3 DIGEST
  * algs, 21 dispatch entries. ALIAS-A + ALIAS-B share ONE dispatch table
  * (identical function addresses); ALIAS-OWN has its own table.

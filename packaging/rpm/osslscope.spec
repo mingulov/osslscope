@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 %{!?pkg_version: %{error:pass --define "pkg_version <ver>" (read from Cargo.toml, see packaging/README.md)}}
 
 # Prebuilt cargo binary: no debuginfo/debugsource subpackages.
@@ -7,7 +8,7 @@ Name:           osslscope
 Version:        %{pkg_version}
 Release:        1%{?dist}
 Summary:        Non-interposing OpenSSL observer on eBPF uprobes
-License:        MIT OR Apache-2.0
+License:        GPL-3.0-or-later
 Source0:        %{name}-%{pkg_version}.tar.gz
 Requires:       libcap
 BuildArch:      x86_64

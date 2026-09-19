@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* static_lowlevel.c — static-link blindness (P1 exit-3 static cell,
  * PLAN static-link cell). Low-level SHA256 linked against libcrypto.a
  * + stripped → no libcrypto mapping → inspect must emit

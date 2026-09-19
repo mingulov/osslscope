@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* lying_driver.c — fetch-only driver for the P1 exit-4 lying
  * provider. Fetches LYING-SHA + LYING-UNBACKED + SHA256 (provider=
  * lying) but NEVER invokes any digest op: LYING-UNBACKED's dispatch

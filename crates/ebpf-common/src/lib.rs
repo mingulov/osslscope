@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! Key/value structs shared between `crates/ebpf` and userspace.
 //! Single source of truth for the P2 capture-map wire format; both
 //! sides `include` this crate, so drift is a compile error, not a

@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! `--pid` target pinning (P1 exit-6): pidfd + starttime identity.
 //!
 //! Evidence paths (`inspect`/harvest) must not attribute one

@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! `observed-crypto-v1` reader contract (P3 exit-3).
 //!
 //! The schema file lives at `schemas/observed-crypto-v1.json`.

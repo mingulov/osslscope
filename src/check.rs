@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! P3 `check`: bounded-window policy gate (CI use).
 //!
 //! `check [capture flags] [rules] {--pid P | run -- <cmd>}`

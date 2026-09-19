@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* dlopen_blind.c — pre-loaded provider blindness (P1 exit-3 dlopen
  * cell). dlopen()s the provider + full load/fetch/digest BEFORE
  * printing PID, then idles through GO1/GO2/EOF. Post-attach the

@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # osslscope
 
 Prove which OpenSSL crypto implementations actually execute in a running
@@ -123,4 +124,9 @@ application payloads.
 
 ## License
 
-MIT OR Apache-2.0. See `LICENSE-MIT` and `LICENSE-APACHE`.
+Public license: GPL-3.0-or-later - see [LICENSE](LICENSE).
+BPF sources: GPL-2.0-only - see
+[LICENSES/GPL-2.0-only.txt](LICENSES/GPL-2.0-only.txt).
+
+Per-file SPDX tags (`GPL-3.0-or-later` for userspace, docs, and scripts;
+`GPL-2.0-only` for BPF programs) remove any ambiguity.

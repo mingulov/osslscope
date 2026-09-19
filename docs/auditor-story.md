@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Auditor story: from evidence to verdict
 
 This is the end-to-end story an auditor walks: capture evidence,

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* P0-3 EVP driver: deterministic dispatch-callback ground truth.
  * Usage: echo GO | evp_driver -n N -alg {digest|sign}
  * stdout: exactly "%ld\n" with N. stderr: diagnostics (provider lines,

@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! Frozen version-keyed registries (P1-0 freeze, `REGISTRY_VERSION = 1`).
 //!
 //! Sources (all verified 2026-09-17; re-freeze = re-run the same greps):

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Fake AWS-LC-flavored libcrypto (P1 exit-5 doctor fixture):
  * AWSLC_-prefixed + EVP_ dynamic exports, no OpenSSL anchors —
  * the flavor classifier must report AwsLc and doctor must refuse

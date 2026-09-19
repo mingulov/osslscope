@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Privacy residuals
 
 The [capture allowlist](allowlist-v1.md) is the complete set the

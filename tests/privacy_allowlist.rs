@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! Privacy allowlist pins: the checked-in BPF map inventory and the
 //! complete target-memory read list must match the sources. Any drift
 //! is a release blocker, not a doc nit.

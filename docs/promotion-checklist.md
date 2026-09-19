@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Staging-to-production promotion checklist
 
 v1 promotes bounded, evidence-carrying observation from staging

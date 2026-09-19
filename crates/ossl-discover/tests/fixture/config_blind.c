@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* config_blind.c — config-selected provider blindness (P1 exit-3
  * config cell). The provider auto-loads via openssl.cnf (OPENSSL_CONF
  * = argv[1], gate-generated, spike by absolute module path) + a

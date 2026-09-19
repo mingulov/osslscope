@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* blind_driver.c — no-OpenSSL target for the P1 exit-3 blind cell.
  * Links only libc: no libcrypto mapping, so legacy tripwires cannot
  * attach and the doc must carry the blind legacy section (mandated

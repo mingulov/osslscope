@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Violation triage
 
 `check` exits 10 on violation -- on COMPLETE or PARTIAL evidence

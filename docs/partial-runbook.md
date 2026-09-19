@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # PARTIAL runbook: per-reason response
 
 A PARTIAL window (exit 3) carries `reasons[]`, each with exactly

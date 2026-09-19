@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # docs
 
 Product documentation. Planned layout (directories appear as their first spec lands):

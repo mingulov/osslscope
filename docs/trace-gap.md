@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # osslscope vs OSSL_TRACE: the gap
 
 `OSSL_TRACE` is the built-in rival. We shot it out against three

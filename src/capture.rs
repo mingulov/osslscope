@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! Keyed capture engine (P2): window loop, fencing, `run --` spawn.
 //!
 //! Windows observe ONE tgid's crypto executions as keyed counts.

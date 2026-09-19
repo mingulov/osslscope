@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* P1 exit-3 TP driver: spike EVP fetch (dispatch trigger) plus the
  * full legacy-tripwire ground truth, all through this binary's PLT
  * (caller-attributed probes must observe exactly these calls):

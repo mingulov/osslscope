@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # What osslscope proves (and what it does not)
 
 osslscope is a runtime cryptographic observer for OpenSSL. It proves

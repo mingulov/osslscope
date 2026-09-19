@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! `/proc/pid/maps` parsing + provider-mapping lookup for the
 //! relocation leg. Userspace never reads target memory — only maps.
 use std::path::Path;

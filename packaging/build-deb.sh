@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Build osslscope_<ver>-1_amd64.deb from a cargo-built release binary.
 # Usage: ./packaging/build-deb.sh [PATH_TO_BINARY]   (default: target/release/osslscope)
 # Version is read from Cargo.toml at build time, never hardcoded.

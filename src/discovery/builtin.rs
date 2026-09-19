@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! Built-in default-provider bootstrap (P1 exit 2): resolve the file
 //! offset of the core-static `ossl_provider_query_operation` (no
 //! `.dynsym` entry — uprobes need an absolute file offset).

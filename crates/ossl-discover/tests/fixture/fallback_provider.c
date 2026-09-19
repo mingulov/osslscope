@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* P0-11 fallback fixture: ENGINE Y that shadows NID_sha256.
  * fallback_run(n): with FALLBACK_ENGINE=1 (default) registers the engine
  * and sets it default for digests, fetches SHA256 (X oracle), then runs n

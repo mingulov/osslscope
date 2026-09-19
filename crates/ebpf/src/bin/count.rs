@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-2.0-only
 //! Keyed execution-count probe (P2 capture; entry-only v1).
 //!
 //! One program, `count_entry`, attached via `uprobe_multi` to every

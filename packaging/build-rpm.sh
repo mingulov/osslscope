@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Build osslscope-<ver>-1.<dist>.x86_64.rpm from a cargo-built release binary.
 # Usage: ./packaging/build-rpm.sh [PATH_TO_BINARY]   (default: target/release/osslscope)
 # Version is read from Cargo.toml at build time, never hardcoded.

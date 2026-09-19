@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Canary provider (P1 exit 1): 1 DIGEST + 1 SIGNATURE with canary
  * names that must NEVER appear in inspect output (registry-class at
  * emission maps them to "other"). 13 dispatch entries total (7+6).

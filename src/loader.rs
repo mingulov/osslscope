@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! Raw multi loader for the frozen eBPF shape (P2).
 //!
 //! aya 0.14 loads uprobe progs with `expected_attach_type=0`, which

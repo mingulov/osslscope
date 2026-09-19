@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Caps live on the binary inode and vanish with the file; clear
 # best-effort anyway. Never fail uninstall.
 set -e

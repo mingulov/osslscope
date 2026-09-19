@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! Harvest document schema: one row per (op, alg, funcid, addr)
 //! plus relocation backing. `addr_hash` (frozen preimage: the attested
 //! backing triple, NOT the runtime address) is the golden-comparable
