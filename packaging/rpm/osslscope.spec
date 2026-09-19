@@ -1,5 +1,8 @@
 %{!?pkg_version: %{error:pass --define "pkg_version <ver>" (read from Cargo.toml, see packaging/README.md)}}
 
+# Prebuilt cargo binary: no debuginfo/debugsource subpackages.
+%global debug_package %{nil}
+
 Name:           osslscope
 Version:        %{pkg_version}
 Release:        1%{?dist}
