@@ -28,6 +28,8 @@ sha2 = "=0.11.0"
 
 [dev-dependencies]
 aya-obj = "=0.3.0"
+# T02: protocol tests decode the discovery wire ABI directly.
+osslscope-ebpf-common = { path = "crates/ebpf-common" }
 
 [workspace]
 members = ["crates/ossl-discover", "crates/manifest", "crates/ebpf-common", "crates/bpf-sys"]

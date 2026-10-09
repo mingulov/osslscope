@@ -4,10 +4,13 @@
  * OSSL_ALGORITHM array: 4 sentinel-named algs (short, exact-128,
  * overlong-200, unterminated) + 516 filler algs = 520 entries:
  * slots 0..511 walk, the guard at slot 512 sees live entries
- * (TRUNC_ALGS must fire). All names carry
- * the CNRY7QN- prefix: the canary scanner asserts the prefix is
- * PRESENT in the raw ring dump (alias lanes really traversed the
- * string-read site) and ABSENT from every classified artifact.
+ * (TRUNC_ALGS must fire). All names carry the CNRY7QN- prefix.
+ * Since T02 (classify-before-emission) the ring carries no string
+ * bytes, so the presence half of the old doctrine moved: the
+ * scanner asserts the prefix is ABSENT from every artifact, ring
+ * payload, and live map, while the classified evidence shows
+ * matching `other`/overlong verdicts (the positive control that
+ * the alias lanes really traversed the string-read site).
  * All algs share one digest dispatch table (fetch-safe bodies). */
 #include <stdlib.h>
 #include <string.h>

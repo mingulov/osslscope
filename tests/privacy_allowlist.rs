@@ -82,7 +82,7 @@ fn map_inventory_matches_sources() {
     actual.extend(maps_from_source(
         &manifest_dir().join("crates/ebpf/src/bin/count.rs"),
     ));
-    assert_eq!(actual.len(), 12, "unexpected map count: {actual:?}");
+    assert_eq!(actual.len(), 14, "unexpected map count: {actual:?}");
     assert_eq!(
         expected, actual,
         "allowlist inventory drifted from eBPF maps"

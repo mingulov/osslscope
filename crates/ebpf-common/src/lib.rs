@@ -55,6 +55,573 @@ impl CountValue {
     }
 }
 
+// Discovery wire ABI v2 (T02 classify-before-emission): the ring
+// carries finite numeric class IDs plus internal structural join
+// addresses only. Raw target name/argument bytes never cross; the
+// kernel classifies bounded strings against observer-populated
+// tables (`ALG_CLASS`/`TRIP_CLASS` maps) and emits
+// `(class, status)` numerics. Both sides share these definitions,
+// so wire drift is a compile error. The classifier logic below is
+// generic over the table backend: BPF passes map lookups, host
+// tests pass `HashMap` lookups over identically built tables.
+//
+// Endianness: same-host little-endian, embodied by the target pair
+// (`bpfel-unknown-none` + x86-64). Map values serialize explicitly
+// little-endian; no `transmute` crosses this boundary.
+
+/// Discovery wire-shape version. Bump with loader enforcement on any
+/// incompatible event change.
+pub const DISCOVERY_ABI_VERSION: u32 = 2;
+
+/// Ring event kinds (frozen). Kind 6 (`KIND_WALKDBG`) was retired in
+/// ABI v2: walk-abort forensics left the ring (TRUNC bits keep the
+/// abort signal), so decoders must reject kind 6.
+pub const KIND_INIT_RET: u32 = 1;
+pub const KIND_QUERY_RET: u32 = 2;
+pub const KIND_ROW: u32 = 3;
+pub const KIND_ALG: u32 = 4;
+pub const KIND_TRIP: u32 = 5;
+
+/// Kernel string-read windows (bytes, NUL-inclusive).
+pub const ALG_WINDOW: usize = 128;
+pub const TRIP_WINDOW: usize = 32;
+
+/// Max `:`-separated alias segments classified per algorithm name.
+/// Real provider alias lists hold a handful of segments (81-char
+/// census max); longer lists emit `ALG_TRUNCATED` with weak failed
+/// closed rather than silently dropping tail evidence.
+pub const MAX_ALG_SEGMENTS: usize = 8;
+
+/// Map-value name capacities (bytes). Population fails closed if the
+/// registry outgrows them.
+pub const MAX_ALG_NAME: usize = 36;
+pub const MAX_TRIP_NAME: usize = 16;
+
+/// Algorithm class for unregistered/overlong/unreadable primaries.
+/// Never a valid registry index (asserted by protocol tests).
+pub const OTHER_CLASS: u16 = u16::MAX;
+
+/// Algorithm verdict statuses (u8 wire; strict vocabulary).
+/// `ALG_UNREADABLE` is emitted by BPF when the string helper fails
+/// (the pure [`classify_alg_with`] never returns it: its input is
+/// already-read bytes, and saturation maps to `ALG_OVERLONG`).
+pub const ALG_OK: u8 = 0;
+pub const ALG_UNKNOWN: u8 = 1;
+pub const ALG_OVERLONG: u8 = 2;
+pub const ALG_TRUNCATED: u8 = 3;
+pub const ALG_UNREADABLE: u8 = 4;
+
+/// Trip verdict statuses (u8 wire; strict vocabulary).
+pub const TRIP_OK: u8 = 0;
+pub const TRIP_UNREADABLE: u8 = 1;
+pub const TRIP_OVERLONG: u8 = 2;
+
+/// Trip classes (u16 wire). Engine and load taxonomies share the
+/// numeric space; the probe program (cookie context) selects the
+/// decoder, so the values never mix.
+pub const TRIP_OTHER: u16 = 0;
+pub const ENGINE_DYNAMIC: u16 = 1;
+pub const ENGINE_BUILTIN: u16 = 2;
+pub const LOAD_LEGACY: u16 = 1;
+pub const LOAD_DEFAULT: u16 = 2;
+pub const LOAD_FIPS: u16 = 3;
+
+/// Classified algorithm record: 32 bytes. `arr`/`idx` are the
+/// internal structural join keys (array base + alg index) consumed
+/// at relocation/attribution and never serialized.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AlgEvent {
+    pub kind: u32,
+    pub op: u32,
+    pub class: u16,
+    pub status: u8,
+    pub weak: u8,
+    pub _pad: u32,
+    pub arr: u64,
+    pub idx: u64,
+}
+
+const _: () = assert!(size_of::<AlgEvent>() == 32);
+const _: () = assert!(align_of::<AlgEvent>() == 8);
+
+/// Classified tripwire hit: 16 bytes. `cookie` selects the probe
+/// (hence the taxonomy); `class`/`status` are the kernel verdict.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TripEvent {
+    pub kind: u32,
+    pub cookie: u32,
+    pub class: u16,
+    pub status: u8,
+    pub _pad: u8,
+    pub _pad2: u32,
+}
+
+const _: () = assert!(size_of::<TripEvent>() == 16);
+const _: () = assert!(align_of::<TripEvent>() == 4);
+
+/// Dispatch row: 40 bytes, unchanged shape (no strings by
+/// construction). Shared here so BPF cannot drift the layout.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RowEvent {
+    pub kind: u32,
+    pub op: u32,
+    pub funcid: u32,
+    pub _pad: u32,
+    pub addr: u64,
+    pub aux: u64,
+    pub idx: u64,
+}
+
+const _: () = assert!(size_of::<RowEvent>() == 40);
+const _: () = assert!(align_of::<RowEvent>() == 8);
+
+/// Init-return anchor report: 32 bytes (`addr` = query-fn address
+/// for stage-2 attach, `aux` = attach cookie). Shrunk from the
+/// 160-byte v1 generic event; the name payload is gone.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InitRetEvent {
+    pub kind: u32,
+    pub op: u32,
+    pub funcid: u32,
+    pub _pad: u32,
+    pub addr: u64,
+    pub aux: u64,
+}
+
+const _: () = assert!(size_of::<InitRetEvent>() == 32);
+const _: () = assert!(align_of::<InitRetEvent>() == 8);
+
+/// `ALG_CLASS` map value, keyed by FNV-1a-64 of the exact registry
+/// spelling: 40 bytes. `name`/`len` exist so the kernel can confirm
+/// an exact byte match after the hash prefilter (a hash hit alone
+/// never establishes membership). `weak` is 0/1.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AlgClassValue {
+    pub class: u16,
+    pub weak: u8,
+    pub len: u8,
+    pub name: [u8; MAX_ALG_NAME],
+}
+
+const _: () = assert!(size_of::<AlgClassValue>() == 40);
+const _: () = assert!(align_of::<AlgClassValue>() == 2);
+
+/// `TRIP_CLASS` map value, keyed by FNV-1a-64 of the exact pattern:
+/// 22 bytes. Both taxonomy classes ride one entry (today's patterns
+/// belong to exactly one taxonomy each, but the shape tolerates a
+/// future shared spelling).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TripClassValue {
+    pub engine: u16,
+    pub load: u16,
+    pub len: u16,
+    pub name: [u8; MAX_TRIP_NAME],
+}
+
+const _: () = assert!(size_of::<TripClassValue>() == 22);
+const _: () = assert!(align_of::<TripClassValue>() == 2);
+
+/// Explicit little-endian map-value encodings for population (no
+/// `transmute`: the byte layout is pinned here, once).
+pub fn alg_value_bytes(v: &AlgClassValue) -> [u8; 40] {
+    let mut b = [0u8; 40];
+    b[0..2].copy_from_slice(&v.class.to_le_bytes());
+    b[2] = v.weak;
+    b[3] = v.len;
+    b[4..4 + MAX_ALG_NAME].copy_from_slice(&v.name);
+    b
+}
+
+pub fn trip_value_bytes(v: &TripClassValue) -> [u8; 22] {
+    let mut b = [0u8; 22];
+    b[0..2].copy_from_slice(&v.engine.to_le_bytes());
+    b[2..4].copy_from_slice(&v.load.to_le_bytes());
+    b[4..6].copy_from_slice(&v.len.to_le_bytes());
+    b[6..6 + MAX_TRIP_NAME].copy_from_slice(&v.name);
+    b
+}
+
+/// FNV-1a-64 (IETF draft-eastlake-fnv, non-cryptographic): a hash
+/// prefilter only. Membership always requires the exact byte
+/// confirm, so adversarial preimages cannot forge a class (and a
+/// hostile provider can already claim any name directly).
+pub const FNV1A64_BASIS: u64 = 14695981039346656037;
+const FNV1A64_PRIME: u64 = 1099511628211;
+
+#[inline(always)]
+pub const fn fnv1a64_step(h: u64, b: u8) -> u64 {
+    (h ^ b as u64).wrapping_mul(FNV1A64_PRIME)
+}
+
+pub const fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut h = FNV1A64_BASIS;
+    let mut i = 0;
+    while i < bytes.len() {
+        h = fnv1a64_step(h, bytes[i]);
+        i += 1;
+    }
+    h
+}
+
+// Verifier-shape contract for every loop below: bounds are
+// compile-time constants, iteration breaks on runtime lengths, and
+// every byte load carries its own dominating `.get()` check (no
+// bare indexing off reloaded positions, no intermediate sub-slices
+// whose validity the verifier must carry across calls). Any check
+// failure fails closed to "unknown segment", never to a partial
+// decode.
+
+/// Kernel algorithm verdict over one alias-list window.
+pub struct AlgVerdict {
+    pub class: u16,
+    pub weak: bool,
+    pub status: u8,
+}
+
+/// Classify one `:`-separated alias window (the string-helper slice:
+/// no NUL inside, at most `ALG_WINDOW - 1` bytes). `saturated` is
+/// true when the window filled completely, in which case the input
+/// is `OVERLONG` without parsing (an exact-fit window and a
+/// truncated read are indistinguishable — the helper forces NUL —
+/// so saturation fails closed with no retained prefix).
+///
+/// `lookup` resolves a segment hash to its populated table entry;
+/// BPF passes map lookups, host tests pass `HashMap` lookups. Every
+/// loop bound is a compile-time constant (verifier-safe); every
+/// byte access is bounds-checked (`.get`, never bare indexing off a
+/// runtime position).
+pub fn classify_alg_with<F>(name: &[u8], saturated: bool, lookup: F) -> AlgVerdict
+where
+    F: Fn(u64) -> Option<AlgClassValue>,
+{
+    if saturated || name.len() >= ALG_WINDOW {
+        return AlgVerdict {
+            class: OTHER_CLASS,
+            weak: false,
+            status: ALG_OVERLONG,
+        };
+    }
+    // Phase 1: single bounded pass — split on ':' while hashing each
+    // segment (FNV streams byte by byte). Store (hash, start, len)
+    // for the first segments; count the total for truncation.
+    let mut hashes = [0u64; MAX_ALG_SEGMENTS];
+    let mut starts = [0u8; MAX_ALG_SEGMENTS];
+    let mut lens = [0u8; MAX_ALG_SEGMENTS];
+    let mut total: usize = 0;
+    let mut h = FNV1A64_BASIS;
+    let mut seg_start: usize = 0;
+    let mut i: usize = 0;
+    while i < ALG_WINDOW {
+        let b = match name.get(i) {
+            Some(b) => *b,
+            None => break,
+        };
+        if b == b':' {
+            if total < MAX_ALG_SEGMENTS {
+                hashes[total] = h;
+                starts[total] = seg_start as u8;
+                lens[total] = (i - seg_start) as u8;
+            }
+            total += 1;
+            h = FNV1A64_BASIS;
+            seg_start = i + 1;
+        } else {
+            h = fnv1a64_step(h, b);
+        }
+        i += 1;
+    }
+    // Trailing segment (also the sole empty segment of empty input,
+    // matching `str::split(':')` semantics incl. edge splits).
+    if total < MAX_ALG_SEGMENTS {
+        hashes[total] = h;
+        starts[total] = seg_start as u8;
+        lens[total] = (i - seg_start) as u8;
+    }
+    total += 1;
+    // Look one segment up: hash prefilter + exact byte confirm.
+    // `None` (hash miss, length mismatch, byte mismatch, or any
+    // bounds-check failure) is an unknown segment — never a partial
+    // decode. Segments longer than any possible pattern cannot match
+    // (population caps pattern length), so they skip the lookup.
+    let resolve = |s: usize| -> Option<(u16, bool)> {
+        let st = *starts.get(s)? as usize;
+        let ln = *lens.get(s)? as usize;
+        if ln > MAX_ALG_NAME {
+            return None;
+        }
+        let v = lookup(*hashes.get(s)?)?;
+        if v.len as usize != ln {
+            return None;
+        }
+        let mut i = 0usize;
+        while i < MAX_ALG_NAME {
+            if i >= ln {
+                break;
+            }
+            if name.get(st.saturating_add(i)) != v.name.get(i) {
+                return None;
+            }
+            i += 1;
+        }
+        Some((v.class, v.weak != 0))
+    };
+    if total > MAX_ALG_SEGMENTS {
+        // Pathological alias list: the primary (fully observed and
+        // confirmed) is kept, but weak fails closed — unseen tail
+        // segments may be weak — and the status stays explicit.
+        let class = resolve(0).map(|(c, _)| c).unwrap_or(OTHER_CLASS);
+        return AlgVerdict {
+            class,
+            weak: true,
+            status: ALG_TRUNCATED,
+        };
+    }
+    let mut class = OTHER_CLASS;
+    let mut weak = false;
+    let mut s = 0;
+    while s < MAX_ALG_SEGMENTS {
+        if s >= total {
+            break;
+        }
+        if let Some((c, w)) = resolve(s) {
+            if s == 0 {
+                class = c;
+            }
+            weak |= w;
+        }
+        s += 1;
+    }
+    AlgVerdict {
+        class,
+        weak,
+        status: if class == OTHER_CLASS {
+            ALG_UNKNOWN
+        } else {
+            ALG_OK
+        },
+    }
+}
+
+/// Trip taxonomy selected by the probe program (`trip_str0` watches
+/// `ENGINE_by_id`, `trip_str1` watches provider loads).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TripTaxonomy {
+    Engine,
+    Load,
+}
+
+/// Kernel trip verdict over one argument window.
+pub struct TripVerdict {
+    pub class: u16,
+    pub status: u8,
+}
+
+/// Classify one trip argument window (same window/saturation
+/// contract as [`classify_alg_with`], single segment, no alias
+/// splitting). Readable-but-unregistered input is `TRIP_OK` with
+/// class `TRIP_OTHER` (matching the historical `other` counts);
+/// only saturated windows are `TRIP_OVERLONG`. NULL/unreadable
+/// arguments never reach this function: the probe emits
+/// `TRIP_UNREADABLE` for them directly.
+pub fn classify_trip_with<F>(
+    arg: &[u8],
+    saturated: bool,
+    taxonomy: TripTaxonomy,
+    lookup: F,
+) -> TripVerdict
+where
+    F: Fn(u64) -> Option<TripClassValue>,
+{
+    if saturated || arg.len() >= TRIP_WINDOW {
+        return TripVerdict {
+            class: TRIP_OTHER,
+            status: TRIP_OVERLONG,
+        };
+    }
+    let mut h = FNV1A64_BASIS;
+    let mut i: usize = 0;
+    while i < TRIP_WINDOW {
+        let b = match arg.get(i) {
+            Some(b) => *b,
+            None => break,
+        };
+        h = fnv1a64_step(h, b);
+        i += 1;
+    }
+    if let Some(v) = lookup(h) {
+        if v.len as usize == arg.len() && arg.len() <= MAX_TRIP_NAME {
+            let mut i = 0usize;
+            let mut same = true;
+            while i < MAX_TRIP_NAME {
+                if i >= arg.len() {
+                    break;
+                }
+                if arg.get(i) != v.name.get(i) {
+                    same = false;
+                    break;
+                }
+                i += 1;
+            }
+            if same {
+                let class = match taxonomy {
+                    TripTaxonomy::Engine => v.engine,
+                    TripTaxonomy::Load => v.load,
+                };
+                return TripVerdict {
+                    class,
+                    status: TRIP_OK,
+                };
+            }
+        }
+    }
+    TripVerdict {
+        class: TRIP_OTHER,
+        status: TRIP_OK,
+    }
+}
+
+/// Taxonomy decoders: known ids become their labels, anything else
+/// is `None` (fail closed to a dropped hit, never to a wrong
+/// specific class). Callers validate with cookie context right
+/// after [`parse_trip_event`], since the class range is
+/// taxonomy-relative.
+pub fn engine_class_name(id: u16) -> Option<&'static str> {
+    match id {
+        ENGINE_DYNAMIC => Some("dynamic"),
+        ENGINE_BUILTIN => Some("builtin"),
+        TRIP_OTHER => Some("other"),
+        _ => None,
+    }
+}
+
+pub fn load_class_name(id: u16) -> Option<&'static str> {
+    match id {
+        LOAD_LEGACY => Some("legacy"),
+        LOAD_DEFAULT => Some("default"),
+        LOAD_FIPS => Some("fips"),
+        TRIP_OTHER => Some("other"),
+        _ => None,
+    }
+}
+
+/// Strict wire-decode failures. Every rejection drops the event (and
+/// logs); nothing rejected ever becomes a label or a count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WireErr {
+    Length,
+    Kind,
+    ClassRange,
+    StatusRange,
+    WeakRange,
+    Contradiction,
+}
+
+fn read_event<T: Copy>(b: &[u8]) -> Option<T> {
+    // Exact size: ring items are fixed-size reservations, so a short
+    // OR oversized payload is corruption, never a longer variant.
+    if b.len() != size_of::<T>() {
+        return None;
+    }
+    // Sound: `T` is `repr(C)` all-integer (every bit pattern valid),
+    // the length is exact, `read_unaligned` tolerates ring
+    // alignment. Padding bytes are real (BPF zeroes `_pad`s).
+    Some(unsafe { b.as_ptr().cast::<T>().read_unaligned() })
+}
+
+/// Kernel algorithm-status labels for row emission. Total over the
+/// strict vocabulary; decode-time validation guarantees membership.
+pub fn alg_status_name(s: u8) -> Option<&'static str> {
+    match s {
+        ALG_OK => Some("ok"),
+        ALG_UNKNOWN => Some("unknown"),
+        ALG_OVERLONG => Some("overlong"),
+        ALG_TRUNCATED => Some("truncated"),
+        ALG_UNREADABLE => Some("unreadable"),
+        _ => None,
+    }
+}
+
+/// Decode one `AlgEvent`: exact length, kind, class range (`OTHER` or
+/// a live registry index — `class_count` comes from the single
+/// registry at runtime, never from the wire), strict status/weak
+/// vocabularies, and combination validity (each status admits only
+/// the classes/weak values the kernel actually emits with it).
+pub fn parse_alg_event(b: &[u8], class_count: u16) -> Result<AlgEvent, WireErr> {
+    let e: AlgEvent = read_event(b).ok_or(WireErr::Length)?;
+    if e.kind != KIND_ALG {
+        return Err(WireErr::Kind);
+    }
+    if e.class != OTHER_CLASS && e.class >= class_count {
+        return Err(WireErr::ClassRange);
+    }
+    match e.status {
+        ALG_OK | ALG_UNKNOWN | ALG_OVERLONG | ALG_TRUNCATED | ALG_UNREADABLE => {}
+        _ => return Err(WireErr::StatusRange),
+    }
+    if e.weak > 1 {
+        return Err(WireErr::WeakRange);
+    }
+    let combo_ok = match e.status {
+        ALG_OK => e.class != OTHER_CLASS,
+        ALG_UNKNOWN => e.class == OTHER_CLASS,
+        ALG_OVERLONG | ALG_UNREADABLE => e.class == OTHER_CLASS && e.weak == 0,
+        ALG_TRUNCATED => e.weak == 1,
+        _ => false,
+    };
+    if !combo_ok {
+        return Err(WireErr::Contradiction);
+    }
+    Ok(e)
+}
+
+/// Decode one `TripEvent`: exact length, kind, strict status, and
+/// combination validity (non-OK statuses always pair with `OTHER`).
+/// The class range itself is taxonomy-relative, so the caller
+/// validates it via [`engine_class_name`]/[`load_class_name`] with
+/// cookie context.
+pub fn parse_trip_event(b: &[u8]) -> Result<TripEvent, WireErr> {
+    let e: TripEvent = read_event(b).ok_or(WireErr::Length)?;
+    if e.kind != KIND_TRIP {
+        return Err(WireErr::Kind);
+    }
+    match e.status {
+        TRIP_OK => {}
+        TRIP_UNREADABLE | TRIP_OVERLONG => {
+            if e.class != TRIP_OTHER {
+                return Err(WireErr::Contradiction);
+            }
+        }
+        _ => return Err(WireErr::StatusRange),
+    }
+    Ok(e)
+}
+
+/// Decode one `RowEvent` (`KIND_ROW`) or first-hit liveness record
+/// (`KIND_QUERY_RET`, same shape). All remaining fields are opaque
+/// internal join/relocation numerics.
+pub fn parse_row_event(b: &[u8]) -> Result<RowEvent, WireErr> {
+    let e: RowEvent = read_event(b).ok_or(WireErr::Length)?;
+    if e.kind != KIND_ROW && e.kind != KIND_QUERY_RET {
+        return Err(WireErr::Kind);
+    }
+    Ok(e)
+}
+
+/// Decode one `InitRetEvent` (stage-1 anchor report).
+pub fn parse_init_ret_event(b: &[u8]) -> Result<InitRetEvent, WireErr> {
+    let e: InitRetEvent = read_event(b).ok_or(WireErr::Length)?;
+    if e.kind != KIND_INIT_RET {
+        return Err(WireErr::Kind);
+    }
+    Ok(e)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

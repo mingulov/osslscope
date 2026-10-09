@@ -51,8 +51,10 @@ pub struct ProgSpec {
 
 /// Frozen harvest shape (keyed-design §1): dims asserted vs the
 /// object by `prepare`, fail-closed on drift. Proven by the P2
-/// task-0 spike (spike-uret.sh GREEN 3/3).
-pub const HARVEST_MAPS: [MapSpec; 8] = [
+/// task-0 spike (spike-uret.sh GREEN 3/3). T02 adds the two
+/// observer-populated classifier tables (`ALG_CLASS`, `TRIP_CLASS`):
+/// same frozen discipline, same commit as the wire ABI change.
+pub const HARVEST_MAPS: [MapSpec; 10] = [
     MapSpec {
         name: "EVENTS",
         map_type: 27,
@@ -114,6 +116,22 @@ pub const HARVEST_MAPS: [MapSpec; 8] = [
         map_type: 1,
         key_size: 4,
         value_size: 8,
+        max_entries: 64,
+        flags: 0,
+    },
+    MapSpec {
+        name: "ALG_CLASS",
+        map_type: 1,
+        key_size: 8,
+        value_size: 40,
+        max_entries: 1024,
+        flags: 0,
+    },
+    MapSpec {
+        name: "TRIP_CLASS",
+        map_type: 1,
+        key_size: 8,
+        value_size: 22,
         max_entries: 64,
         flags: 0,
     },

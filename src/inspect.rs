@@ -2,9 +2,10 @@
 //! `inspect` — dispatch discovery against a live PID (P1 exit 1).
 //!
 //! Runs the two-stage harvest and prints the harvest document (P1 schema:
-//! `alg_class` + `weak`, never raw provider strings; `addr` present for
-//! P0-schema compat, redacted before golden comparison). Exit 0 on a
-//! triggered harvest, 1 on timeout/failure.
+//! `alg_class` + `weak`, never raw provider strings; no runtime
+//! addresses — relocation backing travels as file triples plus
+//! one-way hashes). Exit 0 on a triggered harvest, 1 on
+//! timeout/failure.
 use crate::discovery::harvest;
 use std::process::ExitCode;
 use std::time::Duration;

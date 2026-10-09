@@ -16,6 +16,7 @@ use crate::discovery::{builtin, elf, legacy, maps, schema};
 use crate::loader::Loaded;
 use anyhow::{Context as _, anyhow, bail};
 use aya::maps::{Map, MapData, RingBuf};
+use osslscope_ebpf_common as wire;
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::num::NonZeroU32;
@@ -24,63 +25,17 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-const KIND_INIT_RET: u32 = 1;
-
 fn debug_harvest() -> bool {
     std::env::var("OSSL_DEBUG_HARVEST").is_ok()
 }
 
-/// Test-only ring tap (P4 canary suite): when `OSSL_CANARY_DUMP`
-/// names a file, every raw ring payload is appended there (capped
-/// at 32 MiB). The dump is the ringbuf artifact the canary scanner
-/// checks for secret bytes — it holds raw target strings by design
-/// (non-secret provider names), so it is never set in production.
-struct CanaryDump {
-    file: Option<std::fs::File>,
-    remaining: u64,
-}
-
-impl CanaryDump {
-    fn open_from_env() -> Self {
-        let mut d = CanaryDump {
-            file: None,
-            remaining: 32 << 20,
-        };
-        if let Ok(path) = std::env::var("OSSL_CANARY_DUMP") {
-            if !path.is_empty() {
-                match std::fs::File::create(&path) {
-                    Ok(f) => d.file = Some(f),
-                    Err(e) => eprintln!("canary dump: cannot create {path}: {e}"),
-                }
-            }
-        }
-        d
-    }
-
-    fn write(&mut self, b: &[u8]) {
-        let Some(f) = self.file.as_mut() else {
-            return;
-        };
-        if self.remaining == 0 {
-            return;
-        }
-        let n = b.len().min(self.remaining as usize);
-        use std::io::Write as _;
-        if f.write_all(&b[..n]).is_err() {
-            self.file = None;
-            return;
-        }
-        self.remaining -= n as u64;
-    }
-}
-
-/// Debug-only alg line: classify before printing (logs are
-/// artifacts — raw target strings never serialize, even under the
+/// Debug-only alg line over an already-classified record (logs are
+/// artifacts: table labels, ids, and counters only — never target
+/// strings, string lengths, or runtime addresses, even under the
 /// debug flag).
-fn debug_alg_line(op: u32, arr: u64, idx: u64, alg: &str, len: usize) -> String {
-    let (class, weak) = crate::kinds::classify_alg(alg);
+fn debug_alg_line(op: u32, idx: u64, class: &str, weak: bool, status: u8) -> String {
     format!(
-        "HARVESTDBG alg op={op} arr={arr:#x} idx={idx} class={class} weak={} len={len}",
+        "HARVESTDBG alg op={op} idx={idx} class={class} weak={} status={status}",
         u8::from(weak)
     )
 }
@@ -145,20 +100,174 @@ fn pretouch_mappings(pid: u32, live: &[maps::Mapping], path: &Path, canon: &str)
         }
     }
 }
-const KIND_QUERY_RET: u32 = 2;
-const KIND_ROW: u32 = 3;
-const KIND_ALG: u32 = 4;
-const KIND_TRIP: u32 = 5;
-const KIND_WALKDBG: u32 = 6;
-const EVENT_LEN: usize = 160;
-const ROW_EVENT_LEN: usize = 40;
-const NAME_OFF: usize = 32;
-const NAME_LEN: usize = 128;
-/// KIND_TRIP string bytes (bounded 32B at offset 8).
-const TRIP_ARG_OFF: usize = 8;
-const TRIP_ARG_LEN: usize = 32;
 /// Legacy-query attach cookie (primary query/init use 0).
 const LEGACY_COOKIE: u64 = 1;
+
+/// Build the `ALG_CLASS` kernel table entries from the single
+/// registry: every registered name (class = registry index) plus
+/// every weak-only name (class = `OTHER`, weak set). Fails closed on
+/// a hash collision or an over-capacity name — the kernel confirms
+/// exact bytes after the hash prefilter, so a collision would be
+/// unrepresentable.
+pub fn build_alg_entries() -> anyhow::Result<Vec<(u64, wire::AlgClassValue)>> {
+    let mut out: Vec<(u64, wire::AlgClassValue)> = Vec::new();
+    let mut seen: HashSet<u64> = HashSet::new();
+    let mut push = |name: &str, class: u16, weak: bool| -> anyhow::Result<()> {
+        if name.len() > wire::MAX_ALG_NAME {
+            bail!("registry name over kernel cap: {name:?}");
+        }
+        let h = wire::fnv1a64(name.as_bytes());
+        if !seen.insert(h) {
+            bail!("classifier hash collision on {name:?}");
+        }
+        let mut bytes = [0u8; wire::MAX_ALG_NAME];
+        bytes[..name.len()].copy_from_slice(name.as_bytes());
+        out.push((
+            h,
+            wire::AlgClassValue {
+                class,
+                weak: u8::from(weak),
+                len: name.len() as u8,
+                name: bytes,
+            },
+        ));
+        Ok(())
+    };
+    for (i, a) in crate::kinds::ALG_NAMES.iter().enumerate() {
+        let class = u16::try_from(i).map_err(|_| anyhow!("registry exceeds class id space"))?;
+        if class == wire::OTHER_CLASS {
+            bail!("registry exceeds class id space");
+        }
+        push(a.name, class, crate::kinds::is_weak_alg(a.name))?;
+    }
+    for w in crate::kinds::WEAK_ALGS {
+        if !crate::kinds::is_known_alg(w) {
+            push(w, wire::OTHER_CLASS, true)?;
+        }
+    }
+    Ok(out)
+}
+
+/// Build the `TRIP_CLASS` kernel table entries from the single trip
+/// taxonomy: the dynamic id, the built-in engine ids, and the load
+/// names. Each entry carries both taxonomy classes (today's patterns
+/// belong to exactly one taxonomy each).
+pub fn build_trip_entries() -> anyhow::Result<Vec<(u64, wire::TripClassValue)>> {
+    let mut out: Vec<(u64, wire::TripClassValue)> = Vec::new();
+    let mut seen: HashSet<u64> = HashSet::new();
+    let mut push = |name: &str, engine: u16, load: u16| -> anyhow::Result<()> {
+        if name.len() > wire::MAX_TRIP_NAME {
+            bail!("trip pattern over kernel cap: {name:?}");
+        }
+        let h = wire::fnv1a64(name.as_bytes());
+        if !seen.insert(h) {
+            bail!("trip table hash collision on {name:?}");
+        }
+        let mut bytes = [0u8; wire::MAX_TRIP_NAME];
+        bytes[..name.len()].copy_from_slice(name.as_bytes());
+        out.push((
+            h,
+            wire::TripClassValue {
+                engine,
+                load,
+                len: name.len() as u16,
+                name: bytes,
+            },
+        ));
+        Ok(())
+    };
+    push("dynamic", wire::ENGINE_DYNAMIC, wire::TRIP_OTHER)?;
+    for id in legacy::BUILTIN_ENGINE_IDS {
+        push(id, wire::ENGINE_BUILTIN, wire::TRIP_OTHER)?;
+    }
+    let loads = [
+        ("legacy", wire::LOAD_LEGACY),
+        ("default", wire::LOAD_DEFAULT),
+        ("fips", wire::LOAD_FIPS),
+    ];
+    for (name, class) in loads {
+        if !legacy::LOAD_NAMES.contains(&name) {
+            bail!("load taxonomy drift: {name:?} left the registry");
+        }
+        push(name, wire::TRIP_OTHER, class)?;
+    }
+    Ok(out)
+}
+
+/// Populate the kernel classifier tables right after map creation,
+/// before any attach can fire. Observer-owned registry bytes only;
+/// no target memory is involved.
+fn populate_classifier_maps(maps: &HashMap<String, OwnedFd>) -> anyhow::Result<()> {
+    let put = |map: &str, key: &[u8], value: &[u8]| -> anyhow::Result<()> {
+        let fd = maps
+            .get(map)
+            .ok_or_else(|| anyhow!("missing classifier map {map}"))?;
+        ossl_bpf_sys::map_update_elem(fd.as_raw_fd(), key, value, 0)
+            .with_context(|| format!("populate {map}"))?;
+        Ok(())
+    };
+    for (h, v) in build_alg_entries()? {
+        put("ALG_CLASS", &h.to_le_bytes(), &wire::alg_value_bytes(&v))?;
+    }
+    for (h, v) in build_trip_entries()? {
+        put("TRIP_CLASS", &h.to_le_bytes(), &wire::trip_value_bytes(&v))?;
+    }
+    Ok(())
+}
+
+/// Decode one trip verdict against the probe taxonomy: the cookie
+/// selects engine vs load decoding, and the class id must be valid
+/// for that taxonomy. `None` (unknown cookie or out-of-taxonomy
+/// class) fails closed to a dropped hit.
+fn decode_trip_hit(
+    cookie: u64,
+    class: u16,
+    status: u8,
+    set: &legacy::ProbeSet,
+) -> Option<legacy::TripHit> {
+    if set.by_id_cookies.contains(&cookie) {
+        wire::engine_class_name(class)?;
+    } else if set.is_load_cookie(cookie) {
+        wire::load_class_name(class)?;
+    } else {
+        return None;
+    }
+    Some(legacy::TripHit {
+        cookie,
+        class,
+        status,
+    })
+}
+
+/// Resolve a BPF-reported query-fn address to its (file offset,
+/// object path) for stage-2 attach. Errors carry the provider path
+/// and cookie (observer inputs) — never the runtime address (stderr
+/// is a scanned artifact, so error paths redact like emission).
+fn resolve_query_target(
+    live: &[maps::Mapping],
+    provider: &Path,
+    canon: &str,
+    addr: u64,
+    cookie: u64,
+) -> anyhow::Result<(u64, PathBuf)> {
+    if cookie == LEGACY_COOKIE {
+        let m = live
+            .iter()
+            .find(|m| m.start <= addr && addr < m.end && m.ino != 0)
+            .ok_or_else(|| {
+                anyhow!("legacy stage-2 attach has no file mapping (cookie {cookie})")
+            })?;
+        Ok((addr - m.start + m.offset, PathBuf::from(&m.path)))
+    } else {
+        let m = maps::provider_mapping(live, provider, canon, addr).ok_or_else(|| {
+            anyhow!(
+                "stage-2 attach has no provider mapping for {}",
+                provider.display()
+            )
+        })?;
+        Ok((addr - m.start + m.offset, provider.to_path_buf()))
+    }
+}
 
 /// Load-mandated init anchor, present even in stripped modules.
 const INIT_ANCHOR: &str = "OSSL_provider_init";
@@ -471,7 +580,7 @@ fn blind_legacy_section() -> serde_json::Value {
     legacy::section(&legacy::SectionInputs {
         set: &set,
         trip: &HashMap::new(),
-        trip_strs: &[],
+        trip_hits: &[],
         legacy_queries: 0,
         legacy_classes: Vec::new(),
         extra_findings: &[],
@@ -592,6 +701,9 @@ pub fn run_detailed(
     )?;
 
     let loaded = load_frozen(&obj_bytes)?;
+    // Classifier tables before any attach can fire: the kernel
+    // classifies every string-bearing event against these.
+    populate_classifier_maps(&loaded.maps)?;
     // Owns every multi link (drop = detach, all paths).
     let mut links = Links::default();
     let mut resolution: Option<String> = None;
@@ -723,7 +835,6 @@ pub fn run_detailed(
     let ev_data = MapData::from_fd(ev_fd).map_err(|e| anyhow!("EVENTS mapdata: {e}"))?;
     let ev_map = Map::from_map_data(ev_data).map_err(|e| anyhow!("EVENTS map: {e}"))?;
     let mut ring = RingBuf::try_from(ev_map)?;
-    let mut canary = CanaryDump::open_from_env();
     let start = Instant::now();
     let mut last_event = None;
     let mut trigger_observed = false;
@@ -734,22 +845,27 @@ pub fn run_detailed(
         attached_queries.insert(0);
     }
     let mut primary_init_observed = false;
-    let mut trip_strs: Vec<(u64, String)> = Vec::new();
+    let mut trip_hits: Vec<legacy::TripHit> = Vec::new();
     let mut rows: Vec<schema::Row> = Vec::new();
-    // Identity includes addr: scaled tables cycle funcids, so the triple
-    // alone collapses distinct dispatch entries (72 vs 504 observed).
+    // Identity includes the impl address: scaled tables cycle funcids,
+    // so the triple alone collapses distinct dispatch entries (72 vs
+    // 504 observed). Weak and kernel status ride the key too: two
+    // alias lists sharing a primary class but differing in evidence
+    // or verdict stay distinct.
     // Index (not unit): duplicate keys arbitrate the stored array below.
-    let mut seen: HashMap<(u32, String, u32, u64), usize> = HashMap::new();
+    let mut seen: HashMap<(u32, String, bool, String, u32, u64), usize> = HashMap::new();
     // Pre-drain maps snapshot for duplicate arbitration (mappings are
     // stable — providers stay loaded for the whole harvest; a failed
     // read degrades to first-seen-wins).
     let early_maps = maps::read_maps(cfg.pid).unwrap_or_default();
     let mut queries_observed: u64 = 0;
     let mut ops_hit: HashSet<u32> = HashSet::new();
-    // (Array address, alg index) → names; ROW events join here (BPF
-    // emits the 128B name once per walked alg; the array disambiguates
+    // (Array address, alg index) → kernel verdict (table label,
+    // weak, status label): ROW events join here (BPF emits one
+    // classified ALG record per walked alg; the array disambiguates
     // providers sharing (op, index)).
-    let mut alg_names: HashMap<(u64, u64), String> = HashMap::new();
+    let mut alg_records: HashMap<(u64, u64), (String, bool, String)> = HashMap::new();
+    let class_count = crate::kinds::ALG_NAMES.len() as u16;
 
     while start.elapsed() < cfg.timeout {
         // Short-lived targets (and signals): no more events can
@@ -775,35 +891,44 @@ pub fn run_detailed(
             fresh = true;
             last_event = Some(Instant::now());
             let b: &[u8] = &item;
-            canary.write(b);
-            if b.len() < 8 {
+            if b.len() < 4 {
                 eprintln!("short event: {} bytes", b.len());
                 continue;
             }
-            let u32at = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
-            let u64at = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
-            let want =
-                if u32at(0) == KIND_ROW || u32at(0) == KIND_QUERY_RET || u32at(0) == KIND_TRIP {
-                    ROW_EVENT_LEN
-                } else {
-                    EVENT_LEN
-                };
+            let kind = u32::from_le_bytes(b[0..4].try_into().unwrap());
+            // Ring payloads are small numerics-only structs (shared
+            // wire ABI v2): unknown kinds cannot be sized, so they
+            // are dropped here, before any field is read.
+            let want = match kind {
+                wire::KIND_INIT_RET => size_of::<wire::InitRetEvent>(),
+                wire::KIND_QUERY_RET | wire::KIND_ROW => size_of::<wire::RowEvent>(),
+                wire::KIND_ALG => size_of::<wire::AlgEvent>(),
+                wire::KIND_TRIP => size_of::<wire::TripEvent>(),
+                k => {
+                    eprintln!("unknown event kind {k}");
+                    continue;
+                }
+            };
             if b.len() < want {
                 eprintln!("short event: {} bytes", b.len());
                 continue;
             }
-            match u32at(0) {
-                KIND_INIT_RET => {
+            match kind {
+                wire::KIND_INIT_RET => {
+                    let Ok(ev) = wire::parse_init_ret_event(b) else {
+                        eprintln!("bad init-ret event");
+                        continue;
+                    };
                     // aux carries the attach cookie: 0 = target
                     // provider, 1 = legacy.
-                    let cookie = u64at(24);
+                    let cookie = ev.aux;
                     if attached_queries.contains(&cookie) {
                         // Re-pretouch on repeat inits (unload/reload
                         // cycles): the new mapping's pages are cold and
                         // nofault BPF reads fail on them (exit-8 P4:
                         // 3.x TRUNC_WALK_NAME on the reload query).
                         // Best-effort, never fatal.
-                        let addr = u64at(16);
+                        let addr = ev.addr;
                         if let Ok(live) = maps::read_maps(cfg.pid) {
                             let path = if cookie == LEGACY_COOKIE {
                                 live.iter()
@@ -832,28 +957,15 @@ pub fn run_detailed(
                         cfg.builtin,
                         cfg.legacy,
                     )?;
-                    let addr = u64at(16);
+                    let addr = ev.addr;
                     let live = maps::read_maps(cfg.pid).with_context(|| {
                         format!("read maps of {} (target may have exited)", cfg.pid)
                     })?;
                     // Resolve in the init's own file: the target
                     // provider for cookie 0, the mapped legacy.so for
                     // cookie 1 (mapped by now — its init just ran).
-                    let (off, path) = if cookie == LEGACY_COOKIE {
-                        let m = live
-                            .iter()
-                            .find(|m| m.start <= addr && addr < m.end && m.ino != 0)
-                            .ok_or_else(|| {
-                                anyhow!("legacy query addr {addr:#x} outside file mappings")
-                            })?;
-                        (addr - m.start + m.offset, PathBuf::from(&m.path))
-                    } else {
-                        let m = maps::provider_mapping(&live, &cfg.provider, &canon, addr)
-                            .ok_or_else(|| {
-                                anyhow!("query addr {addr:#x} outside provider mappings")
-                            })?;
-                        (addr - m.start + m.offset, cfg.provider.clone())
-                    };
+                    let (off, path) =
+                        resolve_query_target(&live, &cfg.provider, &canon, addr, cookie)?;
                     attach_pair(
                         &loaded,
                         &mut links,
@@ -866,42 +978,70 @@ pub fn run_detailed(
                     )?;
                     attached_queries.insert(cookie);
                     pretouch_mappings(pid.get(), &live, &path, &canon);
-                    eprintln!("INSPECT stage=query addr={addr:#x} off={off:#x} cookie={cookie}");
+                    eprintln!("INSPECT stage=query off={off:#x} cookie={cookie}");
                 }
-                KIND_QUERY_RET if u32at(8) == 0 => {
+                wire::KIND_QUERY_RET => {
+                    let Ok(ev) = wire::parse_row_event(b) else {
+                        eprintln!("bad query-ret event");
+                        continue;
+                    };
+                    if ev.kind != wire::KIND_QUERY_RET || ev.funcid != 0 {
+                        continue;
+                    }
                     trigger_observed = true;
                     queries_observed += 1;
-                    ops_hit.insert(u32at(4));
+                    ops_hit.insert(ev.op);
                     if debug_harvest() {
-                        eprintln!(
-                            "HARVESTDBG query_ret op={} rv={:#x} aux={}",
-                            u32at(4),
-                            u64at(16),
-                            u64at(24)
-                        );
+                        eprintln!("HARVESTDBG query_ret op={} slot={}", ev.op, ev.aux);
                     }
                 }
-                KIND_ALG => {
+                wire::KIND_ALG => {
+                    let Ok(ev) = wire::parse_alg_event(b, class_count) else {
+                        eprintln!("bad alg event");
+                        continue;
+                    };
                     trigger_observed = true;
-                    let name = &b[NAME_OFF..NAME_OFF + NAME_LEN];
-                    let len = name.iter().position(|c| *c == 0).unwrap_or(name.len());
-                    let alg = String::from_utf8_lossy(&name[..len]).into_owned();
+                    let Some(label) = crate::kinds::alg_class_label(ev.class) else {
+                        eprintln!("alg event with out-of-range class {}", ev.class);
+                        continue;
+                    };
+                    let Some(status) = wire::alg_status_name(ev.status) else {
+                        eprintln!("alg event with out-of-range status {}", ev.status);
+                        continue;
+                    };
                     if debug_harvest() {
                         eprintln!(
                             "{}",
-                            debug_alg_line(u32at(4), u64at(16), u64at(24), &alg, len)
+                            debug_alg_line(ev.op, ev.idx, label, ev.weak != 0, ev.status)
                         );
                     }
-                    alg_names.insert((u64at(16), u64at(24)), alg);
+                    alg_records.insert(
+                        (ev.arr, ev.idx),
+                        (label.to_string(), ev.weak != 0, status.to_string()),
+                    );
                 }
-                KIND_ROW => {
-                    trigger_observed = true;
-                    let arr = u64at(24);
-                    let Some(alg) = alg_names.get(&(arr, u64at(32))).cloned() else {
-                        eprintln!("orphan row: op={} arr={arr:#x} idx={}", u32at(4), u64at(32));
+                wire::KIND_ROW => {
+                    let Ok(ev) = wire::parse_row_event(b) else {
+                        eprintln!("bad row event");
                         continue;
                     };
-                    let key = (u32at(4), alg.clone(), u32at(8), u64at(16));
+                    if ev.kind != wire::KIND_ROW {
+                        continue;
+                    }
+                    trigger_observed = true;
+                    let Some((label, weak, status)) = alg_records.get(&(ev.aux, ev.idx)).cloned()
+                    else {
+                        eprintln!("orphan row: op={} idx={}", ev.op, ev.idx);
+                        continue;
+                    };
+                    let key = (
+                        ev.op,
+                        label.clone(),
+                        weak,
+                        status.clone(),
+                        ev.funcid,
+                        ev.addr,
+                    );
                     if let Some(&i) = seen.get(&key) {
                         // Duplicate key: multi-libctx re-query, or two
                         // providers sharing one implementation (default +
@@ -916,57 +1056,51 @@ pub fn run_detailed(
                                 rows[i].arr,
                             )
                             .is_none()
-                            && maps::provider_mapping(&early_maps, &cfg.provider, &canon, arr)
+                            && maps::provider_mapping(&early_maps, &cfg.provider, &canon, ev.aux)
                                 .is_some()
                         {
-                            rows[i].arr = arr;
+                            rows[i].arr = ev.aux;
                         }
                     } else {
                         seen.insert(key, rows.len());
                         rows.push(schema::Row {
-                            op: u32at(4),
-                            alg,
-                            funcid: u32at(8),
-                            addr: u64at(16),
-                            arr,
+                            op: ev.op,
+                            alg_class: label,
+                            weak,
+                            status,
+                            funcid: ev.funcid,
+                            impl_addr: ev.addr,
+                            arr: ev.aux,
                         });
                     }
                 }
-                KIND_TRIP => {
+                wire::KIND_TRIP => {
                     // Deliberately NOT a dispatch trigger (doctrine in
                     // the no-trigger block below): tripwires observe
                     // independently of the dispatch harvest.
-                    let s = &b[TRIP_ARG_OFF..TRIP_ARG_OFF + TRIP_ARG_LEN];
-                    let len = s.iter().position(|c| *c == 0).unwrap_or(s.len());
-                    trip_strs.push((
-                        u32at(4) as u64,
-                        String::from_utf8_lossy(&s[..len]).into_owned(),
-                    ));
-                }
-                KIND_WALKDBG => {
-                    // Walk-abort forensics (never a trigger, never a
-                    // row — diagnostic only, printed under the debug
-                    // flag, rare by construction).
-                    if debug_harvest() {
-                        let aux = u64at(24);
-                        let nv = u64::from_le_bytes(
-                            b[NAME_OFF..NAME_OFF + 8].try_into().unwrap_or([0; 8]),
-                        );
-                        let iv = u64::from_le_bytes(
-                            b[NAME_OFF + 8..NAME_OFF + 16].try_into().unwrap_or([0; 8]),
-                        );
-                        eprintln!(
-                            "HARVESTDBG walkdbg op={} rv={:#x} j={} reason={} names={:#x} imp={:#x}",
-                            u32at(4),
-                            u64at(16),
-                            aux >> 32,
-                            aux & 0xffff_ffff,
-                            nv,
-                            iv
-                        );
+                    let Ok(ev) = wire::parse_trip_event(b) else {
+                        eprintln!("bad trip event");
+                        continue;
+                    };
+                    // Trip events imply attached tripwires, which imply
+                    // a planned probe set (same statement attaches and
+                    // records); without one the cookie cannot be
+                    // validated, so the hit is dropped.
+                    let Some(set) = &probe_set else {
+                        eprintln!("trip hit before probe plan");
+                        continue;
+                    };
+                    match decode_trip_hit(ev.cookie as u64, ev.class, ev.status, set) {
+                        Some(hit) => trip_hits.push(hit),
+                        None => eprintln!(
+                            "trip hit outside taxonomy: cookie={} class={}",
+                            ev.cookie, ev.class
+                        ),
                     }
                 }
-                k => eprintln!("unknown event kind {k}"),
+                // Unreachable: unknown kinds are dropped at the sizing
+                // match above, before any field is read.
+                _ => continue,
             }
         }
         if trigger_observed && !fresh {
@@ -1030,7 +1164,7 @@ pub fn run_detailed(
             Some(set) => Some(legacy::section(&legacy::SectionInputs {
                 set,
                 trip: &trip,
-                trip_strs: &trip_strs,
+                trip_hits: &trip_hits,
                 legacy_queries: lgcalls,
                 legacy_classes: Vec::new(),
                 extra_findings: &extra_findings,
@@ -1142,7 +1276,7 @@ pub fn run_detailed(
         }
         let loads_observed = probe_set
             .as_ref()
-            .is_some_and(|set| trip_strs.iter().any(|(c, _)| set.is_load_cookie(*c)));
+            .is_some_and(|set| trip_hits.iter().any(|h| set.is_load_cookie(h.cookie)));
         if cfg.legacy && !loads_observed {
             // Quiet target: COMPLETE-EMPTY. Stats.builtin=false
             // suppresses the inventory counters (nothing was
@@ -1244,7 +1378,7 @@ pub fn run_detailed(
             }
             // Anonymous or unmapped array: attribute by implementation
             // address instead.
-            maps::provider_mapping(&live, &cfg.provider, &canon, r.addr).is_some()
+            maps::provider_mapping(&live, &cfg.provider, &canon, r.impl_addr).is_some()
         });
         foreign_dropped = (before - rows.len()) as u64;
     }
@@ -1288,15 +1422,14 @@ pub fn run_detailed(
         },
     )?;
     if cfg.legacy {
-        let classes: Vec<String> = legacy_rows
-            .iter()
-            .map(|r| crate::kinds::classify_alg(&r.alg).0.to_string())
-            .collect();
+        // Rows arrive pre-classified (kernel verdicts resolved at
+        // ring decode); legacy classes are carried, not recomputed.
+        let classes: Vec<String> = legacy_rows.iter().map(|r| r.alg_class.clone()).collect();
         let l = match &probe_set {
             Some(set) => legacy::section(&legacy::SectionInputs {
                 set,
                 trip: &trip,
-                trip_strs: &trip_strs,
+                trip_hits: &trip_hits,
                 legacy_queries: lgcalls,
                 legacy_classes: classes,
                 extra_findings: &extra_findings,
@@ -1311,44 +1444,156 @@ pub fn run_detailed(
 #[cfg(test)]
 mod tests {
     #[test]
-    fn row_key_includes_addr() {
+    fn row_key_includes_addr_weak_and_status() {
         // Regression pin for the scaled-table collapse (72 vs 504):
-        // same (op, alg, funcid) at distinct addrs are distinct rows.
-        let a = (1u32, "X".to_string(), 7u32, 0x1000u64);
-        let b = (1u32, "X".to_string(), 7u32, 0x2000u64);
-        let mut s: std::collections::HashSet<(u32, String, u32, u64)> =
+        // same (op, class, funcid) at distinct addrs are distinct
+        // rows; weak evidence and kernel status survive alias
+        // collapse (same class, different verdicts stay distinct).
+        let a = (
+            1u32,
+            "X".to_string(),
+            false,
+            "ok".to_string(),
+            7u32,
+            0x1000u64,
+        );
+        let b = (
+            1u32,
+            "X".to_string(),
+            false,
+            "ok".to_string(),
+            7u32,
+            0x2000u64,
+        );
+        let c = (
+            1u32,
+            "X".to_string(),
+            true,
+            "ok".to_string(),
+            7u32,
+            0x1000u64,
+        );
+        let d = (
+            1u32,
+            "other".to_string(),
+            false,
+            "overlong".to_string(),
+            7u32,
+            0x1000u64,
+        );
+        let e = (
+            1u32,
+            "other".to_string(),
+            false,
+            "unknown".to_string(),
+            7u32,
+            0x1000u64,
+        );
+        let mut s: std::collections::HashSet<(u32, String, bool, String, u32, u64)> =
             std::collections::HashSet::new();
         assert!(s.insert(a));
         assert!(s.insert(b));
-        assert_eq!(s.len(), 2);
+        assert!(s.insert(c));
+        assert!(s.insert(d));
+        assert!(s.insert(e));
+        assert_eq!(s.len(), 5);
     }
 
     #[test]
-    fn debug_alg_line_never_prints_raw_names() {
-        let line = super::debug_alg_line(1, 0x1000, 0, "canary-DOOM-7QZ", 14);
-        assert!(!line.contains("canary-DOOM-7QZ"), "raw name leaked: {line}");
-        assert!(line.contains("class=other"), "missing class: {line}");
-        let line = super::debug_alg_line(1, 0x1000, 0, "SHA2-256:SHA256", 13);
+    fn debug_alg_line_prints_classified_fields_only() {
+        // Table labels, ids, and counters only: no addresses, no
+        // lengths, and no slot for raw names (the signature takes a
+        // pre-classified record).
+        let line = super::debug_alg_line(1, 0, "other", false, super::wire::ALG_UNKNOWN);
         assert_eq!(
             line,
-            "HARVESTDBG alg op=1 arr=0x1000 idx=0 class=SHA2-256 weak=0 len=13"
+            "HARVESTDBG alg op=1 idx=0 class=other weak=0 status=1"
         );
+        let line = super::debug_alg_line(1, 3, "SHA2-256", false, super::wire::ALG_OK);
+        assert_eq!(
+            line,
+            "HARVESTDBG alg op=1 idx=3 class=SHA2-256 weak=0 status=0"
+        );
+        assert!(!line.contains("0x"), "address leaked: {line}");
+        assert!(!line.contains("len="), "length leaked: {line}");
     }
 
     #[test]
-    fn canary_dump_appends_and_caps() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(format!("canary-dump-test-{}", std::process::id()));
-        let mut d = super::CanaryDump {
-            file: Some(std::fs::File::create(&path).unwrap()),
-            remaining: 4,
+    fn resolve_query_target_redacts_errors() {
+        use std::path::Path;
+        let live = vec![super::maps::Mapping {
+            start: 0x1000,
+            end: 0x2000,
+            x: true,
+            offset: 0x500,
+            dev: "08:01".into(),
+            ino: 7,
+            path: "/prov.so".into(),
+        }];
+        // Happy paths resolve to file offsets.
+        let (off, path) =
+            super::resolve_query_target(&live, Path::new("/prov.so"), "", 0x1400, 0).unwrap();
+        assert_eq!((off, path), (0x900, std::path::PathBuf::from("/prov.so")));
+        let (off, path) =
+            super::resolve_query_target(&live, Path::new("/prov.so"), "", 0x1400, 1).unwrap();
+        assert_eq!((off, path), (0x900, std::path::PathBuf::from("/prov.so")));
+        // Failure paths redact the runtime address (both hex and
+        // decimal forms) while keeping observer context.
+        for cookie in [0u64, 1] {
+            let addr = 0x7f00_deed_beefu64;
+            let err = super::resolve_query_target(&live, Path::new("/prov.so"), "", addr, cookie)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                !err.contains(&format!("{addr:#x}")),
+                "hex addr leaked: {err}"
+            );
+            assert!(!err.contains(&addr.to_string()), "addr leaked: {err}");
+        }
+    }
+
+    #[test]
+    fn trip_hit_decode_validates_taxonomy() {
+        use std::collections::HashSet;
+        let set = super::legacy::ProbeSet {
+            load_cookies: HashSet::from([9]),
+            by_id_cookies: HashSet::from([10]),
+            ..Default::default()
         };
-        d.write(b"ab");
-        d.write(b"cdef");
-        d.write(b"GH");
-        drop(d);
-        assert_eq!(std::fs::read(&path).unwrap(), b"abcd");
-        std::fs::remove_file(&path).ok();
+        // Right taxonomy, valid class: accepted (any status).
+        assert!(
+            super::decode_trip_hit(9, super::wire::LOAD_LEGACY, super::wire::TRIP_OK, &set)
+                .is_some()
+        );
+        assert!(
+            super::decode_trip_hit(
+                9,
+                super::wire::TRIP_OTHER,
+                super::wire::TRIP_UNREADABLE,
+                &set
+            )
+            .is_some()
+        );
+        assert!(
+            super::decode_trip_hit(10, super::wire::ENGINE_DYNAMIC, super::wire::TRIP_OK, &set)
+                .is_some()
+        );
+        // The cookie selects the decoder (numeric spaces overlap by
+        // design): class 3 is LOAD_FIPS under a load cookie but
+        // invalid under an engine cookie. Unknown cookies and
+        // out-of-range classes are dropped.
+        assert!(
+            super::decode_trip_hit(9, super::wire::LOAD_FIPS, super::wire::TRIP_OK, &set).is_some()
+        );
+        assert!(
+            super::decode_trip_hit(10, super::wire::LOAD_FIPS, super::wire::TRIP_OK, &set)
+                .is_none()
+        );
+        assert!(
+            super::decode_trip_hit(11, super::wire::TRIP_OTHER, super::wire::TRIP_OK, &set)
+                .is_none()
+        );
+        assert!(super::decode_trip_hit(9, 99, super::wire::TRIP_OK, &set).is_none());
+        assert!(super::decode_trip_hit(10, 99, super::wire::TRIP_OK, &set).is_none());
     }
 }

@@ -327,7 +327,6 @@ mod tests {
     fn row(op: u32, funcid: u32, dev: &str, ino: u64, off: u64) -> serde_json::Value {
         serde_json::json!({
             "provider": "spike", "op": op, "alg_class": "digest", "funcid": funcid,
-            "addr": 0x7f00_0000_0000u64 + off,
             "backing": {"dev": dev, "ino": ino, "offset": off},
         })
     }
