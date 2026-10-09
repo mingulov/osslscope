@@ -314,16 +314,18 @@ fn exit_for(c: &capture::Capture, v: &Verdict) -> u8 {
 // and a shared strict parser costs more than it saves. The rule
 // flags are check-only (repeatable; validated below).
 fn parse(argv: &[String]) -> Result<Args, String> {
-    let mut duration: Option<f64> = None;
+    // T04 (coordinator review): time flags are captured raw and validated
+    // once via args::parse_seconds below (R08 bounds, no panics).
+    let mut duration_raw: Option<String> = None;
     let mut format = "human".to_string();
     let mut out: Option<String> = None;
     let mut provider: Option<String> = None;
     let mut builtin = false;
     let mut object: Option<String> = None;
     let mut count_object: Option<String> = None;
-    let mut settle = 2.0f64;
-    let mut timeout = 60.0f64;
-    let mut grace = 5.0f64;
+    let mut settle_raw: Option<String> = None;
+    let mut timeout_raw: Option<String> = None;
+    let mut grace_raw: Option<String> = None;
     let mut image_digest = String::new();
     let mut pid: Option<u32> = None;
     let mut run_at: Option<usize> = None;
@@ -341,9 +343,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
                 .ok_or_else(|| format!("{k} needs a value"))
         };
         match a {
-            "--duration" => {
-                duration = Some(val(a)?.parse().map_err(|_| "--duration needs seconds")?)
-            }
+            "--duration" => duration_raw = Some(val(a)?),
             "--format" => format = val(a)?,
             "--out" => out = Some(val(a)?),
             "--provider" => provider = Some(val(a)?),
@@ -354,9 +354,9 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             }
             "--object" => object = Some(val(a)?),
             "--count-object" => count_object = Some(val(a)?),
-            "--settle" => settle = val(a)?.parse().map_err(|_| "--settle needs seconds")?,
-            "--timeout" => timeout = val(a)?.parse().map_err(|_| "--timeout needs seconds")?,
-            "--grace" => grace = val(a)?.parse().map_err(|_| "--grace needs seconds")?,
+            "--settle" => settle_raw = Some(val(a)?),
+            "--timeout" => timeout_raw = Some(val(a)?),
+            "--grace" => grace_raw = Some(val(a)?),
             "--image-digest" => image_digest = val(a)?,
             "--pid" => pid = Some(val(a)?.parse().map_err(|_| "--pid needs an integer")?),
             "--require-provider" => rules.require_provider.push(val(a)?),
@@ -394,19 +394,25 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         }
         _ => return Err("need exactly one of --pid P | run -- <cmd>".to_string()),
     };
-    let duration = duration.unwrap_or(crate::report::DEFAULT_DURATION_SECS);
-    if !duration.is_finite() || duration <= 0.0 {
-        return Err("--duration must be > 0".to_string());
-    }
-    for (name, v) in [
-        ("--settle", settle),
-        ("--timeout", timeout),
-        ("--grace", grace),
-    ] {
-        if !v.is_finite() || v < 0.0 {
-            return Err(format!("{name} must be >= 0 seconds"));
-        }
-    }
+    // T04 (coordinator review): single conversion point shared with
+    // report (R08 bounds; rejects 1e30/NaN/inf/negatives/zero-rounding
+    // before any target/BPF side effect). Defaults are exact.
+    let duration = match &duration_raw {
+        Some(s) => crate::args::parse_seconds("--duration", s)?,
+        None => Duration::from_secs_f64(crate::report::DEFAULT_DURATION_SECS),
+    };
+    let settle = match &settle_raw {
+        Some(s) => crate::args::parse_seconds("--settle", s)?,
+        None => Duration::from_secs(2),
+    };
+    let timeout = match &timeout_raw {
+        Some(s) => crate::args::parse_seconds("--timeout", s)?,
+        None => Duration::from_secs(60),
+    };
+    let grace = match &grace_raw {
+        Some(s) => crate::args::parse_seconds("--grace", s)?,
+        None => Duration::from_secs(5),
+    };
     // Algorithm names are exact frozen-registry matches: unknown
     // names are config errors, never silent non-matches.
     for a in rules.deny_algorithm.iter().chain(&rules.require_executed) {
@@ -426,10 +432,10 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             count_object: count_object.ok_or("--count-object C is required")?.into(),
             provider: provider.ok_or("--provider P is required")?.into(),
             builtin,
-            duration: Duration::from_secs_f64(duration),
-            settle: Duration::from_secs_f64(settle),
-            harvest_timeout: Duration::from_secs_f64(timeout),
-            grace: Duration::from_secs_f64(grace),
+            duration,
+            settle,
+            harvest_timeout: timeout,
+            grace,
             image_digest,
         },
         target,

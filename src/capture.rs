@@ -18,10 +18,10 @@
 //! `TARGET=0` at expiry is the §8 mechanism, unchanged.
 use crate::discovery::{elf, harvest, maps};
 use crate::loader::Loaded;
-use crate::{kinds, pin, plan};
+// T04 (coordinator review): owned-target custody + safe args (R05/R07/R08).
+use crate::{args, kinds, pin, plan, target};
 use osslscope_ebpf_common::{CountValue, split_key};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::ffi::CString;
 use std::os::fd::{AsRawFd as _, OwnedFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -179,47 +179,10 @@ fn interrupted() -> bool {
 
 // ---------------------------------------------------------------- spawn
 
-/// Fork + stop pre-exec. CStrings are built BEFORE the fork so the
-/// child allocates nothing (async-signal-safe; the parent may be
-/// multithreaded). Returns the stopped child's pid.
-fn spawn_stopped(argv: &[String]) -> anyhow::Result<u32> {
-    use anyhow::Context as _;
-    if argv.is_empty() {
-        anyhow::bail!("run -- needs a command");
-    }
-    let cs: Vec<CString> = argv
-        .iter()
-        .map(|a| CString::new(a.as_str()))
-        .collect::<Result<_, _>>()
-        .context("NUL in argv")?;
-    let mut ptrs: Vec<*const libc::c_char> = cs.iter().map(|c| c.as_ptr()).collect();
-    ptrs.push(std::ptr::null());
-    let pid = unsafe { libc::fork() };
-    if pid < 0 {
-        anyhow::bail!("fork: {}", std::io::Error::last_os_error());
-    }
-    if pid == 0 {
-        unsafe {
-            libc::raise(libc::SIGSTOP);
-            libc::execvp(ptrs[0], ptrs.as_ptr());
-            libc::_exit(127);
-        }
-    }
-    loop {
-        let mut status = 0;
-        let r = unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) };
-        if r < 0 {
-            if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
-                continue;
-            }
-            anyhow::bail!("waitpid: {}", std::io::Error::last_os_error());
-        }
-        if libc::WIFSTOPPED(status) {
-            return Ok(pid as u32);
-        }
-        anyhow::bail!("child exited before stop (status {status})");
-    }
-}
+// T04 (coordinator review): fork+stop pre-exec moved to
+// target::OwnedTarget::spawn_stopped (R05 explicit custody); the
+// non-reaping probe, reaping poll, and corpse-close below stay until
+// T08 migrates the window loop onto the custody API.
 
 /// Non-reaping child-death probe (`waitid` WNOWAIT keeps the zombie
 /// for harvest's pin + the later reaping waitpid).
@@ -277,6 +240,23 @@ fn reap_corpse(spawn: bool, maps_empty: bool, pid: u32) -> Option<i32> {
         }
     }
     code
+}
+
+// T04 (coordinator review): pre-window early-return custody (R05/G05).
+// A never-released child is released here (the application runs — the
+// observer never leaves a stopped child); an already-exited fast
+// command keeps its preserved status instead of losing it. A still
+// running child stays owned-and-released; dropping it later leaves it
+// running per the leave-running policy (T08 reports the disposition).
+fn settle_early_exit(owned: &std::cell::RefCell<Option<target::OwnedTarget>>, engine: &mut Engine) {
+    if let Some(t) = owned.borrow_mut().as_mut() {
+        if t.state() == target::CustodyState::Stopped {
+            let _ = t.release();
+        }
+        if let Ok(Some(code)) = t.poll_exit() {
+            engine.child_exit = Some(code);
+        }
+    }
 }
 
 // ---------------------------------------------------------------- ppid scan
@@ -655,28 +635,10 @@ fn container_id_of(pid: u32) -> String {
         .unwrap_or_default()
 }
 
-/// Render `/proc/<pid>/cmdline` bytes: NUL-joined argv → spaces,
-/// lossy, capped at 8 KiB with a truncation marker (argv can be
-/// huge and can carry secrets; the cap bounds artifact size).
-fn render_cmdline(raw: &[u8]) -> String {
-    const CAP: usize = 8192;
-    let s = String::from_utf8_lossy(raw);
-    let s = s.trim_matches('\0').replace('\0', " ");
-    if s.len() <= CAP {
-        return s;
-    }
-    let mut end = CAP;
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}[truncated]", &s[..end])
-}
-
-fn cmdline_of(pid: u32) -> String {
-    std::fs::read(format!("/proc/{pid}/cmdline"))
-        .map(|b| render_cmdline(&b))
-        .unwrap_or_default()
-}
+// T04 (coordinator review): raw argv rendering is gone (R07 — no raw
+// argv in artifacts); both target kinds store args::REDACTED_CMDLINE
+// via redact_spawn_argv / redact_proc_cmdline at acquisition. The
+// explicit argv_redacted evidence flag is T11 output work.
 
 /// Blind legacy entrypoints: (engine misses, PARTIAL reasons).
 /// The merged block holds per-family MAX across harvest phases,
@@ -1299,16 +1261,28 @@ pub fn run(cfg: &Config, target: Target) -> anyhow::Result<Capture> {
     program(&loaded, "GEN", &0u32.to_le_bytes())?;
     program(&loaded, "TARGET", &0u64.to_le_bytes())?;
 
+    // T04 (coordinator review): OwnedTarget guards spawn→release
+    // custody (R05); argv is redacted at acquisition (R07). The window
+    // poll loop still uses the existing waitpid helpers — T08 migrates
+    // it fully. Reaping discipline until then: OwnedTarget reaps only on
+    // the pre-window early returns below; the Engine owns in-window reaps.
+    // RefCell: the harvest attach hook below is `&dyn Fn`, so the
+    // guard needs interior mutability (still single-threaded).
+    let owned: std::cell::RefCell<Option<target::OwnedTarget>> = std::cell::RefCell::new(None);
     // Acquire the target (spawn stopped; --pid pinned).
     let (pid, pin, spawn, cmdline) = match target {
         Target::Spawn { argv } => {
-            let cmdline = argv.join(" ");
-            let pid = spawn_stopped(&argv).map_err(|e| anyhow::anyhow!("spawn: {e:#}"))?;
+            let cmdline = args::redact_spawn_argv(&argv);
+            let t = target::OwnedTarget::spawn_stopped(&argv)
+                .map_err(|e| anyhow::anyhow!("spawn: {e:#}"))?;
+            let pid = t.pid();
+            owned.replace(Some(t));
             (pid, None, true, cmdline)
         }
         Target::Pid(p) => {
             let pin = pin::pin(p).map_err(|e| anyhow::anyhow!("pin: {e:#}"))?;
-            (p, Some(pin), false, cmdline_of(p))
+            let raw = std::fs::read(format!("/proc/{p}/cmdline")).unwrap_or_default();
+            (p, Some(pin), false, args::redact_proc_cmdline(&raw))
         }
     };
     // Target-identity snapshot at acquisition (the target may be
@@ -1325,12 +1299,12 @@ pub fn run(cfg: &Config, target: Target) -> anyhow::Result<Capture> {
     // Non-reaping death probe during harvest (reaping would race
     // harvest's own pin); the poll loop reaps via waitpid.
     let should_stop = || interrupted() || (spawn && child_gone(pid));
+    // T04 (coordinator review): release via the owned guard (strictly
+    // once; a failed SIGCONT records custody instead of assuming it).
+    // spawn holds exactly when `owned` is Some.
     let on_attached = || -> anyhow::Result<()> {
-        if spawn {
-            let r = unsafe { libc::kill(pid as libc::pid_t, libc::SIGCONT) };
-            if r != 0 {
-                anyhow::bail!("SIGCONT: {}", std::io::Error::last_os_error());
-            }
+        if let Some(t) = owned.borrow_mut().as_mut() {
+            t.release()?;
         }
         Ok(())
     };
@@ -1346,6 +1320,11 @@ pub fn run(cfg: &Config, target: Target) -> anyhow::Result<Capture> {
     let (doc, _totals) = match harvest_result {
         Ok(ok) => ok,
         Err(e) if e.downcast_ref::<harvest::Recycled>().is_some() => {
+            // T04 (coordinator review): Recycled is a --pid-only outcome,
+            // but resolve anyway so no path relies on Drop alone.
+            if let Some(t) = owned.borrow_mut().as_mut() {
+                let _ = t.resolve_setup_failure();
+            }
             let empty = Engine {
                 cfg,
                 pid,
@@ -1384,7 +1363,15 @@ pub fn run(cfg: &Config, target: Target) -> anyhow::Result<Capture> {
             };
             return Ok(empty.discarded(Duration::ZERO));
         }
-        Err(e) => return Err(anyhow::anyhow!("harvest: {e:#}")),
+        // T04 (coordinator review): failed setup resolves custody — a
+        // never-released child is terminated/reaped, a released one is
+        // detached and left running (R05).
+        Err(e) => {
+            if let Some(t) = owned.borrow_mut().as_mut() {
+                let _ = t.resolve_setup_failure();
+            }
+            return Err(anyhow::anyhow!("harvest: {e:#}"));
+        }
     };
     // NOTE: initial-harvest queries are pre-window by construction
     // (the window starts at count-ready) — only RE-harvest queries
@@ -1468,6 +1455,9 @@ pub fn run(cfg: &Config, target: Target) -> anyhow::Result<Capture> {
         } else {
             engine.reason("no-query");
         }
+        // T04 (coordinator review): settle_early_exit preserves a fast
+        // exit status and never leaves a stopped child (R05/G05).
+        settle_early_exit(&owned, &mut engine);
         let c = engine.finish(Outcome::Partial, Duration::ZERO);
         return Ok(c);
     }
@@ -1487,6 +1477,9 @@ pub fn run(cfg: &Config, target: Target) -> anyhow::Result<Capture> {
     }
 
     if !engine.plan_and_attach(&doc)? {
+        // T04 (coordinator review): settle_early_exit preserves a fast
+        // exit status and never leaves a stopped child (R05/G05).
+        settle_early_exit(&owned, &mut engine);
         let c = engine.finish(Outcome::Fatal(FatalKind::AttachZero), Duration::ZERO);
         return Ok(c);
     }
@@ -1494,7 +1487,9 @@ pub fn run(cfg: &Config, target: Target) -> anyhow::Result<Capture> {
     program(&engine.loaded, "TARGET", &(pid as u64).to_le_bytes())?;
     eprintln!("CAPTURE window open pid={pid} links={}", engine.links.len());
     engine.window_start = Instant::now();
-    engine.window_end = engine.window_start + cfg.duration;
+    // T04 (coordinator review): checked deadline construction (R08).
+    engine.window_end = args::deadline_at(engine.window_start, cfg.duration)
+        .ok_or_else(|| anyhow::anyhow!("window deadline overflow"))?;
     engine.window_start_wall = SystemTime::now();
     let live0 = maps::read_maps(pid).unwrap_or_default();
     engine.snapshot = snapshot(pid, &engine.planned_paths(), &live0);
@@ -1621,7 +1616,11 @@ pub fn run(cfg: &Config, target: Target) -> anyhow::Result<Capture> {
             std::thread::sleep(Duration::from_millis(ms));
         }
     }
-    let deadline = interrupted_flag.then(|| Instant::now() + cfg.grace);
+    // T04 (coordinator review): checked grace deadline (R08; overflow
+    // would mean an unbounded drain — physically unreachable).
+    let deadline = interrupted_flag
+        .then(|| args::deadline_at(Instant::now(), cfg.grace))
+        .flatten();
     let d = drain_counts(
         &engine.loaded,
         engine.generation,
@@ -1865,6 +1864,53 @@ mod tests {
         assert_eq!(reap_corpse(true, true, pid as u32), Some(7));
     }
 
+    // T04 (coordinator review): settle_early_exit custody — the
+    // integration lifecycle tests cannot reach capture::run without
+    // BPF, so the helper is pinned directly (R05/G05).
+    #[test]
+    fn settle_early_exit_preserves_reaped_status() {
+        let cfg = absorb_cfg();
+        let mut engine = absorb_engine(&cfg);
+        let mut t = crate::target::OwnedTarget::spawn_stopped(&["/bin/true".to_string()]).unwrap();
+        t.release().unwrap();
+        let end = Instant::now() + Duration::from_secs(5);
+        while t.poll_exit().unwrap().is_none() {
+            assert!(Instant::now() < end, "child never exited");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let owned = std::cell::RefCell::new(Some(t));
+        settle_early_exit(&owned, &mut engine);
+        assert_eq!(engine.child_exit, Some(0));
+    }
+
+    #[test]
+    fn settle_early_exit_releases_stopped_child() {
+        let cfg = absorb_cfg();
+        let mut engine = absorb_engine(&cfg);
+        let t = crate::target::OwnedTarget::spawn_stopped(&[
+            "/bin/sleep".to_string(),
+            "30".to_string(),
+        ])
+        .unwrap();
+        let pid = t.pid();
+        let owned = std::cell::RefCell::new(Some(t));
+        settle_early_exit(&owned, &mut engine);
+        // Released (the application runs), never left stopped; a sleep
+        // cannot have exited on its own.
+        assert_eq!(
+            owned.borrow().as_ref().unwrap().state(),
+            crate::target::CustodyState::Released
+        );
+        assert_eq!(engine.child_exit, None);
+        // Test-only teardown (production leaves it running).
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGKILL);
+        }
+        let mut status = 0;
+        let r = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
+        assert!(r > 0);
+    }
+
     #[test]
     fn merge_legacy_sums_unions_and_maxes() {
         let mut acc = serde_json::json!({
@@ -2048,24 +2094,10 @@ mod tests {
         assert_eq!(parse_container_id("0::/docker/abc123\n"), "");
     }
 
-    #[test]
-    fn cmdline_renders_and_truncates() {
-        assert_eq!(
-            render_cmdline(b"nginx\0-g\0daemon off;\0"),
-            "nginx -g daemon off;"
-        );
-        assert_eq!(render_cmdline(b""), "");
-        // Kernel threads read empty: no crash, empty string.
-        assert_eq!(render_cmdline(b"\0"), "");
-        let big = vec![b'x'; 9000];
-        let out = render_cmdline(&big);
-        assert!(
-            out.ends_with("[truncated]"),
-            "tail: {}",
-            &out[out.len() - 20..]
-        );
-        assert!(out.len() <= 8192 + "[truncated]".len() + 1);
-    }
+    // T04 (coordinator review): cmdline_renders_and_truncates is
+    // replaced by the R07 sentinel tests in tests/cli_limits.rs
+    // (spawn_argv_is_redacted, pid_cmdline_bytes_are_redacted) — raw
+    // argv must not reach artifacts at all, truncated or not.
 
     #[test]
     fn kernel_release_nonempty() {
