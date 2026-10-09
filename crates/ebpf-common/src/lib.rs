@@ -116,6 +116,67 @@ pub const TRIP_OK: u8 = 0;
 pub const TRIP_UNREADABLE: u8 = 1;
 pub const TRIP_OVERLONG: u8 = 2;
 
+/// `TRUNC[op]` walk-shape bits (T03: frozen here so BPF and
+/// userspace share one vocabulary; the doc carries raw bits for
+/// stability, `coverage::primary_reason` ranks them). Bits 1..32
+/// are the historical walker signals; `TRUNC_NO_STORE` is new.
+pub const TRUNC_ALGS: u64 = 1;
+pub const TRUNC_DISPATCH: u64 = 2;
+pub const TRUNC_WALK_READ: u64 = 4;
+pub const TRUNC_WALK_EMPTY: u64 = 8;
+pub const TRUNC_WALK_NOIMP: u64 = 16;
+pub const TRUNC_WALK_NAME: u64 = 32;
+/// `no_store` table: the provider forbids caching the array, so the
+/// walker samples slot 0 only and never advances a persistent
+/// counter across queries (T03 honesty: never COMPLETE).
+pub const TRUNC_NO_STORE: u64 = 64;
+
+/// `LOSS[src]` failure counters (T03: every ring-reserve and
+/// map-update failure has a source-tagged counter; userspace forces
+/// PARTIAL on any nonzero entry). Keys are these `u32` ids.
+pub const LOSS_RING_ALG: u32 = 1;
+pub const LOSS_RING_ROW: u32 = 2;
+pub const LOSS_RING_TRIP: u32 = 3;
+pub const LOSS_RING_INIT: u32 = 4;
+pub const LOSS_MAP_QUERY_NEXT: u32 = 5;
+pub const LOSS_MAP_TRUNC: u32 = 6;
+pub const LOSS_MAP_CALLS: u32 = 7;
+pub const LOSS_MAP_TRIP: u32 = 8;
+pub const LOSS_MAP_LGCALLS: u32 = 9;
+pub const LOSS_MAP_TERMD: u32 = 10;
+pub const LOSS_PENDING_INIT_FULL: u32 = 11;
+pub const LOSS_PENDING_QUERY_FULL: u32 = 12;
+pub const LOSS_PENDING_INIT_MISS: u32 = 13;
+pub const LOSS_PENDING_QUERY_MISS: u32 = 14;
+pub const LOSS_INIT_SCAN: u32 = 15;
+
+/// `TERMD[arr]` termination proof (T03): keyed by query-returned
+/// array base, value packs the op (low 32) and the proven live-slot
+/// count (high 32). Recorded exactly when the walker reads the
+/// terminator (`names == 0`) — directly, or at slot 512 via the
+/// overrun guard. `no_store` arrays are never recorded (uncacheable).
+/// A table without proof is a prefix, never COMPLETE.
+pub const fn make_termd(op: u32, len: u32) -> u64 {
+    ((len as u64) << 32) | (op as u64)
+}
+
+/// Split a TERMD value back into (op, len).
+pub const fn split_termd(v: u64) -> (u32, u32) {
+    ((v & 0xFFFF_FFFF) as u32, (v >> 32) as u32)
+}
+
+/// `PENDING_QUERY` entry→return pair (BPF-internal shape,
+/// loader-pinned): the op plus the caller's `no_store` out-pointer,
+/// dereferenced once at return. 16 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PendQuery {
+    pub op: u64,
+    pub ns_ptr: u64,
+}
+
+const _: () = assert!(size_of::<PendQuery>() == 16);
+
 /// Trip classes (u16 wire). Engine and load taxonomies share the
 /// numeric space; the probe program (cookie context) selects the
 /// decoder, so the values never mix.

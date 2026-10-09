@@ -29,7 +29,7 @@ Maps: `COUNTS`, `GEN`, `TARGET`, `DROPFAIL` (see §4).
 - `walk_dispatch` and `classify_alg` are BPF subprograms used by
   `query_return`.
 
-There are exactly ten target-memory reads. Only two move bytes, and
+There are exactly eleven target-memory reads. Only two move bytes, and
 both land in kernel stack scratch that is classified in-kernel and
 never emitted; the rest move fixed scalars.
 
@@ -41,10 +41,11 @@ never emitted; the rest move fixed scalars.
 | `trip_str0`, `trip_str1` | engine/provider-load argument string | 32-byte NUL-bounded string | kernel trip verdict | explicit unreadable verdict, counter only on missing arg |
 | `walk_dispatch` | dispatch function id | `u32` | per-alg dispatch walk | stop walk |
 | `walk_dispatch` | dispatch function pointer | `u64` | per-alg dispatch walk | stop walk |
-| `query_return` | algorithm `names` pointer | `u64` | alg-slot join key | abort slot, overflow bit only on slot 0 |
-| `query_return` | algorithm `impl` pointer | `u64` | alg-slot join key | abort slot, overflow bit only on slot 0 |
+| `query_return` | caller `no_store` verdict | `u32` | provider lifetime (cacheable vs sample-once) | fail closed to `no_store` sample |
+| `query_return` | algorithm `names` pointer | `u64` | alg-slot join key | abort slot, overflow bit (all slots) |
+| `query_return` | algorithm `impl` pointer | `u64` | alg-slot join key | abort slot, overflow bit (all slots) |
 | `query_return` | array tail slot | `u64` | overrun detection | overflow bit |
-| `query_return` | algorithm `names` string | 128-byte NUL-bounded string | kernel registry verdict | explicit unreadable verdict, slot freeze, overflow bit only on slot 0 |
+| `query_return` | algorithm `names` string | 128-byte NUL-bounded string | kernel registry verdict | explicit unreadable verdict, slot freeze, overflow bit (all slots) |
 
 Kernel classification: the 128-byte alias window is split on `:`
 (max 8 segments) and each segment is hashed (FNV-1a-64 prefilter)
@@ -133,6 +134,8 @@ EVENTS
 PENDING_INIT
 PENDING_QUERY
 QUERY_NEXT
+TERMD
+LOSS
 TRUNC
 CALLS
 TRIP
@@ -152,6 +155,8 @@ tables, which hold observer-owned registry bytes (populated from
 the frozen registry/taxonomy at load, before any attach —
 `ALG_CLASS`: hash → class/weak/name; `TRIP_CLASS`: hash →
 engine/load class/name). No map stores target string bytes at rest.
+`PENDING_QUERY` values are (op, `no_store`-pointer) pairs;
+`TERMD`/`LOSS` are termination proofs and failure counters.
 
 ## 5. Emitted artifacts
 
@@ -160,7 +165,11 @@ engine/load class/name). No map stores target string bytes at rest.
 - provider/op/`alg_class`/`weak`/`status`/funcid/`addr_hash`/
   `addr_backed`/backing/gen/trigger/status/counters/reason
   (row `status` is the kernel read verdict: `ok`, `unknown`,
-  `overlong`, or `truncated`).
+  `overlong`, `truncated`, or `unreadable`).
+- PARTIAL-only gap keys: `truncated_ops` (op → walk-shape bits),
+  `unterminated_ops` (op ids without termination proof), `losses`
+  (source name → failure count), `lossy_slots` (slots with lost
+  identity). No array bases or runtime addresses.
 - Optional `legacy` block: entry states, call counts, engine/load
   classes, weak rollup, tripwire capability, flags/findings.
 - No raw provider/target strings. No runtime addresses.

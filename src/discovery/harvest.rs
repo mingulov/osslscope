@@ -12,7 +12,7 @@
 //! P2 migrates load+attach to the raw multi loader (same BPF
 //! programs, same cookie id space — P1 goldens match byte-for-byte).
 //! Aya stays only for typed map/ringbuf reads over dup'd fds.
-use crate::discovery::{builtin, elf, legacy, maps, schema};
+use crate::discovery::{builtin, coverage, elf, legacy, maps, schema};
 use crate::loader::Loaded;
 use anyhow::{Context as _, anyhow, bail};
 use aya::maps::{Map, MapData, RingBuf};
@@ -500,7 +500,14 @@ fn partial_doc(
     builtin: bool,
     legacy_section: Option<serde_json::Value>,
     pid_recycled: u64,
+    tracker: Option<&coverage::CoverageTracker>,
 ) -> anyhow::Result<serde_json::Value> {
+    // Post-drain callers pass the joined tracker so walk-shape bits
+    // and losses travel even on bootstrap-failure PARTIALs;
+    // pre-drain/discard callers pass None (nothing was observed, or
+    // the evidence is tainted and discarded).
+    let empty = coverage::CoverageTracker::new();
+    let t = tracker.unwrap_or(&empty);
     let mut doc = schema::emit(
         provider_name,
         provider,
@@ -511,6 +518,10 @@ fn partial_doc(
         false,
         &schema::Stats {
             builtin,
+            truncated: t.truncated(),
+            unterminated_ops: t.unterminated_ops(),
+            losses: t.losses(),
+            lossy_slots: t.lossy_slots(),
             reason: Some(reason.to_string()),
             pid_recycled,
             ..schema::Stats::trivial()
@@ -565,6 +576,7 @@ fn check_pin(
             builtin,
             blind,
             1,
+            None,
         )?;
         return Err(anyhow::Error::new(Recycled { doc }));
     }
@@ -596,27 +608,89 @@ where
     K: aya::Pod + Eq + std::hash::Hash,
     V: aya::Pod,
 {
+    read_kv_checked(maps, name).0
+}
+
+/// Checked variant: returns the rows plus whether the snapshot
+/// failed (setup or iteration). T03-critical maps (TRUNC/TERMD/LOSS)
+/// use this so a failed snapshot becomes explicit snapshot loss,
+/// never a silent "no truncation / no loss" read.
+fn read_kv_checked<K, V>(maps: &HashMap<String, OwnedFd>, name: &str) -> (Vec<(K, V)>, bool)
+where
+    K: aya::Pod + Eq + std::hash::Hash,
+    V: aya::Pod,
+{
     let fd = match maps.get(name).and_then(|f| f.try_clone().ok()) {
         Some(fd) => fd,
-        None => return Vec::new(),
+        None => return (Vec::new(), true),
     };
     let data = match MapData::from_fd(fd) {
         Ok(d) => d,
-        Err(_) => return Vec::new(),
+        Err(_) => return (Vec::new(), true),
     };
     let map = match Map::from_map_data(data) {
         Ok(m) => m,
-        Err(_) => return Vec::new(),
+        Err(_) => return (Vec::new(), true),
     };
     let Ok(map) = aya::maps::HashMap::<_, K, V>::try_from(map) else {
-        return Vec::new();
+        return (Vec::new(), true);
     };
-    map.iter().filter_map(|r| r.ok()).collect()
+    let mut out = Vec::new();
+    let mut failed = false;
+    for r in map.iter() {
+        match r {
+            Ok(kv) => out.push(kv),
+            Err(_) => failed = true,
+        }
+    }
+    (out, failed)
 }
 
-/// Drain the TRUNC overflow map.
-fn read_trunc(maps: &HashMap<String, OwnedFd>) -> Vec<(u32, u64)> {
-    read_kv(maps, "TRUNC")
+/// Drain the TRUNC overflow map: (op, bits) plus snapshot failure.
+fn read_trunc(maps: &HashMap<String, OwnedFd>) -> (Vec<(u32, u64)>, bool) {
+    read_kv_checked(maps, "TRUNC")
+}
+
+/// Drain the TERMD termination-proof map: (array base, packed op/len).
+fn read_termd(maps: &HashMap<String, OwnedFd>) -> (Vec<(u64, u64)>, bool) {
+    read_kv_checked(maps, "TERMD")
+}
+
+/// Drain the LOSS failure-counter map: (source id, count).
+fn read_losses(maps: &HashMap<String, OwnedFd>) -> (Vec<(u32, u64)>, bool) {
+    read_kv_checked(maps, "LOSS")
+}
+
+/// Join the T03-critical map snapshots into the tracker on EVERY
+/// post-drain path (trigger and no-trigger alike): termination
+/// proofs, walk-shape bits, and failure counters meet the decoded
+/// event stream. Failed snapshots become explicit snapshot loss,
+/// never silent empties. Callers read TRUNC rows back from the
+/// tracker (single filtered source for `truncated_ops`).
+fn ingest_completion(loaded: &Loaded, tracker: &mut coverage::CoverageTracker) {
+    let (truncated, trunc_fail) = read_trunc(&loaded.maps);
+    let (termd, termd_fail) = read_termd(&loaded.maps);
+    let (losses, loss_fail) = read_losses(&loaded.maps);
+    tracker.ingest_termd(&termd);
+    tracker.ingest_trunc(&truncated);
+    tracker.ingest_losses(&losses);
+    for failed in [trunc_fail, termd_fail, loss_fail] {
+        if failed {
+            tracker.note_map_snapshot();
+        }
+    }
+}
+
+/// Tracker gaps as a `Stats` fragment (no-trigger returns spread
+/// this under their explicit reasons).
+fn gap_stats(t: &coverage::CoverageTracker) -> schema::Stats {
+    schema::Stats {
+        truncated: t.truncated(),
+        unterminated_ops: t.unterminated_ops(),
+        losses: t.losses(),
+        lossy_slots: t.lossy_slots(),
+        ..schema::Stats::trivial()
+    }
 }
 
 /// Sum the CALLS per-op map (empty → the caller falls back to the
@@ -809,6 +883,7 @@ pub fn run_detailed(
             cfg.builtin,
             blind,
             0,
+            None,
         )
         .map(|d| (d, HarvestTotals::default()));
     }
@@ -866,6 +941,9 @@ pub fn run_detailed(
     // providers sharing (op, index)).
     let mut alg_records: HashMap<(u64, u64), (String, bool, String)> = HashMap::new();
     let class_count = crate::kinds::ALG_NAMES.len() as u16;
+    // T03 completion + loss accounting: the drain feeds decoded
+    // events below; map snapshots join after the drain.
+    let mut tracker = coverage::CoverageTracker::new();
 
     while start.elapsed() < cfg.timeout {
         // Short-lived targets (and signals): no more events can
@@ -893,6 +971,7 @@ pub fn run_detailed(
             let b: &[u8] = &item;
             if b.len() < 4 {
                 eprintln!("short event: {} bytes", b.len());
+                tracker.note_bad_event(coverage::HOST_SHORT_EVENT);
                 continue;
             }
             let kind = u32::from_le_bytes(b[0..4].try_into().unwrap());
@@ -906,17 +985,20 @@ pub fn run_detailed(
                 wire::KIND_TRIP => size_of::<wire::TripEvent>(),
                 k => {
                     eprintln!("unknown event kind {k}");
+                    tracker.note_bad_event(coverage::HOST_UNKNOWN_KIND);
                     continue;
                 }
             };
             if b.len() < want {
                 eprintln!("short event: {} bytes", b.len());
+                tracker.note_bad_event(coverage::HOST_SHORT_EVENT);
                 continue;
             }
             match kind {
                 wire::KIND_INIT_RET => {
                     let Ok(ev) = wire::parse_init_ret_event(b) else {
                         eprintln!("bad init-ret event");
+                        tracker.note_bad_event(coverage::HOST_BAD_EVENT);
                         continue;
                     };
                     // aux carries the attach cookie: 0 = target
@@ -983,14 +1065,17 @@ pub fn run_detailed(
                 wire::KIND_QUERY_RET => {
                     let Ok(ev) = wire::parse_row_event(b) else {
                         eprintln!("bad query-ret event");
+                        tracker.note_bad_event(coverage::HOST_BAD_EVENT);
                         continue;
                     };
                     if ev.kind != wire::KIND_QUERY_RET || ev.funcid != 0 {
+                        tracker.note_bad_event(coverage::HOST_BAD_EVENT);
                         continue;
                     }
                     trigger_observed = true;
                     queries_observed += 1;
                     ops_hit.insert(ev.op);
+                    tracker.note_query_ret(ev.op, ev.addr);
                     if debug_harvest() {
                         eprintln!("HARVESTDBG query_ret op={} slot={}", ev.op, ev.aux);
                     }
@@ -998,15 +1083,18 @@ pub fn run_detailed(
                 wire::KIND_ALG => {
                     let Ok(ev) = wire::parse_alg_event(b, class_count) else {
                         eprintln!("bad alg event");
+                        tracker.note_bad_event(coverage::HOST_BAD_EVENT);
                         continue;
                     };
                     trigger_observed = true;
                     let Some(label) = crate::kinds::alg_class_label(ev.class) else {
                         eprintln!("alg event with out-of-range class {}", ev.class);
+                        tracker.note_bad_event(coverage::HOST_BAD_EVENT);
                         continue;
                     };
                     let Some(status) = wire::alg_status_name(ev.status) else {
                         eprintln!("alg event with out-of-range status {}", ev.status);
+                        tracker.note_bad_event(coverage::HOST_BAD_EVENT);
                         continue;
                     };
                     if debug_harvest() {
@@ -1015,6 +1103,12 @@ pub fn run_detailed(
                             debug_alg_line(ev.op, ev.idx, label, ev.weak != 0, ev.status)
                         );
                     }
+                    // Unreadable/overlong names lose the slot's
+                    // identity (no retained prefix); unknown names
+                    // are explicit `other` evidence, not loss.
+                    let lossy =
+                        ev.status == wire::ALG_UNREADABLE || ev.status == wire::ALG_OVERLONG;
+                    tracker.note_alg(ev.op, ev.arr, ev.idx, lossy);
                     alg_records.insert(
                         (ev.arr, ev.idx),
                         (label.to_string(), ev.weak != 0, status.to_string()),
@@ -1023,15 +1117,18 @@ pub fn run_detailed(
                 wire::KIND_ROW => {
                     let Ok(ev) = wire::parse_row_event(b) else {
                         eprintln!("bad row event");
+                        tracker.note_bad_event(coverage::HOST_BAD_EVENT);
                         continue;
                     };
                     if ev.kind != wire::KIND_ROW {
+                        tracker.note_bad_event(coverage::HOST_BAD_EVENT);
                         continue;
                     }
                     trigger_observed = true;
                     let Some((label, weak, status)) = alg_records.get(&(ev.aux, ev.idx)).cloned()
                     else {
                         eprintln!("orphan row: op={} idx={}", ev.op, ev.idx);
+                        tracker.note_orphan_row();
                         continue;
                     };
                     let key = (
@@ -1080,6 +1177,7 @@ pub fn run_detailed(
                     // independently of the dispatch harvest.
                     let Ok(ev) = wire::parse_trip_event(b) else {
                         eprintln!("bad trip event");
+                        tracker.note_bad_event(coverage::HOST_BAD_EVENT);
                         continue;
                     };
                     // Trip events imply attached tripwires, which imply
@@ -1088,14 +1186,18 @@ pub fn run_detailed(
                     // validated, so the hit is dropped.
                     let Some(set) = &probe_set else {
                         eprintln!("trip hit before probe plan");
+                        tracker.note_bad_event(coverage::HOST_BAD_EVENT);
                         continue;
                     };
                     match decode_trip_hit(ev.cookie as u64, ev.class, ev.status, set) {
                         Some(hit) => trip_hits.push(hit),
-                        None => eprintln!(
-                            "trip hit outside taxonomy: cookie={} class={}",
-                            ev.cookie, ev.class
-                        ),
+                        None => {
+                            eprintln!(
+                                "trip hit outside taxonomy: cookie={} class={}",
+                                ev.cookie, ev.class
+                            );
+                            tracker.note_bad_event(coverage::HOST_BAD_EVENT);
+                        }
                     }
                 }
                 // Unreachable: unknown kinds are dropped at the sizing
@@ -1116,6 +1218,29 @@ pub fn run_detailed(
             std::thread::sleep(Duration::from_millis(5));
         }
     }
+    // Drain tail: stop/timeout can exit with items still queued.
+    // They are already unprocessed — consuming them here only labels
+    // the shortfall. Counted in two phases: first with producers
+    // attached (bounded — an unbounded tail could spin on a hot
+    // target), then links drop (quiesce: no later use of `links`
+    // exists past this point) and the remainder is counted exactly,
+    // so no post-stop arrival escapes accounting. (T06 sessions own
+    // quiesce-then-PROCESS teardown; this run labels the gap.)
+    let mut shortfall: u64 = 0;
+    while ring.next().is_some() {
+        shortfall += 1;
+        if shortfall >= 65536 {
+            break;
+        }
+    }
+    drop(links);
+    while ring.next().is_some() {
+        shortfall += 1;
+    }
+    if shortfall > 0 {
+        eprintln!("drain shortfall: {shortfall} unprocessed ring items at stop");
+    }
+    tracker.note_drain_shortfall(shortfall);
     // Post-drain backstop: discards ALL observations (rows and trips
     // alike) when the pid recycled under the drain.
     check_pin(
@@ -1193,6 +1318,10 @@ pub fn run_detailed(
         if live_now.is_empty() && !Path::new(&format!("/proc/{}", cfg.pid)).exists() {
             bail!("target {} exited before trigger", cfg.pid);
         }
+        // Join map snapshots here too: quiet paths must not hide
+        // host-side drops or kernel-side failures behind a clean
+        // no-trigger verdict.
+        ingest_completion(&loaded, &mut tracker);
         if let Some(reason) = preset_reason.clone() {
             return partial_doc(
                 &provider_name,
@@ -1203,6 +1332,7 @@ pub fn run_detailed(
                 cfg.builtin,
                 legacy_live,
                 0,
+                Some(&tracker),
             )
             .map(|d| (d, HarvestTotals { queries_observed }));
         }
@@ -1215,7 +1345,7 @@ pub fn run_detailed(
                 let stats = schema::Stats {
                     resolution: resolution.clone(),
                     reason: Some("no-query-trigger".to_string()),
-                    ..schema::Stats::trivial()
+                    ..gap_stats(&tracker)
                 };
                 let mut doc = schema::emit(
                     &provider_name,
@@ -1242,7 +1372,7 @@ pub fn run_detailed(
                 let stats = schema::Stats {
                     resolution: resolution.clone(),
                     reason: Some("init-without-queries".to_string()),
-                    ..schema::Stats::trivial()
+                    ..gap_stats(&tracker)
                 };
                 let mut doc = schema::emit(
                     &provider_name,
@@ -1259,6 +1389,8 @@ pub fn run_detailed(
                 }
                 return Ok((doc, HarvestTotals { queries_observed }));
             }
+            // COMPLETE-EMPTY only when the tracker is also clean:
+            // any gap flips the doc to PARTIAL below.
             let mut doc = schema::emit(
                 &provider_name,
                 &cfg.provider,
@@ -1267,7 +1399,7 @@ pub fn run_detailed(
                 &[],
                 &[],
                 false,
-                &schema::Stats::trivial(),
+                &gap_stats(&tracker),
             )?;
             if let Some(l) = legacy_live {
                 doc["legacy"] = l;
@@ -1280,7 +1412,8 @@ pub fn run_detailed(
         if cfg.legacy && !loads_observed {
             // Quiet target: COMPLETE-EMPTY. Stats.builtin=false
             // suppresses the inventory counters (nothing was
-            // inventoried — uninstrumented=14 would lie).
+            // inventoried — uninstrumented=14 would lie). Gaps
+            // still flip the doc to PARTIAL below.
             let mut doc = schema::emit(
                 &provider_name,
                 &cfg.provider,
@@ -1289,7 +1422,7 @@ pub fn run_detailed(
                 &[],
                 &[],
                 false,
-                &schema::Stats::trivial(),
+                &gap_stats(&tracker),
             )?;
             if let Some(l) = legacy_live {
                 doc["legacy"] = l;
@@ -1302,7 +1435,7 @@ pub fn run_detailed(
             queries_observed,
             resolution: resolution.clone(),
             reason: Some("no-query-trigger".to_string()),
-            ..schema::Stats::trivial()
+            ..gap_stats(&tracker)
         };
         stats.zero_row_ops = ops_hit.into_iter().collect();
         let mut doc = schema::emit(
@@ -1386,7 +1519,10 @@ pub fn run_detailed(
     ops_with_rows.extend(legacy_rows.iter().map(|r| r.op));
     let mut zero_row_ops: Vec<u32> = ops_hit.difference(&ops_with_rows).copied().collect();
     zero_row_ops.sort_unstable();
-    let truncated = read_trunc(&loaded.maps);
+    // T03 completion + loss join: termination proofs, walk-shape
+    // bits, and failure counters meet the decoded event stream.
+    ingest_completion(&loaded, &mut tracker);
+    let truncated = tracker.truncated();
     // Call volume from the CALLS map (QUERY_RET events are
     // first-hit-only; the event count is the pre-exit-2 fallback).
     // Best-effort under threads: shared-map increments are
@@ -1415,6 +1551,9 @@ pub fn run_detailed(
             queries_observed,
             zero_row_ops,
             truncated,
+            unterminated_ops: tracker.unterminated_ops(),
+            losses: tracker.losses(),
+            lossy_slots: tracker.lossy_slots(),
             resolution,
             reason,
             foreign_dropped,
