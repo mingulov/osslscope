@@ -6,6 +6,9 @@
 //! semantics (P3), hardening (P4+) — no stub modules until owned.
 
 pub mod aliases;
+// T04 (coordinator review): new modules for owned-target custody +
+// safe CLI arguments; placement is alphabetical, no other movement.
+pub mod args;
 pub mod capture;
 pub mod check;
 pub mod cli;
@@ -22,3 +25,4 @@ pub mod plan;
 pub mod policy;
 pub mod report;
 pub mod schema;
+pub mod target;

@@ -103,6 +103,38 @@ impl TargetPin {
             _ => Err(PinError { pid: self.pid }),
         }
     }
+
+    // T04 (coordinator review): pid accessor for the external-target wrapper below.
+    /// Pinned pid (identity only — never a signal target).
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+}
+
+// T04 (coordinator review): `--pid` targets are external processes the
+// observer must never signal or wait on (R05). This wrapper owns a pin
+// and deliberately exposes no kill/wait operation, so `--pid` custody
+// cannot be confused with `OwnedTarget` custody at the type level.
+/// An external (`--pid`) target: pinned for identity, never signaled.
+pub struct ExternalTarget {
+    pin: TargetPin,
+}
+
+impl ExternalTarget {
+    /// Adopt a live external pid (pin it; send nothing).
+    pub fn adopt(pid: u32) -> anyhow::Result<Self> {
+        Ok(ExternalTarget { pin: pin(pid)? })
+    }
+
+    /// Adopted pid (identity only — never a signal target).
+    pub fn pid(&self) -> u32 {
+        self.pin.pid()
+    }
+
+    /// Re-verify identity (pidfd + starttime; sends nothing).
+    pub fn verify(&self) -> Result<(), PinError> {
+        self.pin.verify()
+    }
 }
 
 #[cfg(test)]
@@ -115,6 +147,16 @@ mod tests {
         let p = pin(me).unwrap();
         assert!(p.verify().is_ok(), "self re-read: {:?}", starttime_of(me));
         assert!(starttime_of(me).unwrap() > 0);
+    }
+
+    // T04 (coordinator review): the wrapper pins without signaling.
+    #[test]
+    fn external_target_adopts_without_signaling() {
+        let me = std::process::id();
+        let ext = ExternalTarget::adopt(me).unwrap();
+        assert_eq!(ext.pid(), me);
+        assert!(ext.verify().is_ok());
+        assert!(starttime_of(me).is_ok(), "self still alive, untouched");
     }
 
     #[test]
