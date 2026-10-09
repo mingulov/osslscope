@@ -12,6 +12,31 @@ jobs:
       - run: cargo check --workspace --locked
       - run: cargo test --workspace --locked
       - run: cargo clippy --workspace --locked -- -D warnings
+  bpf:
+    # Detached BPF build (T05): crates/ebpf is its own workspace on a pinned
+    # nightly and never enters the host workspace build. Compilation only —
+    # loader/ABI behavior needs an authorized privileged lane, never CI.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-05-20
+          components: rust-src
+      - run: cargo install bpf-linker --locked --version 0.10.4
+      - run: cd crates/ebpf && cargo +nightly-2026-05-20 build --locked -Z build-std=core --target bpfel-unknown-none --release --bin osslscope-harvest --bin osslscope-count
+      - run: file crates/ebpf/target/bpfel-unknown-none/release/osslscope-harvest crates/ebpf/target/bpfel-unknown-none/release/osslscope-count
+  live-gates:
+    # Labeled skips, never passes: every live suite needs a privileged BPF
+    # lane driven by spike/dev/run.py. CI has no such capability, so each
+    # suite below is an explicit SKIP. A green CI run therefore means
+    # host+BPF compile plus host tests only — never a live observation pass.
+    runs-on: ubuntu-24.04
+    steps:
+      - run: |
+          for s in core privacy identity lifecycle ordinary installed rate; do
+            echo "SKIP(live-capability): suite $s requires a privileged BPF lane; not run in CI"
+          done
   beachhead:
     # P1 exit-6: stock ubuntu-24.04 + sudo file-caps bootstrap, then a
     # least-priv doctor run (exit 0). Ubuntu-class behaves like lanes
