@@ -1,21 +1,31 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
-//! Harvest document schema: one row per (op, alg, funcid, addr)
-//! plus relocation backing. `addr_hash` (frozen preimage: the attested
+//! Harvest document schema: one row per (op, class, funcid) plus
+//! relocation backing. `addr_hash` (frozen preimage: the attested
 //! backing triple, NOT the runtime address) is the golden-comparable
-//! identity; raw `addr` is redacted before golden comparison.
+//! identity. Raw runtime addresses are internal relocation input
+//! only and are never serialized (T02).
 use crate::discovery::{elf, maps};
 use std::path::Path;
 
-/// One harvested dispatch entry. `alg` is the provider's raw name
-/// bytes — classification input ONLY, never serialized: `emit` maps it
-/// to a registry class at emission (goldens forbid verbatim provider
-/// strings).
+/// One harvested dispatch entry. Rows arrive pre-classified: the
+/// kernel maps the provider's raw name bytes to a registry class id
+/// before ring emission, and the ring decoder resolves the id to its
+/// table label here. `alg_class` is therefore always a registry
+/// label or `"other"` — never target bytes. `weak` is the kernel's
+/// alias-list weak verdict and `status` its read verdict (`ok`,
+/// `unknown`, `overlong`, or `truncated`) for the same record, so
+/// classification uncertainty survives to the artifact instead of
+/// collapsing into an ordinary-looking row.
 #[derive(Clone, Debug)]
 pub struct Row {
     pub op: u32,
-    pub alg: String,
+    pub alg_class: String,
+    pub weak: bool,
+    pub status: String,
     pub funcid: u32,
-    pub addr: u64,
+    /// Implementation code address: INTERNAL relocation input,
+    /// consumed against live mappings below and never serialized.
+    pub impl_addr: u64,
     /// Query-returned array base (join key + provider attribution: the
     /// array's mapping identifies the owning provider even when the
     /// implementation address is shared libcrypto code).
@@ -58,9 +68,10 @@ impl Stats {
 }
 
 /// Relocate every row against current maps + disk ELF, then emit the
-/// harvest document. A row is `addr_backed` iff its address sits in an
-/// executable provider mapping whose file offset lands in an executable
-/// LOAD segment (same rule the P0 oracle proved at 26/26 stripped).
+/// harvest document. A row is `addr_backed` iff its implementation
+/// address sits in an executable provider mapping whose file offset
+/// lands in an executable LOAD segment (same rule the P0 oracle
+/// proved at 26/26 stripped).
 // Eight params is the honest seam (identity + relocation + run stats);
 // bundling would churn the exit-1 call shape for no behavioral gain.
 #[allow(clippy::too_many_arguments)]
@@ -77,20 +88,20 @@ pub fn emit(
     let elf = elf::parse_elf(elf_bytes)?;
     // Deterministic row order (exit-1 hardening): arrival order is
     // race-dependent (GO1 queries may predate the stage-2 attach, so
-    // rotation starts mid-array). Rows sort by (op, claimed name,
-    // funcid, attested backing triple) — never by runtime addr:
+    // rotation starts mid-array). Rows sort by (op, class, status,
+    // funcid, attested backing triple) — never by runtime address:
     // same-key multi-impl rows span files (provider + shared
     // libcrypto), whose ASLR slides differ, so an addr tiebreak
-    // would flip run to run. Upstream seen-set keys (op, name,
-    // funcid, addr) uniquely, and one file maps once per process
-    // (dlopen dedupes by (dev, ino)), so the key is total in
-    // practice. Backing resolves before the sort so the tiebreak
-    // sees stable triples.
+    // would flip run to run. Upstream seen-set keys (op, class,
+    // weak, status, funcid, impl addr) uniquely, and one file maps
+    // once per process (dlopen dedupes by (dev, ino)), so the key is
+    // total in practice. Backing resolves before the sort so the
+    // tiebreak sees stable triples.
     //
     // M4 fence (P1 exit 4, revised per exit-2 parity): ONLY impls in
     // no file-backed x mapping fence (forged pointers — the claim
-    // "provider offers this addr" is unverifiable there). Same
-    // (op, name, funcid) at several BACKED addrs is legitimate
+    // "provider offers this address" is unverifiable there). Same
+    // (op, class, funcid) at several BACKED addrs is legitimate
     // multi-impl (default provider: DH ×4 impls, 255 such keys) or
     // property-dependent dispatch — every such row is a true,
     // attributable claim, so all emit. A same-name second table is
@@ -105,21 +116,21 @@ pub fn emit(
     let mut resolved: Vec<(&Row, bool, String, u64, u64)> = Vec::with_capacity(rows.len());
     for r in rows {
         let (backed, dev, ino, off) =
-            match maps::provider_mapping(live_maps, provider, canon, r.addr) {
+            match maps::provider_mapping(live_maps, provider, canon, r.impl_addr) {
                 Some(m) => {
-                    let o = r.addr - m.start + m.offset;
+                    let o = r.impl_addr - m.start + m.offset;
                     let ok = m.x && elf::offset_in_x_segment(&elf, o);
                     (ok, m.dev.clone(), m.ino, o)
                 }
                 None => match live_maps
                     .iter()
-                    .find(|m| m.start <= r.addr && r.addr < m.end && m.ino != 0)
+                    .find(|m| m.start <= r.impl_addr && r.impl_addr < m.end && m.ino != 0)
                 {
                     // Shared-code row (e.g. legacy re-exporting libcrypto
                     // implementations): relocate against the containing
                     // file, not the provider.
                     Some(m) => {
-                        let o = r.addr - m.start + m.offset;
+                        let o = r.impl_addr - m.start + m.offset;
                         let bytes = elf_cache
                             .entry(m.path.clone())
                             .or_insert_with(|| std::fs::read(&m.path).unwrap_or_default());
@@ -135,8 +146,24 @@ pub fn emit(
         resolved.push((r, backed, dev, ino, off));
     }
     resolved.sort_by(|a, b| {
-        (a.0.op, &a.0.alg, a.0.funcid, &a.2, a.3, a.4)
-            .cmp(&(b.0.op, &b.0.alg, b.0.funcid, &b.2, b.3, b.4))
+        (
+            a.0.op,
+            &a.0.alg_class,
+            &a.0.status,
+            a.0.funcid,
+            &a.2,
+            a.3,
+            a.4,
+        )
+            .cmp(&(
+                b.0.op,
+                &b.0.alg_class,
+                &b.0.status,
+                b.0.funcid,
+                &b.2,
+                b.3,
+                b.4,
+            ))
     });
     let mut jrows = Vec::with_capacity(resolved.len());
     let mut fenced: u64 = 0;
@@ -152,14 +179,13 @@ pub fn emit(
             fenced += 1;
             continue;
         }
-        let (alg_class, weak) = crate::kinds::classify_alg(&r.alg);
         jrows.push(serde_json::json!({
             "provider": provider_name,
             "op": r.op,
-            "alg_class": alg_class,
-            "weak": weak,
+            "alg_class": r.alg_class,
+            "weak": r.weak,
+            "status": r.status,
             "funcid": r.funcid,
-            "addr": r.addr,
             "addr_hash": crate::kinds::addr_hash(&dev, ino, off),
             "addr_backed": backed,
             "backing": {"dev": dev, "ino": ino, "offset": off},
@@ -242,23 +268,29 @@ mod tests {
         vec![
             Row {
                 op: 1,
-                alg: "SHA2-256:SHA256".into(),
+                alg_class: "SHA2-256".into(),
+                weak: false,
+                status: "ok".into(),
                 funcid: 7,
-                addr: 0x1000,
+                impl_addr: 0x1000,
                 arr: 0,
             },
             Row {
                 op: 1,
-                alg: "canary-DOOM-7QZ".into(),
+                alg_class: "other".into(),
+                weak: false,
+                status: "unknown".into(),
                 funcid: 1,
-                addr: 0x2000,
+                impl_addr: 0x2000,
                 arr: 0,
             },
             Row {
                 op: 1,
-                alg: "MD5".into(),
+                alg_class: "MD5".into(),
+                weak: true,
+                status: "ok".into(),
                 funcid: 2,
-                addr: 0x3000,
+                impl_addr: 0x3000,
                 arr: 0,
             },
         ]
@@ -298,23 +330,29 @@ mod tests {
         let rows = vec![
             Row {
                 op: 1,
-                alg: "SHA2-256:SHA256".into(),
+                alg_class: "SHA2-256".into(),
+                weak: false,
+                status: "ok".into(),
                 funcid: 7,
-                addr: backed_addr(0),
+                impl_addr: backed_addr(0),
                 arr: 0,
             },
             Row {
                 op: 1,
-                alg: "canary-DOOM-7QZ".into(),
+                alg_class: "other".into(),
+                weak: false,
+                status: "unknown".into(),
                 funcid: 1,
-                addr: backed_addr(1),
+                impl_addr: backed_addr(1),
                 arr: 0,
             },
             Row {
                 op: 1,
-                alg: "MD5".into(),
+                alg_class: "MD5".into(),
+                weak: true,
+                status: "ok".into(),
                 funcid: 2,
-                addr: backed_addr(2),
+                impl_addr: backed_addr(2),
                 arr: 0,
             },
         ];
@@ -332,17 +370,26 @@ mod tests {
         .unwrap();
         let jrows = doc["rows"].as_array().unwrap();
         assert_eq!(jrows.len(), 3);
-        // Sorted by (op, claimed name, funcid): MD5 < SHA2-256 <
-        // canary-DOOM-7QZ in byte order.
+        // Sorted by (op, class, funcid): MD5 < SHA2-256 < other.
         let classes: Vec<&str> = jrows
             .iter()
             .map(|r| r["alg_class"].as_str().unwrap())
             .collect();
         assert_eq!(classes, vec!["MD5", "SHA2-256", "other"]);
         assert_eq!(jrows[1]["weak"], false);
-        // Canary bytes never survive emission.
+        // Raw names and runtime addresses never survive emission.
         assert!(jrows[2].get("alg").is_none());
+        for r in jrows {
+            assert!(r.get("addr").is_none(), "raw addr leaked: {r}");
+        }
         assert_eq!(jrows[0]["weak"], true);
+        // Kernel verdict statuses ride the rows: uncertainty stays
+        // explicit instead of collapsing into ordinary rows.
+        let statuses: Vec<&str> = jrows
+            .iter()
+            .map(|r| r["status"].as_str().unwrap())
+            .collect();
+        assert_eq!(statuses, vec!["ok", "ok", "unknown"]);
         let r = &jrows[1];
         assert_eq!(r["addr_backed"], true);
         assert_eq!(
@@ -368,7 +415,7 @@ mod tests {
             .into_iter()
             .enumerate()
             .map(|(i, mut r)| {
-                r.addr = backed_addr(i as u64);
+                r.impl_addr = backed_addr(i as u64);
                 r
             })
             .collect();
@@ -399,23 +446,29 @@ mod tests {
         let rows = vec![
             Row {
                 op: 1,
-                alg: "DH".into(),
+                alg_class: "DH".into(),
+                weak: false,
+                status: "ok".into(),
                 funcid: 10,
-                addr: backed_addr(1),
+                impl_addr: backed_addr(1),
                 arr: 0,
             },
             Row {
                 op: 1,
-                alg: "HONEST-SHA".into(),
+                alg_class: "other".into(),
+                weak: false,
+                status: "unknown".into(),
                 funcid: 3,
-                addr: backed_addr(2),
+                impl_addr: backed_addr(2),
                 arr: 0,
             },
             Row {
                 op: 1,
-                alg: "DH".into(),
+                alg_class: "DH".into(),
+                weak: false,
+                status: "ok".into(),
                 funcid: 10,
-                addr: backed_addr(0),
+                impl_addr: backed_addr(0),
                 arr: 0,
             },
         ];
@@ -444,9 +497,11 @@ mod tests {
                 .iter()
                 .map(|&a| Row {
                     op: 1,
-                    alg: "DH".into(),
+                    alg_class: "DH".into(),
+                    weak: false,
+                    status: "ok".into(),
                     funcid: 10,
-                    addr: a,
+                    impl_addr: a,
                     arr: 0,
                 })
                 .collect()
@@ -467,7 +522,7 @@ mod tests {
         let slid: Vec<Row> = fwd
             .iter()
             .map(|r| Row {
-                addr: r.addr + 0x5000,
+                impl_addr: r.impl_addr + 0x5000,
                 ..r.clone()
             })
             .collect();
@@ -482,14 +537,10 @@ mod tests {
             &Stats::trivial(),
         )
         .unwrap();
-        let strip = |d: &serde_json::Value| {
-            let mut d = d.clone();
-            for r in d["rows"].as_array_mut().unwrap() {
-                r.as_object_mut().unwrap().remove("addr");
-            }
-            d
-        };
-        assert_eq!(strip(&a), strip(&c));
+        // Re-slide: same triples at moved addrs → byte-identical docs
+        // (no runtime address is serialized at all since T02, so no
+        // redaction step remains).
+        assert_eq!(a, c);
     }
 
     #[test]
@@ -533,16 +584,20 @@ mod tests {
         let rows = vec![
             Row {
                 op: 1,
-                alg: "DH".into(),
+                alg_class: "DH".into(),
+                weak: false,
+                status: "ok".into(),
                 funcid: 10,
-                addr: 0x1000,
+                impl_addr: 0x1000,
                 arr: 0,
             },
             Row {
                 op: 1,
-                alg: "DH".into(),
+                alg_class: "DH".into(),
+                weak: false,
+                status: "ok".into(),
                 funcid: 10,
-                addr: 0x8010,
+                impl_addr: 0x8010,
                 arr: 0,
             },
         ];
@@ -572,9 +627,11 @@ mod tests {
         // with a unique claim.
         let rows = vec![Row {
             op: 1,
-            alg: "LYING-UNBACKED".into(),
+            alg_class: "other".into(),
+            weak: false,
+            status: "unknown".into(),
             funcid: 3,
-            addr: 0x7f00_0000_0000,
+            impl_addr: 0x7f00_0000_0000,
             arr: 0,
         }];
         let doc = emit_backed(&rows, &Stats::trivial());
@@ -589,9 +646,11 @@ mod tests {
         // keep their name; fence ranks above walk-completeness.
         let rows = vec![Row {
             op: 1,
-            alg: "LYING-UNBACKED".into(),
+            alg_class: "other".into(),
+            weak: false,
+            status: "unknown".into(),
             funcid: 3,
-            addr: 0x7f00_0000_0000,
+            impl_addr: 0x7f00_0000_0000,
             arr: 0,
         }];
         let stats = Stats {
@@ -641,7 +700,7 @@ mod tests {
             .into_iter()
             .enumerate()
             .map(|(i, mut r)| {
-                r.addr = backed_addr(i as u64);
+                r.impl_addr = backed_addr(i as u64);
                 r
             })
             .collect();
@@ -670,7 +729,7 @@ mod tests {
             .into_iter()
             .enumerate()
             .map(|(i, mut r)| {
-                r.addr = backed_addr(i as u64);
+                r.impl_addr = backed_addr(i as u64);
                 r
             })
             .collect();
@@ -704,16 +763,20 @@ mod tests {
         let rows = vec![
             Row {
                 op: 1,
-                alg: "SHA1".into(),
+                alg_class: "SHA1".into(),
+                weak: true,
+                status: "ok".into(),
                 funcid: 3,
-                addr: base + off,
+                impl_addr: base + off,
                 arr: 0,
             },
             Row {
                 op: 1,
-                alg: "SHA1-UNMAPPED".into(),
+                alg_class: "other".into(),
+                weak: false,
+                status: "unknown".into(),
                 funcid: 3,
-                addr: 0x1234,
+                impl_addr: 0x1234,
                 arr: 0,
             },
         ];

@@ -19,6 +19,8 @@
 /// Registry schema version. Bumped only by a recorded re-freeze.
 pub const REGISTRY_VERSION: u32 = 1;
 
+use osslscope_ebpf_common::OTHER_CLASS;
+
 /// (major, minor) OpenSSL version key.
 pub type Version = (u32, u32);
 
@@ -6018,6 +6020,10 @@ pub fn is_weak_alg(base_name: &str) -> bool {
 /// (first) segment iff it is an exact registry spelling, else `"other"`;
 /// `weak` is true iff ANY segment exactly matches [`WEAK_ALGS`]. Raw
 /// provider bytes never leave this function except as `"other"`.
+///
+/// Since T02 the kernel classifies first (same rules, shared-table
+/// backend) and userspace only decodes class ids; this function
+/// remains the agreement oracle for the protocol tests.
 pub fn classify_alg(names: &str) -> (&'static str, bool) {
     let mut primary = "other";
     let mut weak = false;
@@ -6039,6 +6045,17 @@ pub fn classify_alg(names: &str) -> (&'static str, bool) {
 /// True iff the exact spelling is a registered algorithm name.
 pub fn is_known_alg(name: &str) -> bool {
     ALG_NAMES.iter().any(|a| a.name == name)
+}
+
+/// Decode a kernel algorithm class id to its registry label (T02
+/// discovery wire ABI v2). `OTHER_CLASS` is `"other"`; anything past
+/// the registry is `None` (fail closed to a dropped event, never to
+/// a wrong label). Index order is the frozen `ALG_NAMES` order.
+pub fn alg_class_label(id: u16) -> Option<&'static str> {
+    if id == OTHER_CLASS {
+        return Some("other");
+    }
+    ALG_NAMES.get(id as usize).map(|a| a.name)
 }
 
 /// Struct shape by type name.

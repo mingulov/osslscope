@@ -17,7 +17,9 @@ pub const FINDING_ENGINE_ABSENT: &str = "ENGINE API absent";
 pub const FINDING_LOWLEVEL_NODYNSYM: &str = "low-level coverage unavailable (no .dynsym)";
 
 /// Known upstream built-in engine ids (best-effort; unknown → other).
-const BUILTIN_ENGINE_IDS: &[&str] = &[
+/// Single home of the trip taxonomy strings: the harvest-time kernel
+/// table population reads this list, so BPF and userspace cannot drift.
+pub const BUILTIN_ENGINE_IDS: &[&str] = &[
     "padlock",
     "capi",
     "dasync",
@@ -25,6 +27,9 @@ const BUILTIN_ENGINE_IDS: &[&str] = &[
     "loader_attic",
     "ossltest",
 ];
+
+/// Provider-load names with dedicated classes (same single-home rule).
+pub const LOAD_NAMES: &[&str] = &["legacy", "default", "fips"];
 
 /// One tripwire attachment.
 #[derive(Debug, Clone)]
@@ -57,8 +62,10 @@ pub struct ProbeSet {
     pub unprobed_meth_syms: Vec<String>,
     pub unprobed_lowlevel_syms: Vec<String>,
     pub findings: Vec<String>,
-    by_id_cookies: HashSet<u64>,
-    load_cookies: HashSet<u64>,
+    /// `ENGINE_by_id` probe cookies (engine-id taxonomy).
+    pub by_id_cookies: HashSet<u64>,
+    /// Provider-load probe cookies (load-name taxonomy).
+    pub load_cookies: HashSet<u64>,
 }
 
 impl ProbeSet {
@@ -73,25 +80,16 @@ impl ProbeSet {
     }
 }
 
-/// `ENGINE_by_id` argument class (raw ids never serialized).
-pub fn engine_id_class(id: &str) -> &'static str {
-    if id == "dynamic" {
-        "dynamic"
-    } else if BUILTIN_ENGINE_IDS.contains(&id) {
-        "builtin"
-    } else {
-        "other"
-    }
-}
-
-/// Provider-load argument class.
-pub fn load_class(name: &str) -> &'static str {
-    match name {
-        "legacy" => "legacy",
-        "default" => "default",
-        "fips" => "fips",
-        _ => "other",
-    }
+/// One classified tripwire hit: the kernel verdict for a single
+/// string-bearing probe firing. `class` is a taxonomy-relative class
+/// id (`TRIP_OTHER`/`ENGINE_*`/`LOAD_*`), `status` the read verdict
+/// (`TRIP_OK`/`TRIP_UNREADABLE`/`TRIP_OVERLONG`). Raw argument bytes
+/// never cross the ring (T02).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TripHit {
+    pub cookie: u64,
+    pub class: u16,
+    pub status: u8,
 }
 
 /// A target module to scan for caller-attributed low-level imports.
@@ -525,8 +523,8 @@ pub struct SectionInputs<'a> {
     pub set: &'a ProbeSet,
     /// TRIP map contents: cookie → hit count.
     pub trip: &'a HashMap<u64, u64>,
-    /// KIND_TRIP string hits: (cookie, arg0).
-    pub trip_strs: &'a [(u64, String)],
+    /// KIND_TRIP classified hits: (cookie, class, status).
+    pub trip_hits: &'a [TripHit],
     /// LGCALLS sum: executed legacy-provider queries (deny signal).
     pub legacy_queries: u64,
     /// Legacy-partitioned row classes (sorted/deduped here).
@@ -564,11 +562,30 @@ pub fn section(inp: &SectionInputs) -> serde_json::Value {
     let mut loads: BTreeMap<&str, u64> = [("legacy", 0), ("default", 0), ("fips", 0), ("other", 0)]
         .into_iter()
         .collect();
-    for (c, s) in inp.trip_strs {
-        if inp.set.by_id_cookies.contains(c) {
-            *id_class.get_mut(engine_id_class(s)).unwrap() += 1;
-        } else if inp.set.load_cookies.contains(c) {
-            *loads.get_mut(load_class(s)).unwrap() += 1;
+    // Explicit unreadable verdicts (NULL/unreadable/overlong args):
+    // counted per taxonomy straight from the kernel status, never
+    // folded into `other` classes.
+    let mut id_unreadable: u64 = 0;
+    let mut load_unreadable: u64 = 0;
+    for hit in inp.trip_hits {
+        if inp.set.by_id_cookies.contains(&hit.cookie) {
+            if hit.status != osslscope_ebpf_common::TRIP_OK {
+                id_unreadable += 1;
+                continue;
+            }
+            let Some(label) = osslscope_ebpf_common::engine_class_name(hit.class) else {
+                continue;
+            };
+            *id_class.get_mut(label).unwrap() += 1;
+        } else if inp.set.load_cookies.contains(&hit.cookie) {
+            if hit.status != osslscope_ebpf_common::TRIP_OK {
+                load_unreadable += 1;
+                continue;
+            }
+            let Some(label) = osslscope_ebpf_common::load_class_name(hit.class) else {
+                continue;
+            };
+            *loads.get_mut(label).unwrap() += 1;
         }
     }
     let mut fam_calls: BTreeMap<&str, u64> = crate::kinds::LOWLEVEL
@@ -587,34 +604,36 @@ pub fn section(inp: &SectionInputs) -> serde_json::Value {
     classes.dedup();
     let mut findings: Vec<String> = inp.set.findings.clone();
     findings.extend(inp.extra_findings.iter().map(|s| s.to_string()));
-    // String-bearing probes fire TRIP always but emit strings only for
-    // readable args: a TRIP/string delta means calls with NULL or
-    // unreadable names happened — findings, not silent undercount.
-    // Counts live in `unreadable` (merge-summable); finding strings
-    // stay count-free so cross-harvest merges dedupe exactly.
+    // String-bearing probes fire TRIP always and emit a classified
+    // hit for every firing (readable, unreadable, and overlong
+    // alike): a TRIP/hit delta means ring events were lost, not that
+    // calls hid — findings, not silent undercount. The delta rides
+    // with the explicit unreadable verdicts above (both are
+    // merge-summable); finding strings stay count-free so
+    // cross-harvest merges dedupe exactly.
     let fires = |cookies: &HashSet<u64>| cookies.iter().map(|c| count(*c)).sum::<u64>();
-    let strs = |cookies: &HashSet<u64>| {
-        inp.trip_strs
+    let hits = |cookies: &HashSet<u64>| {
+        inp.trip_hits
             .iter()
-            .filter(|(c, _)| cookies.contains(c))
+            .filter(|h| cookies.contains(&h.cookie))
             .count() as u64
     };
-    let load_delta = fires(&inp.set.load_cookies).saturating_sub(strs(&inp.set.load_cookies));
-    if load_delta > 0 {
+    load_unreadable += fires(&inp.set.load_cookies).saturating_sub(hits(&inp.set.load_cookies));
+    if load_unreadable > 0 {
         findings.push("provider loads with unreadable names".to_string());
     }
-    let id_delta = fires(&inp.set.by_id_cookies).saturating_sub(strs(&inp.set.by_id_cookies));
-    if id_delta > 0 {
+    id_unreadable += fires(&inp.set.by_id_cookies).saturating_sub(hits(&inp.set.by_id_cookies));
+    if id_unreadable > 0 {
         findings.push("engine-id lookups with unreadable ids".to_string());
     }
     // Machine flags: one slug per finding (check/CI consume these;
     // humans read `findings`). Deltas map directly; the rest via
     // flag_for (exact/prefix rules + slugify fallback, all tested).
     let mut flags: BTreeSet<String> = findings.iter().map(|f| flag_for(f)).collect();
-    if load_delta > 0 {
+    if load_unreadable > 0 {
         flags.insert("unreadable-load-names".to_string());
     }
-    if id_delta > 0 {
+    if id_unreadable > 0 {
         flags.insert("unreadable-engine-ids".to_string());
     }
     // Per-entry states over the CONSIDERED set (registry order =
@@ -729,7 +748,7 @@ pub fn section(inp: &SectionInputs) -> serde_json::Value {
                        "tripwires_attached": attached, "tripwires_missed": missed},
         "flags": flags.into_iter().collect::<Vec<_>>(),
         "weak": {"legacy_algs": weak_algs},
-        "unreadable": {"load_names": load_delta, "engine_ids": id_delta},
+        "unreadable": {"load_names": load_unreadable, "engine_ids": id_unreadable},
     });
     if inp.set.engine_uninstrumented > 0 {
         legacy["engine"]["uninstrumented"] = inp.set.engine_uninstrumented.into();
@@ -755,14 +774,28 @@ mod tests {
 
     #[test]
     fn taxonomy_classes() {
-        assert_eq!(engine_id_class("dynamic"), "dynamic");
-        assert_eq!(engine_id_class("padlock"), "builtin");
-        assert_eq!(engine_id_class("wat"), "other");
-        assert_eq!(engine_id_class(""), "other");
-        assert_eq!(load_class("legacy"), "legacy");
-        assert_eq!(load_class("default"), "default");
-        assert_eq!(load_class("fips"), "fips");
-        assert_eq!(load_class("spike"), "other");
+        // Kernel class ids (populated from this taxonomy) decode to
+        // the frozen labels; anything else is rejected, never
+        // mislabeled. (End-to-end classifier pins live in the
+        // discovery-protocol integration tests.)
+        use osslscope_ebpf_common as wire;
+        assert_eq!(
+            wire::engine_class_name(wire::ENGINE_DYNAMIC),
+            Some("dynamic")
+        );
+        assert_eq!(
+            wire::engine_class_name(wire::ENGINE_BUILTIN),
+            Some("builtin")
+        );
+        assert_eq!(wire::engine_class_name(wire::TRIP_OTHER), Some("other"));
+        assert_eq!(wire::engine_class_name(99), None);
+        assert_eq!(wire::load_class_name(wire::LOAD_LEGACY), Some("legacy"));
+        assert_eq!(wire::load_class_name(wire::LOAD_DEFAULT), Some("default"));
+        assert_eq!(wire::load_class_name(wire::LOAD_FIPS), Some("fips"));
+        assert_eq!(wire::load_class_name(wire::TRIP_OTHER), Some("other"));
+        assert_eq!(wire::load_class_name(99), None);
+        assert!(BUILTIN_ENGINE_IDS.contains(&"padlock"));
+        assert_eq!(LOAD_NAMES, &["legacy", "default", "fips"]);
     }
 
     #[test]
@@ -923,8 +956,10 @@ mod tests {
 
     #[test]
     fn null_names_are_loud_findings() {
-        // TRIP fires without string events (NULL/unreadable args):
-        // the calls happened — findings, not silent undercount.
+        // TRIP fires with explicit unreadable hits (NULL args) plus a
+        // lost-event delta: the calls happened — findings and
+        // merge-summable counts, not silent undercount.
+        use osslscope_ebpf_common as wire;
         let set = ProbeSet {
             probes: vec![
                 Probe {
@@ -954,7 +989,18 @@ mod tests {
         let doc = section(&SectionInputs {
             set: &set,
             trip: &trip,
-            trip_strs: &[(9u64, "spike".into()), (10u64, "dynamic".into())],
+            trip_hits: &[
+                TripHit {
+                    cookie: 9,
+                    class: wire::TRIP_OTHER,
+                    status: wire::TRIP_UNREADABLE,
+                },
+                TripHit {
+                    cookie: 10,
+                    class: wire::ENGINE_DYNAMIC,
+                    status: wire::TRIP_OK,
+                },
+            ],
             legacy_queries: 0,
             legacy_classes: Vec::new(),
             extra_findings: &[],
@@ -963,15 +1009,19 @@ mod tests {
         let texts: Vec<&str> = findings.iter().map(|v| v.as_str().unwrap()).collect();
         assert!(
             texts.contains(&"provider loads with unreadable names"),
-            "load delta finding missing: {texts:?}"
+            "load finding missing: {texts:?}"
         );
         assert!(
             texts.contains(&"engine-id lookups with unreadable ids"),
-            "by_id delta finding missing: {texts:?}"
+            "by_id finding missing: {texts:?}"
         );
-        // Counts ride merge-summable in `unreadable`, not in strings.
-        assert_eq!(doc["unreadable"]["load_names"], 1);
+        // Load: 1 explicit unreadable hit + 1 lost-event delta (2
+        // fires, 1 hit). Engine: 2 lost-event delta (3 fires, 1 hit).
+        assert_eq!(doc["unreadable"]["load_names"], 2);
         assert_eq!(doc["unreadable"]["engine_ids"], 2);
+        // Explicit unreadable hits never inflate `other` classes.
+        assert_eq!(doc["legacy_provider"]["loads"]["other"], 0);
+        assert_eq!(doc["engine"]["engine_id_class"]["dynamic"], 1);
         let flags = doc["flags"].as_array().unwrap();
         let slugs: Vec<&str> = flags.iter().map(|v| v.as_str().unwrap()).collect();
         assert!(slugs.contains(&"unreadable-load-names"), "{slugs:?}");
@@ -1021,7 +1071,11 @@ mod tests {
         let doc = section(&SectionInputs {
             set: &set,
             trip: &HashMap::from([(1u64, 4u64)]),
-            trip_strs: &[(1u64, "dynamic".into())],
+            trip_hits: &[TripHit {
+                cookie: 1,
+                class: osslscope_ebpf_common::ENGINE_DYNAMIC,
+                status: osslscope_ebpf_common::TRIP_OK,
+            }],
             legacy_queries: 0,
             legacy_classes: vec!["MD4".into()],
             extra_findings: &[],
@@ -1048,7 +1102,7 @@ mod tests {
         let bdoc = section(&SectionInputs {
             set: &blind,
             trip: &HashMap::new(),
-            trip_strs: &[],
+            trip_hits: &[],
             legacy_queries: 0,
             legacy_classes: Vec::new(),
             extra_findings: &[],
@@ -1090,7 +1144,7 @@ mod tests {
         let doc = section(&SectionInputs {
             set: &set,
             trip: &trip,
-            trip_strs: &[],
+            trip_hits: &[],
             legacy_queries: 0,
             legacy_classes: Vec::new(),
             extra_findings: &[],
@@ -1185,15 +1239,27 @@ mod tests {
             load_cookies: [2].into_iter().collect(),
         };
         let trip: HashMap<u64, u64> = [(0, 1), (1, 5), (2, 2), (3, 9)].into_iter().collect();
-        let strs = vec![
-            (0u64, "dynamic".to_string()),
-            (2u64, "legacy".to_string()),
-            (2u64, "spike".to_string()),
+        let hits = vec![
+            TripHit {
+                cookie: 0,
+                class: osslscope_ebpf_common::ENGINE_DYNAMIC,
+                status: osslscope_ebpf_common::TRIP_OK,
+            },
+            TripHit {
+                cookie: 2,
+                class: osslscope_ebpf_common::LOAD_LEGACY,
+                status: osslscope_ebpf_common::TRIP_OK,
+            },
+            TripHit {
+                cookie: 2,
+                class: osslscope_ebpf_common::TRIP_OTHER,
+                status: osslscope_ebpf_common::TRIP_OK,
+            },
         ];
         let doc = section(&SectionInputs {
             set: &set,
             trip: &trip,
-            trip_strs: &strs,
+            trip_hits: &hits,
             legacy_queries: 7,
             legacy_classes: vec!["B".into(), "A".into(), "A".into()],
             extra_findings: &[],

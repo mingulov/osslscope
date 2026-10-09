@@ -88,8 +88,8 @@ No `OSSL_PARAM` values, property strings, verbatim algorithm
 names, key/IV/plaintext/ciphertext/AAD/tag/salt/password/seed
 bytes, KEM secrets, KDF/RAND/signature/digest outputs, `EVP_PKEY`
 buffers, bignum limbs, PEM/DER/PKCS#12 bytes, error strings, or
-TLS payloads. Raw code addresses stay in-kernel as join keys
-(`inspect` retains a runtime address for attribution debugging;
-report/check/CBOM carry file `offset` plus one-way `addr_hash`
-only). See the allowlist for the audited read sites and the
-change rule for adding any.
+TLS payloads. Raw code addresses stay in the transient internal
+discovery transport as join/relocation keys, consumed and discarded
+at relocation; every artifact carries file `offset` plus one-way
+`addr_hash` only. See the allowlist for the audited read sites and
+the change rule for adding any.

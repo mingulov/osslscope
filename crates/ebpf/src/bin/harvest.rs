@@ -9,7 +9,7 @@
 //! OSSL_FUNC_PROVIDER_QUERY_OPERATION (1027) and reports its address.
 //! Stage 2 (attached by userspace at that address) walks each query-return
 //! OSSL_ALGORITHM array plus per-alg dispatch tables, emitting one ROW
-//! event per (op, alg, funcid, addr). No symbols are used past the init
+//! event per (op, class, funcid, addr). No symbols are used past the init
 //! anchor; userspace never reads target memory.
 //!
 //! Walk bounds (P1 exit 2, default-provider census 4.0.2: 241 algs/op
@@ -24,20 +24,35 @@
 //! shape is deliberate: nested slice loops blow the verifier's 1M
 //! processed-insn ceiling via state explosion (bisected 2026-09-17),
 //! while one loop (dispatch walk, as a subprogram) verifies with wide
-//! margin. Name field 128B; ring 2MB. Event layout must match
-//! `discovery::harvest` EVENT_LEN (160 bytes, 40 for ROW/QUERY_RET).
+//! margin.
+//!
+//! Classify-before-emission (T02, wire ABI v2): target strings are
+//! read into kernel stack scratch (128B alg window, 32B trip window)
+//! and classified in-kernel against the observer-populated
+//! `ALG_CLASS`/`TRIP_CLASS` tables. The ring carries finite
+//! `(class, status)` numerics plus internal structural join
+//! addresses only — no name/argument bytes. All event shapes come
+//! from the shared crate (this program defines no wire structs of
+//! its own); userspace decodes ids to table labels. Saturated
+//! windows (helper filled the whole window — exact-fit and
+//! truncation are indistinguishable) fail closed to overlong with no
+//! retained prefix. String-read failures emit explicit unreadable
+//! verdicts; the alg-slot counter still freezes so the next query
+//! re-walks the slot. Walk-abort forensics left the ring (TRUNC bits
+//! keep the abort signal).
 //!
 //! Layout constants mirror `kinds::SHAPES` (R12; asserted fail-closed by
 //! `layout_assert.c` against real headers): OSSL_DISPATCH = {u32, pad,
 //! u64} @16B; OSSL_ALGORITHM = 4×u64 @32B.
 //!
 //! P1 exit 3 adds legacy tripwires: `trip_count` (cookie++ only, hot
-//! symbols) and `trip_str` (cookie++ plus the arg0 string, cold
-//! string-bearing entrypoints) share one `TRIP` map keyed by attach
-//! cookie (userspace-defined id space; kernels ≥5.15). Query programs
-//! read their own cookie to count `CALLS` (0) vs `LGCALLS` (1): the
-//! legacy provider's query fn is stage-attached alongside the target
-//! provider's, and userspace partitions rows by array mapping.
+//! symbols) and `trip_str0`/`trip_str1` (cookie++ plus the classified
+//! arg verdict, cold string-bearing entrypoints) share one `TRIP` map
+//! keyed by attach cookie (userspace-defined id space; kernels
+//! ≥5.15). Query programs read their own cookie to count `CALLS` (0)
+//! vs `LGCALLS` (1): the legacy provider's query fn is stage-attached
+//! alongside the target provider's, and userspace partitions rows by
+//! array mapping.
 #![no_std]
 #![no_main]
 
@@ -48,54 +63,11 @@ use aya_ebpf::{
     programs::{ProbeContext, RetProbeContext},
     EbpfContext as _,
 };
-
-/// Must match discovery::harvest Event. 160 bytes, align 8.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct Event {
-    kind: u32,
-    op: u32,
-    funcid: u32,
-    _pad: u32,
-    addr: u64,
-    aux: u64,
-    name: [u8; 128],
-}
-
-/// Hot-loop row: 40 bytes (no name copy — userspace joins
-/// (`aux` = array address, `idx` = alg index) to the KIND_ALG record;
-/// the array disambiguates providers sharing (op, index)). The 128B
-/// name copy inside the dispatch loop blows the verifier's 1M
-/// processed-insn ceiling; the normalized split keeps the inner body
-/// small. Must match discovery::harvest RowEvent.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct RowEvent {
-    kind: u32,
-    op: u32,
-    funcid: u32,
-    _pad: u32,
-    addr: u64,
-    aux: u64,
-    idx: u64,
-}
-
-const KIND_INIT_RET: u32 = 1;
-const KIND_QUERY_RET: u32 = 2;
-const KIND_ROW: u32 = 3;
-const KIND_ALG: u32 = 4;
-const KIND_TRIP: u32 = 5;
-const KIND_WALKDBG: u32 = 6;
-
-/// Cold-path tripwire hit: attach cookie + arg0 string (bounded 32B).
-/// 40 bytes; must match discovery::harvest TRIP layout.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct TripEvent {
-    kind: u32,
-    cookie: u32,
-    arg: [u8; 32],
-}
+use osslscope_ebpf_common::{
+    AlgClassValue, AlgEvent, InitRetEvent, RowEvent, TripClassValue, TripEvent, TripTaxonomy,
+    ALG_UNREADABLE, ALG_WINDOW, KIND_ALG, KIND_INIT_RET, KIND_QUERY_RET, KIND_ROW, KIND_TRIP,
+    OTHER_CLASS, TRIP_OTHER, TRIP_UNREADABLE, TRIP_WINDOW, classify_alg_with, classify_trip_with,
+};
 
 /// core_dispatch.h: provider codes live at 1024+; verified 2026-09-16.
 const OSSL_FUNC_PROVIDER_QUERY_OPERATION: u32 = 1027;
@@ -154,9 +126,19 @@ static TRIP: HashMap<u64, u64> = HashMap::with_max_entries(128, 0);
 /// (cookie 1); the target provider's stay in CALLS.
 #[map]
 static LGCALLS: HashMap<u32, u64> = HashMap::with_max_entries(64, 0);
+/// Kernel classifier table: FNV-1a-64 of exact registry spelling →
+/// (class, weak, name for exact confirm). Observer-populated before
+/// any attach; no target bytes at rest.
+#[map]
+static ALG_CLASS: HashMap<u64, AlgClassValue> = HashMap::with_max_entries(1024, 0);
+/// Kernel trip table: FNV-1a-64 of exact taxonomy pattern →
+/// (engine class, load class, name for exact confirm). Same
+/// observer-populated discipline.
+#[map]
+static TRIP_CLASS: HashMap<u64, TripClassValue> = HashMap::with_max_entries(64, 0);
 
-fn emit(ev: &Event) {
-    if let Some(mut e) = EVENTS.reserve::<Event>(0) {
+fn emit_alg(ev: &AlgEvent) {
+    if let Some(mut e) = EVENTS.reserve::<AlgEvent>(0) {
         e.write(*ev);
         e.submit(0);
     }
@@ -176,23 +158,28 @@ fn emit_trip(ev: &TripEvent) {
     }
 }
 
-/// Walk-abort forensics: WHY slot j of array rv failed. `aux` packs
-/// j (high) + reason (low: 1 read, 2 empty, 3 noimp, 4 name);
-/// `name[..16]` packs the names+imp slot values. Emitted alongside
-/// the TRUNC bit on slot-0 aborts only (rare by construction).
-fn emit_walkdbg(op: u32, rv: u64, j: u64, reason: u64, names: u64, imp: u64) {
-    let mut payload = [0u8; 128];
-    payload[..8].copy_from_slice(&names.to_le_bytes());
-    payload[8..16].copy_from_slice(&imp.to_le_bytes());
-    emit(&Event {
-        kind: KIND_WALKDBG,
-        op,
-        funcid: 0,
-        _pad: 0,
-        addr: rv,
-        aux: (j << 32) | reason,
-        name: payload,
-    });
+fn emit_init_ret(ev: &InitRetEvent) {
+    if let Some(mut e) = EVENTS.reserve::<InitRetEvent>(0) {
+        e.write(*ev);
+        e.submit(0);
+    }
+}
+
+/// Table lookups behind the shared classifiers (copied out: values
+/// are small, and the confirm step borrows the copy).
+fn lookup_alg(h: u64) -> Option<AlgClassValue> {
+    unsafe { ALG_CLASS.get_ptr(&h).map(|p| *p) }
+}
+
+fn lookup_trip(h: u64) -> Option<TripClassValue> {
+    unsafe { TRIP_CLASS.get_ptr(&h).map(|p| *p) }
+}
+
+/// Algorithm classification as a BPF subprogram (separate
+/// verification scope, like the dispatch walk below).
+#[inline(never)]
+fn classify_alg(name: &[u8], saturated: bool) -> osslscope_ebpf_common::AlgVerdict {
+    classify_alg_with(name, saturated, lookup_alg)
 }
 
 fn cookie_of(ctx: &ProbeContext) -> u64 {
@@ -268,14 +255,13 @@ pub fn init_return(ctx: RetProbeContext) -> u32 {
             return 0;
         }
         if fid == OSSL_FUNC_PROVIDER_QUERY_OPERATION && fptr != 0 {
-            emit(&Event {
+            emit_init_ret(&InitRetEvent {
                 kind: KIND_INIT_RET,
                 op: 0,
                 funcid: fid,
                 _pad: 0,
                 addr: fptr,
                 aux: cookie,
-                name: [0; 128],
             });
             return 0;
         }
@@ -290,31 +276,56 @@ pub fn trip_count(ctx: ProbeContext) -> u32 {
     0
 }
 
-fn trip_str_at(ctx: &ProbeContext, n: usize) {
+fn trip_unreadable(cookie: u64) {
+    emit_trip(&TripEvent {
+        kind: KIND_TRIP,
+        cookie: cookie as u32,
+        class: TRIP_OTHER,
+        status: TRIP_UNREADABLE,
+        _pad: 0,
+        _pad2: 0,
+    });
+}
+
+fn trip_str_at(ctx: &ProbeContext, n: usize, taxonomy: TripTaxonomy) {
     let c = cookie_of(ctx);
     bump_trip(c);
     let s: u64 = match ctx.arg(n) {
         Some(v) => v,
         None => return,
     };
+    // NULL argument: an explicit unreadable verdict (the call
+    // happened; userspace counts it, never a silent undercount).
     if s == 0 {
+        trip_unreadable(c);
         return;
     }
-    let mut arg = [0u8; 32];
-    if unsafe { helpers::bpf_probe_read_user_str_bytes(s as *const u8, &mut arg) }.is_err() {
-        return;
-    }
+    // Kernel scratch only: classified below, never emitted.
+    let mut arg_buf = [0u8; 32];
+    let slice =
+        match unsafe { helpers::bpf_probe_read_user_str_bytes(s as *const u8, &mut arg_buf) } {
+            Ok(s) => s,
+            Err(_) => {
+                trip_unreadable(c);
+                return;
+            }
+        };
+    let saturated = slice.len() == TRIP_WINDOW - 1;
+    let v = classify_trip_with(slice, saturated, taxonomy, lookup_trip);
     emit_trip(&TripEvent {
         kind: KIND_TRIP,
         cookie: c as u32,
-        arg,
+        class: v.class,
+        status: v.status,
+        _pad: 0,
+        _pad2: 0,
     });
 }
 
 /// Cold string-bearing tripwire, arg0 flavor (`ENGINE_by_id(id)`).
 #[uprobe]
 pub fn trip_str0(ctx: ProbeContext) -> u32 {
-    trip_str_at(&ctx, 0);
+    trip_str_at(&ctx, 0, TripTaxonomy::Engine);
     0
 }
 
@@ -322,7 +333,7 @@ pub fn trip_str0(ctx: ProbeContext) -> u32 {
 /// (`OSSL_PROVIDER_load(libctx, name)`).
 #[uprobe]
 pub fn trip_str1(ctx: ProbeContext) -> u32 {
-    trip_str_at(&ctx, 1);
+    trip_str_at(&ctx, 1, TripTaxonomy::Load);
     0
 }
 
@@ -416,7 +427,6 @@ pub fn query_return(ctx: RetProbeContext) -> u32 {
     let (Ok(names), Ok(imp)) = (names, imp) else {
         if j == 0 {
             flag_trunc(op as u32, TRUNC_WALK_READ);
-            emit_walkdbg(op as u32, rv, j, 1, 0, 0);
         }
         return 0;
     };
@@ -425,7 +435,6 @@ pub fn query_return(ctx: RetProbeContext) -> u32 {
         // empty = the query returned a table with no first alg.
         if j == 0 {
             flag_trunc(op as u32, TRUNC_WALK_EMPTY);
-            emit_walkdbg(op as u32, rv, j, 2, names, imp);
         }
         return 0;
     }
@@ -435,7 +444,6 @@ pub fn query_return(ctx: RetProbeContext) -> u32 {
         // next hit re-walks this slot instead of sliding past it.
         if j == 0 {
             flag_trunc(op as u32, TRUNC_WALK_NOIMP);
-            emit_walkdbg(op as u32, rv, j, 3, names, imp);
         }
         return 0;
     }
@@ -449,24 +457,45 @@ pub fn query_return(ctx: RetProbeContext) -> u32 {
             _ => flag_trunc(op as u32, TRUNC_ALGS),
         }
     }
-    let mut name = [0u8; 128];
-    if unsafe { helpers::bpf_probe_read_user_str_bytes(names as *const u8, &mut name) }.is_err() {
-        if j == 0 {
-            flag_trunc(op as u32, TRUNC_WALK_NAME);
-            emit_walkdbg(op as u32, rv, j, 4, names, imp);
-        }
-        return 0;
-    }
+    // Kernel scratch only: classified below, never emitted.
+    let mut name_buf = [0u8; 128];
+    let slice =
+        match unsafe { helpers::bpf_probe_read_user_str_bytes(names as *const u8, &mut name_buf) }
+        {
+            Ok(s) => s,
+            Err(_) => {
+                if j == 0 {
+                    flag_trunc(op as u32, TRUNC_WALK_NAME);
+                }
+                // Explicit unreadable record (cold page or hostile
+                // pointer): the counter still freezes so the next
+                // query re-walks this slot instead of losing the alg.
+                emit_alg(&AlgEvent {
+                    kind: KIND_ALG,
+                    op: op as u32,
+                    class: OTHER_CLASS,
+                    status: ALG_UNREADABLE,
+                    weak: 0,
+                    _pad: 0,
+                    arr: rv,
+                    idx: j,
+                });
+                return 0;
+            }
+        };
+    let saturated = slice.len() == ALG_WINDOW - 1;
+    let v = classify_alg(slice, saturated);
     // ALG first: userspace drops rows whose (array, index) has no
     // ALG record yet (orphan rule), so rows must follow their ALG.
-    emit(&Event {
+    emit_alg(&AlgEvent {
         kind: KIND_ALG,
         op: op as u32,
-        funcid: 0,
+        class: v.class,
+        status: v.status,
+        weak: u8::from(v.weak),
         _pad: 0,
-        addr: rv,
-        aux: j,
-        name,
+        arr: rv,
+        idx: j,
     });
     // Advance past this slot ONLY on a fully-walked alg: BPF probe
     // reads are nofault, so a cold (never-touched) page aborts the

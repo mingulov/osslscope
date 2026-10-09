@@ -128,7 +128,7 @@ mod tests {
 
     fn row(op: u64, class: &str, funcid: u64, hash: &str) -> serde_json::Value {
         serde_json::json!({"provider":"t","op":op,"alg_class":class,"funcid":funcid,
-                           "addr":1,"addr_hash":hash,"addr_backed":true})
+                           "addr_hash":hash,"addr_backed":true})
     }
 
     #[test]

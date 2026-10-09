@@ -3,12 +3,15 @@
  * through digest/sign/cipher/MAC/KEM/KDF/RAND/password/salt paths
  * while the observer watches. Two sentinel classes (by prefix):
  * CNRY7QZ-* crypto-buffer sentinels must be absent from EVERY
- * artifact including the raw ring dump (probes never read them);
- * CNRY7QN-* trip-arg sentinels traverse the trip string-read site,
- * so they must be PRESENT in the ring dump (alias lane fired) and
- * ABSENT from every classified artifact. Sentinels live only in
- * this binary's rodata and in crypto-call arguments — never in
- * argv/env/stderr (cmdline is allowlisted).
+ * artifact including ring payloads and live maps (probes never
+ * read them); CNRY7QN-* trip-arg sentinels traverse the trip
+ * string-read site, so they must be ABSENT from every artifact,
+ * ring payload, and live map while the classified evidence shows
+ * matching `other`/unreadable verdicts (T02: the kernel classifies
+ * before emission, so presence-in-ring is no longer the positive
+ * control — classified `other`/unreadable evidence is).
+ * Sentinels live only in this binary's rodata and in crypto-call
+ * arguments — never in argv/env/stderr (cmdline is allowlisted).
  * Protocol: prints PID=, runs all lanes on GO1, prints CANARYDONE,
  * blocks for GO2/EOF. -threads T runs stack-buffer worker lanes
  * concurrently. Exit 2 on any lane failure. Lanes print LANE <name>
