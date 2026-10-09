@@ -5,9 +5,8 @@
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    // T04 (coordinator review; beyond the listed T04 files — approve or
-    // revert): std::env::args() panics on non-UTF8 argv (exit 101). Lossy
-    // conversion keeps operator/target bytes out of panics (R07/R08);
+    // std::env::args() panics on non-UTF8 argv (exit 101). Lossy conversion
+    // at the boundary keeps operator/target bytes out of panics (R07/R08);
     // parsing still rejects anything invalid with exit 2.
     let argv: Vec<String> = std::env::args_os()
         .skip(1)
