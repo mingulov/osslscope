@@ -1,0 +1,554 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
+//! T01 conserved evidence model (spec R01/R02/R06).
+//!
+//! The counted unit is entry into a provider-dispatch callback at one
+//! physical site, not an algorithm execution. Each [`SiteExecution`]
+//! carries its physical call count once plus a sorted, deduplicated set
+//! of [`CandidateIdentity`] metadata describing which identities could
+//! explain that entry. Candidate identity is not definite executed
+//! algorithm identity: a complete candidate set permits a definite
+//! statement only for predicates true of every candidate, and an
+//! incomplete ([`CandidateCoverage::Unknown`]) set makes the possible
+//! upper bound unknown while preventing any lower-bound assertion.
+//!
+//! [`finalize`] is the sole completeness finalizer: it canonicalizes
+//! input order, collects typed [`GapReason`]s, and assigns
+//! [`Completeness`]. Nothing else in the tree may mint a COMPLETE
+//! status.
+
+use serde::{Deserialize, Serialize};
+
+/// Schema identity carried by every finalized capture document.
+pub const CAPTURE_SCHEMA_V2: &str = "observed-crypto-v2.0";
+
+/// Verified object fingerprint. A pathname may locate a file for display,
+/// but it never defines identity (R02).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ObjectId(pub String);
+
+/// Physical callback backing site: the executable backing object plus the
+/// `(device, inode, file offset)` triple. Replacing the file at a path
+/// yields a new inode and therefore a new site, never a relabeled one.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct SiteKey {
+    pub object: ObjectId,
+    pub device: u64,
+    pub inode: u64,
+    pub offset: u64,
+}
+
+/// One candidate identity that could explain entry at a site: the
+/// advertising provider object, its finite class (or third-party opaque
+/// id), the operation/function ids, the sorted recognized algorithm
+/// classes from that alias, and whether the alias is weak. The first
+/// class is not a canonical semantic authority.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct CandidateIdentity {
+    pub provider: ObjectId,
+    pub provider_class: String,
+    pub op: u32,
+    pub funcid: u32,
+    pub algorithm_classes: Vec<String>,
+    pub weak_alias: bool,
+}
+
+impl CandidateIdentity {
+    /// Build a candidate, sorting and deduplicating its algorithm classes.
+    pub fn new(
+        provider: ObjectId,
+        provider_class: String,
+        op: u32,
+        funcid: u32,
+        mut algorithm_classes: Vec<String>,
+        weak_alias: bool,
+    ) -> Self {
+        algorithm_classes.sort();
+        algorithm_classes.dedup();
+        Self {
+            provider,
+            provider_class,
+            op,
+            funcid,
+            algorithm_classes,
+            weak_alias,
+        }
+    }
+}
+
+/// Whether the candidate set for a site is itself complete. `Unknown`
+/// means candidates may be missing; it is not the same as a candidate
+/// carrying an `other`/unreadable algorithm class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum CandidateCoverage {
+    Complete,
+    Unknown,
+}
+
+/// Physical execution record for one site in one generation: the site
+/// key, its candidate metadata, and the conserved call count with its
+/// first/last in-window timestamps. Field order defines the total
+/// document order: `(site, generation)` first, full record after.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct SiteExecution {
+    pub site: SiteKey,
+    pub generation: u32,
+    pub candidates: Vec<CandidateIdentity>,
+    pub candidates_coverage: CandidateCoverage,
+    pub calls: u64,
+    pub first_ns: u64,
+    pub last_ns: u64,
+}
+
+impl SiteExecution {
+    /// Conserved total: each site's calls counted once, never once per
+    /// candidate. Saturates rather than wrapping on hostile input.
+    pub fn sum_calls(sites: &[SiteExecution]) -> u64 {
+        sites.iter().map(|s| s.calls).fold(0, u64::saturating_add)
+    }
+
+    /// Canonicalize candidate metadata in place: sort classes, sort and
+    /// dedupe candidates. Full-struct equality keeps a weak alias
+    /// distinct from an otherwise identical strong one.
+    fn normalize(&mut self) {
+        for c in &mut self.candidates {
+            c.algorithm_classes.sort();
+            c.algorithm_classes.dedup();
+        }
+        self.candidates.sort();
+        self.candidates.dedup();
+    }
+}
+
+/// Three-valued predicate outcome over one candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum PredicateMatch {
+    Yes,
+    No,
+    Unknown,
+}
+
+/// Conserved match bounds for one predicate over a set of sites:
+/// `definite` calls are proved to match; `possible` bounds the calls
+/// that could match, or is `None` when candidate loss makes the upper
+/// bound unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MatchBounds {
+    pub definite: u64,
+    pub possible: Option<u64>,
+}
+
+/// Per-site bound outcomes. A site contributes its calls to `definite`
+/// only when every candidate matches and the set is complete; it
+/// contributes to `possible` whenever any candidate matches or is
+/// unknown. An empty candidate set proves nothing either way: absence
+/// of attribution is not absence of use.
+fn site_bound(
+    site: &SiteExecution,
+    predicate: &dyn Fn(&CandidateIdentity) -> PredicateMatch,
+) -> (u64, Option<u64>) {
+    if site.calls == 0 {
+        // No activity to attribute: known-zero on both bounds however
+        // incomplete the candidate set is.
+        return (0, Some(0));
+    }
+    if site.candidates_coverage == CandidateCoverage::Unknown {
+        // Incomplete set: no lower-bound assertion, unbounded upper.
+        return (0, None);
+    }
+    if site.candidates.is_empty() {
+        return (0, Some(site.calls));
+    }
+    let mut all_yes = true;
+    let mut any_yes_or_unknown = false;
+    for c in &site.candidates {
+        match predicate(c) {
+            PredicateMatch::Yes => {
+                any_yes_or_unknown = true;
+            }
+            PredicateMatch::No => {
+                all_yes = false;
+            }
+            PredicateMatch::Unknown => {
+                all_yes = false;
+                any_yes_or_unknown = true;
+            }
+        }
+    }
+    if all_yes {
+        (site.calls, Some(site.calls))
+    } else if any_yes_or_unknown {
+        // Mixed or unknown between candidates: possible but unproven.
+        (0, Some(site.calls))
+    } else {
+        // Every candidate says no: proved absence at this site.
+        (0, Some(0))
+    }
+}
+
+/// Compute conserved definite/possible bounds without duplicating any
+/// site. Ambiguity between candidates shapes both bounds; ambiguity
+/// inside one alias list is the predicate's job
+/// (see `crate::policy::Predicate`).
+pub fn match_bounds(
+    sites: &[SiteExecution],
+    predicate: &dyn Fn(&CandidateIdentity) -> PredicateMatch,
+) -> MatchBounds {
+    let mut definite = 0u64;
+    let mut possible = Some(0u64);
+    for site in sites {
+        let (d, p) = site_bound(site, predicate);
+        definite = definite.saturating_add(d);
+        possible = match (possible, p) {
+            (Some(a), Some(b)) => Some(a.saturating_add(b)),
+            _ => None,
+        };
+    }
+    MatchBounds { definite, possible }
+}
+
+/// Policy verdict for one rule (R06). `Inconclusive` is fail-closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RuleVerdict {
+    Pass,
+    Violation,
+    Inconclusive,
+}
+
+/// What the observer expected to instrument for one scope unit (one
+/// provider/operation area). `NotApplicable` (nothing expected) differs
+/// from `Unknown` (denominator unknowable, never complete).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum ExpectedScope {
+    Applicable { sites: u64 },
+    NotApplicable,
+    Unknown,
+}
+
+/// Readiness for one scope: what was expected, discovered and attached.
+/// Coverage is about instrumentation, not about which operations fired:
+/// quiet but fully attached sites are covered, not gaps.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ScopeCoverage {
+    pub scope: String,
+    pub expected: ExpectedScope,
+    pub discovered: u64,
+    pub attached: u64,
+}
+
+impl ScopeCoverage {
+    pub fn is_complete(&self) -> bool {
+        match self.expected {
+            ExpectedScope::NotApplicable => true,
+            ExpectedScope::Unknown => false,
+            ExpectedScope::Applicable { sites } => {
+                self.discovered >= sites && self.attached >= sites
+            }
+        }
+    }
+
+    /// Typed gaps for this scope; empty exactly when complete.
+    pub fn gaps(&self) -> Vec<GapReason> {
+        match self.expected {
+            ExpectedScope::NotApplicable => Vec::new(),
+            ExpectedScope::Unknown => vec![GapReason::UnknownDenominator {
+                scope: self.scope.clone(),
+            }],
+            ExpectedScope::Applicable { sites } => {
+                let mut out = Vec::new();
+                if self.discovered < sites {
+                    out.push(GapReason::UndiscoveredSites {
+                        scope: self.scope.clone(),
+                        missing: sites - self.discovered,
+                    });
+                }
+                if self.attached < sites {
+                    out.push(GapReason::UnattachedSites {
+                        scope: self.scope.clone(),
+                        missing: sites - self.attached,
+                    });
+                }
+                out
+            }
+        }
+    }
+}
+
+/// Whether a counter records integrity/coverage loss (forces PARTIAL
+/// when positive) or ordinary non-gap activity (never forces PARTIAL).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum CounterKind {
+    Loss,
+    Activity,
+}
+
+/// Units of a gap/activity counter, published with every counter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum CounterUnits {
+    Calls,
+    Sites,
+    TableRows,
+    Events,
+    Probes,
+}
+
+/// Source that produced a counter value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum CounterSource {
+    KernelRing,
+    KernelMap,
+    Discovery,
+    Attach,
+    Drain,
+    Lifecycle,
+    Setup,
+}
+
+/// One source-tagged counter with its units and loss/activity kind.
+/// Field order defines the total document order: `name` first so the
+/// primary key stays human-stable, full record after for ties.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct GapCounter {
+    pub name: String,
+    pub kind: CounterKind,
+    pub units: CounterUnits,
+    pub source: CounterSource,
+    pub value: u64,
+}
+
+impl GapCounter {
+    /// Only positive loss forces PARTIAL. Activity counters — including
+    /// "unseen op" tallies that are mere observations — never do.
+    pub fn forces_partial(&self) -> bool {
+        matches!(self.kind, CounterKind::Loss) && self.value > 0
+    }
+}
+
+/// Typed reason a window is not COMPLETE.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum GapReason {
+    UnknownDenominator {
+        scope: String,
+    },
+    UndiscoveredSites {
+        scope: String,
+        missing: u64,
+    },
+    UnattachedSites {
+        scope: String,
+        missing: u64,
+    },
+    Loss {
+        counter: String,
+        source: CounterSource,
+        value: u64,
+    },
+    UnattributedCalls {
+        sites: u64,
+        calls: u64,
+    },
+    StartupGap {
+        missing_ns: u64,
+    },
+    TailGap {
+        missing_ns: u64,
+    },
+    SignalCut,
+}
+
+/// Requested versus effective coverage boundaries. Any unobserved
+/// interval inside the requested window is a gap; starting the visible
+/// clock late cannot erase setup activity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaptureWindow {
+    pub requested_start_ns: u64,
+    pub requested_end_ns: u64,
+    pub effective_start_ns: u64,
+    pub effective_end_ns: u64,
+    pub signal_cut: bool,
+}
+
+impl CaptureWindow {
+    pub fn startup_gap_ns(&self) -> u64 {
+        self.effective_start_ns
+            .saturating_sub(self.requested_start_ns)
+    }
+
+    pub fn tail_gap_ns(&self) -> u64 {
+        self.requested_end_ns.saturating_sub(self.effective_end_ns)
+    }
+}
+
+/// Observed code object: verified identity plus a display locator. The
+/// locator is provenance for operators, never identity.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ObjectRecord {
+    pub id: ObjectId,
+    pub device: u64,
+    pub inode: u64,
+    pub display_locator: String,
+}
+
+/// Conserved counts of one fenced generation: same [`SiteExecution`]
+/// shape as current sites so fence crossings preserve candidates.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct FencedGeneration {
+    pub generation: u32,
+    pub sites: Vec<SiteExecution>,
+}
+
+/// Fatal observation failure: nothing usable was captured.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FatalKind {
+    Recycled,
+    AttachZero,
+    Environment(String),
+}
+
+/// Window completeness. COMPLETE means no relevant
+/// integrity/coverage/startup/drain/lifecycle gaps for the stated
+/// scope; positive non-gap activity counters are allowed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Completeness {
+    Complete,
+    Partial {
+        reasons: Vec<GapReason>,
+    },
+    Fatal {
+        kind: FatalKind,
+        reasons: Vec<GapReason>,
+    },
+}
+
+/// Unfinalized capture input. Producers fill this; only [`finalize`]
+/// turns it into a [`CaptureDocument`].
+#[derive(Debug, Clone)]
+pub struct FinalizeInput {
+    pub window: CaptureWindow,
+    pub sites: Vec<SiteExecution>,
+    pub fenced: Vec<FencedGeneration>,
+    pub objects: Vec<ObjectRecord>,
+    pub coverage: Vec<ScopeCoverage>,
+    pub counters: Vec<GapCounter>,
+    pub fatal: Option<FatalKind>,
+}
+
+/// Finalized capture document. All report/check/CBOM formats derive
+/// from this one document for the same window.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaptureDocument {
+    pub schema: String,
+    pub status: Completeness,
+    pub window: CaptureWindow,
+    pub sites: Vec<SiteExecution>,
+    pub fenced: Vec<FencedGeneration>,
+    pub objects: Vec<ObjectRecord>,
+    pub coverage: Vec<ScopeCoverage>,
+    pub counters: Vec<GapCounter>,
+}
+
+impl CaptureDocument {
+    /// Conserved total across current and fenced sites.
+    pub fn total_calls(&self) -> u64 {
+        let current = SiteExecution::sum_calls(&self.sites);
+        self.fenced.iter().fold(current, |acc, g| {
+            acc.saturating_add(SiteExecution::sum_calls(&g.sites))
+        })
+    }
+
+    /// Gap reasons; empty for COMPLETE and (by construction) for fatal
+    /// inputs that carried no other gaps.
+    pub fn reasons(&self) -> &[GapReason] {
+        match &self.status {
+            Completeness::Complete => &[],
+            Completeness::Partial { reasons } | Completeness::Fatal { reasons, .. } => reasons,
+        }
+    }
+}
+
+/// Sole completeness finalizer: canonicalize every list into a total
+/// order independent of arrival order, collect typed gap reasons, and
+/// assign the status. Every sort is a full-record derived order, so
+/// even records sharing a primary key (two same-name counters, two
+/// same-scope coverage rows) serialize deterministically. COMPLETE
+/// requires no fatal failure, no coverage gaps, no positive loss, no
+/// unattributed executed calls, and an effective window covering the
+/// requested window.
+pub fn finalize(mut input: FinalizeInput) -> CaptureDocument {
+    for site in &mut input.sites {
+        site.normalize();
+    }
+    input.sites.sort();
+    for bucket in &mut input.fenced {
+        for site in &mut bucket.sites {
+            site.normalize();
+        }
+        bucket.sites.sort();
+    }
+    input.fenced.sort();
+    input.objects.sort();
+    input.coverage.sort();
+    input.counters.sort();
+
+    let mut reasons: Vec<GapReason> = Vec::new();
+    for scope in &input.coverage {
+        reasons.extend(scope.gaps());
+    }
+    for counter in &input.counters {
+        if counter.forces_partial() {
+            reasons.push(GapReason::Loss {
+                counter: counter.name.clone(),
+                source: counter.source,
+                value: counter.value,
+            });
+        }
+    }
+    let mut unattributed_sites = 0u64;
+    let mut unattributed_calls = 0u64;
+    for site in input
+        .sites
+        .iter()
+        .chain(input.fenced.iter().flat_map(|g| g.sites.iter()))
+    {
+        if site.calls > 0 && site.candidates_coverage == CandidateCoverage::Unknown {
+            unattributed_sites += 1;
+            unattributed_calls = unattributed_calls.saturating_add(site.calls);
+        }
+    }
+    if unattributed_sites > 0 {
+        reasons.push(GapReason::UnattributedCalls {
+            sites: unattributed_sites,
+            calls: unattributed_calls,
+        });
+    }
+    let startup = input.window.startup_gap_ns();
+    if startup > 0 {
+        reasons.push(GapReason::StartupGap {
+            missing_ns: startup,
+        });
+    }
+    let tail = input.window.tail_gap_ns();
+    if tail > 0 {
+        reasons.push(GapReason::TailGap { missing_ns: tail });
+    }
+    if input.window.signal_cut {
+        reasons.push(GapReason::SignalCut);
+    }
+    reasons.sort();
+    reasons.dedup();
+
+    let status = match input.fatal {
+        Some(kind) => Completeness::Fatal { kind, reasons },
+        None if reasons.is_empty() => Completeness::Complete,
+        None => Completeness::Partial { reasons },
+    };
+    CaptureDocument {
+        schema: CAPTURE_SCHEMA_V2.to_string(),
+        status,
+        window: input.window,
+        sites: input.sites,
+        fenced: input.fenced,
+        objects: input.objects,
+        coverage: input.coverage,
+        counters: input.counters,
+    }
+}
