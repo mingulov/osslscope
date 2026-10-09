@@ -54,7 +54,7 @@ pub struct ProgSpec {
 /// task-0 spike (spike-uret.sh GREEN 3/3). T02 adds the two
 /// observer-populated classifier tables (`ALG_CLASS`, `TRIP_CLASS`):
 /// same frozen discipline, same commit as the wire ABI change.
-pub const HARVEST_MAPS: [MapSpec; 10] = [
+pub const HARVEST_MAPS: [MapSpec; 12] = [
     MapSpec {
         name: "EVENTS",
         map_type: 27,
@@ -75,14 +75,30 @@ pub const HARVEST_MAPS: [MapSpec; 10] = [
         name: "PENDING_QUERY",
         map_type: 1,
         key_size: 8,
+        value_size: 16,
+        max_entries: 1024,
+        flags: 0,
+    },
+    MapSpec {
+        name: "TERMD",
+        map_type: 1,
+        key_size: 8,
         value_size: 8,
         max_entries: 1024,
         flags: 0,
     },
     MapSpec {
+        name: "LOSS",
+        map_type: 1,
+        key_size: 4,
+        value_size: 8,
+        max_entries: 32,
+        flags: 0,
+    },
+    MapSpec {
         name: "QUERY_NEXT",
         map_type: 1,
-        key_size: 8,
+        key_size: 16,
         value_size: 8,
         max_entries: 4096,
         flags: 0,

@@ -4,7 +4,7 @@
 //! backing triple, NOT the runtime address) is the golden-comparable
 //! identity. Raw runtime addresses are internal relocation input
 //! only and are never serialized (T02).
-use crate::discovery::{elf, maps};
+use crate::discovery::{coverage, elf, maps};
 use std::path::Path;
 
 /// One harvested dispatch entry. Rows arrive pre-classified: the
@@ -46,10 +46,22 @@ pub struct Stats {
     pub zero_row_ops: Vec<u32>,
     /// `(op, TRUNC bits)` walk overflows (1 = alg array, 2 = dispatch).
     pub truncated: Vec<(u32, u64)>,
+    /// Ops with at least one observed array lacking termination
+    /// proof (T03: a prefix, never COMPLETE).
+    pub unterminated_ops: Vec<u32>,
+    /// `(loss source id, count)` failures (T03: ring-reserve,
+    /// map-update, pending, orphan, undecodable — see
+    /// `coverage::loss_source_name`).
+    pub losses: Vec<(u32, u64)>,
+    /// Walked slots whose identity was lost (T03:
+    /// unreadable/overlong names; unreadable slots emit no rows, so
+    /// this count — not the rows — carries the gap).
+    pub lossy_slots: u64,
     /// Non-default resolution label (`symtab`, `anchor+delta`, `force`).
     pub resolution: Option<String>,
     /// Explicit PARTIAL reason (frozen vocabulary: `anchor-unresolved`,
     /// `no-query-trigger`, `zero-rows`, `zero-row-ops`, `truncated-walk`,
+    /// `prefix-walk`, `unreadable-alg`, `discovery-loss`, `fenced-rows`,
     /// `pid-recycled`).
     pub reason: Option<String>,
     /// Pid-recycle detections this run (exit-6 pin): rows are always
@@ -199,22 +211,30 @@ pub fn emit(
         "rows": jrows,
     });
     // PARTIAL iff an explicit reason, a fenced row, a zero-row op,
-    // or a walk overflow; derived reason ranks fence above
-    // truncation above zero-row-ops (integrity > completeness).
+    // a walk overflow, an unterminated table, any loss, or a lossy
+    // slot; the derived reason is the single shared ranking in
+    // `coverage::primary_reason` (integrity > completeness).
+    let has_loss = stats.losses.iter().any(|(_, n)| *n > 0);
     let partial = stats.reason.is_some()
         || fenced > 0
         || !stats.zero_row_ops.is_empty()
-        || !stats.truncated.is_empty();
+        || !stats.truncated.is_empty()
+        || !stats.unterminated_ops.is_empty()
+        || has_loss
+        || stats.lossy_slots > 0;
     let counts = stats.builtin || partial;
     if partial {
         let reason = stats.reason.clone().unwrap_or_else(|| {
-            if fenced > 0 {
-                "fenced-rows".to_string()
-            } else if stats.truncated.is_empty() {
-                "zero-row-ops".to_string()
-            } else {
-                "truncated-walk".to_string()
-            }
+            coverage::primary_reason(&coverage::ReasonFlags {
+                fenced: fenced > 0,
+                loss: has_loss,
+                unreadable: stats.lossy_slots > 0,
+                truncated: !stats.truncated.is_empty(),
+                prefix: !stats.unterminated_ops.is_empty(),
+                zero_row: !stats.zero_row_ops.is_empty(),
+            })
+            .expect("partial implies a gap")
+            .to_string()
         });
         doc["status"] = "PARTIAL".into();
         doc["reason"] = reason.into();
@@ -237,6 +257,50 @@ pub fn emit(
                 map.insert(op.to_string(), (*bits).into());
             }
             doc["truncated_ops"] = map.into();
+        }
+        if !stats.unterminated_ops.is_empty() {
+            let mut ops = stats.unterminated_ops.clone();
+            ops.sort_unstable();
+            ops.dedup();
+            doc["unterminated_ops"] = ops.into();
+        }
+        // Loss ledger, keyed by stable source name (the JSON map
+        // keeps output order). Unknown ids (newer BPF than
+        // userspace) keep their counts under `unknown_<id>` rather
+        // than vanishing.
+        let mut sums: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
+        let mut unknowns: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
+        for (src, n) in &stats.losses {
+            if *n == 0 {
+                continue;
+            }
+            match coverage::loss_source_name(*src) {
+                Some(name) => {
+                    let e = sums.entry(name).or_default();
+                    *e = e.saturating_add(*n);
+                }
+                None => {
+                    let e = unknowns.entry(*src).or_default();
+                    *e = e.saturating_add(*n);
+                }
+            }
+        }
+        if !sums.is_empty() || !unknowns.is_empty() {
+            let mut map = serde_json::Map::new();
+            let mut names: Vec<&str> = sums.keys().copied().collect();
+            names.sort_unstable();
+            for name in names {
+                map.insert(name.to_string(), sums[name].into());
+            }
+            let mut ids: Vec<u32> = unknowns.keys().copied().collect();
+            ids.sort_unstable();
+            for id in ids {
+                map.insert(format!("unknown_{id}"), unknowns[&id].into());
+            }
+            doc["losses"] = map.into();
+        }
+        if stats.lossy_slots > 0 {
+            doc["lossy_slots"] = stats.lossy_slots.into();
         }
         if stats.foreign_dropped > 0 {
             doc["foreign_rows_dropped"] = stats.foreign_dropped.into();
@@ -428,6 +492,9 @@ mod tests {
             "zero_row_ops",
             "uninstrumented_ops",
             "truncated_ops",
+            "unterminated_ops",
+            "losses",
+            "lossy_slots",
             "foreign_rows_dropped",
             "fenced_rows",
         ] {
@@ -681,6 +748,9 @@ mod tests {
         assert!(doc.get("queries_observed").is_none());
         assert!(doc.get("zero_row_ops").is_none());
         assert!(doc.get("truncated_ops").is_none());
+        assert!(doc.get("unterminated_ops").is_none());
+        assert!(doc.get("losses").is_none());
+        assert!(doc.get("lossy_slots").is_none());
         assert!(doc.get("fenced_rows").is_none());
     }
 
@@ -691,6 +761,9 @@ mod tests {
             queries_observed: 5,
             zero_row_ops: vec![3],
             truncated: vec![(12, 1)],
+            unterminated_ops: vec![12],
+            losses: vec![(osslscope_ebpf_common::LOSS_RING_ROW, 2)],
+            lossy_slots: 1,
             resolution: Some("anchor+delta".into()),
             reason: None,
             foreign_dropped: 2,
@@ -706,12 +779,15 @@ mod tests {
             .collect();
         let doc = emit_backed(&rows, &stats);
         assert_eq!(doc["status"], "PARTIAL");
-        // Truncation outranks zero-row-ops in the derived reason.
-        assert_eq!(doc["reason"], "truncated-walk");
+        // Pipeline loss outranks truncation outranks zero-row-ops.
+        assert_eq!(doc["reason"], "discovery-loss");
         assert_eq!(doc["resolution"], "anchor+delta");
         assert_eq!(doc["queries_observed"], 5);
         assert_eq!(doc["zero_row_ops"], serde_json::json!([3]));
         assert_eq!(doc["truncated_ops"], serde_json::json!({"12": 1}));
+        assert_eq!(doc["unterminated_ops"], serde_json::json!([12]));
+        assert_eq!(doc["losses"], serde_json::json!({"ring_row": 2}));
+        assert_eq!(doc["lossy_slots"], 1);
         assert_eq!(doc["foreign_rows_dropped"], 2);
         assert_eq!(doc["pid_recycled"], 1);
         // Sample rows cover op 1 only → 13 of 14 registry ops rowless.

@@ -26,6 +26,14 @@
 //! while one loop (dispatch walk, as a subprogram) verifies with wide
 //! margin.
 //!
+//! T03 honesty: a prefix is never COMPLETE. The walker records
+//! termination proof (`TERMD[arr] = (op, len)`) on reading the
+//! terminator, flags walk aborts at every slot, advances past
+//! implementation-less slots (stable: freezing would stall), counts
+//! every ring/map failure in `LOSS[src]`, and samples `no_store`
+//! arrays once (slot 0, `TRUNC_NO_STORE`, never proven). TRUNC bits
+//! and LOSS ids are frozen in the shared crate.
+//!
 //! Classify-before-emission (T02, wire ABI v2): target strings are
 //! read into kernel stack scratch (128B alg window, 32B trip window)
 //! and classified in-kernel against the observer-populated
@@ -64,9 +72,14 @@ use aya_ebpf::{
     EbpfContext as _,
 };
 use osslscope_ebpf_common::{
-    AlgClassValue, AlgEvent, InitRetEvent, RowEvent, TripClassValue, TripEvent, TripTaxonomy,
-    ALG_UNREADABLE, ALG_WINDOW, KIND_ALG, KIND_INIT_RET, KIND_QUERY_RET, KIND_ROW, KIND_TRIP,
-    OTHER_CLASS, TRIP_OTHER, TRIP_UNREADABLE, TRIP_WINDOW, classify_alg_with, classify_trip_with,
+    AlgClassValue, AlgEvent, InitRetEvent, PendQuery, RowEvent, TripClassValue, TripEvent,
+    TripTaxonomy, ALG_UNREADABLE, ALG_WINDOW, KIND_ALG, KIND_INIT_RET, KIND_QUERY_RET, KIND_ROW,
+    KIND_TRIP, LOSS_INIT_SCAN, LOSS_MAP_CALLS, LOSS_MAP_LGCALLS, LOSS_MAP_QUERY_NEXT,
+    LOSS_MAP_TERMD, LOSS_MAP_TRIP, LOSS_MAP_TRUNC, LOSS_PENDING_INIT_FULL, LOSS_PENDING_INIT_MISS,
+    LOSS_PENDING_QUERY_FULL, LOSS_PENDING_QUERY_MISS, LOSS_RING_ALG, LOSS_RING_INIT,
+    LOSS_RING_ROW, LOSS_RING_TRIP, OTHER_CLASS, TRIP_OTHER, TRIP_UNREADABLE, TRIP_WINDOW,
+    TRUNC_ALGS, TRUNC_DISPATCH, TRUNC_NO_STORE, TRUNC_WALK_EMPTY, TRUNC_WALK_NAME,
+    TRUNC_WALK_NOIMP, TRUNC_WALK_READ, classify_alg_with, classify_trip_with, make_termd,
 };
 
 /// core_dispatch.h: provider codes live at 1024+; verified 2026-09-16.
@@ -84,31 +97,36 @@ const MAX_ALGS: u64 = 512;
 /// across 3.0/3.5/4.0; 128 keeps the verifier under its 1M processed-insn
 /// ceiling with ~2x margin — overflow fails closed via TRUNC).
 const MAX_DISPATCH: u64 = 128;
-/// TRUNC[op] bits: alg-array overflow | dispatch-table overflow |
-/// walk aborts (entry unreadable | empty table at slot 0 |
-/// implementation-less alg at slot 0 | alg-name unreadable). The
-/// slot-0 aborts are suspicious (a live query returning an
-/// unwalkable first entry); later-slot terminators stay silent.
-const TRUNC_ALGS: u64 = 1;
-const TRUNC_DISPATCH: u64 = 2;
-const TRUNC_WALK_READ: u64 = 4;
-const TRUNC_WALK_EMPTY: u64 = 8;
-const TRUNC_WALK_NOIMP: u64 = 16;
-const TRUNC_WALK_NAME: u64 = 32;
+/// `QUERY_NEXT` sentinel for `no_store` arrays: the persistent
+/// counter is meaningless for uncacheable tables (T03: sampled once,
+/// never advanced). Unreachable by real query counts.
+const NS_FROZEN: u64 = u64::MAX;
 
 #[map]
 static EVENTS: RingBuf = RingBuf::with_byte_size(1 << 21, 0);
 #[map]
 static PENDING_INIT: HashMap<u64, u64> = HashMap::with_max_entries(1024, 0);
+/// Entry→return pairs: op + caller `no_store` out-pointer (16-byte
+/// values; T03 widens the shape to honor provider lifetimes).
 #[map]
-static PENDING_QUERY: HashMap<u64, u64> = HashMap::with_max_entries(1024, 0);
+static PENDING_QUERY: HashMap<u64, PendQuery> = HashMap::with_max_entries(1024, 0);
+/// Termination proofs: array base → packed (op, live-slot count)
+/// (T03: a table without proof is a prefix, never COMPLETE).
+#[map]
+static TERMD: HashMap<u64, u64> = HashMap::with_max_entries(1024, 0);
+/// Source-tagged failure counters (T03: every ring-reserve and
+/// map-update failure lands here; keys are the `LOSS_*` ids).
+#[map]
+static LOSS: HashMap<u32, u64> = HashMap::with_max_entries(32, 0);
 /// Per-(thread, array) query count; walked index = count % MAX_ALGS.
-/// Keyed by array address (each provider-op array is a distinct static):
-/// different providers' same-op arrays must NOT share a counter, and
-/// the counter freezes at the first terminator (see query_return), so
+/// Keyed by the composite (pid_tgid, array address) pair — each
+/// provider-op array is a distinct static, so different providers'
+/// same-op arrays must NOT share a counter, and an XOR-folded key
+/// could collide across threads (T03: composite, never folded). The
+/// counter freezes at the first terminator (see query_return), so
 /// short arrays never walk past their end into adjacent tables.
 #[map]
-static QUERY_NEXT: HashMap<u64, u64> = HashMap::with_max_entries(4096, 0);
+static QUERY_NEXT: HashMap<u128, u64> = HashMap::with_max_entries(4096, 0);
 /// Walk-overflow flags per op id; userspace degrades to PARTIAL.
 #[map]
 static TRUNC: HashMap<u32, u64> = HashMap::with_max_entries(64, 0);
@@ -137,10 +155,21 @@ static ALG_CLASS: HashMap<u64, AlgClassValue> = HashMap::with_max_entries(1024, 
 #[map]
 static TRIP_CLASS: HashMap<u64, TripClassValue> = HashMap::with_max_entries(64, 0);
 
+/// Source-tagged loss bump (T03: ring-exhaustion and map-update
+/// failures are counted, never silent). The LOSS insert itself is
+/// the one uncounted residual (15 keys in 32 slots: effectively
+/// never full).
+fn bump_loss(src: u32) {
+    let cur = unsafe { LOSS.get_ptr(&src).map(|p| *p).unwrap_or(0) };
+    let _ = LOSS.insert(src, cur.wrapping_add(1), 0);
+}
+
 fn emit_alg(ev: &AlgEvent) {
     if let Some(mut e) = EVENTS.reserve::<AlgEvent>(0) {
         e.write(*ev);
         e.submit(0);
+    } else {
+        bump_loss(LOSS_RING_ALG);
     }
 }
 
@@ -148,6 +177,8 @@ fn emit_row(ev: &RowEvent) {
     if let Some(mut e) = EVENTS.reserve::<RowEvent>(0) {
         e.write(*ev);
         e.submit(0);
+    } else {
+        bump_loss(LOSS_RING_ROW);
     }
 }
 
@@ -155,6 +186,8 @@ fn emit_trip(ev: &TripEvent) {
     if let Some(mut e) = EVENTS.reserve::<TripEvent>(0) {
         e.write(*ev);
         e.submit(0);
+    } else {
+        bump_loss(LOSS_RING_TRIP);
     }
 }
 
@@ -162,6 +195,8 @@ fn emit_init_ret(ev: &InitRetEvent) {
     if let Some(mut e) = EVENTS.reserve::<InitRetEvent>(0) {
         e.write(*ev);
         e.submit(0);
+    } else {
+        bump_loss(LOSS_RING_INIT);
     }
 }
 
@@ -188,10 +223,12 @@ fn cookie_of(ctx: &ProbeContext) -> u64 {
 
 fn bump_trip(cookie: u64) {
     let cur = unsafe { TRIP.get_ptr(&cookie).map(|p| *p).unwrap_or(0) };
-    let _ = TRIP.insert(cookie, cur.wrapping_add(1), 0);
+    if TRIP.insert(cookie, cur.wrapping_add(1), 0).is_err() {
+        bump_loss(LOSS_MAP_TRIP);
+    }
 }
 
-fn take_key(map: &HashMap<u64, u64>, key: u64) -> Option<u64> {
+fn take_key<V: Copy>(map: &HashMap<u64, V>, key: u64) -> Option<V> {
     let val = unsafe { *map.get_ptr(&key)? };
     let _ = map.remove(&key);
     Some(val)
@@ -208,7 +245,26 @@ fn pend_key(cookie: u64) -> u64 {
 
 fn flag_trunc(op: u32, bit: u64) {
     let cur = unsafe { TRUNC.get_ptr(&op).map(|p| *p).unwrap_or(0) };
-    let _ = TRUNC.insert(op, cur | bit, 0);
+    if TRUNC.insert(op, cur | bit, 0).is_err() {
+        bump_loss(LOSS_MAP_TRUNC);
+    }
+}
+
+/// Record termination proof for an array (T03). Insert failures are
+/// counted — a lost proof must read as a gap, never as COMPLETE.
+fn record_termd(arr: u64, op: u32, len: u64) {
+    if TERMD.insert(arr, make_termd(op, len as u32), 0).is_err() {
+        bump_loss(LOSS_MAP_TERMD);
+    }
+}
+
+/// Advance the per-(thread, array) counter past a fully-observed
+/// slot. Insert failures freeze the counter (retry next query) and
+/// are counted.
+fn advance_next(key: u128, count: u64) {
+    if QUERY_NEXT.insert(key, count.wrapping_add(1), 0).is_err() {
+        bump_loss(LOSS_MAP_QUERY_NEXT);
+    }
 }
 
 /// OSSL_provider_init(handle, in, out, provctx): stash arg2 (out).
@@ -218,7 +274,12 @@ pub fn init_entry(ctx: ProbeContext) -> u32 {
         Some(v) => v,
         None => return 0,
     };
-    let _ = PENDING_INIT.insert(pend_key(cookie_of(&ctx)), out, 0);
+    if PENDING_INIT
+        .insert(pend_key(cookie_of(&ctx)), out, 0)
+        .is_err()
+    {
+        bump_loss(LOSS_PENDING_INIT_FULL);
+    }
     0
 }
 
@@ -230,7 +291,12 @@ pub fn init_return(ctx: RetProbeContext) -> u32 {
     let cookie = unsafe { helpers::bpf_get_attach_cookie(ctx.as_ptr()) };
     let out = match take_key(&PENDING_INIT, pend_key(cookie)) {
         Some(v) => v,
-        None => return 0,
+        // Return without entry (in flight during attach, or the
+        // entry insert failed): the init is unobservable — a gap.
+        None => {
+            bump_loss(LOSS_PENDING_INIT_MISS);
+            return 0;
+        }
     };
     let rv: u64 = ctx.ret();
     if rv != 1 || out == 0 {
@@ -238,7 +304,13 @@ pub fn init_return(ctx: RetProbeContext) -> u32 {
     }
     let table = match unsafe { helpers::bpf_probe_read_user(out as *const u64) } {
         Ok(v) => v,
-        Err(_) => return 0,
+        // The stage-1 anchor read failed (cold page on a fresh
+        // mapping): no INIT_RET event follows, so the miss is
+        // counted here or the blind stage-2 has no cause.
+        Err(_) => {
+            bump_loss(LOSS_INIT_SCAN);
+            return 0;
+        }
     };
     if table == 0 {
         return 0;
@@ -249,9 +321,13 @@ pub fn init_return(ctx: RetProbeContext) -> u32 {
         let fid = unsafe { helpers::bpf_probe_read_user(base as *const u32) };
         let fptr = unsafe { helpers::bpf_probe_read_user((base + 8) as *const u64) };
         let (Ok(fid), Ok(fptr)) = (fid, fptr) else {
+            bump_loss(LOSS_INIT_SCAN);
             return 0;
         };
         if fid == 0 {
+            // Clean terminator without a query operation: a
+            // definitive (broken-provider) shape, loud downstream
+            // via the blind stage-2 — not scan loss.
             return 0;
         }
         if fid == OSSL_FUNC_PROVIDER_QUERY_OPERATION && fptr != 0 {
@@ -266,6 +342,9 @@ pub fn init_return(ctx: RetProbeContext) -> u32 {
             return 0;
         }
     }
+    // Sixteen entries without a terminator or a query operation: a
+    // truncated scan, counted or the blind stage-2 has no cause.
+    bump_loss(LOSS_INIT_SCAN);
     0
 }
 
@@ -337,16 +416,29 @@ pub fn trip_str1(ctx: ProbeContext) -> u32 {
     0
 }
 
-/// query_operation(provctx, operation_id, no_store): stash arg1 (op).
-/// Same arg position for the core wrapper
-/// ossl_provider_query_operation(prov, op, no_cache) on 3.0/3.5/4.0.
+/// query_operation(provctx, operation_id, no_store): stash arg1
+/// (op) plus arg2 (the caller's `no_store` out-pointer, read back
+/// at return). Same arg positions for the core wrapper
+/// ossl_provider_query_operation(prov, op, no_cache) on 3.0/3.5/4.0,
+/// which passes the provider's verdict straight through; a missed
+/// or misread pointer fails closed to `no_store` (loud PARTIAL, and
+/// the live lane confirms the wrapper shape on the default
+/// provider).
 #[uprobe]
 pub fn query_entry(ctx: ProbeContext) -> u32 {
     let op: u64 = match ctx.arg(1) {
         Some(v) => v,
         None => return 0,
     };
-    let _ = PENDING_QUERY.insert(pend_key(cookie_of(&ctx)), op, 0);
+    // A missing arg2 stashes a NULL pointer: the return-side read
+    // then fails and the array is treated as `no_store`.
+    let ns_ptr: u64 = ctx.arg(2).unwrap_or(0);
+    if PENDING_QUERY
+        .insert(pend_key(cookie_of(&ctx)), PendQuery { op, ns_ptr }, 0)
+        .is_err()
+    {
+        bump_loss(LOSS_PENDING_QUERY_FULL);
+    }
     0
 }
 
@@ -385,16 +477,30 @@ fn walk_dispatch(imp: u64, op: u32, arr: u64, j: u64) -> u64 {
 /// (index = per-(thread, array) query count mod 512) plus its dispatch
 /// table. The counter freezes at the first terminator (names == 0):
 /// later hits re-read the terminator and stop, so short arrays never
-/// walk past their end (impl-less algs still advance — they can sit
-/// mid-array). OSSL_ALGORITHM = { names, props, impl, desc } @32B.
+/// walk past their end. OSSL_ALGORITHM = { names, props, impl, desc }
+/// @32B.
+///
+/// T03 honesty: the walker records termination proof (`TERMD`) when
+/// it reads the terminator, flags walk aborts at EVERY slot (not
+/// just slot 0), advances past implementation-less slots (they are
+/// stable observations, not transient failures — freezing on them
+/// stalls the op forever), counts every ring/map failure in `LOSS`,
+/// and samples `no_store` arrays once (slot 0, no persistent
+/// counter, never termination proof).
 #[uretprobe]
 pub fn query_return(ctx: RetProbeContext) -> u32 {
     // Cookie 1 = legacy attachment: its calls stay out of CALLS.
     let cookie = unsafe { helpers::bpf_get_attach_cookie(ctx.as_ptr()) };
-    let op = match take_key(&PENDING_QUERY, pend_key(cookie)) {
+    let pend = match take_key(&PENDING_QUERY, pend_key(cookie)) {
         Some(v) => v,
-        None => return 0,
+        // Return without entry (in flight during attach, or the
+        // entry insert failed): the query is unobservable — a gap.
+        None => {
+            bump_loss(LOSS_PENDING_QUERY_MISS);
+            return 0;
+        }
     };
+    let op = pend.op;
     let rv: u64 = ctx.ret();
     if rv == 0 {
         return 0;
@@ -402,14 +508,66 @@ pub fn query_return(ctx: RetProbeContext) -> u32 {
     let legacy = cookie == 1;
     if legacy {
         let calls = unsafe { LGCALLS.get_ptr(&(op as u32)).map(|p| *p).unwrap_or(0) };
-        let _ = LGCALLS.insert(op as u32, calls.wrapping_add(1), 0);
+        if LGCALLS
+            .insert(op as u32, calls.wrapping_add(1), 0)
+            .is_err()
+        {
+            bump_loss(LOSS_MAP_LGCALLS);
+        }
     } else {
         let calls = unsafe { CALLS.get_ptr(&(op as u32)).map(|p| *p).unwrap_or(0) };
-        let _ = CALLS.insert(op as u32, calls.wrapping_add(1), 0);
+        if CALLS.insert(op as u32, calls.wrapping_add(1), 0).is_err() {
+            bump_loss(LOSS_MAP_CALLS);
+        }
     }
-    let key = helpers::bpf_get_current_pid_tgid() ^ rv;
-    let count = unsafe { QUERY_NEXT.get_ptr(&key).map(|p| *p).unwrap_or(0) };
-    let j = count % MAX_ALGS;
+    // The provider's lifetime verdict, read once from the caller's
+    // out-pointer in this valid return context. Only an explicit 0
+    // is cacheable; any nonzero verdict, NULL pointer, or read
+    // failure fails closed to `no_store`.
+    let no_store = match unsafe { helpers::bpf_probe_read_user(pend.ns_ptr as *const u32) } {
+        Ok(0) => false,
+        _ => true,
+    };
+    // Composite cursor key: pid_tgid in the high half, array base
+    // in the low half. Never XOR-folded: two (thread, array) pairs
+    // must never share a walk position.
+    let key = ((helpers::bpf_get_current_pid_tgid() as u128) << 64) | (rv as u128);
+    let stored = unsafe { QUERY_NEXT.get_ptr(&key).map(|p| *p) };
+    if no_store {
+        // Uncacheable table: the persistent counter is meaningless
+        // (the array may be freed or mutated between queries), so
+        // this path samples slot 0 exactly once per (thread,
+        // array) — no advance, no termination proof, ever. Later
+        // queries only refresh the call count and the sticky bit.
+        // FULL slot-0 sampling (not just liveness) still runs
+        // below on the first observation; transient sample aborts
+        // fail closed to PARTIAL rather than spamming retries.
+        flag_trunc(op as u32, TRUNC_NO_STORE);
+        if stored.is_some() {
+            // Poison any stale positional count (cacheable→no_store
+            // flip): the array is uncacheable now, so a later flip
+            // back to cacheable must restart the walk at slot 0
+            // rather than resume a position across the gap.
+            if stored != Some(NS_FROZEN)
+                && QUERY_NEXT.insert(key, NS_FROZEN, 0).is_err()
+            {
+                bump_loss(LOSS_MAP_QUERY_NEXT);
+            }
+            return 0;
+        }
+        if QUERY_NEXT.insert(key, NS_FROZEN, 0).is_err() {
+            bump_loss(LOSS_MAP_QUERY_NEXT);
+        }
+    }
+    let mut count = stored.unwrap_or(0);
+    // A `no_store`→cacheable flip (provider verdicts may change
+    // across queries): the frozen sentinel is not a position, so
+    // the walk restarts at slot 0.
+    if !no_store && count == NS_FROZEN {
+        count = 0;
+    }
+    // `no_store` first observations always sample slot 0.
+    let j = if no_store { 0 } else { count % MAX_ALGS };
     if count == 0 {
         emit_row(&RowEvent {
             kind: KIND_QUERY_RET,
@@ -425,37 +583,51 @@ pub fn query_return(ctx: RetProbeContext) -> u32 {
     let names = unsafe { helpers::bpf_probe_read_user(base as *const u64) };
     let imp = unsafe { helpers::bpf_probe_read_user((base + 16) as *const u64) };
     let (Ok(names), Ok(imp)) = (names, imp) else {
-        if j == 0 {
-            flag_trunc(op as u32, TRUNC_WALK_READ);
-        }
+        // Unreadable slot at ANY position aborts this query's walk;
+        // the counter freezes so the next query retries the slot.
+        // Sticky: a later success does not clear the flag (fail
+        // closed; pretouch keeps cold pages off this path).
+        flag_trunc(op as u32, TRUNC_WALK_READ);
         return 0;
     };
     if names == 0 {
-        // Terminator: freeze the counter (no insert), stop. Slot 0
-        // empty = the query returned a table with no first alg.
+        // Terminator: freeze the counter (no insert), stop, and
+        // record proof — unless `no_store` (uncacheable tables are
+        // never proven). Slot 0 empty = the query returned a table
+        // with no first alg (suspicious: flagged, still PARTIAL).
+        if !no_store {
+            record_termd(rv, op as u32, j);
+        }
         if j == 0 {
             flag_trunc(op as u32, TRUNC_WALK_EMPTY);
         }
         return 0;
     }
-    if imp == 0 {
-        // Alg without implementation: skipped, like the dumper.
-        // Counter NOT advanced (same as every abort below): the
-        // next hit re-walks this slot instead of sliding past it.
-        if j == 0 {
-            flag_trunc(op as u32, TRUNC_WALK_NOIMP);
-        }
-        return 0;
-    }
     // Overrun guard on the last slot: entries 0..=511 all live means
     // the array may extend past the bound — slot 512 decides (live or
-    // unreadable = TRUNC, terminator = clean).
+    // unreadable = TRUNC, terminator = clean + proof). Runs before
+    // the impl-less skip so a bare slot 511 still guards the tail.
     if j == MAX_ALGS - 1 {
         let tail = unsafe { helpers::bpf_probe_read_user((rv + MAX_ALGS * 32) as *const u64) };
         match tail {
-            Ok(0) => {}
+            Ok(0) => {
+                if !no_store {
+                    record_termd(rv, op as u32, MAX_ALGS);
+                }
+            }
             _ => flag_trunc(op as u32, TRUNC_ALGS),
         }
+    }
+    if imp == 0 {
+        // Alg without implementation: a stable observation (the slot
+        // read fine), so the walk ADVANCES past it — freezing here
+        // would re-walk this slot on every future query and stall
+        // the op forever. The skip is explicit via NOIMP.
+        flag_trunc(op as u32, TRUNC_WALK_NOIMP);
+        if !no_store {
+            advance_next(key, count);
+        }
+        return 0;
     }
     // Kernel scratch only: classified below, never emitted.
     let mut name_buf = [0u8; 128];
@@ -464,9 +636,7 @@ pub fn query_return(ctx: RetProbeContext) -> u32 {
         {
             Ok(s) => s,
             Err(_) => {
-                if j == 0 {
-                    flag_trunc(op as u32, TRUNC_WALK_NAME);
-                }
+                flag_trunc(op as u32, TRUNC_WALK_NAME);
                 // Explicit unreadable record (cold page or hostile
                 // pointer): the counter still freezes so the next
                 // query re-walks this slot instead of losing the alg.
@@ -508,14 +678,20 @@ pub fn query_return(ctx: RetProbeContext) -> u32 {
         // Overflow: rows 0..127 are kept, the rest is unwalkable —
         // advance past like a success, but flag the truncation.
         1 => {
-            let _ = QUERY_NEXT.insert(key, count.wrapping_add(1), 0);
+            if !no_store {
+                advance_next(key, count);
+            }
             flag_trunc(op as u32, TRUNC_DISPATCH);
         }
         0 => {
-            let _ = QUERY_NEXT.insert(key, count.wrapping_add(1), 0);
+            if !no_store {
+                advance_next(key, count);
+            }
         }
-        // Read abort: no insert (freeze for re-walk).
-        _ => {}
+        // Read abort: flag (all slots) and freeze for re-walk.
+        _ => {
+            flag_trunc(op as u32, TRUNC_WALK_READ);
+        }
     }
     0
 }

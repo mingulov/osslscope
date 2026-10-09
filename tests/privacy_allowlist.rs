@@ -82,7 +82,7 @@ fn map_inventory_matches_sources() {
     actual.extend(maps_from_source(
         &manifest_dir().join("crates/ebpf/src/bin/count.rs"),
     ));
-    assert_eq!(actual.len(), 14, "unexpected map count: {actual:?}");
+    assert_eq!(actual.len(), 16, "unexpected map count: {actual:?}");
     assert_eq!(
         expected, actual,
         "allowlist inventory drifted from eBPF maps"
@@ -102,7 +102,7 @@ fn probe_read_allowlist_is_complete() {
     let str_reads = harvest
         .match_indices("bpf_probe_read_user_str_bytes")
         .count();
-    assert_eq!(total, 10, "expected 10 probe-read sites, found {total}");
+    assert_eq!(total, 11, "expected 11 probe-read sites, found {total}");
     assert_eq!(str_reads, 2, "expected 2 string reads, found {str_reads}");
     assert!(harvest.contains("[0u8; 32]"), "trip string bound missing");
     assert!(
