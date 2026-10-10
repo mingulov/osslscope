@@ -21,8 +21,12 @@ installed
     != EXECUTED
 ```
 
-> **Status: v1.0.0 released (doctor/inspect/report/check/alias-audit work end to end).**
-> Stack: Rust 1.88 + Aya 0.14 (raw multi-link primary) -- confirmed at the P0 gate.
+> **Status: development (unreleased).** The tree is mid-continuation toward
+> the v2 evidence contract (`docs/observed-crypto-v2.md`); the last
+> packaged baseline is 1.0.0 and no packages built from this branch are
+> final distributables. Build and install locally per
+> [build](docs/build.md) and [install](docs/install.md).
+> Stack: Rust 1.88 + Aya 0.14 (raw multi-link primary).
 > Specs appear under `docs/`; see `docs/README.md`.
 
 ## Why
@@ -62,7 +66,8 @@ See [the side-by-side gap matrix](docs/trace-gap.md).
 - [Promotion checklist](docs/promotion-checklist.md) --
   staging to production
 - [Operator's guide](docs/usage.md) -- CLI usage for all commands
-- [Install](docs/install.md) -- packages, file caps, doctor-first verify
+- [Build from source](docs/build.md) -- host + BPF entrypoint, manifests, lockfiles
+- [Install](docs/install.md) -- local prefix and packages, file caps, doctor-first verify
 - [Built-in provider runbook](docs/builtin-runbook.md) --
   stripped/unknown libcrypto
 - [osslscope vs OSSL_TRACE](docs/trace-gap.md) -- gap matrix
@@ -71,52 +76,49 @@ See [the side-by-side gap matrix](docs/trace-gap.md).
 - [Privacy residuals](docs/privacy/residuals.md) --
   what the guarantee does not cover
 
-## Build
+## Build and install (development)
 
-Prerequisites: Linux x86-64, kernel >= 6.9, Rust 1.88 (pinned by
-`rust-toolchain.toml`) plus nightly-2026-05-20 with `rust-src` for
-the eBPF object.
+Prerequisites: Linux x86-64, kernel >= 6.9, Rust 1.88 plus
+nightly-2026-05-20 with `rust-src` and `bpf-linker` 0.10.4 — see
+[build](docs/build.md). One entrypoint builds host + BPF:
 
 ```sh
-cargo build --locked
-(cd crates/ebpf && cargo +nightly-2026-05-20 build -Z build-std=core \
-    --target bpfel-unknown-none --release \
-    --bin osslscope-harvest --bin osslscope-count)
+./scripts/build-dev.sh                # writes target/dev-build-manifest.json
+./scripts/install-dev.sh              # installs into $HOME/.local (default prefix)
 ```
-
-This produces the two BPF objects `report`/`check` need via flags:
-
-- `--object crates/ebpf/target/bpfel-unknown-none/release/osslscope-harvest`
-- `--count-object crates/ebpf/target/bpfel-unknown-none/release/osslscope-count`
 
 First run (one-time setup, then least-privilege runs):
 
 ```sh
-sudo setcap 'cap_bpf,cap_perfmon=ep' target/debug/osslscope
-./target/debug/osslscope doctor   # preflight; must print verdict: ok
+sudo setcap 'cap_bpf,cap_perfmon=ep' "$HOME/.local/bin/osslscope"
+"$HOME/.local/bin/osslscope" doctor   # preflight; must print verdict: ok
 ```
 
-Observe a command (30 s default window, human report):
+The prefix layout is `$PREFIX/bin/osslscope` plus both BPF objects
+under `$PREFIX/lib/osslscope/`, which `report`/`check` need via
+flags until default object resolution lands:
 
 ```sh
-./target/debug/osslscope report --provider /path/to/provider.so \
-    --object <harvest above> --count-object <count above> \
+"$HOME/.local/bin/osslscope" report --provider /path/to/provider.so \
+    --object "$HOME/.local/lib/osslscope/osslscope-harvest" \
+    --count-object "$HOME/.local/lib/osslscope/osslscope-count" \
     run -- my-app --serve
 ```
 
-Gate a window in CI (exit 10 on violation; `--help` lists all rules):
+Gate a window in CI (one rule minimum; `--help` lists all rules):
 
 ```sh
-./target/debug/osslscope check --provider /path/to/provider.so \
-    --object <harvest> --count-object <count> \
+"$HOME/.local/bin/osslscope" check --provider /path/to/provider.so \
+    --object <harvest above> --count-object <count above> \
     --deny-weak --deny-provider legacy --format json --out gate.json \
     run -- my-app --smoke-test
-echo $?  # 0 clean, 10 violation, 3 PARTIAL, 4 environment, 2 usage
+echo $?  # 0 clean, 10 violation, 11 inconclusive, 3 PARTIAL, 4 environment, 2 usage, 1 child/artifact failure
 ```
 
-Installable packages (deb/rpm): build per
+System packages (deb/rpm): build per
 [packaging/README.md](packaging/README.md), then follow
-[docs/install.md](docs/install.md) (doctor-first).
+[docs/install.md](docs/install.md) (doctor-first). Packages from
+this branch are development snapshots, not final distributables.
 
 ## What it will NOT do
 

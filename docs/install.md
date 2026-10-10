@@ -3,12 +3,76 @@
 
 `osslscope` proves which OpenSSL crypto implementations actually
 execute in a running Linux application — without changing the
-application. Install the package, then start with `doctor`: it
-preflights the environment (kernel, caps, LSM, lockdown) and prints
-`verdict: ok` when the machine can observe, or `verdict:
-FAIL-CLOSED` with a remediation when it cannot.
+application. Install the package or a local prefix build, then start
+with `doctor`: it preflights the environment (kernel, caps, LSM,
+lockdown) and prints `verdict: ok` when the machine can observe, or
+`verdict: FAIL-CLOSED` with a remediation when it cannot.
 
 Prerequisites: Linux x86-64, kernel >= 6.9.
+
+> Development status: this branch is unreleased work. No deb/rpm
+> built from it is a final distributable; BPF objects are always
+> operator-built (see [build](build.md)) and are never shipped in a
+> package. For day-to-day development use the local prefix install
+> below.
+
+## Local prefix install (development)
+
+Build once per [build](build.md), then install into a user-owned
+prefix (default `$HOME/.local`):
+
+```sh
+./scripts/build-dev.sh
+./scripts/install-dev.sh --prefix "$HOME/.local"
+```
+
+The prefix layout is the contract default object resolution
+consumes (explicit `--object`/`--count-object` flags remain as
+troubleshooting overrides):
+
+```text
+$PREFIX/bin/osslscope
+$PREFIX/lib/osslscope/osslscope-harvest
+$PREFIX/lib/osslscope/osslscope-count
+$PREFIX/share/doc/osslscope/install.md
+$PREFIX/share/osslscope/install-manifest.json
+```
+
+The installer reads artifact paths from
+`target/dev-build-manifest.json`; pass `--manifest PATH` to use a
+different build, or `--binary F --harvest F --count F` to install
+explicit operator-built objects. Every object is validated before
+copying: the host binary must be an x86-64 ELF executable and the
+BPF objects eBPF relocatables — anything else fails closed with a
+diagnosis. Installing into `/` or `/usr` is refused: `/usr` is
+system package territory.
+
+Grant capabilities once (needs privilege), then verify:
+
+```sh
+sudo setcap cap_bpf,cap_perfmon+ep "$HOME/.local/bin/osslscope"
+getcap "$HOME/.local/bin/osslscope"   # expect: cap_bpf,cap_perfmon+ep
+"$HOME/.local/bin/osslscope" doctor   # expect: verdict: ok
+"$HOME/.local/bin/osslscope" --help   # lists doctor|inspect|report|check|alias-audit
+```
+
+`install-dev.sh --setcap` applies the capabilities during install
+instead of printing the follow-up; it fails deterministically if
+`setcap` is missing or the call is denied (exit 3 with a libcap
+install hint when the tool is absent, exit 1 with the labeled-sudo
+fallback otherwise).
+
+Diagnostics to know:
+
+- Missing `setcap` (`libcap2-bin` on Debian/Ubuntu, `libcap` on
+  Fedora/RHEL) never fails an install or a package transaction;
+  every script prints the labeled-sudo fallback and `doctor`
+  repeats the remediation.
+- `NoNewPrivs=1` in the install report or `NNP=1` in `doctor`
+  means processes exec'd from that environment cannot gain file
+  capabilities — run the installed binary outside it.
+- A stale manifest (artifacts moved or rebuilt elsewhere) fails
+  with a rebuild hint; rerun `scripts/build-dev.sh`.
 
 ## Debian/Ubuntu (.deb)
 
@@ -26,7 +90,10 @@ sudo dnf install ./osslscope-<ver>-1.*.x86_64.rpm
 Both packages install `/usr/bin/osslscope` plus this file at
 `/usr/share/doc/osslscope/install.md`, and grant the binary
 `CAP_BPF`+`CAP_PERFMON` file capabilities at install time so it runs
-unprivileged.
+unprivileged. Upgrading keeps the capabilities: the rpm restores
+them at the end of the transaction even when upgrading from a
+package whose old cleanup script predates the fix (see
+[packaging](../packaging/README.md)).
 
 ## Verify (doctor-first)
 
@@ -46,19 +113,27 @@ osslscope doctor
 
 `doctor` is fail-closed by design: any environment it cannot verify
 ends in `verdict: FAIL-CLOSED` with a `remediate:` line, never a
-silent partial run.
+silent partial run. An unprivileged `doctor` on a fresh install
+reports `FAIL-CLOSED` and names the `setcap` remediation above;
+granting caps flips it to `verdict: ok` on a capable machine.
 
 ## Next steps
 
 - Vet a target before observing: `osslscope doctor --pid PID` (or
   `--libcrypto PATH`).
-- `report`/`check` need operator-built BPF objects, which are
-  intentionally not in the package (build with nightly per the
-  project README, then pass `--object` and `--count-object`).
+- `report`/`check` need BPF objects: with a prefix install they
+  live at `$PREFIX/lib/osslscope/` (pass `--object` and
+  `--count-object` until default resolution lands); packages never
+  ship them, so build per [build](build.md) and pass the flags.
 
 ## Uninstall
 
 ```sh
 sudo dpkg -P osslscope      # deb: purge, removes caps with the binary
 sudo dnf remove osslscope   # rpm
+rm -rf "$HOME/.local/bin/osslscope" "$HOME/.local/lib/osslscope" \
+  "$HOME/.local/share/doc/osslscope" "$HOME/.local/share/osslscope/install-manifest.json"
 ```
+
+The last line removes a default-prefix local install; adjust paths
+for a custom `--prefix`.

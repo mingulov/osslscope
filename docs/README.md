@@ -3,7 +3,8 @@
 
 Product documentation. Start with the README, then:
 
-- `install.md` - package install, doctor-first verify, uninstall
+- `build.md` - reproducible source build (host + BPF), manifests, lockfiles
+- `install.md` - local prefix and package install, doctor-first verify, uninstall
 - `usage.md` - CLI usage (`inspect` / `report` / `check` / `doctor` /
   `alias-audit`)
 - `what-it-proves.md` - claim chain, non-goals, who-should-NOT-adopt
