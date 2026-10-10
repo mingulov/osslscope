@@ -1129,6 +1129,7 @@ pub fn adapt_delta(
     let mut unparsed_dev = 0u64;
     let mut late_attach = 0u64;
     let mut fresh_mapped = 0u64;
+    let mut identity_refreshed = 0u64;
     // triple → (dev string, new candidates, ops, any bad read).
     type Group = (String, Vec<CandidateIdentity>, HashSet<u32>, bool);
     let mut groups: HashMap<(u64, u64, u64), Group> = HashMap::new();
@@ -1226,10 +1227,16 @@ pub fn adapt_delta(
                 if unknown {
                     prior.candidates_coverage = CandidateCoverage::Unknown;
                 }
-                // A conflicting fingerprint for one triple is a
-                // producer contradiction: the count session fails
-                // closed on it; keep the first here so the conflict
-                // surfaces there instead of flapping.
+                if prior.site != site_key {
+                    // Refreshed backing fingerprint (same triple, new
+                    // bytes): forward it so the count session versions
+                    // the meaning at the next fence — the fenced
+                    // generation keeps the old fingerprint, the new
+                    // one carries the new — instead of silently
+                    // reusing the stale identity.
+                    prior.site = site_key;
+                    identity_refreshed += 1;
+                }
                 touched.insert(triple, prior.clone());
             }
             None => {
@@ -1287,6 +1294,15 @@ pub fn adapt_delta(
             CounterUnits::Sites,
             CounterSource::Discovery,
             fresh_mapped,
+        ));
+    }
+    if identity_refreshed > 0 {
+        activity.push(typed_counter(
+            "discovery.site_identity_refreshed",
+            CounterKind::Activity,
+            CounterUnits::Sites,
+            CounterSource::Discovery,
+            identity_refreshed,
         ));
     }
 

@@ -1748,6 +1748,98 @@ fn advertising_fallback_unresolved_is_anonymous() {
     assert!(!id.contains("gone"));
 }
 
+/// Same ELF with a different build-id (one flipped descriptor byte
+/// in the first PT_NOTE): simulates in-place content change for the
+/// identity-refresh pin.
+fn flipped_build_id(bytes: &[u8]) -> Vec<u8> {
+    use goblin::elf::program_header::PT_NOTE;
+    let elf = goblin::elf::Elf::parse(bytes).unwrap();
+    let note = elf
+        .program_headers
+        .iter()
+        .find(|ph| ph.p_type == PT_NOTE)
+        .unwrap();
+    let mut out = bytes.to_vec();
+    // GNU build-id note: namesz(4) + descsz(4) + type(4) + "GNU\0"(4),
+    // descriptor follows — flip a byte well inside it.
+    let at = note.p_offset as usize + 20;
+    out[at] ^= 0x01;
+    let before = osslscope::discovery::elf::read_build_id(bytes).unwrap();
+    let after = osslscope::discovery::elf::read_build_id(&out).unwrap();
+    assert_ne!(before, after, "flip must change the build-id");
+    out
+}
+
+#[test]
+fn refreshed_site_fingerprint_is_forwarded() {
+    // Same backing triple, new file bytes on the second poll: the
+    // adapter re-emits the site with the NEW fingerprint (so the
+    // count session versions it at the next fence) instead of
+    // silently reusing the stale identity.
+    let stage = Stage::fresh("refresh-fwd");
+    let bytes_a = self_bytes();
+    let bytes_b = flipped_build_id(&bytes_a);
+    let staged = stage.write("prov.so", &bytes_a);
+    let live = vec![mapping(&staged)];
+    let fresh: HashSet<(String, u64)> = HashSet::new();
+    let mut state = AdapterState::default();
+    let delta = || DiscoveryDelta {
+        candidates: vec![cand(
+            staged.path.as_str(),
+            backing_of(&staged, 0x100),
+            1,
+            11,
+            "SHA-256",
+            false,
+            "ok",
+        )],
+        tables: vec![terminated(1, 0)],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    };
+    let files_a: HashMap<String, Vec<u8>> = HashMap::from([(staged.path.clone(), bytes_a.clone())]);
+    let first = adapt_delta(
+        &mut state,
+        &delta(),
+        &AdapterCtx {
+            live: &live,
+            files: &files_a,
+            builtin_default: false,
+            fresh: &fresh,
+            post_settle: false,
+            baseline: false,
+        },
+    );
+    assert_eq!(first.delta.discovered.len(), 1);
+    let fp_a = first.delta.discovered[0].site.object.0.clone();
+    assert!(fp_a.starts_with("build:"), "{fp_a}");
+    let files_b: HashMap<String, Vec<u8>> = HashMap::from([(staged.path.clone(), bytes_b.clone())]);
+    let second = adapt_delta(
+        &mut state,
+        &delta(),
+        &AdapterCtx {
+            live: &live,
+            files: &files_b,
+            builtin_default: false,
+            fresh: &fresh,
+            post_settle: false,
+            baseline: false,
+        },
+    );
+    assert_eq!(second.delta.discovered.len(), 1);
+    let fp_b = second.delta.discovered[0].site.object.0.clone();
+    assert!(fp_b.starts_with("build:"), "{fp_b}");
+    assert_ne!(fp_a, fp_b, "stale fingerprint must not be reused");
+    assert!(
+        second
+            .activity
+            .iter()
+            .any(|c| c.name == "discovery.site_identity_refreshed" && c.value == 1),
+        "{:?}",
+        second.activity
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Live lifecycle fixtures: real pids, real custody, no privileges.
 // ---------------------------------------------------------------------------
