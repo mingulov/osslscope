@@ -42,7 +42,8 @@ use crate::count_session::{
     CountBackend, CountDelta, CountDrain, CountSession, DiscoveredSite, FenceReason as CountFence,
 };
 use crate::discovery::session::{
-    CoverageState, DiscoveryDelta, DiscoverySession, DiscoverySnapshot, PollBudget, TripwireDelta,
+    CoverageState, DiscoveryDelta, DiscoverySession, DiscoverySnapshot, PollBudget, Recycled,
+    TripwireDelta,
 };
 use crate::discovery::{coverage, elf, legacy, maps};
 use crate::evidence::{
@@ -67,6 +68,9 @@ pub const DEFAULT_GRACE: Duration = Duration::from_secs(5);
 /// Backpressure, not loss — but the round stays bounded so a busy
 /// ring cannot starve the deadline.
 const MAX_CATCHUP_POLLS: u32 = 8;
+/// Bounded corpse-close wait: covers the `exit_mm`-to-zombie window
+/// (maps already empty, waitpid still blind) through custody.
+const CORPSE_WAIT: Duration = Duration::from_millis(100);
 
 /// Capture run configuration.
 pub struct Config {
@@ -689,49 +693,6 @@ fn detect_fence(prev: &Snapshot, next: &Snapshot) -> Vec<FenceKind> {
         out.push(FenceKind::Exec);
     }
     out
-}
-
-// ---------------------------------------------------------------- corpse close
-
-/// Corpse-close: a spawn target whose maps read empty is dead or
-/// mid-`do_exit` (a live process always maps something — exe, stack,
-/// vdso) — reap it and close cleanly. A bounded blocking wait covers
-/// the `exit_mm`-to-zombie window, where maps are already empty but
-/// `waitpid` still sees nothing. Returns the exit code when reaped;
-/// `None` (impossibly alive, or --pid) falls through to the fence.
-fn reap_corpse(spawn: bool, maps_empty: bool, pid: u32) -> Option<i32> {
-    if !(spawn && maps_empty) {
-        return None;
-    }
-    let mut status = 0;
-    let r = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
-    let mut code = if r > 0 {
-        if libc::WIFEXITED(status) {
-            Some(libc::WEXITSTATUS(status))
-        } else if libc::WIFSIGNALED(status) {
-            Some(128 + libc::WTERMSIG(status))
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-    if code.is_none() {
-        let t0 = Instant::now();
-        while code.is_none() && t0.elapsed() < Duration::from_millis(100) {
-            std::thread::sleep(Duration::from_millis(1));
-            let mut status = 0;
-            let r = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
-            if r > 0 {
-                if libc::WIFEXITED(status) {
-                    code = Some(libc::WEXITSTATUS(status));
-                } else if libc::WIFSIGNALED(status) {
-                    code = Some(128 + libc::WTERMSIG(status));
-                }
-            }
-        }
-    }
-    code
 }
 
 // ---------------------------------------------------------------- target identity
@@ -1638,15 +1599,22 @@ where
             // evidence) — the loop closes instead.
             return Ok(RoundAction::Expired);
         }
-        // Post-read liveness: close corpses, never fence them.
+        // Post-read liveness: close corpses, never fence them. The
+        // bounded wait covers the `exit_mm`-to-zombie window (maps
+        // already empty, waitpid still blind) through custody — never
+        // a raw waitpid outside OwnedTarget.
         if live.is_empty() && owned {
             if let Ok(Some(code)) = self.target.poll_exit() {
                 self.child_exit = Some(code);
                 return Ok(RoundAction::Closed);
             }
-            if let Some(code) = reap_corpse(true, true, pid) {
-                self.child_exit = Some(code);
-                return Ok(RoundAction::Closed);
+            let waited_from = self.clock.now();
+            while self.clock.now().saturating_duration_since(waited_from) < CORPSE_WAIT {
+                self.clock.sleep(Duration::from_millis(1));
+                if let Ok(Some(code)) = self.target.poll_exit() {
+                    self.child_exit = Some(code);
+                    return Ok(RoundAction::Closed);
+                }
             }
         }
         let mut fresh = HashSet::new();
@@ -2151,11 +2119,33 @@ where
             .map(|d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX))
             .unwrap_or(0);
         let effective_end_ns = self.clock.monotonic_ns();
+        // An owned child that already exited was reaped mid-window,
+        // so its /proc entry is gone and the discovery close misreads
+        // that as a pid recycle. Snapshot first: on a spurious
+        // recycle the pre-close state (plus an explicit skipped-join
+        // loss for the missed final map join) survives instead of
+        // losing the whole capture. Foreign targets keep the loud
+        // recycle verdict — their pids really can be reused.
+        let pre_close =
+            (self.info.owned && self.child_exit.is_some()).then(|| self.discovery.snapshot());
         let snapshot = match self.discovery.finish() {
             Ok(snapshot) => snapshot,
             Err(e) => {
                 let _ = self.target.finish_observation();
-                return Err(e.context("discovery finish"));
+                let recycled = e.downcast_ref::<Recycled>().is_some();
+                match (pre_close, recycled) {
+                    (Some(pre), true) => {
+                        self.extra_loss.push(typed_counter(
+                            "discovery.close_join_skipped",
+                            CounterKind::Loss,
+                            CounterUnits::Events,
+                            CounterSource::Discovery,
+                            1,
+                        ));
+                        pre
+                    }
+                    _ => return Err(e.context("discovery finish")),
+                }
             }
         };
         let disposition = self
@@ -2975,9 +2965,7 @@ pub fn run(cfg: &Config, target: Target) -> anyhow::Result<Capture> {
                 Err(e) => {
                     // Mid-attach recycle: fatal verdict, no sessions
                     // held (the count object drops unused).
-                    if e.downcast_ref::<crate::discovery::session::Recycled>()
-                        .is_some()
-                    {
+                    if e.downcast_ref::<Recycled>().is_some() {
                         return Ok(recycled_capture(cfg, &info));
                     }
                     return Err(e.context("discovery attach"));
@@ -3114,29 +3102,6 @@ mod tests {
         assert!(!fips_configured(Path::new("/p/default.so")));
         assert!(!fips_configured(Path::new("/p/FIPS.so")));
         assert!(!fips_configured(Path::new("/p/myfips.so")));
-    }
-
-    #[test]
-    fn reap_corpse_gating() {
-        // --pid path and mapped targets never corpse-close (no wait).
-        assert_eq!(reap_corpse(false, true, std::process::id()), None);
-        assert_eq!(reap_corpse(true, false, std::process::id()), None);
-        // Unwaitable pid (ourselves): bounded wait, then None.
-        let t0 = Instant::now();
-        assert_eq!(reap_corpse(true, true, std::process::id()), None);
-        assert!(t0.elapsed() < Duration::from_secs(5));
-    }
-
-    #[test]
-    fn reap_corpse_reaps_exited_child() {
-        let pid = unsafe { libc::fork() };
-        assert!(pid >= 0);
-        if pid == 0 {
-            unsafe { libc::_exit(7) };
-        }
-        // Exited child (empty maps by kernel construction): reaped
-        // with its code, well inside the bound.
-        assert_eq!(reap_corpse(true, true, pid as u32), Some(7));
     }
 
     #[test]

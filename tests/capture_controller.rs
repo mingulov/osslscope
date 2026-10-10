@@ -21,7 +21,7 @@ use osslscope::count_session::{
 use osslscope::discovery::maps::Mapping;
 use osslscope::discovery::session::{
     BackingRef, CoverageState, DiscoveredCandidate, DiscoveryDelta, DiscoveryLoss,
-    DiscoverySnapshot, PollBudget, TableCoverage, TripwireDelta,
+    DiscoverySnapshot, PollBudget, Recycled, TableCoverage, TripwireDelta,
 };
 use osslscope::evidence::{Completeness, PredicateMatch, match_bounds};
 use osslscope::{plan, target};
@@ -172,6 +172,7 @@ struct FakeDiscovery {
     poll_err_at: HashSet<usize>,
     snapshot: DiscoverySnapshot,
     finish_err: bool,
+    finish_recycled: bool,
     cancel_flag: Option<Rc<Cell<bool>>>,
     polls_done: usize,
     finished: bool,
@@ -214,6 +215,13 @@ impl DiscoveryPort for FakeDiscovery {
             .borrow_mut()
             .log
             .push("discovery_finished".to_string());
+        if self.finish_recycled {
+            // Mirror SessionCore::close on a dead /proc entry: typed
+            // recycle over discarded state.
+            return Err(anyhow::Error::new(Recycled {
+                snapshot: DiscoverySnapshot::default(),
+            }));
+        }
         if self.finish_err {
             anyhow::bail!("injected finish failure");
         }
@@ -558,6 +566,7 @@ struct Harness {
     poll_err_at: HashSet<usize>,
     snapshot: DiscoverySnapshot,
     finish_err: bool,
+    finish_recycled: bool,
     release_err: bool,
     exit_at_ns: Option<u64>,
     exit_code: i32,
@@ -613,6 +622,7 @@ impl Harness {
             poll_err_at: HashSet::new(),
             snapshot: DiscoverySnapshot::default(),
             finish_err: false,
+            finish_recycled: false,
             release_err: false,
             exit_at_ns: None,
             exit_code: 0,
@@ -662,6 +672,7 @@ impl Harness {
             poll_err_at: self.poll_err_at,
             snapshot: self.snapshot,
             finish_err: self.finish_err,
+            finish_recycled: self.finish_recycled,
             cancel_flag: self.cancel_on_poll.then(|| self.cancelled.clone()),
             polls_done: 0,
             finished: false,
@@ -832,6 +843,57 @@ fn already_exited_child_preserves_status() {
     assert!(log.released);
     assert!(log.finished);
     assert!(log.polls >= 1);
+}
+
+#[test]
+fn owned_exit_survives_spurious_recycle_at_finish() {
+    // Owned child exits mid-window and is reaped before the
+    // discovery close, whose pin check then misreads the gone
+    // /proc entry as a recycle. The capture survives on the
+    // pre-close snapshot: exit and disposition preserved, the
+    // skipped final join explicit loss — never a lost capture.
+    let mut h = Harness::fresh("exit-recycle");
+    h.snapshot_attached();
+    h.exit_at_ns = Some(BASE_NS + 100_000_000);
+    h.exit_code = 7;
+    h.finish_recycled = true;
+    let (out, post) = h.run();
+    let c = out.unwrap();
+    assert_eq!(c.child_exit, Some(7));
+    assert!(matches!(
+        c.disposition,
+        Some(target::TargetDisposition::Exited { code: 7 })
+    ));
+    assert_eq!(counter_value(&c, "discovery.close_join_skipped"), 1);
+    assert!(matches!(c.outcome, Outcome::Partial));
+    assert!(post.target_log.borrow().finished);
+}
+
+#[test]
+fn corpse_close_goes_through_custody() {
+    // Empty maps with an exit landing inside the bounded wait: the
+    // round closes through custody (no raw waitpid, no fence on the
+    // corpse, no discovery poll past the death).
+    let mut h = Harness::fresh("corpse");
+    h.snapshot_attached();
+    let mapped = vec![mapping(&h.staged)];
+    h.maps_seq = VecDeque::from([mapped, vec![]]);
+    h.exit_at_ns = Some(BASE_NS + 255_000_000);
+    h.exit_code = 7;
+    h.polls.push_back(DiscoveryDelta::default());
+    // Poll 1 runs only if the round polls past the corpse.
+    h.polls.push_back(DiscoveryDelta {
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    let (out, _) = h.run();
+    let c = out.unwrap();
+    assert_eq!(c.child_exit, Some(7));
+    assert!(matches!(
+        c.disposition,
+        Some(target::TargetDisposition::Exited { code: 7 })
+    ));
+    assert!(has_reason(&c, "no-query"), "{:?}", c.reasons);
 }
 
 #[test]
@@ -1903,6 +1965,7 @@ fn live_observe(test: &str, argv: &[&str], duration: Duration) -> (anyhow::Resul
         poll_err_at: HashSet::new(),
         snapshot,
         finish_err: false,
+        finish_recycled: false,
         cancel_flag: None,
         polls_done: 0,
         finished: false,
