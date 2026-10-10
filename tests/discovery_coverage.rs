@@ -450,6 +450,59 @@ fn partial_delta_retains_reasons() {
     );
 }
 
+#[test]
+fn single_query_full_walk_covers_late_slot() {
+    // Host-side contract for a future complete walker (T14r5: the
+    // in-kernel multi-slot walk proved verifier-infeasible — see the
+    // round-5 handoff — so the kernel still emits prefix streams;
+    // this pins the accounting a future walker feeds): a single
+    // query-ret plus ALG records for slots 0..30 plus the len-30
+    // proof terminates the table — the later slot (idx 29, the G02
+    // ECDSA shape) is covered with a one-query oracle, not 30.
+    const OP_SIGNATURE: u32 = 12;
+    let mut t = CoverageTracker::new();
+    t.note_query_ret(OP_SIGNATURE, ARR);
+    for idx in 0..30u64 {
+        t.note_alg(OP_SIGNATURE, ARR, idx, false);
+    }
+    t.ingest_termd(&[(ARR, wire::make_termd(OP_SIGNATURE, 30))]);
+    assert_eq!(
+        t.table_state(OP_SIGNATURE, ARR),
+        TableState::Terminated { len: 30 }
+    );
+    assert!(t.unterminated_ops().is_empty());
+    assert!(t.is_complete());
+
+    // The walked set is exactly 0..30 (a sampler's 1-query prefix
+    // would hold one slot and stay InProgress — pinned by contrast).
+    let mut prefix = CoverageTracker::new();
+    prefix.note_query_ret(OP_SIGNATURE, ARR);
+    prefix.note_alg(OP_SIGNATURE, ARR, 0, false);
+    assert_eq!(
+        prefix.table_state(OP_SIGNATURE, ARR),
+        TableState::InProgress { walked: 1 }
+    );
+    assert_eq!(prefix.unterminated_ops(), vec![OP_SIGNATURE]);
+    assert!(!prefix.is_complete());
+
+    // And the doc for the full-walk stream is COMPLETE (no status,
+    // no gaps) — the later slot needs no second query.
+    let (exe, maps) = backed_exe_maps();
+    let doc = schema::emit(
+        "t",
+        Path::new(&maps[0].path),
+        "",
+        &exe,
+        &maps,
+        &[ok_row(7, 0)],
+        true,
+        &stats_from_tracker(&t),
+    )
+    .unwrap();
+    assert!(doc.get("status").is_none(), "one-query table is COMPLETE");
+    assert!(doc.get("unterminated_ops").is_none());
+}
+
 /// Live single-query later-slot coverage (NOT-RUN here: needs a
 /// privileged lane + C2-built BPF object + compiled fixtures).
 ///
