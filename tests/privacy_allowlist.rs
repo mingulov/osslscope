@@ -162,8 +162,12 @@ fn userspace_target_memory_reads_are_pinned() {
         1,
         "exactly one userspace target-memory read site, found {readers:?}"
     );
+    // T06 moved the single `pretouch_mappings` site from
+    // `harvest.rs` to `session.rs` with the live environment; the
+    // count stays exactly one and the documented behavior (fault
+    // pages in, sink the bytes) is unchanged.
     assert!(
-        readers[0].ends_with("src/discovery/harvest.rs"),
+        readers[0].ends_with("src/discovery/session.rs"),
         "unexpected read site: {}",
         readers[0].display()
     );

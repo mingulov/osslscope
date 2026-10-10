@@ -28,6 +28,7 @@ pub const HOST_SHORT_EVENT: u32 = 103;
 pub const HOST_UNKNOWN_KIND: u32 = 104;
 pub const HOST_MAP_SNAPSHOT: u32 = 105;
 pub const HOST_DRAIN_SHORTFALL: u32 = 106;
+pub const HOST_EVICT_FAILED: u32 = 107;
 
 /// Frozen gap-reason vocabulary owned here (schema's derived reasons
 /// reference these; see [`primary_reason`] for the single ranking).
@@ -64,6 +65,7 @@ pub fn loss_source_name(src: u32) -> Option<&'static str> {
         HOST_UNKNOWN_KIND => "unknown_kind",
         HOST_MAP_SNAPSHOT => "map_snapshot",
         HOST_DRAIN_SHORTFALL => "drain_shortfall",
+        HOST_EVICT_FAILED => "evict_failed",
         _ => return None,
     })
 }
@@ -174,9 +176,11 @@ impl CoverageTracker {
     }
 
     /// A dropped ring item: `src` is one of the `HOST_*` ids.
+    /// (Also the counter for host-side map-operation failures such
+    /// as failed array evictions.)
     pub fn note_bad_event(&mut self, src: u32) {
         debug_assert!(
-            (HOST_ORPHAN_ROW..=HOST_DRAIN_SHORTFALL).contains(&src),
+            (HOST_ORPHAN_ROW..=HOST_EVICT_FAILED).contains(&src),
             "host loss source out of range: {src}"
         );
         *self.losses.entry(src).or_default() += 1;
@@ -219,6 +223,42 @@ impl CoverageTracker {
             if *n > 0 {
                 *self.losses.entry(*src).or_default() += *n;
             }
+        }
+    }
+
+    /// Retire one (op, array) table incarnation: drop its walked set,
+    /// observation, and termination proof, returning the gap it
+    /// carried as a [`CoverageDelta`] for per-epoch retention (T06
+    /// session epochs). Losses are global, not per-table, so they
+    /// never travel here — only the table's own prefix/truncation
+    /// reasons do.
+    ///
+    /// Callers retire when the array's mapping incarnation changes
+    /// (reload/remap) or vanishes (unload). A terminated table
+    /// retires silently (it carried no gap); anything observed but
+    /// unterminated contributes its prefix, plus truncation while
+    /// the op's TRUNC bits are set (TRUNC is kernel-sticky per op,
+    /// so the bits stay for the next incarnation too).
+    pub fn retire_table(&mut self, op: u32, arr: u64) -> CoverageDelta {
+        let state = self.table_state(op, arr);
+        let was_observed = self.observed.contains(&(op, arr));
+        self.walked.remove(&(op, arr));
+        self.observed.remove(&(op, arr));
+        let drop_proof = matches!(self.termd.get(&arr), Some((top, _)) if *top == op);
+        if drop_proof {
+            self.termd.remove(&arr);
+        }
+        let mut reasons = Vec::new();
+        if was_observed && !matches!(state, TableState::Terminated { .. }) {
+            reasons.push(REASON_PREFIX_WALK.to_string());
+        }
+        if self.trunc.get(&op).is_some_and(|b| *b != 0) {
+            reasons.push(REASON_TRUNCATED_WALK.to_string());
+        }
+        reasons.sort_unstable();
+        CoverageDelta {
+            reasons,
+            losses: Vec::new(),
         }
     }
 
@@ -371,6 +411,54 @@ mod tests {
     use super::*;
 
     #[test]
+    fn retire_preserves_gap_drops_proof() {
+        // Epoch turnover: retiring an unterminated table returns its
+        // prefix for retention, drops the walked set and the proof,
+        // and leaves global losses untouched.
+        let mut t = CoverageTracker::new();
+        t.note_query_ret(1, ARR_TEST);
+        t.note_alg(1, ARR_TEST, 0, false);
+        t.ingest_termd(&[(ARR_TEST, wire::make_termd(1, 4))]);
+        t.ingest_trunc(&[(1, wire::TRUNC_WALK_READ)]);
+        t.ingest_losses(&[(wire::LOSS_RING_ROW, 2)]);
+        let gap = t.retire_table(1, ARR_TEST);
+        assert_eq!(
+            gap,
+            CoverageDelta {
+                reasons: vec![
+                    REASON_PREFIX_WALK.to_string(),
+                    REASON_TRUNCATED_WALK.to_string()
+                ],
+                losses: vec![],
+            }
+        );
+        assert_eq!(t.table_state(1, ARR_TEST), TableState::Unseen);
+        assert!(t.unterminated_ops().is_empty());
+        assert_eq!(t.losses(), vec![(wire::LOSS_RING_ROW, 2)]);
+        // TRUNC is kernel-sticky per op: it stays for the next
+        // incarnation (the kernel re-reports it on every join).
+        assert_eq!(t.truncated(), vec![(1, wire::TRUNC_WALK_READ)]);
+
+        // A terminated table retires silently.
+        let mut t = CoverageTracker::new();
+        t.note_query_ret(1, ARR_TEST);
+        t.note_alg(1, ARR_TEST, 0, false);
+        t.ingest_termd(&[(ARR_TEST, wire::make_termd(1, 1))]);
+        assert_eq!(
+            t.table_state(1, ARR_TEST),
+            TableState::Terminated { len: 1 }
+        );
+        let gap = t.retire_table(1, ARR_TEST);
+        assert!(gap.reasons.is_empty());
+        assert_eq!(t.table_state(1, ARR_TEST), TableState::Unseen);
+
+        // An unseen table retires silently too.
+        let mut t = CoverageTracker::new();
+        let gap = t.retire_table(9, ARR_TEST);
+        assert!(gap.reasons.is_empty());
+    }
+
+    #[test]
     fn termd_op_mismatch_proves_nothing() {
         // Address reuse across reloads: a proof naming op 2 at this
         // base does not terminate the op-1 table there.
@@ -432,13 +520,14 @@ mod tests {
             HOST_UNKNOWN_KIND,
             HOST_MAP_SNAPSHOT,
             HOST_DRAIN_SHORTFALL,
+            HOST_EVICT_FAILED,
         ] {
             assert!(loss_source_name(src).is_some(), "host source {src}");
         }
         assert_eq!(loss_source_name(0), None);
         assert_eq!(loss_source_name(16), None);
         assert_eq!(loss_source_name(100), None);
-        assert_eq!(loss_source_name(107), None);
+        assert_eq!(loss_source_name(108), None);
         assert_eq!(loss_source_name(u32::MAX), None);
     }
 }

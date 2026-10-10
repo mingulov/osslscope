@@ -19,3 +19,4 @@ pub mod harvest;
 pub mod legacy;
 pub mod maps;
 pub mod schema;
+pub mod session;
