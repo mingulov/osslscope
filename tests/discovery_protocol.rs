@@ -300,7 +300,7 @@ fn soaked_wire_bytes_yield_numerics_only() {
     );
     let mut b = vec![0x41u8; 32];
     b[0..4].copy_from_slice(&4u32.to_le_bytes());
-    // class bytes 0x4141 = 16705: out of range (625 valid + OTHER).
+    // class bytes 0x4141 = 16705: out of range (692 valid + OTHER).
     assert_eq!(wire::parse_alg_event(&b, n), Err(wire::WireErr::ClassRange));
     let soaked16 = vec![0x41u8; 16];
     assert_eq!(wire::parse_trip_event(&soaked16), Err(wire::WireErr::Kind));
@@ -341,7 +341,9 @@ fn registry_hashes_are_collision_free_and_bounded() {
             longest = longest.max(w.len());
         }
     }
-    assert_eq!(hashes.len(), 630);
+    // 692 registry + 4 weak-only extras (SHA0/3DES/Blowfish/CAST5;
+    // RC4 registered since T09).
+    assert_eq!(hashes.len(), 692 + 4);
     assert!(longest <= wire::MAX_ALG_NAME, "longest {longest}");
     assert!(kinds::ALG_NAMES.len() < wire::OTHER_CLASS as usize);
     let trips = [
@@ -427,7 +429,8 @@ fn classifier_agrees_with_reference_over_corpus() {
         assert_eq!(v.status, want, "status for {input:?}");
     }
     // Unknown primaries (incl. empty/edge splits) are explicit UNKNOWN.
-    for input in ["", ":", "nope", ":SHA2-256", "RC4"] {
+    // (RC4 registered since T09; SHA0 keeps the weak-only exemplar.)
+    for input in ["", ":", "nope", ":SHA2-256", "SHA0"] {
         let v = classify_host(input.as_bytes(), false);
         assert_eq!(v.status, wire::ALG_UNKNOWN, "status for {input:?}");
         assert_eq!(kinds::alg_class_label(v.class), Some("other"));
@@ -524,16 +527,20 @@ fn trip_taxonomy_pins_classes() {
 #[test]
 fn population_builders_cover_registry() {
     let alg = build_alg_entries().unwrap();
-    assert_eq!(alg.len(), 630);
+    assert_eq!(alg.len(), 692 + 4);
     let by_hash: HashMap<u64, &wire::AlgClassValue> = alg.iter().map(|(h, v)| (*h, v)).collect();
-    assert_eq!(by_hash.len(), 630, "population hashes must be unique");
+    assert_eq!(by_hash.len(), 692 + 4, "population hashes must be unique");
     // Spot checks: recognized class index, weak flag, weak-only names.
     let sha = &by_hash[&wire::fnv1a64(b"SHA2-256")];
     assert_eq!(kinds::alg_class_label(sha.class), Some("SHA2-256"));
     assert_eq!(sha.weak, 0);
     let md5 = &by_hash[&wire::fnv1a64(b"MD5")];
     assert_eq!(md5.weak, 1);
-    for w in ["SHA0", "3DES", "RC4", "Blowfish", "CAST5"] {
+    // RC4 registered since T09: own class id, still weak-flagged.
+    let rc4 = &by_hash[&wire::fnv1a64(b"RC4")];
+    assert_eq!(kinds::alg_class_label(rc4.class), Some("RC4"));
+    assert_eq!(rc4.weak, 1);
+    for w in ["SHA0", "3DES", "Blowfish", "CAST5"] {
         let v = &by_hash[&wire::fnv1a64(w.as_bytes())];
         assert_eq!((v.class, v.weak), (wire::OTHER_CLASS, 1), "weak-only {w}");
     }

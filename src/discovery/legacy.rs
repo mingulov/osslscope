@@ -49,6 +49,54 @@ pub struct Probe {
     pub program: &'static str,
 }
 
+/// One address-taken (GLOB_DAT) import resolved to exactly one
+/// FUNC definition: the symbol, the defining object, and its file
+/// offset. Diagnostic fact only, never a probe: attaching at the
+/// definition would count every caller including libcrypto
+/// internals, corrupting caller-attributed tripwire semantics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedImport {
+    pub symbol: String,
+    pub object: String,
+    pub offset: u64,
+}
+
+/// One address-taken import defined in two or more scanned
+/// objects: attaching to either would misattribute the other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AmbiguousImport {
+    pub symbol: String,
+    pub objects: Vec<String>,
+}
+
+/// Address-taken (GLOB_DAT) import resolution over scanned
+/// objects: every import lands in exactly one bucket. Resolution
+/// sharpens the diagnosis only — all three buckets stay
+/// uninstrumented gaps (the `lowlevel-fallback-uninstrumented`
+/// reason is never resolved away).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AddressTakenResolution {
+    pub resolved: Vec<ResolvedImport>,
+    pub ambiguous: Vec<AmbiguousImport>,
+    pub absent: Vec<String>,
+}
+
+/// Outcome of one address-taken import for [`ProbeSet::address_taken`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AddressTakenOutcome {
+    Resolved { object: String, offset: u64 },
+    Ambiguous { objects: Vec<String> },
+    Absent,
+}
+
+/// One module's address-taken import with its resolution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddressTakenRecord {
+    pub symbol: String,
+    pub module: String,
+    pub outcome: AddressTakenOutcome,
+}
+
 /// Resolved probe plan + coverage gaps.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProbeSet {
@@ -56,6 +104,11 @@ pub struct ProbeSet {
     pub engine_uninstrumented: u64,
     pub meth_uninstrumented: u64,
     pub lowlevel_uninstrumented: u64,
+    /// Address-taken (GLOB_DAT) taxonomy imports with their
+    /// defining-object resolution, grouped by module in scan order,
+    /// symbols sorted within each outcome bucket.
+    /// Diagnostic facts only, never probes (see [`ResolvedImport`]).
+    pub address_taken: Vec<AddressTakenRecord>,
     /// Unprobed symbols per class (sorted, deduped): matched in the
     /// target but stub-less (per-entry `uninstrumented` states).
     pub unprobed_engine_syms: Vec<String>,
@@ -210,8 +263,74 @@ fn lowlevel_family(name: &str) -> Option<&'static str> {
         .map(|f| f.family)
 }
 
+/// True iff the symbol is tripwire taxonomy (exact ENGINE/METH
+/// name or low-level prefix): the same membership rule as
+/// [`module_plan`], shared so the two planners cannot drift.
+fn is_taxonomy(name: &str) -> bool {
+    lowlevel_family(name).is_some()
+        || crate::kinds::ENGINE
+            .iter()
+            .any(|e| e.name == name && !matches!(e.class, crate::kinds::EngineClass::Other))
+        || crate::kinds::METH_NEW.iter().any(|m| m.name == name)
+}
+
+/// Resolve address-taken imports against defining objects: each
+/// import is looked up as a DEFINED FUNC symbol in every definer.
+/// Exactly one (object, offset) definition resolves; two or more
+/// (shared implementations, or versioned duplicates inside one
+/// object) are ambiguous; none is absent. Only FUNC definitions
+/// count (a data symbol can never execute). Deterministic: inputs
+/// are visited sorted, ambiguous object lists sorted and deduped.
+/// Unparseable definer bytes fail the whole resolution (resolving
+/// over a silent subset could claim `Resolved` where the full set
+/// is `Ambiguous`); callers record the definer as unscannable.
+pub fn resolve_address_taken(
+    imports: &[String],
+    definers: &[Module],
+) -> anyhow::Result<AddressTakenResolution> {
+    let mut tables: Vec<(&str, Vec<(String, u64)>)> = Vec::new();
+    for d in definers {
+        tables.push((d.path, elf::dynsym_func_entries(d.bytes)?));
+    }
+    let mut sorted: Vec<&String> = imports.iter().collect();
+    sorted.sort();
+    sorted.dedup();
+    let mut out = AddressTakenResolution::default();
+    for name in sorted {
+        let mut hits: Vec<(&str, u64)> = tables
+            .iter()
+            .flat_map(|(path, entries)| {
+                entries
+                    .iter()
+                    .filter(|(n, _)| n.as_str() == name.as_str())
+                    .map(|(_, o)| (*path, *o))
+            })
+            .collect();
+        hits.sort();
+        hits.dedup();
+        match hits.len() {
+            0 => out.absent.push(name.clone()),
+            1 => out.resolved.push(ResolvedImport {
+                symbol: name.clone(),
+                object: hits[0].0.to_string(),
+                offset: hits[0].1,
+            }),
+            _ => {
+                let mut objects: Vec<String> = hits.iter().map(|(p, _)| p.to_string()).collect();
+                objects.sort();
+                objects.dedup();
+                out.ambiguous.push(AmbiguousImport {
+                    symbol: name.clone(),
+                    objects,
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Machine slug for a finding string (check/CI consume `flags`;
-/// humans read `findings`). Exact/prefix rules for the six producer
+/// humans read `findings`). Exact/prefix rules for the producer
 /// templates; slugify fallback (lowercase alnum runs joined by `-`,
 /// capped at 40 chars) never fails.
 pub fn flag_for(finding: &str) -> String {
@@ -225,6 +344,7 @@ pub fn flag_for(finding: &str) -> String {
         ("unreadable module: ", "unreadable-module"),
         ("tripwire cap (", "tripwire-cap-exceeded"),
         ("unprobed import: ", "unprobed-imports"),
+        ("address-taken import", "unprobed-imports"),
         ("…and ", "unprobed-imports"),
         ("legacy tripwire attach failed: ", "legacy-attach-failed"),
         (
@@ -400,11 +520,41 @@ pub fn find_libcrypto(maps: &[maps::Mapping]) -> Option<String> {
         .map(|m| m.path.clone())
 }
 
+/// Route one address-taken gap pair to its class bucket.
+/// Exact-class priority mirrors [`module_plan`]: ENGINE/METH exact
+/// names win over low-level prefix text (`RSA_meth_new` is meth,
+/// not low-level). Callers pass taxonomy names only; anything else
+/// lands in low-level rather than vanishing.
+fn route_gap(
+    engine: &mut Vec<(String, String)>,
+    meth: &mut Vec<(String, String)>,
+    lowlevel: &mut Vec<(String, String)>,
+    symbol: String,
+    module: &str,
+) {
+    let pair = (symbol.clone(), module.to_string());
+    let is_engine = crate::kinds::ENGINE
+        .iter()
+        .any(|e| e.name == symbol && !matches!(e.class, crate::kinds::EngineClass::Other));
+    if is_engine {
+        engine.push(pair);
+    } else if crate::kinds::METH_NEW.iter().any(|m| m.name == symbol) {
+        meth.push(pair);
+    } else {
+        lowlevel.push(pair);
+    }
+}
+
 /// Build the probe plan. Provider loads stay on libcrypto (global
 /// events — internal auto-loads are real loads and must count);
 /// ENGINE, meth_new, and low-level are caller-attributed per-module
 /// PLT probes (libcrypto's internal direct calls are implementation,
 /// not usage — on 3.x they fire ENGINE_register_* during init).
+/// Address-taken (GLOB_DAT) taxonomy imports resolve to precise
+/// diagnosed gaps: a symbol with a PLT probe AND a GLOB_DAT slot is
+/// still partially blind (pointer calls miss the stub probe), and
+/// a symbol with only a GLOB_DAT slot keeps its exact gap pair
+/// under a precise finding instead of the generic unprobed line.
 /// Gaps count (symbol, module) pairs among SCANNED modules; skipped
 /// modules say so loudly (their imports are unknown).
 /// dlsym/JIT callers are a known gap (no PLT to probe).
@@ -439,18 +589,70 @@ pub fn probes_for(
     let mut gaps_engine: Vec<(String, String)> = Vec::new();
     let mut gaps_meth: Vec<(String, String)> = Vec::new();
     let mut gaps_lowlevel: Vec<(String, String)> = Vec::new();
+    // Pass 1: scan every module (PLT + address-taken). Unscannable
+    // modules are loud unknowns and do not join the definers.
+    struct Scan {
+        und: HashSet<String>,
+        plt: HashMap<String, u64>,
+        globdat: Vec<String>,
+    }
+    let mut scans: Vec<Option<Scan>> = Vec::with_capacity(modules.len());
     for m in modules {
-        let (und, plt) = match (elf::und_imports(m.bytes), elf::plt_stub_offsets(m.bytes)) {
-            (Ok(u), Ok(p)) => (u, p),
+        let scanned = match (
+            elf::und_imports(m.bytes),
+            elf::plt_stub_offsets(m.bytes),
+            elf::glob_dat_imports(m.bytes),
+        ) {
+            (Ok(u), Ok(p), Ok(g)) => Some(Scan {
+                und: u.into_iter().collect(),
+                plt: p,
+                globdat: g,
+            }),
             _ => {
                 set.findings
                     .push(format!("unscannable module: {} (imports unknown)", m.path));
-                continue;
+                None
             }
         };
-        let und: HashSet<String> = und.into_iter().collect();
-        let (plan, next) = module_plan(m.path, &und, &plt, cookie);
+        scans.push(scanned);
+    }
+    // Definers for address-taken resolution: libcrypto plus every
+    // scanned module (an unscannable module's definitions are
+    // unknown, covered by its loud finding above).
+    let mut definers: Vec<Module> = Vec::with_capacity(modules.len() + 1);
+    definers.push(Module {
+        path: libcrypto_path,
+        bytes: libcrypto_elf,
+    });
+    for (m, s) in modules.iter().zip(scans.iter()) {
+        if s.is_some() {
+            definers.push(Module {
+                path: m.path,
+                bytes: m.bytes,
+            });
+        }
+    }
+    // Pass 2: plan PLT probes, then resolve address-taken imports.
+    let mut addr_findings: Vec<String> = Vec::new();
+    for (m, scan) in modules.iter().zip(scans.iter()) {
+        let Some(scan) = scan else {
+            continue;
+        };
+        let (mut plan, next) = module_plan(m.path, &scan.und, &scan.plt, cookie);
         cookie = next;
+        // Address-taken taxonomy imports, partitioned out of the
+        // generic unprobed lists so each (symbol, module) pair is
+        // counted once, under its precise finding.
+        let addr_taken: Vec<String> = scan
+            .globdat
+            .iter()
+            .filter(|n| is_taxonomy(n))
+            .cloned()
+            .collect();
+        let addr_set: HashSet<String> = addr_taken.iter().cloned().collect();
+        plan.unprobed_engine.retain(|n| !addr_set.contains(n));
+        plan.unprobed_meth.retain(|n| !addr_set.contains(n));
+        plan.unprobed_lowlevel.retain(|n| !addr_set.contains(n));
         gaps_engine.extend(
             plan.unprobed_engine
                 .into_iter()
@@ -467,6 +669,102 @@ pub fn probes_for(
                 .map(|s| (s, m.path.to_string())),
         );
         set.probes.extend(plan.probes);
+        if addr_taken.is_empty() {
+            continue;
+        }
+        let r = match resolve_address_taken(&addr_taken, &definers) {
+            Ok(r) => r,
+            Err(_) => {
+                set.findings.push(format!(
+                    "unscannable module: {} (address-taken imports unknown)",
+                    m.path
+                ));
+                // Fall back to generic gap pairs (the und path may
+                // not have covered non-import slots).
+                for n in addr_taken {
+                    route_gap(
+                        &mut gaps_engine,
+                        &mut gaps_meth,
+                        &mut gaps_lowlevel,
+                        n,
+                        m.path,
+                    );
+                }
+                continue;
+            }
+        };
+        for h in &r.resolved {
+            addr_findings.push(format!(
+                "address-taken import: {} ({} -> {}@0x{:x}): no PLT stub; execution unobserved",
+                h.symbol, m.path, h.object, h.offset
+            ));
+            set.address_taken.push(AddressTakenRecord {
+                symbol: h.symbol.clone(),
+                module: m.path.to_string(),
+                outcome: AddressTakenOutcome::Resolved {
+                    object: h.object.clone(),
+                    offset: h.offset,
+                },
+            });
+            route_gap(
+                &mut gaps_engine,
+                &mut gaps_meth,
+                &mut gaps_lowlevel,
+                h.symbol.clone(),
+                m.path,
+            );
+        }
+        for h in &r.ambiguous {
+            addr_findings.push(format!(
+                "address-taken import: {} ({}): shared by {} objects; unattributable",
+                h.symbol,
+                m.path,
+                h.objects.len()
+            ));
+            set.address_taken.push(AddressTakenRecord {
+                symbol: h.symbol.clone(),
+                module: m.path.to_string(),
+                outcome: AddressTakenOutcome::Ambiguous {
+                    objects: h.objects.clone(),
+                },
+            });
+            route_gap(
+                &mut gaps_engine,
+                &mut gaps_meth,
+                &mut gaps_lowlevel,
+                h.symbol.clone(),
+                m.path,
+            );
+        }
+        for n in &r.absent {
+            addr_findings.push(format!(
+                "address-taken import without definition: {n} ({})",
+                m.path
+            ));
+            set.address_taken.push(AddressTakenRecord {
+                symbol: n.clone(),
+                module: m.path.to_string(),
+                outcome: AddressTakenOutcome::Absent,
+            });
+            route_gap(
+                &mut gaps_engine,
+                &mut gaps_meth,
+                &mut gaps_lowlevel,
+                n.clone(),
+                m.path,
+            );
+        }
+    }
+    // Precise address-taken findings join the finding list under
+    // the same 16-line bound as generic gap findings (counters
+    // stay exact regardless).
+    addr_findings.sort();
+    set.findings.extend(addr_findings.into_iter().take(16));
+    if set.address_taken.len() > 16 {
+        set.findings.push(format!(
+            "…and {} more address-taken imports",
+            set.address_taken.len() - 16
+        ));
     }
     // Cap overflow rejoins the gaps (classified exactly).
     let dropped = apply_trip_cap(&mut set.probes);
@@ -1307,6 +1605,7 @@ mod tests {
             unprobed_meth_syms: vec!["RSA_meth_new".into(), "DSA_meth_new".into()],
             unprobed_lowlevel_syms: vec![],
             findings: vec![],
+            address_taken: vec![],
             by_id_cookies: [0].into_iter().collect(),
             load_cookies: [2].into_iter().collect(),
         };

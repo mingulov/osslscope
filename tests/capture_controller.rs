@@ -1388,6 +1388,7 @@ fn prewindow_vs_inwindow_engine() {
         unprobed_meth_syms: Vec::new(),
         unprobed_lowlevel_syms: Vec::new(),
         findings: Vec::new(),
+        address_taken: Vec::new(),
         by_id_cookies: HashSet::from([7]),
         load_cookies: HashSet::new(),
     };
@@ -1466,6 +1467,7 @@ fn transient_load_hits_are_loads_not_executions() {
         unprobed_meth_syms: Vec::new(),
         unprobed_lowlevel_syms: Vec::new(),
         findings: Vec::new(),
+        address_taken: Vec::new(),
         by_id_cookies: HashSet::new(),
         load_cookies: HashSet::from([9]),
     };
@@ -1645,6 +1647,7 @@ fn slow_metadata_past_deadline_admits_no_tripwire() {
         unprobed_meth_syms: Vec::new(),
         unprobed_lowlevel_syms: Vec::new(),
         findings: Vec::new(),
+        address_taken: Vec::new(),
         by_id_cookies: HashSet::from([7]),
         load_cookies: HashSet::new(),
     };
