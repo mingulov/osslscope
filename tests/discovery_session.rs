@@ -687,6 +687,68 @@ fn nostore_sample_never_terminates() {
 }
 
 #[test]
+fn one_query_full_walk_covers_late_slot() {
+    // Host-side contract for a future complete walker (T14r5: the
+    // in-kernel multi-slot walk proved verifier-infeasible — see the
+    // round-5 handoff — so the kernel still emits prefix streams;
+    // this pins the session accounting a future walker feeds): the
+    // G02 ECDSA shape — a 30-slot signature table (op 12) with ECDSA
+    // at slot 29, observed through ONE query — terminates with a
+    // one-query oracle.
+    use osslscope::discovery::session::CoverageState;
+    const OP_SIGNATURE: u32 = 12;
+    let ecdsa_class = osslscope::kinds::ALG_NAMES
+        .iter()
+        .position(|a| a.name == "ECDSA-SHA2-256")
+        .expect("registry carries ECDSA-SHA2-256") as u16;
+    let mut env = TestEnv::new();
+    let mut core = test_core(false);
+    let arr = 0x7f00_1000u64;
+    let imp = 0x7f00_2000u64;
+    env.push(query_ret(OP_SIGNATURE, arr, 0));
+    for idx in 0..30u64 {
+        if idx == 29 {
+            env.push(enc_alg(
+                OP_SIGNATURE,
+                ecdsa_class,
+                wire::ALG_OK,
+                0,
+                arr,
+                idx,
+            ));
+        } else {
+            env.push(ok_alg(OP_SIGNATURE, arr, idx));
+        }
+    }
+    env.push(dispatch_row(OP_SIGNATURE, 3, imp, arr, 29));
+    env.staged.termd = vec![(arr, wire::make_termd(OP_SIGNATURE, 30))];
+    let d = core.poll(&mut env, ample_budget()).unwrap();
+    assert!(!d.budget_exhausted);
+    // Few-query oracle: exactly one query observed, yet slot 29 is
+    // covered — under the sampler this stream would need 30.
+    assert_eq!(d.queries_delta, 1);
+    let snap = core.snapshot();
+    assert_eq!(snap.queries_observed, 1);
+    assert_eq!(snap.tables.len(), 1);
+    assert!(matches!(
+        snap.tables[0].state,
+        CoverageState::Terminated { len: 30 }
+    ));
+    assert!(snap.reasons.is_empty());
+    let late = snap
+        .candidates
+        .iter()
+        .find(|c| c.op == OP_SIGNATURE && c.funcid == 3)
+        .expect("slot-29 candidate present after one query");
+    assert!(
+        late.class.contains("ECDSA"),
+        "slot-29 class must be ECDSA, got {}",
+        late.class
+    );
+    assert_eq!(late.arr, arr);
+}
+
+#[test]
 fn shrinkage_proof_does_not_carry() {
     // A len-5 proof terminates epoch 0; after the mapping
     // incarnation changes, the stale proof cannot terminate the
