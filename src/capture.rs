@@ -2461,16 +2461,15 @@ where
             .executed_queries
             .checked_sub(self.adapter.baseline_lgcalls)
             && let Some(tail_lgcalls) = after_base.checked_sub(self.in_window_lgcalls)
+            && tail_lgcalls > 0
         {
-            if tail_lgcalls > 0 {
-                self.extra_loss.push(typed_counter(
-                    "legacy.close_tail_lgcalls",
-                    CounterKind::Loss,
-                    CounterUnits::Events,
-                    CounterSource::Discovery,
-                    tail_lgcalls,
-                ));
-            }
+            self.extra_loss.push(typed_counter(
+                "legacy.close_tail_lgcalls",
+                CounterKind::Loss,
+                CounterUnits::Events,
+                CounterSource::Discovery,
+                tail_lgcalls,
+            ));
         }
         let (engine_un, meth_un, low_un) = snapshot
             .legacy
