@@ -1585,6 +1585,22 @@ where
         self.reasons.insert(r.to_string());
     }
 
+    /// Post-exec comm settle (owned only): refresh until the
+    /// snapshot differs from the pre-exec acquisition value, then
+    /// freeze — later setproctitle changes do not rewrite identity.
+    /// Call BEFORE any custody reap (never after: a reused pid
+    /// could supply another process's comm, and a reaped child
+    /// keeps no post-hoc read). No-op once settled, after a known
+    /// exit, on foreign targets, or when /proc is unreadable.
+    fn settle_comm(&mut self) {
+        if !self.info.owned || self.child_exit.is_some() || self.comm != self.info.comm {
+            return;
+        }
+        if let Some(comm) = self.proc.read_comm(self.info.pid) {
+            self.comm = comm;
+        }
+    }
+
     /// Pre-read every distinct mapped path once per round. Failures
     /// skip (the planner misses those rows loud as unreadable).
     fn read_round_files(&mut self, live: &[maps::Mapping]) -> HashMap<String, Vec<u8>> {
@@ -1669,6 +1685,8 @@ where
             Err(_) => {
                 // Target gone, or /proc flakiness: custody decides.
                 if owned {
+                    // Last-gasp settle before the reap below.
+                    self.settle_comm();
                     if let Ok(Some(code)) = self.target.poll_exit() {
                         self.child_exit = Some(code);
                         return Ok(RoundAction::Closed);
@@ -1691,6 +1709,11 @@ where
             // evidence) — the loop closes instead.
             return Ok(RoundAction::Expired);
         }
+        // Pre-reap comm settle: the corpse path below reaps, after
+        // which no post-hoc comm read exists — a fast exit would
+        // otherwise keep the pre-exec observer comm. Settles until
+        // the snapshot differs, then freezes.
+        self.settle_comm();
         // Post-read liveness: close corpses, never fence them. The
         // bounded wait covers the `exit_mm`-to-zombie window (maps
         // already empty, waitpid still blind) through custody — never
@@ -1703,20 +1726,14 @@ where
             let waited_from = self.clock.now();
             while self.clock.now().saturating_duration_since(waited_from) < CORPSE_WAIT {
                 self.clock.sleep(Duration::from_millis(1));
+                // Settle before each wait poll: the exit may land
+                // on this poll, ending post-hoc comm reads.
+                self.settle_comm();
                 if let Ok(Some(code)) = self.target.poll_exit() {
                     self.child_exit = Some(code);
                     return Ok(RoundAction::Closed);
                 }
             }
-        }
-        // Post-exec comm settle (owned): refresh until the snapshot
-        // differs from the pre-exec acquisition value, then freeze —
-        // later setproctitle changes do not rewrite identity.
-        if owned
-            && self.comm == self.info.comm
-            && let Some(comm) = self.proc.read_comm(pid)
-        {
-            self.comm = comm;
         }
         let mut fresh = HashSet::new();
         for m in &live {
@@ -2093,11 +2110,9 @@ where
             }
             // Post-release comm settle: acquisition read comm while
             // the child was stopped pre-exec (the observer's inherited
-            // comm); refresh now, and again per round until it differs
-            // (a slow exec settles late).
-            if let Some(comm) = self.proc.read_comm(pid) {
-                self.comm = comm;
-            }
+            // comm); refresh now, and again before every reap until
+            // it differs (a slow exec settles late).
+            self.settle_comm();
             self.requested_start_ns = self.clock.monotonic_ns();
             self.open_instant = self.clock.now();
         } else {
@@ -2138,6 +2153,9 @@ where
                 self.signal_cut = true;
                 break;
             }
+            // Pre-reap settle: this poll may reap, ending post-hoc
+            // comm reads (a fast exit keeps no second chance).
+            self.settle_comm();
             if owned {
                 match self.target.poll_exit() {
                     Ok(Some(code)) => {
@@ -2156,6 +2174,9 @@ where
             }
             // Post-sleep liveness: a child that died during the
             // sleep closes the window, never fences on its corpse.
+            // Pre-reap settle again: the exec may have settled
+            // during the sleep, just before the death below.
+            self.settle_comm();
             if owned {
                 match self.target.poll_exit() {
                     Ok(Some(code)) => {
@@ -2183,6 +2204,9 @@ where
     }
 
     fn close_and_finalize(mut self) -> anyhow::Result<Capture> {
+        // Last pre-reap settle: the expiry poll and the final
+        // disposition below can reap, ending post-hoc comm reads.
+        self.settle_comm();
         // Over-budget: the window expired while the target lived. A
         // spawn reaped here died in the last poll slice — its full
         // lifetime was observed, so it is NOT over-budget.

@@ -361,6 +361,11 @@ struct FakeProc {
     file_delay_ns: u64,
     maps_calls: usize,
     comm: Option<String>,
+    /// Post-exec comm once the clock reaches `comm_settle_at_ns`
+    /// (scripted exec timing — deliberately clock-driven, never
+    /// read-count-driven, so added settle reads cannot shift it).
+    comm_settle_at_ns: Option<u64>,
+    comm_settled: Option<String>,
 }
 
 impl ProcPort for FakeProc {
@@ -396,6 +401,14 @@ impl ProcPort for FakeProc {
     }
 
     fn read_comm(&mut self, _pid: u32) -> Option<String> {
+        if self
+            .comm_settle_at_ns
+            .is_some_and(|t| self.clock.monotonic_ns() >= t)
+        {
+            if let Some(settled) = self.comm_settled.clone() {
+                return Some(settled);
+            }
+        }
         self.comm.clone()
     }
 }
@@ -590,6 +603,8 @@ struct Harness {
     maps_delay_ns: u64,
     file_delay_ns: u64,
     comm: Option<String>,
+    comm_settle_at_ns: Option<u64>,
+    comm_settled: Option<String>,
     cancelled: Rc<Cell<bool>>,
     cancel_on_poll: bool,
 }
@@ -647,6 +662,8 @@ impl Harness {
             maps_delay_ns: 0,
             file_delay_ns: 0,
             comm: None,
+            comm_settle_at_ns: None,
+            comm_settled: None,
             cancelled: Rc::new(Cell::new(false)),
             cancel_on_poll: false,
         }
@@ -715,6 +732,8 @@ impl Harness {
             file_delay_ns: self.file_delay_ns,
             maps_calls: 0,
             comm: self.comm,
+            comm_settle_at_ns: self.comm_settle_at_ns,
+            comm_settled: self.comm_settled,
         };
         let flag = self.cancelled.clone();
         let out = observe(
@@ -1032,6 +1051,75 @@ fn owned_comm_settles_post_release() {
     let (out, _) = h.run();
     let c = out.unwrap();
     assert_eq!(c.target_comm, "sleep-app");
+}
+
+#[test]
+fn corpse_close_keeps_settled_comm() {
+    // F9: exec settles the comm after release but before a fast
+    // exit; the corpse path reaps, after which no post-hoc comm
+    // read exists. The pre-reap settle must capture the post-exec
+    // comm through observe() — never the pre-exec observer comm.
+    // (Non-static fake comm: the flip is clock-driven.)
+    let mut h = Harness::fresh("comm-corpse");
+    h.snapshot_attached();
+    h.comm = Some("test-target".to_string());
+    h.comm_settle_at_ns = Some(BASE_NS + 100_000_000);
+    h.comm_settled = Some("fast-app".to_string());
+    let mapped = vec![mapping(&h.staged)];
+    h.maps_seq = VecDeque::from([mapped, vec![]]);
+    h.exit_at_ns = Some(BASE_NS + 255_000_000);
+    h.exit_code = 7;
+    h.polls.push_back(DiscoveryDelta::default());
+    let (out, _) = h.run();
+    let c = out.unwrap();
+    assert_eq!(c.child_exit, Some(7));
+    assert!(matches!(
+        c.disposition,
+        Some(target::TargetDisposition::Exited { code: 7 })
+    ));
+    assert_eq!(c.target_comm, "fast-app");
+}
+
+#[test]
+fn comm_settling_during_corpse_wait_is_observed() {
+    // F9: the exec settles while the corpse wait is already
+    // polling and the exit lands later in the same wait. Only a
+    // settle before each wait poll observes it — a post-reap read
+    // cannot exist.
+    let mut h = Harness::fresh("comm-wait");
+    h.snapshot_attached();
+    h.comm = Some("test-target".to_string());
+    h.comm_settle_at_ns = Some(BASE_NS + 260_000_000);
+    h.comm_settled = Some("late-app".to_string());
+    let mapped = vec![mapping(&h.staged)];
+    h.maps_seq = VecDeque::from([mapped, vec![]]);
+    h.exit_at_ns = Some(BASE_NS + 300_000_000);
+    h.exit_code = 7;
+    h.polls.push_back(DiscoveryDelta::default());
+    let (out, _) = h.run();
+    let c = out.unwrap();
+    assert_eq!(c.child_exit, Some(7));
+    assert_eq!(c.target_comm, "late-app");
+}
+
+#[test]
+fn owned_comm_late_settle_observed_through_observe() {
+    // F9: a slow exec settles several rounds after release while
+    // the child lives on. The per-round settle must pick the
+    // post-exec comm up through observe() with a non-static fake
+    // comm (clock-driven flip, not a read-count script).
+    let mut h = Harness::fresh("comm-late");
+    h.snapshot_attached();
+    h.comm = Some("test-target".to_string());
+    h.comm_settle_at_ns = Some(BASE_NS + 600_000_000);
+    h.comm_settled = Some("slow-app".to_string());
+    h.exit_at_ns = Some(BASE_NS + 1_000_000_000);
+    h.exit_code = 0;
+    h.polls.push_back(DiscoveryDelta::default());
+    let (out, _) = h.run();
+    let c = out.unwrap();
+    assert_eq!(c.child_exit, Some(0));
+    assert_eq!(c.target_comm, "slow-app");
 }
 
 #[test]
@@ -2465,6 +2553,8 @@ fn live_observe(
         file_delay_ns: 0,
         maps_calls: 0,
         comm: None,
+        comm_settle_at_ns: None,
+        comm_settled: None,
     };
     let info = TargetInfo {
         pid,
