@@ -130,6 +130,19 @@ else
         || bad "missing manifest fails with build-dev.sh diagnosis"
 fi
 
+cat >"$T/host-only-manifest.json" <<EOF
+{"schema": "osslscope-dev-build-manifest-v1",
+ "product_ref": null, "product_dirty": null,
+ "artifacts": [{"role": "host-binary", "path": "$T/host-bin"}]}
+EOF
+if "$SH_BIN" "$INSTALL" --manifest "$T/host-only-manifest.json" --prefix "$T/pfxho" >"$T/out" 2>&1; then
+    bad "host-only manifest fails (got exit 0)"
+else
+    grep -q 'no harvest object' "$T/out" \
+        && ok "host-only manifest fails naming the missing harvest object" \
+        || bad "host-only manifest fails naming the missing harvest object (saw: $(head -1 "$T/out"))"
+fi
+
 if "$SH_BIN" "$INSTALL" --manifest "$T/manifest.json" --prefix "$T/pfx4" \
         --count "$T/host-bin" >"$T/out" 2>&1; then
     bad "x86-64 executable as BPF object fails closed (got exit 0)"

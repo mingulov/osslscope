@@ -124,8 +124,11 @@ bpf = [a for a in m.get("artifacts", []) if a.get("role") == "bpf-object"]
 host = arts.get("host-binary", {}).get("path", "")
 harvest = next((a.get("path", "") for a in bpf if a.get("bin") == "osslscope-harvest"), "")
 count = next((a.get("path", "") for a in bpf if a.get("bin") == "osslscope-count"), "")
-print("%s\t%s\t%s\t%s\t%s" % (host, harvest, count,
-      m.get("product_ref", ""), str(m.get("product_dirty", ""))))
+# One value per line: tab cannot delimit here (tab is IFS whitespace, so
+# consecutive tabs collapse and empty fields vanish — a host-only manifest
+# would misparse). Paths with newlines are not supported.
+print("%s\n%s\n%s\n%s\n%s" % (host, harvest, count,
+      m.get("product_ref") or "", str(m.get("product_dirty", ""))))
 EOF
 )" || exit 1
 fi
@@ -136,7 +139,13 @@ COUNT_OBJ="$COUNT_OVERRIDE"
 PRODUCT_REF=""
 PRODUCT_DIRTY=""
 if [ -n "$MANIFEST_PATHS" ]; then
-    IFS='	' read -r _m_host _m_harvest _m_count _m_ref _m_dirty <<EOF2
+    {
+        IFS= read -r _m_host
+        IFS= read -r _m_harvest
+        IFS= read -r _m_count
+        IFS= read -r _m_ref
+        IFS= read -r _m_dirty
+    } <<EOF2
 $MANIFEST_PATHS
 EOF2
     [ -n "$HOST_BIN" ] || HOST_BIN="$_m_host"
@@ -259,7 +268,7 @@ manifest = {
     "prefix": pfx,
     "build_manifest": e.get("MANIFEST") or None,
     "product_ref": e.get("PRODUCT_REF") or None,
-    "product_dirty": e.get("PRODUCT_DIRTY") == "True",
+    "product_dirty": {"True": True, "False": False}.get(e.get("PRODUCT_DIRTY")),
     "setcap": e.get("SETCAP_STATE"),
     "artifacts": arts,
 }
