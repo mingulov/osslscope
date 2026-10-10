@@ -13,16 +13,17 @@
 //! No live capture here: all documents are built with
 //! [`evidence::finalize`], so these tests run on the host (C3).
 
-use osslscope::check::{
-    ArtifactOutcome, DeliveryResult, OutputRequest, exit_for, policy_json, write_artifacts,
-};
+use osslscope::check::{exit_for, policy_json, policy_record};
 use osslscope::evidence::{
     CandidateCoverage, CandidateIdentity, CaptureDocument, CaptureWindow, Completeness,
     CounterKind, CounterSource, CounterUnits, ExpectedScope, FatalKind, FencedGeneration,
-    FinalizeInput, GapCounter, MatchBounds, ObjectId, RuleVerdict, ScopeCoverage, SiteExecution,
-    SiteKey, finalize,
+    FinalizeInput, GapCounter, MatchBounds, ObjectId, OpensslVersion, RuleVerdict, ScopeCoverage,
+    SiteExecution, SiteKey, TargetRecord, finalize,
 };
 use osslscope::policy::{ENGINE_PROVIDER_CLASS, PolicyOutcome, PolicyRule, evaluate_document};
+use osslscope::report::{
+    ArtifactOutcome, DeliveryResult, OutputDest, OutputFormat, OutputRequest, write_artifacts,
+};
 use std::process::ExitCode;
 
 const DIGEST: u32 = 1;
@@ -100,6 +101,10 @@ fn doc(
         coverage,
         counters,
         fatal,
+        target: TargetRecord::unknown(),
+        openssl: OpensslVersion::unknown(),
+        disposition: None,
+        policy: None,
     })
 }
 
@@ -145,8 +150,14 @@ fn coverage_gap(scope: &str) -> ScopeCoverage {
 
 fn ok_delivery() -> DeliveryResult {
     DeliveryResult {
-        primary: ArtifactOutcome::Delivered,
-        cbom: ArtifactOutcome::NotRequested,
+        primary: ArtifactOutcome {
+            dest: "stdout".to_string(),
+            ok: true,
+            bytes: 8,
+            error: None,
+        },
+        cbom: None,
+        diagnostics: Vec::new(),
     }
 }
 
@@ -1147,14 +1158,32 @@ fn exit_precedence() {
 }
 
 fn failed_delivery_with(which: &str) -> DeliveryResult {
+    let ok = ArtifactOutcome {
+        dest: "stdout".to_string(),
+        ok: true,
+        bytes: 8,
+        error: None,
+    };
     match which {
         "primary" => DeliveryResult {
-            primary: ArtifactOutcome::Failed("primary failed".to_string()),
-            cbom: ArtifactOutcome::NotRequested,
+            primary: ArtifactOutcome {
+                dest: "stdout".to_string(),
+                ok: false,
+                bytes: 0,
+                error: Some("primary failed".to_string()),
+            },
+            cbom: None,
+            diagnostics: vec!["primary stdout: primary failed".to_string()],
         },
         _ => DeliveryResult {
-            primary: ArtifactOutcome::Delivered,
-            cbom: ArtifactOutcome::Failed("cbom failed".to_string()),
+            primary: ok,
+            cbom: Some(ArtifactOutcome {
+                dest: "cbom.json".to_string(),
+                ok: false,
+                bytes: 0,
+                error: Some("cbom failed".to_string()),
+            }),
+            diagnostics: vec!["cbom cbom.json: cbom failed".to_string()],
         },
     }
 }
@@ -1306,7 +1335,7 @@ fn artifacts_carry_same_window() {
         effective_end_ns: 222_000,
         signal_cut: false,
     };
-    let d = doc(
+    let mut d = doc(
         vec![site_at(
             1,
             0,
@@ -1331,79 +1360,89 @@ fn artifacts_carry_same_window() {
         std::slice::from_ref(&PolicyRule::deny_algorithm("AES-256-GCM")),
         &d,
     );
+    d.policy = Some(policy_record(&v));
     let primary = tmp_path("primary.json");
     let cbom = tmp_path("cbom.json");
     let req = OutputRequest {
-        format: "json".to_string(),
-        out: Some(primary.to_string_lossy().to_string()),
-        cbom: Some(cbom.to_string_lossy().to_string()),
-        policy: v,
+        format: OutputFormat::Json,
+        primary: OutputDest::File(primary.clone()),
+        cbom: Some(OutputDest::File(cbom.clone())),
     };
     let delivery = write_artifacts(&d, &req);
-    assert_eq!(delivery.primary, ArtifactOutcome::Delivered);
-    assert_eq!(delivery.cbom, ArtifactOutcome::Delivered);
+    assert!(delivery.primary.ok);
+    assert!(delivery.cbom.as_ref().is_some_and(|c| c.ok));
     assert!(!delivery.failed());
     let p: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&primary).unwrap()).unwrap();
     let c: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&cbom).unwrap()).unwrap();
-    for (name, artifact) in [("primary", &p), ("cbom", &c)] {
-        assert_eq!(artifact["window"]["requested_start_ns"], 111_000, "{name}");
-        assert_eq!(artifact["window"]["requested_end_ns"], 222_000, "{name}");
-        assert_eq!(artifact["window"]["effective_start_ns"], 111_500, "{name}");
-        assert_eq!(artifact["window"]["effective_end_ns"], 222_000, "{name}");
-    }
+    assert_eq!(p["window"]["requested_start_ns"], 111_000);
+    assert_eq!(p["window"]["requested_end_ns"], 222_000);
+    assert_eq!(p["window"]["effective_start_ns"], 111_500);
+    assert_eq!(p["window"]["effective_end_ns"], 222_000);
+    let meta = cbom_metadata(&c);
+    assert_eq!(meta["osslscope:window-requested-start-ns"], "111000");
+    assert_eq!(meta["osslscope:window-requested-end-ns"], "222000");
+    assert_eq!(meta["osslscope:window-effective-start-ns"], "111500");
+    assert_eq!(meta["osslscope:window-effective-end-ns"], "222000");
     // The startup gap makes the absence unproven: artifacts still
     // deliver, carrying the policy verdict with the same window.
     assert_eq!(p["policy"]["verdict"], "inconclusive");
-    assert_eq!(c["policy_verdict"], "inconclusive");
+    assert_eq!(meta["osslscope:policy-verdict"], "inconclusive");
     let _ = std::fs::remove_file(&primary);
     let _ = std::fs::remove_file(&cbom);
+}
+
+fn cbom_metadata(cbom: &serde_json::Value) -> std::collections::BTreeMap<String, String> {
+    cbom["metadata"]["properties"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| {
+            (
+                p["name"].as_str().unwrap().to_string(),
+                p["value"].as_str().unwrap_or("").to_string(),
+            )
+        })
+        .collect()
 }
 
 /// Every requested artifact is attempted even when another fails, and
 /// each failure is reported without pretending delivery succeeded.
 #[test]
 fn all_artifacts_attempted_despite_failure() {
-    let d = complete_doc(Vec::new());
+    let mut d = complete_doc(Vec::new());
     let v = evaluate_document(
         std::slice::from_ref(&PolicyRule::deny_algorithm("AES-256-GCM")),
         &d,
     );
+    d.policy = Some(policy_record(&v));
     // Unwritable primary (missing parent), writable CBOM.
     let cbom = tmp_path("ok-cbom.json");
     let req = OutputRequest {
-        format: "json".to_string(),
-        out: Some(
-            tmp_path("no-such-dir-5f2c/out.json")
-                .to_string_lossy()
-                .to_string(),
-        ),
-        cbom: Some(cbom.to_string_lossy().to_string()),
-        policy: v.clone(),
+        format: OutputFormat::Json,
+        primary: OutputDest::File(tmp_path("no-such-dir-5f2c/out.json")),
+        cbom: Some(OutputDest::File(cbom.clone())),
     };
     let delivery = write_artifacts(&d, &req);
-    assert!(matches!(delivery.primary, ArtifactOutcome::Failed(_)));
-    assert_eq!(delivery.cbom, ArtifactOutcome::Delivered);
+    assert!(!delivery.primary.ok);
+    assert!(delivery.cbom.as_ref().is_some_and(|c| c.ok));
     assert!(delivery.failed());
+    assert!(!delivery.diagnostics.is_empty());
     assert!(cbom.is_file(), "CBOM still attempted");
     let _ = std::fs::remove_file(&cbom);
     // Reverse: writable primary, unwritable CBOM.
     let primary = tmp_path("ok-primary.json");
     let req = OutputRequest {
-        format: "json".to_string(),
-        out: Some(primary.to_string_lossy().to_string()),
-        cbom: Some(
-            tmp_path("no-such-dir-9d1a/cbom.json")
-                .to_string_lossy()
-                .to_string(),
-        ),
-        policy: v,
+        format: OutputFormat::Json,
+        primary: OutputDest::File(primary.clone()),
+        cbom: Some(OutputDest::File(tmp_path("no-such-dir-9d1a/cbom.json"))),
     };
     let delivery = write_artifacts(&d, &req);
-    assert_eq!(delivery.primary, ArtifactOutcome::Delivered);
-    assert!(matches!(delivery.cbom, ArtifactOutcome::Failed(_)));
+    assert!(delivery.primary.ok);
+    assert!(delivery.cbom.as_ref().is_some_and(|c| !c.ok));
     assert!(delivery.failed());
+    assert!(!delivery.diagnostics.is_empty());
     assert!(primary.is_file(), "primary still attempted");
     let _ = std::fs::remove_file(&primary);
 }

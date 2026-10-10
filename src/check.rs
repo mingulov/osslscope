@@ -16,11 +16,12 @@
 //! closed); a proved violation stays exit 10 even when an artifact path
 //! is unwritable or the child failed.
 use crate::capture;
-use crate::evidence::{CaptureDocument, Completeness, GapReason, RuleVerdict};
+use crate::evidence::{CaptureDocument, Completeness, PolicyRecord, RuleVerdict};
 use crate::policy::{
-    DefiniteHit, PolicyOutcome, PolicyRule, PolicyVerdict, apply_legacy_engine_fallback,
-    evaluate_document, executed_param_blind_ops, fips_unlabeled_calls,
+    PolicyOutcome, PolicyRule, PolicyVerdict, apply_legacy_engine_fallback, evaluate_document,
+    executed_param_blind_ops, fips_unlabeled_calls,
 };
+use crate::report::{DeliveryResult, OutputDest, OutputFormat, OutputRequest, write_artifacts};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -365,316 +366,57 @@ pub fn policy_json(doc: &CaptureDocument, v: &PolicyVerdict) -> serde_json::Valu
     })
 }
 
-fn reason_short(r: &GapReason) -> String {
-    match r {
-        GapReason::UnknownDenominator { scope } => format!("unknown-denominator({scope})"),
-        GapReason::UndiscoveredSites { scope, missing } => {
-            format!("undiscovered({scope}):{missing}")
-        }
-        GapReason::UnattachedSites { scope, missing } => {
-            format!("unattached({scope}):{missing}")
-        }
-        GapReason::Loss { counter, value, .. } => format!("{counter}={value}"),
-        GapReason::UnattributedCalls { sites, calls } => {
-            format!("unattributed={sites}s/{calls}c")
-        }
-        GapReason::StartupGap { missing_ns } => format!("startup-gap={missing_ns}ns"),
-        GapReason::TailGap { missing_ns } => format!("tail-gap={missing_ns}ns"),
-        GapReason::SignalCut => "signal-cut".to_string(),
-    }
-}
-
-fn status_line(doc: &CaptureDocument) -> String {
-    let status = match &doc.status {
-        Completeness::Complete => "COMPLETE".to_string(),
-        Completeness::Partial { reasons } => format!(
-            "PARTIAL reasons={}",
-            reasons
+/// Map a T10 [`PolicyVerdict`] onto the document [`PolicyRecord`]
+/// the T11 renderers embed (merge reconciliation: T11's as-built
+/// [`OutputRequest`](crate::report::OutputRequest) carries no policy
+/// input — policy rides the document). Rules sort into document
+/// order; definite hits become evidence refs resolving to sites in the
+/// same document. Legacy ENGINE tripwire calls have no document site,
+/// so a legacy-only violation maps to bounds WITHOUT evidence refs
+/// (T08 retires the tripwire once ENGINE executions surface as
+/// sites); exits and [`policy_json`] keep full fidelity either way.
+pub fn policy_record(v: &PolicyVerdict) -> PolicyRecord {
+    use crate::evidence::{PolicyEvidenceRef, PolicyRuleResult, PolicyVerdict as DocVerdict};
+    let mut rules: Vec<PolicyRuleResult> = v
+        .rules
+        .iter()
+        .map(|r| {
+            // Canonical order mirrors finalize: evidence refs sort
+            // (current hits precede fenced hits in evaluation order,
+            // which is not document order) as do rules.
+            let mut evidence: Vec<PolicyEvidenceRef> = r
+                .hits
                 .iter()
-                .map(reason_short)
-                .collect::<Vec<_>>()
-                .join(",")
-        ),
-        Completeness::Fatal { kind, .. } => format!("FATAL kind={kind:?}"),
-    };
-    format!(
-        "status={status} window={}-{} effective={}-{}",
-        doc.window.requested_start_ns,
-        doc.window.requested_end_ns,
-        doc.window.effective_start_ns,
-        doc.window.effective_end_ns,
-    )
-}
-
-fn short_obj(id: &str) -> String {
-    if id.len() > 16 {
-        format!("{}...", &id[..16])
-    } else {
-        id.to_string()
-    }
-}
-
-fn hit_line(h: &DefiniteHit) -> String {
-    let mut provs: Vec<&str> = h
-        .candidates
-        .iter()
-        .map(|c| c.provider_class.as_str())
-        .collect();
-    provs.sort();
-    provs.dedup();
-    let mut algs: Vec<&str> = h
-        .candidates
-        .iter()
-        .flat_map(|c| c.algorithm_classes.iter().map(String::as_str))
-        .collect();
-    algs.sort();
-    algs.dedup();
-    let alg_display = if algs.is_empty() {
-        "(no classes)".to_string()
-    } else {
-        algs.join(":")
-    };
-    let first = &h.candidates[0];
-    format!(
-        "{} via {}: {} calls (obj={} gen={}{}, {} funcid={})",
-        alg_display,
-        provs.join(","),
-        crate::report::grouped(h.calls),
-        short_obj(&h.site.object.0),
-        h.generation,
-        if h.fenced { ", fenced" } else { "" },
-        crate::report::op_display(first.op),
-        first.funcid,
-    )
-}
-
-fn tag(name: &str, matcher: &str) -> String {
-    if matcher.is_empty() {
-        format!("[{name}]")
-    } else {
-        format!("[{name} {matcher}]")
-    }
-}
-
-/// Verdict-first human output: violations, then inconclusive rules,
-/// then passes, then the evidence line plus doctrine notes.
-fn human(doc: &CaptureDocument, v: &PolicyVerdict) -> String {
-    let mut s = String::new();
-    let nv = v
-        .rules
-        .iter()
-        .filter(|r| r.verdict == RuleVerdict::Violation)
-        .count();
-    let ni = v
-        .rules
-        .iter()
-        .filter(|r| r.verdict == RuleVerdict::Inconclusive)
-        .count();
-    let np = v
-        .rules
-        .iter()
-        .filter(|r| r.verdict == RuleVerdict::Pass)
-        .count();
-    if v.no_verdict {
-        s.push_str("osslscope check: NO VERDICT (FATAL evidence; run doctor)\n");
-    } else if v.overall() == PolicyOutcome::Violation {
-        s.push_str(&format!(
-            "osslscope check: VIOLATION ({nv} rules violated, {ni} inconclusive, {np} passed)\n"
-        ));
-    } else if v.overall() == PolicyOutcome::Inconclusive {
-        s.push_str(&format!(
-            "osslscope check: INCONCLUSIVE ({ni} rules unproven, {np} passed)\n"
-        ));
-    } else {
-        s.push_str(&format!("osslscope check: PASS ({np} passed)\n"));
-    }
-    if !v.no_verdict {
-        for r in v
-            .rules
-            .iter()
-            .filter(|r| r.verdict == RuleVerdict::Violation)
-        {
-            if matches!(r.name, "require-provider" | "require-executed") {
-                s.push_str(&format!(
-                    "  {} not observed in window\n",
-                    tag(r.name, &r.matcher)
-                ));
-            } else {
-                for h in &r.hits {
-                    s.push_str(&format!("  {} {}\n", tag(r.name, &r.matcher), hit_line(h)));
-                }
-                if r.hits.is_empty() && r.legacy_engine_calls > 0 {
-                    s.push_str(&format!(
-                        "  {} ENGINE call: {} calls (tripwire, untimed)\n",
-                        tag(r.name, &r.matcher),
-                        crate::report::grouped(r.legacy_engine_calls)
-                    ));
-                }
+                .map(|h| PolicyEvidenceRef {
+                    object: h.site.object.clone(),
+                    device: h.site.device,
+                    inode: h.site.inode,
+                    offset: h.site.offset,
+                    generation: h.generation,
+                    calls: h.calls,
+                })
+                .collect();
+            evidence.sort();
+            PolicyRuleResult {
+                rule: r.name.to_string(),
+                predicate: r.matcher.clone(),
+                result: r.verdict,
+                definite: r.bounds.definite,
+                possible: r.bounds.possible,
+                evidence,
             }
-        }
-        for r in v
-            .rules
-            .iter()
-            .filter(|r| r.verdict == RuleVerdict::Inconclusive)
-        {
-            let poss = match r.bounds.possible {
-                Some(n) => n.to_string(),
-                None => "unknown".to_string(),
-            };
-            s.push_str(&format!(
-                "  {} inconclusive (definite={} possible={})\n",
-                tag(r.name, &r.matcher),
-                r.bounds.definite,
-                poss,
-            ));
-        }
-        for r in v.rules.iter().filter(|r| r.verdict == RuleVerdict::Pass) {
-            s.push_str(&format!(
-                "  {} pass ({} calls)\n",
-                tag(r.name, &r.matcher),
-                crate::report::grouped(r.bounds.definite)
-            ));
-        }
+        })
+        .collect();
+    rules.sort();
+    PolicyRecord {
+        verdict: match v.overall() {
+            PolicyOutcome::NoVerdict => DocVerdict::NoVerdict,
+            PolicyOutcome::Pass => DocVerdict::Pass,
+            PolicyOutcome::Violation => DocVerdict::Violation,
+            PolicyOutcome::Inconclusive => DocVerdict::Inconclusive,
+        },
+        rules,
     }
-    s.push_str(&format!("evidence: {}\n", status_line(doc)));
-    s.push_str("absence = not-observed in window (never \"not present / never used\")\n");
-    if param_blind(doc, v) {
-        s.push_str("note: algorithm rules are blind to SIGN/MAC/KDF/ASYM-CIPHER parameter-selected components (param values never captured)\n");
-    }
-    let unseen = unseen_deny_providers(v);
-    if !unseen.is_empty() {
-        s.push_str(&format!(
-            "note: --deny-provider matched nothing (verify spelling): {}\n",
-            unseen.join(", ")
-        ));
-    }
-    let fips = fips_unlabeled_calls(doc);
-    if fips > 0 {
-        s.push_str(&format!(
-            "note: {fips} FIPS-class calls unlabeled (self-test not distinguished; never excluded)\n"
-        ));
-    }
-    s.push_str("note: alg-name-only strength (key sizes unobservable); window-only claims\n");
-    s
-}
-
-// ------------------------------------------------- T11 checkpoint
-// Specified T11 interface, NOT YET LANDED in this branch: `report.rs`
-// will declare `OutputRequest`/`DeliveryResult` and
-// `write_artifacts(&CaptureDocument, &OutputRequest) -> DeliveryResult`.
-// This local mirror keeps T10 compiling and is DELETED at merge — the
-// coordinator swaps these paths for `crate::report::` (drift notes in
-// the T10 handoff). The mirror renders placeholder envelopes only; all
-// real v2 human/JSON/CBOM transformations belong to T11.
-
-/// Requested artifacts for one checked document: the primary
-/// human/JSON rendering plus an optional CBOM, with the T10-evaluated
-/// policy the renderers embed.
-pub struct OutputRequest {
-    pub format: String,
-    pub out: Option<String>,
-    pub cbom: Option<String>,
-    pub policy: PolicyVerdict,
-}
-
-/// Per-artifact delivery outcome.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ArtifactOutcome {
-    NotRequested,
-    Delivered,
-    Failed(String),
-}
-
-/// Delivery result across all requested artifacts.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DeliveryResult {
-    pub primary: ArtifactOutcome,
-    pub cbom: ArtifactOutcome,
-}
-
-impl DeliveryResult {
-    /// True when any REQUESTED artifact failed.
-    pub fn failed(&self) -> bool {
-        matches!(self.primary, ArtifactOutcome::Failed(_))
-            || matches!(self.cbom, ArtifactOutcome::Failed(_))
-    }
-
-    /// Bounded failure diagnostics for stderr.
-    pub fn failures(&self) -> Vec<String> {
-        let mut out = Vec::new();
-        if let ArtifactOutcome::Failed(e) = &self.primary {
-            out.push(format!("primary artifact: {e}"));
-        }
-        if let ArtifactOutcome::Failed(e) = &self.cbom {
-            out.push(format!("cbom artifact: {e}"));
-        }
-        out
-    }
-}
-
-/// Placeholder primary JSON: the finalized document plus the T10
-/// policy section. T11 replaces the envelope with the real v2 schema
-/// rendering (and reuses [`policy_json`]).
-fn render_primary_json(doc: &CaptureDocument, policy: &PolicyVerdict) -> String {
-    let mut v = serde_json::to_value(doc).expect("capture document serializes");
-    v["policy"] = policy_json(doc, policy);
-    serde_json::to_string_pretty(&v).expect("json renders") + "\n"
-}
-
-/// Placeholder CBOM: an honest stub carrying the exact capture window
-/// so same-window delivery is testable before T11 lands the CycloneDX
-/// renderer. Never shipped as a real CBOM.
-fn render_cbom_placeholder(doc: &CaptureDocument, policy: &PolicyVerdict) -> Vec<u8> {
-    let verdict = match policy.overall() {
-        PolicyOutcome::NoVerdict => "no-verdict",
-        PolicyOutcome::Pass => "pass",
-        PolicyOutcome::Violation => "violation",
-        PolicyOutcome::Inconclusive => "inconclusive",
-    };
-    let v = serde_json::json!({
-        "renderer": "t11-pending",
-        "note": "placeholder CBOM envelope: same-window stub only, replaced by T11 CycloneDX",
-        "schema": doc.schema,
-        "window": doc.window,
-        "policy_verdict": verdict,
-    });
-    (serde_json::to_string_pretty(&v).expect("json renders") + "\n").into_bytes()
-}
-
-fn write_file(path: &str, bytes: &[u8]) -> ArtifactOutcome {
-    match std::fs::write(path, bytes) {
-        Ok(()) => ArtifactOutcome::Delivered,
-        Err(e) => ArtifactOutcome::Failed(format!("write {path}: {e}")),
-    }
-}
-
-fn write_stdout(text: &str) -> ArtifactOutcome {
-    use std::io::Write;
-    let mut lock = std::io::stdout().lock();
-    match lock.write_all(text.as_bytes()).and_then(|()| lock.flush()) {
-        Ok(()) => ArtifactOutcome::Delivered,
-        Err(e) => ArtifactOutcome::Failed(format!("stdout: {e}")),
-    }
-}
-
-/// Attempt every requested artifact write — even when another fails —
-/// and report per-artifact outcomes. Diagnostics never pretend a
-/// failed delivery succeeded.
-pub fn write_artifacts(doc: &CaptureDocument, req: &OutputRequest) -> DeliveryResult {
-    let primary_text = if req.format == "json" {
-        render_primary_json(doc, &req.policy)
-    } else {
-        human(doc, &req.policy)
-    };
-    let primary = match &req.out {
-        None => write_stdout(&primary_text),
-        Some(path) => write_file(path, primary_text.as_bytes()),
-    };
-    let cbom = match &req.cbom {
-        None => ArtifactOutcome::NotRequested,
-        Some(path) => write_file(path, &render_cbom_placeholder(doc, &req.policy)),
-    };
-    DeliveryResult { primary, cbom }
 }
 
 const USAGE: [&str; 2] = [
@@ -719,20 +461,29 @@ pub fn run(argv: &[String]) -> ExitCode {
     // in so --deny-engine cannot miss them. No-op once T08 retires the
     // legacy block (or when the document already has the hits).
     apply_legacy_engine_fallback(&mut verdict, legacy_engine_calls(&c.legacy));
+    // Policy rides the document for the T11 renderers (JSON `policy`
+    // section, human policy block, CBOM `osslscope:policy-verdict`).
+    let child_exit = c.child_exit;
+    let mut document = c.document;
+    document.policy = Some(policy_record(&verdict));
     let req = OutputRequest {
-        format: args.format,
-        out: args.out,
-        cbom: args.cbom,
-        policy: verdict.clone(),
+        format: if args.format == "json" {
+            OutputFormat::Json
+        } else {
+            OutputFormat::Human
+        },
+        primary: match args.out {
+            None => OutputDest::Stdout,
+            Some(path) => OutputDest::File(path.into()),
+        },
+        cbom: args.cbom.map(|path| OutputDest::File(path.into())),
     };
-    let delivery = write_artifacts(&c.document, &req);
-    for f in delivery.failures() {
-        eprintln!("osslscope check: {f}");
-    }
+    let delivery = write_artifacts(&document, &req);
+    crate::report::emit_diagnostics(&delivery);
     ExitCode::from(exit_for(
         verdict.overall(),
-        c.child_exit,
-        &c.document,
+        child_exit,
+        &document,
         &delivery,
     ))
 }
@@ -742,9 +493,11 @@ mod tests {
     use super::*;
     use crate::evidence::{
         CandidateCoverage, CandidateIdentity, CaptureWindow, CounterKind, CounterSource,
-        CounterUnits, FinalizeInput, GapCounter, ObjectId, SiteExecution, SiteKey,
+        CounterUnits, FinalizeInput, GapCounter, ObjectId, OpensslVersion, SiteExecution, SiteKey,
+        TargetRecord,
     };
     use crate::policy::{Predicate, Rule};
+    use crate::report::ArtifactOutcome;
 
     fn cand(
         provider: &str,
@@ -796,6 +549,10 @@ mod tests {
             coverage: Vec::new(),
             counters: Vec::new(),
             fatal: None,
+            target: TargetRecord::unknown(),
+            openssl: OpensslVersion::unknown(),
+            disposition: None,
+            policy: None,
         })
     }
 
@@ -805,8 +562,27 @@ mod tests {
 
     fn ok_delivery() -> DeliveryResult {
         DeliveryResult {
-            primary: ArtifactOutcome::Delivered,
-            cbom: ArtifactOutcome::NotRequested,
+            primary: ArtifactOutcome {
+                dest: "stdout".to_string(),
+                ok: true,
+                bytes: 8,
+                error: None,
+            },
+            cbom: None,
+            diagnostics: Vec::new(),
+        }
+    }
+
+    fn failed_delivery() -> DeliveryResult {
+        DeliveryResult {
+            primary: ArtifactOutcome {
+                dest: "stdout".to_string(),
+                ok: false,
+                bytes: 0,
+                error: Some("x".to_string()),
+            },
+            cbom: None,
+            diagnostics: vec!["primary stdout: x".to_string()],
         }
     }
 
@@ -974,6 +750,10 @@ mod tests {
                 value: 1,
             }],
             fatal: None,
+            target: TargetRecord::unknown(),
+            openssl: OpensslVersion::unknown(),
+            disposition: None,
+            policy: None,
         });
         let inconclusive = evaluate_document(
             std::slice::from_ref(&PolicyRule::deny_algorithm("AES-256-GCM")),
@@ -982,10 +762,7 @@ mod tests {
         assert_eq!(pass.overall(), PolicyOutcome::Pass);
         assert_eq!(violation.overall(), PolicyOutcome::Violation);
         assert_eq!(inconclusive.overall(), PolicyOutcome::Inconclusive);
-        let failed = DeliveryResult {
-            primary: ArtifactOutcome::Failed("x".to_string()),
-            cbom: ArtifactOutcome::NotRequested,
-        };
+        let failed = failed_delivery();
         // Violation dominates child and artifact failure.
         assert_eq!(
             exit_for(violation.overall(), Some(1), &viol_doc, &ok_delivery()),
@@ -1040,6 +817,10 @@ mod tests {
             coverage: Vec::new(),
             counters: Vec::new(),
             fatal: Some(crate::evidence::FatalKind::AttachZero),
+            target: TargetRecord::unknown(),
+            openssl: OpensslVersion::unknown(),
+            disposition: None,
+            policy: None,
         });
         let v = evaluate_document(
             &[
@@ -1107,8 +888,10 @@ mod tests {
     }
 
     #[test]
-    fn human_verdict_shapes() {
-        // Violation with a definite hit and an absent require.
+    fn policy_record_mapping() {
+        use crate::evidence::PolicyVerdict as DocVerdict;
+        // Violation with a definite hit plus an absent require: both
+        // rules map, hits become evidence refs, verdict is violation.
         let d = doc(vec![site(
             1,
             500,
@@ -1121,24 +904,42 @@ mod tests {
             ],
             &d,
         );
-        let out = human(&d, &v);
-        assert!(
-            out.starts_with(
-                "osslscope check: VIOLATION (2 rules violated, 0 inconclusive, 0 passed)\n"
-            ),
-            "{out}"
-        );
-        assert!(
-            out.contains("[deny-algorithm DES] DES via default: 500 calls"),
-            "{out}"
-        );
-        assert!(
-            out.contains("[require-executed SHA2-256] not observed in window\n"),
-            "{out}"
-        );
-        assert!(out.contains("evidence: status=COMPLETE"), "{out}");
-        // Inconclusive sorts between violations and passes.
-        let gappy = crate::evidence::finalize(FinalizeInput {
+        let rec = policy_record(&v);
+        assert_eq!(rec.verdict, DocVerdict::Violation);
+        assert_eq!(rec.rules.len(), 2);
+        // Document order, not CLI order: deny-algorithm sorts first.
+        assert_eq!(rec.rules[0].rule, "deny-algorithm");
+        assert_eq!(rec.rules[0].predicate, "DES");
+        assert_eq!(rec.rules[0].result, RuleVerdict::Violation);
+        assert_eq!(rec.rules[0].definite, 500);
+        assert_eq!(rec.rules[0].possible, Some(500));
+        assert_eq!(rec.rules[0].evidence.len(), 1);
+        let e = &rec.rules[0].evidence[0];
+        assert_eq!(e.object.0, "exe-fingerprint");
+        assert_eq!((e.device, e.inode, e.offset), (7, 9, 1));
+        assert_eq!(e.generation, 0);
+        assert_eq!(e.calls, 500);
+        assert_eq!(rec.rules[1].rule, "require-executed");
+        assert_eq!(rec.rules[1].predicate, "SHA2-256");
+        assert_eq!(rec.rules[1].result, RuleVerdict::Violation);
+        assert!(rec.rules[1].evidence.is_empty(), "absence has no sites");
+        // Legacy-only tripwire: bounds WITHOUT evidence refs (no
+        // document site exists); the violation still maps.
+        let quiet = doc(Vec::new());
+        let mut v = evaluate_document(std::slice::from_ref(&PolicyRule::deny_engine()), &quiet);
+        crate::policy::apply_legacy_engine_fallback(&mut v, 5);
+        let rec = policy_record(&v);
+        assert_eq!(rec.verdict, DocVerdict::Violation);
+        assert_eq!(rec.rules[0].definite, 5);
+        assert_eq!(rec.rules[0].possible, None);
+        assert!(rec.rules[0].evidence.is_empty());
+        // Evidence refs sort into canonical order even though
+        // evaluation emits current hits before fenced hits.
+        let mut cur = site(9, 100, vec![cand("p", "default", 2, 21, &["DES"], true)]);
+        cur.generation = 1;
+        let mut fen = site(9, 50, vec![cand("p", "default", 2, 21, &["DES"], true)]);
+        fen.generation = 0;
+        let mixed = crate::evidence::finalize(FinalizeInput {
             window: CaptureWindow {
                 requested_start_ns: 1_000,
                 requested_end_ns: 2_000,
@@ -1146,43 +947,27 @@ mod tests {
                 effective_end_ns: 2_000,
                 signal_cut: false,
             },
-            sites: Vec::new(),
-            fenced: Vec::new(),
+            sites: vec![cur],
+            fenced: vec![crate::evidence::FencedGeneration {
+                generation: 0,
+                sites: vec![fen],
+            }],
             objects: Vec::new(),
             coverage: Vec::new(),
-            counters: vec![GapCounter {
-                name: "discovery.table_aborted".to_string(),
-                kind: CounterKind::Loss,
-                units: CounterUnits::Events,
-                source: CounterSource::Discovery,
-                value: 1,
-            }],
+            counters: Vec::new(),
             fatal: None,
+            target: TargetRecord::unknown(),
+            openssl: OpensslVersion::unknown(),
+            disposition: None,
+            policy: None,
         });
         let v = evaluate_document(
-            std::slice::from_ref(&PolicyRule::deny_algorithm("RC2")),
-            &gappy,
+            std::slice::from_ref(&PolicyRule::deny_algorithm("DES")),
+            &mixed,
         );
-        let out = human(&gappy, &v);
-        assert!(
-            out.starts_with("osslscope check: INCONCLUSIVE (1 rules unproven, 0 passed)\n"),
-            "{out}"
-        );
-        assert!(
-            out.contains("[deny-algorithm RC2] inconclusive (definite=0 possible=0)\n"),
-            "{out}"
-        );
-        // Pass and no-verdict headers.
-        let v = evaluate_document(
-            std::slice::from_ref(&PolicyRule::deny_weak()),
-            &doc(Vec::new()),
-        );
-        let out = human(&doc(Vec::new()), &v);
-        assert!(
-            out.starts_with("osslscope check: PASS (1 passed)\n"),
-            "{out}"
-        );
-        assert!(out.contains("  [deny-weak] pass (0 calls)\n"), "{out}");
+        let rec = policy_record(&v);
+        let gens: Vec<u32> = rec.rules[0].evidence.iter().map(|e| e.generation).collect();
+        assert_eq!(gens, vec![0, 1]);
     }
 
     #[test]
@@ -1203,19 +988,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn delivery_result_reports_requested_failures() {
-        let ok = DeliveryResult {
-            primary: ArtifactOutcome::Delivered,
-            cbom: ArtifactOutcome::NotRequested,
-        };
-        assert!(!ok.failed());
-        assert!(ok.failures().is_empty());
-        let bad = DeliveryResult {
-            primary: ArtifactOutcome::Delivered,
-            cbom: ArtifactOutcome::Failed("write b: denied".to_string()),
-        };
-        assert!(bad.failed());
-        assert_eq!(bad.failures(), vec!["cbom artifact: write b: denied"]);
-    }
+    // Delivery semantics (all-attempted, same-sink refusal,
+    // diagnostics bounds) are T11's: pinned by output_contract, not
+    // re-pinned here.
 }
