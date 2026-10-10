@@ -358,6 +358,7 @@ struct FakeProc {
     maps_delay_ns: u64,
     file_delay_ns: u64,
     maps_calls: usize,
+    comm: Option<String>,
 }
 
 impl ProcPort for FakeProc {
@@ -390,6 +391,10 @@ impl ProcPort for FakeProc {
 
     fn file_len(&mut self, path: &str) -> Option<u64> {
         self.files.get(path).map(|b| b.len() as u64)
+    }
+
+    fn read_comm(&mut self, _pid: u32) -> Option<String> {
+        self.comm.clone()
     }
 }
 
@@ -582,6 +587,7 @@ struct Harness {
     maps_err_at: HashSet<usize>,
     maps_delay_ns: u64,
     file_delay_ns: u64,
+    comm: Option<String>,
     cancelled: Rc<Cell<bool>>,
     cancel_on_poll: bool,
 }
@@ -638,6 +644,7 @@ impl Harness {
             maps_err_at: HashSet::new(),
             maps_delay_ns: 0,
             file_delay_ns: 0,
+            comm: None,
             cancelled: Rc::new(Cell::new(false)),
             cancel_on_poll: false,
         }
@@ -705,6 +712,7 @@ impl Harness {
             maps_delay_ns: self.maps_delay_ns,
             file_delay_ns: self.file_delay_ns,
             maps_calls: 0,
+            comm: self.comm,
         };
         let flag = self.cancelled.clone();
         let out = observe(
@@ -928,6 +936,20 @@ fn release_failure_on_dead_child_preserves_exit() {
     assert!(has_reason(&c, "no-query"), "{:?}", c.reasons);
     assert!(matches!(c.outcome, Outcome::Partial));
     assert!(post.target_log.borrow().resolved);
+}
+
+#[test]
+fn owned_comm_settles_post_release() {
+    // Acquisition snapshots comm while the child is stopped
+    // pre-exec; the post-release refresh settles the application
+    // identity instead of reporting the observer's comm.
+    let mut h = Harness::fresh("comm-settle");
+    h.snapshot_attached();
+    h.comm = Some("sleep-app".to_string());
+    h.exit_at_ns = Some(BASE_NS + 100_000_000);
+    let (out, _) = h.run();
+    let c = out.unwrap();
+    assert_eq!(c.target_comm, "sleep-app");
 }
 
 #[test]
@@ -1928,7 +1950,7 @@ fn refreshed_site_fingerprint_is_forwarded() {
 // Live lifecycle fixtures: real pids, real custody, no privileges.
 // ---------------------------------------------------------------------------
 
-use osslscope::capture::PollingLifecycle;
+use osslscope::capture::{LiveProc, PollingLifecycle};
 use osslscope::target::OwnedTarget;
 
 /// Assert `pid` has no waitable status left (reaped, never a zombie).
@@ -1988,6 +2010,7 @@ fn live_observe(test: &str, argv: &[&str], duration: Duration) -> (anyhow::Resul
         maps_delay_ns: 0,
         file_delay_ns: 0,
         maps_calls: 0,
+        comm: None,
     };
     let info = TargetInfo {
         pid,
@@ -2165,6 +2188,45 @@ fn live_same_tgid_exec_is_detected() {
     assert_eq!(after.events.len(), 1, "{after:?}");
     assert_eq!(after.events[0].kind, LifecycleKind::Exec);
     assert_eq!(after.events[0].pid, pid);
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+    }
+    let mut status = 0;
+    let r = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
+    assert!(r > 0);
+    assert_reaped(pid);
+}
+
+#[test]
+fn live_comm_settles_post_exec() {
+    // Acquisition reads comm while the child is stopped pre-exec
+    // (the observer's inherited comm); after release + exec the
+    // live read reports the application ("sleep").
+    let argv = vec!["/bin/sleep".to_string(), "30".to_string()];
+    let mut owned = OwnedTarget::spawn_stopped(&argv).unwrap();
+    let pid = owned.pid();
+    let mut proc = LiveProc;
+    let pre = proc.read_comm(pid);
+    assert_ne!(
+        pre.as_deref(),
+        Some("sleep"),
+        "pre-exec comm must not be the app: {pre:?}"
+    );
+    owned.release().unwrap();
+    let t0 = Instant::now();
+    let mut settled = None;
+    while t0.elapsed() < Duration::from_secs(5) {
+        settled = proc.read_comm(pid);
+        if settled.as_deref() == Some("sleep") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        settled.as_deref(),
+        Some("sleep"),
+        "post-exec comm never settled: {settled:?}"
+    );
     unsafe {
         libc::kill(pid as libc::pid_t, libc::SIGKILL);
     }

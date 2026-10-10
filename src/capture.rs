@@ -582,12 +582,16 @@ impl ClockPort for LiveClock {
 
 /// Target /proc + file reads: live mappings for planning, file bytes
 /// for ELF validation and object fingerprints, the exe link and file
-/// sizes for fence comparison.
+/// sizes for fence comparison, and the comm for post-exec identity.
 pub trait ProcPort {
     fn read_maps(&mut self, pid: u32) -> anyhow::Result<Vec<maps::Mapping>>;
     fn read_file(&mut self, path: &str) -> anyhow::Result<Vec<u8>>;
     fn read_exe(&mut self, pid: u32) -> Option<PathBuf>;
     fn file_len(&mut self, path: &str) -> Option<u64>;
+    /// Current comm (`None` when unreadable — the caller keeps its
+    /// snapshot). Owned children are acquired stopped pre-exec, so
+    /// this settles the application identity after release.
+    fn read_comm(&mut self, pid: u32) -> Option<String>;
 }
 
 /// Live /proc + filesystem reads.
@@ -608,6 +612,12 @@ impl ProcPort for LiveProc {
 
     fn file_len(&mut self, path: &str) -> Option<u64> {
         std::fs::metadata(path).map(|m| m.len()).ok()
+    }
+
+    fn read_comm(&mut self, pid: u32) -> Option<String> {
+        std::fs::read_to_string(format!("/proc/{pid}/comm"))
+            .map(|s| s.trim().to_string())
+            .ok()
     }
 }
 
@@ -1469,6 +1479,10 @@ struct Runner<'x, D, B: CountBackend, T, L, C: ClockPort, P: ProcPort> {
     seen_backings: HashSet<(String, u64)>,
     snapshot: Snapshot,
     last_live: Vec<maps::Mapping>,
+    /// Settled application comm: starts at the acquisition snapshot
+    /// (pre-exec for owned children) and refreshes post-release
+    /// until it differs (foreign targets never refresh).
+    comm: String,
     child_exit: Option<i32>,
     signal_cut: bool,
     expired: bool,
@@ -1616,6 +1630,15 @@ where
                     return Ok(RoundAction::Closed);
                 }
             }
+        }
+        // Post-exec comm settle (owned): refresh until the snapshot
+        // differs from the pre-exec acquisition value, then freeze —
+        // later setproctitle changes do not rewrite identity.
+        if owned
+            && self.comm == self.info.comm
+            && let Some(comm) = self.proc.read_comm(pid)
+        {
+            self.comm = comm;
         }
         let mut fresh = HashSet::new();
         for m in &live {
@@ -1885,6 +1908,7 @@ where
         seen_backings: HashSet::new(),
         snapshot: Snapshot::default(),
         last_live: Vec::new(),
+        comm: info.comm.clone(),
         child_exit: None,
         signal_cut: false,
         expired: false,
@@ -1985,6 +2009,13 @@ where
                 let _ = self.count.close_and_drain(self.cfg.grace);
                 let _ = self.target.resolve_setup_failure();
                 return Err(e.context("release"));
+            }
+            // Post-release comm settle: acquisition read comm while
+            // the child was stopped pre-exec (the observer's inherited
+            // comm); refresh now, and again per round until it differs
+            // (a slow exec settles late).
+            if let Some(comm) = self.proc.read_comm(pid) {
+                self.comm = comm;
             }
             self.requested_start_ns = self.clock.monotonic_ns();
             self.open_instant = self.clock.now();
@@ -2712,7 +2743,7 @@ where
         reasons.sort();
         Capture {
             target_pid: self.info.pid,
-            target_comm: self.info.comm.clone(),
+            target_comm: self.comm.clone(),
             window_planned: self.cfg.duration,
             window_actual: parts.window_actual,
             outcome: parts.outcome,
