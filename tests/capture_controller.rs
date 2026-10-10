@@ -219,9 +219,11 @@ impl DiscoveryPort for FakeDiscovery {
             .push("discovery_finished".to_string());
         if self.finish_recycled {
             // Mirror SessionCore::close on a dead /proc entry: typed
-            // recycle over discarded state.
+            // recycle over discarded state (no pre-wipe final: the
+            // fake stages no close-time joins).
             return Err(anyhow::Error::new(Recycled {
                 snapshot: DiscoverySnapshot::default(),
+                final_snapshot: None,
             }));
         }
         if self.finish_err {

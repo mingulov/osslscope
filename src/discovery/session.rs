@@ -467,9 +467,17 @@ pub trait SessionEnv {
 /// snapshot (zero rows; blind legacy at most — trip data is
 /// pid-scoped, hence tainted too). Callers render their
 /// `PARTIAL(pid-recycled)` discard from it.
+///
+/// `final_snapshot` is `Some` only from [`SessionCore::close`]: the
+/// pre-wipe cumulative state (all polls' joins plus the close-time
+/// tail count), for custody-holding callers whose pin failure is a
+/// reaped OWNED child (exit, not recycle). Foreign callers must
+/// never touch it (tainted pid scope); the wiped `snapshot` stays
+/// the discard contract.
 #[derive(Debug)]
 pub struct Recycled {
     pub snapshot: DiscoverySnapshot,
+    pub final_snapshot: Option<DiscoverySnapshot>,
 }
 
 impl std::fmt::Display for Recycled {
@@ -803,6 +811,16 @@ impl SessionCore {
     fn recycled_err(&self) -> anyhow::Error {
         anyhow::Error::new(Recycled {
             snapshot: self.snapshot(),
+            final_snapshot: None,
+        })
+    }
+
+    /// Recycle error carrying a pre-wipe final snapshot (close-time
+    /// only; see [`Recycled::final_snapshot`]).
+    fn recycled_err_with_final(&self, final_snapshot: DiscoverySnapshot) -> anyhow::Error {
+        anyhow::Error::new(Recycled {
+            snapshot: self.snapshot(),
+            final_snapshot: Some(final_snapshot),
         })
     }
 
@@ -1446,9 +1464,16 @@ impl SessionCore {
         let mut delta = DiscoveryDelta::default();
         self.join_snapshots(&snap, &mut delta);
         self.last_links = env.link_counts();
+        // Pre-wipe final: every poll's joins plus the close-time
+        // tail count, before the recycle wipe below destroys the
+        // tracker. A reaped owned child (custody-known exit, not a
+        // recycle) keeps this state via the error carrier instead of
+        // losing the close-time magnitude (G07: the doc records the
+        // event AND its count, never stderr-only).
+        let final_snap = self.snapshot();
         if env.verify_pin().is_err() {
             self.mark_recycled();
-            return Err(self.recycled_err());
+            return Err(self.recycled_err_with_final(final_snap));
         }
         Ok(self.snapshot())
     }

@@ -12,7 +12,7 @@ use osslscope::discovery::coverage::{HOST_DRAIN_SHORTFALL, HOST_ORPHAN_ROW, loss
 use osslscope::discovery::legacy::{Probe, ProbeSet};
 use osslscope::discovery::maps::Mapping;
 use osslscope::discovery::session::{
-    DiscoverySnapshot, MapSnapshots, PollBudget, SessionCore, SessionEnv,
+    DiscoverySnapshot, MapSnapshots, PollBudget, Recycled, SessionCore, SessionEnv,
 };
 use osslscope_ebpf_common as wire;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -873,4 +873,39 @@ fn evict_failure_is_loss() {
     assert_eq!(losses_of(&snap)[&HOST_EVICT_FAILED], 1);
     assert!(snap.reasons.contains(&"prefix-walk".to_string()));
     assert!(snap.retained_reasons.contains(&"prefix-walk".to_string()));
+}
+
+#[test]
+fn close_recycle_carries_prewip_final() {
+    // Close after a pin failure (reaped owned child): the wipe
+    // still discards tainted state, but the error carries the
+    // pre-wipe final (polls' joins + close-time tail count) so
+    // custody-holding callers lose neither the evidence nor the
+    // close-time magnitude (G07: the doc records the event AND its
+    // count, never stderr-only).
+    let mut env = TestEnv::new();
+    let mut core = test_core(false);
+    let arr = 0x7f00_1000u64;
+    env.push(query_ret(OP_DIGEST, arr, 0));
+    env.push(ok_alg(OP_DIGEST, arr, 0));
+    env.push(dispatch_row(OP_DIGEST, 7, 0x7f00_2000, arr, 0));
+    let d = core.poll(&mut env, ample_budget()).unwrap();
+    assert_eq!(d.candidates.len(), 1);
+    assert!(core.snapshot().queries_observed >= 1);
+    // Tail queued at close + pin dead (reaped): recycle error ...
+    for idx in 1..4u64 {
+        env.push(ok_alg(OP_DIGEST, arr, idx));
+    }
+    env.pin_ok = false;
+    let err = core.close(&mut env).unwrap_err();
+    let rec = err.downcast_ref::<Recycled>().expect("typed recycle");
+    // ... with the wiped discard snapshot (taint-safe contract) ...
+    assert!(rec.snapshot.candidates.is_empty());
+    assert_eq!(rec.snapshot.queries_observed, 0);
+    // ... AND the pre-wipe final: the poll's candidate + query plus
+    // the 3 close-time tail items as shortfall magnitude.
+    let fin = rec.final_snapshot.as_ref().expect("close carries final");
+    assert_eq!(fin.candidates.len(), 1);
+    assert!(fin.queries_observed >= 1);
+    assert_eq!(losses_of(fin)[&HOST_DRAIN_SHORTFALL], 3);
 }
