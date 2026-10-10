@@ -1635,6 +1635,17 @@ where
             .fork_exec_ignored
             .saturating_add(sweep.events.len() as u64);
         self.lifecycle_loss = self.lifecycle_loss.saturating_add(sweep.loss);
+        // Slow metadata work above (file reads, fence snapshots,
+        // lifecycle scan) may have crossed the deadline — or a
+        // signal may have landed — since the pre-read check: no
+        // post-deadline discovery poll (its tripwire would pollute
+        // in-window evidence). The loop owns the signal cut.
+        if (self.cancelled)() {
+            return Ok(RoundAction::Continue);
+        }
+        if self.clock.now() >= deadline {
+            return Ok(RoundAction::Expired);
+        }
         // Discovery catch-up: backpressure re-polls, bounded, with
         // the deadline enforced even while discovery is busy.
         let post_settle = self.clock.now() >= settle_end;

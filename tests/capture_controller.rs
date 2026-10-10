@@ -1338,6 +1338,76 @@ fn delayed_metadata_io_still_meets_deadline() {
 }
 
 #[test]
+fn slow_metadata_past_deadline_admits_no_tripwire() {
+    // 300ms metadata reads cross the 1900ms deadline mid-round (at
+    // ~1650ms the sleep has not crossed, the file reads do): the
+    // round expires BEFORE polling, so the scripted post-deadline
+    // ENGINE tripwire never becomes in-window legacy evidence.
+    // `--pid` keeps the loop deadline fixed (no clamp interaction):
+    // this pins the mid-round recheck alone.
+    use osslscope::discovery::legacy::{Probe, ProbeSet};
+    use osslscope_ebpf_common as wire;
+    let mut h = Harness::fresh("slow-trip");
+    h.owned = false;
+    h.cfg.duration = Duration::from_millis(1900);
+    h.snapshot_attached();
+    h.file_delay_ns = 300_000_000;
+    let set = ProbeSet {
+        probes: vec![Probe {
+            cookie: 7,
+            symbol: "ENGINE_by_id".to_string(),
+            offset: 0x100,
+            module: "/p/libcrypto.so.3".to_string(),
+            family: None,
+            str_arg: None,
+            program: "trip_count",
+        }],
+        engine_uninstrumented: 0,
+        meth_uninstrumented: 0,
+        lowlevel_uninstrumented: 0,
+        unprobed_engine_syms: Vec::new(),
+        unprobed_meth_syms: Vec::new(),
+        unprobed_lowlevel_syms: Vec::new(),
+        findings: Vec::new(),
+        by_id_cookies: HashSet::from([7]),
+        load_cookies: HashSet::new(),
+    };
+    h.snapshot.legacy.set = Some(set);
+    let hit = || osslscope::discovery::legacy::TripHit {
+        cookie: 7,
+        class: wire::ENGINE_DYNAMIC,
+        status: wire::TRIP_OK,
+    };
+    h.polls.push_back(DiscoveryDelta::default());
+    h.polls.push_back(DiscoveryDelta {
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    h.polls.push_back(DiscoveryDelta::default());
+    // Poll 3 runs only if the round polls past the deadline.
+    h.polls.push_back(DiscoveryDelta {
+        tripwire: TripwireDelta {
+            hits: vec![hit(), hit(), hit(), hit(), hit()],
+            counter_deltas: vec![(7, 5)],
+            executed_legacy_queries_delta: 5,
+        },
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    let (out, _) = h.run();
+    let c = out.unwrap();
+    assert_eq!(
+        c.legacy["legacy_provider"]["executed_calls"],
+        serde_json::json!(0)
+    );
+    assert_eq!(
+        c.legacy["engine"]["calls_by_entrypoint"]["ENGINE_by_id"],
+        serde_json::json!(0)
+    );
+    assert_eq!(c.counters.over_budget, 1);
+}
+
+#[test]
 fn partial_final_delta_reconciles_once() {
     // Lossy final polls plus a close-tail residual: each increment
     // counts exactly once, and attached evidence survives.
