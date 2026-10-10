@@ -27,43 +27,6 @@ pub fn check_version(v: &str) -> bool {
     }
 }
 
-/// Assert a document carries every `required` key in the schema
-/// (recursive over properties/items; nulls and absent optionals
-/// skipped). Structural pin for goldens — external consumers use
-/// real JSON-Schema validators against the schema file.
-#[cfg(test)]
-pub(crate) fn assert_required_keys(schema: &serde_json::Value, doc: &serde_json::Value) {
-    fn walk(schema: &serde_json::Value, doc: &serde_json::Value, path: &str) {
-        if let Some(req) = schema.get("required").and_then(|v| v.as_array()) {
-            let obj = doc
-                .as_object()
-                .unwrap_or_else(|| panic!("{path}: not an object"));
-            for k in req {
-                let k = k.as_str().unwrap();
-                assert!(obj.contains_key(k), "{path}: missing required key '{k}'");
-            }
-        }
-        if let Some(props) = schema.get("properties").and_then(|v| v.as_object()) {
-            for (k, sub) in props {
-                if let Some(d) = doc.get(k) {
-                    if d.is_null() {
-                        continue;
-                    }
-                    walk(sub, d, &format!("{path}.{k}"));
-                }
-            }
-        }
-        if let Some(items) = schema.get("items") {
-            if let Some(arr) = doc.as_array() {
-                for (i, d) in arr.iter().enumerate() {
-                    walk(items, d, &format!("{path}[{i}]"));
-                }
-            }
-        }
-    }
-    walk(schema, doc, "$");
-}
-
 // ---------------------------------------------------------------- v2 schema
 //
 // `observed-crypto-v2` reader contract (continuation R08). Unlike the
@@ -1431,38 +1394,24 @@ mod tests {
     }
 
     #[test]
-    fn goldens_conform_to_schema() {
+    fn no_v1_report_goldens_remain() {
+        // T14r4: the v1 report renderer is deleted (PRD §14.1 v2-only
+        // live producer), so no v1 report golden may exist — any
+        // checked-in one is v1 rot. (The v1 READER stays tested by
+        // the check_version unit tests; the frozen v1 auditor golden
+        // lives at tests/auditor_golden.json, outside goldens/.)
         let dir = format!("{}/tests/goldens", env!("CARGO_MANIFEST_DIR"));
-        let schema: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(format!(
-                "{}/schemas/observed-crypto-v1.json",
-                env!("CARGO_MANIFEST_DIR")
-            ))
-            .unwrap(),
-        )
-        .unwrap();
-        let mut n = 0;
-        let mut entries: Vec<_> = std::fs::read_dir(&dir)
+        let entries: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .map(|e| e.unwrap().file_name().to_str().unwrap().to_string())
-            // v1 files only (`report-v2-*` conform to the v2 schema
-            // under `goldens_v2_conform_to_schema` below).
             .filter(|f| {
                 f.starts_with("report-") && !f.starts_with("report-v2-") && f.ends_with(".json")
             })
             .collect();
-        entries.sort();
-        for f in entries {
-            let doc: serde_json::Value =
-                serde_json::from_str(&std::fs::read_to_string(format!("{dir}/{f}")).unwrap())
-                    .unwrap();
-            let v = doc["schema_version"].as_str().unwrap();
-            assert!(check_version(v), "{f}: reader rejects {v}");
-            assert!(!check_version_v2(v), "{f}: v1 file accepted by v2 reader");
-            assert_required_keys(&schema, &doc);
-            n += 1;
-        }
-        assert!(n >= 8, "expected report goldens, found {n}");
+        assert!(
+            entries.is_empty(),
+            "v1 report goldens rot: {entries:?} (v1 is unproduced)"
+        );
     }
 
     #[test]

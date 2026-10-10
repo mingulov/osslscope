@@ -60,41 +60,35 @@ pub fn parse_maps(text: &str) -> Vec<Mapping> {
 pub fn provider_mapping<'a>(
     maps: &'a [Mapping],
     provider: &Path,
-    canon: &str,
+    _canon: &str,
     addr: u64,
 ) -> Option<&'a Mapping> {
-    let arg = provider.to_string_lossy();
-    // Same-file arm: stat the provider argument (follows symlinks,
-    // so symlink aliases resolve to the mapped file's identity). Any
-    // mapping of the same (dev,ino) covering `addr` is the provider
-    // file, whatever locator path it was mapped under. The stat runs
-    // per call (not hoisted): a provider path replaced mid-run must
-    // resolve to the CURRENT file, never a pinned stale identity
-    // (the epoch machinery binds the returned backing triple). A stat
-    // failure (deleted path, permissions) falls through to the path
-    // arms; an unlinked-but-mapped file then fails closed (loud
-    // attach failure), never misattributed.
-    if let Ok(meta) = std::fs::metadata(provider) {
-        let ino = meta.ino();
-        if ino != 0 {
-            let dev = format!(
-                "{:02x}:{:02x}",
-                libc::major(meta.dev()),
-                libc::minor(meta.dev())
-            );
-            if let Some(m) = maps
-                .iter()
-                .find(|m| m.start <= addr && addr < m.end && m.ino == ino && m.dev == dev)
-            {
-                return Some(m);
-            }
-        }
+    // Same-file ONLY (stat-or-None): stat the provider argument
+    // (follows symlinks, so symlink/hardlink/bind aliases resolve
+    // to the mapped file's identity). Any mapping of the same inode
+    // covering `addr` is the provider file, whatever locator path
+    // it was mapped under. The stat runs per call (not hoisted): a
+    // provider path replaced mid-run resolves to the CURRENT file,
+    // never a pinned stale identity. There is NO pathname fallback:
+    // after a same-path replacement the old mapping still matches
+    // by pathname but backs the WRONG bytes, and a deleted path's
+    // unlinked mapping must fail closed (loud attach failure), never
+    // misattribute (T14r4-2b). The match key is the INODE alone:
+    // stat-dev and maps-text dev DIVERGE on overlayfs (measured
+    // 00:33 vs 00:22 for one file — xino reporting), while the inode
+    // is the same dentry both sides. Addr coverage makes cross-fs
+    // ino collisions vanish (two filesystems' files mapped over one
+    // address), and the epoch fingerprint keeps the maps-view dev
+    // for maps-consistent turnover detection.
+    let Ok(meta) = std::fs::metadata(provider) else {
+        return None;
+    };
+    let ino = meta.ino();
+    if ino == 0 {
+        return None;
     }
-    maps.iter().find(|m| {
-        m.start <= addr
-            && addr < m.end
-            && (m.path == arg || m.path == canon || (!canon.is_empty() && m.path.ends_with(canon)))
-    })
+    maps.iter()
+        .find(|m| m.start <= addr && addr < m.end && m.ino == ino)
 }
 
 #[cfg(test)]
@@ -115,18 +109,53 @@ mod tests {
         assert_eq!(m[1].ino, 1234);
     }
 
+    /// T14r4-2b pins: no pathname fallback. A same-path
+    /// replacement (new inode, old mapping still matches by
+    /// pathname) must NOT resolve to the stale bytes, and a deleted
+    /// path must fail closed even though its unlinked mapping keeps
+    /// the pathname. Identity is (dev,ino), never the locator.
     #[test]
-    fn mapping_lookup_by_suffix() {
-        let m = parse_maps(SAMPLE);
-        let hit = provider_mapping(
-            &m,
-            Path::new("provider.so"),
-            "lib64/provider.so",
-            0x7f2a2400,
+    fn mapping_lookup_rejects_stale_pathname() {
+        let dir = std::env::temp_dir().join(format!("osslscope-repl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("idprov.so");
+        std::fs::write(&path, b"v1-bytes").unwrap();
+        let meta1 = std::fs::metadata(&path).unwrap();
+        let dev = format!(
+            "{:02x}:{:02x}",
+            libc::major(meta1.dev()),
+            libc::minor(meta1.dev())
         );
-        assert!(hit.is_some() && hit.unwrap().x);
+        // Target mapped v1 under the module path.
+        let text = format!(
+            "7f2a2000-7f2a3000 r-xp 00000000 {} {} {}\\n",
+            dev,
+            meta1.ino(),
+            path.display()
+        );
+        let m = parse_maps(&text);
+        assert_eq!(m.len(), 1);
+        // Sanity: v1 resolves while it is the current file.
+        assert!(provider_mapping(&m, &path, "", 0x7f2a2400).is_some());
+        // Replace the path with v2 bytes (new inode, same path).
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"v2-bytes-longer").unwrap();
+        let meta2 = std::fs::metadata(&path).unwrap();
+        assert_ne!(meta2.ino(), meta1.ino());
+        // The old mapping still matches BY PATHNAME, but it backs
+        // v1 bytes, not the current file: fail closed, never
+        // misattribute the stale bytes as the new provider.
+        assert!(provider_mapping(&m, &path, "", 0x7f2a2400).is_none());
+        // Deleted path with the unlinked mapping still present:
+        // fail closed (no pathname fallback to the ghost).
+        std::fs::remove_file(&path).unwrap();
+        assert!(provider_mapping(&m, &path, "", 0x7f2a2400).is_none());
+        // Unrelated path and out-of-range address stay negative.
         assert!(provider_mapping(&m, Path::new("other.so"), "", 0x7f2a2400).is_none());
-        assert!(provider_mapping(&m, Path::new("provider.so"), "", 0x1000).is_none());
+        std::fs::write(&path, b"v3").unwrap();
+        assert!(provider_mapping(&m, &path, "", 0x1000).is_none());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap_or_default();
     }
 
     /// F-IDENT-1 pin: a hardlink alias (same inode, unrelated path)
@@ -167,8 +196,8 @@ mod tests {
         std::fs::write(&other, b"different-bytes").unwrap();
         assert_ne!(std::fs::metadata(&other).unwrap().ino(), meta.ino());
         assert!(provider_mapping(&m, &other, "", 0x7f2a2400).is_none());
-        // Deleted provider path: stat fails, no path arm matches the
-        // alias-only mapping — fail closed, never misattribute.
+        // Deleted provider path: stat fails → None (no pathname
+        // fallback) — fail closed, never misattribute.
         std::fs::remove_file(&orig).unwrap();
         std::fs::remove_file(&alias).unwrap();
         let ghost = dir.join("prov-v1.so");
