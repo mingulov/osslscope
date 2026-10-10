@@ -189,6 +189,45 @@ pub fn map_update_elem(map_fd: RawFd, key: &[u8], value: &[u8], flags: u64) -> i
     Ok(())
 }
 
+/// Load a KPROBE-typed program (uprobe family) with no verifier log
+/// (`log_level` 0): the success path needs no diagnostics, and a
+/// large-but-valid verification can overflow any fixed log buffer
+/// (`ENOSPC`) even when the program verifies. Callers retry
+/// failures via [`prog_load_kprobe`] to capture the report.
+pub fn prog_load_kprobe_quiet(
+    insns: &[u8],
+    license: &CStr,
+    token: Option<RawFd>,
+    name: &str,
+) -> io::Result<OwnedFd> {
+    assert!(insns.len() % 8 == 0, "BPF insn stride is 8 bytes");
+    let mut attr: ProgAttr = zeroed();
+    attr.prog_type = BPF_PROG_TYPE_KPROBE;
+    let bytes = name.as_bytes();
+    let n = bytes.len().min(15);
+    attr.prog_name[..n].copy_from_slice(&bytes[..n]);
+    // Multi attach requires this at load (is_uprobe_multi checks
+    // expected_attach_type, not the link's attach_type); 0 yields EINVAL.
+    attr.expected_attach_type = BPF_TRACE_UPROBE_MULTI;
+    attr.insn_cnt = (insns.len() / 8) as u32;
+    attr.insns = insns.as_ptr() as u64;
+    attr.license = license.as_ptr() as u64;
+    attr.log_level = 0;
+    attr.log_size = 0;
+    attr.log_buf = 0;
+    attr.prog_token_fd = token.unwrap_or(0);
+    if token.is_some() {
+        attr.prog_flags |= BPF_F_TOKEN_FD;
+    }
+    let fd = bpf(
+        BPF_PROG_LOAD,
+        std::ptr::addr_of_mut!(attr).cast(),
+        size_of::<ProgAttr>(),
+    )?;
+    // SAFETY: bpf() returned a fresh owned fd.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
 /// Load a KPROBE-typed program (uprobe family). `insns` is raw 8B-stride
 /// BPF bytecode; verifier output lands in `log_buf` on failure.
 /// `name` lands in the kernel prog name (truncated to 15 bytes) so

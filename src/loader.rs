@@ -11,7 +11,7 @@
 //! object. Fail-closed throughout: any shape drift (BTF sections,
 //! unknown relocs, dim mismatch, non-GPL license) is an error, and
 //! map-fd fixups assert `BPF_PSEUDO_MAP_FD` at the site.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::fd::{AsRawFd as _, OwnedFd};
 
 /// BPF relocation types (from `readelf -r` on the real object).
@@ -373,6 +373,9 @@ fn sec_index(elf: &goblin::elf::Elf, want: &str) -> anyhow::Result<usize> {
 
 /// BPF static-call opcode (sites carry src=1 + a reloc).
 const BPF_CALL: u8 = 0x85;
+/// `call` src reg marking a subprogram (pseudo) call, as opposed to
+/// a helper call (`src == 0`, imm = helper id).
+const BPF_PSEUDO_CALL: u8 = 1;
 
 /// Resolve an `R_BPF_64_32` call reloc to a `.text` function name.
 /// Named FUNC syms resolve by (value, name); STT_SECTION syms (the
@@ -442,6 +445,37 @@ fn apply_call(
         .try_into()
         .map_err(|_| anyhow::anyhow!("{prog}: call target out of range"))?;
     insn[4..8].copy_from_slice(&imm32.to_le_bytes());
+    Ok(())
+}
+
+/// Reject a linked image containing a subprogram call that was not
+/// rewritten from a relocation (F-BPF-1 hardening).
+///
+/// The toolchain pre-resolves same-section local→local calls to
+/// relative pseudo-calls WITHOUT relocs, and reachable-subset
+/// linking (required: the verifier rejects unreachable trailing
+/// insns) invalidates their offsets — observed as `window_byte`
+/// mis-linked onto `memset`, surfacing in the guest as `invalid
+/// size of register spill`. Helper calls (`src == 0`) need no
+/// reloc and are ignored; every pseudo-call (`src ==
+/// BPF_PSEUDO_CALL) must be in `rewritten` (byte offsets into
+/// `insns` that `apply_call` patched from a reloc).
+fn check_calls_rewritten(
+    insns: &[u8],
+    rewritten: &HashSet<usize>,
+    prog: &str,
+) -> anyhow::Result<()> {
+    if insns.len() % 8 != 0 {
+        anyhow::bail!("{prog}: linked insns not a whole count");
+    }
+    for (i, insn) in insns.chunks_exact(8).enumerate() {
+        if insn[0] == BPF_CALL && insn[1] >> 4 == BPF_PSEUDO_CALL && !rewritten.contains(&(i * 8)) {
+            anyhow::bail!(
+                "{prog}: unrelocated static call at insn {i} \
+                 (callee must be global or inlined)"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -654,11 +688,16 @@ pub fn prepare(obj: &[u8], maps: &[MapSpec], progs: &[ProgSpec]) -> anyhow::Resu
             insns.extend_from_slice(bytes);
         }
         // Apply calls (main + included) and included map sites.
+        // Every rewritten call site is recorded: the linked image
+        // must contain no other pseudo-call (see
+        // `check_calls_rewritten`).
+        let mut rewritten: HashSet<usize> = HashSet::new();
         for (local, target) in &roots {
             let t = base
                 .get(target)
                 .ok_or_else(|| anyhow::anyhow!("prog {}: call vs unlinked {target}", p.name))?;
             apply_call(&mut insns, *local, *t, p.name)?;
+            rewritten.insert(*local);
         }
         for r in relocs.get(".text").map(Vec::as_slice).unwrap_or(&[]) {
             let Some(owner) = text_owner(r.off) else {
@@ -706,10 +745,12 @@ pub fn prepare(obj: &[u8], maps: &[MapSpec], progs: &[ProgSpec]) -> anyhow::Resu
                                 .map(|(v, _, _)| *v)
                                 .unwrap());
                     apply_call(&mut insns, site, *t, p.name)?;
+                    rewritten.insert(site);
                 }
                 t => anyhow::bail!("prog {}: text reloc type {t} unsupported", p.name),
             }
         }
+        check_calls_rewritten(&insns, &rewritten, p.name)?;
         out.push(PreparedProg {
             name: p.name.to_string(),
             is_return,
@@ -760,21 +801,74 @@ pub fn load(prep: &Prepared) -> anyhow::Result<Loaded> {
             insn[1] = (insn[1] & 0x0f) | (BPF_PSEUDO_MAP_FD << 4);
             insn[4..8].copy_from_slice(&(fd.as_raw_fd() as u32).to_le_bytes());
         }
-        let mut log = vec![0u8; 1 << 20];
         let license = c"GPL";
-        let fd = ossl_bpf_sys::prog_load_kprobe(&insns, license, None, &mut log, &p.name).map_err(
-            |e| {
-                let detail = String::from_utf8_lossy(&log)
-                    .trim_end_matches('\0')
-                    .chars()
-                    .take(2000)
-                    .collect::<String>();
-                anyhow::anyhow!("prog_load {}: {e}\n{detail}", p.name)
-            },
-        )?;
+        // Quiet load first: success needs no diagnostics, and a
+        // large-but-valid verification can overflow a fixed log
+        // buffer (`ENOSPC`) even when the program verifies. On
+        // failure, retry with the log buffer to capture the
+        // verifier's report (a 4 MiB buffer: failure explorations
+        // run to ~0.9 MiB, and an overflowed buffer would eat the
+        // very diagnostics the retry exists for).
+        let fd = match ossl_bpf_sys::prog_load_kprobe_quiet(&insns, license, None, &p.name) {
+            Ok(fd) => fd,
+            Err(_) => {
+                let mut log = vec![0u8; 4 << 20];
+                match ossl_bpf_sys::prog_load_kprobe(&insns, license, None, &mut log, &p.name) {
+                    Ok(fd) => fd,
+                    Err(e) => {
+                        let full = trim_nul(&log);
+                        let detail = String::from_utf8_lossy(full)
+                            .chars()
+                            .take(2000)
+                            .collect::<String>();
+                        let spill = spill_verifier_log(&p.name, full);
+                        return Err(anyhow::anyhow!(
+                            "prog_load {}: {e}\n{detail}{}",
+                            p.name,
+                            spill
+                                .map(|p| format!("\n(full verifier log: {})", p.display()))
+                                .unwrap_or_default()
+                        ));
+                    }
+                }
+            }
+        };
         progs.insert(p.name.clone(), fd);
     }
     Ok(Loaded { progs, maps })
+}
+
+/// Strip the kernel log buffer's NUL padding (the verifier writes a
+/// C string into our 1 MiB buffer).
+fn trim_nul(log: &[u8]) -> &[u8] {
+    let mut end = log.len();
+    while end > 0 && log[end - 1] == 0 {
+        end -= 1;
+    }
+    &log[..end]
+}
+
+/// Best-effort spill of a FULL verifier log on `prog_load` failure
+/// (F-DIAG-1): the in-error summary stays capped at 2000 chars, but
+/// diagnosis needs the whole multi-hundred-KB text, so it lands in
+/// a temp file whose path the error names. Returns the path written.
+fn spill_verifier_log(prog: &str, log: &[u8]) -> Option<std::path::PathBuf> {
+    let safe: String = prog
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let path = std::env::temp_dir().join(format!(
+        "osslscope-verifier-{safe}-{}.log",
+        std::process::id()
+    ));
+    std::fs::write(&path, log).ok()?;
+    Some(path)
 }
 
 #[cfg(test)]
@@ -789,6 +883,79 @@ mod tests {
     }
     fn u64(v: u64) -> [u8; 8] {
         v.to_le_bytes()
+    }
+
+    #[test]
+    fn trim_nul_strips_padding_only() {
+        assert_eq!(trim_nul(b"abc\0\0"), b"abc");
+        assert_eq!(trim_nul(b"abc"), b"abc");
+        assert_eq!(trim_nul(b"\0\0"), b"");
+        assert_eq!(trim_nul(b""), b"");
+        assert_eq!(trim_nul(b"a\0b\0"), b"a\0b");
+    }
+
+    #[test]
+    fn verifier_spill_round_trips_full_log() {
+        let body = vec![b'v'; 300_000];
+        let path = spill_verifier_log("query_return", &body).unwrap();
+        let back = std::fs::read(&path).unwrap();
+        assert_eq!(back, body);
+        assert!(path.to_string_lossy().contains("query_return"));
+        std::fs::remove_file(&path).ok();
+        // Hostile prog names cannot escape the temp dir.
+        let evil = spill_verifier_log("../../x", b"e").unwrap();
+        assert!(
+            evil.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("osslscope-verifier-")
+        );
+        std::fs::remove_file(&evil).ok();
+    }
+
+    fn call_insn(src_pseudo: bool, imm: i32) -> [u8; 8] {
+        let mut b = [0u8; 8];
+        b[0] = BPF_CALL;
+        b[1] = if src_pseudo { BPF_PSEUDO_CALL << 4 } else { 0 };
+        b[4..8].copy_from_slice(&imm.to_le_bytes());
+        b
+    }
+
+    #[test]
+    fn stale_static_calls_fail_closed() {
+        let exit = [0x95u8, 0, 0, 0, 0, 0, 0, 0];
+        let helper = call_insn(false, 14);
+        let pseudo = call_insn(true, 205);
+        let img = |insns: &[&[u8; 8]]| {
+            let mut v = Vec::new();
+            for i in insns {
+                v.extend_from_slice(*i);
+            }
+            v
+        };
+        // Helper calls need no reloc.
+        let ok = img(&[&helper, &exit]);
+        check_calls_rewritten(&ok, &HashSet::new(), "p").unwrap();
+        // Rewritten pseudo-calls pass.
+        let ok = img(&[&pseudo, &exit]);
+        check_calls_rewritten(&ok, &[0usize].into_iter().collect(), "p").unwrap();
+        // Unrewritten pseudo-calls fail, naming the insn.
+        let bad = img(&[&pseudo, &exit]);
+        let e = check_calls_rewritten(&bad, &HashSet::new(), "p").unwrap_err();
+        assert!(
+            e.to_string().contains("unrelocated static call at insn 0"),
+            "{e:#}"
+        );
+        // A rewritten set covering the wrong offset does not help.
+        let bad = img(&[&exit, &pseudo]);
+        let e = check_calls_rewritten(&bad, &[0usize].into_iter().collect(), "p").unwrap_err();
+        assert!(
+            e.to_string().contains("unrelocated static call at insn 1"),
+            "{e:#}"
+        );
+        // Ragged images fail rather than scan short.
+        let e = check_calls_rewritten(&[0u8; 7], &HashSet::new(), "p").unwrap_err();
+        assert!(e.to_string().contains("not a whole count"), "{e:#}");
     }
 
     /// Minimal BPF relocatable: 1 uprobe prog (ld_map/call/exit),

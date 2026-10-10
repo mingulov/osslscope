@@ -27,7 +27,13 @@ fn host_trip_table() -> HashMap<u64, wire::TripClassValue> {
 
 fn classify_host(name: &[u8], saturated: bool) -> wire::AlgVerdict {
     let t = host_alg_table();
-    wire::classify_alg_with(name, saturated, |h| t.get(&h).copied())
+    // Zero-padded 128-byte window, like the BPF stack array (the
+    // classifier scans the full window; overlong `len` returns
+    // before any read).
+    let mut buf = [0u8; wire::ALG_WINDOW];
+    let n = name.len().min(wire::ALG_WINDOW);
+    buf[..n].copy_from_slice(&name[..n]);
+    wire::classify_alg_with(&buf, name.len(), saturated, |h| t.get(&h).copied())
 }
 
 fn classify_trip_host(arg: &[u8], saturated: bool, tax: wire::TripTaxonomy) -> wire::TripVerdict {

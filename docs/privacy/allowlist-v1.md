@@ -48,10 +48,12 @@ never emitted; the rest move fixed scalars.
 | `query_return` | algorithm `names` string | 128-byte NUL-bounded string | kernel registry verdict | explicit unreadable verdict, slot freeze, overflow bit (all slots) |
 
 Kernel classification: the 128-byte alias window is split on `:`
-(max 8 segments) and each segment is hashed (FNV-1a-64 prefilter)
-and looked up in the observer-populated `ALG_CLASS` table, with an
-exact byte confirm before any match is accepted; the 32-byte trip
-window is hashed and confirmed against `TRIP_CLASS` the same way.
+(max 8 segments) and each segment is hashed (FNV-1a-64) and looked
+up in the observer-populated `ALG_CLASS` table, matching on
+hash+exact-length (no byte-compare confirm: it does not fit the
+6.12 verifier budget — accepted 2^-64 accidental-collision
+residual; within-table collisions stay impossible); the 32-byte
+trip window is hashed and exactly confirmed against `TRIP_CLASS`.
 Saturated windows (the helper filled the whole window, so an
 exact-fit read and a truncated read are indistinguishable) fail
 closed to overlong with no retained prefix. Statuses are explicit:

@@ -281,9 +281,10 @@ const _: () = assert!(size_of::<InitRetEvent>() == 32);
 const _: () = assert!(align_of::<InitRetEvent>() == 8);
 
 /// `ALG_CLASS` map value, keyed by FNV-1a-64 of the exact registry
-/// spelling: 40 bytes. `name`/`len` exist so the kernel can confirm
-/// an exact byte match after the hash prefilter (a hash hit alone
-/// never establishes membership). `weak` is 0/1.
+/// spelling: 40 bytes. Membership is hash+exact-length (`len` is
+/// checked; `name` is populated but unread — reserved; a byte
+/// confirm does not fit the 6.12 verifier budget, see
+/// `classify_alg_with`). `weak` is 0/1.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AlgClassValue {
@@ -332,10 +333,12 @@ pub fn trip_value_bytes(v: &TripClassValue) -> [u8; 22] {
     b
 }
 
-/// FNV-1a-64 (IETF draft-eastlake-fnv, non-cryptographic): a hash
-/// prefilter only. Membership always requires the exact byte
-/// confirm, so adversarial preimages cannot forge a class (and a
-/// hostile provider can already claim any name directly).
+/// FNV-1a-64 (IETF draft-eastlake-fnv, non-cryptographic).
+/// Algorithm membership is hash+exact-length (a 2^-64 accidental
+/// collision misclassifies; adversarial preimages are infeasible
+/// and moot — a hostile provider claims any name directly).
+/// Within-table collisions stay impossible (population fails
+/// closed). Trip membership keeps an exact byte confirm.
 pub const FNV1A64_BASIS: u64 = 14695981039346656037;
 const FNV1A64_PRIME: u64 = 1099511628211;
 
@@ -354,13 +357,16 @@ pub const fn fnv1a64(bytes: &[u8]) -> u64 {
     h
 }
 
-// Verifier-shape contract for every loop below: bounds are
-// compile-time constants, iteration breaks on runtime lengths, and
-// every byte load carries its own dominating `.get()` check (no
-// bare indexing off reloaded positions, no intermediate sub-slices
-// whose validity the verifier must carry across calls). Any check
-// failure fails closed to "unknown segment", never to a partial
-// decode.
+// Verifier-shape contract for the classifiers below: the alg
+// scan is ONE fixed 128-iteration pass, branchless except the
+// unavoidable map-miss check per byte (masked arithmetic selects,
+// never data branches — any per-byte branch multiplies states
+// past the 1M-insn ceiling). The trip classifier below is a
+// smaller two-loop shape (32 scan + 16 confirm, single segment)
+// that fits the budget with plain branches. Matching is
+// hash+length for alg (no byte confirm — see `classify_alg_with`),
+// hash+exact-confirm for trip. Any check failure fails closed to
+// "unknown segment", never to a partial decode.
 
 /// Kernel algorithm verdict over one alias-list window.
 pub struct AlgVerdict {
@@ -376,121 +382,192 @@ pub struct AlgVerdict {
 /// truncated read are indistinguishable — the helper forces NUL —
 /// so saturation fails closed with no retained prefix).
 ///
-/// `lookup` resolves a segment hash to its populated table entry;
-/// BPF passes map lookups, host tests pass `HashMap` lookups. Every
-/// loop bound is a compile-time constant (verifier-safe); every
-/// byte access is bounds-checked (`.get`, never bare indexing off a
-/// runtime position).
-pub fn classify_alg_with<F>(name: &[u8], saturated: bool, lookup: F) -> AlgVerdict
+/// `buf` is the full 128-byte window (BPF: the zero-initialized
+/// stack array; host tests: zero-padded the same way) and `len` is
+/// the live length within it (`len < ALG_WINDOW`; overlong inputs
+/// return before the scan). `lookup` resolves a segment hash to
+/// its populated table entry; BPF passes map lookups, host tests
+/// pass `HashMap` lookups.
+///
+/// Matching is hash+length: an FNV-1a-64 prefilter plus an exact
+/// length check against the table entry. There is deliberately NO
+/// byte-compare confirm: a variable stack index escaping the frame
+/// is rejected outright (`query_return` insn 1208 on 6.12), and the
+/// 128-way length partitioning times any inner byte loop exceeds
+/// the 1M-insn verifier ceiling (F-BPF-1). Accepted residual: a
+/// 2^-64 accidental hash collision misclassifies (within-table
+/// collisions stay impossible — population fails closed, pinned by
+/// test); adversarial preimages are infeasible (2^64) and moot (a
+/// hostile provider claims any name directly). The trip classifier
+/// below keeps its exact confirm (its 32x16 single-segment shape
+/// fits the budget).
+///
+/// Verifier shape: ONE fixed 128-iteration scan, branchless except
+/// the unavoidable map-miss check per byte. Every accumulator
+/// updates arithmetically (masked selects — BPF has no `cmov`, so
+/// the masks are explicit bit tricks, never `?:` and never data
+/// branches): per-byte states stay ~2-4 (weak bit × hit/miss) and
+/// merge across iterations (counters stay ranges, hashes stay
+/// symbolic), so the whole scan costs ~15k insns and exits with a
+/// handful of states. Any data branch in the scan body (early
+/// exit, bounds split, per-byte confirm) multiplies states past
+/// the ceiling — keep the body straight-line; the trailing resolve
+/// and verdict below may branch (shallow, outside the scan).
+pub fn classify_alg_with<F>(
+    buf: &[u8; ALG_WINDOW],
+    len: usize,
+    saturated: bool,
+    lookup: F,
+) -> AlgVerdict
 where
     F: Fn(u64) -> Option<AlgClassValue>,
 {
-    if saturated || name.len() >= ALG_WINDOW {
+    if saturated || len >= ALG_WINDOW {
         return AlgVerdict {
             class: OTHER_CLASS,
             weak: false,
             status: ALG_OVERLONG,
         };
     }
-    // Phase 1: single bounded pass — split on ':' while hashing each
-    // segment (FNV streams byte by byte). Store (hash, start, len)
-    // for the first segments; count the total for truncation.
-    let mut hashes = [0u64; MAX_ALG_SEGMENTS];
-    let mut starts = [0u8; MAX_ALG_SEGMENTS];
-    let mut lens = [0u8; MAX_ALG_SEGMENTS];
-    let mut total: usize = 0;
+    // Branchless single pass: hash each `:`-separated segment (FNV
+    // streams byte by byte), resolve every segment end against the
+    // table, fold class/weak/count arithmetically. The window reads
+    // are infallible raw loads: `i` is a pure loop counter (fixed
+    // offset per unrolled iteration, the phase-1-proven pattern),
+    // always `< 128` = the array length (loop bound), and bytes at
+    // or past `len` are zero (zero-init) and masked out of every
+    // update below — never decoded.
     let mut h = FNV1A64_BASIS;
-    let mut seg_start: usize = 0;
+    let mut seg_len: u64 = 0;
+    let mut seg_idx: u64 = 0;
+    let mut class0: u64 = OTHER_CLASS as u64;
+    let mut weak_acc: u64 = 0;
     let mut i: usize = 0;
     while i < ALG_WINDOW {
-        let b = match name.get(i) {
-            Some(b) => *b,
-            None => break,
-        };
-        if b == b':' {
-            if total < MAX_ALG_SEGMENTS {
-                hashes[total] = h;
-                starts[total] = seg_start as u8;
-                lens[total] = (i - seg_start) as u8;
-            }
-            total += 1;
-            h = FNV1A64_BASIS;
-            seg_start = i + 1;
-        } else {
-            h = fnv1a64_step(h, b);
+        // SAFETY: `i < ALG_WINDOW` (loop bound) indexes the array.
+        let b = unsafe { *buf.as_ptr().add(i) };
+        // ALU-only conditions (BPF has no `setcc`: even
+        // `u64::from(x < y)` lowers to a branch, which would
+        // partition ranges on every byte — these identities are
+        // straight-line by construction; see the helpers).
+        let active = alu_lt(i as u64, len as u64);
+        let is_colon = alu_eq(b as u64, 0x3A) & active;
+        // Resolve-attempt for the segment ending here (masked: only
+        // a segment end in the first 8 with a length-ok hit
+        // applies). The lookup runs unconditionally (map ops don't
+        // branch); only the miss check branches (1/byte).
+        let apply0 = is_colon & alu_lt(seg_idx, MAX_ALG_SEGMENTS as u64);
+        if let Some(v) = lookup(h) {
+            let len_ok = alu_eq(v.len as u64, seg_len) & alu_lt(seg_len, MAX_ALG_NAME as u64 + 1);
+            let m = apply0 & len_ok;
+            let m_primary = m & alu_is_zero(seg_idx);
+            class0 = select_u64(mask(m_primary), v.class as u64, class0);
+            weak_acc |= (v.weak as u64) & m;
         }
+        // Fold this byte into the running segment (masked: past-`len`
+        // bytes change nothing; a colon resets for the next one).
+        let h_step = fnv1a64_step(h, b);
+        h = select_u64(
+            mask(is_colon),
+            FNV1A64_BASIS,
+            select_u64(mask(active), h_step, h),
+        );
+        seg_len = select_u64(mask(is_colon), 0, seg_len + active);
+        seg_idx += is_colon;
         i += 1;
     }
     // Trailing segment (also the sole empty segment of empty input,
-    // matching `str::split(':')` semantics incl. edge splits).
-    if total < MAX_ALG_SEGMENTS {
-        hashes[total] = h;
-        starts[total] = seg_start as u8;
-        lens[total] = (i - seg_start) as u8;
+    // matching `str::split(':')` semantics incl. edge splits):
+    // resolve + verdict with plain branches (shallow, outside the
+    // scan — a handful of states).
+    if seg_idx < MAX_ALG_SEGMENTS as u64 {
+        if let Some(v) = lookup(h) {
+            if v.len as u64 == seg_len && seg_len <= MAX_ALG_NAME as u64 {
+                if seg_idx == 0 {
+                    class0 = v.class as u64;
+                }
+                weak_acc |= v.weak as u64;
+            }
+        }
     }
-    total += 1;
-    // Look one segment up: hash prefilter + exact byte confirm.
-    // `None` (hash miss, length mismatch, byte mismatch, or any
-    // bounds-check failure) is an unknown segment — never a partial
-    // decode. Segments longer than any possible pattern cannot match
-    // (population caps pattern length), so they skip the lookup.
-    let resolve = |s: usize| -> Option<(u16, bool)> {
-        let st = *starts.get(s)? as usize;
-        let ln = *lens.get(s)? as usize;
-        if ln > MAX_ALG_NAME {
-            return None;
-        }
-        let v = lookup(*hashes.get(s)?)?;
-        if v.len as usize != ln {
-            return None;
-        }
-        let mut i = 0usize;
-        while i < MAX_ALG_NAME {
-            if i >= ln {
-                break;
-            }
-            if name.get(st.saturating_add(i)) != v.name.get(i) {
-                return None;
-            }
-            i += 1;
-        }
-        Some((v.class, v.weak != 0))
-    };
-    if total > MAX_ALG_SEGMENTS {
+    let total = seg_idx + 1;
+    if total > MAX_ALG_SEGMENTS as u64 {
         // Pathological alias list: the primary (fully observed and
-        // confirmed) is kept, but weak fails closed — unseen tail
-        // segments may be weak — and the status stays explicit.
-        let class = resolve(0).map(|(c, _)| c).unwrap_or(OTHER_CLASS);
+        // hash+length matched) is kept, but weak fails closed —
+        // unseen tail segments may be weak — and the status stays
+        // explicit.
         return AlgVerdict {
-            class,
+            class: class0 as u16,
             weak: true,
             status: ALG_TRUNCATED,
         };
     }
-    let mut class = OTHER_CLASS;
-    let mut weak = false;
-    let mut s = 0;
-    while s < MAX_ALG_SEGMENTS {
-        if s >= total {
-            break;
-        }
-        if let Some((c, w)) = resolve(s) {
-            if s == 0 {
-                class = c;
-            }
-            weak |= w;
-        }
-        s += 1;
-    }
+    let class = class0 as u16;
     AlgVerdict {
         class,
-        weak,
+        weak: weak_acc != 0,
         status: if class == OTHER_CLASS {
             ALG_UNKNOWN
         } else {
             ALG_OK
         },
     }
+}
+
+/// All-ones mask for a 0/1 condition (explicit bit trick — BPF has
+/// no `cmov`, so `?:`/`if` on data would branch; this is ALU-only).
+/// The fence hides the range from the optimizer (which would use
+/// it to form a `select`, and BPF lowers `select` to branches).
+#[inline(always)]
+fn mask(cond: u64) -> u64 {
+    debug_assert!(cond <= 1);
+    core::hint::black_box(cond).wrapping_neg()
+}
+
+/// Arithmetic select: `a` when `m` is all-ones, `b` when zero.
+/// Written add/sub/and (NOT the `(a & m) | (b & !m)` idiom, which
+/// the optimizer recognizes and lowers to a branch on BPF); every
+/// intermediate is fenced so no comparison/select pattern forms.
+/// Emits straight-line ALU; pinned by `alu_conditions_are_exact`.
+#[inline(always)]
+fn select_u64(m: u64, a: u64, b: u64) -> u64 {
+    use core::hint::black_box;
+    let m = black_box(m);
+    let d = black_box(a).wrapping_sub(black_box(b));
+    black_box(b).wrapping_add(black_box(d) & m)
+}
+
+/// `1` iff `x == 0`, else `0` — ALU-only (BPF has no `setcc`, so
+/// even `u64::from(x == 0)` lowers to a branch). Identity: for
+/// nonzero `x`, `x | -x` always has the top bit set; for zero it
+/// is zero. Every intermediate is fenced (the optimizer folds the
+/// naked idiom back to a comparison+branch); fences emit no code.
+/// Pinned by `alu_conditions_are_exact` below; the classifier scan
+/// depends on these compiling branchless (verify with
+/// `llvm-objdump` after touching them).
+#[inline(always)]
+fn alu_is_zero(x: u64) -> u64 {
+    use core::hint::black_box;
+    let neg = black_box(black_box(x).wrapping_neg());
+    let o = black_box(black_box(x) | neg);
+    black_box(o >> 63) ^ 1
+}
+
+/// `1` iff `a == b`, else `0` — ALU-only (see [`alu_is_zero`]).
+#[inline(always)]
+fn alu_eq(a: u64, b: u64) -> u64 {
+    alu_is_zero(core::hint::black_box(a) ^ core::hint::black_box(b))
+}
+
+/// `1` iff `a < b` (unsigned), else `0` — ALU-only (see
+/// [`alu_is_zero`]). Identity: `a - b` borrows (top bit set) iff
+/// `a < b`, provided `b - a <= u64::MAX / 2` (all classifier
+/// operands are byte-scale — asserted).
+#[inline(always)]
+fn alu_lt(a: u64, b: u64) -> u64 {
+    use core::hint::black_box;
+    debug_assert!(a < (1 << 32) && b < (1 << 32));
+    black_box(black_box(a).wrapping_sub(black_box(b))) >> 63
 }
 
 /// Trip taxonomy selected by the probe program (`trip_str0` watches
@@ -716,6 +793,72 @@ mod tests {
         let (c, g) = (0xDEAD_BEEF, 0x1234_5678);
         assert_eq!(split_key(make_key(c, g)), (c, g));
         assert_eq!(make_key(1, 0), 1 << 32);
+    }
+
+    #[test]
+    fn alu_conditions_are_exact() {
+        for x in [0, 1, 2, 57, 58, 59, 127, 128, 255, u64::MAX / 2, u64::MAX] {
+            assert_eq!(alu_is_zero(x), u64::from(x == 0), "is_zero({x})");
+        }
+        for (a, b) in [
+            (0, 0),
+            (0, 1),
+            (1, 0),
+            (57, 58),
+            (58, 58),
+            (127, 128),
+            (128, 128),
+            (u64::MAX, u64::MAX),
+            (u64::MAX - 1, u64::MAX),
+        ] {
+            assert_eq!(alu_eq(a, b), u64::from(a == b), "eq({a},{b})");
+        }
+        for (a, b) in [
+            (0, 0),
+            (0, 1),
+            (1, 0),
+            (0, 128),
+            (127, 128),
+            (128, 128),
+            (128, 127),
+            (36, 37),
+            (37, 37),
+            (8, 9),
+            (255, 256),
+            ((1 << 32) - 2, (1 << 32) - 1),
+        ] {
+            assert_eq!(alu_lt(a, b), u64::from(a < b), "lt({a},{b})");
+        }
+        assert_eq!(mask(0), 0);
+        assert_eq!(mask(1), u64::MAX);
+        assert_eq!(select_u64(u64::MAX, 11, 22), 11);
+        assert_eq!(select_u64(0, 11, 22), 22);
+    }
+
+    #[test]
+    fn hash_len_match_needs_no_confirm_bytes() {
+        // The match inputs are (hash, len) only: a registered
+        // (hash, len) matches without any byte compare (documented
+        // 2^-64 residual — within-table collisions stay impossible,
+        // pinned by the registry test).
+        let mut name = [0u8; MAX_ALG_NAME];
+        name[..3].copy_from_slice(b"MD5");
+        let entry = AlgClassValue {
+            class: 7,
+            weak: 0,
+            len: 3,
+            name,
+        };
+        let md5 = fnv1a64(b"MD5");
+        let lookup = |h: u64| if h == md5 { Some(entry) } else { None };
+        let mut buf = [0u8; ALG_WINDOW];
+        buf[..3].copy_from_slice(b"MD5");
+        let v = classify_alg_with(&buf, 3, false, lookup);
+        assert_eq!((v.class, v.status), (7, ALG_OK));
+        // Unregistered names miss the hash and stay unknown.
+        buf[..4].copy_from_slice(b"MD5X");
+        let v = classify_alg_with(&buf, 4, false, lookup);
+        assert_eq!(v.status, ALG_UNKNOWN);
     }
 
     #[cfg(feature = "user")]
