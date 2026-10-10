@@ -33,6 +33,9 @@ mk_report() {
     printf '{"schema_version": "observed-crypto-v2.0", "completeness": {"status": "COMPLETE"}, "sites": %s}' "$2" >"$1"
 }
 SITE12='[{"calls": 5, "candidates": [{"op": 12, "algorithm_classes": ["ECDSA"]}]}]'
+SITE12_DSA='[{"calls": 5, "candidates": [{"op": 12, "algorithm_classes": ["DSA"]}]}]'
+SITE12_3='[{"calls": 3, "candidates": [{"op": 12, "algorithm_classes": ["ECDSA"]}]}]'
+SITE12_25='[{"calls": 25, "candidates": [{"op": 12, "algorithm_classes": ["ECDSA"]}]}]'
 SITE1='[{"calls": 3, "candidates": [{"op": 1, "algorithm_classes": ["SHA2-256"]}]}]'
 SITE12_ZERO='[{"calls": 0, "candidates": [{"op": 12}]}, {"calls": 3, "candidates": [{"op": 1}]}]'
 
@@ -40,11 +43,15 @@ printf 'LEDGER mode=ecdsa fetches=1 signs=1 verifies=1\nORDDONE mode=ecdsa rc=0\
 printf 'LEDGER mode=kem skipped=old-openssl\nORDDONE mode=kem rc=0\n' >"$T/kem-skip.log"
 printf 'LEDGER mode=md4 legacy_loads=1\nLEDGER digest=MD4 fetches=1 digests=1\nORDDONE mode=md4 rc=0\n' >"$T/md4.log"
 printf 'nothing here\nORDDONE mode=ecdsa rc=0\n' >"$T/no-ledger.log"
-printf 'LEDGER mode=ecdsa fetches=1 signs=1 verifies=1\nLEDGER mode=ecdsa fetches=33 mINSPECT stage=legacy trips=2\nLEDGER mode=ecdsa fetches=34 signs=1 verifies=1\nORDDONE mode=ecdsa rc=0\n' >"$T/interleave.log"
-printf 'LEDGER mode=ecdsa fetches=33 mINSPECT stage=legacy trips=2\nORDDONE mode=ecdsa rc=0\n' >"$T/all-corrupt.log"
+printf 'LEDGER mode=ecdsa fetches=1 signs=1 verifies=1\nLEDGER mINSPECT stage=legacy trips=2\nLEDGER mode=ecdsa fetches=34 signs=1 verifies=1\nORDDONE mode=ecdsa rc=0\n' >"$T/interleave.log"
+printf 'LEDGER mINSPECT stage=legacy trips=2\nORDDONE mode=ecdsa rc=0\n' >"$T/all-corrupt.log"
+printf 'LEDGER mode=ecdsa fetches=1 signs=1 verifies=1\nLEDGER mode=ecdsa loop_secs=10 ops=10 fetches=20\nORDDONE mode=ecdsa rc=0\n' >"$T/loop.log"
 python3 -c "print(''.join('LEDGER mode=ecdsa fetches=%d signs=1 verifies=1\n' % i for i in range(1, 101)) + 'ORDDONE mode=ecdsa rc=0\n')" >"$T/spam.log"
 printf 'LEDGER mode=ecdsa fetches=1 signs=0 verifies=0\nORDDONE mode=ecdsa rc=2\n' >"$T/rc2.log"
 mk_report "$T/rep12.json" "$SITE12"
+mk_report "$T/rep12dsa.json" "$SITE12_DSA"
+mk_report "$T/rep12_3.json" "$SITE12_3"
+mk_report "$T/rep12_25.json" "$SITE12_25"
 mk_report "$T/rep1.json" "$SITE1"
 mk_report "$T/rep12zero.json" "$SITE12_ZERO"
 printf '{"schema_version": "observed-crypto-v1", "sites": %s}' "$SITE12" >"$T/repv1.json"
@@ -146,6 +153,33 @@ if python3 "$ORACLE" "$T/spam.log" "$T/rep12.json" ecdsa >"$T/out" 2>&1; then
         || bad "spam ledger bounded first/last"
 else
     bad "spam ledger bounded first/last (rc=$?)"
+fi
+
+# 13. FAIL: DSA op-12 for an ECDSA ledger (wrong algorithm).
+if python3 "$ORACLE" "$T/ecdsa.log" "$T/rep12dsa.json" ecdsa >"$T/out" 2>&1; then
+    bad "DSA for ECDSA fails (got exit 0)"
+else
+    grep -q 'wrong algorithm' "$T/out" \
+        && ok "DSA for ECDSA fails" \
+        || bad "DSA for ECDSA fails"
+fi
+
+# 14. FAIL: loop op calls below ledgered iterations (3 < 10).
+if python3 "$ORACLE" "$T/loop.log" "$T/rep12_3.json" ecdsa >"$T/out" 2>&1; then
+    bad "calls below ledgered fails (got exit 0)"
+else
+    grep -q 'below ledgered' "$T/out" \
+        && ok "calls below ledgered fails" \
+        || bad "calls below ledgered fails"
+fi
+
+# 15. PASS: loop op calls cover ledgered iterations (25 >= 10).
+if python3 "$ORACLE" "$T/loop.log" "$T/rep12_25.json" ecdsa >"$T/out" 2>&1; then
+    grep -q 'ORACLE PASS' "$T/out" && grep -q '25 op calls over 10' "$T/out" \
+        && ok "calls cover ledgered passes" \
+        || bad "calls cover ledgered passes"
+else
+    bad "calls cover ledgered passes (rc=$?)"
 fi
 
 echo "---"
