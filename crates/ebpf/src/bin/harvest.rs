@@ -145,8 +145,8 @@ static TRIP: HashMap<u64, u64> = HashMap::with_max_entries(128, 0);
 #[map]
 static LGCALLS: HashMap<u32, u64> = HashMap::with_max_entries(64, 0);
 /// Kernel classifier table: FNV-1a-64 of exact registry spelling →
-/// (class, weak, name for exact confirm). Observer-populated before
-/// any attach; no target bytes at rest.
+/// (class, weak, len-checked; name reserved). Observer-populated
+/// before any attach; no target bytes at rest.
 #[map]
 static ALG_CLASS: HashMap<u64, AlgClassValue> = HashMap::with_max_entries(1024, 0);
 /// Kernel trip table: FNV-1a-64 of exact taxonomy pattern →
@@ -201,7 +201,7 @@ fn emit_init_ret(ev: &InitRetEvent) {
 }
 
 /// Table lookups behind the shared classifiers (copied out: values
-/// are small, and the confirm step borrows the copy).
+/// are small, and the trip confirm step borrows the copy).
 fn lookup_alg(h: u64) -> Option<AlgClassValue> {
     unsafe { ALG_CLASS.get_ptr(&h).map(|p| *p) }
 }
@@ -213,8 +213,12 @@ fn lookup_trip(h: u64) -> Option<TripClassValue> {
 /// Algorithm classification as a BPF subprogram (separate
 /// verification scope, like the dispatch walk below).
 #[inline(never)]
-fn classify_alg(name: &[u8], saturated: bool) -> osslscope_ebpf_common::AlgVerdict {
-    classify_alg_with(name, saturated, lookup_alg)
+fn classify_alg(
+    buf: &[u8; ALG_WINDOW],
+    len: usize,
+    saturated: bool,
+) -> osslscope_ebpf_common::AlgVerdict {
+    classify_alg_with(buf, len, saturated, lookup_alg)
 }
 
 fn cookie_of(ctx: &ProbeContext) -> u64 {
@@ -366,6 +370,11 @@ fn trip_unreadable(cookie: u64) {
     });
 }
 
+/// Always inlined: the probe-arg index `n` must be a per-program
+/// constant (a runtime `n` lowers to `ctx - n*8 + 112`, whose
+/// negative intermediate the verifier rejects — F-BPF-1 trip half:
+/// `trip_str1` insn 54 on 6.12).
+#[inline(always)]
 fn trip_str_at(ctx: &ProbeContext, n: usize, taxonomy: TripTaxonomy) {
     let c = cookie_of(ctx);
     bump_trip(c);
@@ -653,8 +662,11 @@ pub fn query_return(ctx: RetProbeContext) -> u32 {
                 return 0;
             }
         };
-    let saturated = slice.len() == ALG_WINDOW - 1;
-    let v = classify_alg(slice, saturated);
+    // Copy the length out first: the window array is reborrowed
+    // shared below, which ends `slice`'s mutable borrow.
+    let len = slice.len();
+    let saturated = len == ALG_WINDOW - 1;
+    let v = classify_alg(&name_buf, len, saturated);
     // ALG first: userspace drops rows whose (array, index) has no
     // ALG record yet (orphan rule), so rows must follow their ALG.
     emit_alg(&AlgEvent {

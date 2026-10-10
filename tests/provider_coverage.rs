@@ -184,7 +184,10 @@ fn kernel_classifier_table_fits_map_cap() {
         .chain(VERIFIED_KDF_KEM)
         .chain(VERIFIED_SYM)
     {
-        let v = wire::classify_alg_with(n.as_bytes(), false, |h| table.get(&h).copied());
+        let mut buf = [0u8; wire::ALG_WINDOW];
+        let nb = n.as_bytes();
+        buf[..nb.len()].copy_from_slice(nb);
+        let v = wire::classify_alg_with(&buf, nb.len(), false, |h| table.get(&h).copied());
         assert_eq!(v.class, class_id(n), "kernel class for {n:?}");
         assert_eq!(v.status, wire::ALG_OK, "status for {n:?}");
     }

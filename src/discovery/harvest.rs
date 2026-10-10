@@ -30,9 +30,9 @@ pub(crate) const LEGACY_COOKIE: u64 = 1;
 /// Build the `ALG_CLASS` kernel table entries from the single
 /// registry: every registered name (class = registry index) plus
 /// every weak-only name (class = `OTHER`, weak set). Fails closed on
-/// a hash collision or an over-capacity name — the kernel confirms
-/// exact bytes after the hash prefilter, so a collision would be
-/// unrepresentable.
+/// a hash collision or an over-capacity name — the kernel matches
+/// hash+exact-length, so a within-table collision would map one key
+/// to two classes.
 pub fn build_alg_entries() -> anyhow::Result<Vec<(u64, wire::AlgClassValue)>> {
     let mut out: Vec<(u64, wire::AlgClassValue)> = Vec::new();
     let mut seen: HashSet<u64> = HashSet::new();
