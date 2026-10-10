@@ -14,7 +14,7 @@ provider it has loaded, with per-provider algorithm coverage:
 
 ```sh
 osslscope inspect --pid 1234 --provider /opt/openssl/lib64/ossl-modules/legacy.so \
-  --object ./target/debug/build/osslscope-ebpf/out/ebpf.o --out inspect.json
+  --object crates/ebpf/target/bpfel-unknown-none/release/osslscope-harvest --out inspect.json
 ```
 
 - `--builtin` inventories libcrypto's built-in provider instead
@@ -38,24 +38,41 @@ osslscope inspect --pid 1234 --provider /opt/openssl/lib64/ossl-modules/legacy.s
 
 `report` runs a bounded capture of `OSSL_FUNC_*` dispatch
 calls (with wall-clock timestamps) and renders the verdict
-directly:
+directly. Discovery is automatic: BPF objects resolve from
+trusted installed locations and the target's libcrypto from
+its live mappings (in-libcrypto default provider mode):
 
 ```sh
-osslscope report --provider legacy --object EVP_DigestInit \
-  --count-object EVP_DigestUpdate run -- ./my-app --serve
-osslscope report --provider legacy --object EVP_DigestInit \
-  --count-object EVP_DigestUpdate --pid 1234 --duration 60
+osslscope report run -- ./my-app --serve
+osslscope report --pid 1234 --duration 60
+osslscope report --format json --out report.json --cbom bom.json run -- ./my-app --serve
 ```
 
 - `run -- <cmd>` (spawn-and-observe) is the reliable mode;
   `--pid` (attach to live) is inherently racy — anything the
   target did before attach is invisible (cold-start gap).
+  `run --` predicts the target libcrypto pre-exec from the
+  exe's `DT_NEEDED` closure plus loader search
+  (`LD_LIBRARY_PATH`, rpath/runpath, system defaults);
+  scripts, `dlopen`-only loads, unresolvable names, and
+  dual-load closures (two libcryptos, refused) need explicit
+  `--provider`.
 - `--format json --out report.json` for machine consumption;
   `--cbom FILE` emits a CycloneDX crypto-BOM alongside.
-- `--builtin` selects libcrypto built-ins; `--settle`,
-  `--timeout`, `--grace` bound the run phases; `--duration`
-  bounds the count window; `--image-digest D` records the
-  container image digest in the target provenance.
+- `--provider P` names a provider file explicitly (a `.so`
+  for file-provider mode, or libcrypto with `--builtin`);
+  `--object O` / `--count-object C` name explicit BPF
+  objects. These are diagnosis/developer overrides — the
+  defaults above are the normal path.
+- `--table F` / `--force-offset N` / `--provider-table F`
+  enroll an unknown local build explicitly (see [the
+  built-in runbook](builtin-runbook.md)); unknown stripped
+  builds are refused with enrollment remediation, never
+  guessed.
+- `--settle`, `--timeout`, `--grace` bound the run phases;
+  `--duration` bounds the count window; `--image-digest D`
+  records the container image digest in the target
+  provenance.
 - A capture may end `PARTIAL` (exit 3) instead of `COMPLETE`
   when evidence is degraded — e.g. events were dropped under
   load, the ring buffer overran, or the child exited early.
@@ -66,19 +83,20 @@ osslscope report --provider legacy --object EVP_DigestInit \
 ## check — policy gate (CI)
 
 `check` captures and evaluates policy rules, exiting 10 on
-violation (clean exit 0; at least one rule is required):
+violation, 11 when a rule is unproven under relevant
+uncertainty (clean exit 0; at least one rule is required):
 
 ```sh
-osslscope check --provider legacy --object EVP_DigestInit \
-  --count-object EVP_DigestUpdate --deny-engine --deny-weak \
-  run -- ./my-app --self-test
+osslscope check --deny-engine --deny-weak run -- ./my-app --self-test
+osslscope check --require-provider default --pid 1234 --duration 60
 ```
 
 Rules: `--require-provider P`, `--deny-provider P`,
 `--deny-engine`, `--deny-algorithm X`, `--deny-weak`,
-`--require-executed X` (repeatable). A `check` over a PARTIAL
-capture fails closed where the missing evidence matters — see
-the result JSON, not just the exit code.
+`--require-executed X` (repeatable). Discovery and
+overrides work exactly as in `report`. A `check` over a
+PARTIAL capture fails closed where the missing evidence
+matters — see the result JSON, not just the exit code.
 
 ## doctor — environment diagnosis
 
@@ -86,15 +104,26 @@ the result JSON, not just the exit code.
 osslscope doctor                        # am I ready to observe anything?
 osslscope doctor --pid 1234             # can I observe THIS process?
 osslscope doctor --libcrypto /path/to/libcrypto.so.3  # can I inventory THIS lib?
+osslscope doctor --exe ./my-app         # would `run --` discover THIS exe?
 ```
 
-`doctor` checks privileges (CAP_BPF/CAP_PERFMON or file caps),
-BPF JIT hardening, kernel lockdown, BTF availability, the
-host/container split, and per-target ptrace rights. On
-failure it prints the concrete fix (e.g. the exact `setcap`
-recipe). An unsuitable target exits 4. `--table FILE`
-overrides the built-in build-id table; `--format json`
-emits machine-readable output.
+`doctor` checks privileges (CAP_BPF/CAP_PERFMON or file
+caps), kernel features, lockdown/LSM/seccomp, installed BPF
+objects (trusted locations, compatibility), and — with a
+target — architecture, OpenSSL flavor, build enrollment,
+the dispatch anchor, provider class, and coverage caveats
+(cold-start, auto-discovery scope, address-taken gaps).
+Target verdicts use the same qualification as
+`report`/`check`, so a `pass` here means the backend would
+attach the same way. On failure it prints the concrete fix
+(e.g. the exact `setcap` recipe, or the enrollment steps).
+An unsuitable target exits 4. `--table FILE`,
+`--force-offset N`, and `--provider-table FILE` vet with
+explicit local enrollment; `--object O` / `--count-object
+C` vet explicit BPF objects; `--format json` emits
+machine-readable output. Implicitly trusted object
+locations are root-owned system dirs; anything else needs
+explicit flags.
 
 ## alias-audit — find shared dispatch addresses
 
@@ -116,6 +145,7 @@ addresses claimed by several (provider, op, funcid) triples.
 | 3 | PARTIAL — degraded evidence, see JSON (`report`/`check` only; `inspect` reports PARTIAL in-doc with exit 0) |
 | 4 | fatal — evidence unusable (incl. unsuitable target, pid recycled) |
 | 10 | policy violation (`check`) |
+| 11 | inconclusive (`check`) — requirement unproven under relevant uncertainty |
 
 ## Current limitations (honest)
 
@@ -127,7 +157,8 @@ addresses claimed by several (provider, op, funcid) triples.
   drop events; drops are counted and reported (PARTIAL),
   never silent — but size `--duration` windows accordingly.
 - Stripped libcrypto needs `--table`/`--force-offset` help
-  for built-in inventory
-  ([recipe](builtin-runbook.md)).
+  for built-in observation unless the build is enrolled
+  ([recipe](builtin-runbook.md)); the shipped table covers
+  ten historical builds only, not arbitrary binaries.
 - FIPS-provider builds change dispatch shapes; support is
   best-effort and explicitly versioned per release.

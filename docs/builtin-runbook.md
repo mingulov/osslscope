@@ -1,23 +1,39 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Built-in provider runbook: stripped or unknown libcrypto
 
-`inspect --builtin` (and `report --builtin`) must find one file
-offset inside libcrypto: the provider-query operation. It tries
-four rungs in order and reports which one won (`resolution`):
+Built-in observation (`report`/`check` automatic discovery,
+`inspect --builtin`) must find one file offset inside
+libcrypto: the provider-query operation. It tries four rungs
+in order and reports which one won (`resolution`):
 
 1. `--force-offset N` — your explicit offset, always wins.
 2. Build-id table — the stripped binary's `.note.gnu.build-id`
-   looked up in the built-in table (`etc/build-id-table.json`)
-   or your `--table FILE`.
+   looked up in the shipped table (`etc/build-id-table.json`,
+   ten historical builds) or your `--table FILE`. A hit is
+   verified against the object's own anchor symbol; a
+   mismatch fails closed, never silently.
 3. Symtab — direct symbol lookup; works only when the binary
    (or debug info) still has a symbol table.
 4. Anchor+delta — exported anchor symbol plus a per-OpenSSL-version
-   delta; a degraded fallback, not a promise.
+   delta from an **explicitly selected** `--table FILE` only.
+   This rung never runs automatically: unknown stripped
+   builds need explicit enrollment, never a guessed offset.
 
-If every rung fails you get PARTIAL (`anchor-unresolved`),
-never a guess. If a rung yields a dead offset you get zero
-rows (PARTIAL `no-query-trigger`): the output itself is the
+If every rung fails, `report`/`check` refuse with enrollment
+remediation (exit 4) and `inspect` reports PARTIAL
+(`anchor-unresolved`) — never a guess. If a rung yields a
+dead offset you get zero rows: the output itself is the
 proof, so always re-run after a change and demand rows.
+
+`run --` finds the libcrypto to qualify by predicting the
+loader: the exe's `DT_NEEDED` closure (direct and transitive)
+via `LD_LIBRARY_PATH`, rpath/runpath (`$ORIGIN` expanded),
+and system defaults. RPATH beats `LD_LIBRARY_PATH`; with
+RUNPATH the reverse holds; `ld.so.cache` is not consulted.
+Scripts, `dlopen`-only loads, unresolvable names, and
+closures mapping two distinct libcryptos (dual-load, refused
+fail-closed) need explicit `--provider` (`doctor --exe`
+shows the same prediction before you run).
 
 ## Recipe
 
@@ -27,9 +43,10 @@ proof, so always re-run after a change and demand rows.
    osslscope doctor --libcrypto /path/to/libcrypto.so.3
    ```
 
-   `known build <id> (OpenSSL X, query_offset N)` means rung 2
-   covers you — no flags needed. `unknown build-id <id>` means
-   proceed.
+   `dispatch-anchor: supported via table|symtab` means you are
+   covered — no flags needed. `unqualified build` means
+   proceed. (`build-id: unknown` alone is not the verdict; the
+   anchor row is.)
 
 2. Find the query offset from an **unstripped twin** of the same
    build (same compiler, flags, and sources — verify with
@@ -47,27 +64,45 @@ proof, so always re-run after a change and demand rows.
 3. Use it for one run:
 
    ```sh
+   osslscope report --force-offset 0x27df00 run -- ./my-app --serve
    osslscope inspect --pid 1234 --provider /path/to/libcrypto.so.3 \
-     --object ebpf.o --builtin --force-offset 0x27df00 --out inspect.json
+     --object crates/ebpf/target/bpfel-unknown-none/release/osslscope-harvest \
+     --builtin --force-offset 0x27df00 --out inspect.json
    ```
 
    `--force-offset` takes decimal or `0x` hex. Demand a COMPLETE
    verdict with rows; zero rows means the offset is dead —
    re-derive, never ship the guess.
 
-4. To persist it, append a `--table` entry (only `build_id`,
-   `query_offset`, and `anchor_offset` are required):
+4. To persist it, write a `--table` entry (only `build_id`,
+   `query_offset`, `anchor`, and `anchor_offset` are required):
 
    ```json
-   {"entries": [{"build_id": "<from readelf -n>",
-     "query_offset": 2612992,
-     "anchor": "OSSL_PROVIDER_available",
-     "anchor_offset": 2612560}]}
+   {"table_version": 1,
+    "entries": [{"build_id": "<from readelf -n>",
+      "query_offset": 2612992,
+      "anchor": "OSSL_PROVIDER_available",
+      "anchor_offset": 2612560}]}
    ```
 
-   Then `osslscope inspect ... --builtin --table my-table.json`.
+   Then `osslscope report --table my-table.json run -- ...`
+   (or the same flag on `inspect`/`check`/`doctor`). A
+   `fallback` section with a per-version `delta` re-enables
+   rung 4 for the named versions — but only through this
+   explicit file.
 
-`--table` also works with `doctor --libcrypto`: the same file
-drives both. (`report` needs no `--table` — it observes dispatch
-rather than resolving the query offset, so there is nothing to
-enroll for it.)
+`--table` also works with `doctor --libcrypto` and
+`doctor --pid`: the same file drives vetting and capture, so
+doctor agrees with the backend.
+
+## Provider-class enrollment
+
+Separately from offsets, `--provider-table FILE` pins which
+provider class an exact build-id carries (see
+`etc/provider-table.example.json` for the shape). Classes are
+`default`, `legacy`, `fips`, or `third-party`; build-ids are
+lowercase hex. Without enrollment, builtin observation
+labels the class `default` by operator assertion, and file
+providers stay unknown (observed under an opaque identity).
+A pinned `fips` class is provenance metadata about those
+exact bytes — never a certification claim.

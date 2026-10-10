@@ -374,6 +374,7 @@ pub fn run_detailed(
         legacy: cfg.legacy,
         table: cfg.table.clone(),
         force_offset: cfg.force_offset,
+        explicit_offsets: cfg.table.is_some() || cfg.force_offset.is_some(),
         cmdline_marker: cfg.cmdline_marker.clone(),
     };
     let mut sess = match session::DiscoverySession::attach(&session_cfg, cfg.pid) {

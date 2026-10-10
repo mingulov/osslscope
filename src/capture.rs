@@ -41,11 +41,12 @@
 use crate::count_session::{
     CountBackend, CountDelta, CountDrain, CountSession, DiscoveredSite, FenceReason as CountFence,
 };
+use crate::discovery::provider::ProviderTable;
 use crate::discovery::session::{
     CoverageState, DiscoveryDelta, DiscoverySession, DiscoverySnapshot, PollBudget, Recycled,
     TripwireDelta,
 };
-use crate::discovery::{coverage, elf, legacy, maps};
+use crate::discovery::{coverage, elf, legacy, maps, onboard};
 use crate::evidence::{
     self, CandidateCoverage, CandidateIdentity, CaptureDocument, CaptureWindow, Completeness,
     CounterKind, CounterSource, CounterUnits, DispositionRecord, ExpectedScope, FinalizeInput,
@@ -74,11 +75,30 @@ const MAX_CATCHUP_POLLS: u32 = 8;
 const CORPSE_WAIT: Duration = Duration::from_millis(100);
 
 /// Capture run configuration.
+///
+/// `harvest_object`/`count_object`/`provider` are `None` for normal
+/// automatic discovery (trusted installed objects; the live target's
+/// libcrypto in builtin mode) and `Some` for explicit operator
+/// overrides. `table`/`force_offset`/`provider_enrollment` are
+/// explicit-only local enrollment (never implicit).
+#[derive(Clone)]
 pub struct Config {
-    pub harvest_object: PathBuf,
-    pub count_object: PathBuf,
-    pub provider: PathBuf,
+    pub harvest_object: Option<PathBuf>,
+    pub count_object: Option<PathBuf>,
+    pub provider: Option<PathBuf>,
     pub builtin: bool,
+    /// Explicit local offset table (`--table`), or None for the
+    /// shipped frozen table.
+    pub table: Option<PathBuf>,
+    /// Forced query-fn file offset (forensics escape hatch).
+    pub force_offset: Option<u64>,
+    /// Explicit provider-class enrollment (parsed at CLI time, so a
+    /// malformed file is a usage error before any side effect).
+    pub provider_enrollment: Option<ProviderTable>,
+    /// Provider class resolved at target resolution (pinned
+    /// enrollment hit, if any); consumed by evidence synthesis.
+    /// `None` until `run` resolves the target.
+    pub resolved_provider_class: Option<String>,
     pub duration: Duration,
     pub settle: Duration,
     pub harvest_timeout: Duration,
@@ -823,9 +843,10 @@ fn sort_executions(executions: &mut [Execution]) {
 // D3 — Identity/metadata synthesis. Backing and advertising object
 // ids are the mapped file's build-id fingerprint when its bytes
 // yield one, else an opaque `unverified-…` id — pathnames never
-// become identity. `provider_class` is `default` in operator-asserted
-// builtin mode and `unknown` otherwise (T09 pinned classification is
-// the seam; never guessed from `fips.so` or a rename). A missing
+// become identity. `provider_class` is the pinned enrollment for
+// this run's provider file when the operator enrolled it, else
+// `default` in operator-asserted builtin mode and `unknown`
+// otherwise (never guessed from `fips.so` or a rename). A missing
 // backing or an unparsable maps device makes the site unplannable:
 // explicit loss, never a fabricated device zero. Per-site coverage
 // is `Unknown` when any candidate read badly (`status != ok`), any
@@ -955,11 +976,16 @@ fn advertising_object_id(
     }
 }
 
-/// Provider class synthesis (D3): builtin mode observes the
+/// Provider class synthesis (D3): a pinned enrollment for this
+/// run's provider file wins; else builtin mode observes the
 /// in-libcrypto provider by operator assertion and OpenSSL
 /// architecture (not a filename guess); file-provider mode stays
-/// `unknown` until T09 pinned classification lands.
-fn synthesize_provider_class(builtin_default: bool) -> String {
+/// `unknown`. One class per run (multi-provider windows share
+/// the run's pin — finer per-array classes are future work).
+fn synthesize_provider_class(builtin_default: bool, enrolled: Option<&str>) -> String {
+    if let Some(class) = enrolled {
+        return class.to_string();
+    }
     if builtin_default {
         "default".to_string()
     } else {
@@ -1088,6 +1114,9 @@ pub struct AdapterCtx<'a> {
     pub live: &'a [maps::Mapping],
     pub files: &'a HashMap<String, Vec<u8>>,
     pub builtin_default: bool,
+    /// Pinned provider class for this run's provider file, if the
+    /// operator enrolled it (wins over the builtin assertion).
+    pub enrolled_class: Option<String>,
     /// Backings first seen this round (fresh dlopen vs long-present).
     pub fresh: &'a HashSet<(String, u64)>,
     /// Past the settle grace: newly emitted long-present sites are
@@ -1205,7 +1234,8 @@ pub fn adapt_delta(
 
     // D1/D3 candidates: group by backing triple, union with the
     // accumulated set, degrade coverage, classify late attaches.
-    let provider_class = synthesize_provider_class(ctx.builtin_default);
+    let provider_class =
+        synthesize_provider_class(ctx.builtin_default, ctx.enrolled_class.as_deref());
     let mut unbacked = 0u64;
     let mut unparsed_dev = 0u64;
     let mut late_attach = 0u64;
@@ -1676,6 +1706,7 @@ where
                 live,
                 files,
                 builtin_default: builtin,
+                enrolled_class: self.cfg.resolved_provider_class.clone(),
                 fresh,
                 post_settle,
                 baseline,
@@ -2747,7 +2778,7 @@ where
         if !self.info.owned {
             self.reason("pid-prewindow-blind");
         }
-        if fips_configured(&self.cfg.provider) && document.total_calls() > 0 {
+        if self.cfg.provider.as_deref().is_some_and(fips_configured) && document.total_calls() > 0 {
             self.reason("fips-unlabeled");
         }
         if engine_un > 0 {
@@ -3070,13 +3101,135 @@ fn recycled_capture(cfg: &Config, info: &TargetInfo) -> Capture {
     }
 }
 
+/// Provider selection after onboarding resolution.
+struct ResolvedProvider {
+    path: PathBuf,
+    builtin: bool,
+    build_id: String,
+    provider_class: Option<String>,
+}
+
+/// Effective run config: onboarding `None`s replaced by resolved
+/// values, so the controller below sees concrete paths + the
+/// effective observation mode.
+fn effective_config(
+    cfg: &Config,
+    objects: &onboard::ObjectPaths,
+    resolved: &ResolvedProvider,
+) -> Config {
+    let mut out = cfg.clone();
+    out.harvest_object = Some(objects.harvest.clone());
+    out.count_object = Some(objects.count.clone());
+    out.provider = Some(resolved.path.clone());
+    out.builtin = resolved.builtin;
+    out.resolved_provider_class = resolved.provider_class.clone();
+    out
+}
+
+/// Automatic-discovery target: a live pid's maps, or pre-exec
+/// spawn prediction (a stopped child's maps still show the
+/// pre-exec image, so `run --` predicts from the exe instead).
+enum AutoTarget<'a> {
+    Pid(u32),
+    Spawn(&'a [String]),
+}
+
+/// Resolve + qualify the capture provider: explicit `--provider`
+/// (builtin or file mode) or automatic discovery (live maps for
+/// `--pid`, exe prediction for `run --`; builtin mode).
+/// Unsupported/Unknown targets fail closed with enrollment
+/// remediation — offsets are never guessed.
+fn resolve_capture_provider(
+    auto: AutoTarget,
+    cfg: &Config,
+    offset_table: &crate::discovery::builtin::Table,
+    enrollment: &ProviderTable,
+) -> anyhow::Result<ResolvedProvider> {
+    let builtin = cfg.builtin || cfg.provider.is_none();
+    let opts = onboard::QualifyOpts {
+        offset_table,
+        offset_table_explicit: cfg.table.is_some(),
+        force_offset: cfg.force_offset,
+        enrollment,
+        builtin_asserted: builtin,
+    };
+    let qual = match &cfg.provider {
+        Some(p) => {
+            let bytes = onboard::read_bounded(p, onboard::MAX_OBJECT_SCAN_BYTES)
+                .map_err(|e| anyhow::anyhow!("provider {} unreadable: {e}", p.display()))?;
+            if builtin {
+                onboard::qualify_libcrypto_bytes(&bytes, p, false, &opts)
+            } else {
+                onboard::qualify_file_provider_bytes(&bytes, p, &opts)
+            }
+        }
+        None => {
+            // The child inherits our environment, so current
+            // `PATH`/`LD_LIBRARY_PATH` predict its resolution.
+            let path_var = std::env::var("PATH").unwrap_or_else(|_| "/bin:/usr/bin".to_string());
+            let ld_var = std::env::var("LD_LIBRARY_PATH").ok();
+            let spenv = onboard::SpawnEnv {
+                path: &path_var,
+                ld_library_path: ld_var.as_deref(),
+            };
+            let qual = match auto {
+                AutoTarget::Pid(p) => onboard::discover_pid(p, &opts),
+                AutoTarget::Spawn(argv) => onboard::discover_spawn(argv, &opts, &spenv),
+            };
+            qual.map_err(|e| anyhow::anyhow!("target discovery: {}", e.full()))?
+        }
+    };
+    match qual {
+        onboard::TargetQualification::Supported(t) => {
+            if cfg.provider.is_none() {
+                eprintln!(
+                    "osslscope: auto discovery: provider={} class={} via={}",
+                    t.provider_path.display(),
+                    t.provider_class.map(|c| c.as_str()).unwrap_or("unknown"),
+                    t.resolution.map(|r| r.as_str()).unwrap_or("init-anchor"),
+                );
+            }
+            Ok(ResolvedProvider {
+                path: t.provider_path,
+                builtin: t.builtin,
+                build_id: t.build_id.unwrap_or_else(|| "unknown".to_string()),
+                provider_class: t.provider_class.map(|c| c.as_str().to_string()),
+            })
+        }
+        onboard::TargetQualification::Unsupported {
+            reason,
+            remediation,
+        } => Err(anyhow::anyhow!(
+            "unsupported target: {reason}; fix: {remediation}"
+        )),
+        onboard::TargetQualification::Unknown {
+            reason,
+            remediation,
+        } => Err(anyhow::anyhow!(
+            "unqualified target: {reason}; fix: {remediation}"
+        )),
+    }
+}
+
 /// Run a full capture window against `target`.
 pub fn run(cfg: &Config, target: Target) -> anyhow::Result<Capture> {
     if cfg.duration.is_zero() {
         anyhow::bail!("--duration must be > 0 (no --forever in v1)");
     }
+    // T12 onboarding: installed BPF objects first (no target needed;
+    // missing/incompatible objects fail before any side effect).
+    let (objects, _) = onboard::resolve_objects(
+        cfg.harvest_object.as_deref(),
+        cfg.count_object.as_deref(),
+        &onboard::default_object_dirs(),
+        &onboard::TrustPolicy::production(),
+    )
+    .map_err(|e| anyhow::anyhow!("BPF objects: {}", e.full()))?;
     arm_signals();
-    let obj_bytes = std::fs::read(&cfg.count_object)?;
+    // Already size-bounded by resolution; re-read bounded anyway
+    // (a swap between resolve and load fails loud, never huge).
+    let obj_bytes = onboard::read_bounded(&objects.count, onboard::MAX_OBJECT_SCAN_BYTES)
+        .map_err(|e| anyhow::anyhow!("count object {}: {e}", objects.count.display()))?;
     let prep = crate::loader::prepare(
         &obj_bytes,
         &crate::loader::COUNT_MAPS,
@@ -3089,17 +3242,46 @@ pub fn run(cfg: &Config, target: Target) -> anyhow::Result<Capture> {
     let acq_ns = acq_clock.monotonic_ns();
     let acq_instant = Instant::now();
     let acq_wall = SystemTime::now();
-    let provider_build_id = std::fs::read(&cfg.provider)
-        .ok()
-        .and_then(|b| elf::read_build_id(&b))
-        .unwrap_or_else(|| "unknown".to_string());
-    let provider_path = cfg.provider.to_string_lossy().into_owned();
+    // Offset table for target qualification (explicit file or
+    // shipped; the CLI pre-validated an explicit file, so a failure
+    // here is a mid-run environment change, not a usage error).
+    let offset_table = match &cfg.table {
+        Some(p) => onboard::load_offset_table_file(p)
+            .map_err(|e| anyhow::anyhow!("offset table: {}", e.full()))?,
+        None => crate::discovery::builtin::shipped_table(),
+    };
+    let empty_enrollment = ProviderTable::empty();
+    let enrollment = cfg
+        .provider_enrollment
+        .as_ref()
+        .unwrap_or(&empty_enrollment);
     match target {
         Target::Spawn { argv } => {
             let cmdline = args::redact_spawn_argv(&argv);
             let mut owned = target::OwnedTarget::spawn_stopped(&argv)
                 .map_err(|e| anyhow::anyhow!("spawn: {e:#}"))?;
             let pid = owned.pid();
+            let resolved = match resolve_capture_provider(
+                AutoTarget::Spawn(&argv),
+                cfg,
+                &offset_table,
+                enrollment,
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    // Same custody rule as a discovery-attach
+                    // failure: preserve status, resolve, fail loud.
+                    let exit_note = owned
+                        .poll_exit()
+                        .ok()
+                        .flatten()
+                        .map(|code| format!(" (child status {code})"))
+                        .unwrap_or_default();
+                    let _ = owned.resolve_setup_failure();
+                    return Err(e.context(format!("target resolution{exit_note}")));
+                }
+            };
+            let effective = effective_config(cfg, &objects, &resolved);
             let info = TargetInfo {
                 pid,
                 owned: true,
@@ -3107,8 +3289,8 @@ pub fn run(cfg: &Config, target: Target) -> anyhow::Result<Capture> {
                 cmdline,
                 container_id: container_id_of(pid),
                 kernel_release: crate::doctor::uname_release(),
-                provider_build_id,
-                provider_path,
+                provider_build_id: resolved.build_id,
+                provider_path: resolved.path.to_string_lossy().into_owned(),
                 image_digest: cfg.image_digest.clone(),
                 acquired_ns: acq_ns,
                 acquired_instant: acq_instant,
@@ -3118,12 +3300,13 @@ pub fn run(cfg: &Config, target: Target) -> anyhow::Result<Capture> {
             let count = CountSession::new(pid, backend);
             let discovery = match DiscoverySession::attach(
                 &crate::discovery::session::DiscoveryConfig {
-                    provider: cfg.provider.clone(),
-                    object: cfg.harvest_object.clone(),
-                    builtin: cfg.builtin,
+                    provider: resolved.path,
+                    object: objects.harvest,
+                    builtin: resolved.builtin,
                     legacy: true,
-                    table: None,
-                    force_offset: None,
+                    table: cfg.table.clone(),
+                    force_offset: cfg.force_offset,
+                    explicit_offsets: cfg.table.is_some() || cfg.force_offset.is_some(),
                     cmdline_marker: None,
                 },
                 pid,
@@ -3144,7 +3327,7 @@ pub fn run(cfg: &Config, target: Target) -> anyhow::Result<Capture> {
                 }
             };
             observe(
-                cfg,
+                &effective,
                 &info,
                 SessionSet {
                     discovery: LiveDiscovery::new(discovery),
@@ -3159,6 +3342,10 @@ pub fn run(cfg: &Config, target: Target) -> anyhow::Result<Capture> {
         }
         Target::Pid(p) => {
             let pin_guard = pin::pin(p).map_err(|e| anyhow::anyhow!("pin: {e:#}"))?;
+            let resolved =
+                resolve_capture_provider(AutoTarget::Pid(p), cfg, &offset_table, enrollment)
+                    .map_err(|e| e.context("target resolution"))?;
+            let effective = effective_config(cfg, &objects, &resolved);
             let raw = std::fs::read(format!("/proc/{p}/cmdline")).unwrap_or_default();
             let info = TargetInfo {
                 pid: p,
@@ -3167,8 +3354,8 @@ pub fn run(cfg: &Config, target: Target) -> anyhow::Result<Capture> {
                 cmdline: args::redact_proc_cmdline(&raw),
                 container_id: container_id_of(p),
                 kernel_release: crate::doctor::uname_release(),
-                provider_build_id,
-                provider_path,
+                provider_build_id: resolved.build_id,
+                provider_path: resolved.path.to_string_lossy().into_owned(),
                 image_digest: cfg.image_digest.clone(),
                 acquired_ns: acq_ns,
                 acquired_instant: acq_instant,
@@ -3178,12 +3365,13 @@ pub fn run(cfg: &Config, target: Target) -> anyhow::Result<Capture> {
             let count = CountSession::new(p, backend);
             let discovery = match DiscoverySession::attach(
                 &crate::discovery::session::DiscoveryConfig {
-                    provider: cfg.provider.clone(),
-                    object: cfg.harvest_object.clone(),
-                    builtin: cfg.builtin,
+                    provider: resolved.path,
+                    object: objects.harvest,
+                    builtin: resolved.builtin,
                     legacy: true,
-                    table: None,
-                    force_offset: None,
+                    table: cfg.table.clone(),
+                    force_offset: cfg.force_offset,
+                    explicit_offsets: cfg.table.is_some() || cfg.force_offset.is_some(),
                     cmdline_marker: None,
                 },
                 p,
@@ -3193,13 +3381,13 @@ pub fn run(cfg: &Config, target: Target) -> anyhow::Result<Capture> {
                     // Mid-attach recycle: fatal verdict, no sessions
                     // held (the count object drops unused).
                     if e.downcast_ref::<Recycled>().is_some() {
-                        return Ok(recycled_capture(cfg, &info));
+                        return Ok(recycled_capture(&effective, &info));
                     }
                     return Err(e.context("discovery attach"));
                 }
             };
             observe(
-                cfg,
+                &effective,
                 &info,
                 SessionSet {
                     discovery: LiveDiscovery::new(discovery),
@@ -3464,6 +3652,7 @@ mod tests {
             live,
             files,
             builtin_default: false,
+            enrolled_class: None,
             fresh,
             post_settle: false,
             baseline: false,
@@ -3481,6 +3670,7 @@ mod tests {
                 live,
                 files: &files,
                 builtin_default: false,
+                enrolled_class: None,
                 fresh: &fresh,
                 post_settle: false,
                 baseline: false,
@@ -3721,8 +3911,8 @@ mod tests {
 
     #[test]
     fn adapt_provider_class_defaults() {
-        // D3: builtin mode asserts `default`; file mode stays
-        // `unknown` (T09 pinned classification is the seam).
+        // D3: a pinned enrollment wins; else builtin mode asserts
+        // `default`; file mode stays `unknown`.
         let delta = DiscoveryDelta {
             candidates: vec![candidate(
                 "/p/provider.so",
@@ -3751,6 +3941,7 @@ mod tests {
                 live: &[],
                 files: &files,
                 builtin_default: true,
+                enrolled_class: None,
                 fresh: &fresh,
                 post_settle: false,
                 baseline: false,
@@ -3760,6 +3951,22 @@ mod tests {
             out.delta.discovered[0].candidates[0].provider_class,
             "default"
         );
+        // Pinned enrollment wins over the builtin assertion.
+        let mut state = AdapterState::default();
+        let out = adapt_delta(
+            &mut state,
+            &delta,
+            &AdapterCtx {
+                live: &[],
+                files: &files,
+                builtin_default: true,
+                enrolled_class: Some("fips".to_string()),
+                fresh: &fresh,
+                post_settle: false,
+                baseline: false,
+            },
+        );
+        assert_eq!(out.delta.discovered[0].candidates[0].provider_class, "fips");
     }
 
     #[test]
@@ -3800,6 +4007,7 @@ mod tests {
                 live: &[],
                 files: &files,
                 builtin_default: false,
+                enrolled_class: None,
                 fresh: &fresh,
                 post_settle: true,
                 baseline: false,
@@ -3848,6 +4056,7 @@ mod tests {
                 live: &[],
                 files: &files,
                 builtin_default: false,
+                enrolled_class: None,
                 fresh: &fresh,
                 post_settle: false,
                 baseline: true,

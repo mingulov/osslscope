@@ -56,12 +56,7 @@ pub fn run(args: &[String]) -> ExitCode {
                 "--table" => table = Some(val(&mut it)?.into()),
                 "--force-offset" => {
                     let s = val(&mut it)?;
-                    let n = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X"));
-                    let v = match n {
-                        Some(h) => u64::from_str_radix(h, 16),
-                        None => s.parse::<u64>(),
-                    };
-                    force_offset = Some(v.map_err(|_| "bad --force-offset")?);
+                    force_offset = Some(crate::args::parse_force_offset(&s)?);
                 }
                 _ => return Err(format!("unknown arg {a}")),
             }
