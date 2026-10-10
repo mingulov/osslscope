@@ -166,6 +166,41 @@ pub fn plt_stub_offsets(elf_bytes: &[u8]) -> anyhow::Result<HashMap<String, u64>
     Ok(out)
 }
 
+/// Address-taken imports: names of UNDEFINED FUNC/NOTYPE symbols
+/// with an `R_X86_64_GLOB_DAT` dynamic reloc — call sites the PLT
+/// scan cannot see (function pointers stored in data, e.g.
+/// libssl's four digest `Transform` slots). Sorted and deduped.
+/// DATA imports (OBJECT type) and self-relocs (defined symbols)
+/// are excluded: only code imports can be low-level call gaps.
+/// Empty (not an error) when the object has no dynamic relocs;
+/// non-ELF input fails closed like the other scanners.
+pub fn glob_dat_imports(elf_bytes: &[u8]) -> anyhow::Result<Vec<String>> {
+    use goblin::elf::reloc::R_X86_64_GLOB_DAT;
+    use goblin::elf::sym::{STT_FUNC, STT_NOTYPE};
+    let elf = parse_elf(elf_bytes)?;
+    let mut out = Vec::new();
+    for r in elf.dynrelas.iter().chain(elf.dynrels.iter()) {
+        if r.r_type != R_X86_64_GLOB_DAT {
+            continue;
+        }
+        let Some(sym) = elf.dynsyms.get(r.r_sym) else {
+            continue;
+        };
+        if sym.st_shndx != 0 {
+            continue;
+        }
+        if sym.st_type() != STT_FUNC && sym.st_type() != STT_NOTYPE {
+            continue;
+        }
+        if let Some(name) = elf.dynstrtab.get_at(sym.st_name) {
+            out.push(name.to_string());
+        }
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
 /// Translate a link-time vaddr to a file offset via the LOAD map.
 pub fn vaddr_to_offset(elf: &goblin::elf::Elf, vaddr: u64) -> Option<u64> {
     elf.program_headers

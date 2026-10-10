@@ -13,6 +13,7 @@
 //! 4. dynsym-anchor + version-keyed delta (`OSSL_PROVIDER_available`,
 //!    the stable export immediately below the query fn on all lanes).
 use crate::discovery::elf;
+use crate::discovery::provider::validate_build_id;
 use crate::kinds::Version;
 use anyhow::{Context as _, anyhow, bail};
 use std::collections::HashMap;
@@ -103,6 +104,7 @@ pub fn load_table_str(s: &str) -> anyhow::Result<Table> {
             .get("build_id")
             .and_then(|s| s.as_str())
             .ok_or_else(|| anyhow!("table entry lacks build_id"))?;
+        validate_build_id(id)?;
         t.by_id.insert(
             id.to_string(),
             TableEntry {
@@ -190,6 +192,25 @@ pub fn resolve_symbol_offset(
     if let Some(id) = elf::read_build_id(elf_bytes)
         && let Some(e) = table.by_build_id(&id)
     {
+        // T09 shape check: the recorded anchor must resolve to the
+        // recorded offset in THESE bytes. A build-id mislabel or a
+        // table/object mismatch fails closed with an actionable
+        // error instead of probing a wrong offset (a wrong offset
+        // yields zero rows → PARTIAL at best; the check exists so a
+        // stale table can never silently resolve).
+        let live = elf::dynsym_file_offset(elf_bytes, &e.anchor).map_err(|_| {
+            anyhow!(
+                "build-id table entry for {id}: anchor {} not exported",
+                e.anchor
+            )
+        })?;
+        if live != e.anchor_offset {
+            bail!(
+                "build-id table entry for {id}: anchor {} at 0x{live:x} (table says 0x{:x}); re-enroll this build",
+                e.anchor,
+                e.anchor_offset
+            );
+        }
         return Ok((e.query_offset, Resolution::Table));
     }
     if let Ok(off) = elf::symtab_file_offset(elf_bytes, symbol) {
@@ -246,16 +267,54 @@ mod tests {
     fn table_hit_on_libc_build_id() {
         let b = libc_bytes();
         let id = elf::read_build_id(&b).unwrap();
+        let anchor_off = elf::dynsym_file_offset(&b, "printf").unwrap();
         let s = format!(
             r#"{{"table_version":1,
                 "entries":[{{"build_id":"{id}","openssl":"9.9",
-                             "query_offset":57005,"anchor":"a",
-                             "anchor_offset":1}}],
+                             "query_offset":57005,"anchor":"printf",
+                             "anchor_offset":{anchor_off}}}],
                 "fallback":[]}}"#
         );
         let t = load_table_str(&s).unwrap();
         let (off, r) = resolve_query_offset(&b, &t, None).unwrap();
         assert_eq!((off, r), (57005, Resolution::Table));
+    }
+
+    #[test]
+    fn table_hit_verifies_anchor_shape() {
+        // Stale table (anchor moved) fails closed with re-enroll
+        // guidance; it must not resolve to a wrong offset.
+        let b = libc_bytes();
+        let id = elf::read_build_id(&b).unwrap();
+        let anchor_off = elf::dynsym_file_offset(&b, "printf").unwrap();
+        let stale = format!(
+            r#"{{"table_version":1,
+                "entries":[{{"build_id":"{id}","openssl":"9.9",
+                             "query_offset":57005,"anchor":"printf",
+                             "anchor_offset":{}}}]}}"#,
+            anchor_off + 0x1000
+        );
+        let t = load_table_str(&stale).unwrap();
+        let e = resolve_query_offset(&b, &t, None).unwrap_err();
+        assert!(format!("{e:#}").contains("re-enroll"), "got: {e:#}");
+        // Missing anchor fails closed too.
+        let missing = format!(
+            r#"{{"table_version":1,
+                "entries":[{{"build_id":"{id}","openssl":"9.9",
+                             "query_offset":57005,"anchor":"OSSLscope_NoSuch_Xyz",
+                             "anchor_offset":1}}]}}"#
+        );
+        let t = load_table_str(&missing).unwrap();
+        assert!(resolve_query_offset(&b, &t, None).is_err());
+    }
+
+    #[test]
+    fn table_rejects_malformed_build_id() {
+        let bad = r#"{"table_version":1,
+            "entries":[{"build_id":"xyz","openssl":"9.9",
+                        "query_offset":1,"anchor":"a",
+                        "anchor_offset":1}]}"#;
+        assert!(load_table_str(bad).is_err());
     }
 
     #[test]

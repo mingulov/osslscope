@@ -18,5 +18,6 @@ pub mod flavor;
 pub mod harvest;
 pub mod legacy;
 pub mod maps;
+pub mod provider;
 pub mod schema;
 pub mod session;

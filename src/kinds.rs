@@ -2830,8 +2830,9 @@ pub const SHAPES: &[ShapeDef] = &[
 /// `PROV_NAMES_*` family it came from (`group` is a macro family, NOT an
 /// `OSSL_OP_*` — op/name consistency rules are P1 exit 4's job), and the
 /// first version whose tree contains it. Union across 3.0/3.5/3.6/4.0
-/// (`names.h` + public `core_names.h`); 625 entries, generated — see the
-/// module header for the re-freeze procedure.
+/// (`names.h` + public `core_names.h`); 625 frozen entries plus the
+/// T09 live-census appendix (67) — see the module header for the
+/// re-freeze procedure and the appendix comment for its basis.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct AlgDef {
     pub name: &'static str,
@@ -5965,6 +5966,351 @@ pub const ALG_NAMES: &[AlgDef] = &[
         group: "RSA",
         since: (3, 5),
     },
+    // --- T09 appendix (67): ordinary default/legacy names missing
+    // from the P1-0 freeze, verified against a live
+    // OSSL_PROVIDER_query_operation census of the default and
+    // legacy providers on host OpenSSL 3.5.5 (`query_dump` oracle;
+    // 401 distinct (op, alias-list) rows, zero implementation-less
+    // slots). Appended — never inserted — so every pre-existing
+    // class id is stable. `since` is uniformly (3, 5): verified
+    // present in 3.5; earlier presence is plausible for carried-over
+    // names but was NOT re-confirmed on this lane (no 3.0 oracle;
+    // T14's 3.0 lane can tighten with a census diff).
+    AlgDef {
+        name: "ECDSA",
+        group: "ECDSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "ECDH",
+        group: "EC",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "EC",
+        group: "EC",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "X25519",
+        group: "EC",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "X448",
+        group: "EC",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "ED25519",
+        group: "EC",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "ED25519ctx",
+        group: "EC",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "ED25519ph",
+        group: "EC",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "ED448",
+        group: "EC",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "ED448ph",
+        group: "EC",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "DH",
+        group: "DH",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "DHX",
+        group: "DH",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "X9.42 DH",
+        group: "DH",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "dhKeyAgreement",
+        group: "DH",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "dhpublicnumber",
+        group: "DH",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "DSA",
+        group: "DSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "dsaEncryption",
+        group: "DSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "RSA",
+        group: "RSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "rsaEncryption",
+        group: "RSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "SM2",
+        group: "SM2",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "id-ecPublicKey",
+        group: "EC",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "1.2.840.10040.4.1",
+        group: "DSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "1.2.840.10045.2.1",
+        group: "EC",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "1.2.840.10046.2.1",
+        group: "DH",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "1.2.840.113549.1.1.1",
+        group: "RSA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "1.2.840.113549.1.3.1",
+        group: "DH",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "1.3.101.110",
+        group: "EC",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "1.3.101.111",
+        group: "EC",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "1.3.101.112",
+        group: "EC",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "1.3.101.113",
+        group: "EC",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "1.2.156.10197.1.301",
+        group: "SM2",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "ARGON2D",
+        group: "KDF",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "ARGON2I",
+        group: "KDF",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "ARGON2ID",
+        group: "KDF",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "PKCS12KDF",
+        group: "KDF",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "PVKKDF",
+        group: "KDF",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "SecP256r1MLKEM768",
+        group: "ML",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "SecP384r1MLKEM1024",
+        group: "ML",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "X25519MLKEM768",
+        group: "ML",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "X448MLKEM1024",
+        group: "ML",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "id-scrypt",
+        group: "KDF",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "1.3.6.1.4.1.11591.4.11",
+        group: "KDF",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "1.2.840.113549.1.5.12",
+        group: "KDF",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "ChaCha20",
+        group: "CHACHA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "ChaCha20-Poly1305",
+        group: "CHACHA",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "RC4",
+        group: "RC4",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "AES",
+        group: "AES",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "GENERIC-SECRET",
+        group: "SKEY",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "2.16.840.1.101.3.4.1",
+        group: "AES",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "WHIRLPOOL",
+        group: "DIGEST",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "SHA-1",
+        group: "DIGEST",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "SSL3-MD5",
+        group: "DIGEST",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "SSL3-SHA1",
+        group: "DIGEST",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "NULL",
+        group: "NULL",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "DER",
+        group: "CODEC",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "file",
+        group: "STORE",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "JITTER",
+        group: "CRNG",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "TEST-RAND",
+        group: "CRNG",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "1.0.10118.3.0.55",
+        group: "DIGEST",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "1.0.9797.3.4",
+        group: "MAC",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "1.2.156.10197.1.401",
+        group: "DIGEST",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "1.2.840.113549.2.4",
+        group: "DIGEST",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "1.2.840.113549.2.5",
+        group: "DIGEST",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "1.2.840.113549.3.4",
+        group: "RC4",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "1.3.14.3.2.26",
+        group: "DIGEST",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "1.3.6.1.4.1.1722.12.2.1",
+        group: "MAC",
+        since: (3, 5),
+    },
+    AlgDef {
+        name: "1.3.6.1.4.1.1722.12.2.2",
+        group: "MAC",
+        since: (3, 5),
+    },
 ];
 
 // --- Lookups (linear; discovery-time only, never hot) ---
@@ -6191,13 +6537,16 @@ mod tests {
 
     #[test]
     fn alg_table_shaped_and_spotted() {
-        assert_eq!(ALG_NAMES.len(), 625);
+        assert_eq!(ALG_NAMES.len(), 625 + 67);
         assert!(is_known_alg("SHA2-256"));
         assert!(is_known_alg("AES-256-GCM"));
         assert!(is_known_alg("CSHAKE-128"));
         assert!(is_known_alg("SNMPKDF"));
         assert!(!is_known_alg("SPIKE-SHA"));
-        assert!(!is_known_alg("TEST-RAND"));
+        // TEST-RAND is registry since T09 (verified default-provider
+        // RAND); the unknown canary moves to a still-absent name.
+        assert!(is_known_alg("TEST-RAND"));
+        assert!(!is_known_alg("NOPE-XYZ-9Q"));
         assert!(!is_known_alg(""));
     }
 
