@@ -748,6 +748,8 @@ mod tests {
             provider_build_id: "unknown".to_string(),
             provider_path: "/p/provider.so".to_string(),
             image_digest: String::new(),
+            document: capture::empty_document(),
+            disposition: None,
         }
     }
 
@@ -936,12 +938,16 @@ note: alg-name-only strength (key sizes unobservable); window-only claims\n";
         ("dropped-events", "blind"),
         ("pid-prewindow-blind", "blind"),
         ("drain-shortfall", "blind"),
-        ("reharvest-skipped", "blind"),
+        // T08 (by review): the re-harvest/re-plan engine is gone —
+        // discovery is a persistent session, so reharvest-*/replan-*
+        // reasons are retired and session-driven gaps take over.
         ("cold-gap", "blind"),
-        ("reharvest-no-query", "blind"),
         ("fips-unlabeled", "blind"),
-        ("reharvest-failed", "blind"),
-        ("replan-skipped", "blind"),
+        ("discovery-loss", "blind"),
+        ("lifecycle-polling-partial", "blind"),
+        ("startup-gap", "blind"),
+        ("tail-gap", "blind"),
+        ("late-attach", "blind"),
         ("pid-recycled", "blind"),
         ("fork-exec-ignored", "blind"),
         ("over-budget", "blind"),

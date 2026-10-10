@@ -700,6 +700,8 @@ mod tests {
             provider_build_id: "unknown".to_string(),
             provider_path: "/p".to_string(),
             image_digest: String::new(),
+            document: capture::empty_document(),
+            disposition: None,
         }
     }
 
