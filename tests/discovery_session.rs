@@ -102,11 +102,34 @@ fn mapping(start: u64, len: u64, x: bool, offset: u64, dev: &str, ino: u64, path
     }
 }
 
+/// Stat-able provider identity for stat-or-None resolution: the
+/// test binary itself (always exists; its /proc/self/maps line gives
+/// the (dev, ino) string without libc). Libcrypto/legacy mappings
+/// stay synthetic (path-matched only, never stat-resolved).
+fn provider_file() -> (PathBuf, String, u64) {
+    use std::os::unix::fs::MetadataExt;
+    let exe = std::env::current_exe().unwrap();
+    let want_ino = std::fs::metadata(&exe).unwrap().ino();
+    let base = exe.file_name().unwrap().to_string_lossy().into_owned();
+    for line in std::fs::read_to_string("/proc/self/maps").unwrap().lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() >= 6
+            && f[5].rsplit('/').next() == Some(base.as_str())
+            && f[4].parse::<u64>().ok() == Some(want_ino)
+        {
+            return (exe, f[3].to_string(), want_ino);
+        }
+    }
+    panic!("self mapping not found in /proc/self/maps");
+}
+
 /// Live-shape maps: provider + libcrypto + legacy file mappings
 /// (adjacent, non-overlapping ranges).
 fn live_maps() -> Vec<Mapping> {
+    let (exe, dev, ino) = provider_file();
+    let exe = exe.to_string_lossy().into_owned();
     vec![
-        mapping(0x7f00_0000, 0x10000, true, 0, "08:01", 100, PROVIDER),
+        mapping(0x7f00_0000, 0x10000, true, 0, &dev, ino, &exe),
         mapping(0x7f01_0000, 0x10000, true, 0, "08:01", 200, LIBCRYPTO),
         mapping(0x7f02_0000, 0x10000, true, 0, "08:01", 300, LEGACY_SO),
     ]
@@ -267,7 +290,7 @@ impl SessionEnv for TestEnv {
 }
 
 fn test_core(legacy: bool) -> SessionCore {
-    SessionCore::new(PathBuf::from(PROVIDER), String::new(), legacy, 4242)
+    SessionCore::new(provider_file().0, String::new(), legacy, 4242)
 }
 
 fn ample_budget() -> PollBudget {
@@ -314,14 +337,19 @@ fn late_query_existing_mapping_emits_delta() {
     assert_eq!(c.status, "ok");
     // Advertising identity is the array owner's locator; backing is
     // the implementation's verified triple — never conflated.
-    assert_eq!(c.advertising, PROVIDER);
+    let (exe, dev, ino) = provider_file();
+    let exe = exe.to_string_lossy().into_owned();
+    assert_eq!(c.advertising, exe);
     let b = c.backing.as_ref().expect("backed candidate");
-    assert_eq!((b.dev.as_str(), b.ino, b.offset), ("08:01", 100, 0x2000));
+    assert_eq!(
+        (b.dev.as_str(), b.ino, b.offset),
+        (dev.as_str(), ino, 0x2000)
+    );
     assert_eq!(d1.queries_delta, 1);
 
     // Newly observed backing objects travel typed (no JSON reparse).
     assert_eq!(d1.objects.len(), 1);
-    assert_eq!(d1.objects[0].display_locator, PROVIDER);
+    assert_eq!(d1.objects[0].display_locator, exe);
 
     let snap = core.snapshot();
     assert!(snap.dispatch.trigger_observed);
@@ -730,11 +758,18 @@ fn shared_impl_stays_distinct_per_array() {
     }
     let d = core.poll(&mut env, ample_budget()).unwrap();
     assert_eq!(d.candidates.len(), 2);
-    assert_eq!(d.candidates[0].advertising, PROVIDER);
+    let (exe, dev, ino) = provider_file();
+    assert_eq!(
+        d.candidates[0].advertising,
+        exe.to_string_lossy().into_owned()
+    );
     assert_eq!(d.candidates[1].advertising, LEGACY_SO);
     for c in &d.candidates {
         let b = c.backing.as_ref().expect("backed candidate");
-        assert_eq!((b.dev.as_str(), b.ino, b.offset), ("08:01", 100, 0x2000));
+        assert_eq!(
+            (b.dev.as_str(), b.ino, b.offset),
+            (dev.as_str(), ino, 0x2000)
+        );
     }
     assert_eq!(core.snapshot().candidates.len(), 2);
 }
@@ -951,4 +986,39 @@ fn close_reaped_child_keeps_sites_no_retire_all() {
     );
     assert!(fin.queries_observed >= 1);
     assert_eq!(losses_of(fin)[&HOST_DRAIN_SHORTFALL], 3);
+}
+
+#[test]
+fn stage2_reattach_on_same_path_replacement() {
+    // T14r4-2b: attach reuse compares backing identity, not just
+    // offset+path. A same-path replacement (same path+offset, new
+    // inode, target remapped) must RE-ATTACH, never reuse the stale
+    // install pinned to the old bytes.
+    use std::os::unix::fs::MetadataExt;
+    let dir = std::env::temp_dir().join(format!("osslscope-reuse-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let prov = dir.join("idprov.so");
+    std::fs::write(&prov, b"v1").unwrap();
+    let ino1 = std::fs::metadata(&prov).unwrap().ino();
+    let exe = prov.to_string_lossy().into_owned();
+    let mut env = TestEnv::new();
+    env.maps = vec![mapping(0x7f00_0000, 0x10000, true, 0, "08:01", ino1, &exe)];
+    let mut core = SessionCore::new(prov.clone(), String::new(), false, 4242);
+    // First init attaches and records ino1.
+    env.push(enc_init(0x7f00_3000, 0));
+    let d = core.poll(&mut env, ample_budget()).unwrap();
+    assert!(d.attaches.iter().all(|a| a.failed.is_none()));
+    assert_eq!(env.stage2.len(), 1);
+    // Replace the path (new inode, same path); the target remaps
+    // the new file at the same address (same offset).
+    std::fs::remove_file(&prov).unwrap();
+    std::fs::write(&prov, b"v2-longer").unwrap();
+    let ino2 = std::fs::metadata(&prov).unwrap().ino();
+    assert_ne!(ino2, ino1);
+    env.maps = vec![mapping(0x7f00_0000, 0x10000, true, 0, "08:01", ino2, &exe)];
+    env.push(enc_init(0x7f00_3000, 0));
+    let d = core.poll(&mut env, ample_budget()).unwrap();
+    assert!(d.attaches.iter().all(|a| a.failed.is_none()));
+    assert_eq!(env.stage2.len(), 2, "replacement must re-attach, not reuse");
+    std::fs::remove_dir_all(&dir).unwrap_or_default();
 }

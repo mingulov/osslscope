@@ -388,9 +388,15 @@ mod tests {
     }
 
     /// Backed maps into the test exe: addrs land in a real x
-    /// PT_LOAD (computed, never hardcoded) so rows back.
+    /// PT_LOAD (computed, never hardcoded) so rows back. The staged
+    /// mapping carries the exe's own (dev, ino): stat-or-None
+    /// resolution stats the provider arg, so synthetic identities
+    /// no longer back.
     fn backed_maps() -> (Vec<u8>, Vec<crate::discovery::maps::Mapping>) {
-        let exe = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        let exe_path = std::env::current_exe().unwrap();
+        let exe = std::fs::read(&exe_path).unwrap();
+        let meta = std::fs::metadata(&exe_path).unwrap();
         let elf = crate::discovery::elf::parse_elf(&exe).unwrap();
         let ph = elf
             .program_headers
@@ -405,11 +411,19 @@ mod tests {
             end: 0x1000 + ph.p_filesz,
             x: true,
             offset: ph.p_offset,
-            dev: "08:01".to_string(),
-            ino: 42,
-            path: "t".to_string(),
+            dev: format!(
+                "{:02x}:{:02x}",
+                libc::major(meta.dev()),
+                libc::minor(meta.dev())
+            ),
+            ino: meta.ino(),
+            path: exe_path.to_string_lossy().into_owned(),
         }];
         (exe, maps)
+    }
+
+    fn exe_provider() -> std::path::PathBuf {
+        std::env::current_exe().unwrap()
     }
 
     fn backed_addr(i: u64) -> u64 {
@@ -448,17 +462,8 @@ mod tests {
             },
         ];
         let (exe, maps) = backed_maps();
-        let doc = emit(
-            "t",
-            Path::new("t"),
-            "",
-            &exe,
-            &maps,
-            &rows,
-            true,
-            &Stats::trivial(),
-        )
-        .unwrap();
+        let prov = exe_provider();
+        let doc = emit("t", &prov, "", &exe, &maps, &rows, true, &Stats::trivial()).unwrap();
         let jrows = doc["rows"].as_array().unwrap();
         assert_eq!(jrows.len(), 3);
         // Sorted by (op, class, funcid): MD5 < SHA2-256 < other.
@@ -483,9 +488,20 @@ mod tests {
         assert_eq!(statuses, vec!["ok", "ok", "unknown"]);
         let r = &jrows[1];
         assert_eq!(r["addr_backed"], true);
+        // Frozen preimage: the attested (dev, ino) is the exe's own
+        // stat identity, not a synthetic constant.
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(std::env::current_exe().unwrap()).unwrap();
+        let dev = format!(
+            "{:02x}:{:02x}",
+            libc::major(meta.dev()),
+            libc::minor(meta.dev())
+        );
+        assert_eq!(r["backing"]["dev"], dev);
+        assert_eq!(r["backing"]["ino"], meta.ino());
         assert_eq!(
             r["addr_hash"],
-            crate::kinds::addr_hash("08:01", 42, r["backing"]["offset"].as_u64().unwrap())
+            crate::kinds::addr_hash(&dev, meta.ino(), r["backing"]["offset"].as_u64().unwrap())
         );
     }
 
@@ -496,7 +512,8 @@ mod tests {
 
     fn emit_backed(rows: &[Row], stats: &Stats) -> serde_json::Value {
         let (exe, maps) = backed_maps();
-        emit("t", Path::new("t"), "", &exe, &maps, rows, true, stats).unwrap()
+        let prov = exe_provider();
+        emit("t", &prov, "", &exe, &maps, rows, true, stats).unwrap()
     }
 
     #[test]
@@ -663,17 +680,8 @@ mod tests {
                 ..r.clone()
             })
             .collect();
-        let c = emit(
-            "t",
-            Path::new("t"),
-            "",
-            &exe,
-            &maps,
-            &slid,
-            true,
-            &Stats::trivial(),
-        )
-        .unwrap();
+        let prov = exe_provider();
+        let c = emit("t", &prov, "", &exe, &maps, &slid, true, &Stats::trivial()).unwrap();
         // Re-slide: same triples at moved addrs → byte-identical docs
         // (no runtime address is serialized at all since T02, so no
         // redaction step remains).
@@ -682,12 +690,17 @@ mod tests {
 
     #[test]
     fn multi_impl_order_uses_backing_not_addr() {
-        // Cross-file same-key rows (provider + shared libcrypto):
-        // runtime addr order follows per-file ASLR slides, so the
-        // tiebreak must use the backing triple instead. Here addr
-        // order and triple order INVERT: the smaller addr sits in
-        // the larger (dev, ino, offset).
-        let exe = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+        // Same-file same-key rows under different ASLR slides:
+        // runtime addr order follows the slides, so the tiebreak
+        // must use the backing triple instead. Here addr order and
+        // triple order INVERT: the smaller addr (0x1000) sits at the
+        // larger file offset (base+0x100) while the larger addr
+        // (0x8010) sits at base+0x10. Triple order emits ascending
+        // offsets; an addr tiebreak would emit them descending.
+        use std::os::unix::fs::MetadataExt;
+        let exe_path = std::env::current_exe().unwrap();
+        let exe = std::fs::read(&exe_path).unwrap();
+        let meta = std::fs::metadata(&exe_path).unwrap();
         let elf = crate::discovery::elf::parse_elf(&exe).unwrap();
         let base = elf
             .program_headers
@@ -698,24 +711,29 @@ mod tests {
             })
             .unwrap()
             .p_offset;
+        let dev = format!(
+            "{:02x}:{:02x}",
+            libc::major(meta.dev()),
+            libc::minor(meta.dev())
+        );
         let maps = vec![
             crate::discovery::maps::Mapping {
                 start: 0x1000,
                 end: 0x2000,
                 x: true,
-                offset: base,
-                dev: "08:02".to_string(),
-                ino: 43,
-                path: "t".to_string(),
+                offset: base + 0x100,
+                dev: dev.clone(),
+                ino: meta.ino(),
+                path: exe_path.to_string_lossy().into_owned(),
             },
             crate::discovery::maps::Mapping {
                 start: 0x8000,
                 end: 0x9000,
                 x: true,
                 offset: base,
-                dev: "08:01".to_string(),
-                ino: 42,
-                path: "t".to_string(),
+                dev,
+                ino: meta.ino(),
+                path: exe_path.to_string_lossy().into_owned(),
             },
         ];
         let rows = vec![
@@ -740,7 +758,7 @@ mod tests {
         ];
         let doc = emit(
             "t",
-            Path::new("t"),
+            &exe_path,
             "",
             &exe,
             &maps,
@@ -751,11 +769,11 @@ mod tests {
         .unwrap();
         let jrows = doc["rows"].as_array().unwrap();
         assert_eq!(jrows.len(), 2);
-        // ("08:01", 42, base+0x10) < ("08:02", 43, base): the
-        // LARGER addr emits first. An addr tiebreak would flip this
-        // whenever the slides invert.
-        assert_eq!(jrows[0]["backing"]["dev"], "08:01");
-        assert_eq!(jrows[1]["backing"]["dev"], "08:02");
+        let offs: Vec<u64> = jrows
+            .iter()
+            .map(|r| r["backing"]["offset"].as_u64().unwrap())
+            .collect();
+        assert_eq!(offs, vec![base + 0x10, base + 0x100]);
     }
 
     #[test]

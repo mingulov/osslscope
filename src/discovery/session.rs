@@ -76,6 +76,7 @@ use std::ffi::CString;
 use std::num::NonZeroU32;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
@@ -590,7 +591,7 @@ pub struct SessionCore {
     /// Installed stage-2 target per cookie: (file offset, attach
     /// path). A repeat init resolving elsewhere re-attaches instead
     /// of trusting a stale offset.
-    attached_targets: HashMap<u64, (u64, String)>,
+    attached_targets: HashMap<u64, (u64, String, String, u64)>,
     attach_failures: HashMap<u64, String>,
     reloads: HashMap<u64, u64>,
     pending_stage2: std::collections::VecDeque<(u64, u64)>,
@@ -675,11 +676,21 @@ impl SessionCore {
 
     /// Record an attach-time stage-2 install (builtin mode
     /// pre-attaches its query pair): later inits for the cookie
-    /// re-resolve against this target and re-attach only when the
-    /// callback moved.
-    pub(crate) fn mark_query_attached(&mut self, cookie: u64, offset: u64, path: String) {
+    /// re-resolve against this target and re-attach when the
+    /// callback moved OR its backing identity changed (a same-path
+    /// replacement keeps offset+path but must not reuse the stale
+    /// install — T14r4-2b).
+    pub(crate) fn mark_query_attached(
+        &mut self,
+        cookie: u64,
+        offset: u64,
+        path: String,
+        dev: String,
+        ino: u64,
+    ) {
         self.attached_queries.insert(cookie);
-        self.attached_targets.insert(cookie, (offset, path));
+        self.attached_targets
+            .insert(cookie, (offset, path, dev, ino));
     }
 
     /// Adopt an attach-time legacy plan (first poll planning goes
@@ -951,13 +962,14 @@ impl SessionCore {
                     cookie,
                     format!("resolve stage-2 for cookie {cookie}: {e:#}"),
                 ),
-                Ok((off, path)) => {
-                    let target = (off, path.to_string_lossy().into_owned());
+                Ok((off, path, dev, ino)) => {
+                    let target = (off, path.to_string_lossy().into_owned(), dev, ino);
                     if self.attached_queries.contains(&cookie)
                         && self.attached_targets.get(&cookie) == Some(&target)
                     {
-                        // Same callback: the install stands; fault
-                        // the cold pages back in (best-effort).
+                        // Same callback on the same bytes: the
+                        // install stands; fault the cold pages back
+                        // in (best-effort).
                         env.pretouch(cookie, addr);
                         continue;
                     }
@@ -1599,6 +1611,12 @@ impl LinkSet {
         self.links.clear();
     }
 
+    /// Drop links back to `len` (fd close = detach): rolls back a
+    /// just-installed pair whose backing file was replaced mid-attach.
+    fn truncate(&mut self, len: usize) {
+        self.links.truncate(len);
+    }
+
     fn counts(&self) -> (u64, u64) {
         let mut dispatch = 0u64;
         let mut tripwire = 0u64;
@@ -1975,6 +1993,18 @@ impl SessionEnv for LiveEnv {
         path: &Path,
         pid: u32,
     ) -> anyhow::Result<()> {
+        // Backing-identity check across the install: uprobes attach
+        // by path, so a same-path replacement between resolve and
+        // attach would pin the NEW bytes at the OLD offset. Stat
+        // before/after; on mismatch roll the pair back and fail
+        // loud (the cookie retries next poll — T14r4-2b).
+        let ident_of = |p: &Path| {
+            std::fs::metadata(p)
+                .map(|m| (m.dev(), m.ino()))
+                .unwrap_or((0, 0))
+        };
+        let before = ident_of(path);
+        let links_before = self.links.links.len();
         attach_pair(
             &self.loaded,
             &mut self.links,
@@ -1986,6 +2016,13 @@ impl SessionEnv for LiveEnv {
             cookie,
             LinkKind::Query,
         )?;
+        if ident_of(path) != before {
+            self.links.truncate(links_before);
+            bail!(
+                "stage-2 attach raced a same-path replacement for {}",
+                path.display()
+            );
+        }
         eprintln!("INSPECT stage=query off={offset:#x} cookie={cookie}");
         Ok(())
     }
@@ -2235,10 +2272,23 @@ impl DiscoverySession {
 
         let mut core = SessionCore::new(cfg.provider.clone(), canon.clone(), cfg.legacy, pid);
         if builtin_query_attached {
+            // Backing identity for the reuse comparison: stat now
+            // (unstatable => ("", 0), which never reuses — the next
+            // resolve re-attaches instead of trusting a stale mark).
+            let (pdev, pino) = std::fs::metadata(&cfg.provider)
+                .map(|m| {
+                    (
+                        format!("{:02x}:{:02x}", libc::major(m.dev()), libc::minor(m.dev())),
+                        m.ino(),
+                    )
+                })
+                .unwrap_or_default();
             core.mark_query_attached(
                 0,
                 builtin_query_offset,
                 cfg.provider.to_string_lossy().into_owned(),
+                pdev,
+                pino,
             );
         }
         let mut env = LiveEnv {

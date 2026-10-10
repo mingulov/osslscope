@@ -144,16 +144,20 @@ pub(crate) fn decode_trip_hit(
 }
 
 /// Resolve a BPF-reported query-fn address to its (file offset,
-/// object path) for stage-2 attach. Errors carry the provider path
-/// and cookie (observer inputs) — never the runtime address (stderr
-/// is a scanned artifact, so error paths redact like emission).
+/// object path, backing dev, backing ino) for stage-2 attach. The
+/// backing identity rides along so attach reuse compares bytes, not
+/// just the locator: a same-path replacement keeps path+offset but
+/// changes (dev,ino) and must re-attach (T14r4-2b). Errors carry the
+/// provider path and cookie (observer inputs) — never the runtime
+/// address (stderr is a scanned artifact, so error paths redact
+/// like emission).
 pub(crate) fn resolve_query_target(
     live: &[maps::Mapping],
     provider: &Path,
     canon: &str,
     addr: u64,
     cookie: u64,
-) -> anyhow::Result<(u64, PathBuf)> {
+) -> anyhow::Result<(u64, PathBuf, String, u64)> {
     if cookie == LEGACY_COOKIE {
         let m = live
             .iter()
@@ -161,7 +165,12 @@ pub(crate) fn resolve_query_target(
             .ok_or_else(|| {
                 anyhow::anyhow!("legacy stage-2 attach has no file mapping (cookie {cookie})")
             })?;
-        Ok((addr - m.start + m.offset, PathBuf::from(&m.path)))
+        Ok((
+            addr - m.start + m.offset,
+            PathBuf::from(&m.path),
+            m.dev.clone(),
+            m.ino,
+        ))
     } else {
         let m = maps::provider_mapping(live, provider, canon, addr).ok_or_else(|| {
             anyhow::anyhow!(
@@ -169,7 +178,12 @@ pub(crate) fn resolve_query_target(
                 provider.display()
             )
         })?;
-        Ok((addr - m.start + m.offset, provider.to_path_buf()))
+        Ok((
+            addr - m.start + m.offset,
+            provider.to_path_buf(),
+            m.dev.clone(),
+            m.ino,
+        ))
     }
 }
 
@@ -923,28 +937,42 @@ mod tests {
 
     #[test]
     fn resolve_query_target_redacts_errors() {
-        use std::path::Path;
+        use std::os::unix::fs::MetadataExt;
+        // Real provider file: stat-or-None resolution needs a
+        // stat-able path whose (dev,ino) backs the staged mapping.
+        let dir = std::env::temp_dir().join(format!("osslscope-resolve-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let prov = dir.join("prov.so");
+        std::fs::write(&prov, b"resolve-bytes").unwrap();
+        let meta = std::fs::metadata(&prov).unwrap();
+        let dev = format!(
+            "{:02x}:{:02x}",
+            libc::major(meta.dev()),
+            libc::minor(meta.dev())
+        );
         let live = vec![super::maps::Mapping {
             start: 0x1000,
             end: 0x2000,
             x: true,
             offset: 0x500,
-            dev: "08:01".into(),
-            ino: 7,
-            path: "/prov.so".into(),
+            dev: dev.clone(),
+            ino: meta.ino(),
+            path: prov.to_string_lossy().into_owned(),
         }];
-        // Happy paths resolve to file offsets.
-        let (off, path) =
-            super::resolve_query_target(&live, Path::new("/prov.so"), "", 0x1400, 0).unwrap();
-        assert_eq!((off, path), (0x900, std::path::PathBuf::from("/prov.so")));
-        let (off, path) =
-            super::resolve_query_target(&live, Path::new("/prov.so"), "", 0x1400, 1).unwrap();
-        assert_eq!((off, path), (0x900, std::path::PathBuf::from("/prov.so")));
+        // Happy paths resolve to file offsets plus backing identity.
+        let (off, path, rdev, rino) =
+            super::resolve_query_target(&live, &prov, "", 0x1400, 0).unwrap();
+        assert_eq!((off, rdev, rino), (0x900, dev.clone(), meta.ino()));
+        assert_eq!(path, prov);
+        let (off, path, rdev, rino) =
+            super::resolve_query_target(&live, &prov, "", 0x1400, 1).unwrap();
+        assert_eq!((off, rdev, rino), (0x900, dev.clone(), meta.ino()));
+        assert_eq!(path, prov);
         // Failure paths redact the runtime address (both hex and
         // decimal forms) while keeping observer context.
         for cookie in [0u64, 1] {
             let addr = 0x7f00_deed_beefu64;
-            let err = super::resolve_query_target(&live, Path::new("/prov.so"), "", addr, cookie)
+            let err = super::resolve_query_target(&live, &prov, "", addr, cookie)
                 .unwrap_err()
                 .to_string();
             assert!(
@@ -953,6 +981,7 @@ mod tests {
             );
             assert!(!err.contains(&addr.to_string()), "addr leaked: {err}");
         }
+        std::fs::remove_dir_all(&dir).unwrap_or_default();
     }
 
     #[test]
