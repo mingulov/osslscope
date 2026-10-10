@@ -37,6 +37,7 @@ jobs:
       - uses: actions/checkout@v4
       - run: ./packaging/tests/test-scriptlets.sh
       - run: ./scripts/tests/test-install-dev.sh
+      - run: ./scripts/tests/test-live-oracle.sh
       - run: python3 -c "import yaml,sys; [yaml.safe_load(open(f)) for f in sys.argv[1:]]" .github/workflows/check.yml .github/workflows/live-known-n.yml
   live-gates:
     # Labeled skips, never passes: every live suite needs a privileged BPF

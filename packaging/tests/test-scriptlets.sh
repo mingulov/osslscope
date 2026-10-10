@@ -99,6 +99,15 @@ else
     bad "build-rpm.sh threads RPM_RELEASE into pkg_release define"
 fi
 
+# The result glob must pin the built release: a shared RPMS dir holding an
+# older release would otherwise make a first-match `-*` glob return the
+# stale rpm and turn an upgrade witness into a no-op.
+if grep -q 'osslscope-"\$ver"-"\$release"\.' "$REPO/packaging/build-rpm.sh"; then
+    ok "build-rpm.sh result glob pins the built release"
+else
+    bad "build-rpm.sh result glob pins the built release"
+fi
+
 # Simulate the control.in substitution build-deb.sh performs.
 if sed -e "s/@VERSION@/9.9.9/" -e "s/@REVISION@/2/" \
         "$REPO/packaging/deb/DEBIAN/control.in" >"$T/control" \

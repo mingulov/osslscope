@@ -71,8 +71,19 @@ if [ -z "$PREFIX" ]; then
     PREFIX="$HOME/.local"
 fi
 # Never spray system package territory: /usr belongs to deb/rpm.
-case "$PREFIX" in
-    /|//|/usr|/usr/) echo "error: refusing system prefix '$PREFIX': /usr is system package territory (use deb/rpm there); pick a local prefix such as \$HOME/.local" >&2; exit 2 ;;
+# Normalize trailing slashes and /./ segments first so /usr/, /usr/.
+# and /usr// cannot bypass the comparison.
+_NORM="$PREFIX"
+while :; do
+    case "$_NORM" in
+        */) _NORM="${_NORM%/}"; continue ;;
+        */.) _NORM="${_NORM%/.}"; continue ;;
+    esac
+    break
+done
+[ -n "$_NORM" ] || _NORM="/"
+case "$_NORM" in
+    /|/usr) echo "error: refusing system prefix '$PREFIX': /usr is system package territory (use deb/rpm there); pick a local prefix such as \$HOME/.local" >&2; exit 2 ;;
 esac
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -139,12 +150,16 @@ COUNT_OBJ="$COUNT_OVERRIDE"
 PRODUCT_REF=""
 PRODUCT_DIRTY=""
 if [ -n "$MANIFEST_PATHS" ]; then
+    # Pre-initialized: command substitution strips trailing empty lines, so
+    # a manifest without revision keys would otherwise make the last read
+    # hit EOF and abort under set -e. Missing keys mean empty metadata.
+    _m_host=""; _m_harvest=""; _m_count=""; _m_ref=""; _m_dirty=""
     {
-        IFS= read -r _m_host
-        IFS= read -r _m_harvest
-        IFS= read -r _m_count
-        IFS= read -r _m_ref
-        IFS= read -r _m_dirty
+        IFS= read -r _m_host || true
+        IFS= read -r _m_harvest || true
+        IFS= read -r _m_count || true
+        IFS= read -r _m_ref || true
+        IFS= read -r _m_dirty || true
     } <<EOF2
 $MANIFEST_PATHS
 EOF2
@@ -209,14 +224,14 @@ SETCAP_STATE="not-requested"
 if [ "$SETCAP" -eq 1 ]; then
     if ! command -v setcap >/dev/null 2>&1; then
         echo "error: --setcap requested but setcap not found." >&2
-        echo "hint: install libcap2-bin (Debian/Ubuntu) or libcap (Fedora/RHEL), then re-run with --setcap; or run 'sudo setcap cap_bpf,cap_perfmon+ep $PREFIX/bin/osslscope' then '$PREFIX/bin/osslscope doctor'." >&2
+        echo "hint: install libcap2-bin (Debian/Ubuntu) or libcap (Fedora/RHEL), then re-run with --setcap; or run sudo setcap cap_bpf,cap_perfmon+ep '$PREFIX/bin/osslscope' then '$PREFIX/bin/osslscope doctor'." >&2
         exit 3
     fi
     if setcap cap_bpf,cap_perfmon+ep "$PREFIX/bin/osslscope" 2>/dev/null; then
         SETCAP_STATE="applied"
     else
         echo "error: setcap failed on $PREFIX/bin/osslscope." >&2
-        echo "hint: fallback (labeled sudo): run 'sudo setcap cap_bpf,cap_perfmon+ep $PREFIX/bin/osslscope' then '$PREFIX/bin/osslscope doctor'." >&2
+        echo "hint: fallback (labeled sudo): run sudo setcap cap_bpf,cap_perfmon+ep '$PREFIX/bin/osslscope' then '$PREFIX/bin/osslscope doctor'." >&2
         exit 1
     fi
 fi
@@ -298,7 +313,7 @@ if [ "$SETCAP" -eq 1 ]; then
     fi
 else
     echo "next: grant caps once (needs privilege), then verify:"
-    echo "  sudo setcap cap_bpf,cap_perfmon+ep $PREFIX/bin/osslscope"
-    echo "  $PREFIX/bin/osslscope doctor"
+    echo "  sudo setcap cap_bpf,cap_perfmon+ep '$PREFIX/bin/osslscope'"
+    echo "  '$PREFIX/bin/osslscope' doctor"
 fi
 echo "done."

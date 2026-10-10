@@ -100,6 +100,39 @@ LOG="$WORKDIR/lifecycle.log"
 mkdir -p "$WORKDIR"
 echo "old=$OLD_REF new=$NEW_REF pkg=$PKG host=$(hostname) kernel=$(uname -r)" | tee "$LOG"
 
+run_step() {
+    # $1 = tag, $@ = command. Runs without pipelines so no exit code is
+    # masked (dash has no pipefail); step output lands in its own log plus
+    # the main log. Any failure aborts the lifecycle: a HELD verdict must
+    # never follow a failed step.
+    _tag="$1"; shift
+    _sl="$WORKDIR/step-$_tag.log"
+    # Progress goes to stderr: build_one runs inside $(...) where stdout is
+    # the captured package path.
+    echo "--- step $_tag: $*" | tee -a "$LOG" >&2
+    if "$@" >"$_sl" 2>&1; then
+        tail -3 "$_sl" | tee -a "$LOG" >&2
+    else
+        _rc=$?
+        cat "$_sl" | tee -a "$LOG" >&2
+        echo "step $_tag FAILED (exit $_rc) — lifecycle FAILED" | tee -a "$LOG" >&2
+        exit 1
+    fi
+}
+
+run_doctor() {
+    # $1 = tag. Records doctor output; a doctor crash (nonzero exit) fails
+    # the lifecycle. A FAIL-CLOSED verdict still exits 0 from doctor and is
+    # recorded for the lane reviewer, not treated as a crash.
+    _tag="$1"
+    if ! osslscope doctor >"$WORKDIR/doctor-$_tag.log" 2>&1; then
+        echo "doctor crashed after $_tag — lifecycle FAILED" | tee -a "$LOG" >&2
+        cat "$WORKDIR/doctor-$_tag.log" | tee -a "$LOG" >&2
+        exit 1
+    fi
+    head -20 "$WORKDIR/doctor-$_tag.log" | tee -a "$LOG" >&2
+}
+
 assert_caps() {
     # $1 = step label
     _caps="$(getcap /usr/bin/osslscope 2>/dev/null || true)"
@@ -111,57 +144,77 @@ assert_caps() {
 }
 
 build_one() {
-    # $1 = ref, $2 = tag (old|new), $3 = release/revision number; echoes pkg path
+    # $1 = ref, $2 = tag (old|new), $3 = release/revision number; echoes the
+    # ABSOLUTE package path. No pipelines on decisive commands: each stage
+    # writes its own log file and its exit code is checked directly.
     _ref="$1"; _tag="$2"; _rel="$3"
     _dir="$WORKDIR/$_tag"
     mkdir -p "$_dir"
-    git -C "$REPO" archive "$_ref" | tar -x -C "$_dir"
-    (cd "$_dir" && CARGO_BUILD_JOBS=2 cargo +1.88.0 build --locked --release) 2>&1 | tail -2 | tee -a "$LOG"
+    git -C "$REPO" archive "$_ref" >"$WORKDIR/archive-$_tag.tar" || exit 1
+    tar -x -f "$WORKDIR/archive-$_tag.tar" -C "$_dir" || exit 1
+    (cd "$_dir" && CARGO_BUILD_JOBS=2 run_step "cargo-$_tag" cargo +1.88.0 build --locked --release) || exit 1
     if [ "$PKG" = "rpm" ]; then
-        (cd "$_dir" && RPM_RELEASE="$_rel" ./packaging/build-rpm.sh) 2>&1 | tee -a "$LOG" | tail -1
+        (cd "$_dir" && RPM_RELEASE="$_rel" run_step "pkg-$_tag" ./packaging/build-rpm.sh) || exit 1
+        _built="$(sed -n 's/^built //p' "$WORKDIR/step-pkg-$_tag.log" | tail -1)"
+        printf '%s\n' "$_built"
     else
-        (cd "$_dir" && DEB_REVISION="$_rel" ./packaging/build-deb.sh) 2>&1 | tee -a "$LOG" | tail -1
+        (cd "$_dir" && DEB_REVISION="$_rel" run_step "pkg-$_tag" ./packaging/build-deb.sh) || exit 1
+        _built="$(sed -n 's/^built //p' "$WORKDIR/step-pkg-$_tag.log" | tail -1)"
+        # build-deb.sh reports a path relative to the export dir; absolutize
+        # before returning (callers check from the original directory).
+        case "$_built" in
+            /*) printf '%s\n' "$_built" ;;
+            *) printf '%s\n' "$_dir/$_built" ;;
+        esac
     fi
 }
 
+deb_install() {
+    # $1 = tag, $2 = pkg. dpkg install with dependency fix-up; fails closed
+    # when the package is not installed afterwards.
+    _tag="$1"; _pkg="$2"
+    # shellcheck disable=SC2024 # log dir is user-owned by design; only dpkg runs privileged
+    if sudo dpkg -i "$_pkg" >"$WORKDIR/step-$_tag.log" 2>&1; then
+        tail -3 "$WORKDIR/step-$_tag.log" | tee -a "$LOG" >&2
+    else
+        tail -5 "$WORKDIR/step-$_tag.log" | tee -a "$LOG" >&2
+        echo "dpkg failed; attempting dependency fix-up" | tee -a "$LOG" >&2
+        run_step "$_tag-deps" sudo apt-get install -f -y
+    fi
+    dpkg -s osslscope >/dev/null 2>&1 \
+        || { echo "package osslscope not installed after $_tag — lifecycle FAILED" | tee -a "$LOG" >&2; exit 1; }
+}
+
 echo "--- building old package (release 1) ---" | tee -a "$LOG"
-OLD_PKG="$(build_one "$OLD_REF" old 1 | sed -n 's/^built //p' | tail -1)"
+OLD_PKG="$(build_one "$OLD_REF" old 1)"
 echo "old package: $OLD_PKG" | tee -a "$LOG"
 [ -f "$OLD_PKG" ] || { echo "old package build produced no file" | tee -a "$LOG"; exit 1; }
 
 echo "--- building new package (release 2) ---" | tee -a "$LOG"
-NEW_PKG="$(build_one "$NEW_REF" new 2 | sed -n 's/^built //p' | tail -1)"
+NEW_PKG="$(build_one "$NEW_REF" new 2)"
 echo "new package: $NEW_PKG" | tee -a "$LOG"
 [ -f "$NEW_PKG" ] || { echo "new package build produced no file" | tee -a "$LOG"; exit 1; }
 
 if [ "$PKG" = "rpm" ]; then
-    echo "--- install old ---" | tee -a "$LOG"
-    sudo dnf install -y "$OLD_PKG" 2>&1 | tail -3 | tee -a "$LOG"
+    run_step "install-old" sudo dnf install -y "$OLD_PKG"
     assert_caps "install-old"
-    osslscope doctor 2>&1 | tee -a "$LOG" | head -20 || true
-    echo "--- upgrade old -> new ---" | tee -a "$LOG"
-    sudo dnf upgrade -y "$NEW_PKG" 2>&1 | tail -3 | tee -a "$LOG"
+    run_doctor "install-old"
+    run_step "upgrade-new" sudo dnf upgrade -y "$NEW_PKG"
     assert_caps "upgrade-new"
-    osslscope doctor 2>&1 | tee -a "$LOG" | head -20 || true
-    echo "--- reinstall new ---" | tee -a "$LOG"
-    sudo dnf reinstall -y "$NEW_PKG" 2>&1 | tail -3 | tee -a "$LOG"
+    run_doctor "upgrade-new"
+    run_step "reinstall-new" sudo dnf reinstall -y "$NEW_PKG"
     assert_caps "reinstall-new"
-    echo "--- remove ---" | tee -a "$LOG"
-    sudo dnf remove -y osslscope 2>&1 | tail -3 | tee -a "$LOG"
+    run_step "remove" sudo dnf remove -y osslscope
 else
-    echo "--- install old ---" | tee -a "$LOG"
-    sudo dpkg -i "$OLD_PKG" 2>&1 | tail -3 | tee -a "$LOG" || sudo apt-get install -f -y 2>&1 | tail -3 | tee -a "$LOG"
+    deb_install "install-old" "$OLD_PKG"
     assert_caps "install-old"
-    osslscope doctor 2>&1 | tee -a "$LOG" | head -20 || true
-    echo "--- upgrade old -> new ---" | tee -a "$LOG"
-    sudo dpkg -i "$NEW_PKG" 2>&1 | tail -3 | tee -a "$LOG" || sudo apt-get install -f -y 2>&1 | tail -3 | tee -a "$LOG"
+    run_doctor "install-old"
+    deb_install "upgrade-new" "$NEW_PKG"
     assert_caps "upgrade-new"
-    osslscope doctor 2>&1 | tee -a "$LOG" | head -20 || true
-    echo "--- reinstall new ---" | tee -a "$LOG"
-    sudo dpkg -i "$NEW_PKG" 2>&1 | tail -3 | tee -a "$LOG" || true
+    run_doctor "upgrade-new"
+    deb_install "reinstall-new" "$NEW_PKG"
     assert_caps "reinstall-new"
-    echo "--- remove ---" | tee -a "$LOG"
-    sudo dpkg -P osslscope 2>&1 | tail -3 | tee -a "$LOG"
+    run_step "remove" sudo dpkg -P osslscope
 fi
 
 if [ -e /usr/bin/osslscope ]; then

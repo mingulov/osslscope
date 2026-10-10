@@ -184,6 +184,39 @@ else
     ok "--prefix / refused"
 fi
 
+for sys in "/usr/." "/usr//" "/usr/./"; do
+    if "$SH_BIN" "$INSTALL" --manifest "$T/manifest.json" --prefix "$sys" >"$T/out" 2>&1; then
+        bad "--prefix $sys refused (got exit 0)"
+    else
+        grep -qi 'system package\|refuse' "$T/out" \
+            && ok "--prefix $sys refused as system path" \
+            || bad "--prefix $sys refused as system path"
+    fi
+done
+
+# Manifest without revision keys must still install (keys are metadata).
+python3 -c "
+import json
+m = json.load(open('$T/manifest.json'))
+del m['product_ref']; del m['product_dirty']
+json.dump(m, open('$T/norev-manifest.json', 'w'))
+"
+if "$SH_BIN" "$INSTALL" --manifest "$T/norev-manifest.json" --prefix "$T/pfxnr" >"$T/out" 2>&1 \
+   && [ -x "$T/pfxnr/bin/osslscope" ]; then
+    ok "manifest without revision keys still installs"
+else
+    bad "manifest without revision keys still installs (rc=$?; $(head -1 "$T/out"))"
+fi
+
+# Printed follow-up commands quote the prefix path.
+if "$SH_BIN" "$INSTALL" --manifest "$T/manifest.json" --prefix "$T/my pfx" >"$T/out" 2>&1; then
+    grep -q "setcap cap_bpf,cap_perfmon+ep '$T/my pfx/bin/osslscope'" "$T/out" \
+        && ok "follow-up setcap hint quotes spaced prefix path" \
+        || bad "follow-up setcap hint quotes spaced prefix path"
+else
+    bad "spaced prefix installs (rc=$?)"
+fi
+
 # ============ --setcap matrix ============
 mkdir -p "$T/stubbin"
 cat >"$T/stubbin/setcap" <<'EOF'
@@ -214,7 +247,15 @@ else
         || bad "--setcap with failing setcap fails with labeled-sudo + doctor fallback"
 fi
 
-if PATH="/usr/bin:/bin" "$SH_BIN" "$INSTALL" --manifest "$T/manifest.json" \
+# Deterministic missing-setcap PATH: a symlink farm with every tool the
+# installer needs except setcap/getcap (a bare /usr/bin:/bin still carries
+# setcap on merged-usr platforms).
+mkdir -p "$T/nocapbin"
+for tool in python3 file readelf cp mkdir chmod rm grep awk sed cat; do
+    dest="$(command -v "$tool")" || { echo "test prereq missing: $tool" >&2; exit 1; }
+    ln -s "$dest" "$T/nocapbin/$tool"
+done
+if PATH="$T/nocapbin" "$SH_BIN" "$INSTALL" --manifest "$T/manifest.json" \
         --prefix "$T/pfx8" --setcap >"$T/out" 2>&1; then
     bad "--setcap without setcap fails (got exit 0)"
 else

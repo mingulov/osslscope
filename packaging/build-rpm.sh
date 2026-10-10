@@ -26,8 +26,11 @@ cp packaging/rpm/osslscope.spec "$top/SPECS/osslscope.spec"
 rpmbuild -bb --define "pkg_version $ver" --define "pkg_release $release" \
   --define "_topdir $top" "$top/SPECS/osslscope.spec"
 found=
-for f in "$top"/RPMS/x86_64/osslscope-"$ver"-*.x86_64.rpm; do
+# Pin the release just built: the shared RPMS dir may hold older releases,
+# and a first-match glob would return a stale rpm (silently turning an
+# upgrade witness into a reinstall of the old package).
+for f in "$top"/RPMS/x86_64/osslscope-"$ver"-"$release".*.x86_64.rpm; do
   [ -f "$f" ] && { found=$f; break; }
 done
-[ -n "$found" ] || { echo "build-rpm: no rpm for $ver under $top/RPMS" >&2; exit 1; }
+[ -n "$found" ] || { echo "build-rpm: no rpm for $ver release $release under $top/RPMS" >&2; exit 1; }
 echo "built $found"
