@@ -29,6 +29,13 @@ MODE_OPS = {
     "mixed": {1},
 }
 
+# Mode -> required algorithm-class substring on the hit (src/kinds.rs
+# registry names; ecdsa only for T14 — other modes keep op-match
+# until their live classes are pinned (T15)).
+MODE_CLASS = {
+    "ecdsa": "ECDSA",
+}
+
 
 def fail(msg):
     print("ORACLE FAIL: " + msg)
@@ -92,17 +99,39 @@ def main(argv):
         len(sites), total, rep.get("completeness", {}).get("status")))
     want = MODE_OPS[mode]
     hit = False
+    class_hit = False
+    op_calls = 0
     for s in sites:
-        ops = sorted({c.get("op") for c in s.get("candidates", [])})
+        cands = s.get("candidates", [])
+        ops = sorted({c.get("op") for c in cands})
         print("  site calls=%d ops=%s" % (s.get("calls"), ops))
         if s.get("calls", 0) >= 1 and (want & set(ops)):
             hit = True
+            op_calls += s.get("calls", 0)
+            if MODE_CLASS.get(mode) and any(
+                    MODE_CLASS[mode] in " ".join(c.get("algorithm_classes", []))
+                    for c in cands if c.get("op") in want):
+                class_hit = True
     if not hit:
         return fail("no executed site carries op %s for mode %s "
                      "(total %d calls over %d sites)"
                      % (sorted(want), mode, total, len(sites)))
-    print("ORACLE PASS: ledgered op %s execution is visible in observer JSON"
-          % sorted(want))
+    if MODE_CLASS.get(mode) and not class_hit:
+        return fail("no executed op-%s site carries class %r for mode %s "
+                     "(wrong algorithm, e.g. DSA for ECDSA)"
+                     % (sorted(want), MODE_CLASS[mode], mode))
+    # Lower-bound conservation (fixture contract: ledgered ops explain
+    # observed execution from below): every loop iteration executes
+    # >=1 mode-op callback, so mode-op calls >= ledgered iterations.
+    # Exact counts stay implementation-defined (never asserted equal).
+    loop_ops = [int(d["ops"]) for d in parsed if "ops" in d]
+    if loop_ops and op_calls < max(loop_ops):
+        return fail("mode-op calls %d below ledgered %d iterations "
+                     "(ledger does not explain observation)"
+                     % (op_calls, max(loop_ops)))
+    print("ORACLE PASS: ledgered op %s execution is visible in observer JSON "
+          "(%d op calls over %d ledgered iterations)"
+          % (sorted(want), op_calls, max(loop_ops) if loop_ops else 0))
     return 0
 
 

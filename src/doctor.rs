@@ -1040,20 +1040,39 @@ fn check_spawn_access() -> Check {
         }
     }
     let mut status = 0;
+    // Reap confirming (not assumed): the first wait may already reap
+    // a child that died instead of stopping; otherwise the kill +
+    // second wait must observe the death. ECHILD anywhere means no
+    // unwaited-for child exists (already reaped — safe, not an
+    // error). A SIGKILLed 3-instruction child always dies, so the
+    // second wait cannot hang; any non-EINTR surprise still breaks
+    // out and fails the check below (never a silent leak).
+    let mut reaped = false;
     let stopped = loop {
         let r = unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) };
         if r < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
             continue;
         }
-        break r > 0 && libc::WIFSTOPPED(status);
+        if r == pid && (libc::WIFEXITED(status) || libc::WIFSIGNALED(status)) {
+            reaped = true;
+        }
+        if r < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD) {
+            reaped = true;
+        }
+        break r == pid && libc::WIFSTOPPED(status);
     };
     let maps = if stopped {
         std::fs::read_to_string(format!("/proc/{pid}/maps"))
     } else {
         Err(std::io::Error::other("probe child never stopped"))
     };
-    unsafe {
-        libc::kill(pid, libc::SIGKILL);
+    let k = unsafe { libc::kill(pid, libc::SIGKILL) };
+    let kill_errno = std::io::Error::last_os_error().raw_os_error();
+    if k != 0 && !reaped && kill_errno != Some(libc::ESRCH) {
+        // Kill failed on a live, unreaped child (EPERM/EINVAL are
+        // impossible for our own pid+SIGKILL — this is defensive):
+        // the wait below still reaps, but say so loudly.
+        eprintln!("osslscope doctor: probe kill failed: {kill_errno:?}");
     }
     let mut status2 = 0;
     loop {
@@ -1061,7 +1080,17 @@ fn check_spawn_access() -> Check {
         if r < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
             continue;
         }
+        if r == pid || std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD) {
+            reaped = true;
+        }
         break;
+    }
+    if !reaped {
+        return Check::fail(
+            "spawn-access",
+            "spawn-setup probe leaked its child (reap unconfirmed)".into(),
+            "re-run; a leftover stopped child blocks the next probe — report this".into(),
+        );
     }
     match maps {
         Ok(body) if !body.is_empty() => Check::pass(
@@ -2330,11 +2359,25 @@ mod tests {
         // read its maps): it must pass on a healthy host, and the
         // probe child must be killed and reaped (never a zombie or
         // a leftover stopped child — a second run would inherit it).
+        // Reap proof: this thread's /proc children list is empty
+        // after each run (zombies and live children both appear).
+        let tid = unsafe { libc::gettid() };
+        // The oracle must exist (a missing children file would make
+        // the empty check vacuous — fail loud instead).
+        std::fs::read_to_string(format!("/proc/self/task/{tid}/children"))
+            .expect("per-thread children file must exist");
+        let children = || {
+            std::fs::read_to_string(format!("/proc/self/task/{tid}/children"))
+                .unwrap_or_default()
+                .split_whitespace()
+                .count()
+        };
         for _ in 0..2 {
             let c = check_spawn_access();
             assert_eq!(c.id, "spawn-access");
             assert!(matches!(c.status, Status::Pass), "{}", c.message);
             assert!(c.message.contains("self dumpable="), "{}", c.message);
+            assert_eq!(children(), 0, "probe leaked a child (zombie or stopped)");
         }
     }
 }
