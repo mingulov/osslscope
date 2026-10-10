@@ -468,18 +468,83 @@ fn address_taken_resolves_absent_and_shared() {
     assert_eq!(r.ambiguous.len(), 1);
     assert_eq!(r.ambiguous[0].symbol, "MD5_Transform");
     assert_eq!(r.ambiguous[0].objects.len(), 2);
-    // Versioned duplicates inside ONE object (libc defines e.g.
-    // cfgetispeed at two FUNC addresses) are ambiguous too — never
-    // a silent last-wins resolution.
-    let libc = host_lib(&["/lib/x86_64-linux-gnu/libc.so.6", "/usr/lib/libc.so.6"]).unwrap();
+    // Versioned duplicates inside ONE object are ambiguous too —
+    // never a silent last-wins resolution. The fixture is
+    // synthesized at test time (the compat+default shape), never
+    // pinned to libc's version-bound layout (F-ORD-1: cfgetispeed
+    // is one FUNC def on glibc 2.41, two on 2.43).
+    let Some(dup) = dup_sym_fixture() else {
+        eprintln!("SKIP: no C toolchain for the dup-symbol fixture");
+        return;
+    };
+    // Independent oracle on the fixture itself: one name, two FUNC
+    // addresses (a toolchain that merged them must fail loudly).
+    let entries = elf::dynsym_func_entries(&dup).unwrap();
+    let addrs: Vec<u64> = entries
+        .iter()
+        .filter(|(n, _)| n == "dup_sym")
+        .map(|(_, o)| *o)
+        .collect();
+    assert_eq!(addrs.len(), 2, "fixture lost its duplicate: {entries:?}");
+    assert_ne!(addrs[0], addrs[1], "fixture addrs collide");
     let one = [Module {
-        path: "libc.so.6",
-        bytes: &libc,
+        path: "libdup.so.3",
+        bytes: &dup,
     }];
-    let r = legacy::resolve_address_taken(&["cfgetispeed".to_string()], &one).unwrap();
+    let r = legacy::resolve_address_taken(&["dup_sym".to_string()], &one).unwrap();
     assert!(r.resolved.is_empty(), "last-wins resolution: {r:?}");
     assert_eq!(r.ambiguous.len(), 1);
-    assert_eq!(r.ambiguous[0].objects, vec!["libc.so.6".to_string()]);
+    assert_eq!(r.ambiguous[0].objects, vec!["libdup.so.3".to_string()]);
+}
+
+/// Build a one-object duplicate-FUNC fixture: `dup_sym` exported at
+/// two addresses via `.symver` (compat `VERS_1` + default `VERS_2`),
+/// the same shape as glibc's versioned duplicates. `None` when no
+/// C toolchain builds it (caller skips).
+fn dup_sym_fixture() -> Option<Vec<u8>> {
+    let dir = std::env::temp_dir().join(format!("osslscope-dup-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).ok()?;
+    let asm = dir.join("dup.s");
+    let map = dir.join("dup.map");
+    let so = dir.join("libdup.so.3");
+    std::fs::write(
+        &asm,
+        "\t.text\n\
+         \t.globl\tdup_impl_v1\n\
+         \t.type\tdup_impl_v1,@function\n\
+         dup_impl_v1:\n\
+         \tret\n\
+         \t.size\tdup_impl_v1,.-dup_impl_v1\n\
+         \t.globl\tdup_impl_v2\n\
+         \t.type\tdup_impl_v2,@function\n\
+         dup_impl_v2:\n\
+         \tret\n\
+         \t.size\tdup_impl_v2,.-dup_impl_v2\n\
+         \t.symver\tdup_impl_v1, dup_sym@VERS_1\n\
+         \t.symver\tdup_impl_v2, dup_sym@@VERS_2\n",
+    )
+    .ok()?;
+    std::fs::write(
+        &map,
+        "VERS_1 { global: dup_sym; local: *; };\nVERS_2 { global: dup_sym; local: *; };\n",
+    )
+    .ok()?;
+    let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
+    let status = std::process::Command::new(cc)
+        .arg("-shared")
+        .arg("-fPIC")
+        .arg("-o")
+        .arg(&so)
+        .arg(&asm)
+        .arg(format!("-Wl,--version-script={}", map.display()))
+        .status()
+        .ok()?;
+    if !status.success() {
+        return None;
+    }
+    let bytes = std::fs::read(&so).ok()?;
+    std::fs::remove_dir_all(&dir).ok();
+    Some(bytes)
 }
 
 #[test]
