@@ -1642,6 +1642,113 @@ fn polling_fallback_is_explicit_partial() {
 }
 
 // ---------------------------------------------------------------------------
+// Adapter pins: direct `adapt_delta` contract checks.
+// ---------------------------------------------------------------------------
+
+use osslscope::capture::{AdapterCtx, AdapterState, adapt_delta};
+
+#[test]
+fn advertising_fallback_binds_mapping_not_path() {
+    // No build-id bytes: the opaque fallback binds the resolving
+    // mapping's (dev, ino). A same-path replacement (new inode)
+    // changes identity instead of conflating two objects.
+    let stage = Stage::fresh("adv-map");
+    let bytes = self_bytes();
+    let staged = stage.write("prov.so", &bytes);
+    let dev = plan::render_device(staged.device);
+    let live1 = vec![mapping(&staged)];
+    let mut live2 = live1.clone();
+    live2[0].ino += 1;
+    let fresh: HashSet<(String, u64)> = HashSet::new();
+    let files: HashMap<String, Vec<u8>> = HashMap::new();
+    let run = |live: &[Mapping], ino: u64| {
+        let mut state = AdapterState::default();
+        let delta = DiscoveryDelta {
+            candidates: vec![cand(
+                staged.path.as_str(),
+                Some(BackingRef {
+                    dev: dev.clone(),
+                    ino,
+                    offset: 0x100,
+                }),
+                1,
+                11,
+                "SHA-256",
+                false,
+                "ok",
+            )],
+            ..DiscoveryDelta::default()
+        };
+        let adapted = adapt_delta(
+            &mut state,
+            &delta,
+            &AdapterCtx {
+                live,
+                files: &files,
+                builtin_default: false,
+                fresh: &fresh,
+                post_settle: false,
+                baseline: false,
+            },
+        );
+        assert_eq!(adapted.delta.discovered.len(), 1);
+        adapted.delta.discovered[0].candidates[0].provider.0.clone()
+    };
+    let first = run(&live1, staged.ino);
+    let second = run(&live2, staged.ino + 1);
+    assert_eq!(
+        first,
+        format!("unverified-advertising:{dev}:{}", staged.ino)
+    );
+    assert_eq!(
+        second,
+        format!("unverified-advertising:{dev}:{}", staged.ino + 1)
+    );
+    assert_ne!(first, second);
+}
+
+#[test]
+fn advertising_fallback_unresolved_is_anonymous() {
+    // An advertising path with no live mapping degrades to
+    // anonymous: the pathname never leaks into identity.
+    let stage = Stage::fresh("adv-anon");
+    let bytes = self_bytes();
+    let staged = stage.write("prov.so", &bytes);
+    let live = vec![mapping(&staged)];
+    let files: HashMap<String, Vec<u8>> = HashMap::new();
+    let fresh: HashSet<(String, u64)> = HashSet::new();
+    let mut state = AdapterState::default();
+    let delta = DiscoveryDelta {
+        candidates: vec![cand(
+            "/p/gone.so",
+            backing_of(&staged, 0x100),
+            1,
+            11,
+            "SHA-256",
+            false,
+            "ok",
+        )],
+        ..DiscoveryDelta::default()
+    };
+    let adapted = adapt_delta(
+        &mut state,
+        &delta,
+        &AdapterCtx {
+            live: &live,
+            files: &files,
+            builtin_default: false,
+            fresh: &fresh,
+            post_settle: false,
+            baseline: false,
+        },
+    );
+    assert_eq!(adapted.delta.discovered.len(), 1);
+    let id = adapted.delta.discovered[0].candidates[0].provider.0.clone();
+    assert_eq!(id, "unverified-advertising:anonymous");
+    assert!(!id.contains("gone"));
+}
+
+// ---------------------------------------------------------------------------
 // Live lifecycle fixtures: real pids, real custody, no privileges.
 // ---------------------------------------------------------------------------
 

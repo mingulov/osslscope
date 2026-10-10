@@ -918,14 +918,21 @@ fn advertising_object_id(
     if advertising.is_empty() {
         return ObjectId("unverified-advertising:anonymous".to_string());
     }
-    let bid = live
-        .iter()
-        .find(|m| m.path == advertising)
+    let owner = live.iter().find(|m| m.path == advertising);
+    let bid = owner
         .and_then(|_| files.get(advertising))
         .and_then(|b| elf::read_build_id(b));
     match bid {
         Some(id) => ObjectId(format!("build:{id}")),
-        None => ObjectId(format!("unverified-advertising:{advertising}")),
+        // Mapping-bound opaque identity (D3): while the path still
+        // resolves, the id binds the mapping's (dev, ino) — a
+        // same-path replacement changes identity instead of
+        // conflating two objects, and an unresolvable path degrades
+        // to anonymous. The pathname itself never becomes identity.
+        None => match owner {
+            Some(m) => ObjectId(format!("unverified-advertising:{}:{}", m.dev, m.ino)),
+            None => ObjectId("unverified-advertising:anonymous".to_string()),
+        },
     }
 }
 
