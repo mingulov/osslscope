@@ -31,14 +31,13 @@
 //! maps on every poll. When the incarnation changes or vanishes,
 //! the table retires: its walked set and termination proof drop,
 //! the kernel's per-array walker state (`TERMD` proof and
-//! `QUERY_NEXT` first-hit markers) is evicted so stale state cannot
-//! satisfy the next incarnation, its gap reasons are retained
-//! forever, and its rows stay. This closes growth-ABA (a stale proof
-//! plus a longer walk is still a prefix, per T03 exact coverage),
+//! `QUERY_NEXT` cursors) is evicted so stale state cannot satisfy
+//! the next incarnation, its gap reasons are retained forever, and
+//! its rows stay. This closes growth-ABA (a stale proof plus a
+//! longer walk is still a prefix, per T03 exact coverage),
 //! shrinkage-OOB (an old proof can never terminate a new
-//! incarnation), and marker staleness on reload (the next walk
-//! restarts at slot 0 with fresh liveness). Two residuals remain
-//! explicit: a
+//! incarnation), and cursor staleness on reload (the next walk
+//! restarts at slot 0). Two residuals remain explicit: a
 //! same-address content swap inside an unchanged mapping is
 //! indistinguishable from continued use (repeat inits bump the
 //! reload witness and re-attach when the callback moved; exact
@@ -49,10 +48,10 @@
 //! (`evict_failed`), and loss forces PARTIAL, which contains any
 //! surviving stale proof.
 //!
-//! `no_store` lifetimes stay intact: uncacheable arrays are
-//! re-walked on every query but never walked to proof, and no array
-//! pointer is ever retained beyond its poll — candidates keep
-//! classified metadata plus integer join keys only, exactly as before.
+//! `no_store` lifetimes stay intact: uncacheable arrays are sampled,
+//! never walked to proof, and no array pointer is ever retained
+//! beyond its poll — candidates keep classified metadata plus
+//! integer join keys only, exactly as before.
 //!
 //! Teardown is quiesce-then-PROCESS: [`SessionCore::close`] drops
 //! the attach links first (quiesce: no new events can arrive),
@@ -110,7 +109,7 @@ pub struct DiscoveryConfig {
 }
 
 /// Per-poll resource bounds (spec R04: every poll/attachment batch
-/// is bounded). The default drains a full 4 MiB ring of smallest
+/// is bounded). The default drains a full 2 MiB ring of smallest
 /// events per poll, matching the old full-drain rounds; tighter
 /// budgets yield partial polls flagged via
 /// [`DiscoveryDelta::budget_exhausted`].
@@ -134,7 +133,7 @@ impl PollBudget {
 impl Default for PollBudget {
     fn default() -> Self {
         Self {
-            max_events: 262144,
+            max_events: 131072,
             max_attaches: 64,
         }
     }
@@ -451,10 +450,9 @@ pub trait SessionEnv {
     /// pages make nofault BPF reads abort the walk).
     fn pretouch(&mut self, cookie: u64, addr: u64);
     /// Evict one array's kernel walker state (`TERMD` proof and
-    /// `QUERY_NEXT` first-hit markers) after its incarnation retired,
-    /// so a stale proof cannot satisfy the next incarnation (which
-    /// would skip its walk entirely under the walk-once guard) and
-    /// liveness re-emits. Evicting an absent entry succeeds; other
+    /// `QUERY_NEXT` cursors) after its incarnation retired, so stale
+    /// proofs and mid-array cursors cannot satisfy the next
+    /// incarnation. Evicting an absent entry succeeds; other
     /// failures are explicit loss (the stale state may survive).
     fn evict_array_state(&mut self, arr: u64) -> anyhow::Result<()>;
     /// Re-verify the target pin; `Err` means the pid recycled and
@@ -761,10 +759,10 @@ impl SessionCore {
             self.retained.accumulate(&gap);
             self.alg_records.retain(|(a, _), _| *a != arr);
             // Generation-bind the kernel walker: without eviction a
-            // sticky proof from the retired incarnation would let the
-            // next one skip its walk entirely under the walk-once
-            // guard. Eviction failure is explicit loss — and loss
-            // forces PARTIAL, which contains any surviving stale proof.
+            // sticky proof (or a mid-array cursor) from the retired
+            // incarnation could satisfy the next one. Eviction
+            // failure is explicit loss — and loss forces PARTIAL,
+            // which contains any surviving stale proof.
             if let Err(e) = env.evict_array_state(arr) {
                 eprintln!("array evict failed: {e:#}");
                 self.tracker.note_bad_event(coverage::HOST_EVICT_FAILED);
@@ -1906,9 +1904,9 @@ fn evict_termd(maps: &HashMap<String, OwnedFd>, arr: u64) -> anyhow::Result<()> 
     delete_elem(&mut termd, &arr).context("evict TERMD")
 }
 
-/// Evict one array's `QUERY_NEXT` first-hit markers across all
-/// threads (low key half is the array base): the next incarnation
-/// re-emits liveness and re-walks from slot 0.
+/// Evict one array's `QUERY_NEXT` cursors across all threads (low
+/// key half is the array base): the next incarnation's walk
+/// restarts at slot 0 instead of resuming mid-array.
 fn evict_cursors(maps: &HashMap<String, OwnedFd>, arr: u64) -> anyhow::Result<()> {
     let mut cursors = open_hash::<u128, u64>(maps, "QUERY_NEXT")?;
     // Collect first: deleting during iteration races concurrent
