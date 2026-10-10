@@ -71,6 +71,10 @@ pub struct Stats {
     /// the core wrapper; attributed by array mapping, by
     /// implementation for runtime-built anonymous arrays).
     pub foreign_dropped: u64,
+    /// Retired-epoch gap reasons (T06 session epochs), in the frozen
+    /// vocabulary. A retired prefix stays PARTIAL even when every
+    /// live table terminates: the observation window is not whole.
+    pub retained_reasons: Vec<String>,
 }
 
 impl Stats {
@@ -211,33 +215,56 @@ pub fn emit(
         "rows": jrows,
     });
     // PARTIAL iff an explicit reason, a fenced row, a zero-row op,
-    // a walk overflow, an unterminated table, any loss, or a lossy
-    // slot; the derived reason is the single shared ranking in
-    // `coverage::primary_reason` (integrity > completeness).
+    // a walk overflow, an unterminated table, any loss, a lossy
+    // slot, or a retained retired-epoch gap; the derived reason is
+    // the single shared ranking in `coverage::primary_reason`
+    // (integrity > completeness), over live and retained flags.
     let has_loss = stats.losses.iter().any(|(_, n)| *n > 0);
+    let retained = |r: &str| stats.retained_reasons.iter().any(|x| x == r);
+    // Unrecognized retained reasons (newer producer than consumer)
+    // rank as discovery-loss: an unknown gap is an integrity gap,
+    // and the `retained_reasons` key below still names it.
+    let foreign_retained = stats.retained_reasons.iter().any(|r| {
+        ![
+            "fenced-rows",
+            "discovery-loss",
+            "unreadable-alg",
+            "truncated-walk",
+            "prefix-walk",
+            "zero-row-ops",
+        ]
+        .contains(&r.as_str())
+    });
     let partial = stats.reason.is_some()
         || fenced > 0
         || !stats.zero_row_ops.is_empty()
         || !stats.truncated.is_empty()
         || !stats.unterminated_ops.is_empty()
         || has_loss
-        || stats.lossy_slots > 0;
+        || stats.lossy_slots > 0
+        || !stats.retained_reasons.is_empty();
     let counts = stats.builtin || partial;
     if partial {
         let reason = stats.reason.clone().unwrap_or_else(|| {
             coverage::primary_reason(&coverage::ReasonFlags {
-                fenced: fenced > 0,
-                loss: has_loss,
-                unreadable: stats.lossy_slots > 0,
-                truncated: !stats.truncated.is_empty(),
-                prefix: !stats.unterminated_ops.is_empty(),
-                zero_row: !stats.zero_row_ops.is_empty(),
+                fenced: fenced > 0 || retained("fenced-rows"),
+                loss: has_loss || retained("discovery-loss") || foreign_retained,
+                unreadable: stats.lossy_slots > 0 || retained("unreadable-alg"),
+                truncated: !stats.truncated.is_empty() || retained("truncated-walk"),
+                prefix: !stats.unterminated_ops.is_empty() || retained("prefix-walk"),
+                zero_row: !stats.zero_row_ops.is_empty() || retained("zero-row-ops"),
             })
             .expect("partial implies a gap")
             .to_string()
         });
         doc["status"] = "PARTIAL".into();
         doc["reason"] = reason.into();
+    }
+    if !stats.retained_reasons.is_empty() {
+        let mut kept = stats.retained_reasons.clone();
+        kept.sort();
+        kept.dedup();
+        doc["retained_reasons"] = kept.into();
     }
     if let Some(resolution) = &stats.resolution {
         doc["resolution"] = resolution.clone().into();
@@ -497,10 +524,53 @@ mod tests {
             "lossy_slots",
             "foreign_rows_dropped",
             "fenced_rows",
+            "retained_reasons",
         ] {
             assert!(doc.get(k).is_none(), "leaked key {k}");
         }
         assert_eq!(doc["rows"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn retained_prefix_keeps_partial() {
+        // A retired prefix stays PARTIAL even with clean live
+        // state: the observation window is not whole. The retained
+        // reason ranks through the single shared ranking and the
+        // retained list travels verbatim.
+        let doc = emit_backed(
+            &[],
+            &Stats {
+                retained_reasons: vec!["prefix-walk".to_string()],
+                ..Stats::trivial()
+            },
+        );
+        assert_eq!(doc["status"], "PARTIAL");
+        assert_eq!(doc["reason"], "prefix-walk");
+        assert_eq!(doc["retained_reasons"], serde_json::json!(["prefix-walk"]));
+        // Live gaps outrank through the same order (loss beats
+        // prefix whether live or retained).
+        let doc = emit_backed(
+            &[],
+            &Stats {
+                losses: vec![(1, 2)],
+                retained_reasons: vec!["prefix-walk".to_string()],
+                ..Stats::trivial()
+            },
+        );
+        assert_eq!(doc["status"], "PARTIAL");
+        assert_eq!(doc["reason"], "discovery-loss");
+        // Unrecognized retained reasons rank as discovery-loss but
+        // still travel verbatim (never a panic, never silent).
+        let doc = emit_backed(
+            &[],
+            &Stats {
+                retained_reasons: vec!["zzz-next".to_string()],
+                ..Stats::trivial()
+            },
+        );
+        assert_eq!(doc["status"], "PARTIAL");
+        assert_eq!(doc["reason"], "discovery-loss");
+        assert_eq!(doc["retained_reasons"], serde_json::json!(["zzz-next"]));
     }
 
     #[test]
@@ -768,6 +838,7 @@ mod tests {
             reason: None,
             foreign_dropped: 2,
             pid_recycled: 1,
+            retained_reasons: vec![],
         };
         let rows: Vec<Row> = sample_rows()
             .into_iter()

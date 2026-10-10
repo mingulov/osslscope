@@ -32,7 +32,7 @@ pub const BUILTIN_ENGINE_IDS: &[&str] = &[
 pub const LOAD_NAMES: &[&str] = &["legacy", "default", "fips"];
 
 /// One tripwire attachment.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Probe {
     pub cookie: u64,
     pub symbol: String,
@@ -50,7 +50,7 @@ pub struct Probe {
 }
 
 /// Resolved probe plan + coverage gaps.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProbeSet {
     pub probes: Vec<Probe>,
     pub engine_uninstrumented: u64,
@@ -533,8 +533,54 @@ pub struct SectionInputs<'a> {
     pub extra_findings: &'a [&'a str],
 }
 
-/// Emit the `legacy` doc section (design §3 shapes).
-pub fn section(inp: &SectionInputs) -> serde_json::Value {
+/// Typed tripwire/query rollup: every aggregate the `legacy` doc
+/// section reports, computed once here. The T06 session consumes
+/// this for typed tripwire deltas (no JSON reparse in the count
+/// loop); [`section`] renders it byte-identically to before.
+///
+/// Query and tripwire counters stay separate throughout:
+/// `executed_queries` (the LGCALLS executed-query ledger) is the
+/// sole source of `legacy_provider.executed_calls` — provider-load
+/// tripwire hits and query arrivals never become execution.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LegacySummary {
+    /// ENGINE entrypoint calls by symbol (trip counters, summed
+    /// across probed modules).
+    pub engine_calls: BTreeMap<String, u64>,
+    /// `*_meth_new` calls by symbol.
+    pub meth_calls: BTreeMap<String, u64>,
+    /// ENGINE-id taxonomy classes (`dynamic`/`builtin`/`other`).
+    pub engine_id_class: BTreeMap<String, u64>,
+    /// Provider-load taxonomy classes
+    /// (`legacy`/`default`/`fips`/`other`).
+    pub loads: BTreeMap<String, u64>,
+    /// Low-level family calls by family.
+    pub family_calls: BTreeMap<String, u64>,
+    /// Legacy-partitioned row classes (sorted, deduped).
+    pub legacy_classes: Vec<String>,
+    /// Weak subset of `legacy_classes` (sorted, deduped).
+    pub weak_legacy_algs: Vec<String>,
+    /// Unreadable load names, including the TRIP/hit delta (ring
+    /// events lost between the counter and the classified hit).
+    pub load_unreadable: u64,
+    /// Unreadable engine ids, including the TRIP/hit delta.
+    pub id_unreadable: u64,
+    /// Executed legacy-provider queries (LGCALLS ledger only).
+    pub executed_queries: u64,
+    /// Findings (probe-set + extra + unreadable verdicts).
+    pub findings: Vec<String>,
+    /// Machine flags, one slug per finding (sorted).
+    pub flags: Vec<String>,
+    /// Tripwires attached.
+    pub attached: u64,
+    /// Capability misses (engine + meth + low-level).
+    pub missed: u64,
+}
+
+/// Aggregate tripwire/query inputs into a [`LegacySummary`]. Pure:
+/// the same inputs always yield the same summary, and [`section`]
+/// renders it without recomputation.
+pub fn summarize(inp: &SectionInputs) -> LegacySummary {
     let count = |c: u64| inp.trip.get(&c).copied().unwrap_or(0);
     let mut engine_calls = BTreeMap::new();
     let mut meth_calls = BTreeMap::new();
@@ -556,12 +602,15 @@ pub fn section(inp: &SectionInputs) -> serde_json::Value {
         .entry(p.symbol.clone())
         .or_insert(0) += count(p.cookie);
     }
-    let mut id_class: BTreeMap<&str, u64> = [("dynamic", 0), ("builtin", 0), ("other", 0)]
+    let mut id_class: BTreeMap<String, u64> = [("dynamic", 0), ("builtin", 0), ("other", 0)]
         .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
         .collect();
-    let mut loads: BTreeMap<&str, u64> = [("legacy", 0), ("default", 0), ("fips", 0), ("other", 0)]
-        .into_iter()
-        .collect();
+    let mut loads: BTreeMap<String, u64> =
+        [("legacy", 0), ("default", 0), ("fips", 0), ("other", 0)]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
     // Explicit unreadable verdicts (NULL/unreadable/overlong args):
     // counted per taxonomy straight from the kernel status, never
     // folded into `other` classes.
@@ -588,9 +637,9 @@ pub fn section(inp: &SectionInputs) -> serde_json::Value {
             *loads.get_mut(label).unwrap() += 1;
         }
     }
-    let mut fam_calls: BTreeMap<&str, u64> = crate::kinds::LOWLEVEL
+    let mut fam_calls: BTreeMap<String, u64> = crate::kinds::LOWLEVEL
         .iter()
-        .map(|f| (f.family, 0))
+        .map(|f| (f.family.to_string(), 0))
         .collect();
     for p in inp.set.probes.iter().filter_map(|p| {
         p.family
@@ -636,18 +685,53 @@ pub fn section(inp: &SectionInputs) -> serde_json::Value {
     if id_unreadable > 0 {
         flags.insert("unreadable-engine-ids".to_string());
     }
+    let mut weak_algs: Vec<String> = inp
+        .legacy_classes
+        .iter()
+        .filter(|c| crate::kinds::is_weak_alg(c))
+        .cloned()
+        .collect();
+    weak_algs.sort();
+    weak_algs.dedup();
+    LegacySummary {
+        engine_calls,
+        meth_calls,
+        engine_id_class: id_class,
+        loads,
+        family_calls: fam_calls,
+        legacy_classes: classes,
+        weak_legacy_algs: weak_algs,
+        load_unreadable,
+        id_unreadable,
+        executed_queries: inp.legacy_queries,
+        findings,
+        flags: flags.into_iter().collect(),
+        attached: inp.set.probes.len() as u64,
+        missed: inp.set.engine_uninstrumented
+            + inp.set.meth_uninstrumented
+            + inp.set.lowlevel_uninstrumented,
+    }
+}
+
+/// Emit the `legacy` doc section (design §3 shapes) by rendering a
+/// [`LegacySummary`]. The JSON shape is unchanged by the T06
+/// extraction: same keys, same order, same values.
+pub fn section(inp: &SectionInputs) -> serde_json::Value {
+    let s = summarize(inp);
     // Per-entry states over the CONSIDERED set (registry order =
     // byte-stable): exact-name ENGINE (non-Other) + METH_NEW
     // symbols, LOWLEVEL families (prefix taxonomy), LOAD classes.
     // observed = calls attributed; uninstrumented = matched but
     // stub-less; absent = not observed (probed-quiet or not in
     // target — `probed` disambiguates; PRD absence doctrine).
-    let eng_fired: HashSet<&str> = engine_calls
+    let eng_fired: HashSet<&str> = s
+        .engine_calls
         .iter()
         .filter(|(_, n)| **n > 0)
         .map(|(s, _)| s.as_str())
         .collect();
-    let meth_fired: HashSet<&str> = meth_calls
+    let meth_fired: HashSet<&str> = s
+        .meth_calls
         .iter()
         .filter(|(_, n)| **n > 0)
         .map(|(s, _)| s.as_str())
@@ -678,7 +762,7 @@ pub fn section(inp: &SectionInputs) -> serde_json::Value {
         };
         entries.push(serde_json::json!({
             "name": e.name, "class": "engine", "state": state,
-            "probed": engine_calls.contains_key(e.name),
+            "probed": s.engine_calls.contains_key(e.name),
         }));
     }
     for m in crate::kinds::METH_NEW {
@@ -691,7 +775,7 @@ pub fn section(inp: &SectionInputs) -> serde_json::Value {
         };
         entries.push(serde_json::json!({
             "name": m.name, "class": "meth", "state": state,
-            "probed": meth_calls.contains_key(m.name),
+            "probed": s.meth_calls.contains_key(m.name),
         }));
     }
     for f in crate::kinds::LOWLEVEL {
@@ -701,7 +785,7 @@ pub fn section(inp: &SectionInputs) -> serde_json::Value {
             .unprobed_lowlevel_syms
             .iter()
             .any(|s| lowlevel_family(s) == Some(f.family));
-        let state = if fam_calls.get(f.family).copied().unwrap_or(0) > 0 {
+        let state = if s.family_calls.get(f.family).copied().unwrap_or(0) > 0 {
             "observed"
         } else if fam_un {
             "uninstrumented"
@@ -714,7 +798,7 @@ pub fn section(inp: &SectionInputs) -> serde_json::Value {
     }
     let loads_probed = !inp.set.load_cookies.is_empty();
     for class in ["legacy", "default", "fips", "other"] {
-        let state = if loads.get(class).copied().unwrap_or(0) > 0 {
+        let state = if s.loads.get(class).copied().unwrap_or(0) > 0 {
             "observed"
         } else if !loads_probed {
             "uninstrumented"
@@ -725,30 +809,18 @@ pub fn section(inp: &SectionInputs) -> serde_json::Value {
             "name": class, "class": "load", "state": state, "probed": loads_probed,
         }));
     }
-    let attached = inp.set.probes.len() as u64;
-    let missed = inp.set.engine_uninstrumented
-        + inp.set.meth_uninstrumented
-        + inp.set.lowlevel_uninstrumented;
-    let mut weak_algs: Vec<String> = inp
-        .legacy_classes
-        .iter()
-        .filter(|c| crate::kinds::is_weak_alg(c))
-        .cloned()
-        .collect();
-    weak_algs.sort();
-    weak_algs.dedup();
     let mut legacy = serde_json::json!({
-        "engine": {"calls_by_entrypoint": engine_calls, "engine_id_class": id_class},
-        "meth_new": {"calls_by_entrypoint": meth_calls},
-        "lowlevel": {"calls_by_family": fam_calls},
-        "legacy_provider": {"loads": loads, "executed_calls": inp.legacy_queries,
-                            "algs": classes},
+        "engine": {"calls_by_entrypoint": s.engine_calls, "engine_id_class": s.engine_id_class},
+        "meth_new": {"calls_by_entrypoint": s.meth_calls},
+        "lowlevel": {"calls_by_family": s.family_calls},
+        "legacy_provider": {"loads": s.loads, "executed_calls": s.executed_queries,
+                            "algs": s.legacy_classes},
         "entries": entries,
-        "capability": {"syms_present": attached + missed,
-                       "tripwires_attached": attached, "tripwires_missed": missed},
-        "flags": flags.into_iter().collect::<Vec<_>>(),
-        "weak": {"legacy_algs": weak_algs},
-        "unreadable": {"load_names": load_unreadable, "engine_ids": id_unreadable},
+        "capability": {"syms_present": s.attached + s.missed,
+                       "tripwires_attached": s.attached, "tripwires_missed": s.missed},
+        "flags": s.flags,
+        "weak": {"legacy_algs": s.weak_legacy_algs},
+        "unreadable": {"load_names": s.load_unreadable, "engine_ids": s.id_unreadable},
     });
     if inp.set.engine_uninstrumented > 0 {
         legacy["engine"]["uninstrumented"] = inp.set.engine_uninstrumented.into();
@@ -762,8 +834,8 @@ pub fn section(inp: &SectionInputs) -> serde_json::Value {
     if inp.set.engine_fallback_uninstrumented() > 0 {
         legacy["engine_fallback_uninstrumented"] = inp.set.engine_fallback_uninstrumented().into();
     }
-    if !findings.is_empty() {
-        legacy["findings"] = findings.into();
+    if !s.findings.is_empty() {
+        legacy["findings"] = s.findings.into();
     }
     legacy
 }
