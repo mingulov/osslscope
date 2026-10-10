@@ -2107,20 +2107,54 @@ fn advertising_fallback_unresolved_is_anonymous() {
 }
 
 /// Same ELF with a different build-id (one flipped descriptor byte
-/// in the first PT_NOTE): simulates in-place content change for the
-/// identity-refresh pin.
+/// in the GNU build-id note): simulates in-place content change for
+/// the identity-refresh pin. Scans every PT_NOTE segment for the
+/// NT_GNU_BUILD_ID note instead of assuming the first note's
+/// layout, mirroring `parse_build_id_notes` padding/bounds; the
+/// build-id before/after assertion stays loud.
 fn flipped_build_id(bytes: &[u8]) -> Vec<u8> {
     use goblin::elf::program_header::PT_NOTE;
+    /// Note type `NT_GNU_BUILD_ID` (3); owner name is `GNU\0`
+    /// (mirrors `osslscope::discovery::elf`).
+    const NT_GNU_BUILD_ID: u32 = 3;
     let elf = goblin::elf::Elf::parse(bytes).unwrap();
-    let note = elf
-        .program_headers
-        .iter()
-        .find(|ph| ph.p_type == PT_NOTE)
-        .unwrap();
+    let mut desc_at = None;
+    for ph in elf.program_headers.iter().filter(|ph| ph.p_type == PT_NOTE) {
+        let off = ph.p_offset as usize;
+        let len = ph.p_filesz as usize;
+        let Some(end) = off.checked_add(len) else {
+            continue;
+        };
+        let Some(seg) = bytes.get(off..end) else {
+            continue;
+        };
+        let mut cur = seg;
+        let mut cur_off = off;
+        while cur.len() >= 12 {
+            let namesz = u32::from_le_bytes(cur[0..4].try_into().unwrap()) as usize;
+            let descsz = u32::from_le_bytes(cur[4..8].try_into().unwrap()) as usize;
+            let ntype = u32::from_le_bytes(cur[8..12].try_into().unwrap());
+            let name_end = 12usize + namesz.next_multiple_of(4);
+            let desc_end = name_end + descsz.next_multiple_of(4);
+            if desc_end > cur.len() {
+                break;
+            }
+            if ntype == NT_GNU_BUILD_ID
+                && descsz > 0
+                && cur.get(12..12 + namesz) == Some(b"GNU\0".as_slice())
+            {
+                desc_at = Some(cur_off + name_end);
+                break;
+            }
+            cur = &cur[desc_end..];
+            cur_off += desc_end;
+        }
+        if desc_at.is_some() {
+            break;
+        }
+    }
+    let at = desc_at.expect("test binary must carry a GNU build-id note");
     let mut out = bytes.to_vec();
-    // GNU build-id note: namesz(4) + descsz(4) + type(4) + "GNU\0"(4),
-    // descriptor follows — flip a byte well inside it.
-    let at = note.p_offset as usize + 20;
     out[at] ^= 0x01;
     let before = osslscope::discovery::elf::read_build_id(bytes).unwrap();
     let after = osslscope::discovery::elf::read_build_id(&out).unwrap();
