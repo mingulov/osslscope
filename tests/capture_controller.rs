@@ -773,6 +773,10 @@ fn clean_exit_yields_complete() {
     assert_eq!(c.document.total_calls(), 7);
     assert_eq!(c.executions.len(), 1);
     assert_eq!(c.executions[0].count, 7);
+    // No close-tail legacy residual on the clean path: the tail
+    // counters stay absent, never zero-valued noise.
+    assert!(!has_counter(&c, "legacy.close_tail_trip"));
+    assert!(!has_counter(&c, "legacy.close_tail_lgcalls"));
     // No owned stopped child remains: released, finished, resolved
     // only via the normal exit path.
     let log = post.target_log.borrow();
@@ -1176,6 +1180,11 @@ fn prewindow_vs_inwindow_engine() {
     // Pre-window queries are cold gap (loud), never in-window.
     assert_eq!(c.counters.cold_gap_calls, 9);
     assert!(has_reason(&c, "cold-gap"), "{:?}", c.reasons);
+    // The same snapshot decoys pin the close-tail residual: snapshot
+    // minus baseline minus in-window becomes explicit loss (never
+    // silent execution, never a silent drop).
+    assert_eq!(counter_value(&c, "legacy.close_tail_trip"), 999 - 3 - 5);
+    assert_eq!(counter_value(&c, "legacy.close_tail_lgcalls"), 999 - 2 - 4);
 }
 
 #[test]

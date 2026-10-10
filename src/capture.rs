@@ -989,6 +989,10 @@ pub struct AdapterState {
     seen_objects: HashSet<(String, u64)>,
     loss_sums: HashMap<u32, u64>,
     queries_observed: u64,
+    /// Pre-window tripwire totals (baselining poll): anchor the
+    /// close-tail residual reconcile at assembly time.
+    baseline_trip: HashMap<u64, u64>,
+    baseline_lgcalls: u64,
 }
 
 impl AdapterState {
@@ -1404,6 +1408,16 @@ pub fn adapt_delta(
         ));
     }
 
+    if ctx.baseline {
+        // Retain the pre-window tripwire totals (dropped as evidence
+        // below): they anchor the close-tail residual reconcile —
+        // snapshot minus baseline minus in-window.
+        state.baseline_trip.clear();
+        for (cookie, n) in &delta.tripwire.counter_deltas {
+            state.baseline_trip.insert(*cookie, *n);
+        }
+        state.baseline_lgcalls = delta.tripwire.executed_legacy_queries_delta;
+    }
     let mut discovered: Vec<DiscoveredSite> = touched.into_values().collect();
     discovered.sort_by(|a, b| a.site.cmp(&b.site));
     AdaptedDelta {
@@ -2302,6 +2316,47 @@ where
                     CounterUnits::Events,
                     CounterSource::Discovery,
                     tail,
+                ));
+            }
+        }
+        // Close-tail legacy reconcile: the final join covers TRIP
+        // and LGCALLS increments past the last poll (a probe with no
+        // ring event, e.g. an in-window ENGINE_init, lands only
+        // here). Counting already closed, so window membership is
+        // unknowable — explicit loss, never silent execution and
+        // never a silent drop.
+        let mut tail_trip = 0u64;
+        for (cookie, total) in &snapshot.legacy.trip {
+            let base = self.adapter.baseline_trip.get(cookie).copied().unwrap_or(0);
+            let in_window = self.in_window_trip.get(cookie).copied().unwrap_or(0);
+            if let Some(after_base) = total.checked_sub(base)
+                && let Some(tail) = after_base.checked_sub(in_window)
+            {
+                tail_trip = tail_trip.saturating_add(tail);
+            }
+        }
+        if tail_trip > 0 {
+            self.extra_loss.push(typed_counter(
+                "legacy.close_tail_trip",
+                CounterKind::Loss,
+                CounterUnits::Events,
+                CounterSource::Discovery,
+                tail_trip,
+            ));
+        }
+        if let Some(after_base) = snapshot
+            .legacy
+            .executed_queries
+            .checked_sub(self.adapter.baseline_lgcalls)
+            && let Some(tail_lgcalls) = after_base.checked_sub(self.in_window_lgcalls)
+        {
+            if tail_lgcalls > 0 {
+                self.extra_loss.push(typed_counter(
+                    "legacy.close_tail_lgcalls",
+                    CounterKind::Loss,
+                    CounterUnits::Events,
+                    CounterSource::Discovery,
+                    tail_lgcalls,
                 ));
             }
         }
