@@ -207,7 +207,9 @@ pub fn match_bounds(
 }
 
 /// Policy verdict for one rule (R06). `Inconclusive` is fail-closed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Derived order is a total canonical order for sorting rendered
+/// rule outcomes, not a severity ranking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum RuleVerdict {
     Pass,
     Violation,
@@ -419,6 +421,189 @@ pub enum Completeness {
     },
 }
 
+/// Observed target identity for safe actionability (R07): pid,
+/// comm and container/image provenance where available. Raw argv is
+/// never carried anywhere in the document: renders state
+/// `argv_redacted = true` unconditionally, and the public schema
+/// rejects any argv/cmdline field.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct TargetRecord {
+    pub pid: u32,
+    pub comm: String,
+    pub container_id: String,
+    pub image_digest: String,
+}
+
+impl TargetRecord {
+    pub fn new(pid: u32, comm: String, container_id: String, image_digest: String) -> Self {
+        Self {
+            pid,
+            comm,
+            container_id,
+            image_digest,
+        }
+    }
+
+    /// Placeholder when a producer never observed a target (fixture
+    /// shorthand; live captures always carry the real target).
+    pub fn unknown() -> Self {
+        Self {
+            pid: 0,
+            comm: "(unknown)".to_string(),
+            container_id: String::new(),
+            image_digest: String::new(),
+        }
+    }
+}
+
+/// Whether the OpenSSL version came from verified object metadata.
+/// A version string is emitted only when verified, never guessed
+/// (R08); `Unknown` carries no version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum OpensslVersionState {
+    Verified,
+    Unknown,
+}
+
+/// Observed OpenSSL version: verified metadata or explicitly
+/// unknown. The constructors maintain the invariant (Verified ⟺
+/// version present and non-empty); the output validator rejects
+/// inconsistent documents rather than silently repairing them.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct OpensslVersion {
+    pub state: OpensslVersionState,
+    pub version: Option<String>,
+}
+
+impl OpensslVersion {
+    pub fn verified(version: String) -> Self {
+        Self {
+            state: OpensslVersionState::Verified,
+            version: Some(version),
+        }
+    }
+
+    pub fn unknown() -> Self {
+        Self {
+            state: OpensslVersionState::Unknown,
+            version: None,
+        }
+    }
+
+    pub fn is_consistent(&self) -> bool {
+        match self.state {
+            OpensslVersionState::Verified => self.version.as_ref().is_some_and(|v| !v.is_empty()),
+            OpensslVersionState::Unknown => self.version.is_none(),
+        }
+    }
+}
+
+/// End-of-observation custody outcome. `Exited` preserves the reaped
+/// status; `DetachedRunning` is an owned child left running under
+/// explicit ownership transfer; `ForeignObserved` is a `--pid`
+/// target left running and never signaled (documented, not
+/// custody). A document with no recorded disposition carries `None`
+/// instead of a value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum DispositionOutcome {
+    Exited,
+    DetachedRunning,
+    ForeignObserved,
+}
+
+/// End-of-observation custody disposition value. `Exited` carries a
+/// code, the running outcomes carry a pid; the constructors maintain
+/// that shape and the output validator rejects anything else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct DispositionRecord {
+    pub outcome: DispositionOutcome,
+    pub code: Option<i32>,
+    pub pid: Option<u32>,
+}
+
+impl DispositionRecord {
+    pub fn exited(code: i32) -> Self {
+        Self {
+            outcome: DispositionOutcome::Exited,
+            code: Some(code),
+            pid: None,
+        }
+    }
+
+    pub fn detached_running(pid: u32) -> Self {
+        Self {
+            outcome: DispositionOutcome::DetachedRunning,
+            code: None,
+            pid: Some(pid),
+        }
+    }
+
+    pub fn foreign_observed(pid: u32) -> Self {
+        Self {
+            outcome: DispositionOutcome::ForeignObserved,
+            code: None,
+            pid: Some(pid),
+        }
+    }
+
+    pub fn is_consistent(&self) -> bool {
+        match self.outcome {
+            DispositionOutcome::Exited => self.code.is_some() && self.pid.is_none(),
+            DispositionOutcome::DetachedRunning | DispositionOutcome::ForeignObserved => {
+                self.code.is_none() && self.pid.is_some()
+            }
+        }
+    }
+}
+
+/// Site evidence backing one policy rule outcome (R02): the exact
+/// site key plus generation and the definite calls attributed there.
+/// Every ref resolves to a site listed in the same document.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct PolicyEvidenceRef {
+    pub object: ObjectId,
+    pub device: u64,
+    pub inode: u64,
+    pub offset: u64,
+    pub generation: u32,
+    pub calls: u64,
+}
+
+/// One policy rule outcome over conserved bounds (R06): the rule and
+/// predicate, the three-valued result, definite/possible call
+/// bounds (`possible == None` means the upper bound is unknown),
+/// and site evidence for definite matches. Field order defines the
+/// total document order: `(rule, predicate)` first, full record
+/// after.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct PolicyRuleResult {
+    pub rule: String,
+    pub predicate: String,
+    pub result: RuleVerdict,
+    pub definite: u64,
+    pub possible: Option<u64>,
+    pub evidence: Vec<PolicyEvidenceRef>,
+}
+
+/// Overall policy verdict (R06): rules are ANDed by the evaluator.
+/// `NoVerdict` rides fatal/evidence-free documents only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum PolicyVerdict {
+    Pass,
+    Violation,
+    Inconclusive,
+    NoVerdict,
+}
+
+/// Evaluated policy section (T10 fills this; T11 renders it):
+/// overall verdict plus per-rule outcomes. `None` on the document
+/// means unevaluated (the `report` path); renders omit the section.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct PolicyRecord {
+    pub verdict: PolicyVerdict,
+    pub rules: Vec<PolicyRuleResult>,
+}
+
 /// Unfinalized capture input. Producers fill this; only [`finalize`]
 /// turns it into a [`CaptureDocument`].
 #[derive(Debug, Clone)]
@@ -430,6 +615,10 @@ pub struct FinalizeInput {
     pub coverage: Vec<ScopeCoverage>,
     pub counters: Vec<GapCounter>,
     pub fatal: Option<FatalKind>,
+    pub target: TargetRecord,
+    pub openssl: OpensslVersion,
+    pub disposition: Option<DispositionRecord>,
+    pub policy: Option<PolicyRecord>,
 }
 
 /// Finalized capture document. All report/check/CBOM formats derive
@@ -444,6 +633,10 @@ pub struct CaptureDocument {
     pub objects: Vec<ObjectRecord>,
     pub coverage: Vec<ScopeCoverage>,
     pub counters: Vec<GapCounter>,
+    pub target: TargetRecord,
+    pub openssl: OpensslVersion,
+    pub disposition: Option<DispositionRecord>,
+    pub policy: Option<PolicyRecord>,
 }
 
 impl CaptureDocument {
@@ -488,6 +681,12 @@ pub fn finalize(mut input: FinalizeInput) -> CaptureDocument {
     input.objects.sort();
     input.coverage.sort();
     input.counters.sort();
+    if let Some(policy) = input.policy.as_mut() {
+        for rule in &mut policy.rules {
+            rule.evidence.sort();
+        }
+        policy.rules.sort();
+    }
 
     let mut reasons: Vec<GapReason> = Vec::new();
     for scope in &input.coverage {
@@ -550,5 +749,9 @@ pub fn finalize(mut input: FinalizeInput) -> CaptureDocument {
         objects: input.objects,
         coverage: input.coverage,
         counters: input.counters,
+        target: input.target,
+        openssl: input.openssl,
+        disposition: input.disposition,
+        policy: input.policy,
     }
 }

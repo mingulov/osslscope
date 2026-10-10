@@ -1,0 +1,125 @@
+{
+  "bomFormat": "CycloneDX",
+  "components": [
+    {
+      "bom-ref": "urn:osslscope:exec:v2:0:8:100:4096:build:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef:AES-128-GCM",
+      "cryptoProperties": {
+        "assetType": "algorithm"
+      },
+      "name": "AES-128-GCM (CIPHER) via default",
+      "properties": [
+        {
+          "name": "osslscope:algorithm",
+          "value": "AES-128-GCM"
+        },
+        {
+          "name": "osslscope:provider-class",
+          "value": "default"
+        },
+        {
+          "name": "osslscope:provider-object",
+          "value": "build:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        },
+        {
+          "name": "osslscope:backing-object",
+          "value": "build:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        },
+        {
+          "name": "osslscope:op",
+          "value": "CIPHER"
+        },
+        {
+          "name": "osslscope:funcid",
+          "value": "21"
+        },
+        {
+          "name": "osslscope:calls",
+          "value": "200"
+        },
+        {
+          "name": "osslscope:generation",
+          "value": "0"
+        },
+        {
+          "name": "osslscope:weak-alias",
+          "value": "false"
+        },
+        {
+          "name": "osslscope:execution-evidence-completeness",
+          "value": "PARTIAL"
+        },
+        {
+          "name": "osslscope:window-requested-start-ns",
+          "value": "0"
+        },
+        {
+          "name": "osslscope:window-requested-end-ns",
+          "value": "100"
+        },
+        {
+          "name": "osslscope:window-effective-start-ns",
+          "value": "5"
+        },
+        {
+          "name": "osslscope:window-effective-end-ns",
+          "value": "95"
+        }
+      ],
+      "type": "cryptographic-asset"
+    }
+  ],
+  "metadata": {
+    "properties": [
+      {
+        "name": "osslscope:schema-version",
+        "value": "observed-crypto-v2.0"
+      },
+      {
+        "name": "osslscope:execution-evidence-completeness",
+        "value": "PARTIAL"
+      },
+      {
+        "name": "osslscope:omitted-ambiguous-sites",
+        "value": "0"
+      },
+      {
+        "name": "osslscope:omitted-ambiguous-calls",
+        "value": "0"
+      },
+      {
+        "name": "osslscope:omitted-unknown-coverage-sites",
+        "value": "1"
+      },
+      {
+        "name": "osslscope:omitted-unknown-coverage-calls",
+        "value": "50"
+      },
+      {
+        "name": "osslscope:omitted-evidence-refs",
+        "value": "build:fedcba@16384#0:50"
+      },
+      {
+        "name": "osslscope:window-requested-start-ns",
+        "value": "0"
+      },
+      {
+        "name": "osslscope:window-requested-end-ns",
+        "value": "100"
+      },
+      {
+        "name": "osslscope:window-effective-start-ns",
+        "value": "5"
+      },
+      {
+        "name": "osslscope:window-effective-end-ns",
+        "value": "95"
+      },
+      {
+        "name": "osslscope:completeness-disclaimer",
+        "value": "PARTIAL evidence (undiscovered-sites:provider/default,unattached-sites:provider/default,loss:count.map_insert_dropped,unattributed-calls,startup-gap,tail-gap); absence = not-observed in window"
+      }
+    ]
+  },
+  "specVersion": "1.6",
+  "version": 1
+}

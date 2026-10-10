@@ -1,0 +1,39 @@
+{
+  "completeness": {
+    "counters": [],
+    "fatal_kind": {
+      "detail": null,
+      "kind": "recycled"
+    },
+    "reasons": [
+      {
+        "kind": "startup-gap",
+        "missing_ns": 30000
+      }
+    ],
+    "status": "FATAL"
+  },
+  "coverage": [],
+  "fenced": [],
+  "objects": [],
+  "openssl": {
+    "state": "unknown",
+    "version": null
+  },
+  "schema_version": "observed-crypto-v2.0",
+  "sites": [],
+  "target": {
+    "argv_redacted": true,
+    "comm": "gone",
+    "container_id": "",
+    "image_digest": "",
+    "pid": 11
+  },
+  "window": {
+    "effective_end_ns": 31000,
+    "effective_start_ns": 31000,
+    "requested_end_ns": 31000,
+    "requested_start_ns": 1000,
+    "signal_cut": false
+  }
+}
