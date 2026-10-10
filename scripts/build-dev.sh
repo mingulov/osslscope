@@ -88,7 +88,6 @@ need_cmd cargo "install the Rust toolchain via rustup (pinned: $HOST_TOOLCHAIN +
 need_cmd rustc "install the Rust toolchain via rustup, then re-run"
 need_cmd rustup "install rustup and the pinned toolchains, then re-run"
 need_cmd python3 "install python3 (used only to write the JSON manifest), then re-run"
-need_cmd git "install git (used only to record the product revision), then re-run"
 need_cmd sha256sum "install coreutils, then re-run"
 
 HOST_CARGO_VER="$(cargo +"$HOST_TOOLCHAIN" --version 2>/dev/null)" \
@@ -115,11 +114,17 @@ if [ "$MODE" != "host" ]; then
     BPF_LINKER_VER="$(bpf-linker --version 2>/dev/null || echo bpf-linker-unknown)"
 fi
 
-PRODUCT_REF="$(git -C "$REPO" rev-parse HEAD 2>/dev/null)" \
-    || fail_prereq "product revision unreadable ($REPO is not a git checkout)" "run from a product checkout or worktree"
-PRODUCT_REF_SHORT="$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)"
-PRODUCT_DIRTY="false"
-if [ -n "$(git -C "$REPO" status --porcelain 2>/dev/null)" ]; then PRODUCT_DIRTY="true"; fi
+# Revision is best-effort: a fresh source archive (not a git checkout) must
+# still build; the manifest then records a null ref instead of failing.
+PRODUCT_REF=""
+PRODUCT_REF_SHORT="unknown"
+PRODUCT_DIRTY="unknown"
+if git -C "$REPO" rev-parse HEAD >/dev/null 2>&1; then
+    PRODUCT_REF="$(git -C "$REPO" rev-parse HEAD 2>/dev/null)"
+    PRODUCT_REF_SHORT="$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+    PRODUCT_DIRTY="false"
+    if [ -n "$(git -C "$REPO" status --porcelain 2>/dev/null)" ]; then PRODUCT_DIRTY="true"; fi
+fi
 
 # Resolve real target dirs (honors CARGO_TARGET_DIR/build.target-dir) via
 # metadata, so validation/manifest hash what cargo actually wrote — never a
@@ -374,9 +379,9 @@ if e.get("CHECK_ONLY") != "1":
 
 manifest = {
     "schema": "osslscope-dev-build-manifest-v1",
-    "product_ref": e.get("PRODUCT_REF"),
-    "product_ref_short": e.get("PRODUCT_REF_SHORT"),
-    "product_dirty": e.get("PRODUCT_DIRTY") == "true",
+    "product_ref": e.get("PRODUCT_REF") or None,
+    "product_ref_short": (e.get("PRODUCT_REF_SHORT") if e.get("PRODUCT_REF") else None),
+    "product_dirty": {"true": True, "false": False}.get(e.get("PRODUCT_DIRTY")),
     "built_at_utc": e.get("BUILT_AT"),
     "host_toolchain": e.get("HOST_TOOLCHAIN"),
     "host_cargo": e.get("HOST_CARGO_VER"),
