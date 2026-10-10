@@ -17,10 +17,15 @@
 //!
 //! The spec's `DiscoveryDelta` producer lands in T06
 //! (`src/discovery/session.rs`); [`CountDelta`] is this session's
-//! consumer-side projection of it with identical site, candidate,
-//! coverage and loss fields, so the T08 adapter is mechanical (see
-//! the handoff for the field map). The live-maps/file-bytes context
-//! rides as explicit [`attach`](CountSession::attach_delta)
+//! consumer-side aggregation of it. The T08 adapter
+//! (`crate::capture::adapt_delta`, decisions D1–D4) accumulates full
+//! per-site candidate sets from the producer's incremental
+//! candidates, synthesizes backing/advertising object identity and
+//! per-site coverage, and classifies discovery losses; the
+//! producer's auxiliary fields (tables, retirements, tripwire,
+//! queries, attaches, budgets, triggers) feed separate coverage and
+//! legacy evidence outside this session. The live-maps/file-bytes
+//! context rides as explicit [`attach`](CountSession::attach_delta)
 //! parameters so planning stays pure and host-testable; T08 passes
 //! `read_maps(pid)` plus pre-read file bytes at each poll.
 //!
@@ -62,10 +67,11 @@ impl DiscoveredSite {
     }
 }
 
-/// Consumer-side discovery delta: new/changed classified sites plus
-/// source-tagged discovery losses to carry into the drain. T06's
-/// producer `DiscoveryDelta` maps onto this field-for-field (T08
-/// adapts; see the handoff).
+/// Consumer-side discovery delta: full per-site replacement sets
+/// for every touched site (capture accumulates these from the
+/// producer's incremental candidates — a delta never partially
+/// updates a site) plus classified discovery losses to carry into
+/// the drain. See `crate::capture::adapt_delta` for the mapping.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CountDelta {
     pub discovered: Vec<DiscoveredSite>,
