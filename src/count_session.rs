@@ -992,16 +992,27 @@ impl FakeCountBackend {
         self.shortfall_hook = n;
     }
 
+    /// Zero the programmed interval while leaving the target armed
+    /// (isolates zeroed-WINDOW admission from the target guard).
+    /// Test hook only.
+    pub fn deprogram_window(&mut self) {
+        self.start_ns = 0;
+        self.deadline_ns = 0;
+    }
+
     /// Model one batch of `count_entry` hits: `n` entries into
-    /// `cookie` from `tgid` at monotonic `now_ns`.
+    /// `cookie` from `tgid` at monotonic `now_ns`. The window check
+    /// runs independently of (and before) the target guard, exactly
+    /// like the kernel: a zeroed interval admits nothing even while
+    /// armed.
     pub fn fire(&mut self, tgid: u32, cookie: u32, now_ns: u64, n: u64) {
         if n == 0 {
             return;
         }
-        if !self.open || u64::from(tgid) != self.tgid {
+        if now_ns < self.start_ns || now_ns >= self.deadline_ns {
             return;
         }
-        if now_ns < self.start_ns || now_ns >= self.deadline_ns {
+        if !self.open || u64::from(tgid) != self.tgid {
             return;
         }
         let key = (cookie, self.generation);
@@ -1209,17 +1220,17 @@ impl CountBackend for LiveBackend {
         start_ns: u64,
         deadline_ns: u64,
     ) -> anyhow::Result<()> {
+        use osslscope_ebpf_common::{WINDOW_DEADLINE, WINDOW_START};
         if start_ns >= deadline_ns {
             anyhow::bail!("empty count window: start {start_ns} >= deadline {deadline_ns}");
         }
+        // Program the admission interval BEFORE arming the target:
+        // the zeroed window admits nothing, so a hit can never slip
+        // in under an unprogrammed deadline.
+        self.program("WINDOW", WINDOW_START, &start_ns.to_le_bytes())?;
+        self.program("WINDOW", WINDOW_DEADLINE, &deadline_ns.to_le_bytes())?;
         self.program("GEN", 0, &generation.to_le_bytes())?;
         self.program("TARGET", 0, &tgid.to_le_bytes())?;
-        // The kernel WINDOW admission interval lands with the
-        // count-window ABI (T07 commit 2); until then the userspace
-        // `close_window` (`TARGET=0`) is the sole deadline on the
-        // live path. The fake backend enforces the full interval
-        // from commit 1.
-        let _ = (start_ns, deadline_ns);
         Ok(())
     }
 

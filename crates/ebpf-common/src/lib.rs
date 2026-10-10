@@ -55,6 +55,30 @@ impl CountValue {
     }
 }
 
+// Count wire ABI v2 (T07 kernel admission window): `WINDOW` is a
+// 2-cell `Array<u64>` holding the monotonic admission interval
+// `[start_ns, deadline_ns)` in `bpf_ktime_get_ns` time. A hit counts
+// iff `start <= now < deadline`. The zeroed map admits nothing
+// until userspace programs it at window open (fail-closed), and
+// `TARGET=0` still closes the window unconditionally. The v1
+// key/value shapes (`make_key`/`CountValue`) are unchanged, and
+// `COUNTS` stays a bounded non-LRU hash: inserts past capacity fail
+// into `DROPFAIL` (loud loss), entries are never evicted, and the
+// count path performs no target-memory reads (entry-only).
+
+/// Count wire-shape version. Bump with loader enforcement on any
+/// incompatible count-map change.
+pub const COUNT_ABI_VERSION: u32 = 2;
+
+/// `WINDOW` cells. Userspace programs both at window open; BPF only
+/// reads them.
+pub const WINDOW_CELLS: u32 = 2;
+pub const WINDOW_START: u32 = 0;
+pub const WINDOW_DEADLINE: u32 = 1;
+
+/// Open-ended deadline: admit everything at/after start.
+pub const WINDOW_NO_DEADLINE: u64 = u64::MAX;
+
 // Discovery wire ABI v2 (T02 classify-before-emission): the ring
 // carries finite numeric class IDs plus internal structural join
 // addresses only. Raw target name/argument bytes never cross; the

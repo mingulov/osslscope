@@ -7,12 +7,16 @@
 //! (userspace sums across CPUs at drain). The `TARGET` tgid guard
 //! drops foreign tasks in-BPF (misattribution impossible — the
 //! guard proof predates this file); `TARGET[0] == 0` closes the
-//! window in-kernel (`--duration` expiry). Insert failures (map
-//! full) increment `DROPFAIL` — no eviction EVER (fail loud, never
-//! misattribute). Capture reads NOTHING from target memory: the
-//! cookie is an attach-time constant, counts are kernel-side.
+//! window in-kernel (`--duration` expiry). The `WINDOW` monotonic
+//! interval admits hits only inside the declared `[start, deadline)`
+//! (`bpf_ktime_get_ns`): pre-window and late hits drop even when
+//! userspace stalls, so blocked discovery cannot extend counting.
+//! Insert failures (map full) increment `DROPFAIL` — no eviction
+//! EVER (fail loud, never misattribute). Capture reads NOTHING from
+//! target memory: the cookie is an attach-time constant, counts are
+//! kernel-side.
 //!
-//! Wire format (key/value structs) is owned by
+//! Wire format (key/value structs + `WINDOW` cells) is owned by
 //! `osslscope-ebpf-common` — shared with userspace, drift-proof.
 #![no_std]
 #![no_main]
@@ -24,7 +28,7 @@ use aya_ebpf::{
     programs::ProbeContext,
     EbpfContext as _,
 };
-use osslscope_ebpf_common::{CountValue, make_key};
+use osslscope_ebpf_common::{CountValue, WINDOW_CELLS, WINDOW_DEADLINE, WINDOW_START, make_key};
 
 /// `BPF_NOEXIST` for `insert` (kernel UAPI; aya-ebpf exposes no const).
 const BPF_NOEXIST: u64 = 1;
@@ -42,6 +46,14 @@ static GEN: Array<u32> = Array::with_max_entries(1, 0);
 #[map]
 static TARGET: Array<u64> = Array::with_max_entries(1, 0);
 
+/// Monotonic admission interval `[start, deadline)` (cells
+/// `WINDOW_START`/`WINDOW_DEADLINE`, `bpf_ktime_get_ns` time),
+/// programmed once by userspace at window open. The zeroed map
+/// admits nothing: hits before the declared start or at/after the
+/// deadline drop in-BPF even when userspace stalls. Read-only to BPF.
+#[map]
+static WINDOW: Array<u64> = Array::with_max_entries(WINDOW_CELLS, 0);
+
 /// BPF-side insert-fail count (map-full). Userspace sums across CPUs.
 #[map]
 static DROPFAIL: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
@@ -56,6 +68,15 @@ pub fn count_entry(ctx: ProbeContext) -> u32 {
     if tgid != target {
         return 0;
     }
+    // Declared-interval admission: the zeroed (unprogrammed) window
+    // admits nothing; the deadline edge excludes. Cheap rejects run
+    // before the attach-cookie fetch and map insert.
+    let now = unsafe { helpers::bpf_ktime_get_ns() };
+    let start = WINDOW.get(WINDOW_START).copied().unwrap_or(0);
+    let deadline = WINDOW.get(WINDOW_DEADLINE).copied().unwrap_or(0);
+    if now < start || now >= deadline {
+        return 0;
+    }
     let cookie = unsafe { helpers::bpf_get_attach_cookie(ctx.as_ptr()) };
     // Plan indices are u32 by construction; a wider cookie is a
     // userspace bug — counted in DROPFAIL, never truncated silently.
@@ -68,7 +89,6 @@ pub fn count_entry(ctx: ProbeContext) -> u32 {
         None => return 0,
     };
     let key = make_key(cookie as u32, gen);
-    let now = unsafe { helpers::bpf_ktime_get_ns() };
     if let Some(slot) = COUNTS.get_ptr_mut(&key) {
         let v = unsafe { &mut *slot };
         // Fresh CPU slot (post-migration): stamp first touch — an

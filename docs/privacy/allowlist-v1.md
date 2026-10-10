@@ -146,6 +146,7 @@ TRIP_CLASS
 COUNTS
 GEN
 TARGET
+WINDOW
 DROPFAIL
 ```
 
@@ -157,6 +158,9 @@ the frozen registry/taxonomy at load, before any attach —
 engine/load class/name). No map stores target string bytes at rest.
 `PENDING_QUERY` values are (op, `no_store`-pointer) pairs;
 `TERMD`/`LOSS` are termination proofs and failure counters.
+`WINDOW` holds the two observer-programmed monotonic window bounds
+(start/deadline); like `GEN`/`TARGET` it is numeric observer state,
+never target bytes.
 
 ## 5. Emitted artifacts
 

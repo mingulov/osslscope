@@ -155,8 +155,10 @@ pub const HARVEST_MAPS: [MapSpec; 12] = [
 
 /// Frozen capture shape (keyed-design §2): dims asserted vs the
 /// object by `prepare`, fail-closed on drift. Read off the built
-/// `osslscope-count` object (maps-section records).
-pub const COUNT_MAPS: [MapSpec; 4] = [
+/// `osslscope-count` object (maps-section records). T07 count ABI
+/// v2 adds `WINDOW` (2 u64 cells: start/deadline); an object without
+/// it fails `prepare` rather than running deadline-blind.
+pub const COUNT_MAPS: [MapSpec; 5] = [
     MapSpec {
         name: "COUNTS",
         map_type: 5,
@@ -179,6 +181,14 @@ pub const COUNT_MAPS: [MapSpec; 4] = [
         key_size: 4,
         value_size: 8,
         max_entries: 1,
+        flags: 0,
+    },
+    MapSpec {
+        name: "WINDOW",
+        map_type: 2,
+        key_size: 4,
+        value_size: 8,
+        max_entries: 2,
         flags: 0,
     },
     MapSpec {
@@ -1033,5 +1043,28 @@ mod tests {
         };
         let site = call_site(-1);
         assert!(call_target(&syms, &fns, 2, &site, &r, "p").is_err());
+    }
+
+    #[test]
+    fn count_shape_carries_window_cells() {
+        // T07 count ABI v2: the loader spec must name the WINDOW
+        // interval map with exactly the dims the BPF object
+        // declares (ARRAY, u32 key, u64 value, 2 cells); anything
+        // else fails `prepare` against the real object instead of
+        // running deadline-blind.
+        let window = COUNT_MAPS
+            .iter()
+            .find(|m| m.name == "WINDOW")
+            .expect("COUNT_MAPS names WINDOW");
+        assert_eq!(window.map_type, 2);
+        assert_eq!(window.key_size, 4);
+        assert_eq!(window.value_size, 8);
+        assert_eq!(window.max_entries, 2);
+        assert_eq!(window.flags, 0);
+        assert_eq!(
+            window.max_entries,
+            osslscope_ebpf_common::WINDOW_CELLS,
+            "spec dims track the shared ABI"
+        );
     }
 }
