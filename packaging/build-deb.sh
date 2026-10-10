@@ -14,14 +14,17 @@ st=$(mktemp -d)
 trap 'rm -rf "$st"' EXIT INT TERM
 chmod 755 "$st"
 mkdir -p "$st/DEBIAN" "$st/usr/bin" "$st/usr/share/doc/osslscope"
-sed "s/@VERSION@/$ver/" packaging/deb/DEBIAN/control.in > "$st/DEBIAN/control"
+sed -e "s/@VERSION@/$ver/" -e "s/@REVISION@/${DEB_REVISION:-1}/" packaging/deb/DEBIAN/control.in > "$st/DEBIAN/control"
 cp packaging/deb/DEBIAN/postinst packaging/deb/DEBIAN/prerm "$st/DEBIAN/"
 chmod 755 "$st/DEBIAN/postinst" "$st/DEBIAN/prerm"
 cp "$bin" "$st/usr/bin/osslscope"
 chmod 755 "$st/usr/bin/osslscope"
 cp docs/install.md "$st/usr/share/doc/osslscope/install.md"
 chmod 644 "$st/usr/share/doc/osslscope/install.md"
-out="osslscope_${ver}-1_amd64.deb"
+# DEB_REVISION overrides the debian revision (default 1) for upgrade-path
+# testing: build the old tree with DEB_REVISION=1 and the new tree with
+# DEB_REVISION=2 at the same version.
+out="osslscope_${ver}-${DEB_REVISION:-1}_amd64.deb"
 rm -f "$out"
 dpkg-deb --build --root-owner-group "$st" "$out" >/dev/null
 echo "built $out"

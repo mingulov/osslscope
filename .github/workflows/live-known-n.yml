@@ -1,0 +1,181 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# live-known-n: bounded live doctor→check with an independent count ledger.
+#
+# Status: IMPLEMENTED, NOT-RUN (owned BPF lane pending). This workflow only
+# runs via workflow_dispatch on a self-hosted runner labeled `osslscope-bpf`
+# (x86-64, kernel >= 6.9, BPF-capable, passwordless sudo for the one-time
+# setcap). No such runner is registered yet; ordinary PR checks in
+# check.yml never touch this file's live steps.
+#
+# The run is bounded (job timeout 30 min, duration/timeout/grace flags) and
+# uses the in-tree ordinary_ops_driver fixture: its LEDGER stdout is the
+# independent oracle, and the observer's v2 JSON must show at least the
+# ledgered execution (lower bound — exact provider-internal callback counts
+# are implementation-defined per the fixture contract, recorded never
+# asserted). A missing live capability is a labeled SKIP in the job summary,
+# never "capture passed".
+name: live-known-n
+on:
+  workflow_dispatch:
+    inputs:
+      product_ref:
+        description: "Clean committed product revision to observe (full SHA)"
+        required: true
+        default: ""
+      driver_mode:
+        description: "ordinary_ops_driver mode"
+        required: false
+        default: "ecdsa"
+run-name: "live-known-n ${{ inputs.product_ref }} mode=${{ inputs.driver_mode }}"
+concurrency:
+  group: live-known-n
+  cancel-in-progress: false
+jobs:
+  known-n:
+    runs-on: [self-hosted, linux, X64, osslscope-bpf]
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: "2"
+    steps:
+      - name: Check out product ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.product_ref }}
+      - name: Record revision (must be clean)
+        id: rev
+        run: |
+          set -eu
+          git rev-parse HEAD | tee product-ref.txt
+          test -z "$(git status --porcelain)" || { echo "tree is dirty; refusing live run"; exit 1; }
+          uname -r | tee kernel.txt
+      - name: Build host + BPF (locked, bounded jobs)
+        run: |
+          set -eu
+          ./scripts/build-dev.sh
+      - name: Install to run prefix
+        run: |
+          set -eu
+          ./scripts/install-dev.sh --prefix "${RUNNER_TEMP}/ossl-pfx"
+          "${RUNNER_TEMP}/ossl-pfx/bin/osslscope" --help | head -5
+      - name: One-time file caps
+        run: |
+          set -eu
+          sudo setcap cap_bpf,cap_perfmon+ep "${RUNNER_TEMP}/ossl-pfx/bin/osslscope"
+          getcap "${RUNNER_TEMP}/ossl-pfx/bin/osslscope"
+      - name: Build ledger driver fixture
+        run: |
+          set -eu
+          cc -O1 -o "${RUNNER_TEMP}/ordinary_ops_driver" \
+            crates/ossl-discover/tests/fixture/ordinary_ops_driver.c -lcrypto
+          "${RUNNER_TEMP}/ordinary_ops_driver" "${{ inputs.driver_mode }}" | tee driver-smoke.txt
+          grep -q ORDDONE driver-smoke.txt
+      - name: Probe live capability (doctor)
+        id: probe
+        run: |
+          set -eu
+          if "${RUNNER_TEMP}/ossl-pfx/bin/osslscope" doctor | tee doctor.txt | grep -q 'verdict: ok'; then
+            echo "capable=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "capable=false" >>"$GITHUB_OUTPUT"
+          fi
+      - name: Bounded live check (known workload)
+        id: capture
+        if: steps.probe.outputs.capable == 'true'
+        run: |
+          set -eu
+          set -o pipefail
+          PFX="${RUNNER_TEMP}/ossl-pfx"
+          LIBCRYPTO="$(ldconfig -p 2>/dev/null | grep -m1 'libcrypto.so.3 ' | awk '{print $NF}')"
+          test -n "$LIBCRYPTO" || { echo "no libcrypto.so.3 on lane; failing closed"; exit 4; }
+          echo "libcrypto: $LIBCRYPTO" | tee lane-libcrypto.txt
+          set +e
+          "$PFX/bin/osslscope" check \
+            --provider "$LIBCRYPTO" --builtin \
+            --object "$PFX/lib/osslscope/osslscope-harvest" \
+            --count-object "$PFX/lib/osslscope/osslscope-count" \
+            --deny-weak \
+            --duration 30 --timeout 60 --grace 5 \
+            --format json --out known-n.json \
+            run -- "${RUNNER_TEMP}/ordinary_ops_driver" "${{ inputs.driver_mode }}" \
+            | tee known-n-driver.log
+          rc=$?
+          set -e
+          echo "$rc" > check-exit.txt
+          echo "check exit: $rc"
+          case "$rc" in
+            0|3|10|11) echo "exit $rc is a usable observation outcome; oracle decides" ;;
+            *) echo "exit $rc is environment/usage failure, not an observation"; exit 1 ;;
+          esac
+      - name: Ledger oracle (independent counts)
+        id: oracle
+        if: steps.probe.outputs.capable == 'true'
+        run: |
+          set -eu
+          python3 - known-n-driver.log known-n.json "${{ inputs.driver_mode }}" <<'EOF' | tee oracle.txt
+          import json, re, sys
+          driver_log, report_path, mode = sys.argv[1], sys.argv[2], sys.argv[3]
+          log = open(driver_log).read()
+          m = re.search(r"^LEDGER (.*)$", log, re.M)
+          assert m, "no LEDGER line in driver output"
+          assert re.search(r"^ORDDONE mode=%s rc=0$" % re.escape(mode), log, re.M), \
+              "driver did not complete rc=0 for mode %s" % mode
+          ledger = dict(kv.split("=", 1) for kv in m.group(1).split())
+          print("ledger:", ledger)
+          rep = json.load(open(report_path))
+          assert rep.get("schema_version") == "observed-crypto-v2.0", rep.get("schema_version")
+          sites = rep.get("sites", [])
+          total = sum(s.get("calls", 0) for s in sites)
+          print("observed sites: %d total_calls: %d completeness: %s" % (
+              len(sites), total, rep.get("completeness", {}).get("status")))
+          for s in sites:
+              ops = sorted({c.get("op") for c in s.get("candidates", [])})
+              print("  site calls=%d ops=%s" % (s.get("calls"), ops))
+          # Lower-bound oracle per the fixture contract: the ledgered
+          # execution must be visible (exact provider-internal counts are
+          # implementation-defined and recorded above, never asserted).
+          assert total >= 1, "no executed site calls observed for a ledgered run"
+          print("ORACLE PASS: ledgered execution is visible in observer JSON")
+          EOF
+      - name: Upload live artifacts (pass or fail)
+        if: always() && steps.probe.outputs.capable == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-known-n-${{ inputs.driver_mode }}
+          path: |
+            product-ref.txt
+            kernel.txt
+            doctor.txt
+            driver-smoke.txt
+            lane-libcrypto.txt
+            known-n-driver.log
+            known-n.json
+            check-exit.txt
+            oracle.txt
+          if-no-files-found: error
+      - name: Verdict summary (skip is labeled, never a pass)
+        if: always()
+        run: |
+          set -eu
+          {
+            echo "## live-known-n verdict"
+            echo ""
+            echo "- product: $(cat product-ref.txt 2>/dev/null || echo unknown)"
+            echo "- kernel: $(cat kernel.txt 2>/dev/null || echo unknown)"
+            if [ "${{ steps.probe.outputs.capable }}" = "true" ]; then
+              echo "- doctor: verdict ok (live capability present)"
+              echo "- check exit: $(cat check-exit.txt 2>/dev/null || echo unknown)"
+              if [ "${{ steps.oracle.outcome }}" = "success" ]; then
+                echo "- oracle: PASS (ledgered execution visible)"
+              else
+                echo "- oracle: FAIL (see oracle.txt artifact)"
+              fi
+            else
+              echo "- SKIP(live-capability): doctor did not report verdict ok on this runner;"
+              echo "  no capture was attempted and no observation is claimed."
+            fi
+          } >>"$GITHUB_STEP_SUMMARY"
+          if [ "${{ steps.probe.outputs.capable }}" != "true" ]; then
+            echo "SKIP(live-capability): no live observation; see summary"
+          elif [ "${{ steps.oracle.outcome }}" != "success" ]; then
+            exit 1
+          fi

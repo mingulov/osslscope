@@ -6,7 +6,9 @@
 
 Name:           osslscope
 Version:        %{pkg_version}
-Release:        1%{?dist}
+# pkg_release is 1 unless overridden for upgrade-path testing
+# (build old=1, new=2 from different refs; see packaging/README.md).
+Release:        %{?pkg_release}%{!?pkg_release:1}%{?dist}
 Summary:        Non-interposing OpenSSL observer on eBPF uprobes
 License:        GPL-3.0-or-later
 Packager:       Denis Mingulov <denis@mingulov.com>
@@ -44,10 +46,37 @@ fi
 exit 0
 
 %preun
-# Caps live on the binary inode and vanish with the file; clear
-# best-effort anyway. Never fail uninstall.
-if command -v setcap >/dev/null 2>&1; then
-  setcap -r /usr/bin/osslscope 2>/dev/null || true
+# Erase-only cleanup ($1 == 0): caps live on the binary inode and vanish
+# with the file; clear best-effort anyway. On upgrade ($1 >= 1) do nothing:
+# rpm runs old %preun AFTER new %post, so clearing here would strip the
+# new binary's freshly applied caps. Never fail the transaction.
+if [ "$1" -eq 0 ]; then
+  if command -v setcap >/dev/null 2>&1; then
+    setcap -r /usr/bin/osslscope 2>/dev/null || true
+  fi
+fi
+exit 0
+
+%posttrans
+# Final-transaction capability restoration. Upgrading FROM the 1.0.0 package
+# still runs that package's UNGUARDED old %preun after our %post, stripping
+# the new binary's caps; guarding our own %preun cannot prevent the old
+# script from running. %posttrans runs at the end of the transaction (after
+# old %preun) on install and upgrade, so re-apply caps idempotently here.
+# $1 (1 install / 2 upgrade) is intentionally ignored: always restore.
+# OSSLSCOPE_BIN overrides the path only for host simulation tests;
+# packaging always uses the default.
+BIN="${OSSLSCOPE_BIN:-/usr/bin/osslscope}"
+if [ -f "$BIN" ]; then
+  if command -v setcap >/dev/null 2>&1; then
+    if setcap cap_bpf,cap_perfmon+ep "$BIN" 2>/dev/null; then
+      :
+    else
+      echo "osslscope: setcap failed; fallback (labeled sudo): run 'sudo setcap cap_bpf,cap_perfmon+ep /usr/bin/osslscope' then 'osslscope doctor'." >&2
+    fi
+  else
+    echo "osslscope: setcap not found (install libcap); fallback (labeled sudo): run 'sudo setcap cap_bpf,cap_perfmon+ep /usr/bin/osslscope' then 'osslscope doctor'." >&2
+  fi
 fi
 exit 0
 
