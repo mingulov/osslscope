@@ -790,8 +790,10 @@ fn sort_executions(executions: &mut [Execution]) {
 // explicit loss, never a fabricated device zero. Per-site coverage
 // is `Unknown` when any candidate read badly (`status != ok`), any
 // of the op's table epochs is unterminated/dirty/retired-unproven,
-// the op carries sticky TRUNC bits, or new candidates arrive for an
-// epoch after it terminated (the set proved non-closed).
+// the op carries sticky TRUNC bits, new candidates arrive for an
+// epoch after it terminated (the set proved non-closed), or
+// candidates arrive for an epoch with zero table proof (an op
+// closed on sibling epochs never vouches for unobserved ones).
 // Session-global losses do NOT flip per-site coverage: they PARTIAL
 // the window via Loss counters while unrelated positive evidence
 // survives (R06).
@@ -1229,10 +1231,13 @@ pub fn adapt_delta(
         let (device, ino, offset) = triple;
         let first_emit = !state.emitted.contains_key(&triple);
         // D3 coverage: degrade on bad reads, an unclosed op (any
-        // epoch unterminated/dirty/retired, or sticky TRUNC bits), or
-        // a NEW arrival for an epoch after it terminated (the set
-        // proved non-closed — arrivals for sibling epochs or ops on
-        // a shared site do not taint a closed epoch).
+        // epoch unterminated/dirty/retired, or sticky TRUNC bits), a
+        // NEW arrival for an epoch after it terminated (the set
+        // proved non-closed), or an arrival for an epoch with zero
+        // table proof (an op closed on sibling epochs never vouches
+        // for an epoch it never observed — arrivals for sibling
+        // epochs or ops on a shared site do not taint a closed
+        // epoch, but an unproven epoch taints its own site).
         let mut unknown = bad_read;
         if let Some(ops) = state.triple_ops.get(&triple) {
             for op in ops {
@@ -1243,12 +1248,15 @@ pub fn adapt_delta(
                     if *gop != *op {
                         continue;
                     }
-                    let fresh_arrival = state
-                        .op_tables
-                        .get(&(*op, *gepoch))
-                        .is_some_and(|t| t.term_poll.is_some_and(|p| p < seq));
-                    if fresh_arrival {
-                        unknown = true;
+                    match state.op_tables.get(&(*op, *gepoch)) {
+                        // Untracked epoch: fail closed (a missing
+                        // entry is not proof of completion).
+                        None => unknown = true,
+                        Some(t) => {
+                            if t.term_poll.is_some_and(|p| p < seq) {
+                                unknown = true;
+                            }
+                        }
                     }
                 }
             }

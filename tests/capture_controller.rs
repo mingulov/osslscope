@@ -807,6 +807,86 @@ fn clean_exit_yields_complete() {
 }
 
 #[test]
+fn untracked_epoch_executions_are_unattributed_partial() {
+    // F3: op 1 provably terminates epoch 0 while a same-window
+    // candidate arrives for epoch 9 with zero table proof for
+    // epoch 9 anywhere. The unproven site must NOT inherit
+    // Complete: its executed calls are unattributed PARTIAL (the
+    // op row stays Applicable — coverage alone cannot catch an
+    // epoch the tables never observed).
+    let mut h = Harness::fresh("untracked-exec");
+    h.snapshot_attached();
+    let prov2 = h.stage.write("prov2.so", &h.bytes.clone());
+    h.files.insert(prov2.path.clone(), h.bytes.clone());
+    h.maps = vec![mapping(&h.staged), mapping(&prov2)];
+    let cand_a = cand(
+        "/p/provider.so",
+        backing_of(&h.staged, h.off),
+        1,
+        11,
+        "SHA-256",
+        false,
+        "ok",
+    );
+    let mut cand_b = cand(
+        "/p/prov2.so",
+        backing_of(&prov2, h.off),
+        1,
+        12,
+        "SHA-512",
+        false,
+        "ok",
+    );
+    cand_b.epoch = 9;
+    h.polls.push_back(DiscoveryDelta::default());
+    h.polls.push_back(DiscoveryDelta {
+        candidates: vec![cand_a, cand_b],
+        tables: vec![terminated(1, 0)],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    h.plans.insert(
+        2,
+        FirePlan {
+            fires: vec![(BASE_NS + 600_000_000, 7)],
+            shortfall: 0,
+            cancel: false,
+        },
+    );
+    h.exit_at_ns = Some(BASE_NS + 1_000_000_000);
+    h.exit_code = 0;
+    let (out, _) = h.run();
+    let c = out.unwrap();
+    assert!(matches!(c.outcome, Outcome::Partial), "{c:?}");
+    assert!(has_reason(&c, "unattributed"), "{:?}", c.reasons);
+    assert!(
+        matches!(c.document.status, Completeness::Partial { .. }),
+        "{:?}",
+        c.document.status
+    );
+    assert_eq!(c.document.total_calls(), 14);
+    assert!(!has_reason(&c, "late-attach"), "{:?}", c.reasons);
+    let unknown: Vec<_> = c
+        .document
+        .sites
+        .iter()
+        .filter(|s| s.candidates_coverage == CandidateCoverage::Unknown)
+        .collect();
+    assert_eq!(unknown.len(), 1);
+    assert_eq!(unknown[0].calls, 7);
+    let cov1 = c
+        .document
+        .coverage
+        .iter()
+        .find(|s| s.scope == "op:1")
+        .unwrap();
+    assert!(
+        matches!(cov1.expected, ExpectedScope::Applicable { .. }),
+        "{cov1:?}"
+    );
+}
+
+#[test]
 fn startup_gap_pid_target_reports_gap() {
     // Requested (acquisition) precedes the programmed window start:
     // explicit startup gap, never a silent late clock.
@@ -2146,6 +2226,41 @@ fn terminated_sibling_cannot_overwrite_unfinished_epoch() {
     assert_eq!(
         second.delta.discovered[0].candidates_coverage,
         CandidateCoverage::Unknown
+    );
+}
+
+#[test]
+fn untracked_epoch_candidate_does_not_inherit_complete() {
+    // F3: epoch 5 terminates and its site emits Complete; a later
+    // candidate for epoch 6 arrives with zero table proof for
+    // epoch 6 in any delta. The new site must NOT inherit
+    // Complete — an op closed on sibling epochs never vouches for
+    // an epoch it never observed.
+    let mut h = AdaptHarness::fresh("untracked-epoch");
+    let d1 = DiscoveryDelta {
+        candidates: vec![h.cand(1, 5, 0x100)],
+        tables: vec![terminated(1, 5)],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    };
+    let first = h.adapt(&d1);
+    assert_eq!(first.delta.discovered.len(), 1);
+    assert_eq!(
+        first.delta.discovered[0].candidates_coverage,
+        CandidateCoverage::Complete
+    );
+    let d2 = DiscoveryDelta {
+        candidates: vec![h.cand(1, 6, 0x200)],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    };
+    let second = h.adapt(&d2);
+    assert_eq!(second.delta.discovered.len(), 1);
+    assert_eq!(second.delta.discovered[0].site.offset, 0x200);
+    assert_eq!(
+        second.delta.discovered[0].candidates_coverage,
+        CandidateCoverage::Unknown,
+        "untracked epoch must fail closed, never inherit Complete"
     );
 }
 
