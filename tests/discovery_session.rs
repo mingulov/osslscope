@@ -656,11 +656,10 @@ fn legacy_links_live_until_close() {
 
 #[test]
 fn nostore_sample_never_terminates() {
-    // A `no_store` table is re-walked on every query but never
-    // walked to proof: full re-walk streams across many queries plus
-    // the NO_STORE bit stay an explicit prefix, and no termination
-    // proof is ever honored for the uncacheable array — even a fully
-    // walked slot set terminates nothing without proof.
+    // A `no_store` table is sampled, never walked to proof: slot-0
+    // samples across many queries plus the NO_STORE bit stay an
+    // explicit prefix, and no termination proof is ever honored
+    // for the uncacheable array.
     use osslscope::discovery::session::CoverageState;
     let mut env = TestEnv::new();
     let mut core = test_core(false);
@@ -668,9 +667,7 @@ fn nostore_sample_never_terminates() {
     env.staged.trunc = vec![(OP_DIGEST, wire::TRUNC_NO_STORE)];
     for _ in 0..3 {
         env.push(query_ret(OP_DIGEST, arr, 0));
-        for idx in 0..3u64 {
-            env.push(ok_alg(OP_DIGEST, arr, idx));
-        }
+        env.push(ok_alg(OP_DIGEST, arr, 0));
         let d = core.poll(&mut env, ample_budget()).unwrap();
         assert!(!d.budget_exhausted);
     }
@@ -678,7 +675,7 @@ fn nostore_sample_never_terminates() {
     assert_eq!(snap.tables.len(), 1);
     assert!(matches!(
         snap.tables[0].state,
-        CoverageState::InProgress { walked: 3 }
+        CoverageState::InProgress { walked: 1 }
     ));
     assert_eq!(
         snap.tables[0].trunc_bits & wire::TRUNC_NO_STORE,
@@ -691,13 +688,13 @@ fn nostore_sample_never_terminates() {
 
 #[test]
 fn one_query_full_walk_covers_late_slot() {
-    // The G02 ECDSA shape at the session layer: a 30-slot signature
-    // table (op 12) with ECDSA at slot 29, observed through ONE
-    // query — the full-walk stream (one QUERY_RET + ALGs 0..30 +
-    // rows + proof) terminates the table and carries a slot-29
-    // ECDSA candidate, with a one-query oracle. (The live half is
-    // the lane's few-query ECDSA workload; this pins the session
-    // accounting the walker feeds.)
+    // Host-side contract for a future complete walker (T14r5: the
+    // in-kernel multi-slot walk proved verifier-infeasible — see the
+    // round-5 handoff — so the kernel still emits prefix streams;
+    // this pins the session accounting a future walker feeds): the
+    // G02 ECDSA shape — a 30-slot signature table (op 12) with ECDSA
+    // at slot 29, observed through ONE query — terminates with a
+    // one-query oracle.
     use osslscope::discovery::session::CoverageState;
     const OP_SIGNATURE: u32 = 12;
     let ecdsa_class = osslscope::kinds::ALG_NAMES

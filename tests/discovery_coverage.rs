@@ -173,8 +173,7 @@ fn empty_impl_does_not_silently_stall() {
     );
 
     // The BPF contract behind this host accounting: the impl-less
-    // path advances the cursor past the slot (no stall — stopping
-    // here would re-walk this slot on every future query) and flags
+    // path advances the per-array counter (no stall) and flags
     // NOIMP (no silence). Pinned by source shape (same precedent as
     // the privacy allowlist pins).
     let bpf = std::fs::read_to_string(
@@ -184,7 +183,7 @@ fn empty_impl_does_not_silently_stall() {
     let imp_pos = bpf.find("imp == 0").expect("impl-less path must exist");
     let window = &bpf[imp_pos..(imp_pos + 600).min(bpf.len())];
     assert!(
-        window.contains("cc_new = (j + 1)"),
+        window.contains("advance_next") || window.contains("QUERY_NEXT.insert"),
         "impl-less slots must advance past, not freeze: {window}"
     );
     assert!(
@@ -453,12 +452,13 @@ fn partial_delta_retains_reasons() {
 
 #[test]
 fn single_query_full_walk_covers_late_slot() {
-    // The T14r5 walker emits the whole table on ONE query: a single
+    // Host-side contract for a future complete walker (T14r5: the
+    // in-kernel multi-slot walk proved verifier-infeasible — see the
+    // round-5 handoff — so the kernel still emits prefix streams;
+    // this pins the accounting a future walker feeds): a single
     // query-ret plus ALG records for slots 0..30 plus the len-30
     // proof terminates the table — the later slot (idx 29, the G02
     // ECDSA shape) is covered with a one-query oracle, not 30.
-    // (The live half of this proof is `one_query_later_slot` on the
-    // lane; this pins the host accounting the walker feeds.)
     const OP_SIGNATURE: u32 = 12;
     let mut t = CoverageTracker::new();
     t.note_query_ret(OP_SIGNATURE, ARR);
@@ -600,7 +600,7 @@ fn one_query_later_slot() {
 
 /// Live no_store explicitness (NOT-RUN here; same lane gate).
 /// A provider whose query sets `*no_store=1` must surface as
-/// PARTIAL with the NO_STORE bit — a re-walked table plus an explicit
+/// PARTIAL with the NO_STORE bit — a sampled slot plus an explicit
 /// reason, never silent COMPLETE.
 #[test]
 #[ignore = "live lane only: privileged BPF + fixtures (see doc comment)"]

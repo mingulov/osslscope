@@ -60,9 +60,7 @@ pub const HARVEST_MAPS: [MapSpec; 12] = [
         map_type: 27,
         key_size: 0,
         value_size: 0,
-        // 4 MiB: one worst-shape full walk (512 ALGs + 512x128 ROWs
-        // ≈ 2.6 MiB) must fit with headroom while the host drains.
-        max_entries: 1 << 22,
+        max_entries: 1 << 21,
         flags: 0,
     },
     MapSpec {
@@ -378,14 +376,6 @@ const BPF_CALL: u8 = 0x85;
 /// `call` src reg marking a subprogram (pseudo) call, as opposed to
 /// a helper call (`src == 0`, imm = helper id).
 const BPF_PSEUDO_CALL: u8 = 1;
-/// `ld_imm64` opcode: function-pointer sites (address-taken
-/// callbacks for helpers like `bpf_loop`) are 16-byte insns carrying
-/// an `R_BPF_64_64` reloc against a `.text` FUNC sym.
-const BPF_LD_IMM64: u8 = 0x18;
-/// `ld_imm64` src reg marking a relocated function address (the
-/// kernel resolves the relative imm to a subprogram — the aya-obj
-/// rule: same `target - pc - 1` encoding as a static call).
-const BPF_PSEUDO_FUNC: u8 = 4;
 
 /// Resolve an `R_BPF_64_32` call reloc to a `.text` function name.
 /// Named FUNC syms resolve by (value, name); STT_SECTION syms (the
@@ -458,64 +448,6 @@ fn apply_call(
     Ok(())
 }
 
-/// Resolve an `R_BPF_64_64` function-pointer reloc to a `.text`
-/// function name. The site must be an unrelocated `ld_imm64` (src 0,
-/// zero imm64 — anything else is an already-relocated or corrupt
-/// object); the symbol must be a named global FUNC in `.text` (what
-/// the toolchain emits for address-taken callbacks). The target MUST
-/// be a `.text` entry: mid-function landings are drift, never a
-/// guess.
-fn func_ptr_target(
-    syms: &[Sym],
-    text_fns: &[(usize, usize, String)],
-    text_idx: usize,
-    site_sec: &[u8],
-    r: &Reloc,
-    prog: &str,
-) -> anyhow::Result<String> {
-    let rsym = syms
-        .get(r.sym)
-        .ok_or_else(|| anyhow::anyhow!("prog {prog}: bad reloc sym"))?;
-    let site = site_sec
-        .get(r.off..r.off + 16)
-        .ok_or_else(|| anyhow::anyhow!("prog {prog}: func reloc out of range"))?;
-    if site[0] != BPF_LD_IMM64 || site[1] >> 4 != 0 {
-        anyhow::bail!("prog {prog}: func reloc vs non-ld_imm64 site");
-    }
-    if site[4..16] != [0u8; 12] {
-        anyhow::bail!("prog {prog}: func reloc vs relocated site");
-    }
-    if !rsym.is_func || rsym.shndx != text_idx {
-        anyhow::bail!("prog {prog}: func reloc vs non-entry {}", rsym.name);
-    }
-    text_fns
-        .iter()
-        .find(|(v, _, n)| *v == rsym.value && *n == rsym.name)
-        .map(|(_, _, n)| n.clone())
-        .ok_or_else(|| anyhow::anyhow!("prog {prog}: func reloc vs non-entry {}", rsym.name))
-}
-
-/// Rewrite one function-pointer site: the `imm` takes the same
-/// relative encoding as a static call (`target - pc - 1`, in insns),
-/// and the src nibble takes `BPF_PSEUDO_FUNC` (the dst reg is
-/// preserved). The high half stays zero (asserted at resolve time).
-fn apply_func_ptr(
-    insns: &mut [u8],
-    rel_off: usize,
-    target_off: usize,
-    prog: &str,
-) -> anyhow::Result<()> {
-    apply_call(insns, rel_off, target_off, prog)?;
-    let insn = insns
-        .get_mut(rel_off..rel_off + 8)
-        .ok_or_else(|| anyhow::anyhow!("{prog}: func reloc out of range"))?;
-    if insn[0] != BPF_LD_IMM64 || insn[1] >> 4 != 0 {
-        anyhow::bail!("{prog}: func site not an unrelocated ld_imm64");
-    }
-    insn[1] = (insn[1] & 0x0f) | (BPF_PSEUDO_FUNC << 4);
-    Ok(())
-}
-
 /// Reject a linked image containing a subprogram call that was not
 /// rewritten from a relocation (F-BPF-1 hardening).
 ///
@@ -543,39 +475,6 @@ fn check_calls_rewritten(
                  (callee must be global or inlined)"
             );
         }
-    }
-    Ok(())
-}
-
-/// Reject a linked image containing a function pointer that was not
-/// rewritten from a relocation (same hazard as
-/// [`check_calls_rewritten`): a pre-resolved `ld_imm64` with
-/// `BPF_PSEUDO_FUNC` src but no reloc would silently point at a
-/// stale offset after reachable-subset linking. The scan steps over
-/// each `ld_imm64`'s second slot (its bytes are not opcodes);
-/// map sites (src 0, rewritten later by `load()`) are ignored here.
-fn check_func_ptrs_rewritten(
-    insns: &[u8],
-    rewritten: &HashSet<usize>,
-    prog: &str,
-) -> anyhow::Result<()> {
-    if insns.len() % 8 != 0 {
-        anyhow::bail!("{prog}: linked insns not a whole count");
-    }
-    let mut i = 0usize;
-    while i * 8 < insns.len() {
-        let insn = &insns[i * 8..i * 8 + 8];
-        if insn[0] == BPF_LD_IMM64 {
-            if insn[1] >> 4 == BPF_PSEUDO_FUNC && !rewritten.contains(&(i * 8)) {
-                anyhow::bail!(
-                    "{prog}: unrelocated function pointer at insn {i} \
-                     (callee must be global)"
-                );
-            }
-            i += 2;
-            continue;
-        }
-        i += 1;
     }
     Ok(())
 }
@@ -717,10 +616,8 @@ pub fn prepare(obj: &[u8], maps: &[MapSpec], progs: &[ProgSpec]) -> anyhow::Resu
             .get(sym.value..sym.value + sym.size)
             .ok_or_else(|| anyhow::anyhow!("prog {} out of range", p.name))?;
         let mut fixups = Vec::new();
-        // Main's owned relocs: map sites recorded, call and
-        // function-pointer targets rooted.
+        // Main's owned relocs: map sites recorded, call targets rooted.
         let mut roots: Vec<(usize, String)> = Vec::new(); // (local off, fn)
-        let mut func_roots: Vec<(usize, String)> = Vec::new(); // (local off, fn)
         for r in relocs.get(p.section).map(Vec::as_slice).unwrap_or(&[]) {
             let owner = funcs
                 .get(p.section)
@@ -737,21 +634,13 @@ pub fn prepare(obj: &[u8], maps: &[MapSpec], progs: &[ProgSpec]) -> anyhow::Resu
             let local = r.off - sym.value;
             match r.typ {
                 R_BPF_64_64 => {
-                    if rsym.is_func {
-                        let tidx = text_idx.ok_or_else(|| {
-                            anyhow::anyhow!("prog {}: func reloc but no .text", p.name)
-                        })?;
-                        let target = func_ptr_target(&syms, &text_fns, tidx, sec, r, p.name)?;
-                        func_roots.push((local, target));
-                    } else {
-                        if !(rsym.is_obj && maps.iter().any(|m| m.name == rsym.name)) {
-                            anyhow::bail!("prog {}: map reloc vs {}", p.name, rsym.name);
-                        }
-                        fixups.push(MapFixup {
-                            insn_off: local,
-                            map: rsym.name.clone(),
-                        });
+                    if !(rsym.is_obj && maps.iter().any(|m| m.name == rsym.name)) {
+                        anyhow::bail!("prog {}: map reloc vs {}", p.name, rsym.name);
                     }
+                    fixups.push(MapFixup {
+                        insn_off: local,
+                        map: rsym.name.clone(),
+                    });
                 }
                 R_BPF_64_32 => {
                     let tidx = text_idx.ok_or_else(|| {
@@ -763,16 +652,11 @@ pub fn prepare(obj: &[u8], maps: &[MapSpec], progs: &[ProgSpec]) -> anyhow::Resu
                 t => anyhow::bail!("prog {}: reloc type {t} unsupported", p.name),
             }
         }
-        // Reachable closure over `.text` call and function-pointer
-        // relocs (transitive). Only reachable subprograms are linked:
-        // the verifier rejects unreachable trailing insns, so blind
-        // `.text` appends fail.
+        // Reachable closure over `.text` call relocs (transitive).
+        // Only reachable subprograms are linked: the verifier rejects
+        // unreachable trailing insns, so blind `.text` appends fail.
         let mut included: Vec<String> = Vec::new();
-        let mut work: Vec<String> = roots
-            .iter()
-            .chain(func_roots.iter())
-            .map(|(_, n)| n.clone())
-            .collect();
+        let mut work: Vec<String> = roots.iter().map(|(_, n)| n.clone()).collect();
         while let Some(next) = work.pop() {
             if included.contains(&next) {
                 continue;
@@ -783,24 +667,11 @@ pub fn prepare(obj: &[u8], maps: &[MapSpec], progs: &[ProgSpec]) -> anyhow::Resu
                 .find(|(_, _, n)| *n == next)
                 .ok_or_else(|| anyhow::anyhow!("prog {}: call vs unknown {next}", p.name))?;
             for r in relocs.get(".text").map(Vec::as_slice).unwrap_or(&[]) {
-                if *f0 <= r.off && r.off < *f1 {
-                    if r.typ == R_BPF_64_32 {
-                        let tidx = text_idx.ok_or_else(|| {
-                            anyhow::anyhow!("prog {}: call reloc but no .text", p.name)
-                        })?;
-                        work.push(call_target(&syms, &text_fns, tidx, text, r, p.name)?);
-                    } else if r.typ == R_BPF_64_64 {
-                        let rsym = syms.get(r.sym).ok_or_else(|| {
-                            anyhow::anyhow!("prog {}: bad text reloc sym", p.name)
-                        })?;
-                        if rsym.is_func {
-                            let tidx = text_idx.ok_or_else(|| {
-                                anyhow::anyhow!("prog {}: func reloc but no .text", p.name)
-                            })?;
-                            work.push(func_ptr_target(&syms, &text_fns, tidx, text, r, p.name)?);
-                        }
-                        // Map relocs pull no code.
-                    }
+                if *f0 <= r.off && r.off < *f1 && r.typ == R_BPF_64_32 {
+                    let tidx = text_idx.ok_or_else(|| {
+                        anyhow::anyhow!("prog {}: call reloc but no .text", p.name)
+                    })?;
+                    work.push(call_target(&syms, &text_fns, tidx, text, r, p.name)?);
                 }
             }
         }
@@ -816,24 +687,16 @@ pub fn prepare(obj: &[u8], maps: &[MapSpec], progs: &[ProgSpec]) -> anyhow::Resu
             base.insert(name.clone(), insns.len());
             insns.extend_from_slice(bytes);
         }
-        // Apply calls and function pointers (main + included)
-        // and included map sites. Every rewritten call/func site is
-        // recorded: the linked image must contain no other
-        // pseudo-call or pseudo-func (see `check_calls_rewritten`
-        // and `check_func_ptrs_rewritten`).
+        // Apply calls (main + included) and included map sites.
+        // Every rewritten call site is recorded: the linked image
+        // must contain no other pseudo-call (see
+        // `check_calls_rewritten`).
         let mut rewritten: HashSet<usize> = HashSet::new();
         for (local, target) in &roots {
             let t = base
                 .get(target)
                 .ok_or_else(|| anyhow::anyhow!("prog {}: call vs unlinked {target}", p.name))?;
             apply_call(&mut insns, *local, *t, p.name)?;
-            rewritten.insert(*local);
-        }
-        for (local, target) in &func_roots {
-            let t = base
-                .get(target)
-                .ok_or_else(|| anyhow::anyhow!("prog {}: func vs unlinked {target}", p.name))?;
-            apply_func_ptr(&mut insns, *local, *t, p.name)?;
             rewritten.insert(*local);
         }
         for r in relocs.get(".text").map(Vec::as_slice).unwrap_or(&[]) {
@@ -848,28 +711,6 @@ pub fn prepare(obj: &[u8], maps: &[MapSpec], progs: &[ProgSpec]) -> anyhow::Resu
                 .ok_or_else(|| anyhow::anyhow!("prog {}: bad text reloc sym", p.name))?;
             match r.typ {
                 R_BPF_64_64 => {
-                    if rsym.is_func {
-                        let tidx = text_idx.ok_or_else(|| {
-                            anyhow::anyhow!("prog {}: func reloc but no .text", p.name)
-                        })?;
-                        let target = func_ptr_target(&syms, &text_fns, tidx, text, r, p.name)?;
-                        if !included.contains(&target) {
-                            anyhow::bail!("prog {}: func vs excluded {}", p.name, target);
-                        }
-                        let t = base.get(&target).ok_or_else(|| {
-                            anyhow::anyhow!("prog {}: func vs unlinked {}", p.name, target)
-                        })?;
-                        let site = obase
-                            + (r.off
-                                - text_fns
-                                    .iter()
-                                    .find(|(_, _, n)| n == &owner)
-                                    .map(|(v, _, _)| *v)
-                                    .unwrap());
-                        apply_func_ptr(&mut insns, site, *t, p.name)?;
-                        rewritten.insert(site);
-                        continue;
-                    }
                     if !(rsym.is_obj && maps.iter().any(|m| m.name == rsym.name)) {
                         anyhow::bail!("prog {}: text map reloc vs {}", p.name, rsym.name);
                     }
@@ -910,7 +751,6 @@ pub fn prepare(obj: &[u8], maps: &[MapSpec], progs: &[ProgSpec]) -> anyhow::Resu
             }
         }
         check_calls_rewritten(&insns, &rewritten, p.name)?;
-        check_func_ptrs_rewritten(&insns, &rewritten, p.name)?;
         out.push(PreparedProg {
             name: p.name.to_string(),
             is_return,
@@ -1238,115 +1078,6 @@ mod tests {
         assert_eq!(&p.insns[20..24], &1i32.to_le_bytes());
         // Map-def dims confirmed.
         assert_eq!(prep.maps[0].max_entries, 1);
-    }
-
-    #[test]
-    fn prepare_rewrites_func_pointers_pseudo() {
-        // The uprobe call site @16 becomes an ld_imm64 of the sub's
-        // address (the `bpf_loop` callback shape): the linked site
-        // takes the relative imm plus the PSEUDO_FUNC src nibble.
-        let mut obj = min_elf();
-        obj[64 + 16..64 + 32]
-            .copy_from_slice(&[0x18, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-        obj[172..180].copy_from_slice(&u64(2 << 32 | 1));
-        let prep = prepare(
-            &obj,
-            &[MapSpec {
-                name: "MYMAP",
-                map_type: 2,
-                key_size: 4,
-                value_size: 8,
-                max_entries: 1,
-                flags: 0,
-            }],
-            &[ProgSpec {
-                name: "uprobe_func",
-                section: "uprobe",
-            }],
-        )
-        .unwrap();
-        let p = &prep.progs[0];
-        assert_eq!(p.insns.len(), 56);
-        // Dst reg preserved, src nibble PSEUDO_FUNC, imm = 4-2-1 = 1.
-        assert_eq!(p.insns[17], 0x02 | (BPF_PSEUDO_FUNC << 4));
-        assert_eq!(&p.insns[20..24], &1i32.to_le_bytes());
-        // High half untouched.
-        assert_eq!(&p.insns[24..32], &[0u8; 8]);
-    }
-
-    #[test]
-    fn prepare_rejects_bad_func_pointers() {
-        let spec = || {
-            (
-                vec![MapSpec {
-                    name: "MYMAP",
-                    map_type: 2,
-                    key_size: 4,
-                    value_size: 8,
-                    max_entries: 1,
-                    flags: 0,
-                }],
-                vec![ProgSpec {
-                    name: "uprobe_func",
-                    section: "uprobe",
-                }],
-            )
-        };
-        // Func reloc against a non-.text FUNC (the prog itself).
-        let mut obj = min_elf();
-        obj[64 + 16..64 + 32]
-            .copy_from_slice(&[0x18, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-        obj[172..180].copy_from_slice(&u64(1 << 32 | 1));
-        let (maps, progs) = spec();
-        let e = prepare(&obj, &maps, &progs).err().expect("must fail");
-        assert!(e.to_string().contains("non-entry"), "{e:#}");
-        // Func reloc against a non-ld_imm64 site (the call shape).
-        let mut obj = min_elf();
-        obj[172..180].copy_from_slice(&u64(2 << 32 | 1));
-        let (maps, progs) = spec();
-        let e = prepare(&obj, &maps, &progs).err().expect("must fail");
-        assert!(e.to_string().contains("non-ld_imm64"), "{e:#}");
-        // Func reloc against an already-relocated site (nonzero imm).
-        let mut obj = min_elf();
-        obj[64 + 16..64 + 32]
-            .copy_from_slice(&[0x18, 0x02, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-        obj[172..180].copy_from_slice(&u64(2 << 32 | 1));
-        let (maps, progs) = spec();
-        let e = prepare(&obj, &maps, &progs).err().expect("must fail");
-        assert!(e.to_string().contains("relocated site"), "{e:#}");
-    }
-
-    #[test]
-    fn stale_func_pointers_fail_closed() {
-        let exit = [0x95u8, 0, 0, 0, 0, 0, 0, 0];
-        let zeros = [0u8; 8];
-        // A PSEUDO_FUNC site without a rewrite record fails, naming
-        // the insn; map sites (src 0) are ignored here.
-        let mut bad = Vec::new();
-        bad.extend_from_slice(&[0x18, 0x02 | (BPF_PSEUDO_FUNC << 4), 0, 0, 1, 0, 0, 0]);
-        bad.extend_from_slice(&zeros);
-        bad.extend_from_slice(&exit);
-        let e = check_func_ptrs_rewritten(&bad, &HashSet::new(), "p").unwrap_err();
-        assert!(
-            e.to_string()
-                .contains("unrelocated function pointer at insn 0"),
-            "{e:#}"
-        );
-        let mut ok = Vec::new();
-        ok.extend_from_slice(&[0x18, 0x02 | (BPF_PSEUDO_FUNC << 4), 0, 0, 1, 0, 0, 0]);
-        ok.extend_from_slice(&zeros);
-        ok.extend_from_slice(&exit);
-        check_func_ptrs_rewritten(&ok, &[0usize].into_iter().collect(), "p").unwrap();
-        // The second slot's bytes are not opcodes: 0x85 there must
-        // not scan as a call (and 0x18 there must not recurse).
-        let mut second = Vec::new();
-        second.extend_from_slice(&[0x18, 0x01, 0, 0, 0, 0, 0, 0]);
-        second.extend_from_slice(&[0x85, 0x10, 0, 0, 0, 0, 0, 0]);
-        second.extend_from_slice(&exit);
-        check_func_ptrs_rewritten(&second, &HashSet::new(), "p").unwrap();
-        // Ragged images fail rather than scan short.
-        let e = check_func_ptrs_rewritten(&[0u8; 7], &HashSet::new(), "p").unwrap_err();
-        assert!(e.to_string().contains("not a whole count"), "{e:#}");
     }
 
     #[test]

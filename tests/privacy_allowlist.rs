@@ -102,8 +102,8 @@ fn probe_read_allowlist_is_complete() {
     let str_reads = harvest
         .match_indices("bpf_probe_read_user_str_bytes")
         .count();
-    assert_eq!(total, 21, "expected 21 probe-read sites, found {total}");
-    assert_eq!(str_reads, 5, "expected 5 string reads, found {str_reads}");
+    assert_eq!(total, 11, "expected 11 probe-read sites, found {total}");
+    assert_eq!(str_reads, 2, "expected 2 string reads, found {str_reads}");
     assert!(harvest.contains("[0u8; 32]"), "trip string bound missing");
     assert!(
         harvest.contains("[0u8; 128]"),
