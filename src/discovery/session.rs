@@ -721,6 +721,15 @@ impl SessionCore {
         env: &mut E,
         maps: &[maps::Mapping],
     ) -> ReconcileOutcome {
+        // Empty maps mean the target is gone (reaped) or the read
+        // failed: there is nothing to reconcile against, and every
+        // incarnation would read None != live fingerprint,
+        // retiring ALL tables. The last-good epochs stand instead
+        // (T14r4 w1: close-time retire-all wiped live tables and
+        // the doc collapsed to 0 sites despite 581 late sites).
+        if maps.is_empty() {
+            return ReconcileOutcome::default();
+        }
         let mut outcome = ReconcileOutcome::default();
         let keys: Vec<(u32, u64)> = self.table_epochs.keys().copied().collect();
         for (op, arr) in keys {

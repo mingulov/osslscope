@@ -909,3 +909,46 @@ fn close_recycle_carries_prewip_final() {
     assert!(fin.queries_observed >= 1);
     assert_eq!(losses_of(fin)[&HOST_DRAIN_SHORTFALL], 3);
 }
+
+#[test]
+fn close_reaped_child_keeps_sites_no_retire_all() {
+    // Close after a REAPED owned child: /proc is gone, so the
+    // close-time maps read is empty. Reconciling against empty
+    // maps must NOT retire every table (incarnation None != live
+    // fingerprint): the last-good epochs stand, the final keeps
+    // the poll's candidate, and the tail still counts (T14r4 w1:
+    // retire-all wiped 581 late sites to a 0-site doc).
+    let mut env = TestEnv::new();
+    let mut core = test_core(false);
+    let arr = 0x7f00_1000u64;
+    env.push(query_ret(OP_DIGEST, arr, 0));
+    env.push(ok_alg(OP_DIGEST, arr, 0));
+    env.push(dispatch_row(OP_DIGEST, 7, 0x7f00_2000, arr, 0));
+    let d = core.poll(&mut env, ample_budget()).unwrap();
+    assert_eq!(d.candidates.len(), 1);
+    for idx in 1..4u64 {
+        env.push(ok_alg(OP_DIGEST, arr, idx));
+    }
+    // Reaped: pin dead AND maps gone (LiveEnv reads nothing).
+    env.pin_ok = false;
+    env.maps.clear();
+    let err = core.close(&mut env).unwrap_err();
+    let rec = err.downcast_ref::<Recycled>().expect("typed recycle");
+    assert!(rec.snapshot.candidates.is_empty());
+    let fin = rec.final_snapshot.as_ref().expect("close carries final");
+    assert_eq!(fin.candidates.len(), 1);
+    // Live-epoch tables survive (sites render from live tables;
+    // retire-all empties them and the doc collapses to 0 sites).
+    assert_eq!(
+        fin.tables.len(),
+        1,
+        "empty maps must not retire live tables"
+    );
+    assert!(
+        fin.retained_reasons.is_empty(),
+        "no retire gaps: {:?}",
+        fin.retained_reasons
+    );
+    assert!(fin.queries_observed >= 1);
+    assert_eq!(losses_of(fin)[&HOST_DRAIN_SHORTFALL], 3);
+}
