@@ -231,6 +231,25 @@ fn release_is_strictly_once() {
 }
 
 #[test]
+fn stopped_child_maps_readable_for_setup_baseline() {
+    // F-CAPS-1 setup shape: while the child is stopped pre-exec,
+    // the observer reads its /proc/PID/maps for the baseline. The
+    // child opts itself dumpable pre-exec (target.rs), so the read
+    // succeeds even when the observer runs under filecaps (the
+    // filecaps transition itself is pinned by the T14 capability
+    // matrix evidence + the installed/filecaps suites, not here).
+    let mut t = OwnedTarget::spawn_stopped(&["/bin/sleep".to_string(), "30".to_string()]).unwrap();
+    let pid = t.pid();
+    assert_eq!(t.state(), CustodyState::Stopped);
+    let maps = std::fs::read_to_string(format!("/proc/{pid}/maps"))
+        .expect("stopped pre-exec child maps readable");
+    assert!(!maps.is_empty());
+    t.resolve_setup_failure().unwrap();
+    assert_eq!(t.state(), CustodyState::Reaped);
+    assert_reaped_no_zombie(pid);
+}
+
+#[test]
 fn external_pid_target_is_never_signaled() {
     // An external `--pid` target (not spawned by the observer) is
     // pinned for identity only: pin + verify touch nothing, and the
