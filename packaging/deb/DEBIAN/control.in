@@ -1,5 +1,5 @@
 Package: osslscope
-Version: @VERSION@-1
+Version: @VERSION@-@REVISION@
 Section: utils
 Priority: optional
 Architecture: amd64

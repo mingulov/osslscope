@@ -1,0 +1,194 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# live-known-n: bounded live doctor→check with an independent count ledger.
+#
+# Status: IMPLEMENTED, NOT-RUN (owned BPF lane pending). This workflow only
+# runs via workflow_dispatch on a self-hosted runner labeled `osslscope-bpf`
+# (x86-64, kernel >= 6.9, BPF-capable, passwordless sudo for the one-time
+# setcap). No such runner is registered yet; ordinary PR checks in
+# check.yml never touch this file's live steps.
+#
+# The run is bounded (job timeout 30 min, duration/timeout/grace flags) and
+# uses the in-tree ordinary_ops_driver fixture: its LEDGER stdout is the
+# independent oracle (scripts/live-oracle.py, unit-tested on the host), and
+# the observer's v2 JSON must show the ledgered operation as >=1 executed
+# site with a matching candidate op id — a lower bound, since exact
+# provider-internal callback counts are implementation-defined per the
+# fixture contract (recorded, never asserted). A missing live capability is
+# a labeled SKIP in the job summary, never "capture passed"; a setup
+# failure is reported as setup failure, never as a capability skip.
+name: live-known-n
+on:
+  workflow_dispatch:
+    inputs:
+      product_ref:
+        description: "Clean committed product revision to observe (full SHA)"
+        required: true
+        default: ""
+      driver_mode:
+        description: "ordinary_ops_driver mode (ecdsa|keyexch|kdf|kem|md4|mixed)"
+        required: false
+        default: "ecdsa"
+run-name: "live-known-n ${{ inputs.product_ref }} mode=${{ inputs.driver_mode }}"
+concurrency:
+  group: live-known-n
+  cancel-in-progress: false
+jobs:
+  known-n:
+    runs-on: [self-hosted, linux, X64, osslscope-bpf]
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: "2"
+    steps:
+      - name: Validate driver mode (allowlist, no shell interpolation)
+        id: mode
+        env:
+          MODE_INPUT: ${{ inputs.driver_mode }}
+        run: |
+          set -eu
+          case "$MODE_INPUT" in
+            ecdsa|keyexch|kdf|kem|md4|mixed) ;;
+            *) echo "bad driver_mode: $MODE_INPUT" >&2; exit 2 ;;
+          esac
+          echo "mode=$MODE_INPUT" >>"$GITHUB_OUTPUT"
+      - name: Check out product ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.product_ref }}
+      - name: Record revision (must be clean)
+        id: rev
+        run: |
+          set -eu
+          test -z "$(git status --porcelain)" || { echo "tree is dirty; refusing live run"; exit 1; }
+          git rev-parse HEAD >product-ref.txt
+          uname -r >kernel.txt
+          cat product-ref.txt kernel.txt
+      - name: Build host + BPF (locked, bounded jobs)
+        run: |
+          set -eu
+          ./scripts/build-dev.sh
+      - name: Install to run prefix
+        run: |
+          set -eu
+          ./scripts/install-dev.sh --prefix "${RUNNER_TEMP}/ossl-pfx"
+          "${RUNNER_TEMP}/ossl-pfx/bin/osslscope" --help | head -5
+      - name: One-time file caps
+        run: |
+          set -eu
+          sudo setcap cap_bpf,cap_perfmon+ep "${RUNNER_TEMP}/ossl-pfx/bin/osslscope"
+          getcap "${RUNNER_TEMP}/ossl-pfx/bin/osslscope"
+      - name: Build ledger driver fixture
+        env:
+          MODE: ${{ steps.mode.outputs.mode }}
+        run: |
+          set -eu
+          cc -O1 -o "${RUNNER_TEMP}/ordinary_ops_driver" \
+            crates/ossl-discover/tests/fixture/ordinary_ops_driver.c -lcrypto
+          "${RUNNER_TEMP}/ordinary_ops_driver" "$MODE" >driver-smoke.txt 2>&1
+          cat driver-smoke.txt
+          grep -q ORDDONE driver-smoke.txt
+      - name: Probe live capability (doctor)
+        id: probe
+        run: |
+          set -eu
+          "${RUNNER_TEMP}/ossl-pfx/bin/osslscope" doctor >doctor.txt 2>&1 || true
+          cat doctor.txt
+          if grep -q 'verdict: ok' doctor.txt; then
+            echo "capable=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "capable=false" >>"$GITHUB_OUTPUT"
+          fi
+      - name: Bounded live check (known workload)
+        id: capture
+        if: steps.probe.outputs.capable == 'true'
+        env:
+          MODE: ${{ steps.mode.outputs.mode }}
+        run: |
+          set -eu
+          set -o pipefail
+          PFX="${RUNNER_TEMP}/ossl-pfx"
+          LIBCRYPTO="$(ldconfig -p 2>/dev/null | grep -m1 'libcrypto.so.3 ' | awk '{print $NF}')"
+          test -n "$LIBCRYPTO" || { echo "no libcrypto.so.3 on lane; failing closed"; exit 4; }
+          echo "libcrypto: $LIBCRYPTO" >lane-libcrypto.txt
+          set +e
+          "$PFX/bin/osslscope" check \
+            --provider "$LIBCRYPTO" --builtin \
+            --object "$PFX/lib/osslscope/osslscope-harvest" \
+            --count-object "$PFX/lib/osslscope/osslscope-count" \
+            --deny-weak \
+            --duration 30 --timeout 60 --grace 5 \
+            --format json --out known-n.json \
+            run -- "${RUNNER_TEMP}/ordinary_ops_driver" "$MODE" \
+            >known-n-driver.log 2>&1
+          rc=$?
+          set -e
+          cat known-n-driver.log
+          echo "$rc" >check-exit.txt
+          echo "check exit: $rc"
+          case "$rc" in
+            0|3|10|11) echo "exit $rc is a usable observation outcome; oracle decides" ;;
+            *) echo "exit $rc is environment/usage failure, not an observation"; exit 1 ;;
+          esac
+      - name: Ledger oracle (independent counts)
+        id: oracle
+        if: steps.probe.outputs.capable == 'true'
+        env:
+          MODE: ${{ steps.mode.outputs.mode }}
+        run: |
+          set -eu
+          python3 scripts/live-oracle.py known-n-driver.log known-n.json "$MODE" >oracle.txt 2>&1
+          rc=$?
+          cat oracle.txt
+          exit $rc
+      - name: Upload live artifacts (pass, fail, or capability skip)
+        if: always() && steps.probe.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-known-n-${{ steps.mode.outputs.mode }}
+          path: |
+            product-ref.txt
+            kernel.txt
+            doctor.txt
+            driver-smoke.txt
+            lane-libcrypto.txt
+            known-n-driver.log
+            known-n.json
+            check-exit.txt
+            oracle.txt
+          if-no-files-found: warn
+      - name: Verdict summary (skip and setup failure are labeled, never a pass)
+        if: always()
+        run: |
+          set -eu
+          {
+            echo "## live-known-n verdict"
+            echo ""
+            echo "- product: $(cat product-ref.txt 2>/dev/null || echo unknown)"
+            echo "- kernel: $(cat kernel.txt 2>/dev/null || echo unknown)"
+            if [ "${{ steps.probe.outcome }}" != "success" ]; then
+              echo "- SETUP FAILURE: an earlier step failed before the capability probe;"
+              echo "  no capture was attempted and no observation is claimed."
+            elif [ "${{ steps.probe.outputs.capable }}" = "true" ]; then
+              echo "- doctor: verdict ok (live capability present)"
+              echo "- check exit: $(cat check-exit.txt 2>/dev/null || echo unknown)"
+              if grep -q 'ORACLE PASS' oracle.txt 2>/dev/null; then
+                echo "- oracle: PASS (ledgered execution visible)"
+              elif grep -q 'ORACLE SKIP' oracle.txt 2>/dev/null; then
+                echo "- oracle: SKIP (version-gated fixture; nothing asserted)"
+              else
+                echo "- oracle: FAIL (see oracle.txt artifact)"
+              fi
+            else
+              echo "- SKIP(live-capability): doctor did not report verdict ok on this runner;"
+              echo "  no capture was attempted and no observation is claimed."
+            fi
+          } >>"$GITHUB_STEP_SUMMARY"
+          if [ "${{ steps.probe.outcome }}" != "success" ]; then
+            echo "SETUP FAILURE before probe; see summary"
+            exit 1
+          elif [ "${{ steps.probe.outputs.capable }}" != "true" ]; then
+            echo "SKIP(live-capability): no live observation; see summary"
+          elif grep -q 'ORACLE PASS\|ORACLE SKIP' oracle.txt 2>/dev/null; then
+            echo "oracle accepted (PASS or version-gated SKIP); see summary"
+          else
+            exit 1
+          fi
