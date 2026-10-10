@@ -108,8 +108,11 @@ osslscope doctor --exe ./my-app         # would `run --` discover THIS exe?
 ```
 
 `doctor` checks privileges (CAP_BPF/CAP_PERFMON or file
-caps), kernel features, lockdown/LSM/seccomp, installed BPF
-objects (trusted locations, compatibility), and — with a
+caps), kernel features, lockdown/LSM/seccomp, the spawn-setup
+maps read (`spawn-access`: a stopped self-dumpable child, exactly
+as `run --` sets up, predicting filecaps setup success without a
+target), installed BPF objects (trusted locations,
+compatibility), and — with a
 target — architecture, OpenSSL flavor, build enrollment,
 the dispatch anchor, provider class, and coverage caveats
 (cold-start, auto-discovery scope, address-taken gaps).

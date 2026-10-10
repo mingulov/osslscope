@@ -131,6 +131,14 @@ reports `FAIL-CLOSED` and names the `setcap` remediation above;
 granting caps plus staged objects flips it to `verdict: ok` on a
 capable machine.
 
+The capability set is complete at `cap_bpf,cap_perfmon`: `run --`
+needs no `cap_sys_ptrace` for owned targets, because each spawned
+child opts itself dumpable pre-exec (see the `spawn-access` row in
+`doctor`, which replicates that setup read and predicts success).
+Only foreign non-dumpable `--pid` targets (setuid/filecaps
+binaries) need `CAP_SYS_PTRACE` in the observer, and `doctor --pid`
+says so explicitly for that target.
+
 ## Next steps
 
 - Vet a target before observing: `osslscope doctor --pid PID` (or
