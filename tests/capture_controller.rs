@@ -2277,6 +2277,16 @@ fn retired_epoch_table_cannot_resurrect_closure() {
 use osslscope::capture::{LiveProc, PollingLifecycle};
 use osslscope::target::OwnedTarget;
 
+/// Parent pid from `/proc/<pid>/stat` (fields start after the LAST
+/// ')'; ppid is post-comm token 1).
+fn ppid_of(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after = stat.rsplit_once(')')?.1;
+    let mut toks = after.split_whitespace();
+    toks.next()?;
+    toks.next()?.parse().ok()
+}
+
 /// Assert `pid` has no waitable status left (reaped, never a zombie).
 fn assert_reaped(pid: u32) {
     let mut status = 0;
@@ -2292,7 +2302,12 @@ fn assert_reaped(pid: u32) {
 /// Real owned child through the real `observe` loop (scripted
 /// sessions/proc, injected clock): fast commands keep their status
 /// and leave no zombie.
-fn live_observe(test: &str, argv: &[&str], duration: Duration) -> (anyhow::Result<Capture>, u32) {
+fn live_observe(
+    test: &str,
+    argv: &[&str],
+    duration: Duration,
+    finish_recycled: bool,
+) -> (anyhow::Result<Capture>, u32) {
     let stage = Stage::fresh(test);
     let bytes = self_bytes();
     let staged = stage.write("prov.so", &bytes);
@@ -2311,7 +2326,7 @@ fn live_observe(test: &str, argv: &[&str], duration: Duration) -> (anyhow::Resul
         poll_err_at: HashSet::new(),
         snapshot,
         finish_err: false,
-        finish_recycled: false,
+        finish_recycled,
         cancel_flag: None,
         polls_done: 0,
         finished: false,
@@ -2385,6 +2400,7 @@ fn live_fast_child_exit7_no_zombie() {
         "live-exit7",
         &["/bin/sh", "-c", "exit 7"],
         Duration::from_secs(30),
+        false,
     );
     let c = out.unwrap();
     assert_eq!(c.child_exit, Some(7));
@@ -2403,6 +2419,7 @@ fn live_20ms_target_exit_no_zombie() {
         "live-20ms",
         &["/bin/sh", "-c", "sleep 0.02"],
         Duration::from_secs(30),
+        false,
     );
     let c = out.unwrap();
     assert_eq!(c.child_exit, Some(0));
@@ -2410,6 +2427,29 @@ fn live_20ms_target_exit_no_zombie() {
         c.disposition,
         Some(target::TargetDisposition::Exited { code: 0 })
     ));
+    assert_reaped(pid);
+}
+
+#[test]
+fn live_owned_exit_survives_pin_recycle_at_finish() {
+    // Pin-aware controller exit: a real owned child really exits
+    // (custody reaps it, so /proc goes away) and the discovery
+    // close reports the spurious pin recycle — the capture still
+    // lands with the exit preserved and no zombie left behind.
+    let (out, pid) = live_observe(
+        "live-exit-recycle",
+        &["/bin/sh", "-c", "exit 7"],
+        Duration::from_secs(30),
+        true,
+    );
+    let c = out.unwrap();
+    assert_eq!(c.child_exit, Some(7));
+    assert!(matches!(
+        c.disposition,
+        Some(target::TargetDisposition::Exited { code: 7 })
+    ));
+    assert_eq!(counter_value(&c, "discovery.close_join_skipped"), 1);
+    assert!(matches!(c.outcome, Outcome::Partial));
     assert_reaped(pid);
 }
 
@@ -2486,6 +2526,76 @@ fn live_double_fork_reparent_stays_counted() {
     unsafe {
         libc::kill(kid as libc::pid_t, libc::SIGKILL);
     }
+}
+
+#[test]
+fn live_double_fork_grandchild_reparents_past_target() {
+    // TRUE double fork: the target's child forks a grandchild and
+    // exits while the TARGET LIVES — the grandchild reparents past
+    // the target (never its child), counted once via the
+    // intermediate, never recounted, never a ghost.
+    let stage = Stage::fresh("dblfork");
+    let pidfile = stage.dir.join("grandchild.pid");
+    let pidfile = pidfile.to_str().unwrap().to_string();
+    let argv = vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        format!("(sleep 30 & echo $! > '{pidfile}'; sleep 0.5); exec sleep 60"),
+    ];
+    let mut owned = OwnedTarget::spawn_stopped(&argv).unwrap();
+    let pid = owned.pid();
+    owned.release().unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    let mut lc = PollingLifecycle::new(pid);
+    // The intermediate is alive (0.5s): exactly one Fork for it.
+    let first = lc.poll();
+    assert_eq!(first.events.len(), 1, "{first:?}");
+    assert_eq!(first.events[0].kind, LifecycleKind::Fork);
+    let middle = first.events[0].pid;
+    // Wait for the true reparent (intermediate gone, grandchild past
+    // the live target) instead of a fixed sleep.
+    let grandchild: u32 = std::fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let t0 = Instant::now();
+    loop {
+        let ppid = ppid_of(grandchild);
+        assert!(
+            t0.elapsed() < Duration::from_secs(10),
+            "grandchild {grandchild} never reparented (ppid {ppid:?})"
+        );
+        if ppid.is_some_and(|p| p != middle) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_ne!(
+        ppid_of(grandchild),
+        Some(pid),
+        "grandchild must reparent past the live target"
+    );
+    assert_eq!(
+        unsafe { libc::kill(pid as libc::pid_t, 0) },
+        0,
+        "target must outlive the intermediate"
+    );
+    // After the reparent: no Fork recount, no ghost (a same-TGID
+    // Exec from the target's own exec is allowed).
+    let second = lc.poll();
+    assert!(
+        second.events.iter().all(|e| e.kind != LifecycleKind::Fork),
+        "reparent must not recount: {second:?}"
+    );
+    unsafe {
+        libc::kill(grandchild as libc::pid_t, libc::SIGKILL);
+        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+    }
+    let mut status = 0;
+    let r = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
+    assert!(r > 0);
+    assert_reaped(pid);
 }
 
 #[test]
