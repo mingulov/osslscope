@@ -1823,11 +1823,18 @@ where
         let kinds = detect_fence(&self.snapshot, &next);
         self.snapshot = next;
         self.last_live = live.clone();
-        // Fork/exec detection: every NEW child counted once.
+        // Fork/exec detection: every NEW child counted once. Only
+        // Fork events count as ignored: the target's own execs are
+        // fence-tracked by the snapshot generation (counting them
+        // here double-books the observed spawn-exec as ignored).
         let sweep = self.lifecycle.poll();
-        self.fork_exec_ignored = self
-            .fork_exec_ignored
-            .saturating_add(sweep.events.len() as u64);
+        self.fork_exec_ignored = self.fork_exec_ignored.saturating_add(
+            sweep
+                .events
+                .iter()
+                .filter(|e| e.kind == LifecycleKind::Fork)
+                .count() as u64,
+        );
         self.lifecycle_loss = self.lifecycle_loss.saturating_add(sweep.loss);
         // Slow metadata work above (file reads, fence snapshots,
         // lifecycle scan) may have crossed the deadline — or a
@@ -2321,12 +2328,23 @@ where
                 ));
             }
         }
-        // One last lifecycle sweep at window end.
-        let sweep = self.lifecycle.poll();
-        self.fork_exec_ignored = self
-            .fork_exec_ignored
-            .saturating_add(sweep.events.len() as u64);
-        self.lifecycle_loss = self.lifecycle_loss.saturating_add(sweep.loss);
+        // One last lifecycle sweep at window end — skipped once
+        // the owned child has exited: it is reaped by then (its
+        // children reparented, its exe link gone), so a sweep can
+        // only find its own unreadable-exe loss, never activity.
+        // (Fork events only, as in the round sweep above: execs are
+        // fence-tracked, never ignored.)
+        if self.child_exit.is_none() {
+            let sweep = self.lifecycle.poll();
+            self.fork_exec_ignored = self.fork_exec_ignored.saturating_add(
+                sweep
+                    .events
+                    .iter()
+                    .filter(|e| e.kind == LifecycleKind::Fork)
+                    .count() as u64,
+            );
+            self.lifecycle_loss = self.lifecycle_loss.saturating_add(sweep.loss);
+        }
         // TEST HOOK (exit-3 kernel-proof): hold the final drain past
         // close so a still-counting kernel would advance last_ns
         // beyond the window edge. Production behavior unchanged when
@@ -2375,9 +2393,9 @@ where
             Ok(snapshot) => snapshot,
             Err(e) => {
                 let _ = self.target.finish_observation();
-                let recycled = e.downcast_ref::<Recycled>().is_some();
+                let recycled = e.downcast_ref::<Recycled>();
                 match (pre_close, recycled) {
-                    (Some(pre), true) => {
+                    (Some(pre), Some(r)) => {
                         self.extra_loss.push(typed_counter(
                             "discovery.close_join_skipped",
                             CounterKind::Loss,
@@ -2385,7 +2403,12 @@ where
                             CounterSource::Discovery,
                             1,
                         ));
-                        pre
+                        // Prefer the close-time final (a superset of
+                        // the pre-close snapshot: the same polls plus
+                        // the close-time joins and tail count); fall
+                        // back to the pre-close state when the backend
+                        // stages no final.
+                        r.final_snapshot.clone().unwrap_or(pre)
                     }
                     _ => return Err(e.context("discovery finish")),
                 }

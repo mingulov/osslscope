@@ -12,8 +12,8 @@
 
 use osslscope::capture::{Capture, Outcome};
 use osslscope::capture::{
-    ClockPort, Config, DiscoveryPort, LifecycleDelta, LifecycleKind, LifecyclePort, ProcPort,
-    SessionSet, TargetInfo, TargetPort, observe,
+    ClockPort, Config, DiscoveryPort, LifecycleDelta, LifecycleEvent, LifecycleKind, LifecyclePort,
+    ProcPort, SessionSet, TargetInfo, TargetPort, observe,
 };
 use osslscope::count_session::{
     CountBackend, CountSession, DrainedCounts, FakeCountBackend, FakeLink,
@@ -175,6 +175,7 @@ struct FakeDiscovery {
     snapshot: DiscoverySnapshot,
     finish_err: bool,
     finish_recycled: bool,
+    finish_final: Option<DiscoverySnapshot>,
     cancel_flag: Option<Rc<Cell<bool>>>,
     polls_done: usize,
     finished: bool,
@@ -219,11 +220,11 @@ impl DiscoveryPort for FakeDiscovery {
             .push("discovery_finished".to_string());
         if self.finish_recycled {
             // Mirror SessionCore::close on a dead /proc entry: typed
-            // recycle over discarded state (no pre-wipe final: the
-            // fake stages no close-time joins).
+            // recycle over discarded state, with the staged pre-wipe
+            // final when the test provides one.
             return Err(anyhow::Error::new(Recycled {
                 snapshot: DiscoverySnapshot::default(),
-                final_snapshot: None,
+                final_snapshot: self.finish_final.clone(),
             }));
         }
         if self.finish_err {
@@ -589,6 +590,7 @@ struct Harness {
     snapshot: DiscoverySnapshot,
     finish_err: bool,
     finish_recycled: bool,
+    finish_final: Option<DiscoverySnapshot>,
     release_err: bool,
     exit_at_ns: Option<u64>,
     exit_code: i32,
@@ -652,6 +654,7 @@ impl Harness {
             snapshot: DiscoverySnapshot::default(),
             finish_err: false,
             finish_recycled: false,
+            finish_final: None,
             release_err: false,
             exit_at_ns: None,
             exit_code: 0,
@@ -705,6 +708,7 @@ impl Harness {
             snapshot: self.snapshot,
             finish_err: self.finish_err,
             finish_recycled: self.finish_recycled,
+            finish_final: self.finish_final,
             cancel_flag: self.cancel_on_poll.then(|| self.cancelled.clone()),
             polls_done: 0,
             finished: false,
@@ -982,6 +986,113 @@ fn owned_exit_survives_spurious_recycle_at_finish() {
     assert_eq!(counter_value(&c, "discovery.close_join_skipped"), 1);
     assert!(matches!(c.outcome, Outcome::Partial));
     assert!(post.target_log.borrow().finished);
+}
+
+#[test]
+fn spurious_recycle_prefers_close_time_final() {
+    // Same spurious recycle, but the backend stages a close-time
+    // final (pre-wipe joins + tail count): the capture assembles
+    // from the final, not the pre-close snapshot, so the close-time
+    // magnitude reaches the doc instead of dying with the wipe.
+    let mut h = Harness::fresh("exit-recycle-final");
+    h.snapshot_attached();
+    h.exit_at_ns = Some(BASE_NS + 100_000_000);
+    h.exit_code = 7;
+    h.finish_recycled = true;
+    h.finish_final = Some(DiscoverySnapshot {
+        queries_observed: 9,
+        ..DiscoverySnapshot::default()
+    });
+    let (out, _) = h.run();
+    let c = out.unwrap();
+    assert_eq!(c.child_exit, Some(7));
+    assert_eq!(counter_value(&c, "discovery.close_join_skipped"), 1);
+    assert_eq!(counter_value(&c, "discovery.queries_observed"), 9);
+    assert!(matches!(c.outcome, Outcome::Partial));
+}
+
+#[test]
+fn lifecycle_exec_is_fence_tracked_not_ignored() {
+    // One round observes a Fork and an Exec sweep event: only the
+    // fork counts as ignored (untracked child); the target's own
+    // exec is fence-tracked by the snapshot generation, so counting
+    // it here would double-book the observed spawn-exec as ignored.
+    let mut h = Harness::fresh("fork-exec-count");
+    h.snapshot_attached();
+    // Exit lands in the second sleep: exactly one round runs (the
+    // sweep under test), then the loop breaks and closes.
+    h.exit_at_ns = Some(BASE_NS + 250_000_001);
+    h.exit_code = 0;
+    h.lifecycle_polls.push_back(LifecycleDelta {
+        events: vec![
+            LifecycleEvent {
+                kind: LifecycleKind::Fork,
+                pid: 99991,
+            },
+            LifecycleEvent {
+                kind: LifecycleKind::Exec,
+                pid: PID,
+            },
+        ],
+        loss: 0,
+    });
+    let (out, _) = h.run();
+    let c = out.unwrap();
+    assert_eq!(counter_value(&c, "lifecycle.fork_exec_ignored"), 1);
+}
+
+#[test]
+fn final_sweep_skipped_after_owned_exit() {
+    // The owned child exits after one round; the close-time sweep
+    // is skipped (the child is reaped: nothing to scan but the
+    // sweep's own unreadable-exe loss), so a loss-bearing staged
+    // final poll never reaches the doc.
+    let mut h = Harness::fresh("skip-sweep-exited");
+    h.snapshot_attached();
+    // Exit lands in the first sleep: zero rounds run, so the only
+    // lifecycle consumer is the close-time sweep — which must skip
+    // (the child is reaped), leaving the staged loss poll unread.
+    h.exit_at_ns = Some(BASE_NS + 1);
+    h.exit_code = 0;
+    h.lifecycle_polls.push_back(LifecycleDelta {
+        events: vec![],
+        loss: 1,
+    });
+    let (out, _) = h.run();
+    let c = out.unwrap();
+    assert_eq!(c.child_exit, Some(0));
+    assert_eq!(counter_value(&c, "lifecycle.scan_loss"), 0);
+}
+
+#[test]
+fn final_sweep_runs_while_target_lives() {
+    // Guard: the window cut by a signal (no rounds run, child
+    // alive) still sweeps at close — the skip above must not starve
+    // the live path.
+    let mut h = Harness::fresh("sweep-alive");
+    h.snapshot_attached();
+    // Cancel lands during the first round's discovery poll (idx 1;
+    // idx 0 is the setup baseline): the round's sweep consumes the
+    // clean poll, the loop cuts, and the close-time sweep consumes
+    // the loss poll — the skip above must not starve this path.
+    h.cancel_on_poll = true;
+    h.plans.insert(
+        1,
+        FirePlan {
+            fires: Vec::new(),
+            shortfall: 0,
+            cancel: true,
+        },
+    );
+    h.lifecycle_polls.push_back(LifecycleDelta::default());
+    h.lifecycle_polls.push_back(LifecycleDelta {
+        events: vec![],
+        loss: 1,
+    });
+    let (out, _) = h.run();
+    let c = out.unwrap();
+    assert!(c.document.window.signal_cut);
+    assert_eq!(counter_value(&c, "lifecycle.scan_loss"), 1);
 }
 
 #[test]
@@ -2578,6 +2689,7 @@ fn live_observe(
         snapshot,
         finish_err: false,
         finish_recycled,
+        finish_final: None,
         cancel_flag: None,
         polls_done: 0,
         finished: false,
