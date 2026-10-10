@@ -581,7 +581,24 @@ fn assert_no_addr_key(v: &serde_json::Value, path: &str) {
 #[test]
 fn inspect_rows_carry_no_raw_addresses() {
     // Backed rows emit class/backing/hash — never the runtime address.
-    let exe = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+    // Stat-or-None resolution stats the provider arg: stage the test
+    // exe's own identity.
+    use std::os::unix::fs::MetadataExt;
+    let exe_path = std::env::current_exe().unwrap();
+    let exe = std::fs::read(&exe_path).unwrap();
+    let want_ino = std::fs::metadata(&exe_path).unwrap().ino();
+    let base = exe_path.file_name().unwrap().to_string_lossy().into_owned();
+    let mut dev = String::from("08:01");
+    for line in std::fs::read_to_string("/proc/self/maps").unwrap().lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() >= 6
+            && f[5].rsplit('/').next() == Some(base.as_str())
+            && f[4].parse::<u64>().ok() == Some(want_ino)
+        {
+            dev = f[3].to_string();
+            break;
+        }
+    }
     let elf = osslscope::discovery::elf::parse_elf(&exe).unwrap();
     let ph = elf
         .program_headers
@@ -596,9 +613,9 @@ fn inspect_rows_carry_no_raw_addresses() {
         end: 0x1000 + ph.p_filesz,
         x: true,
         offset: ph.p_offset,
-        dev: "08:01".to_string(),
-        ino: 42,
-        path: "t".to_string(),
+        dev,
+        ino: want_ino,
+        path: exe_path.to_string_lossy().into_owned(),
     }];
     let rows = vec![
         Row {
@@ -631,7 +648,7 @@ fn inspect_rows_carry_no_raw_addresses() {
     ];
     let doc = schema::emit(
         "t",
-        std::path::Path::new("t"),
+        &exe_path,
         "",
         &exe,
         &maps,
