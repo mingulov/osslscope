@@ -136,7 +136,8 @@ pub fn openssl_line(ev: &Evidence) -> Option<&'static str> {
     Some(if ev.has_engine_by_id { "3.x" } else { "4.x" })
 }
 
-/// Classify a candidate libcrypto's disk-ELF bytes.
+/// Classify a candidate libcrypto's disk-ELF bytes (dynamic
+/// symbols: the dynamically-linked case).
 pub fn classify_elf(bytes: &[u8]) -> anyhow::Result<(Flavor, Evidence)> {
     let obj = goblin::Object::parse(bytes)?;
     let goblin::Object::Elf(elf) = obj else {
@@ -147,6 +148,34 @@ pub fn classify_elf(bytes: &[u8]) -> anyhow::Result<(Flavor, Evidence)> {
         .iter()
         .filter_map(|s| elf.dynstrtab.get_at(s.st_name))
         .collect();
+    Ok(classify_named(names.into_iter(), &elf, bytes))
+}
+
+/// Classify with static symbol-table names unioned in: a
+/// non-rdynamic static exe keeps its anchors only in `.symtab`,
+/// invisible to [`classify_elf`]. Same rules, wider name set —
+/// the static-candidate entry point.
+pub fn classify_elf_with_symtab(bytes: &[u8]) -> anyhow::Result<(Flavor, Evidence)> {
+    let obj = goblin::Object::parse(bytes)?;
+    let goblin::Object::Elf(elf) = obj else {
+        anyhow::bail!("not an ELF object")
+    };
+    let mut names: Vec<&str> = elf
+        .dynsyms
+        .iter()
+        .filter_map(|s| elf.dynstrtab.get_at(s.st_name))
+        .collect();
+    names.extend(elf.syms.iter().filter_map(|s| elf.strtab.get_at(s.st_name)));
+    Ok(classify_named(names.into_iter(), &elf, bytes))
+}
+
+/// Shared rule application: rodata version-string scan plus
+/// [`classify_symbols`] (single home; both entry points agree).
+fn classify_named<'a>(
+    names: impl Iterator<Item = &'a str>,
+    elf: &goblin::elf::Elf,
+    bytes: &[u8],
+) -> (Flavor, Evidence) {
     // Scan all PROGBITS sections for the version string (cheap; discovery-time only).
     let mut rodata = Vec::new();
     for sh in elf.section_headers.iter() {
@@ -158,7 +187,7 @@ pub fn classify_elf(bytes: &[u8]) -> anyhow::Result<(Flavor, Evidence)> {
             }
         }
     }
-    Ok(classify_symbols(names.into_iter(), &rodata))
+    classify_symbols(names, &rodata)
 }
 
 #[cfg(test)]

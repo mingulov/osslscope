@@ -520,6 +520,98 @@ pub fn find_libcrypto(maps: &[maps::Mapping]) -> Option<String> {
         .map(|m| m.path.clone())
 }
 
+/// Address-taken (GLOB_DAT) coverage summary for onboarding
+/// diagnostics (total: never errors — unscannable inputs land in
+/// `skipped_modules`/`unknown`). Same scan + definer + taxonomy
+/// rules as [`probes_for`] (libcrypto plus every scannable caller
+/// are definers), so doctor's caveat agrees with the backend plan.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AddressTakenSummary {
+    /// Caller modules scanned (taxonomy or not).
+    pub scanned_modules: u64,
+    /// Modules that could not be scanned (imports unknown), in scan
+    /// order; libcrypto itself appears here when its bytes do not
+    /// parse (then every import is `unknown`).
+    pub skipped_modules: Vec<String>,
+    /// Taxonomy imports seen across scanned callers.
+    pub taxonomy_imports: u64,
+    /// Of those: resolved to exactly one FUNC definition.
+    pub resolved: u64,
+    /// Of those: defined in two or more scanned objects.
+    pub ambiguous: u64,
+    /// Of those: defined nowhere scanned.
+    pub absent: u64,
+    /// Of those: resolution itself failed (unscannable definers).
+    pub unknown: u64,
+}
+
+/// Summarize caller-attributed address-taken coverage: scan every
+/// caller for taxonomy GLOB_DAT imports, resolve each against
+/// libcrypto plus the scannable callers. Every taxonomy import
+/// lands in exactly one bucket; all buckets stay uninstrumented
+/// gaps downstream (diagnostic facts only, never probes).
+pub fn address_taken_summary(libcrypto: &Module, callers: &[Module]) -> AddressTakenSummary {
+    let mut out = AddressTakenSummary::default();
+    let lib_ok = elf::dynsym_func_entries(libcrypto.bytes).is_ok();
+    if !lib_ok {
+        out.skipped_modules.push(libcrypto.path.to_string());
+    }
+    // Pass 1: scan (mirrors probes_for pass 1).
+    let mut per_caller: Vec<Option<Vec<String>>> = Vec::with_capacity(callers.len());
+    for c in callers {
+        match elf::glob_dat_imports(c.bytes) {
+            Ok(all) => {
+                out.scanned_modules += 1;
+                per_caller.push(Some(all.into_iter().filter(|n| is_taxonomy(n)).collect()));
+            }
+            Err(_) => {
+                out.skipped_modules.push(c.path.to_string());
+                per_caller.push(None);
+            }
+        }
+    }
+    // Without libcrypto as a definer the backend plan itself
+    // fails: every import is unknown (never resolved over a silent
+    // subset that could claim Resolved where the full set is
+    // Ambiguous — same rule as resolve_address_taken's callers).
+    if !lib_ok {
+        out.taxonomy_imports = per_caller.iter().flatten().flatten().count() as u64;
+        out.unknown = out.taxonomy_imports;
+        return out;
+    }
+    // Pass 2: resolve (mirrors probes_for definers).
+    let mut definers: Vec<Module> = Vec::with_capacity(callers.len() + 1);
+    definers.push(Module {
+        path: libcrypto.path,
+        bytes: libcrypto.bytes,
+    });
+    for (c, scan) in callers.iter().zip(per_caller.iter()) {
+        if scan.is_some() {
+            definers.push(Module {
+                path: c.path,
+                bytes: c.bytes,
+            });
+        }
+    }
+    for scan in per_caller.into_iter().flatten() {
+        out.taxonomy_imports += scan.len() as u64;
+        if scan.is_empty() {
+            continue;
+        }
+        match resolve_address_taken(&scan, &definers) {
+            Ok(r) => {
+                out.resolved += r.resolved.len() as u64;
+                out.ambiguous += r.ambiguous.len() as u64;
+                out.absent += r.absent.len() as u64;
+            }
+            Err(_) => {
+                out.unknown += scan.len() as u64;
+            }
+        }
+    }
+    out
+}
+
 /// Route one address-taken gap pair to its class bucket.
 /// Exact-class priority mirrors [`module_plan`]: ENGINE/METH exact
 /// names win over low-level prefix text (`RSA_meth_new` is meth,

@@ -20,6 +20,20 @@
 //!   exit 6 owns pidfd/starttime pinning for evidence paths.
 //! - Panics are avoid-by-construction (no unwrap on fallible paths);
 //!   internal errors exit 1 via anyhow.
+//!
+//! T12 onboarding agreement: target/object verdicts come from the
+//! same [`crate::discovery::onboard`] qualification the backend
+//! runs, so doctor cannot drift from `report`/`check`. Qualification
+//! is three-way — Supported (attach now), Unsupported (never
+//! supportable: arch/flavor), Unknown (stripped unenrolled build:
+//! needs `--table` enrollment) — and privilege/capability,
+//! target-support, and cold/coverage caveats are independent rows:
+//! a caps failure never masks a target verdict and vice versa.
+use crate::discovery::legacy;
+use crate::discovery::maps;
+use crate::discovery::onboard::{self, LibcryptoMaps, QualifyOpts, TargetQualification};
+use crate::discovery::provider::{ProviderTable, ResolutionInputs, resolve_provider_class};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -709,58 +723,6 @@ fn self_uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
-enum LibcryptoHit {
-    None,
-    Deleted,
-    One { path: String },
-    Multi { paths: Vec<String> },
-}
-
-fn find_libcrypto(maps: &[crate::discovery::maps::Mapping]) -> LibcryptoHit {
-    use std::collections::BTreeMap;
-    let mut by_file: BTreeMap<(String, u64), String> = BTreeMap::new();
-    let mut deleted_only = false;
-    for m in maps {
-        if !m.path.contains("libcrypto.so") {
-            continue;
-        }
-        if m.path.contains("(deleted)") {
-            deleted_only = true;
-            continue;
-        }
-        by_file
-            .entry((m.dev.clone(), m.ino))
-            .or_insert_with(|| m.path.clone());
-    }
-    let mut paths: Vec<String> = by_file.into_values().collect();
-    match paths.len() {
-        0 if deleted_only => LibcryptoHit::Deleted,
-        0 => LibcryptoHit::None,
-        1 => LibcryptoHit::One {
-            path: paths.pop().unwrap(),
-        },
-        _ => {
-            paths.sort();
-            LibcryptoHit::Multi { paths }
-        }
-    }
-}
-
-fn arch_name(machine: u16) -> String {
-    // EM_ numbers per /usr/include/elf.h.
-    match machine {
-        3 => "i386".into(),
-        20 => "PowerPC".into(),
-        21 => "PowerPC64".into(),
-        22 => "s390x".into(),
-        40 => "ARM".into(),
-        62 => "x86-64".into(),
-        183 => "AArch64".into(),
-        243 => "RISC-V".into(),
-        n => format!("EM_{n}"),
-    }
-}
-
 fn evidence_str(ev: &crate::discovery::flavor::Evidence) -> String {
     format!(
         "anchors: provider_load={} version_major={} engine={} boring_prefix={} awslc_prefix={}",
@@ -1059,7 +1021,170 @@ fn check_seccomp(env: &Env) -> Check {
     }
 }
 
+// ---- installed objects + coverage caveats (T12/R09) ----
+
+/// Installed-object rows (both roles): explicit paths validate
+/// individually; a fully automatic pair resolves from the first
+/// trusted dir holding a complete pair — the same primitives the
+/// backend composes, so doctor agrees with `report`/`check`. A
+/// failed pair fails both rows (neither role is usable without
+/// its mate).
+fn objects_checks(harvest: Option<&str>, count: Option<&str>) -> Vec<Check> {
+    use onboard::ObjectRole::{Count, Harvest};
+    let row = |role: onboard::ObjectRole,
+               r: Result<PathBuf, onboard::OnboardError>,
+               how: &str|
+     -> Check {
+        let (id, noun) = match role {
+            Harvest => ("objects-harvest", "harvest"),
+            Count => ("objects-count", "count"),
+        };
+        match r {
+            Ok(path) => Check::pass(
+                id,
+                format!("{noun} object: {} ({how}, compatible)", path.display()),
+            ),
+            Err(e) => Check::fail(id, e.message, e.remediation),
+        }
+    };
+    let dirs = onboard::default_object_dirs();
+    let trust = onboard::TrustPolicy::production();
+    let mut search = onboard::ObjectSearch::default();
+    match (harvest, count) {
+        (Some(h), Some(c)) => vec![
+            row(
+                Harvest,
+                onboard::resolve_explicit(Harvest, Path::new(h)),
+                "explicit",
+            ),
+            row(
+                Count,
+                onboard::resolve_explicit(Count, Path::new(c)),
+                "explicit",
+            ),
+        ],
+        (Some(h), None) => vec![
+            row(
+                Harvest,
+                onboard::resolve_explicit(Harvest, Path::new(h)),
+                "explicit",
+            ),
+            row(
+                Count,
+                onboard::resolve_implicit_role(Count, &dirs, &trust, &mut search),
+                "installed",
+            ),
+        ],
+        (None, Some(c)) => vec![
+            row(
+                Harvest,
+                onboard::resolve_implicit_role(Harvest, &dirs, &trust, &mut search),
+                "installed",
+            ),
+            row(
+                Count,
+                onboard::resolve_explicit(Count, Path::new(c)),
+                "explicit",
+            ),
+        ],
+        (None, None) => match onboard::resolve_implicit_pair(&dirs, &trust, &mut search) {
+            Ok(pair) => vec![
+                Check::pass(
+                    "objects-harvest",
+                    format!(
+                        "harvest object: {} (installed, compatible)",
+                        pair.harvest.display()
+                    ),
+                ),
+                Check::pass(
+                    "objects-count",
+                    format!(
+                        "count object: {} (installed, compatible)",
+                        pair.count.display()
+                    ),
+                ),
+            ],
+            Err(e) => vec![
+                Check::fail("objects-harvest", e.message.clone(), e.remediation.clone()),
+                Check::fail("objects-count", e.message, e.remediation),
+            ],
+        },
+    }
+}
+
+/// Maximum caller modules doctor scans for the address-taken
+/// caveat (diagnostic bound, disclosed in the row on truncation).
+const DOCTOR_SCAN_MODULES: usize = 32;
+/// Maximum module file size doctor reads for the caveat scan.
+const DOCTOR_SCAN_MAX_BYTES: u64 = 64 << 20;
+/// Maximum total bytes doctor reads across the caveat scan.
+const DOCTOR_SCAN_TOTAL_BUDGET: u64 = 256 << 20;
+
+/// Coverage-caveat rows for a live target (all info, never fail):
+/// cold-start, auto-discovery scope, and the bounded address-taken
+/// summary (same scan/resolution rules as the backend plan).
+fn coverage_checks(maps: &[maps::Mapping], libcrypto: &str, lib_bytes: &[u8]) -> Vec<Check> {
+    let mut out = vec![
+        Check::info(
+            "coverage-cold-start",
+            "--pid cannot see pre-attach history (cold-start gap); prefer `run --` when first-call coverage matters".into(),
+        ),
+        Check::info(
+            "coverage-scope",
+            "automatic discovery observes the in-libcrypto default provider; file providers need explicit --provider".into(),
+        ),
+    ];
+    let modules = legacy::target_modules(maps, libcrypto);
+    let mut owned: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut skipped_io: u64 = 0;
+    let mut total: u64 = 0;
+    for m in modules.iter().take(DOCTOR_SCAN_MODULES) {
+        // Bounded per file (oversize/I/O skips, disclosed below) plus
+        // a total budget across the scan.
+        match onboard::read_bounded(Path::new(m), DOCTOR_SCAN_MAX_BYTES) {
+            Ok(b) if total + b.len() as u64 <= DOCTOR_SCAN_TOTAL_BUDGET => {
+                total += b.len() as u64;
+                owned.push((m.clone(), b));
+            }
+            _ => skipped_io += 1,
+        }
+    }
+    let truncated = modules.len().saturating_sub(DOCTOR_SCAN_MODULES);
+    let callers: Vec<legacy::Module> = owned
+        .iter()
+        .map(|(p, b)| legacy::Module {
+            path: p.as_str(),
+            bytes: b,
+        })
+        .collect();
+    let lib_mod = legacy::Module {
+        path: libcrypto,
+        bytes: lib_bytes,
+    };
+    let s = legacy::address_taken_summary(&lib_mod, &callers);
+    let mut message = format!(
+        "{} taxonomy address-taken imports across {} scanned modules ({} resolved, {} ambiguous, {} absent, {} unknown)",
+        s.taxonomy_imports, s.scanned_modules, s.resolved, s.ambiguous, s.absent, s.unknown,
+    );
+    let skipped = s.skipped_modules.len() as u64 + skipped_io + truncated as u64;
+    if skipped > 0 {
+        message.push_str(&format!(
+            "; {skipped} modules skipped (unreadable/oversize/bounds)"
+        ));
+    }
+    message.push_str(" — all stay uninstrumented gaps (see lowlevel-fallback-uninstrumented)");
+    out.push(Check::info("coverage-address-taken", message));
+    out
+}
+
 // ---- target assembly ----
+
+fn base_name(p: &Path) -> String {
+    p.file_name()
+        .and_then(|b| b.to_str())
+        .unwrap_or("?")
+        .to_string()
+}
 
 struct Target {
     exe: String,
@@ -1170,59 +1295,148 @@ fn check_foreign_uid(pid: u32, tuid: u32, env: &Env) -> Check {
     }
 }
 
-fn check_libcrypto_bytes(path: &str, table: &crate::discovery::builtin::Table) -> Vec<Check> {
+/// Qualification inputs shared by every target byte check (one
+/// construction per doctor run; the same values the backend would
+/// use for this target, so rows agree with `report`/`check`).
+struct TargetCtx<'a> {
+    table: &'a crate::discovery::builtin::Table,
+    table_explicit: bool,
+    force_offset: Option<u64>,
+    enrollment: &'a ProviderTable,
+}
+
+impl<'a> TargetCtx<'a> {
+    fn opts(&self) -> QualifyOpts<'a> {
+        QualifyOpts {
+            offset_table: self.table,
+            offset_table_explicit: self.table_explicit,
+            force_offset: self.force_offset,
+            enrollment: self.enrollment,
+            builtin_asserted: true,
+        }
+    }
+}
+
+/// `dispatch-anchor` row from a backend qualification (pure): the
+/// verdict row that agrees with what `report`/`check` would do for
+/// this target — Supported (attach now), Unsupported (never
+/// supportable), Unknown (needs `--table` enrollment).
+fn anchor_check(qual: &TargetQualification) -> Check {
+    match qual {
+        TargetQualification::Supported(t) => {
+            let via = t.resolution.map(|r| r.as_str()).unwrap_or("init-anchor");
+            let off = t
+                .query_offset
+                .map(|o| format!(" (offset {o:#x})"))
+                .unwrap_or_default();
+            if t.resolution == Some(crate::discovery::builtin::Resolution::Forced) {
+                Check::pass(
+                    "dispatch-anchor",
+                    format!("supported via force{off} (operator-selected; validated at attach)"),
+                )
+            } else {
+                Check::pass("dispatch-anchor", format!("supported via {via}{off}"))
+            }
+        }
+        TargetQualification::Unsupported {
+            reason,
+            remediation,
+        } => Check::fail(
+            "dispatch-anchor",
+            format!("unsupported target: {reason}"),
+            remediation.clone(),
+        ),
+        TargetQualification::Unknown {
+            reason,
+            remediation,
+        } => Check::fail(
+            "dispatch-anchor",
+            format!("unqualified build: {reason}"),
+            remediation.clone(),
+        ),
+    }
+}
+
+/// `provider-class` row from pinned enrollment / builtin assertion
+/// (pure, never fails: an unknown class is honest, not blocking —
+/// the backend observes with an opaque identity).
+fn class_check(build_id: Option<&str>, enrollment: &ProviderTable) -> Check {
+    let class = resolve_provider_class(&ResolutionInputs {
+        build_id,
+        table: enrollment,
+        builtin_asserted: true,
+    });
+    match class {
+        Some(c) => {
+            let pinned = build_id.and_then(|id| enrollment.by_build_id(id)).is_some();
+            let basis = if pinned {
+                "pinned enrollment"
+            } else {
+                "operator builtin assertion"
+            };
+            let mut message = format!("provider class: {} ({basis})", c.as_str());
+            if c == crate::discovery::provider::ProviderClass::Fips {
+                message.push_str(" — provenance metadata, not a certification claim");
+            }
+            Check::pass("provider-class", message)
+        }
+        None => Check::info(
+            "provider-class",
+            "unknown provider class (no enrollment; runtime uses an opaque third-party identity)"
+                .into(),
+        ),
+    }
+}
+
+fn target_file_unreadable(path: &str, e: &onboard::ReadBoundedError) -> Check {
+    Check::fail(
+        "libcrypto-found",
+        format!("libcrypto file unreadable ({path}): {e}"),
+        "check the path/permissions (deleted underfoot?)".into(),
+    )
+}
+
+/// Target rows over already-read bytes (one bounded read shared
+/// with coverage scans — never re-read unbounded a file that
+/// qualification already bounded).
+fn check_target_bytes(path: &str, bytes: &[u8], ctx: &TargetCtx) -> Vec<Check> {
+    let mut out = vec![Check::pass("libcrypto-found", format!("libcrypto: {path}"))];
+    out.extend(check_byte_rows(path, bytes, false, ctx));
+    out
+}
+
+/// Target file checks: presence row plus the byte rows below.
+fn check_target_file(path: &str, ctx: &TargetCtx) -> Vec<Check> {
+    match onboard::read_bounded(Path::new(path), onboard::MAX_OBJECT_SCAN_BYTES) {
+        Ok(bytes) => check_target_bytes(path, &bytes, ctx),
+        Err(e) => vec![target_file_unreadable(path, &e)],
+    }
+}
+
+/// Byte rows over target bytes: arch → flavor → build-id (fact) →
+/// dispatch-anchor (verdict) → provider-class. Arch/flavor failures
+/// stop early (Unsupported can never qualify); the anchor verdict
+/// always comes from the backend qualification.
+fn check_byte_rows(path: &str, bytes: &[u8], static_exe: bool, ctx: &TargetCtx) -> Vec<Check> {
     let mut out = Vec::new();
-    let bytes = match std::fs::read(path) {
-        Ok(b) => b,
-        Err(e) => {
-            out.push(Check::fail(
-                "libcrypto-found",
-                format!("libcrypto file unreadable ({path}): {e}"),
-                "check the path/permissions (deleted underfoot?)".into(),
-            ));
-            return out;
-        }
-    };
-    out.push(Check::pass("libcrypto-found", format!("libcrypto: {path}")));
-    if bytes.len() < 20 {
+    if let Err(e) = onboard::check_arch(bytes) {
         out.push(Check::fail(
             "arch",
-            format!("libcrypto file too small ({}B, truncated?)", bytes.len()),
-            "not a usable ELF object".into(),
-        ));
-        return out;
-    }
-    // EI_CLASS + e_machine by raw offset (no parser dependence).
-    match bytes[4] {
-        2 => {}
-        1 => {
-            out.push(Check::fail(
-                "arch",
-                "32-bit target libcrypto (ELFCLASS32) — v1 x86-64 only".into(),
-                "run against a 64-bit OpenSSL build".into(),
-            ));
-            return out;
-        }
-        n => {
-            out.push(Check::fail(
-                "arch",
-                format!("unknown EI_CLASS {n} — v1 x86-64 only"),
-                "run against a 64-bit OpenSSL build".into(),
-            ));
-            return out;
-        }
-    }
-    let machine = u16::from_le_bytes([bytes[18], bytes[19]]);
-    if machine != 62 {
-        out.push(Check::fail(
-            "arch",
-            format!("arch {} — v1 x86-64 only", arch_name(machine)),
+            e,
             "run against a 64-bit x86-64 OpenSSL build".into(),
         ));
         return out;
     }
     out.push(Check::pass("arch", "x86-64 (ELFCLASS64, EM_X86_64)".into()));
-    match crate::discovery::flavor::classify_elf(&bytes) {
+    // Static candidates classify with symtab names unioned in (same
+    // rule as backend qualification — a non-rdynamic static exe
+    // keeps anchors only in `.symtab`).
+    let classified = if static_exe {
+        crate::discovery::flavor::classify_elf_with_symtab(bytes)
+    } else {
+        crate::discovery::flavor::classify_elf(bytes)
+    };
+    match classified {
         Ok((flavor, ev)) => {
             use crate::discovery::flavor::Flavor;
             match flavor {
@@ -1238,7 +1452,7 @@ fn check_libcrypto_bytes(path: &str, table: &crate::discovery::builtin::Table) -
                     out.push(Check::fail(
                         "flavor",
                         format!("lookalike libcrypto ({flavor:?}): provider model absent — harvest REFUSED ({})", evidence_str(&ev)),
-                        "v1 supports genuine OpenSSL only (P5 qualifies forks)".into(),
+                        "osslscope supports genuine OpenSSL 3.x/4.x only".into(),
                     ));
                     return out;
                 }
@@ -1246,14 +1460,19 @@ fn check_libcrypto_bytes(path: &str, table: &crate::discovery::builtin::Table) -
                     out.push(Check::fail(
                         "flavor",
                         format!("unrecognized crypto library (no OpenSSL anchors, no fork prefix) — REFUSED fail-closed ({})", evidence_str(&ev)),
-                        "v1 supports genuine OpenSSL only".into(),
+                        "osslscope supports genuine OpenSSL 3.x/4.x only".into(),
                     ));
                     return out;
                 }
                 Flavor::NotCrypto => {
+                    let message = if static_exe {
+                        "static exe is not OpenSSL (no libcrypto present and the exe is not a crypto library)".to_string()
+                    } else {
+                        "mapped libcrypto.so is not a crypto library (path confusion?)".to_string()
+                    };
                     out.push(Check::fail(
                         "flavor",
-                        "mapped libcrypto.so is not a crypto library (path confusion?)".into(),
+                        message,
                         "check which file the target maps".into(),
                     ));
                     return out;
@@ -1269,43 +1488,64 @@ fn check_libcrypto_bytes(path: &str, table: &crate::discovery::builtin::Table) -
             return out;
         }
     }
-    match crate::discovery::elf::read_build_id(&bytes) {
-        None => out.push(Check::fail(
+    // Build-id is a fact row, not the verdict: an unknown id with
+    // a symtab still qualifies (see dispatch-anchor).
+    let build_id = crate::discovery::elf::read_build_id(bytes);
+    match &build_id {
+        None => out.push(Check::info(
             "build-id",
-            "no GNU build-id in target libcrypto (custom build or stripped notes?)".into(),
-            "enroll the build: add build-id + query_offset to etc/build-id-table.json (see exit-6 privilege doc)".into(),
+            "no GNU build-id in target libcrypto (custom build or stripped notes?) — symtab may still qualify; see dispatch-anchor".into(),
         )),
-        Some(bid) => match table.by_build_id(&bid) {
+        Some(bid) => match ctx.table.by_build_id(bid) {
             Some(e) => out.push(Check::pass(
                 "build-id",
                 format!("known build {bid} (OpenSSL {}, query_offset {})", e.openssl, e.query_offset),
             )),
-            None => out.push(Check::fail(
+            None => out.push(Check::info(
                 "build-id",
-                format!("unknown build-id {bid} (not in frozen table of {} entries) — custom libcrypto build?", table.entry_count()),
-                "anchor+delta fallback may work (inspect tries it); enroll via etc/build-id-table.json".into(),
+                format!("unknown build-id {bid} (not in table of {} entries) — custom libcrypto build? see dispatch-anchor", ctx.table.entry_count()),
             )),
         },
     }
+    // Backend-agreement verdict rows (same qualification the
+    // backend runs for this target + flags).
+    let qual = onboard::qualify_libcrypto_bytes(bytes, Path::new(path), static_exe, &ctx.opts());
+    out.push(anchor_check(&qual));
+    out.push(class_check(build_id.as_deref(), ctx.enrollment));
     out
 }
 
 // ---- entry point ----
 
-const USAGE: &str =
-    "usage: osslscope doctor [--pid PID | --libcrypto PATH] [--table FILE] [--format human|json]";
+const USAGE: &str = "usage: osslscope doctor [--pid PID | --libcrypto PATH | --exe PATH] [--table FILE] [--force-offset N] [--provider-table FILE] [--object O] [--count-object C] [--format human|json]";
 
 pub fn run(args: &[String]) -> ExitCode {
     let mut pid: Option<u32> = None;
     let mut libcrypto: Option<String> = None;
+    let mut exe_path: Option<String> = None;
     let mut table_path: Option<String> = None;
+    let mut force_offset_raw: Option<String> = None;
+    let mut provider_table_path: Option<String> = None;
+    let mut object: Option<String> = None;
+    let mut count_object: Option<String> = None;
     let mut format = "human".to_string();
     let mut it = args.iter();
     while let Some(a) = it.next() {
         if a == "--help" || a == "-h" {
             println!("{USAGE}");
-            println!("  no target: environment preflight (kernel, caps, LSM, lockdown)");
-            println!("  --pid PID | --libcrypto PATH: also vet the target");
+            println!("  no target: environment + installed-objects preflight");
+            println!(
+                "  --pid PID | --libcrypto PATH | --exe PATH: also vet the target (same qualification as report/check)"
+            );
+            println!(
+                "  --exe PATH: pre-exec spawn prediction (same rule as `run --` automatic discovery)"
+            );
+            println!(
+                "  --table FILE | --force-offset N | --provider-table FILE: vet with explicit local enrollment"
+            );
+            println!(
+                "  --object O | --count-object C: vet explicit BPF objects instead of installed defaults"
+            );
             println!("  --format human|json (default human)");
             return ExitCode::SUCCESS;
         }
@@ -1318,7 +1558,12 @@ pub fn run(args: &[String]) -> ExitCode {
             match a.as_str() {
                 "--pid" => pid = Some(val(&mut it)?.parse().map_err(|_| "bad --pid")?),
                 "--libcrypto" => libcrypto = Some(val(&mut it)?),
+                "--exe" => exe_path = Some(val(&mut it)?),
                 "--table" => table_path = Some(val(&mut it)?),
+                "--force-offset" => force_offset_raw = Some(val(&mut it)?),
+                "--provider-table" => provider_table_path = Some(val(&mut it)?),
+                "--object" => object = Some(val(&mut it)?),
+                "--count-object" => count_object = Some(val(&mut it)?),
                 "--format" => {
                     let f = val(&mut it)?;
                     if f != "human" && f != "json" {
@@ -1335,8 +1580,15 @@ pub fn run(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     }
-    if pid.is_some() && libcrypto.is_some() {
-        eprintln!("osslscope doctor: use one target selector (--pid or --libcrypto)\n{USAGE}");
+    if [pid.is_some(), libcrypto.is_some(), exe_path.is_some()]
+        .into_iter()
+        .filter(|b| *b)
+        .count()
+        > 1
+    {
+        eprintln!(
+            "osslscope doctor: use one target selector (--pid, --libcrypto, or --exe)\n{USAGE}"
+        );
         return ExitCode::from(2);
     }
     // Build-id table: shipped frozen, --table overrides. Needed only
@@ -1362,6 +1614,34 @@ pub fn run(args: &[String]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    // Explicit local enrollment for the vetting below (same early
+    // usage-error shape as report/check).
+    let enrollment = match &provider_table_path {
+        Some(p) => match onboard::load_enrollment_file(Path::new(p)) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("osslscope doctor: {}", e.full());
+                return ExitCode::from(2);
+            }
+        },
+        None => ProviderTable::empty(),
+    };
+    let force_offset = match &force_offset_raw {
+        Some(s) => match crate::args::parse_force_offset(s) {
+            Ok(n) => Some(n),
+            Err(e) => {
+                eprintln!("osslscope doctor: {e}");
+                return ExitCode::from(2);
+            }
+        },
+        None => None,
+    };
+    let tctx = TargetCtx {
+        table: &table,
+        table_explicit: table_path.is_some(),
+        force_offset,
+        enrollment: &enrollment,
+    };
     if pid.is_some_and(|p| !std::path::Path::new(&format!("/proc/{p}")).exists()) {
         eprintln!("osslscope doctor: no such process {} (died?)", pid.unwrap());
         return ExitCode::from(2);
@@ -1378,6 +1658,7 @@ pub fn run(args: &[String]) -> ExitCode {
         check_lsm(&env),
         check_seccomp(&env),
     ];
+    checks.extend(objects_checks(object.as_deref(), count_object.as_deref()));
 
     let mut target: Option<Target> = None;
     if let Some(p) = pid {
@@ -1388,31 +1669,58 @@ pub fn run(args: &[String]) -> ExitCode {
         match crate::discovery::maps::read_maps(p) {
             Ok(maps) => {
                 checks.push(Check::pass("target-access", "target maps readable".into()));
-                match find_libcrypto(&maps) {
-                    LibcryptoHit::One { path } => {
+                match onboard::libcrypto_from_maps(&maps) {
+                    LibcryptoMaps::One { path } => {
                         target = Some(Target {
                             exe,
                             uid: Some(tuid),
                             self_uid: self_uid(),
                             libcrypto: Some(path.clone()),
                         });
-                        checks.extend(check_libcrypto_bytes(&path, &table));
+                        // One bounded read shared by rows + coverage
+                        // (never re-read unbounded a file that
+                        // qualification already bounded).
+                        match onboard::read_bounded(
+                            Path::new(&path),
+                            onboard::MAX_OBJECT_SCAN_BYTES,
+                        ) {
+                            Ok(bytes) => {
+                                checks.extend(check_target_bytes(&path, &bytes, &tctx));
+                                checks.extend(coverage_checks(&maps, &path, &bytes));
+                            }
+                            Err(e) => checks.push(target_file_unreadable(&path, &e)),
+                        }
                     }
-                    LibcryptoHit::None => {
+                    LibcryptoMaps::None => {
                         target = Some(Target {
                             exe,
                             uid: Some(tuid),
                             self_uid: self_uid(),
                             libcrypto: None,
                         });
-                        checks.push(Check::fail(
-                            "libcrypto-found",
-                            "no libcrypto.so mapped in target (static link? non-crypto process?)"
-                                .into(),
-                            "inspect needs a dynamically-linked libcrypto target".into(),
-                        ));
+                        // Static candidate: the exe itself may link
+                        // OpenSSL (same discovery rule as the backend).
+                        let exe_link = format!("/proc/{p}/exe");
+                        let exe_path = Path::new(&exe_link);
+                        match onboard::read_bounded(exe_path, onboard::MAX_OBJECT_SCAN_BYTES) {
+                            Ok(bytes) => {
+                                checks.push(Check::info(
+                                    "libcrypto-found",
+                                    format!("no libcrypto mapped; static candidate: {exe_link}"),
+                                ));
+                                checks.extend(check_byte_rows(&exe_link, &bytes, true, &tctx));
+                                checks.extend(coverage_checks(&maps, &exe_link, &bytes));
+                            }
+                            Err(e) => {
+                                checks.push(Check::fail(
+                                    "libcrypto-found",
+                                    format!("no libcrypto mapped and target exe unreadable: {e}"),
+                                    "run as the target uid, or grant cap_sys_ptrace file cap and re-run".into(),
+                                ));
+                            }
+                        }
                     }
-                    LibcryptoHit::Deleted => {
+                    LibcryptoMaps::Deleted => {
                         target = Some(Target {
                             exe,
                             uid: Some(tuid),
@@ -1425,7 +1733,7 @@ pub fn run(args: &[String]) -> ExitCode {
                             "restart the target".into(),
                         ));
                     }
-                    LibcryptoHit::Multi { paths } => {
+                    LibcryptoMaps::Multi { paths } => {
                         target = Some(Target {
                             exe,
                             uid: Some(tuid),
@@ -1463,13 +1771,8 @@ pub fn run(args: &[String]) -> ExitCode {
             }
         }
     } else if let Some(path) = libcrypto {
-        let base = std::path::Path::new(&path)
-            .file_name()
-            .and_then(|b| b.to_str())
-            .unwrap_or("?")
-            .to_string();
         target = Some(Target {
-            exe: base,
+            exe: base_name(Path::new(&path)),
             uid: None,
             self_uid: self_uid(),
             libcrypto: Some(path.clone()),
@@ -1486,7 +1789,119 @@ pub fn run(args: &[String]) -> ExitCode {
             "target-access",
             "libcrypto file given directly (--libcrypto)".into(),
         ));
-        checks.extend(check_libcrypto_bytes(&path, &table));
+        checks.extend(check_target_file(&path, &tctx));
+        checks.push(Check::info(
+            "coverage-scope",
+            "automatic discovery observes the in-libcrypto default provider; file providers need explicit --provider".into(),
+        ));
+    } else if let Some(exe_arg) = exe_path {
+        // --exe: pre-exec spawn prediction (same rule as `run --`
+        // automatic discovery). The child would inherit our
+        // environment, so current PATH/LD_LIBRARY_PATH predict it.
+        let path_var = std::env::var("PATH").unwrap_or_else(|_| "/bin:/usr/bin".to_string());
+        let ld_var = std::env::var("LD_LIBRARY_PATH").ok();
+        let spenv = onboard::SpawnEnv {
+            path: &path_var,
+            ld_library_path: ld_var.as_deref(),
+        };
+        let argv = vec![exe_arg.clone()];
+        checks.push(Check::info(
+            "pidns",
+            "no process target (--exe predicts pre-exec)".into(),
+        ));
+        checks.push(Check::info(
+            "foreign-uid",
+            "no process target (--exe predicts pre-exec)".into(),
+        ));
+        match onboard::predict_spawn_lib(&argv, &spenv) {
+            Err(e) => {
+                target = Some(Target {
+                    exe: exe_arg.clone(),
+                    uid: None,
+                    self_uid: self_uid(),
+                    libcrypto: None,
+                });
+                checks.push(Check::fail("target-access", e.message, e.remediation));
+            }
+            Ok(pred) => {
+                checks.push(Check::pass(
+                    "target-access",
+                    format!("spawn executable resolved: {}", pred.exe.display()),
+                ));
+                // Backend checks the exe arch before the lib: mirror
+                // the gate so doctor cannot pass what discovery
+                // rejects. (The verdict row stays single-sourced
+                // from discover_spawn.)
+                let exe_arch_err = onboard::check_arch(&pred.exe_bytes).err();
+                if pred.libs.len() == 1 && exe_arch_err.is_none() {
+                    let lib = pred.libs[0].to_string_lossy().into_owned();
+                    target = Some(Target {
+                        exe: base_name(&pred.exe),
+                        uid: None,
+                        self_uid: self_uid(),
+                        libcrypto: Some(lib.clone()),
+                    });
+                    checks.extend(check_target_file(&lib, &tctx));
+                } else {
+                    target = Some(Target {
+                        exe: base_name(&pred.exe),
+                        uid: None,
+                        self_uid: self_uid(),
+                        libcrypto: None,
+                    });
+                    if pred.libs.is_empty()
+                        && pred.unresolved.is_empty()
+                        && !pred.incomplete
+                        && exe_arch_err.is_none()
+                    {
+                        let exe_s = pred.exe.to_string_lossy().into_owned();
+                        checks.push(Check::info(
+                            "libcrypto-found",
+                            format!("no NEEDED libcrypto; static candidate: {exe_s}"),
+                        ));
+                        checks.extend(check_byte_rows(&exe_s, &pred.exe_bytes, true, &tctx));
+                    } else {
+                        if let Some(e) = exe_arch_err {
+                            checks.push(Check::fail(
+                                "arch",
+                                format!("{}: {e}", pred.exe.display()),
+                                "run a 64-bit x86-64 binary".into(),
+                            ));
+                        } else {
+                            checks.push(Check::info(
+                                "libcrypto-found",
+                                format!(
+                                    "no single predicted libcrypto for {} — see dispatch-anchor",
+                                    pred.exe.display()
+                                ),
+                            ));
+                        }
+                        match onboard::discover_spawn(&argv, &tctx.opts(), &spenv) {
+                            Ok(qual) => {
+                                checks.push(anchor_check(&qual));
+                                checks.push(Check::info(
+                                    "provider-class",
+                                    "unknown (target unqualified)".into(),
+                                ));
+                            }
+                            Err(e) => checks.push(Check::fail(
+                                "dispatch-anchor",
+                                e.message,
+                                e.remediation,
+                            )),
+                        }
+                    }
+                }
+                checks.push(Check::info(
+                    "coverage-scope",
+                    "automatic discovery observes the in-libcrypto default provider; file providers need explicit --provider".into(),
+                ));
+                checks.push(Check::info(
+                    "coverage-spawn",
+                    "run -- observes from exec (no cold-start gap); a wrong libcrypto prediction degrades to zero-rows PARTIAL, never wrong attribution".into(),
+                ));
+            }
+        }
     }
 
     let failed = checks.iter().any(|c| c.status == Status::Fail);
@@ -1668,28 +2083,36 @@ mod tests {
 
     #[test]
     fn libcrypto_find_cases() {
+        // Doctor delegates to the shared onboarding discovery (same
+        // rule as the backend); these pins guard the delegation.
+        use crate::discovery::onboard::libcrypto_from_maps;
         let maps = vec![
             mapping("08:01", 1, "/lib/libc.so.6"),
             mapping("08:01", 2, "/opt/lib/libcrypto.so.4"),
             mapping("08:01", 2, "/opt/lib/libcrypto.so.4"),
         ];
-        assert!(matches!(find_libcrypto(&maps), LibcryptoHit::One { .. }));
+        assert!(matches!(
+            libcrypto_from_maps(&maps),
+            LibcryptoMaps::One { .. }
+        ));
         let maps = vec![mapping("08:01", 1, "/lib/libc.so.6")];
-        assert!(matches!(find_libcrypto(&maps), LibcryptoHit::None));
+        assert!(matches!(libcrypto_from_maps(&maps), LibcryptoMaps::None));
         let maps = vec![
             mapping("08:01", 2, "/a/libcrypto.so.4"),
             mapping("08:01", 3, "/b/libcrypto.so.3"),
         ];
-        match find_libcrypto(&maps) {
-            LibcryptoHit::Multi { paths } => assert_eq!(paths.len(), 2),
+        match libcrypto_from_maps(&maps) {
+            LibcryptoMaps::Multi { paths } => assert_eq!(paths.len(), 2),
             _ => panic!("want multi"),
         }
         let maps = vec![mapping("08:01", 2, "/a/libcrypto.so.4 (deleted)")];
-        assert!(matches!(find_libcrypto(&maps), LibcryptoHit::Deleted));
+        assert!(matches!(libcrypto_from_maps(&maps), LibcryptoMaps::Deleted));
     }
 
     #[test]
     fn arch_names() {
+        // Single home in onboard (doctor renders the same strings).
+        use crate::discovery::onboard::arch_name;
         assert_eq!(arch_name(62), "x86-64");
         assert_eq!(arch_name(183), "AArch64");
         assert_eq!(arch_name(40), "ARM");
@@ -1698,6 +2121,53 @@ mod tests {
         assert_eq!(arch_name(22), "s390x");
         assert_eq!(arch_name(243), "RISC-V");
         assert_eq!(arch_name(999), "EM_999");
+    }
+
+    #[test]
+    fn anchor_row_maps_qualification() {
+        use crate::discovery::builtin::Resolution;
+        use crate::discovery::onboard::SupportedTarget;
+        let supported = TargetQualification::Supported(SupportedTarget {
+            provider_path: "/x/libcrypto.so.3".into(),
+            builtin: true,
+            query_offset: Some(0x1234),
+            resolution: Some(Resolution::Symtab),
+            build_id: None,
+            openssl_display: "3.?".into(),
+            provider_class: None,
+            static_exe: false,
+        });
+        let c = anchor_check(&supported);
+        assert_eq!(c.status, Status::Pass);
+        assert!(c.message.contains("symtab"));
+        let unknown = TargetQualification::Unknown {
+            reason: "stripped build".into(),
+            remediation: "enroll".into(),
+        };
+        let c = anchor_check(&unknown);
+        assert_eq!((c.status, c.id), (Status::Fail, "dispatch-anchor"));
+        assert_eq!(c.remediation.as_deref(), Some("enroll"));
+    }
+
+    #[test]
+    fn class_row_never_fails() {
+        use crate::discovery::provider::load_table_str;
+        let empty = ProviderTable::empty();
+        // Builtin assertion resolves even without a build-id.
+        let c = class_check(None, &empty);
+        assert_eq!(c.status, Status::Pass);
+        assert!(c.message.contains("default"));
+        let c = class_check(Some("ab".repeat(20).leak() as &str), &empty);
+        assert_eq!(c.status, Status::Pass);
+        // Pinned enrollment wins and names its basis.
+        let id = "ab".repeat(20);
+        let t = load_table_str(&format!(
+            r#"{{"table_version":1,"entries":[{{"build_id":"{id}","provider_class":"fips"}}]}}"#
+        ))
+        .unwrap();
+        let c = class_check(Some(&id), &t);
+        assert!(c.message.contains("fips") && c.message.contains("pinned"));
+        assert!(c.message.contains("not a certification claim"));
     }
 
     #[test]

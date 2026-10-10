@@ -1,0 +1,12 @@
+{
+  "_comment": "EXAMPLE provider-class enrollment for --provider-table (never auto-loaded). Replace build_id with the target's GNU build-id from `readelf -n` and provider_class with one of default|legacy|fips|third-party. openssl/note are display hints only.",
+  "table_version": 1,
+  "entries": [
+    {
+      "build_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "provider_class": "third-party",
+      "openssl": "3.5.5 (example)",
+      "note": "example entry: replace before use"
+    }
+  ]
+}

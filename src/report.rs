@@ -4,7 +4,14 @@
 //!
 //! `report [--duration S] [--format human|json] [--out FILE]
 //! [--provider P] [--builtin] [--object O] [--count-object C]
+//! [--table F] [--force-offset N] [--provider-table F]
 //! [--settle S] [--timeout S] [--grace S] {--pid P | run -- <cmd>}`
+//!
+//! Normal discovery is automatic: BPF objects resolve from trusted
+//! installed locations and the target's libcrypto from its live
+//! mappings (builtin mode). `--provider`/`--object`/`--count-object`
+//! are explicit overrides; `--table`/`--force-offset`/
+//! `--provider-table` are explicit local enrollment (R09).
 //!
 //! Exit precedence (PRD §6 proposal): child non-zero → 1 (with
 //! `child_exit` in the doc — the subject failed, evidence rides
@@ -13,6 +20,7 @@
 //! inconclusive (11) arrive with `check` at P3.
 use crate::capture;
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -40,6 +48,9 @@ fn parse(argv: &[String]) -> Result<Args, String> {
     let mut builtin = false;
     let mut object: Option<String> = None;
     let mut count_object: Option<String> = None;
+    let mut table_raw: Option<String> = None;
+    let mut force_offset_raw: Option<String> = None;
+    let mut provider_table_raw: Option<String> = None;
     let mut settle_raw: Option<String> = None;
     let mut timeout_raw: Option<String> = None;
     let mut grace_raw: Option<String> = None;
@@ -71,6 +82,9 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             }
             "--object" => object = Some(val(a)?),
             "--count-object" => count_object = Some(val(a)?),
+            "--table" => table_raw = Some(val(a)?),
+            "--force-offset" => force_offset_raw = Some(val(a)?),
+            "--provider-table" => provider_table_raw = Some(val(a)?),
             "--settle" => settle_raw = Some(val(a)?),
             "--timeout" => timeout_raw = Some(val(a)?),
             "--grace" => grace_raw = Some(val(a)?),
@@ -117,12 +131,38 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         Some(s) => crate::args::parse_seconds("--grace", s)?,
         None => Duration::from_secs(5),
     };
+    // T12 onboarding: explicit tables are validated here (usage
+    // errors, exit 2, before any target/BPF side effect); objects
+    // and the target provider resolve inside capture (environment
+    // errors there exit 4, never 2).
+    let table: Option<PathBuf> = match &table_raw {
+        Some(p) => {
+            let path = PathBuf::from(p);
+            crate::discovery::onboard::load_offset_table_file(&path).map_err(|e| e.full())?;
+            Some(path)
+        }
+        None => None,
+    };
+    let provider_enrollment = match &provider_table_raw {
+        Some(p) => Some(
+            crate::discovery::onboard::load_enrollment_file(Path::new(p)).map_err(|e| e.full())?,
+        ),
+        None => None,
+    };
+    let force_offset = match &force_offset_raw {
+        Some(s) => Some(crate::args::parse_force_offset(s)?),
+        None => None,
+    };
     Ok(Args {
         cfg: capture::Config {
-            harvest_object: object.ok_or("--object O is required")?.into(),
-            count_object: count_object.ok_or("--count-object C is required")?.into(),
-            provider: provider.ok_or("--provider P is required")?.into(),
+            harvest_object: object.map(PathBuf::from),
+            count_object: count_object.map(PathBuf::from),
+            provider: provider.map(PathBuf::from),
             builtin,
+            table,
+            force_offset,
+            provider_enrollment,
+            resolved_provider_class: None,
             duration,
             settle,
             harvest_timeout: timeout,
@@ -667,7 +707,7 @@ fn cbom(c: &capture::Capture) -> serde_json::Value {
     })
 }
 
-const USAGE: &str = "usage: report [--duration S] --provider P --object O --count-object C [--format human|json] [--out F] [--cbom FILE] [--builtin] [--settle S] [--timeout S] [--grace S] [--image-digest D] {--pid P | run -- <cmd>}";
+const USAGE: &str = "usage: report [--duration S] [--provider P] [--object O] [--count-object C] [--table F] [--force-offset N] [--provider-table F] [--format human|json] [--out F] [--cbom FILE] [--builtin] [--settle S] [--timeout S] [--grace S] [--image-digest D] {--pid P | run -- <cmd>}";
 
 pub fn run(argv: &[String]) -> ExitCode {
     // --help anywhere on the osslscope side (a target command after
@@ -2418,8 +2458,11 @@ note: alg-name-only strength (key sizes unobservable); window-only claims\n";
         let v = |s: Vec<&str>| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
         assert_eq!(run(&v(vec!["--help"])), ExitCode::from(0));
         assert_eq!(run(&v(vec!["-h"])), ExitCode::from(0));
-        // A target command after run -- may contain --help.
-        assert_eq!(run(&v(vec!["run", "--", "--help"])), ExitCode::from(2));
+        // A target command after run -- may contain --help: it must
+        // not print our help (nonzero either way — capture of a
+        // nonexistent command cannot succeed; exact code depends on
+        // whether BPF objects are installed on this host).
+        assert_ne!(run(&v(vec!["run", "--", "--help"])), ExitCode::from(0));
     }
 
     #[test]
@@ -2480,7 +2523,24 @@ note: alg-name-only strength (key sizes unobservable); window-only claims\n";
         let mut both = base.clone();
         both.extend(["--pid", "9", "run", "--", "x"]);
         assert!(parse(&v(both)).is_err()); // both targets
-        assert!(parse(&v(vec!["--provider", "p", "--pid", "9"])).is_err()); // no objects
+        // T12: provider/objects are optional (automatic discovery).
+        let auto = parse(&v(vec!["--pid", "9"])).unwrap();
+        assert!(auto.cfg.provider.is_none());
+        assert!(auto.cfg.harvest_object.is_none());
+        assert!(auto.cfg.count_object.is_none());
+        // Explicit enrollment validates at parse time (exit 2).
+        let mut bad_table = vec!["--pid", "9"];
+        bad_table.extend(["--table", "/nonexistent-table.json"]);
+        assert!(parse(&v(bad_table)).is_err());
+        let mut bad_enroll = vec!["--pid", "9"];
+        bad_enroll.extend(["--provider-table", "/nonexistent-enroll.json"]);
+        assert!(parse(&v(bad_enroll)).is_err());
+        let mut bad_force = vec!["--pid", "9"];
+        bad_force.extend(["--force-offset", "xyz"]);
+        assert!(parse(&v(bad_force)).is_err());
+        let mut force = vec!["--pid", "9"];
+        force.extend(["--force-offset", "0x10"]);
+        assert_eq!(parse(&v(force)).unwrap().cfg.force_offset, Some(0x10));
         let mut yaml = base.clone();
         yaml.extend(["--pid", "9", "--format", "yaml"]);
         assert!(parse(&v(yaml)).is_err());

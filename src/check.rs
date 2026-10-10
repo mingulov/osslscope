@@ -22,6 +22,7 @@ use crate::policy::{
     executed_param_blind_ops, fips_unlabeled_calls,
 };
 use crate::report::{DeliveryResult, OutputDest, OutputFormat, OutputRequest, write_artifacts};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -128,6 +129,9 @@ fn parse(argv: &[String]) -> Result<Args, String> {
     let mut builtin = false;
     let mut object: Option<String> = None;
     let mut count_object: Option<String> = None;
+    let mut table_raw: Option<String> = None;
+    let mut force_offset_raw: Option<String> = None;
+    let mut provider_table_raw: Option<String> = None;
     let mut settle_raw: Option<String> = None;
     let mut timeout_raw: Option<String> = None;
     let mut grace_raw: Option<String> = None;
@@ -160,6 +164,9 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             }
             "--object" => object = Some(val(a)?),
             "--count-object" => count_object = Some(val(a)?),
+            "--table" => table_raw = Some(val(a)?),
+            "--force-offset" => force_offset_raw = Some(val(a)?),
+            "--provider-table" => provider_table_raw = Some(val(a)?),
             "--settle" => settle_raw = Some(val(a)?),
             "--timeout" => timeout_raw = Some(val(a)?),
             "--grace" => grace_raw = Some(val(a)?),
@@ -234,12 +241,38 @@ fn parse(argv: &[String]) -> Result<Args, String> {
                 .to_string(),
         );
     }
+    // T12 onboarding: explicit tables are validated here (usage
+    // errors, exit 2, before any target/BPF side effect); objects
+    // and the target provider resolve inside capture (environment
+    // errors there exit 4, never 2).
+    let table: Option<PathBuf> = match &table_raw {
+        Some(p) => {
+            let path = PathBuf::from(p);
+            crate::discovery::onboard::load_offset_table_file(&path).map_err(|e| e.full())?;
+            Some(path)
+        }
+        None => None,
+    };
+    let provider_enrollment = match &provider_table_raw {
+        Some(p) => Some(
+            crate::discovery::onboard::load_enrollment_file(Path::new(p)).map_err(|e| e.full())?,
+        ),
+        None => None,
+    };
+    let force_offset = match &force_offset_raw {
+        Some(s) => Some(crate::args::parse_force_offset(s)?),
+        None => None,
+    };
     Ok(Args {
         cfg: capture::Config {
-            harvest_object: object.ok_or("--object O is required")?.into(),
-            count_object: count_object.ok_or("--count-object C is required")?.into(),
-            provider: provider.ok_or("--provider P is required")?.into(),
+            harvest_object: object.map(PathBuf::from),
+            count_object: count_object.map(PathBuf::from),
+            provider: provider.map(PathBuf::from),
             builtin,
+            table,
+            force_offset,
+            provider_enrollment,
+            resolved_provider_class: None,
             duration,
             settle,
             harvest_timeout: timeout,
@@ -420,7 +453,7 @@ pub fn policy_record(v: &PolicyVerdict) -> PolicyRecord {
 }
 
 const USAGE: [&str; 2] = [
-    "usage: check [--duration S] --provider P --object O --count-object C [rules] [--format human|json] [--out F] [--cbom FILE] [--builtin] [--settle S] [--timeout S] [--grace S] [--image-digest D] {--pid P | run -- <cmd>}",
+    "usage: check [--duration S] [--provider P] [--object O] [--count-object C] [--table F] [--force-offset N] [--provider-table F] [rules] [--format human|json] [--out F] [--cbom FILE] [--builtin] [--settle S] [--timeout S] [--grace S] [--image-digest D] {--pid P | run -- <cmd>}",
     "rules: [--require-provider P] [--deny-provider P] [--deny-engine] [--deny-algorithm X] [--deny-weak] [--require-executed X] (repeatable; at least one required)",
 ];
 
@@ -705,7 +738,10 @@ mod tests {
         let mut neither: Vec<&str> = vec!["--deny-weak"];
         assert!(parse(&v(neither.clone())).is_err());
         neither.extend(["run", "--", "x"]);
-        assert!(parse(&v(neither)).is_err(), "objects still required");
+        // T12: provider/objects are optional (automatic discovery).
+        let auto = parse(&v(neither)).unwrap();
+        assert!(auto.cfg.provider.is_none());
+        assert!(auto.cfg.harvest_object.is_none());
     }
 
     #[test]
