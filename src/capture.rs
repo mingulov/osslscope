@@ -1973,6 +1973,12 @@ where
             self.signal_cut = true;
             let _ = self.count.close_and_drain(self.cfg.grace);
             let _ = self.target.resolve_setup_failure();
+            // A never-released owned child was just terminated and
+            // reaped above: preserve its status (foreign targets
+            // answer None — no disposition for a target never owned).
+            if let Ok(Some(code)) = self.target.poll_exit() {
+                self.child_exit = Some(code);
+            }
             self.requested_start_ns = self.clock.monotonic_ns();
             return Ok(self.no_window_result());
         }

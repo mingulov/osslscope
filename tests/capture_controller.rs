@@ -284,6 +284,13 @@ impl TargetPort for FakeTarget {
 
     fn resolve_setup_failure(&mut self) -> anyhow::Result<()> {
         self.log.borrow_mut().resolved = true;
+        if self.owned && !self.exited {
+            // Mirror OwnedTarget: a never-released child is SIGKILLed
+            // and reaped (128+SIGKILL); an already-exited child keeps
+            // its status; foreign targets are untouched.
+            self.exited = true;
+            self.exit_code = 137;
+        }
         Ok(())
     }
 
@@ -871,7 +878,8 @@ fn setup_discovery_failure_is_loud() {
 #[test]
 fn signal_during_setup_cuts_cleanly() {
     // Cancelled before release: the never-released child resolves
-    // (never left stopped), and the result is signal-cut PARTIAL.
+    // (never left stopped), and the result is signal-cut PARTIAL
+    // with the SIGKILL status and disposition preserved.
     let h = Harness::fresh("setup-cancel");
     h.cancelled.set(true);
     let (out, post) = h.run();
@@ -879,6 +887,11 @@ fn signal_during_setup_cuts_cleanly() {
     assert!(matches!(c.outcome, Outcome::Partial));
     assert!(has_reason(&c, "interrupted"), "{:?}", c.reasons);
     assert!(has_reason(&c, "startup-gap"), "{:?}", c.reasons);
+    assert_eq!(c.child_exit, Some(137));
+    assert!(matches!(
+        c.disposition,
+        Some(target::TargetDisposition::Exited { code: 137 })
+    ));
     let log = post.target_log.borrow();
     assert!(!log.released);
     assert!(log.resolved);
