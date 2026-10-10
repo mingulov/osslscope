@@ -24,7 +24,25 @@ const ARR: u64 = 0x7f00_1000;
 /// Backed maps into the test exe: addrs land in a real x PT_LOAD so
 /// rows back (same shape as the schema unit tests).
 fn backed_exe_maps() -> (Vec<u8>, Vec<osslscope::discovery::maps::Mapping>) {
-    let exe = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+    // Stat-or-None resolution stats the provider arg: stage the test
+    // exe's own identity (its /proc/self/maps line gives the dev
+    // string; no libc in integration tests).
+    use std::os::unix::fs::MetadataExt;
+    let exe_path = std::env::current_exe().unwrap();
+    let exe = std::fs::read(&exe_path).unwrap();
+    let want_ino = std::fs::metadata(&exe_path).unwrap().ino();
+    let base = exe_path.file_name().unwrap().to_string_lossy().into_owned();
+    let mut dev = String::from("08:01");
+    for line in std::fs::read_to_string("/proc/self/maps").unwrap().lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() >= 6
+            && f[5].rsplit('/').next() == Some(base.as_str())
+            && f[4].parse::<u64>().ok() == Some(want_ino)
+        {
+            dev = f[3].to_string();
+            break;
+        }
+    }
     let elf = osslscope::discovery::elf::parse_elf(&exe).unwrap();
     let ph = elf
         .program_headers
@@ -39,9 +57,9 @@ fn backed_exe_maps() -> (Vec<u8>, Vec<osslscope::discovery::maps::Mapping>) {
         end: 0x1000 + ph.p_filesz,
         x: true,
         offset: ph.p_offset,
-        dev: "08:01".to_string(),
-        ino: 42,
-        path: "t".to_string(),
+        dev,
+        ino: want_ino,
+        path: exe_path.to_string_lossy().into_owned(),
     }];
     (exe, maps)
 }
@@ -92,7 +110,7 @@ fn later_unreadable_slot_is_partial() {
     let (exe, maps) = backed_exe_maps();
     let doc = schema::emit(
         "t",
-        Path::new("t"),
+        Path::new(&maps[0].path),
         "",
         &exe,
         &maps,
@@ -138,7 +156,7 @@ fn empty_impl_does_not_silently_stall() {
     stats.truncated = vec![(OP_DIGEST, wire::TRUNC_WALK_NOIMP)];
     let doc = schema::emit(
         "t",
-        Path::new("t"),
+        Path::new(&maps[0].path),
         "",
         &exe,
         &maps,
@@ -209,7 +227,7 @@ fn bounds_512_513() {
     let (exe, maps) = backed_exe_maps();
     let doc = schema::emit(
         "t",
-        Path::new("t"),
+        Path::new(&maps[0].path),
         "",
         &exe,
         &maps,
@@ -240,7 +258,7 @@ fn bounds_512_513() {
     stats.truncated = vec![(OP_DIGEST, wire::TRUNC_ALGS)];
     let doc = schema::emit(
         "t",
-        Path::new("t"),
+        Path::new(&maps[0].path),
         "",
         &exe,
         &maps,
@@ -277,7 +295,7 @@ fn stale_proof_does_not_terminate() {
     let (exe, maps) = backed_exe_maps();
     let doc = schema::emit(
         "t",
-        Path::new("t"),
+        Path::new(&maps[0].path),
         "",
         &exe,
         &maps,
@@ -332,7 +350,7 @@ fn lost_alg_or_row_is_accounted() {
     let (exe, maps) = backed_exe_maps();
     let doc = schema::emit(
         "t",
-        Path::new("t"),
+        Path::new(&maps[0].path),
         "",
         &exe,
         &maps,
@@ -378,7 +396,7 @@ fn pending_map_full_is_accounted() {
     let (exe, maps) = backed_exe_maps();
     let doc = schema::emit(
         "t",
-        Path::new("t"),
+        Path::new(&maps[0].path),
         "",
         &exe,
         &maps,
