@@ -1004,6 +1004,88 @@ fn check_lsm(env: &Env) -> Check {
     )
 }
 
+/// Current dumpable state of this process via prctl (the
+/// historical /proc/self/status Dumpable field is absent on
+/// 6.12+/7.0, so status parsing cannot report it).
+fn self_dumpable() -> Option<libc::c_int> {
+    let r = unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) };
+    if r < 0 { None } else { Some(r) }
+}
+
+/// F-CAPS-1: replicate the `run --` setup maps read exactly — fork a
+/// stopped child that opts itself dumpable pre-exec (the product
+/// path in target.rs), then read its maps from here. Under filecaps
+/// this read is what decides whether `run --` setup passes: without
+/// the product's self-dumpable call it fails EACCES (the child
+/// inherits the observer's non-dumpable state); with it, it must
+/// pass. Single-threaded CLI — fork is safe (no threads, no held
+/// locks). The probe child is always killed and reaped (never a
+/// zombie, never left stopped).
+fn check_spawn_access() -> Check {
+    let dump_txt = self_dumpable().map_or("unknown".to_string(), |d| d.to_string());
+    // SAFETY: single-threaded; child only prctls/stops/_exits.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return Check::fail(
+            "spawn-access",
+            "cannot fork the spawn-setup probe".into(),
+            "check process limits (ulimit -u), then re-run".into(),
+        );
+    }
+    if pid == 0 {
+        unsafe {
+            libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0);
+            libc::raise(libc::SIGSTOP);
+            libc::_exit(0);
+        }
+    }
+    let mut status = 0;
+    let stopped = loop {
+        let r = unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) };
+        if r < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        break r > 0 && libc::WIFSTOPPED(status);
+    };
+    let maps = if stopped {
+        std::fs::read_to_string(format!("/proc/{pid}/maps"))
+    } else {
+        Err(std::io::Error::other("probe child never stopped"))
+    };
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+    }
+    let mut status2 = 0;
+    loop {
+        let r = unsafe { libc::waitpid(pid, &mut status2, 0) };
+        if r < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        break;
+    }
+    match maps {
+        Ok(body) if !body.is_empty() => Check::pass(
+            "spawn-access",
+            format!(
+                "spawn setup maps read ok: pre-exec child maps readable ({} bytes; self dumpable={dump_txt})",
+                body.len()
+            ),
+        ),
+        Ok(_) => Check::fail(
+            "spawn-access",
+            "spawn setup maps read would fail: pre-exec child maps empty".into(),
+            "run with sudo once to confirm, then report (observer self-dumpable mechanism failed)"
+                .into(),
+        ),
+        Err(e) => Check::fail(
+            "spawn-access",
+            format!("spawn setup maps read would fail: pre-exec child maps unreadable ({e})"),
+            "run with sudo once to confirm, then report (observer self-dumpable mechanism failed)"
+                .into(),
+        ),
+    }
+}
+
 fn check_seccomp(env: &Env) -> Check {
     match env.seccomp {
         0 => Check::info("seccomp", format!("no seccomp filter (NNP={})", env.nnp)),
@@ -1657,6 +1739,7 @@ pub fn run(args: &[String]) -> ExitCode {
         check_ima(),
         check_lsm(&env),
         check_seccomp(&env),
+        check_spawn_access(),
     ];
     checks.extend(objects_checks(object.as_deref(), count_object.as_deref()));
 
@@ -2231,5 +2314,27 @@ mod tests {
         assert_eq!(j["remediation"], "r");
         let c = Check::pass("y", "m".into());
         assert!(c.json().get("remediation").is_none());
+    }
+
+    #[test]
+    fn self_dumpable_reports_prctl_state() {
+        // The query must succeed (values vary: 1 unprivileged,
+        // non-dumpable under filecaps/root per kernel).
+        assert!(self_dumpable().is_some());
+    }
+
+    #[test]
+    fn spawn_access_probe_passes_and_reaps() {
+        // The probe replicates the run -- setup maps read (fork a
+        // stopped child that opts itself dumpable pre-exec, then
+        // read its maps): it must pass on a healthy host, and the
+        // probe child must be killed and reaped (never a zombie or
+        // a leftover stopped child — a second run would inherit it).
+        for _ in 0..2 {
+            let c = check_spawn_access();
+            assert_eq!(c.id, "spawn-access");
+            assert!(matches!(c.status, Status::Pass), "{}", c.message);
+            assert!(c.message.contains("self dumpable="), "{}", c.message);
+        }
     }
 }

@@ -197,6 +197,20 @@ impl OwnedTarget {
         }
         if pid == 0 {
             unsafe {
+                // F-CAPS-1: a filecaps observer (cap_bpf+cap_perfmon)
+                // is born non-dumpable, and the forked child inherits
+                // that — same-uid /proc/PID/maps reads then fail with
+                // EACCES while the child is stopped pre-exec, which
+                // breaks the setup baseline read. The child opts
+                // itself back to dumpable pre-exec (unprivileged
+                // self-set; async-signal-safe: prctl is a raw
+                // syscall). Post-exec the child is dumpable regardless
+                // (plain binaries reset it — measured), so this only
+                // covers the stopped pre-exec window and changes no
+                // post-exec posture. A prctl failure is non-fatal (an
+                // exotic kernel keeps the old behavior; the maps read
+                // then fails loud, never silent).
+                libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0);
                 libc::raise(libc::SIGSTOP);
                 libc::execvp(ptrs[0], ptrs.as_ptr());
                 libc::_exit(127);
