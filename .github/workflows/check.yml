@@ -58,11 +58,21 @@ jobs:
     # least-priv doctor run (exit 0). Ubuntu-class behaves like lanes
     # B/C (green), not Debian-class. Procedure proven identical on
     # 6.9/6.12/7.0 lane kernels (spike-filecaps.sh gate evidence).
+    # Doctor also requires BPF objects for verdict ok, so the job
+    # builds them and stages copies into root-owned
+    # /usr/local/lib/osslscope, which implicit object discovery trusts.
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-05-20
+          components: rust-src
+      - run: cargo install bpf-linker --locked --version 0.10.4
       - run: cargo build --locked --bin osslscope
+      - run: cd crates/ebpf && cargo +nightly-2026-05-20 build --locked -Z build-std=core --target bpfel-unknown-none --release --bin osslscope-harvest --bin osslscope-count
+      - run: sudo mkdir -p /usr/local/lib/osslscope && sudo cp crates/ebpf/target/bpfel-unknown-none/release/osslscope-harvest crates/ebpf/target/bpfel-unknown-none/release/osslscope-count /usr/local/lib/osslscope/
       - run: sudo setcap 'cap_bpf,cap_perfmon=ep' target/debug/osslscope
       - run: ./target/debug/osslscope doctor | tee doctor.log; test ${PIPESTATUS[0]} -eq 0
       - run: "grep -q 'verdict: ok' doctor.log && ! grep -E 'can_issue|cap_mint_ok' doctor.log"

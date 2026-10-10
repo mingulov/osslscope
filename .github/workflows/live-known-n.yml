@@ -90,7 +90,14 @@ jobs:
         id: probe
         run: |
           set -eu
-          "${RUNNER_TEMP}/ossl-pfx/bin/osslscope" doctor >doctor.txt 2>&1 || true
+          PFX="${RUNNER_TEMP}/ossl-pfx"
+          # User-owned prefix objects are never implicitly trusted: probe
+          # with the same explicit flags the check step uses, or a capable
+          # runner misclassifies as a capability skip on objects rows.
+          "$PFX/bin/osslscope" doctor \
+            --object "$PFX/lib/osslscope/osslscope-harvest" \
+            --count-object "$PFX/lib/osslscope/osslscope-count" \
+            >doctor.txt 2>&1 || true
           cat doctor.txt
           if grep -q 'verdict: ok' doctor.txt; then
             echo "capable=true" >>"$GITHUB_OUTPUT"

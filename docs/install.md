@@ -26,9 +26,13 @@ prefix (default `$HOME/.local`):
 ./scripts/install-dev.sh --prefix "$HOME/.local"
 ```
 
-The prefix layout is the contract default object resolution
-consumes (explicit `--object`/`--count-object` flags remain as
-troubleshooting overrides):
+The prefix layout mirrors the system layout that automatic
+object discovery trusts — but a user-owned prefix is never
+trusted implicitly, so every `doctor`/`report`/`check` run from
+this prefix passes explicit `--object`/`--count-object` flags.
+Only the same `lib/osslscope/` layout under a root-owned system
+dir (`/usr/local/lib{,64}/osslscope`, `/usr/lib{,64}/osslscope`)
+resolves without flags:
 
 ```text
 $PREFIX/bin/osslscope
@@ -52,7 +56,10 @@ Grant capabilities once (needs privilege), then verify:
 ```sh
 sudo setcap cap_bpf,cap_perfmon+ep "$HOME/.local/bin/osslscope"
 getcap "$HOME/.local/bin/osslscope"   # expect: cap_bpf,cap_perfmon+ep
-"$HOME/.local/bin/osslscope" doctor   # expect: verdict: ok
+"$HOME/.local/bin/osslscope" doctor \
+  --object "$HOME/.local/lib/osslscope/osslscope-harvest" \
+  --count-object "$HOME/.local/lib/osslscope/osslscope-count"
+# expect: verdict: ok
 "$HOME/.local/bin/osslscope" --help   # lists doctor|inspect|report|check|alias-audit
 ```
 
@@ -99,9 +106,15 @@ package whose old cleanup script predates the fix (see
 
 ```sh
 getcap /usr/bin/osslscope   # expect: cap_perfmon,cap_bpf=ep
-osslscope doctor            # expect: verdict: ok
+osslscope doctor            # expect: verdict: ok once objects are staged (below)
 osslscope --help            # lists doctor|inspect|report|check|alias-audit
 ```
+
+Packages never ship BPF objects, so a bare `doctor` reports the
+objects rows `FAIL` until the operator stages them: build per
+[build](build.md), then either copy both objects into root-owned
+`/usr/local/lib/osslscope/` (implicitly trusted) or pass
+`--object`/`--count-object` explicitly on every run.
 
 If the caps are missing (e.g. the cap hook warned at install),
 re-apply them and re-run doctor:
@@ -115,16 +128,18 @@ osslscope doctor
 ends in `verdict: FAIL-CLOSED` with a `remediate:` line, never a
 silent partial run. An unprivileged `doctor` on a fresh install
 reports `FAIL-CLOSED` and names the `setcap` remediation above;
-granting caps flips it to `verdict: ok` on a capable machine.
+granting caps plus staged objects flips it to `verdict: ok` on a
+capable machine.
 
 ## Next steps
 
 - Vet a target before observing: `osslscope doctor --pid PID` (or
   `--libcrypto PATH`).
-- `report`/`check` need BPF objects: with a prefix install they
-  live at `$PREFIX/lib/osslscope/` (pass `--object` and
-  `--count-object` until default resolution lands); packages never
-  ship them, so build per [build](build.md) and pass the flags.
+- `report`/`check` need BPF objects: a user-owned prefix install
+  always needs `--object`/`--count-object` pointing at
+  `$PREFIX/lib/osslscope/`; packages never ship objects, so build
+  per [build](build.md) and either stage them into root-owned
+  `/usr/local/lib/osslscope/` (auto-discovered) or pass the flags.
 
 ## Uninstall
 

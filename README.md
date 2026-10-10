@@ -91,12 +91,17 @@ First run (one-time setup, then least-privilege runs):
 
 ```sh
 sudo setcap 'cap_bpf,cap_perfmon=ep' "$HOME/.local/bin/osslscope"
-"$HOME/.local/bin/osslscope" doctor   # preflight; must print verdict: ok
+"$HOME/.local/bin/osslscope" doctor \
+  --object "$HOME/.local/lib/osslscope/osslscope-harvest" \
+  --count-object "$HOME/.local/lib/osslscope/osslscope-count"
+# preflight; must print verdict: ok
 ```
 
 The prefix layout is `$PREFIX/bin/osslscope` plus both BPF objects
-under `$PREFIX/lib/osslscope/`, which `report`/`check` need via
-flags until default object resolution lands:
+under `$PREFIX/lib/osslscope/`. A user-owned prefix is never
+trusted implicitly, so `report`/`check` (and `doctor`) need the
+explicit flags below; only the same layout under a root-owned
+system dir auto-resolves (see [install](docs/install.md)):
 
 ```sh
 "$HOME/.local/bin/osslscope" report --provider /path/to/provider.so \

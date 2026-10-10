@@ -121,15 +121,20 @@ run_step() {
 }
 
 run_doctor() {
-    # $1 = tag. Records doctor output; a doctor crash (nonzero exit) fails
-    # the lifecycle. A FAIL-CLOSED verdict still exits 0 from doctor and is
-    # recorded for the lane reviewer, not treated as a crash.
+    # $1 = tag. Records doctor output; a doctor crash fails the
+    # lifecycle. Exit 4 is the orderly FAIL-CLOSED verdict (expected
+    # here: packages never ship BPF objects, so objects rows fail) and
+    # is recorded for the lane reviewer, not treated as a crash.
     _tag="$1"
-    if ! osslscope doctor >"$WORKDIR/doctor-$_tag.log" 2>&1; then
-        echo "doctor crashed after $_tag — lifecycle FAILED" | tee -a "$LOG" >&2
-        cat "$WORKDIR/doctor-$_tag.log" | tee -a "$LOG" >&2
-        exit 1
-    fi
+    _rc=0
+    osslscope doctor >"$WORKDIR/doctor-$_tag.log" 2>&1 || _rc=$?
+    case "$_rc" in
+        0|4) ;;
+        *) echo "doctor crashed after $_tag (exit $_rc) — lifecycle FAILED" | tee -a "$LOG" >&2
+           cat "$WORKDIR/doctor-$_tag.log" | tee -a "$LOG" >&2
+           exit 1 ;;
+    esac
+    grep -h "verdict:" "$WORKDIR/doctor-$_tag.log" | tee -a "$LOG" >&2
     head -20 "$WORKDIR/doctor-$_tag.log" | tee -a "$LOG" >&2
 }
 
