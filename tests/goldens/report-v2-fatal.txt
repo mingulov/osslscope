@@ -1,0 +1,26 @@
+osslscope report (observed-crypto-v2.0): pid=11 (gone) window=1000..31000ns effective=31000..31000ns
+openssl: unknown (no verified version)
+target: argv_redacted=true container_id=(none) image_digest=(none)
+disposition: unknown (not recorded)
+
+sites (0, 0 calls):
+  none (no usable evidence)
+
+coverage:
+  none recorded
+
+counters:
+  none recorded
+
+completeness: FATAL
+
+fatal: recycled (pid reused mid-window; all observations discarded)
+
+reasons:
+  - startup-gap: 30000ns unobserved at window start
+
+policy: (not evaluated)
+
+status=FATAL
+absence = not-observed in window (never "not present / never used")
+note: argv redacted; file offsets are not runtime addresses; window-only claims

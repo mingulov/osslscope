@@ -1,0 +1,30 @@
+osslscope report (observed-crypto-v2.0): pid=9 (staging) window=0..100ns effective=5..95ns
+openssl: unknown (no verified version)
+target: argv_redacted=true container_id=cid-1 image_digest=sha256:abc
+disposition: detached-running pid=9
+
+sites (2, 250 calls):
+  site build:012345 file-offset=4096 gen=0: 200 calls, definite: AES-128-GCM (CIPHER) via default
+  site build:fedcba file-offset=16384 gen=0: 50 calls, UNATTRIBUTED (candidate set incomplete)
+
+coverage:
+  provider/default: expected=3 discovered=2 attached=1 (gap)
+
+counters:
+  loss count.map_insert_dropped (events from kernel-ring) = 3
+
+completeness: PARTIAL
+
+reasons:
+  - undiscovered-sites: provider/default missing=1
+  - unattached-sites: provider/default missing=2
+  - loss: count.map_insert_dropped (kernel-ring) = 3
+  - unattributed-calls: 1 sites, 50 calls (candidate sets incomplete)
+  - startup-gap: 5ns unobserved at window start
+  - tail-gap: 5ns unobserved at window end
+
+policy: (not evaluated)
+
+status=PARTIAL
+absence = not-observed in window (never "not present / never used")
+note: argv redacted; file offsets are not runtime addresses; window-only claims

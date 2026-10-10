@@ -12,6 +12,13 @@
 //! `src/report.rs` tests; rule names mirror `src/check.rs`. Any
 //! emitter change fails this test by design -- update the golden and
 //! the checker together, by review, never by regeneration alone.
+//!
+//! v2 conformance (T11) follows below the v1 suite: the v2 checker
+//! is `osslscope::schema::{validate_v2, check_v2_semantics}` (actual
+//! JSON Schema validation plus cross-field semantics, shared with
+//! `tests/output_contract.rs`), pinning `tests/auditor_golden_v2.json`
+//! and validating explicitly supplied artifacts via
+//! `OSSLSCOPE_AUDITOR_STORY_V2`. The v1 suite is frozen history.
 
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -759,4 +766,452 @@ fn story_output_conforms() {
     let text = std::fs::read_to_string(&path).unwrap();
     let v: Value = serde_json::from_str(&text).unwrap();
     check_auditor_shape(&v).expect("story output must conform");
+}
+
+// ---------------------------------------------------------------- v2 conformance
+//
+// The v2 checker is the shared library validator (schema +
+// semantics), not a second hand-rolled walker: auditor conformance
+// and the output contract can never drift apart. The golden below
+// is generated from the fixture by review
+// (`OSSLSCOPE_REGENERATE_AUDITOR_GOLDEN=1`), then pinned.
+
+use osslscope::evidence::{
+    CandidateCoverage, CandidateIdentity, CaptureDocument, CaptureWindow, CounterKind,
+    CounterSource, CounterUnits, DispositionRecord, ExpectedScope, FinalizeInput, GapCounter,
+    ObjectId, ObjectRecord, OpensslVersion, PolicyRecord, PolicyRuleResult, PolicyVerdict,
+    RuleVerdict, ScopeCoverage, SiteExecution, SiteKey, TargetRecord, finalize,
+};
+use osslscope::report::render_json;
+use osslscope::schema::{check_v2_semantics, validate_v2};
+
+/// Strict v2 auditor conformance: actual JSON Schema validation plus
+/// cross-field semantics. Accepts report documents and, when
+/// present, the check `policy` section.
+fn check_auditor_v2_shape(v: &Value) -> Result<(), String> {
+    validate_v2(v).map_err(|e| format!("schema: {e}"))?;
+    check_v2_semantics(v).map_err(|e| format!("semantics: {e}"))?;
+    Ok(())
+}
+
+fn auditor_v2_fixture() -> CaptureDocument {
+    let obj = |id: &str| ObjectId(id.to_string());
+    let cand = |provider: &str, class: &str, op: u32, func: u32, algs: &[&str], weak: bool| {
+        CandidateIdentity::new(
+            obj(provider),
+            class.to_string(),
+            op,
+            func,
+            algs.iter().map(|a| a.to_string()).collect(),
+            weak,
+        )
+    };
+    let site = |object: &str,
+                inode: u64,
+                offset: u64,
+                generation: u32,
+                calls: u64,
+                cands: Vec<CandidateIdentity>,
+                cov: CandidateCoverage| {
+        SiteExecution {
+            site: SiteKey {
+                object: obj(object),
+                device: 8,
+                inode,
+                offset,
+            },
+            generation,
+            candidates: cands,
+            candidates_coverage: cov,
+            calls,
+            first_ns: 10,
+            last_ns: 90,
+        }
+    };
+    const FP_A: &str = "build:aaaa0123456789aaaa0123456789aaaa0123456789aaaa0123456789";
+    const FP_B: &str = "build:bbbb0123456789bbbb0123456789bbbb0123456789bbbb0123456789";
+    let input = FinalizeInput {
+        window: CaptureWindow {
+            requested_start_ns: 0,
+            requested_end_ns: 30_000_000_000,
+            effective_start_ns: 0,
+            effective_end_ns: 30_000_000_000,
+            signal_cut: false,
+        },
+        sites: vec![
+            site(
+                FP_A,
+                100,
+                0x1000,
+                0,
+                400,
+                vec![cand(FP_A, "default", 2, 21, &["DES"], false)],
+                CandidateCoverage::Complete,
+            ),
+            site(
+                FP_B,
+                200,
+                0x1000,
+                0,
+                60,
+                vec![
+                    cand(FP_B, "default", 2, 21, &["AES-256-GCM"], false),
+                    cand(FP_B, "default", 2, 21, &["ARIA-256-GCM"], true),
+                ],
+                CandidateCoverage::Complete,
+            ),
+            site(
+                FP_A,
+                100,
+                0x2000,
+                0,
+                0,
+                vec![cand(FP_A, "default", 1, 7, &["SHA-256"], false)],
+                CandidateCoverage::Complete,
+            ),
+        ],
+        fenced: vec![osslscope::evidence::FencedGeneration {
+            generation: 2,
+            sites: vec![site(
+                FP_A,
+                100,
+                0x1000,
+                2,
+                40,
+                vec![cand(FP_A, "default", 2, 21, &["DES"], false)],
+                CandidateCoverage::Complete,
+            )],
+        }],
+        objects: vec![
+            ObjectRecord {
+                id: obj(FP_A),
+                device: 8,
+                inode: 100,
+                display_locator: "/usr/lib/ossl-modules/default.so".to_string(),
+            },
+            ObjectRecord {
+                id: obj(FP_B),
+                device: 8,
+                inode: 200,
+                display_locator: "/usr/lib/ossl-modules/legacy.so".to_string(),
+            },
+        ],
+        coverage: vec![ScopeCoverage {
+            scope: "provider/default".to_string(),
+            expected: ExpectedScope::Applicable { sites: 3 },
+            discovered: 3,
+            attached: 3,
+        }],
+        counters: vec![GapCounter {
+            name: "count.map_insert_dropped".to_string(),
+            kind: CounterKind::Loss,
+            units: CounterUnits::Events,
+            source: CounterSource::KernelMap,
+            value: 0,
+        }],
+        fatal: None,
+        target: TargetRecord::new(
+            42,
+            "audited".to_string(),
+            "cid-auditor".to_string(),
+            "sha256:auditor".to_string(),
+        ),
+        openssl: OpensslVersion::verified("3.0.14".to_string()),
+        disposition: Some(DispositionRecord::exited(0)),
+        policy: Some(PolicyRecord {
+            verdict: PolicyVerdict::Violation,
+            rules: vec![
+                PolicyRuleResult {
+                    rule: "deny-algorithm".to_string(),
+                    predicate: "algorithm=DES".to_string(),
+                    result: RuleVerdict::Violation,
+                    definite: 440,
+                    possible: Some(440),
+                    evidence: vec![
+                        osslscope::evidence::PolicyEvidenceRef {
+                            object: obj(FP_A),
+                            device: 8,
+                            inode: 100,
+                            offset: 0x1000,
+                            generation: 0,
+                            calls: 400,
+                        },
+                        osslscope::evidence::PolicyEvidenceRef {
+                            object: obj(FP_A),
+                            device: 8,
+                            inode: 100,
+                            offset: 0x1000,
+                            generation: 2,
+                            calls: 40,
+                        },
+                    ],
+                },
+                PolicyRuleResult {
+                    rule: "deny-weak".to_string(),
+                    predicate: "weak-alias".to_string(),
+                    result: RuleVerdict::Pass,
+                    definite: 0,
+                    possible: Some(0),
+                    evidence: Vec::new(),
+                },
+            ],
+        }),
+    };
+    finalize(input)
+}
+
+fn load_golden_v2() -> (String, Value) {
+    // Read-only by design: regeneration is the single-writer test
+    // below (parallel writers would tear the file).
+    let path = manifest_dir().join("tests/auditor_golden_v2.json");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let v: Value = serde_json::from_str(&text).unwrap();
+    (text, v)
+}
+
+#[test]
+fn regenerate_auditor_golden_v2() {
+    // Single writer: run filtered
+    // (`OSSLSCOPE_REGENERATE_AUDITOR_GOLDEN=1 cargo test
+    // --test auditor_report regenerate_auditor_golden_v2`), review
+    // the diff, then commit. Without the env var this is a no-op.
+    if std::env::var("OSSLSCOPE_REGENERATE_AUDITOR_GOLDEN").is_err() {
+        return;
+    }
+    let path = manifest_dir().join("tests/auditor_golden_v2.json");
+    let bytes = render_json(&auditor_v2_fixture()).unwrap();
+    std::fs::write(&path, &bytes).unwrap();
+}
+
+#[test]
+fn golden_v2_conforms() {
+    let (_, v) = load_golden_v2();
+    check_auditor_v2_shape(&v).expect("v2 golden must conform");
+}
+
+#[test]
+fn golden_v2_bytes_stable() {
+    // Same byte-shape pin as v1: the golden round-trips through the
+    // real toolchain serializer unchanged.
+    let (text, v) = load_golden_v2();
+    let back = serde_json::to_string_pretty(&v).unwrap() + "\n";
+    assert_eq!(
+        text, back,
+        "v2 golden is not byte-stable under re-serialize"
+    );
+    // And it equals a fresh render of the fixture (the emitter, not
+    // a hand-written lookalike, is the shape source).
+    let fresh = render_json(&auditor_v2_fixture()).unwrap();
+    assert_eq!(
+        text.as_bytes(),
+        fresh.as_slice(),
+        "v2 golden drifted from emitter"
+    );
+}
+
+#[test]
+fn golden_v2_exercises_branches() {
+    let (_, v) = load_golden_v2();
+    let o = v.as_object().unwrap();
+    assert_eq!(o["schema_version"], "observed-crypto-v2.0");
+    assert!(
+        !o["sites"].as_array().unwrap().is_empty(),
+        "v2 golden needs sites"
+    );
+    assert!(
+        o["sites"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["candidates"].as_array().unwrap().len() > 1),
+        "v2 golden needs an ambiguous site"
+    );
+    assert!(
+        !o["fenced"].as_array().unwrap().is_empty()
+            && !o["fenced"][0]["sites"].as_array().unwrap().is_empty(),
+        "v2 golden needs fenced detail"
+    );
+    assert!(o.contains_key("policy"), "v2 golden needs policy");
+    assert_eq!(o["policy"]["verdict"], "violation");
+    assert!(o.contains_key("disposition"), "v2 golden needs disposition");
+    assert_eq!(o["openssl"]["state"], "verified");
+}
+
+#[test]
+fn tampered_v2_documents_rejected() {
+    // Negative proof for the v2 checker: every tamper below must
+    // fail schema validation, semantics, or both. Cases marked
+    // `semantics` pass the schema by design (JSON Schema cannot
+    // express them) and must fail the semantic layer instead.
+    type Tamper = (&'static str, Option<&'static str>, Box<dyn Fn(&mut Value)>);
+    let (_, v) = load_golden_v2();
+    let mut cases: Vec<Tamper> = Vec::new();
+    cases.push((
+        "drop sites",
+        None,
+        Box::new(|d: &mut Value| {
+            d.as_object_mut().unwrap().remove("sites");
+        }),
+    ));
+    cases.push((
+        "add top-level key",
+        None,
+        Box::new(|d: &mut Value| {
+            d["extra"] = Value::from(1);
+        }),
+    ));
+    cases.push((
+        "status vocabulary",
+        None,
+        Box::new(|d: &mut Value| {
+            d["completeness"]["status"] = Value::from("COMPLETE-ISH");
+        }),
+    ));
+    cases.push((
+        "unknown reason kind",
+        None,
+        Box::new(|d: &mut Value| {
+            d["completeness"]["reasons"] = Value::from(vec![serde_json::json!({"kind": "bogus"})]);
+        }),
+    ));
+    cases.push((
+        "drop counter value",
+        None,
+        Box::new(|d: &mut Value| {
+            d["completeness"]["counters"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("value");
+        }),
+    ));
+    cases.push((
+        "count type flip",
+        None,
+        Box::new(|d: &mut Value| {
+            d["sites"][0]["calls"] = Value::from("400");
+        }),
+    ));
+    cases.push((
+        "v1 schema_version",
+        Some("semantics"),
+        Box::new(|d: &mut Value| {
+            d["schema_version"] = Value::from("observed-crypto-v1.0");
+        }),
+    ));
+    cases.push((
+        "negative calls",
+        None,
+        Box::new(|d: &mut Value| {
+            d["sites"][0]["calls"] = Value::from(-1);
+        }),
+    ));
+    cases.push((
+        "dangling object ref",
+        Some("semantics"),
+        Box::new(|d: &mut Value| {
+            d["sites"][0]["object"] = Value::from("build:nope");
+        }),
+    ));
+    cases.push((
+        "inconsistent window",
+        Some("semantics"),
+        Box::new(|d: &mut Value| {
+            d["window"]["effective_end_ns"] = Value::from(99_000_000_000u64);
+        }),
+    ));
+    cases.push((
+        "smuggled address",
+        None,
+        Box::new(|d: &mut Value| {
+            d["sites"][0]["address"] = Value::from(140737348900864u64);
+        }),
+    ));
+    cases.push((
+        "argv_redacted false",
+        None,
+        Box::new(|d: &mut Value| {
+            d["target"]["argv_redacted"] = Value::from(false);
+        }),
+    ));
+    cases.push((
+        "policy bad verdict",
+        None,
+        Box::new(|d: &mut Value| {
+            d["policy"]["verdict"] = Value::from("unknown");
+        }),
+    ));
+    cases.push((
+        "evidence wrong generation",
+        Some("semantics"),
+        Box::new(|d: &mut Value| {
+            d["policy"]["rules"][0]["evidence"][0]["generation"] = Value::from(9);
+        }),
+    ));
+    cases.push((
+        "exited without code",
+        Some("semantics"),
+        Box::new(|d: &mut Value| {
+            d["disposition"]["code"] = Value::Null;
+        }),
+    ));
+    cases.push((
+        "definite exceeds possible",
+        Some("semantics"),
+        Box::new(|d: &mut Value| {
+            d["policy"]["rules"][0]["definite"] = Value::from(441);
+        }),
+    ));
+    cases.push((
+        "verdict contradicts rules",
+        Some("semantics"),
+        Box::new(|d: &mut Value| {
+            d["policy"]["verdict"] = Value::from("pass");
+        }),
+    ));
+    cases.push((
+        "site contradicts object triple",
+        Some("semantics"),
+        Box::new(|d: &mut Value| {
+            d["sites"][0]["inode"] = Value::from(999);
+        }),
+    ));
+    assert!(!cases.is_empty());
+    for (name, layer, tamper) in &cases {
+        let mut d = v.clone();
+        tamper(&mut d);
+        let schema_err = validate_v2(&d).is_err();
+        let semantics_err = check_v2_semantics(&d).is_err();
+        match *layer {
+            Some("semantics") => {
+                assert!(
+                    !schema_err,
+                    "tamper must pass schema by design (case {name}): use a semantic-only shape"
+                );
+                assert!(semantics_err, "tamper accepted (must reject): {name}");
+            }
+            _ => {
+                assert!(
+                    schema_err || semantics_err,
+                    "tamper accepted (must reject): {name}"
+                );
+            }
+        }
+        assert!(
+            check_auditor_v2_shape(&d).is_err(),
+            "auditor v2 checker accepted tamper: {name}"
+        );
+    }
+}
+
+#[test]
+fn story_v2_output_conforms() {
+    // Explicitly supplied v2 artifacts (fresh generator output, live
+    // story captures) validate with the same checker. Unset (CI
+    // default) -> nothing to validate, pass.
+    let Some(path) = std::env::var_os("OSSLSCOPE_AUDITOR_STORY_V2") else {
+        return;
+    };
+    let text = std::fs::read_to_string(&path).unwrap();
+    let v: Value = serde_json::from_str(&text).unwrap();
+    check_auditor_v2_shape(&v).expect("supplied v2 artifact must conform");
 }

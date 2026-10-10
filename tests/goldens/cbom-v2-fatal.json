@@ -1,0 +1,58 @@
+{
+  "bomFormat": "CycloneDX",
+  "components": [],
+  "metadata": {
+    "properties": [
+      {
+        "name": "osslscope:schema-version",
+        "value": "observed-crypto-v2.0"
+      },
+      {
+        "name": "osslscope:execution-evidence-completeness",
+        "value": "FATAL"
+      },
+      {
+        "name": "osslscope:omitted-ambiguous-sites",
+        "value": "0"
+      },
+      {
+        "name": "osslscope:omitted-ambiguous-calls",
+        "value": "0"
+      },
+      {
+        "name": "osslscope:omitted-unknown-coverage-sites",
+        "value": "0"
+      },
+      {
+        "name": "osslscope:omitted-unknown-coverage-calls",
+        "value": "0"
+      },
+      {
+        "name": "osslscope:omitted-evidence-refs",
+        "value": ""
+      },
+      {
+        "name": "osslscope:window-requested-start-ns",
+        "value": "1000"
+      },
+      {
+        "name": "osslscope:window-requested-end-ns",
+        "value": "31000"
+      },
+      {
+        "name": "osslscope:window-effective-start-ns",
+        "value": "31000"
+      },
+      {
+        "name": "osslscope:window-effective-end-ns",
+        "value": "31000"
+      },
+      {
+        "name": "osslscope:completeness-disclaimer",
+        "value": "FATAL: no usable evidence (startup-gap)"
+      }
+    ]
+  },
+  "specVersion": "1.6",
+  "version": 1
+}

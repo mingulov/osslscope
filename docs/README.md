@@ -19,5 +19,6 @@ Product documentation. Start with the README, then:
 - `builtin-runbook.md` - stripped/unknown-libcrypto recipe for
   `--builtin` inventory
 - `trace-gap.md` - osslscope vs OSSL_TRACE side-by-side
+- `observed-crypto-v2.md` - v2 report/check JSON, human and CBOM contract
 - `privacy/allowlist-v1.md` - capture allowlist: what may be observed
 - `privacy/residuals.md` - privacy residuals beyond the allowlist

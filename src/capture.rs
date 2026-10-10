@@ -48,8 +48,9 @@ use crate::discovery::session::{
 use crate::discovery::{coverage, elf, legacy, maps};
 use crate::evidence::{
     self, CandidateCoverage, CandidateIdentity, CaptureDocument, CaptureWindow, Completeness,
-    CounterKind, CounterSource, CounterUnits, ExpectedScope, FinalizeInput, GapCounter, GapReason,
-    ObjectId, ObjectRecord, ScopeCoverage, SiteExecution, SiteKey,
+    CounterKind, CounterSource, CounterUnits, DispositionRecord, ExpectedScope, FinalizeInput,
+    GapCounter, GapReason, ObjectId, ObjectRecord, OpensslVersion, ScopeCoverage, SiteExecution,
+    SiteKey, TargetRecord,
 };
 use crate::{args, kinds, pin, plan, target};
 use anyhow::Context as _;
@@ -220,7 +221,46 @@ pub fn empty_document() -> CaptureDocument {
         coverage: Vec::new(),
         counters: Vec::new(),
         fatal: None,
+        target: TargetRecord::unknown(),
+        openssl: OpensslVersion::unknown(),
+        disposition: None,
+        policy: None,
     })
+}
+
+/// v2 document target context: mirrors the legacy `Capture` target
+/// fields exactly (settled comm plus container/image provenance;
+/// never raw argv/cmdline).
+fn doc_target(pid: u32, comm: &str, container_id: &str, image_digest: &str) -> TargetRecord {
+    TargetRecord::new(
+        pid,
+        comm.to_string(),
+        container_id.to_string(),
+        image_digest.to_string(),
+    )
+}
+
+/// Custody disposition → v2 document value. Foreign `--pid` finish
+/// reports `Detached` ("left running, never signaled — documented,
+/// not custody"), which the document records distinctly from an
+/// owned detach (explicit ownership transfer). `None` (never
+/// recorded, e.g. mid-window recycle) stays `None`.
+fn doc_disposition(
+    owned: bool,
+    disposition: Option<&target::TargetDisposition>,
+) -> Option<DispositionRecord> {
+    match (owned, disposition) {
+        (_, Some(target::TargetDisposition::Exited { code })) => {
+            Some(DispositionRecord::exited(*code))
+        }
+        (true, Some(target::TargetDisposition::Detached { pid })) => {
+            Some(DispositionRecord::detached_running(*pid))
+        }
+        (false, Some(target::TargetDisposition::Detached { pid })) => {
+            Some(DispositionRecord::foreign_observed(*pid))
+        }
+        (_, None) => None,
+    }
 }
 
 // ---------------------------------------------------------------- signals
@@ -1843,6 +1883,15 @@ where
             coverage: Vec::new(),
             counters: Vec::new(),
             fatal: None,
+            target: doc_target(
+                self.info.pid,
+                &self.comm,
+                &self.info.container_id,
+                &self.info.image_digest,
+            ),
+            openssl: OpensslVersion::unknown(),
+            disposition: self.child_exit.map(DispositionRecord::exited),
+            policy: None,
         });
         self.emit_gap_reasons(document.reasons());
         if !self.trigger_observed {
@@ -1895,6 +1944,15 @@ where
             coverage: Vec::new(),
             counters: Vec::new(),
             fatal: Some(evidence::FatalKind::Recycled),
+            target: doc_target(
+                self.info.pid,
+                &self.comm,
+                &self.info.container_id,
+                &self.info.image_digest,
+            ),
+            openssl: OpensslVersion::unknown(),
+            disposition: None,
+            policy: None,
         });
         self.reasons.clear();
         self.reason("pid-recycled");
@@ -2649,6 +2707,15 @@ where
             coverage,
             counters,
             fatal,
+            target: doc_target(
+                self.info.pid,
+                &self.comm,
+                &self.info.container_id,
+                &self.info.image_digest,
+            ),
+            openssl: OpensslVersion::unknown(),
+            disposition: doc_disposition(self.info.owned, Some(&disposition)),
+            policy: None,
         });
 
         // Legacy `legacy` block from IN-WINDOW tripwire evidence only
@@ -2971,6 +3038,10 @@ fn recycled_capture(cfg: &Config, info: &TargetInfo) -> Capture {
         coverage: Vec::new(),
         counters: Vec::new(),
         fatal: Some(evidence::FatalKind::Recycled),
+        target: doc_target(info.pid, &info.comm, &info.container_id, &info.image_digest),
+        openssl: OpensslVersion::unknown(),
+        disposition: None,
+        policy: None,
     });
     Capture {
         target_pid: info.pid,

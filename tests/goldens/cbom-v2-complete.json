@@ -1,0 +1,187 @@
+{
+  "bomFormat": "CycloneDX",
+  "components": [
+    {
+      "bom-ref": "urn:osslscope:exec:v2:0:8:100:4096:build:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef:AES-128-GCM",
+      "cryptoProperties": {
+        "assetType": "algorithm"
+      },
+      "name": "AES-128-GCM (CIPHER) via default",
+      "properties": [
+        {
+          "name": "osslscope:algorithm",
+          "value": "AES-128-GCM"
+        },
+        {
+          "name": "osslscope:provider-class",
+          "value": "default"
+        },
+        {
+          "name": "osslscope:provider-object",
+          "value": "build:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        },
+        {
+          "name": "osslscope:backing-object",
+          "value": "build:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        },
+        {
+          "name": "osslscope:op",
+          "value": "CIPHER"
+        },
+        {
+          "name": "osslscope:funcid",
+          "value": "21"
+        },
+        {
+          "name": "osslscope:calls",
+          "value": "500"
+        },
+        {
+          "name": "osslscope:generation",
+          "value": "0"
+        },
+        {
+          "name": "osslscope:weak-alias",
+          "value": "false"
+        },
+        {
+          "name": "osslscope:execution-evidence-completeness",
+          "value": "COMPLETE"
+        },
+        {
+          "name": "osslscope:window-requested-start-ns",
+          "value": "0"
+        },
+        {
+          "name": "osslscope:window-requested-end-ns",
+          "value": "100"
+        },
+        {
+          "name": "osslscope:window-effective-start-ns",
+          "value": "0"
+        },
+        {
+          "name": "osslscope:window-effective-end-ns",
+          "value": "100"
+        }
+      ],
+      "type": "cryptographic-asset"
+    },
+    {
+      "bom-ref": "urn:osslscope:exec:v2:0:8:100:8192:build:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef:SHA-256",
+      "cryptoProperties": {
+        "assetType": "algorithm"
+      },
+      "name": "SHA-256 (DIGEST) via default",
+      "properties": [
+        {
+          "name": "osslscope:algorithm",
+          "value": "SHA-256"
+        },
+        {
+          "name": "osslscope:provider-class",
+          "value": "default"
+        },
+        {
+          "name": "osslscope:provider-object",
+          "value": "build:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        },
+        {
+          "name": "osslscope:backing-object",
+          "value": "build:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        },
+        {
+          "name": "osslscope:op",
+          "value": "DIGEST"
+        },
+        {
+          "name": "osslscope:funcid",
+          "value": "7"
+        },
+        {
+          "name": "osslscope:calls",
+          "value": "300"
+        },
+        {
+          "name": "osslscope:generation",
+          "value": "0"
+        },
+        {
+          "name": "osslscope:weak-alias",
+          "value": "false"
+        },
+        {
+          "name": "osslscope:execution-evidence-completeness",
+          "value": "COMPLETE"
+        },
+        {
+          "name": "osslscope:window-requested-start-ns",
+          "value": "0"
+        },
+        {
+          "name": "osslscope:window-requested-end-ns",
+          "value": "100"
+        },
+        {
+          "name": "osslscope:window-effective-start-ns",
+          "value": "0"
+        },
+        {
+          "name": "osslscope:window-effective-end-ns",
+          "value": "100"
+        }
+      ],
+      "type": "cryptographic-asset"
+    }
+  ],
+  "metadata": {
+    "properties": [
+      {
+        "name": "osslscope:schema-version",
+        "value": "observed-crypto-v2.0"
+      },
+      {
+        "name": "osslscope:execution-evidence-completeness",
+        "value": "COMPLETE"
+      },
+      {
+        "name": "osslscope:omitted-ambiguous-sites",
+        "value": "1"
+      },
+      {
+        "name": "osslscope:omitted-ambiguous-calls",
+        "value": "100"
+      },
+      {
+        "name": "osslscope:omitted-unknown-coverage-sites",
+        "value": "0"
+      },
+      {
+        "name": "osslscope:omitted-unknown-coverage-calls",
+        "value": "0"
+      },
+      {
+        "name": "osslscope:omitted-evidence-refs",
+        "value": "build:fedcba@4096#0:100"
+      },
+      {
+        "name": "osslscope:window-requested-start-ns",
+        "value": "0"
+      },
+      {
+        "name": "osslscope:window-requested-end-ns",
+        "value": "100"
+      },
+      {
+        "name": "osslscope:window-effective-start-ns",
+        "value": "0"
+      },
+      {
+        "name": "osslscope:window-effective-end-ns",
+        "value": "100"
+      }
+    ]
+  },
+  "specVersion": "1.6",
+  "version": 1
+}
