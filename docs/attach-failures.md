@@ -49,6 +49,7 @@ failure and exits 4. The checks, in the order to fix them:
 | `lockdown=confidentiality` | Lockdown blocks BPF even with caps held. | Observe on a host without confidentiality lockdown. |
 | `lsm` | Active LSM denial (AppArmor/SELinux policy). | Adjust the host policy per the `remediate:` line (package note included); re-run `doctor`. |
 | `seccomp` | A seccomp filter may be EPERMing `bpf`/`perf_event_open` syscalls. | Restricted-seccomp environments (locked-down shared CI, Autopilot-class) are unproven stretch: move the gate to a VM/self-hosted runner where `doctor` goes green. |
+| `spawn-access` | The spawn-setup probe child maps are unreadable or empty (the observer's pre-exec self-dumpable call failed, or the kernel denies same-uid reads anyway). `run --` setup would fail the same way. | Run once with sudo to confirm the environment, then report it: this row failing means the product mechanism broke, not the install. |
 | `pidns` | Observer and target are in different pid namespaces. | Observe from the target's pid namespace (see [staging deploy](staging-deploy.md)). |
 | `libcrypto-found` | Target maps no readable libcrypto (wrong path, `ENOENT`, `(deleted)` after upgrade, or a static binary). | Fix the path; for static binaries see below. |
 | `arch` | Non-x86-64 target (including 32-bit). | v1 is x86-64-only; observe an x86-64 build. |
