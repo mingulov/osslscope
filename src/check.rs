@@ -1,21 +1,26 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
-//! P3 `check`: bounded-window policy gate (CI use).
+//! T10 `check`: R06 policy gate over the finalized v2 evidence document.
 //!
-//! `check [capture flags] [rules] {--pid P | run -- <cmd>}`
+//! `check [capture flags] [rules] [--cbom FILE] {--pid P | run -- <cmd>}`
 //! Rules (AND semantics, repeatable): `--require-provider P`,
 //! `--deny-provider P`, `--deny-engine`, `--deny-algorithm X`,
 //! `--deny-weak`, `--require-executed X`.
 //!
-//! Match domain is EXECUTED evidence (current + fenced detail):
-//! queried-but-unexecuted classes (legacy block) are reported, not
-//! policy-evaluated. Provider labels are file stems (`default` for
-//! `--builtin`, else the provider .so stem) — exact match; the PRD
-//! §7 `third-party:<hash>` class mapping is P5. Algorithm names are
-//! exact frozen-registry matches (unknown → exit 2, typo-safe).
-//! Require-rules on PARTIAL evidence fail closed (exit 10 with the
-//! PARTIAL caveat); on FATAL there is no verdict at all (exit 4).
-//! Exit 11 is reserved and never emitted in v1 (gate record).
+//! Match domain is EXECUTED evidence (current + fenced sites) from
+//! `capture.document`: queried-but-unexecuted shape and query/load
+//! counters are reported, never policy-evaluated. Predicates match by
+//! pinned provider class and classified algorithm (spec R06):
+//! `--require-provider` stays existential, registry typos stay usage
+//! errors, and possible use is inconclusive — never a definite
+//! violation. Exit 11 carries `policy.verdict = inconclusive` (CI fails
+//! closed); a proved violation stays exit 10 even when an artifact path
+//! is unwritable or the child failed.
 use crate::capture;
+use crate::evidence::{CaptureDocument, Completeness, GapReason, RuleVerdict};
+use crate::policy::{
+    DefiniteHit, PolicyOutcome, PolicyRule, PolicyVerdict, apply_legacy_engine_fallback,
+    evaluate_document, executed_param_blind_ops, fips_unlabeled_calls,
+};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -41,247 +46,29 @@ impl RuleSet {
     }
 }
 
-/// One executed identity (current or fenced) for rule matching.
-struct Exec<'a> {
-    provider: &'a str,
-    op: u32,
-    funcid: u32,
-    alg: &'a str,
-    count: u64,
-    first_ns: u64,
-    last_ns: u64,
-    fenced_gen: Option<u32>,
-}
-
-/// Executed evidence: current executions plus fenced detail.
-fn execs(c: &capture::Capture) -> Vec<Exec<'_>> {
-    let mut v: Vec<Exec<'_>> = c
-        .executions
-        .iter()
-        .map(|e| Exec {
-            provider: &e.id.provider,
-            op: e.id.op,
-            funcid: e.id.funcid,
-            alg: &e.id.alg_class,
-            count: e.count,
-            first_ns: e.first_ns,
-            last_ns: e.last_ns,
-            fenced_gen: None,
-        })
-        .collect();
-    for s in &c.stale {
-        for d in &s.detail {
-            v.push(Exec {
-                provider: &d.id.provider,
-                op: d.id.op,
-                funcid: d.id.funcid,
-                alg: &d.id.alg_class,
-                count: d.count,
-                first_ns: d.first_ns,
-                last_ns: d.last_ns,
-                fenced_gen: Some(s.generation),
-            });
-        }
-    }
-    v
-}
-
-/// One violation with the actionability tuple (PRD §6): the
-/// capture-level tuple (window, cmdline, container, image,
-/// provider object) rides in the JSON envelope; the per-violation
-/// identity rides here. `absent` require-violations carry no
-/// identity (nothing matched); engine violations are untimed
-/// (tripwire counts only).
-#[derive(Debug)]
-pub(crate) struct Violation {
-    pub rule: String,
-    pub matcher: String,
-    pub provider_label: String,
-    pub op: u32,
-    pub op_name: String,
-    pub alg: String,
-    pub funcid: u32,
-    pub count: u64,
-    pub first_ns: Option<u64>,
-    pub last_ns: Option<u64>,
-    pub fenced_gen: Option<u32>,
-    pub absent: bool,
-}
-
-#[derive(Debug)]
-pub(crate) struct RuleResult {
-    pub rule: String,
-    pub value: String,
-    pub passed: bool,
-    pub matches: u64,
-}
-
-#[derive(Debug)]
-pub(crate) struct Verdict {
-    pub no_verdict: bool,
-    pub violations: Vec<Violation>,
-    pub results: Vec<RuleResult>,
-    pub unseen_deny_providers: Vec<String>,
-    pub param_blind: bool,
-}
-
-/// Evaluate rules against executed evidence (pure — unit-tested).
-/// Unknown registry names are rejected by parse (exit 2), so this
-/// never sees them. FATAL evidence yields no verdict (nothing to
-/// evaluate — never a violation without evidence).
-pub(crate) fn evaluate(c: &capture::Capture, rules: &RuleSet) -> Verdict {
-    if matches!(c.outcome, capture::Outcome::Fatal(_)) {
-        return Verdict {
-            no_verdict: true,
-            violations: Vec::new(),
-            results: Vec::new(),
-            unseen_deny_providers: Vec::new(),
-            param_blind: false,
-        };
-    }
-    let ex = execs(c);
-    let mut v = Verdict {
-        no_verdict: false,
-        violations: Vec::new(),
-        results: Vec::new(),
-        unseen_deny_providers: Vec::new(),
-        param_blind: !rules.deny_algorithm.is_empty(),
-    };
-    let hit = |e: &Exec<'_>, rule: &str, matcher: String| Violation {
-        rule: rule.to_string(),
-        matcher,
-        provider_label: e.provider.to_string(),
-        op: e.op,
-        op_name: crate::report::op_display(e.op),
-        alg: e.alg.to_string(),
-        funcid: e.funcid,
-        count: e.count,
-        first_ns: Some(e.first_ns),
-        last_ns: Some(e.last_ns),
-        fenced_gen: e.fenced_gen,
-        absent: false,
-    };
-    let miss = |rule: &str, matcher: &str| Violation {
-        rule: rule.to_string(),
-        matcher: matcher.to_string(),
-        provider_label: String::new(),
-        op: 0,
-        op_name: String::new(),
-        alg: String::new(),
-        funcid: 0,
-        count: 0,
-        first_ns: None,
-        last_ns: None,
-        fenced_gen: None,
-        absent: true,
-    };
+/// Map CLI rules to typed policy rules through the single
+/// [`PolicyRule`] constructors (evaluation order below).
+fn policy_rules(rules: &RuleSet) -> Vec<PolicyRule> {
+    let mut out = Vec::new();
     for p in &rules.require_provider {
-        let n: u64 = ex.iter().filter(|e| e.provider == p).map(|e| e.count).sum();
-        let passed = n > 0;
-        if !passed {
-            v.violations.push(miss("require-provider", p));
-        }
-        v.results.push(RuleResult {
-            rule: "require-provider".to_string(),
-            value: p.clone(),
-            passed,
-            matches: n,
-        });
+        out.push(PolicyRule::require_provider(p));
     }
     for p in &rules.deny_provider {
-        let hits: Vec<&Exec<'_>> = ex.iter().filter(|e| e.provider == p).collect();
-        if hits.is_empty() && !v.unseen_deny_providers.iter().any(|u| u == p) {
-            v.unseen_deny_providers.push(p.clone());
-        }
-        for e in &hits {
-            v.violations.push(hit(e, "deny-provider", (*p).clone()));
-        }
-        v.results.push(RuleResult {
-            rule: "deny-provider".to_string(),
-            value: p.clone(),
-            passed: hits.is_empty(),
-            matches: hits.iter().map(|e| e.count).sum(),
-        });
+        out.push(PolicyRule::deny_provider(p));
     }
     if rules.deny_engine {
-        let calls = c
-            .legacy
-            .pointer("/engine/calls_by_entrypoint")
-            .and_then(|m| m.as_object())
-            .map(|m| {
-                let mut v: Vec<(&String, u64)> = m
-                    .iter()
-                    .map(|(k, n)| (k, n.as_u64().unwrap_or(0)))
-                    .filter(|(_, n)| *n > 0)
-                    .collect();
-                v.sort_by(|a, b| a.0.cmp(b.0));
-                v
-            })
-            .unwrap_or_default();
-        for (entry, n) in &calls {
-            v.violations.push(Violation {
-                rule: "deny-engine".to_string(),
-                matcher: (*entry).clone(),
-                provider_label: "engine".to_string(),
-                op: 0,
-                op_name: "ENGINE".to_string(),
-                alg: (*entry).clone(),
-                funcid: 0,
-                count: *n,
-                first_ns: None,
-                last_ns: None,
-                fenced_gen: None,
-                absent: false,
-            });
-        }
-        v.results.push(RuleResult {
-            rule: "deny-engine".to_string(),
-            value: String::new(),
-            passed: calls.is_empty(),
-            matches: calls.iter().map(|(_, n)| n).sum(),
-        });
+        out.push(PolicyRule::deny_engine());
     }
     for a in &rules.deny_algorithm {
-        let hits: Vec<&Exec<'_>> = ex.iter().filter(|e| e.alg == a).collect();
-        for e in &hits {
-            v.violations.push(hit(e, "deny-algorithm", (*a).clone()));
-        }
-        v.results.push(RuleResult {
-            rule: "deny-algorithm".to_string(),
-            value: a.clone(),
-            passed: hits.is_empty(),
-            matches: hits.iter().map(|e| e.count).sum(),
-        });
+        out.push(PolicyRule::deny_algorithm(a));
     }
     if rules.deny_weak {
-        let hits: Vec<&Exec<'_>> = ex
-            .iter()
-            .filter(|e| crate::kinds::is_weak_alg(e.alg))
-            .collect();
-        for e in &hits {
-            v.violations.push(hit(e, "deny-weak", e.alg.to_string()));
-        }
-        v.results.push(RuleResult {
-            rule: "deny-weak".to_string(),
-            value: String::new(),
-            passed: hits.is_empty(),
-            matches: hits.iter().map(|e| e.count).sum(),
-        });
+        out.push(PolicyRule::deny_weak());
     }
     for x in &rules.require_executed {
-        let n: u64 = ex.iter().filter(|e| e.alg == x).map(|e| e.count).sum();
-        let passed = n > 0;
-        if !passed {
-            v.violations.push(miss("require-executed", x));
-        }
-        v.results.push(RuleResult {
-            rule: "require-executed".to_string(),
-            value: x.clone(),
-            passed,
-            matches: n,
-        });
+        out.push(PolicyRule::require_executed(x));
     }
-    v
+    out
 }
 
 struct Args {
@@ -289,36 +76,53 @@ struct Args {
     target: capture::Target,
     format: String,
     out: Option<String>,
+    cbom: Option<String>,
     rules: RuleSet,
 }
 
-/// Exit for a checked capture (pure — unit-tested). Violation
-/// dominates (even child failure); otherwise child failure, then
-/// evidence status. Exit 11 is reserved and never emitted in v1.
-fn exit_for(c: &capture::Capture, v: &Verdict) -> u8 {
-    if !v.violations.is_empty() {
+/// Exit for a checked capture (pure — unit-tested). R06 precedence,
+/// after attempting requested artifacts: fatal is 4, a proved
+/// violation is 10 (even with child/artifact failure), otherwise a
+/// failed child or failed required artifact is 1, an unproven rule is
+/// 11, a signal-cut or PARTIAL window with a passing verdict is 3,
+/// else 0. Usage errors (2) never reach this function.
+pub fn exit_for(
+    outcome: PolicyOutcome,
+    child_exit: Option<i32>,
+    doc: &CaptureDocument,
+    delivery: &DeliveryResult,
+) -> u8 {
+    if outcome == PolicyOutcome::NoVerdict {
+        return 4;
+    }
+    if outcome == PolicyOutcome::Violation {
         return 10;
     }
-    if matches!(c.child_exit, Some(code) if code != 0) {
+    if matches!(child_exit, Some(code) if code != 0) {
         return 1;
     }
-    match &c.outcome {
-        capture::Outcome::Fatal(_) => 4,
-        capture::Outcome::Partial => 3,
-        capture::Outcome::Complete => 0,
+    if delivery.failed() {
+        return 1;
+    }
+    if outcome == PolicyOutcome::Inconclusive {
+        return 11;
+    }
+    match &doc.status {
+        Completeness::Complete => 0,
+        Completeness::Partial { .. } | Completeness::Fatal { .. } => 3,
     }
 }
 
-// Capture-flag parsing intentionally mirrors report::parse: the
-// two flag sets diverge (report owns --cbom, check owns rules),
-// and a shared strict parser costs more than it saves. The rule
-// flags are check-only (repeatable; validated below).
+// Capture-flag parsing intentionally mirrors report::parse: the two
+// flag sets share capture/cbom flags but diverge on rules vs report
+// options, and a shared strict parser costs more than it saves.
 fn parse(argv: &[String]) -> Result<Args, String> {
     // T04 (coordinator review): time flags are captured raw and validated
     // once via args::parse_seconds below (R08 bounds, no panics).
     let mut duration_raw: Option<String> = None;
     let mut format = "human".to_string();
     let mut out: Option<String> = None;
+    let mut cbom: Option<String> = None;
     let mut provider: Option<String> = None;
     let mut builtin = false;
     let mut object: Option<String> = None;
@@ -346,6 +150,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             "--duration" => duration_raw = Some(val(a)?),
             "--format" => format = val(a)?,
             "--out" => out = Some(val(a)?),
+            "--cbom" => cbom = Some(val(a)?),
             "--provider" => provider = Some(val(a)?),
             "--builtin" => {
                 builtin = true;
@@ -414,7 +219,9 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         None => Duration::from_secs(5),
     };
     // Algorithm names are exact frozen-registry matches: unknown
-    // names are config errors, never silent non-matches.
+    // names are config errors, never silent non-matches. Provider
+    // classes stay unvalidated: third-party opaque ids are open-ended,
+    // so no finite registry can enumerate them.
     for a in rules.deny_algorithm.iter().chain(&rules.require_executed) {
         if !crate::kinds::is_known_alg(a) {
             return Err(format!("unknown algorithm '{a}' (not in frozen registry)"));
@@ -441,187 +248,437 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         target,
         format,
         out,
+        cbom,
         rules,
     })
 }
 
-/// One violation as JSON: per-violation identity plus the
-/// capture-level actionability tuple (PRD §6).
-fn violation_json(c: &capture::Capture, x: &Violation) -> serde_json::Value {
-    serde_json::json!({
-        "rule": x.rule,
-        "matcher": x.matcher,
-        "provider_label": x.provider_label,
-        "op": x.op,
-        "op_name": x.op_name,
-        "alg": x.alg,
-        "funcid": x.funcid,
-        "count": x.count,
-        "first_ns": x.first_ns,
-        "last_ns": x.last_ns,
-        "fenced_gen": x.fenced_gen,
-        "absent": x.absent,
-        "window": {
-            "start_epoch": crate::report::epoch_of(c.window_start_wall),
-            "end_epoch": crate::report::epoch_of(c.window_end_wall),
-        },
-        "cmdline": c.target_cmdline,
-        "container_id": c.target_container_id,
-        "image_digest": c.image_digest,
-        "provider": {"path": c.provider_path, "build_id": c.provider_build_id},
-    })
+/// Deny-provider matchers proved absent (definite 0, possible exactly
+/// 0): typo visibility. Ambiguous matchers might be present and are not
+/// listed here.
+fn unseen_deny_providers(v: &PolicyVerdict) -> Vec<&str> {
+    v.rules
+        .iter()
+        .filter(|r| {
+            r.name == "deny-provider" && r.bounds.definite == 0 && r.bounds.possible == Some(0)
+        })
+        .map(|r| r.matcher.as_str())
+        .collect()
 }
 
-/// The `policy` document section (CI-parseable verdict).
-pub(crate) fn policy_json(c: &capture::Capture, v: &Verdict) -> serde_json::Value {
-    let verdict = if v.no_verdict {
-        "no-verdict"
-    } else if v.violations.is_empty() {
-        "pass"
-    } else {
-        "violation"
+/// The parameter caveat fires only when algorithm rules meet executed
+/// parameter-blind operations — the ambiguity that actually shaped a
+/// bound, not a blanket flag.
+fn param_blind(doc: &CaptureDocument, v: &PolicyVerdict) -> bool {
+    v.rules
+        .iter()
+        .any(|r| matches!(r.name, "deny-algorithm" | "require-executed"))
+        && executed_param_blind_ops(doc)
+}
+
+/// Legacy ENGINE tripwire calls from the pre-T08 `legacy` block
+/// (v1 shape; T08 retires it once ENGINE executions surface as
+/// document sites). Sums positive per-entrypoint counts; a missing or
+/// misshapen block contributes nothing.
+pub(crate) fn legacy_engine_calls(legacy: &serde_json::Value) -> u64 {
+    legacy
+        .pointer("/engine/calls_by_entrypoint")
+        .and_then(|m| m.as_object())
+        .map(|m| m.values().map(|n| n.as_u64().unwrap_or(0)).sum())
+        .unwrap_or(0)
+}
+
+/// The `policy` document section (CI-parseable verdict). T10-owned:
+/// T11's real artifact renderer reuses this section verbatim.
+pub fn policy_json(doc: &CaptureDocument, v: &PolicyVerdict) -> serde_json::Value {
+    let verdict = match v.overall() {
+        PolicyOutcome::NoVerdict => "no-verdict",
+        PolicyOutcome::Pass => "pass",
+        PolicyOutcome::Violation => "violation",
+        PolicyOutcome::Inconclusive => "inconclusive",
     };
+    let mut violations: Vec<serde_json::Value> = Vec::new();
+    for r in v
+        .rules
+        .iter()
+        .filter(|r| r.verdict == RuleVerdict::Violation)
+    {
+        if matches!(r.name, "require-provider" | "require-executed") {
+            violations.push(serde_json::json!({
+                "rule": r.name,
+                "matcher": r.matcher,
+                "absent": true,
+                "definite": r.bounds.definite,
+                "possible": r.bounds.possible,
+            }));
+            continue;
+        }
+        debug_assert!(
+            !r.hits.is_empty() || r.legacy_engine_calls > 0,
+            "deny violations always carry definite hits or legacy tripwire evidence"
+        );
+        for h in &r.hits {
+            violations.push(serde_json::json!({
+                "rule": r.name,
+                "matcher": r.matcher,
+                "absent": false,
+                "site": h.site,
+                "generation": h.generation,
+                "fenced": h.fenced,
+                "calls": h.calls,
+                "first_ns": h.first_ns,
+                "last_ns": h.last_ns,
+                "candidates": h.candidates,
+            }));
+        }
+        if r.hits.is_empty() && r.legacy_engine_calls > 0 {
+            violations.push(serde_json::json!({
+                "rule": r.name,
+                "matcher": r.matcher,
+                "absent": false,
+                "legacy": true,
+                "timed": false,
+                "calls": r.legacy_engine_calls,
+            }));
+        }
+    }
     serde_json::json!({
         "verdict": verdict,
-        "rules": v.results.iter().map(|r| serde_json::json!({
-            "rule": r.rule,
-            "value": r.value,
-            "result": if r.passed { "pass" } else { "violation" },
-            "matches": r.matches,
+        "rules": v.rules.iter().map(|r| serde_json::json!({
+            "rule": r.name,
+            "value": r.matcher,
+            "result": match r.verdict {
+                RuleVerdict::Pass => "pass",
+                RuleVerdict::Violation => "violation",
+                RuleVerdict::Inconclusive => "inconclusive",
+            },
+            "definite": r.bounds.definite,
+            "possible": r.bounds.possible,
+            "relevant_complete": r.relevant_complete,
         })).collect::<Vec<_>>(),
-        "violations": v.violations.iter().map(|x| violation_json(c, x)).collect::<Vec<_>>(),
-        "unseen_deny_providers": v.unseen_deny_providers,
-        "param_blind": v.param_blind,
+        "violations": violations,
+        "unseen_deny_providers": unseen_deny_providers(v),
+        "param_blind": param_blind(doc, v),
         "kat_excluded": 0,
-        "kat_note": "v1 executions are unlabeled (no KAT discriminator); exclusion vacuous — see fips-unlabeled",
+        "kat_note": "executions are unlabeled (no KAT discriminator); exclusion vacuous — see fips_unlabeled_executions",
+        "fips_unlabeled_executions": fips_unlabeled_calls(doc),
     })
 }
 
-/// Report document plus the `policy` section.
-pub(crate) fn doc_with_policy(c: &capture::Capture, v: &Verdict) -> serde_json::Value {
-    let mut d = crate::report::doc(c);
-    d["policy"] = policy_json(c, v);
-    d
+fn reason_short(r: &GapReason) -> String {
+    match r {
+        GapReason::UnknownDenominator { scope } => format!("unknown-denominator({scope})"),
+        GapReason::UndiscoveredSites { scope, missing } => {
+            format!("undiscovered({scope}):{missing}")
+        }
+        GapReason::UnattachedSites { scope, missing } => {
+            format!("unattached({scope}):{missing}")
+        }
+        GapReason::Loss { counter, value, .. } => format!("{counter}={value}"),
+        GapReason::UnattributedCalls { sites, calls } => {
+            format!("unattributed={sites}s/{calls}c")
+        }
+        GapReason::StartupGap { missing_ns } => format!("startup-gap={missing_ns}ns"),
+        GapReason::TailGap { missing_ns } => format!("tail-gap={missing_ns}ns"),
+        GapReason::SignalCut => "signal-cut".to_string(),
+    }
 }
 
-/// Human tuple: window edges, cmdline, container/image, provider.
-fn tuple_human(c: &capture::Capture) -> String {
-    let cmdline = if c.target_cmdline.is_empty() {
-        "(unknown)".to_string()
-    } else {
-        format!("\"{}\"", c.target_cmdline)
-    };
-    let opt = |s: &str| {
-        if s.is_empty() {
-            "(none)".to_string()
-        } else {
-            s.to_string()
-        }
+fn status_line(doc: &CaptureDocument) -> String {
+    let status = match &doc.status {
+        Completeness::Complete => "COMPLETE".to_string(),
+        Completeness::Partial { reasons } => format!(
+            "PARTIAL reasons={}",
+            reasons
+                .iter()
+                .map(reason_short)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        Completeness::Fatal { kind, .. } => format!("FATAL kind={kind:?}"),
     };
     format!(
-        "window={} - {} cmdline={} container={} image={} provider={} build={}",
-        crate::report::iso8601_utc(crate::report::epoch_secs(c.window_start_wall)),
-        crate::report::iso8601_utc(crate::report::epoch_secs(c.window_end_wall)),
-        cmdline,
-        opt(&c.target_container_id),
-        opt(&c.image_digest),
-        c.provider_path,
-        c.provider_build_id,
+        "status={status} window={}-{} effective={}-{}",
+        doc.window.requested_start_ns,
+        doc.window.requested_end_ns,
+        doc.window.effective_start_ns,
+        doc.window.effective_end_ns,
     )
 }
 
-/// Verdict-first human output: violations, then passes, then the
-/// evidence line plus doctrine notes.
-fn human(c: &capture::Capture, v: &Verdict) -> String {
-    use crate::report::grouped;
+fn short_obj(id: &str) -> String {
+    if id.len() > 16 {
+        format!("{}...", &id[..16])
+    } else {
+        id.to_string()
+    }
+}
+
+fn hit_line(h: &DefiniteHit) -> String {
+    let mut provs: Vec<&str> = h
+        .candidates
+        .iter()
+        .map(|c| c.provider_class.as_str())
+        .collect();
+    provs.sort();
+    provs.dedup();
+    let mut algs: Vec<&str> = h
+        .candidates
+        .iter()
+        .flat_map(|c| c.algorithm_classes.iter().map(String::as_str))
+        .collect();
+    algs.sort();
+    algs.dedup();
+    let alg_display = if algs.is_empty() {
+        "(no classes)".to_string()
+    } else {
+        algs.join(":")
+    };
+    let first = &h.candidates[0];
+    format!(
+        "{} via {}: {} calls (obj={} gen={}{}, {} funcid={})",
+        alg_display,
+        provs.join(","),
+        crate::report::grouped(h.calls),
+        short_obj(&h.site.object.0),
+        h.generation,
+        if h.fenced { ", fenced" } else { "" },
+        crate::report::op_display(first.op),
+        first.funcid,
+    )
+}
+
+fn tag(name: &str, matcher: &str) -> String {
+    if matcher.is_empty() {
+        format!("[{name}]")
+    } else {
+        format!("[{name} {matcher}]")
+    }
+}
+
+/// Verdict-first human output: violations, then inconclusive rules,
+/// then passes, then the evidence line plus doctrine notes.
+fn human(doc: &CaptureDocument, v: &PolicyVerdict) -> String {
     let mut s = String::new();
-    let nv = v.results.iter().filter(|r| !r.passed).count();
-    let np = v.results.iter().filter(|r| r.passed).count();
+    let nv = v
+        .rules
+        .iter()
+        .filter(|r| r.verdict == RuleVerdict::Violation)
+        .count();
+    let ni = v
+        .rules
+        .iter()
+        .filter(|r| r.verdict == RuleVerdict::Inconclusive)
+        .count();
+    let np = v
+        .rules
+        .iter()
+        .filter(|r| r.verdict == RuleVerdict::Pass)
+        .count();
     if v.no_verdict {
+        s.push_str("osslscope check: NO VERDICT (FATAL evidence; run doctor)\n");
+    } else if v.overall() == PolicyOutcome::Violation {
         s.push_str(&format!(
-            "osslscope check: NO VERDICT (FATAL evidence; run doctor) pid={} ({})\n",
-            c.target_pid, c.target_comm
+            "osslscope check: VIOLATION ({nv} rules violated, {ni} inconclusive, {np} passed)\n"
         ));
-    } else if v.violations.is_empty() {
+    } else if v.overall() == PolicyOutcome::Inconclusive {
         s.push_str(&format!(
-            "osslscope check: PASS ({np} passed) pid={} ({})\n",
-            c.target_pid, c.target_comm
+            "osslscope check: INCONCLUSIVE ({ni} rules unproven, {np} passed)\n"
         ));
     } else {
-        s.push_str(&format!(
-            "osslscope check: VIOLATION ({nv} rules violated, {np} passed) pid={} ({})\n",
-            c.target_pid, c.target_comm
-        ));
+        s.push_str(&format!("osslscope check: PASS ({np} passed)\n"));
     }
     if !v.no_verdict {
-        let tup = tuple_human(c);
-        for x in &v.violations {
-            if x.absent {
+        for r in v
+            .rules
+            .iter()
+            .filter(|r| r.verdict == RuleVerdict::Violation)
+        {
+            if matches!(r.name, "require-provider" | "require-executed") {
                 s.push_str(&format!(
-                    "  [{} {}] not observed in window {tup}\n",
-                    x.rule, x.matcher
-                ));
-            } else if x.rule == "deny-engine" {
-                s.push_str(&format!(
-                    "  [{} {}] ENGINE call: {} calls (tripwire, untimed) {tup}\n",
-                    x.rule,
-                    x.matcher,
-                    grouped(x.count)
+                    "  {} not observed in window\n",
+                    tag(r.name, &r.matcher)
                 ));
             } else {
-                let fenced = x
-                    .fenced_gen
-                    .map(|g| format!(", fenced gen {g}"))
-                    .unwrap_or_default();
-                s.push_str(&format!(
-                    "  [{} {}] {} via {}: {} calls ({} funcid={}{fenced}) {tup}\n",
-                    x.rule,
-                    x.matcher,
-                    x.alg,
-                    x.provider_label,
-                    grouped(x.count),
-                    x.op_name,
-                    x.funcid
-                ));
+                for h in &r.hits {
+                    s.push_str(&format!("  {} {}\n", tag(r.name, &r.matcher), hit_line(h)));
+                }
+                if r.hits.is_empty() && r.legacy_engine_calls > 0 {
+                    s.push_str(&format!(
+                        "  {} ENGINE call: {} calls (tripwire, untimed)\n",
+                        tag(r.name, &r.matcher),
+                        crate::report::grouped(r.legacy_engine_calls)
+                    ));
+                }
             }
         }
-        for r in v.results.iter().filter(|r| r.passed) {
-            if r.value.is_empty() {
-                s.push_str(&format!(
-                    "  [{}] pass ({} calls)\n",
-                    r.rule,
-                    grouped(r.matches)
-                ));
-            } else {
-                s.push_str(&format!(
-                    "  [{} {}] pass ({} calls)\n",
-                    r.rule,
-                    r.value,
-                    grouped(r.matches)
-                ));
-            }
+        for r in v
+            .rules
+            .iter()
+            .filter(|r| r.verdict == RuleVerdict::Inconclusive)
+        {
+            let poss = match r.bounds.possible {
+                Some(n) => n.to_string(),
+                None => "unknown".to_string(),
+            };
+            s.push_str(&format!(
+                "  {} inconclusive (definite={} possible={})\n",
+                tag(r.name, &r.matcher),
+                r.bounds.definite,
+                poss,
+            ));
+        }
+        for r in v.rules.iter().filter(|r| r.verdict == RuleVerdict::Pass) {
+            s.push_str(&format!(
+                "  {} pass ({} calls)\n",
+                tag(r.name, &r.matcher),
+                crate::report::grouped(r.bounds.definite)
+            ));
         }
     }
-    s.push_str(&format!("evidence: {}\n", crate::report::status_line(c)));
+    s.push_str(&format!("evidence: {}\n", status_line(doc)));
     s.push_str("absence = not-observed in window (never \"not present / never used\")\n");
-    if v.param_blind {
-        s.push_str("note: --deny-algorithm is blind to SIGN/MAC/KDF digest selection (param values never captured)\n");
+    if param_blind(doc, v) {
+        s.push_str("note: algorithm rules are blind to SIGN/MAC/KDF/ASYM-CIPHER parameter-selected components (param values never captured)\n");
     }
-    if !v.unseen_deny_providers.is_empty() {
+    let unseen = unseen_deny_providers(v);
+    if !unseen.is_empty() {
         s.push_str(&format!(
             "note: --deny-provider matched nothing (verify spelling): {}\n",
-            v.unseen_deny_providers.join(", ")
+            unseen.join(", ")
         ));
     }
-    if c.reasons.iter().any(|r| r == "fips-unlabeled") {
-        s.push_str("note: FIPS executions unlabeled in v1 (self-test calls not distinguished)\n");
+    let fips = fips_unlabeled_calls(doc);
+    if fips > 0 {
+        s.push_str(&format!(
+            "note: {fips} FIPS-class calls unlabeled (self-test not distinguished; never excluded)\n"
+        ));
     }
     s.push_str("note: alg-name-only strength (key sizes unobservable); window-only claims\n");
     s
 }
 
+// ------------------------------------------------- T11 checkpoint
+// Specified T11 interface, NOT YET LANDED in this branch: `report.rs`
+// will declare `OutputRequest`/`DeliveryResult` and
+// `write_artifacts(&CaptureDocument, &OutputRequest) -> DeliveryResult`.
+// This local mirror keeps T10 compiling and is DELETED at merge — the
+// coordinator swaps these paths for `crate::report::` (drift notes in
+// the T10 handoff). The mirror renders placeholder envelopes only; all
+// real v2 human/JSON/CBOM transformations belong to T11.
+
+/// Requested artifacts for one checked document: the primary
+/// human/JSON rendering plus an optional CBOM, with the T10-evaluated
+/// policy the renderers embed.
+pub struct OutputRequest {
+    pub format: String,
+    pub out: Option<String>,
+    pub cbom: Option<String>,
+    pub policy: PolicyVerdict,
+}
+
+/// Per-artifact delivery outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArtifactOutcome {
+    NotRequested,
+    Delivered,
+    Failed(String),
+}
+
+/// Delivery result across all requested artifacts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliveryResult {
+    pub primary: ArtifactOutcome,
+    pub cbom: ArtifactOutcome,
+}
+
+impl DeliveryResult {
+    /// True when any REQUESTED artifact failed.
+    pub fn failed(&self) -> bool {
+        matches!(self.primary, ArtifactOutcome::Failed(_))
+            || matches!(self.cbom, ArtifactOutcome::Failed(_))
+    }
+
+    /// Bounded failure diagnostics for stderr.
+    pub fn failures(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if let ArtifactOutcome::Failed(e) = &self.primary {
+            out.push(format!("primary artifact: {e}"));
+        }
+        if let ArtifactOutcome::Failed(e) = &self.cbom {
+            out.push(format!("cbom artifact: {e}"));
+        }
+        out
+    }
+}
+
+/// Placeholder primary JSON: the finalized document plus the T10
+/// policy section. T11 replaces the envelope with the real v2 schema
+/// rendering (and reuses [`policy_json`]).
+fn render_primary_json(doc: &CaptureDocument, policy: &PolicyVerdict) -> String {
+    let mut v = serde_json::to_value(doc).expect("capture document serializes");
+    v["policy"] = policy_json(doc, policy);
+    serde_json::to_string_pretty(&v).expect("json renders") + "\n"
+}
+
+/// Placeholder CBOM: an honest stub carrying the exact capture window
+/// so same-window delivery is testable before T11 lands the CycloneDX
+/// renderer. Never shipped as a real CBOM.
+fn render_cbom_placeholder(doc: &CaptureDocument, policy: &PolicyVerdict) -> Vec<u8> {
+    let verdict = match policy.overall() {
+        PolicyOutcome::NoVerdict => "no-verdict",
+        PolicyOutcome::Pass => "pass",
+        PolicyOutcome::Violation => "violation",
+        PolicyOutcome::Inconclusive => "inconclusive",
+    };
+    let v = serde_json::json!({
+        "renderer": "t11-pending",
+        "note": "placeholder CBOM envelope: same-window stub only, replaced by T11 CycloneDX",
+        "schema": doc.schema,
+        "window": doc.window,
+        "policy_verdict": verdict,
+    });
+    (serde_json::to_string_pretty(&v).expect("json renders") + "\n").into_bytes()
+}
+
+fn write_file(path: &str, bytes: &[u8]) -> ArtifactOutcome {
+    match std::fs::write(path, bytes) {
+        Ok(()) => ArtifactOutcome::Delivered,
+        Err(e) => ArtifactOutcome::Failed(format!("write {path}: {e}")),
+    }
+}
+
+fn write_stdout(text: &str) -> ArtifactOutcome {
+    use std::io::Write;
+    let mut lock = std::io::stdout().lock();
+    match lock.write_all(text.as_bytes()).and_then(|()| lock.flush()) {
+        Ok(()) => ArtifactOutcome::Delivered,
+        Err(e) => ArtifactOutcome::Failed(format!("stdout: {e}")),
+    }
+}
+
+/// Attempt every requested artifact write — even when another fails —
+/// and report per-artifact outcomes. Diagnostics never pretend a
+/// failed delivery succeeded.
+pub fn write_artifacts(doc: &CaptureDocument, req: &OutputRequest) -> DeliveryResult {
+    let primary_text = if req.format == "json" {
+        render_primary_json(doc, &req.policy)
+    } else {
+        human(doc, &req.policy)
+    };
+    let primary = match &req.out {
+        None => write_stdout(&primary_text),
+        Some(path) => write_file(path, primary_text.as_bytes()),
+    };
+    let cbom = match &req.cbom {
+        None => ArtifactOutcome::NotRequested,
+        Some(path) => write_file(path, &render_cbom_placeholder(doc, &req.policy)),
+    };
+    DeliveryResult { primary, cbom }
+}
+
 const USAGE: [&str; 2] = [
-    "usage: check [--duration S] --provider P --object O --count-object C [rules] [--format human|json] [--out F] [--builtin] [--settle S] [--timeout S] [--grace S] [--image-digest D] {--pid P | run -- <cmd>}",
+    "usage: check [--duration S] --provider P --object O --count-object C [rules] [--format human|json] [--out F] [--cbom FILE] [--builtin] [--settle S] [--timeout S] [--grace S] [--image-digest D] {--pid P | run -- <cmd>}",
     "rules: [--require-provider P] [--deny-provider P] [--deny-engine] [--deny-algorithm X] [--deny-weak] [--require-executed X] (repeatable; at least one required)",
 ];
 
@@ -656,209 +713,144 @@ pub fn run(argv: &[String]) -> ExitCode {
             return ExitCode::from(4);
         }
     };
-    let v = evaluate(&c, &args.rules);
-    let text = if args.format == "json" {
-        serde_json::to_string_pretty(&doc_with_policy(&c, &v)).unwrap() + "\n"
-    } else {
-        human(&c, &v)
+    let mut verdict = evaluate_document(&policy_rules(&args.rules), &c.document);
+    // Pre-T08 transition: the legacy ENGINE tripwire counted real
+    // in-window executions the document does not model yet; fold them
+    // in so --deny-engine cannot miss them. No-op once T08 retires the
+    // legacy block (or when the document already has the hits).
+    apply_legacy_engine_fallback(&mut verdict, legacy_engine_calls(&c.legacy));
+    let req = OutputRequest {
+        format: args.format,
+        out: args.out,
+        cbom: args.cbom,
+        policy: verdict.clone(),
     };
-    if let Some(path) = &args.out {
-        if let Err(e) = std::fs::write(path, &text) {
-            eprintln!("osslscope check: write {path}: {e}");
-            return ExitCode::from(4);
-        }
-    } else {
-        print!("{text}");
+    let delivery = write_artifacts(&c.document, &req);
+    for f in delivery.failures() {
+        eprintln!("osslscope check: {f}");
     }
-    ExitCode::from(exit_for(&c, &v))
+    ExitCode::from(exit_for(
+        verdict.overall(),
+        c.child_exit,
+        &c.document,
+        &delivery,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::evidence::{
+        CandidateCoverage, CandidateIdentity, CaptureWindow, CounterKind, CounterSource,
+        CounterUnits, FinalizeInput, GapCounter, ObjectId, SiteExecution, SiteKey,
+    };
+    use crate::policy::{Predicate, Rule};
 
-    fn cap(outcome: capture::Outcome) -> capture::Capture {
-        capture::Capture {
-            target_pid: 7,
-            target_comm: "t".to_string(),
-            window_planned: Duration::from_secs(1),
-            window_actual: Duration::from_secs(1),
-            outcome,
-            reasons: Vec::new(),
-            executions: Vec::new(),
-            stale: Vec::new(),
-            counters: capture::Counters::default(),
-            child_exit: None,
-            drain_wall_us: 0,
-            harvest_doc: serde_json::json!({}),
-            legacy: serde_json::Value::Null,
-            window_start_wall: std::time::UNIX_EPOCH,
-            window_end_wall: std::time::UNIX_EPOCH,
-            kernel_release: "k".to_string(),
-            target_cmdline: "t".to_string(),
-            target_container_id: String::new(),
-            provider_build_id: "unknown".to_string(),
-            provider_path: "/p".to_string(),
-            image_digest: String::new(),
-            document: capture::empty_document(),
-            disposition: None,
-        }
+    fn cand(
+        provider: &str,
+        class: &str,
+        op: u32,
+        func: u32,
+        algs: &[&str],
+        weak: bool,
+    ) -> CandidateIdentity {
+        CandidateIdentity::new(
+            ObjectId(provider.to_string()),
+            class.to_string(),
+            op,
+            func,
+            algs.iter().map(|s| s.to_string()).collect(),
+            weak,
+        )
     }
 
-    fn exec(op: u32, provider: &str, alg: &str, funcid: u32, count: u64) -> capture::Execution {
-        capture::Execution {
-            cookie: 0,
-            id: crate::plan::Identity {
-                provider: provider.to_string(),
-                op,
-                funcid,
-                alg_class: alg.to_string(),
-                offset: 0,
+    fn site(offset: u64, calls: u64, cands: Vec<CandidateIdentity>) -> SiteExecution {
+        SiteExecution {
+            site: SiteKey {
+                object: ObjectId("exe-fingerprint".to_string()),
+                device: 7,
+                inode: 9,
+                offset,
             },
-            aliases: Vec::new(),
-            count,
+            generation: 0,
+            candidates: cands,
+            candidates_coverage: CandidateCoverage::Complete,
+            calls,
             first_ns: 100,
             last_ns: 200,
         }
     }
 
-    fn rules() -> RuleSet {
+    fn doc(sites: Vec<SiteExecution>) -> CaptureDocument {
+        crate::evidence::finalize(FinalizeInput {
+            window: CaptureWindow {
+                requested_start_ns: 1_000,
+                requested_end_ns: 2_000,
+                effective_start_ns: 1_000,
+                effective_end_ns: 2_000,
+                signal_cut: false,
+            },
+            sites,
+            fenced: Vec::new(),
+            objects: Vec::new(),
+            coverage: Vec::new(),
+            counters: Vec::new(),
+            fatal: None,
+        })
+    }
+
+    fn ruleset() -> RuleSet {
         RuleSet::default()
     }
 
-    #[test]
-    fn deny_algorithm_hit_and_miss() {
-        let mut c = cap(capture::Outcome::Complete);
-        c.executions = vec![exec(1, "default", "DES", 11, 500)];
-        let mut r = rules();
-        r.deny_algorithm = vec!["DES".to_string()];
-        let v = evaluate(&c, &r);
-        assert_eq!(v.violations.len(), 1);
-        let x = &v.violations[0];
-        assert_eq!(x.rule, "deny-algorithm");
-        assert_eq!(x.matcher, "DES");
-        assert_eq!(x.provider_label, "default");
-        assert_eq!((x.op, x.funcid, x.count), (1, 11, 500));
-        assert_eq!(x.op_name, "DIGEST");
-        assert_eq!((x.first_ns, x.last_ns), (Some(100), Some(200)));
-        assert_eq!(x.fenced_gen, None);
-        assert!(!x.absent);
-        assert!(v.results.iter().all(|t| !t.passed));
-        // Miss: satisfied, no violation.
-        r.deny_algorithm = vec!["RC2".to_string()];
-        let v = evaluate(&c, &r);
-        assert!(v.violations.is_empty());
-        assert!(v.results.iter().all(|t| t.passed));
-        assert!(v.param_blind, "deny-algorithm always carries the caveat");
+    fn ok_delivery() -> DeliveryResult {
+        DeliveryResult {
+            primary: ArtifactOutcome::Delivered,
+            cbom: ArtifactOutcome::NotRequested,
+        }
     }
 
     #[test]
-    fn deny_matches_fenced_detail() {
-        let mut c = cap(capture::Outcome::Complete);
-        c.stale = vec![capture::StaleBucket {
-            generation: 3,
-            events: 9,
-            keys: 1,
-            detail: vec![capture::StaleDetail {
-                cookie: 0,
-                id: crate::plan::Identity {
-                    provider: "spike".to_string(),
-                    op: 2,
-                    funcid: 21,
-                    alg_class: "RC2".to_string(),
-                    offset: 0,
-                },
-                count: 9,
-                first_ns: 1,
-                last_ns: 2,
-            }],
-        }];
-        let mut r = rules();
-        r.deny_algorithm = vec!["RC2".to_string()];
-        let v = evaluate(&c, &r);
-        assert_eq!(v.violations.len(), 1);
-        assert_eq!(v.violations[0].fenced_gen, Some(3));
-    }
-
-    #[test]
-    fn require_executed_fail_closed() {
-        let mut c = cap(capture::Outcome::Complete);
-        c.executions = vec![exec(1, "default", "SHA-256", 11, 5)];
-        let mut r = rules();
-        r.require_executed = vec!["SHA-256".to_string()];
-        assert!(evaluate(&c, &r).violations.is_empty());
-        // Absent on COMPLETE: violation with no identity.
-        r.require_executed = vec!["MD5".to_string()];
-        let v = evaluate(&c, &r);
-        assert_eq!(v.violations.len(), 1);
-        assert!(v.violations[0].absent);
-        assert_eq!(v.violations[0].matcher, "MD5");
-        // Absent on PARTIAL: still a violation (fail closed —
-        // degraded evidence must not silently pass a require).
-        c.outcome = capture::Outcome::Partial;
-        c.reasons = vec!["cold-gap".to_string()];
-        let v = evaluate(&c, &r);
-        assert_eq!(v.violations.len(), 1);
-        assert!(v.violations[0].absent);
-    }
-
-    #[test]
-    fn provider_rules() {
-        let mut c = cap(capture::Outcome::Complete);
-        c.executions = vec![exec(1, "spike", "SHA-256", 11, 5)];
-        let mut r = rules();
-        r.require_provider = vec!["spike".to_string()];
-        assert!(evaluate(&c, &r).violations.is_empty());
-        r.require_provider = vec!["fips".to_string()];
-        let v = evaluate(&c, &r);
-        assert_eq!(v.violations.len(), 1);
-        assert!(v.violations[0].absent);
-        // Deny hit: one record per matched identity.
-        r = rules();
-        r.deny_provider = vec!["spike".to_string()];
-        let v = evaluate(&c, &r);
-        assert_eq!(v.violations.len(), 1);
-        assert_eq!(v.violations[0].provider_label, "spike");
-        // Deny unseen: satisfied, but noted (typo visibility).
+    fn rule_mapping_uses_typed_constructors() {
+        let mut r = ruleset();
+        r.require_provider = vec!["default".to_string()];
         r.deny_provider = vec!["fips".to_string()];
-        let v = evaluate(&c, &r);
-        assert!(v.violations.is_empty());
-        assert_eq!(v.unseen_deny_providers, vec!["fips".to_string()]);
-    }
-
-    #[test]
-    fn deny_weak_and_engine() {
-        let mut c = cap(capture::Outcome::Complete);
-        c.executions = vec![
-            exec(1, "default", "SHA-256", 11, 5),
-            exec(2, "default", "DES", 21, 7),
-        ];
-        let mut r = rules();
-        r.deny_weak = true;
-        let v = evaluate(&c, &r);
-        assert_eq!(v.violations.len(), 1);
-        assert_eq!(v.violations[0].matcher, "DES");
-        // Engine: tripwire counts only (untimed violation).
-        c.legacy = serde_json::json!({
-            "engine": {"calls_by_entrypoint": {"ENGINE_init": 2}},
-        });
-        r = rules();
         r.deny_engine = true;
-        let v = evaluate(&c, &r);
-        assert_eq!(v.violations.len(), 1);
-        let x = &v.violations[0];
+        r.deny_algorithm = vec!["DES".to_string()];
+        r.deny_weak = true;
+        r.require_executed = vec!["SHA2-256".to_string()];
+        let mapped = policy_rules(&r);
+        let names: Vec<(&str, &str)> = mapped
+            .iter()
+            .map(|m| (m.name, m.matcher.as_str()))
+            .collect();
         assert_eq!(
-            (x.rule.as_str(), x.matcher.as_str()),
-            ("deny-engine", "ENGINE_init")
+            names,
+            vec![
+                ("require-provider", "default"),
+                ("deny-provider", "fips"),
+                ("deny-engine", ""),
+                ("deny-algorithm", "DES"),
+                ("deny-weak", ""),
+                ("require-executed", "SHA2-256"),
+            ]
         );
-        assert_eq!(x.op_name, "ENGINE");
-        assert_eq!(x.count, 2);
-        assert_eq!((x.first_ns, x.last_ns), (None, None));
-        // Quiet engine: pass (zero calls and null legacy alike).
-        c.legacy = serde_json::json!({"engine": {"calls_by_entrypoint": {}}});
-        assert!(evaluate(&c, &r).violations.is_empty());
-        c.legacy = serde_json::Value::Null;
-        assert!(evaluate(&c, &r).violations.is_empty());
+        assert!(matches!(
+            mapped[2].rule,
+            Rule::Deny(Predicate::ProviderClass(_))
+        ));
+        assert!(matches!(
+            mapped[3].rule,
+            Rule::Deny(Predicate::AlgorithmParamAware(_))
+        ));
+        assert!(matches!(
+            mapped[4].rule,
+            Rule::Deny(Predicate::WeakOrUnresolved)
+        ));
+        assert!(matches!(
+            mapped[5].rule,
+            Rule::Require(Predicate::AlgorithmParamAware(_))
+        ));
     }
 
     #[test]
@@ -874,7 +866,7 @@ mod tests {
             "--pid",
             "9",
         ];
-        // Full ruleset, repeatable flags accumulate.
+        // Full ruleset, repeatable flags accumulate; --cbom rides along.
         let mut full = base.clone();
         full.extend([
             "--require-provider",
@@ -890,7 +882,13 @@ mod tests {
             "RC2",
             "--deny-weak",
             "--require-executed",
-            "SHA-256",
+            "SHA2-256",
+            "--format",
+            "json",
+            "--out",
+            "r.json",
+            "--cbom",
+            "b.json",
         ]);
         let a = parse(&v(full)).unwrap();
         assert_eq!(a.rules.require_provider, vec!["default".to_string()]);
@@ -904,7 +902,10 @@ mod tests {
             vec!["DES".to_string(), "RC2".to_string()]
         );
         assert!(a.rules.deny_weak);
-        assert_eq!(a.rules.require_executed, vec!["SHA-256".to_string()]);
+        assert_eq!(a.rules.require_executed, vec!["SHA2-256".to_string()]);
+        assert_eq!(a.format, "json");
+        assert_eq!(a.out.as_deref(), Some("r.json"));
+        assert_eq!(a.cbom.as_deref(), Some("b.json"));
         assert_eq!(a.cfg.duration, Duration::from_secs(30));
         // Unknown registry names are config errors (typo-safe).
         let mut typo = base.clone();
@@ -913,6 +914,11 @@ mod tests {
         let mut typo2 = base.clone();
         typo2.extend(["--require-executed", "SHA257"]);
         assert!(parse(&v(typo2)).is_err());
+        // Provider classes are NOT registry-validated: third-party
+        // opaque ids are open-ended.
+        let mut opaque = base.clone();
+        opaque.extend(["--require-provider", "third-party:deadbeef"]);
+        assert!(parse(&v(opaque)).is_ok());
         // Ruleness checks are rejected (a pass with no rules would
         // mask a misconfigured gate).
         assert!(parse(&v(base.clone())).is_err());
@@ -926,150 +932,6 @@ mod tests {
         assert!(parse(&v(neither)).is_err(), "objects still required");
     }
 
-    fn viol_cap() -> capture::Capture {
-        let mut c = cap(capture::Outcome::Partial);
-        c.reasons = vec!["cold-gap".to_string()];
-        c.counters.cold_gap_calls = 5;
-        c.executions = vec![exec(2, "default", "DES", 21, 500)];
-        c
-    }
-
-    #[test]
-    fn human_violation_shape() {
-        let c = viol_cap();
-        let mut r = rules();
-        r.deny_algorithm = vec!["DES".to_string()];
-        r.require_executed = vec!["SHA-256".to_string()];
-        let v = evaluate(&c, &r);
-        let w = "1970-01-01T00:00:00Z - 1970-01-01T00:00:00Z";
-        let tup = "window=".to_string()
-            + w
-            + " cmdline=\"t\" container=(none) image=(none) provider=/p build=unknown";
-        let want = format!(
-            "osslscope check: VIOLATION (2 rules violated, 0 passed) pid=7 (t)\n  [deny-algorithm DES] DES via default: 500 calls (CIPHER funcid=21) {tup}\n  [require-executed SHA-256] not observed in window {tup}\nevidence: status=PARTIAL reasons=cold-gap counters[cold_gap=5]\nabsence = not-observed in window (never \"not present / never used\")\nnote: --deny-algorithm is blind to SIGN/MAC/KDF digest selection (param values never captured)\nnote: alg-name-only strength (key sizes unobservable); window-only claims\n"
-        );
-        assert_eq!(human(&c, &v), want);
-    }
-
-    #[test]
-    fn human_pass_and_mixed_order() {
-        // All pass.
-        let mut c = cap(capture::Outcome::Complete);
-        c.executions = vec![exec(1, "default", "SHA-256", 11, 5)];
-        let mut r = rules();
-        r.require_executed = vec!["SHA-256".to_string()];
-        r.deny_weak = true;
-        let v = evaluate(&c, &r);
-        let out = human(&c, &v);
-        assert!(
-            out.starts_with("osslscope check: PASS (2 passed) pid=7 (t)\n"),
-            "{out}"
-        );
-        assert!(out.contains("  [deny-weak] pass (0 calls)\n"), "{out}");
-        assert!(
-            out.contains("  [require-executed SHA-256] pass (5 calls)\n"),
-            "{out}"
-        );
-        assert!(out.contains("evidence: status=COMPLETE\n"), "{out}");
-        // Mixed: violations first, then passes (rule order within).
-        let mut r = rules();
-        r.deny_algorithm = vec!["RC2".to_string()];
-        r.deny_weak = true;
-        c.executions.push(exec(2, "default", "DES", 21, 7));
-        let v = evaluate(&c, &r);
-        let out = human(&c, &v);
-        let vv = out.find("[deny-weak DES]").expect("violation line");
-        let pp = out.find("[deny-algorithm RC2] pass").expect("pass line");
-        assert!(vv < pp, "violations before passes:\n{out}");
-    }
-
-    #[test]
-    fn human_no_verdict_and_unseen() {
-        let mut c = cap(capture::Outcome::Fatal(capture::FatalKind::AttachZero));
-        c.reasons = vec!["pid-recycled".to_string()];
-        let mut r = rules();
-        r.deny_weak = true;
-        let v = evaluate(&c, &r);
-        let out = human(&c, &v);
-        assert!(
-            out.starts_with("osslscope check: NO VERDICT (FATAL evidence; run doctor) pid=7 (t)\n"),
-            "{out}"
-        );
-        // Unseen deny-provider note.
-        let c = cap(capture::Outcome::Complete);
-        let mut r = rules();
-        r.deny_provider = vec!["fips".to_string()];
-        let v = evaluate(&c, &r);
-        let out = human(&c, &v);
-        assert!(
-            out.contains("note: --deny-provider matched nothing (verify spelling): fips\n"),
-            "{out}"
-        );
-    }
-
-    #[test]
-    fn policy_json_shape() {
-        let c = viol_cap();
-        let mut r = rules();
-        r.deny_algorithm = vec!["DES".to_string()];
-        r.deny_provider = vec!["fips".to_string()];
-        let v = evaluate(&c, &r);
-        let p = policy_json(&c, &v);
-        assert_eq!(p["verdict"], "violation");
-        assert_eq!(p["rules"].as_array().unwrap().len(), 2);
-        assert_eq!(p["param_blind"], true);
-        assert_eq!(p["kat_excluded"], 0);
-        assert!(p["kat_note"].as_str().unwrap().contains("v1"));
-        assert_eq!(p["unseen_deny_providers"], serde_json::json!(["fips"]));
-        let x = &p["violations"].as_array().unwrap()[0];
-        assert_eq!(x["rule"], "deny-algorithm");
-        assert_eq!(x["matcher"], "DES");
-        assert_eq!(x["provider_label"], "default");
-        assert_eq!(x["op_name"], "CIPHER");
-        assert_eq!(x["count"], 500);
-        assert_eq!(x["first_ns"], 100);
-        assert_eq!(x["absent"], false);
-        assert!(x["fenced_gen"].is_null());
-        // Actionability tuple (PRD §6).
-        assert_eq!(x["window"]["start_epoch"], 0.0);
-        assert_eq!(x["cmdline"], "t");
-        assert_eq!(x["container_id"], "");
-        assert_eq!(x["image_digest"], "");
-        assert_eq!(x["provider"]["path"], "/p");
-        assert_eq!(x["provider"]["build_id"], "unknown");
-        // Pass + no-verdict verdicts.
-        let c2 = cap(capture::Outcome::Complete);
-        let mut r2 = rules();
-        r2.deny_weak = true;
-        assert_eq!(policy_json(&c2, &evaluate(&c2, &r2))["verdict"], "pass");
-        let c3 = cap(capture::Outcome::Fatal(capture::FatalKind::AttachZero));
-        assert_eq!(
-            policy_json(&c3, &evaluate(&c3, &r2))["verdict"],
-            "no-verdict"
-        );
-    }
-
-    #[test]
-    fn doc_carries_policy() {
-        let c = cap(capture::Outcome::Complete);
-        let mut r = rules();
-        r.deny_weak = true;
-        let d = doc_with_policy(&c, &evaluate(&c, &r));
-        assert_eq!(d["schema_version"], "observed-crypto-v1.0");
-        assert_eq!(d["policy"]["verdict"], "pass");
-        assert_eq!(d["policy"]["rules"].as_array().unwrap().len(), 1);
-        // Check documents conform too (policy required-keys).
-        let schema: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(format!(
-                "{}/schemas/observed-crypto-v1.json",
-                env!("CARGO_MANIFEST_DIR")
-            ))
-            .unwrap(),
-        )
-        .unwrap();
-        crate::schema::assert_required_keys(&schema, &d);
-    }
-
     #[test]
     fn help_exits_zero_before_run_only() {
         let v = |s: Vec<&str>| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
@@ -1080,63 +942,280 @@ mod tests {
 
     #[test]
     fn exit_matrix() {
-        let viol = || Verdict {
-            no_verdict: false,
-            violations: vec![Violation {
-                rule: "deny-weak".to_string(),
-                matcher: "DES".to_string(),
-                provider_label: "default".to_string(),
-                op: 2,
-                op_name: "CIPHER".to_string(),
-                alg: "DES".to_string(),
-                funcid: 21,
-                count: 1,
-                first_ns: Some(0),
-                last_ns: Some(0),
-                fenced_gen: None,
-                absent: false,
+        let viol_doc = doc(vec![site(
+            1,
+            7,
+            vec![cand("p", "default", 1, 7, &["MD5"], true)],
+        )]);
+        let violation =
+            evaluate_document(std::slice::from_ref(&PolicyRule::deny_weak()), &viol_doc);
+        let clean_doc = doc(Vec::new());
+        let pass = evaluate_document(
+            std::slice::from_ref(&PolicyRule::deny_algorithm("AES-256-GCM")),
+            &clean_doc,
+        );
+        let gappy = crate::evidence::finalize(FinalizeInput {
+            window: CaptureWindow {
+                requested_start_ns: 1_000,
+                requested_end_ns: 2_000,
+                effective_start_ns: 1_000,
+                effective_end_ns: 2_000,
+                signal_cut: false,
+            },
+            sites: Vec::new(),
+            fenced: Vec::new(),
+            objects: Vec::new(),
+            coverage: Vec::new(),
+            counters: vec![GapCounter {
+                name: "discovery.table_aborted".to_string(),
+                kind: CounterKind::Loss,
+                units: CounterUnits::Events,
+                source: CounterSource::Discovery,
+                value: 1,
             }],
-            results: Vec::new(),
-            unseen_deny_providers: Vec::new(),
-            param_blind: false,
+            fatal: None,
+        });
+        let inconclusive = evaluate_document(
+            std::slice::from_ref(&PolicyRule::deny_algorithm("AES-256-GCM")),
+            &gappy,
+        );
+        assert_eq!(pass.overall(), PolicyOutcome::Pass);
+        assert_eq!(violation.overall(), PolicyOutcome::Violation);
+        assert_eq!(inconclusive.overall(), PolicyOutcome::Inconclusive);
+        let failed = DeliveryResult {
+            primary: ArtifactOutcome::Failed("x".to_string()),
+            cbom: ArtifactOutcome::NotRequested,
         };
-        let clean = || Verdict {
-            no_verdict: false,
-            violations: Vec::new(),
-            results: Vec::new(),
-            unseen_deny_providers: Vec::new(),
-            param_blind: false,
-        };
-        // Violation dominates everything (even child failure).
-        let mut c = cap(capture::Outcome::Partial);
-        c.child_exit = Some(1);
-        assert_eq!(exit_for(&c, &viol()), 10);
-        let c = cap(capture::Outcome::Complete);
-        assert_eq!(exit_for(&c, &viol()), 10);
-        // No violation: child failure, then evidence status.
-        let mut c = cap(capture::Outcome::Complete);
-        c.child_exit = Some(2);
-        assert_eq!(exit_for(&c, &clean()), 1);
-        let c = cap(capture::Outcome::Fatal(capture::FatalKind::AttachZero));
-        assert_eq!(exit_for(&c, &clean()), 4);
-        let c = cap(capture::Outcome::Partial);
-        assert_eq!(exit_for(&c, &clean()), 3);
-        let c = cap(capture::Outcome::Complete);
-        assert_eq!(exit_for(&c, &clean()), 0);
+        // Violation dominates child and artifact failure.
+        assert_eq!(
+            exit_for(violation.overall(), Some(1), &viol_doc, &ok_delivery()),
+            10
+        );
+        assert_eq!(
+            exit_for(violation.overall(), Some(0), &viol_doc, &failed),
+            10
+        );
+        // Fatal (no verdict) is 4.
+        assert_eq!(
+            exit_for(PolicyOutcome::NoVerdict, None, &clean_doc, &ok_delivery()),
+            4
+        );
+        // Child failure, then artifact failure, beat inconclusive.
+        assert_eq!(
+            exit_for(inconclusive.overall(), Some(7), &gappy, &ok_delivery()),
+            1
+        );
+        assert_eq!(
+            exit_for(inconclusive.overall(), Some(0), &gappy, &failed),
+            1
+        );
+        assert_eq!(
+            exit_for(pass.overall(), Some(2), &clean_doc, &ok_delivery()),
+            1
+        );
+        // Inconclusive is 11; PARTIAL-with-pass is 3; clean is 0.
+        assert_eq!(
+            exit_for(inconclusive.overall(), Some(0), &gappy, &ok_delivery()),
+            11
+        );
+        assert_eq!(
+            exit_for(pass.overall(), Some(0), &clean_doc, &ok_delivery()),
+            0
+        );
     }
 
     #[test]
     fn fatal_has_no_verdict() {
-        let c = cap(capture::Outcome::Fatal(capture::FatalKind::AttachZero));
-        let mut r = rules();
-        r.require_executed = vec!["SHA-256".to_string()];
-        r.deny_weak = true;
-        let v = evaluate(&c, &r);
-        assert!(v.no_verdict);
-        assert!(
-            v.violations.is_empty(),
-            "never a violation without evidence"
+        let fatal = crate::evidence::finalize(FinalizeInput {
+            window: CaptureWindow {
+                requested_start_ns: 1_000,
+                requested_end_ns: 2_000,
+                effective_start_ns: 1_000,
+                effective_end_ns: 2_000,
+                signal_cut: false,
+            },
+            sites: vec![site(1, 7, vec![cand("p", "default", 1, 7, &["MD5"], true)])],
+            fenced: Vec::new(),
+            objects: Vec::new(),
+            coverage: Vec::new(),
+            counters: Vec::new(),
+            fatal: Some(crate::evidence::FatalKind::AttachZero),
+        });
+        let v = evaluate_document(
+            &[
+                PolicyRule::require_executed("SHA2-256"),
+                PolicyRule::deny_weak(),
+            ],
+            &fatal,
         );
-        assert!(v.results.is_empty());
+        assert!(v.no_verdict);
+        assert!(v.rules.is_empty(), "never a verdict without evidence");
+        assert_eq!(policy_json(&fatal, &v)["verdict"], "no-verdict");
+        assert_eq!(exit_for(v.overall(), None, &fatal, &ok_delivery()), 4);
+    }
+
+    #[test]
+    fn policy_json_shape() {
+        let d = doc(vec![site(
+            1,
+            500,
+            vec![cand("p", "default", 2, 21, &["DES"], true)],
+        )]);
+        let v = evaluate_document(
+            &[
+                PolicyRule::deny_algorithm("DES"),
+                PolicyRule::deny_provider("fips"),
+            ],
+            &d,
+        );
+        let p = policy_json(&d, &v);
+        assert_eq!(p["verdict"], "violation");
+        assert_eq!(p["rules"].as_array().unwrap().len(), 2);
+        assert_eq!(p["rules"][0]["result"], "violation");
+        assert_eq!(p["rules"][0]["definite"], 500);
+        assert_eq!(p["rules"][0]["possible"], 500);
+        assert_eq!(p["rules"][1]["result"], "pass");
+        assert_eq!(p["param_blind"], false);
+        assert_eq!(p["kat_excluded"], 0);
+        assert_eq!(p["fips_unlabeled_executions"], 0);
+        assert_eq!(p["unseen_deny_providers"], serde_json::json!(["fips"]));
+        let x = &p["violations"].as_array().unwrap()[0];
+        assert_eq!(x["rule"], "deny-algorithm");
+        assert_eq!(x["matcher"], "DES");
+        assert_eq!(x["absent"], false);
+        assert_eq!(x["site"]["object"], "exe-fingerprint");
+        assert_eq!(x["site"]["device"], 7);
+        assert_eq!(x["site"]["inode"], 9);
+        assert_eq!(x["site"]["offset"], 1);
+        assert_eq!(x["generation"], 0);
+        assert_eq!(x["fenced"], false);
+        assert_eq!(x["calls"], 500);
+        assert_eq!(x["first_ns"], 100);
+        assert_eq!(x["last_ns"], 200);
+        assert_eq!(x["candidates"][0]["provider_class"], "default");
+        // Require-absent violations carry no identity.
+        let v = evaluate_document(
+            std::slice::from_ref(&PolicyRule::require_executed("SHA2-256")),
+            &doc(Vec::new()),
+        );
+        let p = policy_json(&doc(Vec::new()), &v);
+        assert_eq!(p["verdict"], "violation");
+        let x = &p["violations"].as_array().unwrap()[0];
+        assert_eq!(x["absent"], true);
+        assert_eq!(x["rule"], "require-executed");
+        assert!(x.get("site").is_none());
+    }
+
+    #[test]
+    fn human_verdict_shapes() {
+        // Violation with a definite hit and an absent require.
+        let d = doc(vec![site(
+            1,
+            500,
+            vec![cand("p", "default", 2, 21, &["DES"], true)],
+        )]);
+        let v = evaluate_document(
+            &[
+                PolicyRule::deny_algorithm("DES"),
+                PolicyRule::require_executed("SHA2-256"),
+            ],
+            &d,
+        );
+        let out = human(&d, &v);
+        assert!(
+            out.starts_with(
+                "osslscope check: VIOLATION (2 rules violated, 0 inconclusive, 0 passed)\n"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("[deny-algorithm DES] DES via default: 500 calls"),
+            "{out}"
+        );
+        assert!(
+            out.contains("[require-executed SHA2-256] not observed in window\n"),
+            "{out}"
+        );
+        assert!(out.contains("evidence: status=COMPLETE"), "{out}");
+        // Inconclusive sorts between violations and passes.
+        let gappy = crate::evidence::finalize(FinalizeInput {
+            window: CaptureWindow {
+                requested_start_ns: 1_000,
+                requested_end_ns: 2_000,
+                effective_start_ns: 1_000,
+                effective_end_ns: 2_000,
+                signal_cut: false,
+            },
+            sites: Vec::new(),
+            fenced: Vec::new(),
+            objects: Vec::new(),
+            coverage: Vec::new(),
+            counters: vec![GapCounter {
+                name: "discovery.table_aborted".to_string(),
+                kind: CounterKind::Loss,
+                units: CounterUnits::Events,
+                source: CounterSource::Discovery,
+                value: 1,
+            }],
+            fatal: None,
+        });
+        let v = evaluate_document(
+            std::slice::from_ref(&PolicyRule::deny_algorithm("RC2")),
+            &gappy,
+        );
+        let out = human(&gappy, &v);
+        assert!(
+            out.starts_with("osslscope check: INCONCLUSIVE (1 rules unproven, 0 passed)\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("[deny-algorithm RC2] inconclusive (definite=0 possible=0)\n"),
+            "{out}"
+        );
+        // Pass and no-verdict headers.
+        let v = evaluate_document(
+            std::slice::from_ref(&PolicyRule::deny_weak()),
+            &doc(Vec::new()),
+        );
+        let out = human(&doc(Vec::new()), &v);
+        assert!(
+            out.starts_with("osslscope check: PASS (1 passed)\n"),
+            "{out}"
+        );
+        assert!(out.contains("  [deny-weak] pass (0 calls)\n"), "{out}");
+    }
+
+    #[test]
+    fn legacy_engine_extraction_sums_entrypoints() {
+        let legacy = serde_json::json!({
+            "engine": {"calls_by_entrypoint": {"ENGINE_init": 2, "ENGINE_finish": 3}},
+        });
+        assert_eq!(legacy_engine_calls(&legacy), 5);
+        // Missing or misshapen blocks contribute nothing (never a
+        // violation from unparseable shape).
+        assert_eq!(legacy_engine_calls(&serde_json::Value::Null), 0);
+        assert_eq!(legacy_engine_calls(&serde_json::json!({"engine": {}})), 0);
+        assert_eq!(
+            legacy_engine_calls(&serde_json::json!({
+                "engine": {"calls_by_entrypoint": {"ENGINE_init": "x"}},
+            })),
+            0
+        );
+    }
+
+    #[test]
+    fn delivery_result_reports_requested_failures() {
+        let ok = DeliveryResult {
+            primary: ArtifactOutcome::Delivered,
+            cbom: ArtifactOutcome::NotRequested,
+        };
+        assert!(!ok.failed());
+        assert!(ok.failures().is_empty());
+        let bad = DeliveryResult {
+            primary: ArtifactOutcome::Delivered,
+            cbom: ArtifactOutcome::Failed("write b: denied".to_string()),
+        };
+        assert!(bad.failed());
+        assert_eq!(bad.failures(), vec!["cbom artifact: write b: denied"]);
     }
 }
