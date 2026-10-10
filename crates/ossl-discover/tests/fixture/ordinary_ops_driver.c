@@ -21,11 +21,15 @@
  * converges and sustained execution is observable. Each iteration
  * keeps the single-fetch LEDGER shape; a final LEDGER carries the
  * loop totals. The kem version gate runs once (no loop).
+ * Iterations are paced ~2/s (usleep 500ms): unpaced iterations
+ * livelock the one-slot harvest walk (restart-at-0 on every new
+ * query outruns walk completion), collapsing to 0 converged sites.
  */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 #include <openssl/core_names.h>
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
@@ -340,6 +344,11 @@ int main(int argc, char **argv)
             if (rc != 0)
                 break;
             ops++;
+            /* Paced ~2 iters/s: the harvest walk restarts at slot 0
+             * on every new query, so a tight loop livelocks it (new
+             * queries land before any walk completes — 0 sites).
+             * 500ms spacing lets each walk finish (T14r4). */
+            usleep(500000);
         }
         printf("LEDGER mode=%s loop_secs=%ld ops=%lu fetches=%lu\n", mode,
                loop_secs, ops, fetches);
