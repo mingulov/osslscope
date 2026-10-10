@@ -173,7 +173,8 @@ fn empty_impl_does_not_silently_stall() {
     );
 
     // The BPF contract behind this host accounting: the impl-less
-    // path advances the per-array counter (no stall) and flags
+    // path advances the cursor past the slot (no stall — stopping
+    // here would re-walk this slot on every future query) and flags
     // NOIMP (no silence). Pinned by source shape (same precedent as
     // the privacy allowlist pins).
     let bpf = std::fs::read_to_string(
@@ -183,7 +184,7 @@ fn empty_impl_does_not_silently_stall() {
     let imp_pos = bpf.find("imp == 0").expect("impl-less path must exist");
     let window = &bpf[imp_pos..(imp_pos + 600).min(bpf.len())];
     assert!(
-        window.contains("advance_next") || window.contains("QUERY_NEXT.insert"),
+        window.contains("cc_new = (j + 1)"),
         "impl-less slots must advance past, not freeze: {window}"
     );
     assert!(
@@ -450,6 +451,58 @@ fn partial_delta_retains_reasons() {
     );
 }
 
+#[test]
+fn single_query_full_walk_covers_late_slot() {
+    // The T14r5 walker emits the whole table on ONE query: a single
+    // query-ret plus ALG records for slots 0..30 plus the len-30
+    // proof terminates the table — the later slot (idx 29, the G02
+    // ECDSA shape) is covered with a one-query oracle, not 30.
+    // (The live half of this proof is `one_query_later_slot` on the
+    // lane; this pins the host accounting the walker feeds.)
+    const OP_SIGNATURE: u32 = 12;
+    let mut t = CoverageTracker::new();
+    t.note_query_ret(OP_SIGNATURE, ARR);
+    for idx in 0..30u64 {
+        t.note_alg(OP_SIGNATURE, ARR, idx, false);
+    }
+    t.ingest_termd(&[(ARR, wire::make_termd(OP_SIGNATURE, 30))]);
+    assert_eq!(
+        t.table_state(OP_SIGNATURE, ARR),
+        TableState::Terminated { len: 30 }
+    );
+    assert!(t.unterminated_ops().is_empty());
+    assert!(t.is_complete());
+
+    // The walked set is exactly 0..30 (a sampler's 1-query prefix
+    // would hold one slot and stay InProgress — pinned by contrast).
+    let mut prefix = CoverageTracker::new();
+    prefix.note_query_ret(OP_SIGNATURE, ARR);
+    prefix.note_alg(OP_SIGNATURE, ARR, 0, false);
+    assert_eq!(
+        prefix.table_state(OP_SIGNATURE, ARR),
+        TableState::InProgress { walked: 1 }
+    );
+    assert_eq!(prefix.unterminated_ops(), vec![OP_SIGNATURE]);
+    assert!(!prefix.is_complete());
+
+    // And the doc for the full-walk stream is COMPLETE (no status,
+    // no gaps) — the later slot needs no second query.
+    let (exe, maps) = backed_exe_maps();
+    let doc = schema::emit(
+        "t",
+        Path::new(&maps[0].path),
+        "",
+        &exe,
+        &maps,
+        &[ok_row(7, 0)],
+        true,
+        &stats_from_tracker(&t),
+    )
+    .unwrap();
+    assert!(doc.get("status").is_none(), "one-query table is COMPLETE");
+    assert!(doc.get("unterminated_ops").is_none());
+}
+
 /// Live single-query later-slot coverage (NOT-RUN here: needs a
 /// privileged lane + C2-built BPF object + compiled fixtures).
 ///
@@ -547,7 +600,7 @@ fn one_query_later_slot() {
 
 /// Live no_store explicitness (NOT-RUN here; same lane gate).
 /// A provider whose query sets `*no_store=1` must surface as
-/// PARTIAL with the NO_STORE bit — a sampled slot plus an explicit
+/// PARTIAL with the NO_STORE bit — a re-walked table plus an explicit
 /// reason, never silent COMPLETE.
 #[test]
 #[ignore = "live lane only: privileged BPF + fixtures (see doc comment)"]

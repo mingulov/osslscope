@@ -468,8 +468,9 @@ pub fn run_detailed(
                 }
             }
         }
-        // Sleep only when idle: the inventory trigger bursts ~1MB in
-        // milliseconds and the drain must not lag a fixed quantum.
+        // Sleep only when idle: first walks burst (up to ~2.6MB for
+        // a worst-shape table) in milliseconds and the drain must not
+        // lag a fixed quantum.
         if !fresh {
             std::thread::sleep(Duration::from_millis(5));
         }

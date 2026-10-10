@@ -12,27 +12,43 @@
 //! event per (op, class, funcid, addr). No symbols are used past the init
 //! anchor; userspace never reads target memory.
 //!
-//! Walk bounds (P1 exit 2, default-provider census 4.0.2: 241 algs/op
-//! max, 115 dispatch entries/alg max, 81-char names max): each
-//! query-return hit walks exactly ONE alg — index = per-(thread, op)
-//! query count mod 512 — so an op queried N times covers algs 0..N
-//! (order-independent; single-shot triggers walk alg 0). The 512-call
-//! inventory trigger covers 512 algs/op; array overrun is detected by
-//! reading one past the last slot (sets TRUNC[op] bit 1) and dispatch
-//! tables past 128 entries set bit 2 — userspace degrades to PARTIAL,
-//! so growth fails closed, never truncates silently. The single-alg
-//! shape is deliberate: nested slice loops blow the verifier's 1M
-//! processed-insn ceiling via state explosion (bisected 2026-09-17),
-//! while one loop (dispatch walk, as a subprogram) verifies with wide
-//! margin.
+//! Walk bounds (T14r5 complete walker; default-provider census
+//! 4.0.2: 241 algs/op max, 115 dispatch entries/alg max, 81-char
+//! names max): each query-return hit walks the FULL array — slots
+//! 0..512 via `bpf_loop` (one slot per callback) plus the per-alg
+//! dispatch walk — so a
+//! single ordinary query covers a later slot (the one-slot-per-query
+//! sampler this replaces convicted G02 live: narrow workloads never
+//! reached ECDSA at slot 29). The 512-call inventory trigger still
+//! runs (harmless: post-proof queries are count-only) but no longer
+//! gates coverage. Array overrun is detected by reading one past the
+//! last slot (sets TRUNC[op] bit 1) and dispatch tables past 128
+//! entries set bit 2 — userspace degrades to PARTIAL, so growth
+//! fails closed, never truncates silently. The callback nests the
+//! dispatch walk and the branchless classifier as subprograms and is
+//! verified once against the merged index range; a plain loop
+//! explodes instead (bisected 2026-09-17 for the sampler, re-measured
+//! 2026-10-10 for the full walk: per-iteration call states
+//! cross-multiply past the 1M-insn ceiling).
+//!
+//! Walk-once guard: a cacheable array whose termination proof
+//! (`TERMD[arr] = (op, len)`) is already recorded is not re-walked —
+//! later queries only bump CALLS. The host evicts the proof when the
+//! array's mapping incarnation retires, so the next incarnation
+//! re-walks from slot 0. `no_store` arrays are re-walked on EVERY
+//! query (uncacheable tables may change between queries) and never
+//! proven; a `no_store` observation also invalidates any stale
+//! cacheable proof for the array (flip back to cacheable re-walks).
 //!
 //! T03 honesty: a prefix is never COMPLETE. The walker records
-//! termination proof (`TERMD[arr] = (op, len)`) on reading the
-//! terminator, flags walk aborts at every slot, advances past
-//! implementation-less slots (stable: freezing would stall), counts
-//! every ring/map failure in `LOSS[src]`, and samples `no_store`
-//! arrays once (slot 0, `TRUNC_NO_STORE`, never proven). TRUNC bits
-//! and LOSS ids are frozen in the shared crate.
+//! termination proof on reading the terminator, STOPS the walk
+//! (no proof — the next query re-walks from slot 0) on any slot
+//! read failure, name read failure, dispatch abort, or ring
+//! reserve failure, skips past implementation-less slots (stable:
+//! stopping would stall), counts every ring/map failure in
+//! `LOSS[src]`, and flags `no_store` arrays `TRUNC_NO_STORE`
+//! (never proven). TRUNC bits and LOSS ids are frozen in the
+//! shared crate.
 //!
 //! Classify-before-emission (T02, wire ABI v2): target strings are
 //! read into kernel stack scratch (128B alg window, 32B trip window)
@@ -86,24 +102,49 @@ use osslscope_ebpf_common::{
 const OSSL_FUNC_PROVIDER_QUERY_OPERATION: u32 = 1027;
 
 /// Alg-array bound per op (measured max 364, oqsprovider encoder;
-/// 512 is the next power of two with headroom). No BPF loop runs
-/// on this bound — one alg slot per query-return hit — so the
-/// raise costs the verifier nothing. LOCKSTEP: the inventory
-/// trigger rounds (SPIKE_QUERY_ROUNDS, fixture default) must stay
-/// >= this bound, or arrays past the round count go silently
-/// unflagged (the overrun guard only fires at the last slot).
+/// 512 is the next power of two with headroom). The full walk loops
+/// on this bound (one outer pass per query-return hit, dispatch and
+/// classifier nested as subprograms). The inventory trigger rounds
+/// (SPIKE_QUERY_ROUNDS, fixture default) no longer gate coverage —
+/// one query walks the whole table — so the old LOCKSTEP between
+/// trigger rounds and this bound is retired (extra queries are
+/// count-only past the walk-once guard).
 const MAX_ALGS: u64 = 512;
 /// Dispatch-table bound per alg (measured max 115, RSA encoder, stable
 /// across 3.0/3.5/4.0; 128 keeps the verifier under its 1M processed-insn
 /// ceiling with ~2x margin — overflow fails closed via TRUNC).
 const MAX_DISPATCH: u64 = 128;
-/// `QUERY_NEXT` sentinel for `no_store` arrays: the persistent
-/// counter is meaningless for uncacheable tables (T03: sampled once,
-/// never advanced). Unreachable by real query counts.
-const NS_FROZEN: u64 = u64::MAX;
+/// `QUERY_NEXT` packing (EXPERIMENT E17b): low 10 bits carry
+/// cursor+1 (1..=512), bit 16 carries the within-query done flag.
+/// Cross-site state lives in the map — every site re-reads it as
+/// opaque, keeping nested-call states identical so the verifier
+/// explores each callee once. Four explicit sites per query cover
+/// the R03 one-query acceptance shape (slot 3) and reach ECDSA
+/// (slot 29) in eight queries; larger tables converge across
+/// queries with honest prefix PARTIAL between. (The site count is
+/// structural — adding/removing a site trips the probe-read
+/// allowlist pin, forcing a conscious update.)
+const QN_CURSOR_MASK: u64 = 0x3FF;
+const QN_DONE_BIT: u64 = 1 << 16;
 
+/// Decode a packed cursor word to cursor+1 (1..=512): absent (0)
+/// and out-of-range values fail closed to first-hit cursor 0.
+/// Always inlined (straight-line; no subprogram, no relocation).
+#[inline(always)]
+fn qn_cursor(w: u64) -> u64 {
+    let mut cc = (w & QN_CURSOR_MASK) % (MAX_ALGS + 1);
+    if cc == 0 {
+        cc = 1;
+    }
+    cc
+}
+
+/// Worst-shape ring budget: 512 ALGs (16 KiB) + 512x128 ROWs
+/// (2.5 MiB) + liveness from one full walk must fit with headroom
+/// while the host drains between queries — 4 MiB. LOCKSTEP: the
+/// loader's EVENTS spec asserts these dims.
 #[map]
-static EVENTS: RingBuf = RingBuf::with_byte_size(1 << 21, 0);
+static EVENTS: RingBuf = RingBuf::with_byte_size(1 << 22, 0);
 #[map]
 static PENDING_INIT: HashMap<u64, u64> = HashMap::with_max_entries(1024, 0);
 /// Entry→return pairs: op + caller `no_store` out-pointer (16-byte
@@ -118,13 +159,12 @@ static TERMD: HashMap<u64, u64> = HashMap::with_max_entries(1024, 0);
 /// map-update failure lands here; keys are the `LOSS_*` ids).
 #[map]
 static LOSS: HashMap<u32, u64> = HashMap::with_max_entries(32, 0);
-/// Per-(thread, array) query count; walked index = count % MAX_ALGS.
+/// Per-(thread, array) first-hit marker; presence alone records
+/// that this pair already emitted its QUERY_RET liveness record.
 /// Keyed by the composite (pid_tgid, array address) pair — each
 /// provider-op array is a distinct static, so different providers'
-/// same-op arrays must NOT share a counter, and an XOR-folded key
-/// could collide across threads (T03: composite, never folded). The
-/// counter freezes at the first terminator (see query_return), so
-/// short arrays never walk past their end into adjacent tables.
+/// same-op arrays must NOT share a marker, and an XOR-folded key
+/// could collide across threads (T03: composite, never folded).
 #[map]
 static QUERY_NEXT: HashMap<u128, u64> = HashMap::with_max_entries(4096, 0);
 /// Walk-overflow flags per op id; userspace degrades to PARTIAL.
@@ -132,8 +172,9 @@ static QUERY_NEXT: HashMap<u128, u64> = HashMap::with_max_entries(4096, 0);
 static TRUNC: HashMap<u32, u64> = HashMap::with_max_entries(64, 0);
 /// Non-null query calls per op id. The 512-round inventory trigger
 /// fires ~68K calls in milliseconds; counting in-map (instead of a
-/// ring event per call) keeps the ring burst under 1MB. QUERY_RET is
-/// emitted on the first hit per array only (liveness + ops-hit).
+/// ring event per call) keeps the per-call cost O(1) past the
+/// walk-once guard. QUERY_RET is emitted on the first hit per
+/// (thread, array) only (liveness + ops-hit).
 #[map]
 static CALLS: HashMap<u32, u64> = HashMap::with_max_entries(64, 0);
 /// Tripwire hits per attach cookie (userspace id space: ENGINE /
@@ -164,21 +205,28 @@ fn bump_loss(src: u32) {
     let _ = LOSS.insert(src, cur.wrapping_add(1), 0);
 }
 
-fn emit_alg(ev: &AlgEvent) {
+/// Returns false when the ring is full (loss counted): the walker
+/// stops on the first reserve failure so a pressured ring bounds
+/// each query to O(1) instead of a full-table loss flood.
+fn emit_alg(ev: &AlgEvent) -> bool {
     if let Some(mut e) = EVENTS.reserve::<AlgEvent>(0) {
         e.write(*ev);
         e.submit(0);
+        true
     } else {
         bump_loss(LOSS_RING_ALG);
+        false
     }
 }
 
-fn emit_row(ev: &RowEvent) {
+fn emit_row(ev: &RowEvent) -> bool {
     if let Some(mut e) = EVENTS.reserve::<RowEvent>(0) {
         e.write(*ev);
         e.submit(0);
+        true
     } else {
         bump_loss(LOSS_RING_ROW);
+        false
     }
 }
 
@@ -212,7 +260,13 @@ fn lookup_trip(h: u64) -> Option<TripClassValue> {
 
 /// Algorithm classification as a BPF subprogram (separate
 /// verification scope, like the dispatch walk below).
+/// `no_mangle` (global): the loader resolves same-section calls
+/// only via relocations, which the toolchain emits solely for
+/// global callees — a local callee's call is pre-resolved without
+/// a reloc and the loader fails closed (`unrelocated static call`).
+/// Every non-inlined callee of a `.text` function needs this.
 #[inline(never)]
+#[no_mangle]
 fn classify_alg(
     buf: &[u8; ALG_WINDOW],
     len: usize,
@@ -262,12 +316,29 @@ fn record_termd(arr: u64, op: u32, len: u64) {
     }
 }
 
-/// Advance the per-(thread, array) counter past a fully-observed
-/// slot. Insert failures freeze the counter (retry next query) and
-/// are counted.
-fn advance_next(key: u128, count: u64) {
-    if QUERY_NEXT.insert(key, count.wrapping_add(1), 0).is_err() {
-        bump_loss(LOSS_MAP_QUERY_NEXT);
+/// Walk-once guard: true when this array already carries a
+/// termination proof for this op (fully walked this incarnation —
+/// the host evicts the proof on incarnation retire, so a new
+/// incarnation re-walks). A proof naming another op (address reuse
+/// across ops) proves nothing about this table.
+#[inline(always)]
+fn termd_proven(arr: u64, op: u32) -> bool {
+    matches!(
+        unsafe { TERMD.get_ptr(&arr).map(|p| *p) },
+        Some(v) if (v & 0xFFFF_FFFF) as u32 == op
+    )
+}
+
+/// Invalidate a stale cacheable proof when the provider verdict flips
+/// to `no_store` (uncacheable tables may change between queries, so
+/// the old proof describes old content — a flip back to cacheable
+/// must re-walk). Removal runs only when a proof is present, so a
+/// failure here is real (not a missing key) and is counted: a
+/// surviving stale proof would skip the re-walk.
+#[inline(always)]
+fn invalidate_termd(arr: u64) {
+    if TERMD.get_ptr(&arr).is_some() && TERMD.remove(&arr).is_err() {
+        bump_loss(LOSS_MAP_TERMD);
     }
 }
 
@@ -453,11 +524,15 @@ pub fn query_entry(ctx: ProbeContext) -> u32 {
 
 /// Dispatch-table walk as a BPF subprogram (separate verification
 /// scope). Emits one ROW event per entry (`aux`/`idx` = array address
-/// + alg index, the userspace ALG-join key); returns true when the
-/// table runs past MAX_DISPATCH without a terminator (TRUNC).
-/// Returns 0 (terminator), 1 (overflow), or 2 (read abort — the
-/// caller freezes the counter so the next query re-walks).
+/// + alg index, the userspace ALG-join key).
+/// Returns 0 (terminator), 1 (overflow — rows 0..127 kept, the rest
+/// unwalkable), 2 (read abort), or 3 (ring reserve failed). The
+/// caller stops the array walk on 2/3 (no proof — the next query
+/// re-walks from slot 0) and continues past 0/1.
+/// `no_mangle` (global): same-section callers (see `walk_slot`)
+/// need a relocated call (see `classify_alg`).
 #[inline(never)]
+#[no_mangle]
 fn walk_dispatch(imp: u64, op: u32, arr: u64, j: u64) -> u64 {
     for k in 0..MAX_DISPATCH {
         let base = imp + k * 16;
@@ -469,7 +544,7 @@ fn walk_dispatch(imp: u64, op: u32, arr: u64, j: u64) -> u64 {
         if fid == 0 {
             return 0;
         }
-        emit_row(&RowEvent {
+        if !emit_row(&RowEvent {
             kind: KIND_ROW,
             op,
             funcid: fid,
@@ -477,25 +552,13 @@ fn walk_dispatch(imp: u64, op: u32, arr: u64, j: u64) -> u64 {
             addr: fptr,
             aux: arr,
             idx: j,
-        });
+        }) {
+            return 3;
+        }
     }
     1
 }
 
-/// At query-return walk exactly one alg of the OSSL_ALGORITHM array
-/// (index = per-(thread, array) query count mod 512) plus its dispatch
-/// table. The counter freezes at the first terminator (names == 0):
-/// later hits re-read the terminator and stop, so short arrays never
-/// walk past their end. OSSL_ALGORITHM = { names, props, impl, desc }
-/// @32B.
-///
-/// T03 honesty: the walker records termination proof (`TERMD`) when
-/// it reads the terminator, flags walk aborts at EVERY slot (not
-/// just slot 0), advances past implementation-less slots (they are
-/// stable observations, not transient failures — freezing on them
-/// stalls the op forever), counts every ring/map failure in `LOSS`,
-/// and samples `no_store` arrays once (slot 0, no persistent
-/// counter, never termination proof).
 #[uretprobe]
 pub fn query_return(ctx: RetProbeContext) -> u32 {
     // Cookie 1 = legacy attachment: its calls stay out of CALLS.
@@ -537,172 +600,480 @@ pub fn query_return(ctx: RetProbeContext) -> u32 {
         Ok(0) => false,
         _ => true,
     };
-    // Composite cursor key: pid_tgid in the high half, array base
+    // Composite first-hit key: pid_tgid in the high half, array base
     // in the low half. Never XOR-folded: two (thread, array) pairs
-    // must never share a walk position.
+    // must never share a marker.
     let key = ((helpers::bpf_get_current_pid_tgid() as u128) << 64) | (rv as u128);
-    let stored = unsafe { QUERY_NEXT.get_ptr(&key).map(|p| *p) };
-    if no_store {
-        // Uncacheable table: the persistent counter is meaningless
-        // (the array may be freed or mutated between queries), so
-        // this path samples slot 0 exactly once per (thread,
-        // array) — no advance, no termination proof, ever. Later
-        // queries only refresh the call count and the sticky bit.
-        // FULL slot-0 sampling (not just liveness) still runs
-        // below on the first observation; transient sample aborts
-        // fail closed to PARTIAL rather than spamming retries.
-        flag_trunc(op as u32, TRUNC_NO_STORE);
-        if stored.is_some() {
-            // Poison any stale positional count (cacheable→no_store
-            // flip): the array is uncacheable now, so a later flip
-            // back to cacheable must restart the walk at slot 0
-            // rather than resume a position across the gap.
-            if stored != Some(NS_FROZEN)
-                && QUERY_NEXT.insert(key, NS_FROZEN, 0).is_err()
-            {
-                bump_loss(LOSS_MAP_QUERY_NEXT);
-            }
-            return 0;
-        }
-        if QUERY_NEXT.insert(key, NS_FROZEN, 0).is_err() {
-            bump_loss(LOSS_MAP_QUERY_NEXT);
-        }
-    }
-    let mut count = stored.unwrap_or(0);
-    // A `no_store`→cacheable flip (provider verdicts may change
-    // across queries): the frozen sentinel is not a position, so
-    // the walk restarts at slot 0.
-    if !no_store && count == NS_FROZEN {
-        count = 0;
-    }
-    // `no_store` first observations always sample slot 0.
-    let j = if no_store { 0 } else { count % MAX_ALGS };
-    if count == 0 {
-        emit_row(&RowEvent {
+    // First-hit liveness: the cursor insert below records the hit
+    // for cacheable tables; `no_store` tables (never inserted)
+    // re-emit per query — duplicates collapse userside (trigger and
+    // ops-hit are idempotent; call volume is CALLS-joined).
+    if QUERY_NEXT.get_ptr(&key).is_none() {
+        let _ = emit_row(&RowEvent {
             kind: KIND_QUERY_RET,
             op: op as u32,
             funcid: 0,
             _pad: 0,
             addr: rv,
-            aux: j,
+            aux: 0,
             idx: 0,
         });
     }
-    let base = rv + j * 32;
-    let names = unsafe { helpers::bpf_probe_read_user(base as *const u64) };
-    let imp = unsafe { helpers::bpf_probe_read_user((base + 16) as *const u64) };
-    let (Ok(names), Ok(imp)) = (names, imp) else {
-        // Unreadable slot at ANY position aborts this query's walk;
-        // the counter freezes so the next query retries the slot.
-        // Sticky: a later success does not clear the flag (fail
-        // closed; pretouch keeps cold pages off this path).
-        flag_trunc(op as u32, TRUNC_WALK_READ);
+    // Uncacheable tables re-walk on EVERY query (they may be
+    // freed or mutated between queries) and are never proven; a
+    // `no_store` observation also invalidates any stale cacheable
+    // proof for the array, so a verdict flip back to cacheable
+    // re-walks. Cacheable tables carry the walk-once guard: a proven
+    // table is fully walked this incarnation — count only. (The host
+    // evicts the proof on incarnation retire.)
+    if no_store {
+        flag_trunc(op as u32, TRUNC_NO_STORE);
+        invalidate_termd(rv);
+    } else if termd_proven(rv, op as u32) {
         return 0;
-    };
-    if names == 0 {
-        // Terminator: freeze the counter (no insert), stop, and
-        // record proof — unless `no_store` (uncacheable tables are
-        // never proven). Slot 0 empty = the query returned a table
-        // with no first alg (suspicious: flagged, still PARTIAL).
-        if !no_store {
-            record_termd(rv, op as u32, j);
-        }
-        if j == 0 {
+    }
+    // EXPERIMENT E17b: pre-chunk EMPTY detect (straight-line slot-0
+    // read at a constant offset — a duplicate of the walk's own
+    // slot-0 read when the cursor is 0; TOCTOU-contained: cacheable
+    // tables are static, and `no_store` carries its own sticky bit).
+    if let Ok(names0) = unsafe { helpers::bpf_probe_read_user(rv as *const u64) } {
+        if names0 == 0 {
             flag_trunc(op as u32, TRUNC_WALK_EMPTY);
         }
+    }
+    // Chunk reset: cacheable resumes at the stored cursor (done bit
+    // cleared); `no_store` always restarts at slot 0 (uncacheable
+    // tables may change between queries — a flip back to cacheable
+    // restarts too). Any map failure aborts the chunk (freeze).
+    let cc0 = if no_store {
+        1
+    } else {
+        qn_cursor(unsafe { QUERY_NEXT.get_ptr(&key).map(|p| *p) }.unwrap_or(0))
+    };
+    if QUERY_NEXT.insert(key, cc0, 0).is_err() {
+        bump_loss(LOSS_MAP_QUERY_NEXT);
         return 0;
     }
-    // Overrun guard on the last slot: entries 0..=511 all live means
-    // the array may extend past the bound — slot 512 decides (live or
-    // unreadable = TRUNC, terminator = clean + proof). Runs before
-    // the impl-less skip so a bare slot 511 still guards the tail.
-    if j == MAX_ALGS - 1 {
-        let tail = unsafe { helpers::bpf_probe_read_user((rv + MAX_ALGS * 32) as *const u64) };
-        match tail {
-            Ok(0) => {
-                if !no_store {
-                    record_termd(rv, op as u32, MAX_ALGS);
+    // Kernel scratch shared by every site: one buffer (a single
+    // stack slot) keeps the classifier call-states identical across
+    // sites. Never emitted.
+    let mut name_buf = [0u8; 128];
+    // Four walk sites, explicitly unrolled: each site re-reads the
+    // packed cursor word (opaque), walks one slot straight-line at
+    // depth 1, and writes the word back. The four bodies are
+    // structurally identical (same code, sequential slots) — keep
+    // them in sync. A mid-chunk eviction (incarnation retired)
+    // aborts the chunk; the next query restarts at slot 0.
+    {
+        let w = match unsafe { QUERY_NEXT.get_ptr(&key).map(|p| *p) } {
+            Some(w) => w,
+            None => return 0,
+        };
+        let cc = qn_cursor(w);
+        let site_done = (w & QN_DONE_BIT) != 0;
+        let j = cc - 1;
+        let mut cc_new = cc;
+        let mut done_new = u64::from(site_done);
+        if !site_done {
+            let base = rv + j * 32;
+            let r_names = unsafe { helpers::bpf_probe_read_user(base as *const u64) };
+            let r_imp = unsafe { helpers::bpf_probe_read_user((base + 16) as *const u64) };
+            match (r_names, r_imp) {
+                (Ok(names), Ok(imp)) => {
+                    if names == 0 {
+                        if !no_store {
+                            record_termd(rv, op as u32, j);
+                        }
+                        done_new = 1;
+                    } else if imp == 0 {
+                        flag_trunc(op as u32, TRUNC_WALK_NOIMP);
+                        cc_new = (j + 1) % MAX_ALGS + 1;
+                    } else {
+                        match unsafe {
+                            helpers::bpf_probe_read_user_str_bytes(
+                                names as *const u8,
+                                &mut name_buf,
+                            )
+                        } {
+                            Ok(slice) => {
+                                let len = slice.len();
+                                let saturated = len == ALG_WINDOW - 1;
+                                let v = classify_alg(&name_buf, len, saturated);
+                                if emit_alg(&AlgEvent {
+                                    kind: KIND_ALG,
+                                    op: op as u32,
+                                    class: v.class,
+                                    status: v.status,
+                                    weak: u8::from(v.weak),
+                                    _pad: 0,
+                                    arr: rv,
+                                    idx: j,
+                                }) {
+                                    match walk_dispatch(imp, op as u32, rv, j) {
+                                        1 => {
+                                            flag_trunc(op as u32, TRUNC_DISPATCH);
+                                            cc_new = (j + 1) % MAX_ALGS + 1;
+                                        }
+                                        0 => {
+                                            cc_new = (j + 1) % MAX_ALGS + 1;
+                                        }
+                                        2 => {
+                                            flag_trunc(op as u32, TRUNC_WALK_READ);
+                                            done_new = 1;
+                                        }
+                                        _ => {
+                                            done_new = 1;
+                                        }
+                                    }
+                                } else {
+                                    done_new = 1;
+                                }
+                            }
+                            Err(_) => {
+                                flag_trunc(op as u32, TRUNC_WALK_NAME);
+                                let _ = emit_alg(&AlgEvent {
+                                    kind: KIND_ALG,
+                                    op: op as u32,
+                                    class: OTHER_CLASS,
+                                    status: ALG_UNREADABLE,
+                                    weak: 0,
+                                    _pad: 0,
+                                    arr: rv,
+                                    idx: j,
+                                });
+                                done_new = 1;
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    flag_trunc(op as u32, TRUNC_WALK_READ);
+                    done_new = 1;
                 }
             }
-            _ => flag_trunc(op as u32, TRUNC_ALGS),
         }
-    }
-    if imp == 0 {
-        // Alg without implementation: a stable observation (the slot
-        // read fine), so the walk ADVANCES past it — freezing here
-        // would re-walk this slot on every future query and stall
-        // the op forever. The skip is explicit via NOIMP.
-        flag_trunc(op as u32, TRUNC_WALK_NOIMP);
-        if !no_store {
-            advance_next(key, count);
-        }
-        return 0;
-    }
-    // Kernel scratch only: classified below, never emitted.
-    let mut name_buf = [0u8; 128];
-    let slice =
-        match unsafe { helpers::bpf_probe_read_user_str_bytes(names as *const u8, &mut name_buf) }
+        if QUERY_NEXT
+            .insert(key, cc_new | (done_new << 16), 0)
+            .is_err()
         {
-            Ok(s) => s,
-            Err(_) => {
-                flag_trunc(op as u32, TRUNC_WALK_NAME);
-                // Explicit unreadable record (cold page or hostile
-                // pointer): the counter still freezes so the next
-                // query re-walks this slot instead of losing the alg.
-                emit_alg(&AlgEvent {
-                    kind: KIND_ALG,
-                    op: op as u32,
-                    class: OTHER_CLASS,
-                    status: ALG_UNREADABLE,
-                    weak: 0,
-                    _pad: 0,
-                    arr: rv,
-                    idx: j,
-                });
-                return 0;
-            }
+            bump_loss(LOSS_MAP_QUERY_NEXT);
+            return 0;
+        }
+    }
+    {
+        let w = match unsafe { QUERY_NEXT.get_ptr(&key).map(|p| *p) } {
+            Some(w) => w,
+            None => return 0,
         };
-    // Copy the length out first: the window array is reborrowed
-    // shared below, which ends `slice`'s mutable borrow.
-    let len = slice.len();
-    let saturated = len == ALG_WINDOW - 1;
-    let v = classify_alg(&name_buf, len, saturated);
-    // ALG first: userspace drops rows whose (array, index) has no
-    // ALG record yet (orphan rule), so rows must follow their ALG.
-    emit_alg(&AlgEvent {
-        kind: KIND_ALG,
-        op: op as u32,
-        class: v.class,
-        status: v.status,
-        weak: u8::from(v.weak),
-        _pad: 0,
-        arr: rv,
-        idx: j,
-    });
-    // Advance past this slot ONLY on a fully-walked alg: BPF probe
-    // reads are nofault, so a cold (never-touched) page aborts the
-    // walk even though the table is valid — freezing the counter
-    // lets the next query re-walk this slot instead of losing the
-    // alg forever (the terminator path above still freezes too, and
-    // a dispatch read-abort freezes as well: ALG/ROW re-emits
-    // dedupe userside via the alg_names overwrite + rows seen-map).
-    match walk_dispatch(imp, op as u32, rv, j) {
-        // Overflow: rows 0..127 are kept, the rest is unwalkable —
-        // advance past like a success, but flag the truncation.
-        1 => {
-            if !no_store {
-                advance_next(key, count);
+        let cc = qn_cursor(w);
+        let site_done = (w & QN_DONE_BIT) != 0;
+        let j = cc - 1;
+        let mut cc_new = cc;
+        let mut done_new = u64::from(site_done);
+        if !site_done {
+            let base = rv + j * 32;
+            let r_names = unsafe { helpers::bpf_probe_read_user(base as *const u64) };
+            let r_imp = unsafe { helpers::bpf_probe_read_user((base + 16) as *const u64) };
+            match (r_names, r_imp) {
+                (Ok(names), Ok(imp)) => {
+                    if names == 0 {
+                        if !no_store {
+                            record_termd(rv, op as u32, j);
+                        }
+                        done_new = 1;
+                    } else if imp == 0 {
+                        flag_trunc(op as u32, TRUNC_WALK_NOIMP);
+                        cc_new = (j + 1) % MAX_ALGS + 1;
+                    } else {
+                        match unsafe {
+                            helpers::bpf_probe_read_user_str_bytes(
+                                names as *const u8,
+                                &mut name_buf,
+                            )
+                        } {
+                            Ok(slice) => {
+                                let len = slice.len();
+                                let saturated = len == ALG_WINDOW - 1;
+                                let v = classify_alg(&name_buf, len, saturated);
+                                if emit_alg(&AlgEvent {
+                                    kind: KIND_ALG,
+                                    op: op as u32,
+                                    class: v.class,
+                                    status: v.status,
+                                    weak: u8::from(v.weak),
+                                    _pad: 0,
+                                    arr: rv,
+                                    idx: j,
+                                }) {
+                                    match walk_dispatch(imp, op as u32, rv, j) {
+                                        1 => {
+                                            flag_trunc(op as u32, TRUNC_DISPATCH);
+                                            cc_new = (j + 1) % MAX_ALGS + 1;
+                                        }
+                                        0 => {
+                                            cc_new = (j + 1) % MAX_ALGS + 1;
+                                        }
+                                        2 => {
+                                            flag_trunc(op as u32, TRUNC_WALK_READ);
+                                            done_new = 1;
+                                        }
+                                        _ => {
+                                            done_new = 1;
+                                        }
+                                    }
+                                } else {
+                                    done_new = 1;
+                                }
+                            }
+                            Err(_) => {
+                                flag_trunc(op as u32, TRUNC_WALK_NAME);
+                                let _ = emit_alg(&AlgEvent {
+                                    kind: KIND_ALG,
+                                    op: op as u32,
+                                    class: OTHER_CLASS,
+                                    status: ALG_UNREADABLE,
+                                    weak: 0,
+                                    _pad: 0,
+                                    arr: rv,
+                                    idx: j,
+                                });
+                                done_new = 1;
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    flag_trunc(op as u32, TRUNC_WALK_READ);
+                    done_new = 1;
+                }
             }
-            flag_trunc(op as u32, TRUNC_DISPATCH);
         }
-        0 => {
-            if !no_store {
-                advance_next(key, count);
+        if QUERY_NEXT
+            .insert(key, cc_new | (done_new << 16), 0)
+            .is_err()
+        {
+            bump_loss(LOSS_MAP_QUERY_NEXT);
+            return 0;
+        }
+    }
+    {
+        let w = match unsafe { QUERY_NEXT.get_ptr(&key).map(|p| *p) } {
+            Some(w) => w,
+            None => return 0,
+        };
+        let cc = qn_cursor(w);
+        let site_done = (w & QN_DONE_BIT) != 0;
+        let j = cc - 1;
+        let mut cc_new = cc;
+        let mut done_new = u64::from(site_done);
+        if !site_done {
+            let base = rv + j * 32;
+            let r_names = unsafe { helpers::bpf_probe_read_user(base as *const u64) };
+            let r_imp = unsafe { helpers::bpf_probe_read_user((base + 16) as *const u64) };
+            match (r_names, r_imp) {
+                (Ok(names), Ok(imp)) => {
+                    if names == 0 {
+                        if !no_store {
+                            record_termd(rv, op as u32, j);
+                        }
+                        done_new = 1;
+                    } else if imp == 0 {
+                        flag_trunc(op as u32, TRUNC_WALK_NOIMP);
+                        cc_new = (j + 1) % MAX_ALGS + 1;
+                    } else {
+                        match unsafe {
+                            helpers::bpf_probe_read_user_str_bytes(
+                                names as *const u8,
+                                &mut name_buf,
+                            )
+                        } {
+                            Ok(slice) => {
+                                let len = slice.len();
+                                let saturated = len == ALG_WINDOW - 1;
+                                let v = classify_alg(&name_buf, len, saturated);
+                                if emit_alg(&AlgEvent {
+                                    kind: KIND_ALG,
+                                    op: op as u32,
+                                    class: v.class,
+                                    status: v.status,
+                                    weak: u8::from(v.weak),
+                                    _pad: 0,
+                                    arr: rv,
+                                    idx: j,
+                                }) {
+                                    match walk_dispatch(imp, op as u32, rv, j) {
+                                        1 => {
+                                            flag_trunc(op as u32, TRUNC_DISPATCH);
+                                            cc_new = (j + 1) % MAX_ALGS + 1;
+                                        }
+                                        0 => {
+                                            cc_new = (j + 1) % MAX_ALGS + 1;
+                                        }
+                                        2 => {
+                                            flag_trunc(op as u32, TRUNC_WALK_READ);
+                                            done_new = 1;
+                                        }
+                                        _ => {
+                                            done_new = 1;
+                                        }
+                                    }
+                                } else {
+                                    done_new = 1;
+                                }
+                            }
+                            Err(_) => {
+                                flag_trunc(op as u32, TRUNC_WALK_NAME);
+                                let _ = emit_alg(&AlgEvent {
+                                    kind: KIND_ALG,
+                                    op: op as u32,
+                                    class: OTHER_CLASS,
+                                    status: ALG_UNREADABLE,
+                                    weak: 0,
+                                    _pad: 0,
+                                    arr: rv,
+                                    idx: j,
+                                });
+                                done_new = 1;
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    flag_trunc(op as u32, TRUNC_WALK_READ);
+                    done_new = 1;
+                }
             }
         }
-        // Read abort: flag (all slots) and freeze for re-walk.
-        _ => {
-            flag_trunc(op as u32, TRUNC_WALK_READ);
+        if QUERY_NEXT
+            .insert(key, cc_new | (done_new << 16), 0)
+            .is_err()
+        {
+            bump_loss(LOSS_MAP_QUERY_NEXT);
+            return 0;
+        }
+    }
+    {
+        let w = match unsafe { QUERY_NEXT.get_ptr(&key).map(|p| *p) } {
+            Some(w) => w,
+            None => return 0,
+        };
+        let cc = qn_cursor(w);
+        let site_done = (w & QN_DONE_BIT) != 0;
+        let j = cc - 1;
+        let mut cc_new = cc;
+        let mut done_new = u64::from(site_done);
+        if !site_done {
+            let base = rv + j * 32;
+            let r_names = unsafe { helpers::bpf_probe_read_user(base as *const u64) };
+            let r_imp = unsafe { helpers::bpf_probe_read_user((base + 16) as *const u64) };
+            match (r_names, r_imp) {
+                (Ok(names), Ok(imp)) => {
+                    if names == 0 {
+                        if !no_store {
+                            record_termd(rv, op as u32, j);
+                        }
+                        done_new = 1;
+                    } else if imp == 0 {
+                        flag_trunc(op as u32, TRUNC_WALK_NOIMP);
+                        cc_new = (j + 1) % MAX_ALGS + 1;
+                    } else {
+                        match unsafe {
+                            helpers::bpf_probe_read_user_str_bytes(
+                                names as *const u8,
+                                &mut name_buf,
+                            )
+                        } {
+                            Ok(slice) => {
+                                let len = slice.len();
+                                let saturated = len == ALG_WINDOW - 1;
+                                let v = classify_alg(&name_buf, len, saturated);
+                                if emit_alg(&AlgEvent {
+                                    kind: KIND_ALG,
+                                    op: op as u32,
+                                    class: v.class,
+                                    status: v.status,
+                                    weak: u8::from(v.weak),
+                                    _pad: 0,
+                                    arr: rv,
+                                    idx: j,
+                                }) {
+                                    match walk_dispatch(imp, op as u32, rv, j) {
+                                        1 => {
+                                            flag_trunc(op as u32, TRUNC_DISPATCH);
+                                            cc_new = (j + 1) % MAX_ALGS + 1;
+                                        }
+                                        0 => {
+                                            cc_new = (j + 1) % MAX_ALGS + 1;
+                                        }
+                                        2 => {
+                                            flag_trunc(op as u32, TRUNC_WALK_READ);
+                                            done_new = 1;
+                                        }
+                                        _ => {
+                                            done_new = 1;
+                                        }
+                                    }
+                                } else {
+                                    done_new = 1;
+                                }
+                            }
+                            Err(_) => {
+                                flag_trunc(op as u32, TRUNC_WALK_NAME);
+                                let _ = emit_alg(&AlgEvent {
+                                    kind: KIND_ALG,
+                                    op: op as u32,
+                                    class: OTHER_CLASS,
+                                    status: ALG_UNREADABLE,
+                                    weak: 0,
+                                    _pad: 0,
+                                    arr: rv,
+                                    idx: j,
+                                });
+                                done_new = 1;
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    flag_trunc(op as u32, TRUNC_WALK_READ);
+                    done_new = 1;
+                }
+            }
+        }
+        if QUERY_NEXT
+            .insert(key, cc_new | (done_new << 16), 0)
+            .is_err()
+        {
+            bump_loss(LOSS_MAP_QUERY_NEXT);
+            return 0;
+        }
+    }
+
+    if no_store {
+        // Exit with cursor 0 (a flip back to cacheable restarts).
+        if QUERY_NEXT.insert(key, 1, 0).is_err() {
+            bump_loss(LOSS_MAP_QUERY_NEXT);
+        }
+    }
+    // Post-chunk overrun guard (straight-line): the cursor wrapped
+    // with every slot continued, so slot 511 was covered and the
+    // array may extend past the bound — slot 512 decides (live or
+    // unreadable = TRUNC, terminator = clean + proof).
+    {
+        let w = unsafe { QUERY_NEXT.get_ptr(&key).map(|p| *p) }.unwrap_or(0);
+        let done_f = (w & QN_DONE_BIT) != 0;
+        let cc_f = qn_cursor(w);
+        if !done_f && cc_f < cc0 {
+            let tail =
+                unsafe { helpers::bpf_probe_read_user((rv + MAX_ALGS * 32) as *const u64) };
+            match tail {
+                Ok(0) => {
+                    if !no_store {
+                        record_termd(rv, op as u32, MAX_ALGS);
+                    }
+                }
+                _ => flag_trunc(op as u32, TRUNC_ALGS),
+            }
         }
     }
     0
