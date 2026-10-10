@@ -12,6 +12,8 @@ pub mod args;
 pub mod capture;
 pub mod check;
 pub mod cli;
+// T07: immutable planner identity + count session (coordinator review).
+pub mod count_session;
 pub mod discovery;
 pub mod doctor;
 // T01 (coordinator review): conserved evidence model + pure policy primitives.

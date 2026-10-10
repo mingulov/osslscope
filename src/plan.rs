@@ -27,9 +27,9 @@ pub struct Identity {
 }
 
 /// One planned probe: multi-link site + cookie + identity. Shared
-/// implementations (same path+offset under several rows) attach ONCE
-/// under the first identity; the rest ride as `aliases` (their calls
-/// ARE counted — under the canonical cookie — so this is plan
+/// implementations (same backing+offset under several rows) attach
+/// ONCE under the first identity; the rest ride as `aliases` (their
+/// calls ARE counted — under the canonical cookie — so this is plan
 /// metadata, not a gap counter).
 #[derive(Debug, Clone)]
 pub struct Entry {
@@ -40,7 +40,11 @@ pub struct Entry {
     pub aliases: Vec<Identity>,
 }
 
-/// Plan-time reject → `missed_attaches` at window end.
+/// Plan-time reject → `missed_attaches` at window end. Reasons:
+/// `unmapped` (no live X mapping of the backing file),
+/// `unreadable` (no file bytes / stat failure), `past-eof`,
+/// `not-executable`, `replaced` (the link path no longer backs the
+/// planned file identity — open-file check around attachment).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Missed {
     pub dev: String,
@@ -87,19 +91,23 @@ fn u64_at(r: &serde_json::Value, k: &str) -> anyhow::Result<u64> {
 }
 
 /// Stable cookie allocator across fence re-plans. Cookies identify
-/// (path, offset) for the whole run — old links keep firing with
-/// correct cookies under new generations (the gen half of the key
-/// separates pre/post-fence counts), so re-plans never detach.
-/// Single-shot `plan` is the fresh-allocator case (cookies 0..n).
+/// verified physical backing (device, inode, file offset) for the
+/// whole run — never the link path. The same inode through another
+/// path reuses its cookie; a replacement inode at the same path
+/// mints a new one while the old cookie keeps its old meaning. Old
+/// links keep firing with correct cookies under new generations
+/// (the gen half of the key separates pre/post-fence counts), so
+/// re-plans never detach. Single-shot `plan` is the fresh-allocator
+/// case (cookies 0..n).
 #[derive(Debug, Default)]
 pub struct StableCookies {
     next: u32,
-    ids: HashMap<(String, u64), u32>,
+    ids: HashMap<(String, u64, u64), u32>,
 }
 
 impl StableCookies {
-    fn cookie_for(&mut self, path: &str, offset: u64) -> anyhow::Result<u32> {
-        if let Some(&c) = self.ids.get(&(path.to_string(), offset)) {
+    fn cookie_for(&mut self, dev: &str, ino: u64, offset: u64) -> anyhow::Result<u32> {
+        if let Some(&c) = self.ids.get(&(dev.to_string(), ino, offset)) {
             return Ok(c);
         }
         if self.next == u32::MAX {
@@ -107,9 +115,101 @@ impl StableCookies {
         }
         let c = self.next;
         self.next += 1;
-        self.ids.insert((path.to_string(), offset), c);
+        self.ids.insert((dev.to_string(), ino, offset), c);
         Ok(c)
     }
+
+    /// Reverse lookup: the cookie minted for a backing triple, if any.
+    pub fn lookup(&self, dev: &str, ino: u64, offset: u64) -> Option<u32> {
+        self.ids.get(&(dev.to_string(), ino, offset)).copied()
+    }
+
+    /// Cookies minted so far.
+    pub fn len(&self) -> usize {
+        self.ids.len()
+    }
+
+    /// Whether any cookie has been minted.
+    pub fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+}
+
+/// Parse a `/proc/pid/maps` device field (`major:minor`, both hex —
+/// the kernel prints `%02x:%02x` of the device numbers, so e.g.
+/// device-mapper `253:0` reads `fd:00`). `None` on any malformed
+/// input; callers treat that as an unplannable row, never a guess.
+pub fn parse_maps_dev(dev: &str) -> Option<(u32, u32)> {
+    let (major, minor) = dev.split_once(':')?;
+    if major.is_empty() || minor.is_empty() {
+        return None;
+    }
+    let major = u32::from_str_radix(major, 16).ok()?;
+    let minor = u32::from_str_radix(minor, 16).ok()?;
+    Some((major, minor))
+}
+
+/// Encode a (major, minor) device pair as the `SiteKey.device`
+/// identity word. This is a stable identity encoding, not the kernel
+/// `dev_t` bit layout; [`decode_device`] inverts it exactly.
+pub fn encode_device(major: u32, minor: u32) -> u64 {
+    ((major as u64) << 32) | (minor as u64)
+}
+
+/// Split an [`encode_device`] word back into (major, minor).
+pub fn decode_device(id: u64) -> (u32, u32) {
+    ((id >> 32) as u32, id as u32)
+}
+
+/// Render an encoded device word in maps `major:minor` hex form.
+pub fn render_device(id: u64) -> String {
+    let (major, minor) = decode_device(id);
+    format!("{major:02x}:{minor:02x}")
+}
+
+/// Maps device field → encoded identity word. `None` when the field
+/// is malformed.
+pub fn device_id_of_maps_dev(dev: &str) -> Option<u64> {
+    parse_maps_dev(dev).map(|(major, minor)| encode_device(major, minor))
+}
+
+/// Sample the (device, inode) identity word pair currently behind
+/// `path`. The count session samples before and after each attach:
+/// a path that moves across the attach call has its fresh links
+/// dropped loud as `replaced` instead of risking attribution to the
+/// wrong backing under an already-known cookie.
+pub fn sample_backing(path: &str) -> std::io::Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt as _;
+    let file = std::fs::File::open(path)?;
+    let meta = file.metadata()?;
+    Ok((
+        encode_device(libc::major(meta.dev()), libc::minor(meta.dev())),
+        meta.ino(),
+    ))
+}
+
+/// Open `path` and verify the open file still backs the planned
+/// (device, inode) identity. The count session calls this around
+/// attachment so a path replaced between planning and attach is
+/// skipped as `replaced` instead of probed under a stale identity.
+/// A best-effort TOCTOU guard: `uprobe_multi` attach takes a path,
+/// not a file descriptor, so no userspace flow can pin the resolved
+/// inode — open-then-fstat plus a post-attach re-sample narrows the
+/// race to a replace-and-restore of the same inode across the attach
+/// call, which is accepted and documented rather than silently
+/// trusted. A wrongly attached probe under an already-known cookie
+/// would attribute to stale provenance, so the session drops fresh
+/// links whenever the path moves across attach (loud PARTIAL)
+/// instead of hoping the drain catches it.
+pub fn verify_backing(path: &str, device: u64, ino: u64) -> std::io::Result<()> {
+    let (live_device, live_ino) = sample_backing(path)?;
+    if live_device != device || live_ino != ino {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{path} no longer backs the planned file identity"),
+        ));
+    }
+    Ok(())
 }
 
 /// Plan every doc row against live mappings. `files` maps link-path
@@ -137,25 +237,62 @@ pub fn plan_stable(
         .get("rows")
         .and_then(|r| r.as_array())
         .ok_or_else(|| anyhow::anyhow!("harvest doc has no rows array"))?;
+    let mut typed = Vec::with_capacity(rows.len());
+    for r in rows {
+        let backing = r
+            .get("backing")
+            .ok_or_else(|| anyhow::anyhow!("harvest row lacks backing"))?;
+        typed.push(PlanRow {
+            dev: str_at(backing, "dev")?,
+            ino: u64_at(backing, "ino")?,
+            offset: u64_at(backing, "offset")?,
+            id: Identity {
+                provider: str_at(r, "provider")?,
+                op: u32_at(r, "op")?,
+                funcid: u32_at(r, "funcid")?,
+                alg_class: str_at(r, "alg_class")?,
+                offset: u64_at(backing, "offset")?,
+            },
+        });
+    }
+    plan_rows(&typed, live, files, generation, stable)
+}
+
+/// One typed plan row: physical backing + the candidate identity
+/// riding it. The JSON harvest-doc path ([`plan_stable`]) and the
+/// typed discovery-delta path (count session) both funnel through
+/// [`plan_rows`], so validation and cookie identity cannot drift.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanRow {
+    pub dev: String,
+    pub ino: u64,
+    pub offset: u64,
+    pub id: Identity,
+}
+
+/// Plan typed rows against live mappings. `files` maps link-path →
+/// file bytes (caller pre-reads each distinct mapped path once).
+/// Fail-closed: malformed rows are an error, never a skip.
+/// Dedup and cookie identity key on verified physical backing
+/// (dev, ino, offset) — the same inode through another path aliases
+/// under one cookie, while a replacement inode mints a new one.
+pub fn plan_rows(
+    rows: &[PlanRow],
+    live: &[maps::Mapping],
+    files: &HashMap<String, Vec<u8>>,
+    generation: u32,
+    stable: &mut StableCookies,
+) -> anyhow::Result<Plan> {
     let mut out = Plan {
         entries: Vec::new(),
         missed: Vec::new(),
         generation,
     };
-    let mut seen: HashMap<(String, u64), usize> = HashMap::new();
+    let mut seen: HashMap<(String, u64, u64), usize> = HashMap::new();
     for r in rows {
-        let backing = r
-            .get("backing")
-            .ok_or_else(|| anyhow::anyhow!("harvest row lacks backing"))?;
-        let id = Identity {
-            provider: str_at(r, "provider")?,
-            op: u32_at(r, "op")?,
-            funcid: u32_at(r, "funcid")?,
-            alg_class: str_at(r, "alg_class")?,
-            offset: u64_at(backing, "offset")?,
-        };
-        let dev = str_at(backing, "dev")?;
-        let ino = u64_at(backing, "ino")?;
+        let dev = r.dev.clone();
+        let ino = r.ino;
+        let id = r.id.clone();
         // Candidate link paths: X mappings of the same file.
         let mut cands: Vec<&str> = live
             .iter()
@@ -169,7 +306,7 @@ pub fn plan_stable(
             out.missed.push(Missed {
                 dev,
                 ino,
-                offset: id.offset,
+                offset: r.offset,
                 reason: if cands.is_empty() {
                     "unmapped"
                 } else {
@@ -179,17 +316,17 @@ pub fn plan_stable(
             continue;
         };
         let bytes = &files[*path];
-        if id.offset >= bytes.len() as u64 {
+        if r.offset >= bytes.len() as u64 {
             out.missed.push(Missed {
                 dev,
                 ino,
-                offset: id.offset,
+                offset: r.offset,
                 reason: "past-eof",
             });
             continue;
         }
         let reason = match elf::parse_elf(bytes) {
-            Ok(e) if elf::offset_in_x_segment(&e, id.offset) => None,
+            Ok(e) if elf::offset_in_x_segment(&e, r.offset) => None,
             Ok(_) => Some("not-executable"),
             Err(_) => Some("unreadable"),
         };
@@ -197,22 +334,25 @@ pub fn plan_stable(
             out.missed.push(Missed {
                 dev,
                 ino,
-                offset: id.offset,
+                offset: r.offset,
                 reason,
             });
             continue;
         }
         // Shared implementation: alias under the canonical cookie.
-        let key = (path.to_string(), id.offset);
+        // Keyed by physical backing, not by the chosen link path, so
+        // the same file reached through another alias cannot mint a
+        // second cookie for the same site.
+        let key = (dev.clone(), ino, r.offset);
         if let Some(&i) = seen.get(&key) {
             out.entries[i].aliases.push(id);
             continue;
         }
-        let cookie = stable.cookie_for(path, id.offset)?;
+        let cookie = stable.cookie_for(&dev, ino, r.offset)?;
         seen.insert(key, out.entries.len());
         out.entries.push(Entry {
             path: path.to_string(),
-            offset: id.offset,
+            offset: r.offset,
             cookie,
             id,
             aliases: Vec::new(),
@@ -507,5 +647,106 @@ mod tests {
         );
         assert!(links.is_empty());
         assert_eq!(bad, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn maps_dev_codec_roundtrips() {
+        // Hex major:minor, including a device-mapper-shaped major.
+        assert_eq!(parse_maps_dev("08:01"), Some((8, 1)));
+        assert_eq!(parse_maps_dev("fd:00"), Some((253, 0)));
+        assert_eq!(parse_maps_dev("0:0"), Some((0, 0)));
+        assert_eq!(parse_maps_dev(""), None);
+        assert_eq!(parse_maps_dev("08"), None);
+        assert_eq!(parse_maps_dev("08:"), None);
+        assert_eq!(parse_maps_dev(":01"), None);
+        assert_eq!(parse_maps_dev("zz:01"), None);
+        assert_eq!(parse_maps_dev("08:01:02"), None);
+        for (major, minor) in [(8u32, 1u32), (253, 0), (0, 0), (259, 3)] {
+            let id = encode_device(major, minor);
+            assert_eq!(decode_device(id), (major, minor));
+            assert_eq!(device_id_of_maps_dev(&render_device(id)), Some(id));
+        }
+        assert_eq!(device_id_of_maps_dev("bogus"), None);
+    }
+
+    #[test]
+    fn verify_backing_checks_open_file() {
+        use std::os::unix::fs::MetadataExt as _;
+        let exe = std::env::current_exe().unwrap();
+        let meta = std::fs::metadata(&exe).unwrap();
+        let id = encode_device(libc::major(meta.dev()), libc::minor(meta.dev()));
+        let path = exe.to_str().unwrap();
+        assert!(verify_backing(path, id, meta.ino()).is_ok());
+        // Wrong inode or device fails closed.
+        assert!(verify_backing(path, id, meta.ino().wrapping_add(1)).is_err());
+        assert!(verify_backing(path, encode_device(0xdead, 0xbeef), meta.ino()).is_err());
+        // Missing path fails (open error, not a silent pass).
+        assert!(verify_backing("/nonexistent-osslscope-probe-path", id, meta.ino()).is_err());
+    }
+
+    #[test]
+    fn sample_backing_matches_stat() {
+        use std::os::unix::fs::MetadataExt as _;
+        let exe = std::env::current_exe().unwrap();
+        let meta = std::fs::metadata(&exe).unwrap();
+        let expect = (
+            encode_device(libc::major(meta.dev()), libc::minor(meta.dev())),
+            meta.ino(),
+        );
+        assert_eq!(sample_backing(exe.to_str().unwrap()).unwrap(), expect);
+        assert!(sample_backing("/nonexistent-osslscope-probe-path").is_err());
+    }
+
+    #[test]
+    fn typed_rows_alias_by_backing_not_path() {
+        // Same (dev, ino, offset) reached through two alias link
+        // paths plans ONE entry under ONE cookie.
+        let bytes = self_bytes();
+        let (x_off, _) = probe_offsets(&bytes);
+        let live = vec![
+            mapping("08:01", 99, "/lib/spike.so"),
+            mapping("08:01", 99, "/mnt/alias/spike.so"),
+        ];
+        let files = HashMap::from([
+            ("/lib/spike.so".to_string(), bytes.clone()),
+            ("/mnt/alias/spike.so".to_string(), bytes),
+        ]);
+        let mk = |provider: &str| PlanRow {
+            dev: "08:01".to_string(),
+            ino: 99,
+            offset: x_off,
+            id: Identity {
+                provider: provider.to_string(),
+                op: 1,
+                funcid: 7,
+                alg_class: "digest".to_string(),
+                offset: x_off,
+            },
+        };
+        let mut stable = StableCookies::default();
+        let p = plan_rows(&[mk("a"), mk("b")], &live, &files, 0, &mut stable).unwrap();
+        assert!(p.missed.is_empty(), "{:?}", p.missed);
+        assert_eq!(p.entries.len(), 1);
+        assert_eq!(p.entries[0].aliases.len(), 1);
+        assert_eq!(stable.len(), 1);
+        assert_eq!(stable.lookup("08:01", 99, x_off), Some(0));
+        // A replacement inode at the same offset mints a new cookie.
+        let mk2 = PlanRow {
+            dev: "08:01".to_string(),
+            ino: 100,
+            offset: x_off,
+            id: Identity {
+                provider: "a".to_string(),
+                op: 1,
+                funcid: 7,
+                alg_class: "digest".to_string(),
+                offset: x_off,
+            },
+        };
+        let live2 = vec![mapping("08:01", 100, "/lib/spike.so")];
+        let p2 = plan_rows(std::slice::from_ref(&mk2), &live2, &files, 1, &mut stable).unwrap();
+        assert_eq!(p2.entries.len(), 1);
+        assert_eq!(p2.entries[0].cookie, 1);
+        assert_eq!(stable.lookup("08:01", 99, x_off), Some(0));
     }
 }
