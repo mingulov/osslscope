@@ -98,6 +98,11 @@ pub struct DiscoveryConfig {
     pub table: Option<PathBuf>,
     /// Forced query-fn file offset (forensics escape hatch).
     pub force_offset: Option<u64>,
+    /// Operator explicitly selected offsets (`--table` or
+    /// `--force-offset`): unlocks the version-keyed anchor+delta
+    /// rung. False (automatic discovery) uses the supported-only
+    /// ladder — table hit or symtab — and never guesses.
+    pub explicit_offsets: bool,
     /// Required cmdline marker (fixture guard), or None for any target.
     pub cmdline_marker: Option<String>,
 }
@@ -1868,7 +1873,7 @@ fn evict_cursors(maps: &HashMap<String, OwnedFd>, arr: u64) -> anyhow::Result<()
 }
 
 /// Load-mandated init anchor, present even in stripped modules.
-const INIT_ANCHOR: &str = "OSSL_provider_init";
+pub(crate) const INIT_ANCHOR: &str = "OSSL_provider_init";
 
 /// The privileged [`SessionEnv`]: real ring, maps, links, pin, and
 /// `/proc` reads. Owned by [`DiscoverySession`] until session drop.
@@ -2119,7 +2124,15 @@ impl DiscoverySession {
                 }
                 None => builtin::shipped_table(),
             };
-            match builtin::resolve_query_offset(&elf_bytes, &table, cfg.force_offset) {
+            // Automatic discovery uses the supported-only ladder
+            // (table hit or symtab); the anchor+delta rung needs an
+            // explicitly selected table (R09: never guessed offsets).
+            let resolved = if cfg.explicit_offsets {
+                builtin::resolve_query_offset(&elf_bytes, &table, cfg.force_offset)
+            } else {
+                builtin::resolve_supported_offset(&elf_bytes, &table)
+            };
+            match resolved {
                 Ok((off, r)) => {
                     if r != builtin::Resolution::Table {
                         resolution = Some(r.as_str().to_string());

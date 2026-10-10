@@ -241,6 +241,74 @@ pub fn symtab_file_offset(elf_bytes: &[u8], want: &str) -> anyhow::Result<u64> {
 
 /// GNU build-id of the object (hex), or None when no
 /// `.note.gnu.build-id` note is present. Survives stripping by design.
+/// Raw dynamic string table (single home; the builtin ladder and
+/// the spawn loader search share it).
+pub fn dynamic_strtab<'a>(elf: &goblin::elf::Elf<'_>, elf_bytes: &'a [u8]) -> Option<&'a [u8]> {
+    let dyn_info = elf.dynamic.as_ref()?;
+    let off = vaddr_to_offset(elf, dyn_info.info.strtab as u64)?;
+    let len = dyn_info.info.strsz;
+    elf_bytes.get(off as usize..(off as usize).checked_add(len)?)
+}
+
+/// Read one NUL-terminated string from a dynamic string table.
+fn dynstr_at(dynstr: &[u8], off: usize) -> Option<&str> {
+    let rel = dynstr.get(off..)?;
+    let end = rel.iter().position(|&b| b == 0)?;
+    std::str::from_utf8(&rel[..end]).ok()
+}
+
+/// `DT_NEEDED` library names in loader order (empty for static /
+/// non-dynamic objects). Undecodable entries are skipped, never
+/// fatal (a corrupt name cannot become a load prediction).
+pub fn needed_libraries(elf_bytes: &[u8]) -> anyhow::Result<Vec<String>> {
+    let obj = goblin::Object::parse(elf_bytes).context("ELF parse")?;
+    let goblin::Object::Elf(elf) = obj else {
+        bail!("not an ELF object")
+    };
+    let Some(dynamic) = elf.dynamic.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let Some(dynstr) = dynamic_strtab(&elf, elf_bytes) else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for d in &dynamic.dyns {
+        if d.d_tag == goblin::elf::dynamic::DT_NEEDED
+            && let Some(name) = dynstr_at(dynstr, d.d_val as usize)
+        {
+            out.push(name.to_string());
+        }
+    }
+    Ok(out)
+}
+
+/// `(RPATH, RUNPATH)` search strings (each `None` when the tag is
+/// absent or undecodable). The loader ignores RPATH when RUNPATH
+/// is present; callers apply that rule.
+pub fn rpath_runpath(elf_bytes: &[u8]) -> anyhow::Result<(Option<String>, Option<String>)> {
+    let obj = goblin::Object::parse(elf_bytes).context("ELF parse")?;
+    let goblin::Object::Elf(elf) = obj else {
+        bail!("not an ELF object")
+    };
+    let Some(dynamic) = elf.dynamic.as_ref() else {
+        return Ok((None, None));
+    };
+    let Some(dynstr) = dynamic_strtab(&elf, elf_bytes) else {
+        return Ok((None, None));
+    };
+    let mut rpath = None;
+    let mut runpath = None;
+    for d in &dynamic.dyns {
+        let tag = d.d_tag;
+        if tag == goblin::elf::dynamic::DT_RPATH {
+            rpath = dynstr_at(dynstr, d.d_val as usize).map(str::to_string);
+        } else if tag == goblin::elf::dynamic::DT_RUNPATH {
+            runpath = dynstr_at(dynstr, d.d_val as usize).map(str::to_string);
+        }
+    }
+    Ok((rpath, runpath))
+}
+
 pub fn read_build_id(elf_bytes: &[u8]) -> Option<String> {
     let elf = parse_elf(elf_bytes).ok()?;
     elf.program_headers

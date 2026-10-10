@@ -77,6 +77,20 @@ pub fn deadline_at(start: Instant, after: Duration) -> Option<Instant> {
     start.checked_add(after)
 }
 
+/// Parse a `--force-offset` value: decimal or `0x`/`0X` hex.
+/// Shared by inspect/report/check/doctor so the forensics hatch
+/// spells the same everywhere (R09 explicit override).
+pub fn parse_force_offset(value: &str) -> Result<u64, String> {
+    let parsed = match value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        Some(hex) => u64::from_str_radix(hex, 16),
+        None => value.parse::<u64>(),
+    };
+    parsed.map_err(|_| format!("--force-offset needs a decimal or 0x-hex integer (got {value:?})"))
+}
+
 /// Redact a spawn argv: the target strings are never copied into
 /// evidence, logs, or debug output.
 pub fn redact_spawn_argv(_argv: &[String]) -> String {

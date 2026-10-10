@@ -1,0 +1,192 @@
+{
+  "completeness": {
+    "counters": [
+      {
+        "kind": "loss",
+        "name": "count.map_insert_dropped",
+        "source": "kernel-map",
+        "units": "events",
+        "value": 0
+      },
+      {
+        "kind": "activity",
+        "name": "count.windows_closed",
+        "source": "drain",
+        "units": "events",
+        "value": 1
+      }
+    ],
+    "fatal_kind": null,
+    "reasons": [],
+    "status": "COMPLETE"
+  },
+  "coverage": [
+    {
+      "attached": 3,
+      "discovered": 3,
+      "expected": {
+        "sites": 3,
+        "state": "applicable"
+      },
+      "scope": "provider/default"
+    },
+    {
+      "attached": 0,
+      "discovered": 0,
+      "expected": {
+        "sites": null,
+        "state": "not-applicable"
+      },
+      "scope": "provider/legacy"
+    }
+  ],
+  "disposition": {
+    "code": 0,
+    "outcome": "exited",
+    "pid": null
+  },
+  "fenced": [],
+  "objects": [
+    {
+      "device": 8,
+      "display_locator": "/usr/lib/x86_64-linux-gnu/ossl-modules/default.so",
+      "id": "build:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "inode": 100
+    },
+    {
+      "device": 8,
+      "display_locator": "/usr/lib/x86_64-linux-gnu/ossl-modules/legacy.so",
+      "id": "build:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+      "inode": 200
+    },
+    {
+      "device": 8,
+      "display_locator": "/opt/vendor/lib/third-party.so",
+      "id": "unverified:8:123456",
+      "inode": 300
+    }
+  ],
+  "openssl": {
+    "state": "verified",
+    "version": "3.5.1"
+  },
+  "schema_version": "observed-crypto-v2.0",
+  "sites": [
+    {
+      "calls": 500,
+      "candidates": [
+        {
+          "algorithm_classes": [
+            "AES-128-GCM"
+          ],
+          "funcid": 21,
+          "op": 2,
+          "provider": "build:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+          "provider_class": "default",
+          "weak_alias": false
+        }
+      ],
+      "candidates_coverage": "complete",
+      "device": 8,
+      "first_ns": 10,
+      "generation": 0,
+      "inode": 100,
+      "last_ns": 90,
+      "object": "build:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "offset": 4096
+    },
+    {
+      "calls": 300,
+      "candidates": [
+        {
+          "algorithm_classes": [
+            "SHA-256"
+          ],
+          "funcid": 7,
+          "op": 1,
+          "provider": "build:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+          "provider_class": "default",
+          "weak_alias": false
+        }
+      ],
+      "candidates_coverage": "complete",
+      "device": 8,
+      "first_ns": 10,
+      "generation": 0,
+      "inode": 100,
+      "last_ns": 90,
+      "object": "build:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "offset": 8192
+    },
+    {
+      "calls": 100,
+      "candidates": [
+        {
+          "algorithm_classes": [
+            "AES-256-GCM"
+          ],
+          "funcid": 21,
+          "op": 2,
+          "provider": "build:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+          "provider_class": "default",
+          "weak_alias": false
+        },
+        {
+          "algorithm_classes": [
+            "ARIA-256-GCM"
+          ],
+          "funcid": 21,
+          "op": 2,
+          "provider": "build:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+          "provider_class": "default",
+          "weak_alias": true
+        }
+      ],
+      "candidates_coverage": "complete",
+      "device": 8,
+      "first_ns": 10,
+      "generation": 0,
+      "inode": 200,
+      "last_ns": 90,
+      "object": "build:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+      "offset": 4096
+    },
+    {
+      "calls": 0,
+      "candidates": [
+        {
+          "algorithm_classes": [
+            "SHA-384"
+          ],
+          "funcid": 9,
+          "op": 1,
+          "provider": "unverified:8:123456",
+          "provider_class": "third-party:xyz",
+          "weak_alias": false
+        }
+      ],
+      "candidates_coverage": "complete",
+      "device": 8,
+      "first_ns": 10,
+      "generation": 0,
+      "inode": 300,
+      "last_ns": 90,
+      "object": "unverified:8:123456",
+      "offset": 12288
+    }
+  ],
+  "target": {
+    "argv_redacted": true,
+    "comm": "demo",
+    "container_id": "",
+    "image_digest": "",
+    "pid": 7
+  },
+  "window": {
+    "effective_end_ns": 100,
+    "effective_start_ns": 0,
+    "requested_end_ns": 100,
+    "requested_start_ns": 0,
+    "signal_cut": false
+  }
+}

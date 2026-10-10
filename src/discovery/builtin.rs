@@ -177,6 +177,66 @@ pub fn resolve_query_offset(
     resolve_symbol_offset(elf_bytes, table, force, QUERY_SYMBOL)
 }
 
+/// Build-id table rung (shared by the full and supported-only
+/// ladders): a hit returns the recorded offset after the T09 shape
+/// check (the recorded anchor must resolve to the recorded offset
+/// in THESE bytes — a mislabel/mismatch fails closed instead of
+/// probing a wrong offset); a miss returns None (the caller falls
+/// through to the next rung).
+fn table_hit(elf_bytes: &[u8], table: &Table) -> anyhow::Result<Option<(u64, Resolution)>> {
+    let Some(id) = elf::read_build_id(elf_bytes) else {
+        return Ok(None);
+    };
+    let Some(e) = table.by_build_id(&id) else {
+        return Ok(None);
+    };
+    let live = elf::dynsym_file_offset(elf_bytes, &e.anchor).map_err(|_| {
+        anyhow!(
+            "build-id table entry for {id}: anchor {} not exported",
+            e.anchor
+        )
+    })?;
+    if live != e.anchor_offset {
+        bail!(
+            "build-id table entry for {id}: anchor {} at 0x{live:x} (table says 0x{:x}); re-enroll this build",
+            e.anchor,
+            e.anchor_offset
+        );
+    }
+    Ok(Some((e.query_offset, Resolution::Table)))
+}
+
+/// Supported-only ladder for automatic discovery (T12/R09):
+/// build-id table hit (anchor-verified, same rule as the full
+/// ladder) or the object's own symtab. The version-keyed
+/// anchor+delta rung is NOT consulted — it needs an explicitly
+/// selected table (see [`resolve_query_offset`], explicit-only).
+/// Unknown/stripped builds error with enrollment remediation;
+/// never a guess.
+pub fn resolve_supported_offset(
+    elf_bytes: &[u8],
+    table: &Table,
+) -> anyhow::Result<(u64, Resolution)> {
+    elf::parse_elf(elf_bytes)?;
+    if let Some(hit) = table_hit(elf_bytes, table)? {
+        return Ok(hit);
+    }
+    if let Ok(off) = elf::symtab_file_offset(elf_bytes, QUERY_SYMBOL) {
+        return Ok((off, Resolution::Symtab));
+    }
+    match elf::read_build_id(elf_bytes) {
+        Some(id) => bail!(
+            "no supported anchor for stripped build {id}: not enrolled and no symtab; \
+             enroll with --table (see docs/builtin-runbook.md) or pass --force-offset \
+             for a one-shot run"
+        ),
+        None => bail!(
+            "no supported anchor: no GNU build-id and no symtab; enroll with --table \
+             (see docs/builtin-runbook.md) or pass --force-offset for a one-shot run"
+        ),
+    }
+}
+
 /// Ladder over a caller-chosen symbol (the query symbol in production;
 /// the seam that keeps every rung hermetically testable).
 pub fn resolve_symbol_offset(
@@ -189,29 +249,8 @@ pub fn resolve_symbol_offset(
         return Ok((off, Resolution::Forced));
     }
     let elf = elf::parse_elf(elf_bytes)?;
-    if let Some(id) = elf::read_build_id(elf_bytes)
-        && let Some(e) = table.by_build_id(&id)
-    {
-        // T09 shape check: the recorded anchor must resolve to the
-        // recorded offset in THESE bytes. A build-id mislabel or a
-        // table/object mismatch fails closed with an actionable
-        // error instead of probing a wrong offset (a wrong offset
-        // yields zero rows → PARTIAL at best; the check exists so a
-        // stale table can never silently resolve).
-        let live = elf::dynsym_file_offset(elf_bytes, &e.anchor).map_err(|_| {
-            anyhow!(
-                "build-id table entry for {id}: anchor {} not exported",
-                e.anchor
-            )
-        })?;
-        if live != e.anchor_offset {
-            bail!(
-                "build-id table entry for {id}: anchor {} at 0x{live:x} (table says 0x{:x}); re-enroll this build",
-                e.anchor,
-                e.anchor_offset
-            );
-        }
-        return Ok((e.query_offset, Resolution::Table));
+    if let Some(hit) = table_hit(elf_bytes, table)? {
+        return Ok(hit);
     }
     if let Ok(off) = elf::symtab_file_offset(elf_bytes, symbol) {
         return Ok((off, Resolution::Symtab));
@@ -238,10 +277,7 @@ pub fn resolve_via_anchor(elf_bytes: &[u8], anchor: &str, delta: u64) -> anyhow:
 /// Raw `.dynstr` bytes via PT_DYNAMIC (strip-proof: the loader needs
 /// it; no section headers required).
 fn dynamic_strtab<'a>(elf: &goblin::elf::Elf<'_>, elf_bytes: &'a [u8]) -> Option<&'a [u8]> {
-    let dyn_info = elf.dynamic.as_ref()?;
-    let off = elf::vaddr_to_offset(elf, dyn_info.info.strtab as u64)?;
-    let len = dyn_info.info.strsz;
-    elf_bytes.get(off as usize..(off as usize).checked_add(len)?)
+    elf::dynamic_strtab(elf, elf_bytes)
 }
 
 #[cfg(test)]

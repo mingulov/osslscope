@@ -3,7 +3,8 @@
 
 Product documentation. Start with the README, then:
 
-- `install.md` - package install, doctor-first verify, uninstall
+- `build.md` - reproducible source build (host + BPF), manifests, lockfiles
+- `install.md` - local prefix and package install, doctor-first verify, uninstall
 - `usage.md` - CLI usage (`inspect` / `report` / `check` / `doctor` /
   `alias-audit`)
 - `what-it-proves.md` - claim chain, non-goals, who-should-NOT-adopt
@@ -19,5 +20,6 @@ Product documentation. Start with the README, then:
 - `builtin-runbook.md` - stripped/unknown-libcrypto recipe for
   `--builtin` inventory
 - `trace-gap.md` - osslscope vs OSSL_TRACE side-by-side
+- `observed-crypto-v2.md` - v2 report/check JSON, human and CBOM contract
 - `privacy/allowlist-v1.md` - capture allowlist: what may be observed
 - `privacy/residuals.md` - privacy residuals beyond the allowlist

@@ -1,0 +1,354 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://osslscope.dev/schemas/observed-crypto-v2.json",
+  "title": "observed-crypto v2",
+  "description": "osslscope report/check window document (continuation R08). The counted unit is entry into a provider-dispatch callback at one physical site; candidates are sorted attribution metadata, not definite executed-algorithm identity. Producers emit observed-crypto-v2.0 today. Readers gate majors via check_version_v2 (accept v2.x, reject other majors); validators enforce this minor's schema strictly (unknown keys fail: a v2.0 validator cannot verify v2.1 keys it does not know) while field-level readers ignore unknown keys. report documents omit policy/disposition when unevaluated/unrecorded; check documents add policy. No raw argv, cmdline, environment or runtime addresses anywhere: every object forbids additional properties.",
+  "type": "object",
+  "required": ["schema_version", "target", "openssl", "window", "completeness", "sites", "fenced", "objects", "coverage"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "description": "Producers emit exactly observed-crypto-v2.0; readers major-gate via check_version_v2 (accept v2.x, reject other majors).",
+      "type": "string",
+      "minLength": 1
+    },
+    "target": {
+      "description": "Safe actionability (R07): pid, comm, container/image provenance. argv is never carried; argv_redacted is always true.",
+      "type": "object",
+      "required": ["pid", "comm", "container_id", "image_digest", "argv_redacted"],
+      "additionalProperties": false,
+      "properties": {
+        "pid": { "$ref": "#/$defs/u32" },
+        "comm": { "type": "string" },
+        "container_id": { "type": "string" },
+        "image_digest": { "type": "string" },
+        "argv_redacted": { "const": true }
+      }
+    },
+    "openssl": {
+      "description": "OpenSSL version from verified object metadata, or explicitly unknown (never guessed).",
+      "type": "object",
+      "required": ["state", "version"],
+      "additionalProperties": false,
+      "properties": {
+        "state": { "enum": ["verified", "unknown"] },
+        "version": { "type": ["string", "null"] }
+      }
+    },
+    "window": {
+      "description": "Requested versus effective coverage boundaries in monotonic nanoseconds. Any unobserved interval inside the requested window is a gap; the effective window never extends past the requested one.",
+      "type": "object",
+      "required": ["requested_start_ns", "requested_end_ns", "effective_start_ns", "effective_end_ns", "signal_cut"],
+      "additionalProperties": false,
+      "properties": {
+        "requested_start_ns": { "$ref": "#/$defs/u64" },
+        "requested_end_ns": { "$ref": "#/$defs/u64" },
+        "effective_start_ns": { "$ref": "#/$defs/u64" },
+        "effective_end_ns": { "$ref": "#/$defs/u64" },
+        "signal_cut": { "type": "boolean" }
+      }
+    },
+    "completeness": {
+      "type": "object",
+      "required": ["status", "fatal_kind", "reasons", "counters"],
+      "additionalProperties": false,
+      "properties": {
+        "status": { "enum": ["COMPLETE", "PARTIAL", "FATAL"] },
+        "fatal_kind": {
+          "description": "Null unless status is FATAL; environment carries a detail string.",
+          "anyOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "required": ["kind", "detail"],
+              "additionalProperties": false,
+              "properties": {
+                "kind": { "enum": ["recycled", "attach-zero", "environment"] },
+                "detail": { "type": ["string", "null"] }
+              }
+            }
+          ]
+        },
+        "reasons": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/reason" }
+        },
+        "counters": {
+          "description": "Source-tagged gap/activity counters with published units and kind. Only positive loss counters force PARTIAL.",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "kind", "units", "source", "value"],
+            "additionalProperties": false,
+            "properties": {
+              "name": { "type": "string", "minLength": 1 },
+              "kind": { "enum": ["loss", "activity"] },
+              "units": { "enum": ["calls", "sites", "table-rows", "events", "probes"] },
+              "source": { "enum": ["kernel-ring", "kernel-map", "discovery", "attach", "drain", "lifecycle", "setup"] },
+              "value": { "$ref": "#/$defs/u64" }
+            }
+          }
+        }
+      }
+    },
+    "sites": {
+      "description": "Current-generation physical execution records: one conserved call count per site plus sorted candidate metadata.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/site" }
+    },
+    "fenced": {
+      "description": "Conserved counts of fenced generations in the same SiteExecution shape, so fence crossings preserve candidates.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["generation", "sites"],
+        "additionalProperties": false,
+        "properties": {
+          "generation": { "$ref": "#/$defs/u32" },
+          "sites": {
+            "type": "array",
+            "items": { "$ref": "#/$defs/site" }
+          }
+        }
+      }
+    },
+    "objects": {
+      "description": "Observed code objects: verified identity plus a display locator (provenance for operators, never identity). Every site backing object and candidate advertising provider resolves here.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "device", "inode", "display_locator"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "device": { "$ref": "#/$defs/u64" },
+          "inode": { "$ref": "#/$defs/u64" },
+          "display_locator": { "type": "string" }
+        }
+      }
+    },
+    "coverage": {
+      "description": "Per-scope instrumentation readiness: what was expected, discovered and attached. Quiet but fully attached sites are covered, not gaps.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["scope", "expected", "discovered", "attached"],
+        "additionalProperties": false,
+        "properties": {
+          "scope": { "type": "string", "minLength": 1 },
+          "expected": {
+            "type": "object",
+            "required": ["state", "sites"],
+            "additionalProperties": false,
+            "properties": {
+              "state": { "enum": ["applicable", "not-applicable", "unknown"] },
+              "sites": {
+                "type": ["integer", "null"],
+                "minimum": 0,
+                "maximum": 18446744073709551615
+              }
+            }
+          },
+          "discovered": { "$ref": "#/$defs/u64" },
+          "attached": { "$ref": "#/$defs/u64" }
+        }
+      }
+    },
+    "disposition": {
+      "description": "End-of-observation custody disposition. Omitted when never recorded.",
+      "type": "object",
+      "required": ["outcome", "code", "pid"],
+      "additionalProperties": false,
+      "properties": {
+        "outcome": { "enum": ["exited", "detached-running", "foreign-observed"] },
+        "code": {
+          "type": ["integer", "null"],
+          "minimum": -2147483648,
+          "maximum": 2147483647
+        },
+        "pid": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "maximum": 4294967295
+        }
+      }
+    },
+    "policy": {
+      "description": "Evaluated policy section (check documents only; report documents omit it). Rules are ANDed by the evaluator.",
+      "type": "object",
+      "required": ["verdict", "rules"],
+      "additionalProperties": false,
+      "properties": {
+        "verdict": { "enum": ["pass", "violation", "inconclusive", "no-verdict"] },
+        "rules": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["rule", "predicate", "result", "definite", "possible", "evidence"],
+            "additionalProperties": false,
+            "properties": {
+              "rule": { "type": "string", "minLength": 1 },
+              "predicate": { "type": "string", "minLength": 1 },
+              "result": { "enum": ["pass", "violation", "inconclusive"] },
+              "definite": { "$ref": "#/$defs/u64" },
+              "possible": {
+                "description": "Upper bound on matching calls; null means the upper bound is unknown.",
+                "type": ["integer", "null"],
+                "minimum": 0,
+                "maximum": 18446744073709551615
+              },
+              "evidence": {
+                "description": "Site evidence for definite matches; every ref resolves to a site listed in this document.",
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": ["object", "device", "inode", "offset", "generation", "calls"],
+                  "additionalProperties": false,
+                  "properties": {
+                    "object": { "type": "string", "minLength": 1 },
+                    "device": { "$ref": "#/$defs/u64" },
+                    "inode": { "$ref": "#/$defs/u64" },
+                    "offset": { "$ref": "#/$defs/u64" },
+                    "generation": { "$ref": "#/$defs/u32" },
+                    "calls": { "$ref": "#/$defs/u64" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "u64": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 18446744073709551615
+    },
+    "u32": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4294967295
+    },
+    "candidate": {
+      "description": "One candidate identity that could explain entry at a site. The class list is sorted; the first class is not a canonical authority.",
+      "type": "object",
+      "required": ["provider", "provider_class", "op", "funcid", "algorithm_classes", "weak_alias"],
+      "additionalProperties": false,
+      "properties": {
+        "provider": { "type": "string", "minLength": 1 },
+        "provider_class": { "type": "string", "minLength": 1 },
+        "op": { "$ref": "#/$defs/u32" },
+        "funcid": { "$ref": "#/$defs/u32" },
+        "algorithm_classes": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "weak_alias": { "type": "boolean" }
+      }
+    },
+    "site": {
+      "description": "Physical execution record for one site in one generation: the site key, candidate metadata, and the conserved call count with first/last in-window timestamps.",
+      "type": "object",
+      "required": ["object", "device", "inode", "offset", "generation", "candidates", "candidates_coverage", "calls", "first_ns", "last_ns"],
+      "additionalProperties": false,
+      "properties": {
+        "object": { "type": "string", "minLength": 1 },
+        "device": { "$ref": "#/$defs/u64" },
+        "inode": { "$ref": "#/$defs/u64" },
+        "offset": { "$ref": "#/$defs/u64" },
+        "generation": { "$ref": "#/$defs/u32" },
+        "candidates": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/candidate" }
+        },
+        "candidates_coverage": { "enum": ["complete", "unknown"] },
+        "calls": { "$ref": "#/$defs/u64" },
+        "first_ns": { "$ref": "#/$defs/u64" },
+        "last_ns": { "$ref": "#/$defs/u64" }
+      }
+    },
+    "reason": {
+      "description": "Typed reason a window is not COMPLETE.",
+      "anyOf": [
+        {
+          "type": "object",
+          "required": ["kind", "scope"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "unknown-denominator" },
+            "scope": { "type": "string", "minLength": 1 }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["kind", "scope", "missing"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "undiscovered-sites" },
+            "scope": { "type": "string", "minLength": 1 },
+            "missing": { "$ref": "#/$defs/u64" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["kind", "scope", "missing"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "unattached-sites" },
+            "scope": { "type": "string", "minLength": 1 },
+            "missing": { "$ref": "#/$defs/u64" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["kind", "counter", "source", "value"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "loss" },
+            "counter": { "type": "string", "minLength": 1 },
+            "source": { "enum": ["kernel-ring", "kernel-map", "discovery", "attach", "drain", "lifecycle", "setup"] },
+            "value": { "$ref": "#/$defs/u64" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["kind", "sites", "calls"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "unattributed-calls" },
+            "sites": { "$ref": "#/$defs/u64" },
+            "calls": { "$ref": "#/$defs/u64" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["kind", "missing_ns"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "startup-gap" },
+            "missing_ns": { "$ref": "#/$defs/u64" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["kind", "missing_ns"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "tail-gap" },
+            "missing_ns": { "$ref": "#/$defs/u64" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["kind"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "signal-cut" }
+          }
+        }
+      ]
+    }
+  }
+}

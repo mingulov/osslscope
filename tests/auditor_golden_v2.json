@@ -1,0 +1,214 @@
+{
+  "completeness": {
+    "counters": [
+      {
+        "kind": "loss",
+        "name": "count.map_insert_dropped",
+        "source": "kernel-map",
+        "units": "events",
+        "value": 0
+      }
+    ],
+    "fatal_kind": null,
+    "reasons": [],
+    "status": "COMPLETE"
+  },
+  "coverage": [
+    {
+      "attached": 3,
+      "discovered": 3,
+      "expected": {
+        "sites": 3,
+        "state": "applicable"
+      },
+      "scope": "provider/default"
+    }
+  ],
+  "disposition": {
+    "code": 0,
+    "outcome": "exited",
+    "pid": null
+  },
+  "fenced": [
+    {
+      "generation": 2,
+      "sites": [
+        {
+          "calls": 40,
+          "candidates": [
+            {
+              "algorithm_classes": [
+                "DES"
+              ],
+              "funcid": 21,
+              "op": 2,
+              "provider": "build:aaaa0123456789aaaa0123456789aaaa0123456789aaaa0123456789",
+              "provider_class": "default",
+              "weak_alias": false
+            }
+          ],
+          "candidates_coverage": "complete",
+          "device": 8,
+          "first_ns": 10,
+          "generation": 2,
+          "inode": 100,
+          "last_ns": 90,
+          "object": "build:aaaa0123456789aaaa0123456789aaaa0123456789aaaa0123456789",
+          "offset": 4096
+        }
+      ]
+    }
+  ],
+  "objects": [
+    {
+      "device": 8,
+      "display_locator": "/usr/lib/ossl-modules/default.so",
+      "id": "build:aaaa0123456789aaaa0123456789aaaa0123456789aaaa0123456789",
+      "inode": 100
+    },
+    {
+      "device": 8,
+      "display_locator": "/usr/lib/ossl-modules/legacy.so",
+      "id": "build:bbbb0123456789bbbb0123456789bbbb0123456789bbbb0123456789",
+      "inode": 200
+    }
+  ],
+  "openssl": {
+    "state": "verified",
+    "version": "3.0.14"
+  },
+  "policy": {
+    "rules": [
+      {
+        "definite": 440,
+        "evidence": [
+          {
+            "calls": 400,
+            "device": 8,
+            "generation": 0,
+            "inode": 100,
+            "object": "build:aaaa0123456789aaaa0123456789aaaa0123456789aaaa0123456789",
+            "offset": 4096
+          },
+          {
+            "calls": 40,
+            "device": 8,
+            "generation": 2,
+            "inode": 100,
+            "object": "build:aaaa0123456789aaaa0123456789aaaa0123456789aaaa0123456789",
+            "offset": 4096
+          }
+        ],
+        "possible": 440,
+        "predicate": "algorithm=DES",
+        "result": "violation",
+        "rule": "deny-algorithm"
+      },
+      {
+        "definite": 0,
+        "evidence": [],
+        "possible": 0,
+        "predicate": "weak-alias",
+        "result": "pass",
+        "rule": "deny-weak"
+      }
+    ],
+    "verdict": "violation"
+  },
+  "schema_version": "observed-crypto-v2.0",
+  "sites": [
+    {
+      "calls": 400,
+      "candidates": [
+        {
+          "algorithm_classes": [
+            "DES"
+          ],
+          "funcid": 21,
+          "op": 2,
+          "provider": "build:aaaa0123456789aaaa0123456789aaaa0123456789aaaa0123456789",
+          "provider_class": "default",
+          "weak_alias": false
+        }
+      ],
+      "candidates_coverage": "complete",
+      "device": 8,
+      "first_ns": 10,
+      "generation": 0,
+      "inode": 100,
+      "last_ns": 90,
+      "object": "build:aaaa0123456789aaaa0123456789aaaa0123456789aaaa0123456789",
+      "offset": 4096
+    },
+    {
+      "calls": 0,
+      "candidates": [
+        {
+          "algorithm_classes": [
+            "SHA-256"
+          ],
+          "funcid": 7,
+          "op": 1,
+          "provider": "build:aaaa0123456789aaaa0123456789aaaa0123456789aaaa0123456789",
+          "provider_class": "default",
+          "weak_alias": false
+        }
+      ],
+      "candidates_coverage": "complete",
+      "device": 8,
+      "first_ns": 10,
+      "generation": 0,
+      "inode": 100,
+      "last_ns": 90,
+      "object": "build:aaaa0123456789aaaa0123456789aaaa0123456789aaaa0123456789",
+      "offset": 8192
+    },
+    {
+      "calls": 60,
+      "candidates": [
+        {
+          "algorithm_classes": [
+            "AES-256-GCM"
+          ],
+          "funcid": 21,
+          "op": 2,
+          "provider": "build:bbbb0123456789bbbb0123456789bbbb0123456789bbbb0123456789",
+          "provider_class": "default",
+          "weak_alias": false
+        },
+        {
+          "algorithm_classes": [
+            "ARIA-256-GCM"
+          ],
+          "funcid": 21,
+          "op": 2,
+          "provider": "build:bbbb0123456789bbbb0123456789bbbb0123456789bbbb0123456789",
+          "provider_class": "default",
+          "weak_alias": true
+        }
+      ],
+      "candidates_coverage": "complete",
+      "device": 8,
+      "first_ns": 10,
+      "generation": 0,
+      "inode": 200,
+      "last_ns": 90,
+      "object": "build:bbbb0123456789bbbb0123456789bbbb0123456789bbbb0123456789",
+      "offset": 4096
+    }
+  ],
+  "target": {
+    "argv_redacted": true,
+    "comm": "audited",
+    "container_id": "cid-auditor",
+    "image_digest": "sha256:auditor",
+    "pid": 42
+  },
+  "window": {
+    "effective_end_ns": 30000000000,
+    "effective_start_ns": 0,
+    "requested_end_ns": 30000000000,
+    "requested_start_ns": 0,
+    "signal_cut": false
+  }
+}

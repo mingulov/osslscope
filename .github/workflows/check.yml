@@ -26,27 +26,53 @@ jobs:
       - run: cargo install bpf-linker --locked --version 0.10.4
       - run: cd crates/ebpf && cargo +nightly-2026-05-20 build --locked -Z build-std=core --target bpfel-unknown-none --release --bin osslscope-harvest --bin osslscope-count
       - run: file crates/ebpf/target/bpfel-unknown-none/release/osslscope-harvest crates/ebpf/target/bpfel-unknown-none/release/osslscope-count
+  packaging:
+    # Host-runnable lifecycle/install simulation: deb/rpm scriptlet argument
+    # matrix (stub setcap, no root) + local-prefix install layout and
+    # diagnostics. Seconds, no toolchain. Real package builds and the
+    # privileged guest lifecycle stay in packaging/tests/guest-lifecycle.sh
+    # (approved lane only, NOT-RUN here).
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./packaging/tests/test-scriptlets.sh
+      - run: ./scripts/tests/test-install-dev.sh
+      - run: ./scripts/tests/test-live-oracle.sh
+      - run: python3 -c "import yaml,sys; [yaml.safe_load(open(f)) for f in sys.argv[1:]]" .github/workflows/check.yml .github/workflows/live-known-n.yml
   live-gates:
     # Labeled skips, never passes: every live suite needs a privileged BPF
-    # lane driven by spike/dev/run.py. CI has no such capability, so each
-    # suite below is an explicit SKIP. A green CI run therefore means
-    # host+BPF compile plus host tests only — never a live observation pass.
+    # lane. The dispatch-only live-known-n workflow holds the owned-runner
+    # doctor→check run and stays NOT-RUN until that lane exists. CI has no
+    # such capability, so each suite below is an explicit SKIP. A green CI
+    # run therefore means host+BPF compile plus host tests only — never a
+    # live observation pass.
     runs-on: ubuntu-24.04
     steps:
       - run: |
           for s in core privacy identity lifecycle ordinary installed rate; do
             echo "SKIP(live-capability): suite $s requires a privileged BPF lane; not run in CI"
           done
+          echo "SKIP(live-capability): live-known-n workflow is dispatch-only on an owned runner (lane pending)"
   beachhead:
     # P1 exit-6: stock ubuntu-24.04 + sudo file-caps bootstrap, then a
     # least-priv doctor run (exit 0). Ubuntu-class behaves like lanes
     # B/C (green), not Debian-class. Procedure proven identical on
     # 6.9/6.12/7.0 lane kernels (spike-filecaps.sh gate evidence).
+    # Doctor also requires BPF objects for verdict ok, so the job
+    # builds them and stages copies into root-owned
+    # /usr/local/lib/osslscope, which implicit object discovery trusts.
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-05-20
+          components: rust-src
+      - run: cargo install bpf-linker --locked --version 0.10.4
       - run: cargo build --locked --bin osslscope
+      - run: cd crates/ebpf && cargo +nightly-2026-05-20 build --locked -Z build-std=core --target bpfel-unknown-none --release --bin osslscope-harvest --bin osslscope-count
+      - run: sudo mkdir -p /usr/local/lib/osslscope && sudo cp crates/ebpf/target/bpfel-unknown-none/release/osslscope-harvest crates/ebpf/target/bpfel-unknown-none/release/osslscope-count /usr/local/lib/osslscope/
       - run: sudo setcap 'cap_bpf,cap_perfmon=ep' target/debug/osslscope
       - run: ./target/debug/osslscope doctor | tee doctor.log; test ${PIPESTATUS[0]} -eq 0
-      - run: grep -q 'verdict: ok' doctor.log && ! grep -E 'can_issue|cap_mint_ok' doctor.log
+      - run: "grep -q 'verdict: ok' doctor.log && ! grep -E 'can_issue|cap_mint_ok' doctor.log"

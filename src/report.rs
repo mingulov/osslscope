@@ -4,7 +4,14 @@
 //!
 //! `report [--duration S] [--format human|json] [--out FILE]
 //! [--provider P] [--builtin] [--object O] [--count-object C]
+//! [--table F] [--force-offset N] [--provider-table F]
 //! [--settle S] [--timeout S] [--grace S] {--pid P | run -- <cmd>}`
+//!
+//! Normal discovery is automatic: BPF objects resolve from trusted
+//! installed locations and the target's libcrypto from its live
+//! mappings (builtin mode). `--provider`/`--object`/`--count-object`
+//! are explicit overrides; `--table`/`--force-offset`/
+//! `--provider-table` are explicit local enrollment (R09).
 //!
 //! Exit precedence (PRD §6 proposal): child non-zero → 1 (with
 //! `child_exit` in the doc — the subject failed, evidence rides
@@ -13,6 +20,7 @@
 //! inconclusive (11) arrive with `check` at P3.
 use crate::capture;
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -40,6 +48,9 @@ fn parse(argv: &[String]) -> Result<Args, String> {
     let mut builtin = false;
     let mut object: Option<String> = None;
     let mut count_object: Option<String> = None;
+    let mut table_raw: Option<String> = None;
+    let mut force_offset_raw: Option<String> = None;
+    let mut provider_table_raw: Option<String> = None;
     let mut settle_raw: Option<String> = None;
     let mut timeout_raw: Option<String> = None;
     let mut grace_raw: Option<String> = None;
@@ -71,6 +82,9 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             }
             "--object" => object = Some(val(a)?),
             "--count-object" => count_object = Some(val(a)?),
+            "--table" => table_raw = Some(val(a)?),
+            "--force-offset" => force_offset_raw = Some(val(a)?),
+            "--provider-table" => provider_table_raw = Some(val(a)?),
             "--settle" => settle_raw = Some(val(a)?),
             "--timeout" => timeout_raw = Some(val(a)?),
             "--grace" => grace_raw = Some(val(a)?),
@@ -117,12 +131,38 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         Some(s) => crate::args::parse_seconds("--grace", s)?,
         None => Duration::from_secs(5),
     };
+    // T12 onboarding: explicit tables are validated here (usage
+    // errors, exit 2, before any target/BPF side effect); objects
+    // and the target provider resolve inside capture (environment
+    // errors there exit 4, never 2).
+    let table: Option<PathBuf> = match &table_raw {
+        Some(p) => {
+            let path = PathBuf::from(p);
+            crate::discovery::onboard::load_offset_table_file(&path).map_err(|e| e.full())?;
+            Some(path)
+        }
+        None => None,
+    };
+    let provider_enrollment = match &provider_table_raw {
+        Some(p) => Some(
+            crate::discovery::onboard::load_enrollment_file(Path::new(p)).map_err(|e| e.full())?,
+        ),
+        None => None,
+    };
+    let force_offset = match &force_offset_raw {
+        Some(s) => Some(crate::args::parse_force_offset(s)?),
+        None => None,
+    };
     Ok(Args {
         cfg: capture::Config {
-            harvest_object: object.ok_or("--object O is required")?.into(),
-            count_object: count_object.ok_or("--count-object C is required")?.into(),
-            provider: provider.ok_or("--provider P is required")?.into(),
+            harvest_object: object.map(PathBuf::from),
+            count_object: count_object.map(PathBuf::from),
+            provider: provider.map(PathBuf::from),
             builtin,
+            table,
+            force_offset,
+            provider_enrollment,
+            resolved_provider_class: None,
             duration,
             settle,
             harvest_timeout: timeout,
@@ -667,7 +707,7 @@ fn cbom(c: &capture::Capture) -> serde_json::Value {
     })
 }
 
-const USAGE: &str = "usage: report [--duration S] --provider P --object O --count-object C [--format human|json] [--out F] [--cbom FILE] [--builtin] [--settle S] [--timeout S] [--grace S] [--image-digest D] {--pid P | run -- <cmd>}";
+const USAGE: &str = "usage: report [--duration S] [--provider P] [--object O] [--count-object C] [--table F] [--force-offset N] [--provider-table F] [--format human|json] [--out F] [--cbom FILE] [--builtin] [--settle S] [--timeout S] [--grace S] [--image-digest D] {--pid P | run -- <cmd>}";
 
 pub fn run(argv: &[String]) -> ExitCode {
     // --help anywhere on the osslscope side (a target command after
@@ -719,6 +759,1071 @@ pub fn run(argv: &[String]) -> ExitCode {
         }
     }
     ExitCode::from(exit_for(&c))
+}
+
+// ---------------------------------------------------------------- v2 output
+//
+// T11 v2 human/JSON/CBOM API. T10 codes against these signatures;
+// they are declared here before any T10 wiring exists. All renders
+// take the finalized [`crate::evidence::CaptureDocument`] for one
+// window: report shape when `policy` is None, check shape (with the
+// `policy` section) when T10 sets it. No second capture is ever
+// needed to produce additional artifacts from the same document.
+
+use crate::evidence::CaptureDocument;
+use crate::evidence::{
+    CandidateCoverage, Completeness, CounterKind, CounterSource, CounterUnits, DispositionOutcome,
+    ExpectedScope, FatalKind, GapReason, OpensslVersionState, PolicyVerdict, RuleVerdict,
+    SiteExecution,
+};
+
+/// Primary artifact format for [`OutputRequest`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputFormat {
+    Human,
+    Json,
+}
+
+/// Artifact destination: process stdout or a file path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutputDest {
+    Stdout,
+    File(std::path::PathBuf),
+}
+
+/// Requested v2 artifacts from one finalized document (single
+/// window): the primary report plus an optional CBOM sidecar.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputRequest {
+    pub format: OutputFormat,
+    pub primary: OutputDest,
+    pub cbom: Option<OutputDest>,
+}
+
+/// Per-artifact delivery outcome. `error` is a bounded one-line
+/// summary, never a dump; `bytes` counts delivered bytes (0 unless
+/// the full artifact was written).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactOutcome {
+    pub dest: String,
+    pub ok: bool,
+    pub bytes: u64,
+    pub error: Option<String>,
+}
+
+/// Delivery result for one [`write_artifacts`] call: every requested
+/// artifact was attempted independently (a failed primary never
+/// suppresses the CBOM attempt and vice versa). T10 maps this onto
+/// the R06 exit table: a proved violation stays exit 10 even when
+/// delivery failed; otherwise any failure is exit 1. `diagnostics`
+/// go to stderr (bounded: at most 8 lines, 200 chars each).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliveryResult {
+    pub primary: ArtifactOutcome,
+    pub cbom: Option<ArtifactOutcome>,
+    pub diagnostics: Vec<String>,
+}
+
+impl DeliveryResult {
+    /// True when any requested artifact failed delivery.
+    pub fn failed(&self) -> bool {
+        !self.primary.ok || self.cbom.as_ref().is_some_and(|c| !c.ok)
+    }
+
+    /// True when every requested artifact was delivered.
+    pub fn delivered_all(&self) -> bool {
+        !self.failed()
+    }
+}
+
+/// Render the v2 JSON artifact (`observed-crypto-v2.0`) for one
+/// finalized document: sorted keys, pretty-printed, trailing
+/// newline. Sites carry conserved per-site counts with candidate
+/// uncertainty; target/openssl/window/coverage/losses/disposition
+/// and the optional policy section ride along. Validates against
+/// `schemas/observed-crypto-v2.json`.
+pub fn render_json(doc: &CaptureDocument) -> anyhow::Result<Vec<u8>> {
+    let mut out = serde_json::to_vec_pretty(&doc_json(doc))?;
+    out.push(b'\n');
+    Ok(out)
+}
+
+fn status_str(doc: &CaptureDocument) -> &'static str {
+    match &doc.status {
+        Completeness::Complete => "COMPLETE",
+        Completeness::Partial { .. } => "PARTIAL",
+        Completeness::Fatal { .. } => "FATAL",
+    }
+}
+
+fn counter_kind_str(kind: CounterKind) -> &'static str {
+    match kind {
+        CounterKind::Loss => "loss",
+        CounterKind::Activity => "activity",
+    }
+}
+
+fn counter_units_str(units: CounterUnits) -> &'static str {
+    match units {
+        CounterUnits::Calls => "calls",
+        CounterUnits::Sites => "sites",
+        CounterUnits::TableRows => "table-rows",
+        CounterUnits::Events => "events",
+        CounterUnits::Probes => "probes",
+    }
+}
+
+fn counter_source_str(source: CounterSource) -> &'static str {
+    match source {
+        CounterSource::KernelRing => "kernel-ring",
+        CounterSource::KernelMap => "kernel-map",
+        CounterSource::Discovery => "discovery",
+        CounterSource::Attach => "attach",
+        CounterSource::Drain => "drain",
+        CounterSource::Lifecycle => "lifecycle",
+        CounterSource::Setup => "setup",
+    }
+}
+
+fn gap_reason_json(reason: &GapReason) -> serde_json::Value {
+    match reason {
+        GapReason::UnknownDenominator { scope } => {
+            serde_json::json!({"kind": "unknown-denominator", "scope": scope})
+        }
+        GapReason::UndiscoveredSites { scope, missing } => {
+            serde_json::json!({"kind": "undiscovered-sites", "scope": scope, "missing": missing})
+        }
+        GapReason::UnattachedSites { scope, missing } => {
+            serde_json::json!({"kind": "unattached-sites", "scope": scope, "missing": missing})
+        }
+        GapReason::Loss {
+            counter,
+            source,
+            value,
+        } => serde_json::json!({
+            "kind": "loss",
+            "counter": counter,
+            "source": counter_source_str(*source),
+            "value": value,
+        }),
+        GapReason::UnattributedCalls { sites, calls } => {
+            serde_json::json!({"kind": "unattributed-calls", "sites": sites, "calls": calls})
+        }
+        GapReason::StartupGap { missing_ns } => {
+            serde_json::json!({"kind": "startup-gap", "missing_ns": missing_ns})
+        }
+        GapReason::TailGap { missing_ns } => {
+            serde_json::json!({"kind": "tail-gap", "missing_ns": missing_ns})
+        }
+        GapReason::SignalCut => serde_json::json!({"kind": "signal-cut"}),
+    }
+}
+
+fn site_json(site: &SiteExecution) -> serde_json::Value {
+    serde_json::json!({
+        "object": site.site.object.0,
+        "device": site.site.device,
+        "inode": site.site.inode,
+        "offset": site.site.offset,
+        "generation": site.generation,
+        "candidates": site.candidates.iter().map(|c| serde_json::json!({
+            "provider": c.provider.0,
+            "provider_class": c.provider_class,
+            "op": c.op,
+            "funcid": c.funcid,
+            "algorithm_classes": c.algorithm_classes,
+            "weak_alias": c.weak_alias,
+        })).collect::<Vec<_>>(),
+        "candidates_coverage": match site.candidates_coverage {
+            CandidateCoverage::Complete => "complete",
+            CandidateCoverage::Unknown => "unknown",
+        },
+        "calls": site.calls,
+        "first_ns": site.first_ns,
+        "last_ns": site.last_ns,
+    })
+}
+
+fn rule_verdict_str(verdict: RuleVerdict) -> &'static str {
+    match verdict {
+        RuleVerdict::Pass => "pass",
+        RuleVerdict::Violation => "violation",
+        RuleVerdict::Inconclusive => "inconclusive",
+    }
+}
+
+fn doc_json(doc: &CaptureDocument) -> serde_json::Value {
+    let fatal_kind = match &doc.status {
+        Completeness::Fatal {
+            kind: FatalKind::Recycled,
+            ..
+        } => serde_json::json!({"kind": "recycled", "detail": null}),
+        Completeness::Fatal {
+            kind: FatalKind::AttachZero,
+            ..
+        } => serde_json::json!({"kind": "attach-zero", "detail": null}),
+        Completeness::Fatal {
+            kind: FatalKind::Environment(detail),
+            ..
+        } => serde_json::json!({"kind": "environment", "detail": detail}),
+        _ => serde_json::Value::Null,
+    };
+    let mut out = serde_json::json!({
+        "schema_version": "observed-crypto-v2.0",
+        "target": {
+            "pid": doc.target.pid,
+            "comm": doc.target.comm,
+            "container_id": doc.target.container_id,
+            "image_digest": doc.target.image_digest,
+            "argv_redacted": true,
+        },
+        "openssl": {
+            "state": match doc.openssl.state {
+                OpensslVersionState::Verified => "verified",
+                OpensslVersionState::Unknown => "unknown",
+            },
+            "version": doc.openssl.version.clone(),
+        },
+        "window": {
+            "requested_start_ns": doc.window.requested_start_ns,
+            "requested_end_ns": doc.window.requested_end_ns,
+            "effective_start_ns": doc.window.effective_start_ns,
+            "effective_end_ns": doc.window.effective_end_ns,
+            "signal_cut": doc.window.signal_cut,
+        },
+        "completeness": {
+            "status": status_str(doc),
+            "fatal_kind": fatal_kind,
+            "reasons": doc.reasons().iter().map(gap_reason_json).collect::<Vec<_>>(),
+            "counters": doc.counters.iter().map(|c| serde_json::json!({
+                "name": c.name,
+                "kind": counter_kind_str(c.kind),
+                "units": counter_units_str(c.units),
+                "source": counter_source_str(c.source),
+                "value": c.value,
+            })).collect::<Vec<_>>(),
+        },
+        "sites": doc.sites.iter().map(site_json).collect::<Vec<_>>(),
+        "fenced": doc.fenced.iter().map(|bucket| serde_json::json!({
+            "generation": bucket.generation,
+            "sites": bucket.sites.iter().map(site_json).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+        "objects": doc.objects.iter().map(|o| serde_json::json!({
+            "id": o.id.0,
+            "device": o.device,
+            "inode": o.inode,
+            "display_locator": o.display_locator,
+        })).collect::<Vec<_>>(),
+        "coverage": doc.coverage.iter().map(|c| {
+            let (state, sites) = match &c.expected {
+                ExpectedScope::Applicable { sites } => ("applicable", Some(*sites)),
+                ExpectedScope::NotApplicable => ("not-applicable", None),
+                ExpectedScope::Unknown => ("unknown", None),
+            };
+            serde_json::json!({
+                "scope": c.scope,
+                "expected": {"state": state, "sites": sites},
+                "discovered": c.discovered,
+                "attached": c.attached,
+            })
+        }).collect::<Vec<_>>(),
+    });
+    // Report/check convention (v1-compatible): unevaluated policy
+    // and unrecorded disposition omit their sections.
+    if let Some(disposition) = &doc.disposition {
+        let (outcome, code, pid) = match disposition.outcome {
+            DispositionOutcome::Exited => ("exited", disposition.code, None),
+            DispositionOutcome::DetachedRunning => ("detached-running", None, disposition.pid),
+            DispositionOutcome::ForeignObserved => ("foreign-observed", None, disposition.pid),
+        };
+        out["disposition"] = serde_json::json!({
+            "outcome": outcome,
+            "code": code,
+            "pid": pid,
+        });
+    }
+    if let Some(policy) = &doc.policy {
+        out["policy"] = serde_json::json!({
+            "verdict": match policy.verdict {
+                PolicyVerdict::Pass => "pass",
+                PolicyVerdict::Violation => "violation",
+                PolicyVerdict::Inconclusive => "inconclusive",
+                PolicyVerdict::NoVerdict => "no-verdict",
+            },
+            "rules": policy.rules.iter().map(|r| serde_json::json!({
+                "rule": r.rule,
+                "predicate": r.predicate,
+                "result": rule_verdict_str(r.result),
+                "definite": r.definite,
+                "possible": r.possible,
+                "evidence": r.evidence.iter().map(|e| serde_json::json!({
+                    "object": e.object.0,
+                    "device": e.device,
+                    "inode": e.inode,
+                    "offset": e.offset,
+                    "generation": e.generation,
+                    "calls": e.calls,
+                })).collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
+        });
+    }
+    out
+}
+
+/// Render the v2 human artifact for one finalized document:
+/// callback counts with explicit definite/ambiguous/unattributed
+/// attribution, verified-or-unknown OpenSSL version, coverage,
+/// source-tagged losses, disposition and safe actionability
+/// (`argv_redacted`, no raw argv or addresses).
+pub fn render_human(doc: &CaptureDocument) -> String {
+    let mut s = String::new();
+    s.push_str(&format!(
+        "osslscope report (observed-crypto-v2.0): pid={} ({}) window={}..{}ns effective={}..{}ns\n",
+        doc.target.pid,
+        doc.target.comm,
+        doc.window.requested_start_ns,
+        doc.window.requested_end_ns,
+        doc.window.effective_start_ns,
+        doc.window.effective_end_ns,
+    ));
+    match (&doc.openssl.state, &doc.openssl.version) {
+        (OpensslVersionState::Verified, Some(version)) => {
+            s.push_str(&format!("openssl: {version} (verified object metadata)\n"));
+        }
+        _ => s.push_str("openssl: unknown (no verified version)\n"),
+    }
+    let or_none = |text: &str| {
+        if text.is_empty() {
+            "(none)".to_string()
+        } else {
+            text.to_string()
+        }
+    };
+    s.push_str(&format!(
+        "target: argv_redacted=true container_id={} image_digest={}\n",
+        or_none(&doc.target.container_id),
+        or_none(&doc.target.image_digest),
+    ));
+    match &doc.disposition {
+        Some(d) if d.outcome == DispositionOutcome::Exited => {
+            s.push_str(&format!(
+                "disposition: exited code={}\n",
+                d.code.unwrap_or(0)
+            ));
+        }
+        Some(d) if d.outcome == DispositionOutcome::DetachedRunning => {
+            s.push_str(&format!(
+                "disposition: detached-running pid={}\n",
+                d.pid.unwrap_or(0)
+            ));
+        }
+        Some(d) => {
+            s.push_str(&format!(
+                "disposition: foreign-observed pid={}\n",
+                d.pid.unwrap_or(0)
+            ));
+        }
+        None => s.push_str("disposition: unknown (not recorded)\n"),
+    }
+    s.push('\n');
+    // Sites: conserved per-site counts; attribution is definite
+    // only for a complete set with one agreed algorithm.
+    let fenced_sites: usize = doc.fenced.iter().map(|g| g.sites.len()).sum();
+    if fenced_sites == 0 {
+        s.push_str(&format!(
+            "sites ({}, {} calls):\n",
+            doc.sites.len(),
+            grouped(doc.total_calls()),
+        ));
+    } else {
+        s.push_str(&format!(
+            "sites ({} current + {} fenced, {} calls):\n",
+            doc.sites.len(),
+            fenced_sites,
+            grouped(doc.total_calls()),
+        ));
+    }
+    if doc.sites.is_empty() && fenced_sites == 0 {
+        s.push_str("  none (no usable evidence)\n");
+    }
+    for site in &doc.sites {
+        human_site(site, &mut s);
+    }
+    s.push('\n');
+    if !doc.fenced.is_empty() {
+        s.push_str("fenced generations:\n");
+        for bucket in &doc.fenced {
+            s.push_str(&format!(
+                "  gen {}: {} sites, {} calls (detail in JSON)\n",
+                bucket.generation,
+                bucket.sites.len(),
+                grouped(SiteExecution::sum_calls(&bucket.sites)),
+            ));
+        }
+        s.push('\n');
+    }
+    s.push_str("coverage:\n");
+    if doc.coverage.is_empty() {
+        s.push_str("  none recorded\n");
+    }
+    for scope in &doc.coverage {
+        match &scope.expected {
+            ExpectedScope::Applicable { sites } => {
+                let state = if scope.is_complete() {
+                    "complete"
+                } else {
+                    "gap"
+                };
+                s.push_str(&format!(
+                    "  {}: expected={} discovered={} attached={} ({state})\n",
+                    scope.scope, sites, scope.discovered, scope.attached,
+                ));
+            }
+            ExpectedScope::NotApplicable => {
+                s.push_str(&format!("  {}: not applicable\n", scope.scope));
+            }
+            ExpectedScope::Unknown => {
+                s.push_str(&format!(
+                    "  {}: expected=UNKNOWN discovered={} attached={} (gap)\n",
+                    scope.scope, scope.discovered, scope.attached,
+                ));
+            }
+        }
+    }
+    s.push('\n');
+    // Loss counters always show (even zero: the observer checked);
+    // activity counters show when nonzero.
+    s.push_str("counters:\n");
+    let mut shown = 0;
+    for counter in &doc.counters {
+        if counter.kind == CounterKind::Activity && counter.value == 0 {
+            continue;
+        }
+        shown += 1;
+        s.push_str(&format!(
+            "  {} {} ({} from {}) = {}\n",
+            counter_kind_str(counter.kind),
+            counter.name,
+            counter_units_str(counter.units),
+            counter_source_str(counter.source),
+            grouped(counter.value),
+        ));
+    }
+    if shown == 0 {
+        s.push_str("  none recorded\n");
+    }
+    s.push('\n');
+    s.push_str(&format!("completeness: {}\n", status_str(doc)));
+    s.push('\n');
+    if let Completeness::Fatal { kind, .. } = &doc.status {
+        match kind {
+            FatalKind::Recycled => {
+                s.push_str("fatal: recycled (pid reused mid-window; all observations discarded)\n");
+            }
+            FatalKind::AttachZero => {
+                s.push_str("fatal: attach-zero (no probes attached; no usable evidence)\n");
+            }
+            FatalKind::Environment(detail) => {
+                s.push_str(&format!("fatal: environment: {detail}\n"));
+            }
+        }
+        s.push('\n');
+    }
+    if !doc.reasons().is_empty() {
+        s.push_str("reasons:\n");
+        for reason in doc.reasons() {
+            s.push_str(&format!("  - {}\n", gap_reason_human(reason)));
+        }
+        s.push('\n');
+    }
+    match &doc.policy {
+        None => s.push_str("policy: (not evaluated)\n"),
+        Some(policy) => {
+            let verdict = match policy.verdict {
+                PolicyVerdict::Pass => "pass",
+                PolicyVerdict::Violation => "violation",
+                PolicyVerdict::Inconclusive => "inconclusive",
+                PolicyVerdict::NoVerdict => "no-verdict",
+            };
+            s.push_str(&format!("policy: {verdict}\n"));
+            for rule in &policy.rules {
+                let possible = rule
+                    .possible
+                    .map(grouped)
+                    .unwrap_or_else(|| "unknown".to_string());
+                s.push_str(&format!(
+                    "  rule {} ({}): {} (definite={}, possible={possible})\n",
+                    rule.rule,
+                    rule.predicate,
+                    rule_verdict_str(rule.result),
+                    grouped(rule.definite),
+                ));
+                for evidence in &rule.evidence {
+                    s.push_str(&format!(
+                        "    evidence: {} file-offset={} gen={} ({} calls)\n",
+                        fp_short(&evidence.object.0),
+                        evidence.offset,
+                        evidence.generation,
+                        grouped(evidence.calls),
+                    ));
+                }
+            }
+        }
+    }
+    s.push('\n');
+    s.push_str(&format!("status={}\n", status_str(doc)));
+    s.push_str("absence = not-observed in window (never \"not present / never used\")\n");
+    s.push_str("note: argv redacted; file offsets are not runtime addresses; window-only claims\n");
+    s
+}
+
+/// First 12 characters of an object fingerprint for display
+/// (char-boundary cut: fingerprints are opaque strings, never
+/// assumed ASCII).
+fn fp_short(fp: &str) -> String {
+    fp.chars().take(12).collect()
+}
+
+/// Attribution summary shared by the human render and the CBOM
+/// definite-asset rule: `Some` only when the site executed, its
+/// candidate set is complete, and every candidate agrees on
+/// provider, class, op, funcid and one single *resolved* algorithm
+/// class (the `other` bucket never qualifies). `weak_alias` may
+/// vary (surfaced, not silently dropped).
+struct DefiniteAsset {
+    algorithm: String,
+    provider: String,
+    provider_class: String,
+    op: u32,
+    funcid: u32,
+    weak: bool,
+}
+
+fn definite_asset(site: &SiteExecution) -> Option<DefiniteAsset> {
+    if site.calls == 0 || site.candidates_coverage != CandidateCoverage::Complete {
+        return None;
+    }
+    let first = site.candidates.first()?;
+    if first.algorithm_classes.len() != 1 {
+        return None;
+    }
+    // The unresolved bucket is never a definite asset: a candidate
+    // carrying `other` proves neither a match nor an absence
+    // (`crate::policy::UNRESOLVED_ALGORITHM_CLASS`).
+    if first.algorithm_classes[0] == crate::policy::UNRESOLVED_ALGORITHM_CLASS {
+        return None;
+    }
+    for candidate in &site.candidates[1..] {
+        if candidate.provider != first.provider
+            || candidate.provider_class != first.provider_class
+            || candidate.op != first.op
+            || candidate.funcid != first.funcid
+            || candidate.algorithm_classes != first.algorithm_classes
+        {
+            return None;
+        }
+    }
+    Some(DefiniteAsset {
+        algorithm: first.algorithm_classes[0].clone(),
+        provider: first.provider.0.clone(),
+        provider_class: first.provider_class.clone(),
+        op: first.op,
+        funcid: first.funcid,
+        weak: site.candidates.iter().any(|c| c.weak_alias),
+    })
+}
+
+fn human_site(site: &SiteExecution, s: &mut String) {
+    s.push_str(&format!(
+        "  site {} file-offset={} gen={}: {} calls, ",
+        fp_short(&site.site.object.0),
+        site.site.offset,
+        site.generation,
+        grouped(site.calls),
+    ));
+    if site.calls == 0 {
+        s.push_str("quiet (no calls in window)\n");
+        return;
+    }
+    if site.candidates_coverage == CandidateCoverage::Unknown {
+        s.push_str("UNATTRIBUTED (candidate set incomplete)\n");
+        return;
+    }
+    if let Some(asset) = definite_asset(site) {
+        s.push_str(&format!(
+            "definite: {} ({}) via {}{}\n",
+            asset.algorithm,
+            op_display(asset.op),
+            asset.provider_class,
+            if asset.weak { " [weak alias]" } else { "" },
+        ));
+        return;
+    }
+    if site.candidates.is_empty() {
+        s.push_str("UNATTRIBUTED (no candidates)\n");
+        return;
+    }
+    // Complete set, unresolvable algorithm class: the provider, op
+    // and funcid below are certain, the algorithm is not.
+    if site.candidates.iter().all(|c| {
+        c.algorithm_classes.len() == 1
+            && c.algorithm_classes[0] == crate::policy::UNRESOLVED_ALGORITHM_CLASS
+    }) {
+        s.push_str(&format!(
+            "UNRESOLVED ({} {}, algorithm class unresolvable):\n",
+            site.candidates.len(),
+            plural(site.candidates.len(), "candidate"),
+        ));
+        human_candidates(site, s);
+        return;
+    }
+    s.push_str(&format!(
+        "AMBIGUOUS ({} {}, attribution uncertain):\n",
+        site.candidates.len(),
+        plural(site.candidates.len(), "candidate"),
+    ));
+    human_candidates(site, s);
+}
+
+fn plural(n: usize, word: &str) -> String {
+    if n == 1 {
+        word.to_string()
+    } else {
+        format!("{word}s")
+    }
+}
+
+fn human_candidates(site: &SiteExecution, s: &mut String) {
+    for candidate in &site.candidates {
+        s.push_str(&format!(
+            "    candidate: provider={} class={} op={} funcid={} algs=[{}]{}\n",
+            fp_short(&candidate.provider.0),
+            candidate.provider_class,
+            op_display(candidate.op),
+            candidate.funcid,
+            candidate.algorithm_classes.join(", "),
+            if candidate.weak_alias { " weak" } else { "" },
+        ));
+    }
+}
+
+fn gap_reason_human(reason: &GapReason) -> String {
+    match reason {
+        GapReason::UnknownDenominator { scope } => {
+            format!("unknown-denominator: {scope} (expected sites unknowable, never complete)")
+        }
+        GapReason::UndiscoveredSites { scope, missing } => {
+            format!("undiscovered-sites: {scope} missing={missing}")
+        }
+        GapReason::UnattachedSites { scope, missing } => {
+            format!("unattached-sites: {scope} missing={missing}")
+        }
+        GapReason::Loss {
+            counter,
+            source,
+            value,
+        } => format!(
+            "loss: {counter} ({}) = {}",
+            counter_source_str(*source),
+            grouped(*value),
+        ),
+        GapReason::UnattributedCalls { sites, calls } => {
+            format!(
+                "unattributed-calls: {sites} sites, {} calls (candidate sets incomplete)",
+                grouped(*calls),
+            )
+        }
+        GapReason::StartupGap { missing_ns } => {
+            format!("startup-gap: {missing_ns}ns unobserved at window start")
+        }
+        GapReason::TailGap { missing_ns } => {
+            format!("tail-gap: {missing_ns}ns unobserved at window end")
+        }
+        GapReason::SignalCut => "signal-cut: window ended by signal".to_string(),
+    }
+}
+
+/// Render the v2 CycloneDX CBOM for one finalized document:
+/// definite algorithm assets only (one component per definite site,
+/// never one per candidate); omitted ambiguous counts plus evidence
+/// references stay explicit metadata. Same window on
+/// pass/violation/PARTIAL/inconclusive; explicit empty/fatal
+/// artifact when no evidence exists.
+pub fn render_cbom(doc: &CaptureDocument) -> anyhow::Result<Vec<u8>> {
+    let mut out = serde_json::to_vec_pretty(&cbom_json(doc))?;
+    out.push(b'\n');
+    Ok(out)
+}
+
+/// Omitted-site evidence ref for CBOM metadata: short fingerprint,
+/// decimal file offset, generation and calls (bounded count at the
+/// call site; never a runtime address).
+fn omitted_ref(site: &SiteExecution) -> String {
+    format!(
+        "{}@{}#{}:{}",
+        fp_short(&site.site.object.0),
+        site.site.offset,
+        site.generation,
+        site.calls,
+    )
+}
+
+/// Short gap vocabulary for the CBOM disclaimer line.
+fn gap_reason_short(reason: &GapReason) -> String {
+    match reason {
+        GapReason::UnknownDenominator { scope } => format!("unknown-denominator:{scope}"),
+        GapReason::UndiscoveredSites { scope, .. } => format!("undiscovered-sites:{scope}"),
+        GapReason::UnattachedSites { scope, .. } => format!("unattached-sites:{scope}"),
+        GapReason::Loss { counter, .. } => format!("loss:{counter}"),
+        GapReason::UnattributedCalls { .. } => "unattributed-calls".to_string(),
+        GapReason::StartupGap { .. } => "startup-gap".to_string(),
+        GapReason::TailGap { .. } => "tail-gap".to_string(),
+        GapReason::SignalCut => "signal-cut".to_string(),
+    }
+}
+
+/// Sanitize an algorithm class for `bom-ref` embedding (classes are
+/// operator-visible strings; only URI-safe characters survive).
+fn bom_slug(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+fn cbom_json(doc: &CaptureDocument) -> serde_json::Value {
+    let fatal = matches!(doc.status, Completeness::Fatal { .. });
+    let prop = |name: &str, value: String| serde_json::json!({"name": name, "value": value});
+    let window_props = || {
+        vec![
+            prop(
+                "osslscope:window-requested-start-ns",
+                doc.window.requested_start_ns.to_string(),
+            ),
+            prop(
+                "osslscope:window-requested-end-ns",
+                doc.window.requested_end_ns.to_string(),
+            ),
+            prop(
+                "osslscope:window-effective-start-ns",
+                doc.window.effective_start_ns.to_string(),
+            ),
+            prop(
+                "osslscope:window-effective-end-ns",
+                doc.window.effective_end_ns.to_string(),
+            ),
+        ]
+    };
+    // One component per definite site (current + fenced); ambiguous,
+    // unknown-coverage and quiet sites contribute none. FATAL
+    // carries no components at all: the evidence is unusable.
+    let mut components: Vec<serde_json::Value> = Vec::new();
+    let mut omitted_ambiguous_sites = 0u64;
+    let mut omitted_ambiguous_calls = 0u64;
+    let mut omitted_unknown_sites = 0u64;
+    let mut omitted_unknown_calls = 0u64;
+    let mut omitted_refs: Vec<String> = Vec::new();
+    if !fatal {
+        let mut visit = |site: &SiteExecution| {
+            if site.calls == 0 {
+                return;
+            }
+            if site.candidates_coverage == CandidateCoverage::Unknown {
+                omitted_unknown_sites += 1;
+                omitted_unknown_calls = omitted_unknown_calls.saturating_add(site.calls);
+                omitted_refs.push(omitted_ref(site));
+                return;
+            }
+            let Some(asset) = definite_asset(site) else {
+                omitted_ambiguous_sites += 1;
+                omitted_ambiguous_calls = omitted_ambiguous_calls.saturating_add(site.calls);
+                omitted_refs.push(omitted_ref(site));
+                return;
+            };
+            let mut props = vec![
+                prop("osslscope:algorithm", asset.algorithm.clone()),
+                prop("osslscope:provider-class", asset.provider_class.clone()),
+                prop("osslscope:provider-object", asset.provider.clone()),
+                prop("osslscope:backing-object", site.site.object.0.clone()),
+                prop("osslscope:op", op_display(asset.op)),
+                prop("osslscope:funcid", asset.funcid.to_string()),
+                prop("osslscope:calls", site.calls.to_string()),
+                prop("osslscope:generation", site.generation.to_string()),
+                prop(
+                    "osslscope:weak-alias",
+                    if asset.weak { "true" } else { "false" }.to_string(),
+                ),
+                prop(
+                    "osslscope:execution-evidence-completeness",
+                    status_str(doc).to_string(),
+                ),
+            ];
+            props.extend(window_props());
+            components.push(serde_json::json!({
+                "bom-ref": format!(
+                    "urn:osslscope:exec:v2:{}:{}:{}:{}:{}:{}",
+                    site.generation,
+                    site.site.device,
+                    site.site.inode,
+                    site.site.offset,
+                    site.site.object.0,
+                    bom_slug(&asset.algorithm),
+                ),
+                "type": "cryptographic-asset",
+                "name": format!(
+                    "{} ({}) via {}",
+                    asset.algorithm,
+                    op_display(asset.op),
+                    asset.provider_class,
+                ),
+                "cryptoProperties": {"assetType": "algorithm"},
+                "properties": props,
+            }));
+        };
+        for site in &doc.sites {
+            visit(site);
+        }
+        for bucket in &doc.fenced {
+            for site in &bucket.sites {
+                visit(site);
+            }
+        }
+    }
+    // Omitted refs stay explicit but bounded (16 refs, then a count).
+    let refs_value = if omitted_refs.len() <= 16 {
+        omitted_refs.join(",")
+    } else {
+        format!(
+            "{},+{} more",
+            omitted_refs[..16].join(","),
+            omitted_refs.len() - 16,
+        )
+    };
+    let mut metadata = vec![
+        prop(
+            "osslscope:schema-version",
+            "observed-crypto-v2.0".to_string(),
+        ),
+        prop(
+            "osslscope:execution-evidence-completeness",
+            status_str(doc).to_string(),
+        ),
+        prop(
+            "osslscope:omitted-ambiguous-sites",
+            omitted_ambiguous_sites.to_string(),
+        ),
+        prop(
+            "osslscope:omitted-ambiguous-calls",
+            omitted_ambiguous_calls.to_string(),
+        ),
+        prop(
+            "osslscope:omitted-unknown-coverage-sites",
+            omitted_unknown_sites.to_string(),
+        ),
+        prop(
+            "osslscope:omitted-unknown-coverage-calls",
+            omitted_unknown_calls.to_string(),
+        ),
+        prop("osslscope:omitted-evidence-refs", refs_value),
+    ];
+    metadata.extend(window_props());
+    if let Some(policy) = &doc.policy {
+        metadata.push(prop(
+            "osslscope:policy-verdict",
+            match policy.verdict {
+                PolicyVerdict::Pass => "pass",
+                PolicyVerdict::Violation => "violation",
+                PolicyVerdict::Inconclusive => "inconclusive",
+                PolicyVerdict::NoVerdict => "no-verdict",
+            }
+            .to_string(),
+        ));
+    }
+    match &doc.status {
+        Completeness::Complete => {}
+        Completeness::Partial { .. } => {
+            let why = doc
+                .reasons()
+                .iter()
+                .map(gap_reason_short)
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut disclaimer = format!(
+                "PARTIAL evidence ({}); absence = not-observed in window",
+                if why.is_empty() { "unknown" } else { &why },
+            );
+            if disclaimer.chars().count() > 2000 {
+                disclaimer = format!("{}...", disclaimer.chars().take(1997).collect::<String>());
+            }
+            metadata.push(prop("osslscope:completeness-disclaimer", disclaimer));
+        }
+        Completeness::Fatal { kind, .. } => {
+            let why = doc
+                .reasons()
+                .iter()
+                .map(gap_reason_short)
+                .collect::<Vec<_>>()
+                .join(",");
+            let why = if why.is_empty() {
+                match kind {
+                    FatalKind::Recycled => "recycled",
+                    FatalKind::AttachZero => "attach-zero",
+                    FatalKind::Environment(_) => "environment",
+                }
+                .to_string()
+            } else {
+                why
+            };
+            metadata.push(prop(
+                "osslscope:completeness-disclaimer",
+                format!("FATAL: no usable evidence ({why})"),
+            ));
+        }
+    }
+    serde_json::json!({
+        "bomFormat": "CycloneDX",
+        "specVersion": "1.6",
+        "version": 1,
+        "metadata": {"properties": metadata},
+        "components": components,
+    })
+}
+
+/// Bound a diagnostic to one line of at most 200 chars (destinations
+/// and OS errors are operator data, never trusted for length).
+fn bound_line(text: &str) -> String {
+    let flat: String = text
+        .chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect();
+    if flat.chars().count() <= 200 {
+        return flat;
+    }
+    format!("{}...", flat.chars().take(197).collect::<String>())
+}
+
+fn dest_display(dest: &OutputDest) -> String {
+    match dest {
+        OutputDest::Stdout => "stdout".to_string(),
+        OutputDest::File(path) => path.display().to_string(),
+    }
+}
+
+fn write_dest(dest: &OutputDest, bytes: &[u8]) -> ArtifactOutcome {
+    let display = dest_display(dest);
+    let result = match dest {
+        OutputDest::Stdout => {
+            use std::io::Write;
+            std::io::stdout()
+                .write_all(bytes)
+                .and_then(|()| std::io::stdout().flush())
+        }
+        OutputDest::File(path) => std::fs::write(path, bytes),
+    };
+    match result {
+        Ok(()) => ArtifactOutcome {
+            dest: display,
+            ok: true,
+            bytes: bytes.len() as u64,
+            error: None,
+        },
+        Err(e) => ArtifactOutcome {
+            dest: display,
+            ok: false,
+            bytes: 0,
+            error: Some(bound_line(&e.to_string())),
+        },
+    }
+}
+
+fn render_failed_outcome(dest: &OutputDest, detail: &str) -> ArtifactOutcome {
+    ArtifactOutcome {
+        dest: dest_display(dest),
+        ok: false,
+        bytes: 0,
+        error: Some(bound_line(detail)),
+    }
+}
+
+/// Deliver requested artifacts from one finalized document: render
+/// once per format, attempt every destination independently, and
+/// return per-artifact outcomes plus bounded stderr diagnostics.
+pub fn write_artifacts(doc: &CaptureDocument, req: &OutputRequest) -> DeliveryResult {
+    // Primary + CBOM to the same sink would concatenate (stdout)
+    // or overwrite (same file): refuse the CBOM side while the
+    // primary still delivers. Path comparison is lexical; distinct
+    // spellings of one file are the caller's responsibility.
+    let same_sink = match &req.cbom {
+        None => false,
+        Some(dest) => req.primary == *dest,
+    };
+    let primary_render: Result<Vec<u8>, String> = match req.format {
+        OutputFormat::Human => Ok(render_human(doc).into_bytes()),
+        OutputFormat::Json => render_json(doc).map_err(|e| format!("render failed: {e:#}")),
+    };
+    let cbom_render: Option<Result<Vec<u8>, String>> = match (&req.cbom, same_sink) {
+        (Some(_), false) => Some(render_cbom(doc).map_err(|e| format!("render failed: {e:#}"))),
+        _ => None,
+    };
+    let primary = match primary_render {
+        Ok(bytes) => write_dest(&req.primary, &bytes),
+        Err(detail) => render_failed_outcome(&req.primary, &detail),
+    };
+    let cbom = match (&req.cbom, cbom_render) {
+        (None, _) => None,
+        (Some(dest), None) => Some(ArtifactOutcome {
+            dest: dest_display(dest),
+            ok: false,
+            bytes: 0,
+            error: Some(
+                "cbom and primary target the same sink (refused: artifacts would concatenate or overwrite)"
+                    .to_string(),
+            ),
+        }),
+        (Some(dest), Some(Ok(bytes))) => Some(write_dest(dest, &bytes)),
+        (Some(dest), Some(Err(detail))) => Some(render_failed_outcome(dest, &detail)),
+    };
+    let mut diagnostics = Vec::new();
+    if !primary.ok {
+        diagnostics.push(format!(
+            "primary {}: {}",
+            primary.dest,
+            primary.error.as_deref().unwrap_or("failed"),
+        ));
+    }
+    if let Some(outcome) = &cbom {
+        if !outcome.ok {
+            diagnostics.push(format!(
+                "cbom {}: {}",
+                outcome.dest,
+                outcome.error.as_deref().unwrap_or("failed"),
+            ));
+        }
+    }
+    let diagnostics: Vec<String> = diagnostics
+        .into_iter()
+        .map(|line| bound_line(&line))
+        .take(8)
+        .collect();
+    DeliveryResult {
+        primary,
+        cbom,
+        diagnostics,
+    }
+}
+
+/// Emit bounded delivery diagnostics to stderr (T10 calls this after
+/// [`write_artifacts`]; the same strings are in
+/// [`DeliveryResult::diagnostics`] for tests).
+pub fn emit_diagnostics(result: &DeliveryResult) {
+    for line in &result.diagnostics {
+        eprintln!("osslscope: {line}");
+    }
 }
 
 #[cfg(test)]
@@ -1353,8 +2458,11 @@ note: alg-name-only strength (key sizes unobservable); window-only claims\n";
         let v = |s: Vec<&str>| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
         assert_eq!(run(&v(vec!["--help"])), ExitCode::from(0));
         assert_eq!(run(&v(vec!["-h"])), ExitCode::from(0));
-        // A target command after run -- may contain --help.
-        assert_eq!(run(&v(vec!["run", "--", "--help"])), ExitCode::from(2));
+        // A target command after run -- may contain --help: it must
+        // not print our help (nonzero either way — capture of a
+        // nonexistent command cannot succeed; exact code depends on
+        // whether BPF objects are installed on this host).
+        assert_ne!(run(&v(vec!["run", "--", "--help"])), ExitCode::from(0));
     }
 
     #[test]
@@ -1415,7 +2523,24 @@ note: alg-name-only strength (key sizes unobservable); window-only claims\n";
         let mut both = base.clone();
         both.extend(["--pid", "9", "run", "--", "x"]);
         assert!(parse(&v(both)).is_err()); // both targets
-        assert!(parse(&v(vec!["--provider", "p", "--pid", "9"])).is_err()); // no objects
+        // T12: provider/objects are optional (automatic discovery).
+        let auto = parse(&v(vec!["--pid", "9"])).unwrap();
+        assert!(auto.cfg.provider.is_none());
+        assert!(auto.cfg.harvest_object.is_none());
+        assert!(auto.cfg.count_object.is_none());
+        // Explicit enrollment validates at parse time (exit 2).
+        let mut bad_table = vec!["--pid", "9"];
+        bad_table.extend(["--table", "/nonexistent-table.json"]);
+        assert!(parse(&v(bad_table)).is_err());
+        let mut bad_enroll = vec!["--pid", "9"];
+        bad_enroll.extend(["--provider-table", "/nonexistent-enroll.json"]);
+        assert!(parse(&v(bad_enroll)).is_err());
+        let mut bad_force = vec!["--pid", "9"];
+        bad_force.extend(["--force-offset", "xyz"]);
+        assert!(parse(&v(bad_force)).is_err());
+        let mut force = vec!["--pid", "9"];
+        force.extend(["--force-offset", "0x10"]);
+        assert_eq!(parse(&v(force)).unwrap().cfg.force_offset, Some(0x10));
         let mut yaml = base.clone();
         yaml.extend(["--pid", "9", "--format", "yaml"]);
         assert!(parse(&v(yaml)).is_err());
