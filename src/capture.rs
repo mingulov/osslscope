@@ -768,13 +768,17 @@ fn sort_executions(executions: &mut [Execution]) {
 // D2 — The nine producer fields without a `CountDelta` counterpart:
 // `events_consumed`/`queries_delta`/`attaches`(ok)/`budget_exhausted`
 // become Activity counters; `objects` become [`ObjectRecord`]s;
-// `tables` feed per-op [`ScopeCoverage`]; `retirements` invalidate
-// op completion (dirty until the new epoch proves) and re-emit
-// affected sites as Unknown; `tripwire` feeds the separate legacy
-// evidence with window baselining (controller-owned);
-// `trigger_observed` drives the no-query verdict. Retirement gap
-// losses are NOT re-counted here (the session emits them through
-// `losses`); close-time snapshot residuals reconcile once.
+// `tables` feed per-op [`ScopeCoverage`], tracked per table epoch
+// (sibling epochs never collapse); `retirements` tombstone the
+// retired epoch (dirty until the rebirth proves — an unload keeps
+// the tombstone) and re-emit affected sites as Unknown;
+// table-only changes that un-close an op (new unproven epochs,
+// fresh TRUNC bits, lost termination) re-emit the same way;
+// `tripwire` feeds the separate legacy evidence with window
+// baselining (controller-owned); `trigger_observed` drives the
+// no-query verdict. Retirement gap losses are NOT re-counted here
+// (the session emits them through `losses`); close-time snapshot
+// residuals reconcile once.
 //
 // D3 — Identity/metadata synthesis. Backing and advertising object
 // ids are the mapped file's build-id fingerprint when its bytes
@@ -784,11 +788,13 @@ fn sort_executions(executions: &mut [Execution]) {
 // the seam; never guessed from `fips.so` or a rename). A missing
 // backing or an unparsable maps device makes the site unplannable:
 // explicit loss, never a fabricated device zero. Per-site coverage
-// is `Unknown` when any candidate read badly (`status != ok`), the
-// op table is unterminated/dirty, or new candidates arrive after the
-// op already terminated (the set proved non-closed). Session-global
-// losses do NOT flip per-site coverage: they PARTIAL the window via
-// Loss counters while unrelated positive evidence survives (R06).
+// is `Unknown` when any candidate read badly (`status != ok`), any
+// of the op's table epochs is unterminated/dirty/retired-unproven,
+// the op carries sticky TRUNC bits, or new candidates arrive for an
+// epoch after it terminated (the set proved non-closed).
+// Session-global losses do NOT flip per-site coverage: they PARTIAL
+// the window via Loss counters while unrelated positive evidence
+// survives (R06).
 //
 // D4 — Loss classification. Every [`DiscoveryLoss`](crate::discovery::session::DiscoveryLoss)
 // stays `Loss`: wire ring ids → `KernelRing`, wire map ids →
@@ -932,15 +938,16 @@ fn is_legacy_locator(locator: &str) -> bool {
     stem == "legacy"
 }
 
-/// Per-op table view: termination proof plus retirement dirt. Only
-/// the live epoch's proof counts; a retired epoch's completion never
-/// carries over.
+/// Per-(op, epoch) table view: termination proof plus retirement
+/// dirt. Sibling epochs never collapse: each array incarnation
+/// proves separately, and a retired epoch's completion never carries
+/// over.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct OpTable {
-    epoch: u64,
     terminated: bool,
     /// Poll sequence when termination was first observed (a new
-    /// candidate in a LATER poll proves the set non-closed).
+    /// candidate for this epoch in a LATER poll proves the set
+    /// non-closed).
     term_poll: Option<u64>,
     /// Retired without new-epoch proof yet.
     dirty: bool,
@@ -954,7 +961,10 @@ pub struct AdapterState {
     emitted: HashMap<(u64, u64, u64), DiscoveredSite>,
     triple_ops: HashMap<(u64, u64, u64), HashSet<u32>>,
     op_triples: HashMap<u32, HashSet<(u64, u64, u64)>>,
-    op_tables: HashMap<u32, OpTable>,
+    op_tables: HashMap<(u32, u64), OpTable>,
+    /// Sticky per-op walk-shape bits (mirrors the producer: never
+    /// retired — any nonzero bit keeps the op unclosed).
+    op_trunc: HashMap<u32, u64>,
     legacy_classes: BTreeSet<String>,
     objects: Vec<ObjectRecord>,
     seen_objects: HashSet<(String, u64)>,
@@ -980,12 +990,53 @@ impl AdapterState {
         let mut ops: Vec<u32> = self
             .op_triples
             .keys()
-            .chain(self.op_tables.keys())
+            .chain(self.op_tables.keys().map(|(op, _)| op))
             .copied()
             .collect();
         ops.sort_unstable();
         ops.dedup();
         ops
+    }
+
+    /// Op closure: at least one tracked epoch, every epoch
+    /// terminated and clean, and no sticky walk-shape bits. A
+    /// retired-awaiting-rebirth epoch (dirty tombstone) or an op
+    /// with no table yet never closes.
+    fn op_closed(&self, op: u32) -> bool {
+        if self.op_trunc.get(&op).copied().unwrap_or(0) != 0 {
+            return false;
+        }
+        let mut any = false;
+        for ((o, _), t) in &self.op_tables {
+            if *o != op {
+                continue;
+            }
+            any = true;
+            if !t.terminated || t.dirty {
+                return false;
+            }
+        }
+        any
+    }
+}
+
+/// Re-emit an op's emitted sites as Unknown (retirements and
+/// closed-transitions share this): the op's completion dropped, so
+/// every site touching it degrades.
+fn degrade_op_sites(
+    state: &mut AdapterState,
+    touched: &mut HashMap<(u64, u64, u64), DiscoveredSite>,
+    op: u32,
+) {
+    if let Some(triples) = state.op_triples.get(&op).cloned() {
+        for triple in triples {
+            if let Some(site) = state.emitted.get_mut(&triple) {
+                if site.candidates_coverage != CandidateCoverage::Unknown {
+                    site.candidates_coverage = CandidateCoverage::Unknown;
+                }
+                touched.insert(triple, site.clone());
+            }
+        }
     }
 }
 
@@ -1038,37 +1089,17 @@ pub fn adapt_delta(
         count_losses.push(classify_loss(loss.source, loss.count));
     }
 
-    // D2 tables: track the live epoch's proof; a rebirth resets it.
-    for table in &delta.tables {
-        let entry = state.op_tables.entry(table.op).or_insert(OpTable {
-            epoch: table.epoch,
-            terminated: false,
-            term_poll: None,
-            dirty: false,
-        });
-        if entry.epoch != table.epoch {
-            *entry = OpTable {
-                epoch: table.epoch,
-                terminated: false,
-                term_poll: None,
-                dirty: false,
-            };
-        }
-        if matches!(table.state, CoverageState::Terminated { .. }) {
-            entry.terminated = true;
-            entry.dirty = false;
-            if entry.term_poll.is_none() {
-                entry.term_poll = Some(seq);
-            }
-        } else {
-            entry.terminated = false;
-        }
-    }
-
-    // D2 retirements: the epoch's completion drops (rows survive);
-    // affected emitted sites re-emit as Unknown until the new epoch
-    // proves. Retirement gap losses are NOT re-counted (D2).
+    // D2 retirements FIRST: the retired epoch's completion drops
+    // (rows survive) into a dirty tombstone; this delta's tables then
+    // supersede it with the rebirth (an unload leaves the tombstone
+    // standing — proof dropped forever). Retirement gap losses are
+    // NOT re-counted (D2).
     let mut touched: HashMap<(u64, u64, u64), DiscoveredSite> = HashMap::new();
+    let was_closed: HashSet<u32> = state
+        .ops()
+        .into_iter()
+        .filter(|op| state.op_closed(*op))
+        .collect();
     for retirement in &delta.retirements {
         activity.push(typed_counter(
             "discovery.table_retired",
@@ -1077,23 +1108,56 @@ pub fn adapt_delta(
             CounterSource::Discovery,
             1,
         ));
-        let entry = state.op_tables.entry(retirement.op).or_insert(OpTable {
-            epoch: 0,
+        state.op_tables.insert(
+            (retirement.op, retirement.epoch),
+            OpTable {
+                terminated: false,
+                term_poll: None,
+                dirty: true,
+            },
+        );
+        degrade_op_sites(state, &mut touched, retirement.op);
+    }
+
+    // D2 tables: track each live epoch's proof per (op, epoch) —
+    // sibling arrays at distinct epochs never collapse, and a
+    // terminated table cannot overwrite an unfinished sibling. A
+    // rebirth (newer epoch) supersedes its retired tombstone;
+    // epochs are globally monotonic, so the comparison is exact.
+    for table in &delta.tables {
+        let key = (table.op, table.epoch);
+        let entry = state.op_tables.entry(key).or_insert(OpTable {
             terminated: false,
             term_poll: None,
-            dirty: true,
+            dirty: false,
         });
-        entry.terminated = false;
-        entry.dirty = true;
-        if let Some(triples) = state.op_triples.get(&retirement.op).cloned() {
-            for triple in triples {
-                if let Some(site) = state.emitted.get_mut(&triple) {
-                    if site.candidates_coverage != CandidateCoverage::Unknown {
-                        site.candidates_coverage = CandidateCoverage::Unknown;
-                    }
-                    touched.insert(triple, site.clone());
-                }
+        if entry.dirty {
+            // Stale re-emit of a retired epoch: the tombstone stands
+            // (only a newer epoch's rebirth clears it).
+            continue;
+        }
+        if matches!(table.state, CoverageState::Terminated { .. }) {
+            entry.terminated = true;
+            if entry.term_poll.is_none() {
+                entry.term_poll = Some(seq);
             }
+        } else {
+            entry.terminated = false;
+        }
+        state
+            .op_tables
+            .retain(|(op, epoch), t| *op != table.op || *epoch >= table.epoch || !t.dirty);
+        if table.trunc_bits != 0 {
+            *state.op_trunc.entry(table.op).or_default() |= table.trunc_bits;
+        }
+    }
+
+    // Closed-transition degrade: table-only changes that un-close an
+    // op (new unproven epochs, fresh TRUNC bits, lost termination)
+    // degrade already-emitted sites exactly like retirements do.
+    for op in state.ops() {
+        if was_closed.contains(&op) && !state.op_closed(op) {
+            degrade_op_sites(state, &mut touched, op);
         }
     }
 
@@ -1105,8 +1169,9 @@ pub fn adapt_delta(
     let mut late_attach = 0u64;
     let mut fresh_mapped = 0u64;
     let mut identity_refreshed = 0u64;
-    // triple → (dev string, new candidates, ops, any bad read).
-    type Group = (String, Vec<CandidateIdentity>, HashSet<u32>, bool);
+    // triple → (dev string, new candidates, (op, epoch) arrivals,
+    // any bad read).
+    type Group = (String, Vec<CandidateIdentity>, HashSet<(u32, u64)>, bool);
     let mut groups: HashMap<(u64, u64, u64), Group> = HashMap::new();
     for candidate in &delta.candidates {
         if is_legacy_locator(&candidate.advertising) {
@@ -1152,33 +1217,38 @@ pub fn adapt_delta(
             .entry(triple)
             .or_insert_with(|| (backing.dev.clone(), Vec::new(), HashSet::new(), false));
         slot.1.push(identity);
-        slot.2.insert(candidate.op);
+        slot.2.insert((candidate.op, candidate.epoch));
         slot.3 |= bad_read;
     }
     // Deterministic group order (arrival order must not leak).
     let mut group_keys: Vec<(u64, u64, u64)> = groups.keys().copied().collect();
     group_keys.sort_unstable();
     for triple in group_keys {
-        let (dev_str, mut fresh_identities, group_ops, bad_read) =
+        let (dev_str, mut fresh_identities, group_epochs, bad_read) =
             groups.remove(&triple).unwrap_or_default();
         let (device, ino, offset) = triple;
         let first_emit = !state.emitted.contains_key(&triple);
-        // D3 coverage: degrade on bad reads, unterminated/dirty
-        // tables, or a NEW arrival for an op that already terminated
-        // (the set proved non-closed — arrivals for sibling ops on
-        // a shared site do not taint a closed op).
+        // D3 coverage: degrade on bad reads, an unclosed op (any
+        // epoch unterminated/dirty/retired, or sticky TRUNC bits), or
+        // a NEW arrival for an epoch after it terminated (the set
+        // proved non-closed — arrivals for sibling epochs or ops on
+        // a shared site do not taint a closed epoch).
         let mut unknown = bad_read;
         if let Some(ops) = state.triple_ops.get(&triple) {
             for op in ops {
-                match state.op_tables.get(op) {
-                    None => unknown = true,
-                    Some(t) => {
-                        let closed = t.terminated && !t.dirty;
-                        let fresh_arrival =
-                            group_ops.contains(op) && t.term_poll.is_some_and(|p| p < seq);
-                        if !closed || fresh_arrival {
-                            unknown = true;
-                        }
+                if !state.op_closed(*op) {
+                    unknown = true;
+                }
+                for (gop, gepoch) in &group_epochs {
+                    if *gop != *op {
+                        continue;
+                    }
+                    let fresh_arrival = state
+                        .op_tables
+                        .get(&(*op, *gepoch))
+                        .is_some_and(|t| t.term_poll.is_some_and(|p| p < seq));
+                    if fresh_arrival {
+                        unknown = true;
                     }
                 }
             }
@@ -2443,22 +2513,25 @@ where
         }
 
         // Coverage: per-op rows from discovery census + attach truth,
-        // legacy + dispatch planes, then the sole finalizer.
+        // legacy + dispatch planes, then the sole finalizer. An op
+        // terminates only when EVERY live epoch proves and no sticky
+        // walk-shape bits haunt it — sibling epochs never collapse.
+        let snap_trunc: HashMap<u32, u64> = snapshot.truncated_ops.iter().copied().collect();
         let mut snap_term: HashMap<u32, bool> = HashMap::new();
         for table in &snapshot.tables {
-            snap_term.insert(
-                table.op,
-                matches!(table.state, CoverageState::Terminated { .. }),
-            );
+            let term = matches!(table.state, CoverageState::Terminated { .. })
+                && snap_trunc.get(&table.op).copied().unwrap_or(0) == 0;
+            snap_term
+                .entry(table.op)
+                .and_modify(|t| *t &= term)
+                .or_insert(term);
         }
         let mut coverage = Vec::new();
         for op in self.adapter.ops() {
-            let terminated = snap_term.get(&op).copied().unwrap_or_else(|| {
-                self.adapter
-                    .op_tables
-                    .get(&op)
-                    .is_some_and(|t| t.terminated && !t.dirty)
-            });
+            let terminated = snap_term
+                .get(&op)
+                .copied()
+                .unwrap_or_else(|| self.adapter.op_closed(op));
             let discovered = self.adapter.op_discovered(op);
             let attached = self.op_attached(op);
             coverage.push(ScopeCoverage {

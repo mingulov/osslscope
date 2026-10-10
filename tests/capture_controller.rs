@@ -21,9 +21,11 @@ use osslscope::count_session::{
 use osslscope::discovery::maps::Mapping;
 use osslscope::discovery::session::{
     BackingRef, CoverageState, DiscoveredCandidate, DiscoveryDelta, DiscoveryLoss,
-    DiscoverySnapshot, PollBudget, Recycled, TableCoverage, TripwireDelta,
+    DiscoverySnapshot, PollBudget, Recycled, TableCoverage, TableRetirement, TripwireDelta,
 };
-use osslscope::evidence::{Completeness, PredicateMatch, match_bounds};
+use osslscope::evidence::{
+    CandidateCoverage, Completeness, ExpectedScope, PredicateMatch, match_bounds,
+};
 use osslscope::{plan, target};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -1702,6 +1704,44 @@ fn positive_rule_on_unrelated_partial_coverage() {
 }
 
 #[test]
+fn finalize_requires_all_live_epochs_terminated() {
+    // The closing snapshot carries two live epochs for op 1 — one
+    // in progress, one terminated: the op stays Unknown-denominator
+    // (a single terminated table must not close the op).
+    let mut h = Harness::fresh("final-epochs");
+    h.snapshot_attached();
+    let cand1 = cand(
+        "/p/provider.so",
+        backing_of(&h.staged, h.off),
+        1,
+        11,
+        "SHA-256",
+        false,
+        "ok",
+    );
+    h.polls.push_back(DiscoveryDelta::default());
+    h.polls.push_back(DiscoveryDelta {
+        candidates: vec![cand1],
+        tables: vec![in_progress(1, 5)],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    h.snapshot.tables = vec![in_progress(1, 5), terminated(1, 6)];
+    // Exit after the first round polled (250ms), so the op is known.
+    h.exit_at_ns = Some(BASE_NS + 300_000_000);
+    let (out, _) = h.run();
+    let c = out.unwrap();
+    let row = c
+        .document
+        .coverage
+        .iter()
+        .find(|s| s.scope == "op:1")
+        .unwrap();
+    assert_eq!(row.expected, ExpectedScope::Unknown);
+    assert_eq!(row.discovered, 1);
+}
+
+#[test]
 fn maps_fence_versions_generation() {
     // A mid-window mapping change fences exactly once: the fenced
     // generation keeps gen-0 counts under gen-0 meaning, later
@@ -1795,7 +1835,7 @@ fn polling_fallback_is_explicit_partial() {
 // Adapter pins: direct `adapt_delta` contract checks.
 // ---------------------------------------------------------------------------
 
-use osslscope::capture::{AdapterCtx, AdapterState, adapt_delta};
+use osslscope::capture::{AdaptedDelta, AdapterCtx, AdapterState, adapt_delta};
 
 #[test]
 fn advertising_fallback_binds_mapping_not_path() {
@@ -1987,6 +2027,246 @@ fn refreshed_site_fingerprint_is_forwarded() {
             .any(|c| c.name == "discovery.site_identity_refreshed" && c.value == 1),
         "{:?}",
         second.activity
+    );
+}
+
+/// Direct-adapter driver: staged bytes, one live mapping, fresh
+/// adapter state.
+struct AdaptHarness {
+    staged: Staged,
+    live: Vec<Mapping>,
+    files: HashMap<String, Vec<u8>>,
+    fresh: HashSet<(String, u64)>,
+    state: AdapterState,
+}
+
+impl AdaptHarness {
+    fn fresh(test: &str) -> Self {
+        let stage = Stage::fresh(test);
+        let bytes = self_bytes();
+        let staged = stage.write("prov.so", &bytes);
+        let live = vec![mapping(&staged)];
+        let files = HashMap::from([(staged.path.clone(), bytes)]);
+        // `stage` drops here: the temp dir is gone but every byte the
+        // adapter reads is already staged in `files`.
+        Self {
+            staged,
+            live,
+            files,
+            fresh: HashSet::new(),
+            state: AdapterState::default(),
+        }
+    }
+
+    fn cand(&self, op: u32, epoch: u64, offset: u64) -> DiscoveredCandidate {
+        let mut c = cand(
+            self.staged.path.as_str(),
+            backing_of(&self.staged, offset),
+            op,
+            11,
+            "SHA-256",
+            false,
+            "ok",
+        );
+        c.epoch = epoch;
+        c
+    }
+
+    fn adapt(&mut self, delta: &DiscoveryDelta) -> AdaptedDelta {
+        adapt_delta(
+            &mut self.state,
+            delta,
+            &AdapterCtx {
+                live: &self.live,
+                files: &self.files,
+                builtin_default: false,
+                fresh: &self.fresh,
+                post_settle: false,
+                baseline: false,
+            },
+        )
+    }
+}
+
+#[test]
+fn table_only_new_epoch_degrades_emitted_sites() {
+    // Epoch 5 terminates and its site emits Complete; a table-only
+    // delta then reports a new unproven epoch 6 for the same op —
+    // the emitted site re-emits as Unknown (no silent Complete).
+    let mut h = AdaptHarness::fresh("epoch-degrade");
+    let d1 = DiscoveryDelta {
+        candidates: vec![h.cand(1, 5, 0x100)],
+        tables: vec![terminated(1, 5)],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    };
+    let first = h.adapt(&d1);
+    assert_eq!(first.delta.discovered.len(), 1);
+    assert_eq!(
+        first.delta.discovered[0].candidates_coverage,
+        CandidateCoverage::Complete
+    );
+    let d2 = DiscoveryDelta {
+        tables: vec![in_progress(1, 6)],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    };
+    let second = h.adapt(&d2);
+    assert_eq!(second.delta.discovered.len(), 1);
+    assert_eq!(
+        second.delta.discovered[0].candidates_coverage,
+        CandidateCoverage::Unknown
+    );
+}
+
+#[test]
+fn terminated_sibling_cannot_overwrite_unfinished_epoch() {
+    // Epoch 6 in progress; a late terminated table for epoch 5 in
+    // the SAME delta as a new epoch-6 candidate must not resurrect
+    // closure: the new site emits Unknown.
+    let mut h = AdaptHarness::fresh("sibling-epoch");
+    let d1 = DiscoveryDelta {
+        candidates: vec![h.cand(1, 6, 0x100)],
+        tables: vec![in_progress(1, 6)],
+        ..DiscoveryDelta::default()
+    };
+    let first = h.adapt(&d1);
+    assert_eq!(
+        first.delta.discovered[0].candidates_coverage,
+        CandidateCoverage::Unknown
+    );
+    let d2 = DiscoveryDelta {
+        candidates: vec![h.cand(1, 6, 0x200)],
+        tables: vec![terminated(1, 5)],
+        ..DiscoveryDelta::default()
+    };
+    let second = h.adapt(&d2);
+    assert_eq!(second.delta.discovered.len(), 1);
+    assert_eq!(second.delta.discovered[0].site.offset, 0x200);
+    assert_eq!(
+        second.delta.discovered[0].candidates_coverage,
+        CandidateCoverage::Unknown
+    );
+}
+
+#[test]
+fn trunc_bits_degrade_emitted_sites() {
+    // Terminated table, Complete site; a table-only delta then
+    // carries sticky walk-shape bits — the site re-emits Unknown.
+    use osslscope_ebpf_common as wire;
+    let mut h = AdaptHarness::fresh("trunc-degrade");
+    let d1 = DiscoveryDelta {
+        candidates: vec![h.cand(1, 0, 0x100)],
+        tables: vec![terminated(1, 0)],
+        ..DiscoveryDelta::default()
+    };
+    let first = h.adapt(&d1);
+    assert_eq!(
+        first.delta.discovered[0].candidates_coverage,
+        CandidateCoverage::Complete
+    );
+    let mut t = terminated(1, 0);
+    t.trunc_bits = wire::TRUNC_WALK_READ;
+    let d2 = DiscoveryDelta {
+        tables: vec![t],
+        ..DiscoveryDelta::default()
+    };
+    let second = h.adapt(&d2);
+    assert_eq!(second.delta.discovered.len(), 1);
+    assert_eq!(
+        second.delta.discovered[0].candidates_coverage,
+        CandidateCoverage::Unknown
+    );
+}
+
+fn retirement(op: u32, epoch: u64) -> TableRetirement {
+    TableRetirement {
+        op,
+        epoch,
+        gap: osslscope::discovery::coverage::CoverageDelta::default(),
+    }
+}
+
+#[test]
+fn retirement_with_rebirth_degrades_until_proven() {
+    // Same-delta retirement + rebirth: the site re-emits Unknown
+    // (proof dropped); when the rebirth later terminates, nothing
+    // re-emits — coverage degrades, never upgrades.
+    let mut h = AdaptHarness::fresh("retire-rebirth");
+    let d1 = DiscoveryDelta {
+        candidates: vec![h.cand(1, 5, 0x100)],
+        tables: vec![terminated(1, 5)],
+        ..DiscoveryDelta::default()
+    };
+    let first = h.adapt(&d1);
+    assert_eq!(
+        first.delta.discovered[0].candidates_coverage,
+        CandidateCoverage::Complete
+    );
+    let d2 = DiscoveryDelta {
+        retirements: vec![retirement(1, 5)],
+        tables: vec![in_progress(1, 7)],
+        ..DiscoveryDelta::default()
+    };
+    let second = h.adapt(&d2);
+    assert_eq!(second.delta.discovered.len(), 1);
+    assert_eq!(
+        second.delta.discovered[0].candidates_coverage,
+        CandidateCoverage::Unknown
+    );
+    assert!(
+        second
+            .activity
+            .iter()
+            .any(|c| c.name == "discovery.table_retired" && c.value == 1),
+        "{:?}",
+        second.activity
+    );
+    let d3 = DiscoveryDelta {
+        tables: vec![terminated(1, 7)],
+        ..DiscoveryDelta::default()
+    };
+    let third = h.adapt(&d3);
+    assert!(third.delta.discovered.is_empty());
+}
+
+#[test]
+fn retired_epoch_table_cannot_resurrect_closure() {
+    // Epoch 5 retires unproven (unload, no rebirth); a stale
+    // terminated table for it later must not resurrect closure: a
+    // new site still emits Unknown.
+    let mut h = AdaptHarness::fresh("tombstone");
+    let d1 = DiscoveryDelta {
+        candidates: vec![h.cand(1, 5, 0x100)],
+        tables: vec![in_progress(1, 5)],
+        ..DiscoveryDelta::default()
+    };
+    let first = h.adapt(&d1);
+    assert_eq!(
+        first.delta.discovered[0].candidates_coverage,
+        CandidateCoverage::Unknown
+    );
+    let d2 = DiscoveryDelta {
+        retirements: vec![retirement(1, 5)],
+        ..DiscoveryDelta::default()
+    };
+    let second = h.adapt(&d2);
+    assert_eq!(second.delta.discovered.len(), 1);
+    assert_eq!(
+        second.delta.discovered[0].candidates_coverage,
+        CandidateCoverage::Unknown
+    );
+    let d3 = DiscoveryDelta {
+        candidates: vec![h.cand(1, 5, 0x200)],
+        tables: vec![terminated(1, 5)],
+        ..DiscoveryDelta::default()
+    };
+    let third = h.adapt(&d3);
+    assert_eq!(third.delta.discovered.len(), 1);
+    assert_eq!(third.delta.discovered[0].site.offset, 0x200);
+    assert_eq!(
+        third.delta.discovered[0].candidates_coverage,
+        CandidateCoverage::Unknown
     );
 }
 
