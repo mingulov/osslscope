@@ -8,16 +8,24 @@
  * Exact provider-internal callback counts are implementation-defined
  * and recorded, never asserted.
  *
- * Usage: ordinary_ops_driver {ecdsa|keyexch|kdf|kem|md4|mixed}
+ * Usage: ordinary_ops_driver {ecdsa|keyexch|kdf|kem|md4|mixed} [--loop SECS]
  * stdout: LEDGER lines + ORDDONE. stderr: diagnostics. Exit 2 on
  * provider/fetch failures; exit 0 with LEDGER skipped=1 on the
  * version-gated kem mode below OpenSSL 3.5 (deterministic skip).
  * Fast by design (no GO gating): exercises the observer's fast-
  * command startup-gap honesty as well as ordinary coverage.
+ * With --loop SECS the mode repeats for SECS seconds with a FRESH
+ * library context per iteration: fetch caching would otherwise
+ * collapse the whole loop to a single provider query (one sampled
+ * slot), while fresh contexts re-query every iteration so sampling
+ * converges and sustained execution is observable. Each iteration
+ * keeps the single-fetch LEDGER shape; a final LEDGER carries the
+ * loop totals. The kem version gate runs once (no loop).
  */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <openssl/core_names.h>
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
@@ -28,6 +36,10 @@
 
 static const unsigned char input[64] = { 0xA5 };
 static unsigned long fetches = 0;
+/* Active library context (NULL = default): one-shot modes run on the
+ * default context exactly as before; --loop installs a fresh context
+ * per iteration so every iteration re-queries. */
+static OSSL_LIB_CTX *G_LC = NULL;
 
 static int fail(const char *what)
 {
@@ -37,7 +49,7 @@ static int fail(const char *what)
 
 static int do_ecdsa(void)
 {
-    EVP_SIGNATURE *sig = EVP_SIGNATURE_fetch(NULL, "ECDSA", NULL);
+    EVP_SIGNATURE *sig = EVP_SIGNATURE_fetch(G_LC, "ECDSA", NULL);
     EVP_PKEY *pkey = NULL;
     EVP_MD_CTX *mctx = NULL;
     EVP_PKEY_CTX *vctx = NULL;
@@ -49,7 +61,7 @@ static int do_ecdsa(void)
         return fail("ECDSA fetch");
     fetches++;
     EVP_SIGNATURE_free(sig);
-    pkey = EVP_PKEY_Q_keygen(NULL, NULL, "EC", "P-256");
+    pkey = EVP_PKEY_Q_keygen(G_LC, NULL, "EC", "P-256");
     if (pkey == NULL)
         return fail("EC keygen");
     mctx = EVP_MD_CTX_new();
@@ -74,7 +86,7 @@ out:
 
 static int do_keyexch(void)
 {
-    EVP_KEYEXCH *ex = EVP_KEYEXCH_fetch(NULL, "X25519", NULL);
+    EVP_KEYEXCH *ex = EVP_KEYEXCH_fetch(G_LC, "X25519", NULL);
     EVP_PKEY *a = NULL, *b = NULL;
     EVP_PKEY_CTX *ctx = NULL;
     unsigned char secret[64];
@@ -85,11 +97,11 @@ static int do_keyexch(void)
         return fail("X25519 keyexch fetch");
     fetches++;
     EVP_KEYEXCH_free(ex);
-    a = EVP_PKEY_Q_keygen(NULL, NULL, "X25519");
-    b = EVP_PKEY_Q_keygen(NULL, NULL, "X25519");
+    a = EVP_PKEY_Q_keygen(G_LC, NULL, "X25519");
+    b = EVP_PKEY_Q_keygen(G_LC, NULL, "X25519");
     if (a == NULL || b == NULL)
         return fail("X25519 keygen");
-    ctx = EVP_PKEY_CTX_new_from_pkey(NULL, a, NULL);
+    ctx = EVP_PKEY_CTX_new_from_pkey(G_LC, a, NULL);
     if (ctx == NULL
         || EVP_PKEY_derive_init(ctx) <= 0
         || EVP_PKEY_derive_set_peer(ctx, b) <= 0
@@ -107,7 +119,7 @@ out:
 
 static int do_kdf(void)
 {
-    EVP_KDF *kdf = EVP_KDF_fetch(NULL, "HKDF", NULL);
+    EVP_KDF *kdf = EVP_KDF_fetch(G_LC, "HKDF", NULL);
     EVP_KDF_CTX *ctx = NULL;
     OSSL_PARAM params[6], *p = params;
     unsigned char key[16], salt[16], info[8], out[32];
@@ -140,7 +152,7 @@ out:
 #if OPENSSL_VERSION_MAJOR > 3 || (OPENSSL_VERSION_MAJOR == 3 && OPENSSL_VERSION_MINOR >= 5)
 static int do_kem(void)
 {
-    EVP_KEM *kem = EVP_KEM_fetch(NULL, "ML-KEM-768", NULL);
+    EVP_KEM *kem = EVP_KEM_fetch(G_LC, "ML-KEM-768", NULL);
     EVP_PKEY *pkey = NULL;
     EVP_PKEY_CTX *ctx = NULL;
     unsigned char ct[2048], ss1[64], ss2[64];
@@ -151,10 +163,10 @@ static int do_kem(void)
         return fail("ML-KEM-768 fetch");
     fetches++;
     EVP_KEM_free(kem);
-    pkey = EVP_PKEY_Q_keygen(NULL, NULL, "ML-KEM-768");
+    pkey = EVP_PKEY_Q_keygen(G_LC, NULL, "ML-KEM-768");
     if (pkey == NULL)
         return fail("ML-KEM-768 keygen");
-    ctx = EVP_PKEY_CTX_new_from_pkey(NULL, pkey, NULL);
+    ctx = EVP_PKEY_CTX_new_from_pkey(G_LC, pkey, NULL);
     if (ctx == NULL || EVP_PKEY_encapsulate_init(ctx, NULL) <= 0
         || EVP_PKEY_encapsulate(ctx, ct, &ctlen, ss1, &ss1len) <= 0)
         goto out;
@@ -184,7 +196,7 @@ static int do_kem(void)
 
 static int run_digest(const char *name, const char *propq)
 {
-    EVP_MD *md = EVP_MD_fetch(NULL, name, propq);
+    EVP_MD *md = EVP_MD_fetch(G_LC, name, propq);
     unsigned char out[64];
     unsigned int outlen = 0;
     int digests = 0, rc = 2;
@@ -204,7 +216,7 @@ out:
 
 static int do_md4(void)
 {
-    OSSL_PROVIDER *lp = OSSL_PROVIDER_load(NULL, "legacy");
+    OSSL_PROVIDER *lp = OSSL_PROVIDER_load(G_LC, "legacy");
     int rc;
 
     if (lp == NULL)
@@ -224,7 +236,7 @@ static int do_mixed(void)
     rc = run_digest("SHA2-256", "provider=default");
     if (rc != 0)
         return rc;
-    lp = OSSL_PROVIDER_load(NULL, "legacy");
+    lp = OSSL_PROVIDER_load(G_LC, "legacy");
     if (lp == NULL)
         return fail("legacy load");
     printf("LEDGER mode=mixed legacy_loads=1\n");
@@ -233,30 +245,105 @@ static int do_mixed(void)
     return rc;
 }
 
+static int run_mode(const char *mode)
+{
+    if (strcmp(mode, "ecdsa") == 0)
+        return do_ecdsa();
+    if (strcmp(mode, "keyexch") == 0)
+        return do_keyexch();
+    if (strcmp(mode, "kdf") == 0)
+        return do_kdf();
+    if (strcmp(mode, "kem") == 0)
+        return do_kem();
+    if (strcmp(mode, "md4") == 0)
+        return do_md4();
+    if (strcmp(mode, "mixed") == 0)
+        return do_mixed();
+    return -1;
+}
+
 int main(int argc, char **argv)
 {
+    const char *mode;
+    long loop_secs = 0;
     int rc;
 
-    if (argc != 2) {
-        fprintf(stderr, "usage: ordinary_ops_driver {ecdsa|keyexch|kdf|kem|md4|mixed}\n");
+    if (argc < 2 || argc > 4) {
+        fprintf(stderr, "usage: ordinary_ops_driver {ecdsa|keyexch|kdf|kem|md4|mixed} [--loop SECS]\n");
         return 2;
     }
-    if (strcmp(argv[1], "ecdsa") == 0)
-        rc = do_ecdsa();
-    else if (strcmp(argv[1], "keyexch") == 0)
-        rc = do_keyexch();
-    else if (strcmp(argv[1], "kdf") == 0)
-        rc = do_kdf();
-    else if (strcmp(argv[1], "kem") == 0)
-        rc = do_kem();
-    else if (strcmp(argv[1], "md4") == 0)
-        rc = do_md4();
-    else if (strcmp(argv[1], "mixed") == 0)
-        rc = do_mixed();
-    else {
-        fprintf(stderr, "ordinary_ops_driver: unknown mode %s\n", argv[1]);
+    mode = argv[1];
+    if (strcmp(mode, "ecdsa") != 0 && strcmp(mode, "keyexch") != 0
+        && strcmp(mode, "kdf") != 0 && strcmp(mode, "kem") != 0
+        && strcmp(mode, "md4") != 0 && strcmp(mode, "mixed") != 0) {
+        fprintf(stderr, "ordinary_ops_driver: unknown mode %s\n", mode);
         return 2;
     }
-    printf("ORDDONE mode=%s rc=%d\n", argv[1], rc);
-    return rc;
+    if (argc == 4) {
+        if (strcmp(argv[2], "--loop") != 0) {
+            fprintf(stderr, "usage: ordinary_ops_driver MODE [--loop SECS]\n");
+            return 2;
+        }
+        loop_secs = atol(argv[3]);
+        if (loop_secs <= 0 || loop_secs > 3600) {
+            fprintf(stderr, "ordinary_ops_driver: bad --loop %s\n", argv[3]);
+            return 2;
+        }
+    } else if (argc == 3) {
+        fprintf(stderr, "usage: ordinary_ops_driver MODE [--loop SECS]\n");
+        return 2;
+    }
+#if OPENSSL_VERSION_MAJOR > 3 || (OPENSSL_VERSION_MAJOR == 3 && OPENSSL_VERSION_MINOR >= 5)
+    (void)0;
+#else
+    /* Below 3.5 the kem mode is a deterministic skip: looping it
+     * would spin LEDGER-skipped lines for the whole window. */
+    if (loop_secs > 0 && strcmp(mode, "kem") == 0)
+        loop_secs = 0;
+#endif
+    if (loop_secs <= 0) {
+        rc = run_mode(mode);
+        printf("ORDDONE mode=%s rc=%d\n", mode, rc);
+        return rc;
+    }
+    {
+        time_t deadline = time(NULL) + loop_secs;
+        unsigned long ops = 0;
+
+        /* Sustained: a fresh context per iteration defeats fetch
+         * caching, so every iteration queries and sampling converges.
+         * The default provider loads per context; modes needing
+         * legacy load it themselves (as in one-shot). */
+        rc = 0;
+        while (time(NULL) < deadline) {
+            OSSL_PROVIDER *dp;
+
+            G_LC = OSSL_LIB_CTX_new();
+            if (G_LC == NULL) {
+                fprintf(stderr, "ordinary_ops_driver: libctx new failed\n");
+                rc = 2;
+                break;
+            }
+            dp = OSSL_PROVIDER_load(G_LC, "default");
+            if (dp == NULL) {
+                fprintf(stderr, "ordinary_ops_driver: default load failed\n");
+                OSSL_LIB_CTX_free(G_LC);
+                G_LC = NULL;
+                rc = 2;
+                break;
+            }
+            rc = run_mode(mode);
+            /* Mode-owned legacy providers unload inside the mode;
+             * the default provider frees with the context. */
+            OSSL_LIB_CTX_free(G_LC);
+            G_LC = NULL;
+            if (rc != 0)
+                break;
+            ops++;
+        }
+        printf("LEDGER mode=%s loop_secs=%ld ops=%lu fetches=%lu\n", mode,
+               loop_secs, ops, fetches);
+        printf("ORDDONE mode=%s rc=%d\n", mode, rc);
+        return rc;
+    }
 }
