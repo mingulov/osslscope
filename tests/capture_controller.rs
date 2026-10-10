@@ -1514,6 +1514,50 @@ fn slow_metadata_past_deadline_admits_no_tripwire() {
 }
 
 #[test]
+fn setup_slice_reports_exact_tail_gap() {
+    // The kernel window opens pre-setup while the requested window
+    // starts at release: the 300ms setup slice is uncounted time
+    // inside the requested window, so it reports as an exact 300ms
+    // tail gap — never hidden, never inflated by drain time.
+    let mut h = Harness::fresh("setup-tail");
+    h.snapshot_attached();
+    h.file_delay_ns = 300_000_000;
+    h.polls.push_back(DiscoveryDelta {
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    let (out, _) = h.run();
+    let c = out.unwrap();
+    assert_eq!(c.document.window.tail_gap_ns(), 300_000_000);
+    assert!(has_reason(&c, "tail-gap"), "{:?}", c.reasons);
+    assert_eq!(c.counters.over_budget, 1);
+}
+
+#[test]
+fn loop_clamps_to_kernel_deadline() {
+    // 600ms setup with a 2s window: the loop ends at the kernel
+    // deadline (open + 2s), so the poll that would run past it
+    // never does — and the tail gap is exactly the setup slice.
+    let mut h = Harness::fresh("clamp");
+    h.snapshot_attached();
+    h.file_delay_ns = 600_000_000;
+    h.polls.push_back(DiscoveryDelta::default());
+    h.polls.push_back(DiscoveryDelta::default());
+    // Poll 2 runs only if the loop passes the kernel deadline.
+    h.polls.push_back(DiscoveryDelta {
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    h.polls.push_back(DiscoveryDelta::default());
+    let (out, _) = h.run();
+    let c = out.unwrap();
+    assert!(has_reason(&c, "no-query"), "{:?}", c.reasons);
+    assert_eq!(c.document.window.tail_gap_ns(), 600_000_000);
+    assert!(has_reason(&c, "tail-gap"), "{:?}", c.reasons);
+    assert_eq!(c.counters.over_budget, 1);
+}
+
+#[test]
 fn partial_final_delta_reconciles_once() {
     // Lossy final polls plus a close-tail residual: each increment
     // counts exactly once, and attached evidence survives.

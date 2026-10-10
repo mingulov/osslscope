@@ -1862,7 +1862,10 @@ where
     }
     // Open the kernel window BEFORE release: probes arm while the
     // child is still stopped, so the happy-path startup gap is zero
-    // (release instant ≥ programmed start saturates the gap).
+    // (release instant ≥ programmed start saturates the gap). The
+    // setup slice this steals from the requested window reports as
+    // tail gap: the loop clamps to the kernel deadline and the
+    // effective end caps there (never hidden, never drained).
     let start_ns = clock.monotonic_ns();
     let duration = duration_ns(cfg.duration);
     let Some(deadline_ns) = start_ns.checked_add(duration) else {
@@ -2032,6 +2035,17 @@ where
             let _ = self.target.resolve_setup_failure();
             anyhow::bail!("window deadline overflow");
         };
+        // Clamp the loop to the kernel deadline: the kernel window
+        // opened pre-setup while the requested window starts at
+        // release, so an unclamped loop runs one setup past the
+        // kernel deadline — uncounted time with no gap (spec: any
+        // unobserved interval in the requested window is a gap). The
+        // setup slice then reports as tail gap via the capped
+        // effective end below. (--pid requested starts predate the
+        // kernel open, so the clamp is a no-op there.)
+        let setup_ns = self.requested_start_ns.saturating_sub(self.window_start_ns);
+        let setup = Duration::from_nanos(setup_ns.min(duration_ns(self.cfg.duration)));
+        let loop_deadline = loop_deadline.checked_sub(setup).unwrap_or(loop_deadline);
         let settle_end =
             args::deadline_at(requested_instant, self.cfg.settle).unwrap_or(loop_deadline);
 
@@ -2131,6 +2145,14 @@ where
                 self.clock.sleep(Duration::from_millis(ms));
             }
         }
+        // Effective coverage ends when counting stops (close_window
+        // inside): stamp before the userspace drain, capped at the
+        // kernel deadline — drain time is not coverage, and the loop
+        // can overshoot the clamped deadline by up to one round.
+        let kernel_deadline_ns = self
+            .window_start_ns
+            .saturating_add(duration_ns(self.cfg.duration));
+        let effective_end_ns = self.clock.monotonic_ns().min(kernel_deadline_ns);
         // Counting closes BEFORE the final discovery drain
         // (in-kernel TARGET=0 inside: no userspace delay can extend
         // counting past this point).
@@ -2149,7 +2171,6 @@ where
             .checked_duration_since(drain_t0)
             .map(|d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX))
             .unwrap_or(0);
-        let effective_end_ns = self.clock.monotonic_ns();
         // An owned child that already exited was reaped mid-window,
         // so its /proc entry is gone and the discovery close misreads
         // that as a pid recycle. Snapshot first: on a spurious
