@@ -54,12 +54,27 @@ def main(argv):
     if not re.search(r"^ORDDONE mode=%s rc=0$" % re.escape(mode), log, re.M):
         return fail("driver did not complete rc=0 for mode %s" % mode)
     parsed = []
+    corrupt = 0
     for line in ledgers:
         try:
             parsed.append(dict(tok.split("=", 1) for tok in line.split()))
         except ValueError:
-            return fail("unparsable LEDGER line: %r" % line)
-    print("ledger: %s" % parsed)
+            # Shared-fd interleave (observer INSPECT + driver LEDGER
+            # race on one redirect): corrupt fragments carry no
+            # ledger meaning. Skip, count, keep judging (T14r4).
+            corrupt += 1
+    if not parsed:
+        return fail("no parsable LEDGER line (%d corrupt)" % corrupt)
+    if corrupt:
+        print("ledger: skipped %d corrupt line(s) (shared-fd interleave)"
+              % corrupt)
+    # Bounded calibration record: the loop-totals LEDGER is last,
+    # so first+last carry the shape without megabytes of spam.
+    if len(parsed) <= 50:
+        print("ledger: %s" % parsed)
+    else:
+        print("ledger: %d lines, first=%s last=%s"
+              % (len(parsed), parsed[:3], parsed[-3:]))
     if any("skipped" in d for d in parsed):
         print("ORACLE SKIP: version-gated fixture, no observation asserted")
         return 0

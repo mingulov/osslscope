@@ -40,6 +40,9 @@ printf 'LEDGER mode=ecdsa fetches=1 signs=1 verifies=1\nORDDONE mode=ecdsa rc=0\
 printf 'LEDGER mode=kem skipped=old-openssl\nORDDONE mode=kem rc=0\n' >"$T/kem-skip.log"
 printf 'LEDGER mode=md4 legacy_loads=1\nLEDGER digest=MD4 fetches=1 digests=1\nORDDONE mode=md4 rc=0\n' >"$T/md4.log"
 printf 'nothing here\nORDDONE mode=ecdsa rc=0\n' >"$T/no-ledger.log"
+printf 'LEDGER mode=ecdsa fetches=1 signs=1 verifies=1\nLEDGER mode=ecdsa fetches=33 mINSPECT stage=legacy trips=2\nLEDGER mode=ecdsa fetches=34 signs=1 verifies=1\nORDDONE mode=ecdsa rc=0\n' >"$T/interleave.log"
+printf 'LEDGER mode=ecdsa fetches=33 mINSPECT stage=legacy trips=2\nORDDONE mode=ecdsa rc=0\n' >"$T/all-corrupt.log"
+python3 -c "print(''.join('LEDGER mode=ecdsa fetches=%d signs=1 verifies=1\n' % i for i in range(1, 101)) + 'ORDDONE mode=ecdsa rc=0\n')" >"$T/spam.log"
 printf 'LEDGER mode=ecdsa fetches=1 signs=0 verifies=0\nORDDONE mode=ecdsa rc=2\n' >"$T/rc2.log"
 mk_report "$T/rep12.json" "$SITE12"
 mk_report "$T/rep1.json" "$SITE1"
@@ -115,6 +118,34 @@ if python3 "$ORACLE" "$T/ecdsa.log" "$T/rep12.json" bogus >"$T/out" 2>&1; then
     bad "unknown mode exits 2 (got exit 0)"
 else
     [ "$?" -eq 2 ] && ok "unknown mode exits 2" || bad "unknown mode exits 2 (rc=$?)"
+fi
+
+# 10. PASS: one interleaved-corrupt LEDGER line is skipped, not fatal.
+if python3 "$ORACLE" "$T/interleave.log" "$T/rep12.json" ecdsa >"$T/out" 2>&1; then
+    grep -q 'ORACLE PASS' "$T/out" && grep -q 'skipped 1 corrupt' "$T/out" \
+        && ok "interleaved corrupt line skipped, verdict stands" \
+        || bad "interleaved corrupt line skipped, verdict stands"
+else
+    bad "interleaved corrupt line skipped, verdict stands (rc=$?)"
+fi
+
+# 11. FAIL: all-corrupt ledger stays vacuous (skip is not a blank pass).
+if python3 "$ORACLE" "$T/all-corrupt.log" "$T/rep12.json" ecdsa >"$T/out" 2>&1; then
+    bad "all-corrupt ledger fails (got exit 0)"
+else
+    grep -q 'no parsable LEDGER' "$T/out" \
+        && ok "all-corrupt ledger fails" \
+        || bad "all-corrupt ledger fails"
+fi
+
+# 12. PASS: 100-LEDGER spam prints bounded (first/last, not megabytes).
+if python3 "$ORACLE" "$T/spam.log" "$T/rep12.json" ecdsa >"$T/out" 2>&1; then
+    grep -q 'ORACLE PASS' "$T/out" && grep -q '100 lines, first=' "$T/out" \
+        && [ "$(wc -c <"$T/out")" -lt 2000 ] \
+        && ok "spam ledger bounded first/last" \
+        || bad "spam ledger bounded first/last"
+else
+    bad "spam ledger bounded first/last (rc=$?)"
 fi
 
 echo "---"
