@@ -29,6 +29,13 @@ pub const HOST_UNKNOWN_KIND: u32 = 104;
 pub const HOST_MAP_SNAPSHOT: u32 = 105;
 pub const HOST_DRAIN_SHORTFALL: u32 = 106;
 pub const HOST_EVICT_FAILED: u32 = 107;
+/// A failed /proc/pid/maps read (F-D/Am1): the poll reconciles
+/// against the last-good snapshot instead of reading the failure
+/// as empty, and the failure is explicit loss (unlocalizable —
+/// taints every op like other snapshot failures). A single count
+/// at close with an exited target is expected (the final drain
+/// runs against last-good after /proc goes away).
+pub const HOST_MAPS_READ: u32 = 108;
 
 /// Frozen gap-reason vocabulary owned here (schema's derived reasons
 /// reference these; see [`primary_reason`] for the single ranking).
@@ -66,6 +73,7 @@ pub fn loss_source_name(src: u32) -> Option<&'static str> {
         HOST_MAP_SNAPSHOT => "map_snapshot",
         HOST_DRAIN_SHORTFALL => "drain_shortfall",
         HOST_EVICT_FAILED => "evict_failed",
+        HOST_MAPS_READ => "maps_read",
         _ => return None,
     })
 }
@@ -205,6 +213,13 @@ impl CoverageTracker {
     /// read as empty.
     pub fn note_map_snapshot(&mut self) {
         *self.losses.entry(HOST_MAP_SNAPSHOT).or_default() += 1;
+    }
+
+    /// A failed /proc/pid/maps read (F-D/Am1): the caller
+    /// reconciles against its last-good snapshot, and the
+    /// failure itself is explicit loss rather than empty maps.
+    pub fn note_maps_read(&mut self) {
+        *self.losses.entry(HOST_MAPS_READ).or_default() += 1;
     }
 
     /// End-of-run `TERMD` snapshot: (array, packed op/len).
@@ -540,13 +555,14 @@ mod tests {
             HOST_MAP_SNAPSHOT,
             HOST_DRAIN_SHORTFALL,
             HOST_EVICT_FAILED,
+            HOST_MAPS_READ,
         ] {
             assert!(loss_source_name(src).is_some(), "host source {src}");
         }
         assert_eq!(loss_source_name(0), None);
         assert_eq!(loss_source_name(16), None);
         assert_eq!(loss_source_name(100), None);
-        assert_eq!(loss_source_name(108), None);
+        assert_eq!(loss_source_name(109), None);
         assert_eq!(loss_source_name(u32::MAX), None);
     }
 }

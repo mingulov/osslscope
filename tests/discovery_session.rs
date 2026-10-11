@@ -237,8 +237,8 @@ impl SessionEnv for TestEnv {
         self.events.pop_front()
     }
 
-    fn current_maps(&mut self) -> Vec<Mapping> {
-        self.maps.clone()
+    fn current_maps(&mut self) -> Option<Vec<Mapping>> {
+        Some(self.maps.clone())
     }
 
     fn join_maps(&mut self) -> MapSnapshots {
@@ -266,7 +266,12 @@ impl SessionEnv for TestEnv {
         Ok(())
     }
 
-    fn install_trips(&mut self, set: &ProbeSet, _pid: u32) -> anyhow::Result<Option<String>> {
+    fn install_trips(
+        &mut self,
+        set: &ProbeSet,
+        _pid: u32,
+        _maps: &[Mapping],
+    ) -> anyhow::Result<Option<String>> {
         self.trip_install_calls += 1;
         self.trip_links_live += set.probes.len() as u64;
         Ok(None)
