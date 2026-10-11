@@ -173,6 +173,34 @@ fn reap_blocking(pid: u32) -> anyhow::Result<i32> {
     }
 }
 
+/// Redirect a fork child's stdout onto the observer's stderr
+/// (F-E/B2 output policy): a spawned workload must never share the
+/// observer's stdout artifact channel (JSON corruption, secret
+/// capture). Both child streams land on the observer's stderr,
+/// where workload output stays visible but never machine-parsed.
+/// When the observer's stderr is closed (pathological), sink to
+/// /dev/null instead — the run survives and the artifact channel
+/// stays pure. Async-signal-safe (raw syscalls only); explicit fds
+/// so tests never touch process stdio. Never closes the passed-in
+/// fds; closes only a /dev/null fd it opened itself.
+fn redirect_child_stdout(child_stdout: libc::c_int, observer_stderr: libc::c_int) {
+    unsafe {
+        if libc::dup2(observer_stderr, child_stdout) >= 0 {
+            return;
+        }
+        let null = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY);
+        if null < 0 {
+            return;
+        }
+        // open() returns the lowest free fd: when child_stdout was
+        // closed it may BE the fresh /dev/null fd already.
+        if null != child_stdout {
+            libc::dup2(null, child_stdout);
+            libc::close(null);
+        }
+    }
+}
+
 impl OwnedTarget {
     /// Fork a child held stopped pre-exec. CStrings are built before
     /// the fork so the child allocates nothing (async-signal-safe).
@@ -211,6 +239,11 @@ impl OwnedTarget {
                 // exotic kernel keeps the old behavior; the maps read
                 // then fails loud, never silent).
                 libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0);
+                // F-E/B2: explicit output policy — the workload's
+                // stdout follows the observer's stderr (never the
+                // stdout artifact channel), before the pre-exec stop
+                // so the fds are final while setup observes us.
+                redirect_child_stdout(libc::STDOUT_FILENO, libc::STDERR_FILENO);
                 libc::raise(libc::SIGSTOP);
                 libc::execvp(ptrs[0], ptrs.as_ptr());
                 libc::_exit(127);
@@ -427,6 +460,63 @@ impl Drop for OwnedTarget {
                 }
             }
             CustodyState::Reaped | CustodyState::Detached => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fd_target(fd: libc::c_int) -> String {
+        std::fs::read_link(format!("/proc/self/fd/{fd}"))
+            .expect("fd target")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn pipe() -> (libc::c_int, libc::c_int) {
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        (fds[0], fds[1])
+    }
+
+    #[test]
+    fn child_stdout_redirect_follows_given_stderr() {
+        let (a_r, a_w) = pipe();
+        let (b_r, b_w) = pipe();
+        redirect_child_stdout(a_w, b_w);
+        // a_w now points where b_w points (pipe B), not pipe A.
+        assert_eq!(fd_target(a_w), fd_target(b_w));
+        assert_eq!(fd_target(a_w), fd_target(b_r));
+        assert_ne!(fd_target(a_w), fd_target(a_r));
+        // Still functional: bytes written via the redirected fd
+        // arrive on pipe B.
+        let msg = b"ping";
+        assert_eq!(
+            unsafe { libc::write(a_w, msg.as_ptr() as *const libc::c_void, msg.len()) },
+            msg.len() as isize
+        );
+        let mut buf = [0u8; 4];
+        assert_eq!(
+            unsafe { libc::read(b_r, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) },
+            msg.len() as isize
+        );
+        assert_eq!(&buf, msg);
+        for fd in [a_r, a_w, b_r, b_w] {
+            unsafe { libc::close(fd) };
+        }
+    }
+
+    #[test]
+    fn child_stdout_redirect_sinks_to_dev_null_when_stderr_closed() {
+        let (a_r, a_w) = pipe();
+        // A fd value no thread can hold open: deterministic EBADF,
+        // no close-then-race with parallel tests.
+        redirect_child_stdout(a_w, 1_000_000_000);
+        assert_eq!(fd_target(a_w), "/dev/null");
+        for fd in [a_r, a_w] {
+            unsafe { libc::close(fd) };
         }
     }
 }

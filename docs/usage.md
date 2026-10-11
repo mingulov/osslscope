@@ -51,6 +51,12 @@ osslscope report --format json --out report.json --cbom bom.json run -- ./my-app
 - `run -- <cmd>` (spawn-and-observe) is the reliable mode;
   `--pid` (attach to live) is inherently racy — anything the
   target did before attach is invisible (cold-start gap).
+- Output policy: the spawned workload's stdout and stderr both
+  go to the observer's stderr. Observer stdout stays a pure
+  artifact channel — workload bytes can never corrupt
+  `--format json` or leak workload secrets into captured JSON.
+  Nothing is swallowed: workload output remains visible on
+  stderr (redirect the observer's stdout alone for clean JSON).
   `run --` predicts the target libcrypto pre-exec from the
   exe's `DT_NEEDED` closure plus loader search
   (`LD_LIBRARY_PATH`, rpath/runpath, system defaults);
