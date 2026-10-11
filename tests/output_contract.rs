@@ -2042,6 +2042,35 @@ fn cbom_omits_unresolved_classes() {
 }
 
 #[test]
+fn h3_t4_mixed_site_lands_in_cbom_omitted_unknown() {
+    // H3 (design T4): a mixed-shaped site (Unknown coverage +
+    // min label + weak, as H3-T2 produces) exports NO component
+    // — the collapsed min label must never become a definite
+    // asset — and lands in omitted-unknown, not
+    // omitted-ambiguous (coverage-unknown short-circuits before
+    // the definite-asset check).
+    let mut input = input_base();
+    input.sites = vec![site_at(
+        FP_A,
+        8,
+        100,
+        0x1000,
+        0,
+        7,
+        vec![cand(FP_A, "default", 1, 7, &["SHA-256"], true)],
+        CandidateCoverage::Unknown,
+    )];
+    let doc = finalize(input);
+    let cbom = cbom_of(&doc);
+    assert_eq!(cbom["components"].as_array().unwrap().len(), 0);
+    let meta = cbom_metadata(&cbom);
+    assert_eq!(meta["osslscope:omitted-unknown-coverage-sites"], "1");
+    assert_eq!(meta["osslscope:omitted-unknown-coverage-calls"], "7");
+    assert_eq!(meta["osslscope:omitted-ambiguous-sites"], "0");
+    assert_eq!(meta["osslscope:omitted-ambiguous-calls"], "0");
+}
+
+#[test]
 fn delivery_same_file_path_refuses_cbom() {
     // F1: primary and CBOM to one file would overwrite the primary;
     // the CBOM side is refused and the primary bytes survive.

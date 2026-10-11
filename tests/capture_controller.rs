@@ -1657,12 +1657,13 @@ fn h3_t2_mixed_arrival_withholds_definite_claim_sticky() {
 }
 
 #[test]
-fn h3_t4_fenced_mixed_survives_retrospective_revision_intact() {
-    // H3: the H2-T4 fence setup with a MIXED gen-0 site. Mixed
-    // is already Unknown, so retrospective revision is a no-op
-    // for it — and taint composes, not flips: the fenced leg
-    // keeps its min label + weak flag, calls intact, and the
-    // mixed_classes activity survives alongside the taint.
+fn h3_t6_fenced_mixed_survives_retrospective_revision_intact() {
+    // H3 (extra, beyond design §4): the H2-T4 fence setup with
+    // a MIXED gen-0 site. Mixed is already Unknown, so
+    // retrospective revision is a no-op for it — and taint
+    // composes, not flips: the fenced leg keeps its min label
+    // + weak flag, calls intact, and the mixed_classes activity
+    // survives alongside the taint.
     let mut h = Harness::fresh("h3-t4");
     h.snapshot_attached();
     let newso = h.stage.write("new.so", &h.bytes.clone());
