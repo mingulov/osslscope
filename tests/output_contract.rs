@@ -24,7 +24,7 @@ use osslscope::evidence::{
 use osslscope::policy::{PolicyRule, evaluate_document};
 use osslscope::report::{
     OutputDest, OutputFormat, OutputRequest, render_cbom, render_human, render_json,
-    write_artifacts,
+    setup_failure_document, write_artifacts,
 };
 use osslscope::schema::{
     FORBIDDEN_V2_KEYS, V2_SCHEMA_JSON, check_v2_semantics, check_version, check_version_v2,
@@ -1397,6 +1397,33 @@ fn cbom_covers_fenced_and_policy() {
     }
     let meta = cbom_metadata(&cbom);
     assert_eq!(meta["osslscope:policy-verdict"], "violation");
+}
+
+#[test]
+fn setup_failure_document_renders_fatal_report_and_check_shapes() {
+    // F-E/B4: a capture setup failure must still attempt every
+    // requested artifact from a typed no-evidence document — a
+    // fatal primary plus (for check) a no-verdict policy section
+    // and an explicit-empty fatal CBOM — instead of returning
+    // with nothing written.
+    let doc = setup_failure_document(FatalKind::Environment("mock setup failure".to_string()));
+    assert!(matches!(doc.status, Completeness::Fatal { .. }));
+    assert!(doc.policy.is_none());
+    let v = json_of(&doc);
+    validate_v2(&v).expect("fatal report shape validates");
+    check_v2_semantics(&v).expect("fatal report shape is sound");
+    let mut cdoc = setup_failure_document(FatalKind::Environment("mock setup failure".to_string()));
+    let verdict = evaluate_document(&[], &cdoc);
+    assert!(verdict.no_verdict);
+    cdoc.policy = Some(policy_record(&verdict));
+    let cv = json_of(&cdoc);
+    validate_v2(&cv).expect("fatal check shape validates");
+    check_v2_semantics(&cv).expect("fatal check shape is sound");
+    assert_eq!(cv["policy"]["verdict"], "no-verdict");
+    let cbom = cbom_of(&cdoc);
+    assert_eq!(cbom["components"].as_array().unwrap().len(), 0);
+    let disclaimer = &cbom_metadata(&cbom)["osslscope:completeness-disclaimer"];
+    assert!(disclaimer.contains("FATAL"), "{disclaimer}");
 }
 
 #[test]

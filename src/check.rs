@@ -16,12 +16,14 @@
 //! closed); a proved violation stays exit 10 even when an artifact path
 //! is unwritable or the child failed.
 use crate::capture;
-use crate::evidence::{CaptureDocument, Completeness, PolicyRecord, RuleVerdict};
+use crate::evidence::{CaptureDocument, FatalKind, PolicyRecord, RuleVerdict};
 use crate::policy::{
     PolicyOutcome, PolicyRule, PolicyVerdict, apply_legacy_engine_fallback, evaluate_document,
     executed_param_blind_ops, fips_unlabeled_calls,
 };
-use crate::report::{DeliveryResult, OutputDest, OutputFormat, OutputRequest, write_artifacts};
+use crate::report::{
+    OutputDest, OutputFormat, OutputRequest, bound_line, setup_failure_document, write_artifacts,
+};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
@@ -88,32 +90,9 @@ struct Args {
 /// failed child or failed required artifact is 1, an unproven rule is
 /// 11, a signal-cut or PARTIAL window with a passing verdict is 3,
 /// else 0. Usage errors (2) never reach this function.
-pub fn exit_for(
-    outcome: PolicyOutcome,
-    child_exit: Option<i32>,
-    doc: &CaptureDocument,
-    delivery: &DeliveryResult,
-) -> u8 {
-    if outcome == PolicyOutcome::NoVerdict {
-        return 4;
-    }
-    if outcome == PolicyOutcome::Violation {
-        return 10;
-    }
-    if matches!(child_exit, Some(code) if code != 0) {
-        return 1;
-    }
-    if delivery.failed() {
-        return 1;
-    }
-    if outcome == PolicyOutcome::Inconclusive {
-        return 11;
-    }
-    match &doc.status {
-        Completeness::Complete => 0,
-        Completeness::Partial { .. } | Completeness::Fatal { .. } => 3,
-    }
-}
+// F-E/B3: the exit decision lives in report (shared by both commands);
+// this re-export keeps the established `check::exit_for` path working.
+pub use crate::report::exit_for;
 
 // Capture-flag parsing intentionally mirrors report::parse: the two
 // flag sets share capture/cbom flags but diverge on rules vs report
@@ -480,12 +459,35 @@ pub fn run(argv: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let req = OutputRequest {
+        format: if args.format == "json" {
+            OutputFormat::Json
+        } else {
+            OutputFormat::Human
+        },
+        primary: match args.out {
+            None => OutputDest::Stdout,
+            Some(path) => OutputDest::File(path.into()),
+        },
+        cbom: args.cbom.map(|path| OutputDest::File(path.into())),
+    };
     let c = match capture::run(&args.cfg, args.target) {
         Ok(c) => c,
         Err(e) => {
+            // F-E/B4: setup/environment failures still attempt
+            // every requested artifact — a fatal primary, a
+            // no-verdict policy section, and a fatal CBOM — from a
+            // typed no-evidence document. No legacy fallback: with
+            // no capture there is no tripwire evidence to fold in.
             eprintln!("osslscope check: {e:#}");
             eprintln!("osslscope check: run 'osslscope doctor' to diagnose environment failures");
-            return ExitCode::from(4);
+            let mut document =
+                setup_failure_document(FatalKind::Environment(bound_line(&format!("{e:#}"))));
+            let verdict = evaluate_document(&[], &document);
+            document.policy = Some(policy_record(&verdict));
+            let delivery = write_artifacts(&document, &req);
+            crate::report::emit_diagnostics(&delivery);
+            return ExitCode::from(exit_for(verdict.overall(), None, &document, &delivery));
         }
     };
     let mut verdict = evaluate_document(&policy_rules(&args.rules), &c.document);
@@ -499,18 +501,6 @@ pub fn run(argv: &[String]) -> ExitCode {
     let child_exit = c.child_exit;
     let mut document = c.document;
     document.policy = Some(policy_record(&verdict));
-    let req = OutputRequest {
-        format: if args.format == "json" {
-            OutputFormat::Json
-        } else {
-            OutputFormat::Human
-        },
-        primary: match args.out {
-            None => OutputDest::Stdout,
-            Some(path) => OutputDest::File(path.into()),
-        },
-        cbom: args.cbom.map(|path| OutputDest::File(path.into())),
-    };
     let delivery = write_artifacts(&document, &req);
     crate::report::emit_diagnostics(&delivery);
     ExitCode::from(exit_for(
@@ -530,7 +520,7 @@ mod tests {
         TargetRecord,
     };
     use crate::policy::{Predicate, Rule};
-    use crate::report::ArtifactOutcome;
+    use crate::report::{ArtifactOutcome, DeliveryResult};
 
     fn cand(
         provider: &str,
