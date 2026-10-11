@@ -788,8 +788,6 @@ fn shrinkage_proof_does_not_carry() {
         mapping(0x7f01_0000, 0x20000, true, 0, "08:01", 200, LIBCRYPTO),
     ];
     env.staged.termd = vec![(arr, wire::make_termd(OP_DIGEST, 5))];
-    env.push(query_ret(OP_DIGEST, arr, 0));
-    env.push(ok_alg(OP_DIGEST, arr, 0));
     let d = core.poll(&mut env, ample_budget()).unwrap();
     assert_eq!(env.evicted, vec![arr]);
     assert!(env.staged.termd.is_empty());
@@ -802,8 +800,20 @@ fn shrinkage_proof_does_not_carry() {
     assert_eq!(snap.candidates[0].epoch, 0);
     assert_eq!(snap.tables.len(), 1);
     assert_eq!(snap.tables[0].epoch, 1);
-    // One walked slot against a stale len-5 proof is a prefix, and
-    // the new epoch must re-prove from scratch.
+    // The rebirth inherits nothing — not even same-poll walks
+    // (F-A/A4: the drain precedes reconcile, so turnover-poll
+    // events keep the old era; only post-turnover polls walk the
+    // new epoch).
+    assert!(matches!(snap.tables[0].state, CoverageState::Unseen));
+    // A post-turnover walk (unambiguously new-era) starts a
+    // prefix: one walked slot against the evicted len-5 proof,
+    // and the new epoch must re-prove from scratch.
+    env.push(query_ret(OP_DIGEST, arr, 0));
+    env.push(ok_alg(OP_DIGEST, arr, 0));
+    core.poll(&mut env, ample_budget()).unwrap();
+    let snap = core.snapshot();
+    assert_eq!(snap.tables.len(), 1);
+    assert_eq!(snap.tables[0].epoch, 1);
     assert!(matches!(
         snap.tables[0].state,
         CoverageState::InProgress { walked: 1 }
@@ -1096,4 +1106,194 @@ fn stage2_reattach_on_same_path_replacement() {
     assert!(d.attaches.iter().all(|a| a.failed.is_none()));
     assert_eq!(env.stage2.len(), 2, "replacement must re-attach, not reuse");
     std::fs::remove_dir_all(&dir).unwrap_or_default();
+}
+
+// ---------------------------------------------------------------------------
+// F-A/A4: incarnation binding — repeat-init suspects tables, stragglers
+// keep their era, re-walks heal the epoch.
+// ---------------------------------------------------------------------------
+
+/// Walk one row of a table: query + alg + row; returns the new
+/// candidate's epoch.
+fn walk_row(env: &mut TestEnv, core: &mut SessionCore, arr: u64, idx: u64, funcid: u32, imp: u64) {
+    env.push(query_ret(OP_DIGEST, arr, idx));
+    env.push(ok_alg(OP_DIGEST, arr, idx));
+    env.push(dispatch_row(OP_DIGEST, funcid, imp, arr, idx));
+    core.poll(env, ample_budget()).unwrap();
+}
+
+fn epoch_of(cands: &[osslscope::discovery::session::DiscoveredCandidate], arr: u64) -> u64 {
+    cands.iter().find(|c| c.arr == arr).unwrap().epoch
+}
+
+#[test]
+fn repeat_init_retires_provider_tables() {
+    // F-A/A4: a repeat init re-resolves to the provider file — its
+    // tables retire (same retirement as maps turnover: proof
+    // dropped, alg join pruned, kernel evicted, rebirth visible).
+    // Another file's tables are untouched.
+    let mut env = TestEnv::new();
+    let mut core = test_core(false);
+    env.push(enc_init(0x7f00_3000, 0));
+    core.poll(&mut env, ample_budget()).unwrap();
+    assert_eq!(env.stage2.len(), 1);
+
+    let arr_a = 0x7f00_1000u64;
+    let arr_b = 0x7f01_1000u64;
+    walk_row(&mut env, &mut core, arr_a, 0, 7, 0x7f00_2000);
+    walk_row(&mut env, &mut core, arr_b, 0, 7, 0x7f01_2000);
+    let snap = core.snapshot();
+    let e_a = epoch_of(&snap.candidates, arr_a);
+    let e_b = epoch_of(&snap.candidates, arr_b);
+    assert_ne!(e_a, e_b);
+
+    env.push(enc_init(0x7f00_3000, 0));
+    let d = core.poll(&mut env, ample_budget()).unwrap();
+    assert_eq!(env.stage2.len(), 1, "same bytes: install stands");
+    assert_eq!(d.retirements.len(), 1);
+    assert_eq!(
+        (d.retirements[0].op, d.retirements[0].epoch),
+        (OP_DIGEST, e_a)
+    );
+    assert_eq!(env.evicted, vec![arr_a]);
+    // The rebirth is delta-visible and unproven; the other file's
+    // epoch never turned over.
+    let rb = d
+        .tables
+        .iter()
+        .map(|t| t.epoch)
+        .find(|e| *e != e_a && *e != e_b)
+        .expect("rebirth table");
+    assert!(core.snapshot().tables.iter().any(|t| t.epoch == rb));
+    assert!(core.snapshot().tables.iter().any(|t| t.epoch == e_b));
+}
+
+#[test]
+fn repeat_init_suspects_anonymous_arrays_globally() {
+    // F-A/A4: anonymous arrays carry no verifiable identity, so any
+    // repeat init suspects them — while file-backed tables outside
+    // the init's provider file survive.
+    let mut env = TestEnv::new();
+    let mut core = test_core(false);
+    env.push(enc_init(0x7f02_1000, 1));
+    core.poll(&mut env, ample_budget()).unwrap();
+    assert_eq!(env.stage2.len(), 1);
+
+    let arr_p = 0x7f00_1000u64;
+    let arr_l = 0x7f01_1000u64;
+    let arr_x = 0x6000_1000u64;
+    walk_row(&mut env, &mut core, arr_p, 0, 7, 0x7f00_2000);
+    walk_row(&mut env, &mut core, arr_l, 0, 7, 0x7f01_2000);
+    walk_row(&mut env, &mut core, arr_x, 0, 7, 0x7f00_2000);
+    let snap = core.snapshot();
+    let e_p = epoch_of(&snap.candidates, arr_p);
+    let e_l = epoch_of(&snap.candidates, arr_l);
+    let e_x = epoch_of(&snap.candidates, arr_x);
+
+    // Repeat init resolving to the libcrypto file.
+    env.push(enc_init(0x7f01_3000, 1));
+    let d = core.poll(&mut env, ample_budget()).unwrap();
+    let retired: std::collections::HashSet<u64> = d.retirements.iter().map(|r| r.epoch).collect();
+    assert!(retired.contains(&e_l), "matching file retires: {retired:?}");
+    assert!(
+        retired.contains(&e_x),
+        "anonymous is globally suspect: {retired:?}"
+    );
+    assert!(!retired.contains(&e_p), "other file survives: {retired:?}");
+    assert!(env.evicted.contains(&arr_x));
+    assert!(!env.evicted.contains(&arr_p));
+}
+
+#[test]
+fn repeat_init_unresolvable_suspects_anon_only() {
+    // F-A/A4: an init whose address resolves nowhere cannot scope
+    // to a file — but anonymous arrays are still suspect. Live
+    // file-backed tables stand (their file is mapped, so an
+    // unresolvable init is not theirs).
+    let mut env = TestEnv::new();
+    let mut core = test_core(false);
+    env.push(enc_init(0x7f00_3000, 0));
+    core.poll(&mut env, ample_budget()).unwrap();
+
+    let arr_p = 0x7f00_1000u64;
+    let arr_x = 0x6000_1000u64;
+    walk_row(&mut env, &mut core, arr_p, 0, 7, 0x7f00_2000);
+    walk_row(&mut env, &mut core, arr_x, 0, 7, 0x7f00_2000);
+    let snap = core.snapshot();
+    let e_p = epoch_of(&snap.candidates, arr_p);
+    let e_x = epoch_of(&snap.candidates, arr_x);
+
+    env.push(enc_init(0xdead_beef, 0));
+    let d = core.poll(&mut env, ample_budget()).unwrap();
+    let retired: std::collections::HashSet<u64> = d.retirements.iter().map(|r| r.epoch).collect();
+    assert_eq!(retired, std::collections::HashSet::from([e_x]));
+    assert!(!retired.contains(&e_p));
+}
+
+#[test]
+fn stragglers_keep_old_epoch_across_turnover() {
+    // F-A/A4: the drain runs before reconcile, so a late-arriving
+    // row for a never-before-seen slot joins the OLD epoch — never
+    // the rebirth. (Reconcile-first stamped it with the new epoch:
+    // A's evidence attributed to B.)
+    let mut env = TestEnv::new();
+    let mut core = test_core(false);
+    let arr = 0x7f00_1000u64;
+    walk_row(&mut env, &mut core, arr, 0, 7, 0x7f00_2000);
+    let e0 = epoch_of(&core.snapshot().candidates, arr);
+
+    // Same address, replacement inode + a straggler for a fresh slot.
+    env.maps = vec![
+        mapping(0x7f00_0000, 0x10000, true, 0, "08:01", 101, PROVIDER),
+        mapping(0x7f01_0000, 0x20000, true, 0, "08:01", 200, LIBCRYPTO),
+    ];
+    env.push(ok_alg(OP_DIGEST, arr, 9));
+    env.push(dispatch_row(OP_DIGEST, 8, 0x7f00_2010, arr, 9));
+    let d = core.poll(&mut env, ample_budget()).unwrap();
+    assert_eq!(d.retirements.len(), 1);
+    assert_eq!(d.retirements[0].epoch, e0);
+    assert_eq!(d.candidates.len(), 1);
+    assert_eq!(
+        d.candidates[0].epoch, e0,
+        "straggler must keep its era, not the rebirth"
+    );
+}
+
+#[test]
+fn rebirth_rewalk_heals_candidate_epoch() {
+    // F-A/A4: new-epoch rows first arrive stamped with the retired
+    // epoch (one poll stale — the drain precedes reconcile); the
+    // next re-walk refreshes them to the live epoch and re-emits.
+    let mut env = TestEnv::new();
+    let mut core = test_core(false);
+    let arr = 0x7f00_1000u64;
+    walk_row(&mut env, &mut core, arr, 0, 7, 0x7f00_2000);
+    let e0 = epoch_of(&core.snapshot().candidates, arr);
+
+    env.maps = vec![
+        mapping(0x7f00_0000, 0x10000, true, 0, "08:01", 101, PROVIDER),
+        mapping(0x7f01_0000, 0x20000, true, 0, "08:01", 200, LIBCRYPTO),
+    ];
+    env.push(query_ret(OP_DIGEST, arr, 1));
+    env.push(ok_alg(OP_DIGEST, arr, 1));
+    env.push(dispatch_row(OP_DIGEST, 8, 0x7f00_2010, arr, 1));
+    let d = core.poll(&mut env, ample_budget()).unwrap();
+    assert_eq!(d.retirements.len(), 1);
+    assert_eq!(d.candidates.len(), 1);
+    assert_eq!(d.candidates[0].epoch, e0, "transitional old stamp");
+
+    // Same rows re-walked: epoch heals to the rebirth and re-emits
+    // (the refresh carries the epoch, not just remap identity).
+    env.push(query_ret(OP_DIGEST, arr, 1));
+    env.push(ok_alg(OP_DIGEST, arr, 1));
+    env.push(dispatch_row(OP_DIGEST, 8, 0x7f00_2010, arr, 1));
+    let d = core.poll(&mut env, ample_budget()).unwrap();
+    assert!(d.retirements.is_empty());
+    assert_eq!(d.candidates.len(), 1, "epoch heal must re-emit");
+    let e1 = d.candidates[0].epoch;
+    assert_ne!(e1, e0);
+    assert!(
+        core.snapshot().tables.iter().any(|t| t.epoch == e1),
+        "healed epoch is the live table"
+    );
 }
