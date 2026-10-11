@@ -467,7 +467,11 @@ pub trait SessionEnv {
     /// Pop one raw ring item, or `None` when the ring is empty now.
     fn next_event(&mut self) -> Option<Vec<u8>>;
     /// Current target mappings (epoch reconcile + attribution).
-    fn current_maps(&mut self) -> Vec<maps::Mapping>;
+    /// `None` when the read itself failed (F-D/Am1) — NOT empty
+    /// maps: the core reconciles against its last-good snapshot
+    /// and records the failure explicitly instead of reading it
+    /// as a vanished target.
+    fn current_maps(&mut self) -> Option<Vec<maps::Mapping>>;
     /// One round of BPF map reads.
     fn join_maps(&mut self) -> MapSnapshots;
     /// Install one stage-2 query pair; the live impl reports the
@@ -485,8 +489,15 @@ pub trait SessionEnv {
     ) -> anyhow::Result<()>;
     /// Install one tripwire batch; returns an optional attach note
     /// (e.g. legacy-query attach failure, loud but non-fatal).
-    fn install_trips(&mut self, set: &legacy::ProbeSet, pid: u32)
-    -> anyhow::Result<Option<String>>;
+    /// `maps` is the caller's explicit snapshot (F-D/Am1) — the
+    /// installer never re-reads /proc itself (a second read would
+    /// be a second failure-conflation site).
+    fn install_trips(
+        &mut self,
+        set: &legacy::ProbeSet,
+        pid: u32,
+        maps: &[maps::Mapping],
+    ) -> anyhow::Result<Option<String>>;
     /// Plan legacy tripwires against `maps`: `None` when
     /// libcrypto is not mapped (blind — the core retries on later
     /// polls as mappings appear).
@@ -705,6 +716,12 @@ pub struct SessionCore {
     retained: coverage::CoverageDelta,
     table_epochs: HashMap<(u32, u64), TableEpoch>,
     next_epoch: u64,
+    /// Last successfully read mappings (F-D/Am1): a failed
+    /// `current_maps` reconciles against this instead of reading
+    /// the failure as empty. Starts empty (a first-poll failure
+    /// reconciles against nothing, WITH an explicit loss — links
+    /// cannot spuriously detach before any attach).
+    last_good_maps: Vec<maps::Mapping>,
     candidates: Vec<DiscoveredCandidate>,
     /// Dedupe index by [`CandidateKey`]. Value is the candidate index.
     seen: HashMap<CandidateKey, usize>,
@@ -794,6 +811,7 @@ impl SessionCore {
             retained: coverage::CoverageDelta::default(),
             table_epochs: HashMap::new(),
             next_epoch: 0,
+            last_good_maps: Vec::new(),
             candidates: Vec::new(),
             seen: HashMap::new(),
             objects: Vec::new(),
@@ -1204,6 +1222,23 @@ impl SessionCore {
             || provider_print(&self.provider, &self.canon, maps) != self.dispatch_blind_print
     }
 
+    /// Mappings for one reconcile/attribution step (F-D/Am1): a
+    /// successful read refreshes the last-good snapshot; a failed
+    /// read keeps the last-good snapshot and records explicit
+    /// loss instead of reading the failure as empty maps.
+    fn poll_maps<E: SessionEnv>(&mut self, env: &mut E) -> Vec<maps::Mapping> {
+        match env.current_maps() {
+            Some(maps) => {
+                self.last_good_maps = maps.clone();
+                maps
+            }
+            None => {
+                self.tracker.note_maps_read();
+                self.last_good_maps.clone()
+            }
+        }
+    }
+
     /// One bounded poll: verify the pin, reconcile epochs, plan
     /// deferred tripwires, decode up to `budget.max_events` ring
     /// items, install up to `budget.max_attaches` pending links,
@@ -1227,7 +1262,7 @@ impl SessionCore {
             self.mark_recycled();
             return Err(self.recycled_err());
         }
-        let mut maps = env.current_maps();
+        let mut maps = self.poll_maps(env);
         let mut delta = DiscoveryDelta::default();
         let mut touched: HashSet<(u32, u64)> = HashSet::new();
 
@@ -1302,7 +1337,7 @@ impl SessionCore {
                 attaches_done += 1;
                 let count = set.probes.len();
                 let replan = self.probe_set.is_some();
-                match env.install_trips(&set, self.pid) {
+                match env.install_trips(&set, self.pid, &maps) {
                     Err(e) if is_transient_race(&e) => {
                         // Swap spanned the install (rolled back by
                         // the env): drop the staged plan and retry
@@ -1374,7 +1409,7 @@ impl SessionCore {
         // after the poll-start snapshot (file reads sit between the
         // snapshot and this drain) must still resolve.
         if !self.pending_stage2.is_empty() {
-            maps = env.current_maps();
+            maps = self.poll_maps(env);
         }
         // Bounded pending stage-2 installs (FIFO across polls),
         // sharing the budget with the tripwire batch above.
@@ -2110,7 +2145,9 @@ impl SessionCore {
         self.closed = true;
         // Final reconcile so the closing snapshot never carries a
         // stale-epoch table (retirements feed the retained gaps).
-        let maps = env.current_maps();
+        // A failed read reconciles against last-good (F-D/Am1),
+        // not empty — with explicit loss.
+        let maps = self.poll_maps(env);
         self.reconcile_epochs(env, &maps);
         env.quiesce();
         let mut shortfall: u64 = 0;
@@ -2670,8 +2707,8 @@ impl SessionEnv for LiveEnv {
         self.ring.next().map(|item| item.to_vec())
     }
 
-    fn current_maps(&mut self) -> Vec<maps::Mapping> {
-        maps::read_maps(self.pid).unwrap_or_default()
+    fn current_maps(&mut self) -> Option<Vec<maps::Mapping>> {
+        maps::read_maps(self.pid).ok()
     }
 
     fn join_maps(&mut self) -> MapSnapshots {
@@ -2765,6 +2802,7 @@ impl SessionEnv for LiveEnv {
         &mut self,
         set: &legacy::ProbeSet,
         pid: u32,
+        maps: &[maps::Mapping],
     ) -> anyhow::Result<Option<String>> {
         // F-D/A11: plan/install binding check (A1 pattern) — the
         // plan's offsets describe its bound libcrypto; a swap
@@ -2788,7 +2826,7 @@ impl SessionEnv for LiveEnv {
         attach_trips(&self.loaded, &mut self.links, set, pid)?;
         eprintln!("INSPECT stage=legacy trips={}", set.probes.len());
         let mut note = None;
-        if let Some(lc_path) = legacy::find_libcrypto(&self.current_maps()) {
+        if let Some(lc_path) = legacy::find_libcrypto(maps) {
             for cand in legacy_candidates(pid, &lc_path) {
                 let off = std::fs::read(&cand)
                     .ok()
@@ -3265,14 +3303,24 @@ impl DiscoverySession {
         // truly blind). Planned now when libcrypto is already mapped
         // and deferred to the first post-exec poll otherwise.
         if cfg.legacy {
-            let maps0 = env.current_maps();
-            if legacy::find_libcrypto(&maps0).is_some() {
-                if let Some(set) = env.plan_trips(&maps0)? {
-                    let note = env.install_trips(&set, pid)?;
-                    core.adopt_legacy_plan(set, note);
+            match env.current_maps() {
+                Some(maps0) if legacy::find_libcrypto(&maps0).is_some() => {
+                    if let Some(set) = env.plan_trips(&maps0)? {
+                        let note = env.install_trips(&set, pid, &maps0)?;
+                        core.adopt_legacy_plan(set, note);
+                    }
                 }
-            } else {
-                eprintln!("INSPECT stage=legacy blind=no-libcrypto-mapping");
+                Some(_) => {
+                    eprintln!("INSPECT stage=legacy blind=no-libcrypto-mapping");
+                }
+                // F-D/Am1: a failed bootstrap read defers like a
+                // pre-exec image (the first successful poll plans),
+                // with explicit loss — never misdiagnosed as a
+                // missing libcrypto mapping.
+                None => {
+                    core.tracker.note_maps_read();
+                    eprintln!("INSPECT stage=legacy blind=maps-read-failed");
+                }
             }
         }
         core.set_bootstrap(
@@ -3449,6 +3497,14 @@ mod tests {
         stage2_installs: Vec<(u64, u64, String)>,
         stage2_detaches: Vec<u64>,
         stage2_fail_first: u32,
+        /// Scripted maps-read failures (F-D/Am1): `current_maps`
+        /// fails this many times before succeeding (mirrors
+        /// `stage2_fail_first`).
+        maps_fail_first: u32,
+        /// Maps threaded into the last `install_trips` call
+        /// (F-D/Am1 T3'): proves the caller passes its explicit
+        /// maps instead of the installer re-reading.
+        last_install_maps: Vec<maps::Mapping>,
         reinstall_script: VecDeque<anyhow::Result<DispatchReinstall>>,
         reinstall_calls: u32,
         pin_ok: bool,
@@ -3466,6 +3522,8 @@ mod tests {
                 stage2_installs: Vec::new(),
                 stage2_detaches: Vec::new(),
                 stage2_fail_first: 0,
+                maps_fail_first: 0,
+                last_install_maps: Vec::new(),
                 reinstall_script: VecDeque::new(),
                 reinstall_calls: 0,
                 pin_ok: true,
@@ -3478,8 +3536,12 @@ mod tests {
             None
         }
 
-        fn current_maps(&mut self) -> Vec<maps::Mapping> {
-            self.maps.clone()
+        fn current_maps(&mut self) -> Option<Vec<maps::Mapping>> {
+            if self.maps_fail_first > 0 {
+                self.maps_fail_first -= 1;
+                return None;
+            }
+            Some(self.maps.clone())
         }
 
         fn join_maps(&mut self) -> MapSnapshots {
@@ -3507,8 +3569,10 @@ mod tests {
             &mut self,
             _set: &legacy::ProbeSet,
             _pid: u32,
+            maps: &[maps::Mapping],
         ) -> anyhow::Result<Option<String>> {
             self.trip_installs += 1;
+            self.last_install_maps = maps.to_vec();
             Ok(None)
         }
 
@@ -4076,5 +4140,99 @@ mod tests {
         let mut shifted = trip_set(200, &[0x110, 0x220]);
         shifted.probes[0].cookie = 42;
         assert!(!trip_mapping_equal(&a, &shifted));
+    }
+
+    #[test]
+    fn maps_failure_keeps_last_good_and_reports_loss() {
+        // F-D/Am1 T1: a failed maps read is NOT empty maps — links
+        // stay attached against the last-good snapshot and the
+        // failure is an explicit delta loss, never a silent
+        // mass-detach.
+        let mut env = MiniEnv::new();
+        env.maps = vec![lc_mapping(100)];
+        env.plan = Some(trip_set(100, &[0x100]));
+        let mut core = a11_core();
+        core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(env.trip_installs, 1);
+        env.maps_fail_first = 1;
+        let delta = core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(
+            env.trip_detaches, 0,
+            "maps failure must not detach: last-good keeps links"
+        );
+        assert!(
+            core.snapshot().legacy.planned,
+            "legacy plan must survive a maps failure"
+        );
+        assert!(
+            delta
+                .losses
+                .iter()
+                .any(|l| l.source == coverage::HOST_MAPS_READ && l.count == 1 && l.op.is_none()),
+            "maps failure must be explicit unlocalizable loss: {:?}",
+            delta.losses
+        );
+    }
+
+    #[test]
+    fn install_trips_receives_caller_maps() {
+        // F-D/Am1 T3': the trip installer uses the caller's
+        // explicit maps (last-good-or-fresh, failure already
+        // handled) instead of re-reading /proc itself — no second
+        // conflation site.
+        let mut env = MiniEnv::new();
+        env.maps = vec![lc_mapping(100)];
+        env.plan = Some(trip_set(100, &[0x100]));
+        let mut core = a11_core();
+        core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(env.trip_installs, 1);
+        assert!(
+            legacy::find_libcrypto(&env.last_install_maps).is_some(),
+            "installer must see the caller's libcrypto mapping: {:?}",
+            env.last_install_maps
+        );
+    }
+
+    #[test]
+    fn close_maps_failure_reconciles_last_good_with_loss() {
+        // F-D/Am1 T4: close against a failed maps read reconciles
+        // the stale epoch against the last-good snapshot (precise
+        // retire, not skip-all) and records the failure — the
+        // single close-time count with an exited target is
+        // expected (final drain runs against last-good).
+        let mut env = MiniEnv::new();
+        env.maps = vec![lc_mapping(100)];
+        env.plan = Some(trip_set(100, &[0x100]));
+        let mut core = a11_core();
+        core.poll(&mut env, a11_budget()).unwrap();
+        // Stale table epoch: array 0x1500 lives in lc_mapping
+        // (0x1000..0x2000, ino 100) but the epoch still carries
+        // the predecessor file's fingerprint.
+        core.table_epochs.insert(
+            (1, 0x1500),
+            TableEpoch {
+                epoch: 0,
+                fingerprint: Some(("08:01".to_string(), 99, 0x1000, 0x2000, 0)),
+            },
+        );
+        env.maps_fail_first = 1;
+        let snap = core.close(&mut env).unwrap();
+        // The stale epoch retires against last-good and rebirths
+        // with the last-good fingerprint (ino 100, not the seeded
+        // predecessor 99) — precise reconcile, not skip-all.
+        assert_eq!(
+            core.table_epochs
+                .get(&(1, 0x1500))
+                .and_then(|t| t.fingerprint.clone()),
+            Some(("08:01".to_string(), 100, 0x1000, 0x2000, 0)),
+            "stale epoch must retire+rebirth against last-good"
+        );
+        assert!(
+            snap.losses
+                .iter()
+                .any(|(s, n)| *s == coverage::HOST_MAPS_READ && *n == 1),
+            "close-time maps failure must be explicit loss: {:?}",
+            snap.losses
+        );
     }
 }

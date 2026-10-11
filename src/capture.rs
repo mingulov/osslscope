@@ -943,6 +943,7 @@ fn classify_loss(source: u32, count: u64) -> GapCounter {
         | coverage::HOST_SHORT_EVENT
         | coverage::HOST_UNKNOWN_KIND
         | coverage::HOST_MAP_SNAPSHOT
+        | coverage::HOST_MAPS_READ
         | coverage::HOST_EVICT_FAILED => (CounterUnits::Events, CounterSource::Discovery),
         _ => (CounterUnits::Events, CounterSource::Discovery),
     };
