@@ -570,7 +570,7 @@ fn poll_budget_stops_busy_ring() {
 #[test]
 fn load_query_is_not_execution() {
     // Provider loads and query arrivals are query/load counters,
-    // never executed calls: legacy `executed_calls` derives only
+    // never executed calls: legacy `executed_queries` derives only
     // from the executed-query ledger, and query counters stay
     // separate from tripwire counters.
     let mut env = TestEnv::new();
@@ -594,7 +594,7 @@ fn load_query_is_not_execution() {
     // Query and tripwire counters are separate fields.
     assert_eq!(snap.legacy.trip.get(&8), Some(&2));
 
-    // Only the executed-query ledger moves execution.
+    // Only the executed-query ledger moves the query count.
     env.staged.lgcalls = 3;
     let d = core.poll(&mut env, ample_budget()).unwrap();
     assert_eq!(d.tripwire.executed_legacy_queries_delta, 3);
@@ -603,7 +603,7 @@ fn load_query_is_not_execution() {
     assert_eq!(snap.legacy.executed_queries, 3);
 
     // The rendered legacy section agrees: loads are loads,
-    // executed_calls is execution.
+    // executed_queries is execution.
     let set = snap.legacy.set.as_ref().expect("planned probe set");
     let doc = osslscope::discovery::legacy::section(&osslscope::discovery::legacy::SectionInputs {
         set,
@@ -613,7 +613,7 @@ fn load_query_is_not_execution() {
         legacy_classes: vec![],
         extra_findings: &[],
     });
-    assert_eq!(doc["legacy_provider"]["executed_calls"], 3);
+    assert_eq!(doc["legacy_provider"]["executed_queries"], 3);
     assert_eq!(doc["legacy_provider"]["loads"]["legacy"], 2);
 }
 

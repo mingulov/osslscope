@@ -929,9 +929,11 @@ pub struct SectionInputs<'a> {
 /// loop); [`section`] renders it byte-identically to before.
 ///
 /// Query and tripwire counters stay separate throughout:
-/// `executed_queries` (the LGCALLS executed-query ledger) is the
-/// sole source of `legacy_provider.executed_calls` — provider-load
-/// tripwire hits and query arrivals never become execution.
+/// `executed_queries` (the LGCALLS executed-query ledger) renders
+/// as `legacy_provider.executed_queries` (F-C/A9: non-null query
+/// returns are query executions, never algorithm executions —
+/// provider-load tripwire hits and query arrivals never become
+/// execution; true executions report per-entrypoint/family).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LegacySummary {
     /// ENGINE entrypoint calls by symbol (trip counters, summed
@@ -1203,7 +1205,7 @@ pub fn section(inp: &SectionInputs) -> serde_json::Value {
         "engine": {"calls_by_entrypoint": s.engine_calls, "engine_id_class": s.engine_id_class},
         "meth_new": {"calls_by_entrypoint": s.meth_calls},
         "lowlevel": {"calls_by_family": s.family_calls},
-        "legacy_provider": {"loads": s.loads, "executed_calls": s.executed_queries,
+        "legacy_provider": {"loads": s.loads, "executed_queries": s.executed_queries,
                             "algs": s.legacy_classes},
         "entries": entries,
         "capability": {"syms_present": s.attached + s.missed,
@@ -1735,7 +1737,7 @@ mod tests {
         assert_eq!(doc["lowlevel"]["calls_by_family"]["digest/sha"], 9);
         assert_eq!(doc["legacy_provider"]["loads"]["legacy"], 1);
         assert_eq!(doc["legacy_provider"]["loads"]["other"], 1);
-        assert_eq!(doc["legacy_provider"]["executed_calls"], 7);
+        assert_eq!(doc["legacy_provider"]["executed_queries"], 7);
         assert_eq!(
             doc["legacy_provider"]["algs"],
             serde_json::json!(["A", "B"])
