@@ -389,6 +389,18 @@ pub struct AlgVerdict {
 /// its populated table entry; BPF passes map lookups, host tests
 /// pass `HashMap` lookups.
 ///
+/// The label is the canonical minimum: the smallest class id
+/// over ALL recognized segments (F-A/A5), never the primary
+/// alone — alias order cannot change the verdict. Unrecognized
+/// segments contribute nothing (weak still folds across every
+/// matched segment, including weak-only table extras, which carry
+/// `OTHER_CLASS` and can never win the minimum). `ALG_OK` iff at
+/// least one segment is recognized; a list no segment of which
+/// the registry knows is `ALG_UNKNOWN`, never a silent pick.
+/// (A mixed-algorithm list collapses to one label by
+/// construction — hostile providers are out of model since they
+/// can claim any name directly, exactly like hash preimages.)
+///
 /// Matching is hash+length: an FNV-1a-64 prefilter plus an exact
 /// length check against the table entry. There is deliberately NO
 /// byte-compare confirm: a variable stack index escaping the frame
@@ -440,7 +452,7 @@ where
     let mut h = FNV1A64_BASIS;
     let mut seg_len: u64 = 0;
     let mut seg_idx: u64 = 0;
-    let mut class0: u64 = OTHER_CLASS as u64;
+    let mut class_min: u64 = OTHER_CLASS as u64;
     let mut weak_acc: u64 = 0;
     let mut i: usize = 0;
     while i < ALG_WINDOW {
@@ -460,8 +472,10 @@ where
         if let Some(v) = lookup(h) {
             let len_ok = alu_eq(v.len as u64, seg_len) & alu_lt(seg_len, MAX_ALG_NAME as u64 + 1);
             let m = apply0 & len_ok;
-            let m_primary = m & alu_is_zero(seg_idx);
-            class0 = select_u64(mask(m_primary), v.class as u64, class0);
+            // Canonical minimum (F-A/A5): straight-line fold, no
+            // per-segment branch — the scan stays in budget.
+            let take = m & alu_lt(v.class as u64, class_min);
+            class_min = select_u64(mask(take), v.class as u64, class_min);
             weak_acc |= (v.weak as u64) & m;
         }
         // Fold this byte into the running segment (masked: past-`len`
@@ -483,8 +497,8 @@ where
     if seg_idx < MAX_ALG_SEGMENTS as u64 {
         if let Some(v) = lookup(h) {
             if v.len as u64 == seg_len && seg_len <= MAX_ALG_NAME as u64 {
-                if seg_idx == 0 {
-                    class0 = v.class as u64;
+                if (v.class as u64) < class_min {
+                    class_min = v.class as u64;
                 }
                 weak_acc |= v.weak as u64;
             }
@@ -492,17 +506,17 @@ where
     }
     let total = seg_idx + 1;
     if total > MAX_ALG_SEGMENTS as u64 {
-        // Pathological alias list: the primary (fully observed and
-        // hash+length matched) is kept, but weak fails closed —
+        // Pathological alias list: the canonical minimum over the
+        // observed segments is kept, but weak fails closed —
         // unseen tail segments may be weak — and the status stays
         // explicit.
         return AlgVerdict {
-            class: class0 as u16,
+            class: class_min as u16,
             weak: true,
             status: ALG_TRUNCATED,
         };
     }
-    let class = class0 as u16;
+    let class = class_min as u16;
     AlgVerdict {
         class,
         weak: weak_acc != 0,

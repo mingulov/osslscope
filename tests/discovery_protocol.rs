@@ -424,27 +424,81 @@ fn classifier_agrees_with_reference_over_corpus() {
         let label = kinds::alg_class_label(v.class).unwrap();
         assert_eq!(label, class, "class mismatch for {input:?}");
         assert_eq!(v.weak, weak, "weak mismatch for {input:?}");
-        // Status is OK iff the primary segment is registered (no
+        // Status is OK iff ANY segment is registered (F-A/A5: no
         // corpus entry exceeds the segment bound or saturates).
-        let primary_known = input.split(':').next().is_some_and(kinds::is_known_alg);
-        let want = if primary_known {
+        let any_known = input.split(':').any(kinds::is_known_alg);
+        let want = if any_known {
             wire::ALG_OK
         } else {
             wire::ALG_UNKNOWN
         };
         assert_eq!(v.status, want, "status for {input:?}");
     }
-    // Unknown primaries (incl. empty/edge splits) are explicit UNKNOWN.
-    // (RC4 registered since T09; SHA0 keeps the weak-only exemplar.)
-    for input in ["", ":", "nope", ":SHA2-256", "SHA0"] {
+    // Lists no segment of which is registered (incl. empty/edge
+    // splits) are explicit UNKNOWN. (RC4 registered since T09;
+    // SHA0 keeps the weak-only exemplar: its table extra folds
+    // weak but never wins the label.)
+    for input in ["", ":", "nope", "SHA0"] {
         let v = classify_host(input.as_bytes(), false);
         assert_eq!(v.status, wire::ALG_UNKNOWN, "status for {input:?}");
         assert_eq!(kinds::alg_class_label(v.class), Some("other"));
     }
-    // Non-UTF8 bytes can never confirm against UTF-8 registry names.
+    let v = classify_host(b"SHA0", false);
+    assert!(v.weak, "weak-only extra must still count weak");
+    // Non-UTF8 bytes can never confirm against UTF-8 registry
+    // names — but the MD5 segment still identifies the list.
     let v = classify_host(&[0xff, 0xfe, b':', b'M', b'D', b'5'], false);
-    assert_eq!((v.class, v.status), (wire::OTHER_CLASS, wire::ALG_UNKNOWN));
+    assert_eq!(v.status, wire::ALG_OK);
+    assert_eq!(kinds::alg_class_label(v.class), Some("MD5"));
     assert!(v.weak, "MD5 segment must still count weak");
+}
+
+#[test]
+fn classifier_label_is_order_free() {
+    // F-A/A5: alias order never changes the verdict — the label
+    // is the canonical minimum over recognized segments.
+    for (a, b) in [
+        ("SHA2-256", "SHA256"),
+        ("RC4", "SHA2-256"),
+        ("MDC2", "AES-128-CBC"),
+        ("SHA1", "MD5"),
+        ("nope", "MD5"),
+        ("", "SHA2-256"),
+    ] {
+        let fwd = classify_host(format!("{a}:{b}").as_bytes(), false);
+        let rev = classify_host(format!("{b}:{a}").as_bytes(), false);
+        assert_eq!(
+            (fwd.class, fwd.weak, fwd.status),
+            (rev.class, rev.weak, rev.status),
+            "order swap {a}:{b}"
+        );
+    }
+    // The canonical label is the minimum registry index.
+    let v = classify_host(b"SHA256:SHA2-256", false);
+    assert_eq!(kinds::alg_class_label(v.class), Some("SHA2-256"));
+    let v = classify_host(b"MDC2:AES-128-CBC", false);
+    assert_eq!(kinds::alg_class_label(v.class), Some("AES-128-CBC"));
+    let v = classify_host(b"RC4:SHA2-256", false);
+    assert_eq!(kinds::alg_class_label(v.class), Some("SHA2-256"));
+}
+
+#[test]
+fn classifier_recognizes_non_primary_alias() {
+    // F-A/A5: a recognized non-primary alias identifies the
+    // algorithm — no longer UNKNOWN.
+    for (input, want) in [
+        ("nope:MD5", "MD5"),
+        (":SHA2-256", "SHA2-256"),
+        ("SHA0:SHA1", "SHA1"),
+    ] {
+        let v = classify_host(input.as_bytes(), false);
+        assert_eq!(v.status, wire::ALG_OK, "status for {input:?}");
+        assert_eq!(
+            kinds::alg_class_label(v.class),
+            Some(want),
+            "label for {input:?}"
+        );
+    }
 }
 
 #[test]

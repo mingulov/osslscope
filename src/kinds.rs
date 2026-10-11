@@ -6362,30 +6362,28 @@ pub fn is_weak_alg(base_name: &str) -> bool {
 }
 
 /// Emission classifier: split a provider `algorithm_names` alias list on
-/// `:` and classify. Returns `(class, weak)` where `class` is the primary
-/// (first) segment iff it is an exact registry spelling, else `"other"`;
-/// `weak` is true iff ANY segment exactly matches [`WEAK_ALGS`]. Raw
-/// provider bytes never leave this function except as `"other"`.
+/// `:` and classify. Returns `(class, weak)` where `class` is the
+/// canonical minimum — the lowest-index registry spelling over ALL
+/// recognized segments (F-A/A5), else `"other"` when none is
+/// recognized; alias order never changes the label. `weak` is true
+/// iff ANY segment exactly matches [`WEAK_ALGS`]. Raw provider
+/// bytes never leave this function except as `"other"`.
 ///
 /// Since T02 the kernel classifies first (same rules, shared-table
 /// backend) and userspace only decodes class ids; this function
 /// remains the agreement oracle for the protocol tests.
 pub fn classify_alg(names: &str) -> (&'static str, bool) {
-    let mut primary = "other";
+    let mut best: Option<usize> = None;
     let mut weak = false;
-    for (i, seg) in names.split(':').enumerate() {
-        if ALG_NAMES.iter().any(|a| a.name == seg) {
-            if i == 0 {
-                primary = ALG_NAMES.iter().find(|a| a.name == seg).unwrap().name;
-            }
-        } else if i == 0 {
-            primary = "other";
+    for seg in names.split(':') {
+        if let Some(idx) = ALG_NAMES.iter().position(|a| a.name == seg) {
+            best = Some(best.map_or(idx, |b| b.min(idx)));
         }
         if is_weak_alg(seg) {
             weak = true;
         }
     }
-    (primary, weak)
+    (best.map_or("other", |b| ALG_NAMES[b].name), weak)
 }
 
 /// True iff the exact spelling is a registered algorithm name.
@@ -6559,6 +6557,13 @@ mod tests {
         assert_eq!(classify_alg("canary-DOOM-7QZ"), ("other", false));
         assert_eq!(classify_alg("AES-256-GCM:MD5"), ("AES-256-GCM", true));
         assert_eq!(classify_alg(""), ("other", false));
+        // F-A/A5: canonical minimum — order-free, non-primary
+        // aliases identify the list.
+        assert_eq!(classify_alg("SHA256:SHA2-256"), ("SHA2-256", false));
+        assert_eq!(classify_alg("MD5:AES-256-GCM"), ("AES-256-GCM", true));
+        assert_eq!(classify_alg("RC4:SHA2-256"), ("SHA2-256", true));
+        assert_eq!(classify_alg("nope:MD5"), ("MD5", true));
+        assert_eq!(classify_alg(":SHA2-256"), ("SHA2-256", false));
     }
 
     #[test]
