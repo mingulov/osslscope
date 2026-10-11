@@ -625,3 +625,47 @@ fn quarantined_cookie_skips_reattach_until_fence() {
         "stale identity must fail verify as replaced: {report3:?}"
     );
 }
+
+#[test]
+fn quarantined_retry_counts_missed_once() {
+    // Slice-A review Minor-1: a quarantined re-attach must count
+    // exactly once into count.missed_attaches (one per missed site),
+    // not once at the push plus once at the per-call aggregate.
+    let stage = Stage::fresh("a1quarcount");
+    let bytes = self_bytes();
+    let off = x_offsets(&bytes, 1)[0];
+    let a = stage.write("prov.so", &bytes);
+    let live = vec![mapping(&a)];
+    let files = HashMap::from([(
+        a.path.clone(),
+        plan::FileBytes {
+            bytes: std::fs::read(&a.path).unwrap(),
+            dev: a.device,
+            ino: a.ino,
+        },
+    )]);
+    let backend = SwapBackend {
+        inner: FakeCountBackend::new(),
+        swap: std::cell::RefCell::new(Some((PathBuf::from(&a.path), bytes.clone()))),
+    };
+    let mut s = CountSession::new(PID, backend);
+    let d = CountDelta {
+        discovered: vec![site(&a, off, 7)],
+        losses: Vec::new(),
+    };
+    // Call 1: mid-attach replacement drops the links (1 miss) and
+    // quarantines the cookie. Call 2: same generation re-attach
+    // reports quarantined (1 miss). The final counter is 2, not 3.
+    let report = s.attach_delta(&d, &live, &files).unwrap();
+    assert!(report.missed.iter().any(|m| m.reason == "replaced"));
+    let report2 = s.attach_delta(&d, &live, &files).unwrap();
+    assert!(report2.missed.iter().any(|m| m.reason == "quarantined"));
+    s.open_window(1000, 2000).unwrap();
+    let drain = s.close_and_drain(Duration::from_secs(5)).unwrap();
+    assert_eq!(
+        counter_value(&drain, "count.missed_attaches"),
+        Some(2),
+        "quarantined retry must count once: {:?}",
+        drain.counters
+    );
+}
