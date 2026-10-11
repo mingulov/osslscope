@@ -133,7 +133,7 @@ pub fn emit(
     for r in rows {
         let (backed, dev, ino, off) =
             match maps::provider_mapping(live_maps, provider, canon, r.impl_addr) {
-                Some(m) => {
+                Some((m, _)) => {
                     let o = r.impl_addr - m.start + m.offset;
                     let ok = m.x && elf::offset_in_x_segment(&elf, o);
                     (ok, m.dev.clone(), m.ino, o)

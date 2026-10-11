@@ -172,11 +172,14 @@ fn canned_probe_set() -> ProbeSet {
     }
 }
 
+/// Recorded stage-2 install: (cookie, offset, path, expected raw identity).
+type Stage2Install = (u64, u64, String, Option<(u64, u64)>);
+
 struct TestEnv {
     events: VecDeque<Vec<u8>>,
     maps: Vec<Mapping>,
     staged: MapSnapshots,
-    stage2: Vec<(u64, u64, String)>,
+    stage2: Vec<Stage2Install>,
     stage2_failures: u32,
     trip_links_live: u64,
     trip_install_calls: u32,
@@ -237,13 +240,18 @@ impl SessionEnv for TestEnv {
         offset: u64,
         path: &Path,
         _pid: u32,
+        expected: Option<(u64, u64)>,
     ) -> anyhow::Result<()> {
         if self.stage2_failures > 0 {
             self.stage2_failures -= 1;
             anyhow::bail!("injected stage-2 failure for cookie {cookie}");
         }
-        self.stage2
-            .push((cookie, offset, path.to_string_lossy().into_owned()));
+        self.stage2.push((
+            cookie,
+            offset,
+            path.to_string_lossy().into_owned(),
+            expected,
+        ));
         Ok(())
     }
 
@@ -1072,6 +1080,10 @@ fn stage2_reattach_on_same_path_replacement() {
     let d = core.poll(&mut env, ample_budget()).unwrap();
     assert!(d.attaches.iter().all(|a| a.failed.is_none()));
     assert_eq!(env.stage2.len(), 1);
+    // A1: the install carries the resolve-time raw identity for
+    // expected-binding (not just the maps-text triple).
+    let meta1 = std::fs::metadata(&prov).unwrap();
+    assert_eq!(env.stage2[0].3, Some((meta1.dev(), meta1.ino())));
     // Replace the path (new inode, same path); the target remaps
     // the new file at the same address (same offset).
     std::fs::remove_file(&prov).unwrap();

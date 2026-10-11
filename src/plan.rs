@@ -212,6 +212,16 @@ pub fn verify_backing(path: &str, device: u64, ino: u64) -> std::io::Result<()> 
     Ok(())
 }
 
+/// Attach-binding decision (F-A/A1): pre==post is NOT enough — both
+/// samples may describe the replacement (moved between the verify
+/// and the pre sample). The binding holds only when both samples
+/// are readable AND equal the expected identity the attach was
+/// planned against. Generic over the identity tuple: count uses
+/// encoded (dev, ino), discovery uses raw (dev, ino).
+pub fn binding_holds<T: PartialEq>(before: &Option<T>, after: &Option<T>, expected: &T) -> bool {
+    before.as_ref() == Some(expected) && after.as_ref() == Some(expected)
+}
+
 /// Plan every doc row against live mappings. `files` maps link-path
 /// → file bytes (caller pre-reads each distinct mapped path once).
 /// Fail-closed: malformed rows are an error, never a skip.
@@ -682,6 +692,23 @@ mod tests {
         assert!(verify_backing(path, encode_device(0xdead, 0xbeef), meta.ino()).is_err());
         // Missing path fails (open error, not a silent pass).
         assert!(verify_backing("/nonexistent-osslscope-probe-path", id, meta.ino()).is_err());
+    }
+
+    #[test]
+    fn attach_binding_needs_expected_identity() {
+        // A1: pre==post is not enough — both samples may describe
+        // the REPLACEMENT (moved between verify and pre). The
+        // binding holds only when both samples equal the expected
+        // identity the provenance was planned against.
+        let old = (11u64, 100u64);
+        let new = (11u64, 200u64);
+        assert!(binding_holds(&Some(old), &Some(old), &old));
+        assert!(!binding_holds(&Some(new), &Some(new), &old));
+        assert!(!binding_holds(&Some(old), &Some(new), &old));
+        assert!(!binding_holds(&Some(new), &Some(old), &old));
+        assert!(!binding_holds(&None, &None, &old));
+        assert!(!binding_holds(&Some(old), &None, &old));
+        assert!(!binding_holds(&None, &Some(old), &old));
     }
 
     #[test]

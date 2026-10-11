@@ -56,13 +56,16 @@ pub fn parse_maps(text: &str) -> Vec<Mapping> {
 /// Mapping of the provider file covering `addr`: same-file
 /// (dev,ino) first (hardlink/symlink aliases share bytes+inode; the
 /// path is only a locator), then exact, canonical, or suffix path
-/// match (lanes bind-mount providers at odd prefixes).
+/// match (lanes bind-mount providers at odd prefixes). Returns the
+/// mapping plus the provider file's resolve-time raw (dev, ino) —
+/// the identity the match was bound against (F-A/A1: attach
+/// sampling must equal THIS, not merely agree with itself).
 pub fn provider_mapping<'a>(
     maps: &'a [Mapping],
     provider: &Path,
     _canon: &str,
     addr: u64,
-) -> Option<&'a Mapping> {
+) -> Option<(&'a Mapping, (u64, u64))> {
     // Same-file ONLY (stat-or-None): stat the provider argument
     // (follows symlinks, so symlink/hardlink/bind aliases resolve
     // to the mapped file's identity). Any mapping of the same inode
@@ -109,7 +112,7 @@ pub fn provider_mapping<'a>(
     if map_meta.dev() != meta.dev() || map_meta.ino() != ino {
         return None;
     }
-    Some(m)
+    Some((m, (meta.dev(), ino)))
 }
 
 #[cfg(test)]
