@@ -67,7 +67,7 @@
 use aya_ebpf::{
     helpers,
     macros::{map, uprobe, uretprobe},
-    maps::{HashMap, RingBuf},
+    maps::{HashMap, PerCpuHashMap, RingBuf},
     programs::{ProbeContext, RetProbeContext},
     EbpfContext as _,
 };
@@ -84,6 +84,9 @@ use osslscope_ebpf_common::{
 
 /// core_dispatch.h: provider codes live at 1024+; verified 2026-09-16.
 const OSSL_FUNC_PROVIDER_QUERY_OPERATION: u32 = 1027;
+
+/// `BPF_NOEXIST` for `insert` (kernel UAPI; aya-ebpf exposes no const).
+const BPF_NOEXIST: u64 = 1;
 
 /// Alg-array bound per op (measured max 364, oqsprovider encoder;
 /// 512 is the next power of two with headroom). No BPF loop runs
@@ -116,8 +119,12 @@ static PENDING_QUERY: HashMap<u64, PendQuery> = HashMap::with_max_entries(1024, 
 static TERMD: HashMap<u64, u64> = HashMap::with_max_entries(1024, 0);
 /// Source-tagged failure counters (T03: every ring-reserve and
 /// map-update failure lands here; keys are the `LOSS_*` ids).
+/// Per-CPU (F-C/A8): shared-map lookup–increment–replace loses
+/// concurrent increments across CPUs; per-CPU slots are
+/// single-writer (no migration mid-BPF), so a plain add is
+/// exact. Userspace sums across CPUs at drain.
 #[map]
-static LOSS: HashMap<u32, u64> = HashMap::with_max_entries(32, 0);
+static LOSS: PerCpuHashMap<u32, u64> = PerCpuHashMap::with_max_entries(32, 0);
 /// Per-(thread, array) query count; walked index = count % MAX_ALGS.
 /// Keyed by the composite (pid_tgid, array address) pair — each
 /// provider-op array is a distinct static, so different providers'
@@ -128,22 +135,27 @@ static LOSS: HashMap<u32, u64> = HashMap::with_max_entries(32, 0);
 #[map]
 static QUERY_NEXT: HashMap<u128, u64> = HashMap::with_max_entries(4096, 0);
 /// Walk-overflow flags per op id; userspace degrades to PARTIAL.
+/// Per-CPU (F-C/A8, same race as the counters); userspace ORs
+/// across CPUs at drain.
 #[map]
-static TRUNC: HashMap<u32, u64> = HashMap::with_max_entries(64, 0);
+static TRUNC: PerCpuHashMap<u32, u64> = PerCpuHashMap::with_max_entries(64, 0);
 /// Non-null query calls per op id. The 512-round inventory trigger
 /// fires ~68K calls in milliseconds; counting in-map (instead of a
 /// ring event per call) keeps the ring burst under 1MB. QUERY_RET is
 /// emitted on the first hit per array only (liveness + ops-hit).
+/// Per-CPU (F-C/A8); userspace sums at drain.
 #[map]
-static CALLS: HashMap<u32, u64> = HashMap::with_max_entries(64, 0);
+static CALLS: PerCpuHashMap<u32, u64> = PerCpuHashMap::with_max_entries(64, 0);
 /// Tripwire hits per attach cookie (userspace id space: ENGINE /
 /// meth_new / provider-load / low-level-family probes).
+/// Per-CPU (F-C/A8); userspace sums at drain.
 #[map]
-static TRIP: HashMap<u64, u64> = HashMap::with_max_entries(128, 0);
+static TRIP: PerCpuHashMap<u64, u64> = PerCpuHashMap::with_max_entries(128, 0);
 /// Non-null query calls per op id on the legacy attachment
 /// (cookie 1); the target provider's stay in CALLS.
+/// Per-CPU (F-C/A8); userspace sums at drain.
 #[map]
-static LGCALLS: HashMap<u32, u64> = HashMap::with_max_entries(64, 0);
+static LGCALLS: PerCpuHashMap<u32, u64> = PerCpuHashMap::with_max_entries(64, 0);
 /// Kernel classifier table: FNV-1a-64 of exact registry spelling →
 /// (class, weak, len-checked; name reserved). Observer-populated
 /// before any attach; no target bytes at rest.
@@ -155,13 +167,47 @@ static ALG_CLASS: HashMap<u64, AlgClassValue> = HashMap::with_max_entries(1024, 
 #[map]
 static TRIP_CLASS: HashMap<u64, TripClassValue> = HashMap::with_max_entries(64, 0);
 
+/// Per-CPU counter add (F-C/A8): shared-map lookup–increment–
+/// replace loses concurrent increments across CPUs, and `core`
+/// atomics are unavailable on this target — so the counters live
+/// in per-CPU slots (single-writer: no migration mid-BPF) and a
+/// plain wrapping add is exact. Absent keys plant 0 with NOEXIST
+/// first (a lost plant race still lands on the winner's slot);
+/// only a full map fails. Userspace sums across CPUs at drain.
+fn percpu_add<K>(map: &PerCpuHashMap<K, u64>, key: &K) -> Result<(), ()> {
+    if map.get_ptr_mut(key).is_none() {
+        let _ = map.insert(key, &0u64, BPF_NOEXIST);
+    }
+    match map.get_ptr_mut(key) {
+        Some(slot) => {
+            unsafe { *slot = (*slot).wrapping_add(1) };
+            Ok(())
+        }
+        None => Err(()),
+    }
+}
+
+/// Per-CPU flag-OR (F-C/A8): same lost-update race as the
+/// counters, same fix; userspace ORs across CPUs at drain.
+fn percpu_or<K>(map: &PerCpuHashMap<K, u64>, key: &K, bit: u64) -> Result<(), ()> {
+    if map.get_ptr_mut(key).is_none() {
+        let _ = map.insert(key, &0u64, BPF_NOEXIST);
+    }
+    match map.get_ptr_mut(key) {
+        Some(slot) => {
+            unsafe { *slot |= bit };
+            Ok(())
+        }
+        None => Err(()),
+    }
+}
+
 /// Source-tagged loss bump (T03: ring-exhaustion and map-update
-/// failures are counted, never silent). The LOSS insert itself is
-/// the one uncounted residual (15 keys in 32 slots: effectively
-/// never full).
+/// failures are counted, never silent). A full LOSS map is the one
+/// uncounted residual (15 keys in 32 slots: effectively never
+/// full).
 fn bump_loss(src: u32) {
-    let cur = unsafe { LOSS.get_ptr(&src).map(|p| *p).unwrap_or(0) };
-    let _ = LOSS.insert(src, cur.wrapping_add(1), 0);
+    let _ = percpu_add(&LOSS, &src);
 }
 
 fn emit_alg(ev: &AlgEvent) {
@@ -226,8 +272,7 @@ fn cookie_of(ctx: &ProbeContext) -> u64 {
 }
 
 fn bump_trip(cookie: u64) {
-    let cur = unsafe { TRIP.get_ptr(&cookie).map(|p| *p).unwrap_or(0) };
-    if TRIP.insert(cookie, cur.wrapping_add(1), 0).is_err() {
+    if percpu_add(&TRIP, &cookie).is_err() {
         bump_loss(LOSS_MAP_TRIP);
     }
 }
@@ -248,8 +293,7 @@ fn pend_key(cookie: u64) -> u64 {
 }
 
 fn flag_trunc(op: u32, bit: u64) {
-    let cur = unsafe { TRUNC.get_ptr(&op).map(|p| *p).unwrap_or(0) };
-    if TRUNC.insert(op, cur | bit, 0).is_err() {
+    if percpu_or(&TRUNC, &op, bit).is_err() {
         bump_loss(LOSS_MAP_TRUNC);
     }
 }
@@ -516,18 +560,11 @@ pub fn query_return(ctx: RetProbeContext) -> u32 {
     }
     let legacy = cookie == 1;
     if legacy {
-        let calls = unsafe { LGCALLS.get_ptr(&(op as u32)).map(|p| *p).unwrap_or(0) };
-        if LGCALLS
-            .insert(op as u32, calls.wrapping_add(1), 0)
-            .is_err()
-        {
+        if percpu_add(&LGCALLS, &(op as u32)).is_err() {
             bump_loss(LOSS_MAP_LGCALLS);
         }
-    } else {
-        let calls = unsafe { CALLS.get_ptr(&(op as u32)).map(|p| *p).unwrap_or(0) };
-        if CALLS.insert(op as u32, calls.wrapping_add(1), 0).is_err() {
-            bump_loss(LOSS_MAP_CALLS);
-        }
+    } else if percpu_add(&CALLS, &(op as u32)).is_err() {
+        bump_loss(LOSS_MAP_CALLS);
     }
     // The provider's lifetime verdict, read once from the caller's
     // out-pointer in this valid return context. Only an explicit 0

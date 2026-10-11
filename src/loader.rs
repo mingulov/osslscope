@@ -54,6 +54,9 @@ pub struct ProgSpec {
 /// task-0 spike (spike-uret.sh GREEN 3/3). T02 adds the two
 /// observer-populated classifier tables (`ALG_CLASS`, `TRIP_CLASS`):
 /// same frozen discipline, same commit as the wire ABI change.
+/// F-C/A8: the five counter/flag maps (`LOSS`, `TRUNC`, `CALLS`,
+/// `TRIP`, `LGCALLS`) are per-CPU hash (type 5) — exact
+/// single-writer slots replace racy shared read-modify-write.
 pub const HARVEST_MAPS: [MapSpec; 12] = [
     MapSpec {
         name: "EVENTS",
@@ -89,7 +92,7 @@ pub const HARVEST_MAPS: [MapSpec; 12] = [
     },
     MapSpec {
         name: "LOSS",
-        map_type: 1,
+        map_type: 5,
         key_size: 4,
         value_size: 8,
         max_entries: 32,
@@ -105,7 +108,7 @@ pub const HARVEST_MAPS: [MapSpec; 12] = [
     },
     MapSpec {
         name: "TRUNC",
-        map_type: 1,
+        map_type: 5,
         key_size: 4,
         value_size: 8,
         max_entries: 64,
@@ -113,7 +116,7 @@ pub const HARVEST_MAPS: [MapSpec; 12] = [
     },
     MapSpec {
         name: "CALLS",
-        map_type: 1,
+        map_type: 5,
         key_size: 4,
         value_size: 8,
         max_entries: 64,
@@ -121,7 +124,7 @@ pub const HARVEST_MAPS: [MapSpec; 12] = [
     },
     MapSpec {
         name: "TRIP",
-        map_type: 1,
+        map_type: 5,
         key_size: 8,
         value_size: 8,
         max_entries: 128,
@@ -129,7 +132,7 @@ pub const HARVEST_MAPS: [MapSpec; 12] = [
     },
     MapSpec {
         name: "LGCALLS",
-        map_type: 1,
+        map_type: 5,
         key_size: 4,
         value_size: 8,
         max_entries: 64,
