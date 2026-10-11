@@ -6391,6 +6391,16 @@ pub fn is_known_alg(name: &str) -> bool {
     ALG_NAMES.iter().any(|a| a.name == name)
 }
 
+/// The registry group of an exact spelling (`None` when
+/// unregistered). Groups are the mixed-detection granularity
+/// (H3): alias spellings share their group's id, so
+/// multi-spelling lists stay OK while cross-group lists mix.
+/// Group ids (first-appearance order) are BPF-internal — the
+/// mixed flag is the only thing that leaves the kernel.
+pub fn alg_group(name: &str) -> Option<&'static str> {
+    ALG_NAMES.iter().find(|a| a.name == name).map(|a| a.group)
+}
+
 /// Decode a kernel algorithm class id to its registry label (T02
 /// discovery wire ABI v2). `OTHER_CLASS` is `"other"`; anything past
 /// the registry is `None` (fail closed to a dropped event, never to

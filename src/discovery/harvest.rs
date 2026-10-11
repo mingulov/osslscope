@@ -36,13 +36,21 @@ pub(crate) const LEGACY_COOKIE: u64 = 1;
 pub fn build_alg_entries() -> anyhow::Result<Vec<(u64, wire::AlgClassValue)>> {
     let mut out: Vec<(u64, wire::AlgClassValue)> = Vec::new();
     let mut seen: HashSet<u64> = HashSet::new();
-    let mut push = |name: &str, class: u16, weak: bool| -> anyhow::Result<()> {
+    // Group ids (H3): first-appearance order over the frozen
+    // registry — deterministic, BPF-internal (only the mixed
+    // flag leaves the kernel, so the ids need no stability
+    // contract beyond a single table build).
+    let mut groups: HashMap<&str, u16> = HashMap::new();
+    let mut push = |name: &str, class: u16, weak: bool, canon: u16| -> anyhow::Result<()> {
         if name.len() > wire::MAX_ALG_NAME {
             anyhow::bail!("registry name over kernel cap: {name:?}");
         }
         let h = wire::fnv1a64(name.as_bytes());
         if !seen.insert(h) {
             anyhow::bail!("classifier hash collision on {name:?}");
+        }
+        if class != wire::OTHER_CLASS && canon == wire::OTHER_CLASS {
+            anyhow::bail!("canon id exhausted (H3 sentinel reserved)");
         }
         let mut bytes = [0u8; wire::MAX_ALG_NAME];
         bytes[..name.len()].copy_from_slice(name.as_bytes());
@@ -52,6 +60,7 @@ pub fn build_alg_entries() -> anyhow::Result<Vec<(u64, wire::AlgClassValue)>> {
                 class,
                 weak: u8::from(weak),
                 len: name.len() as u8,
+                canon,
                 name: bytes,
             },
         ));
@@ -63,11 +72,13 @@ pub fn build_alg_entries() -> anyhow::Result<Vec<(u64, wire::AlgClassValue)>> {
         if class == wire::OTHER_CLASS {
             anyhow::bail!("registry exceeds class id space");
         }
-        push(a.name, class, crate::kinds::is_weak_alg(a.name))?;
+        let next = groups.len() as u16;
+        let canon = *groups.entry(a.group).or_insert(next);
+        push(a.name, class, crate::kinds::is_weak_alg(a.name), canon)?;
     }
     for w in crate::kinds::WEAK_ALGS {
         if !crate::kinds::is_known_alg(w) {
-            push(w, wire::OTHER_CLASS, true)?;
+            push(w, wire::OTHER_CLASS, true, wire::OTHER_CLASS)?;
         }
     }
     Ok(out)
