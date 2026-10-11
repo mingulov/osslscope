@@ -2112,13 +2112,16 @@ impl SessionCore {
                     // The epoch heals too (F-A/A4): a re-walked row
                     // is live evidence in the CURRENT epoch, so it
                     // re-points (and re-emits) instead of sticking
-                    // to a retired one. Sound because the drain
-                    // precedes reconcile: a row ingested while an
-                    // epoch is current cannot be a later epoch's
-                    // straggler, and same-epoch re-queries compare
-                    // equal and stay silent. No minting here: an
-                    // unloaded array (key removed) keeps its
-                    // retired stamp — only a live table re-points.
+                    // to a retired one. Sound because every ingest
+                    // arm gates on `check_gen` before ANY
+                    // attribution or heal (QUERY_RET/ALG/ROW arms
+                    // above): a retired generation's straggler
+                    // drops with loss before reaching this refresh,
+                    // so only live-generation rows re-point, and
+                    // same-epoch re-queries compare equal and stay
+                    // silent. No minting here: an unloaded array
+                    // (key removed) keeps its retired stamp — only
+                    // a live table re-points.
                     let mut changed = false;
                     if let Some(t) = self.table_epochs.get(&(ev.op, ev.aux)) {
                         let live_epoch = t.epoch;
