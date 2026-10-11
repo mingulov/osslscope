@@ -102,3 +102,61 @@ pub fn redact_spawn_argv(_argv: &[String]) -> String {
 pub fn redact_proc_cmdline(_raw: &[u8]) -> String {
     REDACTED_CMDLINE.to_string()
 }
+
+/// Decode process argv to UTF-8 (F-G/Bm2): every argument must be
+/// valid UTF-8, target arguments after `run --` included. Lossy
+/// conversion would silently EXECUTE different bytes than the
+/// operator typed, so non-UTF-8 argv is a usage error (the caller
+/// exits 2 before any side effect), never quiet mutation. Positions
+/// are 1-based past the binary name; the offending bytes are never
+/// echoed (R07).
+pub fn decode_argv(os_args: &[std::ffi::OsString]) -> Result<Vec<String>, String> {
+    os_args
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            a.clone().into_string().map_err(|_| {
+                format!(
+                    "argument {} is not valid UTF-8; refusing to run with altered bytes \
+                     (target arguments after 'run --' must also be UTF-8)",
+                    i + 1
+                )
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::ffi::OsStringExt;
+
+    fn os(items: &[&[u8]]) -> Vec<std::ffi::OsString> {
+        items
+            .iter()
+            .map(|b| std::ffi::OsString::from_vec(b.to_vec()))
+            .collect()
+    }
+
+    #[test]
+    fn valid_argv_round_trips_including_run_separator() {
+        let argv = os(&[b"report", b"--duration", b"30", b"run", b"--", b"/bin/true"]);
+        assert_eq!(
+            decode_argv(&argv).unwrap(),
+            vec!["report", "--duration", "30", "run", "--", "/bin/true"]
+        );
+        let empty: Vec<std::ffi::OsString> = Vec::new();
+        assert!(decode_argv(&empty).unwrap().is_empty());
+    }
+
+    #[test]
+    fn non_utf8_argv_reports_position_without_echoing_bytes() {
+        let argv = os(&[b"report", b"run", b"--", b"/bin/x-\xff"]);
+        let err = decode_argv(&argv).unwrap_err();
+        assert!(err.contains("argument 4"), "position: {err}");
+        assert!(err.to_lowercase().contains("utf-8"), "cause: {err}");
+        assert!(!err.contains('\u{FFFD}'), "no replacement bytes: {err}");
+        let argv = os(&[b"\xff"]);
+        assert!(decode_argv(&argv).unwrap_err().contains("argument 1"));
+    }
+}
