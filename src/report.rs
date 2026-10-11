@@ -175,15 +175,39 @@ fn parse(argv: &[String]) -> Result<Args, String> {
     })
 }
 
-/// Exit for a finished capture (pure — unit-tested).
-fn exit_for(c: &capture::Capture) -> u8 {
-    if matches!(c.child_exit, Some(code) if code != 0) {
+/// Shared exit decision for report and check (pure — unit-tested).
+/// PRD §14 precedence: 2 (usage, decided by the caller) →
+/// 4/no-verdict → 10 → 1 (child or delivery) → 11 → 3 → 0.
+/// F-E/B3: this used to live in check only while report kept its
+/// own ordering (child before fatal) and its own delivery code (4);
+/// both commands now resolve through this one function. Report
+/// maps its capture outcome to a policy outcome (fatal →
+/// no-verdict, anything else → pass) and lets the shared table do
+/// the rest.
+pub fn exit_for(
+    outcome: crate::policy::PolicyOutcome,
+    child_exit: Option<i32>,
+    doc: &CaptureDocument,
+    delivery: &DeliveryResult,
+) -> u8 {
+    if outcome == crate::policy::PolicyOutcome::NoVerdict {
+        return 4;
+    }
+    if outcome == crate::policy::PolicyOutcome::Violation {
+        return 10;
+    }
+    if matches!(child_exit, Some(code) if code != 0) {
         return 1;
     }
-    match &c.outcome {
-        capture::Outcome::Fatal(_) => 4,
-        capture::Outcome::Partial => 3,
-        capture::Outcome::Complete => 0,
+    if delivery.failed() {
+        return 1;
+    }
+    if outcome == crate::policy::PolicyOutcome::Inconclusive {
+        return 11;
+    }
+    match &doc.status {
+        Completeness::Complete => 0,
+        Completeness::Partial { .. } | Completeness::Fatal { .. } => 3,
     }
 }
 
@@ -237,14 +261,6 @@ pub fn run(argv: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let c = match capture::run(&args.cfg, args.target) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("osslscope report: {e:#}");
-            eprintln!("osslscope report: run 'osslscope doctor' to diagnose environment failures");
-            return ExitCode::from(4);
-        }
-    };
     // T14r4: report renders the finalized v2 capture document
     // (policy None => report shape), never the historical v1
     // projection. PRD §14.1: the live producer schema is
@@ -261,12 +277,37 @@ pub fn run(argv: &[String]) -> ExitCode {
         },
         cbom: args.cbom.map(|path| OutputDest::File(path.into())),
     };
+    let c = match capture::run(&args.cfg, args.target) {
+        Ok(c) => c,
+        Err(e) => {
+            // F-E/B4: setup/environment failures still attempt
+            // every requested artifact from a typed no-evidence
+            // document instead of returning with nothing written.
+            eprintln!("osslscope report: {e:#}");
+            eprintln!("osslscope report: run 'osslscope doctor' to diagnose environment failures");
+            let document =
+                setup_failure_document(FatalKind::Environment(bound_line(&format!("{e:#}"))));
+            let delivery = write_artifacts(&document, &req);
+            emit_diagnostics(&delivery);
+            return ExitCode::from(exit_for(
+                crate::policy::PolicyOutcome::NoVerdict,
+                None,
+                &document,
+                &delivery,
+            ));
+        }
+    };
     let delivery = write_artifacts(&c.document, &req);
     emit_diagnostics(&delivery);
-    if delivery.failed() {
-        return ExitCode::from(4);
-    }
-    ExitCode::from(exit_for(&c))
+    // F-E/B3: report resolves through the shared exit table (fatal
+    // capture maps to no-verdict so it dominates at 4).
+    let outcome = match &c.outcome {
+        capture::Outcome::Fatal(_) => crate::policy::PolicyOutcome::NoVerdict,
+        capture::Outcome::Partial | capture::Outcome::Complete => {
+            crate::policy::PolicyOutcome::Pass
+        }
+    };
+    ExitCode::from(exit_for(outcome, c.child_exit, &c.document, &delivery))
 }
 
 // ---------------------------------------------------------------- v2 output
@@ -1204,7 +1245,7 @@ fn cbom_json(doc: &CaptureDocument) -> serde_json::Value {
 
 /// Bound a diagnostic to one line of at most 200 chars (destinations
 /// and OS errors are operator data, never trusted for length).
-fn bound_line(text: &str) -> String {
+pub(crate) fn bound_line(text: &str) -> String {
     let flat: String = text
         .chars()
         .map(|c| if c.is_control() { '?' } else { c })
@@ -1256,6 +1297,35 @@ fn render_failed_outcome(dest: &OutputDest, detail: &str) -> ArtifactOutcome {
         bytes: 0,
         error: Some(bound_line(detail)),
     }
+}
+
+/// Typed no-evidence document for capture setup failures (F-E/B4).
+/// `report`/`check` convert a `capture::run` error into this fatal
+/// document and attempt every requested artifact from it, instead of
+/// returning with nothing written. Zero window (nothing was
+/// observed), unknown target/toolchain, caller attaches the policy
+/// section for the check shape.
+pub fn setup_failure_document(fatal: FatalKind) -> CaptureDocument {
+    use crate::evidence::{CaptureWindow, FinalizeInput, OpensslVersion, TargetRecord, finalize};
+    finalize(FinalizeInput {
+        window: CaptureWindow {
+            requested_start_ns: 0,
+            requested_end_ns: 0,
+            effective_start_ns: 0,
+            effective_end_ns: 0,
+            signal_cut: false,
+        },
+        sites: Vec::new(),
+        fenced: Vec::new(),
+        objects: Vec::new(),
+        coverage: Vec::new(),
+        counters: Vec::new(),
+        fatal: Some(fatal),
+        target: TargetRecord::unknown(),
+        openssl: OpensslVersion::unknown(),
+        disposition: None,
+        policy: None,
+    })
 }
 
 /// Deliver requested artifacts from one finalized document: render
@@ -1338,51 +1408,66 @@ pub fn emit_diagnostics(result: &DeliveryResult) {
 mod tests {
     use super::*;
 
-    fn cap(outcome: capture::Outcome, child_exit: Option<i32>) -> capture::Capture {
-        capture::Capture {
-            target_pid: 7,
-            target_comm: "t".to_string(),
-            window_planned: Duration::from_secs(1),
-            window_actual: Duration::from_secs(1),
-            outcome,
-            reasons: Vec::new(),
-            executions: Vec::new(),
-            stale: Vec::new(),
-            counters: capture::Counters::default(),
-            child_exit,
-            drain_wall_us: 0,
-            harvest_doc: serde_json::json!({}),
-            legacy: serde_json::Value::Null,
-            window_start_wall: std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
-            window_end_wall: std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_001),
-            kernel_release: "test-kernel".to_string(),
-            target_cmdline: "t".to_string(),
-            target_container_id: String::new(),
-            provider_build_id: "unknown".to_string(),
-            provider_path: "/p/provider.so".to_string(),
-            image_digest: String::new(),
-            document: capture::empty_document(),
-            disposition: None,
+    fn ok_delivery() -> DeliveryResult {
+        DeliveryResult {
+            primary: ArtifactOutcome {
+                dest: "stdout".to_string(),
+                ok: true,
+                bytes: 8,
+                error: None,
+            },
+            cbom: None,
+            diagnostics: Vec::new(),
         }
+    }
+
+    fn failed_delivery() -> DeliveryResult {
+        DeliveryResult {
+            primary: ArtifactOutcome {
+                dest: "/nope/out.json".to_string(),
+                ok: false,
+                bytes: 0,
+                error: Some("denied".to_string()),
+            },
+            cbom: None,
+            diagnostics: Vec::new(),
+        }
+    }
+
+    fn doc_with(status: Completeness) -> CaptureDocument {
+        let mut d = capture::empty_document();
+        d.status = status;
+        d
     }
 
     #[test]
     fn exit_precedence() {
-        use capture::{FatalKind, Outcome};
-        assert_eq!(exit_for(&cap(Outcome::Complete, None)), 0);
-        assert_eq!(exit_for(&cap(Outcome::Complete, Some(0))), 0);
-        assert_eq!(exit_for(&cap(Outcome::Partial, None)), 3);
-        assert_eq!(
-            exit_for(&cap(Outcome::Fatal(FatalKind::AttachZero), None)),
-            4
-        );
+        use crate::policy::PolicyOutcome;
+        let pass = PolicyOutcome::Pass;
+        let no_verdict = PolicyOutcome::NoVerdict;
+        let complete = doc_with(Completeness::Complete);
+        let partial = doc_with(Completeness::Partial {
+            reasons: Vec::new(),
+        });
+        let fatal = doc_with(Completeness::Fatal {
+            kind: FatalKind::AttachZero,
+            reasons: Vec::new(),
+        });
+        assert_eq!(exit_for(pass, None, &complete, &ok_delivery()), 0);
+        assert_eq!(exit_for(pass, Some(0), &complete, &ok_delivery()), 0);
+        assert_eq!(exit_for(pass, None, &partial, &ok_delivery()), 3);
+        assert_eq!(exit_for(no_verdict, None, &fatal, &ok_delivery()), 4);
+        // F-E/B3: fatal/no-verdict (4) dominates child failure (1)
+        // per PRD §14 precedence; report maps fatal captures to
+        // no-verdict so this row covers the old report path too.
+        assert_eq!(exit_for(no_verdict, Some(1), &fatal, &ok_delivery()), 4);
         // Child failure dominates evidence status (never 10 without a verdict).
-        assert_eq!(exit_for(&cap(Outcome::Complete, Some(2))), 1);
-        assert_eq!(exit_for(&cap(Outcome::Partial, Some(139))), 1);
-        assert_eq!(
-            exit_for(&cap(Outcome::Fatal(FatalKind::Recycled), Some(1))),
-            1
-        );
+        assert_eq!(exit_for(pass, Some(2), &complete, &ok_delivery()), 1);
+        assert_eq!(exit_for(pass, Some(139), &partial, &ok_delivery()), 1);
+        // F-E/B3: delivery failure is an internal error (1), not an
+        // environment failure (4); report used to return 4 here.
+        assert_eq!(exit_for(pass, None, &complete, &failed_delivery()), 1);
+        assert_eq!(exit_for(pass, Some(0), &partial, &failed_delivery()), 1);
     }
 
     #[test]
