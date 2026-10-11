@@ -1076,7 +1076,12 @@ impl FakeCountBackend {
         let key = (cookie, self.generation);
         if let Some(slot) = self.ledger.get_mut(&key) {
             slot.count = slot.count.saturating_add(n);
-            slot.last_ns = now_ns;
+            // Min/max, not last-write-wins: the single-slot fake
+            // emulates per-CPU kernel slots (each first<=last by
+            // per-CPU time order) composed by the userspace fold —
+            // out-of-order fires must not invert the bounds.
+            slot.first_ns = slot.first_ns.min(now_ns);
+            slot.last_ns = slot.last_ns.max(now_ns);
             return;
         }
         if self.ledger.len() >= self.capacity {

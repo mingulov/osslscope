@@ -504,6 +504,35 @@ fn replaced_during_attach_quarantines_hits() {
 }
 
 #[test]
+fn fake_backend_folds_bounds_monotonically() {
+    // Out-of-order fires (the thread-interleave model) keep
+    // first<=last: the single-slot fake emulates per-CPU slots +
+    // the userspace min/max fold, not last-write-wins. Pins the
+    // per_key_threaded_counts flake (first>last under race).
+    let stage = Stage::fresh("fakefold");
+    let bytes = self_bytes();
+    let off = x_offsets(&bytes, 1)[0];
+    let a = stage.write("prov.so", &bytes);
+    let live = vec![mapping(&a)];
+    let files = HashMap::from([(a.path.clone(), std::fs::read(&a.path).unwrap())]);
+    let mut s = session_with(FakeCountBackend::new());
+    let d = CountDelta {
+        discovered: vec![site(&a, off, 7)],
+        losses: Vec::new(),
+    };
+    s.attach_delta(&d, &live, &files).unwrap();
+    let cookie = s.cookie_for(a.device, a.ino, off).unwrap();
+    s.open_window(1000, 2000).unwrap();
+    s.backend_mut().fire(PID, cookie, 1500, 1);
+    s.backend_mut().fire(PID, cookie, 1000, 1);
+    s.backend_mut().fire(PID, cookie, 1999, 1);
+    let drain = s.close_and_drain(Duration::from_secs(5)).unwrap();
+    assert_eq!(drain.current.len(), 1);
+    let exec = &drain.current[0];
+    assert_eq!((exec.calls, exec.first_ns, exec.last_ns), (3, 1000, 1999));
+}
+
+#[test]
 fn quarantined_cookie_skips_reattach_until_fence() {
     // A1: a dropped cookie stays quarantined for the generation
     // (re-attach reports quarantined, never re-binds), and the
