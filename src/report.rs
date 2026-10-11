@@ -161,7 +161,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             table,
             force_offset,
             provider_enrollment,
-            resolved_provider_class: None,
+            resolved_provider: None,
             duration,
             settle,
             harvest_timeout: timeout,
