@@ -641,7 +641,7 @@ fn legacy_links_live_until_close() {
     assert!(
         d.losses
             .iter()
-            .any(|l| l.source == HOST_ORPHAN_ROW && l.count == 1)
+            .any(|l| l.source == HOST_ORPHAN_ROW && l.count == 1 && l.op == Some(OP_DIGEST))
     );
     let snap = core.snapshot();
     assert_eq!(snap.links_live.tripwire, 3);
@@ -873,6 +873,7 @@ fn counter_dips_do_not_double_count() {
         vec![osslscope::discovery::session::DiscoveryLoss {
             source: wire::LOSS_RING_ROW,
             count: 5,
+            op: None,
         }]
     );
     assert_eq!(d.tripwire.counter_deltas, vec![(8, 5)]);

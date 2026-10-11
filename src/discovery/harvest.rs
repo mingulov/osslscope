@@ -206,6 +206,23 @@ pub struct Config {
     pub table: Option<PathBuf>,
     /// Forced query-fn file offset (forensics escape hatch).
     pub force_offset: Option<u64>,
+    /// Observation started at process birth: the target performed no
+    /// observable behavior before attach (spawn-held-stopped until
+    /// attaches installed, or caller-enforced pre-attach silence such
+    /// as GO-gating). Attach-mode callers pass false: mid-life quiet
+    /// cannot exclude pre-attach cached callbacks/loads, so a quiet
+    /// attach is PARTIAL (unknown), never COMPLETE-EMPTY (F-B/A14).
+    pub observed_from_birth: bool,
+}
+
+/// Legacy-quiet COMPLETE-EMPTY contract (F-B/A14): a quiet target is
+/// proven-empty only with tripwires attached (`set_attached` proves
+/// something was watching — an unplannable legacy surface is blind,
+/// not quiet) AND observation from process birth (attach-mode quiet
+/// cannot exclude pre-attach cached callbacks/loads). Gap signals
+/// still flip to PARTIAL inside `schema::emit`.
+fn legacy_proven_quiet(set_attached: bool, observed_from_birth: bool) -> bool {
+    set_attached && observed_from_birth
 }
 
 /// Ops with at least one live-epoch table lacking termination
@@ -662,7 +679,14 @@ pub fn run_detailed(
                 .iter()
                 .any(|h| set.is_load_cookie(h.cookie))
         });
-        if cfg.legacy && !loads_observed {
+        // F-B/A14: COMPLETE-EMPTY only for proven-quiet (tripwires
+        // attached + observed from birth). Anything else falls
+        // through to PARTIAL(no-query-trigger) below with the
+        // (possibly blind) legacy section attached.
+        if cfg.legacy
+            && !loads_observed
+            && legacy_proven_quiet(snap.legacy.set.is_some(), cfg.observed_from_birth)
+        {
             // Quiet target: COMPLETE-EMPTY. Stats.builtin=false
             // suppresses the inventory counters (nothing was
             // inventoried — uninstrumented=14 would lie). Gaps
@@ -859,7 +883,20 @@ pub fn run_detailed(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use osslscope_ebpf_common as wire;
+
+    #[test]
+    fn legacy_quiet_complete_needs_attached_tripwires_and_birth_observation() {
+        // F-B/A14 truth table: COMPLETE-EMPTY only with tripwires
+        // attached (something was watching) AND observation from
+        // process birth (attach-mode quiet cannot exclude pre-attach
+        // cached callbacks/loads).
+        assert!(legacy_proven_quiet(true, true));
+        assert!(!legacy_proven_quiet(false, true));
+        assert!(!legacy_proven_quiet(true, false));
+        assert!(!legacy_proven_quiet(false, false));
+    }
 
     #[test]
     fn row_key_includes_addr_array_weak_and_status() {

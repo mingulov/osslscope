@@ -1873,6 +1873,7 @@ fn partial_final_delta_reconciles_once() {
         losses: vec![DiscoveryLoss {
             source: osslscope_ebpf_common::LOSS_RING_ROW,
             count: 2,
+            op: None,
         }],
         budget_exhausted: true,
         trigger_observed: true,
@@ -1892,6 +1893,59 @@ fn partial_final_delta_reconciles_once() {
         .find(|s| s.scope == "op:1")
         .unwrap();
     assert_eq!((row.discovered, row.attached), (1, 1));
+}
+
+#[test]
+fn orphan_loss_taints_op_denominator() {
+    // A7: op 1 terminates, but an orphan ROW localizes to it — the
+    // discovered-site count is no longer the expected denominator
+    // (a site may be missing), so expected stays Unknown. The
+    // sibling op 2 (terminated, no loss) keeps its denominator.
+    let mut h = Harness::fresh("orphan-taint");
+    h.snapshot_attached();
+    let cand1 = cand(
+        "/p/provider.so",
+        backing_of(&h.staged, h.off),
+        1,
+        11,
+        "SHA-256",
+        false,
+        "ok",
+    );
+    h.polls.push_back(DiscoveryDelta::default());
+    h.polls.push_back(DiscoveryDelta {
+        candidates: vec![cand1],
+        tables: vec![terminated(1, 0), terminated(2, 0)],
+        losses: vec![DiscoveryLoss {
+            source: osslscope::discovery::coverage::HOST_ORPHAN_ROW,
+            count: 1,
+            op: Some(1),
+        }],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    let (out, _) = h.run();
+    let c = out.unwrap();
+    let row1 = c
+        .document
+        .coverage
+        .iter()
+        .find(|s| s.scope == "op:1")
+        .unwrap();
+    assert!(
+        matches!(row1.expected, ExpectedScope::Unknown),
+        "tainted op keeps no denominator: {row1:?}"
+    );
+    let row2 = c
+        .document
+        .coverage
+        .iter()
+        .find(|s| s.scope == "op:2")
+        .unwrap();
+    assert!(
+        matches!(row2.expected, ExpectedScope::Applicable { .. }),
+        "untainted sibling keeps its denominator: {row2:?}"
+    );
 }
 
 #[test]

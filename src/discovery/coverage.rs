@@ -147,6 +147,9 @@ pub struct CoverageTracker {
     losses: HashMap<u32, u64>,
     /// Slots whose identity was lost (unreadable/overlong names).
     lossy: u64,
+    /// Orphan-ROW counts per op (localizable loss for A7 taint;
+    /// the totals above stay the D4/doc record).
+    orphan_ops: HashMap<u32, u64>,
 }
 
 impl CoverageTracker {
@@ -170,9 +173,12 @@ impl CoverageTracker {
         }
     }
 
-    /// A ROW whose (array, index) has no ALG record: dropped, counted.
-    pub fn note_orphan_row(&mut self) {
+    /// A ROW whose (array, index) has no ALG record: dropped,
+    /// counted, and localized to its op for candidate-set taint
+    /// (F-B/A7 — the missing identity belongs to this op's table).
+    pub fn note_orphan_row(&mut self, op: u32) {
         *self.losses.entry(HOST_ORPHAN_ROW).or_default() += 1;
+        *self.orphan_ops.entry(op).or_default() += 1;
     }
 
     /// A dropped ring item: `src` is one of the `HOST_*` ids.
@@ -345,6 +351,19 @@ impl CoverageTracker {
     /// Slots with lost identity (unreadable/overlong names).
     pub fn lossy_slots(&self) -> u64 {
         self.lossy
+    }
+
+    /// Cumulative per-op orphan-ROW counts, sorted by op (F-B/A7:
+    /// the session diffs these into op-localized loss increments).
+    pub fn orphan_ops(&self) -> Vec<(u32, u64)> {
+        let mut out: Vec<(u32, u64)> = self
+            .orphan_ops
+            .iter()
+            .filter(|(_, n)| **n > 0)
+            .map(|(op, n)| (*op, *n))
+            .collect();
+        out.sort_unstable();
+        out
     }
 
     fn has_trunc(&self) -> bool {

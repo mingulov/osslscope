@@ -317,8 +317,8 @@ fn lost_alg_or_row_is_accounted() {
     t.note_query_ret(OP_DIGEST, ARR);
     t.note_alg(OP_DIGEST, ARR, 0, false);
     t.ingest_losses(&[(wire::LOSS_RING_ROW, 5), (wire::LOSS_MAP_TRUNC, 1)]);
-    t.note_orphan_row();
-    t.note_orphan_row();
+    t.note_orphan_row(1);
+    t.note_orphan_row(1);
     t.note_bad_event(HOST_SHORT_EVENT);
     t.note_bad_event(HOST_UNKNOWN_KIND);
     t.note_bad_event(HOST_BAD_EVENT);
@@ -559,6 +559,7 @@ fn one_query_later_slot() {
         legacy: false,
         table: None,
         force_offset: None,
+        observed_from_birth: false,
     };
     let harvest = std::thread::spawn(move || {
         osslscope::discovery::harvest::run_detailed(
@@ -644,6 +645,7 @@ fn nostore_table_is_explicit_partial() {
         legacy: false,
         table: None,
         force_offset: None,
+        observed_from_birth: false,
     };
     let harvest = std::thread::spawn(move || {
         osslscope::discovery::harvest::run_detailed(
@@ -677,5 +679,169 @@ fn nostore_table_is_explicit_partial() {
     assert!(
         bits & wire::TRUNC_NO_STORE != 0,
         "NO_STORE bit must be set: {doc}"
+    );
+}
+
+/// Live libcrypto path mapped by `pid` (basename `libcrypto.so.*`,
+/// same match as the harvest's own `find_libcrypto`).
+fn mapped_libcrypto(pid: u32) -> Option<String> {
+    let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).ok()?;
+    maps.lines().find_map(|line| {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() >= 6
+            && f[4].parse::<u64>().ok().unwrap_or(0) != 0
+            && f[5]
+                .rsplit('/')
+                .next()
+                .unwrap_or("")
+                .starts_with("libcrypto.so.")
+        {
+            Some(f[5].to_string())
+        } else {
+            None
+        }
+    })
+}
+
+/// First system libcrypto from the loader cache (host ELF path for
+/// a harvest whose target maps no libcrypto).
+fn system_libcrypto() -> Option<String> {
+    let out = std::process::Command::new("ldconfig")
+        .arg("-p")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|line| {
+            let line = line.trim();
+            line.strip_prefix("libcrypto.so.")
+                .and_then(|rest| rest.split("=>").nth(1))
+                .map(|p| p.trim().to_string())
+        })
+}
+
+/// Live legacy-quiet attach verdict (NOT RUN here: needs a privileged
+/// lane + C2-built BPF object via OSSL_T03_LIVE=1 and OSSL_T03_OBJECT).
+/// The child imports `ssl` BEFORE attach (2s pre-sleep: cached
+/// callbacks/loads are the pre-attach past), so tripwires attach into
+/// a mid-life process that then stays quiet. Mid-life quiet cannot
+/// exclude the pre-attach past: this must be PARTIAL (unknown), never
+/// COMPLETE-EMPTY — even with tripwires attached and zero gaps
+/// (F-B/A14 leg 1). Pre-fix this returned COMPLETE-EMPTY.
+#[test]
+#[ignore = "live lane only: privileged BPF (see doc comment)"]
+fn legacy_quiet_attach_with_tripwires_is_partial() {
+    let live = std::env::var("OSSL_T03_LIVE").unwrap_or_default();
+    if live != "1" {
+        eprintln!("legacy_quiet_attach_with_tripwires_is_partial: set OSSL_T03_LIVE=1; skipping");
+        return;
+    }
+    let object = std::env::var("OSSL_T03_OBJECT").expect("OSSL_T03_OBJECT=<harvest BPF .o>");
+    let probe = std::process::Command::new("python3")
+        .args(["-c", "import ssl"])
+        .output();
+    match probe {
+        Ok(o) if o.status.success() => {}
+        _ => {
+            eprintln!(
+                "legacy_quiet_attach_with_tripwires_is_partial: need python3 with ssl; skipping"
+            );
+            return;
+        }
+    }
+    let mut child = std::process::Command::new("python3")
+        .args(["-c", "import ssl, time; time.sleep(60)"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn python3 ssl sleeper");
+    let pid = child.id();
+    // Let the ssl import settle BEFORE attach: the cached-callback
+    // past this test exists to protect against.
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let provider = mapped_libcrypto(pid).expect("child must map libcrypto.so.* by now");
+    let cfg = osslscope::discovery::harvest::Config {
+        pid,
+        provider: provider.into(),
+        object: object.into(),
+        settle: std::time::Duration::from_millis(500),
+        timeout: std::time::Duration::from_secs(10),
+        cmdline_marker: None,
+        builtin: true,
+        legacy: true,
+        table: None,
+        force_offset: None,
+        observed_from_birth: false,
+    };
+    let doc = osslscope::discovery::harvest::run(&cfg).expect("harvest run");
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(doc["status"], "PARTIAL", "mid-life quiet is unknown: {doc}");
+    assert_eq!(
+        doc["reason"], "no-query-trigger",
+        "quiet attach keeps the unknown verdict: {doc}"
+    );
+    assert!(
+        doc.get("legacy").is_some(),
+        "legacy section must travel with the PARTIAL: {doc}"
+    );
+}
+
+/// Live legacy-blind verdict (NOT RUN here: needs a privileged lane +
+/// C2-built BPF object via OSSL_T03_LIVE=1 and OSSL_T03_OBJECT). The
+/// target maps no libcrypto, so no tripwires can attach: the legacy
+/// surface is blind, not quiet — PARTIAL (unknown), never
+/// COMPLETE-EMPTY (F-B/A14 leg 2). Pre-fix this returned
+/// COMPLETE-EMPTY through the same quiet branch.
+#[test]
+#[ignore = "live lane only: privileged BPF (see doc comment)"]
+fn legacy_blind_quiet_is_partial() {
+    let live = std::env::var("OSSL_T03_LIVE").unwrap_or_default();
+    if live != "1" {
+        eprintln!("legacy_blind_quiet_is_partial: set OSSL_T03_LIVE=1; skipping");
+        return;
+    }
+    let object = std::env::var("OSSL_T03_OBJECT").expect("OSSL_T03_OBJECT=<harvest BPF .o>");
+    let provider =
+        system_libcrypto().expect("lane needs a system libcrypto for the builtin anchor");
+    let mut child = std::process::Command::new("sleep")
+        .arg("60")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn sleep 60");
+    let pid = child.id();
+    assert!(
+        mapped_libcrypto(pid).is_none(),
+        "blind leg needs a target with no libcrypto mapped"
+    );
+    let cfg = osslscope::discovery::harvest::Config {
+        pid,
+        provider: provider.into(),
+        object: object.into(),
+        settle: std::time::Duration::from_millis(500),
+        timeout: std::time::Duration::from_secs(10),
+        cmdline_marker: None,
+        builtin: true,
+        legacy: true,
+        table: None,
+        force_offset: None,
+        observed_from_birth: false,
+    };
+    let doc = osslscope::discovery::harvest::run(&cfg).expect("harvest run");
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(
+        doc["status"], "PARTIAL",
+        "blind is unknown, not empty: {doc}"
+    );
+    assert_eq!(
+        doc["reason"], "no-query-trigger",
+        "blind quiet keeps the unknown verdict: {doc}"
     );
 }

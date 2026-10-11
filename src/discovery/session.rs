@@ -147,6 +147,12 @@ impl Default for PollBudget {
 pub struct DiscoveryLoss {
     pub source: u32,
     pub count: u64,
+    /// Op the missing evidence localizes to (orphan ROWs carry
+    /// their table's op); `None` when the loss cannot be localized
+    /// (undecodable records, drain tails, snapshot failures,
+    /// kernel-side counters) and conservatively taints every op
+    /// (F-B/A7).
+    pub op: Option<u32>,
 }
 
 /// Traversal state of one table incarnation. R03's aborted/truncated
@@ -580,6 +586,7 @@ pub struct SessionCore {
     calls_pinned: bool,
     emitted_queries: u64,
     emitted_losses: HashMap<u32, u64>,
+    emitted_orphan_ops: HashMap<u32, u64>,
     loss_seen: HashMap<u32, u64>,
     trip_joined: HashMap<u64, u64>,
     lgcalls_joined: u64,
@@ -635,6 +642,7 @@ impl SessionCore {
             calls_pinned: false,
             emitted_queries: 0,
             emitted_losses: HashMap::new(),
+            emitted_orphan_ops: HashMap::new(),
             loss_seen: HashMap::new(),
             trip_joined: HashMap::new(),
             lgcalls_joined: 0,
@@ -808,6 +816,7 @@ impl SessionCore {
         self.calls_joined = None;
         self.emitted_queries = 0;
         self.emitted_losses.clear();
+        self.emitted_orphan_ops.clear();
         self.loss_seen.clear();
         self.trip_joined.clear();
         self.lgcalls_joined = 0;
@@ -1029,16 +1038,30 @@ impl SessionCore {
         delta.tables = tables;
 
         // Fresh losses: positive diffs of the cumulative tracker
-        // against what earlier deltas already reported.
+        // against what earlier deltas already reported. Orphan ROWs
+        // localize to their op (per-op diffs below); everything else
+        // is unlocalizable (op: None) and taints every op (F-B/A7).
         for (src, n) in self.tracker.losses() {
             let last = self.emitted_losses.get(&src).copied().unwrap_or(0);
-            if n > last {
+            if n > last && src != coverage::HOST_ORPHAN_ROW {
                 delta.losses.push(DiscoveryLoss {
                     source: src,
                     count: n - last,
+                    op: None,
                 });
             }
             self.emitted_losses.insert(src, n);
+        }
+        for (op, n) in self.tracker.orphan_ops() {
+            let last = self.emitted_orphan_ops.get(&op).copied().unwrap_or(0);
+            if n > last {
+                delta.losses.push(DiscoveryLoss {
+                    source: coverage::HOST_ORPHAN_ROW,
+                    count: n - last,
+                    op: Some(op),
+                });
+            }
+            self.emitted_orphan_ops.insert(op, n);
         }
         let total = self.queries_total();
         delta.queries_delta = total.saturating_sub(self.emitted_queries);
@@ -1249,7 +1272,7 @@ impl SessionCore {
                 let Some((label, weak, status)) = self.alg_records.get(&(ev.aux, ev.idx)).cloned()
                 else {
                     eprintln!("orphan row: op={} idx={}", ev.op, ev.idx);
-                    self.tracker.note_orphan_row();
+                    self.tracker.note_orphan_row(ev.op);
                     return;
                 };
                 let key = (

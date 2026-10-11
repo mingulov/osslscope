@@ -893,6 +893,109 @@ fn semantics_rejects_inconsistent_windows() {
 }
 
 #[test]
+fn semantics_rejects_site_activity_outside_effective_window() {
+    // Bm1: site first/last must sit inside the effective window —
+    // counting cannot precede the clock or run past the deadline.
+    // (Window here is 0..100; fixture sites run 10..90.)
+    let mut v = json_of(&complete_doc());
+    v["sites"][0]["last_ns"] = json!(500);
+    assert!(
+        check_v2_semantics(&v).is_err(),
+        "site activity past effective end accepted"
+    );
+
+    // First-touch before the effective start (PARTIAL fixture with
+    // a narrowed 5..95 window isolates containment from the
+    // COMPLETE reconciliation below).
+    let mut v = json_of(&partial_doc());
+    v["sites"][0]["first_ns"] = json!(0);
+    assert!(
+        check_v2_semantics(&v).is_err(),
+        "site activity before effective start accepted"
+    );
+
+    // Fenced sites are contained too.
+    let mut v = json_of(&violation_doc());
+    v["fenced"][0]["sites"][0]["last_ns"] = json!(500);
+    assert!(
+        check_v2_semantics(&v).is_err(),
+        "fenced site activity past effective end accepted"
+    );
+
+    // Boundaries are inclusive: touching the clock edges is fine.
+    let mut v = json_of(&complete_doc());
+    v["sites"][0]["first_ns"] = json!(0);
+    v["sites"][0]["last_ns"] = json!(100);
+    assert!(
+        check_v2_semantics(&v).is_ok(),
+        "boundary-contained site rejected: {:?}",
+        check_v2_semantics(&v).err()
+    );
+}
+
+#[test]
+fn semantics_rejects_complete_contradicting_underlying_fields() {
+    // Bm1: COMPLETE must reconcile window gaps, coverage, and loss
+    // data — not just the reasons array.
+    // Nonzero loss counter (fixture counter 0 is a zero loss).
+    let mut v = json_of(&complete_doc());
+    v["completeness"]["counters"][0]["value"] = json!(1);
+    assert!(
+        check_v2_semantics(&v).is_err(),
+        "COMPLETE with nonzero loss accepted"
+    );
+
+    // Unknown denominator.
+    let mut v = json_of(&complete_doc());
+    v["coverage"][0]["expected"]["state"] = json!("unknown");
+    v["coverage"][0]["expected"]["sites"] = Value::Null;
+    assert!(
+        check_v2_semantics(&v).is_err(),
+        "COMPLETE with unknown coverage accepted"
+    );
+
+    // Applicable shortfall: fewer discovered than expected.
+    let mut v = json_of(&complete_doc());
+    v["coverage"][0]["discovered"] = json!(1);
+    assert!(
+        check_v2_semantics(&v).is_err(),
+        "COMPLETE with undiscovered sites accepted"
+    );
+
+    // Narrowed effective window (still consistent: 0..95 in 0..100).
+    let mut v = json_of(&complete_doc());
+    v["window"]["effective_end_ns"] = json!(95);
+    assert!(
+        check_v2_semantics(&v).is_err(),
+        "COMPLETE with a tail gap accepted"
+    );
+
+    // Signal-cut window.
+    let mut v = json_of(&complete_doc());
+    v["window"]["signal_cut"] = json!(true);
+    assert!(
+        check_v2_semantics(&v).is_err(),
+        "COMPLETE with signal_cut accepted"
+    );
+
+    // Executed-but-unattributed site (calls 500, set unknown).
+    let mut v = json_of(&complete_doc());
+    v["sites"][0]["candidates_coverage"] = json!("unknown");
+    assert!(
+        check_v2_semantics(&v).is_err(),
+        "COMPLETE with unattributed calls accepted"
+    );
+
+    // PARTIAL keeps accepting all of these shapes (reconciliation
+    // binds COMPLETE only).
+    assert!(
+        check_v2_semantics(&json_of(&partial_doc())).is_ok(),
+        "valid PARTIAL rejected: {:?}",
+        check_v2_semantics(&json_of(&partial_doc())).err()
+    );
+}
+
+#[test]
 fn semantics_rejects_inconsistent_records() {
     let mut v = json_of(&complete_doc());
     v["openssl"]["version"] = Value::Null;
