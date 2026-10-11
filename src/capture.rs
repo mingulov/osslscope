@@ -2909,12 +2909,25 @@ where
         }
         if let Some(set) = snapshot.legacy.set.as_ref() {
             let n = set.probes.len() as u64;
-            coverage.push(ScopeCoverage {
-                scope: "legacy".to_string(),
-                expected: ExpectedScope::Applicable { sites: n },
-                discovered: n,
-                attached: n,
-            });
+            if snapshot.legacy.planned {
+                coverage.push(ScopeCoverage {
+                    scope: "legacy".to_string(),
+                    expected: ExpectedScope::Applicable { sites: n },
+                    discovered: n,
+                    attached: n,
+                });
+            } else {
+                // F-D/A11: anchors superseded mid-window — the
+                // last-good set still renders history, but nothing
+                // further is observable: Unknown, never
+                // stale-Applicable.
+                coverage.push(ScopeCoverage {
+                    scope: "legacy".to_string(),
+                    expected: ExpectedScope::Unknown,
+                    discovered: n,
+                    attached: 0,
+                });
+            }
         } else if legacy::find_libcrypto(&self.last_live).is_some() {
             coverage.push(ScopeCoverage {
                 scope: "legacy".to_string(),

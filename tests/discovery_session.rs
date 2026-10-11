@@ -12,7 +12,8 @@ use osslscope::discovery::coverage::{HOST_DRAIN_SHORTFALL, HOST_ORPHAN_ROW, loss
 use osslscope::discovery::legacy::{Probe, ProbeSet};
 use osslscope::discovery::maps::Mapping;
 use osslscope::discovery::session::{
-    DiscoverySnapshot, MapSnapshots, PollBudget, Recycled, SessionCore, SessionEnv,
+    AttachKind, DiscoverySnapshot, DispatchReinstall, MapSnapshots, PollBudget, Recycled,
+    SessionCore, SessionEnv,
 };
 use osslscope_ebpf_common as wire;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -181,8 +182,13 @@ struct TestEnv {
     staged: MapSnapshots,
     stage2: Vec<Stage2Install>,
     stage2_failures: u32,
+    stage2_detaches: Vec<u64>,
     trip_links_live: u64,
     trip_install_calls: u32,
+    trip_detaches: u32,
+    dispatch_detaches: u32,
+    reinstall_script: VecDeque<anyhow::Result<DispatchReinstall>>,
+    reinstall_calls: u32,
     probe_set: Option<ProbeSet>,
     pin_ok: bool,
     quiesced: bool,
@@ -198,8 +204,13 @@ impl TestEnv {
             staged: MapSnapshots::default(),
             stage2: Vec::new(),
             stage2_failures: 0,
+            stage2_detaches: Vec::new(),
             trip_links_live: 0,
             trip_install_calls: 0,
+            trip_detaches: 0,
+            dispatch_detaches: 0,
+            reinstall_script: VecDeque::new(),
+            reinstall_calls: 0,
             probe_set: None,
             pin_ok: true,
             quiesced: false,
@@ -294,6 +305,27 @@ impl SessionEnv for TestEnv {
 
     fn link_counts(&self) -> (u64, u64) {
         self.link_counts_now()
+    }
+
+    fn detach_trips(&mut self) {
+        self.trip_detaches += 1;
+        self.trip_links_live = 0;
+    }
+
+    fn detach_dispatch_anchors(&mut self) {
+        self.dispatch_detaches += 1;
+    }
+
+    fn detach_stage2(&mut self, cookie: u64) {
+        self.stage2_detaches.push(cookie);
+        self.stage2.retain(|(c, _, _, _)| *c != cookie);
+    }
+
+    fn reinstall_dispatch(&mut self) -> anyhow::Result<DispatchReinstall> {
+        self.reinstall_calls += 1;
+        self.reinstall_script
+            .pop_front()
+            .unwrap_or_else(|| Err(anyhow::anyhow!("no reinstall scripted")))
     }
 }
 
@@ -426,16 +458,30 @@ fn no_query_can_retry() {
 
     // A repeat init at a MOVED callback re-attaches (no stale
     // offset), while a same-target repeat only faults pages in.
+    // F-D/A11: the superseding install detaches the old link
+    // (no leak, no duplicate cookie) and carries a continuity
+    // signal alongside the install report.
     env.push(enc_init(0x7f00_4000, 0));
     let d = core.poll(&mut env, ample_budget()).unwrap();
-    assert_eq!(d.attaches.len(), 1);
-    assert!(d.attaches[0].failed.is_none());
-    assert_eq!(env.stage2.len(), 3);
-    assert_eq!(env.stage2[2].1, 0x4000);
+    assert_eq!(d.attaches.len(), 2);
+    assert!(
+        d.attaches.iter().any(|a| a.failed.is_none()),
+        "reinstall reports its install: {:?}",
+        d.attaches
+    );
+    assert!(
+        d.attaches.iter().any(|a| a.failed.is_some()),
+        "supersede carries a continuity signal: {:?}",
+        d.attaches
+    );
+    assert_eq!(env.stage2.len(), 2, "old link detaches (no leak)");
+    assert_eq!(env.stage2.iter().filter(|(c, _, _, _)| *c == 0).count(), 1);
+    let moved = env.stage2.iter().find(|(c, _, _, _)| *c == 0).unwrap();
+    assert_eq!(moved.1, 0x4000);
     env.push(enc_init(0x7f00_4000, 0));
     let d = core.poll(&mut env, ample_budget()).unwrap();
     assert!(d.attaches.is_empty());
-    assert_eq!(env.stage2.len(), 3);
+    assert_eq!(env.stage2.len(), 2);
     assert!(core.snapshot().dispatch.reloads.contains(&(0, 3)));
 
     // And a real query after the quiet wait still emits.
@@ -1103,8 +1149,24 @@ fn stage2_reattach_on_same_path_replacement() {
     env.maps = vec![mapping(0x7f00_0000, 0x10000, true, 0, "08:01", ino2, &exe)];
     env.push(enc_init(0x7f00_3000, 0));
     let d = core.poll(&mut env, ample_budget()).unwrap();
-    assert!(d.attaches.iter().all(|a| a.failed.is_none()));
-    assert_eq!(env.stage2.len(), 2, "replacement must re-attach, not reuse");
+    // F-D/A11: the unmapped old target detaches with a loss
+    // signal, then the fresh install reports clean — re-attach,
+    // never reuse, never leak.
+    assert!(
+        d.attaches.iter().any(|a| a.failed.is_none()),
+        "reinstall reports its install: {:?}",
+        d.attaches
+    );
+    assert!(
+        d.attaches.iter().any(|a| a.failed.is_some()),
+        "unmapped drop carries a loss signal: {:?}",
+        d.attaches
+    );
+    assert_eq!(
+        env.stage2.len(),
+        1,
+        "replacement must re-attach, not reuse or leak"
+    );
     std::fs::remove_dir_all(&dir).unwrap_or_default();
 }
 
@@ -1295,5 +1357,48 @@ fn rebirth_rewalk_heals_candidate_epoch() {
     assert!(
         core.snapshot().tables.iter().any(|t| t.epoch == e1),
         "healed epoch is the live table"
+    );
+}
+
+#[test]
+fn trip_replacement_replans_through_pub_poll() {
+    // F-D/A11 (pub-path smoke): libcrypto replaced under a live
+    // session (same path, new inode) with a same-mapping fresh
+    // plan — detach stale links and re-attach with a
+    // continuity-loss signal, adopting the fresh offsets.
+    let mut env = TestEnv::new();
+    let mut s1 = canned_probe_set();
+    s1.libcrypto = Some((LIBCRYPTO.to_string(), "08:01".to_string(), 200));
+    env.probe_set = Some(s1.clone());
+    let mut core = test_core(true);
+    core.poll(&mut env, ample_budget()).unwrap();
+    assert_eq!(env.trip_install_calls, 1);
+    assert!(core.snapshot().legacy.planned);
+
+    env.maps = live_maps()
+        .into_iter()
+        .map(|mut m| {
+            if m.path == LIBCRYPTO {
+                m.ino = 201;
+            }
+            m
+        })
+        .collect();
+    let mut s2 = s1.clone();
+    s2.libcrypto = Some((LIBCRYPTO.to_string(), "08:01".to_string(), 201));
+    s2.probes[0].offset = 0x1001;
+    env.probe_set = Some(s2.clone());
+    let delta = core.poll(&mut env, ample_budget()).unwrap();
+    assert_eq!(env.trip_detaches, 1, "stale links must detach");
+    assert_eq!(env.trip_install_calls, 2, "same mapping must re-attach");
+    assert!(core.snapshot().legacy.planned);
+    assert_eq!(core.snapshot().legacy.set.as_ref(), Some(&s2));
+    assert!(
+        delta
+            .attaches
+            .iter()
+            .any(|a| matches!(a.kind, AttachKind::Tripwires { .. }) && a.failed.is_some()),
+        "replan must carry a continuity-loss signal: {:?}",
+        delta.attaches
     );
 }

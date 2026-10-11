@@ -561,7 +561,8 @@ fn address_taken_gaps_stay_uninstrumented() {
         path: "libssl.so.3",
         bytes: &ssl,
     }];
-    let set = legacy::probes_for("libcrypto.so.3", &lc, &modules).unwrap();
+    let set =
+        legacy::probes_for("libcrypto.so.3", &lc, &modules, ("08:01".to_string(), 7)).unwrap();
     assert!(
         set.lowlevel_uninstrumented >= 4,
         "Transform gaps lost: {}",
