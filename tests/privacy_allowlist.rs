@@ -11,10 +11,17 @@ fn manifest_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-fn inventory_from_doc() -> BTreeSet<String> {
+/// (harvest, count) sections from the doc's inventory block. The
+/// sections are compared PER OBJECT: a union would let a new map
+/// hide behind a same-named map in the other object (H1's harvest
+/// `GEN` hid behind count's `GEN` — union count stayed 17 by
+/// coincidence).
+fn inventory_from_doc() -> (BTreeSet<String>, BTreeSet<String>) {
     let text = fs::read_to_string(manifest_dir().join("docs/privacy/allowlist-v1.md")).unwrap();
     let mut in_block = false;
-    let mut out = BTreeSet::new();
+    let mut harvest = BTreeSet::new();
+    let mut count = BTreeSet::new();
+    let mut section: Option<&mut BTreeSet<String>> = None;
     for line in text.lines() {
         let t = line.trim();
         if t.starts_with("```") {
@@ -30,17 +37,29 @@ fn inventory_from_doc() -> BTreeSet<String> {
         if !in_block {
             continue;
         }
-        if t.is_empty() || t.starts_with('#') {
+        if t.is_empty() {
+            continue;
+        }
+        if let Some(name) = t.strip_prefix("# ") {
+            section = Some(match name {
+                "harvest" => &mut harvest,
+                "count" => &mut count,
+                other => panic!("unknown inventory section: {other:?}"),
+            });
             continue;
         }
         assert!(
             t.bytes().all(|b| b.is_ascii_uppercase() || b == b'_'),
             "inventory names are BPF map idents, found {t:?}"
         );
-        out.insert(t.to_string());
+        section
+            .as_mut()
+            .expect("inventory entry before any section")
+            .insert(t.to_string());
     }
-    assert!(!out.is_empty(), "map-inventory block missing/empty");
-    out
+    assert!(!harvest.is_empty(), "harvest inventory missing/empty");
+    assert!(!count.is_empty(), "count inventory missing/empty");
+    (harvest, count)
 }
 
 fn maps_from_source(path: &Path) -> BTreeSet<String> {
@@ -77,15 +96,98 @@ fn maps_from_source(path: &Path) -> BTreeSet<String> {
 
 #[test]
 fn map_inventory_matches_sources() {
-    let expected = inventory_from_doc();
-    let mut actual = maps_from_source(&manifest_dir().join("crates/ebpf/src/bin/harvest.rs"));
-    actual.extend(maps_from_source(
-        &manifest_dir().join("crates/ebpf/src/bin/count.rs"),
-    ));
-    assert_eq!(actual.len(), 17, "unexpected map count: {actual:?}");
+    let (doc_harvest, doc_count) = inventory_from_doc();
+    let src_harvest = maps_from_source(&manifest_dir().join("crates/ebpf/src/bin/harvest.rs"));
+    let src_count = maps_from_source(&manifest_dir().join("crates/ebpf/src/bin/count.rs"));
+    assert_eq!(src_harvest.len(), 13, "unexpected harvest map count: {src_harvest:?}");
+    assert_eq!(src_count.len(), 5, "unexpected count map count: {src_count:?}");
     assert_eq!(
-        expected, actual,
-        "allowlist inventory drifted from eBPF maps"
+        doc_harvest, src_harvest,
+        "allowlist harvest inventory drifted from eBPF maps"
+    );
+    assert_eq!(
+        doc_count, src_count,
+        "allowlist count inventory drifted from eBPF maps"
+    );
+}
+
+#[test]
+fn no_raw_runtime_addresses_in_diagnostics() {
+    // Allowlist §2 rule, source-pinned: no diagnostic may print a
+    // raw runtime address, in any base. Named `arr`/`addr` format
+    // args trip this, as does positional hex with an `arr`/`addr`
+    // argument. Deliberately NOT flagged: file offsets
+    // (`off`/`offset`, incl. ELF `vaddr`/symbol values and BPF
+    // section offsets — static locators, not ASLR-slid addresses)
+    // and `#[cfg(test)]` modules (which assert redaction).
+    // (M3: H1's generation diagnostics printed `{arr:#x}` — the
+    // first raw vaddrs on stderr. They now identify tables by op.)
+    fn is_addr_print(line: &str) -> bool {
+        // Named form, any base: `{arr}`, `{addr:#x}`, `{arr:?}`,
+        // `{addr.len}`... The continuation check keeps `{array…}`
+        // idents from tripping it.
+        for name in ["{arr", "{addr"] {
+            let mut rest = line;
+            while let Some(i) = rest.find(name) {
+                let after = rest[i + name.len()..].chars().next();
+                if matches!(after, Some('}') | Some(':') | Some('?') | Some('.')) {
+                    return true;
+                }
+                rest = &rest[i + name.len()..];
+            }
+        }
+        // Positional form: `... {:x} ...", arr)`. Token-boundary
+        // match so `address_taken`-style idents do not trip it.
+        if !line.contains(":x}") {
+            return false;
+        }
+        line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .any(|t| t == "arr" || t == "addr")
+    }
+    fn visit(path: &std::path::Path, hits: &mut Vec<String>) {
+        if path.is_dir() {
+            for entry in fs::read_dir(path).unwrap() {
+                visit(&entry.unwrap().path(), hits);
+            }
+            return;
+        }
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            return;
+        }
+        let text = fs::read_to_string(path).unwrap();
+        let mut depth: i32 = 0;
+        let mut cfg_test_armed = false;
+        let mut test_mod_depth: Option<i32> = None;
+        for (n, line) in text.lines().enumerate() {
+            let t = line.trim();
+            if t == "#[cfg(test)]" {
+                cfg_test_armed = true;
+            } else if cfg_test_armed && t.starts_with("mod ") {
+                test_mod_depth = Some(depth);
+                cfg_test_armed = false;
+            }
+            depth += line.bytes().filter(|b| *b == b'{').count() as i32;
+            depth -= line.bytes().filter(|b| *b == b'}').count() as i32;
+            if let Some(d) = test_mod_depth {
+                if depth <= d {
+                    test_mod_depth = None;
+                } else {
+                    continue;
+                }
+            }
+            if t.starts_with("//") {
+                continue;
+            }
+            if is_addr_print(t) {
+                hits.push(format!("{}:{}: {t}", path.display(), n + 1));
+            }
+        }
+    }
+    let mut hits = Vec::new();
+    visit(&manifest_dir().join("src"), &mut hits);
+    assert!(
+        hits.is_empty(),
+        "raw runtime address in diagnostics (allowlist §2): {hits:?}"
     );
 }
 

@@ -973,7 +973,7 @@ impl SessionCore {
         }
         let generation = self.array_gen.get(&arr).copied().unwrap_or(0) + 1;
         if let Err(e) = env.install_generation(arr, generation) {
-            eprintln!("generation bootstrap failed for array {arr:#x}: {e:#}");
+            eprintln!("generation bootstrap failed for op {op}: {e:#}");
             self.tracker.note_bad_event(coverage::HOST_EVICT_FAILED);
             return None;
         }
@@ -1078,7 +1078,7 @@ impl SessionCore {
             Some(fp) => {
                 let generation = self.array_gen.get(&arr).copied().unwrap_or(0) + 1;
                 if let Err(e) = env.install_generation(arr, generation) {
-                    eprintln!("generation bump failed for array {arr:#x}: {e:#}");
+                    eprintln!("generation bump failed for op {op}: {e:#}");
                     self.tracker.note_bad_event(coverage::HOST_EVICT_FAILED);
                     self.table_epochs.remove(&(op, arr));
                     self.array_gen.remove(&arr);
@@ -2861,7 +2861,7 @@ fn install_gen(maps: &HashMap<String, OwnedFd>, arr: u64, gen_value: u64) -> any
     let mut table = open_hash::<u64, u64>(maps, "GEN")?;
     table
         .insert(arr, gen_value, 0)
-        .map_err(|e| anyhow!("install GEN[{arr:#x}]={gen_value}: {e}"))
+        .map_err(|e| anyhow!("install GEN failed (gen {gen_value}): {e}"))
 }
 
 /// Evict one array's `QUERY_NEXT` cursors across all threads (low

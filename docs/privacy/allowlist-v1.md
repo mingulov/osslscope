@@ -66,10 +66,12 @@ its own):
 
 - `InitRetEvent`: kind/op/funcid plus query-fn address and attach
   cookie. 32 bytes.
-- `RowEvent`: kind/op/funcid plus join addresses/index; no name.
-  40 bytes (`KIND_QUERY_RET` liveness shares the shape).
-- `AlgEvent`: kind/op plus class id, status, weak flag, and the
-  (array, index) join key. 32 bytes.
+- `RowEvent`: kind/op/funcid plus join addresses/index and the
+  incarnation generation cookie; no name. 48 bytes
+  (`KIND_QUERY_RET` liveness shares the shape).
+- `AlgEvent`: kind/op plus class id, status, weak flag, the
+  (array, index) join key, and the incarnation generation
+  cookie. 40 bytes.
 - `TripEvent`: kind/cookie plus class id and status. 16 bytes.
 
 No ring payload carries target string bytes, string lengths, or
@@ -144,6 +146,7 @@ TRIP
 LGCALLS
 ALG_CLASS
 TRIP_CLASS
+GEN
 # count
 COUNTS
 GEN
@@ -162,7 +165,13 @@ engine/load class/name). No map stores target string bytes at rest.
 `TERMD`/`LOSS` are termination proofs and failure counters.
 `WINDOW` holds the two observer-programmed monotonic window bounds
 (start/deadline); like `GEN`/`TARGET` it is numeric observer state,
-never target bytes.
+never target bytes. `GEN` exists in both objects with different
+shapes (harvest: array base → incarnation generation, the
+producer-bound ABA cookie; count: window generation); both are
+observer counters. The `generation` cookie on ring records is
+likewise numeric observer state. Generation diagnostics identify
+tables by op id only — no diagnostic prints raw array addresses
+(allowlist §2 rule; pinned by `no_raw_runtime_addresses_in_diagnostics`).
 
 ## 5. Emitted artifacts
 
