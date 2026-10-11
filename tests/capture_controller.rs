@@ -1560,8 +1560,10 @@ fn prewindow_vs_inwindow_engine() {
         address_taken: Vec::new(),
         by_id_cookies: HashSet::from([7]),
         load_cookies: HashSet::new(),
+        libcrypto: None,
     };
     h.snapshot.legacy.set = Some(set);
+    h.snapshot.legacy.planned = true;
     h.snapshot.legacy.trip = HashMap::from([(7, 999)]);
     h.snapshot.legacy.executed_queries = 999;
     let hit = || osslscope::discovery::legacy::TripHit {
@@ -1639,8 +1641,10 @@ fn transient_load_hits_are_loads_not_executions() {
         address_taken: Vec::new(),
         by_id_cookies: HashSet::new(),
         load_cookies: HashSet::from([9]),
+        libcrypto: None,
     };
     h.snapshot.legacy.set = Some(set);
+    h.snapshot.legacy.planned = true;
     let hit = || osslscope::discovery::legacy::TripHit {
         cookie: 9,
         class: wire::LOAD_LEGACY,
@@ -1819,8 +1823,10 @@ fn slow_metadata_past_deadline_admits_no_tripwire() {
         address_taken: Vec::new(),
         by_id_cookies: HashSet::from([7]),
         load_cookies: HashSet::new(),
+        libcrypto: None,
     };
     h.snapshot.legacy.set = Some(set);
+    h.snapshot.legacy.planned = true;
     let hit = || osslscope::discovery::legacy::TripHit {
         cookie: 7,
         class: wire::ENGINE_DYNAMIC,
@@ -1961,8 +1967,10 @@ fn straddling_poll_tripwire_is_loss_not_evidence() {
         address_taken: Vec::new(),
         by_id_cookies: HashSet::from([7]),
         load_cookies: HashSet::new(),
+        libcrypto: None,
     };
     h.snapshot.legacy.set = Some(set);
+    h.snapshot.legacy.planned = true;
     let hit = || osslscope::discovery::legacy::TripHit {
         cookie: 7,
         class: wire::ENGINE_DYNAMIC,
@@ -1994,6 +2002,80 @@ fn straddling_poll_tripwire_is_loss_not_evidence() {
     assert_eq!(counter_value(&c, "legacy.straddling_poll_trip"), 5);
     assert_eq!(counter_value(&c, "legacy.straddling_poll_lgcalls"), 5);
     assert_eq!(c.counters.over_budget, 1);
+}
+
+#[test]
+fn blind_legacy_renders_history_with_unknown_coverage() {
+    // F-D/A11: anchors superseded mid-window (planned=false) with
+    // a retained last-good set — pre-replacement in-window evidence
+    // still renders (it happened), but legacy coverage is Unknown
+    // (nothing further observable): PARTIAL, never stale-Applicable.
+    use osslscope::discovery::legacy::{Probe, ProbeSet};
+    use osslscope_ebpf_common as wire;
+    let mut h = Harness::fresh("blind-legacy");
+    h.snapshot_attached();
+    let set = ProbeSet {
+        probes: vec![Probe {
+            cookie: 7,
+            symbol: "ENGINE_by_id".to_string(),
+            offset: 0x100,
+            module: "/p/libcrypto.so.3".to_string(),
+            family: None,
+            str_arg: None,
+            program: "trip_count",
+        }],
+        engine_uninstrumented: 0,
+        meth_uninstrumented: 0,
+        lowlevel_uninstrumented: 0,
+        unprobed_engine_syms: Vec::new(),
+        unprobed_meth_syms: Vec::new(),
+        unprobed_lowlevel_syms: Vec::new(),
+        findings: Vec::new(),
+        address_taken: Vec::new(),
+        by_id_cookies: HashSet::from([7]),
+        load_cookies: HashSet::new(),
+        libcrypto: None,
+    };
+    h.snapshot.legacy.set = Some(set);
+    // NOTE: planned stays false — the blind-with-history shape.
+    let hit = || osslscope::discovery::legacy::TripHit {
+        cookie: 7,
+        class: wire::ENGINE_DYNAMIC,
+        status: wire::TRIP_OK,
+    };
+    h.polls.push_back(DiscoveryDelta::default());
+    h.polls.push_back(DiscoveryDelta {
+        tripwire: TripwireDelta {
+            hits: vec![hit()],
+            counter_deltas: vec![(7, 1)],
+            executed_legacy_queries_delta: 1,
+        },
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    h.exit_at_ns = Some(BASE_NS + 1_000_000_000);
+    h.exit_code = 0;
+    let (out, _) = h.run();
+    let c = out.unwrap();
+    assert_eq!(
+        c.legacy["engine"]["calls_by_entrypoint"]["ENGINE_by_id"],
+        serde_json::json!(1)
+    );
+    assert_eq!(
+        c.legacy["legacy_provider"]["executed_queries"],
+        serde_json::json!(1)
+    );
+    let leg = c
+        .document
+        .coverage
+        .iter()
+        .find(|s| s.scope == "legacy")
+        .expect("legacy scope");
+    assert!(
+        matches!(leg.expected, ExpectedScope::Unknown),
+        "blind legacy must be Unknown: {leg:?}"
+    );
+    assert!(matches!(c.outcome, Outcome::Partial), "{:?}", c.outcome);
 }
 
 #[test]

@@ -119,6 +119,11 @@ pub struct ProbeSet {
     pub by_id_cookies: HashSet<u64>,
     /// Provider-load probe cookies (load-name taxonomy).
     pub load_cookies: HashSet<u64>,
+    /// Libcrypto the plan resolved against: (path, dev, ino).
+    /// Anchor bindings validate this identity against current
+    /// mappings every poll (F-D/A11); a mismatch means the plan's
+    /// offsets describe bytes no longer mapped.
+    pub libcrypto: Option<(String, String, u64)>,
 }
 
 impl ProbeSet {
@@ -654,10 +659,18 @@ pub fn probes_for(
     libcrypto_path: &str,
     libcrypto_elf: &[u8],
     modules: &[Module],
+    libcrypto_ident: (String, u64),
 ) -> anyhow::Result<ProbeSet> {
     let entries = elf::dynsym_func_entries(libcrypto_elf)?;
     let by_name: HashMap<&str, u64> = entries.iter().map(|(n, o)| (n.as_str(), *o)).collect();
-    let mut set = ProbeSet::default();
+    let mut set = ProbeSet {
+        libcrypto: Some((
+            libcrypto_path.to_string(),
+            libcrypto_ident.0,
+            libcrypto_ident.1,
+        )),
+        ..ProbeSet::default()
+    };
     let mut cookie = 0u64;
     // Loads first (cookies 0..2, pinned under the cap).
     let mut seen_load = HashSet::new();
@@ -1642,8 +1655,12 @@ mod tests {
             .into_iter()
             .find_map(|p| std::fs::read(p).ok())
             .expect("no libc — broken test env");
-        let set = probes_for("libc.so.6", &b, &[]).unwrap();
+        let set = probes_for("libc.so.6", &b, &[], ("08:01".to_string(), 7)).unwrap();
         assert!(set.probes.is_empty());
+        assert_eq!(
+            set.libcrypto,
+            Some(("libc.so.6".to_string(), "08:01".to_string(), 7))
+        );
         assert_eq!(set.engine_uninstrumented, 0);
         assert_eq!(set.meth_uninstrumented, 0);
         assert_eq!(set.lowlevel_uninstrumented, 0);
@@ -1702,6 +1719,7 @@ mod tests {
             address_taken: vec![],
             by_id_cookies: [0].into_iter().collect(),
             load_cookies: [2].into_iter().collect(),
+            libcrypto: None,
         };
         let trip: HashMap<u64, u64> = [(0, 1), (1, 5), (2, 2), (3, 9)].into_iter().collect();
         let hits = vec![

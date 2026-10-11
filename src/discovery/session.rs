@@ -266,6 +266,9 @@ pub enum AttachKind {
     Stage2 { cookie: u64 },
     /// Legacy tripwire batch.
     Tripwires { count: usize },
+    /// Dispatch anchor pair (init or builtin query) reinstalled
+    /// after replacement (F-D/A11).
+    DispatchAnchors { count: usize },
 }
 
 /// One table-incarnation retirement this poll: the epoch that
@@ -436,6 +439,15 @@ pub struct MapSnapshots {
     pub lgcalls_failed: bool,
 }
 
+/// Fresh dispatch anchor binding after a reinstall (F-D/A11):
+/// the (path, dev, ino) the new links pin, plus the resolution
+/// label when the non-default ladder rung applied.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DispatchReinstall {
+    pub binding: (String, String, u64),
+    pub resolution: Option<String>,
+}
+
 /// Privileged/file operations the [`SessionCore`] needs. The live
 /// implementation ([`LiveEnv`]) performs real BPF and `/proc` work;
 /// host tests stage synthetic rings, maps, snapshots, links, and
@@ -484,6 +496,23 @@ pub trait SessionEnv {
     fn quiesce(&mut self);
     /// Live link counts as `(dispatch, tripwire)`.
     fn link_counts(&self) -> (u64, u64);
+    /// Detach the legacy tripwire batch, including the legacy-init
+    /// pairs installed with it (F-D/A11: replacement invalidated
+    /// the plan's offsets).
+    fn detach_trips(&mut self);
+    /// Detach the dispatch anchor pairs (init or builtin query),
+    /// excluding stage-2 links (F-D/A11).
+    fn detach_dispatch_anchors(&mut self);
+    /// Detach one cookie's stage-2 links (F-D/A11: the cookie's
+    /// target was superseded or unmapped).
+    fn detach_stage2(&mut self, cookie: u64);
+    /// Re-resolve the dispatch anchor against the current provider
+    /// file and install a fresh pair, returning its binding
+    /// (F-D/A11). Fails when the provider is unmapped or the
+    /// anchor is unresolvable (the core latches blind and retries
+    /// on fingerprint change); an `InvalidData` error is a
+    /// transient file race (retry next poll, no latch).
+    fn reinstall_dispatch(&mut self) -> anyhow::Result<DispatchReinstall>;
 }
 
 /// Pid recycle mid-observation: carries the discarded-state
@@ -571,6 +600,80 @@ fn incarnation_of(maps: &[maps::Mapping], arr: u64) -> Option<Fingerprint> {
         .map(|m| (m.dev.clone(), m.ino, m.start, m.end, m.offset))
 }
 
+/// Cookie-meaning equality for tripwire re-plans (F-D/A11): the
+/// same (cookie, symbol, module, family, string-arg, program) pairs
+/// as sets (offsets excluded — they legitimately move across
+/// replacement; order excluded — the TRIP map keys by cookie).
+/// Equal mappings re-attach soundly (accumulation continues under
+/// unchanged meanings); anything else must stay blind (fresh
+/// cookies would collide with old meanings).
+/// Cookie-meaning key for one tripwire probe (everything but the
+/// file offset, which legitimately moves across replacement).
+type TripProbeKey<'a> = (
+    u64,
+    &'a str,
+    &'a str,
+    Option<&'static str>,
+    Option<usize>,
+    &'static str,
+);
+
+fn trip_mapping_equal(a: &legacy::ProbeSet, b: &legacy::ProbeSet) -> bool {
+    use std::collections::HashSet;
+    fn pairs(set: &legacy::ProbeSet) -> HashSet<TripProbeKey<'_>> {
+        set.probes
+            .iter()
+            .map(|p| {
+                (
+                    p.cookie,
+                    p.symbol.as_str(),
+                    p.module.as_str(),
+                    p.family,
+                    p.str_arg,
+                    p.program,
+                )
+            })
+            .collect()
+    }
+    pairs(a) == pairs(b)
+}
+
+/// The mapped libcrypto entry a plan would resolve against, if any
+/// (shared by planning and blind-latch fingerprints so the two
+/// cannot select different entries).
+fn libcrypto_entry(maps: &[maps::Mapping]) -> Option<&maps::Mapping> {
+    legacy::find_libcrypto(maps).and_then(|path| maps.iter().find(|m| m.path == path))
+}
+
+/// Current libcrypto fingerprint: (path, dev, ino) or `None` when
+/// unmapped (F-D/A11 blind-latch print).
+fn libcrypto_print(maps: &[maps::Mapping]) -> Option<(String, String, u64)> {
+    libcrypto_entry(maps).map(|m| (m.path.clone(), m.dev.clone(), m.ino))
+}
+
+/// Current provider fingerprint: (path, dev, ino) or `None` when
+/// unmapped (F-D/A11 blind-latch print).
+fn provider_print(
+    provider: &Path,
+    canon: &str,
+    maps: &[maps::Mapping],
+) -> Option<(String, String, u64)> {
+    let prov = provider.to_string_lossy();
+    maps.iter()
+        .find(|m| m.path == prov || m.path == canon)
+        .map(|m| (m.path.clone(), m.dev.clone(), m.ino))
+}
+
+/// Transient file-race errors (F-D/A11): the target file changed
+/// mid-operation — retry next poll without latching blind and
+/// without failing the poll. Only the A3 bound-read mid-read
+/// signal and the plan/reinstall identity-mismatch errors use
+/// `InvalidData`, so the match is precise.
+fn is_transient_race(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<std::io::Error>()
+        .is_some_and(|io| io.kind() == std::io::ErrorKind::InvalidData)
+}
+
 /// The discovery state machine: ring decode, epoch binding,
 /// monotonic joins, event-driven retry, and delta/snapshot
 /// accounting, with no direct BPF dependency. Drive it with
@@ -613,6 +716,17 @@ pub struct SessionCore {
     trip_hits: Vec<legacy::TripHit>,
     probe_set: Option<legacy::ProbeSet>,
     staged_trips: Option<legacy::ProbeSet>,
+    /// Tripwire anchors live (F-D/A11): links installed against
+    /// the bound libcrypto. `probe_set` retains the last-good plan
+    /// for rendering history while blind.
+    trip_live: bool,
+    /// Libcrypto (path, dev, ino) the live tripwire links pin.
+    trip_bound: Option<(String, String, u64)>,
+    /// Blind latch (F-D/A11): a changed-mapping replacement
+    /// declined re-attach; planning resumes when the libcrypto
+    /// fingerprint differs from the latch print (bounded reads).
+    trip_blind: bool,
+    trip_blind_print: Option<(String, String, u64)>,
     legacy_note: Option<String>,
     attached_queries: HashSet<u64>,
     /// Installed stage-2 target per cookie: (file offset, attach
@@ -624,7 +738,16 @@ pub struct SessionCore {
     pending_stage2: std::collections::VecDeque<(u64, u64)>,
     primary_init_observed: bool,
     trigger_observed: bool,
-    bootstrap_attached: bool,
+    /// Dispatch anchors live (F-D/A11): init/query links installed
+    /// against the bound provider file. Cleared when replacement
+    /// invalidates the binding, restored by reinstall.
+    dispatch_live: bool,
+    /// Provider (path, dev, ino) the live dispatch links pin.
+    dispatch_bound: Option<(String, String, u64)>,
+    /// Blind latch (F-D/A11): a failed reinstall retries only when
+    /// the provider fingerprint differs from the latch print.
+    dispatch_blind: bool,
+    dispatch_blind_print: Option<(String, String, u64)>,
     preset_reason: Option<String>,
     resolution: Option<String>,
     trunc_seen: HashMap<u32, u64>,
@@ -669,6 +792,10 @@ impl SessionCore {
             trip_hits: Vec::new(),
             probe_set: None,
             staged_trips: None,
+            trip_live: false,
+            trip_bound: None,
+            trip_blind: false,
+            trip_blind_print: None,
             legacy_note: None,
             attached_queries: HashSet::new(),
             attached_targets: HashMap::new(),
@@ -677,7 +804,10 @@ impl SessionCore {
             pending_stage2: std::collections::VecDeque::new(),
             primary_init_observed: false,
             trigger_observed: false,
-            bootstrap_attached: false,
+            dispatch_live: false,
+            dispatch_bound: None,
+            dispatch_blind: false,
+            dispatch_blind_print: None,
             preset_reason: None,
             resolution: None,
             trunc_seen: HashMap::new(),
@@ -690,14 +820,19 @@ impl SessionCore {
     }
 
     /// Record the live bootstrap outcome (init/builtin anchor
-    /// installed, or blind with a preset reason).
+    /// installed, or blind with a preset reason) plus the provider
+    /// identity the installed links pin (F-D/A11 anchor binding;
+    /// `None` when the file was unstatable — validation then trusts
+    /// the links as before).
     pub(crate) fn set_bootstrap(
         &mut self,
         attached: bool,
         preset_reason: Option<String>,
         resolution: Option<String>,
+        binding: Option<(String, String, u64)>,
     ) {
-        self.bootstrap_attached = attached;
+        self.dispatch_live = attached;
+        self.dispatch_bound = binding;
         self.preset_reason = preset_reason;
         self.resolution = resolution;
     }
@@ -727,6 +862,10 @@ impl SessionCore {
         if self.legacy_note.is_none() {
             self.legacy_note = note;
         }
+        // Freshly installed at attach: live against the plan's own
+        // libcrypto binding (validated from the first poll).
+        self.trip_bound = set.libcrypto.clone();
+        self.trip_live = true;
         self.probe_set = Some(set);
     }
 
@@ -918,12 +1057,20 @@ impl SessionCore {
         self.trip_hits.clear();
         self.probe_set = None;
         self.staged_trips = None;
+        self.trip_live = false;
+        self.trip_bound = None;
+        self.trip_blind = false;
+        self.trip_blind_print = None;
         self.legacy_note = None;
         self.attached_queries.clear();
         self.attached_targets.clear();
         self.attach_failures.clear();
         self.reloads.clear();
         self.pending_stage2.clear();
+        self.dispatch_live = false;
+        self.dispatch_bound = None;
+        self.dispatch_blind = false;
+        self.dispatch_blind_print = None;
         self.stashed = None;
         self.primary_init_observed = false;
         self.trigger_observed = false;
@@ -969,6 +1116,71 @@ impl SessionCore {
         (state, self.trunc_seen.get(&op).copied().unwrap_or(0))
     }
 
+    /// Validate anchor bindings against current mappings (F-D/A11).
+    /// Links pin the bytes they resolved at attach, so a bound
+    /// (dev, ino) that is no longer mapped means dead links (exec,
+    /// dlclose, replacement): detach them and clear readiness. The
+    /// planning gates below re-establish what is soundly
+    /// re-establishable; invalidation itself is silent (the outcome
+    /// — replan, reinstall, or blind latch — carries the loss
+    /// signal, exactly once per replacement).
+    fn reconcile_anchors<E: SessionEnv>(
+        &mut self,
+        env: &mut E,
+        maps: &[maps::Mapping],
+        delta: &mut DiscoveryDelta,
+    ) {
+        if self.trip_live
+            && let Some((_, dev, ino)) = &self.trip_bound
+            && !maps.iter().any(|m| &m.dev == dev && m.ino == *ino)
+        {
+            env.detach_trips();
+            // A staged plan resolved against the old maps: stale
+            // offsets, never installable.
+            self.staged_trips = None;
+            self.trip_live = false;
+        }
+        if self.dispatch_live
+            && let Some((_, dev, ino)) = &self.dispatch_bound
+            && !maps.iter().any(|m| &m.dev == dev && m.ino == *ino)
+        {
+            env.detach_dispatch_anchors();
+            self.dispatch_live = false;
+        }
+        // Stage-2 targets whose backing vanished: detach and forget
+        // (dead links never count as live coverage). Unlike the
+        // planes above there is no follow-up outcome — removal is
+        // terminal, so it signals here.
+        let dead: Vec<u64> = self
+            .attached_targets
+            .iter()
+            .filter(|(_, (_, _, dev, ino))| !maps.iter().any(|m| &m.dev == dev && m.ino == *ino))
+            .map(|(cookie, _)| *cookie)
+            .collect();
+        for cookie in dead {
+            env.detach_stage2(cookie);
+            self.attached_queries.remove(&cookie);
+            self.attached_targets.remove(&cookie);
+            delta.attaches.push(AttachEvent {
+                kind: AttachKind::Stage2 { cookie },
+                failed: Some("stage-2 target unmapped; link detached".to_string()),
+            });
+        }
+    }
+
+    /// A tripwire replan is due when not latched blind, or when the
+    /// libcrypto fingerprint moved under the latch (F-D/A11).
+    fn trip_replan_due(&self, maps: &[maps::Mapping]) -> bool {
+        !self.trip_blind || libcrypto_print(maps) != self.trip_blind_print
+    }
+
+    /// A dispatch reinstall is due when not latched blind, or when
+    /// the provider fingerprint moved under the latch (F-D/A11).
+    fn dispatch_reinstall_due(&self, maps: &[maps::Mapping]) -> bool {
+        !self.dispatch_blind
+            || provider_print(&self.provider, &self.canon, maps) != self.dispatch_blind_print
+    }
+
     /// One bounded poll: verify the pin, reconcile epochs, plan
     /// deferred tripwires, decode up to `budget.max_events` ring
     /// items, install up to `budget.max_attaches` pending links,
@@ -994,30 +1206,107 @@ impl SessionCore {
         let mut delta = DiscoveryDelta::default();
         let mut touched: HashSet<(u32, u64)> = HashSet::new();
 
+        // F-D/A11: validate anchor bindings before planning or
+        // installing anything — replacement invalidates pins, and
+        // stale links must detach before fresh ones attach.
+        self.reconcile_anchors(env, &maps, &mut delta);
+
         let mut attaches_done = 0u32;
         // Deferred legacy planning: pre-exec images have no
         // libcrypto; plan at the first poll where it appears, and
         // install under the same attach budget as stage-2 pairs (a
         // zero budget stages the plan without installing).
-        if self.legacy_enabled && self.probe_set.is_none() {
+        // F-D/A11: the same gate re-establishes superseded anchors
+        // (reconcile cleared `trip_live` above): a fresh plan with
+        // an identical cookie mapping re-attaches soundly, anything
+        // else latches blind (fresh cookies would collide with old
+        // meanings), and unmapped libcrypto latches silently on
+        // first plan, loudly on replacement.
+        if self.legacy_enabled && !self.trip_live && self.trip_replan_due(&maps) {
             if self.staged_trips.is_none() && legacy::find_libcrypto(&maps).is_some() {
-                self.staged_trips = env.plan_trips(&maps)?;
+                match env.plan_trips(&maps) {
+                    Err(e) if is_transient_race(&e) => {
+                        // File swapped mid-plan: retry next poll
+                        // (no latch — the maps fingerprint is
+                        // unchanged, so a latch would stick blind
+                        // past a transient race).
+                    }
+                    Err(e) => return Err(e),
+                    Ok(None) => {
+                        self.trip_blind = true;
+                        self.trip_blind_print = libcrypto_print(&maps);
+                        if self.probe_set.is_some() {
+                            delta.attaches.push(AttachEvent {
+                                kind: AttachKind::Tripwires { count: 0 },
+                                failed: Some(
+                                    "libcrypto unmapped after replacement; \
+                                     tripwire anchors blind"
+                                        .to_string(),
+                                ),
+                            });
+                        }
+                    }
+                    Ok(Some(fresh)) => {
+                        let sound = match &self.probe_set {
+                            Some(stale) => trip_mapping_equal(stale, &fresh),
+                            // First plan: no old meanings to collide.
+                            None => true,
+                        };
+                        if sound {
+                            self.staged_trips = Some(fresh);
+                        } else {
+                            self.trip_blind = true;
+                            self.trip_blind_print = libcrypto_print(&maps);
+                            delta.attaches.push(AttachEvent {
+                                kind: AttachKind::Tripwires {
+                                    count: fresh.probes.len(),
+                                },
+                                failed: Some(
+                                    "tripwire mapping changed across replacement; \
+                                     anchors blind (cookie meanings shifted)"
+                                        .to_string(),
+                                ),
+                            });
+                        }
+                    }
+                }
             }
             if let Some(set) = self.staged_trips.clone()
                 && attaches_done < budget.max_attaches
             {
                 attaches_done += 1;
                 let count = set.probes.len();
-                let note = env.install_trips(&set, self.pid)?;
-                if self.legacy_note.is_none() {
-                    self.legacy_note = note;
+                let replan = self.probe_set.is_some();
+                match env.install_trips(&set, self.pid) {
+                    Err(e) if is_transient_race(&e) => {
+                        // Swap spanned the install (rolled back by
+                        // the env): drop the staged plan and retry
+                        // next poll without latching blind.
+                        self.staged_trips = None;
+                    }
+                    Err(e) => return Err(e),
+                    Ok(note) => {
+                        if self.legacy_note.is_none() {
+                            self.legacy_note = note;
+                        }
+                        // Freshly installed: live against the
+                        // plan's own libcrypto binding (validated
+                        // from the next poll).
+                        self.trip_bound = set.libcrypto.clone();
+                        self.trip_live = true;
+                        self.trip_blind = false;
+                        self.probe_set = Some(set);
+                        self.staged_trips = None;
+                        delta.attaches.push(AttachEvent {
+                            kind: AttachKind::Tripwires { count },
+                            failed: replan.then(|| {
+                                "tripwire anchors re-established after replacement \
+                                 (identical mapping)"
+                                    .to_string()
+                            }),
+                        });
+                    }
                 }
-                self.probe_set = Some(set);
-                self.staged_trips = None;
-                delta.attaches.push(AttachEvent {
-                    kind: AttachKind::Tripwires { count },
-                    failed: None,
-                });
             }
         }
 
@@ -1091,6 +1380,15 @@ impl SessionCore {
                         env.pretouch(cookie, addr);
                         continue;
                     }
+                    // F-D/A11: superseding install — the same
+                    // cookie re-resolved to a different target
+                    // (replacement). Detach the old link first: it
+                    // pins the old bytes and would attribute to the
+                    // new meaning.
+                    let supersede = self.attached_queries.contains(&cookie);
+                    if supersede {
+                        env.detach_stage2(cookie);
+                    }
                     match env.install_stage2(cookie, t.off, &t.path, self.pid, t.expected) {
                         Err(e) => {
                             self.record_attach_failure(&mut delta, cookie, format!("{e:#}"));
@@ -1104,6 +1402,16 @@ impl SessionCore {
                                 kind: AttachKind::Stage2 { cookie },
                                 failed: None,
                             });
+                            if supersede {
+                                delta.attaches.push(AttachEvent {
+                                    kind: AttachKind::Stage2 { cookie },
+                                    failed: Some(
+                                        "stage-2 target superseded by replacement; \
+                                         old link detached"
+                                            .to_string(),
+                                    ),
+                                });
+                            }
                         }
                     }
                 }
@@ -1111,6 +1419,49 @@ impl SessionCore {
         }
         if self.staged_trips.is_some() || !self.pending_stage2.is_empty() {
             delta.budget_exhausted = true;
+        }
+
+        // F-D/A11: re-establish superseded dispatch anchors under
+        // the same attach budget (bounded batches). Success restores
+        // readiness with a continuity caveat (the replacement gap is
+        // unproven); failure latches blind until the provider
+        // fingerprint moves; a transient file race retries next
+        // poll without latching.
+        if !self.dispatch_live
+            && self.dispatch_bound.is_some()
+            && self.dispatch_reinstall_due(&maps)
+            && attaches_done < budget.max_attaches
+        {
+            // Gated on the remaining budget (bounded batches);
+            // no counter increment — nothing observes attach
+            // counts past this point.
+            match env.reinstall_dispatch() {
+                Err(e) if is_transient_race(&e) => {}
+                Err(e) => {
+                    self.dispatch_blind = true;
+                    self.dispatch_blind_print = provider_print(&self.provider, &self.canon, &maps);
+                    self.preset_reason = Some("anchor-unresolved".to_string());
+                    delta.attaches.push(AttachEvent {
+                        kind: AttachKind::DispatchAnchors { count: 0 },
+                        failed: Some(format!("dispatch reinstall failed: {e:#}")),
+                    });
+                }
+                Ok(fresh) => {
+                    self.dispatch_bound = Some(fresh.binding);
+                    self.dispatch_live = true;
+                    self.dispatch_blind = false;
+                    self.resolution = fresh.resolution;
+                    self.preset_reason = None;
+                    delta.attaches.push(AttachEvent {
+                        kind: AttachKind::DispatchAnchors { count: 2 },
+                        failed: Some(
+                            "dispatch anchors re-established after replacement; \
+                             continuity unproven"
+                                .to_string(),
+                        ),
+                    });
+                }
+            }
         }
 
         // Map-only transitions (a late proof, a fresh TRUNC bit)
@@ -1592,7 +1943,7 @@ impl SessionCore {
             queries_observed: self.queries_total(),
             ops_hit,
             dispatch: DispatchSnapshot {
-                attached: self.bootstrap_attached || !self.attached_queries.is_empty(),
+                attached: self.dispatch_live || !self.attached_queries.is_empty(),
                 preset_reason: self.preset_reason.clone(),
                 resolution: self.resolution.clone(),
                 attach_failures,
@@ -1601,7 +1952,7 @@ impl SessionCore {
                 trigger_observed: self.trigger_observed,
             },
             legacy: LegacySnapshot {
-                planned: self.probe_set.is_some(),
+                planned: self.trip_live,
                 set: self.probe_set.clone(),
                 trip: self.trip_joined.clone(),
                 hits: self.trip_hits.clone(),
@@ -1751,23 +2102,28 @@ fn union_reasons(retained: &[String], live: &[String]) -> Vec<String> {
 // ---------------------------------------------------------------------------
 
 /// Attach-link plane: dispatch anchors/pairs vs tripwires (the
-/// liveness witness keeps the planes separate).
+/// liveness witness keeps the planes separate). Stage-2 query
+/// pairs are their own kind so replacement reconciliation can
+/// detach them per cookie without touching the anchors (F-D/A11).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LinkKind {
     Init,
     Query,
     Tripwire,
+    Stage2,
 }
 
 /// Owned multi links (drop = detach) with their plane records.
+/// Cookies ride along so selective detach can identify batch
+/// members (tripwire links carry the whole batch's cookies).
 #[derive(Default)]
 pub(crate) struct LinkSet {
-    links: Vec<(OwnedFd, LinkKind)>,
+    links: Vec<(OwnedFd, LinkKind, Vec<u64>)>,
 }
 
 impl LinkSet {
-    fn push(&mut self, fd: OwnedFd, kind: LinkKind) {
-        self.links.push((fd, kind));
+    fn push(&mut self, fd: OwnedFd, kind: LinkKind, cookies: Vec<u64>) {
+        self.links.push((fd, kind, cookies));
     }
 
     fn clear(&mut self) {
@@ -1780,12 +2136,18 @@ impl LinkSet {
         self.links.truncate(len);
     }
 
+    /// Detach every link matching `pred` (fd close = detach).
+    fn remove_matching(&mut self, mut pred: impl FnMut(LinkKind, &[u64]) -> bool) {
+        self.links
+            .retain(|(_, kind, cookies)| !pred(*kind, cookies));
+    }
+
     fn counts(&self) -> (u64, u64) {
         let mut dispatch = 0u64;
         let mut tripwire = 0u64;
-        for (_, kind) in &self.links {
+        for (_, kind, _) in &self.links {
             match kind {
-                LinkKind::Init | LinkKind::Query => dispatch += 1,
+                LinkKind::Init | LinkKind::Query | LinkKind::Stage2 => dispatch += 1,
                 LinkKind::Tripwire => tripwire += 1,
             }
         }
@@ -1841,8 +2203,8 @@ fn attach_pair(
         pid,
     )
     .map_err(|e| anyhow!("attach {ret}@{offset:#x}: {e}"))?;
-    links.push(entry_link, kind);
-    links.push(ret_link, kind);
+    links.push(entry_link, kind, vec![cookie]);
+    links.push(ret_link, kind, vec![cookie]);
     Ok(())
 }
 
@@ -1874,7 +2236,7 @@ fn attach_trips(
             pid,
         )
         .map_err(|e| anyhow!("attach {prog_name}@{module}+{}: {e}", offsets.len()))?;
-        links.push(link, LinkKind::Tripwire);
+        links.push(link, LinkKind::Tripwire, cookies.clone());
     }
     Ok(())
 }
@@ -2155,6 +2517,22 @@ pub struct LiveEnv {
     links: LinkSet,
     ring: RingBuf<MapData>,
     pin: crate::pin::TargetPin,
+    /// Retained dispatch anchor recipe (F-D/A11): reinstall
+    /// re-resolves with the same flavor/table/flags as attach.
+    /// `None` when attach installed no dispatch anchor.
+    dispatch_spec: Option<DispatchSpec>,
+}
+
+/// Dispatch anchor recipe retained for post-replacement
+/// reinstalls: the same resolution the attach used.
+#[derive(Clone, Debug)]
+pub(crate) enum DispatchSpec {
+    Init,
+    Builtin {
+        table: builtin::Table,
+        force_offset: Option<u64>,
+        explicit_offsets: bool,
+    },
 }
 
 impl SessionEnv for LiveEnv {
@@ -2237,7 +2615,7 @@ impl SessionEnv for LiveEnv {
             path,
             pid,
             cookie,
-            LinkKind::Query,
+            LinkKind::Stage2,
         )?;
         // `None` expected (unstatable at resolve) never binds.
         let bound =
@@ -2258,6 +2636,25 @@ impl SessionEnv for LiveEnv {
         set: &legacy::ProbeSet,
         pid: u32,
     ) -> anyhow::Result<Option<String>> {
+        // F-D/A11: plan/install binding check (A1 pattern) — the
+        // plan's offsets describe its bound libcrypto; a swap
+        // between plan and install would pin the new bytes at old
+        // offsets. Roll back and fail loud (the core retries).
+        let links_before = self.links.links.len();
+        let expected = set.libcrypto.as_ref().and_then(|(path, dev, ino)| {
+            crate::plan::device_id_of_maps_dev(dev).map(|enc| (path.clone(), (enc, *ino)))
+        });
+        let ident_of = |p: &str| {
+            std::fs::metadata(p)
+                .map(|m| {
+                    (
+                        crate::plan::encode_device(libc::major(m.dev()), libc::minor(m.dev())),
+                        m.ino(),
+                    )
+                })
+                .ok()
+        };
+        let before = expected.as_ref().and_then(|(path, _)| ident_of(path));
         attach_trips(&self.loaded, &mut self.links, set, pid)?;
         eprintln!("INSPECT stage=legacy trips={}", set.probes.len());
         let mut note = None;
@@ -2288,15 +2685,56 @@ impl SessionEnv for LiveEnv {
                 }
             }
         }
+        // Whole-batch binding check (A1 pattern): the plan's
+        // offsets describe its bound libcrypto — a swap spanning
+        // the install would pin new bytes at old offsets. Roll the
+        // batch back and fail loud (the core retries); unbound
+        // plans (hand-built sets only) skip verification.
+        let bound = match (&expected, &before) {
+            (Some((path, e)), Some(b)) if b == e => {
+                crate::plan::binding_holds(&before, &ident_of(path), e)
+            }
+            _ => true,
+        };
+        if !bound {
+            self.links.truncate(links_before);
+            // Transient-typed (InvalidData): the core retries next
+            // poll without latching blind or failing the poll.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "tripwire install raced a libcrypto replacement",
+            )
+            .into());
+        }
         Ok(note)
     }
 
     fn plan_trips(&mut self, maps: &[maps::Mapping]) -> anyhow::Result<Option<legacy::ProbeSet>> {
-        let Some(lc_path) = legacy::find_libcrypto(maps) else {
+        let Some(entry) = libcrypto_entry(maps) else {
             return Ok(None);
         };
-        let lc_bytes =
-            std::fs::read(&lc_path).with_context(|| format!("read target libcrypto {lc_path}"))?;
+        let lc_path = entry.path.clone();
+        // F-D/A11: the plan binds the MAPPED identity — the bytes
+        // must be the mapped file's (same open), else a swap between
+        // the maps read and this read resolves offsets for the wrong
+        // bytes. Identity mismatch → InvalidData (the core retries
+        // next poll as a transient, without latching blind);
+        // unmapped-race (gone between find and read) → Ok(None);
+        // other IO errors propagate (pre-existing posture).
+        let bound = match crate::plan::read_file_bound(&lc_path) {
+            Ok(fb) => fb,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let file_ident = (crate::plan::render_device(bound.dev), bound.ino);
+        if file_ident != (entry.dev.clone(), entry.ino) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("libcrypto {lc_path} changed during plan"),
+            )
+            .into());
+        }
+        let lc_bytes = bound.bytes;
         // Caller modules for low-level PLT planning. Unreadable
         // files (deleted-but-mapped, permissions) are loud
         // findings: their imports stay unknown.
@@ -2312,7 +2750,12 @@ impl SessionEnv for LiveEnv {
             .iter()
             .map(|(p, b)| legacy::Module { path: p, bytes: b })
             .collect();
-        let mut set = legacy::probes_for(&lc_path, &lc_bytes, &modules)?;
+        let mut set = legacy::probes_for(
+            &lc_path,
+            &lc_bytes,
+            &modules,
+            (entry.dev.clone(), entry.ino),
+        )?;
         for path in &unreadable {
             set.findings
                 .push(format!("unreadable module: {path} (imports unknown)"));
@@ -2354,6 +2797,132 @@ impl SessionEnv for LiveEnv {
 
     fn link_counts(&self) -> (u64, u64) {
         self.links.counts()
+    }
+
+    fn detach_trips(&mut self) {
+        // The whole tripwire plane, including the legacy-init
+        // pairs installed with the batch (Init links carrying the
+        // legacy cookie).
+        self.links.remove_matching(|kind, cookies| {
+            kind == LinkKind::Tripwire
+                || (kind == LinkKind::Init && cookies.contains(&harvest::LEGACY_COOKIE))
+        });
+    }
+
+    fn detach_dispatch_anchors(&mut self) {
+        // Init/query anchors only: stage-2 pairs (their own kind)
+        // and legacy-init pairs (tripwire batch) survive.
+        self.links.remove_matching(|kind, cookies| {
+            (kind == LinkKind::Init && !cookies.contains(&harvest::LEGACY_COOKIE))
+                || kind == LinkKind::Query
+        });
+    }
+
+    fn detach_stage2(&mut self, cookie: u64) {
+        self.links
+            .remove_matching(|kind, cookies| kind == LinkKind::Stage2 && cookies.contains(&cookie));
+    }
+
+    fn reinstall_dispatch(&mut self) -> anyhow::Result<DispatchReinstall> {
+        // F-D/A11: re-resolve with the attach-time recipe against
+        // the CURRENT provider file, then pin a fresh pair. The
+        // bytes must be the mapped file's (same open, A3 helper) —
+        // mismatch is a transient race (InvalidData, retry next
+        // poll); the attach itself carries the A1-grade
+        // resolve/attach binding check with rollback.
+        let spec = self
+            .dispatch_spec
+            .clone()
+            .context("no dispatch anchor to reinstall")?;
+        let live = maps::read_maps(self.pid)?;
+        let prov_path = self.provider.to_string_lossy().into_owned();
+        let entry = live
+            .iter()
+            .find(|m| m.path == prov_path || m.path == self.canon)
+            .context("provider unmapped")?;
+        let bound = crate::plan::read_file_bound(&prov_path)?;
+        let file_ident = (crate::plan::render_device(bound.dev), bound.ino);
+        if file_ident != (entry.dev.clone(), entry.ino) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("provider {prov_path} changed during reinstall"),
+            )
+            .into());
+        }
+        let (off, prog_entry, prog_ret, resolution) = match &spec {
+            DispatchSpec::Init => {
+                let (off, res) = elf::dynsym_file_offset(&bound.bytes, INIT_ANCHOR)
+                    .map(|off| (off, None))
+                    .or_else(|_| {
+                        elf::symtab_file_offset(&bound.bytes, INIT_ANCHOR)
+                            .map(|off| (off, Some("symtab".to_string())))
+                    })
+                    .map_err(|e| anyhow!("reinstall anchor unresolved: {e:#}"))?;
+                (off, "init_entry", "init_return", res)
+            }
+            DispatchSpec::Builtin {
+                table,
+                force_offset,
+                explicit_offsets,
+            } => {
+                let (off, r) = if *explicit_offsets {
+                    builtin::resolve_query_offset(&bound.bytes, table, *force_offset)
+                } else {
+                    builtin::resolve_supported_offset(&bound.bytes, table)
+                }
+                .map_err(|e| anyhow!("reinstall anchor unresolved: {e:#}"))?;
+                let res = (r != builtin::Resolution::Table).then(|| r.as_str().to_string());
+                (off, "query_entry", "query_return", res)
+            }
+        };
+        let ident_of = |p: &Path| {
+            std::fs::metadata(p)
+                .map(|m| {
+                    (
+                        crate::plan::encode_device(libc::major(m.dev()), libc::minor(m.dev())),
+                        m.ino(),
+                    )
+                })
+                .ok()
+        };
+        let expected = Some((bound.dev, bound.ino));
+        let before = ident_of(&self.provider);
+        let links_before = self.links.links.len();
+        attach_pair(
+            &self.loaded,
+            &mut self.links,
+            prog_entry,
+            prog_ret,
+            off,
+            &self.provider,
+            self.pid,
+            0,
+            if matches!(spec, DispatchSpec::Init) {
+                LinkKind::Init
+            } else {
+                LinkKind::Query
+            },
+        )?;
+        let bound_ok = expected
+            .is_some_and(|e| crate::plan::binding_holds(&before, &ident_of(&self.provider), &e));
+        if !bound_ok {
+            self.links.truncate(links_before);
+            // Transient-typed (InvalidData): the core retries next
+            // poll without latching blind or failing the poll.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "dispatch reinstall raced a same-path replacement for {}",
+                    self.provider.display()
+                ),
+            )
+            .into());
+        }
+        eprintln!("INSPECT stage=reinstall off={off:#x}");
+        Ok(DispatchReinstall {
+            binding: (prov_path, entry.dev.clone(), entry.ino),
+            resolution,
+        })
     }
 }
 
@@ -2409,6 +2978,10 @@ impl DiscoverySession {
         let mut builtin_query_attached = false;
         let mut builtin_query_offset = 0u64;
         let mut resolution: Option<String> = None;
+        // F-D/A11 anchor bindings: the identities the installed
+        // links pin, plus the recipe to reinstall them.
+        let mut dispatch_spec: Option<DispatchSpec> = None;
+        let mut dispatch_binding: Option<(String, String, u64)> = None;
         // Dispatch-blind runs preset their PARTIAL reason but still
         // drain for legacy tripwires (dispatch and legacy observe
         // independently).
@@ -2448,6 +3021,11 @@ impl DiscoverySession {
                     eprintln!("INSPECT stage=builtin off={off:#x} via={}", r.as_str());
                     builtin_query_attached = true;
                     builtin_query_offset = off;
+                    dispatch_spec = Some(DispatchSpec::Builtin {
+                        table,
+                        force_offset: cfg.force_offset,
+                        explicit_offsets: cfg.explicit_offsets,
+                    });
                 }
                 Err(e) => {
                     eprintln!("INSPECT builtin unresolved: {e:#}");
@@ -2476,6 +3054,20 @@ impl DiscoverySession {
                         0,
                         LinkKind::Init,
                     )?;
+                    dispatch_spec = Some(DispatchSpec::Init);
+                    // Best-effort pin record: the link pins path
+                    // resolution at attach; a swap between attach
+                    // and this stat binds the wrong identity (it
+                    // self-heals as an immediate replan — the
+                    // A1-grade check lives in reinstall, which owns
+                    // its resolve).
+                    if let Ok(m) = std::fs::metadata(&cfg.provider) {
+                        dispatch_binding = Some((
+                            cfg.provider.to_string_lossy().into_owned(),
+                            format!("{:02x}:{:02x}", libc::major(m.dev()), libc::minor(m.dev())),
+                            m.ino(),
+                        ));
+                    }
                 }
                 Err(e) => {
                     eprintln!("INSPECT anchor unresolved: {e:#}");
@@ -2509,6 +3101,15 @@ impl DiscoverySession {
                     )
                 })
                 .unwrap_or_default();
+            // F-D/A11: the same stat binds the anchor (statable
+            // only — unstatable leaves validation trusting, below).
+            if !pdev.is_empty() {
+                dispatch_binding = Some((
+                    cfg.provider.to_string_lossy().into_owned(),
+                    pdev.clone(),
+                    pino,
+                ));
+            }
             core.mark_query_attached(
                 0,
                 builtin_query_offset,
@@ -2525,6 +3126,7 @@ impl DiscoverySession {
             links,
             ring,
             pin,
+            dispatch_spec,
         };
 
         // Legacy tripwires (dispatch-independent: attach even when
@@ -2543,7 +3145,12 @@ impl DiscoverySession {
                 eprintln!("INSPECT stage=legacy blind=no-libcrypto-mapping");
             }
         }
-        core.set_bootstrap(preset_reason.is_none(), preset_reason, resolution);
+        core.set_bootstrap(
+            preset_reason.is_none(),
+            preset_reason,
+            resolution,
+            dispatch_binding,
+        );
 
         // Post-attach verify: every maps read and attach above
         // resolved through /proc/<pid> — confirm the identity.
@@ -2694,5 +3301,477 @@ mod tests {
         );
         assert!(!line.contains("0x"), "address leaked: {line}");
         assert!(!line.contains("len="), "length leaked: {line}");
+    }
+
+    // ------------------------------------------------------------------
+    // F-D/A11: anchor reconciliation after replacement.
+    // ------------------------------------------------------------------
+
+    use std::collections::VecDeque;
+
+    struct MiniEnv {
+        maps: Vec<maps::Mapping>,
+        plan: Option<legacy::ProbeSet>,
+        plan_calls: u32,
+        trip_installs: u32,
+        trip_detaches: u32,
+        dispatch_detaches: u32,
+        stage2_installs: Vec<(u64, u64, String)>,
+        stage2_detaches: Vec<u64>,
+        reinstall_script: VecDeque<anyhow::Result<DispatchReinstall>>,
+        reinstall_calls: u32,
+        pin_ok: bool,
+    }
+
+    impl MiniEnv {
+        fn new() -> Self {
+            Self {
+                maps: Vec::new(),
+                plan: None,
+                plan_calls: 0,
+                trip_installs: 0,
+                trip_detaches: 0,
+                dispatch_detaches: 0,
+                stage2_installs: Vec::new(),
+                stage2_detaches: Vec::new(),
+                reinstall_script: VecDeque::new(),
+                reinstall_calls: 0,
+                pin_ok: true,
+            }
+        }
+    }
+
+    impl SessionEnv for MiniEnv {
+        fn next_event(&mut self) -> Option<Vec<u8>> {
+            None
+        }
+
+        fn current_maps(&mut self) -> Vec<maps::Mapping> {
+            self.maps.clone()
+        }
+
+        fn join_maps(&mut self) -> MapSnapshots {
+            MapSnapshots::default()
+        }
+
+        fn install_stage2(
+            &mut self,
+            cookie: u64,
+            offset: u64,
+            path: &Path,
+            _pid: u32,
+            _expected: Option<(u64, u64)>,
+        ) -> anyhow::Result<()> {
+            self.stage2_installs
+                .push((cookie, offset, path.to_string_lossy().into_owned()));
+            Ok(())
+        }
+
+        fn install_trips(
+            &mut self,
+            _set: &legacy::ProbeSet,
+            _pid: u32,
+        ) -> anyhow::Result<Option<String>> {
+            self.trip_installs += 1;
+            Ok(None)
+        }
+
+        fn plan_trips(
+            &mut self,
+            _maps: &[maps::Mapping],
+        ) -> anyhow::Result<Option<legacy::ProbeSet>> {
+            self.plan_calls += 1;
+            Ok(self.plan.clone())
+        }
+
+        fn pretouch(&mut self, _cookie: u64, _addr: u64) {}
+
+        fn evict_array_state(&mut self, _arr: u64) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn verify_pin(&self) -> anyhow::Result<()> {
+            if self.pin_ok {
+                Ok(())
+            } else {
+                anyhow::bail!("pid recycled")
+            }
+        }
+
+        fn quiesce(&mut self) {}
+
+        fn link_counts(&self) -> (u64, u64) {
+            (0, 0)
+        }
+
+        fn detach_trips(&mut self) {
+            self.trip_detaches += 1;
+        }
+
+        fn detach_dispatch_anchors(&mut self) {
+            self.dispatch_detaches += 1;
+        }
+
+        fn detach_stage2(&mut self, cookie: u64) {
+            self.stage2_detaches.push(cookie);
+        }
+
+        fn reinstall_dispatch(&mut self) -> anyhow::Result<DispatchReinstall> {
+            self.reinstall_calls += 1;
+            self.reinstall_script
+                .pop_front()
+                .unwrap_or_else(|| Err(anyhow::anyhow!("no reinstall scripted")))
+        }
+    }
+
+    fn lc_mapping(ino: u64) -> maps::Mapping {
+        maps::Mapping {
+            start: 0x1000,
+            end: 0x2000,
+            x: true,
+            offset: 0,
+            dev: "08:01".to_string(),
+            ino,
+            path: "/lib/libcrypto.so.3".to_string(),
+        }
+    }
+
+    fn prov_mapping(ino: u64, start: u64) -> maps::Mapping {
+        maps::Mapping {
+            start,
+            end: start + 0x1000,
+            x: true,
+            offset: 0,
+            dev: "08:01".to_string(),
+            ino,
+            path: "/p/provider.so".to_string(),
+        }
+    }
+
+    fn trip_probe(cookie: u64, symbol: &str, offset: u64) -> legacy::Probe {
+        legacy::Probe {
+            cookie,
+            symbol: symbol.to_string(),
+            offset,
+            module: "/app/target".to_string(),
+            family: None,
+            str_arg: None,
+            program: "trip_count",
+        }
+    }
+
+    fn trip_set(ino: u64, offsets: &[u64]) -> legacy::ProbeSet {
+        let probes = ["ENGINE_by_id", "RSA_new"]
+            .iter()
+            .zip(offsets.iter().chain(std::iter::repeat(&0x100)))
+            .enumerate()
+            .map(|(i, (sym, off))| trip_probe(7 + i as u64, sym, *off))
+            .collect();
+        legacy::ProbeSet {
+            probes,
+            engine_uninstrumented: 0,
+            meth_uninstrumented: 0,
+            lowlevel_uninstrumented: 0,
+            address_taken: Vec::new(),
+            unprobed_engine_syms: Vec::new(),
+            unprobed_meth_syms: Vec::new(),
+            unprobed_lowlevel_syms: Vec::new(),
+            findings: Vec::new(),
+            by_id_cookies: HashSet::from([7]),
+            load_cookies: HashSet::new(),
+            libcrypto: Some(("/lib/libcrypto.so.3".to_string(), "08:01".to_string(), ino)),
+        }
+    }
+
+    fn a11_core() -> SessionCore {
+        SessionCore::new(
+            PathBuf::from("/p/provider.so"),
+            "/canon/provider.so".to_string(),
+            true,
+            4242,
+        )
+    }
+
+    fn a11_budget() -> PollBudget {
+        PollBudget::new(65536, 64)
+    }
+
+    #[test]
+    fn trip_replacement_same_mapping_replans() {
+        // F-D/A11: libcrypto replaced (same path, new inode), fresh
+        // plan with the identical (cookie, symbol) mapping — detach
+        // the stale links and re-attach (offsets-only change is
+        // cookie-continuous, so accumulation stays sound).
+        let mut env = MiniEnv::new();
+        env.maps = vec![lc_mapping(100)];
+        let s1 = trip_set(100, &[0x100, 0x200]);
+        env.plan = Some(s1.clone());
+        let mut core = a11_core();
+        core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(env.trip_installs, 1);
+        assert!(core.snapshot().legacy.planned);
+        assert_eq!(core.snapshot().legacy.set.as_ref(), Some(&s1));
+
+        env.maps = vec![lc_mapping(200)];
+        let s2 = trip_set(200, &[0x110, 0x220]);
+        env.plan = Some(s2.clone());
+        let delta = core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(env.trip_detaches, 1, "stale links must detach");
+        assert_eq!(env.trip_installs, 2, "same-mapping plan must re-attach");
+        assert!(core.snapshot().legacy.planned);
+        assert_eq!(
+            core.snapshot().legacy.set.as_ref(),
+            Some(&s2),
+            "fresh offsets adopted"
+        );
+        assert!(
+            delta
+                .attaches
+                .iter()
+                .any(|a| matches!(a.kind, AttachKind::Tripwires { .. }) && a.failed.is_some()),
+            "replan must carry a continuity-loss signal: {:?}",
+            delta.attaches
+        );
+    }
+
+    #[test]
+    fn trip_replacement_changed_mapping_goes_blind() {
+        // F-D/A11: replacement with a changed probe mapping (cookie
+        // meanings shifted) — detach, but do NOT re-attach (new
+        // cookies would collide with old meanings): honestly blind
+        // with the last-good set retained for rendering history.
+        let mut env = MiniEnv::new();
+        env.maps = vec![lc_mapping(100)];
+        let s1 = trip_set(100, &[0x100, 0x200]);
+        env.plan = Some(s1.clone());
+        let mut core = a11_core();
+        core.poll(&mut env, a11_budget()).unwrap();
+
+        env.maps = vec![lc_mapping(200)];
+        let mut s2 = trip_set(200, &[0x110, 0x220]);
+        s2.probes.push(trip_probe(9, "EVP_new", 0x330));
+        env.plan = Some(s2);
+        let delta = core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(env.trip_detaches, 1);
+        assert_eq!(env.trip_installs, 1, "changed mapping must not re-attach");
+        assert!(!core.snapshot().legacy.planned);
+        assert_eq!(
+            core.snapshot().legacy.set.as_ref(),
+            Some(&s1),
+            "last-good set retained for rendering"
+        );
+        assert!(
+            delta
+                .attaches
+                .iter()
+                .any(|a| matches!(a.kind, AttachKind::Tripwires { .. }) && a.failed.is_some()),
+            "blind latch must signal loss: {:?}",
+            delta.attaches
+        );
+    }
+
+    #[test]
+    fn trip_blind_retries_on_new_fingerprint() {
+        // F-D/A11: a blind latch does not retry while the libcrypto
+        // fingerprint is unchanged (bounded file reads), and resumes
+        // planning when it changes.
+        let mut env = MiniEnv::new();
+        env.maps = vec![lc_mapping(100)];
+        env.plan = Some(trip_set(100, &[0x100, 0x200]));
+        let mut core = a11_core();
+        core.poll(&mut env, a11_budget()).unwrap();
+
+        env.maps = vec![lc_mapping(200)];
+        let mut changed = trip_set(200, &[0x110]);
+        changed.probes.push(trip_probe(9, "EVP_new", 0x330));
+        env.plan = Some(changed);
+        core.poll(&mut env, a11_budget()).unwrap();
+        assert!(!core.snapshot().legacy.planned);
+        let plan_calls = env.plan_calls;
+
+        // Same fingerprint: no replan attempt.
+        core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(env.plan_calls, plan_calls, "latched blind must not retry");
+        assert!(!core.snapshot().legacy.planned);
+
+        // New fingerprint with a same-mapping plan: re-attach.
+        env.maps = vec![lc_mapping(300)];
+        env.plan = Some(trip_set(300, &[0x140, 0x240]));
+        core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(env.plan_calls, plan_calls + 1);
+        assert_eq!(env.trip_installs, 2);
+        assert!(core.snapshot().legacy.planned);
+    }
+
+    #[test]
+    fn dispatch_replacement_reinstalls() {
+        // F-D/A11: provider file replaced (bound inode unmapped) —
+        // detach the stale dispatch links and reinstall against the
+        // current file, with a continuity-loss signal.
+        let mut env = MiniEnv::new();
+        env.maps = vec![prov_mapping(50, 0x1000)];
+        let mut core = a11_core();
+        core.dispatch_bound = Some(("/p/provider.so".to_string(), "08:01".to_string(), 50));
+        core.dispatch_live = true;
+        core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(env.dispatch_detaches, 0);
+        assert_eq!(env.reinstall_calls, 0);
+
+        env.maps = vec![prov_mapping(60, 0x1000)];
+        env.reinstall_script.push_back(Ok(DispatchReinstall {
+            binding: ("/p/provider.so".to_string(), "08:01".to_string(), 60),
+            resolution: None,
+        }));
+        let delta = core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(env.dispatch_detaches, 1);
+        assert_eq!(env.reinstall_calls, 1);
+        assert!(core.dispatch_live);
+        assert_eq!(
+            core.dispatch_bound,
+            Some(("/p/provider.so".to_string(), "08:01".to_string(), 60))
+        );
+        assert!(core.snapshot().dispatch.attached);
+        assert!(
+            delta.attaches.iter().any(|a| matches!(
+                a.kind,
+                AttachKind::DispatchAnchors { .. }
+            ) && a.failed.is_some()),
+            "reinstall must carry a continuity-loss signal: {:?}",
+            delta.attaches
+        );
+    }
+
+    #[test]
+    fn dispatch_reinstall_failure_latches_blind() {
+        // F-D/A11: a failed dispatch reinstall leaves readiness
+        // false (honest coverage) and retries only when the provider
+        // fingerprint changes.
+        let mut env = MiniEnv::new();
+        env.maps = vec![prov_mapping(50, 0x1000)];
+        let mut core = a11_core();
+        core.dispatch_bound = Some(("/p/provider.so".to_string(), "08:01".to_string(), 50));
+        core.dispatch_live = true;
+        core.poll(&mut env, a11_budget()).unwrap();
+
+        env.maps = vec![prov_mapping(60, 0x1000)];
+        env.reinstall_script
+            .push_back(Err(anyhow::anyhow!("anchor unresolvable")));
+        let delta = core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(env.dispatch_detaches, 1);
+        assert!(!core.dispatch_live);
+        assert!(!core.snapshot().dispatch.attached);
+        assert!(
+            delta.attaches.iter().any(|a| matches!(
+                a.kind,
+                AttachKind::DispatchAnchors { .. }
+            ) && a.failed.is_some()),
+            "failed reinstall must signal loss: {:?}",
+            delta.attaches
+        );
+
+        // Same fingerprint: no retry.
+        core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(env.reinstall_calls, 1);
+
+        // New fingerprint: retry, and success clears the latch.
+        env.maps = vec![prov_mapping(70, 0x1000)];
+        env.reinstall_script.push_back(Ok(DispatchReinstall {
+            binding: ("/p/provider.so".to_string(), "08:01".to_string(), 70),
+            resolution: None,
+        }));
+        core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(env.reinstall_calls, 2);
+        assert!(core.dispatch_live);
+        assert!(core.snapshot().dispatch.attached);
+    }
+
+    #[test]
+    fn stage2_target_change_detaches_old_link() {
+        // F-D/A11: same cookie re-resolves to a different target
+        // (replacement with both instances mapped) — detach the old
+        // link before installing the new one (same cookie, new
+        // target), with a supersede signal.
+        use crate::discovery::harvest::LEGACY_COOKIE;
+        let mut env = MiniEnv::new();
+        env.maps = vec![prov_mapping(50, 0x1000)];
+        let mut core = a11_core();
+        core.pending_stage2.push_back((LEGACY_COOKIE, 0x1500));
+        core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(env.stage2_installs.len(), 1);
+
+        env.maps = vec![prov_mapping(50, 0x1000), prov_mapping(60, 0x3000)];
+        core.pending_stage2.push_back((LEGACY_COOKIE, 0x3500));
+        let delta = core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(env.stage2_detaches, vec![LEGACY_COOKIE]);
+        assert_eq!(env.stage2_installs.len(), 2);
+        let target = core.attached_targets.get(&LEGACY_COOKIE).unwrap();
+        assert_eq!((target.2.as_str(), target.3), ("08:01", 60));
+        assert!(
+            delta
+                .attaches
+                .iter()
+                .any(|a| matches!(a.kind, AttachKind::Stage2 { .. }) && a.failed.is_some()),
+            "supersede must signal loss: {:?}",
+            delta.attaches
+        );
+        assert!(
+            delta
+                .attaches
+                .iter()
+                .any(|a| matches!(a.kind, AttachKind::Stage2 { .. }) && a.failed.is_none()),
+            "reinstall still reports its install: {:?}",
+            delta.attaches
+        );
+    }
+
+    #[test]
+    fn stage2_unmapped_target_is_detached_and_dropped() {
+        // F-D/A11: a stage-2 target whose backing is no longer mapped
+        // (exec) is detached and forgotten — dead links never count
+        // as live coverage.
+        use crate::discovery::harvest::LEGACY_COOKIE;
+        let mut env = MiniEnv::new();
+        env.maps = vec![prov_mapping(50, 0x1000)];
+        let mut core = a11_core();
+        core.pending_stage2.push_back((LEGACY_COOKIE, 0x1500));
+        core.poll(&mut env, a11_budget()).unwrap();
+        assert!(core.attached_queries.contains(&LEGACY_COOKIE));
+
+        env.maps = vec![prov_mapping(60, 0x3000)];
+        let delta = core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(env.stage2_detaches, vec![LEGACY_COOKIE]);
+        assert!(!core.attached_queries.contains(&LEGACY_COOKIE));
+        assert!(!core.attached_targets.contains_key(&LEGACY_COOKIE));
+        assert_eq!(env.stage2_installs.len(), 1, "no reinstall without events");
+        assert!(
+            delta
+                .attaches
+                .iter()
+                .any(|a| matches!(a.kind, AttachKind::Stage2 { .. }) && a.failed.is_some()),
+            "unmapped drop must signal loss: {:?}",
+            delta.attaches
+        );
+    }
+
+    #[test]
+    fn trip_mapping_compare_ignores_offsets() {
+        // Cookie-meaning equality: same (cookie, symbol, module,
+        // family, program) pairs in any order re-attaches soundly;
+        // any pair change (or add/drop) does not.
+        let a = trip_set(100, &[0x100, 0x200]);
+        let b = trip_set(200, &[0x110, 0x220]);
+        assert!(trip_mapping_equal(&a, &b));
+        let mut reordered = trip_set(200, &[0x110, 0x220]);
+        reordered.probes.reverse();
+        assert!(trip_mapping_equal(&a, &reordered));
+        let mut extra = trip_set(200, &[0x110, 0x220]);
+        extra.probes.push(trip_probe(9, "EVP_new", 0x330));
+        assert!(!trip_mapping_equal(&a, &extra));
+        let mut renamed = trip_set(200, &[0x110, 0x220]);
+        renamed.probes[0].symbol = "OTHER_by_id".to_string();
+        assert!(!trip_mapping_equal(&a, &renamed));
+        let mut shifted = trip_set(200, &[0x110, 0x220]);
+        shifted.probes[0].cookie = 42;
+        assert!(!trip_mapping_equal(&a, &shifted));
     }
 }
