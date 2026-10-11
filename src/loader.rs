@@ -433,9 +433,7 @@ fn call_target(
         .iter()
         .find(|(v, _, _)| *v == target_off)
         .map(|(_, _, n)| n.clone())
-        .ok_or_else(|| {
-            anyhow::anyhow!("prog {prog}: call lands mid-function at {target_off:#x}")
-        })
+        .ok_or_else(|| anyhow::anyhow!("prog {prog}: call lands mid-function at {target_off:#x}"))
 }
 
 /// Rewrite one static-call imm: call site at `rel_off` (in the final
