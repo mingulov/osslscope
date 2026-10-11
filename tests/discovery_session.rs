@@ -563,6 +563,77 @@ fn h1_t1f_failed_bootstrap_binds_nothing_and_retries() {
 }
 
 #[test]
+fn h1_t5_producer_ring_drops_surface_as_loss() {
+    // H1 wiring pin (premise refuted: producer ring-reserve
+    // failures were already counted via LOSS_RING_* and joined
+    // through the LOSS map — this pins the join, not new
+    // behavior). A staged kernel loss counter surfaces in both
+    // the delta and the cumulative snapshot, unlocalized (a
+    // dropped reserve cannot name its op).
+    let mut env = TestEnv::new();
+    let mut core = test_core(false);
+    core.poll(&mut env, ample_budget()).unwrap();
+    env.staged.losses = vec![(wire::LOSS_RING_ROW, 3)];
+    let d = core.poll(&mut env, ample_budget()).unwrap();
+    assert!(
+        d.losses
+            .iter()
+            .any(|l| l.source == wire::LOSS_RING_ROW && l.op.is_none() && l.count == 3),
+        "ring-row drops must surface unlocalized: {:?}",
+        d.losses
+    );
+    let losses = losses_of(&core.snapshot());
+    assert_eq!(losses.get(&wire::LOSS_RING_ROW).copied(), Some(3));
+}
+
+#[test]
+fn h1_t7_deep_queue_stragglers_all_drop_across_turnover() {
+    // H1-T1's deeper sibling: several records (stash + ring
+    // remainder) straddle a replacement across polls. Every one
+    // drops with op-localized loss — stash-first ordering never
+    // re-attributes.
+    let mut env = TestEnv::new();
+    let mut core = test_core(false);
+    let d0 = core.poll(&mut env, ample_budget()).unwrap();
+    assert!(d0.candidates.is_empty());
+
+    let arr = 0x7f00_1000u64;
+    let imp = 0x7f00_2000u64;
+    env.push(query_ret(OP_DIGEST, arr, 3));
+    for idx in 0..4u64 {
+        env.push(ok_alg(OP_DIGEST, arr, idx));
+    }
+    env.push(dispatch_row_gen(OP_DIGEST, 3, imp, arr, 3, 1));
+    // Budget 3: query + 2 algs ingested; the 3rd alg stashes and
+    // the 4th alg + row stay queued in the ring.
+    let d1 = core.poll(&mut env, PollBudget::new(3, 64)).unwrap();
+    assert!(d1.budget_exhausted);
+    assert!(d1.candidates.is_empty());
+
+    // A→B replacement: same addresses and pathname, new file
+    // identity.
+    let (exe, _a_dev, _a_ino) = provider_file();
+    let exe = exe.to_string_lossy().into_owned();
+    env.maps = vec![
+        mapping(0x7f00_0000, 0x10000, true, 0, "08:02", 999, &exe),
+        mapping(0x7f01_0000, 0x10000, true, 0, "08:01", 200, LIBCRYPTO),
+        mapping(0x7f02_0000, 0x10000, true, 0, "08:01", 300, LEGACY_SO),
+    ];
+    let d2 = core.poll(&mut env, ample_budget()).unwrap();
+    assert!(d2.candidates.is_empty());
+    assert_eq!(env.gen_map.get(&arr).copied(), Some(2));
+    // Stash (1 alg) + ring remainder (1 alg + 1 row): all three
+    // drop as the retired generation's stragglers.
+    assert!(
+        d2.losses
+            .iter()
+            .any(|l| { l.source == HOST_STRAGGLER && l.op == Some(OP_DIGEST) && l.count == 3 }),
+        "all queued stragglers must surface: {:?}",
+        d2.losses
+    );
+}
+
+#[test]
 fn no_query_can_retry() {
     // A mapped-but-quiet provider and a failed stage-2 attach are
     // both retryable: no permanent "harvested" bit blocks a later
