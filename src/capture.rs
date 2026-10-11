@@ -1365,7 +1365,17 @@ pub fn adapt_delta(
     let mut identity_refreshed = 0u64;
     // triple → (dev string, new candidates, (op, epoch) arrivals,
     // any bad read).
-    type Group = (String, Vec<CandidateIdentity>, HashSet<(u32, u64)>, bool);
+    // (device string, fresh identities, every arrival's epoch,
+    // novel arrivals' epochs, bad-read flag). The two epoch sets
+    // split per-arrival validation (F-H/H1): membership/proof-
+    // voidness covers all arrivals, the post-proof trip novel only.
+    type Group = (
+        String,
+        Vec<CandidateIdentity>,
+        HashSet<(u32, u64)>,
+        HashSet<(u32, u64)>,
+        bool,
+    );
     let mut groups: HashMap<(u64, u64, u64), Group> = HashMap::new();
     // Novelty index for the non-closed guard (F-A/A4): duplicate
     // arrivals (re-walked rows, multi-libctx re-queries) carry no
@@ -1418,9 +1428,15 @@ pub fn adapt_delta(
             candidate.weak,
         );
         let bad_read = candidate.status != "ok";
-        let slot = groups
-            .entry(triple)
-            .or_insert_with(|| (backing.dev.clone(), Vec::new(), HashSet::new(), false));
+        let slot = groups.entry(triple).or_insert_with(|| {
+            (
+                backing.dev.clone(),
+                Vec::new(),
+                HashSet::new(),
+                HashSet::new(),
+                false,
+            )
+        });
         let novel = seen_ids
             .entry(triple)
             .or_insert_with(|| {
@@ -1432,10 +1448,17 @@ pub fn adapt_delta(
             })
             .insert(identity.clone());
         slot.1.push(identity);
+        // Per-arrival validation (F-H/H1): EVERY arrival's epoch
+        // joins the membership set — a duplicate carrying a retired
+        // epoch is still evidence about that epoch, and skipping
+        // it let retired stamps re-close a site (A-2). The
+        // post-proof arm below stays novel-only (a re-walked
+        // identity proves nothing new), tracked in the second set.
+        slot.2.insert((candidate.op, candidate.epoch));
         if novel {
-            slot.2.insert((candidate.op, candidate.epoch));
+            slot.3.insert((candidate.op, candidate.epoch));
         }
-        slot.3 |= bad_read;
+        slot.4 |= bad_read;
         if bad_read {
             state.sites_bad_read.insert(triple);
         }
@@ -1444,7 +1467,7 @@ pub fn adapt_delta(
     let mut group_keys: Vec<(u64, u64, u64)> = groups.keys().copied().collect();
     group_keys.sort_unstable();
     for triple in group_keys {
-        let (dev_str, mut fresh_identities, group_epochs, bad_read) =
+        let (dev_str, mut fresh_identities, group_epochs, novel_epochs, bad_read) =
             groups.remove(&triple).unwrap_or_default();
         let (device, ino, offset) = triple;
         let first_emit = !state.emitted.contains_key(&triple);
@@ -1456,6 +1479,9 @@ pub fn adapt_delta(
         // for an epoch it never observed — arrivals for sibling
         // epochs or ops on a shared site do not taint a closed
         // epoch, but an unproven epoch taints its own site).
+        // Membership/proof-voidness covers every arrival, duplicate
+        // or novel (F-H/H1); only the post-proof trip stays
+        // novel-only.
         // A7: relevant loss taints the set (op-localized orphans
         // via tainted_ops; unlocalizable loss via the global flag).
         let mut unknown = bad_read || state.taint_global || state.sites_bad_read.contains(&triple);
@@ -1473,18 +1499,33 @@ pub fn adapt_delta(
                     }
                     match state.op_tables.get(&(*op, *gepoch)) {
                         // Untracked epoch: fail closed (a missing
-                        // entry is not proof of completion).
+                        // entry is not proof of completion). Covers
+                        // every arrival, duplicate or novel (F-H/H1).
                         None => unknown = true,
                         Some(t) => {
-                            // Transient trip (F-A/A4): a novel
+                            // Retired tombstone: the epoch's proof
+                            // is void, so any arrival for it —
+                            // duplicate or novel — taints its own
+                            // site. (Also subsumed by the unclosed-op
+                            // arm above while the tombstone stands;
+                            // explicit here so a pruned-then-reseen
+                            // tombstone can never slip through.)
+                            if t.dirty {
+                                unknown = true;
+                            }
+                            // Transient trip (F-A/A4): a NOVEL
                             // arrival after this epoch's proof
-                            // degrades this emit only. True
+                            // degrades this emit only — a re-walked
+                            // duplicate proves nothing new, so live
+                            // re-walks still recover closure. True
                             // non-closure (beyond-proof rows) is
                             // the session's call — it re-opens the
                             // table (len-aware) until re-proof —
                             // while drain-delayed in-range rows
                             // must not dirt the epoch forever.
-                            if t.term_poll.is_some_and(|p| p < seq) {
+                            if novel_epochs.contains(&(*op, *gepoch))
+                                && t.term_poll.is_some_and(|p| p < seq)
+                            {
                                 unknown = true;
                             }
                         }
