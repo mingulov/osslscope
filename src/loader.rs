@@ -426,14 +426,16 @@ fn call_target(
         anyhow::bail!("prog {prog}: call reloc vs non-.text section {}", rsym.name);
     }
     let imm = i32::from_le_bytes(site[4..8].try_into().unwrap()) as i64;
-    let addr = rsym.value as i64 + (imm + 1) * 8;
-    let addr = usize::try_from(addr)
+    let target_off = rsym.value as i64 + (imm + 1) * 8;
+    let target_off = usize::try_from(target_off)
         .map_err(|_| anyhow::anyhow!("prog {prog}: call target out of range"))?;
     text_fns
         .iter()
-        .find(|(v, _, _)| *v == addr)
+        .find(|(v, _, _)| *v == target_off)
         .map(|(_, _, n)| n.clone())
-        .ok_or_else(|| anyhow::anyhow!("prog {prog}: call lands mid-function at {addr:#x}"))
+        .ok_or_else(|| {
+            anyhow::anyhow!("prog {prog}: call lands mid-function at {target_off:#x}")
+        })
 }
 
 /// Rewrite one static-call imm: call site at `rel_off` (in the final
