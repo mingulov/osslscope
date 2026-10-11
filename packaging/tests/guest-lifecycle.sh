@@ -56,14 +56,18 @@ esac
 [ -n "$NEW_REF" ] || { echo "error: --new-ref is required (a clean committed revision)" >&2; exit 2; }
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 if [ -z "$WORKDIR" ]; then WORKDIR="$REPO/target/lifecycle-$PKG-$$"; fi
+# shellcheck source=./lifecycle-assert.sh
+. "$(dirname "$0")/lifecycle-assert.sh"
 
 plan() {
     echo "lifecycle plan ($PKG): old=$OLD_REF new=$NEW_REF workdir=$WORKDIR"
+    echo "  0. precondition: osslscope NOT installed and no stray binary (no-op witnesses refused)"
     echo "  1. export both refs to isolated dirs; build a release binary in each"
-    echo "  2. build old package (release/revision 1) and new package (release/revision 2)"
-    echo "  3. install old; assert getcap shows cap_bpf+cap_perfmon; run doctor"
-    echo "  4. upgrade old->new; assert caps SURVIVED (posttrans migration); run doctor"
-    echo "  5. reinstall new; assert caps still present"
+    echo "  2. build old package (release/revision 1) and new package (release/revision 2);"
+    echo "     assert distinct package EVRs and old removal-scriptlet presence"
+    echo "  3. install old; assert exact old EVR + binary identity; caps; doctor"
+    echo "  4. upgrade old->new; assert exact new EVR + changed binary identity (bytes transitioned); caps; doctor"
+    echo "  5. reinstall new; assert EVR + binary identity stable; caps"
     echo "  6. remove; assert /usr/bin/osslscope is gone"
     echo "NOT-RUN without --execute on an approved guest."
 }
@@ -83,12 +87,16 @@ need_cmd cargo "pinned Rust 1.88.0 toolchain"
 need_cmd setcap "libcap2-bin (deb) or libcap (rpm)"
 need_cmd getcap "libcap2-bin (deb) or libcap (rpm)"
 need_cmd sudo "passwordless or interactive sudo on the approved guest"
+need_cmd sha256sum "coreutils (binary identity assertions)"
+need_cmd tar "tar (control-member listing)"
 if [ "$PKG" = "rpm" ]; then
     need_cmd rpmbuild "rpm-build package"
+    need_cmd rpm "rpm (installed-version assertions)"
     need_cmd dnf "dnf (or adapt install/upgrade/remove lines to yum/zypper)"
 else
     need_cmd dpkg-deb "dpkg-dev package"
     need_cmd dpkg "dpkg"
+    need_cmd dpkg-query "dpkg (installed-version assertions)"
     need_cmd apt-get "apt (dependency fix-up)"
 fi
 git -C "$REPO" rev-parse --verify "$OLD_REF^{commit}" >/dev/null 2>&1 \
@@ -190,6 +198,8 @@ deb_install() {
         || { echo "package osslscope not installed after $_tag — lifecycle FAILED" | tee -a "$LOG" >&2; exit 1; }
 }
 
+assert_initial_absent "$PKG"
+
 echo "--- building old package (release 1) ---" | tee -a "$LOG"
 OLD_PKG="$(build_one "$OLD_REF" old 1)"
 echo "old package: $OLD_PKG" | tee -a "$LOG"
@@ -200,24 +210,65 @@ NEW_PKG="$(build_one "$NEW_REF" new 2)"
 echo "new package: $NEW_PKG" | tee -a "$LOG"
 [ -f "$NEW_PKG" ] || { echo "new package build produced no file" | tee -a "$LOG"; exit 1; }
 
+# F-G/Bm3: identities come from the built files, never assumed. An
+# old==new EVR would make the "upgrade" theater — refuse it here.
+OLD_EVR="$(pkg_file_evr "$PKG" "$OLD_PKG")" \
+    || { echo "cannot read old package EVR — lifecycle FAILED" | tee -a "$LOG" >&2; exit 1; }
+NEW_EVR="$(pkg_file_evr "$PKG" "$NEW_PKG")" \
+    || { echo "cannot read new package EVR — lifecycle FAILED" | tee -a "$LOG" >&2; exit 1; }
+echo "old EVR: $OLD_EVR; new EVR: $NEW_EVR" | tee -a "$LOG"
+[ "$OLD_EVR" != "$NEW_EVR" ] \
+    || { echo "old and new packages share EVR $OLD_EVR — upgrade would be a no-op — lifecycle FAILED" | tee -a "$LOG" >&2; exit 1; }
+assert_old_scriptlet "$PKG" "$OLD_PKG"
+
 if [ "$PKG" = "rpm" ]; then
     run_step "install-old" sudo dnf install -y "$OLD_PKG"
+    assert_installed_evr "install-old" "$PKG" "$OLD_EVR"
+    HASH_OLD="$(bin_identity)" \
+        || { echo "cannot hash installed binary after install-old — lifecycle FAILED" | tee -a "$LOG" >&2; exit 1; }
+    echo "[install-old] binary sha256 $HASH_OLD" | tee -a "$LOG"
     assert_caps "install-old"
     run_doctor "install-old"
     run_step "upgrade-new" sudo dnf upgrade -y "$NEW_PKG"
+    assert_installed_evr "upgrade-new" "$PKG" "$NEW_EVR"
+    HASH_NEW="$(bin_identity)" \
+        || { echo "cannot hash installed binary after upgrade-new — lifecycle FAILED" | tee -a "$LOG" >&2; exit 1; }
+    echo "[upgrade-new] binary sha256 $HASH_NEW" | tee -a "$LOG"
+    [ "$HASH_OLD" != "$HASH_NEW" ] \
+        || { echo "installed bytes never transitioned old->new (identical sha256) — lifecycle FAILED" | tee -a "$LOG" >&2; exit 1; }
     assert_caps "upgrade-new"
     run_doctor "upgrade-new"
     run_step "reinstall-new" sudo dnf reinstall -y "$NEW_PKG"
+    assert_installed_evr "reinstall-new" "$PKG" "$NEW_EVR"
+    HASH_RE="$(bin_identity)" \
+        || { echo "cannot hash installed binary after reinstall-new — lifecycle FAILED" | tee -a "$LOG" >&2; exit 1; }
+    [ "$HASH_RE" = "$HASH_NEW" ] \
+        || { echo "binary identity changed across reinstall ($HASH_NEW -> $HASH_RE) — lifecycle FAILED" | tee -a "$LOG" >&2; exit 1; }
     assert_caps "reinstall-new"
     run_step "remove" sudo dnf remove -y osslscope
 else
     deb_install "install-old" "$OLD_PKG"
+    assert_installed_evr "install-old" "$PKG" "$OLD_EVR"
+    HASH_OLD="$(bin_identity)" \
+        || { echo "cannot hash installed binary after install-old — lifecycle FAILED" | tee -a "$LOG" >&2; exit 1; }
+    echo "[install-old] binary sha256 $HASH_OLD" | tee -a "$LOG"
     assert_caps "install-old"
     run_doctor "install-old"
     deb_install "upgrade-new" "$NEW_PKG"
+    assert_installed_evr "upgrade-new" "$PKG" "$NEW_EVR"
+    HASH_NEW="$(bin_identity)" \
+        || { echo "cannot hash installed binary after upgrade-new — lifecycle FAILED" | tee -a "$LOG" >&2; exit 1; }
+    echo "[upgrade-new] binary sha256 $HASH_NEW" | tee -a "$LOG"
+    [ "$HASH_OLD" != "$HASH_NEW" ] \
+        || { echo "installed bytes never transitioned old->new (identical sha256) — lifecycle FAILED" | tee -a "$LOG" >&2; exit 1; }
     assert_caps "upgrade-new"
     run_doctor "upgrade-new"
     deb_install "reinstall-new" "$NEW_PKG"
+    assert_installed_evr "reinstall-new" "$PKG" "$NEW_EVR"
+    HASH_RE="$(bin_identity)" \
+        || { echo "cannot hash installed binary after reinstall-new — lifecycle FAILED" | tee -a "$LOG" >&2; exit 1; }
+    [ "$HASH_RE" = "$HASH_NEW" ] \
+        || { echo "binary identity changed across reinstall ($HASH_NEW -> $HASH_RE) — lifecycle FAILED" | tee -a "$LOG" >&2; exit 1; }
     assert_caps "reinstall-new"
     run_step "remove" sudo dpkg -P osslscope
 fi
@@ -225,5 +276,5 @@ fi
 if [ -e /usr/bin/osslscope ]; then
     echo "removal FAILED: /usr/bin/osslscope still exists" | tee -a "$LOG"; exit 1
 fi
-echo "lifecycle HELD: install/upgrade/reinstall kept caps; removal cleaned up." | tee -a "$LOG"
+echo "lifecycle HELD: exact old->new EVR + binary transition with caps kept; removal cleaned up." | tee -a "$LOG"
 echo "log: $LOG"

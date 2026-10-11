@@ -71,19 +71,31 @@ if [ -z "$PREFIX" ]; then
     PREFIX="$HOME/.local"
 fi
 # Never spray system package territory: /usr belongs to deb/rpm.
-# Normalize trailing slashes and /./ segments first so /usr/, /usr/.
-# and /usr// cannot bypass the comparison.
+# F-G/B11: canonicalize the FULL ancestry — parent components and
+# symlinks — not just trailing slashes: /var/../usr and a symlink
+# to /usr must refuse exactly like /usr. realpath resolves the
+# nearest existing ancestor physically, then the remainder
+# lexically, so not-yet-created prefixes work too. Only exact /
+# and /usr are protected (/usr/local and other subdirs stay the
+# admin's explicit choice, as before).
+command -v realpath >/dev/null 2>&1 || { echo "error: command 'realpath' not found on PATH (install coreutils, then re-run)" >&2; exit 3; }
 _NORM="$PREFIX"
-while :; do
-    case "$_NORM" in
-        */) _NORM="${_NORM%/}"; continue ;;
-        */.) _NORM="${_NORM%/.}"; continue ;;
-    esac
-    break
+case "$_NORM" in
+    /*) ;;
+    *) _NORM="$(pwd)/$_NORM" ;;
+esac
+_rest=""
+_cur="$_NORM"
+while [ ! -e "$_cur" ] && [ "$_cur" != "/" ]; do
+    _rest="/${_cur##*/}$_rest"
+    _cur="${_cur%/*}"
+    [ -n "$_cur" ] || _cur="/"
 done
+_canon_base="$(realpath "$_cur" 2>/dev/null || echo "$_cur")"
+_NORM="$(realpath -m "$_canon_base$_rest" 2>/dev/null || echo "$_canon_base$_rest")"
 [ -n "$_NORM" ] || _NORM="/"
 case "$_NORM" in
-    /|/usr) echo "error: refusing system prefix '$PREFIX': /usr is system package territory (use deb/rpm there); pick a local prefix such as \$HOME/.local" >&2; exit 2 ;;
+    /|/usr) echo "error: refusing system prefix '$PREFIX' (canonical path '$_NORM'): /usr is system package territory (use deb/rpm there); pick a local prefix such as \$HOME/.local" >&2; exit 2 ;;
 esac
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
