@@ -169,8 +169,10 @@ struct FirePlan {
 
 struct FakeDiscovery {
     shared: Rc<RefCell<SharedState>>,
+    clock: Rc<FakeClock>,
     polls: VecDeque<DiscoveryDelta>,
     plans: HashMap<usize, FirePlan>,
+    poll_delay_ns: HashMap<usize, u64>,
     poll_err_at: HashSet<usize>,
     snapshot: DiscoverySnapshot,
     finish_err: bool,
@@ -204,6 +206,11 @@ impl DiscoveryPort for FakeDiscovery {
                     flag.set(true);
                 }
             }
+        }
+        // Scripted poll latency (deadline-straddle model): the poll
+        // starts pre-deadline and completes after advancing the clock.
+        if let Some(ns) = self.poll_delay_ns.get(&idx) {
+            self.clock.sleep(Duration::from_nanos(*ns));
         }
         Ok(self.polls.pop_front().unwrap_or_default())
     }
@@ -599,6 +606,7 @@ struct Harness {
     acquired_ns: u64,
     polls: VecDeque<DiscoveryDelta>,
     plans: HashMap<usize, FirePlan>,
+    poll_delay_ns: HashMap<usize, u64>,
     poll_err_at: HashSet<usize>,
     snapshot: DiscoverySnapshot,
     finish_err: bool,
@@ -670,6 +678,7 @@ impl Harness {
             acquired_ns: BASE_NS,
             polls: VecDeque::new(),
             plans: HashMap::new(),
+            poll_delay_ns: HashMap::new(),
             poll_err_at: HashSet::new(),
             snapshot: DiscoverySnapshot::default(),
             finish_err: false,
@@ -722,8 +731,10 @@ impl Harness {
         };
         let discovery = FakeDiscovery {
             shared: self.shared.clone(),
+            clock: self.clock.clone(),
             polls: self.polls,
             plans: self.plans,
+            poll_delay_ns: self.poll_delay_ns,
             poll_err_at: self.poll_err_at,
             snapshot: self.snapshot,
             finish_err: self.finish_err,
@@ -1841,6 +1852,147 @@ fn slow_metadata_past_deadline_admits_no_tripwire() {
         c.legacy["engine"]["calls_by_entrypoint"]["ENGINE_by_id"],
         serde_json::json!(0)
     );
+    assert_eq!(c.counters.over_budget, 1);
+}
+
+#[test]
+fn pid_kernel_deadline_measured_from_acquisition() {
+    // F-D/A10: for --pid the requested window starts at acquisition,
+    // so the kernel deadline is acquisition + duration — not window
+    // open + duration. Post-requested-end executions must drop
+    // in-BPF even though the kernel window opened later.
+    let mut h = Harness::fresh("pid-deadline");
+    h.owned = false;
+    h.acquired_ns = BASE_NS - 500_000_000;
+    h.snapshot_attached();
+    let cand1 = cand(
+        "/p/provider.so",
+        backing_of(&h.staged, h.off),
+        1,
+        11,
+        "SHA-256",
+        false,
+        "ok",
+    );
+    h.polls.push_back(DiscoveryDelta {
+        candidates: vec![cand1],
+        tables: vec![terminated(1, 0)],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    // Requested end is BASE + 1.5s: the 1.0s fires count, the 1.6s
+    // fires are post-requested-end (but pre-open+duration).
+    h.plans.insert(
+        1,
+        FirePlan {
+            fires: vec![(BASE_NS + 1_000_000_000, 5)],
+            shortfall: 0,
+            cancel: false,
+        },
+    );
+    h.plans.insert(
+        2,
+        FirePlan {
+            fires: vec![(BASE_NS + 1_600_000_000, 7)],
+            shortfall: 0,
+            cancel: false,
+        },
+    );
+    let (out, post) = h.run();
+    let c = out.unwrap();
+    let programmed = post.shared.borrow().backend.programmed().to_vec();
+    assert_eq!(
+        programmed,
+        vec![(PID as u64, 0, BASE_NS, BASE_NS + 1_500_000_000)],
+        "kernel deadline must measure from acquisition: {programmed:?}"
+    );
+    assert_eq!(c.document.total_calls(), 5, "{:?}", c.document.sites);
+    assert!(has_reason(&c, "startup-gap"), "{:?}", c.reasons);
+}
+
+#[test]
+fn pid_setup_outlasts_window_fails_closed() {
+    // F-D/A10: setup consumed the whole requested window before the
+    // kernel window could open (acquisition + duration predates the
+    // open) — loud failure, never an open + duration window that
+    // would launder post-window executions as in-window evidence.
+    let mut h = Harness::fresh("pid-elapsed");
+    h.owned = false;
+    h.acquired_ns = BASE_NS - 3_000_000_000;
+    h.snapshot_attached();
+    let (out, _) = h.run();
+    let err = out.unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("requested window elapsed before window open"),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn straddling_poll_tripwire_is_loss_not_evidence() {
+    // F-D/A10: a discovery poll that starts pre-deadline but
+    // completes post-deadline straddles the window edge — its
+    // tripwire/query deltas are window-ambiguous, so they report as
+    // explicit loss, never as in-window legacy evidence.
+    use osslscope::discovery::legacy::{Probe, ProbeSet};
+    use osslscope_ebpf_common as wire;
+    let mut h = Harness::fresh("straddle-trip");
+    h.owned = false;
+    h.cfg.duration = Duration::from_millis(300);
+    h.snapshot_attached();
+    let set = ProbeSet {
+        probes: vec![Probe {
+            cookie: 7,
+            symbol: "ENGINE_by_id".to_string(),
+            offset: 0x100,
+            module: "/p/libcrypto.so.3".to_string(),
+            family: None,
+            str_arg: None,
+            program: "trip_count",
+        }],
+        engine_uninstrumented: 0,
+        meth_uninstrumented: 0,
+        lowlevel_uninstrumented: 0,
+        unprobed_engine_syms: Vec::new(),
+        unprobed_meth_syms: Vec::new(),
+        unprobed_lowlevel_syms: Vec::new(),
+        findings: Vec::new(),
+        address_taken: Vec::new(),
+        by_id_cookies: HashSet::from([7]),
+        load_cookies: HashSet::new(),
+    };
+    h.snapshot.legacy.set = Some(set);
+    let hit = || osslscope::discovery::legacy::TripHit {
+        cookie: 7,
+        class: wire::ENGINE_DYNAMIC,
+        status: wire::TRIP_OK,
+    };
+    h.polls.push_back(DiscoveryDelta::default());
+    h.polls.push_back(DiscoveryDelta {
+        tripwire: TripwireDelta {
+            hits: vec![hit(), hit(), hit(), hit(), hit()],
+            counter_deltas: vec![(7, 5)],
+            executed_legacy_queries_delta: 5,
+        },
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    // The single round runs at 250ms; its poll takes 100ms, crossing
+    // the 300ms deadline mid-poll.
+    h.poll_delay_ns.insert(1, 100_000_000);
+    let (out, _) = h.run();
+    let c = out.unwrap();
+    assert_eq!(
+        c.legacy["legacy_provider"]["executed_queries"],
+        serde_json::json!(0)
+    );
+    assert_eq!(
+        c.legacy["engine"]["calls_by_entrypoint"]["ENGINE_by_id"],
+        serde_json::json!(0)
+    );
+    assert_eq!(counter_value(&c, "legacy.straddling_poll_trip"), 5);
+    assert_eq!(counter_value(&c, "legacy.straddling_poll_lgcalls"), 5);
     assert_eq!(c.counters.over_budget, 1);
 }
 
@@ -3390,8 +3542,10 @@ fn live_observe(
     snapshot.dispatch.trigger_observed = true;
     let discovery = FakeDiscovery {
         shared: shared.clone(),
+        clock: clock.clone(),
         polls: VecDeque::new(),
         plans: HashMap::new(),
+        poll_delay_ns: HashMap::new(),
         poll_err_at: HashSet::new(),
         snapshot,
         finish_err: false,

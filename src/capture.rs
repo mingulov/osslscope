@@ -1750,6 +1750,13 @@ struct Runner<'x, D, B: CountBackend, T, L, C: ClockPort, P: ProcPort> {
     in_window_trip: HashMap<u64, u64>,
     in_window_hits: Vec<legacy::TripHit>,
     in_window_lgcalls: u64,
+    /// Window-straddling poll deltas (F-D/A10): a discovery poll
+    /// that completes at/after the loop deadline contributes
+    /// window-ambiguous tripwire/query counts — explicit loss, never
+    /// in-window evidence. Subtracted from the close-tail residual
+    /// alongside the in-window accumulators (counted exactly once).
+    straddling_trip: HashMap<u64, u64>,
+    straddling_lgcalls: u64,
     trigger_observed: bool,
     attached_total: u64,
     cold_gap_queries: u64,
@@ -1773,6 +1780,7 @@ struct Runner<'x, D, B: CountBackend, T, L, C: ClockPort, P: ProcPort> {
     fallback_partial: bool,
     window_start_ns: u64,
     requested_start_ns: u64,
+    kernel_deadline_ns: u64,
     open_instant: Instant,
     open_wall: SystemTime,
     drain_wall_us: u64,
@@ -1825,6 +1833,12 @@ where
 
     /// Poll discovery once, adapt, attach, and accumulate. Returns
     /// (budget_exhausted, candidates_changed).
+    /// Apply one discovery poll. `deadline` (loop rounds only, never
+    /// the setup baseline poll) is the window edge the poll must
+    /// complete before: rounds only poll pre-deadline, so a poll
+    /// completing at/after it straddled the edge and its tripwire
+    /// deltas route to the straddling-loss accumulators instead of
+    /// the in-window evidence (F-D/A10).
     fn poll_and_apply(
         &mut self,
         live: &[maps::Mapping],
@@ -1832,6 +1846,7 @@ where
         fresh: &HashSet<(String, u64)>,
         post_settle: bool,
         baseline: bool,
+        deadline: Option<Instant>,
     ) -> anyhow::Result<(bool, bool)> {
         let delta = self.discovery.poll(PollBudget::default())?;
         let exhausted = delta.budget_exhausted;
@@ -1852,14 +1867,30 @@ where
             .cold_gap_queries
             .saturating_add(adapted.pre_window_queries);
         if let Some(trip) = adapted.tripwire {
-            for (cookie, n) in trip.counter_deltas {
-                let slot = self.in_window_trip.entry(cookie).or_default();
-                *slot = slot.saturating_add(n);
+            // Window-ambiguous poll: the counter values were read
+            // after the window closed — the delta mixes pre- and
+            // post-deadline increments inseparably (hits carry no
+            // timestamps), so all of it is loss. Anything else is
+            // in-window evidence (the round checked pre-deadline).
+            let straddled = deadline.is_some_and(|d| self.clock.now() >= d);
+            if straddled {
+                for (cookie, n) in trip.counter_deltas {
+                    let slot = self.straddling_trip.entry(cookie).or_default();
+                    *slot = slot.saturating_add(n);
+                }
+                self.straddling_lgcalls = self
+                    .straddling_lgcalls
+                    .saturating_add(trip.executed_legacy_queries_delta);
+            } else {
+                for (cookie, n) in trip.counter_deltas {
+                    let slot = self.in_window_trip.entry(cookie).or_default();
+                    *slot = slot.saturating_add(n);
+                }
+                self.in_window_hits.extend(trip.hits.iter());
+                self.in_window_lgcalls = self
+                    .in_window_lgcalls
+                    .saturating_add(trip.executed_legacy_queries_delta);
             }
-            self.in_window_hits.extend(trip.hits.iter());
-            self.in_window_lgcalls = self
-                .in_window_lgcalls
-                .saturating_add(trip.executed_legacy_queries_delta);
         }
         self.trigger_observed |= adapted.trigger_observed;
         let report = self.count.attach_delta(&adapted.delta, live, files)?;
@@ -1989,7 +2020,7 @@ where
         let mut catches = 0u32;
         loop {
             let (exhausted, fence) =
-                self.poll_and_apply(&live, &files, &fresh, post_settle, false)?;
+                self.poll_and_apply(&live, &files, &fresh, post_settle, false, Some(deadline))?;
             fence_candidates |= fence;
             if !exhausted {
                 break;
@@ -2192,17 +2223,36 @@ where
     // setup slice this steals from the requested window reports as
     // tail gap: the loop clamps to the kernel deadline and the
     // effective end caps there (never hidden, never drained).
+    // F-D/A10: the kernel admission deadline measures from the
+    // DECLARED window start — window open for owned spawns (the
+    // child is stopped, so the setup slice counts nothing and the
+    // clamped loop ends at this same edge), acquisition for --pid
+    // (setup already consumed part of the requested window, so
+    // open + duration would admit post-requested-end executions as
+    // in-window).
     let start_ns = clock.monotonic_ns();
     let duration = duration_ns(cfg.duration);
-    let Some(deadline_ns) = start_ns.checked_add(duration) else {
+    let declared_start_ns = if info.owned {
+        start_ns
+    } else {
+        info.acquired_ns
+    };
+    let Some(kernel_deadline_ns) = declared_start_ns.checked_add(duration) else {
         let _ = target.resolve_setup_failure();
         anyhow::bail!("window deadline overflow");
     };
-    if start_ns >= deadline_ns {
+    if start_ns >= kernel_deadline_ns {
         let _ = target.resolve_setup_failure();
-        anyhow::bail!("empty count window");
+        if info.owned {
+            anyhow::bail!("empty count window");
+        }
+        // Setup outlasted the requested window (or acquisition is
+        // unstamped): nothing of the declared interval is countable.
+        // Fail closed — programming open + duration would launder
+        // post-window executions as in-window evidence.
+        anyhow::bail!("requested window elapsed before window open");
     }
-    if let Err(e) = count.open_window(start_ns, deadline_ns) {
+    if let Err(e) = count.open_window(start_ns, kernel_deadline_ns) {
         let _ = count.close_and_drain(cfg.grace);
         let _ = target.resolve_setup_failure();
         return Err(e.context("count open_window"));
@@ -2224,6 +2274,8 @@ where
         in_window_trip: HashMap::new(),
         in_window_hits: Vec::new(),
         in_window_lgcalls: 0,
+        straddling_trip: HashMap::new(),
+        straddling_lgcalls: 0,
         trigger_observed: false,
         attached_total: 0,
         cold_gap_queries: 0,
@@ -2244,6 +2296,7 @@ where
         fallback_partial: false,
         window_start_ns: start_ns,
         requested_start_ns: start_ns,
+        kernel_deadline_ns,
         open_instant: clock.now(),
         open_wall: clock.wall_now(),
         drain_wall_us: 0,
@@ -2288,7 +2341,7 @@ where
         self.snapshot = snapshot(exe, &live, &[], &HashMap::new());
         self.last_live = live.clone();
         let fresh = HashSet::new();
-        match self.poll_and_apply(&live, &files, &fresh, false, true) {
+        match self.poll_and_apply(&live, &files, &fresh, false, true, None) {
             Ok((_, fence_candidates)) => {
                 if fence_candidates {
                     if let Err(e) = self.count.fence(CountFence::CandidatesChanged) {
@@ -2491,12 +2544,10 @@ where
         }
         // Effective coverage ends when counting stops (close_window
         // inside): stamp before the userspace drain, capped at the
-        // kernel deadline — drain time is not coverage, and the loop
-        // can overshoot the clamped deadline by up to one round.
-        let kernel_deadline_ns = self
-            .window_start_ns
-            .saturating_add(duration_ns(self.cfg.duration));
-        let effective_end_ns = self.clock.monotonic_ns().min(kernel_deadline_ns);
+        // programmed kernel deadline — drain time is not coverage,
+        // and the loop can overshoot the clamped deadline by up to
+        // one round.
+        let effective_end_ns = self.clock.monotonic_ns().min(self.kernel_deadline_ns);
         // Counting closes BEFORE the final discovery drain
         // (in-kernel TARGET=0 inside: no userspace delay can extend
         // counting past this point).
@@ -2710,6 +2761,33 @@ where
                 ));
             }
         }
+        // Straddling-poll legacy reconcile (F-D/A10): polls that
+        // completed at/after the loop deadline contributed
+        // window-ambiguous deltas — explicit loss here, and
+        // subtracted from the close-tail residual below so each
+        // increment counts exactly once.
+        let straddling_trip: u64 = self
+            .straddling_trip
+            .values()
+            .fold(0u64, |a, &b| a.saturating_add(b));
+        if straddling_trip > 0 {
+            self.extra_loss.push(typed_counter(
+                "legacy.straddling_poll_trip",
+                CounterKind::Loss,
+                CounterUnits::Events,
+                CounterSource::Discovery,
+                straddling_trip,
+            ));
+        }
+        if self.straddling_lgcalls > 0 {
+            self.extra_loss.push(typed_counter(
+                "legacy.straddling_poll_lgcalls",
+                CounterKind::Loss,
+                CounterUnits::Events,
+                CounterSource::Discovery,
+                self.straddling_lgcalls,
+            ));
+        }
         // Close-tail legacy reconcile: the final join covers TRIP
         // and LGCALLS increments past the last poll (a probe with no
         // ring event, e.g. an in-window ENGINE_init, lands only
@@ -2720,8 +2798,10 @@ where
         for (cookie, total) in &snapshot.legacy.trip {
             let base = self.adapter.baseline_trip.get(cookie).copied().unwrap_or(0);
             let in_window = self.in_window_trip.get(cookie).copied().unwrap_or(0);
+            let straddling = self.straddling_trip.get(cookie).copied().unwrap_or(0);
             if let Some(after_base) = total.checked_sub(base)
-                && let Some(tail) = after_base.checked_sub(in_window)
+                && let Some(after_window) = after_base.checked_sub(in_window)
+                && let Some(tail) = after_window.checked_sub(straddling)
             {
                 tail_trip = tail_trip.saturating_add(tail);
             }
@@ -2739,7 +2819,8 @@ where
             .legacy
             .executed_queries
             .checked_sub(self.adapter.baseline_lgcalls)
-            && let Some(tail_lgcalls) = after_base.checked_sub(self.in_window_lgcalls)
+            && let Some(after_window) = after_base.checked_sub(self.in_window_lgcalls)
+            && let Some(tail_lgcalls) = after_window.checked_sub(self.straddling_lgcalls)
             && tail_lgcalls > 0
         {
             self.extra_loss.push(typed_counter(
