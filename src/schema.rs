@@ -563,12 +563,14 @@ fn validate_against(
 /// version gate, forbidden argv/cmdline/address keys, window
 /// consistency, object reference integrity (full
 /// fingerprint/device/inode triples), record invariants, site
-/// timestamp order and key uniqueness, status/reasons agreement,
-/// policy verdict combination with definite-within-possible bounds
-/// and per-site evidence totals, and fenced-bucket generation
-/// agreement. Fails closed on malformed shape (this runs after
-/// [`validate_v2`] in the normal pipeline, but never assumes it
-/// did).
+/// timestamp order with effective-window containment (current and
+/// fenced) and key uniqueness, status/reasons agreement with
+/// COMPLETE reconciled against window gaps, coverage, loss, and
+/// unattributed calls, policy verdict combination with
+/// definite-within-possible bounds and per-site evidence totals,
+/// and fenced-bucket generation agreement. Fails closed on
+/// malformed shape (this runs after [`validate_v2`] in the normal
+/// pipeline, but never assumes it did).
 pub fn check_v2_semantics(doc: &serde_json::Value) -> Result<(), String> {
     let root = doc
         .as_object()
@@ -581,9 +583,9 @@ pub fn check_v2_semantics(doc: &serde_json::Value) -> Result<(), String> {
         return Err(format!("doc.schema_version: rejected {version:?}"));
     }
     sweep_forbidden_keys(doc, "$")?;
-    check_window(root)?;
+    let (effective_start, effective_end) = check_window(root)?;
     check_object_refs(root)?;
-    check_records(root)?;
+    check_records(root, effective_start, effective_end)?;
     Ok(())
 }
 
@@ -618,7 +620,9 @@ fn get_u64(
         .ok_or_else(|| format!("{ctx}.{key}: expected u64"))
 }
 
-fn check_window(root: &serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
+/// Window consistency; returns the effective bounds for
+/// site-activity containment.
+fn check_window(root: &serde_json::Map<String, serde_json::Value>) -> Result<(u64, u64), String> {
     let window = root
         .get("window")
         .and_then(|v| v.as_object())
@@ -639,7 +643,7 @@ fn check_window(root: &serde_json::Map<String, serde_json::Value>) -> Result<(),
     if effective_start < requested_start || effective_end > requested_end {
         return Err("doc.window: effective window escapes the requested window".to_string());
     }
-    Ok(())
+    Ok((effective_start, effective_end))
 }
 
 /// (object, device, inode, offset, generation) → calls for every
@@ -863,7 +867,11 @@ fn check_object_refs(root: &serde_json::Map<String, serde_json::Value>) -> Resul
     Ok(())
 }
 
-fn check_records(root: &serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
+fn check_records(
+    root: &serde_json::Map<String, serde_json::Value>,
+    effective_start: u64,
+    effective_end: u64,
+) -> Result<(), String> {
     // OpenSSL: verified ⟺ version present and non-empty.
     let openssl = root
         .get("openssl")
@@ -988,7 +996,11 @@ fn check_records(root: &serde_json::Map<String, serde_json::Value>) -> Result<()
             other => return Err(format!("{ctx}.state: unknown {other:?}")),
         }
     }
-    // Site timestamps order (first touch precedes last touch).
+    // Site timestamps order (first touch precedes last touch)
+    // with effective-window containment (F-B/Bm1: counting cannot
+    // precede the clock or run past the deadline; current and
+    // fenced share this closure). Bounds are inclusive: touching
+    // the clock edges is ordinary.
     let check_times = |site: &serde_json::Value, ctx: &str| -> Result<(), String> {
         let record = site
             .as_object()
@@ -997,6 +1009,11 @@ fn check_records(root: &serde_json::Map<String, serde_json::Value>) -> Result<()
         let last = get_u64(record, "last_ns", ctx)?;
         if first > last {
             return Err(format!("{ctx}: first_ns {first} is past last_ns {last}"));
+        }
+        if first < effective_start || last > effective_end {
+            return Err(format!(
+                "{ctx}: activity [{first}, {last}] escapes the effective window [{effective_start}, {effective_end}]"
+            ));
         }
         Ok(())
     };
@@ -1058,6 +1075,14 @@ fn check_records(root: &serde_json::Map<String, serde_json::Value>) -> Result<()
         }
         _ => {}
     }
+    // COMPLETE reconciles against the underlying fields, not just
+    // the reasons array (F-B/Bm1): no window gaps, no unknown or
+    // short coverage, no positive loss, no executed-but-unattributed
+    // calls. Each rule mirrors a `finalize` reason, so no pipeline
+    // COMPLETE can trip it; PARTIAL/FATAL skip it entirely.
+    if status == "COMPLETE" {
+        check_complete_reconciles(root)?;
+    }
     // Policy verdict is the AND of its rules: any violation rules
     // the verdict a violation, else any inconclusive rules it
     // inconclusive, else pass. `no-verdict` rides FATAL documents
@@ -1100,6 +1125,138 @@ fn check_records(root: &serde_json::Map<String, serde_json::Value>) -> Result<()
             return Err(format!(
                 "doc.policy: verdict {verdict:?} contradicts rule results {results:?}"
             ));
+        }
+    }
+    Ok(())
+}
+
+/// COMPLETE/underlying-field reconciliation (F-B/Bm1): a COMPLETE
+/// verdict with an empty reasons array must also show a gapless
+/// window, complete coverage, zero loss, and no unattributed
+/// executions — each mirrors a `finalize` gap reason.
+fn check_complete_reconciles(
+    root: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
+    // Gapless window: effective equals requested, no signal cut
+    // (mirrors StartupGap/TailGap/SignalCut).
+    let window = root
+        .get("window")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| "doc.window: expected object".to_string())?;
+    let requested_start = get_u64(window, "requested_start_ns", "doc.window")?;
+    let requested_end = get_u64(window, "requested_end_ns", "doc.window")?;
+    let effective_start = get_u64(window, "effective_start_ns", "doc.window")?;
+    let effective_end = get_u64(window, "effective_end_ns", "doc.window")?;
+    if effective_start != requested_start || effective_end != requested_end {
+        return Err("doc.completeness: COMPLETE with a narrowed effective window".to_string());
+    }
+    let signal_cut = window
+        .get("signal_cut")
+        .and_then(|v| v.as_bool())
+        .ok_or_else(|| "doc.window.signal_cut: expected bool".to_string())?;
+    if signal_cut {
+        return Err("doc.completeness: COMPLETE with signal_cut".to_string());
+    }
+    // Complete coverage: no unknown denominators, no applicable
+    // shortfalls (mirrors UnknownDenominator/UndiscoveredSites/
+    // UnattachedSites).
+    let coverage = root
+        .get("coverage")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "doc.coverage: expected array".to_string())?;
+    for (index, entry) in coverage.iter().enumerate() {
+        let ctx = format!("doc.coverage[{index}]");
+        let record = entry
+            .as_object()
+            .ok_or_else(|| format!("{ctx}: expected object"))?;
+        let expected = record
+            .get("expected")
+            .and_then(|v| v.as_object())
+            .ok_or_else(|| format!("{ctx}.expected: expected object"))?;
+        let state = expected
+            .get("state")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("{ctx}.expected.state: expected string"))?;
+        match state {
+            "unknown" => {
+                return Err(format!("{ctx}: COMPLETE with an unknown denominator"));
+            }
+            "applicable" => {
+                let sites = expected
+                    .get("sites")
+                    .and_then(|v| v.as_u64())
+                    .ok_or_else(|| format!("{ctx}.expected.sites: expected u64"))?;
+                let discovered = get_u64(record, "discovered", &ctx)?;
+                let attached = get_u64(record, "attached", &ctx)?;
+                if discovered < sites || attached < sites {
+                    return Err(format!(
+                        "{ctx}: COMPLETE with undiscovered/unattached sites"
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    // Zero loss: no positive Loss-kind counter (mirrors Loss).
+    let completeness = root
+        .get("completeness")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| "doc.completeness: expected object".to_string())?;
+    let counters = completeness
+        .get("counters")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "doc.completeness.counters: expected array".to_string())?;
+    for (index, counter) in counters.iter().enumerate() {
+        let ctx = format!("doc.completeness.counters[{index}]");
+        let record = counter
+            .as_object()
+            .ok_or_else(|| format!("{ctx}: expected object"))?;
+        let kind = record
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("{ctx}.kind: expected string"))?;
+        if kind == "loss" && get_u64(record, "value", &ctx)? > 0 {
+            return Err(format!("{ctx}: COMPLETE with positive loss"));
+        }
+    }
+    // No unattributed executions (mirrors UnattributedCalls):
+    // calls>0 with an unknown candidate set, current and fenced.
+    let check_site = |site: &serde_json::Value, ctx: &str| -> Result<(), String> {
+        let record = site
+            .as_object()
+            .ok_or_else(|| format!("{ctx}: expected object"))?;
+        let calls = get_u64(record, "calls", ctx)?;
+        if calls == 0 {
+            return Ok(());
+        }
+        let candidates_coverage = record
+            .get("candidates_coverage")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("{ctx}.candidates_coverage: expected string"))?;
+        if candidates_coverage == "unknown" {
+            return Err(format!("{ctx}: COMPLETE with unattributed calls"));
+        }
+        Ok(())
+    };
+    let sites = root
+        .get("sites")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "doc.sites: expected array".to_string())?;
+    for (index, site) in sites.iter().enumerate() {
+        check_site(site, &format!("doc.sites[{index}]"))?;
+    }
+    let fenced = root
+        .get("fenced")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "doc.fenced: expected array".to_string())?;
+    for (bucket, fenced_doc) in fenced.iter().enumerate() {
+        let inner = fenced_doc
+            .as_object()
+            .and_then(|o| o.get("sites"))
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| format!("doc.fenced[{bucket}].sites: expected array"))?;
+        for (index, site) in inner.iter().enumerate() {
+            check_site(site, &format!("doc.fenced[{bucket}].sites[{index}]"))?;
         }
     }
     Ok(())

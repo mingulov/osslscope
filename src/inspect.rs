@@ -84,6 +84,9 @@ pub fn run(args: &[String]) -> ExitCode {
         legacy,
         table,
         force_offset,
+        // inspect attaches to a live pid: mid-life observation, never
+        // from birth (F-B/A14 — quiet attaches stay PARTIAL).
+        observed_from_birth: false,
     };
     let emit = |doc: &serde_json::Value| {
         let text = serde_json::to_string_pretty(doc).unwrap();

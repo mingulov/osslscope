@@ -1037,6 +1037,12 @@ pub struct AdapterState {
     objects: Vec<ObjectRecord>,
     seen_objects: HashSet<(String, u64)>,
     loss_sums: HashMap<u32, u64>,
+    /// Ops carrying op-localized loss (orphan ROWs): their
+    /// candidate sets and denominators are tainted (F-B/A7).
+    tainted_ops: HashSet<u32>,
+    /// Unlocalizable loss seen (undecodable records, drain tails,
+    /// snapshot failures, kernel counters): taints every op.
+    taint_global: bool,
     queries_observed: u64,
     /// Pre-window tripwire totals (baselining poll): anchor the
     /// close-tail residual reconcile at assembly time.
@@ -1070,6 +1076,14 @@ impl AdapterState {
     /// terminated and clean, and no sticky walk-shape bits. A
     /// retired-awaiting-rebirth epoch (dirty tombstone) or an op
     /// with no table yet never closes.
+    /// Loss taint for an op's completeness claims (F-B/A7):
+    /// op-localized orphan loss or unlocalizable global loss. Pure
+    /// table proof stays in `op_closed`; taint applies at the claim
+    /// sites (candidate coverage, denominator).
+    fn loss_tainted(&self, op: u32) -> bool {
+        self.taint_global || self.tainted_ops.contains(&op)
+    }
+
     fn op_closed(&self, op: u32) -> bool {
         if self.op_trunc.get(&op).copied().unwrap_or(0) != 0 {
             return false;
@@ -1104,6 +1118,23 @@ fn degrade_op_sites(
                 }
                 touched.insert(triple, site.clone());
             }
+        }
+    }
+}
+
+/// Re-emit every emitted site as Unknown: unlocalizable loss taints
+/// all ops (F-B/A7 — the missing evidence could be anyone's).
+fn degrade_all_sites(
+    state: &mut AdapterState,
+    touched: &mut HashMap<(u64, u64, u64), DiscoveredSite>,
+) {
+    let triples: Vec<(u64, u64, u64)> = state.emitted.keys().copied().collect();
+    for triple in triples {
+        if let Some(site) = state.emitted.get_mut(&triple) {
+            if site.candidates_coverage != CandidateCoverage::Unknown {
+                site.candidates_coverage = CandidateCoverage::Unknown;
+            }
+            touched.insert(triple, site.clone());
         }
     }
 }
@@ -1151,6 +1182,11 @@ pub fn adapt_delta(
     let mut activity = Vec::new();
 
     // D4: every discovery loss stays Loss, forwarded exactly once.
+    // A7: loss also taints completeness claims — op-localized
+    // orphans taint their op's sets/denominators, unlocalizable
+    // loss taints every op. Newly tainted scopes degrade below.
+    let mut taint_global_new = false;
+    let mut taint_ops_new = Vec::new();
     for loss in &delta.losses {
         if loss.count == 0 {
             continue;
@@ -1158,6 +1194,19 @@ pub fn adapt_delta(
         let sum = state.loss_sums.entry(loss.source).or_default();
         *sum = sum.saturating_add(loss.count);
         count_losses.push(classify_loss(loss.source, loss.count));
+        match loss.op {
+            Some(op) => {
+                if state.tainted_ops.insert(op) {
+                    taint_ops_new.push(op);
+                }
+            }
+            None => {
+                if !state.taint_global {
+                    state.taint_global = true;
+                    taint_global_new = true;
+                }
+            }
+        }
     }
 
     // D2 retirements FIRST: the retired epoch's completion drops
@@ -1230,6 +1279,16 @@ pub fn adapt_delta(
         if was_closed.contains(&op) && !state.op_closed(op) {
             degrade_op_sites(state, &mut touched, op);
         }
+    }
+
+    // A7 loss-taint degrade: newly tainted scopes re-emit as
+    // Unknown (transition-only — already-tainted scopes stay
+    // quiet, and the emit-time check below covers first emits).
+    for op in taint_ops_new {
+        degrade_op_sites(state, &mut touched, op);
+    }
+    if taint_global_new {
+        degrade_all_sites(state, &mut touched);
     }
 
     // D1/D3 candidates: group by backing triple, union with the
@@ -1308,10 +1367,15 @@ pub fn adapt_delta(
         // for an epoch it never observed — arrivals for sibling
         // epochs or ops on a shared site do not taint a closed
         // epoch, but an unproven epoch taints its own site).
-        let mut unknown = bad_read;
+        // A7: relevant loss taints the set (op-localized orphans
+        // via tainted_ops; unlocalizable loss via the global flag).
+        let mut unknown = bad_read || state.taint_global;
         if let Some(ops) = state.triple_ops.get(&triple) {
             for op in ops {
                 if !state.op_closed(*op) {
+                    unknown = true;
+                }
+                if state.tainted_ops.contains(op) {
                     unknown = true;
                 }
                 for (gop, gepoch) in &group_epochs {
@@ -2677,9 +2741,12 @@ where
                 .unwrap_or_else(|| self.adapter.op_closed(op));
             let discovered = self.adapter.op_discovered(op);
             let attached = self.op_attached(op);
+            // A7: a tainted op's discovered count is no denominator
+            // (a lost ROW may hide a site or an identity).
+            let known = terminated && !self.adapter.loss_tainted(op);
             coverage.push(ScopeCoverage {
                 scope: format!("op:{op}"),
-                expected: if terminated {
+                expected: if known {
                     ExpectedScope::Applicable { sites: discovered }
                 } else {
                     ExpectedScope::Unknown
@@ -3843,6 +3910,136 @@ mod tests {
     }
 
     #[test]
+    fn adapt_orphan_loss_taints_same_op_site_set() {
+        use crate::discovery::session::DiscoveryLoss;
+        // A7: both ALG records arrive (table terminates) but one ROW
+        // is lost — the orphan localizes to op 1, so the surviving
+        // site's set degrades to Unknown (the missing identity could
+        // be hers), exactly like a retirement re-emit.
+        let live: Vec<maps::Mapping> = Vec::new();
+        let files = HashMap::new();
+        let fresh = HashSet::new();
+        let mut state = AdapterState::default();
+        let first = DiscoveryDelta {
+            candidates: vec![candidate(
+                "/p/provider.so",
+                backing("08:01", 7, 0x100),
+                1,
+                11,
+                "SHA-256",
+                false,
+                "ok",
+            )],
+            tables: vec![terminated(1, 0)],
+            ..DiscoveryDelta::default()
+        };
+        let out = adapt_delta(&mut state, &first, &ctx_for(&live, &files, &fresh));
+        assert_eq!(
+            out.delta.discovered[0].candidates_coverage,
+            CandidateCoverage::Complete
+        );
+        let orphan = DiscoveryDelta {
+            losses: vec![DiscoveryLoss {
+                source: coverage::HOST_ORPHAN_ROW,
+                count: 1,
+                op: Some(1),
+            }],
+            ..DiscoveryDelta::default()
+        };
+        let out = adapt_delta(&mut state, &orphan, &ctx_for(&live, &files, &fresh));
+        assert_eq!(out.delta.discovered.len(), 1);
+        assert_eq!(
+            out.delta.discovered[0].candidates_coverage,
+            CandidateCoverage::Unknown
+        );
+    }
+
+    #[test]
+    fn adapt_orphan_loss_same_delta_taints_emit() {
+        use crate::discovery::session::DiscoveryLoss;
+        // A7: loss in the SAME delta as the first emit taints it —
+        // the site is never Complete even for one poll.
+        let delta = DiscoveryDelta {
+            candidates: vec![candidate(
+                "/p/provider.so",
+                backing("08:01", 7, 0x100),
+                1,
+                11,
+                "SHA-256",
+                false,
+                "ok",
+            )],
+            tables: vec![terminated(1, 0)],
+            losses: vec![DiscoveryLoss {
+                source: coverage::HOST_ORPHAN_ROW,
+                count: 1,
+                op: Some(1),
+            }],
+            ..DiscoveryDelta::default()
+        };
+        let (_, out) = adapt_fresh(&delta, &[]);
+        assert_eq!(out.delta.discovered.len(), 1);
+        assert_eq!(
+            out.delta.discovered[0].candidates_coverage,
+            CandidateCoverage::Unknown
+        );
+    }
+
+    #[test]
+    fn adapt_unlocalizable_loss_taints_all_ops() {
+        use crate::discovery::session::DiscoveryLoss;
+        // A7: an undecodable record localizes to no op — every
+        // previously Complete site degrades, and later emits stay
+        // Unknown (the missing evidence could be anyone's).
+        let live: Vec<maps::Mapping> = Vec::new();
+        let files = HashMap::new();
+        let fresh = HashSet::new();
+        let mut state = AdapterState::default();
+        let first = DiscoveryDelta {
+            candidates: vec![
+                candidate(
+                    "/p/provider.so",
+                    backing("08:01", 7, 0x100),
+                    1,
+                    11,
+                    "SHA-256",
+                    false,
+                    "ok",
+                ),
+                candidate(
+                    "/p/provider.so",
+                    backing("08:01", 9, 0x200),
+                    2,
+                    21,
+                    "SHA-512",
+                    false,
+                    "ok",
+                ),
+            ],
+            tables: vec![terminated(1, 0), terminated(2, 0)],
+            ..DiscoveryDelta::default()
+        };
+        let out = adapt_delta(&mut state, &first, &ctx_for(&live, &files, &fresh));
+        assert_eq!(out.delta.discovered.len(), 2);
+        for site in &out.delta.discovered {
+            assert_eq!(site.candidates_coverage, CandidateCoverage::Complete);
+        }
+        let bad = DiscoveryDelta {
+            losses: vec![DiscoveryLoss {
+                source: coverage::HOST_BAD_EVENT,
+                count: 1,
+                op: None,
+            }],
+            ..DiscoveryDelta::default()
+        };
+        let out = adapt_delta(&mut state, &bad, &ctx_for(&live, &files, &fresh));
+        assert_eq!(out.delta.discovered.len(), 2);
+        for site in &out.delta.discovered {
+            assert_eq!(site.candidates_coverage, CandidateCoverage::Unknown);
+        }
+    }
+
+    #[test]
     fn adapt_unplannable_sites_are_loud_loss() {
         // D3: missing backing / unparsable device → explicit loss,
         // never a fabricated site.
@@ -3882,22 +4079,27 @@ mod tests {
                 DiscoveryLoss {
                     source: osslscope_ebpf_common::LOSS_RING_ROW,
                     count: 2,
+                    op: None,
                 },
                 DiscoveryLoss {
                     source: osslscope_ebpf_common::LOSS_MAP_TRIP,
                     count: 3,
+                    op: None,
                 },
                 DiscoveryLoss {
                     source: coverage::HOST_ORPHAN_ROW,
                     count: 4,
+                    op: None,
                 },
                 DiscoveryLoss {
                     source: 4242,
                     count: 5,
+                    op: None,
                 },
                 DiscoveryLoss {
                     source: osslscope_ebpf_common::LOSS_RING_ROW,
                     count: 0,
+                    op: None,
                 },
             ],
             ..DiscoveryDelta::default()
