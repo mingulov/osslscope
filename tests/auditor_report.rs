@@ -295,14 +295,14 @@ fn check_legacy(v: &Value, ctx: &str) -> Result<(), String> {
     if let Some(l) = o.get("legacy_provider") {
         let c = format!("{ctx}.legacy_provider");
         let lo = obj(l, &c)?;
-        exact_keys(lo, &["algs", "executed_calls", "loads"], &c)?;
+        exact_keys(lo, &["algs", "executed_queries", "loads"], &c)?;
         str_map(
             obj(get(lo, "loads", &c)?, &format!("{c}.loads"))?,
             &format!("{c}.loads"),
         )?;
         as_u64(
-            get(lo, "executed_calls", &c)?,
-            &format!("{c}.executed_calls"),
+            get(lo, "executed_queries", &c)?,
+            &format!("{c}.executed_queries"),
         )?;
         for s in as_arr(get(lo, "algs", &c)?, &format!("{c}.algs"))? {
             as_str(s, &format!("{c}.algs[]"))?;

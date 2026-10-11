@@ -1583,7 +1583,7 @@ fn prewindow_vs_inwindow_engine() {
         serde_json::json!(5)
     );
     assert_eq!(
-        c.legacy["legacy_provider"]["executed_calls"],
+        c.legacy["legacy_provider"]["executed_queries"],
         serde_json::json!(4)
     );
     assert_eq!(
@@ -1652,7 +1652,7 @@ fn transient_load_hits_are_loads_not_executions() {
         serde_json::json!(2)
     );
     assert_eq!(
-        c.legacy["legacy_provider"]["executed_calls"],
+        c.legacy["legacy_provider"]["executed_queries"],
         serde_json::json!(0)
     );
 }
@@ -1834,7 +1834,7 @@ fn slow_metadata_past_deadline_admits_no_tripwire() {
     let (out, _) = h.run();
     let c = out.unwrap();
     assert_eq!(
-        c.legacy["legacy_provider"]["executed_calls"],
+        c.legacy["legacy_provider"]["executed_queries"],
         serde_json::json!(0)
     );
     assert_eq!(

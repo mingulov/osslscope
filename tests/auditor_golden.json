@@ -99,7 +99,7 @@
       "algs": [
         "MD4"
       ],
-      "executed_calls": 4,
+      "executed_queries": 4,
       "loads": {
         "legacy": 1
       }

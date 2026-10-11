@@ -346,7 +346,8 @@ pub struct DispatchSnapshot {
 /// Cumulative legacy-plane state. Query counters
 /// (`executed_queries`) and tripwire counters (`trip`/`hits`) are
 /// separate fields; only the executed-query ledger feeds
-/// `executed_calls` at render.
+/// `executed_queries` at render (F-C/A9: queries, not
+/// executions).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LegacySnapshot {
     /// A tripwire probe set is planned and installed.
@@ -2280,7 +2281,7 @@ impl SessionEnv for LiveEnv {
                         LinkKind::Init,
                     )
                 {
-                    // Loud in-doc (executed_calls would read a
+                    // Loud in-doc (executed_queries would read a
                     // false 0); the run continues for tripwires.
                     note = Some(format!("legacy tripwire attach failed: {e:#}"));
                     eprintln!("INSPECT legacy attach failed: {e:#}");
