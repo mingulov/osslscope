@@ -726,14 +726,32 @@ pub struct SessionCore {
     next_epoch: u64,
     /// Expected producer generation per array base (F-H/H1):
     /// installed into `GEN[arr]` when the array's epoch is born
-    /// (bootstrap, from 1) or reborn (turnover, bumped — never
-    /// reused, so a retired incarnation's queued records can never
-    /// validate again). Keyed by array, not (op, array): BPF stamps
-    /// from the same key, and two ops sharing one array degrade to
-    /// explicit in-flight loss on a bump, never to silence or a
-    /// permanently bricked array. Removed on unload (with the
-    /// kernel entry evicted); a re-mapped array bootstraps fresh.
+    /// (bootstrap) or reborn (turnover bump). Keyed by array,
+    /// not (op, array): BPF stamps from the same key, and two
+    /// ops sharing one array degrade to explicit in-flight loss
+    /// on a bump, never to silence or a permanently bricked
+    /// array. Removed on forget (failed bump / unload, with the
+    /// kernel entry evicted); a re-mapped array re-bootstraps
+    /// above the high-water mark, never from 1 (M2).
     array_gen: HashMap<u64, u64>,
+    /// Highest generation ever installed per array base (M2):
+    /// survives forget (failed bump / unload remove the live
+    /// binding above, never this mark), so a re-bootstrap
+    /// cannot reuse a value whose stragglers may still be
+    /// queued. Entries persist for the session (bounded by
+    /// distinct arrays ever observed — dispatch tables, few
+    /// per target); cleared only on recycle with all lineage.
+    gen_high_water: HashMap<u64, u64>,
+    /// Bootstrap-install drain grace (M2): arrays whose
+    /// generation installed during the CURRENT poll's drain.
+    /// Records sharing the bootstrap install's drain predate
+    /// it — genuine install-gap evidence, like the fresh
+    /// `GEN == 1` case — so a tracked table accepts stamp 0
+    /// from them. Cleared every poll: deep-queue gap-0s in
+    /// later drains, and ancient gap-0s, still drop loud.
+    /// Bootstrap installs only (rebirth bumps land back-to-back
+    /// with their eviction — a 0 after a bump is stale).
+    bootstrap_grace: HashSet<u64>,
     /// Last successfully read mappings (F-D/Am1): a failed
     /// `current_maps` reconciles against this instead of reading
     /// the failure as empty. Starts empty (a first-poll failure
@@ -831,6 +849,8 @@ impl SessionCore {
             table_epochs: HashMap::new(),
             next_epoch: 0,
             array_gen: HashMap::new(),
+            gen_high_water: HashMap::new(),
+            bootstrap_grace: HashSet::new(),
             last_good_maps: Vec::new(),
             candidates: Vec::new(),
             seen: HashMap::new(),
@@ -930,16 +950,40 @@ impl SessionCore {
         self.probe_set = Some(set);
     }
 
+    /// Next installable generation for an array (M2 high-water):
+    /// above both the live binding and every generation this
+    /// session ever installed for the array. `None` at u64
+    /// exhaustion (F10 — callers fail closed like an install
+    /// failure; operationally unreachable).
+    fn next_generation(&self, arr: u64) -> Option<u64> {
+        self.array_gen
+            .get(&arr)
+            .copied()
+            .unwrap_or(0)
+            .max(self.gen_high_water.get(&arr).copied().unwrap_or(0))
+            .checked_add(1)
+    }
+
+    /// Record a successful install in both the live binding and
+    /// the high-water mark (every install is a new maximum by
+    /// construction of [`Self::next_generation`]).
+    fn record_generation_install(&mut self, arr: u64, generation: u64) {
+        self.array_gen.insert(arr, generation);
+        self.gen_high_water.insert(arr, generation);
+    }
+
     /// Register (op, arr) under its current incarnation when first
     /// observed; every fresh key mints a new epoch id.
     /// Fetch an array's epoch, minting one for a novel table.
     /// Minting bootstraps the incarnation generation (F-H/H1):
-    /// `GEN[arr]` installs at previous+1 (1 for a fresh array —
-    /// never 0, the pre-install stamp), so records the new
-    /// incarnation produces validate while the retired one's queued
-    /// records drop. A novel table on an already-tracked array
-    /// whose record carries the installed value adopts it (shared
-    /// array across ops — no install, no bump). `None` when the
+    /// `GEN[arr]` installs at previous+1 (1 for a
+    /// never-before-seen array — never 0, the pre-install
+    /// stamp; above the high-water mark after forget — never a
+    /// reuse, M2), so records the new incarnation produces
+    /// validate while the retired one's queued records drop. A
+    /// novel table on an already-tracked array whose record
+    /// carries the installed value adopts it (shared array
+    /// across ops — no install, no bump). `None` when the
     /// install fails: nothing is inserted, existing bindings are
     /// untouched (a failed `map_update` leaves the old value), and
     /// the next record retries — with explicit loss, so a stuck
@@ -971,13 +1015,22 @@ impl SessionCore {
             );
             return Some(epoch);
         }
-        let generation = self.array_gen.get(&arr).copied().unwrap_or(0) + 1;
+        let Some(generation) = self.next_generation(arr) else {
+            // u64 exhaustion: fail closed like an install failure
+            // (F10 — operationally unreachable).
+            eprintln!("generation space exhausted for op {op}");
+            self.tracker.note_bad_event(coverage::HOST_EVICT_FAILED);
+            return None;
+        };
         if let Err(e) = env.install_generation(arr, generation) {
             eprintln!("generation bootstrap failed for op {op}: {e:#}");
             self.tracker.note_bad_event(coverage::HOST_EVICT_FAILED);
             return None;
         }
-        self.array_gen.insert(arr, generation);
+        self.record_generation_install(arr, generation);
+        // The bootstrap install's own drain shares the install
+        // gap: same-drain stamp-0 records predate it (M2 grace).
+        self.bootstrap_grace.insert(arr);
         let epoch = self.next_epoch;
         self.next_epoch += 1;
         self.table_epochs.insert(
@@ -1003,11 +1056,13 @@ impl SessionCore {
     ///   garbage);
     /// - tracked table: accept the installed value, plus 0 while
     ///   the incarnation was never reborn (`GEN[arr] == 1` — the
-    ///   first drain's records all predate the bootstrap install).
-    ///   A 0 after any rebirth is ancient garbage (the install
-    ///   landed long ago), and anything else is a retired
-    ///   incarnation's queued record. Fail-closed throughout: no
-    ///   rule matches, no attribution.
+    ///   first drain's records all predate the bootstrap install)
+    ///   or the bootstrap install landed during this drain (M2
+    ///   grace — same-drain records predate it). A 0 after any
+    ///   rebirth, outside the install drain, is ancient garbage
+    ///   (the install landed long ago), and anything else is a
+    ///   retired incarnation's queued record. Fail-closed
+    ///   throughout: no rule matches, no attribution.
     fn check_gen(&mut self, op: u32, arr: u64, generation: u64) -> bool {
         if !self.table_epochs.contains_key(&(op, arr)) {
             let ok = match self.array_gen.get(&arr).copied() {
@@ -1021,6 +1076,9 @@ impl SessionCore {
         }
         if generation == 0 {
             if self.array_gen.get(&arr).copied() == Some(1) {
+                return true;
+            }
+            if self.bootstrap_grace.contains(&arr) {
                 return true;
             }
             self.tracker.note_straggler(op);
@@ -1045,14 +1103,16 @@ impl SessionCore {
     /// `GEN[arr]` installs at previous+1 AFTER the eviction above
     /// deletes the retired entry, so the new incarnation's records
     /// validate while the retired one's queued records drop. A
-    /// failed bump forgets the array entirely (no epoch, no
+    /// failed bump forgets the array's live binding (no epoch, no
     /// expected generation — the retired kernel entry is already
-    /// evicted) with explicit loss, and reports no rebirth: the
-    /// next record re-bootstraps from 1 instead of running
-    /// half-bound. Unload removes the expected generation with the
-    /// key (the kernel entry is evicted with it); a re-mapped
-    /// array bootstraps fresh, and its pre-unload stragglers keep
-    /// their nonzero stamps on a novel key, so they still drop.
+    /// evicted) with explicit loss, and reports no rebirth; the
+    /// high-water mark survives, so the next record
+    /// re-bootstraps ABOVE it instead of reusing 1 (M2) — never
+    /// half-bound, never reused. Unload removes the live binding
+    /// with the key (the kernel entry is evicted with it); a
+    /// re-mapped array re-bootstraps above high-water, and its
+    /// pre-unload stragglers drop by the generation gap whatever
+    /// key they carry (same-key mmap reuse included).
     fn retire_table_epoch<E: SessionEnv>(
         &mut self,
         env: &mut E,
@@ -1076,7 +1136,15 @@ impl SessionCore {
         let rebirth = now.is_some();
         match now {
             Some(fp) => {
-                let generation = self.array_gen.get(&arr).copied().unwrap_or(0) + 1;
+                let Some(generation) = self.next_generation(arr) else {
+                    // u64 exhaustion: fail closed like a failed
+                    // bump (F10 — operationally unreachable).
+                    eprintln!("generation space exhausted for op {op}");
+                    self.tracker.note_bad_event(coverage::HOST_EVICT_FAILED);
+                    self.table_epochs.remove(&(op, arr));
+                    self.array_gen.remove(&arr);
+                    return (TableRetirement { op, epoch, gap }, false);
+                };
                 if let Err(e) = env.install_generation(arr, generation) {
                     eprintln!("generation bump failed for op {op}: {e:#}");
                     self.tracker.note_bad_event(coverage::HOST_EVICT_FAILED);
@@ -1084,7 +1152,7 @@ impl SessionCore {
                     self.array_gen.remove(&arr);
                     return (TableRetirement { op, epoch, gap }, false);
                 }
-                self.array_gen.insert(arr, generation);
+                self.record_generation_install(arr, generation);
                 let epoch = self.next_epoch;
                 self.next_epoch += 1;
                 self.table_epochs.insert(
@@ -1215,6 +1283,8 @@ impl SessionCore {
         self.retained = coverage::CoverageDelta::default();
         self.table_epochs.clear();
         self.array_gen.clear();
+        self.gen_high_water.clear();
+        self.bootstrap_grace.clear();
         self.candidates.clear();
         self.seen.clear();
         self.objects.clear();
@@ -1393,6 +1463,9 @@ impl SessionCore {
         }
         // Every poll advances the retry clock (F-D/A12).
         self.poll_seq += 1;
+        // Bootstrap-install grace is drain-scoped (M2): last
+        // poll's installs confer no stamp-0 tolerance now.
+        self.bootstrap_grace.clear();
         // Pin FIRST: tainted events must not drive attaches.
         if env.verify_pin().is_err() {
             self.mark_recycled();

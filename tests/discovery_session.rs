@@ -1661,10 +1661,85 @@ fn same_key_rewalk_heals_retained_candidate_epoch() {
     env.push(dispatch_row_gen(OP_DIGEST, 7, 0x7f00_2000, arr, 0, 2));
     let d = core.poll(&mut env, ample_budget()).unwrap();
     assert!(d.retirements.is_empty());
+    assert!(d.candidates.is_empty(), "healed re-walk must stay silent");
+}
+
+#[test]
+fn m2_forgotten_array_rebootstraps_above_high_water() {
+    // Review M2: forget (failed bump / unload) removes the
+    // expected generation; re-bootstrap must install ABOVE the
+    // high-water mark, never reuse 1 — else a queued
+    // incarnation-1 straggler validates and joins the new epoch
+    // with the new fingerprint. Unload path: unmap the array,
+    // re-map the same address with a DIFFERENT backing
+    // (mmap reuse), re-observe with genuine stamp-0 records,
+    // then deliver the old stamp-1 row.
+    let mut env = TestEnv::new();
+    let mut core = test_core(false);
+    let arr = 0x7f00_1000u64;
+    walk_row(&mut env, &mut core, arr, 0, 7, 0x7f00_2000);
+    assert_eq!(env.gen_map.get(&arr).copied(), Some(1));
+
+    // Unload: the array's mapping is gone (other mappings live).
+    env.maps = vec![mapping(
+        0x7f01_0000,
+        0x20000,
+        true,
+        0,
+        "08:01",
+        200,
+        LIBCRYPTO,
+    )];
+    let d = core.poll(&mut env, ample_budget()).unwrap();
+    assert_eq!(d.retirements.len(), 1);
     assert!(
-        d.candidates.is_empty(),
-        "healed re-walk must stay silent"
+        !env.gen_map.contains_key(&arr),
+        "unload must evict kernel state"
     );
+
+    // Re-map the same address with a different backing; genuine
+    // stamp-0 records re-observe it (BPF state was evicted).
+    env.maps = vec![
+        mapping(0x7f00_0000, 0x10000, true, 0, "08:01", 777, PROVIDER),
+        mapping(0x7f01_0000, 0x20000, true, 0, "08:01", 200, LIBCRYPTO),
+    ];
+    env.push(query_ret_gen(OP_DIGEST, arr, 0, 0));
+    env.push(ok_alg_gen(OP_DIGEST, arr, 0, 0));
+    env.push(dispatch_row_gen(OP_DIGEST, 7, 0x7f00_2000, arr, 0, 0));
+    let d = core.poll(&mut env, ample_budget()).unwrap();
+    assert_eq!(d.candidates.len(), 1, "re-observe must bind");
+    assert_eq!(
+        env.gen_map.get(&arr).copied(),
+        Some(2),
+        "re-bootstrap must exceed the high-water mark, never reuse 1"
+    );
+
+    // The queued incarnation-1 straggler (same key!) must drop
+    // with op-localized loss, not join the new epoch.
+    env.push(dispatch_row_gen(OP_DIGEST, 7, 0x7f00_2000, arr, 0, 1));
+    let before = losses_of(&core.snapshot())
+        .get(&HOST_STRAGGLER)
+        .copied()
+        .unwrap_or(0);
+    let d = core.poll(&mut env, ample_budget()).unwrap();
+    assert!(d.candidates.is_empty(), "straggler must not join");
+    let after = losses_of(&core.snapshot())
+        .get(&HOST_STRAGGLER)
+        .copied()
+        .unwrap_or(0);
+    assert_eq!(after, before + 1, "straggler must drop loud");
+
+    // Grace is drain-scoped: a stamp-0 row in a LATER drain (deep
+    // queue or ancient gap) drops even though the array was
+    // bootstrapped this session.
+    env.push(dispatch_row_gen(OP_DIGEST, 7, 0x7f00_2000, arr, 0, 0));
+    let d = core.poll(&mut env, ample_budget()).unwrap();
+    assert!(d.candidates.is_empty(), "late gap-0 must not join");
+    let late = losses_of(&core.snapshot())
+        .get(&HOST_STRAGGLER)
+        .copied()
+        .unwrap_or(0);
+    assert_eq!(late, after + 1, "late gap-0 must drop loud");
 }
 
 #[test]
