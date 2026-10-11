@@ -1367,6 +1367,20 @@ fn doctor_exe_predicts_spawn_target() {
         "info",
         "spawn coverage note present"
     );
+    // F-G/B7: the spawn note must state requested-vs-effective
+    // observation, never unqualified exec-anchored observation.
+    let spawn_note = check_row(&doc, "coverage-spawn")["message"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        spawn_note.contains("requests observation from exec") && spawn_note.contains("effective"),
+        "spawn note states requested-vs-effective: {spawn_note}"
+    );
+    assert!(
+        !spawn_note.contains("no cold-start gap"),
+        "spawn note must not overpromise exec-anchored observation: {spawn_note}"
+    );
 }
 
 #[test]

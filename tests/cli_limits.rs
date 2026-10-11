@@ -263,19 +263,60 @@ fn redaction_wiring_is_present_in_capture() {
 #[test]
 fn non_utf8_argv_exits_without_panic() {
     // std::env::args() panics on non-UTF8 argv (exit 101); the entry
-    // point must convert lossily and let parsing decide (exit 2 here).
+    // point must reject non-UTF-8 with exit 2, never execute altered
+    // bytes. F-G/Bm2: the duration here is VALID, so encoding is the
+    // only defect (the old 1e30 masked it behind a second error).
     use std::os::unix::ffi::OsStringExt;
     let secret = std::ffi::OsString::from_vec(b"T04-\xff-secret".to_vec());
     let bin = env!("CARGO_BIN_EXE_osslscope");
     let out = std::process::Command::new(bin)
         .arg("report")
-        .args(["--duration", "1e30", "--provider"])
+        .args(["--duration", "30", "--provider"])
         .arg(&secret)
         .args(["--object", "o", "--count-object", "c", "--pid", "1"])
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(2), "must be a usage error");
     let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("panicked"), "must not panic: {stderr}");
+    assert!(
+        stderr.to_lowercase().contains("utf-8") || stderr.to_lowercase().contains("utf8"),
+        "must diagnose encoding: {stderr}"
+    );
+}
+
+#[test]
+fn non_utf8_target_argv_is_rejected_before_spawning() {
+    // F-G/Bm2: target arguments after `run --` are executed bytes —
+    // lossy conversion would run DIFFERENT bytes than typed. The
+    // entry point must refuse with exit 2 (never proceed to capture).
+    use std::os::unix::ffi::OsStringExt;
+    let bad = std::ffi::OsString::from_vec(b"/bin/echo-\xff".to_vec());
+    let bin = env!("CARGO_BIN_EXE_osslscope");
+    let out = std::process::Command::new(bin)
+        .args([
+            "report",
+            "--object",
+            "o",
+            "--count-object",
+            "c",
+            "run",
+            "--",
+        ])
+        .arg(&bad)
+        .arg("sentinel")
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "non-UTF-8 target argv must be a usage error, never capture"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.to_lowercase().contains("utf-8") || stderr.to_lowercase().contains("utf8"),
+        "must diagnose encoding: {stderr}"
+    );
     assert!(!stderr.contains("panicked"), "must not panic: {stderr}");
 }
 

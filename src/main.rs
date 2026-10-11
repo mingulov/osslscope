@@ -5,12 +5,18 @@
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    // std::env::args() panics on non-UTF8 argv (exit 101). Lossy conversion
-    // at the boundary keeps operator/target bytes out of panics (R07/R08);
-    // parsing still rejects anything invalid with exit 2.
-    let argv: Vec<String> = std::env::args_os()
-        .skip(1)
-        .map(|s| s.to_string_lossy().into_owned())
-        .collect();
+    // std::env::args() panics on non-UTF8 argv (exit 101). F-G/Bm2:
+    // non-UTF-8 argv is rejected here with exit 2 (usage error,
+    // before any side effect) — lossy conversion would silently
+    // EXECUTE different target bytes than the operator typed. The
+    // offending bytes are never echoed (R07).
+    let os_args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let argv = match osslscope::args::decode_argv(&os_args) {
+        Ok(argv) => argv,
+        Err(e) => {
+            eprintln!("osslscope: {e}");
+            return ExitCode::from(2);
+        }
+    };
     osslscope::cli::run(argv.into_iter())
 }

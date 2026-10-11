@@ -2010,7 +2010,7 @@ pub fn run(args: &[String]) -> ExitCode {
                 ));
                 checks.push(Check::info(
                     "coverage-spawn",
-                    "run -- observes from exec (no cold-start gap); a wrong libcrypto prediction degrades to zero-rows PARTIAL, never wrong attribution".into(),
+                    "run -- requests observation from exec; effective callback attachment follows discovery (fast or short-lived workloads may stay PARTIAL); a wrong libcrypto prediction degrades to zero-rows PARTIAL, never wrong attribution".into(),
                 ));
             }
         }
