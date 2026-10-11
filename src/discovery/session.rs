@@ -37,16 +37,22 @@
 //! longer walk is still a prefix, per T03 exact coverage),
 //! shrinkage-OOB (an old proof can never terminate a new
 //! incarnation), and cursor staleness on reload (the next walk
-//! restarts at slot 0). Two residuals remain explicit: a
-//! same-address content swap inside an unchanged mapping is
-//! indistinguishable from continued use (repeat inits bump the
-//! reload witness and re-attach when the callback moved; exact
-//! coverage is the backstop when the walk shape changes); and a
-//! turnover that lands between the kernel's genuine re-proof and
-//! the next poll evicts a fresh proof too — fail-safe to prefix,
-//! never to false COMPLETE. Eviction failure is explicit loss
-//! (`evict_failed`), and loss forces PARTIAL, which contains any
-//! surviving stale proof.
+//! restarts at slot 0). Two more closings (F-A/A4): the ring drains
+//! BEFORE reconcile, so stragglers join their own (old) epoch
+//! instead of the rebirth (reconcile-first stamped A's evidence
+//! with B's epoch); and a repeat init retires its provider file's
+//! tables plus every anonymous table — a same-fingerprint rebirth
+//! is polling-invisible, so suspicion replaces proof (multi-libctx
+//! pays a spurious retire; re-walks re-prove). Residuals remain
+//! explicit: content change with no init and no maps delta (token
+//! swap behind a static array) is invisible to polling; cross-CPU
+//! ring misorder can invert an init and its first re-query
+//! (microscopic — the maps reconcile still catches print changes);
+//! and a turnover that lands between the kernel's genuine re-proof
+//! and the next poll evicts a fresh proof too — fail-safe to
+//! prefix, never to false COMPLETE. Eviction failure is explicit
+//! loss (`evict_failed`), and loss forces PARTIAL, which contains
+//! any surviving stale proof.
 //!
 //! `no_store` lifetimes stay intact: uncacheable arrays are sampled,
 //! never walked to proof, and no array pointer is ever retained
@@ -526,13 +532,17 @@ fn debug_alg_line(op: u32, idx: u64, class: &str, weak: bool, status: u8) -> Str
 // SessionCore: the host-testable discovery state machine.
 // ---------------------------------------------------------------------------
 
+/// Mapping-incarnation fingerprint: `(device text, inode, range
+/// start, range end, file offset)`. File mappings only.
+type Fingerprint = (String, u64, u64, u64, u64);
+
 /// One table incarnation: the epoch id plus the mapping
 /// fingerprint the array was bound to (`None` for anonymous or
 /// unmapped arrays, which carry no verifiable identity).
 #[derive(Clone, Debug)]
 struct TableEpoch {
     epoch: u64,
-    fingerprint: Option<(String, u64, u64, u64, u64)>,
+    fingerprint: Option<Fingerprint>,
 }
 
 /// Candidate identity: `(op, class, weak, status, funcid,
@@ -554,7 +564,7 @@ struct ReconcileOutcome {
 /// Fingerprint the mapping covering `arr`: `(dev, ino, start, end,
 /// file offset)`. File mappings only — anonymous mappings have no
 /// identity to bind.
-fn incarnation_of(maps: &[maps::Mapping], arr: u64) -> Option<(String, u64, u64, u64, u64)> {
+fn incarnation_of(maps: &[maps::Mapping], arr: u64) -> Option<Fingerprint> {
     maps.iter()
         .find(|m| m.start <= arr && arr < m.end && m.ino != 0)
         .map(|m| (m.dev.clone(), m.ino, m.start, m.end, m.offset))
@@ -737,6 +747,53 @@ impl SessionCore {
         epoch
     }
 
+    /// Retire one table epoch: proof and walked set drop, gap
+    /// retained, join records pruned, kernel walker state evicted.
+    /// `now` is the array's current fingerprint: `Some` rebirths a
+    /// fresh unproven epoch, `None` (unload) removes the key.
+    /// Shared by maps-turnover reconcile and repeat-init suspect
+    /// (F-A/A4). Returns the retirement plus whether the array
+    /// rebirthed (delta-visible rebirth).
+    fn retire_table_epoch<E: SessionEnv>(
+        &mut self,
+        env: &mut E,
+        op: u32,
+        arr: u64,
+        epoch: u64,
+        now: Option<Fingerprint>,
+    ) -> (TableRetirement, bool) {
+        let gap = self.tracker.retire_table(op, arr);
+        self.retained.accumulate(&gap);
+        self.alg_records.retain(|(a, _), _| *a != arr);
+        // Generation-bind the kernel walker: without eviction a
+        // sticky proof (or a mid-array cursor) from the retired
+        // incarnation could satisfy the next one. Eviction
+        // failure is explicit loss — and loss forces PARTIAL,
+        // which contains any surviving stale proof.
+        if let Err(e) = env.evict_array_state(arr) {
+            eprintln!("array evict failed: {e:#}");
+            self.tracker.note_bad_event(coverage::HOST_EVICT_FAILED);
+        }
+        let rebirth = now.is_some();
+        match now {
+            Some(fp) => {
+                let epoch = self.next_epoch;
+                self.next_epoch += 1;
+                self.table_epochs.insert(
+                    (op, arr),
+                    TableEpoch {
+                        epoch,
+                        fingerprint: Some(fp),
+                    },
+                );
+            }
+            None => {
+                self.table_epochs.remove(&(op, arr));
+            }
+        };
+        (TableRetirement { op, epoch, gap }, rebirth)
+    }
+
     /// Reconcile tracked tables against current mappings: an
     /// incarnation change or unload retires the table (proof and
     /// walked set drop, gap retained, join records pruned, kernel
@@ -772,41 +829,69 @@ impl SessionCore {
             if fp == now {
                 continue;
             }
-            let gap = self.tracker.retire_table(op, arr);
-            self.retained.accumulate(&gap);
-            self.alg_records.retain(|(a, _), _| *a != arr);
-            // Generation-bind the kernel walker: without eviction a
-            // sticky proof (or a mid-array cursor) from the retired
-            // incarnation could satisfy the next one. Eviction
-            // failure is explicit loss — and loss forces PARTIAL,
-            // which contains any surviving stale proof.
-            if let Err(e) = env.evict_array_state(arr) {
-                eprintln!("array evict failed: {e:#}");
-                self.tracker.note_bad_event(coverage::HOST_EVICT_FAILED);
+            let (retirement, rebirth) = self.retire_table_epoch(env, op, arr, epoch, now);
+            if rebirth {
+                outcome.reborn.push((op, arr));
             }
-            outcome.retired.push(TableRetirement { op, epoch, gap });
-            match now {
-                Some(fp) => {
-                    let epoch = self.next_epoch;
-                    self.next_epoch += 1;
-                    self.table_epochs.insert(
-                        (op, arr),
-                        TableEpoch {
-                            epoch,
-                            fingerprint: Some(fp),
-                        },
-                    );
-                    outcome.reborn.push((op, arr));
-                }
-                None => {
-                    self.table_epochs.remove(&(op, arr));
-                }
-            }
+            outcome.retired.push(retirement);
         }
         outcome
             .retired
             .sort_by(|a, b| (a.op, a.epoch).cmp(&(b.op, b.epoch)));
         outcome
+    }
+
+    /// Suspect a provider file's tables on repeat init (F-A/A4): a
+    /// re-initialized provider may have reborn its arrays at
+    /// identical fingerprints (same file, same range — polling
+    /// cannot prove absence of ABA), so every table bound to the
+    /// init address's `(device, inode)` retires, plus every
+    /// anonymous/unmapped table (no verifiable identity — globally
+    /// suspect). An unresolvable init address scopes to anonymous
+    /// only: a mapped file's tables cannot be the reborn ones.
+    /// Mid-drain ring order keeps this exact: pre-init events
+    /// already joined the old epoch; post-init events join the
+    /// rebirth. Retires through the shared epoch path, so gaps,
+    /// prunes, eviction, and rebirth links match maps turnover.
+    fn suspect_provider_tables<E: SessionEnv>(
+        &mut self,
+        env: &mut E,
+        maps: &[maps::Mapping],
+        addr: u64,
+        delta: &mut DiscoveryDelta,
+        touched: &mut HashSet<(u32, u64)>,
+    ) {
+        let scope = maps
+            .iter()
+            .find(|m| m.start <= addr && addr < m.end && m.ino != 0)
+            .map(|m| (m.dev.clone(), m.ino));
+        let mut keys: Vec<(u32, u64, u64, Option<Fingerprint>)> = self
+            .table_epochs
+            .iter()
+            .map(|((op, arr), t)| (*op, *arr, t.epoch, t.fingerprint.clone()))
+            .collect();
+        keys.sort();
+        for (op, arr, epoch, fp) in keys {
+            let suspect = match (&scope, &fp) {
+                (Some((dev, ino)), Some((fdev, fino, _, _, _))) => dev == fdev && ino == fino,
+                (Some(_), None) => true,
+                (None, None) => true,
+                (None, Some(_)) => false,
+            };
+            if !suspect {
+                continue;
+            }
+            // A second matching init in this drain retires the
+            // rebirth again (chained links): each repeat init is
+            // its own suspected rebirth — multi-libctx and fast
+            // double-cycles are indistinguishable by polling.
+            let now = incarnation_of(maps, arr);
+            let (retirement, rebirth) = self.retire_table_epoch(env, op, arr, epoch, now);
+            if rebirth {
+                touched.insert((op, arr));
+            }
+            delta.retirements.push(retirement);
+        }
     }
 
     /// Discard all observation state after a pin failure: rows and
@@ -907,9 +992,6 @@ impl SessionCore {
         let mut maps = env.current_maps();
         let mut delta = DiscoveryDelta::default();
         let mut touched: HashSet<(u32, u64)> = HashSet::new();
-        let rec = self.reconcile_epochs(env, &maps);
-        delta.retirements = rec.retired;
-        touched.extend(rec.reborn);
 
         let mut attaches_done = 0u32;
         // Deferred legacy planning: pre-exec images have no
@@ -944,7 +1026,7 @@ impl SessionCore {
                 break;
             };
             consumed += 1;
-            self.ingest_one(&maps, &item, &mut delta, &mut touched);
+            self.ingest_one(env, &maps, &item, &mut delta, &mut touched);
         }
         delta.events_consumed = consumed;
         // Exact exhaustion signal: probe one past the budget and
@@ -955,6 +1037,23 @@ impl SessionCore {
             self.stashed = Some(extra);
             delta.budget_exhausted = true;
         }
+
+        // Reconcile AFTER the drain (F-A/A4): the ring is drained
+        // exhaustively every poll (plus stash-first), so every
+        // event ingested here predates this reconcile — stragglers
+        // join their own (old) epoch instead of the rebirth, and
+        // only genuinely new-epoch rows arrive stamped old (one
+        // poll stale; the refresh heals them on re-walk). A
+        // reconcile-first order stamped stragglers with the new
+        // epoch: A's evidence attributed to B.
+        let rec = self.reconcile_epochs(env, &maps);
+        delta.retirements.extend(rec.retired);
+        touched.extend(rec.reborn);
+        // Deterministic retirement order across the mid-drain
+        // suspect batch (ring order) and the reconcile batch.
+        delta
+            .retirements
+            .sort_by(|a, b| (a.op, a.epoch).cmp(&(b.op, b.epoch)));
 
         // Resolve against fresh mappings: a provider that loaded
         // after the poll-start snapshot (file reads sit between the
@@ -1154,8 +1253,9 @@ impl SessionCore {
     /// cannot be sized, so they are dropped before any field is
     /// read. Every drop path counts its loss at the drop site.
     #[allow(clippy::too_many_lines, reason = "one decode dispatch per wire kind")]
-    fn ingest_one(
+    fn ingest_one<E: SessionEnv>(
         &mut self,
+        env: &mut E,
         maps: &[maps::Mapping],
         b: &[u8],
         delta: &mut DiscoveryDelta,
@@ -1195,11 +1295,15 @@ impl SessionCore {
                 let cookie = ev.aux;
                 if self.attached_queries.contains(&cookie) {
                     // Repeat init (unload/reload cycles,
-                    // multi-libctx): witness the reload and queue
-                    // for the bounded drain, which re-resolves and
+                    // multi-libctx): witness the reload, suspect
+                    // the provider's tables (F-A/A4 — a
+                    // same-fingerprint rebirth is
+                    // polling-invisible), and queue for
+                    // the bounded drain, which re-resolves and
                     // re-attaches when the callback moved, else
                     // faults the cold pages back in.
                     *self.reloads.entry(cookie).or_default() += 1;
+                    self.suspect_provider_tables(env, maps, ev.addr, delta, touched);
                     self.pending_stage2.push_back((cookie, ev.addr));
                     return;
                 }
@@ -1302,7 +1406,24 @@ impl SessionCore {
                     // else skip. A missing backing now (transient
                     // unmap) never overwrites an attested triple —
                     // the render re-derives from live maps.
+                    // The epoch heals too (F-A/A4): a re-walked row
+                    // is live evidence in the CURRENT epoch, so it
+                    // re-points (and re-emits) instead of sticking
+                    // to a retired one. Sound because the drain
+                    // precedes reconcile: a row ingested while an
+                    // epoch is current cannot be a later epoch's
+                    // straggler, and same-epoch re-queries compare
+                    // equal and stay silent. No minting here: an
+                    // unloaded array (key removed) keeps its
+                    // retired stamp — only a live table re-points.
                     let mut changed = false;
+                    if let Some(t) = self.table_epochs.get(&(ev.op, ev.aux)) {
+                        let live_epoch = t.epoch;
+                        if self.candidates[i].epoch != live_epoch {
+                            self.candidates[i].epoch = live_epoch;
+                            changed = true;
+                        }
+                    }
                     if self.candidates[i].advertising != advertising
                         || self.candidates[i].advertising_dev != advertising_dev
                         || self.candidates[i].advertising_ino != advertising_ino

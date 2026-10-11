@@ -1066,6 +1066,11 @@ pub struct AdapterState {
     triple_ops: HashMap<(u64, u64, u64), HashSet<u32>>,
     op_triples: HashMap<u32, HashSet<(u64, u64, u64)>>,
     op_tables: HashMap<(u32, u64), OpTable>,
+    /// Sites with a permanent read gap (F-A/A4): once a candidate
+    /// arrives unreadable, the site never claims Complete. Same
+    /// stickiness as the old coverage latch — per-identity healing
+    /// (a re-read row clearing its own gap) is future work.
+    sites_bad_read: HashSet<(u64, u64, u64)>,
     /// Sticky per-op walk-shape bits (mirrors the producer: never
     /// retired — any nonzero bit keeps the op unclosed).
     op_trunc: HashMap<u32, u64>,
@@ -1245,10 +1250,12 @@ pub fn adapt_delta(
     }
 
     // D2 retirements FIRST: the retired epoch's completion drops
-    // (rows survive) into a dirty tombstone; this delta's tables then
-    // supersede it with the rebirth (an unload leaves the tombstone
-    // standing — proof dropped forever). Retirement gap losses are
-    // NOT re-counted (D2).
+    // (rows survive) into a dirty tombstone. A newer epoch's table
+    // prunes older dirt (sibling isolation: an unload must not veto
+    // a live array's proof); pruned-epoch arrivals fail closed via
+    // the untracked-epoch arm. An unload with no newer table leaves
+    // the tombstone standing — proof dropped forever. Retirement
+    // gap losses are NOT re-counted (D2).
     let mut touched: HashMap<(u64, u64, u64), DiscoveredSite> = HashMap::new();
     let was_closed: HashSet<u32> = state
         .ops()
@@ -1338,6 +1345,12 @@ pub fn adapt_delta(
     // any bad read).
     type Group = (String, Vec<CandidateIdentity>, HashSet<(u32, u64)>, bool);
     let mut groups: HashMap<(u64, u64, u64), Group> = HashMap::new();
+    // Novelty index for the non-closed guard (F-A/A4): duplicate
+    // arrivals (re-walked rows, multi-libctx re-queries) carry no
+    // new information and must not trip "new candidate after
+    // termination" — only novel identities feed the guard's epoch
+    // set. Prior emitted identities plus this poll's arrivals.
+    let mut seen_ids: HashMap<(u64, u64, u64), HashSet<CandidateIdentity>> = HashMap::new();
     for candidate in &delta.candidates {
         if is_legacy_locator(&candidate.advertising) {
             state.legacy_classes.insert(candidate.class.clone());
@@ -1386,9 +1399,24 @@ pub fn adapt_delta(
         let slot = groups
             .entry(triple)
             .or_insert_with(|| (backing.dev.clone(), Vec::new(), HashSet::new(), false));
+        let novel = seen_ids
+            .entry(triple)
+            .or_insert_with(|| {
+                state
+                    .emitted
+                    .get(&triple)
+                    .map(|s| s.candidates.iter().cloned().collect())
+                    .unwrap_or_default()
+            })
+            .insert(identity.clone());
         slot.1.push(identity);
-        slot.2.insert((candidate.op, candidate.epoch));
+        if novel {
+            slot.2.insert((candidate.op, candidate.epoch));
+        }
         slot.3 |= bad_read;
+        if bad_read {
+            state.sites_bad_read.insert(triple);
+        }
     }
     // Deterministic group order (arrival order must not leak).
     let mut group_keys: Vec<(u64, u64, u64)> = groups.keys().copied().collect();
@@ -1408,7 +1436,7 @@ pub fn adapt_delta(
         // epoch, but an unproven epoch taints its own site).
         // A7: relevant loss taints the set (op-localized orphans
         // via tainted_ops; unlocalizable loss via the global flag).
-        let mut unknown = bad_read || state.taint_global;
+        let mut unknown = bad_read || state.taint_global || state.sites_bad_read.contains(&triple);
         if let Some(ops) = state.triple_ops.get(&triple) {
             for op in ops {
                 if !state.op_closed(*op) {
@@ -1426,6 +1454,14 @@ pub fn adapt_delta(
                         // entry is not proof of completion).
                         None => unknown = true,
                         Some(t) => {
+                            // Transient trip (F-A/A4): a novel
+                            // arrival after this epoch's proof
+                            // degrades this emit only. True
+                            // non-closure (beyond-proof rows) is
+                            // the session's call — it re-opens the
+                            // table (len-aware) until re-proof —
+                            // while drain-delayed in-range rows
+                            // must not dirt the epoch forever.
                             if t.term_poll.is_some_and(|p| p < seq) {
                                 unknown = true;
                             }
@@ -1450,9 +1486,12 @@ pub fn adapt_delta(
                 prior.candidates.append(&mut fresh_identities);
                 prior.candidates.sort();
                 prior.candidates.dedup();
-                if unknown {
-                    prior.candidates_coverage = CandidateCoverage::Unknown;
-                }
+                // Recomputed every emit (F-A/A4): retirement dirt
+                // clears when a newer table prunes it and the
+                // rebirth proves, while permanent gaps (read
+                // failures via `sites_bad_read`, loss taint)
+                // persist in their own sticky state.
+                prior.candidates_coverage = coverage;
                 if prior.site != site_key {
                     // Refreshed backing fingerprint (same triple, new
                     // bytes): forward it so the count session versions

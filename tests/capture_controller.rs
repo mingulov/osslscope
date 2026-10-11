@@ -3115,6 +3115,230 @@ fn retired_epoch_table_cannot_resurrect_closure() {
     );
 }
 
+#[test]
+fn sibling_table_prunes_unload_dirt() {
+    // F-A/A4: epoch 5 retires with NO rebirth (unload). A newer
+    // epoch's table prunes the older dirt (sibling isolation —
+    // the unload cannot veto a live array's proof), so the live
+    // epoch's rows close on their own proof. Stale-epoch arrivals
+    // still fail closed via the untracked-epoch arm.
+    let mut h = AdaptHarness::fresh("sibling-prune");
+    let d1 = DiscoveryDelta {
+        candidates: vec![h.cand(1, 5, 0x100)],
+        tables: vec![terminated(1, 5)],
+        ..DiscoveryDelta::default()
+    };
+    let first = h.adapt(&d1);
+    assert_eq!(
+        first.delta.discovered[0].candidates_coverage,
+        CandidateCoverage::Complete
+    );
+    let d2 = DiscoveryDelta {
+        retirements: vec![retirement(1, 5)],
+        ..DiscoveryDelta::default()
+    };
+    let second = h.adapt(&d2);
+    assert_eq!(
+        second.delta.discovered[0].candidates_coverage,
+        CandidateCoverage::Unknown
+    );
+    // Sibling epoch 7 terminates and its rows arrive: the pruned
+    // tombstone no longer vetoes the live epoch's closure.
+    let d3 = DiscoveryDelta {
+        candidates: vec![h.cand(1, 7, 0x100)],
+        tables: vec![terminated(1, 7)],
+        ..DiscoveryDelta::default()
+    };
+    let third = h.adapt(&d3);
+    assert_eq!(third.delta.discovered.len(), 1);
+    assert_eq!(
+        third.delta.discovered[0].candidates_coverage,
+        CandidateCoverage::Complete
+    );
+    // But a stale-epoch arrival (pruned tombstone, no entry) still
+    // fails closed.
+    let d4 = DiscoveryDelta {
+        candidates: vec![h.cand(1, 5, 0x200)],
+        ..DiscoveryDelta::default()
+    };
+    let fourth = h.adapt(&d4);
+    assert_eq!(fourth.delta.discovered.len(), 1);
+    assert_eq!(
+        fourth.delta.discovered[0].candidates_coverage,
+        CandidateCoverage::Unknown
+    );
+}
+
+#[test]
+fn rebirth_reproof_recovers_closure() {
+    // F-A/A4 recovery: epoch 5 retires as 7 rebirths; once 7
+    // terminates AND its rows re-arrive (re-walk refresh), the
+    // site returns to Complete. Proof alone still re-emits
+    // nothing — only arrivals render.
+    let mut h = AdaptHarness::fresh("rebirth-recover");
+    let d1 = DiscoveryDelta {
+        candidates: vec![h.cand(1, 5, 0x100)],
+        tables: vec![terminated(1, 5)],
+        ..DiscoveryDelta::default()
+    };
+    let first = h.adapt(&d1);
+    assert_eq!(
+        first.delta.discovered[0].candidates_coverage,
+        CandidateCoverage::Complete
+    );
+    let d2 = DiscoveryDelta {
+        retirements: vec![retirement(1, 5)],
+        tables: vec![in_progress(1, 7)],
+        ..DiscoveryDelta::default()
+    };
+    let second = h.adapt(&d2);
+    assert_eq!(
+        second.delta.discovered[0].candidates_coverage,
+        CandidateCoverage::Unknown
+    );
+    let d3 = DiscoveryDelta {
+        tables: vec![terminated(1, 7)],
+        ..DiscoveryDelta::default()
+    };
+    let third = h.adapt(&d3);
+    assert!(third.delta.discovered.is_empty());
+    // Re-walked rows re-arrive under the live epoch: identical
+    // identities (duplicates, not news) + proven rebirth.
+    let d4 = DiscoveryDelta {
+        candidates: vec![h.cand(1, 7, 0x100)],
+        tables: vec![terminated(1, 7)],
+        ..DiscoveryDelta::default()
+    };
+    let fourth = h.adapt(&d4);
+    assert_eq!(fourth.delta.discovered.len(), 1);
+    assert_eq!(
+        fourth.delta.discovered[0].candidates_coverage,
+        CandidateCoverage::Complete
+    );
+}
+
+#[test]
+fn chained_rebirths_recover_through_prune() {
+    // F-A/A4: chained retirements (5, then 7 — e.g. double suspect
+    // in one drain) clear transitively: each newer table prunes
+    // older dirt, so only the tail's proof counts.
+    let mut h = AdaptHarness::fresh("rebirth-chain");
+    let d1 = DiscoveryDelta {
+        candidates: vec![h.cand(1, 5, 0x100)],
+        tables: vec![terminated(1, 5)],
+        ..DiscoveryDelta::default()
+    };
+    h.adapt(&d1);
+    let d2 = DiscoveryDelta {
+        retirements: vec![retirement(1, 5)],
+        tables: vec![in_progress(1, 7)],
+        ..DiscoveryDelta::default()
+    };
+    h.adapt(&d2);
+    let d3 = DiscoveryDelta {
+        retirements: vec![retirement(1, 7)],
+        tables: vec![in_progress(1, 9)],
+        ..DiscoveryDelta::default()
+    };
+    let third = h.adapt(&d3);
+    assert_eq!(
+        third.delta.discovered[0].candidates_coverage,
+        CandidateCoverage::Unknown
+    );
+    let d4 = DiscoveryDelta {
+        candidates: vec![h.cand(1, 9, 0x100)],
+        tables: vec![terminated(1, 9)],
+        ..DiscoveryDelta::default()
+    };
+    let fourth = h.adapt(&d4);
+    assert_eq!(fourth.delta.discovered.len(), 1);
+    assert_eq!(
+        fourth.delta.discovered[0].candidates_coverage,
+        CandidateCoverage::Complete
+    );
+}
+
+#[test]
+fn duplicate_arrivals_do_not_reopen_closure() {
+    // F-A/A4: a duplicate arrival (multi-libctx re-query, re-walk
+    // refresh) after termination is not news — the non-closed
+    // guard fires on novel identities only.
+    let mut h = AdaptHarness::fresh("dup-no-reopen");
+    let d1 = DiscoveryDelta {
+        candidates: vec![h.cand(1, 5, 0x100)],
+        tables: vec![terminated(1, 5)],
+        ..DiscoveryDelta::default()
+    };
+    let first = h.adapt(&d1);
+    assert_eq!(
+        first.delta.discovered[0].candidates_coverage,
+        CandidateCoverage::Complete
+    );
+    let d2 = DiscoveryDelta {
+        candidates: vec![h.cand(1, 5, 0x100)],
+        tables: vec![terminated(1, 5)],
+        ..DiscoveryDelta::default()
+    };
+    let second = h.adapt(&d2);
+    assert_eq!(second.delta.discovered.len(), 1);
+    assert_eq!(
+        second.delta.discovered[0].candidates_coverage,
+        CandidateCoverage::Complete
+    );
+}
+
+#[test]
+fn bad_read_gap_never_heals_by_recompute() {
+    // F-A/A4: an unreadable arrival permanently gaps its site —
+    // later clean arrivals (even duplicates of the bad row)
+    // re-emit Unknown. Same stickiness as the old coverage latch
+    // (per-identity healing is future work).
+    let mut h = AdaptHarness::fresh("bad-sticky");
+    let mut bad = cand(
+        h.staged.path.as_str(),
+        backing_of(&h.staged, 0x100),
+        1,
+        99,
+        "SHA-256",
+        false,
+        "error",
+    );
+    bad.epoch = 5;
+    let d1 = DiscoveryDelta {
+        candidates: vec![bad],
+        tables: vec![terminated(1, 5)],
+        ..DiscoveryDelta::default()
+    };
+    let first = h.adapt(&d1);
+    assert_eq!(
+        first.delta.discovered[0].candidates_coverage,
+        CandidateCoverage::Unknown
+    );
+    // Same row re-read clean: duplicate identity, no guard trip —
+    // but the read gap persists.
+    let mut clean = cand(
+        h.staged.path.as_str(),
+        backing_of(&h.staged, 0x100),
+        1,
+        99,
+        "SHA-256",
+        false,
+        "ok",
+    );
+    clean.epoch = 5;
+    let d2 = DiscoveryDelta {
+        candidates: vec![clean],
+        tables: vec![terminated(1, 5)],
+        ..DiscoveryDelta::default()
+    };
+    let second = h.adapt(&d2);
+    assert_eq!(second.delta.discovered.len(), 1);
+    assert_eq!(
+        second.delta.discovered[0].candidates_coverage,
+        CandidateCoverage::Unknown
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Live lifecycle fixtures: real pids, real custody, no privileges.
 // ---------------------------------------------------------------------------
