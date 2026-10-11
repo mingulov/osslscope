@@ -1560,6 +1560,280 @@ fn h2_t3_stale_seal_revised_at_close() {
 }
 
 #[test]
+fn h3_t2_mixed_arrival_withholds_definite_claim_sticky() {
+    // H3: a mixed-status arrival forces Unknown coverage with the
+    // min label + weak preserved, sticky across re-walks (a
+    // same-triple single re-walk never flips back — window
+    // soundness: in-window ambiguity poisons the site's claim),
+    // and counted once in discovery.mixed_classes (set
+    // semantics, not per-arrival). Pre-split this degrades via
+    // bad_read; the counter leg is the split's tripwire (RED
+    // until the adapter re-homes mixed into sites_mixed).
+    let mut h = Harness::fresh("h3-t2");
+    h.snapshot_attached();
+    let cand_mixed = cand(
+        "/p/provider.so",
+        backing_of(&h.staged, h.off),
+        1,
+        11,
+        "SHA-256",
+        true,
+        "mixed",
+    );
+    h.polls.push_back(DiscoveryDelta::default());
+    h.polls.push_back(DiscoveryDelta {
+        candidates: vec![cand_mixed],
+        tables: vec![terminated(1, 0)],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    // Same-triple single re-walk: must not flip back, must not
+    // double-count.
+    let cand_single = cand(
+        "/p/provider.so",
+        backing_of(&h.staged, h.off),
+        1,
+        11,
+        "SHA-256",
+        true,
+        "ok",
+    );
+    h.polls.push_back(DiscoveryDelta {
+        candidates: vec![cand_single],
+        tables: vec![terminated(1, 0)],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    h.plans.insert(
+        3,
+        FirePlan {
+            fires: vec![(BASE_NS + 600_000_000, 7)],
+            shortfall: 0,
+            cancel: false,
+        },
+    );
+    h.exit_at_ns = Some(BASE_NS + 1_000_000_000);
+    h.exit_code = 0;
+    let (out, _) = h.run();
+    let c = out.unwrap();
+    assert_eq!(
+        counter_value(&c, "discovery.mixed_classes"),
+        1,
+        "one mixed triple withheld exactly once: {:?}",
+        c.document.counters
+    );
+    assert!(!c.document.sites.is_empty());
+    for site in &c.document.sites {
+        assert_eq!(
+            site.candidates_coverage,
+            CandidateCoverage::Unknown,
+            "mixed site must not claim Complete"
+        );
+        // Min label + weak preserved (withheld, not dropped).
+        assert!(
+            site.candidates
+                .iter()
+                .any(|id| id.algorithm_classes.contains(&"SHA-256".to_string())),
+            "min label must render: {:?}",
+            site.candidates
+        );
+        assert!(
+            site.candidates.iter().any(|id| id.weak_alias),
+            "weak must survive mixed: {:?}",
+            site.candidates
+        );
+    }
+    // Denominators stand: ambiguity withholds definiteness, it
+    // hides no sites (mixed is not loss).
+    for scope in &c.document.coverage {
+        if scope.scope == "legacy" {
+            continue;
+        }
+        assert!(
+            matches!(scope.expected, ExpectedScope::Applicable { .. }),
+            "mixed must not taint denominators: {scope:?}"
+        );
+    }
+}
+
+#[test]
+fn h3_t4_fenced_mixed_survives_retrospective_revision_intact() {
+    // H3: the H2-T4 fence setup with a MIXED gen-0 site. Mixed
+    // is already Unknown, so retrospective revision is a no-op
+    // for it — and taint composes, not flips: the fenced leg
+    // keeps its min label + weak flag, calls intact, and the
+    // mixed_classes activity survives alongside the taint.
+    let mut h = Harness::fresh("h3-t4");
+    h.snapshot_attached();
+    let newso = h.stage.write("new.so", &h.bytes.clone());
+    h.files.insert(
+        newso.path.clone(),
+        plan::FileBytes {
+            bytes: h.bytes.clone(),
+            dev: newso.device,
+            ino: newso.ino,
+        },
+    );
+    let before = vec![mapping(&h.staged)];
+    let after = vec![mapping(&h.staged), mapping(&newso)];
+    h.maps_seq = VecDeque::from([before.clone(), before.clone(), before, after.clone()]);
+    h.maps = after;
+    let cand1 = cand(
+        "/p/provider.so",
+        backing_of(&h.staged, h.off),
+        1,
+        11,
+        "SHA-256",
+        true,
+        "mixed",
+    );
+    h.polls.push_back(DiscoveryDelta::default());
+    h.polls.push_back(DiscoveryDelta {
+        candidates: vec![cand1],
+        tables: vec![terminated(1, 0)],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    h.polls.push_back(DiscoveryDelta::default());
+    h.polls.push_back(DiscoveryDelta {
+        losses: vec![DiscoveryLoss {
+            source: osslscope::discovery::coverage::HOST_ORPHAN_ROW,
+            count: 1,
+            op: Some(1),
+        }],
+        ..DiscoveryDelta::default()
+    });
+    h.plans.insert(
+        2,
+        FirePlan {
+            fires: vec![(BASE_NS + 600_000_000, 3)],
+            shortfall: 0,
+            cancel: false,
+        },
+    );
+    h.plans.insert(
+        5,
+        FirePlan {
+            fires: vec![(BASE_NS + 1_200_000_000, 4)],
+            shortfall: 0,
+            cancel: false,
+        },
+    );
+    h.exit_at_ns = Some(BASE_NS + 1_500_000_000);
+    h.exit_code = 0;
+    let (out, _) = h.run();
+    let c = out.unwrap();
+    assert!(matches!(c.document.status, Completeness::Partial { .. }));
+    // ONE fence, not H2-T4's two: the taint round's Unknown
+    // update lands on an already-Unknown mixed site
+    // (Unknown→Unknown is no coverage change, so it stages no
+    // second fence — mixed absorbs taint silently). The gen-0
+    // seal predates all taint — the revision target.
+    assert_eq!(c.document.fenced.len(), 1);
+    assert_eq!(c.document.fenced[0].generation, 0);
+    assert_eq!(c.document.fenced[0].sites.len(), 1);
+    let leg = &c.document.fenced[0].sites[0];
+    assert_eq!(leg.calls, 3);
+    assert_eq!(
+        leg.candidates_coverage,
+        CandidateCoverage::Unknown,
+        "fenced mixed leg stays Unknown under later taint"
+    );
+    assert!(
+        leg.candidates
+            .iter()
+            .any(|id| id.algorithm_classes.contains(&"SHA-256".to_string())),
+        "revision must not strip the min label: {:?}",
+        leg.candidates
+    );
+    assert!(
+        leg.candidates.iter().any(|id| id.weak_alias),
+        "revision must not strip weak: {:?}",
+        leg.candidates
+    );
+    assert_eq!(
+        counter_value(&c, "discovery.mixed_classes"),
+        1,
+        "mixed activity survives alongside taint: {:?}",
+        c.document.counters
+    );
+}
+
+#[test]
+fn h3_t5_mixed_counter_counts_distinct_triples() {
+    // H3: discovery.mixed_classes counts DISTINCT withheld
+    // triples (two mixed triples → 2, one mixed + one clean →
+    // 1); clean runs show zero. Activity (ambiguity audit),
+    // never loss — mixed must not force PARTIAL by itself.
+    for (name, statuses, want) in [
+        ("h3-t5-two", ["mixed", "mixed"], 2),
+        ("h3-t5-one", ["mixed", "ok"], 1),
+        ("h3-t5-clean", ["ok", "ok"], 0),
+    ] {
+        let mut h = Harness::fresh(name);
+        h.snapshot_attached();
+        let staged2 = h.stage.write("prov2.so", &h.bytes.clone());
+        h.maps.push(mapping(&staged2));
+        h.files.insert(
+            staged2.path.clone(),
+            plan::FileBytes {
+                bytes: h.bytes.clone(),
+                dev: staged2.device,
+                ino: staged2.ino,
+            },
+        );
+        let cand1 = cand(
+            "/p/provider.so",
+            backing_of(&h.staged, h.off),
+            1,
+            11,
+            "SHA-256",
+            false,
+            statuses[0],
+        );
+        let cand2 = cand(
+            "/p/provider.so",
+            backing_of(&staged2, h.off),
+            2,
+            12,
+            "SHA-256",
+            false,
+            statuses[1],
+        );
+        h.polls.push_back(DiscoveryDelta::default());
+        h.polls.push_back(DiscoveryDelta {
+            candidates: vec![cand1, cand2],
+            tables: vec![terminated(1, 0), terminated(2, 0)],
+            trigger_observed: true,
+            ..DiscoveryDelta::default()
+        });
+        h.plans.insert(
+            2,
+            FirePlan {
+                fires: vec![(BASE_NS + 600_000_000, 7)],
+                shortfall: 0,
+                cancel: false,
+            },
+        );
+        h.exit_at_ns = Some(BASE_NS + 1_000_000_000);
+        h.exit_code = 0;
+        let (out, _) = h.run();
+        let c = out.unwrap();
+        assert_eq!(
+            counter_value(&c, "discovery.mixed_classes"),
+            want,
+            "{name}: withheld distinct triples"
+        );
+        if want == 0 {
+            assert!(
+                matches!(c.document.status, Completeness::Complete),
+                "{name}: clean runs keep prior behavior"
+            );
+        }
+    }
+}
+
+#[test]
 fn untracked_epoch_executions_are_unattributed_partial() {
     // F3: op 1 provably terminates epoch 0 while a same-window
     // candidate arrives for epoch 9 with zero table proof for

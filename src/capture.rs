@@ -1093,6 +1093,11 @@ pub struct AdapterState {
     /// stickiness as the old coverage latch — per-identity healing
     /// (a re-read row clearing its own gap) is future work.
     sites_bad_read: HashSet<(u64, u64, u64)>,
+    /// Sites that ever arrived mixed (H3): same stickiness —
+    /// in-window ambiguity poisons the site's window claim, so a
+    /// same-triple single re-walk never flips back to Complete.
+    /// Separate from bad_read (ambiguity, not lost identity).
+    sites_mixed: HashSet<(u64, u64, u64)>,
     /// Sticky per-op walk-shape bits (mirrors the producer: never
     /// retired — any nonzero bit keeps the op unclosed).
     op_trunc: HashMap<u32, u64>,
@@ -1375,6 +1380,7 @@ pub fn adapt_delta(
         HashSet<(u32, u64)>,
         HashSet<(u32, u64)>,
         bool,
+        bool,
     );
     let mut groups: HashMap<(u64, u64, u64), Group> = HashMap::new();
     // Novelty index for the non-closed guard (F-A/A4): duplicate
@@ -1427,13 +1433,17 @@ pub fn adapt_delta(
             vec![class],
             candidate.weak,
         );
-        let bad_read = candidate.status != "ok";
+        // H3: mixed is ambiguity, not lost identity — it rides
+        // its own sticky set, never bad_read.
+        let mixed = candidate.status == "mixed";
+        let bad_read = candidate.status != "ok" && !mixed;
         let slot = groups.entry(triple).or_insert_with(|| {
             (
                 backing.dev.clone(),
                 Vec::new(),
                 HashSet::new(),
                 HashSet::new(),
+                false,
                 false,
             )
         });
@@ -1462,12 +1472,16 @@ pub fn adapt_delta(
         if bad_read {
             state.sites_bad_read.insert(triple);
         }
+        slot.5 |= mixed;
+        if mixed {
+            state.sites_mixed.insert(triple);
+        }
     }
     // Deterministic group order (arrival order must not leak).
     let mut group_keys: Vec<(u64, u64, u64)> = groups.keys().copied().collect();
     group_keys.sort_unstable();
     for triple in group_keys {
-        let (dev_str, mut fresh_identities, group_epochs, novel_epochs, bad_read) =
+        let (dev_str, mut fresh_identities, group_epochs, novel_epochs, bad_read, mixed) =
             groups.remove(&triple).unwrap_or_default();
         let (device, ino, offset) = triple;
         let first_emit = !state.emitted.contains_key(&triple);
@@ -1484,7 +1498,11 @@ pub fn adapt_delta(
         // novel-only.
         // A7: relevant loss taints the set (op-localized orphans
         // via tainted_ops; unlocalizable loss via the global flag).
-        let mut unknown = bad_read || state.taint_global || state.sites_bad_read.contains(&triple);
+        let mut unknown = bad_read
+            || mixed
+            || state.taint_global
+            || state.sites_bad_read.contains(&triple)
+            || state.sites_mixed.contains(&triple);
         if let Some(ops) = state.triple_ops.get(&triple) {
             for op in ops {
                 if !state.op_closed(*op) {
@@ -2914,6 +2932,21 @@ where
                 CounterUnits::Events,
                 CounterSource::Lifecycle,
                 self.lifecycle_loss,
+            ));
+        }
+        // H3: mixed-withheld sites are ambiguity, not loss —
+        // Activity (the observation is complete; the verdict is
+        // withheld). Distinct triples ever marked mixed; absent
+        // (zero) on clean runs. Deliberately NOT a taint input:
+        // mixed hides no sites and misses no evidence.
+        let mixed_sites = self.adapter.sites_mixed.len() as u64;
+        if mixed_sites > 0 {
+            self.activity.push(typed_counter(
+                "discovery.mixed_classes",
+                CounterKind::Activity,
+                CounterUnits::Sites,
+                CounterSource::Discovery,
+                mixed_sites,
             ));
         }
         if self.fallback_partial {

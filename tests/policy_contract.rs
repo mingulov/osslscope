@@ -429,6 +429,50 @@ fn deny_weak_is_inconclusive_for_resolved_hmac_with_unseen_digest() {
     assert_eq!(v.rules[0].verdict, RuleVerdict::Inconclusive);
 }
 
+#[test]
+fn h3_t3_mixed_sites_never_yield_definite_verdicts() {
+    // H3: a mixed-shaped site (Unknown coverage + min label +
+    // weak preserved, as H3-T2 produces) feeds no definite
+    // verdict in either direction — neither require (present)
+    // nor deny (weak label). Pins the coverage→exclusion link
+    // (Complete-first gate); the status→coverage link is H3-T2's.
+    let mixed = doc(
+        vec![site_at(
+            1,
+            0,
+            7,
+            vec![cand(
+                "prov-default",
+                "default",
+                DIGEST,
+                7,
+                &["SHA-256"],
+                true,
+            )],
+            CandidateCoverage::Unknown,
+        )],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        exact_window(),
+        None,
+    );
+    for rule in [
+        PolicyRule::require_executed("SHA-256"),
+        PolicyRule::deny_algorithm("SHA-256"),
+        PolicyRule::deny_weak(),
+    ] {
+        let v = evaluate_document(std::slice::from_ref(&rule), &mixed);
+        assert_eq!(v.rules[0].bounds.definite, 0, "{}", rule.name);
+        assert_eq!(
+            v.rules[0].verdict,
+            RuleVerdict::Inconclusive,
+            "{}",
+            rule.name
+        );
+    }
+}
+
 /// Unknown candidate sets make the upper bound unknown and prevent any
 /// absence proof; zero-call unknown sites stay known-zero.
 #[test]

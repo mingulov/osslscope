@@ -150,7 +150,7 @@ pub const HARVEST_MAPS: [MapSpec; 13] = [
         name: "ALG_CLASS",
         map_type: 1,
         key_size: 8,
-        value_size: 40,
+        value_size: 42,
         max_entries: 1024,
         flags: 0,
     },

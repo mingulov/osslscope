@@ -88,17 +88,19 @@ fn wire_layout_leaves_no_room_for_raw_buffers() {
     assert_eq!(&t.status as *const _ as usize - base, 10);
     // Map-value layouts (population writes explicit LE bytes against
     // these offsets; BPF reads the same structs typed).
-    assert_eq!(size_of::<wire::AlgClassValue>(), 40);
+    assert_eq!(size_of::<wire::AlgClassValue>(), 42);
     assert_eq!(size_of::<wire::TripClassValue>(), 22);
     let v = wire::AlgClassValue {
         class: 0x0201,
         weak: 1,
         len: 3,
+        canon: 0x0403,
         name: [0u8; wire::MAX_ALG_NAME],
     };
     let b = wire::alg_value_bytes(&v);
     assert_eq!(&b[0..2], &[0x01, 0x02]);
     assert_eq!(&b[2..4], &[1, 3]);
+    assert_eq!(&b[4..6], &[0x03, 0x04]);
     let w = wire::TripClassValue {
         engine: 1,
         load: 2,
@@ -242,7 +244,7 @@ fn parse_rejects_contradictory_combinations() {
         b[11] = weak;
         wire::parse_alg_event(&b, n)
     };
-    // Valid combinations (all five statuses).
+    // Valid combinations (all six statuses).
     verdict(7, wire::ALG_OK, 0).unwrap();
     verdict(7, wire::ALG_OK, 1).unwrap();
     verdict(wire::OTHER_CLASS, wire::ALG_UNKNOWN, 0).unwrap();
@@ -251,6 +253,8 @@ fn parse_rejects_contradictory_combinations() {
     verdict(7, wire::ALG_TRUNCATED, 1).unwrap();
     verdict(wire::OTHER_CLASS, wire::ALG_TRUNCATED, 1).unwrap();
     verdict(wire::OTHER_CLASS, wire::ALG_UNREADABLE, 0).unwrap();
+    verdict(7, wire::ALG_MIXED, 0).unwrap();
+    verdict(7, wire::ALG_MIXED, 1).unwrap();
     // Contradictions.
     for (class, status, weak) in [
         (wire::OTHER_CLASS, wire::ALG_OK, 0), // ok requires a registry class
@@ -261,6 +265,8 @@ fn parse_rejects_contradictory_combinations() {
         (wire::OTHER_CLASS, wire::ALG_UNREADABLE, 1),
         (7, wire::ALG_TRUNCATED, 0), // truncated always fails weak closed
         (wire::OTHER_CLASS, wire::ALG_TRUNCATED, 0),
+        (wire::OTHER_CLASS, wire::ALG_MIXED, 0), // mixed requires a registry class
+        (wire::OTHER_CLASS, wire::ALG_MIXED, 1),
     ] {
         assert_eq!(
             verdict(class, status, weak),
@@ -430,13 +436,20 @@ fn classifier_agrees_with_reference_over_corpus() {
         let label = kinds::alg_class_label(v.class).unwrap();
         assert_eq!(label, class, "class mismatch for {input:?}");
         assert_eq!(v.weak, weak, "weak mismatch for {input:?}");
-        // Status is OK iff ANY segment is registered (F-A/A5: no
-        // corpus entry exceeds the segment bound or saturates).
-        let any_known = input.split(':').any(kinds::is_known_alg);
-        let want = if any_known {
-            wire::ALG_OK
-        } else {
-            wire::ALG_UNKNOWN
+        // Status follows recognized-group diversity (H3: no
+        // corpus entry exceeds the segment bound or saturates):
+        // no registered segment → UNKNOWN; one group → OK;
+        // two or more → MIXED.
+        let mut groups = std::collections::BTreeSet::new();
+        for seg in input.split(':') {
+            if kinds::is_known_alg(seg) {
+                groups.insert(kinds::alg_group(seg).unwrap());
+            }
+        }
+        let want = match groups.len() {
+            0 => wire::ALG_UNKNOWN,
+            1 => wire::ALG_OK,
+            _ => wire::ALG_MIXED,
         };
         assert_eq!(v.status, want, "status for {input:?}");
     }
@@ -505,6 +518,38 @@ fn classifier_recognizes_non_primary_alias() {
             "label for {input:?}"
         );
     }
+}
+
+#[test]
+fn h3_t1_mixed_lists_report_mixed_with_min_label() {
+    // H3: two recognized groups → MIXED (min label preserved);
+    // single-group alias spellings stay OK; MIXED only refines
+    // OK (TRUNCATED wins); unrecognized and weak-only extras
+    // contribute nothing toward mixed.
+    let a = classify_host(b"AES-256-GCM", false);
+    let m = classify_host(b"MD5", false);
+    let v = classify_host(b"AES-256-GCM:MD5", false);
+    assert_eq!(v.status, wire::ALG_MIXED, "two groups must mix");
+    assert_eq!(v.class, a.class.min(m.class), "min preserved");
+    let v = classify_host(b"RC4:SHA2-256", false);
+    assert_eq!(v.status, wire::ALG_MIXED, "two groups must mix");
+    assert_eq!(kinds::alg_class_label(v.class), Some("SHA2-256"));
+    // Alias spellings of one group stay OK.
+    let v = classify_host(b"SHA256:SHA2-256", false);
+    assert_eq!(v.status, wire::ALG_OK, "single group stays OK");
+    assert_eq!(kinds::alg_class_label(v.class), Some("SHA2-256"));
+    // Mixed + truncated → TRUNCATED (precedence).
+    let nine = ["SHA2-256", "MD5", "a", "b", "c", "d", "e", "f", "g"].join(":");
+    let v = classify_host(nine.as_bytes(), false);
+    assert_eq!(v.status, wire::ALG_TRUNCATED);
+    // Unrecognized extras contribute nothing.
+    let v = classify_host(b"nope:MD5", false);
+    assert_eq!(v.status, wire::ALG_OK);
+    // Weak-only extras (OTHER-class) contribute nothing — but
+    // still count weak (untouched).
+    let v = classify_host(b"SHA0:SHA1", false);
+    assert_eq!(v.status, wire::ALG_OK);
+    assert!(v.weak, "weak-only extra must still count weak");
 }
 
 #[test]

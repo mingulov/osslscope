@@ -134,6 +134,7 @@ pub const ALG_UNKNOWN: u8 = 1;
 pub const ALG_OVERLONG: u8 = 2;
 pub const ALG_TRUNCATED: u8 = 3;
 pub const ALG_UNREADABLE: u8 = 4;
+pub const ALG_MIXED: u8 = 5;
 
 /// Trip verdict statuses (u8 wire; strict vocabulary).
 pub const TRIP_OK: u8 = 0;
@@ -293,20 +294,25 @@ const _: () = assert!(size_of::<InitRetEvent>() == 32);
 const _: () = assert!(align_of::<InitRetEvent>() == 8);
 
 /// `ALG_CLASS` map value, keyed by FNV-1a-64 of the exact registry
-/// spelling: 40 bytes. Membership is hash+exact-length (`len` is
+/// spelling: 42 bytes. Membership is hash+exact-length (`len` is
 /// checked; `name` is populated but unread — reserved; a byte
 /// confirm does not fit the 6.12 verifier budget, see
-/// `classify_alg_with`). `weak` is 0/1.
+/// `classify_alg_with`). `weak` is 0/1. `canon` is the
+/// BPF-internal group id (H3: alias spellings share their
+/// group's id, so multi-spelling lists stay OK while
+/// cross-group lists mix — first-appearance order at table
+/// build; only the mixed flag leaves the kernel).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AlgClassValue {
     pub class: u16,
     pub weak: u8,
     pub len: u8,
+    pub canon: u16,
     pub name: [u8; MAX_ALG_NAME],
 }
 
-const _: () = assert!(size_of::<AlgClassValue>() == 40);
+const _: () = assert!(size_of::<AlgClassValue>() == 42);
 const _: () = assert!(align_of::<AlgClassValue>() == 2);
 
 /// `TRIP_CLASS` map value, keyed by FNV-1a-64 of the exact pattern:
@@ -327,12 +333,13 @@ const _: () = assert!(align_of::<TripClassValue>() == 2);
 
 /// Explicit little-endian map-value encodings for population (no
 /// `transmute`: the byte layout is pinned here, once).
-pub fn alg_value_bytes(v: &AlgClassValue) -> [u8; 40] {
-    let mut b = [0u8; 40];
+pub fn alg_value_bytes(v: &AlgClassValue) -> [u8; 42] {
+    let mut b = [0u8; 42];
     b[0..2].copy_from_slice(&v.class.to_le_bytes());
     b[2] = v.weak;
     b[3] = v.len;
-    b[4..4 + MAX_ALG_NAME].copy_from_slice(&v.name);
+    b[4..6].copy_from_slice(&v.canon.to_le_bytes());
+    b[6..6 + MAX_ALG_NAME].copy_from_slice(&v.name);
     b
 }
 
@@ -407,11 +414,15 @@ pub struct AlgVerdict {
 /// segments contribute nothing (weak still folds across every
 /// matched segment, including weak-only table extras, which carry
 /// `OTHER_CLASS` and can never win the minimum). `ALG_OK` iff at
-/// least one segment is recognized; a list no segment of which
-/// the registry knows is `ALG_UNKNOWN`, never a silent pick.
-/// (A mixed-algorithm list collapses to one label by
-/// construction — hostile providers are out of model since they
-/// can claim any name directly, exactly like hash preimages.)
+/// least one segment is recognized and all recognized segments
+/// share one group (H3); a list no segment of which the registry
+/// knows is `ALG_UNKNOWN`, never a silent pick. A mixed-group
+/// list keeps the min label but reports `ALG_MIXED` — the
+/// ambiguity is explicit instead of collapsing silently.
+/// (Hostile providers are out of model since they can claim any
+/// name directly, exactly like hash preimages.) Groups are the
+/// registry `group` strings (alias spellings share one group);
+/// same-group multi-spelling lists stay OK.
 ///
 /// Matching is hash+length: an FNV-1a-64 prefilter plus an exact
 /// length check against the table entry. There is deliberately NO
@@ -430,13 +441,14 @@ pub struct AlgVerdict {
 /// the unavoidable map-miss check per byte. Every accumulator
 /// updates arithmetically (masked selects — BPF has no `cmov`, so
 /// the masks are explicit bit tricks, never `?:` and never data
-/// branches): per-byte states stay ~2-4 (weak bit × hit/miss) and
-/// merge across iterations (counters stay ranges, hashes stay
-/// symbolic), so the whole scan costs ~15k insns and exits with a
-/// handful of states. Any data branch in the scan body (early
-/// exit, bounds split, per-byte confirm) multiplies states past
-/// the ceiling — keep the body straight-line; the trailing resolve
-/// and verdict below may branch (shallow, outside the scan).
+/// branches): per-byte states stay ~4-8 (weak bit × mixed bit ×
+/// hit/miss; first-seen stays a range) and merge across
+/// iterations (counters stay ranges, hashes stay symbolic), so
+/// the whole scan costs ~30k insns and exits with a handful of
+/// states. Any data branch in the scan body (early exit, bounds
+/// split, per-byte confirm) multiplies states past the ceiling —
+/// keep the body straight-line; the trailing resolve and verdict
+/// below may branch (shallow, outside the scan).
 pub fn classify_alg_with<F>(
     buf: &[u8; ALG_WINDOW],
     len: usize,
@@ -466,6 +478,12 @@ where
     let mut seg_idx: u64 = 0;
     let mut class_min: u64 = OTHER_CLASS as u64;
     let mut weak_acc: u64 = 0;
+    // Mixed detection (H3): first-seen group id + flag. The
+    // `OTHER_CLASS` sentinel doubles as the unlatched marker —
+    // recognized records never carry it (build-guarded), so no
+    // separate seen bit (verifier states stay ~4-8, not ~8-16).
+    let mut first_canon: u64 = OTHER_CLASS as u64;
+    let mut mixed_acc: u64 = 0;
     let mut i: usize = 0;
     while i < ALG_WINDOW {
         // SAFETY: `i < ALG_WINDOW` (loop bound) indexes the array.
@@ -489,6 +507,17 @@ where
             let take = m & alu_lt(v.class as u64, class_min);
             class_min = select_u64(mask(take), v.class as u64, class_min);
             weak_acc |= (v.weak as u64) & m;
+            // Mixed detection (H3): also straight-line. Only
+            // RECOGNIZED records participate (`rec` excludes
+            // OTHER-class weak-only extras); the first one latches
+            // `first_canon`, later ones set the flag on group
+            // difference. Single-group lists (incl. multi-spelling
+            // alias lists) never set it.
+            let rec = m & (1 - alu_eq(v.class as u64, OTHER_CLASS as u64));
+            let latched = 1 - alu_eq(first_canon, OTHER_CLASS as u64);
+            mixed_acc |= rec & latched & (1 - alu_eq(v.canon as u64, first_canon));
+            let take_first = rec & (1 - latched);
+            first_canon = select_u64(mask(take_first), v.canon as u64, first_canon);
         }
         // Fold this byte into the running segment (masked: past-`len`
         // bytes change nothing; a colon resets for the next one).
@@ -513,6 +542,17 @@ where
                     class_min = v.class as u64;
                 }
                 weak_acc |= v.weak as u64;
+                // H3: the trailing segment can only DIFFER from the
+                // latched group — latching here would be a dead
+                // store (no segments follow; the verdict reads
+                // only mixed_acc). An unlatched scan means the
+                // trailing segment is the sole group: not mixed.
+                if v.class != OTHER_CLASS
+                    && first_canon != OTHER_CLASS as u64
+                    && v.canon as u64 != first_canon
+                {
+                    mixed_acc = 1;
+                }
             }
         }
     }
@@ -521,7 +561,9 @@ where
         // Pathological alias list: the canonical minimum over the
         // observed segments is kept, but weak fails closed —
         // unseen tail segments may be weak — and the status stays
-        // explicit.
+        // explicit. TRUNCATED wins over MIXED (H3): the unseen
+        // tail may hold anything, so mixed-ness over the observed
+        // prefix is not the verdict.
         return AlgVerdict {
             class: class_min as u16,
             weak: true,
@@ -534,6 +576,8 @@ where
         weak: weak_acc != 0,
         status: if class == OTHER_CLASS {
             ALG_UNKNOWN
+        } else if mixed_acc != 0 {
+            ALG_MIXED
         } else {
             ALG_OK
         },
@@ -731,6 +775,7 @@ pub fn alg_status_name(s: u8) -> Option<&'static str> {
         ALG_OVERLONG => Some("overlong"),
         ALG_TRUNCATED => Some("truncated"),
         ALG_UNREADABLE => Some("unreadable"),
+        ALG_MIXED => Some("mixed"),
         _ => None,
     }
 }
@@ -749,14 +794,14 @@ pub fn parse_alg_event(b: &[u8], class_count: u16) -> Result<AlgEvent, WireErr> 
         return Err(WireErr::ClassRange);
     }
     match e.status {
-        ALG_OK | ALG_UNKNOWN | ALG_OVERLONG | ALG_TRUNCATED | ALG_UNREADABLE => {}
+        ALG_OK | ALG_UNKNOWN | ALG_OVERLONG | ALG_TRUNCATED | ALG_UNREADABLE | ALG_MIXED => {}
         _ => return Err(WireErr::StatusRange),
     }
     if e.weak > 1 {
         return Err(WireErr::WeakRange);
     }
     let combo_ok = match e.status {
-        ALG_OK => e.class != OTHER_CLASS,
+        ALG_OK | ALG_MIXED => e.class != OTHER_CLASS,
         ALG_UNKNOWN => e.class == OTHER_CLASS,
         ALG_OVERLONG | ALG_UNREADABLE => e.class == OTHER_CLASS && e.weak == 0,
         ALG_TRUNCATED => e.weak == 1,
@@ -873,6 +918,7 @@ mod tests {
             class: 7,
             weak: 0,
             len: 3,
+            canon: 9,
             name,
         };
         let md5 = fnv1a64(b"MD5");
