@@ -1614,6 +1614,60 @@ fn rebirth_records_join_live_epoch_directly() {
 }
 
 #[test]
+fn same_key_rewalk_heals_retained_candidate_epoch() {
+    // Review F9: the rewritten T6 covers join-live-directly with a
+    // FRESH key, never the duplicate-key epoch heal. Here the same
+    // candidate key (same op/funcid/impl/arr/idx — mmap-addr reuse
+    // with identical content) re-walks under the rebirth with the
+    // live generation stamp: the retained e0 candidate must heal
+    // to e1 and re-emit once, then stay silent.
+    let mut env = TestEnv::new();
+    let mut core = test_core(false);
+    let arr = 0x7f00_1000u64;
+    walk_row(&mut env, &mut core, arr, 0, 7, 0x7f00_2000);
+    let e0 = epoch_of(&core.snapshot().candidates, arr);
+
+    // Turnover: the epoch rebirths; the e0 candidate is retained
+    // (lagging), not dropped.
+    env.maps = vec![
+        mapping(0x7f00_0000, 0x10000, true, 0, "08:01", 101, PROVIDER),
+        mapping(0x7f01_0000, 0x20000, true, 0, "08:01", 200, LIBCRYPTO),
+    ];
+    let d = core.poll(&mut env, ample_budget()).unwrap();
+    assert_eq!(d.retirements.len(), 1);
+    let e1 = core.snapshot().tables[0].epoch;
+    assert_ne!(e1, e0);
+    let lagging = core
+        .snapshot()
+        .candidates
+        .iter()
+        .find(|c| c.arr == arr)
+        .expect("rebirth must retain the e0 candidate for heal")
+        .epoch;
+    assert_eq!(lagging, e0, "candidate must lag before the re-walk");
+
+    // Same-key re-walk with the live stamp: heal + re-emit.
+    env.push(query_ret_gen(OP_DIGEST, arr, 0, 2));
+    env.push(ok_alg_gen(OP_DIGEST, arr, 0, 2));
+    env.push(dispatch_row_gen(OP_DIGEST, 7, 0x7f00_2000, arr, 0, 2));
+    let d = core.poll(&mut env, ample_budget()).unwrap();
+    assert!(d.retirements.is_empty());
+    assert_eq!(d.candidates.len(), 1, "healed candidate must re-emit");
+    assert_eq!(d.candidates[0].epoch, e1, "re-emit carries live epoch");
+
+    // Second same-key re-walk: compare-equal, silent.
+    env.push(query_ret_gen(OP_DIGEST, arr, 0, 2));
+    env.push(ok_alg_gen(OP_DIGEST, arr, 0, 2));
+    env.push(dispatch_row_gen(OP_DIGEST, 7, 0x7f00_2000, arr, 0, 2));
+    let d = core.poll(&mut env, ample_budget()).unwrap();
+    assert!(d.retirements.is_empty());
+    assert!(
+        d.candidates.is_empty(),
+        "healed re-walk must stay silent"
+    );
+}
+
+#[test]
 fn trip_replacement_replans_through_pub_poll() {
     // F-D/A11 (pub-path smoke): libcrypto replaced under a live
     // session (same path, new inode) with a same-mapping fresh
