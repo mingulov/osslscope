@@ -436,13 +436,17 @@ pub trait SessionEnv {
     /// One round of BPF map reads.
     fn join_maps(&mut self) -> MapSnapshots;
     /// Install one stage-2 query pair; the live impl reports the
-    /// harness-gated `INSPECT stage=query` line itself.
+    /// harness-gated `INSPECT stage=query` line itself. `expected`
+    /// is the resolve-time raw (dev, ino) the install binds
+    /// against (F-A/A1); `None` (unstatable at resolve) fails
+    /// closed.
     fn install_stage2(
         &mut self,
         cookie: u64,
         offset: u64,
         path: &Path,
         pid: u32,
+        expected: Option<(u64, u64)>,
     ) -> anyhow::Result<()>;
     /// Install one tripwire batch; returns an optional attach note
     /// (e.g. legacy-query attach failure, loud but non-fatal).
@@ -971,8 +975,8 @@ impl SessionCore {
                     cookie,
                     format!("resolve stage-2 for cookie {cookie}: {e:#}"),
                 ),
-                Ok((off, path, dev, ino)) => {
-                    let target = (off, path.to_string_lossy().into_owned(), dev, ino);
+                Ok(t) => {
+                    let target = (t.off, t.path.to_string_lossy().into_owned(), t.dev, t.ino);
                     if self.attached_queries.contains(&cookie)
                         && self.attached_targets.get(&cookie) == Some(&target)
                     {
@@ -982,7 +986,7 @@ impl SessionCore {
                         env.pretouch(cookie, addr);
                         continue;
                     }
-                    match env.install_stage2(cookie, off, &path, self.pid) {
+                    match env.install_stage2(cookie, t.off, &t.path, self.pid, t.expected) {
                         Err(e) => {
                             self.record_attach_failure(&mut delta, cookie, format!("{e:#}"));
                         }
@@ -1544,7 +1548,7 @@ fn attribute_impl(
     canon: &str,
     addr: u64,
 ) -> (Option<BackingRef>, String) {
-    if let Some(m) = maps::provider_mapping(maps, provider, canon, addr) {
+    if let Some((m, _)) = maps::provider_mapping(maps, provider, canon, addr) {
         let backing = BackingRef {
             dev: m.dev.clone(),
             ino: m.ino,
@@ -2015,17 +2019,17 @@ impl SessionEnv for LiveEnv {
         offset: u64,
         path: &Path,
         pid: u32,
+        expected: Option<(u64, u64)>,
     ) -> anyhow::Result<()> {
         // Backing-identity check across the install: uprobes attach
         // by path, so a same-path replacement between resolve and
         // attach would pin the NEW bytes at the OLD offset. Stat
         // before/after; on mismatch roll the pair back and fail
-        // loud (the cookie retries next poll — T14r4-2b).
-        let ident_of = |p: &Path| {
-            std::fs::metadata(p)
-                .map(|m| (m.dev(), m.ino()))
-                .unwrap_or((0, 0))
-        };
+        // loud (the cookie retries next poll — T14r4-2b). F-A/A1:
+        // both samples must equal the RESOLVE-time identity, not
+        // merely agree — a replacement between resolve and `before`
+        // reads identically on both sides.
+        let ident_of = |p: &Path| std::fs::metadata(p).map(|m| (m.dev(), m.ino())).ok();
         let before = ident_of(path);
         let links_before = self.links.links.len();
         attach_pair(
@@ -2039,7 +2043,10 @@ impl SessionEnv for LiveEnv {
             cookie,
             LinkKind::Query,
         )?;
-        if ident_of(path) != before {
+        // `None` expected (unstatable at resolve) never binds.
+        let bound =
+            expected.is_some_and(|e| crate::plan::binding_holds(&before, &ident_of(path), &e));
+        if !bound {
             self.links.truncate(links_before);
             bail!(
                 "stage-2 attach raced a same-path replacement for {}",

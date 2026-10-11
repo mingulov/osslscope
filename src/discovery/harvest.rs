@@ -143,21 +143,33 @@ pub(crate) fn decode_trip_hit(
     })
 }
 
-/// Resolve a BPF-reported query-fn address to its (file offset,
-/// object path, backing dev, backing ino) for stage-2 attach. The
-/// backing identity rides along so attach reuse compares bytes, not
-/// just the locator: a same-path replacement keeps path+offset but
-/// changes (dev,ino) and must re-attach (T14r4-2b). Errors carry the
-/// provider path and cookie (observer inputs) — never the runtime
-/// address (stderr is a scanned artifact, so error paths redact
-/// like emission).
+/// Resolved stage-2 attach target: file offset, object path,
+/// maps-text backing identity, and the resolve-time raw (dev, ino)
+/// the install must bind against (`None` when unstatable — install
+/// fails closed).
+#[derive(Debug)]
+pub(crate) struct ResolvedTarget {
+    pub off: u64,
+    pub path: PathBuf,
+    pub dev: String,
+    pub ino: u64,
+    pub expected: Option<(u64, u64)>,
+}
+
+/// Resolve a BPF-reported query-fn address to its stage-2 attach
+/// target. The backing identity rides along so attach reuse
+/// compares bytes, not just the locator: a same-path replacement
+/// keeps path+offset but changes (dev,ino) and must re-attach
+/// (T14r4-2b). Errors carry the provider path and cookie (observer
+/// inputs) — never the runtime address (stderr is a scanned
+/// artifact, so error paths redact like emission).
 pub(crate) fn resolve_query_target(
     live: &[maps::Mapping],
     provider: &Path,
     canon: &str,
     addr: u64,
     cookie: u64,
-) -> anyhow::Result<(u64, PathBuf, String, u64)> {
+) -> anyhow::Result<ResolvedTarget> {
     if cookie == LEGACY_COOKIE {
         let m = live
             .iter()
@@ -165,25 +177,35 @@ pub(crate) fn resolve_query_target(
             .ok_or_else(|| {
                 anyhow::anyhow!("legacy stage-2 attach has no file mapping (cookie {cookie})")
             })?;
-        Ok((
-            addr - m.start + m.offset,
-            PathBuf::from(&m.path),
-            m.dev.clone(),
-            m.ino,
-        ))
+        // Expected identity pins the maps-time inode (the VMA pins
+        // it — a same-path replacement cannot reuse the number)
+        // with the resolve-time raw dev; unstatable paths bind
+        // nothing and fail closed at install.
+        use std::os::unix::fs::MetadataExt as _;
+        let expected = std::fs::metadata(&m.path)
+            .ok()
+            .map(|meta| (meta.dev(), m.ino));
+        Ok(ResolvedTarget {
+            off: addr - m.start + m.offset,
+            path: PathBuf::from(&m.path),
+            dev: m.dev.clone(),
+            ino: m.ino,
+            expected,
+        })
     } else {
-        let m = maps::provider_mapping(live, provider, canon, addr).ok_or_else(|| {
+        let (m, raw) = maps::provider_mapping(live, provider, canon, addr).ok_or_else(|| {
             anyhow::anyhow!(
                 "stage-2 attach has no provider mapping for {}",
                 provider.display()
             )
         })?;
-        Ok((
-            addr - m.start + m.offset,
-            provider.to_path_buf(),
-            m.dev.clone(),
-            m.ino,
-        ))
+        Ok(ResolvedTarget {
+            off: addr - m.start + m.offset,
+            path: provider.to_path_buf(),
+            dev: m.dev.clone(),
+            ino: m.ino,
+            expected: Some(raw),
+        })
     }
 }
 
@@ -997,14 +1019,14 @@ mod tests {
             path: prov.to_string_lossy().into_owned(),
         }];
         // Happy paths resolve to file offsets plus backing identity.
-        let (off, path, rdev, rino) =
-            super::resolve_query_target(&live, &prov, "", 0x1400, 0).unwrap();
-        assert_eq!((off, rdev, rino), (0x900, dev.clone(), meta.ino()));
-        assert_eq!(path, prov);
-        let (off, path, rdev, rino) =
-            super::resolve_query_target(&live, &prov, "", 0x1400, 1).unwrap();
-        assert_eq!((off, rdev, rino), (0x900, dev.clone(), meta.ino()));
-        assert_eq!(path, prov);
+        let t = super::resolve_query_target(&live, &prov, "", 0x1400, 0).unwrap();
+        assert_eq!((t.off, t.dev, t.ino), (0x900, dev.clone(), meta.ino()));
+        assert_eq!(t.path, prov);
+        assert_eq!(t.expected, Some((meta.dev(), meta.ino())));
+        let t = super::resolve_query_target(&live, &prov, "", 0x1400, 1).unwrap();
+        assert_eq!((t.off, t.dev, t.ino), (0x900, dev.clone(), meta.ino()));
+        assert_eq!(t.path, prov);
+        assert_eq!(t.expected, Some((meta.dev(), meta.ino())));
         // Failure paths redact the runtime address (both hex and
         // decimal forms) while keeping observer context.
         for cookie in [0u64, 1] {

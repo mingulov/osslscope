@@ -9,7 +9,9 @@
 //! entries are never evicted), and per-key counts stay exact under
 //! threaded hammering.
 
-use osslscope::count_session::{CountDelta, CountSession, DiscoveredSite, FakeCountBackend};
+use osslscope::count_session::{
+    CountBackend, CountDelta, CountSession, DiscoveredSite, FakeCountBackend, FakeLink, FenceReason,
+};
 use osslscope::discovery::maps::Mapping;
 use osslscope::evidence::{CandidateCoverage, CandidateIdentity, ObjectId};
 use osslscope::plan;
@@ -401,5 +403,147 @@ fn kernel_source_enforces_window() {
     assert!(
         !src.contains("bpf_probe_read"),
         "count program stays entry-only: no target-memory reads"
+    );
+}
+
+/// Backend double that swaps the attached file mid-attach (models a
+/// same-path replacement landing between the pre and post samples).
+struct SwapBackend {
+    inner: FakeCountBackend,
+    swap: std::cell::RefCell<Option<(PathBuf, Vec<u8>)>>,
+}
+
+impl SwapBackend {
+    fn fire(&mut self, tgid: u32, cookie: u32, now_ns: u64, n: u64) {
+        self.inner.fire(tgid, cookie, now_ns, n);
+    }
+}
+
+impl CountBackend for SwapBackend {
+    type Link = FakeLink;
+
+    fn attach(
+        &mut self,
+        path: &str,
+        offsets: &[u64],
+        cookies: &[u64],
+    ) -> (Vec<FakeLink>, Vec<usize>) {
+        if let Some((p, bytes)) = self.swap.borrow_mut().take() {
+            std::fs::remove_file(&p).unwrap();
+            std::fs::write(&p, &bytes).unwrap();
+        }
+        self.inner.attach(path, offsets, cookies)
+    }
+
+    fn open_window(
+        &mut self,
+        tgid: u64,
+        generation: u32,
+        start_ns: u64,
+        deadline_ns: u64,
+    ) -> anyhow::Result<()> {
+        self.inner
+            .open_window(tgid, generation, start_ns, deadline_ns)
+    }
+
+    fn set_generation(&mut self, generation: u32) -> anyhow::Result<()> {
+        self.inner.set_generation(generation)
+    }
+
+    fn close_window(&mut self) -> anyhow::Result<()> {
+        self.inner.close_window()
+    }
+
+    fn drain(
+        &mut self,
+        deadline: Option<std::time::Instant>,
+    ) -> anyhow::Result<osslscope::count_session::DrainedCounts> {
+        self.inner.drain(deadline)
+    }
+}
+
+#[test]
+fn replaced_during_attach_quarantines_hits() {
+    // A1: the path moves mid-attach (pre=old, post=new): links drop
+    // AND the cookie quarantines — hits recorded under the dropped
+    // links drain as unattributed loss, never misattributed to the
+    // stale provenance.
+    let stage = Stage::fresh("a1drop");
+    let bytes = self_bytes();
+    let off = x_offsets(&bytes, 1)[0];
+    let a = stage.write("prov.so", &bytes);
+    let live = vec![mapping(&a)];
+    let files = HashMap::from([(a.path.clone(), std::fs::read(&a.path).unwrap())]);
+    let backend = SwapBackend {
+        inner: FakeCountBackend::new(),
+        swap: std::cell::RefCell::new(Some((PathBuf::from(&a.path), bytes.clone()))),
+    };
+    let mut s = CountSession::new(PID, backend);
+    let d = CountDelta {
+        discovered: vec![site(&a, off, 7)],
+        losses: Vec::new(),
+    };
+    let report = s.attach_delta(&d, &live, &files).unwrap();
+    assert!(
+        report.missed.iter().any(|m| m.reason == "replaced"),
+        "mid-attach replacement must drop links: {report:?}"
+    );
+    assert_eq!(report.attached, 0);
+    let cookie = s.cookie_for(a.device, a.ino, off).unwrap();
+    s.open_window(1000, 2000).unwrap();
+    // In-flight hits under the dropped links (recorded while they
+    // were briefly live, drained after the drop).
+    s.backend_mut().fire(PID, cookie, 1500, 7);
+    let drain = s.close_and_drain(Duration::from_secs(5)).unwrap();
+    assert!(
+        drain.current.is_empty(),
+        "dropped-link hits must not attribute: {:?}",
+        drain.current
+    );
+    assert_eq!(counter_value(&drain, "count.unattributed"), Some(7));
+}
+
+#[test]
+fn quarantined_cookie_skips_reattach_until_fence() {
+    // A1: a dropped cookie stays quarantined for the generation
+    // (re-attach reports quarantined, never re-binds), and the
+    // fence clears quarantine (the stale identity then fails its
+    // verify as replaced — the new file needs re-discovery).
+    let stage = Stage::fresh("a1quar");
+    let bytes = self_bytes();
+    let off = x_offsets(&bytes, 1)[0];
+    let a = stage.write("prov.so", &bytes);
+    let live = vec![mapping(&a)];
+    let files = HashMap::from([(a.path.clone(), std::fs::read(&a.path).unwrap())]);
+    let backend = SwapBackend {
+        inner: FakeCountBackend::new(),
+        swap: std::cell::RefCell::new(Some((PathBuf::from(&a.path), bytes.clone()))),
+    };
+    let mut s = CountSession::new(PID, backend);
+    let d = CountDelta {
+        discovered: vec![site(&a, off, 7)],
+        losses: Vec::new(),
+    };
+    let report = s.attach_delta(&d, &live, &files).unwrap();
+    assert!(report.missed.iter().any(|m| m.reason == "replaced"));
+    // Same generation, same (stale) row: quarantined, not rebound.
+    let report2 = s.attach_delta(&d, &live, &files).unwrap();
+    assert_eq!(report2.attached, 0);
+    assert!(
+        report2.missed.iter().any(|m| m.reason == "quarantined"),
+        "quarantined cookie must report quarantined: {report2:?}"
+    );
+    // Fence clears quarantine: the stale identity fails verify as
+    // replaced (no silent re-bind, no quarantine shadow).
+    s.open_window(1000, 2000).unwrap();
+    s.fence(FenceReason::ProviderChanged).unwrap();
+    let report3 = s.attach_delta(&d, &live, &files).unwrap();
+    assert!(
+        !report3.missed.iter().any(|m| m.reason == "quarantined"),
+        "fence must clear quarantine: {report3:?}"
+    );
+    assert!(
+        report3.missed.iter().any(|m| m.reason == "replaced"),
+        "stale identity must fail verify as replaced: {report3:?}"
     );
 }

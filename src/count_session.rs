@@ -325,6 +325,15 @@ pub struct CountSession<B: CountBackend> {
     /// re-attaching would double-fire every hit.
     attached: HashSet<(u64, u64, u64)>,
     known: HashSet<u32>,
+    /// Cookies dropped after a detected mid-attach replacement,
+    /// quarantined for the rest of the generation (F-A/A1): their
+    /// links are dead but the kernel may hold hits under them, so
+    /// re-establishing provenance would misattribute. Quarantined
+    /// cookies skip known/provenance (their drains route
+    /// unattributed) and report `quarantined` instead of
+    /// re-binding; the fence clears the set (old-generation
+    /// stragglers then miss `retired` and stay unattributed).
+    quarantined: HashSet<u32>,
     current: HashMap<u32, CountValue>,
     fenced: Vec<FencedGeneration>,
     /// (generation, cookie) → meaning then current, for exact
@@ -361,6 +370,7 @@ impl<B: CountBackend> CountSession<B> {
             pending: HashMap::new(),
             attached: HashSet::new(),
             known: HashSet::new(),
+            quarantined: HashSet::new(),
             current: HashMap::new(),
             fenced: Vec::new(),
             retired: HashMap::new(),
@@ -440,6 +450,22 @@ impl<B: CountBackend> CountSession<B> {
     /// until [`fence`](Self::fence) versions it. Every planned link
     /// path is open-file verified against its backing triple just
     /// before attach; a replaced path is skipped as `replaced`, loud.
+    /// Quarantine a cookie whose links just dropped after a
+    /// detected replacement (F-A/A1): forget known/provenance so
+    /// in-flight kernel hits route unattributed instead of
+    /// misattributing to stale meaning, retract already-routed
+    /// counts into unattributed loss, and block re-binding for the
+    /// rest of the generation (cleared by [`CountSession::fence`]).
+    fn quarantine(&mut self, cookie: u32) {
+        self.known.remove(&cookie);
+        self.provenance.remove(&cookie);
+        self.pending.remove(&cookie);
+        if let Some(total) = self.current.remove(&cookie) {
+            self.unattributed = self.unattributed.saturating_add(total.count);
+        }
+        self.quarantined.insert(cookie);
+    }
+
     pub fn attach_delta(
         &mut self,
         delta: &CountDelta,
@@ -508,6 +534,19 @@ impl<B: CountBackend> CountSession<B> {
             let Some(cookie) = self.stable.lookup(&row.dev, row.ino, row.offset) else {
                 continue;
             };
+            if self.quarantined.contains(&cookie) {
+                // F-A/A1: dropped-link cookie, still quarantined for
+                // this generation — report, never re-bind (its
+                // kernel hits would misattribute to fresh meaning).
+                report.missed.push(plan::Missed {
+                    dev: row.dev.clone(),
+                    ino: row.ino,
+                    offset: row.offset,
+                    reason: "quarantined",
+                });
+                self.missed_attaches += 1;
+                continue;
+            }
             self.known.insert(cookie);
             let same = self.provenance.get(&cookie).is_some_and(|current| {
                 current.site == site.site
@@ -550,6 +589,7 @@ impl<B: CountBackend> CountSession<B> {
         for group in plan::groups(&planned) {
             let mut offs: Vec<u64> = Vec::new();
             let mut cks: Vec<u64> = Vec::new();
+            let mut expected: Vec<(u64, u64)> = Vec::new();
             for (offset, cookie) in group.offsets.iter().zip(group.cookies.iter()) {
                 let cookie = *cookie as u32;
                 let Some(prov) = self.provenance.get(&cookie) else {
@@ -564,6 +604,7 @@ impl<B: CountBackend> CountSession<B> {
                     Ok(()) => {
                         offs.push(*offset);
                         cks.push(cookie as u64);
+                        expected.push((prov.site.device, prov.site.inode));
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
                         report.missed.push(plan::Missed {
@@ -593,11 +634,16 @@ impl<B: CountBackend> CountSession<B> {
             // path that moves mid-attach may bind either side. Fresh
             // links from a moved path are dropped loud as `replaced`
             // — they must never attribute to stale provenance under
-            // an already-known cookie.
+            // an already-known cookie. F-A/A1: the binding must equal
+            // every attached cookie's EXPECTED identity, not merely
+            // agree with itself — pre==post passes when both samples
+            // describe the replacement (moved between the verify
+            // above and the pre sample).
             let pre = plan::sample_backing(&group.path).ok();
             let (links, bad) = self.backend.attach(&group.path, &offs, &cks);
             let post = plan::sample_backing(&group.path).ok();
-            if pre != post {
+            let bound = expected.iter().all(|e| plan::binding_holds(&pre, &post, e));
+            if !bound {
                 drop(links);
                 for (offset, cookie) in offs.iter().zip(cks.iter()) {
                     let cookie = *cookie as u32;
@@ -610,6 +656,7 @@ impl<B: CountBackend> CountSession<B> {
                         });
                         self.missed_attaches += 1;
                     }
+                    self.quarantine(cookie);
                 }
                 continue;
             }
@@ -722,6 +769,11 @@ impl<B: CountBackend> CountSession<B> {
             }
         }
         self.current.clear();
+        // F-A/A1: quarantine lifts with the generation — cookies may
+        // re-attach fresh, while old-generation stragglers miss
+        // `retired` (provenance was removed at quarantine time) and
+        // route unattributed.
+        self.quarantined.clear();
         self.generation = next;
         self.fences += 1;
         Ok(())
