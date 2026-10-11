@@ -321,7 +321,9 @@ fn r06_rule_outcomes() {
             doc: relevant_gap.clone(),
             bounds: MatchBounds {
                 definite: 0,
-                possible: Some(0),
+                // F-E/B5: relevant loss makes the upper bound
+                // unknown; the old Some(0) was the false certainty.
+                possible: None,
             },
             expected: RuleVerdict::Inconclusive,
             overall: PolicyOutcome::Inconclusive,
@@ -377,6 +379,54 @@ fn r06_rule_outcomes() {
         &exact,
     );
     assert_eq!(mixed.overall(), PolicyOutcome::Violation);
+}
+
+/// F-E/B5: an empty observation with an unknown denominator reports
+/// an unknown upper bound (None), never a finite `possible: 0`.
+/// Relevant coverage/loss shapes the bound, not just the verdict.
+#[test]
+fn empty_observation_with_unknown_denominator_has_unknown_possible() {
+    let d = doc(
+        Vec::new(),
+        Vec::new(),
+        vec![ScopeCoverage {
+            scope: "provider/default".to_string(),
+            expected: ExpectedScope::Unknown,
+            discovered: 0,
+            attached: 0,
+        }],
+        Vec::new(),
+        exact_window(),
+        None,
+    );
+    assert!(matches!(d.status, Completeness::Partial { .. }));
+    let v = evaluate_document(std::slice::from_ref(&PolicyRule::deny_algorithm("DES")), &d);
+    assert_eq!(v.rules.len(), 1);
+    assert_eq!(v.rules[0].bounds.definite, 0);
+    assert_eq!(v.rules[0].bounds.possible, None);
+    assert_eq!(v.rules[0].verdict, RuleVerdict::Inconclusive);
+    let rec = policy_record(&v);
+    assert_eq!(rec.rules[0].possible, None);
+}
+
+/// F-E/B6: a resolved non-weak HMAC identity does not establish a
+/// strong unseen digest — deny-weak is inconclusive at
+/// parameter-blind ops, never a clean pass.
+#[test]
+fn deny_weak_is_inconclusive_for_resolved_hmac_with_unseen_digest() {
+    let mac = osslscope::kinds::op_id("OSSL_OP_MAC").expect("MAC op id");
+    let d = complete_doc(vec![site_at(
+        1,
+        0,
+        5,
+        vec![cand("prov-default", "default", mac, 5, &["HMAC"], false)],
+        CandidateCoverage::Complete,
+    )]);
+    let v = evaluate_document(std::slice::from_ref(&PolicyRule::deny_weak()), &d);
+    assert_eq!(v.rules.len(), 1);
+    assert_eq!(v.rules[0].bounds.definite, 0);
+    assert_eq!(v.rules[0].bounds.possible, Some(5));
+    assert_eq!(v.rules[0].verdict, RuleVerdict::Inconclusive);
 }
 
 /// Unknown candidate sets make the upper bound unknown and prevent any

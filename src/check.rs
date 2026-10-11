@@ -638,9 +638,12 @@ mod tests {
             vec![
                 ("require-provider", "default"),
                 ("deny-provider", "fips"),
-                ("deny-engine", ""),
+                // F-E/B1: argument-less rules carry canonical
+                // nonempty matchers (the old "" violated the v2
+                // predicate minLength 1).
+                ("deny-engine", "engine"),
                 ("deny-algorithm", "DES"),
-                ("deny-weak", ""),
+                ("deny-weak", "weak"),
                 ("require-executed", "SHA2-256"),
             ]
         );
