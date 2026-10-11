@@ -910,6 +910,656 @@ fn clean_exit_yields_complete() {
 }
 
 #[test]
+fn h2_t1_close_tail_residual_downgrades_denominators_and_sites() {
+    // A-6: a close-tail loss residual (snapshot counters beyond
+    // what polls adapted) must propagate through taint into
+    // per-op denominators AND already-emitted site coverages —
+    // not sit in extra_loss while Complete claims stand.
+    // The target exits cleanly here, so this also pins that the
+    // H2/T5 exemption is source-scoped (maps only): a ring-row
+    // residual under an exited target still taints.
+    let mut h = Harness::fresh("h2-t1");
+    h.snapshot_attached();
+    let cand1 = cand(
+        "/p/provider.so",
+        backing_of(&h.staged, h.off),
+        1,
+        11,
+        "SHA-256",
+        false,
+        "ok",
+    );
+    h.polls.push_back(DiscoveryDelta::default());
+    h.polls.push_back(DiscoveryDelta {
+        candidates: vec![cand1],
+        tables: vec![terminated(1, 0)],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    h.plans.insert(
+        2,
+        FirePlan {
+            fires: vec![(BASE_NS + 600_000_000, 7)],
+            shortfall: 0,
+            cancel: false,
+        },
+    );
+    h.exit_at_ns = Some(BASE_NS + 1_000_000_000);
+    h.exit_code = 0;
+    // Close-tail: three ring-row drops the final join observed
+    // after the last poll adapted (snapshot-only increment).
+    h.snapshot.losses = vec![(osslscope_ebpf_common::LOSS_RING_ROW, 3)];
+    let (out, _) = h.run();
+    let c = out.unwrap();
+    assert!(matches!(c.document.status, Completeness::Partial { .. }));
+    assert!(!c.document.coverage.is_empty());
+    for scope in &c.document.coverage {
+        if scope.scope == "legacy" {
+            // H2 leaves the legacy scope untouched (H8 owns
+            // legacy-call semantics): no libcrypto was ever
+            // observed here, so NotApplicable stands — taint must
+            // not conflate "surface absent" with "unobserved".
+            assert!(
+                matches!(scope.expected, ExpectedScope::NotApplicable),
+                "legacy scope must be untouched by H2: {scope:?}"
+            );
+        } else {
+            assert!(
+                matches!(scope.expected, ExpectedScope::Unknown),
+                "close-tail loss must taint denominators: {scope:?}"
+            );
+        }
+    }
+    assert!(!c.document.sites.is_empty());
+    for site in &c.document.sites {
+        assert_eq!(
+            site.candidates_coverage,
+            CandidateCoverage::Unknown,
+            "close-tail loss must revise emitted sites"
+        );
+    }
+}
+
+#[test]
+fn h2_t5_exited_target_maps_residual_is_exempt() {
+    // H2/T5: the benign post-exit single — a HOST_MAPS_READ close
+    // residual under an exited target (reaped child, /proc gone,
+    // nothing missable) — taints no denominator and revises no
+    // site. Mid-run maps failures already rode the deltas (op
+    // None → poll-global taint), so the residual is close-only.
+    // The D4 counter record is preserved: the exemption is
+    // taint-only (status stays PARTIAL via the loss counter —
+    // finalize is unchanged by H2).
+    let mut h = Harness::fresh("h2-t5");
+    h.snapshot_attached();
+    let cand1 = cand(
+        "/p/provider.so",
+        backing_of(&h.staged, h.off),
+        1,
+        11,
+        "SHA-256",
+        false,
+        "ok",
+    );
+    h.polls.push_back(DiscoveryDelta::default());
+    h.polls.push_back(DiscoveryDelta {
+        candidates: vec![cand1],
+        tables: vec![terminated(1, 0)],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    h.plans.insert(
+        2,
+        FirePlan {
+            fires: vec![(BASE_NS + 600_000_000, 7)],
+            shortfall: 0,
+            cancel: false,
+        },
+    );
+    h.exit_at_ns = Some(BASE_NS + 1_000_000_000);
+    h.exit_code = 0;
+    h.snapshot.losses = vec![(osslscope::discovery::coverage::HOST_MAPS_READ, 1)];
+    let (out, _) = h.run();
+    let c = out.unwrap();
+    assert!(
+        matches!(
+            c.disposition,
+            Some(target::TargetDisposition::Exited { code: 0 })
+        ),
+        "exemption requires an exited target: {:?}",
+        c.disposition
+    );
+    assert_eq!(
+        counter_value(&c, "discovery.maps_read"),
+        1,
+        "the benign single must still land as a D4 record: {:?}",
+        c.document.counters
+    );
+    for scope in &c.document.coverage {
+        if scope.scope == "legacy" {
+            assert!(
+                matches!(scope.expected, ExpectedScope::NotApplicable),
+                "legacy scope must be untouched by H2: {scope:?}"
+            );
+        } else {
+            assert!(
+                matches!(scope.expected, ExpectedScope::Applicable { .. }),
+                "benign maps single must not taint denominators: {scope:?}"
+            );
+        }
+    }
+    assert!(!c.document.sites.is_empty());
+    for site in &c.document.sites {
+        assert_eq!(
+            site.candidates_coverage,
+            CandidateCoverage::Complete,
+            "benign maps single must not revise sites"
+        );
+    }
+}
+
+#[test]
+fn h2_t5b_capture_maps_failure_always_taints() {
+    // H2/T5b: the capture-side `maps_read_failed` counter has no
+    // post-exit increment site (round() reaps-or-continues first),
+    // so every count is mid-window turnover blindness — it taints
+    // even when the target later exits cleanly. Asymmetry with T5
+    // is the point: discovery-side maps residual (close-only,
+    // benign) vs capture-side maps failure (live-round, real).
+    let mut h = Harness::fresh("h2-t5b");
+    h.snapshot_attached();
+    let cand1 = cand(
+        "/p/provider.so",
+        backing_of(&h.staged, h.off),
+        1,
+        11,
+        "SHA-256",
+        false,
+        "ok",
+    );
+    h.polls.push_back(DiscoveryDelta::default());
+    h.polls.push_back(DiscoveryDelta {
+        candidates: vec![cand1],
+        tables: vec![terminated(1, 0)],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    h.plans.insert(
+        2,
+        FirePlan {
+            fires: vec![(BASE_NS + 600_000_000, 7)],
+            shortfall: 0,
+            cancel: false,
+        },
+    );
+    // Fail a loop-round maps read (1-based; 1-2 are setup): the
+    // round skips, later rounds proceed, the target exits.
+    h.maps_err_at = HashSet::from([3]);
+    h.exit_at_ns = Some(BASE_NS + 1_000_000_000);
+    h.exit_code = 0;
+    let (out, _) = h.run();
+    let c = out.unwrap();
+    assert!(
+        matches!(
+            c.disposition,
+            Some(target::TargetDisposition::Exited { code: 0 })
+        ),
+        "T5b needs the exited-target asymmetry: {:?}",
+        c.disposition
+    );
+    assert_eq!(
+        counter_value(&c, "discovery.maps_read_failed"),
+        1,
+        "the staged maps failure must land: {:?}",
+        c.document.counters
+    );
+    assert!(matches!(c.document.status, Completeness::Partial { .. }));
+    for scope in &c.document.coverage {
+        if scope.scope == "legacy" {
+            assert!(
+                matches!(scope.expected, ExpectedScope::NotApplicable),
+                "legacy scope must be untouched by H2: {scope:?}"
+            );
+        } else {
+            assert!(
+                matches!(scope.expected, ExpectedScope::Unknown),
+                "capture-side maps failure must taint: {scope:?}"
+            );
+        }
+    }
+    assert!(!c.document.sites.is_empty());
+    for site in &c.document.sites {
+        assert_eq!(
+            site.candidates_coverage,
+            CandidateCoverage::Unknown,
+            "capture-side maps failure must revise sites"
+        );
+    }
+}
+
+#[test]
+fn h2_t2_close_truncation_taints_only_its_op() {
+    // H2/T2: a close-time truncated walk is OP-LOCALIZED
+    // (`truncated_ops` carries op ids): op:1 goes Unknown while
+    // op:2 stays Applicable/Complete, and the dispatch anchor
+    // claim stands (a truncated op walk does not un-observe the
+    // dispatch table — only global evidence taint moves dispatch).
+    let mut h = Harness::fresh("h2-t2");
+    h.snapshot_attached();
+    let staged2 = h.stage.write("prov2.so", &h.bytes.clone());
+    h.maps.push(mapping(&staged2));
+    h.files.insert(
+        staged2.path.clone(),
+        plan::FileBytes {
+            bytes: h.bytes.clone(),
+            dev: staged2.device,
+            ino: staged2.ino,
+        },
+    );
+    let cand1 = cand(
+        "/p/provider.so",
+        backing_of(&h.staged, h.off),
+        1,
+        11,
+        "SHA-256",
+        false,
+        "ok",
+    );
+    let cand2 = cand(
+        "/p/provider.so",
+        backing_of(&staged2, h.off),
+        2,
+        12,
+        "SHA-256",
+        false,
+        "ok",
+    );
+    h.polls.push_back(DiscoveryDelta::default());
+    h.polls.push_back(DiscoveryDelta {
+        candidates: vec![cand1, cand2],
+        tables: vec![terminated(1, 0), terminated(2, 0)],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    h.plans.insert(
+        2,
+        FirePlan {
+            fires: vec![(BASE_NS + 600_000_000, 7)],
+            shortfall: 0,
+            cancel: false,
+        },
+    );
+    h.exit_at_ns = Some(BASE_NS + 1_000_000_000);
+    h.exit_code = 0;
+    // Close-time: op 1's final walk truncated (snapshot-only).
+    h.snapshot.truncated_ops = vec![(1, 2)];
+    let (out, _) = h.run();
+    let c = out.unwrap();
+    assert!(matches!(c.document.status, Completeness::Partial { .. }));
+    assert_eq!(
+        counter_value(&c, "discovery.truncated_walk"),
+        1,
+        "truncation must land as a D4 record: {:?}",
+        c.document.counters
+    );
+    let mut saw_op1 = false;
+    let mut saw_op2 = false;
+    for scope in &c.document.coverage {
+        match scope.scope.as_str() {
+            "op:1" => {
+                saw_op1 = true;
+                assert!(
+                    matches!(scope.expected, ExpectedScope::Unknown),
+                    "truncated op must taint: {scope:?}"
+                );
+            }
+            "op:2" => {
+                saw_op2 = true;
+                assert!(
+                    matches!(scope.expected, ExpectedScope::Applicable { .. }),
+                    "untruncated op must stand: {scope:?}"
+                );
+            }
+            "dispatch" => {
+                assert!(
+                    matches!(scope.expected, ExpectedScope::Applicable { .. }),
+                    "op-localized trunc leaves dispatch standing: {scope:?}"
+                );
+            }
+            "legacy" => {}
+            other => panic!("unexpected scope: {other}"),
+        }
+    }
+    assert!(saw_op1 && saw_op2, "both ops must report");
+    assert_eq!(c.document.sites.len(), 2, "one site per op");
+    for site in &c.document.sites {
+        let ops: Vec<u32> = site.candidates.iter().map(|id| id.op).collect();
+        if ops.contains(&1) {
+            assert_eq!(
+                site.candidates_coverage,
+                CandidateCoverage::Unknown,
+                "op-1 site must revise"
+            );
+        } else {
+            assert!(ops.contains(&2), "every site belongs to an op: {ops:?}");
+            assert_eq!(
+                site.candidates_coverage,
+                CandidateCoverage::Complete,
+                "op-2 site must stand"
+            );
+        }
+    }
+}
+
+#[test]
+fn h2_t6_relevance_cap_migrates_to_global_taint() {
+    // H2/T6 (A13 migration): a capped relevance round may hide
+    // any backing, so `relevance_capped > 0` taints GLOBALLY
+    // (op denominators + dispatch + sites) — while the counter
+    // itself stays as the D4 record. One cand references the
+    // staged backing (attachable → real site); 256 more overflow
+    // the 256 cap (staged sorts first, so it is kept).
+    let mut h = Harness::fresh("h2-t6");
+    h.snapshot_attached();
+    let dev = plan::render_device(h.staged.device);
+    let mut maps = vec![mapping(&h.staged)];
+    let mut cands = vec![cand(
+        "/p/provider.so",
+        backing_of(&h.staged, h.off),
+        1,
+        11,
+        "SHA-256",
+        false,
+        "ok",
+    )];
+    for i in 0..256u64 {
+        maps.push(Mapping {
+            start: 0x7f00_0000_0000,
+            end: 0x7f00_0000_1000,
+            x: true,
+            offset: 0,
+            dev: dev.clone(),
+            ino: 1_000_000 + i,
+            path: format!("/x/mod{i:03}.so"),
+        });
+        cands.push(cand(
+            "/p/provider.so",
+            Some(BackingRef {
+                dev: dev.clone(),
+                ino: 1_000_000 + i,
+                offset: h.off,
+            }),
+            1,
+            11,
+            "SHA-256",
+            false,
+            "ok",
+        ));
+    }
+    h.maps = maps;
+    h.polls.push_back(DiscoveryDelta::default());
+    h.polls.push_back(DiscoveryDelta {
+        candidates: cands,
+        tables: vec![terminated(1, 0)],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    h.plans.insert(
+        2,
+        FirePlan {
+            fires: vec![(BASE_NS + 600_000_000, 7)],
+            shortfall: 0,
+            cancel: false,
+        },
+    );
+    h.exit_at_ns = Some(BASE_NS + 1_000_000_000);
+    h.exit_code = 0;
+    let (out, _) = h.run();
+    let c = out.unwrap();
+    assert!(matches!(c.document.status, Completeness::Partial { .. }));
+    assert_eq!(
+        counter_value(&c, "discovery.relevance_capped"),
+        1,
+        "257 backings over a 256 cap must report 1 dropped: {:?}",
+        c.document.counters
+    );
+    for scope in &c.document.coverage {
+        if scope.scope == "legacy" {
+            assert!(
+                matches!(scope.expected, ExpectedScope::NotApplicable),
+                "legacy scope must be untouched by H2: {scope:?}"
+            );
+        } else {
+            assert!(
+                matches!(scope.expected, ExpectedScope::Unknown),
+                "relevance cap must taint globally: {scope:?}"
+            );
+        }
+    }
+    assert!(!c.document.sites.is_empty());
+    for site in &c.document.sites {
+        assert_eq!(
+            site.candidates_coverage,
+            CandidateCoverage::Unknown,
+            "relevance cap must revise sites"
+        );
+    }
+}
+
+#[test]
+fn h2_t4_fenced_complete_revised_by_later_poll_taint() {
+    // H2/T4 (B-3b): a generation sealed Complete is revisited
+    // against final taint at close. A maps change fences gen 0
+    // (3 calls, Complete — no taint exists yet); a LATER poll
+    // localizes orphan-row loss to op 1; at close the fenced
+    // site revises to Unknown. Poll order guarantees the fence
+    // precedes the taint (one poll per round; fence at end of
+    // round 3, loss adapted in round 4).
+    let mut h = Harness::fresh("h2-t4");
+    h.snapshot_attached();
+    let newso = h.stage.write("new.so", &h.bytes.clone());
+    h.files.insert(
+        newso.path.clone(),
+        plan::FileBytes {
+            bytes: h.bytes.clone(),
+            dev: newso.device,
+            ino: newso.ino,
+        },
+    );
+    let before = vec![mapping(&h.staged)];
+    let after = vec![mapping(&h.staged), mapping(&newso)];
+    h.maps_seq = VecDeque::from([before.clone(), before.clone(), before, after.clone()]);
+    h.maps = after;
+    let cand1 = cand(
+        "/p/provider.so",
+        backing_of(&h.staged, h.off),
+        1,
+        11,
+        "SHA-256",
+        false,
+        "ok",
+    );
+    h.polls.push_back(DiscoveryDelta::default());
+    h.polls.push_back(DiscoveryDelta {
+        candidates: vec![cand1],
+        tables: vec![terminated(1, 0)],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    h.polls.push_back(DiscoveryDelta::default());
+    h.polls.push_back(DiscoveryDelta::default());
+    h.polls.push_back(DiscoveryDelta {
+        losses: vec![DiscoveryLoss {
+            source: osslscope::discovery::coverage::HOST_ORPHAN_ROW,
+            count: 1,
+            op: Some(1),
+        }],
+        ..DiscoveryDelta::default()
+    });
+    h.plans.insert(
+        2,
+        FirePlan {
+            fires: vec![(BASE_NS + 600_000_000, 3)],
+            shortfall: 0,
+            cancel: false,
+        },
+    );
+    h.plans.insert(
+        5,
+        FirePlan {
+            fires: vec![(BASE_NS + 1_200_000_000, 4)],
+            shortfall: 0,
+            cancel: false,
+        },
+    );
+    h.exit_at_ns = Some(BASE_NS + 1_500_000_000);
+    h.exit_code = 0;
+    let (out, _) = h.run();
+    let c = out.unwrap();
+    assert!(matches!(c.document.status, Completeness::Partial { .. }));
+    // Two fences: the maps change seals gen 0 with real evidence;
+    // the taint round itself stages an Unknown coverage update,
+    // which (coverage ∈ meaning) fences an empty gen 1. The
+    // gen-0 seal predates all taint — the revision target.
+    assert_eq!(c.document.fenced.len(), 2);
+    assert_eq!(c.document.fenced[0].generation, 0);
+    assert_eq!(c.document.fenced[0].sites.len(), 1);
+    assert_eq!(c.document.fenced[0].sites[0].calls, 3);
+    assert_eq!(c.document.fenced[1].generation, 1);
+    assert!(c.document.fenced[1].sites.is_empty());
+    // Poll-time op-localized taint reaches the sealed claim.
+    assert_eq!(
+        c.document.fenced[0].sites[0].candidates_coverage,
+        CandidateCoverage::Unknown,
+        "fenced Complete must revise under later poll taint"
+    );
+    assert!(!c.document.sites.is_empty());
+    for site in &c.document.sites {
+        assert_eq!(
+            site.candidates_coverage,
+            CandidateCoverage::Unknown,
+            "current site of a tainted op must not stand Complete"
+        );
+    }
+    for scope in &c.document.coverage {
+        match scope.scope.as_str() {
+            "op:1" => assert!(
+                matches!(scope.expected, ExpectedScope::Unknown),
+                "tainted op keeps no denominator: {scope:?}"
+            ),
+            "dispatch" => assert!(
+                matches!(scope.expected, ExpectedScope::Applicable { .. }),
+                "op-localized poll taint leaves dispatch standing: {scope:?}"
+            ),
+            "legacy" => {}
+            other => panic!("unexpected scope: {other}"),
+        }
+    }
+}
+
+#[test]
+fn h2_t3_stale_seal_revised_at_close() {
+    // H2/T3 (B-3a): a non-empty bucket sealed while a staged
+    // Unknown re-emit pends. The seal reads live provenance
+    // (Complete — pending applies post-seal), so the sealed
+    // claim is stale at birth; close-time revision (B-3b) owns
+    // final truth and the doc still reads Unknown. No fence
+    // reorder: pending mixes identity changes (new generation's
+    // meaning — must seal old) with coverage downgrades, so a
+    // blanket pre-seal apply would smear new identity onto old
+    // counts; the seal-time value is unobservable except via
+    // the revised doc (see H2 design §2c amendment).
+    let mut h = Harness::fresh("h2-t3");
+    h.snapshot_attached();
+    let newso = h.stage.write("new.so", &h.bytes.clone());
+    h.files.insert(
+        newso.path.clone(),
+        plan::FileBytes {
+            bytes: h.bytes.clone(),
+            dev: newso.device,
+            ino: newso.ino,
+        },
+    );
+    let before = vec![mapping(&h.staged)];
+    let after = vec![mapping(&h.staged), mapping(&newso)];
+    h.maps_seq = VecDeque::from([before.clone(), before.clone(), before, after.clone()]);
+    h.maps = after;
+    let cand1 = cand(
+        "/p/provider.so",
+        backing_of(&h.staged, h.off),
+        1,
+        11,
+        "SHA-256",
+        false,
+        "ok",
+    );
+    h.polls.push_back(DiscoveryDelta::default());
+    h.polls.push_back(DiscoveryDelta {
+        candidates: vec![cand1],
+        tables: vec![terminated(1, 0)],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    h.polls.push_back(DiscoveryDelta::default());
+    h.polls.push_back(DiscoveryDelta::default());
+    h.polls.push_back(DiscoveryDelta {
+        losses: vec![DiscoveryLoss {
+            source: osslscope::discovery::coverage::HOST_ORPHAN_ROW,
+            count: 1,
+            op: Some(1),
+        }],
+        ..DiscoveryDelta::default()
+    });
+    h.plans.insert(
+        2,
+        FirePlan {
+            fires: vec![(BASE_NS + 600_000_000, 3)],
+            shortfall: 0,
+            cancel: false,
+        },
+    );
+    // Fires during the taint round land in gen 1 under Complete
+    // provenance (the plan fires before the loss delta adapts),
+    // then the staged Unknown fences a NON-EMPTY bucket.
+    h.plans.insert(
+        4,
+        FirePlan {
+            fires: vec![(BASE_NS + 900_000_000, 2)],
+            shortfall: 0,
+            cancel: false,
+        },
+    );
+    h.plans.insert(
+        5,
+        FirePlan {
+            fires: vec![(BASE_NS + 1_200_000_000, 4)],
+            shortfall: 0,
+            cancel: false,
+        },
+    );
+    h.exit_at_ns = Some(BASE_NS + 1_500_000_000);
+    h.exit_code = 0;
+    let (out, _) = h.run();
+    let c = out.unwrap();
+    assert!(matches!(c.document.status, Completeness::Partial { .. }));
+    assert_eq!(c.document.fenced.len(), 2);
+    // The stale seal: non-empty, fenced by the taint round.
+    assert_eq!(c.document.fenced[1].generation, 1);
+    assert_eq!(c.document.fenced[1].sites.len(), 1);
+    assert_eq!(c.document.fenced[1].sites[0].calls, 2);
+    assert_eq!(
+        c.document.fenced[1].sites[0].candidates_coverage,
+        CandidateCoverage::Unknown,
+        "stale Complete seal must revise at close"
+    );
+    assert_eq!(
+        c.document.fenced[0].sites[0].candidates_coverage,
+        CandidateCoverage::Unknown,
+        "pre-taint seal must revise at close"
+    );
+}
+
+#[test]
 fn untracked_epoch_executions_are_unattributed_partial() {
     // F3: op 1 provably terminates epoch 0 while a same-window
     // candidate arrives for epoch 9 with zero table proof for
