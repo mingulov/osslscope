@@ -659,7 +659,7 @@ impl Harness {
                 table: None,
                 force_offset: None,
                 provider_enrollment: None,
-                resolved_provider_class: None,
+                resolved_provider: None,
                 duration: Duration::from_secs(2),
                 settle: Duration::from_millis(500),
                 harvest_timeout: Duration::from_secs(30),
@@ -2225,7 +2225,47 @@ fn polling_fallback_is_explicit_partial() {
 // Adapter pins: direct `adapt_delta` contract checks.
 // ---------------------------------------------------------------------------
 
-use osslscope::capture::{AdaptedDelta, AdapterCtx, AdapterState, adapt_delta};
+use osslscope::capture::{AdaptedDelta, AdapterCtx, AdapterState, PinnedProvider, adapt_delta};
+use osslscope::discovery::elf;
+
+/// Minimal ELF64 with one PT_NOTE holding a GNU build-id note —
+/// distinct descriptors fingerprint distinct objects.
+fn fake_elf_with_build_id(desc: &[u8]) -> Vec<u8> {
+    let mut v = Vec::new();
+    v.extend_from_slice(&[0x7f, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    v.extend_from_slice(&3u16.to_le_bytes()); // ET_DYN
+    v.extend_from_slice(&62u16.to_le_bytes()); // x86-64
+    v.extend_from_slice(&1u32.to_le_bytes()); // version
+    v.extend_from_slice(&0u64.to_le_bytes()); // entry
+    v.extend_from_slice(&64u64.to_le_bytes()); // phoff
+    v.extend_from_slice(&0u64.to_le_bytes()); // shoff
+    v.extend_from_slice(&0u32.to_le_bytes()); // flags
+    v.extend_from_slice(&64u16.to_le_bytes()); // ehsize
+    v.extend_from_slice(&56u16.to_le_bytes()); // phentsize
+    v.extend_from_slice(&1u16.to_le_bytes()); // phnum
+    v.extend_from_slice(&0u16.to_le_bytes()); // shentsize
+    v.extend_from_slice(&0u16.to_le_bytes()); // shnum
+    v.extend_from_slice(&0u16.to_le_bytes()); // shstrndx
+    let mut note = Vec::new();
+    note.extend_from_slice(&4u32.to_le_bytes()); // namesz
+    note.extend_from_slice(&(desc.len() as u32).to_le_bytes());
+    note.extend_from_slice(&3u32.to_le_bytes()); // NT_GNU_BUILD_ID
+    note.extend_from_slice(b"GNU\0");
+    note.extend_from_slice(desc);
+    while note.len() % 4 != 0 {
+        note.push(0);
+    }
+    v.extend_from_slice(&4u32.to_le_bytes()); // PT_NOTE
+    v.extend_from_slice(&0u32.to_le_bytes()); // flags
+    v.extend_from_slice(&120u64.to_le_bytes()); // offset
+    v.extend_from_slice(&0u64.to_le_bytes()); // vaddr
+    v.extend_from_slice(&0u64.to_le_bytes()); // paddr
+    v.extend_from_slice(&(note.len() as u64).to_le_bytes());
+    v.extend_from_slice(&(note.len() as u64).to_le_bytes());
+    v.extend_from_slice(&4u64.to_le_bytes()); // align
+    v.extend_from_slice(&note);
+    v
+}
 
 #[test]
 fn advertising_fallback_binds_mapping_not_path() {
@@ -2272,8 +2312,7 @@ fn advertising_fallback_binds_mapping_not_path() {
             &AdapterCtx {
                 live,
                 files: &files,
-                builtin_default: false,
-                enrolled_class: None,
+                pinned_provider: None,
                 fresh: &fresh,
                 post_settle: false,
                 baseline: false,
@@ -2324,8 +2363,7 @@ fn advertising_fallback_unresolved_is_anonymous() {
         &AdapterCtx {
             live: &live,
             files: &files,
-            builtin_default: false,
-            enrolled_class: None,
+            pinned_provider: None,
             fresh: &fresh,
             post_settle: false,
             baseline: false,
@@ -2335,6 +2373,105 @@ fn advertising_fallback_unresolved_is_anonymous() {
     let id = adapted.delta.discovered[0].candidates[0].provider.0.clone();
     assert_eq!(id, "unverified-advertising:anonymous");
     assert!(!id.contains("gone"));
+}
+
+#[test]
+fn provider_class_resolves_per_advertising_object() {
+    // F-A/A6: the run's pin labels ONE verified object — a mixed
+    // window's other object stays `unknown`, never borrowed.
+    let stage = Stage::fresh("a6-mixed");
+    let bytes_a = fake_elf_with_build_id(&[0xA1; 20]);
+    let bytes_b = fake_elf_with_build_id(&[0xB2; 20]);
+    let id_a = elf::read_build_id(&bytes_a).expect("fixture A parses");
+    let id_b = elf::read_build_id(&bytes_b).expect("fixture B parses");
+    assert_ne!(id_a, id_b, "fixtures must fingerprint apart");
+    let sa = stage.write("a.so", &bytes_a);
+    let sb = stage.write("b.so", &bytes_b);
+    let ma = mapping(&sa);
+    let mut mb = mapping(&sb);
+    mb.start = 0x7f01_0000_0000;
+    mb.end = 0x7f01_0000_1000;
+    let live = vec![ma.clone(), mb.clone()];
+    let files: HashMap<String, plan::FileBytes> = HashMap::from([
+        (
+            sa.path.clone(),
+            plan::FileBytes {
+                bytes: bytes_a,
+                dev: sa.device,
+                ino: sa.ino,
+            },
+        ),
+        (
+            sb.path.clone(),
+            plan::FileBytes {
+                bytes: bytes_b,
+                dev: sb.device,
+                ino: sb.ino,
+            },
+        ),
+    ]);
+    let mut ca = cand(
+        sa.path.as_str(),
+        backing_of(&sa, 0x100),
+        1,
+        11,
+        "SHA-256",
+        false,
+        "ok",
+    );
+    ca.arr = ma.start + 8;
+    ca.advertising_dev = ma.dev.clone();
+    ca.advertising_ino = ma.ino;
+    let mut cb = cand(
+        sb.path.as_str(),
+        backing_of(&sb, 0x100),
+        1,
+        12,
+        "SHA-256",
+        false,
+        "ok",
+    );
+    cb.arr = mb.start + 8;
+    cb.advertising_dev = mb.dev.clone();
+    cb.advertising_ino = mb.ino;
+    let delta = DiscoveryDelta {
+        candidates: vec![ca, cb],
+        ..DiscoveryDelta::default()
+    };
+    let mut state = AdapterState::default();
+    let fresh: HashSet<(String, u64)> = HashSet::new();
+    let adapted = adapt_delta(
+        &mut state,
+        &delta,
+        &AdapterCtx {
+            live: &live,
+            files: &files,
+            pinned_provider: Some(PinnedProvider {
+                object: format!("build:{id_a}"),
+                class: "enrolled-a".to_string(),
+            }),
+            fresh: &fresh,
+            post_settle: false,
+            baseline: false,
+        },
+    );
+    let mut seen = 0;
+    for site in &adapted.delta.discovered {
+        for c in &site.candidates {
+            seen += 1;
+            if c.provider.0 == format!("build:{id_a}") {
+                assert_eq!(c.provider_class, "enrolled-a");
+            } else if c.provider.0 == format!("build:{id_b}") {
+                assert_eq!(
+                    c.provider_class, "unknown",
+                    "unpinned object must not borrow the run's pin"
+                );
+            } else {
+                panic!("unexpected advertising {}", c.provider.0);
+            }
+        }
+    }
+    assert_eq!(seen, 2);
 }
 
 #[test]
@@ -2388,8 +2525,7 @@ fn stale_path_fingerprint_is_unverified() {
         &AdapterCtx {
             live: &live,
             files: &files,
-            builtin_default: false,
-            enrolled_class: None,
+            pinned_provider: None,
             fresh: &fresh,
             post_settle: false,
             baseline: false,
@@ -2473,8 +2609,7 @@ fn advertising_joins_exact_vma_not_first_path() {
         &AdapterCtx {
             live: &live,
             files: &files,
-            builtin_default: false,
-            enrolled_class: None,
+            pinned_provider: None,
             fresh: &fresh,
             post_settle: false,
             baseline: false,
@@ -2547,8 +2682,7 @@ fn advertising_turnover_is_anonymous() {
         &AdapterCtx {
             live: &live,
             files: &files,
-            builtin_default: false,
-            enrolled_class: None,
+            pinned_provider: None,
             fresh: &fresh,
             post_settle: false,
             baseline: false,
@@ -2656,8 +2790,7 @@ fn refreshed_site_fingerprint_is_forwarded() {
         &AdapterCtx {
             live: &live,
             files: &files_a,
-            builtin_default: false,
-            enrolled_class: None,
+            pinned_provider: None,
             fresh: &fresh,
             post_settle: false,
             baseline: false,
@@ -2680,8 +2813,7 @@ fn refreshed_site_fingerprint_is_forwarded() {
         &AdapterCtx {
             live: &live,
             files: &files_b,
-            builtin_default: false,
-            enrolled_class: None,
+            pinned_provider: None,
             fresh: &fresh,
             post_settle: false,
             baseline: false,
@@ -2757,8 +2889,7 @@ impl AdaptHarness {
             &AdapterCtx {
                 live: &self.live,
                 files: &self.files,
-                builtin_default: false,
-                enrolled_class: None,
+                pinned_provider: None,
                 fresh: &self.fresh,
                 post_settle: false,
                 baseline: false,
@@ -3097,7 +3228,7 @@ fn live_observe(
         table: None,
         force_offset: None,
         provider_enrollment: None,
-        resolved_provider_class: None,
+        resolved_provider: None,
         duration,
         settle: Duration::from_millis(500),
         harvest_timeout: Duration::from_secs(30),

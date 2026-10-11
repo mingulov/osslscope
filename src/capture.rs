@@ -95,10 +95,11 @@ pub struct Config {
     /// Explicit provider-class enrollment (parsed at CLI time, so a
     /// malformed file is a usage error before any side effect).
     pub provider_enrollment: Option<ProviderTable>,
-    /// Provider class resolved at target resolution (pinned
-    /// enrollment hit, if any); consumed by evidence synthesis.
-    /// `None` until `run` resolves the target.
-    pub resolved_provider_class: Option<String>,
+    /// Provider pinned at target resolution (enrollment hit or
+    /// builtin assertion, bound to one verified object id);
+    /// consumed by evidence synthesis. `None` until `run`
+    /// resolves the target.
+    pub resolved_provider: Option<PinnedProvider>,
     pub duration: Duration,
     pub settle: Duration,
     pub harvest_timeout: Duration,
@@ -852,10 +853,11 @@ fn sort_executions(executions: &mut [Execution]) {
 // D3 — Identity/metadata synthesis. Backing and advertising object
 // ids are the mapped file's build-id fingerprint when its bytes
 // yield one, else an opaque `unverified-…` id — pathnames never
-// become identity. `provider_class` is the pinned enrollment for
-// this run's provider file when the operator enrolled it, else
-// `default` in operator-asserted builtin mode and `unknown`
-// otherwise (never guessed from `fips.so` or a rename). A missing
+// become identity. `provider_class` resolves per verified
+// advertising object (F-A/A6): the run's pin (enrollment hit, else
+// `default` in operator-asserted builtin mode) labels only the
+// pinned object id — every other object stays `unknown`, never
+// guessed from `fips.so`, a rename, or a run-wide default. A missing
 // backing or an unparsable maps device makes the site unplannable:
 // explicit loss, never a fabricated device zero. Per-site coverage
 // is `Unknown` when any candidate read badly (`status != ok`), any
@@ -995,21 +997,36 @@ fn advertising_object_id(
     }
 }
 
-/// Provider class synthesis (D3): a pinned enrollment for this
-/// run's provider file wins; else builtin mode observes the
+/// Run-pinned provider (F-A/A6): the enrollment pins a class to
+/// ONE verified object id (`build:<hex>`), never to the run — a
+/// mixed window's other objects stay `unknown`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PinnedProvider {
+    pub object: String,
+    pub class: String,
+}
+
+/// Run-pin synthesis (D3): a pinned enrollment for this run's
+/// provider file wins; else builtin mode observes the
 /// in-libcrypto provider by operator assertion and OpenSSL
-/// architecture (not a filename guess); file-provider mode stays
-/// `unknown`. One class per run (multi-provider windows share
-/// the run's pin — finer per-array classes are future work).
-fn synthesize_provider_class(builtin_default: bool, enrolled: Option<&str>) -> String {
-    if let Some(class) = enrolled {
-        return class.to_string();
+/// architecture (not a filename guess); file-provider mode pins
+/// nothing. An unknown build-id pins nothing — without an object
+/// id there is nothing to scope the pin to.
+fn pin_provider_class(
+    builtin: bool,
+    build_id: &str,
+    enrolled: Option<&str>,
+) -> Option<PinnedProvider> {
+    if build_id == "unknown" {
+        return None;
     }
-    if builtin_default {
-        "default".to_string()
-    } else {
-        "unknown".to_string()
-    }
+    let class = enrolled
+        .map(str::to_string)
+        .or_else(|| builtin.then(|| "default".to_string()))?;
+    Some(PinnedProvider {
+        object: format!("build:{build_id}"),
+        class,
+    })
 }
 
 /// Legacy display partitioning: classes of candidates advertised
@@ -1163,10 +1180,9 @@ fn degrade_all_sites(
 pub struct AdapterCtx<'a> {
     pub live: &'a [maps::Mapping],
     pub files: &'a HashMap<String, plan::FileBytes>,
-    pub builtin_default: bool,
-    /// Pinned provider class for this run's provider file, if the
-    /// operator enrolled it (wins over the builtin assertion).
-    pub enrolled_class: Option<String>,
+    /// Run-pinned provider (F-A/A6): labels only the candidate
+    /// whose verified advertising object id matches the pin.
+    pub pinned_provider: Option<PinnedProvider>,
     /// Backings first seen this round (fresh dlopen vs long-present).
     pub fresh: &'a HashSet<(String, u64)>,
     /// Past the settle grace: newly emitted long-present sites are
@@ -1312,8 +1328,7 @@ pub fn adapt_delta(
 
     // D1/D3 candidates: group by backing triple, union with the
     // accumulated set, degrade coverage, classify late attaches.
-    let provider_class =
-        synthesize_provider_class(ctx.builtin_default, ctx.enrolled_class.as_deref());
+    // The class resolves per verified advertising object (F-A/A6).
     let mut unbacked = 0u64;
     let mut unparsed_dev = 0u64;
     let mut late_attach = 0u64;
@@ -1354,9 +1369,14 @@ pub fn adapt_delta(
         } else {
             candidate.class.clone()
         };
+        let advertising = advertising_object_id(candidate, ctx.live, ctx.files);
+        let provider_class = match &ctx.pinned_provider {
+            Some(pinned) if pinned.object == advertising.0 => pinned.class.clone(),
+            _ => "unknown".to_string(),
+        };
         let identity = CandidateIdentity::new(
-            advertising_object_id(candidate, ctx.live, ctx.files),
-            provider_class.clone(),
+            advertising,
+            provider_class,
             candidate.op,
             candidate.funcid,
             vec![class],
@@ -1774,7 +1794,6 @@ where
         post_settle: bool,
         baseline: bool,
     ) -> anyhow::Result<(bool, bool)> {
-        let builtin = self.cfg.builtin;
         let delta = self.discovery.poll(PollBudget::default())?;
         let exhausted = delta.budget_exhausted;
         let adapted = adapt_delta(
@@ -1783,8 +1802,7 @@ where
             &AdapterCtx {
                 live,
                 files,
-                builtin_default: builtin,
-                enrolled_class: self.cfg.resolved_provider_class.clone(),
+                pinned_provider: self.cfg.resolved_provider.clone(),
                 fresh,
                 post_settle,
                 baseline,
@@ -3226,7 +3244,11 @@ fn effective_config(
     out.count_object = Some(objects.count.clone());
     out.provider = Some(resolved.path.clone());
     out.builtin = resolved.builtin;
-    out.resolved_provider_class = resolved.provider_class.clone();
+    out.resolved_provider = pin_provider_class(
+        resolved.builtin,
+        &resolved.build_id,
+        resolved.provider_class.as_deref(),
+    );
     out
 }
 
@@ -3757,8 +3779,7 @@ mod tests {
         AdapterCtx {
             live,
             files,
-            builtin_default: false,
-            enrolled_class: None,
+            pinned_provider: None,
             fresh,
             post_settle: false,
             baseline: false,
@@ -3775,8 +3796,7 @@ mod tests {
             &AdapterCtx {
                 live,
                 files: &files,
-                builtin_default: false,
-                enrolled_class: None,
+                pinned_provider: None,
                 fresh: &fresh,
                 post_settle: false,
                 baseline: false,
@@ -4151,9 +4171,41 @@ mod tests {
     }
 
     #[test]
-    fn adapt_provider_class_defaults() {
-        // D3: a pinned enrollment wins; else builtin mode asserts
-        // `default`; file mode stays `unknown`.
+    fn pin_provider_class_precedence() {
+        // D3/F-A/A6: a pinned enrollment wins; else builtin mode
+        // asserts `default`; file mode pins nothing; an unknown
+        // build-id pins nothing (no object to scope the pin to).
+        assert_eq!(
+            pin_provider_class(false, "ab12", Some("fips")),
+            Some(PinnedProvider {
+                object: "build:ab12".to_string(),
+                class: "fips".to_string(),
+            })
+        );
+        assert_eq!(
+            pin_provider_class(true, "ab12", Some("fips")),
+            Some(PinnedProvider {
+                object: "build:ab12".to_string(),
+                class: "fips".to_string(),
+            })
+        );
+        assert_eq!(
+            pin_provider_class(true, "ab12", None),
+            Some(PinnedProvider {
+                object: "build:ab12".to_string(),
+                class: "default".to_string(),
+            })
+        );
+        assert_eq!(pin_provider_class(false, "ab12", None), None);
+        assert_eq!(pin_provider_class(true, "unknown", Some("fips")), None);
+        assert_eq!(pin_provider_class(true, "unknown", None), None);
+    }
+
+    #[test]
+    fn adapt_provider_class_resolves_per_object() {
+        // D3/F-A/A6: the pin labels only the matching verified
+        // object — an unverified advertising id never matches, and
+        // an unpinned run labels nothing.
         let delta = DiscoveryDelta {
             candidates: vec![candidate(
                 "/p/provider.so",
@@ -4167,11 +4219,14 @@ mod tests {
             tables: vec![terminated(1, 0)],
             ..DiscoveryDelta::default()
         };
+        // Unpinned: unknown.
         let (_, out) = adapt_fresh(&delta, &[]);
         assert_eq!(
             out.delta.discovered[0].candidates[0].provider_class,
             "unknown"
         );
+        // Pinned, but no live mapping resolves the advertising —
+        // the anonymous id is not the pinned object: unknown.
         let mut state = AdapterState::default();
         let files = HashMap::new();
         let fresh = HashSet::new();
@@ -4181,8 +4236,10 @@ mod tests {
             &AdapterCtx {
                 live: &[],
                 files: &files,
-                builtin_default: true,
-                enrolled_class: None,
+                pinned_provider: Some(PinnedProvider {
+                    object: "build:ab12".to_string(),
+                    class: "fips".to_string(),
+                }),
                 fresh: &fresh,
                 post_settle: false,
                 baseline: false,
@@ -4190,24 +4247,8 @@ mod tests {
         );
         assert_eq!(
             out.delta.discovered[0].candidates[0].provider_class,
-            "default"
+            "unknown"
         );
-        // Pinned enrollment wins over the builtin assertion.
-        let mut state = AdapterState::default();
-        let out = adapt_delta(
-            &mut state,
-            &delta,
-            &AdapterCtx {
-                live: &[],
-                files: &files,
-                builtin_default: true,
-                enrolled_class: Some("fips".to_string()),
-                fresh: &fresh,
-                post_settle: false,
-                baseline: false,
-            },
-        );
-        assert_eq!(out.delta.discovered[0].candidates[0].provider_class, "fips");
     }
 
     #[test]
@@ -4247,8 +4288,7 @@ mod tests {
             &AdapterCtx {
                 live: &[],
                 files: &files,
-                builtin_default: false,
-                enrolled_class: None,
+                pinned_provider: None,
                 fresh: &fresh,
                 post_settle: true,
                 baseline: false,
@@ -4296,8 +4336,7 @@ mod tests {
             &AdapterCtx {
                 live: &[],
                 files: &files,
-                builtin_default: false,
-                enrolled_class: None,
+                pinned_provider: None,
                 fresh: &fresh,
                 post_settle: false,
                 baseline: true,
