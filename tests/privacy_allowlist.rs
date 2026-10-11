@@ -99,8 +99,16 @@ fn map_inventory_matches_sources() {
     let (doc_harvest, doc_count) = inventory_from_doc();
     let src_harvest = maps_from_source(&manifest_dir().join("crates/ebpf/src/bin/harvest.rs"));
     let src_count = maps_from_source(&manifest_dir().join("crates/ebpf/src/bin/count.rs"));
-    assert_eq!(src_harvest.len(), 13, "unexpected harvest map count: {src_harvest:?}");
-    assert_eq!(src_count.len(), 5, "unexpected count map count: {src_count:?}");
+    assert_eq!(
+        src_harvest.len(),
+        13,
+        "unexpected harvest map count: {src_harvest:?}"
+    );
+    assert_eq!(
+        src_count.len(),
+        5,
+        "unexpected count map count: {src_count:?}"
+    );
     assert_eq!(
         doc_harvest, src_harvest,
         "allowlist harvest inventory drifted from eBPF maps"
