@@ -732,6 +732,16 @@ impl<B: CountBackend> CountSession<B> {
         // fence is cleanly retryable. Committing userspace first
         // would strand a usable session on a stale kernel epoch.
         self.backend.set_generation(next)?;
+        // Seal reads LIVE provenance (pending applies below, after
+        // the seal): staged identity changes are the NEW
+        // generation's meaning and must not relabel old counts.
+        // Coverage-only staged downgrades therefore seal stale —
+        // by design, not oversight: close-time revision (H2)
+        // owns final truth (it revisits every fenced + current
+        // site against final taint), and the seal-time value is
+        // unobservable except through the revised doc. Do NOT
+        // "fix" the order without splitting identity (post-seal)
+        // from coverage (pre-seal) per staged entry.
         let mut sites: Vec<SiteExecution> = Vec::new();
         for (cookie, total) in &self.current {
             if total.count == 0 {

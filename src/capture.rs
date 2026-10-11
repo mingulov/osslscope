@@ -2885,7 +2885,7 @@ where
     fn assemble(
         mut self,
         snapshot: DiscoverySnapshot,
-        drain: CountDrain,
+        mut drain: CountDrain,
         disposition: target::TargetDisposition,
         effective_end_ns: u64,
     ) -> Capture {
@@ -2943,13 +2943,29 @@ where
                 self.relevance_capped,
             ));
         }
+        // Post-exit maps reads miss nothing (the target is reaped,
+        // its /proc entry gone — the expected close single); live
+        // targets have no benign maps failure. Needed before the
+        // residual loop: the maps-source residual is exempt below.
+        let target_exited = matches!(disposition, target::TargetDisposition::Exited { .. });
         // Close reconcile (D2/D4): increments rode the deltas; only
         // the close-tail residual lands here, exactly once.
+        let mut loss_residual_any = false;
         for (source, total) in &snapshot.losses {
             let adapted = self.adapter.loss_sums.get(source).copied().unwrap_or(0);
             if let Some(residual) = total.checked_sub(adapted) {
                 if residual > 0 {
                     self.extra_loss.push(classify_loss(*source, residual));
+                    // H2/T5: mid-run maps failures rode the deltas
+                    // (op None → poll-global taint already fired),
+                    // so a maps residual under an exited target is
+                    // the close-only benign single — exempt. Every
+                    // other source, and maps under a live target,
+                    // taints: round errors are fatal (fail, never a
+                    // silent delta drop), so residuals are real.
+                    if !target_exited || *source != coverage::HOST_MAPS_READ {
+                        loss_residual_any = true;
+                    }
                 }
             }
         }
@@ -3144,6 +3160,39 @@ where
                 .and_modify(|t| *t &= term)
                 .or_insert(term);
         }
+        // H2 close-taint computation (A-6): close residuals that
+        // never rode a poll delta taint here, before coverage.
+        // EXTENSIBLE: H7 adds close-error inputs to this set —
+        // keep the evidence/census split (sites vs denominators).
+        let drain_shortfall = drain
+            .counters
+            .iter()
+            .find(|c| c.name == "count.drain_shortfall")
+            .map(|c| c.value)
+            .unwrap_or(0);
+        // Evidence taint (sites + denominators Unknown): the
+        // snapshot collapses per-source totals, so residuals
+        // taint globally — op info exists only in poll-time
+        // deltas (already tainted then).
+        // `maps_read_failed` always taints (H2/T5b): the counter
+        // increments only on the live-round path (round()
+        // reaps-or-continues first — no post-exit site exists),
+        // so every count is mid-window turnover blindness. The
+        // benign post-exit single lives on the discovery side
+        // (HOST_MAPS_READ residual, exempt above).
+        let close_evidence_global = loss_residual_any
+            || snapshot.lossy_slots > 0
+            || !snapshot.dispatch.attach_failures.is_empty()
+            || !snapshot.retained_reasons.is_empty()
+            || self.relevance_capped > 0
+            || drain_shortfall > 0
+            || self.maps_read_failed > 0;
+        let close_evidence_ops: HashSet<u32> =
+            snapshot.truncated_ops.iter().map(|(op, _)| *op).collect();
+        // Census taint (denominators Unknown, emitted+proven sites
+        // stand — all site evidence is in-window by construction).
+        let close_census_global =
+            self.cold_gap_queries > 0 || self.lifecycle_loss > 0 || self.fallback_partial;
         let mut coverage = Vec::new();
         for op in self.adapter.ops() {
             let terminated = snap_term
@@ -3154,7 +3203,12 @@ where
             let attached = self.op_attached(op);
             // A7: a tainted op's discovered count is no denominator
             // (a lost ROW may hide a site or an identity).
-            let known = terminated && !self.adapter.loss_tainted(op);
+            // H2: final taint (poll ∪ close, evidence ∪ census).
+            let known = terminated
+                && !self.adapter.loss_tainted(op)
+                && !close_evidence_global
+                && !close_evidence_ops.contains(&op)
+                && !close_census_global;
             coverage.push(ScopeCoverage {
                 scope: format!("op:{op}"),
                 expected: if known {
@@ -3204,10 +3258,19 @@ where
                 attached: 0,
             });
         }
+        // H2: the dispatch surface is a denominator too (B-3b) —
+        // global evidence taint (poll ∪ close) means it was not
+        // fully observed. Op-localized truncation leaves the
+        // dispatch anchor claim standing.
+        let dispatch_known = !self.adapter.taint_global && !close_evidence_global;
         if snapshot.dispatch.attached {
             coverage.push(ScopeCoverage {
                 scope: "dispatch".to_string(),
-                expected: ExpectedScope::Applicable { sites: 1 },
+                expected: if dispatch_known {
+                    ExpectedScope::Applicable { sites: 1 }
+                } else {
+                    ExpectedScope::Unknown
+                },
                 discovered: 1,
                 attached: 1,
             });
@@ -3235,6 +3298,33 @@ where
         } else {
             None
         };
+        // H2 retrospective revision (A-6/B-3b): final evidence
+        // taint (poll ∪ close) revises every claimed site —
+        // current AND fenced — before the doc is built. Census
+        // taint never touches sites (emitted+proven sites are
+        // in-window by construction). (adapter.emitted needs no
+        // revision: Capture carries no adapter — the doc's sites
+        // come from this drain alone.)
+        {
+            let poll_global = self.adapter.taint_global;
+            let site_tainted = |site: &SiteExecution| {
+                close_evidence_global
+                    || poll_global
+                    || site.candidates.iter().any(|c| {
+                        close_evidence_ops.contains(&c.op)
+                            || self.adapter.tainted_ops.contains(&c.op)
+                    })
+            };
+            for site in drain
+                .current
+                .iter_mut()
+                .chain(drain.fenced.iter_mut().flat_map(|g| g.sites.iter_mut()))
+            {
+                if site.candidates_coverage == CandidateCoverage::Complete && site_tainted(site) {
+                    site.candidates_coverage = CandidateCoverage::Unknown;
+                }
+            }
+        }
         let mut counters = drain.counters.clone();
         counters.extend(self.activity.iter().cloned());
         counters.extend(self.extra_loss.iter().cloned());
