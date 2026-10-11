@@ -57,7 +57,7 @@ pub struct ProgSpec {
 /// F-C/A8: the five counter/flag maps (`LOSS`, `TRUNC`, `CALLS`,
 /// `TRIP`, `LGCALLS`) are per-CPU hash (type 5) — exact
 /// single-writer slots replace racy shared read-modify-write.
-pub const HARVEST_MAPS: [MapSpec; 12] = [
+pub const HARVEST_MAPS: [MapSpec; 13] = [
     MapSpec {
         name: "EVENTS",
         map_type: 27,
@@ -84,6 +84,14 @@ pub const HARVEST_MAPS: [MapSpec; 12] = [
     },
     MapSpec {
         name: "TERMD",
+        map_type: 1,
+        key_size: 8,
+        value_size: 8,
+        max_entries: 1024,
+        flags: 0,
+    },
+    MapSpec {
+        name: "GEN",
         map_type: 1,
         key_size: 8,
         value_size: 8,

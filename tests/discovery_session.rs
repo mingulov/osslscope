@@ -8,7 +8,9 @@
 //! and live-loss cases need a privileged lane; they stay NOT-RUN here
 //! (lane pending) and are covered by the C4 suite.
 
-use osslscope::discovery::coverage::{HOST_DRAIN_SHORTFALL, HOST_ORPHAN_ROW, loss_source_name};
+use osslscope::discovery::coverage::{
+    HOST_DRAIN_SHORTFALL, HOST_EVICT_FAILED, HOST_ORPHAN_ROW, HOST_STRAGGLER, loss_source_name,
+};
 use osslscope::discovery::legacy::{Probe, ProbeSet};
 use osslscope::discovery::maps::Mapping;
 use osslscope::discovery::session::{
@@ -28,8 +30,16 @@ const LEGACY_SO: &str = "/p/ossl-modules/legacy.so";
 // Synthetic wire encoders (field layouts mirror ebpf-common repr(C) structs).
 // ---------------------------------------------------------------------------
 
-fn enc_row(kind: u32, op: u32, funcid: u32, addr: u64, aux: u64, idx: u64) -> Vec<u8> {
-    let mut b = Vec::with_capacity(40);
+fn enc_row(
+    kind: u32,
+    op: u32,
+    funcid: u32,
+    addr: u64,
+    aux: u64,
+    idx: u64,
+    generation: u64,
+) -> Vec<u8> {
+    let mut b = Vec::with_capacity(48);
     b.extend_from_slice(&kind.to_le_bytes());
     b.extend_from_slice(&op.to_le_bytes());
     b.extend_from_slice(&funcid.to_le_bytes());
@@ -37,11 +47,20 @@ fn enc_row(kind: u32, op: u32, funcid: u32, addr: u64, aux: u64, idx: u64) -> Ve
     b.extend_from_slice(&addr.to_le_bytes());
     b.extend_from_slice(&aux.to_le_bytes());
     b.extend_from_slice(&idx.to_le_bytes());
+    b.extend_from_slice(&generation.to_le_bytes());
     b
 }
 
-fn enc_alg(op: u32, class: u16, status: u8, weak: u8, arr: u64, idx: u64) -> Vec<u8> {
-    let mut b = Vec::with_capacity(32);
+fn enc_alg(
+    op: u32,
+    class: u16,
+    status: u8,
+    weak: u8,
+    arr: u64,
+    idx: u64,
+    generation: u64,
+) -> Vec<u8> {
+    let mut b = Vec::with_capacity(40);
     b.extend_from_slice(&wire::KIND_ALG.to_le_bytes());
     b.extend_from_slice(&op.to_le_bytes());
     b.extend_from_slice(&class.to_le_bytes());
@@ -50,6 +69,7 @@ fn enc_alg(op: u32, class: u16, status: u8, weak: u8, arr: u64, idx: u64) -> Vec
     b.extend_from_slice(&0u32.to_le_bytes());
     b.extend_from_slice(&arr.to_le_bytes());
     b.extend_from_slice(&idx.to_le_bytes());
+    b.extend_from_slice(&generation.to_le_bytes());
     b
 }
 
@@ -76,15 +96,37 @@ fn enc_init(addr: u64, cookie: u64) -> Vec<u8> {
 }
 
 fn query_ret(op: u32, arr: u64, slot: u64) -> Vec<u8> {
-    enc_row(wire::KIND_QUERY_RET, op, 0, arr, 0, slot)
+    enc_row(wire::KIND_QUERY_RET, op, 0, arr, 0, slot, 0)
 }
 
 fn ok_alg(op: u32, arr: u64, idx: u64) -> Vec<u8> {
-    enc_alg(op, 0, wire::ALG_OK, 0, arr, idx)
+    enc_alg(op, 0, wire::ALG_OK, 0, arr, idx, 0)
 }
 
 fn dispatch_row(op: u32, funcid: u32, impl_addr: u64, arr: u64, idx: u64) -> Vec<u8> {
-    enc_row(wire::KIND_ROW, op, funcid, impl_addr, arr, idx)
+    enc_row(wire::KIND_ROW, op, funcid, impl_addr, arr, idx, 0)
+}
+
+/// Gen-stamped variants (F-H/H1): the stamp is the record's
+/// production incarnation — 0 pre-install genuine, N the value
+/// `GEN[arr]` held when BPF emitted it.
+fn query_ret_gen(op: u32, arr: u64, slot: u64, generation: u64) -> Vec<u8> {
+    enc_row(wire::KIND_QUERY_RET, op, 0, arr, 0, slot, generation)
+}
+
+fn ok_alg_gen(op: u32, arr: u64, idx: u64, generation: u64) -> Vec<u8> {
+    enc_alg(op, 0, wire::ALG_OK, 0, arr, idx, generation)
+}
+
+fn dispatch_row_gen(
+    op: u32,
+    funcid: u32,
+    impl_addr: u64,
+    arr: u64,
+    idx: u64,
+    generation: u64,
+) -> Vec<u8> {
+    enc_row(wire::KIND_ROW, op, funcid, impl_addr, arr, idx, generation)
 }
 
 // ---------------------------------------------------------------------------
@@ -194,6 +236,8 @@ struct TestEnv {
     quiesced: bool,
     evicted: Vec<u64>,
     evict_fail: bool,
+    gen_map: HashMap<u64, u64>,
+    gen_failures: u32,
 }
 
 impl TestEnv {
@@ -216,6 +260,8 @@ impl TestEnv {
             quiesced: false,
             evicted: Vec::new(),
             evict_fail: false,
+            gen_map: HashMap::new(),
+            gen_failures: 0,
         }
     }
 
@@ -290,7 +336,17 @@ impl SessionEnv for TestEnv {
         // Faithful fake: eviction deletes kernel state, so later
         // joins stop reporting the retired proof.
         self.staged.termd.retain(|(a, _)| *a != arr);
+        self.gen_map.remove(&arr);
         self.evicted.push(arr);
+        Ok(())
+    }
+
+    fn install_generation(&mut self, arr: u64, generation: u64) -> anyhow::Result<()> {
+        if self.gen_failures > 0 {
+            self.gen_failures -= 1;
+            anyhow::bail!("injected generation-install failure for array {arr:#x}");
+        }
+        self.gen_map.insert(arr, generation);
         Ok(())
     }
 
@@ -406,6 +462,104 @@ fn late_query_existing_mapping_emits_delta() {
         snap.tables[0].state,
         osslscope::discovery::session::CoverageState::InProgress { walked: 4 }
     ));
+}
+
+#[test]
+fn h1_t1_queued_row_never_gains_replacement_provenance() {
+    // A-1: a dispatch row queued (in the ring) BEFORE a provider
+    // replacement but ingested AFTER it must never surface carrying
+    // the replacement's triple. Pre-fix the bounded drain leaves the
+    // row for the next poll, which attributes it against the new
+    // maps — A's evidence gains B's provenance.
+    let mut env = TestEnv::new();
+    let mut core = test_core(false);
+    let d0 = core.poll(&mut env, ample_budget()).unwrap();
+    assert!(d0.candidates.is_empty());
+
+    let arr = 0x7f00_1000u64;
+    let imp = 0x7f00_2000u64;
+    env.push(query_ret(OP_DIGEST, arr, 3));
+    for idx in 0..4u64 {
+        env.push(ok_alg(OP_DIGEST, arr, idx));
+    }
+    // The row is produced after the bootstrap install lands, so it
+    // carries generation 1 (the query + algs above are pre-install
+    // genuine, stamp 0).
+    env.push(dispatch_row_gen(OP_DIGEST, 3, imp, arr, 3, 1));
+    // Budget 5: query + 4 algs ingested, the row stays queued
+    // (stash) for the next poll.
+    let d1 = core.poll(&mut env, PollBudget::new(5, 64)).unwrap();
+    assert!(d1.budget_exhausted);
+    assert!(d1.candidates.is_empty());
+
+    // A→B replacement: same addresses and pathname, new file
+    // identity.
+    let (exe, _a_dev, _a_ino) = provider_file();
+    let exe = exe.to_string_lossy().into_owned();
+    let b_dev = "08:02";
+    let b_ino = 999u64;
+    env.maps = vec![
+        mapping(0x7f00_0000, 0x10000, true, 0, b_dev, b_ino, &exe),
+        mapping(0x7f01_0000, 0x10000, true, 0, "08:01", 200, LIBCRYPTO),
+        mapping(0x7f02_0000, 0x10000, true, 0, "08:01", 300, LEGACY_SO),
+    ];
+    let d2 = core.poll(&mut env, ample_budget()).unwrap();
+    // The pre-replacement row must never wear B's triple.
+    for c in &d2.candidates {
+        let triple = c.backing.as_ref().map(|b| (b.dev.as_str(), b.ino));
+        assert_ne!(
+            triple,
+            Some((b_dev, b_ino)),
+            "straggler row gained replacement provenance"
+        );
+    }
+    // Stronger: the row drops outright (retired generation 1 vs
+    // the rebirth's 2) with explicit op-localized loss — and the
+    // bump landed in the (fake) kernel map.
+    assert!(d2.candidates.is_empty());
+    assert_eq!(env.gen_map.get(&arr).copied(), Some(2));
+    let losses = losses_of(&core.snapshot());
+    assert!(losses.get(&HOST_STRAGGLER).copied().unwrap_or(0) >= 1);
+    assert!(
+        d2.losses
+            .iter()
+            .any(|l| l.source == HOST_STRAGGLER && l.op == Some(OP_DIGEST) && l.count >= 1),
+        "straggler loss must localize to the row's op"
+    );
+}
+
+#[test]
+fn h1_t1f_failed_bootstrap_binds_nothing_and_retries() {
+    // Install failure fails soft, never half-bound and never
+    // silent: no epoch is minted, explicit loss is recorded, and
+    // the next record re-bootstraps cleanly.
+    let mut env = TestEnv::new();
+    let mut core = test_core(false);
+    let d0 = core.poll(&mut env, ample_budget()).unwrap();
+    assert!(d0.candidates.is_empty());
+
+    let arr = 0x7f00_1000u64;
+    env.gen_failures = 1;
+    env.push(query_ret(OP_DIGEST, arr, 3));
+    let d1 = core.poll(&mut env, ample_budget()).unwrap();
+    // Liveness is genuine (the record arrived) but nothing
+    // epoch-scoped joined: no table, no walked state.
+    assert!(d1.candidates.is_empty());
+    assert!(core.snapshot().tables.is_empty());
+    let losses = losses_of(&core.snapshot());
+    assert!(losses.get(&HOST_EVICT_FAILED).copied().unwrap_or(0) >= 1);
+    assert!(!env.gen_map.contains_key(&arr));
+
+    // The next record retries the bootstrap and binds normally.
+    env.push(query_ret(OP_DIGEST, arr, 3));
+    for idx in 0..4u64 {
+        env.push(ok_alg(OP_DIGEST, arr, idx));
+    }
+    let imp = 0x7f00_2000u64;
+    env.push(dispatch_row_gen(OP_DIGEST, 3, imp, arr, 3, 1));
+    let d2 = core.poll(&mut env, ample_budget()).unwrap();
+    assert_eq!(d2.candidates.len(), 1);
+    assert_eq!(env.gen_map.get(&arr).copied(), Some(1));
 }
 
 #[test]
@@ -774,6 +928,7 @@ fn one_query_full_walk_covers_late_slot() {
                 0,
                 arr,
                 idx,
+                0,
             ));
         } else {
             env.push(ok_alg(OP_SIGNATURE, arr, idx));
@@ -856,11 +1011,12 @@ fn shrinkage_proof_does_not_carry() {
     // events keep the old era; only post-turnover polls walk the
     // new epoch).
     assert!(matches!(snap.tables[0].state, CoverageState::Unseen));
-    // A post-turnover walk (unambiguously new-era) starts a
-    // prefix: one walked slot against the evicted len-5 proof,
-    // and the new epoch must re-prove from scratch.
-    env.push(query_ret(OP_DIGEST, arr, 0));
-    env.push(ok_alg(OP_DIGEST, arr, 0));
+    // A post-turnover walk (unambiguously new-era — stamped
+    // with the rebirth's generation 2) starts a prefix: one
+    // walked slot against the evicted len-5 proof, and the new
+    // epoch must re-prove from scratch.
+    env.push(query_ret_gen(OP_DIGEST, arr, 0, 2));
+    env.push(ok_alg_gen(OP_DIGEST, arr, 0, 2));
     core.poll(&mut env, ample_budget()).unwrap();
     let snap = core.snapshot();
     assert_eq!(snap.tables.len(), 1);
@@ -1298,70 +1454,91 @@ fn repeat_init_unresolvable_suspects_anon_only() {
 }
 
 #[test]
-fn stragglers_keep_old_epoch_across_turnover() {
-    // F-A/A4: the drain runs before reconcile, so a late-arriving
-    // row for a never-before-seen slot joins the OLD epoch — never
-    // the rebirth. (Reconcile-first stamped it with the new epoch:
-    // A's evidence attributed to B.)
+fn stragglers_drop_with_loss_across_turnover() {
+    // F-H/H1 (supersedes the F-A/A4 join-old-epoch rule): the
+    // turnover reconcile runs before the drain and bumps the
+    // array's generation, so a late-arriving record stamped with
+    // the retired generation drops with explicit op-localized
+    // loss — it joins neither the old epoch nor the rebirth.
+    // (Joining the old epoch attributed A's evidence against B's
+    // mappings; the generation cookie removes the order's stamp
+    // path entirely.)
     let mut env = TestEnv::new();
     let mut core = test_core(false);
     let arr = 0x7f00_1000u64;
     walk_row(&mut env, &mut core, arr, 0, 7, 0x7f00_2000);
     let e0 = epoch_of(&core.snapshot().candidates, arr);
 
-    // Same address, replacement inode + a straggler for a fresh slot.
+    // Same address, replacement inode + stragglers (stamped with
+    // the retired generation 1) for a fresh slot.
     env.maps = vec![
         mapping(0x7f00_0000, 0x10000, true, 0, "08:01", 101, PROVIDER),
         mapping(0x7f01_0000, 0x20000, true, 0, "08:01", 200, LIBCRYPTO),
     ];
-    env.push(ok_alg(OP_DIGEST, arr, 9));
-    env.push(dispatch_row(OP_DIGEST, 8, 0x7f00_2010, arr, 9));
+    env.push(ok_alg_gen(OP_DIGEST, arr, 9, 1));
+    env.push(dispatch_row_gen(OP_DIGEST, 8, 0x7f00_2010, arr, 9, 1));
     let d = core.poll(&mut env, ample_budget()).unwrap();
     assert_eq!(d.retirements.len(), 1);
     assert_eq!(d.retirements[0].epoch, e0);
-    assert_eq!(d.candidates.len(), 1);
-    assert_eq!(
-        d.candidates[0].epoch, e0,
-        "straggler must keep its era, not the rebirth"
+    assert!(d.candidates.is_empty(), "stragglers must drop, not join");
+    assert!(
+        d.losses
+            .iter()
+            .any(|l| l.source == HOST_STRAGGLER && l.op == Some(OP_DIGEST) && l.count >= 2),
+        "both stragglers must surface as op-localized loss"
     );
 }
 
 #[test]
-fn rebirth_rewalk_heals_candidate_epoch() {
-    // F-A/A4: new-epoch rows first arrive stamped with the retired
-    // epoch (one poll stale — the drain precedes reconcile); the
-    // next re-walk refreshes them to the live epoch and re-emits.
+fn rebirth_records_join_live_epoch_directly() {
+    // F-H/H1 (supersedes the F-A/A4 transitional stamp + heal):
+    // the turnover reconcile runs before the drain, so there is
+    // no stale-epoch window — records the rebirth produces (new
+    // generation stamp) join the live epoch directly, and a
+    // same-generation re-walk stays silent (H1-T6: no heal needed,
+    // nothing to heal).
     let mut env = TestEnv::new();
     let mut core = test_core(false);
     let arr = 0x7f00_1000u64;
     walk_row(&mut env, &mut core, arr, 0, 7, 0x7f00_2000);
     let e0 = epoch_of(&core.snapshot().candidates, arr);
 
+    // Turnover with no records: the epoch rebirths and waits for
+    // genuinely new evidence (no transitional stamp exists).
     env.maps = vec![
         mapping(0x7f00_0000, 0x10000, true, 0, "08:01", 101, PROVIDER),
         mapping(0x7f01_0000, 0x20000, true, 0, "08:01", 200, LIBCRYPTO),
     ];
-    env.push(query_ret(OP_DIGEST, arr, 1));
-    env.push(ok_alg(OP_DIGEST, arr, 1));
-    env.push(dispatch_row(OP_DIGEST, 8, 0x7f00_2010, arr, 1));
     let d = core.poll(&mut env, ample_budget()).unwrap();
     assert_eq!(d.retirements.len(), 1);
-    assert_eq!(d.candidates.len(), 1);
-    assert_eq!(d.candidates[0].epoch, e0, "transitional old stamp");
+    assert_eq!(d.retirements[0].epoch, e0);
+    assert!(d.candidates.is_empty());
+    let e1 = core.snapshot().tables[0].epoch;
+    assert_ne!(e1, e0);
 
-    // Same rows re-walked: epoch heals to the rebirth and re-emits
-    // (the refresh carries the epoch, not just remap identity).
-    env.push(query_ret(OP_DIGEST, arr, 1));
-    env.push(ok_alg(OP_DIGEST, arr, 1));
-    env.push(dispatch_row(OP_DIGEST, 8, 0x7f00_2010, arr, 1));
+    // New-incarnation records (rebirth's generation 2) join the
+    // live epoch directly — never a retired stamp.
+    env.push(query_ret_gen(OP_DIGEST, arr, 1, 2));
+    env.push(ok_alg_gen(OP_DIGEST, arr, 1, 2));
+    env.push(dispatch_row_gen(OP_DIGEST, 8, 0x7f00_2010, arr, 1, 2));
     let d = core.poll(&mut env, ample_budget()).unwrap();
     assert!(d.retirements.is_empty());
-    assert_eq!(d.candidates.len(), 1, "epoch heal must re-emit");
-    let e1 = d.candidates[0].epoch;
-    assert_ne!(e1, e0);
+    assert_eq!(d.candidates.len(), 1);
+    assert_eq!(d.candidates[0].epoch, e1, "live epoch, first walk");
     assert!(
         core.snapshot().tables.iter().any(|t| t.epoch == e1),
-        "healed epoch is the live table"
+        "joined epoch is the live table"
+    );
+
+    // Same-generation re-walk: duplicate key, same epoch, silent.
+    env.push(query_ret_gen(OP_DIGEST, arr, 1, 2));
+    env.push(ok_alg_gen(OP_DIGEST, arr, 1, 2));
+    env.push(dispatch_row_gen(OP_DIGEST, 8, 0x7f00_2010, arr, 1, 2));
+    let d = core.poll(&mut env, ample_budget()).unwrap();
+    assert!(d.retirements.is_empty());
+    assert!(
+        d.candidates.is_empty(),
+        "same-generation re-query must stay silent"
     );
 }
 

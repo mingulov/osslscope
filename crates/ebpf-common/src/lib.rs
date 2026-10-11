@@ -211,9 +211,14 @@ pub const LOAD_LEGACY: u16 = 1;
 pub const LOAD_DEFAULT: u16 = 2;
 pub const LOAD_FIPS: u16 = 3;
 
-/// Classified algorithm record: 32 bytes. `arr`/`idx` are the
+/// Classified algorithm record: 40 bytes. `arr`/`idx` are the
 /// internal structural join keys (array base + alg index) consumed
-/// at relocation/attribution and never serialized.
+/// at relocation/attribution and never serialized. `gen` is the
+/// producer-side incarnation cookie (F-H/H1): the value of
+/// `GEN[arr]` when BPF emitted the record (0 when the map has no
+/// entry yet — the array's first observation). The host drops any
+/// record whose `gen` disagrees with the array's current
+/// generation instead of attributing it against newer mappings.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AlgEvent {
@@ -225,9 +230,10 @@ pub struct AlgEvent {
     pub _pad: u32,
     pub arr: u64,
     pub idx: u64,
+    pub generation: u64,
 }
 
-const _: () = assert!(size_of::<AlgEvent>() == 32);
+const _: () = assert!(size_of::<AlgEvent>() == 40);
 const _: () = assert!(align_of::<AlgEvent>() == 8);
 
 /// Classified tripwire hit: 16 bytes. `cookie` selects the probe
@@ -246,8 +252,13 @@ pub struct TripEvent {
 const _: () = assert!(size_of::<TripEvent>() == 16);
 const _: () = assert!(align_of::<TripEvent>() == 4);
 
-/// Dispatch row: 40 bytes, unchanged shape (no strings by
-/// construction). Shared here so BPF cannot drift the layout.
+/// Dispatch row: 48 bytes (no strings by construction). Shared
+/// here so BPF cannot drift the layout. `gen` is the
+/// producer-side incarnation cookie (F-H/H1): the value of
+/// `GEN[arr]` when BPF emitted the row (0 when the map has no
+/// entry yet — the array's first observation). The host drops any
+/// row whose `gen` disagrees with the array's current generation
+/// instead of attributing it against newer mappings.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RowEvent {
@@ -258,9 +269,10 @@ pub struct RowEvent {
     pub addr: u64,
     pub aux: u64,
     pub idx: u64,
+    pub generation: u64,
 }
 
-const _: () = assert!(size_of::<RowEvent>() == 40);
+const _: () = assert!(size_of::<RowEvent>() == 48);
 const _: () = assert!(align_of::<RowEvent>() == 8);
 
 /// Init-return anchor report: 32 bytes (`addr` = query-fn address
