@@ -470,7 +470,7 @@ impl<B: CountBackend> CountSession<B> {
         &mut self,
         delta: &CountDelta,
         live: &[maps::Mapping],
-        files: &HashMap<String, Vec<u8>>,
+        files: &HashMap<String, plan::FileBytes>,
     ) -> anyhow::Result<AttachReport> {
         if self.closed {
             anyhow::bail!("count session is closed");

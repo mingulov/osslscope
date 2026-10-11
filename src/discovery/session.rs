@@ -211,6 +211,11 @@ pub struct DiscoveredCandidate {
     /// Array owner's mapped locator (`""` for anonymous/unmapped
     /// arrays).
     pub advertising: String,
+    /// Array owner's discovery-time identity (F-A/A3): capture
+    /// verifies the array's CURRENT owner against this instead of
+    /// re-resolving the bare locator (empty/zero for anonymous).
+    pub advertising_dev: String,
+    pub advertising_ino: u64,
     pub backing: Option<BackingRef>,
     pub op: u32,
     pub funcid: u32,
@@ -1288,7 +1293,7 @@ impl SessionCore {
                     ev.addr,
                     ev.aux,
                 );
-                let advertising = array_owner(maps, ev.aux);
+                let (advertising, advertising_dev, advertising_ino) = array_owner(maps, ev.aux);
                 let (backing, locator) = attribute_impl(maps, &self.provider, &self.canon, ev.addr);
                 if let Some(&i) = self.seen.get(&key) {
                     // Duplicate key (multi-libctx re-query): refresh
@@ -1298,8 +1303,13 @@ impl SessionCore {
                     // unmap) never overwrites an attested triple —
                     // the render re-derives from live maps.
                     let mut changed = false;
-                    if self.candidates[i].advertising != advertising {
+                    if self.candidates[i].advertising != advertising
+                        || self.candidates[i].advertising_dev != advertising_dev
+                        || self.candidates[i].advertising_ino != advertising_ino
+                    {
                         self.candidates[i].advertising = advertising;
+                        self.candidates[i].advertising_dev = advertising_dev;
+                        self.candidates[i].advertising_ino = advertising_ino;
                         changed = true;
                     }
                     if let Some(b) = &backing
@@ -1335,6 +1345,8 @@ impl SessionCore {
                     }
                     let candidate = DiscoveredCandidate {
                         advertising,
+                        advertising_dev,
+                        advertising_ino,
                         backing,
                         op: ev.op,
                         funcid: ev.funcid,
@@ -1527,13 +1539,15 @@ impl SessionCore {
     }
 }
 
-/// Advertising identity for one array: the mapped path of the
-/// file owning the array, or `""` for anonymous/unmapped arrays
-/// (which carry no attributable owner).
-fn array_owner(maps: &[maps::Mapping], arr: u64) -> String {
+/// Advertising identity for one array: the owning mapping's
+/// (path, dev, ino) triple, or empty/zero for anonymous/unmapped
+/// arrays (which carry no attributable owner). The triple travels
+/// on the candidate (F-A/A3) so capture verifies the array's
+/// current owner instead of re-resolving a bare locator.
+fn array_owner(maps: &[maps::Mapping], arr: u64) -> (String, String, u64) {
     maps.iter()
         .find(|m| m.start <= arr && arr < m.end && m.ino != 0)
-        .map(|m| m.path.clone())
+        .map(|m| (m.path.clone(), m.dev.clone(), m.ino))
         .unwrap_or_default()
 }
 
@@ -2415,11 +2429,17 @@ mod tests {
     fn attribution_splits_advertising_and_backing() {
         let m = sample_maps();
         // Array owner is the file mapping covering the array.
-        assert_eq!(array_owner(&m, 0x1400), "/prov.so");
-        assert_eq!(array_owner(&m, 0x3500), "/lib/libcrypto.so");
+        assert_eq!(
+            array_owner(&m, 0x1400),
+            ("/prov.so".to_string(), "08:01".to_string(), 7)
+        );
+        assert_eq!(
+            array_owner(&m, 0x3500),
+            ("/lib/libcrypto.so".to_string(), "08:01".to_string(), 9)
+        );
         // Anonymous/unmapped arrays carry no attributable owner.
-        assert_eq!(array_owner(&m, 0x5500), "");
-        assert_eq!(array_owner(&m, 0x9000), "");
+        assert_eq!(array_owner(&m, 0x5500), (String::new(), String::new(), 0));
+        assert_eq!(array_owner(&m, 0x9000), (String::new(), String::new(), 0));
         // Backing prefers the provider mapping, then any file
         // mapping, else unbacked (render fences it). The canon is
         // a realistic non-empty path (live canonicalize only

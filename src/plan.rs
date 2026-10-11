@@ -222,13 +222,73 @@ pub fn binding_holds<T: PartialEq>(before: &Option<T>, after: &Option<T>, expect
     before.as_ref() == Some(expected) && after.as_ref() == Some(expected)
 }
 
+/// One round's read of a mapped file: bytes plus the read-time
+/// identity (F-A/A3). The identity binds the bytes to the mapping
+/// they are looked up for — a same-path replacement between the
+/// maps read and the files read must not lend the new file's bytes
+/// (or fingerprint) to the old mapping. `dev` is the encoded
+/// device (same domain as [`sample_backing`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileBytes {
+    pub bytes: Vec<u8>,
+    pub dev: u64,
+    pub ino: u64,
+}
+
+/// Identity-bound byte lookup (F-A/A3): the bytes read for `path`
+/// serve a mapping with inode `ino` only when the read-time inode
+/// matches. No lookup-time stat: maps and files are round-consistent
+/// artifacts (both sampled in-round), so a replacement between the
+/// two samples surfaces as an identity mismatch, while a replacement
+/// after both keeps the round consistently old. Device domains are
+/// never compared (maps text vs stat diverge on overlayfs — the
+/// inode suffices because a mapped inode's number cannot be reused
+/// while the mapping pins it). Cross-mount-namespace observation is
+/// out of model (operator co-locates; see attach-failures.md pidns).
+pub fn bound_bytes<'a>(
+    files: &'a HashMap<String, FileBytes>,
+    path: &str,
+    ino: u64,
+) -> Option<&'a [u8]> {
+    let fb = files.get(path)?;
+    if fb.ino != ino {
+        return None;
+    }
+    Some(&fb.bytes)
+}
+
+/// Identity-bound file read (F-A/A3): open once, fstat/read/fstat —
+/// the bytes cannot tear across a replacement; a mid-read change
+/// (or unreadable path) fails instead of returning mixed bytes.
+pub fn read_file_bound(path: &str) -> std::io::Result<FileBytes> {
+    use std::io::Read as _;
+    use std::os::unix::fs::MetadataExt as _;
+    let mut file = std::fs::File::open(path)?;
+    let before = file.metadata()?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let after = file.metadata()?;
+    if before.dev() != after.dev() || before.ino() != after.ino() || before.len() != after.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{path} changed mid-read"),
+        ));
+    }
+    Ok(FileBytes {
+        bytes,
+        dev: encode_device(libc::major(before.dev()), libc::minor(before.dev())),
+        ino: before.ino(),
+    })
+}
+
 /// Plan every doc row against live mappings. `files` maps link-path
-/// → file bytes (caller pre-reads each distinct mapped path once).
-/// Fail-closed: malformed rows are an error, never a skip.
+/// → identity-bound bytes (caller pre-reads each distinct mapped
+/// path once). Fail-closed: malformed rows are an error, never a
+/// skip.
 pub fn plan(
     doc: &serde_json::Value,
     live: &[maps::Mapping],
-    files: &HashMap<String, Vec<u8>>,
+    files: &HashMap<String, FileBytes>,
     generation: u32,
 ) -> anyhow::Result<Plan> {
     plan_stable(doc, live, files, generation, &mut StableCookies::default())
@@ -239,7 +299,7 @@ pub fn plan(
 pub fn plan_stable(
     doc: &serde_json::Value,
     live: &[maps::Mapping],
-    files: &HashMap<String, Vec<u8>>,
+    files: &HashMap<String, FileBytes>,
     generation: u32,
     stable: &mut StableCookies,
 ) -> anyhow::Result<Plan> {
@@ -281,15 +341,15 @@ pub struct PlanRow {
 }
 
 /// Plan typed rows against live mappings. `files` maps link-path →
-/// file bytes (caller pre-reads each distinct mapped path once).
-/// Fail-closed: malformed rows are an error, never a skip.
+/// identity-bound bytes (caller pre-reads each distinct mapped path
+/// once). Fail-closed: malformed rows are an error, never a skip.
 /// Dedup and cookie identity key on verified physical backing
 /// (dev, ino, offset) — the same inode through another path aliases
 /// under one cookie, while a replacement inode mints a new one.
 pub fn plan_rows(
     rows: &[PlanRow],
     live: &[maps::Mapping],
-    files: &HashMap<String, Vec<u8>>,
+    files: &HashMap<String, FileBytes>,
     generation: u32,
     stable: &mut StableCookies,
 ) -> anyhow::Result<Plan> {
@@ -311,8 +371,13 @@ pub fn plan_rows(
             .collect();
         cands.sort_unstable();
         cands.dedup();
-        let path = cands.iter().find(|p| files.contains_key(**p));
-        let Some(path) = path else {
+        // First candidate whose bytes bind to the ROW's inode
+        // (F-A/A3): a same-path replacement between the maps read
+        // and the files read lends nothing to the old row.
+        let bound = cands
+            .iter()
+            .find_map(|p| bound_bytes(files, p, ino).map(|b| (*p, b)));
+        let Some((path, bytes)) = bound else {
             out.missed.push(Missed {
                 dev,
                 ino,
@@ -325,7 +390,6 @@ pub fn plan_rows(
             });
             continue;
         };
-        let bytes = &files[*path];
         if r.offset >= bytes.len() as u64 {
             out.missed.push(Missed {
                 dev,
@@ -497,12 +561,20 @@ mod tests {
         serde_json::json!({"provider": "spike", "rows": rows})
     }
 
+    fn file_bytes(bytes: Vec<u8>, ino: u64) -> FileBytes {
+        FileBytes {
+            bytes,
+            dev: device_id_of_maps_dev("08:01").unwrap(),
+            ino,
+        }
+    }
+
     #[test]
     fn plan_entries_aliases_groups() {
         let bytes = self_bytes();
         let (x_off, _) = probe_offsets(&bytes);
         let live = vec![mapping("08:01", 99, "/lib/spike.so")];
-        let files = HashMap::from([("/lib/spike.so".to_string(), bytes)]);
+        let files = HashMap::from([("/lib/spike.so".to_string(), file_bytes(bytes, 99))]);
         let d = doc(vec![
             row(1, 7, "08:01", 99, x_off),
             row(1, 9, "08:01", 99, x_off + 0x40),
@@ -530,7 +602,7 @@ mod tests {
             mapping("08:01", 99, "/lib/spike.so"),
             mapping("08:01", 100, "/lib/gone.so"), // no bytes
         ];
-        let files = HashMap::from([("/lib/spike.so".to_string(), bytes)]);
+        let files = HashMap::from([("/lib/spike.so".to_string(), file_bytes(bytes, 99))]);
         let d = doc(vec![
             row(1, 1, "08:01", 4242, x_off), // unmapped
             row(1, 2, "08:01", 100, x_off),  // unreadable
@@ -549,7 +621,7 @@ mod tests {
     #[test]
     fn plan_rejects_malformed_rows() {
         let live = vec![mapping("08:01", 99, "/lib/spike.so")];
-        let files = HashMap::from([("/lib/spike.so".to_string(), self_bytes())]);
+        let files = HashMap::from([("/lib/spike.so".to_string(), file_bytes(self_bytes(), 99))]);
         assert!(plan(&serde_json::json!({}), &live, &files, 0).is_err());
         assert!(plan(&doc(vec![serde_json::json!({"op": 1})]), &live, &files, 0).is_err());
         let mut bad = row(1, 1, "08:01", 99, 0x1010);
@@ -618,7 +690,7 @@ mod tests {
         let bytes = self_bytes();
         let (x_off, _) = probe_offsets(&bytes);
         let live = vec![mapping("08:01", 99, "/lib/spike.so")];
-        let files = HashMap::from([("/lib/spike.so".to_string(), bytes)]);
+        let files = HashMap::from([("/lib/spike.so".to_string(), file_bytes(bytes, 99))]);
         let mut stable = StableCookies::default();
         let p0 = plan_stable(
             &doc(vec![
@@ -712,6 +784,36 @@ mod tests {
     }
 
     #[test]
+    fn bound_bytes_requires_identity_match() {
+        // A3: bytes bind to the mapping's inode — a same-path
+        // replacement between the maps read and the files read
+        // must not lend the new file's bytes to the old mapping.
+        let files: HashMap<String, FileBytes> = HashMap::from([
+            (
+                "old.so".to_string(),
+                FileBytes {
+                    bytes: b"v1".to_vec(),
+                    dev: 1,
+                    ino: 100,
+                },
+            ),
+            (
+                "new.so".to_string(),
+                FileBytes {
+                    bytes: b"v2".to_vec(),
+                    dev: 1,
+                    ino: 200,
+                },
+            ),
+        ]);
+        assert_eq!(bound_bytes(&files, "old.so", 100), Some(b"v1".as_slice()));
+        // Same path, replaced bytes: the old mapping binds nothing.
+        assert_eq!(bound_bytes(&files, "old.so", 200), None);
+        assert_eq!(bound_bytes(&files, "new.so", 100), None);
+        assert_eq!(bound_bytes(&files, "missing.so", 100), None);
+    }
+
+    #[test]
     fn sample_backing_matches_stat() {
         use std::os::unix::fs::MetadataExt as _;
         let exe = std::env::current_exe().unwrap();
@@ -735,8 +837,8 @@ mod tests {
             mapping("08:01", 99, "/mnt/alias/spike.so"),
         ];
         let files = HashMap::from([
-            ("/lib/spike.so".to_string(), bytes.clone()),
-            ("/mnt/alias/spike.so".to_string(), bytes),
+            ("/lib/spike.so".to_string(), file_bytes(bytes.clone(), 99)),
+            ("/mnt/alias/spike.so".to_string(), file_bytes(bytes, 99)),
         ]);
         let mk = |provider: &str| PlanRow {
             dev: "08:01".to_string(),
@@ -771,7 +873,10 @@ mod tests {
             },
         };
         let live2 = vec![mapping("08:01", 100, "/lib/spike.so")];
-        let p2 = plan_rows(std::slice::from_ref(&mk2), &live2, &files, 1, &mut stable).unwrap();
+        // A3: the replacement inode's bytes arrive under their own
+        // binding — the old ino-99 read no longer lends to ino 100.
+        let files2 = HashMap::from([("/lib/spike.so".to_string(), file_bytes(self_bytes(), 100))]);
+        let p2 = plan_rows(std::slice::from_ref(&mk2), &live2, &files2, 1, &mut stable).unwrap();
         assert_eq!(p2.entries.len(), 1);
         assert_eq!(p2.entries[0].cookie, 1);
         assert_eq!(stable.lookup("08:01", 99, x_off), Some(0));
