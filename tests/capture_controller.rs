@@ -3458,6 +3458,148 @@ fn sibling_table_prunes_unload_dirt() {
 }
 
 #[test]
+fn h1_t2_retired_epoch_duplicate_never_regains_complete() {
+    // A-2: a duplicate identity carrying a retired epoch must not
+    // flip its site back to Complete after a sibling pruned the
+    // tombstone. Epoch validation covers every arrival — novel or
+    // duplicate — so a retired stamp can never re-close a site.
+    let mut h = AdaptHarness::fresh("h1-t2");
+    let d1 = DiscoveryDelta {
+        candidates: vec![h.cand(1, 5, 0x100)],
+        tables: vec![terminated(1, 5)],
+        ..DiscoveryDelta::default()
+    };
+    let first = h.adapt(&d1);
+    assert_eq!(
+        first.delta.discovered[0].candidates_coverage,
+        CandidateCoverage::Complete
+    );
+    let d2 = DiscoveryDelta {
+        retirements: vec![retirement(1, 5)],
+        ..DiscoveryDelta::default()
+    };
+    let second = h.adapt(&d2);
+    assert_eq!(
+        second.delta.discovered[0].candidates_coverage,
+        CandidateCoverage::Unknown
+    );
+    // Sibling epoch 7 terminates with rows at ANOTHER site: the
+    // (1,5) tombstone prunes (sibling isolation) while op 1 closes
+    // via the live epoch.
+    let d3 = DiscoveryDelta {
+        candidates: vec![h.cand(1, 7, 0x200)],
+        tables: vec![terminated(1, 7)],
+        ..DiscoveryDelta::default()
+    };
+    let third = h.adapt(&d3);
+    assert_eq!(
+        third.delta.discovered[0].candidates_coverage,
+        CandidateCoverage::Complete
+    );
+    // The d1 identity re-arrives verbatim (duplicate) carrying the
+    // retired epoch 5: the site must stay Unknown, never Complete.
+    let d4 = DiscoveryDelta {
+        candidates: vec![h.cand(1, 5, 0x100)],
+        ..DiscoveryDelta::default()
+    };
+    let fourth = h.adapt(&d4);
+    assert_eq!(fourth.delta.discovered.len(), 1);
+    assert_eq!(fourth.delta.discovered[0].site.offset, 0x100);
+    assert_eq!(
+        fourth.delta.discovered[0].candidates_coverage,
+        CandidateCoverage::Unknown,
+        "retired-epoch duplicate must not re-close the site"
+    );
+}
+
+#[test]
+fn h1_t3_untracked_epoch_duplicate_enters_validation() {
+    // A-2 coverage: a duplicate carrying an epoch with zero table
+    // proof (never tracked — no table, no retirement) still enters
+    // the validation set and taints its own site. Skipping it
+    // would let proof-less stamps ride a sibling-closed op.
+    let mut h = AdaptHarness::fresh("h1-t3");
+    let d1 = DiscoveryDelta {
+        candidates: vec![h.cand(1, 5, 0x100)],
+        tables: vec![terminated(1, 5)],
+        ..DiscoveryDelta::default()
+    };
+    let first = h.adapt(&d1);
+    assert_eq!(
+        first.delta.discovered[0].candidates_coverage,
+        CandidateCoverage::Complete
+    );
+    let d2 = DiscoveryDelta {
+        candidates: vec![h.cand(1, 9, 0x100)],
+        ..DiscoveryDelta::default()
+    };
+    let second = h.adapt(&d2);
+    assert_eq!(second.delta.discovered.len(), 1);
+    assert_eq!(
+        second.delta.discovered[0].candidates_coverage,
+        CandidateCoverage::Unknown,
+        "proof-less duplicate stamp must taint its site"
+    );
+}
+
+#[test]
+fn h1_t4_duplicate_validation_boundary_pins() {
+    // A-2 boundary (pins the F-H/H1 novelty split in both
+    // directions — characterization of the fix's edge, RED-carried
+    // by H1-T2/T3):
+    // (a) a duplicate for a standing retired tombstone stays
+    // Unknown via the explicit dirt arm;
+    // (b) a duplicate for a live terminated epoch still recovers
+    // Complete (the post-proof trip stays novel-only — naive
+    // validate-everything would break legitimate re-walks).
+    let mut h = AdaptHarness::fresh("h1-t4");
+    let d1 = DiscoveryDelta {
+        candidates: vec![h.cand(1, 5, 0x100)],
+        tables: vec![terminated(1, 5)],
+        ..DiscoveryDelta::default()
+    };
+    let first = h.adapt(&d1);
+    assert_eq!(
+        first.delta.discovered[0].candidates_coverage,
+        CandidateCoverage::Complete
+    );
+    // (b) first: live re-walk duplicate, no retirement anywhere.
+    let d2 = DiscoveryDelta {
+        candidates: vec![h.cand(1, 5, 0x100)],
+        ..DiscoveryDelta::default()
+    };
+    let second = h.adapt(&d2);
+    assert_eq!(second.delta.discovered.len(), 1);
+    assert_eq!(
+        second.delta.discovered[0].candidates_coverage,
+        CandidateCoverage::Complete,
+        "live-epoch duplicate must keep closure"
+    );
+    // (a): retire (tombstone stands — no sibling table), then the
+    // same duplicate for the retired epoch.
+    let d3 = DiscoveryDelta {
+        retirements: vec![retirement(1, 5)],
+        ..DiscoveryDelta::default()
+    };
+    let third = h.adapt(&d3);
+    assert_eq!(
+        third.delta.discovered[0].candidates_coverage,
+        CandidateCoverage::Unknown
+    );
+    let d4 = DiscoveryDelta {
+        candidates: vec![h.cand(1, 5, 0x100)],
+        ..DiscoveryDelta::default()
+    };
+    let fourth = h.adapt(&d4);
+    assert_eq!(fourth.delta.discovered.len(), 1);
+    assert_eq!(
+        fourth.delta.discovered[0].candidates_coverage,
+        CandidateCoverage::Unknown,
+        "retired-tombstone duplicate must not re-close"
+    );
+}
+
+#[test]
 fn rebirth_reproof_recovers_closure() {
     // F-A/A4 recovery: epoch 5 retires as 7 rebirths; once 7
     // terminates AND its rows re-arrive (re-walk refresh), the
