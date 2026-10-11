@@ -1424,3 +1424,33 @@ fn doctor_unknown_build_points_at_enrollment() {
     assert_eq!(doc["verdict"], "fail-closed");
     assert_eq!(doc["exit"], 4);
 }
+
+#[test]
+fn built_objects_pass_loader_shape_check() {
+    // Loader-fix regression (F-C/A8 follow-up): the per-CPU
+    // helpers took `&0u64`, which LLVM folds into .rodata with an
+    // R_BPF_64_64 reloc — the fail-closed loader rejects non-map
+    // 64-bit relocs, so E2E loading broke while C1/C2 (build-only
+    // gates) stayed green. This test runs the same pure shape
+    // check the backend runs at attach over the just-built
+    // objects (no caps needed). Loud skip when the BPF objects
+    // were not built (C2 builds them; a host-only checkout has
+    // nothing to check).
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("crates/ebpf/target/bpfel-unknown-none/release");
+    let harvest = dir.join("osslscope-harvest");
+    let count = dir.join("osslscope-count");
+    if !harvest.exists() || !count.exists() {
+        eprintln!(
+            "SKIP built_objects_pass_loader_shape_check: BPF objects not built \
+             (run the C2 BPF build; host-only checkouts skip)"
+        );
+        return;
+    }
+    let h = std::fs::read(&harvest).unwrap();
+    let c = std::fs::read(&count).unwrap();
+    onboard::check_object_compatible(onboard::ObjectRole::Harvest, &h)
+        .unwrap_or_else(|e| panic!("built harvest object fails loader shape check: {e}"));
+    onboard::check_object_compatible(onboard::ObjectRole::Count, &c)
+        .unwrap_or_else(|e| panic!("built count object fails loader shape check: {e}"));
+}

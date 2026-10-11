@@ -176,7 +176,11 @@ static TRIP_CLASS: HashMap<u64, TripClassValue> = HashMap::with_max_entries(64, 
 /// only a full map fails. Userspace sums across CPUs at drain.
 fn percpu_add<K>(map: &PerCpuHashMap<K, u64>, key: &K) -> Result<(), ()> {
     if map.get_ptr_mut(key).is_none() {
-        let _ = map.insert(key, &0u64, BPF_NOEXIST);
+        // Stack local, never `&0u64`: a literal reference folds
+        // into .rodata with an R_BPF_64_64 reloc, which the
+        // fail-closed loader rejects (non-map 64-bit reloc).
+        let zero = 0u64;
+        let _ = map.insert(key, &zero, BPF_NOEXIST);
     }
     match map.get_ptr_mut(key) {
         Some(slot) => {
@@ -191,7 +195,10 @@ fn percpu_add<K>(map: &PerCpuHashMap<K, u64>, key: &K) -> Result<(), ()> {
 /// counters, same fix; userspace ORs across CPUs at drain.
 fn percpu_or<K>(map: &PerCpuHashMap<K, u64>, key: &K, bit: u64) -> Result<(), ()> {
     if map.get_ptr_mut(key).is_none() {
-        let _ = map.insert(key, &0u64, BPF_NOEXIST);
+        // Stack local (see percpu_add): `&0u64` emits a
+        // loader-rejected .rodata R_BPF_64_64 reloc.
+        let zero = 0u64;
+        let _ = map.insert(key, &zero, BPF_NOEXIST);
     }
     match map.get_ptr_mut(key) {
         Some(slot) => {
