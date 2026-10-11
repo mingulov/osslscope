@@ -173,6 +173,11 @@ struct FakeDiscovery {
     polls: VecDeque<DiscoveryDelta>,
     plans: HashMap<usize, FirePlan>,
     poll_delay_ns: HashMap<usize, u64>,
+    /// REAL (wall-clock) sleep per poll, never fake-advancing
+    /// (F-D/A13): live-child tests need real time to pass for the
+    /// real target while the injected clock stays scripted. Zero
+    /// everywhere except live_observe.
+    poll_real_delay: Duration,
     poll_err_at: HashSet<usize>,
     snapshot: DiscoverySnapshot,
     finish_err: bool,
@@ -212,6 +217,11 @@ impl DiscoveryPort for FakeDiscovery {
         if let Some(ns) = self.poll_delay_ns.get(&idx) {
             self.clock.sleep(Duration::from_nanos(*ns));
         }
+        // Wall-clock pacing for live-child tests (zero elsewhere):
+        // lets a real target run while fake time stays scripted.
+        if !self.poll_real_delay.is_zero() {
+            std::thread::sleep(self.poll_real_delay);
+        }
         Ok(self.polls.pop_front().unwrap_or_default())
     }
 
@@ -244,6 +254,15 @@ impl DiscoveryPort for FakeDiscovery {
 // ---------------------------------------------------------------------------
 // Scripted target with shared custody log (assertable after observe).
 // ---------------------------------------------------------------------------
+
+/// Proc-side read log (F-D/A13): every `read_file_bound` path and
+/// every `stat_file` path, in call order. Lets relevance/cache
+/// tests assert WHAT was read, not just the adapted outcome.
+#[derive(Debug, Default)]
+struct ProcLog {
+    reads: Vec<String>,
+    stats: Vec<String>,
+}
 
 #[derive(Debug, Default)]
 struct TargetLog {
@@ -376,6 +395,12 @@ struct FakeProc {
     /// read-count-driven, so added settle reads cannot shift it).
     comm_settle_at_ns: Option<u64>,
     comm_settled: Option<String>,
+    proc_log: Rc<RefCell<ProcLog>>,
+    /// Scripted stat identities, popped in call order (F-D/A13 F3):
+    /// `Some((dev, ino))` overrides the staged identity once (a
+    /// scripted replacement race), `None`/exhausted falls back to
+    /// the staged identity.
+    stat_seq: VecDeque<Option<(u64, u64)>>,
 }
 
 impl ProcPort for FakeProc {
@@ -404,6 +429,7 @@ impl ProcPort for FakeProc {
 
     fn read_file_bound(&mut self, path: &str) -> anyhow::Result<(Vec<u8>, (u64, u64))> {
         self.clock.advance_ns(self.file_delay_ns);
+        self.proc_log.borrow_mut().reads.push(path.to_string());
         if self.file_err.contains(path) {
             anyhow::bail!("injected file failure for {path}");
         }
@@ -411,6 +437,14 @@ impl ProcPort for FakeProc {
             .get(path)
             .map(|f| (f.bytes.clone(), (f.dev, f.ino)))
             .ok_or_else(|| anyhow::anyhow!("no such staged file {path}"))
+    }
+
+    fn stat_file(&mut self, path: &str) -> Option<(u64, u64)> {
+        self.proc_log.borrow_mut().stats.push(path.to_string());
+        if let Some(scripted) = self.stat_seq.pop_front().flatten() {
+            return Some(scripted);
+        }
+        self.files.get(path).map(|f| (f.dev, f.ino))
     }
 
     fn read_exe(&mut self, _pid: u32) -> Option<PathBuf> {
@@ -591,6 +625,7 @@ fn has_counter(capture: &Capture, name: &str) -> bool {
 struct PostCtx {
     shared: Rc<RefCell<SharedState>>,
     target_log: Rc<RefCell<TargetLog>>,
+    proc_log: Rc<RefCell<ProcLog>>,
 }
 
 struct Harness {
@@ -601,6 +636,8 @@ struct Harness {
     clock: Rc<FakeClock>,
     shared: Rc<RefCell<SharedState>>,
     target_log: Rc<RefCell<TargetLog>>,
+    proc_log: Rc<RefCell<ProcLog>>,
+    stat_seq: VecDeque<Option<(u64, u64)>>,
     cfg: Config,
     owned: bool,
     acquired_ns: u64,
@@ -659,6 +696,8 @@ impl Harness {
             clock: clock.clone(),
             shared: Rc::new(RefCell::new(SharedState::default())),
             target_log: Rc::new(RefCell::new(TargetLog::default())),
+            proc_log: Rc::new(RefCell::new(ProcLog::default())),
+            stat_seq: VecDeque::new(),
             cfg: Config {
                 harvest_object: Some(PathBuf::new()),
                 count_object: Some(PathBuf::new()),
@@ -735,6 +774,7 @@ impl Harness {
             polls: self.polls,
             plans: self.plans,
             poll_delay_ns: self.poll_delay_ns,
+            poll_real_delay: Duration::ZERO,
             poll_err_at: self.poll_err_at,
             snapshot: self.snapshot,
             finish_err: self.finish_err,
@@ -775,6 +815,8 @@ impl Harness {
             comm: self.comm,
             comm_settle_at_ns: self.comm_settle_at_ns,
             comm_settled: self.comm_settled,
+            proc_log: self.proc_log.clone(),
+            stat_seq: self.stat_seq,
         };
         let flag = self.cancelled.clone();
         let out = observe(
@@ -795,6 +837,7 @@ impl Harness {
             PostCtx {
                 shared: self.shared,
                 target_log: self.target_log,
+                proc_log: self.proc_log,
             },
         )
     }
@@ -1791,7 +1834,7 @@ fn delayed_metadata_io_still_meets_deadline() {
 #[test]
 fn slow_metadata_past_deadline_admits_no_tripwire() {
     // 300ms metadata reads cross the 1900ms deadline mid-round (at
-    // ~1650ms the sleep has not crossed, the file reads do): the
+    // ~1650ms the sleep has not crossed, the maps read does): the
     // round expires BEFORE polling, so the scripted post-deadline
     // ENGINE tripwire never becomes in-window legacy evidence.
     // `--pid` keeps the loop deadline fixed (no clamp interaction):
@@ -1802,7 +1845,12 @@ fn slow_metadata_past_deadline_admits_no_tripwire() {
     h.owned = false;
     h.cfg.duration = Duration::from_millis(1900);
     h.snapshot_attached();
-    h.file_delay_ns = 300_000_000;
+    // Slow metadata via the maps read (F-D/A13): file reads are
+    // relevance-gated now and these polls reference nothing, so
+    // file_delay would no longer advance the clock here. The maps
+    // read is unconditional every round — same cadence, same
+    // 300ms/round crossing.
+    h.maps_delay_ns = 300_000_000;
     let set = ProbeSet {
         probes: vec![Probe {
             cookie: 7,
@@ -2086,7 +2134,10 @@ fn setup_slice_reports_exact_tail_gap() {
     // tail gap — never hidden, never inflated by drain time.
     let mut h = Harness::fresh("setup-tail");
     h.snapshot_attached();
-    h.file_delay_ns = 300_000_000;
+    // 300ms setup slice via the maps read (F-D/A13): the setup
+    // poll references no files so file_delay no longer advances
+    // the clock; the setup maps read carries the same 300ms.
+    h.maps_delay_ns = 300_000_000;
     h.polls.push_back(DiscoveryDelta {
         trigger_observed: true,
         ..DiscoveryDelta::default()
@@ -2105,7 +2156,10 @@ fn loop_clamps_to_kernel_deadline() {
     // never does — and the tail gap is exactly the setup slice.
     let mut h = Harness::fresh("clamp");
     h.snapshot_attached();
-    h.file_delay_ns = 600_000_000;
+    // 600ms setup via the maps read (F-D/A13): file reads are
+    // relevance-gated and these polls reference nothing; the
+    // unconditional maps read carries the same 600ms slice.
+    h.maps_delay_ns = 600_000_000;
     h.polls.push_back(DiscoveryDelta::default());
     h.polls.push_back(DiscoveryDelta::default());
     // Poll 2 runs only if the loop passes the kernel deadline.
@@ -3628,6 +3682,11 @@ fn live_observe(
         polls: VecDeque::new(),
         plans: HashMap::new(),
         poll_delay_ns: HashMap::new(),
+        // 5ms real per poll (~120 polls over the 30s window):
+        // the real child needs wall-clock time to exec+exit while
+        // the fake clock spins instantly (F-D/A13 made rounds too
+        // fast to rely on incidental I/O latency).
+        poll_real_delay: Duration::from_millis(5),
         poll_err_at: HashSet::new(),
         snapshot,
         finish_err: false,
@@ -3665,6 +3724,8 @@ fn live_observe(
         comm: None,
         comm_settle_at_ns: None,
         comm_settled: None,
+        proc_log: Rc::new(RefCell::new(ProcLog::default())),
+        stat_seq: VecDeque::new(),
     };
     let info = TargetInfo {
         pid,
@@ -4034,4 +4095,202 @@ fn live_thread_creation_is_not_ignored_process() {
     );
     kid.kill().unwrap();
     let _ = kid.wait();
+}
+
+// ---------------------------------------------------------------------------
+// F-D/A13: relevance-scoped file reads + verified-identity cache.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn round_reads_only_relevant_files() {
+    // F1: per-poll file reads are scoped to the poll's delta
+    // (candidate backings, array owners, new objects) — a
+    // mapped-but-unreferenced file is never read nor stat'ed.
+    let mut h = Harness::fresh("relevant-reads");
+    h.snapshot_attached();
+    let decoy = h.stage.write("decoy.so", &h.bytes.clone());
+    h.files.insert(
+        decoy.path.clone(),
+        plan::FileBytes {
+            bytes: h.bytes.clone(),
+            dev: decoy.device,
+            ino: decoy.ino,
+        },
+    );
+    let decoy_path = decoy.path.clone();
+    h.maps = vec![mapping(&h.staged), mapping(&decoy)];
+    let staged_path = h.staged.path.clone();
+    let c = cand(
+        "/p/provider.so",
+        backing_of(&h.staged, h.off),
+        1,
+        11,
+        "SHA-256",
+        false,
+        "ok",
+    );
+    h.polls.push_back(DiscoveryDelta::default());
+    h.polls.push_back(DiscoveryDelta {
+        candidates: vec![c],
+        tables: vec![terminated(1, 0)],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    h.exit_at_ns = Some(BASE_NS + 1_000_000_000);
+    let (out, post) = h.run();
+    out.unwrap();
+    let log = post.proc_log.borrow();
+    assert!(
+        !log.reads.iter().any(|p| p == &decoy_path),
+        "unreferenced decoy must never be read: {:?}",
+        log.reads
+    );
+    assert!(
+        !log.stats.iter().any(|p| p == &decoy_path),
+        "unreferenced decoy must never be stat'ed: {:?}",
+        log.stats
+    );
+    assert!(
+        log.reads.iter().any(|p| p == &staged_path),
+        "referenced provider must be read: {:?}",
+        log.reads
+    );
+}
+
+#[test]
+fn unchanged_files_are_read_once_then_stat_validated() {
+    // F2: an unchanged relevant file is read once (first poll)
+    // and validated by stat afterwards — N polls, 1 read.
+    let mut h = Harness::fresh("read-once");
+    h.snapshot_attached();
+    let staged_path = h.staged.path.clone();
+    for _ in 0..4 {
+        let c = cand(
+            "/p/provider.so",
+            backing_of(&h.staged, h.off),
+            1,
+            11,
+            "SHA-256",
+            false,
+            "ok",
+        );
+        h.polls.push_back(DiscoveryDelta {
+            candidates: vec![c],
+            trigger_observed: true,
+            ..DiscoveryDelta::default()
+        });
+    }
+    h.exit_at_ns = Some(BASE_NS + 1_000_000_000);
+    let (out, post) = h.run();
+    out.unwrap();
+    let log = post.proc_log.borrow();
+    let reads = log.reads.iter().filter(|p| *p == &staged_path).count();
+    let stats = log.stats.iter().filter(|p| *p == &staged_path).count();
+    assert_eq!(
+        reads, 1,
+        "unchanged provider must be read exactly once: {:?} / {:?}",
+        log.reads, log.stats
+    );
+    assert!(
+        stats >= 2,
+        "expected setup + round stat validations, got {stats}: {:?}",
+        log.stats
+    );
+}
+
+#[test]
+fn stat_identity_change_forces_reread() {
+    // F3: a stat identity that differs from the cached entry
+    // forces a re-read (scripted transient race on the 3rd stat);
+    // afterwards the cache converges again (exactly 2 reads).
+    let mut h = Harness::fresh("stat-reread");
+    h.snapshot_attached();
+    let staged_path = h.staged.path.clone();
+    let (dev, ino) = (h.staged.device, h.staged.ino);
+    for _ in 0..6 {
+        let c = cand(
+            "/p/provider.so",
+            backing_of(&h.staged, h.off),
+            1,
+            11,
+            "SHA-256",
+            false,
+            "ok",
+        );
+        h.polls.push_back(DiscoveryDelta {
+            candidates: vec![c],
+            trigger_observed: true,
+            ..DiscoveryDelta::default()
+        });
+    }
+    h.stat_seq = VecDeque::from([None, None, Some((dev, ino + 1000))]);
+    h.exit_at_ns = Some(BASE_NS + 1_000_000_000);
+    let (out, post) = h.run();
+    out.unwrap();
+    let log = post.proc_log.borrow();
+    let reads = log.reads.iter().filter(|p| *p == &staged_path).count();
+    assert_eq!(
+        reads, 2,
+        "setup read + one race re-read expected: {:?} / {:?}",
+        log.reads, log.stats
+    );
+}
+
+#[test]
+fn pathological_relevance_set_is_capped_and_loud() {
+    // F4: a pathological delta (257 distinct backings) reads at
+    // most MAX_RELEVANT_FILES_PER_ROUND paths and reports the
+    // dropped remainder as discovery.relevance_capped loss —
+    // bounded memory, loud degradation.
+    let mut h = Harness::fresh("relevance-cap");
+    h.snapshot_attached();
+    let dev = plan::render_device(h.staged.device);
+    let mut maps = vec![mapping(&h.staged)];
+    let mut cands = Vec::new();
+    for i in 0..257u64 {
+        maps.push(Mapping {
+            start: 0x7f00_0000_0000,
+            end: 0x7f00_0000_1000,
+            x: true,
+            offset: 0,
+            dev: dev.clone(),
+            ino: 1_000_000 + i,
+            path: format!("/x/mod{i:03}.so"),
+        });
+        cands.push(cand(
+            "/p/provider.so",
+            Some(BackingRef {
+                dev: dev.clone(),
+                ino: 1_000_000 + i,
+                offset: h.off,
+            }),
+            1,
+            11,
+            "SHA-256",
+            false,
+            "ok",
+        ));
+    }
+    h.maps = maps;
+    h.polls.push_back(DiscoveryDelta::default());
+    h.polls.push_back(DiscoveryDelta {
+        candidates: cands,
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    h.exit_at_ns = Some(BASE_NS + 1_000_000_000);
+    let (out, post) = h.run();
+    let c = out.unwrap();
+    assert_eq!(
+        counter_value(&c, "discovery.relevance_capped"),
+        1,
+        "257 backings over a 256 cap must report 1 dropped: {:?}",
+        c.document.counters
+    );
+    let log = post.proc_log.borrow();
+    assert!(
+        log.reads.len() <= 257,
+        "reads must stay bounded: {}",
+        log.reads.len()
+    );
 }

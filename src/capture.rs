@@ -652,6 +652,12 @@ pub trait ProcPort {
     /// the file across the read (open once, fstat/read/fstat) so
     /// the bytes cannot tear across a replacement.
     fn read_file_bound(&mut self, path: &str) -> anyhow::Result<(Vec<u8>, (u64, u64))>;
+    /// Identity stat (F-D/A13): the CURRENT (encoded dev, ino) of
+    /// `path` without reading bytes — same encoding domain as
+    /// [`read_file_bound`](Self::read_file_bound) so callers can
+    /// validate a cached entry. `None` when unstatable (the caller
+    /// treats that as a cache miss, never as a hit).
+    fn stat_file(&mut self, path: &str) -> Option<(u64, u64)>;
     fn read_exe(&mut self, pid: u32) -> Option<PathBuf>;
     fn file_len(&mut self, path: &str) -> Option<u64>;
     /// Current comm (`None` when unreadable — the caller keeps its
@@ -674,6 +680,21 @@ impl ProcPort for LiveProc {
 
     fn read_file_bound(&mut self, path: &str) -> anyhow::Result<(Vec<u8>, (u64, u64))> {
         Ok(plan::read_file_bound(path).map(|f| (f.bytes, (f.dev, f.ino)))?)
+    }
+
+    fn stat_file(&mut self, path: &str) -> Option<(u64, u64)> {
+        use std::os::unix::fs::MetadataExt as _;
+        // Same encoding as plan::read_file_bound (major/minor via
+        // libc, never the raw dev_t word) so cache validation
+        // compares in one domain.
+        std::fs::metadata(path)
+            .map(|m| {
+                (
+                    plan::encode_device(libc::major(m.dev()), libc::minor(m.dev())),
+                    m.ino(),
+                )
+            })
+            .ok()
     }
 
     fn read_exe(&mut self, pid: u32) -> Option<PathBuf> {
@@ -1784,6 +1805,91 @@ struct Runner<'x, D, B: CountBackend, T, L, C: ClockPort, P: ProcPort> {
     open_instant: Instant,
     open_wall: SystemTime,
     drain_wall_us: u64,
+    /// Verified-identity file cache (F-D/A13): path →
+    /// identity-bound bytes. Entries are validated per poll by
+    /// [`ProcPort::stat_file`] against the CURRENT on-disk
+    /// identity and re-read on any mismatch; unmapped entries
+    /// never survive a round (a vanished mapping's bytes are
+    /// unprovable). Bounded by [`MAX_CACHED_FILES`] /
+    /// [`MAX_CACHED_BYTES`].
+    file_cache: HashMap<String, plan::FileBytes>,
+    /// Relevant paths dropped by the per-poll relevance/bytes
+    /// caps (loud loss at finalize).
+    relevance_capped: u64,
+}
+
+/// Maximum distinct file paths read per discovery poll
+/// (F-D/A13). Typical polls reference a handful of backings;
+/// 256 is 10x headroom — beyond it the poll keeps the
+/// lexicographically first 256 (deterministic under pathology)
+/// and reports the remainder as `discovery.relevance_capped`
+/// loss. Counts distinct PATHS (aliases of one file each
+/// count): the bound that matters is read calls + resident
+/// clones, both path-keyed.
+const MAX_RELEVANT_FILES_PER_POLL: usize = 256;
+
+/// Maximum cached file entries across polls (F-D/A13). Overflow
+/// (mapping churn across polls) retains only the current poll's
+/// relevant set — eviction is a silent perf event (the next poll
+/// re-reads fresh bytes), never a loss.
+const MAX_CACHED_FILES: usize = 256;
+
+/// Maximum accumulated file bytes per poll's read set (F-D/A13).
+/// The read loop stops past this (remaining paths join
+/// `discovery.relevance_capped`); the cache evicts largest-first
+/// past this. It bounds the per-poll out-map accumulation —
+/// total transient resident is ~2x (out-map clones + cache) plus
+/// retained entries, all path-bounded above. Sized at ~8x a
+/// legitimate multi-provider set (~15MB: provider + libcrypto +
+/// siblings) so small sets always read fully; only pathological
+/// counts (100s of distinct backings) stop here instead of
+/// growing into the gigabytes the old read-all round map
+/// routinely held.
+const MAX_CACHED_BYTES: usize = 128 * 1024 * 1024;
+
+/// File paths a discovery poll's consumers can touch (F-D/A13):
+/// candidate backing identities + array-owner identities (a
+/// superset of the advertising exact-VMA join — ALL mappings
+/// containing the array, so VMA overlap can never strand a
+/// read) + new object identities, expanded to ALL mapped-path
+/// aliases (any x-bit — dispatch arrays live in data mappings;
+/// anonymous mappings have no bytes and are excluded). Every
+/// round-map consumer (plan_rows, object_id_for_mapping,
+/// advertising_object_id) resolves within these (dev, ino)
+/// identities, so scoping reads to this set changes no outcome
+/// — only I/O. Returns the sorted path set plus the
+/// over-cap dropped count (0 on the common path).
+fn relevant_paths(delta: &DiscoveryDelta, live: &[maps::Mapping]) -> (BTreeSet<String>, u64) {
+    let mut idents: HashSet<(String, u64)> = HashSet::new();
+    for c in &delta.candidates {
+        if let Some(b) = &c.backing {
+            idents.insert((b.dev.clone(), b.ino));
+        }
+        if c.arr != 0 {
+            for m in live
+                .iter()
+                .filter(|m| m.start <= c.arr && c.arr < m.end && m.ino != 0)
+            {
+                idents.insert((m.dev.clone(), m.ino));
+            }
+        }
+    }
+    for o in &delta.objects {
+        idents.insert((o.dev.clone(), o.ino));
+    }
+    let mut paths: BTreeSet<String> = live
+        .iter()
+        .filter(|m| m.ino != 0 && idents.contains(&(m.dev.clone(), m.ino)))
+        .map(|m| m.path.clone())
+        .collect();
+    let dropped = paths.len().saturating_sub(MAX_RELEVANT_FILES_PER_POLL) as u64;
+    if dropped > 0 {
+        paths = paths
+            .into_iter()
+            .take(MAX_RELEVANT_FILES_PER_POLL)
+            .collect();
+    }
+    (paths, dropped)
 }
 
 impl<D, B, T, L, C, P> Runner<'_, D, B, T, L, C, P>
@@ -1818,50 +1924,120 @@ where
     /// Pre-read every distinct mapped path once per round, bound
     /// to its read-time identity (F-A/A3). Failures skip (the
     /// planner misses those rows loud as unreadable).
-    fn read_round_files(&mut self, live: &[maps::Mapping]) -> HashMap<String, plan::FileBytes> {
-        let mut paths: Vec<&str> = live.iter().map(|m| m.path.as_str()).collect();
-        paths.sort_unstable();
-        paths.dedup();
+    /// Relevance-scoped file bytes for one discovery poll
+    /// (F-D/A13): only [`relevant_paths`] are read, through the
+    /// verified-identity cache (stat-validated per poll, re-read
+    /// on any mismatch or stat failure). Unreadable paths are
+    /// skipped exactly like the old read-all round map (their
+    /// rows miss with "unreadable" + the cap counter stays the
+    /// loud path for cap drops). Callers pass the returned map to
+    /// [`adapt_delta`](adapt_delta) and attach; the cache retains
+    /// across polls within its bounds.
+    fn read_relevant_files(
+        &mut self,
+        delta: &DiscoveryDelta,
+        live: &[maps::Mapping],
+    ) -> HashMap<String, plan::FileBytes> {
+        let (relevant, mut dropped) = relevant_paths(delta, live);
         let mut out = HashMap::new();
-        for p in paths {
-            if let Ok((bytes, (dev, ino))) = self.proc.read_file_bound(p) {
-                out.insert(p.to_string(), plan::FileBytes { bytes, dev, ino });
+        let mut out_bytes: usize = 0;
+        let mut remaining = relevant.len() as u64;
+        for p in &relevant {
+            remaining -= 1;
+            // Bytes cap: stop past MAX_CACHED_BYTES (always read
+            // at least one path — progress under a single huge
+            // file). Skipped paths join the dropped count: their
+            // rows miss "unreadable" and the loss counter says so.
+            if out_bytes > MAX_CACHED_BYTES && !out.is_empty() {
+                dropped = dropped.saturating_add(remaining + 1);
+                break;
+            }
+            let current = self.proc.stat_file(p);
+            let hit = matches!(
+                (current, self.file_cache.get(p)),
+                (Some((dev, ino)), Some(cached)) if cached.dev == dev && cached.ino == ino
+            );
+            if !hit {
+                match self.proc.read_file_bound(p) {
+                    Ok((bytes, (dev, ino))) => {
+                        self.file_cache
+                            .insert(p.clone(), plan::FileBytes { bytes, dev, ino });
+                    }
+                    Err(_) => {
+                        self.file_cache.remove(p);
+                        continue;
+                    }
+                }
+            }
+            if let Some(cached) = self.file_cache.get(p) {
+                out_bytes = out_bytes.saturating_add(cached.bytes.len());
+                out.insert(p.clone(), cached.clone());
             }
         }
+        self.relevance_capped = self.relevance_capped.saturating_add(dropped);
+        self.prune_file_cache(live, &relevant);
         out
     }
 
-    /// Poll discovery once, adapt, attach, and accumulate. Returns
-    /// (budget_exhausted, candidates_changed).
-    /// Apply one discovery poll. `deadline` (loop rounds only, never
-    /// the setup baseline poll) is the window edge the poll must
-    /// complete before: rounds only poll pre-deadline, so a poll
-    /// completing at/after it straddled the edge and its tripwire
-    /// deltas route to the straddling-loss accumulators instead of
-    /// the in-window evidence (F-D/A10).
-    fn poll_and_apply(
+    /// Cache bounds enforcement (F-D/A13): unmapped entries never
+    /// survive a round; count/bytes overflow retains only the
+    /// current poll's relevant set, then evicts largest-first
+    /// past the bytes cap. Eviction is silent (the next poll
+    /// re-reads fresh bytes — a perf event, never a loss).
+    fn prune_file_cache(&mut self, live: &[maps::Mapping], relevant: &BTreeSet<String>) {
+        let mapped: HashSet<&str> = live.iter().map(|m| m.path.as_str()).collect();
+        self.file_cache.retain(|p, _| mapped.contains(p.as_str()));
+        let cached_bytes: usize = self.file_cache.values().map(|f| f.bytes.len()).sum();
+        if self.file_cache.len() <= MAX_CACHED_FILES && cached_bytes <= MAX_CACHED_BYTES {
+            return;
+        }
+        self.file_cache.retain(|p, _| relevant.contains(p));
+        let mut survivors: Vec<(String, usize)> = self
+            .file_cache
+            .iter()
+            .map(|(p, f)| (p.clone(), f.bytes.len()))
+            .collect();
+        survivors.sort_by(|a, b| b.1.cmp(&a.1));
+        let mut bytes: usize = survivors.iter().map(|(_, s)| s).sum();
+        for (p, s) in &survivors {
+            if bytes <= MAX_CACHED_BYTES {
+                break;
+            }
+            if self.file_cache.remove(p).is_some() {
+                bytes = bytes.saturating_sub(*s);
+            }
+        }
+    }
+
+    /// One discovery poll plus its completion stamp (F-D/A13):
+    /// the stamp is taken at poll return so the straddle verdict
+    /// measures the POLL, never the file reads + adapt work after
+    /// it (A10's "poll completing at/after the edge").
+    fn poll_discovery(&mut self) -> anyhow::Result<(DiscoveryDelta, Instant)> {
+        let delta = self.discovery.poll(PollBudget::default())?;
+        let poll_end = self.clock.now();
+        Ok((delta, poll_end))
+    }
+
+    /// Apply one discovery poll's delta: adapt, attach, and
+    /// accumulate. Returns (budget_exhausted, candidates_changed).
+    /// `poll_end` is the poll-completion stamp from
+    /// [`poll_discovery`](Self::poll_discovery); `deadline` (loop
+    /// rounds only, never the setup baseline poll) is the window
+    /// edge the poll must complete before: rounds only poll
+    /// pre-deadline, so a poll completing at/after it straddled
+    /// the edge and its tripwire deltas route to the
+    /// straddling-loss accumulators instead of the in-window
+    /// evidence (F-D/A10).
+    fn apply_delta(
         &mut self,
-        live: &[maps::Mapping],
-        files: &HashMap<String, plan::FileBytes>,
-        fresh: &HashSet<(String, u64)>,
-        post_settle: bool,
-        baseline: bool,
+        delta: &DiscoveryDelta,
+        poll_end: Instant,
+        ctx: &AdapterCtx,
         deadline: Option<Instant>,
     ) -> anyhow::Result<(bool, bool)> {
-        let delta = self.discovery.poll(PollBudget::default())?;
         let exhausted = delta.budget_exhausted;
-        let adapted = adapt_delta(
-            &mut self.adapter,
-            &delta,
-            &AdapterCtx {
-                live,
-                files,
-                pinned_provider: self.cfg.resolved_provider.clone(),
-                fresh,
-                post_settle,
-                baseline,
-            },
-        );
+        let adapted = adapt_delta(&mut self.adapter, delta, ctx);
         self.activity.extend(adapted.activity);
         self.cold_gap_queries = self
             .cold_gap_queries
@@ -1872,7 +2048,7 @@ where
             // post-deadline increments inseparably (hits carry no
             // timestamps), so all of it is loss. Anything else is
             // in-window evidence (the round checked pre-deadline).
-            let straddled = deadline.is_some_and(|d| self.clock.now() >= d);
+            let straddled = deadline.is_some_and(|d| poll_end >= d);
             if straddled {
                 for (cookie, n) in trip.counter_deltas {
                     let slot = self.straddling_trip.entry(cookie).or_default();
@@ -1893,7 +2069,9 @@ where
             }
         }
         self.trigger_observed |= adapted.trigger_observed;
-        let report = self.count.attach_delta(&adapted.delta, live, files)?;
+        let report = self
+            .count
+            .attach_delta(&adapted.delta, ctx.live, ctx.files)?;
         self.attached_total = self.attached_total.saturating_add(report.attached);
         for site in &adapted.delta.discovered {
             if let Some(cookie) =
@@ -1978,7 +2156,6 @@ where
                 fresh.insert((m.dev.clone(), m.ino));
             }
         }
-        let files = self.read_round_files(&live);
         let exe = self.proc.read_exe(pid);
         let mut sizes = HashMap::new();
         for p in &self.planned_paths {
@@ -2002,11 +2179,12 @@ where
                 .count() as u64,
         );
         self.lifecycle_loss = self.lifecycle_loss.saturating_add(sweep.loss);
-        // Slow metadata work above (file reads, fence snapshots,
-        // lifecycle scan) may have crossed the deadline — or a
-        // signal may have landed — since the pre-read check: no
-        // post-deadline discovery poll (its tripwire would pollute
-        // in-window evidence). The loop owns the signal cut.
+        // Slow metadata work above (fence snapshots, lifecycle
+        // scan — file reads moved per-poll below, F-D/A13) may have
+        // crossed the deadline — or a signal may have landed —
+        // since the pre-read check: no post-deadline discovery poll
+        // (its tripwire would pollute in-window evidence). The loop
+        // owns the signal cut.
         if (self.cancelled)() {
             return Ok(RoundAction::Continue);
         }
@@ -2019,8 +2197,21 @@ where
         let mut fence_candidates = false;
         let mut catches = 0u32;
         loop {
-            let (exhausted, fence) =
-                self.poll_and_apply(&live, &files, &fresh, post_settle, false, Some(deadline))?;
+            // Poll → read-relevant → apply (F-D/A13): the file
+            // reads follow the poll so only this delta's paths
+            // are touched (verified-identity cache across polls).
+            let (delta, poll_end) = self.poll_discovery()?;
+            let files = self.read_relevant_files(&delta, &live);
+            let pinned = self.cfg.resolved_provider.clone();
+            let ctx = AdapterCtx {
+                live: &live,
+                files: &files,
+                pinned_provider: pinned,
+                fresh: &fresh,
+                post_settle,
+                baseline: false,
+            };
+            let (exhausted, fence) = self.apply_delta(&delta, poll_end, &ctx, Some(deadline))?;
             fence_candidates |= fence;
             if !exhausted {
                 break;
@@ -2300,6 +2491,8 @@ where
         open_instant: clock.now(),
         open_wall: clock.wall_now(),
         drain_wall_us: 0,
+        file_cache: HashMap::new(),
+        relevance_capped: 0,
     };
     runner.fallback_partial = runner.lifecycle.fallback_partial();
     runner.setup_and_run()
@@ -2336,12 +2529,27 @@ where
         for m in &live {
             self.seen_backings.insert((m.dev.clone(), m.ino));
         }
-        let files = self.read_round_files(&live);
         let exe = self.proc.read_exe(pid);
         self.snapshot = snapshot(exe, &live, &[], &HashMap::new());
         self.last_live = live.clone();
         let fresh = HashSet::new();
-        match self.poll_and_apply(&live, &files, &fresh, false, true, None) {
+        // Poll → read-relevant → apply (F-D/A13), like the round
+        // loop: the baseline poll reads only its delta's paths.
+        let baseline_outcome: anyhow::Result<(bool, bool)> = (|| {
+            let (delta, poll_end) = self.poll_discovery()?;
+            let files = self.read_relevant_files(&delta, &live);
+            let pinned = self.cfg.resolved_provider.clone();
+            let ctx = AdapterCtx {
+                live: &live,
+                files: &files,
+                pinned_provider: pinned,
+                fresh: &fresh,
+                post_settle: false,
+                baseline: true,
+            };
+            self.apply_delta(&delta, poll_end, &ctx, None)
+        })();
+        match baseline_outcome {
             Ok((_, fence_candidates)) => {
                 if fence_candidates {
                     if let Err(e) = self.count.fence(CountFence::CandidatesChanged) {
@@ -2682,6 +2890,15 @@ where
                 CounterUnits::Events,
                 CounterSource::Discovery,
                 self.maps_read_failed,
+            ));
+        }
+        if self.relevance_capped > 0 {
+            self.extra_loss.push(typed_counter(
+                "discovery.relevance_capped",
+                CounterKind::Loss,
+                CounterUnits::Sites,
+                CounterSource::Discovery,
+                self.relevance_capped,
             ));
         }
         // Close reconcile (D2/D4): increments rode the deltas; only
@@ -3666,7 +3883,8 @@ pub fn run(cfg: &Config, target: Target) -> anyhow::Result<Capture> {
 mod tests {
     use super::*;
     use crate::discovery::session::{
-        AttachEvent, AttachKind, BackingRef, DiscoveredCandidate, TableCoverage, TableRetirement,
+        AttachEvent, AttachKind, BackingRef, DiscoveredCandidate, DiscoveredObject, TableCoverage,
+        TableRetirement,
     };
 
     #[test]
@@ -4552,5 +4770,117 @@ mod tests {
                 .any(|c| c.name == "discovery.unparsed_object_dev")
         );
         assert_eq!(state.objects.len(), 1);
+    }
+
+    fn unit_mapping(path: &str, dev: &str, ino: u64, start: u64, x: bool) -> maps::Mapping {
+        maps::Mapping {
+            start,
+            end: start + 0x1000,
+            x,
+            offset: 0,
+            dev: dev.to_string(),
+            ino,
+            path: path.to_string(),
+        }
+    }
+
+    fn unit_candidate(backing: Option<BackingRef>, arr: u64) -> DiscoveredCandidate {
+        DiscoveredCandidate {
+            advertising: "/p/data.so".to_string(),
+            advertising_dev: "08:01".to_string(),
+            advertising_ino: 12,
+            backing,
+            op: 1,
+            funcid: 11,
+            class: "SHA-256".to_string(),
+            weak: false,
+            status: "ok".to_string(),
+            epoch: 0,
+            impl_addr: 0,
+            arr,
+        }
+    }
+
+    #[test]
+    fn relevant_paths_covers_backings_owners_and_objects() {
+        // F-D/A13 T-u1: relevance = candidate backings + array
+        // owners (any x-bit — dispatch arrays live in data
+        // mappings) + new objects. Unreferenced and anonymous
+        // mappings are never relevant.
+        let live = vec![
+            unit_mapping("/p/prov.so", "08:01", 11, 0x1000, true),
+            unit_mapping("/p/data.so", "08:01", 12, 0x2000, false),
+            unit_mapping("/p/obj.so", "08:01", 13, 0x3000, true),
+            unit_mapping("/p/other.so", "08:02", 14, 0x4000, true),
+            unit_mapping("[anon]", "00:00", 0, 0x5000, true),
+        ];
+        let delta = DiscoveryDelta {
+            candidates: vec![unit_candidate(
+                Some(BackingRef {
+                    dev: "08:01".to_string(),
+                    ino: 11,
+                    offset: 8,
+                }),
+                0x2400,
+            )],
+            objects: vec![DiscoveredObject {
+                dev: "08:01".to_string(),
+                ino: 13,
+                display_locator: "/p/obj.so".to_string(),
+            }],
+            ..DiscoveryDelta::default()
+        };
+        let (paths, dropped) = relevant_paths(&delta, &live);
+        assert_eq!(dropped, 0);
+        assert_eq!(
+            paths.into_iter().collect::<Vec<_>>(),
+            vec!["/p/data.so", "/p/obj.so", "/p/prov.so"]
+        );
+    }
+
+    #[test]
+    fn relevant_paths_caps_pathological_sets_deterministically() {
+        // F-D/A13 T-u2: a pathological delta (300 distinct
+        // backings) keeps the lexicographically first 256 paths
+        // and reports the dropped remainder.
+        let mut live = Vec::new();
+        let mut candidates = Vec::new();
+        for i in 0..300u64 {
+            live.push(unit_mapping(
+                &format!("/x/mod{i:03}.so"),
+                "08:01",
+                1_000_000 + i,
+                0x1000,
+                true,
+            ));
+            candidates.push(unit_candidate(
+                Some(BackingRef {
+                    dev: "08:01".to_string(),
+                    ino: 1_000_000 + i,
+                    offset: 8,
+                }),
+                0,
+            ));
+        }
+        let delta = DiscoveryDelta {
+            candidates,
+            ..DiscoveryDelta::default()
+        };
+        let (paths, dropped) = relevant_paths(&delta, &live);
+        assert_eq!(dropped, 44);
+        assert_eq!(paths.len(), MAX_RELEVANT_FILES_PER_POLL);
+        assert_eq!(paths.iter().next().unwrap(), "/x/mod000.so");
+        assert!(paths.contains("/x/mod255.so"));
+        assert!(!paths.contains("/x/mod256.so"));
+    }
+
+    #[test]
+    fn relevant_paths_empty_delta_reads_nothing() {
+        // F-D/A13 T-u3: an empty poll reads no files (the common
+        // steady-state round is maps + stats only).
+        let live = vec![unit_mapping("/p/prov.so", "08:01", 11, 0x1000, true)];
+        let (paths, dropped) = relevant_paths(&DiscoveryDelta::default(), &live);
+        assert_eq!(dropped, 0);
+        assert!(paths.is_empty());
     }
 }
