@@ -2041,6 +2041,61 @@ where
     (out, failed)
 }
 
+/// Per-CPU counter fold (F-C/A8): wrapping sum across CPUs.
+/// Overflow wraps (the core's high-water baselines ignore the
+/// dip, same as the old shared counters).
+fn fold_percpu_sum(slots: &[u64]) -> u64 {
+    slots.iter().fold(0u64, |a, &b| a.wrapping_add(b))
+}
+
+/// Per-CPU flag fold (F-C/A8): OR across CPUs — a bit set on any
+/// CPU is set.
+fn fold_percpu_or(slots: &[u64]) -> u64 {
+    slots.iter().fold(0u64, |a, &b| a | b)
+}
+
+fn open_percpu_hash<K>(
+    maps: &HashMap<String, OwnedFd>,
+    name: &str,
+) -> anyhow::Result<aya::maps::PerCpuHashMap<MapData, K, u64>>
+where
+    K: aya::Pod + Eq + std::hash::Hash,
+{
+    let fd = maps
+        .get(name)
+        .and_then(|f| f.try_clone().ok())
+        .ok_or_else(|| anyhow!("missing map {name}"))?;
+    let data = MapData::from_fd(fd).map_err(|e| anyhow!("{name} mapdata: {e}"))?;
+    let map = Map::from_map_data(data).map_err(|e| anyhow!("{name} map: {e}"))?;
+    aya::maps::PerCpuHashMap::<_, K, u64>::try_from(map).map_err(|e| anyhow!("{name} shape: {e}"))
+}
+
+/// Typed per-CPU map read (F-C/A8): folds each key's slots with
+/// `fold` (sum for counters, OR for flags) and returns the rows
+/// plus whether the snapshot failed. Same checked discipline as
+/// [`read_kv_checked`].
+fn read_percpu_checked<K>(
+    maps: &HashMap<String, OwnedFd>,
+    name: &str,
+    fold: fn(&[u64]) -> u64,
+) -> (Vec<(K, u64)>, bool)
+where
+    K: aya::Pod + Eq + std::hash::Hash,
+{
+    let Ok(map) = open_percpu_hash::<K>(maps, name) else {
+        return (Vec::new(), true);
+    };
+    let mut out = Vec::new();
+    let mut failed = false;
+    for r in map.iter() {
+        match r {
+            Ok((k, slots)) => out.push((k, fold(&slots))),
+            Err(_) => failed = true,
+        }
+    }
+    (out, failed)
+}
+
 /// Delete one hash-map element; an absent key succeeds (already
 /// evicted), anything else reports.
 fn delete_elem<K, V>(map: &mut aya::maps::HashMap<MapData, K, V>, key: &K) -> anyhow::Result<()>
@@ -2111,9 +2166,14 @@ impl SessionEnv for LiveEnv {
     }
 
     fn join_maps(&mut self) -> MapSnapshots {
-        let (trunc, trunc_failed) = read_kv_checked(&self.loaded.maps, "TRUNC");
+        // F-C/A8: counter/flag maps are per-CPU in BPF (exact
+        // single-writer slots); the loader folds to scalars here
+        // so the snapshot shape — and every downstream join —
+        // is unchanged.
+        let (trunc, trunc_failed) = read_percpu_checked(&self.loaded.maps, "TRUNC", fold_percpu_or);
         let (termd, termd_failed) = read_kv_checked(&self.loaded.maps, "TERMD");
-        let (losses, losses_failed) = read_kv_checked(&self.loaded.maps, "LOSS");
+        let (losses, losses_failed) =
+            read_percpu_checked(&self.loaded.maps, "LOSS", fold_percpu_sum);
         // Call volume from the CALLS map (`None` only when the map
         // itself is absent — the core falls back to the QUERY_RET
         // event count then). All counter maps read checked: a
@@ -2121,16 +2181,16 @@ impl SessionEnv for LiveEnv {
         // silent partial sum (the core's high-water baselines
         // additionally ignore the dip).
         let (call_rows, calls_failed): (Vec<(u32, u64)>, bool) =
-            read_kv_checked(&self.loaded.maps, "CALLS");
+            read_percpu_checked(&self.loaded.maps, "CALLS", fold_percpu_sum);
         let calls = if call_rows.is_empty() && !self.loaded.maps.contains_key("CALLS") {
             None
         } else {
             Some(call_rows.iter().map(|(_, n)| n).sum())
         };
         let (trip, trip_failed): (Vec<(u64, u64)>, bool) =
-            read_kv_checked(&self.loaded.maps, "TRIP");
+            read_percpu_checked(&self.loaded.maps, "TRIP", fold_percpu_sum);
         let (lg_rows, lgcalls_failed): (Vec<(u32, u64)>, bool) =
-            read_kv_checked(&self.loaded.maps, "LGCALLS");
+            read_percpu_checked(&self.loaded.maps, "LGCALLS", fold_percpu_sum);
         let lgcalls: u64 = lg_rows.iter().map(|(_, n)| n).sum();
         MapSnapshots {
             trunc,
@@ -2513,6 +2573,20 @@ impl DiscoverySession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn percpu_folds_sum_and_or() {
+        // F-C/A8: counters wrap-sum across CPUs (overflow wraps —
+        // session high-water baselines ignore the dip); flags
+        // OR (a bit set on any CPU is set).
+        assert_eq!(fold_percpu_sum(&[]), 0);
+        assert_eq!(fold_percpu_sum(&[7]), 7);
+        assert_eq!(fold_percpu_sum(&[3, 5, 0, 9]), 17);
+        assert_eq!(fold_percpu_sum(&[u64::MAX, 2]), 1);
+        assert_eq!(fold_percpu_or(&[]), 0);
+        assert_eq!(fold_percpu_or(&[0, 0]), 0);
+        assert_eq!(fold_percpu_or(&[0b0101, 0b1010, 0]), 0b1111);
+    }
 
     fn sample_maps() -> Vec<maps::Mapping> {
         vec![
