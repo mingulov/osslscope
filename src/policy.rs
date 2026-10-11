@@ -45,7 +45,9 @@ pub enum Predicate {
     WeakAlias,
     /// Weak-or-possibly-weak (T10/R06): `Yes` iff the alias is weak,
     /// `Unknown` iff the class list is empty or carries an unresolved
-    /// class (an unknown class could be weak), else `No`.
+    /// class (an unknown class could be weak), or the site is a
+    /// parameter-blind op whose unseen digest/cipher could be weak
+    /// (F-E/B6); else `No`.
     WeakOrUnresolved,
     Not(Box<Predicate>),
     All(Vec<Predicate>),
@@ -134,6 +136,14 @@ impl Predicate {
                         .iter()
                         .any(|a| a == UNRESOLVED_ALGORITHM_CLASS)
                 {
+                    PredicateMatch::Unknown
+                } else if param_blind_op(c.op) {
+                    // F-E/B6: a resolved non-weak class list at a
+                    // parameter-blind op (MAC/KDF/SIGNATURE/
+                    // ASYM_CIPHER) does not rule out a weak
+                    // parameter-selected digest/cipher, which is
+                    // never captured — same upgrade as
+                    // AlgorithmParamAware.
                     PredicateMatch::Unknown
                 } else {
                     PredicateMatch::No
@@ -367,7 +377,10 @@ impl PolicyRule {
     pub fn deny_engine() -> Self {
         Self {
             name: "deny-engine",
-            matcher: String::new(),
+            // F-E/B1: the matcher doubles as the v2 "predicate"
+            // (minLength 1) and the human display; an argument-less
+            // rule still needs a canonical nonempty token.
+            matcher: ENGINE_PROVIDER_CLASS.to_string(),
             rule: Rule::Deny(Predicate::ProviderClass(ENGINE_PROVIDER_CLASS.to_string())),
         }
     }
@@ -383,7 +396,8 @@ impl PolicyRule {
     pub fn deny_weak() -> Self {
         Self {
             name: "deny-weak",
-            matcher: String::new(),
+            // F-E/B1: canonical token, see deny_engine.
+            matcher: "weak".to_string(),
             rule: Rule::Deny(Predicate::WeakOrUnresolved),
         }
     }
@@ -501,9 +515,17 @@ pub fn evaluate_document(rules: &[PolicyRule], doc: &CaptureDocument) -> PolicyV
         .iter()
         .map(|r| {
             let predicate = r.predicate();
-            let bounds = match_bounds(&all, &predicate.as_fn());
+            let mut bounds = match_bounds(&all, &predicate.as_fn());
             let area = rule_area(&r.rule);
             let complete = relevant_complete(area, doc);
+            // F-E/B5: relevant coverage/loss shapes the published
+            // bound, not just the verdict. Definite evidence is
+            // preserved, but over a relevant blind spot the upper
+            // count is unknown (None renders as null), never a
+            // finite number over an unknown denominator.
+            if !complete {
+                bounds.possible = None;
+            }
             let verdict = evaluate_rule(&r.rule, &bounds, complete);
             let hits = match (&r.rule, verdict) {
                 (Rule::Deny(_), RuleVerdict::Violation) => {

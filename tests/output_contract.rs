@@ -13,6 +13,7 @@
 //! capture). v2 goldens pin bytes; examples in docs come from these
 //! fixtures, never invented.
 
+use osslscope::check::policy_record;
 use osslscope::evidence::{
     CandidateCoverage, CandidateIdentity, CaptureDocument, CaptureWindow, Completeness,
     CounterKind, CounterSource, CounterUnits, DispositionRecord, ExpectedScope, FatalKind,
@@ -20,6 +21,7 @@ use osslscope::evidence::{
     PolicyRecord, PolicyRuleResult, PolicyVerdict, RuleVerdict, ScopeCoverage, SiteExecution,
     SiteKey, TargetRecord, finalize,
 };
+use osslscope::policy::{PolicyRule, evaluate_document};
 use osslscope::report::{
     OutputDest, OutputFormat, OutputRequest, render_cbom, render_human, render_json,
     write_artifacts,
@@ -514,6 +516,38 @@ fn rendered_fixtures_validate_against_v2_schema() {
         let v = json_of(&doc);
         validate_v2(&v).unwrap_or_else(|e| panic!("{name} fails schema: {e}"));
         check_v2_semantics(&v).unwrap_or_else(|e| panic!("{name} fails semantics: {e}"));
+    }
+}
+
+#[test]
+fn every_cli_rule_renders_a_schema_valid_predicate() {
+    // F-E/B1: evaluator -> policy-record -> renderer for every CLI
+    // rule constructor. deny-engine/deny-weak once emitted
+    // "predicate": "" against minLength 1; every rule must render
+    // a nonempty predicate and validate end to end.
+    for (name, rule) in [
+        ("require-provider", PolicyRule::require_provider("default")),
+        ("deny-provider", PolicyRule::deny_provider("legacy")),
+        ("deny-engine", PolicyRule::deny_engine()),
+        ("deny-algorithm", PolicyRule::deny_algorithm("DES")),
+        ("deny-weak", PolicyRule::deny_weak()),
+        (
+            "require-executed",
+            PolicyRule::require_executed("AES-256-GCM"),
+        ),
+    ] {
+        let v = evaluate_document(std::slice::from_ref(&rule), &complete_doc());
+        let record = policy_record(&v);
+        assert_eq!(record.rules.len(), 1, "{name} yields one rule");
+        assert!(
+            !record.rules[0].predicate.is_empty(),
+            "{name} predicate must be nonempty"
+        );
+        let mut doc = complete_doc();
+        doc.policy = Some(record);
+        let rendered = json_of(&doc);
+        validate_v2(&rendered).unwrap_or_else(|e| panic!("{name} fails schema: {e}"));
+        check_v2_semantics(&rendered).unwrap_or_else(|e| panic!("{name} fails semantics: {e}"));
     }
 }
 
