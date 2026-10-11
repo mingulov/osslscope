@@ -73,13 +73,26 @@ pub fn provider_mapping<'a>(
     // after a same-path replacement the old mapping still matches
     // by pathname but backs the WRONG bytes, and a deleted path's
     // unlinked mapping must fail closed (loud attach failure), never
-    // misattribute (T14r4-2b). The match key is the INODE alone:
-    // stat-dev and maps-text dev DIVERGE on overlayfs (measured
-    // 00:33 vs 00:22 for one file — xino reporting), while the inode
-    // is the same dentry both sides. Addr coverage makes cross-fs
-    // ino collisions vanish (two filesystems' files mapped over one
-    // address), and the epoch fingerprint keeps the maps-view dev
-    // for maps-consistent turnover detection.
+    // misattribute (T14r4-2b).
+    //
+    // The (addr, ino) prefilter is necessary but not sufficient:
+    // inode numbers collide across filesystems, and address
+    // coverage cannot exclude the collision (only one mapping
+    // covers the address — the wrong file's). The maps-text dev
+    // cannot close the gap either: stat-dev and maps-text dev
+    // DIVERGE on overlayfs (measured 00:33 vs 00:22 for one file —
+    // xino reporting). So the match binds in the descriptor domain
+    // instead (F-A/A2): the mapping's path must stat to the SAME
+    // (dev, ino) the provider argument stats to. Both stats traverse
+    // one mount topology from one namespace, so overlay divergence
+    // cannot false-mismatch (the text dev is ignored entirely)
+    // while a genuine cross-filesystem collision mismatches on dev.
+    // The binding is race-sound for ordinary replacement: an inode
+    // number cannot be reused while the target's mapping pins the
+    // inode, so a same-path replacement always fails the prefilter.
+    // Unstatable mapping paths (`(deleted)` suffixes, foreign mount
+    // namespaces) fail closed. The epoch fingerprint keeps the
+    // maps-view dev for maps-consistent turnover detection.
     let Ok(meta) = std::fs::metadata(provider) else {
         return None;
     };
@@ -87,8 +100,16 @@ pub fn provider_mapping<'a>(
     if ino == 0 {
         return None;
     }
-    maps.iter()
-        .find(|m| m.start <= addr && addr < m.end && m.ino == ino)
+    let m = maps
+        .iter()
+        .find(|m| m.start <= addr && addr < m.end && m.ino == ino)?;
+    let Ok(map_meta) = std::fs::metadata(&m.path) else {
+        return None;
+    };
+    if map_meta.dev() != meta.dev() || map_meta.ino() != ino {
+        return None;
+    }
+    Some(m)
 }
 
 #[cfg(test)]
@@ -128,7 +149,7 @@ mod tests {
         );
         // Target mapped v1 under the module path.
         let text = format!(
-            "7f2a2000-7f2a3000 r-xp 00000000 {} {} {}\\n",
+            "7f2a2000-7f2a3000 r-xp 00000000 {} {} {}\n",
             dev,
             meta1.ino(),
             path.display()
@@ -155,6 +176,71 @@ mod tests {
         std::fs::write(&path, b"v3").unwrap();
         assert!(provider_mapping(&m, &path, "", 0x1000).is_none());
         std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap_or_default();
+    }
+
+    /// A2 pin: a same-inode mapping on ANOTHER device is not the
+    /// provider file — inode numbers collide across filesystems,
+    /// and address coverage does not exclude the collision (only
+    /// one mapping covers the address: the wrong file's).
+    #[test]
+    fn mapping_lookup_rejects_cross_filesystem_ino_collision() {
+        let dir = std::env::temp_dir().join(format!("osslscope-xfs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("idprov.so");
+        std::fs::write(&path, b"v1-bytes").unwrap();
+        let ino = std::fs::metadata(&path).unwrap().ino();
+        // The target's mapping carries the colliding inode under a
+        // foreign device (another filesystem's file at the address).
+        let text = format!("7f2a2000-7f2a3000 r-xp 00000000 ff:ff {ino} /other/fs/idprov.so\n");
+        let m = parse_maps(&text);
+        assert_eq!(m.len(), 1);
+        assert!(
+            provider_mapping(&m, &path, "", 0x7f2a2400).is_none(),
+            "cross-filesystem ino collision must not resolve as the provider"
+        );
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap_or_default();
+    }
+
+    /// A2 pin: forged maps text (colliding inode, foreign device,
+    /// but a REAL mapped path) still fails: the mapping's path
+    /// stats to file A while the provider argument stats to file B.
+    #[test]
+    fn mapping_lookup_binds_mapping_path_identity() {
+        let dir = std::env::temp_dir().join(format!("osslscope-bind-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.so");
+        let b = dir.join("b.so");
+        std::fs::write(&a, b"file-a-bytes").unwrap();
+        std::fs::write(&b, b"file-b-bytes-longer").unwrap();
+        let ino_b = std::fs::metadata(&b).unwrap().ino();
+        assert_ne!(std::fs::metadata(&a).unwrap().ino(), ino_b);
+        // (addr, ino) matches file B, but the mapping's path is
+        // file A: the descriptor-domain stats disagree.
+        let text = format!(
+            "7f2a2000-7f2a3000 r-xp 00000000 ff:ff {ino_b} {}\n",
+            a.display()
+        );
+        let m = parse_maps(&text);
+        assert_eq!(m.len(), 1);
+        assert!(
+            provider_mapping(&m, &b, "", 0x7f2a2400).is_none(),
+            "mapping backing a different file must not resolve as the provider"
+        );
+        // Control: the same mapping resolves its own file.
+        let ino_a = std::fs::metadata(&a).unwrap().ino();
+        let text = format!(
+            "7f2a2000-7f2a3000 r-xp 00000000 ff:ff {ino_a} {}\n",
+            a.display()
+        );
+        let m = parse_maps(&text);
+        assert!(
+            provider_mapping(&m, &a, "", 0x7f2a2400).is_some(),
+            "mapping of the provider file must resolve whatever the text dev says"
+        );
+        std::fs::remove_file(&a).unwrap();
+        std::fs::remove_file(&b).unwrap();
         std::fs::remove_dir_all(&dir).unwrap_or_default();
     }
 
