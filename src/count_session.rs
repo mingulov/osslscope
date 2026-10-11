@@ -544,7 +544,9 @@ impl<B: CountBackend> CountSession<B> {
                     offset: row.offset,
                     reason: "quarantined",
                 });
-                self.missed_attaches += 1;
+                // Counted once by the per-call aggregate below (all
+                // pre-attach pushes); a second increment here would
+                // double-count (slice-A review Minor-1).
                 continue;
             }
             self.known.insert(cookie);
@@ -583,6 +585,9 @@ impl<B: CountBackend> CountSession<B> {
                 }
             }
         }
+        // Single counting point for every miss pushed above
+        // (planned + quarantined); pushes below (verify/attach
+        // failures) carry their own increment instead.
         self.missed_attaches += report.missed.len() as u64;
         // Attach survivors are skipped; every attached path is
         // open-file verified against its own backing triple.
