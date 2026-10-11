@@ -43,8 +43,8 @@ use crate::count_session::{
 };
 use crate::discovery::provider::ProviderTable;
 use crate::discovery::session::{
-    CoverageState, DiscoveryDelta, DiscoverySession, DiscoverySnapshot, PollBudget, Recycled,
-    TripwireDelta,
+    CoverageState, DiscoveredCandidate, DiscoveryDelta, DiscoverySession, DiscoverySnapshot,
+    PollBudget, Recycled, TripwireDelta,
 };
 use crate::discovery::{coverage, elf, legacy, maps, onboard};
 use crate::evidence::{
@@ -646,6 +646,11 @@ impl ClockPort for LiveClock {
 pub trait ProcPort {
     fn read_maps(&mut self, pid: u32) -> anyhow::Result<Vec<maps::Mapping>>;
     fn read_file(&mut self, path: &str) -> anyhow::Result<Vec<u8>>;
+    /// Identity-bound read (F-A/A3): bytes plus the read-time
+    /// (encoded dev, ino) they were read as. Implementations pin
+    /// the file across the read (open once, fstat/read/fstat) so
+    /// the bytes cannot tear across a replacement.
+    fn read_file_bound(&mut self, path: &str) -> anyhow::Result<(Vec<u8>, (u64, u64))>;
     fn read_exe(&mut self, pid: u32) -> Option<PathBuf>;
     fn file_len(&mut self, path: &str) -> Option<u64>;
     /// Current comm (`None` when unreadable — the caller keeps its
@@ -664,6 +669,10 @@ impl ProcPort for LiveProc {
 
     fn read_file(&mut self, path: &str) -> anyhow::Result<Vec<u8>> {
         Ok(std::fs::read(path)?)
+    }
+
+    fn read_file_bound(&mut self, path: &str) -> anyhow::Result<(Vec<u8>, (u64, u64))> {
+        Ok(plan::read_file_bound(path).map(|f| (f.bytes, (f.dev, f.ino)))?)
     }
 
     fn read_exe(&mut self, pid: u32) -> Option<PathBuf> {
@@ -925,23 +934,23 @@ fn classify_loss(source: u32, count: u64) -> GapCounter {
 
 /// Verified object identity for one mapped backing: the file's
 /// build-id when its bytes yield one, else an opaque unverified id
-/// (D3). `fallback` covers objects whose mapping is already gone
-/// (their display locator survives as a hint, never as identity).
+/// (D3). Bytes bind to the mapping's inode (F-A/A3): a same-path
+/// replacement between the maps read and the files read lends the
+/// new file's fingerprint to nothing. A vanished mapping never
+/// yields build-id — without the VMA pinning its inode, the bytes
+/// are unprovable (the display locator survives on the record as a
+/// hint, never as identity).
 fn object_id_for_mapping(
     dev: &str,
     ino: u64,
     live: &[maps::Mapping],
-    files: &HashMap<String, Vec<u8>>,
-    fallback: Option<&str>,
+    files: &HashMap<String, plan::FileBytes>,
 ) -> ObjectId {
-    let locator = live
+    let bid = live
         .iter()
         .find(|m| m.dev == dev && m.ino == ino)
-        .map(|m| m.path.as_str())
-        .or(fallback);
-    let bid = locator
-        .and_then(|p| files.get(p))
-        .and_then(|b| elf::read_build_id(b));
+        .and_then(|m| plan::bound_bytes(files, &m.path, ino))
+        .and_then(elf::read_build_id);
     match bid {
         Some(id) => ObjectId(format!("build:{id}")),
         None => ObjectId(format!("unverified:{dev}:{ino}")),
@@ -951,28 +960,38 @@ fn object_id_for_mapping(
 /// Advertising provider object id (D3): fingerprinted from the
 /// array owner's mapped bytes when available, else opaque.
 fn advertising_object_id(
-    advertising: &str,
+    candidate: &DiscoveredCandidate,
     live: &[maps::Mapping],
-    files: &HashMap<String, Vec<u8>>,
+    files: &HashMap<String, plan::FileBytes>,
 ) -> ObjectId {
-    if advertising.is_empty() {
+    if candidate.advertising.is_empty() {
         return ObjectId("unverified-advertising:anonymous".to_string());
     }
-    let owner = live.iter().find(|m| m.path == advertising);
-    let bid = owner
-        .and_then(|_| files.get(advertising))
-        .and_then(|b| elf::read_build_id(b));
+    // Exact-VMA join by array address — never first-pathname-match
+    // (F-A/A3), which conflates simultaneously live old/new objects
+    // under one path.
+    let owner = live
+        .iter()
+        .find(|m| m.start <= candidate.arr && candidate.arr < m.end && m.ino != 0);
+    let Some(m) = owner else {
+        return ObjectId("unverified-advertising:anonymous".to_string());
+    };
+    // Turnover check: the array's current owner must still be the
+    // discovery-time owner (same-domain text compare — overlay
+    // consistent on both sides). The class was decoded from the
+    // old file's array, so a changed owner degrades rather than
+    // borrowing the new file's fingerprint.
+    if m.dev != candidate.advertising_dev || m.ino != candidate.advertising_ino {
+        return ObjectId("unverified-advertising:anonymous".to_string());
+    }
+    let bid = plan::bound_bytes(files, &m.path, m.ino).and_then(elf::read_build_id);
     match bid {
         Some(id) => ObjectId(format!("build:{id}")),
-        // Mapping-bound opaque identity (D3): while the path still
-        // resolves, the id binds the mapping's (dev, ino) — a
-        // same-path replacement changes identity instead of
-        // conflating two objects, and an unresolvable path degrades
-        // to anonymous. The pathname itself never becomes identity.
-        None => match owner {
-            Some(m) => ObjectId(format!("unverified-advertising:{}:{}", m.dev, m.ino)),
-            None => ObjectId("unverified-advertising:anonymous".to_string()),
-        },
+        // Mapping-bound opaque identity (D3): the id binds the
+        // mapping's (dev, ino) — a same-path replacement changes
+        // identity instead of conflating two objects. The pathname
+        // itself never becomes identity.
+        None => ObjectId(format!("unverified-advertising:{}:{}", m.dev, m.ino)),
     }
 }
 
@@ -1143,7 +1162,7 @@ fn degrade_all_sites(
 /// round's classification inputs.
 pub struct AdapterCtx<'a> {
     pub live: &'a [maps::Mapping],
-    pub files: &'a HashMap<String, Vec<u8>>,
+    pub files: &'a HashMap<String, plan::FileBytes>,
     pub builtin_default: bool,
     /// Pinned provider class for this run's provider file, if the
     /// operator enrolled it (wins over the builtin assertion).
@@ -1336,7 +1355,7 @@ pub fn adapt_delta(
             candidate.class.clone()
         };
         let identity = CandidateIdentity::new(
-            advertising_object_id(&candidate.advertising, ctx.live, ctx.files),
+            advertising_object_id(candidate, ctx.live, ctx.files),
             provider_class.clone(),
             candidate.op,
             candidate.funcid,
@@ -1401,7 +1420,7 @@ pub fn adapt_delta(
             CandidateCoverage::Complete
         };
         let site_key = SiteKey {
-            object: object_id_for_mapping(&dev_str, ino, ctx.live, ctx.files, None),
+            object: object_id_for_mapping(&dev_str, ino, ctx.live, ctx.files),
             device,
             inode: ino,
             offset,
@@ -1505,13 +1524,7 @@ pub fn adapt_delta(
             continue;
         }
         let record = ObjectRecord {
-            id: object_id_for_mapping(
-                &object.dev,
-                object.ino,
-                ctx.live,
-                ctx.files,
-                Some(&object.display_locator),
-            ),
+            id: object_id_for_mapping(&object.dev, object.ino, ctx.live, ctx.files),
             device,
             inode: object.ino,
             display_locator: object.display_locator.clone(),
@@ -1735,16 +1748,17 @@ where
         }
     }
 
-    /// Pre-read every distinct mapped path once per round. Failures
-    /// skip (the planner misses those rows loud as unreadable).
-    fn read_round_files(&mut self, live: &[maps::Mapping]) -> HashMap<String, Vec<u8>> {
+    /// Pre-read every distinct mapped path once per round, bound
+    /// to its read-time identity (F-A/A3). Failures skip (the
+    /// planner misses those rows loud as unreadable).
+    fn read_round_files(&mut self, live: &[maps::Mapping]) -> HashMap<String, plan::FileBytes> {
         let mut paths: Vec<&str> = live.iter().map(|m| m.path.as_str()).collect();
         paths.sort_unstable();
         paths.dedup();
         let mut out = HashMap::new();
         for p in paths {
-            if let Ok(bytes) = self.proc.read_file(p) {
-                out.insert(p.to_string(), bytes);
+            if let Ok((bytes, (dev, ino))) = self.proc.read_file_bound(p) {
+                out.insert(p.to_string(), plan::FileBytes { bytes, dev, ino });
             }
         }
         out
@@ -1755,7 +1769,7 @@ where
     fn poll_and_apply(
         &mut self,
         live: &[maps::Mapping],
-        files: &HashMap<String, Vec<u8>>,
+        files: &HashMap<String, plan::FileBytes>,
         fresh: &HashSet<(String, u64)>,
         post_settle: bool,
         baseline: bool,
@@ -3703,6 +3717,8 @@ mod tests {
     ) -> DiscoveredCandidate {
         DiscoveredCandidate {
             advertising: advertising.to_string(),
+            advertising_dev: String::new(),
+            advertising_ino: 0,
             backing,
             op,
             funcid,
@@ -3735,7 +3751,7 @@ mod tests {
 
     fn ctx_for<'a>(
         live: &'a [maps::Mapping],
-        files: &'a HashMap<String, Vec<u8>>,
+        files: &'a HashMap<String, plan::FileBytes>,
         fresh: &'a HashSet<(String, u64)>,
     ) -> AdapterCtx<'a> {
         AdapterCtx {

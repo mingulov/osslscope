@@ -125,9 +125,11 @@ pub fn emit(
     // shifting is out of P1 scope (no wild incidence; catching it
     // needs per-query row tags).
     //
-    // Foreign-file ELF bytes (shared-code rows): path → bytes, failures
-    // cached as empty (parse then fails → unbacked, no repeated reads).
-    let mut elf_cache: std::collections::HashMap<String, Vec<u8>> =
+    // Foreign-file ELF bytes (shared-code rows): path → bytes bound
+    // to the mapping's inode (F-A/A3 — a replacement between the maps
+    // read and the render lends nothing). Failures cached as empty
+    // (parse then fails → unbacked, no repeated reads).
+    let mut elf_cache: std::collections::HashMap<String, crate::plan::FileBytes> =
         std::collections::HashMap::new();
     let mut resolved: Vec<(&Row, bool, String, u64, u64)> = Vec::with_capacity(rows.len());
     for r in rows {
@@ -147,11 +149,19 @@ pub fn emit(
                     // file, not the provider.
                     Some(m) => {
                         let o = r.impl_addr - m.start + m.offset;
-                        let bytes = elf_cache
-                            .entry(m.path.clone())
-                            .or_insert_with(|| std::fs::read(&m.path).unwrap_or_default());
+                        elf_cache.entry(m.path.clone()).or_insert_with(|| {
+                            crate::plan::read_file_bound(&m.path).unwrap_or(
+                                crate::plan::FileBytes {
+                                    bytes: Vec::new(),
+                                    dev: 0,
+                                    ino: 0,
+                                },
+                            )
+                        });
+                        let bound = crate::plan::bound_bytes(&elf_cache, &m.path, m.ino);
                         let ok = m.x
-                            && elf::parse_elf(bytes)
+                            && bound
+                                .and_then(|b| elf::parse_elf(b).ok())
                                 .map(|e| elf::offset_in_x_segment(&e, o))
                                 .unwrap_or(false);
                         (ok, m.dev.clone(), m.ino, o)
@@ -915,6 +925,10 @@ mod tests {
             .expect("no libc at standard paths — broken test env");
         let bytes = std::fs::read(libc).unwrap();
         let off = elf::dynsym_file_offset(&bytes, "printf").unwrap();
+        // A3: the foreign arm binds the cached bytes to the
+        // mapping's inode, so the fixture carries the real one.
+        use std::os::unix::fs::MetadataExt as _;
+        let real_ino = std::fs::metadata(libc).unwrap().ino();
         let base = 0x7f00_0000_0000u64;
         let live = vec![maps::Mapping {
             start: base,
@@ -922,7 +936,7 @@ mod tests {
             x: true,
             offset: 0,
             dev: "08:01".into(),
-            ino: 999,
+            ino: real_ino,
             path: libc.into(),
         }];
         let rows = vec![
@@ -961,10 +975,56 @@ mod tests {
         assert_eq!(jrows[0]["backing"]["offset"], off);
         assert_eq!(
             jrows[0]["addr_hash"],
-            crate::kinds::addr_hash("08:01", 999, off)
+            crate::kinds::addr_hash("08:01", real_ino, off)
         );
         // Unmapped rows are fenced (count-only, never attributed).
         assert_eq!(jrows.len(), 1);
+        assert_eq!(doc["status"], "PARTIAL");
+        assert_eq!(doc["reason"], "fenced-rows");
+        assert_eq!(doc["fenced_rows"], 1);
+    }
+
+    #[test]
+    fn shared_code_row_fenced_on_replacement() {
+        // A3 pin: the bytes of a replaced file lend nothing — the
+        // same libc path under a stale inode fences the row.
+        let libc = ["/lib/x86_64-linux-gnu/libc.so.6", "/usr/lib/libc.so.6"]
+            .into_iter()
+            .find(|p| std::path::Path::new(p).exists())
+            .expect("no libc at standard paths — broken test env");
+        let bytes = std::fs::read(libc).unwrap();
+        let off = elf::dynsym_file_offset(&bytes, "printf").unwrap();
+        let base = 0x7f00_0000_0000u64;
+        let live = vec![maps::Mapping {
+            start: base,
+            end: base + 0x100000,
+            x: true,
+            offset: 0,
+            dev: "08:01".into(),
+            ino: 999,
+            path: libc.into(),
+        }];
+        let rows = vec![Row {
+            op: 1,
+            alg_class: "SHA1".into(),
+            weak: true,
+            status: "ok".into(),
+            funcid: 3,
+            impl_addr: base + off,
+            arr: 0,
+        }];
+        let doc = emit(
+            "t",
+            Path::new("/fake/provider.so"),
+            "",
+            &bytes,
+            &live,
+            &rows,
+            true,
+            &Stats::trivial(),
+        )
+        .unwrap();
+        assert_eq!(doc["rows"].as_array().unwrap().len(), 0);
         assert_eq!(doc["status"], "PARTIAL");
         assert_eq!(doc["reason"], "fenced-rows");
         assert_eq!(doc["fenced_rows"], 1);

@@ -196,10 +196,19 @@ fn session() -> CountSession<FakeCountBackend> {
     CountSession::new(PID, FakeCountBackend::new())
 }
 
-fn files_for(staged: &[&Staged]) -> HashMap<String, Vec<u8>> {
+fn files_for(staged: &[&Staged]) -> HashMap<String, plan::FileBytes> {
     staged
         .iter()
-        .map(|s| (s.path.clone(), std::fs::read(&s.path).unwrap()))
+        .map(|s| {
+            (
+                s.path.clone(),
+                plan::FileBytes {
+                    bytes: std::fs::read(&s.path).unwrap(),
+                    dev: s.device,
+                    ino: s.ino,
+                },
+            )
+        })
         .collect()
 }
 

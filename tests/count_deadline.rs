@@ -152,7 +152,14 @@ fn kernel_deadline_excludes_late_calls() {
     let off = x_offsets(&bytes, 1)[0];
     let a = stage.write("prov.so", &bytes);
     let live = vec![mapping(&a)];
-    let files = HashMap::from([(a.path.clone(), std::fs::read(&a.path).unwrap())]);
+    let files = HashMap::from([(
+        a.path.clone(),
+        plan::FileBytes {
+            bytes: std::fs::read(&a.path).unwrap(),
+            dev: a.device,
+            ino: a.ino,
+        },
+    )]);
     let mut s = session_with(FakeCountBackend::new());
     let d = CountDelta {
         discovered: vec![site(&a, off, 7)],
@@ -193,7 +200,14 @@ fn window_closed_until_open() {
     let off = x_offsets(&bytes, 1)[0];
     let a = stage.write("prov.so", &bytes);
     let live = vec![mapping(&a)];
-    let files = HashMap::from([(a.path.clone(), std::fs::read(&a.path).unwrap())]);
+    let files = HashMap::from([(
+        a.path.clone(),
+        plan::FileBytes {
+            bytes: std::fs::read(&a.path).unwrap(),
+            dev: a.device,
+            ino: a.ino,
+        },
+    )]);
     let mut s = session_with(FakeCountBackend::new());
     let d = CountDelta {
         discovered: vec![site(&a, off, 7)],
@@ -242,7 +256,14 @@ fn map_full_is_explicit() {
     let offs = x_offsets(&bytes, 3);
     let a = stage.write("prov.so", &bytes);
     let live = vec![mapping(&a)];
-    let files = HashMap::from([(a.path.clone(), std::fs::read(&a.path).unwrap())]);
+    let files = HashMap::from([(
+        a.path.clone(),
+        plan::FileBytes {
+            bytes: std::fs::read(&a.path).unwrap(),
+            dev: a.device,
+            ino: a.ino,
+        },
+    )]);
     let mut s = session_with(FakeCountBackend::with_capacity(2));
     let d = CountDelta {
         discovered: offs
@@ -302,7 +323,14 @@ fn per_key_threaded_counts() {
     let offs = x_offsets(&bytes, KEYS);
     let a = stage.write("prov.so", &bytes);
     let live = vec![mapping(&a)];
-    let files = HashMap::from([(a.path.clone(), std::fs::read(&a.path).unwrap())]);
+    let files = HashMap::from([(
+        a.path.clone(),
+        plan::FileBytes {
+            bytes: std::fs::read(&a.path).unwrap(),
+            dev: a.device,
+            ino: a.ino,
+        },
+    )]);
     let mut s = session_with(FakeCountBackend::new());
     let d = CountDelta {
         discovered: offs
@@ -473,7 +501,14 @@ fn replaced_during_attach_quarantines_hits() {
     let off = x_offsets(&bytes, 1)[0];
     let a = stage.write("prov.so", &bytes);
     let live = vec![mapping(&a)];
-    let files = HashMap::from([(a.path.clone(), std::fs::read(&a.path).unwrap())]);
+    let files = HashMap::from([(
+        a.path.clone(),
+        plan::FileBytes {
+            bytes: std::fs::read(&a.path).unwrap(),
+            dev: a.device,
+            ino: a.ino,
+        },
+    )]);
     let backend = SwapBackend {
         inner: FakeCountBackend::new(),
         swap: std::cell::RefCell::new(Some((PathBuf::from(&a.path), bytes.clone()))),
@@ -514,7 +549,14 @@ fn fake_backend_folds_bounds_monotonically() {
     let off = x_offsets(&bytes, 1)[0];
     let a = stage.write("prov.so", &bytes);
     let live = vec![mapping(&a)];
-    let files = HashMap::from([(a.path.clone(), std::fs::read(&a.path).unwrap())]);
+    let files = HashMap::from([(
+        a.path.clone(),
+        plan::FileBytes {
+            bytes: std::fs::read(&a.path).unwrap(),
+            dev: a.device,
+            ino: a.ino,
+        },
+    )]);
     let mut s = session_with(FakeCountBackend::new());
     let d = CountDelta {
         discovered: vec![site(&a, off, 7)],
@@ -543,7 +585,14 @@ fn quarantined_cookie_skips_reattach_until_fence() {
     let off = x_offsets(&bytes, 1)[0];
     let a = stage.write("prov.so", &bytes);
     let live = vec![mapping(&a)];
-    let files = HashMap::from([(a.path.clone(), std::fs::read(&a.path).unwrap())]);
+    let files = HashMap::from([(
+        a.path.clone(),
+        plan::FileBytes {
+            bytes: std::fs::read(&a.path).unwrap(),
+            dev: a.device,
+            ino: a.ino,
+        },
+    )]);
     let backend = SwapBackend {
         inner: FakeCountBackend::new(),
         swap: std::cell::RefCell::new(Some((PathBuf::from(&a.path), bytes.clone()))),

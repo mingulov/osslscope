@@ -356,7 +356,7 @@ struct FakeProc {
     clock: Rc<FakeClock>,
     maps: Vec<Mapping>,
     maps_seq: VecDeque<Vec<Mapping>>,
-    files: HashMap<String, Vec<u8>>,
+    files: HashMap<String, plan::FileBytes>,
     file_err: HashSet<String>,
     exe: Option<PathBuf>,
     maps_err_at: HashSet<usize>,
@@ -391,7 +391,18 @@ impl ProcPort for FakeProc {
         }
         self.files
             .get(path)
-            .cloned()
+            .map(|f| f.bytes.clone())
+            .ok_or_else(|| anyhow::anyhow!("no such staged file {path}"))
+    }
+
+    fn read_file_bound(&mut self, path: &str) -> anyhow::Result<(Vec<u8>, (u64, u64))> {
+        self.clock.advance_ns(self.file_delay_ns);
+        if self.file_err.contains(path) {
+            anyhow::bail!("injected file failure for {path}");
+        }
+        self.files
+            .get(path)
+            .map(|f| (f.bytes.clone(), (f.dev, f.ino)))
             .ok_or_else(|| anyhow::anyhow!("no such staged file {path}"))
     }
 
@@ -400,7 +411,7 @@ impl ProcPort for FakeProc {
     }
 
     fn file_len(&mut self, path: &str) -> Option<u64> {
-        self.files.get(path).map(|b| b.len() as u64)
+        self.files.get(path).map(|f| f.bytes.len() as u64)
     }
 
     fn read_comm(&mut self, _pid: u32) -> Option<String> {
@@ -516,6 +527,8 @@ fn cand(
 ) -> DiscoveredCandidate {
     DiscoveredCandidate {
         advertising: advertising.to_string(),
+        advertising_dev: String::new(),
+        advertising_ino: 0,
         backing,
         op,
         funcid,
@@ -600,7 +613,7 @@ struct Harness {
     lifecycle_fallback: bool,
     maps: Vec<Mapping>,
     maps_seq: VecDeque<Vec<Mapping>>,
-    files: HashMap<String, Vec<u8>>,
+    files: HashMap<String, plan::FileBytes>,
     file_err: HashSet<String>,
     exe: Option<PathBuf>,
     maps_err_at: HashSet<usize>,
@@ -622,7 +635,14 @@ impl Harness {
         let clock = FakeClock::new();
         let maps = vec![mapping(&staged)];
         let mut files = HashMap::new();
-        files.insert(staged.path.clone(), bytes.clone());
+        files.insert(
+            staged.path.clone(),
+            plan::FileBytes {
+                bytes: bytes.clone(),
+                dev: staged.device,
+                ino: staged.ino,
+            },
+        );
         Self {
             stage,
             staged,
@@ -846,7 +866,14 @@ fn untracked_epoch_executions_are_unattributed_partial() {
     let mut h = Harness::fresh("untracked-exec");
     h.snapshot_attached();
     let prov2 = h.stage.write("prov2.so", &h.bytes.clone());
-    h.files.insert(prov2.path.clone(), h.bytes.clone());
+    h.files.insert(
+        prov2.path.clone(),
+        plan::FileBytes {
+            bytes: h.bytes.clone(),
+            dev: prov2.device,
+            ino: prov2.ino,
+        },
+    );
     h.maps = vec![mapping(&h.staged), mapping(&prov2)];
     let cand_a = cand(
         "/p/provider.so",
@@ -1394,8 +1421,22 @@ fn late_provider_operation_attaches_with_loss() {
     h.snapshot_attached();
     let prov2 = h.stage.write("prov2.so", &h.bytes.clone());
     let newso = h.stage.write("new.so", &h.bytes.clone());
-    h.files.insert(prov2.path.clone(), h.bytes.clone());
-    h.files.insert(newso.path.clone(), h.bytes.clone());
+    h.files.insert(
+        prov2.path.clone(),
+        plan::FileBytes {
+            bytes: h.bytes.clone(),
+            dev: prov2.device,
+            ino: prov2.ino,
+        },
+    );
+    h.files.insert(
+        newso.path.clone(),
+        plan::FileBytes {
+            bytes: h.bytes.clone(),
+            dev: newso.device,
+            ino: newso.ino,
+        },
+    );
     let steady = vec![mapping(&h.staged), mapping(&prov2)];
     let dlopen = vec![mapping(&h.staged), mapping(&prov2), mapping(&newso)];
     h.maps_seq = VecDeque::from([
@@ -2091,7 +2132,14 @@ fn maps_fence_versions_generation() {
     let mut h = Harness::fresh("fence");
     h.snapshot_attached();
     let newso = h.stage.write("new.so", &h.bytes.clone());
-    h.files.insert(newso.path.clone(), h.bytes.clone());
+    h.files.insert(
+        newso.path.clone(),
+        plan::FileBytes {
+            bytes: h.bytes.clone(),
+            dev: newso.device,
+            ino: newso.ino,
+        },
+    );
     let before = vec![mapping(&h.staged)];
     let after = vec![mapping(&h.staged), mapping(&newso)];
     h.maps_seq = VecDeque::from([before.clone(), before.clone(), before, after.clone()]);
@@ -2192,23 +2240,30 @@ fn advertising_fallback_binds_mapping_not_path() {
     let mut live2 = live1.clone();
     live2[0].ino += 1;
     let fresh: HashSet<(String, u64)> = HashSet::new();
-    let files: HashMap<String, Vec<u8>> = HashMap::new();
+    let files: HashMap<String, plan::FileBytes> = HashMap::new();
     let run = |live: &[Mapping], ino: u64| {
         let mut state = AdapterState::default();
+        // The candidate carries the array's discovery-time owner
+        // (refreshed by discovery on remap, like the backing):
+        // the array address joins the exact VMA.
+        let mut c = cand(
+            staged.path.as_str(),
+            Some(BackingRef {
+                dev: dev.clone(),
+                ino,
+                offset: 0x100,
+            }),
+            1,
+            11,
+            "SHA-256",
+            false,
+            "ok",
+        );
+        c.arr = live[0].start + 8;
+        c.advertising_dev = dev.clone();
+        c.advertising_ino = ino;
         let delta = DiscoveryDelta {
-            candidates: vec![cand(
-                staged.path.as_str(),
-                Some(BackingRef {
-                    dev: dev.clone(),
-                    ino,
-                    offset: 0x100,
-                }),
-                1,
-                11,
-                "SHA-256",
-                false,
-                "ok",
-            )],
+            candidates: vec![c],
             ..DiscoveryDelta::default()
         };
         let adapted = adapt_delta(
@@ -2248,7 +2303,7 @@ fn advertising_fallback_unresolved_is_anonymous() {
     let bytes = self_bytes();
     let staged = stage.write("prov.so", &bytes);
     let live = vec![mapping(&staged)];
-    let files: HashMap<String, Vec<u8>> = HashMap::new();
+    let files: HashMap<String, plan::FileBytes> = HashMap::new();
     let fresh: HashSet<(String, u64)> = HashSet::new();
     let mut state = AdapterState::default();
     let delta = DiscoveryDelta {
@@ -2280,6 +2335,228 @@ fn advertising_fallback_unresolved_is_anonymous() {
     let id = adapted.delta.discovered[0].candidates[0].provider.0.clone();
     assert_eq!(id, "unverified-advertising:anonymous");
     assert!(!id.contains("gone"));
+}
+
+#[test]
+fn stale_path_fingerprint_is_unverified() {
+    // A3: the files read raced a same-path replacement — the bytes
+    // (and identity) are the NEW file's while the mapping is the
+    // old file's. The site must degrade to unverified, never wear
+    // the new file's fingerprint.
+    let stage = Stage::fresh("fp-stale");
+    let bytes_old = self_bytes();
+    let bytes_new = flipped_build_id(&bytes_old);
+    let staged = stage.write("prov.so", &bytes_old);
+    let dev = plan::render_device(staged.device);
+    // Replacement: same path, new inode.
+    use std::os::unix::fs::MetadataExt as _;
+    let path = PathBuf::from(&staged.path);
+    std::fs::remove_file(&path).unwrap();
+    std::fs::write(&path, &bytes_new).unwrap();
+    let meta_new = std::fs::metadata(&path).unwrap();
+    assert_ne!(meta_new.ino(), staged.ino);
+    // Round artifacts: maps still show the old file (the VMA pins
+    // it), files were read after the replacement.
+    let live = vec![mapping(&staged)];
+    let files: HashMap<String, plan::FileBytes> = HashMap::from([(
+        staged.path.clone(),
+        plan::FileBytes {
+            bytes: bytes_new.clone(),
+            dev: staged.device,
+            ino: meta_new.ino(),
+        },
+    )]);
+    let fresh: HashSet<(String, u64)> = HashSet::new();
+    let mut state = AdapterState::default();
+    let delta = DiscoveryDelta {
+        candidates: vec![cand(
+            staged.path.as_str(),
+            backing_of(&staged, 0x100),
+            1,
+            11,
+            "SHA-256",
+            false,
+            "ok",
+        )],
+        tables: vec![terminated(1, 0)],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    };
+    let adapted = adapt_delta(
+        &mut state,
+        &delta,
+        &AdapterCtx {
+            live: &live,
+            files: &files,
+            builtin_default: false,
+            enrolled_class: None,
+            fresh: &fresh,
+            post_settle: false,
+            baseline: false,
+        },
+    );
+    assert_eq!(adapted.delta.discovered.len(), 1);
+    let site = &adapted.delta.discovered[0].site;
+    assert_eq!(
+        site.object.0,
+        format!("unverified:{dev}:{}", staged.ino),
+        "stale mapping must not wear the replacement fingerprint"
+    );
+}
+
+#[test]
+fn advertising_joins_exact_vma_not_first_path() {
+    // A3: old and new objects simultaneously live under one path —
+    // the array address joins the EXACT VMA (never first-pathname
+    // match), and each candidate fingerprints only against bytes
+    // bound to its own mapping. The files round read the new file.
+    let stage = Stage::fresh("adv-vma");
+    let bytes_v1 = self_bytes();
+    let bytes_v2 = flipped_build_id(&bytes_v1);
+    let v1 = stage.write("v1.so", &bytes_v1);
+    let v2 = stage.write("v2.so", &bytes_v2);
+    let dev = plan::render_device(v1.device);
+    // Two live VMAs under ONE path string (same-path old+new):
+    // the old mapping keeps the path text, the new mapping reuses
+    // it (faithful shape of a live replacement pair).
+    let mut m1 = mapping(&v1);
+    m1.start = 0x7f00_0000_0000;
+    m1.end = 0x7f00_0000_1000;
+    let mut m2 = mapping(&v2);
+    m2.path = v1.path.clone();
+    m2.start = 0x7f00_1000_0000;
+    m2.end = 0x7f00_1000_1000;
+    let live = vec![m1, m2];
+    let files: HashMap<String, plan::FileBytes> = HashMap::from([(
+        v1.path.clone(),
+        plan::FileBytes {
+            bytes: bytes_v2.clone(),
+            dev: v2.device,
+            ino: v2.ino,
+        },
+    )]);
+    let fresh: HashSet<(String, u64)> = HashSet::new();
+    let mut state = AdapterState::default();
+    let mut c1 = cand(
+        v1.path.as_str(),
+        backing_of(&v1, 0x100),
+        1,
+        11,
+        "SHA-256",
+        false,
+        "ok",
+    );
+    c1.arr = 0x7f00_0000_0100;
+    c1.advertising_dev = plan::render_device(v1.device);
+    c1.advertising_ino = v1.ino;
+    let mut c2 = cand(
+        v1.path.as_str(),
+        backing_of(&v2, 0x100),
+        1,
+        12,
+        "SHA-256",
+        false,
+        "ok",
+    );
+    c2.arr = 0x7f00_1000_0100;
+    c2.advertising_dev = plan::render_device(v2.device);
+    c2.advertising_ino = v2.ino;
+    let delta = DiscoveryDelta {
+        candidates: vec![c1, c2],
+        tables: vec![terminated(1, 0)],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    };
+    let adapted = adapt_delta(
+        &mut state,
+        &delta,
+        &AdapterCtx {
+            live: &live,
+            files: &files,
+            builtin_default: false,
+            enrolled_class: None,
+            fresh: &fresh,
+            post_settle: false,
+            baseline: false,
+        },
+    );
+    assert_eq!(adapted.delta.discovered.len(), 2);
+    let prov: Vec<&str> = adapted
+        .delta
+        .discovered
+        .iter()
+        .map(|s| s.candidates[0].provider.0.as_str())
+        .collect();
+    // Old array, new bytes on the shared path: the old candidate
+    // stays opaque (its bytes are unavailable), never build:v2.
+    assert!(
+        prov.iter()
+            .any(|p| *p == format!("unverified-advertising:{dev}:{}", v1.ino)),
+        "old candidate conflated: {prov:?}"
+    );
+    // New array, bound bytes: the true v2 fingerprint.
+    let build_v2 = format!(
+        "build:{}",
+        osslscope::discovery::elf::read_build_id(&bytes_v2).unwrap()
+    );
+    assert!(
+        prov.iter().any(|p| *p == build_v2),
+        "new candidate must fingerprint v2: {prov:?}"
+    );
+}
+
+#[test]
+fn advertising_turnover_is_anonymous() {
+    // A3: the candidate's class was decoded from the old file's
+    // array, but the array's address now maps the new file
+    // (same-address remap). Neither fingerprint fits: anonymous.
+    let stage = Stage::fresh("adv-turn");
+    let bytes = self_bytes();
+    let staged = stage.write("prov.so", &bytes);
+    let live = vec![mapping(&staged)];
+    let files: HashMap<String, plan::FileBytes> = HashMap::from([(
+        staged.path.clone(),
+        plan::FileBytes {
+            bytes: bytes.clone(),
+            dev: staged.device,
+            ino: staged.ino,
+        },
+    )]);
+    let fresh: HashSet<(String, u64)> = HashSet::new();
+    let mut state = AdapterState::default();
+    let mut c = cand(
+        staged.path.as_str(),
+        backing_of(&staged, 0x100),
+        1,
+        11,
+        "SHA-256",
+        false,
+        "ok",
+    );
+    c.arr = live[0].start + 8;
+    // Discovery-time owner is the OLD file; live shows the new.
+    c.advertising_dev = plan::render_device(staged.device);
+    c.advertising_ino = staged.ino.wrapping_add(1);
+    let delta = DiscoveryDelta {
+        candidates: vec![c],
+        ..DiscoveryDelta::default()
+    };
+    let adapted = adapt_delta(
+        &mut state,
+        &delta,
+        &AdapterCtx {
+            live: &live,
+            files: &files,
+            builtin_default: false,
+            enrolled_class: None,
+            fresh: &fresh,
+            post_settle: false,
+            baseline: false,
+        },
+    );
+    assert_eq!(adapted.delta.discovered.len(), 1);
+    let id = adapted.delta.discovered[0].candidates[0].provider.0.clone();
+    assert_eq!(id, "unverified-advertising:anonymous");
 }
 
 /// Same ELF with a different build-id (one flipped descriptor byte
@@ -2365,7 +2642,14 @@ fn refreshed_site_fingerprint_is_forwarded() {
         trigger_observed: true,
         ..DiscoveryDelta::default()
     };
-    let files_a: HashMap<String, Vec<u8>> = HashMap::from([(staged.path.clone(), bytes_a.clone())]);
+    let files_a: HashMap<String, plan::FileBytes> = HashMap::from([(
+        staged.path.clone(),
+        plan::FileBytes {
+            bytes: bytes_a.clone(),
+            dev: staged.device,
+            ino: staged.ino,
+        },
+    )]);
     let first = adapt_delta(
         &mut state,
         &delta(),
@@ -2382,7 +2666,14 @@ fn refreshed_site_fingerprint_is_forwarded() {
     assert_eq!(first.delta.discovered.len(), 1);
     let fp_a = first.delta.discovered[0].site.object.0.clone();
     assert!(fp_a.starts_with("build:"), "{fp_a}");
-    let files_b: HashMap<String, Vec<u8>> = HashMap::from([(staged.path.clone(), bytes_b.clone())]);
+    let files_b: HashMap<String, plan::FileBytes> = HashMap::from([(
+        staged.path.clone(),
+        plan::FileBytes {
+            bytes: bytes_b.clone(),
+            dev: staged.device,
+            ino: staged.ino,
+        },
+    )]);
     let second = adapt_delta(
         &mut state,
         &delta(),
@@ -2415,7 +2706,7 @@ fn refreshed_site_fingerprint_is_forwarded() {
 struct AdaptHarness {
     staged: Staged,
     live: Vec<Mapping>,
-    files: HashMap<String, Vec<u8>>,
+    files: HashMap<String, plan::FileBytes>,
     fresh: HashSet<(String, u64)>,
     state: AdapterState,
 }
@@ -2426,7 +2717,14 @@ impl AdaptHarness {
         let bytes = self_bytes();
         let staged = stage.write("prov.so", &bytes);
         let live = vec![mapping(&staged)];
-        let files = HashMap::from([(staged.path.clone(), bytes)]);
+        let files = HashMap::from([(
+            staged.path.clone(),
+            plan::FileBytes {
+                bytes,
+                dev: staged.device,
+                ino: staged.ino,
+            },
+        )]);
         // `stage` drops here: the temp dir is gone but every byte the
         // adapter reads is already staged in `files`.
         Self {
@@ -2754,7 +3052,14 @@ fn live_observe(
         fallback: false,
     };
     let mut files = HashMap::new();
-    files.insert(staged.path.clone(), bytes);
+    files.insert(
+        staged.path.clone(),
+        plan::FileBytes {
+            bytes,
+            dev: staged.device,
+            ino: staged.ino,
+        },
+    );
     let mut proc = FakeProc {
         clock: clock.clone(),
         maps: vec![mapping(&staged)],
