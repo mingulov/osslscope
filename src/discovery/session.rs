@@ -77,7 +77,7 @@ use crate::loader::Loaded;
 use anyhow::{Context as _, anyhow, bail};
 use aya::maps::{Map, MapData, RingBuf};
 use osslscope_ebpf_common as wire;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::CString;
 use std::num::NonZeroU32;
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -448,6 +448,17 @@ pub struct DispatchReinstall {
     pub resolution: Option<String>,
 }
 
+/// One queued stage-2 retry (F-D/A12): the failed address, the
+/// resolve identity when one was established (`None` for
+/// resolve failures — unmapped, nothing to compare), and the
+/// poll that queued it (due from the next poll on).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Stage2Retry {
+    addr: u64,
+    ident: Option<(String, u64)>,
+    queued_seq: u64,
+}
+
 /// Privileged/file operations the [`SessionCore`] needs. The live
 /// implementation ([`LiveEnv`]) performs real BPF and `/proc` work;
 /// host tests stage synthetic rings, maps, snapshots, links, and
@@ -736,6 +747,15 @@ pub struct SessionCore {
     attach_failures: HashMap<u64, String>,
     reloads: HashMap<u64, u64>,
     pending_stage2: std::collections::VecDeque<(u64, u64)>,
+    /// Retryable unattached set (F-D/A12): cookies whose stage-2
+    /// attach failed, keyed by cookie (latest address wins) with
+    /// the resolve identity when one was established. Retried every
+    /// poll from the NEXT poll on (`queued_seq` excludes same-poll
+    /// retries, so a failure still records before any re-attempt);
+    /// dropped when the bytes change under the queued address.
+    retry_stage2: BTreeMap<u64, Stage2Retry>,
+    /// Poll sequence clock for retry due-ness (F-D/A12).
+    poll_seq: u64,
     primary_init_observed: bool,
     trigger_observed: bool,
     /// Dispatch anchors live (F-D/A11): init/query links installed
@@ -802,6 +822,8 @@ impl SessionCore {
             attach_failures: HashMap::new(),
             reloads: HashMap::new(),
             pending_stage2: std::collections::VecDeque::new(),
+            retry_stage2: BTreeMap::new(),
+            poll_seq: 0,
             primary_init_observed: false,
             trigger_observed: false,
             dispatch_live: false,
@@ -1067,6 +1089,7 @@ impl SessionCore {
         self.attach_failures.clear();
         self.reloads.clear();
         self.pending_stage2.clear();
+        self.retry_stage2.clear();
         self.dispatch_live = false;
         self.dispatch_bound = None;
         self.dispatch_blind = false;
@@ -1197,6 +1220,8 @@ impl SessionCore {
         if self.recycled {
             return Err(self.recycled_err());
         }
+        // Every poll advances the retry clock (F-D/A12).
+        self.poll_seq += 1;
         // Pin FIRST: tainted events must not drive attaches.
         if env.verify_pin().is_err() {
             self.mark_recycled();
@@ -1358,17 +1383,34 @@ impl SessionCore {
                 break;
             };
             attaches_done += 1;
+            // A pending entry is the freshest instruction for its
+            // cookie: it supersedes any queued retry (F-D/A12 —
+            // recovery runs on the fresh address, never the stale
+            // queued one).
+            self.retry_stage2.remove(&cookie);
             // Tainted events must not drive stage-2 attaches.
             if env.verify_pin().is_err() {
                 self.mark_recycled();
                 return Err(self.recycled_err());
             }
             match harvest::resolve_query_target(&maps, &self.provider, &self.canon, addr, cookie) {
-                Err(e) => self.record_attach_failure(
-                    &mut delta,
-                    cookie,
-                    format!("resolve stage-2 for cookie {cookie}: {e:#}"),
-                ),
+                Err(e) => {
+                    self.record_attach_failure(
+                        &mut delta,
+                        cookie,
+                        format!("resolve stage-2 for cookie {cookie}: {e:#}"),
+                    );
+                    // Unmapped (no identity to compare): retry from
+                    // the next poll until it maps.
+                    self.retry_stage2.insert(
+                        cookie,
+                        Stage2Retry {
+                            addr,
+                            ident: None,
+                            queued_seq: self.poll_seq,
+                        },
+                    );
+                }
                 Ok(t) => {
                     let target = (t.off, t.path.to_string_lossy().into_owned(), t.dev, t.ino);
                     if self.attached_queries.contains(&cookie)
@@ -1392,6 +1434,17 @@ impl SessionCore {
                     match env.install_stage2(cookie, t.off, &t.path, self.pid, t.expected) {
                         Err(e) => {
                             self.record_attach_failure(&mut delta, cookie, format!("{e:#}"));
+                            // Resolved but not installed: retry from
+                            // the next poll against the same bytes
+                            // (a changed identity drops the entry).
+                            self.retry_stage2.insert(
+                                cookie,
+                                Stage2Retry {
+                                    addr,
+                                    ident: Some((target.2.clone(), target.3)),
+                                    queued_seq: self.poll_seq,
+                                },
+                            );
                         }
                         Ok(()) => {
                             self.attached_queries.insert(cookie);
@@ -1417,7 +1470,84 @@ impl SessionCore {
                 }
             }
         }
-        if self.staged_trips.is_some() || !self.pending_stage2.is_empty() {
+        // F-D/A12: time-driven retry of the unattached set, in
+        // cookie order (deterministic), on the remaining budget
+        // (fresh pending ran first, above). Quiet systems recover
+        // without fresh inits; retries stay silent while failing
+        // (the first record stands — no event spam) and report
+        // only transitions (install, supersede-drop).
+        let due: Vec<(u64, Stage2Retry)> = self
+            .retry_stage2
+            .iter()
+            .filter(|(_, r)| r.queued_seq < self.poll_seq)
+            .map(|(c, r)| (*c, r.clone()))
+            .collect();
+        let mut retry_idx = 0usize;
+        while retry_idx < due.len() && attaches_done < budget.max_attaches {
+            let (cookie, queued) = due[retry_idx].clone();
+            retry_idx += 1;
+            attaches_done += 1;
+            if env.verify_pin().is_err() {
+                self.mark_recycled();
+                return Err(self.recycled_err());
+            }
+            match harvest::resolve_query_target(
+                &maps,
+                &self.provider,
+                &self.canon,
+                queued.addr,
+                cookie,
+            ) {
+                Err(_) => {
+                    // Still unresolvable: keep queued, silently.
+                }
+                Ok(t) => {
+                    let fresh_ident = (t.dev.clone(), t.ino);
+                    if queued.ident.as_ref().is_some_and(|r| *r != fresh_ident) {
+                        // Bytes changed under the queued address:
+                        // drop (a fresh init drives recovery, if
+                        // any) — never attach to the wrong bytes.
+                        self.retry_stage2.remove(&cookie);
+                        delta.attaches.push(AttachEvent {
+                            kind: AttachKind::Stage2 { cookie },
+                            failed: Some(
+                                "stage-2 retry superseded by replacement; \
+                                 awaiting fresh init"
+                                    .to_string(),
+                            ),
+                        });
+                        continue;
+                    }
+                    let target = (t.off, t.path.to_string_lossy().into_owned(), t.dev, t.ino);
+                    match env.install_stage2(cookie, t.off, &t.path, self.pid, t.expected) {
+                        Err(_) => {
+                            // Still failing: keep queued with the
+                            // fresh identity (learned), silently.
+                            self.retry_stage2.insert(
+                                cookie,
+                                Stage2Retry {
+                                    addr: queued.addr,
+                                    ident: Some(fresh_ident),
+                                    queued_seq: queued.queued_seq,
+                                },
+                            );
+                        }
+                        Ok(()) => {
+                            self.retry_stage2.remove(&cookie);
+                            self.attached_queries.insert(cookie);
+                            self.attached_targets.insert(cookie, target);
+                            self.attach_failures.remove(&cookie);
+                            env.pretouch(cookie, queued.addr);
+                            delta.attaches.push(AttachEvent {
+                                kind: AttachKind::Stage2 { cookie },
+                                failed: None,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        if self.staged_trips.is_some() || !self.pending_stage2.is_empty() || retry_idx < due.len() {
             delta.budget_exhausted = true;
         }
 
@@ -3318,6 +3448,7 @@ mod tests {
         dispatch_detaches: u32,
         stage2_installs: Vec<(u64, u64, String)>,
         stage2_detaches: Vec<u64>,
+        stage2_fail_first: u32,
         reinstall_script: VecDeque<anyhow::Result<DispatchReinstall>>,
         reinstall_calls: u32,
         pin_ok: bool,
@@ -3334,6 +3465,7 @@ mod tests {
                 dispatch_detaches: 0,
                 stage2_installs: Vec::new(),
                 stage2_detaches: Vec::new(),
+                stage2_fail_first: 0,
                 reinstall_script: VecDeque::new(),
                 reinstall_calls: 0,
                 pin_ok: true,
@@ -3362,6 +3494,10 @@ mod tests {
             _pid: u32,
             _expected: Option<(u64, u64)>,
         ) -> anyhow::Result<()> {
+            if self.stage2_fail_first > 0 {
+                self.stage2_fail_first -= 1;
+                return Err(anyhow::anyhow!("scripted install failure"));
+            }
             self.stage2_installs
                 .push((cookie, offset, path.to_string_lossy().into_owned()));
             Ok(())
@@ -3751,6 +3887,173 @@ mod tests {
             "unmapped drop must signal loss: {:?}",
             delta.attaches
         );
+    }
+
+    #[test]
+    fn failed_stage2_retries_next_poll() {
+        // F-D/A12: a transient install failure queues a retry —
+        // the next poll re-attempts WITHOUT needing a fresh init
+        // (quiet systems recover), clearing the sticky failure.
+        use crate::discovery::harvest::LEGACY_COOKIE;
+        let mut env = MiniEnv::new();
+        env.maps = vec![prov_mapping(50, 0x1000)];
+        env.stage2_fail_first = 1;
+        let mut core = a11_core();
+        core.pending_stage2.push_back((LEGACY_COOKIE, 0x1500));
+        let d = core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(env.stage2_installs.len(), 0);
+        assert!(d.attaches.iter().any(|a| a.failed.is_some()));
+        assert!(
+            core.snapshot()
+                .dispatch
+                .attach_failures
+                .iter()
+                .any(|f| f.cookie == LEGACY_COOKIE)
+        );
+
+        // No fresh events: the retry still attempts and succeeds.
+        let d = core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(env.stage2_installs.len(), 1);
+        assert!(core.attached_queries.contains(&LEGACY_COOKIE));
+        assert!(core.snapshot().dispatch.attach_failures.is_empty());
+        assert!(
+            d.attaches
+                .iter()
+                .any(|a| matches!(a.kind, AttachKind::Stage2 { .. }) && a.failed.is_none()),
+            "retry success reports its install: {:?}",
+            d.attaches
+        );
+    }
+
+    #[test]
+    fn retry_respects_replacement_staleness() {
+        // F-D/A12: a queued retry whose bytes changed under it
+        // (replacement, no fresh init) is dropped, never attached
+        // to the wrong bytes — with one loss signal.
+        use crate::discovery::harvest::LEGACY_COOKIE;
+        let mut env = MiniEnv::new();
+        env.maps = vec![prov_mapping(50, 0x1000)];
+        env.stage2_fail_first = 1;
+        let mut core = a11_core();
+        core.pending_stage2.push_back((LEGACY_COOKIE, 0x1500));
+        core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(env.stage2_installs.len(), 0);
+
+        // Same address, replaced bytes, no fresh init: drop.
+        env.maps = vec![prov_mapping(60, 0x1000)];
+        let d = core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(env.stage2_installs.len(), 0, "stale retry must not attach");
+        assert!(
+            d.attaches
+                .iter()
+                .any(|a| matches!(a.kind, AttachKind::Stage2 { .. }) && a.failed.is_some()),
+            "stale drop signals loss: {:?}",
+            d.attaches
+        );
+
+        // Dropped means dropped: restoring the old bytes does not
+        // resurrect the retry (a fresh init would).
+        env.maps = vec![prov_mapping(50, 0x1000)];
+        core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(env.stage2_installs.len(), 0);
+    }
+
+    #[test]
+    fn resolve_failure_retries_until_mapped() {
+        // F-D/A12: an unmapped address queues without an identity
+        // and retries silently until it maps (no event spam while
+        // failing — the first record stands).
+        use crate::discovery::harvest::LEGACY_COOKIE;
+        let mut env = MiniEnv::new();
+        env.maps = vec![prov_mapping(50, 0x1000)];
+        let mut core = a11_core();
+        core.pending_stage2.push_back((LEGACY_COOKIE, 0x9500));
+        let d = core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(env.stage2_installs.len(), 0);
+        assert_eq!(d.attaches.len(), 1, "first failure records once");
+
+        // Still unmapped: silent retry (no new events).
+        let d = core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(env.stage2_installs.len(), 0);
+        assert!(
+            d.attaches.is_empty(),
+            "retries must not spam: {:?}",
+            d.attaches
+        );
+        assert!(
+            core.snapshot()
+                .dispatch
+                .attach_failures
+                .iter()
+                .any(|f| f.cookie == LEGACY_COOKIE)
+        );
+
+        // The mapping appears (no fresh init): retry attaches.
+        env.maps = vec![prov_mapping(50, 0x1000), prov_mapping(50, 0x9000)];
+        core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(env.stage2_installs.len(), 1);
+        assert!(core.attached_queries.contains(&LEGACY_COOKIE));
+        assert!(core.snapshot().dispatch.attach_failures.is_empty());
+    }
+
+    #[test]
+    fn fresh_init_unqueues_retry() {
+        // F-D/A12: a fresh init for a queued cookie hands recovery
+        // to the pending path (fresh address) — the stale queued
+        // address must not fire a spurious supersede later.
+        use crate::discovery::harvest::LEGACY_COOKIE;
+        let mut env = MiniEnv::new();
+        env.maps = vec![prov_mapping(50, 0x1000), prov_mapping(50, 0x3000)];
+        env.stage2_fail_first = 1;
+        let mut core = a11_core();
+        core.pending_stage2.push_back((LEGACY_COOKIE, 0x1500));
+        core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(env.stage2_installs.len(), 0);
+
+        // Fresh init at a new address installs via pending.
+        core.pending_stage2.push_back((LEGACY_COOKIE, 0x3500));
+        core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(env.stage2_installs.len(), 1);
+
+        // The stale queued address never fires (else it would
+        // supersede the fresh install with a second install).
+        core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(env.stage2_installs.len(), 1);
+        let target = core.attached_targets.get(&LEGACY_COOKIE).unwrap();
+        assert_eq!(target.0, 0x500, "fresh install stands: {target:?}");
+    }
+
+    #[test]
+    fn retry_shares_attach_budget() {
+        // F-D/A12: retries consume the same attach budget, fresh
+        // work first — a starved retry defers (flagging exhaustion)
+        // instead of starving the tripwire batch.
+        use crate::discovery::harvest::LEGACY_COOKIE;
+        let mut env = MiniEnv::new();
+        env.maps = vec![prov_mapping(50, 0x1000)];
+        env.stage2_fail_first = 1;
+        let mut core = a11_core();
+        core.pending_stage2.push_back((LEGACY_COOKIE, 0x1500));
+        core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(env.stage2_installs.len(), 0);
+
+        // Budget 1: the tripwire install wins, the retry defers.
+        let tight = || PollBudget::new(65536, 1);
+        env.maps = vec![prov_mapping(50, 0x1000), lc_mapping(100)];
+        env.plan = Some(trip_set(100, &[0x100, 0x200]));
+        let d = core.poll(&mut env, tight()).unwrap();
+        assert_eq!(env.trip_installs, 1);
+        assert_eq!(
+            env.stage2_installs.len(),
+            0,
+            "retry must defer, not starve trips"
+        );
+        assert!(d.budget_exhausted, "deferred retry flags exhaustion");
+
+        // Budget free: the retry attaches.
+        let d = core.poll(&mut env, tight()).unwrap();
+        assert_eq!(env.stage2_installs.len(), 1);
+        assert!(!d.budget_exhausted);
     }
 
     #[test]
