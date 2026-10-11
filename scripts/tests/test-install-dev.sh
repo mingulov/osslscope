@@ -194,6 +194,49 @@ for sys in "/usr/." "/usr//" "/usr/./"; do
     fi
 done
 
+# F-G/B11: canonical aliases of protected destinations must refuse
+# with the system-package diagnosis (not a later mkdir/cp error).
+for sys in "/var/../usr" "/usr/../usr" "/tmp/../usr" "/usr/bin/.."; do
+    if "$SH_BIN" "$INSTALL" --manifest "$T/manifest.json" --prefix "$sys" >"$T/out" 2>&1; then
+        bad "--prefix $sys refused (got exit 0)"
+    else
+        grep -qi 'system package\|refuse' "$T/out" \
+            && ok "--prefix $sys refused as system-path alias" \
+            || bad "--prefix $sys refused as system-path alias ($(head -1 "$T/out"))"
+    fi
+done
+ln -s /usr "$T/evil-usr"
+if "$SH_BIN" "$INSTALL" --manifest "$T/manifest.json" --prefix "$T/evil-usr" >"$T/out" 2>&1; then
+    bad "symlink-to-/usr prefix refused (got exit 0)"
+else
+    grep -qi 'system package\|refuse' "$T/out" \
+        && ok "symlink-to-/usr prefix refused as system-path alias" \
+        || bad "symlink-to-/usr prefix refused as system-path alias ($(head -1 "$T/out"))"
+fi
+ln -s / "$T/evil-root"
+if "$SH_BIN" "$INSTALL" --manifest "$T/manifest.json" --prefix "$T/evil-root" >"$T/out" 2>&1; then
+    bad "symlink-to-/ prefix refused (got exit 0)"
+else
+    grep -qi 'system package\|refuse' "$T/out" \
+        && ok "symlink-to-/ prefix refused as system-path alias" \
+        || bad "symlink-to-/ prefix refused as system-path alias ($(head -1 "$T/out"))"
+fi
+# Positive controls: `..`/symlinks resolving inside allowed space install.
+if "$SH_BIN" "$INSTALL" --manifest "$T/manifest.json" --prefix "$T/pfx/../pfx-ok" >"$T/out" 2>&1 \
+   && [ -x "$T/pfx-ok/bin/osslscope" ]; then
+    ok "dotdot prefix resolving to allowed space still installs"
+else
+    bad "dotdot prefix resolving to allowed space still installs ($(head -1 "$T/out"))"
+fi
+mkdir -p "$T/real-pfx"
+ln -s "$T/real-pfx" "$T/link-pfx"
+if "$SH_BIN" "$INSTALL" --manifest "$T/manifest.json" --prefix "$T/link-pfx" >"$T/out" 2>&1 \
+   && [ -x "$T/real-pfx/bin/osslscope" ]; then
+    ok "symlink prefix resolving to allowed space still installs"
+else
+    bad "symlink prefix resolving to allowed space still installs ($(head -1 "$T/out"))"
+fi
+
 # Manifest without revision keys must still install (keys are metadata).
 python3 -c "
 import json
@@ -251,7 +294,7 @@ fi
 # installer needs except setcap/getcap (a bare /usr/bin:/bin still carries
 # setcap on merged-usr platforms).
 mkdir -p "$T/nocapbin"
-for tool in python3 file readelf cp mkdir chmod rm grep awk sed cat; do
+for tool in python3 file readelf cp mkdir chmod rm grep awk sed cat realpath; do
     dest="$(command -v "$tool")" || { echo "test prereq missing: $tool" >&2; exit 1; }
     ln -s "$dest" "$T/nocapbin/$tool"
 done
