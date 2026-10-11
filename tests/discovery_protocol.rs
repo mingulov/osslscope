@@ -46,11 +46,11 @@ fn wire_layout_leaves_no_room_for_raw_buffers() {
     use std::mem::{align_of, size_of};
     // Classified events are small numerics-only structs: the old
     // 128-byte name / 32-byte arg payloads cannot physically fit.
-    assert_eq!(size_of::<wire::AlgEvent>(), 32);
+    assert_eq!(size_of::<wire::AlgEvent>(), 40);
     assert_eq!(align_of::<wire::AlgEvent>(), 8);
     assert_eq!(size_of::<wire::TripEvent>(), 16);
     assert_eq!(align_of::<wire::TripEvent>(), 4);
-    assert_eq!(size_of::<wire::RowEvent>(), 40);
+    assert_eq!(size_of::<wire::RowEvent>(), 48);
     assert_eq!(size_of::<wire::InitRetEvent>(), 32);
     assert!(size_of::<wire::AlgEvent>() < 128, "must not fit a raw name");
     assert!(size_of::<wire::TripEvent>() < 32, "must not fit a raw arg");
@@ -64,6 +64,7 @@ fn wire_layout_leaves_no_room_for_raw_buffers() {
         _pad: 0,
         arr: 0,
         idx: 0,
+        generation: 0,
     };
     let base = &e as *const _ as usize;
     assert_eq!(&e.op as *const _ as usize - base, 4);
@@ -72,6 +73,7 @@ fn wire_layout_leaves_no_room_for_raw_buffers() {
     assert_eq!(&e.weak as *const _ as usize - base, 11);
     assert_eq!(&e.arr as *const _ as usize - base, 16);
     assert_eq!(&e.idx as *const _ as usize - base, 24);
+    assert_eq!(&e.generation as *const _ as usize - base, 32);
     let t = wire::TripEvent {
         kind: 0,
         cookie: 0,
@@ -114,7 +116,7 @@ fn wire_layout_leaves_no_room_for_raw_buffers() {
 #[test]
 fn parse_accepts_golden_vectors() {
     // AlgEvent: kind=4 op=1 class=7 status=OK weak=1 arr/idx join keys.
-    let mut b = vec![0u8; 32];
+    let mut b = vec![0u8; 40];
     b[0..4].copy_from_slice(&4u32.to_le_bytes());
     b[4..8].copy_from_slice(&1u32.to_le_bytes());
     b[8..10].copy_from_slice(&7u16.to_le_bytes());
@@ -122,9 +124,11 @@ fn parse_accepts_golden_vectors() {
     b[11] = 1;
     b[16..24].copy_from_slice(&0x7f00_1000u64.to_le_bytes());
     b[24..32].copy_from_slice(&3u64.to_le_bytes());
+    b[32..40].copy_from_slice(&9u64.to_le_bytes());
     let e = wire::parse_alg_event(&b, kinds::ALG_NAMES.len() as u16).unwrap();
     assert_eq!((e.op, e.class, e.status, e.weak), (1, 7, wire::ALG_OK, 1));
     assert_eq!((e.arr, e.idx), (0x7f00_1000, 3));
+    assert_eq!(e.generation, 9);
     // OTHER class decodes (unknown-but-explicit), out-of-range does not.
     b[8..10].copy_from_slice(&wire::OTHER_CLASS.to_le_bytes());
     b[10] = wire::ALG_UNKNOWN;
@@ -140,9 +144,11 @@ fn parse_accepts_golden_vectors() {
     let te = wire::parse_trip_event(&t).unwrap();
     assert_eq!((te.cookie, te.class, te.status), (9, wire::LOAD_LEGACY, 0));
     // RowEvent + InitRetEvent shapes.
-    let mut r = vec![0u8; 40];
+    let mut r = vec![0u8; 48];
     r[0..4].copy_from_slice(&3u32.to_le_bytes());
-    wire::parse_row_event(&r).unwrap();
+    r[40..48].copy_from_slice(&5u64.to_le_bytes());
+    let re = wire::parse_row_event(&r).unwrap();
+    assert_eq!(re.generation, 5);
     r[0..4].copy_from_slice(&2u32.to_le_bytes());
     wire::parse_row_event(&r).unwrap();
     let mut i = vec![0u8; 32];
@@ -156,11 +162,11 @@ fn parse_rejects_short_unknown_and_out_of_range() {
     // Wire items are fixed-size reservations: short OR oversized
     // payloads are corruption, never longer variants.
     assert_eq!(
-        wire::parse_alg_event(&[4u8; 31], n),
+        wire::parse_alg_event(&[4u8; 39], n),
         Err(wire::WireErr::Length)
     );
     assert_eq!(
-        wire::parse_alg_event(&[4u8; 33], n),
+        wire::parse_alg_event(&[4u8; 41], n),
         Err(wire::WireErr::Length)
     );
     assert_eq!(
@@ -172,11 +178,11 @@ fn parse_rejects_short_unknown_and_out_of_range() {
         Err(wire::WireErr::Length)
     );
     assert_eq!(
-        wire::parse_row_event(&[3u8; 39]),
+        wire::parse_row_event(&[3u8; 47]),
         Err(wire::WireErr::Length)
     );
     assert_eq!(
-        wire::parse_row_event(&[3u8; 41]),
+        wire::parse_row_event(&[3u8; 49]),
         Err(wire::WireErr::Length)
     );
     assert_eq!(
@@ -184,7 +190,7 @@ fn parse_rejects_short_unknown_and_out_of_range() {
         Err(wire::WireErr::Length)
     );
     // Wrong kind (incl. retired WALKDBG=6 and zero).
-    let mut b = vec![0u8; 32];
+    let mut b = vec![0u8; 40];
     b[0..4].copy_from_slice(&6u32.to_le_bytes());
     assert_eq!(wire::parse_alg_event(&b, n), Err(wire::WireErr::Kind));
     b[0..4].copy_from_slice(&0u32.to_le_bytes());
@@ -228,7 +234,7 @@ fn parse_rejects_contradictory_combinations() {
     // Each status admits only the classes/weak values the kernel
     // actually emits with it; anything else is corruption, never a
     // labeled row.
-    let mut b = vec![0u8; 32];
+    let mut b = vec![0u8; 40];
     b[0..4].copy_from_slice(&4u32.to_le_bytes());
     let mut verdict = |class: u16, status: u8, weak: u8| {
         b[8..10].copy_from_slice(&class.to_le_bytes());
@@ -299,12 +305,12 @@ fn soaked_wire_bytes_yield_numerics_only() {
     // Sentinel-soaked ring bytes (0x41 fill): the decoder either
     // rejects them or yields table-derived labels — never an echo.
     let n = kinds::ALG_NAMES.len() as u16;
-    let soaked32 = vec![0x41u8; 32];
+    let soaked40 = vec![0x41u8; 40];
     assert_eq!(
-        wire::parse_alg_event(&soaked32, n),
+        wire::parse_alg_event(&soaked40, n),
         Err(wire::WireErr::Kind)
     );
-    let mut b = vec![0x41u8; 32];
+    let mut b = vec![0x41u8; 40];
     b[0..4].copy_from_slice(&4u32.to_le_bytes());
     // class bytes 0x4141 = 16705: out of range (692 valid + OTHER).
     assert_eq!(wire::parse_alg_event(&b, n), Err(wire::WireErr::ClassRange));

@@ -511,6 +511,14 @@ pub trait SessionEnv {
     /// incarnation. Evicting an absent entry succeeds; other
     /// failures are explicit loss (the stale state may survive).
     fn evict_array_state(&mut self, arr: u64) -> anyhow::Result<()>;
+    /// Install one array's incarnation generation into `GEN[arr]`
+    /// (F-H/H1): BPF stamps every ROW/ALG/QUERY_RET record with the
+    /// installed value, and the core drops records carrying a
+    /// retired one. Called when an epoch is born (bootstrap) or
+    /// reborn (turnover bump); the core forgets the array on
+    /// failure (the next record re-bootstraps) and records
+    /// explicit loss.
+    fn install_generation(&mut self, arr: u64, generation: u64) -> anyhow::Result<()>;
     /// Re-verify the target pin; `Err` means the pid recycled and
     /// all retained evidence is tainted.
     fn verify_pin(&self) -> anyhow::Result<()>;
@@ -716,6 +724,16 @@ pub struct SessionCore {
     retained: coverage::CoverageDelta,
     table_epochs: HashMap<(u32, u64), TableEpoch>,
     next_epoch: u64,
+    /// Expected producer generation per array base (F-H/H1):
+    /// installed into `GEN[arr]` when the array's epoch is born
+    /// (bootstrap, from 1) or reborn (turnover, bumped — never
+    /// reused, so a retired incarnation's queued records can never
+    /// validate again). Keyed by array, not (op, array): BPF stamps
+    /// from the same key, and two ops sharing one array degrade to
+    /// explicit in-flight loss on a bump, never to silence or a
+    /// permanently bricked array. Removed on unload (with the
+    /// kernel entry evicted); a re-mapped array bootstraps fresh.
+    array_gen: HashMap<u64, u64>,
     /// Last successfully read mappings (F-D/Am1): a failed
     /// `current_maps` reconciles against this instead of reading
     /// the failure as empty. Starts empty (a first-poll failure
@@ -738,6 +756,7 @@ pub struct SessionCore {
     emitted_queries: u64,
     emitted_losses: HashMap<u32, u64>,
     emitted_orphan_ops: HashMap<u32, u64>,
+    emitted_straggler_ops: HashMap<u32, u64>,
     loss_seen: HashMap<u32, u64>,
     trip_joined: HashMap<u64, u64>,
     lgcalls_joined: u64,
@@ -811,6 +830,7 @@ impl SessionCore {
             retained: coverage::CoverageDelta::default(),
             table_epochs: HashMap::new(),
             next_epoch: 0,
+            array_gen: HashMap::new(),
             last_good_maps: Vec::new(),
             candidates: Vec::new(),
             seen: HashMap::new(),
@@ -824,6 +844,7 @@ impl SessionCore {
             emitted_queries: 0,
             emitted_losses: HashMap::new(),
             emitted_orphan_ops: HashMap::new(),
+            emitted_straggler_ops: HashMap::new(),
             loss_seen: HashMap::new(),
             trip_joined: HashMap::new(),
             lgcalls_joined: 0,
@@ -911,10 +932,52 @@ impl SessionCore {
 
     /// Register (op, arr) under its current incarnation when first
     /// observed; every fresh key mints a new epoch id.
-    fn ensure_epoch(&mut self, maps: &[maps::Mapping], op: u32, arr: u64) -> u64 {
+    /// Fetch an array's epoch, minting one for a novel table.
+    /// Minting bootstraps the incarnation generation (F-H/H1):
+    /// `GEN[arr]` installs at previous+1 (1 for a fresh array —
+    /// never 0, the pre-install stamp), so records the new
+    /// incarnation produces validate while the retired one's queued
+    /// records drop. A novel table on an already-tracked array
+    /// whose record carries the installed value adopts it (shared
+    /// array across ops — no install, no bump). `None` when the
+    /// install fails: nothing is inserted, existing bindings are
+    /// untouched (a failed `map_update` leaves the old value), and
+    /// the next record retries — with explicit loss, so a stuck
+    /// install can never pass silent.
+    fn ensure_epoch<E: SessionEnv>(
+        &mut self,
+        env: &mut E,
+        maps: &[maps::Mapping],
+        op: u32,
+        arr: u64,
+        stamp: u64,
+    ) -> Option<u64> {
         if let Some(t) = self.table_epochs.get(&(op, arr)) {
-            return t.epoch;
+            return Some(t.epoch);
         }
+        if let Some(cur) = self.array_gen.get(&arr).copied()
+            && cur == stamp
+        {
+            // Shared-array adoption (see `check_gen`): the array
+            // is already bound, this op just joins it.
+            let epoch = self.next_epoch;
+            self.next_epoch += 1;
+            self.table_epochs.insert(
+                (op, arr),
+                TableEpoch {
+                    epoch,
+                    fingerprint: incarnation_of(maps, arr),
+                },
+            );
+            return Some(epoch);
+        }
+        let generation = self.array_gen.get(&arr).copied().unwrap_or(0) + 1;
+        if let Err(e) = env.install_generation(arr, generation) {
+            eprintln!("generation bootstrap failed for array {arr:#x}: {e:#}");
+            self.tracker.note_bad_event(coverage::HOST_EVICT_FAILED);
+            return None;
+        }
+        self.array_gen.insert(arr, generation);
         let epoch = self.next_epoch;
         self.next_epoch += 1;
         self.table_epochs.insert(
@@ -924,7 +987,50 @@ impl SessionCore {
                 fingerprint: incarnation_of(maps, arr),
             },
         );
-        epoch
+        Some(epoch)
+    }
+
+    /// Per-arrival generation check (F-H/H1): the record's
+    /// producer stamp must agree with the array's incarnation, or
+    /// the record drops with op-localized loss — never attributed
+    /// against mappings it predates. Rules:
+    /// - novel table, untracked array: accept only the pre-install
+    ///   stamp 0 (BPF misses before the bootstrap install lands; a
+    ///   nonzero stamp here is a pre-unload straggler);
+    /// - novel table, tracked array: accept only the installed
+    ///   value (shared-array adoption — a 0 here cannot be genuine
+    ///   because BPF has a value installed, so it is ancient
+    ///   garbage);
+    /// - tracked table: accept the installed value, plus 0 while
+    ///   the incarnation was never reborn (`GEN[arr] == 1` — the
+    ///   first drain's records all predate the bootstrap install).
+    ///   A 0 after any rebirth is ancient garbage (the install
+    ///   landed long ago), and anything else is a retired
+    ///   incarnation's queued record. Fail-closed throughout: no
+    ///   rule matches, no attribution.
+    fn check_gen(&mut self, op: u32, arr: u64, generation: u64) -> bool {
+        if !self.table_epochs.contains_key(&(op, arr)) {
+            let ok = match self.array_gen.get(&arr).copied() {
+                None => generation == 0,
+                Some(cur) => generation == cur,
+            };
+            if !ok {
+                self.tracker.note_straggler(op);
+            }
+            return ok;
+        }
+        if generation == 0 {
+            if self.array_gen.get(&arr).copied() == Some(1) {
+                return true;
+            }
+            self.tracker.note_straggler(op);
+            return false;
+        }
+        if self.array_gen.get(&arr).copied() == Some(generation) {
+            return true;
+        }
+        self.tracker.note_straggler(op);
+        false
     }
 
     /// Retire one table epoch: proof and walked set drop, gap
@@ -934,6 +1040,19 @@ impl SessionCore {
     /// Shared by maps-turnover reconcile and repeat-init suspect
     /// (F-A/A4). Returns the retirement plus whether the array
     /// rebirthed (delta-visible rebirth).
+    ///
+    /// Rebirth bumps the incarnation generation (F-H/H1):
+    /// `GEN[arr]` installs at previous+1 AFTER the eviction above
+    /// deletes the retired entry, so the new incarnation's records
+    /// validate while the retired one's queued records drop. A
+    /// failed bump forgets the array entirely (no epoch, no
+    /// expected generation — the retired kernel entry is already
+    /// evicted) with explicit loss, and reports no rebirth: the
+    /// next record re-bootstraps from 1 instead of running
+    /// half-bound. Unload removes the expected generation with the
+    /// key (the kernel entry is evicted with it); a re-mapped
+    /// array bootstraps fresh, and its pre-unload stragglers keep
+    /// their nonzero stamps on a novel key, so they still drop.
     fn retire_table_epoch<E: SessionEnv>(
         &mut self,
         env: &mut E,
@@ -957,6 +1076,15 @@ impl SessionCore {
         let rebirth = now.is_some();
         match now {
             Some(fp) => {
+                let generation = self.array_gen.get(&arr).copied().unwrap_or(0) + 1;
+                if let Err(e) = env.install_generation(arr, generation) {
+                    eprintln!("generation bump failed for array {arr:#x}: {e:#}");
+                    self.tracker.note_bad_event(coverage::HOST_EVICT_FAILED);
+                    self.table_epochs.remove(&(op, arr));
+                    self.array_gen.remove(&arr);
+                    return (TableRetirement { op, epoch, gap }, false);
+                }
+                self.array_gen.insert(arr, generation);
                 let epoch = self.next_epoch;
                 self.next_epoch += 1;
                 self.table_epochs.insert(
@@ -969,6 +1097,7 @@ impl SessionCore {
             }
             None => {
                 self.table_epochs.remove(&(op, arr));
+                self.array_gen.remove(&arr);
             }
         };
         (TableRetirement { op, epoch, gap }, rebirth)
@@ -1033,6 +1162,11 @@ impl SessionCore {
     /// already joined the old epoch; post-init events join the
     /// rebirth. Retires through the shared epoch path, so gaps,
     /// prunes, eviction, and rebirth links match maps turnover.
+    /// Post-init records stamped with the retired generation drop
+    /// as stragglers (F-H/H1) instead of joining: same-file ABA
+    /// means records produced before the suspect point may attest
+    /// the old incarnation, so only records the rebirth produces
+    /// (new stamp) join it.
     fn suspect_provider_tables<E: SessionEnv>(
         &mut self,
         env: &mut E,
@@ -1080,6 +1214,7 @@ impl SessionCore {
         self.tracker = coverage::CoverageTracker::new();
         self.retained = coverage::CoverageDelta::default();
         self.table_epochs.clear();
+        self.array_gen.clear();
         self.candidates.clear();
         self.seen.clear();
         self.objects.clear();
@@ -1091,6 +1226,7 @@ impl SessionCore {
         self.emitted_queries = 0;
         self.emitted_losses.clear();
         self.emitted_orphan_ops.clear();
+        self.emitted_straggler_ops.clear();
         self.loss_seen.clear();
         self.trip_joined.clear();
         self.lgcalls_joined = 0;
@@ -1271,6 +1407,24 @@ impl SessionCore {
         // stale links must detach before fresh ones attach.
         self.reconcile_anchors(env, &maps, &mut delta);
 
+        // Turnover reconcile BEFORE the drain (F-H/H1): a replaced
+        // array retires and rebirths here — bumping `GEN[arr]` —
+        // before any record is ingested, so the drain's per-arrival
+        // generation check drops the retired incarnation's queued
+        // records instead of attributing them against the new
+        // mappings. F-A/A4 ordered drain-before-reconcile because a
+        // reconcile-first order STAMPED stragglers with the new
+        // epoch (A's evidence attributed to B); the generation
+        // check removes the stamp path — stragglers drop with
+        // explicit loss and never join any epoch — so the order is
+        // safe to invert. (The bounded drain is NOT exhaustive
+        // despite the old comment here: budget cap + one stash
+        // slot. Stash-first ordering is preserved; cross-poll
+        // stragglers are now caught by cookie, not by order.)
+        let rec = self.reconcile_epochs(env, &maps);
+        delta.retirements.extend(rec.retired);
+        touched.extend(rec.reborn);
+
         let mut attaches_done = 0u32;
         // Deferred legacy planning: pre-exec images have no
         // libcrypto; plan at the first poll where it appears, and
@@ -1388,19 +1542,11 @@ impl SessionCore {
             delta.budget_exhausted = true;
         }
 
-        // Reconcile AFTER the drain (F-A/A4): the ring is drained
-        // exhaustively every poll (plus stash-first), so every
-        // event ingested here predates this reconcile — stragglers
-        // join their own (old) epoch instead of the rebirth, and
-        // only genuinely new-epoch rows arrive stamped old (one
-        // poll stale; the refresh heals them on re-walk). A
-        // reconcile-first order stamped stragglers with the new
-        // epoch: A's evidence attributed to B.
-        let rec = self.reconcile_epochs(env, &maps);
-        delta.retirements.extend(rec.retired);
-        touched.extend(rec.reborn);
-        // Deterministic retirement order across the mid-drain
-        // suspect batch (ring order) and the reconcile batch.
+        // Deterministic retirement order across the pre-drain
+        // turnover batch and the mid-drain suspect batch (ring
+        // order). The turnover reconcile ran before the drain
+        // (F-H/H1, above); suspect retirements appended during the
+        // drain join the same sorted set.
         delta
             .retirements
             .sort_by(|a, b| (a.op, a.epoch).cmp(&(b.op, b.epoch)));
@@ -1664,11 +1810,12 @@ impl SessionCore {
 
         // Fresh losses: positive diffs of the cumulative tracker
         // against what earlier deltas already reported. Orphan ROWs
-        // localize to their op (per-op diffs below); everything else
-        // is unlocalizable (op: None) and taints every op (F-B/A7).
+        // and straggler records localize to their op (per-op diffs
+        // below); everything else is unlocalizable (op: None) and
+        // taints every op (F-B/A7).
         for (src, n) in self.tracker.losses() {
             let last = self.emitted_losses.get(&src).copied().unwrap_or(0);
-            if n > last && src != coverage::HOST_ORPHAN_ROW {
+            if n > last && src != coverage::HOST_ORPHAN_ROW && src != coverage::HOST_STRAGGLER {
                 delta.losses.push(DiscoveryLoss {
                     source: src,
                     count: n - last,
@@ -1687,6 +1834,17 @@ impl SessionCore {
                 });
             }
             self.emitted_orphan_ops.insert(op, n);
+        }
+        for (op, n) in self.tracker.straggler_ops() {
+            let last = self.emitted_straggler_ops.get(&op).copied().unwrap_or(0);
+            if n > last {
+                delta.losses.push(DiscoveryLoss {
+                    source: coverage::HOST_STRAGGLER,
+                    count: n - last,
+                    op: Some(op),
+                });
+            }
+            self.emitted_straggler_ops.insert(op, n);
         }
         let total = self.queries_total();
         delta.queries_delta = total.saturating_sub(self.emitted_queries);
@@ -1842,10 +2000,21 @@ impl SessionCore {
                     self.tracker.note_bad_event(coverage::HOST_BAD_EVENT);
                     return;
                 }
+                if !self.check_gen(ev.op, ev.addr, ev.generation) {
+                    return;
+                }
                 self.trigger_observed = true;
                 self.queries_events += 1;
                 self.ops_hit.insert(ev.op);
-                self.ensure_epoch(maps, ev.op, ev.addr);
+                // Unbound (bootstrap install failed — loss already
+                // recorded): liveness above is genuine, but nothing
+                // epoch-scoped may join until the array binds.
+                if self
+                    .ensure_epoch(env, maps, ev.op, ev.addr, ev.generation)
+                    .is_none()
+                {
+                    return;
+                }
                 self.tracker.note_query_ret(ev.op, ev.addr);
                 touched.insert((ev.op, ev.addr));
                 if debug_session() {
@@ -1858,6 +2027,9 @@ impl SessionCore {
                     self.tracker.note_bad_event(coverage::HOST_BAD_EVENT);
                     return;
                 };
+                if !self.check_gen(ev.op, ev.arr, ev.generation) {
+                    return;
+                }
                 self.trigger_observed = true;
                 let Some(label) = crate::kinds::alg_class_label(ev.class) else {
                     eprintln!("alg event with out-of-range class {}", ev.class);
@@ -1879,7 +2051,15 @@ impl SessionCore {
                 // identity (no retained prefix); unknown names
                 // are explicit `other` evidence, not loss.
                 let lossy = ev.status == wire::ALG_UNREADABLE || ev.status == wire::ALG_OVERLONG;
-                self.ensure_epoch(maps, ev.op, ev.arr);
+                // Unbound (bootstrap install failed — loss already
+                // recorded): the verdict must not join `alg_records`
+                // where a later row could meet pre-epoch data.
+                if self
+                    .ensure_epoch(env, maps, ev.op, ev.arr, ev.generation)
+                    .is_none()
+                {
+                    return;
+                }
                 self.tracker.note_alg(ev.op, ev.arr, ev.idx, lossy);
                 self.alg_records.insert(
                     (ev.arr, ev.idx),
@@ -1895,6 +2075,12 @@ impl SessionCore {
                 };
                 if ev.kind != wire::KIND_ROW {
                     self.tracker.note_bad_event(coverage::HOST_BAD_EVENT);
+                    return;
+                }
+                // Incarnation before slot: a retired generation's
+                // record is a straggler even when its slot also
+                // lost its ALG (orphan would mislocalize the cause).
+                if !self.check_gen(ev.op, ev.aux, ev.generation) {
                     return;
                 }
                 self.trigger_observed = true;
@@ -1969,7 +2155,13 @@ impl SessionCore {
                         delta.candidates.push(self.candidates[i].clone());
                     }
                 } else {
-                    let epoch = self.ensure_epoch(maps, ev.op, ev.aux);
+                    // Unbound (bootstrap install failed — loss
+                    // already recorded): no epoch exists to stamp,
+                    // so the row cannot become a candidate.
+                    let Some(epoch) = self.ensure_epoch(env, maps, ev.op, ev.aux, ev.generation)
+                    else {
+                        return;
+                    };
                     if let Some(b) = &backing
                         && self.seen_objects.insert((b.dev.clone(), b.ino))
                     {
@@ -2651,6 +2843,24 @@ fn evict_termd(maps: &HashMap<String, OwnedFd>, arr: u64) -> anyhow::Result<()> 
     delete_elem(&mut termd, &arr).context("evict TERMD")
 }
 
+/// Delete one array's `GEN` entry (F-H/H1): the retired
+/// incarnation's cookie must not validate any later record. An
+/// absent entry succeeds (same tolerance as `TERMD`).
+fn evict_gen(maps: &HashMap<String, OwnedFd>, arr: u64) -> anyhow::Result<()> {
+    let mut table = open_hash::<u64, u64>(maps, "GEN")?;
+    delete_elem(&mut table, &arr).context("evict GEN")
+}
+
+/// Install one array's incarnation generation (F-H/H1): BPF
+/// stamps every record the array produces with this value until
+/// the next bump or eviction.
+fn install_gen(maps: &HashMap<String, OwnedFd>, arr: u64, gen_value: u64) -> anyhow::Result<()> {
+    let mut table = open_hash::<u64, u64>(maps, "GEN")?;
+    table
+        .insert(arr, gen_value, 0)
+        .map_err(|e| anyhow!("install GEN[{arr:#x}]={gen_value}: {e}"))
+}
+
 /// Evict one array's `QUERY_NEXT` cursors across all threads (low
 /// key half is the array base): the next incarnation's walk
 /// restarts at slot 0 instead of resuming mid-array.
@@ -2952,7 +3162,12 @@ impl SessionEnv for LiveEnv {
     fn evict_array_state(&mut self, arr: u64) -> anyhow::Result<()> {
         evict_termd(&self.loaded.maps, arr)?;
         evict_cursors(&self.loaded.maps, arr)?;
+        evict_gen(&self.loaded.maps, arr)?;
         Ok(())
+    }
+
+    fn install_generation(&mut self, arr: u64, generation: u64) -> anyhow::Result<()> {
+        install_gen(&self.loaded.maps, arr, generation)
     }
 
     fn verify_pin(&self) -> anyhow::Result<()> {
@@ -3587,6 +3802,10 @@ mod tests {
         fn pretouch(&mut self, _cookie: u64, _addr: u64) {}
 
         fn evict_array_state(&mut self, _arr: u64) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn install_generation(&mut self, _arr: u64, _gen: u64) -> anyhow::Result<()> {
             Ok(())
         }
 

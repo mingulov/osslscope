@@ -117,6 +117,19 @@ static PENDING_QUERY: HashMap<u64, PendQuery> = HashMap::with_max_entries(1024, 
 /// (T03: a table without proof is a prefix, never COMPLETE).
 #[map]
 static TERMD: HashMap<u64, u64> = HashMap::with_max_entries(1024, 0);
+
+/// Per-array incarnation generation (F-H/H1): the host installs
+/// `GEN[arr]` when an array's epoch is born or reborn and deletes
+/// it when the array unloads. Every ROW/ALG/QUERY_RET record
+/// carries the value read here at emit time (0 on miss — the
+/// array's first observation, before the host's bootstrap install
+/// lands), so the host can drop ring-queued stragglers from a
+/// retired incarnation instead of attributing them against newer
+/// mappings. Same shape as the count side's global `GEN[0]`, but
+/// keyed per array: replacements are per-object, and a global
+/// bump would drop unrelated arrays' in-flight records.
+#[map]
+static GEN: HashMap<u64, u64> = HashMap::with_max_entries(1024, 0);
 /// Source-tagged failure counters (T03: every ring-reserve and
 /// map-update failure lands here; keys are the `LOSS_*` ids).
 /// Per-CPU (F-C/A8): shared-map lookup–increment–replace loses
@@ -251,6 +264,18 @@ fn emit_init_ret(ev: &InitRetEvent) {
     } else {
         bump_loss(LOSS_RING_INIT);
     }
+}
+
+/// Current incarnation cookie for one array: the installed
+/// generation, or 0 when the host has not bootstrapped this array
+/// yet. Zero-stamped records are pre-install genuine (emitted
+/// before the bootstrap install lands): the host accepts them for
+/// novel arrays and for never-reborn tracked arrays, and requires
+/// the installed value otherwise (see `check_gen`).
+fn gen_of(arr: u64) -> u64 {
+    // Same copy-out as `lookup_alg`: the value is small and the
+    // borrow must not escape into the emit below.
+    unsafe { GEN.get_ptr(&arr).map(|p| *p).unwrap_or(0) }
 }
 
 /// Table lookups behind the shared classifiers (copied out: values
@@ -528,6 +553,7 @@ fn walk_dispatch(imp: u64, op: u32, arr: u64, j: u64) -> u64 {
             addr: fptr,
             aux: arr,
             idx: j,
+            generation: gen_of(arr),
         });
     }
     1
@@ -630,6 +656,7 @@ pub fn query_return(ctx: RetProbeContext) -> u32 {
             addr: rv,
             aux: j,
             idx: 0,
+            generation: gen_of(rv),
         });
     }
     let base = rv + j * 32;
@@ -702,6 +729,7 @@ pub fn query_return(ctx: RetProbeContext) -> u32 {
                     _pad: 0,
                     arr: rv,
                     idx: j,
+                    generation: gen_of(rv),
                 });
                 return 0;
             }
@@ -722,6 +750,7 @@ pub fn query_return(ctx: RetProbeContext) -> u32 {
         _pad: 0,
         arr: rv,
         idx: j,
+        generation: gen_of(rv),
     });
     // Advance past this slot ONLY on a fully-walked alg: BPF probe
     // reads are nofault, so a cold (never-touched) page aborts the

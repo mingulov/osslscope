@@ -36,6 +36,12 @@ pub const HOST_EVICT_FAILED: u32 = 107;
 /// at close with an exited target is expected (the final drain
 /// runs against last-good after /proc goes away).
 pub const HOST_MAPS_READ: u32 = 108;
+/// A ring record from a retired array incarnation (F-H/H1): its
+/// producer-stamped generation disagrees with the array's current
+/// one, so the record is dropped instead of attributed against the
+/// replacement's mappings. Op-localized like orphan rows (the
+/// stale record belongs to this op's table).
+pub const HOST_STRAGGLER: u32 = 109;
 
 /// Frozen gap-reason vocabulary owned here (schema's derived reasons
 /// reference these; see [`primary_reason`] for the single ranking).
@@ -74,6 +80,7 @@ pub fn loss_source_name(src: u32) -> Option<&'static str> {
         HOST_DRAIN_SHORTFALL => "drain_shortfall",
         HOST_EVICT_FAILED => "evict_failed",
         HOST_MAPS_READ => "maps_read",
+        HOST_STRAGGLER => "straggler",
         _ => return None,
     })
 }
@@ -158,6 +165,9 @@ pub struct CoverageTracker {
     /// Orphan-ROW counts per op (localizable loss for A7 taint;
     /// the totals above stay the D4/doc record).
     orphan_ops: HashMap<u32, u64>,
+    /// Straggler-record counts per op (F-H/H1; same localization
+    /// contract as orphan rows).
+    straggler_ops: HashMap<u32, u64>,
 }
 
 impl CoverageTracker {
@@ -187,6 +197,14 @@ impl CoverageTracker {
     pub fn note_orphan_row(&mut self, op: u32) {
         *self.losses.entry(HOST_ORPHAN_ROW).or_default() += 1;
         *self.orphan_ops.entry(op).or_default() += 1;
+    }
+
+    /// A ring record stamped with a retired generation: dropped,
+    /// counted, and localized to its op for candidate-set taint
+    /// (F-H/H1 — the stale record belongs to this op's table).
+    pub fn note_straggler(&mut self, op: u32) {
+        *self.losses.entry(HOST_STRAGGLER).or_default() += 1;
+        *self.straggler_ops.entry(op).or_default() += 1;
     }
 
     /// A dropped ring item: `src` is one of the `HOST_*` ids.
@@ -381,6 +399,20 @@ impl CoverageTracker {
         out
     }
 
+    /// Cumulative per-op straggler-record counts, sorted by op
+    /// (F-H/H1; the session diffs these into op-localized loss
+    /// increments exactly like orphan rows).
+    pub fn straggler_ops(&self) -> Vec<(u32, u64)> {
+        let mut out: Vec<(u32, u64)> = self
+            .straggler_ops
+            .iter()
+            .filter(|(_, n)| **n > 0)
+            .map(|(op, n)| (*op, *n))
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
     fn has_trunc(&self) -> bool {
         self.trunc.values().any(|b| *b != 0)
     }
@@ -556,13 +588,14 @@ mod tests {
             HOST_DRAIN_SHORTFALL,
             HOST_EVICT_FAILED,
             HOST_MAPS_READ,
+            HOST_STRAGGLER,
         ] {
             assert!(loss_source_name(src).is_some(), "host source {src}");
         }
         assert_eq!(loss_source_name(0), None);
         assert_eq!(loss_source_name(16), None);
         assert_eq!(loss_source_name(100), None);
-        assert_eq!(loss_source_name(109), None);
+        assert_eq!(loss_source_name(110), None);
         assert_eq!(loss_source_name(u32::MAX), None);
     }
 }
