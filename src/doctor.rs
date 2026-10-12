@@ -2452,6 +2452,10 @@ mod tests {
         // Map-stage EPERM with CAP_BPF held: attributed denial.
         let m = ringbuf_query_detail(&rbq_err("map_create", libc::EPERM, ""), &bpf_only);
         assert!(m.contains("denied"), "{m}");
+        // Map-stage EPERM with both held: attributed denial too
+        // (extra perfmon changes nothing at map stage).
+        let m = ringbuf_query_detail(&rbq_err("map_create", libc::EPERM, ""), &allow);
+        assert!(m.contains("denied") && !m.contains("unverifiable"), "{m}");
         // PERFMON-only + load EPERM (reachable under unprivileged
         // BPF: map creation succeeds, kprobe load still wants BPF):
         // unverifiable wanting CAP_BPF — never denied-with-caps.
@@ -2486,6 +2490,17 @@ mod tests {
             &allow,
         );
         assert!(m.contains("absent"), "{m}");
+        // Same evidence with neither cap: absence still wins over
+        // missing-capability attribution.
+        let m = ringbuf_query_detail(
+            &rbq_err(
+                "prog_load",
+                libc::EACCES,
+                "unknown func bpf_ringbuf_query#134",
+            ),
+            &none,
+        );
+        assert!(m.contains("absent") && !m.contains("unverifiable"), "{m}");
         // ENOSYS (no bpf() at all): unavailable, both stages.
         for stage in ["map_create", "prog_load"] {
             let m = ringbuf_query_detail(&rbq_err(stage, libc::ENOSYS, ""), &allow);
