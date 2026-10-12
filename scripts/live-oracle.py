@@ -4,7 +4,7 @@
 
 Compares the ordinary_ops_driver LEDGER stdout (independent count oracle,
 captured via the observer's --workload-out file, never the observer's
-own logs) against the observer's observed-crypto-v2.0 JSON across
+own logs) against the observer's observed-crypto-v2 JSON across
 current + fenced generations: the ledgered operation must be visible
 as executed sites carrying the mode's op, algorithm class(es),
 provider class and operation funcids. Per the fixture contract, exact
@@ -102,6 +102,26 @@ def fail(msg):
     return 1
 
 
+def check_version_v2(v):
+    # Mirrors src/schema.rs check_version_v2 (the documented v2
+    # reader gate): accepts observed-crypto-v2 (implicit .0) and
+    # observed-crypto-v2.<ascii-digits>; rejects other majors and
+    # anything unparseable. Minor versions add OPTIONAL keys only,
+    # so unknown site keys (e.g. installed_at) are ignored below.
+    if not isinstance(v, str) or not v.startswith("observed-crypto-v"):
+        return False
+    rest = v[len("observed-crypto-v"):]
+    if "." in rest:
+        major, minor = rest.split(".", 1)
+    else:
+        major, minor = rest, None
+    if major != "2":
+        return False
+    if minor is None:
+        return True
+    return bool(re.fullmatch(r"[0-9]+", minor))
+
+
 def func_label(op, funcid):
     name = FUNC_NAMES.get((op, funcid))
     return "%d%s" % (funcid, " " + name if name else "")
@@ -150,9 +170,9 @@ def main(argv):
             rep = json.load(f)
     except (OSError, ValueError) as e:
         return fail("cannot parse report %s: %s" % (report_path, e))
-    if rep.get("schema_version") != "observed-crypto-v2.0":
-        return fail("schema_version is %r, want observed-crypto-v2.0"
-                    % rep.get("schema_version"))
+    if not check_version_v2(rep.get("schema_version")):
+        return fail("schema_version is %r, want observed-crypto-v2.x"
+                    % (rep.get("schema_version"),))
     # Generation-inclusive site set: current sites plus every fenced
     # bucket's sites. A hit in any generation counts; totals sum all.
     collect = [("current", s) for s in rep.get("sites", [])]

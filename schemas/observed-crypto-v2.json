@@ -8,7 +8,7 @@
   "additionalProperties": false,
   "properties": {
     "schema_version": {
-      "description": "Producers emit exactly observed-crypto-v2.0; readers major-gate via check_version_v2 (accept v2.x, reject other majors).",
+      "description": "Producers emit exactly observed-crypto-v2.1; readers major-gate via check_version_v2 (accept v2.x, reject other majors).",
       "type": "string",
       "minLength": 1
     },

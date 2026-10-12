@@ -505,6 +505,96 @@ else
     bad "cross-generation reincarnation passes (rc=$?)"
 fi
 
+# v2.1 fixtures: versioned reports plus installed_at-carrying sites
+# (current + fenced). mk_report/mk_report_f above keep stamping v2.0
+# (stored-evidence compatibility); these stamp the version under test.
+mk_report_v() {
+    # $1 = outfile, $2 = schema_version, $3 = JSON sites array
+    printf '{"schema_version": "%s", "completeness": {"status": "PARTIAL"}, "sites": %s}' "$2" "$3" >"$1"
+}
+mk_report_vf() {
+    # $1 = outfile, $2 = schema_version, $3 = sites, $4 = fenced buckets
+    printf '{"schema_version": "%s", "completeness": {"status": "PARTIAL"}, "sites": %s, "fenced": %s}' "$2" "$3" "$4" >"$1"
+}
+site_i() {
+    # $1 = calls, $2 = inode, $3 = candidates JSON, $4 = installed_at, $5 = generation (opt)
+    printf '{"calls": %s, "candidates": [%s], "object": "lib", "device": 1, "inode": %s, "offset": 4096, "generation": %s, "installed_at": %s}' "$1" "$3" "$2" "${5:-0}" "$4"
+}
+
+S11I=$(site_i 3 101 "$C11" 5); S15I=$(site_i 2 102 "$C15" 6)
+mk_report_v "$T/rep12_v21.json" "observed-crypto-v2.1" "[$S11I, $S15I]"
+F11I=$(site_i 3 201 "$C11" 7); F15I=$(site_i 2 202 "$C15" 8)
+mk_report_vf "$T/rep12fence_v21.json" "observed-crypto-v2.1" "[]" \
+    '[{"generation": 0, "sites": ['"$F11I"', '"$F15I"']}]'
+mk_report_v "$T/rep12_bare.json" "observed-crypto-v2" "[$S11, $S15]"
+mk_report_v "$T/rep12_v29.json" "observed-crypto-v2.9" "[$S11, $S15]"
+mk_report_v "$T/rep12_v3.json" "observed-crypto-v3.0" "[$S11, $S15]"
+mk_report_v "$T/rep12_v2x.json" "observed-crypto-v2.x" "[$S11, $S15]"
+mk_report_v "$T/rep12_v2dot.json" "observed-crypto-v2." "[$S11, $S15]"
+
+# 41. PASS: v2.1 current sites with installed_at pass (reader gate).
+if python3 "$ORACLE" "$T/ecdsa.log" "$T/rep12_v21.json" ecdsa >"$T/out" 2>&1; then
+    grep -q 'ORACLE PASS' "$T/out" \
+        && ok "v2.1 current sites with installed_at pass" \
+        || bad "v2.1 current sites with installed_at pass"
+else
+    bad "v2.1 current sites with installed_at pass (rc=$?)"
+fi
+
+# 42. PASS: v2.1 fenced sites with installed_at pass (reader gate).
+if python3 "$ORACLE" "$T/ecdsa.log" "$T/rep12fence_v21.json" ecdsa >"$T/out" 2>&1; then
+    grep -q 'ORACLE PASS' "$T/out" \
+        && ok "v2.1 fenced sites with installed_at pass" \
+        || bad "v2.1 fenced sites with installed_at pass"
+else
+    bad "v2.1 fenced sites with installed_at pass (rc=$?)"
+fi
+
+# 43. PASS: bare observed-crypto-v2 accepted (implicit .0).
+if python3 "$ORACLE" "$T/ecdsa.log" "$T/rep12_bare.json" ecdsa >"$T/out" 2>&1; then
+    grep -q 'ORACLE PASS' "$T/out" \
+        && ok "bare v2 accepted" \
+        || bad "bare v2 accepted"
+else
+    bad "bare v2 accepted (rc=$?)"
+fi
+
+# 44. PASS: future digit minor v2.9 accepted (reader gate).
+if python3 "$ORACLE" "$T/ecdsa.log" "$T/rep12_v29.json" ecdsa >"$T/out" 2>&1; then
+    grep -q 'ORACLE PASS' "$T/out" \
+        && ok "v2.9 accepted" \
+        || bad "v2.9 accepted"
+else
+    bad "v2.9 accepted (rc=$?)"
+fi
+
+# 45. FAIL: other major v3.0 rejected.
+if python3 "$ORACLE" "$T/ecdsa.log" "$T/rep12_v3.json" ecdsa >"$T/out" 2>&1; then
+    bad "v3.0 rejected (got exit 0)"
+else
+    grep -q 'schema_version' "$T/out" \
+        && ok "v3.0 rejected" \
+        || bad "v3.0 rejected"
+fi
+
+# 46. FAIL: non-digit minor v2.x rejected.
+if python3 "$ORACLE" "$T/ecdsa.log" "$T/rep12_v2x.json" ecdsa >"$T/out" 2>&1; then
+    bad "v2.x rejected (got exit 0)"
+else
+    grep -q 'schema_version' "$T/out" \
+        && ok "v2.x rejected" \
+        || bad "v2.x rejected"
+fi
+
+# 47. FAIL: empty minor v2. rejected.
+if python3 "$ORACLE" "$T/ecdsa.log" "$T/rep12_v2dot.json" ecdsa >"$T/out" 2>&1; then
+    bad "v2. rejected (got exit 0)"
+else
+    grep -q 'schema_version' "$T/out" \
+        && ok "v2. rejected" \
+        || bad "v2. rejected"
+fi
+
 echo "---"
 echo "pass=$PASS fail=$FAIL"
 [ "$FAIL" -eq 0 ]
