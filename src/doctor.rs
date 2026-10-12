@@ -33,6 +33,7 @@ use crate::discovery::legacy;
 use crate::discovery::maps;
 use crate::discovery::onboard::{self, LibcryptoMaps, QualifyOpts, TargetQualification};
 use crate::discovery::provider::{ProviderTable, ResolutionInputs, resolve_provider_class};
+use std::os::fd::{AsRawFd as _, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -235,6 +236,100 @@ struct ProbeOut {
     ok: bool,
     errno: i32,
     log: String,
+}
+
+// r1 = map_fd (ld_map_fd, slots 0-1); r2 = 0
+// (BPF_RB_AVAIL_DATA); call ringbuf_query; r0 = 0; exit.
+// Verifier-trivially-valid on any kernel with helper 134; the
+// fd is patched in directly (known at build time — no loader
+// relocation needed for a probe).
+fn insns_ringbuf_query(map_fd: RawFd) -> Vec<u8> {
+    let mut v = vec![0x18, 0x11, 0x00, 0x00];
+    v.extend_from_slice(&(map_fd as u32).to_le_bytes()); // r1 = map_fd ll
+    v.extend_from_slice(&[0u8; 8]); // (imm64 high)
+    v.extend_from_slice(&[0xb7, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]); // r2 = 0
+    v.extend_from_slice(&[0x85, 0x00, 0x00, 0x00]); // call
+    v.extend_from_slice(&(ossl_bpf_sys::BPF_FUNC_RINGBUF_QUERY as u32).to_le_bytes()); // 134
+    v.extend_from_slice(&[0xb7, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]); // r0 = 0
+    v.extend_from_slice(&[0x95, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]); // exit
+    v
+}
+
+/// `bpf_ringbuf_query` floor-probe failure: which stage failed
+/// (map creation vs program load), the errno, and the verifier
+/// log (empty unless the load stage produced one).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RingbufQueryError {
+    pub stage: &'static str,
+    pub errno: i32,
+    pub log: String,
+}
+
+impl std::fmt::Display for RingbufQueryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ringbuf_query unavailable ({} failed, errno {}): {}",
+            self.stage,
+            self.errno,
+            if self.log.is_empty() {
+                "no verifier log"
+            } else {
+                self.log.trim()
+            }
+        )
+    }
+}
+
+impl std::error::Error for RingbufQueryError {}
+
+/// `bpf_ringbuf_query` availability probe (P7 item 1a, §5.4
+/// floor): creates a scratch ringbuf map, loads a trivial prog
+/// calling the helper against it, and reports the outcome. Needs
+/// CAP_BPF (map + load); fail-closed on any error. Intended for
+/// B-traversal startup gating (P7 item 3+); doctor surfaces it
+/// as an informational row until then.
+pub fn probe_ringbuf_query() -> Result<(), RingbufQueryError> {
+    let map = ossl_bpf_sys::map_create(
+        ossl_bpf_sys::BPF_MAP_TYPE_RINGBUF,
+        0,
+        0,
+        4096,
+        None,
+        "rbqprobe",
+    )
+    .map_err(|e| RingbufQueryError {
+        stage: "map_create",
+        errno: errno_of(&e),
+        log: String::new(),
+    })?;
+    let insns = insns_ringbuf_query(map.as_raw_fd());
+    let mut log = vec![0u8; 4096];
+    let license = c"GPL";
+    ossl_bpf_sys::prog_load_kprobe(&insns, license, None, &mut log, "rbqprobe", None)
+        .map(|_| ())
+        .map_err(|e| RingbufQueryError {
+            stage: "prog_load",
+            errno: errno_of(&e),
+            log: String::from_utf8_lossy(&log)
+                .trim_end_matches('\0')
+                .to_string(),
+        })
+}
+
+fn ringbuf_query_probe_out() -> ProbeOut {
+    match probe_ringbuf_query() {
+        Ok(()) => ProbeOut {
+            ok: true,
+            errno: 0,
+            log: String::new(),
+        },
+        Err(e) => ProbeOut {
+            ok: false,
+            errno: e.errno,
+            log: e.log,
+        },
+    }
 }
 
 fn errno_of(e: &std::io::Error) -> i32 {
@@ -859,6 +954,32 @@ fn check_token_support(env: &Env) -> Check {
         _ => Check::info(
             "token-support",
             "token existence unverifiable without CAP_BPF (informational only)".into(),
+        ),
+    }
+}
+
+fn check_ringbuf_query(env: &Env) -> Check {
+    // B-traversal floor signal (P7 item 1a, §5.4) — informational
+    // until the B entry gates startup on it (P7 item 3+ wires
+    // fail-closed): the sampler path needs no ringbuf_query.
+    let out = ringbuf_query_probe_out();
+    match classify_probe("ringbuf-query", &out, &env.deny_ctx(), false) {
+        ProbeVerdict::Pass => Check::info(
+            "ringbuf-query",
+            "bpf_ringbuf_query present (B-traversal floor ok; entry admission can query occupancy)"
+                .into(),
+        ),
+        ProbeVerdict::TooOld(m) => Check::info(
+            "ringbuf-query",
+            format!("bpf_ringbuf_query absent ({m}; B traversal unavailable, sampler unaffected)"),
+        ),
+        ProbeVerdict::DegradedCaps => Check::info(
+            "ringbuf-query",
+            "bpf_ringbuf_query unverifiable without CAP_BPF (informational only)".into(),
+        ),
+        ProbeVerdict::Denied(m, _) => Check::info(
+            "ringbuf-query",
+            format!("bpf_ringbuf_query denied with caps held ({m}; informational only)"),
         ),
     }
 }
@@ -1772,6 +1893,7 @@ pub fn run(args: &[String]) -> ExitCode {
     let mut checks = vec![
         check_kernel(&env),
         check_token_support(&env),
+        check_ringbuf_query(&env),
         check_caps(&env),
         check_btf(),
         check_lockdown(&env),
@@ -2331,6 +2453,18 @@ mod tests {
         assert_eq!(&p[5 * 8 + 4..5 * 8 + 8], &[0x70, 0x00, 0x00, 0x00]);
         // Last insn is exit.
         assert_eq!(p[7 * 8], 0x95);
+        // ringbuf_query floor probe: ld_map_fd r1, fd (slots 0-1)
+        // + r2 = 0 (AVAIL_DATA) + call 134 + r0 = 0 + exit.
+        let q = insns_ringbuf_query(7);
+        assert_eq!(q.len(), 48);
+        assert_eq!(q[0], 0x18);
+        assert_eq!(q[1], 0x11);
+        assert_eq!(&q[4..8], &[0x07, 0x00, 0x00, 0x00]);
+        assert_eq!(&q[8..16], &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        assert_eq!(&q[16..24], &[0xb7, 0x02, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(q[3 * 8], 0x85);
+        assert_eq!(&q[3 * 8 + 4..4 * 8], &[134, 0x00, 0x00, 0x00]);
+        assert_eq!(q[5 * 8], 0x95);
     }
 
     #[test]
