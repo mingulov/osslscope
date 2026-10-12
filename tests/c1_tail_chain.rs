@@ -184,8 +184,7 @@ fn system_libcrypto() -> Option<PathBuf> {
 }
 
 fn stage(tag: &str) -> PathBuf {
-    let dir =
-        std::env::temp_dir().join(format!("osslscope-c1live-{}-{}", tag, std::process::id()));
+    let dir = std::env::temp_dir().join(format!("osslscope-c1live-{}-{}", tag, std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
@@ -313,7 +312,13 @@ fn c1_frozen_shape_has_chain_support() {
         .find(|m| m.name == "JUMPS")
         .expect("HARVEST_MAPS carries JUMPS");
     assert_eq!(
-        (jumps.map_type, jumps.key_size, jumps.value_size, jumps.max_entries, jumps.flags),
+        (
+            jumps.map_type,
+            jumps.key_size,
+            jumps.value_size,
+            jumps.max_entries,
+            jumps.flags
+        ),
         (3, 4, 4, 8, 0),
         "JUMPS is a prog-array of 8"
     );
