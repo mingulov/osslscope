@@ -157,8 +157,11 @@ validation.
 
 `completeness.status` is `COMPLETE`, `PARTIAL` or `FATAL`.
 `fatal_kind` is null unless `FATAL` (`recycled`, `attach-zero`, or
-`environment` with detail). `reasons` are typed objects with a
-`kind` discriminator:
+`environment`/`runtime` with detail). `runtime` is a salvaged
+post-observation tool failure: the close flow broke mid-run, every
+collected observation survives, and policy still evaluates (a proved
+violation exits 10; otherwise exit 1). `reasons` are typed objects
+with a `kind` discriminator:
 
 | kind | fields |
 |---|---|
@@ -323,11 +326,12 @@ CBOM attempt and vice versa. `DeliveryResult` carries per-artifact
 outcomes plus bounded stderr diagnostics (at most 8 lines, 200
 chars each; `emit_diagnostics` prints them).
 
-Exit mapping (R06, owned by T10): a proved violation stays exit 10
-even when delivery failed; otherwise any delivery failure is exit
-1; then inconclusive 11, `PARTIAL` 3, clean 0. `DeliveryResult`
-preserves this priority via `failed()`/`delivered_all()` — it
-reports, never decides.
+Exit mapping (R06, owned by T10; PRD §14 order, H7-extended): 2
+usage > 10 violation (even when delivery failed, even on salvaged
+docs) > 1 salvaged `runtime`-fatal doc > 4 setup-no-verdict > 1
+failed child / failed delivery > 11 inconclusive > `PARTIAL` 3 >
+clean 0. `DeliveryResult` preserves this priority via
+`failed()`/`delivered_all()` — it reports, never decides.
 
 Primary and CBOM targeting one sink is refused (stdout would
 concatenate two artifacts into unparseable bytes; one file would

@@ -452,9 +452,9 @@ pub fn run(argv: &[String]) -> ExitCode {
     let args = match parse(argv) {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("osslscope check: {e}");
+            crate::report::err_line(&format!("osslscope check: {e}"));
             for l in USAGE {
-                eprintln!("{l}");
+                crate::report::err_line(l);
             }
             return ExitCode::from(2);
         }
@@ -479,8 +479,10 @@ pub fn run(argv: &[String]) -> ExitCode {
             // no-verdict policy section, and a fatal CBOM — from a
             // typed no-evidence document. No legacy fallback: with
             // no capture there is no tripwire evidence to fold in.
-            eprintln!("osslscope check: {e:#}");
-            eprintln!("osslscope check: run 'osslscope doctor' to diagnose environment failures");
+            crate::report::err_line(&format!("osslscope check: {e:#}"));
+            crate::report::err_line(
+                "osslscope check: run 'osslscope doctor' to diagnose environment failures",
+            );
             let mut document =
                 setup_failure_document(FatalKind::Environment(bound_line(&format!("{e:#}"))));
             let verdict = evaluate_document(&[], &document);

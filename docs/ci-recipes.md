@@ -74,9 +74,9 @@ Notes:
 |---|---|---|
 | 0 | clean (COMPLETE, no violation) | pass |
 | 3 | PARTIAL evidence, no violation | warn + upload artifacts; gate passes by default (strict-fail is team policy) |
-| 10 | policy violation (on COMPLETE or PARTIAL) | fail; triage per [violation triage](violation-triage.md) |
-| 4 | environment/attach failure | fail; run `doctor`, remediate, retry (see [attach failures](attach-failures.md)) |
-| 1 | child failed (`child_exit` present) or observer bug (`child_exit` absent) | fail; branch on `child_exit` in gate.json |
+| 10 | policy violation (on COMPLETE, PARTIAL, or salvaged `runtime`-fatal) | fail; triage per [violation triage](violation-triage.md) |
+| 4 | setup failure: observation never started (environment/attach failure) | fail; run `doctor`, remediate, retry (see [attach failures](attach-failures.md)) |
+| 1 | child failed (`child_exit` present), delivery failed, or salvaged close failure (`fatal_kind: runtime` in gate.json — observations kept) | fail; branch on `child_exit` / `fatal_kind` in gate.json |
 | 2 | usage/config error | fail; fix the invocation |
 
 Do NOT gate on COMPLETE status or exit 0 on real TLS apps: v1 is

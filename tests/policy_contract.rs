@@ -1135,8 +1135,11 @@ fn fatal_capture_has_no_verdict() {
     assert_eq!(exit_for(v.overall(), None, &fatal, &ok_delivery()), 4);
 }
 
-/// Exit precedence: violation(10) > child/artifact failure(1) >
-/// inconclusive(11) > signal-cut/PARTIAL(3) > clean(0); fatal is 4.
+/// Exit precedence (PRD §14): violation(10) first, then
+/// setup-no-verdict(4), child/artifact failure(1), inconclusive(11),
+/// signal-cut/PARTIAL(3), clean(0); H7 inserts salvaged
+/// `runtime`-fatal at 1 between violation and no-verdict (see
+/// `h7_failure_fidelity`).
 #[test]
 fn exit_precedence() {
     let viol_doc = complete_doc(vec![site_at(

@@ -941,11 +941,9 @@ fn check_records(
                 .and_then(|o| o.get("detail"))
                 .is_some_and(|v| !v.is_null());
             match kind {
-                "environment" => {
+                "environment" | "runtime" => {
                     if !detail {
-                        return Err(
-                            "doc.completeness.fatal_kind: environment needs detail".to_string()
-                        );
+                        return Err(format!("doc.completeness.fatal_kind: {kind} needs detail"));
                     }
                 }
                 "recycled" | "attach-zero" => {

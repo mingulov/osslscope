@@ -27,7 +27,9 @@ pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
             ExitCode::SUCCESS
         }
         other => {
-            eprintln!("osslscope: unknown subcommand '{other}' (see: osslscope help)");
+            crate::report::err_line(&format!(
+                "osslscope: unknown subcommand '{other}' (see: osslscope help)"
+            ));
             ExitCode::from(2)
         }
     }

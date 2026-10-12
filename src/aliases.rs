@@ -75,7 +75,7 @@ pub fn run(args: &[String]) -> ExitCode {
             "--in" => match it.next() {
                 Some(p) => input = Some(p.into()),
                 None => {
-                    eprintln!("osslscope alias-audit: missing value for --in");
+                    crate::report::err_line("osslscope alias-audit: missing value for --in");
                     return ExitCode::from(2);
                 }
             },
@@ -86,7 +86,7 @@ pub fn run(args: &[String]) -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             _ => {
-                eprintln!("usage: osslscope alias-audit [--in FILE] < doc.json");
+                crate::report::err_line("usage: osslscope alias-audit [--in FILE] < doc.json");
                 return ExitCode::from(2);
             }
         }
@@ -102,23 +102,26 @@ pub fn run(args: &[String]) -> ExitCode {
     let text = match text {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("osslscope alias-audit: read: {e}");
+            crate::report::err_line(&format!("osslscope alias-audit: read: {e}"));
             return ExitCode::FAILURE;
         }
     };
     if text.trim().is_empty() {
-        eprintln!("osslscope alias-audit: empty input (want a harvest doc)");
-        eprintln!("usage: osslscope alias-audit [--in FILE] < doc.json");
+        crate::report::err_line("osslscope alias-audit: empty input (want a harvest doc)");
+        crate::report::err_line("usage: osslscope alias-audit [--in FILE] < doc.json");
         return ExitCode::from(2);
     }
     let doc: serde_json::Value = match serde_json::from_str(&text) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("osslscope alias-audit: parse: {e}");
+            crate::report::err_line(&format!("osslscope alias-audit: parse: {e}"));
             return ExitCode::FAILURE;
         }
     };
-    println!("{}", serde_json::to_string_pretty(&audit(&doc)).unwrap());
+    // H7-T6: `Value` serialization is infallible; the fallback
+    // exists only to shed the panic shape (never observed).
+    let text = serde_json::to_string_pretty(&audit(&doc)).unwrap_or_else(|_| "{}".to_string());
+    println!("{text}");
     ExitCode::SUCCESS
 }
 

@@ -404,6 +404,13 @@ pub enum FatalKind {
     Recycled,
     AttachZero,
     Environment(String),
+    /// Post-observation tool failure (H7): the close flow broke
+    /// mid-run (drain, discovery finish, or target disposition).
+    /// The doc is salvaged — every collected observation survives —
+    /// with the failure folded in as fatal loss + `close-failure`
+    /// reason. Unlike other fatal kinds, salvaged docs evaluate
+    /// policy (a proved violation still exits 10) and exit 1.
+    Runtime(String),
 }
 
 /// Window completeness. COMPLETE means no relevant
