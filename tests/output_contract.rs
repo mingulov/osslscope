@@ -85,6 +85,7 @@ fn site_at(
         calls,
         first_ns: 10,
         last_ns: 90,
+        installed_at: None,
     }
 }
 
@@ -644,7 +645,7 @@ fn schema_version_gate() {
     assert!(!check_version("observed-crypto-v2.9"));
     // Renders carry exactly the current producer version.
     for doc in [complete_doc(), violation_doc(), fatal_doc()] {
-        assert_eq!(json_of(&doc)["schema_version"], "observed-crypto-v2.0");
+        assert_eq!(json_of(&doc)["schema_version"], "observed-crypto-v2.1");
     }
 }
 
@@ -1631,7 +1632,7 @@ fn cbom_carries_same_window() {
             meta["osslscope:window-effective-end-ns"],
             doc.window.effective_end_ns.to_string()
         );
-        assert_eq!(meta["osslscope:schema-version"], "observed-crypto-v2.0");
+        assert_eq!(meta["osslscope:schema-version"], "observed-crypto-v2.1");
     }
     // PARTIAL disclaimer names the gaps.
     let meta = cbom_metadata(&cbom_of(&partial_doc()));
@@ -2318,4 +2319,44 @@ fn write_generated_v2_artifacts() {
             human_path.display()
         );
     }
+}
+
+#[test]
+fn site_installed_at_renders_and_validates_v2() {
+    // P6 installed-at: a stamped site renders its wall, an
+    // unstamped site omits the key (minors add optional keys
+    // only), the document validates and stamps the v2.1 minor.
+    let mut doc = complete_doc();
+    assert!(doc.sites.len() >= 4);
+    doc.sites[0].installed_at = Some(5);
+    assert_eq!(doc.sites[3].installed_at, None);
+    let v = json_of(&doc);
+    assert_eq!(v["schema_version"], "observed-crypto-v2.1");
+    validate_v2(&v).expect("installed_at doc fails schema");
+    check_v2_semantics(&v).expect("installed_at doc fails semantics");
+    assert_eq!(v["sites"][0]["installed_at"], 5);
+    assert!(
+        v["sites"][3].get("installed_at").is_none(),
+        "unstamped site must omit the key"
+    );
+    // A v2.0-shaped document (no installed_at anywhere) keeps
+    // validating: stored evidence survives the minor bump.
+    let mut old = v.clone();
+    old["schema_version"] = Value::from("observed-crypto-v2.0");
+    let strip = |sites: &mut Value| {
+        if let Some(list) = sites.as_array_mut() {
+            for site in list {
+                if let Some(m) = site.as_object_mut() {
+                    m.remove("installed_at");
+                }
+            }
+        }
+    };
+    strip(&mut old["sites"]);
+    if let Some(buckets) = old["fenced"].as_array_mut() {
+        for bucket in buckets {
+            strip(&mut bucket["sites"]);
+        }
+    }
+    validate_v2(&old).expect("v2.0-shaped doc must keep validating");
 }

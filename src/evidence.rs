@@ -19,7 +19,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Schema identity carried by every finalized capture document.
-pub const CAPTURE_SCHEMA_V2: &str = "observed-crypto-v2.0";
+pub const CAPTURE_SCHEMA_V2: &str = "observed-crypto-v2.1";
 
 /// Verified object fingerprint. A pathname may locate a file for display,
 /// but it never defines identity (R02).
@@ -86,8 +86,12 @@ pub enum CandidateCoverage {
 
 /// Physical execution record for one site in one generation: the site
 /// key, its candidate metadata, and the conserved call count with its
-/// first/last in-window timestamps. Field order defines the total
-/// document order: `(site, generation)` first, full record after.
+/// first/last in-window timestamps. `installed_at` is the cookie's
+/// probe-attachment wall (monotonic ns, `None` = never recorded —
+/// installed is not counted: compare against `first_ns`). Field
+/// order defines the total document order: `(site, generation)`
+/// first, full record after (`installed_at` trails, so it only
+/// breaks ties between records otherwise fully equal).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct SiteExecution {
     pub site: SiteKey,
@@ -97,6 +101,7 @@ pub struct SiteExecution {
     pub calls: u64,
     pub first_ns: u64,
     pub last_ns: u64,
+    pub installed_at: Option<u64>,
 }
 
 impl SiteExecution {

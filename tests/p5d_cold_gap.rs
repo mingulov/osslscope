@@ -1081,6 +1081,29 @@ fn capture_spawn_counts_executions() {
         cap.reasons,
         coverage
     );
+    // P6 installed-at (attach-timing proof): every counted live
+    // site carries its install wall at or before its first counted
+    // execution — installed precedes counted, per site. Quiet
+    // sites (none render today) are P7's per-site spec.
+    for site in cap
+        .document
+        .sites
+        .iter()
+        .chain(cap.document.fenced.iter().flat_map(|g| g.sites.iter()))
+    {
+        if site.calls == 0 {
+            continue;
+        }
+        let at = site
+            .installed_at
+            .unwrap_or_else(|| panic!("live site without an install wall: {:?}", site.site));
+        assert!(
+            at <= site.first_ns,
+            "install wall after first count: installed_at={at} first_ns={} site={:?}",
+            site.first_ns,
+            site.site
+        );
+    }
     // Substantial-counting guard (~3.0M observed, 30× margin):
     // pins a heavily counted hot loop rather than a token trickle
     // or a zero collapse. It does not pin attach timing (an ~+3s

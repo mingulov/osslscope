@@ -15,7 +15,7 @@ reject v2 documents and there is no dual live producer.
 
 ## Reader contract
 
-Producers emit exactly `observed-crypto-v2.0`. Readers accept
+Producers emit exactly `observed-crypto-v2.1`. Readers accept
 `observed-crypto-v2` and `observed-crypto-v2.<digits>` and reject
 every other major (`src/schema.rs` `check_version_v2`, pinned by
 `compat_matrix_v2` and `output_contract::schema_version_gate`).
@@ -140,6 +140,17 @@ candidates, one weak alias):
 }
 ```
 
+(The golden fixture predates install walls, so no `installed_at`
+key renders above.) Since v2.1, sites carry the optional
+`installed_at`: the cookie's probe-attachment wall in monotonic
+ns, omitted when the producer never recorded it. Installed is not
+counted — `installed_at` bounds the install moment while
+`first_ns` stamps the first counted execution, so per site
+installed-at vs first-counted is distinguishable; a site with no
+counted executions never renders (quiet cookies stay covered by
+`ScopeCoverage.attached`, not gaps — the per-site never-counted
+rendering is P7's per-site spec).
+
 A site is *definite* only when it executed, its candidate set is
 complete, and every candidate agrees on provider, provider class,
 op, funcid and one single *resolved* algorithm class
@@ -262,7 +273,7 @@ evidence refs stay explicit metadata, values verbatim from
 
 ```json
 {"metadata": {"properties": [
-  {"name": "osslscope:schema-version", "value": "observed-crypto-v2.0"},
+  {"name": "osslscope:schema-version", "value": "observed-crypto-v2.1"},
   {"name": "osslscope:execution-evidence-completeness", "value": "COMPLETE"},
   {"name": "osslscope:omitted-ambiguous-sites", "value": "1"},
   {"name": "osslscope:omitted-ambiguous-calls", "value": "100"},
@@ -287,7 +298,7 @@ evaluated); `PARTIAL`/`FATAL` ride an in-band disclaimer and
 Byte-verbatim `tests/goldens/report-v2-complete.txt`:
 
 ```text
-osslscope report (observed-crypto-v2.0): pid=7 (demo) window=0..100ns effective=0..100ns
+osslscope report (observed-crypto-v2.1): pid=7 (demo) window=0..100ns effective=0..100ns
 openssl: 3.5.1 (verified object metadata)
 target: argv_redacted=true container_id=(none) image_digest=(none)
 disposition: exited code=0

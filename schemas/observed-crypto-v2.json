@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://osslscope.dev/schemas/observed-crypto-v2.json",
   "title": "observed-crypto v2",
-  "description": "osslscope report/check window document (continuation R08). The counted unit is entry into a provider-dispatch callback at one physical site; candidates are sorted attribution metadata, not definite executed-algorithm identity. Producers emit observed-crypto-v2.0 today. Readers gate majors via check_version_v2 (accept v2.x, reject other majors); validators enforce this minor's schema strictly (unknown keys fail: a v2.0 validator cannot verify v2.1 keys it does not know) while field-level readers ignore unknown keys. report documents omit policy/disposition when unevaluated/unrecorded; check documents add policy. No raw argv, cmdline, environment or runtime addresses anywhere: every object forbids additional properties.",
+  "description": "osslscope report/check window document (continuation R08). The counted unit is entry into a provider-dispatch callback at one physical site; candidates are sorted attribution metadata, not definite executed-algorithm identity. Producers emit observed-crypto-v2.1 today. Readers gate majors via check_version_v2 (accept v2.x, reject other majors); validators enforce this minor's schema strictly (unknown keys fail: a v2.0 validator cannot verify v2.1 keys it does not know) while field-level readers ignore unknown keys. report documents omit policy/disposition when unevaluated/unrecorded; check documents add policy. No raw argv, cmdline, environment or runtime addresses anywhere: every object forbids additional properties.",
   "type": "object",
   "required": ["schema_version", "target", "openssl", "window", "completeness", "sites", "fenced", "objects", "coverage", "legacy_partition"],
   "additionalProperties": false,
@@ -261,7 +261,7 @@
       }
     },
     "site": {
-      "description": "Physical execution record for one site in one generation: the site key, candidate metadata, and the conserved call count with first/last in-window timestamps.",
+      "description": "Physical execution record for one site in one generation: the site key, candidate metadata, and the conserved call count with first/last in-window timestamps. installed_at (v2.1, optional) is the cookie's probe-attachment wall in monotonic ns; absent when never recorded. Installed is not counted: compare against first_ns.",
       "type": "object",
       "required": ["object", "device", "inode", "offset", "generation", "candidates", "candidates_coverage", "calls", "first_ns", "last_ns"],
       "additionalProperties": false,
@@ -278,7 +278,8 @@
         "candidates_coverage": { "enum": ["complete", "unknown"] },
         "calls": { "$ref": "#/$defs/u64" },
         "first_ns": { "$ref": "#/$defs/u64" },
-        "last_ns": { "$ref": "#/$defs/u64" }
+        "last_ns": { "$ref": "#/$defs/u64" },
+        "installed_at": { "$ref": "#/$defs/u64" }
       }
     },
     "reason": {

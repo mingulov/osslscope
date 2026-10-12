@@ -585,6 +585,7 @@ mod tests {
             calls,
             first_ns: 100,
             last_ns: 200,
+            installed_at: None,
         }
     }
 

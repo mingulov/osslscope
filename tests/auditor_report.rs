@@ -846,6 +846,7 @@ fn auditor_v2_fixture() -> CaptureDocument {
             calls,
             first_ns: 10,
             last_ns: 90,
+            installed_at: None,
         }
     };
     const FP_A: &str = "build:aaaa0123456789aaaa0123456789aaaa0123456789aaaa0123456789";
@@ -1042,7 +1043,7 @@ fn golden_v2_bytes_stable() {
 fn golden_v2_exercises_branches() {
     let (_, v) = load_golden_v2();
     let o = v.as_object().unwrap();
-    assert_eq!(o["schema_version"], "observed-crypto-v2.0");
+    assert_eq!(o["schema_version"], "observed-crypto-v2.1");
     assert!(
         !o["sites"].as_array().unwrap().is_empty(),
         "v2 golden needs sites"
