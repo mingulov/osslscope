@@ -796,13 +796,17 @@ pub struct SessionCore {
     /// arrays bootstrap cleanly from the next poll. Cleared every
     /// poll, like `bootstrap_grace`.
     m1_poison: HashSet<u64>,
-    /// Remembered impl-backing triple per (array, slot) (M4):
-    /// populated on the first validated row per slot, compared
-    /// before join/refresh, re-seated on mismatch. Cleared for
-    /// `arr` on array retire (memories belong to the array epoch)
-    /// and wholly on recycle. Bounded by distinct slots ever
-    /// walked (same order as `alg_records`).
-    slot_backing: HashMap<(u64, u64), BackingRef>,
+    /// Remembered impl-backing triple per (array, slot, impl)
+    /// (M4): populated on the first validated row per cell,
+    /// compared before join/refresh, re-seated on mismatch. The
+    /// impl vaddr is in the key because one (array, slot) carries
+    /// many dispatch entries (the walker emits one ROW per entry
+    /// sharing the alg index) — and because a new vaddr is a new
+    /// candidate key, hence a fresh cell (sound-silent, never a
+    /// false stale). Cleared for `arr` on array retire (memories
+    /// belong to the array epoch) and wholly on recycle. Bounded
+    /// by distinct (slot, impl) rows ever walked.
+    slot_backing: HashMap<(u64, u64, u64), BackingRef>,
     /// Last successfully read mappings (F-D/Am1): a failed
     /// `current_maps` reconciles against this instead of reading
     /// the failure as empty. Starts empty (a first-poll failure
@@ -1130,11 +1134,11 @@ impl SessionCore {
     }
 
     /// Slot-backing gate (M4): the row's impl backing must match
-    /// the triple remembered for its (array, slot) — a
+    /// the triple remembered for its (array, slot, impl) — a
     /// backing-only replacement at the same vaddr is
     /// indistinguishable from a stale queued row (same address,
     /// same stamp, array never bumped), so the first
-    /// post-replacement row per slot drops loudly with
+    /// post-replacement row per cell drops loudly with
     /// op-localized loss (the row names its op — same channel as
     /// stragglers) and re-seats the memory; subsequent rows match
     /// and flow. First sighting records silently; a missing
@@ -1147,21 +1151,22 @@ impl SessionCore {
         op: u32,
         arr: u64,
         idx: u64,
+        imp: u64,
         backing: &Option<BackingRef>,
     ) -> bool {
         let Some(current) = backing else {
             return true;
         };
-        match self.slot_backing.get(&(arr, idx)) {
+        match self.slot_backing.get(&(arr, idx, imp)) {
             None => {
-                self.slot_backing.insert((arr, idx), current.clone());
+                self.slot_backing.insert((arr, idx, imp), current.clone());
                 true
             }
             Some(remembered) if remembered == current => true,
             Some(_) => {
                 eprintln!("stale slot backing: op={op} idx={idx}");
                 self.tracker.note_straggler(op);
-                self.slot_backing.insert((arr, idx), current.clone());
+                self.slot_backing.insert((arr, idx, imp), current.clone());
                 false
             }
         }
@@ -1328,7 +1333,7 @@ impl SessionCore {
         // retire path (rebirth, unload, failed bump) clears the
         // array's, so the next epoch's first rows record fresh
         // instead of going falsely stale.
-        self.slot_backing.retain(|(a, _), _| *a != arr);
+        self.slot_backing.retain(|(a, _, _), _| *a != arr);
         let gap = self.tracker.retire_table(op, arr);
         self.retained.accumulate(&gap);
         self.alg_records.retain(|(a, _), _| *a != arr);
@@ -2434,7 +2439,7 @@ impl SessionCore {
                 // Slot-backing gate (M4): compares BEFORE the
                 // refresh arm below can adopt a changed backing —
                 // a mismatched duplicate drops here instead.
-                if !self.check_slot_backing(ev.op, ev.aux, ev.idx, &backing) {
+                if !self.check_slot_backing(ev.op, ev.aux, ev.idx, ev.addr, &backing) {
                     return;
                 }
                 if let Some(&i) = self.seen.get(&key) {

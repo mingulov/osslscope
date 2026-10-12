@@ -2090,7 +2090,7 @@ fn m4_impl_replace_drops_first_row_loud() {
     let d3 = core.poll(&mut env, ample_budget()).unwrap();
     assert!(
         d3.losses.is_empty(),
-        "one loud drop per slot per replacement: {:?}",
+        "one loud drop per (slot, impl) per replacement: {:?}",
         d3.losses
     );
     assert_eq!(d3.candidates.len(), 1, "refresh re-emits adopted backing");
@@ -2149,6 +2149,34 @@ fn m4_array_turnover_clears_slot_memory() {
     );
     assert_eq!(d2.candidates.len(), 1, "re-pointed candidate re-emits");
     assert_eq!(backing_ino(&core), 201);
+}
+
+#[test]
+fn m4_multi_entry_slot_validates_silently() {
+    // M4-T5 (dispatch-table shape): one (array, idx) carries many
+    // (funcid, impl) rows — the walker emits one ROW per dispatch
+    // entry sharing the alg index. Distinct impls are distinct
+    // memory cells: all validate silently (no false stale).
+    let mut env = TestEnv::new();
+    let mut core = test_core(false);
+    core.poll(&mut env, ample_budget()).unwrap();
+    env.push(query_ret(OP_DIGEST, M4_ARR, 3));
+    for i in 0..4u64 {
+        env.push(ok_alg(OP_DIGEST, M4_ARR, i));
+    }
+    for (n, imp) in [0x7f01_2000u64, 0x7f01_2100, 0x7f01_2200]
+        .iter()
+        .enumerate()
+    {
+        env.push(dispatch_row(OP_DIGEST, 3 + n as u32, *imp, M4_ARR, 3));
+    }
+    let d = core.poll(&mut env, ample_budget()).unwrap();
+    assert_eq!(d.candidates.len(), 3, "every entry binds");
+    assert!(
+        d.losses.is_empty(),
+        "multi-impl slot must be lossless: {:?}",
+        d.losses
+    );
 }
 
 #[test]
