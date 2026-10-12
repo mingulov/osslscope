@@ -814,25 +814,16 @@ pub fn query_return(ctx: RetProbeContext) -> u32 {
         // the chain continues past like a success, but the
         // truncation is flagged.
         1 => {
-            flag_trunc(op as u32, TRUNC_DISPATCH);
-            if no_store {
-                return 0;
-            }
-            if j == MAX_ALGS - 1 {
+            // V1 BISECT: tip arms (advance only) — chain_tail parked.
+            if !no_store {
                 advance_next(key, count);
-                return 0;
             }
-            chain_tail(&ctx, cookie, pend, key, count);
+            flag_trunc(op as u32, TRUNC_DISPATCH);
         }
         0 => {
-            if no_store {
-                return 0;
-            }
-            if j == MAX_ALGS - 1 {
+            if !no_store {
                 advance_next(key, count);
-                return 0;
             }
-            chain_tail(&ctx, cookie, pend, key, count);
         }
         // Read abort: flag (all slots) and freeze for re-walk.
         _ => {
@@ -853,6 +844,7 @@ pub fn query_return(ctx: RetProbeContext) -> u32 {
 /// scope — and the 16-byte re-insert perturbs the frame far less
 /// than a stash array.
 #[inline(always)]
+#[allow(dead_code)]
 fn chain_tail(ctx: &RetProbeContext, cookie: u64, pend: PendQuery, key: u128, count: u64) {
     if PENDING_QUERY.insert(pend_key(cookie), pend, 0).is_err() {
         // Unstashable (map full — effectively unreachable: one
