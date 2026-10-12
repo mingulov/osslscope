@@ -449,13 +449,36 @@ const BPF_LD_IMM64: u8 = 0x18;
 /// rule: same `target - pc - 1` encoding as a static call).
 const BPF_PSEUDO_FUNC: u8 = 4;
 
+/// Require a whole reloc site inside its owning function. The
+/// ownership filters pin only the site start; without this a
+/// two-slot site could cross into sibling bytes and resolve from
+/// them. (Start-ownership is the caller's filter; this pins the
+/// tail. The checked add also fails closed on offset overflow
+/// before any site read.)
+fn check_site_contained(
+    off: usize,
+    width: usize,
+    owner_end: usize,
+    owner_name: &str,
+    prog: &str,
+) -> anyhow::Result<()> {
+    let end = off
+        .checked_add(width)
+        .ok_or_else(|| anyhow::anyhow!("prog {prog}: reloc @{off} site out of range"))?;
+    if end > owner_end {
+        anyhow::bail!("prog {prog}: reloc @{off} site crosses {owner_name} end");
+    }
+    Ok(())
+}
+
 /// Resolve an `R_BPF_64_32` call reloc to a `.text` function name.
 /// Named FUNC syms resolve by (value, name); STT_SECTION syms (the
 /// toolchain's reduction for LOCAL callees — `call -1` + section
 /// reloc, as in query_return→walk_dispatch) resolve as
 /// section_base + (imm+1)*8, the aya-obj rule. Either way the
 /// target MUST be a `.text` entry: mid-function landings are drift,
-/// never a guess.
+/// never a guess. The site must be instruction-aligned: a
+/// misaligned offset reads a straddling window, never an insn.
 fn call_target(
     syms: &[Sym],
     text_fns: &[(usize, usize, String)],
@@ -464,6 +487,9 @@ fn call_target(
     r: &Reloc,
     prog: &str,
 ) -> anyhow::Result<String> {
+    if r.off % 8 != 0 {
+        anyhow::bail!("prog {prog}: call reloc site misaligned");
+    }
     let rsym = syms
         .get(r.sym)
         .ok_or_else(|| anyhow::anyhow!("prog {prog}: bad reloc sym"))?;
@@ -505,6 +531,9 @@ fn apply_call(
     target_off: usize,
     prog: &str,
 ) -> anyhow::Result<()> {
+    if rel_off % 8 != 0 {
+        anyhow::bail!("{prog}: call site misaligned");
+    }
     let insn = insns
         .get_mut(rel_off..rel_off + 8)
         .ok_or_else(|| anyhow::anyhow!("{prog}: call reloc out of range"))?;
@@ -521,10 +550,11 @@ fn apply_call(
 }
 
 /// Resolve an `R_BPF_64_64` function-pointer reloc to a `.text`
-/// function name. The site must be an unrelocated `ld_imm64` (src 0,
-/// zero imm64 — anything else is an already-relocated or corrupt
-/// object); the symbol must be a named global FUNC in `.text` (what
-/// the toolchain emits for address-taken callbacks). The target MUST
+/// function name. The site must be an aligned, unrelocated
+/// `ld_imm64` (src 0, zero reserved offset bytes, zero imm64 —
+/// anything else is an already-relocated or corrupt object); the
+/// symbol must be a named global FUNC in `.text` (what the
+/// toolchain emits for address-taken callbacks). The target MUST
 /// be a `.text` entry: mid-function landings are drift, never a
 /// guess.
 fn func_ptr_target(
@@ -535,6 +565,9 @@ fn func_ptr_target(
     r: &Reloc,
     prog: &str,
 ) -> anyhow::Result<String> {
+    if r.off % 8 != 0 {
+        anyhow::bail!("prog {prog}: func reloc site misaligned");
+    }
     let rsym = syms
         .get(r.sym)
         .ok_or_else(|| anyhow::anyhow!("prog {prog}: bad reloc sym"))?;
@@ -543,6 +576,9 @@ fn func_ptr_target(
         .ok_or_else(|| anyhow::anyhow!("prog {prog}: func reloc out of range"))?;
     if site[0] != BPF_LD_IMM64 || site[1] >> 4 != 0 {
         anyhow::bail!("prog {prog}: func reloc vs non-ld_imm64 site");
+    }
+    if site[2..4] != [0u8; 2] {
+        anyhow::bail!("prog {prog}: func reloc site reserved bytes set");
     }
     if site[4..16] != [0u8; 12] {
         anyhow::bail!("prog {prog}: func reloc vs relocated site");
@@ -561,19 +597,30 @@ fn func_ptr_target(
 /// relative encoding as a static call (`target - pc - 1`, in insns),
 /// and the src nibble takes `BPF_PSEUDO_FUNC` (the dst reg is
 /// preserved). The high half stays zero (asserted at resolve time).
+/// The site is fully validated before any mutation: a failed
+/// rewrite leaves the image untouched.
 fn apply_func_ptr(
     insns: &mut [u8],
     rel_off: usize,
     target_off: usize,
     prog: &str,
 ) -> anyhow::Result<()> {
+    if rel_off % 8 != 0 {
+        anyhow::bail!("{prog}: func site misaligned");
+    }
+    let site = insns
+        .get(rel_off..rel_off + 8)
+        .ok_or_else(|| anyhow::anyhow!("{prog}: func reloc out of range"))?;
+    if site[0] != BPF_LD_IMM64 || site[1] >> 4 != 0 {
+        anyhow::bail!("{prog}: func site not an unrelocated ld_imm64");
+    }
+    if site[2..4] != [0u8; 2] {
+        anyhow::bail!("{prog}: func site reserved bytes set");
+    }
     apply_call(insns, rel_off, target_off, prog)?;
     let insn = insns
         .get_mut(rel_off..rel_off + 8)
         .ok_or_else(|| anyhow::anyhow!("{prog}: func reloc out of range"))?;
-    if insn[0] != BPF_LD_IMM64 || insn[1] >> 4 != 0 {
-        anyhow::bail!("{prog}: func site not an unrelocated ld_imm64");
-    }
     insn[1] = (insn[1] & 0x0f) | (BPF_PSEUDO_FUNC << 4);
     Ok(())
 }
@@ -858,6 +905,12 @@ pub fn prepare(obj: &[u8], maps: &[MapSpec], progs: &[ProgSpec]) -> anyhow::Resu
             if f.size == 0 || f.size % 8 != 0 {
                 anyhow::bail!(".text fn {}: bad size {}", f.name, f.size);
             }
+            if f.value % 8 != 0 {
+                anyhow::bail!(".text fn {}: misaligned value", f.name);
+            }
+            if text_fns.iter().any(|t| t.2 == f.name) {
+                anyhow::bail!(".text fn {}: duplicate name", f.name);
+            }
             text_fns.push((f.value, f.value + f.size, f.name.clone()));
         }
     }
@@ -865,7 +918,7 @@ pub fn prepare(obj: &[u8], maps: &[MapSpec], progs: &[ProgSpec]) -> anyhow::Resu
         text_fns
             .iter()
             .find(|(a, b, _)| *a <= off && off < *b)
-            .map(|(_, _, n)| n.clone())
+            .map(|(a, b, n)| (*a, *b, n.clone()))
     };
 
     let mut out = Vec::new();
@@ -884,6 +937,9 @@ pub fn prepare(obj: &[u8], maps: &[MapSpec], progs: &[ProgSpec]) -> anyhow::Resu
         if sym.size == 0 || sym.size % 8 != 0 {
             anyhow::bail!("prog {}: bad size {}", p.name, sym.size);
         }
+        if sym.value % 8 != 0 {
+            anyhow::bail!("prog {}: misaligned value", p.name);
+        }
         let main = sec
             .get(sym.value..sym.value + sym.size)
             .ok_or_else(|| anyhow::anyhow!("prog {} out of range", p.name))?;
@@ -896,12 +952,20 @@ pub fn prepare(obj: &[u8], maps: &[MapSpec], progs: &[ProgSpec]) -> anyhow::Resu
             let owner = funcs
                 .get(p.section)
                 .and_then(|v| v.iter().find(|(a, b, _)| *a <= r.off && r.off < *b));
-            let Some((_, _, oname)) = owner else {
+            let Some((_, ob, oname)) = owner else {
                 anyhow::bail!("prog {}: reloc @{} ownerless (drift)", p.name, r.off);
             };
             if *oname != p.name {
                 continue; // belongs to an unloaded sibling prog
             }
+            // Calls patch 8 bytes, `ld_imm64` sites (func and map)
+            // 16: the whole site must sit inside its owner.
+            let width = match r.typ {
+                R_BPF_64_64 => 16,
+                R_BPF_64_32 => 8,
+                t => anyhow::bail!("prog {}: reloc type {t} unsupported", p.name),
+            };
+            check_site_contained(r.off, width, *ob, oname, p.name)?;
             let rsym = syms
                 .get(r.sym)
                 .ok_or_else(|| anyhow::anyhow!("prog {}: bad reloc sym", p.name))?;
@@ -955,6 +1019,13 @@ pub fn prepare(obj: &[u8], maps: &[MapSpec], progs: &[ProgSpec]) -> anyhow::Resu
                 .ok_or_else(|| anyhow::anyhow!("prog {}: call vs unknown {next}", p.name))?;
             for r in relocs.get(".text").map(Vec::as_slice).unwrap_or(&[]) {
                 if *f0 <= r.off && r.off < *f1 {
+                    let width = match r.typ {
+                        R_BPF_64_32 => 8,
+                        R_BPF_64_64 => 16,
+                        // Unknown types bail in the apply loop below.
+                        _ => continue,
+                    };
+                    check_site_contained(r.off, width, *f1, &next, p.name)?;
                     if r.typ == R_BPF_64_32 {
                         let tidx = text_idx.ok_or_else(|| {
                             anyhow::anyhow!("prog {}: call reloc but no .text", p.name)
@@ -1010,12 +1081,18 @@ pub fn prepare(obj: &[u8], maps: &[MapSpec], progs: &[ProgSpec]) -> anyhow::Resu
             callbacks.insert(target.clone());
         }
         for r in relocs.get(".text").map(Vec::as_slice).unwrap_or(&[]) {
-            let Some(owner) = text_owner(r.off) else {
+            let Some((f0, f1, owner)) = text_owner(r.off) else {
                 anyhow::bail!("prog {}: text reloc @{} ownerless (drift)", p.name, r.off);
             };
             let Some(obase) = base.get(&owner) else {
                 continue; // subprogram unreachable from this prog
             };
+            let width = match r.typ {
+                R_BPF_64_64 => 16,
+                R_BPF_64_32 => 8,
+                t => anyhow::bail!("prog {}: text reloc type {t} unsupported", p.name),
+            };
+            check_site_contained(r.off, width, f1, &owner, p.name)?;
             let rsym = syms
                 .get(r.sym)
                 .ok_or_else(|| anyhow::anyhow!("prog {}: bad text reloc sym", p.name))?;
@@ -1032,13 +1109,7 @@ pub fn prepare(obj: &[u8], maps: &[MapSpec], progs: &[ProgSpec]) -> anyhow::Resu
                         let t = base.get(&target).ok_or_else(|| {
                             anyhow::anyhow!("prog {}: func vs unlinked {}", p.name, target)
                         })?;
-                        let site = obase
-                            + (r.off
-                                - text_fns
-                                    .iter()
-                                    .find(|(_, _, n)| n == &owner)
-                                    .map(|(v, _, _)| *v)
-                                    .unwrap());
+                        let site = obase + (r.off - f0);
                         apply_func_ptr(&mut insns, site, *t, p.name)?;
                         rewritten.insert(site);
                         callbacks.insert(target.clone());
@@ -1048,13 +1119,7 @@ pub fn prepare(obj: &[u8], maps: &[MapSpec], progs: &[ProgSpec]) -> anyhow::Resu
                         anyhow::bail!("prog {}: text map reloc vs {}", p.name, rsym.name);
                     }
                     fixups.push(MapFixup {
-                        insn_off: obase
-                            + (r.off
-                                - text_fns
-                                    .iter()
-                                    .find(|(_, _, n)| n == &owner)
-                                    .map(|(v, _, _)| *v)
-                                    .unwrap()),
+                        insn_off: obase + (r.off - f0),
                         map: rsym.name.clone(),
                     });
                 }
@@ -1070,13 +1135,7 @@ pub fn prepare(obj: &[u8], maps: &[MapSpec], progs: &[ProgSpec]) -> anyhow::Resu
                     let t = base.get(&target).ok_or_else(|| {
                         anyhow::anyhow!("prog {}: call vs unlinked {}", p.name, target)
                     })?;
-                    let site = obase
-                        + (r.off
-                            - text_fns
-                                .iter()
-                                .find(|(_, _, n)| n == &owner)
-                                .map(|(v, _, _)| *v)
-                                .unwrap());
+                    let site = obase + (r.off - f0);
                     apply_call(&mut insns, site, *t, p.name)?;
                     rewritten.insert(site);
                 }
@@ -1510,6 +1569,37 @@ mod tests {
     }
 
     #[test]
+    fn prepare_rejects_duplicate_text_names() {
+        // Two `.text` FUNCs sharing a name would resolve by value
+        // but link by first-name-match (silent substitution), so
+        // the loader rejects the shape outright. Repurpose sym1 as
+        // a second `memsub` FUNC in `.text` (the dup check fires
+        // before per-prog validation, so the missing uprobe sym
+        // never masks it).
+        let mut obj = min_elf();
+        obj[220..224].copy_from_slice(&u32(13)); // name "memsub"
+        obj[226..228].copy_from_slice(&u16(2)); // shndx .text
+        let e = prepare(
+            &obj,
+            &[MapSpec {
+                name: "MYMAP",
+                map_type: 2,
+                key_size: 4,
+                value_size: 8,
+                max_entries: 1,
+                flags: 0,
+            }],
+            &[ProgSpec {
+                name: "uprobe_func",
+                section: "uprobe",
+            }],
+        )
+        .err()
+        .expect("must fail");
+        assert!(e.to_string().contains("duplicate"), "{e:#}");
+    }
+
+    #[test]
     fn prepare_rejects_bad_func_pointers() {
         let spec = || {
             (
@@ -1549,6 +1639,264 @@ mod tests {
         let (maps, progs) = spec();
         let e = prepare(&obj, &maps, &progs).err().expect("must fail");
         assert!(e.to_string().contains("relocated site"), "{e:#}");
+    }
+
+    #[test]
+    fn prepare_rejects_misaligned_func_site() {
+        // A func-ptr reloc at misaligned @12 whose straddling bytes
+        // decode as a valid unrelocated ld_imm64: start-only
+        // ownership plus shape checks would link it.
+        let mut obj = min_elf();
+        obj[164..172].copy_from_slice(&u64(12));
+        obj[172..180].copy_from_slice(&u64(2 << 32 | 1));
+        obj[64 + 12] = 0x18;
+        obj[64 + 13] = 0x02;
+        obj[64 + 16..64 + 28].fill(0);
+        let e = prepare(
+            &obj,
+            &[MapSpec {
+                name: "MYMAP",
+                map_type: 2,
+                key_size: 4,
+                value_size: 8,
+                max_entries: 1,
+                flags: 0,
+            }],
+            &[ProgSpec {
+                name: "uprobe_func",
+                section: "uprobe",
+            }],
+        )
+        .err()
+        .expect("must fail");
+        // The resolver fires first (roots resolve before apply).
+        assert!(
+            e.to_string().contains("func reloc site misaligned"),
+            "{e:#}"
+        );
+    }
+
+    #[test]
+    fn prepare_rejects_func_site_crossing_fn_end() {
+        // The site start is owned but its 16 bytes cross the
+        // function's end (shrunk to 16): resolving from the whole
+        // section would use sibling bytes.
+        let mut obj = min_elf();
+        obj[236..244].copy_from_slice(&u64(16));
+        obj[164..172].copy_from_slice(&u64(8));
+        obj[172..180].copy_from_slice(&u64(2 << 32 | 1));
+        obj[64 + 8] = 0x18;
+        obj[64 + 9] = 0x02;
+        obj[64 + 16..64 + 24].fill(0);
+        let e = prepare(
+            &obj,
+            &[MapSpec {
+                name: "MYMAP",
+                map_type: 2,
+                key_size: 4,
+                value_size: 8,
+                max_entries: 1,
+                flags: 0,
+            }],
+            &[ProgSpec {
+                name: "uprobe_func",
+                section: "uprobe",
+            }],
+        )
+        .err()
+        .expect("must fail");
+        assert!(e.to_string().contains("crosses"), "{e:#}");
+    }
+
+    #[test]
+    fn prepare_rejects_misaligned_call_site() {
+        // A call reloc at misaligned @18 whose straddling bytes
+        // start with a CALL opcode: shape checks alone would link it.
+        let mut obj = min_elf();
+        obj[164..172].copy_from_slice(&u64(18));
+        obj[64 + 18] = 0x85;
+        let e = prepare(
+            &obj,
+            &[MapSpec {
+                name: "MYMAP",
+                map_type: 2,
+                key_size: 4,
+                value_size: 8,
+                max_entries: 1,
+                flags: 0,
+            }],
+            &[ProgSpec {
+                name: "uprobe_func",
+                section: "uprobe",
+            }],
+        )
+        .err()
+        .expect("must fail");
+        assert!(e.to_string().contains("misalign"), "{e:#}");
+    }
+
+    #[test]
+    fn prepare_rejects_func_site_reserved_bytes() {
+        // An otherwise valid func-ptr site with the first slot's
+        // reserved offset bytes set.
+        let mut obj = min_elf();
+        obj[64 + 16..64 + 32]
+            .copy_from_slice(&[0x18, 0x02, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        obj[172..180].copy_from_slice(&u64(2 << 32 | 1));
+        let e = prepare(
+            &obj,
+            &[MapSpec {
+                name: "MYMAP",
+                map_type: 2,
+                key_size: 4,
+                value_size: 8,
+                max_entries: 1,
+                flags: 0,
+            }],
+            &[ProgSpec {
+                name: "uprobe_func",
+                section: "uprobe",
+            }],
+        )
+        .err()
+        .expect("must fail");
+        assert!(e.to_string().contains("reserved"), "{e:#}");
+    }
+
+    #[test]
+    fn prepare_rejects_misaligned_text_value() {
+        // A `.text` entry at a misaligned value would link a
+        // mid-instruction slice.
+        let mut obj = min_elf();
+        obj[252..260].copy_from_slice(&u64(4));
+        obj[260..268].copy_from_slice(&u64(8));
+        obj[180..188].copy_from_slice(&u64(4));
+        let e = prepare(
+            &obj,
+            &[MapSpec {
+                name: "MYMAP",
+                map_type: 2,
+                key_size: 4,
+                value_size: 8,
+                max_entries: 1,
+                flags: 0,
+            }],
+            &[ProgSpec {
+                name: "uprobe_func",
+                section: "uprobe",
+            }],
+        )
+        .err()
+        .expect("must fail");
+        assert!(e.to_string().contains("misalign"), "{e:#}");
+    }
+
+    #[test]
+    fn prepare_rejects_misaligned_prog_value() {
+        // A prog entry at a misaligned value would link a
+        // mid-instruction main.
+        let mut obj = min_elf();
+        obj[228..236].copy_from_slice(&u64(4));
+        obj[236..244].copy_from_slice(&u64(24));
+        obj[148..156].copy_from_slice(&u64(8));
+        let e = prepare(
+            &obj,
+            &[MapSpec {
+                name: "MYMAP",
+                map_type: 2,
+                key_size: 4,
+                value_size: 8,
+                max_entries: 1,
+                flags: 0,
+            }],
+            &[ProgSpec {
+                name: "uprobe_func",
+                section: "uprobe",
+            }],
+        )
+        .err()
+        .expect("must fail");
+        assert!(e.to_string().contains("misalign"), "{e:#}");
+    }
+
+    #[test]
+    fn prepare_rejects_map_site_crossing_fn_end() {
+        // Map sites are `ld_imm64` too (16 bytes): a map reloc at
+        // @24 in a 32-byte function crosses the end.
+        let mut obj = min_elf();
+        obj[148..156].copy_from_slice(&u64(24));
+        let e = prepare(
+            &obj,
+            &[MapSpec {
+                name: "MYMAP",
+                map_type: 2,
+                key_size: 4,
+                value_size: 8,
+                max_entries: 1,
+                flags: 0,
+            }],
+            &[ProgSpec {
+                name: "uprobe_func",
+                section: "uprobe",
+            }],
+        )
+        .err()
+        .expect("must fail");
+        assert!(e.to_string().contains("crosses"), "{e:#}");
+    }
+
+    #[test]
+    fn prepare_accepts_call_site_at_exact_fit() {
+        // An 8-byte call site ending exactly at the function end is
+        // contained (pins the call width against the 16-byte
+        // `ld_imm64` width).
+        let mut obj = min_elf();
+        obj[164..172].copy_from_slice(&u64(24));
+        obj[64 + 24] = 0x85;
+        let prep = prepare(
+            &obj,
+            &[MapSpec {
+                name: "MYMAP",
+                map_type: 2,
+                key_size: 4,
+                value_size: 8,
+                max_entries: 1,
+                flags: 0,
+            }],
+            &[ProgSpec {
+                name: "uprobe_func",
+                section: "uprobe",
+            }],
+        )
+        .unwrap();
+        assert_eq!(prep.progs[0].insns.len(), 56);
+    }
+
+    #[test]
+    fn apply_func_ptr_rejects_misaligned_site() {
+        let mut insns = vec![0u8; 24];
+        insns[4] = 0x18;
+        insns[5] = 0x02;
+        let before = insns.clone();
+        let e = apply_func_ptr(&mut insns, 4, 16, "t")
+            .err()
+            .expect("must fail");
+        assert!(e.to_string().contains("misalign"), "{e:#}");
+        assert_eq!(insns, before, "no mutation on failure");
+    }
+
+    #[test]
+    fn apply_func_ptr_rejects_reserved_bytes() {
+        let mut insns = vec![0u8; 16];
+        insns[0] = 0x18;
+        insns[1] = 0x02;
+        insns[2] = 1;
+        let before = insns.clone();
+        let e = apply_func_ptr(&mut insns, 0, 8, "t")
+            .err()
+            .expect("must fail");
+        assert!(e.to_string().contains("reserved"), "{e:#}");
+        assert_eq!(insns, before, "no mutation on failure");
     }
 
     #[test]
