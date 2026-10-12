@@ -49,9 +49,9 @@ use crate::discovery::session::{
 use crate::discovery::{coverage, elf, legacy, maps, onboard};
 use crate::evidence::{
     self, CandidateCoverage, CandidateIdentity, CaptureDocument, CaptureWindow, Completeness,
-    CounterKind, CounterSource, CounterUnits, DispositionRecord, ExpectedScope, FinalizeInput,
-    GapCounter, GapReason, ObjectId, ObjectRecord, OpensslVersion, ScopeCoverage, SiteExecution,
-    SiteKey, TargetRecord,
+    CounterKind, CounterSource, CounterUnits, DispositionRecord, ExpectedScope, FencedGeneration,
+    FinalizeInput, GapCounter, GapReason, ObjectId, ObjectRecord, OpensslVersion, ScopeCoverage,
+    SiteExecution, SiteKey, TargetRecord,
 };
 use crate::{args, kinds, pin, plan, target};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -286,6 +286,75 @@ fn doc_disposition(
         }
         (_, None) => None,
     }
+}
+
+/// Legacy provider file identities for the H8 call partition: the
+/// (device, inode) pairs of advertised objects whose id matches the
+/// run's pinned provider, and only when the pin's class is legacy.
+/// Empty in every other run (nothing partitions legacy) — notably
+/// when no provider is pinned at all. Pure identity join (H5 stat
+/// domain both sides); pathnames never consulted.
+fn legacy_files_for(
+    pinned: Option<&PinnedProvider>,
+    objects: &[ObjectRecord],
+) -> HashSet<(u64, u64)> {
+    let Some(pin) = pinned else {
+        return HashSet::new();
+    };
+    if pin.class != legacy::LEGACY_PROVIDER_CLASS {
+        return HashSet::new();
+    }
+    objects
+        .iter()
+        .filter(|o| o.id.0 == pin.object)
+        .map(|o| (o.device, o.inode))
+        .collect()
+}
+
+/// Legacy call partition (H8/A-8) over current plus fenced sites: a
+/// site counts legacy-exclusive iff ALL its candidates are
+/// legacy-class AND its backing (device, inode) is in
+/// `legacy_files`; any legacy candidate short of that (mixed
+/// classes, or all-legacy backed by a foreign file such as shared
+/// libcrypto) lands shared-ambiguous; sites with no legacy
+/// candidate land non-legacy-exclusive; sites with no candidates at
+/// all land unfenced-tails (no partition key exists). Conserves
+/// exactly: the four buckets sum to every counted call.
+fn partition_calls(
+    current: &[SiteExecution],
+    fenced: &[FencedGeneration],
+    legacy_files: &HashSet<(u64, u64)>,
+) -> legacy::CallPartition {
+    let mut out = legacy::CallPartition::default();
+    let mut one = |site: &SiteExecution| {
+        if site.candidates.is_empty() {
+            out.unfenced_tails = out.unfenced_tails.saturating_add(site.calls);
+        } else if site
+            .candidates
+            .iter()
+            .all(|c| c.provider_class == legacy::LEGACY_PROVIDER_CLASS)
+            && legacy_files.contains(&(site.site.device, site.site.inode))
+        {
+            out.legacy_exclusive = out.legacy_exclusive.saturating_add(site.calls);
+        } else if site
+            .candidates
+            .iter()
+            .any(|c| c.provider_class == legacy::LEGACY_PROVIDER_CLASS)
+        {
+            out.shared_ambiguous = out.shared_ambiguous.saturating_add(site.calls);
+        } else {
+            out.non_legacy_exclusive = out.non_legacy_exclusive.saturating_add(site.calls);
+        }
+    };
+    for site in current {
+        one(site);
+    }
+    for generation in fenced {
+        for site in &generation.sites {
+            one(site);
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------- signals
@@ -3724,6 +3793,10 @@ where
             .iter()
             .map(String::as_str)
             .collect();
+        // H8: legacy call partition over the finalized sites (what
+        // the doc claims, taint revisions included).
+        let legacy_files = legacy_files_for(self.cfg.resolved_provider.as_ref(), &document.objects);
+        let call_partition = partition_calls(&document.sites, &document.fenced, &legacy_files);
         let legacy_doc = legacy::section(&legacy::SectionInputs {
             set,
             trip: &self.in_window_trip,
@@ -3731,6 +3804,7 @@ where
             legacy_queries: self.in_window_lgcalls,
             legacy_classes: self.adapter.legacy_classes.iter().cloned().collect(),
             extra_findings: &extra,
+            call_partition,
         });
 
         self.emit_gap_reasons(document.reasons());
@@ -5418,14 +5492,15 @@ mod tests {
         assert!(paths.is_empty());
     }
 
-    /// H7-T1/T5: failure fidelity — stub ports drive the Runner's
-    /// close paths directly. RED: close errors return Err today
-    /// (the CLI synthesizes an empty no-verdict doc, exit 4); H7
-    /// salvages them into fatal-Runtime captures (exit 1) that
-    /// keep every observation collected so far.
-    mod h7_salvage {
+    /// Stub-port Runner harness (born in H7-T1/T5): stub ports
+    /// drive the Runner's close paths directly. H7 salvages close
+    /// errors into fatal-Runtime captures (exit 1) that keep every
+    /// observation collected so far; H8 reuses the harness for the
+    /// legacy call partition end-to-end.
+    mod stub_runner {
         use super::*;
         use crate::count_session::{CountDelta, FakeCountBackend};
+        use crate::evidence::FencedGeneration;
         use std::cell::Cell;
 
         const TPID: u32 = 424242;
@@ -5724,8 +5799,16 @@ mod tests {
         /// file carries the test binary's own ELF bytes (attach
         /// planning parses ELF and pins the path — zeros and fake
         /// paths never bind). The caller holds the file until the
-        /// drain completes.
+        /// drain completes. Returns the file plus its (device, ino)
+        /// identity for object/backing joins.
         fn seed_site(count: &mut CountSession<FakeCountBackend>) -> SeedFile {
+            seed_site_as(count, "default").0
+        }
+
+        fn seed_site_as(
+            count: &mut CountSession<FakeCountBackend>,
+            class: &str,
+        ) -> (SeedFile, (u64, u64)) {
             let bytes = std::fs::read(std::env::current_exe().unwrap()).unwrap();
             let off = x_offset(&bytes);
             let seed = SeedFile::fresh(&bytes);
@@ -5739,7 +5822,7 @@ mod tests {
                 },
                 candidates: vec![CandidateIdentity::new(
                     ObjectId("prov".to_string()),
-                    "default".to_string(),
+                    class.to_string(),
                     1,
                     7,
                     vec!["digest".to_string()],
@@ -5766,7 +5849,7 @@ mod tests {
             let cookie = count.cookie_for(dev, ino, off).unwrap();
             count.open_window(1000, 2000).unwrap();
             count.backend_mut().fire(TPID, cookie, 1500, 7);
-            seed
+            (seed, (dev, ino))
         }
 
         fn counter(doc: &CaptureDocument, name: &str) -> u64 {
@@ -6104,6 +6187,184 @@ mod tests {
                 cap.document.status
             );
             assert!(cap.reasons.iter().any(|r| r == "close-failure"));
+        }
+
+        const LEG_DEV: u64 = (8 << 32) | 1;
+        const LEG_INO: u64 = 101;
+        const LIB_INO: u64 = 202;
+
+        fn h8_cand(class: &str) -> CandidateIdentity {
+            CandidateIdentity::new(
+                ObjectId("prov".to_string()),
+                class.to_string(),
+                1,
+                7,
+                vec!["digest".to_string()],
+                false,
+            )
+        }
+
+        fn h8_site(dev: u64, ino: u64, off: u64, calls: u64, classes: &[&str]) -> SiteExecution {
+            SiteExecution {
+                site: SiteKey {
+                    object: ObjectId("fp".to_string()),
+                    device: dev,
+                    inode: ino,
+                    offset: off,
+                },
+                generation: 0,
+                candidates: classes.iter().map(|c| h8_cand(c)).collect(),
+                candidates_coverage: CandidateCoverage::Complete,
+                calls,
+                first_ns: 100,
+                last_ns: 200,
+            }
+        }
+
+        fn h8_legacy_files() -> HashSet<(u64, u64)> {
+            HashSet::from([(LEG_DEV, LEG_INO)])
+        }
+
+        #[test]
+        fn h8_partition_three_buckets() {
+            // T1 (RED): exclusive (all-legacy + legacy-backed),
+            // shared by mixed classes, shared by libcrypto backing
+            // despite all-legacy candidates, non-legacy (no legacy).
+            let sites = vec![
+                h8_site(LEG_DEV, LEG_INO, 0x100, 7, &["legacy"]),
+                h8_site(LEG_DEV, LEG_INO, 0x200, 3, &["legacy", "default"]),
+                h8_site(LEG_DEV, LIB_INO, 0x300, 5, &["legacy"]),
+                h8_site(LEG_DEV, LIB_INO, 0x400, 11, &["default"]),
+            ];
+            let p = partition_calls(&sites, &[], &h8_legacy_files());
+            assert_eq!(p.legacy_exclusive, 7);
+            assert_eq!(p.shared_ambiguous, 8);
+            assert_eq!(p.non_legacy_exclusive, 11);
+            assert_eq!(p.unfenced_tails, 0);
+        }
+
+        #[test]
+        fn h8_partition_conserves_fenced_pair() {
+            // T2a (RED): conservation across a current + fenced pair;
+            // zero-candidate sites land unfenced-tails (no key).
+            let current = vec![h8_site(LEG_DEV, LEG_INO, 0x100, 7, &["legacy"])];
+            let fenced = vec![FencedGeneration {
+                generation: 0,
+                sites: vec![
+                    h8_site(LEG_DEV, LEG_INO, 0x100, 4, &["legacy"]),
+                    h8_site(LEG_DEV, LIB_INO, 0x300, 6, &[]),
+                ],
+            }];
+            let p = partition_calls(&current, &fenced, &h8_legacy_files());
+            assert_eq!(p.legacy_exclusive, 11);
+            assert_eq!(p.unfenced_tails, 6);
+            assert_eq!(
+                p.legacy_exclusive + p.non_legacy_exclusive + p.shared_ambiguous + p.unfenced_tails,
+                17
+            );
+        }
+
+        #[test]
+        fn h8_partition_default_heavy_is_zero() {
+            // T4a (RED): no legacy candidates and no legacy files.
+            let sites = vec![h8_site(LEG_DEV, LIB_INO, 0x100, 9, &["default"])];
+            let p = partition_calls(&sites, &[], &HashSet::new());
+            assert_eq!(p.legacy_exclusive, 0);
+            assert_eq!(p.shared_ambiguous, 0);
+            assert_eq!(p.non_legacy_exclusive, 9);
+        }
+
+        #[test]
+        fn h8_close_computes_legacy_partition() {
+            // T2b (RED): end-to-end through close_and_finalize — a
+            // legacy-backed, legacy-class seeded site lands in
+            // executed_calls, and the four buckets conserve the
+            // doc's total calls exactly.
+            let mut cfg = stub_config();
+            cfg.resolved_provider = Some(PinnedProvider {
+                object: "fp-A".to_string(),
+                class: "legacy".to_string(),
+            });
+            let info = stub_info();
+            let clock = ClockStub::at(1_500);
+            let mut proc = ProcStub;
+            let cancelled = || false;
+            let mut count = CountSession::new(TPID, FakeCountBackend::new());
+            let (_seed, (dev, ino)) = seed_site_as(&mut count, "legacy");
+            let mut runner = stub_runner(
+                &cfg,
+                &info,
+                DiscoveryStub {
+                    finish_err: false,
+                    poll_err: false,
+                    dispatch_attached: false,
+                },
+                count,
+                &clock,
+                &mut proc,
+                &cancelled,
+            );
+            runner.adapter.objects.push(ObjectRecord {
+                id: ObjectId("fp-A".to_string()),
+                device: dev,
+                inode: ino,
+                display_locator: "seed".to_string(),
+            });
+            let cap = runner.close_and_finalize().expect("clean close");
+            let lp = &cap.legacy["legacy_provider"];
+            assert_eq!(lp["executed_calls"], 7);
+            assert_eq!(lp["shared_ambiguous_calls"], 0);
+            assert_eq!(lp["non_legacy_exclusive_calls"], 0);
+            assert_eq!(lp["unfenced_tail_calls"], 0);
+            assert_eq!(
+                lp["executed_calls"].as_u64().unwrap()
+                    + lp["shared_ambiguous_calls"].as_u64().unwrap()
+                    + lp["non_legacy_exclusive_calls"].as_u64().unwrap()
+                    + lp["unfenced_tail_calls"].as_u64().unwrap(),
+                cap.document.total_calls()
+            );
+        }
+
+        #[test]
+        fn h8_close_default_pin_partitions_nothing_legacy() {
+            // T4b (RED): a default-class pin leaves the legacy file
+            // set empty — nothing partitions legacy, everything
+            // lands non-legacy-exclusive.
+            let mut cfg = stub_config();
+            cfg.resolved_provider = Some(PinnedProvider {
+                object: "fp-A".to_string(),
+                class: "default".to_string(),
+            });
+            let info = stub_info();
+            let clock = ClockStub::at(1_500);
+            let mut proc = ProcStub;
+            let cancelled = || false;
+            let mut count = CountSession::new(TPID, FakeCountBackend::new());
+            let (_seed, (dev, ino)) = seed_site_as(&mut count, "default");
+            let mut runner = stub_runner(
+                &cfg,
+                &info,
+                DiscoveryStub {
+                    finish_err: false,
+                    poll_err: false,
+                    dispatch_attached: false,
+                },
+                count,
+                &clock,
+                &mut proc,
+                &cancelled,
+            );
+            runner.adapter.objects.push(ObjectRecord {
+                id: ObjectId("fp-A".to_string()),
+                device: dev,
+                inode: ino,
+                display_locator: "seed".to_string(),
+            });
+            let cap = runner.close_and_finalize().expect("clean close");
+            let lp = &cap.legacy["legacy_provider"];
+            assert_eq!(lp["executed_calls"], 0);
+            assert_eq!(lp["shared_ambiguous_calls"], 0);
+            assert_eq!(lp["non_legacy_exclusive_calls"], 7);
         }
     }
 }

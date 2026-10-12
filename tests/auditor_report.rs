@@ -295,7 +295,19 @@ fn check_legacy(v: &Value, ctx: &str) -> Result<(), String> {
     if let Some(l) = o.get("legacy_provider") {
         let c = format!("{ctx}.legacy_provider");
         let lo = obj(l, &c)?;
-        exact_keys(lo, &["algs", "executed_queries", "loads"], &c)?;
+        exact_keys(
+            lo,
+            &[
+                "algs",
+                "executed_queries",
+                "executed_calls",
+                "shared_ambiguous_calls",
+                "non_legacy_exclusive_calls",
+                "unfenced_tail_calls",
+                "loads",
+            ],
+            &c,
+        )?;
         str_map(
             obj(get(lo, "loads", &c)?, &format!("{c}.loads"))?,
             &format!("{c}.loads"),
@@ -304,6 +316,14 @@ fn check_legacy(v: &Value, ctx: &str) -> Result<(), String> {
             get(lo, "executed_queries", &c)?,
             &format!("{c}.executed_queries"),
         )?;
+        for k in [
+            "executed_calls",
+            "shared_ambiguous_calls",
+            "non_legacy_exclusive_calls",
+            "unfenced_tail_calls",
+        ] {
+            as_u64(get(lo, k, &c)?, &format!("{c}.{k}"))?;
+        }
         for s in as_arr(get(lo, "algs", &c)?, &format!("{c}.algs"))? {
             as_str(s, &format!("{c}.algs[]"))?;
         }

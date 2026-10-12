@@ -845,6 +845,7 @@ fn legacy_section_counts_classes_without_raw_strings() {
         legacy_queries: 0,
         legacy_classes: vec!["other".into()],
         extra_findings: &[],
+        call_partition: legacy::CallPartition::default(),
     });
     assert_eq!(doc["legacy_provider"]["loads"]["other"], 1);
     assert_eq!(doc["engine"]["engine_id_class"]["other"], 1);

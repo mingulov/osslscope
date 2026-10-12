@@ -31,6 +31,43 @@ pub const BUILTIN_ENGINE_IDS: &[&str] = &[
 /// Provider-load names with dedicated classes (same single-home rule).
 pub const LOAD_NAMES: &[&str] = &["legacy", "default", "fips"];
 
+/// Provider-class tag marking legacy-provider candidates (H8): the
+/// enrollment class pinned onto candidates advertised by the legacy
+/// provider file under observation.
+pub const LEGACY_PROVIDER_CLASS: &str = "legacy";
+
+/// Legacy call partition (H8/A-8): per-site callback executions
+/// split by candidate class and backing identity. Conserves exactly:
+/// `total()` equals the window's counted calls over current plus
+/// fenced sites.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CallPartition {
+    /// Calls on sites whose every candidate is legacy-class and
+    /// whose backing (device, inode) is the legacy provider file.
+    /// Renders as `legacy_provider.executed_calls`.
+    pub legacy_exclusive: u64,
+    /// Calls on sites with no legacy-class candidate.
+    pub non_legacy_exclusive: u64,
+    /// Calls on sites mixing legacy with non-legacy candidates, or
+    /// all-legacy candidates backed by a foreign file (shared
+    /// libcrypto serving both providers — same impl, two rows).
+    pub shared_ambiguous: u64,
+    /// Calls on sites carrying no candidates (no partition key
+    /// exists); normally zero, bucketed so conservation cannot
+    /// silently drop.
+    pub unfenced_tails: u64,
+}
+
+impl CallPartition {
+    /// Exact conservation total over all four buckets.
+    pub fn total(&self) -> u64 {
+        self.legacy_exclusive
+            .saturating_add(self.non_legacy_exclusive)
+            .saturating_add(self.shared_ambiguous)
+            .saturating_add(self.unfenced_tails)
+    }
+}
+
 /// One tripwire attachment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Probe {
@@ -934,6 +971,10 @@ pub struct SectionInputs<'a> {
     pub legacy_classes: Vec<String>,
     /// Extra findings (the blind path adds its mandated string).
     pub extra_findings: &'a [&'a str],
+    /// Per-site call partition (H8; computed by the capture caller
+    /// from current plus fenced sites — discovery-only callers pass
+    /// the zero default, honestly reporting no executions).
+    pub call_partition: CallPartition,
 }
 
 /// Typed tripwire/query rollup: every aggregate the `legacy` doc
@@ -972,6 +1013,16 @@ pub struct LegacySummary {
     pub id_unreadable: u64,
     /// Executed legacy-provider queries (LGCALLS ledger only).
     pub executed_queries: u64,
+    /// Legacy-exclusive callback executions (H8; renders as
+    /// `legacy_provider.executed_calls`, the did-legacy-code-run
+    /// metric beside the did-it-query metric above).
+    pub executed_calls: u64,
+    /// Shared-ambiguous callback executions (H8).
+    pub shared_ambiguous_calls: u64,
+    /// Non-legacy-exclusive callback executions (H8).
+    pub non_legacy_exclusive_calls: u64,
+    /// Calls on zero-candidate sites (H8; conservation bucket).
+    pub unfenced_tail_calls: u64,
     /// Findings (probe-set + extra + unreadable verdicts).
     pub findings: Vec<String>,
     /// Machine flags, one slug per finding (sorted).
@@ -1109,6 +1160,10 @@ pub fn summarize(inp: &SectionInputs) -> LegacySummary {
         load_unreadable,
         id_unreadable,
         executed_queries: inp.legacy_queries,
+        executed_calls: inp.call_partition.legacy_exclusive,
+        shared_ambiguous_calls: inp.call_partition.shared_ambiguous,
+        non_legacy_exclusive_calls: inp.call_partition.non_legacy_exclusive,
+        unfenced_tail_calls: inp.call_partition.unfenced_tails,
         findings,
         flags: flags.into_iter().collect(),
         attached: inp.set.probes.len() as u64,
@@ -1219,6 +1274,10 @@ pub fn section(inp: &SectionInputs) -> serde_json::Value {
         "meth_new": {"calls_by_entrypoint": s.meth_calls},
         "lowlevel": {"calls_by_family": s.family_calls},
         "legacy_provider": {"loads": s.loads, "executed_queries": s.executed_queries,
+                            "executed_calls": s.executed_calls,
+                            "shared_ambiguous_calls": s.shared_ambiguous_calls,
+                            "non_legacy_exclusive_calls": s.non_legacy_exclusive_calls,
+                            "unfenced_tail_calls": s.unfenced_tail_calls,
                             "algs": s.legacy_classes},
         "entries": entries,
         "capability": {"syms_present": s.attached + s.missed,
@@ -1481,6 +1540,7 @@ mod tests {
             legacy_queries: 0,
             legacy_classes: Vec::new(),
             extra_findings: &[],
+            call_partition: CallPartition::default(),
         });
         let findings = doc["findings"].as_array().unwrap();
         let texts: Vec<&str> = findings.iter().map(|v| v.as_str().unwrap()).collect();
@@ -1556,6 +1616,7 @@ mod tests {
             legacy_queries: 0,
             legacy_classes: vec!["MD4".into()],
             extra_findings: &[],
+            call_partition: CallPartition::default(),
         });
         let entries = doc["entries"].as_array().unwrap();
         let get = |name: &str| {
@@ -1583,6 +1644,7 @@ mod tests {
             legacy_queries: 0,
             legacy_classes: Vec::new(),
             extra_findings: &[],
+            call_partition: CallPartition::default(),
         });
         let bentries = bdoc["entries"].as_array().unwrap();
         assert!(!bentries.is_empty());
@@ -1625,6 +1687,7 @@ mod tests {
             legacy_queries: 0,
             legacy_classes: Vec::new(),
             extra_findings: &[],
+            call_partition: CallPartition::default(),
         });
         assert_eq!(doc["engine"]["calls_by_entrypoint"]["ENGINE_init"], 8);
     }
@@ -1746,6 +1809,7 @@ mod tests {
             legacy_queries: 7,
             legacy_classes: vec!["B".into(), "A".into(), "A".into()],
             extra_findings: &[],
+            call_partition: CallPartition::default(),
         });
         assert_eq!(doc["engine"]["calls_by_entrypoint"]["ENGINE_init"], 5);
         assert_eq!(doc["engine"]["engine_id_class"]["dynamic"], 1);
@@ -1762,5 +1826,28 @@ mod tests {
         );
         assert_eq!(doc["engine_fallback_uninstrumented"], 2);
         assert!(doc.get("findings").is_none());
+    }
+
+    #[test]
+    fn h8_section_renders_partition_beside_queries() {
+        // T3-shape (RED): queries=1/calls=0 diverges honestly, and
+        // the four partition buckets render beside executed_queries.
+        let set = blind_probe_set();
+        let inp = SectionInputs {
+            set: &set,
+            trip: &HashMap::new(),
+            trip_hits: &[],
+            legacy_queries: 1,
+            legacy_classes: Vec::new(),
+            extra_findings: &[],
+            call_partition: CallPartition::default(),
+        };
+        let v = section(&inp);
+        let lp = &v["legacy_provider"];
+        assert_eq!(lp["executed_queries"], 1);
+        assert_eq!(lp["executed_calls"], 0);
+        assert_eq!(lp["shared_ambiguous_calls"], 0);
+        assert_eq!(lp["non_legacy_exclusive_calls"], 0);
+        assert_eq!(lp["unfenced_tail_calls"], 0);
     }
 }
