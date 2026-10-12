@@ -10,7 +10,9 @@
 //! UAPI values verified against the compiler (`linux/bpf.h`) on
 //! 2026-09-17 (MAP_CREATE=0 PROG_LOAD=5 LINK_CREATE=28
 //! TOKEN_CREATE=36, PROG_KPROBE=2 RINGBUF=27 ARRAY=2,
-//! ATTACH_UPROBE_MULTI=48 FUNC_probe_read_user=112).
+//! ATTACH_UPROBE_MULTI=48 FUNC_probe_read_user=112;
+//! FUNC_ringbuf_query=134 verified 2026-10-12 against
+//! /usr/include/linux/bpf.h + aya-obj bindings).
 use std::ffi::CStr;
 use std::io;
 use std::os::fd::{FromRawFd as _, OwnedFd, RawFd};
@@ -31,6 +33,7 @@ pub const BPF_MAP_TYPE_ARRAY: u32 = 2;
 pub const BPF_MAP_TYPE_RINGBUF: u32 = 27;
 pub const BPF_TRACE_UPROBE_MULTI: u32 = 48;
 pub const BPF_FUNC_PROBE_READ_USER: u64 = 112;
+pub const BPF_FUNC_RINGBUF_QUERY: u64 = 134;
 pub const BPF_F_TOKEN_FD: u32 = 1 << 16;
 /// uprobe_multi link flag: return probes (verified in
 /// `linux/bpf.h`: `BPF_F_UPROBE_MULTI_RETURN = (1U << 0)`).

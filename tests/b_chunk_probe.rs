@@ -6,7 +6,10 @@
 //! per hit, (b) what does attach cost at N=512, (c) what fire order
 //! does the kernel deliver (recorded, never depended on), (d) does a
 //! missing member stop the others, (e) what is the per-prog marginal
-//! runtime floor.
+//! runtime floor. P7 item 1 extends the file: (f) the
+//! `bpf_ringbuf_query` floor (§5.4 — the B entry's sole new kernel
+//! requirement) is present, (g) detach-512 wall timing incl. SRCU
+//! grace (tier-3 onset term (a)) with freeze honesty.
 //!
 //! Run: setcaps on the test binary (like the D legs) +
 //! `OSSL_B_LIVE=1 cargo +1.88.0 test --test b_chunk_probe -- --test-threads=1 --ignored`.
@@ -21,7 +24,7 @@
 
 use osslscope::loader::{MapSpec, ProgSpec};
 use std::os::fd::AsRawFd;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const BCHUNK_ENTRIES: u32 = 1024;
 const SEQ_KEY: i32 = 512;
@@ -757,4 +760,69 @@ fn prepare_accepts_uretprobe_section() {
         assert_eq!(p.map_fixups.len(), 1);
         assert!(p.is_return, "uretprobe members are return probes");
     }
+}
+
+/// P7 item 1a (§5.4 floor): `bpf_ringbuf_query` must load on a B
+/// lane — the entry's occupancy check is the sole new kernel
+/// requirement. Live-only: map + load need CAP_BPF.
+#[test]
+#[ignore = "live lane only (see module docs)"]
+fn ringbuf_query_floor_present() {
+    if !gated() {
+        eprintln!("b live leg: set OSSL_B_LIVE=1; skipping");
+        return;
+    }
+    osslscope::doctor::probe_ringbuf_query().expect("bpf_ringbuf_query must load on a B lane");
+    eprintln!("b-probe: ringbuf_query floor present");
+}
+
+/// Detach cost at the 512-contract (P7 item 1: tier-3 onset term
+/// (a), wall-tails incl. SRCU grace). Honesty is symmetric with
+/// the attach leg: the chunk must fire BEFORE detach (slots bump)
+/// and freeze AFTER detach+settle (slots stop) — a detach that
+/// timed dead links would prove nothing.
+#[test]
+#[ignore = "live lane only (see module docs)"]
+fn chunk_detach_time_freezes() {
+    if !gated() {
+        eprintln!("b live leg: set OSSL_B_LIVE=1; skipping");
+        return;
+    }
+    let prep = prepare_chunk(512, inc_shape, "uprobe");
+    let loaded = osslscope::loader::load(&prep).expect("load 512 chunk");
+    let map_fd = loaded.maps["BCHUNK"].as_raw_fd();
+    let libc = own_libc();
+    let off = getpid_off(&libc);
+    let path = std::ffi::CString::new(libc).unwrap();
+    let order: Vec<usize> = (0..512).collect();
+    let links = attach_chunk(&loaded, &path, off, &order, false);
+    assert_eq!(links.len(), 512);
+    fire(2);
+    for k in [0u32, 511] {
+        assert_eq!(read_slot(map_fd, k), 2, "chunk must fire before detach");
+    }
+    let t = Instant::now();
+    drop(links);
+    let wall = t.elapsed();
+    eprintln!(
+        "b-probe: detach_512_wall={}ms (avg {}us/link)",
+        wall.as_millis(),
+        wall.as_micros() / 512,
+    );
+    assert!(
+        wall < Duration::from_secs(30),
+        "512 detaches must take < 30s, took {wall:?}"
+    );
+    // Link close detaches asynchronously (SRCU grace): settle, then
+    // prove the chunk is dead (slots frozen, not merely slow).
+    std::thread::sleep(Duration::from_millis(500));
+    fire(3);
+    for k in [0u32, 511] {
+        assert_eq!(
+            read_slot(map_fd, k),
+            2,
+            "slot {k} must freeze after detach+settle"
+        );
+    }
+    eprintln!("b-probe: post-detach fire frozen at 2 (500ms settle)");
 }
