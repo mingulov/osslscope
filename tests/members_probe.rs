@@ -377,8 +377,24 @@ impl Fixture {
     /// `tail` is nonempty, its entries are planted PAST the
     /// terminator (L3-tail: nonzero garbage the v1 walker reaches).
     pub fn build(slots: &[SlotSpec], tail: &[SlotSpec]) -> Fixture {
+        Self::build_padded(slots, tail, slots.len() + 1 + tail.len())
+    }
+
+    /// Build with the array region sized to `array_slots` cells
+    /// (live prefix + terminator + zero tail). Zero-tail members
+    /// read names==0 and stay silent, so op-level TRUNC reflects
+    /// ONLY the live prefix's walk — required for v1 cleanliness
+    /// asserts (unpadded past-T memory yields READ/NOIMP/NAME soup
+    /// from every member past the terminator; observed TRUNC=52 on
+    /// a "clean" E=7 walk). The past-T reach itself is pinned by
+    /// L3-tail, not hidden here.
+    pub fn build_padded(slots: &[SlotSpec], tail: &[SlotSpec], array_slots: usize) -> Fixture {
+        assert!(
+            array_slots >= slots.len() + 1 + tail.len(),
+            "array must fit live + terminator + tail"
+        );
         let all: Vec<&SlotSpec> = slots.iter().chain(tail.iter()).collect();
-        let n_array = slots.len() + 1 + tail.len();
+        let n_array = array_slots;
         let names_len: usize = all.iter().map(|s| s.name.len() + 1).sum();
         let disp_len: usize = all
             .iter()
@@ -664,10 +680,11 @@ fn e7_slots() -> Vec<SlotSpec> {
 }
 
 /// L2: exact E=7 scan (warm + cold) + null-query silence. Every
-/// ALG/ROW byte-asserted on the live prefix; slots past the
-/// terminator recorded-only (v1 has no T-gate). The cold sub-run
-/// gates real eviction (SKIPs warm-only lanes, labeled — never
-/// false-claims cold).
+/// ALG/ROW byte-asserted on the live prefix; the array is
+/// zero-padded to the full chunk so TRUNC==0 and beyond-T silence
+/// are real asserts (v1 has no T-gate — unpadded past-T memory
+/// yields flag soup). The cold sub-run gates real eviction (SKIPs
+/// warm-only lanes, labeled — never false-claims cold).
 #[test]
 #[ignore]
 fn l2_exact_e7() {
@@ -685,7 +702,9 @@ fn l2_exact_e7() {
 fn run_e7(obj: &std::path::Path, exe: &std::ffi::CString, off: u64, cold: bool) {
     use osslscope_ebpf_common as wire;
     use std::time::Instant;
-    let fx = Fixture::build(&e7_slots(), &[]);
+    // Zero-padded to the full chunk: past-T members stay silent,
+    // so TRUNC==0 reflects the live prefix's clean walk.
+    let fx = Fixture::build_padded(&e7_slots(), &[], 512);
     let temp = if cold {
         let t = fx.pageout_and_temp();
         if t != "cold" {
@@ -757,10 +776,12 @@ fn run_e7(obj: &std::path::Path, exe: &std::ffi::CString, off: u64, cold: bool) 
             assert_eq!(n, QUERIES, "e7-{temp}: slot {j} leg {k} exact");
         }
     }
-    let beyond_alg = algs.iter().filter(|a| a.idx >= 7).count();
-    let beyond_row = rows.iter().filter(|r| r.idx >= 7).count();
-    eprintln!(
-        "e7-{temp}: beyond-T emissions (recorded, v1 gap): {beyond_alg} ALG + {beyond_row} ROW"
+    // Zero tail ⇒ beyond-T silence is a REAL assert here (a
+    // member emitting for a zero slot is a bug); the nonzero-tail
+    // reach is pinned separately by L3-tail.
+    assert!(
+        algs.iter().all(|a| a.idx < 7) && rows.iter().all(|r| r.idx < 7),
+        "e7-{temp}: zero tail stays silent"
     );
 }
 
@@ -932,7 +953,8 @@ fn l4_dispatch_bounds() {
     // 128 + term: clean.
     {
         let disp: Vec<(u32, u64)> = (0..128u32).map(|k| (5000 + k, 0x9000 + k as u64)).collect();
-        let fx = Fixture::build(&[SlotSpec::live("M4A", 100, disp)], &[]);
+        // Zero-padded: DISPATCH-clear reflects member 0's clean walk only.
+        let fx = Fixture::build_padded(&[SlotSpec::live("M4A", 100, disp)], &[], 512);
         fx.pretouch();
         let loaded = load_members(&obj);
         populate_alg_class(&loaded, &fx.classes);
@@ -956,7 +978,9 @@ fn l4_dispatch_bounds() {
         let disp: Vec<(u32, u64)> = (0..129u32).map(|k| (5000 + k, 0x9000 + k as u64)).collect();
         let mut slot = SlotSpec::live("M4B", 100, disp);
         slot.no_term = true;
-        let fx = Fixture::build(&[slot], &[]);
+        // Zero-padded for a deterministic ring (garbage ALGs would
+        // otherwise join the drain; the overflow bit is OR-folded).
+        let fx = Fixture::build_padded(&[slot], &[], 512);
         fx.pretouch();
         let loaded = load_members(&obj);
         populate_alg_class(&loaded, &fx.classes);
