@@ -1376,9 +1376,12 @@ impl SessionCore {
         maps: &[maps::Mapping],
         delta: &mut DiscoveryDelta,
     ) {
+        // H5: one stat-facet pass per poll feeds every plane
+        // (single-domain aliveness — never maps text).
+        let stat_devs: Vec<Option<String>> = maps.iter().map(|m| stat_dev_of(&m.path)).collect();
         if self.trip_live
-            && let Some((_, dev, ino)) = &self.trip_bound
-            && !maps.iter().any(|m| &m.dev == dev && m.ino == *ino)
+            && let Some((path, dev, ino)) = &self.trip_bound
+            && !bindings_alive(maps, &stat_devs, path, dev, *ino)
         {
             env.detach_trips();
             // A staged plan resolved against the old maps: stale
@@ -1387,8 +1390,8 @@ impl SessionCore {
             self.trip_live = false;
         }
         if self.dispatch_live
-            && let Some((_, dev, ino)) = &self.dispatch_bound
-            && !maps.iter().any(|m| &m.dev == dev && m.ino == *ino)
+            && let Some((path, dev, ino)) = &self.dispatch_bound
+            && !bindings_alive(maps, &stat_devs, path, dev, *ino)
         {
             env.detach_dispatch_anchors();
             self.dispatch_live = false;
@@ -1400,7 +1403,7 @@ impl SessionCore {
         let dead: Vec<u64> = self
             .attached_targets
             .iter()
-            .filter(|(_, (_, _, dev, ino))| !maps.iter().any(|m| &m.dev == dev && m.ino == *ino))
+            .filter(|(_, (_, path, dev, ino))| !bindings_alive(maps, &stat_devs, path, dev, *ino))
             .map(|(cookie, _)| *cookie)
             .collect();
         for cookie in dead {
@@ -2454,8 +2457,57 @@ impl SessionCore {
 fn array_owner(maps: &[maps::Mapping], arr: u64) -> (String, String, u64) {
     maps.iter()
         .find(|m| m.start <= arr && arr < m.end && m.ino != 0)
-        .map(|m| (m.path.clone(), m.dev.clone(), m.ino))
+        .map(|m| (m.path.clone(), backing_dev(m), m.ino))
         .unwrap_or_default()
+}
+
+/// Backing device for one mapping (H5): STAT-domain (fstat
+/// dev_t, rendered `MM:mm`), so x-subvol/x-mount twins (same
+/// maps-dev + ino — measured btrfs/overlay/tmpfs) separate and
+/// btrfs/overlay stat-vs-maps divergence never false-fails a
+/// downstream stat-stat bind. Unstatable paths (`(deleted)`,
+/// foreign mount namespaces) fall back to the maps dev-string:
+/// downstream stat compares then safely mismatch (loud miss),
+/// while turnover keeps unlinked-but-mapped files via
+/// maps-identity (dual-facet bindings). Spike:
+/// evidence/2026-10-11-h5-spike/.
+pub(crate) fn backing_dev(m: &maps::Mapping) -> String {
+    stat_dev_of(&m.path).unwrap_or_else(|| m.dev.clone())
+}
+
+/// Resolve-time stat device for one mapped path (H5): `None`
+/// when unstatable (`(deleted)`, foreign mount namespaces).
+/// The `Some` facet compares stat-vs-stat; the `None` facet
+/// keeps deleted-but-mapped files via path + ino (dual-facet
+/// bindings — the maps dev-string is never compared).
+pub(crate) fn stat_dev_of(path: &str) -> Option<String> {
+    std::fs::metadata(path).ok().map(|meta| {
+        use std::os::unix::fs::MetadataExt as _;
+        crate::plan::render_stat_dev(meta.dev())
+    })
+}
+
+/// Anchor aliveness (H5 single-domain): a stored (path,
+/// stat-dev, ino) binding is alive iff some mapping still backs
+/// the same file — stat-vs-stat when the mapping is statable,
+/// else same-path + same-ino (the file was unlinked but stays
+/// mapped). The maps dev-string is NEVER compared (btrfs /
+/// overlay diverge it from stat — reconciling against it
+/// detached live anchors every poll on such filesystems).
+fn bindings_alive(
+    maps: &[maps::Mapping],
+    stat_devs: &[Option<String>],
+    path: &str,
+    dev: &str,
+    ino: u64,
+) -> bool {
+    maps.iter().zip(stat_devs.iter()).any(|(m, stat)| {
+        m.ino == ino
+            && match stat {
+                Some(cur) => cur == dev,
+                None => m.path == path,
+            }
+    })
 }
 
 /// Relocate one implementation address to its claimed backing
@@ -2463,6 +2515,7 @@ fn array_owner(maps: &[maps::Mapping], arr: u64) -> (String, String, u64) {
 /// then any file mapping (shared-code rows), else unbacked. This
 /// mirrors the document render's mapping rule minus the
 /// executable/ELF-segment verification, which stays render-side.
+/// Backing device is STAT-domain ([`backing_dev`]).
 fn attribute_impl(
     maps: &[maps::Mapping],
     provider: &Path,
@@ -2471,7 +2524,7 @@ fn attribute_impl(
 ) -> (Option<BackingRef>, String) {
     if let Some((m, _)) = maps::provider_mapping(maps, provider, canon, addr) {
         let backing = BackingRef {
-            dev: m.dev.clone(),
+            dev: backing_dev(m),
             ino: m.ino,
             offset: addr - m.start + m.offset,
         };
@@ -2482,7 +2535,7 @@ fn attribute_impl(
         .find(|m| m.start <= addr && addr < m.end && m.ino != 0)
     {
         let backing = BackingRef {
-            dev: m.dev.clone(),
+            dev: backing_dev(m),
             ino: m.ino,
             offset: addr - m.start + m.offset,
         };
@@ -3152,7 +3205,7 @@ impl SessionEnv for LiveEnv {
         // No post-batch sampling, no rollback: each trip module
         // binds through its own pin inside `attach_trips`.
         if let Some((lc_path, (enc, ino))) = set.libcrypto.as_ref().and_then(|(path, dev, ino)| {
-            crate::plan::device_id_of_maps_dev(dev).map(|enc| (path, (enc, *ino)))
+            crate::plan::device_id_of_dev_str(dev).map(|enc| (path, (enc, *ino)))
         }) {
             let pin = crate::plan::resolve_pinned_retry(|| crate::plan::resolve_pinned(lc_path))
                 .map_err(|e| {
@@ -3216,10 +3269,17 @@ impl SessionEnv for LiveEnv {
             return Ok(None);
         };
         let lc_path = entry.path.clone();
-        // F-D/A11: the plan binds the MAPPED identity — the bytes
-        // must be the mapped file's (same open), else a swap between
-        // the maps read and this read resolves offsets for the wrong
-        // bytes. Identity mismatch → InvalidData (the core retries
+        // H5 (was F-D/A11 mixed-domain): the plan binds the
+        // mapped file in the STAT domain — the bytes must be the
+        // mapped file's, else a swap between the maps read and
+        // this read resolves offsets for the wrong bytes.
+        // Checks, all stat-domain except the domain-agnostic ino:
+        // (1) the bound read is still current (fresh fstat equals
+        // the read's identity — swap-during-plan fails);
+        // (2) the bound ino is the mapped ino (swap-since-maps
+        // fails). The maps dev-string is NEVER compared (btrfs /
+        // overlay diverge it from stat — spike F1/F7).
+        // Identity mismatch → InvalidData (the core retries
         // next poll as a transient, without latching blind);
         // unmapped-race (gone between find and read) → Ok(None);
         // other IO errors propagate (pre-existing posture).
@@ -3228,8 +3288,12 @@ impl SessionEnv for LiveEnv {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e.into()),
         };
-        let file_ident = (crate::plan::render_device(bound.dev), bound.ino);
-        if file_ident != (entry.dev.clone(), entry.ino) {
+        let fresh = std::fs::metadata(&lc_path).ok().map(|m| {
+            use std::os::unix::fs::MetadataExt as _;
+            (crate::plan::render_stat_dev(m.dev()), m.ino())
+        });
+        let bound_ident = (crate::plan::render_device(bound.dev), bound.ino);
+        if fresh.as_ref() != Some(&bound_ident) || bound.ino != entry.ino {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("libcrypto {lc_path} changed during plan"),
@@ -3252,11 +3316,14 @@ impl SessionEnv for LiveEnv {
             .iter()
             .map(|(p, b)| legacy::Module { path: p, bytes: b })
             .collect();
+        // H5: the plan identity is the BOUND read's stat
+        // identity (not the maps entry's dev-string) — install
+        // compares pin-vs-plan stat-vs-stat.
         let mut set = legacy::probes_for(
             &lc_path,
             &lc_bytes,
             &modules,
-            (entry.dev.clone(), entry.ino),
+            (crate::plan::render_device(bound.dev), bound.ino),
         )?;
         for path in &unreadable {
             set.findings
@@ -3358,8 +3425,15 @@ impl SessionEnv for LiveEnv {
                 )
             })?;
         let bound = crate::plan::read_file_bound(&pin.link_path())?;
-        let file_ident = (crate::plan::render_device(bound.dev), bound.ino);
-        if file_ident != (entry.dev.clone(), entry.ino) {
+        // H5 (was F-D/A11 mixed-domain): the bound read binds the
+        // CURRENT file at the provider path; the maps entry backs
+        // the file the TARGET still maps. Ino (domain-agnostic)
+        // detects a swap; the maps dev-string is NEVER compared
+        // (btrfs/overlay diverge it from stat — a same-ino
+        // x-device swap at one path is the accepted residual,
+        // same as schema.rs). Mismatch is a transient race
+        // (InvalidData, retry next poll).
+        if bound.ino != entry.ino {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("provider {prov_path} changed during reinstall"),
@@ -3409,7 +3483,10 @@ impl SessionEnv for LiveEnv {
         )?;
         eprintln!("INSPECT stage=reinstall off={off:#x}");
         Ok(DispatchReinstall {
-            binding: (prov_path, entry.dev.clone(), entry.ino),
+            // H5: the binding is the PIN-VERIFIED read's stat
+            // identity (reconcile compares stat-vs-stat) — never
+            // the maps entry's dev-string.
+            binding: (prov_path, crate::plan::render_device(bound.dev), bound.ino),
             resolution,
         })
     }
@@ -4120,6 +4197,87 @@ mod tests {
         assert_eq!(env.plan_calls, plan_calls + 1);
         assert_eq!(env.trip_installs, 2);
         assert!(core.snapshot().legacy.planned);
+    }
+
+    #[test]
+    fn h5_t1_backing_identity_is_stat_domain() {
+        // H5 (spike vectors, both directions in one test):
+        // (a) btrfs-shape divergence (maps dev-string says
+        // "00:22", the file's stat says otherwise, same ino):
+        // the backing CARRIES stat, so downstream stat-stat
+        // binds HOLD (no D1 failure);
+        // (b) planted x-fs same-ino twins (forged identical
+        // maps-dev + ino, different files on different
+        // filesystems): backings DIFFER by stat-dev, so
+        // downstream binds REFUSE cross-lending (no B-4 lend).
+        // RED pre-H5 (backing echoes the maps dev-string).
+        use std::os::unix::fs::MetadataExt as _;
+        struct Rm(Vec<std::path::PathBuf>);
+        impl Drop for Rm {
+            fn drop(&mut self) {
+                for p in &self.0 {
+                    let _ = std::fs::remove_file(p);
+                }
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("osslscope-h5t1-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f1 = dir.join("twin1.so");
+        // Second twin MUST live on another filesystem
+        // (separation needs differing stat-devs).
+        let f2 =
+            std::path::PathBuf::from(format!("/dev/shm/osslscope-h5t1-{}", std::process::id()));
+        std::fs::write(&f1, b"one").unwrap();
+        std::fs::write(&f2, b"two").unwrap();
+        let _rm = Rm(vec![f1.clone(), f2.clone()]);
+        let stat_dev = |p: &std::path::Path| {
+            let m = std::fs::metadata(p).unwrap();
+            format!("{:02x}:{:02x}", libc::major(m.dev()), libc::minor(m.dev()))
+        };
+        // Canned twin vectors: identical maps identity, distinct
+        // files (the maps dev-string ALSO diverges from both
+        // files' stat-devs — the btrfs shape).
+        let m1 = maps::Mapping {
+            start: 0x1000,
+            end: 0x2000,
+            x: true,
+            offset: 0,
+            dev: "00:22".to_string(),
+            ino: 999,
+            path: f1.to_str().unwrap().to_string(),
+        };
+        let m2 = maps::Mapping {
+            start: 0x3000,
+            end: 0x4000,
+            x: true,
+            offset: 0,
+            dev: "00:22".to_string(),
+            ino: 999,
+            path: f2.to_str().unwrap().to_string(),
+        };
+        assert_ne!(
+            stat_dev(&f1),
+            stat_dev(&f2),
+            "twins need distinct stat-devs"
+        );
+        let live = vec![m1, m2];
+        let nop = std::path::PathBuf::from("/nonexistent-osslscope-provider");
+        let (b1, loc1) = attribute_impl(&live, &nop, "", 0x1500);
+        let (b2, loc2) = attribute_impl(&live, &nop, "", 0x3500);
+        let (b1, b2) = (b1.expect("twin1 backs"), b2.expect("twin2 backs"));
+        // (a) btrfs shape: stat carried, maps text NOT echoed.
+        assert_eq!(b1.dev, stat_dev(&f1), "backing must carry fstat dev");
+        assert_ne!(
+            b1.dev, "00:22",
+            "maps dev-string must not leak into identity"
+        );
+        assert_eq!((b1.ino, b1.offset), (999, 0x500));
+        assert_eq!(loc1, f1.to_str().unwrap());
+        // (b) twins separate by stat-dev (same maps identity!).
+        assert_eq!(b2.dev, stat_dev(&f2));
+        assert_ne!(b1.dev, b2.dev, "x-fs twins must not share identity");
+        assert_eq!(loc2, f2.to_str().unwrap());
+        let _ = std::fs::remove_dir(&dir);
     }
 
     #[test]

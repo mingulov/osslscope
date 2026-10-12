@@ -970,11 +970,16 @@ fn object_id_for_mapping(
     live: &[maps::Mapping],
     files: &HashMap<String, plan::FileBytes>,
 ) -> ObjectId {
-    let bid = live
-        .iter()
-        .find(|m| m.dev == dev && m.ino == ino)
-        .and_then(|m| plan::bound_bytes(files, &m.path, ino))
-        .and_then(elf::read_build_id);
+    // H5: `dev` is stat-domain (BackingRef via H5-T1) — maps
+    // text never joins identity. Ino-prefilter, then bind each
+    // same-ino mapping's bytes against the full identity; the
+    // first bound mapping wins (live order, deterministic).
+    let bid = plan::device_id_of_dev_str(dev).and_then(|want| {
+        live.iter()
+            .filter(|m| m.ino != 0 && m.ino == ino)
+            .find_map(|m| plan::bound_bytes(files, &m.path, want, ino))
+            .and_then(elf::read_build_id)
+    });
     match bid {
         Some(id) => ObjectId(format!("build:{id}")),
         None => ObjectId(format!("unverified:{dev}:{ino}")),
@@ -1000,22 +1005,44 @@ fn advertising_object_id(
     let Some(m) = owner else {
         return ObjectId("unverified-advertising:anonymous".to_string());
     };
-    // Turnover check: the array's current owner must still be the
-    // discovery-time owner (same-domain text compare — overlay
-    // consistent on both sides). The class was decoded from the
-    // old file's array, so a changed owner degrades rather than
-    // borrowing the new file's fingerprint.
-    if m.dev != candidate.advertising_dev || m.ino != candidate.advertising_ino {
+    // Turnover check (H5): the array's current owner must
+    // still be the discovery-time owner — stat-vs-stat
+    // (backing_dev), never maps text (x-subvol/x-mount twins
+    // share maps-dev + ino). Unstatable owners fall back to
+    // maps-identity on both sides (dual-facet:
+    // unlinked-but-mapped files keep working). Interim: a file
+    // statable at discovery but unstatable now degrades to
+    // anonymous (Slice B adds the maps-facet fallback
+    // compare). The class was decoded from the old file's
+    // array, so a changed owner degrades rather than borrowing
+    // the new file's fingerprint.
+    let Some(want) = plan::device_id_of_dev_str(&candidate.advertising_dev) else {
+        return ObjectId("unverified-advertising:anonymous".to_string());
+    };
+    if crate::discovery::session::backing_dev(m) != candidate.advertising_dev
+        || m.ino != candidate.advertising_ino
+    {
         return ObjectId("unverified-advertising:anonymous".to_string());
     }
-    let bid = plan::bound_bytes(files, &m.path, m.ino).and_then(elf::read_build_id);
+    let bid = plan::bound_bytes(files, &m.path, want, candidate.advertising_ino)
+        .and_then(elf::read_build_id);
     match bid {
         Some(id) => ObjectId(format!("build:{id}")),
-        // Mapping-bound opaque identity (D3): the id binds the
-        // mapping's (dev, ino) — a same-path replacement changes
-        // identity instead of conflating two objects. The pathname
-        // itself never becomes identity.
-        None => ObjectId(format!("unverified-advertising:{}:{}", m.dev, m.ino)),
+        // Mapping-bound opaque identity (D3/H5/B-5): binds the
+        // ADVERTISED (stat-domain) triple — x-fs twins
+        // separate even when the fingerprint is unavailable. A
+        // same-path replacement changes identity instead of
+        // conflating two objects. The pathname itself never
+        // becomes identity. The located form is UNIFIED with
+        // object ids (`unverified:` — same file, same record,
+        // so candidates[].provider joins objects[]); only the
+        // ownerless form keeps the role infix
+        // (`unverified-advertising:anonymous` — D2 never emits
+        // ownerless records, so no unification applies).
+        None => ObjectId(format!(
+            "unverified:{}:{}",
+            candidate.advertising_dev, candidate.advertising_ino
+        )),
     }
 }
 
@@ -1103,7 +1130,13 @@ pub struct AdapterState {
     op_trunc: HashMap<u32, u64>,
     legacy_classes: BTreeSet<String>,
     objects: Vec<ObjectRecord>,
-    seen_objects: HashSet<(String, u64)>,
+    /// Object registry (H5/B-5): every id a ref can name is
+    /// registered at construction (D2 object records AND
+    /// advertising records) — keyed by normalized identity
+    /// (dev-string, ino, id), so a file observed under two ids
+    /// (`build:` + `unverified:`) registers both and every ref
+    /// resolves.
+    seen_objects: HashSet<(String, u64, String)>,
     loss_sums: HashMap<u32, u64>,
     /// Ops carrying op-localized loss (orphan ROWs): their
     /// candidate sets and denominators are tainted (F-B/A7).
@@ -1368,6 +1401,9 @@ pub fn adapt_delta(
     let mut late_attach = 0u64;
     let mut fresh_mapped = 0u64;
     let mut identity_refreshed = 0u64;
+    // B-5: poll-new object records (advertising registrations
+    // below join D2 records — one registry, one vec).
+    let mut objects = Vec::new();
     // triple → (dev string, new candidates, (op, epoch) arrivals,
     // any bad read).
     // (device string, fresh identities, every arrival's epoch,
@@ -1399,7 +1435,7 @@ pub fn adapt_delta(
             unbacked += 1;
             continue;
         };
-        let Some(device) = plan::device_id_of_maps_dev(&backing.dev) else {
+        let Some(device) = plan::device_id_of_dev_str(&backing.dev) else {
             // Unparsable device: unplannable, never device zero.
             unparsed_dev += 1;
             continue;
@@ -1421,6 +1457,26 @@ pub fn adapt_delta(
             candidate.class.clone()
         };
         let advertising = advertising_object_id(candidate, ctx.live, ctx.files);
+        // B-5 registry: the advertising id is a nameable ref
+        // (candidates[].provider), so it registers HERE at
+        // construction — an advertising-only provider (no D2
+        // object) still resolves. The record carries the
+        // owner's triple (device 0 / locator "" when ownerless
+        // — `...:anonymous` still resolves).
+        if state.seen_objects.insert((
+            candidate.advertising_dev.clone(),
+            candidate.advertising_ino,
+            advertising.0.clone(),
+        )) {
+            let record = ObjectRecord {
+                id: advertising.clone(),
+                device: plan::device_id_of_dev_str(&candidate.advertising_dev).unwrap_or(0),
+                inode: candidate.advertising_ino,
+                display_locator: candidate.advertising.clone(),
+            };
+            state.objects.push(record.clone());
+            objects.push(record);
+        }
         let provider_class = match &ctx.pinned_provider {
             Some(pinned) if pinned.object == advertising.0 => pinned.class.clone(),
             _ => "unknown".to_string(),
@@ -1653,18 +1709,24 @@ pub fn adapt_delta(
     }
 
     // D2 objects: fingerprinted records; unparsable devices skip loud.
-    let mut objects = Vec::new();
     let mut unparsed_object_dev = 0u64;
     for object in &delta.objects {
-        let Some(device) = plan::device_id_of_maps_dev(&object.dev) else {
+        let Some(device) = plan::device_id_of_dev_str(&object.dev) else {
             unparsed_object_dev += 1;
             continue;
         };
-        if !state.seen_objects.insert((object.dev.clone(), object.ino)) {
+        // B-5: the id computes BEFORE the registry check — one
+        // file under two ids (`build:` + `unverified:`)
+        // registers both records, never just the first.
+        let id = object_id_for_mapping(&object.dev, object.ino, ctx.live, ctx.files);
+        if !state
+            .seen_objects
+            .insert((object.dev.clone(), object.ino, id.0.clone()))
+        {
             continue;
         }
         let record = ObjectRecord {
-            id: object_id_for_mapping(&object.dev, object.ino, ctx.live, ctx.files),
+            id,
             device,
             inode: object.ino,
             display_locator: object.display_locator.clone(),
@@ -1848,6 +1910,9 @@ struct Runner<'x, D, B: CountBackend, T, L, C: ClockPort, P: ProcPort> {
     provider_changed_fences: u64,
     planned_paths: HashSet<String>,
     site_cookies: HashMap<SiteKey, u32>,
+    /// Backing identities observed in any round (H5:
+    /// stat-or-fallback strings — the `fresh` set derived from
+    /// this joins group device strings, which are stat-domain).
     seen_backings: HashSet<(String, u64)>,
     snapshot: Snapshot,
     last_live: Vec<maps::Mapping>,
@@ -1920,6 +1985,16 @@ const MAX_CACHED_BYTES: usize = 128 * 1024 * 1024;
 /// — only I/O. Returns the sorted path set plus the
 /// over-cap dropped count (0 on the common path).
 fn relevant_paths(delta: &DiscoveryDelta, live: &[maps::Mapping]) -> (BTreeSet<String>, u64) {
+    // H5 single-domain relevance (dual-facet, mirroring
+    // `bindings_alive`): backings/objects carry stat identity
+    // and array owners resolve to stat-or-fallback here
+    // (their mapping is in hand). A mapping is relevant when
+    // its ino matches an ident AND the device binds in one
+    // domain — stat-vs-stat when statable, else maps-vs-maps
+    // (the read then fails into a cache miss, as before).
+    // Maps text never joins against a stat ident: on
+    // btrfs/overlay the old join excluded every backing path
+    // from the round's reads (all sites missed).
     let mut idents: HashSet<(String, u64)> = HashSet::new();
     for c in &delta.candidates {
         if let Some(b) = &c.backing {
@@ -1930,17 +2005,38 @@ fn relevant_paths(delta: &DiscoveryDelta, live: &[maps::Mapping]) -> (BTreeSet<S
                 .iter()
                 .filter(|m| m.start <= c.arr && c.arr < m.end && m.ino != 0)
             {
-                idents.insert((m.dev.clone(), m.ino));
+                idents.insert((crate::discovery::session::backing_dev(m), m.ino));
             }
         }
     }
     for o in &delta.objects {
         idents.insert((o.dev.clone(), o.ino));
     }
-    let mut paths: BTreeSet<String> = live
+    // One stat-facet pass over the live mappings.
+    let facets: Vec<(u64, &str, Option<String>, &str)> = live
         .iter()
-        .filter(|m| m.ino != 0 && idents.contains(&(m.dev.clone(), m.ino)))
-        .map(|m| m.path.clone())
+        .map(|m| {
+            (
+                m.ino,
+                m.dev.as_str(),
+                crate::discovery::session::stat_dev_of(&m.path),
+                m.path.as_str(),
+            )
+        })
+        .collect();
+    let mut paths: BTreeSet<String> = facets
+        .iter()
+        .filter(|(ino, maps_dev, stat, _)| {
+            *ino != 0
+                && idents.iter().any(|(d, i)| {
+                    *i == *ino
+                        && match stat {
+                            Some(cur) => cur == d,
+                            None => maps_dev == d,
+                        }
+                })
+        })
+        .map(|(_, _, _, path)| path.to_string())
         .collect();
     let dropped = paths.len().saturating_sub(MAX_RELEVANT_FILES_PER_POLL) as u64;
     if dropped > 0 {
@@ -2212,8 +2308,12 @@ where
         }
         let mut fresh = HashSet::new();
         for m in &live {
-            if self.seen_backings.insert((m.dev.clone(), m.ino)) {
-                fresh.insert((m.dev.clone(), m.ino));
+            // H5: stat-or-fallback (joins stat-domain group
+            // strings; a same-ino x-device swap reads fresh,
+            // correctly — it IS a new file).
+            let ident = (crate::discovery::session::backing_dev(m), m.ino);
+            if self.seen_backings.insert(ident.clone()) {
+                fresh.insert(ident);
             }
         }
         let exe = self.proc.read_exe(pid);
@@ -2587,7 +2687,8 @@ where
             }
         };
         for m in &live {
-            self.seen_backings.insert((m.dev.clone(), m.ino));
+            self.seen_backings
+                .insert((crate::discovery::session::backing_dev(m), m.ino));
         }
         let exe = self.proc.read_exe(pid);
         self.snapshot = snapshot(exe, &live, &[], &HashMap::new());
@@ -4372,7 +4473,7 @@ mod tests {
         assert!(site.candidates.iter().any(|c| c.weak_alias));
         assert_eq!(site.candidates_coverage, CandidateCoverage::Unknown);
         // Physical identity is the backing triple (never the path).
-        let device = plan::device_id_of_maps_dev("08:01").unwrap();
+        let device = plan::device_id_of_dev_str("08:01").unwrap();
         assert_eq!(site.site.device, device);
         assert_eq!(site.site.inode, 7);
         assert_eq!(site.site.offset, 0x100);
@@ -5001,6 +5102,47 @@ mod tests {
             paths.into_iter().collect::<Vec<_>>(),
             vec!["/p/data.so", "/p/obj.so", "/p/prov.so"]
         );
+    }
+
+    #[test]
+    fn h5_t4a_advertising_ids_register_at_construction() {
+        // H5 (B-5): every id a ref can name is registered at
+        // construction — an advertising-only provider (no D2
+        // object in the delta) still lands an ObjectRecord, so
+        // candidates[].provider always resolves. The located
+        // opaque form is unified (`unverified:`, like object
+        // ids — same file, same record). RED pre-B-5
+        // (advertising records never registered).
+        let live = vec![
+            unit_mapping("/p/prov.so", "08:01", 11, 0x1000, true),
+            unit_mapping("/p/data.so", "08:01", 12, 0x2000, false),
+        ];
+        let files = HashMap::new();
+        let fresh = HashSet::new();
+        let mut state = AdapterState::default();
+        let delta = DiscoveryDelta {
+            candidates: vec![unit_candidate(
+                Some(BackingRef {
+                    dev: "08:01".to_string(),
+                    ino: 11,
+                    offset: 8,
+                }),
+                0x2400,
+            )],
+            tables: vec![terminated(1, 0)],
+            ..DiscoveryDelta::default()
+        };
+        let out = adapt_delta(&mut state, &delta, &ctx_for(&live, &files, &fresh));
+        assert_eq!(out.delta.discovered.len(), 1);
+        let provider = &out.delta.discovered[0].candidates[0].provider.0;
+        assert_eq!(provider, "unverified:08:01:12");
+        // No D2 objects in this delta — the objects set carries
+        // ONLY the advertising record, and the ref resolves.
+        assert_eq!(out.objects.len(), 1);
+        assert_eq!(out.objects[0].id.0, *provider);
+        assert_eq!(out.objects[0].inode, 12);
+        assert_eq!(out.objects[0].display_locator, "/p/data.so");
+        assert_eq!(state.objects.len(), 1);
     }
 
     #[test]

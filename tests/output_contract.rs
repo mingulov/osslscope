@@ -520,6 +520,46 @@ fn rendered_fixtures_validate_against_v2_schema() {
 }
 
 #[test]
+fn h5_t4b_anonymous_advertising_provider_assembles_and_validates() {
+    // H5 (B-5): an advertising-only provider assembles and
+    // validates — the anonymous record registers like any
+    // object, and the provider ref resolves. Without the
+    // record the doc is a dangling ref — rejected, never
+    // sealed.
+    const ANON: &str = "unverified-advertising:anonymous";
+    let site = || {
+        site_at(
+            FP_A,
+            8,
+            100,
+            0x1000,
+            0,
+            10,
+            vec![cand(ANON, "unknown", 2, 21, &["other"], false)],
+            CandidateCoverage::Complete,
+        )
+    };
+    let mut input = input_base();
+    input.sites = vec![site()];
+    input.objects.push(ObjectRecord {
+        id: obj(ANON),
+        device: 0,
+        inode: 0,
+        display_locator: String::new(),
+    });
+    let v = json_of(&finalize(input));
+    validate_v2(&v).expect("anonymous-provider doc fails schema");
+    check_v2_semantics(&v).expect("anonymous-provider doc fails semantics");
+    // Negative pin: the same site without the anonymous record
+    // is an unlisted ref — rejected.
+    let mut input = input_base();
+    input.sites = vec![site()];
+    let v = json_of(&finalize(input));
+    let err = check_v2_semantics(&v).expect_err("dangling anonymous provider accepted");
+    assert!(err.contains("unlisted object"), "unexpected: {err}");
+}
+
+#[test]
 fn every_cli_rule_renders_a_schema_valid_predicate() {
     // F-E/B1: evaluator -> policy-record -> renderer for every CLI
     // rule constructor. deny-engine/deny-weak once emitted

@@ -135,10 +135,14 @@ pub fn emit(
     for r in rows {
         let (backed, dev, ino, off) =
             match maps::provider_mapping(live_maps, provider, canon, r.impl_addr) {
-                Some((m, _)) => {
+                // H5: the row backing is STAT-domain (the
+                // mapping's stat tuple — never maps text), so
+                // harvest rows join capture triples on
+                // divergent filesystems.
+                Some((m, raw)) => {
                     let o = r.impl_addr - m.start + m.offset;
                     let ok = m.x && elf::offset_in_x_segment(&elf, o);
-                    (ok, m.dev.clone(), m.ino, o)
+                    (ok, crate::plan::render_stat_dev(raw.0), m.ino, o)
                 }
                 None => match live_maps
                     .iter()
@@ -158,13 +162,21 @@ pub fn emit(
                                 },
                             )
                         });
-                        let bound = crate::plan::bound_bytes(&elf_cache, &m.path, m.ino);
+                        // H5: direct cache probe — schema owns this cache
+                        // and binds ino only (the row carries no
+                        // foreign-file stat-dev to bind against).
+                        let bound = elf_cache
+                            .get(&m.path)
+                            .filter(|f| f.ino == m.ino)
+                            .map(|f| f.bytes.as_slice());
                         let ok = m.x
                             && bound
                                 .and_then(|b| elf::parse_elf(b).ok())
                                 .map(|e| elf::offset_in_x_segment(&e, o))
                                 .unwrap_or(false);
-                        (ok, m.dev.clone(), m.ino, o)
+                        // H5: foreign-file backing is stat-or-fallback
+                        // (dual-facet, like every row backing).
+                        (ok, crate::discovery::session::backing_dev(m), m.ino, o)
                     }
                     None => (false, String::new(), 0, 0),
                 },
@@ -973,9 +985,13 @@ mod tests {
         let jrows = doc["rows"].as_array().unwrap();
         assert_eq!(jrows[0]["addr_backed"], true);
         assert_eq!(jrows[0]["backing"]["offset"], off);
+        // H5: row backings carry the STAT device (the canned
+        // maps-dev is display-only) — the hash preimage follows.
+        let stat_dev = crate::plan::render_stat_dev(std::fs::metadata(libc).unwrap().dev());
+        assert_eq!(jrows[0]["backing"]["dev"], stat_dev);
         assert_eq!(
             jrows[0]["addr_hash"],
-            crate::kinds::addr_hash("08:01", real_ino, off)
+            crate::kinds::addr_hash(&stat_dev, real_ino, off)
         );
         // Unmapped rows are fenced (count-only, never attributed).
         assert_eq!(jrows.len(), 1);
