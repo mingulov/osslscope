@@ -825,7 +825,7 @@ pub fn query_return(ctx: RetProbeContext) -> u32 {
                 advance_next(key, count);
                 return 0;
             }
-            chain_next(&ctx, key, count, rv, op, j);
+            chain_next(&ctx, count, op, j);
         }
         0 => {
             if no_store {
@@ -835,7 +835,7 @@ pub fn query_return(ctx: RetProbeContext) -> u32 {
                 advance_next(key, count);
                 return 0;
             }
-            chain_next(&ctx, key, count, rv, op, j);
+            chain_next(&ctx, count, op, j);
         }
         // Read abort: flag (all slots) and freeze for re-walk.
         _ => {
@@ -846,20 +846,19 @@ pub fn query_return(ctx: RetProbeContext) -> u32 {
 }
 
 /// Stash the chain handoff and tail-call `c_slot` (P5a-C1 entry
-/// diagonal, shared by the full-walk arms above). Small enough to
-/// inline (no loops, no subprogram calls — the verifier keeps the
-/// entry scope flat): a `#[inline(never)]` extraction here would
-/// reintroduce the depth-2 nesting the duplication avoids.
-#[inline(always)]
-fn chain_next(
-    ctx: &RetProbeContext,
-    key: u128,
-    count: u64,
-    rv: u64,
-    op: u64,
-    j: u64,
-) {
+/// diagonal, shared by the full-walk arms above). A real subprogram
+/// (own frame): the 72-byte stash array must NOT live in the entry
+/// frame — its stack-layout drift breaks the classifier's fragile
+/// loop-state merging (verifier 1M ceiling, observed 2026-10-12).
+/// Loop-free, so depth-1 nesting is trivially verifiable (only
+/// loop-calls are forbidden at depth 2 — see the duplication note).
+/// Four params (`rv` re-reads from the shared ctx, `tgid` from
+/// the helper — `key` re-folds from both, all inside this frame).
+#[inline(never)]
+fn chain_next(ctx: &RetProbeContext, count: u64, op: u64, j: u64) {
+    let rv: u64 = ctx.ret();
     let tgid = helpers::bpf_get_current_pid_tgid();
+    let key = ((tgid as u128) << 64) | (rv as u128);
     let stash = [rv, op, j.wrapping_add(1), count, 0, 0, 0, 0, 0];
     if CURSOR.insert(tgid, stash, 0).is_err() {
         // Unstashable (map full — unreachable with
@@ -895,24 +894,31 @@ fn chain_next(
 pub fn c_slot(ctx: RetProbeContext) -> u32 {
     let rv: u64 = ctx.ret();
     let tgid = helpers::bpf_get_current_pid_tgid();
-    let cur = match take_key(&CURSOR, tgid) {
-        Some(v) => v,
+    // Take the handoff cell-by-cell (NOT `take_key`: copying the
+    // 72-byte value onto this frame perturbs the stack layout the
+    // classifier's loop-state merging depends on — verifier 1M
+    // ceiling, observed 2026-10-12). Borrow, load the four live
+    // cells, then remove: same take semantics, ~zero frame cost.
+    let p = match CURSOR.get_ptr(&tgid) {
+        Some(p) => p,
         // No handoff (direct attach — impossible via the loader —
         // or a clobbered stash): chain nothing.
         None => return 0,
     };
+    // SAFETY: cells [0..4] of a 9-cell value; the map owns the
+    // memory and the borrow ends before the remove below.
+    let (arr, op_raw, j, count) = unsafe { ((*p)[CURS_ARR], (*p)[CURS_OP], (*p)[CURS_NEXT], (*p)[CURS_COUNT]) };
+    let _ = CURSOR.remove(&tgid);
     // Stale-cursor guard: the stash belongs to this query's array.
-    if cur[CURS_ARR] != rv {
+    if arr != rv {
         return 0;
     }
-    let j = cur[CURS_NEXT];
     // Bound guard: the entry never chains past slot 511 — a stale
     // handoff claiming otherwise walks nothing.
     if j >= MAX_ALGS {
         return 0;
     }
-    let op = cur[CURS_OP] as u32;
-    let count = cur[CURS_COUNT];
+    let op = op_raw as u32;
     let key = ((tgid as u128) << 64) | (rv as u128);
     // Slot-walk copy (see the entry's sync note): identical reads,
     // proofs, flags, and emissions — only the counter stores below
