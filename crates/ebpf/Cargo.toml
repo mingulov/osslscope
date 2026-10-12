@@ -27,3 +27,7 @@ path = "src/bin/harvest.rs"
 [[bin]]
 name = "osslscope-count"
 path = "src/bin/count.rs"
+
+[[bin]]
+name = "osslscope-members"
+path = "src/bin/members.rs"

@@ -174,6 +174,16 @@ pub const LOSS_PENDING_QUERY_FULL: u32 = 12;
 pub const LOSS_PENDING_INIT_MISS: u32 = 13;
 pub const LOSS_PENDING_QUERY_MISS: u32 = 14;
 pub const LOSS_INIT_SCAN: u32 = 15;
+/// Member attach-cookie mismatch (P7 item 2): a member's baked slot
+/// disagrees with its link cookie — a loader slot-permutation bug,
+/// never a kernel event. Fail-closed: skip the slot, count it.
+pub const LOSS_MEMBER_COOKIE: u32 = 16;
+
+/// Member-entry attach cookie (P7 item 2, single source for BPF +
+/// host): the loader attaches `member_entry` with this cookie and
+/// `member_J` with cookie J; members peek the entry's PENDING record
+/// under `pend_key` of this cookie. First non-member index.
+pub const MEMBER_ENTRY_COOKIE: u64 = 512;
 
 /// `TERMD[arr]` termination proof (T03): keyed by query-returned
 /// array base, value packs the op (low 32) and the proven live-slot
