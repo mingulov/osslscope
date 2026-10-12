@@ -26,6 +26,18 @@
 //! while one loop (dispatch walk, as a subprogram) verifies with wide
 //! margin.
 //!
+//! P5a-C1 chain probe: the entry program walks slot j, then tail-calls
+//! the `c_slot` callee (via the `JUMPS` prog-array, handoff in the
+//! per-thread `CURSOR`) to walk slot j+1, advancing the cursor by 2
+//! per query. Same per-slot walk body (`walk_slot` subprogram, shared
+//! by entry and callee — one verification scope), same honesty rules;
+//! only the advance diagonal differs (see `c_slot`). An unpopulated
+//! `JUMPS` slot or a failed `CURSOR` stash degrades to the sampler
+//! (advance by 1) — the loader populates before any attach and fails
+//! the attach when population fails, so the fallback is unreachable
+//! in practice, and any live fallback is observable in the doc's
+//! rows-per-query ratio (14 chained vs 7 sampled).
+//!
 //! T03 honesty: a prefix is never COMPLETE. The walker records
 //! termination proof (`TERMD[arr] = (op, len)`) on reading the
 //! terminator, flags walk aborts at every slot, advances past
@@ -67,7 +79,7 @@
 use aya_ebpf::{
     helpers,
     macros::{map, uprobe, uretprobe},
-    maps::{HashMap, PerCpuHashMap, RingBuf},
+    maps::{HashMap, PerCpuHashMap, ProgramArray, RingBuf},
     programs::{ProbeContext, RetProbeContext},
     EbpfContext as _,
 };
@@ -179,6 +191,35 @@ static ALG_CLASS: HashMap<u64, AlgClassValue> = HashMap::with_max_entries(1024, 
 /// observer-populated discipline.
 #[map]
 static TRIP_CLASS: HashMap<u64, TripClassValue> = HashMap::with_max_entries(64, 0);
+/// Chain jump table (P5a-C1): prog-array, slot 0 = the `c_slot` tail
+/// callee. Populated by the loader before any attach (fail-closed);
+/// 8 slots for the P7 multi-callee protocol.
+#[map]
+static JUMPS: ProgramArray = ProgramArray::with_max_entries(8, 0);
+/// Per-thread chain handoff (P5a-C1): pid_tgid → [array, op,
+/// next_index, entry_count, 0, 0, 0, 0, 0]. The entry stashes, the
+/// callee takes (remove-on-read: no accumulation across threads, so
+/// the 1024 slots far exceed any concurrent-thread count). No cookie
+/// namespace (unlike PENDING_*): the stash→tail→take sequence is
+/// synchronous within one BPF invocation — no preemption window
+/// exists for a same-thread clobber.
+#[map]
+static CURSOR: HashMap<u64, [u64; 9]> = HashMap::with_max_entries(1024, 0);
+/// `CURSOR` value cells (see above).
+const CURS_ARR: usize = 0;
+const CURS_OP: usize = 1;
+const CURS_NEXT: usize = 2;
+const CURS_COUNT: usize = 3;
+/// `walk_slot` outcomes: 0/1 continue the chain (full walk, with or
+/// without dispatch overflow), 2 freezes (transient abort — re-walk
+/// next query), 3 is the terminator (proof recorded), 4 is a stable
+/// implementation-less slot (advance past, never stall). Parallels
+/// `walk_dispatch`'s 0/1/2 convention.
+const WS_OK: u64 = 0;
+const WS_OVERFLOW: u64 = 1;
+const WS_ABORT: u64 = 2;
+const WS_TERM: u64 = 3;
+const WS_SKIP: u64 = 4;
 
 /// Per-CPU counter add (F-C/A8): shared-map lookup–increment–
 /// replace loses concurrent increments across CPUs, and `core`
@@ -343,6 +384,15 @@ fn record_termd(arr: u64, op: u32, len: u64) {
 /// are counted.
 fn advance_next(key: u128, count: u64) {
     if QUERY_NEXT.insert(key, count.wrapping_add(1), 0).is_err() {
+        bump_loss(LOSS_MAP_QUERY_NEXT);
+    }
+}
+
+/// Store an explicit per-(thread, array) counter value (the chain
+/// callee's advance-by-2 and freeze-at-terminator diagonals). Same
+/// freeze-on-failure honesty as `advance_next`.
+fn store_next(key: u128, val: u64) {
+    if QUERY_NEXT.insert(key, val, 0).is_err() {
         bump_loss(LOSS_MAP_QUERY_NEXT);
     }
 }
@@ -559,12 +609,138 @@ fn walk_dispatch(imp: u64, op: u32, arr: u64, j: u64) -> u64 {
     1
 }
 
-/// At query-return walk exactly one alg of the OSSL_ALGORITHM array
-/// (index = per-(thread, array) query count mod 512) plus its dispatch
-/// table. The counter freezes at the first terminator (names == 0):
-/// later hits re-read the terminator and stop, so short arrays never
-/// walk past their end. OSSL_ALGORITHM = { names, props, impl, desc }
-/// @32B.
+/// One alg slot's full walk (P5a-C1: shared by the entry program
+/// and the `c_slot` tail callee — one verification scope, identical
+/// honesty). Reads the slot, records termination proof (cacheable
+/// tables only), classifies + emits ALG, walks the dispatch table
+/// into ROWs, and flags every TRUNC bit. Performs NO counter writes:
+/// the caller maps the outcome onto its advance diagonal (entry:
+/// tail-call the chain; callee: advance by 2). `cacheable` is
+/// `!no_store` — uncacheable tables are sampled, never proven.
+#[inline(never)]
+fn walk_slot(rv: u64, op: u32, j: u64, cacheable: bool) -> u64 {
+    let base = rv + j * 32;
+    let names = unsafe { helpers::bpf_probe_read_user(base as *const u64) };
+    let imp = unsafe { helpers::bpf_probe_read_user((base + 16) as *const u64) };
+    let (Ok(names), Ok(imp)) = (names, imp) else {
+        // Unreadable slot at ANY position aborts this query's walk;
+        // the counter freezes so the next query retries the slot.
+        // Sticky: a later success does not clear the flag (fail
+        // closed; pretouch keeps cold pages off this path).
+        flag_trunc(op, TRUNC_WALK_READ);
+        return WS_ABORT;
+    };
+    if names == 0 {
+        // Terminator: the caller freezes (entry) or freezes AT the
+        // terminator (callee) — either way the proof lands here
+        // unless `no_store` (uncacheable tables are never proven).
+        // Slot 0 empty = the query returned a table with no first
+        // alg (suspicious: flagged, still PARTIAL).
+        if cacheable {
+            record_termd(rv, op, j);
+        }
+        if j == 0 {
+            flag_trunc(op, TRUNC_WALK_EMPTY);
+        }
+        return WS_TERM;
+    }
+    // Overrun guard on the last slot: entries 0..=511 all live means
+    // the array may extend past the bound — slot 512 decides (live or
+    // unreadable = TRUNC, terminator = clean + proof). Runs before
+    // the impl-less skip so a bare slot 511 still guards the tail.
+    if j == MAX_ALGS - 1 {
+        let tail = unsafe { helpers::bpf_probe_read_user((rv + MAX_ALGS * 32) as *const u64) };
+        match tail {
+            Ok(0) => {
+                if cacheable {
+                    record_termd(rv, op, MAX_ALGS);
+                }
+            }
+            _ => flag_trunc(op, TRUNC_ALGS),
+        }
+    }
+    if imp == 0 {
+        // Alg without implementation: a stable observation (the slot
+        // read fine), so the caller ADVANCES past it — freezing here
+        // would re-walk this slot on every future query and stall
+        // the op forever. The skip is explicit via NOIMP.
+        flag_trunc(op, TRUNC_WALK_NOIMP);
+        return WS_SKIP;
+    }
+    // Kernel scratch only: classified below, never emitted.
+    let mut name_buf = [0u8; 128];
+    let slice =
+        match unsafe { helpers::bpf_probe_read_user_str_bytes(names as *const u8, &mut name_buf) }
+        {
+            Ok(s) => s,
+            Err(_) => {
+                flag_trunc(op, TRUNC_WALK_NAME);
+                // Explicit unreadable record (cold page or hostile
+                // pointer): the counter still freezes so the next
+                // query re-walks this slot instead of losing the alg.
+                emit_alg(&AlgEvent {
+                    kind: KIND_ALG,
+                    op,
+                    class: OTHER_CLASS,
+                    status: ALG_UNREADABLE,
+                    weak: 0,
+                    _pad: 0,
+                    arr: rv,
+                    idx: j,
+                    generation: gen_of(rv),
+                });
+                return WS_ABORT;
+            }
+        };
+    // Copy the length out first: the window array is reborrowed
+    // shared below, which ends `slice`'s mutable borrow.
+    let len = slice.len();
+    let saturated = len == ALG_WINDOW - 1;
+    let v = classify_alg(&name_buf, len, saturated);
+    // ALG first: userspace drops rows whose (array, index) has no
+    // ALG record yet (orphan rule), so rows must follow their ALG.
+    emit_alg(&AlgEvent {
+        kind: KIND_ALG,
+        op,
+        class: v.class,
+        status: v.status,
+        weak: u8::from(v.weak),
+        _pad: 0,
+        arr: rv,
+        idx: j,
+        generation: gen_of(rv),
+    });
+    // Full-walk outcomes only differ below: BPF probe reads are
+    // nofault, so a cold (never-touched) page aborts the walk even
+    // though the table is valid — the caller freezes the counter so
+    // the next query re-walks this slot instead of losing the alg
+    // forever (the terminator path above still freezes too, and a
+    // dispatch read-abort freezes as well: ALG/ROW re-emits dedupe
+    // userside via the alg_names overwrite + rows seen-map).
+    match walk_dispatch(imp, op, rv, j) {
+        // Overflow: rows 0..127 are kept, the rest is unwalkable —
+        // the chain continues past like a success, but the
+        // truncation is flagged.
+        1 => {
+            flag_trunc(op, TRUNC_DISPATCH);
+            WS_OVERFLOW
+        }
+        0 => WS_OK,
+        // Read abort: flag (all slots) and freeze for re-walk.
+        _ => {
+            flag_trunc(op, TRUNC_WALK_READ);
+            WS_ABORT
+        }
+    }
+}
+
+/// At query-return walk slot j of the OSSL_ALGORITHM array (index =
+/// per-(thread, array) query count mod 512) plus its dispatch table,
+/// then tail-call the `c_slot` callee for slot j+1 (P5a-C1 chain —
+/// the cursor advances by 2 per query). Short arrays still never walk
+/// past their end: the terminator freezes the counter (entry) or
+/// freezes AT the terminator (callee). OSSL_ALGORITHM = { names,
+/// props, impl, desc } @32B.
 ///
 /// T03 honesty: the walker records termination proof (`TERMD`) when
 /// it reads the terminator, flags walk aborts at EVERY slot (not
@@ -572,7 +748,7 @@ fn walk_dispatch(imp: u64, op: u32, arr: u64, j: u64) -> u64 {
 /// stable observations, not transient failures — freezing on them
 /// stalls the op forever), counts every ring/map failure in `LOSS`,
 /// and samples `no_store` arrays once (slot 0, no persistent
-/// counter, never termination proof).
+/// counter, never termination proof — and never chained).
 #[uretprobe]
 pub fn query_return(ctx: RetProbeContext) -> u32 {
     // Cookie 1 = legacy attachment: its calls stay out of CALLS.
@@ -659,124 +835,99 @@ pub fn query_return(ctx: RetProbeContext) -> u32 {
             generation: gen_of(rv),
         });
     }
-    let base = rv + j * 32;
-    let names = unsafe { helpers::bpf_probe_read_user(base as *const u64) };
-    let imp = unsafe { helpers::bpf_probe_read_user((base + 16) as *const u64) };
-    let (Ok(names), Ok(imp)) = (names, imp) else {
-        // Unreadable slot at ANY position aborts this query's walk;
-        // the counter freezes so the next query retries the slot.
-        // Sticky: a later success does not clear the flag (fail
-        // closed; pretouch keeps cold pages off this path).
-        flag_trunc(op as u32, TRUNC_WALK_READ);
-        return 0;
-    };
-    if names == 0 {
-        // Terminator: freeze the counter (no insert), stop, and
-        // record proof — unless `no_store` (uncacheable tables are
-        // never proven). Slot 0 empty = the query returned a table
-        // with no first alg (suspicious: flagged, still PARTIAL).
-        if !no_store {
-            record_termd(rv, op as u32, j);
-        }
-        if j == 0 {
-            flag_trunc(op as u32, TRUNC_WALK_EMPTY);
-        }
-        return 0;
-    }
-    // Overrun guard on the last slot: entries 0..=511 all live means
-    // the array may extend past the bound — slot 512 decides (live or
-    // unreadable = TRUNC, terminator = clean + proof). Runs before
-    // the impl-less skip so a bare slot 511 still guards the tail.
-    if j == MAX_ALGS - 1 {
-        let tail = unsafe { helpers::bpf_probe_read_user((rv + MAX_ALGS * 32) as *const u64) };
-        match tail {
-            Ok(0) => {
-                if !no_store {
-                    record_termd(rv, op as u32, MAX_ALGS);
-                }
-            }
-            _ => flag_trunc(op as u32, TRUNC_ALGS),
-        }
-    }
-    if imp == 0 {
-        // Alg without implementation: a stable observation (the slot
-        // read fine), so the walk ADVANCES past it — freezing here
-        // would re-walk this slot on every future query and stall
-        // the op forever. The skip is explicit via NOIMP.
-        flag_trunc(op as u32, TRUNC_WALK_NOIMP);
-        if !no_store {
-            advance_next(key, count);
-        }
-        return 0;
-    }
-    // Kernel scratch only: classified below, never emitted.
-    let mut name_buf = [0u8; 128];
-    let slice =
-        match unsafe { helpers::bpf_probe_read_user_str_bytes(names as *const u8, &mut name_buf) }
-        {
-            Ok(s) => s,
-            Err(_) => {
-                flag_trunc(op as u32, TRUNC_WALK_NAME);
-                // Explicit unreadable record (cold page or hostile
-                // pointer): the counter still freezes so the next
-                // query re-walks this slot instead of losing the alg.
-                emit_alg(&AlgEvent {
-                    kind: KIND_ALG,
-                    op: op as u32,
-                    class: OTHER_CLASS,
-                    status: ALG_UNREADABLE,
-                    weak: 0,
-                    _pad: 0,
-                    arr: rv,
-                    idx: j,
-                    generation: gen_of(rv),
-                });
+    // Entry advance diagonal (P5a-C1): a fully-walked slot
+    // continues the chain (stash + tail-call — the callee advances
+    // by 2); a stable impl-less slot advances past by 1 (sampler
+    // diagonal — the chain gains nothing chaining INTO a skip, and
+    // the callee would just meet the same skip one slot over);
+    // aborts and the terminator freeze (no insert: the next query
+    // re-walks this slot). `no_store` first observations walk slot 0
+    // and stop: sampled once, never advanced, never chained.
+    match walk_slot(rv, op as u32, j, !no_store) {
+        WS_OK | WS_OVERFLOW => {
+            if no_store {
                 return 0;
             }
-        };
-    // Copy the length out first: the window array is reborrowed
-    // shared below, which ends `slice`'s mutable borrow.
-    let len = slice.len();
-    let saturated = len == ALG_WINDOW - 1;
-    let v = classify_alg(&name_buf, len, saturated);
-    // ALG first: userspace drops rows whose (array, index) has no
-    // ALG record yet (orphan rule), so rows must follow their ALG.
-    emit_alg(&AlgEvent {
-        kind: KIND_ALG,
-        op: op as u32,
-        class: v.class,
-        status: v.status,
-        weak: u8::from(v.weak),
-        _pad: 0,
-        arr: rv,
-        idx: j,
-        generation: gen_of(rv),
-    });
-    // Advance past this slot ONLY on a fully-walked alg: BPF probe
-    // reads are nofault, so a cold (never-touched) page aborts the
-    // walk even though the table is valid — freezing the counter
-    // lets the next query re-walk this slot instead of losing the
-    // alg forever (the terminator path above still freezes too, and
-    // a dispatch read-abort freezes as well: ALG/ROW re-emits
-    // dedupe userside via the alg_names overwrite + rows seen-map).
-    match walk_dispatch(imp, op as u32, rv, j) {
-        // Overflow: rows 0..127 are kept, the rest is unwalkable —
-        // advance past like a success, but flag the truncation.
-        1 => {
-            if !no_store {
+            // The chain ends at the bound: slot 512 is the
+            // overrun decider, never a walked slot — advance
+            // past 511 like the sampler instead of chaining
+            // out of bounds.
+            if j == MAX_ALGS - 1 {
                 advance_next(key, count);
+                return 0;
             }
-            flag_trunc(op as u32, TRUNC_DISPATCH);
+            let tgid = helpers::bpf_get_current_pid_tgid();
+            let stash = [rv, op, j.wrapping_add(1), count, 0, 0, 0, 0, 0];
+            if CURSOR.insert(tgid, stash, 0).is_err() {
+                // Unstashable (map full — unreachable with
+                // take-semantics): chain nothing rather than
+                // chain a stale cursor; sampler fallback keeps
+                // the walk progressing, and the fallback is
+                // observable in the doc's rows-per-query ratio.
+                advance_next(key, count);
+                return 0;
+            }
+            unsafe { JUMPS.tail_call(&ctx, 0) };
+            // Tail-call failure (empty slot, OOB index, or tail
+            // budget — indistinguishable, RET_VOID): sampler
+            // fallback, cursor stays consistent. Unreachable in
+            // practice (the loader populates before any attach
+            // and fails the attach otherwise); observable in
+            // the ratio if it ever fires live.
+            advance_next(key, count);
         }
-        0 => {
+        WS_SKIP => {
             if !no_store {
                 advance_next(key, count);
             }
         }
-        // Read abort: flag (all slots) and freeze for re-walk.
-        _ => {
-            flag_trunc(op as u32, TRUNC_WALK_READ);
-        }
+        // WS_ABORT / WS_TERM: freeze for re-walk (terminator
+        // proof already recorded by the walk above).
+        _ => {}
+    }
+    0
+}
+
+/// Chain tail callee (P5a-C1): walks slot j+1 after the entry walked
+/// slot j. NEVER directly attached — reachable only via `JUMPS[0]`
+/// from `query_return`, with the handoff in `CURSOR[pid_tgid]`
+/// (taken here, remove-on-read). Same `walk_slot` body as the
+/// entry, different advance diagonal: full walks store count+2, a
+/// stable skip stores count+2 past it, the terminator stores
+/// count+1 (frozen AT the terminator — the next query's entry
+/// re-reads it once, exactly like a sampler-frozen terminator),
+/// and aborts freeze (no store: the next query re-walks BOTH
+/// slots). Runs cacheable-only (the entry never chains `no_store`).
+#[uretprobe]
+pub fn c_slot(ctx: RetProbeContext) -> u32 {
+    let rv: u64 = ctx.ret();
+    let tgid = helpers::bpf_get_current_pid_tgid();
+    let cur = match take_key(&CURSOR, tgid) {
+        Some(v) => v,
+        // No handoff (direct attach — impossible via the loader —
+        // or a clobbered stash): chain nothing.
+        None => return 0,
+    };
+    // Stale-cursor guard: the stash belongs to this query's array.
+    if cur[CURS_ARR] != rv {
+        return 0;
+    }
+    let j2 = cur[CURS_NEXT];
+    // Bound guard: the entry never chains past slot 511 — a stale
+    // handoff claiming otherwise walks nothing.
+    if j2 >= MAX_ALGS {
+        return 0;
+    }
+    let op = cur[CURS_OP] as u32;
+    let count = cur[CURS_COUNT];
+    let key = ((tgid as u128) << 64) | (rv as u128);
+    match walk_slot(rv, op, j2, true) {
+        WS_OK | WS_OVERFLOW => store_next(key, count.wrapping_add(2)),
+        WS_SKIP => store_next(key, count.wrapping_add(2)),
+        WS_TERM => store_next(key, count.wrapping_add(1)),
+        // WS_ABORT: freeze (no store — next query re-walks j
+        // and j2, and the re-emits dedupe userside).
+        _ => {}
     }
     0
 }
