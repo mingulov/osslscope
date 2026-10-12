@@ -765,7 +765,8 @@ fn prepare_accepts_uretprobe_section() {
 /// P7 item 1a (§5.4 floor): `bpf_ringbuf_query` must load on a B
 /// lane — the entry's occupancy check is the sole new kernel
 /// requirement. Live-only: map creation needs CAP_BPF, kprobe
-/// program load needs CAP_PERFMON-or-CAP_SYS_ADMIN.
+/// program load needs CAP_PERFMON as well (CAP_SYS_ADMIN covers
+/// both stages instead).
 #[test]
 #[ignore = "live lane only (see module docs)"]
 fn ringbuf_query_floor_present() {
