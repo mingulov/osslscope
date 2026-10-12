@@ -415,6 +415,14 @@ fn h5_t3_every_device_site_names_one_domain() {
         ),
         // session.rs: D2 records from BackingRef strings (stat, ×2).
         ("src/discovery/session.rs", "stat", "dev: b.dev.clone(),", 2),
+        // session.rs (H10): pending re-resolve stats the provider
+        // path (stat-vs-stat against the bound triple).
+        (
+            "src/discovery/session.rs",
+            "stat",
+            "Some((crate::plan::render_device(md.dev()), md.ino()))",
+            1,
+        ),
         // session.rs: plan ident / bindings from bound reads + pins (stat, ×4).
         (
             "src/discovery/session.rs",

@@ -239,6 +239,7 @@ struct TestEnv {
     dispatch_detaches: u32,
     reinstall_script: VecDeque<anyhow::Result<DispatchReinstall>>,
     reinstall_calls: u32,
+    provider_stat: Option<(String, u64)>,
     probe_set: Option<ProbeSet>,
     pin_ok: bool,
     quiesced: bool,
@@ -263,6 +264,7 @@ impl TestEnv {
             dispatch_detaches: 0,
             reinstall_script: VecDeque::new(),
             reinstall_calls: 0,
+            provider_stat: None,
             probe_set: None,
             pin_ok: true,
             quiesced: false,
@@ -395,6 +397,10 @@ impl SessionEnv for TestEnv {
         self.reinstall_script
             .pop_front()
             .unwrap_or_else(|| Err(anyhow::anyhow!("no reinstall scripted")))
+    }
+
+    fn provider_stat(&self) -> Option<(String, u64)> {
+        self.provider_stat.clone()
     }
 }
 
