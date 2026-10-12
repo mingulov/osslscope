@@ -617,6 +617,17 @@ struct TableEpoch {
     fingerprint: Option<Fingerprint>,
 }
 
+/// One mapping's first sighting (M1): the range end, its
+/// fingerprint then (`None` for anonymous mappings), and a session
+/// sequence so the earliest sighting wins even when a later split
+/// reuses a higher start address inside the same range.
+#[derive(Clone, Debug)]
+struct SightedMapping {
+    end: u64,
+    fingerprint: Option<Fingerprint>,
+    seq: u64,
+}
+
 /// Candidate identity: `(op, class, weak, status, funcid,
 /// impl_addr, array)`. Scaled tables cycle funcids, alias verdicts
 /// must not collapse, and two providers sharing one implementation
@@ -764,6 +775,34 @@ pub struct SessionCore {
     /// Bootstrap installs only (rebirth bumps land back-to-back
     /// with their eviction — a 0 after a bump is stale).
     bootstrap_grace: HashSet<u64>,
+    /// First-sighting fingerprints per mapping start (M1): every
+    /// maps snapshot's never-before-seen ranges land here,
+    /// first-wins, so an array's baseline predates its first
+    /// event even when the mapping appeared after attach. Bounded
+    /// by distinct mapping starts sighted (mmap churn per run).
+    /// Cleared on recycle with all lineage (a recycled pid owns a
+    /// new address space — old sightings are meaningless).
+    sightings: BTreeMap<u64, SightedMapping>,
+    /// Sighting sequence: monotonic per session, reset on recycle.
+    sight_seq: u64,
+    /// Resolved first-observation baselines per array (M1):
+    /// earliest-sighting fingerprint, else the current one at
+    /// first ingest; re-seated to current on mismatch. Bounded by
+    /// distinct arrays (same bound as the M2 high-water mark).
+    baselines: HashMap<u64, Option<Fingerprint>>,
+    /// Arrays whose baseline mismatched during the CURRENT poll's
+    /// drain (M1): same-drain siblings of the mismatch drop
+    /// silently (one loss per array per poll), and re-baselined
+    /// arrays bootstrap cleanly from the next poll. Cleared every
+    /// poll, like `bootstrap_grace`.
+    m1_poison: HashSet<u64>,
+    /// Remembered impl-backing triple per (array, slot) (M4):
+    /// populated on the first validated row per slot, compared
+    /// before join/refresh, re-seated on mismatch. Cleared for
+    /// `arr` on array retire (memories belong to the array epoch)
+    /// and wholly on recycle. Bounded by distinct slots ever
+    /// walked (same order as `alg_records`).
+    slot_backing: HashMap<(u64, u64), BackingRef>,
     /// Last successfully read mappings (F-D/Am1): a failed
     /// `current_maps` reconciles against this instead of reading
     /// the failure as empty. Starts empty (a first-poll failure
@@ -876,6 +915,11 @@ impl SessionCore {
             array_gen: HashMap::new(),
             gen_high_water: HashMap::new(),
             bootstrap_grace: HashSet::new(),
+            sightings: BTreeMap::new(),
+            sight_seq: 0,
+            baselines: HashMap::new(),
+            m1_poison: HashSet::new(),
+            slot_backing: HashMap::new(),
             last_good_maps: Vec::new(),
             candidates: Vec::new(),
             seen: HashMap::new(),
@@ -1002,6 +1046,127 @@ impl SessionCore {
         self.gen_high_water.insert(arr, generation);
     }
 
+    /// Record first sightings from one maps snapshot (M1):
+    /// never-before-seen range starts land here with their
+    /// fingerprint, first-wins (a same-start replacement keeps
+    /// the OLDEST fingerprint — that is the point: the baseline
+    /// must predate any turnover). Called from [`Self::poll_maps`],
+    /// the single maps funnel, so poll-start, mid-poll refresh,
+    /// and close-time reads all sight.
+    fn sight_mappings(&mut self, maps: &[maps::Mapping]) {
+        for m in maps {
+            if self.sightings.contains_key(&m.start) {
+                continue;
+            }
+            let fingerprint = if m.ino != 0 {
+                Some((m.dev.clone(), m.ino, m.start, m.end, m.offset))
+            } else {
+                None
+            };
+            self.sightings.insert(
+                m.start,
+                SightedMapping {
+                    end: m.end,
+                    fingerprint,
+                    seq: self.sight_seq,
+                },
+            );
+            self.sight_seq += 1;
+        }
+    }
+
+    /// Resolve (and cache) an array's first-observation baseline
+    /// (M1): the earliest sighting covering the address, else the
+    /// current fingerprint (genuinely first sighting — the R1
+    /// shape: appear+replace inside one poll interval is
+    /// polling-invisible and stays silent by design).
+    fn baseline_for(&mut self, arr: u64, maps: &[maps::Mapping]) -> Option<Fingerprint> {
+        if let Some(fp) = self.baselines.get(&arr) {
+            return fp.clone();
+        }
+        let base = self
+            .sightings
+            .iter()
+            .filter(|(start, s)| **start <= arr && s.end > arr)
+            .min_by_key(|(_, s)| s.seq)
+            .map(|(_, s)| s.fingerprint.clone())
+            .unwrap_or_else(|| incarnation_of(maps, arr));
+        self.baselines.insert(arr, base.clone());
+        base
+    }
+
+    /// First-observation gate (M1): the array's baseline
+    /// fingerprint must agree with the current one, or the array
+    /// turned over inside its first-observation window and this
+    /// batch drops with an op-None mismatch loss (the stale
+    /// records are indistinguishable from the replacement's
+    /// fresh stamp-0s — fail closed). On mismatch the baseline
+    /// re-seats to current and the array poisons for the rest of
+    /// the drain (same-drain siblings drop silently — one loss
+    /// per array per poll); the next poll bootstraps cleanly.
+    /// Idempotent across the row pre-gate and the
+    /// [`Self::ensure_epoch`] funnel: the first call per drain
+    /// does the loud work, the rest observe poison. Arrays with
+    /// an M2 high-water mark skip (post-unload remaps are M2's
+    /// territory — stragglers drop by the generation gap and the
+    /// re-bootstrap is clean).
+    fn check_first_sighting(&mut self, maps: &[maps::Mapping], op: u32, arr: u64) -> bool {
+        if self.gen_high_water.contains_key(&arr) {
+            return true;
+        }
+        if self.m1_poison.contains(&arr) {
+            return false;
+        }
+        let base = self.baseline_for(arr, maps);
+        let current = incarnation_of(maps, arr);
+        if base == current {
+            return true;
+        }
+        eprintln!("first-sighting mismatch: op={op}");
+        self.tracker.note_baseline_mismatch();
+        self.baselines.insert(arr, current);
+        self.m1_poison.insert(arr);
+        false
+    }
+
+    /// Slot-backing gate (M4): the row's impl backing must match
+    /// the triple remembered for its (array, slot) — a
+    /// backing-only replacement at the same vaddr is
+    /// indistinguishable from a stale queued row (same address,
+    /// same stamp, array never bumped), so the first
+    /// post-replacement row per slot drops loudly with
+    /// op-localized loss (the row names its op — same channel as
+    /// stragglers) and re-seats the memory; subsequent rows match
+    /// and flow. First sighting records silently; a missing
+    /// backing now (transient unmap) neither records nor compares
+    /// (like the refresh arm, it never overwrites attested
+    /// state). Callers run this after the orphan check (only
+    /// validated rows participate) and before join/refresh.
+    fn check_slot_backing(
+        &mut self,
+        op: u32,
+        arr: u64,
+        idx: u64,
+        backing: &Option<BackingRef>,
+    ) -> bool {
+        let Some(current) = backing else {
+            return true;
+        };
+        match self.slot_backing.get(&(arr, idx)) {
+            None => {
+                self.slot_backing.insert((arr, idx), current.clone());
+                true
+            }
+            Some(remembered) if remembered == current => true,
+            Some(_) => {
+                eprintln!("stale slot backing: op={op} idx={idx}");
+                self.tracker.note_straggler(op);
+                self.slot_backing.insert((arr, idx), current.clone());
+                false
+            }
+        }
+    }
+
     /// Register (op, arr) under its current incarnation when first
     /// observed; every fresh key mints a new epoch id.
     /// Fetch an array's epoch, minting one for a novel table.
@@ -1044,6 +1209,14 @@ impl SessionCore {
                 },
             );
             return Some(epoch);
+        }
+        // First-observation gate (M1): a pre-ingest replacement
+        // drops the batch loud instead of bootstrapping stale
+        // records against the replacement's mappings. Shared-array
+        // adoption above already returned (bound arrays are
+        // reconcile-guarded); only true bootstraps gate here.
+        if !self.check_first_sighting(maps, op, arr) {
+            return None;
         }
         let Some(generation) = self.next_generation(arr) else {
             // u64 exhaustion: fail closed like an install failure
@@ -1151,6 +1324,11 @@ impl SessionCore {
         epoch: u64,
         now: Option<Fingerprint>,
     ) -> (TableRetirement, bool) {
+        // M4: slot memories belong to the array epoch — every
+        // retire path (rebirth, unload, failed bump) clears the
+        // array's, so the next epoch's first rows record fresh
+        // instead of going falsely stale.
+        self.slot_backing.retain(|(a, _), _| *a != arr);
         let gap = self.tracker.retire_table(op, arr);
         self.retained.accumulate(&gap);
         self.alg_records.retain(|(a, _), _| *a != arr);
@@ -1315,6 +1493,11 @@ impl SessionCore {
         self.array_gen.clear();
         self.gen_high_water.clear();
         self.bootstrap_grace.clear();
+        self.sightings.clear();
+        self.sight_seq = 0;
+        self.baselines.clear();
+        self.m1_poison.clear();
+        self.slot_backing.clear();
         self.candidates.clear();
         self.seen.clear();
         self.objects.clear();
@@ -1490,6 +1673,9 @@ impl SessionCore {
     fn poll_maps<E: SessionEnv>(&mut self, env: &mut E) -> Vec<maps::Mapping> {
         match env.current_maps() {
             Some(maps) => {
+                // M1: every fresh snapshot sights its new ranges
+                // (first-wins baselines for late-seen arrays).
+                self.sight_mappings(&maps);
                 self.last_good_maps = maps.clone();
                 maps
             }
@@ -1521,6 +1707,9 @@ impl SessionCore {
         // Bootstrap-install grace is drain-scoped (M2): last
         // poll's installs confer no stamp-0 tolerance now.
         self.bootstrap_grace.clear();
+        // M1 poison is drain-scoped too: re-baselined arrays
+        // bootstrap cleanly from this poll on.
+        self.m1_poison.clear();
         // Pin FIRST: tainted events must not drive attaches.
         if env.verify_pin().is_err() {
             self.mark_recycled();
@@ -2217,6 +2406,12 @@ impl SessionCore {
                 if !self.check_gen(ev.op, ev.aux, ev.generation) {
                     return;
                 }
+                // Same for first observation (M1): a poisoned
+                // array's row drops here, not as an orphan — the
+                // mismatch loss already names the cause.
+                if !self.check_first_sighting(maps, ev.op, ev.aux) {
+                    return;
+                }
                 self.trigger_observed = true;
                 touched.insert((ev.op, ev.aux));
                 let Some((label, weak, status)) = self.alg_records.get(&(ev.aux, ev.idx)).cloned()
@@ -2236,6 +2431,12 @@ impl SessionCore {
                 );
                 let (advertising, advertising_dev, advertising_ino) = array_owner(maps, ev.aux);
                 let (backing, locator) = attribute_impl(maps, &self.provider, &self.canon, ev.addr);
+                // Slot-backing gate (M4): compares BEFORE the
+                // refresh arm below can adopt a changed backing —
+                // a mismatched duplicate drops here instead.
+                if !self.check_slot_backing(ev.op, ev.aux, ev.idx, &backing) {
+                    return;
+                }
                 if let Some(&i) = self.seen.get(&key) {
                     // Duplicate key (multi-libctx re-query): refresh
                     // identities when the current mappings attest a

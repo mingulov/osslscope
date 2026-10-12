@@ -42,6 +42,12 @@ pub const HOST_MAPS_READ: u32 = 108;
 /// replacement's mappings. Op-localized like orphan rows (the
 /// stale record belongs to this op's table).
 pub const HOST_STRAGGLER: u32 = 109;
+/// An array's first-ingest fingerprint disagrees with its baseline
+/// (M1): the array turned over inside its first-observation window,
+/// so the batch drops and the baseline re-seats. Op-None
+/// (unlocalizable — a first sighting names no proven table) and
+/// taints every op like other snapshot failures (F-B/A7).
+pub const HOST_BASELINE_MISMATCH: u32 = 110;
 
 /// Frozen gap-reason vocabulary owned here (schema's derived reasons
 /// reference these; see [`primary_reason`] for the single ranking).
@@ -81,6 +87,7 @@ pub fn loss_source_name(src: u32) -> Option<&'static str> {
         HOST_EVICT_FAILED => "evict_failed",
         HOST_MAPS_READ => "maps_read",
         HOST_STRAGGLER => "straggler",
+        HOST_BASELINE_MISMATCH => "baseline_mismatch",
         _ => return None,
     })
 }
@@ -197,6 +204,13 @@ impl CoverageTracker {
     pub fn note_orphan_row(&mut self, op: u32) {
         *self.losses.entry(HOST_ORPHAN_ROW).or_default() += 1;
         *self.orphan_ops.entry(op).or_default() += 1;
+    }
+
+    /// A first-observation batch dropped on baseline mismatch
+    /// (M1): counted globally, localized to NO op (a first
+    /// sighting names no proven table — taints every op, F-B/A7).
+    pub fn note_baseline_mismatch(&mut self) {
+        *self.losses.entry(HOST_BASELINE_MISMATCH).or_default() += 1;
     }
 
     /// A ring record stamped with a retired generation: dropped,
@@ -589,13 +603,14 @@ mod tests {
             HOST_EVICT_FAILED,
             HOST_MAPS_READ,
             HOST_STRAGGLER,
+            HOST_BASELINE_MISMATCH,
         ] {
             assert!(loss_source_name(src).is_some(), "host source {src}");
         }
         assert_eq!(loss_source_name(0), None);
         assert_eq!(loss_source_name(16), None);
         assert_eq!(loss_source_name(100), None);
-        assert_eq!(loss_source_name(110), None);
+        assert_eq!(loss_source_name(111), None);
         assert_eq!(loss_source_name(u32::MAX), None);
     }
 }

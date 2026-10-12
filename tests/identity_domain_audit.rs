@@ -481,6 +481,15 @@ fn h5_t3_every_device_site_names_one_domain() {
             ".map(|m| (m.dev.clone(), m.ino, m.start, m.end, m.offset))",
             1,
         ),
+        // session.rs: M1 first-sighting fingerprint (maps, ×1 —
+        // same tuple shape as incarnation_of, compared only
+        // against incarnation_of output — single-domain).
+        (
+            "src/discovery/session.rs",
+            "maps",
+            "Some((m.dev.clone(), m.ino, m.start, m.end, m.offset))",
+            1,
+        ),
         (
             "src/discovery/session.rs",
             "maps",

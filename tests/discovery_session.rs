@@ -9,13 +9,14 @@
 //! (lane pending) and are covered by the C4 suite.
 
 use osslscope::discovery::coverage::{
-    HOST_DRAIN_SHORTFALL, HOST_EVICT_FAILED, HOST_ORPHAN_ROW, HOST_STRAGGLER, loss_source_name,
+    HOST_BASELINE_MISMATCH, HOST_DRAIN_SHORTFALL, HOST_EVICT_FAILED, HOST_ORPHAN_ROW,
+    HOST_STRAGGLER, loss_source_name,
 };
 use osslscope::discovery::legacy::{Probe, ProbeSet};
 use osslscope::discovery::maps::Mapping;
 use osslscope::discovery::session::{
-    AttachKind, DiscoverySnapshot, DispatchReinstall, MapSnapshots, PollBudget, Recycled,
-    SessionCore, SessionEnv,
+    AttachKind, DiscoveryDelta, DiscoverySnapshot, DispatchReinstall, MapSnapshots, PollBudget,
+    Recycled, SessionCore, SessionEnv,
 };
 use osslscope_ebpf_common as wire;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -1805,4 +1806,363 @@ fn trip_replacement_replans_through_pub_poll() {
         "replan must carry a continuity-loss signal: {:?}",
         delta.attaches
     );
+}
+
+// ---------------------------------------------------------------------------
+// M1: first-observation replacement (lazy baseline + drop-and-taint).
+// ---------------------------------------------------------------------------
+
+/// Provider mapping with a swapped file identity (same addresses —
+/// the replacement M1 must catch), siblings unchanged.
+fn replaced_provider_maps(ino: u64) -> Vec<Mapping> {
+    let (exe, dev, _) = provider_file();
+    let exe = exe.to_string_lossy().into_owned();
+    vec![
+        mapping(0x7f00_0000, 0x10000, true, 0, &dev, ino, &exe),
+        mapping(0x7f01_0000, 0x10000, true, 0, "08:01", 200, LIBCRYPTO),
+        mapping(0x7f02_0000, 0x10000, true, 0, "08:01", 300, LEGACY_SO),
+    ]
+}
+
+/// One array's full stamp-0 triple (query + algs + joining row).
+fn push_triple(env: &mut TestEnv, op: u32, arr: u64, imp: u64, idx: u64) {
+    env.push(query_ret(op, arr, 3));
+    for i in 0..4u64 {
+        env.push(ok_alg(op, arr, i));
+    }
+    env.push(dispatch_row(op, 3, imp, arr, idx));
+}
+
+/// Settle under A, replace with B at the same addresses, ingest A's
+/// stamp-0 triple: the M1-T1 flow later tests continue from.
+fn m1_after_t1() -> (TestEnv, SessionCore, DiscoveryDelta) {
+    let mut env = TestEnv::new();
+    let mut core = test_core(false);
+    core.poll(&mut env, ample_budget()).unwrap();
+    let (_, _, ino) = provider_file();
+    env.maps = replaced_provider_maps(ino + 1000);
+    push_triple(&mut env, OP_DIGEST, 0x7f00_1000, 0x7f00_2000, 3);
+    let delta = core.poll(&mut env, ample_budget()).unwrap();
+    (env, core, delta)
+}
+
+#[test]
+fn m1_replacement_before_ingest_drops_loud() {
+    // M1-T1: baseline A, replace with B, ingest A's stamp-0
+    // triple — all drop with one op-None mismatch loss; no epoch
+    // minted (no GEN install), no candidate.
+    let (env, core, d1) = m1_after_t1();
+    assert!(core.snapshot().candidates.is_empty());
+    assert!(
+        !env.gen_map.contains_key(&0x7f00_1000),
+        "mismatch must not install a generation: {:?}",
+        env.gen_map
+    );
+    let losses = losses_of(&core.snapshot());
+    assert_eq!(
+        losses.get(&HOST_BASELINE_MISMATCH).copied(),
+        Some(1),
+        "one mismatch loss per batch: {losses:?}"
+    );
+    // op-None: the mismatch taints globally (A7), localizing to no
+    // op — deep-queue joins afterwards stand on nothing.
+    assert!(
+        d1.losses
+            .iter()
+            .any(|l| l.source == HOST_BASELINE_MISMATCH && l.op.is_none()),
+        "mismatch must be op-None: {:?}",
+        d1.losses
+    );
+    // No orphan cascade: poisoned rows drop pre-orphan
+    // (incarnation-before-slot, like stragglers).
+    assert!(
+        !losses.contains_key(&HOST_ORPHAN_ROW),
+        "orphan would mislocalize the cause: {losses:?}"
+    );
+}
+
+#[test]
+fn m1_rebaseline_bootstraps_cleanly() {
+    // M1-T2: after the T1 mismatch, B's stamp-0 triple bootstraps
+    // with B's fingerprint — candidate binds, no further loss.
+    let (mut env, mut core, _) = m1_after_t1();
+    push_triple(&mut env, OP_DIGEST, 0x7f00_1000, 0x7f00_2000, 3);
+    let d2 = core.poll(&mut env, ample_budget()).unwrap();
+    assert_eq!(d2.candidates.len(), 1);
+    assert_eq!(env.gen_map.get(&0x7f00_1000).copied(), Some(1));
+    assert!(
+        d2.losses.iter().all(|l| l.source != HOST_BASELINE_MISMATCH),
+        "no further mismatch after re-baseline: {:?}",
+        d2.losses
+    );
+    let losses = losses_of(&core.snapshot());
+    assert_eq!(losses.get(&HOST_BASELINE_MISMATCH).copied(), Some(1));
+}
+
+#[test]
+fn m1_stable_array_bootstraps_first_try() {
+    // M1-T3 (no-regression): no replacement — today's path binds
+    // first try with zero loss.
+    let mut env = TestEnv::new();
+    let mut core = test_core(false);
+    core.poll(&mut env, ample_budget()).unwrap();
+    push_triple(&mut env, OP_DIGEST, 0x7f00_1000, 0x7f00_2000, 3);
+    let d1 = core.poll(&mut env, ample_budget()).unwrap();
+    assert_eq!(d1.candidates.len(), 1);
+    assert_eq!(env.gen_map.get(&0x7f00_1000).copied(), Some(1));
+    assert!(
+        d1.losses.is_empty(),
+        "stable bootstrap must be lossless: {:?}",
+        d1.losses
+    );
+}
+
+#[test]
+fn m1_deep_queue_joins_under_taint() {
+    // M1-T4 (R2 pin): A's same-key row arriving after the
+    // re-baseline joins B's epoch silently — sound via the T1
+    // op-None mismatch loss (global taint), which this pins.
+    let (mut env, mut core, _) = m1_after_t1();
+    push_triple(&mut env, OP_DIGEST, 0x7f00_1000, 0x7f00_2000, 3);
+    core.poll(&mut env, ample_budget()).unwrap();
+    env.push(dispatch_row(OP_DIGEST, 3, 0x7f00_2000, 0x7f00_1000, 3));
+    let d3 = core.poll(&mut env, ample_budget()).unwrap();
+    assert!(
+        d3.losses.is_empty(),
+        "R2 join is silent (taint contains it): {:?}",
+        d3.losses
+    );
+    assert!(
+        d3.candidates.is_empty(),
+        "no duplicate candidate on re-join"
+    );
+    assert_eq!(core.snapshot().candidates.len(), 1);
+    // Containment: the T1 mismatch loss is op-None (taints every
+    // op — no claim stands on the joined rows).
+    let losses = losses_of(&core.snapshot());
+    assert_eq!(losses.get(&HOST_BASELINE_MISMATCH).copied(), Some(1));
+    assert!(
+        !losses.contains_key(&HOST_STRAGGLER),
+        "R2 join is not a straggler: {losses:?}"
+    );
+}
+
+#[test]
+fn m1_subpoll_replace_documents_silent_join() {
+    // M1-T5 (R1 pin): appear+replace inside a single poll — first
+    // sighting already shows B, so the bootstrap is silent. A
+    // future mapping-lifetime fix flips this to loud.
+    let mut env = TestEnv::new();
+    let (_, _, ino) = provider_file();
+    env.maps = replaced_provider_maps(ino + 1000);
+    push_triple(&mut env, OP_DIGEST, 0x7f00_1000, 0x7f00_2000, 3);
+    let mut core = test_core(false);
+    let d1 = core.poll(&mut env, ample_budget()).unwrap();
+    assert_eq!(d1.candidates.len(), 1);
+    let losses = losses_of(&core.snapshot());
+    assert!(
+        !losses.contains_key(&HOST_BASELINE_MISMATCH),
+        "R1 residual: silent join: {losses:?}"
+    );
+}
+
+#[test]
+fn m1_late_sighted_turnover_caught() {
+    // M1-T6 (maps-scan leg): an array appearing after attach is
+    // baselined at its first maps-sighting, so a turnover between
+    // the sighting poll and the first-ingest poll still fires.
+    let mut env = TestEnv::new();
+    let mut core = test_core(false);
+    core.poll(&mut env, ample_budget()).unwrap();
+    // A new mapping appears (sighting poll — no events yet).
+    let mut maps = live_maps();
+    maps.push(mapping(
+        0x7f03_0000,
+        0x10000,
+        true,
+        0,
+        "08:01",
+        500,
+        "/p/extra.so",
+    ));
+    env.maps = maps;
+    core.poll(&mut env, ample_budget()).unwrap();
+    // Same range replaced before any event for its arrays.
+    let mut maps = live_maps();
+    maps.push(mapping(
+        0x7f03_0000,
+        0x10000,
+        true,
+        0,
+        "08:01",
+        501,
+        "/p/extra.so",
+    ));
+    env.maps = maps;
+    push_triple(&mut env, OP_DIGEST, 0x7f03_1000, 0x7f03_2000, 3);
+    let d = core.poll(&mut env, ample_budget()).unwrap();
+    assert!(d.candidates.is_empty());
+    let losses = losses_of(&core.snapshot());
+    assert_eq!(
+        losses.get(&HOST_BASELINE_MISMATCH).copied(),
+        Some(1),
+        "sight-poll baseline must catch ingest-poll turnover: {losses:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// M4: per-slot implementation-backing memory (backing-only replacement).
+// ---------------------------------------------------------------------------
+
+/// Array in the provider mapping, implementation in libcrypto: an
+/// impl-file swap leaves the array mapping (and its epoch)
+/// untouched — the backing-only shape M4 owns.
+const M4_ARR: u64 = 0x7f00_1000;
+const M4_IMP: u64 = 0x7f01_2000;
+
+/// Libcrypto mapping with a swapped file identity (same range —
+/// the impl-only replacement), siblings unchanged.
+fn replaced_libcrypto_maps(ino: u64) -> Vec<Mapping> {
+    let mut maps = live_maps();
+    maps[1] = mapping(0x7f01_0000, 0x10000, true, 0, "08:01", ino, LIBCRYPTO);
+    maps
+}
+
+/// Settle, then bind one candidate (array stable, impl in
+/// libcrypto): the M4 memory records its first backing here.
+fn m4_bound() -> (TestEnv, SessionCore) {
+    let mut env = TestEnv::new();
+    let mut core = test_core(false);
+    core.poll(&mut env, ample_budget()).unwrap();
+    push_triple(&mut env, OP_DIGEST, M4_ARR, M4_IMP, 3);
+    let d = core.poll(&mut env, ample_budget()).unwrap();
+    assert_eq!(d.candidates.len(), 1, "bind poll must bind");
+    assert!(d.losses.is_empty(), "bind must be lossless: {:?}", d.losses);
+    (env, core)
+}
+
+fn same_row() -> Vec<u8> {
+    dispatch_row(OP_DIGEST, 3, M4_IMP, M4_ARR, 3)
+}
+
+/// First candidate's attested backing inode (M4 tests bind exactly one).
+fn backing_ino(core: &SessionCore) -> u64 {
+    core.snapshot().candidates[0]
+        .backing
+        .clone()
+        .expect("backed candidate")
+        .ino
+}
+
+#[test]
+fn m4_impl_replace_drops_first_row_loud() {
+    // M4-T1: stable array, impl file replaced at the same vaddr —
+    // the old queued row drops with op-localized loss (no mixed
+    // backings: the candidate keeps the attested triple); the
+    // next row validates after the one loud drop.
+    let (mut env, mut core) = m4_bound();
+    env.maps = replaced_libcrypto_maps(201);
+    env.push(same_row());
+    let d2 = core.poll(&mut env, ample_budget()).unwrap();
+    let losses = losses_of(&core.snapshot());
+    assert_eq!(
+        losses.get(&HOST_STRAGGLER).copied(),
+        Some(1),
+        "stale-slot row must drop loud: {losses:?}"
+    );
+    assert!(
+        d2.losses
+            .iter()
+            .any(|l| l.source == HOST_STRAGGLER && l.op == Some(OP_DIGEST)),
+        "stale-slot loss is op-localized: {:?}",
+        d2.losses
+    );
+    assert!(d2.candidates.is_empty(), "no adopt on mismatch");
+    assert_eq!(
+        backing_ino(&core),
+        200,
+        "candidate keeps the attested backing"
+    );
+
+    // The next row matches the re-seated memory and flows (the
+    // refresh adopts the new backing on a live generation).
+    env.push(same_row());
+    let d3 = core.poll(&mut env, ample_budget()).unwrap();
+    assert!(
+        d3.losses.is_empty(),
+        "one loud drop per slot per replacement: {:?}",
+        d3.losses
+    );
+    assert_eq!(d3.candidates.len(), 1, "refresh re-emits adopted backing");
+    assert_eq!(
+        backing_ino(&core),
+        201,
+        "new backing adopted after the loud drop"
+    );
+}
+
+#[test]
+fn m4_duplicate_refresh_compares_before_adopting() {
+    // M4-T2 (refresh vector): a duplicate key with a changed
+    // backing triple drops with loss instead of refreshing — the
+    // memory compares BEFORE the refresh arm adopts.
+    let (mut env, mut core) = m4_bound();
+    env.maps = replaced_libcrypto_maps(201);
+    env.push(same_row());
+    let d2 = core.poll(&mut env, ample_budget()).unwrap();
+    assert!(
+        d2.candidates.is_empty(),
+        "mismatched duplicate must not refresh: {:?}",
+        d2.candidates
+    );
+    let losses = losses_of(&core.snapshot());
+    assert_eq!(losses.get(&HOST_STRAGGLER).copied(), Some(1));
+    assert_eq!(
+        backing_ino(&core),
+        200,
+        "attested triple survives the mismatch"
+    );
+}
+
+#[test]
+fn m4_array_turnover_clears_slot_memory() {
+    // M4-T3: array rebirth clears the array's slot memories —
+    // post-rebirth rows with a new backing validate without
+    // stale loss (no false stale after array turnover).
+    let (mut env, mut core) = m4_bound();
+    let (_, _, ino) = provider_file();
+    // Array mapping turns over (retire + rebirth to gen 2) AND
+    // the impl file is replaced (new backing triple).
+    let mut maps = replaced_provider_maps(ino + 1000);
+    maps[1] = mapping(0x7f01_0000, 0x10000, true, 0, "08:01", 201, LIBCRYPTO);
+    env.maps = maps;
+    for i in 0..4u64 {
+        env.push(ok_alg_gen(OP_DIGEST, M4_ARR, i, 2));
+    }
+    env.push(dispatch_row_gen(OP_DIGEST, 3, M4_IMP, M4_ARR, 3, 2));
+    let d2 = core.poll(&mut env, ample_budget()).unwrap();
+    assert_eq!(env.gen_map.get(&M4_ARR).copied(), Some(2), "rebirth bumps");
+    let losses = losses_of(&core.snapshot());
+    assert!(
+        !losses.contains_key(&HOST_STRAGGLER),
+        "cleared memory must not go stale: {losses:?}"
+    );
+    assert_eq!(d2.candidates.len(), 1, "re-pointed candidate re-emits");
+    assert_eq!(backing_ino(&core), 201);
+}
+
+#[test]
+fn m4_stable_rewalks_match_silently() {
+    // M4-T4 (no-regression): first sighting records the triple
+    // silently; steady-state re-walks match silently (zero loss
+    // on stable legs).
+    let (mut env, mut core) = m4_bound();
+    env.push(same_row());
+    let d2 = core.poll(&mut env, ample_budget()).unwrap();
+    assert!(
+        d2.losses.is_empty(),
+        "stable re-walk must be lossless: {:?}",
+        d2.losses
+    );
+    assert_eq!(core.snapshot().candidates.len(), 1);
 }
