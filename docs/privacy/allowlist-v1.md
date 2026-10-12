@@ -31,7 +31,11 @@ Maps: `COUNTS`, `GEN`, `TARGET`, `DROPFAIL` (see §4).
 
 There are exactly eleven target-memory reads. Only two move bytes, and
 both land in kernel stack scratch that is classified in-kernel and
-never emitted; the rest move fixed scalars.
+never emitted; the rest move fixed scalars. Chain-hop bodies (the
+`def_hop!` arms, P5a-C2/C5) textually duplicate the entry slot sites
+(verdict, names, impl, tail, name string) with identical classes,
+bounds, and failure semantics — the pin counts textual sites, so it
+runs ahead of this logical table without widening the surface.
 
 | site | read | bound | purpose | failure |
 |---|---|---|---|---|
