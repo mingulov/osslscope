@@ -312,6 +312,11 @@ pub struct PreparedProg {
     pub is_return: bool,
     pub insns: Vec<u8>,
     pub map_fixups: Vec<MapFixup>,
+    /// Linked subprograms in insn order (main first): the BTF
+    /// synthesis input. Callbacks (function-pointer targets) are
+    /// flagged — only progs with a callback take the BTF path in
+    /// `load()`; every other prog loads exactly as before.
+    pub subprogs: Vec<SubprogInfo>,
 }
 
 /// Pure preparation output (no fds — safe unprivileged).
@@ -435,6 +440,14 @@ const BPF_CALL: u8 = 0x85;
 /// `call` src reg marking a subprogram (pseudo) call, as opposed to
 /// a helper call (`src == 0`, imm = helper id).
 const BPF_PSEUDO_CALL: u8 = 1;
+/// `ld_imm64` opcode: function-pointer sites (address-taken
+/// callbacks for helpers like `bpf_loop`) are 16-byte insns carrying
+/// an `R_BPF_64_64` reloc against a `.text` FUNC sym.
+const BPF_LD_IMM64: u8 = 0x18;
+/// `ld_imm64` src reg marking a relocated function address (the
+/// kernel resolves the relative imm to a subprogram — the aya-obj
+/// rule: same `target - pc - 1` encoding as a static call).
+const BPF_PSEUDO_FUNC: u8 = 4;
 
 /// Resolve an `R_BPF_64_32` call reloc to a `.text` function name.
 /// Named FUNC syms resolve by (value, name); STT_SECTION syms (the
@@ -507,6 +520,64 @@ fn apply_call(
     Ok(())
 }
 
+/// Resolve an `R_BPF_64_64` function-pointer reloc to a `.text`
+/// function name. The site must be an unrelocated `ld_imm64` (src 0,
+/// zero imm64 — anything else is an already-relocated or corrupt
+/// object); the symbol must be a named global FUNC in `.text` (what
+/// the toolchain emits for address-taken callbacks). The target MUST
+/// be a `.text` entry: mid-function landings are drift, never a
+/// guess.
+fn func_ptr_target(
+    syms: &[Sym],
+    text_fns: &[(usize, usize, String)],
+    text_idx: usize,
+    site_sec: &[u8],
+    r: &Reloc,
+    prog: &str,
+) -> anyhow::Result<String> {
+    let rsym = syms
+        .get(r.sym)
+        .ok_or_else(|| anyhow::anyhow!("prog {prog}: bad reloc sym"))?;
+    let site = site_sec
+        .get(r.off..r.off + 16)
+        .ok_or_else(|| anyhow::anyhow!("prog {prog}: func reloc out of range"))?;
+    if site[0] != BPF_LD_IMM64 || site[1] >> 4 != 0 {
+        anyhow::bail!("prog {prog}: func reloc vs non-ld_imm64 site");
+    }
+    if site[4..16] != [0u8; 12] {
+        anyhow::bail!("prog {prog}: func reloc vs relocated site");
+    }
+    if !rsym.is_func || rsym.shndx != text_idx {
+        anyhow::bail!("prog {prog}: func reloc vs non-entry {}", rsym.name);
+    }
+    text_fns
+        .iter()
+        .find(|(v, _, n)| *v == rsym.value && *n == rsym.name)
+        .map(|(_, _, n)| n.clone())
+        .ok_or_else(|| anyhow::anyhow!("prog {prog}: func reloc vs non-entry {}", rsym.name))
+}
+
+/// Rewrite one function-pointer site: the `imm` takes the same
+/// relative encoding as a static call (`target - pc - 1`, in insns),
+/// and the src nibble takes `BPF_PSEUDO_FUNC` (the dst reg is
+/// preserved). The high half stays zero (asserted at resolve time).
+fn apply_func_ptr(
+    insns: &mut [u8],
+    rel_off: usize,
+    target_off: usize,
+    prog: &str,
+) -> anyhow::Result<()> {
+    apply_call(insns, rel_off, target_off, prog)?;
+    let insn = insns
+        .get_mut(rel_off..rel_off + 8)
+        .ok_or_else(|| anyhow::anyhow!("{prog}: func reloc out of range"))?;
+    if insn[0] != BPF_LD_IMM64 || insn[1] >> 4 != 0 {
+        anyhow::bail!("{prog}: func site not an unrelocated ld_imm64");
+    }
+    insn[1] = (insn[1] & 0x0f) | (BPF_PSEUDO_FUNC << 4);
+    Ok(())
+}
+
 /// Reject a linked image containing a subprogram call that was not
 /// rewritten from a relocation (F-BPF-1 hardening).
 ///
@@ -536,6 +607,148 @@ fn check_calls_rewritten(
         }
     }
     Ok(())
+}
+
+/// Reject a linked image containing a function pointer that was not
+/// rewritten from a relocation (same hazard as
+/// [`check_calls_rewritten`]): a pre-resolved `ld_imm64` with
+/// `BPF_PSEUDO_FUNC` src but no reloc would silently point at a
+/// stale offset after reachable-subset linking. The scan steps over
+/// each `ld_imm64`'s second slot (its bytes are not opcodes);
+/// map sites (src 0, rewritten later by `load()`) are ignored here.
+fn check_func_ptrs_rewritten(
+    insns: &[u8],
+    rewritten: &HashSet<usize>,
+    prog: &str,
+) -> anyhow::Result<()> {
+    if insns.len() % 8 != 0 {
+        anyhow::bail!("{prog}: linked insns not a whole count");
+    }
+    let mut i = 0usize;
+    while i * 8 < insns.len() {
+        let insn = &insns[i * 8..i * 8 + 8];
+        if insn[0] == BPF_LD_IMM64 {
+            if insn[1] >> 4 == BPF_PSEUDO_FUNC && !rewritten.contains(&(i * 8)) {
+                anyhow::bail!(
+                    "{prog}: unrelocated function pointer at insn {i} \
+                     (callee must be global)"
+                );
+            }
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
+/// One linked subprogram for BTF synthesis: the main entry (insn 0)
+/// plus every included `.text` function in linked order. Callbacks
+/// (function-pointer targets for helpers like `bpf_loop`) need the
+/// callback proto; plain static callees take the void placeholder
+/// (the verifier never signature-checks static calls).
+pub struct SubprogInfo {
+    pub name: String,
+    pub insn_off: u32,
+    pub is_callback: bool,
+}
+
+/// Synthesized BTF bytes plus the func_info table (`(insn_off,
+/// type_id)` pairs in subprogram order).
+pub type SynthBtf = (Vec<u8>, Vec<(u32, u32)>);
+
+/// Synthesize minimal BTF + func_info for one linked image (P5b-D).
+/// The toolchain emits no `.BTF` (the frozen object ban stays), so
+/// helper-callback shapes (`bpf_loop`) get loader-built metadata:
+/// a fixed type prefix (u64/u32 ints, a data pointer, main/callback/
+/// static protos) plus one FUNC per subprog, and a func_info table
+/// mapping each subprogram's insn offset to its FUNC id. Pure bytes;
+/// the kernel re-validates everything at `BPF_BTF_LOAD`/`prog_load`
+/// (fail-closed, loud). Fails closed on any malformed table.
+pub fn synth_btf(subprogs: &[SubprogInfo]) -> anyhow::Result<SynthBtf> {
+    if subprogs.is_empty() {
+        anyhow::bail!("synth_btf: no subprograms");
+    }
+    if subprogs.len() > 256 {
+        anyhow::bail!("synth_btf: too many subprograms ({})", subprogs.len());
+    }
+    if subprogs[0].insn_off != 0 {
+        anyhow::bail!("synth_btf: main at 0, got {}", subprogs[0].insn_off);
+    }
+    for w in subprogs.windows(2) {
+        if w[1].insn_off <= w[0].insn_off {
+            anyhow::bail!("synth_btf: offsets not increasing");
+        }
+    }
+    for s in subprogs {
+        if s.name.is_empty() {
+            anyhow::bail!("synth_btf: empty name");
+        }
+        if s.name.bytes().any(|b| b == 0) {
+            anyhow::bail!("synth_btf: NUL in name");
+        }
+    }
+    // String section: leading empty + fixed literals + names.
+    let mut strs: Vec<u8> = vec![0];
+    let mut off_of: Vec<u32> = Vec::with_capacity(subprogs.len() + 6);
+    for lit in ["__u64", "__u32", "ctx", "pad", "arg0", "index", "cctx"] {
+        off_of.push(strs.len() as u32);
+        strs.extend_from_slice(lit.as_bytes());
+        strs.push(0);
+    }
+    for s in subprogs {
+        off_of.push(strs.len() as u32);
+        strs.extend_from_slice(s.name.as_bytes());
+        strs.push(0);
+    }
+    // Type section. Kinds per uapi/linux/btf.h: INT=1, PTR=2,
+    // STRUCT=4, FUNC=12, FUNC_PROTO=13. The ctx arg is PTR to a
+    // DEFINED struct with named params (the kernel rejects looser
+    // shapes here: measured `Invalid arg#1` for PTR-to-scalar and
+    // PTR-to-FWD with anonymous params on 7.0).
+    let mut types: Vec<u8> = Vec::new();
+    let mut rec = |name: u32, kind: u32, vlen: u32, size_or_type: u32, payload: &[u32]| {
+        types.extend_from_slice(&name.to_le_bytes());
+        types.extend_from_slice(&((kind << 24) | vlen).to_le_bytes());
+        types.extend_from_slice(&size_or_type.to_le_bytes());
+        for w in payload {
+            types.extend_from_slice(&w.to_le_bytes());
+        }
+    };
+    rec(off_of[0], 1, 0, 8, &[64]); // 1: INT __u64
+    rec(off_of[1], 1, 0, 4, &[32]); // 2: INT __u32
+    rec(off_of[2], 4, 1, 8, &[off_of[3], 1, 0]); // 3: STRUCT ctx { u64 pad; }
+    rec(0, 2, 0, 3, &[]); // 4: PTR to ctx
+    rec(0, 13, 1, 2, &[off_of[4], 4]); // 5: main proto u32 <- (ctx *arg0)
+    rec(0, 13, 2, 1, &[off_of[5], 1, off_of[6], 1]); // 6: cb proto u64 <- (u64, u64)
+    rec(0, 13, 0, 0, &[]); // 7: static proto void <- ()
+    let mut info: Vec<(u32, u32)> = Vec::with_capacity(subprogs.len());
+    for (i, s) in subprogs.iter().enumerate() {
+        let proto = if i == 0 {
+            5
+        } else if s.is_callback {
+            6
+        } else {
+            7
+        };
+        let id = 8 + i as u32;
+        rec(off_of[7 + i], 12, 0, proto, &[]);
+        info.push((s.insn_off, id));
+    }
+    // Header: magic, version, flags, hdr_len, type_off, type_len,
+    // str_off, str_len.
+    let mut btf: Vec<u8> = Vec::with_capacity(24 + types.len() + strs.len());
+    btf.extend_from_slice(&0xEB9Fu16.to_le_bytes());
+    btf.push(1);
+    btf.push(0);
+    btf.extend_from_slice(&24u32.to_le_bytes());
+    btf.extend_from_slice(&0u32.to_le_bytes());
+    btf.extend_from_slice(&(types.len() as u32).to_le_bytes());
+    btf.extend_from_slice(&(types.len() as u32).to_le_bytes());
+    btf.extend_from_slice(&(strs.len() as u32).to_le_bytes());
+    btf.extend_from_slice(&types);
+    btf.extend_from_slice(&strs);
+    Ok((btf, info))
 }
 
 /// Pure preparation: parse, assert shape, relocate (map fds stay
@@ -675,8 +888,10 @@ pub fn prepare(obj: &[u8], maps: &[MapSpec], progs: &[ProgSpec]) -> anyhow::Resu
             .get(sym.value..sym.value + sym.size)
             .ok_or_else(|| anyhow::anyhow!("prog {} out of range", p.name))?;
         let mut fixups = Vec::new();
-        // Main's owned relocs: map sites recorded, call targets rooted.
+        // Main's owned relocs: map sites recorded, call and
+        // function-pointer targets rooted.
         let mut roots: Vec<(usize, String)> = Vec::new(); // (local off, fn)
+        let mut func_roots: Vec<(usize, String)> = Vec::new(); // (local off, fn)
         for r in relocs.get(p.section).map(Vec::as_slice).unwrap_or(&[]) {
             let owner = funcs
                 .get(p.section)
@@ -693,13 +908,21 @@ pub fn prepare(obj: &[u8], maps: &[MapSpec], progs: &[ProgSpec]) -> anyhow::Resu
             let local = r.off - sym.value;
             match r.typ {
                 R_BPF_64_64 => {
-                    if !(rsym.is_obj && maps.iter().any(|m| m.name == rsym.name)) {
-                        anyhow::bail!("prog {}: map reloc vs {}", p.name, rsym.name);
+                    if rsym.is_func {
+                        let tidx = text_idx.ok_or_else(|| {
+                            anyhow::anyhow!("prog {}: func reloc but no .text", p.name)
+                        })?;
+                        let target = func_ptr_target(&syms, &text_fns, tidx, sec, r, p.name)?;
+                        func_roots.push((local, target));
+                    } else {
+                        if !(rsym.is_obj && maps.iter().any(|m| m.name == rsym.name)) {
+                            anyhow::bail!("prog {}: map reloc vs {}", p.name, rsym.name);
+                        }
+                        fixups.push(MapFixup {
+                            insn_off: local,
+                            map: rsym.name.clone(),
+                        });
                     }
-                    fixups.push(MapFixup {
-                        insn_off: local,
-                        map: rsym.name.clone(),
-                    });
                 }
                 R_BPF_64_32 => {
                     let tidx = text_idx.ok_or_else(|| {
@@ -711,11 +934,16 @@ pub fn prepare(obj: &[u8], maps: &[MapSpec], progs: &[ProgSpec]) -> anyhow::Resu
                 t => anyhow::bail!("prog {}: reloc type {t} unsupported", p.name),
             }
         }
-        // Reachable closure over `.text` call relocs (transitive).
-        // Only reachable subprograms are linked: the verifier rejects
-        // unreachable trailing insns, so blind `.text` appends fail.
+        // Reachable closure over `.text` call and function-pointer
+        // relocs (transitive). Only reachable subprograms are linked:
+        // the verifier rejects unreachable trailing insns, so blind
+        // `.text` appends fail.
         let mut included: Vec<String> = Vec::new();
-        let mut work: Vec<String> = roots.iter().map(|(_, n)| n.clone()).collect();
+        let mut work: Vec<String> = roots
+            .iter()
+            .chain(func_roots.iter())
+            .map(|(_, n)| n.clone())
+            .collect();
         while let Some(next) = work.pop() {
             if included.contains(&next) {
                 continue;
@@ -726,11 +954,24 @@ pub fn prepare(obj: &[u8], maps: &[MapSpec], progs: &[ProgSpec]) -> anyhow::Resu
                 .find(|(_, _, n)| *n == next)
                 .ok_or_else(|| anyhow::anyhow!("prog {}: call vs unknown {next}", p.name))?;
             for r in relocs.get(".text").map(Vec::as_slice).unwrap_or(&[]) {
-                if *f0 <= r.off && r.off < *f1 && r.typ == R_BPF_64_32 {
-                    let tidx = text_idx.ok_or_else(|| {
-                        anyhow::anyhow!("prog {}: call reloc but no .text", p.name)
-                    })?;
-                    work.push(call_target(&syms, &text_fns, tidx, text, r, p.name)?);
+                if *f0 <= r.off && r.off < *f1 {
+                    if r.typ == R_BPF_64_32 {
+                        let tidx = text_idx.ok_or_else(|| {
+                            anyhow::anyhow!("prog {}: call reloc but no .text", p.name)
+                        })?;
+                        work.push(call_target(&syms, &text_fns, tidx, text, r, p.name)?);
+                    } else if r.typ == R_BPF_64_64 {
+                        let rsym = syms.get(r.sym).ok_or_else(|| {
+                            anyhow::anyhow!("prog {}: bad text reloc sym", p.name)
+                        })?;
+                        if rsym.is_func {
+                            let tidx = text_idx.ok_or_else(|| {
+                                anyhow::anyhow!("prog {}: func reloc but no .text", p.name)
+                            })?;
+                            work.push(func_ptr_target(&syms, &text_fns, tidx, text, r, p.name)?);
+                        }
+                        // Map relocs pull no code.
+                    }
                 }
             }
         }
@@ -746,10 +987,11 @@ pub fn prepare(obj: &[u8], maps: &[MapSpec], progs: &[ProgSpec]) -> anyhow::Resu
             base.insert(name.clone(), insns.len());
             insns.extend_from_slice(bytes);
         }
-        // Apply calls (main + included) and included map sites.
-        // Every rewritten call site is recorded: the linked image
-        // must contain no other pseudo-call (see
-        // `check_calls_rewritten`).
+        // Apply calls and function pointers (main + included)
+        // and included map sites. Every rewritten call/func site is
+        // recorded: the linked image must contain no other
+        // pseudo-call or pseudo-func (see `check_calls_rewritten`
+        // and `check_func_ptrs_rewritten`).
         let mut rewritten: HashSet<usize> = HashSet::new();
         for (local, target) in &roots {
             let t = base
@@ -757,6 +999,15 @@ pub fn prepare(obj: &[u8], maps: &[MapSpec], progs: &[ProgSpec]) -> anyhow::Resu
                 .ok_or_else(|| anyhow::anyhow!("prog {}: call vs unlinked {target}", p.name))?;
             apply_call(&mut insns, *local, *t, p.name)?;
             rewritten.insert(*local);
+        }
+        let mut callbacks: HashSet<String> = HashSet::new();
+        for (local, target) in &func_roots {
+            let t = base
+                .get(target)
+                .ok_or_else(|| anyhow::anyhow!("prog {}: func vs unlinked {target}", p.name))?;
+            apply_func_ptr(&mut insns, *local, *t, p.name)?;
+            rewritten.insert(*local);
+            callbacks.insert(target.clone());
         }
         for r in relocs.get(".text").map(Vec::as_slice).unwrap_or(&[]) {
             let Some(owner) = text_owner(r.off) else {
@@ -770,6 +1021,29 @@ pub fn prepare(obj: &[u8], maps: &[MapSpec], progs: &[ProgSpec]) -> anyhow::Resu
                 .ok_or_else(|| anyhow::anyhow!("prog {}: bad text reloc sym", p.name))?;
             match r.typ {
                 R_BPF_64_64 => {
+                    if rsym.is_func {
+                        let tidx = text_idx.ok_or_else(|| {
+                            anyhow::anyhow!("prog {}: func reloc but no .text", p.name)
+                        })?;
+                        let target = func_ptr_target(&syms, &text_fns, tidx, text, r, p.name)?;
+                        if !included.contains(&target) {
+                            anyhow::bail!("prog {}: func vs excluded {}", p.name, target);
+                        }
+                        let t = base.get(&target).ok_or_else(|| {
+                            anyhow::anyhow!("prog {}: func vs unlinked {}", p.name, target)
+                        })?;
+                        let site = obase
+                            + (r.off
+                                - text_fns
+                                    .iter()
+                                    .find(|(_, _, n)| n == &owner)
+                                    .map(|(v, _, _)| *v)
+                                    .unwrap());
+                        apply_func_ptr(&mut insns, site, *t, p.name)?;
+                        rewritten.insert(site);
+                        callbacks.insert(target.clone());
+                        continue;
+                    }
                     if !(rsym.is_obj && maps.iter().any(|m| m.name == rsym.name)) {
                         anyhow::bail!("prog {}: text map reloc vs {}", p.name, rsym.name);
                     }
@@ -810,11 +1084,29 @@ pub fn prepare(obj: &[u8], maps: &[MapSpec], progs: &[ProgSpec]) -> anyhow::Resu
             }
         }
         check_calls_rewritten(&insns, &rewritten, p.name)?;
+        check_func_ptrs_rewritten(&insns, &rewritten, p.name)?;
+        let mut subprogs = Vec::with_capacity(included.len() + 1);
+        subprogs.push(SubprogInfo {
+            name: p.name.to_string(),
+            insn_off: 0,
+            is_callback: false,
+        });
+        for name in &included {
+            // Invariant: the layout loop above entered every included
+            // name (same vec, same order).
+            let off = base.get(name).copied().unwrap() / 8;
+            subprogs.push(SubprogInfo {
+                name: name.clone(),
+                insn_off: off as u32,
+                is_callback: callbacks.contains(name),
+            });
+        }
         out.push(PreparedProg {
             name: p.name.to_string(),
             is_return,
             insns,
             map_fixups: fixups,
+            subprogs,
         });
     }
     Ok(Prepared {
@@ -861,6 +1153,37 @@ pub fn load(prep: &Prepared) -> anyhow::Result<Loaded> {
             insn[4..8].copy_from_slice(&(fd.as_raw_fd() as u32).to_le_bytes());
         }
         let license = c"GPL";
+        // Callback shapes only: synthesize BTF + func_info and load
+        // it (the kernel needs the callback's FUNC_PROTO — without
+        // it `bpf_loop` fails `missing btf func_info`). Every other
+        // prog loads BTF-less exactly as before. The BTF fd outlives
+        // both load attempts (drop closes it; loaded progs hold
+        // their own refs).
+        let mut btf_fd: Option<std::os::fd::OwnedFd> = None;
+        let mut func_info_bytes: Vec<u8> = Vec::new();
+        if p.subprogs.iter().any(|s| s.is_callback) {
+            let (btf, info) =
+                synth_btf(&p.subprogs).with_context(|| format!("synth_btf {}", p.name))?;
+            for (off, id) in &info {
+                func_info_bytes.extend_from_slice(&off.to_le_bytes());
+                func_info_bytes.extend_from_slice(&id.to_le_bytes());
+            }
+            let mut btf_log = vec![0u8; 1 << 16];
+            let fd = ossl_bpf_sys::btf_load(&btf, &mut btf_log).map_err(|e| {
+                let detail = String::from_utf8_lossy(trim_nul(&btf_log))
+                    .chars()
+                    .take(1000)
+                    .collect::<String>();
+                anyhow::anyhow!("btf_load {}: {e}\n{detail}", p.name)
+            })?;
+            btf_fd = Some(fd);
+        }
+        let prog_btf = |fd: &Option<std::os::fd::OwnedFd>| -> Option<ossl_bpf_sys::ProgBtf<'_>> {
+            fd.as_ref().map(|f| ossl_bpf_sys::ProgBtf {
+                btf_fd: std::os::fd::AsRawFd::as_raw_fd(f),
+                func_info: &func_info_bytes,
+            })
+        };
         // Quiet load first: success needs no diagnostics, and a
         // large-but-valid verification can overflow a fixed log
         // buffer (`ENOSPC`) even when the program verifies. On
@@ -868,11 +1191,24 @@ pub fn load(prep: &Prepared) -> anyhow::Result<Loaded> {
         // verifier's report (a 4 MiB buffer: failure explorations
         // run to ~0.9 MiB, and an overflowed buffer would eat the
         // very diagnostics the retry exists for).
-        let fd = match ossl_bpf_sys::prog_load_kprobe_quiet(&insns, license, None, &p.name) {
+        let fd = match ossl_bpf_sys::prog_load_kprobe_quiet(
+            &insns,
+            license,
+            None,
+            &p.name,
+            prog_btf(&btf_fd),
+        ) {
             Ok(fd) => fd,
             Err(_) => {
                 let mut log = vec![0u8; 4 << 20];
-                match ossl_bpf_sys::prog_load_kprobe(&insns, license, None, &mut log, &p.name) {
+                match ossl_bpf_sys::prog_load_kprobe(
+                    &insns,
+                    license,
+                    None,
+                    &mut log,
+                    &p.name,
+                    prog_btf(&btf_fd),
+                ) {
                     Ok(fd) => fd,
                     Err(e) => {
                         let full = trim_nul(&log);
@@ -1140,6 +1476,115 @@ mod tests {
     }
 
     #[test]
+    fn prepare_rewrites_func_pointers_pseudo() {
+        // The uprobe call site @16 becomes an ld_imm64 of the sub's
+        // address (the `bpf_loop` callback shape): the linked site
+        // takes the relative imm plus the PSEUDO_FUNC src nibble.
+        let mut obj = min_elf();
+        obj[64 + 16..64 + 32]
+            .copy_from_slice(&[0x18, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        obj[172..180].copy_from_slice(&u64(2 << 32 | 1));
+        let prep = prepare(
+            &obj,
+            &[MapSpec {
+                name: "MYMAP",
+                map_type: 2,
+                key_size: 4,
+                value_size: 8,
+                max_entries: 1,
+                flags: 0,
+            }],
+            &[ProgSpec {
+                name: "uprobe_func",
+                section: "uprobe",
+            }],
+        )
+        .unwrap();
+        let p = &prep.progs[0];
+        assert_eq!(p.insns.len(), 56);
+        // Dst reg preserved, src nibble PSEUDO_FUNC, imm = 4-2-1 = 1.
+        assert_eq!(p.insns[17], 0x02 | (BPF_PSEUDO_FUNC << 4));
+        assert_eq!(&p.insns[20..24], &1i32.to_le_bytes());
+        // High half untouched.
+        assert_eq!(&p.insns[24..32], &[0u8; 8]);
+    }
+
+    #[test]
+    fn prepare_rejects_bad_func_pointers() {
+        let spec = || {
+            (
+                vec![MapSpec {
+                    name: "MYMAP",
+                    map_type: 2,
+                    key_size: 4,
+                    value_size: 8,
+                    max_entries: 1,
+                    flags: 0,
+                }],
+                vec![ProgSpec {
+                    name: "uprobe_func",
+                    section: "uprobe",
+                }],
+            )
+        };
+        // Func reloc against a non-.text FUNC (the prog itself).
+        let mut obj = min_elf();
+        obj[64 + 16..64 + 32]
+            .copy_from_slice(&[0x18, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        obj[172..180].copy_from_slice(&u64(1 << 32 | 1));
+        let (maps, progs) = spec();
+        let e = prepare(&obj, &maps, &progs).err().expect("must fail");
+        assert!(e.to_string().contains("non-entry"), "{e:#}");
+        // Func reloc against a non-ld_imm64 site (the call shape).
+        let mut obj = min_elf();
+        obj[172..180].copy_from_slice(&u64(2 << 32 | 1));
+        let (maps, progs) = spec();
+        let e = prepare(&obj, &maps, &progs).err().expect("must fail");
+        assert!(e.to_string().contains("non-ld_imm64"), "{e:#}");
+        // Func reloc against an already-relocated site (nonzero imm).
+        let mut obj = min_elf();
+        obj[64 + 16..64 + 32]
+            .copy_from_slice(&[0x18, 0x02, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        obj[172..180].copy_from_slice(&u64(2 << 32 | 1));
+        let (maps, progs) = spec();
+        let e = prepare(&obj, &maps, &progs).err().expect("must fail");
+        assert!(e.to_string().contains("relocated site"), "{e:#}");
+    }
+
+    #[test]
+    fn stale_func_pointers_fail_closed() {
+        let exit = [0x95u8, 0, 0, 0, 0, 0, 0, 0];
+        let zeros = [0u8; 8];
+        // A PSEUDO_FUNC site without a rewrite record fails, naming
+        // the insn; map sites (src 0) are ignored here.
+        let mut bad = Vec::new();
+        bad.extend_from_slice(&[0x18, 0x02 | (BPF_PSEUDO_FUNC << 4), 0, 0, 1, 0, 0, 0]);
+        bad.extend_from_slice(&zeros);
+        bad.extend_from_slice(&exit);
+        let e = check_func_ptrs_rewritten(&bad, &HashSet::new(), "p").unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("unrelocated function pointer at insn 0"),
+            "{e:#}"
+        );
+        let mut ok = Vec::new();
+        ok.extend_from_slice(&[0x18, 0x02 | (BPF_PSEUDO_FUNC << 4), 0, 0, 1, 0, 0, 0]);
+        ok.extend_from_slice(&zeros);
+        ok.extend_from_slice(&exit);
+        check_func_ptrs_rewritten(&ok, &[0usize].into_iter().collect(), "p").unwrap();
+        // The second slot's bytes are not opcodes: 0x85 there must
+        // not scan as a call (and 0x18 there must not recurse).
+        let mut second = Vec::new();
+        second.extend_from_slice(&[0x18, 0x01, 0, 0, 0, 0, 0, 0]);
+        second.extend_from_slice(&[0x85, 0x10, 0, 0, 0, 0, 0, 0]);
+        second.extend_from_slice(&exit);
+        check_func_ptrs_rewritten(&second, &HashSet::new(), "p").unwrap();
+        // Ragged images fail rather than scan short.
+        let e = check_func_ptrs_rewritten(&[0u8; 7], &HashSet::new(), "p").unwrap_err();
+        assert!(e.to_string().contains("not a whole count"), "{e:#}");
+    }
+
+    #[test]
     fn prepare_rejects_dim_mismatch_and_missing_syms() {
         let obj = min_elf();
         let r = prepare(
@@ -1174,6 +1619,268 @@ mod tests {
             }],
         );
         assert!(r.is_err());
+    }
+
+    /// Minimal BTF walker for synthesis tests: parses the header,
+    /// walks the type section by (kind, vlen), splits the string
+    /// section. Returns (types, strings) where each type is
+    /// (kind, name, size_or_type, payload words).
+    fn walk_btf(btf: &[u8]) -> (Vec<(u32, u32, u32, Vec<u32>)>, Vec<Vec<u8>>) {
+        assert!(btf.len() >= 24, "btf shorter than header");
+        let u16le = |o: usize| u16::from_le_bytes([btf[o], btf[o + 1]]) as u32;
+        let u32le = |o: usize| u32::from_le_bytes([btf[o], btf[o + 1], btf[o + 2], btf[o + 3]]);
+        assert_eq!(u16le(0), 0xEB9F, "bad magic");
+        assert_eq!(btf[2], 1, "bad version");
+        // Header layout: magic(0:2) version(2) flags(3) hdr_len(4:8)
+        // type_off(8:12) type_len(12:16) str_off(16:20) str_len(20:24).
+        let hdr_len = u32le(4) as usize;
+        let type_off = hdr_len + u32le(8) as usize;
+        let type_len = u32le(12) as usize;
+        let str_off = hdr_len + u32le(16) as usize;
+        let str_len = u32le(20) as usize;
+        assert!(type_off + type_len <= btf.len(), "type section overrun");
+        assert!(str_off + str_len <= btf.len(), "string section overrun");
+        let mut types = Vec::new();
+        let mut o = type_off;
+        while o < type_off + type_len {
+            let name = u32le(o);
+            let info = u32le(o + 4);
+            let kind = (info >> 24) & 0x1f;
+            let vlen = (info & 0xffff) as usize;
+            let size_or_type = u32le(o + 8);
+            o += 12;
+            let words = match kind {
+                1 => {
+                    // INT: one data word.
+                    let w = vec![u32le(o)];
+                    o += 4;
+                    w
+                }
+                2 => {
+                    // PTR: no payload.
+                    assert_eq!(vlen, 0, "ptr with vlen");
+                    Vec::new()
+                }
+                4 => {
+                    // STRUCT members: vlen triples.
+                    let mut w = Vec::new();
+                    for _ in 0..vlen {
+                        w.push(u32le(o));
+                        w.push(u32le(o + 4));
+                        w.push(u32le(o + 8));
+                        o += 12;
+                    }
+                    w
+                }
+                12 | 13 => {
+                    // FUNC (vlen 0) / FUNC_PROTO params: vlen pairs.
+                    let mut w = Vec::new();
+                    for _ in 0..vlen {
+                        w.push(u32le(o));
+                        w.push(u32le(o + 4));
+                        o += 8;
+                    }
+                    w
+                }
+                _ => panic!("unexpected kind {kind} in synthesized btf"),
+            };
+            types.push((kind, name, size_or_type, words));
+        }
+        let strings: Vec<Vec<u8>> = btf[str_off..str_off + str_len]
+            .split(|b| *b == 0)
+            .map(|s| s.to_vec())
+            .collect();
+        (types, strings)
+    }
+
+    #[test]
+    fn synth_btf_callback_shape_layout() {
+        // main @0 + one callback @24: fixed type prefix (INT u64,
+        // INT u32, STRUCT ctx, PTR, main proto, callback proto,
+        // static proto) plus one FUNC per subprog; func_info maps
+        // insn offsets to the matching FUNC ids.
+        let (btf, info) = synth_btf(&[
+            SubprogInfo {
+                name: "main".into(),
+                insn_off: 0,
+                is_callback: false,
+            },
+            SubprogInfo {
+                name: "cb".into(),
+                insn_off: 24,
+                is_callback: true,
+            },
+        ])
+        .unwrap();
+        assert_eq!(info, vec![(0u32, 8u32), (24u32, 9u32)]);
+        let (types, strings) = walk_btf(&btf);
+        assert_eq!(types.len(), 9, "7 prefix + 2 funcs");
+        // Kinds: INT=1, PTR=2, STRUCT=4, FUNC_PROTO=13, FUNC=12.
+        let kinds: Vec<u32> = types.iter().map(|t| t.0).collect();
+        assert_eq!(kinds, vec![1, 1, 4, 2, 13, 13, 13, 12, 12]);
+        // INT widths.
+        assert_eq!((types[0].2, types[0].3[0]), (8, 64));
+        assert_eq!((types[1].2, types[1].3[0]), (4, 32));
+        // STRUCT ctx { u64 pad; } + PTR to it.
+        assert_eq!(types[2].2, 8);
+        assert_eq!(types[2].3.len(), 3);
+        assert_eq!(types[3].2, 3);
+        // Main proto: u32 <- (ctx *arg0). Callback proto with named
+        // params. Params are (name_off, type) pairs per
+        // uapi/linux/btf.h.
+        assert_eq!(types[4].2, 2);
+        assert_eq!(types[4].3.len(), 2);
+        assert_eq!(types[4].3[1], 4);
+        assert_eq!(types[5].2, 1);
+        assert_eq!(types[5].3.len(), 4);
+        assert_eq!((types[5].3[1], types[5].3[3]), (1, 1));
+        // Static proto: void <- ().
+        assert_eq!((types[6].2, types[6].3.len()), (0, 0));
+        // FUNCs bind the right protos.
+        assert_eq!((types[7].2, types[8].2), (5, 6));
+        // Names resolve in the string section.
+        let s = |off: u32| {
+            // String offsets are relative to the string section; find
+            // it via the header (hdr_len 24 + str_off field).
+            let base = 24 + u32::from_le_bytes([btf[16], btf[17], btf[18], btf[19]]) as usize;
+            let mut end = base + off as usize;
+            while btf[end] != 0 {
+                end += 1;
+            }
+            std::str::from_utf8(&btf[base + off as usize..end])
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(s(types[0].1), "__u64");
+        assert_eq!(s(types[1].1), "__u32");
+        assert_eq!(s(types[2].1), "ctx");
+        assert_eq!(s(types[2].3[0]), "pad");
+        assert_eq!(s(types[4].3[0]), "arg0");
+        assert_eq!(s(types[5].3[0]), "index");
+        assert_eq!(s(types[5].3[2]), "cctx");
+        assert_eq!(s(types[7].1), "main");
+        assert_eq!(s(types[8].1), "cb");
+        // String section is NUL-separated with a leading empty entry.
+        assert_eq!(strings[0], b"");
+        let joined = strings.concat();
+        for want in [
+            b"__u64".as_slice(),
+            b"__u32",
+            b"ctx",
+            b"pad",
+            b"arg0",
+            b"index",
+            b"cctx",
+            b"main",
+            b"cb",
+        ] {
+            assert!(
+                joined.windows(want.len()).any(|w| w == want),
+                "missing {want:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn prepare_records_subprog_table() {
+        // Plain static-call shape: main + one static callee, no
+        // callbacks — the table still records (main @0, callee @4).
+        let obj = min_elf();
+        let prep = prepare(
+            &obj,
+            &[MapSpec {
+                name: "MYMAP",
+                map_type: 2,
+                key_size: 4,
+                value_size: 8,
+                max_entries: 1,
+                flags: 0,
+            }],
+            &[ProgSpec {
+                name: "uprobe_func",
+                section: "uprobe",
+            }],
+        )
+        .unwrap();
+        let subs: Vec<(String, u32, bool)> = prep.progs[0]
+            .subprogs
+            .iter()
+            .map(|s| (s.name.clone(), s.insn_off, s.is_callback))
+            .collect();
+        assert_eq!(
+            subs,
+            vec![
+                ("uprobe_func".to_string(), 0, false),
+                ("memsub".to_string(), 4, false),
+            ]
+        );
+        // Function-pointer shape: the reloc target is a callback.
+        let mut obj = min_elf();
+        obj[64 + 16..64 + 32]
+            .copy_from_slice(&[0x18, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        obj[172..180].copy_from_slice(&u64(2 << 32 | 1));
+        let prep = prepare(
+            &obj,
+            &[MapSpec {
+                name: "MYMAP",
+                map_type: 2,
+                key_size: 4,
+                value_size: 8,
+                max_entries: 1,
+                flags: 0,
+            }],
+            &[ProgSpec {
+                name: "uprobe_func",
+                section: "uprobe",
+            }],
+        )
+        .unwrap();
+        let subs: Vec<(String, u32, bool)> = prep.progs[0]
+            .subprogs
+            .iter()
+            .map(|s| (s.name.clone(), s.insn_off, s.is_callback))
+            .collect();
+        assert_eq!(
+            subs,
+            vec![
+                ("uprobe_func".to_string(), 0, false),
+                ("memsub".to_string(), 4, true),
+            ]
+        );
+    }
+
+    #[test]
+    fn synth_btf_rejects_bad_inputs() {
+        let sub = |name: &str, off: u32, cb: bool| SubprogInfo {
+            name: name.into(),
+            insn_off: off,
+            is_callback: cb,
+        };
+        // Empty: no main.
+        let e = synth_btf(&[]).err().expect("must fail");
+        assert!(e.to_string().contains("no subprograms"), "{e:#}");
+        // First offset must be 0 (main).
+        let e = synth_btf(&[sub("main", 8, false)])
+            .err()
+            .expect("must fail");
+        assert!(e.to_string().contains("main at 0"), "{e:#}");
+        // Offsets strictly increasing.
+        let e = synth_btf(&[sub("main", 0, false), sub("cb", 0, true)])
+            .err()
+            .expect("must fail");
+        assert!(e.to_string().contains("increasing"), "{e:#}");
+        // Empty name.
+        let e = synth_btf(&[sub("", 0, false)]).err().expect("must fail");
+        assert!(e.to_string().contains("empty name"), "{e:#}");
+        // NUL in name would corrupt the string section.
+        let e = synth_btf(&[sub("a\0b", 0, false)])
+            .err()
+            .expect("must fail");
+        assert!(e.to_string().contains("NUL"), "{e:#}");
+        // Absurd subprog count.
+        let many: Vec<SubprogInfo> = (0..300).map(|i| sub("s", i * 8, false)).collect();
+        let e = synth_btf(&many).err().expect("must fail");
+        assert!(e.to_string().contains("too many"), "{e:#}");
     }
 
     #[test]

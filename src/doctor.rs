@@ -244,7 +244,7 @@ fn errno_of(e: &std::io::Error) -> i32 {
 fn run_prog_load(insns: &[u8]) -> ProbeOut {
     let mut log = vec![0u8; 4096];
     let license = c"GPL";
-    match ossl_bpf_sys::prog_load_kprobe(insns, license, None, &mut log, "doctorprobe") {
+    match ossl_bpf_sys::prog_load_kprobe(insns, license, None, &mut log, "doctorprobe", None) {
         Ok(_) => ProbeOut {
             ok: true,
             errno: 0,
@@ -335,21 +335,26 @@ fn run_multi_self() -> ProbeOut {
     };
     let mut log = vec![0u8; 4096];
     let license = c"GPL";
-    let fd =
-        match ossl_bpf_sys::prog_load_kprobe(&insns_noop(), license, None, &mut log, "doctorprobe")
-        {
-            Ok(f) => f,
-            Err(e) => {
-                return ProbeOut {
-                    ok: false,
-                    errno: errno_of(&e),
-                    log: format!(
-                        "load: {}",
-                        String::from_utf8_lossy(&log).trim_end_matches('\0')
-                    ),
-                };
-            }
-        };
+    let fd = match ossl_bpf_sys::prog_load_kprobe(
+        &insns_noop(),
+        license,
+        None,
+        &mut log,
+        "doctorprobe",
+        None,
+    ) {
+        Ok(f) => f,
+        Err(e) => {
+            return ProbeOut {
+                ok: false,
+                errno: errno_of(&e),
+                log: format!(
+                    "load: {}",
+                    String::from_utf8_lossy(&log).trim_end_matches('\0')
+                ),
+            };
+        }
+    };
     use std::os::fd::AsRawFd as _;
     // Attach to SELF at the entry offset with a no-op prog: safe even
     // if it fired (it can't — entry runs once at exec); drop = detach.

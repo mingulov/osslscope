@@ -18,6 +18,7 @@ use std::os::fd::{FromRawFd as _, OwnedFd, RawFd};
 pub const BPF_MAP_CREATE: u32 = 0;
 pub const BPF_MAP_UPDATE_ELEM: u32 = 2;
 pub const BPF_PROG_LOAD: u32 = 5;
+pub const BPF_BTF_LOAD: u32 = 18;
 pub const BPF_LINK_CREATE: u32 = 28;
 pub const BPF_TOKEN_CREATE: u32 = 36;
 /// `BPF_MAP_UPDATE_ELEM` flags (create-or-update / must-create).
@@ -110,6 +111,26 @@ struct TokenAttr {
     bpffs_fd: u32,
 }
 
+/// `BPF_BTF_LOAD` attr: btf@0, log_buf@8, size@16, log_size@20,
+/// log_level@24 (offsets per `linux/bpf.h`).
+#[repr(C)]
+struct BtfAttr {
+    btf: u64,
+    btf_log_buf: u64,
+    btf_size: u32,
+    btf_log_size: u32,
+    btf_log_level: u32,
+}
+
+/// Program BTF attachment for `prog_load_*`: a loaded BTF fd plus
+/// serialized func_info (`(insn_off, type_id)` u32 pairs, 8 bytes
+/// each — `func_info_rec_size` 8). `None` loads BTF-less (the
+/// frozen default; every existing prog).
+pub struct ProgBtf<'a> {
+    pub btf_fd: RawFd,
+    pub func_info: &'a [u8],
+}
+
 /// `BPF_MAP_*_ELEM` attr: map_fd@0, key@8, value@16, flags@24
 /// (offsets verified against `linux/bpf.h`).
 #[repr(C)]
@@ -189,6 +210,25 @@ pub fn map_update_elem(map_fd: RawFd, key: &[u8], value: &[u8], flags: u64) -> i
     Ok(())
 }
 
+/// Load raw BTF bytes, returning the BTF fd (needs caps). The
+/// kernel validates the type graph (fail-closed, loud errno);
+/// callers pass `log` for the diagnostic on failure.
+pub fn btf_load(btf: &[u8], log: &mut [u8]) -> io::Result<OwnedFd> {
+    let mut attr: BtfAttr = zeroed();
+    attr.btf = btf.as_ptr() as u64;
+    attr.btf_size = btf.len() as u32;
+    attr.btf_log_buf = log.as_mut_ptr() as u64;
+    attr.btf_log_size = log.len() as u32;
+    attr.btf_log_level = 1;
+    let fd = bpf(
+        BPF_BTF_LOAD,
+        std::ptr::addr_of_mut!(attr).cast(),
+        size_of::<BtfAttr>(),
+    )?;
+    // SAFETY: bpf() returned a fresh owned fd.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
 /// Load a KPROBE-typed program (uprobe family) with no verifier log
 /// (`log_level` 0): the success path needs no diagnostics, and a
 /// large-but-valid verification can overflow any fixed log buffer
@@ -199,10 +239,18 @@ pub fn prog_load_kprobe_quiet(
     license: &CStr,
     token: Option<RawFd>,
     name: &str,
+    btf: Option<ProgBtf<'_>>,
 ) -> io::Result<OwnedFd> {
     assert!(insns.len() % 8 == 0, "BPF insn stride is 8 bytes");
     let mut attr: ProgAttr = zeroed();
     attr.prog_type = BPF_PROG_TYPE_KPROBE;
+    if let Some(b) = btf {
+        assert!(b.func_info.len() % 8 == 0, "func_info stride is 8 bytes");
+        attr.prog_btf_fd = b.btf_fd as u32;
+        attr.func_info_rec_size = 8;
+        attr.func_info = b.func_info.as_ptr() as u64;
+        attr.func_info_cnt = (b.func_info.len() / 8) as u32;
+    }
     let bytes = name.as_bytes();
     let n = bytes.len().min(15);
     attr.prog_name[..n].copy_from_slice(&bytes[..n]);
@@ -239,10 +287,18 @@ pub fn prog_load_kprobe(
     token: Option<RawFd>,
     log_buf: &mut [u8],
     name: &str,
+    btf: Option<ProgBtf<'_>>,
 ) -> io::Result<OwnedFd> {
     assert!(insns.len() % 8 == 0, "BPF insn stride is 8 bytes");
     let mut attr: ProgAttr = zeroed();
     attr.prog_type = BPF_PROG_TYPE_KPROBE;
+    if let Some(b) = btf {
+        assert!(b.func_info.len() % 8 == 0, "func_info stride is 8 bytes");
+        attr.prog_btf_fd = b.btf_fd as u32;
+        attr.func_info_rec_size = 8;
+        attr.func_info = b.func_info.as_ptr() as u64;
+        attr.func_info_cnt = (b.func_info.len() / 8) as u32;
+    }
     let bytes = name.as_bytes();
     let n = bytes.len().min(15);
     attr.prog_name[..n].copy_from_slice(&bytes[..n]);
