@@ -679,12 +679,14 @@ fn e7_slots() -> Vec<SlotSpec> {
         .collect()
 }
 
-/// L2: exact E=7 scan (warm + cold) + null-query silence. Every
-/// ALG/ROW byte-asserted on the live prefix; the array is
-/// zero-padded to the full chunk so TRUNC==0 and beyond-T silence
-/// are real asserts (v1 has no T-gate — unpadded past-T memory
-/// yields flag soup). The cold sub-run gates real eviction (SKIPs
-/// warm-only lanes, labeled — never false-claims cold).
+/// L2: exact E=7 scan (warm) + swap-cold fail-closed + null-query
+/// silence. Warm: every ALG/ROW byte-asserted on the live prefix;
+/// the array is zero-padded to the full chunk so TRUNC==0 and
+/// beyond-T silence are real asserts (v1 has no T-gate — unpadded
+/// past-T memory yields flag soup). Cold: evicted pages are
+/// unreadable via nofault (kernel contract), so the leg asserts
+/// the fail-closed shape (WALK_READ alone, silent ring, counted);
+/// it SKIPs labeled on lanes that cannot evict.
 #[test]
 #[ignore]
 fn l2_exact_e7() {
@@ -705,17 +707,11 @@ fn run_e7(obj: &std::path::Path, exe: &std::ffi::CString, off: u64, cold: bool) 
     // Zero-padded to the full chunk: past-T members stay silent,
     // so TRUNC==0 reflects the live prefix's clean walk.
     let fx = Fixture::build_padded(&e7_slots(), &[], 512);
-    let temp = if cold {
-        let t = fx.pageout_and_temp();
-        if t != "cold" {
-            eprintln!("SKIP(e7-cold): lane cannot evict fixture pages (warm-only)");
-            return;
-        }
-        t
-    } else {
-        fx.pretouch();
-        "warm"
-    };
+    if cold {
+        return run_e7_pageout(obj, exe, off, fx);
+    }
+    fx.pretouch();
+    let temp = "warm";
     let loaded = load_members(obj);
     populate_alg_class(&loaded, &fx.classes);
     FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
@@ -785,6 +781,59 @@ fn run_e7(obj: &std::path::Path, exe: &std::ffi::CString, off: u64, cold: bool) 
     );
 }
 
+/// Cold-page leg (T03 amendment §3: "cold-page read failures"): the
+/// evicted fixture is UNREADABLE via nofault helpers (kernel
+/// contract — no IO from BPF), so every member aborts its slot
+/// read: TRUNC_WALK_READ exactly, zero emissions, queries still
+/// counted, zero loss. SKIPs labeled on lanes that cannot evict
+/// (no swap); the munmap-hole leg (L3) always runs and proves the
+/// same member-side abort path.
+fn run_e7_pageout(obj: &std::path::Path, exe: &std::ffi::CString, off: u64, fx: Fixture) {
+    if fx.pageout_and_temp() != "cold" {
+        eprintln!("SKIP(e7-cold): lane cannot evict fixture pages (no swap?)");
+        return;
+    }
+    // From here until the drain: touch nothing fixture-backed (any
+    // touch re-faults and voids the cold).
+    let loaded = load_members(obj);
+    populate_alg_class(&loaded, &fx.classes);
+    FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
+    NS_VERDICT.store(0, Ordering::SeqCst);
+    let _links = attach_all(&loaded, exe, off, None);
+    fire(OP as i32, QUERIES);
+    let (algs, rows) = drain(&loaded);
+    assert_abort_clean(&loaded, &algs, &rows, QUERIES as u64, "e7-cold");
+}
+
+/// Shared read-abort oracle (pageout-cold + munmap-hole): every
+/// slot read fails, so TRUNC holds WALK_READ alone, the ring stays
+/// empty, member 0 still counts (its bump precedes the slot read),
+/// and nothing is lost.
+fn assert_abort_clean(
+    loaded: &Loaded,
+    algs: &[osslscope_ebpf_common::AlgEvent],
+    rows: &[osslscope_ebpf_common::RowEvent],
+    n: u64,
+    tag: &str,
+) {
+    use osslscope_ebpf_common as wire;
+    assert_eq!(
+        read_percpu(loaded, "TRUNC", OP, true),
+        wire::TRUNC_WALK_READ,
+        "{tag}: abort flags WALK_READ alone"
+    );
+    assert!(
+        algs.is_empty() && rows.is_empty(),
+        "{tag}: aborted members emit nothing"
+    );
+    assert_eq!(
+        read_percpu(loaded, "CALLS", OP, false),
+        n,
+        "{tag}: aborted queries still counted"
+    );
+    assert_loss_zero(loaded);
+}
+
 /// Null queries (rv == 0) stay silent and uncounted (v1 returns
 /// before CALLS; member-0 QUERY_RET-EMPTY is item 3).
 fn run_null(obj: &std::path::Path, exe: &std::ffi::CString, off: u64) {
@@ -806,9 +855,11 @@ fn run_null(obj: &std::path::Path, exe: &std::ffi::CString, off: u64) {
     assert_loss_zero(&loaded);
 }
 
-/// L3: empty / one / adjacent-tail fixtures. Prefix-exact; the tail
-/// leg PINS v1's past-T reach (tail presence) — item 3's T-gate
-/// flips it to absence.
+/// L3: empty / one / adjacent-tail / munmap-hole fixtures.
+/// Prefix-exact; the tail leg PINS v1's past-T reach (tail
+/// presence) — item 3's T-gate flips it to absence. The hole leg
+/// proves the read-abort path deterministically on every lane
+/// (same member-side shape as swap-cold, no swap needed).
 #[test]
 #[ignore]
 fn l3_boundaries() {
@@ -933,6 +984,45 @@ fn l3_boundaries() {
             assert_eq!(a.class, 200 + t as u16, "tail slot {idx} classified");
         }
         assert_loss_zero(&loaded);
+    }
+    // Munmap hole: array page 0 (slots 0..127, incl. the live
+    // prefix) unmapped ⇒ every slot read in the hole aborts:
+    // TRUNC_WALK_READ exactly, zero emissions, queries counted.
+    // Same member-side path as swap-cold, but deterministic on
+    // every lane (no swap needed). ORDERING: no mmap/malloc may run
+    // between the munmap and the end of fire (an allocator mmap
+    // could reuse the hole); attach/load/allocations all precede it.
+    {
+        let slots = vec![
+            SlotSpec::live("M3H0", 100, vec![(41, 0x4600)]),
+            SlotSpec::live("M3H1", 101, vec![(42, 0x4601)]),
+        ];
+        let fx = Fixture::build_padded(&slots, &[], 512);
+        let loaded = load_members(&obj);
+        populate_alg_class(&loaded, &fx.classes);
+        FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
+        NS_VERDICT.store(0, Ordering::SeqCst);
+        let _links = attach_all(&loaded, &exe, off, None);
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        // Hoisted: no allocation may run between the munmap and the
+        // end of fire (see the ordering note above).
+        let mut probe = vec![0u8; 1];
+        assert_eq!(
+            unsafe { libc::munmap(fx.array as *mut libc::c_void, page) },
+            0,
+            "munmap hole page"
+        );
+        // Prove the hole (mincore on unmapped memory fails ENOMEM).
+        let mc = unsafe { libc::mincore(fx.array as *mut libc::c_void, page, probe.as_mut_ptr()) };
+        assert_eq!(mc, -1, "hole must read as unmapped");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ENOMEM),
+            "hole errno is ENOMEM"
+        );
+        fire(OP as i32, 2);
+        let (algs, rows) = drain(&loaded);
+        assert_abort_clean(&loaded, &algs, &rows, 2, "l3-hole");
     }
 }
 
