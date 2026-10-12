@@ -1245,8 +1245,14 @@ impl LiveBackend {
             .get(map)
             .context(format!("no {map} map"))?
             .as_raw_fd();
-        ossl_bpf_sys::map_update_elem(fd, &key.to_le_bytes(), value, ossl_bpf_sys::BPF_ANY)
-            .with_context(|| format!("program {map}[{key}]"))?;
+        // SAFETY: every `program()` caller passes exact COUNT_MAPS
+        // dims — key `u32` (4) with value `u64` (8) for WINDOW /
+        // TARGET (value 8) and `u32` (4) for GEN (value 4); all
+        // plain ARRAY maps, fd live from `load()`.
+        unsafe {
+            ossl_bpf_sys::map_update_elem(fd, &key.to_le_bytes(), value, ossl_bpf_sys::BPF_ANY)
+        }
+        .with_context(|| format!("program {map}[{key}]"))?;
         Ok(())
     }
 }

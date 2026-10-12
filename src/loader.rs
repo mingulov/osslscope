@@ -471,6 +471,28 @@ fn check_site_contained(
     Ok(())
 }
 
+/// Validate one `ld_imm64` map site: instruction-aligned offset
+/// plus an unrelocated encoding (opcode, src 0, zero reserved
+/// offset bytes). Shared by both map arms and the load-time fixup
+/// path (func arms use the stricter `func_ptr_target`, which
+/// additionally pins the imm — map sites take an fd imm at load,
+/// so only the shape is pinned here).
+fn check_ld_imm64_site(bytes: &[u8], off: usize, prog: &str) -> anyhow::Result<()> {
+    if off % 8 != 0 {
+        anyhow::bail!("prog {prog}: map site misaligned");
+    }
+    let site = bytes
+        .get(off..off + 16)
+        .ok_or_else(|| anyhow::anyhow!("prog {prog}: map site out of range"))?;
+    if site[0] != BPF_LD_IMM64 || site[1] >> 4 != 0 {
+        anyhow::bail!("prog {prog}: map site vs non-ld_imm64");
+    }
+    if site[2..4] != [0u8; 2] {
+        anyhow::bail!("prog {prog}: map site reserved bytes set");
+    }
+    Ok(())
+}
+
 /// Resolve an `R_BPF_64_32` call reloc to a `.text` function name.
 /// Named FUNC syms resolve by (value, name); STT_SECTION syms (the
 /// toolchain's reduction for LOCAL callees — `call -1` + section
@@ -982,6 +1004,7 @@ pub fn prepare(obj: &[u8], maps: &[MapSpec], progs: &[ProgSpec]) -> anyhow::Resu
                         if !(rsym.is_obj && maps.iter().any(|m| m.name == rsym.name)) {
                             anyhow::bail!("prog {}: map reloc vs {}", p.name, rsym.name);
                         }
+                        check_ld_imm64_site(sec, r.off, p.name)?;
                         fixups.push(MapFixup {
                             insn_off: local,
                             map: rsym.name.clone(),
@@ -1118,6 +1141,7 @@ pub fn prepare(obj: &[u8], maps: &[MapSpec], progs: &[ProgSpec]) -> anyhow::Resu
                     if !(rsym.is_obj && maps.iter().any(|m| m.name == rsym.name)) {
                         anyhow::bail!("prog {}: text map reloc vs {}", p.name, rsym.name);
                     }
+                    check_ld_imm64_site(text, r.off, p.name)?;
                     fixups.push(MapFixup {
                         insn_off: obase + (r.off - f0),
                         map: rsym.name.clone(),
@@ -1196,15 +1220,20 @@ pub fn load(prep: &Prepared) -> anyhow::Result<Loaded> {
     for p in &prep.progs {
         let mut insns = p.insns.clone();
         for f in &p.map_fixups {
+            // Range first (own message), then the shared shape check
+            // (`Prepared` fields are public, so `load()` cannot assume
+            // `prepare()` validated these sites): alignment, full
+            // 16-byte presence, opcode/src, reserved bytes.
+            insns
+                .get(f.insn_off..f.insn_off + 8)
+                .ok_or_else(|| anyhow::anyhow!("{}: fixup out of range", p.name))?;
+            check_ld_imm64_site(&insns, f.insn_off, &p.name)?;
             let insn = insns
                 .get_mut(f.insn_off..f.insn_off + 8)
                 .ok_or_else(|| anyhow::anyhow!("{}: fixup out of range", p.name))?;
             // The compiler emits map sites with src=0; the reloc means
             // "this imm64 is a map" — the loader sets src AND fd.
             // Anything else is an already-relocated (or corrupt) object.
-            if insn[0] != 0x18 || insn[1] >> 4 != 0 {
-                anyhow::bail!("{}: fixup site not an unrelocated ld_imm64", p.name);
-            }
             let fd = maps
                 .get(&f.map)
                 .ok_or_else(|| anyhow::anyhow!("{}: unknown map {}", p.name, f.map))?;
@@ -1870,6 +1899,120 @@ mod tests {
         )
         .unwrap();
         assert_eq!(prep.progs[0].insns.len(), 56);
+    }
+
+    #[test]
+    fn prepare_rejects_misaligned_map_site() {
+        // Map reloc at misaligned @4 (contained: 4+16=20 <= 32):
+        // map arms must enforce alignment like call/func sites.
+        let mut obj = min_elf();
+        obj[148..156].copy_from_slice(&u64(4));
+        let e = prepare(
+            &obj,
+            &[MapSpec {
+                name: "MYMAP",
+                map_type: 2,
+                key_size: 4,
+                value_size: 8,
+                max_entries: 1,
+                flags: 0,
+            }],
+            &[ProgSpec {
+                name: "uprobe_func",
+                section: "uprobe",
+            }],
+        )
+        .err()
+        .expect("must fail");
+        // Exact phrase: proves the map arm fired (not another check).
+        assert!(e.to_string().contains("map site misaligned"), "{e:#}");
+    }
+
+    #[test]
+    fn prepare_rejects_map_site_reserved_bytes() {
+        // Main map site with the first slot's reserved offset bytes
+        // set: map arms must check them like func sites.
+        let mut obj = min_elf();
+        obj[64 + 2] = 1;
+        let e = prepare(
+            &obj,
+            &[MapSpec {
+                name: "MYMAP",
+                map_type: 2,
+                key_size: 4,
+                value_size: 8,
+                max_entries: 1,
+                flags: 0,
+            }],
+            &[ProgSpec {
+                name: "uprobe_func",
+                section: "uprobe",
+            }],
+        )
+        .err()
+        .expect("must fail");
+        // Exact phrase: proves the map arm fired (not another check).
+        assert!(
+            e.to_string().contains("map site reserved bytes set"),
+            "{e:#}"
+        );
+    }
+
+    #[test]
+    fn prepare_rejects_misaligned_text_map_site() {
+        // `.text` map reloc at misaligned @4 (contained in memsub):
+        // the apply-loop map arm must enforce alignment.
+        let mut obj = min_elf();
+        obj[180..188].copy_from_slice(&u64(4));
+        let e = prepare(
+            &obj,
+            &[MapSpec {
+                name: "MYMAP",
+                map_type: 2,
+                key_size: 4,
+                value_size: 8,
+                max_entries: 1,
+                flags: 0,
+            }],
+            &[ProgSpec {
+                name: "uprobe_func",
+                section: "uprobe",
+            }],
+        )
+        .err()
+        .expect("must fail");
+        // Exact phrase: proves the apply-loop map arm fired.
+        assert!(e.to_string().contains("map site misaligned"), "{e:#}");
+    }
+
+    #[test]
+    fn prepare_rejects_text_map_site_reserved_bytes() {
+        // `.text` map site with reserved offset bytes set: the
+        // apply-loop map arm must check them.
+        let mut obj = min_elf();
+        obj[96 + 2] = 1;
+        let e = prepare(
+            &obj,
+            &[MapSpec {
+                name: "MYMAP",
+                map_type: 2,
+                key_size: 4,
+                value_size: 8,
+                max_entries: 1,
+                flags: 0,
+            }],
+            &[ProgSpec {
+                name: "uprobe_func",
+                section: "uprobe",
+            }],
+        )
+        .err()
+        .expect("must fail");
+        // Exact phrase: proves the apply-loop map arm fired.
+        assert!(
+            e.to_string().contains("map site reserved bytes set"),
+            "{e:#}"
+        );
     }
 
     #[test]

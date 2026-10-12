@@ -3056,7 +3056,11 @@ fn populate_classifier_maps(maps: &HashMap<String, OwnedFd>) -> anyhow::Result<(
         let fd = maps
             .get(map)
             .ok_or_else(|| anyhow!("missing classifier map {map}"))?;
-        ossl_bpf_sys::map_update_elem(fd.as_raw_fd(), key, value, 0)
+        // SAFETY: lengths are exact per HARVEST_MAPS — ALG_CLASS is
+        // key 8 / value 42 (`u64` key, `[u8; 42]` encoder),
+        // TRIP_CLASS is key 8 / value 22 (`u64` key, `[u8; 22]`
+        // encoder); both plain HASH maps, fd live from `load()`.
+        unsafe { ossl_bpf_sys::map_update_elem(fd.as_raw_fd(), key, value, 0) }
             .with_context(|| format!("populate {map}"))?;
         Ok(())
     };
@@ -3104,12 +3108,16 @@ fn populate_jump_table(loaded: &Loaded) -> anyhow::Result<()> {
         }
         let name = format!("c{i}");
         let callee = prog_fd(loaded, &name)?;
-        ossl_bpf_sys::map_update_elem(
-            jumps.as_raw_fd(),
-            &i.to_le_bytes(),
-            &(callee as u32).to_le_bytes(),
-            0,
-        )
+        // SAFETY: JUMPS is key 4 / value 4 (PROG_ARRAY); both slices
+        // are `u32` encodings, fd live from `load()`.
+        unsafe {
+            ossl_bpf_sys::map_update_elem(
+                jumps.as_raw_fd(),
+                &i.to_le_bytes(),
+                &(callee as u32).to_le_bytes(),
+                0,
+            )
+        }
         .with_context(|| format!("populate JUMPS[{i}]={name}"))?;
     }
     Ok(())

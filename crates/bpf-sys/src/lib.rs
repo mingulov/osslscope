@@ -194,7 +194,20 @@ pub fn map_create(
 
 /// Update one map element (`GEN`/`TARGET` programming). `flags` is
 /// `BPF_ANY` (create-or-update) or `BPF_NOEXIST` (must-create).
-pub fn map_update_elem(map_fd: RawFd, key: &[u8], value: &[u8], flags: u64) -> io::Result<()> {
+///
+/// # Safety
+///
+/// The kernel reads exactly the map's key/value sizes from the raw
+/// pointers: `key` must be exactly `key_size` bytes, `value`
+/// exactly `value_size` bytes (per-CPU maps: `value_size` × CPUs),
+/// and `map_fd` a live fd for that map. Short slices make the kernel
+/// read past the allocation.
+pub unsafe fn map_update_elem(
+    map_fd: RawFd,
+    key: &[u8],
+    value: &[u8],
+    flags: u64,
+) -> io::Result<()> {
     let mut attr: ElemAttr = zeroed();
     debug_assert_eq!(size_of::<ElemAttr>(), 32);
     debug_assert_eq!(std::mem::offset_of!(ElemAttr, key), 8);
@@ -224,7 +237,9 @@ struct InfoAttr {
 /// length-then-bytes dance; needs caps on the fd). Early
 /// `bpf_prog_info` fields (through `xlated_prog_insns`) are ABI
 /// stable; the info buffer is oversized so version growth cannot
-/// truncate them.
+/// truncate them. A successful call does not prove bytes were copied
+/// (the kernel withholds on restricted paths), so the returned
+/// length and pointer are validated before the buffer is trusted.
 pub fn prog_xlated_bytes(prog_fd: RawFd) -> io::Result<Vec<u8>> {
     // bpf_prog_info head: type@0 id@4 tag@8 jited_len@16
     // xlated_len@20 jited_ptr@24 xlated_ptr@32.
@@ -240,11 +255,20 @@ pub fn prog_xlated_bytes(prog_fd: RawFd) -> io::Result<Vec<u8>> {
         size_of::<InfoAttr>(),
     )?;
     let len = u32::from_le_bytes([info[20], info[21], info[22], info[23]]) as usize;
+    if len == 0 {
+        // Unprivileged callers get length 0 with success: no image
+        // exists to fetch, and requesting 0 bytes would copy nothing.
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "xlated bytes withheld: kernel returned length 0",
+        ));
+    }
     // Fresh info for the bytes fetch: call 1 leaves nonzero lens
     // (e.g. jited) with NULL pointers, which would EFAULT the copy.
     let mut info = vec![0u8; 256];
     let mut bytes = vec![0u8; len];
-    info[32..40].copy_from_slice(&(bytes.as_mut_ptr() as u64).to_le_bytes());
+    let our_ptr = bytes.as_mut_ptr() as u64;
+    info[32..40].copy_from_slice(&our_ptr.to_le_bytes());
     info[20..24].copy_from_slice(&(len as u32).to_le_bytes());
     let mut attr = InfoAttr {
         bpf_fd: prog_fd as u32,
@@ -256,13 +280,25 @@ pub fn prog_xlated_bytes(prog_fd: RawFd) -> io::Result<Vec<u8>> {
         std::ptr::addr_of_mut!(attr).cast(),
         size_of::<InfoAttr>(),
     )?;
+    let got_len = u32::from_le_bytes([info[20], info[21], info[22], info[23]]);
+    let got_ptr = u64::from_le_bytes([
+        info[32], info[33], info[34], info[35], info[36], info[37], info[38], info[39],
+    ]);
+    check_xlated_copied(len, got_len, got_ptr, our_ptr)?;
     Ok(bytes)
 }
 
-/// Read one map value by key (needs caps on the fd). `value` must
-/// fit the map's value size; a missing key errors (`ENOENT`) rather
-/// than returning a default.
-pub fn map_lookup_elem(map_fd: RawFd, key: &[u8], value: &mut [u8]) -> io::Result<()> {
+/// Read one map value by key (needs caps on the fd). A missing key
+/// errors (`ENOENT`) rather than returning a default.
+///
+/// # Safety
+///
+/// The kernel writes the map's full value size into `value` and
+/// reads `key_size` bytes from `key`: `value` must be exactly
+/// `value_size` bytes (per-CPU maps: `value_size` × CPUs), `key`
+/// exactly `key_size` bytes, and `map_fd` a live fd for that map. A
+/// short `value` is a heap/stack overflow through this call.
+pub unsafe fn map_lookup_elem(map_fd: RawFd, key: &[u8], value: &mut [u8]) -> io::Result<()> {
     let mut attr: ElemAttr = zeroed();
     attr.map_fd = map_fd as u32;
     attr.key = key.as_ptr() as u64;
@@ -449,6 +485,45 @@ fn link_create_multi(
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
+/// Validate the second get-info call actually copied xlated bytes.
+/// The kernel can succeed while withholding: unprivileged callers get
+/// `xlated_prog_len = 0`, and blinded progs without dump rights get
+/// `xlated_prog_insns = 0` with the length still set (v6.12
+/// `bpf_prog_get_info_by_fd`). Returning our zeroed buffer as a
+/// "successful image" would mislead the caller.
+fn check_xlated_copied(
+    requested: usize,
+    returned_len: u32,
+    returned_ptr: u64,
+    our_ptr: u64,
+) -> io::Result<()> {
+    if returned_len == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "xlated bytes withheld: kernel returned length 0",
+        ));
+    }
+    if returned_ptr == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "xlated bytes withheld: kernel cleared the output pointer",
+        ));
+    }
+    if returned_ptr != our_ptr {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "xlated output pointer changed by the kernel",
+        ));
+    }
+    if returned_len as usize != requested {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("xlated length changed: requested {requested}, got {returned_len}"),
+        ));
+    }
+    Ok(())
+}
+
 /// Mint a BPF token against a delegated bpffs mount dir fd. Must be
 /// called by the worker itself inside its userns (broker-minted tokens
 /// are impossible). Debug-only path (STOP#6-PIVOT retired tokens from v1).
@@ -464,4 +539,48 @@ pub fn token_create(bpffs_fd: RawFd) -> io::Result<OwnedFd> {
     )?;
     // SAFETY: bpf() returned a fresh owned fd.
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::ErrorKind;
+
+    const OURS: u64 = 0x7fff_0000;
+
+    #[test]
+    fn xlated_copy_accepts_exact() {
+        check_xlated_copied(360, 360, OURS, OURS).expect("exact copy must pass");
+    }
+
+    #[test]
+    fn xlated_copy_rejects_cleared_pointer() {
+        // Blinded prog without dump rights: length set, pointer
+        // cleared, no bytes copied.
+        let e = check_xlated_copied(360, 360, 0, OURS).unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::PermissionDenied);
+        assert!(e.to_string().contains("withheld"), "{e}");
+    }
+
+    #[test]
+    fn xlated_copy_rejects_zero_length() {
+        // Unprivileged caller: length zeroed, no bytes copied.
+        let e = check_xlated_copied(360, 0, OURS, OURS).unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::PermissionDenied);
+        assert!(e.to_string().contains("withheld"), "{e}");
+    }
+
+    #[test]
+    fn xlated_copy_rejects_changed_pointer() {
+        let e = check_xlated_copied(360, 360, 0x1234, OURS).unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn xlated_copy_rejects_length_change() {
+        // Same fd pins the image: a changed length means a short
+        // copy (`min()` truncation) or kernel drift.
+        let e = check_xlated_copied(360, 100, OURS, OURS).unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::InvalidData);
+    }
 }
