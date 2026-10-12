@@ -258,14 +258,91 @@ pub struct Config {
     pub observed_from_birth: bool,
 }
 
-/// Legacy-quiet COMPLETE-EMPTY contract (F-B/A14): a quiet target is
-/// proven-empty only with tripwires attached (`set_attached` proves
-/// something was watching — an unplannable legacy surface is blind,
-/// not quiet) AND observation from process birth (attach-mode quiet
-/// cannot exclude pre-attach cached callbacks/loads). Gap signals
+/// Proven-quiet contract (F-B/A14, shared by legacy + file
+/// providers per H6): a quiet target is proven-empty only with
+/// something watching (`watched` — tripwires attached for
+/// legacy, load hook armed AND quiet for file providers; an
+/// unwatchable surface is blind, not quiet) AND observation
+/// from process birth (attach-mode quiet cannot exclude
+/// pre-attach cached callbacks/loads/queries). Gap signals
 /// still flip to PARTIAL inside `schema::emit`.
-fn legacy_proven_quiet(set_attached: bool, observed_from_birth: bool) -> bool {
-    set_attached && observed_from_birth
+fn proven_quiet(watched: bool, observed_from_birth: bool) -> bool {
+    watched && observed_from_birth
+}
+
+/// Provider presence by identity (H6/A-7-a): the EXPECTED
+/// provider file (bootstrap pin identity) is PRESENT iff some
+/// live mapping stats to the same (dev, ino) — stat-vs-stat
+/// (H5), never pathname. A hardlink-alias mapping reads
+/// present (same file); a same-path replacement reads absent
+/// (the doc is about P — the expected file never mapped).
+/// Unstatable mappings cannot match (no maps-fallback here —
+/// that would reintroduce cross-domain joins); no bootstrap
+/// binding reads absent (conservative).
+fn provider_present_by_identity(
+    live: &[maps::Mapping],
+    expected: Option<&(String, String, u64)>,
+) -> bool {
+    let Some((_, dev, ino)) = expected else {
+        return false;
+    };
+    live.iter()
+        .any(|m| m.ino == *ino && session::stat_dev_of(&m.path).as_deref() == Some(dev.as_str()))
+}
+
+/// Provider-load hook state (H6/A-7-c): the hook is armed AND
+/// quiet iff a tripwire set is attached and no load-cookie hit
+/// arrived all run (hits accumulate in the snapshot — an
+/// end-quiet read covers every poll). Any `OSSL_PROVIDER_load`
+/// / `try_load` firing breaks quiet regardless of name
+/// taxonomy (classification drops unlisted names, but the raw
+/// hit still counts here).
+fn load_hook_armed_and_quiet(set: Option<&legacy::ProbeSet>, hits: &[legacy::TripHit]) -> bool {
+    set.is_some_and(|s| !hits.iter().any(|h| s.is_load_cookie(h.cookie)))
+}
+
+/// File-provider quiet verdict (H6/A-7): pure decision over
+/// the end-of-run evidence. Returns the PARTIAL reason to
+/// emit, or `None` for COMPLETE-EMPTY (gap signals still flip
+/// to PARTIAL inside `schema::emit`).
+///
+/// - init fired but silent → PARTIAL always (2026-09-18
+///   verdict stands: race-miss vs idle indistinguishable
+///   post-hoc, even at birth).
+/// - mapped-but-silent + birth → COMPLETE-EMPTY (the
+///   loss machinery closes the stage-2 blind window — a
+///   clean snapshot proves quiet); warm → PARTIAL
+///   (`no-query-trigger`: pre-attach queries cannot be
+///   excluded).
+/// - absent + proven-quiet (birth + load hook armed and
+///   quiet) → COMPLETE-EMPTY (affirmative absence: owned
+///   children are held stopped until hooks arm, so no
+///   load cycle can hide from both census and hook).
+/// - absent otherwise → PARTIAL (`no-query-trigger`,
+///   reusing the frozen reason: silence without trigger
+///   is exactly what happened — a new `absence-*`
+///   reason would need runbook + consumer updates for
+///   zero new information, so it stays frozen by
+///   recorded rationale, never silently).
+fn file_quiet_verdict(
+    provider_present: bool,
+    primary_init_observed: bool,
+    observed_from_birth: bool,
+    load_armed_and_quiet: bool,
+) -> Option<&'static str> {
+    if primary_init_observed {
+        return Some("init-without-queries");
+    }
+    if provider_present {
+        if observed_from_birth {
+            return None;
+        }
+        return Some("no-query-trigger");
+    }
+    if proven_quiet(load_armed_and_quiet, observed_from_birth) {
+        return None;
+    }
+    Some("no-query-trigger")
 }
 
 /// Ops with at least one live-epoch table lacking termination
@@ -592,14 +669,14 @@ pub fn run_detailed(
         // Doctrine: tripwires are NOT dispatch triggers. Silence means:
         // - target gone → hard error (nothing observable, not even maps).
         // - preset reason (anchor failed) → PARTIAL(preset) + legacy.
-        // - provider mapped but primary init never fired → PARTIAL
-        //   (no-query-trigger): pre-loaded provider (dlopen/config
-        //   blindness) + legacy.
-        // - provider mapped and primary init fired, but zero rows
-        //   (queries raced the stage-2 attach) → PARTIAL
-        //   (init-without-queries): the trigger was observed, so
-        //   silence fails loud (verdict 2026-09-18).
-        // - provider never mapped (provider mode) → COMPLETE-EMPTY.
+        // - file-provider mode → the H6 quiet table
+        //   (`file_quiet_verdict`): presence by bootstrap
+        //   identity (never pathname); mapped-but-silent
+        //   completes ONLY from birth (warm stays PARTIAL);
+        //   init-without-queries stays PARTIAL always
+        //   (verdict 2026-09-18); absence completes ONLY
+        //   proven-quiet (birth + load hook armed and
+        //   quiet), else PARTIAL(no-query-trigger).
         // - builtin mode → PARTIAL(no-query-trigger), UNLESS legacy
         //   mode with zero loads observed (quiet/engine-only target)
         //   → COMPLETE-EMPTY.
@@ -632,70 +709,27 @@ pub fn run_detailed(
             });
         }
         if !cfg.builtin {
-            let arg = cfg.provider.to_string_lossy().into_owned();
-            let provider_mapped = live_now.iter().any(|m| {
-                m.path == arg || m.path == canon || (!canon.is_empty() && m.path.ends_with(&canon))
-            });
-            if provider_mapped && !snap.dispatch.primary_init_observed {
-                let stats = schema::Stats {
+            // H6: presence by bootstrap identity (never pathname),
+            // verdict by the shared quiet table. COMPLETE-EMPTY
+            // only when the snapshot is also clean: any gap flips
+            // the doc to PARTIAL below.
+            let present =
+                provider_present_by_identity(&live_now, snap.dispatch.bootstrap_binding.as_ref());
+            let hook_quiet = load_hook_armed_and_quiet(snap.legacy.set.as_ref(), &snap.legacy.hits);
+            let verdict = file_quiet_verdict(
+                present,
+                snap.dispatch.primary_init_observed,
+                cfg.observed_from_birth,
+                hook_quiet,
+            );
+            let stats = match verdict {
+                Some(reason) => schema::Stats {
                     resolution: snap.dispatch.resolution.clone(),
-                    reason: Some("no-query-trigger".to_string()),
+                    reason: Some(reason.to_string()),
                     ..snap_gap_stats(&snap)
-                };
-                let mut doc = schema::emit(
-                    &provider_name,
-                    &cfg.provider,
-                    &canon,
-                    &elf_bytes,
-                    &[],
-                    &[],
-                    false,
-                    &stats,
-                )?;
-                if let Some(l) = legacy_live {
-                    doc["legacy"] = l;
-                }
-                return Ok((
-                    doc,
-                    HarvestTotals {
-                        queries_observed: snap.queries_observed,
-                    },
-                ));
-            }
-            if provider_mapped && snap.dispatch.primary_init_observed {
-                // Init fired post-attach but its queries raced the
-                // stage-2 attach (trig P2/P3 shape): the evidence is
-                // NOT whole — blind PARTIAL, never COMPLETE-EMPTY
-                // (verdict 2026-09-18; race-miss vs idle is
-                // indistinguishable post-hoc, and the trigger was
-                // observed, so silence fails loud).
-                let stats = schema::Stats {
-                    resolution: snap.dispatch.resolution.clone(),
-                    reason: Some("init-without-queries".to_string()),
-                    ..snap_gap_stats(&snap)
-                };
-                let mut doc = schema::emit(
-                    &provider_name,
-                    &cfg.provider,
-                    &canon,
-                    &elf_bytes,
-                    &[],
-                    &[],
-                    false,
-                    &stats,
-                )?;
-                if let Some(l) = legacy_live {
-                    doc["legacy"] = l;
-                }
-                return Ok((
-                    doc,
-                    HarvestTotals {
-                        queries_observed: snap.queries_observed,
-                    },
-                ));
-            }
-            // COMPLETE-EMPTY only when the snapshot is also clean:
-            // any gap flips the doc to PARTIAL below.
+                },
+                None => snap_gap_stats(&snap),
+            };
             let mut doc = schema::emit(
                 &provider_name,
                 &cfg.provider,
@@ -704,7 +738,7 @@ pub fn run_detailed(
                 &[],
                 &[],
                 false,
-                &snap_gap_stats(&snap),
+                &stats,
             )?;
             if let Some(l) = legacy_live {
                 doc["legacy"] = l;
@@ -728,7 +762,7 @@ pub fn run_detailed(
         // (possibly blind) legacy section attached.
         if cfg.legacy
             && !loads_observed
-            && legacy_proven_quiet(snap.legacy.set.is_some(), cfg.observed_from_birth)
+            && proven_quiet(snap.legacy.set.is_some(), cfg.observed_from_birth)
         {
             // Quiet target: COMPLETE-EMPTY. Stats.builtin=false
             // suppresses the inventory counters (nothing was
@@ -935,10 +969,140 @@ mod tests {
         // attached (something was watching) AND observation from
         // process birth (attach-mode quiet cannot exclude pre-attach
         // cached callbacks/loads).
-        assert!(legacy_proven_quiet(true, true));
-        assert!(!legacy_proven_quiet(false, true));
-        assert!(!legacy_proven_quiet(true, false));
-        assert!(!legacy_proven_quiet(false, false));
+        assert!(proven_quiet(true, true));
+        assert!(!proven_quiet(false, true));
+        assert!(!proven_quiet(true, false));
+        assert!(!proven_quiet(false, false));
+    }
+
+    #[test]
+    fn h6_t1_provider_present_is_identity_not_pathname() {
+        // H6 (A-7/a): the mapped check binds the EXPECTED
+        // file's (dev, ino) — a hardlink-alias mapping reads
+        // PRESENT; a same-path different file reads ABSENT.
+        // RED pre-H6 (pathname match inline in run; no
+        // identity check exists).
+        let dir = std::env::temp_dir().join(format!("osslscope-h6t1-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let orig = dir.join("prov.so");
+        let alias = dir.join("alias.so");
+        std::fs::write(&orig, b"provider-bytes").unwrap();
+        std::fs::hard_link(&orig, &alias).unwrap();
+        let other = dir.join("other.so");
+        std::fs::write(&other, b"different-bytes").unwrap();
+        use std::os::unix::fs::MetadataExt as _;
+        let meta = std::fs::metadata(&orig).unwrap();
+        let expected = (
+            orig.to_string_lossy().into_owned(),
+            crate::plan::render_stat_dev(meta.dev()),
+            meta.ino(),
+        );
+        // Hardlink alias mapped (different path, same file):
+        // PRESENT. The maps dev-string is forged divergent
+        // (btrfs-shape) — identity never consults it.
+        let live = vec![maps::Mapping {
+            start: 0x1000,
+            end: 0x2000,
+            x: true,
+            offset: 0,
+            dev: "00:22".to_string(),
+            ino: meta.ino(),
+            path: alias.to_string_lossy().into_owned(),
+        }];
+        assert!(provider_present_by_identity(&live, Some(&expected)));
+        // Same path, different file (replaced): ABSENT.
+        let live2 = vec![maps::Mapping {
+            start: 0x1000,
+            end: 0x2000,
+            x: true,
+            offset: 0,
+            dev: "00:22".to_string(),
+            ino: std::fs::metadata(&other).unwrap().ino(),
+            path: orig.to_string_lossy().into_owned(),
+        }];
+        assert!(!provider_present_by_identity(&live2, Some(&expected)));
+        // No bootstrap binding: ABSENT (conservative).
+        assert!(!provider_present_by_identity(&live, None));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn h6_t2_warm_mapped_quiet_stays_partial_birth_completes() {
+        // H6 (A-7/b): mapped-but-silent completes ONLY with
+        // birth (the loss machinery closes the stage-2 blind
+        // window — a clean snapshot proves quiet); warm
+        // attach stays PARTIAL (pre-attach queries cannot be
+        // excluded). The load hook is irrelevant once mapped
+        // (pinned both ways).
+        assert_eq!(
+            file_quiet_verdict(true, false, false, false),
+            Some("no-query-trigger")
+        );
+        assert_eq!(
+            file_quiet_verdict(true, false, false, true),
+            Some("no-query-trigger")
+        );
+        assert_eq!(file_quiet_verdict(true, false, true, false), None);
+        assert_eq!(file_quiet_verdict(true, false, true, true), None);
+    }
+
+    #[test]
+    fn h6_t3_absence_needs_birth_and_quiet_hook() {
+        // H6 (A-7/c): absent + birth + load hook armed and
+        // quiet → COMPLETE-EMPTY (affirmative absence);
+        // absent + birth + hook unarmed → PARTIAL (absence
+        // unprovable — frozen reason reused by rationale).
+        assert_eq!(file_quiet_verdict(false, false, true, true), None);
+        assert_eq!(
+            file_quiet_verdict(false, false, true, false),
+            Some("no-query-trigger")
+        );
+        assert_eq!(
+            file_quiet_verdict(false, false, false, true),
+            Some("no-query-trigger")
+        );
+    }
+
+    #[test]
+    fn h6_t4_load_hook_firing_breaks_absence() {
+        // H6 (A-7/c): the hook catches what census misses — a
+        // dlopen-cycle (mapped in no poll) that fired the load
+        // tripwire reads NOT-quiet (→ PARTIAL at the verdict).
+        // Any load-cookie hit breaks quiet regardless of name
+        // taxonomy (class/status irrelevant here); non-load
+        // hits don't; no set at all reads unarmed.
+        let mut set = legacy::ProbeSet::default();
+        set.load_cookies.insert(7);
+        let load_hit = legacy::TripHit {
+            cookie: 7,
+            class: 0,
+            status: 0,
+        };
+        let other_hit = legacy::TripHit {
+            cookie: 9,
+            class: 0,
+            status: 0,
+        };
+        assert!(!load_hook_armed_and_quiet(Some(&set), &[load_hit]));
+        assert!(load_hook_armed_and_quiet(Some(&set), &[other_hit]));
+        assert!(load_hook_armed_and_quiet(Some(&set), &[]));
+        assert!(!load_hook_armed_and_quiet(None, &[]));
+        assert!(!load_hook_armed_and_quiet(None, &[other_hit]));
+    }
+
+    #[test]
+    fn h6_t5_init_without_queries_stays_partial() {
+        // H6 (no-regression pin of the 2026-09-18 verdict):
+        // init fired but silent → PARTIAL always, even at
+        // birth (race-miss vs idle indistinguishable).
+        assert_eq!(
+            file_quiet_verdict(true, true, true, true),
+            Some("init-without-queries")
+        );
+        assert_eq!(
+            file_quiet_verdict(true, true, false, false),
+            Some("init-without-queries")
+        );
     }
 
     #[test]

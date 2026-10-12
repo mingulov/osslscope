@@ -343,6 +343,10 @@ pub struct DispatchSnapshot {
     pub primary_init_observed: bool,
     /// Any dispatch trigger (query/alg/row) was observed.
     pub trigger_observed: bool,
+    /// Bootstrap-original provider binding (H6): (path,
+    /// stat-dev, ino) pinned at attach. The file-provider
+    /// mapped check reads this.
+    pub bootstrap_binding: Option<(String, String, u64)>,
 }
 
 /// Cumulative legacy-plane state. Query counters
@@ -817,6 +821,12 @@ pub struct SessionCore {
     dispatch_live: bool,
     /// Provider (path, dev, ino) the live dispatch links pin.
     dispatch_bound: Option<(String, String, u64)>,
+    /// Bootstrap-original provider binding (H6): the identity
+    /// pinned at attach, NEVER refreshed by reinstall (which
+    /// updates `dispatch_bound` only). The file-provider
+    /// mapped check reads this — the doc is about P, the
+    /// expected file.
+    bootstrap_binding: Option<(String, String, u64)>,
     /// Blind latch (F-D/A11): a failed reinstall retries only when
     /// the provider fingerprint differs from the latch print.
     dispatch_blind: bool,
@@ -886,6 +896,7 @@ impl SessionCore {
             trigger_observed: false,
             dispatch_live: false,
             dispatch_bound: None,
+            bootstrap_binding: None,
             dispatch_blind: false,
             dispatch_blind_print: None,
             preset_reason: None,
@@ -912,7 +923,10 @@ impl SessionCore {
         binding: Option<(String, String, u64)>,
     ) {
         self.dispatch_live = attached;
-        self.dispatch_bound = binding;
+        self.dispatch_bound = binding.clone();
+        // H6: bootstrap-original binding (set once — reinstall
+        // refreshes `dispatch_bound` but never this).
+        self.bootstrap_binding = binding;
         self.preset_reason = preset_reason;
         self.resolution = resolution;
     }
@@ -2385,6 +2399,7 @@ impl SessionCore {
                 reloads,
                 primary_init_observed: self.primary_init_observed,
                 trigger_observed: self.trigger_observed,
+                bootstrap_binding: self.bootstrap_binding.clone(),
             },
             legacy: LegacySnapshot {
                 planned: self.trip_live,
