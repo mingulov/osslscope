@@ -1072,7 +1072,9 @@ fn check_spawn_access() -> Check {
         // Kill failed on a live, unreaped child (EPERM/EINVAL are
         // impossible for our own pid+SIGKILL — this is defensive):
         // the wait below still reaps, but say so loudly.
-        eprintln!("osslscope doctor: probe kill failed: {kill_errno:?}");
+        crate::report::err_line(&format!(
+            "osslscope doctor: probe kill failed: {kill_errno:?}"
+        ));
     }
     let mut status2 = 0;
     loop {
@@ -1687,7 +1689,7 @@ pub fn run(args: &[String]) -> ExitCode {
             Ok(())
         })();
         if let Err(e) = r {
-            eprintln!("osslscope doctor: {e}\n{USAGE}");
+            crate::report::err_line(&format!("osslscope doctor: {e}\n{USAGE}"));
             return ExitCode::from(2);
         }
     }
@@ -1697,9 +1699,9 @@ pub fn run(args: &[String]) -> ExitCode {
         .count()
         > 1
     {
-        eprintln!(
+        crate::report::err_line(&format!(
             "osslscope doctor: use one target selector (--pid, --libcrypto, or --exe)\n{USAGE}"
-        );
+        ));
         return ExitCode::from(2);
     }
     // Build-id table: shipped frozen, --table overrides. Needed only
@@ -1708,7 +1710,7 @@ pub fn run(args: &[String]) -> ExitCode {
         Some(p) => match std::fs::read_to_string(p) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("osslscope doctor: bad --table {p}: {e}");
+                crate::report::err_line(&format!("osslscope doctor: bad --table {p}: {e}"));
                 return ExitCode::from(2);
             }
         },
@@ -1718,10 +1720,12 @@ pub fn run(args: &[String]) -> ExitCode {
         Ok(t) => t,
         Err(e) => {
             if table_path.is_some() {
-                eprintln!("osslscope doctor: bad --table file: {e:#}");
+                crate::report::err_line(&format!("osslscope doctor: bad --table file: {e:#}"));
                 return ExitCode::from(2);
             }
-            eprintln!("osslscope doctor: internal error (shipped table corrupt): {e:#}");
+            crate::report::err_line(&format!(
+                "osslscope doctor: internal error (shipped table corrupt): {e:#}"
+            ));
             return ExitCode::from(1);
         }
     };
@@ -1731,7 +1735,7 @@ pub fn run(args: &[String]) -> ExitCode {
         Some(p) => match onboard::load_enrollment_file(Path::new(p)) {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("osslscope doctor: {}", e.full());
+                crate::report::err_line(&format!("osslscope doctor: {}", e.full()));
                 return ExitCode::from(2);
             }
         },
@@ -1741,7 +1745,7 @@ pub fn run(args: &[String]) -> ExitCode {
         Some(s) => match crate::args::parse_force_offset(s) {
             Ok(n) => Some(n),
             Err(e) => {
-                eprintln!("osslscope doctor: {e}");
+                crate::report::err_line(&format!("osslscope doctor: {e}"));
                 return ExitCode::from(2);
             }
         },
@@ -1753,8 +1757,9 @@ pub fn run(args: &[String]) -> ExitCode {
         force_offset,
         enrollment: &enrollment,
     };
-    if pid.is_some_and(|p| !std::path::Path::new(&format!("/proc/{p}")).exists()) {
-        eprintln!("osslscope doctor: no such process {} (died?)", pid.unwrap());
+    // H7-T6: bind instead of unwrap (same guard, no panic shape).
+    if let Some(p) = pid.filter(|p| !std::path::Path::new(&format!("/proc/{p}")).exists()) {
+        crate::report::err_line(&format!("osslscope doctor: no such process {p} (died?)"));
         return ExitCode::from(2);
     }
 
@@ -2024,7 +2029,10 @@ pub fn run(args: &[String]) -> ExitCode {
             "verdict": if failed { "fail-closed" } else { "ok" },
             "exit": if failed { 4 } else { 0 },
         });
-        println!("{}", serde_json::to_string_pretty(&doc).unwrap());
+        // H7-T6: `Value` serialization is infallible; the fallback
+        // exists only to shed the panic shape (never observed).
+        let text = serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".to_string());
+        println!("{text}");
     } else {
         if let Some(t) = &target {
             println!(

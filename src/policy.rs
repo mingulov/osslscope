@@ -9,8 +9,8 @@
 //! definite/possible bounds; there is no boolean-first-alias shortcut.
 
 use crate::evidence::{
-    CandidateCoverage, CandidateIdentity, CaptureDocument, Completeness, GapReason, MatchBounds,
-    PredicateMatch, RuleVerdict, SiteExecution, SiteKey, match_bounds,
+    CandidateCoverage, CandidateIdentity, CaptureDocument, Completeness, FatalKind, GapReason,
+    MatchBounds, PredicateMatch, RuleVerdict, SiteExecution, SiteKey, match_bounds,
 };
 
 /// Classification bucket for unknown, aliased, overlong or unreadable
@@ -334,8 +334,9 @@ fn gap_relevant_to(area: RuleArea, reason: &GapReason) -> bool {
 
 /// Relevant completeness for one rule over a finalized document:
 /// COMPLETE is complete for every rule; PARTIAL is complete for a rule
-/// iff no gap relevant to its area remains. (Fatal documents never
-/// reach per-rule evaluation — see [`evaluate_document`].) Activity
+/// iff no gap relevant to its area remains. (Evidence-free fatal
+/// documents never reach per-rule evaluation; salvaged ones evaluate
+/// with relevant_complete false — see [`evaluate_document`].) Activity
 /// counters never appear here: only typed loss/coverage/time gaps do,
 /// so query/load/activity tallies cannot shape verdicts.
 pub fn relevant_complete(area: RuleArea, doc: &CaptureDocument) -> bool {
@@ -496,10 +497,21 @@ fn site_is_definite(predicate: &Predicate, site: &SiteExecution) -> bool {
 }
 
 /// Evaluate every rule over a finalized document (current plus fenced
-/// sites, conserved — no site counted twice). Fatal documents yield no
-/// verdict and no per-rule results: never a violation without evidence.
+/// sites, conserved — no site counted twice). Evidence-free fatal
+/// documents yield no verdict and no per-rule results: never a
+/// violation without evidence. Salvaged (runtime-fatal) documents
+/// carry real observed sites, so they evaluate like any doc — a
+/// proved violation still exits 10 (H7-T3).
 pub fn evaluate_document(rules: &[PolicyRule], doc: &CaptureDocument) -> PolicyVerdict {
-    if matches!(doc.status, Completeness::Fatal { .. }) {
+    if matches!(doc.status, Completeness::Fatal { .. })
+        && !matches!(
+            doc.status,
+            Completeness::Fatal {
+                kind: FatalKind::Runtime(_),
+                ..
+            }
+        )
+    {
         return PolicyVerdict {
             no_verdict: true,
             rules: Vec::new(),

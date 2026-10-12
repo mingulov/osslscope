@@ -54,7 +54,6 @@ use crate::evidence::{
     SiteKey, TargetRecord,
 };
 use crate::{args, kinds, pin, plan, target};
-use anyhow::Context as _;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -115,8 +114,9 @@ pub enum Target {
     Pid(u32),
 }
 
-/// Fatal (evidence-unusable) outcomes; the CLI maps these to exit 4
-/// (or 1 when the child itself failed — see report.rs precedence).
+/// Fatal outcomes; the CLI maps these per report.rs precedence
+/// (H7: `Runtime` — a salvaged post-observation tool failure — is
+/// exit 1; the rest are exit 4, or 1 when the child itself failed).
 #[derive(Debug, Clone)]
 pub enum FatalKind {
     /// Target recycled mid-window: all observations discarded.
@@ -127,6 +127,10 @@ pub enum FatalKind {
     /// Environment failure: BPF load, fork/exec, maps reads, ... —
     /// anything that is neither evidence nor a usage error.
     Env(String),
+    /// Post-observation tool failure (H7): the close flow broke
+    /// mid-run; the capture is salvaged (collected state kept,
+    /// failure folded in as fatal loss + reason).
+    Runtime(String),
 }
 
 /// Window outcome.
@@ -1873,6 +1877,26 @@ enum RoundAction {
     Recycled,
 }
 
+/// Pieces a salvage caller already collected (H7/B-6): `Some` = use
+/// as-is (that close is never retried — no double-close, single
+/// fatal); `None` = attempt best-effort inside salvage now.
+struct SalvageSeed {
+    drain: Option<CountDrain>,
+    snapshot: Option<DiscoverySnapshot>,
+    disposition: Option<target::TargetDisposition>,
+    effective_end_ns: u64,
+}
+
+/// What assembly must know about a salvage (H7): the dominating
+/// fatal plus whether counts were lost. Only a lost drain feeds
+/// H2's close-evidence taint — intact counts stay T3-reachable even
+/// when another close call failed (blanket taint would make
+/// violation-in-salvaged-sites unreachable, contradicting T3).
+struct SalvageContext {
+    fatal: evidence::FatalKind,
+    taint_evidence: bool,
+}
+
 /// The session-driven observation: owns both sessions, target
 /// custody, lifecycle, accumulation and finalization for one
 /// requested window.
@@ -1941,6 +1965,12 @@ struct Runner<'x, D, B: CountBackend, T, L, C: ClockPort, P: ProcPort> {
     /// Relevant paths dropped by the per-poll relevance/bytes
     /// caps (loud loss at finalize).
     relevance_capped: u64,
+    /// Setup-vs-runtime classifier (H7/B-6): false until the
+    /// observation loop starts (the baseline poll and count fence
+    /// are setup machinery — attach phase, exit 4 on failure).
+    /// Once set, failures salvage into fatal-Runtime captures
+    /// (exit 1) instead of returning Err.
+    observation_started: bool,
 }
 
 /// Maximum distinct file paths read per discovery poll
@@ -2407,13 +2437,134 @@ where
         Ok(RoundAction::Continue)
     }
 
-    /// Mid-window infrastructure failure: best-effort close (count
-    /// first, then discovery), custody resolved, original error kept.
+    /// Mid-window infrastructure failure (H7/B-6): before the
+    /// observation loop this keeps the setup shape (best-effort
+    /// cleanup, cleanup failures chained onto the original error);
+    /// once observing, it salvages into a fatal-Runtime capture.
     fn fail(mut self, err: anyhow::Error) -> anyhow::Result<Capture> {
-        let _ = self.count.close_and_drain(self.cfg.grace);
-        let _ = self.discovery.finish();
-        let _ = self.target.finish_observation();
+        if self.observation_started {
+            let effective_end_ns = self.clock.monotonic_ns().min(self.kernel_deadline_ns);
+            return Ok(self.salvage(
+                SalvageSeed {
+                    drain: None,
+                    snapshot: None,
+                    disposition: None,
+                    effective_end_ns,
+                },
+                err,
+            ));
+        }
+        let mut err = err;
+        if let Err(e) = self.count.close_and_drain(self.cfg.grace) {
+            err = err.context(format!("setup abandon also failed to close counts: {e:#}"));
+        }
+        if let Err(e) = self.discovery.finish() {
+            err = err.context(format!(
+                "setup abandon also failed to finish discovery: {e:#}"
+            ));
+        }
+        if let Err(e) = self.target.finish_observation() {
+            err = err.context(format!(
+                "setup abandon also failed to finish observation: {e:#}"
+            ));
+        }
         Err(err)
+    }
+
+    /// Post-observation salvage (H7/B-6): every remaining close is
+    /// attempted best-effort, every failure recorded as a typed loss
+    /// counter, and the doc assembles from collected state with a
+    /// fatal-Runtime verdict. Never fails; never retries a close the
+    /// caller already attempted (a `Some` seed piece is used as-is).
+    fn salvage(mut self, seed: SalvageSeed, err: anyhow::Error) -> Capture {
+        self.reason("close-failure");
+        let mut failures = vec![format!("{err:#}")];
+        let drain_failed: bool;
+        let drain = match seed.drain {
+            Some(drained) => {
+                drain_failed = false;
+                Some(drained)
+            }
+            None => match self.count.close_and_drain(self.cfg.grace) {
+                Ok(drained) => {
+                    drain_failed = false;
+                    Some(drained)
+                }
+                Err(e) => {
+                    self.extra_loss.push(typed_counter(
+                        "count.close_failed",
+                        CounterKind::Loss,
+                        CounterUnits::Events,
+                        CounterSource::Drain,
+                        1,
+                    ));
+                    failures.push(format!("close_and_drain: {e:#}"));
+                    drain_failed = true;
+                    None
+                }
+            },
+        };
+        let snapshot = match seed.snapshot {
+            Some(snapshot) => snapshot,
+            None => {
+                // Snapshot BEFORE attempting finish: on failure the
+                // live session is taken and only this pre-state
+                // survives for assembly.
+                let pre = self.discovery.snapshot();
+                match self.discovery.finish() {
+                    Ok(snapshot) => snapshot,
+                    Err(e) => {
+                        self.extra_loss.push(typed_counter(
+                            "discovery.finish_failed",
+                            CounterKind::Loss,
+                            CounterUnits::Events,
+                            CounterSource::Discovery,
+                            1,
+                        ));
+                        failures.push(format!("discovery finish: {e:#}"));
+                        pre
+                    }
+                }
+            }
+        };
+        let disposition = match seed.disposition {
+            Some(disposition) => Some(disposition),
+            None => match self.target.finish_observation() {
+                Ok(disposition) => Some(disposition),
+                Err(e) => {
+                    self.extra_loss.push(typed_counter(
+                        "target.finish_failed",
+                        CounterKind::Loss,
+                        CounterUnits::Events,
+                        CounterSource::Lifecycle,
+                        1,
+                    ));
+                    failures.push(format!("finish_observation: {e:#}"));
+                    None
+                }
+            },
+        };
+        if let Some(target::TargetDisposition::Exited { code }) = &disposition {
+            self.child_exit = Some(*code);
+        }
+        // A lost drain means lost counts (sites gone, not zero) —
+        // assemble over an explicitly empty drain, never a forged one.
+        let drain = drain.unwrap_or(CountDrain {
+            current: Vec::new(),
+            fenced: Vec::new(),
+            counters: Vec::new(),
+        });
+        let fatal = evidence::FatalKind::Runtime(crate::report::bound_line(&failures.join("; ")));
+        self.assemble(
+            snapshot,
+            drain,
+            disposition,
+            seed.effective_end_ns,
+            Some(SalvageContext {
+                fatal,
+                taint_evidence: drain_failed,
+            }),
+        )
     }
 
     /// Setup-phase result with no window opened (fast exit, setup
@@ -2479,8 +2630,30 @@ where
     /// Mid-window recycle: best-effort close, every observation
     /// discarded (pid-scoped evidence is tainted), fatal verdict.
     fn recycled(mut self) -> Capture {
-        let _ = self.count.close_and_drain(self.cfg.grace);
-        let _ = self.discovery.finish();
+        // H7: post-observation close — errors recorded as loss, not
+        // swallowed (the recycle verdict dominates, but close
+        // failures stay visible as typed counters + reason).
+        let mut close_failed = false;
+        if self.count.close_and_drain(self.cfg.grace).is_err() {
+            self.extra_loss.push(typed_counter(
+                "count.close_failed",
+                CounterKind::Loss,
+                CounterUnits::Events,
+                CounterSource::Drain,
+                1,
+            ));
+            close_failed = true;
+        }
+        if self.discovery.finish().is_err() {
+            self.extra_loss.push(typed_counter(
+                "discovery.finish_failed",
+                CounterKind::Loss,
+                CounterUnits::Events,
+                CounterSource::Discovery,
+                1,
+            ));
+            close_failed = true;
+        }
         let requested_end = self
             .requested_start_ns
             .saturating_add(duration_ns(self.cfg.duration));
@@ -2497,7 +2670,7 @@ where
             fenced: Vec::new(),
             objects: Vec::new(),
             coverage: Vec::new(),
-            counters: Vec::new(),
+            counters: self.extra_loss.clone(),
             fatal: Some(evidence::FatalKind::Recycled),
             target: doc_target(
                 self.info.pid,
@@ -2511,6 +2684,9 @@ where
         });
         self.reasons.clear();
         self.reason("pid-recycled");
+        if close_failed {
+            self.reason("close-failure");
+        }
         let window_actual = self
             .clock
             .now()
@@ -2653,6 +2829,7 @@ where
         drain_wall_us: 0,
         file_cache: HashMap::new(),
         relevance_capped: 0,
+        observation_started: false,
     };
     runner.fallback_partial = runner.lifecycle.fallback_partial();
     runner.setup_and_run()
@@ -2795,6 +2972,10 @@ where
         let settle_end =
             args::deadline_at(requested_instant, self.cfg.settle).unwrap_or(loop_deadline);
 
+        // H7/B-6: observation starts here — everything above is
+        // setup (baseline poll included: it seeds pre-window state,
+        // never evidence). From this point failures salvage.
+        self.observation_started = true;
         // Poll loop: expiry / signal / death / fence.
         loop {
             let now = self.clock.now();
@@ -2921,12 +3102,26 @@ where
         // (in-kernel TARGET=0 inside: no userspace delay can extend
         // counting past this point).
         let drain_t0 = self.clock.now();
+        // H7: pre-finish discovery snapshot — on any close failure
+        // below, salvage assembles from this pre-state (no polls run
+        // between here and finish, so it stays valid; a failed
+        // finish takes the live session).
+        let pre_finish = self.discovery.snapshot();
         let drain = match self.count.close_and_drain(self.cfg.grace) {
             Ok(drain) => drain,
             Err(e) => {
-                let _ = self.discovery.finish();
-                let _ = self.target.finish_observation();
-                return Err(e.context("close_and_drain"));
+                // Discovery finish is still attempted inside salvage
+                // (None seed) — only an already-failed finish takes
+                // the pre-finish fallback.
+                return Ok(self.salvage(
+                    SalvageSeed {
+                        drain: None,
+                        snapshot: None,
+                        disposition: None,
+                        effective_end_ns,
+                    },
+                    e.context("close_and_drain"),
+                ));
             }
         };
         self.drain_wall_us = self
@@ -2947,7 +3142,6 @@ where
         let snapshot = match self.discovery.finish() {
             Ok(snapshot) => snapshot,
             Err(e) => {
-                let _ = self.target.finish_observation();
                 let recycled = e.downcast_ref::<Recycled>();
                 match (pre_close, recycled) {
                     (Some(pre), Some(r)) => {
@@ -2965,18 +3159,38 @@ where
                         // stages no final.
                         r.final_snapshot.clone().unwrap_or(pre)
                     }
-                    _ => return Err(e.context("discovery finish")),
+                    _ => {
+                        return Ok(self.salvage(
+                            SalvageSeed {
+                                drain: Some(drain),
+                                snapshot: Some(pre_finish),
+                                disposition: None,
+                                effective_end_ns,
+                            },
+                            e.context("discovery finish"),
+                        ));
+                    }
                 }
             }
         };
-        let disposition = self
-            .target
-            .finish_observation()
-            .context("finish_observation")?;
+        let disposition = match self.target.finish_observation() {
+            Ok(disposition) => disposition,
+            Err(e) => {
+                return Ok(self.salvage(
+                    SalvageSeed {
+                        drain: Some(drain),
+                        snapshot: Some(snapshot),
+                        disposition: None,
+                        effective_end_ns,
+                    },
+                    e.context("finish_observation"),
+                ));
+            }
+        };
         if let target::TargetDisposition::Exited { code } = disposition {
             self.child_exit = Some(code);
         }
-        Ok(self.assemble(snapshot, drain, disposition, effective_end_ns))
+        Ok(self.assemble(snapshot, drain, Some(disposition), effective_end_ns, None))
     }
 
     /// Sites of one op with live probes (coverage attach census).
@@ -3005,8 +3219,9 @@ where
         mut self,
         snapshot: DiscoverySnapshot,
         mut drain: CountDrain,
-        disposition: target::TargetDisposition,
+        disposition: Option<target::TargetDisposition>,
         effective_end_ns: u64,
+        salvage: Option<SalvageContext>,
     ) -> Capture {
         if self.cold_gap_queries > 0 {
             self.extra_loss.push(typed_counter(
@@ -3081,7 +3296,9 @@ where
         // its /proc entry gone — the expected close single); live
         // targets have no benign maps failure. Needed before the
         // residual loop: the maps-source residual is exempt below.
-        let target_exited = matches!(disposition, target::TargetDisposition::Exited { .. });
+        // H7: unknown custody (salvaged finish_observation failure)
+        // is not an exit — the maps-source residual stays suspect.
+        let target_exited = matches!(disposition, Some(target::TargetDisposition::Exited { .. }));
         // Close reconcile (D2/D4): increments rode the deltas; only
         // the close-tail residual lands here, exactly once.
         let mut loss_residual_any = false;
@@ -3314,13 +3531,17 @@ where
         // so every count is mid-window turnover blindness. The
         // benign post-exit single lives on the discovery side
         // (HOST_MAPS_READ residual, exempt above).
+        // H7-T4: a lost drain feeds the close-evidence taint (a
+        // failed close may hide tails) — surviving denominators go
+        // Unknown. Salvages with intact counts do not taint.
         let close_evidence_global = loss_residual_any
             || snapshot.lossy_slots > 0
             || !snapshot.dispatch.attach_failures.is_empty()
             || !snapshot.retained_reasons.is_empty()
             || self.relevance_capped > 0
             || drain_shortfall > 0
-            || self.maps_read_failed > 0;
+            || self.maps_read_failed > 0
+            || salvage.as_ref().is_some_and(|s| s.taint_evidence);
         let close_evidence_ops: HashSet<u32> =
             snapshot.truncated_ops.iter().map(|(op, _)| *op).collect();
         // Census taint (denominators Unknown, emitted+proven sites
@@ -3427,11 +3648,16 @@ where
                 .min(effective_end_ns)
                 .max(self.requested_start_ns);
         }
-        let fatal = if self.attached_total == 0 && !self.adapter.emitted.is_empty() {
-            Some(evidence::FatalKind::AttachZero)
-        } else {
-            None
-        };
+        // H7: a salvage fatal dominates the attach-zero
+        // computation (the close failure is the verdict; zero
+        // attaches stay visible in the coverage rows).
+        let fatal = salvage.as_ref().map(|s| s.fatal.clone()).or(
+            if self.attached_total == 0 && !self.adapter.emitted.is_empty() {
+                Some(evidence::FatalKind::AttachZero)
+            } else {
+                None
+            },
+        );
         // H2 retrospective revision (A-6/B-3b): final evidence
         // taint (poll ∪ close) revises every claimed site —
         // current AND fenced — before the doc is built. Census
@@ -3483,7 +3709,7 @@ where
                 &self.info.image_digest,
             ),
             openssl: OpensslVersion::unknown(),
-            disposition: doc_disposition(self.info.owned, Some(&disposition)),
+            disposition: doc_disposition(self.info.owned, disposition.as_ref()),
             policy: None,
         });
 
@@ -3538,6 +3764,7 @@ where
                 evidence::FatalKind::Recycled => FatalKind::Recycled,
                 evidence::FatalKind::AttachZero => FatalKind::AttachZero,
                 evidence::FatalKind::Environment(msg) => FatalKind::Env(msg.clone()),
+                evidence::FatalKind::Runtime(msg) => FatalKind::Runtime(msg.clone()),
             }),
             _ => Outcome::Partial,
         };
@@ -3638,7 +3865,7 @@ where
                 counters,
                 legacy: legacy_doc,
                 harvest_doc,
-                disposition: Some(disposition),
+                disposition,
                 window_actual,
             },
         )
@@ -5189,5 +5416,694 @@ mod tests {
         let (paths, dropped) = relevant_paths(&DiscoveryDelta::default(), &live);
         assert_eq!(dropped, 0);
         assert!(paths.is_empty());
+    }
+
+    /// H7-T1/T5: failure fidelity — stub ports drive the Runner's
+    /// close paths directly. RED: close errors return Err today
+    /// (the CLI synthesizes an empty no-verdict doc, exit 4); H7
+    /// salvages them into fatal-Runtime captures (exit 1) that
+    /// keep every observation collected so far.
+    mod h7_salvage {
+        use super::*;
+        use crate::count_session::{CountDelta, FakeCountBackend};
+        use std::cell::Cell;
+
+        const TPID: u32 = 424242;
+
+        /// First X-segment file offset of an ELF image (attach plans
+        /// probes at X offsets only — an arbitrary offset filters out
+        /// and no cookie is ever issued).
+        fn x_offset(bytes: &[u8]) -> u64 {
+            use goblin::elf::program_header::{PF_X, PT_LOAD};
+            let elf = goblin::elf::Elf::parse(bytes).unwrap();
+            let ph = elf
+                .program_headers
+                .iter()
+                .find(|ph| ph.p_type == PT_LOAD && ph.p_flags & PF_X != 0)
+                .unwrap();
+            ph.p_offset + 8
+        }
+
+        static SEED_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+        /// Real temp file backing the seeded site: attach pins the
+        /// path on disk (`resolve_pinned`), so a fake path never
+        /// binds and its rows drain as unattributed. Removed on drop.
+        struct SeedFile {
+            path: String,
+        }
+
+        impl SeedFile {
+            fn fresh(bytes: &[u8]) -> Self {
+                use std::sync::atomic::Ordering;
+                let seq = SEED_SEQ.fetch_add(1, Ordering::SeqCst);
+                let dir = std::env::temp_dir().join(format!(
+                    "osslscope-h7-{}-{}-{:?}",
+                    std::process::id(),
+                    seq,
+                    std::thread::current().id()
+                ));
+                std::fs::create_dir_all(&dir).unwrap();
+                let path = dir.join("prov.so");
+                std::fs::write(&path, bytes).unwrap();
+                Self {
+                    path: path.to_str().unwrap().to_string(),
+                }
+            }
+
+            fn identity(&self) -> (u64, u64) {
+                use std::os::unix::fs::MetadataExt as _;
+                let meta = std::fs::metadata(&self.path).unwrap();
+                (
+                    crate::plan::encode_device(libc::major(meta.dev()), libc::minor(meta.dev())),
+                    meta.ino(),
+                )
+            }
+        }
+
+        impl Drop for SeedFile {
+            fn drop(&mut self) {
+                if let Some(dir) = std::path::Path::new(&self.path).parent() {
+                    let _ = std::fs::remove_dir_all(dir);
+                }
+            }
+        }
+
+        struct DiscoveryStub {
+            finish_err: bool,
+            poll_err: bool,
+            dispatch_attached: bool,
+        }
+        impl DiscoveryStub {
+            fn snapshot_value(&self) -> DiscoverySnapshot {
+                let mut snapshot = DiscoverySnapshot::default();
+                snapshot.dispatch.attached = self.dispatch_attached;
+                snapshot
+            }
+        }
+        impl DiscoveryPort for DiscoveryStub {
+            fn poll(&mut self, _budget: PollBudget) -> anyhow::Result<DiscoveryDelta> {
+                if self.poll_err {
+                    anyhow::bail!("injected poll failure");
+                }
+                Ok(DiscoveryDelta::default())
+            }
+            fn snapshot(&self) -> DiscoverySnapshot {
+                self.snapshot_value()
+            }
+            fn finish(&mut self) -> anyhow::Result<DiscoverySnapshot> {
+                if self.finish_err {
+                    anyhow::bail!("injected finish failure");
+                }
+                Ok(self.snapshot_value())
+            }
+        }
+
+        struct TargetStub;
+        impl TargetPort for TargetStub {
+            fn pid(&self) -> u32 {
+                TPID
+            }
+            fn is_owned(&self) -> bool {
+                false
+            }
+            fn release(&mut self) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn poll_exit(&mut self) -> anyhow::Result<Option<i32>> {
+                Ok(None)
+            }
+            fn resolve_setup_failure(&mut self) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn finish_observation(&mut self) -> anyhow::Result<target::TargetDisposition> {
+                Ok(target::TargetDisposition::Detached { pid: TPID })
+            }
+            fn verify(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        struct LifecycleStub;
+        impl LifecyclePort for LifecycleStub {
+            fn poll(&mut self) -> LifecycleDelta {
+                LifecycleDelta {
+                    events: Vec::new(),
+                    loss: 0,
+                }
+            }
+            fn fallback_partial(&self) -> bool {
+                false
+            }
+        }
+
+        struct ClockStub {
+            ns: Cell<u64>,
+            now: Cell<Instant>,
+            wall: SystemTime,
+        }
+        impl ClockStub {
+            fn at(ns: u64) -> Self {
+                Self {
+                    ns: Cell::new(ns),
+                    now: Cell::new(Instant::now()),
+                    wall: SystemTime::now(),
+                }
+            }
+        }
+        impl ClockPort for ClockStub {
+            fn monotonic_ns(&self) -> u64 {
+                self.ns.get()
+            }
+            fn now(&self) -> Instant {
+                self.now.get()
+            }
+            fn wall_now(&self) -> SystemTime {
+                self.wall
+            }
+            fn sleep(&self, d: Duration) {
+                self.ns.set(
+                    self.ns
+                        .get()
+                        .saturating_add(u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)),
+                );
+                self.now.set(self.now.get() + d);
+            }
+        }
+
+        struct ProcStub;
+        impl ProcPort for ProcStub {
+            fn read_maps(&mut self, _pid: u32) -> anyhow::Result<Vec<maps::Mapping>> {
+                Ok(Vec::new())
+            }
+            fn read_file(&mut self, _path: &str) -> anyhow::Result<Vec<u8>> {
+                anyhow::bail!("unstubbed")
+            }
+            fn read_file_bound(&mut self, _path: &str) -> anyhow::Result<(Vec<u8>, (u64, u64))> {
+                anyhow::bail!("unstubbed")
+            }
+            fn stat_file(&mut self, _path: &str) -> Option<(u64, u64)> {
+                None
+            }
+            fn read_exe(&mut self, _pid: u32) -> Option<PathBuf> {
+                None
+            }
+            fn file_len(&mut self, _path: &str) -> Option<u64> {
+                None
+            }
+            fn read_comm(&mut self, _pid: u32) -> Option<String> {
+                None
+            }
+        }
+
+        fn stub_config() -> Config {
+            Config {
+                harvest_object: None,
+                count_object: None,
+                provider: None,
+                builtin: false,
+                table: None,
+                force_offset: None,
+                provider_enrollment: None,
+                resolved_provider: None,
+                duration: Duration::from_secs(1),
+                settle: Duration::ZERO,
+                harvest_timeout: Duration::from_secs(5),
+                grace: Duration::from_secs(1),
+                image_digest: String::new(),
+            }
+        }
+
+        fn stub_info() -> TargetInfo {
+            TargetInfo {
+                pid: TPID,
+                owned: false,
+                comm: "stub".to_string(),
+                cmdline: String::new(),
+                container_id: String::new(),
+                kernel_release: String::new(),
+                provider_build_id: String::new(),
+                provider_path: String::new(),
+                image_digest: String::new(),
+                acquired_ns: 5_000_000_000,
+                acquired_instant: Instant::now(),
+                acquired_wall: SystemTime::now(),
+            }
+        }
+
+        type StubRunner<'x> = Runner<
+            'x,
+            DiscoveryStub,
+            FakeCountBackend,
+            TargetStub,
+            LifecycleStub,
+            ClockStub,
+            ProcStub,
+        >;
+
+        #[allow(clippy::too_many_arguments)]
+        fn stub_runner<'x>(
+            cfg: &'x Config,
+            info: &'x TargetInfo,
+            discovery: DiscoveryStub,
+            count: CountSession<FakeCountBackend>,
+            clock: &'x ClockStub,
+            proc: &'x mut ProcStub,
+            cancelled: &'x dyn Fn() -> bool,
+        ) -> StubRunner<'x> {
+            Runner {
+                cfg,
+                info,
+                discovery,
+                count,
+                target: TargetStub,
+                lifecycle: LifecycleStub,
+                clock,
+                proc,
+                cancelled,
+                reasons: HashSet::new(),
+                adapter: AdapterState::default(),
+                activity: Vec::new(),
+                extra_loss: Vec::new(),
+                in_window_trip: HashMap::new(),
+                in_window_hits: Vec::new(),
+                in_window_lgcalls: 0,
+                straddling_trip: HashMap::new(),
+                straddling_lgcalls: 0,
+                trigger_observed: false,
+                attached_total: 0,
+                cold_gap_queries: 0,
+                fork_exec_ignored: 0,
+                lifecycle_loss: 0,
+                maps_read_failed: 0,
+                scan_budget_exhaustions: 0,
+                provider_changed_fences: 0,
+                planned_paths: HashSet::new(),
+                site_cookies: HashMap::new(),
+                seen_backings: HashSet::new(),
+                snapshot: Snapshot::default(),
+                last_live: Vec::new(),
+                comm: info.comm.clone(),
+                child_exit: None,
+                signal_cut: false,
+                expired: false,
+                fallback_partial: false,
+                window_start_ns: 5_000_000_000,
+                requested_start_ns: 5_000_000_000,
+                kernel_deadline_ns: 7_000_000_000,
+                open_instant: clock.now(),
+                open_wall: clock.wall_now(),
+                drain_wall_us: 0,
+                file_cache: HashMap::new(),
+                relevance_capped: 0,
+                observation_started: false,
+            }
+        }
+
+        /// One attached site with 7 in-window calls: a real temp
+        /// file carries the test binary's own ELF bytes (attach
+        /// planning parses ELF and pins the path — zeros and fake
+        /// paths never bind). The caller holds the file until the
+        /// drain completes.
+        fn seed_site(count: &mut CountSession<FakeCountBackend>) -> SeedFile {
+            let bytes = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+            let off = x_offset(&bytes);
+            let seed = SeedFile::fresh(&bytes);
+            let (dev, ino) = seed.identity();
+            let site = DiscoveredSite {
+                site: SiteKey {
+                    object: ObjectId("fp-A".to_string()),
+                    device: dev,
+                    inode: ino,
+                    offset: off,
+                },
+                candidates: vec![CandidateIdentity::new(
+                    ObjectId("prov".to_string()),
+                    "default".to_string(),
+                    1,
+                    7,
+                    vec!["digest".to_string()],
+                    false,
+                )],
+                candidates_coverage: CandidateCoverage::Complete,
+            };
+            let live = vec![unit_mapping(
+                &seed.path,
+                &crate::plan::render_device(dev),
+                ino,
+                0x7f00_0000_0000,
+                true,
+            )];
+            let files = HashMap::from([(
+                seed.path.clone(),
+                crate::plan::FileBytes { bytes, dev, ino },
+            )]);
+            let delta = CountDelta {
+                discovered: vec![site],
+                losses: Vec::new(),
+            };
+            count.attach_delta(&delta, &live, &files).unwrap();
+            let cookie = count.cookie_for(dev, ino, off).unwrap();
+            count.open_window(1000, 2000).unwrap();
+            count.backend_mut().fire(TPID, cookie, 1500, 7);
+            seed
+        }
+
+        fn counter(doc: &CaptureDocument, name: &str) -> u64 {
+            doc.counters
+                .iter()
+                .find(|c| c.name == name)
+                .map(|c| c.value)
+                .unwrap_or(0)
+        }
+
+        #[test]
+        fn h7_close_finish_error_salvages_sites() {
+            // T1a (RED): discovery.finish fails AFTER the drain
+            // succeeded — the observed sites must survive in a
+            // salvaged capture, not vanish into an Err.
+            let cfg = stub_config();
+            let info = stub_info();
+            let clock = ClockStub::at(1_500);
+            let mut proc = ProcStub;
+            let cancelled = || false;
+            let mut count = CountSession::new(TPID, FakeCountBackend::new());
+            let _seed = seed_site(&mut count);
+            let runner = stub_runner(
+                &cfg,
+                &info,
+                DiscoveryStub {
+                    finish_err: true,
+                    poll_err: false,
+                    dispatch_attached: false,
+                },
+                count,
+                &clock,
+                &mut proc,
+                &cancelled,
+            );
+            let cap = runner
+                .close_and_finalize()
+                .expect("H7: finish error must salvage, not Err");
+            assert_eq!(cap.document.sites.len(), 1);
+            assert_eq!(cap.document.sites[0].calls, 7);
+            assert!(cap.reasons.iter().any(|r| r == "close-failure"));
+            // Fatal kind + message (RED: no Runtime variant yet).
+            let detail = match &cap.document.status {
+                Completeness::Fatal {
+                    kind: evidence::FatalKind::Runtime(detail),
+                    ..
+                } => detail.clone(),
+                other => panic!("want Fatal(Runtime), got {other:?}"),
+            };
+            assert!(
+                detail.contains("discovery finish"),
+                "unexpected detail: {detail}"
+            );
+            // Counts are intact on this path (the drain succeeded),
+            // so surviving sites stay Complete — T3-reachable.
+            assert_eq!(
+                cap.document.sites[0].candidates_coverage,
+                CandidateCoverage::Complete
+            );
+        }
+
+        #[test]
+        fn h7_close_drain_error_salvages_without_sites() {
+            // T1b (RED): close_and_drain fails (here: the session was
+            // already drained — the same Err arm a real close I/O
+            // error takes) — salvage keeps the loss explicit, with
+            // no sites (the drain is gone) and a typed loss counter.
+            let cfg = stub_config();
+            let info = stub_info();
+            let clock = ClockStub::at(1_500);
+            let mut proc = ProcStub;
+            let cancelled = || false;
+            let mut count = CountSession::new(TPID, FakeCountBackend::new());
+            let _seed = seed_site(&mut count);
+            count.close_and_drain(Duration::from_secs(1)).unwrap();
+            let runner = stub_runner(
+                &cfg,
+                &info,
+                DiscoveryStub {
+                    finish_err: false,
+                    poll_err: false,
+                    dispatch_attached: false,
+                },
+                count,
+                &clock,
+                &mut proc,
+                &cancelled,
+            );
+            let cap = runner
+                .close_and_finalize()
+                .expect("H7: drain error must salvage, not Err");
+            assert!(cap.document.sites.is_empty());
+            assert_eq!(counter(&cap.document, "count.close_failed"), 1);
+            assert!(cap.reasons.iter().any(|r| r == "close-failure"));
+        }
+
+        #[test]
+        fn h7_double_close_failure_salvages_once() {
+            // T5 (RED): drain AND finish both fail — one salvaged
+            // capture, both losses recorded, no double-close cascade.
+            let cfg = stub_config();
+            let info = stub_info();
+            let clock = ClockStub::at(1_500);
+            let mut proc = ProcStub;
+            let cancelled = || false;
+            let mut count = CountSession::new(TPID, FakeCountBackend::new());
+            let _seed = seed_site(&mut count);
+            count.close_and_drain(Duration::from_secs(1)).unwrap();
+            let runner = stub_runner(
+                &cfg,
+                &info,
+                DiscoveryStub {
+                    finish_err: true,
+                    poll_err: false,
+                    dispatch_attached: false,
+                },
+                count,
+                &clock,
+                &mut proc,
+                &cancelled,
+            );
+            let cap = runner
+                .close_and_finalize()
+                .expect("H7: double close error must salvage once, not Err");
+            assert!(cap.document.sites.is_empty());
+            assert_eq!(counter(&cap.document, "count.close_failed"), 1);
+            assert_eq!(counter(&cap.document, "discovery.finish_failed"), 1);
+            assert!(cap.reasons.iter().any(|r| r == "close-failure"));
+        }
+
+        #[test]
+        fn h7_setup_poll_error_stays_err() {
+            // T1f (PIN, green now): pre-observation failures keep the
+            // setup shape — Err out of setup_and_run, exit 4 at the
+            // CLI — even after H7.
+            let cfg = stub_config();
+            let info = stub_info();
+            let clock = ClockStub::at(5_000_000_000);
+            let mut proc = ProcStub;
+            let cancelled = || false;
+            let count = CountSession::new(TPID, FakeCountBackend::new());
+            let runner = stub_runner(
+                &cfg,
+                &info,
+                DiscoveryStub {
+                    finish_err: false,
+                    poll_err: true,
+                    dispatch_attached: false,
+                },
+                count,
+                &clock,
+                &mut proc,
+                &cancelled,
+            );
+            let err = runner
+                .setup_and_run()
+                .expect_err("setup poll must stay Err");
+            assert!(
+                format!("{err:#}").contains("setup discovery poll"),
+                "unexpected: {err:#}"
+            );
+        }
+
+        #[test]
+        fn h7_setup_and_run_finish_error_salvages() {
+            // T1e (RED): end-to-end bit wiring — a full setup_and_run
+            // whose discovery.finish fails must salvage (proving the
+            // observation bit was set by the loop, not by hand).
+            let cfg = stub_config();
+            let info = stub_info();
+            let clock = ClockStub::at(5_000_000_000);
+            let mut proc = ProcStub;
+            let cancelled = || false;
+            let count = CountSession::new(TPID, FakeCountBackend::new());
+            let runner = stub_runner(
+                &cfg,
+                &info,
+                DiscoveryStub {
+                    finish_err: true,
+                    poll_err: false,
+                    dispatch_attached: false,
+                },
+                count,
+                &clock,
+                &mut proc,
+                &cancelled,
+            );
+            let cap = runner
+                .setup_and_run()
+                .expect("H7: mid-run finish error must salvage, not Err");
+            assert!(cap.reasons.iter().any(|r| r == "close-failure"));
+        }
+
+        fn dispatch_expected(doc: &CaptureDocument) -> ExpectedScope {
+            doc.coverage
+                .iter()
+                .find(|c| c.scope == "dispatch")
+                .unwrap_or_else(|| panic!("want a dispatch row: {:?}", doc.coverage))
+                .expected
+        }
+
+        #[test]
+        fn h7_clean_close_keeps_dispatch_applicable() {
+            // T4 control (green now): an attached dispatch anchor
+            // with a clean close claims Applicable — the baseline
+            // the taint test below inverts.
+            let cfg = stub_config();
+            let info = stub_info();
+            let clock = ClockStub::at(1_500);
+            let mut proc = ProcStub;
+            let cancelled = || false;
+            let mut count = CountSession::new(TPID, FakeCountBackend::new());
+            let _seed = seed_site(&mut count);
+            let runner = stub_runner(
+                &cfg,
+                &info,
+                DiscoveryStub {
+                    finish_err: false,
+                    poll_err: false,
+                    dispatch_attached: true,
+                },
+                count,
+                &clock,
+                &mut proc,
+                &cancelled,
+            );
+            let cap = runner.close_and_finalize().expect("clean close");
+            assert_eq!(
+                dispatch_expected(&cap.document),
+                ExpectedScope::Applicable { sites: 1 }
+            );
+        }
+
+        #[test]
+        fn h7_drain_error_taints_coverage_unknown() {
+            // T4 (RED): a close_and_drain error feeds H2's
+            // close-evidence taint — surviving coverage denominators
+            // go Unknown (a failed close may hide tails).
+            let cfg = stub_config();
+            let info = stub_info();
+            let clock = ClockStub::at(1_500);
+            let mut proc = ProcStub;
+            let cancelled = || false;
+            let mut count = CountSession::new(TPID, FakeCountBackend::new());
+            let _seed = seed_site(&mut count);
+            count.close_and_drain(Duration::from_secs(1)).unwrap();
+            let runner = stub_runner(
+                &cfg,
+                &info,
+                DiscoveryStub {
+                    finish_err: false,
+                    poll_err: false,
+                    dispatch_attached: true,
+                },
+                count,
+                &clock,
+                &mut proc,
+                &cancelled,
+            );
+            let cap = runner
+                .close_and_finalize()
+                .expect("H7: drain error must salvage, not Err");
+            assert_eq!(dispatch_expected(&cap.document), ExpectedScope::Unknown);
+        }
+
+        #[test]
+        fn h7_fail_before_observation_stays_err() {
+            // PIN: fail() with the observation bit clear keeps the
+            // setup shape — Err with cleanup failures chained, never
+            // a salvaged doc.
+            let cfg = stub_config();
+            let info = stub_info();
+            let clock = ClockStub::at(1_500);
+            let mut proc = ProcStub;
+            let cancelled = || false;
+            let count = CountSession::new(TPID, FakeCountBackend::new());
+            let runner = stub_runner(
+                &cfg,
+                &info,
+                DiscoveryStub {
+                    finish_err: false,
+                    poll_err: false,
+                    dispatch_attached: false,
+                },
+                count,
+                &clock,
+                &mut proc,
+                &cancelled,
+            );
+            let err = runner
+                .fail(anyhow::anyhow!("poll_exit: boom"))
+                .expect_err("pre-observation fail must stay Err");
+            assert!(
+                format!("{err:#}").contains("poll_exit: boom"),
+                "unexpected: {err:#}"
+            );
+        }
+
+        #[test]
+        fn h7_fail_after_observation_salvages() {
+            // RED (compile: no bit yet): fail() with the observation
+            // bit set salvages into a fatal-Runtime capture.
+            let cfg = stub_config();
+            let info = stub_info();
+            let clock = ClockStub::at(1_500);
+            let mut proc = ProcStub;
+            let cancelled = || false;
+            let count = CountSession::new(TPID, FakeCountBackend::new());
+            let mut runner = stub_runner(
+                &cfg,
+                &info,
+                DiscoveryStub {
+                    finish_err: false,
+                    poll_err: false,
+                    dispatch_attached: false,
+                },
+                count,
+                &clock,
+                &mut proc,
+                &cancelled,
+            );
+            runner.observation_started = true;
+            let cap = runner
+                .fail(anyhow::anyhow!("poll_exit: boom"))
+                .expect("H7: post-observation fail must salvage, not Err");
+            assert!(
+                matches!(
+                    cap.document.status,
+                    Completeness::Fatal {
+                        kind: evidence::FatalKind::Runtime(_),
+                        ..
+                    }
+                ),
+                "unexpected: {:?}",
+                cap.document.status
+            );
+            assert!(cap.reasons.iter().any(|r| r == "close-failure"));
+        }
     }
 }

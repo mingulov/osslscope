@@ -149,12 +149,14 @@ addresses claimed by several (provider, op, funcid) triples.
 | Code | Meaning |
 | ---- | ------- |
 | 0 | ok (check: no violation) |
-| 1 | observed child failed (`run --`) or internal error |
+| 1 | tool failure: observed child failed (`run --`), artifact delivery failed, or a post-observation close failure (salvaged `runtime`-fatal doc — observations kept, see JSON) |
 | 2 | usage error |
 | 3 | PARTIAL — degraded evidence, see JSON (`report`/`check` only; `inspect` reports PARTIAL in-doc with exit 0) |
-| 4 | fatal — evidence unusable (incl. unsuitable target, pid recycled) |
-| 10 | policy violation (`check`) |
+| 4 | fatal setup failure — evidence unusable because observation never started (incl. unsuitable target, pid recycled, environment/attach failure) |
+| 10 | policy violation (`check`) — dominates every tool failure (a proved violation in salvaged sites still exits 10) |
 | 11 | inconclusive (`check`) — requirement unproven under relevant uncertainty |
+
+Priority (PRD §14, H7-extended): 2 usage > 10 violation > 1 salvaged runtime-fatal > 4 setup-no-verdict > 1 failed child / failed delivery > 11 inconclusive > 3 partial > 0 clean. Exit 1 says "the tool broke" (with observations kept on the salvaged row); exit 3 says "the observation is incomplete"; exit 4 says "observation never started".
 
 ## Current limitations (honest)
 

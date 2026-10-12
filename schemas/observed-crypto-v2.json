@@ -63,7 +63,7 @@
               "required": ["kind", "detail"],
               "additionalProperties": false,
               "properties": {
-                "kind": { "enum": ["recycled", "attach-zero", "environment"] },
+                "kind": { "enum": ["recycled", "attach-zero", "environment", "runtime"] },
                 "detail": { "type": ["string", "null"] }
               }
             }

@@ -184,17 +184,34 @@ fn parse(argv: &[String]) -> Result<Args, String> {
 /// maps its capture outcome to a policy outcome (fatal →
 /// no-verdict, anything else → pass) and lets the shared table do
 /// the rest.
+/// Exit table (PRD §14 precedence, H7-extended): 2 usage (decided
+/// at CLI parse, before this fn) > 10 violation > 1 salvaged
+/// runtime-fatal > 4 setup-no-verdict > 1 failed child / failed
+/// delivery > 11 inconclusive > 3 partial > 0 clean. (The 1-group is
+/// split by normative PRD order: a salvaged doc dominates
+/// no-verdict — observations exist to look at — while child/delivery
+/// failures stay below it. Violation-vs-no-verdict order is moot:
+/// one outcome never carries both.)
 pub fn exit_for(
     outcome: crate::policy::PolicyOutcome,
     child_exit: Option<i32>,
     doc: &CaptureDocument,
     delivery: &DeliveryResult,
 ) -> u8 {
-    if outcome == crate::policy::PolicyOutcome::NoVerdict {
-        return 4;
-    }
     if outcome == crate::policy::PolicyOutcome::Violation {
         return 10;
+    }
+    if matches!(
+        &doc.status,
+        Completeness::Fatal {
+            kind: FatalKind::Runtime(_),
+            ..
+        }
+    ) {
+        return 1;
+    }
+    if outcome == crate::policy::PolicyOutcome::NoVerdict {
+        return 4;
     }
     if matches!(child_exit, Some(code) if code != 0) {
         return 1;
@@ -256,8 +273,8 @@ pub fn run(argv: &[String]) -> ExitCode {
     let args = match parse(argv) {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("osslscope report: {e}");
-            eprintln!("{USAGE}");
+            err_line(&format!("osslscope report: {e}"));
+            err_line(USAGE);
             return ExitCode::from(2);
         }
     };
@@ -283,8 +300,8 @@ pub fn run(argv: &[String]) -> ExitCode {
             // F-E/B4: setup/environment failures still attempt
             // every requested artifact from a typed no-evidence
             // document instead of returning with nothing written.
-            eprintln!("osslscope report: {e:#}");
-            eprintln!("osslscope report: run 'osslscope doctor' to diagnose environment failures");
+            err_line(&format!("osslscope report: {e:#}"));
+            err_line("osslscope report: run 'osslscope doctor' to diagnose environment failures");
             let document =
                 setup_failure_document(FatalKind::Environment(bound_line(&format!("{e:#}"))));
             let delivery = write_artifacts(&document, &req);
@@ -515,6 +532,10 @@ fn doc_json(doc: &CaptureDocument) -> serde_json::Value {
             kind: FatalKind::Environment(detail),
             ..
         } => serde_json::json!({"kind": "environment", "detail": detail}),
+        Completeness::Fatal {
+            kind: FatalKind::Runtime(detail),
+            ..
+        } => serde_json::json!({"kind": "runtime", "detail": detail}),
         _ => serde_json::Value::Null,
     };
     let mut out = serde_json::json!({
@@ -774,6 +795,9 @@ pub fn render_human(doc: &CaptureDocument) -> String {
             }
             FatalKind::Environment(detail) => {
                 s.push_str(&format!("fatal: environment: {detail}\n"));
+            }
+            FatalKind::Runtime(detail) => {
+                s.push_str(&format!("fatal: runtime: {detail}\n"));
             }
         }
         s.push('\n');
@@ -1223,6 +1247,7 @@ fn cbom_json(doc: &CaptureDocument) -> serde_json::Value {
                     FatalKind::Recycled => "recycled",
                     FatalKind::AttachZero => "attach-zero",
                     FatalKind::Environment(_) => "environment",
+                    FatalKind::Runtime(_) => "runtime",
                 }
                 .to_string()
             } else {
@@ -1395,13 +1420,39 @@ pub fn write_artifacts(doc: &CaptureDocument, req: &OutputRequest) -> DeliveryRe
     }
 }
 
+/// Render bounded delivery diagnostics into any sink (H7/B-7):
+/// the sink error surfaces to the caller (tests observe it); the
+/// CLI wrapper below discards it — diagnostics are advisory and
+/// must never perturb the exit nor panic (no 101).
+pub fn emit_diagnostics_to(
+    writer: &mut dyn std::io::Write,
+    result: &DeliveryResult,
+) -> std::io::Result<()> {
+    for line in &result.diagnostics {
+        writeln!(writer, "osslscope: {line}")?;
+    }
+    Ok(())
+}
+
 /// Emit bounded delivery diagnostics to stderr (T10 calls this after
 /// [`write_artifacts`]; the same strings are in
-/// [`DeliveryResult::diagnostics`] for tests).
+/// [`DeliveryResult::diagnostics`] for tests). A broken stderr
+/// degrades to silence, never to a panic.
 pub fn emit_diagnostics(result: &DeliveryResult) {
-    for line in &result.diagnostics {
-        eprintln!("osslscope: {line}");
-    }
+    let stderr = std::io::stderr();
+    let mut locked = stderr.lock();
+    let _ = emit_diagnostics_to(&mut locked, result);
+}
+
+/// One CLI error line to locked stderr, panic-free (H7/B-7): every
+/// CLI error-path print goes through here so a broken stderr
+/// degrades to silence, never to exit 101. Deliberately infallible
+/// (the `let _` is the design, not a swallow — see the T6 audit).
+pub fn err_line(text: &str) {
+    use std::io::Write as _;
+    let stderr = std::io::stderr();
+    let mut locked = stderr.lock();
+    let _ = writeln!(locked, "{text}");
 }
 
 #[cfg(test)]

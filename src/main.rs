@@ -14,7 +14,7 @@ fn main() -> ExitCode {
     let argv = match osslscope::args::decode_argv(&os_args) {
         Ok(argv) => argv,
         Err(e) => {
-            eprintln!("osslscope: {e}");
+            osslscope::report::err_line(&format!("osslscope: {e}"));
             return ExitCode::from(2);
         }
     };

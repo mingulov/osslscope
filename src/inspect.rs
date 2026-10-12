@@ -63,13 +63,13 @@ pub fn run(args: &[String]) -> ExitCode {
             Ok(())
         })();
         if let Err(e) = r {
-            eprintln!("osslscope inspect: {e}");
+            crate::report::err_line(&format!("osslscope inspect: {e}"));
             return ExitCode::from(2);
         }
     }
     let (Some(pid), Some(provider), Some(object)) = (pid, provider, object) else {
-        eprintln!(
-            "usage: osslscope inspect --pid PID --provider SO --object BPF [--out FILE] [--marker M] [--settle S] [--timeout S] [--builtin [--table FILE] [--force-offset N]] [--legacy]"
+        crate::report::err_line(
+            "usage: osslscope inspect --pid PID --provider SO --object BPF [--out FILE] [--marker M] [--settle S] [--timeout S] [--builtin [--table FILE] [--force-offset N]] [--legacy]",
         );
         return ExitCode::from(2);
     };
@@ -89,7 +89,9 @@ pub fn run(args: &[String]) -> ExitCode {
         observed_from_birth: false,
     };
     let emit = |doc: &serde_json::Value| {
-        let text = serde_json::to_string_pretty(doc).unwrap();
+        // H7-T6: `Value` serialization is infallible; the fallback
+        // exists only to shed the panic shape (never observed).
+        let text = serde_json::to_string_pretty(doc).unwrap_or_else(|_| "{}".to_string());
         if let Some(path) = &out {
             std::fs::write(path, &text).map_err(|e| format!("write {}: {e}", path.display()))
         } else {
@@ -100,7 +102,7 @@ pub fn run(args: &[String]) -> ExitCode {
     match harvest::run(&cfg) {
         Ok(doc) => {
             if let Err(e) = emit(&doc) {
-                eprintln!("osslscope inspect: {e}");
+                crate::report::err_line(&format!("osslscope inspect: {e}"));
                 return ExitCode::FAILURE;
             }
             ExitCode::SUCCESS
@@ -110,13 +112,13 @@ pub fn run(args: &[String]) -> ExitCode {
             // travels (never rows), flagged by exit 4.
             if let Some(r) = e.downcast_ref::<harvest::Recycled>() {
                 if let Err(e) = emit(&r.doc) {
-                    eprintln!("osslscope inspect: {e}");
+                    crate::report::err_line(&format!("osslscope inspect: {e}"));
                     return ExitCode::FAILURE;
                 }
-                eprintln!("osslscope inspect: {r}");
+                crate::report::err_line(&format!("osslscope inspect: {r}"));
                 return ExitCode::from(4);
             }
-            eprintln!("osslscope inspect: {e:#}");
+            crate::report::err_line(&format!("osslscope inspect: {e:#}"));
             ExitCode::FAILURE
         }
     }
