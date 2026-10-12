@@ -50,10 +50,51 @@ fn gated() -> Option<PathBuf> {
 }
 
 fn load_members(obj: &std::path::Path) -> Loaded {
+    raise_fd_limit();
     let bytes = std::fs::read(obj).expect("read members.o");
     let prep =
         osslscope::loader::prepare(&bytes, &MEMBER_MAPS, &MEMBER_PROGS).expect("prepare members.o");
     osslscope::loader::load(&prep).expect("load members.o")
+}
+
+/// Raise RLIMIT_NOFILE for the chunk's fd budget: 513 prog fds + 7
+/// map fds + 513 link fds (all held — drop = detach) + clones +
+/// stdio ≈ 1040 > the 1024 default (observed EMFILE at member_499).
+/// Unprivileged (soft raise under the hard cap), fail-closed when
+/// the hard cap itself is too small. Item-3 session carryover: the
+/// production attach path must raise/check this too.
+fn raise_fd_limit() {
+    const WANT: libc::rlim_t = 8192;
+    const NEED: libc::rlim_t = 4096;
+    unsafe {
+        let mut r = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(
+            libc::getrlimit(libc::RLIMIT_NOFILE, &mut r as *mut _),
+            0,
+            "getrlimit"
+        );
+        if r.rlim_cur < WANT {
+            r.rlim_cur = std::cmp::min(WANT, r.rlim_max);
+            assert_eq!(
+                libc::setrlimit(libc::RLIMIT_NOFILE, &r as *const _),
+                0,
+                "setrlimit NOFILE"
+            );
+            assert_eq!(
+                libc::getrlimit(libc::RLIMIT_NOFILE, &mut r as *mut _),
+                0,
+                "getrlimit"
+            );
+        }
+        assert!(
+            r.rlim_cur >= NEED,
+            "NOFILE {} below the 1033-fd chunk budget",
+            r.rlim_cur
+        );
+    }
 }
 
 /// Populate the member object's `ALG_CLASS` with fixture entries
