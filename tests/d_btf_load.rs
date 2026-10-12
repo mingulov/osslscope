@@ -547,6 +547,106 @@ fn bpf_loop_shape_kernel_image_matches_send() {
     );
 }
 
+/// Manual load of the prepared callback shape with caller-chosen
+/// func_info records: map create + fixup patch (same encoding the
+/// loader applies) + BTF synth/upload + log-buffer load (the
+/// loader's quiet-first path keeps no log). Returns the verifier
+/// log text. Callers corrupt `info` to pin kernel metadata
+/// rejections.
+fn load_with_func_info(
+    p: &osslscope::loader::PreparedProg,
+    info: &[(u32, u32)],
+    prog_name: &str,
+) -> anyhow::Result<String> {
+    use anyhow::Context as _;
+    let (btf, _) = osslscope::loader::synth_btf(&p.subprogs)?;
+    let mut func_info_bytes: Vec<u8> = Vec::new();
+    for (off, id) in info {
+        func_info_bytes.extend_from_slice(&off.to_le_bytes());
+        func_info_bytes.extend_from_slice(&id.to_le_bytes());
+    }
+    let mut btf_log = vec![0u8; 1 << 16];
+    let btf_fd = ossl_bpf_sys::btf_load(&btf, &mut btf_log)?;
+    assert_eq!(p.map_fixups.len(), 1, "one DCOUNT site expected");
+    let f = &p.map_fixups[0];
+    let map_fd = ossl_bpf_sys::map_create(2, 4, 8, 1, None, "DCOUNT")?;
+    let mut insns = p.insns.clone();
+    let slot = insns
+        .get_mut(f.insn_off..f.insn_off + 8)
+        .context("fixup range")?;
+    slot[1] = (slot[1] & 0x0f) | (1 << 4);
+    slot[4..8].copy_from_slice(&(map_fd.as_raw_fd() as u32).to_le_bytes());
+    let mut log = vec![0u8; 1 << 20];
+    let btf_attach = ossl_bpf_sys::ProgBtf {
+        btf_fd: btf_fd.as_raw_fd(),
+        func_info: &func_info_bytes,
+    };
+    let r =
+        ossl_bpf_sys::prog_load_kprobe(&insns, c"GPL", None, &mut log, prog_name, Some(btf_attach));
+    if let Err(e) = r {
+        // Kernel evidence: trailing log lines carry the rejection
+        // mode (the DMETA prints below show them).
+        let text = String::from_utf8_lossy(&log);
+        let tail: String = text.trim_end().chars().rev().take(600).collect();
+        let tail: String = tail.chars().rev().collect();
+        return Err(anyhow::anyhow!("prog load: {e}\nlog tail: {tail}"));
+    }
+    Ok(String::from_utf8_lossy(&log).into_owned())
+}
+
+/// Malformed upload metadata must fail: the kernel re-validates
+/// every func_info record, so lying counts, offsets, or type IDs
+/// never load silently (defense in depth behind the loader's own
+/// synthesis validation). Rejection MODES are kernel evidence
+/// (printed, not pinned — kernel text is not our contract); the
+/// pin is that each corruption FAILS.
+#[test]
+#[ignore = "live lane only (see module docs)"]
+fn malformed_func_info_is_rejected() {
+    if !gated() {
+        eprintln!("d live leg: set OSSL_D_LIVE=1; skipping");
+        return;
+    }
+    let prep = prepare_loop();
+    let p = &prep.progs[0];
+    let (_, info) = osslscope::loader::synth_btf(&p.subprogs).expect("synth");
+    assert_eq!(info.len(), 2, "main + callback records expected");
+    // (a) Dropped callback record: count 1 for 2 subprogs.
+    let e = load_with_func_info(p, &info[..1], "dprobemeta")
+        .err()
+        .expect("dropped record must fail");
+    eprintln!("DMETA dropped-record: {e:#}");
+    // (b) Callback offset shifted mid-function.
+    let mut bad = info.clone();
+    bad[1].0 += 1;
+    let e = load_with_func_info(p, &bad, "dprobemeta")
+        .err()
+        .expect("shifted offset must fail");
+    eprintln!("DMETA shifted-offset: {e:#}");
+    // (c) Callback type id to a non-FUNC (INT u64, id 1).
+    let mut bad = info.clone();
+    bad[1].1 = 1;
+    let e = load_with_func_info(p, &bad, "dprobemeta")
+        .err()
+        .expect("non-FUNC type id must fail");
+    eprintln!("DMETA non-func-id: {e:#}");
+    // (d) Callback type id out of range.
+    let mut bad = info.clone();
+    bad[1].1 = 999;
+    let e = load_with_func_info(p, &bad, "dprobemeta")
+        .err()
+        .expect("out-of-range type id must fail");
+    eprintln!("DMETA oor-id: {e:#}");
+    // (e) Extra record past the subprog count (off 100 is past
+    // the image end).
+    let mut extra = info.clone();
+    extra.push((100, 1));
+    let e = load_with_func_info(p, &extra, "dprobemeta")
+        .err()
+        .expect("extra record must fail");
+    eprintln!("DMETA extra-record: {e:#}");
+}
+
 /// Success-path verifier cost for the callback shape: reload with
 /// a log buffer and report the `processed N insns` summary (the
 /// callback-once budget the D decision is weighed against).
@@ -563,43 +663,8 @@ fn bpf_loop_shape_verifier_cost() {
         p.subprogs.iter().any(|s| s.is_callback),
         "cost leg needs the callback shape"
     );
-    // Same BTF the loader attaches: synthesize + upload, then load
-    // with a log buffer (the loader's quiet-first path keeps none).
-    let (btf, info) = osslscope::loader::synth_btf(&p.subprogs).expect("synth");
-    let mut func_info_bytes: Vec<u8> = Vec::new();
-    for (off, id) in &info {
-        func_info_bytes.extend_from_slice(&off.to_le_bytes());
-        func_info_bytes.extend_from_slice(&id.to_le_bytes());
-    }
-    let mut btf_log = vec![0u8; 1 << 16];
-    let btf_fd = ossl_bpf_sys::btf_load(&btf, &mut btf_log).expect("btf load");
-    // One map site: create the map directly and patch the fd
-    // (same encoding the loader applies: src nibble
-    // BPF_PSEUDO_MAP_FD=1 + fd imm).
-    assert_eq!(p.map_fixups.len(), 1, "one DCOUNT site expected");
-    let f = &p.map_fixups[0];
-    let map_fd = ossl_bpf_sys::map_create(2, 4, 8, 1, None, "DCOUNT").expect("create DCOUNT");
-    let mut insns = p.insns.clone();
-    let slot = insns
-        .get_mut(f.insn_off..f.insn_off + 8)
-        .expect("fixup range");
-    slot[1] = (slot[1] & 0x0f) | (1 << 4);
-    slot[4..8].copy_from_slice(&(map_fd.as_raw_fd() as u32).to_le_bytes());
-    let mut log = vec![0u8; 1 << 20];
-    let btf_attach = ossl_bpf_sys::ProgBtf {
-        btf_fd: btf_fd.as_raw_fd(),
-        func_info: &func_info_bytes,
-    };
-    let _fd = ossl_bpf_sys::prog_load_kprobe(
-        &insns,
-        c"GPL",
-        None,
-        &mut log,
-        "dprobecost",
-        Some(btf_attach),
-    )
-    .expect("cost load");
-    let text = String::from_utf8_lossy(&log);
+    let (_, info) = osslscope::loader::synth_btf(&p.subprogs).expect("synth");
+    let text = load_with_func_info(p, &info, "dprobecost").expect("cost load");
     let summary = text
         .lines()
         .find(|l| l.contains("processed") && l.contains("insns"))
