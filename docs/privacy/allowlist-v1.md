@@ -147,6 +147,7 @@ LGCALLS
 ALG_CLASS
 TRIP_CLASS
 GEN
+JUMPS
 # count
 COUNTS
 GEN
@@ -163,6 +164,8 @@ the frozen registry/taxonomy at load, before any attach —
 engine/load class/name). No map stores target string bytes at rest.
 `PENDING_QUERY` values are (op, `no_store`-pointer) pairs;
 `TERMD`/`LOSS` are termination proofs and failure counters.
+`JUMPS` (P5a-C1) holds kernel program fds (observer-loaded tail
+callees, no target data — the chain jump table).
 `WINDOW` holds the two observer-programmed monotonic window bounds
 (start/deadline); like `GEN`/`TARGET` it is numeric observer state,
 never target bytes. `GEN` exists in both objects with different
