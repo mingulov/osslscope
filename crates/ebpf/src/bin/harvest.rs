@@ -27,18 +27,22 @@
 //! margin.
 //!
 //! P5a-C1 chain probe: the entry program walks slot j, then tail-calls
-//! the `c_slot` callee (via the `JUMPS` prog-array, handoff in the
-//! per-thread `CURSOR`) to walk slot j+1, advancing the cursor by 2
-//! per query. The slot-walk body is duplicated in entry and callee
-//! (a shared subprogram would nest the loop-calls at depth 2 and
-//! blow the verifier's 1M processed-insn ceiling — observed
-//! 2026-10-12); same honesty rules, only the advance diagonal
-//! differs (see `c_slot`). An unpopulated `JUMPS` slot or a failed
-//! `CURSOR` stash degrades to the sampler (advance by 1) — the
-//! loader populates before any attach and fails the attach when
-//! population fails, so the fallback is unreachable in practice,
-//! and any live fallback is observable in the doc's rows-per-query
-//! ratio (14 chained vs 7 sampled).
+//! the `c_slot` callee (via the `JUMPS` prog-array) to walk slot j+1,
+//! advancing the cursor by 2 per query. The handoff rides the
+//! existing maps (the entry re-inserts its `PENDING_QUERY` record;
+//! the callee takes it and re-derives count from `QUERY_NEXT`) — a
+//! dedicated stash array breaks the classifier's loop-state merging,
+//! and the kernel forbids tail calls from subprograms without BTF.
+//! The slot-walk body is duplicated in entry and callee (a shared
+//! subprogram would nest the loop-calls at depth 2 and blow the
+//! verifier's 1M processed-insn ceiling — observed 2026-10-12);
+//! same honesty rules, only the advance diagonal differs (see
+//! `c_slot`). An unpopulated `JUMPS` slot or a failed re-stash
+//! degrades to the sampler (advance by 1) — the loader populates
+//! before any attach and fails the attach when population fails, so
+//! the fallback is unreachable in practice, and any live fallback
+//! is observable in the doc's rows-per-query ratio (14 chained vs 7
+//! sampled).
 //!
 //! T03 honesty: a prefix is never COMPLETE. The walker records
 //! termination proof (`TERMD[arr] = (op, len)`) on reading the
@@ -195,23 +199,16 @@ static ALG_CLASS: HashMap<u64, AlgClassValue> = HashMap::with_max_entries(1024, 
 static TRIP_CLASS: HashMap<u64, TripClassValue> = HashMap::with_max_entries(64, 0);
 /// Chain jump table (P5a-C1): prog-array, slot 0 = the `c_slot` tail
 /// callee. Populated by the loader before any attach (fail-closed);
-/// 8 slots for the P7 multi-callee protocol.
+/// 8 slots for the P7 multi-callee protocol. The handoff rides the
+/// existing maps (zero new state): the entry re-inserts its
+/// `PENDING_QUERY` record before tailing, and the callee takes it
+/// back and re-derives (count, j+1) from `QUERY_NEXT`. (A dedicated
+/// 72-byte `CURSOR` map was prototyped and rejected: its stack
+/// materialization breaks the classifier's loop-state merging, and
+/// the kernel forbids tail calls from subprograms without BTF, so
+/// the tail site must live in the main scope.)
 #[map]
 static JUMPS: ProgramArray = ProgramArray::with_max_entries(8, 0);
-/// Per-thread chain handoff (P5a-C1): pid_tgid → [array, op,
-/// next_index, entry_count, 0, 0, 0, 0, 0]. The entry stashes, the
-/// callee takes (remove-on-read: no accumulation across threads, so
-/// the 1024 slots far exceed any concurrent-thread count). No cookie
-/// namespace (unlike PENDING_*): the stash→tail→take sequence is
-/// synchronous within one BPF invocation — no preemption window
-/// exists for a same-thread clobber.
-#[map]
-static CURSOR: HashMap<u64, [u64; 9]> = HashMap::with_max_entries(1024, 0);
-/// `CURSOR` value cells (see above).
-const CURS_ARR: usize = 0;
-const CURS_OP: usize = 1;
-const CURS_NEXT: usize = 2;
-const CURS_COUNT: usize = 3;
 
 /// Per-CPU counter add (F-C/A8): shared-map lookup–increment–
 /// replace loses concurrent increments across CPUs, and `core`
@@ -825,7 +822,7 @@ pub fn query_return(ctx: RetProbeContext) -> u32 {
                 advance_next(key, count);
                 return 0;
             }
-            chain_next(&ctx, count, op, j);
+            chain_tail(&ctx, cookie, pend, key, count);
         }
         0 => {
             if no_store {
@@ -835,7 +832,7 @@ pub fn query_return(ctx: RetProbeContext) -> u32 {
                 advance_next(key, count);
                 return 0;
             }
-            chain_next(&ctx, count, op, j);
+            chain_tail(&ctx, cookie, pend, key, count);
         }
         // Read abort: flag (all slots) and freeze for re-walk.
         _ => {
@@ -845,81 +842,77 @@ pub fn query_return(ctx: RetProbeContext) -> u32 {
     0
 }
 
-/// Stash the chain handoff and tail-call `c_slot` (P5a-C1 entry
-/// diagonal, shared by the full-walk arms above). A real subprogram
-/// (own frame): the 72-byte stash array must NOT live in the entry
-/// frame — its stack-layout drift breaks the classifier's fragile
-/// loop-state merging (verifier 1M ceiling, observed 2026-10-12).
-/// Loop-free, so depth-1 nesting is trivially verifiable (only
-/// loop-calls are forbidden at depth 2 — see the duplication note).
-/// Four params (`rv` re-reads from the shared ctx, `tgid` from
-/// the helper — `key` re-folds from both, all inside this frame).
-#[inline(never)]
-fn chain_next(ctx: &RetProbeContext, count: u64, op: u64, j: u64) {
-    let rv: u64 = ctx.ret();
-    let tgid = helpers::bpf_get_current_pid_tgid();
-    let key = ((tgid as u128) << 64) | (rv as u128);
-    let stash = [rv, op, j.wrapping_add(1), count, 0, 0, 0, 0, 0];
-    if CURSOR.insert(tgid, stash, 0).is_err() {
-        // Unstashable (map full — unreachable with
-        // take-semantics): chain nothing rather than chain a stale
-        // cursor; sampler fallback keeps the walk progressing, and
-        // the fallback is observable in the doc's rows-per-query
-        // ratio.
+/// Hand the query to `c_slot` and tail-call it (P5a-C1 entry
+/// diagonal, shared by the full-walk arms above). The handoff is
+/// the 16-byte `PENDING_QUERY` record the take at the top consumed:
+/// re-insert it here (the callee takes it back) and re-derive
+/// (count, j+1) from `QUERY_NEXT` there — no new maps, no stack
+/// arrays (a 72-byte CURSOR stash breaks the classifier's
+/// loop-state merging). Inlined: the kernel forbids tail calls from
+/// subprograms without BTF, so the tail site must live in this main
+/// scope — and the 16-byte re-insert perturbs the frame far less
+/// than a stash array.
+#[inline(always)]
+fn chain_tail(ctx: &RetProbeContext, cookie: u64, pend: PendQuery, key: u128, count: u64) {
+    if PENDING_QUERY.insert(pend_key(cookie), pend, 0).is_err() {
+        // Unstashable (map full — effectively unreachable: one
+        // entry per in-flight query): chain nothing rather than
+        // chain a stale record; sampler fallback keeps the walk
+        // progressing, and the fallback is observable in the doc's
+        // rows-per-query ratio.
         advance_next(key, count);
         return;
     }
     unsafe { JUMPS.tail_call(ctx, 0) };
     // Tail-call failure (empty slot, OOB index, or tail budget —
-    // indistinguishable, RET_VOID): sampler fallback, cursor stays
-    // consistent. Unreachable in practice (the loader popululates
-    // before any attach and fails the attach otherwise); observable
-    // in the ratio if it ever fires live.
+    // indistinguishable, RET_VOID): take back the re-stash (else a
+    // stale record lingers until the next query overwrites it) and
+    // advance like the sampler. Unreachable in practice (the loader
+    // populates before any attach and fails the attach otherwise);
+    // observable in the ratio if it ever fires live.
+    let _ = take_key(&PENDING_QUERY, pend_key(cookie));
     advance_next(key, count);
 }
 
 /// Chain tail callee (P5a-C1): walks slot j+1 after the entry walked
 /// slot j. NEVER directly attached — reachable only via `JUMPS[0]`
-/// from `query_return`, with the handoff in `CURSOR[pid_tgid]`
-/// (taken here, remove-on-read). The slot-walk body duplicates the
-/// entry's (see the sync note there — a shared subprogram nests
-/// loop-calls at depth 2 and blows the verifier's 1M ceiling);
-/// only the advance diagonal differs: full walks store count+2, a
-/// stable skip stores count+2 past it, the terminator stores
-/// count+1 (frozen AT the terminator — the next query's entry
-/// re-reads it once, exactly like a sampler-frozen terminator),
-/// and aborts freeze (no store: the next query re-walks BOTH
-/// slots). Runs cacheable-only (the entry never chains `no_store`).
+/// from `query_return`. The handoff is the entry's `PENDING_QUERY`
+/// record (re-inserted before the tail — taken back here); (count,
+/// j+1) re-derive from `QUERY_NEXT`, which the entry has not
+/// advanced yet. The slot-walk body duplicates the entry's (see the
+/// sync note there — a shared subprogram nests loop-calls at depth
+/// 2 and blows the verifier's 1M ceiling); only the advance
+/// diagonal differs: full walks store count+2, a stable skip stores
+/// count+2 past it, the terminator stores count+1 (frozen AT the
+/// terminator — the next query's entry re-reads it once, exactly
+/// like a sampler-frozen terminator), and aborts freeze (no store:
+/// the next query re-walks BOTH slots). Runs cacheable-only (the
+/// entry never chains `no_store`).
 #[uretprobe]
 pub fn c_slot(ctx: RetProbeContext) -> u32 {
     let rv: u64 = ctx.ret();
-    let tgid = helpers::bpf_get_current_pid_tgid();
-    // Take the handoff cell-by-cell (NOT `take_key`: copying the
-    // 72-byte value onto this frame perturbs the stack layout the
-    // classifier's loop-state merging depends on — verifier 1M
-    // ceiling, observed 2026-10-12). Borrow, load the four live
-    // cells, then remove: same take semantics, ~zero frame cost.
-    let p = match CURSOR.get_ptr(&tgid) {
-        Some(p) => p,
+    let cookie = unsafe { helpers::bpf_get_attach_cookie(ctx.as_ptr()) };
+    let pend = match take_key(&PENDING_QUERY, pend_key(cookie)) {
+        Some(v) => v,
         // No handoff (direct attach — impossible via the loader —
         // or a clobbered stash): chain nothing.
         None => return 0,
     };
-    // SAFETY: cells [0..4] of a 9-cell value; the map owns the
-    // memory and the borrow ends before the remove below.
-    let (arr, op_raw, j, count) = unsafe { ((*p)[CURS_ARR], (*p)[CURS_OP], (*p)[CURS_NEXT], (*p)[CURS_COUNT]) };
-    let _ = CURSOR.remove(&tgid);
-    // Stale-cursor guard: the stash belongs to this query's array.
-    if arr != rv {
-        return 0;
-    }
-    // Bound guard: the entry never chains past slot 511 — a stale
-    // handoff claiming otherwise walks nothing.
-    if j >= MAX_ALGS {
-        return 0;
-    }
-    let op = op_raw as u32;
+    let op = pend.op as u32;
+    let tgid = helpers::bpf_get_current_pid_tgid();
     let key = ((tgid as u128) << 64) | (rv as u128);
+    // The entry has not advanced yet, so this is its count —
+    // mirrored normalization: raw NS_FROZEN (a no_store→cacheable
+    // flip) means the entry walked j=0 (same rule as the entry).
+    // j+1 needs no bound guard: the entry chains only below slot
+    // 511, and the modulo keeps every value in range regardless.
+    let raw = unsafe { QUERY_NEXT.get_ptr(&key).map(|p| *p) };
+    let norm = match raw {
+        Some(c) if c != NS_FROZEN => c,
+        _ => 0,
+    };
+    let j = norm.wrapping_add(1) % MAX_ALGS;
+    let count = norm;
     // Slot-walk copy (see the entry's sync note): identical reads,
     // proofs, flags, and emissions — only the counter stores below
     // implement the callee diagonal.

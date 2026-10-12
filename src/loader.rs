@@ -57,9 +57,12 @@ pub struct ProgSpec {
 /// F-C/A8: the five counter/flag maps (`LOSS`, `TRUNC`, `CALLS`,
 /// `TRIP`, `LGCALLS`) are per-CPU hash (type 5) — exact
 /// single-writer slots replace racy shared read-modify-write.
-/// P5a-C1 adds the chain jump table (`JUMPS`, prog-array) + the
-/// per-thread chain handoff (`CURSOR`, u64 → [u64; 9]).
-pub const HARVEST_MAPS: [MapSpec; 15] = [
+/// P5a-C1 adds the chain jump table (`JUMPS`, prog-array); the
+/// handoff rides `PENDING_QUERY` + `QUERY_NEXT` (no new state — a
+/// dedicated `CURSOR` map was prototyped and rejected, see the BPF
+/// notes: stash materialization vs the verifier meets the
+/// no-tail-call-in-subprog kernel rule).
+pub const HARVEST_MAPS: [MapSpec; 14] = [
     MapSpec {
         name: "EVENTS",
         map_type: 27,
@@ -170,14 +173,6 @@ pub const HARVEST_MAPS: [MapSpec; 15] = [
         key_size: 4,
         value_size: 4,
         max_entries: 8,
-        flags: 0,
-    },
-    MapSpec {
-        name: "CURSOR",
-        map_type: 1,
-        key_size: 8,
-        value_size: 72,
-        max_entries: 1024,
         flags: 0,
     },
 ];
