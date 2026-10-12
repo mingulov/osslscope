@@ -110,7 +110,10 @@ pub struct Config {
 
 /// Capture target: spawned child (`run --`) or live pid (staging).
 pub enum Target {
-    Spawn { argv: Vec<String> },
+    Spawn {
+        argv: Vec<String>,
+        workload: target::WorkloadDest,
+    },
     Pid(u32),
 }
 
@@ -4319,9 +4322,9 @@ pub fn run(cfg: &Config, target: Target) -> anyhow::Result<Capture> {
         .as_ref()
         .unwrap_or(&empty_enrollment);
     match target {
-        Target::Spawn { argv } => {
+        Target::Spawn { argv, workload } => {
             let cmdline = args::redact_spawn_argv(&argv);
-            let mut owned = target::OwnedTarget::spawn_stopped(&argv)
+            let mut owned = target::OwnedTarget::spawn_stopped(&argv, workload)
                 .map_err(|e| anyhow::anyhow!("spawn: {e:#}"))?;
             let pid = owned.pid();
             let resolved = match resolve_capture_provider(

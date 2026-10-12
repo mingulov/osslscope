@@ -209,6 +209,115 @@ fn invalid_numerics_spawn_no_child() {
     let _ = std::fs::remove_file(&sentinel);
 }
 
+#[test]
+fn h9_t6_workload_dest_flags_rejected_with_exit2() {
+    // T6 (RED): both destinations → usage error (exit 2), no spawn.
+    let sentinel =
+        std::env::temp_dir().join(format!("osslscope-h9-nospawn-{}", std::process::id()));
+    let _ = std::fs::remove_file(&sentinel);
+    let touch = format!("touch {}", sentinel.display());
+    for verb in ["report", "check"] {
+        let args = base_report(&[
+            "--deny-weak",
+            "--workload-out",
+            "/tmp/h9-x.log",
+            "--workload-out-fd",
+            "7",
+            "run",
+            "--",
+            "/bin/sh",
+            "-c",
+            &touch,
+        ]);
+        // --deny-weak is check-only: strip for report.
+        let args = if verb == "report" {
+            args.into_iter().filter(|a| a != "--deny-weak").collect()
+        } else {
+            args
+        };
+        let code = if verb == "report" {
+            osslscope::report::run(&args)
+        } else {
+            osslscope::check::run(&args)
+        };
+        assert_eq!(code, ExitCode::from(2), "{verb} both flags");
+    }
+    assert!(!sentinel.exists(), "child must not spawn");
+    let _ = std::fs::remove_file(&sentinel);
+    // Non-numeric fd → usage error.
+    for (verb, extra) in [
+        (
+            "report",
+            vec!["--workload-out-fd", "seven", "run", "--", "/bin/true"],
+        ),
+        (
+            "check",
+            vec![
+                "--deny-weak",
+                "--workload-out-fd",
+                "seven",
+                "run",
+                "--",
+                "/bin/true",
+            ],
+        ),
+    ] {
+        let args = base_report(&extra);
+        let code = if verb == "report" {
+            osslscope::report::run(&args)
+        } else {
+            osslscope::check::run(&args)
+        };
+        assert_eq!(code, ExitCode::from(2), "{verb} bad fd");
+    }
+    // Destinations without `run --` are not silently ignored.
+    for (verb, extra) in [
+        (
+            "report",
+            vec!["--workload-out", "/tmp/h9-x.log", "--pid", "1"],
+        ),
+        (
+            "check",
+            vec!["--deny-weak", "--workload-out-fd", "7", "--pid", "1"],
+        ),
+    ] {
+        let args = base_report(&extra);
+        let code = if verb == "report" {
+            osslscope::report::run(&args)
+        } else {
+            osslscope::check::run(&args)
+        };
+        assert_eq!(code, ExitCode::from(2), "{verb} dest without run");
+    }
+    // Accepted values parse, then fail loading the bogus BPF
+    // objects (exit 4) — proving the parser accepted them.
+    for (verb, extra) in [
+        (
+            "report",
+            vec!["--workload-out", "/tmp/h9-x.log", "run", "--", "/bin/true"],
+        ),
+        (
+            "check",
+            vec![
+                "--deny-weak",
+                "--workload-out-fd",
+                "7",
+                "run",
+                "--",
+                "/bin/true",
+            ],
+        ),
+    ] {
+        let args = base_report(&extra);
+        let code = if verb == "report" {
+            osslscope::report::run(&args)
+        } else {
+            osslscope::check::run(&args)
+        };
+        assert_eq!(code, ExitCode::from(4), "{verb} dest accepted");
+    }
+}
+
 const SECRET: &str = "T04-SENTINEL-s3cr3t-argv";
 
 #[test]

@@ -17,6 +17,9 @@
 //! observably stopped, so the residual window is microseconds, not
 //! the whole setup phase.
 use std::ffi::CString;
+use std::os::fd::RawFd;
+use std::os::unix::ffi::OsStrExt;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 /// Explicit custody of an owned child. Query with
@@ -173,32 +176,69 @@ fn reap_blocking(pid: u32) -> anyhow::Result<i32> {
     }
 }
 
-/// Redirect a fork child's stdout onto the observer's stderr
-/// (F-E/B2 output policy): a spawned workload must never share the
-/// observer's stdout artifact channel (JSON corruption, secret
-/// capture). Both child streams land on the observer's stderr,
-/// where workload output stays visible but never machine-parsed.
-/// When the observer's stderr is closed (pathological), sink to
-/// /dev/null instead — the run survives and the artifact channel
-/// stays pure. Async-signal-safe (raw syscalls only); explicit fds
-/// so tests never touch process stdio. Never closes the passed-in
-/// fds; closes only a /dev/null fd it opened itself.
-fn redirect_child_stdout(child_stdout: libc::c_int, observer_stderr: libc::c_int) {
+/// Workload stdio destination (H9/R07): where a spawned child's
+/// stdout+stderr go. Observer stderr NEVER carries workload bytes:
+/// the default sinks to /dev/null and explicit destinations are
+/// operator-chosen (a file per run, or a caller-held fd).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkloadDest {
+    /// Both streams to /dev/null (default).
+    Null,
+    /// Both streams to this file (create+truncate per run).
+    File(PathBuf),
+    /// Both streams to a caller-held fd (harness pipe form; the
+    /// child never closes the caller's fd).
+    Fd(RawFd),
+}
+
+/// Child-side stdio setup failure exit (H9): distinct from
+/// exec-failure 127 — the parent maps 126 to a Setup error naming
+/// the destination, never to silent null.
+pub const WORKLOAD_SETUP_EXIT: i32 = 126;
+
+/// Redirect a fork child's stdout+stderr onto its workload
+/// destination (H9/R07 output policy): a spawned workload must
+/// never share the observer's stdout artifact channel (JSON
+/// corruption, secret capture) NOR the observer's stderr
+/// (workload secrets in harness-captured diagnostics).
+/// Async-signal-safe (raw syscalls only); never returns on
+/// failure — `_exit(126)` (see [`WORKLOAD_SETUP_EXIT`]). Closes
+/// only fds it opened itself; a caller-held [`WorkloadDest::Fd`]
+/// is never closed (dup2 targets 1/2 excepted: when the caller's
+/// fd IS 1 or 2 the dup is a no-op by construction).
+fn redirect_child_stdio(dest: &ChildDest) {
     unsafe {
-        if libc::dup2(observer_stderr, child_stdout) >= 0 {
-            return;
+        let sink: libc::c_int = match dest {
+            ChildDest::Null => libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY),
+            ChildDest::File(path) => libc::open(
+                path.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+                0o644,
+            ),
+            ChildDest::Fd(fd) => *fd,
+        };
+        if sink < 0 {
+            libc::_exit(WORKLOAD_SETUP_EXIT);
         }
-        let null = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY);
-        if null < 0 {
-            return;
+        if libc::dup2(sink, libc::STDOUT_FILENO) < 0 || libc::dup2(sink, libc::STDERR_FILENO) < 0 {
+            libc::_exit(WORKLOAD_SETUP_EXIT);
         }
-        // open() returns the lowest free fd: when child_stdout was
-        // closed it may BE the fresh /dev/null fd already.
-        if null != child_stdout {
-            libc::dup2(null, child_stdout);
-            libc::close(null);
+        // open() returns the lowest free fd: when a stdio fd was
+        // closed the sink may BE fd 1 or 2 already — close only a
+        // spare (a caller fd above stdio is the child's own copy;
+        // the caller's descriptor is untouched).
+        if sink != libc::STDOUT_FILENO && sink != libc::STDERR_FILENO {
+            libc::close(sink);
         }
     }
+}
+
+/// Pre-fork-prepared child destination: CStrings built before the
+/// fork so the child allocates nothing (async-signal-safe).
+enum ChildDest {
+    Null,
+    File(CString),
+    Fd(libc::c_int),
 }
 
 impl OwnedTarget {
@@ -207,7 +247,7 @@ impl OwnedTarget {
     /// Exec failure in the child exits 127. The parent observes the
     /// stop before returning; a child that exits before stopping is
     /// already reaped, and its status rides in the error.
-    pub fn spawn_stopped(argv: &[String]) -> anyhow::Result<Self> {
+    pub fn spawn_stopped(argv: &[String], dest: WorkloadDest) -> anyhow::Result<Self> {
         use anyhow::Context as _;
         if argv.is_empty() {
             anyhow::bail!("run -- needs a command");
@@ -219,6 +259,24 @@ impl OwnedTarget {
             .context("NUL in argv")?;
         let mut ptrs: Vec<*const libc::c_char> = cs.iter().map(|c| c.as_ptr()).collect();
         ptrs.push(std::ptr::null());
+        // H9: destination validated + prepared pre-fork (the child
+        // allocates nothing). An invalid fd fails HERE — no spawn.
+        let child_dest = match &dest {
+            WorkloadDest::Null => ChildDest::Null,
+            WorkloadDest::File(path) => ChildDest::File(
+                CString::new(path.as_os_str().as_bytes()).context("NUL in --workload-out path")?,
+            ),
+            WorkloadDest::Fd(fd) => {
+                let r = unsafe { libc::fcntl(*fd, libc::F_GETFD) };
+                if r < 0 {
+                    anyhow::bail!(
+                        "workload output fd {fd}: not a valid open fd ({})",
+                        std::io::Error::last_os_error()
+                    );
+                }
+                ChildDest::Fd(*fd)
+            }
+        };
         let pid = unsafe { libc::fork() };
         if pid < 0 {
             anyhow::bail!("fork: {}", std::io::Error::last_os_error());
@@ -239,11 +297,12 @@ impl OwnedTarget {
                 // exotic kernel keeps the old behavior; the maps read
                 // then fails loud, never silent).
                 libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0);
-                // F-E/B2: explicit output policy — the workload's
-                // stdout follows the observer's stderr (never the
-                // stdout artifact channel), before the pre-exec stop
-                // so the fds are final while setup observes us.
-                redirect_child_stdout(libc::STDOUT_FILENO, libc::STDERR_FILENO);
+                // H9/R07: explicit output policy — the workload's
+                // stdio follows its destination (never the stdout
+                // artifact channel, never observer stderr), before
+                // the pre-exec stop so the fds are final while
+                // setup observes us.
+                redirect_child_stdio(&child_dest);
                 libc::raise(libc::SIGSTOP);
                 libc::execvp(ptrs[0], ptrs.as_ptr());
                 libc::_exit(127);
@@ -274,6 +333,18 @@ impl OwnedTarget {
             } else {
                 status
             };
+            // H9: 126 is ours alone (child-side stdio setup
+            // failure — nothing else exits pre-stop with it).
+            // Name the destination: never silent null when the
+            // operator asked for the log.
+            if code == WORKLOAD_SETUP_EXIT {
+                let what = match &dest {
+                    WorkloadDest::Null => "/dev/null".to_string(),
+                    WorkloadDest::File(path) => path.display().to_string(),
+                    WorkloadDest::Fd(fd) => format!("fd {fd}"),
+                };
+                anyhow::bail!("workload output {what}: child stdio setup failed (status 126)");
+            }
             anyhow::bail!("child exited before stop (status {code})");
         }
     }
@@ -460,63 +531,6 @@ impl Drop for OwnedTarget {
                 }
             }
             CustodyState::Reaped | CustodyState::Detached => {}
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn fd_target(fd: libc::c_int) -> String {
-        std::fs::read_link(format!("/proc/self/fd/{fd}"))
-            .expect("fd target")
-            .to_string_lossy()
-            .into_owned()
-    }
-
-    fn pipe() -> (libc::c_int, libc::c_int) {
-        let mut fds = [0; 2];
-        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-        (fds[0], fds[1])
-    }
-
-    #[test]
-    fn child_stdout_redirect_follows_given_stderr() {
-        let (a_r, a_w) = pipe();
-        let (b_r, b_w) = pipe();
-        redirect_child_stdout(a_w, b_w);
-        // a_w now points where b_w points (pipe B), not pipe A.
-        assert_eq!(fd_target(a_w), fd_target(b_w));
-        assert_eq!(fd_target(a_w), fd_target(b_r));
-        assert_ne!(fd_target(a_w), fd_target(a_r));
-        // Still functional: bytes written via the redirected fd
-        // arrive on pipe B.
-        let msg = b"ping";
-        assert_eq!(
-            unsafe { libc::write(a_w, msg.as_ptr() as *const libc::c_void, msg.len()) },
-            msg.len() as isize
-        );
-        let mut buf = [0u8; 4];
-        assert_eq!(
-            unsafe { libc::read(b_r, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) },
-            msg.len() as isize
-        );
-        assert_eq!(&buf, msg);
-        for fd in [a_r, a_w, b_r, b_w] {
-            unsafe { libc::close(fd) };
-        }
-    }
-
-    #[test]
-    fn child_stdout_redirect_sinks_to_dev_null_when_stderr_closed() {
-        let (a_r, a_w) = pipe();
-        // A fd value no thread can hold open: deterministic EBADF,
-        // no close-then-race with parallel tests.
-        redirect_child_stdout(a_w, 1_000_000_000);
-        assert_eq!(fd_target(a_w), "/dev/null");
-        for fd in [a_r, a_w] {
-            unsafe { libc::close(fd) };
         }
     }
 }

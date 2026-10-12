@@ -4696,7 +4696,7 @@ fn bad_read_gap_never_heals_by_recompute() {
 // ---------------------------------------------------------------------------
 
 use osslscope::capture::{LiveProc, PollingLifecycle};
-use osslscope::target::OwnedTarget;
+use osslscope::target::{OwnedTarget, WorkloadDest};
 
 /// Parent pid from `/proc/<pid>/stat` (fields start after the LAST
 /// ')'; ppid is post-comm token 1).
@@ -4733,7 +4733,7 @@ fn live_observe(
     let bytes = self_bytes();
     let staged = stage.write("prov.so", &bytes);
     let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
-    let owned = OwnedTarget::spawn_stopped(&argv).unwrap();
+    let owned = OwnedTarget::spawn_stopped(&argv, WorkloadDest::Null).unwrap();
     let pid = owned.pid();
     let clock = FakeClock::new();
     let shared = Rc::new(RefCell::new(SharedState::default()));
@@ -4907,7 +4907,7 @@ fn live_short_children_are_detected() {
         "-c".to_string(),
         "i=0; while [ $i -lt 60 ]; do sleep 0.02; i=$((i+1)); done".to_string(),
     ];
-    let mut owned = OwnedTarget::spawn_stopped(&argv).unwrap();
+    let mut owned = OwnedTarget::spawn_stopped(&argv, WorkloadDest::Null).unwrap();
     let pid = owned.pid();
     owned.release().unwrap();
     let mut lc = PollingLifecycle::new(pid);
@@ -4944,7 +4944,7 @@ fn live_double_fork_reparent_stays_counted() {
         "-c".to_string(),
         "sleep 30 & wait".to_string(),
     ];
-    let mut owned = OwnedTarget::spawn_stopped(&argv).unwrap();
+    let mut owned = OwnedTarget::spawn_stopped(&argv, WorkloadDest::Null).unwrap();
     let pid = owned.pid();
     owned.release().unwrap();
     std::thread::sleep(Duration::from_millis(300));
@@ -4986,7 +4986,7 @@ fn live_double_fork_grandchild_reparents_past_target() {
         "-c".to_string(),
         format!("(sleep 30 & echo $! > '{pidfile}'; sleep 0.5); exec sleep 60"),
     ];
-    let mut owned = OwnedTarget::spawn_stopped(&argv).unwrap();
+    let mut owned = OwnedTarget::spawn_stopped(&argv, WorkloadDest::Null).unwrap();
     let pid = owned.pid();
     owned.release().unwrap();
     std::thread::sleep(Duration::from_millis(100));
@@ -5051,7 +5051,7 @@ fn live_same_tgid_exec_is_detected() {
         "-c".to_string(),
         "sleep 0.4; exec sleep 30".to_string(),
     ];
-    let mut owned = OwnedTarget::spawn_stopped(&argv).unwrap();
+    let mut owned = OwnedTarget::spawn_stopped(&argv, WorkloadDest::Null).unwrap();
     let pid = owned.pid();
     owned.release().unwrap();
     std::thread::sleep(Duration::from_millis(200));
@@ -5081,7 +5081,7 @@ fn live_comm_settles_post_exec() {
     // (the observer's inherited comm); after release + exec the
     // live read reports the application ("sleep").
     let argv = vec!["/bin/sleep".to_string(), "30".to_string()];
-    let mut owned = OwnedTarget::spawn_stopped(&argv).unwrap();
+    let mut owned = OwnedTarget::spawn_stopped(&argv, WorkloadDest::Null).unwrap();
     let pid = owned.pid();
     let mut proc = LiveProc;
     let pre = proc.read_comm(pid);

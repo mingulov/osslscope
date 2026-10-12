@@ -56,6 +56,8 @@ fn parse(argv: &[String]) -> Result<Args, String> {
     let mut pid: Option<u32> = None;
     let mut image_digest = String::new();
     let mut cbom: Option<String> = None;
+    let mut workload_out: Option<String> = None;
+    let mut workload_out_fd: Option<String> = None;
     let mut run_at: Option<usize> = None;
     let mut i = 0;
     while i < argv.len() {
@@ -90,6 +92,8 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             "--pid" => pid = Some(val(a)?.parse().map_err(|_| "--pid needs an integer")?),
             "--image-digest" => image_digest = val(a)?,
             "--cbom" => cbom = Some(val(a)?),
+            "--workload-out" => workload_out = Some(val(a)?),
+            "--workload-out-fd" => workload_out_fd = Some(val(a)?),
             x => return Err(format!("unknown flag {x}")),
         }
         i += 2;
@@ -97,8 +101,16 @@ fn parse(argv: &[String]) -> Result<Args, String> {
     if format != "human" && format != "json" {
         return Err("--format must be human|json".to_string());
     }
+    // H9/R07: destinations are meaningless without `run --`
+    // (never silently ignored); mutual exclusion + fd shape live in
+    // the shared args parser (report and check reject identically).
     let target = match (pid, run_at) {
-        (Some(p), None) => capture::Target::Pid(p),
+        (Some(p), None) => {
+            if workload_out.is_some() || workload_out_fd.is_some() {
+                return Err("--workload-out/--workload-out-fd need run -- <cmd>".to_string());
+            }
+            capture::Target::Pid(p)
+        }
         (None, Some(j)) => {
             if argv.get(j + 1).map(String::as_str) != Some("--") {
                 return Err("run needs -- before the command".to_string());
@@ -107,7 +119,10 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             if cmd.is_empty() {
                 return Err("run -- needs a command".to_string());
             }
-            capture::Target::Spawn { argv: cmd }
+            capture::Target::Spawn {
+                argv: cmd,
+                workload: crate::args::parse_workload_dest(workload_out, workload_out_fd)?,
+            }
         }
         _ => return Err("need exactly one of --pid P | run -- <cmd>".to_string()),
     };
@@ -228,6 +243,20 @@ pub fn exit_for(
     }
 }
 
+/// H9/R07 debug-UX hint: when a spawned child exits nonzero and no
+/// workload destination was given, its output went to /dev/null —
+/// one diagnostic line naming the exit + the re-run hint (never
+/// workload bytes). Clean exits, foreign pids, and explicit
+/// destinations stay silent. Shared by report and check.
+pub(crate) fn workload_hint(child_exit: Option<i32>, discarded: bool) -> Option<String> {
+    match (child_exit, discarded) {
+        (Some(code), true) if code != 0 => Some(format!(
+            "workload exited with status {code} and its output was discarded (default /dev/null); re-run with --workload-out FILE to capture it"
+        )),
+        _ => None,
+    }
+}
+
 /// Op id → display name (`OSSL_OP_DIGEST` → `DIGEST`; kept:
 /// the v2 CBOM renderer shares it).
 pub(crate) fn op_display(id: u32) -> String {
@@ -257,7 +286,7 @@ pub(crate) fn grouped(n: u64) -> String {
     out
 }
 
-const USAGE: &str = "usage: report [--duration S] [--provider P] [--object O] [--count-object C] [--table F] [--force-offset N] [--provider-table F] [--format human|json] [--out F] [--cbom FILE] [--builtin] [--settle S] [--timeout S] [--grace S] [--image-digest D] {--pid P | run -- <cmd>}";
+const USAGE: &str = "usage: report [--duration S] [--provider P] [--object O] [--count-object C] [--table F] [--force-offset N] [--provider-table F] [--format human|json] [--out F] [--cbom FILE] [--builtin] [--settle S] [--timeout S] [--grace S] [--image-digest D] [--workload-out F] [--workload-out-fd N] {--pid P | run -- <cmd>}";
 
 pub fn run(argv: &[String]) -> ExitCode {
     // --help anywhere on the osslscope side (a target command after
@@ -294,6 +323,15 @@ pub fn run(argv: &[String]) -> ExitCode {
         },
         cbom: args.cbom.map(|path| OutputDest::File(path.into())),
     };
+    // H9: captured before the target moves into capture (the T4
+    // hint needs to know the workload was discarded post-run).
+    let workload_discarded = matches!(
+        &args.target,
+        capture::Target::Spawn {
+            workload: crate::target::WorkloadDest::Null,
+            ..
+        }
+    );
     let c = match capture::run(&args.cfg, args.target) {
         Ok(c) => c,
         Err(e) => {
@@ -316,6 +354,11 @@ pub fn run(argv: &[String]) -> ExitCode {
     };
     let delivery = write_artifacts(&c.document, &req);
     emit_diagnostics(&delivery);
+    // H9/R07 T4: nonzero child exit with discarded output → one
+    // diagnostic line (exit + re-run hint, never workload bytes).
+    if let Some(hint) = workload_hint(c.child_exit, workload_discarded) {
+        err_line(&hint);
+    }
     // F-E/B3: report resolves through the shared exit table (fatal
     // capture maps to no-verdict so it dominates at 4).
     let outcome = match &c.outcome {
@@ -1467,6 +1510,24 @@ pub fn err_line(text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn h9_t4_hint_names_exit_and_rerun_only_when_discarded() {
+        // T4 (RED): nonzero child exit without a workload
+        // destination → one line naming the exit + the re-run
+        // hint. Clean exits, foreign pids, and explicit
+        // destinations stay silent.
+        let hint = workload_hint(Some(7), true).expect("hint on nonzero+discarded");
+        assert!(hint.contains('7'), "names the exit: {hint}");
+        assert!(hint.contains("--workload-out"), "re-run hint: {hint}");
+        assert!(!hint.contains('\n'), "one line: {hint}");
+        assert!(workload_hint(Some(0), true).is_none(), "clean exit silent");
+        assert!(workload_hint(None, true).is_none(), "foreign pid silent");
+        assert!(
+            workload_hint(Some(7), false).is_none(),
+            "explicit dest silent"
+        );
+    }
 
     fn ok_delivery() -> DeliveryResult {
         DeliveryResult {
