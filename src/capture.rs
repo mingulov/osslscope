@@ -2379,9 +2379,12 @@ where
             }
         }
         self.trigger_observed |= adapted.trigger_observed;
-        let report = self
-            .count
-            .attach_delta(&adapted.delta, ctx.live, ctx.files)?;
+        let report = self.count.attach_delta(
+            &adapted.delta,
+            ctx.live,
+            ctx.files,
+            self.clock.monotonic_ns(),
+        )?;
         self.attached_total = self.attached_total.saturating_add(report.attached);
         for site in &adapted.delta.discovered {
             if let Some(cookie) =
@@ -5701,6 +5704,10 @@ mod tests {
 
         const TPID: u32 = 424242;
 
+        // Incidental attach stamp for seeds that predate
+        // installed-at: none of them assert on it.
+        const ATTACH_AT: u64 = 900;
+
         /// First X-segment file offset of an ELF image (attach plans
         /// probes at X offsets only — an arbitrary offset filters out
         /// and no cookie is ever issued).
@@ -6041,7 +6048,9 @@ mod tests {
                 discovered: vec![site],
                 losses: Vec::new(),
             };
-            count.attach_delta(&delta, &live, &files).unwrap();
+            count
+                .attach_delta(&delta, &live, &files, ATTACH_AT)
+                .unwrap();
             let cookie = count.cookie_for(dev, ino, off).unwrap();
             count.open_window(1000, 2000).unwrap();
             count.backend_mut().fire(TPID, cookie, 1500, 7);
@@ -6414,6 +6423,7 @@ mod tests {
                 calls,
                 first_ns: 100,
                 last_ns: 200,
+                installed_at: None,
             }
         }
 

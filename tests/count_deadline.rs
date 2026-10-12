@@ -26,6 +26,10 @@ use std::time::Duration;
 
 const PID: u32 = 4242;
 
+// Incidental attach stamp for the tests that predate installed-at:
+// none of them assert on it.
+const ATTACH_AT: u64 = 900;
+
 static STAGE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 fn obj(id: &str) -> ObjectId {
@@ -165,7 +169,7 @@ fn kernel_deadline_excludes_late_calls() {
         discovered: vec![site(&a, off, 7)],
         losses: Vec::new(),
     };
-    s.attach_delta(&d, &live, &files).unwrap();
+    s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
     let cookie = s.cookie_for(a.device, a.ino, off).unwrap();
     s.open_window(1000, 2000).unwrap();
     let fire = |s: &mut CountSession<FakeCountBackend>, tgid: u32, now: u64, n: u64| {
@@ -213,7 +217,7 @@ fn window_closed_until_open() {
         discovered: vec![site(&a, off, 7)],
         losses: Vec::new(),
     };
-    s.attach_delta(&d, &live, &files).unwrap();
+    s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
     let cookie = s.cookie_for(a.device, a.ino, off).unwrap();
 
     s.backend_mut().fire(PID, cookie, 1500, 11);
@@ -221,7 +225,7 @@ fn window_closed_until_open() {
     // Isolate the zeroed interval from the target guard: armed
     // target, zeroed WINDOW — still nothing admitted.
     let mut armed = session_with(FakeCountBackend::new());
-    armed.attach_delta(&d, &live, &files).unwrap();
+    armed.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
     let cookie_a = armed.cookie_for(a.device, a.ino, off).unwrap();
     armed.open_window(1000, 2000).unwrap();
     armed.backend_mut().deprogram_window();
@@ -273,7 +277,7 @@ fn map_full_is_explicit() {
             .collect(),
         losses: Vec::new(),
     };
-    let rep = s.attach_delta(&d, &live, &files).unwrap();
+    let rep = s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
     assert_eq!(rep.attached, 3);
     let cookies: Vec<u32> = offs
         .iter()
@@ -340,7 +344,7 @@ fn per_key_threaded_counts() {
             .collect(),
         losses: Vec::new(),
     };
-    s.attach_delta(&d, &live, &files).unwrap();
+    s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
     let cookies: Vec<u32> = offs
         .iter()
         .map(|off| s.cookie_for(a.device, a.ino, *off).unwrap())
@@ -522,7 +526,7 @@ fn h4_t4_rejected_resolve_attaches_nothing_drains_empty() {
         discovered: vec![site(&a, off, 7)],
         losses: Vec::new(),
     };
-    let report = s.attach_delta(&d, &live, &files).unwrap();
+    let report = s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
     assert!(
         report.missed.iter().any(|m| m.reason == "replaced"),
         "stale plan must not bind: {report:?}"
@@ -569,7 +573,7 @@ fn h4_t3_pin_survives_path_deletion_until_session_drop() {
         discovered: vec![site(&a, off, 7)],
         losses: Vec::new(),
     };
-    let report = s.attach_delta(&d, &live, &files).unwrap();
+    let report = s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
     assert_eq!(report.attached, 1);
     let cookie = s.cookie_for(a.device, a.ino, off).unwrap();
     let at = s
@@ -622,7 +626,7 @@ fn h4_t1_mid_attach_swap_binds_pinned_inode_via_fd_path() {
         discovered: vec![site(&a, off, 7)],
         losses: Vec::new(),
     };
-    let report = s.attach_delta(&d, &live, &files).unwrap();
+    let report = s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
     assert_eq!(report.attached, 1, "pinned attach must bind: {report:?}");
     assert!(
         report.missed.iter().all(|m| m.reason != "replaced"),
@@ -652,7 +656,7 @@ fn h4_t1_mid_attach_swap_binds_pinned_inode_via_fd_path() {
     );
     // Immediate re-attach: the live pinned link reuses (old
     // behavior quarantined here — the stickiness is gone).
-    let report2 = s.attach_delta(&d, &live, &files).unwrap();
+    let report2 = s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
     assert_eq!(report2.reused, 1, "live pin must reuse: {report2:?}");
     assert!(
         report2.missed.iter().all(|m| m.reason != "quarantined"),
@@ -692,7 +696,7 @@ fn h4_unbound_cookie_hits_route_unattributed() {
         discovered: vec![site(&a, off, 7)],
         losses: Vec::new(),
     };
-    let report = s.attach_delta(&d, &live, &files).unwrap();
+    let report = s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
     assert_eq!(report.attached, 0);
     let cookie = s.cookie_for(a.device, a.ino, off).unwrap();
     s.open_window(1000, 2000).unwrap();
@@ -731,7 +735,7 @@ fn fake_backend_folds_bounds_monotonically() {
         discovered: vec![site(&a, off, 7)],
         losses: Vec::new(),
     };
-    s.attach_delta(&d, &live, &files).unwrap();
+    s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
     let cookie = s.cookie_for(a.device, a.ino, off).unwrap();
     s.open_window(1000, 2000).unwrap();
     s.backend_mut().fire(PID, cookie, 1500, 1);
@@ -782,12 +786,12 @@ fn h4_stale_plan_misses_replaced_per_attempt() {
         discovered: vec![site(&a, off, 7)],
         losses: Vec::new(),
     };
-    let report = s.attach_delta(&stale, &live, &files).unwrap();
+    let report = s.attach_delta(&stale, &live, &files, ATTACH_AT).unwrap();
     assert_eq!(report.attached, 0);
     assert!(report.missed.iter().any(|m| m.reason == "replaced"));
     // Same generation, same stale row: replaced again (no
     // quarantine shadow — per-attempt re-resolve).
-    let report2 = s.attach_delta(&stale, &live, &files).unwrap();
+    let report2 = s.attach_delta(&stale, &live, &files, ATTACH_AT).unwrap();
     assert_eq!(report2.attached, 0);
     assert!(
         report2.missed.iter().any(|m| m.reason == "replaced"),
@@ -800,7 +804,7 @@ fn h4_stale_plan_misses_replaced_per_attempt() {
     // Across a fence: still replaced (recovery needs re-discovery).
     s.open_window(1000, 2000).unwrap();
     s.fence(FenceReason::ProviderChanged).unwrap();
-    let report3 = s.attach_delta(&stale, &live, &files).unwrap();
+    let report3 = s.attach_delta(&stale, &live, &files, ATTACH_AT).unwrap();
     assert!(
         report3.missed.iter().any(|m| m.reason == "replaced"),
         "stale identity stays replaced across fences: {report3:?}"
@@ -820,7 +824,9 @@ fn h4_stale_plan_misses_replaced_per_attempt() {
             ino: b.ino,
         },
     )]);
-    let report4 = s.attach_delta(&fresh, &live_b, &files_b).unwrap();
+    let report4 = s
+        .attach_delta(&fresh, &live_b, &files_b, ATTACH_AT)
+        .unwrap();
     assert_eq!(report4.attached, 1, "fresh plan must bind: {report4:?}");
 }
 
@@ -856,9 +862,9 @@ fn h4_stale_retries_count_missed_once_each() {
         discovered: vec![site(&a, off, 7)],
         losses: Vec::new(),
     };
-    let report = s.attach_delta(&d, &live, &files).unwrap();
+    let report = s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
     assert!(report.missed.iter().any(|m| m.reason == "replaced"));
-    let report2 = s.attach_delta(&d, &live, &files).unwrap();
+    let report2 = s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
     assert!(report2.missed.iter().any(|m| m.reason == "replaced"));
     s.open_window(1000, 2000).unwrap();
     let drain = s.close_and_drain(Duration::from_secs(5)).unwrap();

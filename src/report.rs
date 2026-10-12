@@ -310,7 +310,7 @@ pub fn run(argv: &[String]) -> ExitCode {
     // T14r4: report renders the finalized v2 capture document
     // (policy None => report shape), never the historical v1
     // projection. PRD §14.1: the live producer schema is
-    // observed-crypto-v2.0; v1 fixtures are history.
+    // observed-crypto-v2.1; v1 fixtures are history.
     let req = OutputRequest {
         format: if args.format == "json" {
             OutputFormat::Json
@@ -445,7 +445,7 @@ impl DeliveryResult {
     }
 }
 
-/// Render the v2 JSON artifact (`observed-crypto-v2.0`) for one
+/// Render the v2 JSON artifact (`observed-crypto-v2.1`) for one
 /// finalized document: sorted keys, pretty-printed, trailing
 /// newline. Sites carry conserved per-site counts with candidate
 /// uncertainty; target/openssl/window/coverage/losses/disposition
@@ -529,7 +529,7 @@ fn gap_reason_json(reason: &GapReason) -> serde_json::Value {
 }
 
 fn site_json(site: &SiteExecution) -> serde_json::Value {
-    serde_json::json!({
+    let mut out = serde_json::json!({
         "object": site.site.object.0,
         "device": site.site.device,
         "inode": site.site.inode,
@@ -550,7 +550,14 @@ fn site_json(site: &SiteExecution) -> serde_json::Value {
         "calls": site.calls,
         "first_ns": site.first_ns,
         "last_ns": site.last_ns,
-    })
+    });
+    // v2.1: minors add optional keys only — absent when the
+    // producer never recorded the cookie's install wall (v2.0
+    // documents keep validating).
+    if let Some(at) = site.installed_at {
+        out["installed_at"] = serde_json::json!(at);
+    }
+    out
 }
 
 fn rule_verdict_str(verdict: RuleVerdict) -> &'static str {
@@ -582,7 +589,7 @@ fn doc_json(doc: &CaptureDocument) -> serde_json::Value {
         _ => serde_json::Value::Null,
     };
     let mut out = serde_json::json!({
-        "schema_version": "observed-crypto-v2.0",
+        "schema_version": "observed-crypto-v2.1",
         "target": {
             "pid": doc.target.pid,
             "comm": doc.target.comm,
@@ -697,7 +704,7 @@ fn doc_json(doc: &CaptureDocument) -> serde_json::Value {
 pub fn render_human(doc: &CaptureDocument) -> String {
     let mut s = String::new();
     s.push_str(&format!(
-        "osslscope report (observed-crypto-v2.0): pid={} ({}) window={}..{}ns effective={}..{}ns\n",
+        "osslscope report (observed-crypto-v2.1): pid={} ({}) window={}..{}ns effective={}..{}ns\n",
         doc.target.pid,
         doc.target.comm,
         doc.window.requested_start_ns,
@@ -1229,7 +1236,7 @@ fn cbom_json(doc: &CaptureDocument) -> serde_json::Value {
     let mut metadata = vec![
         prop(
             "osslscope:schema-version",
-            "observed-crypto-v2.0".to_string(),
+            "observed-crypto-v2.1".to_string(),
         ),
         prop(
             "osslscope:execution-evidence-completeness",
@@ -1601,7 +1608,7 @@ mod tests {
         assert!(doc.policy.is_none());
         let bytes = render_json(&doc).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(v["schema_version"], "observed-crypto-v2.0");
+        assert_eq!(v["schema_version"], "observed-crypto-v2.1");
         assert!(v.get("policy").is_none());
     }
 

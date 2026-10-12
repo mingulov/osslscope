@@ -32,6 +32,11 @@ use std::time::{Duration, Instant};
 
 const PID: u32 = 4242;
 
+// Incidental attach stamp for the tests that predate installed-at:
+// none of them assert on it (the installed-at tests below pass
+// their own meaningful literals).
+const ATTACH_AT: u64 = 900;
+
 static STAGE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 fn obj(id: &str) -> ObjectId {
@@ -232,7 +237,7 @@ fn replacement_inode_gets_new_cookie() {
         "fp-A",
         vec![candidate("prov", "default", 1, 7, &["digest"], false)],
     )]);
-    let rep = s.attach_delta(&d0, &live_a, &files).unwrap();
+    let rep = s.attach_delta(&d0, &live_a, &files, ATTACH_AT).unwrap();
     assert_eq!(rep.attached, 1, "one site attached: {rep:?}");
     assert!(rep.missed.is_empty(), "{:?}", rep.missed);
     let old = s.cookie_for(a.device, a.ino, off).expect("old cookie");
@@ -251,7 +256,7 @@ fn replacement_inode_gets_new_cookie() {
         "fp-B",
         vec![candidate("prov", "default", 1, 7, &["digest"], false)],
     )]);
-    let rep = s.attach_delta(&d1, &live_b, &files_b).unwrap();
+    let rep = s.attach_delta(&d1, &live_b, &files_b, ATTACH_AT).unwrap();
     assert_eq!(rep.attached, 1, "replacement attaches fresh: {rep:?}");
     let new = s.cookie_for(b.device, b.ino, off).expect("new cookie");
     assert_ne!(old, new, "replacement inode must mint a new cookie");
@@ -293,13 +298,13 @@ fn same_inode_alias_path_dedupes() {
         "fp-A",
         vec![candidate("prov", "default", 1, 7, &["digest"], false)],
     )]);
-    let rep = s.attach_delta(&d, &live, &files).unwrap();
+    let rep = s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
     assert_eq!(rep.attached, 1, "one inode attaches once: {rep:?}");
     assert_eq!(s.cookie_count(), 1, "aliases share one cookie");
     let cookie = s.cookie_for(a.device, a.ino, off).unwrap();
     // A second delta describing the same site reuses the cookie and
     // re-attaches nothing (inode probes cover every mapping).
-    let rep = s.attach_delta(&d, &live, &files).unwrap();
+    let rep = s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
     assert_eq!(rep.attached, 0, "survivor re-attaches nothing: {rep:?}");
     assert_eq!(rep.reused, 1);
     assert_eq!(s.cookie_for(a.device, a.ino, off).unwrap(), cookie);
@@ -339,7 +344,7 @@ fn old_mapping_keeps_old_identity() {
             vec![candidate("prov-new", "default", 1, 7, &["digest"], false)],
         ),
     ]);
-    let rep = s.attach_delta(&d, &live, &files).unwrap();
+    let rep = s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
     assert_eq!(rep.attached, 2, "{rep:?}");
     let old = s.cookie_for(a.device, a.ino, off).unwrap();
     let new = s.cookie_for(b.device, b.ino, off).unwrap();
@@ -390,7 +395,7 @@ fn changed_candidates_version_identity() {
         "fp-A",
         vec![candidate("prov", "default", 1, 7, &["digest"], false)],
     )]);
-    s.attach_delta(&d0, &live, &files).unwrap();
+    s.attach_delta(&d0, &live, &files, ATTACH_AT).unwrap();
     let cookie = s.cookie_for(a.device, a.ino, off).unwrap();
     s.open_window(1000, 3000).unwrap();
     fire(&mut s, cookie, 1500, 7);
@@ -407,7 +412,7 @@ fn changed_candidates_version_identity() {
             candidate("prov", "default", 1, 9, &["digest"], true),
         ],
     )]);
-    let rep = s.attach_delta(&d1, &live, &files).unwrap();
+    let rep = s.attach_delta(&d1, &live, &files, ATTACH_AT).unwrap();
     assert!(
         rep.candidates_changed,
         "attribution change must request a fence: {rep:?}"
@@ -465,7 +470,7 @@ fn fence_keeps_aliases() {
             ),
         ],
     )]);
-    s.attach_delta(&d, &live, &files).unwrap();
+    s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
     let cookie = s.cookie_for(a.device, a.ino, off).unwrap();
     s.open_window(1000, 3000).unwrap();
     fire(&mut s, cookie, 1500, 6);
@@ -526,7 +531,7 @@ fn duplicate_sites_union_candidates() {
             vec![candidate("prov", "default", 1, 9, &["cipher"], true)],
         ),
     ]);
-    let rep = s.attach_delta(&d, &live, &files).unwrap();
+    let rep = s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
     assert_eq!(rep.attached, 1, "{rep:?}");
     assert!(!rep.candidates_changed);
     assert_eq!(s.cookie_count(), 1);
@@ -569,7 +574,7 @@ fn conflicting_objects_in_one_delta_fails() {
             vec![candidate("prov", "default", 1, 7, &["digest"], false)],
         ),
     ]);
-    assert!(s.attach_delta(&d, &live, &files).is_err());
+    assert!(s.attach_delta(&d, &live, &files, ATTACH_AT).is_err());
 }
 
 #[test]
@@ -591,15 +596,18 @@ fn staged_update_reverted_before_fence() {
         }
         delta(vec![site(&a, off, "fp-A", cands)])
     };
-    s.attach_delta(&mk(false), &live, &files).unwrap();
+    s.attach_delta(&mk(false), &live, &files, ATTACH_AT)
+        .unwrap();
     let cookie = s.cookie_for(a.device, a.ino, off).unwrap();
     s.open_window(1000, 3000).unwrap();
     fire(&mut s, cookie, 1200, 3);
 
-    let rep = s.attach_delta(&mk(true), &live, &files).unwrap();
+    let rep = s.attach_delta(&mk(true), &live, &files, ATTACH_AT).unwrap();
     assert!(rep.candidates_changed);
     // Revert: the live meaning re-affirmed, no fence requested.
-    let rep = s.attach_delta(&mk(false), &live, &files).unwrap();
+    let rep = s
+        .attach_delta(&mk(false), &live, &files, ATTACH_AT)
+        .unwrap();
     assert!(!rep.candidates_changed, "revert cancels staging: {rep:?}");
 
     s.fence(FenceReason::MappingsChanged).unwrap();
@@ -637,12 +645,15 @@ fn changed_object_fingerprint_versions_identity() {
             vec![candidate("prov", "default", 1, 7, &["digest"], false)],
         )])
     };
-    s.attach_delta(&mk("fp-A"), &live, &files).unwrap();
+    s.attach_delta(&mk("fp-A"), &live, &files, ATTACH_AT)
+        .unwrap();
     let cookie = s.cookie_for(a.device, a.ino, off).unwrap();
     s.open_window(1000, 3000).unwrap();
     fire(&mut s, cookie, 1500, 7);
 
-    let rep = s.attach_delta(&mk("fp-B"), &live, &files).unwrap();
+    let rep = s
+        .attach_delta(&mk("fp-B"), &live, &files, ATTACH_AT)
+        .unwrap();
     assert!(
         rep.candidates_changed,
         "fingerprint change versions: {rep:?}"
@@ -730,7 +741,7 @@ fn close_drain_quiesces_inflight_increment() {
         "fp-A",
         vec![candidate("prov", "default", 1, 7, &["digest"], false)],
     )]);
-    s.attach_delta(&d, &live, &files).unwrap();
+    s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
     let cookie = s.cookie_for(a.device, a.ino, off).unwrap();
     s.open_window(1000, 2000).unwrap();
     s.backend_mut().inner.fire(PID, cookie, 1500, 7);
@@ -768,7 +779,7 @@ fn future_generation_row_is_unattributed_loss() {
         "fp-A",
         vec![candidate("prov", "default", 1, 7, &["digest"], false)],
     )]);
-    s.attach_delta(&d, &live, &files).unwrap();
+    s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
     let cookie = s.cookie_for(a.device, a.ino, off).unwrap();
     s.open_window(1000, 2000).unwrap();
     s.backend_mut().inject_row(
@@ -791,4 +802,218 @@ fn future_generation_row_is_unattributed_loss() {
     assert_eq!(unattributed.value, 5);
     assert!(!s.window_open());
     assert!(s.is_closed());
+}
+
+// P6 installed-at: the probe-attachment wall per cookie. Minting a
+// cookie is not installing it — `installed_at` stamps the monotonic
+// moment the first bind succeeds, never relabels, and stays unset
+// for cookies whose bind missed.
+
+#[test]
+fn attach_stamps_installed_at_on_first_bind() {
+    let stage = Stage::fresh("installed-first");
+    let bytes = self_bytes();
+    let off = x_offset(&bytes);
+    let a = stage.write("prov.so", &bytes);
+    let mut s = session();
+    let live = vec![mapping(&a)];
+    let files = files_for(&[&a]);
+    let d = delta(vec![site(
+        &a,
+        off,
+        "fp-A",
+        vec![candidate("prov", "default", 1, 7, &["digest"], false)],
+    )]);
+    let rep = s.attach_delta(&d, &live, &files, 900).unwrap();
+    assert_eq!(rep.attached, 1, "{rep:?}");
+    let cookie = s.cookie_for(a.device, a.ino, off).unwrap();
+    assert_eq!(
+        s.provenance(cookie).unwrap().installed_at,
+        Some(900),
+        "first bind stamps the caller-provided wall"
+    );
+}
+
+#[test]
+fn reattach_keeps_first_installed_at() {
+    let stage = Stage::fresh("installed-stable");
+    let bytes = self_bytes();
+    let off = x_offset(&bytes);
+    let a = stage.write("prov.so", &bytes);
+    let mut s = session();
+    let live = vec![mapping(&a)];
+    let files = files_for(&[&a]);
+    let d = delta(vec![site(
+        &a,
+        off,
+        "fp-A",
+        vec![candidate("prov", "default", 1, 7, &["digest"], false)],
+    )]);
+    s.attach_delta(&d, &live, &files, 900).unwrap();
+    let rep = s.attach_delta(&d, &live, &files, 1500).unwrap();
+    assert_eq!(rep.reused, 1, "survivor re-attaches nothing: {rep:?}");
+    let cookie = s.cookie_for(a.device, a.ino, off).unwrap();
+    assert_eq!(
+        s.provenance(cookie).unwrap().installed_at,
+        Some(900),
+        "re-attach must not relabel the install wall"
+    );
+}
+
+#[test]
+fn missed_bind_leaves_installed_at_unset() {
+    let stage = Stage::fresh("installed-miss");
+    let bytes = self_bytes();
+    let off = x_offset(&bytes);
+    let a = stage.write("prov.so", &bytes);
+    // Swap the backing before attach: the plan goes stale.
+    let swap = stage.write("prov.swap", &bytes);
+    assert_ne!(swap.ino, a.ino);
+    std::fs::rename(&swap.path, &a.path).unwrap();
+    let mut s = session();
+    let live = vec![mapping(&a)];
+    let files = files_for(&[&a]);
+    let d = delta(vec![site(
+        &a,
+        off,
+        "fp-A",
+        vec![candidate("prov", "default", 1, 7, &["digest"], false)],
+    )]);
+    let report = s.attach_delta(&d, &live, &files, 900).unwrap();
+    assert_eq!(report.attached, 0);
+    assert!(
+        report.missed.iter().any(|m| m.reason == "replaced"),
+        "stale plan must not bind: {report:?}"
+    );
+    let cookie = s.cookie_for(a.device, a.ino, off).unwrap();
+    assert_eq!(
+        s.provenance(cookie).unwrap().installed_at,
+        None,
+        "minted-but-never-bound cookies carry no install wall"
+    );
+}
+
+// P6 installed-at surfacing: every rendered site carries its
+// cookie's install wall, so installed-at vs first-counted is
+// distinguishable per site (P5d §4, first two legs).
+
+#[test]
+fn drained_site_carries_installed_at() {
+    let stage = Stage::fresh("installed-drain");
+    let bytes = self_bytes();
+    let off = x_offset(&bytes);
+    let a = stage.write("prov.so", &bytes);
+    let mut s = session();
+    let live = vec![mapping(&a)];
+    let files = files_for(&[&a]);
+    let d = delta(vec![site(
+        &a,
+        off,
+        "fp-A",
+        vec![candidate("prov", "default", 1, 7, &["digest"], false)],
+    )]);
+    s.attach_delta(&d, &live, &files, 900).unwrap();
+    let cookie = s.cookie_for(a.device, a.ino, off).unwrap();
+    s.open_window(1000, 2000).unwrap();
+    fire(&mut s, cookie, 1500, 7);
+    let drain = s.close_and_drain(Duration::from_secs(5)).unwrap();
+    assert_eq!(drain.current.len(), 1);
+    let exec = &drain.current[0];
+    assert_eq!(exec.calls, 7);
+    assert_eq!(
+        exec.installed_at,
+        Some(900),
+        "drained site carries the bind wall"
+    );
+    assert_eq!(
+        exec.first_ns, 1500,
+        "first-counted stays distinct from installed-at"
+    );
+}
+
+#[test]
+fn fenced_site_carries_installed_at() {
+    let stage = Stage::fresh("installed-fence");
+    let bytes = self_bytes();
+    let off = x_offset(&bytes);
+    let a = stage.write("prov.so", &bytes);
+    let mut s = session();
+    let live = vec![mapping(&a)];
+    let files = files_for(&[&a]);
+    let d = delta(vec![site(
+        &a,
+        off,
+        "fp-A",
+        vec![candidate("prov", "default", 1, 7, &["digest"], false)],
+    )]);
+    s.attach_delta(&d, &live, &files, 900).unwrap();
+    let cookie = s.cookie_for(a.device, a.ino, off).unwrap();
+    s.open_window(1000, 3000).unwrap();
+    fire(&mut s, cookie, 1500, 7);
+    s.fence(FenceReason::MappingsChanged).unwrap();
+    fire(&mut s, cookie, 2500, 4);
+    let drain = s.close_and_drain(Duration::from_secs(5)).unwrap();
+    assert_eq!(drain.fenced.len(), 1);
+    assert_eq!(drain.fenced[0].sites.len(), 1);
+    assert_eq!(
+        drain.fenced[0].sites[0].installed_at,
+        Some(900),
+        "fenced seal preserves the install wall"
+    );
+    assert_eq!(drain.current.len(), 1);
+    assert_eq!(
+        drain.current[0].installed_at,
+        Some(900),
+        "post-fence site keeps the install wall"
+    );
+}
+
+#[test]
+fn straggler_bucket_carries_installed_at() {
+    // No gen-0 counts before the fence: the sealed bucket is empty
+    // and the late gen-0 row takes the straggler PUSH path (not the
+    // fold into an existing site).
+    let stage = Stage::fresh("installed-straggler");
+    let bytes = self_bytes();
+    let off = x_offset(&bytes);
+    let a = stage.write("prov.so", &bytes);
+    let mut s = session();
+    let live = vec![mapping(&a)];
+    let files = files_for(&[&a]);
+    let d = delta(vec![site(
+        &a,
+        off,
+        "fp-A",
+        vec![candidate("prov", "default", 1, 7, &["digest"], false)],
+    )]);
+    s.attach_delta(&d, &live, &files, 900).unwrap();
+    let cookie = s.cookie_for(a.device, a.ino, off).unwrap();
+    s.open_window(1000, 2000).unwrap();
+    s.fence(FenceReason::MappingsChanged).unwrap();
+    s.backend_mut().inject_row(
+        cookie,
+        0,
+        CountValue {
+            count: 5,
+            first_ns: 1500,
+            last_ns: 1500,
+        },
+    );
+    let drain = s.close_and_drain(Duration::from_secs(5)).unwrap();
+    assert!(drain.current.is_empty(), "straggler must not land current");
+    assert_eq!(drain.fenced.len(), 1);
+    assert_eq!(drain.fenced[0].sites.len(), 1);
+    let exec = &drain.fenced[0].sites[0];
+    assert_eq!(exec.calls, 5);
+    assert_eq!(
+        exec.installed_at,
+        Some(900),
+        "straggler site carries the retired install wall"
+    );
+    let stale = drain
+        .counters
+        .iter()
+        .find(|c| c.name == "count.stale_events")
+        .expect("stale_events counter present");
+    assert_eq!(stale.value, 5, "row took the straggler path");
 }

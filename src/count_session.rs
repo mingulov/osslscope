@@ -145,15 +145,18 @@ pub enum FenceReason {
 }
 
 /// Immutable meaning of one cookie: the physical site, the candidate
-/// set explaining it, that set's coverage, and the link path the
-/// probe attached through (locator, not identity — recorded on
-/// successful attach only, empty before that).
+/// set explaining it, that set's coverage, the link path the probe
+/// attached through (locator, not identity — recorded on successful
+/// attach only, empty before that), and the monotonic install wall
+/// (`None` until the first bind succeeds, never relabelled after —
+/// minted is not installed, and installed is not yet counted).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Provenance {
     pub site: SiteKey,
     pub candidates: Vec<CandidateIdentity>,
     pub candidates_coverage: CandidateCoverage,
     pub link_path: String,
+    pub installed_at: Option<u64>,
 }
 
 /// Attribution update staged by [`CountSession::attach_delta`],
@@ -467,11 +470,16 @@ impl<B: CountBackend> CountSession<B> {
     /// only bound cookies' hits attribute ([`CountSession::route`]
     /// gates on the bound set, so rejected plans' anomaly hits
     /// land in unattributed loss, never silently dropped).
+    ///
+    /// `installed_at_ns` is the caller's monotonic now: every
+    /// cookie this call binds records it as its install wall
+    /// (survivors and misses keep whatever they already carry).
     pub fn attach_delta(
         &mut self,
         delta: &CountDelta,
         live: &[maps::Mapping],
         files: &HashMap<String, plan::FileBytes>,
+        installed_at_ns: u64,
     ) -> anyhow::Result<AttachReport> {
         if self.closed {
             anyhow::bail!("count session is closed");
@@ -548,6 +556,7 @@ impl<B: CountBackend> CountSession<B> {
                         candidates: site.candidates.clone(),
                         candidates_coverage: site.candidates_coverage,
                         link_path: String::new(),
+                        installed_at: None,
                     });
                 }
                 Entry::Occupied(_) if same => {
@@ -661,6 +670,7 @@ impl<B: CountBackend> CountSession<B> {
                         .insert((prov.site.device, prov.site.inode, *offset));
                     self.bound.insert(cookie);
                     prov.link_path = group.path.clone();
+                    prov.installed_at = Some(installed_at_ns);
                     report.attached += 1;
                 }
             }
@@ -741,6 +751,7 @@ impl<B: CountBackend> CountSession<B> {
                 calls: total.count,
                 first_ns: total.first_ns,
                 last_ns: total.last_ns,
+                installed_at: prov.installed_at,
             });
         }
         sites.sort();
@@ -828,6 +839,7 @@ impl<B: CountBackend> CountSession<B> {
                 calls: total.count,
                 first_ns: total.first_ns,
                 last_ns: total.last_ns,
+                installed_at: prov.installed_at,
             });
         }
         current.sort();
@@ -968,6 +980,7 @@ impl<B: CountBackend> CountSession<B> {
                             calls: delta,
                             first_ns: total.first_ns,
                             last_ns: total.last_ns,
+                            installed_at: old.installed_at,
                         });
                         bucket.sites.sort();
                     }

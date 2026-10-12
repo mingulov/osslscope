@@ -57,6 +57,7 @@ fn site_at(
         calls,
         first_ns: 10,
         last_ns: 20,
+        installed_at: None,
     }
 }
 
