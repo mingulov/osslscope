@@ -1232,23 +1232,45 @@ pub struct LiveBackend {
 }
 
 impl LiveBackend {
-    pub fn new(loaded: crate::loader::Loaded, pid: u32) -> Self {
+    /// Crate-sealed: both call sites load COUNT_MAPS through
+    /// `prepare`+`load`, which is what `program()`'s dim gate
+    /// assumes. Public construction would let safe callers pair
+    /// this backend with wrong-sized maps and void the unsafe
+    /// update contract.
+    pub(crate) fn new(loaded: crate::loader::Loaded, pid: u32) -> Self {
         Self { loaded, pid }
     }
 
     fn program(&self, map: &str, key: u32, value: &[u8]) -> anyhow::Result<()> {
         use anyhow::Context as _;
         use std::os::fd::AsRawFd as _;
+        // Soundness gate for the unsafe update below: the map must
+        // be a known COUNT programmer — plain ARRAY (type 2;
+        // per-CPU value sizing follows a different rule, so only
+        // the identity-sized type passes) with exact dims. Runs
+        // before any fd use, so a mismatch fails caps-free.
+        let spec = crate::loader::COUNT_MAPS
+            .iter()
+            .find(|m| m.name == map)
+            .ok_or_else(|| anyhow::anyhow!("program {map}: unknown map"))?;
+        if spec.map_type != 2 || spec.key_size != 4 || spec.value_size as usize != value.len() {
+            anyhow::bail!(
+                "program {map}: type {}/dims {}/{} vs value len {}",
+                spec.map_type,
+                spec.key_size,
+                spec.value_size,
+                value.len()
+            );
+        }
         let fd = self
             .loaded
             .maps
             .get(map)
             .context(format!("no {map} map"))?
             .as_raw_fd();
-        // SAFETY: every `program()` caller passes exact COUNT_MAPS
-        // dims — key `u32` (4) with value `u64` (8) for WINDOW /
-        // TARGET (value 8) and `u32` (4) for GEN (value 4); all
-        // plain ARRAY maps, fd live from `load()`.
+        // SAFETY: the gate above proved a plain-ARRAY COUNT map with
+        // key_size 4 (this `u32`) and value_size == value.len(), and
+        // the fd is live from `load()`.
         unsafe {
             ossl_bpf_sys::map_update_elem(fd, &key.to_le_bytes(), value, ossl_bpf_sys::BPF_ANY)
         }
@@ -1389,6 +1411,45 @@ impl CountBackend for LiveBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn empty_backend() -> LiveBackend {
+        LiveBackend {
+            loaded: crate::loader::Loaded {
+                progs: std::collections::HashMap::new(),
+                maps: std::collections::HashMap::new(),
+            },
+            pid: 0,
+        }
+    }
+
+    #[test]
+    fn program_rejects_dim_mismatch_caps_free() {
+        // GEN value is 4 bytes; an 8-byte value must fail at the
+        // dim gate (before any fd use — no caps needed), not reach
+        // the unsafe update.
+        let b = empty_backend();
+        let e = b.program("GEN", 0, &[0u8; 8]).err().expect("must fail");
+        assert!(e.to_string().contains("vs value len"), "{e:#}");
+    }
+
+    #[test]
+    fn program_rejects_unknown_map() {
+        let b = empty_backend();
+        let e = b.program("NOPE", 0, &[]).err().expect("must fail");
+        assert!(e.to_string().contains("unknown map"), "{e:#}");
+    }
+
+    #[test]
+    fn program_passes_gate_for_valid_dims() {
+        // Correct dims pass the gate (failing later at the missing
+        // fd — caps-free proof the gate admits valid shapes).
+        let b = empty_backend();
+        let e = b
+            .program("GEN", 0, &0u32.to_le_bytes())
+            .err()
+            .expect("must fail");
+        assert!(e.to_string().contains("no GEN map"), "{e:#}");
+    }
 
     #[test]
     fn bad_indices_normalize_defensively() {

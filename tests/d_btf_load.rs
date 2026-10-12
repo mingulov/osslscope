@@ -314,10 +314,15 @@ fn parse_verifier_cost(line: &str) -> Option<VerifierCost> {
     }
     let processed: u64 = tok[1].parse().ok()?;
     // Required `key <n>` metrics (other pairs like `(limit N)` and
-    // `mark_read 0` are ignored).
+    // `mark_read 0` are ignored). Each required key must appear
+    // exactly once — no first-wins on repeats.
     let mut metric = |key: &str| -> Option<u64> {
-        let i = tok.iter().position(|t| *t == key)?;
-        tok.get(i + 1)?.parse().ok()
+        let mut at = tok.iter().position(|t| *t == key)?;
+        if tok.iter().skip(at + 1).any(|t| *t == key) {
+            return None;
+        }
+        at += 1;
+        tok.get(at)?.parse().ok()
     };
     Some(VerifierCost {
         processed,
@@ -365,6 +370,17 @@ fn cost_parser_rejects_malformed_number() {
         )
         .is_none(),
         "trailing garbage must not parse"
+    );
+}
+
+#[test]
+fn cost_parser_rejects_repeated_key() {
+    assert!(
+        parse_verifier_cost(
+            "processed 20 insns max_states_per_insn 1 total_states 2 total_states 99 peak_states 3"
+        )
+        .is_none(),
+        "repeated metric key must not parse (no first-wins)"
     );
 }
 

@@ -481,8 +481,11 @@ fn check_ld_imm64_site(bytes: &[u8], off: usize, prog: &str) -> anyhow::Result<(
     if off % 8 != 0 {
         anyhow::bail!("prog {prog}: map site misaligned");
     }
+    let end = off
+        .checked_add(16)
+        .ok_or_else(|| anyhow::anyhow!("prog {prog}: map site out of range"))?;
     let site = bytes
-        .get(off..off + 16)
+        .get(off..end)
         .ok_or_else(|| anyhow::anyhow!("prog {prog}: map site out of range"))?;
     if site[0] != BPF_LD_IMM64 || site[1] >> 4 != 0 {
         anyhow::bail!("prog {prog}: map site vs non-ld_imm64");
@@ -1220,13 +1223,11 @@ pub fn load(prep: &Prepared) -> anyhow::Result<Loaded> {
     for p in &prep.progs {
         let mut insns = p.insns.clone();
         for f in &p.map_fixups {
-            // Range first (own message), then the shared shape check
-            // (`Prepared` fields are public, so `load()` cannot assume
-            // `prepare()` validated these sites): alignment, full
-            // 16-byte presence, opcode/src, reserved bytes.
-            insns
-                .get(f.insn_off..f.insn_off + 8)
-                .ok_or_else(|| anyhow::anyhow!("{}: fixup out of range", p.name))?;
+            // Full 16-byte range first (checked: `Prepared` fields
+            // are public, so a huge hand-built offset must ERR, not
+            // panic on overflow), then shape, then patch. The borrow
+            // below cannot overflow: the validator proved
+            // `off + 16 <= len`.
             check_ld_imm64_site(&insns, f.insn_off, &p.name)?;
             let insn = insns
                 .get_mut(f.insn_off..f.insn_off + 8)
@@ -2013,6 +2014,41 @@ mod tests {
             e.to_string().contains("map site reserved bytes set"),
             "{e:#}"
         );
+    }
+
+    #[test]
+    fn load_rejects_huge_fixup_off_caps_free() {
+        // `Prepared` fields are public: a hand-built fixup at
+        // `MAX-7` (aligned) must ERR, not panic on `off + 8`
+        // overflow in debug. No maps: the validator bails before
+        // any fd use, so no caps are needed.
+        let prep = Prepared {
+            maps: Vec::new(),
+            progs: vec![PreparedProg {
+                name: "p".to_string(),
+                is_return: false,
+                insns: vec![0u8; 32],
+                map_fixups: vec![MapFixup {
+                    insn_off: usize::MAX - 7,
+                    map: "NOPE".to_string(),
+                }],
+                subprogs: vec![SubprogInfo {
+                    name: "p".to_string(),
+                    insn_off: 0,
+                    is_callback: false,
+                }],
+            }],
+        };
+        let e = load(&prep).err().expect("must fail");
+        assert!(e.to_string().contains("out of range"), "{e:#}");
+    }
+
+    #[test]
+    fn check_ld_imm64_site_rejects_huge_off() {
+        // Aligned `MAX-15`: `off + 16` overflows — must ERR, not
+        // panic in debug.
+        let e = check_ld_imm64_site(&[0u8; 32], usize::MAX - 15, "p").unwrap_err();
+        assert!(e.to_string().contains("out of range"), "{e:#}");
     }
 
     #[test]
