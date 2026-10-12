@@ -524,6 +524,12 @@ fn call_target(
     if site[0] != BPF_CALL {
         anyhow::bail!("prog {prog}: call reloc vs non-call insn");
     }
+    if site[1] >> 4 != BPF_PSEUDO_CALL {
+        // A reloc on a helper-form call would rewrite the helper id
+        // into a relative target — a silent semantic change. Real
+        // toolchains emit PSEUDO_CALL for static calls, always.
+        anyhow::bail!("prog {prog}: call reloc vs helper call");
+    }
     if !rsym.is_section {
         if !rsym.is_func || rsym.shndx != text_idx {
             anyhow::bail!("prog {prog}: call reloc vs non-entry {}", rsym.name);
@@ -1462,7 +1468,7 @@ mod tests {
         b[62..64].copy_from_slice(&u16(8)); // shstrndx
         // uprobe: ld_imm64 r1,map + call + exit.
         b[64..80].copy_from_slice(&[0x18, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-        b[80..88].copy_from_slice(&[0x85, 0, 0, 0, 0, 0, 0, 0]);
+        b[80..88].copy_from_slice(&[0x85, 0x10, 0, 0, 0, 0, 0, 0]);
         b[88..96].copy_from_slice(&[0x95, 0, 0, 0, 0, 0, 0, 0]);
         // .text: ld_imm64 r1,map + exit.
         b[96..112].copy_from_slice(&[0x18, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
@@ -1575,13 +1581,13 @@ mod tests {
         b[58..60].copy_from_slice(&u16(64));
         b[60..62].copy_from_slice(&u16(9));
         b[62..64].copy_from_slice(&u16(8));
-        // uprobe main: call + exit.
-        b[uprobe_off..uprobe_off + 8].copy_from_slice(&[0x85, 0, 0, 0, 0, 0, 0, 0]);
+        // uprobe main: pseudo-call + exit.
+        b[uprobe_off..uprobe_off + 8].copy_from_slice(&[0x85, 0x10, 0, 0, 0, 0, 0, 0]);
         b[uprobe_off + 8..uprobe_off + 16].copy_from_slice(&[0x95, 0, 0, 0, 0, 0, 0, 0]);
         // .text cb: ld_imm64 r1,map + call.
         b[text_off..text_off + 16]
             .copy_from_slice(&[0x18, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-        b[text_off + 16..text_off + 24].copy_from_slice(&[0x85, 0, 0, 0, 0, 0, 0, 0]);
+        b[text_off + 16..text_off + 24].copy_from_slice(&[0x85, 0x10, 0, 0, 0, 0, 0, 0]);
         // .text dead: exit (unreferenced).
         b[text_off + 24..text_off + 32].copy_from_slice(&[0x95, 0, 0, 0, 0, 0, 0, 0]);
         // .text wrap: ld_imm64 r2,cb.
@@ -1711,13 +1717,17 @@ mod tests {
                 ("helper", 7, false),
             ]
         );
-        // main call @0 -> wrap @5insns: imm = 5-0-1.
+        // main call @0 -> wrap @5insns: PSEUDO_CALL nibble +
+        // imm = 5-0-1.
+        assert_eq!(p.insns[1], 0x10);
         assert_eq!(&p.insns[4..8], &4i32.to_le_bytes());
         // wrap func site @40 -> cb @2insns: dst r2 + PSEUDO_FUNC,
         // imm = 2-5-1 (backward).
         assert_eq!(p.insns[41], 0x02 | (BPF_PSEUDO_FUNC << 4));
         assert_eq!(&p.insns[44..48], &(-4i32).to_le_bytes());
-        // cb call @32 -> helper @7insns: imm = 7-4-1.
+        // cb call @32 -> helper @7insns: PSEUDO_CALL nibble +
+        // imm = 7-4-1.
+        assert_eq!(p.insns[33], 0x10);
         assert_eq!(&p.insns[36..40], &2i32.to_le_bytes());
         // One map fixup: cb's site at linked offset 16.
         assert_eq!(p.map_fixups.len(), 1);
@@ -1978,6 +1988,35 @@ mod tests {
     }
 
     #[test]
+    fn prepare_rejects_helper_call_with_reloc() {
+        // A call reloc on a helper-form call (src 0, not
+        // PSEUDO_CALL): linking would rewrite the helper id into a
+        // relative target — a silent semantic change. Pin the
+        // helper-form byte explicitly (min_elf itself emits
+        // PSEUDO_CALL).
+        let mut obj = min_elf();
+        obj[81] = 0x00;
+        let e = prepare(
+            &obj,
+            &[MapSpec {
+                name: "MYMAP",
+                map_type: 2,
+                key_size: 4,
+                value_size: 8,
+                max_entries: 1,
+                flags: 0,
+            }],
+            &[ProgSpec {
+                name: "uprobe_func",
+                section: "uprobe",
+            }],
+        )
+        .err()
+        .expect("must fail");
+        assert!(e.to_string().contains("helper call"), "{e:#}");
+    }
+
+    #[test]
     fn prepare_rejects_misaligned_call_site() {
         // A call reloc at misaligned @18 whose straddling bytes
         // start with a CALL opcode: shape checks alone would link it.
@@ -2122,6 +2161,10 @@ mod tests {
         let mut obj = min_elf();
         obj[164..172].copy_from_slice(&u64(24));
         obj[64 + 24] = 0x85;
+        obj[64 + 25] = 0x10;
+        // The reloc moved: clear the stale call bytes (an unowned
+        // pseudo-call is drift and must not linger).
+        obj[64 + 16..64 + 24].fill(0);
         let prep = prepare(
             &obj,
             &[MapSpec {
@@ -2705,6 +2748,7 @@ mod tests {
     fn call_site(imm: i32) -> Vec<u8> {
         let mut b = vec![0x95u8; 16]; // exit padding
         b[0] = 0x85;
+        b[1] = 0x10; // PSEUDO_CALL, like a real toolchain
         b[4..8].copy_from_slice(&imm.to_le_bytes());
         b
     }

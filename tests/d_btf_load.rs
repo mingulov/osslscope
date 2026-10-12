@@ -547,6 +547,26 @@ fn bpf_loop_shape_kernel_image_matches_send() {
     );
 }
 
+/// Where a manual metadata load failed: setup (BTF upload, map
+/// create, fixup patch — caps or helper bugs) versus the actual
+/// program load (the kernel's metadata verdict). Rejection pins
+/// require `ProgLoad`: a setup failure must never count as a
+/// metadata rejection.
+#[derive(Debug)]
+enum MetaLoadError {
+    Setup(anyhow::Error),
+    ProgLoad(std::io::Error, String),
+}
+
+impl std::fmt::Display for MetaLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MetaLoadError::Setup(e) => write!(f, "setup: {e:#}"),
+            MetaLoadError::ProgLoad(e, tail) => write!(f, "prog load: {e}\nlog tail: {tail}"),
+        }
+    }
+}
+
 /// Manual load of the prepared callback shape with caller-chosen
 /// func_info records: map create + fixup patch (same encoding the
 /// loader applies) + BTF synth/upload + log-buffer load (the
@@ -557,23 +577,26 @@ fn load_with_func_info(
     p: &osslscope::loader::PreparedProg,
     info: &[(u32, u32)],
     prog_name: &str,
-) -> anyhow::Result<String> {
+) -> Result<String, MetaLoadError> {
     use anyhow::Context as _;
-    let (btf, _) = osslscope::loader::synth_btf(&p.subprogs)?;
+    let (btf, _) = osslscope::loader::synth_btf(&p.subprogs).map_err(MetaLoadError::Setup)?;
     let mut func_info_bytes: Vec<u8> = Vec::new();
     for (off, id) in info {
         func_info_bytes.extend_from_slice(&off.to_le_bytes());
         func_info_bytes.extend_from_slice(&id.to_le_bytes());
     }
     let mut btf_log = vec![0u8; 1 << 16];
-    let btf_fd = ossl_bpf_sys::btf_load(&btf, &mut btf_log)?;
+    let btf_fd =
+        ossl_bpf_sys::btf_load(&btf, &mut btf_log).map_err(|e| MetaLoadError::Setup(e.into()))?;
     assert_eq!(p.map_fixups.len(), 1, "one DCOUNT site expected");
     let f = &p.map_fixups[0];
-    let map_fd = ossl_bpf_sys::map_create(2, 4, 8, 1, None, "DCOUNT")?;
+    let map_fd = ossl_bpf_sys::map_create(2, 4, 8, 1, None, "DCOUNT")
+        .map_err(|e| MetaLoadError::Setup(e.into()))?;
     let mut insns = p.insns.clone();
     let slot = insns
         .get_mut(f.insn_off..f.insn_off + 8)
-        .context("fixup range")?;
+        .context("fixup range")
+        .map_err(MetaLoadError::Setup)?;
     slot[1] = (slot[1] & 0x0f) | (1 << 4);
     slot[4..8].copy_from_slice(&(map_fd.as_raw_fd() as u32).to_le_bytes());
     let mut log = vec![0u8; 1 << 20];
@@ -585,21 +608,45 @@ fn load_with_func_info(
         ossl_bpf_sys::prog_load_kprobe(&insns, c"GPL", None, &mut log, prog_name, Some(btf_attach));
     if let Err(e) = r {
         // Kernel evidence: trailing log lines carry the rejection
-        // mode (the DMETA prints below show them).
+        // mode (cut at the first NUL — `trim_end` leaves NUL
+        // padding, which would drown the tail in zeros).
         let text = String::from_utf8_lossy(&log);
+        let text = text.split('\0').next().unwrap_or("");
         let tail: String = text.trim_end().chars().rev().take(600).collect();
         let tail: String = tail.chars().rev().collect();
-        return Err(anyhow::anyhow!("prog load: {e}\nlog tail: {tail}"));
+        return Err(MetaLoadError::ProgLoad(e, tail));
     }
     Ok(String::from_utf8_lossy(&log).into_owned())
 }
 
-/// Malformed upload metadata must fail: the kernel re-validates
-/// every func_info record, so lying counts, offsets, or type IDs
-/// never load silently (defense in depth behind the loader's own
-/// synthesis validation). Rejection MODES are kernel evidence
-/// (printed, not pinned — kernel text is not our contract); the
-/// pin is that each corruption FAILS.
+/// Require a program-load EINVAL (lane 7.0): setup failures and
+/// other errnos fail the pin — a rejection must come from the
+/// kernel's metadata validation, never from fallout. Kernel message
+/// wording stays unpinned (kernel text is not our contract).
+fn assert_prog_load_einval(e: &MetaLoadError, what: &str) {
+    match e {
+        MetaLoadError::ProgLoad(io, tail) => {
+            assert_eq!(
+                io.raw_os_error(),
+                Some(libc::EINVAL),
+                "{what}: errno must be EINVAL"
+            );
+            eprintln!("DMETA {what}: EINVAL as expected");
+            if !tail.trim().is_empty() {
+                eprintln!("DMETA {what} log tail: {tail}");
+            }
+        }
+        MetaLoadError::Setup(s) => panic!("{what}: setup failure is not a rejection: {s:#}"),
+    }
+}
+
+/// Malformed upload metadata must fail at program load: the kernel
+/// re-validates every func_info record, so lying counts, offsets, or
+/// type IDs never load silently (defense in depth behind the
+/// loader's own synthesis validation). The control (unmodified
+/// metadata loads) proves setup, so each corruption's EINVAL is a
+/// real kernel verdict, never setup fallout. Kernel message wording
+/// stays unpinned (kernel text is not our contract).
 #[test]
 #[ignore = "live lane only (see module docs)"]
 fn malformed_func_info_is_rejected() {
@@ -611,40 +658,44 @@ fn malformed_func_info_is_rejected() {
     let p = &prep.progs[0];
     let (_, info) = osslscope::loader::synth_btf(&p.subprogs).expect("synth");
     assert_eq!(info.len(), 2, "main + callback records expected");
+    // Control: unmodified metadata loads (setup works).
+    load_with_func_info(p, &info, "dprobemeta").expect("control must load");
     // (a) Dropped callback record: count 1 for 2 subprogs.
     let e = load_with_func_info(p, &info[..1], "dprobemeta")
         .err()
         .expect("dropped record must fail");
-    eprintln!("DMETA dropped-record: {e:#}");
+    assert_prog_load_einval(&e, "dropped-record");
     // (b) Callback offset shifted mid-function.
     let mut bad = info.clone();
     bad[1].0 += 1;
     let e = load_with_func_info(p, &bad, "dprobemeta")
         .err()
         .expect("shifted offset must fail");
-    eprintln!("DMETA shifted-offset: {e:#}");
+    assert_prog_load_einval(&e, "shifted-offset");
     // (c) Callback type id to a non-FUNC (INT u64, id 1).
     let mut bad = info.clone();
     bad[1].1 = 1;
     let e = load_with_func_info(p, &bad, "dprobemeta")
         .err()
         .expect("non-FUNC type id must fail");
-    eprintln!("DMETA non-func-id: {e:#}");
+    assert_prog_load_einval(&e, "non-func-id");
     // (d) Callback type id out of range.
     let mut bad = info.clone();
     bad[1].1 = 999;
     let e = load_with_func_info(p, &bad, "dprobemeta")
         .err()
         .expect("out-of-range type id must fail");
-    eprintln!("DMETA oor-id: {e:#}");
-    // (e) Extra record past the subprog count (off 100 is past
-    // the image end).
+    assert_prog_load_einval(&e, "oor-id");
+    // (e) Extra record past the subprog count (off 100 is past the
+    // image end) with the callback's own VALID func id, so the
+    // rejection exercises the count/offset — not a repeat of the
+    // non-FUNC-id mode.
     let mut extra = info.clone();
-    extra.push((100, 1));
+    extra.push((100, info[1].1));
     let e = load_with_func_info(p, &extra, "dprobemeta")
         .err()
         .expect("extra record must fail");
-    eprintln!("DMETA extra-record: {e:#}");
+    assert_prog_load_einval(&e, "extra-record");
 }
 
 /// Success-path verifier cost for the callback shape: reload with
