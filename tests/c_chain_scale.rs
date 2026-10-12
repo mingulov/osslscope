@@ -192,11 +192,7 @@ fn system_libcrypto() -> Option<PathBuf> {
 }
 
 fn stage(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "osslscope-cklive-{}-{}",
-        tag,
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("osslscope-cklive-{}-{}", tag, std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
@@ -235,7 +231,7 @@ fn run_leg(
     n_algs: usize,
     rounds: usize,
     hole: Option<u32>,
-) -> (serde_json::Value, String) {
+) -> (serde_json::Value, String, u64) {
     let dir = stage(tag);
     std::fs::write(dir.join("ckprov.c"), prov_src(n_algs)).unwrap();
     let prov = dir.join("ckprov.so");
@@ -293,7 +289,12 @@ fn run_leg(
             std::env::remove_var("OSSL_JUMPS_HOLE");
         }
     }
-    let doc = osslscope::discovery::harvest::run(&cfg).expect("harvest run");
+    // Query volume from the exact in-memory totals, not the doc
+    // field: `schema::emit` reports `queries_observed` only when
+    // `builtin || partial`, so a clean COMPLETE doc omits it
+    // (a leg that reads the doc field goes 0 when no gap fires).
+    let (doc, totals) = osslscope::discovery::harvest::run_detailed(&cfg, &|| Ok(()), &|| false)
+        .expect("harvest run");
     unsafe {
         std::env::remove_var("OSSL_JUMPS_HOLE");
     }
@@ -309,7 +310,7 @@ fn run_leg(
         vlog_text.contains(&format!("CKQUERIES {rounds}")),
         "vehicle did not complete {rounds} queries: {vlog_text:?}"
     );
-    (doc, vlog_text)
+    (doc, vlog_text, totals.queries_observed)
 }
 
 fn dispatch_rows(doc: &serde_json::Value) -> Vec<serde_json::Value> {
@@ -331,9 +332,9 @@ fn k4_five_slots_per_query() {
         return;
     };
     let guard = LEG_LOCK.lock().unwrap();
-    let (doc, _) = run_leg(&guard, "k4", &object, &libcrypto, 20, 4, None);
+    let (doc, _, queries_raw) = run_leg(&guard, "k4", &object, &libcrypto, 20, 4, None);
     let rows = dispatch_rows(&doc);
-    let queries = doc["queries_observed"].as_u64().unwrap_or(0) as usize;
+    let queries = queries_raw as usize;
     assert!(
         queries >= 2,
         "too few queries observed for a ratio ({queries}), flaky attach?"
@@ -355,9 +356,9 @@ fn k8_nine_slots_per_query() {
         return;
     };
     let guard = LEG_LOCK.lock().unwrap();
-    let (doc, _) = run_leg(&guard, "k8", &object, &libcrypto, 36, 4, None);
+    let (doc, _, queries_raw) = run_leg(&guard, "k8", &object, &libcrypto, 36, 4, None);
     let rows = dispatch_rows(&doc);
-    let queries = doc["queries_observed"].as_u64().unwrap_or(0) as usize;
+    let queries = queries_raw as usize;
     assert!(
         queries >= 2,
         "too few queries observed for a ratio ({queries}), flaky attach?"
@@ -382,9 +383,9 @@ fn hole_degrades_rate_not_coverage() {
         return;
     };
     let guard = LEG_LOCK.lock().unwrap();
-    let (doc_a, _) = run_leg(&guard, "hole-a", &object, &libcrypto, 20, 4, None);
+    let (doc_a, _, queries_a_raw) = run_leg(&guard, "hole-a", &object, &libcrypto, 20, 4, None);
     let rows_a = dispatch_rows(&doc_a);
-    let queries_a = doc_a["queries_observed"].as_u64().unwrap_or(0) as usize;
+    let queries_a = queries_a_raw as usize;
     assert!(queries_a >= 2, "leg A too few queries ({queries_a})");
     assert_eq!(
         rows_a.len(),
@@ -392,9 +393,9 @@ fn hole_degrades_rate_not_coverage() {
         "leg A (no hole) must run the C2 rate: rows={} queries={queries_a}",
         rows_a.len(),
     );
-    let (doc_b, _) = run_leg(&guard, "hole-b", &object, &libcrypto, 20, 4, Some(1));
+    let (doc_b, _, queries_b_raw) = run_leg(&guard, "hole-b", &object, &libcrypto, 20, 4, Some(1));
     let rows_b = dispatch_rows(&doc_b);
-    let queries_b = doc_b["queries_observed"].as_u64().unwrap_or(0) as usize;
+    let queries_b = queries_b_raw as usize;
     assert!(queries_b >= 2, "leg B too few queries ({queries_b})");
     assert_eq!(
         rows_b.len(),
@@ -429,9 +430,9 @@ fn k8_pressure_complete() {
         return;
     };
     let guard = LEG_LOCK.lock().unwrap();
-    let (doc, _) = run_leg(&guard, "k8p", &object, &libcrypto, 64, 9, None);
+    let (doc, _, queries_raw) = run_leg(&guard, "k8p", &object, &libcrypto, 64, 9, None);
     let rows = dispatch_rows(&doc);
-    let queries = doc["queries_observed"].as_u64().unwrap_or(0) as usize;
+    let queries = queries_raw as usize;
     assert!(
         queries >= 8,
         "C5 needs 8 observed queries to reach the terminator ({queries})"
@@ -476,4 +477,3 @@ fn ck_frozen_shape_has_eight_callees() {
         "no CURSOR at any K: the handoff rides PENDING_QUERY + QUERY_NEXT"
     );
 }
-
