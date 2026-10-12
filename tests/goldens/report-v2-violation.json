@@ -59,6 +59,12 @@
       ]
     }
   ],
+  "legacy_partition": {
+    "legacy_exclusive_calls": 0,
+    "non_legacy_exclusive_calls": 550,
+    "shared_ambiguous_calls": 0,
+    "unfenced_tail_calls": 0
+  },
   "objects": [
     {
       "device": 8,

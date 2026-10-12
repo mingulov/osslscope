@@ -10,8 +10,8 @@
 use osslscope::evidence::{
     CandidateCoverage, CandidateIdentity, CaptureWindow, Completeness, CounterKind, CounterSource,
     CounterUnits, ExpectedScope, FatalKind, FencedGeneration, FinalizeInput, GapCounter, GapReason,
-    MatchBounds, ObjectId, OpensslVersion, PredicateMatch, RuleVerdict, ScopeCoverage,
-    SiteExecution, SiteKey, TargetRecord, finalize, match_bounds,
+    LegacyCallPartition, MatchBounds, ObjectId, OpensslVersion, PredicateMatch, RuleVerdict,
+    ScopeCoverage, SiteExecution, SiteKey, TargetRecord, finalize, match_bounds,
 };
 use osslscope::policy::{Predicate, Rule, evaluate_rule};
 
@@ -87,6 +87,7 @@ fn clean_input(sites: Vec<SiteExecution>) -> FinalizeInput {
         openssl: OpensslVersion::unknown(),
         disposition: None,
         policy: None,
+        legacy_partition: LegacyCallPartition::default(),
     }
 }
 

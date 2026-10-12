@@ -586,6 +586,41 @@ pub fn check_v2_semantics(doc: &serde_json::Value) -> Result<(), String> {
     let (effective_start, effective_end) = check_window(root)?;
     check_object_refs(root)?;
     check_records(root, effective_start, effective_end)?;
+    check_legacy_partition(root)?;
+    Ok(())
+}
+
+/// Legacy partition conservation (H8): the four buckets sum to
+/// every counted call over current plus fenced sites.
+fn check_legacy_partition(root: &serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
+    let part = root
+        .get("legacy_partition")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| "doc.legacy_partition: expected object".to_string())?;
+    let sum = get_u64(part, "legacy_exclusive_calls", "doc.legacy_partition")?
+        .saturating_add(get_u64(
+            part,
+            "non_legacy_exclusive_calls",
+            "doc.legacy_partition",
+        )?)
+        .saturating_add(get_u64(
+            part,
+            "shared_ambiguous_calls",
+            "doc.legacy_partition",
+        )?)
+        .saturating_add(get_u64(
+            part,
+            "unfenced_tail_calls",
+            "doc.legacy_partition",
+        )?);
+    let total: u64 = site_calls_map(root)?
+        .values()
+        .fold(0, |a, c| a.saturating_add(*c));
+    if sum != total {
+        return Err(format!(
+            "doc.legacy_partition: buckets sum to {sum} but sites count {total}"
+        ));
+    }
     Ok(())
 }
 

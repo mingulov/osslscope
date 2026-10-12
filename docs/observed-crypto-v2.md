@@ -44,13 +44,15 @@ auditor v2 suite (`tests/auditor_report.rs`):
   ordered site timestamps, unique site keys, status/reasons
   agreement, policy verdict combination with
   definite-within-possible bounds and per-site evidence totals,
-  fenced-bucket generation agreement, and the forbidden
-  argv/cmdline/address key sweep.
+  fenced-bucket generation agreement, legacy-partition
+  conservation (buckets sum to the sites plus fenced call
+  total), and the forbidden argv/cmdline/address key sweep.
 
 ## Top-level sections
 
 Required: `schema_version`, `target`, `openssl`, `window`,
-`completeness`, `sites`, `fenced`, `objects`, `coverage`.
+`completeness`, `sites`, `fenced`, `objects`, `coverage`,
+`legacy_partition`.
 Optional: `disposition` (omitted when never recorded), `policy`
 (`check` documents only; `report` omits it).
 
@@ -152,6 +154,16 @@ preserve candidates. Every site backing triple
 provider resolves into `objects` (verified fingerprint plus
 display locator); dangling or contradicting references fail
 validation.
+
+`legacy_partition` splits every counted call (current plus
+fenced sites) by candidate class and backing identity:
+`legacy_exclusive_calls` (all candidates legacy-class, backed by
+the legacy provider file), `non_legacy_exclusive_calls` (no
+legacy-class candidate), `shared_ambiguous_calls` (mixed classes,
+or all-legacy backed by a foreign file), `unfenced_tail_calls`
+(sites with no candidates). The four buckets conserve exactly:
+their sum equals the sites plus fenced call total, enforced by
+`check_v2_semantics`.
 
 ## Completeness, coverage, counters
 

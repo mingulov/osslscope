@@ -50,8 +50,8 @@ use crate::discovery::{coverage, elf, legacy, maps, onboard};
 use crate::evidence::{
     self, CandidateCoverage, CandidateIdentity, CaptureDocument, CaptureWindow, Completeness,
     CounterKind, CounterSource, CounterUnits, DispositionRecord, ExpectedScope, FencedGeneration,
-    FinalizeInput, GapCounter, GapReason, ObjectId, ObjectRecord, OpensslVersion, ScopeCoverage,
-    SiteExecution, SiteKey, TargetRecord,
+    FinalizeInput, GapCounter, GapReason, LegacyCallPartition, ObjectId, ObjectRecord,
+    OpensslVersion, ScopeCoverage, SiteExecution, SiteKey, TargetRecord,
 };
 use crate::{args, kinds, pin, plan, target};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -250,6 +250,7 @@ pub fn empty_document() -> CaptureDocument {
         openssl: OpensslVersion::unknown(),
         disposition: None,
         policy: None,
+        legacy_partition: LegacyCallPartition::default(),
     })
 }
 
@@ -355,6 +356,17 @@ fn partition_calls(
         }
     }
     out
+}
+
+/// Map the discovery-side partition onto the evidence document
+/// shape (same four buckets, same conservation).
+fn evidence_partition(p: legacy::CallPartition) -> LegacyCallPartition {
+    LegacyCallPartition {
+        legacy_exclusive: p.legacy_exclusive,
+        non_legacy_exclusive: p.non_legacy_exclusive,
+        shared_ambiguous: p.shared_ambiguous,
+        unfenced_tails: p.unfenced_tails,
+    }
 }
 
 // ---------------------------------------------------------------- signals
@@ -2667,6 +2679,7 @@ where
             openssl: OpensslVersion::unknown(),
             disposition: self.child_exit.map(DispositionRecord::exited),
             policy: None,
+            legacy_partition: LegacyCallPartition::default(),
         });
         self.emit_gap_reasons(document.reasons());
         if !self.trigger_observed {
@@ -2750,6 +2763,7 @@ where
             openssl: OpensslVersion::unknown(),
             disposition: None,
             policy: None,
+            legacy_partition: LegacyCallPartition::default(),
         });
         self.reasons.clear();
         self.reason("pid-recycled");
@@ -3757,6 +3771,14 @@ where
         let mut counters = drain.counters.clone();
         counters.extend(self.activity.iter().cloned());
         counters.extend(self.extra_loss.iter().cloned());
+        // H8: legacy call partition over the claimed sites (taint
+        // revisions applied above; finalize only sorts/dedups
+        // candidates, never calls, so pre-finalize values equal the
+        // document's). One computation feeds both the v2 document
+        // field and the v1 legacy section below.
+        let legacy_files =
+            legacy_files_for(self.cfg.resolved_provider.as_ref(), &self.adapter.objects);
+        let call_partition = partition_calls(&drain.current, &drain.fenced, &legacy_files);
         let document = evidence::finalize(FinalizeInput {
             window: CaptureWindow {
                 requested_start_ns: self.requested_start_ns,
@@ -3780,6 +3802,7 @@ where
             openssl: OpensslVersion::unknown(),
             disposition: doc_disposition(self.info.owned, disposition.as_ref()),
             policy: None,
+            legacy_partition: evidence_partition(call_partition),
         });
 
         // Legacy `legacy` block from IN-WINDOW tripwire evidence only
@@ -3793,10 +3816,6 @@ where
             .iter()
             .map(String::as_str)
             .collect();
-        // H8: legacy call partition over the finalized sites (what
-        // the doc claims, taint revisions included).
-        let legacy_files = legacy_files_for(self.cfg.resolved_provider.as_ref(), &document.objects);
-        let call_partition = partition_calls(&document.sites, &document.fenced, &legacy_files);
         let legacy_doc = legacy::section(&legacy::SectionInputs {
             set,
             trip: &self.in_window_trip,
@@ -4112,6 +4131,7 @@ fn recycled_capture(cfg: &Config, info: &TargetInfo) -> Capture {
         openssl: OpensslVersion::unknown(),
         disposition: None,
         policy: None,
+        legacy_partition: LegacyCallPartition::default(),
     });
     Capture {
         target_pid: info.pid,
@@ -6311,6 +6331,14 @@ mod tests {
                 display_locator: "seed".to_string(),
             });
             let cap = runner.close_and_finalize().expect("clean close");
+            // H8b (RED): the partition also lands on the v2
+            // document (the only live-rendered surface).
+            let part = &cap.document.legacy_partition;
+            assert_eq!(part.legacy_exclusive, 7);
+            assert_eq!(part.non_legacy_exclusive, 0);
+            assert_eq!(part.shared_ambiguous, 0);
+            assert_eq!(part.unfenced_tails, 0);
+            assert_eq!(part.total(), cap.document.total_calls());
             let lp = &cap.legacy["legacy_provider"];
             assert_eq!(lp["executed_calls"], 7);
             assert_eq!(lp["shared_ambiguous_calls"], 0);

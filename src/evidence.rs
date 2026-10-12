@@ -626,6 +626,37 @@ pub struct FinalizeInput {
     pub openssl: OpensslVersion,
     pub disposition: Option<DispositionRecord>,
     pub policy: Option<PolicyRecord>,
+    pub legacy_partition: LegacyCallPartition,
+}
+
+/// Legacy call partition (H8): per-site callback executions split
+/// by candidate class and backing identity. Conserves exactly:
+/// [`total`](LegacyCallPartition::total) equals the window's
+/// counted calls over current plus fenced sites. Computed once by
+/// the producer over the same sites the document claims.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LegacyCallPartition {
+    /// Calls on sites whose every candidate is legacy-class and
+    /// whose backing (device, inode) is the legacy provider file.
+    pub legacy_exclusive: u64,
+    /// Calls on sites with no legacy-class candidate.
+    pub non_legacy_exclusive: u64,
+    /// Calls on sites mixing legacy with non-legacy candidates, or
+    /// all-legacy candidates backed by a foreign file.
+    pub shared_ambiguous: u64,
+    /// Calls on sites carrying no candidates (no partition key).
+    pub unfenced_tails: u64,
+}
+
+impl LegacyCallPartition {
+    /// Conserved total: must equal
+    /// [`total_calls`](CaptureDocument::total_calls).
+    pub fn total(&self) -> u64 {
+        self.legacy_exclusive
+            .saturating_add(self.non_legacy_exclusive)
+            .saturating_add(self.shared_ambiguous)
+            .saturating_add(self.unfenced_tails)
+    }
 }
 
 /// Finalized capture document. All report/check/CBOM formats derive
@@ -644,6 +675,7 @@ pub struct CaptureDocument {
     pub openssl: OpensslVersion,
     pub disposition: Option<DispositionRecord>,
     pub policy: Option<PolicyRecord>,
+    pub legacy_partition: LegacyCallPartition,
 }
 
 impl CaptureDocument {
@@ -760,5 +792,6 @@ pub fn finalize(mut input: FinalizeInput) -> CaptureDocument {
         openssl: input.openssl,
         disposition: input.disposition,
         policy: input.policy,
+        legacy_partition: input.legacy_partition,
     }
 }
