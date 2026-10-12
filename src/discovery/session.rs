@@ -3069,6 +3069,29 @@ fn populate_classifier_maps(maps: &HashMap<String, OwnedFd>) -> anyhow::Result<(
     Ok(())
 }
 
+/// Populate the chain jump table right after load, before any attach
+/// can fire (P5a-C1): `JUMPS[0]` = the `c_slot` tail callee. Values
+/// are raw prog fds (u32, kernel takes its own ref). Fail-closed: an
+/// unpopulated slot would silently degrade every query to the
+/// sampler, so population failure fails the attach.
+fn populate_jump_table(loaded: &Loaded) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    use std::os::fd::AsRawFd as _;
+    let jumps = loaded
+        .maps
+        .get("JUMPS")
+        .ok_or_else(|| anyhow::anyhow!("missing chain map JUMPS"))?;
+    let callee = prog_fd(loaded, "c_slot")?;
+    ossl_bpf_sys::map_update_elem(
+        jumps.as_raw_fd(),
+        &0u32.to_le_bytes(),
+        &(callee as u32).to_le_bytes(),
+        0,
+    )
+    .context("populate JUMPS[0]=c_slot")?;
+    Ok(())
+}
+
 /// Fault in the provider file's mapped pages (best-effort, one byte
 /// per page via process_vm_readv). BPF probe reads are nofault: a
 /// query whose alg tables were never touched aborts the walk even
@@ -3823,6 +3846,8 @@ impl DiscoverySession {
         // Classifier tables before any attach can fire: the kernel
         // classifies every string-bearing event against these.
         populate_classifier_maps(&loaded.maps)?;
+        // Chain jump table likewise: every query tail-calls into it.
+        populate_jump_table(&loaded)?;
         // Owns every multi link (drop = detach, all paths).
         let mut links = LinkSet::default();
         let mut builtin_query_attached = false;

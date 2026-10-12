@@ -57,7 +57,9 @@ pub struct ProgSpec {
 /// F-C/A8: the five counter/flag maps (`LOSS`, `TRUNC`, `CALLS`,
 /// `TRIP`, `LGCALLS`) are per-CPU hash (type 5) — exact
 /// single-writer slots replace racy shared read-modify-write.
-pub const HARVEST_MAPS: [MapSpec; 13] = [
+/// P5a-C1 adds the chain jump table (`JUMPS`, prog-array) + the
+/// per-thread chain handoff (`CURSOR`, u64 → [u64; 9]).
+pub const HARVEST_MAPS: [MapSpec; 15] = [
     MapSpec {
         name: "EVENTS",
         map_type: 27,
@@ -162,6 +164,22 @@ pub const HARVEST_MAPS: [MapSpec; 13] = [
         max_entries: 64,
         flags: 0,
     },
+    MapSpec {
+        name: "JUMPS",
+        map_type: 3,
+        key_size: 4,
+        value_size: 4,
+        max_entries: 8,
+        flags: 0,
+    },
+    MapSpec {
+        name: "CURSOR",
+        map_type: 1,
+        key_size: 8,
+        value_size: 72,
+        max_entries: 1024,
+        flags: 0,
+    },
 ];
 
 /// Frozen capture shape (keyed-design §2): dims asserted vs the
@@ -219,8 +237,11 @@ pub const COUNT_PROGS: [ProgSpec; 1] = [ProgSpec {
 }];
 
 /// Frozen harvest programs: the init/query entry+return pairs plus
-/// the three entry-only tripwire counters.
-pub const HARVEST_PROGS: [ProgSpec; 7] = [
+/// the three entry-only tripwire counters. P5a-C1 adds the chain
+/// tail callee (`c_slot` — loaded, never directly attached: the only
+/// attach call sites name entry/return pairs explicitly, and `c_slot`
+/// is reachable solely via `JUMPS[0]`).
+pub const HARVEST_PROGS: [ProgSpec; 8] = [
     ProgSpec {
         name: "init_entry",
         section: "uprobe",
@@ -248,6 +269,10 @@ pub const HARVEST_PROGS: [ProgSpec; 7] = [
     ProgSpec {
         name: "trip_str1",
         section: "uprobe",
+    },
+    ProgSpec {
+        name: "c_slot",
+        section: "uretprobe",
     },
 ];
 
