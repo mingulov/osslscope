@@ -344,6 +344,13 @@ fn h5_t3_every_device_site_names_one_domain() {
             "let expected = meta.as_ref().map(|meta| (meta.dev(), m.ino));",
             1,
         ),
+        // harvest.rs: H6 presence check (stat-vs-stat, never pathname).
+        (
+            "src/discovery/harvest.rs",
+            "stat",
+            ".any(|m| m.ino == *ino && session::stat_dev_of(&m.path).as_deref() == Some(dev.as_str()))",
+            1,
+        ),
         // maps.rs: provider binding in the descriptor domain (raw dev_t).
         (
             "src/discovery/maps.rs",
