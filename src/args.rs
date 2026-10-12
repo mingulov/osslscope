@@ -91,6 +91,37 @@ pub fn parse_force_offset(value: &str) -> Result<u64, String> {
     parsed.map_err(|_| format!("--force-offset needs a decimal or 0x-hex integer (got {value:?})"))
 }
 
+/// Parse the H9/R07 workload destination pair (shared by report
+/// and check so both verbs reject identically): at most one of
+/// `--workload-out` (file path) / `--workload-out-fd` (caller-held
+/// fd number); neither means /dev/null. A non-numeric or negative
+/// fd is a usage error; fd *validity* is checked pre-fork at spawn
+/// (a setup error — validity can change between parse and fork).
+pub fn parse_workload_dest(
+    file: Option<String>,
+    fd_raw: Option<String>,
+) -> Result<crate::target::WorkloadDest, String> {
+    use crate::target::WorkloadDest;
+    match (file, fd_raw) {
+        (Some(_), Some(_)) => {
+            Err("--workload-out and --workload-out-fd are mutually exclusive".to_string())
+        }
+        (Some(path), None) => Ok(WorkloadDest::File(path.into())),
+        (None, Some(raw)) => {
+            let fd: std::os::fd::RawFd = raw
+                .parse()
+                .map_err(|_| format!("--workload-out-fd needs an integer (got {raw:?})"))?;
+            if fd < 0 {
+                return Err(format!(
+                    "--workload-out-fd needs a non-negative fd (got {raw:?})"
+                ));
+            }
+            Ok(WorkloadDest::Fd(fd))
+        }
+        (None, None) => Ok(WorkloadDest::Null),
+    }
+}
+
 /// Redact a spawn argv: the target strings are never copied into
 /// evidence, logs, or debug output.
 pub fn redact_spawn_argv(_argv: &[String]) -> String {

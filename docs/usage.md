@@ -52,11 +52,18 @@ osslscope report --format json --out report.json --cbom bom.json run -- ./my-app
   `--pid` (attach to live) is inherently racy — anything the
   target did before attach is invisible (cold-start gap).
 - Output policy: the spawned workload's stdout and stderr both
-  go to the observer's stderr. Observer stdout stays a pure
-  artifact channel — workload bytes can never corrupt
-  `--format json` or leak workload secrets into captured JSON.
-  Nothing is swallowed: workload output remains visible on
-  stderr (redirect the observer's stdout alone for clean JSON).
+  go to /dev/null by default — observer stderr carries ONLY
+  observer diagnostics, and observer stdout stays a pure
+  artifact channel (workload bytes can neither corrupt
+  `--format json` nor leak workload secrets into captured
+  JSON/diagnostics). Capture workload output explicitly per
+  run: `--workload-out FILE` (create+truncate) or
+  `--workload-out-fd N` (a caller-held fd, e.g. a harness
+  pipe; mutually exclusive). A child-side log-open failure
+  exits 126 and fails setup naming the path (never silent
+  null); a nonzero child exit without a destination prints
+  one re-run hint line (exit + `--workload-out FILE`) and
+  no workload bytes.
   `run --` predicts the target libcrypto pre-exec from the
   exe's `DT_NEEDED` closure plus loader search
   (`LD_LIBRARY_PATH`, rpath/runpath, system defaults);

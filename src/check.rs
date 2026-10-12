@@ -117,6 +117,8 @@ fn parse(argv: &[String]) -> Result<Args, String> {
     let mut image_digest = String::new();
     let mut pid: Option<u32> = None;
     let mut run_at: Option<usize> = None;
+    let mut workload_out: Option<String> = None;
+    let mut workload_out_fd: Option<String> = None;
     let mut rules = RuleSet::default();
     let mut i = 0;
     while i < argv.len() {
@@ -150,6 +152,8 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             "--timeout" => timeout_raw = Some(val(a)?),
             "--grace" => grace_raw = Some(val(a)?),
             "--image-digest" => image_digest = val(a)?,
+            "--workload-out" => workload_out = Some(val(a)?),
+            "--workload-out-fd" => workload_out_fd = Some(val(a)?),
             "--pid" => pid = Some(val(a)?.parse().map_err(|_| "--pid needs an integer")?),
             "--require-provider" => rules.require_provider.push(val(a)?),
             "--deny-provider" => rules.deny_provider.push(val(a)?),
@@ -172,8 +176,16 @@ fn parse(argv: &[String]) -> Result<Args, String> {
     if format != "human" && format != "json" {
         return Err("--format must be human|json".to_string());
     }
+    // H9/R07: destinations are meaningless without `run --`
+    // (never silently ignored); mutual exclusion + fd shape live in
+    // the shared args parser (report and check reject identically).
     let target = match (pid, run_at) {
-        (Some(p), None) => capture::Target::Pid(p),
+        (Some(p), None) => {
+            if workload_out.is_some() || workload_out_fd.is_some() {
+                return Err("--workload-out/--workload-out-fd need run -- <cmd>".to_string());
+            }
+            capture::Target::Pid(p)
+        }
         (None, Some(j)) => {
             if argv.get(j + 1).map(String::as_str) != Some("--") {
                 return Err("run needs -- before the command".to_string());
@@ -182,7 +194,10 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             if cmd.is_empty() {
                 return Err("run -- needs a command".to_string());
             }
-            capture::Target::Spawn { argv: cmd }
+            capture::Target::Spawn {
+                argv: cmd,
+                workload: crate::args::parse_workload_dest(workload_out, workload_out_fd)?,
+            }
         }
         _ => return Err("need exactly one of --pid P | run -- <cmd>".to_string()),
     };
@@ -432,7 +447,7 @@ pub fn policy_record(v: &PolicyVerdict) -> PolicyRecord {
 }
 
 const USAGE: [&str; 2] = [
-    "usage: check [--duration S] [--provider P] [--object O] [--count-object C] [--table F] [--force-offset N] [--provider-table F] [rules] [--format human|json] [--out F] [--cbom FILE] [--builtin] [--settle S] [--timeout S] [--grace S] [--image-digest D] {--pid P | run -- <cmd>}",
+    "usage: check [--duration S] [--provider P] [--object O] [--count-object C] [--table F] [--force-offset N] [--provider-table F] [rules] [--format human|json] [--out F] [--cbom FILE] [--builtin] [--settle S] [--timeout S] [--grace S] [--image-digest D] [--workload-out F] [--workload-out-fd N] {--pid P | run -- <cmd>}",
     "rules: [--require-provider P] [--deny-provider P] [--deny-engine] [--deny-algorithm X] [--deny-weak] [--require-executed X] (repeatable; at least one required)",
 ];
 
@@ -471,6 +486,15 @@ pub fn run(argv: &[String]) -> ExitCode {
         },
         cbom: args.cbom.map(|path| OutputDest::File(path.into())),
     };
+    // H9: captured before the target moves into capture (the T4
+    // hint needs to know the workload was discarded post-run).
+    let workload_discarded = matches!(
+        &args.target,
+        capture::Target::Spawn {
+            workload: crate::target::WorkloadDest::Null,
+            ..
+        }
+    );
     let c = match capture::run(&args.cfg, args.target) {
         Ok(c) => c,
         Err(e) => {
@@ -505,6 +529,11 @@ pub fn run(argv: &[String]) -> ExitCode {
     document.policy = Some(policy_record(&verdict));
     let delivery = write_artifacts(&document, &req);
     crate::report::emit_diagnostics(&delivery);
+    // H9/R07 T4: nonzero child exit with discarded output → one
+    // diagnostic line (exit + re-run hint, never workload bytes).
+    if let Some(hint) = crate::report::workload_hint(child_exit, workload_discarded) {
+        crate::report::err_line(&hint);
+    }
     ExitCode::from(exit_for(
         verdict.overall(),
         child_exit,
