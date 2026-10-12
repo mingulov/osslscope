@@ -8,8 +8,8 @@
 //! missing member stop the others, (e) what is the per-prog marginal
 //! runtime floor. P7 item 1 extends the file: (f) the
 //! `bpf_ringbuf_query` floor (§5.4 — the B entry's sole new kernel
-//! requirement) is present, (g) detach-512 wall timing incl. SRCU
-//! grace (tier-3 onset term (a)) with freeze honesty.
+//! requirement) is present, (g) idle detach-512 wall timing
+//! (tier-3 onset term (a)) with full-slot freeze honesty.
 //!
 //! Run: setcaps on the test binary (like the D legs) +
 //! `OSSL_B_LIVE=1 cargo +1.88.0 test --test b_chunk_probe -- --test-threads=1 --ignored`.
@@ -764,7 +764,8 @@ fn prepare_accepts_uretprobe_section() {
 
 /// P7 item 1a (§5.4 floor): `bpf_ringbuf_query` must load on a B
 /// lane — the entry's occupancy check is the sole new kernel
-/// requirement. Live-only: map + load need CAP_BPF.
+/// requirement. Live-only: map creation needs CAP_BPF, kprobe
+/// program load needs CAP_PERFMON-or-CAP_SYS_ADMIN.
 #[test]
 #[ignore = "live lane only (see module docs)"]
 fn ringbuf_query_floor_present() {
@@ -777,10 +778,14 @@ fn ringbuf_query_floor_present() {
 }
 
 /// Detach cost at the 512-contract (P7 item 1: tier-3 onset term
-/// (a), wall-tails incl. SRCU grace). Honesty is symmetric with
-/// the attach leg: the chunk must fire BEFORE detach (slots bump)
-/// and freeze AFTER detach+settle (slots stop) — a detach that
-/// timed dead links would prove nothing.
+/// (a)) — IDLE entry-probe measurement, not onset qualification:
+/// entry probes, no in-flight load, and the 30s bound is a
+/// post-hoc regression ceiling, not a hang timeout. Under-load
+/// onset qualification (in-flight drain) stays explicitly
+/// outstanding. Honesty is symmetric with the attach leg: the
+/// chunk must fire BEFORE detach (all slots bump) and freeze
+/// AFTER detach+settle (all slots stop) — a detach that timed
+/// dead links would prove nothing.
 #[test]
 #[ignore = "live lane only (see module docs)"]
 fn chunk_detach_time_freezes() {
@@ -798,7 +803,7 @@ fn chunk_detach_time_freezes() {
     let links = attach_chunk(&loaded, &path, off, &order, false);
     assert_eq!(links.len(), 512);
     fire(2);
-    for k in [0u32, 511] {
+    for k in 0..512u32 {
         assert_eq!(read_slot(map_fd, k), 2, "chunk must fire before detach");
     }
     let t = Instant::now();
@@ -813,11 +818,13 @@ fn chunk_detach_time_freezes() {
         wall < Duration::from_secs(30),
         "512 detaches must take < 30s, took {wall:?}"
     );
-    // Link close detaches asynchronously (SRCU grace): settle, then
-    // prove the chunk is dead (slots frozen, not merely slow).
+    // Final link close is synchronous (unregister waits RCU/SRCU
+    // grace inside the timed drop — slow grace extends the wall, it
+    // does not outlast it). The settle below is scheduling margin
+    // only; then the chunk must be dead (slots frozen, not slow).
     std::thread::sleep(Duration::from_millis(500));
     fire(3);
-    for k in [0u32, 511] {
+    for k in 0..512u32 {
         assert_eq!(
             read_slot(map_fd, k),
             2,

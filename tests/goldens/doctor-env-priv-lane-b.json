@@ -11,6 +11,11 @@
       "status": "info"
     },
     {
+      "id": "ringbuf-query",
+      "message": "bpf_ringbuf_query present (B-traversal floor ok; entry admission can query occupancy)",
+      "status": "info"
+    },
+    {
       "id": "caps",
       "message": "CAP_SYS_ADMIN effective",
       "status": "pass"
