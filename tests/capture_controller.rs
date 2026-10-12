@@ -3482,8 +3482,8 @@ fn fake_elf_with_build_id(desc: &[u8]) -> Vec<u8> {
 
 #[test]
 fn advertising_fallback_binds_mapping_not_path() {
-    // No build-id bytes: the opaque fallback binds the resolving
-    // mapping's (dev, ino). A same-path replacement (new inode)
+    // No build-id bytes: the opaque fallback binds the advertised
+    // (stat-domain) triple. A same-path replacement (new inode)
     // changes identity instead of conflating two objects.
     let stage = Stage::fresh("adv-map");
     let bytes = self_bytes();
@@ -3536,14 +3536,8 @@ fn advertising_fallback_binds_mapping_not_path() {
     };
     let first = run(&live1, staged.ino);
     let second = run(&live2, staged.ino + 1);
-    assert_eq!(
-        first,
-        format!("unverified-advertising:{dev}:{}", staged.ino)
-    );
-    assert_eq!(
-        second,
-        format!("unverified-advertising:{dev}:{}", staged.ino + 1)
-    );
+    assert_eq!(first, format!("unverified:{dev}:{}", staged.ino));
+    assert_eq!(second, format!("unverified:{dev}:{}", staged.ino + 1));
     assert_ne!(first, second);
 }
 
@@ -3839,7 +3833,7 @@ fn advertising_joins_exact_vma_not_first_path() {
     // stays opaque (its bytes are unavailable), never build:v2.
     assert!(
         prov.iter()
-            .any(|p| *p == format!("unverified-advertising:{dev}:{}", v1.ino)),
+            .any(|p| *p == format!("unverified:{dev}:{}", v1.ino)),
         "old candidate conflated: {prov:?}"
     );
     // New array, bound bytes: the true v2 fingerprint.

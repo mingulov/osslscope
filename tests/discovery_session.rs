@@ -166,6 +166,14 @@ fn provider_file() -> (PathBuf, String, u64) {
     panic!("self mapping not found in /proc/self/maps");
 }
 
+/// fstat dev_t for a real path (H5: backings carry the STAT
+/// device — expectations render it via the library helper so the
+/// encoding matches by construction).
+fn fs_dev(path: &std::path::Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).unwrap().dev()
+}
+
 /// Live-shape maps: provider + libcrypto + legacy file mappings
 /// (adjacent, non-overlapping ranges).
 fn live_maps() -> Vec<Mapping> {
@@ -438,7 +446,9 @@ fn late_query_existing_mapping_emits_delta() {
     assert_eq!(c.status, "ok");
     // Advertising identity is the array owner's locator; backing is
     // the implementation's verified triple — never conflated.
-    let (exe, dev, ino) = provider_file();
+    let (exe, _maps_dev, ino) = provider_file();
+    // H5: the backing carries the STAT device (never maps text).
+    let dev = osslscope::plan::render_stat_dev(fs_dev(&exe));
     let exe = exe.to_string_lossy().into_owned();
     assert_eq!(c.advertising, exe);
     let b = c.backing.as_ref().expect("backed candidate");
@@ -1116,7 +1126,9 @@ fn shared_impl_stays_distinct_per_array() {
     }
     let d = core.poll(&mut env, ample_budget()).unwrap();
     assert_eq!(d.candidates.len(), 2);
-    let (exe, dev, ino) = provider_file();
+    let (exe, _maps_dev, ino) = provider_file();
+    // H5: backings carry the STAT device (never maps text).
+    let dev = osslscope::plan::render_stat_dev(fs_dev(&exe));
     assert_eq!(
         d.candidates[0].advertising,
         exe.to_string_lossy().into_owned()

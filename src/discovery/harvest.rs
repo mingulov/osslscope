@@ -155,9 +155,10 @@ pub(crate) fn decode_trip_hit(
 }
 
 /// Resolved stage-2 attach target: file offset, object path,
-/// maps-text backing identity, and the resolve-time raw (dev, ino)
-/// the install must bind against (`None` when unstatable — install
-/// fails closed).
+/// stat-domain backing identity (H5; maps-text fallback when
+/// unstatable), and the resolve-time raw (dev, ino) the install
+/// must bind against (`None` when unstatable — install fails
+/// closed).
 #[derive(Debug)]
 pub(crate) struct ResolvedTarget {
     pub off: u64,
@@ -193,13 +194,19 @@ pub(crate) fn resolve_query_target(
         // with the resolve-time raw dev; unstatable paths bind
         // nothing and fail closed at install.
         use std::os::unix::fs::MetadataExt as _;
-        let expected = std::fs::metadata(&m.path)
-            .ok()
-            .map(|meta| (meta.dev(), m.ino));
+        let meta = std::fs::metadata(&m.path).ok();
+        let expected = meta.as_ref().map(|meta| (meta.dev(), m.ino));
+        // H5: target dev is STAT-domain (rendered resolve-time
+        // fstat), falling back to maps text when unstatable —
+        // retry idents and reuse tuples compare in one domain.
+        let dev = meta
+            .as_ref()
+            .map(|meta| crate::plan::render_stat_dev(meta.dev()))
+            .unwrap_or_else(|| m.dev.clone());
         Ok(ResolvedTarget {
             off: addr - m.start + m.offset,
             path: PathBuf::from(&m.path),
-            dev: m.dev.clone(),
+            dev,
             ino: m.ino,
             expected,
         })
@@ -210,10 +217,13 @@ pub(crate) fn resolve_query_target(
                 provider.display()
             )
         })?;
+        // H5: `raw` is the provider's resolve-time stat identity
+        // (provider_mapping binds stat-vs-stat) — render it for
+        // the target dev (stat-domain, like the legacy branch).
         Ok(ResolvedTarget {
             off: addr - m.start + m.offset,
             path: provider.to_path_buf(),
-            dev: m.dev.clone(),
+            dev: crate::plan::render_stat_dev(raw.0),
             ino: m.ino,
             expected: Some(raw),
         })

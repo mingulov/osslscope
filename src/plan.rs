@@ -135,11 +135,14 @@ impl StableCookies {
     }
 }
 
-/// Parse a `/proc/pid/maps` device field (`major:minor`, both hex —
-/// the kernel prints `%02x:%02x` of the device numbers, so e.g.
-/// device-mapper `253:0` reads `fd:00`). `None` on any malformed
-/// input; callers treat that as an unplannable row, never a guess.
-pub fn parse_maps_dev(dev: &str) -> Option<(u32, u32)> {
+/// Parse an `MM:mm` device string (both hex — the kernel prints
+/// `%02x:%02x`, so e.g. device-mapper `253:0` reads `fd:00`;
+/// stat-rendered strings share the shape exactly). Domain-free
+/// decoder: stat and maps strings parse identically — the
+/// CALLER's domain governs what the word may join against (H5).
+/// `None` on any malformed input; callers treat that as an
+/// unplannable row, never a guess.
+pub fn parse_dev_str(dev: &str) -> Option<(u32, u32)> {
     let (major, minor) = dev.split_once(':')?;
     if major.is_empty() || minor.is_empty() {
         return None;
@@ -161,16 +164,30 @@ pub fn decode_device(id: u64) -> (u32, u32) {
     ((id >> 32) as u32, id as u32)
 }
 
-/// Render an encoded device word in maps `major:minor` hex form.
+/// Render an encoded device word as `MM:mm` (domain-agnostic
+/// shape — the word's domain comes from its producer: stat
+/// fstat or maps text; callers document which).
 pub fn render_device(id: u64) -> String {
     let (major, minor) = decode_device(id);
     format!("{major:02x}:{minor:02x}")
 }
 
-/// Maps device field → encoded identity word. `None` when the field
-/// is malformed.
-pub fn device_id_of_maps_dev(dev: &str) -> Option<u64> {
-    parse_maps_dev(dev).map(|(major, minor)| encode_device(major, minor))
+/// Render a RAW stat dev_t (`Metadata::dev`) as `MM:mm` (H5):
+/// the stat-domain device string for rows, bindings, and retry
+/// idents — same format as maps dev-strings, deliberately
+/// indistinguishable in shape (callers document the domain).
+pub fn render_stat_dev(dev_t: u64) -> String {
+    render_device(encode_device(
+        libc::major(dev_t as libc::dev_t),
+        libc::minor(dev_t as libc::dev_t),
+    ))
+}
+
+/// `MM:mm` device string → encoded identity word (H5: parses
+/// EITHER domain — stat-rendered and maps text share the shape).
+/// `None` when the field is malformed.
+pub fn device_id_of_dev_str(dev: &str) -> Option<u64> {
+    parse_dev_str(dev).map(|(major, minor)| encode_device(major, minor))
 }
 
 // H4 removed `sample_backing` (before/after path sampling for
@@ -280,13 +297,20 @@ pub struct FileBytes {
 /// inode suffices because a mapped inode's number cannot be reused
 /// while the mapping pins it). Cross-mount-namespace observation is
 /// out of model (operator co-locates; see attach-failures.md pidns).
+/// Identity-bound bytes lookup (F-A/A3, H5): serve `files[path]`
+/// only when the entry's FULL identity matches the claim —
+/// encoded stat-dev AND ino, both stat-domain. Ino-only used to
+/// lend x-fs same-ino twins' bytes (B-4); the dev check closes
+/// it. Callers pass the row's stat-dev (BackingRef-sourced) or a
+/// fresh path fstat for path-exact lookups.
 pub fn bound_bytes<'a>(
     files: &'a HashMap<String, FileBytes>,
     path: &str,
+    dev: u64,
     ino: u64,
 ) -> Option<&'a [u8]> {
     let fb = files.get(path)?;
-    if fb.ino != ino {
+    if fb.dev != dev || fb.ino != ino {
         return None;
     }
     Some(&fb.bytes)
@@ -398,20 +422,38 @@ pub fn plan_rows(
         let dev = r.dev.clone();
         let ino = r.ino;
         let id = r.id.clone();
-        // Candidate link paths: X mappings of the same file.
+        // Row device (H5/B-4): the stat-domain `MM:mm` binding
+        // (BackingRef via H5-T1) — parsed to the encoded
+        // identity; an unparsable row binds nothing (loud miss,
+        // never device zero).
+        let Some(row_dev) = device_id_of_dev_str(&dev) else {
+            out.missed.push(Missed {
+                dev,
+                ino,
+                offset: r.offset,
+                reason: "unmapped",
+            });
+            continue;
+        };
+        // Candidate link paths: X mappings sharing the row's
+        // inode (H5: ino is the domain-agnostic prefilter; the
+        // device binds at the byte read, never via maps text —
+        // x-subvol/x-mount twins share maps-dev + ino).
         let mut cands: Vec<&str> = live
             .iter()
-            .filter(|m| m.x && m.ino != 0 && m.dev == dev && m.ino == ino)
+            .filter(|m| m.x && m.ino != 0 && m.ino == ino)
             .map(|m| m.path.as_str())
             .collect();
         cands.sort_unstable();
         cands.dedup();
-        // First candidate whose bytes bind to the ROW's inode
-        // (F-A/A3): a same-path replacement between the maps read
-        // and the files read lends nothing to the old row.
+        // First candidate whose bytes bind to the ROW's full
+        // (dev, ino) identity (H5/B-4): an x-fs same-ino twin
+        // lends nothing even when the path matches, and a
+        // same-path replacement between the maps read and the
+        // files read lends nothing to the old row.
         let bound = cands
             .iter()
-            .find_map(|p| bound_bytes(files, p, ino).map(|b| (*p, b)));
+            .find_map(|p| bound_bytes(files, p, row_dev, ino).map(|b| (*p, b)));
         let Some((path, bytes)) = bound else {
             out.missed.push(Missed {
                 dev,
@@ -599,7 +641,7 @@ mod tests {
     fn file_bytes(bytes: Vec<u8>, ino: u64) -> FileBytes {
         FileBytes {
             bytes,
-            dev: device_id_of_maps_dev("08:01").unwrap(),
+            dev: device_id_of_dev_str("08:01").unwrap(),
             ino,
         }
     }
@@ -769,21 +811,21 @@ mod tests {
     #[test]
     fn maps_dev_codec_roundtrips() {
         // Hex major:minor, including a device-mapper-shaped major.
-        assert_eq!(parse_maps_dev("08:01"), Some((8, 1)));
-        assert_eq!(parse_maps_dev("fd:00"), Some((253, 0)));
-        assert_eq!(parse_maps_dev("0:0"), Some((0, 0)));
-        assert_eq!(parse_maps_dev(""), None);
-        assert_eq!(parse_maps_dev("08"), None);
-        assert_eq!(parse_maps_dev("08:"), None);
-        assert_eq!(parse_maps_dev(":01"), None);
-        assert_eq!(parse_maps_dev("zz:01"), None);
-        assert_eq!(parse_maps_dev("08:01:02"), None);
+        assert_eq!(parse_dev_str("08:01"), Some((8, 1)));
+        assert_eq!(parse_dev_str("fd:00"), Some((253, 0)));
+        assert_eq!(parse_dev_str("0:0"), Some((0, 0)));
+        assert_eq!(parse_dev_str(""), None);
+        assert_eq!(parse_dev_str("08"), None);
+        assert_eq!(parse_dev_str("08:"), None);
+        assert_eq!(parse_dev_str(":01"), None);
+        assert_eq!(parse_dev_str("zz:01"), None);
+        assert_eq!(parse_dev_str("08:01:02"), None);
         for (major, minor) in [(8u32, 1u32), (253, 0), (0, 0), (259, 3)] {
             let id = encode_device(major, minor);
             assert_eq!(decode_device(id), (major, minor));
-            assert_eq!(device_id_of_maps_dev(&render_device(id)), Some(id));
+            assert_eq!(device_id_of_dev_str(&render_device(id)), Some(id));
         }
-        assert_eq!(device_id_of_maps_dev("bogus"), None);
+        assert_eq!(device_id_of_dev_str("bogus"), None);
     }
 
     // H4 removed `verify_backing_checks_open_file` with
@@ -853,9 +895,10 @@ mod tests {
 
     #[test]
     fn bound_bytes_requires_identity_match() {
-        // A3: bytes bind to the mapping's inode — a same-path
-        // replacement between the maps read and the files read
-        // must not lend the new file's bytes to the old mapping.
+        // A3/H5(B-4): bytes bind to the full (dev, ino) identity
+        // — a same-path replacement between the maps read and
+        // the files read must not lend the new file's bytes to
+        // the old mapping.
         let files: HashMap<String, FileBytes> = HashMap::from([
             (
                 "old.so".to_string(),
@@ -874,11 +917,46 @@ mod tests {
                 },
             ),
         ]);
-        assert_eq!(bound_bytes(&files, "old.so", 100), Some(b"v1".as_slice()));
+        assert_eq!(
+            bound_bytes(&files, "old.so", 1, 100),
+            Some(b"v1".as_slice())
+        );
         // Same path, replaced bytes: the old mapping binds nothing.
-        assert_eq!(bound_bytes(&files, "old.so", 200), None);
-        assert_eq!(bound_bytes(&files, "new.so", 100), None);
-        assert_eq!(bound_bytes(&files, "missing.so", 100), None);
+        assert_eq!(bound_bytes(&files, "old.so", 1, 200), None);
+        assert_eq!(bound_bytes(&files, "new.so", 1, 100), None);
+        assert_eq!(bound_bytes(&files, "missing.so", 1, 100), None);
+    }
+
+    #[test]
+    fn h5_t2_bound_bytes_refuses_xfs_same_ino() {
+        // H5 (B-4): bytes bind to the FULL (dev, ino) identity —
+        // an x-fs same-ino twin (same ino, different device) lends
+        // nothing, even when the path matches. Both sides are
+        // stat-domain (encoded dev_t); the row's stat-dev arrives
+        // via BackingRef (H5-T1). RED pre-H5 (ino-only).
+        let files: HashMap<String, FileBytes> = HashMap::from([(
+            "twin.so".to_string(),
+            FileBytes {
+                bytes: b"v1".to_vec(),
+                dev: 0x1111,
+                ino: 100,
+            },
+        )]);
+        assert_eq!(
+            bound_bytes(&files, "twin.so", 0x1111, 100),
+            Some(b"v1".as_slice()),
+            "exact identity binds"
+        );
+        assert_eq!(
+            bound_bytes(&files, "twin.so", 0x2222, 100),
+            None,
+            "x-fs twin (same ino, other dev) must not lend"
+        );
+        assert_eq!(
+            bound_bytes(&files, "twin.so", 0x1111, 200),
+            None,
+            "replaced ino must not lend"
+        );
     }
 
     #[test]
