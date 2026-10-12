@@ -2194,3 +2194,35 @@ fn m4_stable_rewalks_match_silently() {
     );
     assert_eq!(core.snapshot().candidates.len(), 1);
 }
+
+#[test]
+fn calls_absent_per_op_falls_back_to_query_ret_events() {
+    // P5d attribution fallback: with no CALLS map (staged default),
+    // accepted QUERY_RET ring events drive BOTH the total and the
+    // per-op split, and the two conserve.
+    let mut env = TestEnv::new();
+    let mut core = test_core(false);
+    let arr = 0x7f00_1000u64;
+    env.push(query_ret(OP_DIGEST, arr, 0));
+    env.push(query_ret(12, arr + 0x1000, 0));
+    env.push(query_ret(12, arr + 0x1000, 1));
+    let d = core.poll(&mut env, ample_budget()).unwrap();
+    assert_eq!(d.queries_delta, 3);
+    let snap = core.snapshot();
+    assert_eq!(snap.queries_observed, 3);
+    assert_eq!(snap.queries_by_op, vec![(OP_DIGEST, 1), (12, 2)]);
+}
+
+#[test]
+fn calls_present_per_op_comes_from_map_join() {
+    // P5d attribution primary: with a CALLS map, the per-op split
+    // rides the map join (not the ring events).
+    let mut env = TestEnv::new();
+    let mut core = test_core(false);
+    env.staged.calls = Some(10);
+    env.staged.calls_by_op = vec![(1, 6), (12, 4)];
+    core.poll(&mut env, ample_budget()).unwrap();
+    let snap = core.snapshot();
+    assert_eq!(snap.queries_observed, 10);
+    assert_eq!(snap.queries_by_op, vec![(1, 6), (12, 4)]);
+}
