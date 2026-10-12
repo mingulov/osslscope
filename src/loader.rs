@@ -232,11 +232,11 @@ pub const COUNT_PROGS: [ProgSpec; 1] = [ProgSpec {
 }];
 
 /// Frozen harvest programs: the init/query entry+return pairs plus
-/// the three entry-only tripwire counters. P5a-C1 adds the chain
-/// tail callee (`c_slot` — loaded, never directly attached: the only
-/// attach call sites name entry/return pairs explicitly, and `c_slot`
-/// is reachable solely via `JUMPS[0]`).
-pub const HARVEST_PROGS: [ProgSpec; 8] = [
+/// the three entry-only tripwire counters. P5a adds the eight chain
+/// hops (`c0..c7` — loaded, never directly attached: the only attach
+/// call sites name entry/return pairs explicitly, and hop `i` is
+/// reachable solely via `JUMPS[i]`).
+pub const HARVEST_PROGS: [ProgSpec; 15] = [
     ProgSpec {
         name: "init_entry",
         section: "uprobe",
@@ -266,7 +266,35 @@ pub const HARVEST_PROGS: [ProgSpec; 8] = [
         section: "uprobe",
     },
     ProgSpec {
-        name: "c_slot",
+        name: "c0",
+        section: "uretprobe",
+    },
+    ProgSpec {
+        name: "c1",
+        section: "uretprobe",
+    },
+    ProgSpec {
+        name: "c2",
+        section: "uretprobe",
+    },
+    ProgSpec {
+        name: "c3",
+        section: "uretprobe",
+    },
+    ProgSpec {
+        name: "c4",
+        section: "uretprobe",
+    },
+    ProgSpec {
+        name: "c5",
+        section: "uretprobe",
+    },
+    ProgSpec {
+        name: "c6",
+        section: "uretprobe",
+    },
+    ProgSpec {
+        name: "c7",
         section: "uretprobe",
     },
 ];

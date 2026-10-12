@@ -3069,11 +3069,27 @@ fn populate_classifier_maps(maps: &HashMap<String, OwnedFd>) -> anyhow::Result<(
     Ok(())
 }
 
+/// P5-probe hook: `OSSL_JUMPS_HOLE=<idx>` leaves one jump-table
+/// slot empty so C4 can measure hole tolerance live (the chain
+/// stops at the hole with an honest advance — rate-only, never a
+/// coverage skip). Absent/unparseable/out-of-range = no hole.
+/// P7 either adopts best-effort holes (keeping the tolerance,
+/// dropping this hook) or stays fail-closed (dropping the hook).
+fn jump_hole_idx() -> Option<u32> {
+    jump_hole_idx_from(std::env::var("OSSL_JUMPS_HOLE").ok().as_deref())
+}
+
+fn jump_hole_idx_from(raw: Option<&str>) -> Option<u32> {
+    let idx: u32 = raw?.parse().ok()?;
+    if idx < 8 { Some(idx) } else { None }
+}
+
 /// Populate the chain jump table right after load, before any attach
-/// can fire (P5a-C1): `JUMPS[0]` = the `c_slot` tail callee. Values
-/// are raw prog fds (u32, kernel takes its own ref). Fail-closed: an
-/// unpopulated slot would silently degrade every query to the
-/// sampler, so population failure fails the attach.
+/// can fire (P5a): `JUMPS[i]` = hop `ci`. Values are raw prog fds
+/// (u32, kernel takes its own ref). Fail-closed: any population
+/// failure (or a missing hop program) fails the attach — an
+/// accidental hole would silently cut the slots/query rate (only
+/// the explicit `OSSL_JUMPS_HOLE` probe hook leaves one).
 fn populate_jump_table(loaded: &Loaded) -> anyhow::Result<()> {
     use anyhow::Context as _;
     use std::os::fd::AsRawFd as _;
@@ -3081,14 +3097,21 @@ fn populate_jump_table(loaded: &Loaded) -> anyhow::Result<()> {
         .maps
         .get("JUMPS")
         .ok_or_else(|| anyhow::anyhow!("missing chain map JUMPS"))?;
-    let callee = prog_fd(loaded, "c_slot")?;
-    ossl_bpf_sys::map_update_elem(
-        jumps.as_raw_fd(),
-        &0u32.to_le_bytes(),
-        &(callee as u32).to_le_bytes(),
-        0,
-    )
-    .context("populate JUMPS[0]=c_slot")?;
+    let hole = jump_hole_idx();
+    for i in 0..8u32 {
+        if hole == Some(i) {
+            continue;
+        }
+        let name = format!("c{i}");
+        let callee = prog_fd(loaded, &name)?;
+        ossl_bpf_sys::map_update_elem(
+            jumps.as_raw_fd(),
+            &i.to_le_bytes(),
+            &(callee as u32).to_le_bytes(),
+            0,
+        )
+        .with_context(|| format!("populate JUMPS[{i}]={name}"))?;
+    }
     Ok(())
 }
 
@@ -4053,6 +4076,19 @@ impl DiscoverySession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jump_hole_parses_in_range_only() {
+        // P5 C4 probe hook: absent/unparseable/out-of-range = no hole.
+        assert_eq!(jump_hole_idx_from(None), None);
+        assert_eq!(jump_hole_idx_from(Some("")), None);
+        assert_eq!(jump_hole_idx_from(Some("x")), None);
+        assert_eq!(jump_hole_idx_from(Some("8")), None);
+        assert_eq!(jump_hole_idx_from(Some("4294967295")), None);
+        assert_eq!(jump_hole_idx_from(Some("0")), Some(0));
+        assert_eq!(jump_hole_idx_from(Some("1")), Some(1));
+        assert_eq!(jump_hole_idx_from(Some("7")), Some(7));
+    }
 
     #[test]
     fn percpu_folds_sum_and_or() {
