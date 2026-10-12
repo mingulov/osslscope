@@ -612,7 +612,8 @@ fn walk_dispatch(imp: u64, op: u32, arr: u64, j: u64) -> u64 {
 /// stable observations, not transient failures — freezing on them
 /// stalls the op forever), counts every ring/map failure in `LOSS`,
 /// and samples `no_store` arrays once (slot 0, no persistent
-/// counter, never termination proof — and never chained).
+/// counter, never termination proof — the tail fires but the callee
+/// declines uncacheable tables, so the sample stands alone).
 #[uretprobe]
 pub fn query_return(ctx: RetProbeContext) -> u32 {
     // Cookie 1 = legacy attachment: its calls stay out of CALLS.
@@ -798,23 +799,24 @@ pub fn query_return(ctx: RetProbeContext) -> u32 {
         idx: j,
         generation: gen_of(rv),
     });
-    // Entry diagonal: a fully-walked slot continues the chain (stash
-    // + tail-call — the callee walks j+1 and advances by 2).
-    // `no_store` first observations walk slot 0 and stop (sampled
-    // once, never advanced, never chained); the chain ends at the
-    // bound (slot 512 is the overrun decider, never a walked slot).
-    // BPF probe reads are nofault, so a cold page aborts the walk
-    // even though the table is valid — freezing the counter lets the
-    // next query re-walk this slot instead of losing the alg forever
-    // (the terminator path above still freezes too, and a dispatch
-    // read-abort freezes as well: ALG/ROW re-emits dedupe userside
-    // via the alg_names overwrite + rows seen-map).
+    // Entry diagonal: a fully-walked slot continues the chain
+    // (re-stash + tail-call — the callee walks j+1 and advances by
+    // 2). The tail is unconditional here: the lifetime/bound guards
+    // live in the callee, because entry-side branches break the
+    // classifier's loop-state merging (verifier 1M ceiling —
+    // bisected 2026-10-12: two guard branches per arm explode, the
+    // branch-lean tail below verifies). BPF probe reads are nofault,
+    // so a cold page aborts the walk even though the table is valid
+    // — freezing the counter lets the next query re-walk this slot
+    // instead of losing the alg forever (the terminator path above
+    // still freezes too, and a dispatch read-abort freezes as well:
+    // ALG/ROW re-emits dedupe userside via the alg_names overwrite
+    // + rows seen-map).
     match walk_dispatch(imp, op as u32, rv, j) {
         // Overflow: rows 0..127 are kept, the rest is unwalkable —
         // the chain continues past like a success, but the
         // truncation is flagged.
         1 => {
-            // V3: overflow flagged, then the shared chain site below.
             flag_trunc(op as u32, TRUNC_DISPATCH);
             chain_tail(&ctx, cookie, pend, key, count);
         }
@@ -840,7 +842,6 @@ pub fn query_return(ctx: RetProbeContext) -> u32 {
 /// scope — and the 16-byte re-insert perturbs the frame far less
 /// than a stash array.
 #[inline(always)]
-#[allow(dead_code)]
 fn chain_tail(ctx: &RetProbeContext, cookie: u64, pend: PendQuery, key: u128, count: u64) {
     if PENDING_QUERY.insert(pend_key(cookie), pend, 0).is_err() {
         // Unstashable (map full — effectively unreachable: one
@@ -874,8 +875,9 @@ fn chain_tail(ctx: &RetProbeContext, cookie: u64, pend: PendQuery, key: u128, co
 /// count+2 past it, the terminator stores count+1 (frozen AT the
 /// terminator — the next query's entry re-reads it once, exactly
 /// like a sampler-frozen terminator), and aborts freeze (no store:
-/// the next query re-walks BOTH slots). Runs cacheable-only (the
-/// entry never chains `no_store`).
+/// the next query re-walks BOTH slots). The entry tails here
+/// unconditionally, so the lifetime/bound guards live below (entry
+/// scope stays branch-lean for the verifier — see the note there).
 #[uretprobe]
 pub fn c_slot(ctx: RetProbeContext) -> u32 {
     let rv: u64 = ctx.ret();
@@ -887,7 +889,6 @@ pub fn c_slot(ctx: RetProbeContext) -> u32 {
         None => return 0,
     };
     let op = pend.op as u32;
-    // V3: the entry tails unconditionally — the guards live here.
     // Lifetime verdict, re-read (same rule as the entry: only an
     // explicit 0 is cacheable): uncacheable tables sampled slot 0
     // already, so the callee walks nothing and stores nothing.
