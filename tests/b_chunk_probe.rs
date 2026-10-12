@@ -243,8 +243,8 @@ fn chunk_elf(n: usize, shape: fn(u32) -> Vec<u8>, section: &str) -> Vec<u8> {
                 11,
                 16,
                 30,
-                37,
-                44,
+                38,
+                46,
             )
         };
     b.extend_from_slice(t);
@@ -699,6 +699,52 @@ fn prepare_accepts_skip_shape() {
             assert_eq!(p.insns.len(), 96, "sibling {i} stays INC");
         }
         assert_eq!(p.map_fixups.len(), 1);
+    }
+}
+
+/// Resolve every section name of a built chunk ELF (minimal
+/// parser: ehdr → shdrs → shstrtab). Pins the string-table offsets
+/// for BOTH spellings — the loader locates symtab/strtab by
+/// type/link, so a misnamed table still prepares; only this test
+/// proves the names resolve (it caught the uretprobe 37/44 slip).
+fn section_names(obj: &[u8], section: &str) -> Vec<String> {
+    let shoff = u64::from_le_bytes(obj[40..48].try_into().unwrap()) as usize;
+    let shnum = u16::from_le_bytes(obj[60..62].try_into().unwrap()) as usize;
+    let shstrndx = u16::from_le_bytes(obj[62..64].try_into().unwrap()) as usize;
+    assert_eq!((shnum, shstrndx), (7, 6));
+    let hdr = |i: usize| &obj[shoff + i * 64..shoff + (i + 1) * 64];
+    let shstr_hdr = hdr(shstrndx);
+    let str_off = u64::from_le_bytes(shstr_hdr[24..32].try_into().unwrap()) as usize;
+    let str_len = u64::from_le_bytes(shstr_hdr[32..40].try_into().unwrap()) as usize;
+    let shstr = &obj[str_off..str_off + str_len];
+    let rel = format!(".rel{section}");
+    let expect = [
+        "",
+        section,
+        "maps",
+        rel.as_str(),
+        ".symtab",
+        ".strtab",
+        ".shstrtab",
+    ];
+    (0..shnum)
+        .map(|i| {
+            let h = hdr(i);
+            let at = u32::from_le_bytes(h[0..4].try_into().unwrap()) as usize;
+            let end = shstr[at..].iter().position(|b| *b == 0).unwrap() + at;
+            let name = std::str::from_utf8(&shstr[at..end]).unwrap().to_string();
+            assert_eq!(name, expect[i], "section {i} name resolves");
+            name
+        })
+        .collect()
+}
+
+#[test]
+fn chunk_section_names_resolve_both_spellings() {
+    for section in ["uprobe", "uretprobe"] {
+        let obj = chunk_elf(2, inc_shape, section);
+        let names = section_names(&obj, section);
+        assert_eq!(names.len(), 7);
     }
 }
 
