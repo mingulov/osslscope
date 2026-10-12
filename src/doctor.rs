@@ -286,10 +286,11 @@ impl std::error::Error for RingbufQueryError {}
 /// `bpf_ringbuf_query` availability probe (P7 item 1a, §5.4
 /// floor): creates a scratch ringbuf map, loads a trivial prog
 /// calling the helper against it, and reports the outcome. Needs
-/// CAP_BPF (map creation) plus CAP_PERFMON-or-CAP_SYS_ADMIN
-/// (kprobe program load); fail-closed on any error. Intended for
-/// B-traversal startup gating (P7 item 3+); doctor surfaces it
-/// as an informational row until then.
+/// CAP_BPF-or-CAP_SYS_ADMIN (map creation) plus, for the kprobe
+/// program load, CAP_PERFMON as well (or CAP_SYS_ADMIN instead of
+/// both); fail-closed on any error. Intended for B-traversal
+/// startup gating (P7 item 3+); doctor surfaces it as an
+/// informational row until then.
 pub fn probe_ringbuf_query() -> Result<(), RingbufQueryError> {
     let map = ossl_bpf_sys::map_create(
         ossl_bpf_sys::BPF_MAP_TYPE_RINGBUF,
@@ -319,42 +320,57 @@ pub fn probe_ringbuf_query() -> Result<(), RingbufQueryError> {
 }
 
 /// Render a failed floor probe honestly (pure — unit-tested).
-/// Syscall-missing and permission failures defer to the shared
-/// caps ladder with the STAGE-correct perfmon requirement (map
-/// creation needs CAP_BPF; kprobe program load needs
-/// CAP_PERFMON-or-CAP_SYS_ADMIN). Everything else is
+/// Syscall-missing defers to the shared ladder (no caps
+/// involved). Permission failures evaluate COMPLETE stage
+/// permissions — map creation needs CAP_BPF-or-CAP_SYS_ADMIN,
+/// kprobe program load needs
+/// (CAP_BPF-and-CAP_PERFMON)-or-CAP_SYS_ADMIN — and report the
+/// actual missing capability; satisfied-yet-denied cases share
+/// the lockdown→LSM→seccomp attribution. Everything else is
 /// evidence-gated per stage: only a verifier "unknown func" log
 /// establishes helper absence — allocation and setup failures
 /// (EINVAL included) stay unverifiable, never "absent".
 fn ringbuf_query_detail(e: &RingbufQueryError, deny: &DenyCtx) -> String {
     let n = e.errno;
-    if n == libc::ENOSYS || is_perm_errno(n) {
+    if n == libc::ENOSYS {
         let out = ProbeOut {
             ok: false,
             errno: n,
             log: e.log.clone(),
         };
-        let need_perfmon = e.stage == "prog_load";
-        return match classify_probe("ringbuf-query", &out, deny, need_perfmon) {
-            ProbeVerdict::Pass => {
-                "bpf_ringbuf_query probe inconclusive (classifier disagreement; report with doctor JSON)"
-                    .into()
-            }
+        return match classify_probe("ringbuf-query", &out, deny, false) {
             ProbeVerdict::TooOld(m) => {
                 format!("bpf_ringbuf_query unavailable ({m}; B traversal unavailable, sampler unaffected)")
             }
-            ProbeVerdict::DegradedCaps => {
-                let want = if need_perfmon {
-                    "CAP_PERFMON"
-                } else {
-                    "CAP_BPF"
-                };
-                format!("bpf_ringbuf_query unverifiable without {want} (informational only)")
-            }
-            ProbeVerdict::Denied(m, _) => {
-                format!("bpf_ringbuf_query denied ({m}; informational only)")
+            _ => {
+                "bpf_ringbuf_query probe inconclusive (classifier disagreement; report with doctor JSON)"
+                    .into()
             }
         };
+    }
+    if is_perm_errno(n) {
+        // Verifier evidence beats errno shape (a reject can arrive
+        // EACCES-shaped with "unknown func" in the log).
+        if e.stage == "prog_load" && e.log.contains("unknown func") {
+            return "bpf_ringbuf_query absent (verifier: unknown helper; B traversal unavailable, sampler unaffected)"
+                .into();
+        }
+        let need_perfmon = e.stage == "prog_load";
+        let mut missing = Vec::new();
+        if !deny.cap_bpf && !deny.cap_sys_admin {
+            missing.push("CAP_BPF");
+        }
+        if need_perfmon && !deny.cap_perfmon && !deny.cap_sys_admin {
+            missing.push("CAP_PERFMON");
+        }
+        if !missing.is_empty() {
+            return format!(
+                "bpf_ringbuf_query unverifiable without {} (informational only)",
+                missing.join("+")
+            );
+        }
+        let (m, _) = denied_detail("ringbuf-query", n, deny);
+        return format!("bpf_ringbuf_query denied ({m}; informational only)");
     }
     if e.stage == "prog_load" && n == libc::EINVAL && e.log.contains("unknown func") {
         return "bpf_ringbuf_query absent (verifier: unknown helper; B traversal unavailable, sampler unaffected)"
@@ -574,6 +590,7 @@ fn run_token_probe() -> ProbeOut {
 struct DenyCtx {
     cap_bpf: bool,
     cap_perfmon: bool,
+    cap_sys_admin: bool,
     lockdown_conf: bool,
     enforcing_lsm: Vec<String>,
     seccomp_filter: bool,
@@ -627,32 +644,43 @@ fn classify_probe(
         if !have {
             return ProbeVerdict::DegradedCaps;
         }
-        if ctx.lockdown_conf {
-            return ProbeVerdict::Denied(
-                format!("{feature} blocked by lockdown=confidentiality"),
-                "boot with lockdown=integrity (or none) if policy allows — confidentiality mode blocks BPF even with caps".into(),
-            );
-        }
-        if !ctx.enforcing_lsm.is_empty() {
-            return ProbeVerdict::Denied(
-                format!("{feature} denied with caps held (likely LSM: {})", ctx.enforcing_lsm.join(",")),
-                "check audit denials (ausearch -m AVC,USER_AVC -ts recent); AppArmor: aa-status + profile in complain? SELinux: audit2why; attach needs bpf+perfmon allowed".into(),
-            );
-        }
-        if ctx.seccomp_filter {
-            return ProbeVerdict::Denied(
-                format!("{feature} denied with caps held (seccomp filter active)"),
-                "a seccomp filter is blocking bpf(); restricted-SCC/Autopilot-class environments are stretch (unproven) — run outside the filter".into(),
-            );
-        }
-        return ProbeVerdict::Denied(
-            format!("{feature} denied (errno {n}) with caps held, no lockdown/LSM/seccomp"),
-            "unexplained denial — see dmesg + audit log; file it with the doctor JSON".into(),
-        );
+        let (m, r) = denied_detail(feature, n, ctx);
+        return ProbeVerdict::Denied(m, r);
     }
     ProbeVerdict::Denied(
         format!("{feature} failed (errno {n})"),
         "unexpected errno — see dmesg; file it with the doctor JSON".into(),
+    )
+}
+
+/// Denial attribution once stage caps are satisfied (shared by
+/// classify_probe and the ringbuf-query floor detail): lockdown →
+/// LSM → seccomp → unexplained. Pure.
+fn denied_detail(feature: &'static str, n: i32, ctx: &DenyCtx) -> (String, String) {
+    if ctx.lockdown_conf {
+        return (
+            format!("{feature} blocked by lockdown=confidentiality"),
+            "boot with lockdown=integrity (or none) if policy allows — confidentiality mode blocks BPF even with caps".into(),
+        );
+    }
+    if !ctx.enforcing_lsm.is_empty() {
+        return (
+            format!(
+                "{feature} denied with caps held (likely LSM: {})",
+                ctx.enforcing_lsm.join(",")
+            ),
+            "check audit denials (ausearch -m AVC,USER_AVC -ts recent); AppArmor: aa-status + profile in complain? SELinux: audit2why; attach needs bpf+perfmon allowed".into(),
+        );
+    }
+    if ctx.seccomp_filter {
+        return (
+            format!("{feature} denied with caps held (seccomp filter active)"),
+            "a seccomp filter is blocking bpf(); restricted-SCC/Autopilot-class environments are stretch (unproven) — run outside the filter".into(),
+        );
+    }
+    (
+        format!("{feature} denied (errno {n}) with caps held, no lockdown/LSM/seccomp"),
+        "unexplained denial — see dmesg + audit log; file it with the doctor JSON".into(),
     )
 }
 
@@ -920,6 +948,7 @@ impl Env {
         DenyCtx {
             cap_bpf: has_cap(self.eff, CAP_BPF),
             cap_perfmon: has_cap(self.eff, CAP_PERFMON),
+            cap_sys_admin: has_cap(self.eff, CAP_SYS_ADMIN),
             lockdown_conf: self.lockdown == "confidentiality",
             enforcing_lsm: self.enforcing.clone(),
             seccomp_filter: self.seccomp == 2,
@@ -2236,6 +2265,7 @@ mod tests {
         DenyCtx {
             cap_bpf: has_cap(caps, CAP_BPF),
             cap_perfmon: has_cap(caps, CAP_PERFMON),
+            cap_sys_admin: has_cap(caps, CAP_SYS_ADMIN),
             lockdown_conf,
             enforcing_lsm: lsm.iter().map(|s| s.to_string()).collect(),
             seccomp_filter: seccomp,
@@ -2410,18 +2440,60 @@ mod tests {
         // CAP_PERFMON — never "denied with caps held".
         let m = ringbuf_query_detail(&rbq_err("prog_load", libc::EPERM, ""), &bpf_only);
         assert!(
-            m.contains("unverifiable") && m.contains("CAP_PERFMON"),
+            m.contains("unverifiable") && m.contains("without CAP_PERFMON ("),
             "{m}"
         );
-        // Same EPERM with perfmon held: attributed denial.
+        // Same EPERM with both held: attributed denial.
         let m = ringbuf_query_detail(&rbq_err("prog_load", libc::EPERM, ""), &allow);
         assert!(m.contains("denied"), "{m}");
         // Map-stage EPERM without CAP_BPF: unverifiable, wants BPF.
         let m = ringbuf_query_detail(&rbq_err("map_create", libc::EPERM, ""), &none);
-        assert!(m.contains("CAP_BPF"), "{m}");
+        assert!(m.contains("without CAP_BPF ("), "{m}");
         // Map-stage EPERM with CAP_BPF held: attributed denial.
         let m = ringbuf_query_detail(&rbq_err("map_create", libc::EPERM, ""), &bpf_only);
         assert!(m.contains("denied"), "{m}");
+        // PERFMON-only + load EPERM (reachable under unprivileged
+        // BPF: map creation succeeds, kprobe load still wants BPF):
+        // unverifiable wanting CAP_BPF — never denied-with-caps.
+        let perfmon_only = ctx(1u64 << CAP_PERFMON, false, &[], false);
+        let m = ringbuf_query_detail(&rbq_err("prog_load", libc::EPERM, ""), &perfmon_only);
+        assert!(
+            m.contains("unverifiable") && m.contains("without CAP_BPF ("),
+            "{m}"
+        );
+        // PERFMON-only + map EPERM: perfmon is irrelevant to map
+        // creation — still wants CAP_BPF.
+        let m = ringbuf_query_detail(&rbq_err("map_create", libc::EPERM, ""), &perfmon_only);
+        assert!(m.contains("without CAP_BPF ("), "{m}");
+        // Neither cap + load EPERM: reports both missing caps.
+        let m = ringbuf_query_detail(&rbq_err("prog_load", libc::EPERM, ""), &none);
+        assert!(m.contains("without CAP_BPF+CAP_PERFMON ("), "{m}");
+        // CAP_SYS_ADMIN-only satisfies both stages: EPERM with
+        // admin held is an attributed denial, never "unverifiable".
+        let admin_only = ctx(1u64 << CAP_SYS_ADMIN, false, &[], false);
+        for stage in ["map_create", "prog_load"] {
+            let m = ringbuf_query_detail(&rbq_err(stage, libc::EPERM, ""), &admin_only);
+            assert!(m.contains("denied") && !m.contains("unverifiable"), "{m}");
+        }
+        // EACCES-shaped verifier reject with "unknown func" log:
+        // evidence beats errno shape — absent, not denied.
+        let m = ringbuf_query_detail(
+            &rbq_err(
+                "prog_load",
+                libc::EACCES,
+                "unknown func bpf_ringbuf_query#134",
+            ),
+            &allow,
+        );
+        assert!(m.contains("absent"), "{m}");
+        // ENOSYS (no bpf() at all): unavailable, both stages.
+        for stage in ["map_create", "prog_load"] {
+            let m = ringbuf_query_detail(&rbq_err(stage, libc::ENOSYS, ""), &allow);
+            assert!(
+                m.contains("unavailable") && m.contains("bpf() missing"),
+                "{m}"
+            );
+        }
     }
 
     #[test]
