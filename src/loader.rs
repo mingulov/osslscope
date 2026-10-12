@@ -1531,6 +1531,245 @@ mod tests {
         b
     }
 
+    /// Key offsets into [`mixed_elf`] for tests that patch it (the
+    /// builder lays out sequentially, so tests take offsets from
+    /// here instead of duplicating the layout).
+    struct MixedLayout {
+        symtab_off: usize,
+        reltext_off: usize,
+        cb_name_off: u32,
+    }
+
+    /// Mixed callback graph: main calls `wrap` (static), `wrap`
+    /// takes `cb`'s address (func-ptr, backward over `dead`), `cb`
+    /// bumps the map and calls `helper` (static, forward over
+    /// `dead`+`wrap`), and `dead` is unreferenced between `cb` and
+    /// `wrap` so its exclusion shifts linked offsets. `.text`
+    /// order: cb @0/24, dead @24/8, wrap @32/16, helper @48/8;
+    /// main is 16B (`call` + `exit`). Syms: null, main, cb, dead,
+    /// wrap, helper, MYMAP.
+    fn mixed_elf() -> (Vec<u8>, MixedLayout) {
+        let uprobe_off = 64usize;
+        let text_off = uprobe_off + 16;
+        let maps_off = text_off + 56;
+        let reluprobe_off = maps_off + 28;
+        let reltext_off = reluprobe_off + 16;
+        let symtab_off = reltext_off + 48;
+        let strtab_off = symtab_off + 7 * 24;
+        let strtab: &[u8] = b"\0main\0cb\0dead\0wrap\0helper\0MYMAP\0";
+        // Name offsets into strtab: main=1, cb=6, dead=9, wrap=14,
+        // helper=19, MYMAP=26.
+        let shstrtab_off = strtab_off + strtab.len();
+        let shstr: &[u8] =
+            b"\0uprobe\0.text\0maps\0.reluprobe\0.rel.text\0.symtab\0.strtab\0.shstrtab\0";
+        let shoff = (shstrtab_off + shstr.len() + 7) & !7;
+        let mut b = vec![0u8; shoff + 9 * 64];
+        // ELF header.
+        b[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+        b[4] = 2;
+        b[5] = 1;
+        b[6] = 1;
+        b[16..18].copy_from_slice(&u16(1));
+        b[18..20].copy_from_slice(&u16(247));
+        b[40..48].copy_from_slice(&u64(shoff as u64));
+        b[58..60].copy_from_slice(&u16(64));
+        b[60..62].copy_from_slice(&u16(9));
+        b[62..64].copy_from_slice(&u16(8));
+        // uprobe main: call + exit.
+        b[uprobe_off..uprobe_off + 8].copy_from_slice(&[0x85, 0, 0, 0, 0, 0, 0, 0]);
+        b[uprobe_off + 8..uprobe_off + 16].copy_from_slice(&[0x95, 0, 0, 0, 0, 0, 0, 0]);
+        // .text cb: ld_imm64 r1,map + call.
+        b[text_off..text_off + 16]
+            .copy_from_slice(&[0x18, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        b[text_off + 16..text_off + 24].copy_from_slice(&[0x85, 0, 0, 0, 0, 0, 0, 0]);
+        // .text dead: exit (unreferenced).
+        b[text_off + 24..text_off + 32].copy_from_slice(&[0x95, 0, 0, 0, 0, 0, 0, 0]);
+        // .text wrap: ld_imm64 r2,cb.
+        b[text_off + 32..text_off + 48]
+            .copy_from_slice(&[0x18, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        // .text helper: exit.
+        b[text_off + 48..text_off + 56].copy_from_slice(&[0x95, 0, 0, 0, 0, 0, 0, 0]);
+        // maps: ARRAY u32->u64 max 1.
+        for (i, v) in [2u32, 4, 8, 1, 0, 0, 0].iter().enumerate() {
+            b[maps_off + i * 4..maps_off + i * 4 + 4].copy_from_slice(&u32(*v));
+        }
+        // .reluprobe: call @0 (sym 4 = wrap).
+        b[reluprobe_off..reluprobe_off + 8].copy_from_slice(&u64(0));
+        b[reluprobe_off + 8..reluprobe_off + 16].copy_from_slice(&u64(4 << 32 | 10));
+        // .rel.text: map @0 (sym 6), call @16 (sym 5 = helper),
+        // func @32 (sym 2 = cb).
+        b[reltext_off..reltext_off + 8].copy_from_slice(&u64(0));
+        b[reltext_off + 8..reltext_off + 16].copy_from_slice(&u64(6 << 32 | 1));
+        b[reltext_off + 16..reltext_off + 24].copy_from_slice(&u64(16));
+        b[reltext_off + 24..reltext_off + 32].copy_from_slice(&u64(5 << 32 | 10));
+        b[reltext_off + 32..reltext_off + 40].copy_from_slice(&u64(32));
+        b[reltext_off + 40..reltext_off + 48].copy_from_slice(&u64(2 << 32 | 1));
+        // symtab.
+        let mut sym = |o: usize, name: u32, info: u8, shndx: u16, val: u64, size: u64| {
+            b[o..o + 4].copy_from_slice(&u32(name));
+            b[o + 4] = info;
+            b[o + 6..o + 8].copy_from_slice(&u16(shndx));
+            b[o + 8..o + 16].copy_from_slice(&u64(val));
+            b[o + 16..o + 24].copy_from_slice(&u64(size));
+        };
+        sym(symtab_off, 0, 0, 0, 0, 0);
+        sym(symtab_off + 24, 1, 0x12, 1, 0, 16);
+        sym(symtab_off + 48, 6, 0x12, 2, 0, 24);
+        sym(symtab_off + 72, 9, 0x12, 2, 24, 8);
+        sym(symtab_off + 96, 14, 0x12, 2, 32, 16);
+        sym(symtab_off + 120, 19, 0x12, 2, 48, 8);
+        sym(symtab_off + 144, 26, 0x11, 3, 0, 28);
+        b[strtab_off..strtab_off + strtab.len()].copy_from_slice(strtab);
+        b[shstrtab_off..shstrtab_off + shstr.len()].copy_from_slice(shstr);
+        // Section headers: null, uprobe, .text, maps, .reluprobe,
+        // .rel.text, symtab, strtab, shstrtab.
+        let mut sh = |i: usize,
+                      name: u32,
+                      ty: u32,
+                      flags: u64,
+                      off: u64,
+                      size: u64,
+                      link: u32,
+                      info: u32,
+                      entsize: u64| {
+            let o = shoff + i * 64;
+            b[o..o + 4].copy_from_slice(&u32(name));
+            b[o + 4..o + 8].copy_from_slice(&u32(ty));
+            b[o + 8..o + 16].copy_from_slice(&u64(flags));
+            b[o + 24..o + 32].copy_from_slice(&u64(off));
+            b[o + 32..o + 40].copy_from_slice(&u64(size));
+            b[o + 40..o + 44].copy_from_slice(&u32(link));
+            b[o + 44..o + 48].copy_from_slice(&u32(info));
+            b[o + 48..o + 56].copy_from_slice(&u64(8));
+            b[o + 56..o + 64].copy_from_slice(&u64(entsize));
+        };
+        sh(0, 0, 0, 0, 0, 0, 0, 0, 0);
+        sh(1, 1, 1, 6, uprobe_off as u64, 16, 0, 0, 0);
+        sh(2, 8, 1, 6, text_off as u64, 56, 0, 0, 0);
+        sh(3, 14, 1, 3, maps_off as u64, 28, 0, 0, 0);
+        sh(4, 19, 9, 0, reluprobe_off as u64, 16, 6, 1, 16);
+        sh(5, 30, 9, 0, reltext_off as u64, 48, 6, 2, 16);
+        sh(6, 40, 2, 0, symtab_off as u64, 168, 7, 1, 24);
+        sh(7, 48, 3, 0, strtab_off as u64, strtab.len() as u64, 0, 0, 0);
+        sh(
+            8,
+            56,
+            3,
+            0,
+            shstrtab_off as u64,
+            shstr.len() as u64,
+            0,
+            0,
+            0,
+        );
+        (
+            b,
+            MixedLayout {
+                symtab_off,
+                reltext_off,
+                cb_name_off: 6,
+            },
+        )
+    }
+
+    #[test]
+    fn prepare_links_mixed_callback_graph() {
+        // main -call-> wrap -funcptr-> cb -call-> helper, with
+        // `dead` unreferenced between cb and wrap: linked layout is
+        // main(16) + cb(24) + wrap(16) + helper(8) = 64B, and the
+        // func-ptr imm goes negative (backward over dead).
+        let (obj, _) = mixed_elf();
+        let prep = prepare(
+            &obj,
+            &[MapSpec {
+                name: "MYMAP",
+                map_type: 2,
+                key_size: 4,
+                value_size: 8,
+                max_entries: 1,
+                flags: 0,
+            }],
+            &[ProgSpec {
+                name: "main",
+                section: "uprobe",
+            }],
+        )
+        .unwrap();
+        let p = &prep.progs[0];
+        assert_eq!(p.insns.len(), 64);
+        let subs: Vec<(&str, u32, bool)> = p
+            .subprogs
+            .iter()
+            .map(|s| (s.name.as_str(), s.insn_off, s.is_callback))
+            .collect();
+        assert_eq!(
+            subs,
+            vec![
+                ("main", 0, false),
+                ("cb", 2, true),
+                ("wrap", 5, false),
+                ("helper", 7, false),
+            ]
+        );
+        // main call @0 -> wrap @5insns: imm = 5-0-1.
+        assert_eq!(&p.insns[4..8], &4i32.to_le_bytes());
+        // wrap func site @40 -> cb @2insns: dst r2 + PSEUDO_FUNC,
+        // imm = 2-5-1 (backward).
+        assert_eq!(p.insns[41], 0x02 | (BPF_PSEUDO_FUNC << 4));
+        assert_eq!(&p.insns[44..48], &(-4i32).to_le_bytes());
+        // cb call @32 -> helper @7insns: imm = 7-4-1.
+        assert_eq!(&p.insns[36..40], &2i32.to_le_bytes());
+        // One map fixup: cb's site at linked offset 16.
+        assert_eq!(p.map_fixups.len(), 1);
+        assert_eq!(p.map_fixups[0].insn_off, 16);
+        assert_eq!(p.map_fixups[0].map, "MYMAP");
+        // `dead` is excluded: the subprog offs already prove
+        // compaction (helper sits 8B below its naive .text+main
+        // position), and every unpatched image byte matches its
+        // source — only the three asserted reloc sites differ.
+        let text = &obj[80..136];
+        assert_eq!(&p.insns[0..4], &obj[64..68]);
+        assert_eq!(&p.insns[8..16], &obj[72..80]);
+        assert_eq!(&p.insns[16..36], &text[0..20]);
+        assert_eq!(p.insns[40], text[32]);
+        assert_eq!(&p.insns[48..56], &text[40..48]);
+        assert_eq!(&p.insns[56..64], &text[48..56]);
+    }
+
+    #[test]
+    fn prepare_rejects_duplicate_targeting_second() {
+        // Strengthened dup regression: valid main intact, two `cb`
+        // bodies with distinct bytes at different offsets (0 and
+        // 48), and the func-ptr reloc repointed at the SECOND.
+        // Name-only linking would resolve (48, "cb") but link the
+        // first body with agreeing func_info — silent substitution.
+        let (mut obj, layout) = mixed_elf();
+        // Rename helper (sym 5) to "cb".
+        obj[layout.symtab_off + 5 * 24..layout.symtab_off + 5 * 24 + 4]
+            .copy_from_slice(&u32(layout.cb_name_off));
+        // Repoint the func-ptr reloc (3rd .rel.text entry) at sym 5.
+        obj[layout.reltext_off + 2 * 16 + 8..layout.reltext_off + 2 * 16 + 16]
+            .copy_from_slice(&u64(5 << 32 | 1));
+        let e = prepare(
+            &obj,
+            &[MapSpec {
+                name: "MYMAP",
+                map_type: 2,
+                key_size: 4,
+                value_size: 8,
+                max_entries: 1,
+                flags: 0,
+            }],
+            &[ProgSpec {
+                name: "main",
+                section: "uprobe",
+            }],
+        )
+        .err()
+        .expect("must fail");
+        assert!(e.to_string().contains("duplicate"), "{e:#}");
+    }
+
     #[test]
     fn prepare_patches_calls_and_records_map_fixups() {
         let obj = min_elf();
