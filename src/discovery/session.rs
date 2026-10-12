@@ -405,6 +405,10 @@ pub struct DiscoverySnapshot {
     /// Query/load arrivals (CALLS-joined total, event-count
     /// fallback) — never execution.
     pub queries_observed: u64,
+    /// Per-op query arrivals, sorted by op, from the same source
+    /// as the published total (CALLS-joined per-op high-water, or
+    /// event counts when the map is absent; see the core fields).
+    pub queries_by_op: Vec<(u32, u64)>,
     /// Ops with at least one query hit.
     pub ops_hit: Vec<u32>,
     pub dispatch: DispatchSnapshot,
@@ -433,6 +437,9 @@ pub struct MapSnapshots {
     pub losses_failed: bool,
     /// `CALLS` sum (`None` when the map is absent).
     pub calls: Option<u64>,
+    /// `CALLS` per-op rows (empty when the map is absent; partial
+    /// rows ride with `calls_failed` and the max-join ignores dips).
+    pub calls_by_op: Vec<(u32, u64)>,
     pub calls_failed: bool,
     /// `TRIP` contents.
     pub trip: Vec<(u64, u64)>,
@@ -822,6 +829,16 @@ pub struct SessionCore {
     alg_records: HashMap<(u64, u64), (String, bool, String)>,
     ops_hit: HashSet<u32>,
     queries_events: u64,
+    /// Per-op query-event arrivals (fallback source, used only when
+    /// the CALLS map is absent — always sums to `queries_events`).
+    queries_by_op: HashMap<u32, u64>,
+    /// Per-op CALLS-joined high-water (primary source, mirrors the
+    /// total's max-join per key; sums to the published total when
+    /// every map read is good — a failed (partial) read inflates
+    /// the sum past the total while its failure flag records
+    /// snapshot loss; a silent dip on a good read is ignored by
+    /// the max-join without record).
+    calls_by_op: HashMap<u32, u64>,
     /// Joined CALLS total (`None` until the map is first seen; the
     /// query source pins on first join — see `calls_pinned`).
     calls_joined: Option<u64>,
@@ -932,6 +949,8 @@ impl SessionCore {
             alg_records: HashMap::new(),
             ops_hit: HashSet::new(),
             queries_events: 0,
+            queries_by_op: HashMap::new(),
+            calls_by_op: HashMap::new(),
             calls_joined: None,
             calls_pinned: false,
             emitted_queries: 0,
@@ -1510,6 +1529,8 @@ impl SessionCore {
         self.alg_records.clear();
         self.ops_hit.clear();
         self.queries_events = 0;
+        self.queries_by_op.clear();
+        self.calls_by_op.clear();
         self.calls_joined = None;
         self.emitted_queries = 0;
         self.emitted_losses.clear();
@@ -1672,19 +1693,24 @@ impl SessionCore {
     }
 
     /// Mappings for one reconcile/attribution step (F-D/Am1): a
-    /// successful read refreshes the last-good snapshot; a failed
-    /// read keeps the last-good snapshot and records explicit
-    /// loss instead of reading the failure as empty maps.
+    /// successful non-empty read refreshes the last-good snapshot;
+    /// a failed read — or an EMPTY snapshot — keeps the last-good
+    /// snapshot and records explicit loss instead of reading the
+    /// absence as empty maps. Empty is information-free, never an
+    /// unmap: a zombie (dead, not yet reaped) reads 0 bytes
+    /// successfully, while a live address space always carries
+    /// mappings — clobbering last-good with it terminally
+    /// detached every plane in the death-during-poll race.
     fn poll_maps<E: SessionEnv>(&mut self, env: &mut E) -> Vec<maps::Mapping> {
         match env.current_maps() {
-            Some(maps) => {
+            Some(maps) if !maps.is_empty() => {
                 // M1: every fresh snapshot sights its new ranges
                 // (first-wins baselines for late-seen arrays).
                 self.sight_mappings(&maps);
                 self.last_good_maps = maps.clone();
                 maps
             }
-            None => {
+            _ => {
                 self.tracker.note_maps_read();
                 self.last_good_maps.clone()
             }
@@ -2236,6 +2262,17 @@ impl SessionCore {
         } else if let (Some(cur), Some(c)) = (self.calls_joined, snap.calls) {
             self.calls_joined = Some(cur.max(c));
         }
+        // Per-op CALLS high-water (same max-join per key; partial
+        // rows from a failed iteration can only undershoot, so the
+        // max ignores the dip exactly like the total's).
+        if snap.calls.is_some() {
+            for (op, n) in &snap.calls_by_op {
+                let last = self.calls_by_op.get(op).copied().unwrap_or(0);
+                if *n > last {
+                    self.calls_by_op.insert(*op, *n);
+                }
+            }
+        }
         let joined: HashMap<u64, u64> = snap.trip.iter().copied().collect();
         for (cookie, n) in &joined {
             let last = self.trip_joined.get(cookie).copied().unwrap_or(0);
@@ -2334,6 +2371,7 @@ impl SessionCore {
                 self.trigger_observed = true;
                 self.queries_events += 1;
                 self.ops_hit.insert(ev.op);
+                *self.queries_by_op.entry(ev.op).or_default() += 1;
                 // Unbound (bootstrap install failed — loss already
                 // recorded): liveness above is genuine, but nothing
                 // epoch-scoped may join until the array binds.
@@ -2620,6 +2658,14 @@ impl SessionCore {
         truncated_ops.sort_unstable();
         let mut ops_hit: Vec<u32> = self.ops_hit.iter().copied().collect();
         ops_hit.sort_unstable();
+        // Same source as the published total: CALLS-joined per-op
+        // when the map exists, event counts otherwise.
+        let mut queries_by_op: Vec<(u32, u64)> = if self.calls_joined.is_some() {
+            self.calls_by_op.iter().map(|(op, n)| (*op, *n)).collect()
+        } else {
+            self.queries_by_op.iter().map(|(op, n)| (*op, *n)).collect()
+        };
+        queries_by_op.sort_unstable();
         let mut attach_failures: Vec<AttachFailure> = self
             .attach_failures
             .iter()
@@ -2641,6 +2687,7 @@ impl SessionCore {
             truncated_ops,
             lossy_slots: self.tracker.lossy_slots(),
             queries_observed: self.queries_total(),
+            queries_by_op,
             ops_hit,
             dispatch: DispatchSnapshot {
                 attached: self.dispatch_live || !self.attached_queries.is_empty(),
@@ -3445,6 +3492,7 @@ impl SessionEnv for LiveEnv {
             losses,
             losses_failed,
             calls,
+            calls_by_op: call_rows,
             calls_failed,
             trip,
             trip_failed,
@@ -4744,7 +4792,10 @@ mod tests {
     #[test]
     fn h10_t2_mapped_then_unmapped_detaches() {
         // T2 (RED): GONE preserved — mapped (armed) then unmapped
-        // (dlclose) detaches exactly once.
+        // (dlclose) detaches exactly once. The post-dlclose maps
+        // stay NON-empty (a live address space always carries
+        // mappings — an empty snapshot is the zombie phase, not
+        // an unmap, and takes the failed-read arm per Am1 T1').
         let mut env = MiniEnv::new();
         env.maps = vec![prov_mapping(50, 0x1000)];
         env.provider_stat = Some(("08:01".to_string(), 50));
@@ -4753,7 +4804,7 @@ mod tests {
         core.dispatch_live = true;
         core.poll(&mut env, a11_budget()).unwrap();
         assert_eq!(env.dispatch_detaches, 0);
-        env.maps = Vec::new();
+        env.maps = vec![lc_mapping(99)];
         core.poll(&mut env, a11_budget()).unwrap();
         assert_eq!(env.dispatch_detaches, 1, "gone detaches once");
         assert!(!core.dispatch_live);
@@ -5115,6 +5166,43 @@ mod tests {
     }
 
     #[test]
+    fn empty_maps_snapshot_keeps_last_good_and_reports_loss() {
+        // F-D/Am1 T1': an EMPTY maps snapshot is information-free,
+        // not an unmap — a zombie (dead, not yet reaped) reads 0
+        // bytes successfully, and a live address space is never
+        // empty (exe/vdso/stack at minimum). Like a failed read it
+        // keeps links against last-good with explicit loss; the
+        // old clobber terminally detached stage-2 in the
+        // death-during-poll race (P5d: bailed ~1/4 of speed legs
+        // plus the dgst specimen — same arm feeds trips, dispatch
+        // and stage-2, so the trip assertions pin the shared fix).
+        let mut env = MiniEnv::new();
+        env.maps = vec![lc_mapping(100)];
+        env.plan = Some(trip_set(100, &[0x100]));
+        let mut core = a11_core();
+        core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(env.trip_installs, 1);
+        env.maps = vec![];
+        let delta = core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(
+            env.trip_detaches, 0,
+            "empty snapshot must not detach: last-good keeps links"
+        );
+        assert!(
+            core.snapshot().legacy.planned,
+            "legacy plan must survive an empty snapshot"
+        );
+        assert!(
+            delta
+                .losses
+                .iter()
+                .any(|l| l.source == coverage::HOST_MAPS_READ && l.count == 1 && l.op.is_none()),
+            "empty snapshot must be explicit unlocalizable loss: {:?}",
+            delta.losses
+        );
+    }
+
+    #[test]
     fn install_trips_receives_caller_maps() {
         // F-D/Am1 T3': the trip installer uses the caller's
         // explicit maps (last-good-or-fresh, failure already
@@ -5174,5 +5262,82 @@ mod tests {
             "close-time maps failure must be explicit loss: {:?}",
             snap.losses
         );
+    }
+
+    #[test]
+    fn calls_join_source_pins_permanently() {
+        // P5d: the first join decides the query-count source forever.
+        // CALLS-absent pins the event fallback — a later-appearing
+        // map does not flip mid-stream (same rule as the total).
+        let mut delta = DiscoveryDelta::default();
+        let mut core = a11_core();
+        core.join_snapshots(
+            &MapSnapshots {
+                calls: None,
+                ..Default::default()
+            },
+            &mut delta,
+        );
+        // Simulate three accepted QUERY_RET events on op 2 (ring
+        // ingestion is covered by integration tests; the source
+        // SELECTION is what's under test here).
+        core.queries_events = 3;
+        core.queries_by_op.insert(2, 3);
+        core.join_snapshots(
+            &MapSnapshots {
+                calls: Some(50),
+                calls_by_op: vec![(2, 50)],
+                ..Default::default()
+            },
+            &mut delta,
+        );
+        let snap = core.snapshot();
+        assert_eq!(snap.queries_observed, 3);
+        assert_eq!(snap.queries_by_op, vec![(2, 3)]);
+    }
+
+    #[test]
+    fn calls_join_partial_read_inflates_perop_recovers_on_complete() {
+        // P5d: good {1:5,2:5}, then a failed partial {1:9} — the
+        // total stays 10 (max-of-sums) while the per-op high-water
+        // sums to 14. A later complete read restores equality.
+        // (Sum > total is legitimate ONLY with a failed read behind
+        // it; silent dips are ignored without record.)
+        let mut delta = DiscoveryDelta::default();
+        let mut core = a11_core();
+        core.join_snapshots(
+            &MapSnapshots {
+                calls: Some(10),
+                calls_by_op: vec![(1, 5), (2, 5)],
+                ..Default::default()
+            },
+            &mut delta,
+        );
+        let snap = core.snapshot();
+        assert_eq!(snap.queries_observed, 10);
+        assert_eq!(snap.queries_by_op, vec![(1, 5), (2, 5)]);
+        core.join_snapshots(
+            &MapSnapshots {
+                calls: Some(9),
+                calls_by_op: vec![(1, 9)],
+                calls_failed: true,
+                ..Default::default()
+            },
+            &mut delta,
+        );
+        let snap = core.snapshot();
+        assert_eq!(snap.queries_observed, 10);
+        assert_eq!(snap.queries_by_op, vec![(1, 9), (2, 5)]);
+        core.join_snapshots(
+            &MapSnapshots {
+                calls: Some(14),
+                calls_by_op: vec![(1, 9), (2, 5)],
+                ..Default::default()
+            },
+            &mut delta,
+        );
+        let snap = core.snapshot();
+        assert_eq!(snap.queries_observed, 14);
+        assert_eq!(snap.queries_by_op, vec![(1, 9), (2, 5)]);
     }
 }

@@ -486,9 +486,12 @@ fn blind_legacy_section() -> serde_json::Value {
 /// Exact in-memory harvest totals for capture callers (the doc
 /// only carries them when builtin/PARTIAL — cold-gap accounting
 /// needs them always).
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct HarvestTotals {
     pub queries_observed: u64,
+    /// Per-op query arrivals, sorted by op (P5d attribution; same
+    /// source as the total — see the session field).
+    pub queries_by_op: Vec<(u32, u64)>,
 }
 
 /// Run the harvest; returns the emitted document on success.
@@ -706,6 +709,7 @@ pub fn run_detailed(
                     d,
                     HarvestTotals {
                         queries_observed: snap.queries_observed,
+                        queries_by_op: snap.queries_by_op.clone(),
                     },
                 )
             });
@@ -749,6 +753,7 @@ pub fn run_detailed(
                 doc,
                 HarvestTotals {
                     queries_observed: snap.queries_observed,
+                    queries_by_op: snap.queries_by_op.clone(),
                 },
             ));
         }
@@ -787,6 +792,7 @@ pub fn run_detailed(
                 doc,
                 HarvestTotals {
                     queries_observed: snap.queries_observed,
+                    queries_by_op: snap.queries_by_op.clone(),
                 },
             ));
         }
@@ -816,6 +822,7 @@ pub fn run_detailed(
             doc,
             HarvestTotals {
                 queries_observed: snap.queries_observed,
+                queries_by_op: snap.queries_by_op.clone(),
             },
         ));
     }
@@ -959,7 +966,13 @@ pub fn run_detailed(
         };
         doc["legacy"] = l;
     }
-    Ok((doc, HarvestTotals { queries_observed }))
+    Ok((
+        doc,
+        HarvestTotals {
+            queries_observed,
+            queries_by_op: snap.queries_by_op.clone(),
+        },
+    ))
 }
 
 #[cfg(test)]
