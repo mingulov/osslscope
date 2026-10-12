@@ -135,11 +135,13 @@ fn h5_t3_every_device_site_names_one_domain() {
             1,
         ),
         ("src/capture.rs", "stat", ".map(|o| (o.device, o.inode))", 1),
-        // capture.rs: object-id bind against the full identity.
+        // capture.rs: object-id bind against the full identity
+        // (P6: carries the path for the build-id cache key; the
+        // bind itself is still stat (dev, ino)).
         (
             "src/capture.rs",
             "stat",
-            ".find_map(|m| plan::bound_bytes(files, &m.path, want, ino))",
+            "plan::bound_bytes(files, &m.path, want, ino).map(|b| (m.path.clone(), b))",
             1,
         ),
         // capture.rs: B-5 registry key (dev, ino, id).
@@ -245,11 +247,13 @@ fn h5_t3_every_device_site_names_one_domain() {
             "let Some(want) = plan::device_id_of_dev_str(&candidate.advertising_dev) else {",
             1,
         ),
-        // capture.rs: advertising bind against the full identity.
+        // capture.rs: advertising bind against the full identity
+        // (P6: match-restructured to route bytes through the
+        // build-id cache; the bind is still stat (dev, ino)).
         (
             "src/capture.rs",
             "stat",
-            "let bid = plan::bound_bytes(files, &m.path, want, candidate.advertising_ino)",
+            "let bid = match plan::bound_bytes(files, &m.path, want, candidate.advertising_ino) {",
             1,
         ),
         // capture.rs: object-id row decode (stat string).
@@ -259,11 +263,13 @@ fn h5_t3_every_device_site_names_one_domain() {
             "let bid = plan::device_id_of_dev_str(dev).and_then(|want| {",
             1,
         ),
-        // capture.rs: D2 record id from the stat triple.
+        // capture.rs: D2 record id from the stat triple (P6:
+        // added the call-local build-id cache param; the id still
+        // derives from the stat (dev, ino) bind, never the cache).
         (
             "src/capture.rs",
             "stat",
-            "let id = object_id_for_mapping(&object.dev, object.ino, ctx.live, ctx.files);",
+            "object_id_for_mapping(&object.dev, object.ino, ctx.live, ctx.files, &mut build_ids);",
             1,
         ),
         // capture.rs: maps facet carried for the unstatable arm.

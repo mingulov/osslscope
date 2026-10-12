@@ -399,6 +399,26 @@ pub struct PlanRow {
     pub id: Identity,
 }
 
+/// Memoized ELF parses (P6): one parse per bound file per
+/// plan_rows call. The parse closure runs at most once per (path,
+/// dev, ino) identity (unparseable files cache None); a same-path
+/// replacement carries a new inode, so it re-parses. Call-local:
+/// never outlives the `files` bytes of its own call.
+type ElfCache<'b> = HashMap<(String, u64, u64), Option<goblin::elf::Elf<'b>>>;
+
+fn cached_elf_parse<'m, 'b>(
+    cache: &'m mut ElfCache<'b>,
+    path: &str,
+    dev: u64,
+    ino: u64,
+    parse: impl FnOnce() -> Option<goblin::elf::Elf<'b>>,
+) -> Option<&'m goblin::elf::Elf<'b>> {
+    cache
+        .entry((path.to_owned(), dev, ino))
+        .or_insert_with(parse)
+        .as_ref()
+}
+
 /// Plan typed rows against live mappings. `files` maps link-path →
 /// identity-bound bytes (caller pre-reads each distinct mapped path
 /// once). Fail-closed: malformed rows are an error, never a skip.
@@ -418,6 +438,7 @@ pub fn plan_rows(
         generation,
     };
     let mut seen: HashMap<(String, u64, u64), usize> = HashMap::new();
+    let mut elfs: ElfCache<'_> = HashMap::new();
     for r in rows {
         let dev = r.dev.clone();
         let ino = r.ino;
@@ -476,10 +497,11 @@ pub fn plan_rows(
             });
             continue;
         }
-        let reason = match elf::parse_elf(bytes) {
-            Ok(e) if elf::offset_in_x_segment(&e, r.offset) => None,
-            Ok(_) => Some("not-executable"),
-            Err(_) => Some("unreadable"),
+        let parsed = cached_elf_parse(&mut elfs, path, row_dev, ino, || elf::parse_elf(bytes).ok());
+        let reason = match parsed {
+            Some(e) if elf::offset_in_x_segment(e, r.offset) => None,
+            Some(_) => Some("not-executable"),
+            None => Some("unreadable"),
         };
         if let Some(reason) = reason {
             out.missed.push(Missed {
@@ -668,6 +690,48 @@ mod tests {
         assert_eq!(g.len(), 1);
         assert_eq!(g[0].offsets, vec![x_off, x_off + 0x40]);
         assert_eq!(g[0].cookies, vec![0, 1]);
+    }
+
+    #[test]
+    fn elf_cache_parses_once_per_identity() {
+        // P6: plan_rows memoized per-file ELF parses — the per-row
+        // parse stalled count attach ~2.5s (414 rows × full goblin
+        // parse). The parse closure runs once per (path, dev, ino);
+        // unparseable files cache None; distinct identities
+        // re-parse.
+        use std::cell::Cell;
+        let bytes = self_bytes();
+        let garbage = vec![0u8; 64];
+        let calls = Cell::new(0u32);
+        let mut cache: ElfCache<'_> = HashMap::new();
+        let e1 = cached_elf_parse(&mut cache, "/lib/a.so", 8, 100, || {
+            calls.set(calls.get() + 1);
+            elf::parse_elf(&bytes).ok()
+        });
+        assert!(e1.is_some());
+        let e2 = cached_elf_parse(&mut cache, "/lib/a.so", 8, 100, || {
+            calls.set(calls.get() + 1);
+            elf::parse_elf(&bytes).ok()
+        });
+        assert!(e2.is_some());
+        assert_eq!(calls.get(), 1, "same identity parses once");
+        let e3 = cached_elf_parse(&mut cache, "/lib/b.so", 8, 101, || {
+            calls.set(calls.get() + 1);
+            elf::parse_elf(&bytes).ok()
+        });
+        assert!(e3.is_some());
+        assert_eq!(calls.get(), 2, "distinct identity re-parses");
+        let n1 = cached_elf_parse(&mut cache, "/lib/z.so", 8, 102, || {
+            calls.set(calls.get() + 1);
+            elf::parse_elf(&garbage).ok()
+        });
+        assert!(n1.is_none());
+        let n2 = cached_elf_parse(&mut cache, "/lib/z.so", 8, 102, || {
+            calls.set(calls.get() + 1);
+            elf::parse_elf(&bytes).ok()
+        });
+        assert!(n2.is_none(), "absence caches too");
+        assert_eq!(calls.get(), 3);
     }
 
     #[test]

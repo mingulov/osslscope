@@ -18,7 +18,7 @@
 //! Legs: `birth_speed_harvest` (full-run birth reference),
 //! `cold_speed_harvest` (delayed attach), `birth_dgst_harvest`
 //! (fifo-held one-shot — cold-attach infeasible, spawn-only),
-//! `capture_spawn_empty_inventory_defect` (P6 defect pin).
+//! `capture_spawn_counts_executions` (P6 counting contract).
 //! Plus one offline unit test (per-op conservation).
 //!
 //! Live legs MUST run with `--test-threads=1`: the orphan backstop
@@ -804,29 +804,18 @@ fn birth_dgst_harvest() {
     );
 }
 
-/// P6 zero-execution characterization (boundary-2 live measurement
-/// BLOCKED — read before touching): a spawn-birth capture on the
-/// pinned vehicle observes the query trigger yet yields ZERO
-/// counted executions (`empty-inventory` + `discovery-loss`, 0
-/// executions, child exit 0, no fatal) — while the census shows
-/// attach COUNTS complete (op sites 320+47+47 discovered =
-/// attached, dispatch 1/1, legacy trips 95/95, 2 objects). The
-/// counting plane is the prime suspect (no counted calls on 414
-/// attached sites under a call-hot workload — suspects: WINDOW
-/// admission programming, TARGET/GEN mismatch, count drain), but
-/// late/incomplete discovery (attached after the calls) is NOT
-/// excluded: aggregate counts prove nothing about attach TIMING or
-/// whether a workload-used callback was attached while further
-/// calls remained. That timing/site proof is P6's. Settle (0.5s vs
-/// 30s — a late-attach label, not a counting delay) plus legacy
-/// (off/on) do not change the signature.
-/// This leg PINS the characterization (so P6's fix flips it red —
-/// then rewrite it into the boundary-2 first-call leg asserting
-/// non-empty executions + install/first-count latency). It also pins
-/// the GOOD parts: birth capture shows zero cold_gap_calls.
+/// Spawn-birth capture counts executions (P6: the redundant-ELF-parse
+/// stall is fixed — discovery adapts in ms, count probes attach while
+/// the workload still runs): a spawn-birth capture on the pinned
+/// vehicle observes the query trigger and yields NON-EMPTY executions
+/// with the attach census HELD (op sites discovered == attached,
+/// objects present, child exit 0, non-fatal, zero cold_gap_calls).
+/// (P5d pinned the zero-execution defect here: 10.2s of repeated
+/// goblin parses stalled one apply_delta, landing count attach 7.5s
+/// after the child exited. The fix memoizes build-ids per file.)
 #[test]
 #[ignore = "live lane only (OSSL_P5D_LIVE=1)"]
-fn capture_spawn_empty_inventory_defect() {
+fn capture_spawn_counts_executions() {
     let Some(harvest_object) = gated() else {
         return;
     };
@@ -937,19 +926,16 @@ fn capture_spawn_empty_inventory_defect() {
         "birth capture shows a cold gap: {}",
         cap.counters.cold_gap_calls
     );
-    // CHARACTERIZATION (P6): trigger observed, zero counted
-    // executions. If this fails because executions are NON-empty,
-    // the underlying behavior changed — P6 must replace this leg
-    // with the boundary-2 first-call leg (and locate what moved).
+    // Trigger gate: the count plane only observes post-trigger
+    // executions, so a missing trigger voids the contract below.
     assert!(
         cap.harvest_doc.get("trigger_observed") == Some(&serde_json::Value::Bool(true)),
-        "characterization changed: no trigger anymore?"
+        "no query trigger observed — counting contract void"
     );
-    // PINNED census (attach counts complete, executions zero): every
-    // op scope attached exactly what it discovered (no attach
-    // shortfall hiding behind the zero), at least one op site
-    // attached, objects present, and no sites anywhere (current,
-    // document, or fenced).
+    // HELD census (attach counts complete) + COUNTING contract
+    // (executions non-empty): every op scope attached exactly what
+    // it discovered, at least one op site attached, objects present,
+    // and the count plane observed real calls (no empty-inventory).
     let op_scopes: Vec<_> = cap
         .document
         .coverage
@@ -958,7 +944,7 @@ fn capture_spawn_empty_inventory_defect() {
         .collect();
     assert!(
         !op_scopes.is_empty(),
-        "characterization changed: no op scopes in census: {coverage:?}"
+        "no op scopes in census: {coverage:?}"
     );
     for c in &op_scopes {
         assert_eq!(
@@ -968,24 +954,33 @@ fn capture_spawn_empty_inventory_defect() {
         );
     }
     let op_attached: u64 = op_scopes.iter().map(|c| c.attached).sum();
+    assert!(op_attached > 0, "zero attached op sites: {coverage:?}");
+    assert!(!cap.document.objects.is_empty(), "zero objects in document");
     assert!(
-        op_attached > 0,
-        "characterization changed: zero attached op sites: {coverage:?}"
-    );
-    assert!(
-        !cap.document.objects.is_empty(),
-        "characterization changed: zero objects"
-    );
-    assert!(
-        cap.document.sites.is_empty() && fenced_sites == 0,
-        "characterization changed: document carries sites"
-    );
-    assert!(
-        cap.executions.is_empty() && cap.reasons.iter().any(|r| r == "empty-inventory"),
-        "BEHAVIOR CHANGED? executions={} reasons={:?} coverage={:?} — P6 must replace this leg with the boundary-2 first-call leg",
+        !cap.document.sites.is_empty(),
+        "count plane observed no sites: executions={} reasons={:?} coverage={:?}",
         cap.executions.len(),
         cap.reasons,
         coverage
+    );
+    // Substantial-counting guard (~3.0M observed, 30× margin):
+    // pins a heavily counted hot loop rather than a token trickle
+    // or a zero collapse. It does not pin attach timing (an ~+3s
+    // attach still cleared ~800K) — only that the plane counted
+    // at scale — while tolerating timing variance.
+    assert!(
+        !cap.executions.is_empty() && total_calls > 100_000,
+        "count plane counted too few calls: executions={} calls={} reasons={:?} coverage={:?}",
+        cap.executions.len(),
+        total_calls,
+        cap.reasons,
+        coverage
+    );
+    assert!(
+        !cap.reasons.iter().any(|r| r == "empty-inventory"),
+        "empty-inventory still raised with {} executions: {:?}",
+        cap.executions.len(),
+        cap.reasons
     );
 }
 
