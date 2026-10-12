@@ -99,10 +99,14 @@
       "algs": [
         "MD4"
       ],
+      "executed_calls": 0,
       "executed_queries": 4,
       "loads": {
         "legacy": 1
-      }
+      },
+      "non_legacy_exclusive_calls": 0,
+      "shared_ambiguous_calls": 0,
+      "unfenced_tail_calls": 0
     },
     "weak": {
       "executed_algs": [

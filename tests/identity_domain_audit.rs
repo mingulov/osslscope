@@ -126,6 +126,15 @@ fn h5_t3_every_device_site_names_one_domain() {
             ".cookie_for(site.site.device, site.site.inode, site.site.offset)",
             1,
         ),
+        // capture.rs (H8): legacy-file join — stat triple both
+        // sides (site backing vs advertised object identity).
+        (
+            "src/capture.rs",
+            "stat",
+            "&& legacy_files.contains(&(site.site.device, site.site.inode))",
+            1,
+        ),
+        ("src/capture.rs", "stat", ".map(|o| (o.device, o.inode))", 1),
         // capture.rs: object-id bind against the full identity.
         (
             "src/capture.rs",

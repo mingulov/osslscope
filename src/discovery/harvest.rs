@@ -479,6 +479,7 @@ fn blind_legacy_section() -> serde_json::Value {
         legacy_queries: 0,
         legacy_classes: Vec::new(),
         extra_findings: &[],
+        call_partition: legacy::CallPartition::default(),
     })
 }
 
@@ -659,6 +660,7 @@ pub fn run_detailed(
                 legacy_queries: snap.legacy.executed_queries,
                 legacy_classes: Vec::new(),
                 extra_findings: &extra_findings,
+                call_partition: legacy::CallPartition::default(),
             })),
             None => Some(blind_legacy_section()),
         }
@@ -950,6 +952,8 @@ pub fn run_detailed(
                 legacy_queries: snap.legacy.executed_queries,
                 legacy_classes: classes,
                 extra_findings: &extra_findings,
+                // Discovery-only: no executions exist to partition.
+                call_partition: legacy::CallPartition::default(),
             }),
             None => blind_legacy_section(),
         };

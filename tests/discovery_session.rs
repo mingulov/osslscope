@@ -898,6 +898,7 @@ fn load_query_is_not_execution() {
         legacy_queries: snap.legacy.executed_queries,
         legacy_classes: vec![],
         extra_findings: &[],
+        call_partition: osslscope::discovery::legacy::CallPartition::default(),
     });
     assert_eq!(doc["legacy_provider"]["executed_queries"], 3);
     assert_eq!(doc["legacy_provider"]["loads"]["legacy"], 2);
