@@ -828,7 +828,8 @@ fn partial_reharvest_preserved() {
 fn poll_budget_stops_busy_ring() {
     // A busy ring is consumed in bounded batches: each poll stops
     // at the budget, flags exhaustion (not loss), and resumes where
-    // it left off. Only close-time leftovers become shortfall.
+    // it left off. Close-time leftovers join the snapshot (bounded);
+    // only the residual past the bound becomes shortfall (P6 §6ii).
     let mut env = TestEnv::new();
     let mut core = test_core(false);
     let arr = 0x7f00_1000u64;
@@ -852,12 +853,21 @@ fn poll_budget_stops_busy_ring() {
     let snap = core.snapshot();
     assert!(!losses_of(&snap).contains_key(&HOST_DRAIN_SHORTFALL));
 
-    // Items still queued at close are labeled exactly once.
-    for idx in 500..510u64 {
-        env.push(ok_alg(OP_DIGEST, arr, idx));
+    // Items still queued at close are labeled exactly once: the
+    // bounded tail join absorbs them (P6 §6ii), so no shortfall is
+    // recorded and the queries join the cumulative total (1 polled
+    // + 10 tail on a fresh array for deterministic ingress).
+    let arr2 = 0x7f00_9000u64;
+    for slot in 0..10u64 {
+        env.push(query_ret(OP_DIGEST, arr2, slot));
     }
     let snap = core.close(&mut env).unwrap();
-    assert_eq!(losses_of(&snap)[&HOST_DRAIN_SHORTFALL], 10);
+    assert_eq!(snap.queries_observed, 11);
+    assert!(
+        !losses_of(&snap).contains_key(&HOST_DRAIN_SHORTFALL),
+        "joined tail must not count as shortfall: {:?}",
+        losses_of(&snap)
+    );
 }
 
 #[test]
@@ -1307,8 +1317,11 @@ fn close_recycle_carries_prewip_final() {
     assert_eq!(d.candidates.len(), 1);
     assert!(core.snapshot().queries_observed >= 1);
     // Tail queued at close + pin dead (reaped): recycle error ...
-    for idx in 1..4u64 {
-        env.push(ok_alg(OP_DIGEST, arr, idx));
+    // (P6 §6ii: the tail joins instead of counting as shortfall, so
+    // the G07 magnitude below is joined queries, still in-doc.)
+    let arr2 = 0x7f00_9000u64;
+    for slot in 0..3u64 {
+        env.push(query_ret(OP_DIGEST, arr2, slot));
     }
     env.pin_ok = false;
     let err = core.close(&mut env).unwrap_err();
@@ -1317,11 +1330,16 @@ fn close_recycle_carries_prewip_final() {
     assert!(rec.snapshot.candidates.is_empty());
     assert_eq!(rec.snapshot.queries_observed, 0);
     // ... AND the pre-wipe final: the poll's candidate + query plus
-    // the 3 close-time tail items as shortfall magnitude.
+    // the 3 close-time tail queries joined (magnitude carried, not
+    // stderr-only).
     let fin = rec.final_snapshot.as_ref().expect("close carries final");
     assert_eq!(fin.candidates.len(), 1);
-    assert!(fin.queries_observed >= 1);
-    assert_eq!(losses_of(fin)[&HOST_DRAIN_SHORTFALL], 3);
+    assert_eq!(fin.queries_observed, 4);
+    assert!(
+        !losses_of(fin).contains_key(&HOST_DRAIN_SHORTFALL),
+        "joined tail must not count as shortfall: {:?}",
+        losses_of(fin)
+    );
 }
 
 #[test]
@@ -1340,8 +1358,11 @@ fn close_reaped_child_keeps_sites_no_retire_all() {
     env.push(dispatch_row(OP_DIGEST, 7, 0x7f00_2000, arr, 0));
     let d = core.poll(&mut env, ample_budget()).unwrap();
     assert_eq!(d.candidates.len(), 1);
-    for idx in 1..4u64 {
-        env.push(ok_alg(OP_DIGEST, arr, idx));
+    // (P6 §6ii: tail joins instead of counting as shortfall. Same
+    // array: a tail must not mint tables — the live-table count
+    // below pins no-retire, not tail growth.)
+    for slot in 1..4u64 {
+        env.push(query_ret(OP_DIGEST, arr, slot));
     }
     // Reaped: pin dead AND maps gone (LiveEnv reads nothing).
     env.pin_ok = false;
@@ -1363,8 +1384,12 @@ fn close_reaped_child_keeps_sites_no_retire_all() {
         "no retire gaps: {:?}",
         fin.retained_reasons
     );
-    assert!(fin.queries_observed >= 1);
-    assert_eq!(losses_of(fin)[&HOST_DRAIN_SHORTFALL], 3);
+    assert_eq!(fin.queries_observed, 4);
+    assert!(
+        !losses_of(fin).contains_key(&HOST_DRAIN_SHORTFALL),
+        "joined tail must not count as shortfall: {:?}",
+        losses_of(fin)
+    );
 }
 
 #[test]

@@ -228,7 +228,14 @@ fn h5_t3_every_device_site_names_one_domain() {
             "if crate::discovery::session::backing_dev(m) != candidate.advertising_dev",
             1,
         ),
-        // capture.rs: triple device decodes (stat strings, ×3).
+        // capture.rs: triple device decodes (stat strings, ×3
+        // variants). Honest guarantee (sol round 2): BackingRef.dev
+        // is stat-normally but maps-on-fallback (`backing_dev`
+        // falls back to maps text when unstatable), so one file
+        // may group under two triples across an unlink — a known
+        // H5 tension (bindings use dual-facet path+ino and never
+        // compare maps dev; triple grouping does not). The close
+        // reconcile sidesteps it by matching (ino, offset) only.
         (
             "src/capture.rs",
             "stat",
