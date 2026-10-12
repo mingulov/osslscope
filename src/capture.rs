@@ -3660,7 +3660,7 @@ where
         // H7-T4: a lost drain feeds the close-evidence taint (a
         // failed close may hide tails) — surviving denominators go
         // Unknown. Salvages with intact counts do not taint.
-        let close_evidence_global = loss_residual_any
+        let mut close_evidence_global = loss_residual_any
             || snapshot.lossy_slots > 0
             || !snapshot.dispatch.attach_failures.is_empty()
             || !snapshot.retained_reasons.is_empty()
@@ -3668,8 +3668,96 @@ where
             || drain_shortfall > 0
             || self.maps_read_failed > 0
             || salvage.as_ref().is_some_and(|s| s.taint_evidence);
-        let close_evidence_ops: HashSet<u32> =
+        // Close-candidate reconcile (P6 §6ii sol blocker 2):
+        // candidates first joined (or refreshed) by close's tail
+        // ingest never rode a poll delta, so the adapter never saw
+        // them — yet the final table proof may be complete. Every
+        // close-joined candidate is a genuine adapter-visible
+        // change (unchanged duplicates never reach the close
+        // list), so each one taints: its op joins the
+        // evidence-tainted set (denominator Unknown — the window
+        // census is short or its sets incomplete; blanket per op
+        // like the orphan doctrine, not gated on novelty) and its
+        // (ino, offset) joins the site-revision set below (covers
+        // cross-op aliases, whose op never appears in the site's
+        // adapted identities). The adapter is the POLL record and
+        // stays write-free here: `discovered` keeps its
+        // operational meaning (the attachable window census —
+        // every counted triple was attachable, so
+        // attached==discovered still pins attach completeness),
+        // while post-window discoveries ride the gap counter, not
+        // the census. A close-only op (no poll triples) keeps no
+        // coverage row — its sites surface in the gap volume, and
+        // the discovery snapshot retains the full inventory.
+        //
+        // Device is deliberately IGNORED (sol round 2): the
+        // backing dev string flips facets across unlink
+        // (`backing_dev` falls back to maps text when unstatable),
+        // so a device match misses same-file aliases. (ino,
+        // offset) are flip-proof (maps ino is stable across
+        // unlink — the dual-facet doctrine of `bindings_alive`),
+        // and kernel-grounded u64s need no parsing (there is no
+        // unparsed path here — even a garbage dev string rides
+        // its (ino, offset)). A candidate with NO backing at all
+        // cannot be localized to any site — its alias could
+        // belong anywhere — so it taints GLOBALLY (F-B/A7: the
+        // missing evidence could be anyone's), plus the explicit
+        // volume counter. (Poll-time unbacked stays counter-only:
+        // a later poll may still resolve it; at close there is
+        // no later.)
+        let mut close_backings: HashSet<(u64, u64)> = HashSet::new();
+        let mut close_joined = 0u64;
+        let mut close_unbacked = 0u64;
+        let mut close_evidence_ops: HashSet<u32> =
             snapshot.truncated_ops.iter().map(|(op, _)| *op).collect();
+        for candidate in &snapshot.close_candidates {
+            let Some(backing) = candidate.backing.as_ref() else {
+                close_unbacked += 1;
+                // Unlocalizable: taint everything (see above).
+                close_evidence_global = true;
+                continue;
+            };
+            close_joined += 1;
+            close_evidence_ops.insert(candidate.op);
+            close_backings.insert((backing.ino, backing.offset));
+        }
+        // Remap-evidence merge (sol round 3): M4-remembered old
+        // backings for close-joined impls join the SAME revision
+        // set — a silent first-cell adoption may have outrun an
+        // impl remap, so the old sites' sets may miss the alias.
+        // Site revision ONLY (no op taint): no triple is missing
+        // for the old ops, so their denominators stay exact —
+        // the precise Applicable-census/Unknown-set split.
+        for (ino, offset) in &snapshot.close_remembered {
+            close_backings.insert((*ino, *offset));
+        }
+        if !snapshot.close_remembered.is_empty() {
+            self.extra_loss.push(typed_counter(
+                "discovery.close_remembered",
+                CounterKind::Loss,
+                CounterUnits::Sites,
+                CounterSource::Discovery,
+                snapshot.close_remembered.len() as u64,
+            ));
+        }
+        if close_joined > 0 {
+            self.extra_loss.push(typed_counter(
+                "discovery.close_candidates",
+                CounterKind::Loss,
+                CounterUnits::Sites,
+                CounterSource::Discovery,
+                close_joined,
+            ));
+        }
+        if close_unbacked > 0 {
+            self.extra_loss.push(typed_counter(
+                "discovery.unbacked_candidate",
+                CounterKind::Loss,
+                CounterUnits::Sites,
+                CounterSource::Discovery,
+                close_unbacked,
+            ));
+        }
         // Census taint (denominators Unknown, emitted+proven sites
         // stand — all site evidence is in-window by construction).
         let close_census_global =
@@ -3796,6 +3884,7 @@ where
             let site_tainted = |site: &SiteExecution| {
                 close_evidence_global
                     || poll_global
+                    || close_backings.contains(&(site.site.inode, site.site.offset))
                     || site.candidates.iter().any(|c| {
                         close_evidence_ops.contains(&c.op)
                             || self.adapter.tainted_ops.contains(&c.op)

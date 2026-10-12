@@ -615,9 +615,11 @@ pub fn run_detailed(
             std::thread::sleep(Duration::from_millis(5));
         }
     }
-    // Quiesce-then-PROCESS close: links drop, the ring tail counts
-    // exactly into shortfall, maps join once more, and the pin
-    // verifies (recycle discards everything above).
+    // Quiesce-then-PROCESS close: links drop, the ring tail
+    // joins the snapshot (bounded — only the residual past one
+    // poll budget counts into shortfall, P6 §6ii), maps join once
+    // more, and the pin verifies (recycle discards everything
+    // above).
     let snap = match sess.close() {
         Ok(s) => s,
         Err(e) => {

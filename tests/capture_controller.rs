@@ -1059,6 +1059,409 @@ fn h2_t5_exited_target_maps_residual_is_exempt() {
 }
 
 #[test]
+fn close_new_site_taints_denominator_without_fabricating_site() {
+    // P6 §6ii sol blocker 2 (capture half, new-site case): a site
+    // first joined by close's tail ingest never rode a poll delta,
+    // so the adapter never saw it — yet the final table proof is
+    // complete. The op's denominator must go Unknown (the window
+    // census is short) with an explicit gap record, the window
+    // census itself stays poll-only (attached==discovered still
+    // pins attach completeness), and the unmeasured site must NOT
+    // render as a zero-count site.
+    let mut h = Harness::fresh("close-new-site");
+    h.snapshot_attached();
+    let cand1 = cand(
+        "/p/provider.so",
+        backing_of(&h.staged, h.off),
+        1,
+        11,
+        "SHA-256",
+        false,
+        "ok",
+    );
+    h.polls.push_back(DiscoveryDelta::default());
+    h.polls.push_back(DiscoveryDelta {
+        candidates: vec![cand1],
+        tables: vec![terminated(1, 0)],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    h.plans.insert(
+        2,
+        FirePlan {
+            fires: vec![(BASE_NS + 600_000_000, 7)],
+            shortfall: 0,
+            cancel: false,
+        },
+    );
+    h.exit_at_ns = Some(BASE_NS + 1_000_000_000);
+    h.exit_code = 0;
+    // Final proof complete — but a second site joined only at close.
+    h.snapshot.tables = vec![terminated(1, 0)];
+    h.snapshot.close_candidates = vec![cand(
+        "/p/provider.so",
+        backing_of(&h.staged, h.off + 0x40),
+        1,
+        11,
+        "SHA-256",
+        false,
+        "ok",
+    )];
+    let (out, _) = h.run();
+    let c = out.unwrap();
+    assert_eq!(
+        counter_value(&c, "discovery.close_candidates"),
+        1,
+        "close-joined candidates need an explicit gap record: {:?}",
+        c.document.counters
+    );
+    let scope = c
+        .document
+        .coverage
+        .iter()
+        .find(|s| s.scope == "op:1")
+        .expect("op:1 must keep its coverage row");
+    assert!(
+        matches!(scope.expected, ExpectedScope::Unknown),
+        "window census is short a close-joined site: {scope:?}"
+    );
+    assert_eq!(
+        (scope.discovered, scope.attached),
+        (1, 1),
+        "window census stays poll-only and attach-complete: {scope:?}"
+    );
+    assert_eq!(
+        c.document.sites.len(),
+        1,
+        "the unmeasured close site must not render: {:?}",
+        c.document.sites
+    );
+}
+
+#[test]
+fn close_alias_revises_attached_site_to_unknown() {
+    // P6 §6ii sol blocker 2 (capture half, alias case): a second
+    // identity for an attached triple arrives only at close — the
+    // emitted set is missing an alias. The site must revise to
+    // Unknown (triple-touched, even though no op-localized loss
+    // names it) and the op's denominator with it.
+    let mut h = Harness::fresh("close-alias");
+    h.snapshot_attached();
+    let cand1 = cand(
+        "/p/provider.so",
+        backing_of(&h.staged, h.off),
+        1,
+        11,
+        "SHA-256",
+        false,
+        "ok",
+    );
+    h.polls.push_back(DiscoveryDelta::default());
+    h.polls.push_back(DiscoveryDelta {
+        candidates: vec![cand1],
+        tables: vec![terminated(1, 0)],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    h.plans.insert(
+        2,
+        FirePlan {
+            fires: vec![(BASE_NS + 600_000_000, 7)],
+            shortfall: 0,
+            cancel: false,
+        },
+    );
+    h.exit_at_ns = Some(BASE_NS + 1_000_000_000);
+    h.exit_code = 0;
+    h.snapshot.tables = vec![terminated(1, 0)];
+    h.snapshot.close_candidates = vec![cand(
+        "/p/provider.so",
+        backing_of(&h.staged, h.off),
+        1,
+        12,
+        "SHA-512",
+        false,
+        "ok",
+    )];
+    let (out, _) = h.run();
+    let c = out.unwrap();
+    assert_eq!(c.document.sites.len(), 1);
+    assert_eq!(
+        c.document.sites[0].candidates_coverage,
+        CandidateCoverage::Unknown,
+        "attached site misses its close-joined alias: {:?}",
+        c.document.sites[0]
+    );
+    let scope = c
+        .document
+        .coverage
+        .iter()
+        .find(|s| s.scope == "op:1")
+        .expect("op:1 must keep its coverage row");
+    assert!(
+        matches!(scope.expected, ExpectedScope::Unknown),
+        "op with a close-joined alias claims no census: {scope:?}"
+    );
+    assert_eq!(
+        (scope.discovered, scope.attached),
+        (1, 1),
+        "same triple stays one window site, attach-complete: {scope:?}"
+    );
+}
+
+#[test]
+fn close_unbacked_candidate_taints_globally() {
+    // P6 §6ii sol round-2 hole 1: a close-joined candidate with no
+    // backing (impl mapping gone, array still mapped) cannot be
+    // localized to any triple — its alias could belong to ANY
+    // emitted site. Unlocalizable ⟹ global taint (F-B/A7: the
+    // missing evidence could be anyone's), plus the explicit
+    // volume counter. A second, clean op pins the GLOBAL scope:
+    // op-local taint alone would leave it Applicable.
+    let mut h = Harness::fresh("close-unbacked");
+    h.snapshot_attached();
+    let cand1 = cand(
+        "/p/provider.so",
+        backing_of(&h.staged, h.off),
+        1,
+        11,
+        "SHA-256",
+        false,
+        "ok",
+    );
+    let cand2 = cand(
+        "/p/provider.so",
+        backing_of(&h.staged, h.off + 0x80),
+        2,
+        21,
+        "SHA-256",
+        false,
+        "ok",
+    );
+    h.polls.push_back(DiscoveryDelta::default());
+    h.polls.push_back(DiscoveryDelta {
+        candidates: vec![cand1, cand2],
+        tables: vec![terminated(1, 0), terminated(2, 0)],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    h.plans.insert(
+        2,
+        FirePlan {
+            fires: vec![(BASE_NS + 600_000_000, 7)],
+            shortfall: 0,
+            cancel: false,
+        },
+    );
+    h.exit_at_ns = Some(BASE_NS + 1_000_000_000);
+    h.exit_code = 0;
+    h.snapshot.tables = vec![terminated(1, 0), terminated(2, 0)];
+    h.snapshot.close_candidates = vec![cand("/p/provider.so", None, 1, 11, "SHA-256", false, "ok")];
+    let (out, _) = h.run();
+    let c = out.unwrap();
+    assert_eq!(
+        counter_value(&c, "discovery.unbacked_candidate"),
+        1,
+        "unbacked close volume needs its explicit record: {:?}",
+        c.document.counters
+    );
+    for op in ["op:1", "op:2"] {
+        let scope = c
+            .document
+            .coverage
+            .iter()
+            .find(|s| s.scope == op)
+            .unwrap_or_else(|| panic!("{op} must keep its coverage row"));
+        assert!(
+            matches!(scope.expected, ExpectedScope::Unknown),
+            "unlocalizable close evidence taints every op: {scope:?}"
+        );
+    }
+    assert!(!c.document.sites.is_empty());
+    for site in &c.document.sites {
+        assert_eq!(
+            site.candidates_coverage,
+            CandidateCoverage::Unknown,
+            "unlocalizable close evidence revises every site"
+        );
+    }
+}
+
+#[test]
+fn close_fallback_alias_revises_by_ino_offset_despite_device_flip() {
+    // P6 §6ii sol round-2 hole 2: `backing_dev` falls back to maps
+    // text when unstatable, so an unlink between poll and close
+    // flips the close-candidate's device facet (stat "08:01" →
+    // maps "00:22") for the SAME file — a device-triple match
+    // misses. (ino, offset) are flip-proof (maps ino is stable
+    // across unlink — the dual-facet doctrine of `bindings_alive`),
+    // so the site revision matches on them and ignores device.
+    // Cross-op shape: the alias's op never appears in the site's
+    // adapted identities, so ONLY the (ino, offset) match can
+    // revise it — and the close-only op keeps no coverage row.
+    let mut h = Harness::fresh("close-fallback");
+    h.snapshot_attached();
+    let staged_dev = plan::render_device(h.staged.device);
+    let staged_ino = h.staged.ino;
+    let cand1 = cand(
+        "/p/provider.so",
+        backing_of(&h.staged, h.off),
+        1,
+        11,
+        "SHA-256",
+        false,
+        "ok",
+    );
+    h.polls.push_back(DiscoveryDelta::default());
+    h.polls.push_back(DiscoveryDelta {
+        candidates: vec![cand1],
+        tables: vec![terminated(1, 0)],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    h.plans.insert(
+        2,
+        FirePlan {
+            fires: vec![(BASE_NS + 600_000_000, 7)],
+            shortfall: 0,
+            cancel: false,
+        },
+    );
+    h.exit_at_ns = Some(BASE_NS + 1_000_000_000);
+    h.exit_code = 0;
+    h.snapshot.tables = vec![terminated(1, 0)];
+    // Same file (same ino + offset), maps-facet device string,
+    // cross-op identity: the triple match must not need device.
+    h.snapshot.close_candidates = vec![DiscoveredCandidate {
+        advertising: "/p/provider.so".to_string(),
+        advertising_dev: staged_dev,
+        advertising_ino: staged_ino,
+        backing: Some(BackingRef {
+            dev: "00:22".to_string(),
+            ino: staged_ino,
+            offset: h.off,
+        }),
+        op: 2,
+        funcid: 21,
+        class: "SHA-256".to_string(),
+        weak: false,
+        status: "ok".to_string(),
+        epoch: 0,
+        impl_addr: 0,
+        arr: 0,
+    }];
+    let (out, _) = h.run();
+    let c = out.unwrap();
+    assert_eq!(c.document.sites.len(), 1);
+    assert_eq!(
+        c.document.sites[0].candidates_coverage,
+        CandidateCoverage::Unknown,
+        "facet-flipped alias must still revise its site: {:?}",
+        c.document.sites[0]
+    );
+    assert!(
+        c.document.coverage.iter().all(|s| s.scope != "op:2"),
+        "close-only op keeps no coverage row: {:?}",
+        c.document.coverage
+    );
+}
+
+#[test]
+fn close_remembered_backing_revises_old_counted_site() {
+    // P6 §6ii sol round-3 remap variant: a first-cross-op ROW for
+    // an impl joins at close under a NEW backing (silent M4
+    // first-cell adoption — the impl may have remapped since the
+    // record was queued, so the record may belong to the OLD
+    // backing instead). Discovery reports the remembered old
+    // (ino, offset); capture revises that old counted site (its
+    // set may miss the alias) WITHOUT tainting the old op's
+    // denominator (no triple is missing FOR IT — the precise
+    // split: Applicable census, Unknown set).
+    let mut h = Harness::fresh("close-remembered");
+    h.snapshot_attached();
+    let staged_ino = h.staged.ino;
+    let cand1 = cand(
+        "/p/provider.so",
+        backing_of(&h.staged, h.off),
+        1,
+        11,
+        "SHA-256",
+        false,
+        "ok",
+    );
+    h.polls.push_back(DiscoveryDelta::default());
+    h.polls.push_back(DiscoveryDelta {
+        candidates: vec![cand1],
+        tables: vec![terminated(1, 0)],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    h.plans.insert(
+        2,
+        FirePlan {
+            fires: vec![(BASE_NS + 600_000_000, 7)],
+            shortfall: 0,
+            cancel: false,
+        },
+    );
+    h.exit_at_ns = Some(BASE_NS + 1_000_000_000);
+    h.exit_code = 0;
+    h.snapshot.tables = vec![terminated(1, 0)];
+    // Cross-op ROW under a NEW backing (device string ignored —
+    // the match is (ino, offset)); the remembered OLD backing
+    // arrives alongside.
+    h.snapshot.close_candidates = vec![DiscoveredCandidate {
+        advertising: "/p/provider.so".to_string(),
+        advertising_dev: String::new(),
+        advertising_ino: 0,
+        backing: Some(BackingRef {
+            dev: "00:22".to_string(),
+            ino: staged_ino + 1,
+            offset: h.off,
+        }),
+        op: 2,
+        funcid: 21,
+        class: "SHA-256".to_string(),
+        weak: false,
+        status: "ok".to_string(),
+        epoch: 0,
+        impl_addr: 0,
+        arr: 0,
+    }];
+    h.snapshot.close_remembered = vec![(staged_ino, h.off)];
+    let (out, _) = h.run();
+    let c = out.unwrap();
+    assert_eq!(
+        counter_value(&c, "discovery.close_remembered"),
+        1,
+        "remembered remap evidence needs its explicit record: {:?}",
+        c.document.counters
+    );
+    assert_eq!(c.document.sites.len(), 1);
+    assert_eq!(
+        c.document.sites[0].candidates_coverage,
+        CandidateCoverage::Unknown,
+        "old site may miss the remapped alias: {:?}",
+        c.document.sites[0]
+    );
+    let scope = c
+        .document
+        .coverage
+        .iter()
+        .find(|s| s.scope == "op:1")
+        .expect("op:1 must keep its coverage row");
+    assert!(
+        matches!(scope.expected, ExpectedScope::Applicable { sites: 1 }),
+        "old op loses no triple — census stays exact: {scope:?}"
+    );
+    assert!(
+        c.document.coverage.iter().all(|s| s.scope != "op:2"),
+        "close-only op keeps no coverage row: {:?}",
+        c.document.coverage
+    );
+}
+
+#[test]
 fn h2_t5b_capture_maps_failure_always_taints() {
     // H2/T5b: the capture-side `maps_read_failed` counter has no
     // post-exit increment site (round() reaps-or-continues first),

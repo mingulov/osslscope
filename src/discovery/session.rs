@@ -61,11 +61,11 @@
 //!
 //! Teardown is quiesce-then-PROCESS: [`SessionCore::close`] drops
 //! the attach links first (quiesce: no new events can arrive),
-//! then counts the ring tail exactly into drain shortfall, joins
-//! the maps once more, and verifies the pin — so no post-stop
-//! arrival escapes accounting. Prefer `close()` over `drop()`: the
-//! `Drop` impl only releases file descriptors and cannot report
-//! the tail.
+//! then ingests the ring tail (bounded; only the residual past
+//! the bound counts as drain shortfall), joins the maps once more,
+//! and verifies the pin — so no post-stop arrival escapes
+//! accounting. Prefer `close()` over `drop()`: the `Drop` impl
+//! only releases file descriptors and cannot report the tail.
 //!
 //! The session performs no ELF reads in the poll path: backing
 //! triples come from `/proc` maps alone, and foreign-object ELF
@@ -388,6 +388,17 @@ pub struct LinkLiveness {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DiscoverySnapshot {
     pub candidates: Vec<DiscoveredCandidate>,
+    /// Candidates first joined (or identity-refreshed) by
+    /// close's tail ingest: they never rode a poll delta, so a
+    /// delta-fed consumer (capture's adapter) never saw them.
+    /// Reported for the finish-time reconcile (P6 §6ii) — taint,
+    /// never silent census. Empty until close runs.
+    pub close_candidates: Vec<DiscoveredCandidate>,
+    /// M4-remembered (ino, offset) backings for close-joined impl
+    /// addrs that differ from the joined backing (sol round 3 —
+    /// first-cell adoption may have outrun an impl remap). Sorted
+    /// + deduped; empty until close runs.
+    pub close_remembered: Vec<(u64, u64)>,
     pub objects: Vec<DiscoveredObject>,
     /// Live-epoch tables only; retired epochs survive in
     /// `candidates` (rows) and `reasons` (gaps).
@@ -821,6 +832,17 @@ pub struct SessionCore {
     /// cannot spuriously detach before any attach).
     last_good_maps: Vec<maps::Mapping>,
     candidates: Vec<DiscoveredCandidate>,
+    /// Close-time tail-joined candidates (P6 §6ii): stashed by
+    /// [`SessionCore::close`] from its otherwise-discarded delta so
+    /// the closing snapshot reports them. Always empty before close
+    /// (close runs once); cleared on recycle with all lineage.
+    close_candidates: Vec<DiscoveredCandidate>,
+    /// M4-remembered (ino, offset) backings for close-joined impl
+    /// addrs that DIFFER from the joined backing (P6 §6ii sol
+    /// round 3): a first-cell adoption may have outrun an impl
+    /// remap, so the old sites' sets may miss the alias — capture
+    /// revises them too. Sorted + deduped; empty until close.
+    close_remembered: Vec<(u64, u64)>,
     /// Dedupe index by [`CandidateKey`]. Value is the candidate index.
     seen: HashMap<CandidateKey, usize>,
     objects: Vec<DiscoveredObject>,
@@ -943,6 +965,8 @@ impl SessionCore {
             slot_backing: HashMap::new(),
             last_good_maps: Vec::new(),
             candidates: Vec::new(),
+            close_candidates: Vec::new(),
+            close_remembered: Vec::new(),
             seen: HashMap::new(),
             objects: Vec::new(),
             seen_objects: HashSet::new(),
@@ -1385,6 +1409,16 @@ impl SessionCore {
                     return (TableRetirement { op, epoch, gap }, false);
                 }
                 self.record_generation_install(arr, generation);
+                // Retirement invalidates bootstrap grace (P6 §6ii):
+                // the previous drain's M2 stamp-0 tolerance belongs
+                // to the retired incarnation, never the replacement
+                // — without this, close-time rebirth (which runs
+                // before the tail join, outside any poll's
+                // drain-scoped clear) would attribute queued stamp-0
+                // records to the new generation. Grace is
+                // array-scoped, so a rebirth conservatively retires
+                // it for every table sharing the array.
+                self.bootstrap_grace.remove(&arr);
                 let epoch = self.next_epoch;
                 self.next_epoch += 1;
                 self.table_epochs.insert(
@@ -1523,6 +1557,8 @@ impl SessionCore {
         self.m1_poison.clear();
         self.slot_backing.clear();
         self.candidates.clear();
+        self.close_candidates.clear();
+        self.close_remembered.clear();
         self.seen.clear();
         self.objects.clear();
         self.seen_objects.clear();
@@ -1620,8 +1656,17 @@ impl SessionCore {
         // H5: one stat-facet pass per poll feeds every plane
         // (single-domain aliveness — never maps text).
         let stat_devs: Vec<Option<String>> = maps.iter().map(|m| stat_dev_of(&m.path)).collect();
+        // P6 §6ii: empty maps are "no information", never an unmap —
+        // but ONLY the purely maps-driven detaches below are gated
+        // on that. The dispatch arm stays ungated: its stat-driven
+        // paths (H10 pending re-resolve) must run against filesystem
+        // truth even when the address space is unreadable (h10_t3),
+        // and its maps-driven GONE branch is unreachable here anyway
+        // (blind ⟹ never mapped ⟹ !ever_mapped).
+        let maps_blind = maps.is_empty();
         if self.trip_live
             && let Some((path, dev, ino)) = &self.trip_bound
+            && !maps_blind
             && !bindings_alive(maps, &stat_devs, path, dev, *ino)
         {
             env.detach_trips();
@@ -1661,13 +1706,21 @@ impl SessionCore {
         // Stage-2 targets whose backing vanished: detach and forget
         // (dead links never count as live coverage). Unlike the
         // planes above there is no follow-up outcome — removal is
-        // terminal, so it signals here.
-        let dead: Vec<u64> = self
-            .attached_targets
-            .iter()
-            .filter(|(_, (_, path, dev, ino))| !bindings_alive(maps, &stat_devs, path, dev, *ino))
-            .map(|(cookie, _)| *cookie)
-            .collect();
+        // terminal, so it signals here. Blind polls (empty maps: no
+        // successful read yet — the death-during-first-poll race)
+        // detach nothing: a zombie-phase address space is not an
+        // unmap, and death is the drain's business (should_stop).
+        let dead: Vec<u64> = if maps_blind {
+            Vec::new()
+        } else {
+            self.attached_targets
+                .iter()
+                .filter(|(_, (_, path, dev, ino))| {
+                    !bindings_alive(maps, &stat_devs, path, dev, *ino)
+                })
+                .map(|(cookie, _)| *cookie)
+                .collect()
+        };
         for cookie in dead {
             env.detach_stage2(cookie);
             self.attached_queries.remove(&cookie);
@@ -2679,6 +2732,8 @@ impl SessionCore {
         reloads.sort_unstable();
         DiscoverySnapshot {
             candidates,
+            close_candidates: self.close_candidates.clone(),
+            close_remembered: self.close_remembered.clone(),
             objects,
             tables,
             reasons: union_reasons(&self.retained.reasons, &self.tracker.reasons()),
@@ -2716,8 +2771,10 @@ impl SessionCore {
     }
 
     /// Quiesce-then-PROCESS teardown: drop the attach links first
-    /// (no new events can arrive past this point), count the ring
-    /// tail exactly into drain shortfall, join the maps once more,
+    /// (no new events can arrive past this point), ingest the
+    /// quiesced ring tail through the same path as poll (bounded
+    /// by one default budget — P6 §6ii), count only the residual
+    /// past the bound as drain shortfall, join the maps once more,
     /// and verify the pin — so no post-stop arrival escapes
     /// accounting. Consumes nothing: the closed session keeps its
     /// final snapshot but rejects further polls.
@@ -2726,6 +2783,19 @@ impl SessionCore {
             bail!("discovery session is already closed");
         }
         self.closed = true;
+        // Freeze M4 cell memory at entry (sol round 4): the final
+        // reconcile below RETIRES tables — wiping their cells —
+        // and a terminated retirement is SILENT (no retained
+        // reason — it carried no gap). The remap-evidence scan
+        // must therefore read pre-reconciliation memory, else a
+        // queued first-cross-op ROW joining a remapped impl loses
+        // its old backing silently. Triples only (imp, ino, off)
+        // — all the scan needs; one-time close cost.
+        let frozen_backings: Vec<(u64, u64, u64)> = self
+            .slot_backing
+            .iter()
+            .map(|((_, _, imp), b)| (*imp, b.ino, b.offset))
+            .collect();
         // Final reconcile so the closing snapshot never carries a
         // stale-epoch table (retirements feed the retained gaps).
         // A failed read reconciles against last-good (F-D/Am1),
@@ -2733,6 +2803,23 @@ impl SessionCore {
         let maps = self.poll_maps(env);
         self.reconcile_epochs(env, &maps);
         env.quiesce();
+        // Tail join (P6 §6ii): a fast-dying target's in-ring wave
+        // joins the snapshot instead of becoming shortfall. Same
+        // ingest_one path as poll (no attaches can issue — the
+        // pending drains live in poll(), and quiesce already
+        // dropped the links); the close-time delta is discarded
+        // like the join below, the snapshot carries the state.
+        let mut delta = DiscoveryDelta::default();
+        let mut touched: HashSet<(u32, u64)> = HashSet::new();
+        let mut joined = 0u64;
+        while joined < PollBudget::default().max_events {
+            let Some(item) = self.pop_event(env) else {
+                break;
+            };
+            joined += 1;
+            self.ingest_one(env, &maps, &item, &mut delta, &mut touched);
+        }
+        delta.events_consumed = joined;
         let mut shortfall: u64 = 0;
         while self.pop_event(env).is_some() {
             shortfall += 1;
@@ -2744,8 +2831,49 @@ impl SessionCore {
         // Final join feeds cumulative state only (the close-time
         // delta is discarded — the snapshot below carries it).
         let snap = env.join_maps();
-        let mut delta = DiscoveryDelta::default();
         self.join_snapshots(&snap, &mut delta);
+        // ...except its candidates (P6 §6ii sol blocker 2): they
+        // never rode a poll delta, so a delta-fed consumer
+        // (capture's adapter) never saw them — stash them for the
+        // snapshot so the finish-time reconcile taints their
+        // ops/sites instead of claiming a poll-time census.
+        self.close_candidates = std::mem::take(&mut delta.candidates);
+        // Remap-evidence scan (sol round 3, frozen round 4): for
+        // each close-joined impl, collect M4-remembered (ino,
+        // offset) backings that DIFFER from the joined one. A
+        // first-cell adoption is silent, so it may have outrun an
+        // impl remap (stale record, misattributed) — the old
+        // sites' sets may miss the alias and must revise too.
+        // Reads the ENTRY-FROZEN memory plus the live map (union,
+        // deduped): the final reconcile above may have retired
+        // tables — wiping their cells — and a terminated
+        // retirement is SILENT, so post-reconcile memory alone
+        // would forget the old backing without any taint. There
+        // is deliberately no reliance on "retirement's own global
+        // taint" (that claim was false for the silent shape).
+        // Per-candidate filter + global union, sorted + deduped
+        // for determinism. Only the direct shape is covered.
+        {
+            let mut remembered: Vec<(u64, u64)> = Vec::new();
+            for candidate in &self.close_candidates {
+                let Some(joined) = candidate.backing.as_ref() else {
+                    continue;
+                };
+                let joined_pair = (joined.ino, joined.offset);
+                for (imp, ino, off) in frozen_backings.iter().copied().chain(
+                    self.slot_backing
+                        .iter()
+                        .map(|((_, _, imp), b)| (*imp, b.ino, b.offset)),
+                ) {
+                    if imp == candidate.impl_addr && (ino, off) != joined_pair {
+                        remembered.push((ino, off));
+                    }
+                }
+            }
+            remembered.sort_unstable();
+            remembered.dedup();
+            self.close_remembered = remembered;
+        }
         self.last_links = env.link_counts();
         // Pre-wipe final: every poll's joins plus the close-time
         // tail count, before the recycle wipe below destroys the
@@ -2785,6 +2913,12 @@ fn array_owner(maps: &[maps::Mapping], arr: u64) -> (String, String, u64) {
 /// maps-identity (dual-facet bindings). Spike:
 /// evidence/2026-10-11-h5-spike/.
 pub(crate) fn backing_dev(m: &maps::Mapping) -> String {
+    // Maps fallback (H5 tension, sol round 2): keeps
+    // deleted-but-mapped files trackable, but one file may then
+    // group under two device facets across an unlink. Triple
+    // grouping does not dual-facet (bindings do); consumers that
+    // must survive the flip match (ino, offset) instead (capture's
+    // close reconcile) rather than comparing this string.
     stat_dev_of(&m.path).unwrap_or_else(|| m.dev.clone())
 }
 
@@ -4295,6 +4429,9 @@ mod tests {
         reinstall_calls: u32,
         pin_ok: bool,
         provider_stat: Option<(String, u64)>,
+        /// Scripted ring events, popped in order by `next_event`
+        /// (P6: close-time tail-join tests).
+        events: VecDeque<Vec<u8>>,
     }
 
     impl MiniEnv {
@@ -4315,13 +4452,14 @@ mod tests {
                 reinstall_calls: 0,
                 pin_ok: true,
                 provider_stat: None,
+                events: VecDeque::new(),
             }
         }
     }
 
     impl SessionEnv for MiniEnv {
         fn next_event(&mut self) -> Option<Vec<u8>> {
-            None
+            self.events.pop_front()
         }
 
         fn current_maps(&mut self) -> Option<Vec<maps::Mapping>> {
@@ -5199,6 +5337,364 @@ mod tests {
                 .any(|l| l.source == coverage::HOST_MAPS_READ && l.count == 1 && l.op.is_none()),
             "empty snapshot must be explicit unlocalizable loss: {:?}",
             delta.losses
+        );
+    }
+
+    /// One QUERY_RET ring item (48-byte RowEvent layout):
+    /// op/addr/generation carried, funcid 0.
+    fn query_ret_bytes(op: u32, addr: u64, generation: u64) -> Vec<u8> {
+        let mut b = vec![0u8; 48];
+        b[0..4].copy_from_slice(&wire::KIND_QUERY_RET.to_le_bytes());
+        b[4..8].copy_from_slice(&op.to_le_bytes());
+        b[8..12].copy_from_slice(&0u32.to_le_bytes());
+        b[16..24].copy_from_slice(&addr.to_le_bytes());
+        b[40..48].copy_from_slice(&generation.to_le_bytes());
+        b
+    }
+
+    /// One ROW ring item (48-byte RowEvent layout):
+    /// op/funcid/impl/arr/idx/generation carried.
+    fn row_bytes(
+        op: u32,
+        funcid: u32,
+        impl_addr: u64,
+        arr: u64,
+        idx: u64,
+        generation: u64,
+    ) -> Vec<u8> {
+        let mut b = vec![0u8; 48];
+        b[0..4].copy_from_slice(&wire::KIND_ROW.to_le_bytes());
+        b[4..8].copy_from_slice(&op.to_le_bytes());
+        b[8..12].copy_from_slice(&funcid.to_le_bytes());
+        b[16..24].copy_from_slice(&impl_addr.to_le_bytes());
+        b[24..32].copy_from_slice(&arr.to_le_bytes());
+        b[32..40].copy_from_slice(&idx.to_le_bytes());
+        b[40..48].copy_from_slice(&generation.to_le_bytes());
+        b
+    }
+
+    /// One ALG ring item (40-byte AlgEvent layout, class 0 / OK /
+    /// non-weak): op/arr/idx/generation carried.
+    fn alg_bytes(op: u32, arr: u64, idx: u64, generation: u64) -> Vec<u8> {
+        let mut b = Vec::with_capacity(40);
+        b.extend_from_slice(&wire::KIND_ALG.to_le_bytes());
+        b.extend_from_slice(&op.to_le_bytes());
+        b.extend_from_slice(&0u16.to_le_bytes());
+        b.push(wire::ALG_OK);
+        b.push(0u8);
+        b.extend_from_slice(&0u32.to_le_bytes());
+        b.extend_from_slice(&arr.to_le_bytes());
+        b.extend_from_slice(&idx.to_le_bytes());
+        b.extend_from_slice(&generation.to_le_bytes());
+        b
+    }
+
+    #[test]
+    fn close_joins_ring_tail_instead_of_counting_shortfall() {
+        // P6 §6ii: close() ingests the quiesced ring tail through
+        // the same ingest_one path as poll (bounded) instead of
+        // counting every tail item as drain shortfall. Pre-fix, a
+        // fast-dying target's in-ring wave became shortfall (live
+        // dgst specimen: 193 shortfall, 0 rows, queries kept only
+        // via CALLS); post-fix it joins the snapshot.
+        let mut env = MiniEnv::new();
+        env.maps = vec![lc_mapping(100)];
+        env.events.push_back(query_ret_bytes(12, 0x1000, 0));
+        let mut core = a11_core();
+        let snap = core.close(&mut env).unwrap();
+        assert_eq!(snap.queries_observed, 1, "tail query must join");
+        assert_eq!(snap.queries_by_op, vec![(12u32, 1u64)]);
+        assert_eq!(snap.ops_hit, vec![12u32]);
+        assert!(
+            !snap
+                .losses
+                .iter()
+                .any(|(s, _)| *s == coverage::HOST_DRAIN_SHORTFALL),
+            "joined tail must not count as shortfall: {:?}",
+            snap.losses
+        );
+    }
+
+    #[test]
+    fn close_tail_join_is_bounded_with_residual_shortfall() {
+        // P6 §6ii companion: the close-time join is bounded (one
+        // default poll budget); items past the bound stay honest
+        // shortfall instead of stalling close on a huge tail.
+        let mut env = MiniEnv::new();
+        env.maps = vec![lc_mapping(100)];
+        for _ in 0..PollBudget::default().max_events + 3 {
+            env.events.push_back(query_ret_bytes(12, 0x1000, 0));
+        }
+        let mut core = a11_core();
+        let snap = core.close(&mut env).unwrap();
+        assert_eq!(
+            snap.queries_observed,
+            PollBudget::default().max_events,
+            "close joins exactly one budget of tail"
+        );
+        let short: u64 = snap
+            .losses
+            .iter()
+            .filter(|(s, _)| *s == coverage::HOST_DRAIN_SHORTFALL)
+            .map(|(_, n)| *n)
+            .sum();
+        assert_eq!(short, 3, "residual past the bound stays shortfall");
+    }
+
+    #[test]
+    fn reconcile_blind_first_poll_keeps_stage2_instead_of_terminal_detach() {
+        // P6 §6ii follow-up: a blind session (no successful maps read
+        // yet — last-good itself empty) must not read empty maps as an
+        // unmap. This is the death-during-first-poll race: a 10ms dgst
+        // dies after install but before the first drain poll, whose
+        // empty (zombie) read would terminally detach stage-2
+        // ("stage-2 target unmapped; link detached") even though the
+        // drain's should_stop already owns death.
+        let mut env = MiniEnv::new();
+        let mut core = a11_core();
+        assert!(core.last_good_maps.is_empty(), "precondition: never primed");
+        core.attached_targets.insert(
+            9,
+            (
+                0x1000,
+                "/x/libcrypto.so.3".to_string(),
+                "253:0".to_string(),
+                7,
+            ),
+        );
+        core.attached_queries.insert(9);
+        let mut delta = DiscoveryDelta::default();
+        core.reconcile_anchors(&mut env, &[], &mut delta);
+        assert!(
+            core.attached_targets.contains_key(&9),
+            "blind first poll must not detach stage-2"
+        );
+        assert!(
+            delta.attaches.iter().all(|a| a.failed.is_none()),
+            "no terminal detach signal on empty maps: {:?}",
+            delta.attaches
+        );
+        assert!(
+            env.stage2_detaches.is_empty(),
+            "no detach call issued: {:?}",
+            env.stage2_detaches
+        );
+    }
+
+    #[test]
+    fn reconcile_blind_first_poll_keeps_trips_instead_of_detaching() {
+        // Same class as the stage-2 blind-detach above: trips
+        // installed at attach time must survive a blind first poll
+        // (empty maps carry no unmap information).
+        let mut env = MiniEnv::new();
+        let mut core = a11_core();
+        core.trip_live = true;
+        core.trip_bound = Some(("/x/libcrypto.so.3".to_string(), "253:0".to_string(), 7));
+        let mut delta = DiscoveryDelta::default();
+        core.reconcile_anchors(&mut env, &[], &mut delta);
+        assert!(core.trip_live, "blind first poll must not detach trips");
+        assert_eq!(env.trip_detaches, 0, "no trip detach call issued");
+    }
+
+    #[test]
+    fn close_rebirth_drops_queued_stamp0_with_straggler_loss() {
+        // P6 §6ii sol blocker 1: close reconciles epochs (2→3
+        // rebirth) BEFORE tail ingestion; the previous poll's
+        // bootstrap grace must not survive the retirement. A queued
+        // stamp-0 ALG belongs to the retired incarnation: it drops
+        // with op-localized straggler loss, never attributed to the
+        // replacement.
+        let mut env = MiniEnv::new();
+        env.maps = vec![lc_mapping(100)];
+        env.plan = Some(trip_set(100, &[0x100]));
+        let mut core = a11_core();
+        core.poll(&mut env, a11_budget()).unwrap();
+        // Simulate "last poll bootstrapped gen 2 for array
+        // 0x1500": tracked table at the predecessor fingerprint
+        // (ino 99) + live binding + drain grace.
+        core.table_epochs.insert(
+            (1, 0x1500),
+            TableEpoch {
+                epoch: 0,
+                fingerprint: Some(("08:01".to_string(), 99, 0x1000, 0x2000, 0)),
+            },
+        );
+        core.array_gen.insert(0x1500, 2);
+        core.bootstrap_grace.insert(0x1500);
+        // Queued stamp-0 ALG from the retired incarnation.
+        env.events.push_back(alg_bytes(1, 0x1500, 0, 0));
+        let snap = core.close(&mut env).unwrap();
+        // Precondition: the rebirth happened (2→3, ino 100).
+        assert_eq!(
+            core.array_gen.get(&0x1500),
+            Some(&3),
+            "close must rebirth the replaced array 2→3"
+        );
+        assert!(
+            !core.alg_records.contains_key(&(0x1500, 0)),
+            "retired stamp-0 ALG must not attribute to the replacement"
+        );
+        let stragglers: u64 = snap
+            .losses
+            .iter()
+            .filter(|(s, _)| *s == coverage::HOST_STRAGGLER)
+            .map(|(_, n)| *n)
+            .sum();
+        assert_eq!(stragglers, 1, "dropped stamp-0 must record straggler loss");
+    }
+
+    #[test]
+    fn close_reports_tail_joined_candidates_for_capture_reconcile() {
+        // P6 §6ii sol blocker 2 (discovery half): candidates first
+        // joined (or refreshed) by close's tail ingest never rode a
+        // poll delta, so capture's adapter never saw them. Close
+        // reports them for the finish-time reconcile (taint, never
+        // silent census).
+        let mut env = MiniEnv::new();
+        env.maps = vec![lc_mapping(100)];
+        env.plan = Some(trip_set(100, &[0x100]));
+        let mut core = a11_core();
+        core.poll(&mut env, a11_budget()).unwrap();
+        core.alg_records.insert(
+            (0x1500, 0),
+            ("AES-128-CBC".to_string(), false, "ok".to_string()),
+        );
+        // Novel ROW (new key) arriving only in the close tail.
+        env.events.push_back(row_bytes(1, 0, 0x1600, 0x1500, 0, 0));
+        let snap = core.close(&mut env).unwrap();
+        assert_eq!(
+            snap.close_candidates.len(),
+            1,
+            "close must report its tail-joined candidate"
+        );
+        let c = &snap.close_candidates[0];
+        assert_eq!(c.op, 1);
+        assert_eq!(c.arr, 0x1500);
+        assert_eq!(c.impl_addr, 0x1600);
+        assert!(
+            snap.candidates.iter().any(|k| k.op == 1 && k.arr == 0x1500),
+            "the candidate joins the cumulative set too"
+        );
+    }
+
+    #[test]
+    fn close_reports_remembered_backings_for_joined_impls() {
+        // P6 §6ii sol round-3 remap variant: M4's first-cell arm
+        // silently adopts a close-joined ROW's backing — but the
+        // impl may have remapped since the ROW was queued (the
+        // record is stale, the adoption misattributes it). Close
+        // reports the M4-remembered backings for each joined impl
+        // that DIFFER from the joined backing, so capture can
+        // revise the old sites too (whose sets may miss the
+        // alias). Consistent memory reports nothing.
+        let mut env = MiniEnv::new();
+        env.maps = vec![lc_mapping(100)];
+        env.plan = Some(trip_set(100, &[0x100]));
+        let mut core = a11_core();
+        core.poll(&mut env, a11_budget()).unwrap();
+        // M4 remembers impl 0x1600 under a DIFFERENT backing
+        // (ino 999 — the pre-remap file) for another cell.
+        core.slot_backing.insert(
+            (0x1500, 7, 0x1600),
+            BackingRef {
+                dev: "08:01".to_string(),
+                ino: 999,
+                offset: 0x600,
+            },
+        );
+        // Consistent memory for impl 0x1700 (same backing the ROW
+        // will attribute): reports nothing.
+        core.slot_backing.insert(
+            (0x1500, 8, 0x1700),
+            BackingRef {
+                dev: "08:01".to_string(),
+                ino: 100,
+                offset: 0x700,
+            },
+        );
+        core.alg_records.insert(
+            (0x1500, 0),
+            ("AES-128-CBC".to_string(), false, "ok".to_string()),
+        );
+        core.alg_records.insert(
+            (0x1500, 1),
+            ("AES-128-CBC".to_string(), false, "ok".to_string()),
+        );
+        // Novel ROWs (new keys) arriving only in the close tail.
+        env.events.push_back(row_bytes(1, 0, 0x1600, 0x1500, 0, 0));
+        env.events.push_back(row_bytes(1, 0, 0x1700, 0x1500, 1, 0));
+        let snap = core.close(&mut env).unwrap();
+        assert_eq!(snap.close_candidates.len(), 2);
+        // Only the DIVERGING memory is reported (ino 999); the
+        // consistent one (ino 100) is not.
+        assert_eq!(snap.close_remembered, vec![(999u64, 0x600u64)]);
+    }
+
+    #[test]
+    fn close_remembered_survives_silent_terminated_retirement() {
+        // P6 §6ii sol round-4: a TERMINATED table retires SILENTLY
+        // (no retained reason — it carried no gap) while still
+        // wiping its array's M4 cells. The remap-evidence scan
+        // must therefore read memory FROZEN at close entry
+        // (pre-reconciliation), not the post-reconcile map —
+        // else a queued first-cross-op ROW joining a remapped
+        // impl loses its old backing and the old counted site
+        // never revises. Pins the silence (empty retained
+        // reasons) AND the surviving evidence together.
+        let mut env = MiniEnv::new();
+        env.maps = vec![lc_mapping(100)];
+        env.plan = Some(trip_set(100, &[0x100]));
+        let mut core = a11_core();
+        core.poll(&mut env, a11_budget()).unwrap();
+        // op-1's table at the predecessor fingerprint (ino 99):
+        // close will rebirth it (2→3). Observed + terminated ⟹
+        // the retirement is silent.
+        core.table_epochs.insert(
+            (1, 0x1500),
+            TableEpoch {
+                epoch: 0,
+                fingerprint: Some(("08:01".to_string(), 99, 0x1000, 0x2000, 0)),
+            },
+        );
+        core.array_gen.insert(0x1500, 2);
+        // Observed (a query arrived) + terminated (TERMD proof
+        // names len 0 with nothing walked) ⟹ silent retirement.
+        core.tracker.note_query_ret(1, 0x1500);
+        core.tracker.ingest_termd(&[(0x1500, 1)]);
+        // M4 remembers impl 0x1900 under the OLD backing (ino
+        // 999) — wiped by the rebirth below.
+        core.slot_backing.insert(
+            (0x1500, 7, 0x1900),
+            BackingRef {
+                dev: "08:01".to_string(),
+                ino: 999,
+                offset: 0x600,
+            },
+        );
+        // Queued first op-2 ROW from ANOTHER, unchanged array
+        // for the same impl (novel cell → silent adopt).
+        core.alg_records.insert(
+            (0x1800, 0),
+            ("AES-128-CBC".to_string(), false, "ok".to_string()),
+        );
+        env.events.push_back(row_bytes(2, 0, 0x1900, 0x1800, 0, 0));
+        let snap = core.close(&mut env).unwrap();
+        // Preconditions: the rebirth ran, and it was silent.
+        assert_eq!(
+            core.array_gen.get(&0x1500),
+            Some(&3),
+            "close must rebirth the replaced array 2→3"
+        );
+        assert!(
+            snap.retained_reasons.is_empty(),
+            "terminated retirement must stay silent: {:?}",
+            snap.retained_reasons
+        );
+        assert_eq!(snap.close_candidates.len(), 1);
+        assert_eq!(
+            snap.close_remembered,
+            vec![(999u64, 0x600u64)],
+            "frozen memory must survive the silent wipe"
         );
     }
 

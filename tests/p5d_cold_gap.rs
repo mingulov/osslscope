@@ -18,6 +18,7 @@
 //! Legs: `birth_speed_harvest` (full-run birth reference),
 //! `cold_speed_harvest` (delayed attach), `birth_dgst_harvest`
 //! (fifo-held one-shot — cold-attach infeasible, spawn-only),
+//! `birth_dgst_free_running_rows` (P6 §6ii close-join proof),
 //! `capture_spawn_counts_executions` (P6 counting contract).
 //! Plus one offline unit test (per-op conservation).
 //!
@@ -796,6 +797,123 @@ fn birth_dgst_harvest() {
         "dgst wave must be op 1 x2"
     );
     assert_eq!(rows, 174, "dgst walk must enumerate the same 174 tables");
+    assert!(
+        conservation_ok(&totals),
+        "per-op counts don't sum: {:?} vs {}",
+        totals.queries_by_op,
+        totals.queries_observed
+    );
+}
+
+/// Free-running one-shot rows leg (P6 §6ii close-join proof):
+/// `dgst` on a 64KiB regular file exits ~10ms after release, so its
+/// startup wave is still in the ring at close. Pre-fix, close()
+/// counted the tail as shortfall without joining → 0 rows in 2/7
+/// runs (specimen `drain_shortfall=193`, queries kept via CALLS).
+/// Post-fix, close ingests the tail (bounded) and every run walks
+/// the same 174 tables. Same exact asserts as the fifo leg; the
+/// fifo leg pins the wave independent of death timing, this leg
+/// pins close completeness under real death timing.
+#[test]
+#[ignore = "live lane only (OSSL_P5D_LIVE=1)"]
+fn birth_dgst_free_running_rows() {
+    let Some(object) = gated() else { return };
+    assert_vehicle_pinned();
+    let seq = FIXTURE_SEQ.fetch_add(1, Ordering::SeqCst);
+    let input =
+        std::env::temp_dir().join(format!("p5d-dgstfree-{}-{}.bin", std::process::id(), seq));
+    std::fs::write(&input, vec![0x5Au8; 65536]).unwrap();
+    let argv = [VEHICLE_BIN, "dgst", "-sha256", input.to_str().unwrap()]
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>();
+    let target = RefCell::new(
+        OwnedTarget::spawn_stopped(&argv, WorkloadDest::Null).expect("spawn held-stopped"),
+    );
+    let guard = ChildGuard { target: &target };
+    let table = EnrollmentTable::create("birth-dgstfree");
+    let pid = target.borrow().pid();
+    let cfg = harvest_cfg(pid, object, table.path(), true, Duration::from_millis(500));
+    let on_attached = || {
+        target.borrow_mut().release()?;
+        let exe = format!("/proc/{pid}/exe");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(link) = std::fs::read_link(&exe) {
+                if link.to_string_lossy() == VEHICLE_BIN {
+                    break;
+                }
+            }
+            if Instant::now() > deadline {
+                anyhow::bail!("child {pid} never exec'd {VEHICLE_BIN}");
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        // Then wait for libcrypto mapped OR child death (bounded):
+        // the first drain poll detaches stage-2 TERMINALLY when
+        // bindings are absent, so returning in the loader window
+        // bails the run — luck is not a gate. Post-mortem return
+        // is safe: the drain breaks before polling and close joins
+        // the tail (this leg's whole point).
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if child_dead_noreap(pid) {
+                break;
+            }
+            if let Ok(maps) = std::fs::read_to_string(format!("/proc/{pid}/maps")) {
+                if maps.lines().any(|l| {
+                    l.rsplit_once(' ')
+                        .map(|(_, p)| p)
+                        .unwrap_or("")
+                        .ends_with("libcrypto.so.3")
+                }) {
+                    break;
+                }
+            }
+            if Instant::now() >= deadline {
+                anyhow::bail!("child {pid}: libcrypto.so.3 never mapped while alive");
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        // No mapped-identity gate here (see mapped_libcrypto_ok):
+        // the pid-scoped, file-bound probes prove pinned execution
+        // via the exact-count asserts below, and a 10ms child may
+        // already be a zombie (empty maps) at this point.
+        Ok(())
+    };
+    let should_stop = || child_dead_noreap(pid);
+    let (doc, totals) =
+        harvest::run_detailed(&cfg, &on_attached, &should_stop).expect("dgst-free harvest");
+    guard.require_natural_exit("dgst-free");
+    let _ = std::fs::remove_file(&input);
+    let rows = doc
+        .get("rows")
+        .and_then(|r| r.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    eprintln!(
+        "p5d dgst-free birth: queries_observed={} by_op={:?} rows={} status={:?} reason={:?}",
+        totals.queries_observed,
+        totals.queries_by_op,
+        rows,
+        doc.get("status"),
+        doc.get("reason")
+    );
+    std::fs::write(
+        "/tmp/p5d-dgst-free.json",
+        serde_json::to_string_pretty(&doc).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        totals.queries_observed, 2,
+        "dgst startup wave must be exactly init + fetch"
+    );
+    assert_eq!(
+        totals.queries_by_op,
+        vec![(1u32, 2u64)],
+        "dgst wave must be op 1 x2"
+    );
+    assert_eq!(rows, 174, "close must join the tail: 174 tables every run");
     assert!(
         conservation_ok(&totals),
         "per-op counts don't sum: {:?} vs {}",
