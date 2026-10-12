@@ -26,23 +26,25 @@
 //! while one loop (dispatch walk, as a subprogram) verifies with wide
 //! margin.
 //!
-//! P5a-C1 chain probe: the entry program walks slot j, then tail-calls
-//! the `c_slot` callee (via the `JUMPS` prog-array) to walk slot j+1,
-//! advancing the cursor by 2 per query. The handoff rides the
-//! existing maps (the entry re-inserts its `PENDING_QUERY` record;
-//! the callee takes it and re-derives count from `QUERY_NEXT`) — a
-//! dedicated stash array breaks the classifier's loop-state merging,
-//! and the kernel forbids tail calls from subprograms without BTF.
-//! The slot-walk body is duplicated in entry and callee (a shared
-//! subprogram would nest the loop-calls at depth 2 and blow the
-//! verifier's 1M processed-insn ceiling — observed 2026-10-12);
-//! same honesty rules, only the advance diagonal differs (see
-//! `c_slot`). An unpopulated `JUMPS` slot or a failed re-stash
-//! degrades to the sampler (advance by 1) — the loader populates
-//! before any attach and fails the attach when population fails, so
-//! the fallback is unreachable in practice, and any live fallback
-//! is observable in the doc's rows-per-query ratio (14 chained vs 7
-//! sampled).
+//! P5a chain probe: the entry program walks slot j, then tail-calls
+//! down the `c0..c7` callees (via the `JUMPS` prog-array), hop `i`
+//! walking slot `(norm + i + 1) % 512` — K hops cover K+1 slots per
+//! query (C1: K=1; C2/C4: K=4; C3/C5: K=8). The handoff rides the
+//! existing maps (each hop takes the `PENDING_QUERY` record and
+//! re-derives count from `QUERY_NEXT`, re-stashing for the next
+//! hop) — a dedicated stash array breaks the classifier's
+//! loop-state merging, and the kernel forbids tail calls from
+//! subprograms without BTF. The slot-walk body is duplicated in
+//! the entry and every hop (a shared subprogram would nest the
+//! loop-calls at depth 2 and blow the verifier's 1M processed-insn
+//! ceiling — observed 2026-10-12); same honesty rules, only the
+//! advance diagonal differs per hop (see `def_hop`). A tail/re-stash
+//! failure stops the chain with the advance past the current hop's
+//! slot (C4: holes cut the rate, never the coverage) — the loader
+//! populates every slot before any attach and fails the attach
+//! otherwise, so fall-through is unreachable in practice, and any
+//! live fall-through is observable in the doc's rows-per-query
+//! ratio (7 × slots-per-query).
 //!
 //! T03 honesty: a prefix is never COMPLETE. The walker records
 //! termination proof (`TERMD[arr] = (op, len)`) on reading the
@@ -197,9 +199,11 @@ static ALG_CLASS: HashMap<u64, AlgClassValue> = HashMap::with_max_entries(1024, 
 /// observer-populated discipline.
 #[map]
 static TRIP_CLASS: HashMap<u64, TripClassValue> = HashMap::with_max_entries(64, 0);
-/// Chain jump table (P5a-C1): prog-array, slot 0 = the `c_slot` tail
-/// callee. Populated by the loader before any attach (fail-closed);
-/// 8 slots for the P7 multi-callee protocol. The handoff rides the
+/// Chain jump table (P5a-C1+): prog-array, slot `i` = hop `ci`
+/// (`JUMPS[0]` = `c0`, tailed by the entry; hop `i` tails
+/// `JUMPS[i+1]`; `c7` advances without tailing). Populated by the
+/// loader before any attach (fail-closed); 8 slots bound the P5a
+/// matrix (K ≤ 8) and the P7 multi-callee protocol. The handoff rides the
 /// existing maps (zero new state): the entry re-inserts its
 /// `PENDING_QUERY` record before tailing, and the callee takes it
 /// back and re-derives (count, j+1) from `QUERY_NEXT`. (A dedicated
@@ -600,10 +604,11 @@ fn walk_dispatch(imp: u64, op: u32, arr: u64, j: u64) -> u64 {
 
 /// At query-return walk slot j of the OSSL_ALGORITHM array (index =
 /// per-(thread, array) query count mod 512) plus its dispatch table,
-/// then tail-call the `c_slot` callee for slot j+1 (P5a-C1 chain —
-/// the cursor advances by 2 per query). Short arrays still never walk
-/// past their end: the terminator freezes the counter (entry) or
-/// freezes AT the terminator (callee). OSSL_ALGORITHM = { names,
+/// then tail-call into the `c0..c7` hop chain (P5a chain — K hops
+/// cover K+1 slots per query; the cursor advances past the whole
+/// window). Short arrays still never walk past their end: the
+/// terminator freezes the counter wherever it lands (entry) or
+/// freezes AT the terminator (hop). OSSL_ALGORITHM = { names,
 /// props, impl, desc } @32B.
 ///
 /// T03 honesty: the walker records termination proof (`TERMD`) when
@@ -700,12 +705,12 @@ pub fn query_return(ctx: RetProbeContext) -> u32 {
             generation: gen_of(rv),
         });
     }
-    // Slot walk (P5a-C1: this body is duplicated in `c_slot`
+    // Slot walk (P5a: this body is duplicated in the `c0..c7` hops
     // below — a shared subprogram would nest loop-calls at depth 2
-    // and blow the verifier's 1M processed-insn ceiling, so the two
-    // mains each inline the walk and differ only in the advance
-    // diagonal at the end. Keep the two copies in sync; the P7
-    // protocol subsumes both).
+    // and blow the verifier's 1M processed-insn ceiling, so every
+    // main inlines the walk and differs only in its advance
+    // diagonal. Keep all copies in sync (the hops share one macro);
+    // the P7 protocol subsumes them).
     let base = rv + j * 32;
     let names = unsafe { helpers::bpf_probe_read_user(base as *const u64) };
     let imp = unsafe { helpers::bpf_probe_read_user((base + 16) as *const u64) };
@@ -831,8 +836,8 @@ pub fn query_return(ctx: RetProbeContext) -> u32 {
     0
 }
 
-/// Hand the query to `c_slot` and tail-call it (P5a-C1 entry
-/// diagonal, shared by the full-walk arms above). The handoff is
+/// Hand the query to `c0` and tail-call it (P5a entry diagonal,
+/// shared by the full-walk arms above). The handoff is
 /// the 16-byte `PENDING_QUERY` record the take at the top consumed:
 /// re-insert it here (the callee takes it back) and re-derive
 /// (count, j+1) from `QUERY_NEXT` there — no new maps, no stack
@@ -863,144 +868,285 @@ fn chain_tail(ctx: &RetProbeContext, cookie: u64, pend: PendQuery, key: u128, co
     advance_next(key, count);
 }
 
-/// Chain tail callee (P5a-C1): walks slot j+1 after the entry walked
-/// slot j. NEVER directly attached — reachable only via `JUMPS[0]`
-/// from `query_return`. The handoff is the entry's `PENDING_QUERY`
-/// record (re-inserted before the tail — taken back here); (count,
-/// j+1) re-derive from `QUERY_NEXT`, which the entry has not
-/// advanced yet. The slot-walk body duplicates the entry's (see the
-/// sync note there — a shared subprogram nests loop-calls at depth
-/// 2 and blows the verifier's 1M ceiling); only the advance
-/// diagonal differs: full walks store count+2, a stable skip stores
-/// count+2 past it, the terminator stores count+1 (frozen AT the
-/// terminator — the next query's entry re-reads it once, exactly
-/// like a sampler-frozen terminator), and aborts freeze (no store:
-/// the next query re-walks BOTH slots). The entry tails here
-/// unconditionally, so the lifetime/bound guards live below (entry
-/// scope stays branch-lean for the verifier — see the note there).
-#[uretprobe]
-pub fn c_slot(ctx: RetProbeContext) -> u32 {
-    let rv: u64 = ctx.ret();
-    let cookie = unsafe { helpers::bpf_get_attach_cookie(ctx.as_ptr()) };
-    let pend = match take_key(&PENDING_QUERY, pend_key(cookie)) {
-        Some(v) => v,
-        // No handoff (direct attach — impossible via the loader —
-        // or a clobbered stash): chain nothing.
-        None => return 0,
-    };
-    let op = pend.op as u32;
-    // Lifetime verdict, re-read (same rule as the entry: only an
-    // explicit 0 is cacheable): uncacheable tables sampled slot 0
-    // already, so the callee walks nothing and stores nothing.
-    let cacheable =
-        matches!(unsafe { helpers::bpf_probe_read_user(pend.ns_ptr as *const u32) }, Ok(0));
-    if !cacheable {
-        return 0;
+/// Chain continuation for a mid hop (P5a-C2+): re-stash the
+/// handoff for the next hop and tail into it. Inlined: the kernel
+/// forbids tail calls from subprograms without BTF. Tail/re-stash
+/// failure stores the advance past THIS hop's slot and stops — the
+/// fall-through that makes holes rate-only (C4): later queries'
+/// earlier hops cover the skipped offsets, so coverage stays
+/// contiguous and only the slots/query rate drops.
+#[inline(always)]
+fn hop_chain(
+    ctx: &RetProbeContext,
+    cookie: u64,
+    pend: PendQuery,
+    key: u128,
+    norm: u64,
+    adv: u64,
+    next: u32,
+) {
+    if PENDING_QUERY.insert(pend_key(cookie), pend, 0).is_err() {
+        store_next(key, norm.wrapping_add(adv));
+        return;
     }
-    let tgid = helpers::bpf_get_current_pid_tgid();
-    let key = ((tgid as u128) << 64) | (rv as u128);
-    // The entry has not advanced yet, so this is its count —
-    // mirrored normalization: raw NS_FROZEN (a no_store→cacheable
-    // flip) means the entry walked j=0 (same rule as the entry).
-    let raw = unsafe { QUERY_NEXT.get_ptr(&key).map(|p| *p) };
-    let norm = match raw {
-        Some(c) if c != NS_FROZEN => c,
-        _ => 0,
-    };
-    // Wraparound guard: j+1 == 0 means the entry walked slot 511
-    // (the overrun decider, never chained INTO) — advance past it
-    // like the sampler instead of re-walking slot 0.
-    if norm.wrapping_add(1) % MAX_ALGS == 0 {
-        store_next(key, norm.wrapping_add(1));
-        return 0;
-    }
-    let j = norm.wrapping_add(1) % MAX_ALGS;
-    let count = norm;
-    // Slot-walk copy (see the entry's sync note): identical reads,
-    // proofs, flags, and emissions — only the counter stores below
-    // implement the callee diagonal.
-    let base = rv + j * 32;
-    let names = unsafe { helpers::bpf_probe_read_user(base as *const u64) };
-    let imp = unsafe { helpers::bpf_probe_read_user((base + 16) as *const u64) };
-    let (Ok(names), Ok(imp)) = (names, imp) else {
-        flag_trunc(op, TRUNC_WALK_READ);
-        return 0;
-    };
-    if names == 0 {
-        // Terminator at j+1: proof + freeze AT the terminator
-        // (count+1 — the next query's entry re-reads this slot
-        // once, like a sampler-frozen terminator).
-        record_termd(rv, op, j);
-        store_next(key, count.wrapping_add(1));
-        return 0;
-    }
-    // Overrun guard (mirrors the entry: j == 511 reads slot 512 as
-    // the decider; the entry never chains INTO 512, but the callee
-    // can walk 511 itself when the entry walked 510).
-    if j == MAX_ALGS - 1 {
-        let tail = unsafe { helpers::bpf_probe_read_user((rv + MAX_ALGS * 32) as *const u64) };
-        match tail {
-            Ok(0) => {
-                record_termd(rv, op, MAX_ALGS);
-            }
-            _ => flag_trunc(op, TRUNC_ALGS),
-        }
-    }
-    if imp == 0 {
-        // Stable skip: advance past by 2 (both slots observed).
-        flag_trunc(op, TRUNC_WALK_NOIMP);
-        store_next(key, count.wrapping_add(2));
-        return 0;
-    }
-    let mut name_buf = [0u8; 128];
-    let slice =
-        match unsafe { helpers::bpf_probe_read_user_str_bytes(names as *const u8, &mut name_buf) }
-        {
-            Ok(s) => s,
-            Err(_) => {
-                flag_trunc(op, TRUNC_WALK_NAME);
-                emit_alg(&AlgEvent {
-                    kind: KIND_ALG,
-                    op,
-                    class: OTHER_CLASS,
-                    status: ALG_UNREADABLE,
-                    weak: 0,
-                    _pad: 0,
-                    arr: rv,
-                    idx: j,
-                    generation: gen_of(rv),
-                });
+    unsafe { JUMPS.tail_call(ctx, next) };
+    let _ = take_key(&PENDING_QUERY, pend_key(cookie));
+    store_next(key, norm.wrapping_add(adv));
+}
+
+/// Define one positional chain callee (P5a-C2+). Hop `i` (fn `$name`)
+/// walks slot `(norm + $off) % 512` where `$off = i + 1`, then:
+/// full/skip → advance `norm + $adv` (`$adv = i + 2`, both this hop
+/// and every earlier slot observed); terminator → freeze AT it
+/// (`norm + $off`); abort → freeze with no store (the next query
+/// re-walks the whole window). Mid hops re-stash + tail `JUMPS[$next]`
+/// (`$next = i + 1`); the final hop (`none`) advances without
+/// tailing. NEVER directly attached — reachable only via `JUMPS`.
+/// The slot-walk body duplicates the entry's per hop (see the sync
+/// note there — shared subprograms nest loop-calls at depth 2).
+macro_rules! def_hop {
+    ($name:ident, $off:literal, $adv:literal, $next:literal) => {
+        #[uretprobe]
+        pub fn $name(ctx: RetProbeContext) -> u32 {
+            let rv: u64 = ctx.ret();
+            let cookie = unsafe { helpers::bpf_get_attach_cookie(ctx.as_ptr()) };
+            let pend = match take_key(&PENDING_QUERY, pend_key(cookie)) {
+                Some(v) => v,
+                // No handoff (direct attach — impossible via the
+                // loader — or a clobbered stash): chain nothing.
+                None => return 0,
+            };
+            let op = pend.op as u32;
+            // Lifetime verdict, re-read (only an explicit 0 is
+            // cacheable): uncacheable tables sampled slot 0
+            // already, so this hop walks nothing and stores
+            // nothing — and tails nothing (the sample stands).
+            let cacheable = matches!(
+                unsafe { helpers::bpf_probe_read_user(pend.ns_ptr as *const u32) },
+                Ok(0)
+            );
+            if !cacheable {
                 return 0;
             }
-        };
-    let len = slice.len();
-    let saturated = len == ALG_WINDOW - 1;
-    let v = classify_alg(&name_buf, len, saturated);
-    emit_alg(&AlgEvent {
-        kind: KIND_ALG,
-        op,
-        class: v.class,
-        status: v.status,
-        weak: u8::from(v.weak),
-        _pad: 0,
-        arr: rv,
-        idx: j,
-        generation: gen_of(rv),
-    });
-    match walk_dispatch(imp, op, rv, j) {
-        1 => {
-            flag_trunc(op, TRUNC_DISPATCH);
-            store_next(key, count.wrapping_add(2));
+            let tgid = helpers::bpf_get_current_pid_tgid();
+            let key = ((tgid as u128) << 64) | (rv as u128);
+            // No earlier hop advanced yet, so this is the entry's
+            // count — mirrored normalization (raw NS_FROZEN means
+            // the entry walked j=0).
+            let raw = unsafe { QUERY_NEXT.get_ptr(&key).map(|p| *p) };
+            let norm = match raw {
+                Some(c) if c != NS_FROZEN => c,
+                _ => 0,
+            };
+            // Wraparound guard: slot 0 here means the window crossed
+            // the 512 bound (the previous hop walked 511 and ran
+            // its overrun guard there) — advance past the bound
+            // like the sampler instead of restarting mid-window.
+            if norm.wrapping_add($off) % MAX_ALGS == 0 {
+                store_next(key, norm.wrapping_add($off));
+                return 0;
+            }
+            let j = norm.wrapping_add($off) % MAX_ALGS;
+            let base = rv + j * 32;
+            let names = unsafe { helpers::bpf_probe_read_user(base as *const u64) };
+            let imp = unsafe { helpers::bpf_probe_read_user((base + 16) as *const u64) };
+            let (Ok(names), Ok(imp)) = (names, imp) else {
+                flag_trunc(op, TRUNC_WALK_READ);
+                return 0;
+            };
+            if names == 0 {
+                // Terminator: proof + freeze AT it (the next
+                // query's entry re-reads this slot once).
+                record_termd(rv, op, j);
+                store_next(key, norm.wrapping_add($off));
+                return 0;
+            }
+            // Overrun guard (mirrors the entry: slot 511 reads
+            // slot 512 as the decider).
+            if j == MAX_ALGS - 1 {
+                let tail =
+                    unsafe { helpers::bpf_probe_read_user((rv + MAX_ALGS * 32) as *const u64) };
+                match tail {
+                    Ok(0) => {
+                        record_termd(rv, op, MAX_ALGS);
+                    }
+                    _ => flag_trunc(op, TRUNC_ALGS),
+                }
+            }
+            if imp == 0 {
+                // Stable skip: observed — continue the chain past
+                // it (the advance lands below via the tail path).
+                flag_trunc(op, TRUNC_WALK_NOIMP);
+                hop_chain(&ctx, cookie, pend, key, norm, $adv, $next);
+                return 0;
+            }
+            let mut name_buf = [0u8; 128];
+            let slice = match unsafe {
+                helpers::bpf_probe_read_user_str_bytes(names as *const u8, &mut name_buf)
+            } {
+                Ok(s) => s,
+                Err(_) => {
+                    flag_trunc(op, TRUNC_WALK_NAME);
+                    emit_alg(&AlgEvent {
+                        kind: KIND_ALG,
+                        op,
+                        class: OTHER_CLASS,
+                        status: ALG_UNREADABLE,
+                        weak: 0,
+                        _pad: 0,
+                        arr: rv,
+                        idx: j,
+                        generation: gen_of(rv),
+                    });
+                    return 0;
+                }
+            };
+            let len = slice.len();
+            let saturated = len == ALG_WINDOW - 1;
+            let v = classify_alg(&name_buf, len, saturated);
+            emit_alg(&AlgEvent {
+                kind: KIND_ALG,
+                op,
+                class: v.class,
+                status: v.status,
+                weak: u8::from(v.weak),
+                _pad: 0,
+                arr: rv,
+                idx: j,
+                generation: gen_of(rv),
+            });
+            match walk_dispatch(imp, op, rv, j) {
+                1 => {
+                    flag_trunc(op, TRUNC_DISPATCH);
+                    hop_chain(&ctx, cookie, pend, key, norm, $adv, $next);
+                }
+                0 => {
+                    hop_chain(&ctx, cookie, pend, key, norm, $adv, $next);
+                }
+                _ => {
+                    flag_trunc(op, TRUNC_WALK_READ);
+                }
+            }
+            0
         }
-        0 => {
-            store_next(key, count.wrapping_add(2));
+    };
+    ($name:ident, $off:literal, $adv:literal, none) => {
+        #[uretprobe]
+        pub fn $name(ctx: RetProbeContext) -> u32 {
+            let rv: u64 = ctx.ret();
+            let cookie = unsafe { helpers::bpf_get_attach_cookie(ctx.as_ptr()) };
+            let pend = match take_key(&PENDING_QUERY, pend_key(cookie)) {
+                Some(v) => v,
+                None => return 0,
+            };
+            let op = pend.op as u32;
+            let cacheable = matches!(
+                unsafe { helpers::bpf_probe_read_user(pend.ns_ptr as *const u32) },
+                Ok(0)
+            );
+            if !cacheable {
+                return 0;
+            }
+            let tgid = helpers::bpf_get_current_pid_tgid();
+            let key = ((tgid as u128) << 64) | (rv as u128);
+            let raw = unsafe { QUERY_NEXT.get_ptr(&key).map(|p| *p) };
+            let norm = match raw {
+                Some(c) if c != NS_FROZEN => c,
+                _ => 0,
+            };
+            if norm.wrapping_add($off) % MAX_ALGS == 0 {
+                store_next(key, norm.wrapping_add($off));
+                return 0;
+            }
+            let j = norm.wrapping_add($off) % MAX_ALGS;
+            let base = rv + j * 32;
+            let names = unsafe { helpers::bpf_probe_read_user(base as *const u64) };
+            let imp = unsafe { helpers::bpf_probe_read_user((base + 16) as *const u64) };
+            let (Ok(names), Ok(imp)) = (names, imp) else {
+                flag_trunc(op, TRUNC_WALK_READ);
+                return 0;
+            };
+            if names == 0 {
+                record_termd(rv, op, j);
+                store_next(key, norm.wrapping_add($off));
+                return 0;
+            }
+            if j == MAX_ALGS - 1 {
+                let tail =
+                    unsafe { helpers::bpf_probe_read_user((rv + MAX_ALGS * 32) as *const u64) };
+                match tail {
+                    Ok(0) => {
+                        record_termd(rv, op, MAX_ALGS);
+                    }
+                    _ => flag_trunc(op, TRUNC_ALGS),
+                }
+            }
+            if imp == 0 {
+                flag_trunc(op, TRUNC_WALK_NOIMP);
+                store_next(key, norm.wrapping_add($adv));
+                return 0;
+            }
+            let mut name_buf = [0u8; 128];
+            let slice = match unsafe {
+                helpers::bpf_probe_read_user_str_bytes(names as *const u8, &mut name_buf)
+            } {
+                Ok(s) => s,
+                Err(_) => {
+                    flag_trunc(op, TRUNC_WALK_NAME);
+                    emit_alg(&AlgEvent {
+                        kind: KIND_ALG,
+                        op,
+                        class: OTHER_CLASS,
+                        status: ALG_UNREADABLE,
+                        weak: 0,
+                        _pad: 0,
+                        arr: rv,
+                        idx: j,
+                        generation: gen_of(rv),
+                    });
+                    return 0;
+                }
+            };
+            let len = slice.len();
+            let saturated = len == ALG_WINDOW - 1;
+            let v = classify_alg(&name_buf, len, saturated);
+            emit_alg(&AlgEvent {
+                kind: KIND_ALG,
+                op,
+                class: v.class,
+                status: v.status,
+                weak: u8::from(v.weak),
+                _pad: 0,
+                arr: rv,
+                idx: j,
+                generation: gen_of(rv),
+            });
+            match walk_dispatch(imp, op, rv, j) {
+                1 => {
+                    flag_trunc(op, TRUNC_DISPATCH);
+                    store_next(key, norm.wrapping_add($adv));
+                }
+                0 => {
+                    store_next(key, norm.wrapping_add($adv));
+                }
+                _ => {
+                    flag_trunc(op, TRUNC_WALK_READ);
+                }
+            }
+            0
         }
-        _ => {
-            flag_trunc(op, TRUNC_WALK_READ);
-        }
-    }
-    0
+    };
 }
+
+def_hop!(c0, 1, 2, 1);
+def_hop!(c1, 2, 3, 2);
+def_hop!(c2, 3, 4, 3);
+def_hop!(c3, 4, 5, 4);
+def_hop!(c4, 5, 6, 5);
+def_hop!(c5, 6, 7, 6);
+def_hop!(c6, 7, 8, 7);
+def_hop!(c7, 8, 9, none);
+
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {

@@ -298,8 +298,10 @@ fn c1_two_slots_per_query() {
     );
 }
 
-/// Frozen-shape extension for the C probe: the jump table
-/// (prog-array) + the tail callee. No handoff map: the chain rides
+/// Frozen-shape extension for the C1 probe: the jump table
+/// (prog-array) + the first-hop callee (`c0` — renamed from `c_slot`
+/// when the chain grew to eight hops in C2–C5; the eight-callee
+/// shape lives in the scale file). No handoff map: the chain rides
 /// `PENDING_QUERY` + `QUERY_NEXT` (a dedicated 72-byte `CURSOR` was
 /// prototyped and rejected — stash materialization breaks the
 /// classifier's loop-state merging and the kernel forbids tail calls
@@ -329,7 +331,7 @@ fn c1_frozen_shape_has_chain_support() {
     let progs = osslscope::loader::HARVEST_PROGS;
     let callee = progs
         .iter()
-        .find(|p| p.name == "c_slot")
-        .expect("HARVEST_PROGS carries c_slot");
+        .find(|p| p.name == "c0")
+        .expect("HARVEST_PROGS carries c0");
     assert_eq!(callee.section, "uretprobe");
 }
