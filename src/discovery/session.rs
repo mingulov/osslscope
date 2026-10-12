@@ -545,7 +545,16 @@ pub trait SessionEnv {
     /// anchor is unresolvable (the core latches blind and retries
     /// on fingerprint change); an `InvalidData` error is a
     /// transient file race (retry next poll, no latch).
+    /// H10: unmapped-but-present installs kernel-pending on the
+    /// current file (no maps entry to compare); only a missing
+    /// file stays a retry.
     fn reinstall_dispatch(&mut self) -> anyhow::Result<DispatchReinstall>;
+    /// Current (rendered dev, ino) of the provider-path file
+    /// (H10): the pending re-resolve compares stat-vs-stat
+    /// against the bound identity (H5 single-domain — the maps
+    /// dev-string is never compared). `None` when the file is
+    /// unstatable (retained quietly — absence of evidence).
+    fn provider_stat(&self) -> Option<(String, u64)>;
 }
 
 /// Pid recycle mid-observation: carries the discarded-state
@@ -821,6 +830,13 @@ pub struct SessionCore {
     dispatch_live: bool,
     /// Provider (path, dev, ino) the live dispatch links pin.
     dispatch_bound: Option<(String, String, u64)>,
+    /// Whether the bound provider file was ever observed mapped
+    /// (H10): distinguishes PENDING (never mapped → retain the
+    /// kernel-pending links across unmapped polls) from GONE (was
+    /// mapped, now unmapped → detach). Set on the first poll whose
+    /// maps carry the bound triple; cleared only by pid recycle (a
+    /// new process restarts the distinction).
+    dispatch_ever_mapped: bool,
     /// Bootstrap-original provider binding (H6): the identity
     /// pinned at attach, NEVER refreshed by reinstall (which
     /// updates `dispatch_bound` only). The file-provider
@@ -896,6 +912,7 @@ impl SessionCore {
             trigger_observed: false,
             dispatch_live: false,
             dispatch_bound: None,
+            dispatch_ever_mapped: false,
             bootstrap_binding: None,
             dispatch_blind: false,
             dispatch_blind_print: None,
@@ -1329,6 +1346,7 @@ impl SessionCore {
         self.retry_stage2.clear();
         self.dispatch_live = false;
         self.dispatch_bound = None;
+        self.dispatch_ever_mapped = false;
         self.dispatch_blind = false;
         self.dispatch_blind_print = None;
         self.stashed = None;
@@ -1405,10 +1423,31 @@ impl SessionCore {
         }
         if self.dispatch_live
             && let Some((path, dev, ino)) = &self.dispatch_bound
-            && !bindings_alive(maps, &stat_devs, path, dev, *ino)
         {
-            env.detach_dispatch_anchors();
-            self.dispatch_live = false;
+            if bindings_alive(maps, &stat_devs, path, dev, *ino) {
+                // ARMED (or still armed): the bound file is mapped.
+                self.dispatch_ever_mapped = true;
+            } else if self.dispatch_ever_mapped {
+                // GONE: was mapped, now unmapped (dlclose) — detach
+                // (A11 behavior preserved).
+                env.detach_dispatch_anchors();
+                self.dispatch_live = false;
+            } else {
+                // H10 PENDING: never observed mapped — retain the
+                // kernel-pending links (they arm on first map).
+                // Re-resolve the path per poll: a replace-before-map
+                // must not leave links on A while the path serves B
+                // (stat-vs-stat, H5 single-domain). Unstatable →
+                // retained quietly (absence of evidence).
+                match env.provider_stat() {
+                    Some((cur_dev, cur_ino)) if cur_dev == *dev && cur_ino == *ino => {}
+                    Some(_) => {
+                        env.detach_dispatch_anchors();
+                        self.dispatch_live = false;
+                    }
+                    None => {}
+                }
+            }
         }
         // Stage-2 targets whose backing vanished: detach and forget
         // (dead links never count as live coverage). Unlike the
@@ -3388,6 +3427,12 @@ impl SessionEnv for LiveEnv {
         self.links.counts()
     }
 
+    fn provider_stat(&self) -> Option<(String, u64)> {
+        use std::os::unix::fs::MetadataExt as _;
+        let md = std::fs::metadata(&self.provider).ok()?;
+        Some((crate::plan::render_device(md.dev()), md.ino()))
+    }
+
     fn detach_trips(&mut self) {
         // The whole tripwire plane, including the legacy-init
         // pairs installed with the batch (Init links carrying the
@@ -3430,8 +3475,11 @@ impl SessionEnv for LiveEnv {
         let prov_path = self.provider.to_string_lossy().into_owned();
         let entry = live
             .iter()
-            .find(|m| m.path == prov_path || m.path == self.canon)
-            .context("provider unmapped")?;
+            .find(|m| m.path == prov_path || m.path == self.canon);
+        // H10: unmapped-but-present installs kernel-pending on the
+        // current file (no maps entry to compare — the pin IS the
+        // binding; the spike proved the kernel accepts this and
+        // arms on first map). Only a missing file stays a retry.
         let pin = crate::plan::resolve_pinned_retry(|| crate::plan::resolve_pinned(&prov_path))
             .map_err(|e| {
                 std::io::Error::new(
@@ -3447,8 +3495,10 @@ impl SessionEnv for LiveEnv {
         // (btrfs/overlay diverge it from stat — a same-ino
         // x-device swap at one path is the accepted residual,
         // same as schema.rs). Mismatch is a transient race
-        // (InvalidData, retry next poll).
-        if bound.ino != entry.ino {
+        // (InvalidData, retry next poll). No maps entry (H10
+        // pending) skips the compare — there is nothing mapped
+        // to contradict the pin.
+        if entry.as_ref().is_some_and(|e| bound.ino != e.ino) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("provider {prov_path} changed during reinstall"),
@@ -3915,6 +3965,7 @@ mod tests {
         reinstall_script: VecDeque<anyhow::Result<DispatchReinstall>>,
         reinstall_calls: u32,
         pin_ok: bool,
+        provider_stat: Option<(String, u64)>,
     }
 
     impl MiniEnv {
@@ -3934,6 +3985,7 @@ mod tests {
                 reinstall_script: VecDeque::new(),
                 reinstall_calls: 0,
                 pin_ok: true,
+                provider_stat: None,
             }
         }
     }
@@ -4032,6 +4084,10 @@ mod tests {
             self.reinstall_script
                 .pop_front()
                 .unwrap_or_else(|| Err(anyhow::anyhow!("no reinstall scripted")))
+        }
+
+        fn provider_stat(&self) -> Option<(String, u64)> {
+            self.provider_stat.clone()
         }
     }
 
@@ -4375,6 +4431,110 @@ mod tests {
         assert_eq!(env.reinstall_calls, 2);
         assert!(core.dispatch_live);
         assert!(core.snapshot().dispatch.attached);
+    }
+
+    #[test]
+    fn h10_t1_pending_anchor_retained_across_unmapped_polls() {
+        // T1 (RED): configured provider never mapped → the
+        // kernel-pending links are RETAINED across unmapped polls
+        // (zero detaches, stays live, no reinstall, no blind
+        // latch); then mapped → still live, still zero detaches.
+        // (No A11 test asserted pending detach — both dispatch
+        // tests start mapped — so nothing flips.)
+        let mut env = MiniEnv::new();
+        env.maps = Vec::new();
+        env.provider_stat = Some(("08:01".to_string(), 50));
+        let mut core = a11_core();
+        core.dispatch_bound = Some(("/p/provider.so".to_string(), "08:01".to_string(), 50));
+        core.dispatch_live = true;
+        for _ in 0..3 {
+            core.poll(&mut env, a11_budget()).unwrap();
+        }
+        assert_eq!(env.dispatch_detaches, 0, "pending links retained");
+        assert!(core.dispatch_live, "pending stays live");
+        assert_eq!(env.reinstall_calls, 0, "no reinstall while pending");
+        assert!(!core.dispatch_blind, "no blind latch while pending");
+        env.maps = vec![prov_mapping(50, 0x1000)];
+        core.poll(&mut env, a11_budget()).unwrap();
+        assert!(core.dispatch_live, "armed stays live");
+        assert_eq!(env.dispatch_detaches, 0, "map-in detaches nothing");
+    }
+
+    #[test]
+    fn h10_t2_mapped_then_unmapped_detaches() {
+        // T2 (RED): GONE preserved — mapped (armed) then unmapped
+        // (dlclose) detaches exactly once.
+        let mut env = MiniEnv::new();
+        env.maps = vec![prov_mapping(50, 0x1000)];
+        env.provider_stat = Some(("08:01".to_string(), 50));
+        let mut core = a11_core();
+        core.dispatch_bound = Some(("/p/provider.so".to_string(), "08:01".to_string(), 50));
+        core.dispatch_live = true;
+        core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(env.dispatch_detaches, 0);
+        env.maps = Vec::new();
+        core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(env.dispatch_detaches, 1, "gone detaches once");
+        assert!(!core.dispatch_live);
+    }
+
+    #[test]
+    fn h10_t3_replace_before_map_reinstalls_on_new_inode() {
+        // T3: pending links pin inode 50; the path is replaced
+        // (stat now 60) before any map → detach the stale pin +
+        // reinstall on the current file (same poll), still
+        // never-mapped (a later map arms the NEW links).
+        let mut env = MiniEnv::new();
+        env.maps = Vec::new();
+        env.provider_stat = Some(("08:01".to_string(), 60));
+        env.reinstall_script.push_back(Ok(DispatchReinstall {
+            binding: ("/p/provider.so".to_string(), "08:01".to_string(), 60),
+            resolution: None,
+        }));
+        let mut core = a11_core();
+        core.dispatch_bound = Some(("/p/provider.so".to_string(), "08:01".to_string(), 50));
+        core.dispatch_live = true;
+        core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(env.dispatch_detaches, 1, "stale pin detaches");
+        assert_eq!(env.reinstall_calls, 1, "reinstall on current file");
+        assert!(core.dispatch_live, "pending again on inode 60");
+        assert_eq!(
+            core.dispatch_bound,
+            Some(("/p/provider.so".to_string(), "08:01".to_string(), 60))
+        );
+        assert!(!core.dispatch_ever_mapped, "still never mapped");
+        // The new links arm when the new file maps.
+        env.maps = vec![prov_mapping(60, 0x1000)];
+        core.poll(&mut env, a11_budget()).unwrap();
+        assert!(core.dispatch_live);
+        assert_eq!(env.dispatch_detaches, 1, "map-in detaches nothing");
+    }
+
+    #[test]
+    fn h10_t4_unconfigured_map_installs_nothing() {
+        // T4 (core half): a dlopen the session never configured
+        // installs no dispatch anchors — the stranger's map-in
+        // changes nothing (still pending on the configured file;
+        // PARTIAL verdict pinned by the live leg).
+        let mut env = MiniEnv::new();
+        env.maps = vec![maps::Mapping {
+            start: 0x5000,
+            end: 0x6000,
+            x: true,
+            offset: 0,
+            dev: "08:01".to_string(),
+            ino: 70,
+            path: "/p/stranger.so".to_string(),
+        }];
+        env.provider_stat = Some(("08:01".to_string(), 50));
+        let mut core = a11_core();
+        core.dispatch_bound = Some(("/p/provider.so".to_string(), "08:01".to_string(), 50));
+        core.dispatch_live = true;
+        core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(env.dispatch_detaches, 0);
+        assert_eq!(env.reinstall_calls, 0, "stranger triggers no install");
+        assert!(core.dispatch_live, "still pending on configured file");
+        assert!(!core.dispatch_ever_mapped, "stranger is not our map");
     }
 
     #[test]
