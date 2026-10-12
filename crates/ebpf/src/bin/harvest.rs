@@ -330,8 +330,13 @@ fn lookup_trip(h: u64) -> Option<TripClassValue> {
 }
 
 /// Algorithm classification as a BPF subprogram (separate
-/// verification scope, like the dispatch walk below).
+/// verification scope, like the dispatch walk below). Global
+/// (`no_mangle`): same-section local→local calls are pre-resolved by
+/// the toolchain WITHOUT relocs, which the fail-closed loader
+/// rejects (F-BPF-1: callee must be global or inlined) — and
+/// `walk_slot` calls this from the same `.text` section.
 #[inline(never)]
+#[no_mangle]
 fn classify_alg(
     buf: &[u8; ALG_WINDOW],
     len: usize,
@@ -583,7 +588,11 @@ pub fn query_entry(ctx: ProbeContext) -> u32 {
 /// table runs past MAX_DISPATCH without a terminator (TRUNC).
 /// Returns 0 (terminator), 1 (overflow), or 2 (read abort — the
 /// caller freezes the counter so the next query re-walks).
+/// Global (`no_mangle`): same-section local→local calls carry no
+/// reloc and the loader rejects them (F-BPF-1) — `walk_slot` calls
+/// this from the same `.text` section.
 #[inline(never)]
+#[no_mangle]
 fn walk_dispatch(imp: u64, op: u32, arr: u64, j: u64) -> u64 {
     for k in 0..MAX_DISPATCH {
         let base = imp + k * 16;
