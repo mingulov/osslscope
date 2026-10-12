@@ -3692,13 +3692,16 @@ fn stale_path_fingerprint_is_unverified() {
     let bytes_new = flipped_build_id(&bytes_old);
     let staged = stage.write("prov.so", &bytes_old);
     let dev = plan::render_device(staged.device);
-    // Replacement: same path, new inode.
+    // Replacement: same path, new inode — via create-then-rename
+    // (never remove-then-recreate: freed inodes are reused
+    // immediately on some filesystems — observed in CI).
     use std::os::unix::fs::MetadataExt as _;
     let path = PathBuf::from(&staged.path);
-    std::fs::remove_file(&path).unwrap();
-    std::fs::write(&path, &bytes_new).unwrap();
-    let meta_new = std::fs::metadata(&path).unwrap();
+    let tmp = path.with_extension("swap");
+    std::fs::write(&tmp, &bytes_new).unwrap();
+    let meta_new = std::fs::metadata(&tmp).unwrap();
     assert_ne!(meta_new.ino(), staged.ino);
+    std::fs::rename(&tmp, &path).unwrap();
     // Round artifacts: maps still show the old file (the VMA pins
     // it), files were read after the replacement.
     let live = vec![mapping(&staged)];

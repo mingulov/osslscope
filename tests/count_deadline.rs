@@ -451,8 +451,12 @@ impl CountBackend for SwapBackend {
         cookies: &[u64],
     ) -> (Vec<FakeLink>, Vec<usize>) {
         if let Some((p, bytes)) = self.swap.borrow_mut().take() {
-            std::fs::remove_file(&p).unwrap();
-            std::fs::write(&p, &bytes).unwrap();
+            // Create-then-rename (never remove-then-recreate:
+            // freed inodes are reused immediately on some
+            // filesystems — observed in CI).
+            let tmp = p.with_extension("swap");
+            std::fs::write(&tmp, &bytes).unwrap();
+            std::fs::rename(&tmp, &p).unwrap();
         }
         self.inner.attach(path, offsets, cookies)
     }
@@ -507,8 +511,12 @@ fn h4_t4_rejected_resolve_attaches_nothing_drains_empty() {
         },
     )]);
     // Replace BEFORE attach (new inode; planned identity stale).
-    std::fs::remove_file(&a.path).unwrap();
-    std::fs::write(&a.path, &bytes).unwrap();
+    // Replace via create-then-rename: two coexisting files never
+    // share an ino, so the new identity holds even on filesystems
+    // that immediately reuse a freed inode (observed in CI).
+    let swap = stage.write("prov.swap", &bytes);
+    assert_ne!(swap.ino, a.ino);
+    std::fs::rename(&swap.path, &a.path).unwrap();
     let mut s = session_with(FakeCountBackend::new());
     let d = CountDelta {
         discovered: vec![site(&a, off, 7)],
@@ -673,8 +681,12 @@ fn h4_unbound_cookie_hits_route_unattributed() {
         },
     )]);
     // Stale plan: nothing binds (H4-T4 shape).
-    std::fs::remove_file(&a.path).unwrap();
-    std::fs::write(&a.path, &bytes).unwrap();
+    // Replace via create-then-rename: two coexisting files never
+    // share an ino, so the new identity holds even on filesystems
+    // that immediately reuse a freed inode (observed in CI).
+    let swap = stage.write("prov.swap", &bytes);
+    assert_ne!(swap.ino, a.ino);
+    std::fs::rename(&swap.path, &a.path).unwrap();
     let mut s = session_with(FakeCountBackend::new());
     let d = CountDelta {
         discovered: vec![site(&a, off, 7)],
@@ -743,8 +755,12 @@ fn h4_stale_plan_misses_replaced_per_attempt() {
     let off = x_offsets(&bytes, 1)[0];
     let a = stage.write("prov.so", &bytes);
     // Replace before any attach: the plan below is born stale.
-    std::fs::remove_file(&a.path).unwrap();
-    std::fs::write(&a.path, &bytes).unwrap();
+    // Replace via create-then-rename: two coexisting files never
+    // share an ino, so the new identity holds even on filesystems
+    // that immediately reuse a freed inode (observed in CI).
+    let swap = stage.write("prov.swap", &bytes);
+    assert_ne!(swap.ino, a.ino);
+    std::fs::rename(&swap.path, &a.path).unwrap();
     let meta = std::fs::metadata(&a.path).unwrap();
     let b = Staged {
         path: a.path.clone(),
@@ -829,8 +845,12 @@ fn h4_stale_retries_count_missed_once_each() {
         },
     )]);
     // Born-stale plan (replace before any attach).
-    std::fs::remove_file(&a.path).unwrap();
-    std::fs::write(&a.path, &bytes).unwrap();
+    // Replace via create-then-rename: two coexisting files never
+    // share an ino, so the new identity holds even on filesystems
+    // that immediately reuse a freed inode (observed in CI).
+    let swap = stage.write("prov.swap", &bytes);
+    assert_ne!(swap.ino, a.ino);
+    std::fs::rename(&swap.path, &a.path).unwrap();
     let mut s = session_with(FakeCountBackend::new());
     let d = CountDelta {
         discovered: vec![site(&a, off, 7)],

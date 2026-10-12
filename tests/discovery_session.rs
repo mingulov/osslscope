@@ -1386,10 +1386,13 @@ fn stage2_reattach_on_same_path_replacement() {
     assert_eq!(env.stage2[0].3, Some((meta1.dev(), meta1.ino())));
     // Replace the path (new inode, same path); the target remaps
     // the new file at the same address (same offset).
-    std::fs::remove_file(&prov).unwrap();
-    std::fs::write(&prov, b"v2-longer").unwrap();
-    let ino2 = std::fs::metadata(&prov).unwrap().ino();
+    // Create-then-rename (never remove-then-recreate: freed inodes
+    // are reused immediately on some filesystems — observed in CI).
+    let tmp = dir.join("idprov.so.tmp");
+    std::fs::write(&tmp, b"v2-longer").unwrap();
+    let ino2 = std::fs::metadata(&tmp).unwrap().ino();
     assert_ne!(ino2, ino1);
+    std::fs::rename(&tmp, &prov).unwrap();
     env.maps = vec![mapping(0x7f00_0000, 0x10000, true, 0, "08:01", ino2, &exe)];
     env.push(enc_init(0x7f00_3000, 0));
     let d = core.poll(&mut env, ample_budget()).unwrap();
