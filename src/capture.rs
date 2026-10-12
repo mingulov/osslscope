@@ -1052,21 +1052,52 @@ fn classify_loss(source: u32, count: u64) -> GapCounter {
 /// yields build-id — without the VMA pinning its inode, the bytes
 /// are unprovable (the display locator survives on the record as a
 /// hint, never as identity).
+/// Memoized build-id reads (P6): one ELF parse per bound file per
+/// adapt call. The parse closure runs at most once per (path, dev,
+/// ino) identity (absence caches too); a same-path replacement
+/// carries a new inode, so it re-parses. The cache is call-local
+/// (fresh per adapt_delta) and adds no persistence beyond the byte
+/// cache: it inherits `files`-map freshness — an in-place rewrite
+/// that keeps (dev, ino) keeps serving the previously read bytes
+/// (read_relevant_files reuses cache hits across polls), so its
+/// ids stay exactly as stale as those bytes. Within one immutable
+/// `files` map, every result is exact.
+type BuildIdCache = HashMap<(String, u64, u64), Option<String>>;
+
+fn cached_build_id(
+    cache: &mut BuildIdCache,
+    path: &str,
+    dev: u64,
+    ino: u64,
+    parse: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    if let Some(hit) = cache.get(&(path.to_owned(), dev, ino)) {
+        return hit.clone();
+    }
+    let id = parse();
+    cache.insert((path.to_owned(), dev, ino), id.clone());
+    id
+}
+
 fn object_id_for_mapping(
     dev: &str,
     ino: u64,
     live: &[maps::Mapping],
     files: &HashMap<String, plan::FileBytes>,
+    build_ids: &mut BuildIdCache,
 ) -> ObjectId {
     // H5: `dev` is stat-domain (BackingRef via H5-T1) — maps
     // text never joins identity. Ino-prefilter, then bind each
     // same-ino mapping's bytes against the full identity; the
     // first bound mapping wins (live order, deterministic).
     let bid = plan::device_id_of_dev_str(dev).and_then(|want| {
-        live.iter()
+        let (path, bytes) = live
+            .iter()
             .filter(|m| m.ino != 0 && m.ino == ino)
-            .find_map(|m| plan::bound_bytes(files, &m.path, want, ino))
-            .and_then(elf::read_build_id)
+            .find_map(|m| {
+                plan::bound_bytes(files, &m.path, want, ino).map(|b| (m.path.clone(), b))
+            })?;
+        cached_build_id(build_ids, &path, want, ino, || elf::read_build_id(bytes))
     });
     match bid {
         Some(id) => ObjectId(format!("build:{id}")),
@@ -1080,6 +1111,7 @@ fn advertising_object_id(
     candidate: &DiscoveredCandidate,
     live: &[maps::Mapping],
     files: &HashMap<String, plan::FileBytes>,
+    build_ids: &mut BuildIdCache,
 ) -> ObjectId {
     if candidate.advertising.is_empty() {
         return ObjectId("unverified-advertising:anonymous".to_string());
@@ -1112,8 +1144,12 @@ fn advertising_object_id(
     {
         return ObjectId("unverified-advertising:anonymous".to_string());
     }
-    let bid = plan::bound_bytes(files, &m.path, want, candidate.advertising_ino)
-        .and_then(elf::read_build_id);
+    let bid = match plan::bound_bytes(files, &m.path, want, candidate.advertising_ino) {
+        Some(bytes) => cached_build_id(build_ids, &m.path, want, candidate.advertising_ino, || {
+            elf::read_build_id(bytes)
+        }),
+        None => None,
+    };
     match bid {
         Some(id) => ObjectId(format!("build:{id}")),
         // Mapping-bound opaque identity (D3/H5/B-5): binds the
@@ -1368,6 +1404,9 @@ pub fn adapt_delta(
     let seq = state.poll_seq;
     let mut count_losses = Vec::new();
     let mut activity = Vec::new();
+    // P6: call-local build-id memoization (one ELF parse per bound
+    // file per delta — see BuildIdCache).
+    let mut build_ids: BuildIdCache = HashMap::new();
 
     // D4: every discovery loss stays Loss, forwarded exactly once.
     // A7: loss also taints completeness claims — op-localized
@@ -1544,7 +1583,7 @@ pub fn adapt_delta(
         } else {
             candidate.class.clone()
         };
-        let advertising = advertising_object_id(candidate, ctx.live, ctx.files);
+        let advertising = advertising_object_id(candidate, ctx.live, ctx.files, &mut build_ids);
         // B-5 registry: the advertising id is a nameable ref
         // (candidates[].provider), so it registers HERE at
         // construction — an advertising-only provider (no D2
@@ -1701,7 +1740,7 @@ pub fn adapt_delta(
             CandidateCoverage::Complete
         };
         let site_key = SiteKey {
-            object: object_id_for_mapping(&dev_str, ino, ctx.live, ctx.files),
+            object: object_id_for_mapping(&dev_str, ino, ctx.live, ctx.files, &mut build_ids),
             device,
             inode: ino,
             offset,
@@ -1806,7 +1845,8 @@ pub fn adapt_delta(
         // B-5: the id computes BEFORE the registry check — one
         // file under two ids (`build:` + `unverified:`)
         // registers both records, never just the first.
-        let id = object_id_for_mapping(&object.dev, object.ino, ctx.live, ctx.files);
+        let id =
+            object_id_for_mapping(&object.dev, object.ino, ctx.live, ctx.files, &mut build_ids);
         if !state
             .seen_objects
             .insert((object.dev.clone(), object.ino, id.0.clone()))
@@ -4476,6 +4516,50 @@ mod tests {
         AttachEvent, AttachKind, BackingRef, DiscoveredCandidate, DiscoveredObject, TableCoverage,
         TableRetirement,
     };
+
+    #[test]
+    fn build_id_cache_parses_once_per_identity() {
+        // P6: one goblin parse per bound file per adapt call — the
+        // uncached helpers re-parsed multi-MB files per candidate
+        // AND per group (1658 parses ≈ 10s stalled one apply_delta,
+        // landing count attach after the child exited). The parse
+        // closure runs once per (path, dev, ino); absence (None)
+        // caches too; distinct identities re-parse.
+        use std::cell::Cell;
+        let calls = Cell::new(0u32);
+        let mut cache: BuildIdCache = HashMap::new();
+        let r1 = cached_build_id(&mut cache, "/lib/x.so", 8, 100, || {
+            calls.set(calls.get() + 1);
+            Some("aa".to_string())
+        });
+        let r2 = cached_build_id(&mut cache, "/lib/x.so", 8, 100, || {
+            calls.set(calls.get() + 1);
+            Some("bb".to_string())
+        });
+        assert_eq!(r1, Some("aa".to_string()));
+        assert_eq!(
+            r2,
+            Some("aa".to_string()),
+            "second resolve must hit the cache"
+        );
+        assert_eq!(calls.get(), 1, "same identity parses once");
+        let r3 = cached_build_id(&mut cache, "/lib/y.so", 8, 101, || {
+            calls.set(calls.get() + 1);
+            Some("cc".to_string())
+        });
+        assert_eq!(r3, Some("cc".to_string()));
+        assert_eq!(calls.get(), 2, "distinct identity re-parses");
+        let r4: Option<String> = cached_build_id(&mut cache, "/lib/z.so", 8, 102, || {
+            calls.set(calls.get() + 1);
+            None
+        });
+        let r5: Option<String> = cached_build_id(&mut cache, "/lib/z.so", 8, 102, || {
+            calls.set(calls.get() + 1);
+            Some("zz".to_string())
+        });
+        assert_eq!((r4, r5), (None, None), "absence caches too");
+        assert_eq!(calls.get(), 3);
+    }
 
     #[test]
     fn ppid_parse_tricky_comm() {
