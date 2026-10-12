@@ -162,10 +162,14 @@ mod tests {
         // Sanity: v1 resolves while it is the current file.
         assert!(provider_mapping(&m, &path, "", 0x7f2a2400).is_some());
         // Replace the path with v2 bytes (new inode, same path).
-        std::fs::remove_file(&path).unwrap();
-        std::fs::write(&path, b"v2-bytes-longer").unwrap();
-        let meta2 = std::fs::metadata(&path).unwrap();
+        // Create-then-rename (never remove-then-recreate: some
+        // filesystems immediately reuse the freed inode, which
+        // would make v2's inode equal v1's — observed in CI).
+        let tmp = dir.join("idprov.so.tmp");
+        std::fs::write(&tmp, b"v2-bytes-longer").unwrap();
+        let meta2 = std::fs::metadata(&tmp).unwrap();
         assert_ne!(meta2.ino(), meta1.ino());
+        std::fs::rename(&tmp, &path).unwrap();
         // The old mapping still matches BY PATHNAME, but it backs
         // v1 bytes, not the current file: fail closed, never
         // misattribute the stale bytes as the new provider.
