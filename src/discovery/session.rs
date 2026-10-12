@@ -1891,13 +1891,19 @@ impl SessionCore {
                     self.dispatch_blind = false;
                     self.resolution = fresh.resolution;
                     self.preset_reason = None;
+                    // H10: a pending re-resolve (never mapped in
+                    // this pid) is provably lossless — no events
+                    // could have fired on either inode — so it
+                    // carries no continuity caveat. Only a
+                    // post-map replacement keeps the caveat.
+                    let failed = self.dispatch_ever_mapped.then(|| {
+                        "dispatch anchors re-established after replacement; \
+                         continuity unproven"
+                            .to_string()
+                    });
                     delta.attaches.push(AttachEvent {
                         kind: AttachKind::DispatchAnchors { count: 2 },
-                        failed: Some(
-                            "dispatch anchors re-established after replacement; \
-                             continuity unproven"
-                                .to_string(),
-                        ),
+                        failed,
                     });
                 }
             }
@@ -4494,9 +4500,16 @@ mod tests {
         let mut core = a11_core();
         core.dispatch_bound = Some(("/p/provider.so".to_string(), "08:01".to_string(), 50));
         core.dispatch_live = true;
-        core.poll(&mut env, a11_budget()).unwrap();
+        let delta = core.poll(&mut env, a11_budget()).unwrap();
         assert_eq!(env.dispatch_detaches, 1, "stale pin detaches");
         assert_eq!(env.reinstall_calls, 1, "reinstall on current file");
+        // Pending replace is provably lossless (nothing was ever
+        // mapped in this pid): no continuity caveat rides along.
+        assert!(
+            delta.attaches.iter().all(|a| a.failed.is_none()),
+            "pending re-resolve carries no failure: {:?}",
+            delta.attaches
+        );
         assert!(core.dispatch_live, "pending again on inode 60");
         assert_eq!(
             core.dispatch_bound,
