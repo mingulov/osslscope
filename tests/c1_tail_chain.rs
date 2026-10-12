@@ -300,7 +300,11 @@ fn c1_two_slots_per_query() {
 }
 
 /// Frozen-shape extension for the C probe: the jump table
-/// (prog-array) + the per-thread chain cursor + the tail callee.
+/// (prog-array) + the tail callee. No handoff map: the chain rides
+/// `PENDING_QUERY` + `QUERY_NEXT` (a dedicated 72-byte `CURSOR` was
+/// prototyped and rejected — stash materialization breaks the
+/// classifier's loop-state merging and the kernel forbids tail calls
+/// from subprograms without BTF).
 #[test]
 fn c1_frozen_shape_has_chain_support() {
     let maps = osslscope::loader::HARVEST_MAPS;
@@ -313,20 +317,9 @@ fn c1_frozen_shape_has_chain_support() {
         (3, 4, 4, 8, 0),
         "JUMPS is a prog-array of 8"
     );
-    let cursor = maps
-        .iter()
-        .find(|m| m.name == "CURSOR")
-        .expect("HARVEST_MAPS carries CURSOR");
-    assert_eq!(
-        (
-            cursor.map_type,
-            cursor.key_size,
-            cursor.value_size,
-            cursor.max_entries,
-            cursor.flags
-        ),
-        (1, 8, 72, 1024, 0),
-        "CURSOR is a u64->[u64;9] hash"
+    assert!(
+        maps.iter().all(|m| m.name != "CURSOR"),
+        "no CURSOR: the handoff rides PENDING_QUERY + QUERY_NEXT"
     );
     let progs = osslscope::loader::HARVEST_PROGS;
     let callee = progs
