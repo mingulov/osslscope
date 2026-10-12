@@ -1873,6 +1873,25 @@ mod tests {
     }
 
     #[test]
+    fn check_site_contained_rejects_offset_overflow() {
+        // All current callers pre-constrain the offset via
+        // ownership filters; this pins the fail-closed contract
+        // for future callers (without the checked add this input
+        // panics in debug / wraps in release).
+        let e = check_site_contained(usize::MAX, 16, 32, "f", "p").unwrap_err();
+        assert!(e.to_string().contains("site out of range"), "{e:#}");
+    }
+
+    #[test]
+    fn apply_call_rejects_misaligned_site() {
+        // Unreachable via `prepare` (reloc offset and prog value
+        // are both aligned there); pinned directly.
+        let mut insns = vec![0u8; 16];
+        let e = apply_call(&mut insns, 4, 8, "t").err().expect("must fail");
+        assert!(e.to_string().contains("call site misaligned"), "{e:#}");
+    }
+
+    #[test]
     fn apply_func_ptr_rejects_misaligned_site() {
         let mut insns = vec![0u8; 24];
         insns[4] = 0x18;
