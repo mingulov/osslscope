@@ -16,7 +16,9 @@ use std::io;
 use std::os::fd::{FromRawFd as _, OwnedFd, RawFd};
 
 pub const BPF_MAP_CREATE: u32 = 0;
+pub const BPF_MAP_LOOKUP_ELEM: u32 = 1;
 pub const BPF_MAP_UPDATE_ELEM: u32 = 2;
+pub const BPF_OBJ_GET_INFO_BY_FD: u32 = 15;
 pub const BPF_PROG_LOAD: u32 = 5;
 pub const BPF_BTF_LOAD: u32 = 18;
 pub const BPF_LINK_CREATE: u32 = 28;
@@ -204,6 +206,70 @@ pub fn map_update_elem(map_fd: RawFd, key: &[u8], value: &[u8], flags: u64) -> i
     attr.flags = flags;
     bpf(
         BPF_MAP_UPDATE_ELEM,
+        std::ptr::addr_of_mut!(attr).cast(),
+        size_of::<ElemAttr>(),
+    )?;
+    Ok(())
+}
+
+/// `BPF_OBJ_GET_INFO_BY_FD` attr: bpf_fd@0, info_len@4, info@8.
+#[repr(C)]
+struct InfoAttr {
+    bpf_fd: u32,
+    info_len: u32,
+    info: u64,
+}
+
+/// Fetch a program's xlated image bytes from the kernel (two-step
+/// length-then-bytes dance; needs caps on the fd). Early
+/// `bpf_prog_info` fields (through `xlated_prog_insns`) are ABI
+/// stable; the info buffer is oversized so version growth cannot
+/// truncate them.
+pub fn prog_xlated_bytes(prog_fd: RawFd) -> io::Result<Vec<u8>> {
+    // bpf_prog_info head: type@0 id@4 tag@8 jited_len@16
+    // xlated_len@20 jited_ptr@24 xlated_ptr@32.
+    let mut info = vec![0u8; 256];
+    let mut attr = InfoAttr {
+        bpf_fd: prog_fd as u32,
+        info_len: info.len() as u32,
+        info: info.as_mut_ptr() as u64,
+    };
+    bpf(
+        BPF_OBJ_GET_INFO_BY_FD,
+        std::ptr::addr_of_mut!(attr).cast(),
+        size_of::<InfoAttr>(),
+    )?;
+    let len = u32::from_le_bytes([info[20], info[21], info[22], info[23]]) as usize;
+    // Fresh info for the bytes fetch: call 1 leaves nonzero lens
+    // (e.g. jited) with NULL pointers, which would EFAULT the copy.
+    let mut info = vec![0u8; 256];
+    let mut bytes = vec![0u8; len];
+    info[32..40].copy_from_slice(&(bytes.as_mut_ptr() as u64).to_le_bytes());
+    info[20..24].copy_from_slice(&(len as u32).to_le_bytes());
+    let mut attr = InfoAttr {
+        bpf_fd: prog_fd as u32,
+        info_len: info.len() as u32,
+        info: info.as_mut_ptr() as u64,
+    };
+    bpf(
+        BPF_OBJ_GET_INFO_BY_FD,
+        std::ptr::addr_of_mut!(attr).cast(),
+        size_of::<InfoAttr>(),
+    )?;
+    Ok(bytes)
+}
+
+/// Read one map value by key (needs caps on the fd). `value` must
+/// fit the map's value size; a missing key errors (`ENOENT`) rather
+/// than returning a default.
+pub fn map_lookup_elem(map_fd: RawFd, key: &[u8], value: &mut [u8]) -> io::Result<()> {
+    let mut attr: ElemAttr = zeroed();
+    attr.map_fd = map_fd as u32;
+    attr.key = key.as_ptr() as u64;
+    attr.value = value.as_mut_ptr() as u64;
+    attr.flags = 0;
+    bpf(
+        BPF_MAP_LOOKUP_ELEM,
         std::ptr::addr_of_mut!(attr).cast(),
         size_of::<ElemAttr>(),
     )?;
