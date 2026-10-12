@@ -12,6 +12,11 @@
       "status": "info"
     },
     {
+      "id": "ringbuf-query",
+      "message": "bpf_ringbuf_query unverifiable without CAP_BPF (informational only)",
+      "status": "info"
+    },
+    {
       "id": "caps",
       "message": "missing caps: CAP_BPF+CAP_PERFMON (have neither file caps nor root)",
       "remediation": "grant file caps: sudo setcap cap_bpf,cap_perfmon+ep $(command -v osslscope) [+cap_sys_ptrace for foreign-uid targets], then re-run",

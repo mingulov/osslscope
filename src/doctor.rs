@@ -286,7 +286,8 @@ impl std::error::Error for RingbufQueryError {}
 /// `bpf_ringbuf_query` availability probe (P7 item 1a, §5.4
 /// floor): creates a scratch ringbuf map, loads a trivial prog
 /// calling the helper against it, and reports the outcome. Needs
-/// CAP_BPF (map + load); fail-closed on any error. Intended for
+/// CAP_BPF (map creation) plus CAP_PERFMON-or-CAP_SYS_ADMIN
+/// (kprobe program load); fail-closed on any error. Intended for
 /// B-traversal startup gating (P7 item 3+); doctor surfaces it
 /// as an informational row until then.
 pub fn probe_ringbuf_query() -> Result<(), RingbufQueryError> {
@@ -317,19 +318,69 @@ pub fn probe_ringbuf_query() -> Result<(), RingbufQueryError> {
         })
 }
 
-fn ringbuf_query_probe_out() -> ProbeOut {
-    match probe_ringbuf_query() {
-        Ok(()) => ProbeOut {
-            ok: true,
-            errno: 0,
-            log: String::new(),
-        },
-        Err(e) => ProbeOut {
+/// Render a failed floor probe honestly (pure — unit-tested).
+/// Syscall-missing and permission failures defer to the shared
+/// caps ladder with the STAGE-correct perfmon requirement (map
+/// creation needs CAP_BPF; kprobe program load needs
+/// CAP_PERFMON-or-CAP_SYS_ADMIN). Everything else is
+/// evidence-gated per stage: only a verifier "unknown func" log
+/// establishes helper absence — allocation and setup failures
+/// (EINVAL included) stay unverifiable, never "absent".
+fn ringbuf_query_detail(e: &RingbufQueryError, deny: &DenyCtx) -> String {
+    let n = e.errno;
+    if n == libc::ENOSYS || is_perm_errno(n) {
+        let out = ProbeOut {
             ok: false,
-            errno: e.errno,
-            log: e.log,
-        },
+            errno: n,
+            log: e.log.clone(),
+        };
+        let need_perfmon = e.stage == "prog_load";
+        return match classify_probe("ringbuf-query", &out, deny, need_perfmon) {
+            ProbeVerdict::Pass => {
+                "bpf_ringbuf_query probe inconclusive (classifier disagreement; report with doctor JSON)"
+                    .into()
+            }
+            ProbeVerdict::TooOld(m) => {
+                format!("bpf_ringbuf_query unavailable ({m}; B traversal unavailable, sampler unaffected)")
+            }
+            ProbeVerdict::DegradedCaps => {
+                let want = if need_perfmon {
+                    "CAP_PERFMON"
+                } else {
+                    "CAP_BPF"
+                };
+                format!("bpf_ringbuf_query unverifiable without {want} (informational only)")
+            }
+            ProbeVerdict::Denied(m, _) => {
+                format!("bpf_ringbuf_query denied ({m}; informational only)")
+            }
+        };
     }
+    if e.stage == "prog_load" && n == libc::EINVAL && e.log.contains("unknown func") {
+        return "bpf_ringbuf_query absent (verifier: unknown helper; B traversal unavailable, sampler unaffected)"
+            .into();
+    }
+    let what = if e.stage == "map_create" {
+        "ringbuf map creation"
+    } else {
+        "probe program load"
+    };
+    let mut msg = format!("bpf_ringbuf_query unverifiable ({what} failed, errno {n}");
+    let excerpt: String = e
+        .log
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .take(120)
+        .collect();
+    if !excerpt.is_empty() {
+        msg.push_str(": ");
+        msg.push_str(&excerpt);
+    }
+    msg.push_str("; B traversal gated, sampler unaffected)");
+    msg
 }
 
 fn errno_of(e: &std::io::Error) -> i32 {
@@ -962,25 +1013,13 @@ fn check_ringbuf_query(env: &Env) -> Check {
     // B-traversal floor signal (P7 item 1a, §5.4) — informational
     // until the B entry gates startup on it (P7 item 3+ wires
     // fail-closed): the sampler path needs no ringbuf_query.
-    let out = ringbuf_query_probe_out();
-    match classify_probe("ringbuf-query", &out, &env.deny_ctx(), false) {
-        ProbeVerdict::Pass => Check::info(
+    match probe_ringbuf_query() {
+        Ok(()) => Check::info(
             "ringbuf-query",
             "bpf_ringbuf_query present (B-traversal floor ok; entry admission can query occupancy)"
                 .into(),
         ),
-        ProbeVerdict::TooOld(m) => Check::info(
-            "ringbuf-query",
-            format!("bpf_ringbuf_query absent ({m}; B traversal unavailable, sampler unaffected)"),
-        ),
-        ProbeVerdict::DegradedCaps => Check::info(
-            "ringbuf-query",
-            "bpf_ringbuf_query unverifiable without CAP_BPF (informational only)".into(),
-        ),
-        ProbeVerdict::Denied(m, _) => Check::info(
-            "ringbuf-query",
-            format!("bpf_ringbuf_query denied with caps held ({m}; informational only)"),
-        ),
+        Err(e) => Check::info("ringbuf-query", ringbuf_query_detail(&e, &env.deny_ctx())),
     }
 }
 
@@ -2326,6 +2365,63 @@ mod tests {
             ino,
             path: path.into(),
         }
+    }
+
+    fn rbq_err(stage: &'static str, errno: i32, log: &str) -> RingbufQueryError {
+        RingbufQueryError {
+            stage,
+            errno,
+            log: log.into(),
+        }
+    }
+
+    #[test]
+    fn ringbuf_query_detail_cases() {
+        let allow = ctx((1u64 << CAP_BPF) | (1u64 << CAP_PERFMON), false, &[], false);
+        let none = ctx(0, false, &[], false);
+        let bpf_only = ctx(1u64 << CAP_BPF, false, &[], false);
+        // Unknown-helper rejection establishes absence (load stage).
+        let m = ringbuf_query_detail(
+            &rbq_err(
+                "prog_load",
+                libc::EINVAL,
+                "unknown func bpf_ringbuf_query#134",
+            ),
+            &allow,
+        );
+        assert!(m.contains("absent"), "{m}");
+        // Bare EINVAL (allocation/setup failure) stays unverifiable.
+        let m = ringbuf_query_detail(&rbq_err("prog_load", libc::EINVAL, ""), &allow);
+        assert!(m.contains("unverifiable") && !m.contains("absent"), "{m}");
+        // Map-stage EINVAL (unsupported ringbuf OR page-size floor)
+        // stays unverifiable — it establishes no helper fact.
+        let m = ringbuf_query_detail(&rbq_err("map_create", libc::EINVAL, ""), &allow);
+        assert!(
+            m.contains("unverifiable") && m.contains("map creation"),
+            "{m}"
+        );
+        // Resource errors carry the first log line.
+        let m = ringbuf_query_detail(
+            &rbq_err("prog_load", libc::ENOMEM, "out of memory\nsecond line"),
+            &allow,
+        );
+        assert!(m.contains("out of memory") && !m.contains("second"), "{m}");
+        // CAP_BPF-only + load EPERM: unverifiable for want of
+        // CAP_PERFMON — never "denied with caps held".
+        let m = ringbuf_query_detail(&rbq_err("prog_load", libc::EPERM, ""), &bpf_only);
+        assert!(
+            m.contains("unverifiable") && m.contains("CAP_PERFMON"),
+            "{m}"
+        );
+        // Same EPERM with perfmon held: attributed denial.
+        let m = ringbuf_query_detail(&rbq_err("prog_load", libc::EPERM, ""), &allow);
+        assert!(m.contains("denied"), "{m}");
+        // Map-stage EPERM without CAP_BPF: unverifiable, wants BPF.
+        let m = ringbuf_query_detail(&rbq_err("map_create", libc::EPERM, ""), &none);
+        assert!(m.contains("CAP_BPF"), "{m}");
+        // Map-stage EPERM with CAP_BPF held: attributed denial.
+        let m = ringbuf_query_detail(&rbq_err("map_create", libc::EPERM, ""), &bpf_only);
+        assert!(m.contains("denied"), "{m}");
     }
 
     #[test]
