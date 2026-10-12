@@ -814,26 +814,12 @@ pub fn query_return(ctx: RetProbeContext) -> u32 {
         // the chain continues past like a success, but the
         // truncation is flagged.
         1 => {
-            // V2 BISECT: branches only, no re-insert/tail.
+            // V3: overflow flagged, then the shared chain site below.
             flag_trunc(op as u32, TRUNC_DISPATCH);
-            if no_store {
-                return 0;
-            }
-            if j == MAX_ALGS - 1 {
-                advance_next(key, count);
-                return 0;
-            }
-            advance_next(key, count);
+            chain_tail(&ctx, cookie, pend, key, count);
         }
         0 => {
-            if no_store {
-                return 0;
-            }
-            if j == MAX_ALGS - 1 {
-                advance_next(key, count);
-                return 0;
-            }
-            advance_next(key, count);
+            chain_tail(&ctx, cookie, pend, key, count);
         }
         // Read abort: flag (all slots) and freeze for re-walk.
         _ => {
@@ -901,18 +887,32 @@ pub fn c_slot(ctx: RetProbeContext) -> u32 {
         None => return 0,
     };
     let op = pend.op as u32;
+    // V3: the entry tails unconditionally — the guards live here.
+    // Lifetime verdict, re-read (same rule as the entry: only an
+    // explicit 0 is cacheable): uncacheable tables sampled slot 0
+    // already, so the callee walks nothing and stores nothing.
+    let cacheable =
+        matches!(unsafe { helpers::bpf_probe_read_user(pend.ns_ptr as *const u32) }, Ok(0));
+    if !cacheable {
+        return 0;
+    }
     let tgid = helpers::bpf_get_current_pid_tgid();
     let key = ((tgid as u128) << 64) | (rv as u128);
     // The entry has not advanced yet, so this is its count —
     // mirrored normalization: raw NS_FROZEN (a no_store→cacheable
     // flip) means the entry walked j=0 (same rule as the entry).
-    // j+1 needs no bound guard: the entry chains only below slot
-    // 511, and the modulo keeps every value in range regardless.
     let raw = unsafe { QUERY_NEXT.get_ptr(&key).map(|p| *p) };
     let norm = match raw {
         Some(c) if c != NS_FROZEN => c,
         _ => 0,
     };
+    // Wraparound guard: j+1 == 0 means the entry walked slot 511
+    // (the overrun decider, never chained INTO) — advance past it
+    // like the sampler instead of re-walking slot 0.
+    if norm.wrapping_add(1) % MAX_ALGS == 0 {
+        store_next(key, norm.wrapping_add(1));
+        return 0;
+    }
     let j = norm.wrapping_add(1) % MAX_ALGS;
     let count = norm;
     // Slot-walk copy (see the entry's sync note): identical reads,
