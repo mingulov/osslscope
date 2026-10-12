@@ -814,16 +814,26 @@ pub fn query_return(ctx: RetProbeContext) -> u32 {
         // the chain continues past like a success, but the
         // truncation is flagged.
         1 => {
-            // V1 BISECT: tip arms (advance only) — chain_tail parked.
-            if !no_store {
-                advance_next(key, count);
-            }
+            // V2 BISECT: branches only, no re-insert/tail.
             flag_trunc(op as u32, TRUNC_DISPATCH);
+            if no_store {
+                return 0;
+            }
+            if j == MAX_ALGS - 1 {
+                advance_next(key, count);
+                return 0;
+            }
+            advance_next(key, count);
         }
         0 => {
-            if !no_store {
-                advance_next(key, count);
+            if no_store {
+                return 0;
             }
+            if j == MAX_ALGS - 1 {
+                advance_next(key, count);
+                return 0;
+            }
+            advance_next(key, count);
         }
         // Read abort: flag (all slots) and freeze for re-walk.
         _ => {
