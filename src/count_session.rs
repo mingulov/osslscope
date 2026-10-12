@@ -317,6 +317,12 @@ pub struct CountSession<B: CountBackend> {
     pid: u32,
     backend: B,
     links: Vec<B::Link>,
+    /// Open-file pins behind the links (H4), one per attach call
+    /// that bound ≥1 link. Declared AFTER `links` on purpose:
+    /// fields drop in order, so links detach first and pins
+    /// release after — a pin lives at least as long as every
+    /// link bound through it ("retain until detach").
+    link_pins: Vec<std::os::fd::OwnedFd>,
     stable: plan::StableCookies,
     provenance: HashMap<u32, Provenance>,
     pending: HashMap<u32, PendingMeaning>,
@@ -324,16 +330,22 @@ pub struct CountSession<B: CountBackend> {
     /// skip survivors: inode probes persist across remaps, and
     /// re-attaching would double-fire every hit.
     attached: HashSet<(u64, u64, u64)>,
+    /// Cookies with ≥1 live link (H4: attribution requires a
+    /// bound link). Planned-but-never-bound cookies (rejected
+    /// resolves, kernel refusals) stay OUT: their hits — backend
+    /// anomalies only, no link could have produced them — route
+    /// to unattributed loss at [`CountSession::route`], never
+    /// silently dropped, never misattributed. Monotonic within
+    /// the run (links never detach mid-run), so fenced
+    /// stragglers keep routing under their retired meaning.
+    bound: HashSet<u32>,
     known: HashSet<u32>,
-    /// Cookies dropped after a detected mid-attach replacement,
-    /// quarantined for the rest of the generation (F-A/A1): their
-    /// links are dead but the kernel may hold hits under them, so
-    /// re-establishing provenance would misattribute. Quarantined
-    /// cookies skip known/provenance (their drains route
-    /// unattributed) and report `quarantined` instead of
-    /// re-binding; the fence clears the set (old-generation
-    /// stragglers then miss `retired` and stay unattributed).
-    quarantined: HashSet<u32>,
+    // H4 removed the `quarantined` set (F-A/A1 generation
+    // quarantine): the fd pin binds the planned inode exactly,
+    // so no link is ever bound wrong and there is nothing to
+    // quarantine — a stale plan misses `replaced` per attempt,
+    // having bound nothing (see H4-T4). Design:
+    // docs/2026-10-11-h4-descriptor-custody-design.md §3.
     current: HashMap<u32, CountValue>,
     fenced: Vec<FencedGeneration>,
     /// (generation, cookie) → meaning then current, for exact
@@ -365,12 +377,13 @@ impl<B: CountBackend> CountSession<B> {
             pid,
             backend,
             links: Vec::new(),
+            link_pins: Vec::new(),
             stable: plan::StableCookies::default(),
             provenance: HashMap::new(),
             pending: HashMap::new(),
             attached: HashSet::new(),
+            bound: HashSet::new(),
             known: HashSet::new(),
-            quarantined: HashSet::new(),
             current: HashMap::new(),
             fenced: Vec::new(),
             retired: HashMap::new(),
@@ -447,25 +460,13 @@ impl<B: CountBackend> CountSession<B> {
     /// surviving triples reuse both and skip re-attach. A changed
     /// candidate set for a live cookie stages a [`PendingMeaning`]
     /// and reports `candidates_changed` — the old meaning stands
-    /// until [`fence`](Self::fence) versions it. Every planned link
-    /// path is open-file verified against its backing triple just
-    /// before attach; a replaced path is skipped as `replaced`, loud.
-    /// Quarantine a cookie whose links just dropped after a
-    /// detected replacement (F-A/A1): forget known/provenance so
-    /// in-flight kernel hits route unattributed instead of
-    /// misattributing to stale meaning, retract already-routed
-    /// counts into unattributed loss, and block re-binding for the
-    /// rest of the generation (cleared by [`CountSession::fence`]).
-    fn quarantine(&mut self, cookie: u32) {
-        self.known.remove(&cookie);
-        self.provenance.remove(&cookie);
-        self.pending.remove(&cookie);
-        if let Some(total) = self.current.remove(&cookie) {
-            self.unattributed = self.unattributed.saturating_add(total.count);
-        }
-        self.quarantined.insert(cookie);
-    }
-
+    /// until [`fence`](Self::fence) versions it. Every group pins
+    /// its path (open+fstat) just before attach and the backend
+    /// binds through the fd-path (H4); a pin missing the plan is
+    /// skipped as `replaced`, loud, having bound nothing — and
+    /// only bound cookies' hits attribute ([`CountSession::route`]
+    /// gates on the bound set, so rejected plans' anomaly hits
+    /// land in unattributed loss, never silently dropped).
     pub fn attach_delta(
         &mut self,
         delta: &CountDelta,
@@ -534,21 +535,6 @@ impl<B: CountBackend> CountSession<B> {
             let Some(cookie) = self.stable.lookup(&row.dev, row.ino, row.offset) else {
                 continue;
             };
-            if self.quarantined.contains(&cookie) {
-                // F-A/A1: dropped-link cookie, still quarantined for
-                // this generation — report, never re-bind (its
-                // kernel hits would misattribute to fresh meaning).
-                report.missed.push(plan::Missed {
-                    dev: row.dev.clone(),
-                    ino: row.ino,
-                    offset: row.offset,
-                    reason: "quarantined",
-                });
-                // Counted once by the per-call aggregate below (all
-                // pre-attach pushes); a second increment here would
-                // double-count (slice-A review Minor-1).
-                continue;
-            }
             self.known.insert(cookie);
             let same = self.provenance.get(&cookie).is_some_and(|current| {
                 current.site == site.site
@@ -586,15 +572,21 @@ impl<B: CountBackend> CountSession<B> {
             }
         }
         // Single counting point for every miss pushed above
-        // (planned + quarantined); pushes below (verify/attach
-        // failures) carry their own increment instead.
+        // (planned); pushes below (resolve/attach failures) carry
+        // their own increment instead.
         self.missed_attaches += report.missed.len() as u64;
-        // Attach survivors are skipped; every attached path is
-        // open-file verified against its own backing triple.
+        // H4: attach survivors are skipped; every group pins its
+        // path (open+fstat) BEFORE the backend runs, and the
+        // backend attaches through the fd-path — the kernel binds
+        // the pinned inode, so a mid-attach path move is simply
+        // not observed (no pre/post sampling, no binding check,
+        // no rollback: the fd IS the pin). A pin whose identity
+        // misses the plan (or an unopenable path) rejects the
+        // group having bound nothing (H4-T4).
         for group in plan::groups(&planned) {
             let mut offs: Vec<u64> = Vec::new();
             let mut cks: Vec<u64> = Vec::new();
-            let mut expected: Vec<(u64, u64)> = Vec::new();
+            let mut survivors: Vec<(u64, u32)> = Vec::new();
             for (offset, cookie) in group.offsets.iter().zip(group.cookies.iter()) {
                 let cookie = *cookie as u32;
                 let Some(prov) = self.provenance.get(&cookie) else {
@@ -605,22 +597,18 @@ impl<B: CountBackend> CountSession<B> {
                     report.reused += 1;
                     continue;
                 }
-                match plan::verify_backing(&group.path, prov.site.device, prov.site.inode) {
-                    Ok(()) => {
-                        offs.push(*offset);
-                        cks.push(cookie as u64);
-                        expected.push((prov.site.device, prov.site.inode));
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
-                        report.missed.push(plan::Missed {
-                            dev: plan::render_device(prov.site.device),
-                            ino: prov.site.inode,
-                            offset: *offset,
-                            reason: "replaced",
-                        });
-                        self.missed_attaches += 1;
-                    }
-                    Err(_) => {
+                survivors.push((*offset, cookie));
+            }
+            if survivors.is_empty() {
+                continue;
+            }
+            let pin = match plan::resolve_pinned(&group.path) {
+                Ok(pin) => pin,
+                Err(_) => {
+                    for (offset, cookie) in &survivors {
+                        let Some(prov) = self.provenance.get(cookie) else {
+                            continue;
+                        };
                         report.missed.push(plan::Missed {
                             dev: plan::render_device(prov.site.device),
                             ino: prov.site.inode,
@@ -629,41 +617,35 @@ impl<B: CountBackend> CountSession<B> {
                         });
                         self.missed_attaches += 1;
                     }
+                    continue;
+                }
+            };
+            for (offset, cookie) in &survivors {
+                let Some(prov) = self.provenance.get(cookie) else {
+                    continue;
+                };
+                // One fstat (the pin's) serves every cookie in the
+                // group: no per-cookie re-open, no TOCTOU between
+                // cookies — the sample point is the single open.
+                if pin.device == prov.site.device && pin.ino == prov.site.inode {
+                    offs.push(*offset);
+                    cks.push(*cookie as u64);
+                } else {
+                    report.missed.push(plan::Missed {
+                        dev: plan::render_device(prov.site.device),
+                        ino: prov.site.inode,
+                        offset: *offset,
+                        reason: "replaced",
+                    });
+                    self.missed_attaches += 1;
                 }
             }
             if offs.is_empty() {
                 continue;
             }
-            // The path is verified above and re-sampled across the
-            // attach: `uprobe_multi` resolves the path itself, so a
-            // path that moves mid-attach may bind either side. Fresh
-            // links from a moved path are dropped loud as `replaced`
-            // — they must never attribute to stale provenance under
-            // an already-known cookie. F-A/A1: the binding must equal
-            // every attached cookie's EXPECTED identity, not merely
-            // agree with itself — pre==post passes when both samples
-            // describe the replacement (moved between the verify
-            // above and the pre sample).
-            let pre = plan::sample_backing(&group.path).ok();
-            let (links, bad) = self.backend.attach(&group.path, &offs, &cks);
-            let post = plan::sample_backing(&group.path).ok();
-            let bound = expected.iter().all(|e| plan::binding_holds(&pre, &post, e));
-            if !bound {
-                drop(links);
-                for (offset, cookie) in offs.iter().zip(cks.iter()) {
-                    let cookie = *cookie as u32;
-                    if let Some(prov) = self.provenance.get(&cookie) {
-                        report.missed.push(plan::Missed {
-                            dev: plan::render_device(prov.site.device),
-                            ino: prov.site.inode,
-                            offset: *offset,
-                            reason: "replaced",
-                        });
-                        self.missed_attaches += 1;
-                    }
-                    self.quarantine(cookie);
-                }
-                continue;
+            let (links, bad) = self.backend.attach(&pin.link_path(), &offs, &cks);
+            if !links.is_empty() {
+                self.link_pins.push(pin.fd);
             }
             self.links.extend(links);
             let refused = normalize_bad(bad, offs.len());
@@ -677,6 +659,7 @@ impl<B: CountBackend> CountSession<B> {
                 if let Some(prov) = self.provenance.get_mut(&cookie) {
                     self.attached
                         .insert((prov.site.device, prov.site.inode, *offset));
+                    self.bound.insert(cookie);
                     prov.link_path = group.path.clone();
                     report.attached += 1;
                 }
@@ -784,11 +767,9 @@ impl<B: CountBackend> CountSession<B> {
             }
         }
         self.current.clear();
-        // F-A/A1: quarantine lifts with the generation — cookies may
-        // re-attach fresh, while old-generation stragglers miss
-        // `retired` (provenance was removed at quarantine time) and
-        // route unattributed.
-        self.quarantined.clear();
+        // H4: no quarantine set remains to lift (see the removed
+        // field) — every generation re-resolves from the maps
+        // plan, and stale plans miss `replaced` per attempt.
         self.generation = next;
         self.fences += 1;
         Ok(())
@@ -947,6 +928,15 @@ impl<B: CountBackend> CountSession<B> {
             if !self.known.contains(&cookie) {
                 // Unknown cookie (any generation): truly
                 // unattributable — loud loss, never silent.
+                self.unattributed += delta;
+                continue;
+            }
+            if !self.bound.contains(&cookie) {
+                // H4: planned but never bound (rejected resolve,
+                // kernel refusal) — no link exists, so these hits
+                // are backend anomalies, not evidence. Loud
+                // unattributed loss (replaces F-A/A1 quarantine's
+                // eager retract, which died with the !bound path).
                 self.unattributed += delta;
                 continue;
             }

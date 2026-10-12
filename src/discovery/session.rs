@@ -82,7 +82,6 @@ use std::ffi::CString;
 use std::num::NonZeroU32;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt as _;
-use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
@@ -2548,40 +2547,61 @@ pub(crate) enum LinkKind {
     Stage2,
 }
 
-/// Owned multi links (drop = detach) with their plane records.
-/// Cookies ride along so selective detach can identify batch
-/// members (tripwire links carry the whole batch's cookies).
+/// One owned multi link (drop = detach) with its plane record
+/// and the open-file pin it bound through (H4: one fd per link
+/// entry, dup'd at push — the pin drops WITH its link, so
+/// selective detach releases pins with their links and no pin
+/// outlives (or pre-dies) its link).
+///
+/// `link`/`pin` are pure RAII guards (drop = detach/release),
+/// never read by design.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) struct LinkEntry {
+    link: OwnedFd,
+    pin: OwnedFd,
+    kind: LinkKind,
+    cookies: Vec<u64>,
+}
+
+/// Owned multi links with their plane records. Cookies ride
+/// along so selective detach can identify batch members
+/// (tripwire links carry the whole batch's cookies).
 #[derive(Default)]
 pub(crate) struct LinkSet {
-    links: Vec<(OwnedFd, LinkKind, Vec<u64>)>,
+    links: Vec<LinkEntry>,
 }
 
 impl LinkSet {
-    fn push(&mut self, fd: OwnedFd, kind: LinkKind, cookies: Vec<u64>) {
-        self.links.push((fd, kind, cookies));
+    fn push(&mut self, link: OwnedFd, pin: OwnedFd, kind: LinkKind, cookies: Vec<u64>) {
+        self.links.push(LinkEntry {
+            link,
+            pin,
+            kind,
+            cookies,
+        });
     }
 
     fn clear(&mut self) {
         self.links.clear();
     }
 
-    /// Drop links back to `len` (fd close = detach): rolls back a
-    /// just-installed pair whose backing file was replaced mid-attach.
-    fn truncate(&mut self, len: usize) {
-        self.links.truncate(len);
-    }
+    // H4 removed `truncate` with the rollback-after-attach sites:
+    // rejection happens strictly before any link exists, so no
+    // installed link is ever rolled back. Design:
+    // docs/2026-10-11-h4-descriptor-custody-design.md §3.
 
-    /// Detach every link matching `pred` (fd close = detach).
+    /// Detach every link matching `pred` (fd close = detach;
+    /// each link's pin drops with it).
     fn remove_matching(&mut self, mut pred: impl FnMut(LinkKind, &[u64]) -> bool) {
-        self.links
-            .retain(|(_, kind, cookies)| !pred(*kind, cookies));
+        self.links.retain(|e| !pred(e.kind, &e.cookies));
     }
 
     fn counts(&self) -> (u64, u64) {
         let mut dispatch = 0u64;
         let mut tripwire = 0u64;
-        for (_, kind, _) in &self.links {
-            match kind {
+        for e in &self.links {
+            match e.kind {
                 LinkKind::Init | LinkKind::Query | LinkKind::Stage2 => dispatch += 1,
                 LinkKind::Tripwire => tripwire += 1,
             }
@@ -2612,12 +2632,17 @@ fn attach_pair(
     entry: &str,
     ret: &str,
     offset: u64,
-    path: &Path,
+    pin: &crate::plan::PinnedFile,
     pid: u32,
     cookie: u64,
     kind: LinkKind,
 ) -> anyhow::Result<()> {
-    let cpath = link_path(path)?;
+    // H4: attach through the pin's fd-path — the kernel binds the
+    // open file description, so no path move can race the attach.
+    // One fd per link entry: the pin dups once per push and drops
+    // with its link.
+    let fd_path = pin.link_path();
+    let cpath = link_path(Path::new(&fd_path))?;
     // Both links publish only after the pair succeeds: a failed
     // return-probe attach must not leave its entry link live (the
     // session retries, so a leak would accumulate double-firing
@@ -2638,8 +2663,13 @@ fn attach_pair(
         pid,
     )
     .map_err(|e| anyhow!("attach {ret}@{offset:#x}: {e}"))?;
-    links.push(entry_link, kind, vec![cookie]);
-    links.push(ret_link, kind, vec![cookie]);
+    // Dup both pins BEFORE publishing either link (a dup can only
+    // fail on fd exhaustion, but a half-published pair would
+    // strand a firing entry link — same rule as the attaches).
+    let entry_pin = pin.fd.try_clone()?;
+    let ret_pin = pin.fd.try_clone()?;
+    links.push(entry_link, entry_pin, kind, vec![cookie]);
+    links.push(ret_link, ret_pin, kind, vec![cookie]);
     Ok(())
 }
 
@@ -2662,7 +2692,17 @@ fn attach_trips(
     keys.sort_unstable();
     for (module, prog_name) in keys {
         let (offsets, cookies) = &groups[&(module, prog_name)];
-        let cpath = link_path(Path::new(module))?;
+        // H4: pin the module (open, bounded retries) and attach
+        // through the fd-path. Caller modules carry no planned
+        // identity (only libcrypto is plan-bound — checked by the
+        // caller pre-attach), so the pin alone fixes their
+        // attach-time TOCTOU: the link binds exactly the opened
+        // inode, deliberately. One group → one link → the pin
+        // moves in whole (no dup needed).
+        let pin = crate::plan::resolve_pinned_retry(|| crate::plan::resolve_pinned(module))
+            .map_err(|e| anyhow!("pin {module} for {prog_name}: {e}"))?;
+        let fd_path = pin.link_path();
+        let cpath = link_path(Path::new(&fd_path))?;
         let link = ossl_bpf_sys::link_create_uprobe_multi(
             prog_fd(loaded, prog_name)?,
             &cpath,
@@ -2671,7 +2711,7 @@ fn attach_trips(
             pid,
         )
         .map_err(|e| anyhow!("attach {prog_name}@{module}+{}: {e}", offsets.len()))?;
-        links.push(link, LinkKind::Tripwire, cookies.clone());
+        links.push(link, pin.fd, LinkKind::Tripwire, cookies.clone());
     }
     Ok(())
 }
@@ -3048,38 +3088,49 @@ impl SessionEnv for LiveEnv {
         pid: u32,
         expected: Option<(u64, u64)>,
     ) -> anyhow::Result<()> {
-        // Backing-identity check across the install: uprobes attach
-        // by path, so a same-path replacement between resolve and
-        // attach would pin the NEW bytes at the OLD offset. Stat
-        // before/after; on mismatch roll the pair back and fail
-        // loud (the cookie retries next poll — T14r4-2b). F-A/A1:
-        // both samples must equal the RESOLVE-time identity, not
-        // merely agree — a replacement between resolve and `before`
-        // reads identically on both sides.
-        let ident_of = |p: &Path| std::fs::metadata(p).map(|m| (m.dev(), m.ino())).ok();
-        let before = ident_of(path);
-        let links_before = self.links.links.len();
+        // H4: pin the path (open, bounded retries over transient
+        // absence) and compare the pin's fstat against the
+        // resolve-time `expected` BEFORE attaching — no
+        // before/after sampling, no rollback: the fd IS the pin,
+        // and the pair binds through its fd-path. Mismatch (or
+        // `None` expected — unstatable at resolve) fails loud
+        // having bound nothing; the cookie retries next poll
+        // (T14r4-2b) against fresh maps. NOTE the domain bridge:
+        // `expected` is raw (dev_t, ino) per the trait, the pin
+        // is encoded — the comparison encodes explicitly.
+        let path_str = path.to_string_lossy();
+        let pin =
+            crate::plan::resolve_pinned_retry(|| crate::plan::resolve_pinned(path_str.as_ref()))
+                .map_err(|e| {
+                    anyhow!(
+                        "stage-2 pin open failed for {} (cookie retries next poll): {e}",
+                        path.display()
+                    )
+                })?;
+        let matches = expected.is_some_and(|(raw_dev, ino)| {
+            let enc = crate::plan::encode_device(
+                libc::major(raw_dev as libc::dev_t),
+                libc::minor(raw_dev as libc::dev_t),
+            );
+            pin.device == enc && pin.ino == ino
+        });
+        if !matches {
+            bail!(
+                "stage-2 pin for {} misses the resolve-time identity (cookie retries next poll)",
+                path.display()
+            );
+        }
         attach_pair(
             &self.loaded,
             &mut self.links,
             "query_entry",
             "query_return",
             offset,
-            path,
+            &pin,
             pid,
             cookie,
             LinkKind::Stage2,
         )?;
-        // `None` expected (unstatable at resolve) never binds.
-        let bound =
-            expected.is_some_and(|e| crate::plan::binding_holds(&before, &ident_of(path), &e));
-        if !bound {
-            self.links.truncate(links_before);
-            bail!(
-                "stage-2 attach raced a same-path replacement for {}",
-                path.display()
-            );
-        }
         eprintln!("INSPECT stage=query off={offset:#x} cookie={cookie}");
         Ok(())
     }
@@ -3090,35 +3141,55 @@ impl SessionEnv for LiveEnv {
         pid: u32,
         maps: &[maps::Mapping],
     ) -> anyhow::Result<Option<String>> {
-        // F-D/A11: plan/install binding check (A1 pattern) — the
-        // plan's offsets describe its bound libcrypto; a swap
-        // between plan and install would pin the new bytes at old
-        // offsets. Roll back and fail loud (the core retries).
-        let links_before = self.links.links.len();
-        let expected = set.libcrypto.as_ref().and_then(|(path, dev, ino)| {
-            crate::plan::device_id_of_maps_dev(dev).map(|enc| (path.clone(), (enc, *ino)))
-        });
-        let ident_of = |p: &str| {
-            std::fs::metadata(p)
-                .map(|m| {
-                    (
-                        crate::plan::encode_device(libc::major(m.dev()), libc::minor(m.dev())),
-                        m.ino(),
+        // H4 (was F-D/A11 whole-batch check): the plan's offsets
+        // describe its bound libcrypto — pin libcrypto FIRST and
+        // compare against the plan's identity BEFORE attaching
+        // anything. Mismatch (or unopenable libcrypto on a bound
+        // plan) fails the batch having bound nothing; unbound
+        // plans (hand-built sets only) skip verification, as
+        // before. Transient-typed (InvalidData): the core retries
+        // next poll without latching blind or failing the poll.
+        // No post-batch sampling, no rollback: each trip module
+        // binds through its own pin inside `attach_trips`.
+        if let Some((lc_path, (enc, ino))) = set.libcrypto.as_ref().and_then(|(path, dev, ino)| {
+            crate::plan::device_id_of_maps_dev(dev).map(|enc| (path, (enc, *ino)))
+        }) {
+            let pin = crate::plan::resolve_pinned_retry(|| crate::plan::resolve_pinned(lc_path))
+                .map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("tripwire install: bound libcrypto unopenable ({lc_path}): {e}"),
                     )
-                })
-                .ok()
-        };
-        let before = expected.as_ref().and_then(|(path, _)| ident_of(path));
+                })?;
+            if pin.device != enc || pin.ino != ino {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "tripwire install: bound libcrypto replaced since plan",
+                )
+                .into());
+            }
+        }
         attach_trips(&self.loaded, &mut self.links, set, pid)?;
         eprintln!("INSPECT stage=legacy trips={}", set.probes.len());
         let mut note = None;
         if let Some(lc_path) = legacy::find_libcrypto(maps) {
             for cand in legacy_candidates(pid, &lc_path) {
-                let off = std::fs::read(&cand)
+                // Pin-first per candidate (H4): offsets resolve
+                // against the OPEN file and the pair binds through
+                // its fd-path. Unopenable candidates skip silently
+                // (as before — a pre-loaded legacy stays
+                // unattributed, documented edge); attach failures
+                // stay loud in-doc (executed_queries would read a
+                // false 0) while the run continues for tripwires.
+                let pin = match crate::plan::resolve_pinned_retry(|| {
+                    crate::plan::resolve_pinned(cand.to_string_lossy().as_ref())
+                }) {
+                    Ok(pin) => pin,
+                    Err(_) => continue,
+                };
+                let off = std::fs::read(pin.link_path())
                     .ok()
                     .and_then(|b| elf::dynsym_file_offset(&b, INIT_ANCHOR).ok());
-                // No init anchor in the candidate: a pre-loaded
-                // legacy stays unattributed (documented edge).
                 if let Some(off) = off
                     && let Err(e) = attach_pair(
                         &self.loaded,
@@ -3126,39 +3197,16 @@ impl SessionEnv for LiveEnv {
                         "init_entry",
                         "init_return",
                         off,
-                        &cand,
+                        &pin,
                         pid,
                         harvest::LEGACY_COOKIE,
                         LinkKind::Init,
                     )
                 {
-                    // Loud in-doc (executed_queries would read a
-                    // false 0); the run continues for tripwires.
                     note = Some(format!("legacy tripwire attach failed: {e:#}"));
                     eprintln!("INSPECT legacy attach failed: {e:#}");
                 }
             }
-        }
-        // Whole-batch binding check (A1 pattern): the plan's
-        // offsets describe its bound libcrypto — a swap spanning
-        // the install would pin new bytes at old offsets. Roll the
-        // batch back and fail loud (the core retries); unbound
-        // plans (hand-built sets only) skip verification.
-        let bound = match (&expected, &before) {
-            (Some((path, e)), Some(b)) if b == e => {
-                crate::plan::binding_holds(&before, &ident_of(path), e)
-            }
-            _ => true,
-        };
-        if !bound {
-            self.links.truncate(links_before);
-            // Transient-typed (InvalidData): the core retries next
-            // poll without latching blind or failing the poll.
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "tripwire install raced a libcrypto replacement",
-            )
-            .into());
         }
         Ok(note)
     }
@@ -3283,12 +3331,15 @@ impl SessionEnv for LiveEnv {
     }
 
     fn reinstall_dispatch(&mut self) -> anyhow::Result<DispatchReinstall> {
-        // F-D/A11: re-resolve with the attach-time recipe against
-        // the CURRENT provider file, then pin a fresh pair. The
-        // bytes must be the mapped file's (same open, A3 helper) —
-        // mismatch is a transient race (InvalidData, retry next
-        // poll); the attach itself carries the A1-grade
-        // resolve/attach binding check with rollback.
+        // H4 (was F-D/A11 + A1-grade check with rollback): pin the
+        // CURRENT provider file FIRST (open, bounded retries),
+        // then read the resolve bytes THROUGH the pin's fd-path
+        // (same inode, guaranteed — the A3 helper's open/read
+        // still applies, now trivially tear-proof) and compare
+        // against the maps entry. Mismatch is a transient race
+        // (InvalidData, retry next poll); the attach binds through
+        // the fd-path with no post-attach sampling — the fd IS
+        // the pin.
         let spec = self
             .dispatch_spec
             .clone()
@@ -3299,7 +3350,14 @@ impl SessionEnv for LiveEnv {
             .iter()
             .find(|m| m.path == prov_path || m.path == self.canon)
             .context("provider unmapped")?;
-        let bound = crate::plan::read_file_bound(&prov_path)?;
+        let pin = crate::plan::resolve_pinned_retry(|| crate::plan::resolve_pinned(&prov_path))
+            .map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("provider {prov_path} unopenable during reinstall: {e}"),
+                )
+            })?;
+        let bound = crate::plan::read_file_bound(&pin.link_path())?;
         let file_ident = (crate::plan::render_device(bound.dev), bound.ino);
         if file_ident != (entry.dev.clone(), entry.ino) {
             return Err(std::io::Error::new(
@@ -3334,26 +3392,13 @@ impl SessionEnv for LiveEnv {
                 (off, "query_entry", "query_return", res)
             }
         };
-        let ident_of = |p: &Path| {
-            std::fs::metadata(p)
-                .map(|m| {
-                    (
-                        crate::plan::encode_device(libc::major(m.dev()), libc::minor(m.dev())),
-                        m.ino(),
-                    )
-                })
-                .ok()
-        };
-        let expected = Some((bound.dev, bound.ino));
-        let before = ident_of(&self.provider);
-        let links_before = self.links.links.len();
         attach_pair(
             &self.loaded,
             &mut self.links,
             prog_entry,
             prog_ret,
             off,
-            &self.provider,
+            &pin,
             self.pid,
             0,
             if matches!(spec, DispatchSpec::Init) {
@@ -3362,21 +3407,6 @@ impl SessionEnv for LiveEnv {
                 LinkKind::Query
             },
         )?;
-        let bound_ok = expected
-            .is_some_and(|e| crate::plan::binding_holds(&before, &ident_of(&self.provider), &e));
-        if !bound_ok {
-            self.links.truncate(links_before);
-            // Transient-typed (InvalidData): the core retries next
-            // poll without latching blind or failing the poll.
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "dispatch reinstall raced a same-path replacement for {}",
-                    self.provider.display()
-                ),
-            )
-            .into());
-        }
         eprintln!("INSPECT stage=reinstall off={off:#x}");
         Ok(DispatchReinstall {
             binding: (prov_path, entry.dev.clone(), entry.ino),
@@ -3417,7 +3447,14 @@ impl DiscoverySession {
                 bail!("pid {pid} cmdline lacks marker {marker}");
             }
         }
-        let elf_bytes = std::fs::read(&cfg.provider)?;
+        // H4: pin the provider file FIRST (open, bounded
+        // retries) — offsets resolve against the pinned bytes and
+        // every bootstrap pair binds through its fd-path. Named
+        // `prov_pin`: `pin` is the target (pid) pin above.
+        let prov_path_str = cfg.provider.to_string_lossy().into_owned();
+        let prov_pin =
+            crate::plan::resolve_pinned_retry(|| crate::plan::resolve_pinned(&prov_path_str))?;
+        let elf_bytes = std::fs::read(prov_pin.link_path())?;
         let canon = std::fs::canonicalize(&cfg.provider)
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
@@ -3472,7 +3509,7 @@ impl DiscoverySession {
                         "query_entry",
                         "query_return",
                         off,
-                        &cfg.provider,
+                        &prov_pin,
                         nz.get(),
                         0,
                         LinkKind::Query,
@@ -3508,25 +3545,20 @@ impl DiscoverySession {
                         "init_entry",
                         "init_return",
                         off,
-                        &cfg.provider,
+                        &prov_pin,
                         nz.get(),
                         0,
                         LinkKind::Init,
                     )?;
                     dispatch_spec = Some(DispatchSpec::Init);
-                    // Best-effort pin record: the link pins path
-                    // resolution at attach; a swap between attach
-                    // and this stat binds the wrong identity (it
-                    // self-heals as an immediate replan — the
-                    // A1-grade check lives in reinstall, which owns
-                    // its resolve).
-                    if let Ok(m) = std::fs::metadata(&cfg.provider) {
-                        dispatch_binding = Some((
-                            cfg.provider.to_string_lossy().into_owned(),
-                            format!("{:02x}:{:02x}", libc::major(m.dev()), libc::minor(m.dev())),
-                            m.ino(),
-                        ));
-                    }
+                    // H4: the binding is EXACT now — the pin's own
+                    // identity (the link bound through its fd-path),
+                    // not a best-effort post-attach stat.
+                    dispatch_binding = Some((
+                        cfg.provider.to_string_lossy().into_owned(),
+                        crate::plan::render_device(prov_pin.device),
+                        prov_pin.ino,
+                    ));
                 }
                 Err(e) => {
                     eprintln!("INSPECT anchor unresolved: {e:#}");
@@ -3549,26 +3581,18 @@ impl DiscoverySession {
 
         let mut core = SessionCore::new(cfg.provider.clone(), canon.clone(), cfg.legacy, pid);
         if builtin_query_attached {
-            // Backing identity for the reuse comparison: stat now
-            // (unstatable => ("", 0), which never reuses — the next
-            // resolve re-attaches instead of trusting a stale mark).
-            let (pdev, pino) = std::fs::metadata(&cfg.provider)
-                .map(|m| {
-                    (
-                        format!("{:02x}:{:02x}", libc::major(m.dev()), libc::minor(m.dev())),
-                        m.ino(),
-                    )
-                })
-                .unwrap_or_default();
-            // F-D/A11: the same stat binds the anchor (statable
-            // only — unstatable leaves validation trusting, below).
-            if !pdev.is_empty() {
-                dispatch_binding = Some((
-                    cfg.provider.to_string_lossy().into_owned(),
-                    pdev.clone(),
-                    pino,
-                ));
-            }
+            // H4: backing identity for the reuse comparison —
+            // EXACT from the bootstrap pin (the builtin pair bound
+            // through its fd-path), replacing the best-effort
+            // post-attach stat (whose unstatable-fallback is now
+            // unreachable — the pin opened or bootstrap failed).
+            let pdev = crate::plan::render_device(prov_pin.device);
+            let pino = prov_pin.ino;
+            dispatch_binding = Some((
+                cfg.provider.to_string_lossy().into_owned(),
+                pdev.clone(),
+                pino,
+            ));
             core.mark_query_attached(
                 0,
                 builtin_query_offset,

@@ -173,61 +173,96 @@ pub fn device_id_of_maps_dev(dev: &str) -> Option<u64> {
     parse_maps_dev(dev).map(|(major, minor)| encode_device(major, minor))
 }
 
-/// Sample the (device, inode) identity word pair currently behind
-/// `path`. The count session samples before and after each attach:
-/// a path that moves across the attach call has its fresh links
-/// dropped loud as `replaced` instead of risking attribution to the
-/// wrong backing under an already-known cookie.
-pub fn sample_backing(path: &str) -> std::io::Result<(u64, u64)> {
+// H4 removed `sample_backing` (before/after path sampling for
+// attach binding): the fd pin subsumes it — no path sample can
+// race an open file description. Design:
+// docs/2026-10-11-h4-descriptor-custody-design.md §2.
+
+/// An open file retained as an attach pin (H4): the fd was opened
+/// FIRST and fstat'd ITSELF, so `(device, ino)` names the exact
+/// inode the subsequent fd-path attach binds — no path sample can
+/// race it. The kernel resolves [`PinnedFile::link_path`] to the
+/// open file description, not the pathname (H4 §4 spike: pin
+/// proven across A→B→A, pending arms on exec of the pinned
+/// inode). Retain until the link detaches.
+#[derive(Debug)]
+pub struct PinnedFile {
+    /// The pin itself. Keep alive while the link lives.
+    pub fd: std::os::fd::OwnedFd,
+    /// Encoded device of the OPEN file (fstat, not path stat).
+    pub device: u64,
+    /// Inode of the OPEN file (fstat, not path stat).
+    pub ino: u64,
+}
+
+impl PinnedFile {
+    /// Attach-path form for this pin: the kernel binds the open
+    /// file description behind the fd, whatever the pathname
+    /// says now (or whether it still exists).
+    pub fn link_path(&self) -> String {
+        use std::os::fd::AsRawFd as _;
+        format!("/proc/self/fd/{}", self.fd.as_raw_fd())
+    }
+}
+
+/// Open `path` and pin the open file's identity (H4): open FIRST,
+/// then fstat THE FD. What the pathname says afterwards —
+/// swapped, replaced, deleted — cannot move the pin. Compare
+/// [`PinnedFile::device`]/[`PinnedFile::ino`] against the planned
+/// identity; on mismatch drop the plan (loud `replaced`) having
+/// bound nothing.
+pub fn resolve_pinned(path: &str) -> std::io::Result<PinnedFile> {
     use std::os::unix::fs::MetadataExt as _;
     let file = std::fs::File::open(path)?;
     let meta = file.metadata()?;
-    Ok((
-        encode_device(libc::major(meta.dev()), libc::minor(meta.dev())),
-        meta.ino(),
-    ))
+    Ok(PinnedFile {
+        fd: file.into(),
+        device: encode_device(libc::major(meta.dev()), libc::minor(meta.dev())),
+        ino: meta.ino(),
+    })
 }
 
-/// Open `path` and verify the open file still backs the planned
-/// (device, inode) identity. The count session calls this around
-/// attachment so a path replaced between planning and attach is
-/// skipped as `replaced` instead of probed under a stale identity.
-/// A best-effort TOCTOU guard: `uprobe_multi` attach takes a path,
-/// not a file descriptor, so no userspace flow can pin the resolved
-/// inode — open-then-fstat plus a post-attach re-sample narrows the
-/// race to a replace-and-restore of the same inode across the attach
-/// call, which is accepted and documented rather than silently
-/// trusted. A wrongly attached probe under an already-known cookie
-/// would attribute to stale provenance, so the session drops fresh
-/// links whenever the path moves across attach (loud PARTIAL)
-/// instead of hoping the drain catches it.
-pub fn verify_backing(path: &str, device: u64, ino: u64) -> std::io::Result<()> {
-    let (live_device, live_ino) = sample_backing(path)?;
-    if live_device != device || live_ino != ino {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("{path} no longer backs the planned file identity"),
-        ));
+/// Pin-open attempts (H4-T2): the initial open plus bounded
+/// retries over transient absence (a rename swap landing
+/// mid-open resolves in microseconds; the poll loop is the
+/// slow retry). Mismatches are NOT retried here — open is
+/// atomic, so a pin-vs-plan mismatch is deterministic, and
+/// F-D/Am1 forbids installer maps re-reads; the fresh-maps
+/// retry happens at the next-poll boundary instead.
+pub const PIN_OPEN_ATTEMPTS: u32 = 3;
+
+/// Open a pin with bounded retries over transient failure
+/// (H4-T2). Returns the first success, else the LAST error
+/// after exactly [`PIN_OPEN_ATTEMPTS`] attempts. The opener
+/// is injected so tests script absence-then-presence;
+/// production passes `|| resolve_pinned(path)`.
+pub fn resolve_pinned_retry(
+    mut open: impl FnMut() -> std::io::Result<PinnedFile>,
+) -> std::io::Result<PinnedFile> {
+    let mut err = None;
+    for _ in 0..PIN_OPEN_ATTEMPTS {
+        match open() {
+            ok @ Ok(_) => return ok,
+            Err(e) => err = Some(e),
+        }
     }
-    Ok(())
+    Err(err.expect("PIN_OPEN_ATTEMPTS >= 1"))
 }
 
-/// Attach-binding decision (F-A/A1): pre==post is NOT enough — both
-/// samples may describe the replacement (moved between the verify
-/// and the pre sample). The binding holds only when both samples
-/// are readable AND equal the expected identity the attach was
-/// planned against. Generic over the identity tuple: count uses
-/// encoded (dev, ino), discovery uses raw (dev, ino).
-pub fn binding_holds<T: PartialEq>(before: &Option<T>, after: &Option<T>, expected: &T) -> bool {
-    before.as_ref() == Some(expected) && after.as_ref() == Some(expected)
-}
+// H4 removed `verify_backing` and `binding_holds` (F-A/A1
+// open-then-verify plus pre/post-sample attach binding): the fd
+// pin subsumes both — the open file description IS the binding,
+// so there is nothing to re-sample or compare after attach, and
+// the old comment's "no userspace flow can pin the resolution"
+// is superseded by fd-path attaches (proven in the H4 §4 spike).
+// Design: docs/2026-10-11-h4-descriptor-custody-design.md §2.
 
 /// One round's read of a mapped file: bytes plus the read-time
 /// identity (F-A/A3). The identity binds the bytes to the mapping
 /// they are looked up for — a same-path replacement between the
 /// maps read and the files read must not lend the new file's bytes
 /// (or fingerprint) to the old mapping. `dev` is the encoded
-/// device (same domain as [`sample_backing`]).
+/// device (same domain as [`PinnedFile::device`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileBytes {
     pub bytes: Vec<u8>,
@@ -751,37 +786,70 @@ mod tests {
         assert_eq!(device_id_of_maps_dev("bogus"), None);
     }
 
-    #[test]
-    fn verify_backing_checks_open_file() {
-        use std::os::unix::fs::MetadataExt as _;
-        let exe = std::env::current_exe().unwrap();
-        let meta = std::fs::metadata(&exe).unwrap();
-        let id = encode_device(libc::major(meta.dev()), libc::minor(meta.dev()));
-        let path = exe.to_str().unwrap();
-        assert!(verify_backing(path, id, meta.ino()).is_ok());
-        // Wrong inode or device fails closed.
-        assert!(verify_backing(path, id, meta.ino().wrapping_add(1)).is_err());
-        assert!(verify_backing(path, encode_device(0xdead, 0xbeef), meta.ino()).is_err());
-        // Missing path fails (open error, not a silent pass).
-        assert!(verify_backing("/nonexistent-osslscope-probe-path", id, meta.ino()).is_err());
-    }
+    // H4 removed `verify_backing_checks_open_file` with
+    // `verify_backing`: the pin fstats the open fd itself (no
+    // path-vs-plan comparison exists to test at this layer —
+    // callers compare, pinned by the count-session H4 tests).
 
     #[test]
-    fn attach_binding_needs_expected_identity() {
-        // A1: pre==post is not enough — both samples may describe
-        // the REPLACEMENT (moved between verify and pre). The
-        // binding holds only when both samples equal the expected
-        // identity the provenance was planned against.
-        let old = (11u64, 100u64);
-        let new = (11u64, 200u64);
-        assert!(binding_holds(&Some(old), &Some(old), &old));
-        assert!(!binding_holds(&Some(new), &Some(new), &old));
-        assert!(!binding_holds(&Some(old), &Some(new), &old));
-        assert!(!binding_holds(&Some(new), &Some(old), &old));
-        assert!(!binding_holds(&None, &None, &old));
-        assert!(!binding_holds(&Some(old), &None, &old));
-        assert!(!binding_holds(&None, &Some(old), &old));
+    fn h4_t2_pin_open_retries_bounded_then_fails() {
+        // H4: the pin open retries transient absence (a swap
+        // landing mid-open) — bounded, then the last error
+        // surfaces. Mismatches are NOT retried here (open is
+        // atomic: a mismatch is deterministic, and F-D/Am1
+        // forbids installer maps re-reads — fresh-maps retry
+        // happens at the next-poll boundary, not here).
+        use std::cell::Cell;
+        use std::os::fd::AsRawFd as _;
+        // First-try success: one attempt.
+        let attempts = Cell::new(0u32);
+        let exe = std::env::current_exe()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let pin = resolve_pinned_retry(|| {
+            attempts.set(attempts.get() + 1);
+            resolve_pinned(&exe)
+        })
+        .expect("first-try open succeeds");
+        assert_eq!(attempts.get(), 1);
+        assert_eq!(
+            pin.link_path(),
+            format!("/proc/self/fd/{}", pin.fd.as_raw_fd()),
+            "link_path form"
+        );
+        // Absent-then-present: the retry lands it.
+        let attempts2 = Cell::new(0u32);
+        let pin2 = resolve_pinned_retry(|| {
+            attempts2.set(attempts2.get() + 1);
+            if attempts2.get() < 2 {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "swap in flight",
+                ))
+            } else {
+                resolve_pinned(&exe)
+            }
+        })
+        .expect("retry succeeds");
+        assert_eq!(attempts2.get(), 2);
+        assert_eq!(pin2.ino, pin.ino, "same file pinned");
+        // Persistent failure: EXACTLY the bound, last error kept.
+        let attempts3 = Cell::new(0u32);
+        let err = resolve_pinned_retry(|| {
+            attempts3.set(attempts3.get() + 1);
+            Err::<PinnedFile, _>(std::io::Error::new(std::io::ErrorKind::NotFound, "gone"))
+        })
+        .expect_err("persistent absence must fail");
+        assert_eq!(attempts3.get(), PIN_OPEN_ATTEMPTS);
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
+
+    // H4 removed `attach_binding_needs_expected_identity` with
+    // `binding_holds`: no post-attach binding decision exists
+    // anymore — the fd IS the pin (the A→B→A race is
+    // unrepresentable, pinned by H4-T1 at the caller).
 
     #[test]
     fn bound_bytes_requires_identity_match() {
@@ -814,16 +882,23 @@ mod tests {
     }
 
     #[test]
-    fn sample_backing_matches_stat() {
+    fn resolve_pinned_stats_the_open_file() {
+        // H4 successor to sample_backing_matches_stat: the pin
+        // carries the OPEN file's fstat identity (not a path
+        // sample), and a missing path fails (open error, not a
+        // silent pass).
         use std::os::unix::fs::MetadataExt as _;
         let exe = std::env::current_exe().unwrap();
         let meta = std::fs::metadata(&exe).unwrap();
-        let expect = (
-            encode_device(libc::major(meta.dev()), libc::minor(meta.dev())),
-            meta.ino(),
+        let pin = resolve_pinned(exe.to_str().unwrap()).unwrap();
+        assert_eq!(
+            (pin.device, pin.ino),
+            (
+                encode_device(libc::major(meta.dev()), libc::minor(meta.dev())),
+                meta.ino()
+            )
         );
-        assert_eq!(sample_backing(exe.to_str().unwrap()).unwrap(), expect);
-        assert!(sample_backing("/nonexistent-osslscope-probe-path").is_err());
+        assert!(resolve_pinned("/nonexistent-osslscope-probe-path").is_err());
     }
 
     #[test]
