@@ -597,6 +597,12 @@ fn doc_json(doc: &CaptureDocument) -> serde_json::Value {
                 "attached": c.attached,
             })
         }).collect::<Vec<_>>(),
+        "legacy_partition": serde_json::json!({
+            "legacy_exclusive_calls": doc.legacy_partition.legacy_exclusive,
+            "non_legacy_exclusive_calls": doc.legacy_partition.non_legacy_exclusive,
+            "shared_ambiguous_calls": doc.legacy_partition.shared_ambiguous,
+            "unfenced_tail_calls": doc.legacy_partition.unfenced_tails,
+        }),
     });
     // Report/check convention (v1-compatible): unevaluated policy
     // and unrecorded disposition omit their sections.
@@ -1331,7 +1337,9 @@ fn render_failed_outcome(dest: &OutputDest, detail: &str) -> ArtifactOutcome {
 /// observed), unknown target/toolchain, caller attaches the policy
 /// section for the check shape.
 pub fn setup_failure_document(fatal: FatalKind) -> CaptureDocument {
-    use crate::evidence::{CaptureWindow, FinalizeInput, OpensslVersion, TargetRecord, finalize};
+    use crate::evidence::{
+        CaptureWindow, FinalizeInput, LegacyCallPartition, OpensslVersion, TargetRecord, finalize,
+    };
     finalize(FinalizeInput {
         window: CaptureWindow {
             requested_start_ns: 0,
@@ -1350,6 +1358,7 @@ pub fn setup_failure_document(fatal: FatalKind) -> CaptureDocument {
         openssl: OpensslVersion::unknown(),
         disposition: None,
         policy: None,
+        legacy_partition: LegacyCallPartition::default(),
     })
 }
 

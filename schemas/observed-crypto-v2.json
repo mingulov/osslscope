@@ -4,7 +4,7 @@
   "title": "observed-crypto v2",
   "description": "osslscope report/check window document (continuation R08). The counted unit is entry into a provider-dispatch callback at one physical site; candidates are sorted attribution metadata, not definite executed-algorithm identity. Producers emit observed-crypto-v2.0 today. Readers gate majors via check_version_v2 (accept v2.x, reject other majors); validators enforce this minor's schema strictly (unknown keys fail: a v2.0 validator cannot verify v2.1 keys it does not know) while field-level readers ignore unknown keys. report documents omit policy/disposition when unevaluated/unrecorded; check documents add policy. No raw argv, cmdline, environment or runtime addresses anywhere: every object forbids additional properties.",
   "type": "object",
-  "required": ["schema_version", "target", "openssl", "window", "completeness", "sites", "fenced", "objects", "coverage"],
+  "required": ["schema_version", "target", "openssl", "window", "completeness", "sites", "fenced", "objects", "coverage", "legacy_partition"],
   "additionalProperties": false,
   "properties": {
     "schema_version": {
@@ -110,6 +110,18 @@
             "items": { "$ref": "#/$defs/site" }
           }
         }
+      }
+    },
+    "legacy_partition": {
+      "description": "Legacy call partition (H8): counted callback executions split by candidate class and backing identity. The four buckets conserve exactly: their sum equals the sites plus fenced call total.",
+      "type": "object",
+      "required": ["legacy_exclusive_calls", "non_legacy_exclusive_calls", "shared_ambiguous_calls", "unfenced_tail_calls"],
+      "additionalProperties": false,
+      "properties": {
+        "legacy_exclusive_calls": { "$ref": "#/$defs/u64" },
+        "non_legacy_exclusive_calls": { "$ref": "#/$defs/u64" },
+        "shared_ambiguous_calls": { "$ref": "#/$defs/u64" },
+        "unfenced_tail_calls": { "$ref": "#/$defs/u64" }
       }
     },
     "objects": {

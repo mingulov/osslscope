@@ -17,8 +17,8 @@ use osslscope::check::{exit_for, policy_json, policy_record};
 use osslscope::evidence::{
     CandidateCoverage, CandidateIdentity, CaptureDocument, CaptureWindow, Completeness,
     CounterKind, CounterSource, CounterUnits, ExpectedScope, FatalKind, FencedGeneration,
-    FinalizeInput, GapCounter, MatchBounds, ObjectId, OpensslVersion, RuleVerdict, ScopeCoverage,
-    SiteExecution, SiteKey, TargetRecord, finalize,
+    FinalizeInput, GapCounter, LegacyCallPartition, MatchBounds, ObjectId, OpensslVersion,
+    RuleVerdict, ScopeCoverage, SiteExecution, SiteKey, TargetRecord, finalize,
 };
 use osslscope::policy::{ENGINE_PROVIDER_CLASS, PolicyOutcome, PolicyRule, evaluate_document};
 use osslscope::report::{
@@ -105,6 +105,7 @@ fn doc(
         openssl: OpensslVersion::unknown(),
         disposition: None,
         policy: None,
+        legacy_partition: LegacyCallPartition::default(),
     })
 }
 

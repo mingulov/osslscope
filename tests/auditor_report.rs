@@ -799,8 +799,8 @@ fn story_output_conforms() {
 use osslscope::evidence::{
     CandidateCoverage, CandidateIdentity, CaptureDocument, CaptureWindow, CounterKind,
     CounterSource, CounterUnits, DispositionRecord, ExpectedScope, FinalizeInput, GapCounter,
-    ObjectId, ObjectRecord, OpensslVersion, PolicyRecord, PolicyRuleResult, PolicyVerdict,
-    RuleVerdict, ScopeCoverage, SiteExecution, SiteKey, TargetRecord, finalize,
+    LegacyCallPartition, ObjectId, ObjectRecord, OpensslVersion, PolicyRecord, PolicyRuleResult,
+    PolicyVerdict, RuleVerdict, ScopeCoverage, SiteExecution, SiteKey, TargetRecord, finalize,
 };
 use osslscope::report::render_json;
 use osslscope::schema::{check_v2_semantics, validate_v2};
@@ -976,6 +976,15 @@ fn auditor_v2_fixture() -> CaptureDocument {
                 },
             ],
         }),
+        // Honest by construction: every candidate above is
+        // default-class, so all 500 counted calls (400 + 0 + 60
+        // current, 40 fenced) land non-legacy-exclusive.
+        legacy_partition: LegacyCallPartition {
+            legacy_exclusive: 0,
+            non_legacy_exclusive: 500,
+            shared_ambiguous: 0,
+            unfenced_tails: 0,
+        },
     };
     finalize(input)
 }
@@ -1055,6 +1064,19 @@ fn golden_v2_exercises_branches() {
     assert_eq!(o["policy"]["verdict"], "violation");
     assert!(o.contains_key("disposition"), "v2 golden needs disposition");
     assert_eq!(o["openssl"]["state"], "verified");
+    // H8: the golden pins the legacy partition and its
+    // conservation (500 = 400 + 0 + 60 current + 40 fenced).
+    let part = o["legacy_partition"].as_object().unwrap();
+    assert_eq!(part["non_legacy_exclusive_calls"], 500);
+    assert_eq!(
+        part["legacy_exclusive_calls"]
+            .as_u64()
+            .unwrap()
+            .saturating_add(part["non_legacy_exclusive_calls"].as_u64().unwrap())
+            .saturating_add(part["shared_ambiguous_calls"].as_u64().unwrap())
+            .saturating_add(part["unfenced_tail_calls"].as_u64().unwrap()),
+        500
+    );
 }
 
 #[test]
@@ -1109,6 +1131,20 @@ fn tampered_v2_documents_rejected() {
         None,
         Box::new(|d: &mut Value| {
             d["sites"][0]["calls"] = Value::from("400");
+        }),
+    ));
+    cases.push((
+        "drop legacy_partition",
+        None,
+        Box::new(|d: &mut Value| {
+            d.as_object_mut().unwrap().remove("legacy_partition");
+        }),
+    ));
+    cases.push((
+        "skew partition bucket",
+        Some("semantics"),
+        Box::new(|d: &mut Value| {
+            d["legacy_partition"]["unfenced_tail_calls"] = Value::from(1);
         }),
     ));
     cases.push((

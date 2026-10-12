@@ -20,7 +20,8 @@
 
 use osslscope::evidence::{
     CandidateCoverage, CandidateIdentity, CaptureDocument, CaptureWindow, Completeness, FatalKind,
-    FinalizeInput, ObjectId, OpensslVersion, SiteExecution, SiteKey, TargetRecord, finalize,
+    FinalizeInput, LegacyCallPartition, ObjectId, OpensslVersion, SiteExecution, SiteKey,
+    TargetRecord, finalize,
 };
 use osslscope::policy::{PolicyOutcome, PolicyRule, evaluate_document};
 use osslscope::report::{
@@ -111,6 +112,7 @@ fn doc_with(sites: Vec<SiteExecution>, fatal: Option<FatalKind>) -> CaptureDocum
         openssl: OpensslVersion::unknown(),
         disposition: None,
         policy: None,
+        legacy_partition: LegacyCallPartition::default(),
     })
 }
 

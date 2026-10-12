@@ -17,9 +17,9 @@ use osslscope::check::policy_record;
 use osslscope::evidence::{
     CandidateCoverage, CandidateIdentity, CaptureDocument, CaptureWindow, Completeness,
     CounterKind, CounterSource, CounterUnits, DispositionRecord, ExpectedScope, FatalKind,
-    FencedGeneration, FinalizeInput, GapCounter, ObjectId, ObjectRecord, OpensslVersion,
-    PolicyRecord, PolicyRuleResult, PolicyVerdict, RuleVerdict, ScopeCoverage, SiteExecution,
-    SiteKey, TargetRecord, finalize,
+    FencedGeneration, FinalizeInput, GapCounter, LegacyCallPartition, ObjectId, ObjectRecord,
+    OpensslVersion, PolicyRecord, PolicyRuleResult, PolicyVerdict, RuleVerdict, ScopeCoverage,
+    SiteExecution, SiteKey, TargetRecord, finalize,
 };
 use osslscope::policy::{PolicyRule, evaluate_document};
 use osslscope::report::{
@@ -140,7 +140,32 @@ fn input_base() -> FinalizeInput {
         openssl: OpensslVersion::verified("3.5.1".to_string()),
         disposition: Some(DispositionRecord::exited(0)),
         policy: None,
+        legacy_partition: LegacyCallPartition::default(),
     }
+}
+
+/// Finalize with an honest legacy partition: no fixture in this
+/// file enrolls legacy-class candidates, so every counted call
+/// (current plus fenced) lands non-legacy-exclusive. Keeps the
+/// conservation check passing for its intended subject, never as
+/// the failure under test.
+fn finalize_honest(mut input: FinalizeInput) -> CaptureDocument {
+    let mut total = 0u64;
+    for site in &input.sites {
+        total = total.saturating_add(site.calls);
+    }
+    for bucket in &input.fenced {
+        for site in &bucket.sites {
+            total = total.saturating_add(site.calls);
+        }
+    }
+    input.legacy_partition = LegacyCallPartition {
+        legacy_exclusive: 0,
+        non_legacy_exclusive: total,
+        shared_ambiguous: 0,
+        unfenced_tails: 0,
+    };
+    finalize(input)
 }
 
 /// COMPLETE report document: two definite sites (500 + 300 calls),
@@ -217,7 +242,7 @@ fn complete_doc() -> CaptureDocument {
             value: 1,
         },
     ];
-    let doc = finalize(input);
+    let doc = finalize_honest(input);
     assert_eq!(doc.status, Completeness::Complete);
     assert_eq!(doc.total_calls(), 900);
     doc
@@ -276,7 +301,7 @@ fn partial_doc() -> CaptureDocument {
     );
     input.openssl = OpensslVersion::unknown();
     input.disposition = Some(DispositionRecord::detached_running(9));
-    let doc = finalize(input);
+    let doc = finalize_honest(input);
     assert!(matches!(doc.status, Completeness::Partial { .. }));
     doc
 }
@@ -296,7 +321,7 @@ fn fatal_doc() -> CaptureDocument {
     input.target = TargetRecord::new(11, "gone".to_string(), String::new(), String::new());
     input.openssl = OpensslVersion::unknown();
     input.disposition = None;
-    let doc = finalize(input);
+    let doc = finalize_honest(input);
     assert!(matches!(
         doc.status,
         Completeness::Fatal {
@@ -387,7 +412,7 @@ fn violation_doc() -> CaptureDocument {
             },
         ],
     });
-    let doc = finalize(input);
+    let doc = finalize_honest(input);
     assert!(matches!(doc.status, Completeness::Complete));
     doc
 }
@@ -426,7 +451,7 @@ fn inconclusive_doc() -> CaptureDocument {
             evidence: Vec::new(),
         }],
     });
-    finalize(input)
+    finalize_honest(input)
 }
 
 /// Pass check document: definite SHA use, denied DES cleanly absent.
@@ -459,7 +484,7 @@ fn pass_doc() -> CaptureDocument {
             evidence: Vec::new(),
         }],
     });
-    finalize(input)
+    finalize_honest(input)
 }
 
 fn json_of(doc: &CaptureDocument) -> Value {
@@ -547,14 +572,14 @@ fn h5_t4b_anonymous_advertising_provider_assembles_and_validates() {
         inode: 0,
         display_locator: String::new(),
     });
-    let v = json_of(&finalize(input));
+    let v = json_of(&finalize_honest(input));
     validate_v2(&v).expect("anonymous-provider doc fails schema");
     check_v2_semantics(&v).expect("anonymous-provider doc fails semantics");
     // Negative pin: the same site without the anonymous record
     // is an unlisted ref — rejected.
     let mut input = input_base();
     input.sites = vec![site()];
-    let v = json_of(&finalize(input));
+    let v = json_of(&finalize_honest(input));
     let err = check_v2_semantics(&v).expect_err("dangling anonymous provider accepted");
     assert!(err.contains("unlisted object"), "unexpected: {err}");
 }
@@ -1278,7 +1303,7 @@ fn shuffled_variants() -> Vec<CaptureDocument> {
                     0xdef + round,
                 ),
             });
-            finalize(input)
+            finalize_honest(input)
         })
         .collect()
 }
@@ -2046,7 +2071,7 @@ fn unresolved_doc() -> CaptureDocument {
         discovered: 2,
         attached: 2,
     }];
-    let doc = finalize(input);
+    let doc = finalize_honest(input);
     assert!(
         matches!(doc.status, Completeness::Complete),
         "unresolved classes are not gaps: {:?}",
@@ -2100,7 +2125,7 @@ fn h3_t4_mixed_site_lands_in_cbom_omitted_unknown() {
         vec![cand(FP_A, "default", 1, 7, &["SHA-256"], true)],
         CandidateCoverage::Unknown,
     )];
-    let doc = finalize(input);
+    let doc = finalize_honest(input);
     let cbom = cbom_of(&doc);
     assert_eq!(cbom["components"].as_array().unwrap().len(), 0);
     let meta = cbom_metadata(&cbom);

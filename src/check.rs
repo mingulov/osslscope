@@ -518,8 +518,8 @@ mod tests {
     use super::*;
     use crate::evidence::{
         CandidateCoverage, CandidateIdentity, CaptureWindow, CounterKind, CounterSource,
-        CounterUnits, FinalizeInput, GapCounter, ObjectId, OpensslVersion, SiteExecution, SiteKey,
-        TargetRecord,
+        CounterUnits, FinalizeInput, GapCounter, LegacyCallPartition, ObjectId, OpensslVersion,
+        SiteExecution, SiteKey, TargetRecord,
     };
     use crate::policy::{Predicate, Rule};
     use crate::report::{ArtifactOutcome, DeliveryResult};
@@ -578,6 +578,7 @@ mod tests {
             openssl: OpensslVersion::unknown(),
             disposition: None,
             policy: None,
+            legacy_partition: LegacyCallPartition::default(),
         })
     }
 
@@ -785,6 +786,7 @@ mod tests {
             openssl: OpensslVersion::unknown(),
             disposition: None,
             policy: None,
+            legacy_partition: LegacyCallPartition::default(),
         });
         let inconclusive = evaluate_document(
             std::slice::from_ref(&PolicyRule::deny_algorithm("AES-256-GCM")),
@@ -852,6 +854,7 @@ mod tests {
             openssl: OpensslVersion::unknown(),
             disposition: None,
             policy: None,
+            legacy_partition: LegacyCallPartition::default(),
         });
         let v = evaluate_document(
             &[
@@ -991,6 +994,7 @@ mod tests {
             openssl: OpensslVersion::unknown(),
             disposition: None,
             policy: None,
+            legacy_partition: LegacyCallPartition::default(),
         });
         let v = evaluate_document(
             std::slice::from_ref(&PolicyRule::deny_algorithm("DES")),
