@@ -7,7 +7,9 @@
 //! proves the callback fires N×M, (c) captures the success-path
 //! verifier cost.
 
-use osslscope::loader::{MapSpec, ProgSpec};
+use osslscope::loader::{
+    MapFixup, MapSpec, MapSpecLite, Prepared, PreparedProg, ProgSpec, SubprogInfo,
+};
 use std::os::fd::AsRawFd as _;
 
 /// `BPF_FUNC_loop` (kernel ABI; the verifier log names the callee,
@@ -167,6 +169,79 @@ fn prepare_loop() -> osslscope::loader::Prepared {
     .expect("prepare callback shape")
 }
 
+/// Hand-built `Prepared` with one map fixup (`Prepared` fields are
+/// public, so `load()` cannot assume `prepare()` validated the
+/// site): the load path must reject misaligned, reserved-byte, and
+/// truncated fixup sites before patching.
+fn fixup_prep(insns: Vec<u8>, off: usize) -> Prepared {
+    Prepared {
+        maps: vec![MapSpecLite {
+            name: "DCOUNT".to_string(),
+            map_type: 2,
+            key_size: 4,
+            value_size: 8,
+            max_entries: 1,
+            flags: 0,
+        }],
+        progs: vec![PreparedProg {
+            name: "dprobefix".to_string(),
+            is_return: false,
+            insns,
+            map_fixups: vec![MapFixup {
+                insn_off: off,
+                map: "DCOUNT".to_string(),
+            }],
+            subprogs: vec![SubprogInfo {
+                name: "dprobefix".to_string(),
+                insn_off: 0,
+                is_callback: false,
+            }],
+        }],
+    }
+}
+
+fn ld_imm64_r1() -> [u8; 16] {
+    let mut s = [0u8; 16];
+    s[0] = 0x18;
+    s[1] = 0x01;
+    s
+}
+
+#[test]
+#[ignore = "live lane only (see module docs)"]
+fn load_rejects_bad_map_fixup_sites() {
+    if !gated() {
+        eprintln!("d live leg: set OSSL_D_LIVE=1; skipping");
+        return;
+    }
+    // Reserved offset bytes set.
+    let mut site = ld_imm64_r1();
+    site[2] = 1;
+    let mut insns = site.to_vec();
+    insns.extend_from_slice(&[0x95, 0, 0, 0, 0, 0, 0, 0]);
+    let e = osslscope::loader::load(&fixup_prep(insns, 0))
+        .err()
+        .expect("reserved fixup must fail");
+    assert!(
+        e.to_string().contains("map site reserved bytes set"),
+        "{e:#}"
+    );
+    // Misaligned site.
+    let mut insns = vec![0u8; 4];
+    insns.extend_from_slice(&ld_imm64_r1());
+    insns.extend_from_slice(&[0u8; 4]);
+    let e = osslscope::loader::load(&fixup_prep(insns, 4))
+        .err()
+        .expect("misaligned fixup must fail");
+    assert!(e.to_string().contains("map site misaligned"), "{e:#}");
+    // Truncated site (first slot only).
+    let insns = ld_imm64_r1()[..8].to_vec();
+    let e = osslscope::loader::load(&fixup_prep(insns, 0))
+        .err()
+        .expect("truncated fixup must fail");
+    assert!(e.to_string().contains("map site out of range"), "{e:#}");
+}
+
 /// The callback shape prepares (relocation + subprog table) and
 /// LOADS on 7.0: the loader synthesizes BTF + func_info for the
 /// callback, answering r5's `missing btf func_info` EINVAL.
@@ -208,8 +283,101 @@ fn own_libc() -> String {
 
 fn read_count(map_fd: std::os::fd::RawFd) -> u64 {
     let mut val = [0u8; 8];
-    ossl_bpf_sys::map_lookup_elem(map_fd, &0u32.to_le_bytes(), &mut val).expect("lookup DCOUNT[0]");
+    // SAFETY: DCOUNT is key 4 / value 8 (plain ARRAY); the key is
+    // a `u32` encoding and `val` is `[u8; 8]`, fd live (asserted —
+    // a short buffer would be kernel-written heap overflow).
+    debug_assert_eq!(val.len(), 8);
+    unsafe { ossl_bpf_sys::map_lookup_elem(map_fd, &0u32.to_le_bytes(), &mut val) }
+        .expect("lookup DCOUNT[0]");
     u64::from_le_bytes(val)
+}
+
+/// Parsed verifier success summary (lane kernel 7.0 line shape:
+/// `processed 20 insns (limit 1000000) max_states_per_insn 1
+/// total_states 2 peak_states 3 mark_read 0`). The state metrics are
+/// verifier STATES, not frames.
+struct VerifierCost {
+    processed: u64,
+    max_states_per_insn: u64,
+    total_states: u64,
+    peak_states: u64,
+}
+
+/// Parse one verifier summary line. Every required field must be
+/// present and numeric — a missing or malformed metric is a failed
+/// pin (`None`), never a silent default.
+fn parse_verifier_cost(line: &str) -> Option<VerifierCost> {
+    let tok: Vec<&str> = line.split_whitespace().collect();
+    // `processed <n> insns` head.
+    if tok.len() < 3 || tok[0] != "processed" || tok[2] != "insns" {
+        return None;
+    }
+    let processed: u64 = tok[1].parse().ok()?;
+    // Required `key <n>` metrics (other pairs like `(limit N)` and
+    // `mark_read 0` are ignored).
+    let mut metric = |key: &str| -> Option<u64> {
+        let i = tok.iter().position(|t| *t == key)?;
+        tok.get(i + 1)?.parse().ok()
+    };
+    Some(VerifierCost {
+        processed,
+        max_states_per_insn: metric("max_states_per_insn")?,
+        total_states: metric("total_states")?,
+        peak_states: metric("peak_states")?,
+    })
+}
+
+#[test]
+fn cost_parser_accepts_golden_line() {
+    let c = parse_verifier_cost(
+        "processed 20 insns (limit 1000000) max_states_per_insn 1 total_states 2 peak_states 3 mark_read 0",
+    )
+    .expect("golden line must parse");
+    assert_eq!(c.processed, 20);
+    assert_eq!(c.max_states_per_insn, 1);
+    assert_eq!(c.total_states, 2);
+    assert_eq!(c.peak_states, 3);
+}
+
+#[test]
+fn cost_parser_rejects_missing_metric() {
+    assert!(
+        parse_verifier_cost(
+            "processed 20 insns (limit 1000000) max_states_per_insn 1 total_states 2 mark_read 0"
+        )
+        .is_none(),
+        "dropped peak_states must not parse"
+    );
+}
+
+#[test]
+fn cost_parser_rejects_malformed_number() {
+    assert!(
+        parse_verifier_cost(
+            "processed XX insns max_states_per_insn 1 total_states 2 peak_states 3"
+        )
+        .is_none(),
+        "non-numeric processed must not parse"
+    );
+    assert!(
+        parse_verifier_cost(
+            "processed 20 insns max_states_per_insn 1 total_states 2 peak_states 3x"
+        )
+        .is_none(),
+        "trailing garbage must not parse"
+    );
+}
+
+#[test]
+fn cost_parser_rejects_wrong_shape() {
+    assert!(
+        parse_verifier_cost("verification successful").is_none(),
+        "non-summary line must not parse"
+    );
+    assert!(
+        parse_verifier_cost("").is_none(),
+        "empty line must not parse"
+    );
 }
 
 /// The callback FIRES: attached to our own `getpid`, three calls
@@ -233,8 +401,12 @@ fn bpf_loop_callback_fires_nxm() {
         osslscope::discovery::elf::dynsym_file_offset(&elf_bytes, "getpid").expect("getpid off");
     let path = std::ffi::CString::new(libc).unwrap();
     // Self-pid filter: exact counts (system-wide would catch
-    // stray getpids). No getpid may run between attach and the
-    // reads except the trigger loop itself.
+    // stray getpids). The filter covers the whole THREAD GROUP, so
+    // exactness additionally requires single-threaded execution: the
+    // leg itself is synchronous (getpid only in the trigger loop,
+    // none between attach and the reads otherwise) and the live
+    // runner uses --test-threads=1, so no sibling test thread can
+    // issue getpid concurrently.
     let _link =
         ossl_bpf_sys::link_create_uprobe_multi(prog_fd, &path, &[off], &[0], std::process::id())
             .expect("attach dprobe to getpid");
@@ -249,14 +421,16 @@ fn bpf_loop_callback_fires_nxm() {
     );
 }
 
-/// Structural pin on the kernel's linked image: the kernel
+/// Callback identity in the kernel's linked image: the kernel
 /// expands the `bpf_loop` call into a bounds-check + dispatch
-/// sequence and relocates the callback (observed 168B sent ->
-/// 360B stored on 7.0), so byte ranges past the setup are NOT
-/// pinned — only invariants a pruning/linking failure would
-/// break: growth (a pruned callback shrinks to main-only 64B),
-/// the func-ptr site intact, and its imm pointing inside the
-/// stored image (a dangling link would not).
+/// sequence and relocates the callback (lane 7.0 profile: 168B sent
+/// -> 360B stored), so exact bytes past the setup are NOT pinned.
+/// Pinned instead: growth as an anti-pruning observation (a pruned
+/// callback shrinks to main-only 64B), the func-ptr site intact,
+/// its imm decoded RELATIVELY (an absolute reading lands on main's
+/// own exit), the expansion's static call agreeing on the same
+/// entry, the callback's map-load prologue at that entry, and the
+/// xlated exit count matching the linked subprog table.
 #[test]
 #[ignore = "live lane only (see module docs)"]
 fn bpf_loop_shape_kernel_image_matches_send() {
@@ -284,10 +458,76 @@ fn bpf_loop_shape_kernel_image_matches_send() {
         &p.insns[16..48],
         "register setup must survive verbatim"
     );
-    let target = u32::from_le_bytes([xlated[4], xlated[5], xlated[6], xlated[7]]) as usize;
+    // Callback identity, three independent ways. The kernel keeps
+    // the func-ptr imm relative (lane 7.0 rewrote 7 -> 25 for the
+    // expanded layout; an absolute reading would land on main's
+    // own exit, not the callback).
+    let imm = u32::from_le_bytes([xlated[4], xlated[5], xlated[6], xlated[7]]) as usize;
+    let entry = 0 + 1 + imm;
     assert!(
-        target + 1 < xlated.len() / 8,
-        "linked func-ptr imm ({target}) must land inside the stored image"
+        entry * 8 + 8 <= xlated.len(),
+        "func-ptr target ({entry}) must land inside the stored image"
+    );
+    // (1) The loop expansion's static pseudo-call must agree: scan
+    // for CALL-with-PSEUDO_CALL-src (stepping over `ld_imm64`
+    // second slots, whose bytes are not opcodes) and decode each
+    // relative target. NOTE: xlated pseudo-calls decode from `off`
+    // (observed: imm reads 0), unlike pre-verifier images, which
+    // keep the toolchain imm-form the loader writes.
+    let mut call_targets = Vec::new();
+    let mut i = 0;
+    while i * 8 + 8 <= xlated.len() {
+        let op = xlated[i * 8];
+        if op == 0x85 && xlated[i * 8 + 1] >> 4 == 1 {
+            let rel = i16::from_le_bytes([xlated[i * 8 + 2], xlated[i * 8 + 3]]);
+            call_targets.push(i as i64 + 1 + rel as i64);
+        }
+        i += if op == 0x18 { 2 } else { 1 };
+    }
+    assert!(
+        call_targets.contains(&(entry as i64)),
+        "a static call must target the func-ptr entry {entry}: {call_targets:?}"
+    );
+    // (2) Recognizable callback prologue at the entry: the counter
+    // map load (`ld_imm64 r1`, map-fd src nibble — the loader
+    // patched the fd pre-load and the kernel kept the shape).
+    assert_eq!(xlated[entry * 8], 0x18, "callback must open with ld_imm64");
+    assert_eq!(
+        xlated[entry * 8 + 1],
+        0x11,
+        "callback map load must keep dst r1 + map-fd src"
+    );
+    // (3) Subprogram count from exit scan must match the linked
+    // table, and the callback must follow main's terminal exit
+    // (it sits past its linked position: the expansion moved it).
+    let mut exits = Vec::new();
+    let mut j = 0;
+    while j * 8 + 8 <= xlated.len() {
+        let op = xlated[j * 8];
+        if op == 0x95 {
+            exits.push(j);
+        }
+        j += if op == 0x18 { 2 } else { 1 };
+    }
+    assert_eq!(
+        exits.len(),
+        p.subprogs.len(),
+        "xlated exits must match linked subprogs: {exits:?}"
+    );
+    assert!(
+        exits[0] < entry,
+        "callback entry {entry} must follow main's exit at {}",
+        exits[0]
+    );
+    let sent_cb = p
+        .subprogs
+        .iter()
+        .find(|s| s.is_callback)
+        .expect("callback")
+        .insn_off as usize;
+    assert!(
+        entry > sent_cb,
+        "callback entry {entry} must sit past its linked offset {sent_cb}"
     );
 }
 
@@ -357,8 +597,13 @@ fn bpf_loop_shape_verifier_cost() {
             .any(|l| l.contains("call bpf_loop#") && l.contains(&format!("{BPF_FUNC_LOOP}"))),
         "verifier must decode the call as bpf_loop#{BPF_FUNC_LOOP}"
     );
-    assert!(
-        summary.contains("processed"),
-        "verifier must report processed insns: {summary}"
-    );
+    // Numeric cost pin for the fixed 8+13 shape on the lane kernel
+    // (7.0): exact expectations, not bounds. Drift means the shape
+    // or the verifier changed — investigate before updating, and
+    // note the metrics are verifier STATES, not frames.
+    let cost = parse_verifier_cost(&summary).expect("parse verifier summary");
+    assert_eq!(cost.processed, 20, "processed insns: {summary}");
+    assert_eq!(cost.max_states_per_insn, 1, "max states: {summary}");
+    assert_eq!(cost.total_states, 2, "total states: {summary}");
+    assert_eq!(cost.peak_states, 3, "peak states: {summary}");
 }
