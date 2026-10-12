@@ -199,9 +199,9 @@ pub fn map_create(
 ///
 /// The kernel reads exactly the map's key/value sizes from the raw
 /// pointers: `key` must be exactly `key_size` bytes, `value`
-/// exactly `value_size` bytes (per-CPU maps: `value_size` × CPUs),
-/// and `map_fd` a live fd for that map. Short slices make the kernel
-/// read past the allocation.
+/// exactly `value_size` bytes (per-CPU maps: `round_up(value_size,
+/// 8)` × possible CPUs), and `map_fd` a live fd for that map. Short
+/// slices make the kernel read past the allocation.
 pub unsafe fn map_update_elem(
     map_fd: RawFd,
     key: &[u8],
@@ -295,9 +295,10 @@ pub fn prog_xlated_bytes(prog_fd: RawFd) -> io::Result<Vec<u8>> {
 ///
 /// The kernel writes the map's full value size into `value` and
 /// reads `key_size` bytes from `key`: `value` must be exactly
-/// `value_size` bytes (per-CPU maps: `value_size` × CPUs), `key`
-/// exactly `key_size` bytes, and `map_fd` a live fd for that map. A
-/// short `value` is a heap/stack overflow through this call.
+/// `value_size` bytes (per-CPU maps: `round_up(value_size, 8)` ×
+/// possible CPUs), `key` exactly `key_size` bytes, and `map_fd` a
+/// live fd for that map. A short `value` is a heap/stack overflow
+/// through this call.
 pub unsafe fn map_lookup_elem(map_fd: RawFd, key: &[u8], value: &mut [u8]) -> io::Result<()> {
     let mut attr: ElemAttr = zeroed();
     attr.map_fd = map_fd as u32;
