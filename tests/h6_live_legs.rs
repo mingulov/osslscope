@@ -13,7 +13,7 @@
 //! `OSSL_H6_EXPECT=base` asserts pre-H6 verdicts (same
 //! fixtures, old tree — the flip table).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn gated() -> Option<(PathBuf, PathBuf, bool)> {
     if std::env::var("OSSL_H6_LIVE").unwrap_or_default() != "1" {
@@ -43,7 +43,7 @@ fn stage_alias(origin: &PathBuf, tag: &str) -> (PathBuf, PathBuf) {
     (prov, alias)
 }
 
-fn spawn_preloaded(preload: &PathBuf) -> std::process::Child {
+fn spawn_preloaded(preload: &Path) -> std::process::Child {
     std::process::Command::new("sleep")
         .arg("60")
         .env("LD_PRELOAD", preload)
@@ -55,16 +55,16 @@ fn spawn_preloaded(preload: &PathBuf) -> std::process::Child {
 }
 
 fn run_harvest(
-    object: &PathBuf,
-    provider: &PathBuf,
+    object: &Path,
+    provider: &Path,
     pid: u32,
     legacy: bool,
     birth: bool,
 ) -> serde_json::Value {
     let cfg = osslscope::discovery::harvest::Config {
         pid,
-        provider: provider.clone(),
-        object: object.clone(),
+        provider: provider.to_path_buf(),
+        object: object.to_path_buf(),
         settle: std::time::Duration::from_millis(500),
         timeout: std::time::Duration::from_secs(10),
         cmdline_marker: None,
