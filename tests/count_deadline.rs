@@ -441,12 +441,6 @@ struct SwapBackend {
     swap: std::cell::RefCell<Option<(PathBuf, Vec<u8>)>>,
 }
 
-impl SwapBackend {
-    fn fire(&mut self, tgid: u32, cookie: u32, now_ns: u64, n: u64) {
-        self.inner.fire(tgid, cookie, now_ns, n);
-    }
-}
-
 impl CountBackend for SwapBackend {
     type Link = FakeLink;
 
@@ -491,12 +485,114 @@ impl CountBackend for SwapBackend {
 }
 
 #[test]
-fn replaced_during_attach_quarantines_hits() {
-    // A1: the path moves mid-attach (pre=old, post=new): links drop
-    // AND the cookie quarantines — hits recorded under the dropped
-    // links drain as unattributed loss, never misattributed to the
-    // stale provenance.
-    let stage = Stage::fresh("a1drop");
+fn h4_t4_rejected_resolve_attaches_nothing_drains_empty() {
+    // H4 (quarantine-by-construction guard): a resolve the
+    // session rejects (planned identity no longer on disk)
+    // binds NO link — backend.attach is never invoked — so
+    // the drain is exactly empty: no sites, no unattributed
+    // (nothing was ever bound, nothing in flight to route).
+    // GREEN before and after the H4 refactor — the refactor
+    // must not break it.
+    let stage = Stage::fresh("h4t4");
+    let bytes = self_bytes();
+    let off = x_offsets(&bytes, 1)[0];
+    let a = stage.write("prov.so", &bytes);
+    let live = vec![mapping(&a)];
+    let files = HashMap::from([(
+        a.path.clone(),
+        plan::FileBytes {
+            bytes: std::fs::read(&a.path).unwrap(),
+            dev: a.device,
+            ino: a.ino,
+        },
+    )]);
+    // Replace BEFORE attach (new inode; planned identity stale).
+    std::fs::remove_file(&a.path).unwrap();
+    std::fs::write(&a.path, &bytes).unwrap();
+    let mut s = session_with(FakeCountBackend::new());
+    let d = CountDelta {
+        discovered: vec![site(&a, off, 7)],
+        losses: Vec::new(),
+    };
+    let report = s.attach_delta(&d, &live, &files).unwrap();
+    assert!(
+        report.missed.iter().any(|m| m.reason == "replaced"),
+        "stale plan must not bind: {report:?}"
+    );
+    assert_eq!(report.attached, 0);
+    let cookie = s.cookie_for(a.device, a.ino, off).unwrap();
+    assert_eq!(
+        s.backend().attached_path(cookie),
+        None,
+        "rejected resolve must never reach the backend"
+    );
+    s.open_window(1000, 2000).unwrap();
+    let drain = s.close_and_drain(Duration::from_secs(5)).unwrap();
+    assert!(drain.current.is_empty());
+    assert_eq!(
+        counter_value(&drain, "count.unattributed"),
+        Some(0),
+        "rejected resolve routes nothing to unattributed"
+    );
+}
+
+#[test]
+fn h4_t3_pin_survives_path_deletion_until_session_drop() {
+    // H4: the link table owns the pin — deleting the path does
+    // not release the inode (the fd-path still stats to the
+    // pinned identity), and dropping the session releases it
+    // (the fd-path goes dangling — or, if the number was
+    // recycled, it never stats to the deleted inode again).
+    let stage = Stage::fresh("h4t3");
+    let bytes = self_bytes();
+    let off = x_offsets(&bytes, 1)[0];
+    let a = stage.write("prov.so", &bytes);
+    let live = vec![mapping(&a)];
+    let files = HashMap::from([(
+        a.path.clone(),
+        plan::FileBytes {
+            bytes: std::fs::read(&a.path).unwrap(),
+            dev: a.device,
+            ino: a.ino,
+        },
+    )]);
+    let mut s = session_with(FakeCountBackend::new());
+    let d = CountDelta {
+        discovered: vec![site(&a, off, 7)],
+        losses: Vec::new(),
+    };
+    let report = s.attach_delta(&d, &live, &files).unwrap();
+    assert_eq!(report.attached, 1);
+    let cookie = s.cookie_for(a.device, a.ino, off).unwrap();
+    let at = s
+        .backend()
+        .attached_path(cookie)
+        .expect("backend records the attach path")
+        .to_string();
+    assert!(at.starts_with("/proc/self/fd/"), "fd-path form: {at:?}");
+    std::fs::remove_file(&a.path).unwrap();
+    assert_eq!(
+        std::fs::metadata(&at).unwrap().ino(),
+        a.ino,
+        "pin must retain the deleted inode"
+    );
+    drop(s);
+    match std::fs::metadata(&at) {
+        Err(_) => {}
+        Ok(meta) => assert_ne!(meta.ino(), a.ino, "session drop must release the pin"),
+    }
+}
+
+#[test]
+fn h4_t1_mid_attach_swap_binds_pinned_inode_via_fd_path() {
+    // H4: the A→B→A race is unrepresentable — the session pins
+    // (open+fstat) BEFORE backend.attach, so a mid-attach swap
+    // is simply not observed: the attach binds the pinned
+    // (planned) inode through an fd-path, records it, and an
+    // immediate re-attach reuses the live link (no quarantine
+    // stickiness — nothing was ever bound wrong).
+    // RED pre-H4 (backend receives the group path; replaced).
+    let stage = Stage::fresh("h4t1");
     let bytes = self_bytes();
     let off = x_offsets(&bytes, 1)[0];
     let a = stage.write("prov.so", &bytes);
@@ -519,20 +615,81 @@ fn replaced_during_attach_quarantines_hits() {
         losses: Vec::new(),
     };
     let report = s.attach_delta(&d, &live, &files).unwrap();
+    assert_eq!(report.attached, 1, "pinned attach must bind: {report:?}");
     assert!(
-        report.missed.iter().any(|m| m.reason == "replaced"),
-        "mid-attach replacement must drop links: {report:?}"
+        report.missed.iter().all(|m| m.reason != "replaced"),
+        "no replacement observed mid-attach: {report:?}"
     );
+    let cookie = s.cookie_for(a.device, a.ino, off).unwrap();
+    let at = s
+        .backend()
+        .inner
+        .attached_path(cookie)
+        .expect("backend records the attach path")
+        .to_string();
+    assert!(
+        at.starts_with("/proc/self/fd/"),
+        "backend must receive an fd-path, got {at:?}"
+    );
+    // The pin holds the PLANNED (old) inode, not the swap's.
+    assert_eq!(
+        std::fs::metadata(&at).unwrap().ino(),
+        a.ino,
+        "fd-path must stat to the pinned inode"
+    );
+    assert_ne!(
+        std::fs::metadata(&a.path).unwrap().ino(),
+        a.ino,
+        "the swap must have landed (race actually raced)"
+    );
+    // Immediate re-attach: the live pinned link reuses (old
+    // behavior quarantined here — the stickiness is gone).
+    let report2 = s.attach_delta(&d, &live, &files).unwrap();
+    assert_eq!(report2.reused, 1, "live pin must reuse: {report2:?}");
+    assert!(
+        report2.missed.iter().all(|m| m.reason != "quarantined"),
+        "nothing quarantines post-H4: {report2:?}"
+    );
+}
+
+#[test]
+fn h4_unbound_cookie_hits_route_unattributed() {
+    // H4 rework of replaced_during_attach_quarantines_hits: the
+    // !bound setup (mid-attach race → rollback) is unrepresentable
+    // post-pin — but the drain-side proposition survives: hits
+    // under a cookie with NO bound link (backend anomaly model)
+    // drain as unattributed loss, never misattributed.
+    let stage = Stage::fresh("h4unbound");
+    let bytes = self_bytes();
+    let off = x_offsets(&bytes, 1)[0];
+    let a = stage.write("prov.so", &bytes);
+    let live = vec![mapping(&a)];
+    let files = HashMap::from([(
+        a.path.clone(),
+        plan::FileBytes {
+            bytes: std::fs::read(&a.path).unwrap(),
+            dev: a.device,
+            ino: a.ino,
+        },
+    )]);
+    // Stale plan: nothing binds (H4-T4 shape).
+    std::fs::remove_file(&a.path).unwrap();
+    std::fs::write(&a.path, &bytes).unwrap();
+    let mut s = session_with(FakeCountBackend::new());
+    let d = CountDelta {
+        discovered: vec![site(&a, off, 7)],
+        losses: Vec::new(),
+    };
+    let report = s.attach_delta(&d, &live, &files).unwrap();
     assert_eq!(report.attached, 0);
     let cookie = s.cookie_for(a.device, a.ino, off).unwrap();
     s.open_window(1000, 2000).unwrap();
-    // In-flight hits under the dropped links (recorded while they
-    // were briefly live, drained after the drop).
+    // Backend anomaly: hits under the unbound cookie.
     s.backend_mut().fire(PID, cookie, 1500, 7);
     let drain = s.close_and_drain(Duration::from_secs(5)).unwrap();
     assert!(
         drain.current.is_empty(),
-        "dropped-link hits must not attribute: {:?}",
+        "unbound-cookie hits must not attribute: {:?}",
         drain.current
     );
     assert_eq!(counter_value(&drain, "count.unattributed"), Some(7));
@@ -575,15 +732,26 @@ fn fake_backend_folds_bounds_monotonically() {
 }
 
 #[test]
-fn quarantined_cookie_skips_reattach_until_fence() {
-    // A1: a dropped cookie stays quarantined for the generation
-    // (re-attach reports quarantined, never re-binds), and the
-    // fence clears quarantine (the stale identity then fails its
-    // verify as replaced — the new file needs re-discovery).
-    let stage = Stage::fresh("a1quar");
+fn h4_stale_plan_misses_replaced_per_attempt() {
+    // H4 rework of quarantined_cookie_skips_reattach_until_fence:
+    // no quarantine set exists — a stale plan misses `replaced`
+    // on EVERY attempt (same generation, across fences), having
+    // bound nothing; recovery arrives only via a fresh delta
+    // planned against the current file.
+    let stage = Stage::fresh("h4stale");
     let bytes = self_bytes();
     let off = x_offsets(&bytes, 1)[0];
     let a = stage.write("prov.so", &bytes);
+    // Replace before any attach: the plan below is born stale.
+    std::fs::remove_file(&a.path).unwrap();
+    std::fs::write(&a.path, &bytes).unwrap();
+    let meta = std::fs::metadata(&a.path).unwrap();
+    let b = Staged {
+        path: a.path.clone(),
+        device: plan::encode_device(libc::major(meta.dev()), libc::minor(meta.dev())),
+        ino: meta.ino(),
+    };
+    assert_ne!(a.ino, b.ino, "replace must move the inode");
     let live = vec![mapping(&a)];
     let files = HashMap::from([(
         a.path.clone(),
@@ -593,45 +761,61 @@ fn quarantined_cookie_skips_reattach_until_fence() {
             ino: a.ino,
         },
     )]);
-    let backend = SwapBackend {
-        inner: FakeCountBackend::new(),
-        swap: std::cell::RefCell::new(Some((PathBuf::from(&a.path), bytes.clone()))),
-    };
-    let mut s = CountSession::new(PID, backend);
-    let d = CountDelta {
+    let mut s = session_with(FakeCountBackend::new());
+    let stale = CountDelta {
         discovered: vec![site(&a, off, 7)],
         losses: Vec::new(),
     };
-    let report = s.attach_delta(&d, &live, &files).unwrap();
+    let report = s.attach_delta(&stale, &live, &files).unwrap();
+    assert_eq!(report.attached, 0);
     assert!(report.missed.iter().any(|m| m.reason == "replaced"));
-    // Same generation, same (stale) row: quarantined, not rebound.
-    let report2 = s.attach_delta(&d, &live, &files).unwrap();
+    // Same generation, same stale row: replaced again (no
+    // quarantine shadow — per-attempt re-resolve).
+    let report2 = s.attach_delta(&stale, &live, &files).unwrap();
     assert_eq!(report2.attached, 0);
     assert!(
-        report2.missed.iter().any(|m| m.reason == "quarantined"),
-        "quarantined cookie must report quarantined: {report2:?}"
+        report2.missed.iter().any(|m| m.reason == "replaced"),
+        "stale plan must miss replaced per attempt: {report2:?}"
     );
-    // Fence clears quarantine: the stale identity fails verify as
-    // replaced (no silent re-bind, no quarantine shadow).
+    assert!(
+        report2.missed.iter().all(|m| m.reason != "quarantined"),
+        "no quarantine vocabulary post-H4: {report2:?}"
+    );
+    // Across a fence: still replaced (recovery needs re-discovery).
     s.open_window(1000, 2000).unwrap();
     s.fence(FenceReason::ProviderChanged).unwrap();
-    let report3 = s.attach_delta(&d, &live, &files).unwrap();
-    assert!(
-        !report3.missed.iter().any(|m| m.reason == "quarantined"),
-        "fence must clear quarantine: {report3:?}"
-    );
+    let report3 = s.attach_delta(&stale, &live, &files).unwrap();
     assert!(
         report3.missed.iter().any(|m| m.reason == "replaced"),
-        "stale identity must fail verify as replaced: {report3:?}"
+        "stale identity stays replaced across fences: {report3:?}"
     );
+    // Fresh delta against the current file (with re-discovered
+    // bytes bound to the new identity): binds.
+    let fresh = CountDelta {
+        discovered: vec![site(&b, off, 7)],
+        losses: Vec::new(),
+    };
+    let live_b = vec![mapping(&b)];
+    let files_b = HashMap::from([(
+        b.path.clone(),
+        plan::FileBytes {
+            bytes: std::fs::read(&b.path).unwrap(),
+            dev: b.device,
+            ino: b.ino,
+        },
+    )]);
+    let report4 = s.attach_delta(&fresh, &live_b, &files_b).unwrap();
+    assert_eq!(report4.attached, 1, "fresh plan must bind: {report4:?}");
 }
 
 #[test]
-fn quarantined_retry_counts_missed_once() {
-    // Slice-A review Minor-1: a quarantined re-attach must count
-    // exactly once into count.missed_attaches (one per missed site),
-    // not once at the push plus once at the per-call aggregate.
-    let stage = Stage::fresh("a1quarcount");
+fn h4_stale_retries_count_missed_once_each() {
+    // H4 rework of quarantined_retry_counts_missed_once
+    // (slice-A review Minor-1 survives): each stale attempt
+    // counts exactly once into count.missed_attaches — two
+    // attempts, counter 2, never double-counted at any
+    // aggregate.
+    let stage = Stage::fresh("h4quarcount");
     let bytes = self_bytes();
     let off = x_offsets(&bytes, 1)[0];
     let a = stage.write("prov.so", &bytes);
@@ -644,28 +828,24 @@ fn quarantined_retry_counts_missed_once() {
             ino: a.ino,
         },
     )]);
-    let backend = SwapBackend {
-        inner: FakeCountBackend::new(),
-        swap: std::cell::RefCell::new(Some((PathBuf::from(&a.path), bytes.clone()))),
-    };
-    let mut s = CountSession::new(PID, backend);
+    // Born-stale plan (replace before any attach).
+    std::fs::remove_file(&a.path).unwrap();
+    std::fs::write(&a.path, &bytes).unwrap();
+    let mut s = session_with(FakeCountBackend::new());
     let d = CountDelta {
         discovered: vec![site(&a, off, 7)],
         losses: Vec::new(),
     };
-    // Call 1: mid-attach replacement drops the links (1 miss) and
-    // quarantines the cookie. Call 2: same generation re-attach
-    // reports quarantined (1 miss). The final counter is 2, not 3.
     let report = s.attach_delta(&d, &live, &files).unwrap();
     assert!(report.missed.iter().any(|m| m.reason == "replaced"));
     let report2 = s.attach_delta(&d, &live, &files).unwrap();
-    assert!(report2.missed.iter().any(|m| m.reason == "quarantined"));
+    assert!(report2.missed.iter().any(|m| m.reason == "replaced"));
     s.open_window(1000, 2000).unwrap();
     let drain = s.close_and_drain(Duration::from_secs(5)).unwrap();
     assert_eq!(
         counter_value(&drain, "count.missed_attaches"),
         Some(2),
-        "quarantined retry must count once: {:?}",
+        "each stale attempt must count once: {:?}",
         drain.counters
     );
 }
