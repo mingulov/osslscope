@@ -6,8 +6,8 @@
 
 use osslscope::target::{
     __test_set_control_worker_counter, __test_set_fail_fork, __test_set_prestop_pid_sink,
-    __test_set_prestop_stall_ms, __test_set_setup_delay_ms, CustodyState, OwnedTarget,
-    TargetDisposition, WorkloadDest,
+    __test_set_prestop_stall_ms, __test_set_setup_delay_ms, __test_set_truncate_delay_ms,
+    CustodyState, OwnedTarget, TargetDisposition, WorkloadDest,
 };
 use std::time::{Duration, Instant};
 
@@ -1418,6 +1418,101 @@ fn abandoned_prep_worker_never_truncates_successor() {
         "late worker must never truncate post-abandonment bytes"
     );
     assert!(!sentinel.exists(), "sentinel must never execute");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn file_truncate_runs_under_setup_control() {
+    // Fix round 3 / NEW: file-sink truncation must run where
+    // deadline/cancellation control applies — the caller must never block
+    // in open/truncate/close on the setup path — while a worker delayed
+    // past abandonment still truncates nothing.
+    //
+    // Leg 1 (bounded + fenced): the truncate half of preparation is
+    // deterministically stalled (3s, simulating a sink that withholds the
+    // SETATTR response) past a 300ms setup deadline. The caller must fail
+    // fast on the deadline — not block in the stall — fork nothing, and
+    // the successor bytes written after abandonment must survive the late
+    // worker.
+    let dir = r06_scratch("truncate-control");
+    let log = dir.join("workload.log");
+    std::fs::write(&log, b"original\n").unwrap();
+    let sentinel = dir.join("SENTINEL");
+    let argv = r06_sentinel_argv(&sentinel);
+    let cancel = AtomicBool::new(false);
+    let counter = Arc::new(AtomicU32::new(0));
+    let pid_sink = Arc::new(AtomicU32::new(0));
+    __test_set_control_worker_counter(Some(counter.clone()));
+    __test_set_truncate_delay_ms(3000);
+    __test_set_prestop_pid_sink(Some(pid_sink.clone()));
+    let t0 = Instant::now();
+    let result = OwnedTarget::spawn_stopped_with_control(
+        &argv,
+        WorkloadDest::File(log.clone()),
+        Instant::now() + Duration::from_millis(300),
+        &cancel,
+    );
+    let elapsed = t0.elapsed();
+    __test_set_truncate_delay_ms(0);
+    __test_set_control_worker_counter(None);
+    __test_set_prestop_pid_sink(None);
+    let msg = match result {
+        Err(e) => e.to_string(),
+        Ok(t) => r06_unexpected_child(t, "expired setup must fail"),
+    };
+    assert!(
+        msg.contains("deadline"),
+        "caller abandoned on deadline: {msg}"
+    );
+    assert!(msg.contains("no child spawned"), "nothing forked: {msg}");
+    assert_eq!(pid_sink.load(Ordering::SeqCst), 0, "no fork may happen");
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "caller must not block in truncation (took {elapsed:?})"
+    );
+    assert_eq!(
+        std::fs::read(&log).unwrap(),
+        b"original\n",
+        "staged open truncates nothing"
+    );
+    assert!(!sentinel.exists(), "sentinel must never execute");
+    // A retry or another writer populates the destination now.
+    std::fs::write(&log, b"successor-bytes\n").unwrap();
+    // Wait for the late worker to finish (bounded), then prove the
+    // successor bytes survived it.
+    let end = Instant::now() + Duration::from_secs(10);
+    while counter.load(Ordering::SeqCst) < 1 {
+        assert!(Instant::now() < end, "worker never finished");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        std::fs::read(&log).unwrap(),
+        b"successor-bytes\n",
+        "late worker must never truncate post-abandonment bytes"
+    );
+    //
+    // Leg 2 (live setup still truncates): pre-existing bytes — longer than
+    // the workload output, so a skipped truncate would leave a detectable
+    // tail — are gone after a successful spawn; the workload output lands
+    // in the file byte-identical.
+    let log2 = dir.join("live.log");
+    std::fs::write(&log2, b"stale-stale-stale-stale-stale\n").unwrap();
+    let mut t = OwnedTarget::spawn_stopped_with_control(
+        &sentinel_argv(),
+        WorkloadDest::File(log2.clone()),
+        Instant::now() + Duration::from_secs(30),
+        &cancel,
+    )
+    .unwrap();
+    let pid = t.pid();
+    t.release().unwrap();
+    assert_eq!(wait_for_exit(&mut t, Duration::from_secs(5)), Some(0));
+    assert_reaped_no_zombie(pid);
+    assert_eq!(
+        std::fs::read(&log2).unwrap(),
+        b"H9-OUT-S\nH9-ERR-S\n",
+        "live setup truncates pre-existing bytes"
+    );
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
