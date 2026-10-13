@@ -38,15 +38,26 @@ use aya_ebpf::{
     EbpfContext as _,
 };
 use osslscope_ebpf_common::{
-    classify_alg_with, AlgClassValue, AlgEvent, CtrlValue, PendQuery, RowEvent, ScanRec,
-    TCacheValue, ALG_UNREADABLE, ALG_WINDOW, KIND_ALG, KIND_ROW, LOSS_MAP_CALLS, LOSS_MAP_TRUNC,
-    LOSS_MEMBER_COOKIE, LOSS_PENDING_QUERY_FULL, LOSS_PENDING_QUERY_MISS, LOSS_RING_ALG,
-    LOSS_RING_ROW, MEMBER_ENTRY_COOKIE, OTHER_CLASS, TRUNC_ALGS, TRUNC_DISPATCH, TRUNC_NO_STORE,
-    TRUNC_WALK_EMPTY, TRUNC_WALK_NAME, TRUNC_WALK_NOIMP, TRUNC_WALK_READ,
+    classify_alg_with, loss_for_skip_cause, make_call_flags, make_rcount, make_seq, split_rcount,
+    split_seq, AlgClassValue, AlgEvent, CtrlValue, PendQuery, RowEvent, ScanCallEvent, ScanRec,
+    TCacheValue, ALG_UNREADABLE, ALG_WINDOW, BIRTH_FROZEN, KIND_ALG, KIND_ROW, KIND_SCAN_CALL,
+    LOSS_MAP_CALLS, LOSS_MAP_TRUNC, LOSS_MEMBER_COOKIE, LOSS_RETIRE_FAIL, LOSS_RING_ALG,
+    LOSS_RING_CALL, LOSS_RING_ROW, LOSS_SCAN_CHURNED, LOSS_SCAN_EVICTED, LOSS_STALE_REPAIRED,
+    MEMBER_ENTRY_COOKIE, OTHER_CLASS, RCOUNT_STATE_ACTIVE,
+    RCOUNT_STATE_IDLE, RINGBUF_AVAIL_DATA, SEQ_CTR_MAX, SKIP_ADMITTED, SKIP_ADMIT_STORE_FAIL,
+    SKIP_ALL, SKIP_BIRTH_PENDING, SKIP_BIRTH_WRAP, SKIP_CTRL_UNPROGRAMMED, SKIP_ENTRY_COOKIE,
+    SKIP_RING_PRESSURE, SKIP_SEQ_FULL, SKIP_SEQ_SATURATED, TRUNC_ALGS, TRUNC_DISPATCH,
+    TRUNC_NO_STORE, TRUNC_WALK_EMPTY, TRUNC_WALK_NAME, TRUNC_WALK_NOIMP, TRUNC_WALK_READ,
 };
 
 /// `BPF_NOEXIST` for `insert` (kernel UAPI; aya-ebpf exposes no const).
 const BPF_NOEXIST: u64 = 1;
+
+/// Kernel errno ENOENT (UAPI asm-generic/errno.h): aya-ebpf
+/// `remove` surfaces raw negative errnos, so ENOENT is
+/// distinguishable from real cleanup failures (R18 §3/§6.16
+/// ENOENT-as-absent).
+const ENOENT: i32 = 2;
 
 /// Alg-array bound per op (measured max 364, oqsprovider encoder;
 /// 512 is the next power of two with headroom). Members are
@@ -98,7 +109,8 @@ static CALLS: PerCpuHashMap<u32, u64> = PerCpuHashMap::with_max_entries(64, 0);
 static ALG_CLASS: HashMap<u64, AlgClassValue> = HashMap::with_max_entries(1024, 0);
 /// One in-flight scan per thread (§5.1): the entry's take record,
 /// peeked by members. LRU: orphans from never-returning hits evict
-/// instead of leaking (eviction counted via the NULL+SEQ rule).
+/// instead of leaking (eviction ⟺ NULL + ACTIVE — the NULL+SEQ
+/// rule misclassified retirement AND first queries, R18 §2).
 #[map]
 static SCAN: LruHashMap<u32, ScanRec> = LruHashMap::with_max_entries(1024, 0);
 /// Invocation sequences (§5.1): tid → birth:16|ctr:48.
@@ -111,10 +123,12 @@ static SEQ: HashMap<u32, u64> = HashMap::with_max_entries(4096, 0);
 /// incarnation supersedes).
 #[map]
 static BIRTH: HashMap<u32, u16> = HashMap::with_max_entries(4096, 0);
-/// Per-thread member return counter (§5.1): bumped first-thing by
-/// every admitted-scan exit, reset by every admit. 4k lifecycle
-/// (never deleted; insert-fail unreachable — RCOUNT keys ⊆ SEQ
-/// keys, and the admit order inserts SEQ first).
+/// Per-thread member return counter + scan lifecycle (§5.1, R18
+/// §2/§6.9): count:32|state:32 fold. Bumped by every admitted-scan
+/// exit (members, D), reset to ACTIVE|0 by every admit, IDLEd by
+/// every skip/retire. 4k lifecycle (never created by the SKIP path;
+/// insert-fail unreachable — RCOUNT keys ⊆ SEQ keys, and the admit
+/// order inserts SEQ first).
 #[map]
 static RCOUNT: HashMap<u32, u64> = HashMap::with_max_entries(4096, 0);
 /// Terminator cache (§5.3): array → (T, GEN),
@@ -123,7 +137,9 @@ static RCOUNT: HashMap<u32, u64> = HashMap::with_max_entries(4096, 0);
 #[map]
 static T_CACHE: HashMap<u64, TCacheValue> = HashMap::with_max_entries(1024, 0);
 /// Session control (§5.1/§5.4/§5.5): EXPECTED / epoch / SKIP-ALL /
-/// governor threshold. Loader-programmed at attach.
+/// governor (max admittable ring OCCUPANCY in bytes — admit iff
+/// occupancy <= threshold, R18 §2/§6.6). Loader-programmed at
+/// attach.
 #[map]
 static CTRL: Array<CtrlValue> = Array::with_max_entries(1, 0);
 /// Entry-hit attempts (§5.5): every hit including skips. Per-CPU
@@ -272,15 +288,77 @@ fn walk_dispatch(imp: u64, op: u32, arr: u64, j: u64) -> u64 {
     1
 }
 
-/// query_operation(provctx, operation_id, no_store): stash arg1
-/// (op) plus arg2 (the caller's `no_store` out-pointer, read back
-/// at return). Verbatim `query_entry` semantics, stashed under this
-/// link's cookie (the loader attaches the entry with
-/// MEMBER_ENTRY_COOKIE); members peek it back. Same arg positions
-/// for the core wrapper ossl_provider_query_operation(prov, op,
-/// no_cache) on 3.0/3.5/4.0.
+/// ATTEMPT-first (R18 §3 step 1): every entry hit, admitted or
+/// skipped, no exceptions — the SINGLE count (`skip` performs no
+/// bump; ATTEMPT − CALLS = skipped queries, exactly).
+/// PerCpuArray cells pre-exist, so the slot cannot miss.
+fn bump_attempt() {
+    if let Some(slot) = ATTEMPT.get_ptr_mut(0) {
+        unsafe { *slot = (*slot).wrapping_add(1) };
+    }
+}
+
+fn emit_call(ev: &ScanCallEvent) {
+    if let Some(mut e) = EVENTS.reserve::<ScanCallEvent>(0) {
+        e.write(*ev);
+        e.submit(0);
+    } else {
+        bump_loss(LOSS_RING_CALL);
+    }
+}
+
+/// Absent-ok delete (R18 §6.16 ENOENT-as-absent): `Ok`/`-ENOENT`
+/// mean the desired state is achieved (no LOSS); any other error
+/// is a cleanup failure (LOSS_RETIRE_FAIL now — a failure count is
+/// never delayed to take time, or a never-coming take silences
+/// it) and the cell is retained.
+fn absent_ok(r: Result<(), i32>) {
+    match r {
+        Ok(()) => {}
+        Err(e) if e == -ENOENT => {}
+        Err(_) => bump_loss(LOSS_RETIRE_FAIL),
+    }
+}
+
+/// Uniform skip path (R18 §3, sol F1): every cause, including
+/// post-SEQ publication failures. Deletes PENDING[tid] (C — D
+/// drops the map) + SCAN[tid], RCOUNT→IDLE|0 iff present (never
+/// create — the SKIP path never creates cells), LOSS[cause],
+/// CALL(skipped, cause, seq 0). The RCOUNT→IDLE step runs
+/// REGARDLESS of delete outcomes, so a retained cell is always
+/// paired with IDLE-or-missing.
+fn skip(tid: u32, op: u64, cause: u8) {
+    absent_ok(PENDING_QUERY.remove(&pend_key(MEMBER_ENTRY_COOKIE)));
+    absent_ok(SCAN.remove(&tid));
+    if RCOUNT.get_ptr(&tid).is_some() {
+        // Existing-key update: cannot fail; ignored regardless —
+        // the skip disposition is already decided.
+        let _ = RCOUNT.insert(&tid, make_rcount(0, RCOUNT_STATE_IDLE), 0);
+    }
+    bump_loss(loss_for_skip_cause(cause));
+    emit_call(&ScanCallEvent {
+        kind: KIND_SCAN_CALL,
+        op: op as u32,
+        tid,
+        flags: make_call_flags(false, cause),
+        seq: 0,
+    });
+}
+
+/// query_operation(provctx, operation_id, no_store): the stage-C
+/// entry plane (R18 §3). Fail-fast gates (cookie → CTRL →
+/// SKIP_ALL → BIRTH → wrap → governor), SEQ mint, C-interim
+/// PENDING write, SCAN take (snapshot-then-classify), RCOUNT
+/// reset, SCAN publish, then admit effects (CALLS bump + CALL).
+/// Every gate skips with its cause + LOSS + CALL(skipped, seq 0);
+/// admits freeze EXPECTED+epoch from CTRL into the record. Same
+/// arg positions for the core wrapper
+/// ossl_provider_query_operation(prov, op, no_cache) on
+/// 3.0/3.5/4.0. Straight-line: zero loops (R18 §10.3).
 #[uprobe]
 pub fn member_entry(ctx: ProbeContext) -> u32 {
+    // 1. ATTEMPT bump FIRST (before every exit incl. legacy).
+    bump_attempt();
     let op: u64 = match ctx.arg(1) {
         Some(v) => v,
         None => return 0,
@@ -288,12 +366,170 @@ pub fn member_entry(ctx: ProbeContext) -> u32 {
     // A missing arg2 stashes a NULL pointer: the return-side read
     // then fails and the array is treated as `no_store`.
     let ns_ptr: u64 = ctx.arg(2).unwrap_or(0);
+    let tid = helpers::bpf_get_current_pid_tgid() as u32;
+    // 2. Cookie fail-fast, before any map read (loader bug).
+    if cookie_of(&ctx) != MEMBER_ENTRY_COOKIE {
+        skip(tid, op, SKIP_ENTRY_COOKIE);
+        return 0;
+    }
+    // 3. CTRL: missing/unreadable/invalid → cause 7 (defense in
+    // depth — the loader always programs it; zero EXPECTED/epoch =
+    // never programmed, EXPECTED > 512 = loader bug — v1 attaches
+    // exactly 512, item 6 programs fewer legitimately).
+    let ctrl = match unsafe { CTRL.get_ptr(0).map(|p| *p) } {
+        Some(c) => c,
+        None => {
+            skip(tid, op, SKIP_CTRL_UNPROGRAMMED);
+            return 0;
+        }
+    };
+    if ctrl.expected == 0 || ctrl.expected > MAX_ALGS as u32 || ctrl.epoch == 0 {
+        skip(tid, op, SKIP_CTRL_UNPROGRAMMED);
+        return 0;
+    }
+    // 4. SKIP_ALL.
+    if ctrl.skip_all != 0 {
+        skip(tid, op, SKIP_ALL);
+        return 0;
+    }
+    // 5-6. BIRTH: missing → pending; MAX → frozen (freeze is
+    // enforced by keeping BIRTH at MAX and checking every hit —
+    // NO future admits for this tid).
+    let birth = match unsafe { BIRTH.get_ptr(&tid).map(|p| *p) } {
+        Some(b) => b,
+        None => {
+            skip(tid, op, SKIP_BIRTH_PENDING);
+            return 0;
+        }
+    };
+    if birth == BIRTH_FROZEN {
+        skip(tid, op, SKIP_BIRTH_WRAP);
+        return 0;
+    }
+    // 7. Governor: occupancy > GOVERNOR → cause 4 (occupancy
+    // semantics — GOVERNOR is max admittable OCCUPANCY, R18 §2).
+    if EVENTS.query(RINGBUF_AVAIL_DATA) > ctrl.governor {
+        skip(tid, op, SKIP_RING_PRESSURE);
+        return 0;
+    }
+    // 8. SEQ step: missing → insert (birth,0) (fail → cause 2);
+    // birth mismatch → reset (birth_new,0); match → ctr+1
+    // saturating, re-issuing MAX skips (cause 9, sol F10 — never
+    // reissue). `split_seq` masks to 48 bits, so ctr > MAX is
+    // impossible and `== MAX` is the exact saturation test.
+    // (SEQ-update of an existing key cannot fail — plain HASH
+    // update.)
+    let seq = match unsafe { SEQ.get_ptr(&tid).map(|p| *p) } {
+        None => {
+            let fresh = make_seq(birth, 0);
+            if SEQ.insert(&tid, fresh, BPF_NOEXIST).is_err() {
+                skip(tid, op, SKIP_SEQ_FULL);
+                return 0;
+            }
+            fresh
+        }
+        Some(cur) => {
+            let (cur_birth, ctr) = split_seq(cur);
+            if cur_birth != birth {
+                let fresh = make_seq(birth, 0);
+                let _ = SEQ.insert(&tid, fresh, 0);
+                fresh
+            } else if ctr == SEQ_CTR_MAX {
+                skip(tid, op, SKIP_SEQ_SATURATED);
+                return 0;
+            } else {
+                let next = make_seq(birth, ctr + 1);
+                let _ = SEQ.insert(&tid, next, 0);
+                next
+            }
+        }
+    };
+    // 9. C-interim PENDING write for the still-v1 members (fail →
+    // cause 8, BEFORE SCAN publish — D removes the map, R18 §6.1).
     if PENDING_QUERY
-        .insert(pend_key(cookie_of(&ctx)), PendQuery { op, ns_ptr }, 0)
+        .insert(&pend_key(MEMBER_ENTRY_COOKIE), PendQuery { op, ns_ptr }, 0)
         .is_err()
     {
-        bump_loss(LOSS_PENDING_QUERY_FULL);
+        skip(tid, op, SKIP_ADMIT_STORE_FAIL);
+        return 0;
     }
+    // 10. SCAN take: SNAPSHOT old SCAN + old RCOUNT into stack
+    // FIRST, classify the snapshot (R18 §3 table), run the row's
+    // effects. The repair rows' "delete" is subsumed by the step-12
+    // BPF_ANY overwrite (single-writer serial context: identical
+    // end state), and a failed publish runs the uniform skip path
+    // whose SCAN delete preserves the loss accounting — so no
+    // explicit delete here.
+    let old_scan: Option<ScanRec> = unsafe { SCAN.get_ptr(&tid).map(|p| *p) };
+    let old_rc: Option<u64> = unsafe { RCOUNT.get_ptr(&tid).map(|p| *p) };
+    let mut hint = false;
+    match (old_scan, old_rc) {
+        (None, Some(rc)) if split_rcount(rc).1 == RCOUNT_STATE_ACTIVE => {
+            // LRU-evicted in-flight (NULL + ACTIVE ⟺ evicted).
+            bump_loss(LOSS_SCAN_EVICTED);
+        }
+        (None, _) => {
+            // First query, retired, or prior skip: fresh-silent.
+        }
+        (Some(rec), _) if rec.epoch != ctrl.epoch => {
+            // Membership churned mid-flight: never a hint.
+            bump_loss(LOSS_SCAN_CHURNED);
+        }
+        (Some(_), None) => {
+            // Corrupt (unreachable: step 11 precedes 12).
+            bump_loss(LOSS_STALE_REPAIRED);
+        }
+        (Some(rec), Some(rc)) => {
+            let (count, state) = split_rcount(rc);
+            if state == RCOUNT_STATE_IDLE {
+                // Failed-delete marker: already counted at retire —
+                // silent recovery (recounting would double-count).
+            } else if count >= rec.expected {
+                // Unretired complete (structurally unreachable):
+                // loud repair.
+                bump_loss(LOSS_STALE_REPAIRED);
+            } else {
+                // Nested (fresh in-flight has count 0).
+                hint = true;
+            }
+        }
+    }
+    // 11. RCOUNT-reset (insert-or-create ACTIVE|0; logically
+    // unreachable by the §2 invariant — leg via synthetic
+    // violation).
+    if RCOUNT
+        .insert(&tid, make_rcount(0, RCOUNT_STATE_ACTIVE), 0)
+        .is_err()
+    {
+        skip(tid, op, SKIP_ADMIT_STORE_FAIL);
+        return 0;
+    }
+    // 12. SCAN-publish (the minted seq is spent on failure —
+    // monotonicity preserved, the id simply never observed).
+    let rec = ScanRec {
+        op,
+        ns_ptr,
+        seq,
+        expected: ctrl.expected,
+        _pad: 0,
+        epoch: ctrl.epoch,
+    };
+    if SCAN.insert(&tid, rec, 0).is_err() {
+        skip(tid, op, SKIP_ADMIT_STORE_FAIL);
+        return 0;
+    }
+    // 13. Admit effects: CALLS bump (admitted-once — NULL included,
+    // the entry cannot see rv) + CALL(admitted, seq, hint?).
+    if percpu_add(&CALLS, &(op as u32)).is_err() {
+        bump_loss(LOSS_MAP_CALLS);
+    }
+    emit_call(&ScanCallEvent {
+        kind: KIND_SCAN_CALL,
+        op: op as u32,
+        tid,
+        flags: make_call_flags(hint, SKIP_ADMITTED),
+        seq,
+    });
     0
 }
 
@@ -306,12 +542,13 @@ pub fn member_entry(ctx: ProbeContext) -> u32 {
 ///
 /// Body deltas vs the sampler's `query_return` (all else verbatim):
 /// PENDING peek (never take — a taker would starve later-firing
-/// members); attach-cookie self-check (loader permutation bugs fail
-/// closed); CALLS counted by member 0 only (once per non-null
-/// return — cookies ride the slot, single site in v1); no
+/// members), entry-owned lifecycle in C (write-on-admit,
+/// delete-on-skip; miss silent — R18 §6.1); attach-cookie
+/// self-check (loader permutation bugs fail closed); CALLS counted
+/// by the entry (admit-bump, NULL included — R18 §6.2); no
 /// QUERY_NEXT cursor (every scan is full); no TERMD (512 writers
 /// would last-wins — TRUE-T is the item-4 join's job); no QUERY_RET
-/// (no first-hit gate without a cursor); no tail calls.
+/// (lands in D, member-0 verdict-first); no tail calls.
 macro_rules! def_member {
     ($name:ident, $j:literal) => {
         #[uretprobe]
@@ -326,12 +563,15 @@ macro_rules! def_member {
             }
             // Peek-only: taking would delete the record for the
             // members that fire after this one (order-dependent
-            // holes). A MISS is a return without entry (in flight
-            // during attach, or the entry insert failed).
+            // holes). A MISS is the intentional skip (the entry
+            // deleted PENDING on its uniform skip path — R18 §6.1
+            // interim invariant: present ⟺ last entry event was
+            // admit), silent by design; the attach-race miss goes
+            // silent too as a documented interim divergence
+            // (matching D's SCAN-miss silence).
             let pend: PendQuery = match PENDING_QUERY.get_ptr(&pend_key(MEMBER_ENTRY_COOKIE)) {
                 Some(p) => unsafe { *p },
                     None => {
-                        bump_loss(LOSS_PENDING_QUERY_MISS);
                         return 0;
                     }
                 };
@@ -340,16 +580,10 @@ macro_rules! def_member {
             if rv == 0 {
                 return 0;
             }
-            // Member 0 counts the query (once per non-null return,
-            // exactly the sampler's CALLS semantics — all-members
-            // bumping would inflate counts 512x). Order-free: every
-            // member fires every hit, so member 0's bump is the
-            // per-query count. Folds out of members 1..511.
-            if $j == 0 {
-                if percpu_add(&CALLS, &(op as u32)).is_err() {
-                    bump_loss(LOSS_MAP_CALLS);
-                }
-            }
+            // CALLS moved to the entry (admit-bump — R18 §6.2):
+            // only the entry is always attached (item-6 selective
+            // load may drop member 0), and the entry cannot see rv
+            // — so NULL flips to counted (spec-mandated).
             // The provider's lifetime verdict, read once from the
             // caller's out-pointer in this valid return context. Only
             // an explicit 0 is cacheable; any nonzero verdict, NULL

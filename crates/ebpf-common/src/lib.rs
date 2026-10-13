@@ -241,6 +241,16 @@ pub const LOSS_RING_GUARD: u32 = 29;
 /// loader always programs it, so zero means a loader bug — the
 /// entry skips everything loudly rather than admitting blind.
 pub const LOSS_CTRL_UNPROGRAMMED: u32 = 30;
+/// Take-time repair of an ACTIVE record at/above EXPECTED, or a
+/// record without a counter (admit-path, NOT a skip cause;
+/// unreachable except synthetic/corrupt — R18 §2).
+pub const LOSS_STALE_REPAIRED: u32 = 31;
+/// Admit-store failure: PENDING/RCOUNT-reset/SCAN-insert failure
+/// (OOM-class; skips with cause 8 via the uniform path — R18 §2).
+pub const LOSS_ADMIT_STORE_FAIL: u32 = 32;
+/// SEQ counter re-issuing MAX: fail-closed skip (cause 9), never
+/// silent invocation-id reuse (R18 §2, sol F10).
+pub const LOSS_SEQ_SATURATED: u32 = 33;
 
 /// Entry skip causes (P7 item 3): the `ScanCallEvent.flags` cause
 /// field. 0 = admitted (no counter); each nonzero cause maps to
@@ -253,6 +263,12 @@ pub const SKIP_RING_PRESSURE: u8 = 4;
 pub const SKIP_ALL: u8 = 5;
 pub const SKIP_ENTRY_COOKIE: u8 = 6;
 pub const SKIP_CTRL_UNPROGRAMMED: u8 = 7;
+/// Admit-store failure (PENDING/RCOUNT/SCAN insert — R18 §2).
+pub const SKIP_ADMIT_STORE_FAIL: u8 = 8;
+/// SEQ counter saturated (re-issuing MAX — R18 §2, sol F10).
+pub const SKIP_SEQ_SATURATED: u8 = 9;
+/// Highest valid skip cause (decoders reject above this).
+pub const SKIP_CAUSE_MAX: u8 = SKIP_SEQ_SATURATED;
 
 /// `ScanCallEvent.flags` layout: bit 0 = NESTED_HINT (advisory —
 /// §5.2 rules corroborate); cause in bits 8..16; all other bits
@@ -270,7 +286,7 @@ pub const fn split_call_flags(flags: u32) -> (bool, u8) {
 
 /// Loss-proof counter for a skip cause (0 = none — admitted
 /// queries are counted in CALLS, not LOSS). Callers only pass
-/// parse-gated causes 0..=6.
+/// parse-gated causes 0..=9.
 pub const fn loss_for_skip_cause(cause: u8) -> u32 {
     match cause {
         SKIP_BIRTH_PENDING => LOSS_BIRTH_PENDING,
@@ -280,9 +296,57 @@ pub const fn loss_for_skip_cause(cause: u8) -> u32 {
         SKIP_ALL => LOSS_SKIP_ALL,
         SKIP_ENTRY_COOKIE => LOSS_ENTRY_COOKIE,
         SKIP_CTRL_UNPROGRAMMED => LOSS_CTRL_UNPROGRAMMED,
+        SKIP_ADMIT_STORE_FAIL => LOSS_ADMIT_STORE_FAIL,
+        SKIP_SEQ_SATURATED => LOSS_SEQ_SATURATED,
         _ => 0,
     }
 }
+
+/// `RCOUNT[tid]` fold (P7 item 3, R18 §2/§6.9): count:32 in the low
+/// half, scan lifecycle in the high half — 0 IDLE (no scan
+/// in-flight: initial/retired/skipped), 1 ACTIVE (admitted and
+/// unretired). One state bit, no new maps.
+pub const RCOUNT_STATE_IDLE: u32 = 0;
+pub const RCOUNT_STATE_ACTIVE: u32 = 1;
+
+pub const fn make_rcount(count: u32, state: u32) -> u64 {
+    ((state as u64) << 32) | (count as u64)
+}
+
+pub const fn split_rcount(v: u64) -> (u32, u32) {
+    ((v & 0xFFFF_FFFF) as u32, (v >> 32) as u32)
+}
+
+/// Governor policy (P7 item 3, R18 §2/§6.6): GOVERNOR is max
+/// admittable ring OCCUPANCY (bytes); admit iff occupancy <=
+/// threshold. Frozen policy: 4MiB (on 16MiB, 12MiB free).
+pub const GOVERNOR_MAX_OCCUPIED: u64 = 4 << 20;
+
+/// Programmed governor for a ring of `ring_bytes`: min(policy,
+/// ring/2). The small-ring half is a labeled fixture rule (the
+/// §5.4 derivation assumes a ring bigger than the worst scan);
+/// item 7's 16MiB ring uses the 4MiB policy value.
+pub const fn governor_for_ring(ring_bytes: u64) -> u64 {
+    let half = ring_bytes / 2;
+    if half < GOVERNOR_MAX_OCCUPIED {
+        half
+    } else {
+        GOVERNOR_MAX_OCCUPIED
+    }
+}
+
+/// `bpf_ringbuf_query` flag for occupied bytes (kernel UAPI
+/// `BPF_RB_AVAIL_DATA`, include/uapi/linux/bpf.h).
+pub const RINGBUF_AVAIL_DATA: u64 = 4;
+
+/// Per-record ringbuf header (the occupancy math adds this per
+/// record; on-ring sizes are payload rounded up to 8 + 8).
+pub const RINGBUF_HDR: u64 = 8;
+
+/// Stage quanta (R18 §2, recomputed with 8-byte headers): C emits
+/// CALL-only (24+8); D emits CALL+RET pairs (32 + 40+8).
+pub const SCAN_QUANTUM_C: u64 = 32;
+pub const SCAN_QUANTUM_D: u64 = 80;
 
 /// Member-entry attach cookie (P7 item 2, single source for BPF +
 /// host): the loader attaches `member_entry` with this cookie and
@@ -351,8 +415,10 @@ const _: () = assert!(size_of::<TCacheValue>() == 16);
 
 /// `CTRL[0]` session control (P7 item 3, §5.1/§5.4/§5.5):
 /// userspace-owned EXPECTED / membership-epoch / SKIP-ALL /
-/// governor threshold (bytes of ring headroom required to
-/// admit). Programmed by the loader at attach. 24 bytes.
+/// governor (max admittable ring OCCUPANCY in bytes — admit iff
+/// occupancy <= threshold, R18 §2/§6.6; the old "headroom"
+/// wording inverted the comparison). Programmed by the loader at
+/// attach. 24 bytes.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CtrlValue {
@@ -1114,7 +1180,7 @@ pub fn parse_scan_call_event(b: &[u8]) -> Result<ScanCallEvent, WireErr> {
         return Err(WireErr::Kind);
     }
     let (hint, cause) = split_call_flags(e.flags);
-    if cause > SKIP_CTRL_UNPROGRAMMED {
+    if cause > SKIP_CAUSE_MAX {
         return Err(WireErr::StatusRange);
     }
     if e.flags != make_call_flags(hint, cause) {
@@ -1298,6 +1364,70 @@ mod tests {
     }
 
     #[test]
+    fn scan_stage_c_vocabulary() {
+        // P7 item-3 C (R18 §2): skip causes 8–9 + LOSS 31–33 consts,
+        // loss-proof mapping, and the RCOUNT count:32|state:32 fold.
+        assert_eq!(
+            (SKIP_ADMIT_STORE_FAIL, SKIP_SEQ_SATURATED),
+            (8, 9),
+            "C skip causes are 8-9"
+        );
+        assert_eq!(
+            (
+                LOSS_STALE_REPAIRED,
+                LOSS_ADMIT_STORE_FAIL,
+                LOSS_SEQ_SATURATED
+            ),
+            (31, 32, 33),
+            "C loss ids are 31-33"
+        );
+        assert_eq!(
+            loss_for_skip_cause(SKIP_ADMIT_STORE_FAIL),
+            LOSS_ADMIT_STORE_FAIL
+        );
+        assert_eq!(loss_for_skip_cause(SKIP_SEQ_SATURATED), LOSS_SEQ_SATURATED);
+        assert_eq!(
+            loss_for_skip_cause(SKIP_ADMITTED),
+            0,
+            "admitted has no loss"
+        );
+        assert_eq!(loss_for_skip_cause(10), 0, "out-of-range cause has no loss");
+        // RCOUNT lifecycle fold: count:32 | state:32.
+        assert_eq!((RCOUNT_STATE_IDLE, RCOUNT_STATE_ACTIVE), (0, 1));
+        assert_eq!(split_rcount(make_rcount(0, RCOUNT_STATE_ACTIVE)), (0, 1));
+        assert_eq!(split_rcount(make_rcount(512, RCOUNT_STATE_IDLE)), (512, 0));
+        assert_eq!(
+            split_rcount(make_rcount(u32::MAX, RCOUNT_STATE_ACTIVE)),
+            (u32::MAX, 1)
+        );
+    }
+
+    #[test]
+    fn scan_governor_policy() {
+        // P7 item-3 C (R18 §2/§6.6): GOVERNOR is max admittable ring
+        // OCCUPANCY (bytes); admit iff occupancy <= threshold. Frozen
+        // policy 4MiB; programmed = min(policy, ring/2) with the
+        // small-ring half labeled fixture rule.
+        assert_eq!(GOVERNOR_MAX_OCCUPIED, 4 << 20, "frozen 4MiB policy");
+        assert_eq!(
+            governor_for_ring(1 << 21),
+            1 << 20,
+            "2MiB ring programs 1MiB (small-ring fixture rule)"
+        );
+        assert_eq!(
+            governor_for_ring(1 << 24),
+            4 << 20,
+            "16MiB ring uses the 4MiB policy value"
+        );
+        // On-ring quanta (payload + 8B ringbuf header each record).
+        assert_eq!(RINGBUF_HDR, 8);
+        assert_eq!(SCAN_QUANTUM_C, 32, "C: CALL-only 24+8");
+        assert_eq!(SCAN_QUANTUM_D, 80, "D: CALL+RET 32+48");
+        // ringbuf_query flag: kernel UAPI BPF_RB_AVAIL_DATA.
+        assert_eq!(RINGBUF_AVAIL_DATA, 4);
+    }
+
+    #[test]
     fn seq_fold_unfold_saturates() {
         assert_eq!(split_seq(make_seq(1, 0)), (1, 0));
         assert_eq!(
@@ -1401,8 +1531,12 @@ mod tests {
         bad[0..4].copy_from_slice(&KIND_ROW.to_le_bytes());
         assert_eq!(parse_scan_call_event(&bad), Err(WireErr::Kind));
         let mut bad = cb;
-        bad[12..16].copy_from_slice(&make_call_flags(false, 8).to_le_bytes());
+        bad[12..16].copy_from_slice(&make_call_flags(false, 10).to_le_bytes());
         assert_eq!(parse_scan_call_event(&bad), Err(WireErr::StatusRange));
+        // Causes 8-9 are valid in stage C (admit-store/saturation).
+        let mut ok = cb;
+        ok[12..16].copy_from_slice(&make_call_flags(false, SKIP_SEQ_SATURATED).to_le_bytes());
+        assert!(parse_scan_call_event(&ok).is_ok());
         let mut bad = cb;
         bad[12..16].copy_from_slice(&0x02u32.to_le_bytes());
         assert_eq!(parse_scan_call_event(&bad), Err(WireErr::StatusRange));
