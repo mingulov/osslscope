@@ -146,14 +146,16 @@ jobs:
           ADMITTED_CAPABILITY_IDS = ("caps", "kernel", "lockdown", "lsm")
 
           # Gate rows the disposition reasons about. The producer
-          # always emits them (doctor.rs: the base checks plus both
-          # objects rows), so a report missing any of them cannot
-          # authorize capture or a skip.
+          # always emits them (doctor.rs: the base checks including
+          # the spawn-access setup gate, plus both objects rows), so
+          # a report missing any of them cannot authorize capture
+          # or a skip.
           REQUIRED_GATE_IDS = (
               "caps",
               "kernel",
               "lockdown",
               "lsm",
+              "spawn-access",
               "objects-harvest",
               "objects-count",
           )

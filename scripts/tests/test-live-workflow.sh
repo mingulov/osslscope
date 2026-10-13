@@ -183,6 +183,7 @@ P_LOCK=$(ck lockdown pass "lockdown=integrity (BPF allowed)")
 P_LSM=$(ck lsm pass "no LSM denial (BPF ops succeed; active: none)")
 P_HV=$(ck objects-harvest pass "harvest object: /pfx/osslscope-harvest (explicit, compatible)")
 P_CT=$(ck objects-count pass "count object: /pfx/osslscope-count (explicit, compatible)")
+P_SPAWN=$(ck spawn-access pass "spawn setup maps read ok: pre-exec child maps readable (4096 bytes; self dumpable=1)")
 F_CAPS=$(ck caps fail "missing caps: CAP_BPF+CAP_PERFMON (have neither file caps nor root)")
 F_KERN=$(ck kernel fail "wrong kernel: uprobe-multi unsupported (feature probe, not uname; release 6.1.0 informational)")
 F_LOCK=$(ck lockdown fail "lockdown=confidentiality blocks BPF even with caps")
@@ -196,28 +197,30 @@ F_LSM_NOATTR=$(ck lsm fail "BPF denied with caps held, no lockdown/LSM/seccomp a
 F_KERN_LOCK=$(ck kernel fail "kprobe-load blocked by lockdown=confidentiality")
 F_LSM_LOCKPTR=$(ck lsm fail "BPF denied with caps held — lockdown=confidentiality, not LSM")
 
-mkdoc "$T/d-ok.json" ok 0 "[$P_KERN, $P_CAPS, $P_LOCK, $P_LSM, $P_HV, $P_CT]"
-mkdoc "$T/d-caps.json" fail-closed 4 "[$P_KERN, $F_CAPS, $P_LOCK, $P_LSM, $P_HV, $P_CT]"
-mkdoc "$T/d-kernel.json" fail-closed 4 "[$F_KERN, $P_CAPS, $P_LOCK, $P_LSM, $P_HV, $P_CT]"
-mkdoc "$T/d-lockdown.json" fail-closed 4 "[$P_KERN, $P_CAPS, $F_LOCK, $P_LSM, $P_HV, $P_CT]"
-mkdoc "$T/d-lsm.json" fail-closed 4 "[$P_KERN, $P_CAPS, $P_LOCK, $F_LSM, $P_HV, $P_CT]"
-mkdoc "$T/d-obj.json" fail-closed 4 "[$P_KERN, $P_CAPS, $P_LOCK, $P_LSM, $F_HV, $P_CT]"
-mkdoc "$T/d-mixed.json" fail-closed 4 "[$P_KERN, $F_CAPS, $P_LOCK, $P_LSM, $P_HV, $F_CT]"
+mkdoc "$T/d-ok.json" ok 0 "[$P_KERN, $P_CAPS, $P_LOCK, $P_LSM, $P_SPAWN, $P_HV, $P_CT]"
+mkdoc "$T/d-caps.json" fail-closed 4 "[$P_KERN, $F_CAPS, $P_LOCK, $P_LSM, $P_SPAWN, $P_HV, $P_CT]"
+mkdoc "$T/d-kernel.json" fail-closed 4 "[$F_KERN, $P_CAPS, $P_LOCK, $P_LSM, $P_SPAWN, $P_HV, $P_CT]"
+mkdoc "$T/d-lockdown.json" fail-closed 4 "[$P_KERN, $P_CAPS, $F_LOCK, $P_LSM, $P_SPAWN, $P_HV, $P_CT]"
+mkdoc "$T/d-lsm.json" fail-closed 4 "[$P_KERN, $P_CAPS, $P_LOCK, $F_LSM, $P_SPAWN, $P_HV, $P_CT]"
+mkdoc "$T/d-obj.json" fail-closed 4 "[$P_KERN, $P_CAPS, $P_LOCK, $P_LSM, $P_SPAWN, $F_HV, $P_CT]"
+mkdoc "$T/d-mixed.json" fail-closed 4 "[$P_KERN, $F_CAPS, $P_LOCK, $P_LSM, $P_SPAWN, $P_HV, $F_CT]"
 mkdoc "$T/d-unknown.json" fail-closed 4 "[$P_KERN, $P_CAPS, $P_LOCK, $P_LSM, $F_UNK]"
-mkdoc "$T/d-nofail.json" fail-closed 4 "[$P_KERN, $P_CAPS, $P_LOCK, $P_LSM, $P_HV, $P_CT]"
+mkdoc "$T/d-nofail.json" fail-closed 4 "[$P_KERN, $P_CAPS, $P_LOCK, $P_LSM, $P_SPAWN, $P_HV, $P_CT]"
 printf '{"target": null, "checks": [%s], "verdict": "maybe", "exit": 4}' "$F_CAPS" >"$T/d-badverdict.json"
 printf 'osslscope doctor: unknown arg --frobnicate\nusage: osslscope doctor ...\n' >"$T/d-text.txt"
 : >"$T/d-empty.txt"
-mkdoc "$T/d-enomem.json" fail-closed 4 "[$F_KERN_OOM, $P_CAPS, $P_LOCK, $P_LSM, $P_HV, $P_CT]"
-mkdoc "$T/d-kern-nodeny.json" fail-closed 4 "[$F_KERN_NODENY, $P_CAPS, $P_LOCK, $P_LSM, $P_HV, $P_CT]"
-mkdoc "$T/d-lsm-noattr.json" fail-closed 4 "[$P_KERN, $P_CAPS, $P_LOCK, $F_LSM_NOATTR, $P_HV, $P_CT]"
-mkdoc "$T/d-lockdown-full.json" fail-closed 4 "[$F_KERN_LOCK, $P_CAPS, $F_LOCK, $F_LSM_LOCKPTR, $P_HV, $P_CT]"
+mkdoc "$T/d-enomem.json" fail-closed 4 "[$F_KERN_OOM, $P_CAPS, $P_LOCK, $P_LSM, $P_SPAWN, $P_HV, $P_CT]"
+mkdoc "$T/d-kern-nodeny.json" fail-closed 4 "[$F_KERN_NODENY, $P_CAPS, $P_LOCK, $P_LSM, $P_SPAWN, $P_HV, $P_CT]"
+mkdoc "$T/d-lsm-noattr.json" fail-closed 4 "[$P_KERN, $P_CAPS, $P_LOCK, $F_LSM_NOATTR, $P_SPAWN, $P_HV, $P_CT]"
+mkdoc "$T/d-lockdown-full.json" fail-closed 4 "[$F_KERN_LOCK, $P_CAPS, $F_LOCK, $F_LSM_LOCKPTR, $P_SPAWN, $P_HV, $P_CT]"
 printf '{"target": null, "checks": [], "verdict": "ok", "exit": 0}' >"$T/d-emptychecks.json"
 mkdoc "$T/d-noobjects.json" ok 0 "[$P_KERN, $P_CAPS, $P_LOCK, $P_LSM]"
 printf '{"target": null, "checks": [%s, "oops", 42], "verdict": "fail-closed", "exit": 4}' "$F_CAPS" >"$T/d-malformed-rows.json"
-printf '{"target": null, "checks": [%s, %s, %s, %s, {"id": "objects-harvest", "status": "bogus", "message": "made up"}, %s], "verdict": "fail-closed", "exit": 4}' "$P_KERN" "$F_CAPS" "$P_LOCK" "$P_LSM" "$P_CT" >"$T/d-badstatus.json"
-printf '{"target": null, "checks": [%s, %s, %s, %s, %s, %s], "verdict": "ok"}' "$P_KERN" "$P_CAPS" "$P_LOCK" "$P_LSM" "$P_HV" "$P_CT" >"$T/d-noexit.json"
-mkdoc "$T/d-dup.json" ok 0 "[$P_KERN, $P_CAPS, $P_LOCK, $P_LSM, $P_HV, $P_CT, $P_CAPS]"
+printf '{"target": null, "checks": [%s, %s, %s, %s, %s, {"id": "objects-harvest", "status": "bogus", "message": "made up"}, %s], "verdict": "fail-closed", "exit": 4}' "$P_KERN" "$F_CAPS" "$P_LOCK" "$P_LSM" "$P_SPAWN" "$P_CT" >"$T/d-badstatus.json"
+printf '{"target": null, "checks": [%s, %s, %s, %s, %s, %s, %s], "verdict": "ok"}' "$P_KERN" "$P_CAPS" "$P_LOCK" "$P_LSM" "$P_SPAWN" "$P_HV" "$P_CT" >"$T/d-noexit.json"
+mkdoc "$T/d-dup.json" ok 0 "[$P_KERN, $P_CAPS, $P_LOCK, $P_LSM, $P_SPAWN, $P_HV, $P_CT, $P_CAPS]"
+mkdoc "$T/d-nospawn-ok.json" ok 0 "[$P_KERN, $P_CAPS, $P_LOCK, $P_LSM, $P_HV, $P_CT]"
+mkdoc "$T/d-nospawn-fc.json" fail-closed 4 "[$P_KERN, $F_CAPS, $P_LOCK, $P_LSM, $P_HV, $P_CT]"
 
 # --- workload + report fixtures (host workload-output seam) ---
 
@@ -786,6 +789,28 @@ if [ "$CAPTURE_RC" -eq 0 ] \
     ok "capture without --workload-out fails the oracle (mutant red)"
 else
     bad "capture without --workload-out fails the oracle (mutant red) (capture_rc=$CAPTURE_RC oracle_rc=$ORACLE_RC)"
+fi
+
+# --- required-row completeness (fix round 2: spawn-access) ---
+
+# 56. An ok report missing only the spawn-access setup gate
+# authorizes nothing: the producer always emits that row
+# (doctor.rs check_spawn_access), and it can fail when the
+# spawn probe cannot fork.
+run_probe "$T/d-nospawn-ok.json" 0 p-nospawn-ok
+if [ "$PROBE_RC" -ne 0 ] && gh_no_capable p-nospawn-ok; then
+    ok "probe ok report missing spawn-access fails setup without capable="
+else
+    bad "probe ok report missing spawn-access fails setup without capable= (rc=$PROBE_RC)"
+fi
+
+# 57. A fail-closed admitted report missing only spawn-access
+# is setup failure, never a skip.
+run_probe "$T/d-nospawn-fc.json" 4 p-nospawn-fc
+if [ "$PROBE_RC" -ne 0 ] && gh_no_capable p-nospawn-fc; then
+    ok "probe fail-closed report missing spawn-access fails setup without capable="
+else
+    bad "probe fail-closed report missing spawn-access fails setup without capable= (rc=$PROBE_RC)"
 fi
 
 echo "---"
