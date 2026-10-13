@@ -6,8 +6,8 @@
 
 use osslscope::target::{
     __test_set_control_worker_counter, __test_set_fail_fork, __test_set_prestop_pid_sink,
-    __test_set_prestop_stall_ms, __test_set_setup_delay_ms, __test_set_truncate_delay_ms,
-    CustodyState, OwnedTarget, TargetDisposition, WorkloadDest,
+    __test_set_prestop_stall_ms, __test_set_publish_gate, __test_set_setup_delay_ms,
+    __test_set_truncate_delay_ms, CustodyState, OwnedTarget, TargetDisposition, WorkloadDest,
 };
 use std::time::{Duration, Instant};
 
@@ -1428,12 +1428,12 @@ fn file_truncate_runs_under_setup_control() {
     // in open/truncate/close on the setup path — while a worker delayed
     // past abandonment still truncates nothing.
     //
-    // Leg 1 (bounded + fenced): the truncate half of preparation is
-    // deterministically stalled (3s, simulating a sink that withholds the
-    // SETATTR response) past a 300ms setup deadline. The caller must fail
-    // fast on the deadline — not block in the stall — fork nothing, and
-    // the successor bytes written after abandonment must survive the late
-    // worker.
+    // Leg 1 (bounded + gated): preparation is deterministically
+    // stalled (3s, simulating a sink that answers slowly) between staging
+    // and the atomic publish, past a 300ms setup deadline. The caller must
+    // fail fast on the deadline — not block in the stall — fork nothing,
+    // and the successor bytes written after abandonment must survive the
+    // late worker.
     let dir = r06_scratch("truncate-control");
     let log = dir.join("workload.log");
     std::fs::write(&log, b"original\n").unwrap();
@@ -1513,6 +1513,93 @@ fn file_truncate_runs_under_setup_control() {
         b"H9-OUT-S\nH9-ERR-S\n",
         "live setup truncates pre-existing bytes"
     );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn abandoned_late_worker_never_truncates_successor() {
+    // Fix round 4 / NO-LATE-TRUNCATE (restored post-check control): the
+    // worker runs every pre-publish step (outer check passed while live,
+    // destination validated, staging complete) and then pauses poised at
+    // the atomic publish; the caller abandons on its deadline, a
+    // successor populates the destination, and only then is the worker
+    // released — the abandonment is ordered strictly before the atomic
+    // check + rename, so the worker must delete its staging and publish
+    // nothing, and the successor bytes must survive. (The old structure's
+    // check-then-truncate gap — the RED shape of this test — no longer
+    // exists: there is no post-check pause point inside the atomic
+    // section, so this pauses at the last point before it.)
+    let dir = r06_scratch("post-check-pause");
+    let log = dir.join("workload.log");
+    std::fs::write(&log, b"original\n").unwrap();
+    let sentinel = dir.join("SENTINEL");
+    let argv = r06_sentinel_argv(&sentinel);
+    let cancel = AtomicBool::new(false);
+    let counter = Arc::new(AtomicU32::new(0));
+    let pid_sink = Arc::new(AtomicU32::new(0));
+    let ready = Arc::new(AtomicBool::new(false));
+    let proceed = Arc::new(AtomicBool::new(false));
+    __test_set_control_worker_counter(Some(counter.clone()));
+    __test_set_publish_gate(Some((ready.clone(), proceed.clone())));
+    __test_set_prestop_pid_sink(Some(pid_sink.clone()));
+    let t0 = Instant::now();
+    let result = OwnedTarget::spawn_stopped_with_control(
+        &argv,
+        WorkloadDest::File(log.clone()),
+        Instant::now() + Duration::from_millis(300),
+        &cancel,
+    );
+    let elapsed = t0.elapsed();
+    __test_set_publish_gate(None);
+    __test_set_control_worker_counter(None);
+    __test_set_prestop_pid_sink(None);
+    let msg = match result {
+        Err(e) => e.to_string(),
+        Ok(t) => r06_unexpected_child(t, "expired setup must fail"),
+    };
+    assert!(
+        msg.contains("deadline"),
+        "caller abandoned on deadline: {msg}"
+    );
+    assert!(msg.contains("no child spawned"), "nothing forked: {msg}");
+    assert_eq!(pid_sink.load(Ordering::SeqCst), 0, "no fork may happen");
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "caller must not block on the poised worker (took {elapsed:?})"
+    );
+    // The worker is poised at the publish (bounded wait covers a
+    // descheduled worker — either way it has NOT taken the publish lock
+    // yet, and the abandonment above strictly precedes its decision).
+    let end = Instant::now() + Duration::from_secs(10);
+    while !ready.load(Ordering::SeqCst) {
+        assert!(Instant::now() < end, "worker never poised at publish");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // A retry or another writer populates the destination now — after
+    // the abandonment, before the worker's publish decision.
+    std::fs::write(&log, b"successor-bytes\n").unwrap();
+    assert!(!sentinel.exists(), "sentinel must never execute");
+    // Release the worker, wait for it to finish (bounded), then prove
+    // the successor bytes survived it.
+    proceed.store(true, Ordering::SeqCst);
+    let end = Instant::now() + Duration::from_secs(10);
+    while counter.load(Ordering::SeqCst) < 1 {
+        assert!(Instant::now() < end, "worker never finished");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        std::fs::read(&log).unwrap(),
+        b"successor-bytes\n",
+        "late worker must never truncate post-abandonment bytes"
+    );
+    // The abandoned worker deleted its staging: no litter beside the
+    // destination.
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    assert_eq!(names, vec!["workload.log".to_string()]);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
