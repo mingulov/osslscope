@@ -7,10 +7,11 @@ captured via the observer's --workload-out file, never the observer's
 own logs) against the observer's observed-crypto-v2 JSON across
 current + fenced generations: the ledgered operation must be visible
 as executed sites carrying the mode's op, algorithm class(es),
-provider class and operation funcids. Per the fixture contract, exact
-provider-internal counts are implementation-defined: they are printed
-for the calibration record, never asserted; the ledger lower-bounds
-observation instead.
+provider class and operation funcids on ONE candidate (split
+evidence across candidates is never definite attribution). Per the
+fixture contract, exact provider-internal counts are
+implementation-defined: they are printed for the calibration record,
+never asserted; the ledger lower-bounds observation instead.
 
 Usage: live-oracle.py WORKLOAD_LOG REPORT_JSON MODE
 Exits 0 on ORACLE PASS, 1 on ORACLE FAIL, 2 on usage error, 3 on
@@ -33,9 +34,11 @@ MODE_OPS = {
     "mixed": {1},
 }
 
-# Mode -> required algorithm-class sets (existential: EACH set must
-# appear on >=1 executed mode-op candidate). Multiple spellings in one
-# set are provider-array aliases of one algorithm: live runs show the
+# Mode -> required algorithm-class sets (existential per leg: EACH set
+# must appear on >=1 executed mode-op candidate TOGETHER WITH the
+# leg's provider class and, when ledgered, the operation funcid: one
+# candidate carries the full tuple). Multiple spellings in one set
+# are provider-array aliases of one algorithm: live runs show the
 # KEM and SHA2 entries emit OIDs, never friendly names, while
 # X25519/HKDF/MD4 emit friendly names (P3 smoke, 2026-10-12).
 MODE_CLASSES = {
@@ -73,8 +76,9 @@ MODE_PROVIDERS_BIND = {
 }
 
 # Mode -> ((ledger counter, {operation funcids})...) (existential: when
-# the summed counter is > 0, >=1 executed mode-op site must carry one
-# of the funcids). Frozen ABI ids from src/kinds.rs; call paths
+# the summed counter is > 0, >=1 executed mode-op candidate per leg
+# must carry one of the funcids TOGETHER WITH the leg's class and
+# provider). Frozen ABI ids from src/kinds.rs; call paths
 # source-confirmed in OpenSSL 3.5.8 crypto/evp/ (DigestSign/
 # DigestVerify one-shots; EVP_Digest is Init+Update+Final, never the
 # one-shot 5). Setup-only funcids (newctx/init/freectx/params) never
@@ -95,6 +99,45 @@ FUNC_NAMES = {
     (12, 11): "DIGEST_SIGN", (12, 15): "DIGEST_VERIFY",
     (14, 3): "ENCAPSULATE", (14, 5): "DECAPSULATE",
 }
+
+
+def candidate_matches_operation(candidate, op, algorithm_classes,
+                                provider_classes, funcids):
+    """Pure single-candidate operation predicate (R09).
+
+    One candidate must carry the FULL operation tuple (op, algorithm
+    class, provider class and operation funcid) to witness a
+    ledgered operation. Split evidence (class on one candidate,
+    provider or funcid on another) never witnesses an operation and
+    is never reported as definite attribution. `op` is the accepted
+    op-id set (a singleton int is tolerated); `funcids=None` checks
+    leg presence (any funcid). Missing keys never match, never crash.
+    """
+    if isinstance(op, int):
+        op = {op}
+    if candidate.get("op") not in op:
+        return False
+    if not (set(algorithm_classes)
+            & set(candidate.get("algorithm_classes") or [])):
+        return False
+    if candidate.get("provider_class") not in provider_classes:
+        return False
+    if funcids is not None and candidate.get("funcid") not in funcids:
+        return False
+    return True
+
+
+def mode_legs(mode):
+    """((algorithm-class spellings, accepted provider classes), ...).
+
+    One leg per required class set: ALL-provider modes pair each
+    MODE_CLASSES set with the mode-wide provider; per-class modes
+    keep their adopted MODE_PROVIDERS_BIND pairs verbatim.
+    """
+    if mode in MODE_PROVIDERS_ALL:
+        allowed = MODE_PROVIDERS_ALL[mode]
+        return tuple((classes, allowed) for classes in MODE_CLASSES[mode])
+    return MODE_PROVIDERS_BIND[mode]
 
 
 def fail(msg):
@@ -226,13 +269,21 @@ def main(argv):
                     "(total %d calls over %d sites across %d generations)"
                     % (sorted(want), mode, total, len(collect), ngen))
     op_calls = sum(s.get("calls", 0) for _, s in hits)
-    for classes in MODE_CLASSES[mode]:
-        if not any(classes & set(c.get("algorithm_classes", []))
+    legs = mode_legs(mode)
+    for classes, providers in legs:
+        if any(candidate_matches_operation(c, want, classes, providers, None)
+               for _, s in hits for c in s.get("candidates", [])):
+            continue
+        if not any(classes & set(c.get("algorithm_classes") or [])
                    for _, s in hits for c in s.get("candidates", [])
                    if c.get("op") in want):
             return fail("no executed op-%s site carries class %r for mode %s "
                         "(wrong algorithm, e.g. DSA for ECDSA)"
                         % (sorted(want), sorted(classes), mode))
+        return fail("no executed op-%s site binds class %r to provider "
+                    "%r for mode %s (wrong provider)"
+                    % (sorted(want), sorted(classes), sorted(providers),
+                       mode))
     if mode in MODE_PROVIDERS_ALL:
         allowed = MODE_PROVIDERS_ALL[mode]
         for w, s in hits:
@@ -245,15 +296,6 @@ def main(argv):
                                 sorted(want), s.get("calls"), w,
                                 sorted(p for p in provs if p is not None),
                                 sorted(allowed), mode))
-    for classes, allowed in MODE_PROVIDERS_BIND.get(mode, ()):
-        if not any(c.get("provider_class") in allowed
-                   and (classes & set(c.get("algorithm_classes", [])))
-                   for _, s in hits for c in s.get("candidates", [])
-                   if c.get("op") in want):
-            return fail("no executed op-%s site binds class %r to provider "
-                        "%r for mode %s (wrong provider)"
-                        % (sorted(want), sorted(classes), sorted(allowed),
-                           mode))
     counters = {}
     for d in parsed:
         for k, v in d.items():
@@ -262,17 +304,24 @@ def main(argv):
             except (ValueError, TypeError):
                 pass
     for counter, funcids in MODE_OPFUNC[mode]:
-        if counters.get(counter, 0) > 0 and not any(
-                c.get("funcid") in funcids
-                for _, s in hits for c in s.get("candidates", [])
-                if c.get("op") in want):
+        if counters.get(counter, 0) <= 0:
+            continue
+        for classes, providers in legs:
+            if any(candidate_matches_operation(
+                    c, want, classes, providers, funcids)
+                   for _, s in hits for c in s.get("candidates", [])):
+                continue
             op = sorted(want)[0]
-            return fail("ledgered %d %s but no executed op-%s site carries "
-                        "function %s for mode %s (wrong function: setup "
-                        "calls without the operation)" % (
-                            counters[counter], counter, sorted(want),
-                            "/".join(func_label(op, f) for f in sorted(funcids)),
-                            mode))
+            return fail("ledgered %d %s but no single candidate "
+                        "carries class %r + provider %r + function %s on "
+                        "executed op-%s for mode %s (wrong function: split "
+                        "attribution across candidates is not an operation)"
+                        % (
+                            counters[counter], counter,
+                            sorted(classes), sorted(providers),
+                            "/".join(func_label(op, f)
+                                     for f in sorted(funcids)),
+                            sorted(want), mode))
     # Lower-bound conservation (fixture contract: ledgered ops explain
     # observed execution from below): every loop iteration executes
     # >=1 mode-op callback, so mode-op calls >= ledgered iterations.
@@ -283,7 +332,8 @@ def main(argv):
                     "(ledger does not explain observation)"
                     % (op_calls, max(loop_ops)))
     print("ORACLE PASS: ledgered op %s execution is visible in observer JSON "
-          "(%d op calls over %d ledgered iterations, %d generations)"
+          "(%d op calls over %d ledgered iterations, aggregate lower "
+          "bound, %d generations)"
           % (sorted(want), op_calls, max(loop_ops) if loop_ops else 0, ngen))
     return 0
 
