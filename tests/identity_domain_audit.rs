@@ -468,7 +468,7 @@ fn h5_t3_every_device_site_names_one_domain() {
         (
             "src/discovery/session.rs",
             "stat",
-            ".map(|p| (p.module, (p.dev, p.ino)))",
+            ".map(|p| ((p.module, p.program), (p.dev, p.ino)))",
             2,
         ),
         // session.rs: plan ident / bindings from bound reads + pins (stat, ×4).
