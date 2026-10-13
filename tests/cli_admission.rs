@@ -347,6 +347,99 @@ fn ordering_inspect_invalid_input_precedes_effects() {
 }
 
 #[test]
+fn ordering_inspect_harvest_spy_fires_on_valid_stays_zero_on_invalid() {
+    // Fix-round-2 (re-review F1): production harvest-call spy.
+    // inspect emits nothing on setup failure, so the --out file spy
+    // cannot distinguish "setup ran" from "setup never reached" —
+    // both leave the file absent. This spy counts PRODUCTION
+    // harvest invocations (thread-local): it must fire exactly once
+    // for valid input (exit 4 on the bogus paths) and stay at zero
+    // for invalid input (exit 2), proving invalid input is rejected
+    // before any provider read / BPF preparation.
+    use osslscope::inspect::{harvest_calls, reset_harvest_calls};
+    let invalid: &[&[&str]] = &[
+        &["--timeout", "121"],
+        &["--timeout", "NaN"],
+        &["--timeout", "1e-300"],
+        &["--settle", "31"],
+        &["--settle", "1e30"],
+        &["--bogus", "1"],
+        &["--timeout"],
+    ];
+    for extra in invalid {
+        reset_harvest_calls();
+        assert_eq!(
+            run_inspect(&base_inspect(extra)),
+            ExitCode::from(2),
+            "inspect {extra:?}"
+        );
+        assert_eq!(
+            harvest_calls(),
+            0,
+            "inspect {extra:?}: usage rejection precedes harvest setup (no provider read)"
+        );
+    }
+    // Missing required args are usage errors too.
+    reset_harvest_calls();
+    assert_eq!(run_inspect(&argv(&["--pid", "1"])), ExitCode::from(2));
+    assert_eq!(harvest_calls(), 0, "missing args precede harvest setup");
+    // Positive controls: valid input reaches production harvest
+    // (exit 4 on the bogus BPF objects) and the spy fires exactly
+    // once per run.
+    for extra in [
+        Vec::<&str>::new(),
+        vec!["--timeout", "0.5", "--settle", "30"],
+    ] {
+        reset_harvest_calls();
+        assert_eq!(
+            run_inspect(&base_inspect(&extra)),
+            ExitCode::from(4),
+            "inspect {extra:?}"
+        );
+        assert_eq!(
+            harvest_calls(),
+            1,
+            "inspect {extra:?}: setup ran exactly once"
+        );
+    }
+}
+
+#[test]
+fn ordering_inspect_harvest_spy_catches_premature_provider_read() {
+    // Negative control for the harvest spy: simulate the reviewer's
+    // violation scenario — a production provider-read attempt
+    // FOLLOWED BY a normal usage rejection — and prove the
+    // invalid-path control (spy stays zero) FAILS in that world,
+    // i.e. a premature read cannot hide behind exit 2.
+    use osslscope::inspect::{harvest_calls, reset_harvest_calls};
+    reset_harvest_calls();
+    // Force a REAL production provider-read attempt first: valid
+    // admission reaches harvest::run, whose first effect is
+    // fs::read(&cfg.provider) (bogus here → setup exit 4).
+    assert_eq!(run_inspect(&base_inspect(&[])), ExitCode::from(4));
+    assert_eq!(harvest_calls(), 1, "the forced setup attempt fired the spy");
+    // ... followed by a normal usage rejection (which itself must
+    // fire nothing further).
+    assert_eq!(
+        run_inspect(&base_inspect(&["--timeout", "121"])),
+        ExitCode::from(2)
+    );
+    assert_eq!(
+        harvest_calls(),
+        1,
+        "usage rejection adds no setup call, but the earlier attempt stays observed"
+    );
+    // The invalid-path control (zero spy) must FAIL now: the spy is
+    // cumulative, so the earlier setup attempt is still observed.
+    let control_holds = harvest_calls() == 0;
+    assert!(
+        !control_holds,
+        "zero-spy control must FAIL after a setup attempt (calls observed: {})",
+        harvest_calls()
+    );
+}
+
+#[test]
 fn provider_matchers_reject_empty_on_every_occurrence() {
     // Each matrix row must be a usage error (exit 2), even with
     // missing BPF objects that would fail setup (4) if admitted.
