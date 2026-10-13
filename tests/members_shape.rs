@@ -6,9 +6,15 @@
 //! forbidden-helper scan, and size records. Behavioral proof (baking,
 //! walk contents) is the live `members_probe` suite's job.
 //!
-//! Run: `OSSL_MEMBERS_OBJECT=<members.o> cargo +1.88.0 test
+//! Run (optional mode, the local default):
+//! `OSSL_MEMBERS_OBJECT=<members.o> cargo +1.88.0 test
 //! --test members_shape`. Unset object → labeled SKIP (CI has no
 //! BPF artifacts in the host job); set-but-bad → FAIL.
+//!
+//! Run (required mode, the CI gate): prepend
+//! `OSSL_MEMBERS_REQUIRED=1`. Unset/empty object → FAIL — no
+//! silent skips; the suite must run against the job's freshly
+//! built members object. Set-but-bad → FAIL in both modes.
 
 use osslscope::loader::{MEMBER_MAPS, MEMBER_PROGS, MapSpec};
 use std::collections::{HashMap, HashSet};
@@ -17,6 +23,29 @@ fn object_path() -> Option<String> {
     std::env::var("OSSL_MEMBERS_OBJECT")
         .ok()
         .filter(|s| !s.is_empty())
+}
+
+/// Required mode (the CI gate): `OSSL_MEMBERS_REQUIRED=1` fails
+/// closed on a missing object. Any other value, including unset,
+/// keeps the optional local default.
+fn is_required() -> bool {
+    matches!(std::env::var("OSSL_MEMBERS_REQUIRED").as_deref(), Ok("1"))
+}
+
+/// Missing-object branch shared by the nine object-backed tests:
+/// loud FAIL in required mode, clearly labeled optional-mode SKIP
+/// otherwise.
+fn no_object() {
+    if is_required() {
+        panic!(
+            "FAIL(members-required): OSSL_MEMBERS_OBJECT unset or empty; \
+             required mode refuses silent skips"
+        );
+    }
+    eprintln!(
+        "SKIP(members-object,optional-mode): OSSL_MEMBERS_OBJECT unset \
+         (set OSSL_MEMBERS_REQUIRED=1 to fail closed)"
+    );
 }
 
 fn object_bytes() -> Option<Vec<u8>> {
@@ -172,7 +201,7 @@ fn scanner_unit() {
 #[test]
 fn s1_prepare_513() {
     let Some(prep) = prepared() else {
-        eprintln!("SKIP(members-object): OSSL_MEMBERS_OBJECT unset");
+        no_object();
         return;
     };
     assert_eq!(prep.progs.len(), 513, "512 members + member_entry");
@@ -183,7 +212,7 @@ fn s1_prepare_513() {
 #[test]
 fn s2_names_sections() {
     let Some(prep) = prepared() else {
-        eprintln!("SKIP(members-object): OSSL_MEMBERS_OBJECT unset");
+        no_object();
         return;
     };
     let by_name: HashMap<&str, &osslscope::loader::PreparedProg> =
@@ -205,7 +234,7 @@ fn s2_names_sections() {
 #[test]
 fn s3_bodies_distinct() {
     let Some(obj) = object_bytes() else {
-        eprintln!("SKIP(members-object): OSSL_MEMBERS_OBJECT unset");
+        no_object();
         return;
     };
     let mains = section_mains(&obj, "uretprobe");
@@ -221,7 +250,7 @@ fn s3_bodies_distinct() {
 #[test]
 fn s4_map_dims() {
     let Some(prep) = prepared() else {
-        eprintln!("SKIP(members-object): OSSL_MEMBERS_OBJECT unset");
+        no_object();
         return;
     };
     let want: &[(&str, u32, u32, u32, u32, u32)] = &[
@@ -273,7 +302,7 @@ fn s4_map_dims() {
 #[test]
 fn s5_no_forbidden_helpers() {
     let Some(obj) = object_bytes() else {
-        eprintln!("SKIP(members-object): OSSL_MEMBERS_OBJECT unset");
+        no_object();
         return;
     };
     const FORBIDDEN: [i32; 3] = [12, 134, 181];
@@ -301,7 +330,7 @@ fn s5_no_forbidden_helpers() {
 #[test]
 fn s5_dottext_negative() {
     let Some(obj) = object_bytes() else {
-        eprintln!("SKIP(members-object): OSSL_MEMBERS_OBJECT unset");
+        no_object();
         return;
     };
     if !has_section(&obj, ".text") {
@@ -329,7 +358,7 @@ fn s5_dottext_negative() {
 #[test]
 fn s6_size_cap() {
     let Some(prep) = prepared() else {
-        eprintln!("SKIP(members-object): OSSL_MEMBERS_OBJECT unset");
+        no_object();
         return;
     };
     let mut sizes: Vec<(String, usize)> = prep
@@ -354,7 +383,7 @@ fn s6_size_cap() {
 #[test]
 fn s7_retired_maps_absent() {
     let Some(obj) = object_bytes() else {
-        eprintln!("SKIP(members-object): OSSL_MEMBERS_OBJECT unset");
+        no_object();
         return;
     };
     for retired in ["QUERY_NEXT", "TERMD", "LGCALLS"] {
@@ -390,7 +419,7 @@ fn s7_retired_maps_absent() {
 #[test]
 fn s8_folded_specials() {
     let Some(obj) = object_bytes() else {
-        eprintln!("SKIP(members-object): OSSL_MEMBERS_OBJECT unset");
+        no_object();
         return;
     };
     let mains = section_mains(&obj, "uretprobe");

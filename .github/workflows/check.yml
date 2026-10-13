@@ -26,6 +26,12 @@ jobs:
       - run: cargo install bpf-linker --locked --version 0.10.4
       - run: cd crates/ebpf && cargo +nightly-2026-05-20 build --locked -Z build-std=core --target bpfel-unknown-none --release --bin osslscope-harvest --bin osslscope-count --bin osslscope-members
       - run: file crates/ebpf/target/bpfel-unknown-none/release/osslscope-harvest crates/ebpf/target/bpfel-unknown-none/release/osslscope-count crates/ebpf/target/bpfel-unknown-none/release/osslscope-members
+      # Members-shape gate (G04): the pure shape suite runs in required
+      # mode against this job's freshly built members object — a missing
+      # object fails, never a silent skip. Compilation/shape success is
+      # still not verifier or live qualification.
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - run: OSSL_MEMBERS_REQUIRED=1 OSSL_MEMBERS_OBJECT=crates/ebpf/target/bpfel-unknown-none/release/osslscope-members cargo +1.88.0 test --locked --test members_shape -- --nocapture
   packaging:
     # Host-runnable lifecycle/install simulation: deb/rpm scriptlet argument
     # matrix (stub setcap, no root) + local-prefix install layout and
