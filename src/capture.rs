@@ -554,11 +554,17 @@ pub struct LifecycleEvent {
 }
 
 /// One lifecycle poll: new events plus scan loss (failed /proc
-/// reads that may have missed activity).
+/// reads that may have missed activity) plus kernel-side signal
+/// drops (the kernel producer's own overflow count between drains,
+/// as reported through the port — distinct from host scan loss so
+/// the two sources stay attributable).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LifecycleDelta {
     pub events: Vec<LifecycleEvent>,
     pub loss: u64,
+    /// Kernel-side signals known-dropped (ring overflow). Zero for
+    /// ports with no kernel producer (polling).
+    pub dropped: u64,
 }
 
 /// Short fork/exec + lifecycle-loss observer. The T08 selection is
@@ -569,6 +575,15 @@ pub struct LifecycleDelta {
 pub trait LifecyclePort {
     fn poll(&mut self) -> LifecycleDelta;
     fn fallback_partial(&self) -> bool;
+    /// Close-time signal-ring drain for kernel-signal ports: consume
+    /// the ring through the current tail at window close, even when
+    /// the target already exited (a ring drain needs no /proc scan,
+    /// so it is safe on corpses). Polling ports return `None`: their
+    /// close-time sweep stays skipped once the child is reaped (there
+    /// is nothing to scan but the sweep's own unreadable-exe loss).
+    fn close_drain(&mut self) -> Option<LifecycleDelta> {
+        None
+    }
 }
 
 /// Parse (pid, ppid) from a `/proc/<pid>/stat` line; comm may hold
@@ -740,18 +755,36 @@ pub trait ProcPort {
     /// the file across the read (open once, fstat/read/fstat) so
     /// the bytes cannot tear across a replacement.
     fn read_file_bound(&mut self, path: &str) -> anyhow::Result<(Vec<u8>, (u64, u64))>;
-    /// Identity stat (F-D/A13): the CURRENT (encoded dev, ino) of
-    /// `path` without reading bytes — same encoding domain as
+    /// Identity stat (F-D/A13, freshness per R20): the CURRENT
+    /// [`FileStat`] of `path` without reading bytes — same (dev,
+    /// ino) encoding domain as
     /// [`read_file_bound`](Self::read_file_bound) so callers can
     /// validate a cached entry. `None` when unstatable (the caller
     /// treats that as a cache miss, never as a hit).
-    fn stat_file(&mut self, path: &str) -> Option<(u64, u64)>;
+    fn stat_file(&mut self, path: &str) -> Option<FileStat>;
     fn read_exe(&mut self, pid: u32) -> Option<PathBuf>;
     fn file_len(&mut self, path: &str) -> Option<u64>;
     /// Current comm (`None` when unreadable — the caller keeps its
     /// snapshot). Owned children are acquired stopped pre-exec, so
     /// this settles the application identity after release.
     fn read_comm(&mut self, pid: u32) -> Option<String>;
+}
+
+/// Identity + freshness of one filesystem path (R20): (dev, ino)
+/// is the file identity (same encoding domain as
+/// [`plan::read_file_bound`]), (size, mtime_ns) its freshness. The
+/// file cache validates all four: an in-place content change keeps
+/// (dev, ino) but moves size and/or mtime, so (dev, ino)-only
+/// validation would serve stale bytes under a stale fingerprint
+/// indefinitely (P6 implementation-only replacement).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileStat {
+    pub dev: u64,
+    pub ino: u64,
+    pub size: u64,
+    /// Nanoseconds since the Unix epoch, saturating (pre-epoch
+    /// mtimes read 0 — a constant, never a tear).
+    pub mtime_ns: u64,
 }
 
 /// Live /proc + filesystem reads.
@@ -770,17 +803,22 @@ impl ProcPort for LiveProc {
         Ok(plan::read_file_bound(path).map(|f| (f.bytes, (f.dev, f.ino)))?)
     }
 
-    fn stat_file(&mut self, path: &str) -> Option<(u64, u64)> {
+    fn stat_file(&mut self, path: &str) -> Option<FileStat> {
         use std::os::unix::fs::MetadataExt as _;
         // Same encoding as plan::read_file_bound (major/minor via
         // libc, never the raw dev_t word) so cache validation
         // compares in one domain.
         std::fs::metadata(path)
-            .map(|m| {
-                (
-                    plan::encode_device(libc::major(m.dev()), libc::minor(m.dev())),
-                    m.ino(),
-                )
+            .map(|m| FileStat {
+                dev: plan::encode_device(libc::major(m.dev()), libc::minor(m.dev())),
+                ino: m.ino(),
+                size: m.len(),
+                mtime_ns: m
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_nanos().min(u128::from(u64::MAX)) as u64)
+                    .unwrap_or(0),
             })
             .ok()
     }
@@ -2021,6 +2059,16 @@ struct SalvageContext {
     taint_evidence: bool,
 }
 
+/// One cached file: the identity-bound bytes plus the freshness
+/// (size, mtime) they were read under. Kept in one entry so prune
+/// and validation can never disagree about what a path holds.
+#[derive(Debug, Clone)]
+struct CachedFile {
+    file: plan::FileBytes,
+    size: u64,
+    mtime_ns: u64,
+}
+
 /// The session-driven observation: owns both sessions, target
 /// custody, lifecycle, accumulation and finalization for one
 /// requested window.
@@ -2053,6 +2101,9 @@ struct Runner<'x, D, B: CountBackend, T, L, C: ClockPort, P: ProcPort> {
     cold_gap_queries: u64,
     fork_exec_ignored: u64,
     lifecycle_loss: u64,
+    /// Kernel-side lifecycle signals known-dropped (ring overflow
+    /// reported through the port).
+    lifecycle_dropped: u64,
     maps_read_failed: u64,
     scan_budget_exhaustions: u64,
     provider_changed_fences: u64,
@@ -2078,14 +2129,15 @@ struct Runner<'x, D, B: CountBackend, T, L, C: ClockPort, P: ProcPort> {
     open_instant: Instant,
     open_wall: SystemTime,
     drain_wall_us: u64,
-    /// Verified-identity file cache (F-D/A13): path →
-    /// identity-bound bytes. Entries are validated per poll by
+    /// Verified-identity file cache (F-D/A13, freshness per R20):
+    /// path → identity-bound bytes plus the freshness they were
+    /// read under. Entries are validated per poll by
     /// [`ProcPort::stat_file`] against the CURRENT on-disk
-    /// identity and re-read on any mismatch; unmapped entries
+    /// [`FileStat`] and re-read on any mismatch; unmapped entries
     /// never survive a round (a vanished mapping's bytes are
     /// unprovable). Bounded by [`MAX_CACHED_FILES`] /
     /// [`MAX_CACHED_BYTES`].
-    file_cache: HashMap<String, plan::FileBytes>,
+    file_cache: HashMap<String, CachedFile>,
     /// Relevant paths dropped by the per-poll relevance/bytes
     /// caps (loud loss at finalize).
     relevance_capped: u64,
@@ -2263,25 +2315,62 @@ where
                 break;
             }
             let current = self.proc.stat_file(p);
+            // Identity + freshness (R20): an in-place content change
+            // keeps (dev, ino) but moves size and/or mtime, so
+            // identity-only validation would serve stale bytes under
+            // a stale fingerprint indefinitely (P6 implementation-only
+            // replacement). Any mismatch re-reads.
             let hit = matches!(
-                (current, self.file_cache.get(p)),
-                (Some((dev, ino)), Some(cached)) if cached.dev == dev && cached.ino == ino
+                (&current, self.file_cache.get(p)),
+                (Some(cur), Some(cached))
+                    if cached.file.dev == cur.dev
+                        && cached.file.ino == cur.ino
+                        && cached.size == cur.size
+                        && cached.mtime_ns == cur.mtime_ns
             );
             if !hit {
                 match self.proc.read_file_bound(p) {
                     Ok((bytes, (dev, ino))) => {
-                        self.file_cache
-                            .insert(p.clone(), plan::FileBytes { bytes, dev, ino });
+                        let read = plan::FileBytes { bytes, dev, ino };
+                        // Torn-read guard: the file may have changed
+                        // between the pre-stat and the read (stat old
+                        // / read new, or the fd pinning the old inode
+                        // under a new stat). Cache only when the read
+                        // identity matches the pre-stat AND a
+                        // post-read stat still matches it; otherwise
+                        // serve these bytes this round uncached and
+                        // re-read next poll. An unstatable path never
+                        // caches (freshness unprovable).
+                        let verified = match current {
+                            Some(cur)
+                                if (dev, ino) == (cur.dev, cur.ino)
+                                    && self.proc.stat_file(p) == Some(cur) =>
+                            {
+                                Some(cur)
+                            }
+                            _ => None,
+                        };
+                        if let Some(cur) = verified {
+                            self.file_cache.insert(
+                                p.clone(),
+                                CachedFile {
+                                    file: read.clone(),
+                                    size: cur.size,
+                                    mtime_ns: cur.mtime_ns,
+                                },
+                            );
+                        }
+                        out_bytes = out_bytes.saturating_add(read.bytes.len());
+                        out.insert(p.clone(), read);
                     }
                     Err(_) => {
                         self.file_cache.remove(p);
                         continue;
                     }
                 }
-            }
-            if let Some(cached) = self.file_cache.get(p) {
-                out_bytes = out_bytes.saturating_add(cached.bytes.len());
-                out.insert(p.clone(), cached.clone());
+            } else if let Some(cached) = self.file_cache.get(p) {
+                out_bytes = out_bytes.saturating_add(cached.file.bytes.len());
+                out.insert(p.clone(), cached.file.clone());
             }
         }
         self.relevance_capped = self.relevance_capped.saturating_add(dropped);
@@ -2297,7 +2386,7 @@ where
     fn prune_file_cache(&mut self, live: &[maps::Mapping], relevant: &BTreeSet<String>) {
         let mapped: HashSet<&str> = live.iter().map(|m| m.path.as_str()).collect();
         self.file_cache.retain(|p, _| mapped.contains(p.as_str()));
-        let cached_bytes: usize = self.file_cache.values().map(|f| f.bytes.len()).sum();
+        let cached_bytes: usize = self.file_cache.values().map(|f| f.file.bytes.len()).sum();
         if self.file_cache.len() <= MAX_CACHED_FILES && cached_bytes <= MAX_CACHED_BYTES {
             return;
         }
@@ -2305,7 +2394,7 @@ where
         let mut survivors: Vec<(String, usize)> = self
             .file_cache
             .iter()
-            .map(|(p, f)| (p.clone(), f.bytes.len()))
+            .map(|(p, f)| (p.clone(), f.file.bytes.len()))
             .collect();
         survivors.sort_by(|a, b| b.1.cmp(&a.1));
         let mut bytes: usize = survivors.iter().map(|(_, s)| s).sum();
@@ -2402,6 +2491,25 @@ where
         Ok((exhausted, report.candidates_changed))
     }
 
+    /// Fold one lifecycle delta (round sweep, final sweep, or
+    /// close-time ring drain) into the accumulators. Only Fork events
+    /// count as ignored: the target's own execs are fence-tracked by
+    /// the snapshot generation (counting them here would double-book
+    /// the observed spawn-exec as ignored). Kernel-side drops ride
+    /// separately from host scan loss so the two sources stay
+    /// attributable.
+    fn fold_lifecycle(&mut self, delta: &LifecycleDelta) {
+        self.fork_exec_ignored = self.fork_exec_ignored.saturating_add(
+            delta
+                .events
+                .iter()
+                .filter(|e| e.kind == LifecycleKind::Fork)
+                .count() as u64,
+        );
+        self.lifecycle_loss = self.lifecycle_loss.saturating_add(delta.loss);
+        self.lifecycle_dropped = self.lifecycle_dropped.saturating_add(delta.dropped);
+    }
+
     /// One bounded poll round: maps, corpse check, fence compare,
     /// lifecycle sweep, discovery catch-up polls, single fence.
     fn round(&mut self, deadline: Instant, settle_end: Instant) -> anyhow::Result<RoundAction> {
@@ -2488,14 +2596,7 @@ where
         // fence-tracked by the snapshot generation (counting them
         // here double-books the observed spawn-exec as ignored).
         let sweep = self.lifecycle.poll();
-        self.fork_exec_ignored = self.fork_exec_ignored.saturating_add(
-            sweep
-                .events
-                .iter()
-                .filter(|e| e.kind == LifecycleKind::Fork)
-                .count() as u64,
-        );
-        self.lifecycle_loss = self.lifecycle_loss.saturating_add(sweep.loss);
+        self.fold_lifecycle(&sweep);
         // Slow metadata work above (fence snapshots, lifecycle
         // scan — file reads moved per-poll below, F-D/A13) may have
         // crossed the deadline — or a signal may have landed —
@@ -2937,6 +3038,7 @@ where
         cold_gap_queries: 0,
         fork_exec_ignored: 0,
         lifecycle_loss: 0,
+        lifecycle_dropped: 0,
         maps_read_failed: 0,
         scan_budget_exhaustions: 0,
         provider_changed_fences: 0,
@@ -3203,14 +3305,15 @@ where
         // fence-tracked, never ignored.)
         if self.child_exit.is_none() {
             let sweep = self.lifecycle.poll();
-            self.fork_exec_ignored = self.fork_exec_ignored.saturating_add(
-                sweep
-                    .events
-                    .iter()
-                    .filter(|e| e.kind == LifecycleKind::Fork)
-                    .count() as u64,
-            );
-            self.lifecycle_loss = self.lifecycle_loss.saturating_add(sweep.loss);
+            self.fold_lifecycle(&sweep);
+        }
+        // Kernel-signal close drain (R20): consume the signal ring
+        // through the current tail even when the target already
+        // exited — a ring drain needs no /proc scan, so it is safe
+        // on corpses. Polling ports return `None` (their close sweep
+        // above stays skipped once reaped).
+        if let Some(drained) = self.lifecycle.close_drain() {
+            self.fold_lifecycle(&drained);
         }
         // TEST HOOK (exit-3 kernel-proof): hold the final drain past
         // close so a still-counting kernel would advance last_ns
@@ -3377,6 +3480,15 @@ where
                 CounterUnits::Events,
                 CounterSource::Lifecycle,
                 self.lifecycle_loss,
+            ));
+        }
+        if self.lifecycle_dropped > 0 {
+            self.extra_loss.push(typed_counter(
+                "lifecycle.signal_dropped",
+                CounterKind::Loss,
+                CounterUnits::Events,
+                CounterSource::Lifecycle,
+                self.lifecycle_dropped,
             ));
         }
         // H3: mixed-withheld sites are ambiguity, not loss —
@@ -3763,8 +3875,10 @@ where
         }
         // Census taint (denominators Unknown, emitted+proven sites
         // stand — all site evidence is in-window by construction).
-        let close_census_global =
-            self.cold_gap_queries > 0 || self.lifecycle_loss > 0 || self.fallback_partial;
+        let close_census_global = self.cold_gap_queries > 0
+            || self.lifecycle_loss > 0
+            || self.lifecycle_dropped > 0
+            || self.fallback_partial;
         let mut coverage = Vec::new();
         for op in self.adapter.ops() {
             let terminated = snap_term
@@ -4141,7 +4255,7 @@ where
             "count.missed_attaches" => self.reason("missed-attaches"),
             "count.unresolved_offsets" => self.reason("unresolved-offsets"),
             "capture.over_budget" => self.reason("over-budget"),
-            "lifecycle.fork_exec_ignored" | "lifecycle.scan_loss" => {
+            "lifecycle.fork_exec_ignored" | "lifecycle.scan_loss" | "lifecycle.signal_dropped" => {
                 self.reason("fork-exec-ignored")
             }
             "lifecycle.polling_fallback" => self.reason("lifecycle-polling-partial"),
@@ -5844,6 +5958,7 @@ mod tests {
                 LifecycleDelta {
                     events: Vec::new(),
                     loss: 0,
+                    dropped: 0,
                 }
             }
             fn fallback_partial(&self) -> bool {
@@ -5896,7 +6011,7 @@ mod tests {
             fn read_file_bound(&mut self, _path: &str) -> anyhow::Result<(Vec<u8>, (u64, u64))> {
                 anyhow::bail!("unstubbed")
             }
-            fn stat_file(&mut self, _path: &str) -> Option<(u64, u64)> {
+            fn stat_file(&mut self, _path: &str) -> Option<FileStat> {
                 None
             }
             fn read_exe(&mut self, _pid: u32) -> Option<PathBuf> {
@@ -5989,6 +6104,7 @@ mod tests {
                 cold_gap_queries: 0,
                 fork_exec_ignored: 0,
                 lifecycle_loss: 0,
+                lifecycle_dropped: 0,
                 maps_read_failed: 0,
                 scan_budget_exhaustions: 0,
                 provider_changed_fences: 0,

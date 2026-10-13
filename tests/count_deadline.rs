@@ -875,3 +875,169 @@ fn h4_stale_retries_count_missed_once_each() {
         drain.counters
     );
 }
+
+// ---------------------------------------------------------------------------
+// R20 count-close assurance: quiesce recovery + delayed-hit countermodel.
+// ---------------------------------------------------------------------------
+
+use osslscope::count_session::DrainedCounts;
+use osslscope_ebpf_common::CountValue;
+use std::time::Instant;
+
+/// Backend that lands one admitted-pre-close hit AFTER the first
+/// drain's read (models a uprobe completion racing the drain: the
+/// hit passed TARGET+deadline admission before close but its
+/// increment lands mid-drain). Delegates everything else.
+struct MidDrainBackend {
+    inner: FakeCountBackend,
+    cookie: u32,
+    generation: u32,
+    injected: bool,
+}
+
+impl CountBackend for MidDrainBackend {
+    type Link = FakeLink;
+
+    fn attach(
+        &mut self,
+        path: &str,
+        offsets: &[u64],
+        cookies: &[u64],
+    ) -> (Vec<Self::Link>, Vec<usize>) {
+        self.inner.attach(path, offsets, cookies)
+    }
+
+    fn open_window(
+        &mut self,
+        tgid: u64,
+        generation: u32,
+        start_ns: u64,
+        deadline_ns: u64,
+    ) -> anyhow::Result<()> {
+        self.inner
+            .open_window(tgid, generation, start_ns, deadline_ns)
+    }
+
+    fn set_generation(&mut self, generation: u32) -> anyhow::Result<()> {
+        self.inner.set_generation(generation)
+    }
+
+    fn close_window(&mut self) -> anyhow::Result<()> {
+        self.inner.close_window()
+    }
+
+    fn drain(&mut self, deadline: Option<Instant>) -> anyhow::Result<DrainedCounts> {
+        let out = self.inner.drain(deadline)?;
+        if !self.injected {
+            self.injected = true;
+            self.inner.inject_row(
+                self.cookie,
+                self.generation,
+                CountValue {
+                    count: 2,
+                    first_ns: 1500,
+                    last_ns: 1500,
+                },
+            );
+        }
+        Ok(out)
+    }
+}
+
+#[test]
+fn close_quiesce_recovers_row_landing_mid_drain() {
+    // Best-effort quiesce: a hit completing between the first and
+    // second drain passes is recovered by the re-scan — the close
+    // total includes it with no shortfall and no loss.
+    let stage = Stage::fresh("quiesce");
+    let bytes = self_bytes();
+    let off = x_offsets(&bytes, 1)[0];
+    let a = stage.write("prov.so", &bytes);
+    let live = vec![mapping(&a)];
+    let files = HashMap::from([(
+        a.path.clone(),
+        plan::FileBytes {
+            bytes: std::fs::read(&a.path).unwrap(),
+            dev: a.device,
+            ino: a.ino,
+        },
+    )]);
+    let mut s = CountSession::new(
+        PID,
+        MidDrainBackend {
+            inner: FakeCountBackend::new(),
+            cookie: 0,
+            generation: 0,
+            injected: false,
+        },
+    );
+    let d = CountDelta {
+        discovered: vec![site(&a, off, 7)],
+        losses: Vec::new(),
+    };
+    s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
+    let cookie = s.cookie_for(a.device, a.ino, off).unwrap();
+    s.backend_mut().cookie = cookie;
+    s.open_window(1000, 2000).unwrap();
+    s.backend_mut().inner.fire(PID, cookie, 1500, 5);
+    let drain = s.close_and_drain(Duration::from_secs(5)).unwrap();
+    assert_eq!(drain.total_calls(), 7, "5 fired + 2 mid-drain");
+    assert_eq!(counter_value(&drain, "count.drain_shortfall"), Some(0));
+    assert_eq!(counter_value(&drain, "count.unattributed"), Some(0));
+    assert_eq!(counter_value(&drain, "count.map_insert_dropped"), Some(0));
+}
+
+#[test]
+fn close_delayed_hit_after_drain_is_uncounted_countermodel() {
+    // R20 count-close countermodel (pins the limitation, not a bug):
+    // a hit admitted pre-close but completing AFTER the final drain
+    // pass is invisible to the returned drain AND to every loss
+    // counter — the bounded quiesce passes are best-effort tail
+    // collection, not a completion barrier. The admitted barrier is
+    // death+reap (no dead thread runs a uprobe): the controller
+    // orders reap before close for owned exits (pinned by
+    // `count_close_reap_precedes_drain_for_owned_exit`), and every
+    // non-fatal close with a live target already carries an
+    // over-budget loss or a signal cut, so it cannot claim COMPLETE.
+    // Detach and arbitrary sleeps are assumed to prove nothing.
+    let stage = Stage::fresh("delayed-hit");
+    let bytes = self_bytes();
+    let off = x_offsets(&bytes, 1)[0];
+    let a = stage.write("prov.so", &bytes);
+    let live = vec![mapping(&a)];
+    let files = HashMap::from([(
+        a.path.clone(),
+        plan::FileBytes {
+            bytes: std::fs::read(&a.path).unwrap(),
+            dev: a.device,
+            ino: a.ino,
+        },
+    )]);
+    let mut s = session_with(FakeCountBackend::new());
+    let d = CountDelta {
+        discovered: vec![site(&a, off, 7)],
+        losses: Vec::new(),
+    };
+    s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
+    let cookie = s.cookie_for(a.device, a.ino, off).unwrap();
+    s.open_window(1000, 2000).unwrap();
+    s.backend_mut().fire(PID, cookie, 1500, 5);
+    let drain = s.close_and_drain(Duration::from_secs(5)).unwrap();
+    assert_eq!(drain.total_calls(), 5);
+    // The delayed completion lands after the drain returned.
+    s.backend_mut().inject_row(
+        cookie,
+        0,
+        CountValue {
+            count: 3,
+            first_ns: 1500,
+            last_ns: 1500,
+        },
+    );
+    // The returned drain neither includes it nor records any loss
+    // for it: quiesce passes cannot prove completion.
+    assert_eq!(drain.total_calls(), 5, "post-drain hit excluded");
+    assert_eq!(counter_value(&drain, "count.map_insert_dropped"), Some(0));
+    assert_eq!(counter_value(&drain, "count.unattributed"), Some(0));
+    assert_eq!(counter_value(&drain, "count.drain_shortfall"), Some(0));
+}

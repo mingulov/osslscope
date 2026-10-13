@@ -12,8 +12,8 @@
 
 use osslscope::capture::{Capture, Outcome};
 use osslscope::capture::{
-    ClockPort, Config, DiscoveryPort, LifecycleDelta, LifecycleEvent, LifecycleKind, LifecyclePort,
-    ProcPort, SessionSet, TargetInfo, TargetPort, observe,
+    ClockPort, Config, DiscoveryPort, FileStat, LifecycleDelta, LifecycleEvent, LifecycleKind,
+    LifecyclePort, ProcPort, SessionSet, TargetInfo, TargetPort, observe,
 };
 use osslscope::count_session::{
     CountBackend, CountSession, DrainedCounts, FakeCountBackend, FakeLink,
@@ -99,10 +99,17 @@ struct SharedState {
     backend: FakeCountBackend,
     attached: Vec<u32>,
     log: Vec<String>,
+    /// Fake-clock instant of `close_window` (R20 count-close
+    /// barrier control: reap must precede this for owned exits).
+    closed_at: Option<u64>,
 }
 
 #[derive(Clone)]
-struct SharedBackend(Rc<RefCell<SharedState>>);
+struct SharedBackend {
+    shared: Rc<RefCell<SharedState>>,
+    clock: Rc<FakeClock>,
+    order: Rc<RefCell<Vec<String>>>,
+}
 
 impl CountBackend for SharedBackend {
     type Link = FakeLink;
@@ -113,7 +120,7 @@ impl CountBackend for SharedBackend {
         offsets: &[u64],
         cookies: &[u64],
     ) -> (Vec<Self::Link>, Vec<usize>) {
-        let mut st = self.0.borrow_mut();
+        let mut st = self.shared.borrow_mut();
         let (links, bad) = st.backend.attach(path, offsets, cookies);
         for (i, cookie) in cookies.iter().enumerate() {
             if !bad.contains(&i) {
@@ -135,26 +142,28 @@ impl CountBackend for SharedBackend {
         start_ns: u64,
         deadline_ns: u64,
     ) -> anyhow::Result<()> {
-        let mut st = self.0.borrow_mut();
+        let mut st = self.shared.borrow_mut();
         st.log.push("count_open".to_string());
         st.backend
             .open_window(tgid, generation, start_ns, deadline_ns)
     }
 
     fn set_generation(&mut self, generation: u32) -> anyhow::Result<()> {
-        let mut st = self.0.borrow_mut();
+        let mut st = self.shared.borrow_mut();
         st.log.push(format!("gen:{generation}"));
         st.backend.set_generation(generation)
     }
 
     fn close_window(&mut self) -> anyhow::Result<()> {
-        let mut st = self.0.borrow_mut();
+        let mut st = self.shared.borrow_mut();
         st.log.push("count_closed".to_string());
+        st.closed_at = Some(self.clock.monotonic_ns());
+        self.order.borrow_mut().push("count_closed".to_string());
         st.backend.close_window()
     }
 
     fn drain(&mut self, deadline: Option<Instant>) -> anyhow::Result<DrainedCounts> {
-        self.0.borrow_mut().backend.drain(deadline)
+        self.shared.borrow_mut().backend.drain(deadline)
     }
 }
 
@@ -273,11 +282,15 @@ struct TargetLog {
     finished: bool,
     polls: usize,
     verify_calls: usize,
+    /// Fake-clock instant `poll_exit` first reported an exit (R20
+    /// count-close barrier control: this must precede `closed_at`).
+    reaped_at: Option<u64>,
 }
 
 struct FakeTarget {
     clock: Rc<FakeClock>,
     log: Rc<RefCell<TargetLog>>,
+    order: Rc<RefCell<Vec<String>>>,
     pid: u32,
     owned: bool,
     release_err: bool,
@@ -318,6 +331,11 @@ impl TargetPort for FakeTarget {
             .is_some_and(|t| self.clock.monotonic_ns() >= t)
         {
             self.exited = true;
+            let mut log = self.log.borrow_mut();
+            if log.reaped_at.is_none() {
+                log.reaped_at = Some(self.clock.monotonic_ns());
+                self.order.borrow_mut().push("reaped".to_string());
+            }
             return Ok(Some(self.exit_code));
         }
         Ok(None)
@@ -368,6 +386,10 @@ impl TargetPort for FakeTarget {
 struct FakeLifecycle {
     polls: VecDeque<LifecycleDelta>,
     fallback: bool,
+    /// Scripted close-time ring drain (R20): `None` is the polling
+    /// shape (no close witness); `Some` is the kernel-signal shape
+    /// (drained through the tail even after the target exited).
+    close_drain: Option<LifecycleDelta>,
 }
 
 impl LifecyclePort for FakeLifecycle {
@@ -378,6 +400,10 @@ impl LifecyclePort for FakeLifecycle {
     fn fallback_partial(&self) -> bool {
         self.fallback
     }
+
+    fn close_drain(&mut self) -> Option<LifecycleDelta> {
+        self.close_drain.clone()
+    }
 }
 
 struct FakeProc {
@@ -387,6 +413,13 @@ struct FakeProc {
     files: HashMap<String, plan::FileBytes>,
     file_err: HashSet<String>,
     exe: Option<PathBuf>,
+    /// Scripted exe-link values, popped per `read_exe` call (R20
+    /// exec-fence tests); exhausted falls back to `exe`.
+    exe_seq: VecDeque<Option<PathBuf>>,
+    /// Scripted file contents, popped per `read_file_bound` call
+    /// (R20 implementation-only replacement: bytes change while
+    /// the triple stays); exhausted falls back to `files`.
+    file_read_seq: VecDeque<HashMap<String, plan::FileBytes>>,
     maps_err_at: HashSet<usize>,
     maps_delay_ns: u64,
     file_delay_ns: u64,
@@ -398,11 +431,12 @@ struct FakeProc {
     comm_settle_at_ns: Option<u64>,
     comm_settled: Option<String>,
     proc_log: Rc<RefCell<ProcLog>>,
-    /// Scripted stat identities, popped in call order (F-D/A13 F3):
-    /// `Some((dev, ino))` overrides the staged identity once (a
-    /// scripted replacement race), `None`/exhausted falls back to
-    /// the staged identity.
-    stat_seq: VecDeque<Option<(u64, u64)>>,
+    /// Scripted stats, popped in call order (F-D/A13 F3 + R20
+    /// freshness): `Some(FileStat)` overrides the staged stat once
+    /// (a scripted replacement race or in-place edit),
+    /// `None`/exhausted falls back to the staged identity with the
+    /// staged bytes' length and mtime 0.
+    stat_seq: VecDeque<Option<FileStat>>,
 }
 
 impl ProcPort for FakeProc {
@@ -435,21 +469,35 @@ impl ProcPort for FakeProc {
         if self.file_err.contains(path) {
             anyhow::bail!("injected file failure for {path}");
         }
+        if let Some(seq) = self.file_read_seq.pop_front() {
+            return seq
+                .get(path)
+                .map(|f| (f.bytes.clone(), (f.dev, f.ino)))
+                .ok_or_else(|| anyhow::anyhow!("no such staged file {path}"));
+        }
         self.files
             .get(path)
             .map(|f| (f.bytes.clone(), (f.dev, f.ino)))
             .ok_or_else(|| anyhow::anyhow!("no such staged file {path}"))
     }
 
-    fn stat_file(&mut self, path: &str) -> Option<(u64, u64)> {
+    fn stat_file(&mut self, path: &str) -> Option<FileStat> {
         self.proc_log.borrow_mut().stats.push(path.to_string());
         if let Some(scripted) = self.stat_seq.pop_front().flatten() {
             return Some(scripted);
         }
-        self.files.get(path).map(|f| (f.dev, f.ino))
+        self.files.get(path).map(|f| FileStat {
+            dev: f.dev,
+            ino: f.ino,
+            size: f.bytes.len() as u64,
+            mtime_ns: 0,
+        })
     }
 
     fn read_exe(&mut self, _pid: u32) -> Option<PathBuf> {
+        if !self.exe_seq.is_empty() {
+            return self.exe_seq.pop_front().flatten();
+        }
         self.exe.clone()
     }
 
@@ -628,6 +676,7 @@ struct PostCtx {
     shared: Rc<RefCell<SharedState>>,
     target_log: Rc<RefCell<TargetLog>>,
     proc_log: Rc<RefCell<ProcLog>>,
+    order: Rc<RefCell<Vec<String>>>,
 }
 
 struct Harness {
@@ -639,7 +688,8 @@ struct Harness {
     shared: Rc<RefCell<SharedState>>,
     target_log: Rc<RefCell<TargetLog>>,
     proc_log: Rc<RefCell<ProcLog>>,
-    stat_seq: VecDeque<Option<(u64, u64)>>,
+    order: Rc<RefCell<Vec<String>>>,
+    stat_seq: VecDeque<Option<FileStat>>,
     cfg: Config,
     owned: bool,
     acquired_ns: u64,
@@ -658,11 +708,14 @@ struct Harness {
     verify_err_after: Option<usize>,
     lifecycle_polls: VecDeque<LifecycleDelta>,
     lifecycle_fallback: bool,
+    lifecycle_close_drain: Option<LifecycleDelta>,
     maps: Vec<Mapping>,
     maps_seq: VecDeque<Vec<Mapping>>,
     files: HashMap<String, plan::FileBytes>,
     file_err: HashSet<String>,
     exe: Option<PathBuf>,
+    exe_seq: VecDeque<Option<PathBuf>>,
+    file_read_seq: VecDeque<HashMap<String, plan::FileBytes>>,
     maps_err_at: HashSet<usize>,
     maps_delay_ns: u64,
     file_delay_ns: u64,
@@ -699,6 +752,7 @@ impl Harness {
             shared: Rc::new(RefCell::new(SharedState::default())),
             target_log: Rc::new(RefCell::new(TargetLog::default())),
             proc_log: Rc::new(RefCell::new(ProcLog::default())),
+            order: Rc::new(RefCell::new(Vec::new())),
             stat_seq: VecDeque::new(),
             cfg: Config {
                 harvest_object: Some(PathBuf::new()),
@@ -732,11 +786,14 @@ impl Harness {
             verify_err_after: None,
             lifecycle_polls: VecDeque::new(),
             lifecycle_fallback: false,
+            lifecycle_close_drain: None,
             maps,
             maps_seq: VecDeque::new(),
             files,
             file_err: HashSet::new(),
             exe: Some(PathBuf::from("/bin/app")),
+            exe_seq: VecDeque::new(),
+            file_read_seq: VecDeque::new(),
             maps_err_at: HashSet::new(),
             maps_delay_ns: 0,
             file_delay_ns: 0,
@@ -786,10 +843,18 @@ impl Harness {
             polls_done: 0,
             finished: false,
         };
-        let count = CountSession::new(PID, SharedBackend(self.shared.clone()));
+        let count = CountSession::new(
+            PID,
+            SharedBackend {
+                shared: self.shared.clone(),
+                clock: self.clock.clone(),
+                order: self.order.clone(),
+            },
+        );
         let target = FakeTarget {
             clock: self.clock.clone(),
             log: self.target_log.clone(),
+            order: self.order.clone(),
             pid: PID,
             owned: self.owned,
             release_err: self.release_err,
@@ -802,6 +867,7 @@ impl Harness {
         let lifecycle = FakeLifecycle {
             polls: self.lifecycle_polls,
             fallback: self.lifecycle_fallback,
+            close_drain: self.lifecycle_close_drain,
         };
         let mut proc = FakeProc {
             clock: self.clock.clone(),
@@ -810,6 +876,8 @@ impl Harness {
             files: self.files,
             file_err: self.file_err,
             exe: self.exe,
+            exe_seq: self.exe_seq,
+            file_read_seq: self.file_read_seq,
             maps_err_at: self.maps_err_at,
             maps_delay_ns: self.maps_delay_ns,
             file_delay_ns: self.file_delay_ns,
@@ -840,6 +908,7 @@ impl Harness {
                 shared: self.shared,
                 target_log: self.target_log,
                 proc_log: self.proc_log,
+                order: self.order,
             },
         )
     }
@@ -2446,6 +2515,7 @@ fn lifecycle_exec_is_fence_tracked_not_ignored() {
             },
         ],
         loss: 0,
+        dropped: 0,
     });
     let (out, _) = h.run();
     let c = out.unwrap();
@@ -2468,6 +2538,7 @@ fn final_sweep_skipped_after_owned_exit() {
     h.lifecycle_polls.push_back(LifecycleDelta {
         events: vec![],
         loss: 1,
+        dropped: 0,
     });
     let (out, _) = h.run();
     let c = out.unwrap();
@@ -2499,6 +2570,7 @@ fn final_sweep_runs_while_target_lives() {
     h.lifecycle_polls.push_back(LifecycleDelta {
         events: vec![],
         loss: 1,
+        dropped: 0,
     });
     let (out, _) = h.run();
     let c = out.unwrap();
@@ -5215,10 +5287,18 @@ fn live_observe_inner(
         polls_done: 0,
         finished: false,
     };
-    let count = CountSession::new(pid, SharedBackend(shared));
+    let count = CountSession::new(
+        pid,
+        SharedBackend {
+            shared,
+            clock: clock.clone(),
+            order: Rc::new(RefCell::new(Vec::new())),
+        },
+    );
     let lifecycle = FakeLifecycle {
         polls: VecDeque::new(),
         fallback: false,
+        close_drain: None,
     };
     let mut files = HashMap::new();
     files.insert(
@@ -5236,6 +5316,8 @@ fn live_observe_inner(
         files,
         file_err: HashSet::new(),
         exe: Some(PathBuf::from("/bin/sh")),
+        exe_seq: VecDeque::new(),
+        file_read_seq: VecDeque::new(),
         maps_err_at: HashSet::new(),
         maps_delay_ns: 0,
         file_delay_ns: 0,
@@ -5939,7 +6021,16 @@ fn stat_identity_change_forces_reread() {
             ..DiscoveryDelta::default()
         });
     }
-    h.stat_seq = VecDeque::from([None, None, Some((dev, ino + 1000))]);
+    h.stat_seq = VecDeque::from([
+        None,
+        None,
+        Some(FileStat {
+            dev,
+            ino: ino + 1000,
+            size: h.bytes.len() as u64,
+            mtime_ns: 0,
+        }),
+    ]);
     h.exit_at_ns = Some(BASE_NS + 1_000_000_000);
     let (out, post) = h.run();
     out.unwrap();
@@ -6009,4 +6100,663 @@ fn pathological_relevance_set_is_capped_and_loud() {
         "reads must stay bounded: {}",
         log.reads.len()
     );
+}
+
+// ---------------------------------------------------------------------------
+// R20 lifecycle/readiness + count-close assurance.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn lifecycle_scan_loss_withholds_complete() {
+    // Lost lifecycle witness (failed /proc scan mid-window): the
+    // seven executed calls survive as positive evidence, but the
+    // window cannot claim COMPLETE — the census is tainted and the
+    // loss rides loud with its reason.
+    let mut h = Harness::fresh("scan-loss-partial");
+    h.snapshot_attached();
+    let cand1 = cand(
+        "/p/provider.so",
+        backing_of(&h.staged, h.off),
+        1,
+        11,
+        "SHA-256",
+        false,
+        "ok",
+    );
+    h.polls.push_back(DiscoveryDelta::default());
+    h.polls.push_back(DiscoveryDelta {
+        candidates: vec![cand1],
+        tables: vec![terminated(1, 0)],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    h.plans.insert(
+        2,
+        FirePlan {
+            fires: vec![(BASE_NS + 600_000_000, 7)],
+            shortfall: 0,
+            cancel: false,
+        },
+    );
+    // First round sweep loses its scan; later sweeps stay clean.
+    h.lifecycle_polls.push_back(LifecycleDelta {
+        events: vec![],
+        loss: 1,
+        dropped: 0,
+    });
+    h.exit_at_ns = Some(BASE_NS + 1_000_000_000);
+    h.exit_code = 0;
+    let (out, _) = h.run();
+    let c = out.unwrap();
+    assert_eq!(c.document.total_calls(), 7);
+    assert_eq!(counter_value(&c, "lifecycle.scan_loss"), 1);
+    assert!(has_reason(&c, "fork-exec-ignored"), "{:?}", c.reasons);
+    assert!(matches!(c.outcome, Outcome::Partial), "{c:?}");
+    assert!(matches!(c.document.status, Completeness::Partial { .. }));
+}
+
+#[test]
+fn lifecycle_signal_dropped_withholds_complete() {
+    // Kernel-side lifecycle overflow (signals known-dropped between
+    // drains) is its own attributable loss — never silent, never
+    // folded into the host scan count — and withholds COMPLETE.
+    let mut h = Harness::fresh("signal-dropped");
+    h.snapshot_attached();
+    h.polls.push_back(DiscoveryDelta {
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    h.lifecycle_polls.push_back(LifecycleDelta {
+        events: vec![],
+        loss: 0,
+        dropped: 3,
+    });
+    // Exit lands in the second sleep: exactly one round runs, so the
+    // round sweep consumes the overflow poll.
+    h.exit_at_ns = Some(BASE_NS + 250_000_001);
+    let (out, _) = h.run();
+    let c = out.unwrap();
+    assert_eq!(counter_value(&c, "lifecycle.signal_dropped"), 3);
+    assert_eq!(counter_value(&c, "lifecycle.scan_loss"), 0);
+    assert!(has_reason(&c, "fork-exec-ignored"), "{:?}", c.reasons);
+    assert!(matches!(c.outcome, Outcome::Partial), "{c:?}");
+}
+
+#[test]
+fn lifecycle_close_drain_folds_after_owned_exit() {
+    // The owned child exits before any round runs, so the close-time
+    // /proc sweep stays skipped — but a kernel-signal port's ring
+    // drain still folds: its fork witness lands loud (no /proc scan
+    // needed, so corpses are safe).
+    let mut h = Harness::fresh("close-drain-folds");
+    h.snapshot_attached();
+    h.exit_at_ns = Some(BASE_NS + 1);
+    h.exit_code = 0;
+    h.lifecycle_close_drain = Some(LifecycleDelta {
+        events: vec![LifecycleEvent {
+            kind: LifecycleKind::Fork,
+            pid: 99991,
+        }],
+        loss: 0,
+        dropped: 0,
+    });
+    let (out, _) = h.run();
+    let c = out.unwrap();
+    assert_eq!(c.child_exit, Some(0));
+    assert_eq!(counter_value(&c, "lifecycle.fork_exec_ignored"), 1);
+    assert!(matches!(c.outcome, Outcome::Partial), "{c:?}");
+}
+
+#[test]
+fn lifecycle_close_drain_loss_is_loud() {
+    // A loss-bearing close drain (ring overflow at the tail) rides
+    // loud even on the zero-round fast-exit path.
+    let mut h = Harness::fresh("close-drain-loss");
+    h.snapshot_attached();
+    h.exit_at_ns = Some(BASE_NS + 1);
+    h.exit_code = 0;
+    h.lifecycle_close_drain = Some(LifecycleDelta {
+        events: vec![],
+        loss: 1,
+        dropped: 2,
+    });
+    let (out, _) = h.run();
+    let c = out.unwrap();
+    assert_eq!(counter_value(&c, "lifecycle.scan_loss"), 1);
+    assert_eq!(counter_value(&c, "lifecycle.signal_dropped"), 2);
+    assert!(matches!(c.outcome, Outcome::Partial), "{c:?}");
+}
+
+#[test]
+fn lifecycle_empty_close_drain_preserves_complete() {
+    // Kernel-signal shape with a clean tail (drained, nothing
+    // happened): the COMPLETE path is undisturbed — the close drain
+    // adds evidence handling, not an unconditional PARTIAL.
+    let mut h = Harness::fresh("close-drain-clean");
+    h.snapshot_attached();
+    let cand1 = cand(
+        "/p/provider.so",
+        backing_of(&h.staged, h.off),
+        1,
+        11,
+        "SHA-256",
+        false,
+        "ok",
+    );
+    h.polls.push_back(DiscoveryDelta::default());
+    h.polls.push_back(DiscoveryDelta {
+        candidates: vec![cand1],
+        tables: vec![terminated(1, 0)],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    h.plans.insert(
+        2,
+        FirePlan {
+            fires: vec![(BASE_NS + 600_000_000, 7)],
+            shortfall: 0,
+            cancel: false,
+        },
+    );
+    h.exit_at_ns = Some(BASE_NS + 1_000_000_000);
+    h.exit_code = 0;
+    h.lifecycle_close_drain = Some(LifecycleDelta::default());
+    let (out, _) = h.run();
+    let c = out.unwrap();
+    assert!(matches!(c.outcome, Outcome::Complete), "{c:?}");
+    assert!(matches!(c.document.status, Completeness::Complete));
+    assert_eq!(c.document.total_calls(), 7);
+}
+
+#[test]
+fn lifecycle_exec_fences_generation_and_conserves() {
+    // The target's own exec (exe link flips mid-window, mappings
+    // unchanged): exactly one Exec fence — the fenced generation
+    // keeps gen-0 counts under gen-0 meaning, later counts land in
+    // gen 1, the total is conserved, and the exec is NOT double-booked
+    // as ignored fork/exec activity.
+    let mut h = Harness::fresh("exec-fence");
+    h.snapshot_attached();
+    h.exe = Some(PathBuf::from("/bin/app-next"));
+    h.exe_seq = VecDeque::from([
+        Some(PathBuf::from("/bin/app")),
+        Some(PathBuf::from("/bin/app")),
+        Some(PathBuf::from("/bin/app")),
+        Some(PathBuf::from("/bin/app-next")),
+    ]);
+    let cand1 = cand(
+        "/p/provider.so",
+        backing_of(&h.staged, h.off),
+        1,
+        11,
+        "SHA-256",
+        false,
+        "ok",
+    );
+    h.polls.push_back(DiscoveryDelta::default());
+    h.polls.push_back(DiscoveryDelta {
+        candidates: vec![cand1],
+        tables: vec![terminated(1, 0)],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    h.plans.insert(
+        2,
+        FirePlan {
+            fires: vec![(BASE_NS + 600_000_000, 3)],
+            shortfall: 0,
+            cancel: false,
+        },
+    );
+    h.plans.insert(
+        4,
+        FirePlan {
+            fires: vec![(BASE_NS + 1_200_000_000, 4)],
+            shortfall: 0,
+            cancel: false,
+        },
+    );
+    let (out, post) = h.run();
+    let c = out.unwrap();
+    assert_eq!(c.document.total_calls(), 7);
+    assert_eq!(c.document.fenced.len(), 1);
+    assert_eq!(c.document.fenced[0].generation, 0);
+    assert_eq!(c.document.fenced[0].sites[0].calls, 3);
+    assert_eq!(c.document.sites.len(), 1);
+    assert_eq!(c.document.sites[0].generation, 1);
+    assert_eq!(c.document.sites[0].calls, 4);
+    assert_eq!(counter_value(&c, "lifecycle.fork_exec_ignored"), 0);
+    let gens: Vec<u32> = post
+        .shared
+        .borrow()
+        .log
+        .iter()
+        .filter_map(|l| l.strip_prefix("gen:")?.parse().ok())
+        .collect();
+    assert_eq!(gens, vec![1]);
+}
+
+#[test]
+fn lifecycle_subpoll_object_replacement_fences_provenance() {
+    // P6 sub-poll object replacement: between two polls the provider
+    // file is replaced (old mapping gone, new inode mapped). The
+    // replacement fences exactly once: gen-0 counts stay fenced under
+    // the OLD object fingerprint, the replacement's counts land in
+    // gen 1 under the NEW fingerprint, nothing is relabeled, and the
+    // conserved total reaches the document.
+    let mut h = Harness::fresh("replacement");
+    h.snapshot_attached();
+    let bytes_b = flipped_build_id(&h.bytes.clone());
+    let newso = h.stage.write("new.so", &bytes_b);
+    h.files.insert(
+        newso.path.clone(),
+        plan::FileBytes {
+            bytes: bytes_b.clone(),
+            dev: newso.device,
+            ino: newso.ino,
+        },
+    );
+    let before = vec![mapping(&h.staged)];
+    let after = vec![mapping(&newso)];
+    h.maps_seq = VecDeque::from([before.clone(), before.clone(), before, after.clone()]);
+    h.maps = after;
+    let cand_old = cand(
+        "/p/provider.so",
+        backing_of(&h.staged, h.off),
+        1,
+        11,
+        "SHA-256",
+        false,
+        "ok",
+    );
+    let new_off = x_offset(&bytes_b);
+    let cand_new = cand(
+        "/p/provider.so",
+        backing_of(&newso, new_off),
+        1,
+        11,
+        "SHA-256",
+        false,
+        "ok",
+    );
+    h.polls.push_back(DiscoveryDelta::default());
+    h.polls.push_back(DiscoveryDelta {
+        candidates: vec![cand_old],
+        tables: vec![terminated(1, 0)],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    h.polls.push_back(DiscoveryDelta::default());
+    h.polls.push_back(DiscoveryDelta::default());
+    h.polls.push_back(DiscoveryDelta {
+        candidates: vec![cand_new],
+        tables: vec![terminated(1, 0)],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    h.plans.insert(
+        2,
+        FirePlan {
+            fires: vec![(BASE_NS + 600_000_000, 3)],
+            shortfall: 0,
+            cancel: false,
+        },
+    );
+    // Post-fence fire hits every still-bound cookie: the replacement
+    // cookie legitimately (mapped) plus the old cookie (the fake
+    // fires bound cookies without consulting mappings — production
+    // cannot execute unmapped code, so the old-cookie row is a fake
+    // over-fire, honestly routed under the old meaning, never
+    // relabeled as the replacement).
+    h.plans.insert(
+        5,
+        FirePlan {
+            fires: vec![(BASE_NS + 1_500_000_000, 4)],
+            shortfall: 0,
+            cancel: false,
+        },
+    );
+    let (out, post) = h.run();
+    let c = out.unwrap();
+    assert_eq!(c.document.fenced.len(), 1);
+    assert_eq!(c.document.fenced[0].generation, 0);
+    assert_eq!(c.document.fenced[0].sites.len(), 1);
+    assert_eq!(c.document.fenced[0].sites[0].calls, 3);
+    let fp_old = c.document.fenced[0].sites[0].site.object.0.clone();
+    assert!(fp_old.starts_with("build:"), "{fp_old}");
+    let fp_new_sites: Vec<_> = c
+        .document
+        .sites
+        .iter()
+        .filter(|s| s.site.object.0 != fp_old)
+        .collect();
+    assert_eq!(fp_new_sites.len(), 1, "{:?}", c.document.sites);
+    assert_eq!(fp_new_sites[0].generation, 1);
+    assert_eq!(fp_new_sites[0].calls, 4);
+    assert!(
+        fp_new_sites[0].site.object.0.starts_with("build:"),
+        "{:?}",
+        fp_new_sites[0].site.object.0
+    );
+    // Conserved: 3 fenced + 4 replacement + 4 fake over-fire on the
+    // still-bound old cookie (old meaning, gen 1).
+    assert_eq!(c.document.total_calls(), 11);
+    assert_eq!(counter_value(&c, "count.missed_attaches"), 0);
+    let gens: Vec<u32> = post
+        .shared
+        .borrow()
+        .log
+        .iter()
+        .filter_map(|l| l.strip_prefix("gen:")?.parse().ok())
+        .collect();
+    assert_eq!(gens, vec![1]);
+}
+
+#[test]
+fn lifecycle_stale_queued_record_creates_no_evidence() {
+    // P6 stale queued records: after the replacement fences, a queued
+    // (stale) redelivery of the OLD triple arrives. Its mapping is
+    // gone, so the bytes are unverifiable: the adapter downgrades
+    // the meaning to an unverified fingerprint at a versioning fence
+    // (fail-closed) instead of reusing the stale verified identity —
+    // no new site, no relabel, no fabricated evidence: the fenced
+    // counts stand alone under the old fingerprint.
+    let mut h = Harness::fresh("stale-queue");
+    h.snapshot_attached();
+    let bytes_b = flipped_build_id(&h.bytes.clone());
+    let newso = h.stage.write("new.so", &bytes_b);
+    h.files.insert(
+        newso.path.clone(),
+        plan::FileBytes {
+            bytes: bytes_b.clone(),
+            dev: newso.device,
+            ino: newso.ino,
+        },
+    );
+    let before = vec![mapping(&h.staged)];
+    let after = vec![mapping(&newso)];
+    h.maps_seq = VecDeque::from([before.clone(), before.clone(), before, after.clone()]);
+    h.maps = after;
+    let cand_old = || {
+        cand(
+            "/p/provider.so",
+            backing_of(&h.staged, h.off),
+            1,
+            11,
+            "SHA-256",
+            false,
+            "ok",
+        )
+    };
+    h.polls.push_back(DiscoveryDelta::default());
+    h.polls.push_back(DiscoveryDelta {
+        candidates: vec![cand_old()],
+        tables: vec![terminated(1, 0)],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    h.polls.push_back(DiscoveryDelta::default());
+    h.polls.push_back(DiscoveryDelta::default());
+    // Stale redelivery of the pre-replacement triple, post-fence.
+    h.polls.push_back(DiscoveryDelta {
+        candidates: vec![cand_old()],
+        tables: vec![terminated(1, 0)],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    h.plans.insert(
+        2,
+        FirePlan {
+            fires: vec![(BASE_NS + 600_000_000, 3)],
+            shortfall: 0,
+            cancel: false,
+        },
+    );
+    let (out, post) = h.run();
+    let c = out.unwrap();
+    assert_eq!(c.document.fenced.len(), 2);
+    assert_eq!(c.document.fenced[0].generation, 0);
+    assert_eq!(c.document.fenced[0].sites.len(), 1);
+    assert_eq!(c.document.fenced[0].sites[0].calls, 3);
+    assert!(
+        c.document.fenced[0].sites[0]
+            .site
+            .object
+            .0
+            .starts_with("build:"),
+        "{:?}",
+        c.document.fenced[0].sites[0].site.object.0
+    );
+    // The downgrade fence seals an empty gen-1 bucket (no counts
+    // arrived under the replacement generation): evidence-free.
+    assert_eq!(c.document.fenced[1].generation, 1);
+    assert!(c.document.fenced[1].sites.is_empty());
+    assert!(c.document.sites.is_empty(), "{:?}", c.document.sites);
+    assert_eq!(c.document.total_calls(), 3);
+    assert_eq!(
+        counter_value(&c, "discovery.site_identity_refreshed"),
+        1,
+        "{:?}",
+        c.document.counters
+    );
+    let gens: Vec<u32> = post
+        .shared
+        .borrow()
+        .log
+        .iter()
+        .filter_map(|l| l.strip_prefix("gen:")?.parse().ok())
+        .collect();
+    assert_eq!(gens, vec![1, 2]);
+}
+
+#[test]
+fn lifecycle_impl_only_replacement_versions_and_conserves() {
+    // P6 implementation-only backing replacement: same (dev, ino,
+    // offset) triple, new bytes (new build-id, SAME size — only the
+    // mtime moves). The file cache must notice the freshness change,
+    // re-read, and forward the new fingerprint so the count session
+    // versions at a fence: gen-0 counts stay fenced under the old
+    // fingerprint, later counts land in gen 1 under the new one.
+    let mut h = Harness::fresh("impl-only");
+    h.snapshot_attached();
+    let bytes_a = h.bytes.clone();
+    let bytes_b = flipped_build_id(&bytes_a);
+    assert_eq!(bytes_a.len(), bytes_b.len());
+    let (dev, ino) = (h.staged.device, h.staged.ino);
+    let staged_path = h.staged.path.clone();
+    let files_a: HashMap<String, plan::FileBytes> = HashMap::from([(
+        staged_path.clone(),
+        plan::FileBytes {
+            bytes: bytes_a.clone(),
+            dev,
+            ino,
+        },
+    )]);
+    let files_b: HashMap<String, plan::FileBytes> = HashMap::from([(
+        staged_path.clone(),
+        plan::FileBytes {
+            bytes: bytes_b.clone(),
+            dev,
+            ino,
+        },
+    )]);
+    // Round-1 read serves A; the round-2 re-read serves B. (The
+    // baseline carries the default delta: no relevant paths, so no
+    // stats and no reads there.)
+    h.file_read_seq = VecDeque::from([files_a, files_b]);
+    let stat_new = FileStat {
+        dev,
+        ino,
+        size: bytes_b.len() as u64,
+        mtime_ns: 1,
+    };
+    // Round-1 stat + re-stat, round-2 miss + re-stat. (Round 3
+    // carries the default delta: no relevant paths, no stats.)
+    h.stat_seq = VecDeque::from([None, None, Some(stat_new), Some(stat_new)]);
+    let cand1 = || {
+        cand(
+            "/p/provider.so",
+            backing_of(&h.staged, h.off),
+            1,
+            11,
+            "SHA-256",
+            false,
+            "ok",
+        )
+    };
+    h.polls.push_back(DiscoveryDelta::default());
+    h.polls.push_back(DiscoveryDelta {
+        candidates: vec![cand1()],
+        tables: vec![terminated(1, 0)],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    h.polls.push_back(DiscoveryDelta {
+        candidates: vec![cand1()],
+        tables: vec![terminated(1, 0)],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    h.polls.push_back(DiscoveryDelta::default());
+    h.plans.insert(
+        2,
+        FirePlan {
+            fires: vec![(BASE_NS + 600_000_000, 3)],
+            shortfall: 0,
+            cancel: false,
+        },
+    );
+    h.plans.insert(
+        3,
+        FirePlan {
+            fires: vec![(BASE_NS + 900_000_000, 4)],
+            shortfall: 0,
+            cancel: false,
+        },
+    );
+    // Three rounds run (exit lands in the fourth sleep): attach in
+    // round 1, refresh + fence in round 2, gen-1 fire in round 3.
+    h.exit_at_ns = Some(BASE_NS + 750_000_001);
+    h.exit_code = 0;
+    let (out, post) = h.run();
+    let c = out.unwrap();
+    let gens: Vec<u32> = post
+        .shared
+        .borrow()
+        .log
+        .iter()
+        .filter_map(|l| l.strip_prefix("gen:")?.parse().ok())
+        .collect();
+    assert_eq!(gens, vec![1], "stale bytes must not suppress the fence");
+    assert_eq!(c.document.fenced.len(), 1);
+    assert_eq!(c.document.fenced[0].sites[0].calls, 3);
+    let fp_old = c.document.fenced[0].sites[0].site.object.0.clone();
+    assert_eq!(c.document.sites.len(), 1);
+    assert_eq!(c.document.sites[0].generation, 1);
+    assert_eq!(c.document.sites[0].calls, 4);
+    let fp_new = c.document.sites[0].site.object.0.clone();
+    assert_ne!(fp_old, fp_new, "fingerprint must version, not relabel");
+    assert_eq!(c.document.total_calls(), 7);
+    let log = post.proc_log.borrow();
+    let reads = log.reads.iter().filter(|p| *p == &staged_path).count();
+    assert_eq!(reads, 2, "baseline read + exactly one freshness re-read");
+}
+
+#[test]
+fn startup_count_window_programmed_before_release() {
+    // Startup first-call evidence (owned spawn): the kernel window is
+    // programmed before the stopped child is released, so the
+    // requested window (starting at release) is covered from its
+    // first nanosecond — zero startup gap, COMPLETE-capable.
+    let mut h = Harness::fresh("startup-order");
+    h.snapshot_attached();
+    let cand1 = cand(
+        "/p/provider.so",
+        backing_of(&h.staged, h.off),
+        1,
+        11,
+        "SHA-256",
+        false,
+        "ok",
+    );
+    h.polls.push_back(DiscoveryDelta::default());
+    h.polls.push_back(DiscoveryDelta {
+        candidates: vec![cand1],
+        tables: vec![terminated(1, 0)],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    h.plans.insert(
+        2,
+        FirePlan {
+            fires: vec![(BASE_NS + 600_000_000, 7)],
+            shortfall: 0,
+            cancel: false,
+        },
+    );
+    h.exit_at_ns = Some(BASE_NS + 1_000_000_000);
+    h.exit_code = 0;
+    let (out, post) = h.run();
+    let c = out.unwrap();
+    assert!(matches!(c.outcome, Outcome::Complete), "{c:?}");
+    let programmed = post.shared.borrow().backend.programmed().to_vec();
+    assert_eq!(programmed.len(), 1);
+    let (_, _, start_ns, _) = programmed[0];
+    assert!(
+        start_ns <= c.document.window.requested_start_ns,
+        "window must open at or before release: {start_ns} vs {}",
+        c.document.window.requested_start_ns
+    );
+    assert_eq!(c.document.window.startup_gap_ns(), 0);
+    assert!(post.target_log.borrow().released);
+}
+
+#[test]
+fn count_close_reap_precedes_drain_for_owned_exit() {
+    // Count-close barrier control (owned exit): the child is reaped
+    // BEFORE the count window closes and drains — dead threads run
+    // no further uprobes, so no hit can land after the drain. The
+    // order is structural (reap in the loop, close after it), pinned
+    // here against future reordering.
+    let mut h = Harness::fresh("reap-before-close");
+    h.snapshot_attached();
+    let cand1 = cand(
+        "/p/provider.so",
+        backing_of(&h.staged, h.off),
+        1,
+        11,
+        "SHA-256",
+        false,
+        "ok",
+    );
+    h.polls.push_back(DiscoveryDelta::default());
+    h.polls.push_back(DiscoveryDelta {
+        candidates: vec![cand1],
+        tables: vec![terminated(1, 0)],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    h.plans.insert(
+        2,
+        FirePlan {
+            fires: vec![(BASE_NS + 600_000_000, 7)],
+            shortfall: 0,
+            cancel: false,
+        },
+    );
+    h.exit_at_ns = Some(BASE_NS + 1_000_000_000);
+    h.exit_code = 0;
+    let (out, post) = h.run();
+    let c = out.unwrap();
+    assert!(matches!(c.outcome, Outcome::Complete), "{c:?}");
+    assert_eq!(c.document.total_calls(), 7);
+    let order = post.order.borrow();
+    let reap = order.iter().position(|e| e == "reaped");
+    let closed = order.iter().position(|e| e == "count_closed");
+    assert_eq!(
+        order.as_slice(),
+        &["reaped".to_string(), "count_closed".to_string()],
+        "reap must strictly precede count close"
+    );
+    assert!(reap < closed);
 }

@@ -2096,3 +2096,47 @@ fn r06_pid_guard_rescues_on_unwind() {
     assert!(!sentinel.exists(), "sentinel must never execute");
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// R20 lifecycle/readiness: exec custody composition.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn r20_exec_replaces_image_custody_survives() {
+    // R20 cleanup mapping: the owned child execs a second image
+    // mid-flight (same pid, new exe link). Custody still tracks it
+    // to its real exit — no lost child, no zombie, no wrong status.
+    let mut t = OwnedTarget::spawn_stopped(
+        &[
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "exec /bin/sleep 0.3".to_string(),
+        ],
+        WorkloadDest::Null,
+    )
+    .unwrap();
+    let pid = t.pid();
+    assert_eq!(t.state(), CustodyState::Stopped);
+    t.release().unwrap();
+    // The exe link must flip from sh to sleep while custody holds
+    // (300ms sleep vs 5ms polls — no timing flake).
+    let end = Instant::now() + Duration::from_secs(5);
+    let mut saw_sleep = false;
+    loop {
+        let exe = std::fs::read_link(format!("/proc/{pid}/exe")).unwrap_or_default();
+        if exe.to_string_lossy().contains("sleep") {
+            saw_sleep = true;
+            break;
+        }
+        if t.poll_exit().unwrap().is_some() {
+            break;
+        }
+        assert!(Instant::now() < end, "child never reached exec");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(saw_sleep, "exe link never flipped to sleep");
+    assert_eq!(wait_for_exit(&mut t, Duration::from_secs(5)), Some(0));
+    assert_eq!(t.state(), CustodyState::Reaped);
+    assert_eq!(t.exit_code(), Some(0));
+    assert_reaped_no_zombie(pid);
+}
