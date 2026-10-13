@@ -181,6 +181,21 @@ GEN
 TARGET
 WINDOW
 DROPFAIL
+# members
+EVENTS
+PENDING_QUERY
+GEN
+LOSS
+TRUNC
+CALLS
+ALG_CLASS
+SCAN
+SEQ
+BIRTH
+RCOUNT
+T_CACHE
+CTRL
+ATTEMPT
 ```
 
 All maps hold numeric keys/values/counters/cursors except `EVENTS`,
@@ -202,6 +217,23 @@ observer counters. The `generation` cookie on ring records is
 likewise numeric observer state. Generation diagnostics identify
 tables by op id only — no diagnostic prints raw array addresses
 (allowlist §2 rule; pinned by `no_raw_runtime_addresses_in_diagnostics`).
+
+The members (traversal) object shares the `EVENTS`/`GEN`/`LOSS`/
+`TRUNC`/`CALLS`/`ALG_CLASS` shapes above (same numeric discipline;
+its `PENDING_QUERY` is the entry-owned interim scaffold — R18
+§6.1 — dropped in stage D). The scan-plane maps hold numeric
+observer state only: `SCAN` (one in-flight take record per thread:
+op, `no_store`-pointer, seq, frozen EXPECTED/epoch — pointers are
+stashed for the return-side read, never emitted), `SEQ`
+(birth:16|ctr:48 invocation ids), `BIRTH` (registry births),
+`RCOUNT` (count:32|lifecycle:32), `T_CACHE` (array → terminator +
+generation, userspace-written), `CTRL` (EXPECTED/epoch/SKIP-ALL/
+governor occupancy bound), `ATTEMPT` (entry-hit census). The
+entry plane reads NO target memory (args + map cells only — the
+entry cannot see rv; pinned by `probe_read_allowlist_is_complete`),
+so admission/skip decisions never retain target bytes. `T_CACHE`
+and the guard/`no_store` pointee reads extend this section in
+stage D with their own justification.
 
 ## 5. Emitted artifacts
 

@@ -26,5 +26,8 @@ pub mod plan;
 // T01 (coordinator review): pure policy predicate primitives, no CLI wiring.
 pub mod policy;
 pub mod report;
+// R19 (P7 item 3): scan-plane host modules (birth registry first;
+// oracle + governor follow in later commits on this branch).
+pub mod scan;
 pub mod schema;
 pub mod target;
