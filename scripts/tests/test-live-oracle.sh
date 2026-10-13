@@ -696,6 +696,207 @@ else
         || bad "multi-candidate duplicate fails"
 fi
 
+# R09 fix-round-1: full-schema fixtures with coherent object references
+# and conservation fields, plus conflicting/incomplete certainty controls.
+# Abbreviated builders above omit candidates_coverage/first_ns/last_ns and
+# provider/weak_alias; these builders emit structurally complete v2.1
+# documents. Definite operation evidence requires a complete candidate set
+# with every alternative agreeing on the full tuple (evidence model);
+# conflicting alternatives or unknown coverage are possible attribution,
+# never definite.
+full_cand() {
+    # $1=provider $2=provider_class $3=op $4=funcid $5=classes JSON $6=weak_alias
+    printf '{"provider": "%s", "provider_class": "%s", "op": %s, "funcid": %s, "algorithm_classes": %s, "weak_alias": %s}' "$1" "$2" "$3" "$4" "$5" "$6"
+}
+full_site() {
+    # $1=calls $2=object $3=device $4=inode $5=offset $6=generation $7=candidates $8=coverage $9=first_ns $10=last_ns
+    printf '{"calls": %s, "candidates": [%s], "object": "%s", "device": %s, "inode": %s, "offset": %s, "generation": %s, "candidates_coverage": "%s", "first_ns": %s, "last_ns": %s}' "$1" "$7" "$2" "$3" "$4" "$5" "$6" "$8" "$9" "${10}"
+}
+mk_full_report() {
+    # $1=outfile $2=sites JSON $3=total $4=leg $5=nonleg $6=shared $7=tail
+    python3 - "$1" "$2" "$3" "$4" "$5" "$6" "$7" <<'PYEOF'
+import sys, json
+outfile, sites_json, total, leg, nonleg, shared, tail = sys.argv[1:8]
+sites = json.loads(sites_json)
+total = int(total); leg = int(leg); nonleg = int(nonleg)
+shared = int(shared); tail = int(tail)
+assert leg + nonleg + shared + tail == total, "partition must sum to total"
+assert sum(s["calls"] for s in sites) == total, "sites must sum to total"
+objs = {("obj-default", 8, 100), ("obj-legacy", 8, 200)}
+prov_ids = {"obj-default", "obj-legacy"}
+for s in sites:
+    assert (s["object"], s["device"], s["inode"]) in objs, \
+        "dangling site object %r" % ((s["object"], s["device"], s["inode"]),)
+    for c in s["candidates"]:
+        assert c["provider"] in prov_ids, \
+            "dangling candidate provider %r" % (c["provider"],)
+    assert s["first_ns"] <= s["last_ns"], "ordered timestamps"
+doc = {
+    "schema_version": "observed-crypto-v2.1",
+    "target": {"pid": 42, "comm": "test", "container_id": "",
+               "image_digest": "", "argv_redacted": True},
+    "openssl": {"state": "verified", "version": "3.5.8"},
+    "window": {"requested_start_ns": 0, "requested_end_ns": 30000000000,
+               "effective_start_ns": 0, "effective_end_ns": 30000000000,
+               "signal_cut": False},
+    "completeness": {"status": "PARTIAL", "fatal_kind": None,
+                     "reasons": [{"kind": "loss",
+                                  "counter": "lifecycle.polling_fallback",
+                                  "source": "lifecycle", "value": 1}],
+                     "counters": [{"name": "lifecycle.polling_fallback",
+                                   "kind": "loss", "units": "events",
+                                   "source": "lifecycle", "value": 1}]},
+    "sites": sites,
+    "fenced": [],
+    "objects": [
+        {"id": "obj-default", "device": 8, "inode": 100,
+         "display_locator": "/usr/lib/ossl-modules/default.so"},
+        {"id": "obj-legacy", "device": 8, "inode": 200,
+         "display_locator": "/usr/lib/ossl-modules/legacy.so"}],
+    "coverage": [{"scope": "provider/default",
+                  "expected": {"state": "applicable", "sites": len(sites)},
+                  "discovered": len(sites), "attached": len(sites)}],
+    "legacy_partition": {"legacy_exclusive_calls": leg,
+                         "non_legacy_exclusive_calls": nonleg,
+                         "shared_ambiguous_calls": shared,
+                         "unfenced_tail_calls": tail},
+}
+with open(outfile, "w") as f:
+    json.dump(doc, f)
+PYEOF
+}
+
+F11=$(full_cand "obj-default" "default" 12 11 '["ECDSA"]' false)
+F15=$(full_cand "obj-default" "default" 12 15 '["ECDSA"]' false)
+FDSA11=$(full_cand "obj-default" "default" 12 11 '["DSA"]' false)
+FDSA15=$(full_cand "obj-default" "default" 12 15 '["DSA"]' false)
+FLEG11=$(full_cand "obj-legacy" "legacy" 12 11 '["ECDSA"]' false)
+FSETUP=$(full_cand "obj-default" "default" 12 1 '["ECDSA"]' false)
+FMD4SETUP=$(full_cand "obj-legacy" "legacy" 1 2 '["MD4"]' false)
+FMD4OP=$(full_cand "obj-legacy" "legacy" 1 4 '["MD4"]' false)
+FSHA=$(full_cand "obj-default" "default" 1 3 '["SHA2-256"]' false)
+
+# 56: conflicting class alternatives (ECDSA vs DSA) in complete sets.
+S56A=$(full_site 5 "obj-default" 8 100 4096 0 "$F11, $FDSA11" "complete" 10 90)
+S56B=$(full_site 5 "obj-default" 8 100 8192 0 "$F15, $FDSA15" "complete" 10 90)
+mk_full_report "$T/rep56conf.json" "[$S56A, $S56B]" 10 0 10 0 0
+# 57: incomplete sets (unknown coverage) with matching single candidates.
+S57A=$(full_site 5 "obj-default" 8 100 12288 0 "$F11" "unknown" 10 90)
+S57B=$(full_site 5 "obj-default" 8 100 16384 0 "$F15" "unknown" 10 90)
+mk_full_report "$T/rep57unk.json" "[$S57A, $S57B]" 10 0 10 0 0
+# 58: conflicting provider alternatives (default vs legacy) in complete sets.
+FLEG15=$(full_cand "obj-legacy" "legacy" 12 15 '["ECDSA"]' false)
+S58A=$(full_site 5 "obj-default" 8 100 20480 0 "$F11, $FLEG11" "complete" 10 90)
+S58B=$(full_site 5 "obj-default" 8 100 24576 0 "$F15, $FLEG15" "complete" 10 90)
+mk_full_report "$T/rep58prov.json" "[$S58A, $S58B]" 10 0 0 10 0
+# 59: empty candidate sets prove nothing (unattributed).
+S59A=$(full_site 5 "obj-default" 8 100 28672 0 "" "complete" 10 90)
+S59B=$(full_site 5 "obj-default" 8 100 32768 0 "" "complete" 10 90)
+mk_full_report "$T/rep59empty.json" "[$S59A, $S59B]" 10 0 0 0 10
+# 60: full-schema ECDSA setup + DSA sign/verify split.
+S60A=$(full_site 5 "obj-default" 8 100 36864 0 "$FSETUP" "complete" 10 90)
+S60B=$(full_site 3 "obj-default" 8 100 40960 0 "$FDSA11" "complete" 10 90)
+S60C=$(full_site 2 "obj-default" 8 100 45056 0 "$FDSA15" "complete" 10 90)
+mk_full_report "$T/rep60split.json" "[$S60A, $S60B, $S60C]" 10 0 10 0 0
+# 61: full-schema ECDSA/legacy + DSA/default split.
+S61A=$(full_site 4 "obj-default" 8 100 49152 0 "$FLEG11, $FDSA11" "complete" 10 90)
+S61B=$(full_site 2 "obj-default" 8 100 53248 0 "$F15" "complete" 10 90)
+mk_full_report "$T/rep61split.json" "[$S61A, $S61B]" 6 0 2 4 0
+# 62: full-schema MD4 setup + SHA operation split.
+S62A=$(full_site 3 "obj-legacy" 8 200 4096 0 "$FMD4SETUP" "complete" 10 90)
+S62B=$(full_site 4 "obj-default" 8 100 57344 0 "$FSHA" "complete" 10 90)
+mk_full_report "$T/rep62split.json" "[$S62A, $S62B]" 7 3 4 0 0
+# 63: full-schema ECDSA combined tuples pass (definite).
+S63A=$(full_site 7 "obj-default" 8 100 61440 0 "$FSETUP" "complete" 10 90)
+S63B=$(full_site 3 "obj-default" 8 100 65536 0 "$F11" "complete" 10 90)
+S63C=$(full_site 2 "obj-default" 8 100 69632 0 "$F15" "complete" 10 90)
+mk_full_report "$T/rep63combo.json" "[$S63A, $S63B, $S63C]" 12 0 12 0 0
+# 64: full-schema MD4 combined tuples pass (definite).
+S64A=$(full_site 4 "obj-legacy" 8 200 8192 0 "$FMD4SETUP" "complete" 10 90)
+S64B=$(full_site 3 "obj-legacy" 8 200 12288 0 "$FMD4OP" "complete" 10 90)
+mk_full_report "$T/rep64combo.json" "[$S64A, $S64B]" 7 7 0 0 0
+
+# 56. FAIL: conflicting ECDSA/DSA alternatives are possible, not definite.
+if python3 "$ORACLE" "$T/ecdsa.log" "$T/rep56conf.json" ecdsa >"$T/out" 2>&1; then
+    bad "full-schema conflicting class fails (got exit 0)"
+else
+    grep -q 'ambiguous' "$T/out" \
+        && ok "full-schema conflicting class fails" \
+        || bad "full-schema conflicting class fails"
+fi
+
+# 57. FAIL: unknown candidate sets cannot establish certainty.
+if python3 "$ORACLE" "$T/ecdsa.log" "$T/rep57unk.json" ecdsa >"$T/out" 2>&1; then
+    bad "full-schema unknown coverage fails (got exit 0)"
+else
+    grep -q 'ambiguous' "$T/out" \
+        && ok "full-schema unknown coverage fails" \
+        || bad "full-schema unknown coverage fails"
+fi
+
+# 58. FAIL: conflicting default/legacy alternatives are not definite.
+if python3 "$ORACLE" "$T/ecdsa.log" "$T/rep58prov.json" ecdsa >"$T/out" 2>&1; then
+    bad "full-schema conflicting provider fails (got exit 0)"
+else
+    grep -q 'ambiguous' "$T/out" \
+        && ok "full-schema conflicting provider fails" \
+        || bad "full-schema conflicting provider fails"
+fi
+
+# 59. FAIL: empty candidate sets prove nothing.
+if python3 "$ORACLE" "$T/ecdsa.log" "$T/rep59empty.json" ecdsa >"$T/out" 2>&1; then
+    bad "full-schema empty candidates fail (got exit 0)"
+else
+    grep -q 'FAIL' "$T/out" \
+        && ok "full-schema empty candidates fail" \
+        || bad "full-schema empty candidates fail"
+fi
+
+# 60. FAIL: full-schema ECDSA setup + DSA sign/verify split.
+if python3 "$ORACLE" "$T/ecdsa.log" "$T/rep60split.json" ecdsa >"$T/out" 2>&1; then
+    bad "full-schema ecdsa setup+DSA split fails (got exit 0)"
+else
+    grep -q 'no single candidate' "$T/out" \
+        && ok "full-schema ecdsa setup+DSA split fails" \
+        || bad "full-schema ecdsa setup+DSA split fails"
+fi
+
+# 61. FAIL: full-schema ECDSA/legacy + DSA/default split.
+if python3 "$ORACLE" "$T/ecdsa.log" "$T/rep61split.json" ecdsa >"$T/out" 2>&1; then
+    bad "full-schema legacy/DSA split fails (got exit 0)"
+else
+    grep -q 'no single candidate' "$T/out" \
+        && ok "full-schema legacy/DSA split fails" \
+        || bad "full-schema legacy/DSA split fails"
+fi
+
+# 62. FAIL: full-schema MD4 setup + SHA operation split.
+if python3 "$ORACLE" "$T/md4.log" "$T/rep62split.json" md4 >"$T/out" 2>&1; then
+    bad "full-schema md4 setup+SHA split fails (got exit 0)"
+else
+    grep -q 'no single candidate' "$T/out" \
+        && ok "full-schema md4 setup+SHA split fails" \
+        || bad "full-schema md4 setup+SHA split fails"
+fi
+
+# 63. PASS: full-schema ECDSA combined tuples pass (definite).
+if python3 "$ORACLE" "$T/ecdsa.log" "$T/rep63combo.json" ecdsa >"$T/out" 2>&1; then
+    grep -q 'ORACLE PASS' "$T/out" \
+        && ok "full-schema ecdsa combined passes" \
+        || bad "full-schema ecdsa combined passes"
+else
+    bad "full-schema ecdsa combined passes (rc=$?)"
+fi
+
+# 64. PASS: full-schema MD4 combined tuples pass (definite).
+if python3 "$ORACLE" "$T/md4.log" "$T/rep64combo.json" md4 >"$T/out" 2>&1; then
+    grep -q 'ORACLE PASS' "$T/out" \
+        && ok "full-schema md4 combined passes" \
+        || bad "full-schema md4 combined passes"
+else
+    bad "full-schema md4 combined passes (rc=$?)"
+fi
+
 echo "---"
 echo "pass=$PASS fail=$FAIL"
 [ "$FAIL" -eq 0 ]

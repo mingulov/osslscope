@@ -127,6 +127,30 @@ def candidate_matches_operation(candidate, op, algorithm_classes,
     return True
 
 
+def site_definitely_matches_operation(site, op, algorithm_classes,
+                                      provider_classes, funcids):
+    """Definite single-site operation evidence (R09 fix-round-1).
+
+    A site definitely witnesses an operation only when it executed,
+    its candidate set is complete, and EVERY alternative agrees on
+    the full tuple (evidence model: complete set + all-match). An
+    unknown (or any non-complete) set, an empty set, or conflicting
+    alternatives are possible attribution, never definite. Missing
+    candidates_coverage is tolerated as complete for legacy
+    abbreviated fixtures; full-schema reports always carry it.
+    """
+    if site.get("calls", 0) < 1:
+        return False
+    cands = site.get("candidates", []) or []
+    if not cands:
+        return False
+    if site.get("candidates_coverage", "complete") != "complete":
+        return False
+    return all(candidate_matches_operation(c, op, algorithm_classes,
+                                           provider_classes, funcids)
+               for c in cands)
+
+
 def mode_legs(mode):
     """((algorithm-class spellings, accepted provider classes), ...).
 
@@ -271,11 +295,20 @@ def main(argv):
     op_calls = sum(s.get("calls", 0) for _, s in hits)
     legs = mode_legs(mode)
     for classes, providers in legs:
-        if any(candidate_matches_operation(c, want, classes, providers, None)
-               for _, s in hits for c in s.get("candidates", [])):
+        if any(site_definitely_matches_operation(
+                s, want, classes, providers, None) for _, s in hits):
             continue
+        if any(candidate_matches_operation(c, want, classes, providers, None)
+               for _, s in hits for c in s.get("candidates", []) or []):
+            return fail("no definite op-%s site carries class %r + "
+                        "provider %r for mode %s (ambiguous attribution: "
+                        "conflicting alternatives or unknown "
+                        "candidates_coverage; possible attribution is not "
+                        "definite operation evidence)"
+                        % (sorted(want), sorted(classes),
+                           sorted(providers), mode))
         if not any(classes & set(c.get("algorithm_classes") or [])
-                   for _, s in hits for c in s.get("candidates", [])
+                   for _, s in hits for c in s.get("candidates", []) or []
                    if c.get("op") in want):
             return fail("no executed op-%s site carries class %r for mode %s "
                         "(wrong algorithm, e.g. DSA for ECDSA)"
@@ -307,11 +340,29 @@ def main(argv):
         if counters.get(counter, 0) <= 0:
             continue
         for classes, providers in legs:
-            if any(candidate_matches_operation(
-                    c, want, classes, providers, funcids)
-                   for _, s in hits for c in s.get("candidates", [])):
+            if any(site_definitely_matches_operation(
+                    s, want, classes, providers, funcids)
+                   for _, s in hits):
                 continue
             op = sorted(want)[0]
+            if any(candidate_matches_operation(
+                    c, want, classes, providers, funcids)
+                   for _, s in hits
+                   for c in s.get("candidates", []) or []):
+                return fail("ledgered %d %s but no definite site "
+                            "carries class %r + provider %r + function %s "
+                            "on executed op-%s for mode %s (ambiguous "
+                            "attribution: conflicting alternatives or "
+                            "unknown candidates_coverage; possible "
+                            "attribution is not definite operation "
+                            "evidence; no single candidate carries the "
+                            "tuple definitely)"
+                            % (
+                                counters[counter], counter,
+                                sorted(classes), sorted(providers),
+                                "/".join(func_label(op, f)
+                                         for f in sorted(funcids)),
+                                sorted(want), mode))
             return fail("ledgered %d %s but no single candidate "
                         "carries class %r + provider %r + function %s on "
                         "executed op-%s for mode %s (wrong function: split "
