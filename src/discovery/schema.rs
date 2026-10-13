@@ -156,7 +156,7 @@ pub fn emit(
                         elf_cache.entry(m.path.clone()).or_insert_with(|| {
                             crate::plan::read_file_bound(&m.path).unwrap_or(
                                 crate::plan::FileBytes {
-                                    bytes: Vec::new(),
+                                    bytes: Vec::<u8>::new().into(),
                                     dev: 0,
                                     ino: 0,
                                 },
@@ -168,7 +168,7 @@ pub fn emit(
                         let bound = elf_cache
                             .get(&m.path)
                             .filter(|f| f.ino == m.ino)
-                            .map(|f| f.bytes.as_slice());
+                            .map(|f| &f.bytes[..]);
                         let ok = m.x
                             && bound
                                 .and_then(|b| elf::parse_elf(b).ok())
