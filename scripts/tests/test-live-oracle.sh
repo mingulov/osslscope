@@ -595,6 +595,107 @@ else
         || bad "v2. rejected"
 fi
 
+# R09 fixtures: split-attribution negatives (class/provider/function on
+# different candidates must not witness an operation), combined
+# positives, and the aggregate-bound quantitative pin. SIGNATURE
+# NEWCTX=1 and DIGEST INIT=2 are setup-only funcids (src/kinds.rs);
+# they never satisfy an operation counter.
+CSETUP='{"op": 12, "funcid": 1, "provider_class": "default", "algorithm_classes": ["ECDSA"]}'
+CMD4SETUP='{"op": 1, "funcid": 2, "provider_class": "legacy", "algorithm_classes": ["MD4"]}'
+printf 'LEDGER mode=ecdsa fetches=102 signs=1 verifies=1\nLEDGER mode=ecdsa loop_secs=30 ops=100 fetches=102\nORDDONE mode=ecdsa rc=0\n' >"$T/loop100.log"
+
+S48A=$(site 5 301 "$CSETUP"); S48B=$(site 3 302 "$CDSA"); S48C=$(site 2 303 "$CDSA15")
+mk_report "$T/rep48split.json" "[$S48A, $S48B, $S48C]"
+S49A=$(site 4 304 "$CLEG, $CDSA"); S49B=$(site 2 305 "$C15")
+mk_report "$T/rep49split.json" "[$S49A, $S49B]"
+S50A=$(site 3 306 "$CMD4SETUP"); S50B=$(site 4 307 "$CSHAF")
+mk_report "$T/rep50split.json" "[$S50A, $S50B]"
+S51A=$(site 7 308 "$CSETUP"); S51B=$(site 3 309 "$C11"); S51C=$(site 2 310 "$C15")
+mk_report "$T/rep51combo.json" "[$S51A, $S51B, $S51C]"
+S52A=$(site 4 311 "$CMD4SETUP"); S52B=$(site 3 312 "$CMD4L")
+mk_report "$T/rep52combo.json" "[$S52A, $S52B]"
+S53A=$(site 100 313 "$CSETUP"); S53B=$(site 1 314 "$C11"); S53C=$(site 1 315 "$C15")
+mk_report "$T/rep53agg.json" "[$S53A, $S53B, $S53C]"
+S54A=$(site 97 316 "$CSETUP"); S54B=$(site 1 317 "$C11"); S54C=$(site 1 318 "$C15")
+mk_report "$T/rep54agg.json" "[$S54A, $S54B, $S54C]"
+D55A=$(site 2 319 "$CLEG, $CDSA"); D55B=$(site 3 319 "$CLEG, $CDSA")
+mk_report "$T/rep55dup.json" "[$D55A, $D55B]"
+
+# 48. FAIL: ECDSA setup + DSA sign/verify split across candidates.
+if python3 "$ORACLE" "$T/ecdsa.log" "$T/rep48split.json" ecdsa >"$T/out" 2>&1; then
+    bad "ecdsa setup+DSA split fails (got exit 0)"
+else
+    grep -q 'no single candidate' "$T/out" \
+        && ok "ecdsa setup+DSA split fails" \
+        || bad "ecdsa setup+DSA split fails"
+fi
+
+# 49. FAIL: ECDSA/legacy + DSA/default alternatives in one site.
+if python3 "$ORACLE" "$T/ecdsa.log" "$T/rep49split.json" ecdsa >"$T/out" 2>&1; then
+    bad "ecdsa legacy/DSA split fails (got exit 0)"
+else
+    grep -q 'no single candidate' "$T/out" \
+        && ok "ecdsa legacy/DSA split fails" \
+        || bad "ecdsa legacy/DSA split fails"
+fi
+
+# 50. FAIL: MD4 setup + SHA operation split across candidates.
+if python3 "$ORACLE" "$T/md4.log" "$T/rep50split.json" md4 >"$T/out" 2>&1; then
+    bad "md4 setup+SHA split fails (got exit 0)"
+else
+    grep -q 'no single candidate' "$T/out" \
+        && ok "md4 setup+SHA split fails" \
+        || bad "md4 setup+SHA split fails"
+fi
+
+# 51. PASS: ECDSA setup + sign + verify combined tuples pass.
+if python3 "$ORACLE" "$T/ecdsa.log" "$T/rep51combo.json" ecdsa >"$T/out" 2>&1; then
+    grep -q 'ORACLE PASS' "$T/out" \
+        && ok "ecdsa combined tuples pass" \
+        || bad "ecdsa combined tuples pass"
+else
+    bad "ecdsa combined tuples pass (rc=$?)"
+fi
+
+# 52. PASS: MD4 setup + MD4 operation combined tuples pass.
+if python3 "$ORACLE" "$T/md4.log" "$T/rep52combo.json" md4 >"$T/out" 2>&1; then
+    grep -q 'ORACLE PASS' "$T/out" \
+        && ok "md4 combined tuples pass" \
+        || bad "md4 combined tuples pass"
+else
+    bad "md4 combined tuples pass (rc=$?)"
+fi
+
+# 53. PASS: setup 100 + sign 1 + verify 1 at ledger 100 meets the
+# adopted aggregate lower bound (102 >= 100). The guarantee is
+# aggregate presence, never per-function exactness.
+if python3 "$ORACLE" "$T/loop100.log" "$T/rep53agg.json" ecdsa >"$T/out" 2>&1; then
+    grep -q 'ORACLE PASS' "$T/out" && grep -q '102 op calls over 100' "$T/out" \
+        && grep -q 'aggregate lower bound' "$T/out" \
+        && ok "aggregate bound 102-over-100 passes" \
+        || bad "aggregate bound 102-over-100 passes"
+else
+    bad "aggregate bound 102-over-100 passes (rc=$?)"
+fi
+
+# 54. FAIL: fewer than 100 aggregate calls at ledger 100 (99 < 100).
+if python3 "$ORACLE" "$T/loop100.log" "$T/rep54agg.json" ecdsa >"$T/out" 2>&1; then
+    bad "aggregate shortfall 99-under-100 fails (got exit 0)"
+else
+    grep -q 'below ledgered' "$T/out" \
+        && ok "aggregate shortfall 99-under-100 fails" \
+        || bad "aggregate shortfall 99-under-100 fails"
+fi
+
+# 55. FAIL: duplicate physical join on a multi-candidate site.
+if python3 "$ORACLE" "$T/ecdsa.log" "$T/rep55dup.json" ecdsa >"$T/out" 2>&1; then
+    bad "multi-candidate duplicate fails (got exit 0)"
+else
+    grep -q 'duplicate' "$T/out" \
+        && ok "multi-candidate duplicate fails" \
+        || bad "multi-candidate duplicate fails"
+fi
+
 echo "---"
 echo "pass=$PASS fail=$FAIL"
 [ "$FAIL" -eq 0 ]
