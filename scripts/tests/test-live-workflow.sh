@@ -3,13 +3,15 @@
 # test-live-workflow.sh — host-runnable tests for .github/workflows/live-known-n.yml.
 #
 # R10 (F12/F13): the live workflow's ledger channel and doctor
-# disposition. This suite executes the workflow's EXACT probe and
-# oracle shell blocks (extracted from the YAML at test time) with
-# fixture doctor reports/return codes and a fixture workload file
-# (the host workload-output seam standing in for the runner's
-# --workload-out file). Wiring drift guards pin the exact ledger
-# paths, the typed-disposition markers, the archived channels and
-# the NOT-RUN status. Nothing here runs a live lane.
+# disposition. This suite executes the workflow's EXACT probe,
+# capture and oracle shell blocks (extracted from the YAML at test
+# time) with fixture doctor reports/return codes and a stub
+# check subcommand that writes the workload file only through the
+# block's own --workload-out argument (the host
+# workload-output seam); the oracle block then consumes those
+# capture outputs directly. Wiring drift guards pin the exact
+# ledger paths, the typed-disposition markers, the archived
+# channels and the NOT-RUN status. Nothing here runs a live lane.
 #
 # Usage: ./scripts/tests/test-live-workflow.sh
 # Exit: 0 all pass; 1 any failure.
@@ -68,12 +70,42 @@ extract_run() {
 # temp file.
 
 mkdir -p "$T/runner/ossl-pfx/bin"
-cat >"$T/runner/ossl-pfx/bin/osslscope" <<'EOF'
+cat >"$T/stub-osslscope" <<'EOF'
 #!/bin/sh
+# Test double for $PFX/bin/osslscope: doctor replays one fixture
+# report/status; check parses its own output arguments and writes
+# the workload file ONLY through the supplied --workload-out path
+# (absent flag: the workload goes nowhere, mirroring the real
+# /dev/null default), the report through --out, diagnostics to
+# stdout. No channel path is hardcoded here: if the block drops
+# --workload-out, no workload file appears.
+if [ "${1:-}" = "check" ]; then
+    WO=""
+    OUT=""
+    PREV=""
+    for a in "$@"; do
+        if [ "$PREV" = "--workload-out" ]; then WO="$a"; PREV=""; continue; fi
+        if [ "$PREV" = "--out" ]; then OUT="$a"; PREV=""; continue; fi
+        case "$a" in --workload-out|--out) PREV="$a";; esac
+    done
+    if [ -z "$OUT" ]; then echo "stub osslscope: no --out" >&2; exit 2; fi
+    cp "$OSSLSCOPE_REPORT_SRC" "$OUT"
+    if [ -n "$WO" ]; then cp "$OSSLSCOPE_WORKLOAD_SRC" "$WO"; fi
+    cat "$OSSLSCOPE_DRIVER_SRC"
+    exit "${OSSLSCOPE_CHECK_RC:-0}"
+fi
 cat "$OSSLSCOPE_FIXTURE_OUT"
 exit "$OSSLSCOPE_FIXTURE_RC"
 EOF
+cp "$T/stub-osslscope" "$T/runner/ossl-pfx/bin/osslscope"
 chmod +x "$T/runner/ossl-pfx/bin/osslscope"
+# Fake lane libcrypto advertisement for the capture block's
+# ldconfig lookup (the stub check never opens the path).
+cat >"$T/stub-ldconfig" <<'EOF'
+#!/bin/sh
+echo "	libcrypto.so.3 (libc6,x86-64) => /stub/lib/libcrypto.so.3"
+EOF
+chmod +x "$T/stub-ldconfig"
 
 PROBE_RC=0
 run_probe() {
@@ -107,6 +139,35 @@ run_oracle_block() {
     fi
 }
 
+# --- capture harness --------------------------------------------------
+# The extracted capture block runs unmodified under bash (the
+# runner's shell: the block uses pipefail) with a stub PFX whose
+# check subcommand writes the workload file only through the
+# parsed --workload-out argument, plus a stub ldconfig
+# advertising a lane libcrypto. The case dir then feeds the
+# oracle block directly: capture-to-oracle coupling, not copies.
+
+CAPTURE_RC=0
+run_capture_block() {
+    rm -rf "${T:?}/$1"; mkdir -p "$T/$1/runner/ossl-pfx/bin" "$T/$1/stubbin"
+    cp "$T/stub-osslscope" "$T/$1/runner/ossl-pfx/bin/osslscope"
+    chmod +x "$T/$1/runner/ossl-pfx/bin/osslscope"
+    cp "$T/stub-ldconfig" "$T/$1/stubbin/ldconfig"
+    chmod +x "$T/$1/stubbin/ldconfig"
+    ln -s "$REPO/scripts" "$T/$1/scripts"
+    if (cd "$T/$1" && MODE="$2" RUNNER_TEMP="$T/$1/runner" \
+        OSSLSCOPE_WORKLOAD_SRC="$T/w-good.log" \
+        OSSLSCOPE_REPORT_SRC="$T/rep.json" \
+        OSSLSCOPE_DRIVER_SRC="$T/driver-decoy.log" \
+        OSSLSCOPE_CHECK_RC=0 \
+        PATH="$T/$1/stubbin:$PATH" \
+        bash "$3" >"$T/$1/capture-stdout.log" 2>&1); then
+        CAPTURE_RC=0
+    else
+        CAPTURE_RC=$?
+    fi
+}
+
 # --- doctor fixtures (typed report shape: target/checks/verdict/exit) ---
 
 mkdoc() {
@@ -129,6 +190,11 @@ F_LSM=$(ck lsm fail "likely LSM denial with caps held (enforcing: AppArmor)")
 F_HV=$(ck objects-harvest fail "incompatible object: harvest was built for another map layout")
 F_CT=$(ck objects-count fail "incompatible object: count ABI mismatch")
 F_UNK=$(ck frobnicator fail "unknown check failed")
+F_KERN_OOM=$(ck kernel fail "ringbuf failed (errno 12)")
+F_KERN_NODENY=$(ck kernel fail "uprobe-multi denied (errno 1) with caps held, no lockdown/LSM/seccomp")
+F_LSM_NOATTR=$(ck lsm fail "BPF denied with caps held, no lockdown/LSM/seccomp attribution")
+F_KERN_LOCK=$(ck kernel fail "kprobe-load blocked by lockdown=confidentiality")
+F_LSM_LOCKPTR=$(ck lsm fail "BPF denied with caps held — lockdown=confidentiality, not LSM")
 
 mkdoc "$T/d-ok.json" ok 0 "[$P_KERN, $P_CAPS, $P_LOCK, $P_LSM, $P_HV, $P_CT]"
 mkdoc "$T/d-caps.json" fail-closed 4 "[$P_KERN, $F_CAPS, $P_LOCK, $P_LSM, $P_HV, $P_CT]"
@@ -142,6 +208,16 @@ mkdoc "$T/d-nofail.json" fail-closed 4 "[$P_KERN, $P_CAPS, $P_LOCK, $P_LSM, $P_H
 printf '{"target": null, "checks": [%s], "verdict": "maybe", "exit": 4}' "$F_CAPS" >"$T/d-badverdict.json"
 printf 'osslscope doctor: unknown arg --frobnicate\nusage: osslscope doctor ...\n' >"$T/d-text.txt"
 : >"$T/d-empty.txt"
+mkdoc "$T/d-enomem.json" fail-closed 4 "[$F_KERN_OOM, $P_CAPS, $P_LOCK, $P_LSM, $P_HV, $P_CT]"
+mkdoc "$T/d-kern-nodeny.json" fail-closed 4 "[$F_KERN_NODENY, $P_CAPS, $P_LOCK, $P_LSM, $P_HV, $P_CT]"
+mkdoc "$T/d-lsm-noattr.json" fail-closed 4 "[$P_KERN, $P_CAPS, $P_LOCK, $F_LSM_NOATTR, $P_HV, $P_CT]"
+mkdoc "$T/d-lockdown-full.json" fail-closed 4 "[$F_KERN_LOCK, $P_CAPS, $F_LOCK, $F_LSM_LOCKPTR, $P_HV, $P_CT]"
+printf '{"target": null, "checks": [], "verdict": "ok", "exit": 0}' >"$T/d-emptychecks.json"
+mkdoc "$T/d-noobjects.json" ok 0 "[$P_KERN, $P_CAPS, $P_LOCK, $P_LSM]"
+printf '{"target": null, "checks": [%s, "oops", 42], "verdict": "fail-closed", "exit": 4}' "$F_CAPS" >"$T/d-malformed-rows.json"
+printf '{"target": null, "checks": [%s, %s, %s, %s, {"id": "objects-harvest", "status": "bogus", "message": "made up"}, %s], "verdict": "fail-closed", "exit": 4}' "$P_KERN" "$F_CAPS" "$P_LOCK" "$P_LSM" "$P_CT" >"$T/d-badstatus.json"
+printf '{"target": null, "checks": [%s, %s, %s, %s, %s, %s], "verdict": "ok"}' "$P_KERN" "$P_CAPS" "$P_LOCK" "$P_LSM" "$P_HV" "$P_CT" >"$T/d-noexit.json"
+mkdoc "$T/d-dup.json" ok 0 "[$P_KERN, $P_CAPS, $P_LOCK, $P_LSM, $P_HV, $P_CT, $P_CAPS]"
 
 # --- workload + report fixtures (host workload-output seam) ---
 
@@ -151,6 +227,7 @@ printf 'LEDGER mode=ecdsa fetches=1 signs\nORDDONE mode=ecdsa rc=0\n' >"$T/smoke
 printf 'LEDGER mode=ecdsa fetches=1 signs=1 verifies=1\nLEDGER mode=ecdsa loop_secs=10 ops=11 fetches=22\nORDDONE mode=ecdsa rc=0\n' >"$T/w-odd11.log"
 printf 'LEDGER mode=ecdsa fetches=1 signs=1 verifies=1\nORDDONE mode=ecdsa rc=1\n' >"$T/w-rc1.log"
 printf 'LEDGER mode=kem skipped=old-openssl\nORDDONE mode=kem rc=0\n' >"$T/w-skip.log"
+printf 'osslscope check: observation window complete\nLEDGER mode=ecdsa loop_secs=10 ops=99 fetches=198 signs=99 verifies=99\nORDDONE mode=ecdsa rc=0\nreport: known-n.json (PARTIAL, 2 sites)\nrun: workload exited with status 0\n' >"$T/driver-decoy.log"
 
 C11='{"op": 12, "funcid": 11, "provider_class": "default", "algorithm_classes": ["ECDSA"]}'
 C15='{"op": 12, "funcid": 15, "provider_class": "default", "algorithm_classes": ["ECDSA"]}'
@@ -176,6 +253,11 @@ if extract_run "Ledger oracle (independent counts)" "$T/oracle-block.sh"; then
 else
     bad "oracle block extracts from live-known-n.yml"
 fi
+if extract_run "Bounded live check (known workload)" "$T/capture-block.sh"; then
+    ok "capture block extracts from live-known-n.yml"
+else
+    bad "capture block extracts from live-known-n.yml"
+fi
 if grep -q -- '- name: ' "$T/probe-block.sh" 2>/dev/null; then
     bad "probe extraction stops at the next step"
 else
@@ -185,6 +267,11 @@ if grep -q -- '- name: ' "$T/oracle-block.sh" 2>/dev/null; then
     bad "oracle extraction stops at the next step"
 else
     ok "oracle extraction stops at the next step"
+fi
+if grep -q -- '- name: ' "$T/capture-block.sh" 2>/dev/null; then
+    bad "capture extraction stops at the next step"
+else
+    ok "capture extraction stops at the next step"
 fi
 
 # --- wiring drift guards (F12 ledger paths) ---
@@ -536,22 +623,169 @@ else
     bad "oracle block fails 10 op calls under 11 ledgered (rc=$ORACLE_RC)"
 fi
 
-# 40. A workload whose driver did not complete rc=0 fails.
-if python3 "$ORACLE" "$T/w-rc1.log" "$T/rep.json" ecdsa >"$T/out" 2>&1; then
-    bad "workload ORDDONE rc=1 fails (got exit 0)"
+# 40. A workload whose driver did not complete rc=0 fails
+# (through the workflow block, not a direct oracle call).
+mkdir -p "$T/o-rc1"
+cp "$T/w-rc1.log" "$T/o-rc1/known-n-workload.log"
+cp "$T/driver.log" "$T/o-rc1/known-n-driver.log"
+cp "$T/rep.json" "$T/o-rc1/known-n.json"
+ln -s "$REPO/scripts" "$T/o-rc1/scripts"
+run_oracle_block o-rc1 ecdsa
+if [ "$ORACLE_RC" -ne 0 ] \
+    && grep -q 'did not complete rc=0' "$T/o-rc1/oracle.txt" 2>/dev/null; then
+    ok "workload ORDDONE rc=1 fails"
 else
-    grep -q 'did not complete rc=0' "$T/out" \
-        && ok "workload ORDDONE rc=1 fails" \
-        || bad "workload ORDDONE rc=1 fails"
+    bad "workload ORDDONE rc=1 fails (rc=$ORACLE_RC)"
 fi
 
-# 41. Version-gated fixtures still skip with exit 3 (semantics unchanged).
-if python3 "$ORACLE" "$T/w-skip.log" "$T/does-not-exist.json" kem >"$T/out" 2>&1; then
-    bad "skipped ledger exits 3 (got exit 0)"
+# 41. Version-gated fixtures still skip with exit 3
+# (through the workflow block; the report stays unopened).
+mkdir -p "$T/o-skip"
+cp "$T/w-skip.log" "$T/o-skip/known-n-workload.log"
+cp "$T/driver.log" "$T/o-skip/known-n-driver.log"
+ln -s "$REPO/scripts" "$T/o-skip/scripts"
+run_oracle_block o-skip kem
+if [ "$ORACLE_RC" -eq 3 ] \
+    && grep -q 'ORACLE SKIP' "$T/o-skip/oracle.txt" 2>/dev/null; then
+    ok "skipped ledger skips without opening report (exit 3)"
 else
-    [ "$?" -eq 3 ] && grep -q 'ORACLE SKIP' "$T/out" \
-        && ok "skipped ledger skips without opening report (exit 3)" \
-        || bad "skipped ledger skips without opening report (rc=$?)"
+    bad "skipped ledger skips without opening report (rc=$ORACLE_RC)"
+fi
+
+# --- probe disposition hardening (fix round 1: findings 1+2) ---
+
+# 42. RED (finding 1): an empty-checks ok report authorizes
+# nothing, even with a matching exit and process status.
+run_probe "$T/d-emptychecks.json" 0 p-emptychecks
+if [ "$PROBE_RC" -ne 0 ] && gh_no_capable p-emptychecks; then
+    ok "probe ok report with empty checks fails setup without capable="
+else
+    bad "probe ok report with empty checks fails setup without capable= (rc=$PROBE_RC)"
+fi
+
+# 43. An ok report missing the artifact rows authorizes nothing.
+run_probe "$T/d-noobjects.json" 0 p-noobjects
+if [ "$PROBE_RC" -ne 0 ] && gh_no_capable p-noobjects; then
+    ok "probe ok report missing objects rows fails setup without capable="
+else
+    bad "probe ok report missing objects rows fails setup without capable= (rc=$PROBE_RC)"
+fi
+
+# 44. Malformed rows beside a failing caps row are setup failure,
+# never an admitted skip.
+run_probe "$T/d-malformed-rows.json" 4 p-malformed-rows
+if [ "$PROBE_RC" -ne 0 ] && gh_no_capable p-malformed-rows; then
+    ok "probe caps failure plus malformed rows fails setup without capable="
+else
+    bad "probe caps failure plus malformed rows fails setup without capable= (rc=$PROBE_RC)"
+fi
+
+# 45. Unrecognized check statuses fail closed, never skip.
+run_probe "$T/d-badstatus.json" 4 p-badstatus
+if [ "$PROBE_RC" -ne 0 ] && gh_no_capable p-badstatus; then
+    ok "probe unrecognized check status fails setup without capable="
+else
+    bad "probe unrecognized check status fails setup without capable= (rc=$PROBE_RC)"
+fi
+
+# 46. The report exit field is required, not optional.
+run_probe "$T/d-noexit.json" 0 p-noexit
+if [ "$PROBE_RC" -ne 0 ] && gh_no_capable p-noexit; then
+    ok "probe ok report without exit fails setup without capable="
+else
+    bad "probe ok report without exit fails setup without capable= (rc=$PROBE_RC)"
+fi
+
+# 47. Duplicate check ids fail closed, never authorize.
+run_probe "$T/d-dup.json" 0 p-dup
+if [ "$PROBE_RC" -ne 0 ] && gh_no_capable p-dup; then
+    ok "probe duplicate check id fails setup without capable="
+else
+    bad "probe duplicate check id fails setup without capable= (rc=$PROBE_RC)"
+fi
+
+# 48. RED (finding 2): an unexpected kernel probe errno (ENOMEM)
+# is setup failure, never an admitted capability absence.
+run_probe "$T/d-enomem.json" 4 p-enomem
+if [ "$PROBE_RC" -ne 0 ] && gh_no_capable p-enomem; then
+    ok "probe ENOMEM kernel failure fails setup without capable="
+else
+    bad "probe ENOMEM kernel failure fails setup without capable= (rc=$PROBE_RC)"
+fi
+
+# 49. An unattributed LSM denial is setup failure, never a skip.
+run_probe "$T/d-lsm-noattr.json" 4 p-lsm-noattr
+if [ "$PROBE_RC" -ne 0 ] && gh_no_capable p-lsm-noattr; then
+    ok "probe unattributed LSM denial fails setup without capable="
+else
+    bad "probe unattributed LSM denial fails setup without capable= (rc=$PROBE_RC)"
+fi
+
+# 50. An unexplained kernel denial (attributionless despite
+# the "no lockdown/LSM/seccomp" text) is setup failure.
+run_probe "$T/d-kern-nodeny.json" 4 p-kern-nodeny
+if [ "$PROBE_RC" -ne 0 ] && gh_no_capable p-kern-nodeny; then
+    ok "probe unexplained kernel denial fails setup without capable="
+else
+    bad "probe unexplained kernel denial fails setup without capable= (rc=$PROBE_RC)"
+fi
+
+# 51. Attributed denials stay an admitted skip: a lockdown
+# denial with the kernel/LSM rows pointing at lockdown.
+run_probe "$T/d-lockdown-full.json" 4 p-lockdown-full
+if [ "$PROBE_RC" -eq 0 ] && gh_has p-lockdown-full "capable=false"; then
+    ok "probe lockdown denial with attributed rows yields capable=false"
+else
+    bad "probe lockdown denial with attributed rows yields capable=false (rc=$PROBE_RC)"
+fi
+
+# --- capture-to-oracle seam (fix round 1: finding 3) ---
+
+# 52. The capture block runs under the runner's shell.
+if command -v bash >/dev/null 2>&1; then
+    ok "bash available to execute the capture block (runner shell)"
+else
+    bad "bash available to execute the capture block (runner shell)"
+fi
+
+# 53. RED (finding 3): this invocation's check command produces
+# the consumed channel — the stub writes the workload file only
+# through the block's --workload-out argument, and the oracle
+# block consumes those capture outputs (decoy observer
+# diagnostics in the driver log cannot satisfy it).
+run_capture_block c-seam ecdsa "$T/capture-block.sh"
+run_oracle_block c-seam ecdsa
+if [ "$CAPTURE_RC" -eq 0 ] \
+    && grep -q '^LEDGER ' "$T/c-seam/known-n-workload.log" 2>/dev/null \
+    && grep -q '^ORDDONE mode=ecdsa rc=0' "$T/c-seam/known-n-workload.log" 2>/dev/null \
+    && grep -q 'ops=99' "$T/c-seam/known-n-driver.log" 2>/dev/null \
+    && [ "$ORACLE_RC" -eq 0 ] \
+    && grep -q 'ORACLE PASS' "$T/c-seam/oracle.txt" 2>/dev/null; then
+    ok "capture block output feeds the oracle block (stub seam PASS)"
+else
+    bad "capture block output feeds the oracle block (stub seam PASS) (capture_rc=$CAPTURE_RC oracle_rc=$ORACLE_RC)"
+fi
+
+# 54. The negative control really drops the argument.
+grep -v -F -- '--workload-out known-n-workload.log' "$T/capture-block.sh" >"$T/capture-mutant.sh"
+if grep -q -F 'workload-out' "$T/capture-mutant.sh" 2>/dev/null; then
+    bad "capture mutant drops the --workload-out argument"
+else
+    ok "capture mutant drops the --workload-out argument"
+fi
+
+# 55. The seam detects a dropped --workload-out: capture stays
+# silent (rc 0, no workload file) and the oracle fails closed.
+run_capture_block c-mutant ecdsa "$T/capture-mutant.sh"
+run_oracle_block c-mutant ecdsa
+if [ "$CAPTURE_RC" -eq 0 ] \
+    && [ ! -f "$T/c-mutant/known-n-workload.log" ] \
+    && [ "$ORACLE_RC" -ne 0 ] \
+    && grep -q 'ORACLE FAIL' "$T/c-mutant/oracle.txt" 2>/dev/null \
+    && ! grep -q 'ORACLE PASS' "$T/c-mutant/oracle.txt" 2>/dev/null; then
+    ok "capture without --workload-out fails the oracle (mutant red)"
+else
+    bad "capture without --workload-out fails the oracle (mutant red) (capture_rc=$CAPTURE_RC oracle_rc=$ORACLE_RC)"
 fi
 
 echo "---"
