@@ -46,8 +46,12 @@ The installer reads artifact paths from
 `target/dev-build-manifest.json`; pass `--manifest PATH` to use a
 different build, or `--binary F --harvest F --count F` to install
 explicit operator-built objects. The complete artifact set is staged
-and validated before anything in the prefix is replaced, so a failed
-install leaves an existing install byte-identical. Manifest-selected
+and validated before anything in the prefix is replaced, so a validation
+failure leaves an existing install byte-identical. Once replacement
+begins, a failure (I/O error, `chmod`, receipt write) stops the install
+and may leave a partially updated prefix; rerun the install to complete
+it. The receipt itself publishes atomically (temp file + rename), so a
+failed install never leaves a truncated receipt. Manifest-selected
 artifacts must match the recorded `sha256` and byte length — a stale
 manifest or modified bytes fail closed with a rebuild hint. Every
 object is also screened before copying: the host binary must be an
