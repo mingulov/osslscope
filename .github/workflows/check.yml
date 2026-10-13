@@ -39,6 +39,7 @@ jobs:
       - run: ./packaging/tests/test-lifecycle-assert.sh
       - run: ./scripts/tests/test-install-dev.sh
       - run: ./scripts/tests/test-live-oracle.sh
+      - run: ./scripts/tests/test-live-workflow.sh
       - run: python3 -c "import yaml,sys; [yaml.safe_load(open(f)) for f in sys.argv[1:]]" .github/workflows/check.yml .github/workflows/live-known-n.yml
   live-gates:
     # Labeled skips, never passes: every live suite needs a privileged BPF
