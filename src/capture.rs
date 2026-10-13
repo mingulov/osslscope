@@ -6608,17 +6608,23 @@ mod tests {
                 .collect()
         }
 
-        fn ok_delivery() -> crate::report::DeliveryResult {
-            crate::report::DeliveryResult {
-                primary: crate::report::ArtifactOutcome {
-                    dest: "stdout".to_string(),
-                    ok: true,
-                    bytes: 8,
-                    error: None,
-                },
-                cbom: None,
-                diagnostics: Vec::new(),
-            }
+        /// Unique temp artifact path for delivery readback
+        /// (parallel-safe: pid + sequence + thread id, the same
+        /// scheme as [`SeedFile`]).
+        fn artifact_path(name: &str) -> std::path::PathBuf {
+            use std::sync::atomic::Ordering;
+            static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let seq = SEQ.fetch_add(1, Ordering::SeqCst);
+            std::env::temp_dir().join(format!(
+                "osslscope-r02-{}-{}-{:?}-{name}",
+                std::process::id(),
+                seq,
+                std::thread::current().id()
+            ))
+        }
+
+        fn remove_quiet(path: &std::path::Path) {
+            let _ = std::fs::remove_file(path);
         }
 
         /// Align the harness window with the count window so the
@@ -6714,24 +6720,49 @@ mod tests {
                 CandidateCoverage::Complete
             );
             assert!(cap.document.has_usable_evidence());
-            // Check assembly (mirrors check::run): evaluate, fold the
-            // legacy tripwire, attach the policy section.
-            let mut verdict = crate::policy::evaluate_document(
+            // Check assembly flows through the production seam:
+            // evaluate, fold the legacy tripwire, attach the policy
+            // section.
+            let (verdict, document) = crate::check::assemble_checked_document(
                 std::slice::from_ref(&crate::policy::PolicyRule::deny_weak()),
-                &cap.document,
-            );
-            crate::policy::apply_legacy_engine_fallback(
-                &mut verdict,
-                crate::check::legacy_engine_calls(&cap.legacy),
+                cap.document.clone(),
+                &cap.legacy,
             );
             assert_eq!(verdict.overall(), crate::policy::PolicyOutcome::Violation);
             assert!(!verdict.rules.is_empty());
-            let mut document = cap.document.clone();
-            document.policy = Some(crate::check::policy_record(&verdict));
+            // Delivered artifacts are independently validated:
+            // both destinations are written, read back, and checked
+            // — the exit below derives from the actual delivery
+            // result, never a fabricated outcome.
+            let primary_path = artifact_path("runtime.report.json");
+            let cbom_path = artifact_path("runtime.report.cdx.json");
+            let req = crate::report::OutputRequest {
+                format: crate::report::OutputFormat::Json,
+                primary: crate::report::OutputDest::File(primary_path.clone()),
+                cbom: Some(crate::report::OutputDest::File(cbom_path.clone())),
+            };
+            let delivery = crate::report::write_artifacts(&document, &req);
+            assert!(delivery.delivered_all(), "{delivery:?}");
+            assert!(
+                delivery.diagnostics.is_empty(),
+                "{:?}",
+                delivery.diagnostics
+            );
+            let primary = std::fs::read(&primary_path).unwrap();
+            let cbom_bytes = std::fs::read(&cbom_path).unwrap();
+            assert_eq!(
+                primary,
+                crate::report::render_json(&document).unwrap(),
+                "delivered primary drifted from the direct render"
+            );
+            assert_eq!(
+                cbom_bytes,
+                crate::report::render_cbom(&document).unwrap(),
+                "delivered CBOM drifted from the direct render"
+            );
             // JSON validates and semantics accepts the evaluated
             // verdict on usable Runtime evidence.
-            let bytes = crate::report::render_json(&document).unwrap();
-            let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&primary).unwrap();
             crate::schema::validate_v2(&v).unwrap();
             crate::schema::check_v2_semantics(&v).expect("usable Runtime verdict must validate");
             assert_eq!(v["policy"]["verdict"], "violation");
@@ -6739,8 +6770,7 @@ mod tests {
             assert_eq!(document.total_calls(), 7);
             // CBOM retains the definite MD5 asset with honest
             // omission accounting and an accurate disclaimer.
-            let cbom: serde_json::Value =
-                serde_json::from_slice(&crate::report::render_cbom(&document).unwrap()).unwrap();
+            let cbom: serde_json::Value = serde_json::from_slice(&cbom_bytes).unwrap();
             let comps = cbom["components"].as_array().unwrap();
             assert_eq!(comps.len(), 1);
             let asset = cbom_props(&comps[0]["properties"]);
@@ -6759,16 +6789,14 @@ mod tests {
             assert!(text.contains("7 calls"), "{text}");
             assert!(text.contains("policy: violation"), "{text}");
             assert!(text.contains("fatal: runtime:"), "{text}");
-            // A proved violation dominates the tool failure.
+            // A proved violation dominates the tool failure (driven
+            // by the actual delivery result).
             assert_eq!(
-                crate::report::exit_for(
-                    verdict.overall(),
-                    cap.child_exit,
-                    &document,
-                    &ok_delivery()
-                ),
+                crate::report::exit_for(verdict.overall(), cap.child_exit, &document, &delivery),
                 10
             );
+            remove_quiet(&primary_path);
+            remove_quiet(&cbom_path);
         }
 
         #[test]
@@ -6837,24 +6865,45 @@ mod tests {
             assert_eq!(cap.document.sites.len(), 1);
             assert_eq!(cap.document.sites[0].calls, 7);
             assert!(cap.document.has_usable_evidence());
-            let verdict = crate::policy::evaluate_document(
+            // Same production seam as the violation case above.
+            let (verdict, document) = crate::check::assemble_checked_document(
                 std::slice::from_ref(&crate::policy::PolicyRule::deny_weak()),
-                &cap.document,
+                cap.document.clone(),
+                &cap.legacy,
             );
             assert_eq!(
                 verdict.overall(),
                 crate::policy::PolicyOutcome::Inconclusive
             );
             assert!(!verdict.rules.is_empty());
-            let mut document = cap.document.clone();
-            document.policy = Some(crate::check::policy_record(&verdict));
-            let bytes = crate::report::render_json(&document).unwrap();
-            let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            // Same independent delivery readback as the violation
+            // case: both destinations written, read back, and checked.
+            let primary_path = artifact_path("runtime.ambiguous.report.json");
+            let cbom_path = artifact_path("runtime.ambiguous.report.cdx.json");
+            let req = crate::report::OutputRequest {
+                format: crate::report::OutputFormat::Json,
+                primary: crate::report::OutputDest::File(primary_path.clone()),
+                cbom: Some(crate::report::OutputDest::File(cbom_path.clone())),
+            };
+            let delivery = crate::report::write_artifacts(&document, &req);
+            assert!(delivery.delivered_all(), "{delivery:?}");
+            let primary = std::fs::read(&primary_path).unwrap();
+            let cbom_bytes = std::fs::read(&cbom_path).unwrap();
+            assert_eq!(
+                primary,
+                crate::report::render_json(&document).unwrap(),
+                "delivered primary drifted from the direct render"
+            );
+            assert_eq!(
+                cbom_bytes,
+                crate::report::render_cbom(&document).unwrap(),
+                "delivered CBOM drifted from the direct render"
+            );
+            let v: serde_json::Value = serde_json::from_slice(&primary).unwrap();
             crate::schema::validate_v2(&v).unwrap();
             crate::schema::check_v2_semantics(&v).expect("ambiguous Runtime must validate");
             assert_eq!(v["policy"]["verdict"], "inconclusive");
-            let cbom: serde_json::Value =
-                serde_json::from_slice(&crate::report::render_cbom(&document).unwrap()).unwrap();
+            let cbom: serde_json::Value = serde_json::from_slice(&cbom_bytes).unwrap();
             assert_eq!(cbom["components"].as_array().unwrap().len(), 0);
             let meta = cbom_props(&cbom["metadata"]["properties"]);
             assert_eq!(meta["osslscope:omitted-ambiguous-sites"], "1");
@@ -6869,14 +6918,11 @@ mod tests {
             assert!(disclaimer.contains("salvaged"), "{disclaimer}");
             assert!(!disclaimer.contains("no usable evidence"), "{disclaimer}");
             assert_eq!(
-                crate::report::exit_for(
-                    verdict.overall(),
-                    cap.child_exit,
-                    &document,
-                    &ok_delivery()
-                ),
+                crate::report::exit_for(verdict.overall(), cap.child_exit, &document, &delivery),
                 1
             );
+            remove_quiet(&primary_path);
+            remove_quiet(&cbom_path);
         }
 
         #[test]
@@ -6927,24 +6973,45 @@ mod tests {
             assert_eq!(counter(&cap.document, "discovery.finish_failed"), 1);
             assert!(cap.reasons.iter().any(|r| r == "close-failure"));
             assert!(cap.document.has_usable_evidence());
-            let verdict = crate::policy::evaluate_document(
+            // Same production seam as the violation case above.
+            let (verdict, document) = crate::check::assemble_checked_document(
                 std::slice::from_ref(&crate::policy::PolicyRule::deny_weak()),
-                &cap.document,
+                cap.document.clone(),
+                &cap.legacy,
             );
             assert_eq!(
                 verdict.overall(),
                 crate::policy::PolicyOutcome::Inconclusive
             );
             assert!(!verdict.rules.is_empty());
-            let mut document = cap.document.clone();
-            document.policy = Some(crate::check::policy_record(&verdict));
-            let bytes = crate::report::render_json(&document).unwrap();
-            let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            // Same independent delivery readback as the violation
+            // case: both destinations written, read back, and checked.
+            let primary_path = artifact_path("runtime.lostdrain.report.json");
+            let cbom_path = artifact_path("runtime.lostdrain.report.cdx.json");
+            let req = crate::report::OutputRequest {
+                format: crate::report::OutputFormat::Json,
+                primary: crate::report::OutputDest::File(primary_path.clone()),
+                cbom: Some(crate::report::OutputDest::File(cbom_path.clone())),
+            };
+            let delivery = crate::report::write_artifacts(&document, &req);
+            assert!(delivery.delivered_all(), "{delivery:?}");
+            let primary = std::fs::read(&primary_path).unwrap();
+            let cbom_bytes = std::fs::read(&cbom_path).unwrap();
+            assert_eq!(
+                primary,
+                crate::report::render_json(&document).unwrap(),
+                "delivered primary drifted from the direct render"
+            );
+            assert_eq!(
+                cbom_bytes,
+                crate::report::render_cbom(&document).unwrap(),
+                "delivered CBOM drifted from the direct render"
+            );
+            let v: serde_json::Value = serde_json::from_slice(&primary).unwrap();
             crate::schema::validate_v2(&v).unwrap();
             crate::schema::check_v2_semantics(&v).expect("lost-drain Runtime must validate");
             assert_eq!(v["policy"]["verdict"], "inconclusive");
-            let cbom: serde_json::Value =
-                serde_json::from_slice(&crate::report::render_cbom(&document).unwrap()).unwrap();
+            let cbom: serde_json::Value = serde_json::from_slice(&cbom_bytes).unwrap();
             assert_eq!(cbom["components"].as_array().unwrap().len(), 0);
             let meta = cbom_props(&cbom["metadata"]["properties"]);
             assert_eq!(meta["osslscope:omitted-ambiguous-sites"], "0");
@@ -6954,14 +7021,11 @@ mod tests {
             assert!(disclaimer.contains("salvaged"), "{disclaimer}");
             assert!(!disclaimer.contains("no usable evidence"), "{disclaimer}");
             assert_eq!(
-                crate::report::exit_for(
-                    verdict.overall(),
-                    cap.child_exit,
-                    &document,
-                    &ok_delivery()
-                ),
+                crate::report::exit_for(verdict.overall(), cap.child_exit, &document, &delivery),
                 1
             );
+            remove_quiet(&primary_path);
+            remove_quiet(&cbom_path);
         }
     }
 }
