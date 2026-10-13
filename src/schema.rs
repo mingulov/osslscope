@@ -1727,6 +1727,37 @@ mod tests {
     }
 
     #[test]
+    fn r12_old_strict_schema_rejects_context_key() {
+        // A strict validator pinned to the pre-R12 schema rejects a
+        // context-bearing document (top-level additionalProperties)
+        // — EXPECTED: strict validators upgrade with the schema,
+        // while field readers ignore unknown keys (see
+        // output_contract r12_old_reader_ignores_context).
+        let dir = format!("{}/tests/goldens", env!("CARGO_MANIFEST_DIR"));
+        let doc: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(format!("{dir}/report-v2-complete.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            doc.get("context").is_some(),
+            "golden must carry context for the old-strict pin"
+        );
+        validate_v2(&doc).expect("new schema accepts context");
+        let mut old_schema: serde_json::Value = serde_json::from_str(V2_SCHEMA_JSON).unwrap();
+        old_schema
+            .get_mut("properties")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("context");
+        let Err(e) = check_inline(&old_schema, &doc) else {
+            panic!("old strict schema accepted a context-bearing doc");
+        };
+        assert_eq!(e.path, "$.context");
+        assert_eq!(e.message, "value forbidden here");
+    }
+
+    #[test]
     fn no_v1_report_goldens_remain() {
         // T14r4: the v1 report renderer is deleted (PRD §14.1 v2-only
         // live producer), so no v1 report golden may exist — any

@@ -1079,8 +1079,9 @@ fn safe_display(text: &str) -> String {
 
 /// Non-`is_control` characters that manipulate terminal/log
 /// display: bidi overrides/isolates, zero-width and invisible
-/// format characters, line/paragraph separators, and the
-/// interlinear-annotation controls.
+/// format characters (including WORD JOINER..INVISIBLE PLUS),
+/// line/paragraph separators, and the interlinear-annotation
+/// controls.
 fn is_display_control(c: char) -> bool {
     matches!(
         c,
@@ -1088,6 +1089,7 @@ fn is_display_control(c: char) -> bool {
             | '\u{061C}' // ARABIC LETTER MARK (bidi)
             | '\u{200B}'..='\u{200F}' // ZERO WIDTH SPACE .. RIGHT-TO-LEFT MARK
             | '\u{2028}'..='\u{202E}' // LINE SEPARATOR .. RIGHT-TO-LEFT OVERRIDE
+            | '\u{2060}'..='\u{2064}' // WORD JOINER .. INVISIBLE PLUS
             | '\u{2066}'..='\u{2069}' // bidi isolates
             | '\u{FEFF}' // ZERO WIDTH NO-BREAK SPACE / BOM
             | '\u{FFF9}'..='\u{FFFB}' // interlinear annotation

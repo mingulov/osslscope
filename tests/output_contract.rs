@@ -2660,28 +2660,69 @@ const EVIL_COMM_SHORT: &str = "a\x1b[2J\nstatus=OK";
 const EVIL_COMM_WIDE: &str =
     "x\t\x1b]0;pwned\x07\u{202E}RTL\u{202C}\u{0085}\u{200B}\u{2028}\u{FEFF}y";
 
+/// Actual short tab/bidi comms (Linux-permitted: at most 15 bytes):
+/// a tab-split comm with a bidi override, and a bare bidi-override
+/// comm. Lengths pinned in the test.
+const EVIL_COMM_TAB_SHORT: &str = "a\tb\u{202E}c";
+const EVIL_COMM_BIDI_SHORT: &str = "\u{202E}RTL\u{202C}";
+
+/// Omitted invisible format controls (U+2060–U+2064): WORD JOINER,
+/// FUNCTION APPLICATION, INVISIBLE TIMES, INVISIBLE SEPARATOR,
+/// INVISIBLE PLUS. General_Category=Cf, outside `is_control`, so a
+/// renderer matching only C0/C1 passes them through. Each `x{c}y`
+/// comm below is 5 bytes — Linux-permitted.
+fn evil_comm_invisible() -> Vec<String> {
+    (0x2060..=0x2064)
+        .map(|cp| format!("x{}y", char::from_u32(cp).unwrap()))
+        .collect()
+}
+
+/// Independent oracle: characters that must never reach human output
+/// active. Derived from Unicode properties (UCD) — NOT copied from
+/// the renderer's match arms: `char::is_control` is the std
+/// General_Category=Cc property, and each row below cites its UCD
+/// property (Bidi_Control, invisible Cf, Zl/Zp). Deliberately
+/// structured as (lo, hi, property) rows rather than match arms so
+/// the two lists cannot drift by copy.
+const FORBIDDEN_DISPLAY_ROWS: &[(char, char, &str)] = &[
+    ('\u{00AD}', '\u{00AD}', "SOFT HYPHEN (Cf)"),
+    (
+        '\u{061C}',
+        '\u{061C}',
+        "ARABIC LETTER MARK (Cf, Bidi_Control)",
+    ),
+    (
+        '\u{200B}',
+        '\u{200F}',
+        "ZERO WIDTH SPACE..RIGHT-TO-LEFT MARK (Cf; 200E/200F Bidi_Control)",
+    ),
+    ('\u{2028}', '\u{2029}', "LINE/PARAGRAPH SEPARATOR (Zl/Zp)"),
+    (
+        '\u{202A}',
+        '\u{202E}',
+        "bidi embeddings/overrides (Cf, Bidi_Control)",
+    ),
+    ('\u{2060}', '\u{2064}', "WORD JOINER..INVISIBLE PLUS (Cf)"),
+    ('\u{2066}', '\u{2069}', "bidi isolates (Cf, Bidi_Control)"),
+    ('\u{FEFF}', '\u{FEFF}', "ZERO WIDTH NO-BREAK SPACE (Cf)"),
+    ('\u{FFF9}', '\u{FFFB}', "interlinear annotation (Cf)"),
+];
+
 /// No active display controls outside the renderer's own `\n` line
-/// separators: no C0/C1/DEL, no bidi overrides/isolates, no
-/// zero-width/format tricks, no U+2028/2029 line breaks.
+/// separators: no C0/C1/DEL, no bidi controls, no invisible/zero-
+/// width format characters, no U+2028/2029 line breaks.
 fn assert_no_active_display_controls(text: &str) {
     for c in text.chars() {
         if c == '\n' {
             continue;
         }
         assert!(!c.is_control(), "active control {c:?} in human output");
-        assert!(
-            !matches!(
-                c,
-                '\u{00AD}'
-                    | '\u{061C}'
-                    | '\u{200B}'..='\u{200F}'
-                    | '\u{2028}'..='\u{202E}'
-                    | '\u{2066}'..='\u{2069}'
-                    | '\u{FEFF}'
-                    | '\u{FFF9}'..='\u{FFFB}'
-            ),
-            "active display control {c:?} in human output"
-        );
+        for (lo, hi, property) in FORBIDDEN_DISPLAY_ROWS {
+            assert!(
+                !(*lo..=*hi).contains(&c),
+                "active display control {c:?} ({property}) in human output"
+            );
+        }
     }
 }
 
@@ -2707,12 +2748,55 @@ fn r12_context_renders_in_json_with_exact_values() {
 }
 
 #[test]
+fn r12_oracle_covers_invisible_format_controls() {
+    // The oracle guards itself: every omitted-format control
+    // (U+2060–U+2064 by codepoint) plus one representative of each
+    // other forbidden class must appear in its rows, so a future
+    // erosion of either list fails here rather than passing blind.
+    // Ordinary printable Unicode must NOT appear.
+    let covered = |c: char| {
+        FORBIDDEN_DISPLAY_ROWS
+            .iter()
+            .any(|(lo, hi, _)| (*lo..=*hi).contains(&c))
+    };
+    for cp in 0x2060..=0x2064 {
+        let c = char::from_u32(cp).unwrap();
+        assert!(!c.is_control(), "U+{cp:04X} must be outside is_control");
+        assert!(covered(c), "oracle must forbid U+{cp:04X}");
+    }
+    assert!('\t'.is_control(), "tab is Cc");
+    for c in ['\u{202E}', '\u{200B}', '\u{FEFF}', '\u{2028}', '\u{00AD}'] {
+        assert!(covered(c), "oracle must forbid {c:?}");
+    }
+    for c in ['é', '日', '🎉', 'Ω', 'م', 'ß', ' ', '\u{00A0}'] {
+        assert!(!c.is_control(), "printable {c:?} must not be control");
+        assert!(!covered(c), "printable {c:?} must not be forbidden");
+    }
+}
+
+#[test]
 fn r12_human_neutralizes_target_controlled_comm() {
     // R12/F14 RED: Linux-permitted comm controls (ESC/newline/tab/
     // bidi) plus Unicode controls never reach the terminal active;
     // the genuine status/policy footer stays intact and singular.
     assert_eq!(EVIL_COMM_SHORT.len(), 15, "short-comm shape must hold");
-    for evil in [EVIL_COMM_SHORT, EVIL_COMM_WIDE] {
+    assert!(
+        EVIL_COMM_TAB_SHORT.len() <= 15 && EVIL_COMM_BIDI_SHORT.len() <= 15,
+        "tab/bidi comms must be short"
+    );
+    let invisible = evil_comm_invisible();
+    assert_eq!(invisible.len(), 5, "one comm per U+2060–U+2064");
+    for comm in &invisible {
+        assert_eq!(comm.len(), 5, "invisible-format comm must be 5 bytes");
+    }
+    let mut evils: Vec<&str> = vec![
+        EVIL_COMM_SHORT,
+        EVIL_COMM_WIDE,
+        EVIL_COMM_TAB_SHORT,
+        EVIL_COMM_BIDI_SHORT,
+    ];
+    evils.extend(invisible.iter().map(String::as_str));
+    for evil in evils {
         let mut doc = violation_doc();
         doc.target.comm = evil.to_string();
         let text = render_human(&doc);
@@ -2738,7 +2822,15 @@ fn r12_human_neutralizes_target_controlled_comm() {
 fn r12_json_round_trips_target_controlled_comm() {
     // R12/F14: JSON keeps the reversible original — neutralization
     // happens at human rendering only, never in the model or JSON.
-    for evil in [EVIL_COMM_SHORT, EVIL_COMM_WIDE] {
+    let invisible = evil_comm_invisible();
+    let mut evils: Vec<&str> = vec![
+        EVIL_COMM_SHORT,
+        EVIL_COMM_WIDE,
+        EVIL_COMM_TAB_SHORT,
+        EVIL_COMM_BIDI_SHORT,
+    ];
+    evils.extend(invisible.iter().map(String::as_str));
+    for evil in evils {
         let mut doc = complete_doc();
         doc.target.comm = evil.to_string();
         let v = json_of(&doc);
@@ -2746,6 +2838,22 @@ fn r12_json_round_trips_target_controlled_comm() {
         validate_v2(&v).expect("evil-comm doc fails schema");
         check_v2_semantics(&v).expect("evil-comm doc fails semantics");
     }
+}
+
+#[test]
+fn r12_human_preserves_printable_unicode() {
+    // Neutralization targets display controls, not text: ordinary
+    // printable Unicode (accents, CJK, emoji, Greek, an Arabic
+    // letter, NBSP) passes through human rendering verbatim.
+    let comm = "café-日本-🎉-Ω-م-\u{00A0}x";
+    let mut doc = violation_doc();
+    doc.target.comm = comm.to_string();
+    let text = render_human(&doc);
+    assert_no_active_display_controls(&text);
+    assert!(
+        text.contains(comm),
+        "printable Unicode must survive verbatim:\n{text}"
+    );
 }
 
 #[test]
@@ -2875,11 +2983,57 @@ fn r12_no_window_fatal_carries_explicit_unknown() {
     );
 }
 
+/// Pre-R12 field-reader shape: the supported-evidence subset an old
+/// (pre-context) reader parses. No `context` field; serde ignores
+/// unknown keys by default — exactly like a real old field reader.
+#[derive(serde::Deserialize)]
+#[allow(dead_code)]
+struct PreR12Document {
+    status: Completeness,
+    window: CaptureWindow,
+    target: TargetRecord,
+    sites: Vec<SiteExecution>,
+    objects: Vec<ObjectRecord>,
+    coverage: Vec<ScopeCoverage>,
+    counters: Vec<GapCounter>,
+    engine_observations: Vec<EngineObservation>,
+}
+
 #[test]
 fn r12_old_reader_ignores_context() {
-    // R12 additive evolution (R05 rule): a v2.1 document without the
-    // optional context section validates, and a reader parses it
-    // with context None — old-shaped bytes stay meaningful.
+    // Correct direction: an UNCHANGED context-bearing document —
+    // with R05 ENGINE observations — feeds a pre-R12 field-reader
+    // shape (no `context` field). The old reader parses it and its
+    // supported evidence survives intact; the unknown key is ignored.
+    let doc = engine_doc_fixture();
+    let v = serde_json::to_value(&doc).expect("document serializes");
+    assert!(
+        v.get("context").is_some(),
+        "fixture must carry context into the old reader"
+    );
+    assert_eq!(
+        v["engine_observations"].as_array().unwrap().len(),
+        5,
+        "fixture must carry ENGINE observations into the old reader"
+    );
+    let back: PreR12Document = serde_json::from_value(v).expect("old reader parses new bytes");
+    assert_eq!(back.status, doc.status);
+    assert_eq!(back.window, doc.window);
+    assert_eq!(back.target, doc.target);
+    assert_eq!(back.sites, doc.sites);
+    assert_eq!(back.objects, doc.objects);
+    assert_eq!(back.coverage, doc.coverage);
+    assert_eq!(back.counters, doc.counters);
+    assert_eq!(back.engine_observations, doc.engine_observations);
+    let calls: u64 = back.sites.iter().map(|s| s.calls).sum();
+    assert_eq!(calls, 500, "calls conserved through the old reader");
+}
+
+#[test]
+fn r12_new_reader_defaults_missing_context() {
+    // New code still reads old bytes: a document without the
+    // optional context section validates, and a missing context
+    // defaults to None — never to fabricated kernel/wall values.
     let mut doc = complete_doc();
     doc.context = Some(fixture_context());
     let mut v = json_of(&doc);
@@ -2887,8 +3041,6 @@ fn r12_old_reader_ignores_context() {
     v.as_object_mut().unwrap().remove("context");
     validate_v2(&v).expect("old-shaped doc fails schema");
     check_v2_semantics(&v).expect("old-shaped doc fails semantics");
-    // New code reads old serde documents: a missing context
-    // defaults to None, never to fabricated kernel/wall values.
     let mut stripped = serde_json::to_value(&doc).expect("document serializes");
     stripped.as_object_mut().unwrap().remove("context");
     let back: CaptureDocument = serde_json::from_value(stripped).expect("old shape parses");

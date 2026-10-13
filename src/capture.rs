@@ -213,9 +213,15 @@ pub struct Capture {
     pub drain_wall_us: u64,
     pub harvest_doc: serde_json::Value,
     pub legacy: serde_json::Value,
-    /// Window wall-clock edges (PRD §5 window-only claims).
-    /// Pre-window FATAL captures carry the acquisition instant in
-    /// both (window_actual == 0 marks "no window opened").
+    /// Window wall-clock edges (PRD §5 window-only claims): the
+    /// ONE consistently captured pair (R12), shared verbatim with
+    /// `document.context`. The start is the wall counterpart of the
+    /// monotonic requested start (release for owned spawns,
+    /// acquisition for `--pid`); the end is the single close sample
+    /// taken alongside the effective-end stamp. Context only — the
+    /// monotonic window fields stay authoritative. Pre-window FATAL
+    /// captures carry the acquisition instant in both
+    /// (window_actual == 0 marks "no window opened").
     pub window_start_wall: SystemTime,
     pub window_end_wall: SystemTime,
     pub kernel_release: String,
@@ -304,7 +310,9 @@ fn unix_ns(t: SystemTime) -> Option<u64> {
 }
 
 /// Execution context for the finalized document (R12): the
-/// already-captured kernel release plus the window wall edges.
+/// already-captured kernel release plus the ONE consistently
+/// captured wall pair (requested-start counterpart + single close
+/// sample — the same pair the enclosing Capture carries).
 /// Monotonic window fields stay authoritative; this context never
 /// feeds durations or deadlines.
 fn doc_context(kernel_release: &str, start: SystemTime, end: SystemTime) -> CaptureContext {
@@ -2258,7 +2266,19 @@ struct Runner<'x, D, B: CountBackend, T, L, C: ClockPort, P: ProcPort> {
     requested_start_ns: u64,
     kernel_deadline_ns: u64,
     open_instant: Instant,
-    open_wall: SystemTime,
+    /// Wall counterpart of `requested_start_ns` (R12): re-stamped at
+    /// every requested-start assignment (release for owned spawns,
+    /// acquisition for `--pid`), so the wall pair always brackets
+    /// the requested window the monotonic fields describe — never
+    /// the pre-setup open instant. Monotonic stays authoritative.
+    wall_start: SystemTime,
+    /// Wall counterpart of the effective-end stamp (R12): sampled
+    /// ONCE at window close, alongside the monotonic effective-end
+    /// stamp (before count/discovery teardown on the clean path —
+    /// drain time is not coverage), then reused verbatim by both
+    /// `document.context` and the enclosing Capture's wall edges.
+    /// Tentatively equals `wall_start` until the close stamp lands.
+    wall_end: SystemTime,
     drain_wall_us: u64,
     /// Verified-identity file cache (F-D/A13): path →
     /// identity-bound bytes. Entries are validated per poll by
@@ -2798,6 +2818,9 @@ where
     fn fail(mut self, err: anyhow::Error) -> anyhow::Result<Capture> {
         if self.observation_started {
             let effective_end_ns = self.clock.monotonic_ns().min(self.kernel_deadline_ns);
+            // R12: the single close sample, alongside the monotonic
+            // end stamp — reused by the document and the Capture.
+            self.wall_end = self.clock.wall_now();
             return Ok(self.salvage(
                 SalvageSeed {
                     drain: None,
@@ -2925,6 +2948,9 @@ where
     /// cut): the whole requested window is startup gap, the exit
     /// status rides along, and nothing claims COMPLETE.
     fn no_window_result(mut self) -> Capture {
+        // R12: the single close sample (no window was observed, but
+        // the pair still closes here) — reused below.
+        self.wall_end = self.clock.wall_now();
         let requested_end = self
             .requested_start_ns
             .saturating_add(duration_ns(self.cfg.duration));
@@ -2955,13 +2981,12 @@ where
             legacy_partition: LegacyCallPartition::default(),
             engine_observations: Vec::new(),
         });
-        // R12: retain the already-captured execution context in the
-        // finalized document (no window was observed, but the host
-        // context is still honest context).
+        // R12: retain the one consistently captured pair (no window
+        // was observed, but the host context is still honest context).
         document.context = Some(doc_context(
             &self.info.kernel_release,
-            self.open_wall,
-            self.clock.wall_now(),
+            self.wall_start,
+            self.wall_end,
         ));
         self.emit_gap_reasons(document.reasons());
         if !self.trigger_observed {
@@ -3022,6 +3047,9 @@ where
             .requested_start_ns
             .saturating_add(duration_ns(self.cfg.duration));
         let now_ns = self.clock.monotonic_ns();
+        // R12: the single close sample, alongside the monotonic end
+        // stamp — reused by the document and the Capture.
+        self.wall_end = self.clock.wall_now();
         let mut document = evidence::finalize(FinalizeInput {
             window: CaptureWindow {
                 requested_start_ns: self.requested_start_ns,
@@ -3048,12 +3076,12 @@ where
             legacy_partition: LegacyCallPartition::default(),
             engine_observations: Vec::new(),
         });
-        // R12: retain the already-captured execution context (the
+        // R12: retain the one consistently captured pair (the
         // observations are discarded, but the host context stands).
         document.context = Some(doc_context(
             &self.info.kernel_release,
-            self.open_wall,
-            self.clock.wall_now(),
+            self.wall_start,
+            self.wall_end,
         ));
         self.reasons.clear();
         self.reason("pid-recycled");
@@ -3157,6 +3185,10 @@ where
         let _ = target.resolve_setup_failure();
         return Err(e.context("count open_window"));
     }
+    // R12: the wall pair is sampled once per edge and reused —
+    // this open instant is tentative (release/acquisition re-stamps
+    // the start; window close stamps the end).
+    let wall_open = clock.wall_now();
     let mut runner = Runner {
         cfg,
         info,
@@ -3199,7 +3231,8 @@ where
         requested_start_ns: start_ns,
         kernel_deadline_ns,
         open_instant: clock.now(),
-        open_wall: clock.wall_now(),
+        wall_start: wall_open,
+        wall_end: wall_open,
         drain_wall_us: 0,
         file_cache: HashMap::new(),
         relevance_capped: 0,
@@ -3288,6 +3321,9 @@ where
                 self.child_exit = Some(code);
             }
             self.requested_start_ns = self.clock.monotonic_ns();
+            // R12: the wall start is the counterpart of the requested
+            // start — re-stamped together, never the pre-setup open.
+            self.wall_start = self.clock.wall_now();
             return Ok(self.no_window_result());
         }
         if setup_deadline.is_some_and(|d| self.clock.now() >= d) {
@@ -3306,6 +3342,8 @@ where
                     let _ = self.count.close_and_drain(self.cfg.grace);
                     let _ = self.target.resolve_setup_failure();
                     self.requested_start_ns = self.clock.monotonic_ns();
+                    // R12: wall/requested starts re-stamp together.
+                    self.wall_start = self.clock.wall_now();
                     return Ok(self.no_window_result());
                 }
                 let _ = self.count.close_and_drain(self.cfg.grace);
@@ -3318,9 +3356,11 @@ where
             // it differs (a slow exec settles late).
             self.settle_comm();
             self.requested_start_ns = self.clock.monotonic_ns();
+            self.wall_start = self.clock.wall_now();
             self.open_instant = self.clock.now();
         } else {
             self.requested_start_ns = self.info.acquired_ns;
+            self.wall_start = self.info.acquired_wall;
         }
         let requested_instant = if owned {
             self.open_instant
@@ -3472,6 +3512,10 @@ where
         // and the loop can overshoot the clamped deadline by up to
         // one round.
         let effective_end_ns = self.clock.monotonic_ns().min(self.kernel_deadline_ns);
+        // R12: the single close sample, alongside the monotonic end
+        // stamp (drain time is not coverage) — every consumer below
+        // reuses this pair, never re-samples.
+        self.wall_end = self.clock.wall_now();
         // Counting closes BEFORE the final discovery drain
         // (in-kernel TARGET=0 inside: no userspace delay can extend
         // counting past this point).
@@ -4199,12 +4243,12 @@ where
             legacy_partition: evidence_partition(call_partition),
             engine_observations,
         });
-        // R12: retain the already-captured execution context in the
-        // finalized document (monotonic fields stay authoritative).
+        // R12: retain the one consistently captured pair
+        // (monotonic fields stay authoritative).
         document.context = Some(doc_context(
             &self.info.kernel_release,
-            self.open_wall,
-            self.clock.wall_now(),
+            self.wall_start,
+            self.wall_end,
         ));
 
         // Legacy `legacy` block from IN-WINDOW tripwire evidence only
@@ -4438,8 +4482,8 @@ where
             drain_wall_us: self.drain_wall_us,
             harvest_doc: parts.harvest_doc,
             legacy: parts.legacy,
-            window_start_wall: self.open_wall,
-            window_end_wall: self.clock.wall_now(),
+            window_start_wall: self.wall_start,
+            window_end_wall: self.wall_end,
             kernel_release: self.info.kernel_release.clone(),
             target_cmdline: self.info.cmdline.clone(),
             target_container_id: self.info.container_id.clone(),
@@ -6255,6 +6299,7 @@ mod tests {
             proc: &'x mut ProcStub,
             cancelled: &'x dyn Fn() -> bool,
         ) -> StubRunner<'x> {
+            let wall = clock.wall_now();
             Runner {
                 cfg,
                 info,
@@ -6297,7 +6342,8 @@ mod tests {
                 requested_start_ns: 5_000_000_000,
                 kernel_deadline_ns: 7_000_000_000,
                 open_instant: clock.now(),
-                open_wall: clock.wall_now(),
+                wall_start: wall,
+                wall_end: wall,
                 drain_wall_us: 0,
                 file_cache: HashMap::new(),
                 relevance_capped: 0,
@@ -7485,6 +7531,158 @@ mod tests {
             assert_eq!(lp["executed_calls"], 0);
             assert_eq!(lp["shared_ambiguous_calls"], 0);
             assert_eq!(lp["non_legacy_exclusive_calls"], 7);
+        }
+
+        /// Wall-script clock (R12 fix): wall advances by a full step
+        /// on EVERY wall sample while monotonic advances only via
+        /// sleep — the two clocks change independently, so any
+        /// double-sampled edge or pre-setup start shows up as an
+        /// exact-step skew the assertions below pin.
+        struct WallScriptClock {
+            ns: Cell<u64>,
+            now: Cell<Instant>,
+            wall_ns: Cell<u64>,
+        }
+
+        impl WallScriptClock {
+            const WALL_BASE: u64 = 1_700_000_000_000_000_000;
+            const WALL_STEP: u64 = 1_000_000_000;
+            fn at(ns: u64) -> Self {
+                Self {
+                    ns: Cell::new(ns),
+                    now: Cell::new(Instant::now()),
+                    wall_ns: Cell::new(Self::WALL_BASE),
+                }
+            }
+            fn wall_at(sample: u64) -> SystemTime {
+                SystemTime::UNIX_EPOCH
+                    + Duration::from_nanos(Self::WALL_BASE + sample * Self::WALL_STEP)
+            }
+        }
+
+        impl ClockPort for WallScriptClock {
+            fn monotonic_ns(&self) -> u64 {
+                self.ns.get()
+            }
+            fn now(&self) -> Instant {
+                self.now.get()
+            }
+            fn wall_now(&self) -> SystemTime {
+                let w = self.wall_ns.get();
+                self.wall_ns.set(w.saturating_add(Self::WALL_STEP));
+                SystemTime::UNIX_EPOCH + Duration::from_nanos(w)
+            }
+            fn sleep(&self, d: Duration) {
+                self.ns.set(
+                    self.ns
+                        .get()
+                        .saturating_add(u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)),
+                );
+                self.now.set(self.now.get() + d);
+            }
+        }
+
+        fn wall_script_capture(owned: bool, acquired_wall: SystemTime) -> Capture {
+            let cfg = stub_config();
+            let mut info = stub_info();
+            info.owned = owned;
+            info.kernel_release = "6.9.0-test".to_string();
+            info.acquired_wall = acquired_wall;
+            let clock = WallScriptClock::at(5_000_000_000);
+            let mut proc = ProcStub;
+            let cancelled = || false;
+            let count = CountSession::new(TPID, FakeCountBackend::new());
+            observe(
+                &cfg,
+                &info,
+                SessionSet {
+                    discovery: DiscoveryStub {
+                        finish_err: false,
+                        poll_err: false,
+                        dispatch_attached: false,
+                        trip_set: None,
+                    },
+                    count,
+                    target: TargetStub,
+                    lifecycle: LifecycleStub,
+                },
+                &clock,
+                &mut proc,
+                &cancelled,
+            )
+            .expect("stubbed capture runs end to end")
+        }
+
+        #[test]
+        fn r12_fix_wall_pair_is_single_release_to_close_pair_owned() {
+            // R12 fix control (fails pre-fix): one consistently
+            // captured wall pair through the real controller — the
+            // document context and the enclosing Capture share both
+            // edges; the start is the release-time wall (sample 1,
+            // not the pre-setup open sample 0); the end is the single
+            // close sample (sample 2), reused — not a fresh
+            // post-teardown sample per consumer. Monotonic stays
+            // authoritative: setup moved wall samples without moving
+            // monotonic, and the 1s window is pure monotonic.
+            let cap = wall_script_capture(true, WallScriptClock::wall_at(0));
+            let ctx = cap.document.context.as_ref().expect("context retained");
+            assert_eq!(ctx.kernel_release, "6.9.0-test");
+            assert_eq!(
+                ctx.wall_start_unix_ns,
+                unix_ns(WallScriptClock::wall_at(1)),
+                "start must be the release-time wall, not the pre-setup open"
+            );
+            assert_eq!(
+                ctx.wall_end_unix_ns,
+                unix_ns(WallScriptClock::wall_at(2)),
+                "end must be the single close sample"
+            );
+            assert_eq!(
+                cap.window_start_wall,
+                WallScriptClock::wall_at(1),
+                "Capture must reuse the one start edge"
+            );
+            assert_eq!(
+                cap.window_end_wall,
+                WallScriptClock::wall_at(2),
+                "Capture must reuse the one end edge"
+            );
+            assert_eq!(cap.document.window.requested_start_ns, 5_000_000_000);
+            assert_eq!(cap.document.window.requested_end_ns, 6_000_000_000);
+            assert_eq!(cap.document.window.effective_start_ns, 5_000_000_000);
+            assert_eq!(cap.document.window.effective_end_ns, 6_000_000_000);
+        }
+
+        #[test]
+        fn r12_fix_wall_pair_is_single_acquire_to_close_pair_foreign() {
+            // R12 fix control (fails pre-fix): foreign requested
+            // start IS acquisition, so the wall start is the
+            // acquisition wall — never the post-acquisition open
+            // sample — and the close sample is reused by both
+            // consumers.
+            let acquired = SystemTime::UNIX_EPOCH + Duration::from_nanos(1_600_000_000_000_000_000);
+            let cap = wall_script_capture(false, acquired);
+            let ctx = cap.document.context.as_ref().expect("context retained");
+            assert_eq!(
+                ctx.wall_start_unix_ns,
+                unix_ns(acquired),
+                "foreign start must be the acquisition wall"
+            );
+            assert_eq!(
+                ctx.wall_end_unix_ns,
+                unix_ns(WallScriptClock::wall_at(1)),
+                "end must be the single close sample"
+            );
+            assert_eq!(
+                cap.window_start_wall, acquired,
+                "Capture must reuse the one start edge"
+            );
+            assert_eq!(
+                cap.window_end_wall,
+                WallScriptClock::wall_at(1),
+                "Capture must reuse the one end edge"
+            );
+            assert_eq!(cap.document.window.requested_start_ns, 5_000_000_000);
         }
     }
 }
