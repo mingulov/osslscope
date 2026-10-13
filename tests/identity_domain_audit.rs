@@ -169,7 +169,7 @@ fn h5_t3_every_device_site_names_one_domain() {
         (
             "src/capture.rs",
             "stat",
-            "Ok(plan::read_file_bound(path).map(|f| (f.bytes, (f.dev, f.ino)))?)",
+            "plan::read_file_bounded(path, max_bytes).map(|f| (f.bytes, (f.dev, f.ino)))",
             1,
         ),
         // capture.rs: group device string (BackingRef, stat).
@@ -611,23 +611,21 @@ fn h5_t3_every_device_site_names_one_domain() {
             1,
         ),
         // plan.rs: bound/pinned reads encode fstat (raw, ×2).
+        // R14: the bound-read encode moved into
+        // `ReadBoundedSource::bound_identity` (same raw dev_t in,
+        // same encoded word out); the tear check now compares
+        // those encoded words (encode is injective, so equality
+        // is exact) and is no longer a greppable site.
         (
             "src/plan.rs",
             "raw",
-            "dev: encode_device(libc::major(before.dev()), libc::minor(before.dev())),",
+            "encode_device(libc::major(meta.dev()), libc::minor(meta.dev())),",
             1,
         ),
         (
             "src/plan.rs",
             "raw",
             "device: encode_device(libc::major(meta.dev()), libc::minor(meta.dev())),",
-            1,
-        ),
-        // plan.rs: tear check in raw dev_t.
-        (
-            "src/plan.rs",
-            "raw",
-            "if before.dev() != after.dev() || before.ino() != after.ino() || before.len() != after.len() {",
             1,
         ),
         // plan.rs: bound_bytes core (fstat word vs stat-decoded word).
