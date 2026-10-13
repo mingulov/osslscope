@@ -90,21 +90,44 @@ pub fn count_entry(ctx: ProbeContext) -> u32 {
     };
     let key = make_key(cookie as u32, gen);
     if let Some(slot) = COUNTS.get_ptr_mut(&key) {
-        let v = unsafe { &mut *slot };
-        // Fresh CPU slot (post-migration): stamp first touch — an
-        // ever-zero first_ns poisons the userspace min-fold.
-        if v.count == 0 {
-            v.first_ns = now;
-        }
-        v.count = v.count.saturating_add(1);
-        v.last_ns = now;
+        bump(slot, now);
         return 0;
     }
-    let fresh = CountValue { count: 1, first_ns: now, last_ns: now };
-    if COUNTS.insert(&key, &fresh, BPF_NOEXIST).is_err() {
+    // Fresh-key slow path (F05/R04): bounded zero-seed + relookup.
+    // Two CPUs can miss the same fresh key concurrently: both
+    // insert here, one wins and the other takes EEXIST — but the
+    // loser's per-CPU slot exists either way (a per-CPU hash
+    // shares keys across CPUs; the winner's entry is already
+    // visible), so the collision is recoverable: ignore the
+    // insert result and resolve through one ordinary relookup. A
+    // present slot counts this hit exactly once via the same
+    // single bump as the fast path; a still-absent slot is
+    // genuine exhaustion (map full) and stays DROPFAIL. No retry
+    // loop: one insert + one lookup per miss, then done. (Per-CPU
+    // keys are never removed, so a slot seen present cannot
+    // vanish before the bump below.)
+    let zero = CountValue { count: 0, first_ns: 0, last_ns: 0 };
+    let _ = COUNTS.insert(&key, &zero, BPF_NOEXIST);
+    if let Some(slot) = COUNTS.get_ptr_mut(&key) {
+        bump(slot, now);
+    } else {
         dropfail();
     }
     0
+}
+
+/// The one ordinary per-CPU increment, shared by the fast path
+/// and the slow-path relookup: stamp first touch (an ever-zero
+/// first_ns poisons the userspace min-fold — including a fresh
+/// zero-seeded slot), saturating-add one, stamp last.
+#[inline(always)]
+fn bump(slot: *mut CountValue, now: u64) {
+    let v = unsafe { &mut *slot };
+    if v.count == 0 {
+        v.first_ns = now;
+    }
+    v.count = v.count.saturating_add(1);
+    v.last_ns = now;
 }
 
 fn dropfail() {
