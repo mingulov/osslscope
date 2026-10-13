@@ -316,28 +316,117 @@ pub fn bound_bytes<'a>(
     Some(&fb.bytes)
 }
 
+/// Per-object read bound (R14): no single relevant-file read may
+/// hold more than this. Sized at the existing per-poll
+/// cache-budget ceiling (capture's `MAX_CACHED_BYTES`) so one
+/// object can never exceed the whole round's allowance on its own.
+/// This value is a proposed resource policy for R14, not a
+/// preexisting PRD maximum: an unusual legitimate object past this
+/// bound is refused with `ErrorKind::FileTooLarge`, its rows miss
+/// loud, and the run degrades to PARTIAL — never a completeness
+/// claim.
+pub const MAX_OBJECT_BYTES: usize = 128 * 1024 * 1024;
+
+/// A readable object with a stable identity (R14): the production
+/// source is an open `File` (fstat identity on the open file
+/// description — same pin semantics as the pre-R14 reader); tests
+/// inject scripted sources (mid-read growth, replacement) that no
+/// filesystem timing can produce deterministically.
+pub trait ReadBoundedSource: std::io::Read {
+    /// (encoded stat-domain device, inode, advertised length) of
+    /// the CURRENT object behind this source.
+    fn bound_identity(&self) -> std::io::Result<(u64, u64, u64)>;
+}
+
+impl ReadBoundedSource for std::fs::File {
+    fn bound_identity(&self) -> std::io::Result<(u64, u64, u64)> {
+        use std::os::unix::fs::MetadataExt as _;
+        let meta = self.metadata()?;
+        Ok((
+            encode_device(libc::major(meta.dev()), libc::minor(meta.dev())),
+            meta.ino(),
+            meta.len(),
+        ))
+    }
+}
+
+fn too_large(max_bytes: usize) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::FileTooLarge,
+        format!("file exceeds {max_bytes}-byte read bound"),
+    )
+}
+
+/// Bounded identity-bound read over an injected source (R14):
+/// fstat the source, refuse a huge advertised length BEFORE
+/// allocating, read at most `max_bytes + 1` (one
+/// overflow-detection byte, so a mid-read grower cannot slip
+/// past), then fstat identity/length again. Oversize (before or
+/// during) is `ErrorKind::FileTooLarge`; a mid-read
+/// identity/length change is `ErrorKind::InvalidData` (the
+/// pre-R14 tear refusal, unchanged). Never allocates from the
+/// advertised length.
+pub fn read_bounded_from<S: ReadBoundedSource>(
+    mut src: S,
+    max_bytes: usize,
+) -> std::io::Result<FileBytes> {
+    use std::io::Read as _;
+    let (dev, ino, advertised) = src.bound_identity()?;
+    // BEFORE: a huge advertised length refuses without reading a
+    // byte (a sparse multi-gigabyte file costs one fstat, not a
+    // multi-gigabyte Vec).
+    if advertised > max_bytes as u64 {
+        return Err(too_large(max_bytes));
+    }
+    // DURING: one overflow-detection byte past the cap; checked
+    // arithmetic (an unrepresentable bound refuses, never wraps).
+    let limit = u64::try_from(max_bytes)
+        .ok()
+        .and_then(|m| m.checked_add(1))
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("unrepresentable read bound {max_bytes}"),
+            )
+        })?;
+    let mut bytes = Vec::new();
+    // Borrowed take: the source stays owned for the after-fstat.
+    (&mut src).take(limit).read_to_end(&mut bytes)?;
+    if bytes.len() > max_bytes {
+        return Err(too_large(max_bytes));
+    }
+    // AFTER: same pin semantics as the pre-R14 reader — the object
+    // behind the source must be unchanged in identity and length,
+    // else the bytes may have torn across a replacement.
+    let (dev_after, ino_after, len_after) = src.bound_identity()?;
+    if dev != dev_after || ino != ino_after || advertised != len_after {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "file changed mid-read",
+        ));
+    }
+    Ok(FileBytes { bytes, dev, ino })
+}
+
+/// Identity-bound file read (F-A/A3), bounded (R14): open once,
+/// fstat/read/fstat on the open description — the bytes cannot tear
+/// across a replacement; a mid-read change (or unreadable path)
+/// fails instead of returning mixed bytes. Reads past `max_bytes`
+/// refuse with `ErrorKind::FileTooLarge` before and during the
+/// read; callers skip the path and count loud loss.
+pub fn read_file_bounded(path: &str, max_bytes: usize) -> std::io::Result<FileBytes> {
+    let file = std::fs::File::open(path)?;
+    read_bounded_from(file, max_bytes)
+        .map_err(|e| std::io::Error::new(e.kind(), format!("{path}: {e}")))
+}
+
 /// Identity-bound file read (F-A/A3): open once, fstat/read/fstat —
 /// the bytes cannot tear across a replacement; a mid-read change
 /// (or unreadable path) fails instead of returning mixed bytes.
+/// Capped at [`MAX_OBJECT_BYTES`] per object (R14); callers with a
+/// tighter remaining round budget prefer [`read_file_bounded`].
 pub fn read_file_bound(path: &str) -> std::io::Result<FileBytes> {
-    use std::io::Read as _;
-    use std::os::unix::fs::MetadataExt as _;
-    let mut file = std::fs::File::open(path)?;
-    let before = file.metadata()?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
-    let after = file.metadata()?;
-    if before.dev() != after.dev() || before.ino() != after.ino() || before.len() != after.len() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("{path} changed mid-read"),
-        ));
-    }
-    Ok(FileBytes {
-        bytes,
-        dev: encode_device(libc::major(before.dev()), libc::minor(before.dev())),
-        ino: before.ino(),
-    })
+    read_file_bounded(path, MAX_OBJECT_BYTES)
 }
 
 /// Plan every doc row against live mappings. `files` maps link-path
