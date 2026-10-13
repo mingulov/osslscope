@@ -155,6 +155,58 @@ fn collect_helpers(obj: &[u8]) -> Vec<(String, i32)> {
     out
 }
 
+/// File offset of the `CALLS` max_entries low byte in the
+/// `maps` section (for the S4 negative: bump 64 -> 65 in a COPY).
+/// The def record is the loader's 28-byte aya legacy shape with
+/// max_entries at +12; the 0x40 assertion fails loudly on layout
+/// drift instead of mutating the wrong byte.
+fn calls_max_entries_offset(obj: &[u8]) -> usize {
+    let elf = goblin::elf::Elf::parse(obj).expect("parse members.o");
+    let (idx, sh) = elf
+        .section_headers
+        .iter()
+        .enumerate()
+        .find(|(_, s)| &elf.shdr_strtab[s.sh_name] == "maps")
+        .unwrap_or_else(|| panic!("section maps missing"));
+    let sym = elf
+        .syms
+        .iter()
+        .find(|s| {
+            s.st_type() == goblin::elf::sym::STT_OBJECT
+                && s.st_shndx == idx
+                && elf.strtab.get_at(s.st_name) == Some("CALLS")
+        })
+        .expect("CALLS map sym present");
+    assert_eq!(sym.st_size as usize, 28, "CALLS def record is 7 x u32");
+    let off = sh.sh_offset as usize + sym.st_value as usize + 12;
+    assert_eq!(obj[off], 0x40, "CALLS max_entries low byte is 64");
+    off
+}
+
+/// File offset of the last `0` in the `member_000` strtab name (for
+/// the S2 negative: rename to `member_00x` in a COPY). Same length,
+/// NUL preserved, section headers and symtab untouched.
+fn member_000_name_offset(obj: &[u8]) -> usize {
+    let elf = goblin::elf::Elf::parse(obj).expect("parse members.o");
+    let strtab = elf
+        .section_headers
+        .iter()
+        .find(|s| &elf.shdr_strtab[s.sh_name] == ".strtab")
+        .expect(".strtab present");
+    let sym = elf
+        .syms
+        .iter()
+        .find(|s| {
+            s.st_type() == goblin::elf::sym::STT_FUNC
+                && elf.strtab.get_at(s.st_name) == Some("member_000")
+        })
+        .expect("member_000 sym present");
+    let off = strtab.sh_offset as usize + sym.st_name + "member_000".len() - 1;
+    assert_eq!(obj[off], b'0', "member_000 name ends in 0");
+    assert_eq!(obj[off + 1], 0, "member_000 NUL terminator intact");
+    off
+}
+
 /// File offset of the first helper-form call in `.text` (for the
 /// S5 negative: flip it to a forbidden id in a COPY of the
 /// object). `None` when `.text` is absent or call-free.
@@ -228,6 +280,52 @@ fn s2_names_sections() {
     }
 }
 
+/// S2-negative: a renamed required program symbol must fail
+/// `prepare` with the prog-missing error — not an ELF-parse error.
+/// Renames `member_000` -> `member_00x` in an in-memory COPY (one
+/// strtab byte; same length, NUL preserved, still parses) and pins
+/// the exact failure.
+#[test]
+fn s2_prog_sym_negative() {
+    let Some(obj) = object_bytes() else {
+        no_object();
+        return;
+    };
+    let off = member_000_name_offset(&obj);
+    let mut mutated = obj.clone();
+    mutated[off] = b'x';
+    assert_eq!(
+        obj.iter()
+            .zip(mutated.iter())
+            .filter(|(a, b)| a != b)
+            .count(),
+        1,
+        "exactly one byte differs (surgical prog-sym mutation)"
+    );
+    let elf = goblin::elf::Elf::parse(&mutated).expect("mutated object still parses");
+    let names: Vec<&str> = elf
+        .syms
+        .iter()
+        .filter_map(|s| elf.strtab.get_at(s.st_name))
+        .collect();
+    assert!(
+        !names.contains(&"member_000"),
+        "member_000 gone after rename"
+    );
+    assert!(
+        names.contains(&"member_00x"),
+        "member_00x present after rename"
+    );
+    let err = osslscope::loader::prepare(&mutated, &MEMBER_MAPS, &MEMBER_PROGS)
+        .err()
+        .expect("renamed member_000 must fail prepare");
+    assert_eq!(
+        err.to_string(),
+        "prog member_000 missing",
+        "specific prog-symbol failure"
+    );
+}
+
 /// S3: all 512 member bodies pairwise distinct (baking necessary
 /// condition — identical bodies would disprove baked slots; the
 /// live suite proves baking behaviorally).
@@ -286,6 +384,39 @@ fn s4_map_dims() {
             "map dims pinned"
         );
     }
+}
+
+/// S4-negative: a tampered required map definition must fail
+/// `prepare` with the map-dims error — not an ELF-parse error.
+/// Bumps the `CALLS` max_entries 64 -> 65 in an in-memory COPY (one
+/// byte; section headers and symtab untouched, still parses) and
+/// pins the exact failure.
+#[test]
+fn s4_map_dims_negative() {
+    let Some(obj) = object_bytes() else {
+        no_object();
+        return;
+    };
+    let off = calls_max_entries_offset(&obj);
+    let mut mutated = obj.clone();
+    mutated[off] = 0x41;
+    assert_eq!(
+        obj.iter()
+            .zip(mutated.iter())
+            .filter(|(a, b)| a != b)
+            .count(),
+        1,
+        "exactly one byte differs (surgical map-def mutation)"
+    );
+    goblin::elf::Elf::parse(&mutated).expect("mutated object still parses");
+    let err = osslscope::loader::prepare(&mutated, &MEMBER_MAPS, &MEMBER_PROGS)
+        .err()
+        .expect("tampered CALLS dims must fail prepare");
+    assert_eq!(
+        err.to_string(),
+        "map CALLS: dims [5, 4, 8, 65, 0] != spec [5, 4, 8, 64, 0]",
+        "specific map-definition failure"
+    );
 }
 
 /// S5: helper set pinned (raw bytes, exact, mains + `.text`
@@ -401,9 +532,13 @@ fn s7_retired_maps_absent() {
             .unwrap_or_else(|| panic!("{retired} dims known from HARVEST_MAPS"));
         let mut maps: Vec<MapSpec> = MEMBER_MAPS.to_vec();
         maps.push(spec);
-        assert!(
-            osslscope::loader::prepare(&obj, &maps, &MEMBER_PROGS).is_err(),
-            "{retired} must be absent from members.o"
+        let err = osslscope::loader::prepare(&obj, &maps, &MEMBER_PROGS)
+            .err()
+            .unwrap_or_else(|| panic!("{retired} must be absent from members.o"));
+        assert_eq!(
+            err.to_string(),
+            format!("map {retired} missing"),
+            "retired map fails for its absence, not any error"
         );
     }
 }
