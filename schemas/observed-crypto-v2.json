@@ -242,7 +242,7 @@
       "items": { "$ref": "#/$defs/engine_observation" }
     },
     "context": {
-      "description": "Execution context (R12, optional): host kernel release plus the wall-clock window edges in unix nanoseconds. Omitted when unrecorded. Context only: the monotonic window fields stay authoritative for durations and deadlines; wall edges may be null (explicit unknown) and may run backward across a clock adjustment without affecting verdicts.",
+      "description": "Execution context (R12, optional): host kernel release plus the wall-clock window edges in unix nanoseconds. Omitted when unrecorded. Context only: the monotonic window fields stay authoritative for durations and deadlines; wall edges may be null (explicit unknown) and may run backward across a clock adjustment without affecting verdicts. Old field readers ignore this key; strict validators pinned to a pre-R12 schema reject documents carrying it (expected).",
       "type": "object",
       "required": ["kernel_release", "wall_start_unix_ns", "wall_end_unix_ns"],
       "additionalProperties": false,
