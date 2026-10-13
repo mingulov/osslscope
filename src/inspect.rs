@@ -155,6 +155,33 @@ pub fn is_partial_doc(doc: &serde_json::Value) -> bool {
     doc.get("status").and_then(|s| s.as_str()) == Some("PARTIAL")
 }
 
+// Production harvest-invocation spy (R07/F08 ordering proof).
+// Thread-local so parallel tests never observe each other's
+// setup calls; each test resets its own thread's counter first.
+thread_local! {
+    static HARVEST_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Number of production harvest invocations observed on the
+/// calling thread since the last [`reset_harvest_calls`]. Only
+/// [`run`] fires it, exactly once per call that passes admission
+/// and reaches [`harvest::run`] (whose first effect is reading
+/// the provider file) — injected harvests via [`run_with`] and
+/// usage/2 rejections never fire it.
+pub fn harvest_calls() -> usize {
+    HARVEST_CALLS.with(|c| c.get())
+}
+
+/// Reset the calling thread's production-harvest counter (test
+/// seam; production [`run`] never resets).
+pub fn reset_harvest_calls() {
+    HARVEST_CALLS.with(|c| c.set(0));
+}
+
+fn note_harvest_call() {
+    HARVEST_CALLS.with(|c| c.set(c.get().saturating_add(1)));
+}
+
 /// Production artifact emitter (R07 seam): serialize the harvest
 /// document (pretty JSON, trailing newline) and deliver it to
 /// `--out` or stdout. `run()` passes a live stdout; tests pass real
@@ -245,5 +272,12 @@ pub fn run(args: &[String]) -> ExitCode {
         let mut locked = stdout.lock();
         emit_doc(doc, out.as_deref(), &mut locked)
     };
-    run_with(&cfg, harvest::run, emit)
+    run_with(
+        &cfg,
+        |c| {
+            note_harvest_call();
+            harvest::run(c)
+        },
+        emit,
+    )
 }
