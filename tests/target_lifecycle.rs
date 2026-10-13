@@ -6,8 +6,9 @@
 
 use osslscope::target::{
     __test_set_control_worker_counter, __test_set_fail_fork, __test_set_prestop_pid_sink,
-    __test_set_prestop_stall_ms, __test_set_publish_gate, __test_set_setup_delay_ms,
-    __test_set_truncate_delay_ms, CustodyState, OwnedTarget, TargetDisposition, WorkloadDest,
+    __test_set_prestop_stall_ms, __test_set_publish_gate, __test_set_rename_hold_ms,
+    __test_set_rename_hold_ready, __test_set_setup_delay_ms, __test_set_truncate_delay_ms,
+    CustodyState, OwnedTarget, TargetDisposition, WorkloadDest,
 };
 use std::time::{Duration, Instant};
 
@@ -489,6 +490,63 @@ fn r06_spawn_async(
         __test_set_prestop_stall_ms(stall_ms);
         __test_set_prestop_pid_sink(Some(sink_c));
         let r = OwnedTarget::spawn_stopped_with_control(&argv, dest, deadline, cancel.flag());
+        __test_set_prestop_pid_sink(None);
+        __test_set_prestop_stall_ms(0);
+        let _ = tx.send(r);
+    });
+    (worker, sink, rx)
+}
+
+/// Setup-hook bundle for a supervised spawn (fix round 5): the setup
+/// hooks are thread-local to the thread calling `spawn_stopped_with_control`,
+/// so a supervised (async) spawn must arm them on its worker thread, not the
+/// test thread. All armed before the call, all reset after (every path).
+#[derive(Default)]
+struct R06SetupHooks {
+    setup_delay_ms: u64,
+    truncate_delay_ms: u64,
+    publish_gate: Option<(Arc<AtomicBool>, Arc<AtomicBool>)>,
+    rename_hold_ms: u64,
+    rename_hold_ready: Option<Arc<AtomicBool>>,
+    worker_counter: Option<Arc<AtomicU32>>,
+}
+
+/// Supervised spawn with setup hooks armed on the worker thread (fix round
+/// 5): same independence guarantees as [`r06_spawn_async`] (own join bound,
+/// exact-pid discipline, never hangs the runner), plus worker-side setup
+/// instrumentation for tests that must act mid-setup (retry during a poised
+/// worker, cancel during a post-check hold).
+fn r06_spawn_async_setup(
+    argv: Vec<String>,
+    dest: WorkloadDest,
+    deadline: Instant,
+    cancel: R06Cancel,
+    stall_ms: u64,
+    setup: R06SetupHooks,
+) -> (
+    std::thread::JoinHandle<()>,
+    Arc<AtomicU32>,
+    mpsc::Receiver<anyhow::Result<OwnedTarget>>,
+) {
+    let sink = Arc::new(AtomicU32::new(0));
+    let sink_c = sink.clone();
+    let (tx, rx) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        __test_set_prestop_stall_ms(stall_ms);
+        __test_set_prestop_pid_sink(Some(sink_c));
+        __test_set_setup_delay_ms(setup.setup_delay_ms);
+        __test_set_truncate_delay_ms(setup.truncate_delay_ms);
+        __test_set_publish_gate(setup.publish_gate);
+        __test_set_rename_hold_ms(setup.rename_hold_ms);
+        __test_set_rename_hold_ready(setup.rename_hold_ready);
+        __test_set_control_worker_counter(setup.worker_counter);
+        let r = OwnedTarget::spawn_stopped_with_control(&argv, dest, deadline, cancel.flag());
+        __test_set_control_worker_counter(None);
+        __test_set_rename_hold_ready(None);
+        __test_set_rename_hold_ms(0);
+        __test_set_publish_gate(None);
+        __test_set_truncate_delay_ms(0);
+        __test_set_setup_delay_ms(0);
         __test_set_prestop_pid_sink(None);
         __test_set_prestop_stall_ms(0);
         let _ = tx.send(r);
@@ -1600,6 +1658,367 @@ fn abandoned_late_worker_never_truncates_successor() {
         .collect();
     names.sort();
     assert_eq!(names, vec!["workload.log".to_string()]);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn abandonment_bounded_with_stuck_worker() {
+    // Fix round 5 / (i): abandonment returns within the deadline no matter
+    // where the prep worker is stuck — the caller path takes no lock and
+    // performs no blocking file syscalls (bounded by construction). Leg A
+    // parks the worker before its first check; leg C parks it after its
+    // final check (the re-reviewer's descheduled-after-check shape). The
+    // pre-final-check pause stays pinned by
+    // `abandoned_late_worker_never_truncates_successor` (preserved).
+    //
+    // Leg A (stuck pre-check): the worker is deterministically delayed
+    // (2s) past a 300ms setup deadline; the caller must fail fast.
+    let dir = r06_scratch("stuck-worker");
+    let log = dir.join("workload.log");
+    std::fs::write(&log, b"original\n").unwrap();
+    let sentinel = dir.join("SENTINEL");
+    let argv = r06_sentinel_argv(&sentinel);
+    let cancel = AtomicBool::new(false);
+    let counter = Arc::new(AtomicU32::new(0));
+    let pid_sink = Arc::new(AtomicU32::new(0));
+    __test_set_control_worker_counter(Some(counter.clone()));
+    __test_set_setup_delay_ms(2000);
+    __test_set_prestop_pid_sink(Some(pid_sink.clone()));
+    let t0 = Instant::now();
+    let result = OwnedTarget::spawn_stopped_with_control(
+        &argv,
+        WorkloadDest::File(log.clone()),
+        Instant::now() + Duration::from_millis(300),
+        &cancel,
+    );
+    let elapsed = t0.elapsed();
+    __test_set_setup_delay_ms(0);
+    __test_set_control_worker_counter(None);
+    __test_set_prestop_pid_sink(None);
+    let msg = match result {
+        Err(e) => e.to_string(),
+        Ok(t) => r06_unexpected_child(t, "expired setup must fail"),
+    };
+    assert!(msg.contains("deadline"), "caller abandoned: {msg}");
+    assert!(msg.contains("no child spawned"), "nothing forked: {msg}");
+    assert_eq!(pid_sink.load(Ordering::SeqCst), 0, "no fork may happen");
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "caller must not wait out a stuck worker (took {elapsed:?})"
+    );
+    std::fs::write(&log, b"successor-bytes\n").unwrap();
+    let end = Instant::now() + Duration::from_secs(10);
+    while counter.load(Ordering::SeqCst) < 1 {
+        assert!(Instant::now() < end, "worker never finished");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        std::fs::read(&log).unwrap(),
+        b"successor-bytes\n",
+        "late worker must never truncate post-abandonment bytes"
+    );
+    assert!(!sentinel.exists(), "sentinel must never execute");
+    //
+    // Leg C (stuck post-final-check): the worker passes every check while
+    // live, then sleeps 6s between its final abandonment check and the
+    // rename — the exact descheduled-after-check / blocked-inside-rename
+    // shape. The caller cancels during the hold and must return within its
+    // bound anyway; an OUR-setup retry during the hold must refuse (the
+    // registry fences even this window). Every ordering is gate-enforced
+    // except the 6s hold itself, which dwarfs the ~ms caller actions.
+    let log_c = dir.join("post-check.log");
+    std::fs::write(&log_c, b"original\n").unwrap();
+    let argv_c = r06_sentinel_argv(&sentinel);
+    let hold_ready = Arc::new(AtomicBool::new(false));
+    let counter_c = Arc::new(AtomicU32::new(0));
+    let cancel_c = Arc::new(AtomicBool::new(false));
+    let (worker, sink_c, rx) = r06_spawn_async_setup(
+        argv_c,
+        WorkloadDest::File(log_c.clone()),
+        Instant::now() + Duration::from_secs(60),
+        R06Cancel::Shared(cancel_c.clone()),
+        0,
+        R06SetupHooks {
+            rename_hold_ms: 6000,
+            rename_hold_ready: Some(hold_ready.clone()),
+            worker_counter: Some(counter_c.clone()),
+            ..R06SetupHooks::default()
+        },
+    );
+    let end = Instant::now() + Duration::from_secs(10);
+    while !hold_ready.load(Ordering::SeqCst) {
+        assert!(Instant::now() < end, "worker never reached post-check hold");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // The worker is now stuck past its final check. Cancel and prove the
+    // caller stays bounded.
+    let t0 = Instant::now();
+    cancel_c.store(true, Ordering::SeqCst);
+    let result = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("caller returns despite the stuck worker");
+    let elapsed = t0.elapsed();
+    let msg = match result {
+        Err(e) => e.to_string(),
+        Ok(t) => r06_unexpected_child(t, "cancelled setup must fail"),
+    };
+    assert!(msg.contains("cancelled"), "caller abandoned: {msg}");
+    assert!(msg.contains("no child spawned"), "nothing forked: {msg}");
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "caller must not wait out a post-check stuck worker (took {elapsed:?})"
+    );
+    // Still inside the 6s hold: an OUR-setup retry must refuse without
+    // writing (registry fencing covers the post-check window too).
+    let before: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    let retry_cancel = AtomicBool::new(false);
+    match OwnedTarget::spawn_stopped_with_control(
+        &r06_sentinel_argv(&sentinel),
+        WorkloadDest::File(log_c.clone()),
+        Instant::now() + Duration::from_secs(5),
+        &retry_cancel,
+    ) {
+        Err(e) => {
+            let msg = e.to_string();
+            assert!(msg.contains("in flight"), "refusal names fencing: {msg}");
+            assert!(msg.contains("no child spawned"), "nothing forked: {msg}");
+        }
+        Ok(mut t) => {
+            let pid = t.pid();
+            t.resolve_setup_failure().unwrap();
+            assert_reaped_no_zombie(pid);
+            panic!("retry must refuse while the prior worker is live, but spawned pid {pid}");
+        }
+    }
+    let mut after: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    let mut before_sorted = before.clone();
+    before_sorted.sort();
+    after.sort();
+    assert_eq!(before_sorted, after, "refused retry writes nothing");
+    worker.join().unwrap();
+    assert_eq!(sink_c.load(Ordering::SeqCst), 0, "no fork may happen");
+    // Quiesce the stuck worker, then pin the documented residual honestly:
+    // a worker descheduled after its final check still publishes on resume
+    // (no userspace conditional-rename exists) — but no OUR bytes were at
+    // risk in that window (the retry above refused), so only concurrent
+    // EXTERNAL writers are unfenced.
+    let end = Instant::now() + Duration::from_secs(15);
+    while counter_c.load(Ordering::SeqCst) < 1 {
+        assert!(Instant::now() < end, "worker never finished");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        std::fs::read(&log_c).unwrap(),
+        b"",
+        "post-check hold documents the residual: the resumed worker publishes"
+    );
+    assert!(!sentinel.exists(), "sentinel must never execute");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn retry_setup_refuses_while_prior_worker_live() {
+    // Fix round 5 / (ii): a process-wide per-destination setup registry —
+    // a new OUR-setup for a path with a still-live prior worker REFUSES
+    // instead of writing concurrently (this closes OUR-retry successor
+    // races structurally). The first worker poises pre-publish; the retry
+    // must refuse without writing; after the first worker quiesces, a
+    // successor setup runs normally (fencing is live-worker-scoped).
+    let dir = r06_scratch("registry-fence");
+    let log = dir.join("workload.log");
+    std::fs::write(&log, b"original\n").unwrap();
+    let sentinel = dir.join("SENTINEL");
+    let argv = r06_sentinel_argv(&sentinel);
+    let ready = Arc::new(AtomicBool::new(false));
+    let proceed = Arc::new(AtomicBool::new(false));
+    let counter = Arc::new(AtomicU32::new(0));
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (worker, sink, rx) = r06_spawn_async_setup(
+        argv,
+        WorkloadDest::File(log.clone()),
+        Instant::now() + Duration::from_secs(60),
+        R06Cancel::Shared(cancel.clone()),
+        0,
+        R06SetupHooks {
+            publish_gate: Some((ready.clone(), proceed.clone())),
+            worker_counter: Some(counter.clone()),
+            ..R06SetupHooks::default()
+        },
+    );
+    let end = Instant::now() + Duration::from_secs(10);
+    while !ready.load(Ordering::SeqCst) {
+        assert!(Instant::now() < end, "worker never poised at publish");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // The prior worker is live (poised, registered). The retry must refuse
+    // fast, fork nothing, and write nothing — not even staging.
+    let mut before: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    before.sort();
+    let retry_cancel = AtomicBool::new(false);
+    let t0 = Instant::now();
+    let retry = OwnedTarget::spawn_stopped_with_control(
+        &r06_sentinel_argv(&sentinel),
+        WorkloadDest::File(log.clone()),
+        Instant::now() + Duration::from_secs(5),
+        &retry_cancel,
+    );
+    let elapsed = t0.elapsed();
+    match retry {
+        Err(e) => {
+            let msg = e.to_string();
+            assert!(msg.contains("in flight"), "refusal names fencing: {msg}");
+            assert!(msg.contains("no child spawned"), "nothing forked: {msg}");
+        }
+        Ok(mut t) => {
+            let pid = t.pid();
+            t.resolve_setup_failure().unwrap();
+            assert_reaped_no_zombie(pid);
+            panic!("retry must refuse while the prior worker is live, but spawned pid {pid}");
+        }
+    }
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "refusal must fail fast (took {elapsed:?})"
+    );
+    assert_eq!(
+        std::fs::read(&log).unwrap(),
+        b"original\n",
+        "refused retry writes nothing"
+    );
+    let mut after: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    after.sort();
+    assert_eq!(before, after, "refused retry creates nothing");
+    // Abandon the first setup BEFORE releasing its worker (strictly
+    // ordered: the lock-free caller returns while the worker is still
+    // gated, so the worker must observe abandonment at its final check):
+    // it must publish nothing and delete only its own staging.
+    cancel.store(true, Ordering::SeqCst);
+    let result = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("first setup returns after abandonment");
+    let msg = match result {
+        Err(e) => e.to_string(),
+        Ok(t) => r06_unexpected_child(t, "cancelled setup must fail"),
+    };
+    assert!(msg.contains("cancelled"), "caller abandoned: {msg}");
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        0,
+        "worker still gated at abandonment"
+    );
+    proceed.store(true, Ordering::SeqCst);
+    worker.join().unwrap();
+    assert_eq!(sink.load(Ordering::SeqCst), 0, "no fork may happen");
+    let end = Instant::now() + Duration::from_secs(10);
+    while counter.load(Ordering::SeqCst) < 1 {
+        assert!(Instant::now() < end, "worker never finished");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        std::fs::read(&log).unwrap(),
+        b"original\n",
+        "abandoned worker publishes nothing"
+    );
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    assert_eq!(names, vec!["workload.log".to_string()], "no staging litter");
+    assert!(!sentinel.exists(), "sentinel must never execute");
+    // After quiescence the fence lifts: a successor OUR-setup runs the full
+    // path (publish + fork + workload output).
+    let idle = AtomicBool::new(false);
+    let mut t = OwnedTarget::spawn_stopped_with_control(
+        &sentinel_argv(),
+        WorkloadDest::File(log.clone()),
+        Instant::now() + Duration::from_secs(30),
+        &idle,
+    )
+    .expect("successor setup runs after quiescence");
+    let pid = t.pid();
+    t.release().unwrap();
+    assert_eq!(wait_for_exit(&mut t, Duration::from_secs(5)), Some(0));
+    assert_reaped_no_zombie(pid);
+    assert_eq!(
+        std::fs::read(&log).unwrap(),
+        b"H9-OUT-S\nH9-ERR-S\n",
+        "successor output lands byte-identical"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn staging_namespace_dest_refused_before_creating() {
+    // Fix round 5 / (iv): staging paths are provably distinct from the
+    // destination — any destination whose file name lies in the staging
+    // namespace is refused BEFORE creating anything (no staging, no
+    // validation fd, no child), so abandoned cleanup can never alias it.
+    let dir = r06_scratch("staging-collision");
+    let sentinel = dir.join("SENTINEL");
+    let idle = AtomicBool::new(false);
+    let pid_sink = Arc::new(AtomicU32::new(0));
+    __test_set_prestop_pid_sink(Some(pid_sink.clone()));
+    // Leg 1: absent destination in the staging namespace.
+    let absent = dir.join(".osslscope-staging-probe-1");
+    let result = OwnedTarget::spawn_stopped_with_control(
+        &r06_sentinel_argv(&sentinel),
+        WorkloadDest::File(absent.clone()),
+        Instant::now() + Duration::from_secs(5),
+        &idle,
+    );
+    let msg = match result {
+        Err(e) => e.to_string(),
+        Ok(t) => r06_unexpected_child(t, "staging-namespace dest must be refused"),
+    };
+    assert!(msg.contains("staging"), "refusal names staging: {msg}");
+    assert!(msg.contains("no child spawned"), "nothing forked: {msg}");
+    assert!(!absent.exists(), "refused setup creates nothing");
+    // Leg 2: existing destination in the staging namespace keeps its bytes.
+    let present = dir.join(".osslscope-staging-probe-2");
+    std::fs::write(&present, b"precious\n").unwrap();
+    let result = OwnedTarget::spawn_stopped_with_control(
+        &r06_sentinel_argv(&sentinel),
+        WorkloadDest::File(present.clone()),
+        Instant::now() + Duration::from_secs(5),
+        &idle,
+    );
+    let msg = match result {
+        Err(e) => e.to_string(),
+        Ok(t) => r06_unexpected_child(t, "staging-namespace dest must be refused"),
+    };
+    assert!(msg.contains("staging"), "refusal names staging: {msg}");
+    assert!(msg.contains("no child spawned"), "nothing forked: {msg}");
+    assert_eq!(
+        std::fs::read(&present).unwrap(),
+        b"precious\n",
+        "refused setup touches nothing"
+    );
+    __test_set_prestop_pid_sink(None);
+    assert_eq!(pid_sink.load(Ordering::SeqCst), 0, "no fork may happen");
+    assert!(!sentinel.exists(), "sentinel must never execute");
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec![".osslscope-staging-probe-2".to_string()],
+        "nothing created beside the pre-existing file"
+    );
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
