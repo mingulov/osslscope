@@ -204,6 +204,12 @@ tables by op id only — no diagnostic prints raw array addresses
   as cookie/provider/op/funcid/`alg_class`/offset/count/first/last
   plus aliases, adopted `legacy` block plus executed-weak rollup,
   fenced generations, `drain_wall_us`, optional `child_exit`.
+- Optional `engine_observations` (R05, rendered only when observed):
+  per-observation pinned caller-module triple (object fingerprint,
+  encoded device, inode), stub file offset, binding generation,
+  frozen-registry entrypoint index + display name, window
+  (`in-window`/`pre-window`/`untimed`), untimed call count. No
+  timestamps, no target strings, no runtime addresses.
 - Human output renders the same fields plus fixed doctrine notes.
 - Runtime addresses are absent; offsets are file offsets.
 
@@ -213,7 +219,12 @@ tables by op id only — no diagnostic prints raw array addresses
   unseen deny providers, parameter-blind caveat, KAT caveat.
 - Each violation carries rule/matcher/identity plus the same
   capture-level actionability tuple: window, cmdline, container,
-  image, provider path/build-id.
+  image, provider path/build-id. ENGINE-plane violations carry the
+  observation key (object/device/inode/offset), generation,
+  entrypoint index + name, untimed flag, and calls — the same
+  allowlisted triple shape as sites, never raw addresses.
+- Per-rule `engine_evidence` refs (R05, rendered only when present):
+  the resolving observation key plus generation/entrypoint/calls.
 - No verdict on fatal evidence.
 
 CBOM:
@@ -221,6 +232,10 @@ CBOM:
 - CycloneDX 1.6 `cryptographic-asset` components derived only from
   executed identities, provider object/build-id, op display names,
   counts, generation, window edges, and completeness.
+- Optional engine metadata (R05, rendered only when observed):
+  `osslscope:engine-observations` (count) and
+  `osslscope:engine-in-window-calls` (count). Counts only, no
+  identities.
 - No key sizes, modes, primitives, parameters, or secret metadata.
 
 `alias-audit`:
