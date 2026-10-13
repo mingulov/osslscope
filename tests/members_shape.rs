@@ -93,6 +93,64 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
     h
 }
 
+fn has_section(obj: &[u8], section: &str) -> bool {
+    let elf = goblin::elf::Elf::parse(obj).expect("parse members.o");
+    elf.section_headers
+        .iter()
+        .any(|s| &elf.shdr_strtab[s.sh_name] == section)
+}
+
+/// (func name, helper id) pairs across the mains sections PLUS
+/// the shared-subprogram section (`.text`): `walk_dispatch` /
+/// `classify_alg` / `emit_*` live there, so a mains-only scan
+/// would miss a forbidden helper reachable only via `.text` (an
+/// in-memory 181 mutation in `.text` passed the old scan).
+/// `.text` joins when present; a fully-inlining toolchain would
+/// leave no `.text`, and then the mains scan is already complete.
+fn collect_helpers(obj: &[u8]) -> Vec<(String, i32)> {
+    let mut out = Vec::new();
+    for section in ["uprobe", "uretprobe"] {
+        for (name, bytes) in section_mains(obj, section) {
+            for id in helper_calls(&bytes) {
+                out.push((name.clone(), id));
+            }
+        }
+    }
+    if has_section(obj, ".text") {
+        for (name, bytes) in section_mains(obj, ".text") {
+            for id in helper_calls(&bytes) {
+                out.push((format!(".text:{name}"), id));
+            }
+        }
+    }
+    out
+}
+
+/// File offset of the first helper-form call in `.text` (for the
+/// S5 negative: flip it to a forbidden id in a COPY of the
+/// object). `None` when `.text` is absent or call-free.
+fn first_text_call_offset(obj: &[u8]) -> Option<usize> {
+    let elf = goblin::elf::Elf::parse(obj).expect("parse members.o");
+    let sh = elf
+        .section_headers
+        .iter()
+        .find(|s| &elf.shdr_strtab[s.sh_name] == ".text")?;
+    let base = sh.sh_offset as usize;
+    let sec = &obj[base..base + sh.sh_size as usize];
+    let mut i = 0;
+    while i + 8 <= sec.len() {
+        if sec[i] == 0x18 {
+            i += 16;
+            continue;
+        }
+        if sec[i] == 0x85 && sec[i + 1] >> 4 == 0 {
+            return Some(base + i);
+        }
+        i += 8;
+    }
+    None
+}
+
 #[test]
 fn scanner_unit() {
     // call 112 (helper form) then ld_imm64 (16B, must be skipped,
@@ -191,9 +249,10 @@ fn s4_map_dims() {
     }
 }
 
-/// S5: helper set pinned (raw bytes, exact): map_lookup (1),
-/// map_update (2), get_current_pid_tgid (14), probe_read_user
-/// (112), probe_read_user_str (114), ringbuf_reserve (131),
+/// S5: helper set pinned (raw bytes, exact, mains + `.text`
+/// subprograms): map_lookup (1), map_update (2),
+/// get_current_pid_tgid (14), probe_read_user (112),
+/// probe_read_user_str (114), ringbuf_reserve (131),
 /// ringbuf_submit (132), get_attach_cookie (174) — and nothing
 /// else. In particular: no tail_call (12 — members never chain),
 /// no ringbuf_query (134 — entry-only per §5.4), no bpf_loop
@@ -210,21 +269,47 @@ fn s5_no_forbidden_helpers() {
     const FORBIDDEN: [i32; 3] = [12, 134, 181];
     const PINNED: [i32; 8] = [1, 2, 14, 112, 114, 131, 132, 174];
     let mut observed: HashSet<i32> = HashSet::new();
-    for section in ["uprobe", "uretprobe"] {
-        for (name, bytes) in section_mains(&obj, section) {
-            for id in helper_calls(&bytes) {
-                observed.insert(id);
-                assert!(
-                    !FORBIDDEN.contains(&id),
-                    "{name}: forbidden helper {id} (12=tail 134=rbq 181=loop)"
-                );
-            }
-        }
+    for (name, id) in collect_helpers(&obj) {
+        observed.insert(id);
+        assert!(
+            !FORBIDDEN.contains(&id),
+            "{name}: forbidden helper {id} (12=tail 134=rbq 181=loop)"
+        );
     }
     let mut obs: Vec<i32> = observed.into_iter().collect();
     obs.sort_unstable();
     eprintln!("members helpers observed: {obs:?}");
     assert_eq!(obs, PINNED, "member helper set pinned (review any drift)");
+}
+
+/// S5-negative: a forbidden helper smuggled into `.text` must
+/// trip the scan. Flips the first `.text` helper-form call to 181
+/// (bpf_loop) in an in-memory COPY and asserts the collector
+/// reports it from a `.text` func. SKIPs labeled when `.text` is
+/// absent (same tolerance as S5); FAILs when `.text` exists but
+/// has no helper-form call (the negative needs a call site).
+#[test]
+fn s5_dottext_negative() {
+    let Some(obj) = object_bytes() else {
+        eprintln!("SKIP(members-object): OSSL_MEMBERS_OBJECT unset");
+        return;
+    };
+    let Some(off) = first_text_call_offset(&obj) else {
+        eprintln!("SKIP(s5-negative): no .text helper-form call to mutate");
+        return;
+    };
+    let mut mutated = obj.clone();
+    mutated[off + 4..off + 8].copy_from_slice(&181i32.to_le_bytes());
+    let hits: Vec<(String, i32)> = collect_helpers(&mutated)
+        .into_iter()
+        .filter(|(_, id)| *id == 181)
+        .collect();
+    assert_eq!(hits.len(), 1, "exactly the smuggled 181 is reported");
+    assert!(
+        hits[0].0.starts_with(".text:"),
+        "smuggled 181 attributed to .text, got {}",
+        hits[0].0
+    );
 }
 
 /// S6: per-member size sanity cap + records (the real xlated

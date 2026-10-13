@@ -359,8 +359,9 @@ macro_rules! def_member {
             if $j == MAX_ALGS - 1 {
                 let tail =
                     unsafe { helpers::bpf_probe_read_user((rv + MAX_ALGS * 32) as *const u64) };
-                if !matches!(tail, Ok(0)) {
-                    flag_trunc(op as u32, TRUNC_ALGS);
+                match tail {
+                    Ok(0) => {}
+                    _ => flag_trunc(op as u32, TRUNC_ALGS),
                 }
             }
             if imp == 0 {
@@ -370,7 +371,7 @@ macro_rules! def_member {
                 return 0;
             }
             // Kernel scratch only: classified below, never emitted.
-            let mut name_buf = [0u8; ALG_WINDOW];
+            let mut name_buf = [0u8; 128];
             let slice = match unsafe {
                 helpers::bpf_probe_read_user_str_bytes(names as *const u8, &mut name_buf)
             } {

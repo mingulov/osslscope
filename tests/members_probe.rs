@@ -36,8 +36,9 @@ use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 const OP: u32 = 1;
 const QUERIES: usize = 3;
 /// `MADV_PAGEOUT` (21, Linux 5.4+ — uapi asm-generic/mman-common.h):
-/// reclaim own pages (memfd page-cache eviction needs no swap, no
-/// privilege). Local const, not libc-version-coupled.
+/// reclaim own pages (evicting populated memfd pages needs swap —
+/// swapless lanes take the labeled SKIP instead; no privilege
+/// needed). Local const, not libc-version-coupled.
 const MADV_PAGEOUT: libc::c_int = 21;
 
 fn gated() -> Option<PathBuf> {
@@ -408,7 +409,13 @@ impl Fixture {
             })
             .sum();
         let array_len = n_array * size_of::<FakeAlg>();
-        let total = array_len + names_len + disp_len;
+        // The dispatch region must be FakeDispatch-aligned:
+        // `write_slot` uses `ptr::write` (alignment-required) and
+        // names are variable-length, so an unpadded cursor is UB
+        // (observed %8==3 on E7). All tables then stay aligned
+        // (each advances the cursor by a multiple of 16).
+        let disp_base = (array_len + names_len).next_multiple_of(align_of::<FakeDispatch>());
+        let total = disp_base + disp_len;
         let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
         let len = total.div_ceil(page) * page;
         let fd = unsafe {
@@ -430,7 +437,7 @@ impl Fixture {
         };
         let base = fd.1 as u64;
         let mut name_off = array_len;
-        let mut disp_off = array_len + names_len;
+        let mut disp_off = disp_base;
         // The terminator cell (right after the live prefix) stays
         // zero (memfd starts zeroed); tail entries (if any) are
         // planted after it.
@@ -476,6 +483,11 @@ impl Fixture {
                 0
             } else {
                 let dptr = base + *disp_off as u64;
+                assert_eq!(
+                    dptr as usize % align_of::<FakeDispatch>(),
+                    0,
+                    "dispatch table alignment (ptr::write requires it)"
+                );
                 for (k, (fid, fptr)) in s.dispatch.iter().enumerate() {
                     let e = (dptr as *mut FakeDispatch).add(k);
                     std::ptr::write(
@@ -835,10 +847,13 @@ fn run_e7_pageout(obj: &std::path::Path, exe: &std::ffi::CString, off: u64, fx: 
     assert_abort_clean(&loaded, &algs, &rows, QUERIES as u64, "e7-cold");
 }
 
-/// Shared read-abort oracle (pageout-cold + munmap-hole): every
-/// slot read fails, so TRUNC holds WALK_READ alone, the ring stays
-/// empty, member 0 still counts (its bump precedes the slot read),
-/// and nothing is lost.
+/// Shared read-abort oracle (pageout-cold + munmap-hole).
+/// Pageout-cold evicts the whole fixture, so every slot read
+/// fails; the munmap-hole unmaps only the live prefix's page while
+/// the mapped zero tail reads fine and stays silent (names==0).
+/// Either way TRUNC holds WALK_READ alone, the ring stays empty,
+/// member 0 still counts (its bump precedes the slot read), and
+/// nothing is lost.
 fn assert_abort_clean(
     loaded: &Loaded,
     algs: &[osslscope_ebpf_common::AlgEvent],
@@ -865,12 +880,32 @@ fn assert_abort_clean(
 }
 
 /// Null queries (rv == 0) stay silent and uncounted (v1 returns
-/// before CALLS; member-0 QUERY_RET-EMPTY is item 3).
+/// before CALLS; member-0 QUERY_RET-EMPTY is item 3). A positive
+/// control fires through the SAME links first: a dead attach would
+/// otherwise satisfy every null assert vacuously (T03 demands
+/// positive fire evidence per firing leg).
 fn run_null(obj: &std::path::Path, exe: &std::ffi::CString, off: u64) {
+    let fx = Fixture::build(&e7_slots(), &[]);
+    fx.pretouch();
     let loaded = load_members(obj);
-    FIXTURE_ARRAY.store(0, Ordering::SeqCst);
+    populate_alg_class(&loaded, &fx.classes);
     NS_VERDICT.store(0, Ordering::SeqCst);
     let _links = attach_all(&loaded, exe, off, None);
+    // Positive control: one live query proves these links fire.
+    FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
+    fire(OP as i32, 1);
+    let (algs, rows) = drain(&loaded);
+    assert_eq!(
+        read_percpu(&loaded, "CALLS", OP, false),
+        1,
+        "null-leg control: live query counted"
+    );
+    assert!(
+        !algs.is_empty() && !rows.is_empty(),
+        "null-leg control: live query emits"
+    );
+    // Null phase: silence, and the count stays at the control's 1.
+    FIXTURE_ARRAY.store(0, Ordering::SeqCst);
     fire(OP as i32, 2);
     let (algs, rows) = drain(&loaded);
     assert!(
@@ -879,8 +914,8 @@ fn run_null(obj: &std::path::Path, exe: &std::ffi::CString, off: u64) {
     );
     assert_eq!(
         read_percpu(&loaded, "CALLS", OP, false),
-        0,
-        "null queries uncounted"
+        1,
+        "null queries uncounted (control count unchanged)"
     );
     assert_loss_zero(&loaded);
 }
@@ -954,6 +989,19 @@ fn l3_boundaries() {
         }
         let r0: Vec<_> = rows.iter().filter(|r| r.idx == 0).collect();
         assert_eq!(r0.len(), 4, "slot-0 ROWs 2 legs × 2");
+        for (k, (fid, fptr)) in [(31u32, 0x4300u64), (32, 0x4301)].iter().enumerate() {
+            let n = r0
+                .iter()
+                .filter(|r| {
+                    r.funcid == *fid
+                        && r.addr == *fptr
+                        && r.aux == fx.array
+                        && r.op == OP
+                        && r.generation == 0
+                })
+                .count();
+            assert_eq!(n, 2, "slot-0 leg {k} exact");
+        }
         assert_loss_zero(&loaded);
     }
     // Adjacent tail: 3 live + term@3 + 3 planted @4..6. Prefix
@@ -992,15 +1040,29 @@ fn l3_boundaries() {
         let (algs, rows) = drain(&loaded);
         assert_eq!(read_percpu(&loaded, "CALLS", OP, false), 2);
         for j in 0..3u64 {
-            assert_eq!(
-                algs.iter().filter(|a| a.idx == j).count(),
-                2,
-                "prefix slot {j} exact"
+            let got: Vec<_> = algs.iter().filter(|a| a.idx == j).collect();
+            assert_eq!(got.len(), 2, "prefix slot {j} exact");
+            assert!(
+                got.iter().all(|a| {
+                    a.op == OP
+                        && a.class == 100 + j as u16
+                        && a.status == wire::ALG_OK
+                        && a.arr == fx.array
+                        && a.generation == 0
+                }),
+                "prefix slot {j} ALG payload"
             );
-            assert_eq!(
-                rows.iter().filter(|r| r.idx == j).count(),
-                2,
-                "prefix slot {j} rows exact"
+            let rws: Vec<_> = rows.iter().filter(|r| r.idx == j).collect();
+            assert_eq!(rws.len(), 2, "prefix slot {j} rows exact");
+            assert!(
+                rws.iter().all(|r| {
+                    r.funcid == 300 + j as u32
+                        && r.addr == 0x4400 + j
+                        && r.aux == fx.array
+                        && r.op == OP
+                        && r.generation == 0
+                }),
+                "prefix slot {j} ROW payload"
             );
         }
         for t in 0..3u64 {
@@ -1012,6 +1074,18 @@ fn l3_boundaries() {
             );
             let a = algs.iter().find(|a| a.idx == idx).unwrap();
             assert_eq!(a.class, 200 + t as u16, "tail slot {idx} classified");
+            let rt: Vec<_> = rows.iter().filter(|r| r.idx == idx).collect();
+            assert_eq!(
+                rt.len(),
+                2,
+                "v1 gap pin: tail slot {idx} ROWs PRESENT (item 3 flips to absence)"
+            );
+            assert!(
+                rt.iter().all(|r| r.funcid == 900 + t as u32
+                    && r.addr == 0x9900 + t
+                    && r.aux == fx.array),
+                "tail slot {idx} ROW payload"
+            );
         }
         assert_loss_zero(&loaded);
     }
@@ -1090,12 +1164,33 @@ fn l4_dispatch_bounds() {
         let (algs, rows) = drain(&loaded);
         assert_eq!(read_percpu(&loaded, "CALLS", OP, false), 2);
         assert_eq!(
-            read_percpu(&loaded, "TRUNC", OP, true) & wire::TRUNC_DISPATCH,
+            read_percpu(&loaded, "TRUNC", OP, true),
             0,
-            "127+term leaves DISPATCH clear"
+            "127+term: TRUNC exactly clear (warm, zero-padded)"
         );
-        assert_eq!(algs.iter().filter(|a| a.idx == 0).count(), 2);
-        assert_eq!(rows.iter().filter(|r| r.idx == 0).count(), 254);
+        let a0: Vec<_> = algs.iter().filter(|a| a.idx == 0).collect();
+        assert_eq!(a0.len(), 2);
+        assert!(
+            a0.iter().all(|a| {
+                a.op == OP && a.class == 100 && a.status == wire::ALG_OK && a.arr == fx.array
+            }),
+            "slot-0 ALG payload"
+        );
+        let r0: Vec<_> = rows.iter().filter(|r| r.idx == 0).collect();
+        assert_eq!(r0.len(), 254);
+        for k in 0..127u64 {
+            let n = r0
+                .iter()
+                .filter(|r| {
+                    r.funcid == 5000 + k as u32
+                        && r.addr == 0x9000 + k
+                        && r.aux == fx.array
+                        && r.op == OP
+                        && r.generation == 0
+                })
+                .count();
+            assert_eq!(n, 2, "leg {k} exact");
+        }
         assert_loss_zero(&loaded);
     }
     // 128 + term@128: overflow — the terminator exists but the
@@ -1112,13 +1207,21 @@ fn l4_dispatch_bounds() {
         fire(OP as i32, 2);
         let (algs, rows) = drain(&loaded);
         assert_eq!(read_percpu(&loaded, "CALLS", OP, false), 2);
-        assert_ne!(
-            read_percpu(&loaded, "TRUNC", OP, true) & wire::TRUNC_DISPATCH,
-            0,
-            "128+term sets DISPATCH: term@128 unreachable"
+        assert_eq!(
+            read_percpu(&loaded, "TRUNC", OP, true),
+            wire::TRUNC_DISPATCH,
+            "128+term: DISPATCH alone (term@128 unreachable)"
         );
         assert_eq!(algs.iter().filter(|a| a.idx == 0).count(), 2);
-        assert_eq!(rows.iter().filter(|r| r.idx == 0).count(), 256);
+        let r0: Vec<_> = rows.iter().filter(|r| r.idx == 0).collect();
+        assert_eq!(r0.len(), 256);
+        for k in 0..128u64 {
+            let n = r0
+                .iter()
+                .filter(|r| r.funcid == 5000 + k as u32 && r.addr == 0x9000 + k)
+                .count();
+            assert_eq!(n, 2, "leg {k} exact");
+        }
         assert_loss_zero(&loaded);
     }
     // 129 live, no term: overflow.
@@ -1138,14 +1241,21 @@ fn l4_dispatch_bounds() {
         fire(OP as i32, 2);
         let (algs, rows) = drain(&loaded);
         assert_eq!(read_percpu(&loaded, "CALLS", OP, false), 2);
-        assert_ne!(
-            read_percpu(&loaded, "TRUNC", OP, true) & wire::TRUNC_DISPATCH,
-            0,
-            "129-live sets DISPATCH"
+        assert_eq!(
+            read_percpu(&loaded, "TRUNC", OP, true),
+            wire::TRUNC_DISPATCH,
+            "129-live: DISPATCH alone"
         );
         assert_eq!(algs.iter().filter(|a| a.idx == 0).count(), 2);
         let r0: Vec<_> = rows.iter().filter(|r| r.idx == 0).collect();
         assert_eq!(r0.len(), 256, "first 128 legs × 2 kept");
+        for k in 0..128u64 {
+            let n = r0
+                .iter()
+                .filter(|r| r.funcid == 5000 + k as u32 && r.addr == 0x9000 + k)
+                .count();
+            assert_eq!(n, 2, "leg {k} exact");
+        }
         assert!(
             r0.iter().all(|r| r.funcid < 5000 + 128),
             "leg 128 never walked"
@@ -1188,15 +1298,44 @@ fn l5_no_store() {
     fire(OP as i32, 1);
     let (algs, rows) = drain(&loaded);
     assert_eq!(read_percpu(&loaded, "CALLS", OP, false), 3);
+    // Masked, not exact: this fixture is unpadded, so members past
+    // the terminator read names-region memory and may OR past-T soup
+    // into TRUNC (the known v1 gap, pinned by L3-tail).
     assert_ne!(
         read_percpu(&loaded, "TRUNC", OP, true) & wire::TRUNC_NO_STORE,
         0,
         "no_store flag sticks after flip-back"
     );
-    assert_eq!(algs.iter().filter(|a| a.idx == 0).count(), 3);
-    assert_eq!(algs.iter().filter(|a| a.idx == 1).count(), 3);
-    assert_eq!(rows.iter().filter(|r| r.idx == 0).count(), 3);
-    assert_eq!(rows.iter().filter(|r| r.idx == 1).count(), 6);
+    for j in [0u64, 1] {
+        let got: Vec<_> = algs.iter().filter(|a| a.idx == j).collect();
+        assert_eq!(got.len(), 3, "slot {j} ALG × 3");
+        assert!(
+            got.iter().all(|a| {
+                a.op == OP
+                    && a.class == 100 + j as u16
+                    && a.status == wire::ALG_OK
+                    && a.arr == fx.array
+                    && a.generation == 0
+            }),
+            "slot {j} ALG payload"
+        );
+    }
+    let r0: Vec<_> = rows.iter().filter(|r| r.idx == 0).collect();
+    assert_eq!(r0.len(), 3);
+    assert!(
+        r0.iter()
+            .all(|r| r.funcid == 51 && r.addr == 0x4500 && r.aux == fx.array),
+        "slot-0 ROW payload"
+    );
+    let r1: Vec<_> = rows.iter().filter(|r| r.idx == 1).collect();
+    assert_eq!(r1.len(), 6);
+    for (fid, fptr) in [(52u32, 0x4501u64), (53, 0x4502)] {
+        let n = r1
+            .iter()
+            .filter(|r| r.funcid == fid && r.addr == fptr && r.aux == fx.array)
+            .count();
+        assert_eq!(n, 3, "slot-1 leg {fid} exact");
+    }
     assert_loss_zero(&loaded);
 }
 
@@ -1240,9 +1379,9 @@ fn l6_full_chunk() {
         let (algs, rows) = drain(&loaded);
         assert_eq!(read_percpu(&loaded, "CALLS", OP, false), 2);
         assert_eq!(
-            read_percpu(&loaded, "TRUNC", OP, true) & wire::TRUNC_ALGS,
+            read_percpu(&loaded, "TRUNC", OP, true),
             0,
-            "512-clean leaves TRUNC_ALGS clear"
+            "512-clean: TRUNC exactly clear (every slot live, guard sees term)"
         );
         assert_eq!(algs.len(), 1024, "512 slots × 2 ALG");
         assert_eq!(rows.len(), 1024, "512 slots × 1 leg × 2 ROWs");
@@ -1250,14 +1389,26 @@ fn l6_full_chunk() {
             let a: Vec<_> = algs.iter().filter(|a| a.idx == j).collect();
             assert_eq!(a.len(), 2, "slot {j} ALG × 2");
             assert!(
-                a.iter()
-                    .all(|a| a.class == 100 + j as u16 && a.status == wire::ALG_OK)
+                a.iter().all(|a| {
+                    a.op == OP
+                        && a.class == 100 + j as u16
+                        && a.status == wire::ALG_OK
+                        && a.arr == fx.array
+                        && a.generation == 0
+                }),
+                "slot {j} ALG payload"
             );
             let r: Vec<_> = rows.iter().filter(|r| r.idx == j).collect();
             assert_eq!(r.len(), 2, "slot {j} ROW × 2");
             assert!(
-                r.iter()
-                    .all(|r| r.funcid == 7000 + j as u32 && r.addr == 0xA000 + j)
+                r.iter().all(|r| {
+                    r.funcid == 7000 + j as u32
+                        && r.addr == 0xA000 + j
+                        && r.aux == fx.array
+                        && r.op == OP
+                        && r.generation == 0
+                }),
+                "slot {j} ROW payload"
             );
         }
         assert_loss_zero(&loaded);
@@ -1283,16 +1434,38 @@ fn l6_full_chunk() {
         fire(OP as i32, 2);
         let (algs, rows) = drain(&loaded);
         assert_eq!(read_percpu(&loaded, "CALLS", OP, false), 2);
-        assert_ne!(
-            read_percpu(&loaded, "TRUNC", OP, true) & wire::TRUNC_ALGS,
-            0,
-            "513-live sets TRUNC_ALGS"
+        assert_eq!(
+            read_percpu(&loaded, "TRUNC", OP, true),
+            wire::TRUNC_ALGS,
+            "513-live: TRUNC_ALGS alone (warm, every walked slot live)"
         );
         assert_eq!(algs.len(), 1024, "slots 0..511 × 2 ALG (512 unwalked)");
+        assert_eq!(rows.len(), 1024, "slots 0..511 × 1 leg × 2 ROWs");
         assert!(
             algs.iter().all(|a| a.idx <= 511) && rows.iter().all(|r| r.idx <= 511),
             "no member 512: slot 512 never walked"
         );
+        for j in 0..512u64 {
+            let a: Vec<_> = algs.iter().filter(|a| a.idx == j).collect();
+            assert_eq!(a.len(), 2, "slot {j} ALG × 2");
+            assert!(
+                a.iter().all(|a| {
+                    a.op == OP
+                        && a.class == 100 + j as u16
+                        && a.status == wire::ALG_OK
+                        && a.arr == fx.array
+                }),
+                "slot {j} ALG payload"
+            );
+            let r: Vec<_> = rows.iter().filter(|r| r.idx == j).collect();
+            assert_eq!(r.len(), 2, "slot {j} ROW × 2");
+            assert!(
+                r.iter().all(|r| r.funcid == 7000 + j as u32
+                    && r.addr == 0xA000 + j
+                    && r.aux == fx.array),
+                "slot {j} ROW payload"
+            );
+        }
         assert_loss_zero(&loaded);
     }
 }
@@ -1328,10 +1501,20 @@ fn l7_cookie_mismatch() {
     let (algs, rows) = drain(&loaded);
     assert_eq!(read_percpu(&loaded, "CALLS", OP, false), 2);
     for j in [0u64, 1, 2] {
-        assert_eq!(
-            algs.iter().filter(|a| a.idx == j).count(),
-            2,
-            "slot {j} fires"
+        let got: Vec<_> = algs.iter().filter(|a| a.idx == j).collect();
+        assert_eq!(got.len(), 2, "slot {j} fires");
+        assert!(
+            got.iter().all(|a| a.class == 100 + j as u16
+                && a.status == wire::ALG_OK
+                && a.arr == fx.array),
+            "slot {j} ALG payload"
+        );
+        let rws: Vec<_> = rows.iter().filter(|r| r.idx == j).collect();
+        assert_eq!(rws.len(), 2, "slot {j} ROWs fire");
+        assert!(
+            rws.iter()
+                .all(|r| r.funcid == 71 + j as u32 && r.addr == 0x4700 + j && r.aux == fx.array),
+            "slot {j} ROW payload"
         );
     }
     assert!(
