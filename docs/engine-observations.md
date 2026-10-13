@@ -17,22 +17,26 @@ the same counters but never become ENGINE observations.
 
 ## Pin, generation, retirement
 
-Each probe module attaches through its own pin
+Each `(module, program)` attach group pins separately
 (`src/discovery/session.rs` `attach_trips`): the uprobe link binds
-the opened file description, and the session retains each module's
+the opened file description, and the session retains each group's
 `(dev, ino)` from its pin at install time. Observations key each
-probe's stub to its own module's pinned identity — never to
+probe's stub to its own group's pinned identity — never to
 libcrypto — so two callers sharing an entrypoint and stub offset
-keep distinct keys.
+keep distinct keys, and so does one pathname bound through two
+programs when it is replaced between the groups' attaches.
 
 The tripwire binding generation is 0 at the first bind, +1 per
 install. Counts key per `(generation, cookie)`; a replacement can
 never join two bindings' probes into one row. Before a replacement
 install, the session fences the retired binding by draining the
 cumulative `TRIP` map under the retired generation (retired news
-rides the poll tagged with its generation). A failed fence refuses
-attribution (loud snapshot loss) rather than joining ambiguous
-counts to fresh meanings.
+rides the poll tagged with its generation). The `TRIP` and
+`LGCALLS` streams fence independently: one stream's failure never
+discards the other's successful drain. A failed `TRIP` fence
+refuses attribution (loud snapshot loss) rather than joining
+ambiguous counts to fresh meanings, and the refusal latches until
+a trustworthy `TRIP` read re-baselines.
 
 ## Window binding
 

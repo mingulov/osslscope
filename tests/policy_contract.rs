@@ -1894,9 +1894,10 @@ fn engine_plan(lc_ino: u64, probes: Vec<legacy::Probe>) -> legacy::ProbeSet {
     }
 }
 
-fn caller_pin(module: &str, ino: u64) -> TripModulePin {
+fn caller_pin(module: &str, program: &str, ino: u64) -> TripModulePin {
     TripModulePin {
         module: module.to_string(),
+        program: program.to_string(),
         dev: "08:01".to_string(),
         ino,
     }
@@ -2027,7 +2028,7 @@ fn engine_policy_replays_from_document() {
         .map(|(i, s)| engine_probe(10 + i as u64, s, 0x100 + i as u64 * 0x100, "/app/caller.so"))
         .collect();
     let plan = engine_plan(100, probes);
-    let pins = vec![caller_pin("/app/caller.so", 200)];
+    let pins = vec![caller_pin("/app/caller.so", "trip_count", 200)];
     let objects = vec![caller_object("build:caller", 200, "/app/caller.so")];
     // Poll 1 installs gen 0; poll 2 joins one hit per cookie.
     let trip: Vec<(u64, u64)> = (10..15).map(|c| (c, 1)).collect();
@@ -2207,7 +2208,10 @@ fn engine_duplicate_cookie_joins_sum() {
             engine_probe(8, "ENGINE_init", 0x100, "/app/b.so"),
         ],
     );
-    let pins = vec![caller_pin("/app/a.so", 201), caller_pin("/app/b.so", 202)];
+    let pins = vec![
+        caller_pin("/app/a.so", "trip_count", 201),
+        caller_pin("/app/b.so", "trip_count", 202),
+    ];
     let objects = vec![
         caller_object("build:a", 201, "/app/a.so"),
         caller_object("build:b", 202, "/app/b.so"),
@@ -2261,7 +2265,7 @@ fn engine_retired_binding_replays_per_generation() {
         200,
         vec![engine_probe(7, "ENGINE_init", 0x140, "/app/caller.so")],
     );
-    let pins = vec![caller_pin("/app/caller.so", 300)];
+    let pins = vec![caller_pin("/app/caller.so", "trip_count", 300)];
     let objects = vec![caller_object("build:caller", 300, "/app/caller.so")];
     let doc = real_engine_doc(
         vec![
@@ -2333,7 +2337,7 @@ fn engine_runtime_salvage_evaluates() {
         100,
         vec![engine_probe(7, "ENGINE_init", 0x100, "/app/caller.so")],
     );
-    let pins = vec![caller_pin("/app/caller.so", 200)];
+    let pins = vec![caller_pin("/app/caller.so", "trip_count", 200)];
     let mut core = SessionCore::new(
         std::path::PathBuf::from("/p/provider.so"),
         "/canon/provider.so".to_string(),
@@ -2389,30 +2393,67 @@ fn engine_runtime_salvage_evaluates() {
 }
 
 #[test]
-fn engine_side_input_replay_disagrees_without_typed_provenance() {
-    // BEHAVIORAL missing-provenance RED (retained): five ENGINE
-    // executions visible only through the legacy side input (no
-    // typed observations) make the source verdict a violation via
-    // the fallback, while independent document replay — which has
-    // no ENGINE evidence at all — passes. The disagreement is the
-    // F06 gap the typed plane closes (see
-    // `engine_policy_replays_from_document`, which agrees).
+fn engine_fallback_replay_agreement_on_typed_provenance() {
+    // Fix-round-2 F4: GENUINE missing-provenance RED→GREEN
+    // control (replaces the retired both-paths-passing
+    // characterization). Five real ENGINE executions flow
+    // through real `SessionCore` polls + the production
+    // collector into typed document observations. Source
+    // (document evidence; the side-input fallback stands down —
+    // document hits win) and independent serialized-document
+    // replay AGREE: violation, definite 5. Pre-fix this
+    // agreement assertion FAILS: old finalization produced a
+    // quiet document, so the fallback (positive evidence the
+    // document lacks) reported violation while replay passed
+    // (recorded RED: `left: Violation, right: Pass` — see the
+    // task report). Stripping the typed observations flips this
+    // control red again (coupling proof in the report).
     use osslscope::policy::apply_legacy_engine_fallback;
-    let quiet = complete_doc(Vec::new());
-    let mut v = evaluate_document(std::slice::from_ref(&PolicyRule::deny_engine()), &quiet);
-    assert_eq!(v.rules[0].verdict, RuleVerdict::Pass);
-    apply_legacy_engine_fallback(&mut v, 5);
-    assert_eq!(v.overall(), PolicyOutcome::Violation);
-    assert_eq!(v.rules[0].bounds.definite, 5);
-    // Independent replay from the document alone has no ENGINE
-    // evidence and no side input: it passes. Source and replay
-    // disagree — missing provenance, fail loud by retaining this
-    // characterization until every caller uses typed input.
-    let bytes = serde_json::to_string(&quiet).unwrap();
+    let plan = engine_plan(
+        100,
+        vec![engine_probe(7, "ENGINE_init", 0x100, "/app/caller.so")],
+    );
+    let pins = vec![caller_pin("/app/caller.so", "trip_count", 200)];
+    let objects = vec![caller_object("build:caller", 200, "/app/caller.so")];
+    let doc = real_engine_doc(
+        vec![
+            PollScript {
+                maps: vec![lc_map(100)],
+                plan: Some(plan.clone()),
+                pins: pins.clone(),
+                trip: Vec::new(),
+            },
+            PollScript {
+                maps: vec![lc_map(100)],
+                plan: Some(plan),
+                pins,
+                trip: vec![(7, 5)],
+            },
+        ],
+        objects,
+    );
+    assert_eq!(doc.engine_observations.len(), 1);
+    assert_eq!(doc.engine_observations[0].calls, 5);
+    let rules = vec![PolicyRule::deny_engine()];
+    // Source verdict: document evidence plus the side input —
+    // the fallback must stand down (the document already proves
+    // the executions).
+    let mut v_src = evaluate_document(&rules, &doc);
+    apply_legacy_engine_fallback(&mut v_src, 5);
+    assert_eq!(
+        v_src.rules[0].legacy_engine_calls, 0,
+        "fallback must stand down on typed evidence"
+    );
+    assert_eq!(v_src.overall(), PolicyOutcome::Violation);
+    // Independent replay from the serialized document alone (no
+    // side input) — and the agreement that closes F06.
+    let bytes = serde_json::to_string(&doc).unwrap();
     let replayed: CaptureDocument = serde_json::from_str(&bytes).unwrap();
-    let v2 = evaluate_document(std::slice::from_ref(&PolicyRule::deny_engine()), &replayed);
-    assert_eq!(v2.overall(), PolicyOutcome::Pass);
-    assert_ne!(v.overall(), v2.overall());
+    let v_re = evaluate_document(&rules, &replayed);
+    assert_eq!(v_src.overall(), v_re.overall());
+    assert_eq!(v_src.rules[0].bounds, v_re.rules[0].bounds);
+    assert_eq!(v_src.rules[0].bounds.definite, 5);
+    assert_eq!(policy_record(&v_re), policy_record(&v_src));
 }
 
 #[test]
