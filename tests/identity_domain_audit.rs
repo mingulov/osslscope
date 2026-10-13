@@ -254,19 +254,20 @@ fn h5_t3_every_device_site_names_one_domain() {
             "let Some(want) = plan::device_id_of_dev_str(&candidate.advertising_dev) else {",
             1,
         ),
-        // capture.rs (R05): tripwire binding device decode +
-        // object join — stat words both sides (bound libcrypto
-        // print vs fingerprinted object registry).
+        // capture.rs (R05 fix): per-module pin device decode +
+        // object join — stat words both sides (fstat-rendered pin
+        // strings decoded vs fingerprinted object registry). Each
+        // probe's own module, never libcrypto.
         (
             "src/capture.rs",
             "stat",
-            "let Some(device) = plan::device_id_of_dev_str(dev_str) else {",
+            "if let Some(device) = plan::device_id_of_dev_str(&p.dev) {",
             1,
         ),
         (
             "src/capture.rs",
             "stat",
-            ".filter(|o| o.device == device && o.inode == *ino)",
+            ".filter(|o| o.device == *device && o.inode == *ino)",
             1,
         ),
         // capture.rs: advertising bind against the full identity
@@ -454,6 +455,21 @@ fn h5_t3_every_device_site_names_one_domain() {
             "stat",
             "Some((crate::plan::render_device(md.dev()), md.ino()))",
             1,
+        ),
+        // session.rs (R05 fix): tripwire module pins — fstat word
+        // rendered to a stat string at attach, plumbed stat
+        // end-to-end into the binding map (×2 sites).
+        (
+            "src/discovery/session.rs",
+            "stat",
+            "dev: crate::plan::render_device(pin.device),",
+            1,
+        ),
+        (
+            "src/discovery/session.rs",
+            "stat",
+            ".map(|p| (p.module, (p.dev, p.ino)))",
+            2,
         ),
         // session.rs: plan ident / bindings from bound reads + pins (stat, ×4).
         (

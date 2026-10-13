@@ -2468,12 +2468,71 @@ fn engine_observations_render_validate_and_replay() {
         "{human}"
     );
     assert!(human.contains("ENGINE_init"), "{human}");
-    // Replay from the serialized document agrees.
-    let bytes = serde_json::to_string(&doc).unwrap();
-    let replayed: CaptureDocument = serde_json::from_str(&bytes).unwrap();
-    assert_eq!(replayed.engine_observations, doc.engine_observations);
-    let v2 = evaluate_document(std::slice::from_ref(&PolicyRule::deny_engine()), &replayed);
-    assert_eq!(policy_record(&v2), doc.policy.clone().unwrap());
+    // Replay consumes the RENDERED artifact (not the Rust model):
+    // re-derive ENGINE bounds from the rendered JSON observations
+    // and require agreement with the model's evaluation plus the
+    // rendered policy section. Certainty/window limits and counts
+    // must survive rendering.
+    let bytes = render_json(&doc).expect("rendered artifact serializes");
+    let rendered: Value = serde_json::from_slice(&bytes).expect("rendered artifact parses");
+    validate_v2(&rendered).expect("rendered replay fails schema");
+    check_v2_semantics(&rendered).expect("rendered replay fails semantics");
+    let robs = rendered["engine_observations"]
+        .as_array()
+        .expect("rendered observations");
+    assert_eq!(robs.len(), 5);
+    let mut definite = 0u64;
+    let mut untimed = false;
+    for o in robs {
+        let calls = o["calls"].as_u64().expect("rendered calls");
+        match o["window"].as_str().expect("rendered window") {
+            "in-window" => definite = definite.saturating_add(calls),
+            "pre-window" => {}
+            "untimed" => {
+                if calls > 0 {
+                    untimed = true;
+                }
+            }
+            w => panic!("unknown rendered window {w}"),
+        }
+    }
+    let possible = if untimed { None } else { Some(definite) };
+    let v2 = evaluate_document(std::slice::from_ref(&PolicyRule::deny_engine()), &doc);
+    assert_eq!(v2.rules[0].bounds.definite, definite);
+    assert_eq!(v2.rules[0].bounds.possible, possible);
+    let rrule = &rendered["policy"]["rules"][0];
+    assert_eq!(rrule["definite"].as_u64().unwrap(), definite);
+    assert_eq!(rrule["possible"].as_u64(), possible);
+    // Every rendered ref resolves to a rendered observation with
+    // no over-claim (mirrors the semantic check, over the artifact
+    // bytes a downstream consumer actually reads).
+    let rrefs = rrule["engine_evidence"].as_array().unwrap();
+    assert_eq!(rrefs.len(), 5);
+    for r in rrefs {
+        let key = (
+            r["object"].as_str().unwrap(),
+            r["device"].as_u64().unwrap(),
+            r["inode"].as_u64().unwrap(),
+            r["offset"].as_u64().unwrap(),
+            r["generation"].as_u64().unwrap(),
+            r["entrypoint"].as_u64().unwrap(),
+        );
+        let have = robs
+            .iter()
+            .find(|o| {
+                (
+                    o["object"].as_str().unwrap(),
+                    o["device"].as_u64().unwrap(),
+                    o["inode"].as_u64().unwrap(),
+                    o["offset"].as_u64().unwrap(),
+                    o["generation"].as_u64().unwrap(),
+                    o["entrypoint"].as_u64().unwrap(),
+                ) == key
+            })
+            .unwrap_or_else(|| panic!("rendered ref resolves: {r}"));
+        assert_eq!(have["window"], "in-window");
+        assert!(have["calls"].as_u64().unwrap() >= r["calls"].as_u64().unwrap());
+    }
 }
 
 #[test]
@@ -2535,4 +2594,40 @@ fn engine_semantics_rejects_bad_engine_refs() {
     bad["policy"]["rules"][0]["definite"] = json!(6);
     bad["policy"]["rules"][0]["possible"] = json!(5);
     assert!(check_v2_semantics(&bad).is_err());
+}
+
+#[test]
+fn engine_semantics_rejects_pre_window_definite_refs() {
+    // F-R05-4 RED: definite ENGINE refs must resolve to InWindow
+    // observations. All five fixture observations flipped to
+    // pre-window must invalidate the definite violation refs.
+    let good = json_of(&engine_doc_fixture());
+    let mut bad = good.clone();
+    let obs = bad["engine_observations"].as_array_mut().unwrap();
+    assert_eq!(obs.len(), 5);
+    for o in obs.iter_mut() {
+        o["window"] = json!("pre-window");
+    }
+    assert!(
+        check_v2_semantics(&bad).is_err(),
+        "definite refs to pre-window observations must be rejected"
+    );
+}
+
+#[test]
+fn engine_semantics_rejects_untimed_definite_refs() {
+    // F-R05-4 RED: definite ENGINE refs must resolve to InWindow
+    // observations. All five fixture observations flipped to
+    // untimed must invalidate the definite violation refs.
+    let good = json_of(&engine_doc_fixture());
+    let mut bad = good.clone();
+    let obs = bad["engine_observations"].as_array_mut().unwrap();
+    assert_eq!(obs.len(), 5);
+    for o in obs.iter_mut() {
+        o["window"] = json!("untimed");
+    }
+    assert!(
+        check_v2_semantics(&bad).is_err(),
+        "definite refs to untimed observations must be rejected"
+    );
 }

@@ -13,13 +13,19 @@
 //! No live capture here: all documents are built with
 //! [`evidence::finalize`], so these tests run on the host (C3).
 
+use osslscope::capture::EngineCollector;
 use osslscope::check::{exit_for, policy_json, policy_record};
+use osslscope::discovery::legacy;
+use osslscope::discovery::maps;
+use osslscope::discovery::session::{
+    DiscoveryDelta, MapSnapshots, PollBudget, SessionCore, SessionEnv, TripModulePin,
+};
 use osslscope::evidence::{
     CandidateCoverage, CandidateIdentity, CaptureDocument, CaptureWindow, Completeness,
     CounterKind, CounterSource, CounterUnits, EngineObservation, EngineWindow, ExpectedScope,
     FatalKind, FencedGeneration, FinalizeInput, GapCounter, LegacyCallPartition, MatchBounds,
-    ObjectId, OpensslVersion, RuleVerdict, ScopeCoverage, SiteExecution, SiteKey, TargetRecord,
-    engine_index, finalize,
+    ObjectId, ObjectRecord, OpensslVersion, RuleVerdict, ScopeCoverage, SiteExecution, SiteKey,
+    TargetRecord, engine_index, finalize,
 };
 use osslscope::policy::{ENGINE_PROVIDER_CLASS, PolicyOutcome, PolicyRule, evaluate_document};
 use osslscope::report::{
@@ -1760,6 +1766,215 @@ fn engine_ref_resolves(doc: &CaptureDocument, r: &osslscope::evidence::EngineEvi
     })
 }
 
+// ---------------------------------------------------------------- R05 real-transition harness (F-R05-5)
+//
+// Acceptance observations come from REAL transitions: a real
+// `SessionCore` joins scripted `TRIP` maps into per-generation
+// counter deltas (real cookie join, real replacement fence, real
+// pins), and the production `EngineCollector` joins them into
+// observations. Nothing here hand-builds an `EngineObservation`.
+
+struct ScriptEnv {
+    maps: Vec<maps::Mapping>,
+    plan: Option<legacy::ProbeSet>,
+    pins: Vec<TripModulePin>,
+    trip: Vec<(u64, u64)>,
+}
+
+impl ScriptEnv {
+    fn new() -> Self {
+        Self {
+            maps: Vec::new(),
+            plan: None,
+            pins: Vec::new(),
+            trip: Vec::new(),
+        }
+    }
+}
+
+impl SessionEnv for ScriptEnv {
+    fn next_event(&mut self) -> Option<Vec<u8>> {
+        None
+    }
+    fn current_maps(&mut self) -> Option<Vec<maps::Mapping>> {
+        Some(self.maps.clone())
+    }
+    fn join_maps(&mut self) -> MapSnapshots {
+        MapSnapshots {
+            trip: self.trip.clone(),
+            ..MapSnapshots::default()
+        }
+    }
+    fn install_stage2(
+        &mut self,
+        _cookie: u64,
+        _offset: u64,
+        _path: &std::path::Path,
+        _pid: u32,
+        _expected: Option<(u64, u64)>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn install_trips(
+        &mut self,
+        _set: &legacy::ProbeSet,
+        _pid: u32,
+        _maps: &[maps::Mapping],
+    ) -> anyhow::Result<Option<String>> {
+        Ok(None)
+    }
+    fn last_trip_pins(&self) -> Vec<TripModulePin> {
+        self.pins.clone()
+    }
+    fn plan_trips(&mut self, _maps: &[maps::Mapping]) -> anyhow::Result<Option<legacy::ProbeSet>> {
+        Ok(self.plan.clone())
+    }
+    fn pretouch(&mut self, _cookie: u64, _addr: u64) {}
+    fn evict_array_state(&mut self, _arr: u64) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn install_generation(&mut self, _arr: u64, _gen: u64) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn verify_pin(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn quiesce(&mut self) {}
+    fn link_counts(&self) -> (u64, u64) {
+        (0, 0)
+    }
+    fn detach_trips(&mut self) {}
+    fn detach_dispatch_anchors(&mut self) {}
+    fn detach_stage2(&mut self, _cookie: u64) {}
+    fn reinstall_dispatch(
+        &mut self,
+    ) -> anyhow::Result<osslscope::discovery::session::DispatchReinstall> {
+        anyhow::bail!("no reinstall scripted")
+    }
+    fn provider_stat(&self) -> Option<(String, u64)> {
+        None
+    }
+}
+
+fn lc_map(ino: u64) -> maps::Mapping {
+    maps::Mapping {
+        start: 0x1000,
+        end: 0x2000,
+        x: true,
+        offset: 0,
+        dev: "08:01".to_string(),
+        ino,
+        path: "/lib/libcrypto.so.3".to_string(),
+    }
+}
+
+fn engine_probe(cookie: u64, symbol: &str, offset: u64, module: &str) -> legacy::Probe {
+    legacy::Probe {
+        cookie,
+        symbol: symbol.to_string(),
+        offset,
+        module: module.to_string(),
+        family: None,
+        str_arg: None,
+        program: "trip_count",
+    }
+}
+
+fn engine_plan(lc_ino: u64, probes: Vec<legacy::Probe>) -> legacy::ProbeSet {
+    legacy::ProbeSet {
+        probes,
+        by_id_cookies: std::collections::HashSet::new(),
+        load_cookies: std::collections::HashSet::new(),
+        libcrypto: Some((
+            "/lib/libcrypto.so.3".to_string(),
+            "08:01".to_string(),
+            lc_ino,
+        )),
+        ..legacy::ProbeSet::default()
+    }
+}
+
+fn caller_pin(module: &str, ino: u64) -> TripModulePin {
+    TripModulePin {
+        module: module.to_string(),
+        dev: "08:01".to_string(),
+        ino,
+    }
+}
+
+fn caller_object(id: &str, ino: u64, path: &str) -> ObjectRecord {
+    ObjectRecord {
+        id: ObjectId(id.to_string()),
+        device: osslscope::plan::device_id_of_dev_str("08:01").unwrap(),
+        inode: ino,
+        display_locator: path.to_string(),
+    }
+}
+
+/// One scripted poll: maps + plan + pins + cumulative TRIP map.
+struct PollScript {
+    maps: Vec<maps::Mapping>,
+    plan: Option<legacy::ProbeSet>,
+    pins: Vec<TripModulePin>,
+    trip: Vec<(u64, u64)>,
+}
+
+/// Drive real `SessionCore::poll` transitions through the production
+/// `EngineCollector`, then finalize a COMPLETE document carrying the
+/// resulting observations (plus `objects` for the join). Returns the
+/// document. Panics on unkeyed loss (every scripted hit must key).
+fn real_engine_doc(scripts: Vec<PollScript>, objects: Vec<ObjectRecord>) -> CaptureDocument {
+    let mut core = SessionCore::new(
+        std::path::PathBuf::from("/p/provider.so"),
+        "/canon/provider.so".to_string(),
+        true,
+        4242,
+    );
+    let mut env = ScriptEnv::new();
+    let mut collector = EngineCollector::new();
+    let budget = PollBudget::new(65536, 64);
+    for s in scripts {
+        env.maps = s.maps;
+        env.plan = s.plan;
+        env.pins = s.pins;
+        env.trip = s.trip;
+        let delta: DiscoveryDelta = core.poll(&mut env, budget.clone()).unwrap();
+        collector.snapshot_binding(
+            delta.trip_generation,
+            core.snapshot().legacy.set,
+            &delta.trip_module_pins,
+        );
+        collector.accumulate(
+            delta.trip_generation,
+            &delta.tripwire.counter_deltas,
+            &delta.retired_trip_deltas,
+        );
+    }
+    let (obs, unkeyed) = collector.build(&objects);
+    assert_eq!(unkeyed, 0, "scripted hits must key: {unkeyed} unkeyed");
+    let mut doc = finalize(FinalizeInput {
+        window: exact_window(),
+        sites: Vec::new(),
+        fenced: Vec::new(),
+        objects,
+        coverage: Vec::new(),
+        counters: Vec::new(),
+        fatal: None,
+        target: TargetRecord::unknown(),
+        openssl: OpensslVersion::unknown(),
+        disposition: None,
+        policy: None,
+        legacy_partition: LegacyCallPartition::default(),
+        engine_observations: obs,
+    });
+    assert!(matches!(doc.status, Completeness::Complete));
+    // Attach the evaluated policy record, as `check` does.
+    let rules = vec![PolicyRule::deny_engine()];
+    let v = evaluate_document(&rules, &doc);
+    doc.policy = Some(policy_record(&v));
+    doc
+}
+
 /// `--deny-engine` matches the engine provider class, not file stems.
 #[test]
 fn deny_engine_matches_class() {
@@ -1793,17 +2008,52 @@ fn deny_engine_matches_class() {
 
 /// R05: five in-window typed ENGINE observations drive the source
 /// check verdict, and independent serialized-document replay agrees
-/// with all evidence references resolving on both sides.
+/// with all evidence references resolving on both sides. The
+/// observations come from REAL transitions (real `SessionCore`
+/// cookie join + production `EngineCollector`), never from
+/// hand-built fixtures.
 #[test]
 fn engine_policy_replays_from_document() {
-    let mut doc = engine_doc(vec![
-        engine_obs(0x100, 0, "ENGINE_by_id", 1, EngineWindow::InWindow),
-        engine_obs(0x200, 0, "ENGINE_init", 1, EngineWindow::InWindow),
-        engine_obs(0x300, 0, "ENGINE_finish", 1, EngineWindow::InWindow),
-        engine_obs(0x400, 0, "ENGINE_free", 1, EngineWindow::InWindow),
-        engine_obs(0x500, 0, "ENGINE_ctrl", 1, EngineWindow::InWindow),
-    ]);
-    assert!(matches!(doc.status, Completeness::Complete));
+    let syms = [
+        "ENGINE_by_id",
+        "ENGINE_init",
+        "ENGINE_finish",
+        "ENGINE_free",
+        "ENGINE_ctrl",
+    ];
+    let probes: Vec<legacy::Probe> = syms
+        .iter()
+        .enumerate()
+        .map(|(i, s)| engine_probe(10 + i as u64, s, 0x100 + i as u64 * 0x100, "/app/caller.so"))
+        .collect();
+    let plan = engine_plan(100, probes);
+    let pins = vec![caller_pin("/app/caller.so", 200)];
+    let objects = vec![caller_object("build:caller", 200, "/app/caller.so")];
+    // Poll 1 installs gen 0; poll 2 joins one hit per cookie.
+    let trip: Vec<(u64, u64)> = (10..15).map(|c| (c, 1)).collect();
+    let doc = real_engine_doc(
+        vec![
+            PollScript {
+                maps: vec![lc_map(100)],
+                plan: Some(plan.clone()),
+                pins: pins.clone(),
+                trip: Vec::new(),
+            },
+            PollScript {
+                maps: vec![lc_map(100)],
+                plan: Some(plan),
+                pins,
+                trip,
+            },
+        ],
+        objects,
+    );
+    assert_eq!(doc.engine_observations.len(), 5);
+    for o in &doc.engine_observations {
+        assert_eq!(o.calls, 1);
+        assert_eq!(o.window, EngineWindow::InWindow);
+        assert_eq!(o.generation, 0);
+    }
     let rules = vec![PolicyRule::deny_engine()];
     let v = evaluate_document(&rules, &doc);
     assert_eq!(v.overall(), PolicyOutcome::Violation);
@@ -1811,14 +2061,12 @@ fn engine_policy_replays_from_document() {
     assert_eq!(v.rules[0].bounds.possible, Some(5));
     assert_eq!(v.rules[0].engine_hits.len(), 5);
     assert_eq!(v.rules[0].legacy_engine_calls, 0);
-    let rec = policy_record(&v);
+    let rec = doc.policy.clone().expect("harness attaches the record");
     assert_eq!(rec.rules[0].engine_evidence.len(), 5);
     assert!(rec.rules[0].evidence.is_empty());
     for r in &rec.rules[0].engine_evidence {
         assert!(engine_ref_resolves(&doc, r), "ref resolves: {r:?}");
     }
-    // The exported document carries the evaluated policy record.
-    doc.policy = Some(rec.clone());
     // Independent replay from the serialized document alone: no
     // side input, same verdict, same bounds, same record.
     let bytes = serde_json::to_string(&doc).expect("document serializes");
@@ -1835,6 +2083,10 @@ fn engine_policy_replays_from_document() {
     // Conserved provider unit: ENGINE calls never join site totals.
     assert_eq!(doc.total_calls(), 0);
     assert_eq!(replayed.total_calls(), 0);
+    // Certainty/window limits survive the round trip.
+    for o in &replayed.engine_observations {
+        assert_eq!(o.window, EngineWindow::InWindow);
+    }
 }
 
 #[test]
@@ -1945,12 +2197,43 @@ fn engine_zero_hits_passes() {
 
 #[test]
 fn engine_duplicate_cookie_joins_sum() {
-    // Same entrypoint probed in two modules: two cookies, two
-    // observations, one entrypoint — both definite, summed once.
-    let doc = engine_doc(vec![
-        engine_obs(0x100, 0, "ENGINE_init", 3, EngineWindow::InWindow),
-        engine_obs(0x900, 0, "ENGINE_init", 5, EngineWindow::InWindow),
-    ]);
+    // Same entrypoint probed in two caller modules: a REAL cookie
+    // join (two TRIP cookies → two counts → two observations, one
+    // entrypoint) — both definite, summed once, never collapsed.
+    let plan = engine_plan(
+        100,
+        vec![
+            engine_probe(7, "ENGINE_init", 0x100, "/app/a.so"),
+            engine_probe(8, "ENGINE_init", 0x100, "/app/b.so"),
+        ],
+    );
+    let pins = vec![caller_pin("/app/a.so", 201), caller_pin("/app/b.so", 202)];
+    let objects = vec![
+        caller_object("build:a", 201, "/app/a.so"),
+        caller_object("build:b", 202, "/app/b.so"),
+    ];
+    let doc = real_engine_doc(
+        vec![
+            PollScript {
+                maps: vec![lc_map(100)],
+                plan: Some(plan.clone()),
+                pins: pins.clone(),
+                trip: Vec::new(),
+            },
+            PollScript {
+                maps: vec![lc_map(100)],
+                plan: Some(plan),
+                pins,
+                trip: vec![(7, 3), (8, 5)],
+            },
+        ],
+        objects,
+    );
+    assert_eq!(doc.engine_observations.len(), 2);
+    assert_ne!(
+        doc.engine_observations[0].key,
+        doc.engine_observations[1].key
+    );
     let v = evaluate_document(std::slice::from_ref(&PolicyRule::deny_engine()), &doc);
     assert_eq!(v.rules[0].verdict, RuleVerdict::Violation);
     assert_eq!(v.rules[0].bounds.definite, 8);
@@ -1964,17 +2247,63 @@ fn engine_duplicate_cookie_joins_sum() {
 
 #[test]
 fn engine_retired_binding_replays_per_generation() {
-    // Binding turnover mid-window: generation 0 retired, generation
-    // 1 live. Both observed in-window under a live binding, so both
-    // are definite; replay preserves the per-generation split.
-    let doc = engine_doc(vec![
-        engine_obs(0x100, 0, "ENGINE_init", 2, EngineWindow::InWindow),
-        engine_obs(0x140, 1, "ENGINE_init", 4, EngineWindow::InWindow),
-    ]);
+    // REAL replacement transition: gen 0 binds and observes 2 hits,
+    // libcrypto is replaced (same path, new inode, identical cookie
+    // mapping), gen 1 binds and observes 4 fresh hits. Both
+    // generations observed in-window under a live binding, so both
+    // are definite; replay preserves the per-generation split and
+    // the retired fence keeps gen-0 hits off gen-1 meanings.
+    let g0 = engine_plan(
+        100,
+        vec![engine_probe(7, "ENGINE_init", 0x100, "/app/caller.so")],
+    );
+    let g1 = engine_plan(
+        200,
+        vec![engine_probe(7, "ENGINE_init", 0x140, "/app/caller.so")],
+    );
+    let pins = vec![caller_pin("/app/caller.so", 300)];
+    let objects = vec![caller_object("build:caller", 300, "/app/caller.so")];
+    let doc = real_engine_doc(
+        vec![
+            PollScript {
+                maps: vec![lc_map(100)],
+                plan: Some(g0),
+                pins: pins.clone(),
+                trip: Vec::new(),
+            },
+            PollScript {
+                maps: vec![lc_map(100)],
+                plan: None,
+                pins: pins.clone(),
+                trip: vec![(7, 2)],
+            },
+            PollScript {
+                maps: vec![lc_map(200)],
+                plan: Some(g1),
+                pins: pins.clone(),
+                trip: vec![(7, 2)],
+            },
+            PollScript {
+                maps: vec![lc_map(200)],
+                plan: None,
+                pins,
+                trip: vec![(7, 6)],
+            },
+        ],
+        objects,
+    );
+    assert_eq!(doc.engine_observations.len(), 2);
+    let mut by_gen: Vec<(u64, u64)> = doc
+        .engine_observations
+        .iter()
+        .map(|o| (o.generation, o.calls))
+        .collect();
+    by_gen.sort();
+    assert_eq!(by_gen, vec![(0, 2), (1, 4)]);
     let v = evaluate_document(std::slice::from_ref(&PolicyRule::deny_engine()), &doc);
     assert_eq!(v.rules[0].verdict, RuleVerdict::Violation);
     assert_eq!(v.rules[0].bounds.definite, 6);
-    let rec = policy_record(&v);
+    let rec = doc.policy.clone().expect("harness attaches the record");
     assert_eq!(rec.rules[0].engine_evidence.len(), 2);
     let mut gens: Vec<u64> = rec.rules[0]
         .engine_evidence
@@ -1993,13 +2322,54 @@ fn engine_retired_binding_replays_per_generation() {
 
 #[test]
 fn engine_runtime_salvage_evaluates() {
-    // Salvaged Runtime docs carry real observations: a proved
-    // ENGINE violation still evaluates (exit 10 via check).
+    // Salvaged Runtime docs carry REAL observations (joined through
+    // the production collector from real `SessionCore` polls): a
+    // proved ENGINE violation still evaluates (exit 10 via check).
+    // The salvage ASSEMBLY itself (close failure → fatal-Runtime
+    // capture preserving collected observations) runs really in
+    // `capture::tests::stub_runner::engine_runtime_salvage_keeps_real_observations`;
+    // this control pins the salvaged SHAPE's policy evaluation.
+    let plan = engine_plan(
+        100,
+        vec![engine_probe(7, "ENGINE_init", 0x100, "/app/caller.so")],
+    );
+    let pins = vec![caller_pin("/app/caller.so", 200)];
+    let mut core = SessionCore::new(
+        std::path::PathBuf::from("/p/provider.so"),
+        "/canon/provider.so".to_string(),
+        true,
+        4242,
+    );
+    let mut env = ScriptEnv::new();
+    let mut collector = EngineCollector::new();
+    let budget = PollBudget::new(65536, 64);
+    for (i, trip) in [Vec::new(), vec![(7, 7)]].into_iter().enumerate() {
+        env.maps = vec![lc_map(100)];
+        env.plan = Some(plan.clone());
+        env.pins = pins.clone();
+        env.trip = trip;
+        let delta = core.poll(&mut env, budget.clone()).unwrap();
+        collector.snapshot_binding(
+            delta.trip_generation,
+            core.snapshot().legacy.set,
+            &delta.trip_module_pins,
+        );
+        collector.accumulate(
+            delta.trip_generation,
+            &delta.tripwire.counter_deltas,
+            &delta.retired_trip_deltas,
+        );
+        let _ = i;
+    }
+    let objects = vec![caller_object("build:caller", 200, "/app/caller.so")];
+    let (obs, unkeyed) = collector.build(&objects);
+    assert_eq!(unkeyed, 0);
+    assert_eq!(obs.len(), 1);
     let doc = finalize(FinalizeInput {
         window: exact_window(),
         sites: Vec::new(),
         fenced: Vec::new(),
-        objects: Vec::new(),
+        objects,
         coverage: Vec::new(),
         counters: Vec::new(),
         fatal: Some(FatalKind::Runtime("drain failed".to_string())),
@@ -2008,13 +2378,7 @@ fn engine_runtime_salvage_evaluates() {
         disposition: None,
         policy: None,
         legacy_partition: LegacyCallPartition::default(),
-        engine_observations: vec![engine_obs(
-            0x100,
-            0,
-            "ENGINE_init",
-            7,
-            EngineWindow::InWindow,
-        )],
+        engine_observations: obs,
     });
     let v = evaluate_document(std::slice::from_ref(&PolicyRule::deny_engine()), &doc);
     assert_eq!(v.overall(), PolicyOutcome::Violation);
@@ -2022,6 +2386,33 @@ fn engine_runtime_salvage_evaluates() {
     assert_eq!(v.rules[0].bounds.possible, None);
     assert_eq!(v.rules[0].engine_hits.len(), 1);
     assert_eq!(exit_for(v.overall(), Some(0), &doc, &ok_delivery()), 10);
+}
+
+#[test]
+fn engine_side_input_replay_disagrees_without_typed_provenance() {
+    // BEHAVIORAL missing-provenance RED (retained): five ENGINE
+    // executions visible only through the legacy side input (no
+    // typed observations) make the source verdict a violation via
+    // the fallback, while independent document replay — which has
+    // no ENGINE evidence at all — passes. The disagreement is the
+    // F06 gap the typed plane closes (see
+    // `engine_policy_replays_from_document`, which agrees).
+    use osslscope::policy::apply_legacy_engine_fallback;
+    let quiet = complete_doc(Vec::new());
+    let mut v = evaluate_document(std::slice::from_ref(&PolicyRule::deny_engine()), &quiet);
+    assert_eq!(v.rules[0].verdict, RuleVerdict::Pass);
+    apply_legacy_engine_fallback(&mut v, 5);
+    assert_eq!(v.overall(), PolicyOutcome::Violation);
+    assert_eq!(v.rules[0].bounds.definite, 5);
+    // Independent replay from the document alone has no ENGINE
+    // evidence and no side input: it passes. Source and replay
+    // disagree — missing provenance, fail loud by retaining this
+    // characterization until every caller uses typed input.
+    let bytes = serde_json::to_string(&quiet).unwrap();
+    let replayed: CaptureDocument = serde_json::from_str(&bytes).unwrap();
+    let v2 = evaluate_document(std::slice::from_ref(&PolicyRule::deny_engine()), &replayed);
+    assert_eq!(v2.overall(), PolicyOutcome::Pass);
+    assert_ne!(v.overall(), v2.overall());
 }
 
 #[test]
