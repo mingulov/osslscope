@@ -54,7 +54,9 @@ Required: `schema_version`, `target`, `openssl`, `window`,
 `completeness`, `sites`, `fenced`, `objects`, `coverage`,
 `legacy_partition`.
 Optional: `disposition` (omitted when never recorded), `policy`
-(`check` documents only; `report` omits it).
+(`check` documents only; `report` omits it), `context`
+(omitted when unrecorded), `engine_observations` (omitted when
+none were observed).
 
 Target, OpenSSL version, window and disposition, values verbatim
 from `tests/goldens/report-v2-violation.json` (whitespace
@@ -94,6 +96,32 @@ Notes:
 - `disposition` mirrors custody: `exited` (code), `detached-running`
   (owned child left running), `foreign-observed` (`--pid` target
   left untouched).
+- `context` is execution context only: host kernel release plus
+  the wall-clock window edges in unix nanoseconds (either edge
+  may be null for explicit unknown). The monotonic `window`
+  fields stay authoritative for durations and deadlines; wall
+  edges may run backward across a clock adjustment without
+  affecting verdicts. Old field readers ignore this key; strict
+  validators pinned to a pre-`context` schema reject documents
+  carrying it (expected):
+
+```json
+{"context": {
+  "kernel_release": "6.9.0-test",
+  "wall_end_unix_ns": 1700000030000000000,
+  "wall_start_unix_ns": 1700000000000000000
+}}
+```
+
+- `engine_observations` is the replayable engine plane: one
+  typed record per ENGINE tripwire observation (pinned
+  caller-module triple, stub file offset, binding generation,
+  frozen-registry entrypoint index + display name, window
+  provenance `in-window`/`pre-window`/`untimed`, untimed call
+  count). Engine observations never join site call totals or
+  the legacy partition; per-rule `engine_evidence` refs (in
+  `policy` rules, rendered only when present) resolve to
+  observations listed in the same document.
 
 ## Sites and uncertainty
 
@@ -216,6 +244,15 @@ T10 evaluates rules and fills `PolicyRecord`; T11 renders it.
 (`no-verdict` exactly on `FATAL` documents with policy). The
 verdict is the AND of its rules: any `violation` rules a
 violation, else any `inconclusive` rules inconclusive, else `pass`.
+Relevance is per-rule: a `--require-executed` name absent from
+the evidence violates only when the relevant coverage is
+complete with zero possible use; under a relevant gap the rule
+is inconclusive (exit 11) -- the requirement is unproven, never
+fabricated into a violation or a pass. Deny rules mirror this:
+only definite use violates. Positive evidence dominates: a
+proved violation exits 10 on COMPLETE, PARTIAL, or salvaged
+`runtime`-fatal documents alike, even when artifact delivery
+failed.
 Each rule carries three-valued `result`, conserved
 `definite`/`possible` bounds (`possible: null` means the upper
 bound is unknown; `definite` never exceeds a known `possible`) and
@@ -338,6 +375,23 @@ Candidate lines never carry counts (the site total is shared, not
 per-alias). Offsets are decimal file offsets, explicitly labeled;
 no `0x` bytes appear anywhere (`output_contract` scans for them).
 
+When execution context is recorded, three lines follow the
+header (omitted when unrecorded; unknown wall edges render
+`unknown`):
+
+```text
+duration: requested=100ns effective=100ns (monotonic; authoritative)
+kernel: 6.9.0-test
+wall: start=1700000000000000000 end=1700000030000000000 (unix-ns; context only)
+```
+
+Every human-rendered string passes display neutralization:
+control characters plus bidi overrides/isolates, zero-width and
+invisible format characters, line/paragraph separators, and
+interlinear-annotation controls all render as `?`, so hostile
+comm/container/digest strings cannot reshape terminal or log
+output (`src/report.rs` `safe_display`).
+
 ## Delivery API (T10 checkpoint)
 
 ```rust
@@ -377,6 +431,10 @@ records the refusal. Path comparison is lexical.
   characters); file offsets render decimal.
 - `display_locator` values are operator-visible provenance with
   stated limits, not target buffer dumps.
+- Human output neutralizes display controls (`?` for control,
+  bidi, zero-width/invisible, separator, and annotation
+  characters), so rendered provenance cannot reshape the
+  terminal or log that shows it.
 
 ## v1 versus v2
 
@@ -394,5 +452,8 @@ JSON/CBOM/human examples: `tests/goldens/report-v2-*`,
 `output_contract::v2_goldens_pinned`, generated from the fixtures
 in `tests/output_contract.rs`). Auditor shape:
 `tests/auditor_golden_v2.json` (pinned by `tests/auditor_report.rs`
-v2 suite). CLI wiring examples stay with T10; no command above was
-run against a live target for this document.
+v2 suite). The `context` JSON and the three human context lines
+above are verbatim from the `context`-carrying golden shape
+(optional keys, omitted when unrecorded). CLI wiring examples
+stay with T10; no command above was run against a live target
+for this document.
