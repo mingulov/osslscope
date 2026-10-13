@@ -112,11 +112,17 @@ fn h5_t3_every_device_site_names_one_domain() {
         "stat", "maps", "raw", "agnostic", "fallback", "display", "local",
     ];
     let pinned: &[(&str, &str, &str, u32)] = &[
-        // capture.rs: file-cache validation (both fstat-sourced).
+        // capture.rs: file-cache identity validation (R20: both
+        // fstat-sourced encoded words — cached read identity vs
+        // current FileStat).
+        ("src/capture.rs", "stat", "if cached.file.dev == cur.dev", 1),
+        // capture.rs: torn-read guard (R20: read-identity (dev, ino)
+        // from the bound read's fstat vs the pre-stat FileStat —
+        // both fstat-encoded).
         (
             "src/capture.rs",
             "stat",
-            "(Some((dev, ino)), Some(cached)) if cached.dev == dev && cached.ino == ino",
+            "if (dev, ino) == (cur.dev, cur.ino)",
             1,
         ),
         // capture.rs: stable cookies keyed by the stat triple.
@@ -297,13 +303,19 @@ fn h5_t3_every_device_site_names_one_domain() {
         ),
         // capture.rs: maps facet carried for the unstatable arm.
         ("src/capture.rs", "fallback", "m.dev.as_str(),", 1),
-        // capture.rs: stat_file encodes fstat (raw dev_t).
+        // capture.rs: stat_file encodes fstat (raw dev_t) into the
+        // FileStat dev word (R20 struct-literal form).
         (
             "src/capture.rs",
             "raw",
-            "plan::encode_device(libc::major(m.dev()), libc::minor(m.dev())),",
+            "dev: plan::encode_device(libc::major(m.dev()), libc::minor(m.dev())),",
             1,
         ),
+        // target.rs: staging self-delete guard (R06: raw lstat
+        // dev_t vs the raw dev_t recorded at staging creation —
+        // both raw, never encoded; re-pinned during R20 while the
+        // audit was already red at BASE for this line).
+        ("src/target.rs", "raw", "&& st.st_dev == staging.dev", 1),
         // check.rs: evidence ref carries the stat word (plumbing).
         ("src/check.rs", "stat", "device: h.site.device,", 1),
         // check.rs (R05): engine-plane ref + violation entry carry
