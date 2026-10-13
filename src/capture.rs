@@ -4456,8 +4456,24 @@ pub fn run(cfg: &Config, target: Target) -> anyhow::Result<Capture> {
     match target {
         Target::Spawn { argv, workload } => {
             let cmdline = args::redact_spawn_argv(&argv);
-            let mut owned = target::OwnedTarget::spawn_stopped(&argv, workload)
-                .map_err(|e| anyhow::anyhow!("spawn: {e:#}"))?;
+            // R06/F07: pre-stop setup runs under the checked
+            // harvest-timeout deadline and the live SIGINT/SIGTERM
+            // flag — a blocking workload destination or a lost stop
+            // can neither hang setup nor orphan a child: every
+            // failure kills + reaps only this never-released owned
+            // child. (observe() bounds its own post-spawn setup
+            // slice separately with the same timeout.)
+            let setup_deadline = match args::deadline_at(Instant::now(), cfg.harvest_timeout) {
+                Some(d) => d,
+                None => anyhow::bail!("spawn: setup deadline overflow"),
+            };
+            let mut owned = target::OwnedTarget::spawn_stopped_with_control(
+                &argv,
+                workload,
+                setup_deadline,
+                &INTERRUPTED,
+            )
+            .map_err(|e| anyhow::anyhow!("spawn: {e:#}"))?;
             let pid = owned.pid();
             let resolved = match resolve_capture_provider(
                 AutoTarget::Spawn(&argv),

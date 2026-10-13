@@ -405,3 +405,440 @@ fn h9_t5_unwritable_path_maps_126_naming_path() {
     assert!(!err.contains("127"), "never 127-confused: {err}");
     assert!(err.contains(path), "names the path: {err}");
 }
+
+// ---------------------------------------------------------------------------
+// R06 (F07): bounded pre-stop setup with immediate child custody.
+// ---------------------------------------------------------------------------
+
+use std::ffi::CString;
+use std::os::unix::ffi::OsStrExt as _;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Unique scratch dir per R06 test (parallel-safe: distinct names).
+fn r06_scratch(test: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("r06-{test}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// Sentinel argv: touches `sentinel`, then sleeps. The sentinel must
+/// NEVER exist after a failed setup: a never-released child is killed
+/// pre-exec (or never forked), so the payload cannot run.
+fn r06_sentinel_argv(sentinel: &Path) -> Vec<String> {
+    vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        format!("touch '{}'; sleep 30", sentinel.display()),
+    ]
+}
+
+fn r06_mkfifo(path: &Path) {
+    let c = CString::new(path.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+}
+
+/// Independent watchdog for the FIFO tests: if the spawn has not
+/// returned after `timeout`, opens the fifo O_RDWR (never blocks,
+/// even with no counterpart) and HOLDS it — releasing any child
+/// stuck in a blocking open (the RED shape) so the test runner never
+/// waits indefinitely. `finish` returns whether the rescue fired.
+struct R06Rescue {
+    done: Arc<AtomicBool>,
+    fired: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+fn r06_watch_fifo(fifo: PathBuf, timeout: Duration) -> R06Rescue {
+    let done = Arc::new(AtomicBool::new(false));
+    let fired = Arc::new(AtomicBool::new(false));
+    let done_c = done.clone();
+    let fired_c = fired.clone();
+    let handle = std::thread::spawn(move || {
+        let end = Instant::now() + timeout;
+        let mut fd: libc::c_int = -1;
+        loop {
+            if done_c.load(Ordering::SeqCst) {
+                break;
+            }
+            if Instant::now() >= end {
+                fired_c.store(true, Ordering::SeqCst);
+                if fd < 0 {
+                    let c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+                    fd = unsafe { libc::open(c.as_ptr(), libc::O_RDWR | libc::O_NONBLOCK) };
+                }
+            }
+            if Instant::now() >= end + Duration::from_secs(60) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if fd >= 0 {
+            unsafe {
+                libc::close(fd);
+            }
+        }
+    });
+    R06Rescue {
+        done,
+        fired,
+        handle: Some(handle),
+    }
+}
+
+impl R06Rescue {
+    fn finish(mut self) -> bool {
+        self.done.store(true, Ordering::SeqCst);
+        self.handle.take().unwrap().join().unwrap();
+        self.fired.load(Ordering::SeqCst)
+    }
+}
+
+/// Cleanup for an unexpectedly spawned child on the must-fail paths:
+/// retains the exact owned pid and guarantees no stopped child or
+/// zombie survives, then fails with the RED shape.
+fn r06_unexpected_child(mut t: OwnedTarget, what: &str) -> ! {
+    let pid = t.pid();
+    t.resolve_setup_failure().unwrap();
+    assert_reaped_no_zombie(pid);
+    panic!("{what}, but spawned pid {pid}");
+}
+
+#[test]
+fn fifo_setup_cancel_reaps_child() {
+    // R06/F07 core: a FIFO workload destination with no reader, plus
+    // a SIGINT/SIGTERM-like cancellation arriving mid-setup. Setup
+    // must fail fast with no surviving child; the sentinel must never
+    // execute. The watchdog only fires on a regressed (blocking)
+    // implementation, releasing the stuck child so the runner never
+    // hangs; GREEN never needs the rescue.
+    let dir = r06_scratch("fifo-cancel");
+    let fifo = dir.join("sink.fifo");
+    r06_mkfifo(&fifo);
+    let sentinel = dir.join("SENTINEL");
+    let argv = r06_sentinel_argv(&sentinel);
+    let cancel = Arc::new(AtomicBool::new(false));
+    // Signal-like cancellation from another thread (the same store
+    // the SIGINT/SIGTERM handler performs on capture's live flag).
+    let cancel_c = cancel.clone();
+    let signaller = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        cancel_c.store(true, Ordering::SeqCst);
+    });
+    let watchdog = r06_watch_fifo(fifo.clone(), Duration::from_secs(5));
+    let t0 = Instant::now();
+    let result = OwnedTarget::spawn_stopped_with_control(
+        &argv,
+        WorkloadDest::File(fifo.clone()),
+        Instant::now() + Duration::from_secs(30),
+        &cancel,
+    );
+    let elapsed = t0.elapsed();
+    let fired = watchdog.finish();
+    signaller.join().unwrap();
+    match result {
+        Err(e) => {
+            let msg = e.to_string();
+            // No-reader FIFO: the pre-fork open fails fast (ENXIO),
+            // naming the path, the fifo kind and the 126 marker. (A
+            // wildly descheduled entry could observe the pending
+            // cancel first instead — also a childless fast failure.)
+            assert!(msg.contains("sink.fifo"), "names the path: {msg}");
+            assert!(msg.contains("126"), "126 marker: {msg}");
+            assert!(
+                msg.contains("fifo") || msg.contains("cancel"),
+                "fifo or cancel cause: {msg}"
+            );
+            assert!(elapsed < Duration::from_secs(5), "fail fast: {elapsed:?}");
+            assert!(!fired, "watchdog rescue must not be needed");
+            assert!(!sentinel.exists(), "sentinel must never execute");
+        }
+        Ok(t) => r06_unexpected_child(t, "FIFO setup must fail"),
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn prestop_deadline_reaps_child() {
+    // R06: an already-exceeded pre-stop deadline fails WITHOUT
+    // forking: no child exists to stop, the sentinel never executes,
+    // and the error names the deadline.
+    let dir = r06_scratch("prestop-deadline");
+    let sentinel = dir.join("SENTINEL");
+    let argv = r06_sentinel_argv(&sentinel);
+    let cancel = AtomicBool::new(false);
+    // Zero-timeout-shaped deadline, sampled before the call, so the
+    // `now >= deadline` check inside is deterministically true.
+    let deadline = osslscope::args::deadline_at(Instant::now(), Duration::ZERO).unwrap();
+    let t0 = Instant::now();
+    let result =
+        OwnedTarget::spawn_stopped_with_control(&argv, WorkloadDest::Null, deadline, &cancel);
+    let elapsed = t0.elapsed();
+    match result {
+        Err(e) => {
+            let msg = e.to_string();
+            assert!(msg.contains("deadline"), "names the deadline: {msg}");
+            assert!(elapsed < Duration::from_secs(5), "fail fast: {elapsed:?}");
+            assert!(!sentinel.exists(), "sentinel must never execute");
+        }
+        Ok(t) => r06_unexpected_child(t, "expired deadline must fail"),
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn setup_cancel_before_fork_spawns_nothing() {
+    // R06: cancellation already pending (SIGINT/SIGTERM delivered
+    // before setup) fails without forking; the sentinel never runs.
+    let dir = r06_scratch("cancel-prefix");
+    let sentinel = dir.join("SENTINEL");
+    let argv = r06_sentinel_argv(&sentinel);
+    let cancel = AtomicBool::new(true);
+    let t0 = Instant::now();
+    let result = OwnedTarget::spawn_stopped_with_control(
+        &argv,
+        WorkloadDest::Null,
+        Instant::now() + Duration::from_secs(30),
+        &cancel,
+    );
+    let elapsed = t0.elapsed();
+    match result {
+        Err(e) => {
+            let msg = e.to_string();
+            assert!(msg.contains("cancel"), "names cancellation: {msg}");
+            assert!(elapsed < Duration::from_secs(5), "fail fast: {elapsed:?}");
+            assert!(!sentinel.exists(), "sentinel must never execute");
+        }
+        Ok(t) => r06_unexpected_child(t, "pending cancel must fail"),
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn zero_timeout_admission_fails_fast_without_child() {
+    // `--timeout 0` is ADMITTED (range [0,120]) and means "no setup
+    // time": capture's checked setup deadline is already exceeded, so
+    // the spawn fails before ANY side effect — the child is never
+    // forked AND the file sink is never opened/truncated.
+    assert_eq!(
+        osslscope::args::parse_seconds("--timeout", "0").unwrap(),
+        Duration::ZERO
+    );
+    let dir = r06_scratch("zero-timeout");
+    let log = dir.join("workload.log");
+    std::fs::write(&log, b"precious\n").unwrap();
+    let sentinel = dir.join("SENTINEL");
+    let argv = r06_sentinel_argv(&sentinel);
+    let cancel = AtomicBool::new(false);
+    let deadline = osslscope::args::deadline_at(Instant::now(), Duration::ZERO).unwrap();
+    let t0 = Instant::now();
+    let result = OwnedTarget::spawn_stopped_with_control(
+        &argv,
+        WorkloadDest::File(log.clone()),
+        deadline,
+        &cancel,
+    );
+    let elapsed = t0.elapsed();
+    match result {
+        Err(e) => {
+            let msg = e.to_string();
+            assert!(msg.contains("deadline"), "names the deadline: {msg}");
+            assert!(elapsed < Duration::from_secs(5), "fail fast: {elapsed:?}");
+            assert_eq!(
+                std::fs::read(&log).unwrap(),
+                b"precious\n",
+                "no truncation on dead setup"
+            );
+            assert!(!sentinel.exists(), "sentinel must never execute");
+        }
+        Ok(t) => r06_unexpected_child(t, "zero timeout must fail"),
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn file_open_failure_names_path_with_126() {
+    // R06 keeps the H9 126 taxonomy on the new entrypoint: a file
+    // sink that cannot be opened fails pre-fork, naming the path with
+    // the 126 setup marker (never 127, never silent null).
+    let path = "/nonexistent-r06-dir-xyz/workload.log";
+    let cancel = AtomicBool::new(false);
+    let err = OwnedTarget::spawn_stopped_with_control(
+        &sentinel_argv(),
+        WorkloadDest::File(path.into()),
+        Instant::now() + Duration::from_secs(30),
+        &cancel,
+    )
+    .err()
+    .expect("unwritable path must fail")
+    .to_string();
+    assert!(err.contains("126"), "126 mapping: {err}");
+    assert!(!err.contains("127"), "never 127-confused: {err}");
+    assert!(err.contains(path), "names the path: {err}");
+}
+
+#[test]
+fn fifo_dest_rejected_without_spawn() {
+    // FIFO rejection via the fstat gate (no cancellation): the test
+    // itself holds a reader, so even a regressed blocking open could
+    // not hang — yet the sink is still refused as a non-regular
+    // file, pre-fork, naming the path. Nothing forked, sentinel
+    // never executes.
+    let dir = r06_scratch("fifo-plain");
+    let fifo = dir.join("sink.fifo");
+    r06_mkfifo(&fifo);
+    let sentinel = dir.join("SENTINEL");
+    let argv = r06_sentinel_argv(&sentinel);
+    let cancel = AtomicBool::new(false);
+    let fc = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    let reader = unsafe { libc::open(fc.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
+    assert!(reader >= 0, "test holds a fifo reader");
+    let t0 = Instant::now();
+    let result = OwnedTarget::spawn_stopped_with_control(
+        &argv,
+        WorkloadDest::File(fifo.clone()),
+        Instant::now() + Duration::from_secs(30),
+        &cancel,
+    );
+    let elapsed = t0.elapsed();
+    unsafe {
+        libc::close(reader);
+    }
+    match result {
+        Err(e) => {
+            let msg = e.to_string();
+            assert!(
+                msg.contains("not a regular file") && msg.contains("fifo"),
+                "regular-file cause: {msg}"
+            );
+            assert!(msg.contains("sink.fifo"), "names the path: {msg}");
+            assert!(elapsed < Duration::from_secs(5), "fail fast: {elapsed:?}");
+            assert!(!sentinel.exists(), "sentinel must never execute");
+        }
+        Ok(t) => r06_unexpected_child(t, "FIFO dest must fail"),
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn device_dest_rejected_without_spawn() {
+    // Non-regular sinks are rejected even when openable: /dev/null
+    // (a character device) is not a pinned regular file — the Null
+    // default and caller-held fds cover those uses.
+    let dir = r06_scratch("device-sink");
+    let sentinel = dir.join("SENTINEL");
+    let argv = r06_sentinel_argv(&sentinel);
+    let cancel = AtomicBool::new(false);
+    let t0 = Instant::now();
+    let result = OwnedTarget::spawn_stopped_with_control(
+        &argv,
+        WorkloadDest::File("/dev/null".into()),
+        Instant::now() + Duration::from_secs(30),
+        &cancel,
+    );
+    let elapsed = t0.elapsed();
+    match result {
+        Err(e) => {
+            let msg = e.to_string();
+            assert!(msg.contains("regular file"), "regular-file cause: {msg}");
+            assert!(elapsed < Duration::from_secs(5), "fail fast: {elapsed:?}");
+            assert!(!sentinel.exists(), "sentinel must never execute");
+        }
+        Ok(t) => r06_unexpected_child(t, "device dest must fail"),
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn symlink_dest_rejected_without_truncation() {
+    // A symlinked sink is refused WITHOUT following it: the classic
+    // truncation surprise (open+truncate through a link the operator
+    // did not pin) cannot happen.
+    let dir = r06_scratch("symlink-sink");
+    let victim = dir.join("victim.log");
+    std::fs::write(&victim, b"precious\n").unwrap();
+    let link = dir.join("sink.log");
+    std::os::unix::fs::symlink(&victim, &link).unwrap();
+    let sentinel = dir.join("SENTINEL");
+    let argv = r06_sentinel_argv(&sentinel);
+    let cancel = AtomicBool::new(false);
+    let result = OwnedTarget::spawn_stopped_with_control(
+        &argv,
+        WorkloadDest::File(link.clone()),
+        Instant::now() + Duration::from_secs(30),
+        &cancel,
+    );
+    match result {
+        Err(e) => {
+            let msg = e.to_string();
+            assert!(msg.contains("sink.log"), "names the path: {msg}");
+            assert_eq!(
+                std::fs::read(&victim).unwrap(),
+                b"precious\n",
+                "link target never truncated"
+            );
+            assert!(!sentinel.exists(), "sentinel must never execute");
+        }
+        Ok(t) => r06_unexpected_child(t, "symlink dest must fail"),
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn pinned_sink_survives_path_replacement() {
+    // The file sink is PINNED (an open fd, not a path): replacing the
+    // path after a successful spawn cannot redirect the child's
+    // output — the original inode keeps the bytes, the replacement
+    // stays untouched. (Preserved-behavior pin: the pinning moves
+    // parent-side under R06.)
+    let dir = r06_scratch("replacement");
+    let path = dir.join("workload.log");
+    std::fs::write(&path, b"stale\n").unwrap();
+    let cancel = AtomicBool::new(false);
+    let mut t = OwnedTarget::spawn_stopped_with_control(
+        &sentinel_argv(),
+        WorkloadDest::File(path.clone()),
+        Instant::now() + Duration::from_secs(30),
+        &cancel,
+    )
+    .unwrap();
+    let pid = t.pid();
+    let aside = dir.join("original.log");
+    std::fs::rename(&path, &aside).unwrap();
+    std::fs::write(&path, b"replacement\n").unwrap();
+    t.release().unwrap();
+    assert_eq!(wait_for_exit(&mut t, Duration::from_secs(5)), Some(0));
+    assert_reaped_no_zombie(pid);
+    assert_eq!(
+        std::fs::read(&aside).unwrap(),
+        b"H9-OUT-S\nH9-ERR-S\n",
+        "original inode keeps the bytes"
+    );
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        b"replacement\n",
+        "replacement untouched"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn with_control_happy_path_releases_and_reaps() {
+    // The new entrypoint preserves the happy path: spawn stopped,
+    // release, exit status preserved, reaped exactly once.
+    let cancel = AtomicBool::new(false);
+    let mut t = OwnedTarget::spawn_stopped_with_control(
+        &["/bin/true".to_string()],
+        WorkloadDest::Null,
+        Instant::now() + Duration::from_secs(30),
+        &cancel,
+    )
+    .unwrap();
+    let pid = t.pid();
+    assert_eq!(t.state(), CustodyState::Stopped);
+    t.release().unwrap();
+    assert_eq!(wait_for_exit(&mut t, Duration::from_secs(5)), Some(0));
+    assert_reaped_no_zombie(pid);
+}

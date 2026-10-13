@@ -2682,6 +2682,20 @@ fn signal_during_setup_cuts_cleanly() {
 }
 
 #[test]
+fn zero_setup_timeout_resolves_without_window() {
+    // R06: a zero setup timeout (admitted `--timeout 0`) fails setup
+    // before release: loud error, custody resolved, never released.
+    let mut h = Harness::fresh("setup-timeout");
+    h.cfg.harvest_timeout = Duration::ZERO;
+    let (out, post) = h.run();
+    let msg = out.expect_err("zero setup timeout must fail").to_string();
+    assert!(msg.contains("setup timeout"), "{msg}");
+    let log = post.target_log.borrow();
+    assert!(!log.released);
+    assert!(log.resolved);
+}
+
+#[test]
 fn signal_cut_mid_window_is_partial() {
     // Cancelled mid-window: counting still closes before the final
     // discovery drain, SignalCut recorded, running child detached
@@ -5132,6 +5146,24 @@ fn live_observe(
     duration: Duration,
     finish_recycled: bool,
 ) -> (anyhow::Result<Capture>, u32) {
+    live_observe_inner(
+        test,
+        argv,
+        duration,
+        finish_recycled,
+        Duration::from_secs(30),
+    )
+}
+
+/// [`live_observe`] with an explicit setup timeout (R06: the zero
+/// case must reap a real child without opening a window).
+fn live_observe_inner(
+    test: &str,
+    argv: &[&str],
+    duration: Duration,
+    finish_recycled: bool,
+    harvest_timeout: Duration,
+) -> (anyhow::Result<Capture>, u32) {
     let stage = Stage::fresh(test);
     let bytes = self_bytes();
     let staged = stage.write("prov.so", &bytes);
@@ -5219,7 +5251,7 @@ fn live_observe(
         resolved_provider: None,
         duration,
         settle: Duration::from_millis(500),
-        harvest_timeout: Duration::from_secs(30),
+        harvest_timeout,
         grace: Duration::from_secs(5),
         image_digest: String::new(),
     };
@@ -5298,6 +5330,50 @@ fn live_owned_exit_survives_pin_recycle_at_finish() {
     assert_eq!(counter_value(&c, "discovery.close_join_skipped"), 1);
     assert!(matches!(c.outcome, Outcome::Partial));
     assert_reaped(pid);
+}
+
+#[test]
+fn live_zero_setup_timeout_reaps_real_child() {
+    // R06: zero setup timeout with a REAL forked child — the
+    // never-released child is SIGKILLed pre-exec and reaped (no
+    // window, no zombie) and the sentinel never runs.
+    let dir = std::env::temp_dir().join(format!("r06-live-timeout-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let sentinel = dir.join("SENTINEL");
+    let script = format!("touch '{}'; sleep 30", sentinel.display());
+    let argv_owned = ["/bin/sh".to_string(), "-c".to_string(), script];
+    let argv_refs: Vec<&str> = argv_owned.iter().map(|s| s.as_str()).collect();
+    let (out, pid) = live_observe_inner(
+        "live-zero-timeout",
+        &argv_refs,
+        Duration::from_secs(30),
+        false,
+        Duration::ZERO,
+    );
+    if let Ok(c) = &out {
+        // Regression: retain the exact owned pid and guarantee
+        // cleanup (the child may have been released) before failing.
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGKILL);
+        }
+        let end = Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut status = 0;
+            let r = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
+            if r != 0 {
+                break;
+            }
+            assert!(Instant::now() < end, "child {pid} would not die");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("zero setup timeout must fail, got {:?}", c.outcome);
+    }
+    let msg = out.expect_err("zero setup timeout must fail").to_string();
+    assert!(msg.contains("setup timeout"), "{msg}");
+    assert_reaped(pid);
+    assert!(!sentinel.exists(), "sentinel must never execute");
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
