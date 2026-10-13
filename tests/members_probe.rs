@@ -27,7 +27,7 @@
 //! `temp_probe_is_nondestructive`) run offline (pure, unprivileged)
 //! and gate the harness itself.
 
-use osslscope::loader::{Loaded, MEMBER_MAPS, MEMBER_PROGS};
+use osslscope::loader::Loaded;
 use std::collections::HashSet;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::PathBuf;
@@ -51,52 +51,19 @@ fn gated() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-fn load_members(obj: &std::path::Path) -> Loaded {
-    raise_fd_limit();
-    let bytes = std::fs::read(obj).expect("read members.o");
-    let prep =
-        osslscope::loader::prepare(&bytes, &MEMBER_MAPS, &MEMBER_PROGS).expect("prepare members.o");
-    osslscope::loader::load(&prep).expect("load members.o")
-}
-
-/// Raise RLIMIT_NOFILE for the chunk's fd budget: 513 prog fds + 7
-/// map fds + 513 link fds (all held — drop = detach) + clones +
-/// stdio ≈ 1040 > the 1024 default (observed EMFILE at member_499).
-/// Unprivileged (soft raise under the hard cap), fail-closed when
-/// the hard cap itself is too small. Item-3 session carryover: the
-/// production attach path must raise/check this too.
-fn raise_fd_limit() {
-    const WANT: libc::rlim_t = 8192;
-    const NEED: libc::rlim_t = 4096;
-    unsafe {
-        let mut r = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        assert_eq!(
-            libc::getrlimit(libc::RLIMIT_NOFILE, &mut r as *mut _),
-            0,
-            "getrlimit"
-        );
-        if r.rlim_cur < WANT {
-            r.rlim_cur = std::cmp::min(WANT, r.rlim_max);
-            assert_eq!(
-                libc::setrlimit(libc::RLIMIT_NOFILE, &r as *const _),
-                0,
-                "setrlimit NOFILE"
-            );
-            assert_eq!(
-                libc::getrlimit(libc::RLIMIT_NOFILE, &mut r as *mut _),
-                0,
-                "getrlimit"
-            );
-        }
-        assert!(
-            r.rlim_cur >= NEED,
-            "NOFILE {} below the 1033-fd chunk budget",
-            r.rlim_cur
-        );
-    }
+/// Dogfood the production attach (fd budget → prepare → load →
+/// CTRL program → entry + member links). Every leg attaches through
+/// here, so the production path is live-proven along with the legs.
+/// CTRL: EXPECTED = 512 attached members, epoch 1, governor =
+/// half the 2MiB ring (provisional until item 7 re-derives).
+fn attach_chunk(
+    obj: &std::path::Path,
+    exe: &std::ffi::CString,
+    off: u64,
+) -> osslscope::loader::MembersAttached {
+    let ctrl = osslscope_ebpf_common::ctrl_value(512, 1, 1 << 20);
+    osslscope::loader::attach_members(obj, exe, off, std::process::id(), &ctrl)
+        .expect("production attach")
 }
 
 /// Populate the member object's `ALG_CLASS` with fixture entries
@@ -127,41 +94,6 @@ fn populate_alg_class(loaded: &Loaded, entries: &[(String, u16)]) {
         }
         .expect("insert ALG_CLASS");
     }
-}
-
-/// Attach the entry (cookie 512) + all 512 members (cookie = slot)
-/// to `off` in our own image. `cookie_override` (L7) attaches one
-/// member with a wrong cookie. Returns the links (drop = detach).
-fn attach_all(
-    loaded: &Loaded,
-    exe: &std::ffi::CString,
-    off: u64,
-    cookie_override: Option<(u64, u64)>,
-) -> (OwnedFd, Vec<OwnedFd>) {
-    let pid = std::process::id();
-    let entry_fd = loaded.progs["member_entry"].as_raw_fd();
-    let entry = ossl_bpf_sys::link_create_uprobe_multi(
-        entry_fd,
-        exe,
-        &[off],
-        &[osslscope_ebpf_common::MEMBER_ENTRY_COOKIE],
-        pid,
-    )
-    .expect("attach member_entry");
-    let mut members = Vec::with_capacity(512);
-    for j in 0..512u64 {
-        let name = format!("member_{j:03}");
-        let fd = loaded.progs[&name].as_raw_fd();
-        let cookie = match cookie_override {
-            Some((idx, c)) if idx == j => c,
-            _ => j,
-        };
-        members.push(
-            ossl_bpf_sys::link_create_uretprobe_multi(fd, exe, &[off], &[cookie], pid)
-                .unwrap_or_else(|e| panic!("attach {name}: {e}")),
-        );
-    }
-    (entry, members)
 }
 
 /// Drain the member EVENTS ring to parsed (ALG, ROW) events. Drops
@@ -660,9 +592,10 @@ fn temp_probe_is_nondestructive() {
 
 // ===== live legs (lane only) =====
 
-/// L1: the chunk loads (all 513 progs verify — no new verifier
-/// risk shape) + per-prog xlated margins recorded (T03 acceptance:
-/// margin per program). Load-only: no attach, no fire.
+/// L1: the chunk loads through the production attach (all 513
+/// progs verify — no new verifier risk shape) + per-prog xlated
+/// margins recorded (T03 acceptance: margin per program) + CTRL
+/// roundtrip (the attach programmed it). No fire.
 #[test]
 #[ignore]
 fn l1_load_513_margins() {
@@ -670,9 +603,19 @@ fn l1_load_513_margins() {
         eprintln!("SKIP(members-live): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
         return;
     };
-    let loaded = load_members(&obj);
+    let exe = own_exe_cstr();
+    let off = query_off();
+    let attached = attach_chunk(&obj, &exe, off);
+    let loaded = &attached.loaded;
     assert_eq!(loaded.progs.len(), 513, "all member progs loaded");
     assert_eq!(loaded.maps.len(), 14, "all member maps created");
+    assert_eq!(attached.members.len(), 512, "all member links attached");
+    let ctrl = osslscope::loader::read_ctrl(&loaded.maps).expect("read CTRL");
+    assert_eq!(
+        (ctrl.expected, ctrl.skip_all, ctrl.epoch, ctrl.governor),
+        (512, 0, 1, 1 << 20),
+        "production attach programmed CTRL"
+    );
     let mut lens: Vec<(String, usize)> = loaded
         .progs
         .iter()
@@ -754,11 +697,11 @@ fn run_e7(obj: &std::path::Path, exe: &std::ffi::CString, off: u64, cold: bool) 
     }
     fx.pretouch();
     let temp = "warm";
-    let loaded = load_members(obj);
-    populate_alg_class(&loaded, &fx.classes);
+    let attached = attach_chunk(obj, exe, off);
+    let loaded = &attached.loaded;
+    populate_alg_class(loaded, &fx.classes);
     FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
     NS_VERDICT.store(0, Ordering::SeqCst);
-    let _links = attach_all(&loaded, exe, off, None);
     let t0 = Instant::now();
     fire(OP as i32, QUERIES);
     let wall = t0.elapsed();
@@ -766,18 +709,18 @@ fn run_e7(obj: &std::path::Path, exe: &std::ffi::CString, off: u64, cold: bool) 
         "e7-{temp}: {QUERIES} queries in {wall:?} ({:.1}µs/scan, recorded)",
         wall.as_micros() as f64 / QUERIES as f64
     );
-    let (algs, rows) = drain(&loaded);
+    let (algs, rows) = drain(loaded);
     assert_eq!(
-        read_percpu(&loaded, "CALLS", OP, false),
+        read_percpu(loaded, "CALLS", OP, false),
         QUERIES as u64,
         "e7-{temp}: one query counted once"
     );
     assert_eq!(
-        read_percpu(&loaded, "TRUNC", OP, true),
+        read_percpu(loaded, "TRUNC", OP, true),
         0,
         "e7-{temp}: no TRUNC on the clean walk"
     );
-    assert_loss_zero(&loaded);
+    assert_loss_zero(loaded);
     assert_eq!(algs.len(), 7 * QUERIES, "e7-{temp}: 7 slots × N ALG");
     for j in 0..7u64 {
         let got: Vec<_> = algs.iter().filter(|a| a.idx == j).collect();
@@ -837,14 +780,14 @@ fn run_e7_pageout(obj: &std::path::Path, exe: &std::ffi::CString, off: u64, fx: 
     }
     // From here until the drain: touch nothing fixture-backed (any
     // touch re-faults and voids the cold).
-    let loaded = load_members(obj);
-    populate_alg_class(&loaded, &fx.classes);
+    let attached = attach_chunk(obj, exe, off);
+    let loaded = &attached.loaded;
+    populate_alg_class(loaded, &fx.classes);
     FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
     NS_VERDICT.store(0, Ordering::SeqCst);
-    let _links = attach_all(&loaded, exe, off, None);
     fire(OP as i32, QUERIES);
-    let (algs, rows) = drain(&loaded);
-    assert_abort_clean(&loaded, &algs, &rows, QUERIES as u64, "e7-cold");
+    let (algs, rows) = drain(loaded);
+    assert_abort_clean(loaded, &algs, &rows, QUERIES as u64, "e7-cold");
 }
 
 /// Shared read-abort oracle (pageout-cold + munmap-hole).
@@ -887,16 +830,16 @@ fn assert_abort_clean(
 fn run_null(obj: &std::path::Path, exe: &std::ffi::CString, off: u64) {
     let fx = Fixture::build(&e7_slots(), &[]);
     fx.pretouch();
-    let loaded = load_members(obj);
-    populate_alg_class(&loaded, &fx.classes);
+    let attached = attach_chunk(obj, exe, off);
+    let loaded = &attached.loaded;
+    populate_alg_class(loaded, &fx.classes);
     NS_VERDICT.store(0, Ordering::SeqCst);
-    let _links = attach_all(&loaded, exe, off, None);
     // Positive control: one live query proves these links fire.
     FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
     fire(OP as i32, 1);
-    let (algs, rows) = drain(&loaded);
+    let (algs, rows) = drain(loaded);
     assert_eq!(
-        read_percpu(&loaded, "CALLS", OP, false),
+        read_percpu(loaded, "CALLS", OP, false),
         1,
         "null-leg control: live query counted"
     );
@@ -907,17 +850,17 @@ fn run_null(obj: &std::path::Path, exe: &std::ffi::CString, off: u64) {
     // Null phase: silence, and the count stays at the control's 1.
     FIXTURE_ARRAY.store(0, Ordering::SeqCst);
     fire(OP as i32, 2);
-    let (algs, rows) = drain(&loaded);
+    let (algs, rows) = drain(loaded);
     assert!(
         algs.is_empty() && rows.is_empty(),
         "null queries emit nothing"
     );
     assert_eq!(
-        read_percpu(&loaded, "CALLS", OP, false),
+        read_percpu(loaded, "CALLS", OP, false),
         1,
         "null queries uncounted (control count unchanged)"
     );
-    assert_loss_zero(&loaded);
+    assert_loss_zero(loaded);
 }
 
 /// L3: empty / one / adjacent-tail / munmap-hole fixtures.
@@ -939,16 +882,16 @@ fn l3_boundaries() {
     {
         let fx = Fixture::build(&[], &[]);
         fx.pretouch();
-        let loaded = load_members(&obj);
-        populate_alg_class(&loaded, &fx.classes);
+        let attached = attach_chunk(&obj, &exe, off);
+        let loaded = &attached.loaded;
+        populate_alg_class(loaded, &fx.classes);
         FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
         NS_VERDICT.store(0, Ordering::SeqCst);
-        let _links = attach_all(&loaded, &exe, off, None);
         fire(OP as i32, 2);
-        let (algs, rows) = drain(&loaded);
-        assert_eq!(read_percpu(&loaded, "CALLS", OP, false), 2);
+        let (algs, rows) = drain(loaded);
+        assert_eq!(read_percpu(loaded, "CALLS", OP, false), 2);
         assert_ne!(
-            read_percpu(&loaded, "TRUNC", OP, true) & wire::TRUNC_WALK_EMPTY,
+            read_percpu(loaded, "TRUNC", OP, true) & wire::TRUNC_WALK_EMPTY,
             0,
             "empty slot 0 flagged"
         );
@@ -959,23 +902,23 @@ fn l3_boundaries() {
             algs.len(),
             rows.len()
         );
-        assert_loss_zero(&loaded);
+        assert_loss_zero(loaded);
     }
     // One: slot 0 exact, EMPTY bit clear.
     {
         let slots = vec![SlotSpec::live("M3A", 100, vec![(31, 0x4300), (32, 0x4301)])];
         let fx = Fixture::build(&slots, &[]);
         fx.pretouch();
-        let loaded = load_members(&obj);
-        populate_alg_class(&loaded, &fx.classes);
+        let attached = attach_chunk(&obj, &exe, off);
+        let loaded = &attached.loaded;
+        populate_alg_class(loaded, &fx.classes);
         FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
         NS_VERDICT.store(0, Ordering::SeqCst);
-        let _links = attach_all(&loaded, &exe, off, None);
         fire(OP as i32, 2);
-        let (algs, rows) = drain(&loaded);
-        assert_eq!(read_percpu(&loaded, "CALLS", OP, false), 2);
+        let (algs, rows) = drain(loaded);
+        assert_eq!(read_percpu(loaded, "CALLS", OP, false), 2);
         assert_eq!(
-            read_percpu(&loaded, "TRUNC", OP, true) & wire::TRUNC_WALK_EMPTY,
+            read_percpu(loaded, "TRUNC", OP, true) & wire::TRUNC_WALK_EMPTY,
             0,
             "live slot 0 leaves EMPTY clear"
         );
@@ -1002,7 +945,7 @@ fn l3_boundaries() {
                 .count();
             assert_eq!(n, 2, "slot-0 leg {k} exact");
         }
-        assert_loss_zero(&loaded);
+        assert_loss_zero(loaded);
     }
     // Adjacent tail: 3 live + term@3 + 3 planted @4..6. Prefix
     // exact AND tail present (v1 walks past T — pinned gap).
@@ -1029,16 +972,16 @@ fn l3_boundaries() {
             tail.iter().map(|s| (s.name.clone(), s.class)).collect();
         let fx = Fixture::build(&slots, &tail);
         fx.pretouch();
-        let loaded = load_members(&obj);
+        let attached = attach_chunk(&obj, &exe, off);
+        let loaded = &attached.loaded;
         let mut entries = fx.classes.clone();
         entries.extend(tail_classes);
-        populate_alg_class(&loaded, &entries);
+        populate_alg_class(loaded, &entries);
         FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
         NS_VERDICT.store(0, Ordering::SeqCst);
-        let _links = attach_all(&loaded, &exe, off, None);
         fire(OP as i32, 2);
-        let (algs, rows) = drain(&loaded);
-        assert_eq!(read_percpu(&loaded, "CALLS", OP, false), 2);
+        let (algs, rows) = drain(loaded);
+        assert_eq!(read_percpu(loaded, "CALLS", OP, false), 2);
         for j in 0..3u64 {
             let got: Vec<_> = algs.iter().filter(|a| a.idx == j).collect();
             assert_eq!(got.len(), 2, "prefix slot {j} exact");
@@ -1100,7 +1043,7 @@ fn l3_boundaries() {
                 "tail slot {idx} ROW payload"
             );
         }
-        assert_loss_zero(&loaded);
+        assert_loss_zero(loaded);
     }
     // Munmap hole: array page 0 (slots 0..127, incl. the live
     // prefix) unmapped ⇒ every slot read in the hole aborts:
@@ -1115,11 +1058,11 @@ fn l3_boundaries() {
             SlotSpec::live("M3H1", 101, vec![(42, 0x4601)]),
         ];
         let fx = Fixture::build_padded(&slots, &[], 512);
-        let loaded = load_members(&obj);
-        populate_alg_class(&loaded, &fx.classes);
+        let attached = attach_chunk(&obj, &exe, off);
+        let loaded = &attached.loaded;
+        populate_alg_class(loaded, &fx.classes);
         FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
         NS_VERDICT.store(0, Ordering::SeqCst);
-        let _links = attach_all(&loaded, &exe, off, None);
         let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
         // Hoisted: no allocation may run between the munmap and the
         // end of fire (see the ordering note above).
@@ -1138,8 +1081,8 @@ fn l3_boundaries() {
             "hole errno is ENOMEM"
         );
         fire(OP as i32, 2);
-        let (algs, rows) = drain(&loaded);
-        assert_abort_clean(&loaded, &algs, &rows, 2, "l3-hole");
+        let (algs, rows) = drain(loaded);
+        assert_abort_clean(loaded, &algs, &rows, 2, "l3-hole");
     }
 }
 
@@ -1168,16 +1111,16 @@ fn l4_dispatch_bounds() {
         // Zero-padded: DISPATCH-clear reflects member 0's clean walk only.
         let fx = Fixture::build_padded(&[SlotSpec::live("M4A", 100, disp)], &[], 512);
         fx.pretouch();
-        let loaded = load_members(&obj);
-        populate_alg_class(&loaded, &fx.classes);
+        let attached = attach_chunk(&obj, &exe, off);
+        let loaded = &attached.loaded;
+        populate_alg_class(loaded, &fx.classes);
         FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
         NS_VERDICT.store(0, Ordering::SeqCst);
-        let _links = attach_all(&loaded, &exe, off, None);
         fire(OP as i32, 2);
-        let (algs, rows) = drain(&loaded);
-        assert_eq!(read_percpu(&loaded, "CALLS", OP, false), 2);
+        let (algs, rows) = drain(loaded);
+        assert_eq!(read_percpu(loaded, "CALLS", OP, false), 2);
         assert_eq!(
-            read_percpu(&loaded, "TRUNC", OP, true),
+            read_percpu(loaded, "TRUNC", OP, true),
             0,
             "127+term: TRUNC exactly clear (warm, zero-padded)"
         );
@@ -1208,7 +1151,7 @@ fn l4_dispatch_bounds() {
                 .count();
             assert_eq!(n, 2, "leg {k} exact");
         }
-        assert_loss_zero(&loaded);
+        assert_loss_zero(loaded);
     }
     // 128 + term@128: overflow — the terminator exists but the
     // walker exhausts its 128 reads on live legs first.
@@ -1216,16 +1159,16 @@ fn l4_dispatch_bounds() {
         let disp: Vec<(u32, u64)> = (0..128u32).map(|k| (5000 + k, 0x9000 + k as u64)).collect();
         let fx = Fixture::build_padded(&[SlotSpec::live("M4E", 100, disp)], &[], 512);
         fx.pretouch();
-        let loaded = load_members(&obj);
-        populate_alg_class(&loaded, &fx.classes);
+        let attached = attach_chunk(&obj, &exe, off);
+        let loaded = &attached.loaded;
+        populate_alg_class(loaded, &fx.classes);
         FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
         NS_VERDICT.store(0, Ordering::SeqCst);
-        let _links = attach_all(&loaded, &exe, off, None);
         fire(OP as i32, 2);
-        let (algs, rows) = drain(&loaded);
-        assert_eq!(read_percpu(&loaded, "CALLS", OP, false), 2);
+        let (algs, rows) = drain(loaded);
+        assert_eq!(read_percpu(loaded, "CALLS", OP, false), 2);
         assert_eq!(
-            read_percpu(&loaded, "TRUNC", OP, true),
+            read_percpu(loaded, "TRUNC", OP, true),
             wire::TRUNC_DISPATCH,
             "128+term: DISPATCH alone (term@128 unreachable)"
         );
@@ -1256,7 +1199,7 @@ fn l4_dispatch_bounds() {
                 .count();
             assert_eq!(n, 2, "leg {k} exact");
         }
-        assert_loss_zero(&loaded);
+        assert_loss_zero(loaded);
     }
     // 129 live, no term: overflow.
     {
@@ -1267,16 +1210,16 @@ fn l4_dispatch_bounds() {
         // otherwise join the drain; the overflow bit is OR-folded).
         let fx = Fixture::build_padded(&[slot], &[], 512);
         fx.pretouch();
-        let loaded = load_members(&obj);
-        populate_alg_class(&loaded, &fx.classes);
+        let attached = attach_chunk(&obj, &exe, off);
+        let loaded = &attached.loaded;
+        populate_alg_class(loaded, &fx.classes);
         FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
         NS_VERDICT.store(0, Ordering::SeqCst);
-        let _links = attach_all(&loaded, &exe, off, None);
         fire(OP as i32, 2);
-        let (algs, rows) = drain(&loaded);
-        assert_eq!(read_percpu(&loaded, "CALLS", OP, false), 2);
+        let (algs, rows) = drain(loaded);
+        assert_eq!(read_percpu(loaded, "CALLS", OP, false), 2);
         assert_eq!(
-            read_percpu(&loaded, "TRUNC", OP, true),
+            read_percpu(loaded, "TRUNC", OP, true),
             wire::TRUNC_DISPATCH,
             "129-live: DISPATCH alone"
         );
@@ -1311,7 +1254,7 @@ fn l4_dispatch_bounds() {
             r0.iter().all(|r| r.funcid < 5000 + 128),
             "leg 128 never walked"
         );
-        assert_loss_zero(&loaded);
+        assert_loss_zero(loaded);
     }
 }
 
@@ -1334,26 +1277,26 @@ fn l5_no_store() {
     ];
     let fx = Fixture::build(&slots, &[]);
     fx.pretouch();
-    let loaded = load_members(&obj);
-    populate_alg_class(&loaded, &fx.classes);
+    let attached = attach_chunk(&obj, &exe, off);
+    let loaded = &attached.loaded;
+    populate_alg_class(loaded, &fx.classes);
     FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
-    let _links = attach_all(&loaded, &exe, off, None);
     NS_VERDICT.store(1, Ordering::SeqCst);
     fire(OP as i32, 2);
     assert_ne!(
-        read_percpu(&loaded, "TRUNC", OP, true) & wire::TRUNC_NO_STORE,
+        read_percpu(loaded, "TRUNC", OP, true) & wire::TRUNC_NO_STORE,
         0,
         "no_store flagged"
     );
     NS_VERDICT.store(0, Ordering::SeqCst);
     fire(OP as i32, 1);
-    let (algs, rows) = drain(&loaded);
-    assert_eq!(read_percpu(&loaded, "CALLS", OP, false), 3);
+    let (algs, rows) = drain(loaded);
+    assert_eq!(read_percpu(loaded, "CALLS", OP, false), 3);
     // Masked, not exact: this fixture is unpadded, so members past
     // the terminator read names-region memory and may OR past-T soup
     // into TRUNC (the known v1 gap, pinned by L3-tail).
     assert_ne!(
-        read_percpu(&loaded, "TRUNC", OP, true) & wire::TRUNC_NO_STORE,
+        read_percpu(loaded, "TRUNC", OP, true) & wire::TRUNC_NO_STORE,
         0,
         "no_store flag sticks after flip-back"
     );
@@ -1398,7 +1341,7 @@ fn l5_no_store() {
             .count();
         assert_eq!(n, 3, "slot-1 leg {fid} exact");
     }
-    assert_loss_zero(&loaded);
+    assert_loss_zero(loaded);
 }
 
 /// L6: the full-chunk proof — 512 live slots walk exactly (1024
@@ -1430,18 +1373,18 @@ fn l6_full_chunk() {
         let fx = Fixture::build(&slots, &[]);
         fx.pretouch();
         eprintln!("l6a fixture temp: {}", fx.temp());
-        let loaded = load_members(&obj);
-        populate_alg_class(&loaded, &fx.classes);
+        let attached = attach_chunk(&obj, &exe, off);
+        let loaded = &attached.loaded;
+        populate_alg_class(loaded, &fx.classes);
         FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
         NS_VERDICT.store(0, Ordering::SeqCst);
-        let _links = attach_all(&loaded, &exe, off, None);
         let t0 = Instant::now();
         fire(OP as i32, 2);
         eprintln!("l6a: 2 full scans in {:?} (recorded)", t0.elapsed());
-        let (algs, rows) = drain(&loaded);
-        assert_eq!(read_percpu(&loaded, "CALLS", OP, false), 2);
+        let (algs, rows) = drain(loaded);
+        assert_eq!(read_percpu(loaded, "CALLS", OP, false), 2);
         assert_eq!(
-            read_percpu(&loaded, "TRUNC", OP, true),
+            read_percpu(loaded, "TRUNC", OP, true),
             0,
             "512-clean: TRUNC exactly clear (every slot live, guard sees term)"
         );
@@ -1473,7 +1416,7 @@ fn l6_full_chunk() {
                 "slot {j} ROW payload"
             );
         }
-        assert_loss_zero(&loaded);
+        assert_loss_zero(loaded);
     }
     // 513 live + term@513: TRUNC_ALGS, slot 512 unwalked.
     {
@@ -1488,16 +1431,16 @@ fn l6_full_chunk() {
             .collect();
         let fx = Fixture::build(&slots, &[]);
         fx.pretouch();
-        let loaded = load_members(&obj);
-        populate_alg_class(&loaded, &fx.classes);
+        let attached = attach_chunk(&obj, &exe, off);
+        let loaded = &attached.loaded;
+        populate_alg_class(loaded, &fx.classes);
         FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
         NS_VERDICT.store(0, Ordering::SeqCst);
-        let _links = attach_all(&loaded, &exe, off, None);
         fire(OP as i32, 2);
-        let (algs, rows) = drain(&loaded);
-        assert_eq!(read_percpu(&loaded, "CALLS", OP, false), 2);
+        let (algs, rows) = drain(loaded);
+        assert_eq!(read_percpu(loaded, "CALLS", OP, false), 2);
         assert_eq!(
-            read_percpu(&loaded, "TRUNC", OP, true),
+            read_percpu(loaded, "TRUNC", OP, true),
             wire::TRUNC_ALGS,
             "513-live: TRUNC_ALGS alone (warm, every walked slot live)"
         );
@@ -1533,7 +1476,7 @@ fn l6_full_chunk() {
                 "slot {j} ROW payload"
             );
         }
-        assert_loss_zero(&loaded);
+        assert_loss_zero(loaded);
     }
 }
 
@@ -1559,14 +1502,27 @@ fn l7_cookie_mismatch() {
     ];
     let fx = Fixture::build(&slots, &[]);
     fx.pretouch();
-    let loaded = load_members(&obj);
-    populate_alg_class(&loaded, &fx.classes);
+    let mut attached = attach_chunk(&obj, &exe, off);
+    let loaded = &attached.loaded;
+    populate_alg_class(loaded, &fx.classes);
     FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
     NS_VERDICT.store(0, Ordering::SeqCst);
-    let _links = attach_all(&loaded, &exe, off, Some((3, 7)));
+    // Surgical cookie fault on top of the production attach: drop
+    // member_3's correct link (drop = detach) and re-attach the
+    // same prog with cookie 7. Same code path as production for
+    // the other 512 links.
+    let m3 = ossl_bpf_sys::link_create_uretprobe_multi(
+        loaded.progs["member_003"].as_raw_fd(),
+        &exe,
+        &[off],
+        &[7],
+        std::process::id(),
+    )
+    .expect("re-attach member_3 with cookie 7");
+    drop(std::mem::replace(&mut attached.members[3], m3));
     fire(OP as i32, 2);
-    let (algs, rows) = drain(&loaded);
-    assert_eq!(read_percpu(&loaded, "CALLS", OP, false), 2);
+    let (algs, rows) = drain(loaded);
+    assert_eq!(read_percpu(loaded, "CALLS", OP, false), 2);
     for j in [0u64, 1, 2] {
         let got: Vec<_> = algs.iter().filter(|a| a.idx == j).collect();
         assert_eq!(got.len(), 2, "slot {j} fires");

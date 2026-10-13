@@ -237,6 +237,10 @@ pub const LOSS_SKIP_ALL: u32 = 26;
 pub const LOSS_RING_CALL: u32 = 27;
 pub const LOSS_RING_RET: u32 = 28;
 pub const LOSS_RING_GUARD: u32 = 29;
+/// CTRL cell never programmed (expected == 0 or epoch == 0): the
+/// loader always programs it, so zero means a loader bug — the
+/// entry skips everything loudly rather than admitting blind.
+pub const LOSS_CTRL_UNPROGRAMMED: u32 = 30;
 
 /// Entry skip causes (P7 item 3): the `ScanCallEvent.flags` cause
 /// field. 0 = admitted (no counter); each nonzero cause maps to
@@ -248,6 +252,7 @@ pub const SKIP_BIRTH_WRAP: u8 = 3;
 pub const SKIP_RING_PRESSURE: u8 = 4;
 pub const SKIP_ALL: u8 = 5;
 pub const SKIP_ENTRY_COOKIE: u8 = 6;
+pub const SKIP_CTRL_UNPROGRAMMED: u8 = 7;
 
 /// `ScanCallEvent.flags` layout: bit 0 = NESTED_HINT (advisory —
 /// §5.2 rules corroborate); cause in bits 8..16; all other bits
@@ -274,6 +279,7 @@ pub const fn loss_for_skip_cause(cause: u8) -> u32 {
         SKIP_RING_PRESSURE => LOSS_RING_PRESSURE,
         SKIP_ALL => LOSS_SKIP_ALL,
         SKIP_ENTRY_COOKIE => LOSS_ENTRY_COOKIE,
+        SKIP_CTRL_UNPROGRAMMED => LOSS_CTRL_UNPROGRAMMED,
         _ => 0,
     }
 }
@@ -359,6 +365,28 @@ pub struct CtrlValue {
 
 const _: () = assert!(size_of::<CtrlValue>() == 24);
 const _: () = assert!(align_of::<CtrlValue>() == 8);
+
+/// Session-control constructor (userspace): pads zeroed, SKIP_ALL
+/// clear. Every field explicit — no silent defaults.
+#[cfg(feature = "user")]
+pub const fn ctrl_value(expected: u32, epoch: u64, governor: u64) -> CtrlValue {
+    CtrlValue {
+        expected,
+        skip_all: 0,
+        _pad: [0; 3],
+        epoch,
+        governor,
+    }
+}
+
+/// Typed map access over populated/read cells. Sound: `repr(C)`,
+/// all-integer (every bit pattern valid), explicit zero pads.
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for ScanRec {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for TCacheValue {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for CtrlValue {}
 
 /// Trip classes (u16 wire). Engine and load taxonomies share the
 /// numeric space; the probe program (cookie context) selects the
@@ -1086,7 +1114,7 @@ pub fn parse_scan_call_event(b: &[u8]) -> Result<ScanCallEvent, WireErr> {
         return Err(WireErr::Kind);
     }
     let (hint, cause) = split_call_flags(e.flags);
-    if cause > SKIP_ENTRY_COOKIE {
+    if cause > SKIP_CTRL_UNPROGRAMMED {
         return Err(WireErr::StatusRange);
     }
     if e.flags != make_call_flags(hint, cause) {
@@ -1297,9 +1325,10 @@ mod tests {
                 SKIP_BIRTH_WRAP,
                 SKIP_RING_PRESSURE,
                 SKIP_ALL,
-                SKIP_ENTRY_COOKIE
+                SKIP_ENTRY_COOKIE,
+                SKIP_CTRL_UNPROGRAMMED
             ),
-            (0, 1, 2, 3, 4, 5, 6)
+            (0, 1, 2, 3, 4, 5, 6, 7)
         );
         assert_eq!(loss_for_skip_cause(SKIP_BIRTH_PENDING), LOSS_BIRTH_PENDING);
         assert_eq!(loss_for_skip_cause(SKIP_SEQ_FULL), LOSS_SEQ_FULL);
@@ -1307,6 +1336,10 @@ mod tests {
         assert_eq!(loss_for_skip_cause(SKIP_RING_PRESSURE), LOSS_RING_PRESSURE);
         assert_eq!(loss_for_skip_cause(SKIP_ALL), LOSS_SKIP_ALL);
         assert_eq!(loss_for_skip_cause(SKIP_ENTRY_COOKIE), LOSS_ENTRY_COOKIE);
+        assert_eq!(
+            loss_for_skip_cause(SKIP_CTRL_UNPROGRAMMED),
+            LOSS_CTRL_UNPROGRAMMED
+        );
         // CALL flags: hint bit + cause nibble roundtrip.
         assert_eq!(
             split_call_flags(make_call_flags(true, SKIP_SEQ_FULL)),
@@ -1316,6 +1349,14 @@ mod tests {
             split_call_flags(make_call_flags(false, SKIP_ADMITTED)),
             (false, SKIP_ADMITTED)
         );
+    }
+
+    #[cfg(feature = "user")]
+    #[test]
+    fn ctrl_value_ctor_zeroes_pads() {
+        let c = ctrl_value(512, 1, 1 << 20);
+        assert_eq!((c.expected, c.skip_all, c.epoch, c.governor), (512, 0, 1, 1 << 20));
+        assert_eq!(c._pad, [0; 3], "pads zero for Pod map writes");
     }
 
     #[test]
@@ -1357,7 +1398,7 @@ mod tests {
         bad[0..4].copy_from_slice(&KIND_ROW.to_le_bytes());
         assert_eq!(parse_scan_call_event(&bad), Err(WireErr::Kind));
         let mut bad = cb;
-        bad[12..16].copy_from_slice(&make_call_flags(false, 7).to_le_bytes());
+        bad[12..16].copy_from_slice(&make_call_flags(false, 8).to_le_bytes());
         assert_eq!(parse_scan_call_event(&bad), Err(WireErr::StatusRange));
         let mut bad = cb;
         bad[12..16].copy_from_slice(&0x02u32.to_le_bytes());
