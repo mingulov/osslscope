@@ -21,8 +21,13 @@ use osslscope::count_session::{
     FakeLink, FenceReason,
 };
 use osslscope::discovery::maps::Mapping;
-use osslscope::evidence::{CandidateCoverage, CandidateIdentity, ObjectId};
+use osslscope::evidence::{
+    CandidateCoverage, CandidateIdentity, CaptureDocument, CaptureWindow, Completeness,
+    FinalizeInput, LegacyCallPartition, ObjectId, OpensslVersion, RuleVerdict, SiteExecution,
+    TargetRecord, finalize,
+};
 use osslscope::plan;
+use osslscope::policy::{PolicyRule, evaluate_document};
 use osslscope_ebpf_common::CountValue;
 use std::collections::HashMap;
 use std::os::unix::fs::MetadataExt as _;
@@ -219,6 +224,35 @@ fn files_for(staged: &[&Staged]) -> HashMap<String, plan::FileBytes> {
 
 fn fire(session: &mut CountSession<FakeCountBackend>, cookie: u32, now_ns: u64, n: u64) {
     session.backend_mut().fire(PID, cookie, now_ns, n);
+}
+
+fn finalize_doc(sites: Vec<SiteExecution>) -> CaptureDocument {
+    finalize(FinalizeInput {
+        window: CaptureWindow {
+            requested_start_ns: 1_000,
+            requested_end_ns: 2_000,
+            effective_start_ns: 1_000,
+            effective_end_ns: 2_000,
+            signal_cut: false,
+        },
+        sites,
+        fenced: Vec::new(),
+        objects: Vec::new(),
+        coverage: Vec::new(),
+        counters: Vec::new(),
+        fatal: None,
+        target: TargetRecord::unknown(),
+        openssl: OpensslVersion::unknown(),
+        disposition: None,
+        policy: None,
+        legacy_partition: LegacyCallPartition::default(),
+    })
+}
+
+fn cbom_assets(doc: &CaptureDocument) -> Vec<serde_json::Value> {
+    let bytes = osslscope::report::render_cbom(doc).unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    v["components"].as_array().cloned().unwrap_or_default()
 }
 
 #[test]
@@ -546,6 +580,94 @@ fn duplicate_sites_union_candidates() {
     let drain = s.close_and_drain(Duration::from_secs(5)).unwrap();
     assert_eq!(drain.total_calls(), 4);
     assert_eq!(drain.current[0].candidates.len(), 2);
+}
+
+#[test]
+fn duplicate_merge_preserves_ambiguity_in_both_orders() {
+    // R01 fix round 3: the duplicate-triple merge (attach_delta) is
+    // coverage-conservative — AmbiguousComplete survives merging in
+    // BOTH input orders (ambiguity is contagious: Complete +
+    // AmbiguousComplete = AmbiguousComplete either way). One triple,
+    // two legs; candidates agree on algorithm/provider/op/funcid and
+    // differ only in weak metadata — the shape `definite_asset`
+    // would otherwise mint into a false definite 7 + CBOM asset.
+    for complete_first in [true, false] {
+        let tag = if complete_first {
+            "complete-first"
+        } else {
+            "ambiguous-first"
+        };
+        let stage = Stage::fresh("dup-amb");
+        let bytes = self_bytes();
+        let off = x_offset(&bytes);
+        let mut s = session();
+        let a = stage.write("prov.so", &bytes);
+        let live = vec![mapping(&a)];
+        let files = files_for(&[&a]);
+        let mut leg_complete = site(
+            &a,
+            off,
+            "fp-A",
+            vec![candidate("prov", "default", 1, 7, &["AES-128-GCM"], false)],
+        );
+        leg_complete.candidates_coverage = CandidateCoverage::Complete;
+        let mut leg_ambiguous = site(
+            &a,
+            off,
+            "fp-A",
+            vec![candidate("prov", "default", 1, 7, &["AES-128-GCM"], true)],
+        );
+        leg_ambiguous.candidates_coverage = CandidateCoverage::AmbiguousComplete;
+        let legs = if complete_first {
+            vec![leg_complete, leg_ambiguous]
+        } else {
+            vec![leg_ambiguous, leg_complete]
+        };
+        let rep = s
+            .attach_delta(&delta(legs), &live, &files, ATTACH_AT)
+            .unwrap();
+        assert_eq!(rep.attached, 1, "{tag}: {rep:?}");
+        assert_eq!(s.cookie_count(), 1, "{tag}");
+        let cookie = s.cookie_for(a.device, a.ino, off).unwrap();
+        s.open_window(1000, 2000).unwrap();
+        fire(&mut s, cookie, 1500, 7);
+        let drain = s.close_and_drain(Duration::from_secs(5)).unwrap();
+        assert_eq!(drain.total_calls(), 7, "{tag}");
+        assert_eq!(drain.current.len(), 1, "{tag}");
+        assert_eq!(drain.current[0].candidates.len(), 2, "{tag}: aliases union");
+        // End-to-end consequence: no definite attribution, finite
+        // upper over the 7 observed calls, no CBOM asset.
+        let doc = finalize_doc(drain.current.clone());
+        assert!(
+            matches!(doc.status, Completeness::Complete),
+            "{tag}: merged ambiguous duplicates stay COMPLETE"
+        );
+        for rule in [
+            PolicyRule::require_executed("AES-128-GCM"),
+            PolicyRule::deny_algorithm("AES-128-GCM"),
+        ] {
+            let v = evaluate_document(std::slice::from_ref(&rule), &doc);
+            assert_eq!(
+                v.rules[0].bounds.definite, 0,
+                "{tag}: {} must not mint definite",
+                rule.name
+            );
+            assert_eq!(v.rules[0].bounds.possible, Some(7), "{tag}: {}", rule.name);
+            assert_eq!(
+                v.rules[0].verdict,
+                RuleVerdict::Inconclusive,
+                "{tag}: {}",
+                rule.name
+            );
+        }
+        assert_eq!(cbom_assets(&doc).len(), 0, "{tag}");
+        // Direct contract pin: the merge preserved ambiguity.
+        assert_eq!(
+            drain.current[0].candidates_coverage,
+            CandidateCoverage::AmbiguousComplete,
+            "{tag}: merge keeps the weakest claim"
+        );
+    }
 }
 
 #[test]

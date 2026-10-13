@@ -499,10 +499,12 @@ impl<B: CountBackend> CountSession<B> {
         }
         // Merge duplicate backing triples within one delta: their
         // candidate sets union (a site's aliases are simultaneous,
-        // never competing updates) and coverage degrades to Unknown
-        // when either side is incomplete. Conflicting object
-        // fingerprints for one triple are a producer contradiction:
-        // fail closed rather than silently keeping the first.
+        // never competing updates) and coverage merges
+        // conservatively — the weakest claim wins in either input
+        // order (Unknown over AmbiguousComplete over Complete;
+        // ambiguity is contagious). Conflicting object fingerprints
+        // for one triple are a producer contradiction: fail closed
+        // rather than silently keeping the first.
         let mut merged: HashMap<(u64, u64, u64), DiscoveredSite> = HashMap::new();
         for mut site in delta.discovered.clone() {
             site.normalize();
@@ -516,9 +518,17 @@ impl<B: CountBackend> CountSession<B> {
                         anyhow::bail!("conflicting object identity for one backing triple");
                     }
                     prior.candidates.extend(site.candidates);
-                    if site.candidates_coverage == CandidateCoverage::Unknown {
-                        prior.candidates_coverage = CandidateCoverage::Unknown;
-                    }
+                    prior.candidates_coverage =
+                        match (prior.candidates_coverage, site.candidates_coverage) {
+                            (CandidateCoverage::Unknown, _) | (_, CandidateCoverage::Unknown) => {
+                                CandidateCoverage::Unknown
+                            }
+                            (CandidateCoverage::AmbiguousComplete, _)
+                            | (_, CandidateCoverage::AmbiguousComplete) => {
+                                CandidateCoverage::AmbiguousComplete
+                            }
+                            _ => CandidateCoverage::Complete,
+                        };
                 }
             }
         }
