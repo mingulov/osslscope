@@ -306,6 +306,94 @@ fn h7_runtime_human_shape() {
     );
 }
 
+#[test]
+fn h7_usable_evidence_is_kind_eligibility() {
+    // R02: has_usable_evidence centralizes fatal-kind eligibility —
+    // non-fatal and salvaged-Runtime docs are usable; every other
+    // fatal kind is evidence-free. Ambiguous and site-free Runtime
+    // docs stay usable: per-site tests still decide definite vs
+    // possible (see the stub-runner controls).
+    let mut complete = osslscope::capture::empty_document();
+    complete.status = Completeness::Complete;
+    assert!(complete.has_usable_evidence());
+    let mut partial = osslscope::capture::empty_document();
+    partial.status = Completeness::Partial {
+        reasons: Vec::new(),
+    };
+    assert!(partial.has_usable_evidence());
+    assert!(runtime_doc().has_usable_evidence());
+    let ambiguous = doc_with(
+        vec![site_with(
+            1,
+            7,
+            vec![
+                cand("prov-default", "default", 1, 7, &["MD5"], true),
+                cand("prov-default", "default", 1, 7, &["SHA2-256"], false),
+            ],
+            CandidateCoverage::Complete,
+        )],
+        Some(FatalKind::Runtime("discovery finish: boom".to_string())),
+    );
+    assert!(ambiguous.has_usable_evidence());
+    assert!(!env_doc().has_usable_evidence());
+    assert!(!setup_failure_document(FatalKind::Recycled).has_usable_evidence());
+    assert!(!setup_failure_document(FatalKind::AttachZero).has_usable_evidence());
+}
+
+#[test]
+fn h7_evidence_free_fatal_stays_no_verdict() {
+    // R02 controls: environment/recycled/attach-zero docs carry no
+    // usable evidence — check assembly yields no-verdict, semantics
+    // accepts no-verdict (and still rejects evaluated verdicts),
+    // the CBOM is explicitly empty with the no-usable-evidence
+    // disclaimer, and the exit stays 4.
+    for (name, kind) in [
+        ("environment", FatalKind::Environment("no bpf".to_string())),
+        ("recycled", FatalKind::Recycled),
+        ("attach-zero", FatalKind::AttachZero),
+    ] {
+        let doc = setup_failure_document(kind);
+        assert!(!doc.has_usable_evidence(), "{name}");
+        let v = evaluate_document(std::slice::from_ref(&PolicyRule::deny_weak()), &doc);
+        assert_eq!(v.overall(), PolicyOutcome::NoVerdict, "{name}");
+        assert!(v.rules.is_empty(), "{name}");
+        let mut cdoc = doc.clone();
+        cdoc.policy = Some(osslscope::check::policy_record(&v));
+        let bytes = render_json(&cdoc).unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        osslscope::schema::validate_v2(&val).unwrap();
+        osslscope::schema::check_v2_semantics(&val)
+            .unwrap_or_else(|e| panic!("{name}: no-verdict must validate: {e}"));
+        assert_eq!(val["policy"]["verdict"], "no-verdict", "{name}");
+        let mut bad = val.clone();
+        bad["policy"] = serde_json::json!({"verdict": "pass", "rules": []});
+        assert!(
+            osslscope::schema::check_v2_semantics(&bad).is_err(),
+            "{name}: evaluated verdict on evidence-free fatal accepted"
+        );
+        let cbom: serde_json::Value =
+            serde_json::from_slice(&osslscope::report::render_cbom(&cdoc).unwrap()).unwrap();
+        assert_eq!(cbom["components"].as_array().unwrap().len(), 0, "{name}");
+        let disclaimer = cbom["metadata"]["properties"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == "osslscope:completeness-disclaimer")
+            .unwrap()["value"]
+            .as_str()
+            .unwrap();
+        assert!(
+            disclaimer.contains("no usable evidence"),
+            "{name}: {disclaimer}"
+        );
+        assert_eq!(
+            exit_for(v.overall(), None, &cdoc, &ok_delivery()),
+            4,
+            "{name}"
+        );
+    }
+}
+
 // --- Acceptance: post-observation close-flow audit -----------------------
 // The close flow (close_and_finalize, fail/salvage, recycled) never
 // `?`s — every error is caught and folded into the salvaged doc —

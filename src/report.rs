@@ -216,13 +216,10 @@ pub fn exit_for(
     if outcome == crate::policy::PolicyOutcome::Violation {
         return 10;
     }
-    if matches!(
-        &doc.status,
-        Completeness::Fatal {
-            kind: FatalKind::Runtime(_),
-            ..
-        }
-    ) {
+    // A salvaged (usable-evidence) fatal doc is a tool failure
+    // below a proved violation but above setup-no-verdict. Fatal-kind
+    // eligibility is the shared has_usable_evidence distinction.
+    if matches!(&doc.status, Completeness::Fatal { .. }) && doc.has_usable_evidence() {
         return 1;
     }
     if outcome == crate::policy::PolicyOutcome::NoVerdict {
@@ -1127,7 +1124,11 @@ fn bom_slug(text: &str) -> String {
 }
 
 fn cbom_json(doc: &CaptureDocument) -> serde_json::Value {
-    let fatal = matches!(doc.status, Completeness::Fatal { .. });
+    // Eligibility is the shared fatal-kind distinction
+    // (has_usable_evidence): salvaged Runtime docs enumerate
+    // definite assets with the same per-site accounting as any
+    // usable doc, while evidence-free fatal docs stay empty.
+    let usable = doc.has_usable_evidence();
     let prop = |name: &str, value: String| serde_json::json!({"name": name, "value": value});
     let window_props = || {
         vec![
@@ -1150,15 +1151,16 @@ fn cbom_json(doc: &CaptureDocument) -> serde_json::Value {
         ]
     };
     // One component per definite site (current + fenced); ambiguous,
-    // unknown-coverage and quiet sites contribute none. FATAL
-    // carries no components at all: the evidence is unusable.
+    // unknown-coverage and quiet sites contribute none. An
+    // evidence-free fatal doc carries no components at all: the
+    // evidence is unusable.
     let mut components: Vec<serde_json::Value> = Vec::new();
     let mut omitted_ambiguous_sites = 0u64;
     let mut omitted_ambiguous_calls = 0u64;
     let mut omitted_unknown_sites = 0u64;
     let mut omitted_unknown_calls = 0u64;
     let mut omitted_refs: Vec<String> = Vec::new();
-    if !fatal {
+    if usable {
         let mut visit = |site: &SiteExecution| {
             if site.calls == 0 {
                 return;
@@ -1310,10 +1312,18 @@ fn cbom_json(doc: &CaptureDocument) -> serde_json::Value {
             } else {
                 why
             };
-            metadata.push(prop(
-                "osslscope:completeness-disclaimer",
-                format!("FATAL: no usable evidence ({why})"),
-            ));
+            // A usable (Runtime) fatal still names FATAL — absence
+            // stays unprovable — but reports the salvaged evidence
+            // instead of claiming none exists. Evidence-free kinds
+            // keep the refusal wording.
+            let disclaimer = if doc.has_usable_evidence() {
+                format!(
+                    "FATAL runtime failure ({why}); salvaged evidence retained, absence = not-observed in window"
+                )
+            } else {
+                format!("FATAL: no usable evidence ({why})")
+            };
+            metadata.push(prop("osslscope:completeness-disclaimer", disclaimer));
         }
     }
     serde_json::json!({
