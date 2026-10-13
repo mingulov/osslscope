@@ -33,24 +33,46 @@ getcap /usr/bin/osslscope                  # expect: cap_bpf,cap_perfmon+ep
 ```
 
 Build the BPF objects the gate needs (nightly toolchain, see the
-project README), then place them where the gate step can read
-them. If the install hook warned about caps, re-apply:
+project README), then install them into a trusted system
+location (`/usr/local/lib/osslscope` or `/usr/local/lib64/osslscope`;
+the distro `/usr/lib{,64}/osslscope` pair is the fallback) so the
+gate step below resolves them without flags. If the install hook
+warned about caps, re-apply:
 `sudo setcap cap_bpf,cap_perfmon+ep /usr/bin/osslscope`.
 See [install](install.md).
 
 ## Gate step (unprivileged)
+
+Preflight with the same objects the gate will use, then gate.
+With a trusted system install, both resolve the BPF objects
+implicitly; with a user-owned prefix (never trusted implicitly),
+pass the same explicit `--object`/`--count-object` pair to both:
 
 ```sh
 osslscope doctor || exit 4                      # preflight first, always
 
 osslscope check \
   --provider /path/to/libcrypto.so.3 --builtin \
-  --object ./osslscope-harvest --count-object ./osslscope-count \
   --deny-weak --deny-provider legacy \
   --require-executed ML-KEM-768 \
   --duration 30 --grace 5 \
   --format json --out gate.json --image-digest "$IMAGE_DIGEST" \
-  run -- ./my-app --smoke-test
+  --workload-out workload.log \
+  run -- ./my-app --smoke-test \
+  >driver.log 2>&1                             # observer diagnostics only
+```
+
+User-owned-prefix variant (explicit pair, same on both lines):
+
+```sh
+osslscope doctor --object "$PFX/lib/osslscope/osslscope-harvest" \
+  --count-object "$PFX/lib/osslscope/osslscope-count" || exit 4
+
+osslscope check \
+  --provider /path/to/libcrypto.so.3 --builtin \
+  --object "$PFX/lib/osslscope/osslscope-harvest" \
+  --count-object "$PFX/lib/osslscope/osslscope-count" \
+  ... # same rules, window, and outputs as above
 ```
 
 Notes:
@@ -62,6 +84,11 @@ Notes:
   external provider module instead.
 - `--image-digest` records the container digest in the actionability
   tuple (empty string on bare metal).
+- `--workload-out workload.log` captures the workload's own
+  stdout/stderr to a file; without it the workload output goes
+  to /dev/null and observer stdout stays a pure artifact
+  channel. Observer diagnostics stay in `driver.log` and are
+  never oracle input.
 - Defaults when flags are omitted: `--duration 30`,
   `--settle 2`, `--timeout 60`, `--grace 5` (all seconds).
   <!-- source: defaults: src/report.rs, src/check.rs, src/capture.rs -->
@@ -73,17 +100,20 @@ Notes:
 | Exit | Meaning | Gate action |
 |---|---|---|
 | 0 | clean (COMPLETE, no violation) | pass |
-| 3 | PARTIAL evidence, no violation | warn + upload artifacts; gate passes by default (strict-fail is team policy) |
+| 3 | PARTIAL evidence, passing policy verdict | warn + upload artifacts; gate passes by default (strict-fail is team policy) |
 | 10 | policy violation (on COMPLETE, PARTIAL, or salvaged `runtime`-fatal) | fail; triage per [violation triage](violation-triage.md) |
+| 11 | inconclusive: a requirement is unproven under relevant uncertainty | fail; triage the relevant gap per [the PARTIAL runbook](partial-runbook.md) -- the requirement is unproven, never fabricated |
 | 4 | setup failure: observation never started (environment/attach failure) | fail; run `doctor`, remediate, retry (see [attach failures](attach-failures.md)) |
-| 1 | child failed (`child_exit` present), delivery failed, or salvaged close failure (`fatal_kind: runtime` in gate.json — observations kept) | fail; branch on `child_exit` / `fatal_kind` in gate.json |
+| 1 | child failed (`disposition: exited` with nonzero code), delivery failed, or salvaged close failure (`fatal_kind: runtime` in gate.json — observations kept) | fail; branch on `disposition` / `fatal_kind` in gate.json |
 | 2 | usage/config error | fail; fix the invocation |
 
 Do NOT gate on COMPLETE status or exit 0 on real TLS apps: v1 is
 explicitly not qualified for that (see [who should NOT
 adopt](what-it-proves.md#who-should-not-adopt-read-before-installing)).
 Exit 3 with a passing policy verdict is the normal shape for
-TLS-terminating services.
+TLS-terminating services. A proved violation dominates every
+tool failure: exit 10 fires even when delivery failed or the
+document is a salvaged `runtime`-fatal.
 
 ## Artifact upload
 
@@ -91,9 +121,11 @@ Always upload the gate artifacts, even on violation/PARTIAL --
 they are written in all non-fatal outcomes:
 
 - `gate.json` (the full evidence document: window, completeness,
-  executions, legacy block, policy).
+  sites, coverage, legacy partition, policy).
 - The CBOM file when `--cbom` is passed (CycloneDX 1.6; PARTIAL
   evidence travels as a `metadata` disclaimer property).
+- `workload.log` (the workload's own output) and `driver.log`
+  (observer diagnostics) for triage.
 
 Example (GitHub Actions):
 
@@ -105,12 +137,16 @@ Example (GitHub Actions):
     path: |
       gate.json
       cbom.json
+      workload.log
+      driver.log
 ```
 
 ## CI timeout
 
-The CI step timeout must exceed the capture window plus drain
-grace plus twice the unobserved test baseline:
+`--duration` sets the requested observation window; the CI
+step timeout is a separate, outer bound and must exceed the
+capture window plus drain grace plus twice the unobserved
+test baseline:
 
 ```text
 CI timeout >= duration + grace + test-baseline x 2
@@ -118,8 +154,17 @@ CI timeout >= duration + grace + test-baseline x 2
 
 With defaults (30 s window, 5 s grace) and a 60 s smoke test,
 set the step timeout above 155 s. A live child at window expiry
-is `over-budget` PARTIAL by design (the observer never kills its
-child), and a signal-cut window is always PARTIAL -- both are
+is PARTIAL by design (`loss` reason, counter
+`capture.over_budget`; the observer never kills its child),
+and a signal-cut window is always PARTIAL -- both are
 avoided by sizing the timeout, not by raising the duration.
 <!-- source: timeout rule: PLAN.md P6 exit 2; over-budget/signal
      semantics: PRD.md sections 5-6 -->
+
+At window end the observer detaches a still-running owned child
+and leaves it running (`disposition: detached-running` with its
+pid; the child is never signaled). Waiting for and cleaning up
+that intentionally detached workload is the CI step's job, not
+the observer's: the step owns the workload process lifetime
+after detach, so size the timeout for the workload's own
+shutdown and reap it in the step.
