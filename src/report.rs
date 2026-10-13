@@ -1054,10 +1054,13 @@ fn fp_short(fp: &str) -> String {
 }
 
 /// Neutralize target-controlled text for human (terminal/log)
-/// display (R12/F14): every control, bidi-override and
-/// zero-width/format character becomes `?`, so rendered lines
-/// cannot move the cursor, inject fake lines, or reorder displayed
-/// text. Identity on clean text. Applies at the human boundary to
+/// display (R12/F14): every control, bidi-override/isolate and
+/// listed zero-width/format character becomes `?` (coverage is the
+/// `is_display_control` set only: U+2060-U+2064 neutralized, while
+/// deprecated U+206A-U+206F and other unlisted Cf controls pass
+/// through), so rendered lines cannot move the cursor, inject fake
+/// lines, or reorder displayed text. Identity on clean text. Applies
+/// at the human boundary to
 /// every free-text interpolation (comm, container/image, version,
 /// scopes, counters, rules, fingerprints, fatal detail); fixed
 /// vocabulary (status, verdicts, op names, numbers) needs none.
