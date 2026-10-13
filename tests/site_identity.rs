@@ -208,7 +208,7 @@ fn files_for(staged: &[&Staged]) -> HashMap<String, plan::FileBytes> {
             (
                 s.path.clone(),
                 plan::FileBytes {
-                    bytes: std::fs::read(&s.path).unwrap(),
+                    bytes: std::fs::read(&s.path).unwrap().into(),
                     dev: s.device,
                     ino: s.ino,
                 },
@@ -1060,6 +1060,39 @@ impl plan::ReadBoundedSource for ScriptedSource {
     }
 }
 
+/// Metered `ReadBoundedSource` (R14 fix round 1): counts `read`
+/// calls and delivered bytes through shared handles (the reader
+/// takes the source by value, so the test keeps the meters),
+/// while reporting scripted before/after identities. Proves
+/// pre-read refusal (zero reads for oversized advertised length)
+/// and bounded delivery (at most cap+1 bytes for growers) —
+/// error-kind-only checks would pass even with the guards gutted.
+struct MeteredSource {
+    data: std::io::Cursor<Vec<u8>>,
+    before: (u64, u64, u64),
+    after: (u64, u64, u64),
+    identity_calls: std::cell::Cell<usize>,
+    read_calls: std::rc::Rc<std::cell::Cell<usize>>,
+    bytes_served: std::rc::Rc<std::cell::Cell<u64>>,
+}
+
+impl std::io::Read for MeteredSource {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.read_calls.set(self.read_calls.get() + 1);
+        let n = self.data.read(buf)?;
+        self.bytes_served.set(self.bytes_served.get() + n as u64);
+        Ok(n)
+    }
+}
+
+impl plan::ReadBoundedSource for MeteredSource {
+    fn bound_identity(&self) -> std::io::Result<(u64, u64, u64)> {
+        let n = self.identity_calls.get();
+        self.identity_calls.set(n + 1);
+        Ok(if n == 0 { self.before } else { self.after })
+    }
+}
+
 #[test]
 fn r14_bounded_read_accepts_exactly_at_cap() {
     // Cap: a file of exactly the allowance reads fully with its
@@ -1088,8 +1121,31 @@ fn r14_bounded_read_refuses_cap_plus_one() {
 
 #[test]
 fn r14_bounded_read_refuses_huge_advertised_length() {
-    // A sparse file advertising terabytes refuses on fstat alone:
-    // no multi-gigabyte allocation, no read.
+    // Pre-read refusal (R14 fix round 1): an object advertising
+    // past the allowance refuses on fstat alone — the injected
+    // source observes ZERO reads (a kind-only check would pass
+    // even if the reader read 1,025 bytes first).
+    let read_calls = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let bytes_served = std::rc::Rc::new(std::cell::Cell::new(0u64));
+    let src = MeteredSource {
+        data: std::io::Cursor::new(vec![0x7fu8; 8]),
+        before: (7, 7, 1u64 << 40),
+        after: (7, 7, 1u64 << 40),
+        identity_calls: std::cell::Cell::new(0),
+        read_calls: read_calls.clone(),
+        bytes_served: bytes_served.clone(),
+    };
+    let err = plan::read_bounded_from(src, 1024).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::FileTooLarge);
+    assert_eq!(
+        read_calls.get(),
+        0,
+        "oversized advertised length must refuse before any read"
+    );
+    assert_eq!(bytes_served.get(), 0);
+    // Same contract through a real sparse file (the fstat path,
+    // not just the injected source): terabytes advertised, bytes
+    // on disk tiny, no multi-gigabyte allocation.
     let stage = Stage::fresh("r14-huge");
     let path = stage.dir.join("huge.so");
     std::fs::write(&path, [0x7fu8; 8]).unwrap();
@@ -1107,15 +1163,31 @@ fn r14_bounded_read_refuses_huge_advertised_length() {
 fn r14_bounded_read_refuses_growth_mid_read() {
     // A grower serving past the allowance trips the
     // overflow-detection byte DURING the read (the fstat
-    // pre-check alone cannot catch it).
-    let growing = || ScriptedSource {
+    // pre-check alone cannot catch it). Delivery is metered
+    // (R14 fix round 1): exactly cap+1 bytes are served — a
+    // kind-only check would pass even if the reader delivered
+    // all 70 bytes before refusing.
+    let read_calls = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let bytes_served = std::rc::Rc::new(std::cell::Cell::new(0u64));
+    let growing = || MeteredSource {
         data: std::io::Cursor::new(vec![0x7fu8; 70]),
         before: (7, 7, 64),
         after: (7, 7, 70),
         identity_calls: std::cell::Cell::new(0),
+        read_calls: read_calls.clone(),
+        bytes_served: bytes_served.clone(),
     };
     let err = plan::read_bounded_from(growing(), 64).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::FileTooLarge);
+    assert!(
+        read_calls.get() > 0,
+        "the during-read guard (not the pre-check) must fire"
+    );
+    assert_eq!(
+        bytes_served.get(),
+        65,
+        "delivery stops at cap+1 (one overflow-detection byte)"
+    );
     // Growth within the allowance still refuses: the after-length
     // no longer matches, so the bytes may have torn.
     let err = plan::read_bounded_from(growing(), 128).unwrap_err();
@@ -1167,4 +1239,37 @@ fn r14_legacy_wrapper_caps_single_object() {
     let fb = plan::read_file_bound(&small.path).unwrap();
     assert_eq!(fb.bytes.len(), 32);
     assert_eq!((fb.dev, fb.ino), (small.device, small.ino));
+    // The wrapper enforces the per-object policy ceiling (R14 fix
+    // round 1): a sparse object advertising past 128 MiB refuses
+    // without being read (bytes on disk stay tiny).
+    let sparse = stage.dir.join("sparse-big.so");
+    std::fs::write(&sparse, [0x7fu8; 8]).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&sparse)
+        .unwrap()
+        .set_len(plan::MAX_OBJECT_BYTES as u64 + 1)
+        .unwrap();
+    let err = plan::read_file_bound(sparse.to_str().unwrap()).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::FileTooLarge);
+}
+
+#[test]
+fn r14_fix_filebytes_clone_shares_allocation() {
+    // R14 fix round 1 (finding 2): cache entries and round outputs
+    // share one immutable payload owner — cloning a FileBytes must
+    // NOT duplicate the allocation (the pre-fix Vec clone copied
+    // every payload byte on every relevant poll).
+    let fb = plan::FileBytes {
+        bytes: vec![0x7fu8; 64].into(),
+        dev: 7,
+        ino: 7,
+    };
+    let dupe = fb.clone();
+    assert_eq!(
+        fb.bytes.as_ptr(),
+        dupe.bytes.as_ptr(),
+        "FileBytes::clone must share the payload allocation, not copy it"
+    );
+    assert_eq!(fb, dupe);
 }
