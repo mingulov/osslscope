@@ -418,6 +418,55 @@ fn violation_doc() -> CaptureDocument {
     doc
 }
 
+/// Salvaged Runtime-fatal violation document: definite DES use with an
+/// evaluated policy — usable evidence under a fatal status.
+fn runtime_violation_doc() -> CaptureDocument {
+    let mut input = input_base();
+    input.sites = vec![site_at(
+        FP_A,
+        8,
+        100,
+        0x1000,
+        0,
+        500,
+        vec![cand(FP_A, "default", 2, 21, &["DES"], false)],
+        CandidateCoverage::Complete,
+    )];
+    input.coverage = vec![ScopeCoverage {
+        scope: "provider/default".to_string(),
+        expected: ExpectedScope::Applicable { sites: 1 },
+        discovered: 1,
+        attached: 1,
+    }];
+    input.counters = vec![loss_counter(
+        "discovery.finish_failed",
+        CounterSource::Discovery,
+        1,
+    )];
+    input.fatal = Some(FatalKind::Runtime("discovery finish: boom".to_string()));
+    input.policy = Some(PolicyRecord {
+        verdict: PolicyVerdict::Violation,
+        rules: vec![PolicyRuleResult {
+            rule: "deny-algorithm".to_string(),
+            predicate: "algorithm=DES".to_string(),
+            result: RuleVerdict::Violation,
+            definite: 500,
+            possible: None,
+            evidence: vec![evidence_ref(FP_A, 8, 100, 0x1000, 0, 500)],
+        }],
+    });
+    let doc = finalize_honest(input);
+    assert!(matches!(
+        doc.status,
+        Completeness::Fatal {
+            kind: FatalKind::Runtime(_),
+            ..
+        }
+    ));
+    assert!(doc.has_usable_evidence());
+    doc
+}
+
 /// Inconclusive check document: only an ambiguous site + a possible
 /// (unproven) algorithm match.
 fn inconclusive_doc() -> CaptureDocument {
@@ -2216,6 +2265,67 @@ fn semantics_rejects_inconsistent_policy_verdict() {
     v["policy"] = json!({"verdict": "no-verdict", "rules": []});
     validate_v2(&v).expect("fatal no-verdict shape validates");
     check_v2_semantics(&v).expect("fatal no-verdict is consistent");
+}
+
+#[test]
+fn semantics_accepts_evaluated_runtime_verdicts() {
+    // R02: a FATAL/runtime doc carries an evaluated verdict (the AND
+    // of its rules) — violation, pass and inconclusive shapes all
+    // validate; no-verdict on usable evidence is rejected, as is any
+    // verdict contradicting its rules.
+    let v = json_of(&runtime_violation_doc());
+    validate_v2(&v).expect("runtime violation shape validates");
+    check_v2_semantics(&v).expect("runtime violation is consistent");
+    assert_eq!(v["policy"]["verdict"], "violation");
+    // Pass and inconclusive verdicts with matching rules validate too.
+    let mut pass = v.clone();
+    pass["policy"]["verdict"] = json!("pass");
+    pass["policy"]["rules"][0]["result"] = json!("pass");
+    pass["policy"]["rules"][0]["definite"] = json!(0);
+    pass["policy"]["rules"][0]["possible"] = json!(0);
+    pass["policy"]["rules"][0]["evidence"] = json!([]);
+    check_v2_semantics(&pass).expect("runtime pass is consistent");
+    let mut inconclusive = v.clone();
+    inconclusive["policy"]["verdict"] = json!("inconclusive");
+    inconclusive["policy"]["rules"][0]["result"] = json!("inconclusive");
+    inconclusive["policy"]["rules"][0]["definite"] = json!(0);
+    inconclusive["policy"]["rules"][0]["evidence"] = json!([]);
+    check_v2_semantics(&inconclusive).expect("runtime inconclusive is consistent");
+    // No-verdict on usable evidence is rejected (it would mask the
+    // retained sites), as is a verdict contradicting its rules.
+    let mut masked = v.clone();
+    masked["policy"]["verdict"] = json!("no-verdict");
+    assert!(
+        check_v2_semantics(&masked).is_err(),
+        "no-verdict on usable Runtime evidence accepted"
+    );
+    let mut contradicted = v.clone();
+    contradicted["policy"]["verdict"] = json!("pass");
+    assert!(
+        check_v2_semantics(&contradicted).is_err(),
+        "pass verdict with a violation rule accepted on a Runtime doc"
+    );
+}
+
+#[test]
+fn cbom_runtime_retains_definite_assets() {
+    // R02: the CBOM enumerates definite assets on usable Runtime
+    // docs (per-site accounting still applies) with an accurate
+    // disclaimer — no silent emptying, no false "no usable evidence".
+    let cbom = cbom_of(&runtime_violation_doc());
+    let comps = cbom["components"].as_array().unwrap();
+    assert_eq!(comps.len(), 1);
+    let props = cbom_props(&comps[0]);
+    assert_eq!(props["osslscope:algorithm"], "DES");
+    assert_eq!(props["osslscope:calls"], "500");
+    let meta = cbom_metadata(&cbom);
+    assert_eq!(meta["osslscope:omitted-ambiguous-sites"], "0");
+    assert_eq!(meta["osslscope:omitted-unknown-coverage-sites"], "0");
+    assert_eq!(meta["osslscope:policy-verdict"], "violation");
+    let disclaimer = &meta["osslscope:completeness-disclaimer"];
+    assert!(disclaimer.contains("FATAL"), "{disclaimer}");
+    assert!(disclaimer.contains("salvaged"), "{disclaimer}");
+    assert!(!disclaimer.contains("no usable evidence"), "{disclaimer}");
 }
 
 #[test]
