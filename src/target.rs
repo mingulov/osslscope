@@ -21,9 +21,9 @@ use std::ffi::CString;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, IntoRawFd as _, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Explicit custody of an owned child. Query with
@@ -187,9 +187,9 @@ fn reap_blocking(pid: u32) -> anyhow::Result<i32> {
 /// fd).
 ///
 /// File vs streaming (R06/F07): a [`WorkloadDest::File`] path is
-/// opened, truncated and pinned to a regular file by the PARENT
-/// pre-fork; the child inherits the open fd and never opens a path
-/// itself, so a FIFO/device/symlink selection — or a path replaced
+/// validated, staged and atomically published to a fresh regular file by
+/// the PARENT pre-fork; the child inherits the open fd and never opens a
+/// path itself, so a FIFO/device/symlink selection — or a path replaced
 /// after validation — can neither block nor redirect setup. Anything
 /// that must stream (pipes, sockets, FIFOs, devices) uses
 /// [`WorkloadDest::Fd`]: the caller opens and owns the fd with
@@ -198,16 +198,22 @@ fn reap_blocking(pid: u32) -> anyhow::Result<i32> {
 pub enum WorkloadDest {
     /// Both streams to /dev/null (default).
     Null,
-    /// Both streams to this file (created + truncated per run,
-    /// parent-side, pre-fork). Preparation is staged on ONE fenced worker:
-    /// the file is opened and pinned WITHOUT truncating, then truncated on
-    /// that same worker only after it re-checks the abandonment fence — a
-    /// worker delayed past abandonment truncates nothing, and the caller
-    /// never blocks in the open/truncate itself. Accepted ONLY as a pinned
-    /// regular file: missing parents, symlinks, FIFOs, directories,
+    /// Both streams to this file (fresh empty inode per run,
+    /// parent-side, pre-fork). Preparation runs on ONE gated worker:
+    /// the destination is validated (never created, never truncated),
+    /// then a uniquely-owned staging file is created beside it, then the
+    /// abandonment check + atomic publish (`rename`) run under the ONE
+    /// lock the caller's abandonment setter shares — a worker delayed
+    /// past abandonment deletes its staging and publishes nothing, and
+    /// the caller never blocks in the open/stage itself. Accepted ONLY
+    /// as a regular file: missing parents, symlinks, FIFOs, directories,
     /// sockets and devices fail setup pre-fork, naming the path with the
-    /// 126 setup marker. The open fd — not the path — is handed to the
-    /// child, so post-open path replacement is harmless.
+    /// 126 setup marker. The published fd — not the path — is handed to
+    /// the child, so post-publish path replacement is harmless. Notes:
+    /// each run publishes a FRESH inode (hard links to a previous run's
+    /// file are not preserved; permission bits are carried over), and the
+    /// destination's directory must be writable (staging + rename live
+    /// beside the destination).
     File(PathBuf),
     /// Both streams to a caller-held fd (harness pipe form; the
     /// child never closes the caller's fd). Validated pre-fork for
@@ -315,34 +321,53 @@ fn lstat_kind(c: &std::ffi::CStr) -> &'static str {
     file_kind(st.st_mode)
 }
 
-/// Open + pin a [`WorkloadDest::File`] sink parent-side, pre-fork
-/// (R06/F07) — WITHOUT truncating (fix round 2: the staged open). There
-/// is deliberately no `O_TRUNC` here: a worker delayed past the caller's
-/// abandonment must not destroy successor bytes, so truncation happens
-/// only in [`truncate_pinned_sink`], on the same fenced worker, after a
-/// re-check of the abandonment fence (fix round 3). `O_NONBLOCK` keeps a
-/// FIFO-with-no-reader from
-/// hanging the open (it fails `ENXIO` instead); `O_NOFOLLOW` refuses a
-/// final symlink; the `fstat` accepts ONLY a regular file; `O_NONBLOCK`
-/// is then cleared so the workload inherits ordinary blocking stdio. The
-/// open fd — never the path — is handed to the child, so post-open path
-/// replacement is harmless. Every failure names the path with the 126
-/// setup marker and spawns nothing. Runs on a setup-control worker (see
-/// [`run_under_control`]) — never call it directly on the setup path:
-/// `O_NONBLOCK` bounds neither a stalled FUSE open nor a block-device
-/// open.
-fn open_pinned_sink(path: &Path) -> anyhow::Result<OwnedFd> {
+/// A validated [`WorkloadDest::File`] target (fix round 4): the
+/// destination as it stands BEFORE staging. Validation opens the CURRENT
+/// destination without creating or truncating it, so a worker delayed
+/// past abandonment has no destructive act available until the atomic
+/// publish — which it then loses (see [`prepare_and_publish_sink`]).
+struct ValidatedTarget {
+    /// The open destination fd when it exists (proves writability,
+    /// non-symlink, regular file; closed after the publish decision —
+    /// the child never sees this fd). `None` when the destination is
+    /// absent (the publish creates it).
+    fd: Option<OwnedFd>,
+    /// Permission bits to carry onto the published inode when the
+    /// destination exists (truncate-in-place preserved them; the atomic
+    /// publish copies them instead). `None` when absent (staging keeps
+    /// its create mode, as a fresh destination always did).
+    mode: Option<u32>,
+}
+
+/// Validate a [`WorkloadDest::File`] target parent-side, pre-fork
+/// (R06/F07) — WITHOUT creating or truncating anything: the open carries
+/// neither `O_CREAT` nor `O_TRUNC`, so validation alone can neither
+/// conjure a destination nor destroy a byte. `O_NONBLOCK` keeps a
+/// FIFO-with-no-reader from hanging the open (it fails `ENXIO` instead);
+/// `O_NOFOLLOW` refuses a final symlink; the `fstat` accepts ONLY a
+/// regular file; `O_NONBLOCK` is then cleared. An absent destination
+/// (`ENOENT`) is NOT an error here — staging + publish create it; every
+/// other failure names the path with the 126 setup marker and spawns
+/// nothing. Runs on a setup-control worker (see [`run_under_control`]) —
+/// never call it directly on the setup path: `O_NONBLOCK` bounds neither
+/// a stalled FUSE open nor a block-device open.
+fn validate_sink_target(path: &Path) -> anyhow::Result<ValidatedTarget> {
     use anyhow::Context as _;
     let c = CString::new(path.as_os_str().as_bytes()).context("NUL in --workload-out path")?;
     let fd = unsafe {
         libc::open(
             c.as_ptr(),
-            libc::O_WRONLY | libc::O_CREAT | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0o644,
+            libc::O_WRONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         )
     };
     if fd < 0 {
         let e = std::io::Error::last_os_error();
+        if e.raw_os_error() == Some(libc::ENOENT) {
+            return Ok(ValidatedTarget {
+                fd: None,
+                mode: None,
+            });
+        }
         anyhow::bail!(
             "workload output {}: cannot open file sink ({}): {e} (setup status 126)",
             path.display(),
@@ -367,8 +392,7 @@ fn open_pinned_sink(path: &Path) -> anyhow::Result<OwnedFd> {
             file_kind(st.st_mode),
         );
     }
-    // Clear O_NONBLOCK: it only guarded the open itself; the
-    // workload must inherit ordinary blocking stdio.
+    // Clear O_NONBLOCK: it only guarded the open itself.
     let flags = unsafe { libc::fcntl(owned.as_raw_fd(), libc::F_GETFL) };
     if flags < 0
         || unsafe { libc::fcntl(owned.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK) } != 0
@@ -379,64 +403,214 @@ fn open_pinned_sink(path: &Path) -> anyhow::Result<OwnedFd> {
             path.display()
         );
     }
-    Ok(owned)
+    let mode = st.st_mode & 0o7777;
+    Ok(ValidatedTarget {
+        fd: Some(owned),
+        mode: Some(mode),
+    })
 }
 
-/// Truncate a staged sink opened by [`open_pinned_sink`] (fix round 2:
-/// the destructive half of file-sink preparation; fix round 3: it runs on
-/// the fenced setup worker, never as a bare caller-side syscall — a sink
-/// that withholds SETATTR fails the setup instead of hanging it). Called
-/// only after the op re-checks the abandonment fence, so a worker delayed
-/// past abandonment truncates nothing. Every failure names the path with
-/// the 126 setup marker and spawns nothing.
-fn truncate_pinned_sink(sink: &OwnedFd, path: &Path) -> anyhow::Result<()> {
-    if unsafe { libc::ftruncate(sink.as_raw_fd(), 0) } != 0 {
-        let e = std::io::Error::last_os_error();
-        anyhow::bail!(
-            "workload output {}: cannot truncate file sink: {e} (setup status 126)",
-            path.display()
-        );
+/// Per-process staging sequence: staging names are unique per (pid,
+/// counter), so a worker delayed past abandonment can only ever touch
+/// its own staging file — never the destination, never another
+/// attempt's staging.
+static STAGING_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Create the uniquely-owned staging sink for `path` (fix round 4): a
+/// fresh empty regular file in the destination's directory, opened
+/// `O_CREAT|O_EXCL` — born empty, so it is never truncated, and never the
+/// destination inode. `mode` carries the validated destination's
+/// permission bits when it exists (see [`ValidatedTarget`]). The staging
+/// path returns alongside the fd so every outcome either publishes it
+/// (atomic rename, exactly once) or deletes it. Every failure names the
+/// destination path with the 126 setup marker and spawns nothing.
+fn create_staging_sink(path: &Path, mode: Option<u32>) -> anyhow::Result<(OwnedFd, PathBuf)> {
+    use anyhow::Context as _;
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let pid = std::process::id();
+    for _ in 0..100 {
+        let n = STAGING_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let staging = dir.join(format!(".osslscope-staging-{pid}-{n}"));
+        let c =
+            CString::new(staging.as_os_str().as_bytes()).context("NUL in --workload-out path")?;
+        let fd = unsafe {
+            libc::open(
+                c.as_ptr(),
+                libc::O_WRONLY
+                    | libc::O_CREAT
+                    | libc::O_EXCL
+                    | libc::O_NONBLOCK
+                    | libc::O_NOFOLLOW
+                    | libc::O_CLOEXEC,
+                0o644,
+            )
+        };
+        if fd < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EEXIST) {
+                continue; // Stale staging from a crashed run or pid reuse; next name.
+            }
+            anyhow::bail!(
+                "workload output {}: cannot create staging file {}: {e} (setup status 126)",
+                path.display(),
+                staging.display(),
+            );
+        }
+        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(owned.as_raw_fd(), &mut st) } != 0
+            || (st.st_mode & libc::S_IFMT) != libc::S_IFREG
+        {
+            let _ = std::fs::remove_file(&staging);
+            anyhow::bail!(
+                "workload output {}: staging file is not a regular file (setup status 126)",
+                path.display(),
+            );
+        }
+        // Clear O_NONBLOCK: it only guarded the open itself; the
+        // workload must inherit ordinary blocking stdio.
+        let flags = unsafe { libc::fcntl(owned.as_raw_fd(), libc::F_GETFL) };
+        if flags < 0
+            || unsafe { libc::fcntl(owned.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK) }
+                != 0
+        {
+            let e = std::io::Error::last_os_error();
+            let _ = std::fs::remove_file(&staging);
+            anyhow::bail!(
+                "workload output {}: cannot clear O_NONBLOCK on staging file: {e} (setup status 126)",
+                path.display(),
+            );
+        }
+        if let Some(mode) = mode {
+            if unsafe { libc::fchmod(owned.as_raw_fd(), mode) } != 0 {
+                let e = std::io::Error::last_os_error();
+                let _ = std::fs::remove_file(&staging);
+                anyhow::bail!(
+                    "workload output {}: cannot set staging file mode: {e} (setup status 126)",
+                    path.display(),
+                );
+            }
+        }
+        return Ok((owned, staging));
     }
-    Ok(())
+    anyhow::bail!(
+        "workload output {}: cannot pick a staging name after 100 attempts (setup status 126)",
+        path.display(),
+    );
 }
 
-/// Open + pin + truncate a [`WorkloadDest::File`] sink, worker-side (fix
-/// round 3 / NEW): the fenced setup op. The staged open
-/// ([`open_pinned_sink`]) never truncates; the truncation runs here, on
-/// the worker — never as a bare caller-side syscall — so a sink that
-/// withholds SETATTR fails the setup instead of hanging it. Between the
-/// two phases the op re-checks the abandonment fence: the caller may have
-/// given up while the open ran, and then the staged fd disposes HERE, on
-/// the worker, without truncating. Residual: the fence load and the
-/// `ftruncate` trap cannot be atomic, so an abandonment landing exactly
-/// between them still truncates — a microsecond window, against an
-/// unbounded caller hang without this move. No fd is ever handed to a
-/// dead setup: the rendezvous only delivers to a live receiver.
-/// `test_delay_ms` is a moved-in test copy (see `SETUP_TEST_HOOK`): a
-/// stall between the open and the fence check, simulating a sink that
-/// answers preparation slowly — the fence is consulted AFTER it. Inert
-/// (`0`) unless a test armed it.
-fn open_and_truncate_pinned_sink(
+/// Read the abandonment gate (fix round 4): poison-tolerant — a lock
+/// failure still yields the guarded value instead of panicking setup
+/// (no panicking operation runs under this lock, so poisoning should
+/// never occur).
+fn abandonment_get(gate: &Mutex<bool>) -> bool {
+    *gate.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Set the abandonment gate (fix round 4): same poison tolerance.
+fn abandonment_set(gate: &Mutex<bool>) {
+    *gate.lock().unwrap_or_else(|e| e.into_inner()) = true;
+}
+
+/// Prepare + publish a [`WorkloadDest::File`] sink, worker-side (fix
+/// round 4): the gated setup op. Staging first — [`validate_sink_target`]
+/// (never creates, never truncates) then [`create_staging_sink`] (a fresh
+/// empty file the worker uniquely owns) — then the ATOMIC publish: the
+/// abandonment check and the `rename` run under ONE mutual-exclusion lock
+/// shared with the caller's abandonment setter, so a late worker is
+/// physically incapable of touching the destination: if the caller
+/// abandoned first, the worker deletes its staging and publishes nothing;
+/// if the worker publishes first, the caller's abandonment lands after —
+/// and the rendezvous only delivers the published fd to a live receiver.
+/// After the caller abandons, no worker path truncates, writes, or
+/// renames onto the destination inode. `test_delay_ms` is a moved-in test
+/// copy (see `SETUP_TEST_HOOK`): a stall between staging and the publish
+/// decision, simulating a sink that answers preparation slowly. Inert
+/// (`0`) unless a test armed it. `publish_gate` is the moved-in poised
+/// rendezvous (see `SETUP_TEST_HOOK`): when armed, the worker signals
+/// readiness and waits (bounded) BEFORE taking the publish lock, so a
+/// test can order the caller's abandonment strictly before the atomic
+/// decision. Residual: the caller takes the publish lock to record
+/// abandonment, so it waits out an in-flight `rename` — microseconds on a
+/// local filesystem; a FUSE server withholding rename would stall
+/// abandonment past the deadline (strictly narrower than a caller-side
+/// truncate, which stalls on every slow SETATTR — and the price of an
+/// atomic publish, since there is no conditional-rename primitive).
+fn prepare_and_publish_sink(
     path: &Path,
-    abandoned: &AtomicBool,
+    gate: &Mutex<bool>,
     test_delay_ms: u64,
+    publish_gate: Option<(Arc<AtomicBool>, Arc<AtomicBool>)>,
 ) -> anyhow::Result<OwnedFd> {
-    let staged = open_pinned_sink(path)?;
+    if abandonment_get(gate) {
+        anyhow::bail!("pre-stop setup abandoned before file-sink preparation (no child spawned)");
+    }
+    let validated = validate_sink_target(path)?;
+    let (staging_fd, staging_path) = create_staging_sink(path, validated.mode)?;
     if test_delay_ms > 0 {
         std::thread::sleep(Duration::from_millis(test_delay_ms));
     }
-    if abandoned.load(Ordering::SeqCst) {
-        // The caller gave up while the open (or the stall above) ran:
-        // dispose the staged fd HERE, on the worker — never truncate
-        // after abandonment, never hand a live fd to a dead setup. (The
-        // caller already dropped the rendezvous receiver, so this error
-        // is dropped with the worker; it stays sensible in case that
-        // ever changes.)
-        drop(staged);
-        anyhow::bail!("pre-stop setup abandoned during file-sink preparation (no child spawned)");
+    if let Some((ready, proceed)) = publish_gate.as_ref() {
+        ready.store(true, Ordering::SeqCst);
+        let end = Instant::now() + Duration::from_secs(10);
+        while !proceed.load(Ordering::SeqCst) {
+            if Instant::now() >= end {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
-    truncate_pinned_sink(&staged, path)?;
-    Ok(staged)
+    // The atomic publish: abandonment check + rename under the ONE lock
+    // shared with the caller's abandonment setter. NOTHING else runs
+    // under this lock — every fd close and staging delete below is
+    // worker-owned (a FUSE stall there hangs only the detached worker,
+    // never the caller's abandonment).
+    enum Decision {
+        Published,
+        Abandoned,
+        Failed(anyhow::Error),
+    }
+    let decision = {
+        let guard = gate.lock().unwrap_or_else(|e| e.into_inner());
+        if *guard {
+            Decision::Abandoned
+        } else {
+            match std::fs::rename(&staging_path, path) {
+                Ok(()) => Decision::Published,
+                Err(e) => Decision::Failed(anyhow::anyhow!(
+                    "workload output {}: cannot publish file sink: {e} (setup status 126)",
+                    path.display(),
+                )),
+            }
+        }
+    };
+    match decision {
+        Decision::Published => {
+            // The validation fd refers to the REPLACED inode (or nothing,
+            // when the destination was absent): drop it — the staging fd
+            // is the published sink the child inherits.
+            drop(validated.fd);
+            Ok(staging_fd)
+        }
+        Decision::Abandoned => {
+            let _ = std::fs::remove_file(&staging_path);
+            drop(validated.fd);
+            drop(staging_fd);
+            anyhow::bail!(
+                "pre-stop setup abandoned during file-sink preparation (no child spawned)"
+            );
+        }
+        Decision::Failed(e) => {
+            let _ = std::fs::remove_file(&staging_path);
+            drop(validated.fd);
+            drop(staging_fd);
+            Err(e)
+        }
+    }
 }
 
 /// Outcome of running one blocking setup op under deadline +
@@ -447,11 +621,11 @@ enum Control<T> {
     /// The op finished; carries its value.
     Done(T),
     /// Cancellation was pending (checked before running, then while
-    /// waiting); the abandonment fence is set, so a worker that has not
+    /// waiting); the abandonment gate is set, so a worker that has not
     /// started its op skips it — a started worker keeps running detached
     /// and owns its captures.
     Cancelled,
-    /// The deadline passed while waiting; the abandonment fence is set
+    /// The deadline passed while waiting; the abandonment gate is set
     /// (as above) and a started worker keeps running detached and owns
     /// its captures.
     Expired,
@@ -463,17 +637,18 @@ enum Control<T> {
 /// the setup deadline and cancel flag (polled at 1ms). An already-dead
 /// setup never starts the op, and a worker that has not started its op
 /// when the caller abandons setup skips it (fix round 2: the abandonment
-/// fence — a late worker must not perform setup work after the caller
-/// gave up). The op receives the fence so a multi-phase op can re-check
-/// it before its destructive half (fix round 3: open, re-check, then
-/// truncate). The result channel is a rendezvous (fix round 2 / F1): a
-/// value is delivered only to a live receiver, so a discarded result is
-/// always dropped on the worker, never inline on the caller. On expiry
-/// the worker is detached — its ownership moves with it, so a stuck
-/// open's fd closes whenever the sink answers — and the caller fails
-/// WITHOUT forking (pre-fork) or resolves the guard-held child under
-/// custody (post-fork). `Err` = the worker thread itself could not start
-/// (fail-closed at the call site).
+/// gate — a late worker must not perform setup work after the caller
+/// gave up). The op receives the gate so a multi-phase op can decide its
+/// destructive half atomically with the caller's abandonment (fix round
+/// 4: staging, then check + publish under the ONE lock the abandonment
+/// setter shares — no check-then-act gap survives). The result channel is
+/// a rendezvous (fix round 2 / F1): a value is delivered only to a live
+/// receiver, so a discarded result is always dropped on the worker, never
+/// inline on the caller. On expiry the worker is detached — its ownership
+/// moves with it, so a stuck open's fd closes whenever the sink answers —
+/// and the caller fails WITHOUT forking (pre-fork) or resolves the
+/// guard-held child under custody (post-fork). `Err` = the worker thread
+/// itself could not start (fail-closed at the call site).
 fn run_under_control<T, F>(
     deadline: Instant,
     cancel: &AtomicBool,
@@ -481,7 +656,7 @@ fn run_under_control<T, F>(
 ) -> anyhow::Result<Control<T>>
 where
     T: Send + 'static,
-    F: FnOnce(&AtomicBool) -> T + Send + 'static,
+    F: FnOnce(&Mutex<bool>) -> T + Send + 'static,
 {
     if cancel.load(Ordering::SeqCst) {
         return Ok(Control::Cancelled);
@@ -489,10 +664,10 @@ where
     if Instant::now() >= deadline {
         return Ok(Control::Expired);
     }
-    // Abandonment fence: set by the caller when it stops waiting, read by
-    // the worker immediately before running the op (and re-checked by the
-    // op itself before any destructive half).
-    let abandoned = Arc::new(AtomicBool::new(false));
+    // Abandonment gate: set by the caller (under the lock) when it stops
+    // waiting, read by the worker before running the op — and locked by
+    // the op itself around its atomic publish decision.
+    let abandoned = Arc::new(Mutex::new(false));
     let abandoned_c = abandoned.clone();
     let (tx, rx) = std::sync::mpsc::sync_channel(0);
     let (test_delay_ms, test_counter) = read_setup_test_hook();
@@ -502,7 +677,7 @@ where
             if test_delay_ms > 0 {
                 std::thread::sleep(Duration::from_millis(test_delay_ms));
             }
-            if !abandoned_c.load(Ordering::SeqCst) {
+            if !abandonment_get(&abandoned_c) {
                 let _ = tx.send(op(abandoned_c.as_ref()));
             }
             if let Some(c) = test_counter.as_ref() {
@@ -516,7 +691,7 @@ where
 /// Spawn the control worker and poll it. Close disposal calls this
 /// directly: a close must run (possibly late, on the detached worker)
 /// even on an already-dead setup — otherwise its fd would leak. There is
-/// deliberately NO abandonment fence here (unlike
+/// deliberately NO abandonment gate here (unlike
 /// [`run_under_control`]): disposal is never skipped. The result channel
 /// is a rendezvous (fix round 2 / F1), as above.
 fn spawn_controlled<T, F>(
@@ -546,17 +721,19 @@ where
 }
 
 /// Poll one control worker (the waiting half of [`run_under_control`] /
-/// [`spawn_controlled`]). When `abandoned` is present (fenced ops), it is
-/// set before returning `Cancelled` / `Expired`, so a worker that has not
-/// started its op skips it instead of running setup work after the caller
-/// gave up. When the test-only poll gate is armed, the caller waits on it
-/// (bounded) before its first check, so a test can order abandonment
-/// strictly after a result completed (fix round 3 / F1-PROOF).
+/// [`spawn_controlled`]). When `abandoned` is present (gated ops), it is
+/// set — under the ONE lock the worker's atomic publish shares — before
+/// returning `Cancelled` / `Expired`, so a worker that has not started
+/// its op skips it, and a worker poised at publish loses the decision,
+/// instead of running setup work after the caller gave up. When the
+/// test-only poll gate is armed, the caller waits on it (bounded) before
+/// its first check, so a test can order abandonment strictly after a
+/// result completed (fix round 3 / F1-PROOF).
 fn poll_controlled<T>(
     deadline: Instant,
     cancel: &AtomicBool,
     rx: std::sync::mpsc::Receiver<T>,
-    abandoned: Option<&AtomicBool>,
+    abandoned: Option<&Mutex<bool>>,
 ) -> anyhow::Result<Control<T>> {
     if let Some(gate) = SETUP_TEST_HOOK.with(|h| h.borrow().poll_gate.clone()) {
         let end = Instant::now() + Duration::from_secs(10);
@@ -570,13 +747,13 @@ fn poll_controlled<T>(
     loop {
         if cancel.load(Ordering::SeqCst) {
             if let Some(a) = abandoned {
-                a.store(true, Ordering::SeqCst);
+                abandonment_set(a);
             }
             return Ok(Control::Cancelled);
         }
         if Instant::now() >= deadline {
             if let Some(a) = abandoned {
-                a.store(true, Ordering::SeqCst);
+                abandonment_set(a);
             }
             return Ok(Control::Expired);
         }
@@ -671,20 +848,27 @@ pub fn __test_set_prestop_pid_sink(sink: Option<Arc<AtomicU32>>) {
 /// - `fail_fork`: the next spawn on this thread skips `fork()` and takes
 ///   the fork-failure path (consumed on read).
 /// - `truncate_delay_ms` (fix round 3): file-sink preparation stalls
-///   this long between the staged open and the fence re-check, simulating
-///   a sink that answers preparation slowly — the caller must stay
-///   bounded regardless. The spawning thread copies it BEFORE creating
-///   the worker; the worker uses only its moved copy.
+///   this long between staging and the publish decision, simulating a
+///   sink that answers preparation slowly — the caller must stay bounded
+///   regardless. The spawning thread copies it BEFORE creating the
+///   worker; the worker uses only its moved copy.
 /// - `poll_gate` (fix round 3): when armed, the control caller waits on
 ///   this flag (bounded) before its first poll check, so a test can order
-///   abandonment strictly after a result completed. Production callers
-///   must never arm any of these.
+///   abandonment strictly after a result completed.
+/// - `publish_gate` (fix round 4): when armed as `(ready, proceed)`,
+///   file-sink preparation sets `ready` and waits (bounded) on `proceed`
+///   AFTER staging and BEFORE the atomic publish, so a test can order
+///   the caller's abandonment strictly before the publish decision. The
+///   spawning thread clones it BEFORE creating the worker; the worker
+///   uses only its moved clone. Production callers must never arm any of
+///   these.
 struct SetupTestHook {
     setup_delay_ms: u64,
     worker_counter: Option<Arc<AtomicU32>>,
     fail_fork: bool,
     truncate_delay_ms: u64,
     poll_gate: Option<Arc<AtomicBool>>,
+    publish_gate: Option<(Arc<AtomicBool>, Arc<AtomicBool>)>,
 }
 
 thread_local! {
@@ -695,6 +879,7 @@ thread_local! {
             fail_fork: false,
             truncate_delay_ms: 0,
             poll_gate: None,
+            publish_gate: None,
         })
     };
 }
@@ -727,6 +912,12 @@ pub fn __test_set_truncate_delay_ms(ms: u64) {
 #[doc(hidden)]
 pub fn __test_set_poll_gate(gate: Option<Arc<AtomicBool>>) {
     SETUP_TEST_HOOK.with(|h| h.borrow_mut().poll_gate = gate);
+}
+
+/// Test-only: arm the publish poised-gate (see `SETUP_TEST_HOOK`).
+#[doc(hidden)]
+pub fn __test_set_publish_gate(gate: Option<(Arc<AtomicBool>, Arc<AtomicBool>)>) {
+    SETUP_TEST_HOOK.with(|h| h.borrow_mut().publish_gate = gate);
 }
 
 /// Post-fork pre-stop custody (R06/F07): owns the just-forked pid
@@ -893,16 +1084,18 @@ impl OwnedTarget {
     /// deadline and the live SIGINT/SIGTERM flag.
     ///
     /// Ordering: argv validation, then the cancel/deadline checks
-    /// (a dead setup forks nothing and truncates nothing), then
-    /// destination preparation — file sinks are opened + pinned to
-    /// a regular file and truncated by the PARENT pre-fork (see
-    /// [`WorkloadDest::File`]), on ONE fenced worker under the same
-    /// deadline + cancel (a stalled sink fails the setup; it never hangs
-    /// it; the fence is re-checked before the destructive half, so a
-    /// worker delayed past abandonment truncates nothing) — then a
-    /// final cancel/deadline re-check, then fork. The caller performs no
-    /// file syscalls itself on this path: open, truncate and close all run
-    /// on control workers. Custody starts
+    /// (a dead setup forks nothing and publishes nothing), then
+    /// destination preparation — file sinks are validated, staged and
+    /// atomically published to a fresh regular file by the PARENT
+    /// pre-fork (see [`WorkloadDest::File`]), on ONE gated worker under
+    /// the same deadline + cancel (a stalled sink fails the setup; it
+    /// never hangs it; the abandonment check + publish run under the ONE
+    /// lock the abandonment setter shares, so a worker delayed past
+    /// abandonment publishes nothing) — then a final cancel/deadline
+    /// re-check, then fork. The caller performs no file syscalls itself
+    /// on this path: validate, stage, publish and close all run on
+    /// control workers (abandonment takes the publish lock only to set
+    /// the flag). Custody starts
     /// at the fork return, BEFORE the parent's sink copy is disposed
     /// (also under control) and before waiting for SIGSTOP; the wait
     /// polls with the checked deadline and the cancel flag, and every
@@ -952,23 +1145,26 @@ impl OwnedTarget {
         let child_dest = match &dest {
             WorkloadDest::Null => ChildDest::Null,
             WorkloadDest::File(path) => {
-                // Two-phase preparation inside ONE fenced worker (fix round
-                // 3 / NEW): the staged open never truncates, and the
-                // truncation runs on the worker — never as a bare caller
-                // syscall — after re-checking the abandonment fence, so a
-                // sink that withholds SETATTR fails the setup instead of
-                // hanging it, and a worker delayed past abandonment still
-                // truncates nothing. The caller only polls the rendezvous.
-                // (Fix round 2 ran the truncation caller-side: bounded
-                // against late workers, but the caller itself could block
-                // past the deadline with no cancellation.)
+                // Staging + atomic publish inside ONE gated worker (fix
+                // round 4): validation never creates or truncates, the
+                // staging file is uniquely owned (a worker delayed past
+                // abandonment can only touch its own staging), and the
+                // abandonment check + rename run under the ONE lock the
+                // caller's abandonment setter shares — a late worker is
+                // physically incapable of touching the destination. The
+                // caller only polls the rendezvous (it takes the publish
+                // lock solely to record abandonment). (Fix round 3 ran a
+                // fenced ftruncate on the worker: bounded, but the fence
+                // load and the truncate could not be atomic — a worker
+                // descheduled between them erased successor bytes.)
                 let owned_path = path.clone();
                 let truncate_delay_ms = SETUP_TEST_HOOK.with(|h| h.borrow().truncate_delay_ms);
-                let prep = run_under_control(deadline, cancel, move |abandoned| {
-                    open_and_truncate_pinned_sink(&owned_path, abandoned, truncate_delay_ms)
+                let publish_gate = SETUP_TEST_HOOK.with(|h| h.borrow().publish_gate.clone());
+                let prep = run_under_control(deadline, cancel, move |gate| {
+                    prepare_and_publish_sink(&owned_path, gate, truncate_delay_ms, publish_gate)
                 })
                 .map_err(|e| anyhow::anyhow!("{e:#} (no child spawned)"))?;
-                let truncated = match prep {
+                let published = match prep {
                     Control::Done(r) => r?,
                     Control::Cancelled => {
                         anyhow::bail!(
@@ -986,8 +1182,8 @@ impl OwnedTarget {
                         );
                     }
                 };
-                let raw = truncated.as_raw_fd();
-                owned_sink = Some(truncated);
+                let raw = published.as_raw_fd();
+                owned_sink = Some(published);
                 ChildDest::Fd(raw)
             }
             WorkloadDest::Fd(fd) => {
@@ -1353,9 +1549,11 @@ mod control_tests {
     //! cancellation control (see [`super::run_under_control`]).
     use super::{
         __test_set_control_worker_counter, __test_set_poll_gate, __test_set_setup_delay_ms,
-        Control, close_under_control, open_and_truncate_pinned_sink, run_under_control,
+        Control, close_under_control, prepare_and_publish_sink, run_under_control,
     };
     use std::os::fd::{FromRawFd as _, OwnedFd};
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::time::{Duration, Instant};
 
@@ -1637,10 +1835,12 @@ mod control_tests {
     }
 
     #[test]
-    fn staged_sink_truncates_when_live_skips_when_abandoned() {
-        // Fix round 3 / NEW, direct pin: the worker-side preparation op
-        // truncates a live setup's sink, and skips the destructive half —
-        // disposing the staged fd — once the abandonment fence is set.
+    fn staged_sink_publishes_when_live_skips_when_abandoned() {
+        // Fix round 4, direct pin: the worker-side preparation op
+        // publishes a fresh empty inode over the destination when live
+        // (carrying the prior permission bits over), and publishes
+        // nothing — deleting its staging — once the abandonment gate is
+        // set.
         let dir = std::env::temp_dir().join(format!("osslscope-trunc-pin-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1648,16 +1848,24 @@ mod control_tests {
         let dead = dir.join("dead.log");
         std::fs::write(&live, b"stale\n").unwrap();
         std::fs::write(&dead, b"stale\n").unwrap();
-        let fence = AtomicBool::new(false);
-        let fd = open_and_truncate_pinned_sink(&live, &fence, 0).unwrap();
+        // A distinctive mode on the live target: the publish must carry
+        // it onto the fresh inode (truncate-in-place preserved it).
+        std::fs::set_permissions(&live, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let gate = Mutex::new(false);
+        let fd = prepare_and_publish_sink(&live, &gate, 0, None).unwrap();
         drop(fd);
         assert_eq!(
             std::fs::read(&live).unwrap(),
             b"",
-            "live setup truncates its sink"
+            "live setup publishes an empty sink"
         );
-        fence.store(true, Ordering::SeqCst);
-        let err = open_and_truncate_pinned_sink(&dead, &fence, 0).unwrap_err();
+        assert_eq!(
+            std::fs::metadata(&live).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "publish carries the prior mode bits over"
+        );
+        *gate.lock().unwrap() = true;
+        let err = prepare_and_publish_sink(&dead, &gate, 0, None).unwrap_err();
         assert!(
             err.to_string().contains("abandoned"),
             "abandonment surfaces: {err:#}"
@@ -1665,8 +1873,15 @@ mod control_tests {
         assert_eq!(
             std::fs::read(&dead).unwrap(),
             b"stale\n",
-            "abandoned setup truncates nothing"
+            "abandoned setup publishes nothing"
         );
+        // No staging litter in either case.
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["dead.log".to_string(), "live.log".to_string()]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
