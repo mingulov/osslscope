@@ -5384,6 +5384,54 @@ fn live_zero_setup_timeout_spawns_nothing() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// Independent exact-PID teardown (fix round 2 / F4; mirrors the
+/// lifecycle suite's guard — this file is a separate crate): RAII rescue
+/// of one observed pid, armed before any fallible assertion and effective
+/// on panic paths too. `Drop` is best-effort SIGKILL + bounded reap of
+/// the exact pid only (ECHILD-tolerant, never panics).
+struct R06PidGuard {
+    pid: u32,
+    armed: bool,
+}
+
+impl R06PidGuard {
+    fn arm(pid: u32) -> Self {
+        Self { pid, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for R06PidGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        unsafe {
+            libc::kill(self.pid as libc::pid_t, libc::SIGKILL);
+        }
+        let end = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < end {
+            let mut status = 0;
+            let r = unsafe { libc::waitpid(self.pid as libc::pid_t, &mut status, libc::WNOHANG) };
+            if r > 0 {
+                return;
+            }
+            if r < 0 {
+                let e = std::io::Error::last_os_error();
+                if e.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
 /// Independent PID custody for the capture spawn test (mirrors the
 /// lifecycle suite's helper; this file is a separate crate): SIGKILL +
 /// reap one exact pid, tolerating the ECHILD race where the spawn worker
@@ -5458,6 +5506,9 @@ fn live_prestop_cancel_reaps_real_child() {
             std::thread::sleep(Duration::from_millis(5));
         }
     };
+    // F4: independent teardown armed before any fallible step — panics
+    // below still rescue the exact observed pid on unwinding.
+    let mut r06_guard = R06PidGuard::arm(pid);
     cancel.store(true, Ordering::SeqCst);
     let (out, helper_pid) = match rx.recv_timeout(Duration::from_secs(20)) {
         Ok(r) => {
@@ -5493,6 +5544,7 @@ fn live_prestop_cancel_reaps_real_child() {
     );
     assert!(msg.contains("(status 137)"), "SIGKILL status: {msg}");
     assert_reaped(pid);
+    r06_guard.disarm();
     assert!(!sentinel.exists(), "sentinel must never execute");
     std::fs::remove_dir_all(&dir).unwrap();
 }
