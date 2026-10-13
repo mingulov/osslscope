@@ -147,67 +147,203 @@ fn inspect_usage_errors_are_exit2() {
     assert_eq!(run_inspect(&no_object), ExitCode::from(2));
 }
 
-#[test]
-fn setup_spy_invalid_input_precedes_effects() {
-    // Invalid numerics exit 2 on deliberately missing-file setup
-    // (valid input reaches setup and fails 4): admission precedes
-    // provider reads and BPF preparation on every verb.
-    assert_eq!(
-        run_inspect(&base_inspect(&["--timeout", "121"])),
-        ExitCode::from(2)
-    );
-    assert_eq!(
-        run_inspect(&base_inspect(&["--settle", "31"])),
-        ExitCode::from(2)
-    );
-    assert_eq!(
-        run_inspect(&base_inspect(&["--timeout", "60"])),
-        ExitCode::from(4)
-    );
-    // Invalid input also precedes child creation: the `run --`
-    // command would touch this sentinel if parsing let it through.
-    let sentinel =
-        std::env::temp_dir().join(format!("osslscope-r07-nospawn-{}", std::process::id()));
-    let _ = std::fs::remove_file(&sentinel);
-    let touch = format!("touch {}", sentinel.display());
-    for args in [
-        base_capture(&["--timeout", "121", "run", "--", "/bin/sh", "-c", &touch]),
-        base_capture(&[
-            "--deny-weak",
-            "--settle",
-            "31",
-            "run",
-            "--",
-            "/bin/sh",
-            "-c",
-            &touch,
-        ]),
-        // Empty provider matchers are admission errors too.
-        base_capture(&["--deny-provider", "", "run", "--", "/bin/sh", "-c", &touch]),
-        base_capture(&[
-            "--require-provider",
-            "",
-            "run",
-            "--",
-            "/bin/sh",
-            "-c",
-            &touch,
-        ]),
-    ] {
-        // Route by rule presence: --deny-provider/--require-provider/
-        // --deny-weak imply check, else report.
-        let is_check = args
-            .iter()
-            .any(|a| a.contains("provider") || a == "--deny-weak");
-        let code = if is_check {
-            run_check(&args)
-        } else {
-            run_report(&args)
-        };
-        assert_eq!(code, ExitCode::from(2), "no-spawn {args:?}");
+// ------------------------------- admission-before-effects ordering
+//
+// Finding-1 fix: explicit verb selection (each case names its verb;
+// no routing heuristic) and observable effect spies with positive
+// controls.
+//
+// Spy design (report/check): `--out` artifact presence. Both verbs
+// attempt every requested artifact even on setup failure (F-E/B4),
+// so on the bogus BPF objects valid input reaches setup and WRITES
+// the spy file (positive control, exit 4), while invalid input must
+// exit 2 with NO spy file — proving admission rejected before setup
+// ran. BPF preparation, provider reads, and child creation all live
+// inside setup (child creation additionally after BPF resolution),
+// so setup-not-reached transitively proves none of them ran. (The
+// old `touch` sentinel proved nothing: BPF resolution fails before
+// any spawn, and a stopped child never execs.)
+//
+// Coupling: every check case carries a valid rule (`--deny-weak`)
+// so the invalid numeric/matcher is the ONLY possible usage error —
+// removing validation flips these cases to exit 4 + spy file
+// (demonstrated by mutation in the fix report).
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static SPY_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+/// Unique pre-removed spy path (parallel-safe within/across runs).
+fn spy_path(tag: &str) -> std::path::PathBuf {
+    let n = SPY_SEQ.fetch_add(1, Ordering::SeqCst);
+    let p = std::env::temp_dir().join(format!(
+        "osslscope-r07-{}-{}-{}.json",
+        tag,
+        std::process::id(),
+        n
+    ));
+    let _ = std::fs::remove_file(&p);
+    p
+}
+
+fn capture_with_spy(extra: &[&str], spy: &std::path::Path) -> Vec<String> {
+    let mut v = base_capture(extra);
+    // `--out` must precede `run`: everything after the separator is
+    // the target command, not CLI flags.
+    match v.iter().position(|a| a == "run") {
+        Some(pos) => {
+            v.insert(pos, "--out".to_string());
+            v.insert(pos + 1, spy.to_string_lossy().to_string());
+        }
+        None => {
+            v.push("--out".to_string());
+            v.push(spy.to_string_lossy().to_string());
+        }
     }
-    assert!(!sentinel.exists(), "child must not spawn on invalid input");
-    let _ = std::fs::remove_file(&sentinel);
+    v
+}
+
+#[test]
+fn ordering_report_invalid_input_precedes_setup() {
+    // Explicit verb: report::run only.
+    let invalid: &[&[&str]] = &[
+        &["--timeout", "121", "--pid", "1"],
+        &["--timeout", "NaN", "--pid", "1"],
+        &["--timeout", "1e-300", "--pid", "1"],
+        &["--settle", "31", "--pid", "1"],
+        &["--settle", "1e30", "--pid", "1"],
+        &["--bogus", "1", "--pid", "1"],
+        // Spawn-target shape: `run --` with an invalid numeric still
+        // rejects before setup (child creation lives inside setup).
+        &["--timeout", "121", "run", "--", "/bin/true"],
+        &["--settle", "31", "run", "--", "/bin/true"],
+    ];
+    for extra in invalid {
+        let spy = spy_path("report-invalid");
+        let code = run_report(&capture_with_spy(extra, &spy));
+        assert_eq!(code, ExitCode::from(2), "report {extra:?}");
+        assert!(
+            !spy.exists(),
+            "report {extra:?}: no artifact on usage error (setup never reached)"
+        );
+        let _ = std::fs::remove_file(&spy);
+    }
+    // Positive controls: valid input reaches setup (exit 4 on the
+    // bogus BPF objects) AND writes the spy artifact — the spy
+    // mechanism fires when setup runs.
+    for extra in [
+        vec!["--timeout", "60", "--pid", "1"],
+        vec![
+            "--timeout",
+            "0.5",
+            "--settle",
+            "30",
+            "run",
+            "--",
+            "/bin/true",
+        ],
+    ] {
+        let spy = spy_path("report-valid");
+        let code = run_report(&capture_with_spy(&extra, &spy));
+        assert_eq!(code, ExitCode::from(4), "report {extra:?}");
+        assert!(spy.exists(), "report {extra:?}: setup writes the spy");
+        assert!(
+            std::fs::metadata(&spy).map(|m| m.len()).unwrap_or(0) > 0,
+            "report {extra:?}: spy artifact is nonempty"
+        );
+        let _ = std::fs::remove_file(&spy);
+    }
+}
+
+#[test]
+fn ordering_check_invalid_input_precedes_setup() {
+    // Explicit verb: check::run only. Every invalid-numeric case
+    // carries a valid rule (--deny-weak) so the numeric is the ONLY
+    // possible usage error: removing numeric validation flips the
+    // case to exit 4 + spy file (coupling proof by mutation).
+    let invalid: &[&[&str]] = &[
+        &["--deny-weak", "--timeout", "121", "--pid", "1"],
+        &["--deny-weak", "--timeout", "NaN", "--pid", "1"],
+        &["--deny-weak", "--settle", "31", "--pid", "1"],
+        &["--deny-weak", "--settle", "1e30", "--pid", "1"],
+        &["--deny-weak", "--timeout", "121", "run", "--", "/bin/true"],
+        // Empty provider matchers are admission errors too (matcher
+        // guard coupling: removing the guard admits the rule and
+        // reaches setup).
+        &["--deny-provider", "", "--pid", "1"],
+        &["--require-provider", "", "--pid", "1"],
+        &["--deny-provider", "", "run", "--", "/bin/true"],
+    ];
+    for extra in invalid {
+        let spy = spy_path("check-invalid");
+        let code = run_check(&capture_with_spy(extra, &spy));
+        assert_eq!(code, ExitCode::from(2), "check {extra:?}");
+        assert!(
+            !spy.exists(),
+            "check {extra:?}: no artifact on usage error (setup never reached)"
+        );
+        let _ = std::fs::remove_file(&spy);
+    }
+    // Positive controls: valid input + valid rule reaches setup
+    // (exit 4) and writes the spy.
+    for extra in [
+        vec!["--deny-weak", "--timeout", "60", "--pid", "1"],
+        vec!["--deny-weak", "run", "--", "/bin/true"],
+        vec!["--require-provider", "third-party:deadbeef", "--pid", "1"],
+    ] {
+        let spy = spy_path("check-valid");
+        let code = run_check(&capture_with_spy(&extra, &spy));
+        assert_eq!(code, ExitCode::from(4), "check {extra:?}");
+        assert!(spy.exists(), "check {extra:?}: setup writes the spy");
+        assert!(
+            std::fs::metadata(&spy).map(|m| m.len()).unwrap_or(0) > 0,
+            "check {extra:?}: spy artifact is nonempty"
+        );
+        let _ = std::fs::remove_file(&spy);
+    }
+}
+
+#[test]
+fn ordering_inspect_invalid_input_precedes_effects() {
+    // Explicit verb: inspect::run only, plus the pure parse() seam
+    // (parse performs no IO by construction: Err proves the parser
+    // itself rejected, before any provider/BPF effect is reachable).
+    let invalid: &[&[&str]] = &[
+        &["--timeout", "121"],
+        &["--timeout", "NaN"],
+        &["--settle", "31"],
+        &["--bogus", "1"],
+    ];
+    for extra in invalid {
+        assert!(
+            osslscope::inspect::parse(&base_inspect(extra)).is_err(),
+            "inspect parse rejects {extra:?}"
+        );
+        let spy = spy_path("inspect-invalid");
+        let mut args = base_inspect(extra);
+        args.push("--out".to_string());
+        args.push(spy.to_string_lossy().to_string());
+        assert_eq!(run_inspect(&args), ExitCode::from(2), "inspect {extra:?}");
+        assert!(
+            !spy.exists(),
+            "inspect {extra:?}: no artifact on usage error"
+        );
+        let _ = std::fs::remove_file(&spy);
+    }
+    // Positive controls: valid input parses (60/2 defaults) and
+    // reaches setup (exit 4 on bogus paths). Inspect emits nothing
+    // on setup failure (pinned by inspect_outcome_environment_is_exit4),
+    // so no spy file here is EXPECTED — the file-spy mechanism
+    // itself is proved by the production-emitter tests below.
+    let parsed = osslscope::inspect::parse(&base_inspect(&[])).expect("minimal args parse");
+    assert_eq!(parsed.timeout, std::time::Duration::from_secs(60));
+    let spy = spy_path("inspect-valid");
+    let mut args = base_inspect(&[]);
+    args.push("--out".to_string());
+    args.push(spy.to_string_lossy().to_string());
+    assert_eq!(run_inspect(&args), ExitCode::from(4));
+    assert!(!spy.exists(), "inspect emits nothing on setup failure");
+    let _ = std::fs::remove_file(&spy);
 }
 
 #[test]
@@ -404,26 +540,97 @@ fn inspect_outcome_recycle_is_exit4() {
 
 #[test]
 fn inspect_outcome_delivery_failure_is_exit1() {
-    // Normal harvest + failed artifact write.
+    // Normal harvest + failed artifact write: delivery failure 1.
     let code = osslscope::inspect::run_with(
         &harvest_cfg(),
         |_| Ok(complete_doc()),
         |_| Err("write /nonexistent-r07-dir/out.json: test delivery".to_string()),
     );
     assert_eq!(code, ExitCode::from(1));
-    // Recycle harvest + failed discard write: delivery still 1.
+    // Recycle harvest + failed discard write: the discard delivery
+    // is still ATTEMPTED (emit called once) and its failure
+    // reported, but recycle/no-verdict 4 precedes artifact failure 1
+    // (plan exit precedence 2 → 4/no-verdict → 10 → 1 → ...).
+    let emitted = Cell::new(0);
     let code = osslscope::inspect::run_with(
         &harvest_cfg(),
         |_| Err::<serde_json::Value, _>(anyhow::Error::new(Recycled { doc: partial_doc() })),
-        |_| Err("write /nonexistent-r07-dir/out.json: test delivery".to_string()),
+        |doc| {
+            emitted.set(emitted.get() + 1);
+            assert_eq!(doc["reason"], "no-query-trigger");
+            Err("write /nonexistent-r07-dir/out.json: test delivery".to_string())
+        },
+    );
+    assert_eq!(code, ExitCode::from(4));
+    assert_eq!(emitted.get(), 1, "recycle discard delivery is attempted");
+}
+
+#[test]
+fn inspect_outcome_production_emitter_file_delivery() {
+    // Real file delivery through the PRODUCTION emitter (replaces
+    // the old harvest-setup-masked case): unwritable --out maps to
+    // exit 1, never confused with usage 2 or setup 4.
+    let code = osslscope::inspect::run_with(
+        &harvest_cfg(),
+        |_| Ok(complete_doc()),
+        |doc| {
+            osslscope::inspect::emit_doc(
+                doc,
+                Some(std::path::Path::new("/nonexistent-r07-dir/out.json")),
+                &mut std::io::sink(),
+            )
+        },
     );
     assert_eq!(code, ExitCode::from(1));
-    // Real delivery failure through run(): unwritable --out dir with
-    // valid admission fails the artifact write — but harvest setup on
-    // bogus paths fails first (exit 4), proving delivery is ordered
-    // after harvest, not confused with usage.
+    // Positive control: the production emitter writes --out files.
+    let spy = spy_path("inspect-emit");
+    let code = osslscope::inspect::run_with(
+        &harvest_cfg(),
+        |_| Ok(complete_doc()),
+        |doc| osslscope::inspect::emit_doc(doc, Some(&spy), &mut std::io::sink()),
+    );
+    assert_eq!(code, ExitCode::from(0));
+    let text = std::fs::read_to_string(&spy).expect("spy file written");
+    let back: serde_json::Value = serde_json::from_str(&text).expect("spy is JSON");
+    assert_eq!(back["provider"], "p");
+    let _ = std::fs::remove_file(&spy);
+    // Setup precedes delivery at run() level (labeled ordering pin,
+    // not a delivery test): valid admission + unwritable --out +
+    // bogus BPF fails harvest setup first (exit 4).
     let code = run_inspect(&base_inspect(&["--out", "/nonexistent-r07-dir/out.json"]));
     assert_eq!(code, ExitCode::from(4));
+}
+
+#[test]
+fn inspect_outcome_broken_pipe_stdout_is_exit1_without_panic() {
+    use std::os::unix::net::UnixStream;
+    // Real OS-level broken pipe through the PRODUCTION emitter: a
+    // socketpair with the peer closed makes the kernel return EPIPE
+    // on write (Rust ignores SIGPIPE, so no signal death — the
+    // failure must surface as delivery exit 1, never a panic/101).
+    let (mut broken, peer) = UnixStream::pair().expect("socketpair");
+    drop(peer);
+    let code = osslscope::inspect::run_with(
+        &harvest_cfg(),
+        |_| Ok(complete_doc()),
+        |doc| osslscope::inspect::emit_doc(doc, None, &mut broken),
+    );
+    assert_eq!(code, ExitCode::from(1));
+    // Direct seam proof: the production emitter maps the real EPIPE
+    // to Err (never panics).
+    let (mut broken, peer) = UnixStream::pair().expect("socketpair");
+    drop(peer);
+    let err = osslscope::inspect::emit_doc(&complete_doc(), None, &mut broken)
+        .expect_err("EPIPE must surface as Err, not panic");
+    assert!(err.contains("stdout"), "names the failed sink: {err}");
+    assert!(err.contains("Broken pipe"), "carries the OS cause: {err}");
+    // Positive control: stdout delivery to a live writer succeeds
+    // byte-identically (pretty JSON + trailing newline, ex-println!).
+    let mut buf = Vec::new();
+    osslscope::inspect::emit_doc(&complete_doc(), None, &mut buf).expect("live writer delivers");
+    assert!(buf.ends_with(b"\n"), "trailing newline preserved");
+    let back: serde_json::Value = serde_json::from_slice(&buf).expect("stdout bytes are JSON");
+    assert_eq!(back["provider"], "p");
 }
 
 #[test]

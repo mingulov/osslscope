@@ -9,7 +9,8 @@
 //! Admission shares [`crate::args::parse_seconds`] with report/check
 //! (R07/F08): float seconds, `--timeout` [0,120] default 60,
 //! `--settle` [0,30] default 2. Exits: 0 normal, 2 usage, 3 PARTIAL
-//! harvest, 4 environment/recycle, 1 artifact delivery failure.
+//! harvest, 4 environment/recycle (retained even when the recycle
+//! discard delivery fails), 1 artifact delivery failure.
 use crate::discovery::harvest;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -154,10 +155,40 @@ pub fn is_partial_doc(doc: &serde_json::Value) -> bool {
     doc.get("status").and_then(|s| s.as_str()) == Some("PARTIAL")
 }
 
+/// Production artifact emitter (R07 seam): serialize the harvest
+/// document (pretty JSON, trailing newline) and deliver it to
+/// `--out` or stdout. `run()` passes a live stdout; tests pass real
+/// writers (byte buffer, file path, closed socketpair) to prove
+/// delivery classification end to end.
+pub fn emit_doc(
+    doc: &serde_json::Value,
+    out: Option<&std::path::Path>,
+    stdout: &mut dyn std::io::Write,
+) -> Result<(), String> {
+    // H7-T6: `Value` serialization is infallible; the fallback
+    // exists only to shed the panic shape (never observed).
+    let text = serde_json::to_string_pretty(doc).unwrap_or_else(|_| "{}".to_string());
+    if let Some(path) = out {
+        std::fs::write(path, &text).map_err(|e| format!("write {}: {e}", path.display()))
+    } else {
+        // Fallible stdout write + flush (never println!: a broken
+        // pipe is a delivery error, exit 1, not a panic/101).
+        // Byte-identical to the old println! (text + newline).
+        let mut bytes = text.into_bytes();
+        bytes.push(b'\n');
+        stdout
+            .write_all(&bytes)
+            .and_then(|()| stdout.flush())
+            .map_err(|e| format!("write stdout: {e}"))
+    }
+}
+
 /// Run one harvest with injected effects (R07 seam): `harvest`
 /// replaces [`harvest::run`], `emit` replaces the stdout/file write.
 /// Exit table: 0 normal, 3 PARTIAL, 4 environment/recycle, 1
-/// artifact delivery failure. (Usage/2 never reaches this function.)
+/// artifact delivery failure — except a failed recycle-discard
+/// delivery retains 4 (no-verdict precedes artifact failure).
+/// (Usage/2 never reaches this function.)
 pub fn run_with(
     cfg: &harvest::Config,
     harvest: impl FnOnce(&harvest::Config) -> anyhow::Result<serde_json::Value>,
@@ -177,12 +208,14 @@ pub fn run_with(
             }
         }
         Err(e) => {
-            // Pin recycle: the PARTIAL(pid-recycled) discard doc still
-            // travels (never rows), flagged by exit 4.
+            // Pin recycle: the PARTIAL(pid-recycled) discard doc is
+            // still attempted (never rows), flagged by exit 4.
+            // Recycle/no-verdict 4 precedes artifact failure 1 (plan
+            // exit precedence), so a failed discard delivery is
+            // reported but retains exit 4.
             if let Some(r) = e.downcast_ref::<harvest::Recycled>() {
                 if let Err(e) = emit(&r.doc) {
                     crate::report::err_line(&format!("osslscope inspect: {e}"));
-                    return ExitCode::FAILURE;
                 }
                 crate::report::err_line(&format!("osslscope inspect: {r}"));
                 return ExitCode::from(4);
@@ -208,15 +241,9 @@ pub fn run(args: &[String]) -> ExitCode {
     let cfg = parsed.harvest_config();
     let out = parsed.out.clone();
     let emit = |doc: &serde_json::Value| {
-        // H7-T6: `Value` serialization is infallible; the fallback
-        // exists only to shed the panic shape (never observed).
-        let text = serde_json::to_string_pretty(doc).unwrap_or_else(|_| "{}".to_string());
-        if let Some(path) = &out {
-            std::fs::write(path, &text).map_err(|e| format!("write {}: {e}", path.display()))
-        } else {
-            println!("{text}");
-            Ok(())
-        }
+        let stdout = std::io::stdout();
+        let mut locked = stdout.lock();
+        emit_doc(doc, out.as_deref(), &mut locked)
     };
     run_with(&cfg, harvest::run, emit)
 }
