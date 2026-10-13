@@ -6392,13 +6392,172 @@ pub fn is_known_alg(name: &str) -> bool {
 }
 
 /// The registry group of an exact spelling (`None` when
-/// unregistered). Groups are the mixed-detection granularity
-/// (H3): alias spellings share their group's id, so
-/// multi-spelling lists stay OK while cross-group lists mix.
-/// Group ids (first-appearance order) are BPF-internal — the
-/// mixed flag is the only thing that leaves the kernel.
+/// unregistered). Groups are `PROV_NAMES_*` macro families, NOT
+/// semantic equivalence (R01): same-group distinct algorithms
+/// (e.g. ML-KEM-512 vs ML-KEM-768, SHA2-256 vs SHA2-512) are
+/// different algorithms. Mixed detection uses
+/// [`algorithm_semantic_id`], never this.
 pub fn alg_group(name: &str) -> Option<&'static str> {
     ALG_NAMES.iter().find(|a| a.name == name).map(|a| a.group)
+}
+
+/// Verified semantic-equivalence sets (R01, F01/F02): each inner
+/// slice lists provider alias spellings proven to name one
+/// algorithm. Provenance: OpenSSL 3.5.5 default-provider alias
+/// sets (`openssl list -digest-algorithms/-kem-algorithms/
+/// -key-managers`, 2026-10-13), every member cross-checked
+/// present in the frozen [`ALG_NAMES`] registry; unregistered
+/// display aliases from those sets are omitted (they can never
+/// classify or admit). Members within one set share one semantic
+/// identity; names in different sets — even in one macro `group`
+/// — are distinct. Unlisted names are singleton identities.
+/// Never infer equivalence from `group`, name similarity, or a
+/// provider assertion: only this table merges.
+pub const ALG_SEMANTIC_EQUIV: &[&[&str]] = &[
+    &["2.16.840.1.101.3.4.2.1", "SHA-256", "SHA2-256", "SHA256"],
+    &["2.16.840.1.101.3.4.2.4", "SHA-224", "SHA2-224", "SHA224"],
+    &["2.16.840.1.101.3.4.2.2", "SHA-384", "SHA2-384", "SHA384"],
+    &["2.16.840.1.101.3.4.2.3", "SHA-512", "SHA2-512", "SHA512"],
+    &[
+        "2.16.840.1.101.3.4.2.5",
+        "SHA-512/224",
+        "SHA2-512/224",
+        "SHA512-224",
+    ],
+    &[
+        "2.16.840.1.101.3.4.2.6",
+        "SHA-512/256",
+        "SHA2-512/256",
+        "SHA512-256",
+    ],
+    &["SHA-256/192", "SHA2-256/192", "SHA256-192"],
+    &["1.3.14.3.2.26", "SHA-1", "SHA1", "SSL3-SHA1"],
+    &["1.2.840.113549.2.5", "MD5", "SSL3-MD5"],
+    &["2.16.840.1.101.3.4.2.7", "SHA3-224"],
+    &["2.16.840.1.101.3.4.2.8", "SHA3-256"],
+    &["2.16.840.1.101.3.4.2.9", "SHA3-384"],
+    &["2.16.840.1.101.3.4.2.10", "SHA3-512"],
+    &["2.16.840.1.101.3.4.2.11", "SHAKE-128", "SHAKE128"],
+    &["2.16.840.1.101.3.4.2.12", "SHAKE-256", "SHAKE256"],
+    &[
+        "2.16.840.1.101.3.4.4.1",
+        "ML-KEM-512",
+        "MLKEM512",
+        "id-alg-ml-kem-512",
+    ],
+    &[
+        "2.16.840.1.101.3.4.4.2",
+        "ML-KEM-768",
+        "MLKEM768",
+        "id-alg-ml-kem-768",
+    ],
+    &[
+        "2.16.840.1.101.3.4.4.3",
+        "ML-KEM-1024",
+        "MLKEM1024",
+        "id-alg-ml-kem-1024",
+    ],
+    &[
+        "2.16.840.1.101.3.4.3.17",
+        "ML-DSA-44",
+        "MLDSA44",
+        "id-ml-dsa-44",
+    ],
+    &[
+        "2.16.840.1.101.3.4.3.18",
+        "ML-DSA-65",
+        "MLDSA65",
+        "id-ml-dsa-65",
+    ],
+    &[
+        "2.16.840.1.101.3.4.3.19",
+        "ML-DSA-87",
+        "MLDSA87",
+        "id-ml-dsa-87",
+    ],
+    &[
+        "2.16.840.1.101.3.4.3.20",
+        "SLH-DSA-SHA2-128s",
+        "id-slh-dsa-sha2-128s",
+    ],
+    &[
+        "2.16.840.1.101.3.4.3.21",
+        "SLH-DSA-SHA2-128f",
+        "id-slh-dsa-sha2-128f",
+    ],
+    &[
+        "2.16.840.1.101.3.4.3.22",
+        "SLH-DSA-SHA2-192s",
+        "id-slh-dsa-sha2-192s",
+    ],
+    &[
+        "2.16.840.1.101.3.4.3.23",
+        "SLH-DSA-SHA2-192f",
+        "id-slh-dsa-sha2-192f",
+    ],
+    &[
+        "2.16.840.1.101.3.4.3.24",
+        "SLH-DSA-SHA2-256s",
+        "id-slh-dsa-sha2-256s",
+    ],
+    &[
+        "2.16.840.1.101.3.4.3.25",
+        "SLH-DSA-SHA2-256f",
+        "id-slh-dsa-sha2-256f",
+    ],
+    &[
+        "2.16.840.1.101.3.4.3.26",
+        "SLH-DSA-SHAKE-128s",
+        "id-slh-dsa-shake-128s",
+    ],
+    &[
+        "2.16.840.1.101.3.4.3.27",
+        "SLH-DSA-SHAKE-128f",
+        "id-slh-dsa-shake-128f",
+    ],
+    &[
+        "2.16.840.1.101.3.4.3.28",
+        "SLH-DSA-SHAKE-192s",
+        "id-slh-dsa-shake-192s",
+    ],
+    &[
+        "2.16.840.1.101.3.4.3.29",
+        "SLH-DSA-SHAKE-192f",
+        "id-slh-dsa-shake-192f",
+    ],
+    &[
+        "2.16.840.1.101.3.4.3.30",
+        "SLH-DSA-SHAKE-256s",
+        "id-slh-dsa-shake-256s",
+    ],
+    &[
+        "2.16.840.1.101.3.4.3.31",
+        "SLH-DSA-SHAKE-256f",
+        "id-slh-dsa-shake-256f",
+    ],
+];
+
+/// Finite semantic identity for one algorithm spelling (R01).
+/// Merged names share their equivalence set's minimum registry
+/// index; unlisted-but-registered names are singleton identities
+/// (their own index); unregistered names are `None`. The id is
+/// stable (frozen registry order), never [`OTHER_CLASS`], and
+/// shared by classifier construction ([`crate::discovery::harvest`])
+/// and policy predicate matching ([`crate::policy`]).
+pub fn algorithm_semantic_id(name: &str) -> Option<u16> {
+    let idx = ALG_NAMES.iter().position(|a| a.name == name)? as u16;
+    for set in ALG_SEMANTIC_EQUIV {
+        if set.contains(&name) {
+            let mut min = idx;
+            for member in *set {
+                if let Some(i) = ALG_NAMES.iter().position(|a| a.name == *member) {
+                    min = min.min(i as u16);
+                }
+            }
+            return Some(min);
+        }
+    }
+    Some(idx)
 }
 
 /// Decode a kernel algorithm class id to its registry label (T02

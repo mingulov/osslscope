@@ -436,17 +436,17 @@ fn classifier_agrees_with_reference_over_corpus() {
         let label = kinds::alg_class_label(v.class).unwrap();
         assert_eq!(label, class, "class mismatch for {input:?}");
         assert_eq!(v.weak, weak, "weak mismatch for {input:?}");
-        // Status follows recognized-group diversity (H3: no
+        // Status follows recognized-semantic diversity (R01: no
         // corpus entry exceeds the segment bound or saturates):
-        // no registered segment → UNKNOWN; one group → OK;
-        // two or more → MIXED.
-        let mut groups = std::collections::BTreeSet::new();
+        // no registered segment → UNKNOWN; one semantic id → OK;
+        // two or more → MIXED. Same-family distinct algorithms mix.
+        let mut ids = std::collections::BTreeSet::new();
         for seg in input.split(':') {
-            if kinds::is_known_alg(seg) {
-                groups.insert(kinds::alg_group(seg).unwrap());
+            if let Some(id) = kinds::algorithm_semantic_id(seg) {
+                ids.insert(id);
             }
         }
-        let want = match groups.len() {
+        let want = match ids.len() {
             0 => wire::ALG_UNKNOWN,
             1 => wire::ALG_OK,
             _ => wire::ALG_MIXED,
@@ -522,22 +522,38 @@ fn classifier_recognizes_non_primary_alias() {
 
 #[test]
 fn h3_t1_mixed_lists_report_mixed_with_min_label() {
-    // H3: two recognized groups → MIXED (min label preserved);
-    // single-group alias spellings stay OK; MIXED only refines
-    // OK (TRUNCATED wins); unrecognized and weak-only extras
-    // contribute nothing toward mixed.
+    // R01: two recognized semantic identities → MIXED (min label
+    // preserved); verified alias spellings stay OK; MIXED only
+    // refines OK (TRUNCATED wins); unrecognized and weak-only
+    // extras contribute nothing toward mixed.
     let a = classify_host(b"AES-256-GCM", false);
     let m = classify_host(b"MD5", false);
     let v = classify_host(b"AES-256-GCM:MD5", false);
-    assert_eq!(v.status, wire::ALG_MIXED, "two groups must mix");
+    assert_eq!(v.status, wire::ALG_MIXED, "two identities must mix");
     assert_eq!(v.class, a.class.min(m.class), "min preserved");
     let v = classify_host(b"RC4:SHA2-256", false);
-    assert_eq!(v.status, wire::ALG_MIXED, "two groups must mix");
+    assert_eq!(v.status, wire::ALG_MIXED, "two identities must mix");
     assert_eq!(kinds::alg_class_label(v.class), Some("SHA2-256"));
-    // Alias spellings of one group stay OK.
+    // Same macro family, distinct semantics → MIXED (F01).
+    for pair in [
+        "ML-KEM-512:ML-KEM-768",
+        "ML-KEM-768:ML-KEM-512",
+        "SHA2-256:SHA2-512",
+        "SHA1:MD5",
+    ] {
+        let v = classify_host(pair.as_bytes(), false);
+        assert_eq!(
+            v.status,
+            wire::ALG_MIXED,
+            "distinct pair must mix: {pair:?}"
+        );
+    }
+    // Verified alias spellings of one identity stay OK (F02).
     let v = classify_host(b"SHA256:SHA2-256", false);
-    assert_eq!(v.status, wire::ALG_OK, "single group stays OK");
+    assert_eq!(v.status, wire::ALG_OK, "single identity stays OK");
     assert_eq!(kinds::alg_class_label(v.class), Some("SHA2-256"));
+    let v = classify_host(b"ML-KEM-768:2.16.840.1.101.3.4.4.2", false);
+    assert_eq!(v.status, wire::ALG_OK, "single identity stays OK");
     // Mixed + truncated → TRUNCATED (precedence).
     let nine = ["SHA2-256", "MD5", "a", "b", "c", "d", "e", "f", "g"].join(":");
     let v = classify_host(nine.as_bytes(), false);
