@@ -91,6 +91,19 @@ pub fn parse_force_offset(value: &str) -> Result<u64, String> {
     parsed.map_err(|_| format!("--force-offset needs a decimal or 0x-hex integer (got {value:?})"))
 }
 
+/// Reject an empty provider matcher (R07/F15): matchers stay
+/// opaque — no trimming, no finite enumeration, so third-party ids
+/// always parse — but must be nonempty, otherwise the rendered rule
+/// `predicate` violates the producer schema's minLength 1. Checked
+/// per occurrence at CLI admission (usage error, exit 2), before any
+/// child/BPF work.
+pub fn parse_provider_matcher(flag: &str, value: String) -> Result<String, String> {
+    if value.is_empty() {
+        return Err(format!("{flag} needs a nonempty value"));
+    }
+    Ok(value)
+}
+
 /// Parse the H9/R07 workload destination pair (shared by report
 /// and check so both verbs reject identically): at most one of
 /// `--workload-out` (file path) / `--workload-out-fd` (caller-held
