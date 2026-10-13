@@ -446,6 +446,30 @@ pub fn policy_record(v: &PolicyVerdict) -> PolicyRecord {
     }
 }
 
+/// Production check assembly (R02 fix round 1): evaluate the rules
+/// against the finalized document, fold the legacy ENGINE tripwire,
+/// and attach the policy section the renderers embed. [`run`] and the
+/// controller close-failure fixture both flow through this one
+/// orchestration point, so a regression here fails both together —
+/// the fixture can no longer pass while production drifts.
+pub(crate) fn assemble_checked_document(
+    rules: &[PolicyRule],
+    document: CaptureDocument,
+    legacy: &serde_json::Value,
+) -> (PolicyVerdict, CaptureDocument) {
+    let mut verdict = evaluate_document(rules, &document);
+    // Pre-T08 transition: the legacy ENGINE tripwire counted real
+    // in-window executions the document does not model yet; fold them
+    // in so --deny-engine cannot miss them. No-op once T08 retires the
+    // legacy block (or when the document already has the hits).
+    apply_legacy_engine_fallback(&mut verdict, legacy_engine_calls(legacy));
+    // Policy rides the document for the T11 renderers (JSON `policy`
+    // section, human policy block, CBOM `osslscope:policy-verdict`).
+    let mut document = document;
+    document.policy = Some(policy_record(&verdict));
+    (verdict, document)
+}
+
 const USAGE: [&str; 2] = [
     "usage: check [--duration S] [--provider P] [--object O] [--count-object C] [--table F] [--force-offset N] [--provider-table F] [rules] [--format human|json] [--out F] [--cbom FILE] [--builtin] [--settle S] [--timeout S] [--grace S] [--image-digest D] [--workload-out F] [--workload-out-fd N] {--pid P | run -- <cmd>}",
     "rules: [--require-provider P] [--deny-provider P] [--deny-engine] [--deny-algorithm X] [--deny-weak] [--require-executed X] (repeatable; at least one required)",
@@ -516,17 +540,12 @@ pub fn run(argv: &[String]) -> ExitCode {
             return ExitCode::from(exit_for(verdict.overall(), None, &document, &delivery));
         }
     };
-    let mut verdict = evaluate_document(&policy_rules(&args.rules), &c.document);
-    // Pre-T08 transition: the legacy ENGINE tripwire counted real
-    // in-window executions the document does not model yet; fold them
-    // in so --deny-engine cannot miss them. No-op once T08 retires the
-    // legacy block (or when the document already has the hits).
-    apply_legacy_engine_fallback(&mut verdict, legacy_engine_calls(&c.legacy));
-    // Policy rides the document for the T11 renderers (JSON `policy`
-    // section, human policy block, CBOM `osslscope:policy-verdict`).
+    // Check assembly flows through the shared production seam
+    // (evaluate → legacy tripwire → policy attach); the controller
+    // close-failure fixture uses the same function.
     let child_exit = c.child_exit;
-    let mut document = c.document;
-    document.policy = Some(policy_record(&verdict));
+    let (verdict, document) =
+        assemble_checked_document(&policy_rules(&args.rules), c.document, &c.legacy);
     let delivery = write_artifacts(&document, &req);
     crate::report::emit_diagnostics(&delivery);
     // H9/R07 T4: nonzero child exit with discarded output → one
@@ -1033,6 +1052,46 @@ mod tests {
         let rec = policy_record(&v);
         let gens: Vec<u32> = rec.rules[0].evidence.iter().map(|e| e.generation).collect();
         assert_eq!(gens, vec![0, 1]);
+    }
+
+    #[test]
+    fn assemble_checked_document_folds_legacy_and_attaches_policy() {
+        use crate::evidence::PolicyVerdict as DocVerdict;
+        // R02 fix round 1: the shared production seam evaluates the
+        // rules, folds the legacy ENGINE tripwire, and attaches the
+        // policy section the renderers embed — one orchestration
+        // point for check::run and the close-failure fixture.
+        let d = doc(vec![site(
+            1,
+            500,
+            vec![cand("p", "default", 2, 21, &["DES"], true)],
+        )]);
+        let (verdict, document) = assemble_checked_document(
+            std::slice::from_ref(&PolicyRule::deny_algorithm("DES")),
+            d,
+            &serde_json::Value::Null,
+        );
+        assert_eq!(verdict.overall(), PolicyOutcome::Violation);
+        let policy = document.policy.as_ref().expect("assembly attaches policy");
+        assert_eq!(policy.verdict, DocVerdict::Violation);
+        assert_eq!(policy.rules[0].definite, 500);
+        assert_eq!(policy.rules[0].evidence.len(), 1);
+        // Legacy-only tripwire: no sites, five ENGINE calls — the
+        // fallback convicts and the bounds ride the attached policy.
+        let quiet = doc(Vec::new());
+        let legacy = serde_json::json!({
+            "engine": {"calls_by_entrypoint": {"ENGINE_init": 5}},
+        });
+        let (verdict, document) = assemble_checked_document(
+            std::slice::from_ref(&PolicyRule::deny_engine()),
+            quiet,
+            &legacy,
+        );
+        assert_eq!(verdict.overall(), PolicyOutcome::Violation);
+        let policy = document.policy.as_ref().expect("assembly attaches policy");
+        assert_eq!(policy.verdict, DocVerdict::Violation);
+        assert_eq!(policy.rules[0].definite, 5);
+        assert!(policy.rules[0].evidence.is_empty());
     }
 
     #[test]

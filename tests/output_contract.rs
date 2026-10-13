@@ -9,9 +9,9 @@
 //! input-order independence, honest human uncertainty, definite-only
 //! CBOM, and independent artifact delivery (unwritable primary vs
 //! writable CBOM and reverse, broken pipe, fatal/partial/
-//! inconclusive/violation artifacts from one document — no second
-//! capture). v2 goldens pin bytes; examples in docs come from these
-//! fixtures, never invented.
+//! inconclusive/violation/runtime artifacts from one document —
+//! no second capture). v2 goldens pin bytes; examples in docs come
+//! from these fixtures, never invented.
 
 use osslscope::check::policy_record;
 use osslscope::evidence::{
@@ -21,9 +21,9 @@ use osslscope::evidence::{
     OpensslVersion, PolicyRecord, PolicyRuleResult, PolicyVerdict, RuleVerdict, ScopeCoverage,
     SiteExecution, SiteKey, TargetRecord, finalize,
 };
-use osslscope::policy::{PolicyRule, evaluate_document};
+use osslscope::policy::{PolicyOutcome, PolicyRule, evaluate_document};
 use osslscope::report::{
-    OutputDest, OutputFormat, OutputRequest, render_cbom, render_human, render_json,
+    OutputDest, OutputFormat, OutputRequest, exit_for, render_cbom, render_human, render_json,
     setup_failure_document, write_artifacts,
 };
 use osslscope::schema::{
@@ -1881,15 +1881,16 @@ fn delivery_stdout_primary_succeeds() {
 
 #[test]
 fn delivery_writes_all_verdict_artifacts_without_second_capture() {
-    // Fatal/partial/inconclusive/violation/pass artifacts from one
-    // document each: delivered bytes equal direct renders and
-    // validate (schema + semantics).
+    // Fatal/partial/inconclusive/violation/pass/runtime artifacts
+    // from one document each: delivered bytes equal direct renders
+    // and validate (schema + semantics).
     for (name, doc) in [
         ("fatal", fatal_doc()),
         ("partial", partial_doc()),
         ("inconclusive", inconclusive_doc()),
         ("violation", violation_doc()),
         ("pass", pass_doc()),
+        ("runtime", runtime_violation_doc()),
     ] {
         let primary_path = temp_path(&format!("verdict-{name}.json"));
         let cbom_path = temp_path(&format!("verdict-{name}.cdx.json"));
@@ -1923,6 +1924,66 @@ fn delivery_writes_all_verdict_artifacts_without_second_capture() {
         remove_quiet(&primary_path);
         remove_quiet(&cbom_path);
     }
+}
+
+#[test]
+fn delivery_runtime_readback_retains_evidence() {
+    // R02 fix round 1: a delivered Runtime-fatal violation is
+    // independently validated — both destinations are read back, the
+    // retained primary bytes carry the verdict and the evidence, the
+    // retained CBOM carries the asset, and the exit derives from the
+    // actual delivery result (never a fabricated outcome).
+    let doc = runtime_violation_doc();
+    let primary_path = temp_path("runtime.report.json");
+    let cbom_path = temp_path("runtime.report.cdx.json");
+    remove_quiet(&primary_path);
+    remove_quiet(&cbom_path);
+    let req = OutputRequest {
+        format: OutputFormat::Json,
+        primary: OutputDest::File(primary_path.clone()),
+        cbom: Some(OutputDest::File(cbom_path.clone())),
+    };
+    let res = write_artifacts(&doc, &req);
+    assert!(res.delivered_all(), "{res:?}");
+    assert!(res.diagnostics.is_empty(), "{:?}", res.diagnostics);
+    let primary = std::fs::read(&primary_path).unwrap();
+    let cbom_bytes = std::fs::read(&cbom_path).unwrap();
+    assert_eq!(
+        primary,
+        render_json(&doc).unwrap(),
+        "delivered primary drifted from the direct render"
+    );
+    assert_eq!(
+        cbom_bytes,
+        render_cbom(&doc).unwrap(),
+        "delivered CBOM drifted from the direct render"
+    );
+    let v: Value = serde_json::from_slice(&primary).unwrap();
+    validate_v2(&v).expect("delivered Runtime primary fails schema");
+    check_v2_semantics(&v).expect("delivered Runtime primary fails semantics");
+    assert_eq!(v["policy"]["verdict"], "violation");
+    assert_eq!(v["policy"]["rules"][0]["definite"], 500);
+    assert_eq!(v["policy"]["rules"][0]["evidence"][0]["calls"], 500);
+    assert_eq!(v["sites"][0]["calls"], 500);
+    let cbom: Value = serde_json::from_slice(&cbom_bytes).unwrap();
+    let comps = cbom["components"].as_array().unwrap();
+    assert_eq!(comps.len(), 1);
+    let props = cbom_props(&comps[0]);
+    assert_eq!(props["osslscope:algorithm"], "DES");
+    assert_eq!(props["osslscope:calls"], "500");
+    let meta = cbom_metadata(&cbom);
+    assert_eq!(meta["osslscope:omitted-ambiguous-sites"], "0");
+    assert_eq!(meta["osslscope:omitted-unknown-coverage-sites"], "0");
+    assert_eq!(meta["osslscope:policy-verdict"], "violation");
+    let disclaimer = &meta["osslscope:completeness-disclaimer"];
+    assert!(disclaimer.contains("FATAL"), "{disclaimer}");
+    assert!(disclaimer.contains("salvaged"), "{disclaimer}");
+    assert!(!disclaimer.contains("no usable evidence"), "{disclaimer}");
+    // A proved violation dominates the tool failure, driven by the
+    // actual delivery result.
+    assert_eq!(exit_for(PolicyOutcome::Violation, None, &doc, &res), 10);
+    remove_quiet(&primary_path);
+    remove_quiet(&cbom_path);
 }
 
 #[test]
