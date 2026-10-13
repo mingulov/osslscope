@@ -275,7 +275,7 @@
           "type": "array",
           "items": { "$ref": "#/$defs/candidate" }
         },
-        "candidates_coverage": { "enum": ["complete", "unknown"] },
+        "candidates_coverage": { "enum": ["complete", "ambiguous_complete", "unknown"] },
         "calls": { "$ref": "#/$defs/u64" },
         "first_ns": { "$ref": "#/$defs/u64" },
         "last_ns": { "$ref": "#/$defs/u64" },

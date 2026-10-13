@@ -545,6 +545,7 @@ fn site_json(site: &SiteExecution) -> serde_json::Value {
         })).collect::<Vec<_>>(),
         "candidates_coverage": match site.candidates_coverage {
             CandidateCoverage::Complete => "complete",
+            CandidateCoverage::AmbiguousComplete => "ambiguous_complete",
             CandidateCoverage::Unknown => "unknown",
         },
         "calls": site.calls,

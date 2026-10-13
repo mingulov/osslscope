@@ -172,6 +172,19 @@ struct PendingMeaning {
     coverage: CandidateCoverage,
 }
 
+/// Fence comparison view of candidate coverage (R01): a mixed
+/// site's finiteness claim (`AmbiguousComplete`) and its loss claim
+/// (`Unknown`) fence identically — drift between them updates
+/// provenance without staging a fence (H3: mixed absorbs taint
+/// silently). `Complete` stands apart: any drift to or from a
+/// definite-capable claim still fences, as before.
+fn fence_candidates_coverage(coverage: CandidateCoverage) -> CandidateCoverage {
+    match coverage {
+        CandidateCoverage::AmbiguousComplete => CandidateCoverage::Unknown,
+        other => other,
+    }
+}
+
 /// Normalize backend refuse-indices into per-position flags.
 /// Defensive: out-of-range indices are ignored, order and
 /// duplicates do not matter — a refused site must never read as
@@ -549,6 +562,21 @@ impl<B: CountBackend> CountSession<B> {
                     && current.candidates == site.candidates
                     && current.candidates_coverage == site.candidates_coverage
             });
+            // R01: AmbiguousComplete and Unknown are the same
+            // fence-wise — a mixed site absorbs taint, retirement
+            // and re-proof silently (H3: mixed absorbs taint
+            // silently; no second fence). Unlike `same`, the claim
+            // DID change, so provenance still updates (newest
+            // delta wins) — the relabel only ever weakens mixed
+            // claims (finite↔unbounded, never toward definite), so
+            // no fenced leg is owed.
+            let same_fence_silent = !same
+                && self.provenance.get(&cookie).is_some_and(|current| {
+                    current.site == site.site
+                        && current.candidates == site.candidates
+                        && fence_candidates_coverage(current.candidates_coverage)
+                            == fence_candidates_coverage(site.candidates_coverage)
+                });
             match self.provenance.entry(cookie) {
                 Entry::Vacant(vacant) => {
                     vacant.insert(Provenance {
@@ -563,6 +591,13 @@ impl<B: CountBackend> CountSession<B> {
                     // Newest delta wins: the live meaning stands, so
                     // any staged update is stale and must not install
                     // later.
+                    self.pending.remove(&cookie);
+                }
+                Entry::Occupied(mut occupied) if same_fence_silent => {
+                    // Mixed-claim drift (AmbiguousComplete↔Unknown):
+                    // adopt the newest claim without fencing — and
+                    // cancel any staged update like `same` does.
+                    occupied.get_mut().candidates_coverage = site.candidates_coverage;
                     self.pending.remove(&cookie);
                 }
                 Entry::Occupied(_) => {
