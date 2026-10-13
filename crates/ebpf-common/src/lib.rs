@@ -1355,7 +1355,10 @@ mod tests {
     #[test]
     fn ctrl_value_ctor_zeroes_pads() {
         let c = ctrl_value(512, 1, 1 << 20);
-        assert_eq!((c.expected, c.skip_all, c.epoch, c.governor), (512, 0, 1, 1 << 20));
+        assert_eq!(
+            (c.expected, c.skip_all, c.epoch, c.governor),
+            (512, 0, 1, 1 << 20)
+        );
         assert_eq!(c._pad, [0; 3], "pads zero for Pod map writes");
     }
 
