@@ -16,10 +16,10 @@
 use osslscope::check::policy_record;
 use osslscope::evidence::{
     CandidateCoverage, CandidateIdentity, CaptureDocument, CaptureWindow, Completeness,
-    CounterKind, CounterSource, CounterUnits, DispositionRecord, ExpectedScope, FatalKind,
-    FencedGeneration, FinalizeInput, GapCounter, LegacyCallPartition, ObjectId, ObjectRecord,
-    OpensslVersion, PolicyRecord, PolicyRuleResult, PolicyVerdict, RuleVerdict, ScopeCoverage,
-    SiteExecution, SiteKey, TargetRecord, finalize,
+    CounterKind, CounterSource, CounterUnits, DispositionRecord, EngineObservation, EngineWindow,
+    ExpectedScope, FatalKind, FencedGeneration, FinalizeInput, GapCounter, LegacyCallPartition,
+    ObjectId, ObjectRecord, OpensslVersion, PolicyRecord, PolicyRuleResult, PolicyVerdict,
+    RuleVerdict, ScopeCoverage, SiteExecution, SiteKey, TargetRecord, engine_index, finalize,
 };
 use osslscope::policy::{PolicyOutcome, PolicyRule, evaluate_document};
 use osslscope::report::{
@@ -142,6 +142,7 @@ fn input_base() -> FinalizeInput {
         disposition: Some(DispositionRecord::exited(0)),
         policy: None,
         legacy_partition: LegacyCallPartition::default(),
+        engine_observations: Vec::new(),
     }
 }
 
@@ -402,6 +403,7 @@ fn violation_doc() -> CaptureDocument {
                     evidence_ref(FP_A, 8, 100, 0x1000, 0, 500),
                     evidence_ref(FP_A, 8, 100, 0x1000, 1, 50),
                 ],
+                engine_evidence: Vec::new(),
             },
             PolicyRuleResult {
                 rule: "deny-weak".to_string(),
@@ -410,6 +412,7 @@ fn violation_doc() -> CaptureDocument {
                 definite: 0,
                 possible: Some(0),
                 evidence: Vec::new(),
+                engine_evidence: Vec::new(),
             },
         ],
     });
@@ -499,6 +502,7 @@ fn inconclusive_doc() -> CaptureDocument {
             definite: 0,
             possible: Some(100),
             evidence: Vec::new(),
+            engine_evidence: Vec::new(),
         }],
     });
     finalize_honest(input)
@@ -532,6 +536,7 @@ fn pass_doc() -> CaptureDocument {
             definite: 0,
             possible: Some(0),
             evidence: Vec::new(),
+            engine_evidence: Vec::new(),
         }],
     });
     finalize_honest(input)
@@ -1348,6 +1353,7 @@ fn shuffled_variants() -> Vec<CaptureDocument> {
                             definite: 0,
                             possible: Some(0),
                             evidence: Vec::new(),
+                            engine_evidence: Vec::new(),
                         },
                         PolicyRuleResult {
                             rule: "deny-weak".to_string(),
@@ -1356,6 +1362,7 @@ fn shuffled_variants() -> Vec<CaptureDocument> {
                             definite: 0,
                             possible: Some(0),
                             evidence: Vec::new(),
+                            engine_evidence: Vec::new(),
                         },
                     ],
                     0xdef + round,
@@ -2538,4 +2545,173 @@ fn site_installed_at_renders_and_validates_v2() {
         }
     }
     validate_v2(&old).expect("v2.0-shaped doc must keep validating");
+}
+
+// ---------------------------------------------------------------- R05 (F06)
+
+fn engine_obs_at(
+    offset: u64,
+    generation: u64,
+    entrypoint: &str,
+    calls: u64,
+    window: EngineWindow,
+) -> EngineObservation {
+    EngineObservation {
+        key: SiteKey {
+            object: obj(FP_A),
+            device: 8,
+            inode: 100,
+            offset,
+        },
+        generation,
+        entrypoint: engine_index(entrypoint).expect("frozen ENGINE registry name"),
+        calls,
+        window,
+    }
+}
+
+/// COMPLETE document with provider sites plus five in-window typed
+/// ENGINE observations and an evaluated deny-engine policy.
+fn engine_doc_fixture() -> CaptureDocument {
+    let mut input = input_base();
+    input.sites = vec![site_at(
+        FP_A,
+        8,
+        100,
+        0x1000,
+        0,
+        500,
+        vec![cand(FP_A, "default", 2, 21, &["AES-128-GCM"], false)],
+        CandidateCoverage::Complete,
+    )];
+    input.engine_observations = vec![
+        engine_obs_at(0x100, 0, "ENGINE_by_id", 1, EngineWindow::InWindow),
+        engine_obs_at(0x200, 0, "ENGINE_init", 1, EngineWindow::InWindow),
+        engine_obs_at(0x300, 0, "ENGINE_finish", 1, EngineWindow::InWindow),
+        engine_obs_at(0x400, 0, "ENGINE_free", 1, EngineWindow::InWindow),
+        engine_obs_at(0x500, 0, "ENGINE_ctrl", 1, EngineWindow::InWindow),
+    ];
+    let doc = finalize_honest(input);
+    assert!(matches!(doc.status, Completeness::Complete));
+    let verdict = evaluate_document(std::slice::from_ref(&PolicyRule::deny_engine()), &doc);
+    let mut doc = doc;
+    doc.policy = Some(policy_record(&verdict));
+    doc
+}
+
+#[test]
+fn engine_observations_render_validate_and_replay() {
+    let doc = engine_doc_fixture();
+    let v = json_of(&doc);
+    validate_v2(&v).expect("engine doc fails schema");
+    check_v2_semantics(&v).expect("engine doc fails semantics");
+    // Rendered observations carry index + registry name + window.
+    let obs = v["engine_observations"]
+        .as_array()
+        .expect("observations render");
+    assert_eq!(obs.len(), 5);
+    assert_eq!(obs[0]["entrypoint_name"], "ENGINE_by_id");
+    assert_eq!(obs[0]["window"], "in-window");
+    assert_eq!(obs[0]["calls"], 1);
+    // Policy engine evidence resolves to the listed observations.
+    let rule = &v["policy"]["rules"][0];
+    assert_eq!(rule["rule"], "deny-engine");
+    assert_eq!(rule["result"], "violation");
+    assert_eq!(rule["definite"], 5);
+    let refs = rule["engine_evidence"]
+        .as_array()
+        .expect("engine evidence renders");
+    assert_eq!(refs.len(), 5);
+    // Provider conservation excludes ENGINE calls everywhere.
+    assert_eq!(doc.total_calls(), 500);
+    let part = &v["legacy_partition"];
+    let buckets: u64 = [
+        "legacy_exclusive_calls",
+        "non_legacy_exclusive_calls",
+        "shared_ambiguous_calls",
+        "unfenced_tail_calls",
+    ]
+    .iter()
+    .map(|k| part[k].as_u64().unwrap())
+    .sum();
+    assert_eq!(buckets, 500);
+    // CBOM carries engine metadata beside definite assets.
+    let cbom = cbom_of(&doc);
+    let meta = cbom_metadata(&cbom);
+    assert_eq!(meta["osslscope:engine-observations"], "5");
+    assert_eq!(meta["osslscope:engine-in-window-calls"], "5");
+    // Human render names the observation plane honestly.
+    let human = render_human(&doc);
+    assert!(
+        human.contains("engine observations (5, 5 in-window calls)"),
+        "{human}"
+    );
+    assert!(human.contains("ENGINE_init"), "{human}");
+    // Replay from the serialized document agrees.
+    let bytes = serde_json::to_string(&doc).unwrap();
+    let replayed: CaptureDocument = serde_json::from_str(&bytes).unwrap();
+    assert_eq!(replayed.engine_observations, doc.engine_observations);
+    let v2 = evaluate_document(std::slice::from_ref(&PolicyRule::deny_engine()), &replayed);
+    assert_eq!(policy_record(&v2), doc.policy.clone().unwrap());
+}
+
+#[test]
+fn engine_documents_read_old_shape() {
+    // Docs without observations omit every engine key (golden
+    // stability) and old-shaped JSON still deserializes.
+    let old = complete_doc();
+    let v = json_of(&old);
+    assert!(v.get("engine_observations").is_none());
+    validate_v2(&v).expect("old-shaped doc fails new schema");
+    check_v2_semantics(&v).expect("old-shaped doc fails new semantics");
+    // New code reads old serde documents: missing engine fields
+    // default to empty, never to fabricated observations.
+    let mut stripped = serde_json::to_value(engine_doc_fixture()).expect("document serializes");
+    stripped
+        .as_object_mut()
+        .unwrap()
+        .remove("engine_observations");
+    if let Some(policy) = stripped.get_mut("policy") {
+        for rule in policy["rules"].as_array_mut().unwrap() {
+            rule.as_object_mut().unwrap().remove("engine_evidence");
+        }
+    }
+    let back: CaptureDocument = serde_json::from_value(stripped).expect("old shape parses");
+    assert!(back.engine_observations.is_empty());
+    assert!(
+        back.policy.as_ref().unwrap().rules[0]
+            .engine_evidence
+            .is_empty()
+    );
+}
+
+#[test]
+fn engine_semantics_rejects_bad_engine_refs() {
+    let good = json_of(&engine_doc_fixture());
+    // Ref to no listed observation.
+    let mut bad = good.clone();
+    bad["policy"]["rules"][0]["engine_evidence"][0]["offset"] = json!(0x9999);
+    assert!(check_v2_semantics(&bad).is_err());
+    // Double-claim across refs exceeds the observed calls.
+    let mut bad = good.clone();
+    bad["policy"]["rules"][0]["engine_evidence"][1] =
+        bad["policy"]["rules"][0]["engine_evidence"][0].clone();
+    assert!(check_v2_semantics(&bad).is_err());
+    // Entrypoint outside the frozen registry.
+    let mut bad = good.clone();
+    bad["engine_observations"][0]["entrypoint"] = json!(9999);
+    assert!(check_v2_semantics(&bad).is_err());
+    // Name contradicting the indexed entrypoint.
+    let mut bad = good.clone();
+    bad["engine_observations"][0]["entrypoint_name"] = json!("ENGINE_init");
+    assert!(check_v2_semantics(&bad).is_err());
+    // Observation keyed to an unlisted object.
+    let mut bad = good.clone();
+    bad["engine_observations"][0]["object"] = json!("build:deadbeef");
+    assert!(check_v2_semantics(&bad).is_err());
+    // definite can never exceed possible on engine rules either.
+    let mut bad = good.clone();
+    bad["policy"]["rules"][0]["definite"] = json!(6);
+    bad["policy"]["rules"][0]["possible"] = json!(5);
+    assert!(check_v2_semantics(&bad).is_err());
 }

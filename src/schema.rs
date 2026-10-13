@@ -736,6 +736,81 @@ fn site_calls_map(
     Ok(map)
 }
 
+/// (object, device, inode, offset, generation, entrypoint) →
+/// calls for every listed ENGINE observation. Absent when the
+/// document carries no `engine_observations` key (old shape).
+/// Duplicate keys fail, like sites. Each observation's object
+/// triple must be listed (same two-tier error as sites) and its
+/// entrypoint must index the frozen ENGINE registry with a
+/// matching display name (the index is authoritative; the name is
+/// checked, never trusted).
+type EngineCallsMap = std::collections::BTreeMap<(String, u64, u64, u64, u64, u64), u64>;
+
+fn engine_calls_map(
+    root: &serde_json::Map<String, serde_json::Value>,
+    known_triples: &std::collections::BTreeSet<(String, u64, u64)>,
+    known_ids: &std::collections::BTreeSet<String>,
+) -> Result<EngineCallsMap, String> {
+    let mut map = std::collections::BTreeMap::new();
+    let Some(items) = root.get("engine_observations") else {
+        return Ok(map);
+    };
+    let items = items
+        .as_array()
+        .ok_or_else(|| "doc.engine_observations: expected array".to_string())?;
+    for (index, item) in items.iter().enumerate() {
+        let ctx = format!("doc.engine_observations[{index}]");
+        let record = item
+            .as_object()
+            .ok_or_else(|| format!("{ctx}: expected object"))?;
+        let object = record
+            .get("object")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("{ctx}.object: expected string"))?
+            .to_string();
+        let triple = (
+            object.clone(),
+            get_u64(record, "device", &ctx)?,
+            get_u64(record, "inode", &ctx)?,
+        );
+        if !known_triples.contains(&triple) {
+            if !known_ids.contains(&object) {
+                return Err(format!("{ctx}.object: unlisted object {object:?}"));
+            }
+            return Err(format!(
+                "{ctx}: (device, inode) contradicts every record of {object:?}"
+            ));
+        }
+        let entrypoint = get_u64(record, "entrypoint", &ctx)?;
+        let want = crate::evidence::engine_name(
+            u16::try_from(entrypoint).map_err(|_| format!("{ctx}.entrypoint: out of range"))?,
+        )
+        .ok_or_else(|| format!("{ctx}.entrypoint: outside the ENGINE registry"))?;
+        let name = record
+            .get("entrypoint_name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("{ctx}.entrypoint_name: expected string"))?;
+        if name != want {
+            return Err(format!(
+                "{ctx}.entrypoint_name: {name:?} contradicts entrypoint {entrypoint} ({want:?})"
+            ));
+        }
+        let key = (
+            object,
+            triple.1,
+            triple.2,
+            get_u64(record, "offset", &ctx)?,
+            get_u64(record, "generation", &ctx)?,
+            entrypoint,
+        );
+        let calls = get_u64(record, "calls", &ctx)?;
+        if map.insert(key, calls).is_some() {
+            return Err(format!("{ctx}: duplicated observation key"));
+        }
+    }
+    Ok(map)
+}
+
 fn check_object_refs(root: &serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
     let objects = root
         .get("objects")
@@ -827,6 +902,9 @@ fn check_object_refs(root: &serde_json::Map<String, serde_json::Value>) -> Resul
             check_site(site, &format!("doc.fenced[{bucket}].sites[{index}]"))?;
         }
     }
+    // R05: typed ENGINE observations resolve their object triple
+    // like sites and their entrypoint against the frozen registry.
+    let engines = engine_calls_map(root, &known_triples, &known_ids)?;
     // Policy evidence refs resolve to a listed site and, summed
     // per site within one rule, never claim more calls than that
     // site executed (the same site cited twice cannot double-claim).
@@ -895,6 +973,57 @@ fn check_object_refs(root: &serde_json::Map<String, serde_json::Value>) -> Resul
                     return Err(format!(
                         "{ctx}: claims {total} calls across refs, site executed {have}"
                     ));
+                }
+            }
+            // R05: engine-plane refs resolve to a listed ENGINE
+            // observation with the same per-rule no-double-claim
+            // rule. Absent on rules without engine evidence.
+            if let Some(items) = rule_obj.get("engine_evidence") {
+                let items = items.as_array().ok_or_else(|| {
+                    format!("doc.policy.rules[{rule}].engine_evidence: expected array")
+                })?;
+                let mut eclaimed: std::collections::BTreeMap<
+                    (String, u64, u64, u64, u64, u64),
+                    u64,
+                > = std::collections::BTreeMap::new();
+                for (index, item) in items.iter().enumerate() {
+                    let ctx = format!("doc.policy.rules[{rule}].engine_evidence[{index}]");
+                    let record = item
+                        .as_object()
+                        .ok_or_else(|| format!("{ctx}: expected object"))?;
+                    let object = record
+                        .get("object")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| format!("{ctx}.object: expected string"))?
+                        .to_string();
+                    let device = get_u64(record, "device", &ctx)?;
+                    let inode = get_u64(record, "inode", &ctx)?;
+                    if !known_triples.contains(&(object.clone(), device, inode)) {
+                        return Err(format!("{ctx}: (object, device, inode) is unlisted"));
+                    }
+                    let key = (
+                        object,
+                        device,
+                        inode,
+                        get_u64(record, "offset", &ctx)?,
+                        get_u64(record, "generation", &ctx)?,
+                        get_u64(record, "entrypoint", &ctx)?,
+                    );
+                    let have = engines
+                        .get(&key)
+                        .ok_or_else(|| format!("{ctx}: resolves to no listed observation"))?;
+                    let calls = get_u64(record, "calls", &ctx)?;
+                    let total = eclaimed
+                        .get(&key)
+                        .copied()
+                        .unwrap_or(0)
+                        .saturating_add(calls);
+                    eclaimed.insert(key, total);
+                    if total > *have {
+                        return Err(format!(
+                            "{ctx}: claims {total} calls across refs, observation executed {have}"
+                        ));
+                    }
                 }
             }
         }
