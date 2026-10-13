@@ -25,7 +25,9 @@
 #     leaves an existing install byte-identical. Once replacement begins,
 #     a failure (I/O error, chmod, receipt write) stops the install and
 #     may leave a partially updated prefix; rerun the install to complete
-#     it. The receipt itself publishes atomically (temp file + rename).
+#     it. The receipt itself publishes atomically (temp file + rename)
+#     through a fresh per-run temporary file; a leftover .install-tmp
+#     path refuses the install instead of being reused.
 #   - Fail closed on incompatible objects: the host binary must be an
 #     x86-64 ELF executable; BPF objects must be ELF64 little-endian
 #     EM_BPF relocatables (role usability stays a loader/doctor gate).
@@ -55,7 +57,7 @@ COUNT_OVERRIDE=""
 SETCAP=0
 
 usage() {
-    sed -n '2,37p' "$0"
+    sed -n '2,39p' "$0"
     echo "Exit codes: 0 ok; 2 usage; 3 missing prerequisite; 1 install/setup failure."
 }
 
@@ -146,16 +148,30 @@ if { [ -n "$BIN_OVERRIDE" ] || [ -n "$HARVEST_OVERRIDE" ] || [ -n "$COUNT_OVERRI
     exit 1
 fi
 
-MANIFEST_PATHS=""
+# --- snapshot the manifest bytes once per run, before any read: every
+# later derivation (paths, revision, hashes, lengths) comes from this
+# single snapshot, so a manifest replaced mid-run cannot mix revision A
+# metadata with revision B hashes. ---
+STAGE="$(mktemp -d "${TMPDIR:-/tmp}/osslscope-install.XXXXXX")" \
+    || { echo "error: cannot create staging directory" >&2; exit 1; }
+trap 'rm -rf "$STAGE"' EXIT INT TERM
+MANIFEST_SNAP=""
 if [ -f "$MANIFEST" ]; then
-    MANIFEST_PATHS="$(python3 - "$MANIFEST" <<'EOF'
+    MANIFEST_SNAP="$STAGE/build-manifest.snapshot.json"
+    cp "$MANIFEST" "$MANIFEST_SNAP" \
+        || { echo "error: cannot snapshot build manifest: $MANIFEST" >&2; exit 1; }
+fi
+
+MANIFEST_PATHS=""
+if [ -n "$MANIFEST_SNAP" ]; then
+    MANIFEST_PATHS="$(python3 - "$MANIFEST_SNAP" "$MANIFEST" <<'EOF'
 import json, sys
 try:
     m = json.load(open(sys.argv[1]))
 except (OSError, ValueError) as e:
-    sys.exit("error: cannot parse build manifest %s: %s" % (sys.argv[1], e))
+    sys.exit("error: cannot parse build manifest %s: %s" % (sys.argv[2], e))
 if m.get("schema") != "osslscope-dev-build-manifest-v1":
-    sys.exit("error: unsupported build manifest schema %r in %s (want osslscope-dev-build-manifest-v1; rebuild with scripts/build-dev.sh)" % (m.get("schema"), sys.argv[1]))
+    sys.exit("error: unsupported build manifest schema %r in %s (want osslscope-dev-build-manifest-v1; rebuild with scripts/build-dev.sh)" % (m.get("schema"), sys.argv[2]))
 arts = {a.get("role"): a for a in m.get("artifacts", [])}
 bpf = [a for a in m.get("artifacts", []) if a.get("role") == "bpf-object"]
 host = arts.get("host-binary", {})
@@ -176,7 +192,7 @@ vals = [
 for v in vals:
     if "\n" in v or "\r" in v:
         sys.exit("error: build manifest %s carries a newline in a field "
-                 "value (refusing to parse)" % sys.argv[1])
+                 "value (refusing to parse)" % sys.argv[2])
 print("\n".join(vals))
 EOF
 )" || exit 1
@@ -221,10 +237,8 @@ done
 
 # --- stage: copy the complete artifact set aside, then validate the staged
 # bytes before touching the prefix, so any failure leaves an existing
-# install byte-identical ---
-STAGE="$(mktemp -d "${TMPDIR:-/tmp}/osslscope-install.XXXXXX")" \
-    || { echo "error: cannot create staging directory" >&2; exit 1; }
-trap 'rm -rf "$STAGE"' EXIT INT TERM
+# install byte-identical (the staging dir was created beside the manifest
+# snapshot above, before any read) ---
 STAGE_HOST="$STAGE/host-binary"
 STAGE_HARVEST="$STAGE/bpf-harvest"
 STAGE_COUNT="$STAGE/bpf-count"
@@ -238,9 +252,12 @@ cp "$COUNT_OBJ" "$STAGE_COUNT" \
 # --- manifest integrity: manifest-selected entries must carry a valid
 # recorded sha256 + byte length and match the staged bytes that will be
 # installed. Explicit overrides are never checked against the manifest. ---
-export STAGE_HOST STAGE_HARVEST STAGE_COUNT MANIFEST
+export STAGE_HOST STAGE_HARVEST STAGE_COUNT MANIFEST MANIFEST_SNAP
 export SEL_HOST SEL_HARVEST SEL_COUNT
-python3 - <<'EOF' || exit 1
+verify_staged() {
+    # Checks staged bytes against the single manifest snapshot; called
+    # before replacement and again before the receipt publishes.
+    python3 - <<'EOF' || exit 1
 import hashlib, json, os, re, sys
 e = os.environ
 jobs = [
@@ -249,12 +266,13 @@ jobs = [
     ("count object", e["STAGE_COUNT"], e["SEL_COUNT"]),
 ]
 # Selection and verification together: recorded identities come from the
-# manifest itself, never through the flattened shell channel, so a
-# newline-bearing JSON value cannot spoof another artifact's identity.
+# single manifest snapshot, never through the flattened shell channel,
+# so a newline-bearing JSON value cannot spoof another artifact's
+# identity and a mid-run manifest swap cannot mix revisions.
 recorded = {}
 if any(sel == "manifest-verified" for _, _, sel in jobs):
     try:
-        with open(e.get("MANIFEST")) as f:
+        with open(e.get("MANIFEST_SNAP")) as f:
             m = json.load(f)
     except (OSError, ValueError, TypeError) as ex:
         sys.exit("error: cannot re-read build manifest %s: %s" % (e.get("MANIFEST"), ex))
@@ -291,6 +309,8 @@ for role, staged, sel in jobs:
         sys.exit("error: staged %s does not match %s: sha256 %s != recorded %s "
                  "(stale manifest or modified bytes? rebuild with scripts/build-dev.sh)" % (role, where, h.hexdigest(), sha.lower()))
 EOF
+}
+verify_staged
 
 # --- fail-closed object validation (on staged bytes) ---
 HOST_FILE="$(file -b "$STAGE_HOST")"
@@ -351,19 +371,44 @@ HARVEST_DEST="$PREFIX/lib/osslscope/osslscope-harvest"
 COUNT_DEST="$PREFIX/lib/osslscope/osslscope-count"
 DOC_DEST="$PREFIX/share/doc/osslscope/install.md"
 INST_MANIFEST="$PREFIX/share/osslscope/install-manifest.json"
-# Each destination is replaced through an independent inode (copy to a
-# temp file plus chmod plus rename), so a symlink or hardlink alias at an
-# existing destination cannot clobber an already installed artifact, and
-# each single-file replacement is atomic. Temp files share the
-# ".install-tmp" suffix and are removed on any failure below.
-BIN_TMP="$BIN_DEST.install-tmp"
-HARVEST_TMP="$HARVEST_DEST.install-tmp"
-COUNT_TMP="$COUNT_DEST.install-tmp"
-DOC_TMP="$DOC_DEST.install-tmp"
-RECEIPT_TMP="$INST_MANIFEST.install-tmp"
-trap 'rm -rf "$STAGE" "$BIN_TMP" "$HARVEST_TMP" "$COUNT_TMP" "$DOC_TMP" "$RECEIPT_TMP"' EXIT INT TERM
+# Each destination is replaced through a FRESH uniquely-owned temporary
+# file (mktemp, one per run: copy plus chmod plus rename), so a symlink
+# or hardlink alias at an existing destination cannot clobber an already
+# installed artifact, and each single-file replacement is atomic. A
+# pre-existing "<dest>.install-tmp" path — leftover or alias — refuses
+# the install outright instead of being followed or reused, and the
+# cleanup trap below only ever removes paths this run created.
+for _legacy in "$BIN_DEST.install-tmp" "$HARVEST_DEST.install-tmp" \
+        "$COUNT_DEST.install-tmp" "$DOC_DEST.install-tmp" \
+        "$INST_MANIFEST.install-tmp"; do
+    if [ -e "$_legacy" ] || [ -L "$_legacy" ]; then
+        if [ "$_legacy" = "$INST_MANIFEST.install-tmp" ]; then
+            echo "error: refusing to publish install receipt: stale temporary path already exists: $_legacy (remove it and re-run)" >&2
+        else
+            echo "error: refusing to install: stale temporary path already exists: $_legacy (remove it and re-run)" >&2
+        fi
+        exit 1
+    fi
+done
+BIN_TMP="$(mktemp "$BIN_DEST.install-tmp.XXXXXX")" \
+    || { echo "error: cannot create temporary file for $BIN_DEST" >&2; exit 1; }
+HARVEST_TMP="$(mktemp "$HARVEST_DEST.install-tmp.XXXXXX")" \
+    || { echo "error: cannot create temporary file for $HARVEST_DEST" >&2; exit 1; }
+COUNT_TMP="$(mktemp "$COUNT_DEST.install-tmp.XXXXXX")" \
+    || { echo "error: cannot create temporary file for $COUNT_DEST" >&2; exit 1; }
+DOC_TMP="$(mktemp "$DOC_DEST.install-tmp.XXXXXX")" \
+    || { echo "error: cannot create temporary file for $DOC_DEST" >&2; exit 1; }
+RECEIPT_TMP="$(mktemp "$INST_MANIFEST.install-tmp.XXXXXX")" \
+    || { echo "error: cannot create temporary file for $INST_MANIFEST" >&2; exit 1; }
+trap 'rm -rf "$STAGE"; rm -f "$BIN_TMP" "$HARVEST_TMP" "$COUNT_TMP" "$DOC_TMP" "$RECEIPT_TMP"' EXIT INT TERM
 install_one() {
     # $1 = staged source, $2 = destination, $3 = temp file, $4 = mode, $5 = role label.
+    # The temp file is a fresh mktemp path owned by this run; never write
+    # through it if it stopped being a plain file.
+    if [ -L "$3" ]; then
+        echo "error: refusing to install $5: temporary path is no longer a plain file: $3" >&2
+        exit 1
+    fi
     cp "$1" "$3" \
         || { echo "error: cannot install $5 to $2" >&2; exit 1; }
     chmod "$4" "$3" \
@@ -406,7 +451,10 @@ if [ "$SETCAP" -eq 1 ]; then
 fi
 
 # --- install manifest (published atomically via temp file + rename) ---
-export PREFIX MANIFEST PRODUCT_REF PRODUCT_DIRTY SETCAP_STATE REPO
+# Re-verify the staged bytes against the single manifest snapshot before
+# publishing, so the receipt only ever records still-verified bytes.
+verify_staged
+export PREFIX MANIFEST PRODUCT_REF PRODUCT_DIRTY SETCAP_STATE REPO RECEIPT_TMP
 export HOST_BIN HARVEST_OBJ COUNT_OBJ
 python3 - "$INST_MANIFEST" <<'EOF' || exit 1
 import hashlib, json, os, subprocess, sys, datetime
@@ -472,9 +520,14 @@ manifest = {
     "setcap": e.get("SETCAP_STATE"),
     "artifacts": arts,
 }
-tmp = sys.argv[1] + ".install-tmp"
+tmp = e.get("RECEIPT_TMP") or None
+if not tmp:
+    sys.exit("error: cannot write install receipt %s: no temporary path" % sys.argv[1])
 try:
-    with open(tmp, "w") as f:
+    # The temp file is a fresh mktemp path owned by this run; O_NOFOLLOW
+    # refuses to write through it if it stopped being a plain file.
+    fd = os.open(tmp, os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW)
+    with os.fdopen(fd, "w") as f:
         json.dump(manifest, f, indent=2, sort_keys=True)
         f.write("\n")
     os.replace(tmp, sys.argv[1])

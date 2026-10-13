@@ -45,13 +45,19 @@ $PREFIX/share/osslscope/install-manifest.json
 The installer reads artifact paths from
 `target/dev-build-manifest.json`; pass `--manifest PATH` to use a
 different build, or `--binary F --harvest F --count F` to install
-explicit operator-built objects. The complete artifact set is staged
+explicit operator-built objects. The build manifest is read once per
+run — revision metadata, hashes, and lengths all come from that single
+snapshot, and staged bytes are re-verified against it before the
+receipt publishes. The complete artifact set is staged
 and validated before anything in the prefix is replaced, so a validation
 failure leaves an existing install byte-identical. Once replacement
 begins, a failure (I/O error, `chmod`, receipt write) stops the install
 and may leave a partially updated prefix; rerun the install to complete
-it. The receipt itself publishes atomically (temp file + rename), so a
-failed install never leaves a truncated receipt. Manifest-selected
+it. The receipt itself publishes atomically (fresh per-run temp file +
+rename), so a failed install never leaves a truncated receipt; each
+destination likewise installs through a fresh temporary file, and a
+leftover `<file>.install-tmp` path refuses the install (remove it and
+re-run) instead of being reused. Manifest-selected
 artifacts must match the recorded `sha256` and byte length — a stale
 manifest or modified bytes fail closed with a rebuild hint. Every
 object is also screened before copying: the host binary must be an
