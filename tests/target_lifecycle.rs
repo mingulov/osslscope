@@ -4,7 +4,10 @@
 //! stopped child or zombie after cleanup; external `--pid` targets
 //! are never signaled. No BPF or privileges needed.
 
-use osslscope::target::{CustodyState, OwnedTarget, TargetDisposition, WorkloadDest};
+use osslscope::target::{
+    __test_set_prestop_pid_sink, __test_set_prestop_stall_ms, CustodyState, OwnedTarget,
+    TargetDisposition, WorkloadDest,
+};
 use std::time::{Duration, Instant};
 
 /// Poll until the child is reaped or the budget expires.
@@ -411,10 +414,12 @@ fn h9_t5_unwritable_path_maps_126_naming_path() {
 // ---------------------------------------------------------------------------
 
 use std::ffi::CString;
+use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::mpsc;
 
 /// Unique scratch dir per R06 test (parallel-safe: distinct names).
 fn r06_scratch(test: &str) -> PathBuf {
@@ -440,59 +445,159 @@ fn r06_mkfifo(path: &Path) {
     assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
 }
 
-/// Independent watchdog for the FIFO tests: if the spawn has not
-/// returned after `timeout`, opens the fifo O_RDWR (never blocks,
-/// even with no counterpart) and HOLDS it — releasing any child
-/// stuck in a blocking open (the RED shape) so the test runner never
-/// waits indefinitely. `finish` returns whether the rescue fired.
-struct R06Rescue {
-    done: Arc<AtomicBool>,
-    fired: Arc<AtomicBool>,
-    handle: Option<std::thread::JoinHandle<()>>,
+/// Cancel source for a supervised spawn: a shared flag (direct
+/// store) or the process signal flag (wired to a real SIGINT/SIGTERM
+/// handler by the signal tests below).
+#[derive(Clone)]
+enum R06Cancel {
+    Shared(Arc<AtomicBool>),
+    Signalled(&'static AtomicBool),
 }
 
-fn r06_watch_fifo(fifo: PathBuf, timeout: Duration) -> R06Rescue {
-    let done = Arc::new(AtomicBool::new(false));
-    let fired = Arc::new(AtomicBool::new(false));
-    let done_c = done.clone();
-    let fired_c = fired.clone();
-    let handle = std::thread::spawn(move || {
-        let end = Instant::now() + timeout;
-        let mut fd: libc::c_int = -1;
-        loop {
-            if done_c.load(Ordering::SeqCst) {
-                break;
-            }
-            if Instant::now() >= end {
-                fired_c.store(true, Ordering::SeqCst);
-                if fd < 0 {
-                    let c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
-                    fd = unsafe { libc::open(c.as_ptr(), libc::O_RDWR | libc::O_NONBLOCK) };
-                }
-            }
-            if Instant::now() >= end + Duration::from_secs(60) {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
+impl R06Cancel {
+    fn flag(&self) -> &AtomicBool {
+        match self {
+            R06Cancel::Shared(a) => a,
+            R06Cancel::Signalled(s) => s,
         }
-        if fd >= 0 {
-            unsafe {
-                libc::close(fd);
-            }
-        }
-    });
-    R06Rescue {
-        done,
-        fired,
-        handle: Some(handle),
     }
 }
 
-impl R06Rescue {
-    fn finish(mut self) -> bool {
-        self.done.store(true, Ordering::SeqCst);
-        self.handle.take().unwrap().join().unwrap();
-        self.fired.load(Ordering::SeqCst)
+/// Spawn on a worker thread with the pre-stop test hook armed (fix round
+/// 1): the worker reports the forked pid out-of-band into the returned
+/// sink (0 = not forked yet) and the pre-stop stall keeps the parent's
+/// wait loop provably mid-spin, so cancellation/deadline land post-fork.
+/// The caller enforces its own join bound plus exact-pid rescue — fully
+/// independent of the code under test (a hung worker fails the test, it
+/// never hangs the runner, and no child leaks on any path).
+fn r06_spawn_async(
+    argv: Vec<String>,
+    dest: WorkloadDest,
+    deadline: Instant,
+    cancel: R06Cancel,
+    stall_ms: u64,
+) -> (
+    std::thread::JoinHandle<()>,
+    Arc<AtomicU32>,
+    mpsc::Receiver<anyhow::Result<OwnedTarget>>,
+) {
+    let sink = Arc::new(AtomicU32::new(0));
+    let sink_c = sink.clone();
+    let (tx, rx) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        __test_set_prestop_stall_ms(stall_ms);
+        __test_set_prestop_pid_sink(Some(sink_c));
+        let r = OwnedTarget::spawn_stopped_with_control(&argv, dest, deadline, cancel.flag());
+        __test_set_prestop_pid_sink(None);
+        __test_set_prestop_stall_ms(0);
+        let _ = tx.send(r);
+    });
+    (worker, sink, rx)
+}
+
+/// Wait until the pid sink reports a fork (or the bound expires).
+fn r06_wait_forked(sink: &AtomicU32, bound: Duration) -> Option<u32> {
+    let end = Instant::now() + bound;
+    loop {
+        let pid = sink.load(Ordering::SeqCst);
+        if pid != 0 {
+            return Some(pid);
+        }
+        if Instant::now() >= end {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Independent PID custody: SIGKILL + reap one exact pid, tolerating the
+/// race where the spawn worker reaped it first (ECHILD). Bounded (5s),
+/// and never touches any other pid (no global child scans — unsafe under
+/// parallel test threads).
+fn r06_rescue_pid(pid: u32) {
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+    }
+    let end = Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut status = 0;
+        let r = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
+        if r > 0 {
+            return;
+        }
+        if r < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            // ECHILD: the worker reaped it — custody resolved either way.
+            return;
+        }
+        assert!(Instant::now() < end, "rescue: pid {pid} would not die");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Join a supervised spawn with a hard bound: on timeout, rescue the
+/// exact observed pid, verify no zombie, then fail — a regressed hang
+/// fails the test, never the runner. (The still-blocked worker is
+/// detached: dropping its handle; it owns no child after the rescue.)
+fn r06_join_supervised(
+    worker: std::thread::JoinHandle<()>,
+    rx: mpsc::Receiver<anyhow::Result<OwnedTarget>>,
+    pid: u32,
+    bound: Duration,
+) -> anyhow::Result<OwnedTarget> {
+    match rx.recv_timeout(bound) {
+        Ok(r) => {
+            worker.join().unwrap();
+            r
+        }
+        Err(_) => {
+            r06_rescue_pid(pid);
+            assert_reaped_no_zombie(pid);
+            panic!("spawn hung beyond {bound:?}; rescued pid {pid}");
+        }
+    }
+}
+
+/// Process-wide test signal flag (mirrors capture's INTERRUPTED: one flag
+/// fed by the real handler). Reset on every arm; the two signal tests
+/// serialize on [`R06_SIGNAL_LOCK`] so delivery attribution stays exact.
+static R06_SIGNAL_FLAG: AtomicBool = AtomicBool::new(false);
+static R06_SIGNAL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+extern "C" fn r06_on_test_signal(_sig: libc::c_int) {
+    R06_SIGNAL_FLAG.store(true, Ordering::SeqCst);
+}
+
+/// RAII signal disposition: installs the test handler, restores the
+/// previous disposition on drop (all paths).
+struct R06SigGuard {
+    sig: libc::c_int,
+    old: libc::sigaction,
+}
+
+fn r06_arm_signal(sig: libc::c_int) -> R06SigGuard {
+    R06_SIGNAL_FLAG.store(false, Ordering::SeqCst);
+    unsafe {
+        let mut new: libc::sigaction = std::mem::zeroed();
+        new.sa_sigaction = r06_on_test_signal as usize;
+        let mut old: libc::sigaction = std::mem::zeroed();
+        assert_eq!(
+            libc::sigaction(sig, &new, &mut old),
+            0,
+            "install test signal handler"
+        );
+        R06SigGuard { sig, old }
+    }
+}
+
+impl Drop for R06SigGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::sigaction(self.sig, &self.old, std::ptr::null_mut());
+        }
     }
 }
 
@@ -508,61 +613,65 @@ fn r06_unexpected_child(mut t: OwnedTarget, what: &str) -> ! {
 
 #[test]
 fn fifo_setup_cancel_reaps_child() {
-    // R06/F07 core: a FIFO workload destination with no reader, plus
-    // a SIGINT/SIGTERM-like cancellation arriving mid-setup. Setup
-    // must fail fast with no surviving child; the sentinel must never
-    // execute. The watchdog only fires on a regressed (blocking)
-    // implementation, releasing the stuck child so the runner never
-    // hangs; GREEN never needs the rescue.
+    // R06/F07 fix round 1: a FIFO workload destination in its sanctioned
+    // streaming form (caller-held fifo fd — `File(fifo)` rejection stays
+    // pinned by `fifo_dest_rejected_without_spawn`), with a
+    // SIGINT/SIGTERM-like cancellation arriving deterministically
+    // post-fork (only after the fork is observed; the 10s stall keeps the
+    // wait loop provably mid-spin). Setup must fail with the forked child
+    // killed pre-exec and reaped (status 137); the sentinel must never
+    // execute. Join bound + exact-pid rescue are independent of the code
+    // under test: error, unexpected-Ok and hung-worker paths all leave no
+    // child and never hang the runner.
     let dir = r06_scratch("fifo-cancel");
     let fifo = dir.join("sink.fifo");
     r06_mkfifo(&fifo);
     let sentinel = dir.join("SENTINEL");
     let argv = r06_sentinel_argv(&sentinel);
+    // Caller-held streaming fd for the fifo (O_RDWR never blocks, even
+    // with no counterpart): the documented non-File form for FIFOs.
+    // OwnedFd so the descriptor closes on every path, including panics.
+    let fc = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    let raw = unsafe { libc::open(fc.as_ptr(), libc::O_RDWR | libc::O_NONBLOCK) };
+    assert!(raw >= 0, "test holds the fifo fd");
+    let stream = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
     let cancel = Arc::new(AtomicBool::new(false));
-    // Signal-like cancellation from another thread (the same store
-    // the SIGINT/SIGTERM handler performs on capture's live flag).
-    let cancel_c = cancel.clone();
-    let signaller = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(200));
-        cancel_c.store(true, Ordering::SeqCst);
-    });
-    let watchdog = r06_watch_fifo(fifo.clone(), Duration::from_secs(5));
-    let t0 = Instant::now();
-    let result = OwnedTarget::spawn_stopped_with_control(
-        &argv,
-        WorkloadDest::File(fifo.clone()),
+    let (worker, sink, rx) = r06_spawn_async(
+        argv,
+        WorkloadDest::Fd(stream.as_raw_fd()),
         Instant::now() + Duration::from_secs(30),
-        &cancel,
+        R06Cancel::Shared(cancel.clone()),
+        10_000,
     );
+    let Some(pid) = r06_wait_forked(&sink, Duration::from_secs(10)) else {
+        let _ = rx.recv_timeout(Duration::from_secs(20));
+        panic!("no fork observed within 10s");
+    };
+    cancel.store(true, Ordering::SeqCst);
+    let t0 = Instant::now();
+    let result = r06_join_supervised(worker, rx, pid, Duration::from_secs(20));
     let elapsed = t0.elapsed();
-    let fired = watchdog.finish();
-    signaller.join().unwrap();
     match result {
         Err(e) => {
             let msg = e.to_string();
-            // No-reader FIFO: the pre-fork open fails fast (ENXIO),
-            // naming the path, the fifo kind and the 126 marker. (A
-            // wildly descheduled entry could observe the pending
-            // cancel first instead — also a childless fast failure.)
-            assert!(msg.contains("sink.fifo"), "names the path: {msg}");
-            assert!(msg.contains("126"), "126 marker: {msg}");
+            assert!(msg.contains("cancel"), "names cancellation: {msg}");
             assert!(
-                msg.contains("fifo") || msg.contains("cancel"),
-                "fifo or cancel cause: {msg}"
+                msg.contains(&format!("owned child {pid} killed and reaped")),
+                "confirmed cleanup of the observed pid: {msg}"
             );
+            assert!(msg.contains("(status 137)"), "SIGKILL status: {msg}");
             assert!(elapsed < Duration::from_secs(5), "fail fast: {elapsed:?}");
-            assert!(!fired, "watchdog rescue must not be needed");
+            assert_reaped_no_zombie(pid);
             assert!(!sentinel.exists(), "sentinel must never execute");
         }
-        Ok(t) => r06_unexpected_child(t, "FIFO setup must fail"),
+        Ok(t) => r06_unexpected_child(t, "cancelled FIFO setup must fail"),
     }
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
 fn prestop_deadline_reaps_child() {
-    // R06: an already-exceeded pre-stop deadline fails WITHOUT
+    // Leg 1 (R06): an already-exceeded pre-stop deadline fails WITHOUT
     // forking: no child exists to stop, the sentinel never executes,
     // and the error names the deadline.
     let dir = r06_scratch("prestop-deadline");
@@ -585,6 +694,152 @@ fn prestop_deadline_reaps_child() {
         }
         Ok(t) => r06_unexpected_child(t, "expired deadline must fail"),
     }
+    std::fs::remove_dir_all(&dir).unwrap();
+
+    // Leg 2 (fix round 1): a LIVE deadline expiring deterministically
+    // mid-wait (2s deadline vs 10s stall, with prep taking ~1ms): the
+    // forked child is killed pre-exec and reaped (status 137), and the
+    // error names both the deadline and the observed pid.
+    let dir = r06_scratch("prestop-deadline-live");
+    let sentinel = dir.join("SENTINEL");
+    let argv = r06_sentinel_argv(&sentinel);
+    let live_cancel = Arc::new(AtomicBool::new(false));
+    let (worker, sink, rx) = r06_spawn_async(
+        argv,
+        WorkloadDest::Null,
+        Instant::now() + Duration::from_secs(2),
+        R06Cancel::Shared(live_cancel),
+        10_000,
+    );
+    let Some(pid) = r06_wait_forked(&sink, Duration::from_secs(10)) else {
+        let _ = rx.recv_timeout(Duration::from_secs(20));
+        panic!("no fork observed within 10s");
+    };
+    let t0 = Instant::now();
+    let result = r06_join_supervised(worker, rx, pid, Duration::from_secs(20));
+    let elapsed = t0.elapsed();
+    match result {
+        Err(e) => {
+            let msg = e.to_string();
+            assert!(msg.contains("deadline"), "names the deadline: {msg}");
+            assert!(
+                msg.contains(&format!("owned child {pid} killed and reaped")),
+                "confirmed cleanup of the observed pid: {msg}"
+            );
+            assert!(msg.contains("(status 137)"), "SIGKILL status: {msg}");
+            assert!(elapsed < Duration::from_secs(5), "fail fast: {elapsed:?}");
+            assert_reaped_no_zombie(pid);
+            assert!(!sentinel.exists(), "sentinel must never execute");
+        }
+        Ok(t) => r06_unexpected_child(t, "expired live deadline must fail"),
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Shared body for the real-signal tests: install a genuine SIGINT /
+/// SIGTERM handler (the production shape — one flag fed by the handler),
+/// spawn supervised with a 10s stall, deliver the actual signal only
+/// after the fork is observed, and prove the child is killed pre-exec
+/// and reaped. Serialized with the sibling signal test so attribution of
+/// the shared process flag stays exact.
+fn r06_prestop_signal_reaps_child(sig: libc::c_int, sig_name: &str, scratch: &str) {
+    // Poison-tolerant: the lock only serializes the two signal tests
+    // (no data protected), so a sibling's failure must not mask this
+    // test's own verdict.
+    let _lock = R06_SIGNAL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = r06_arm_signal(sig);
+    let dir = r06_scratch(scratch);
+    let sentinel = dir.join("SENTINEL");
+    let argv = r06_sentinel_argv(&sentinel);
+    let (worker, sink, rx) = r06_spawn_async(
+        argv,
+        WorkloadDest::Null,
+        Instant::now() + Duration::from_secs(30),
+        R06Cancel::Signalled(&R06_SIGNAL_FLAG),
+        10_000,
+    );
+    let Some(pid) = r06_wait_forked(&sink, Duration::from_secs(10)) else {
+        let _ = rx.recv_timeout(Duration::from_secs(20));
+        panic!("no fork observed within 10s");
+    };
+    // Actual signal delivery to this process (not a bare store): the
+    // installed handler performs the production store.
+    assert_eq!(unsafe { libc::raise(sig) }, 0, "raise {sig_name}");
+    let t0 = Instant::now();
+    let result = r06_join_supervised(worker, rx, pid, Duration::from_secs(20));
+    let elapsed = t0.elapsed();
+    match result {
+        Err(e) => {
+            let msg = e.to_string();
+            assert!(msg.contains("cancel"), "names cancellation: {msg}");
+            assert!(
+                msg.contains(&format!("owned child {pid} killed and reaped")),
+                "confirmed cleanup of the observed pid: {msg}"
+            );
+            assert!(msg.contains("(status 137)"), "SIGKILL status: {msg}");
+            assert!(elapsed < Duration::from_secs(5), "fail fast: {elapsed:?}");
+            assert_reaped_no_zombie(pid);
+            assert!(!sentinel.exists(), "sentinel must never execute");
+        }
+        Ok(t) => r06_unexpected_child(t, &format!("{sig_name} must cancel setup")),
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn prestop_sigint_reaps_stalled_child() {
+    r06_prestop_signal_reaps_child(libc::SIGINT, "SIGINT", "sigint-reap");
+}
+
+#[test]
+fn prestop_sigterm_reaps_stalled_child() {
+    r06_prestop_signal_reaps_child(libc::SIGTERM, "SIGTERM", "sigterm-reap");
+}
+
+#[test]
+fn prestop_watchdog_rescues_blocked_setup() {
+    // The join bound + exact-pid rescue are ENFORCING, not advisory: with
+    // a 60s stall the spawn cannot return within the 3s join window, so
+    // this test must take the timeout path, rescue the exact observed pid
+    // itself, and then confirm the worker still returns (its wait loop
+    // notices the reaped child) — no hung test, no leaked child, no
+    // leaked worker.
+    let dir = r06_scratch("watchdog-rescue");
+    let sentinel = dir.join("SENTINEL");
+    let argv = r06_sentinel_argv(&sentinel);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (worker, sink, rx) = r06_spawn_async(
+        argv,
+        WorkloadDest::Null,
+        Instant::now() + Duration::from_secs(120),
+        R06Cancel::Shared(cancel),
+        60_000,
+    );
+    let Some(pid) = r06_wait_forked(&sink, Duration::from_secs(10)) else {
+        let _ = rx.recv_timeout(Duration::from_secs(20));
+        panic!("no fork observed within 10s");
+    };
+    // The spawn cannot return in 3s (60s stall, no cancel, far deadline):
+    // the timeout path is the assertion.
+    assert!(
+        rx.recv_timeout(Duration::from_secs(3)).is_err(),
+        "spawn must still be blocked"
+    );
+    // Independent rescue of the exact observed pid (the worker never
+    // participates): kill + reap, then verify no zombie.
+    r06_rescue_pid(pid);
+    assert_reaped_no_zombie(pid);
+    // After the rescue the worker's wait must return promptly (its child
+    // is gone): confirm no hung worker, then drop either outcome.
+    let drained = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("worker returns after rescue");
+    worker.join().unwrap();
+    if let Ok(t) = drained {
+        // Unexpected Ok after a rescue: resolve + verify, then fail.
+        r06_unexpected_child(t, "rescued setup must not succeed");
+    }
+    assert!(!sentinel.exists(), "sentinel must never execute");
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -821,6 +1076,154 @@ fn pinned_sink_survives_path_replacement() {
         b"replacement\n",
         "replacement untouched"
     );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// R06 fix round 1 (F3): a pinned file sink must survive closed stdio.
+// ---------------------------------------------------------------------------
+
+/// Marker env var for the closed-stdio inner run: value is the result-file path.
+const R06_CLOSED_STDIO_INNER: &str = "R06_CLOSED_STDIO_INNER";
+/// This test's own name (libtest filter for the inner re-exec).
+const R06_CLOSED_STDIO_TEST: &str = "pinned_sink_survives_closed_stdio";
+
+fn r06_note(log: &mut std::fs::File, s: &str) {
+    use std::io::Write as _;
+    let _ = writeln!(log, "{s}");
+}
+
+/// One closed-stdio spawn: file sink must capture both sentinel streams.
+/// Runs with the caller's stdio already closed; performs no printing.
+/// Returns (exit status, sink bytes): content is checked before status so
+/// a lost stream reports MISMATCH (the F3 shape) rather than a bare error.
+fn r06_closed_stdio_one(sink: &Path, idle: &AtomicBool) -> Result<(Option<i32>, Vec<u8>), String> {
+    let mut t = OwnedTarget::spawn_stopped_with_control(
+        &sentinel_argv(),
+        WorkloadDest::File(sink.to_path_buf()),
+        Instant::now() + Duration::from_secs(30),
+        idle,
+    )
+    .map_err(|e| format!("spawn: {e:#}"))?;
+    t.release().map_err(|e| format!("release: {e:#}"))?;
+    let code = wait_for_exit(&mut t, Duration::from_secs(5));
+    let bytes = std::fs::read(sink).map_err(|e| format!("read sink: {e}"))?;
+    Ok((code, bytes))
+}
+
+/// Check one case's (status, bytes): MISMATCH (return 1) when a stream was
+/// lost, ERROR (return 2) on any other surprise, or `None` to continue.
+fn r06_closed_stdio_check(
+    log: &mut std::fs::File,
+    case: &str,
+    r: Result<(Option<i32>, Vec<u8>), String>,
+) -> Option<i32> {
+    match r {
+        Ok((code, bytes)) if bytes == b"H9-OUT-S\nH9-ERR-S\n" && code == Some(0) => {
+            r06_note(log, &format!("case {case}: PASS"));
+            None
+        }
+        Ok((code, bytes)) => {
+            r06_note(
+                log,
+                &format!("case {case}: MISMATCH exit={code:?} bytes={bytes:?}"),
+            );
+            Some(1)
+        }
+        Err(e) => {
+            r06_note(log, &format!("case {case}: ERROR {e}"));
+            Some(2)
+        }
+    }
+}
+
+/// Inner run (re-exec'd subprocess): closes stdio, then proves both
+/// sentinel streams still land in pinned file sinks. Communicates only
+/// via the result file (fd >= 3, opened before any close) and the exit
+/// code. Returns the process exit code: 0 both pass, 1 content mismatch
+/// (the F3 bug shape), 2 unexpected error.
+fn r06_closed_stdio_inner_main(result_path: &Path) -> i32 {
+    let mut log = match std::fs::File::create(result_path) {
+        Ok(f) => f,
+        Err(_) => return 2,
+    };
+    let dir = r06_scratch("closed-stdio-inner");
+    let idle = AtomicBool::new(false);
+    // Case B first (stderr-only closed: open returns fd 2), then case A
+    // (both closed: open returns fd 1). Each case must capture both lines.
+    unsafe {
+        libc::close(libc::STDERR_FILENO);
+    }
+    let sink_b = dir.join("b.log");
+    if let Some(code) = r06_closed_stdio_check(
+        &mut log,
+        "stderr-only-closed",
+        r06_closed_stdio_one(&sink_b, &idle),
+    ) {
+        let _ = std::fs::remove_dir_all(&dir);
+        return code;
+    }
+    unsafe {
+        libc::close(libc::STDOUT_FILENO);
+    }
+    let sink_a = dir.join("a.log");
+    if let Some(code) = r06_closed_stdio_check(
+        &mut log,
+        "both-closed",
+        r06_closed_stdio_one(&sink_a, &idle),
+    ) {
+        let _ = std::fs::remove_dir_all(&dir);
+        return code;
+    }
+    r06_note(&mut log, "PASS");
+    let _ = std::fs::remove_dir_all(&dir);
+    0
+}
+
+#[test]
+fn pinned_sink_survives_closed_stdio() {
+    // Inner branch: this same test binary re-exec'd with the marker env
+    // set. Closing stdio happens ONLY in the subprocess, so the parallel
+    // harness (which shares fds 1/2 with every in-process test) is
+    // untouched. Never returns.
+    if let Ok(path) = std::env::var(R06_CLOSED_STDIO_INNER) {
+        std::process::exit(r06_closed_stdio_inner_main(Path::new(&path)));
+    }
+    // Outer: re-exec with only this test selected; the inner run closes
+    // ITS copies of fds 1/2, forcing the pinned open() onto fd 1/2 — the
+    // F3 shape (O_CLOEXEC + dup2 no-op loses the stream at exec).
+    let dir = r06_scratch("closed-stdio");
+    let result = dir.join("result.txt");
+    let exe = std::env::current_exe().unwrap();
+    let mut child = std::process::Command::new(exe)
+        .args(["--exact", R06_CLOSED_STDIO_TEST, "--nocapture"])
+        .env(R06_CLOSED_STDIO_INNER, &result)
+        .stdin(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    // Bounded wait: the inner run is self-bounding (~seconds); kill on a
+    // 60s overrun so a regression can never hang the runner.
+    let end = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        match child.try_wait().unwrap() {
+            Some(s) => break s,
+            None => {
+                if Instant::now() >= end {
+                    child.kill().unwrap();
+                    let _ = child.wait();
+                    panic!("closed-stdio inner run hung; killed");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    };
+    let detail =
+        std::fs::read_to_string(&result).unwrap_or_else(|_| "<inner never wrote>".to_string());
+    assert!(
+        status.success(),
+        "closed-stdio inner failed ({status}): {detail}"
+    );
+    assert!(detail.contains("PASS"), "inner result: {detail}");
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

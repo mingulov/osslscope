@@ -16,11 +16,14 @@
 //! The kill paths below still refuse to signal a child that is not
 //! observably stopped, so the residual window is microseconds, not
 //! the whole setup phase.
+use std::cell::RefCell;
 use std::ffi::CString;
-use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd as _, FromRawFd as _, IntoRawFd as _, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant};
 
 /// Explicit custody of an owned child. Query with
@@ -245,6 +248,14 @@ fn redirect_child_stdio(dest: &ChildDest) {
         if libc::dup2(sink, libc::STDOUT_FILENO) < 0 || libc::dup2(sink, libc::STDERR_FILENO) < 0 {
             libc::_exit(WORKLOAD_SETUP_EXIT);
         }
+        // F3: dup2(n, n) is a no-op that RETAINS the close-on-exec flag,
+        // so a sink that already is fd 1 or 2 (open returns the lowest
+        // free descriptor when the caller started with stdio closed)
+        // would vanish at exec. The workload's stdio must always survive
+        // exec, whatever produced the sink — clear both flags (raw fcntl,
+        // async-signal-safe; cannot fail after the dup2s above).
+        libc::fcntl(libc::STDOUT_FILENO, libc::F_SETFD, 0);
+        libc::fcntl(libc::STDERR_FILENO, libc::F_SETFD, 0);
         // open() returns the lowest free fd: when a stdio fd was
         // closed the sink may BE fd 1 or 2 already — close only a
         // spare (a caller fd above stdio is the child's own copy;
@@ -308,7 +319,10 @@ fn lstat_kind(c: &std::ffi::CStr) -> &'static str {
 /// inherits ordinary blocking stdio. The open fd — never the path —
 /// is handed to the child, so post-open path replacement is
 /// harmless. Every failure names the path with the 126 setup marker
-/// and spawns nothing.
+/// and spawns nothing. Runs on a setup-control worker (see
+/// [`run_under_control`]) — never call it directly on the setup path:
+/// `O_NONBLOCK` bounds neither a stalled FUSE open nor a block-device
+/// open.
 fn open_pinned_sink(path: &Path) -> anyhow::Result<OwnedFd> {
     use anyhow::Context as _;
     let c = CString::new(path.as_os_str().as_bytes()).context("NUL in --workload-out path")?;
@@ -365,6 +379,144 @@ fn open_pinned_sink(path: &Path) -> anyhow::Result<OwnedFd> {
     Ok(owned)
 }
 
+/// Outcome of running one blocking setup op under deadline +
+/// cancellation control (fix round 1 / F1): a stalled sink open or
+/// close (FUSE, block device — `O_NONBLOCK` bounds neither) must fail
+/// the setup instead of hanging it.
+enum Control<T> {
+    /// The op finished; carries its value.
+    Done(T),
+    /// Cancellation was pending (checked before running, then while
+    /// waiting); the worker keeps running detached and owns its captures.
+    Cancelled,
+    /// The deadline passed while waiting; the worker keeps running
+    /// detached and owns its captures.
+    Expired,
+    /// The worker died (panic) before reporting.
+    Lost,
+}
+
+/// Run a potentially-blocking setup op on a worker thread, bounded by
+/// the setup deadline and cancel flag (polled at 1ms). An already-dead
+/// setup never starts the op. On expiry the worker is detached — its
+/// ownership moves with it, so a stuck open's fd closes whenever the
+/// sink answers — and the caller fails WITHOUT forking (pre-fork) or
+/// resolves the guard-held child under custody (post-fork). `Err` = the
+/// worker thread itself could not start (fail-closed at the call site).
+fn run_under_control<T, F>(
+    deadline: Instant,
+    cancel: &AtomicBool,
+    op: F,
+) -> anyhow::Result<Control<T>>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    if cancel.load(Ordering::SeqCst) {
+        return Ok(Control::Cancelled);
+    }
+    if Instant::now() >= deadline {
+        return Ok(Control::Expired);
+    }
+    spawn_controlled(deadline, cancel, op)
+}
+
+/// Spawn the control worker and poll it (the post-pre-check half of
+/// [`run_under_control`]). Close disposal calls this directly: a close
+/// must run (possibly late, on the detached worker) even on an
+/// already-dead setup — otherwise its fd would leak.
+fn spawn_controlled<T, F>(
+    deadline: Instant,
+    cancel: &AtomicBool,
+    op: F,
+) -> anyhow::Result<Control<T>>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _worker = std::thread::Builder::new()
+        .name("osslscope-setup-op".to_string())
+        .spawn(move || {
+            let _ = tx.send(op());
+        })
+        .map_err(|e| anyhow::anyhow!("setup worker thread: {e}"))?;
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            return Ok(Control::Cancelled);
+        }
+        if Instant::now() >= deadline {
+            return Ok(Control::Expired);
+        }
+        match rx.recv_timeout(Duration::from_millis(1)) {
+            Ok(v) => return Ok(Control::Done(v)),
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => return Ok(Control::Lost),
+        }
+    }
+}
+
+/// Close a parent-held sink fd under setup control (F1): the actual
+/// close runs on a worker, so a FUSE FLUSH cannot hang setup. The full
+/// [`Control`] outcome returns: on expiry the fd stays owned by the
+/// worker (closed whenever the sink answers); only a worker-thread
+/// spawn failure leaks it process-lifetime (fail-closed thread
+/// exhaustion — setup still never blocks, custody still never breaks).
+fn close_under_control(
+    fd: OwnedFd,
+    deadline: Instant,
+    cancel: &AtomicBool,
+) -> anyhow::Result<Control<()>> {
+    // Pass the fd BY NUMBER so a thread-spawn failure leaks it instead
+    // of closing it inline: dropping the closure must never run the
+    // close on this thread.
+    let raw = fd.into_raw_fd();
+    // No dead-setup pre-check (see `spawn_controlled`): the close runs
+    // even when the deadline already won — late, on the worker.
+    spawn_controlled(deadline, cancel, move || {
+        // SAFETY: `raw` is the live sink fd, moved here by number; this
+        // closure runs at most once (the worker calls it once, or never
+        // on spawn failure — a leaked number, never closed twice).
+        drop(unsafe { OwnedFd::from_raw_fd(raw) });
+    })
+}
+
+/// Test-only pre-stop instrumentation (fix round 1 / F4), thread-local
+/// so parallel tests never interact:
+/// - `stall_ms`: the forked child sleeps this long before SIGSTOP, so
+///   the parent's pre-stop wait is provably mid-spin when cancellation
+///   or the deadline lands (a deterministic post-fork race — no timing
+///   luck, no ambient scheduling dependence).
+/// - `pid_sink`: the parent stores each forked pid here the instant fork
+///   returns, giving tests exact-PID custody independent of the call's
+///   own return (blocked calls and error returns included).
+///
+/// The parent copies both values to the stack BEFORE forking; the child
+/// uses only its stack copy (a plain integer + nanosleep — no
+/// allocation, no TLS access post-fork). Production callers must never
+/// arm this.
+struct PrestopTestHook {
+    stall_ms: u64,
+    pid_sink: Option<Arc<AtomicU32>>,
+}
+
+thread_local! {
+    static PRESTOP_TEST_HOOK: RefCell<PrestopTestHook> =
+        const { RefCell::new(PrestopTestHook { stall_ms: 0, pid_sink: None }) };
+}
+
+/// Test-only: arm the pre-stop stall (see the `PRESTOP_TEST_HOOK` static).
+#[doc(hidden)]
+pub fn __test_set_prestop_stall_ms(ms: u64) {
+    PRESTOP_TEST_HOOK.with(|h| h.borrow_mut().stall_ms = ms);
+}
+
+/// Test-only: arm the forked-pid report (see the `PRESTOP_TEST_HOOK` static).
+#[doc(hidden)]
+pub fn __test_set_prestop_pid_sink(sink: Option<Arc<AtomicU32>>) {
+    PRESTOP_TEST_HOOK.with(|h| h.borrow_mut().pid_sink = sink);
+}
+
 /// Post-fork pre-stop custody (R06/F07): owns the just-forked pid
 /// from the fork return until the SIGSTOP is observed (then an
 /// `OwnedTarget` takes over) or the wait fails (kill + reap here).
@@ -377,15 +529,124 @@ struct PrestopGuard {
     armed: bool,
 }
 
-impl PrestopGuard {
-    /// Failure path: SIGKILL (harmless if already dead) then a
-    /// blocking reap; the exit code rides along when known.
-    fn kill_and_reap(&mut self) -> Option<i32> {
-        self.armed = false;
-        unsafe {
-            libc::kill(self.pid as libc::pid_t, libc::SIGKILL);
+/// How long the pre-stop guard waits to reap a SIGKILLed child before
+/// reporting cleanup failure (a kill is normally reaped in
+/// microseconds; only an unkillable/D-state child exhausts this).
+const PRESTOP_REAP_GRACE: Duration = Duration::from_secs(5);
+
+/// Confirmed outcome of pre-stop failure cleanup (fix round 1 / F2).
+/// Only [`GuardCleanup::KilledAndReaped`] confirms BOTH the kill and the
+/// reap — every other outcome says exactly what was (and was not)
+/// established, so callers never report "killed and reaped" on a guess.
+enum GuardCleanup {
+    /// SIGKILL was delivered and this guard collected the status.
+    KilledAndReaped(i32),
+    /// Resolved without a confirmed kill: the status when observed
+    /// (`Some`), or unknown when another waiter collected it (`None`).
+    ReapedElsewhere(Option<i32>),
+    /// Kill found no process and no status remained (ESRCH + ECHILD):
+    /// nothing existed to kill or reap.
+    AlreadyGone,
+}
+
+impl GuardCleanup {
+    /// Factual report fragment ("owned child {pid} {this}").
+    fn report(&self) -> String {
+        match self {
+            GuardCleanup::KilledAndReaped(code) => format!("killed and reaped (status {code})"),
+            GuardCleanup::ReapedElsewhere(Some(code)) => {
+                format!("reaped without confirmed kill (status {code})")
+            }
+            GuardCleanup::ReapedElsewhere(None) => {
+                "reaped by a concurrent waiter (status unknown)".to_string()
+            }
+            GuardCleanup::AlreadyGone => "already gone (nothing to kill or reap)".to_string(),
         }
-        reap_blocking(self.pid).ok()
+    }
+}
+
+/// Run guard cleanup and render its confirmed outcome (or failure) as a
+/// report fragment. Cleanup failures propagate instead of dissolving
+/// into a "killed and reaped" claim.
+fn guard_cleanup_report(guard: &mut PrestopGuard) -> String {
+    match guard.kill_and_reap() {
+        Ok(outcome) => outcome.report(),
+        Err(e) => format!("cleanup failed: {e:#}"),
+    }
+}
+
+impl PrestopGuard {
+    /// Failure path: SIGKILL, then a bounded reap (fix round 1 / F2).
+    /// Custody stays explicit (armed) until resolution is CONFIRMED —
+    /// only the success returns disarm; every failure propagates with
+    /// the guard still armed, so `Drop` gets a bounded backstop retry.
+    /// The kill result is honored (ESRCH is distinguished from a real
+    /// kill failure) and reap errors propagate — nothing dissolves into
+    /// `None`.
+    fn kill_and_reap(&mut self) -> anyhow::Result<GuardCleanup> {
+        let killed = unsafe { libc::kill(self.pid as libc::pid_t, libc::SIGKILL) } == 0;
+        if !killed {
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() != Some(libc::ESRCH) {
+                anyhow::bail!("SIGKILL to owned child {} failed: {e}", self.pid);
+            }
+        }
+        let end = Instant::now() + PRESTOP_REAP_GRACE;
+        loop {
+            let mut status = 0;
+            let r = unsafe { libc::waitpid(self.pid as libc::pid_t, &mut status, libc::WNOHANG) };
+            if r > 0 {
+                if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
+                    let code = if libc::WIFEXITED(status) {
+                        libc::WEXITSTATUS(status)
+                    } else {
+                        128 + libc::WTERMSIG(status)
+                    };
+                    self.disarm();
+                    return Ok(if killed {
+                        GuardCleanup::KilledAndReaped(code)
+                    } else {
+                        GuardCleanup::ReapedElsewhere(Some(code))
+                    });
+                }
+                // No WUNTRACED was requested, so a stop report cannot
+                // occur; anything else is not our death — keep waiting
+                // (bounded, below).
+            } else if r < 0 {
+                let e = std::io::Error::last_os_error();
+                match e.raw_os_error() {
+                    // EINTR falls through to the bounded wait below.
+                    Some(libc::EINTR) => {}
+                    // Someone else collected our child (a concurrent
+                    // rescue): resolved, status unknown — or already
+                    // gone, if the kill itself found nothing.
+                    Some(libc::ECHILD) => {
+                        self.disarm();
+                        return Ok(if killed {
+                            GuardCleanup::ReapedElsewhere(None)
+                        } else {
+                            GuardCleanup::AlreadyGone
+                        });
+                    }
+                    _ => anyhow::bail!("reap of owned child {} failed: {e}", self.pid),
+                }
+            }
+            if Instant::now() >= end {
+                if killed {
+                    anyhow::bail!(
+                        "reap of owned child {} timed out after {:?} (SIGKILL sent, still unreaped)",
+                        self.pid,
+                        PRESTOP_REAP_GRACE
+                    );
+                }
+                anyhow::bail!(
+                    "reap of owned child {} timed out after {:?} (kill found no process, yet still unreaped)",
+                    self.pid,
+                    PRESTOP_REAP_GRACE
+                );
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     fn disarm(&mut self) {
@@ -423,14 +684,20 @@ impl OwnedTarget {
     /// (a dead setup forks nothing and truncates nothing), then
     /// destination preparation — file sinks are opened + pinned to
     /// a regular file by the PARENT pre-fork (see
-    /// [`WorkloadDest::File`]) — then fork. Custody starts at the
-    /// fork return, BEFORE waiting for SIGSTOP; the wait polls with
-    /// the checked deadline and the cancel flag, and every failure
-    /// kills + reaps only this never-released owned child. A child
-    /// that exits before stopping is already reaped, and its status
-    /// rides in the error (126 keeps the H9 stdio-setup mapping).
-    /// The child allocates nothing post-fork (async-signal-safe):
-    /// it dup2s inherited fds only and opens no paths.
+    /// [`WorkloadDest::File`]), on a worker under the same deadline +
+    /// cancel (a stalled sink fails the setup; it never hangs it) —
+    /// then a final cancel/deadline re-check, then fork. Custody starts
+    /// at the fork return, BEFORE the parent's sink copy is disposed
+    /// (also under control) and before waiting for SIGSTOP; the wait
+    /// polls with the checked deadline and the cancel flag, and every
+    /// failure kills + reaps only this never-released owned child,
+    /// reporting the confirmed outcome (cleanup failures propagate —
+    /// "killed and reaped" is claimed only when both are confirmed). A
+    /// child that exits before stopping is already reaped, and its
+    /// status rides in the error (126 keeps the H9 stdio-setup
+    /// mapping). The child allocates nothing post-fork
+    /// (async-signal-safe): it dup2s inherited fds only and opens no
+    /// paths.
     pub fn spawn_stopped_with_control(
         argv: &[String],
         dest: WorkloadDest,
@@ -454,17 +721,48 @@ impl OwnedTarget {
             .context("NUL in argv")?;
         let mut ptrs: Vec<*const libc::c_char> = cs.iter().map(|c| c.as_ptr()).collect();
         ptrs.push(std::ptr::null());
+        // Test-only hook values, copied to the stack BEFORE forking
+        // (the child uses only its stack copy — no TLS access, no
+        // allocation post-fork).
+        let (prestop_stall_ms, prestop_pid_sink) = PRESTOP_TEST_HOOK.with(|h| {
+            let h = h.borrow();
+            (h.stall_ms, h.pid_sink.clone())
+        });
         // Destination validated + prepared pre-fork (the child
         // allocates nothing). A file sink is opened + pinned HERE
-        // (never by the child); an invalid fd fails HERE — no spawn.
+        // (never by the child), on a worker under the setup deadline +
+        // cancel; an invalid fd fails HERE — no spawn.
         let mut owned_sink: Option<OwnedFd> = None;
         let child_dest = match &dest {
             WorkloadDest::Null => ChildDest::Null,
             WorkloadDest::File(path) => {
-                let sink = open_pinned_sink(path)?;
-                let raw = sink.as_raw_fd();
-                owned_sink = Some(sink);
-                ChildDest::Fd(raw)
+                let owned_path = path.clone();
+                let prep =
+                    run_under_control(deadline, cancel, move || open_pinned_sink(&owned_path))
+                        .map_err(|e| anyhow::anyhow!("{e:#} (no child spawned)"))?;
+                match prep {
+                    Control::Done(r) => {
+                        let sink = r?;
+                        let raw = sink.as_raw_fd();
+                        owned_sink = Some(sink);
+                        ChildDest::Fd(raw)
+                    }
+                    Control::Cancelled => {
+                        anyhow::bail!(
+                            "pre-stop setup cancelled during file-sink preparation (no child spawned)"
+                        );
+                    }
+                    Control::Expired => {
+                        anyhow::bail!(
+                            "pre-stop setup deadline exceeded during file-sink preparation (no child spawned)"
+                        );
+                    }
+                    Control::Lost => {
+                        anyhow::bail!(
+                            "pre-stop setup worker lost during file-sink preparation (no child spawned)"
+                        );
+                    }
+                }
             }
             WorkloadDest::Fd(fd) => {
                 let r = unsafe { libc::fcntl(*fd, libc::F_GETFD) };
@@ -477,6 +775,27 @@ impl OwnedTarget {
                 ChildDest::Fd(*fd)
             }
         };
+        // The setup may have died while preparation ran: re-check BEFORE
+        // forking so a dead setup forks nothing. A prepared sink
+        // disposes under the same control (a FUSE close must not hang
+        // this path either); there is no child yet, so the outcome needs
+        // no custody.
+        if cancel.load(Ordering::SeqCst) {
+            if let Some(sink) = owned_sink.take() {
+                let _ = close_under_control(sink, deadline, cancel);
+            }
+            anyhow::bail!(
+                "pre-stop setup cancelled after destination preparation (no child spawned)"
+            );
+        }
+        if Instant::now() >= deadline {
+            if let Some(sink) = owned_sink.take() {
+                let _ = close_under_control(sink, deadline, cancel);
+            }
+            anyhow::bail!(
+                "pre-stop setup deadline exceeded after destination preparation (no child spawned)"
+            );
+        }
         let pid = unsafe { libc::fork() };
         if pid < 0 {
             anyhow::bail!("fork: {}", std::io::Error::last_os_error());
@@ -503,27 +822,78 @@ impl OwnedTarget {
                 // the pre-exec stop so the fds are final while
                 // setup observes us.
                 redirect_child_stdio(&child_dest);
+                // Test-only pre-stop stall (see the hook static): a
+                // plain stack integer + nanosleep — no allocation, no
+                // TLS access (async-signal-safe). EINTR resumes the
+                // remainder so the stall is never cut short.
+                if prestop_stall_ms > 0 {
+                    let mut rem = libc::timespec {
+                        tv_sec: (prestop_stall_ms / 1000) as libc::time_t,
+                        tv_nsec: ((prestop_stall_ms % 1000) * 1_000_000) as libc::c_long,
+                    };
+                    loop {
+                        let mut out: libc::timespec = std::mem::zeroed();
+                        if libc::nanosleep(&rem, &mut out) == 0 {
+                            break;
+                        }
+                        if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                            rem = out;
+                            continue;
+                        }
+                        break;
+                    }
+                }
                 libc::raise(libc::SIGSTOP);
                 libc::execvp(ptrs[0], ptrs.as_ptr());
                 libc::_exit(127);
             }
         }
-        // Parent only from here (the child never falls through):
-        // the parent's copy of a pinned sink closes NOW (the child
-        // inherited its own), and custody starts BEFORE the wait.
-        drop(owned_sink);
+        // Parent only from here (the child never falls through).
         let pid = pid as u32;
+        // Out-of-band fork report for the test hook (an atomic store:
+        // never blocks).
+        if let Some(sink) = prestop_pid_sink.as_ref() {
+            sink.store(pid, Ordering::SeqCst);
+        }
+        // Custody starts IMMEDIATELY at the fork return — before the
+        // parent's sink copy is disposed (a FUSE close can block) and
+        // before the wait.
         let mut guard = PrestopGuard { pid, armed: true };
+        // The parent's copy of a pinned sink closes NOW (the child
+        // inherited its own) — under setup control, with the guard
+        // already armed. If disposal itself outlives the setup, the
+        // guard-held child resolves under custody.
+        if let Some(sink) = owned_sink.take() {
+            match close_under_control(sink, deadline, cancel) {
+                Ok(Control::Done(()) | Control::Lost) => {}
+                Ok(Control::Cancelled) => {
+                    let report = guard_cleanup_report(&mut guard);
+                    anyhow::bail!(
+                        "pre-stop setup cancelled while disposing parent sink; owned child {pid} {report}"
+                    );
+                }
+                Ok(Control::Expired) => {
+                    let report = guard_cleanup_report(&mut guard);
+                    anyhow::bail!(
+                        "pre-stop setup deadline exceeded while disposing parent sink; owned child {pid} {report}"
+                    );
+                }
+                Err(_) => {
+                    // Thread exhaustion: the fd leaked (never closed
+                    // inline — see `close_under_control`); custody is
+                    // intact, so continue into the wait rather than
+                    // killing a healthy child over a local shortage.
+                }
+            }
+        }
         loop {
             if cancel.load(Ordering::SeqCst) {
-                guard.kill_and_reap();
-                anyhow::bail!("pre-stop setup cancelled; owned child {pid} killed and reaped");
+                let report = guard_cleanup_report(&mut guard);
+                anyhow::bail!("pre-stop setup cancelled; owned child {pid} {report}");
             }
             if Instant::now() >= deadline {
-                guard.kill_and_reap();
-                anyhow::bail!(
-                    "pre-stop setup deadline exceeded; owned child {pid} killed and reaped"
-                );
+                let report = guard_cleanup_report(&mut guard);
+                anyhow::bail!("pre-stop setup deadline exceeded; owned child {pid} {report}");
             }
             let mut status = 0;
             let r = unsafe {
@@ -542,8 +912,8 @@ impl OwnedTarget {
                     continue;
                 }
                 let e = std::io::Error::last_os_error();
-                guard.kill_and_reap();
-                anyhow::bail!("waitpid {pid}: {e}");
+                let report = guard_cleanup_report(&mut guard);
+                anyhow::bail!("waitpid {pid}: {e}; owned child {pid} {report}");
             }
             if libc::WIFSTOPPED(status) {
                 guard.disarm();
@@ -730,6 +1100,151 @@ impl OwnedTarget {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod control_tests {
+    //! F1 mechanism pins: blocking setup ops run under deadline +
+    //! cancellation control (see [`super::run_under_control`]).
+    use super::{Control, close_under_control, run_under_control};
+    use std::os::fd::{FromRawFd as _, OwnedFd};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn control_expired_deadline_does_not_run() {
+        let cancel = AtomicBool::new(false);
+        let ran = std::sync::Arc::new(AtomicBool::new(false));
+        let ran_c = ran.clone();
+        let out = run_under_control(Instant::now(), &cancel, move || {
+            ran_c.store(true, Ordering::SeqCst);
+            42
+        })
+        .unwrap();
+        assert!(matches!(out, Control::Expired));
+        assert!(!ran.load(Ordering::SeqCst), "dead op must not run");
+    }
+
+    #[test]
+    fn control_pending_cancel_does_not_run() {
+        let cancel = AtomicBool::new(true);
+        let ran = std::sync::Arc::new(AtomicBool::new(false));
+        let ran_c = ran.clone();
+        let out = run_under_control(
+            Instant::now() + Duration::from_secs(30),
+            &cancel,
+            move || {
+                ran_c.store(true, Ordering::SeqCst);
+                42
+            },
+        )
+        .unwrap();
+        assert!(matches!(out, Control::Cancelled));
+        assert!(!ran.load(Ordering::SeqCst), "dead op must not run");
+    }
+
+    #[test]
+    fn control_returns_value() {
+        let cancel = AtomicBool::new(false);
+        let out =
+            run_under_control(Instant::now() + Duration::from_secs(30), &cancel, || 42).unwrap();
+        assert!(matches!(out, Control::Done(42)));
+    }
+
+    #[test]
+    fn control_slow_op_cancelled_mid_run() {
+        let cancel = AtomicBool::new(false);
+        // Signal-like cancellation from another thread (the same store
+        // the SIGINT/SIGTERM handler performs on capture's live flag).
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(Duration::from_millis(100));
+                cancel.store(true, Ordering::SeqCst);
+            });
+            let t0 = Instant::now();
+            // The op simulates an uninterruptible stall (a FUSE sink
+            // that never answers): it sleeps past the test and is
+            // abandoned, never awaited.
+            let out = run_under_control(Instant::now() + Duration::from_secs(30), &cancel, || {
+                std::thread::sleep(Duration::from_secs(30))
+            })
+            .unwrap();
+            assert!(matches!(out, Control::Cancelled));
+            assert!(t0.elapsed() < Duration::from_secs(5), "fail fast");
+        });
+    }
+
+    #[test]
+    fn control_slow_op_deadline_mid_run() {
+        let cancel = AtomicBool::new(false);
+        let t0 = Instant::now();
+        let out = run_under_control(Instant::now() + Duration::from_millis(100), &cancel, || {
+            std::thread::sleep(Duration::from_secs(30))
+        })
+        .unwrap();
+        assert!(matches!(out, Control::Expired));
+        assert!(t0.elapsed() < Duration::from_secs(5), "fail fast");
+    }
+
+    #[test]
+    fn control_close_confirms_on_live_setup() {
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let cancel = AtomicBool::new(false);
+        let fd = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+        let out =
+            close_under_control(fd, Instant::now() + Duration::from_secs(30), &cancel).unwrap();
+        assert!(matches!(out, Control::Done(())));
+        let r = unsafe { libc::fcntl(fds[1], libc::F_GETFD) };
+        assert!(r < 0, "fd must be closed");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EBADF)
+        );
+        unsafe {
+            libc::close(fds[0]);
+        }
+    }
+
+    #[test]
+    fn control_close_runs_even_on_dead_setup() {
+        // F1 leak pin: disposal on an already-dead setup still closes
+        // (late, on the worker) instead of leaking the fd.
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let cancel = AtomicBool::new(true);
+        let fd = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+        let out =
+            close_under_control(fd, Instant::now() + Duration::from_secs(30), &cancel).unwrap();
+        assert!(matches!(out, Control::Cancelled));
+        // The worker closes late: poll for EBADF, bounded.
+        let end = Instant::now() + Duration::from_secs(5);
+        loop {
+            let r = unsafe { libc::fcntl(fds[1], libc::F_GETFD) };
+            if r < 0 {
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::EBADF)
+                );
+                break;
+            }
+            assert!(Instant::now() < end, "worker never closed");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        unsafe {
+            libc::close(fds[0]);
+        }
+    }
+
+    #[test]
+    fn control_panicking_worker_reports_lost() {
+        let cancel = AtomicBool::new(false);
+        let out = run_under_control(Instant::now() + Duration::from_secs(30), &cancel, || {
+            panic!("r06 control probe panic")
+        })
+        .unwrap();
+        assert!(matches!(out, Control::Lost));
     }
 }
 
