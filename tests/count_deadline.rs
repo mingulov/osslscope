@@ -830,6 +830,288 @@ fn h4_stale_plan_misses_replaced_per_attempt() {
     assert_eq!(report4.attached, 1, "fresh plan must bind: {report4:?}");
 }
 
+// ── R04: forced two-CPU first-hit rendezvous model (F05) ──
+//
+// Models the BPF `count_entry` fresh-key transaction step by step
+// (lookup → NOEXIST insert → …) and drives the schedule the
+// threaded host tests cannot: BOTH CPUs miss the same fresh key
+// before either inserts, so the second insert collides. The script
+// below must track `crates/ebpf/src/bin/count.rs` line by line;
+// `r04_source_binds_model_to_branch` plus disassembly inspection
+// of the compiled `count_entry` bind the model to the actual
+// control flow.
+//
+// LIMITS (read before citing): this is a host-side schedule
+// driver over an emulated map. It proves the transaction shape
+// counts a forced collision correctly; it does NOT execute BPF,
+// does not run two kernel CPUs, and does not replace the
+// authorized two-CPU fresh-key/fresh-generation exact-ledger run
+// owned by R21.
+mod r04_rendezvous {
+    use osslscope_ebpf_common::CountValue;
+    use std::collections::HashMap;
+
+    /// The forced schedule uses exactly two CPUs.
+    pub const NCPU: usize = 2;
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum InsertOutcome {
+        Inserted,
+        Exists,
+        NoSpace,
+    }
+
+    /// Emulated `COUNTS` per-CPU hash: shared keys, one
+    /// `CountValue` slot per CPU, bounded capacity, no eviction.
+    /// A helper insert seeds the CURRENT CPU's slot and zeroes
+    /// the rest (matches the validated F05 schedule: one count,
+    /// one DROPFAIL pre-fix; post-fix the seed is all-zero so
+    /// every slot starts 0 under either seeding rule).
+    pub struct FirstHitMap {
+        cap: usize,
+        entries: HashMap<u64, [CountValue; NCPU]>,
+        pub dropfail: u64,
+        /// Fault injection: the next relookup reports None even
+        /// when the key exists (models an unavailable slot).
+        pub fail_relookup_once: bool,
+    }
+
+    impl FirstHitMap {
+        pub fn new(cap: usize) -> Self {
+            Self {
+                cap,
+                entries: HashMap::new(),
+                dropfail: 0,
+                fail_relookup_once: false,
+            }
+        }
+
+        /// First lookup: is the shared key present?
+        pub fn lookup(&self, key: u64) -> bool {
+            self.entries.contains_key(&key)
+        }
+
+        /// Slow-path relookup after the zero-seed insert.
+        pub fn relookup(&mut self, key: u64) -> bool {
+            if self.fail_relookup_once {
+                self.fail_relookup_once = false;
+                return false;
+            }
+            self.entries.contains_key(&key)
+        }
+
+        /// `insert(key, seed, BPF_NOEXIST)`: fresh key under
+        /// capacity inserts; an existing key collides; a fresh
+        /// key at capacity is genuine exhaustion.
+        pub fn insert_noexist(&mut self, cpu: usize, key: u64, seed: CountValue) -> InsertOutcome {
+            if self.entries.contains_key(&key) {
+                return InsertOutcome::Exists;
+            }
+            if self.entries.len() >= self.cap {
+                return InsertOutcome::NoSpace;
+            }
+            let mut slots = [CountValue::default(); NCPU];
+            slots[cpu] = seed;
+            self.entries.insert(key, slots);
+            InsertOutcome::Inserted
+        }
+
+        /// The ordinary per-CPU bump shared by every hit path:
+        /// stamp first touch, saturating-add one, stamp last.
+        /// Panics on an absent key: callers bump only slots a
+        /// lookup just proved present.
+        pub fn bump(&mut self, cpu: usize, key: u64, now: u64) {
+            let slots = self.entries.get_mut(&key).expect("bump needs a slot");
+            let v = &mut slots[cpu];
+            if v.count == 0 {
+                v.first_ns = now;
+            }
+            v.count = v.count.saturating_add(1);
+            v.last_ns = now;
+        }
+
+        pub fn dropfail(&mut self) {
+            self.dropfail = self.dropfail.saturating_add(1);
+        }
+
+        /// Userspace drain fold over this key's CPU slots.
+        pub fn fold_total(&self, key: u64) -> u64 {
+            self.entries
+                .get(&key)
+                .map(|slots| slots.iter().map(|v| v.count).sum())
+                .unwrap_or(0)
+        }
+    }
+
+    /// Mirror of the FIXED `count_entry` miss path (`count.rs`):
+    /// zero-seed NOEXIST insert — a collision is recoverable, so
+    /// the result is ignored — then one ordinary relookup:
+    /// present → the single bump, absent → DROPFAIL.
+    pub fn miss_path(map: &mut FirstHitMap, cpu: usize, key: u64, now: u64) {
+        let zero = CountValue {
+            count: 0,
+            first_ns: 0,
+            last_ns: 0,
+        };
+        let _ = map.insert_noexist(cpu, key, zero);
+        if map.relookup(key) {
+            map.bump(cpu, key, now);
+        } else {
+            map.dropfail();
+        }
+    }
+}
+
+#[test]
+fn r04_two_cpu_first_hits_both_count_fresh_key() {
+    // Forced collision on a FRESH key with spare capacity: both
+    // CPUs miss, cpu0's zero-insert wins, cpu1's collides — and
+    // both hits count with no drop (the relookup recovers the
+    // collision). RED pre-fix: count 1, drop 1.
+    use osslscope_ebpf_common::make_key;
+    use r04_rendezvous::{FirstHitMap, miss_path};
+    let key = make_key(41, 0);
+    let mut map = FirstHitMap::new(8192);
+    // Rendezvous: both first lookups miss BEFORE either insert.
+    assert!(!map.lookup(key), "cpu0 first lookup misses fresh key");
+    assert!(!map.lookup(key), "cpu1 first lookup misses fresh key");
+    miss_path(&mut map, 0, key, 1500);
+    miss_path(&mut map, 1, key, 1501);
+    assert_eq!(map.fold_total(key), 2, "both first hits count");
+    assert_eq!(map.dropfail, 0, "no loss with spare capacity");
+}
+
+#[test]
+fn r04_two_cpu_first_hits_both_count_fresh_generation() {
+    // Same forced collision on a FRESH GENERATION of an already
+    // counted cookie: the fenced key is new, so both hits count
+    // without loss while the old generation stays exact.
+    // RED pre-fix: new-gen count 1, drop 1.
+    use osslscope_ebpf_common::make_key;
+    use r04_rendezvous::{FirstHitMap, miss_path};
+    let old_key = make_key(41, 0);
+    let new_key = make_key(41, 1);
+    let mut map = FirstHitMap::new(8192);
+    // Old generation counted earlier (sequential, uncontended).
+    miss_path(&mut map, 0, old_key, 1400);
+    map.bump(0, old_key, 1401);
+    assert_eq!(map.fold_total(old_key), 2);
+    // Rendezvous on the fresh fenced key.
+    assert!(!map.lookup(new_key), "cpu0 misses fresh generation");
+    assert!(!map.lookup(new_key), "cpu1 misses fresh generation");
+    miss_path(&mut map, 0, new_key, 1500);
+    miss_path(&mut map, 1, new_key, 1501);
+    assert_eq!(map.fold_total(new_key), 2, "both fenced hits count");
+    assert_eq!(map.dropfail, 0, "no loss with spare capacity");
+    assert_eq!(
+        map.fold_total(old_key),
+        2,
+        "fenced collision perturbs nothing old"
+    );
+}
+
+#[test]
+fn r04_exhaustion_stays_loss() {
+    // Guard (GREEN before and after): a saturated map still fails
+    // loud — both colliding hits drop, admitted keys stay exact,
+    // nothing evicts. R04 must not trade this loss accounting
+    // for collision recovery.
+    use osslscope_ebpf_common::make_key;
+    use r04_rendezvous::{FirstHitMap, miss_path};
+    let mut map = FirstHitMap::new(1);
+    let admitted = make_key(7, 0);
+    miss_path(&mut map, 0, admitted, 1500);
+    assert_eq!(map.fold_total(admitted), 1);
+    let fresh = make_key(8, 0);
+    assert!(!map.lookup(fresh));
+    assert!(!map.lookup(fresh));
+    miss_path(&mut map, 0, fresh, 1500);
+    miss_path(&mut map, 1, fresh, 1501);
+    assert_eq!(map.fold_total(fresh), 0, "no room: nothing counted");
+    assert_eq!(map.dropfail, 2, "both exhausted hits are loud loss");
+    assert_eq!(map.fold_total(admitted), 1, "admitted key stays exact");
+}
+
+#[test]
+fn r04_unavailable_relookup_stays_loss() {
+    // Guard: when the relookup finds no slot — allocation failed
+    // and no racing insert landed — the hit is loud DROPFAIL
+    // loss, not a phantom count. The model forces one relookup
+    // miss via fault injection; a later hit on the landed key
+    // then bumps normally, proving the zero slot left behind
+    // corrupts nothing.
+    use osslscope_ebpf_common::make_key;
+    use r04_rendezvous::{FirstHitMap, miss_path};
+    let mut map = FirstHitMap::new(8192);
+    let key = make_key(9, 0);
+    assert!(!map.lookup(key), "fresh key misses");
+    map.fail_relookup_once = true;
+    miss_path(&mut map, 0, key, 1500);
+    assert_eq!(map.fold_total(key), 0, "unavailable slot counts nothing");
+    assert_eq!(map.dropfail, 1, "unavailable relookup is loud loss");
+    // The zero-seeded key exists now: a later hit counts once.
+    miss_path(&mut map, 1, key, 1501);
+    assert_eq!(map.fold_total(key), 1, "later hit bumps the landed key");
+    assert_eq!(map.dropfail, 1, "no further loss");
+}
+
+#[test]
+fn r04_source_binds_model_to_branch() {
+    // Tripwire (same precedent as `kernel_source_enforces_window`):
+    // the BPF miss path must BE the bounded zero-seed + relookup
+    // transaction the model scripts — zero insert with NOEXIST,
+    // insert result NOT funneled to DROPFAIL, a second lookup
+    // feeding one ordinary bump, no retry loop — with the
+    // target/generation/deadline guards intact. RED pre-fix: the
+    // current branch seeds count 1 and drops every insert error.
+    let src = std::fs::read_to_string(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("crates/ebpf/src/bin/count.rs"),
+    )
+    .unwrap();
+    let start = src.find("pub fn count_entry").expect("count_entry exists");
+    let end = src.find("fn dropfail").expect("dropfail anchor exists");
+    let body = &src[start..end];
+    assert!(
+        body.contains("CountValue { count: 0"),
+        "miss path must zero-seed the insert"
+    );
+    assert!(
+        body.contains("insert(&key, &zero, BPF_NOEXIST)"),
+        "miss path must NOEXIST-insert the zero seed"
+    );
+    assert!(
+        !body.contains("is_err()"),
+        "insert collision must not funnel to DROPFAIL"
+    );
+    assert!(
+        body.matches("COUNTS.get_ptr_mut(&key)").count() >= 2,
+        "miss path must relookup after the insert"
+    );
+    // (Strip line comments: the disposition note below names the
+    // forbidden loop out loud.)
+    let code: String = body
+        .lines()
+        .map(|l| l.split("//").next().unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !code.contains("loop") && !code.contains("while ") && !code.contains("for "),
+        "bounded transaction: no spin/retry loop on the miss path"
+    );
+    assert!(
+        body.contains("TARGET.get(0)"),
+        "target guard must survive the rewrite"
+    );
+    assert!(
+        body.contains("GEN.get(0)"),
+        "generation keying must survive the rewrite"
+    );
+    assert!(
+        body.contains("now < start || now >= deadline"),
+        "deadline admission must survive the rewrite"
+    );
+}
+
 #[test]
 fn h4_stale_retries_count_missed_once_each() {
     // H4 rework of quarantined_retry_counts_missed_once
