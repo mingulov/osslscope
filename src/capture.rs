@@ -1534,14 +1534,17 @@ pub fn adapt_delta(
     // triple → (dev string, new candidates, (op, epoch) arrivals,
     // any bad read).
     // (device string, fresh identities, every arrival's epoch,
-    // novel arrivals' epochs, bad-read flag). The two epoch sets
-    // split per-arrival validation (F-H/H1): membership/proof-
-    // voidness covers all arrivals, the post-proof trip novel only.
+    // novel arrivals' epochs, bad-read flag, mixed flag,
+    // all-fresh-mixed flag). The two epoch sets split per-arrival
+    // validation (F-H/H1): membership/proof-voidness covers all
+    // arrivals, the post-proof trip novel only. The trailing
+    // conjunct (R01) starts true and folds `&= mixed` per arrival.
     type Group = (
         String,
         Vec<CandidateIdentity>,
         HashSet<(u32, u64)>,
         HashSet<(u32, u64)>,
+        bool,
         bool,
         bool,
     );
@@ -1628,6 +1631,7 @@ pub fn adapt_delta(
                 HashSet::new(),
                 false,
                 false,
+                true,
             )
         });
         let novel = seen_ids
@@ -1659,12 +1663,13 @@ pub fn adapt_delta(
         if mixed {
             state.sites_mixed.insert(triple);
         }
+        slot.6 &= mixed;
     }
     // Deterministic group order (arrival order must not leak).
     let mut group_keys: Vec<(u64, u64, u64)> = groups.keys().copied().collect();
     group_keys.sort_unstable();
     for triple in group_keys {
-        let (dev_str, mut fresh_identities, group_epochs, novel_epochs, bad_read, mixed) =
+        let (dev_str, mut fresh_identities, group_epochs, novel_epochs, bad_read, mixed, all_mixed) =
             groups.remove(&triple).unwrap_or_default();
         let (device, ino, offset) = triple;
         let first_emit = !state.emitted.contains_key(&triple);
@@ -1681,11 +1686,28 @@ pub fn adapt_delta(
         // novel-only.
         // A7: relevant loss taints the set (op-localized orphans
         // via tainted_ops; unlocalizable loss via the global flag).
+        //
+        // R01 finite enumeration: a FIRST-EMIT group whose fresh
+        // arrivals are ALL mixed-status with ≥2 DISTINCT identities
+        // is an explicitly enumerated finite alternative set — the
+        // ambiguity is preserved in the candidate list (finite
+        // bounds, COMPLETE) instead of collapsing to Unknown.
+        // Everything else keeps H3 withhold: singleton mixed (the
+        // alternatives are unenumerated, so the upper is unbounded),
+        // piecemeal mixed (a later poll's arrival cannot prove the
+        // enumeration complete — in-window ambiguity stays sticky),
+        // ok/mixed blends (an ok arrival beside a mixed one leaves
+        // the mixed row's alternatives unlisted), duplicates (no new
+        // information, F-A/A4), bad reads, unclosed ops and taint.
+        let mut fresh_distinct = fresh_identities.clone();
+        fresh_distinct.sort();
+        fresh_distinct.dedup();
+        let finite_enum = first_emit && all_mixed && fresh_distinct.len() >= 2;
         let mut unknown = bad_read
-            || mixed
+            || (!finite_enum && mixed)
             || state.taint_global
             || state.sites_bad_read.contains(&triple)
-            || state.sites_mixed.contains(&triple);
+            || (!finite_enum && state.sites_mixed.contains(&triple));
         if let Some(ops) = state.triple_ops.get(&triple) {
             for op in ops {
                 if !state.op_closed(*op) {

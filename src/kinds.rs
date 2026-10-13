@@ -6403,21 +6403,285 @@ pub fn alg_group(name: &str) -> Option<&'static str> {
 
 /// Verified semantic-equivalence sets (R01, F01/F02): each inner
 /// slice lists provider alias spellings proven to name one
-/// algorithm. Provenance: OpenSSL 3.5.5 default-provider alias
-/// sets (`openssl list -digest-algorithms/-kem-algorithms/
-/// -key-managers`, 2026-10-13), every member cross-checked
-/// present in the frozen [`ALG_NAMES`] registry; unregistered
-/// display aliases from those sets are omitted (they can never
-/// classify or admit). Members within one set share one semantic
-/// identity; names in different sets — even in one macro `group`
-/// — are distinct. Unlisted names are singleton identities.
-/// Never infer equivalence from `group`, name similarity, or a
-/// provider assertion: only this table merges.
+/// algorithm. Provenance: verbatim `OSSL_ALGORITHM.algorithm_names`
+/// rows from a live `OSSL_PROVIDER_query_operation` census over
+/// every operation id on host OpenSSL 3.5.5 (default + legacy
+/// providers, 2026-10-13; 660 rows): every row shape carrying ≥2
+/// registered spellings contributes exactly one set (188 sets,
+/// zero cross-row chains — each set is one row's alias family),
+/// cross-checked against `openssl list` alias groups. Row
+/// spellings rule: fetch conveniences (`aes128 => AES-128-CBC`)
+/// and display spellings (`aes-128-gcm`) that never occur as a
+/// row segment stay unmerged. Every member is present in the
+/// frozen [`ALG_NAMES`] registry; unregistered row companions
+/// are omitted (they can never classify or admit). Members
+/// within one set share one semantic identity; names in
+/// different sets — even in one macro `group` — are distinct
+/// (sizes/modes stay split: ML-KEM-512 ≠ 768, SHA2-256 ≠ 512,
+/// AES-128 ≠ 256, SM3 ≠ RSA-SM3). Unlisted names are singleton
+/// identities. Never infer equivalence from `group`, name
+/// similarity, or a provider assertion: only this table merges.
 pub const ALG_SEMANTIC_EQUIV: &[&[&str]] = &[
+    &["0.3.4401.5.3.1.9.1", "CAMELLIA-128-ECB"],
+    &["0.3.4401.5.3.1.9.21", "CAMELLIA-192-ECB"],
+    &["0.3.4401.5.3.1.9.23", "CAMELLIA-192-OFB"],
+    &["0.3.4401.5.3.1.9.24", "CAMELLIA-192-CFB"],
+    &["0.3.4401.5.3.1.9.29", "CAMELLIA-192-CTR"],
+    &["0.3.4401.5.3.1.9.3", "CAMELLIA-128-OFB"],
+    &["0.3.4401.5.3.1.9.4", "CAMELLIA-128-CFB"],
+    &["0.3.4401.5.3.1.9.41", "CAMELLIA-256-ECB"],
+    &["0.3.4401.5.3.1.9.43", "CAMELLIA-256-OFB"],
+    &["0.3.4401.5.3.1.9.44", "CAMELLIA-256-CFB"],
+    &["0.3.4401.5.3.1.9.49", "CAMELLIA-256-CTR"],
+    &["0.3.4401.5.3.1.9.9", "CAMELLIA-128-CTR"],
+    &["1.0.10118.3.0.55", "WHIRLPOOL"],
+    &["1.0.9797.3.4", "GMAC"],
+    &["1.2.156.10197.1.104.1", "SM4-ECB"],
+    &["1.2.156.10197.1.104.10", "SM4-XTS"],
+    &["1.2.156.10197.1.104.2", "SM4", "SM4-CBC"],
+    &["1.2.156.10197.1.104.3", "SM4-OFB", "SM4-OFB128"],
+    &["1.2.156.10197.1.104.4", "SM4-CFB", "SM4-CFB128"],
+    &["1.2.156.10197.1.104.7", "SM4-CTR"],
+    &["1.2.156.10197.1.104.8", "SM4-GCM"],
+    &["1.2.156.10197.1.104.9", "SM4-CCM"],
+    &["1.2.156.10197.1.301", "SM2"],
+    &["1.2.156.10197.1.401", "SM3"],
+    &["1.2.156.10197.1.504", "RSA-SM3", "sm3WithRSAEncryption"],
+    &[
+        "1.2.392.200011.61.1.1.1.2",
+        "CAMELLIA-128-CBC",
+        "CAMELLIA128",
+    ],
+    &[
+        "1.2.392.200011.61.1.1.1.3",
+        "CAMELLIA-192-CBC",
+        "CAMELLIA192",
+    ],
+    &[
+        "1.2.392.200011.61.1.1.1.4",
+        "CAMELLIA-256-CBC",
+        "CAMELLIA256",
+    ],
+    &["1.2.410.200004.1.3", "SEED-ECB"],
+    &["1.2.410.200004.1.4", "SEED", "SEED-CBC"],
+    &["1.2.410.200004.1.5", "SEED-CFB", "SEED-CFB128"],
+    &["1.2.410.200004.1.6", "SEED-OFB", "SEED-OFB128"],
+    &["1.2.410.200046.1.1.1", "ARIA-128-ECB"],
+    &["1.2.410.200046.1.1.10", "ARIA-192-CTR"],
+    &["1.2.410.200046.1.1.11", "ARIA-256-ECB"],
+    &["1.2.410.200046.1.1.12", "ARIA-256-CBC", "ARIA256"],
+    &["1.2.410.200046.1.1.13", "ARIA-256-CFB"],
+    &["1.2.410.200046.1.1.14", "ARIA-256-OFB"],
+    &["1.2.410.200046.1.1.15", "ARIA-256-CTR"],
+    &["1.2.410.200046.1.1.2", "ARIA-128-CBC", "ARIA128"],
+    &["1.2.410.200046.1.1.3", "ARIA-128-CFB"],
+    &["1.2.410.200046.1.1.34", "ARIA-128-GCM"],
+    &["1.2.410.200046.1.1.35", "ARIA-192-GCM"],
+    &["1.2.410.200046.1.1.36", "ARIA-256-GCM"],
+    &["1.2.410.200046.1.1.37", "ARIA-128-CCM"],
+    &["1.2.410.200046.1.1.38", "ARIA-192-CCM"],
+    &["1.2.410.200046.1.1.39", "ARIA-256-CCM"],
+    &["1.2.410.200046.1.1.4", "ARIA-128-OFB"],
+    &["1.2.410.200046.1.1.5", "ARIA-128-CTR"],
+    &["1.2.410.200046.1.1.6", "ARIA-192-ECB"],
+    &["1.2.410.200046.1.1.7", "ARIA-192-CBC", "ARIA192"],
+    &["1.2.410.200046.1.1.8", "ARIA-192-CFB"],
+    &["1.2.410.200046.1.1.9", "ARIA-192-OFB"],
+    &[
+        "1.2.840.1.101.3.4.3.3",
+        "DSA-SHA2-384",
+        "DSA-SHA384",
+        "dsa_with_SHA384",
+        "id-dsa-with-sha384",
+    ],
+    &[
+        "1.2.840.1.101.3.4.3.4",
+        "DSA-SHA2-512",
+        "DSA-SHA512",
+        "dsa_with_SHA512",
+        "id-dsa-with-sha512",
+    ],
+    &["1.2.840.10040.4.1", "DSA", "dsaEncryption"],
+    &["1.2.840.10040.4.3", "DSA-SHA-1", "DSA-SHA1", "dsaWithSHA1"],
+    &["1.2.840.10045.2.1", "EC", "id-ecPublicKey"],
+    &[
+        "1.2.840.10045.4.1",
+        "ECDSA-SHA-1",
+        "ECDSA-SHA1",
+        "ecdsa-with-SHA1",
+    ],
+    &[
+        "1.2.840.10045.4.3.1",
+        "ECDSA-SHA2-224",
+        "ECDSA-SHA224",
+        "ecdsa-with-SHA224",
+    ],
+    &[
+        "1.2.840.10045.4.3.2",
+        "ECDSA-SHA2-256",
+        "ECDSA-SHA256",
+        "ecdsa-with-SHA256",
+    ],
+    &[
+        "1.2.840.10045.4.3.3",
+        "ECDSA-SHA2-384",
+        "ECDSA-SHA384",
+        "ecdsa-with-SHA384",
+    ],
+    &[
+        "1.2.840.10045.4.3.4",
+        "ECDSA-SHA2-512",
+        "ECDSA-SHA512",
+        "ecdsa-with-SHA512",
+    ],
+    &["1.2.840.10046.2.1", "DHX", "X9.42 DH", "dhpublicnumber"],
+    &["1.2.840.113533.7.66.10", "CAST", "CAST-CBC", "CAST5-CBC"],
+    &["1.2.840.113549.1.1.1", "RSA", "rsaEncryption"],
+    &["1.2.840.113549.1.1.10", "RSA-PSS", "RSASSA-PSS"],
+    &[
+        "1.2.840.113549.1.1.11",
+        "RSA-SHA2-256",
+        "RSA-SHA256",
+        "sha256WithRSAEncryption",
+    ],
+    &[
+        "1.2.840.113549.1.1.12",
+        "RSA-SHA2-384",
+        "RSA-SHA384",
+        "sha384WithRSAEncryption",
+    ],
+    &[
+        "1.2.840.113549.1.1.13",
+        "RSA-SHA2-512",
+        "RSA-SHA512",
+        "sha512WithRSAEncryption",
+    ],
+    &[
+        "1.2.840.113549.1.1.14",
+        "RSA-SHA2-224",
+        "RSA-SHA224",
+        "sha224WithRSAEncryption",
+    ],
+    &[
+        "1.2.840.113549.1.1.15",
+        "RSA-SHA2-512/224",
+        "RSA-SHA512-224",
+        "sha512-224WithRSAEncryption",
+    ],
+    &[
+        "1.2.840.113549.1.1.16",
+        "RSA-SHA2-512/256",
+        "RSA-SHA512-256",
+        "sha512-256WithRSAEncryption",
+    ],
+    &[
+        "1.2.840.113549.1.1.5",
+        "RSA-SHA-1",
+        "RSA-SHA1",
+        "sha1WithRSAEncryption",
+    ],
+    &["1.2.840.113549.1.3.1", "DH", "dhKeyAgreement"],
+    &["1.2.840.113549.1.5.12", "PBKDF2"],
+    &[
+        "1.2.840.113549.1.9.16.3.6",
+        "DES3-WRAP",
+        "id-smime-alg-CMS3DESwrap",
+    ],
+    &["1.2.840.113549.2.4", "MD4"],
+    &["1.2.840.113549.2.5", "MD5", "SSL3-MD5"],
+    &["1.2.840.113549.3.2", "RC2", "RC2-128", "RC2-CBC"],
+    &["1.2.840.113549.3.4", "RC4"],
+    &["1.2.840.113549.3.7", "DES-EDE3-CBC", "DES3"],
+    &["1.3.101.110", "X25519"],
+    &["1.3.101.111", "X448"],
+    &["1.3.101.112", "ED25519"],
+    &["1.3.101.113", "ED448"],
+    &["1.3.111.2.1619.0.1.1", "AES-128-XTS"],
+    &["1.3.111.2.1619.0.1.2", "AES-256-XTS"],
+    &["1.3.14.3.2.17", "DES-EDE", "DES-EDE-ECB"],
+    &["1.3.14.3.2.26", "SHA-1", "SHA1", "SSL3-SHA1"],
+    &["1.3.14.3.2.6", "DES-ECB"],
+    &["1.3.14.3.2.7", "DES", "DES-CBC"],
+    &["1.3.14.3.2.8", "DES-OFB"],
+    &["1.3.14.3.2.9", "DES-CFB"],
+    &[
+        "1.3.36.3.2.1",
+        "RIPEMD",
+        "RIPEMD-160",
+        "RIPEMD160",
+        "RMD160",
+    ],
+    &["1.3.36.3.3.1.2", "RSA-RIPEMD160", "ripemd160WithRSA"],
+    &["1.3.6.1.4.1.11591.4.11", "SCRYPT", "id-scrypt"],
+    &["1.3.6.1.4.1.1722.12.2.1", "BLAKE2BMAC"],
+    &["1.3.6.1.4.1.1722.12.2.1.16", "BLAKE2B-512", "BLAKE2b512"],
+    &["1.3.6.1.4.1.1722.12.2.2", "BLAKE2SMAC"],
+    &["1.3.6.1.4.1.1722.12.2.2.8", "BLAKE2S-256", "BLAKE2s256"],
+    &["1.3.6.1.4.1.3029.1.2", "BF", "BF-CBC", "BLOWFISH"],
+    &["2.16.840.1.101.3.4.1", "AES"],
+    &["2.16.840.1.101.3.4.1.1", "AES-128-ECB"],
+    &["2.16.840.1.101.3.4.1.2", "AES-128-CBC", "AES128"],
+    &["2.16.840.1.101.3.4.1.21", "AES-192-ECB"],
+    &["2.16.840.1.101.3.4.1.22", "AES-192-CBC", "AES192"],
+    &["2.16.840.1.101.3.4.1.23", "AES-192-OFB"],
+    &["2.16.840.1.101.3.4.1.24", "AES-192-CFB"],
+    &[
+        "2.16.840.1.101.3.4.1.25",
+        "AES-192-WRAP",
+        "AES192-WRAP",
+        "id-aes192-wrap",
+    ],
+    &["2.16.840.1.101.3.4.1.26", "AES-192-GCM", "id-aes192-GCM"],
+    &["2.16.840.1.101.3.4.1.27", "AES-192-CCM", "id-aes192-CCM"],
+    &[
+        "2.16.840.1.101.3.4.1.28",
+        "AES-192-WRAP-PAD",
+        "AES192-WRAP-PAD",
+        "id-aes192-wrap-pad",
+    ],
+    &["2.16.840.1.101.3.4.1.3", "AES-128-OFB"],
+    &["2.16.840.1.101.3.4.1.4", "AES-128-CFB"],
+    &["2.16.840.1.101.3.4.1.41", "AES-256-ECB"],
+    &["2.16.840.1.101.3.4.1.42", "AES-256-CBC", "AES256"],
+    &["2.16.840.1.101.3.4.1.43", "AES-256-OFB"],
+    &["2.16.840.1.101.3.4.1.44", "AES-256-CFB"],
+    &[
+        "2.16.840.1.101.3.4.1.45",
+        "AES-256-WRAP",
+        "AES256-WRAP",
+        "id-aes256-wrap",
+    ],
+    &["2.16.840.1.101.3.4.1.46", "AES-256-GCM", "id-aes256-GCM"],
+    &["2.16.840.1.101.3.4.1.47", "AES-256-CCM", "id-aes256-CCM"],
+    &[
+        "2.16.840.1.101.3.4.1.48",
+        "AES-256-WRAP-PAD",
+        "AES256-WRAP-PAD",
+        "id-aes256-wrap-pad",
+    ],
+    &[
+        "2.16.840.1.101.3.4.1.5",
+        "AES-128-WRAP",
+        "AES128-WRAP",
+        "id-aes128-wrap",
+    ],
+    &["2.16.840.1.101.3.4.1.6", "AES-128-GCM", "id-aes128-GCM"],
+    &["2.16.840.1.101.3.4.1.7", "AES-128-CCM", "id-aes128-CCM"],
+    &[
+        "2.16.840.1.101.3.4.1.8",
+        "AES-128-WRAP-PAD",
+        "AES128-WRAP-PAD",
+        "id-aes128-wrap-pad",
+    ],
     &["2.16.840.1.101.3.4.2.1", "SHA-256", "SHA2-256", "SHA256"],
-    &["2.16.840.1.101.3.4.2.4", "SHA-224", "SHA2-224", "SHA224"],
+    &["2.16.840.1.101.3.4.2.10", "SHA3-512"],
+    &["2.16.840.1.101.3.4.2.11", "SHAKE-128", "SHAKE128"],
+    &["2.16.840.1.101.3.4.2.12", "SHAKE-256", "SHAKE256"],
+    &["2.16.840.1.101.3.4.2.19", "KMAC-128", "KMAC128"],
     &["2.16.840.1.101.3.4.2.2", "SHA-384", "SHA2-384", "SHA384"],
+    &["2.16.840.1.101.3.4.2.20", "KMAC-256", "KMAC256"],
     &["2.16.840.1.101.3.4.2.3", "SHA-512", "SHA2-512", "SHA512"],
+    &["2.16.840.1.101.3.4.2.4", "SHA-224", "SHA2-224", "SHA224"],
     &[
         "2.16.840.1.101.3.4.2.5",
         "SHA-512/224",
@@ -6430,32 +6694,52 @@ pub const ALG_SEMANTIC_EQUIV: &[&[&str]] = &[
         "SHA2-512/256",
         "SHA512-256",
     ],
-    &["SHA-256/192", "SHA2-256/192", "SHA256-192"],
-    &["1.3.14.3.2.26", "SHA-1", "SHA1", "SSL3-SHA1"],
-    &["1.2.840.113549.2.5", "MD5", "SSL3-MD5"],
     &["2.16.840.1.101.3.4.2.7", "SHA3-224"],
     &["2.16.840.1.101.3.4.2.8", "SHA3-256"],
     &["2.16.840.1.101.3.4.2.9", "SHA3-384"],
-    &["2.16.840.1.101.3.4.2.10", "SHA3-512"],
-    &["2.16.840.1.101.3.4.2.11", "SHAKE-128", "SHAKE128"],
-    &["2.16.840.1.101.3.4.2.12", "SHAKE-256", "SHAKE256"],
     &[
-        "2.16.840.1.101.3.4.4.1",
-        "ML-KEM-512",
-        "MLKEM512",
-        "id-alg-ml-kem-512",
+        "2.16.840.1.101.3.4.3.1",
+        "DSA-SHA2-224",
+        "DSA-SHA224",
+        "dsa_with_SHA224",
     ],
     &[
-        "2.16.840.1.101.3.4.4.2",
-        "ML-KEM-768",
-        "MLKEM768",
-        "id-alg-ml-kem-768",
+        "2.16.840.1.101.3.4.3.10",
+        "ECDSA-SHA3-256",
+        "ecdsa_with_SHA3-256",
+        "id-ecdsa-with-sha3-256",
     ],
     &[
-        "2.16.840.1.101.3.4.4.3",
-        "ML-KEM-1024",
-        "MLKEM1024",
-        "id-alg-ml-kem-1024",
+        "2.16.840.1.101.3.4.3.11",
+        "ECDSA-SHA3-384",
+        "ecdsa_with_SHA3-384",
+        "id-ecdsa-with-sha3-384",
+    ],
+    &[
+        "2.16.840.1.101.3.4.3.12",
+        "ECDSA-SHA3-512",
+        "ecdsa_with_SHA3-512",
+        "id-ecdsa-with-sha3-512",
+    ],
+    &[
+        "2.16.840.1.101.3.4.3.13",
+        "RSA-SHA3-224",
+        "id-rsassa-pkcs1-v1_5-with-sha3-224",
+    ],
+    &[
+        "2.16.840.1.101.3.4.3.14",
+        "RSA-SHA3-256",
+        "id-rsassa-pkcs1-v1_5-with-sha3-256",
+    ],
+    &[
+        "2.16.840.1.101.3.4.3.15",
+        "RSA-SHA3-384",
+        "id-rsassa-pkcs1-v1_5-with-sha3-384",
+    ],
+    &[
+        "2.16.840.1.101.3.4.3.16",
+        "RSA-SHA3-512",
+        "id-rsassa-pkcs1-v1_5-with-sha3-512",
     ],
     &[
         "2.16.840.1.101.3.4.3.17",
@@ -6474,6 +6758,12 @@ pub const ALG_SEMANTIC_EQUIV: &[&[&str]] = &[
         "ML-DSA-87",
         "MLDSA87",
         "id-ml-dsa-87",
+    ],
+    &[
+        "2.16.840.1.101.3.4.3.2",
+        "DSA-SHA2-256",
+        "DSA-SHA256",
+        "dsa_with_SHA256",
     ],
     &[
         "2.16.840.1.101.3.4.3.20",
@@ -6535,6 +6825,69 @@ pub const ALG_SEMANTIC_EQUIV: &[&[&str]] = &[
         "SLH-DSA-SHAKE-256f",
         "id-slh-dsa-shake-256f",
     ],
+    &[
+        "2.16.840.1.101.3.4.3.5",
+        "DSA-SHA3-224",
+        "dsa_with_SHA3-224",
+        "id-dsa-with-sha3-224",
+    ],
+    &[
+        "2.16.840.1.101.3.4.3.6",
+        "DSA-SHA3-256",
+        "dsa_with_SHA3-256",
+        "id-dsa-with-sha3-256",
+    ],
+    &[
+        "2.16.840.1.101.3.4.3.7",
+        "DSA-SHA3-384",
+        "dsa_with_SHA3-384",
+        "id-dsa-with-sha3-384",
+    ],
+    &[
+        "2.16.840.1.101.3.4.3.8",
+        "DSA-SHA3-512",
+        "dsa_with_SHA3-512",
+        "id-dsa-with-sha3-512",
+    ],
+    &[
+        "2.16.840.1.101.3.4.3.9",
+        "ECDSA-SHA3-224",
+        "ecdsa_with_SHA3-224",
+        "id-ecdsa-with-sha3-224",
+    ],
+    &[
+        "2.16.840.1.101.3.4.4.1",
+        "ML-KEM-512",
+        "MLKEM512",
+        "id-alg-ml-kem-512",
+    ],
+    &[
+        "2.16.840.1.101.3.4.4.2",
+        "ML-KEM-768",
+        "MLKEM768",
+        "id-alg-ml-kem-768",
+    ],
+    &[
+        "2.16.840.1.101.3.4.4.3",
+        "ML-KEM-1024",
+        "MLKEM1024",
+        "id-alg-ml-kem-1024",
+    ],
+    &["AES-128-WRAP-INV", "AES128-WRAP-INV"],
+    &["AES-128-WRAP-PAD-INV", "AES128-WRAP-PAD-INV"],
+    &["AES-192-WRAP-INV", "AES192-WRAP-INV"],
+    &["AES-192-WRAP-PAD-INV", "AES192-WRAP-PAD-INV"],
+    &["AES-256-WRAP-INV", "AES256-WRAP-INV"],
+    &["AES-256-WRAP-PAD-INV", "AES256-WRAP-PAD-INV"],
+    &["DES-EDE3", "DES-EDE3-ECB"],
+    &["DESX", "DESX-CBC"],
+    &["KECCAK-KMAC-128", "KECCAK-KMAC128"],
+    &["KECCAK-KMAC-256", "KECCAK-KMAC256"],
+    &["RC2-40", "RC2-40-CBC"],
+    &["RC2-64", "RC2-64-CBC"],
+    &["SHA-256/192", "SHA2-256/192", "SHA256-192"],
+    &["X942KDF", "X942KDF-ASN1"],
+    &["X942KDF-CONCAT", "X963KDF"],
 ];
 
 /// Finite semantic identity for one algorithm spelling (R01).
@@ -6733,6 +7086,72 @@ mod tests {
         assert_eq!(classify_alg("RC4:SHA2-256"), ("SHA2-256", true));
         assert_eq!(classify_alg("nope:MD5"), ("MD5", true));
         assert_eq!(classify_alg(":SHA2-256"), ("SHA2-256", false));
+    }
+
+    #[test]
+    fn semantic_equiv_sets_verified_and_disjoint() {
+        // R01 fix: 188 row-proven sets (pinned census 2026-10-13).
+        // Every member registered, every set disjoint, distinct
+        // sizes/modes never merged.
+        assert_eq!(ALG_SEMANTIC_EQUIV.len(), 188);
+        let mut seen: HashSet<&str> = HashSet::new();
+        for set in ALG_SEMANTIC_EQUIV {
+            assert!(set.len() >= 2, "set must merge: {set:?}");
+            let mut inner: HashSet<&str> = HashSet::new();
+            for member in *set {
+                assert!(is_known_alg(member), "unregistered member: {member:?}");
+                assert!(inner.insert(member), "dup in set: {member:?}");
+                assert!(seen.insert(member), "member in two sets: {member:?}");
+            }
+            let first = algorithm_semantic_id(set[0]).unwrap();
+            for member in &set[1..] {
+                assert_eq!(
+                    algorithm_semantic_id(member),
+                    Some(first),
+                    "set must share one id: {set:?}"
+                );
+            }
+        }
+        // Reviewer exemplars: stock rows share one id.
+        assert_eq!(
+            algorithm_semantic_id("AES-128-GCM"),
+            algorithm_semantic_id("id-aes128-GCM")
+        );
+        assert_eq!(
+            algorithm_semantic_id("AES-128-GCM"),
+            algorithm_semantic_id("2.16.840.1.101.3.4.1.6")
+        );
+        assert_eq!(
+            algorithm_semantic_id("AES-128-CBC"),
+            algorithm_semantic_id("AES128")
+        );
+        assert_eq!(
+            algorithm_semantic_id("SM3"),
+            algorithm_semantic_id("1.2.156.10197.1.401")
+        );
+        assert_eq!(
+            algorithm_semantic_id("RSA"),
+            algorithm_semantic_id("rsaEncryption")
+        );
+        // F01-distinct algorithms stay split, never merged.
+        for (a, b) in [
+            ("ML-KEM-512", "ML-KEM-768"),
+            ("SHA2-256", "SHA2-512"),
+            ("SHA1", "MD5"),
+            ("AES-128-CBC", "AES-256-CBC"),
+            ("AES-128-GCM", "AES-256-GCM"),
+            ("SM3", "RSA-SM3"),
+            ("SM3", "sm3WithRSAEncryption"),
+            ("DES-EDE3-CBC", "DES-EDE3-ECB"),
+            ("RC2-40", "RC2-64"),
+        ] {
+            assert_ne!(
+                algorithm_semantic_id(a),
+                algorithm_semantic_id(b),
+                "distinct algorithms must stay split: {a} vs {b}"
+            );
+        }
+        assert_eq!(algorithm_semantic_id("NOPE-XYZ-9Q"), None);
     }
 
     #[test]
