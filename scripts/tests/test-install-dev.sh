@@ -373,9 +373,9 @@ mk_variant() {
     cp "$T/host-bin" "$1/host-bin"
     cp "$T/harvest.o" "$1/harvest.o"
     cp "$T/count.o" "$1/count.o"
-    python3 - "$1" <<'EOF'
+    python3 - "$1" "${2:-variant-ref}" <<'EOF'
 import hashlib, json, os, sys
-d = sys.argv[1]
+d, ref = sys.argv[1], sys.argv[2]
 def ident(role, path, extra=None):
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -387,7 +387,7 @@ def ident(role, path, extra=None):
         a.update(extra)
     return a
 m = {"schema": "osslscope-dev-build-manifest-v1",
-     "product_ref": "variant-ref", "product_dirty": False,
+     "product_ref": ref, "product_dirty": False,
      "artifacts": [
         ident("host-binary", d + "/host-bin"),
         ident("bpf-object", d + "/harvest.o", {"bin": "osslscope-harvest"}),
@@ -781,6 +781,174 @@ else
         && ok "unwritable receipt path fails with receipt diagnosis" \
         || bad "unwritable receipt path fails with receipt diagnosis (saw: $(head -1 "$T/out"))"
 fi
+
+# ============ fix round 2: stale temp paths fail closed ============
+# Temporary paths are fresh per run; a pre-existing "<dest>.install-tmp"
+# path is refused, never followed, and cleanup removes only paths this
+# run created.
+
+# Doc temp path symlinked at the already-checked harvest: reinstall must
+# refuse, leaving the verified harvest bytes intact.
+if "$SH_BIN" "$INSTALL" --manifest "$T/manifest.json" --prefix "$T/pfxalias" >/dev/null 2>&1; then
+    ok "setup: good install into temp-alias prefix"
+else
+    bad "setup: good install into temp-alias prefix"
+fi
+snapshot_prefix "$T/pfxalias" "$T/pfxalias.snap"
+ln -s "$T/pfxalias/lib/osslscope/osslscope-harvest" "$T/pfxalias/share/doc/osslscope/install.md.install-tmp"
+if "$SH_BIN" "$INSTALL" --manifest "$T/manifest.json" --prefix "$T/pfxalias" >"$T/out" 2>&1; then
+    bad "doc temp-path symlink fails (got exit 0)"
+else
+    grep -qi 'temporary.*exists\|refus' "$T/out" \
+        && ok "doc temp-path symlink fails closed with temp-path diagnosis" \
+        || bad "doc temp-path symlink fails closed with temp-path diagnosis (saw: $(head -1 "$T/out"))"
+    cmp -s "$T/harvest.o" "$T/pfxalias/lib/osslscope/osslscope-harvest" \
+        && ok "doc temp-path symlink leaves already-checked harvest bytes intact" \
+        || bad "doc temp-path symlink leaves already-checked harvest bytes intact"
+    snapshot_prefix "$T/pfxalias" "$T/pfxalias.now"
+    cmp -s "$T/pfxalias.snap" "$T/pfxalias.now" \
+        && ok "doc temp-path symlink failure leaves existing prefix unchanged" \
+        || bad "doc temp-path symlink failure leaves existing prefix unchanged"
+fi
+
+# Receipt temp path hardlinked to the live receipt, with a fault injected
+# DURING the receipt-byte write: the prior receipt must survive byte-identical.
+if "$SH_BIN" "$INSTALL" --manifest "$T/manifest.json" --prefix "$T/pfxrw" >/dev/null 2>&1; then
+    ok "setup: good install into mid-write receipt prefix"
+else
+    bad "setup: good install into mid-write receipt prefix"
+fi
+cp "$T/pfxrw/share/osslscope/install-manifest.json" "$T/pfxrw.receipt-orig"
+ln "$T/pfxrw/share/osslscope/install-manifest.json" "$T/pfxrw/share/osslscope/install-manifest.json.install-tmp"
+mkdir -p "$T/pyfault"
+cat >"$T/pyfault/sitecustomize.py" <<'EOF'
+import os, sys
+if os.environ.get("FAULT_RECEIPT_MIDWRITE") == "1" and len(sys.argv) == 2 and sys.argv[1].endswith("/install-manifest.json"):
+    import json as _json
+    def _faulting_dump(obj, fp, *a, **k):
+        fp.write('{"fault": "partial-bytes",\n')
+        fp.flush()
+        raise OSError("fault-injected mid-write receipt failure")
+    _json.dump = _faulting_dump
+EOF
+if FAULT_RECEIPT_MIDWRITE=1 PYTHONPATH="$T/pyfault" "$SH_BIN" "$INSTALL" \
+        --manifest "$T/manifest.json" --prefix "$T/pfxrw" >"$T/out" 2>&1; then
+    bad "mid-write receipt fault fails (got exit 0)"
+else
+    grep -qi 'receipt' "$T/out" \
+        && ok "mid-write receipt fault fails with receipt diagnosis" \
+        || bad "mid-write receipt fault fails with receipt diagnosis (saw: $(head -1 "$T/out"))"
+    cmp -s "$T/pfxrw.receipt-orig" "$T/pfxrw/share/osslscope/install-manifest.json" \
+        && ok "mid-write receipt fault keeps the prior receipt byte-identical" \
+        || bad "mid-write receipt fault keeps the prior receipt byte-identical"
+fi
+
+# Same mid-write fault with no alias in place: the fresh-temp atomic
+# publish keeps the prior receipt byte-identical. (Passes pre-fix by
+# design: with no alias the old predictable temp is already a separate
+# file. It pins the publish path against direct-write regressions.)
+if "$SH_BIN" "$INSTALL" --manifest "$T/manifest.json" --prefix "$T/pfxrw2" >/dev/null 2>&1; then
+    ok "setup: good install into mid-write receipt prefix (no alias)"
+else
+    bad "setup: good install into mid-write receipt prefix (no alias)"
+fi
+cp "$T/pfxrw2/share/osslscope/install-manifest.json" "$T/pfxrw2.receipt-orig"
+if FAULT_RECEIPT_MIDWRITE=1 PYTHONPATH="$T/pyfault" "$SH_BIN" "$INSTALL" \
+        --manifest "$T/manifest.json" --prefix "$T/pfxrw2" >"$T/out" 2>&1; then
+    bad "mid-write receipt fault without alias fails (got exit 0)"
+else
+    grep -qi 'receipt' "$T/out" \
+        && ok "mid-write receipt fault without alias fails with receipt diagnosis" \
+        || bad "mid-write receipt fault without alias fails with receipt diagnosis (saw: $(head -1 "$T/out"))"
+    cmp -s "$T/pfxrw2.receipt-orig" "$T/pfxrw2/share/osslscope/install-manifest.json" \
+        && ok "mid-write receipt fault without alias keeps the prior receipt byte-identical" \
+        || bad "mid-write receipt fault without alias keeps the prior receipt byte-identical"
+fi
+
+# Pre-existing temp-path directory: cleanup must remove only paths this
+# run created, leaving the foreign directory and its sentinel alone.
+if "$SH_BIN" "$INSTALL" --manifest "$T/manifest.json" --prefix "$T/pfxsent" >/dev/null 2>&1; then
+    ok "setup: good install into sentinel prefix"
+else
+    bad "setup: good install into sentinel prefix"
+fi
+mkdir "$T/pfxsent/bin/osslscope.install-tmp"
+echo sentinel >"$T/pfxsent/bin/osslscope.install-tmp/sentinel"
+snapshot_prefix "$T/pfxsent" "$T/pfxsent.snap"
+if "$SH_BIN" "$INSTALL" --manifest "$T/manifest.json" --prefix "$T/pfxsent" >"$T/out" 2>&1; then
+    bad "pre-existing temp-path directory fails (got exit 0)"
+else
+    grep -qi 'temporary.*exists\|refus' "$T/out" \
+        && ok "pre-existing temp-path directory fails closed with temp-path diagnosis" \
+        || bad "pre-existing temp-path directory fails closed with temp-path diagnosis (saw: $(head -1 "$T/out"))"
+    [ -f "$T/pfxsent/bin/osslscope.install-tmp/sentinel" ] \
+        && ok "cleanup removes only paths this run created (sentinel kept)" \
+        || bad "cleanup removes only paths this run created (sentinel kept)"
+    snapshot_prefix "$T/pfxsent" "$T/pfxsent.now"
+    cmp -s "$T/pfxsent.snap" "$T/pfxsent.now" \
+        && ok "pre-existing temp-path failure leaves existing prefix unchanged" \
+        || bad "pre-existing temp-path failure leaves existing prefix unchanged"
+fi
+
+# ============ fix round 2: manifest snapshot, no mixed identities ============
+# The manifest bytes are read once per run. A cp shim swaps revision-A
+# sources and manifest for revision B during staging (between the old
+# revision read and hash read): the install must reject the changed
+# bytes, never install B while recording A as manifest-verified.
+mk_variant "$T/v-swapA" rev-A
+mk_variant "$T/v-swapB" rev-B
+python3 -c "
+import hashlib, json, os
+d = '$T/v-swapB'
+for n in ('host-bin', 'harvest.o', 'count.o'):
+    open(d + '/' + n, 'ab').write(b'-revB-pad-revB-pad')
+p = d + '/manifest.json'
+m = json.load(open(p))
+for a in m['artifacts']:
+    a['sha256'] = hashlib.sha256(open(a['path'], 'rb').read()).hexdigest()
+    a['bytes'] = os.path.getsize(a['path'])
+json.dump(m, open(p, 'w'), indent=2, sort_keys=True)
+"
+if "$SH_BIN" "$INSTALL" --manifest "$T/v-swapA/manifest.json" --prefix "$T/pfxswap" >/dev/null 2>&1; then
+    ok "setup: good revision-A install into swap prefix"
+else
+    bad "setup: good revision-A install into swap prefix"
+fi
+snapshot_prefix "$T/pfxswap" "$T/pfxswap.snap"
+mk_tool_farm "$T/swapbin"
+rm "$T/swapbin/cp"
+cat >"$T/swapbin/cp" <<EOF
+#!/bin/sh
+if [ ! -f "$T/swapped" ]; then
+    for _a in "\$@"; do
+        if [ "\$_a" = "$T/v-swapA/host-bin" ]; then
+            "$REAL_CP" "$T/v-swapB/host-bin" "$T/v-swapA/host-bin"
+            "$REAL_CP" "$T/v-swapB/harvest.o" "$T/v-swapA/harvest.o"
+            "$REAL_CP" "$T/v-swapB/count.o" "$T/v-swapA/count.o"
+            "$REAL_CP" "$T/v-swapB/manifest.json" "$T/v-swapA/manifest.json"
+            touch "$T/swapped"
+            break
+        fi
+    done
+fi
+exec "$REAL_CP" "\$@"
+EOF
+chmod +x "$T/swapbin/cp"
+if PATH="$T/swapbin:$PATH" "$SH_BIN" "$INSTALL" \
+        --manifest "$T/v-swapA/manifest.json" --prefix "$T/pfxswap" >"$T/out" 2>&1; then
+    bad "swapped-manifest install fails (got exit 0)"
+else
+    grep -q 'sha256\|byte length' "$T/out" \
+        && ok "swapped manifest fails closed with identity diagnosis" \
+        || bad "swapped manifest fails closed with identity diagnosis (saw: $(head -1 "$T/out"))"
+    snapshot_prefix "$T/pfxswap" "$T/pfxswap.now"
+    cmp -s "$T/pfxswap.snap" "$T/pfxswap.now" \
+        && ok "swapped-manifest failure leaves existing prefix unchanged" \
+        || bad "swapped-manifest failure leaves existing prefix unchanged"
+fi
+[ -f "$T/swapped" ] \
+    && ok "swap probe fired between reads" \
+    || bad "swap probe fired between reads"
 
 # ============ --setcap matrix ============
 mkdir -p "$T/stubbin"
