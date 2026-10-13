@@ -31,7 +31,9 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime};
 
 const PID: u32 = 4242;
@@ -5113,7 +5115,9 @@ fn bad_read_gap_never_heals_by_recompute() {
 // ---------------------------------------------------------------------------
 
 use osslscope::capture::{LiveProc, PollingLifecycle};
-use osslscope::target::{OwnedTarget, WorkloadDest};
+use osslscope::target::{
+    __test_set_prestop_pid_sink, __test_set_prestop_stall_ms, OwnedTarget, WorkloadDest,
+};
 
 /// Parent pid from `/proc/<pid>/stat` (fields start after the LAST
 /// ')'; ppid is post-comm token 1).
@@ -5145,30 +5149,46 @@ fn live_observe(
     argv: &[&str],
     duration: Duration,
     finish_recycled: bool,
-) -> (anyhow::Result<Capture>, u32) {
+) -> (anyhow::Result<Capture>, Option<u32>) {
+    let idle = AtomicBool::new(false);
     live_observe_inner(
         test,
         argv,
         duration,
         finish_recycled,
         Duration::from_secs(30),
+        &idle,
     )
 }
 
-/// [`live_observe`] with an explicit setup timeout (R06: the zero
-/// case must reap a real child without opening a window).
+/// [`live_observe`] with an explicit setup timeout (R06 fix round 1: the
+/// helper spawns through the cancellable control entrypoint with the
+/// checked harvest-timeout deadline — the same shape as production
+/// `run()` — so spawn-level custody is exercised, not just `observe()`'s
+/// own timeout handling). `None` pid = the spawn itself failed (no child).
 fn live_observe_inner(
     test: &str,
     argv: &[&str],
     duration: Duration,
     finish_recycled: bool,
     harvest_timeout: Duration,
-) -> (anyhow::Result<Capture>, u32) {
+    cancel: &AtomicBool,
+) -> (anyhow::Result<Capture>, Option<u32>) {
     let stage = Stage::fresh(test);
     let bytes = self_bytes();
     let staged = stage.write("prov.so", &bytes);
     let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
-    let owned = OwnedTarget::spawn_stopped(&argv, WorkloadDest::Null).unwrap();
+    let setup_deadline = osslscope::args::deadline_at(Instant::now(), harvest_timeout)
+        .expect("test harvest timeout");
+    let owned = match OwnedTarget::spawn_stopped_with_control(
+        &argv,
+        WorkloadDest::Null,
+        setup_deadline,
+        cancel,
+    ) {
+        Ok(t) => t,
+        Err(e) => return (Err(e), None),
+    };
     let pid = owned.pid();
     let clock = FakeClock::new();
     let shared = Rc::new(RefCell::new(SharedState::default()));
@@ -5268,7 +5288,7 @@ fn live_observe_inner(
         &mut proc,
         &|| false,
     );
-    (out, pid)
+    (out, Some(pid))
 }
 
 #[test]
@@ -5281,6 +5301,7 @@ fn live_fast_child_exit7_no_zombie() {
         Duration::from_secs(30),
         false,
     );
+    let pid = pid.expect("spawned");
     let c = out.unwrap();
     assert_eq!(c.child_exit, Some(7));
     assert!(matches!(
@@ -5300,6 +5321,7 @@ fn live_20ms_target_exit_no_zombie() {
         Duration::from_secs(30),
         false,
     );
+    let pid = pid.expect("spawned");
     let c = out.unwrap();
     assert_eq!(c.child_exit, Some(0));
     assert!(matches!(
@@ -5321,6 +5343,7 @@ fn live_owned_exit_survives_pin_recycle_at_finish() {
         Duration::from_secs(30),
         true,
     );
+    let pid = pid.expect("spawned");
     let c = out.unwrap();
     assert_eq!(c.child_exit, Some(7));
     assert!(matches!(
@@ -5333,10 +5356,11 @@ fn live_owned_exit_survives_pin_recycle_at_finish() {
 }
 
 #[test]
-fn live_zero_setup_timeout_reaps_real_child() {
-    // R06: zero setup timeout with a REAL forked child — the
-    // never-released child is SIGKILLed pre-exec and reaped (no
-    // window, no zombie) and the sentinel never runs.
+fn live_zero_setup_timeout_spawns_nothing() {
+    // R06 fix round 1: zero setup timeout fails the capture-helper spawn
+    // itself (pre-fork deadline, via the control entrypoint — the same
+    // shape as production `run()`): no child, no window, and the sentinel
+    // never runs. (The post-fork kill+reap proof is the next test.)
     let dir = std::env::temp_dir().join(format!("r06-live-timeout-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -5344,33 +5368,130 @@ fn live_zero_setup_timeout_reaps_real_child() {
     let script = format!("touch '{}'; sleep 30", sentinel.display());
     let argv_owned = ["/bin/sh".to_string(), "-c".to_string(), script];
     let argv_refs: Vec<&str> = argv_owned.iter().map(|s| s.as_str()).collect();
+    let idle = AtomicBool::new(false);
     let (out, pid) = live_observe_inner(
         "live-zero-timeout",
         &argv_refs,
         Duration::from_secs(30),
         false,
         Duration::ZERO,
+        &idle,
     );
-    if let Ok(c) = &out {
-        // Regression: retain the exact owned pid and guarantee
-        // cleanup (the child may have been released) before failing.
-        unsafe {
-            libc::kill(pid as libc::pid_t, libc::SIGKILL);
+    assert!(pid.is_none(), "nothing may fork");
+    let msg = out.expect_err("zero setup timeout must fail").to_string();
+    assert!(msg.contains("deadline"), "{msg}");
+    assert!(!sentinel.exists(), "sentinel must never execute");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Independent PID custody for the capture spawn test (mirrors the
+/// lifecycle suite's helper; this file is a separate crate): SIGKILL +
+/// reap one exact pid, tolerating the ECHILD race where the spawn worker
+/// reaped it first. Bounded, and never touches any other pid.
+fn r06_capture_rescue_pid(pid: u32) {
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+    }
+    let end = Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut status = 0;
+        let r = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
+        if r > 0 {
+            return;
         }
-        let end = Instant::now() + Duration::from_secs(5);
-        loop {
-            let mut status = 0;
-            let r = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
-            if r != 0 {
-                break;
+        if r < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EINTR) {
+                continue;
             }
-            assert!(Instant::now() < end, "child {pid} would not die");
+            return;
+        }
+        assert!(Instant::now() < end, "rescue: pid {pid} would not die");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn live_prestop_cancel_reaps_real_child() {
+    // R06 fix round 1: the capture helper spawns through the control
+    // entrypoint, so a cancellation landing deterministically post-fork
+    // (after the fork is observed; 10s stall) kills + reaps the real
+    // child before `observe()` ever runs: no window, no zombie, and the
+    // sentinel never runs. Supervised exactly like the lifecycle suite
+    // (worker + join bound + exact-pid rescue): a regressed hang fails
+    // the test instead of the runner, on every path.
+    let dir = std::env::temp_dir().join(format!("r06-live-cancel-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let sentinel = dir.join("SENTINEL");
+    let script = format!("touch '{}'; sleep 30", sentinel.display());
+    let argv_owned = ["/bin/sh".to_string(), "-c".to_string(), script];
+    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel_c = cancel.clone();
+    let sink = Arc::new(AtomicU32::new(0));
+    let sink_c = sink.clone();
+    let (tx, rx) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        __test_set_prestop_stall_ms(10_000);
+        __test_set_prestop_pid_sink(Some(sink_c));
+        let argv_refs: Vec<&str> = argv_owned.iter().map(|s| s.as_str()).collect();
+        let r = live_observe_inner(
+            "live-prestop-cancel",
+            &argv_refs,
+            Duration::from_secs(30),
+            false,
+            Duration::from_secs(30),
+            &cancel_c,
+        );
+        __test_set_prestop_pid_sink(None);
+        __test_set_prestop_stall_ms(0);
+        let _ = tx.send(r);
+    });
+    let pid = {
+        let end = Instant::now() + Duration::from_secs(10);
+        loop {
+            let p = sink.load(Ordering::SeqCst);
+            if p != 0 {
+                break p;
+            }
+            assert!(Instant::now() < end, "no fork observed within 10s");
             std::thread::sleep(Duration::from_millis(5));
         }
-        panic!("zero setup timeout must fail, got {:?}", c.outcome);
-    }
-    let msg = out.expect_err("zero setup timeout must fail").to_string();
-    assert!(msg.contains("setup timeout"), "{msg}");
+    };
+    cancel.store(true, Ordering::SeqCst);
+    let (out, helper_pid) = match rx.recv_timeout(Duration::from_secs(20)) {
+        Ok(r) => {
+            worker.join().unwrap();
+            r
+        }
+        Err(_) => {
+            r06_capture_rescue_pid(pid);
+            assert_reaped(pid);
+            panic!("capture spawn hung beyond 20s; rescued pid {pid}");
+        }
+    };
+    // The helper must never get a child (its spawn fails): the only
+    // pid is the independently observed one. On the unexpected-Ok
+    // regression the helper ran a full window and may have detached a
+    // live child — retain the exact observed pid and guarantee cleanup
+    // before failing.
+    let msg = match out {
+        Err(e) => {
+            assert!(helper_pid.is_none(), "helper spawn must fail");
+            e.to_string()
+        }
+        Ok(c) => {
+            r06_capture_rescue_pid(pid);
+            assert_reaped(pid);
+            panic!("cancelled capture spawn must fail, got {:?}", c.outcome);
+        }
+    };
+    assert!(msg.contains("cancel"), "names cancellation: {msg}");
+    assert!(
+        msg.contains(&format!("owned child {pid} killed and reaped")),
+        "confirmed cleanup of the observed pid: {msg}"
+    );
+    assert!(msg.contains("(status 137)"), "SIGKILL status: {msg}");
     assert_reaped(pid);
     assert!(!sentinel.exists(), "sentinel must never execute");
     std::fs::remove_dir_all(&dir).unwrap();
