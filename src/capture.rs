@@ -48,10 +48,11 @@ use crate::discovery::session::{
 };
 use crate::discovery::{coverage, elf, legacy, maps, onboard};
 use crate::evidence::{
-    self, CandidateCoverage, CandidateIdentity, CaptureDocument, CaptureWindow, Completeness,
-    CounterKind, CounterSource, CounterUnits, DispositionRecord, EngineObservation, EngineWindow,
-    ExpectedScope, FencedGeneration, FinalizeInput, GapCounter, GapReason, LegacyCallPartition,
-    ObjectId, ObjectRecord, OpensslVersion, ScopeCoverage, SiteExecution, SiteKey, TargetRecord,
+    self, CandidateCoverage, CandidateIdentity, CaptureContext, CaptureDocument, CaptureWindow,
+    Completeness, CounterKind, CounterSource, CounterUnits, DispositionRecord, EngineObservation,
+    EngineWindow, ExpectedScope, FencedGeneration, FinalizeInput, GapCounter, GapReason,
+    LegacyCallPartition, ObjectId, ObjectRecord, OpensslVersion, ScopeCoverage, SiteExecution,
+    SiteKey, TargetRecord,
 };
 use crate::{args, kinds, pin, plan, target};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -290,6 +291,27 @@ fn doc_disposition(
             Some(DispositionRecord::foreign_observed(*pid))
         }
         (_, None) => None,
+    }
+}
+
+/// Wall-clock instant → unix nanoseconds for the v2 document
+/// context (R12). Pre-epoch and unrepresentable instants are
+/// explicit `None` (rendered JSON `null`), never a fabricated
+/// zero; a backward-adjusted pair stays visible as-is, never
+/// rewritten.
+fn unix_ns(t: SystemTime) -> Option<u64> {
+    u64::try_from(t.duration_since(SystemTime::UNIX_EPOCH).ok()?.as_nanos()).ok()
+}
+
+/// Execution context for the finalized document (R12): the
+/// already-captured kernel release plus the window wall edges.
+/// Monotonic window fields stay authoritative; this context never
+/// feeds durations or deadlines.
+fn doc_context(kernel_release: &str, start: SystemTime, end: SystemTime) -> CaptureContext {
+    CaptureContext {
+        kernel_release: kernel_release.to_string(),
+        wall_start_unix_ns: unix_ns(start),
+        wall_end_unix_ns: unix_ns(end),
     }
 }
 
@@ -2944,7 +2966,7 @@ where
             effective_end_ns: requested_end,
             signal_cut: self.signal_cut,
         };
-        let document = evidence::finalize(FinalizeInput {
+        let mut document = evidence::finalize(FinalizeInput {
             window,
             sites: Vec::new(),
             fenced: Vec::new(),
@@ -2964,6 +2986,14 @@ where
             legacy_partition: LegacyCallPartition::default(),
             engine_observations: Vec::new(),
         });
+        // R12: retain the already-captured execution context in the
+        // finalized document (no window was observed, but the host
+        // context is still honest context).
+        document.context = Some(doc_context(
+            &self.info.kernel_release,
+            self.open_wall,
+            self.clock.wall_now(),
+        ));
         self.emit_gap_reasons(document.reasons());
         if !self.trigger_observed {
             self.reason("no-query");
@@ -3023,7 +3053,7 @@ where
             .requested_start_ns
             .saturating_add(duration_ns(self.cfg.duration));
         let now_ns = self.clock.monotonic_ns();
-        let document = evidence::finalize(FinalizeInput {
+        let mut document = evidence::finalize(FinalizeInput {
             window: CaptureWindow {
                 requested_start_ns: self.requested_start_ns,
                 requested_end_ns: requested_end,
@@ -3049,6 +3079,13 @@ where
             legacy_partition: LegacyCallPartition::default(),
             engine_observations: Vec::new(),
         });
+        // R12: retain the already-captured execution context (the
+        // observations are discarded, but the host context stands).
+        document.context = Some(doc_context(
+            &self.info.kernel_release,
+            self.open_wall,
+            self.clock.wall_now(),
+        ));
         self.reasons.clear();
         self.reason("pid-recycled");
         if close_failed {
@@ -4174,7 +4211,7 @@ where
         let legacy_files =
             legacy_files_for(self.cfg.resolved_provider.as_ref(), &self.adapter.objects);
         let call_partition = partition_calls(&drain.current, &drain.fenced, &legacy_files);
-        let document = evidence::finalize(FinalizeInput {
+        let mut document = evidence::finalize(FinalizeInput {
             window: CaptureWindow {
                 requested_start_ns: self.requested_start_ns,
                 requested_end_ns: requested_end,
@@ -4200,6 +4237,13 @@ where
             legacy_partition: evidence_partition(call_partition),
             engine_observations,
         });
+        // R12: retain the already-captured execution context in the
+        // finalized document (monotonic fields stay authoritative).
+        document.context = Some(doc_context(
+            &self.info.kernel_release,
+            self.open_wall,
+            self.clock.wall_now(),
+        ));
 
         // Legacy `legacy` block from IN-WINDOW tripwire evidence only
         // (baselined at the declared boundary; the post-count-close
@@ -4509,7 +4553,7 @@ fn fips_configured(provider: &Path) -> bool {
 /// discovery attach, so no session was ever held.
 fn recycled_capture(cfg: &Config, info: &TargetInfo) -> Capture {
     let requested_end = info.acquired_ns.saturating_add(duration_ns(cfg.duration));
-    let document = evidence::finalize(FinalizeInput {
+    let mut document = evidence::finalize(FinalizeInput {
         window: CaptureWindow {
             requested_start_ns: info.acquired_ns,
             requested_end_ns: requested_end,
@@ -4530,6 +4574,13 @@ fn recycled_capture(cfg: &Config, info: &TargetInfo) -> Capture {
         legacy_partition: LegacyCallPartition::default(),
         engine_observations: Vec::new(),
     });
+    // R12: the pre-attach recycle carries the acquisition instant in
+    // both wall edges, mirroring the legacy Capture wall fields.
+    document.context = Some(doc_context(
+        &info.kernel_release,
+        info.acquired_wall,
+        info.acquired_wall,
+    ));
     Capture {
         target_pid: info.pid,
         target_comm: info.comm.clone(),
@@ -5095,6 +5146,34 @@ mod tests {
     #[test]
     fn kernel_release_nonempty() {
         assert!(!crate::doctor::uname_release().is_empty());
+    }
+
+    #[test]
+    fn r12_unix_ns_converts_or_stays_unknown() {
+        // R12: representable wall instants convert exactly;
+        // pre-epoch instants are explicit unknown, never zero.
+        let epoch = SystemTime::UNIX_EPOCH;
+        assert_eq!(unix_ns(epoch), Some(0));
+        let t = epoch + Duration::from_nanos(1_700_000_000_000_000_000);
+        assert_eq!(unix_ns(t), Some(1_700_000_000_000_000_000));
+        let pre = epoch - Duration::from_nanos(1);
+        assert_eq!(unix_ns(pre), None);
+    }
+
+    #[test]
+    fn r12_doc_context_carries_kernel_and_wall_pair() {
+        // R12: the document context mirrors the already-captured
+        // kernel release and wall edges verbatim — including a
+        // backward-adjusted pair, which is legal context.
+        let epoch = SystemTime::UNIX_EPOCH;
+        let ctx = doc_context(
+            "6.9.0-test",
+            epoch + Duration::from_nanos(2_000),
+            epoch + Duration::from_nanos(1_000),
+        );
+        assert_eq!(ctx.kernel_release, "6.9.0-test");
+        assert_eq!(ctx.wall_start_unix_ns, Some(2_000));
+        assert_eq!(ctx.wall_end_unix_ns, Some(1_000));
     }
 
     // ---------------------------------------------------------------- adapter

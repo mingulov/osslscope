@@ -15,11 +15,12 @@
 
 use osslscope::check::policy_record;
 use osslscope::evidence::{
-    CandidateCoverage, CandidateIdentity, CaptureDocument, CaptureWindow, Completeness,
-    CounterKind, CounterSource, CounterUnits, DispositionRecord, EngineObservation, EngineWindow,
-    ExpectedScope, FatalKind, FencedGeneration, FinalizeInput, GapCounter, LegacyCallPartition,
-    ObjectId, ObjectRecord, OpensslVersion, PolicyRecord, PolicyRuleResult, PolicyVerdict,
-    RuleVerdict, ScopeCoverage, SiteExecution, SiteKey, TargetRecord, engine_index, finalize,
+    CandidateCoverage, CandidateIdentity, CaptureContext, CaptureDocument, CaptureWindow,
+    Completeness, CounterKind, CounterSource, CounterUnits, DispositionRecord, EngineObservation,
+    EngineWindow, ExpectedScope, FatalKind, FencedGeneration, FinalizeInput, GapCounter,
+    LegacyCallPartition, ObjectId, ObjectRecord, OpensslVersion, PolicyRecord, PolicyRuleResult,
+    PolicyVerdict, RuleVerdict, ScopeCoverage, SiteExecution, SiteKey, TargetRecord, engine_index,
+    finalize,
 };
 use osslscope::policy::{PolicyOutcome, PolicyRule, evaluate_document};
 use osslscope::report::{
@@ -150,7 +151,8 @@ fn input_base() -> FinalizeInput {
 /// file enrolls legacy-class candidates, so every counted call
 /// (current plus fenced) lands non-legacy-exclusive. Keeps the
 /// conservation check passing for its intended subject, never as
-/// the failure under test.
+/// the failure under test. Attaches the deterministic R12 fixture
+/// context (live captures carry the real uname/wall values).
 fn finalize_honest(mut input: FinalizeInput) -> CaptureDocument {
     let mut total = 0u64;
     for site in &input.sites {
@@ -167,7 +169,9 @@ fn finalize_honest(mut input: FinalizeInput) -> CaptureDocument {
         shared_ambiguous: 0,
         unfenced_tails: 0,
     };
-    finalize(input)
+    let mut doc = finalize(input);
+    doc.context = Some(fixture_context());
+    doc
 }
 
 /// COMPLETE report document: two definite sites (500 + 300 calls),
@@ -2809,4 +2813,285 @@ fn engine_semantics_rejects_untimed_definite_refs() {
         check_v2_semantics(&bad).is_err(),
         "definite refs to untimed observations must be rejected"
     );
+}
+
+// ---------------------------------------------------------------- R12 report context + display neutralization
+
+/// R12 fixture context: deterministic kernel + wall edges for
+/// golden fixtures (attached post-finalize; live captures carry
+/// the real uname release and window wall edges instead).
+fn fixture_context() -> CaptureContext {
+    CaptureContext {
+        kernel_release: "6.9.0-test".to_string(),
+        wall_start_unix_ns: Some(1_700_000_000_000_000_000),
+        wall_end_unix_ns: Some(1_700_000_030_000_000_000),
+    }
+}
+
+/// F14 counterexample, verbatim: an actual Linux-permitted short
+/// comm (TASK_COMM_LEN - 1 = 15 bytes: NUL is the only byte the
+/// kernel refuses) carrying ESC + newline + a fake status line.
+const EVIL_COMM_SHORT: &str = "a\x1b[2J\nstatus=OK";
+
+/// Extended target-controlled comm: tab, OSC title sequence, BEL,
+/// bidi overrides, C1 NEL, zero-width space, U+2028 line
+/// separator and BOM — every class `safe_display` must neutralize.
+const EVIL_COMM_WIDE: &str =
+    "x\t\x1b]0;pwned\x07\u{202E}RTL\u{202C}\u{0085}\u{200B}\u{2028}\u{FEFF}y";
+
+/// No active display controls outside the renderer's own `\n` line
+/// separators: no C0/C1/DEL, no bidi overrides/isolates, no
+/// zero-width/format tricks, no U+2028/2029 line breaks.
+fn assert_no_active_display_controls(text: &str) {
+    for c in text.chars() {
+        if c == '\n' {
+            continue;
+        }
+        assert!(!c.is_control(), "active control {c:?} in human output");
+        assert!(
+            !matches!(
+                c,
+                '\u{00AD}'
+                    | '\u{061C}'
+                    | '\u{200B}'..='\u{200F}'
+                    | '\u{2028}'..='\u{202E}'
+                    | '\u{2066}'..='\u{2069}'
+                    | '\u{FEFF}'
+                    | '\u{FFF9}'..='\u{FFFB}'
+            ),
+            "active display control {c:?} in human output"
+        );
+    }
+}
+
+#[test]
+fn r12_context_renders_in_json_with_exact_values() {
+    // R12 RED: the finalized document retains execution context
+    // (kernel + wall edges) in JSON with exact values, and the
+    // extended document validates end to end.
+    let mut doc = complete_doc();
+    doc.context = Some(fixture_context());
+    let v = json_of(&doc);
+    assert_eq!(
+        v["context"],
+        json!({
+            "kernel_release": "6.9.0-test",
+            "wall_start_unix_ns": 1_700_000_000_000_000_000u64,
+            "wall_end_unix_ns": 1_700_000_030_000_000_000u64,
+        }),
+        "context must render exactly"
+    );
+    validate_v2(&v).expect("context doc fails schema");
+    check_v2_semantics(&v).expect("context doc fails semantics");
+}
+
+#[test]
+fn r12_human_neutralizes_target_controlled_comm() {
+    // R12/F14 RED: Linux-permitted comm controls (ESC/newline/tab/
+    // bidi) plus Unicode controls never reach the terminal active;
+    // the genuine status/policy footer stays intact and singular.
+    assert_eq!(EVIL_COMM_SHORT.len(), 15, "short-comm shape must hold");
+    for evil in [EVIL_COMM_SHORT, EVIL_COMM_WIDE] {
+        let mut doc = violation_doc();
+        doc.target.comm = evil.to_string();
+        let text = render_human(&doc);
+        assert_no_active_display_controls(&text);
+        // The injected fake status line is inert: no line of its
+        // own, and the genuine footer appears exactly once.
+        assert!(
+            !text.lines().any(|l| l == "status=OK"),
+            "fake status line survived neutralization:\n{text}"
+        );
+        assert_eq!(
+            text.lines().filter(|l| l.starts_with("status=")).count(),
+            1,
+            "genuine status footer must be singular:\n{text}"
+        );
+        assert!(text.contains("status=COMPLETE"), "{text}");
+        assert!(text.contains("policy: violation"), "{text}");
+        assert!(text.contains("absence = not-observed in window"), "{text}");
+    }
+}
+
+#[test]
+fn r12_json_round_trips_target_controlled_comm() {
+    // R12/F14: JSON keeps the reversible original — neutralization
+    // happens at human rendering only, never in the model or JSON.
+    for evil in [EVIL_COMM_SHORT, EVIL_COMM_WIDE] {
+        let mut doc = complete_doc();
+        doc.target.comm = evil.to_string();
+        let v = json_of(&doc);
+        assert_eq!(v["target"]["comm"], evil, "JSON must round-trip comm");
+        validate_v2(&v).expect("evil-comm doc fails schema");
+        check_v2_semantics(&v).expect("evil-comm doc fails semantics");
+    }
+}
+
+#[test]
+fn r12_human_shows_duration_kernel_and_wall() {
+    // R12/G08 RED: the human header carries explicit requested/
+    // effective durations plus kernel and wall context, with clock
+    // domains labeled so monotonic and wall are never conflated.
+    let mut doc = complete_doc();
+    doc.context = Some(fixture_context());
+    let text = render_human(&doc);
+    assert!(
+        text.contains("duration: requested=100ns effective=100ns (monotonic; authoritative)"),
+        "{text}"
+    );
+    assert!(text.contains("kernel: 6.9.0-test"), "{text}");
+    assert!(
+        text.contains(
+            "wall: start=1700000000000000000 end=1700000030000000000 (unix-ns; context only)"
+        ),
+        "{text}"
+    );
+    // PARTIAL fixture: narrowed effective window shows its own
+    // explicit durations (requested 100ns, effective 90ns).
+    let mut doc = partial_doc();
+    doc.context = Some(fixture_context());
+    let text = render_human(&doc);
+    assert!(
+        text.contains("duration: requested=100ns effective=90ns (monotonic; authoritative)"),
+        "{text}"
+    );
+}
+
+#[test]
+fn r12_wall_backward_adjustment_never_rewrites_monotonic() {
+    // R12 RED: a backward wall-clock adjustment (end < start) is
+    // legal context — it validates, keeps its exact values, and
+    // never rewrites the authoritative monotonic durations.
+    let mut doc = complete_doc();
+    doc.context = Some(CaptureContext {
+        kernel_release: "6.9.0-test".to_string(),
+        wall_start_unix_ns: Some(2_000),
+        wall_end_unix_ns: Some(1_000),
+    });
+    let v = json_of(&doc);
+    assert_eq!(v["context"]["wall_start_unix_ns"], 2_000);
+    assert_eq!(v["context"]["wall_end_unix_ns"], 1_000);
+    validate_v2(&v).expect("backward wall fails schema");
+    check_v2_semantics(&v).expect("backward wall fails semantics");
+    let text = render_human(&doc);
+    assert!(
+        text.contains("duration: requested=100ns effective=100ns (monotonic; authoritative)"),
+        "wall adjustment must not rewrite monotonic durations:\n{text}"
+    );
+    assert!(
+        text.contains("wall: start=2000 end=1000 (unix-ns; context only)"),
+        "{text}"
+    );
+    // The monotonic window itself is untouched by wall context.
+    assert_eq!(v["window"]["requested_start_ns"], 0);
+    assert_eq!(v["window"]["requested_end_ns"], 100);
+    assert_eq!(v["window"]["effective_start_ns"], 0);
+    assert_eq!(v["window"]["effective_end_ns"], 100);
+}
+
+#[test]
+fn r12_unknown_kernel_and_wall_stay_explicit() {
+    // R12 RED: missing context omits the JSON section and renders
+    // human unknown; present-but-unknown context renders explicit
+    // nulls (never fabricated zeros).
+    let mut doc = complete_doc();
+    doc.context = None;
+    let v = json_of(&doc);
+    assert!(v.get("context").is_none(), "absent context must omit");
+    validate_v2(&v).expect("context-less doc fails schema");
+    check_v2_semantics(&v).expect("context-less doc fails semantics");
+    let text = render_human(&doc);
+    assert!(text.contains("kernel: unknown"), "{text}");
+    assert!(
+        text.contains("wall: start=unknown end=unknown (unix-ns; context only)"),
+        "{text}"
+    );
+
+    doc.context = Some(CaptureContext {
+        kernel_release: String::new(),
+        wall_start_unix_ns: None,
+        wall_end_unix_ns: None,
+    });
+    let v = json_of(&doc);
+    assert_eq!(
+        v["context"],
+        json!({
+            "kernel_release": "",
+            "wall_start_unix_ns": Value::Null,
+            "wall_end_unix_ns": Value::Null,
+        }),
+        "unknown wall times must be explicit null"
+    );
+    validate_v2(&v).expect("null-wall doc fails schema");
+    check_v2_semantics(&v).expect("null-wall doc fails semantics");
+    let text = render_human(&doc);
+    assert!(text.contains("kernel: unknown"), "{text}");
+    assert!(
+        text.contains("wall: start=unknown end=unknown (unix-ns; context only)"),
+        "{text}"
+    );
+}
+
+#[test]
+fn r12_no_window_fatal_carries_explicit_unknown() {
+    // R12 RED: the no-window setup-failure document (nothing was
+    // observed) validates with zero durations and explicit unknown
+    // kernel/wall — no invented context.
+    let doc = setup_failure_document(FatalKind::Environment("boom".to_string()));
+    let v = json_of(&doc);
+    assert!(v.get("context").is_none());
+    validate_v2(&v).expect("no-window fatal fails schema");
+    check_v2_semantics(&v).expect("no-window fatal fails semantics");
+    let text = render_human(&doc);
+    assert!(
+        text.contains("duration: requested=0ns effective=0ns (monotonic; authoritative)"),
+        "{text}"
+    );
+    assert!(text.contains("kernel: unknown"), "{text}");
+    assert!(
+        text.contains("wall: start=unknown end=unknown (unix-ns; context only)"),
+        "{text}"
+    );
+}
+
+#[test]
+fn r12_old_reader_ignores_context() {
+    // R12 additive evolution (R05 rule): a v2.1 document without the
+    // optional context section validates, and a reader parses it
+    // with context None — old-shaped bytes stay meaningful.
+    let mut doc = complete_doc();
+    doc.context = Some(fixture_context());
+    let mut v = json_of(&doc);
+    assert!(v.get("context").is_some());
+    v.as_object_mut().unwrap().remove("context");
+    validate_v2(&v).expect("old-shaped doc fails schema");
+    check_v2_semantics(&v).expect("old-shaped doc fails semantics");
+    // New code reads old serde documents: a missing context
+    // defaults to None, never to fabricated kernel/wall values.
+    let mut stripped = serde_json::to_value(&doc).expect("document serializes");
+    stripped.as_object_mut().unwrap().remove("context");
+    let back: CaptureDocument = serde_json::from_value(stripped).expect("old shape parses");
+    assert!(back.context.is_none());
+    assert_eq!(back.total_calls(), 900);
+}
+
+#[test]
+fn r12_context_carries_no_forbidden_keys() {
+    // R12: the new section holds kernel + two timestamps only — no
+    // raw argv, pointers or payloads under any name.
+    let mut doc = complete_doc();
+    doc.context = Some(fixture_context());
+    let v = json_of(&doc);
+    let context = v["context"].as_object().expect("context renders");
+    for key in context.keys() {
+        assert!(
+            ["kernel_release", "wall_start_unix_ns", "wall_end_unix_ns"].contains(&key.as_str()),
+            "unexpected context key {key:?}"
+        );
+        assert!(
+            !FORBIDDEN_V2_KEYS.contains(&key.as_str()),
+            "forbidden context key {key:?}"
+        );
+    }
+    assert_no_forbidden_keys(&v, "context-doc.json");
 }
