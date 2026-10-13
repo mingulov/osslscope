@@ -42,18 +42,19 @@ use aya_ebpf::{
     EbpfContext as _,
 };
 use osslscope_ebpf_common::{
-    classify_alg_with, loss_for_skip_cause, make_call_flags, make_rcount, make_seq, split_rcount,
-    split_seq, AlgClassValue, AlgEvent, CtrlValue, GuardEvent, RowEvent, ScanCallEvent, ScanRec,
-    ScanRetEvent, TCacheValue, ALG_UNREADABLE, ALG_WINDOW, BIRTH_FROZEN, GUARD_EMPTY, GUARD_ERROR,
-    GUARD_VALID, KIND_ALG, KIND_GUARD, KIND_ROW, KIND_SCAN_CALL, KIND_SCAN_RET, LOSS_GUARD_READ_ABORT,
+    classify_alg_with, loss_for_skip_cause, make_bucket, make_call_flags, make_rcount, make_seq,
+    split_bucket, split_rcount, split_seq, AlgClassValue, CtrlValue, GuardEvent, ScanAlgEvent,
+    ScanCallEvent, ScanRec, ScanRetEvent, ScanRowEvent, TCacheValue, ALG_UNREADABLE, ALG_WINDOW,
+    BIRTH_FROZEN, BUCKET_BURST, BUCKET_PERIOD_SHIFTED, GUARD_EMPTY, GUARD_ERROR, GUARD_VALID,
+    KIND_GUARD, KIND_SCAN_ALG, KIND_SCAN_CALL, KIND_SCAN_RET, KIND_SCAN_ROW, LOSS_GUARD_READ_ABORT,
     LOSS_MAP_CALLS, LOSS_MAP_TRUNC, LOSS_MEMBER_COOKIE, LOSS_RETIRE_FAIL, LOSS_RING_ALG,
     LOSS_RING_CALL, LOSS_RING_GUARD, LOSS_RING_RET, LOSS_RING_ROW, LOSS_SCAN_CHURNED,
     LOSS_SCAN_EVICTED, LOSS_STALE_REPAIRED, MEMBER_ENTRY_COOKIE, OTHER_CLASS, RCOUNT_STATE_ACTIVE,
     RCOUNT_STATE_IDLE, RET_FLAG_EMPTY, RINGBUF_AVAIL_DATA, SEQ_CTR_MAX, SKIP_ADMITTED,
-    SKIP_ADMIT_STORE_FAIL, SKIP_ALL, SKIP_BIRTH_PENDING, SKIP_BIRTH_WRAP, SKIP_CTRL_UNPROGRAMMED,
-    SKIP_ENTRY_COOKIE, SKIP_RING_PRESSURE, SKIP_SEQ_FULL, SKIP_SEQ_SATURATED, TRUNC_ALGS,
-    TRUNC_DISPATCH, TRUNC_NO_STORE, TRUNC_WALK_EMPTY, TRUNC_WALK_NAME, TRUNC_WALK_NOIMP,
-    TRUNC_WALK_READ,
+    SKIP_ADMIT_STORE_FAIL, SKIP_ALL, SKIP_BIRTH_PENDING, SKIP_BIRTH_WRAP, SKIP_BUCKET_EMPTY,
+    SKIP_CTRL_UNPROGRAMMED, SKIP_ENTRY_COOKIE, SKIP_RING_PRESSURE, SKIP_SEQ_FULL,
+    SKIP_SEQ_SATURATED, TRUNC_ALGS, TRUNC_DISPATCH, TRUNC_NO_STORE, TRUNC_WALK_EMPTY,
+    TRUNC_WALK_NAME, TRUNC_WALK_NOIMP, TRUNC_WALK_READ,
 };
 
 /// `BPF_NOEXIST` for `insert` (kernel UAPI; aya-ebpf exposes no const).
@@ -75,8 +76,11 @@ const MAX_ALGS: u64 = 512;
 /// via TRUNC). Matches criteria §2.2 E_bound.
 const MAX_DISPATCH: u64 = 128;
 
+/// Item-7 ring (16MiB — the 2MiB ring cannot hold one worst-case
+/// scan; criterion §5.6, re-verified with item-4 sizes in
+/// `src/scan/oracle.rs`).
 #[map]
-static EVENTS: RingBuf = RingBuf::with_byte_size(1 << 21, 0);
+static EVENTS: RingBuf = RingBuf::with_byte_size(1 << 24, 0);
 
 /// Per-array incarnation generation (F-H/H1): the host installs
 /// `GEN[arr]` when an array's epoch is born or reborn and deletes
@@ -137,6 +141,14 @@ static RCOUNT: HashMap<u32, u64> = HashMap::with_max_entries(4096, 0);
 /// skip-silent past T.
 #[map]
 static T_CACHE: HashMap<u64, TCacheValue> = HashMap::with_max_entries(1024, 0);
+/// Tier-1 token bucket (item 5, §5.4): tid → tokens:8 |
+/// last-refill(ns>>8):56. 40/s sustained, burst 4 — single-writer
+/// (one tid = one thread), race-free. Charged by the entry after
+/// all other gates (tokens meter admitted scans, not attempts);
+/// kept separate from BIRTH (userspace overwrites BIRTH rows on
+/// poll — folding would clobber rate state).
+#[map]
+static BUCKET: HashMap<u32, u64> = HashMap::with_max_entries(4096, 0);
 /// Session control (§5.1/§5.4/§5.5): EXPECTED / epoch / SKIP-ALL /
 /// governor (max admittable ring OCCUPANCY in bytes — admit iff
 /// occupancy <= threshold, R18 §2/§6.6). Loader-programmed at
@@ -196,8 +208,8 @@ fn bump_loss(src: u32) {
     let _ = percpu_add(&LOSS, &src);
 }
 
-fn emit_alg(ev: &AlgEvent) {
-    if let Some(mut e) = EVENTS.reserve::<AlgEvent>(0) {
+fn emit_scan_alg(ev: &ScanAlgEvent) {
+    if let Some(mut e) = EVENTS.reserve::<ScanAlgEvent>(0) {
         e.write(*ev);
         e.submit(0);
     } else {
@@ -205,8 +217,8 @@ fn emit_alg(ev: &AlgEvent) {
     }
 }
 
-fn emit_row(ev: &RowEvent) {
-    if let Some(mut e) = EVENTS.reserve::<RowEvent>(0) {
+fn emit_scan_row(ev: &ScanRowEvent) {
+    if let Some(mut e) = EVENTS.reserve::<ScanRowEvent>(0) {
         e.write(*ev);
         e.submit(0);
     } else {
@@ -248,6 +260,17 @@ fn flag_trunc(op: u32, bit: u64) {
     }
 }
 
+/// Dispatch-walk context (BPF calls take ≤5 args — r1..r5 — so
+/// the scan-keyed ROW emission packs its context into one stack
+/// struct passed by pointer).
+struct WalkCtx {
+    op: u32,
+    tid: u32,
+    arr: u64,
+    j: u64,
+    seq: u64,
+}
+
 /// Dispatch-table walk as a BPF subprogram (separate verification
 /// scope). Emits one ROW event per entry (`aux`/`idx` = array address
 /// + alg index, the userspace ALG-join key); returns true when the
@@ -255,7 +278,7 @@ fn flag_trunc(op: u32, bit: u64) {
 /// Returns 0 (terminator), 1 (overflow), or 2 (read abort — the
 /// caller flags; re-cover semantics land with item 4).
 #[inline(never)]
-fn walk_dispatch(imp: u64, op: u32, arr: u64, j: u64) -> u64 {
+fn walk_dispatch(imp: u64, ctx: &WalkCtx) -> u64 {
     for k in 0..MAX_DISPATCH {
         let base = imp + k * 16;
         let fid = unsafe { helpers::bpf_probe_read_user(base as *const u32) };
@@ -266,15 +289,18 @@ fn walk_dispatch(imp: u64, op: u32, arr: u64, j: u64) -> u64 {
         if fid == 0 {
             return 0;
         }
-        emit_row(&RowEvent {
-            kind: KIND_ROW,
-            op,
+        emit_scan_row(&ScanRowEvent {
+            kind: KIND_SCAN_ROW,
+            op: ctx.op,
             funcid: fid,
             _pad: 0,
             addr: fptr,
-            aux: arr,
-            idx: j,
-            generation: gen_of(arr),
+            aux: ctx.arr,
+            idx: ctx.j,
+            generation: gen_of(ctx.arr),
+            tid: ctx.tid,
+            _pad2: 0,
+            seq: ctx.seq,
         });
     }
     1
@@ -389,15 +415,15 @@ fn skip(tid: u32, op: u64, cause: u8) {
 
 /// query_operation(provctx, operation_id, no_store): the entry
 /// plane (R18 §3, stage D: the C-interim PENDING write is gone —
-/// members read SCAN). Fail-fast gates (cookie → CTRL → SKIP_ALL
-/// → BIRTH → wrap → governor), SEQ mint, SCAN take
-/// (snapshot-then-classify), RCOUNT reset, SCAN publish, then
-/// admit effects (CALLS bump + CALL). Every gate skips with its
-/// cause + LOSS + CALL(skipped, seq 0); admits freeze
-/// EXPECTED+epoch from CTRL into the record. Same arg positions
-/// for the core wrapper ossl_provider_query_operation(prov, op,
-/// no_cache) on 3.0/3.5/4.0. Straight-line: zero loops (R18
-/// §10.3).
+/// members read SCAN; item 5 adds the tier-1 token bucket).
+/// Fail-fast gates (cookie → CTRL → SKIP_ALL → BIRTH → wrap →
+/// governor → bucket), SEQ mint, SCAN take (snapshot-then-classify),
+/// RCOUNT reset, SCAN publish, then admit effects (CALLS bump +
+/// CALL). Every gate skips with its cause + LOSS + CALL(skipped,
+/// seq 0); admits freeze EXPECTED+epoch from CTRL into the record.
+/// Same arg positions for the core wrapper
+/// ossl_provider_query_operation(prov, op, no_cache) on
+/// 3.0/3.5/4.0. Straight-line: zero loops (R18 §10.3).
 #[uprobe]
 pub fn member_entry(ctx: ProbeContext) -> u32 {
     // 1. ATTEMPT bump FIRST (before every exit incl. legacy).
@@ -453,6 +479,33 @@ pub fn member_entry(ctx: ProbeContext) -> u32 {
     // semantics — GOVERNOR is max admittable OCCUPANCY, R18 §2).
     if EVENTS.query(RINGBUF_AVAIL_DATA) > ctrl.governor {
         skip(tid, op, SKIP_RING_PRESSURE);
+        return 0;
+    }
+    // 7b. Tier-1 token bucket (item 5, §5.4): charged AFTER all
+    // other gates (tokens meter admitted scans, not attempts).
+    // Missing cell → full burst (a tid's first query starts
+    // untaxed); insert-fail → cause 8 (admit-store class).
+    // Refill math runs in bucket-shifted space (ns>>8); last is
+    // reset to now (dropping the remainder is conservative —
+    // sustained admits stay ≥25ms apart, exactly 40/s).
+    let now_shifted = unsafe { helpers::bpf_ktime_get_ns() } >> 8;
+    let (tok, last) = match unsafe { BUCKET.get_ptr(&tid).map(|p| *p) } {
+        Some(v) => split_bucket(v),
+        None => (BUCKET_BURST as u8, now_shifted),
+    };
+    let elapsed = now_shifted.wrapping_sub(last);
+    let refill = (elapsed / BUCKET_PERIOD_SHIFTED).min(BUCKET_BURST);
+    let mut tokens = (tok as u64 + refill).min(BUCKET_BURST);
+    if tokens == 0 {
+        skip(tid, op, SKIP_BUCKET_EMPTY);
+        return 0;
+    }
+    tokens -= 1;
+    if BUCKET
+        .insert(&tid, make_bucket(tokens as u8, now_shifted), 0)
+        .is_err()
+    {
+        skip(tid, op, SKIP_ADMIT_STORE_FAIL);
         return 0;
     }
     // 8. SEQ step: missing → insert (birth,0) (fail → cause 2);
@@ -768,8 +821,8 @@ macro_rules! def_member {
                                     // no ALG record yet (orphan
                                     // rule), so rows must follow
                                     // their ALG.
-                                    emit_alg(&AlgEvent {
-                                        kind: KIND_ALG,
+                                    emit_scan_alg(&ScanAlgEvent {
+                                        kind: KIND_SCAN_ALG,
                                         op: op as u32,
                                         class: v.class,
                                         status: v.status,
@@ -778,8 +831,18 @@ macro_rules! def_member {
                                         arr: rv,
                                         idx: $j,
                                         generation: gen_of(rv),
+                                        tid,
+                                        _pad2: 0,
+                                        seq,
                                     });
-                                    match walk_dispatch(imp, op as u32, rv, $j) {
+                                    let wctx = WalkCtx {
+                                        op: op as u32,
+                                        tid,
+                                        arr: rv,
+                                        j: $j,
+                                        seq,
+                                    };
+                                    match walk_dispatch(imp, &wctx) {
                                         // Overflow: rows 0..127 are
                                         // kept, the rest is
                                         // unwalkable — flagged, not
@@ -801,8 +864,8 @@ macro_rules! def_member {
                                     // Explicit unreadable record
                                     // (cold page or hostile
                                     // pointer).
-                                    emit_alg(&AlgEvent {
-                                        kind: KIND_ALG,
+                                    emit_scan_alg(&ScanAlgEvent {
+                                        kind: KIND_SCAN_ALG,
                                         op: op as u32,
                                         class: OTHER_CLASS,
                                         status: ALG_UNREADABLE,
@@ -811,6 +874,9 @@ macro_rules! def_member {
                                         arr: rv,
                                         idx: $j,
                                         generation: gen_of(rv),
+                                        tid,
+                                        _pad2: 0,
+                                        seq,
                                     });
                                 }
                             }
