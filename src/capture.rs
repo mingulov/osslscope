@@ -49,9 +49,9 @@ use crate::discovery::session::{
 use crate::discovery::{coverage, elf, legacy, maps, onboard};
 use crate::evidence::{
     self, CandidateCoverage, CandidateIdentity, CaptureDocument, CaptureWindow, Completeness,
-    CounterKind, CounterSource, CounterUnits, DispositionRecord, ExpectedScope, FencedGeneration,
-    FinalizeInput, GapCounter, GapReason, LegacyCallPartition, ObjectId, ObjectRecord,
-    OpensslVersion, ScopeCoverage, SiteExecution, SiteKey, TargetRecord,
+    CounterKind, CounterSource, CounterUnits, DispositionRecord, EngineObservation, EngineWindow,
+    ExpectedScope, FencedGeneration, FinalizeInput, GapCounter, GapReason, LegacyCallPartition,
+    ObjectId, ObjectRecord, OpensslVersion, ScopeCoverage, SiteExecution, SiteKey, TargetRecord,
 };
 use crate::{args, kinds, pin, plan, target};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -254,6 +254,7 @@ pub fn empty_document() -> CaptureDocument {
         disposition: None,
         policy: None,
         legacy_partition: LegacyCallPartition::default(),
+        engine_observations: Vec::new(),
     })
 }
 
@@ -1397,6 +1398,11 @@ pub struct AdaptedDelta {
     pub pre_window_queries: u64,
     /// In-window tripwire news (`None` on the baselining poll).
     pub tripwire: Option<TripwireDelta>,
+    /// Tripwire binding generation live this poll (R05): in-window
+    /// tripwire counts key per (generation, cookie) so a mid-window
+    /// replacement can never join two bindings' probes into one
+    /// observation row.
+    pub trip_generation: u64,
     pub trigger_observed: bool,
 }
 
@@ -1990,6 +1996,7 @@ pub fn adapt_delta(
         } else {
             Some(delta.tripwire.clone())
         },
+        trip_generation: delta.trip_generation,
         trigger_observed: delta.trigger_observed,
     }
 }
@@ -2072,6 +2079,16 @@ struct Runner<'x, D, B: CountBackend, T, L, C: ClockPort, P: ProcPort> {
     in_window_trip: HashMap<u64, u64>,
     in_window_hits: Vec<legacy::TripHit>,
     in_window_lgcalls: u64,
+    /// Typed ENGINE observation accumulators (R05): in-window
+    /// tripwire counts keyed per (binding generation, cookie),
+    /// plus the probe-meaning snapshot per generation (captured
+    /// when the generation first appears — installs are rare, so
+    /// retention is bounded by poll count like the polls
+    /// themselves). The cookie-keyed `in_window_trip` above is
+    /// untouched (legacy block + fallback parity).
+    engine_counts: HashMap<(u64, u64), u64>,
+    engine_probes: HashMap<u64, legacy::ProbeSet>,
+    engine_probed_generation: Option<u64>,
     /// Window-straddling poll deltas (F-D/A10): a discovery poll
     /// that completes at/after the loop deadline contributes
     /// window-ambiguous tripwire/query counts — explicit loss, never
@@ -2379,6 +2396,15 @@ where
     ) -> anyhow::Result<(bool, bool)> {
         let exhausted = delta.budget_exhausted;
         let adapted = adapt_delta(&mut self.adapter, delta, ctx);
+        // R05: snapshot tripwire probe meanings when the binding
+        // generation turns over (once per generation; a generation
+        // with no plan records nothing and snapshots no further).
+        if self.engine_probed_generation != Some(delta.trip_generation) {
+            self.engine_probed_generation = Some(delta.trip_generation);
+            if let Some(set) = self.discovery.snapshot().legacy.set {
+                self.engine_probes.insert(delta.trip_generation, set);
+            }
+        }
         self.activity.extend(adapted.activity);
         self.cold_gap_queries = self
             .cold_gap_queries
@@ -2402,6 +2428,13 @@ where
                 for (cookie, n) in trip.counter_deltas {
                     let slot = self.in_window_trip.entry(cookie).or_default();
                     *slot = slot.saturating_add(n);
+                    // R05: the same evidence keyed per binding
+                    // generation for the typed ENGINE plane.
+                    let eslot = self
+                        .engine_counts
+                        .entry((adapted.trip_generation, cookie))
+                        .or_default();
+                    *eslot = eslot.saturating_add(n);
                 }
                 self.in_window_hits.extend(trip.hits.iter());
                 self.in_window_lgcalls = self
@@ -2431,6 +2464,83 @@ where
             }
         }
         Ok((exhausted, report.candidates_changed))
+    }
+
+    /// Build typed ENGINE observations (R05) from per-(generation,
+    /// cookie) in-window tripwire counts: join each count to its
+    /// generation's probe meaning (symbol → registry entrypoint,
+    /// stub offset) and the binding's libcrypto identity to a
+    /// fingerprinted object record. Returns the observations plus
+    /// the in-window ENGINE increments that carried no joinable
+    /// provenance (loud loss at the call site — the legacy block
+    /// still shows them, so no evidence goes silent). Other
+    /// planes (low-level families, loads, meth) route here but
+    /// are not ENGINE observations: skipped, never inferred.
+    fn build_engine_observations(&self) -> (Vec<EngineObservation>, u64) {
+        let mut out = Vec::new();
+        let mut unkeyed = 0u64;
+        for ((generation, cookie), n) in &self.engine_counts {
+            if *n == 0 {
+                continue;
+            }
+            let mut reject = || {
+                unkeyed = unkeyed.saturating_add(*n);
+            };
+            let Some(set) = self.engine_probes.get(generation) else {
+                reject();
+                continue;
+            };
+            let Some(probe) = set.probes.iter().find(|p| p.cookie == *cookie) else {
+                reject();
+                continue;
+            };
+            // Other planes stay out (their counts live in the
+            // legacy block, not the ENGINE plane).
+            if probe.family.is_some() || set.load_cookies.contains(cookie) {
+                continue;
+            }
+            let Some(entrypoint) = evidence::engine_index(&probe.symbol) else {
+                continue;
+            };
+            let Some((_, dev_str, ino)) = set.libcrypto.as_ref() else {
+                reject();
+                continue;
+            };
+            let Some(device) = plan::device_id_of_dev_str(dev_str) else {
+                reject();
+                continue;
+            };
+            // B-5 doubles (one file under `build:` + `unverified:`
+            // ids) resolve to the verified id; deterministic order.
+            let mut matches: Vec<&ObjectRecord> = self
+                .adapter
+                .objects
+                .iter()
+                .filter(|o| o.device == device && o.inode == *ino)
+                .collect();
+            matches.sort_by(|a, b| {
+                (!a.id.0.starts_with("build:"), &a.id.0)
+                    .cmp(&(!b.id.0.starts_with("build:"), &b.id.0))
+            });
+            let Some(record) = matches.first() else {
+                reject();
+                continue;
+            };
+            out.push(EngineObservation {
+                key: SiteKey {
+                    object: record.id.clone(),
+                    device,
+                    inode: *ino,
+                    offset: probe.offset,
+                },
+                generation: *generation,
+                entrypoint,
+                calls: *n,
+                window: EngineWindow::InWindow,
+            });
+        }
+        out.sort();
+        (out, unkeyed)
     }
 
     /// One bounded poll round: maps, corpse check, fence compare,
@@ -2757,6 +2867,7 @@ where
             disposition: self.child_exit.map(DispositionRecord::exited),
             policy: None,
             legacy_partition: LegacyCallPartition::default(),
+            engine_observations: Vec::new(),
         });
         self.emit_gap_reasons(document.reasons());
         if !self.trigger_observed {
@@ -2841,6 +2952,7 @@ where
             disposition: None,
             policy: None,
             legacy_partition: LegacyCallPartition::default(),
+            engine_observations: Vec::new(),
         });
         self.reasons.clear();
         self.reason("pid-recycled");
@@ -2961,6 +3073,9 @@ where
         in_window_trip: HashMap::new(),
         in_window_hits: Vec::new(),
         in_window_lgcalls: 0,
+        engine_counts: HashMap::new(),
+        engine_probes: HashMap::new(),
+        engine_probed_generation: None,
         straddling_trip: HashMap::new(),
         straddling_lgcalls: 0,
         trigger_observed: false,
@@ -3944,6 +4059,20 @@ where
         let mut counters = drain.counters.clone();
         counters.extend(self.activity.iter().cloned());
         counters.extend(self.extra_loss.iter().cloned());
+        // R05: typed ENGINE observations join the finalized
+        // document once, from the same in-window tripwire evidence
+        // the legacy block below renders. Unjoinable increments
+        // are loud loss (never silent evidence loss).
+        let (engine_observations, engine_unkeyed) = self.build_engine_observations();
+        if engine_unkeyed > 0 {
+            counters.push(typed_counter(
+                "engine.observation_unkeyed",
+                CounterKind::Loss,
+                CounterUnits::Events,
+                CounterSource::Discovery,
+                engine_unkeyed,
+            ));
+        }
         // H8: legacy call partition over the claimed sites (taint
         // revisions applied above; finalize only sorts/dedups
         // candidates, never calls, so pre-finalize values equal the
@@ -3976,6 +4105,7 @@ where
             disposition: doc_disposition(self.info.owned, disposition.as_ref()),
             policy: None,
             legacy_partition: evidence_partition(call_partition),
+            engine_observations,
         });
 
         // Legacy `legacy` block from IN-WINDOW tripwire evidence only
@@ -4305,6 +4435,7 @@ fn recycled_capture(cfg: &Config, info: &TargetInfo) -> Capture {
         disposition: None,
         policy: None,
         legacy_partition: LegacyCallPartition::default(),
+        engine_observations: Vec::new(),
     });
     Capture {
         target_pid: info.pid,
@@ -6004,6 +6135,9 @@ mod tests {
                 in_window_trip: HashMap::new(),
                 in_window_hits: Vec::new(),
                 in_window_lgcalls: 0,
+                engine_counts: HashMap::new(),
+                engine_probes: HashMap::new(),
+                engine_probed_generation: None,
                 straddling_trip: HashMap::new(),
                 straddling_lgcalls: 0,
                 trigger_observed: false,
@@ -6113,6 +6247,87 @@ mod tests {
                 .find(|c| c.name == name)
                 .map(|c| c.value)
                 .unwrap_or(0)
+        }
+
+        #[test]
+        fn engine_observations_join_binding_and_registry() {
+            // R05: per-(generation, cookie) counts join their
+            // generation's probe meanings plus the bound libcrypto
+            // object; other planes skip silently, unjoinable
+            // ENGINE counts go loud via the unkeyed tally.
+            let cfg = stub_config();
+            let info = stub_info();
+            let clock = ClockStub::at(1_500);
+            let mut proc = ProcStub;
+            let cancelled = || false;
+            let count = CountSession::new(TPID, FakeCountBackend::new());
+            let mut runner = stub_runner(
+                &cfg,
+                &info,
+                DiscoveryStub {
+                    finish_err: false,
+                    poll_err: false,
+                    dispatch_attached: false,
+                },
+                count,
+                &clock,
+                &mut proc,
+                &cancelled,
+            );
+            let device = plan::device_id_of_dev_str("08:01").unwrap();
+            runner.adapter.objects.push(ObjectRecord {
+                id: ObjectId("build:lc".to_string()),
+                device,
+                inode: 100,
+                display_locator: "/lib/libcrypto.so.3".to_string(),
+            });
+            // B-5 double: the same file under an unverified id
+            // must lose to the verified one.
+            runner.adapter.objects.push(ObjectRecord {
+                id: ObjectId("unverified:08:01:100".to_string()),
+                device,
+                inode: 100,
+                display_locator: "/lib/libcrypto.so.3".to_string(),
+            });
+            let probe = |cookie: u64, symbol: &str, offset: u64| legacy::Probe {
+                cookie,
+                symbol: symbol.to_string(),
+                offset,
+                module: "/lib/libcrypto.so.3".to_string(),
+                family: None,
+                str_arg: None,
+                program: "trip_count",
+            };
+            let mut set = legacy::ProbeSet::default();
+            set.probes = vec![
+                probe(7, "ENGINE_init", 0x100),
+                probe(8, "ENGINE_init", 0x200),
+                probe(9, "RSA_meth_new", 0x300),
+            ];
+            set.libcrypto = Some(("/lib/libcrypto.so.3".to_string(), "08:01".to_string(), 100));
+            runner.engine_probes.insert(0, set);
+            runner.engine_counts.insert((0, 7), 3);
+            runner.engine_counts.insert((0, 8), 5);
+            runner.engine_counts.insert((0, 9), 11);
+            runner.engine_counts.insert((0, 77), 13);
+            runner.engine_counts.insert((1, 7), 17);
+            let (obs, unkeyed) = runner.build_engine_observations();
+            // Meth plane skips silently; unknown cookie (13) and
+            // unknown generation (17) go loud.
+            assert_eq!(unkeyed, 30);
+            assert_eq!(obs.len(), 2);
+            assert_eq!(obs[0].calls, 3);
+            assert_eq!(obs[0].key.offset, 0x100);
+            assert_eq!(obs[1].calls, 5);
+            assert_eq!(obs[1].key.offset, 0x200);
+            for o in &obs {
+                assert_eq!(o.key.object.0, "build:lc");
+                assert_eq!(o.key.device, device);
+                assert_eq!(o.key.inode, 100);
+                assert_eq!(o.generation, 0);
+                assert_eq!(o.entrypoint, evidence::engine_index("ENGINE_init").unwrap());
+                assert_eq!(o.window, EngineWindow::InWindow);
+            }
         }
 
         #[test]

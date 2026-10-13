@@ -225,11 +225,21 @@
                     "calls": { "$ref": "#/$defs/u64" }
                   }
                 }
+              },
+              "engine_evidence": {
+                "description": "Engine-plane evidence for definite tripwire observations (R05, optional); every ref resolves to an observation listed in this document.",
+                "type": "array",
+                "items": { "$ref": "#/$defs/engine_evidence" }
               }
             }
           }
         }
       }
+    },
+    "engine_observations": {
+      "description": "Typed ENGINE tripwire observations (R05, optional): the replayable engine plane. Omitted when none were observed. Never joins site call totals or the legacy partition.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/engine_observation" }
     }
   },
   "$defs": {
@@ -242,6 +252,43 @@
       "type": "integer",
       "minimum": 0,
       "maximum": 4294967295
+    },
+    "u16": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 65535
+    },
+    "engine_observation": {
+      "description": "One typed ENGINE tripwire observation: the pinned attach identity, binding generation, frozen-registry entrypoint index with its display name, window provenance, and the untimed observed call count.",
+      "type": "object",
+      "required": ["object", "device", "inode", "offset", "generation", "entrypoint", "entrypoint_name", "window", "calls"],
+      "additionalProperties": false,
+      "properties": {
+        "object": { "type": "string", "minLength": 1 },
+        "device": { "$ref": "#/$defs/u64" },
+        "inode": { "$ref": "#/$defs/u64" },
+        "offset": { "$ref": "#/$defs/u64" },
+        "generation": { "$ref": "#/$defs/u64" },
+        "entrypoint": { "$ref": "#/$defs/u16" },
+        "entrypoint_name": { "type": "string", "minLength": 1 },
+        "window": { "enum": ["in-window", "pre-window", "untimed"] },
+        "calls": { "$ref": "#/$defs/u64" }
+      }
+    },
+    "engine_evidence": {
+      "description": "One engine-plane policy evidence ref: the exact observation key plus generation, entrypoint and the definite calls attributed there.",
+      "type": "object",
+      "required": ["object", "device", "inode", "offset", "generation", "entrypoint", "calls"],
+      "additionalProperties": false,
+      "properties": {
+        "object": { "type": "string", "minLength": 1 },
+        "device": { "$ref": "#/$defs/u64" },
+        "inode": { "$ref": "#/$defs/u64" },
+        "offset": { "$ref": "#/$defs/u64" },
+        "generation": { "$ref": "#/$defs/u64" },
+        "entrypoint": { "$ref": "#/$defs/u16" },
+        "calls": { "$ref": "#/$defs/u64" }
+      }
     },
     "candidate": {
       "description": "One candidate identity that could explain entry at a site. The class list is sorted; the first class is not a canonical authority.",

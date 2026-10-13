@@ -254,6 +254,21 @@ fn h5_t3_every_device_site_names_one_domain() {
             "let Some(want) = plan::device_id_of_dev_str(&candidate.advertising_dev) else {",
             1,
         ),
+        // capture.rs (R05): tripwire binding device decode +
+        // object join — stat words both sides (bound libcrypto
+        // print vs fingerprinted object registry).
+        (
+            "src/capture.rs",
+            "stat",
+            "let Some(device) = plan::device_id_of_dev_str(dev_str) else {",
+            1,
+        ),
+        (
+            "src/capture.rs",
+            "stat",
+            ".filter(|o| o.device == device && o.inode == *ino)",
+            1,
+        ),
         // capture.rs: advertising bind against the full identity
         // (P6: match-restructured to route bytes through the
         // build-id cache; the bind is still stat (dev, ino)).
@@ -290,6 +305,10 @@ fn h5_t3_every_device_site_names_one_domain() {
         ),
         // check.rs: evidence ref carries the stat word (plumbing).
         ("src/check.rs", "stat", "device: h.site.device,", 1),
+        // check.rs (R05): engine-plane ref + violation entry carry
+        // the stat word (same plumbing, tripwire key).
+        ("src/check.rs", "stat", "device: h.key.device,", 1),
+        ("src/check.rs", "stat", "\"device\": h.key.device,", 1),
         // count_session.rs: triple keys (stat words, ×3).
         (
             "src/count_session.rs",
@@ -696,9 +715,11 @@ fn h5_t3_every_device_site_names_one_domain() {
             1,
         ),
         ("src/plan.rs", "stat", "render_device(encode_device(", 1),
-        // report.rs: device words rendered (display-only, ×4).
-        ("src/report.rs", "display", "\"device\": e.device,", 1),
+        // report.rs: device words rendered (display-only, ×5;
+        // R05 adds the engine-observation and engine-evidence rows).
+        ("src/report.rs", "display", "\"device\": e.device,", 2),
         ("src/report.rs", "display", "\"device\": o.device,", 1),
+        ("src/report.rs", "display", "\"device\": o.key.device,", 1),
         (
             "src/report.rs",
             "display",

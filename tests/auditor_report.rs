@@ -966,6 +966,7 @@ fn auditor_v2_fixture() -> CaptureDocument {
                             calls: 40,
                         },
                     ],
+                    engine_evidence: Vec::new(),
                 },
                 PolicyRuleResult {
                     rule: "deny-weak".to_string(),
@@ -974,6 +975,7 @@ fn auditor_v2_fixture() -> CaptureDocument {
                     definite: 0,
                     possible: Some(0),
                     evidence: Vec::new(),
+                    engine_evidence: Vec::new(),
                 },
             ],
         }),
@@ -986,6 +988,7 @@ fn auditor_v2_fixture() -> CaptureDocument {
             shared_ambiguous: 0,
             unfenced_tails: 0,
         },
+        engine_observations: Vec::new(),
     };
     finalize(input)
 }

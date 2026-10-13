@@ -379,8 +379,8 @@ pub fn run(argv: &[String]) -> ExitCode {
 use crate::evidence::CaptureDocument;
 use crate::evidence::{
     CandidateCoverage, Completeness, CounterKind, CounterSource, CounterUnits, DispositionOutcome,
-    ExpectedScope, FatalKind, GapReason, OpensslVersionState, PolicyVerdict, RuleVerdict,
-    SiteExecution,
+    EngineWindow, ExpectedScope, FatalKind, GapReason, OpensslVersionState, PolicyVerdict,
+    RuleVerdict, SiteExecution,
 };
 
 /// Primary artifact format for [`OutputRequest`].
@@ -566,6 +566,14 @@ fn rule_verdict_str(verdict: RuleVerdict) -> &'static str {
     }
 }
 
+fn engine_window_str(window: EngineWindow) -> &'static str {
+    match window {
+        EngineWindow::InWindow => "in-window",
+        EngineWindow::PreWindow => "pre-window",
+        EngineWindow::Untimed => "untimed",
+    }
+}
+
 fn doc_json(doc: &CaptureDocument) -> serde_json::Value {
     let fatal_kind = match &doc.status {
         Completeness::Fatal {
@@ -674,22 +682,61 @@ fn doc_json(doc: &CaptureDocument) -> serde_json::Value {
                 PolicyVerdict::Inconclusive => "inconclusive",
                 PolicyVerdict::NoVerdict => "no-verdict",
             },
-            "rules": policy.rules.iter().map(|r| serde_json::json!({
-                "rule": r.rule,
-                "predicate": r.predicate,
-                "result": rule_verdict_str(r.result),
-                "definite": r.definite,
-                "possible": r.possible,
-                "evidence": r.evidence.iter().map(|e| serde_json::json!({
-                    "object": e.object.0,
-                    "device": e.device,
-                    "inode": e.inode,
-                    "offset": e.offset,
-                    "generation": e.generation,
-                    "calls": e.calls,
-                })).collect::<Vec<_>>(),
-            })).collect::<Vec<_>>(),
+            "rules": policy.rules.iter().map(|r| {
+                let mut rule = serde_json::json!({
+                    "rule": r.rule,
+                    "predicate": r.predicate,
+                    "result": rule_verdict_str(r.result),
+                    "definite": r.definite,
+                    "possible": r.possible,
+                    "evidence": r.evidence.iter().map(|e| serde_json::json!({
+                        "object": e.object.0,
+                        "device": e.device,
+                        "inode": e.inode,
+                        "offset": e.offset,
+                        "generation": e.generation,
+                        "calls": e.calls,
+                    })).collect::<Vec<_>>(),
+                });
+                // R05: engine-plane refs render only when present
+                // (minors add optional keys only — old-shaped
+                // documents keep their exact bytes).
+                if !r.engine_evidence.is_empty() {
+                    rule["engine_evidence"] = serde_json::json!(
+                        r.engine_evidence.iter().map(|e| serde_json::json!({
+                            "object": e.object.0,
+                            "device": e.device,
+                            "inode": e.inode,
+                            "offset": e.offset,
+                            "generation": e.generation,
+                            "entrypoint": e.entrypoint,
+                            "calls": e.calls,
+                        })).collect::<Vec<_>>()
+                    );
+                }
+                rule
+            }).collect::<Vec<_>>(),
         });
+    }
+    // R05: typed ENGINE observations render only when observed
+    // (same optional-key minor-extension rule as above).
+    if !doc.engine_observations.is_empty() {
+        out["engine_observations"] = serde_json::json!(
+            doc.engine_observations
+                .iter()
+                .map(|o| serde_json::json!({
+                    "object": o.key.object.0,
+                    "device": o.key.device,
+                    "inode": o.key.inode,
+                    "offset": o.key.offset,
+                    "generation": o.generation,
+                    "entrypoint": o.entrypoint,
+                    "entrypoint_name": crate::evidence::engine_name(o.entrypoint),
+                    "window": engine_window_str(o.window),
+                    "calls": o.calls,
+                }))
+                .collect::<Vec<_>>()
+        );
     }
     out
 }
@@ -782,6 +829,36 @@ pub fn render_human(doc: &CaptureDocument) -> String {
                 bucket.generation,
                 bucket.sites.len(),
                 grouped(SiteExecution::sum_calls(&bucket.sites)),
+            ));
+        }
+        s.push('\n');
+    }
+    // R05: the ENGINE observation plane renders only when observed
+    // (old-shaped documents keep their exact bytes). Counts are
+    // untimed tripwire evidence with explicit window provenance —
+    // never provider-dispatch calls.
+    if !doc.engine_observations.is_empty() {
+        let in_window_calls: u64 = doc
+            .engine_observations
+            .iter()
+            .filter(|o| o.window == EngineWindow::InWindow)
+            .map(|o| o.calls)
+            .fold(0, u64::saturating_add);
+        s.push_str(&format!(
+            "engine observations ({}, {} in-window calls):\n",
+            doc.engine_observations.len(),
+            grouped(in_window_calls),
+        ));
+        for o in &doc.engine_observations {
+            let name = crate::evidence::engine_name(o.entrypoint).unwrap_or("(unknown entrypoint)");
+            s.push_str(&format!(
+                "  {} {} file-offset={} gen={} ({}) ({} calls)\n",
+                fp_short(&o.key.object.0),
+                name,
+                o.key.offset,
+                o.generation,
+                engine_window_str(o.window),
+                grouped(o.calls),
             ));
         }
         s.push('\n');
@@ -889,6 +966,18 @@ pub fn render_human(doc: &CaptureDocument) -> String {
                     s.push_str(&format!(
                         "    evidence: {} file-offset={} gen={} ({} calls)\n",
                         fp_short(&evidence.object.0),
+                        evidence.offset,
+                        evidence.generation,
+                        grouped(evidence.calls),
+                    ));
+                }
+                for evidence in &rule.engine_evidence {
+                    let name = crate::evidence::engine_name(evidence.entrypoint)
+                        .unwrap_or("(unknown entrypoint)");
+                    s.push_str(&format!(
+                        "    engine evidence: {} {} file-offset={} gen={} ({} calls)\n",
+                        fp_short(&evidence.object.0),
+                        name,
                         evidence.offset,
                         evidence.generation,
                         grouped(evidence.calls),
@@ -1263,6 +1352,25 @@ fn cbom_json(doc: &CaptureDocument) -> serde_json::Value {
         ),
         prop("osslscope:omitted-evidence-refs", refs_value),
     ];
+    // R05: ENGINE-plane metadata renders only when observations
+    // exist (old-shaped CBOMs keep their exact bytes). Counts, not
+    // components: the CBOM stays definite-algorithm-assets-only.
+    if !doc.engine_observations.is_empty() {
+        let in_window_calls: u64 = doc
+            .engine_observations
+            .iter()
+            .filter(|o| o.window == EngineWindow::InWindow)
+            .map(|o| o.calls)
+            .fold(0, u64::saturating_add);
+        metadata.push(prop(
+            "osslscope:engine-observations",
+            doc.engine_observations.len().to_string(),
+        ));
+        metadata.push(prop(
+            "osslscope:engine-in-window-calls",
+            in_window_calls.to_string(),
+        ));
+    }
     metadata.extend(window_props());
     if let Some(policy) = &doc.policy {
         metadata.push(prop(
@@ -1420,6 +1528,7 @@ pub fn setup_failure_document(fatal: FatalKind) -> CaptureDocument {
         disposition: None,
         policy: None,
         legacy_partition: LegacyCallPartition::default(),
+        engine_observations: Vec::new(),
     })
 }
 
