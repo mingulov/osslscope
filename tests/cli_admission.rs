@@ -405,12 +405,13 @@ fn ordering_inspect_harvest_spy_fires_on_valid_stays_zero_on_invalid() {
 }
 
 #[test]
-fn ordering_inspect_harvest_spy_catches_premature_provider_read() {
-    // Negative control for the harvest spy: simulate the reviewer's
-    // violation scenario — a production provider-read attempt
-    // FOLLOWED BY a normal usage rejection — and prove the
-    // invalid-path control (spy stays zero) FAILS in that world,
-    // i.e. a premature read cannot hide behind exit 2.
+fn ordering_inspect_harvest_spy_is_cumulative_across_runs() {
+    // Cumulativity pin for the harvest spy (renamed in fix round 3:
+    // the round-2 name overclaimed — a forced setup attempt in one
+    // run followed by a usage rejection in the NEXT run proves the
+    // counter is cumulative, not that it would catch a genuine
+    // premature read inside the rejected invocation. That closure is
+    // ordering_inspect_no_read_syscall_before_admission below).
     use osslscope::inspect::{harvest_calls, reset_harvest_calls};
     reset_harvest_calls();
     // Force a REAL production provider-read attempt first: valid
@@ -437,6 +438,181 @@ fn ordering_inspect_harvest_spy_catches_premature_provider_read() {
         "zero-spy control must FAIL after a setup attempt (calls observed: {})",
         harvest_calls()
     );
+}
+
+// ---------- premature-read boundary control (fix round 3, Linux-only)
+//
+// Root cause addressed: the harvest-call counter proves *invocation*
+// ordering (run() reaches harvest::run exactly once per admitted
+// call), but it observes only its own marked call site. An ignored
+// `std::fs::read(provider)` before parse() performs genuine IO while
+// leaving the counter unchanged — all counter assertions stay green.
+// This control ties the proof to the ACTUAL read boundary instead:
+// per-thread read-syscall counters from /proc. ANY genuine read() on
+// this thread moves them, wherever the call site hides, so a
+// premature read before admission cannot pass. (Per-thread counters
+// keep parallel tests isolated: each test runs on its own thread and
+// measures deltas around a single run_inspect call.)
+
+/// (rchar, syscr) for the CURRENT thread, via one fixed-cost snapshot
+/// (open + exactly ONE read() call + close — never a read loop — so
+/// the snapshot's own syscall cost is exactly 1, immune to digit-width
+/// and chunk-boundary shifts).
+#[cfg(target_os = "linux")]
+fn thread_io() -> (u64, u64) {
+    use std::io::Read;
+    let tid = unsafe { libc::gettid() };
+    let path = format!("/proc/self/task/{tid}/io");
+    let mut f = std::fs::File::open(&path).expect("per-thread io counters readable");
+    let mut buf = [0u8; 4096];
+    let n = f
+        .read(&mut buf)
+        .expect("single read of io counters issues one read()");
+    assert!(
+        n < buf.len(),
+        "io counters fit one read (got {n} full-buffer bytes?)"
+    );
+    let text = std::str::from_utf8(&buf[..n]).expect("io counters are utf8");
+    let mut rchar = None;
+    let mut syscr = None;
+    for line in text.lines() {
+        let (k, v) = line.split_once(": ").expect("io line is 'key: value'");
+        match k {
+            "rchar" => rchar = Some(v.trim().parse::<u64>().expect("rchar numeric")),
+            "syscr" => syscr = Some(v.trim().parse::<u64>().expect("syscr numeric")),
+            _ => {}
+        }
+    }
+    (rchar.expect("rchar present"), syscr.expect("syscr present"))
+}
+
+/// Genuine read cost of `f` as (rchar bytes, read() syscalls):
+/// double-snapshot cancels the snapshot's own cost, so the result is
+/// exactly the reads `f` performed.
+#[cfg(target_os = "linux")]
+fn read_cost(f: impl FnOnce()) -> (u64, u64) {
+    let (r0, s0) = thread_io();
+    let (r1, s1) = thread_io();
+    f();
+    let (r2, s2) = thread_io();
+    (
+        r2.saturating_sub(r1).saturating_sub(r1 - r0),
+        s2.saturating_sub(s1).saturating_sub(s1 - s0),
+    )
+}
+
+/// Real provider fixture: actual bytes on disk. A premature read must
+/// move real bytes through read() to be observable — a bogus path
+/// fails at open with no read syscall at all.
+#[cfg(target_os = "linux")]
+fn provider_fixture(tag: &str) -> std::path::PathBuf {
+    let p = spy_path(tag);
+    let bytes: Vec<u8> = (0..4096u32)
+        .map(|i| (i.wrapping_mul(2654435761) >> 24) as u8)
+        .collect();
+    std::fs::write(&p, &bytes).expect("fixture written");
+    p
+}
+
+#[cfg(target_os = "linux")]
+fn base_inspect_real_provider(provider: &std::path::Path, extra: &[&str]) -> Vec<String> {
+    let mut v = vec![
+        "--pid".to_string(),
+        "1".to_string(),
+        "--provider".to_string(),
+        provider.to_string_lossy().to_string(),
+        "--object".to_string(),
+        "/nonexistent-r07/harvest.bpf.o".to_string(),
+    ];
+    v.extend(extra.iter().map(|s| s.to_string()));
+    v
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn ordering_inspect_no_read_syscall_before_admission() {
+    // Calibration first: a direct genuine read MUST move the counters
+    // in this environment — otherwise every assertion below would be
+    // vacuous. Loud failure here, never a silent skip.
+    let cal = provider_fixture("prov-cal");
+    let (cal_r, cal_s) = read_cost(|| {
+        let b = std::fs::read(&cal).expect("calibration read works");
+        assert_eq!(b.len(), 4096);
+    });
+    assert!(
+        cal_s > 0,
+        "calibration: fixture read issues read() syscalls (syscr +{cal_s})"
+    );
+    assert!(
+        cal_r >= 4000,
+        "calibration: fixture read moves real bytes (rchar +{cal_r})"
+    );
+    let _ = std::fs::remove_file(&cal);
+
+    // Invalid input against a REAL provider file: rejected (exit 2)
+    // with ZERO read() syscalls on this thread — no provider read,
+    // wherever a premature call site hides.
+    let invalid: &[&[&str]] = &[
+        &["--timeout", "121"],
+        &["--timeout", "NaN"],
+        &["--timeout", "1e-300"],
+        &["--settle", "31"],
+        &["--settle", "1e30"],
+        &["--bogus", "1"],
+        &["--timeout"],
+    ];
+    for extra in invalid {
+        let prov = provider_fixture("prov-invalid");
+        let args = base_inspect_real_provider(&prov, extra);
+        let (rc, sc) = read_cost(|| {
+            assert_eq!(run_inspect(&args), ExitCode::from(2), "inspect {extra:?}");
+        });
+        assert_eq!(
+            sc, 0,
+            "inspect {extra:?}: rejected before any read() syscall"
+        );
+        assert!(
+            rc <= 8,
+            "inspect {extra:?}: no bytes read (rchar +{rc}; slack covers counter digit-width shifts)"
+        );
+        let _ = std::fs::remove_file(&prov);
+    }
+    // Missing required args clear the same bar.
+    for args in [
+        argv(&["--pid", "1"]),
+        argv(&["--pid", "1", "--provider", "/nonexistent-r07/provider.so"]),
+    ] {
+        let (rc, sc) = read_cost(|| {
+            assert_eq!(run_inspect(&args), ExitCode::from(2), "{args:?}");
+        });
+        assert_eq!(sc, 0, "missing args rejected before any read() syscall");
+        assert!(rc <= 8, "missing args read no bytes (rchar +{rc})");
+    }
+
+    // Positive controls: valid admission reaches the REAL
+    // provider-read boundary (harvest::run's first effect is
+    // fs::read(&cfg.provider)) — genuine bytes move through read() —
+    // then setup fails on the bogus BPF object (exit 4). The counters
+    // observe the actual boundary, not a marker.
+    for extra in [
+        Vec::<&str>::new(),
+        vec!["--timeout", "0.5", "--settle", "30"],
+    ] {
+        let prov = provider_fixture("prov-valid");
+        let args = base_inspect_real_provider(&prov, &extra);
+        let (rc, sc) = read_cost(|| {
+            assert_eq!(run_inspect(&args), ExitCode::from(4), "inspect {extra:?}");
+        });
+        assert!(
+            sc > 0,
+            "inspect {extra:?}: setup performs read() syscalls (syscr +{sc})"
+        );
+        assert!(
+            rc >= 4000,
+            "inspect {extra:?}: setup reads real provider bytes (rchar +{rc})"
+        );
+        let _ = std::fs::remove_file(&prov);
+    }
 }
 
 #[test]
