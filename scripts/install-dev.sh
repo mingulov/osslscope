@@ -21,8 +21,11 @@
 #   - No auto-install: missing prerequisites fail with a diagnosis.
 #   - Verify before replacing: manifest-selected artifacts must match the
 #     recorded sha256 + byte length; the complete set is staged and
-#     screened before any prefix file changes, so a failure leaves an
-#     existing install byte-identical.
+#     screened before any prefix file changes, so a validation failure
+#     leaves an existing install byte-identical. Once replacement begins,
+#     a failure (I/O error, chmod, receipt write) stops the install and
+#     may leave a partially updated prefix; rerun the install to complete
+#     it. The receipt itself publishes atomically (temp file + rename).
 #   - Fail closed on incompatible objects: the host binary must be an
 #     x86-64 ELF executable; BPF objects must be ELF64 little-endian
 #     EM_BPF relocatables (role usability stays a loader/doctor gate).
@@ -52,7 +55,7 @@ COUNT_OVERRIDE=""
 SETCAP=0
 
 usage() {
-    sed -n '2,34p' "$0"
+    sed -n '2,37p' "$0"
     echo "Exit codes: 0 ok; 2 usage; 3 missing prerequisite; 1 install/setup failure."
 }
 
@@ -127,6 +130,8 @@ need_cmd cp "install coreutils, then re-run"
 need_cmd mkdir "install coreutils, then re-run"
 need_cmd chmod "install coreutils, then re-run"
 need_cmd mktemp "install coreutils (staging directory), then re-run"
+need_cmd mv "install coreutils, then re-run"
+need_cmd cmp "install diffutils, then re-run"
 
 # --- resolve artifact sources ---
 if [ -z "$BIN_OVERRIDE$HARVEST_OVERRIDE$COUNT_OVERRIDE" ] && [ ! -f "$MANIFEST" ]; then
@@ -160,14 +165,19 @@ def s(v):
     return "" if v is None else str(v)
 # One value per line: tab cannot delimit here (tab is IFS whitespace, so
 # consecutive tabs collapse and empty fields vanish — a host-only manifest
-# would misparse). Paths with newlines are not supported.
-print("\n".join([
-    host.get("path", "") or "", harvest.get("path", "") or "",
-    count.get("path", "") or "",
-    m.get("product_ref") or "", str(m.get("product_dirty", "")),
-    s(host.get("sha256")), s(host.get("bytes")),
-    s(harvest.get("sha256")), s(harvest.get("bytes")),
-    s(count.get("sha256")), s(count.get("bytes"))]))
+# would misparse). Recorded sha256/byte lengths are NOT flattened here:
+# the verifier below reads them from the manifest itself, so a hostile
+# field value cannot shift positional reads and spoof another artifact's
+# identity. A newline in any emitted field is refused outright.
+vals = [
+    s(host.get("path") or ""), s(harvest.get("path") or ""),
+    s(count.get("path") or ""),
+    s(m.get("product_ref") or ""), s(m.get("product_dirty", ""))]
+for v in vals:
+    if "\n" in v or "\r" in v:
+        sys.exit("error: build manifest %s carries a newline in a field "
+                 "value (refusing to parse)" % sys.argv[1])
+print("\n".join(vals))
 EOF
 )" || exit 1
 fi
@@ -177,9 +187,6 @@ HARVEST_OBJ="$HARVEST_OVERRIDE"
 COUNT_OBJ="$COUNT_OVERRIDE"
 PRODUCT_REF=""
 PRODUCT_DIRTY=""
-HOST_SHA=""; HOST_BYTES=""
-HARVEST_SHA=""; HARVEST_BYTES=""
-COUNT_SHA=""; COUNT_BYTES=""
 SEL_HOST="explicit-override"
 SEL_HARVEST="explicit-override"
 SEL_COUNT="explicit-override"
@@ -188,30 +195,18 @@ if [ -n "$MANIFEST_PATHS" ]; then
     # a manifest without revision keys would otherwise make the last read
     # hit EOF and abort under set -e. Missing keys mean empty metadata.
     _m_host=""; _m_harvest=""; _m_count=""; _m_ref=""; _m_dirty=""
-    _m_host_sha=""; _m_host_bytes=""
-    _m_harvest_sha=""; _m_harvest_bytes=""
-    _m_count_sha=""; _m_count_bytes=""
     {
         IFS= read -r _m_host || true
         IFS= read -r _m_harvest || true
         IFS= read -r _m_count || true
         IFS= read -r _m_ref || true
         IFS= read -r _m_dirty || true
-        IFS= read -r _m_host_sha || true
-        IFS= read -r _m_host_bytes || true
-        IFS= read -r _m_harvest_sha || true
-        IFS= read -r _m_harvest_bytes || true
-        IFS= read -r _m_count_sha || true
-        IFS= read -r _m_count_bytes || true
     } <<EOF2
 $MANIFEST_PATHS
 EOF2
     if [ -z "$HOST_BIN" ]; then HOST_BIN="$_m_host"; SEL_HOST="manifest-verified"; fi
     if [ -z "$HARVEST_OBJ" ]; then HARVEST_OBJ="$_m_harvest"; SEL_HARVEST="manifest-verified"; fi
     if [ -z "$COUNT_OBJ" ]; then COUNT_OBJ="$_m_count"; SEL_COUNT="manifest-verified"; fi
-    HOST_SHA="$_m_host_sha"; HOST_BYTES="$_m_host_bytes"
-    HARVEST_SHA="$_m_harvest_sha"; HARVEST_BYTES="$_m_harvest_bytes"
-    COUNT_SHA="$_m_count_sha"; COUNT_BYTES="$_m_count_bytes"
     PRODUCT_REF="$_m_ref"
     PRODUCT_DIRTY="$_m_dirty"
 fi
@@ -245,23 +240,43 @@ cp "$COUNT_OBJ" "$STAGE_COUNT" \
 # installed. Explicit overrides are never checked against the manifest. ---
 export STAGE_HOST STAGE_HARVEST STAGE_COUNT MANIFEST
 export SEL_HOST SEL_HARVEST SEL_COUNT
-export HOST_SHA HOST_BYTES HARVEST_SHA HARVEST_BYTES COUNT_SHA COUNT_BYTES
 python3 - <<'EOF' || exit 1
-import hashlib, os, re, sys
+import hashlib, json, os, re, sys
 e = os.environ
 jobs = [
-    ("host binary", e["STAGE_HOST"], e["SEL_HOST"], e["HOST_SHA"], e["HOST_BYTES"]),
-    ("harvest object", e["STAGE_HARVEST"], e["SEL_HARVEST"], e["HARVEST_SHA"], e["HARVEST_BYTES"]),
-    ("count object", e["STAGE_COUNT"], e["SEL_COUNT"], e["COUNT_SHA"], e["COUNT_BYTES"]),
+    ("host binary", e["STAGE_HOST"], e["SEL_HOST"]),
+    ("harvest object", e["STAGE_HARVEST"], e["SEL_HARVEST"]),
+    ("count object", e["STAGE_COUNT"], e["SEL_COUNT"]),
 ]
-for role, staged, sel, sha, nbytes in jobs:
+# Selection and verification together: recorded identities come from the
+# manifest itself, never through the flattened shell channel, so a
+# newline-bearing JSON value cannot spoof another artifact's identity.
+recorded = {}
+if any(sel == "manifest-verified" for _, _, sel in jobs):
+    try:
+        with open(e.get("MANIFEST")) as f:
+            m = json.load(f)
+    except (OSError, ValueError, TypeError) as ex:
+        sys.exit("error: cannot re-read build manifest %s: %s" % (e.get("MANIFEST"), ex))
+    arts = {a.get("role"): a for a in m.get("artifacts", [])}
+    bpf = [a for a in m.get("artifacts", []) if a.get("role") == "bpf-object"]
+    recorded = {
+        "host binary": arts.get("host-binary", {}),
+        "harvest object": next((a for a in bpf if a.get("bin") == "osslscope-harvest"), {}),
+        "count object": next((a for a in bpf if a.get("bin") == "osslscope-count"), {}),
+    }
+for role, staged, sel in jobs:
     if sel != "manifest-verified":
         continue
     where = "build manifest %s" % e.get("MANIFEST")
-    if not re.fullmatch(r"[0-9a-fA-F]{64}", sha or ""):
+    rec = recorded.get(role, {})
+    sha = rec.get("sha256")
+    nbytes = rec.get("bytes")
+    if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", sha):
         sys.exit("error: %s entry in %s records no valid sha256 "
                  "(rebuild with scripts/build-dev.sh to re-record artifact identity)" % (role, where))
-    if not re.fullmatch(r"[0-9]+", nbytes or ""):
+    if isinstance(nbytes, bool) or not (isinstance(nbytes, int)
+            or (isinstance(nbytes, str) and re.fullmatch(r"[0-9]+", nbytes))):
         sys.exit("error: %s entry in %s records no valid byte length "
                  "(rebuild with scripts/build-dev.sh to re-record artifact identity)" % (role, where))
     actual_len = os.path.getsize(staged)
@@ -331,14 +346,44 @@ check_bpf "$STAGE_COUNT" "$COUNT_OBJ" count
 
 # --- install (from staged bytes: everything above already passed) ---
 mkdir -p "$PREFIX/bin" "$PREFIX/lib/osslscope" "$PREFIX/share/doc/osslscope" "$PREFIX/share/osslscope"
-cp "$STAGE_HOST" "$PREFIX/bin/osslscope"
-chmod 755 "$PREFIX/bin/osslscope"
-cp "$STAGE_HARVEST" "$PREFIX/lib/osslscope/osslscope-harvest"
-cp "$STAGE_COUNT" "$PREFIX/lib/osslscope/osslscope-count"
-chmod 644 "$PREFIX/lib/osslscope/osslscope-harvest" "$PREFIX/lib/osslscope/osslscope-count"
+BIN_DEST="$PREFIX/bin/osslscope"
+HARVEST_DEST="$PREFIX/lib/osslscope/osslscope-harvest"
+COUNT_DEST="$PREFIX/lib/osslscope/osslscope-count"
+DOC_DEST="$PREFIX/share/doc/osslscope/install.md"
+INST_MANIFEST="$PREFIX/share/osslscope/install-manifest.json"
+# Each destination is replaced through an independent inode (copy to a
+# temp file plus chmod plus rename), so a symlink or hardlink alias at an
+# existing destination cannot clobber an already installed artifact, and
+# each single-file replacement is atomic. Temp files share the
+# ".install-tmp" suffix and are removed on any failure below.
+BIN_TMP="$BIN_DEST.install-tmp"
+HARVEST_TMP="$HARVEST_DEST.install-tmp"
+COUNT_TMP="$COUNT_DEST.install-tmp"
+DOC_TMP="$DOC_DEST.install-tmp"
+RECEIPT_TMP="$INST_MANIFEST.install-tmp"
+trap 'rm -rf "$STAGE" "$BIN_TMP" "$HARVEST_TMP" "$COUNT_TMP" "$DOC_TMP" "$RECEIPT_TMP"' EXIT INT TERM
+install_one() {
+    # $1 = staged source, $2 = destination, $3 = temp file, $4 = mode, $5 = role label.
+    cp "$1" "$3" \
+        || { echo "error: cannot install $5 to $2" >&2; exit 1; }
+    chmod "$4" "$3" \
+        || { echo "error: cannot set permissions on $2" >&2; exit 1; }
+    mv "$3" "$2" \
+        || { echo "error: cannot install $5 to $2" >&2; exit 1; }
+}
+install_one "$STAGE_HOST" "$BIN_DEST" "$BIN_TMP" 755 "host binary"
+install_one "$STAGE_HARVEST" "$HARVEST_DEST" "$HARVEST_TMP" 644 "harvest object"
+install_one "$STAGE_COUNT" "$COUNT_DEST" "$COUNT_TMP" 644 "count object"
+# Publication verifies the bytes actually retained: the installed set
+# must still match the verified staged set before any receipt is written.
+cmp -s "$STAGE_HOST" "$BIN_DEST" \
+    || { echo "error: installed binary no longer matches verified staged bytes: $BIN_DEST" >&2; exit 1; }
+cmp -s "$STAGE_HARVEST" "$HARVEST_DEST" \
+    || { echo "error: installed harvest object no longer matches verified staged bytes: $HARVEST_DEST" >&2; exit 1; }
+cmp -s "$STAGE_COUNT" "$COUNT_DEST" \
+    || { echo "error: installed count object no longer matches verified staged bytes: $COUNT_DEST" >&2; exit 1; }
 if [ -f "$REPO/docs/install.md" ]; then
-    cp "$REPO/docs/install.md" "$PREFIX/share/doc/osslscope/install.md"
-    chmod 644 "$PREFIX/share/doc/osslscope/install.md"
+    install_one "$REPO/docs/install.md" "$DOC_DEST" "$DOC_TMP" 644 "install doc"
 else
     echo "note: $REPO/docs/install.md absent; skipping doc install." >&2
 fi
@@ -360,11 +405,10 @@ if [ "$SETCAP" -eq 1 ]; then
     fi
 fi
 
-# --- install manifest ---
+# --- install manifest (published atomically via temp file + rename) ---
 export PREFIX MANIFEST PRODUCT_REF PRODUCT_DIRTY SETCAP_STATE REPO
 export HOST_BIN HARVEST_OBJ COUNT_OBJ
-INST_MANIFEST="$PREFIX/share/osslscope/install-manifest.json"
-python3 - "$INST_MANIFEST" <<'EOF'
+python3 - "$INST_MANIFEST" <<'EOF' || exit 1
 import hashlib, json, os, subprocess, sys, datetime
 
 def ident(path):
@@ -414,8 +458,8 @@ arts = [
      "product_ref": ref(e["SEL_COUNT"]), "product_dirty": dirty(e["SEL_COUNT"])},
 ]
 for a in arts:
-    # Hashes of the installed bytes, which are exactly the staged bytes:
-    # staging plus the checks above mean nothing unverified reaches here.
+    # Hashes of the installed bytes, which the retained-identity check
+    # above proved still match the verified staged bytes.
     a.update(ident(a["dest"]))
 all_verified = all(a["selection"] == "manifest-verified" for a in arts)
 manifest = {
@@ -428,9 +472,14 @@ manifest = {
     "setcap": e.get("SETCAP_STATE"),
     "artifacts": arts,
 }
-with open(sys.argv[1], "w") as f:
-    json.dump(manifest, f, indent=2, sort_keys=True)
-    f.write("\n")
+tmp = sys.argv[1] + ".install-tmp"
+try:
+    with open(tmp, "w") as f:
+        json.dump(manifest, f, indent=2, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp, sys.argv[1])
+except OSError as ex:
+    sys.exit("error: cannot write install receipt %s: %s" % (sys.argv[1], ex))
 print("install manifest: " + sys.argv[1])
 EOF
 
