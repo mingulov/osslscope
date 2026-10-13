@@ -1067,13 +1067,22 @@ fn l3_boundaries() {
         }
         for t in 0..3u64 {
             let idx = 4 + t;
+            let at: Vec<_> = algs.iter().filter(|a| a.idx == idx).collect();
             assert_eq!(
-                algs.iter().filter(|a| a.idx == idx).count(),
+                at.len(),
                 2,
                 "v1 gap pin: tail slot {idx} PRESENT (item 3 flips to absence)"
             );
-            let a = algs.iter().find(|a| a.idx == idx).unwrap();
-            assert_eq!(a.class, 200 + t as u16, "tail slot {idx} classified");
+            assert!(
+                at.iter().all(|a| {
+                    a.op == OP
+                        && a.class == 200 + t as u16
+                        && a.status == wire::ALG_OK
+                        && a.arr == fx.array
+                        && a.generation == 0
+                }),
+                "tail slot {idx} ALG payload"
+            );
             let rt: Vec<_> = rows.iter().filter(|r| r.idx == idx).collect();
             assert_eq!(
                 rt.len(),
@@ -1081,9 +1090,13 @@ fn l3_boundaries() {
                 "v1 gap pin: tail slot {idx} ROWs PRESENT (item 3 flips to absence)"
             );
             assert!(
-                rt.iter().all(|r| r.funcid == 900 + t as u32
-                    && r.addr == 0x9900 + t
-                    && r.aux == fx.array),
+                rt.iter().all(|r| {
+                    r.funcid == 900 + t as u32
+                        && r.addr == 0x9900 + t
+                        && r.aux == fx.array
+                        && r.op == OP
+                        && r.generation == 0
+                }),
                 "tail slot {idx} ROW payload"
             );
         }
@@ -1172,7 +1185,11 @@ fn l4_dispatch_bounds() {
         assert_eq!(a0.len(), 2);
         assert!(
             a0.iter().all(|a| {
-                a.op == OP && a.class == 100 && a.status == wire::ALG_OK && a.arr == fx.array
+                a.op == OP
+                    && a.class == 100
+                    && a.status == wire::ALG_OK
+                    && a.arr == fx.array
+                    && a.generation == 0
             }),
             "slot-0 ALG payload"
         );
@@ -1212,13 +1229,30 @@ fn l4_dispatch_bounds() {
             wire::TRUNC_DISPATCH,
             "128+term: DISPATCH alone (term@128 unreachable)"
         );
-        assert_eq!(algs.iter().filter(|a| a.idx == 0).count(), 2);
+        let a0: Vec<_> = algs.iter().filter(|a| a.idx == 0).collect();
+        assert_eq!(a0.len(), 2);
+        assert!(
+            a0.iter().all(|a| {
+                a.op == OP
+                    && a.class == 100
+                    && a.status == wire::ALG_OK
+                    && a.arr == fx.array
+                    && a.generation == 0
+            }),
+            "slot-0 ALG payload"
+        );
         let r0: Vec<_> = rows.iter().filter(|r| r.idx == 0).collect();
         assert_eq!(r0.len(), 256);
         for k in 0..128u64 {
             let n = r0
                 .iter()
-                .filter(|r| r.funcid == 5000 + k as u32 && r.addr == 0x9000 + k)
+                .filter(|r| {
+                    r.funcid == 5000 + k as u32
+                        && r.addr == 0x9000 + k
+                        && r.aux == fx.array
+                        && r.op == OP
+                        && r.generation == 0
+                })
                 .count();
             assert_eq!(n, 2, "leg {k} exact");
         }
@@ -1246,13 +1280,30 @@ fn l4_dispatch_bounds() {
             wire::TRUNC_DISPATCH,
             "129-live: DISPATCH alone"
         );
-        assert_eq!(algs.iter().filter(|a| a.idx == 0).count(), 2);
+        let a0: Vec<_> = algs.iter().filter(|a| a.idx == 0).collect();
+        assert_eq!(a0.len(), 2);
+        assert!(
+            a0.iter().all(|a| {
+                a.op == OP
+                    && a.class == 100
+                    && a.status == wire::ALG_OK
+                    && a.arr == fx.array
+                    && a.generation == 0
+            }),
+            "slot-0 ALG payload"
+        );
         let r0: Vec<_> = rows.iter().filter(|r| r.idx == 0).collect();
         assert_eq!(r0.len(), 256, "first 128 legs × 2 kept");
         for k in 0..128u64 {
             let n = r0
                 .iter()
-                .filter(|r| r.funcid == 5000 + k as u32 && r.addr == 0x9000 + k)
+                .filter(|r| {
+                    r.funcid == 5000 + k as u32
+                        && r.addr == 0x9000 + k
+                        && r.aux == fx.array
+                        && r.op == OP
+                        && r.generation == 0
+                })
                 .count();
             assert_eq!(n, 2, "leg {k} exact");
         }
@@ -1323,8 +1374,13 @@ fn l5_no_store() {
     let r0: Vec<_> = rows.iter().filter(|r| r.idx == 0).collect();
     assert_eq!(r0.len(), 3);
     assert!(
-        r0.iter()
-            .all(|r| r.funcid == 51 && r.addr == 0x4500 && r.aux == fx.array),
+        r0.iter().all(|r| {
+            r.funcid == 51
+                && r.addr == 0x4500
+                && r.aux == fx.array
+                && r.op == OP
+                && r.generation == 0
+        }),
         "slot-0 ROW payload"
     );
     let r1: Vec<_> = rows.iter().filter(|r| r.idx == 1).collect();
@@ -1332,7 +1388,13 @@ fn l5_no_store() {
     for (fid, fptr) in [(52u32, 0x4501u64), (53, 0x4502)] {
         let n = r1
             .iter()
-            .filter(|r| r.funcid == fid && r.addr == fptr && r.aux == fx.array)
+            .filter(|r| {
+                r.funcid == fid
+                    && r.addr == fptr
+                    && r.aux == fx.array
+                    && r.op == OP
+                    && r.generation == 0
+            })
             .count();
         assert_eq!(n, 3, "slot-1 leg {fid} exact");
     }
@@ -1454,15 +1516,20 @@ fn l6_full_chunk() {
                         && a.class == 100 + j as u16
                         && a.status == wire::ALG_OK
                         && a.arr == fx.array
+                        && a.generation == 0
                 }),
                 "slot {j} ALG payload"
             );
             let r: Vec<_> = rows.iter().filter(|r| r.idx == j).collect();
             assert_eq!(r.len(), 2, "slot {j} ROW × 2");
             assert!(
-                r.iter().all(|r| r.funcid == 7000 + j as u32
-                    && r.addr == 0xA000 + j
-                    && r.aux == fx.array),
+                r.iter().all(|r| {
+                    r.funcid == 7000 + j as u32
+                        && r.addr == 0xA000 + j
+                        && r.aux == fx.array
+                        && r.op == OP
+                        && r.generation == 0
+                }),
                 "slot {j} ROW payload"
             );
         }
@@ -1504,16 +1571,25 @@ fn l7_cookie_mismatch() {
         let got: Vec<_> = algs.iter().filter(|a| a.idx == j).collect();
         assert_eq!(got.len(), 2, "slot {j} fires");
         assert!(
-            got.iter().all(|a| a.class == 100 + j as u16
-                && a.status == wire::ALG_OK
-                && a.arr == fx.array),
+            got.iter().all(|a| {
+                a.op == OP
+                    && a.class == 100 + j as u16
+                    && a.status == wire::ALG_OK
+                    && a.arr == fx.array
+                    && a.generation == 0
+            }),
             "slot {j} ALG payload"
         );
         let rws: Vec<_> = rows.iter().filter(|r| r.idx == j).collect();
         assert_eq!(rws.len(), 2, "slot {j} ROWs fire");
         assert!(
-            rws.iter()
-                .all(|r| r.funcid == 71 + j as u32 && r.addr == 0x4700 + j && r.aux == fx.array),
+            rws.iter().all(|r| {
+                r.funcid == 71 + j as u32
+                    && r.addr == 0x4700 + j
+                    && r.aux == fx.array
+                    && r.op == OP
+                    && r.generation == 0
+            }),
             "slot {j} ROW payload"
         );
     }
