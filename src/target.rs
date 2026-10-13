@@ -199,13 +199,14 @@ pub enum WorkloadDest {
     /// Both streams to /dev/null (default).
     Null,
     /// Both streams to this file (created + truncated per run,
-    /// parent-side, pre-fork). Preparation is staged: the file is opened
-    /// and pinned WITHOUT truncating, then truncated caller-side only
-    /// after the setup re-verifies live — a worker delayed past
-    /// abandonment truncates nothing. Accepted ONLY as a pinned regular
-    /// file: missing parents, symlinks, FIFOs, directories, sockets
-    /// and devices fail setup pre-fork, naming the path with the 126
-    /// setup marker. The open fd — not the path — is handed to the
+    /// parent-side, pre-fork). Preparation is staged on ONE fenced worker:
+    /// the file is opened and pinned WITHOUT truncating, then truncated on
+    /// that same worker only after it re-checks the abandonment fence — a
+    /// worker delayed past abandonment truncates nothing, and the caller
+    /// never blocks in the open/truncate itself. Accepted ONLY as a pinned
+    /// regular file: missing parents, symlinks, FIFOs, directories,
+    /// sockets and devices fail setup pre-fork, naming the path with the
+    /// 126 setup marker. The open fd — not the path — is handed to the
     /// child, so post-open path replacement is harmless.
     File(PathBuf),
     /// Both streams to a caller-held fd (harness pipe form; the
@@ -318,8 +319,9 @@ fn lstat_kind(c: &std::ffi::CStr) -> &'static str {
 /// (R06/F07) — WITHOUT truncating (fix round 2: the staged open). There
 /// is deliberately no `O_TRUNC` here: a worker delayed past the caller's
 /// abandonment must not destroy successor bytes, so truncation happens
-/// only in [`truncate_pinned_sink`], caller-side, after the setup
-/// re-verifies live. `O_NONBLOCK` keeps a FIFO-with-no-reader from
+/// only in [`truncate_pinned_sink`], on the same fenced worker, after a
+/// re-check of the abandonment fence (fix round 3). `O_NONBLOCK` keeps a
+/// FIFO-with-no-reader from
 /// hanging the open (it fails `ENXIO` instead); `O_NOFOLLOW` refuses a
 /// final symlink; the `fstat` accepts ONLY a regular file; `O_NONBLOCK`
 /// is then cleared so the workload inherits ordinary blocking stdio. The
@@ -381,10 +383,11 @@ fn open_pinned_sink(path: &Path) -> anyhow::Result<OwnedFd> {
 }
 
 /// Truncate a staged sink opened by [`open_pinned_sink`] (fix round 2:
-/// the destructive half of file-sink preparation). Called caller-side,
-/// only after the setup re-verifies live (cancel + deadline) — NO
-/// detached worker ever truncates, so a late worker cannot destroy bytes
-/// written after the caller gave up. Every failure names the path with
+/// the destructive half of file-sink preparation; fix round 3: it runs on
+/// the fenced setup worker, never as a bare caller-side syscall — a sink
+/// that withholds SETATTR fails the setup instead of hanging it). Called
+/// only after the op re-checks the abandonment fence, so a worker delayed
+/// past abandonment truncates nothing. Every failure names the path with
 /// the 126 setup marker and spawns nothing.
 fn truncate_pinned_sink(sink: &OwnedFd, path: &Path) -> anyhow::Result<()> {
     if unsafe { libc::ftruncate(sink.as_raw_fd(), 0) } != 0 {
@@ -395,6 +398,45 @@ fn truncate_pinned_sink(sink: &OwnedFd, path: &Path) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// Open + pin + truncate a [`WorkloadDest::File`] sink, worker-side (fix
+/// round 3 / NEW): the fenced setup op. The staged open
+/// ([`open_pinned_sink`]) never truncates; the truncation runs here, on
+/// the worker — never as a bare caller-side syscall — so a sink that
+/// withholds SETATTR fails the setup instead of hanging it. Between the
+/// two phases the op re-checks the abandonment fence: the caller may have
+/// given up while the open ran, and then the staged fd disposes HERE, on
+/// the worker, without truncating. Residual: the fence load and the
+/// `ftruncate` trap cannot be atomic, so an abandonment landing exactly
+/// between them still truncates — a microsecond window, against an
+/// unbounded caller hang without this move. No fd is ever handed to a
+/// dead setup: the rendezvous only delivers to a live receiver.
+/// `test_delay_ms` is a moved-in test copy (see `SETUP_TEST_HOOK`): a
+/// stall between the open and the fence check, simulating a sink that
+/// answers preparation slowly — the fence is consulted AFTER it. Inert
+/// (`0`) unless a test armed it.
+fn open_and_truncate_pinned_sink(
+    path: &Path,
+    abandoned: &AtomicBool,
+    test_delay_ms: u64,
+) -> anyhow::Result<OwnedFd> {
+    let staged = open_pinned_sink(path)?;
+    if test_delay_ms > 0 {
+        std::thread::sleep(Duration::from_millis(test_delay_ms));
+    }
+    if abandoned.load(Ordering::SeqCst) {
+        // The caller gave up while the open (or the stall above) ran:
+        // dispose the staged fd HERE, on the worker — never truncate
+        // after abandonment, never hand a live fd to a dead setup. (The
+        // caller already dropped the rendezvous receiver, so this error
+        // is dropped with the worker; it stays sensible in case that
+        // ever changes.)
+        drop(staged);
+        anyhow::bail!("pre-stop setup abandoned during file-sink preparation (no child spawned)");
+    }
+    truncate_pinned_sink(&staged, path)?;
+    Ok(staged)
 }
 
 /// Outcome of running one blocking setup op under deadline +
@@ -422,7 +464,9 @@ enum Control<T> {
 /// setup never starts the op, and a worker that has not started its op
 /// when the caller abandons setup skips it (fix round 2: the abandonment
 /// fence — a late worker must not perform setup work after the caller
-/// gave up). The result channel is a rendezvous (fix round 2 / F1): a
+/// gave up). The op receives the fence so a multi-phase op can re-check
+/// it before its destructive half (fix round 3: open, re-check, then
+/// truncate). The result channel is a rendezvous (fix round 2 / F1): a
 /// value is delivered only to a live receiver, so a discarded result is
 /// always dropped on the worker, never inline on the caller. On expiry
 /// the worker is detached — its ownership moves with it, so a stuck
@@ -437,7 +481,7 @@ fn run_under_control<T, F>(
 ) -> anyhow::Result<Control<T>>
 where
     T: Send + 'static,
-    F: FnOnce() -> T + Send + 'static,
+    F: FnOnce(&AtomicBool) -> T + Send + 'static,
 {
     if cancel.load(Ordering::SeqCst) {
         return Ok(Control::Cancelled);
@@ -446,7 +490,8 @@ where
         return Ok(Control::Expired);
     }
     // Abandonment fence: set by the caller when it stops waiting, read by
-    // the worker immediately before running the op.
+    // the worker immediately before running the op (and re-checked by the
+    // op itself before any destructive half).
     let abandoned = Arc::new(AtomicBool::new(false));
     let abandoned_c = abandoned.clone();
     let (tx, rx) = std::sync::mpsc::sync_channel(0);
@@ -458,7 +503,7 @@ where
                 std::thread::sleep(Duration::from_millis(test_delay_ms));
             }
             if !abandoned_c.load(Ordering::SeqCst) {
-                let _ = tx.send(op());
+                let _ = tx.send(op(abandoned_c.as_ref()));
             }
             if let Some(c) = test_counter.as_ref() {
                 c.fetch_add(1, Ordering::SeqCst);
@@ -504,13 +549,24 @@ where
 /// [`spawn_controlled`]). When `abandoned` is present (fenced ops), it is
 /// set before returning `Cancelled` / `Expired`, so a worker that has not
 /// started its op skips it instead of running setup work after the caller
-/// gave up.
+/// gave up. When the test-only poll gate is armed, the caller waits on it
+/// (bounded) before its first check, so a test can order abandonment
+/// strictly after a result completed (fix round 3 / F1-PROOF).
 fn poll_controlled<T>(
     deadline: Instant,
     cancel: &AtomicBool,
     rx: std::sync::mpsc::Receiver<T>,
     abandoned: Option<&AtomicBool>,
 ) -> anyhow::Result<Control<T>> {
+    if let Some(gate) = SETUP_TEST_HOOK.with(|h| h.borrow().poll_gate.clone()) {
+        let end = Instant::now() + Duration::from_secs(10);
+        while !gate.load(Ordering::SeqCst) {
+            if Instant::now() >= end {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
     loop {
         if cancel.load(Ordering::SeqCst) {
             if let Some(a) = abandoned {
@@ -613,12 +669,22 @@ pub fn __test_set_prestop_pid_sink(sink: Option<Arc<AtomicU32>>) {
 /// - `worker_counter`: the worker increments this exactly once when it
 ///   finishes (all non-panic exits), proving disposal ran on a worker.
 /// - `fail_fork`: the next spawn on this thread skips `fork()` and takes
-///   the fork-failure path (consumed on read). Production callers must
-///   never arm any of these.
+///   the fork-failure path (consumed on read).
+/// - `truncate_delay_ms` (fix round 3): file-sink preparation stalls
+///   this long between the staged open and the fence re-check, simulating
+///   a sink that answers preparation slowly — the caller must stay
+///   bounded regardless. The spawning thread copies it BEFORE creating
+///   the worker; the worker uses only its moved copy.
+/// - `poll_gate` (fix round 3): when armed, the control caller waits on
+///   this flag (bounded) before its first poll check, so a test can order
+///   abandonment strictly after a result completed. Production callers
+///   must never arm any of these.
 struct SetupTestHook {
     setup_delay_ms: u64,
     worker_counter: Option<Arc<AtomicU32>>,
     fail_fork: bool,
+    truncate_delay_ms: u64,
+    poll_gate: Option<Arc<AtomicBool>>,
 }
 
 thread_local! {
@@ -627,6 +693,8 @@ thread_local! {
             setup_delay_ms: 0,
             worker_counter: None,
             fail_fork: false,
+            truncate_delay_ms: 0,
+            poll_gate: None,
         })
     };
 }
@@ -647,6 +715,18 @@ pub fn __test_set_control_worker_counter(counter: Option<Arc<AtomicU32>>) {
 #[doc(hidden)]
 pub fn __test_set_fail_fork(fail: bool) {
     SETUP_TEST_HOOK.with(|h| h.borrow_mut().fail_fork = fail);
+}
+
+/// Test-only: arm the truncate-half stall (see `SETUP_TEST_HOOK`).
+#[doc(hidden)]
+pub fn __test_set_truncate_delay_ms(ms: u64) {
+    SETUP_TEST_HOOK.with(|h| h.borrow_mut().truncate_delay_ms = ms);
+}
+
+/// Test-only: arm the control-poll gate (see `SETUP_TEST_HOOK`).
+#[doc(hidden)]
+pub fn __test_set_poll_gate(gate: Option<Arc<AtomicBool>>) {
+    SETUP_TEST_HOOK.with(|h| h.borrow_mut().poll_gate = gate);
 }
 
 /// Post-fork pre-stop custody (R06/F07): owns the just-forked pid
@@ -815,12 +895,14 @@ impl OwnedTarget {
     /// Ordering: argv validation, then the cancel/deadline checks
     /// (a dead setup forks nothing and truncates nothing), then
     /// destination preparation — file sinks are opened + pinned to
-    /// a regular file by the PARENT pre-fork (see
-    /// [`WorkloadDest::File`]), on a fenced worker under the same
+    /// a regular file and truncated by the PARENT pre-fork (see
+    /// [`WorkloadDest::File`]), on ONE fenced worker under the same
     /// deadline + cancel (a stalled sink fails the setup; it never hangs
-    /// it; a worker delayed past abandonment is fenced and truncates
-    /// nothing) — then a cancel/deadline re-check, caller-side
-    /// truncation, a final re-check, then fork. Custody starts
+    /// it; the fence is re-checked before the destructive half, so a
+    /// worker delayed past abandonment truncates nothing) — then a
+    /// final cancel/deadline re-check, then fork. The caller performs no
+    /// file syscalls itself on this path: open, truncate and close all run
+    /// on control workers. Custody starts
     /// at the fork return, BEFORE the parent's sink copy is disposed
     /// (also under control) and before waiting for SIGSTOP; the wait
     /// polls with the checked deadline and the cancel flag, and every
@@ -870,15 +952,23 @@ impl OwnedTarget {
         let child_dest = match &dest {
             WorkloadDest::Null => ChildDest::Null,
             WorkloadDest::File(path) => {
-                // Two-phase preparation (fix round 2 / NEW): the staged
-                // open never truncates, and the truncation runs caller-side
-                // only after the setup re-verifies live — a worker delayed
-                // past abandonment truncates nothing.
+                // Two-phase preparation inside ONE fenced worker (fix round
+                // 3 / NEW): the staged open never truncates, and the
+                // truncation runs on the worker — never as a bare caller
+                // syscall — after re-checking the abandonment fence, so a
+                // sink that withholds SETATTR fails the setup instead of
+                // hanging it, and a worker delayed past abandonment still
+                // truncates nothing. The caller only polls the rendezvous.
+                // (Fix round 2 ran the truncation caller-side: bounded
+                // against late workers, but the caller itself could block
+                // past the deadline with no cancellation.)
                 let owned_path = path.clone();
-                let prep =
-                    run_under_control(deadline, cancel, move || open_pinned_sink(&owned_path))
-                        .map_err(|e| anyhow::anyhow!("{e:#} (no child spawned)"))?;
-                let staged = match prep {
+                let truncate_delay_ms = SETUP_TEST_HOOK.with(|h| h.borrow().truncate_delay_ms);
+                let prep = run_under_control(deadline, cancel, move |abandoned| {
+                    open_and_truncate_pinned_sink(&owned_path, abandoned, truncate_delay_ms)
+                })
+                .map_err(|e| anyhow::anyhow!("{e:#} (no child spawned)"))?;
+                let truncated = match prep {
                     Control::Done(r) => r?,
                     Control::Cancelled => {
                         anyhow::bail!(
@@ -896,29 +986,8 @@ impl OwnedTarget {
                         );
                     }
                 };
-                // The setup may have died while the staged open ran:
-                // re-check BEFORE truncating so a dead setup truncates
-                // nothing. A staged sink disposes under the same control
-                // (a FUSE close must not hang this path either); there is
-                // no child yet, so the outcome needs no custody.
-                if cancel.load(Ordering::SeqCst) {
-                    let _ = close_under_control(staged, deadline, cancel);
-                    anyhow::bail!(
-                        "pre-stop setup cancelled before file-sink truncation (no child spawned)"
-                    );
-                }
-                if Instant::now() >= deadline {
-                    let _ = close_under_control(staged, deadline, cancel);
-                    anyhow::bail!(
-                        "pre-stop setup deadline exceeded before file-sink truncation (no child spawned)"
-                    );
-                }
-                if let Err(e) = truncate_pinned_sink(&staged, path) {
-                    let _ = close_under_control(staged, deadline, cancel);
-                    return Err(anyhow::anyhow!("{e:#} (no child spawned)"));
-                }
-                let raw = staged.as_raw_fd();
-                owned_sink = Some(staged);
+                let raw = truncated.as_raw_fd();
+                owned_sink = Some(truncated);
                 ChildDest::Fd(raw)
             }
             WorkloadDest::Fd(fd) => {
@@ -1283,8 +1352,8 @@ mod control_tests {
     //! F1 mechanism pins: blocking setup ops run under deadline +
     //! cancellation control (see [`super::run_under_control`]).
     use super::{
-        __test_set_control_worker_counter, __test_set_setup_delay_ms, Control, close_under_control,
-        run_under_control,
+        __test_set_control_worker_counter, __test_set_poll_gate, __test_set_setup_delay_ms,
+        Control, close_under_control, open_and_truncate_pinned_sink, run_under_control,
     };
     use std::os::fd::{FromRawFd as _, OwnedFd};
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -1295,7 +1364,7 @@ mod control_tests {
         let cancel = AtomicBool::new(false);
         let ran = std::sync::Arc::new(AtomicBool::new(false));
         let ran_c = ran.clone();
-        let out = run_under_control(Instant::now(), &cancel, move || {
+        let out = run_under_control(Instant::now(), &cancel, move |_| {
             ran_c.store(true, Ordering::SeqCst);
             42
         })
@@ -1312,7 +1381,7 @@ mod control_tests {
         let out = run_under_control(
             Instant::now() + Duration::from_secs(30),
             &cancel,
-            move || {
+            move |_| {
                 ran_c.store(true, Ordering::SeqCst);
                 42
             },
@@ -1326,7 +1395,7 @@ mod control_tests {
     fn control_returns_value() {
         let cancel = AtomicBool::new(false);
         let out =
-            run_under_control(Instant::now() + Duration::from_secs(30), &cancel, || 42).unwrap();
+            run_under_control(Instant::now() + Duration::from_secs(30), &cancel, |_| 42).unwrap();
         assert!(matches!(out, Control::Done(42)));
     }
 
@@ -1344,7 +1413,7 @@ mod control_tests {
             // The op simulates an uninterruptible stall (a FUSE sink
             // that never answers): it sleeps past the test and is
             // abandoned, never awaited.
-            let out = run_under_control(Instant::now() + Duration::from_secs(30), &cancel, || {
+            let out = run_under_control(Instant::now() + Duration::from_secs(30), &cancel, |_| {
                 std::thread::sleep(Duration::from_secs(30))
             })
             .unwrap();
@@ -1357,7 +1426,7 @@ mod control_tests {
     fn control_slow_op_deadline_mid_run() {
         let cancel = AtomicBool::new(false);
         let t0 = Instant::now();
-        let out = run_under_control(Instant::now() + Duration::from_millis(100), &cancel, || {
+        let out = run_under_control(Instant::now() + Duration::from_millis(100), &cancel, |_| {
             std::thread::sleep(Duration::from_secs(30))
         })
         .unwrap();
@@ -1418,7 +1487,7 @@ mod control_tests {
     #[test]
     fn control_panicking_worker_reports_lost() {
         let cancel = AtomicBool::new(false);
-        let out = run_under_control(Instant::now() + Duration::from_secs(30), &cancel, || {
+        let out = run_under_control(Instant::now() + Duration::from_secs(30), &cancel, |_| {
             panic!("r06 control probe panic")
         })
         .unwrap();
@@ -1445,7 +1514,7 @@ mod control_tests {
             let out = run_under_control(
                 Instant::now() + Duration::from_secs(30),
                 &cancel,
-                move || {
+                move |_| {
                     ran_c.store(true, Ordering::SeqCst);
                     42
                 },
@@ -1463,6 +1532,142 @@ mod control_tests {
         __test_set_setup_delay_ms(0);
         __test_set_control_worker_counter(None);
         assert!(!ran.load(Ordering::SeqCst), "abandoned op must not run");
+    }
+
+    #[test]
+    fn control_discarded_result_destroys_on_worker() {
+        // Fix round 3 / F1-PROOF: abandonment with a completed, unreceived
+        // result must destroy that result ON THE WORKER — never inline on
+        // the caller (a FUSE FLUSH inside that drop would hang setup). The
+        // interleaving is forced deterministically: the op reports
+        // completion, a helper orders cancel-before-proceed, and the caller
+        // waits on the poll gate before its first check — so the caller
+        // abandons with the result completed but unreceived, on every run.
+        // A drop probe records the destroying thread: on the former
+        // buffered channel this fails (drop on caller); with the rendezvous
+        // it passes (drop on worker).
+        use std::sync::Mutex;
+        use std::thread::ThreadId;
+
+        struct DropProbe {
+            dropper: std::sync::Arc<Mutex<Option<ThreadId>>>,
+        }
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                *self.dropper.lock().unwrap() = Some(std::thread::current().id());
+            }
+        }
+
+        let cancel = AtomicBool::new(false);
+        let caller = std::thread::current().id();
+        let op_done = std::sync::Arc::new(AtomicBool::new(false));
+        let proceed = std::sync::Arc::new(AtomicBool::new(false));
+        let worker_id = std::sync::Arc::new(Mutex::new(None));
+        let dropper = std::sync::Arc::new(Mutex::new(None));
+        let counter = std::sync::Arc::new(AtomicU32::new(0));
+        __test_set_poll_gate(Some(proceed.clone()));
+        __test_set_control_worker_counter(Some(counter.clone()));
+        let op_done_h = op_done.clone();
+        let proceed_h = proceed.clone();
+        let op_done_c = op_done.clone();
+        let worker_id_c = worker_id.clone();
+        let dropper_c = dropper.clone();
+        let out = std::thread::scope(|s| {
+            // Helper: order the abandonment strictly after the op
+            // completed. On a buffered channel the counter only advances
+            // past the send, so waiting for it proves the result queued
+            // before the caller abandoned. A rendezvous send stays blocked
+            // behind the gated caller instead, so this wait expires there
+            // (2s) — the assertions below stay deterministic either way:
+            // abandonment always precedes the receiver's destruction, and a
+            // rendezvous send can only fail once the receiver is gone.
+            s.spawn(|| {
+                let end = Instant::now() + Duration::from_secs(10);
+                while !op_done_h.load(Ordering::SeqCst) {
+                    assert!(Instant::now() < end, "worker op never completed");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                let end = Instant::now() + Duration::from_secs(2);
+                while counter.load(Ordering::SeqCst) < 1 {
+                    if Instant::now() >= end {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                cancel.store(true, Ordering::SeqCst);
+                proceed_h.store(true, Ordering::SeqCst);
+            });
+            run_under_control(
+                Instant::now() + Duration::from_secs(30),
+                &cancel,
+                move |_| {
+                    *worker_id_c.lock().unwrap() = Some(std::thread::current().id());
+                    let probe = DropProbe { dropper: dropper_c };
+                    op_done_c.store(true, Ordering::SeqCst);
+                    probe
+                },
+            )
+            .unwrap()
+        });
+        __test_set_poll_gate(None);
+        __test_set_control_worker_counter(None);
+        assert!(
+            matches!(out, Control::Cancelled),
+            "caller must abandon with the result unreceived"
+        );
+        // Bounded wait for the worker to finish (its drop precedes the
+        // count), then for the drop record itself.
+        let end = Instant::now() + Duration::from_secs(10);
+        while counter.load(Ordering::SeqCst) < 1 {
+            assert!(Instant::now() < end, "worker never finished");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let end = Instant::now() + Duration::from_secs(10);
+        while dropper.lock().unwrap().is_none() {
+            assert!(Instant::now() < end, "discarded result never destroyed");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let worker = worker_id.lock().unwrap().expect("op ran on a worker");
+        assert_ne!(worker, caller, "sanity: op ran off the caller");
+        assert_eq!(
+            dropper.lock().unwrap().expect("drop recorded"),
+            worker,
+            "discarded result must be destroyed on the worker, not the caller"
+        );
+    }
+
+    #[test]
+    fn staged_sink_truncates_when_live_skips_when_abandoned() {
+        // Fix round 3 / NEW, direct pin: the worker-side preparation op
+        // truncates a live setup's sink, and skips the destructive half —
+        // disposing the staged fd — once the abandonment fence is set.
+        let dir = std::env::temp_dir().join(format!("osslscope-trunc-pin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let live = dir.join("live.log");
+        let dead = dir.join("dead.log");
+        std::fs::write(&live, b"stale\n").unwrap();
+        std::fs::write(&dead, b"stale\n").unwrap();
+        let fence = AtomicBool::new(false);
+        let fd = open_and_truncate_pinned_sink(&live, &fence, 0).unwrap();
+        drop(fd);
+        assert_eq!(
+            std::fs::read(&live).unwrap(),
+            b"",
+            "live setup truncates its sink"
+        );
+        fence.store(true, Ordering::SeqCst);
+        let err = open_and_truncate_pinned_sink(&dead, &fence, 0).unwrap_err();
+        assert!(
+            err.to_string().contains("abandoned"),
+            "abandonment surfaces: {err:#}"
+        );
+        assert_eq!(
+            std::fs::read(&dead).unwrap(),
+            b"stale\n",
+            "abandoned setup truncates nothing"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
 
