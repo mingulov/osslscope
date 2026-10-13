@@ -8,14 +8,24 @@
 # check.yml never touch this file's live steps.
 #
 # The run is bounded (job timeout 30 min, duration/timeout/grace flags) and
-# uses the in-tree ordinary_ops_driver fixture: its LEDGER stdout is the
-# independent oracle (scripts/live-oracle.py, unit-tested on the host), and
-# the observer's v2 JSON must show the ledgered operation as >=1 executed
-# site with a matching candidate op id — a lower bound, since exact
-# provider-internal callback counts are implementation-defined per the
-# fixture contract (recorded, never asserted). A missing live capability is
-# a labeled SKIP in the job summary, never "capture passed"; a setup
-# failure is reported as setup failure, never as a capability skip.
+# uses the in-tree ordinary_ops_driver fixture: the workload's own stdout,
+# captured via --workload-out to known-n-workload.log, carries the LEDGER
+# lines that feed the independent oracle (scripts/live-oracle.py,
+# unit-tested on the host), and the observer's v2 JSON must show the
+# ledgered operation as >=1 executed site with a matching candidate op
+# id — a lower bound, since exact provider-internal callback counts are
+# implementation-defined per the fixture contract (recorded, never
+# asserted). Observer diagnostics stay in known-n-driver.log and are never
+# oracle input; the earlier fixture smoke (driver-smoke.txt) is not ledger
+# evidence either. The capability probe consumes doctor --format json plus
+# its process status: only allowlisted capability absences
+# (caps/kernel/lockdown/lsm) are a labeled SKIP, while artifact
+# incompatibility, malformed reports and abnormal exits are setup
+# failures, never skips. A missing live capability is a labeled SKIP in
+# the job summary, never "capture passed"; a setup failure is reported as
+# setup failure, never as a capability skip. A skip is not a passing
+# qualification window: required-runner qualification counts admitted
+# windows only.
 name: live-known-n
 on:
   workflow_dispatch:
@@ -56,12 +66,21 @@ jobs:
           ref: ${{ inputs.product_ref }}
       - name: Record revision (must be clean)
         id: rev
+        env:
+          MODE: ${{ steps.mode.outputs.mode }}
         run: |
           set -eu
           test -z "$(git status --porcelain)" || { echo "tree is dirty; refusing live run"; exit 1; }
           git rev-parse HEAD >product-ref.txt
           uname -r >kernel.txt
           cat product-ref.txt kernel.txt
+          {
+            echo "run: ${GITHUB_RUN_ID:-unknown}/${GITHUB_RUN_ATTEMPT:-unknown}"
+            echo "mode: $MODE"
+            echo "product: $(cat product-ref.txt)"
+            echo "kernel: $(cat kernel.txt)"
+          } >invocation.txt
+          cat invocation.txt
       - name: Build host + BPF (locked, bounded jobs)
         run: |
           set -eu
@@ -94,16 +113,89 @@ jobs:
           # User-owned prefix objects are never implicitly trusted: probe
           # with the same explicit flags the check step uses, or a capable
           # runner misclassifies as a capability skip on objects rows.
+          # Typed disposition (F13): the JSON report plus the process
+          # status decide. Only allowlisted capability absences skip;
+          # artifact incompatibility, malformed reports and abnormal
+          # exits are setup failures, never skips.
+          rc=0
           "$PFX/bin/osslscope" doctor \
             --object "$PFX/lib/osslscope/osslscope-harvest" \
             --count-object "$PFX/lib/osslscope/osslscope-count" \
-            >doctor.txt 2>&1 || true
-          cat doctor.txt
-          if grep -q 'verdict: ok' doctor.txt; then
-            echo "capable=true" >>"$GITHUB_OUTPUT"
-          else
-            echo "capable=false" >>"$GITHUB_OUTPUT"
-          fi
+            --format json \
+            >doctor.json 2>doctor.stderr || rc=$?
+          echo "$rc" >doctor-rc.txt
+          cat doctor.json 2>/dev/null || true
+          cat doctor.stderr 2>/dev/null || true
+          # BEGIN DOCTOR-DISPOSITION (executed verbatim by scripts/tests/test-live-workflow.sh)
+          python3 - "$rc" doctor.json <<'PYEOF'
+          import json
+          import os
+          import sys
+
+          # Allowlisted capability absences: the runner lacks live BPF
+          # capability (privilege, kernel features, lockdown, LSM
+          # denial). Every other failing check (objects-*, spawn-access,
+          # target rows, unknown ids) is a setup failure, never a skip.
+          ADMITTED_CAPABILITY_IDS = ("caps", "kernel", "lockdown", "lsm")
+
+          rc = int(sys.argv[1])
+          path = sys.argv[2]
+
+
+          def emit(verdict, reason):
+              line = "%s: %s" % (verdict, reason)
+              print("DOCTOR-DISPOSITION: " + line)
+              with open("doctor-disposition.txt", "w") as f:
+                  f.write(line + "\n")
+              if verdict in ("capable=true", "capable=false"):
+                  with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                      f.write(verdict + "\n")
+
+
+          def setup(reason):
+              emit("setup-failure", reason)
+              return 1
+
+
+          def main():
+              if rc not in (0, 4):
+                  return setup("doctor exited %d, want 0 (capable) or 4 (fail-closed); abnormal termination is setup failure, never a capability skip" % rc)
+              try:
+                  with open(path) as f:
+                      doc = json.load(f)
+              except (OSError, ValueError) as e:
+                  return setup("doctor report %s unreadable (%s)" % (path, e))
+              if not isinstance(doc, dict):
+                  return setup("doctor report is not a JSON object")
+              verdict = doc.get("verdict")
+              checks = doc.get("checks")
+              if verdict not in ("ok", "fail-closed") or not isinstance(checks, list):
+                  return setup("malformed doctor report (verdict=%r)" % (verdict,))
+              fails = sorted(
+                  (c.get("id") for c in checks if isinstance(c, dict) and c.get("status") == "fail"),
+                  key=lambda v: str(v),
+              )
+              if "exit" in doc and doc["exit"] != rc:
+                  return setup("doctor report exit %r disagrees with process status %d" % (doc["exit"], rc))
+              if verdict == "ok":
+                  if rc != 0 or fails:
+                      return setup("inconsistent ok report (rc=%d, failing=%s)" % (rc, fails))
+                  emit("capable=true", "verdict ok")
+                  return 0
+              if rc != 4:
+                  return setup("inconsistent fail-closed report (rc=%d)" % rc)
+              if not fails:
+                  return setup("fail-closed verdict with no failing check")
+              foreign = [i for i in fails if i not in ADMITTED_CAPABILITY_IDS]
+              if foreign:
+                  return setup("failing checks %s are not admitted capability absences (admitted: %s)" % (fails, list(ADMITTED_CAPABILITY_IDS)))
+              emit("capable=false", "admitted capability absence: %s" % (fails,))
+              return 0
+
+
+          sys.exit(main())
+          PYEOF
+          # END DOCTOR-DISPOSITION
       - name: Bounded live check (known workload)
         id: capture
         if: steps.probe.outputs.capable == 'true'
@@ -116,6 +208,11 @@ jobs:
           LIBCRYPTO="$(ldconfig -p 2>/dev/null | grep -m1 'libcrypto.so.3 ' | awk '{print $NF}')"
           test -n "$LIBCRYPTO" || { echo "no libcrypto.so.3 on lane; failing closed"; exit 4; }
           echo "libcrypto: $LIBCRYPTO" >lane-libcrypto.txt
+          # Ledger evidence (F12): the workload's own stdout carries
+          # LEDGER/ORDDONE into known-n-workload.log; observer
+          # diagnostics stay in known-n-driver.log. The oracle reads
+          # only this invocation's workload file, never observer
+          # output or the earlier fixture smoke.
           set +e
           "$PFX/bin/osslscope" check \
             --provider "$LIBCRYPTO" --builtin \
@@ -124,6 +221,7 @@ jobs:
             --deny-weak \
             --duration 30 --timeout 60 --grace 5 \
             --format json --out known-n.json \
+            --workload-out known-n-workload.log \
             run -- "${RUNNER_TEMP}/ordinary_ops_driver" "$MODE" \
             >known-n-driver.log 2>&1
           rc=$?
@@ -142,22 +240,27 @@ jobs:
           MODE: ${{ steps.mode.outputs.mode }}
         run: |
           set -eu
-          python3 scripts/live-oracle.py known-n-driver.log known-n.json "$MODE" >oracle.txt 2>&1
+          python3 scripts/live-oracle.py known-n-workload.log known-n.json "$MODE" >oracle.txt 2>&1
           rc=$?
           cat oracle.txt
           exit $rc
       - name: Upload live artifacts (pass, fail, or capability skip)
-        if: always() && steps.probe.outcome == 'success'
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: live-known-n-${{ steps.mode.outputs.mode }}
           path: |
             product-ref.txt
             kernel.txt
-            doctor.txt
+            invocation.txt
+            doctor.json
+            doctor.stderr
+            doctor-rc.txt
+            doctor-disposition.txt
             driver-smoke.txt
             lane-libcrypto.txt
             known-n-driver.log
+            known-n-workload.log
             known-n.json
             check-exit.txt
             oracle.txt
@@ -172,8 +275,11 @@ jobs:
             echo "- product: $(cat product-ref.txt 2>/dev/null || echo unknown)"
             echo "- kernel: $(cat kernel.txt 2>/dev/null || echo unknown)"
             if [ "${{ steps.probe.outcome }}" != "success" ]; then
-              echo "- SETUP FAILURE: an earlier step failed before the capability probe;"
+              echo "- SETUP FAILURE: an earlier step failed before or during the capability probe;"
               echo "  no capture was attempted and no observation is claimed."
+              if [ -f doctor-disposition.txt ]; then
+                echo "- disposition: $(cat doctor-disposition.txt)"
+              fi
             elif [ "${{ steps.probe.outputs.capable }}" = "true" ]; then
               echo "- doctor: verdict ok (live capability present)"
               echo "- check exit: $(cat check-exit.txt 2>/dev/null || echo unknown)"
@@ -185,12 +291,16 @@ jobs:
                 echo "- oracle: FAIL (see oracle.txt artifact)"
               fi
             else
-              echo "- SKIP(live-capability): doctor did not report verdict ok on this runner;"
+              echo "- SKIP(live-capability): admitted capability absence on this runner;"
               echo "  no capture was attempted and no observation is claimed."
+              echo "  (a skip is not a passing qualification window)"
+              if [ -f doctor-disposition.txt ]; then
+                echo "- disposition: $(cat doctor-disposition.txt)"
+              fi
             fi
           } >>"$GITHUB_STEP_SUMMARY"
           if [ "${{ steps.probe.outcome }}" != "success" ]; then
-            echo "SETUP FAILURE before probe; see summary"
+            echo "SETUP FAILURE before or during probe; see summary"
             exit 1
           elif [ "${{ steps.probe.outputs.capable }}" != "true" ]; then
             echo "SKIP(live-capability): no live observation; see summary"
