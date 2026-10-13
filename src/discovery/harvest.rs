@@ -36,11 +36,11 @@ pub(crate) const LEGACY_COOKIE: u64 = 1;
 pub fn build_alg_entries() -> anyhow::Result<Vec<(u64, wire::AlgClassValue)>> {
     let mut out: Vec<(u64, wire::AlgClassValue)> = Vec::new();
     let mut seen: HashSet<u64> = HashSet::new();
-    // Group ids (H3): first-appearance order over the frozen
-    // registry — deterministic, BPF-internal (only the mixed
-    // flag leaves the kernel, so the ids need no stability
-    // contract beyond a single table build).
-    let mut groups: HashMap<&str, u16> = HashMap::new();
+    // Semantic ids (R01): verified equivalence from
+    // `kinds::algorithm_semantic_id` — deterministic, BPF-internal
+    // (only the mixed flag leaves the kernel). Synonyms share one
+    // id so multi-spelling lists stay OK; distinct algorithms —
+    // even in one macro family — mix.
     let mut push = |name: &str, class: u16, weak: bool, canon: u16| -> anyhow::Result<()> {
         if name.len() > wire::MAX_ALG_NAME {
             anyhow::bail!("registry name over kernel cap: {name:?}");
@@ -72,8 +72,8 @@ pub fn build_alg_entries() -> anyhow::Result<Vec<(u64, wire::AlgClassValue)>> {
         if class == wire::OTHER_CLASS {
             anyhow::bail!("registry exceeds class id space");
         }
-        let next = groups.len() as u16;
-        let canon = *groups.entry(a.group).or_insert(next);
+        let canon = crate::kinds::algorithm_semantic_id(a.name)
+            .ok_or_else(|| anyhow::anyhow!("registry name has no semantic id: {0:?}", a.name))?;
         push(a.name, class, crate::kinds::is_weak_alg(a.name), canon)?;
     }
     for w in crate::kinds::WEAK_ALGS {
