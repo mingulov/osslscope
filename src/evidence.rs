@@ -616,11 +616,13 @@ pub enum EngineWindow {
 }
 
 /// One typed ENGINE tripwire observation (R05/F06): the pinned
-/// tripwire attach identity ([`SiteKey`] of the probe stub in the
-/// bound libcrypto), the tripwire binding `generation` (0 = first
-/// bind; +1 per install — provenance, never fabricated), the
-/// `entrypoint` index into the frozen [`crate::kinds::ENGINE`]
-/// registry, and the observed `calls` with their [`EngineWindow`].
+/// tripwire attach identity ([`SiteKey`] of the probe stub in its
+/// own module — caller-attributed PLT stubs attach through each
+/// module's own pin, never through libcrypto), the tripwire binding
+/// `generation` (0 = first bind; +1 per install — provenance, never
+/// fabricated), the `entrypoint` index into the frozen
+/// [`crate::kinds::ENGINE`] registry, and the observed `calls` with
+/// their [`EngineWindow`].
 /// Trip counters are untimed by construction (hits carry no
 /// timestamps), so there are no first/last fields: the window
 /// binding is the certainty. Field order defines the total document

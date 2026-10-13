@@ -250,6 +250,28 @@ pub struct TripwireDelta {
     pub executed_legacy_queries_delta: u64,
 }
 
+/// One tripwire module's pinned attach identity (R05/F-R05-1):
+/// the (dev-string, ino) the module's uprobe links bound through
+/// their own pin at install time. Caller-module PLT stubs attach
+/// through each module's own pin, never through libcrypto's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TripModulePin {
+    pub module: String,
+    pub dev: String,
+    pub ino: u64,
+}
+
+/// One retired binding's fenced tripwire increment (R05/F-R05-3):
+/// counter news drained from the `TRIP` map under the retired
+/// generation BEFORE replacement installed the new binding, so it
+/// can never join the new binding's probe meanings.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetiredTripDelta {
+    pub generation: u64,
+    pub cookie: u64,
+    pub count: u64,
+}
+
 /// One link-installation outcome this poll.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AttachEvent {
@@ -305,6 +327,14 @@ pub struct DiscoveryDelta {
     /// the first tripwire bind, +1 per install. Counter deltas in
     /// [`TripwireDelta`] key per (generation, cookie) downstream.
     pub trip_generation: u64,
+    /// Pinned attach identity per tripwire module live this poll
+    /// (R05/F-R05-1): each probe's `module` resolves here, never
+    /// to libcrypto. Empty until the first bind.
+    pub trip_module_pins: Vec<TripModulePin>,
+    /// Retired-binding tripwire news fenced before replacement
+    /// (R05/F-R05-3): (generation, cookie, count) drained under
+    /// the old generation in a replacement poll. Empty otherwise.
+    pub retired_trip_deltas: Vec<RetiredTripDelta>,
     /// Losses incurred this poll (host + kernel increments).
     pub losses: Vec<DiscoveryLoss>,
     /// Query/load counter increment — arrivals, NOT execution.
@@ -523,6 +553,13 @@ pub trait SessionEnv {
         pid: u32,
         maps: &[maps::Mapping],
     ) -> anyhow::Result<Option<String>>;
+    /// Pinned attach identity per tripwire module from the last
+    /// successful `install_trips` (R05/F-R05-1): each module's own
+    /// pin, in install order. Default empty (test envs override
+    /// with scripted pins; the live env records real fstats).
+    fn last_trip_pins(&self) -> Vec<TripModulePin> {
+        Vec::new()
+    }
     /// Plan legacy tripwires against `maps`: `None` when
     /// libcrypto is not mapped (blind — the core retries on later
     /// polls as mappings appear).
@@ -890,6 +927,16 @@ pub struct SessionCore {
     /// so a replacement can never join two bindings' probes into
     /// one observation row.
     trip_generation: u64,
+    /// Pinned attach identity per tripwire module (R05/F-R05-1):
+    /// module path → (dev-string, ino) from each module's own pin
+    /// at install time. Refreshed on every install.
+    trip_module_pins: HashMap<String, (String, u64)>,
+    /// Retired-binding fence failed this poll (R05/F-R05-3): the
+    /// pre-replacement `TRIP` drain hit a snapshot failure, so the
+    /// later full join's increments mix retired and new bindings
+    /// inseparably and must be refused (dropped as loud loss),
+    /// never attributed to the new generation.
+    trip_unfenced: bool,
     /// Blind latch (F-D/A11): a changed-mapping replacement
     /// declined re-attach; planning resumes when the libcrypto
     /// fingerprint differs from the latch print (bounded reads).
@@ -1002,6 +1049,8 @@ impl SessionCore {
             trip_live: false,
             trip_bound: None,
             trip_generation: 0,
+            trip_module_pins: HashMap::new(),
+            trip_unfenced: false,
             trip_blind: false,
             trip_blind_print: None,
             legacy_note: None,
@@ -1108,6 +1157,16 @@ impl SessionCore {
         self.trip_bound = set.libcrypto.clone();
         self.trip_live = true;
         self.probe_set = Some(set);
+    }
+
+    /// Record attach-time tripwire module pins (R05/F-R05-1):
+    /// the caller pulls `env.last_trip_pins()` after a successful
+    /// attach-time `install_trips` and hands them here.
+    pub(crate) fn set_trip_pins(&mut self, pins: Vec<TripModulePin>) {
+        self.trip_module_pins = pins
+            .into_iter()
+            .map(|p| (p.module, (p.dev, p.ino)))
+            .collect();
     }
 
     /// Next installable generation for an array (M2 high-water):
@@ -1619,6 +1678,8 @@ impl SessionCore {
         self.staged_trips = None;
         self.trip_live = false;
         self.trip_bound = None;
+        self.trip_module_pins.clear();
+        self.trip_unfenced = false;
         self.trip_blind = false;
         self.trip_blind_print = None;
         self.legacy_note = None;
@@ -1845,7 +1906,45 @@ impl SessionCore {
         // F-D/A11: validate anchor bindings before planning or
         // installing anything — replacement invalidates pins, and
         // stale links must detach before fresh ones attach.
+        let pre_trip_live = self.trip_live;
+        let pre_trip_generation = self.trip_generation;
         self.reconcile_anchors(env, &maps, &mut delta);
+        // R05/F-R05-3: fence the retired binding BEFORE any
+        // replacement install. The `TRIP` map is cumulative per
+        // cookie; draining it now attributes unread increments to
+        // the retired generation instead of the new binding's
+        // fresh probe meanings. A failed drain refuses attribution
+        // (loud snapshot loss; the later full join advances past
+        // the ambiguous counts without emitting them).
+        if pre_trip_live && !self.trip_live {
+            let snap = env.join_maps();
+            if snap.trip_failed || snap.lgcalls_failed {
+                self.tracker.note_map_snapshot();
+                // Refuse attribution: the later full join's
+                // increments are generation-ambiguous.
+                self.trip_unfenced = true;
+            } else {
+                let mut retired: Vec<RetiredTripDelta> = Vec::new();
+                for (cookie, n) in &snap.trip {
+                    let last = self.trip_joined.get(cookie).copied().unwrap_or(0);
+                    if *n > last {
+                        retired.push(RetiredTripDelta {
+                            generation: pre_trip_generation,
+                            cookie: *cookie,
+                            count: *n - last,
+                        });
+                        self.trip_joined.insert(*cookie, *n);
+                    }
+                }
+                retired.sort_by(|a, b| (a.generation, a.cookie).cmp(&(b.generation, b.cookie)));
+                delta.retired_trip_deltas = retired;
+                if snap.lgcalls > self.lgcalls_joined {
+                    delta.tripwire.executed_legacy_queries_delta =
+                        snap.lgcalls.saturating_sub(self.lgcalls_joined);
+                    self.lgcalls_joined = snap.lgcalls;
+                }
+            }
+        }
 
         // Turnover reconcile BEFORE the drain (F-H/H1): a replaced
         // array retires and rebirths here — bumping `GEN[arr]` —
@@ -1952,6 +2051,13 @@ impl SessionCore {
                             self.trip_generation = self.trip_generation.saturating_add(1);
                         }
                         self.trip_bound = set.libcrypto.clone();
+                        // R05/F-R05-1: retain each module's own
+                        // pinned identity from this install.
+                        self.trip_module_pins = env
+                            .last_trip_pins()
+                            .into_iter()
+                            .map(|p| (p.module, (p.dev, p.ino)))
+                            .collect();
                         self.trip_live = true;
                         self.trip_blind = false;
                         self.probe_set = Some(set);
@@ -2319,6 +2425,19 @@ impl SessionCore {
         // adapter's object registry, which typed ENGINE
         // observations join at assembly).
         delta.trip_generation = self.trip_generation;
+        // R05/F-R05-1: the live binding's per-module pins ride
+        // every poll (capture snapshots them per generation).
+        let mut pins: Vec<TripModulePin> = self
+            .trip_module_pins
+            .iter()
+            .map(|(module, (dev, ino))| TripModulePin {
+                module: module.clone(),
+                dev: dev.clone(),
+                ino: *ino,
+            })
+            .collect();
+        pins.sort_by(|a, b| a.module.cmp(&b.module));
+        delta.trip_module_pins = pins;
         if let Some((path, dev, ino)) = self.trip_bound.clone()
             && self.seen_objects.insert((dev.clone(), ino))
         {
@@ -2329,6 +2448,26 @@ impl SessionCore {
             };
             self.objects.push(obj.clone());
             delta.objects.push(obj);
+        }
+        // R05/F-R05-1: each pinned tripwire module is an observed
+        // code object too (first sighting only) — caller-attributed
+        // ENGINE observations join their own module here.
+        let mut modules: Vec<(String, String, u64)> = self
+            .trip_module_pins
+            .iter()
+            .map(|(module, (dev, ino))| (module.clone(), dev.clone(), *ino))
+            .collect();
+        modules.sort();
+        for (module, dev, ino) in modules {
+            if self.seen_objects.insert((dev.clone(), ino)) {
+                let obj = DiscoveredObject {
+                    dev,
+                    ino,
+                    display_locator: module,
+                };
+                self.objects.push(obj.clone());
+                delta.objects.push(obj);
+            }
         }
 
         self.last_links = env.link_counts();
@@ -2399,6 +2538,25 @@ impl SessionCore {
                 }
             }
         }
+        // R05/F-R05-3: an unfenced replacement refuses TRIP
+        // attribution for this join (the increments mix retired
+        // and new bindings). High-water advances past the
+        // ambiguous counts so later polls start clean; the loss
+        // was already noted at the failed fence.
+        if self.trip_unfenced {
+            self.trip_unfenced = false;
+            for (cookie, n) in &snap.trip {
+                let last = self.trip_joined.get(cookie).copied().unwrap_or(0);
+                if *n > last {
+                    self.trip_joined.insert(*cookie, *n);
+                }
+            }
+            if snap.lgcalls > self.lgcalls_joined {
+                self.lgcalls_joined = snap.lgcalls;
+            }
+            delta.tripwire.counter_deltas.sort_unstable();
+            return;
+        }
         let joined: HashMap<u64, u64> = snap.trip.iter().copied().collect();
         for (cookie, n) in &joined {
             let last = self.trip_joined.get(cookie).copied().unwrap_or(0);
@@ -2409,7 +2567,12 @@ impl SessionCore {
         }
         delta.tripwire.counter_deltas.sort_unstable();
         if snap.lgcalls > self.lgcalls_joined {
-            delta.tripwire.executed_legacy_queries_delta = snap.lgcalls - self.lgcalls_joined;
+            // Accumulate: a replacement poll's pre-drain may have
+            // already banked the retired lgcalls increment above.
+            delta.tripwire.executed_legacy_queries_delta = delta
+                .tripwire
+                .executed_legacy_queries_delta
+                .saturating_add(snap.lgcalls - self.lgcalls_joined);
             self.lgcalls_joined = snap.lgcalls;
         }
     }
@@ -3247,13 +3410,15 @@ fn attach_pair(
 }
 
 /// Attach legacy tripwires: one multi link per (module, program)
-/// with the probes' offsets + cookies batched.
+/// with the probes' offsets + cookies batched. Returns each
+/// distinct module's pinned attach identity (R05/F-R05-1) in
+/// sorted module order.
 fn attach_trips(
     loaded: &Loaded,
     links: &mut LinkSet,
     set: &legacy::ProbeSet,
     pid: u32,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<TripModulePin>> {
     type OffsetsCookies = (Vec<u64>, Vec<u64>);
     let mut groups: HashMap<(&str, &str), OffsetsCookies> = HashMap::new();
     for p in &set.probes {
@@ -3263,6 +3428,7 @@ fn attach_trips(
     }
     let mut keys: Vec<(&str, &str)> = groups.keys().copied().collect();
     keys.sort_unstable();
+    let mut pins: Vec<TripModulePin> = Vec::new();
     for (module, prog_name) in keys {
         let (offsets, cookies) = &groups[&(module, prog_name)];
         // H4: pin the module (open, bounded retries) and attach
@@ -3284,9 +3450,17 @@ fn attach_trips(
             pid,
         )
         .map_err(|e| anyhow!("attach {prog_name}@{module}+{}: {e}", offsets.len()))?;
+        if !pins.iter().any(|p: &TripModulePin| p.module == module) {
+            pins.push(TripModulePin {
+                module: module.to_string(),
+                dev: crate::plan::render_device(pin.device),
+                ino: pin.ino,
+            });
+        }
         links.push(link, pin.fd, LinkKind::Tripwire, cookies.clone());
     }
-    Ok(())
+    pins.sort_by(|a, b| a.module.cmp(&b.module));
+    Ok(pins)
 }
 
 /// Load the frozen harvest shape: `prepare` asserts dims vs the
@@ -3641,6 +3815,9 @@ pub struct LiveEnv {
     /// re-resolves with the same flavor/table/flags as attach.
     /// `None` when attach installed no dispatch anchor.
     dispatch_spec: Option<DispatchSpec>,
+    /// Pinned tripwire module identities from the last successful
+    /// `install_trips` (R05/F-R05-1).
+    last_trip_pins: Vec<TripModulePin>,
 }
 
 /// Dispatch anchor recipe retained for post-replacement
@@ -3797,7 +3974,8 @@ impl SessionEnv for LiveEnv {
                 .into());
             }
         }
-        attach_trips(&self.loaded, &mut self.links, set, pid)?;
+        let pins = attach_trips(&self.loaded, &mut self.links, set, pid)?;
+        self.last_trip_pins = pins;
         eprintln!("INSPECT stage=legacy trips={}", set.probes.len());
         let mut note = None;
         if let Some(lc_path) = legacy::find_libcrypto(maps) {
@@ -3837,6 +4015,10 @@ impl SessionEnv for LiveEnv {
             }
         }
         Ok(note)
+    }
+
+    fn last_trip_pins(&self) -> Vec<TripModulePin> {
+        self.last_trip_pins.clone()
     }
 
     fn plan_trips(&mut self, maps: &[maps::Mapping]) -> anyhow::Result<Option<legacy::ProbeSet>> {
@@ -4275,6 +4457,7 @@ impl DiscoverySession {
             ring,
             pin,
             dispatch_spec,
+            last_trip_pins: Vec::new(),
         };
 
         // Legacy tripwires (dispatch-independent: attach even when
@@ -4287,7 +4470,9 @@ impl DiscoverySession {
                 Some(maps0) if legacy::find_libcrypto(&maps0).is_some() => {
                     if let Some(set) = env.plan_trips(&maps0)? {
                         let note = env.install_trips(&set, pid, &maps0)?;
+                        let pins = env.last_trip_pins();
                         core.adopt_legacy_plan(set, note);
+                        core.set_trip_pins(pins);
                     }
                 }
                 Some(_) => {
@@ -4505,6 +4690,14 @@ mod tests {
         /// Scripted ring events, popped in order by `next_event`
         /// (P6: close-time tail-join tests).
         events: VecDeque<Vec<u8>>,
+        /// Scripted tripwire module pins returned by
+        /// `last_trip_pins` (R05/F-R05-1).
+        trip_pins: Vec<TripModulePin>,
+        /// Scripted `TRIP` map contents returned by `join_maps`
+        /// (R05/F-R05-3): cookie → cumulative hits.
+        trip_map: Vec<(u64, u64)>,
+        /// Scripted `LGCALLS` sum returned by `join_maps`.
+        lgcalls_map: u64,
     }
 
     impl MiniEnv {
@@ -4526,6 +4719,9 @@ mod tests {
                 pin_ok: true,
                 provider_stat: None,
                 events: VecDeque::new(),
+                trip_pins: Vec::new(),
+                trip_map: Vec::new(),
+                lgcalls_map: 0,
             }
         }
     }
@@ -4544,7 +4740,11 @@ mod tests {
         }
 
         fn join_maps(&mut self) -> MapSnapshots {
-            MapSnapshots::default()
+            MapSnapshots {
+                trip: self.trip_map.clone(),
+                lgcalls: self.lgcalls_map,
+                ..MapSnapshots::default()
+            }
         }
 
         fn install_stage2(
@@ -4573,6 +4773,10 @@ mod tests {
             self.trip_installs += 1;
             self.last_install_maps = maps.to_vec();
             Ok(None)
+        }
+
+        fn last_trip_pins(&self) -> Vec<TripModulePin> {
+            self.trip_pins.clone()
         }
 
         fn plan_trips(
@@ -4720,6 +4924,75 @@ mod tests {
         let d2 = core.poll(&mut env, a11_budget()).unwrap();
         assert_eq!(d2.trip_generation, 1);
         assert!(d2.objects.is_empty(), "object emits once: {:?}", d2.objects);
+    }
+
+    #[test]
+    fn trip_pins_ride_delta_and_emit_caller_objects() {
+        // F-R05-1: the live binding's per-module pins ride every
+        // poll and each pinned module emits as an observed object
+        // (first sighting only) alongside libcrypto.
+        let mut env = MiniEnv::new();
+        env.maps = vec![lc_mapping(100)];
+        env.plan = Some(trip_set(100, &[0x100]));
+        env.trip_pins = vec![TripModulePin {
+            module: "/app/target".to_string(),
+            dev: "08:01".to_string(),
+            ino: 300,
+        }];
+        let mut core = a11_core();
+        let d1 = core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(d1.trip_generation, 0);
+        assert_eq!(d1.trip_module_pins, env.trip_pins);
+        assert_eq!(d1.objects.len(), 2);
+        assert!(d1.objects.iter().any(|o| o.ino == 100));
+        assert!(
+            d1.objects
+                .iter()
+                .any(|o| o.ino == 300 && o.display_locator == "/app/target")
+        );
+        let d2 = core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(d2.trip_module_pins, env.trip_pins);
+        assert!(d2.objects.is_empty());
+    }
+
+    #[test]
+    fn trip_replacement_fences_retired_counts() {
+        // F-R05-3: five unread gen-0 hits followed by replacement
+        // and zero new hits drain under gen 0 (retired) instead of
+        // joining gen 1's fresh probe meanings.
+        let mut env = MiniEnv::new();
+        env.maps = vec![lc_mapping(100)];
+        env.plan = Some(trip_set(100, &[0x100, 0x200]));
+        let mut core = a11_core();
+        core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(core.trip_generation, 0);
+        // Five hits accrue under gen 0 but are not yet joined.
+        env.trip_map = vec![(7, 5), (8, 0)];
+        // Replacement: same path, new inode, identical mapping.
+        env.maps = vec![lc_mapping(200)];
+        env.plan = Some(trip_set(200, &[0x110, 0x220]));
+        let delta = core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(env.trip_detaches, 1);
+        assert_eq!(env.trip_installs, 2);
+        assert_eq!(delta.trip_generation, 1);
+        assert_eq!(
+            delta.retired_trip_deltas,
+            vec![RetiredTripDelta {
+                generation: 0,
+                cookie: 7,
+                count: 5,
+            }]
+        );
+        assert!(
+            delta.tripwire.counter_deltas.is_empty(),
+            "no new-gen deltas without new hits: {:?}",
+            delta.tripwire.counter_deltas
+        );
+        // The next poll with no further hits stays silent on both
+        // planes (high-water held — no double report).
+        let d3 = core.poll(&mut env, a11_budget()).unwrap();
+        assert!(d3.retired_trip_deltas.is_empty());
+        assert!(d3.tripwire.counter_deltas.is_empty());
     }
 
     fn a11_budget() -> PollBudget {

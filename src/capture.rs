@@ -1403,6 +1403,11 @@ pub struct AdaptedDelta {
     /// replacement can never join two bindings' probes into one
     /// observation row.
     pub trip_generation: u64,
+    /// Retired-binding tripwire news fenced before replacement
+    /// (R05/F-R05-3): (generation, cookie, count) already keyed to
+    /// the retired generation. Empty on non-replacement polls and
+    /// on the baselining poll.
+    pub retired_trip: Vec<crate::discovery::session::RetiredTripDelta>,
     pub trigger_observed: bool,
 }
 
@@ -1997,7 +2002,142 @@ pub fn adapt_delta(
             Some(delta.tripwire.clone())
         },
         trip_generation: delta.trip_generation,
+        retired_trip: if ctx.baseline {
+            Vec::new()
+        } else {
+            delta.retired_trip_deltas.clone()
+        },
         trigger_observed: delta.trigger_observed,
+    }
+}
+
+/// Typed ENGINE observation collector (R05): the production
+/// accumulation path shared by the capture controller and
+/// acceptance tests. Per-poll, the caller snapshots the live
+/// binding's probe meanings + module pins once per generation
+/// ([`snapshot_binding`](Self::snapshot_binding)), then accumulates
+/// that poll's in-window counter news under its generation
+/// ([`accumulate`](Self::accumulate)). At assembly,
+/// [`build`](Self::build) joins counts to meanings + pins +
+/// fingerprinted objects. Baseline/straddle gating stays with the
+/// caller (only in-window news reaches `accumulate`).
+#[derive(Debug, Default)]
+pub struct EngineCollector {
+    counts: HashMap<(u64, u64), u64>,
+    probes: HashMap<u64, legacy::ProbeSet>,
+    pins: HashMap<u64, HashMap<String, (u64, u64)>>,
+    probed_generation: Option<u64>,
+}
+
+impl EngineCollector {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Snapshot a bound generation's probe meanings + module pins
+    /// (once per generation). An absent binding consumes nothing.
+    pub fn snapshot_binding(
+        &mut self,
+        generation: u64,
+        probe_set: Option<legacy::ProbeSet>,
+        module_pins: &[crate::discovery::session::TripModulePin],
+    ) {
+        if self.probed_generation != Some(generation) {
+            if let Some(set) = probe_set {
+                self.probed_generation = Some(generation);
+                let mut pins: HashMap<String, (u64, u64)> = HashMap::new();
+                for p in module_pins {
+                    if let Some(device) = plan::device_id_of_dev_str(&p.dev) {
+                        pins.insert(p.module.clone(), (device, p.ino));
+                    }
+                }
+                self.pins.insert(generation, pins);
+                self.probes.insert(generation, set);
+            }
+        }
+    }
+
+    /// Accumulate one in-window poll's counter news under its
+    /// generation, plus any retired-binding news already keyed to
+    /// the retired generation.
+    pub fn accumulate(
+        &mut self,
+        generation: u64,
+        counter_deltas: &[(u64, u64)],
+        retired: &[crate::discovery::session::RetiredTripDelta],
+    ) {
+        for (cookie, n) in counter_deltas {
+            let slot = self.counts.entry((generation, *cookie)).or_default();
+            *slot = slot.saturating_add(*n);
+        }
+        for r in retired {
+            let slot = self.counts.entry((r.generation, r.cookie)).or_default();
+            *slot = slot.saturating_add(r.count);
+        }
+    }
+
+    /// Join accumulated counts to probe meanings + pinned module
+    /// identities + fingerprinted objects. Returns the observations
+    /// plus the ENGINE increments with no joinable provenance.
+    pub fn build(&self, objects: &[ObjectRecord]) -> (Vec<EngineObservation>, u64) {
+        let mut out = Vec::new();
+        let mut unkeyed = 0u64;
+        for ((generation, cookie), n) in &self.counts {
+            if *n == 0 {
+                continue;
+            }
+            let mut reject = || {
+                unkeyed = unkeyed.saturating_add(*n);
+            };
+            let Some(set) = self.probes.get(generation) else {
+                reject();
+                continue;
+            };
+            let Some(probe) = set.probes.iter().find(|p| p.cookie == *cookie) else {
+                reject();
+                continue;
+            };
+            if probe.family.is_some() || set.load_cookies.contains(cookie) {
+                continue;
+            }
+            let Some(entrypoint) = evidence::engine_index(&probe.symbol) else {
+                continue;
+            };
+            let Some(pins) = self.pins.get(generation) else {
+                reject();
+                continue;
+            };
+            let Some((device, ino)) = pins.get(&probe.module) else {
+                reject();
+                continue;
+            };
+            let mut matches: Vec<&ObjectRecord> = objects
+                .iter()
+                .filter(|o| o.device == *device && o.inode == *ino)
+                .collect();
+            matches.sort_by(|a, b| {
+                (!a.id.0.starts_with("build:"), &a.id.0)
+                    .cmp(&(!b.id.0.starts_with("build:"), &b.id.0))
+            });
+            let Some(record) = matches.first() else {
+                reject();
+                continue;
+            };
+            out.push(EngineObservation {
+                key: SiteKey {
+                    object: record.id.clone(),
+                    device: *device,
+                    inode: *ino,
+                    offset: probe.offset,
+                },
+                generation: *generation,
+                entrypoint,
+                calls: *n,
+                window: EngineWindow::InWindow,
+            });
+        }
+        out.sort();
+        (out, unkeyed)
     }
 }
 
@@ -2079,16 +2219,11 @@ struct Runner<'x, D, B: CountBackend, T, L, C: ClockPort, P: ProcPort> {
     in_window_trip: HashMap<u64, u64>,
     in_window_hits: Vec<legacy::TripHit>,
     in_window_lgcalls: u64,
-    /// Typed ENGINE observation accumulators (R05): in-window
-    /// tripwire counts keyed per (binding generation, cookie),
-    /// plus the probe-meaning snapshot per generation (captured
-    /// when the generation first appears — installs are rare, so
-    /// retention is bounded by poll count like the polls
-    /// themselves). The cookie-keyed `in_window_trip` above is
-    /// untouched (legacy block + fallback parity).
-    engine_counts: HashMap<(u64, u64), u64>,
-    engine_probes: HashMap<u64, legacy::ProbeSet>,
-    engine_probed_generation: Option<u64>,
+    /// Typed ENGINE observation collector (R05): the shared
+    /// production accumulation path (see [`EngineCollector`]). The
+    /// cookie-keyed `in_window_trip` above is untouched (legacy
+    /// block + fallback parity).
+    engine_collector: EngineCollector,
     /// Window-straddling poll deltas (F-D/A10): a discovery poll
     /// that completes at/after the loop deadline contributes
     /// window-ambiguous tripwire/query counts — explicit loss, never
@@ -2396,15 +2531,14 @@ where
     ) -> anyhow::Result<(bool, bool)> {
         let exhausted = delta.budget_exhausted;
         let adapted = adapt_delta(&mut self.adapter, delta, ctx);
-        // R05: snapshot tripwire probe meanings when the binding
-        // generation turns over (once per generation; a generation
-        // with no plan records nothing and snapshots no further).
-        if self.engine_probed_generation != Some(delta.trip_generation) {
-            self.engine_probed_generation = Some(delta.trip_generation);
-            if let Some(set) = self.discovery.snapshot().legacy.set {
-                self.engine_probes.insert(delta.trip_generation, set);
-            }
-        }
+        // R05: snapshot the live binding's probe meanings + pins
+        // through the shared collector (absent bindings consume
+        // nothing — see `EngineCollector`).
+        self.engine_collector.snapshot_binding(
+            delta.trip_generation,
+            self.discovery.snapshot().legacy.set,
+            &delta.trip_module_pins,
+        );
         self.activity.extend(adapted.activity);
         self.cold_gap_queries = self
             .cold_gap_queries
@@ -2425,21 +2559,45 @@ where
                     .straddling_lgcalls
                     .saturating_add(trip.executed_legacy_queries_delta);
             } else {
-                for (cookie, n) in trip.counter_deltas {
-                    let slot = self.in_window_trip.entry(cookie).or_default();
-                    *slot = slot.saturating_add(n);
-                    // R05: the same evidence keyed per binding
-                    // generation for the typed ENGINE plane.
-                    let eslot = self
-                        .engine_counts
-                        .entry((adapted.trip_generation, cookie))
-                        .or_default();
-                    *eslot = eslot.saturating_add(n);
+                for (cookie, n) in &trip.counter_deltas {
+                    let slot = self.in_window_trip.entry(*cookie).or_default();
+                    *slot = slot.saturating_add(*n);
                 }
+                // R05: the same evidence through the shared
+                // collector for the typed ENGINE plane.
+                self.engine_collector.accumulate(
+                    adapted.trip_generation,
+                    &trip.counter_deltas,
+                    &[],
+                );
                 self.in_window_hits.extend(trip.hits.iter());
                 self.in_window_lgcalls = self
                     .in_window_lgcalls
                     .saturating_add(trip.executed_legacy_queries_delta);
+            }
+        }
+        // R05/F-R05-3: retired-binding news already carries its
+        // generation. In-window polls accumulate it under the
+        // retired generation (plus the cookie-keyed legacy
+        // ledger for parity); straddled polls shed it as
+        // window-ambiguous loss, never evidence.
+        if !adapted.retired_trip.is_empty() {
+            let straddled = deadline.is_some_and(|d| poll_end >= d);
+            if straddled {
+                for r in &adapted.retired_trip {
+                    let slot = self.straddling_trip.entry(r.cookie).or_default();
+                    *slot = slot.saturating_add(r.count);
+                }
+            } else {
+                for r in &adapted.retired_trip {
+                    let slot = self.in_window_trip.entry(r.cookie).or_default();
+                    *slot = slot.saturating_add(r.count);
+                }
+                self.engine_collector.accumulate(
+                    adapted.trip_generation,
+                    &[],
+                    &adapted.retired_trip,
+                );
             }
         }
         self.trigger_observed |= adapted.trigger_observed;
@@ -2466,81 +2624,10 @@ where
         Ok((exhausted, report.candidates_changed))
     }
 
-    /// Build typed ENGINE observations (R05) from per-(generation,
-    /// cookie) in-window tripwire counts: join each count to its
-    /// generation's probe meaning (symbol → registry entrypoint,
-    /// stub offset) and the binding's libcrypto identity to a
-    /// fingerprinted object record. Returns the observations plus
-    /// the in-window ENGINE increments that carried no joinable
-    /// provenance (loud loss at the call site — the legacy block
-    /// still shows them, so no evidence goes silent). Other
-    /// planes (low-level families, loads, meth) route here but
-    /// are not ENGINE observations: skipped, never inferred.
+    /// Build typed ENGINE observations (R05) through the shared
+    /// collector over the adapter's fingerprinted objects.
     fn build_engine_observations(&self) -> (Vec<EngineObservation>, u64) {
-        let mut out = Vec::new();
-        let mut unkeyed = 0u64;
-        for ((generation, cookie), n) in &self.engine_counts {
-            if *n == 0 {
-                continue;
-            }
-            let mut reject = || {
-                unkeyed = unkeyed.saturating_add(*n);
-            };
-            let Some(set) = self.engine_probes.get(generation) else {
-                reject();
-                continue;
-            };
-            let Some(probe) = set.probes.iter().find(|p| p.cookie == *cookie) else {
-                reject();
-                continue;
-            };
-            // Other planes stay out (their counts live in the
-            // legacy block, not the ENGINE plane).
-            if probe.family.is_some() || set.load_cookies.contains(cookie) {
-                continue;
-            }
-            let Some(entrypoint) = evidence::engine_index(&probe.symbol) else {
-                continue;
-            };
-            let Some((_, dev_str, ino)) = set.libcrypto.as_ref() else {
-                reject();
-                continue;
-            };
-            let Some(device) = plan::device_id_of_dev_str(dev_str) else {
-                reject();
-                continue;
-            };
-            // B-5 doubles (one file under `build:` + `unverified:`
-            // ids) resolve to the verified id; deterministic order.
-            let mut matches: Vec<&ObjectRecord> = self
-                .adapter
-                .objects
-                .iter()
-                .filter(|o| o.device == device && o.inode == *ino)
-                .collect();
-            matches.sort_by(|a, b| {
-                (!a.id.0.starts_with("build:"), &a.id.0)
-                    .cmp(&(!b.id.0.starts_with("build:"), &b.id.0))
-            });
-            let Some(record) = matches.first() else {
-                reject();
-                continue;
-            };
-            out.push(EngineObservation {
-                key: SiteKey {
-                    object: record.id.clone(),
-                    device,
-                    inode: *ino,
-                    offset: probe.offset,
-                },
-                generation: *generation,
-                entrypoint,
-                calls: *n,
-                window: EngineWindow::InWindow,
-            });
-        }
-        out.sort();
-        (out, unkeyed)
+        self.engine_collector.build(&self.adapter.objects)
     }
 
     /// One bounded poll round: maps, corpse check, fence compare,
@@ -3073,9 +3160,7 @@ where
         in_window_trip: HashMap::new(),
         in_window_hits: Vec::new(),
         in_window_lgcalls: 0,
-        engine_counts: HashMap::new(),
-        engine_probes: HashMap::new(),
-        engine_probed_generation: None,
+        engine_collector: EngineCollector::new(),
         straddling_trip: HashMap::new(),
         straddling_lgcalls: 0,
         trigger_observed: false,
@@ -5940,11 +6025,14 @@ mod tests {
             finish_err: bool,
             poll_err: bool,
             dispatch_attached: bool,
+            trip_set: Option<legacy::ProbeSet>,
         }
         impl DiscoveryStub {
             fn snapshot_value(&self) -> DiscoverySnapshot {
                 let mut snapshot = DiscoverySnapshot::default();
                 snapshot.dispatch.attached = self.dispatch_attached;
+                snapshot.legacy.set = self.trip_set.clone();
+                snapshot.legacy.planned = self.trip_set.is_some();
                 snapshot
             }
         }
@@ -6135,9 +6223,7 @@ mod tests {
                 in_window_trip: HashMap::new(),
                 in_window_hits: Vec::new(),
                 in_window_lgcalls: 0,
-                engine_counts: HashMap::new(),
-                engine_probes: HashMap::new(),
-                engine_probed_generation: None,
+                engine_collector: EngineCollector::new(),
                 straddling_trip: HashMap::new(),
                 straddling_lgcalls: 0,
                 trigger_observed: false,
@@ -6252,9 +6338,12 @@ mod tests {
         #[test]
         fn engine_observations_join_binding_and_registry() {
             // R05: per-(generation, cookie) counts join their
-            // generation's probe meanings plus the bound libcrypto
-            // object; other planes skip silently, unjoinable
-            // ENGINE counts go loud via the unkeyed tally.
+            // generation's probe meanings plus each probe module's
+            // own pinned identity; other planes skip silently,
+            // unjoinable ENGINE counts go loud via the unkeyed
+            // tally. F-R05-1: the caller's stub never resolves to
+            // libcrypto even when libcrypto is the only other
+            // registered object.
             let cfg = stub_config();
             let info = stub_info();
             let clock = ClockStub::at(1_500);
@@ -6268,6 +6357,7 @@ mod tests {
                     finish_err: false,
                     poll_err: false,
                     dispatch_attached: false,
+                    trip_set: None,
                 },
                 count,
                 &clock,
@@ -6276,15 +6366,22 @@ mod tests {
             );
             let device = plan::device_id_of_dev_str("08:01").unwrap();
             runner.adapter.objects.push(ObjectRecord {
-                id: ObjectId("build:lc".to_string()),
+                id: ObjectId("build:caller".to_string()),
                 device,
-                inode: 100,
-                display_locator: "/lib/libcrypto.so.3".to_string(),
+                inode: 200,
+                display_locator: "/app/caller.so".to_string(),
             });
             // B-5 double: the same file under an unverified id
             // must lose to the verified one.
             runner.adapter.objects.push(ObjectRecord {
-                id: ObjectId("unverified:08:01:100".to_string()),
+                id: ObjectId("unverified:08:01:200".to_string()),
+                device,
+                inode: 200,
+                display_locator: "/app/caller.so".to_string(),
+            });
+            // libcrypto registered but never the caller stub's home.
+            runner.adapter.objects.push(ObjectRecord {
+                id: ObjectId("build:lc".to_string()),
                 device,
                 inode: 100,
                 display_locator: "/lib/libcrypto.so.3".to_string(),
@@ -6293,7 +6390,7 @@ mod tests {
                 cookie,
                 symbol: symbol.to_string(),
                 offset,
-                module: "/lib/libcrypto.so.3".to_string(),
+                module: "/app/caller.so".to_string(),
                 family: None,
                 str_arg: None,
                 program: "trip_count",
@@ -6305,12 +6402,19 @@ mod tests {
                 probe(9, "RSA_meth_new", 0x300),
             ];
             set.libcrypto = Some(("/lib/libcrypto.so.3".to_string(), "08:01".to_string(), 100));
-            runner.engine_probes.insert(0, set);
-            runner.engine_counts.insert((0, 7), 3);
-            runner.engine_counts.insert((0, 8), 5);
-            runner.engine_counts.insert((0, 9), 11);
-            runner.engine_counts.insert((0, 77), 13);
-            runner.engine_counts.insert((1, 7), 17);
+            runner.engine_collector.snapshot_binding(
+                0,
+                Some(set),
+                &[crate::discovery::session::TripModulePin {
+                    module: "/app/caller.so".to_string(),
+                    dev: "08:01".to_string(),
+                    ino: 200,
+                }],
+            );
+            runner
+                .engine_collector
+                .accumulate(0, &[(7, 3), (8, 5), (9, 11), (77, 13)], &[]);
+            runner.engine_collector.accumulate(1, &[(7, 17)], &[]);
             let (obs, unkeyed) = runner.build_engine_observations();
             // Meth plane skips silently; unknown cookie (13) and
             // unknown generation (17) go loud.
@@ -6321,13 +6425,402 @@ mod tests {
             assert_eq!(obs[1].calls, 5);
             assert_eq!(obs[1].key.offset, 0x200);
             for o in &obs {
-                assert_eq!(o.key.object.0, "build:lc");
+                assert_eq!(o.key.object.0, "build:caller");
                 assert_eq!(o.key.device, device);
-                assert_eq!(o.key.inode, 100);
+                assert_eq!(o.key.inode, 200);
                 assert_eq!(o.generation, 0);
                 assert_eq!(o.entrypoint, evidence::engine_index("ENGINE_init").unwrap());
                 assert_eq!(o.window, EngineWindow::InWindow);
             }
+        }
+
+        #[test]
+        fn engine_observations_keep_caller_identities_distinct() {
+            // F-R05-1: two callers with the same entrypoint and stub
+            // offset keep distinct observation keys (their own
+            // pinned modules) instead of collapsing onto libcrypto.
+            let cfg = stub_config();
+            let info = stub_info();
+            let clock = ClockStub::at(1_500);
+            let mut proc = ProcStub;
+            let cancelled = || false;
+            let count = CountSession::new(TPID, FakeCountBackend::new());
+            let mut runner = stub_runner(
+                &cfg,
+                &info,
+                DiscoveryStub {
+                    finish_err: false,
+                    poll_err: false,
+                    dispatch_attached: false,
+                    trip_set: None,
+                },
+                count,
+                &clock,
+                &mut proc,
+                &cancelled,
+            );
+            let device = plan::device_id_of_dev_str("08:01").unwrap();
+            for (id, ino, path) in [
+                ("build:a", 201, "/app/a.so"),
+                ("build:b", 202, "/app/b.so"),
+                ("build:lc", 100, "/lib/libcrypto.so.3"),
+            ] {
+                runner.adapter.objects.push(ObjectRecord {
+                    id: ObjectId(id.to_string()),
+                    device,
+                    inode: ino,
+                    display_locator: path.to_string(),
+                });
+            }
+            let mut set = legacy::ProbeSet::default();
+            set.probes = vec![
+                legacy::Probe {
+                    cookie: 7,
+                    symbol: "ENGINE_init".to_string(),
+                    offset: 0x100,
+                    module: "/app/a.so".to_string(),
+                    family: None,
+                    str_arg: None,
+                    program: "trip_count",
+                },
+                legacy::Probe {
+                    cookie: 8,
+                    symbol: "ENGINE_init".to_string(),
+                    offset: 0x100,
+                    module: "/app/b.so".to_string(),
+                    family: None,
+                    str_arg: None,
+                    program: "trip_count",
+                },
+            ];
+            set.libcrypto = Some(("/lib/libcrypto.so.3".to_string(), "08:01".to_string(), 100));
+            runner.engine_collector.snapshot_binding(
+                0,
+                Some(set),
+                &[
+                    crate::discovery::session::TripModulePin {
+                        module: "/app/a.so".to_string(),
+                        dev: "08:01".to_string(),
+                        ino: 201,
+                    },
+                    crate::discovery::session::TripModulePin {
+                        module: "/app/b.so".to_string(),
+                        dev: "08:01".to_string(),
+                        ino: 202,
+                    },
+                ],
+            );
+            runner
+                .engine_collector
+                .accumulate(0, &[(7, 3), (8, 5)], &[]);
+            let (obs, unkeyed) = runner.build_engine_observations();
+            assert_eq!(unkeyed, 0);
+            assert_eq!(obs.len(), 2);
+            assert_ne!(obs[0].key, obs[1].key);
+            for o in &obs {
+                assert_ne!(o.key.inode, 100, "must not collapse onto libcrypto");
+            }
+            let inos: Vec<u64> = obs.iter().map(|o| o.key.inode).collect();
+            assert!(inos.contains(&201) && inos.contains(&202));
+        }
+
+        #[test]
+        fn engine_deferred_first_install_snapshots_meanings() {
+            // F-R05-2 RED: deferred first install stays generation 0.
+            // A gen-0 poll with no probe set must not consume the
+            // generation; the deferred gen-0 bind must still snapshot
+            // its meanings so its counts become observations.
+            let cfg = stub_config();
+            let info = stub_info();
+            let clock = ClockStub::at(1_500);
+            let mut proc = ProcStub;
+            let cancelled = || false;
+            let count = CountSession::new(TPID, FakeCountBackend::new());
+            let mut runner = stub_runner(
+                &cfg,
+                &info,
+                DiscoveryStub {
+                    finish_err: false,
+                    poll_err: false,
+                    dispatch_attached: false,
+                    trip_set: None,
+                },
+                count,
+                &clock,
+                &mut proc,
+                &cancelled,
+            );
+            let device = plan::device_id_of_dev_str("08:01").unwrap();
+            runner.adapter.objects.push(ObjectRecord {
+                id: ObjectId("build:caller".to_string()),
+                device,
+                inode: 200,
+                display_locator: "/app/caller.so".to_string(),
+            });
+            let live: Vec<maps::Mapping> = Vec::new();
+            let files: HashMap<String, plan::FileBytes> = HashMap::new();
+            let fresh: HashSet<(String, u64)> = HashSet::new();
+            // Poll 1: generation 0, no probe set yet (deferred).
+            let d1 = DiscoveryDelta {
+                trip_generation: 0,
+                ..DiscoveryDelta::default()
+            };
+            let ctx = AdapterCtx {
+                live: &live,
+                files: &files,
+                pinned_provider: None,
+                fresh: &fresh,
+                post_settle: false,
+                baseline: false,
+            };
+            runner
+                .apply_delta(&d1, clock.now(), &ctx, None)
+                .expect("poll 1 applies");
+            // Poll 2: deferred bind arrives, still generation 0, with
+            // five in-window hits on cookie 7.
+            let mut set = legacy::ProbeSet::default();
+            set.probes = vec![legacy::Probe {
+                cookie: 7,
+                symbol: "ENGINE_init".to_string(),
+                offset: 0x100,
+                module: "/app/caller.so".to_string(),
+                family: None,
+                str_arg: None,
+                program: "trip_count",
+            }];
+            set.libcrypto = Some(("/lib/libcrypto.so.3".to_string(), "08:01".to_string(), 100));
+            runner.discovery.trip_set = Some(set);
+            let d2 = DiscoveryDelta {
+                trip_generation: 0,
+                trip_module_pins: vec![crate::discovery::session::TripModulePin {
+                    module: "/app/caller.so".to_string(),
+                    dev: "08:01".to_string(),
+                    ino: 200,
+                }],
+                tripwire: crate::discovery::session::TripwireDelta {
+                    hits: Vec::new(),
+                    counter_deltas: vec![(7, 5)],
+                    executed_legacy_queries_delta: 0,
+                },
+                ..DiscoveryDelta::default()
+            };
+            let ctx2 = AdapterCtx {
+                live: &live,
+                files: &files,
+                pinned_provider: None,
+                fresh: &fresh,
+                post_settle: false,
+                baseline: false,
+            };
+            runner
+                .apply_delta(&d2, clock.now(), &ctx2, None)
+                .expect("poll 2 applies");
+            let (obs, unkeyed) = runner.build_engine_observations();
+            assert_eq!(unkeyed, 0, "deferred counts must key, not go unkeyed");
+            assert_eq!(obs.len(), 1);
+            assert_eq!(obs[0].calls, 5);
+            assert_eq!(obs[0].generation, 0);
+        }
+
+        #[test]
+        fn engine_replacement_keeps_retired_counts_on_old_generation() {
+            // F-R05-3: replacement poll carries retired gen-0 news
+            // plus the live gen-1 binding. Retired counts join gen
+            // 0's probe meanings; nothing joins gen 1 without new
+            // hits. Drives real `apply_delta` transitions (snapshot
+            // + accumulate), not direct map inserts.
+            let cfg = stub_config();
+            let info = stub_info();
+            let clock = ClockStub::at(1_500);
+            let mut proc = ProcStub;
+            let cancelled = || false;
+            let count = CountSession::new(TPID, FakeCountBackend::new());
+            let mut runner = stub_runner(
+                &cfg,
+                &info,
+                DiscoveryStub {
+                    finish_err: false,
+                    poll_err: false,
+                    dispatch_attached: false,
+                    trip_set: None,
+                },
+                count,
+                &clock,
+                &mut proc,
+                &cancelled,
+            );
+            let device = plan::device_id_of_dev_str("08:01").unwrap();
+            runner.adapter.objects.push(ObjectRecord {
+                id: ObjectId("build:caller".to_string()),
+                device,
+                inode: 200,
+                display_locator: "/app/caller.so".to_string(),
+            });
+            let live: Vec<maps::Mapping> = Vec::new();
+            let files: HashMap<String, plan::FileBytes> = HashMap::new();
+            let fresh: HashSet<(String, u64)> = HashSet::new();
+            let ctx_for = || AdapterCtx {
+                live: &live,
+                files: &files,
+                pinned_provider: None,
+                fresh: &fresh,
+                post_settle: false,
+                baseline: false,
+            };
+            let pins = || {
+                vec![crate::discovery::session::TripModulePin {
+                    module: "/app/caller.so".to_string(),
+                    dev: "08:01".to_string(),
+                    ino: 200,
+                }]
+            };
+            let set_at = |off: u64| {
+                let mut set = legacy::ProbeSet::default();
+                set.probes = vec![legacy::Probe {
+                    cookie: 7,
+                    symbol: "ENGINE_init".to_string(),
+                    offset: off,
+                    module: "/app/caller.so".to_string(),
+                    family: None,
+                    str_arg: None,
+                    program: "trip_count",
+                }];
+                set.libcrypto = Some(("/lib/libcrypto.so.3".to_string(), "08:01".to_string(), 100));
+                set
+            };
+            // Poll 1: gen 0 binds (snapshot meanings + pins).
+            runner.discovery.trip_set = Some(set_at(0x100));
+            let d1 = DiscoveryDelta {
+                trip_generation: 0,
+                trip_module_pins: pins(),
+                ..DiscoveryDelta::default()
+            };
+            runner
+                .apply_delta(&d1, clock.now(), &ctx_for(), None)
+                .expect("poll 1 applies");
+            // Poll 2: replacement to gen 1; five unread gen-0 hits
+            // fence as retired; zero new hits under gen 1.
+            runner.discovery.trip_set = Some(set_at(0x110));
+            let d2 = DiscoveryDelta {
+                trip_generation: 1,
+                trip_module_pins: pins(),
+                retired_trip_deltas: vec![crate::discovery::session::RetiredTripDelta {
+                    generation: 0,
+                    cookie: 7,
+                    count: 5,
+                }],
+                ..DiscoveryDelta::default()
+            };
+            runner
+                .apply_delta(&d2, clock.now(), &ctx_for(), None)
+                .expect("poll 2 applies");
+            let (obs, unkeyed) = runner.build_engine_observations();
+            assert_eq!(unkeyed, 0);
+            assert_eq!(obs.len(), 1);
+            assert_eq!(obs[0].generation, 0);
+            assert_eq!(obs[0].key.offset, 0x100);
+            assert_eq!(obs[0].calls, 5);
+            // Legacy parity: the retired hits still count cookie-wise.
+            assert_eq!(runner.in_window_trip.get(&7), Some(&5));
+        }
+
+        #[test]
+        fn engine_runtime_salvage_keeps_real_observations() {
+            // F-R05-5: real controller salvage. Real `apply_delta`
+            // transitions collect ENGINE observations, then a real
+            // close failure salvages them into a fatal-Runtime
+            // capture (not a hand-built doc). Policy still proves
+            // the violation from the salvaged observations.
+            let cfg = stub_config();
+            let info = stub_info();
+            let clock = ClockStub::at(1_500);
+            let mut proc = ProcStub;
+            let cancelled = || false;
+            let count = CountSession::new(TPID, FakeCountBackend::new());
+            let mut runner = stub_runner(
+                &cfg,
+                &info,
+                DiscoveryStub {
+                    finish_err: true,
+                    poll_err: false,
+                    dispatch_attached: false,
+                    trip_set: None,
+                },
+                count,
+                &clock,
+                &mut proc,
+                &cancelled,
+            );
+            let device = plan::device_id_of_dev_str("08:01").unwrap();
+            runner.adapter.objects.push(ObjectRecord {
+                id: ObjectId("build:caller".to_string()),
+                device,
+                inode: 200,
+                display_locator: "/app/caller.so".to_string(),
+            });
+            let mut set = legacy::ProbeSet::default();
+            set.probes = vec![legacy::Probe {
+                cookie: 7,
+                symbol: "ENGINE_init".to_string(),
+                offset: 0x100,
+                module: "/app/caller.so".to_string(),
+                family: None,
+                str_arg: None,
+                program: "trip_count",
+            }];
+            set.libcrypto = Some(("/lib/libcrypto.so.3".to_string(), "08:01".to_string(), 100));
+            runner.discovery.trip_set = Some(set);
+            let live: Vec<maps::Mapping> = Vec::new();
+            let files: HashMap<String, plan::FileBytes> = HashMap::new();
+            let fresh: HashSet<(String, u64)> = HashSet::new();
+            let delta = DiscoveryDelta {
+                trip_generation: 0,
+                trip_module_pins: vec![crate::discovery::session::TripModulePin {
+                    module: "/app/caller.so".to_string(),
+                    dev: "08:01".to_string(),
+                    ino: 200,
+                }],
+                tripwire: crate::discovery::session::TripwireDelta {
+                    hits: Vec::new(),
+                    counter_deltas: vec![(7, 7)],
+                    executed_legacy_queries_delta: 0,
+                },
+                ..DiscoveryDelta::default()
+            };
+            let ctx = AdapterCtx {
+                live: &live,
+                files: &files,
+                pinned_provider: None,
+                fresh: &fresh,
+                post_settle: false,
+                baseline: false,
+            };
+            runner
+                .apply_delta(&delta, clock.now(), &ctx, None)
+                .expect("collect applies");
+            let cap = runner
+                .close_and_finalize()
+                .expect("close failure must salvage, not Err");
+            assert!(
+                matches!(
+                    cap.document.status,
+                    Completeness::Fatal {
+                        kind: evidence::FatalKind::Runtime(_),
+                        ..
+                    }
+                ),
+                "want salvaged Runtime, got {:?}",
+                cap.document.status
+            );
+            assert_eq!(cap.document.engine_observations.len(), 1);
+            assert_eq!(cap.document.engine_observations[0].calls, 7);
+            let v = crate::policy::evaluate_document(
+                std::slice::from_ref(&crate::policy::PolicyRule::deny_engine()),
+                &cap.document,
+            );
+            assert_eq!(v.overall(), crate::policy::PolicyOutcome::Violation);
+            assert_eq!(v.rules[0].bounds.definite, 7);
+            assert_eq!(v.rules[0].engine_hits.len(), 1);
         }
 
         #[test]
@@ -6349,6 +6842,7 @@ mod tests {
                     finish_err: true,
                     poll_err: false,
                     dispatch_attached: false,
+                    trip_set: None,
                 },
                 count,
                 &clock,
@@ -6402,6 +6896,7 @@ mod tests {
                     finish_err: false,
                     poll_err: false,
                     dispatch_attached: false,
+                    trip_set: None,
                 },
                 count,
                 &clock,
@@ -6435,6 +6930,7 @@ mod tests {
                     finish_err: true,
                     poll_err: false,
                     dispatch_attached: false,
+                    trip_set: None,
                 },
                 count,
                 &clock,
@@ -6468,6 +6964,7 @@ mod tests {
                     finish_err: false,
                     poll_err: true,
                     dispatch_attached: false,
+                    trip_set: None,
                 },
                 count,
                 &clock,
@@ -6501,6 +6998,7 @@ mod tests {
                     finish_err: true,
                     poll_err: false,
                     dispatch_attached: false,
+                    trip_set: None,
                 },
                 count,
                 &clock,
@@ -6540,6 +7038,7 @@ mod tests {
                     finish_err: false,
                     poll_err: false,
                     dispatch_attached: true,
+                    trip_set: None,
                 },
                 count,
                 &clock,
@@ -6573,6 +7072,7 @@ mod tests {
                     finish_err: false,
                     poll_err: false,
                     dispatch_attached: true,
+                    trip_set: None,
                 },
                 count,
                 &clock,
@@ -6603,6 +7103,7 @@ mod tests {
                     finish_err: false,
                     poll_err: false,
                     dispatch_attached: false,
+                    trip_set: None,
                 },
                 count,
                 &clock,
@@ -6635,6 +7136,7 @@ mod tests {
                     finish_err: false,
                     poll_err: false,
                     dispatch_attached: false,
+                    trip_set: None,
                 },
                 count,
                 &clock,
@@ -6769,6 +7271,7 @@ mod tests {
                     finish_err: false,
                     poll_err: false,
                     dispatch_attached: false,
+                    trip_set: None,
                 },
                 count,
                 &clock,
@@ -6827,6 +7330,7 @@ mod tests {
                     finish_err: false,
                     poll_err: false,
                     dispatch_attached: false,
+                    trip_set: None,
                 },
                 count,
                 &clock,
