@@ -43,6 +43,11 @@
     ],
     "status": "PARTIAL"
   },
+  "context": {
+    "kernel_release": "6.9.0-test",
+    "wall_end_unix_ns": 1700000030000000000,
+    "wall_start_unix_ns": 1700000000000000000
+  },
   "coverage": [
     {
       "attached": 1,
