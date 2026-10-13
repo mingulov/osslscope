@@ -199,7 +199,10 @@ pub enum WorkloadDest {
     /// Both streams to /dev/null (default).
     Null,
     /// Both streams to this file (created + truncated per run,
-    /// parent-side, pre-fork). Accepted ONLY as a pinned regular
+    /// parent-side, pre-fork). Preparation is staged: the file is opened
+    /// and pinned WITHOUT truncating, then truncated caller-side only
+    /// after the setup re-verifies live — a worker delayed past
+    /// abandonment truncates nothing. Accepted ONLY as a pinned regular
     /// file: missing parents, symlinks, FIFOs, directories, sockets
     /// and devices fail setup pre-fork, naming the path with the 126
     /// setup marker. The open fd — not the path — is handed to the
@@ -312,14 +315,17 @@ fn lstat_kind(c: &std::ffi::CStr) -> &'static str {
 }
 
 /// Open + pin a [`WorkloadDest::File`] sink parent-side, pre-fork
-/// (R06/F07). `O_NONBLOCK` keeps a FIFO-with-no-reader from hanging
-/// the open (it fails `ENXIO` instead); `O_NOFOLLOW` refuses a final
-/// symlink instead of truncating through it; the `fstat` accepts
-/// ONLY a regular file; `O_NONBLOCK` is then cleared so the workload
-/// inherits ordinary blocking stdio. The open fd — never the path —
-/// is handed to the child, so post-open path replacement is
-/// harmless. Every failure names the path with the 126 setup marker
-/// and spawns nothing. Runs on a setup-control worker (see
+/// (R06/F07) — WITHOUT truncating (fix round 2: the staged open). There
+/// is deliberately no `O_TRUNC` here: a worker delayed past the caller's
+/// abandonment must not destroy successor bytes, so truncation happens
+/// only in [`truncate_pinned_sink`], caller-side, after the setup
+/// re-verifies live. `O_NONBLOCK` keeps a FIFO-with-no-reader from
+/// hanging the open (it fails `ENXIO` instead); `O_NOFOLLOW` refuses a
+/// final symlink; the `fstat` accepts ONLY a regular file; `O_NONBLOCK`
+/// is then cleared so the workload inherits ordinary blocking stdio. The
+/// open fd — never the path — is handed to the child, so post-open path
+/// replacement is harmless. Every failure names the path with the 126
+/// setup marker and spawns nothing. Runs on a setup-control worker (see
 /// [`run_under_control`]) — never call it directly on the setup path:
 /// `O_NONBLOCK` bounds neither a stalled FUSE open nor a block-device
 /// open.
@@ -329,12 +335,7 @@ fn open_pinned_sink(path: &Path) -> anyhow::Result<OwnedFd> {
     let fd = unsafe {
         libc::open(
             c.as_ptr(),
-            libc::O_WRONLY
-                | libc::O_CREAT
-                | libc::O_TRUNC
-                | libc::O_NONBLOCK
-                | libc::O_NOFOLLOW
-                | libc::O_CLOEXEC,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             0o644,
         )
     };
@@ -379,6 +380,23 @@ fn open_pinned_sink(path: &Path) -> anyhow::Result<OwnedFd> {
     Ok(owned)
 }
 
+/// Truncate a staged sink opened by [`open_pinned_sink`] (fix round 2:
+/// the destructive half of file-sink preparation). Called caller-side,
+/// only after the setup re-verifies live (cancel + deadline) — NO
+/// detached worker ever truncates, so a late worker cannot destroy bytes
+/// written after the caller gave up. Every failure names the path with
+/// the 126 setup marker and spawns nothing.
+fn truncate_pinned_sink(sink: &OwnedFd, path: &Path) -> anyhow::Result<()> {
+    if unsafe { libc::ftruncate(sink.as_raw_fd(), 0) } != 0 {
+        let e = std::io::Error::last_os_error();
+        anyhow::bail!(
+            "workload output {}: cannot truncate file sink: {e} (setup status 126)",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 /// Outcome of running one blocking setup op under deadline +
 /// cancellation control (fix round 1 / F1): a stalled sink open or
 /// close (FUSE, block device — `O_NONBLOCK` bounds neither) must fail
@@ -387,10 +405,13 @@ enum Control<T> {
     /// The op finished; carries its value.
     Done(T),
     /// Cancellation was pending (checked before running, then while
-    /// waiting); the worker keeps running detached and owns its captures.
+    /// waiting); the abandonment fence is set, so a worker that has not
+    /// started its op skips it — a started worker keeps running detached
+    /// and owns its captures.
     Cancelled,
-    /// The deadline passed while waiting; the worker keeps running
-    /// detached and owns its captures.
+    /// The deadline passed while waiting; the abandonment fence is set
+    /// (as above) and a started worker keeps running detached and owns
+    /// its captures.
     Expired,
     /// The worker died (panic) before reporting.
     Lost,
@@ -398,11 +419,17 @@ enum Control<T> {
 
 /// Run a potentially-blocking setup op on a worker thread, bounded by
 /// the setup deadline and cancel flag (polled at 1ms). An already-dead
-/// setup never starts the op. On expiry the worker is detached — its
-/// ownership moves with it, so a stuck open's fd closes whenever the
-/// sink answers — and the caller fails WITHOUT forking (pre-fork) or
-/// resolves the guard-held child under custody (post-fork). `Err` = the
-/// worker thread itself could not start (fail-closed at the call site).
+/// setup never starts the op, and a worker that has not started its op
+/// when the caller abandons setup skips it (fix round 2: the abandonment
+/// fence — a late worker must not perform setup work after the caller
+/// gave up). The result channel is a rendezvous (fix round 2 / F1): a
+/// value is delivered only to a live receiver, so a discarded result is
+/// always dropped on the worker, never inline on the caller. On expiry
+/// the worker is detached — its ownership moves with it, so a stuck
+/// open's fd closes whenever the sink answers — and the caller fails
+/// WITHOUT forking (pre-fork) or resolves the guard-held child under
+/// custody (post-fork). `Err` = the worker thread itself could not start
+/// (fail-closed at the call site).
 fn run_under_control<T, F>(
     deadline: Instant,
     cancel: &AtomicBool,
@@ -418,13 +445,35 @@ where
     if Instant::now() >= deadline {
         return Ok(Control::Expired);
     }
-    spawn_controlled(deadline, cancel, op)
+    // Abandonment fence: set by the caller when it stops waiting, read by
+    // the worker immediately before running the op.
+    let abandoned = Arc::new(AtomicBool::new(false));
+    let abandoned_c = abandoned.clone();
+    let (tx, rx) = std::sync::mpsc::sync_channel(0);
+    let (test_delay_ms, test_counter) = read_setup_test_hook();
+    std::thread::Builder::new()
+        .name("osslscope-setup-op".to_string())
+        .spawn(move || {
+            if test_delay_ms > 0 {
+                std::thread::sleep(Duration::from_millis(test_delay_ms));
+            }
+            if !abandoned_c.load(Ordering::SeqCst) {
+                let _ = tx.send(op());
+            }
+            if let Some(c) = test_counter.as_ref() {
+                c.fetch_add(1, Ordering::SeqCst);
+            }
+        })
+        .map_err(|e| anyhow::anyhow!("setup worker thread: {e}"))?;
+    poll_controlled(deadline, cancel, rx, Some(abandoned.as_ref()))
 }
 
-/// Spawn the control worker and poll it (the post-pre-check half of
-/// [`run_under_control`]). Close disposal calls this directly: a close
-/// must run (possibly late, on the detached worker) even on an
-/// already-dead setup — otherwise its fd would leak.
+/// Spawn the control worker and poll it. Close disposal calls this
+/// directly: a close must run (possibly late, on the detached worker)
+/// even on an already-dead setup — otherwise its fd would leak. There is
+/// deliberately NO abandonment fence here (unlike
+/// [`run_under_control`]): disposal is never skipped. The result channel
+/// is a rendezvous (fix round 2 / F1), as above.
 fn spawn_controlled<T, F>(
     deadline: Instant,
     cancel: &AtomicBool,
@@ -434,18 +483,45 @@ where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
-    let (tx, rx) = std::sync::mpsc::channel();
-    let _worker = std::thread::Builder::new()
+    let (tx, rx) = std::sync::mpsc::sync_channel(0);
+    let (test_delay_ms, test_counter) = read_setup_test_hook();
+    std::thread::Builder::new()
         .name("osslscope-setup-op".to_string())
         .spawn(move || {
+            if test_delay_ms > 0 {
+                std::thread::sleep(Duration::from_millis(test_delay_ms));
+            }
             let _ = tx.send(op());
+            if let Some(c) = test_counter.as_ref() {
+                c.fetch_add(1, Ordering::SeqCst);
+            }
         })
         .map_err(|e| anyhow::anyhow!("setup worker thread: {e}"))?;
+    poll_controlled(deadline, cancel, rx, None)
+}
+
+/// Poll one control worker (the waiting half of [`run_under_control`] /
+/// [`spawn_controlled`]). When `abandoned` is present (fenced ops), it is
+/// set before returning `Cancelled` / `Expired`, so a worker that has not
+/// started its op skips it instead of running setup work after the caller
+/// gave up.
+fn poll_controlled<T>(
+    deadline: Instant,
+    cancel: &AtomicBool,
+    rx: std::sync::mpsc::Receiver<T>,
+    abandoned: Option<&AtomicBool>,
+) -> anyhow::Result<Control<T>> {
     loop {
         if cancel.load(Ordering::SeqCst) {
+            if let Some(a) = abandoned {
+                a.store(true, Ordering::SeqCst);
+            }
             return Ok(Control::Cancelled);
         }
         if Instant::now() >= deadline {
+            if let Some(a) = abandoned {
+                a.store(true, Ordering::SeqCst);
+            }
             return Ok(Control::Expired);
         }
         match rx.recv_timeout(Duration::from_millis(1)) {
@@ -454,6 +530,16 @@ where
             Err(RecvTimeoutError::Disconnected) => return Ok(Control::Lost),
         }
     }
+}
+
+/// Read the test-only setup copies on the spawning thread (see
+/// `SETUP_TEST_HOOK`): the worker-startup delay and the completion
+/// counter. Inert (`0` / `None`) unless a test armed them.
+fn read_setup_test_hook() -> (u64, Option<Arc<AtomicU32>>) {
+    SETUP_TEST_HOOK.with(|h| {
+        let h = h.borrow();
+        (h.setup_delay_ms, h.worker_counter.clone())
+    })
 }
 
 /// Close a parent-held sink fd under setup control (F1): the actual
@@ -515,6 +601,52 @@ pub fn __test_set_prestop_stall_ms(ms: u64) {
 #[doc(hidden)]
 pub fn __test_set_prestop_pid_sink(sink: Option<Arc<AtomicU32>>) {
     PRESTOP_TEST_HOOK.with(|h| h.borrow_mut().pid_sink = sink);
+}
+
+/// Test-only setup instrumentation (fix round 2), thread-local so parallel
+/// tests never interact. The spawning thread copies these values BEFORE
+/// creating a control worker; the worker uses only its moved copies — the
+/// worker thread never touches this thread-local:
+/// - `setup_delay_ms`: the worker sleeps this long before running its op,
+///   so the caller deterministically abandons setup first (proves a late
+///   worker cannot harm a successor).
+/// - `worker_counter`: the worker increments this exactly once when it
+///   finishes (all non-panic exits), proving disposal ran on a worker.
+/// - `fail_fork`: the next spawn on this thread skips `fork()` and takes
+///   the fork-failure path (consumed on read). Production callers must
+///   never arm any of these.
+struct SetupTestHook {
+    setup_delay_ms: u64,
+    worker_counter: Option<Arc<AtomicU32>>,
+    fail_fork: bool,
+}
+
+thread_local! {
+    static SETUP_TEST_HOOK: RefCell<SetupTestHook> = const {
+        RefCell::new(SetupTestHook {
+            setup_delay_ms: 0,
+            worker_counter: None,
+            fail_fork: false,
+        })
+    };
+}
+
+/// Test-only: arm the control-worker startup delay (see `SETUP_TEST_HOOK`).
+#[doc(hidden)]
+pub fn __test_set_setup_delay_ms(ms: u64) {
+    SETUP_TEST_HOOK.with(|h| h.borrow_mut().setup_delay_ms = ms);
+}
+
+/// Test-only: arm the control-worker completion counter (see `SETUP_TEST_HOOK`).
+#[doc(hidden)]
+pub fn __test_set_control_worker_counter(counter: Option<Arc<AtomicU32>>) {
+    SETUP_TEST_HOOK.with(|h| h.borrow_mut().worker_counter = counter);
+}
+
+/// Test-only: fail the next fork on this thread (see `SETUP_TEST_HOOK`).
+#[doc(hidden)]
+pub fn __test_set_fail_fork(fail: bool) {
+    SETUP_TEST_HOOK.with(|h| h.borrow_mut().fail_fork = fail);
 }
 
 /// Post-fork pre-stop custody (R06/F07): owns the just-forked pid
@@ -684,9 +816,11 @@ impl OwnedTarget {
     /// (a dead setup forks nothing and truncates nothing), then
     /// destination preparation — file sinks are opened + pinned to
     /// a regular file by the PARENT pre-fork (see
-    /// [`WorkloadDest::File`]), on a worker under the same deadline +
-    /// cancel (a stalled sink fails the setup; it never hangs it) —
-    /// then a final cancel/deadline re-check, then fork. Custody starts
+    /// [`WorkloadDest::File`]), on a fenced worker under the same
+    /// deadline + cancel (a stalled sink fails the setup; it never hangs
+    /// it; a worker delayed past abandonment is fenced and truncates
+    /// nothing) — then a cancel/deadline re-check, caller-side
+    /// truncation, a final re-check, then fork. Custody starts
     /// at the fork return, BEFORE the parent's sink copy is disposed
     /// (also under control) and before waiting for SIGSTOP; the wait
     /// polls with the checked deadline and the cancel flag, and every
@@ -736,17 +870,16 @@ impl OwnedTarget {
         let child_dest = match &dest {
             WorkloadDest::Null => ChildDest::Null,
             WorkloadDest::File(path) => {
+                // Two-phase preparation (fix round 2 / NEW): the staged
+                // open never truncates, and the truncation runs caller-side
+                // only after the setup re-verifies live — a worker delayed
+                // past abandonment truncates nothing.
                 let owned_path = path.clone();
                 let prep =
                     run_under_control(deadline, cancel, move || open_pinned_sink(&owned_path))
                         .map_err(|e| anyhow::anyhow!("{e:#} (no child spawned)"))?;
-                match prep {
-                    Control::Done(r) => {
-                        let sink = r?;
-                        let raw = sink.as_raw_fd();
-                        owned_sink = Some(sink);
-                        ChildDest::Fd(raw)
-                    }
+                let staged = match prep {
+                    Control::Done(r) => r?,
                     Control::Cancelled => {
                         anyhow::bail!(
                             "pre-stop setup cancelled during file-sink preparation (no child spawned)"
@@ -762,7 +895,31 @@ impl OwnedTarget {
                             "pre-stop setup worker lost during file-sink preparation (no child spawned)"
                         );
                     }
+                };
+                // The setup may have died while the staged open ran:
+                // re-check BEFORE truncating so a dead setup truncates
+                // nothing. A staged sink disposes under the same control
+                // (a FUSE close must not hang this path either); there is
+                // no child yet, so the outcome needs no custody.
+                if cancel.load(Ordering::SeqCst) {
+                    let _ = close_under_control(staged, deadline, cancel);
+                    anyhow::bail!(
+                        "pre-stop setup cancelled before file-sink truncation (no child spawned)"
+                    );
                 }
+                if Instant::now() >= deadline {
+                    let _ = close_under_control(staged, deadline, cancel);
+                    anyhow::bail!(
+                        "pre-stop setup deadline exceeded before file-sink truncation (no child spawned)"
+                    );
+                }
+                if let Err(e) = truncate_pinned_sink(&staged, path) {
+                    let _ = close_under_control(staged, deadline, cancel);
+                    return Err(anyhow::anyhow!("{e:#} (no child spawned)"));
+                }
+                let raw = staged.as_raw_fd();
+                owned_sink = Some(staged);
+                ChildDest::Fd(raw)
             }
             WorkloadDest::Fd(fd) => {
                 let r = unsafe { libc::fcntl(*fd, libc::F_GETFD) };
@@ -796,8 +953,26 @@ impl OwnedTarget {
                 "pre-stop setup deadline exceeded after destination preparation (no child spawned)"
             );
         }
-        let pid = unsafe { libc::fork() };
+        // Test-only fork fault (see `SETUP_TEST_HOOK`): consumed on read,
+        // inert (`false`) for every production caller.
+        let fail_fork =
+            SETUP_TEST_HOOK.with(|h| std::mem::replace(&mut h.borrow_mut().fail_fork, false));
+        let pid = if fail_fork {
+            -1
+        } else {
+            unsafe { libc::fork() }
+        };
         if pid < 0 {
+            // F1: a prepared sink disposes under control here too — never
+            // by dropping it inline (a FUSE FLUSH in that drop would hang
+            // setup on the caller). No child exists, so the outcome needs
+            // no custody.
+            if let Some(sink) = owned_sink.take() {
+                let _ = close_under_control(sink, deadline, cancel);
+            }
+            if fail_fork {
+                anyhow::bail!("fork: test-injected fork failure");
+            }
             anyhow::bail!("fork: {}", std::io::Error::last_os_error());
         }
         if pid == 0 {
@@ -1107,9 +1282,12 @@ impl OwnedTarget {
 mod control_tests {
     //! F1 mechanism pins: blocking setup ops run under deadline +
     //! cancellation control (see [`super::run_under_control`]).
-    use super::{Control, close_under_control, run_under_control};
+    use super::{
+        __test_set_control_worker_counter, __test_set_setup_delay_ms, Control, close_under_control,
+        run_under_control,
+    };
     use std::os::fd::{FromRawFd as _, OwnedFd};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -1245,6 +1423,46 @@ mod control_tests {
         })
         .unwrap();
         assert!(matches!(out, Control::Lost));
+    }
+
+    #[test]
+    fn control_abandoned_setup_skips_op() {
+        // Fix round 2: a worker that has not started its op when the
+        // caller abandons setup must skip the op (a late destructive
+        // open must never run). The delay deterministically orders the
+        // abandonment before the worker's first step.
+        let cancel = AtomicBool::new(false);
+        let ran = std::sync::Arc::new(AtomicBool::new(false));
+        let ran_c = ran.clone();
+        let counter = std::sync::Arc::new(AtomicU32::new(0));
+        __test_set_setup_delay_ms(500);
+        __test_set_control_worker_counter(Some(counter.clone()));
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(Duration::from_millis(100));
+                cancel.store(true, Ordering::SeqCst);
+            });
+            let out = run_under_control(
+                Instant::now() + Duration::from_secs(30),
+                &cancel,
+                move || {
+                    ran_c.store(true, Ordering::SeqCst);
+                    42
+                },
+            )
+            .unwrap();
+            assert!(matches!(out, Control::Cancelled));
+        });
+        // Bounded wait for the worker to finish, then reset hooks before
+        // asserting (thread-local; this thread dies with the test anyway).
+        let end = Instant::now() + Duration::from_secs(10);
+        while counter.load(Ordering::SeqCst) < 1 {
+            assert!(Instant::now() < end, "worker never finished");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        __test_set_setup_delay_ms(0);
+        __test_set_control_worker_counter(None);
+        assert!(!ran.load(Ordering::SeqCst), "abandoned op must not run");
     }
 }
 

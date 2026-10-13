@@ -5,7 +5,8 @@
 //! are never signaled. No BPF or privileges needed.
 
 use osslscope::target::{
-    __test_set_prestop_pid_sink, __test_set_prestop_stall_ms, CustodyState, OwnedTarget,
+    __test_set_control_worker_counter, __test_set_fail_fork, __test_set_prestop_pid_sink,
+    __test_set_prestop_stall_ms, __test_set_setup_delay_ms, CustodyState, OwnedTarget,
     TargetDisposition, WorkloadDest,
 };
 use std::time::{Duration, Instant};
@@ -538,6 +539,59 @@ fn r06_rescue_pid(pid: u32) {
     }
 }
 
+/// Independent exact-PID teardown (fix round 2 / F4): RAII rescue of one
+/// observed pid. Armed the moment a fork is observed, disarmed only after
+/// the test verifies the reap. `Drop` is best-effort SIGKILL + bounded
+/// reap of the exact pid only (ECHILD-tolerant, never panics), so
+/// assertion failures and unwinding still rescue the child — confinement
+/// never depends on production cleanup succeeding.
+struct R06PidGuard {
+    pid: u32,
+    armed: bool,
+}
+
+impl R06PidGuard {
+    fn arm(pid: u32) -> Self {
+        Self { pid, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for R06PidGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        unsafe {
+            libc::kill(self.pid as libc::pid_t, libc::SIGKILL);
+        }
+        let end = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < end {
+            let mut status = 0;
+            let r = unsafe { libc::waitpid(self.pid as libc::pid_t, &mut status, libc::WNOHANG) };
+            if r > 0 {
+                return;
+            }
+            if r < 0 {
+                let e = std::io::Error::last_os_error();
+                if e.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                // ECHILD: someone else reaped it — resolved either way.
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Bounded effort exhausted: Drop must never panic, so an
+        // unkillable child is left for the explicit asserts (which fail
+        // loudly) rather than panicking from unwinding.
+    }
+}
+
 /// Join a supervised spawn with a hard bound: on timeout, rescue the
 /// exact observed pid, verify no zombie, then fail — a regressed hang
 /// fails the test, never the runner. (The still-blocked worker is
@@ -647,6 +701,10 @@ fn fifo_setup_cancel_reaps_child() {
         let _ = rx.recv_timeout(Duration::from_secs(20));
         panic!("no fork observed within 10s");
     };
+    // F4: independent teardown armed before any fallible step — panics
+    // below (join timeout, message asserts, reap verification) still
+    // rescue the exact observed pid on unwinding.
+    let mut r06_guard = R06PidGuard::arm(pid);
     cancel.store(true, Ordering::SeqCst);
     let t0 = Instant::now();
     let result = r06_join_supervised(worker, rx, pid, Duration::from_secs(20));
@@ -663,6 +721,7 @@ fn fifo_setup_cancel_reaps_child() {
             assert!(elapsed < Duration::from_secs(5), "fail fast: {elapsed:?}");
             assert_reaped_no_zombie(pid);
             assert!(!sentinel.exists(), "sentinel must never execute");
+            r06_guard.disarm();
         }
         Ok(t) => r06_unexpected_child(t, "cancelled FIFO setup must fail"),
     }
@@ -715,6 +774,8 @@ fn prestop_deadline_reaps_child() {
         let _ = rx.recv_timeout(Duration::from_secs(20));
         panic!("no fork observed within 10s");
     };
+    // F4: independent teardown armed before any fallible step.
+    let mut r06_guard = R06PidGuard::arm(pid);
     let t0 = Instant::now();
     let result = r06_join_supervised(worker, rx, pid, Duration::from_secs(20));
     let elapsed = t0.elapsed();
@@ -730,6 +791,7 @@ fn prestop_deadline_reaps_child() {
             assert!(elapsed < Duration::from_secs(5), "fail fast: {elapsed:?}");
             assert_reaped_no_zombie(pid);
             assert!(!sentinel.exists(), "sentinel must never execute");
+            r06_guard.disarm();
         }
         Ok(t) => r06_unexpected_child(t, "expired live deadline must fail"),
     }
@@ -762,6 +824,9 @@ fn r06_prestop_signal_reaps_child(sig: libc::c_int, sig_name: &str, scratch: &st
         let _ = rx.recv_timeout(Duration::from_secs(20));
         panic!("no fork observed within 10s");
     };
+    // F4: independent teardown armed before any fallible step (including
+    // the raise assert itself).
+    let mut r06_guard = R06PidGuard::arm(pid);
     // Actual signal delivery to this process (not a bare store): the
     // installed handler performs the production store.
     assert_eq!(unsafe { libc::raise(sig) }, 0, "raise {sig_name}");
@@ -780,6 +845,7 @@ fn r06_prestop_signal_reaps_child(sig: libc::c_int, sig_name: &str, scratch: &st
             assert!(elapsed < Duration::from_secs(5), "fail fast: {elapsed:?}");
             assert_reaped_no_zombie(pid);
             assert!(!sentinel.exists(), "sentinel must never execute");
+            r06_guard.disarm();
         }
         Ok(t) => r06_unexpected_child(t, &format!("{sig_name} must cancel setup")),
     }
@@ -819,6 +885,8 @@ fn prestop_watchdog_rescues_blocked_setup() {
         let _ = rx.recv_timeout(Duration::from_secs(20));
         panic!("no fork observed within 10s");
     };
+    // F4: independent teardown armed before any fallible step.
+    let mut r06_guard = R06PidGuard::arm(pid);
     // The spawn cannot return in 3s (60s stall, no cancel, far deadline):
     // the timeout path is the assertion.
     assert!(
@@ -829,6 +897,7 @@ fn prestop_watchdog_rescues_blocked_setup() {
     // participates): kill + reap, then verify no zombie.
     r06_rescue_pid(pid);
     assert_reaped_no_zombie(pid);
+    r06_guard.disarm();
     // After the rescue the worker's wait must return promptly (its child
     // is gone): confirm no hung worker, then drop either outcome.
     let drained = rx
@@ -1244,4 +1313,185 @@ fn with_control_happy_path_releases_and_reaps() {
     t.release().unwrap();
     assert_eq!(wait_for_exit(&mut t, Duration::from_secs(5)), Some(0));
     assert_reaped_no_zombie(pid);
+}
+
+// ---------------------------------------------------------------------------
+// R06 fix round 2: discarded-result/fork-error disposal (F1), guard-based
+// test teardown (F4), abandoned-worker truncation (NEW).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn fork_failure_disposes_sink_under_control() {
+    // F1: the fork-failure path must dispose the prepared sink on a
+    // control worker — never by dropping it inline on the caller (a FUSE
+    // FLUSH inside that drop would hang setup). The injected fork fault
+    // is deterministic; the worker counter proves a disposal worker ran
+    // beyond the preparation worker(s).
+    let dir = r06_scratch("fork-fail-dispose");
+    let log = dir.join("workload.log");
+    std::fs::write(&log, b"stale\n").unwrap();
+    let sentinel = dir.join("SENTINEL");
+    let argv = r06_sentinel_argv(&sentinel);
+    let cancel = AtomicBool::new(false);
+    let counter = Arc::new(AtomicU32::new(0));
+    __test_set_control_worker_counter(Some(counter.clone()));
+    __test_set_fail_fork(true);
+    let result = OwnedTarget::spawn_stopped_with_control(
+        &argv,
+        WorkloadDest::File(log.clone()),
+        Instant::now() + Duration::from_secs(30),
+        &cancel,
+    );
+    __test_set_control_worker_counter(None);
+    __test_set_fail_fork(false);
+    let msg = match result {
+        Err(e) => e.to_string(),
+        Ok(t) => r06_unexpected_child(t, "injected fork failure must fail"),
+    };
+    assert!(msg.contains("fork"), "fork failure surfaces: {msg}");
+    assert!(!sentinel.exists(), "sentinel must never execute");
+    // The disposal worker runs asynchronously: bounded poll, then the
+    // ownership assertion (fails on inline disposal: the counter never
+    // passes the preparation worker(s)).
+    let end = Instant::now() + Duration::from_secs(5);
+    while counter.load(Ordering::SeqCst) < 2 {
+        assert!(
+            Instant::now() < end,
+            "no disposal worker ran (counter {})",
+            counter.load(Ordering::SeqCst)
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn abandoned_prep_worker_never_truncates_successor() {
+    // NEW: a preparation worker delayed past the caller's abandonment must
+    // never truncate bytes written after that abandonment. The worker is
+    // deterministically delayed (2s) past a 300ms setup deadline; a
+    // successor then populates the destination; the late worker must not
+    // destroy it.
+    let dir = r06_scratch("abandoned-prep");
+    let log = dir.join("workload.log");
+    std::fs::write(&log, b"original\n").unwrap();
+    let sentinel = dir.join("SENTINEL");
+    let argv = r06_sentinel_argv(&sentinel);
+    let cancel = AtomicBool::new(false);
+    let counter = Arc::new(AtomicU32::new(0));
+    __test_set_control_worker_counter(Some(counter.clone()));
+    __test_set_setup_delay_ms(2000);
+    let result = OwnedTarget::spawn_stopped_with_control(
+        &argv,
+        WorkloadDest::File(log.clone()),
+        Instant::now() + Duration::from_millis(300),
+        &cancel,
+    );
+    __test_set_setup_delay_ms(0);
+    __test_set_control_worker_counter(None);
+    let msg = match result {
+        Err(e) => e.to_string(),
+        Ok(t) => r06_unexpected_child(t, "expired setup must fail"),
+    };
+    assert!(
+        msg.contains("deadline"),
+        "caller abandoned on deadline: {msg}"
+    );
+    assert!(msg.contains("no child spawned"), "nothing forked: {msg}");
+    assert_eq!(
+        std::fs::read(&log).unwrap(),
+        b"original\n",
+        "worker still delayed at abandonment"
+    );
+    // A retry or another writer populates the destination now.
+    std::fs::write(&log, b"successor-bytes\n").unwrap();
+    // Wait for the late worker to finish (bounded), then prove the
+    // successor bytes survived it.
+    let end = Instant::now() + Duration::from_secs(10);
+    while counter.load(Ordering::SeqCst) < 1 {
+        assert!(Instant::now() < end, "worker never finished");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        std::fs::read(&log).unwrap(),
+        b"successor-bytes\n",
+        "late worker must never truncate post-abandonment bytes"
+    );
+    assert!(!sentinel.exists(), "sentinel must never execute");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn r06_pid_guard_rescues_live_child() {
+    // F4 proof: the guard rescues a genuinely live child the test owns
+    // only via the observed pid (production never acts: the worker is
+    // blocked in its pre-stop wait with a far deadline and no cancel).
+    let dir = r06_scratch("guard-rescue");
+    let sentinel = dir.join("SENTINEL");
+    let argv = r06_sentinel_argv(&sentinel);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (worker, sink, rx) = r06_spawn_async(
+        argv,
+        WorkloadDest::Null,
+        Instant::now() + Duration::from_secs(120),
+        R06Cancel::Shared(cancel),
+        60_000,
+    );
+    let Some(pid) = r06_wait_forked(&sink, Duration::from_secs(10)) else {
+        let _ = rx.recv_timeout(Duration::from_secs(20));
+        panic!("no fork observed within 10s");
+    };
+    // Guard drop (explicit scope) kills + reaps the live child.
+    {
+        let _guard = R06PidGuard::arm(pid);
+    }
+    assert_reaped_no_zombie(pid);
+    // The worker notices its reaped child and returns promptly: no hung
+    // worker on any path.
+    let drained = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("worker returns after rescue");
+    worker.join().unwrap();
+    if let Ok(t) = drained {
+        r06_unexpected_child(t, "rescued setup must not succeed");
+    }
+    assert!(!sentinel.exists(), "sentinel must never execute");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn r06_pid_guard_rescues_on_unwind() {
+    // F4 proof: the guard rescues on panic paths too (a simulated
+    // assertion failure inside `catch_unwind` — the unwind drops the
+    // guard, which kills + reaps the live child).
+    let dir = r06_scratch("guard-unwind");
+    let sentinel = dir.join("SENTINEL");
+    let argv = r06_sentinel_argv(&sentinel);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (worker, sink, rx) = r06_spawn_async(
+        argv,
+        WorkloadDest::Null,
+        Instant::now() + Duration::from_secs(120),
+        R06Cancel::Shared(cancel),
+        60_000,
+    );
+    let Some(pid) = r06_wait_forked(&sink, Duration::from_secs(10)) else {
+        let _ = rx.recv_timeout(Duration::from_secs(20));
+        panic!("no fork observed within 10s");
+    };
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = R06PidGuard::arm(pid);
+        panic!("simulated assertion failure");
+    }));
+    assert!(r.is_err(), "the simulated failure must unwind");
+    assert_reaped_no_zombie(pid);
+    let drained = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("worker returns after rescue");
+    worker.join().unwrap();
+    if let Ok(t) = drained {
+        r06_unexpected_child(t, "rescued setup must not succeed");
+    }
+    assert!(!sentinel.exists(), "sentinel must never execute");
+    std::fs::remove_dir_all(&dir).unwrap();
 }
