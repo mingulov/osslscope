@@ -28,8 +28,8 @@ osslscope inspect --pid 1234 --provider /opt/openssl/lib64/ossl-modules/legacy.s
   doc, never rows).
 - `--settle S` / `--timeout S` bound the attach-settle and
   trigger-wait phases; `--marker M` requires the target's
-  cmdline to contain `M`; `--out FILE` writes the JSON doc
-  instead of stdout.
+  cmdline to contain `M` (matched at admission, never emitted);
+  `--out FILE` writes the JSON doc instead of stdout.
 - A degraded inventory is `PARTIAL` in the JSON doc but the
   process still exits 0 — always read `status` (only
   `report`/`check` exit 3 on PARTIAL).
@@ -59,11 +59,15 @@ osslscope report --format json --out report.json --cbom bom.json run -- ./my-app
   JSON/diagnostics). Capture workload output explicitly per
   run: `--workload-out FILE` (create+truncate) or
   `--workload-out-fd N` (a caller-held fd, e.g. a harness
-  pipe; mutually exclusive). A child-side log-open failure
-  exits 126 and fails setup naming the path (never silent
-  null); a nonzero child exit without a destination prints
-  one re-run hint line (exit + `--workload-out FILE`) and
-  no workload bytes.
+  pipe; mutually exclusive). Any non-negative fd parses,
+  including 1/2 -- but an fd shared with the observer routes
+  workload bytes into that observer channel (JSON corruption,
+  secret mixing), so prefer an independent fd. Validity is
+  checked pre-fork: a fd that is not open fails setup before
+  any spawn. A child-side log-open failure exits 126 and
+  fails setup naming the path (never silent null); a nonzero
+  child exit without a destination prints one re-run hint
+  line (exit + `--workload-out FILE`) and no workload bytes.
   `run --` predicts the target libcrypto pre-exec from the
   exe's `DT_NEEDED` closure plus loader search
   (`LD_LIBRARY_PATH`, rpath/runpath, system defaults);
@@ -106,10 +110,13 @@ osslscope check --require-provider default --pid 1234 --duration 60
 
 Rules: `--require-provider P`, `--deny-provider P`,
 `--deny-engine`, `--deny-algorithm X`, `--deny-weak`,
-`--require-executed X` (repeatable). Discovery and
-overrides work exactly as in `report`. A `check` over a
-PARTIAL capture fails closed where the missing evidence
-matters — see the result JSON, not just the exit code.
+`--require-executed X` (repeatable; provider matchers must be
+nonempty -- an empty value is a usage error, exit 2, before
+any side effect). Discovery and overrides work exactly as in
+`report`. Verdicts are three-valued: violation on definite
+evidence (exit 10), pass (exit 0/3), or inconclusive (exit 11)
+when a requirement is unproven under relevant uncertainty --
+see the result JSON, not just the exit code.
 
 ## doctor — environment diagnosis
 
@@ -138,8 +145,14 @@ An unsuitable target exits 4. `--table FILE`,
 explicit local enrollment; `--object O` / `--count-object
 C` vet explicit BPF objects; `--format json` emits
 machine-readable output. Implicitly trusted object
-locations are root-owned system dirs; anything else needs
-explicit flags.
+locations are the root-owned system dirs
+(`/usr/local/lib/osslscope`, `/usr/local/lib64/osslscope`,
+`/usr/lib/osslscope`, `/usr/lib64/osslscope` -- first complete
+pair wins; user-owned prefixes never resolve implicitly);
+anything else needs explicit flags. `doctor` vets objects with
+the same primitives the backend composes, so preflight with
+the same explicit pair (or none) predicts exactly what
+`report`/`check` will resolve.
 
 ## alias-audit — find shared dispatch addresses
 
