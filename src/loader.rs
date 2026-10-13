@@ -323,9 +323,10 @@ pub const HARVEST_PROGS: [ProgSpec; 15] = [
 /// deliberately absent (v1 never proves, single-site CALLS only,
 /// no cursor — every scan is full). The scan plane
 /// (SCAN/SEQ/BIRTH/RCOUNT/T_CACHE/CTRL/ATTEMPT) arrives with item
-/// 3; members.o drops its PENDING_QUERY scaffold in subtask C when
-/// members switch to SCAN (the harvest path's cursor maps retire
-/// in item 9).
+/// 3; members.o drops its PENDING_QUERY scaffold in stage D when
+/// members switch to SCAN (stage C keeps it under entry-owned
+/// lifecycle, R18 §6.1; the harvest path's cursor maps retire in
+/// item 9).
 pub const MEMBER_MAPS: [MapSpec; 14] = [
     MapSpec {
         name: "EVENTS",
@@ -2046,6 +2047,30 @@ pub fn ensure_members_fd_budget() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Member-object EVENTS ring size in bytes (pinned here and in
+/// `MEMBER_MAPS`; item 7 grows it to 16MiB).
+pub const MEMBER_RING_BYTES: u64 = 1 << 21;
+
+/// Production session-control value (R18 §5): EXPECTED = attached
+/// member count (1..=512 — item 6 programs fewer legitimately),
+/// epoch 1, SKIP_ALL clear, governor = min(4MiB policy, ring/2)
+/// per [`osslscope_ebpf_common::governor_for_ring`]. Rejects
+/// out-of-range EXPECTED before any attach (the entry would skip
+/// cause 7 on it — loud either way, but fail-fast is better).
+pub fn default_ctrl(
+    expected: u32,
+    ring_bytes: u64,
+) -> anyhow::Result<osslscope_ebpf_common::CtrlValue> {
+    if !(1..=512).contains(&expected) {
+        anyhow::bail!("EXPECTED {expected} outside 1..=512");
+    }
+    Ok(osslscope_ebpf_common::ctrl_value(
+        expected,
+        1,
+        osslscope_ebpf_common::governor_for_ring(ring_bytes),
+    ))
+}
+
 /// Program the scan-plane session control cell (`CTRL[0]`).
 /// Live-proven (L1 reads it back — a failed write REDs there).
 pub fn program_ctrl(
@@ -3657,8 +3682,8 @@ mod tests {
     #[test]
     fn member_map_count_covers_scan_plane() {
         // The spec count is the prepare-time contract: 7 item-2
-        // maps + the 7 scan-plane maps (bridge; PENDING drops in
-        // subtask C → 13).
+        // maps + the 7 scan-plane maps (stage C keeps PENDING —
+        // entry-owned lifecycle, R18 §6.1; D drops it → 13).
         assert_eq!(MEMBER_MAPS.len(), 14);
         for name in [
             "SCAN", "SEQ", "BIRTH", "RCOUNT", "T_CACHE", "CTRL", "ATTEMPT",
@@ -3668,5 +3693,24 @@ mod tests {
                 "spec names {name}"
             );
         }
+    }
+
+    #[test]
+    fn default_ctrl_programs_occupancy_policy() {
+        // Stage C (R18 §2/§5): EXPECTED/epoch/gov program the
+        // occupancy policy; EXPECTED 0 and 513 fail fast (the entry
+        // would skip cause 7 on them).
+        let c = default_ctrl(512, MEMBER_RING_BYTES).unwrap();
+        assert_eq!(
+            (c.expected, c.skip_all, c.epoch, c.governor),
+            (512, 0, 1, 1 << 20),
+            "2MiB ring: small-ring fixture half"
+        );
+        let c16 = default_ctrl(512, 1 << 24).unwrap();
+        assert_eq!(c16.governor, 4 << 20, "16MiB ring: 4MiB policy");
+        let sub = default_ctrl(7, MEMBER_RING_BYTES).unwrap();
+        assert_eq!(sub.expected, 7, "item-6 selective EXPECTED allowed");
+        assert!(default_ctrl(0, MEMBER_RING_BYTES).is_err());
+        assert!(default_ctrl(513, MEMBER_RING_BYTES).is_err());
     }
 }

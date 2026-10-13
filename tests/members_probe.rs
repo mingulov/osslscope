@@ -26,8 +26,21 @@
 //! Three legs (`target_resolves`, `fixture_builds`,
 //! `temp_probe_is_nondestructive`) run offline (pure, unprivileged)
 //! and gate the harness itself.
+//!
+//! Stage C (P7 item 3, R18): the entry plane. Every leg attaches
+//! through the production path AND registers BIRTH (the entry
+//! skips unregistered tids — cause 1). The drain collects CALLs
+//! alongside ALG/ROW; C legs assert ENTRY-OBSERVABLE state only
+//! (CALLs, cells, CALLS, LOSS, silence) — retirement/RET-dependent
+//! acceptance lives in D. C-LEG CONVENTION (no retirement exists
+//! in C): any same-tid admit over an unretired record carries
+//! NESTED-HINT — hint ⟺ prior record, not proven nesting.
+//! Multi-admit C legs use a fresh tid per admit sequence (spawned
+//! worker), interleave a skip to clear, or assert the hint as
+//! correct. Priming always uses sacrificial tids.
 
 use osslscope::loader::Loaded;
+use osslscope::scan::registry::BirthState;
 use std::collections::HashSet;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::PathBuf;
@@ -51,19 +64,52 @@ fn gated() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// Current thread id (BPF `pid_tgid` low half; the tid-keyed
+/// maps' key width — R18 §2).
+fn self_tid() -> u32 {
+    unsafe { libc::gettid() as u32 }
+}
+
+/// Production attach with an explicit CTRL (no BIRTH programmed —
+/// legs register explicitly via the harness-driven registry, so
+/// unregistered/frozen/full setups are expressible).
+fn attach_with_ctrl(
+    obj: &std::path::Path,
+    exe: &std::ffi::CString,
+    off: u64,
+    ctrl: &osslscope_ebpf_common::CtrlValue,
+) -> osslscope::loader::MembersAttached {
+    osslscope::loader::attach_members(obj, exe, off, std::process::id(), ctrl)
+        .expect("production attach")
+}
+
+/// Register tids through the production registry path (poll +
+/// program). Returns the poll's program rows (legs assert the
+/// registry's own behavior separately).
+fn register(loaded: &Loaded, state: &mut BirthState, tids: &[u32]) -> Vec<(u32, u16)> {
+    let rows = state.poll(tids);
+    osslscope::scan::registry::program_births(&loaded.maps, &rows).expect("program BIRTH");
+    rows
+}
+
 /// Dogfood the production attach (fd budget → prepare → load →
-/// CTRL program → entry + member links). Every leg attaches through
-/// here, so the production path is live-proven along with the legs.
-/// CTRL: EXPECTED = 512 attached members, epoch 1, governor =
-/// half the 2MiB ring (provisional until item 7 re-derives).
+/// CTRL program → entry + member links) + self-tid BIRTH
+/// registration. Every leg attaches through here (or
+/// `attach_with_ctrl`), so the production path is live-proven
+/// along with the legs. CTRL: EXPECTED = 512 attached members,
+/// epoch 1, governor = min(4MiB policy, ring/2) — 1MiB on the 2MiB
+/// ring (small-ring fixture rule, R18 §2; item 7 re-derives).
 fn attach_chunk(
     obj: &std::path::Path,
     exe: &std::ffi::CString,
     off: u64,
 ) -> osslscope::loader::MembersAttached {
-    let ctrl = osslscope_ebpf_common::ctrl_value(512, 1, 1 << 20);
-    osslscope::loader::attach_members(obj, exe, off, std::process::id(), &ctrl)
-        .expect("production attach")
+    let ctrl =
+        osslscope::loader::default_ctrl(512, osslscope::loader::MEMBER_RING_BYTES).expect("CTRL");
+    let attached = attach_with_ctrl(obj, exe, off, &ctrl);
+    let mut state = BirthState::new();
+    register(&attached.loaded, &mut state, &[self_tid()]);
+    attached
 }
 
 /// Populate the member object's `ALG_CLASS` with fixture entries
@@ -96,12 +142,14 @@ fn populate_alg_class(loaded: &Loaded, entries: &[(String, u16)]) {
     }
 }
 
-/// Drain the member EVENTS ring to parsed (ALG, ROW) events. Drops
-/// nothing silently: unknown kinds fail loud (members emit only
-/// ALG/ROW in v1 — no QUERY_RET, no WALK-DONE yet).
+/// Drain the member EVENTS ring to parsed (CALL, ALG, ROW)
+/// events. Drops nothing silently: unknown kinds fail loud (stage
+/// C emits CALL/ALG/ROW — no RET/GUARD until D). CALLs arrive in
+/// ring order; C legs join by (tid,seq), never by position.
 fn drain(
     loaded: &Loaded,
 ) -> (
+    Vec<osslscope_ebpf_common::ScanCallEvent>,
     Vec<osslscope_ebpf_common::AlgEvent>,
     Vec<osslscope_ebpf_common::RowEvent>,
 ) {
@@ -111,6 +159,7 @@ fn drain(
     let data = MapData::from_fd(fd).expect("EVENTS mapdata");
     let map = Map::from_map_data(data).expect("EVENTS map");
     let mut ring = RingBuf::try_from(map).expect("EVENTS ringbuf");
+    let mut calls = Vec::new();
     let mut algs = Vec::new();
     let mut rows = Vec::new();
     while let Some(item) = ring.next() {
@@ -118,12 +167,36 @@ fn drain(
         assert!(b.len() >= 4, "short ring item: {} bytes", b.len());
         let kind = u32::from_le_bytes(b[0..4].try_into().unwrap());
         match kind {
+            wire::KIND_SCAN_CALL => {
+                calls.push(wire::parse_scan_call_event(&b).expect("parse CALL"))
+            }
             wire::KIND_ALG => algs.push(wire::parse_alg_event(&b, 4096).expect("parse ALG")),
             wire::KIND_ROW => rows.push(wire::parse_row_event(&b).expect("parse ROW")),
-            k => panic!("unexpected ring kind {k} (v1 emits ALG/ROW only)"),
+            k => panic!("unexpected ring kind {k} (C emits CALL/ALG/ROW only)"),
         }
     }
-    (algs, rows)
+    (calls, algs, rows)
+}
+
+/// Split CALL flags to (nested-hint, cause) (wire vocabulary).
+fn call_parts(c: &osslscope_ebpf_common::ScanCallEvent) -> (bool, u8) {
+    osslscope_ebpf_common::split_call_flags(c.flags)
+}
+
+/// Bridge-leg CALL assert: exactly `n` admitted CALLs on this tid
+/// (C emits one CALL per entry hit; all bridge legs admit).
+/// Seq/hint patterns are the admit-shape leg's job — bridge legs
+/// pin count + admission + op/tid only.
+fn assert_calls_admitted(calls: &[osslscope_ebpf_common::ScanCallEvent], n: usize, tag: &str) {
+    use osslscope_ebpf_common as wire;
+    assert_eq!(calls.len(), n, "{tag}: one CALL per query");
+    for c in calls {
+        assert_eq!(c.kind, wire::KIND_SCAN_CALL);
+        assert_eq!(c.op, OP, "{tag}: CALL op");
+        assert_eq!(c.tid, self_tid(), "{tag}: CALL tid");
+        let (_, cause) = call_parts(c);
+        assert_eq!(cause, wire::SKIP_ADMITTED, "{tag}: CALL admitted");
+    }
 }
 
 /// Folded per-CPU u32-keyed map read (mirrors the product's
@@ -157,6 +230,114 @@ fn assert_loss_zero(loaded: &Loaded) {
         let sum: u64 = slots.iter().fold(0, |a, &b| a.wrapping_add(b));
         assert_eq!(sum, 0, "LOSS[{k}] must be zero on the clean path");
     }
+}
+
+// ===== stage-C cell readback + map programming =====
+
+/// Raw u64-cell read (SEQ/RCOUNT): None on ENOENT (absent cell —
+/// expected for fresh/skipped tids), hard error otherwise.
+fn read_u64_cell(loaded: &Loaded, map: &str, tid: u32) -> Option<u64> {
+    use std::os::fd::AsRawFd as _;
+    let fd = loaded.maps[map].as_raw_fd();
+    let mut val = [0u8; 8];
+    match unsafe { ossl_bpf_sys::map_lookup_elem(fd, &tid.to_le_bytes(), &mut val) } {
+        Ok(()) => Some(u64::from_le_bytes(val)),
+        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => None,
+        Err(e) => panic!("lookup {map}[{tid}]: {e}"),
+    }
+}
+
+/// Raw u16-cell read (BIRTH): None on ENOENT.
+fn read_u16_cell(loaded: &Loaded, map: &str, tid: u32) -> Option<u16> {
+    use std::os::fd::AsRawFd as _;
+    let fd = loaded.maps[map].as_raw_fd();
+    let mut val = [0u8; 2];
+    match unsafe { ossl_bpf_sys::map_lookup_elem(fd, &tid.to_le_bytes(), &mut val) } {
+        Ok(()) => Some(u16::from_le_bytes(val)),
+        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => None,
+        Err(e) => panic!("lookup {map}[{tid}]: {e}"),
+    }
+}
+
+/// SCAN cell read (40B ScanRec, byte-exact): None on ENOENT.
+fn read_scan_cell(loaded: &Loaded, tid: u32) -> Option<osslscope_ebpf_common::ScanRec> {
+    use std::os::fd::AsRawFd as _;
+    let fd = loaded.maps["SCAN"].as_raw_fd();
+    let mut val = [0u8; 40];
+    match unsafe { ossl_bpf_sys::map_lookup_elem(fd, &tid.to_le_bytes(), &mut val) } {
+        Ok(()) => {
+            let op = u64::from_le_bytes(val[0..8].try_into().unwrap());
+            let ns_ptr = u64::from_le_bytes(val[8..16].try_into().unwrap());
+            let seq = u64::from_le_bytes(val[16..24].try_into().unwrap());
+            let expected = u32::from_le_bytes(val[24..28].try_into().unwrap());
+            let epoch = u64::from_le_bytes(val[32..40].try_into().unwrap());
+            Some(osslscope_ebpf_common::ScanRec {
+                op,
+                ns_ptr,
+                seq,
+                expected,
+                _pad: 0,
+                epoch,
+            })
+        }
+        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => None,
+        Err(e) => panic!("lookup SCAN[{tid}]: {e}"),
+    }
+}
+
+/// PENDING presence read (C-only — D drops the map): the 16B value
+/// decoded to (op, ns_ptr); None on ENOENT. The key namespaces by
+/// the entry cookie over this process's pid_tgid (BPF `pend_key`
+/// mirrored exactly).
+fn pend_key_for(pid: u32, tid: u32) -> u64 {
+    ((pid as u64) << 32 | tid as u64) ^ ((osslscope_ebpf_common::MEMBER_ENTRY_COOKIE + 1) << 56)
+}
+
+fn read_pending_cell(loaded: &Loaded, pid: u32, tid: u32) -> Option<(u64, u64)> {
+    use std::os::fd::AsRawFd as _;
+    let fd = loaded.maps["PENDING_QUERY"].as_raw_fd();
+    let mut val = [0u8; 16];
+    match unsafe {
+        ossl_bpf_sys::map_lookup_elem(fd, &pend_key_for(pid, tid).to_le_bytes(), &mut val)
+    } {
+        Ok(()) => Some((
+            u64::from_le_bytes(val[0..8].try_into().unwrap()),
+            u64::from_le_bytes(val[8..16].try_into().unwrap()),
+        )),
+        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => None,
+        Err(e) => panic!("lookup PENDING[{tid}]: {e}"),
+    }
+}
+
+/// ATTEMPT total (PerCpuArray[1] summed across CPUs).
+fn read_attempt(loaded: &Loaded) -> u64 {
+    use aya::maps::{Map, MapData, PerCpuArray};
+    let fd = loaded.maps["ATTEMPT"].try_clone().expect("clone ATTEMPT");
+    let data = MapData::from_fd(fd).expect("mapdata");
+    let map = Map::from_map_data(data).expect("map");
+    let m = PerCpuArray::<_, u64>::try_from(map).expect("percpu-array shape");
+    m.get(&0, 0)
+        .expect("ATTEMPT[0]")
+        .iter()
+        .fold(0u64, |a, &b| a.wrapping_add(b))
+}
+
+/// Raw cell write (programmed-cell legs): SEQ/RCOUNT u64, BIRTH u16,
+/// SCAN 40B, PENDING 16B. BPF_ANY (flags 0).
+fn write_cell(loaded: &Loaded, map: &str, key: &[u8], val: &[u8]) {
+    use std::os::fd::AsRawFd as _;
+    unsafe { ossl_bpf_sys::map_update_elem(loaded.maps[map].as_raw_fd(), key, val, 0) }
+        .unwrap_or_else(|e| panic!("write {map}: {e}"));
+}
+
+fn scan_bytes(r: &osslscope_ebpf_common::ScanRec) -> [u8; 40] {
+    let mut b = [0u8; 40];
+    b[0..8].copy_from_slice(&r.op.to_le_bytes());
+    b[8..16].copy_from_slice(&r.ns_ptr.to_le_bytes());
+    b[16..24].copy_from_slice(&r.seq.to_le_bytes());
+    b[24..28].copy_from_slice(&r.expected.to_le_bytes());
+    b[32..40].copy_from_slice(&r.epoch.to_le_bytes());
+    b
 }
 
 // ===== own-process query target =====
@@ -228,22 +409,122 @@ fn fire(op: i32, n: usize) {
     }
 }
 
-/// File offset of the query symbol in our own image (uprobe
-/// attach point), via symtab + containing PT_LOAD.
-fn query_off() -> u64 {
+/// Depth-1 self-calling target (C nested legs): TRUE same-thread
+/// recursion — the uprobe fires per call depth, uretprobes per
+/// return. Extra 4th arg is BPF-invisible (entry reads arg1/arg2
+/// only). Same anchor discipline as the main target (every nested
+/// leg calls it; `target_resolves` pins the symbol offline).
+///
+/// # Safety
+///
+/// `no_store` must point to a live writable `c_int` for the call.
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub unsafe extern "C" fn osslscope_member_query_nested(
+    _provctx: *mut std::ffi::c_void,
+    _op: std::ffi::c_int,
+    no_store: *mut std::ffi::c_int,
+    depth: std::ffi::c_int,
+) -> *const FakeAlg {
+    if depth > 0 {
+        let mut inner_ns: std::ffi::c_int = 0;
+        // SAFETY: `inner_ns` is a live stack slot for the call.
+        let _inner = unsafe {
+            osslscope_member_query_nested(
+                std::ptr::null_mut(),
+                _op,
+                &mut inner_ns as *mut std::ffi::c_int,
+                depth - 1,
+            )
+        };
+        std::hint::black_box(_inner);
+    }
+    unsafe {
+        *no_store = NS_VERDICT.load(Ordering::SeqCst);
+        FIXTURE_ARRAY.load(Ordering::SeqCst) as *const FakeAlg
+    }
+}
+
+/// Fire the nested target once at `depth` (depth 1 = outer + inner).
+fn fire_nested(op: i32, depth: i32) {
+    let mut ns: i32 = 0;
+    // SAFETY: `ns` is a live stack slot for the call.
+    let _rv = unsafe {
+        osslscope_member_query_nested(
+            std::ptr::null_mut(),
+            op,
+            &mut ns as *mut std::ffi::c_int,
+            depth,
+        )
+    };
+    std::hint::black_box(_rv);
+}
+
+/// Blocking-target control: pipe fds + entry flag + once latch.
+/// The target blocks between entry and return ONLY when the latch
+/// is armed (first call), so churn legs can detach/bump behind it.
+static BLOCK_PIPE_RD: AtomicI32 = AtomicI32::new(-1);
+static BLOCK_ENTERED: AtomicI32 = AtomicI32::new(0);
+static BLOCK_ONCE: AtomicI32 = AtomicI32::new(0);
+
+/// Pipe-blocked target (C churn legs): when `BLOCK_ONCE` is armed,
+/// signals entry then blocks on `BLOCK_PIPE_RD` until the harness
+/// releases it (detach/epoch-bump happens behind the blocked
+/// return). Unarmed calls pass straight through.
+///
+/// # Safety
+///
+/// `no_store` must point to a live writable `c_int` for the call.
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub unsafe extern "C" fn osslscope_member_query_blocking(
+    _provctx: *mut std::ffi::c_void,
+    _op: std::ffi::c_int,
+    no_store: *mut std::ffi::c_int,
+) -> *const FakeAlg {
+    if BLOCK_ONCE.swap(0, Ordering::SeqCst) != 0 {
+        BLOCK_ENTERED.store(1, Ordering::SeqCst);
+        let mut buf = [0u8; 1];
+        let r = unsafe {
+            libc::read(
+                BLOCK_PIPE_RD.load(Ordering::SeqCst),
+                buf.as_mut_ptr() as *mut libc::c_void,
+                1,
+            )
+        };
+        assert_eq!(r, 1, "blocking target released with 1 byte");
+    }
+    unsafe {
+        *no_store = NS_VERDICT.load(Ordering::SeqCst);
+        FIXTURE_ARRAY.load(Ordering::SeqCst) as *const FakeAlg
+    }
+}
+
+/// Fire the blocking target once (blocks iff the latch is armed).
+fn fire_blocking(op: i32) {
+    let mut ns: i32 = 0;
+    // SAFETY: `ns` is a live stack slot for the call.
+    let _rv = unsafe {
+        osslscope_member_query_blocking(std::ptr::null_mut(), op, &mut ns as *mut std::ffi::c_int)
+    };
+    std::hint::black_box(_rv);
+}
+
+/// File offset of a named query symbol (uprobe attach point).
+fn symbol_off(name: &str) -> u64 {
     let exe = std::env::current_exe().expect("current exe");
     let bytes = std::fs::read(&exe).expect("read exe");
     let elf = goblin::elf::Elf::parse(&bytes).expect("parse exe");
     let sym = elf
         .syms
         .iter()
-        .find(|s| elf.strtab.get_at(s.st_name) == Some("osslscope_member_query"))
-        .expect("query symbol present");
-    assert!(sym.st_size > 0, "query symbol has nonzero size");
+        .find(|s| elf.strtab.get_at(s.st_name) == Some(name))
+        .unwrap_or_else(|| panic!("query symbol {name} present"));
+    assert!(sym.st_size > 0, "query symbol {name} has nonzero size");
     assert_eq!(
         sym.st_type(),
         goblin::elf::sym::STT_FUNC,
-        "query symbol is a function"
+        "query symbol {name} is a function"
     );
     for ph in elf
         .program_headers
@@ -254,7 +535,51 @@ fn query_off() -> u64 {
             return sym.st_value - ph.p_vaddr + ph.p_offset;
         }
     }
-    panic!("query symbol outside LOAD segments");
+    panic!("query symbol {name} outside LOAD segments");
+}
+
+/// Fire `n` queries on a FRESH sacrificial worker tid (joined
+/// before return — deterministic, no stray-thread window past the
+/// join): the worker self-registers birth 0, fires, and reports
+/// its tid. Returns the worker tid (legs filter CALLs by it).
+fn fire_on_worker(loaded: &Loaded, op: i32, n: usize) -> u32 {
+    std::thread::scope(|s| {
+        let h = s.spawn(|| {
+            let tid = self_tid();
+            write_cell(loaded, "BIRTH", &tid.to_le_bytes(), &0u16.to_le_bytes());
+            fire(op, n);
+            tid
+        });
+        h.join().expect("worker join")
+    })
+}
+
+/// File offset of the query symbol in our own image (uprobe
+/// attach point), via symtab + containing PT_LOAD.
+fn query_off() -> u64 {
+    symbol_off("osslscope_member_query")
+}
+
+/// Assert exactly one LOSS id is nonzero at `val` (skip-leg
+/// loss pins: the expected cause-loss fired, nothing else).
+fn assert_loss_only(loaded: &Loaded, id: u32, val: u64, tag: &str) {
+    use aya::maps::{Map, MapData, PerCpuHashMap};
+    let fd = loaded.maps["LOSS"].try_clone().expect("clone LOSS");
+    let data = MapData::from_fd(fd).expect("mapdata");
+    let map = Map::from_map_data(data).expect("map");
+    let m = PerCpuHashMap::<_, u32, u64>::try_from(map).expect("percpu shape");
+    let mut seen = false;
+    for r in m.iter() {
+        let (k, slots) = r.expect("percpu iter");
+        let sum: u64 = slots.iter().fold(0, |a, &b| a.wrapping_add(b));
+        if k == id {
+            assert_eq!(sum, val, "{tag}: LOSS[{id}]");
+            seen = true;
+        } else {
+            assert_eq!(sum, 0, "{tag}: LOSS[{k}] must be zero");
+        }
+    }
+    assert!(seen || val == 0, "{tag}: LOSS[{id}] row present");
 }
 
 fn own_exe_cstr() -> std::ffi::CString {
@@ -537,6 +862,15 @@ fn target_resolves() {
     let off = query_off();
     assert!(off > 0, "query file offset nonzero, got {off}");
     eprintln!("query target: osslscope_member_query @ file+{off:#x}");
+    // C nested/churn targets resolve too (self-pinning anchors).
+    for name in [
+        "osslscope_member_query_nested",
+        "osslscope_member_query_blocking",
+    ] {
+        let o = symbol_off(name);
+        assert!(o > 0, "{name} file offset nonzero, got {o}");
+        eprintln!("query target: {name} @ file+{o:#x}");
+    }
 }
 
 /// Offline: the fixture builder lays out exact bytes (array cells,
@@ -709,7 +1043,8 @@ fn run_e7(obj: &std::path::Path, exe: &std::ffi::CString, off: u64, cold: bool) 
         "e7-{temp}: {QUERIES} queries in {wall:?} ({:.1}µs/scan, recorded)",
         wall.as_micros() as f64 / QUERIES as f64
     );
-    let (algs, rows) = drain(loaded);
+    let (calls, algs, rows) = drain(loaded);
+    assert_calls_admitted(&calls, QUERIES, "e7");
     assert_eq!(
         read_percpu(loaded, "CALLS", OP, false),
         QUERIES as u64,
@@ -786,7 +1121,8 @@ fn run_e7_pageout(obj: &std::path::Path, exe: &std::ffi::CString, off: u64, fx: 
     FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
     NS_VERDICT.store(0, Ordering::SeqCst);
     fire(OP as i32, QUERIES);
-    let (algs, rows) = drain(loaded);
+    let (calls, algs, rows) = drain(loaded);
+    assert_calls_admitted(&calls, QUERIES, "e7-cold");
     assert_abort_clean(loaded, &algs, &rows, QUERIES as u64, "e7-cold");
 }
 
@@ -794,9 +1130,9 @@ fn run_e7_pageout(obj: &std::path::Path, exe: &std::ffi::CString, off: u64, fx: 
 /// Pageout-cold evicts the whole fixture, so every slot read
 /// fails; the munmap-hole unmaps only the live prefix's page while
 /// the mapped zero tail reads fine and stays silent (names==0).
-/// Either way TRUNC holds WALK_READ alone, the ring stays empty,
-/// member 0 still counts (its bump precedes the slot read), and
-/// nothing is lost.
+/// Either way TRUNC holds WALK_READ alone, the member ring stays
+/// empty, the entry still counts (admit-bump precedes the walk),
+/// and nothing is lost.
 fn assert_abort_clean(
     loaded: &Loaded,
     algs: &[osslscope_ebpf_common::AlgEvent],
@@ -822,11 +1158,13 @@ fn assert_abort_clean(
     assert_loss_zero(loaded);
 }
 
-/// Null queries (rv == 0) stay silent and uncounted (v1 returns
-/// before CALLS; member-0 QUERY_RET-EMPTY is item 3). A positive
-/// control fires through the SAME links first: a dead attach would
-/// otherwise satisfy every null assert vacuously (T03 demands
-/// positive fire evidence per firing leg).
+/// Null queries (rv == 0) stay member-silent but are COUNTED in
+/// C (spec-mandated flip, R18 §6.2/§7C: the entry cannot see rv,
+/// so CALLS admit-bumps NULL too; member-0 QUERY_RET-EMPTY lands
+/// in D and asserts there). A positive control fires through the
+/// SAME links first: a dead attach would otherwise satisfy every
+/// null assert vacuously (T03 demands positive fire evidence per
+/// firing leg).
 fn run_null(obj: &std::path::Path, exe: &std::ffi::CString, off: u64) {
     let fx = Fixture::build(&e7_slots(), &[]);
     fx.pretouch();
@@ -837,7 +1175,8 @@ fn run_null(obj: &std::path::Path, exe: &std::ffi::CString, off: u64) {
     // Positive control: one live query proves these links fire.
     FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
     fire(OP as i32, 1);
-    let (algs, rows) = drain(loaded);
+    let (calls, algs, rows) = drain(loaded);
+    assert_calls_admitted(&calls, 1, "null-control");
     assert_eq!(
         read_percpu(loaded, "CALLS", OP, false),
         1,
@@ -847,18 +1186,20 @@ fn run_null(obj: &std::path::Path, exe: &std::ffi::CString, off: u64) {
         !algs.is_empty() && !rows.is_empty(),
         "null-leg control: live query emits"
     );
-    // Null phase: silence, and the count stays at the control's 1.
+    // Null phase: member silence, but the count advances (C flip:
+    // the entry cannot see rv — both nulls admitted + counted).
     FIXTURE_ARRAY.store(0, Ordering::SeqCst);
     fire(OP as i32, 2);
-    let (algs, rows) = drain(loaded);
+    let (calls, algs, rows) = drain(loaded);
+    assert_calls_admitted(&calls, 2, "null-phase");
     assert!(
         algs.is_empty() && rows.is_empty(),
-        "null queries emit nothing"
+        "null queries emit no member records"
     );
     assert_eq!(
         read_percpu(loaded, "CALLS", OP, false),
-        1,
-        "null queries uncounted (control count unchanged)"
+        3,
+        "null queries counted in C (control 1 + 2 nulls)"
     );
     assert_loss_zero(loaded);
 }
@@ -888,7 +1229,8 @@ fn l3_boundaries() {
         FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
         NS_VERDICT.store(0, Ordering::SeqCst);
         fire(OP as i32, 2);
-        let (algs, rows) = drain(loaded);
+        let (calls, algs, rows) = drain(loaded);
+        assert_calls_admitted(&calls, 2, "l3-empty");
         assert_eq!(read_percpu(loaded, "CALLS", OP, false), 2);
         assert_ne!(
             read_percpu(loaded, "TRUNC", OP, true) & wire::TRUNC_WALK_EMPTY,
@@ -915,7 +1257,8 @@ fn l3_boundaries() {
         FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
         NS_VERDICT.store(0, Ordering::SeqCst);
         fire(OP as i32, 2);
-        let (algs, rows) = drain(loaded);
+        let (calls, algs, rows) = drain(loaded);
+        assert_calls_admitted(&calls, 2, "l3-one");
         assert_eq!(read_percpu(loaded, "CALLS", OP, false), 2);
         assert_eq!(
             read_percpu(loaded, "TRUNC", OP, true) & wire::TRUNC_WALK_EMPTY,
@@ -980,7 +1323,8 @@ fn l3_boundaries() {
         FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
         NS_VERDICT.store(0, Ordering::SeqCst);
         fire(OP as i32, 2);
-        let (algs, rows) = drain(loaded);
+        let (calls, algs, rows) = drain(loaded);
+        assert_calls_admitted(&calls, 2, "l3-tail");
         assert_eq!(read_percpu(loaded, "CALLS", OP, false), 2);
         for j in 0..3u64 {
             let got: Vec<_> = algs.iter().filter(|a| a.idx == j).collect();
@@ -1081,7 +1425,8 @@ fn l3_boundaries() {
             "hole errno is ENOMEM"
         );
         fire(OP as i32, 2);
-        let (algs, rows) = drain(loaded);
+        let (calls, algs, rows) = drain(loaded);
+        assert_calls_admitted(&calls, 2, "l3-hole");
         assert_abort_clean(loaded, &algs, &rows, 2, "l3-hole");
     }
 }
@@ -1117,7 +1462,8 @@ fn l4_dispatch_bounds() {
         FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
         NS_VERDICT.store(0, Ordering::SeqCst);
         fire(OP as i32, 2);
-        let (algs, rows) = drain(loaded);
+        let (calls, algs, rows) = drain(loaded);
+        assert_calls_admitted(&calls, 2, "l4a");
         assert_eq!(read_percpu(loaded, "CALLS", OP, false), 2);
         assert_eq!(
             read_percpu(loaded, "TRUNC", OP, true),
@@ -1165,7 +1511,8 @@ fn l4_dispatch_bounds() {
         FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
         NS_VERDICT.store(0, Ordering::SeqCst);
         fire(OP as i32, 2);
-        let (algs, rows) = drain(loaded);
+        let (calls, algs, rows) = drain(loaded);
+        assert_calls_admitted(&calls, 2, "l4b");
         assert_eq!(read_percpu(loaded, "CALLS", OP, false), 2);
         assert_eq!(
             read_percpu(loaded, "TRUNC", OP, true),
@@ -1216,7 +1563,8 @@ fn l4_dispatch_bounds() {
         FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
         NS_VERDICT.store(0, Ordering::SeqCst);
         fire(OP as i32, 2);
-        let (algs, rows) = drain(loaded);
+        let (calls, algs, rows) = drain(loaded);
+        assert_calls_admitted(&calls, 2, "l4c");
         assert_eq!(read_percpu(loaded, "CALLS", OP, false), 2);
         assert_eq!(
             read_percpu(loaded, "TRUNC", OP, true),
@@ -1290,7 +1638,8 @@ fn l5_no_store() {
     );
     NS_VERDICT.store(0, Ordering::SeqCst);
     fire(OP as i32, 1);
-    let (algs, rows) = drain(loaded);
+    let (calls, algs, rows) = drain(loaded);
+    assert_calls_admitted(&calls, 3, "l5");
     assert_eq!(read_percpu(loaded, "CALLS", OP, false), 3);
     // Masked, not exact: this fixture is unpadded, so members past
     // the terminator read names-region memory and may OR past-T soup
@@ -1381,7 +1730,8 @@ fn l6_full_chunk() {
         let t0 = Instant::now();
         fire(OP as i32, 2);
         eprintln!("l6a: 2 full scans in {:?} (recorded)", t0.elapsed());
-        let (algs, rows) = drain(loaded);
+        let (calls, algs, rows) = drain(loaded);
+        assert_calls_admitted(&calls, 2, "l6a");
         assert_eq!(read_percpu(loaded, "CALLS", OP, false), 2);
         assert_eq!(
             read_percpu(loaded, "TRUNC", OP, true),
@@ -1437,7 +1787,8 @@ fn l6_full_chunk() {
         FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
         NS_VERDICT.store(0, Ordering::SeqCst);
         fire(OP as i32, 2);
-        let (algs, rows) = drain(loaded);
+        let (calls, algs, rows) = drain(loaded);
+        assert_calls_admitted(&calls, 2, "l6b");
         assert_eq!(read_percpu(loaded, "CALLS", OP, false), 2);
         assert_eq!(
             read_percpu(loaded, "TRUNC", OP, true),
@@ -1521,7 +1872,8 @@ fn l7_cookie_mismatch() {
     .expect("re-attach member_3 with cookie 7");
     drop(std::mem::replace(&mut attached.members[3], m3));
     fire(OP as i32, 2);
-    let (algs, rows) = drain(loaded);
+    let (calls, algs, rows) = drain(loaded);
+    assert_calls_admitted(&calls, 2, "l7");
     assert_eq!(read_percpu(loaded, "CALLS", OP, false), 2);
     for j in [0u64, 1, 2] {
         let got: Vec<_> = algs.iter().filter(|a| a.idx == j).collect();
@@ -1571,4 +1923,1618 @@ fn l7_cookie_mismatch() {
         }
     }
     assert_eq!(cookie_hits, 2, "one mismatch per query");
+}
+
+// ===== stage-C legs (R18 §7C; lane only) =====
+
+/// C admit-shape: fresh tid admits (CALL + seq 0, no hint, SCAN
+/// cell exact, RCOUNT ACTIVE|0, PENDING present — C-only, CALLS 1);
+/// second admit on the same tid carries NESTED-HINT (asserted as
+/// correct-for-C — no retirement exists; D retires between and
+/// replaces these asserts with the retire-quiet pair, §10.2).
+#[test]
+#[ignore]
+fn c_admit_shape() {
+    use osslscope_ebpf_common as wire;
+    let Some(obj) = gated() else {
+        eprintln!("SKIP(members-live): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
+        return;
+    };
+    let exe = own_exe_cstr();
+    let off = query_off();
+    let attached = attach_chunk(&obj, &exe, off);
+    let loaded = &attached.loaded;
+    let tid = self_tid();
+    let pid = std::process::id();
+    FIXTURE_ARRAY.store(0, Ordering::SeqCst); // NULL: entry-side only
+    NS_VERDICT.store(0, Ordering::SeqCst);
+    fire(OP as i32, 1);
+    let (calls, algs, rows) = drain(loaded);
+    assert_eq!(calls.len(), 1, "one CALL per admit");
+    let c = &calls[0];
+    assert_eq!((c.kind, c.op, c.tid), (wire::KIND_SCAN_CALL, OP, tid));
+    assert_eq!(
+        call_parts(c),
+        (false, wire::SKIP_ADMITTED),
+        "seq-0 admit: silent"
+    );
+    assert_eq!(c.seq, wire::make_seq(0, 0), "fresh tid mints (0,0)");
+    assert!(algs.is_empty() && rows.is_empty(), "NULL: member silence");
+    let rec = read_scan_cell(loaded, tid).expect("SCAN published");
+    assert_eq!(
+        (rec.op, rec.seq, rec.expected, rec.epoch),
+        (OP as u64, wire::make_seq(0, 0), 512, 1),
+        "SCAN cell exact (EXPECTED+epoch frozen from CTRL)"
+    );
+    assert_ne!(rec.ns_ptr, 0, "SCAN stashes the caller out-pointer");
+    let rc = read_u64_cell(loaded, "RCOUNT", tid).expect("RCOUNT reset");
+    assert_eq!(
+        wire::split_rcount(rc),
+        (0, wire::RCOUNT_STATE_ACTIVE),
+        "RCOUNT ACTIVE|0"
+    );
+    let pend = read_pending_cell(loaded, pid, tid).expect("PENDING present (C-only)");
+    assert_eq!(pend.0, OP as u64, "PENDING op");
+    assert_ne!(pend.1, 0, "PENDING ns_ptr");
+    assert_eq!(
+        wire::split_seq(read_u64_cell(loaded, "SEQ", tid).expect("SEQ minted")),
+        (0, 0)
+    );
+    assert_eq!(read_percpu(loaded, "CALLS", OP, false), 1, "CALLS 1");
+    assert_eq!(read_attempt(loaded), 1, "ATTEMPT 1");
+    assert_loss_zero(loaded);
+    // Second admit, same tid: seq 1 WITH nested-hint
+    // (correct-for-C — the record is unretired, ACTIVE, count 0).
+    fire(OP as i32, 1);
+    let (calls, _, _) = drain(loaded);
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        call_parts(&calls[0]),
+        (true, wire::SKIP_ADMITTED),
+        "second same-tid admit hints (C convention)"
+    );
+    assert_eq!(calls[0].seq, wire::make_seq(0, 1));
+    assert_eq!(read_percpu(loaded, "CALLS", OP, false), 2);
+    assert_eq!(read_attempt(loaded), 2);
+    assert_loss_zero(loaded);
+}
+
+/// Skip-case driver (R18 §7C 4-tuple): fresh attach, same-attach
+/// admit-control (positive fire evidence — T03), drain, baseline,
+/// `setup` arms the skip condition, one fire, exact 4-tuple
+/// (cause, ATTEMPTΔ==1 single count, CALLSΔ, state-delta) +
+/// member silence + loss pin. `check_cells` asserts the
+/// case-specific RCOUNT/SEQ end state (uniform parts assert here:
+/// PENDING absent + SCAN absent — C-only PENDING readback).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one driver for 8 skip shapes; bundling would hide the 4-tuple"
+)]
+fn skip_case(
+    obj: &std::path::Path,
+    exe: &std::ffi::CString,
+    off: u64,
+    tag: &str,
+    cause: u8,
+    loss: u32,
+    setup: impl FnOnce(&Loaded),
+    check_cells: impl FnOnce(&Loaded, u32),
+) {
+    use osslscope_ebpf_common as wire;
+    let attached = attach_chunk(obj, exe, off);
+    let loaded = &attached.loaded;
+    let tid = self_tid();
+    let pid = std::process::id();
+    FIXTURE_ARRAY.store(0, Ordering::SeqCst);
+    NS_VERDICT.store(0, Ordering::SeqCst);
+    // Admit-control: same attach, must admit (else the skip below
+    // could be a dead attach, not the armed condition).
+    fire(OP as i32, 1);
+    let (calls, _, _) = drain(loaded);
+    assert_eq!(calls.len(), 1, "{tag}: control CALL");
+    assert_eq!(
+        call_parts(&calls[0]),
+        (false, wire::SKIP_ADMITTED),
+        "{tag}: control admits"
+    );
+    assert!(
+        read_pending_cell(loaded, pid, tid).is_some(),
+        "{tag}: control PENDING"
+    );
+    assert!(read_scan_cell(loaded, tid).is_some(), "{tag}: control SCAN");
+    let (attempt0, calls0, loss0) = (
+        read_attempt(loaded),
+        read_percpu(loaded, "CALLS", OP, false),
+        read_percpu(loaded, "LOSS", loss, false),
+    );
+    setup(loaded);
+    fire(OP as i32, 1);
+    let (calls, algs, rows) = drain(loaded);
+    assert_eq!(calls.len(), 1, "{tag}: skip CALL");
+    let c = &calls[0];
+    assert_eq!(c.tid, tid, "{tag}: skip CALL tid");
+    assert_eq!(call_parts(c), (false, cause), "{tag}: skip cause");
+    assert_eq!(c.seq, 0, "{tag}: skips carry seq 0");
+    assert_eq!(
+        read_attempt(loaded) - attempt0,
+        1,
+        "{tag}: ATTEMPTΔ==1 (single count)"
+    );
+    assert_eq!(
+        read_percpu(loaded, "CALLS", OP, false) - calls0,
+        0,
+        "{tag}: CALLSΔ==0"
+    );
+    assert_eq!(
+        read_percpu(loaded, "LOSS", loss, false) - loss0,
+        1,
+        "{tag}: LOSS[{loss}]Δ==1"
+    );
+    assert!(
+        algs.is_empty() && rows.is_empty(),
+        "{tag}: skip member silence"
+    );
+    assert!(
+        read_pending_cell(loaded, pid, tid).is_none(),
+        "{tag}: PENDING absent (C-only)"
+    );
+    assert!(read_scan_cell(loaded, tid).is_none(), "{tag}: SCAN absent");
+    check_cells(loaded, tid);
+}
+
+/// C skip battery: every gate skips with its cause + loss-proof
+/// counter + exact 4-tuple (R18 §7C). Each case opens with a
+/// same-attach admit-control.
+#[test]
+#[ignore]
+fn c_skip_causes() {
+    use osslscope_ebpf_common as wire;
+    let Some(obj) = gated() else {
+        eprintln!("SKIP(members-live): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
+        return;
+    };
+    let exe = own_exe_cstr();
+    let off = query_off();
+    let gov = 1u64 << 20;
+    // SKIP_ALL (cause 5): program the bit behind the control.
+    skip_case(
+        &obj,
+        &exe,
+        off,
+        "skip-all",
+        wire::SKIP_ALL,
+        wire::LOSS_SKIP_ALL,
+        |loaded| {
+            let ctrl = wire::CtrlValue {
+                expected: 512,
+                skip_all: 1,
+                _pad: [0; 3],
+                epoch: 1,
+                governor: gov,
+            };
+            osslscope::loader::program_ctrl(&loaded.maps, &ctrl).expect("SKIP_ALL on");
+        },
+        |loaded, tid| {
+            assert_eq!(
+                wire::split_rcount(read_u64_cell(loaded, "RCOUNT", tid).expect("RCOUNT kept")),
+                (0, wire::RCOUNT_STATE_IDLE),
+                "skip-all: RCOUNT IDLE|0"
+            );
+            assert_eq!(
+                wire::split_seq(read_u64_cell(loaded, "SEQ", tid).expect("SEQ kept")),
+                (0, 0),
+                "skip-all: SEQ unminted"
+            );
+        },
+    );
+    // BIRTH freeze (cause 3): BIRTH=MAX behind the control.
+    skip_case(
+        &obj,
+        &exe,
+        off,
+        "birth-freeze",
+        wire::SKIP_BIRTH_WRAP,
+        wire::LOSS_BIRTH_WRAP,
+        |loaded| {
+            let tid = self_tid();
+            write_cell(
+                loaded,
+                "BIRTH",
+                &tid.to_le_bytes(),
+                &wire::BIRTH_FROZEN.to_le_bytes(),
+            );
+        },
+        |loaded, tid| {
+            assert_eq!(
+                wire::split_rcount(read_u64_cell(loaded, "RCOUNT", tid).expect("RCOUNT kept")),
+                (0, wire::RCOUNT_STATE_IDLE),
+                "freeze: RCOUNT IDLE|0"
+            );
+            assert_eq!(
+                wire::split_seq(read_u64_cell(loaded, "SEQ", tid).expect("SEQ kept")),
+                (0, 0),
+                "freeze: SEQ unminted (gate precedes SEQ)"
+            );
+        },
+    );
+    // SEQ-full (cause 2): 4k-fill EXCLUDING the test tid (else the
+    // present-key update succeeds and no cause-2 fires).
+    skip_case(
+        &obj,
+        &exe,
+        off,
+        "seq-full",
+        wire::SKIP_SEQ_FULL,
+        wire::LOSS_SEQ_FULL,
+        |loaded| {
+            for i in 0..4096u32 {
+                let k = 0x4000_0000u32.wrapping_add(i);
+                write_cell(
+                    loaded,
+                    "SEQ",
+                    &k.to_le_bytes(),
+                    &wire::make_seq(0, 0).to_le_bytes(),
+                );
+            }
+        },
+        |loaded, tid| {
+            assert_eq!(
+                wire::split_rcount(read_u64_cell(loaded, "RCOUNT", tid).expect("RCOUNT kept")),
+                (0, wire::RCOUNT_STATE_IDLE),
+                "seq-full: RCOUNT IDLE|0"
+            );
+            assert_eq!(
+                wire::split_seq(read_u64_cell(loaded, "SEQ", tid).expect("SEQ kept")),
+                (0, 0),
+                "seq-full: no mint on insert-fail"
+            );
+        },
+    );
+    // Legacy cookie (cause 6): surgical entry re-attach with cookie
+    // 7 behind the control (loader-bug shape, fail-fast before any
+    // map read).
+    {
+        let mut attached = attach_chunk(&obj, &exe, off);
+        let loaded = &attached.loaded;
+        let tid = self_tid();
+        let pid = std::process::id();
+        FIXTURE_ARRAY.store(0, Ordering::SeqCst);
+        NS_VERDICT.store(0, Ordering::SeqCst);
+        fire(OP as i32, 1);
+        let (calls, _, _) = drain(loaded);
+        assert_eq!(
+            call_parts(&calls[0]),
+            (false, wire::SKIP_ADMITTED),
+            "cookie: control"
+        );
+        let bad = ossl_bpf_sys::link_create_uprobe_multi(
+            loaded.progs["member_entry"].as_raw_fd(),
+            &exe,
+            &[off],
+            &[7],
+            std::process::id(),
+        )
+        .expect("re-attach entry with cookie 7");
+        drop(std::mem::replace(&mut attached.entry, bad));
+        let (attempt0, calls0) = (
+            read_attempt(loaded),
+            read_percpu(loaded, "CALLS", OP, false),
+        );
+        fire(OP as i32, 1);
+        let (calls, algs, rows) = drain(loaded);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(call_parts(&calls[0]), (false, wire::SKIP_ENTRY_COOKIE));
+        assert_eq!(calls[0].seq, 0);
+        assert_eq!(read_attempt(loaded) - attempt0, 1, "cookie: ATTEMPTΔ==1");
+        assert_eq!(read_percpu(loaded, "CALLS", OP, false) - calls0, 0);
+        assert_loss_only(loaded, wire::LOSS_ENTRY_COOKIE, 1, "cookie");
+        assert!(algs.is_empty() && rows.is_empty(), "cookie: member silence");
+        assert!(read_pending_cell(loaded, pid, tid).is_none());
+        assert!(read_scan_cell(loaded, tid).is_none());
+        assert_eq!(
+            wire::split_rcount(read_u64_cell(loaded, "RCOUNT", tid).expect("RCOUNT kept")),
+            (0, wire::RCOUNT_STATE_IDLE)
+        );
+    }
+    // CTRL-invalid ×3 (cause 7): EXPECTED 0, EXPECTED 513, epoch 0.
+    for (tag, ctrl) in [
+        ("ctrl-exp0", wire::ctrl_value(0, 1, gov)),
+        ("ctrl-exp513", wire::ctrl_value(513, 1, gov)),
+        ("ctrl-epoch0", wire::ctrl_value(512, 0, gov)),
+    ] {
+        skip_case(
+            &obj,
+            &exe,
+            off,
+            tag,
+            wire::SKIP_CTRL_UNPROGRAMMED,
+            wire::LOSS_CTRL_UNPROGRAMMED,
+            |loaded| {
+                osslscope::loader::program_ctrl(&loaded.maps, &ctrl).expect("program bad CTRL");
+            },
+            |loaded, tid| {
+                assert_eq!(
+                    wire::split_rcount(read_u64_cell(loaded, "RCOUNT", tid).expect("RCOUNT kept")),
+                    (0, wire::RCOUNT_STATE_IDLE),
+                    "{tag}: RCOUNT IDLE|0"
+                );
+            },
+        );
+    }
+}
+
+/// C birth-pending (cause 1): the skip fires on a FRESH
+/// UNREGISTERED worker tid (no BIRTH row) after a same-attach
+/// main-tid admit-control. The skip creates nothing (RCOUNT/SEQ
+/// stay missing for the worker tid — the SKIP path never creates
+/// cells); main-tid cells are untouched.
+#[test]
+#[ignore]
+fn c_skip_birth_pending() {
+    use osslscope_ebpf_common as wire;
+    let Some(obj) = gated() else {
+        eprintln!("SKIP(members-live): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
+        return;
+    };
+    let exe = own_exe_cstr();
+    let off = query_off();
+    let attached = attach_chunk(&obj, &exe, off);
+    let loaded = &attached.loaded;
+    let tid = self_tid();
+    let pid = std::process::id();
+    FIXTURE_ARRAY.store(0, Ordering::SeqCst);
+    NS_VERDICT.store(0, Ordering::SeqCst);
+    fire(OP as i32, 1);
+    let (calls, _, _) = drain(loaded);
+    assert_eq!(
+        call_parts(&calls[0]),
+        (false, wire::SKIP_ADMITTED),
+        "control admits"
+    );
+    let (attempt0, calls0) = (
+        read_attempt(loaded),
+        read_percpu(loaded, "CALLS", OP, false),
+    );
+    // Unregistered worker: fires WITHOUT a BIRTH row.
+    let wtid = std::thread::scope(|s| {
+        s.spawn(|| {
+            let w = self_tid();
+            fire(OP as i32, 1);
+            w
+        })
+        .join()
+        .expect("worker join")
+    });
+    assert_ne!(wtid, tid, "worker tid is fresh");
+    let (calls, algs, rows) = drain(loaded);
+    assert_eq!(calls.len(), 1, "skip CALL");
+    assert_eq!(calls[0].tid, wtid);
+    assert_eq!(call_parts(&calls[0]), (false, wire::SKIP_BIRTH_PENDING));
+    assert_eq!(calls[0].seq, 0);
+    assert_eq!(read_attempt(loaded) - attempt0, 1, "ATTEMPTΔ==1");
+    assert_eq!(
+        read_percpu(loaded, "CALLS", OP, false) - calls0,
+        0,
+        "CALLSΔ==0"
+    );
+    assert_loss_only(loaded, wire::LOSS_BIRTH_PENDING, 1, "birth-pending");
+    assert!(algs.is_empty() && rows.is_empty(), "skip member silence");
+    // Skip creates nothing for the worker tid...
+    assert!(read_pending_cell(loaded, pid, wtid).is_none());
+    assert!(read_scan_cell(loaded, wtid).is_none());
+    assert!(
+        read_u64_cell(loaded, "RCOUNT", wtid).is_none(),
+        "RCOUNT never created"
+    );
+    assert!(
+        read_u64_cell(loaded, "SEQ", wtid).is_none(),
+        "SEQ never created"
+    );
+    // ...and touches nothing of the control's cells.
+    assert!(
+        read_pending_cell(loaded, pid, tid).is_some(),
+        "control PENDING kept"
+    );
+    assert!(read_scan_cell(loaded, tid).is_some(), "control SCAN kept");
+    assert_eq!(
+        wire::split_rcount(read_u64_cell(loaded, "RCOUNT", tid).expect("control RCOUNT")),
+        (0, wire::RCOUNT_STATE_ACTIVE),
+        "control RCOUNT still ACTIVE"
+    );
+}
+
+/// C nested-hint via TRUE same-thread recursion (depth-1
+/// self-calling target — hint bit + supersede, no map
+/// programming). Persists in D (§10.2). Entry-side asserts only
+/// (the C interim PENDING overwrite duplicates outer evidence —
+/// asserted nonzero for vitality, never attributed).
+#[test]
+#[ignore]
+fn c_nested_hint() {
+    use osslscope_ebpf_common as wire;
+    let Some(obj) = gated() else {
+        eprintln!("SKIP(members-live): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
+        return;
+    };
+    let exe = own_exe_cstr();
+    let off = symbol_off("osslscope_member_query_nested");
+    let ctrl =
+        osslscope::loader::default_ctrl(512, osslscope::loader::MEMBER_RING_BYTES).expect("CTRL");
+    let attached = attach_with_ctrl(&obj, &exe, off, &ctrl);
+    let loaded = &attached.loaded;
+    let mut state = BirthState::new();
+    let tid = self_tid();
+    register(loaded, &mut state, &[tid]);
+    let slots = vec![
+        SlotSpec::live("MNH0", 100, vec![(61, 0x6100)]),
+        SlotSpec::live("MNH1", 101, vec![(62, 0x6101)]),
+    ];
+    let fx = Fixture::build(&slots, &[]);
+    fx.pretouch();
+    populate_alg_class(loaded, &fx.classes);
+    FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
+    NS_VERDICT.store(0, Ordering::SeqCst);
+    fire_nested(OP as i32, 1);
+    let (calls, algs, rows) = drain(loaded);
+    assert_eq!(calls.len(), 2, "outer + inner CALLs");
+    assert_eq!(
+        call_parts(&calls[0]),
+        (false, wire::SKIP_ADMITTED),
+        "outer: no hint"
+    );
+    assert_eq!(calls[0].seq, wire::make_seq(0, 0));
+    assert_eq!(
+        call_parts(&calls[1]),
+        (true, wire::SKIP_ADMITTED),
+        "inner: NESTED-HINT"
+    );
+    assert_eq!(calls[1].seq, wire::make_seq(0, 1));
+    assert!(calls.iter().all(|c| c.tid == tid && c.op == OP));
+    // Supersede: the inner record stands (SCAN seq 1, PENDING inner).
+    let rec = read_scan_cell(loaded, tid).expect("SCAN stands");
+    assert_eq!(rec.seq, wire::make_seq(0, 1), "inner record supersedes");
+    assert_eq!(rec.expected, 512);
+    assert_eq!(rec.epoch, 1);
+    assert_eq!(
+        wire::split_rcount(read_u64_cell(loaded, "RCOUNT", tid).expect("RCOUNT")),
+        (0, wire::RCOUNT_STATE_ACTIVE)
+    );
+    assert_eq!(read_percpu(loaded, "CALLS", OP, false), 2, "both counted");
+    assert_eq!(read_attempt(loaded), 2);
+    assert_loss_zero(loaded);
+    // Vitality only: both returns walked (PENDING present at both —
+    // the interim overwrite duplicates inner evidence; C never
+    // attributes member evidence).
+    assert!(!algs.is_empty() && !rows.is_empty(), "both returns walked");
+}
+
+/// C nested-skip (§7C exact): prime 64B via two undrained NULL
+/// queries on a sacrificial tid, baseline counters after priming,
+/// execute outer/inner on a fresh tid at T=88 — outer admits at
+/// 64 (CALL → 96), inner pressure-skips. The nested skip deletes
+/// the outer record (tainted absence for item 4 — the ring CALLs
+/// retain the superseded invocation). Replaced by nested-skip-D
+/// (§10.2: IDLE|0 → IDLE|1024 + RET/guard absence).
+#[test]
+#[ignore]
+fn c_nested_skip() {
+    use osslscope_ebpf_common as wire;
+    let Some(obj) = gated() else {
+        eprintln!("SKIP(members-live): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
+        return;
+    };
+    let exe = own_exe_cstr();
+    let off = symbol_off("osslscope_member_query_nested");
+    let attached = attach_with_ctrl(&obj, &exe, off, &wire::ctrl_value(512, 1, 88));
+    let loaded = &attached.loaded;
+    let mut state = BirthState::new();
+    let tid = self_tid();
+    let pid = std::process::id();
+    FIXTURE_ARRAY.store(0, Ordering::SeqCst); // NULL throughout
+    NS_VERDICT.store(0, Ordering::SeqCst);
+    // Prime 64B on a sacrificial tid (two admitted NULL CALLs).
+    let sacrificial = fire_on_worker(loaded, OP as i32, 2);
+    assert_ne!(sacrificial, tid);
+    register(loaded, &mut state, &[tid]);
+    let (attempt0, calls0, loss0) = (
+        read_attempt(loaded),
+        read_percpu(loaded, "CALLS", OP, false),
+        read_percpu(loaded, "LOSS", wire::LOSS_RING_PRESSURE, false),
+    );
+    fire_nested(OP as i32, 1);
+    let (calls, algs, rows) = drain(loaded);
+    // Filter to the leg tid (priming CALLs still occupy the ring).
+    let mine: Vec<_> = calls.iter().filter(|c| c.tid == tid).collect();
+    assert_eq!(mine.len(), 2, "outer-CALL + inner-CALL");
+    assert_eq!(
+        call_parts(mine[0]),
+        (false, wire::SKIP_ADMITTED),
+        "outer admits at 64"
+    );
+    assert_eq!(mine[0].seq, wire::make_seq(0, 0));
+    assert_eq!(
+        call_parts(mine[1]),
+        (false, wire::SKIP_RING_PRESSURE),
+        "inner pressure-skips at 96"
+    );
+    assert_eq!(mine[1].seq, 0);
+    assert_eq!(
+        read_percpu(loaded, "CALLS", OP, false) - calls0,
+        1,
+        "CALLS Δ1"
+    );
+    assert_eq!(read_attempt(loaded) - attempt0, 2, "ATTEMPT Δ2");
+    assert_eq!(
+        read_percpu(loaded, "LOSS", wire::LOSS_RING_PRESSURE, false) - loss0,
+        1,
+        "LOSS23 Δ1"
+    );
+    assert!(algs.is_empty() && rows.is_empty(), "zero member emissions");
+    assert!(read_scan_cell(loaded, tid).is_none(), "SCAN absent");
+    assert_eq!(
+        wire::split_rcount(read_u64_cell(loaded, "RCOUNT", tid).expect("RCOUNT kept")),
+        (0, wire::RCOUNT_STATE_IDLE),
+        "RCOUNT IDLE|0 (v1 members don't bump)"
+    );
+    assert!(
+        read_pending_cell(loaded, pid, tid).is_none(),
+        "PENDING absent (C-only)"
+    );
+}
+
+/// C stale-complete trio via programmed cells (persists in D —
+/// §10.2): IDLE+record → silent recovery (no LOSS, no hint);
+/// ACTIVE+expected → LOSS 31 + repair; SCAN-without-RCOUNT →
+/// LOSS 31 + repair.
+#[test]
+#[ignore]
+fn c_stale_trio() {
+    use osslscope_ebpf_common as wire;
+    let Some(obj) = gated() else {
+        eprintln!("SKIP(members-live): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
+        return;
+    };
+    let exe = own_exe_cstr();
+    let off = query_off();
+    let attached = attach_chunk(&obj, &exe, off);
+    let loaded = &attached.loaded;
+    let tid = self_tid();
+    FIXTURE_ARRAY.store(0, Ordering::SeqCst);
+    NS_VERDICT.store(0, Ordering::SeqCst);
+    let stale = wire::ScanRec {
+        op: 7,
+        ns_ptr: 0x5555,
+        seq: wire::make_seq(0, 0),
+        expected: 512,
+        _pad: 0,
+        epoch: 1,
+    };
+    // (a) IDLE+record: silent recovery (already counted at retire —
+    // recounting would double-count).
+    write_cell(loaded, "SCAN", &tid.to_le_bytes(), &scan_bytes(&stale));
+    write_cell(
+        loaded,
+        "RCOUNT",
+        &tid.to_le_bytes(),
+        &wire::make_rcount(0, wire::RCOUNT_STATE_IDLE).to_le_bytes(),
+    );
+    fire(OP as i32, 1);
+    let (calls, _, _) = drain(loaded);
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        call_parts(&calls[0]),
+        (false, wire::SKIP_ADMITTED),
+        "(a): no hint"
+    );
+    assert_eq!(calls[0].seq, wire::make_seq(0, 0));
+    assert_loss_zero(loaded);
+    assert_eq!(
+        read_scan_cell(loaded, tid).expect("SCAN republished").op,
+        OP as u64,
+        "(a): fresh record published"
+    );
+    // (b) ACTIVE+expected: loud repair (LOSS 31).
+    write_cell(loaded, "SCAN", &tid.to_le_bytes(), &scan_bytes(&stale));
+    write_cell(
+        loaded,
+        "RCOUNT",
+        &tid.to_le_bytes(),
+        &wire::make_rcount(512, wire::RCOUNT_STATE_ACTIVE).to_le_bytes(),
+    );
+    fire(OP as i32, 1);
+    let (calls, _, _) = drain(loaded);
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        call_parts(&calls[0]),
+        (false, wire::SKIP_ADMITTED),
+        "(b): no hint"
+    );
+    assert_eq!(calls[0].seq, wire::make_seq(0, 1));
+    assert_loss_only(loaded, wire::LOSS_STALE_REPAIRED, 1, "(b)");
+    // (c) SCAN-without-RCOUNT: loud repair (needs an RCOUNT-less
+    // tid — a registered-but-unfired worker).
+    let (wtid_tx, wtid_rx) = std::sync::mpsc::channel::<u32>();
+    let go = std::sync::Barrier::new(2);
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            let w = self_tid();
+            wtid_tx.send(w).expect("report tid");
+            go.wait();
+            fire(OP as i32, 1);
+        });
+        let w = wtid_rx.recv().expect("worker tid");
+        assert_ne!(w, tid);
+        write_cell(loaded, "BIRTH", &w.to_le_bytes(), &0u16.to_le_bytes());
+        assert!(
+            read_u64_cell(loaded, "RCOUNT", w).is_none(),
+            "(c): RCOUNT-less setup"
+        );
+        write_cell(loaded, "SCAN", &w.to_le_bytes(), &scan_bytes(&stale));
+        go.wait();
+    });
+    let (calls, _, _) = drain(loaded);
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        call_parts(&calls[0]),
+        (false, wire::SKIP_ADMITTED),
+        "(c): no hint"
+    );
+    assert_eq!(
+        calls[0].seq,
+        wire::make_seq(0, 0),
+        "(c): worker SEQ starts at 0"
+    );
+    assert_loss_only(loaded, wire::LOSS_STALE_REPAIRED, 2, "(c): second LOSS31");
+}
+
+/// C programmed-epoch churn (persists in D — §10.2): a record
+/// whose epoch mismatches live CTRL churns (LOSS 25, never a hint).
+#[test]
+#[ignore]
+fn c_churn_programmed() {
+    use osslscope_ebpf_common as wire;
+    let Some(obj) = gated() else {
+        eprintln!("SKIP(members-live): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
+        return;
+    };
+    let exe = own_exe_cstr();
+    let off = query_off();
+    let attached = attach_chunk(&obj, &exe, off);
+    let loaded = &attached.loaded;
+    let tid = self_tid();
+    FIXTURE_ARRAY.store(0, Ordering::SeqCst);
+    NS_VERDICT.store(0, Ordering::SeqCst);
+    let churned = wire::ScanRec {
+        op: 7,
+        ns_ptr: 0x5555,
+        seq: wire::make_seq(0, 0),
+        expected: 512,
+        _pad: 0,
+        epoch: 99, // Mismatches live epoch 1.
+    };
+    write_cell(loaded, "SCAN", &tid.to_le_bytes(), &scan_bytes(&churned));
+    write_cell(
+        loaded,
+        "RCOUNT",
+        &tid.to_le_bytes(),
+        &wire::make_rcount(0, wire::RCOUNT_STATE_ACTIVE).to_le_bytes(),
+    );
+    fire(OP as i32, 1);
+    let (calls, _, _) = drain(loaded);
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        call_parts(&calls[0]),
+        (false, wire::SKIP_ADMITTED),
+        "churn: never a hint"
+    );
+    assert_loss_only(loaded, wire::LOSS_SCAN_CHURNED, 1, "churn");
+    let rec = read_scan_cell(loaded, tid).expect("fresh record published");
+    assert_eq!((rec.epoch, rec.expected), (1, 512), "fresh epoch frozen");
+}
+
+/// Pipe-blocked churn driver (C/D contrast pair — §10.2): a worker
+/// blocks inside its first query (entry admitted, return pending);
+/// the harness bumps epoch behind it (and, for detach-C, detaches
+/// member 7 first). C has no retirement, so the record survives →
+/// the worker's second take churns (LOSS 25). Entry-observable
+/// half only.
+fn run_blocked_churn(obj: &std::path::Path, detach_member_7: bool, tag: &str) {
+    use osslscope_ebpf_common as wire;
+    let exe = own_exe_cstr();
+    let off = symbol_off("osslscope_member_query_blocking");
+    let mut attached = attach_chunk(obj, &exe, off);
+    let loaded = &attached.loaded;
+    let pid = std::process::id();
+    let slots = vec![SlotSpec::live("MCH0", 100, vec![(63, 0x6300)])];
+    let fx = Fixture::build(&slots, &[]);
+    fx.pretouch();
+    populate_alg_class(loaded, &fx.classes);
+    FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
+    NS_VERDICT.store(0, Ordering::SeqCst);
+    // Pipe + latch for the one blocked call.
+    let mut fds = [0i32; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+    BLOCK_PIPE_RD.store(fds[0], Ordering::SeqCst);
+    BLOCK_ENTERED.store(0, Ordering::SeqCst);
+    BLOCK_ONCE.store(1, Ordering::SeqCst);
+    let (wtid_tx, wtid_rx) = std::sync::mpsc::channel::<u32>();
+    let go = std::sync::Barrier::new(2);
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            let w = self_tid();
+            wtid_tx.send(w).expect("report tid");
+            go.wait();
+            fire_blocking(OP as i32); // Call 1: blocks (latch armed).
+            fire_blocking(OP as i32); // Call 2: passes (latch spent).
+        });
+        let w = wtid_rx.recv().expect("worker tid");
+        write_cell(loaded, "BIRTH", &w.to_le_bytes(), &0u16.to_le_bytes());
+        go.wait();
+        // Bounded wait for the worker to block inside call 1 (fail,
+        // never hang).
+        let mut entered = false;
+        for _ in 0..10_000 {
+            if BLOCK_ENTERED.load(Ordering::SeqCst) == 1 {
+                entered = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(entered, "{tag}: worker blocked inside call 1");
+        if detach_member_7 {
+            // Detach member 7 behind the blocked return (placeholder
+            // keeps the Vec dense; dropping the old link detaches).
+            let devnull: OwnedFd = std::fs::File::open("/dev/null").expect("devnull").into();
+            drop(std::mem::replace(&mut attached.members[7], devnull));
+        }
+        osslscope::loader::program_ctrl(&loaded.maps, &wire::ctrl_value(512, 2, 1 << 20))
+            .expect("bump epoch to 2");
+        let one = [1u8; 1];
+        assert_eq!(
+            unsafe { libc::write(fds[1], one.as_ptr() as *const libc::c_void, 1) },
+            1,
+            "{tag}: release worker"
+        );
+    });
+    unsafe {
+        libc::close(fds[0]);
+        libc::close(fds[1]);
+    }
+    let (calls, algs, rows) = drain(loaded);
+    assert_eq!(calls.len(), 2, "{tag}: two worker CALLs");
+    assert_eq!(
+        call_parts(&calls[0]),
+        (false, wire::SKIP_ADMITTED),
+        "{tag}: call 1 admits"
+    );
+    assert_eq!(calls[0].seq, wire::make_seq(0, 0));
+    assert_eq!(
+        call_parts(&calls[1]),
+        (false, wire::SKIP_ADMITTED),
+        "{tag}: call 2 admits, no hint"
+    );
+    assert_eq!(calls[1].seq, wire::make_seq(0, 1));
+    // The record survived call 1's return (C: no retirement — and
+    // with member 7 detached, nothing could complete it) → call 2's
+    // take churns on the epoch bump.
+    assert_loss_only(loaded, wire::LOSS_SCAN_CHURNED, 1, tag);
+    assert_eq!(
+        read_percpu(loaded, "CALLS", OP, false),
+        2,
+        "{tag}: both counted"
+    );
+    // Call 1's return walked (member vitality — the walk happened
+    // behind the epoch bump but before call 2's take).
+    assert!(
+        !algs.is_empty() && !rows.is_empty(),
+        "{tag}: call-1 return walked"
+    );
+    if detach_member_7 {
+        assert!(
+            algs.iter().all(|a| a.idx != 7) && rows.iter().all(|r| r.idx != 7),
+            "{tag}: detached member_7 silent"
+        );
+    }
+    // Post-churn record: fresh epoch frozen.
+    let rec = read_scan_cell(loaded, calls[1].tid).expect("fresh record");
+    assert_eq!(rec.epoch, 2, "{tag}: fresh epoch frozen");
+    assert!(
+        read_pending_cell(loaded, pid, calls[1].tid).is_some(),
+        "{tag}: PENDING (C-only)"
+    );
+}
+
+/// C detach-churn: member 7 detached behind a pipe-blocked
+/// invocation + epoch bump → record survives → next take churns.
+/// (C/D contrast pair — replaced by detach-D + bump-blocked-clean-retire.)
+#[test]
+#[ignore]
+fn c_churn_detach() {
+    let Some(obj) = gated() else {
+        eprintln!("SKIP(members-live): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
+        return;
+    };
+    run_blocked_churn(&obj, true, "detach-C");
+}
+
+/// C bump-behind-blocked: epoch bump behind a blocked invocation
+/// (no detach, no retirement exists) → next take churns.
+/// (C/D contrast pair.)
+#[test]
+#[ignore]
+fn c_churn_bump_blocked() {
+    let Some(obj) = gated() else {
+        eprintln!("SKIP(members-live): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
+        return;
+    };
+    run_blocked_churn(&obj, false, "bump-C");
+}
+
+/// C LRU eviction (persists in D — §10.2): SCAN record + RCOUNT
+/// ACTIVE programmed for self, 2048 foreign inserts (pinned-CPU —
+/// self-eviction is structural by capacity, not order),
+/// read-back-absent loud check, then the take reports LOSS 20
+/// (NULL + ACTIVE ⟺ evicted).
+#[test]
+#[ignore]
+fn c_eviction() {
+    use osslscope_ebpf_common as wire;
+    let Some(obj) = gated() else {
+        eprintln!("SKIP(members-live): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
+        return;
+    };
+    let exe = own_exe_cstr();
+    let off = query_off();
+    let attached = attach_chunk(&obj, &exe, off);
+    let loaded = &attached.loaded;
+    let tid = self_tid();
+    FIXTURE_ARRAY.store(0, Ordering::SeqCst);
+    NS_VERDICT.store(0, Ordering::SeqCst);
+    // Admit-control: a live record + ACTIVE counter for self.
+    fire(OP as i32, 1);
+    let (calls, _, _) = drain(loaded);
+    assert_eq!(
+        call_parts(&calls[0]),
+        (false, wire::SKIP_ADMITTED),
+        "control admits"
+    );
+    assert!(
+        read_scan_cell(loaded, tid).is_some(),
+        "control SCAN present"
+    );
+    // 2048 foreign SCAN inserts evict self's record (1024-cap LRU).
+    for i in 0..2048u32 {
+        let k = 0x4000_0000u32.wrapping_add(i);
+        let rec = wire::ScanRec {
+            op: 7,
+            ns_ptr: 0,
+            seq: wire::make_seq(0, 0),
+            expected: 512,
+            _pad: 0,
+            epoch: 1,
+        };
+        write_cell(loaded, "SCAN", &k.to_le_bytes(), &scan_bytes(&rec));
+    }
+    assert!(
+        read_scan_cell(loaded, tid).is_none(),
+        "self SCAN evicted (loud check — fails if the kernel disagrees)"
+    );
+    assert_eq!(
+        wire::split_rcount(read_u64_cell(loaded, "RCOUNT", tid).expect("RCOUNT kept")),
+        (0, wire::RCOUNT_STATE_ACTIVE),
+        "RCOUNT (plain HASH) survives"
+    );
+    fire(OP as i32, 1);
+    let (calls, _, _) = drain(loaded);
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        call_parts(&calls[0]),
+        (false, wire::SKIP_ADMITTED),
+        "post-evict admits, no hint"
+    );
+    assert_eq!(calls[0].seq, wire::make_seq(0, 1));
+    assert_loss_only(loaded, wire::LOSS_SCAN_EVICTED, 1, "eviction");
+}
+
+/// C saturation boundary (RE-PIN in D — §10.2: + RET on the MAX
+/// admit, none on the cause-9 skip): SEQ programmed MAX-1 → admit
+/// MAX, again → cause 9/LOSS 33 (fail-closed, never reissue).
+/// NULL queries.
+#[test]
+#[ignore]
+fn c_saturation() {
+    use osslscope_ebpf_common as wire;
+    let Some(obj) = gated() else {
+        eprintln!("SKIP(members-live): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
+        return;
+    };
+    let exe = own_exe_cstr();
+    let off = query_off();
+    let attached = attach_chunk(&obj, &exe, off);
+    let loaded = &attached.loaded;
+    let tid = self_tid();
+    let pid = std::process::id();
+    FIXTURE_ARRAY.store(0, Ordering::SeqCst);
+    NS_VERDICT.store(0, Ordering::SeqCst);
+    write_cell(
+        loaded,
+        "SEQ",
+        &tid.to_le_bytes(),
+        &wire::make_seq(0, wire::SEQ_CTR_MAX - 1).to_le_bytes(),
+    );
+    fire(OP as i32, 1);
+    let (calls, _, _) = drain(loaded);
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        call_parts(&calls[0]),
+        (false, wire::SKIP_ADMITTED),
+        "MAX admits"
+    );
+    assert_eq!(calls[0].seq, wire::make_seq(0, wire::SEQ_CTR_MAX));
+    assert_eq!(read_percpu(loaded, "CALLS", OP, false), 1);
+    assert_loss_zero(loaded);
+    let (attempt0, calls0) = (
+        read_attempt(loaded),
+        read_percpu(loaded, "CALLS", OP, false),
+    );
+    fire(OP as i32, 1);
+    let (calls, algs, rows) = drain(loaded);
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        call_parts(&calls[0]),
+        (false, wire::SKIP_SEQ_SATURATED),
+        "reissue skips"
+    );
+    assert_eq!(calls[0].seq, 0);
+    assert_eq!(read_attempt(loaded) - attempt0, 1, "ATTEMPTΔ==1");
+    assert_eq!(
+        read_percpu(loaded, "CALLS", OP, false) - calls0,
+        0,
+        "CALLSΔ==0"
+    );
+    assert_loss_only(loaded, wire::LOSS_SEQ_SATURATED, 1, "saturation");
+    assert!(algs.is_empty() && rows.is_empty(), "skip member silence");
+    assert!(
+        read_pending_cell(loaded, pid, tid).is_none(),
+        "PENDING absent (C-only)"
+    );
+    assert!(read_scan_cell(loaded, tid).is_none(), "SCAN absent");
+    assert_eq!(
+        wire::split_rcount(read_u64_cell(loaded, "RCOUNT", tid).expect("RCOUNT kept")),
+        (0, wire::RCOUNT_STATE_IDLE)
+    );
+}
+
+/// C sequential-quiet pair (RE-PIN in D — §10.2: between-count
+/// IDLE|0 in C, IDLE|512 in D): admit → skip → admit — no hint
+/// (the middle skip stands in for D's retirement), SCAN absent +
+/// IDLE between.
+#[test]
+#[ignore]
+fn c_sequential_pair() {
+    use osslscope_ebpf_common as wire;
+    let Some(obj) = gated() else {
+        eprintln!("SKIP(members-live): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
+        return;
+    };
+    let exe = own_exe_cstr();
+    let off = query_off();
+    let attached = attach_chunk(&obj, &exe, off);
+    let loaded = &attached.loaded;
+    let tid = self_tid();
+    let gov = 1u64 << 20;
+    FIXTURE_ARRAY.store(0, Ordering::SeqCst);
+    NS_VERDICT.store(0, Ordering::SeqCst);
+    fire(OP as i32, 1);
+    let (calls, _, _) = drain(loaded);
+    assert_eq!(
+        call_parts(&calls[0]),
+        (false, wire::SKIP_ADMITTED),
+        "first admits"
+    );
+    // Middle skip (SKIP_ALL toggle): clears SCAN + IDLEs.
+    let off_ctrl = wire::CtrlValue {
+        expected: 512,
+        skip_all: 1,
+        _pad: [0; 3],
+        epoch: 1,
+        governor: gov,
+    };
+    osslscope::loader::program_ctrl(&loaded.maps, &off_ctrl).expect("SKIP_ALL on");
+    fire(OP as i32, 1);
+    let (calls, _, _) = drain(loaded);
+    assert_eq!(
+        call_parts(&calls[0]),
+        (false, wire::SKIP_ALL),
+        "middle skips"
+    );
+    assert!(read_scan_cell(loaded, tid).is_none(), "SCAN absent between");
+    assert_eq!(
+        wire::split_rcount(read_u64_cell(loaded, "RCOUNT", tid).expect("RCOUNT kept")),
+        (0, wire::RCOUNT_STATE_IDLE),
+        "between-count IDLE|0 in C"
+    );
+    // Re-admit: quiet (no hint — nothing unretired stands).
+    osslscope::loader::program_ctrl(&loaded.maps, &wire::ctrl_value(512, 1, gov))
+        .expect("SKIP_ALL off");
+    fire(OP as i32, 1);
+    let (calls, _, _) = drain(loaded);
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        call_parts(&calls[0]),
+        (false, wire::SKIP_ADMITTED),
+        "re-admit quiet (no hint)"
+    );
+    assert_eq!(calls[0].seq, wire::make_seq(0, 1));
+    assert_loss_only(loaded, wire::LOSS_SKIP_ALL, 1, "sequential");
+}
+
+/// C store-fail (persists in D — §10.2): RCOUNT 4096-fake-filled
+/// EXCLUDING the test tid → cause 8/LOSS 32 (synthetic invariant
+/// violation — logically unreachable by the §2 subset invariant,
+/// documented).
+#[test]
+#[ignore]
+fn c_store_fail() {
+    use osslscope_ebpf_common as wire;
+    let Some(obj) = gated() else {
+        eprintln!("SKIP(members-live): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
+        return;
+    };
+    let exe = own_exe_cstr();
+    let off = query_off();
+    let attached = attach_chunk(&obj, &exe, off);
+    let loaded = &attached.loaded;
+    let tid = self_tid();
+    let pid = std::process::id();
+    FIXTURE_ARRAY.store(0, Ordering::SeqCst);
+    NS_VERDICT.store(0, Ordering::SeqCst);
+    fire(OP as i32, 1);
+    let (calls, _, _) = drain(loaded);
+    assert_eq!(
+        call_parts(&calls[0]),
+        (false, wire::SKIP_ADMITTED),
+        "control admits"
+    );
+    // Fake-fill RCOUNT to 4096 WITHOUT the test tid (its row
+    // exists from the control — fill around it: 4095 fakes +
+    // control row = full for the test tid's step-11 create... but
+    // the control row EXISTS, so step 11 would UPDATE it (no
+    // fail). Delete-free maps can't drop it — instead, IDLE it
+    // via a skip, then fill the REST: step 11 still updates the
+    // existing row. TRUE store-fail needs a tid WITHOUT a row:
+    // use a fresh worker tid for the failing fire.
+    for i in 0..4095u32 {
+        let k = 0x4000_0000u32.wrapping_add(i);
+        // Skip the test tid if it collides (it won't — tid < 2^22
+        // on any lane; the assert pins the assumption).
+        assert_ne!(k, tid, "fake range excludes the test tid");
+        write_cell(
+            loaded,
+            "RCOUNT",
+            &k.to_le_bytes(),
+            &wire::make_rcount(0, wire::RCOUNT_STATE_IDLE).to_le_bytes(),
+        );
+    }
+    // Fresh worker tid: BIRTH registered, NO RCOUNT row. Its
+    // step-11 create fails (map full) → cause 8. SEQ has room
+    // (only control + worker keys).
+    let (wtid_tx, wtid_rx) = std::sync::mpsc::channel::<u32>();
+    let go = std::sync::Barrier::new(2);
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            let w = self_tid();
+            wtid_tx.send(w).expect("report tid");
+            go.wait();
+            fire(OP as i32, 1);
+        });
+        let w = wtid_rx.recv().expect("worker tid");
+        assert_ne!(w, tid);
+        write_cell(loaded, "BIRTH", &w.to_le_bytes(), &0u16.to_le_bytes());
+        assert!(
+            read_u64_cell(loaded, "RCOUNT", w).is_none(),
+            "worker RCOUNT-less setup"
+        );
+        go.wait();
+    });
+    // Absolute counters (control fired once: CALLS 1, ATTEMPT 1
+    // before the worker's single skip).
+    let (calls, algs, rows) = drain(loaded);
+    assert_eq!(calls.len(), 1, "worker skip CALL");
+    assert_eq!(call_parts(&calls[0]), (false, wire::SKIP_ADMIT_STORE_FAIL));
+    assert_eq!(calls[0].seq, 0);
+    assert_eq!(read_attempt(loaded), 2, "ATTEMPT control + skip");
+    assert_eq!(
+        read_percpu(loaded, "CALLS", OP, false),
+        1,
+        "CALLS control only"
+    );
+    assert_loss_only(loaded, wire::LOSS_ADMIT_STORE_FAIL, 1, "store-fail");
+    assert!(algs.is_empty() && rows.is_empty(), "skip member silence");
+    let w = calls[0].tid;
+    assert!(
+        read_pending_cell(loaded, pid, w).is_none(),
+        "PENDING absent"
+    );
+    assert!(read_scan_cell(loaded, w).is_none(), "SCAN absent");
+    assert!(
+        read_u64_cell(loaded, "RCOUNT", w).is_none(),
+        "RCOUNT still missing"
+    );
+    // SEQ minted (the failure is post-SEQ): the id is spent.
+    assert_eq!(
+        wire::split_seq(read_u64_cell(loaded, "SEQ", w).expect("SEQ minted")),
+        (0, 0),
+        "spent seq (never observed)"
+    );
+}
+
+/// C pending-capacity (C-ONLY — §10.2, map gone in D): 1024
+/// distinct tids admit-and-retain with no skips between, then a
+/// 1025th distinct tid → cause 8/LOSS32 with SEQ at 1025 of 4096
+/// (normal E2BIG fill, no fault injection); a same-tid re-admit on
+/// a RETAINED key still succeeds (BPF_ANY update — proving
+/// full-for-new-keys).
+#[test]
+#[ignore]
+fn c_pending_capacity() {
+    use osslscope_ebpf_common as wire;
+    let Some(obj) = gated() else {
+        eprintln!("SKIP(members-live): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
+        return;
+    };
+    let exe = own_exe_cstr();
+    let off = query_off();
+    let attached = attach_chunk(&obj, &exe, off);
+    let loaded = &attached.loaded;
+    FIXTURE_ARRAY.store(0, Ordering::SeqCst); // NULL: entry-side only
+    NS_VERDICT.store(0, Ordering::SeqCst);
+    // Worker A stays PARKED (alive, tid pinned) for the re-admit.
+    let (a_tx, a_rx) = std::sync::mpsc::channel::<u32>();
+    let phase1 = std::sync::Barrier::new(2);
+    let phase2 = std::sync::Barrier::new(2);
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            let a = self_tid();
+            write_cell(loaded, "BIRTH", &a.to_le_bytes(), &0u16.to_le_bytes());
+            fire(OP as i32, 1); // Admit #1 (retained).
+            a_tx.send(a).expect("report A");
+            phase1.wait();
+            phase2.wait();
+            fire(OP as i32, 1); // Re-admit (BPF_ANY update on retained key).
+        });
+        let a = a_rx.recv().expect("worker A tid");
+        phase1.wait(); // A's PENDING retained before the fill.
+        // Workers 2..=1024: 1023 sequential admit-and-retain.
+        for _ in 2..=1024u32 {
+            std::thread::scope(|s2| {
+                s2.spawn(|| {
+                    let w = self_tid();
+                    assert_ne!(w, a, "fill tids distinct from A");
+                    write_cell(loaded, "BIRTH", &w.to_le_bytes(), &0u16.to_le_bytes());
+                    fire(OP as i32, 1);
+                })
+                .join()
+                .expect("fill worker join");
+            });
+        }
+        // 1025th distinct tid → PENDING-write E2BIG → cause 8.
+        let b = std::thread::scope(|s2| {
+            s2.spawn(|| {
+                let w = self_tid();
+                write_cell(loaded, "BIRTH", &w.to_le_bytes(), &0u16.to_le_bytes());
+                fire(OP as i32, 1);
+                w
+            })
+            .join()
+            .expect("B join")
+        });
+        assert_ne!(b, a, "1025th tid distinct");
+        phase2.wait(); // Release A's re-admit.
+    });
+    let (calls, algs, rows) = drain(loaded);
+    // 1024 admits + B skip + A re-admit = 1026 CALLs.
+    assert_eq!(calls.len(), 1026, "1024 + skip + re-admit");
+    assert!(algs.is_empty() && rows.is_empty(), "NULL: member silence");
+    let (admits, skips): (Vec<&_>, Vec<&_>) = calls
+        .iter()
+        .partition(|c| call_parts(c).1 == wire::SKIP_ADMITTED);
+    assert_eq!(admits.len(), 1025, "1024 + re-admit admitted");
+    assert_eq!(skips.len(), 1, "exactly the 1025th skips");
+    assert_eq!(call_parts(skips[0]), (false, wire::SKIP_ADMIT_STORE_FAIL));
+    assert_eq!(skips[0].seq, 0);
+    assert_loss_only(loaded, wire::LOSS_ADMIT_STORE_FAIL, 1, "pending-capacity");
+    assert_eq!(
+        read_percpu(loaded, "CALLS", OP, false),
+        1025,
+        "CALLS = admits"
+    );
+    assert_eq!(read_attempt(loaded), 1026, "ATTEMPT = all hits");
+}
+
+/// C governor quantum (REPLACED by quantum-D — §10.2): NULL
+/// queries no-drain at T ∈ {719, 720, 721} — 32B quantum:
+/// 23/23/23 admitted (fire k sees occ (k−1)×32: fire 23 sees 704 ≤
+/// T and admits → occ 736; fire 24 sees 736 > T and skips — for
+/// all three T). The skip index pins the byte-exact math: wrong
+/// quanta RED the transition. CALLS-read between fires, single
+/// drain at end.
+#[test]
+#[ignore]
+fn c_governor_quantum() {
+    use osslscope_ebpf_common as wire;
+    let Some(obj) = gated() else {
+        eprintln!("SKIP(members-live): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
+        return;
+    };
+    let exe = own_exe_cstr();
+    let off = query_off();
+    for t in [719u64, 720, 721] {
+        let attached = attach_with_ctrl(&obj, &exe, off, &wire::ctrl_value(512, 1, t));
+        let loaded = &attached.loaded;
+        let mut state = BirthState::new();
+        let tid = self_tid();
+        register(loaded, &mut state, &[tid]);
+        FIXTURE_ARRAY.store(0, Ordering::SeqCst);
+        NS_VERDICT.store(0, Ordering::SeqCst);
+        // Fire one at a time, reading CALLS between fires: the
+        // admit→skip transition index pins the quantum math live.
+        let mut admitted = 0u32;
+        for k in 1..=30u32 {
+            fire(OP as i32, 1);
+            let calls_now = read_percpu(loaded, "CALLS", OP, false);
+            if calls_now == admitted as u64 + 1 {
+                admitted += 1;
+            }
+            assert_eq!(
+                read_attempt(loaded),
+                k as u64,
+                "T={t}: ATTEMPT tracks fires (k={k})"
+            );
+        }
+        assert_eq!(admitted, 23, "T={t}: 23 admitted (32B quantum)");
+        let (calls, algs, rows) = drain(loaded);
+        assert_eq!(calls.len(), 30, "T={t}: 30 CALLs, single end drain");
+        assert!(algs.is_empty() && rows.is_empty(), "T={t}: NULL silence");
+        let (adm, skp): (Vec<&_>, Vec<&_>) = calls
+            .iter()
+            .partition(|c| call_parts(c).1 == wire::SKIP_ADMITTED);
+        assert_eq!(adm.len(), 23, "T={t}: drain agrees (23 admits)");
+        assert_eq!(skp.len(), 7, "T={t}: 7 skips");
+        assert!(
+            skp.iter()
+                .all(|c| call_parts(c) == (false, wire::SKIP_RING_PRESSURE) && c.seq == 0),
+            "T={t}: all skips cause 4, seq 0"
+        );
+        // C convention: first admit silent, later admits hint (no
+        // retirement between sequential admits).
+        assert!(!call_parts(adm[0]).0, "T={t}: first admit silent");
+        assert!(
+            adm[1..].iter().all(|c| call_parts(c).0),
+            "T={t}: later admits hint (C convention)"
+        );
+        assert_loss_only(loaded, wire::LOSS_RING_PRESSURE, 7, &format!("quantum-{t}"));
+    }
+}
+
+/// C pressure rewritten (RE-PIN in D — §10.2: second skip at occ
+/// 80): GOVERNOR=0 extreme — first admits at occ 0, second skips
+/// at 32. Clarifies GOVERNOR 0 is VALID (validation rejects only
+/// EXPECTED 0/>512 and epoch 0).
+#[test]
+#[ignore]
+fn c_pressure_gov0() {
+    use osslscope_ebpf_common as wire;
+    let Some(obj) = gated() else {
+        eprintln!("SKIP(members-live): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
+        return;
+    };
+    let exe = own_exe_cstr();
+    let off = query_off();
+    let attached = attach_with_ctrl(&obj, &exe, off, &wire::ctrl_value(512, 1, 0));
+    let loaded = &attached.loaded;
+    let mut state = BirthState::new();
+    let tid = self_tid();
+    register(loaded, &mut state, &[tid]);
+    FIXTURE_ARRAY.store(0, Ordering::SeqCst);
+    NS_VERDICT.store(0, Ordering::SeqCst);
+    fire(OP as i32, 2);
+    let (calls, algs, rows) = drain(loaded);
+    assert_eq!(calls.len(), 2);
+    assert_eq!(
+        call_parts(&calls[0]),
+        (false, wire::SKIP_ADMITTED),
+        "occ 0 admits"
+    );
+    assert_eq!(calls[0].seq, wire::make_seq(0, 0));
+    assert_eq!(
+        call_parts(&calls[1]),
+        (false, wire::SKIP_RING_PRESSURE),
+        "occ 32 skips"
+    );
+    assert_eq!(calls[1].seq, 0);
+    assert_eq!(read_percpu(loaded, "CALLS", OP, false), 1, "CALLS Δ1");
+    assert_eq!(read_attempt(loaded), 2, "ATTEMPT Δ2");
+    assert_loss_only(loaded, wire::LOSS_RING_PRESSURE, 1, "gov0");
+    assert!(algs.is_empty() && rows.is_empty(), "skip member silence");
+    assert!(read_scan_cell(loaded, tid).is_none(), "skip cleared SCAN");
+}
+
+// ===== item-3 subtask-E registry live legs (R18 §5/§7E; lane only) =====
+
+/// E spawn-storm: N workers fire BEFORE registration (SKIP cause
+/// 1 — registration-gap honesty), the harness polls + programs,
+/// then all fire again (admit). Per-worker BIRTH readback + CALL
+/// sequences; counts/causes only, never joins.
+#[test]
+#[ignore]
+fn e_registry_spawn_storm() {
+    use osslscope_ebpf_common as wire;
+    let Some(obj) = gated() else {
+        eprintln!("SKIP(members-live): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
+        return;
+    };
+    let exe = own_exe_cstr();
+    let off = query_off();
+    let attached = attach_with_ctrl(
+        &obj,
+        &exe,
+        off,
+        &osslscope::loader::default_ctrl(512, osslscope::loader::MEMBER_RING_BYTES).expect("CTRL"),
+    );
+    let loaded = &attached.loaded;
+    FIXTURE_ARRAY.store(0, Ordering::SeqCst);
+    NS_VERDICT.store(0, Ordering::SeqCst);
+    const N: usize = 8;
+    let tids = std::sync::Mutex::new(Vec::<u32>::new());
+    let b1 = std::sync::Barrier::new(N + 1);
+    let b2 = std::sync::Barrier::new(N + 1);
+    std::thread::scope(|s| {
+        for _ in 0..N {
+            s.spawn(|| {
+                let w = self_tid();
+                tids.lock().expect("tids lock").push(w);
+                fire(OP as i32, 1); // Phase 1: unregistered → skip.
+                b1.wait();
+                b2.wait();
+                fire(OP as i32, 1); // Phase 2: registered → admit.
+            });
+        }
+        b1.wait();
+        let observed: Vec<u32> = tids.lock().expect("tids lock").clone();
+        assert_eq!(observed.len(), N, "N worker tids reported");
+        let mut state = BirthState::new();
+        let rows = register(loaded, &mut state, &observed);
+        assert_eq!(rows.len(), N, "all N program birth 0");
+        assert!(rows.iter().all(|(_, b)| *b == 0));
+        b2.wait();
+    });
+    let observed: Vec<u32> = tids.lock().expect("tids lock").clone();
+    for w in &observed {
+        assert_eq!(
+            read_u16_cell(loaded, "BIRTH", *w),
+            Some(0),
+            "BIRTH[{w}] readback"
+        );
+    }
+    let (calls, algs, rows) = drain(loaded);
+    assert_eq!(calls.len(), 2 * N, "skip + admit per worker");
+    assert!(algs.is_empty() && rows.is_empty(), "NULL silence");
+    for w in &observed {
+        let mine: Vec<_> = calls.iter().filter(|c| c.tid == *w).collect();
+        assert_eq!(mine.len(), 2, "worker {w}: two CALLs");
+        assert_eq!(
+            call_parts(mine[0]),
+            (false, wire::SKIP_BIRTH_PENDING),
+            "worker {w}: fire-before-poll SKIPs"
+        );
+        assert_eq!(mine[0].seq, 0);
+        assert_eq!(
+            call_parts(mine[1]),
+            (false, wire::SKIP_ADMITTED),
+            "worker {w}: poll-then-admit"
+        );
+        assert_eq!(mine[1].seq, wire::make_seq(0, 0));
+    }
+    assert_loss_only(loaded, wire::LOSS_BIRTH_PENDING, N as u64, "storm");
+    assert_eq!(read_percpu(loaded, "CALLS", OP, false), N as u64);
+    assert_eq!(read_attempt(loaded), 2 * N as u64);
+}
+
+/// E observed reuse: a poll cycle that observes absence then
+/// reappearance supersedes (1) → the next take resets SEQ (CALL
+/// seq restarts at 0). The registry's observed-set signal is the
+/// contract (true kernel tid-reuse timing is out of scope).
+#[test]
+#[ignore]
+fn e_registry_observed_reuse() {
+    use osslscope_ebpf_common as wire;
+    let Some(obj) = gated() else {
+        eprintln!("SKIP(members-live): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
+        return;
+    };
+    let exe = own_exe_cstr();
+    let off = query_off();
+    let attached = attach_chunk(&obj, &exe, off);
+    let loaded = &attached.loaded;
+    let tid = self_tid();
+    FIXTURE_ARRAY.store(0, Ordering::SeqCst);
+    NS_VERDICT.store(0, Ordering::SeqCst);
+    let mut state = BirthState::new();
+    assert_eq!(register(loaded, &mut state, &[tid]), vec![(tid, 0)]);
+    fire(OP as i32, 1);
+    let (calls, _, _) = drain(loaded);
+    assert_eq!(calls[0].seq, wire::make_seq(0, 0));
+    // Observe absence (poll without the tid), then reappearance.
+    assert!(
+        register(loaded, &mut state, &[0x7FFF_FFFF])
+            .iter()
+            .all(|(t, _)| *t != tid)
+    );
+    assert_eq!(
+        register(loaded, &mut state, &[tid]),
+        vec![(tid, 1)],
+        "supersede to 1"
+    );
+    assert_eq!(read_u16_cell(loaded, "BIRTH", tid), Some(1));
+    fire(OP as i32, 1);
+    let (calls, _, _) = drain(loaded);
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        call_parts(&calls[0]),
+        (false, wire::SKIP_ADMITTED),
+        "superseded tid admits"
+    );
+    assert_eq!(
+        calls[0].seq,
+        wire::make_seq(1, 0),
+        "SEQ reset on birth mismatch"
+    );
+    assert_loss_zero(loaded);
+}
+
+/// E unobserved reuse: no poll between fires → the counter
+/// continues (seq 1, hint — the C convention), no skip (§5.1 quiet
+/// reuse).
+#[test]
+#[ignore]
+fn e_registry_unobserved_reuse() {
+    use osslscope_ebpf_common as wire;
+    let Some(obj) = gated() else {
+        eprintln!("SKIP(members-live): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
+        return;
+    };
+    let exe = own_exe_cstr();
+    let off = query_off();
+    let attached = attach_chunk(&obj, &exe, off);
+    let loaded = &attached.loaded;
+    FIXTURE_ARRAY.store(0, Ordering::SeqCst);
+    NS_VERDICT.store(0, Ordering::SeqCst);
+    fire(OP as i32, 2); // No poll between: quiet reuse.
+    let (calls, _, _) = drain(loaded);
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].seq, wire::make_seq(0, 0));
+    assert_eq!(calls[1].seq, wire::make_seq(0, 1), "ctr continues");
+    assert_eq!(
+        call_parts(&calls[1]),
+        (true, wire::SKIP_ADMITTED),
+        "hint (C convention)"
+    );
+    assert_loss_zero(loaded);
+}
+
+/// E external-child: the TARGET-pid source (R18 sol F11) — a
+/// spawned child's tids are observed and registered; self tids
+/// never appear (self-pid legs alone would conceal a
+/// wrong-process source).
+#[test]
+#[ignore]
+fn e_registry_external_child() {
+    let Some(obj) = gated() else {
+        eprintln!("SKIP(members-live): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
+        return;
+    };
+    let exe = own_exe_cstr();
+    let off = query_off();
+    let attached = attach_chunk(&obj, &exe, off);
+    let loaded = &attached.loaded;
+    use osslscope::scan::registry::TidSource as _;
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleep child");
+    let cpid = child.id();
+    let src = osslscope::scan::registry::ProcTaskSource::new(cpid);
+    let observed = src.tids().expect("child task list");
+    assert!(!observed.is_empty(), "child has at least one task");
+    assert!(
+        !observed.contains(&self_tid()),
+        "child set never contains self (wrong-process source would)"
+    );
+    let mut state = BirthState::new();
+    let rows = register(loaded, &mut state, &observed);
+    assert_eq!(rows.len(), observed.len());
+    for (t, b) in &rows {
+        assert_eq!(*b, 0);
+        assert_eq!(
+            read_u16_cell(loaded, "BIRTH", *t),
+            Some(0),
+            "BIRTH[{t}] programmed"
+        );
+    }
+    child.kill().expect("kill sleep child");
+    let _ = child.wait();
+}
+
+/// E live freeze: BIRTH=MAX via the registry PROGRAM path → cause
+/// 3/LOSS 19 (the entry freezes the tid — no future admits).
+#[test]
+#[ignore]
+fn e_registry_live_freeze() {
+    use osslscope_ebpf_common as wire;
+    let Some(obj) = gated() else {
+        eprintln!("SKIP(members-live): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
+        return;
+    };
+    let exe = own_exe_cstr();
+    let off = query_off();
+    let attached = attach_with_ctrl(
+        &obj,
+        &exe,
+        off,
+        &osslscope::loader::default_ctrl(512, osslscope::loader::MEMBER_RING_BYTES).expect("CTRL"),
+    );
+    let loaded = &attached.loaded;
+    let tid = self_tid();
+    FIXTURE_ARRAY.store(0, Ordering::SeqCst);
+    NS_VERDICT.store(0, Ordering::SeqCst);
+    let mut state = BirthState::new();
+    assert_eq!(register(loaded, &mut state, &[tid]), vec![(tid, 0)]);
+    fire(OP as i32, 1);
+    let (calls, _, _) = drain(loaded);
+    assert_eq!(
+        call_parts(&calls[0]),
+        (false, wire::SKIP_ADMITTED),
+        "control admits"
+    );
+    // Freeze through the registry program path (not a raw write).
+    osslscope::scan::registry::program_births(&loaded.maps, &[(tid, wire::BIRTH_FROZEN)])
+        .expect("program MAX");
+    fire(OP as i32, 1);
+    let (calls, algs, rows) = drain(loaded);
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        call_parts(&calls[0]),
+        (false, wire::SKIP_BIRTH_WRAP),
+        "frozen skips"
+    );
+    assert_loss_only(loaded, wire::LOSS_BIRTH_WRAP, 1, "freeze");
+    assert!(algs.is_empty() && rows.is_empty());
+}
+
+/// E registry-full: BIRTH 4k-filled → `program_births` errors LOUD
+/// (hard error — never silently unregistered).
+#[test]
+#[ignore]
+fn e_registry_full() {
+    let Some(obj) = gated() else {
+        eprintln!("SKIP(members-live): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
+        return;
+    };
+    let exe = own_exe_cstr();
+    let off = query_off();
+    let attached = attach_with_ctrl(
+        &obj,
+        &exe,
+        off,
+        &osslscope::loader::default_ctrl(512, osslscope::loader::MEMBER_RING_BYTES).expect("CTRL"),
+    );
+    let loaded = &attached.loaded;
+    for i in 0..4096u32 {
+        let k = 0x4000_0000u32.wrapping_add(i);
+        write_cell(loaded, "BIRTH", &k.to_le_bytes(), &0u16.to_le_bytes());
+    }
+    let err = osslscope::scan::registry::program_births(&loaded.maps, &[(self_tid(), 0)])
+        .expect_err("4k-full BIRTH programs LOUD");
+    eprintln!("registry-full hard error (expected): {err:#}");
 }
