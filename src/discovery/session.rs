@@ -1047,16 +1047,19 @@ impl SessionCore {
     }
 
     /// Install a (replacement) dispatch-anchor binding (R03): the new
-    /// binding starts never-mapped — mapped history belongs to the
-    /// binding that earned it, so a mapped-then-replaced A can never
-    /// classify its pending replacement B as GONE (which detached +
-    /// reinstalled B every poll). Returns the retired binding's
-    /// mapped history for the continuity caveat: A's gap stays
-    /// reported even though its state no longer classifies B.
-    fn install_dispatch_binding(&mut self, binding: (String, String, u64)) -> bool {
+    /// binding starts with ONLY its own mapping evidence (`mapped`
+    /// — whether the replacement is alive in this poll's maps), so
+    /// a mapped-then-replaced A can never classify its pending
+    /// replacement B as GONE (which detached + reinstalled B every
+    /// poll), while a B that is already mapped at installation owns
+    /// that history (a later unmap is GONE, not PENDING retain).
+    /// Returns the retired binding's mapped history for the
+    /// continuity caveat: A's gap stays reported even though its
+    /// state no longer classifies B.
+    fn install_dispatch_binding(&mut self, binding: (String, String, u64), mapped: bool) -> bool {
         let prior_mapped = self.dispatch_ever_mapped;
         self.dispatch_bound = Some(binding);
-        self.dispatch_ever_mapped = false;
+        self.dispatch_ever_mapped = mapped;
         prior_mapped
     }
 
@@ -2180,10 +2183,19 @@ impl SessionCore {
                     });
                 }
                 Ok(fresh) => {
-                    // R03: the replacement binding starts
-                    // never-mapped; the caveat reads the RETIRED
-                    // binding's history, not the new one.
-                    let prior_mapped = self.install_dispatch_binding(fresh.binding);
+                    // R03: the replacement starts with ONLY its own
+                    // mapping evidence (alive in this poll's maps —
+                    // reconcile ran against A before the install, so
+                    // a mapped-at-install B would otherwise lose its
+                    // history and a later unmap would retain as
+                    // PENDING instead of detaching as GONE). The
+                    // caveat reads the RETIRED binding's history,
+                    // not the new one.
+                    let (ref b_path, ref b_dev, b_ino) = fresh.binding;
+                    let stat_devs: Vec<Option<String>> =
+                        maps.iter().map(|m| stat_dev_of(&m.path)).collect();
+                    let b_mapped = bindings_alive(&maps, &stat_devs, b_path, b_dev, b_ino);
+                    let prior_mapped = self.install_dispatch_binding(fresh.binding, b_mapped);
                     self.dispatch_live = true;
                     self.dispatch_blind = false;
                     self.resolution = fresh.resolution;
@@ -5174,6 +5186,70 @@ mod tests {
                 AttachKind::DispatchAnchors { .. }
             ) && a.failed.is_some()),
             "post-map replacement keeps its caveat: {:?}",
+            delta.attaches
+        );
+    }
+
+    #[test]
+    fn mapped_b_at_install_unmaps_immediately_detaches() {
+        // R03 fix-round-1: B mapped in its installation poll owns that
+        // mapped history — a later unmap (file still present) is GONE
+        // (detach + reinstall attempt + loss), not PENDING retain.
+        // Pre-fix, `install_dispatch_binding` reset history
+        // unconditionally, so the same-poll B evidence was lost and
+        // the unmap retained silently (snapshot stayed attached).
+        let mut env = MiniEnv::new();
+        env.maps = vec![prov_mapping(50, 0x1000)];
+        let mut core = a11_core();
+        core.dispatch_bound = Some(("/p/provider.so".to_string(), "08:01".to_string(), 50));
+        core.dispatch_live = true;
+        core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(env.dispatch_detaches, 0);
+
+        // A→B turnover with B already mapped in the install poll.
+        env.maps = vec![prov_mapping(60, 0x1000)];
+        env.provider_stat = Some(("08:01".to_string(), 60));
+        env.reinstall_script.push_back(Ok(DispatchReinstall {
+            binding: ("/p/provider.so".to_string(), "08:01".to_string(), 60),
+            resolution: None,
+        }));
+        let delta = core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(env.dispatch_detaches, 1, "A turnover detaches once");
+        assert_eq!(env.reinstall_calls, 1, "B installs once");
+        assert!(core.dispatch_live, "mapped B stays live");
+        assert_eq!(
+            core.dispatch_bound,
+            Some(("/p/provider.so".to_string(), "08:01".to_string(), 60))
+        );
+        // A's continuity gap stays reported (retired history).
+        assert!(
+            delta.attaches.iter().any(|a| matches!(
+                a.kind,
+                AttachKind::DispatchAnchors { count: 2 }
+            ) && a.failed.is_some()),
+            "A turnover keeps its caveat: {:?}",
+            delta.attaches
+        );
+
+        // B unmaps immediately (dlclose) while its file remains present.
+        env.maps = vec![lc_mapping(99)];
+        env.provider_stat = Some(("08:01".to_string(), 60));
+        env.reinstall_script
+            .push_back(Err(anyhow::anyhow!("anchor unresolvable")));
+        let delta = core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(env.dispatch_detaches, 2, "B unmap detaches once (GONE)");
+        assert_eq!(env.reinstall_calls, 2, "GONE triggers a reinstall attempt");
+        assert!(!core.dispatch_live, "GONE clears liveness");
+        assert!(
+            !core.snapshot().dispatch.attached,
+            "snapshot reports detached after GONE"
+        );
+        assert!(
+            delta.attaches.iter().any(|a| matches!(
+                a.kind,
+                AttachKind::DispatchAnchors { .. }
+            ) && a.failed.is_some()),
+            "failed B reinstall must signal loss: {:?}",
             delta.attaches
         );
     }
