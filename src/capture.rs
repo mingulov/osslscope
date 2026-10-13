@@ -56,6 +56,7 @@ use crate::evidence::{
 use crate::{args, kinds, pin, plan, target};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -741,12 +742,14 @@ pub trait ProcPort {
     /// BEFORE allocating (callers skip the path and count loud
     /// loss). Implementations pin the file across the read (open
     /// once, fstat/read/fstat) so the bytes cannot tear across a
-    /// replacement.
+    /// replacement. The payload is shared immutable (R14 fix):
+    /// cache and output clones never copy the bytes.
+    #[allow(clippy::type_complexity, reason = "R14 budgeted-read triple")]
     fn read_file_bound(
         &mut self,
         path: &str,
         max_bytes: usize,
-    ) -> std::io::Result<(Vec<u8>, (u64, u64))>;
+    ) -> std::io::Result<(Arc<[u8]>, (u64, u64))>;
     /// Per-poll byte budget for relevant-file reads (R14): the
     /// total allowance one `read_relevant_files` pass may newly
     /// read; production allows [`MAX_CACHED_BYTES`]. Tests inject
@@ -785,7 +788,7 @@ impl ProcPort for LiveProc {
         &mut self,
         path: &str,
         max_bytes: usize,
-    ) -> std::io::Result<(Vec<u8>, (u64, u64))> {
+    ) -> std::io::Result<(Arc<[u8]>, (u64, u64))> {
         plan::read_file_bounded(path, max_bytes).map(|f| (f.bytes, (f.dev, f.ino)))
     }
 
@@ -2321,7 +2324,15 @@ where
                     }
                 }
             }
+            // R14 fix: cached payloads are output-admitted only
+            // within the remaining allowance — a hit past it skips
+            // loud like a fresh-read refusal (a fresh read always
+            // fits: the reader refuses past `allowance` first).
             if let Some(cached) = self.file_cache.get(p) {
+                if cached.bytes.len() > allowance {
+                    dropped = dropped.saturating_add(1);
+                    continue;
+                }
                 out_bytes = out_bytes.saturating_add(cached.bytes.len());
                 out.insert(p.clone(), cached.clone());
             }
@@ -5923,7 +5934,7 @@ mod tests {
                 &mut self,
                 _path: &str,
                 _max_bytes: usize,
-            ) -> std::io::Result<(Vec<u8>, (u64, u64))> {
+            ) -> std::io::Result<(Arc<[u8]>, (u64, u64))> {
                 Err(std::io::Error::new(std::io::ErrorKind::Other, "unstubbed"))
             }
             fn stat_file(&mut self, _path: &str) -> Option<(u64, u64)> {
@@ -6088,7 +6099,11 @@ mod tests {
             )];
             let files = HashMap::from([(
                 seed.path.clone(),
-                crate::plan::FileBytes { bytes, dev, ino },
+                crate::plan::FileBytes {
+                    bytes: bytes.into(),
+                    dev,
+                    ino,
+                },
             )]);
             let delta = CountDelta {
                 discovered: vec![site],

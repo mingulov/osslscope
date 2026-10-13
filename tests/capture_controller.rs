@@ -431,7 +431,7 @@ impl ProcPort for FakeProc {
         }
         self.files
             .get(path)
-            .map(|f| f.bytes.clone())
+            .map(|f| f.bytes.to_vec())
             .ok_or_else(|| anyhow::anyhow!("no such staged file {path}"))
     }
 
@@ -439,7 +439,7 @@ impl ProcPort for FakeProc {
         &mut self,
         path: &str,
         max_bytes: usize,
-    ) -> std::io::Result<(Vec<u8>, (u64, u64))> {
+    ) -> std::io::Result<(std::sync::Arc<[u8]>, (u64, u64))> {
         self.clock.advance_ns(self.file_delay_ns);
         self.proc_log.borrow_mut().reads.push(path.to_string());
         self.proc_log
@@ -721,7 +721,7 @@ impl Harness {
         files.insert(
             staged.path.clone(),
             plan::FileBytes {
-                bytes: bytes.clone(),
+                bytes: bytes.clone().into(),
                 dev: staged.device,
                 ino: staged.ino,
             },
@@ -1596,7 +1596,7 @@ fn h2_t2_close_truncation_taints_only_its_op() {
     h.files.insert(
         staged2.path.clone(),
         plan::FileBytes {
-            bytes: h.bytes.clone(),
+            bytes: h.bytes.clone().into(),
             dev: staged2.device,
             ino: staged2.ino,
         },
@@ -1806,7 +1806,7 @@ fn h2_t4_fenced_complete_revised_by_later_poll_taint() {
     h.files.insert(
         newso.path.clone(),
         plan::FileBytes {
-            bytes: h.bytes.clone(),
+            bytes: h.bytes.clone().into(),
             dev: newso.device,
             ino: newso.ino,
         },
@@ -1920,7 +1920,7 @@ fn h2_t3_stale_seal_revised_at_close() {
     h.files.insert(
         newso.path.clone(),
         plan::FileBytes {
-            bytes: h.bytes.clone(),
+            bytes: h.bytes.clone().into(),
             dev: newso.device,
             ino: newso.ino,
         },
@@ -2115,7 +2115,7 @@ fn h3_t6_fenced_mixed_survives_retrospective_revision_intact() {
     h.files.insert(
         newso.path.clone(),
         plan::FileBytes {
-            bytes: h.bytes.clone(),
+            bytes: h.bytes.clone().into(),
             dev: newso.device,
             ino: newso.ino,
         },
@@ -2223,7 +2223,7 @@ fn h3_t5_mixed_counter_counts_distinct_triples() {
         h.files.insert(
             staged2.path.clone(),
             plan::FileBytes {
-                bytes: h.bytes.clone(),
+                bytes: h.bytes.clone().into(),
                 dev: staged2.device,
                 ino: staged2.ino,
             },
@@ -2293,7 +2293,7 @@ fn untracked_epoch_executions_are_unattributed_partial() {
     h.files.insert(
         prov2.path.clone(),
         plan::FileBytes {
-            bytes: h.bytes.clone(),
+            bytes: h.bytes.clone().into(),
             dev: prov2.device,
             ino: prov2.ino,
         },
@@ -2848,7 +2848,7 @@ fn late_provider_operation_attaches_with_loss() {
     h.files.insert(
         prov2.path.clone(),
         plan::FileBytes {
-            bytes: h.bytes.clone(),
+            bytes: h.bytes.clone().into(),
             dev: prov2.device,
             ino: prov2.ino,
         },
@@ -2856,7 +2856,7 @@ fn late_provider_operation_attaches_with_loss() {
     h.files.insert(
         newso.path.clone(),
         plan::FileBytes {
-            bytes: h.bytes.clone(),
+            bytes: h.bytes.clone().into(),
             dev: newso.device,
             ino: newso.ino,
         },
@@ -3793,7 +3793,7 @@ fn maps_fence_versions_generation() {
     h.files.insert(
         newso.path.clone(),
         plan::FileBytes {
-            bytes: h.bytes.clone(),
+            bytes: h.bytes.clone().into(),
             dev: newso.device,
             ino: newso.ino,
         },
@@ -4048,7 +4048,7 @@ fn provider_class_resolves_per_advertising_object() {
         (
             sa.path.clone(),
             plan::FileBytes {
-                bytes: bytes_a,
+                bytes: bytes_a.into(),
                 dev: sa.device,
                 ino: sa.ino,
             },
@@ -4056,7 +4056,7 @@ fn provider_class_resolves_per_advertising_object() {
         (
             sb.path.clone(),
             plan::FileBytes {
-                bytes: bytes_b,
+                bytes: bytes_b.into(),
                 dev: sb.device,
                 ino: sb.ino,
             },
@@ -4153,7 +4153,7 @@ fn stale_path_fingerprint_is_unverified() {
     let files: HashMap<String, plan::FileBytes> = HashMap::from([(
         staged.path.clone(),
         plan::FileBytes {
-            bytes: bytes_new.clone(),
+            bytes: bytes_new.clone().into(),
             dev: staged.device,
             ino: meta_new.ino(),
         },
@@ -4221,7 +4221,7 @@ fn advertising_joins_exact_vma_not_first_path() {
     let files: HashMap<String, plan::FileBytes> = HashMap::from([(
         v1.path.clone(),
         plan::FileBytes {
-            bytes: bytes_v2.clone(),
+            bytes: bytes_v2.clone().into(),
             dev: v2.device,
             ino: v2.ino,
         },
@@ -4307,7 +4307,7 @@ fn advertising_turnover_is_anonymous() {
     let files: HashMap<String, plan::FileBytes> = HashMap::from([(
         staged.path.clone(),
         plan::FileBytes {
-            bytes: bytes.clone(),
+            bytes: bytes.clone().into(),
             dev: staged.device,
             ino: staged.ino,
         },
@@ -4434,7 +4434,7 @@ fn refreshed_site_fingerprint_is_forwarded() {
     let files_a: HashMap<String, plan::FileBytes> = HashMap::from([(
         staged.path.clone(),
         plan::FileBytes {
-            bytes: bytes_a.clone(),
+            bytes: bytes_a.clone().into(),
             dev: staged.device,
             ino: staged.ino,
         },
@@ -4457,7 +4457,7 @@ fn refreshed_site_fingerprint_is_forwarded() {
     let files_b: HashMap<String, plan::FileBytes> = HashMap::from([(
         staged.path.clone(),
         plan::FileBytes {
-            bytes: bytes_b.clone(),
+            bytes: bytes_b.clone().into(),
             dev: staged.device,
             ino: staged.ino,
         },
@@ -4507,7 +4507,7 @@ impl AdaptHarness {
         let files = HashMap::from([(
             staged.path.clone(),
             plan::FileBytes {
-                bytes,
+                bytes: bytes.into(),
                 dev: staged.device,
                 ino: staged.ino,
             },
@@ -5214,7 +5214,7 @@ fn live_observe(
     files.insert(
         staged.path.clone(),
         plan::FileBytes {
-            bytes,
+            bytes: bytes.into(),
             dev: staged.device,
             ino: staged.ino,
         },
@@ -5622,7 +5622,7 @@ fn round_reads_only_relevant_files() {
     h.files.insert(
         decoy.path.clone(),
         plan::FileBytes {
-            bytes: h.bytes.clone(),
+            bytes: h.bytes.clone().into(),
             dev: decoy.device,
             ino: decoy.ino,
         },
@@ -5829,7 +5829,7 @@ fn r14_first_oversized_object_cannot_bypass_cap() {
     h.files.insert(
         big.path.clone(),
         plan::FileBytes {
-            bytes: vec![0x7fu8; elf_len + 1024],
+            bytes: vec![0x7fu8; elf_len + 1024].into(),
             dev: big.device,
             ino: big.ino,
         },
@@ -5943,7 +5943,7 @@ fn r14_cumulative_two_file_overflow_skips_second() {
     h.files.insert(
         other.path.clone(),
         plan::FileBytes {
-            bytes: h.bytes.clone(),
+            bytes: h.bytes.clone().into(),
             dev: other.device,
             ino: other.ino,
         },
@@ -6124,4 +6124,131 @@ fn r14_within_budget_round_reads_fully() {
     assert!(matches!(c.outcome, Outcome::Complete), "{:?}", c.outcome);
     assert!(matches!(c.document.status, Completeness::Complete));
     assert_eq!(c.document.total_calls(), 7);
+}
+
+#[test]
+fn r14_fix_cached_payload_over_remaining_budget_skips_loud() {
+    // R14 fix round 1 (finding 1): a cache hit past the REMAINING
+    // round allowance skips loud — like a fresh-read refusal its
+    // rows miss and `discovery.relevance_capped` counts it
+    // (PARTIAL, never a completeness claim). The pre-fix loop
+    // admitted cached payloads unconditionally, so a cached entry
+    // last in sort order inflated the output past the round budget
+    // with no loss recorded anywhere.
+    //
+    // Sequence the cumulative test missed: poll 1 caches z-old
+    // (fits the full budget); poll 2 reads a-new fresh FIRST
+    // (sorts first, consumes most of the budget), then the cached
+    // z-old no longer fits the remainder and must be refused.
+    let mut h = Harness::fresh("r14-mixed");
+    h.snapshot_attached();
+    let elf_len = h.bytes.len();
+    let budget = elf_len + elf_len / 2;
+    let fresh = h.stage.write("a-new.so", &h.bytes.clone());
+    h.files.insert(
+        fresh.path.clone(),
+        plan::FileBytes {
+            bytes: h.bytes.clone().into(),
+            dev: fresh.device,
+            ino: fresh.ino,
+        },
+    );
+    let old = h.stage.write("z-old.so", &h.bytes.clone());
+    h.files.insert(
+        old.path.clone(),
+        plan::FileBytes {
+            bytes: h.bytes.clone().into(),
+            dev: old.device,
+            ino: old.ino,
+        },
+    );
+    h.read_budget = budget;
+    h.maps = vec![mapping(&fresh), mapping(&old)];
+    let fresh_path = fresh.path.clone();
+    let old_path = old.path.clone();
+    assert!(
+        fresh_path < old_path,
+        "fresh file must sort first: {fresh_path} vs {old_path}"
+    );
+    // Baseline poll caches z-old alone (fits the full budget).
+    h.polls.push_back(DiscoveryDelta {
+        candidates: vec![cand(
+            "/p/provider.so",
+            backing_of(&old, h.off),
+            1,
+            11,
+            "SHA-256",
+            false,
+            "ok",
+        )],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    // Round poll: a-new reads fresh first, then cached z-old no
+    // longer fits the remainder.
+    h.polls.push_back(DiscoveryDelta {
+        candidates: vec![
+            cand(
+                "/p/provider.so",
+                backing_of(&fresh, h.off),
+                1,
+                11,
+                "SHA-256",
+                false,
+                "ok",
+            ),
+            cand(
+                "/p/provider.so",
+                backing_of(&old, h.off),
+                1,
+                11,
+                "SHA-256",
+                false,
+                "ok",
+            ),
+        ],
+        tables: vec![terminated(1, 0)],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    h.plans.insert(
+        2,
+        FirePlan {
+            fires: vec![(BASE_NS + 600_000_000, 7)],
+            shortfall: 0,
+            cancel: false,
+        },
+    );
+    h.exit_at_ns = Some(BASE_NS + 1_000_000_000);
+    h.exit_code = 0;
+    let (out, post) = h.run();
+    let c = out.unwrap();
+    // The cached entry was refused, not bypassed: exactly one loud
+    // budget drop, and the cache hit caused no re-read.
+    assert_eq!(
+        counter_value(&c, "discovery.relevance_capped"),
+        1,
+        "one cached-over-budget refusal: {:?}",
+        c.document.counters
+    );
+    let log = post.proc_log.borrow();
+    assert_eq!(
+        log.reads,
+        vec![old_path.clone(), fresh_path.clone()],
+        "z-old cached in poll 1, only a-new read in poll 2"
+    );
+    assert_eq!(
+        log.read_allowances,
+        vec![(old_path.clone(), budget), (fresh_path.clone(), budget)],
+        "each poll's first read carries the full round budget"
+    );
+    assert!(matches!(c.outcome, Outcome::Partial), "{:?}", c.outcome);
+    assert!(matches!(c.document.status, Completeness::Partial { .. }));
+    for site in &c.document.sites {
+        assert_eq!(
+            site.candidates_coverage,
+            CandidateCoverage::Unknown,
+            "cached overflow must revise emitted sites"
+        );
+    }
 }

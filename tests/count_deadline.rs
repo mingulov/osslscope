@@ -159,7 +159,7 @@ fn kernel_deadline_excludes_late_calls() {
     let files = HashMap::from([(
         a.path.clone(),
         plan::FileBytes {
-            bytes: std::fs::read(&a.path).unwrap(),
+            bytes: std::fs::read(&a.path).unwrap().into(),
             dev: a.device,
             ino: a.ino,
         },
@@ -207,7 +207,7 @@ fn window_closed_until_open() {
     let files = HashMap::from([(
         a.path.clone(),
         plan::FileBytes {
-            bytes: std::fs::read(&a.path).unwrap(),
+            bytes: std::fs::read(&a.path).unwrap().into(),
             dev: a.device,
             ino: a.ino,
         },
@@ -263,7 +263,7 @@ fn map_full_is_explicit() {
     let files = HashMap::from([(
         a.path.clone(),
         plan::FileBytes {
-            bytes: std::fs::read(&a.path).unwrap(),
+            bytes: std::fs::read(&a.path).unwrap().into(),
             dev: a.device,
             ino: a.ino,
         },
@@ -330,7 +330,7 @@ fn per_key_threaded_counts() {
     let files = HashMap::from([(
         a.path.clone(),
         plan::FileBytes {
-            bytes: std::fs::read(&a.path).unwrap(),
+            bytes: std::fs::read(&a.path).unwrap().into(),
             dev: a.device,
             ino: a.ino,
         },
@@ -509,7 +509,7 @@ fn h4_t4_rejected_resolve_attaches_nothing_drains_empty() {
     let files = HashMap::from([(
         a.path.clone(),
         plan::FileBytes {
-            bytes: std::fs::read(&a.path).unwrap(),
+            bytes: std::fs::read(&a.path).unwrap().into(),
             dev: a.device,
             ino: a.ino,
         },
@@ -563,7 +563,7 @@ fn h4_t3_pin_survives_path_deletion_until_session_drop() {
     let files = HashMap::from([(
         a.path.clone(),
         plan::FileBytes {
-            bytes: std::fs::read(&a.path).unwrap(),
+            bytes: std::fs::read(&a.path).unwrap().into(),
             dev: a.device,
             ino: a.ino,
         },
@@ -612,7 +612,7 @@ fn h4_t1_mid_attach_swap_binds_pinned_inode_via_fd_path() {
     let files = HashMap::from([(
         a.path.clone(),
         plan::FileBytes {
-            bytes: std::fs::read(&a.path).unwrap(),
+            bytes: std::fs::read(&a.path).unwrap().into(),
             dev: a.device,
             ino: a.ino,
         },
@@ -679,7 +679,7 @@ fn h4_unbound_cookie_hits_route_unattributed() {
     let files = HashMap::from([(
         a.path.clone(),
         plan::FileBytes {
-            bytes: std::fs::read(&a.path).unwrap(),
+            bytes: std::fs::read(&a.path).unwrap().into(),
             dev: a.device,
             ino: a.ino,
         },
@@ -725,7 +725,7 @@ fn fake_backend_folds_bounds_monotonically() {
     let files = HashMap::from([(
         a.path.clone(),
         plan::FileBytes {
-            bytes: std::fs::read(&a.path).unwrap(),
+            bytes: std::fs::read(&a.path).unwrap().into(),
             dev: a.device,
             ino: a.ino,
         },
@@ -776,7 +776,7 @@ fn h4_stale_plan_misses_replaced_per_attempt() {
     let files = HashMap::from([(
         a.path.clone(),
         plan::FileBytes {
-            bytes: std::fs::read(&a.path).unwrap(),
+            bytes: std::fs::read(&a.path).unwrap().into(),
             dev: a.device,
             ino: a.ino,
         },
@@ -819,7 +819,7 @@ fn h4_stale_plan_misses_replaced_per_attempt() {
     let files_b = HashMap::from([(
         b.path.clone(),
         plan::FileBytes {
-            bytes: std::fs::read(&b.path).unwrap(),
+            bytes: std::fs::read(&b.path).unwrap().into(),
             dev: b.device,
             ino: b.ino,
         },
@@ -845,7 +845,7 @@ fn h4_stale_retries_count_missed_once_each() {
     let files = HashMap::from([(
         a.path.clone(),
         plan::FileBytes {
-            bytes: std::fs::read(&a.path).unwrap(),
+            bytes: std::fs::read(&a.path).unwrap().into(),
             dev: a.device,
             ino: a.ino,
         },
