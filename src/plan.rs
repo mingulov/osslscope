@@ -280,9 +280,13 @@ pub fn resolve_pinned_retry(
 /// maps read and the files read must not lend the new file's bytes
 /// (or fingerprint) to the old mapping. `dev` is the encoded
 /// device (same domain as [`PinnedFile::device`]).
+/// The payload has one shared immutable owner (R14 fix): the
+/// verified-identity cache and every round output clone the `Arc`,
+/// never the bytes — a cache→output handoff is a refcount bump,
+/// not a per-poll full-payload copy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileBytes {
-    pub bytes: Vec<u8>,
+    pub bytes: std::sync::Arc<[u8]>,
     pub dev: u64,
     pub ino: u64,
 }
@@ -313,7 +317,7 @@ pub fn bound_bytes<'a>(
     if fb.dev != dev || fb.ino != ino {
         return None;
     }
-    Some(&fb.bytes)
+    Some(&fb.bytes[..])
 }
 
 /// Per-object read bound (R14): no single relevant-file read may
@@ -405,7 +409,11 @@ pub fn read_bounded_from<S: ReadBoundedSource>(
             "file changed mid-read",
         ));
     }
-    Ok(FileBytes { bytes, dev, ino })
+    Ok(FileBytes {
+        bytes: bytes.into(),
+        dev,
+        ino,
+    })
 }
 
 /// Identity-bound file read (F-A/A3), bounded (R14): open once,
@@ -751,7 +759,7 @@ mod tests {
 
     fn file_bytes(bytes: Vec<u8>, ino: u64) -> FileBytes {
         FileBytes {
-            bytes,
+            bytes: bytes.into(),
             dev: device_id_of_dev_str("08:01").unwrap(),
             ino,
         }
@@ -1056,7 +1064,7 @@ mod tests {
             (
                 "old.so".to_string(),
                 FileBytes {
-                    bytes: b"v1".to_vec(),
+                    bytes: b"v1".to_vec().into(),
                     dev: 1,
                     ino: 100,
                 },
@@ -1064,7 +1072,7 @@ mod tests {
             (
                 "new.so".to_string(),
                 FileBytes {
-                    bytes: b"v2".to_vec(),
+                    bytes: b"v2".to_vec().into(),
                     dev: 1,
                     ino: 200,
                 },
@@ -1090,7 +1098,7 @@ mod tests {
         let files: HashMap<String, FileBytes> = HashMap::from([(
             "twin.so".to_string(),
             FileBytes {
-                bytes: b"v1".to_vec(),
+                bytes: b"v1".to_vec().into(),
                 dev: 0x1111,
                 ino: 100,
             },
