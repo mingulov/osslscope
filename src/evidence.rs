@@ -78,9 +78,17 @@ impl CandidateIdentity {
 /// Whether the candidate set for a site is itself complete. `Unknown`
 /// means candidates may be missing; it is not the same as a candidate
 /// carrying an `other`/unreadable algorithm class.
+/// `AmbiguousComplete` (R01) means the set is complete — terminated
+/// tables prove no rows are missing — but every row mixed two or more
+/// semantic identities, so each retained class is only the row's
+/// minimum and the discarded alternatives are unlisted. Candidate
+/// count and identities prove nothing on such a site: every
+/// predicate reads `(0, Some(calls))`, never definite, never
+/// proved-absent, and no definite asset is minted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum CandidateCoverage {
     Complete,
+    AmbiguousComplete,
     Unknown,
 }
 
@@ -159,6 +167,14 @@ fn site_bound(
     if site.candidates_coverage == CandidateCoverage::Unknown {
         // Incomplete set: no lower-bound assertion, unbounded upper.
         return (0, None);
+    }
+    if site.candidates_coverage == CandidateCoverage::AmbiguousComplete {
+        // Complete set, ambiguous rows: the wire retains only the
+        // minimum class per row, so candidate identities prove
+        // nothing — no definite attribution from any count, and no
+        // proved absence either (the unlisted alternatives could be
+        // anything in their rows). Finite upper over known calls.
+        return (0, Some(site.calls));
     }
     if site.candidates.is_empty() {
         return (0, Some(site.calls));

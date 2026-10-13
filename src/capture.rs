@@ -1249,6 +1249,12 @@ pub struct AdapterState {
     /// same-triple single re-walk never flips back to Complete.
     /// Separate from bad_read (ambiguity, not lost identity).
     sites_mixed: HashSet<(u64, u64, u64)>,
+    /// Sites that ever arrived with an `ok` verdict (R01): with
+    /// `sites_mixed` this distinguishes pure-mixed triples (every
+    /// row ambiguous — bounded ambiguity when the tables prove no
+    /// rows missing) from mixed/`ok` blends (H3 withhold — a
+    /// re-walked row never unmixes its triple).
+    sites_ok: HashSet<(u64, u64, u64)>,
     /// Sticky per-op walk-shape bits (mirrors the producer: never
     /// retired — any nonzero bit keeps the op unclosed).
     op_trunc: HashMap<u32, u64>,
@@ -1663,6 +1669,9 @@ pub fn adapt_delta(
         if mixed {
             state.sites_mixed.insert(triple);
         }
+        if !mixed && !bad_read {
+            state.sites_ok.insert(triple);
+        }
         slot.6 &= mixed;
     }
     // Deterministic group order (arrival order must not leak).
@@ -1687,27 +1696,25 @@ pub fn adapt_delta(
         // A7: relevant loss taints the set (op-localized orphans
         // via tainted_ops; unlocalizable loss via the global flag).
         //
-        // R01 finite enumeration: a FIRST-EMIT group whose fresh
-        // arrivals are ALL mixed-status with ≥2 DISTINCT identities
-        // is an explicitly enumerated finite alternative set — the
-        // ambiguity is preserved in the candidate list (finite
-        // bounds, COMPLETE) instead of collapsing to Unknown.
-        // Everything else keeps H3 withhold: singleton mixed (the
-        // alternatives are unenumerated, so the upper is unbounded),
-        // piecemeal mixed (a later poll's arrival cannot prove the
-        // enumeration complete — in-window ambiguity stays sticky),
-        // ok/mixed blends (an ok arrival beside a mixed one leaves
-        // the mixed row's alternatives unlisted), duplicates (no new
-        // information, F-A/A4), bad reads, unclosed ops and taint.
-        let mut fresh_distinct = fresh_identities.clone();
-        fresh_distinct.sort();
-        fresh_distinct.dedup();
-        let finite_enum = first_emit && all_mixed && fresh_distinct.len() >= 2;
+        // R01 bounded ambiguity: a group whose fresh arrivals are
+        // ALL mixed-status, on a triple that NEVER arrived `ok`
+        // (pure-mixed — no blend history), carries ambiguity the
+        // terminated tables bound: no rows are missing, so the upper
+        // is finite. Candidate COUNT proves nothing here — the wire
+        // retains only the minimum class per row, so distinct
+        // identities (e.g. weak differing) can name one class while
+        // hiding every alternative (re-reviewer round 2). Bounds
+        // and assets treat AmbiguousComplete as unattributable but
+        // finite. Everything else keeps H3 withhold: ok/mixed
+        // blends (sticky — a re-walk never unmixes its triple),
+        // duplicates (no new information, F-A/A4), bad reads,
+        // unclosed ops and taint.
+        let pure_mixed = all_mixed && !state.sites_ok.contains(&triple);
         let mut unknown = bad_read
-            || (!finite_enum && mixed)
+            || (mixed && !pure_mixed)
             || state.taint_global
             || state.sites_bad_read.contains(&triple)
-            || (!finite_enum && state.sites_mixed.contains(&triple));
+            || (state.sites_mixed.contains(&triple) && !pure_mixed);
         if let Some(ops) = state.triple_ops.get(&triple) {
             for op in ops {
                 if !state.op_closed(*op) {
@@ -1758,6 +1765,8 @@ pub fn adapt_delta(
         }
         let coverage = if unknown {
             CandidateCoverage::Unknown
+        } else if pure_mixed {
+            CandidateCoverage::AmbiguousComplete
         } else {
             CandidateCoverage::Complete
         };
@@ -3920,7 +3929,14 @@ where
                 .iter_mut()
                 .chain(drain.fenced.iter_mut().flat_map(|g| g.sites.iter_mut()))
             {
-                if site.candidates_coverage == CandidateCoverage::Complete && site_tainted(site) {
+                // R01: taint voids AmbiguousComplete exactly like
+                // Complete — possibly-missing evidence unproves the
+                // no-rows-missing finiteness claim.
+                if matches!(
+                    site.candidates_coverage,
+                    CandidateCoverage::Complete | CandidateCoverage::AmbiguousComplete
+                ) && site_tainted(site)
+                {
                     site.candidates_coverage = CandidateCoverage::Unknown;
                 }
             }
