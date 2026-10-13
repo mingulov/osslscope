@@ -6012,6 +6012,25 @@ mod tests {
             count: &mut CountSession<FakeCountBackend>,
             class: &str,
         ) -> (SeedFile, (u64, u64)) {
+            seed_site_candidates(
+                count,
+                vec![CandidateIdentity::new(
+                    ObjectId("prov".to_string()),
+                    class.to_string(),
+                    1,
+                    7,
+                    vec!["digest".to_string()],
+                    false,
+                )],
+            )
+        }
+
+        /// Seeded site with caller-chosen candidates (R02: MD5/weak
+        /// and mixed-ambiguity seeds share the attach/drain path).
+        fn seed_site_candidates(
+            count: &mut CountSession<FakeCountBackend>,
+            candidates: Vec<CandidateIdentity>,
+        ) -> (SeedFile, (u64, u64)) {
             let bytes = std::fs::read(std::env::current_exe().unwrap()).unwrap();
             let off = x_offset(&bytes);
             let seed = SeedFile::fresh(&bytes);
@@ -6023,14 +6042,7 @@ mod tests {
                     inode: ino,
                     offset: off,
                 },
-                candidates: vec![CandidateIdentity::new(
-                    ObjectId("prov".to_string()),
-                    class.to_string(),
-                    1,
-                    7,
-                    vec!["digest".to_string()],
-                    false,
-                )],
+                candidates,
                 candidates_coverage: CandidateCoverage::Complete,
             };
             let live = vec![unit_mapping(
@@ -6579,6 +6591,377 @@ mod tests {
             assert_eq!(lp["executed_calls"], 0);
             assert_eq!(lp["shared_ambiguous_calls"], 0);
             assert_eq!(lp["non_legacy_exclusive_calls"], 7);
+        }
+
+        /// Index a CBOM properties array by name.
+        fn cbom_props(props: &serde_json::Value) -> std::collections::BTreeMap<String, String> {
+            props
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| {
+                    (
+                        p["name"].as_str().unwrap().to_string(),
+                        p["value"].as_str().unwrap().to_string(),
+                    )
+                })
+                .collect()
+        }
+
+        fn ok_delivery() -> crate::report::DeliveryResult {
+            crate::report::DeliveryResult {
+                primary: crate::report::ArtifactOutcome {
+                    dest: "stdout".to_string(),
+                    ok: true,
+                    bytes: 8,
+                    error: None,
+                },
+                cbom: None,
+                diagnostics: Vec::new(),
+            }
+        }
+
+        /// Align the harness window with the count window so the
+        /// salvaged doc is window-consistent for schema/semantic
+        /// validation (the harness default 5e9 window predates
+        /// semantic validation of stub docs).
+        fn align_window(runner: &mut StubRunner<'_>) {
+            runner.window_start_ns = 1000;
+            runner.requested_start_ns = 1000;
+            runner.kernel_deadline_ns = 2000;
+        }
+
+        /// Complete the stubbed discovery with the object records a
+        /// real snapshot would carry for the seeded site (H8
+        /// precedent: the DiscoveryStub provides no objects).
+        fn push_seed_objects(runner: &mut StubRunner<'_>, dev: u64, ino: u64) {
+            runner.adapter.objects.push(ObjectRecord {
+                id: ObjectId("fp-A".to_string()),
+                device: dev,
+                inode: ino,
+                display_locator: "seed".to_string(),
+            });
+            runner.adapter.objects.push(ObjectRecord {
+                id: ObjectId("prov".to_string()),
+                device: dev,
+                inode: ino,
+                display_locator: "seed".to_string(),
+            });
+        }
+
+        #[test]
+        fn runtime_finish_failure_preserves_policy_and_assets() {
+            // R02: an actual controller close failure (discovery
+            // finish fails AFTER a good drain) salvages the observed
+            // MD5 site; check assembly and every renderer must agree
+            // on the retained evidence — JSON validates, semantics
+            // accepts the evaluated verdict, deny_weak convicts (exit
+            // 10), seven calls survive, and the CBOM carries the
+            // asset with an accurate disclaimer.
+            let cfg = stub_config();
+            let info = stub_info();
+            let clock = ClockStub::at(1_500);
+            let mut proc = ProcStub;
+            let cancelled = || false;
+            let mut count = CountSession::new(TPID, FakeCountBackend::new());
+            let (_seed, (dev, ino)) = seed_site_candidates(
+                &mut count,
+                vec![CandidateIdentity::new(
+                    ObjectId("prov".to_string()),
+                    "default".to_string(),
+                    1,
+                    7,
+                    vec!["MD5".to_string()],
+                    true,
+                )],
+            );
+            let mut runner = stub_runner(
+                &cfg,
+                &info,
+                DiscoveryStub {
+                    finish_err: true,
+                    poll_err: false,
+                    dispatch_attached: false,
+                },
+                count,
+                &clock,
+                &mut proc,
+                &cancelled,
+            );
+            align_window(&mut runner);
+            push_seed_objects(&mut runner, dev, ino);
+            let cap = runner
+                .close_and_finalize()
+                .expect("finish error must salvage, not Err");
+            // Controller facts: Runtime fatal naming discovery
+            // finish, seven intact calls, Complete coverage.
+            let detail = match &cap.document.status {
+                Completeness::Fatal {
+                    kind: evidence::FatalKind::Runtime(detail),
+                    ..
+                } => detail.clone(),
+                other => panic!("want Fatal(Runtime), got {other:?}"),
+            };
+            assert!(
+                detail.contains("discovery finish"),
+                "unexpected detail: {detail}"
+            );
+            assert!(cap.reasons.iter().any(|r| r == "close-failure"));
+            assert_eq!(cap.document.sites.len(), 1);
+            assert_eq!(cap.document.sites[0].calls, 7);
+            assert_eq!(
+                cap.document.sites[0].candidates_coverage,
+                CandidateCoverage::Complete
+            );
+            assert!(cap.document.has_usable_evidence());
+            // Check assembly (mirrors check::run): evaluate, fold the
+            // legacy tripwire, attach the policy section.
+            let mut verdict = crate::policy::evaluate_document(
+                std::slice::from_ref(&crate::policy::PolicyRule::deny_weak()),
+                &cap.document,
+            );
+            crate::policy::apply_legacy_engine_fallback(
+                &mut verdict,
+                crate::check::legacy_engine_calls(&cap.legacy),
+            );
+            assert_eq!(verdict.overall(), crate::policy::PolicyOutcome::Violation);
+            assert!(!verdict.rules.is_empty());
+            let mut document = cap.document.clone();
+            document.policy = Some(crate::check::policy_record(&verdict));
+            // JSON validates and semantics accepts the evaluated
+            // verdict on usable Runtime evidence.
+            let bytes = crate::report::render_json(&document).unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            crate::schema::validate_v2(&v).unwrap();
+            crate::schema::check_v2_semantics(&v).expect("usable Runtime verdict must validate");
+            assert_eq!(v["policy"]["verdict"], "violation");
+            assert_eq!(v["policy"]["rules"][0]["definite"], 7);
+            assert_eq!(document.total_calls(), 7);
+            // CBOM retains the definite MD5 asset with honest
+            // omission accounting and an accurate disclaimer.
+            let cbom: serde_json::Value =
+                serde_json::from_slice(&crate::report::render_cbom(&document).unwrap()).unwrap();
+            let comps = cbom["components"].as_array().unwrap();
+            assert_eq!(comps.len(), 1);
+            let asset = cbom_props(&comps[0]["properties"]);
+            assert_eq!(asset["osslscope:algorithm"], "MD5");
+            assert_eq!(asset["osslscope:calls"], "7");
+            let meta = cbom_props(&cbom["metadata"]["properties"]);
+            assert_eq!(meta["osslscope:omitted-ambiguous-sites"], "0");
+            assert_eq!(meta["osslscope:omitted-unknown-coverage-sites"], "0");
+            assert_eq!(meta["osslscope:policy-verdict"], "violation");
+            let disclaimer = &meta["osslscope:completeness-disclaimer"];
+            assert!(disclaimer.contains("FATAL"), "{disclaimer}");
+            assert!(disclaimer.contains("salvaged"), "{disclaimer}");
+            assert!(!disclaimer.contains("no usable evidence"), "{disclaimer}");
+            // Human names the retained site and the violation.
+            let text = crate::report::render_human(&document);
+            assert!(text.contains("7 calls"), "{text}");
+            assert!(text.contains("policy: violation"), "{text}");
+            assert!(text.contains("fatal: runtime:"), "{text}");
+            // A proved violation dominates the tool failure.
+            assert_eq!(
+                crate::report::exit_for(
+                    verdict.overall(),
+                    cap.child_exit,
+                    &document,
+                    &ok_delivery()
+                ),
+                10
+            );
+        }
+
+        #[test]
+        fn runtime_ambiguous_site_stays_possible_only() {
+            // R02 control: ambiguous Runtime evidence is usable (it
+            // evaluates) but never definite — mixed MD5/SHA2-256
+            // candidates are possible-only, so deny_weak is
+            // inconclusive, the CBOM omits the site with accounting,
+            // and the nonviolating Runtime exits 1.
+            let cfg = stub_config();
+            let info = stub_info();
+            let clock = ClockStub::at(1_500);
+            let mut proc = ProcStub;
+            let cancelled = || false;
+            let mut count = CountSession::new(TPID, FakeCountBackend::new());
+            let (_seed, (dev, ino)) = seed_site_candidates(
+                &mut count,
+                vec![
+                    CandidateIdentity::new(
+                        ObjectId("prov".to_string()),
+                        "default".to_string(),
+                        1,
+                        7,
+                        vec!["MD5".to_string()],
+                        true,
+                    ),
+                    CandidateIdentity::new(
+                        ObjectId("prov".to_string()),
+                        "default".to_string(),
+                        1,
+                        7,
+                        vec!["SHA2-256".to_string()],
+                        false,
+                    ),
+                ],
+            );
+            let mut runner = stub_runner(
+                &cfg,
+                &info,
+                DiscoveryStub {
+                    finish_err: true,
+                    poll_err: false,
+                    dispatch_attached: false,
+                },
+                count,
+                &clock,
+                &mut proc,
+                &cancelled,
+            );
+            align_window(&mut runner);
+            push_seed_objects(&mut runner, dev, ino);
+            let cap = runner
+                .close_and_finalize()
+                .expect("finish error must salvage, not Err");
+            assert!(
+                matches!(
+                    &cap.document.status,
+                    Completeness::Fatal {
+                        kind: evidence::FatalKind::Runtime(_),
+                        ..
+                    }
+                ),
+                "want Fatal(Runtime), got {:?}",
+                cap.document.status
+            );
+            assert_eq!(cap.document.sites.len(), 1);
+            assert_eq!(cap.document.sites[0].calls, 7);
+            assert!(cap.document.has_usable_evidence());
+            let verdict = crate::policy::evaluate_document(
+                std::slice::from_ref(&crate::policy::PolicyRule::deny_weak()),
+                &cap.document,
+            );
+            assert_eq!(
+                verdict.overall(),
+                crate::policy::PolicyOutcome::Inconclusive
+            );
+            assert!(!verdict.rules.is_empty());
+            let mut document = cap.document.clone();
+            document.policy = Some(crate::check::policy_record(&verdict));
+            let bytes = crate::report::render_json(&document).unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            crate::schema::validate_v2(&v).unwrap();
+            crate::schema::check_v2_semantics(&v).expect("ambiguous Runtime must validate");
+            assert_eq!(v["policy"]["verdict"], "inconclusive");
+            let cbom: serde_json::Value =
+                serde_json::from_slice(&crate::report::render_cbom(&document).unwrap()).unwrap();
+            assert_eq!(cbom["components"].as_array().unwrap().len(), 0);
+            let meta = cbom_props(&cbom["metadata"]["properties"]);
+            assert_eq!(meta["osslscope:omitted-ambiguous-sites"], "1");
+            assert_eq!(meta["osslscope:omitted-ambiguous-calls"], "7");
+            assert!(
+                meta["osslscope:omitted-evidence-refs"].contains("fp-A"),
+                "refs: {}",
+                meta["osslscope:omitted-evidence-refs"]
+            );
+            let disclaimer = &meta["osslscope:completeness-disclaimer"];
+            assert!(disclaimer.contains("FATAL"), "{disclaimer}");
+            assert!(disclaimer.contains("salvaged"), "{disclaimer}");
+            assert!(!disclaimer.contains("no usable evidence"), "{disclaimer}");
+            assert_eq!(
+                crate::report::exit_for(
+                    verdict.overall(),
+                    cap.child_exit,
+                    &document,
+                    &ok_delivery()
+                ),
+                1
+            );
+        }
+
+        #[test]
+        fn runtime_lost_drain_evaluates_without_sites() {
+            // R02 control: a lost drain (pre-drained session plus a
+            // finish failure) salvages no sites; the Runtime doc still
+            // evaluates (kind-eligible) to inconclusive — absence is
+            // unprovable over a broken close — with an accurate empty
+            // CBOM and exit 1.
+            let cfg = stub_config();
+            let info = stub_info();
+            let clock = ClockStub::at(1_500);
+            let mut proc = ProcStub;
+            let cancelled = || false;
+            let mut count = CountSession::new(TPID, FakeCountBackend::new());
+            let _seed = seed_site(&mut count);
+            count.close_and_drain(Duration::from_secs(1)).unwrap();
+            let mut runner = stub_runner(
+                &cfg,
+                &info,
+                DiscoveryStub {
+                    finish_err: true,
+                    poll_err: false,
+                    dispatch_attached: false,
+                },
+                count,
+                &clock,
+                &mut proc,
+                &cancelled,
+            );
+            align_window(&mut runner);
+            let cap = runner
+                .close_and_finalize()
+                .expect("double close error must salvage once, not Err");
+            assert!(
+                matches!(
+                    &cap.document.status,
+                    Completeness::Fatal {
+                        kind: evidence::FatalKind::Runtime(_),
+                        ..
+                    }
+                ),
+                "want Fatal(Runtime), got {:?}",
+                cap.document.status
+            );
+            assert!(cap.document.sites.is_empty());
+            assert_eq!(counter(&cap.document, "count.close_failed"), 1);
+            assert_eq!(counter(&cap.document, "discovery.finish_failed"), 1);
+            assert!(cap.reasons.iter().any(|r| r == "close-failure"));
+            assert!(cap.document.has_usable_evidence());
+            let verdict = crate::policy::evaluate_document(
+                std::slice::from_ref(&crate::policy::PolicyRule::deny_weak()),
+                &cap.document,
+            );
+            assert_eq!(
+                verdict.overall(),
+                crate::policy::PolicyOutcome::Inconclusive
+            );
+            assert!(!verdict.rules.is_empty());
+            let mut document = cap.document.clone();
+            document.policy = Some(crate::check::policy_record(&verdict));
+            let bytes = crate::report::render_json(&document).unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            crate::schema::validate_v2(&v).unwrap();
+            crate::schema::check_v2_semantics(&v).expect("lost-drain Runtime must validate");
+            assert_eq!(v["policy"]["verdict"], "inconclusive");
+            let cbom: serde_json::Value =
+                serde_json::from_slice(&crate::report::render_cbom(&document).unwrap()).unwrap();
+            assert_eq!(cbom["components"].as_array().unwrap().len(), 0);
+            let meta = cbom_props(&cbom["metadata"]["properties"]);
+            assert_eq!(meta["osslscope:omitted-ambiguous-sites"], "0");
+            assert_eq!(meta["osslscope:omitted-unknown-coverage-sites"], "0");
+            let disclaimer = &meta["osslscope:completeness-disclaimer"];
+            assert!(disclaimer.contains("FATAL"), "{disclaimer}");
+            assert!(disclaimer.contains("salvaged"), "{disclaimer}");
+            assert!(!disclaimer.contains("no usable evidence"), "{disclaimer}");
+            assert_eq!(
+                crate::report::exit_for(
+                    verdict.overall(),
+                    cap.child_exit,
+                    &document,
+                    &ok_delivery()
+                ),
+                1
+            );
         }
     }
 }
