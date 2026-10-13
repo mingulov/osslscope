@@ -317,13 +317,16 @@ pub const HARVEST_PROGS: [ProgSpec; 15] = [
     },
 ];
 
-/// Frozen member shape (P7 item 2): dims asserted vs
-/// `osslscope-members` by `prepare`, fail-closed on drift. The 7
-/// maps mirror harvest dims; TERMD/LGCALLS/QUERY_NEXT are
+/// Frozen member shape (P7 item 3): dims asserted vs
+/// `osslscope-members` by `prepare`, fail-closed on drift. The
+/// first 7 mirror harvest dims; TERMD/LGCALLS/QUERY_NEXT are
 /// deliberately absent (v1 never proves, single-site CALLS only,
-/// no cursor — every scan is full). SCAN/SEQ/T_CACHE arrive with
-/// item 3; the PENDING_QUERY scaffold retires in item 9.
-pub const MEMBER_MAPS: [MapSpec; 7] = [
+/// no cursor — every scan is full). The scan plane
+/// (SCAN/SEQ/BIRTH/RCOUNT/T_CACHE/CTRL/ATTEMPT) arrives with item
+/// 3; members.o drops its PENDING_QUERY scaffold in subtask C when
+/// members switch to SCAN (the harvest path's cursor maps retire
+/// in item 9).
+pub const MEMBER_MAPS: [MapSpec; 14] = [
     MapSpec {
         name: "EVENTS",
         map_type: 27,
@@ -378,6 +381,62 @@ pub const MEMBER_MAPS: [MapSpec; 7] = [
         key_size: 8,
         value_size: 42,
         max_entries: 1024,
+        flags: 0,
+    },
+    MapSpec {
+        name: "SCAN",
+        map_type: 9,
+        key_size: 4,
+        value_size: 40,
+        max_entries: 1024,
+        flags: 0,
+    },
+    MapSpec {
+        name: "SEQ",
+        map_type: 1,
+        key_size: 4,
+        value_size: 8,
+        max_entries: 4096,
+        flags: 0,
+    },
+    MapSpec {
+        name: "BIRTH",
+        map_type: 1,
+        key_size: 4,
+        value_size: 2,
+        max_entries: 4096,
+        flags: 0,
+    },
+    MapSpec {
+        name: "RCOUNT",
+        map_type: 1,
+        key_size: 4,
+        value_size: 8,
+        max_entries: 4096,
+        flags: 0,
+    },
+    MapSpec {
+        name: "T_CACHE",
+        map_type: 1,
+        key_size: 8,
+        value_size: 16,
+        max_entries: 1024,
+        flags: 0,
+    },
+    MapSpec {
+        name: "CTRL",
+        map_type: 2,
+        key_size: 4,
+        value_size: 24,
+        max_entries: 1,
+        flags: 0,
+    },
+    MapSpec {
+        name: "ATTEMPT",
+        map_type: 6,
+        key_size: 4,
+        value_size: 8,
+        max_entries: 1,
         flags: 0,
     },
 ];
