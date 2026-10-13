@@ -744,7 +744,7 @@ fn site_calls_map(
 /// entrypoint must index the frozen ENGINE registry with a
 /// matching display name (the index is authoritative; the name is
 /// checked, never trusted).
-type EngineCallsMap = std::collections::BTreeMap<(String, u64, u64, u64, u64, u64), u64>;
+type EngineCallsMap = std::collections::BTreeMap<(String, u64, u64, u64, u64, u64), (u64, String)>;
 
 fn engine_calls_map(
     root: &serde_json::Map<String, serde_json::Value>,
@@ -804,7 +804,12 @@ fn engine_calls_map(
             entrypoint,
         );
         let calls = get_u64(record, "calls", &ctx)?;
-        if map.insert(key, calls).is_some() {
+        let window = record
+            .get("window")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("{ctx}.window: expected string"))?
+            .to_string();
+        if map.insert(key, (calls, window)).is_some() {
             return Err(format!("{ctx}: duplicated observation key"));
         }
     }
@@ -1009,9 +1014,18 @@ fn check_object_refs(root: &serde_json::Map<String, serde_json::Value>) -> Resul
                         get_u64(record, "generation", &ctx)?,
                         get_u64(record, "entrypoint", &ctx)?,
                     );
-                    let have = engines
+                    let (have, window) = engines
                         .get(&key)
                         .ok_or_else(|| format!("{ctx}: resolves to no listed observation"))?;
+                    // Definite refs resolve to InWindow observations
+                    // only: pre-window proves nothing about the
+                    // window and untimed is never definite (policy
+                    // excludes both from definite bounds).
+                    if window != "in-window" {
+                        return Err(format!(
+                            "{ctx}: definite ref resolves to {window} observation, not in-window"
+                        ));
+                    }
                     let calls = get_u64(record, "calls", &ctx)?;
                     let total = eclaimed
                         .get(&key)
