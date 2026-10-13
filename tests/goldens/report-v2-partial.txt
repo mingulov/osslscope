@@ -1,4 +1,7 @@
 osslscope report (observed-crypto-v2.1): pid=9 (staging) window=0..100ns effective=5..95ns
+duration: requested=100ns effective=90ns (monotonic; authoritative)
+kernel: 6.9.0-test
+wall: start=1700000000000000000 end=1700000030000000000 (unix-ns; context only)
 openssl: unknown (no verified version)
 target: argv_redacted=true container_id=cid-1 image_digest=sha256:abc
 disposition: detached-running pid=9

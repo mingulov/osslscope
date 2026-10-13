@@ -240,6 +240,25 @@
       "description": "Typed ENGINE tripwire observations (R05, optional): the replayable engine plane. Omitted when none were observed. Never joins site call totals or the legacy partition.",
       "type": "array",
       "items": { "$ref": "#/$defs/engine_observation" }
+    },
+    "context": {
+      "description": "Execution context (R12, optional): host kernel release plus the wall-clock window edges in unix nanoseconds. Omitted when unrecorded. Context only: the monotonic window fields stay authoritative for durations and deadlines; wall edges may be null (explicit unknown) and may run backward across a clock adjustment without affecting verdicts.",
+      "type": "object",
+      "required": ["kernel_release", "wall_start_unix_ns", "wall_end_unix_ns"],
+      "additionalProperties": false,
+      "properties": {
+        "kernel_release": { "type": "string" },
+        "wall_start_unix_ns": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "wall_end_unix_ns": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        }
+      }
     }
   },
   "$defs": {
