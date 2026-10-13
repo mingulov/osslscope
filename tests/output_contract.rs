@@ -2678,35 +2678,64 @@ fn evil_comm_invisible() -> Vec<String> {
 }
 
 /// Independent oracle: characters that must never reach human output
-/// active. Derived from Unicode properties (UCD) — NOT copied from
-/// the renderer's match arms: `char::is_control` is the std
-/// General_Category=Cc property, and each row below cites its UCD
-/// property (Bidi_Control, invisible Cf, Zl/Zp). Deliberately
-/// structured as (lo, hi, property) rows rather than match arms so
-/// the two lists cannot drift by copy.
-const FORBIDDEN_DISPLAY_ROWS: &[(char, char, &str)] = &[
-    ('\u{00AD}', '\u{00AD}', "SOFT HYPHEN (Cf)"),
-    (
-        '\u{061C}',
-        '\u{061C}',
-        "ARABIC LETTER MARK (Cf, Bidi_Control)",
-    ),
-    (
-        '\u{200B}',
-        '\u{200F}',
-        "ZERO WIDTH SPACE..RIGHT-TO-LEFT MARK (Cf; 200E/200F Bidi_Control)",
-    ),
-    ('\u{2028}', '\u{2029}', "LINE/PARAGRAPH SEPARATOR (Zl/Zp)"),
-    (
-        '\u{202A}',
-        '\u{202E}',
-        "bidi embeddings/overrides (Cf, Bidi_Control)",
-    ),
-    ('\u{2060}', '\u{2064}', "WORD JOINER..INVISIBLE PLUS (Cf)"),
-    ('\u{2066}', '\u{2069}', "bidi isolates (Cf, Bidi_Control)"),
-    ('\u{FEFF}', '\u{FEFF}', "ZERO WIDTH NO-BREAK SPACE (Cf)"),
-    ('\u{FFF9}', '\u{FFFB}', "interlinear annotation (Cf)"),
+/// active. The expected set is derived INDEPENDENTLY of the
+/// renderer's `is_display_control` match arms: it is the COMPLETE
+/// General_Category=Cf set plus Zl/Zp from the Unicode Character
+/// Database (UCD 16.0.0, classified by CPython's `unicodedata`
+/// property tables — a different codebase's classification, not a
+/// copy of the renderer list), frozen as codepoint ranges below. Cc
+/// controls are covered by `char::is_control` (the std Cc property).
+/// Because the oracle embeds the whole category — 172 codepoints,
+/// including 145 the renderer does NOT neutralize (e.g. deprecated
+/// U+206A-U+206F, U+180E, TAGs) — a renderer omission cannot hide by
+/// shared selection: any Cf/Zl/Zp char in test inputs fails here
+/// unless neutralized.
+///
+/// Regenerate (must reproduce these ranges exactly; exact command in
+/// the R12 report): classify every scalar value with
+/// `unicodedata.category`, keep Cf/Zl/Zp, compress to ranges.
+///
+/// Scope note: the renderer covers 27 of these 172 (see
+/// `is_display_control`); the remainder pass through today. No
+/// fixture scanned below contains them, so the suite is green;
+/// feeding any uncovered Cf through the renderer now FAILS the
+/// oracle (proven by probe — see report).
+const UCD_FORMAT_CONTROL_RANGES: &[(u32, u32)] = &[
+    (0x00AD, 0x00AD),   // SOFT HYPHEN (Cf)
+    (0x0600, 0x0605),   // ARABIC NUMBER SIGN..ARABIC NUMBER MARK ABOVE (Cf)
+    (0x061C, 0x061C),   // ARABIC LETTER MARK (Cf)
+    (0x06DD, 0x06DD),   // ARABIC END OF AYAH (Cf)
+    (0x070F, 0x070F),   // SYRIAC ABBREVIATION MARK (Cf)
+    (0x0890, 0x0891),   // ARABIC POUND MARK ABOVE..ARABIC PIASTRE MARK ABOVE (Cf)
+    (0x08E2, 0x08E2),   // ARABIC DISPUTED END OF AYAH (Cf)
+    (0x180E, 0x180E),   // MONGOLIAN VOWEL SEPARATOR (Cf)
+    (0x200B, 0x200F),   // ZERO WIDTH SPACE..RIGHT-TO-LEFT MARK (Cf)
+    (0x2028, 0x202E),   // LINE SEPARATOR..RIGHT-TO-LEFT OVERRIDE (Zl+Zp+Cf, contiguous)
+    (0x2060, 0x2064),   // WORD JOINER..INVISIBLE PLUS (Cf)
+    (0x2066, 0x206F),   // bidi isolates + deprecated U+206A..U+206F (Cf; U+2065 is Cn)
+    (0xFEFF, 0xFEFF),   // ZERO WIDTH NO-BREAK SPACE (Cf)
+    (0xFFF9, 0xFFFB),   // interlinear annotation (Cf)
+    (0x110BD, 0x110BD), // KAITHI NUMBER SIGN (Cf)
+    (0x110CD, 0x110CD), // KAITHI NUMBER SIGN ABOVE (Cf)
+    (0x13430, 0x1343F), // EGYPTIAN HIEROGLYPH joiners/enclosure (Cf)
+    (0x1BCA0, 0x1BCA3), // SHORTHAND FORMAT LETTER OVERLAP..UP STEP (Cf)
+    (0x1D173, 0x1D17A), // MUSICAL SYMBOL BEGIN BEAM..END PHRASE (Cf)
+    (0xE0001, 0xE0001), // LANGUAGE TAG (Cf; U+E0000 is Cn)
+    (0xE0020, 0xE007F), // TAG SPACE..CANCEL TAG (Cf)
 ];
+
+/// Frozen UCD 16.0.0 Cf+Zl+Zp population (pins the table above
+/// against row erosion; see the self-pin test).
+const UCD_FORMAT_CONTROL_COUNT: usize = 172;
+
+/// True when `c` is Cf/Zl/Zp per the independent UCD table (Cc is
+/// handled by `char::is_control` at the call site).
+fn ucd_is_format_control(c: char) -> bool {
+    let cp = c as u32;
+    UCD_FORMAT_CONTROL_RANGES
+        .iter()
+        .any(|(lo, hi)| (*lo..=*hi).contains(&cp))
+}
 
 /// No active display controls outside the renderer's own `\n` line
 /// separators: no C0/C1/DEL, no bidi controls, no invisible/zero-
@@ -2717,12 +2746,11 @@ fn assert_no_active_display_controls(text: &str) {
             continue;
         }
         assert!(!c.is_control(), "active control {c:?} in human output");
-        for (lo, hi, property) in FORBIDDEN_DISPLAY_ROWS {
-            assert!(
-                !(*lo..=*hi).contains(&c),
-                "active display control {c:?} ({property}) in human output"
-            );
-        }
+        assert!(
+            !ucd_is_format_control(c),
+            "active UCD format/line control {c:?} (U+{:04X}) in human output",
+            c as u32
+        );
     }
 }
 
@@ -2749,29 +2777,74 @@ fn r12_context_renders_in_json_with_exact_values() {
 
 #[test]
 fn r12_oracle_covers_invisible_format_controls() {
-    // The oracle guards itself: every omitted-format control
-    // (U+2060–U+2064 by codepoint) plus one representative of each
-    // other forbidden class must appear in its rows, so a future
-    // erosion of either list fails here rather than passing blind.
-    // Ordinary printable Unicode must NOT appear.
-    let covered = |c: char| {
-        FORBIDDEN_DISPLAY_ROWS
-            .iter()
-            .any(|(lo, hi, _)| (*lo..=*hi).contains(&c))
-    };
+    // The oracle guards itself: it must forbid the omitted-format
+    // range (U+2060-U+2064) plus one representative of every other
+    // forbidden class — and it must NOT be a copy of the renderer
+    // list, so it additionally forbids Cf controls the renderer
+    // passes through (U+206A-U+206F, U+180E, ...), proves
+    // category-precision on unassigned neighbors (U+2065, U+E0000
+    // are Cn, not forbidden), and pins the frozen UCD 16.0
+    // population (172) against row erosion. Ordinary printable
+    // Unicode must NOT appear.
+    let population: usize = UCD_FORMAT_CONTROL_RANGES
+        .iter()
+        .map(|(lo, hi)| (hi - lo + 1) as usize)
+        .sum();
+    assert_eq!(
+        population, UCD_FORMAT_CONTROL_COUNT,
+        "UCD table population must match the frozen UCD 16.0 Cf+Zl+Zp count"
+    );
+    // Table integrity: sorted, disjoint ranges (guards the
+    // transcription from the generator output).
+    for pair in UCD_FORMAT_CONTROL_RANGES.windows(2) {
+        assert!(
+            pair[0].1 < pair[1].0,
+            "UCD ranges must be sorted and disjoint: {pair:?}"
+        );
+    }
+    let forbidden = |c: char| c.is_control() || ucd_is_format_control(c);
     for cp in 0x2060..=0x2064 {
         let c = char::from_u32(cp).unwrap();
         assert!(!c.is_control(), "U+{cp:04X} must be outside is_control");
-        assert!(covered(c), "oracle must forbid U+{cp:04X}");
+        assert!(forbidden(c), "oracle must forbid U+{cp:04X}");
     }
-    assert!('\t'.is_control(), "tab is Cc");
-    for c in ['\u{202E}', '\u{200B}', '\u{FEFF}', '\u{2028}', '\u{00AD}'] {
-        assert!(covered(c), "oracle must forbid {c:?}");
+    // One representative of every other forbidden class.
+    for cp in [
+        0x00ADu32, 0x061C, 0x200B, 0x200E, 0x2028, 0x2029, 0x202A, 0x202E, 0x2066, 0xFEFF, 0xFFF9,
+    ] {
+        let c = char::from_u32(cp).unwrap();
+        assert!(forbidden(c), "oracle must forbid U+{cp:04X}");
     }
-    for c in ['é', '日', '🎉', 'Ω', 'م', 'ß', ' ', '\u{00A0}'] {
+    // Non-copy proof: the oracle forbids Cf controls the renderer
+    // does NOT neutralize (none of these appear in
+    // `is_display_control`), so the oracle cannot be a copy of the
+    // renderer list.
+    for cp in [
+        0x206Au32, 0x206B, 0x206C, 0x206D, 0x206E, 0x206F, 0x180E, 0x0600, 0xE0020,
+    ] {
+        let c = char::from_u32(cp).unwrap();
+        assert!(!c.is_control(), "U+{cp:04X} must be outside is_control");
+        assert!(
+            ucd_is_format_control(c),
+            "oracle must forbid U+{cp:04X} although the renderer passes it"
+        );
+    }
+    // Category precision: unassigned neighbors are Cn, not Cf —
+    // the table came from category data, not from padded ranges.
+    for cp in [0x2065u32, 0xE0000] {
+        let c = char::from_u32(cp).unwrap();
+        assert!(!c.is_control(), "U+{cp:04X} must be outside is_control");
+        assert!(
+            !ucd_is_format_control(c),
+            "U+{cp:04X} is Cn and must not be forbidden"
+        );
+    }
+    for c in ['é', '日', '🎉', 'Ω', 'م', 'ß', ' '] {
         assert!(!c.is_control(), "printable {c:?} must not be control");
-        assert!(!covered(c), "printable {c:?} must not be forbidden");
+        assert!(!forbidden(c), "printable {c:?} must not be forbidden");
     }
+    let nbsp = char::from_u32(0x00A0).unwrap();
+    assert!(!forbidden(nbsp), "NBSP (Zs) must not be forbidden");
 }
 
 #[test]
@@ -2983,50 +3056,244 @@ fn r12_no_window_fatal_carries_explicit_unknown() {
     );
 }
 
-/// Pre-R12 field-reader shape: the supported-evidence subset an old
-/// (pre-context) reader parses. No `context` field; serde ignores
-/// unknown keys by default — exactly like a real old field reader.
-#[derive(serde::Deserialize)]
+/// Pre-R12 wire-reader shape: the supported-evidence subset an old
+/// (pre-context) reader parses from the PUBLISHED artifact layout
+/// (`render_json` bytes) — `completeness.status` string, wire
+/// `target`/`window`/`sites`/`objects`/`coverage` objects, and R05
+/// ENGINE observations. No `context` field; serde ignores that
+/// unknown key by default — exactly like a real old field reader.
+/// Inner objects deny unknown fields, so the shape provably matches
+/// the published layout instead of loosely parsing it.
+#[derive(serde::Deserialize, Debug)]
 #[allow(dead_code)]
-struct PreR12Document {
-    status: Completeness,
-    window: CaptureWindow,
-    target: TargetRecord,
-    sites: Vec<SiteExecution>,
-    objects: Vec<ObjectRecord>,
-    coverage: Vec<ScopeCoverage>,
-    counters: Vec<GapCounter>,
-    engine_observations: Vec<EngineObservation>,
+struct PreR12WireDocument {
+    schema_version: String,
+    target: PreR12WireTarget,
+    window: PreR12WireWindow,
+    completeness: PreR12WireCompleteness,
+    sites: Vec<PreR12WireSite>,
+    objects: Vec<PreR12WireObject>,
+    coverage: Vec<PreR12WireCoverage>,
+    engine_observations: Vec<PreR12WireEngineObs>,
+}
+
+#[derive(serde::Deserialize, Debug)]
+#[allow(dead_code)]
+#[serde(deny_unknown_fields)]
+struct PreR12WireTarget {
+    pid: u32,
+    comm: String,
+    container_id: String,
+    image_digest: String,
+    argv_redacted: bool,
+}
+
+#[derive(serde::Deserialize, Debug)]
+#[allow(dead_code)]
+#[serde(deny_unknown_fields)]
+struct PreR12WireWindow {
+    requested_start_ns: u64,
+    requested_end_ns: u64,
+    effective_start_ns: u64,
+    effective_end_ns: u64,
+    signal_cut: bool,
+}
+
+#[derive(serde::Deserialize, Debug)]
+#[allow(dead_code)]
+#[serde(deny_unknown_fields)]
+struct PreR12WireCounter {
+    name: String,
+    kind: String,
+    units: String,
+    source: String,
+    value: u64,
+}
+
+#[derive(serde::Deserialize, Debug)]
+#[allow(dead_code)]
+#[serde(deny_unknown_fields)]
+struct PreR12WireCompleteness {
+    status: String,
+    fatal_kind: Value,
+    reasons: Vec<Value>,
+    counters: Vec<PreR12WireCounter>,
+}
+
+#[derive(serde::Deserialize, Debug)]
+#[allow(dead_code)]
+#[serde(deny_unknown_fields)]
+struct PreR12WireCandidate {
+    provider: String,
+    provider_class: String,
+    op: u32,
+    funcid: u32,
+    algorithm_classes: Vec<String>,
+    weak_alias: bool,
+}
+
+#[derive(serde::Deserialize, Debug)]
+#[allow(dead_code)]
+#[serde(deny_unknown_fields)]
+struct PreR12WireSite {
+    object: String,
+    device: u64,
+    inode: u64,
+    offset: u64,
+    generation: u32,
+    candidates: Vec<PreR12WireCandidate>,
+    candidates_coverage: String,
+    calls: u64,
+    first_ns: u64,
+    last_ns: u64,
+}
+
+#[derive(serde::Deserialize, Debug)]
+#[allow(dead_code)]
+#[serde(deny_unknown_fields)]
+struct PreR12WireObject {
+    id: String,
+    device: u64,
+    inode: u64,
+    display_locator: String,
+}
+
+#[derive(serde::Deserialize, Debug)]
+#[allow(dead_code)]
+#[serde(deny_unknown_fields)]
+struct PreR12WireExpected {
+    state: String,
+    sites: Option<u64>,
+}
+
+#[derive(serde::Deserialize, Debug)]
+#[allow(dead_code)]
+#[serde(deny_unknown_fields)]
+struct PreR12WireCoverage {
+    scope: String,
+    expected: PreR12WireExpected,
+    discovered: u64,
+    attached: u64,
+}
+
+#[derive(serde::Deserialize, Debug)]
+#[allow(dead_code)]
+#[serde(deny_unknown_fields)]
+struct PreR12WireEngineObs {
+    object: String,
+    device: u64,
+    inode: u64,
+    offset: u64,
+    generation: u64,
+    entrypoint: u16,
+    entrypoint_name: String,
+    window: String,
+    calls: u64,
 }
 
 #[test]
 fn r12_old_reader_ignores_context() {
-    // Correct direction: an UNCHANGED context-bearing document —
-    // with R05 ENGINE observations — feeds a pre-R12 field-reader
-    // shape (no `context` field). The old reader parses it and its
-    // supported evidence survives intact; the unknown key is ignored.
+    // Correct direction: the UNCHANGED context-bearing RENDERED
+    // artifact (`render_json` bytes — with R05 ENGINE observations)
+    // feeds a pre-R12 wire-reader shape (no `context` field). The
+    // old reader parses the published layout and its supported
+    // evidence survives intact; the unknown key is ignored.
     let doc = engine_doc_fixture();
-    let v = serde_json::to_value(&doc).expect("document serializes");
+    assert!(doc.context.is_some(), "fixture must carry context");
+    let bytes = render_json(&doc).expect("rendered artifact serializes");
+    let rendered: Value = serde_json::from_slice(&bytes).expect("rendered artifact parses");
+    validate_v2(&rendered).expect("rendered artifact fails schema");
+    check_v2_semantics(&rendered).expect("rendered artifact fails semantics");
     assert!(
-        v.get("context").is_some(),
-        "fixture must carry context into the old reader"
+        rendered.get("context").is_some(),
+        "artifact must carry context into the old reader"
     );
     assert_eq!(
-        v["engine_observations"].as_array().unwrap().len(),
+        rendered["engine_observations"].as_array().unwrap().len(),
         5,
-        "fixture must carry ENGINE observations into the old reader"
+        "artifact must carry ENGINE observations into the old reader"
     );
-    let back: PreR12Document = serde_json::from_value(v).expect("old reader parses new bytes");
-    assert_eq!(back.status, doc.status);
-    assert_eq!(back.window, doc.window);
-    assert_eq!(back.target, doc.target);
-    assert_eq!(back.sites, doc.sites);
-    assert_eq!(back.objects, doc.objects);
-    assert_eq!(back.coverage, doc.coverage);
-    assert_eq!(back.counters, doc.counters);
-    assert_eq!(back.engine_observations, doc.engine_observations);
+    let back: PreR12WireDocument =
+        serde_json::from_value(rendered).expect("old reader parses new bytes");
+    assert_eq!(back.schema_version, "observed-crypto-v2.1");
+    assert_eq!(back.completeness.status, "COMPLETE");
+    assert_eq!(
+        back.window.requested_start_ns,
+        doc.window.requested_start_ns
+    );
+    assert_eq!(back.window.requested_end_ns, doc.window.requested_end_ns);
+    assert_eq!(
+        back.window.effective_start_ns,
+        doc.window.effective_start_ns
+    );
+    assert_eq!(back.window.effective_end_ns, doc.window.effective_end_ns);
+    assert_eq!(back.window.signal_cut, doc.window.signal_cut);
+    assert_eq!(back.target.pid, doc.target.pid);
+    assert_eq!(back.target.comm, doc.target.comm);
+    assert_eq!(back.target.container_id, doc.target.container_id);
+    assert_eq!(back.target.image_digest, doc.target.image_digest);
+    assert!(back.target.argv_redacted, "wire target redacts argv");
+    assert_eq!(back.sites.len(), doc.sites.len());
+    let site = &back.sites[0];
+    let model = &doc.sites[0];
+    assert_eq!(site.object, model.site.object.0);
+    assert_eq!(site.device, model.site.device);
+    assert_eq!(site.inode, model.site.inode);
+    assert_eq!(site.offset, model.site.offset);
+    assert_eq!(site.generation, model.generation);
+    assert_eq!(site.candidates_coverage, "complete");
+    assert_eq!(site.calls, model.calls);
+    assert_eq!(site.first_ns, model.first_ns);
+    assert_eq!(site.last_ns, model.last_ns);
+    assert_eq!(site.candidates.len(), model.candidates.len());
+    assert_eq!(site.candidates[0].provider, FP_A);
+    assert_eq!(site.candidates[0].provider_class, "default");
+    assert_eq!(site.candidates[0].op, 2);
+    assert_eq!(site.candidates[0].funcid, 21);
+    assert_eq!(site.candidates[0].algorithm_classes, ["AES-128-GCM"]);
+    assert!(!site.candidates[0].weak_alias);
+    assert_eq!(back.objects.len(), doc.objects.len());
+    for (wire, model) in back.objects.iter().zip(doc.objects.iter()) {
+        assert_eq!(wire.id, model.id.0);
+        assert_eq!(wire.device, model.device);
+        assert_eq!(wire.inode, model.inode);
+        assert_eq!(wire.display_locator, model.display_locator);
+    }
+    assert_eq!(back.coverage.len(), doc.coverage.len());
+    assert_eq!(back.completeness.counters.len(), doc.counters.len());
+    assert_eq!(back.engine_observations.len(), 5);
+    let names: Vec<&str> = back
+        .engine_observations
+        .iter()
+        .map(|o| o.entrypoint_name.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            "ENGINE_by_id",
+            "ENGINE_init",
+            "ENGINE_finish",
+            "ENGINE_free",
+            "ENGINE_ctrl"
+        ]
+    );
+    for (wire, model) in back
+        .engine_observations
+        .iter()
+        .zip(doc.engine_observations.iter())
+    {
+        assert_eq!(wire.object, model.key.object.0);
+        assert_eq!(wire.device, model.key.device);
+        assert_eq!(wire.inode, model.key.inode);
+        assert_eq!(wire.offset, model.key.offset);
+        assert_eq!(wire.generation, model.generation);
+        assert_eq!(wire.entrypoint, model.entrypoint);
+        assert_eq!(wire.window, "in-window");
+        assert_eq!(wire.calls, model.calls);
+    }
     let calls: u64 = back.sites.iter().map(|s| s.calls).sum();
     assert_eq!(calls, 500, "calls conserved through the old reader");
+    assert_eq!(calls, doc.total_calls());
 }
 
 #[test]
