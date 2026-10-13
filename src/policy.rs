@@ -9,8 +9,8 @@
 //! definite/possible bounds; there is no boolean-first-alias shortcut.
 
 use crate::evidence::{
-    CandidateCoverage, CandidateIdentity, CaptureDocument, Completeness, FatalKind, GapReason,
-    MatchBounds, PredicateMatch, RuleVerdict, SiteExecution, SiteKey, match_bounds,
+    CandidateCoverage, CandidateIdentity, CaptureDocument, Completeness, EngineWindow, FatalKind,
+    GapReason, MatchBounds, PredicateMatch, RuleVerdict, SiteExecution, SiteKey, match_bounds,
 };
 
 /// Classification bucket for unknown, aliased, overlong or unreadable
@@ -433,6 +433,19 @@ pub struct DefiniteHit {
     pub candidates: Vec<CandidateIdentity>,
 }
 
+/// One definitely matching ENGINE observation (R05 provenance):
+/// the pinned tripwire key, its binding generation, the registry
+/// entrypoint, and conserved call evidence. Only in-window
+/// observations with nonzero calls appear here — pre-window and
+/// untimed observations are never listed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EngineHit {
+    pub key: SiteKey,
+    pub generation: u64,
+    pub entrypoint: u16,
+    pub calls: u64,
+}
+
 /// One evaluated rule: conserved bounds, relevance, verdict, and — for
 /// deny rules with definite matches — the hit sites behind the
 /// violation. Require violations carry no hits (nothing matched).
@@ -447,6 +460,7 @@ pub struct EvaluatedRule {
     pub relevant_complete: bool,
     pub verdict: RuleVerdict,
     pub hits: Vec<DefiniteHit>,
+    pub engine_hits: Vec<EngineHit>,
     pub legacy_engine_calls: u64,
 }
 
@@ -496,9 +510,39 @@ fn site_is_definite(predicate: &Predicate, site: &SiteExecution) -> bool {
         .all(|c| predicate.eval(c) == PredicateMatch::Yes)
 }
 
+/// Conserved ENGINE-plane bounds over a document's typed tripwire
+/// observations (R05): definite in-window calls sum; the upper
+/// bound is unknown whenever any executed untimed observation
+/// exists (window-unplaceable evidence poisons absence proofs —
+/// fail closed). Pre-window observations are retained replay
+/// context, never bounds. Zero-call observations on any window are
+/// evidence of nothing.
+pub fn engine_match_bounds(doc: &CaptureDocument) -> MatchBounds {
+    let mut definite = 0u64;
+    let mut untimed = false;
+    for o in &doc.engine_observations {
+        match o.window {
+            EngineWindow::InWindow => {
+                definite = definite.saturating_add(o.calls);
+            }
+            EngineWindow::PreWindow => {}
+            EngineWindow::Untimed => {
+                if o.calls > 0 {
+                    untimed = true;
+                }
+            }
+        }
+    }
+    MatchBounds {
+        definite,
+        possible: if untimed { None } else { Some(definite) },
+    }
+}
+
 /// Evaluate every rule over a finalized document (current plus fenced
-/// sites, conserved — no site counted twice). Evidence-free fatal
-/// documents yield no verdict and no per-rule results: never a
+/// sites, conserved — no site counted twice; engine-area rules also
+/// evaluate the typed ENGINE observation plane, R05). Evidence-free
+/// fatal documents yield no verdict and no per-rule results: never a
 /// violation without evidence. Salvaged (runtime-fatal) documents
 /// carry real observed sites, so they evaluate like any doc — a
 /// proved violation still exits 10 (H7-T3).
@@ -530,6 +574,18 @@ pub fn evaluate_document(rules: &[PolicyRule], doc: &CaptureDocument) -> PolicyV
             let mut bounds = match_bounds(&all, &predicate.as_fn());
             let area = rule_area(&r.rule);
             let complete = relevant_complete(area, doc);
+            // R05: engine-area rules evaluate the typed ENGINE
+            // observation plane alongside provider-dispatch sites
+            // (both planes are definite-execution evidence; either
+            // unknown upper bound poisons the published bound).
+            if area == RuleArea::Engine {
+                let engine = engine_match_bounds(doc);
+                bounds.definite = bounds.definite.saturating_add(engine.definite);
+                bounds.possible = match (bounds.possible, engine.possible) {
+                    (Some(a), Some(b)) => Some(a.saturating_add(b)),
+                    _ => None,
+                };
+            }
             // F-E/B5: relevant coverage/loss shapes the published
             // bound, not just the verdict. Definite evidence is
             // preserved, but over a relevant blind spot the upper
@@ -576,6 +632,25 @@ pub fn evaluate_document(rules: &[PolicyRule], doc: &CaptureDocument) -> PolicyV
                 }
                 _ => Vec::new(),
             };
+            // R05: deny violations also list definite in-window
+            // ENGINE observations (document order — deterministic).
+            let engine_hits = match (&r.rule, verdict) {
+                (Rule::Deny(_), RuleVerdict::Violation)
+                    if rule_area(&r.rule) == RuleArea::Engine =>
+                {
+                    doc.engine_observations
+                        .iter()
+                        .filter(|o| o.calls > 0 && o.window == EngineWindow::InWindow)
+                        .map(|o| EngineHit {
+                            key: o.key.clone(),
+                            generation: o.generation,
+                            entrypoint: o.entrypoint,
+                            calls: o.calls,
+                        })
+                        .collect()
+                }
+                _ => Vec::new(),
+            };
             EvaluatedRule {
                 name: r.name,
                 matcher: r.matcher.clone(),
@@ -583,6 +658,7 @@ pub fn evaluate_document(rules: &[PolicyRule], doc: &CaptureDocument) -> PolicyV
                 relevant_complete: complete,
                 verdict,
                 hits,
+                engine_hits,
                 legacy_engine_calls: 0,
             }
         })
@@ -599,10 +675,11 @@ pub fn evaluate_document(rules: &[PolicyRule], doc: &CaptureDocument) -> PolicyV
 /// model as sites; when a deny-engine rule found no definite document
 /// hit but the tripwire counted `engine_calls`, upgrade that rule to a
 /// definite violation. Never downgrades, never double-counts (document
-/// hits win; the tripwire fires only when the document is silent), and
-/// never manufactures a pass. No-op for zero calls, no-verdict
-/// verdicts, and verdicts without a deny-engine rule. T08 retires this
-/// once ENGINE executions surface as document sites.
+/// site and engine-observation hits win; the tripwire fires only when
+/// the document is silent), and never manufactures a pass. No-op for
+/// zero calls, no-verdict verdicts, and verdicts without a deny-engine
+/// rule. R05 keeps this until every caller uses typed observations;
+/// T08 retires it once ENGINE executions surface as document sites.
 pub fn apply_legacy_engine_fallback(verdict: &mut PolicyVerdict, engine_calls: u64) {
     if engine_calls == 0 || verdict.no_verdict {
         return;

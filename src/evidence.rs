@@ -581,12 +581,82 @@ pub struct PolicyEvidenceRef {
     pub calls: u64,
 }
 
+/// Window provenance of one [`EngineObservation`]: whether the trip
+/// count is definite requested-window evidence (`InWindow`),
+/// retained pre-window context excluded from verdicts (`PreWindow`),
+/// or window-unbound (`Untimed`, never definite, poisons the upper
+/// bound — fail closed). The live path emits `InWindow` only:
+/// baselined at the window boundary, accumulated from in-window
+/// polls; straddling polls are already explicit loss, never
+/// observations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EngineWindow {
+    InWindow,
+    PreWindow,
+    Untimed,
+}
+
+/// One typed ENGINE tripwire observation (R05/F06): the pinned
+/// tripwire attach identity ([`SiteKey`] of the probe stub in the
+/// bound libcrypto), the tripwire binding `generation` (0 = first
+/// bind; +1 per install — provenance, never fabricated), the
+/// `entrypoint` index into the frozen [`crate::kinds::ENGINE`]
+/// registry, and the observed `calls` with their [`EngineWindow`].
+/// Trip counters are untimed by construction (hits carry no
+/// timestamps), so there are no first/last fields: the window
+/// binding is the certainty. Field order defines the total document
+/// order: `(key, generation, entrypoint)` first, count/window after.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct EngineObservation {
+    pub key: SiteKey,
+    pub generation: u64,
+    pub entrypoint: u16,
+    pub calls: u64,
+    pub window: EngineWindow,
+}
+
+/// Index of an `ENGINE_*` symbol in the frozen
+/// [`crate::kinds::ENGINE`] registry: the authoritative join key for
+/// [`EngineObservation::entrypoint`]. `None` for meth/low-level/load
+/// symbols, which live on other planes and never become ENGINE
+/// observations.
+pub fn engine_index(name: &str) -> Option<u16> {
+    u16::try_from(crate::kinds::ENGINE.iter().position(|e| e.name == name)?).ok()
+}
+
+/// Name of the indexed [`crate::kinds::ENGINE`] entrypoint, for
+/// display rendering (the index stays the authoritative key).
+pub fn engine_name(entrypoint: u16) -> Option<&'static str> {
+    crate::kinds::ENGINE
+        .get(entrypoint as usize)
+        .map(|e| e.name)
+}
+
+/// Engine-plane evidence backing one policy rule outcome (R05): the
+/// exact observation key plus generation, entrypoint and the
+/// definite calls attributed there. Every ref resolves to an
+/// observation listed in the same document; per-rule refs never
+/// claim more calls than the observation executed (checked like
+/// [`PolicyEvidenceRef`]).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct EngineEvidenceRef {
+    pub object: ObjectId,
+    pub device: u64,
+    pub inode: u64,
+    pub offset: u64,
+    pub generation: u64,
+    pub entrypoint: u16,
+    pub calls: u64,
+}
+
 /// One policy rule outcome over conserved bounds (R06): the rule and
 /// predicate, the three-valued result, definite/possible call
 /// bounds (`possible == None` means the upper bound is unknown),
-/// and site evidence for definite matches. Field order defines the
-/// total document order: `(rule, predicate)` first, full record
-/// after.
+/// site evidence for definite provider-plane matches, and
+/// engine-plane evidence for definite tripwire observations (R05).
+/// Field order defines the total document order: `(rule, predicate)`
+/// first, full record after.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct PolicyRuleResult {
     pub rule: String,
@@ -595,6 +665,8 @@ pub struct PolicyRuleResult {
     pub definite: u64,
     pub possible: Option<u64>,
     pub evidence: Vec<PolicyEvidenceRef>,
+    #[serde(default)]
+    pub engine_evidence: Vec<EngineEvidenceRef>,
 }
 
 /// Overall policy verdict (R06): rules are ANDed by the evaluator.
@@ -632,6 +704,7 @@ pub struct FinalizeInput {
     pub disposition: Option<DispositionRecord>,
     pub policy: Option<PolicyRecord>,
     pub legacy_partition: LegacyCallPartition,
+    pub engine_observations: Vec<EngineObservation>,
 }
 
 /// Legacy call partition (H8): per-site callback executions split
@@ -681,6 +754,12 @@ pub struct CaptureDocument {
     pub disposition: Option<DispositionRecord>,
     pub policy: Option<PolicyRecord>,
     pub legacy_partition: LegacyCallPartition,
+    /// Typed ENGINE tripwire observations (R05/F06): the replayable
+    /// engine plane. Additive and old-reader-safe: missing in old
+    /// documents means none observed. Never joins [`Self::total_calls`]
+    /// or the legacy partition (conserved provider-dispatch units).
+    #[serde(default)]
+    pub engine_observations: Vec<EngineObservation>,
 }
 
 impl CaptureDocument {
@@ -725,9 +804,11 @@ pub fn finalize(mut input: FinalizeInput) -> CaptureDocument {
     input.objects.sort();
     input.coverage.sort();
     input.counters.sort();
+    input.engine_observations.sort();
     if let Some(policy) = input.policy.as_mut() {
         for rule in &mut policy.rules {
             rule.evidence.sort();
+            rule.engine_evidence.sort();
         }
         policy.rules.sort();
     }
@@ -798,5 +879,6 @@ pub fn finalize(mut input: FinalizeInput) -> CaptureDocument {
         disposition: input.disposition,
         policy: input.policy,
         legacy_partition: input.legacy_partition,
+        engine_observations: input.engine_observations,
     }
 }

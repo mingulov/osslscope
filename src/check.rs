@@ -342,7 +342,7 @@ pub fn policy_json(doc: &CaptureDocument, v: &PolicyVerdict) -> serde_json::Valu
             continue;
         }
         debug_assert!(
-            !r.hits.is_empty() || r.legacy_engine_calls > 0,
+            !r.hits.is_empty() || !r.engine_hits.is_empty() || r.legacy_engine_calls > 0,
             "deny violations always carry definite hits or legacy tripwire evidence"
         );
         for h in &r.hits {
@@ -359,7 +359,28 @@ pub fn policy_json(doc: &CaptureDocument, v: &PolicyVerdict) -> serde_json::Valu
                 "candidates": h.candidates,
             }));
         }
-        if r.hits.is_empty() && r.legacy_engine_calls > 0 {
+        // R05: typed ENGINE observations are untimed (trip counters
+        // carry no timestamps) but window-bound, unlike the legacy
+        // side input below, which has neither timing nor document
+        // provenance.
+        for h in &r.engine_hits {
+            violations.push(serde_json::json!({
+                "rule": r.name,
+                "matcher": r.matcher,
+                "absent": false,
+                "plane": "engine",
+                "object": h.key.object.0,
+                "device": h.key.device,
+                "inode": h.key.inode,
+                "offset": h.key.offset,
+                "generation": h.generation,
+                "entrypoint": h.entrypoint,
+                "entrypoint_name": crate::evidence::engine_name(h.entrypoint),
+                "timed": false,
+                "calls": h.calls,
+            }));
+        }
+        if r.hits.is_empty() && r.engine_hits.is_empty() && r.legacy_engine_calls > 0 {
             violations.push(serde_json::json!({
                 "rule": r.name,
                 "matcher": r.matcher,
@@ -398,12 +419,16 @@ pub fn policy_json(doc: &CaptureDocument, v: &PolicyVerdict) -> serde_json::Valu
 /// [`OutputRequest`](crate::report::OutputRequest) carries no policy
 /// input — policy rides the document). Rules sort into document
 /// order; definite hits become evidence refs resolving to sites in the
-/// same document. Legacy ENGINE tripwire calls have no document site,
-/// so a legacy-only violation maps to bounds WITHOUT evidence refs
+/// same document, and definite ENGINE observations become
+/// engine-plane refs resolving to observations in the same document
+/// (R05). Legacy ENGINE tripwire calls have no document site, so a
+/// legacy-only violation maps to bounds WITHOUT evidence refs
 /// (T08 retires the tripwire once ENGINE executions surface as
 /// sites); exits and [`policy_json`] keep full fidelity either way.
 pub fn policy_record(v: &PolicyVerdict) -> PolicyRecord {
-    use crate::evidence::{PolicyEvidenceRef, PolicyRuleResult, PolicyVerdict as DocVerdict};
+    use crate::evidence::{
+        EngineEvidenceRef, PolicyEvidenceRef, PolicyRuleResult, PolicyVerdict as DocVerdict,
+    };
     let mut rules: Vec<PolicyRuleResult> = v
         .rules
         .iter()
@@ -424,6 +449,20 @@ pub fn policy_record(v: &PolicyVerdict) -> PolicyRecord {
                 })
                 .collect();
             evidence.sort();
+            let mut engine_evidence: Vec<EngineEvidenceRef> = r
+                .engine_hits
+                .iter()
+                .map(|h| EngineEvidenceRef {
+                    object: h.key.object.clone(),
+                    device: h.key.device,
+                    inode: h.key.inode,
+                    offset: h.key.offset,
+                    generation: h.generation,
+                    entrypoint: h.entrypoint,
+                    calls: h.calls,
+                })
+                .collect();
+            engine_evidence.sort();
             PolicyRuleResult {
                 rule: r.name.to_string(),
                 predicate: r.matcher.clone(),
@@ -431,6 +470,7 @@ pub fn policy_record(v: &PolicyVerdict) -> PolicyRecord {
                 definite: r.bounds.definite,
                 possible: r.bounds.possible,
                 evidence,
+                engine_evidence,
             }
         })
         .collect();
@@ -609,6 +649,7 @@ mod tests {
             disposition: None,
             policy: None,
             legacy_partition: LegacyCallPartition::default(),
+            engine_observations: Vec::new(),
         })
     }
 
@@ -817,6 +858,7 @@ mod tests {
             disposition: None,
             policy: None,
             legacy_partition: LegacyCallPartition::default(),
+            engine_observations: Vec::new(),
         });
         let inconclusive = evaluate_document(
             std::slice::from_ref(&PolicyRule::deny_algorithm("AES-256-GCM")),
@@ -885,6 +927,7 @@ mod tests {
             disposition: None,
             policy: None,
             legacy_partition: LegacyCallPartition::default(),
+            engine_observations: Vec::new(),
         });
         let v = evaluate_document(
             &[
@@ -1025,6 +1068,7 @@ mod tests {
             disposition: None,
             policy: None,
             legacy_partition: LegacyCallPartition::default(),
+            engine_observations: Vec::new(),
         });
         let v = evaluate_document(
             std::slice::from_ref(&PolicyRule::deny_algorithm("DES")),

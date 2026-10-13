@@ -301,6 +301,10 @@ pub struct DiscoveryDelta {
     /// Incarnations retired this poll, with their gaps.
     pub retirements: Vec<TableRetirement>,
     pub tripwire: TripwireDelta,
+    /// Tripwire binding generation live this poll (R05): 0 until
+    /// the first tripwire bind, +1 per install. Counter deltas in
+    /// [`TripwireDelta`] key per (generation, cookie) downstream.
+    pub trip_generation: u64,
     /// Losses incurred this poll (host + kernel increments).
     pub losses: Vec<DiscoveryLoss>,
     /// Query/load counter increment — arrivals, NOT execution.
@@ -881,6 +885,11 @@ pub struct SessionCore {
     trip_live: bool,
     /// Libcrypto (path, dev, ino) the live tripwire links pin.
     trip_bound: Option<(String, String, u64)>,
+    /// Tripwire binding generation (R05): 0 at the first bind, +1
+    /// per install. Counts key per (generation, cookie) downstream
+    /// so a replacement can never join two bindings' probes into
+    /// one observation row.
+    trip_generation: u64,
     /// Blind latch (F-D/A11): a changed-mapping replacement
     /// declined re-attach; planning resumes when the libcrypto
     /// fingerprint differs from the latch print (bounded reads).
@@ -989,6 +998,7 @@ impl SessionCore {
             staged_trips: None,
             trip_live: false,
             trip_bound: None,
+            trip_generation: 0,
             trip_blind: false,
             trip_blind_print: None,
             legacy_note: None,
@@ -1066,6 +1076,11 @@ impl SessionCore {
         }
         // Freshly installed at attach: live against the plan's own
         // libcrypto binding (validated from the first poll).
+        if self.probe_set.is_some() {
+            // Re-install over a live plan: a new binding
+            // generation (counts key per generation downstream).
+            self.trip_generation = self.trip_generation.saturating_add(1);
+        }
         self.trip_bound = set.libcrypto.clone();
         self.trip_live = true;
         self.probe_set = Some(set);
@@ -1906,7 +1921,12 @@ impl SessionCore {
                         }
                         // Freshly installed: live against the
                         // plan's own libcrypto binding (validated
-                        // from the next poll).
+                        // from the next poll). A re-install over a
+                        // live plan is a new binding generation
+                        // (counts key per generation downstream).
+                        if self.probe_set.is_some() {
+                            self.trip_generation = self.trip_generation.saturating_add(1);
+                        }
                         self.trip_bound = set.libcrypto.clone();
                         self.trip_live = true;
                         self.trip_blind = false;
@@ -2257,6 +2277,23 @@ impl SessionCore {
         delta.queries_delta = total.saturating_sub(self.emitted_queries);
         self.emitted_queries = total;
         delta.trigger_observed = self.trigger_observed;
+        // R05: the tripwire binding generation live this poll, plus
+        // the bound libcrypto as an observed code object (first
+        // sighting only — the D2 path fingerprints it into the
+        // adapter's object registry, which typed ENGINE
+        // observations join at assembly).
+        delta.trip_generation = self.trip_generation;
+        if let Some((path, dev, ino)) = self.trip_bound.clone()
+            && self.seen_objects.insert((dev.clone(), ino))
+        {
+            let obj = DiscoveredObject {
+                dev,
+                ino,
+                display_locator: path,
+            };
+            self.objects.push(obj.clone());
+            delta.objects.push(obj);
+        }
 
         self.last_links = env.link_counts();
         Ok(delta)
@@ -4624,6 +4661,29 @@ mod tests {
             true,
             4242,
         )
+    }
+
+    #[test]
+    fn tripwire_binding_generation_and_object_emission() {
+        // R05: first bind is generation 0, each install a new
+        // generation; polls carry the live generation and emit
+        // the bound libcrypto as an observed object exactly once.
+        let mut core = a11_core();
+        assert_eq!(core.trip_generation, 0);
+        core.adopt_legacy_plan(trip_set(100, &[0x100]), None);
+        assert_eq!(core.trip_generation, 0);
+        core.adopt_legacy_plan(trip_set(100, &[0x100]), None);
+        assert_eq!(core.trip_generation, 1);
+        let mut env = MiniEnv::new();
+        env.maps = vec![lc_mapping(100)];
+        let d1 = core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(d1.trip_generation, 1);
+        assert_eq!(d1.objects.len(), 1);
+        assert_eq!(d1.objects[0].display_locator, "/lib/libcrypto.so.3");
+        assert_eq!(d1.objects[0].ino, 100);
+        let d2 = core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(d2.trip_generation, 1);
+        assert!(d2.objects.is_empty(), "object emits once: {:?}", d2.objects);
     }
 
     fn a11_budget() -> PollBudget {
