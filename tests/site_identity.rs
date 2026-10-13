@@ -1139,3 +1139,154 @@ fn straggler_bucket_carries_installed_at() {
         .expect("stale_events counter present");
     assert_eq!(stale.value, 5, "row took the straggler path");
 }
+
+// ---------------------------------------------------------------------------
+// R14: bounded identity-bound reads (covers F17).
+// ---------------------------------------------------------------------------
+
+/// Scripted `ReadBoundedSource` (R14): serves `data` through a
+/// cursor while reporting scripted before/after identities, so
+/// mid-read growth and replacement are deterministic (no
+/// filesystem timing). No test allocates anywhere near the real
+/// 128 MiB policy ceiling.
+struct ScriptedSource {
+    data: std::io::Cursor<Vec<u8>>,
+    before: (u64, u64, u64),
+    after: (u64, u64, u64),
+    identity_calls: std::cell::Cell<usize>,
+}
+
+impl ScriptedSource {
+    fn stable(data: Vec<u8>, dev: u64, ino: u64) -> Self {
+        let len = data.len() as u64;
+        Self {
+            data: std::io::Cursor::new(data),
+            before: (dev, ino, len),
+            after: (dev, ino, len),
+            identity_calls: std::cell::Cell::new(0),
+        }
+    }
+}
+
+impl std::io::Read for ScriptedSource {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.data.read(buf)
+    }
+}
+
+impl plan::ReadBoundedSource for ScriptedSource {
+    fn bound_identity(&self) -> std::io::Result<(u64, u64, u64)> {
+        let n = self.identity_calls.get();
+        self.identity_calls.set(n + 1);
+        Ok(if n == 0 { self.before } else { self.after })
+    }
+}
+
+#[test]
+fn r14_bounded_read_accepts_exactly_at_cap() {
+    // Cap: a file of exactly the allowance reads fully with its
+    // read-time identity.
+    let stage = Stage::fresh("r14-cap");
+    let exact = stage.write("exact.so", &[0x7fu8; 64]);
+    let fb = plan::read_file_bounded(&exact.path, 64).unwrap();
+    assert_eq!(fb.bytes.len(), 64);
+    assert_eq!((fb.dev, fb.ino), (exact.device, exact.ino));
+    assert_eq!(
+        plan::MAX_OBJECT_BYTES,
+        128 * 1024 * 1024,
+        "per-object policy ceiling"
+    );
+}
+
+#[test]
+fn r14_bounded_read_refuses_cap_plus_one() {
+    // Cap+1 (GREEN evolution of the RED scaffold): the bounded
+    // reader refuses past the allowance instead of reading on.
+    let stage = Stage::fresh("r14-cap-plus-one");
+    let over = stage.write("over.so", &[0x7fu8; 65]);
+    let err = plan::read_file_bounded(&over.path, 64).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::FileTooLarge);
+}
+
+#[test]
+fn r14_bounded_read_refuses_huge_advertised_length() {
+    // A sparse file advertising terabytes refuses on fstat alone:
+    // no multi-gigabyte allocation, no read.
+    let stage = Stage::fresh("r14-huge");
+    let path = stage.dir.join("huge.so");
+    std::fs::write(&path, [0x7fu8; 8]).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(1u64 << 40)
+        .unwrap();
+    let err = plan::read_file_bounded(path.to_str().unwrap(), 1024).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::FileTooLarge);
+}
+
+#[test]
+fn r14_bounded_read_refuses_growth_mid_read() {
+    // A grower serving past the allowance trips the
+    // overflow-detection byte DURING the read (the fstat
+    // pre-check alone cannot catch it).
+    let growing = || ScriptedSource {
+        data: std::io::Cursor::new(vec![0x7fu8; 70]),
+        before: (7, 7, 64),
+        after: (7, 7, 70),
+        identity_calls: std::cell::Cell::new(0),
+    };
+    let err = plan::read_bounded_from(growing(), 64).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::FileTooLarge);
+    // Growth within the allowance still refuses: the after-length
+    // no longer matches, so the bytes may have torn.
+    let err = plan::read_bounded_from(growing(), 128).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+}
+
+#[test]
+fn r14_bounded_read_refuses_replacement_mid_read() {
+    // Same-path inode/device replacement between the two fstats
+    // refuses (InvalidData tear refusal, unchanged from pre-R14).
+    for (label, after) in [
+        ("inode", (7u64, 8u64, 64u64)),
+        ("device", (8u64, 7u64, 64u64)),
+    ] {
+        let src = ScriptedSource {
+            data: std::io::Cursor::new(vec![0x7fu8; 64]),
+            before: (7, 7, 64),
+            after,
+            identity_calls: std::cell::Cell::new(0),
+        };
+        let err = plan::read_bounded_from(src, 64).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{label}");
+    }
+    // A stable scripted source binds fine (control).
+    let fb = plan::read_bounded_from(ScriptedSource::stable(vec![0x7fu8; 64], 7, 7), 64).unwrap();
+    assert_eq!((fb.dev, fb.ino), (7, 7));
+    assert_eq!(fb.bytes.len(), 64);
+}
+
+#[test]
+fn r14_bounded_read_empty_file_with_zero_budget() {
+    // Allowance zero still binds empty files (a drained round
+    // budget skips only nonempty objects).
+    let stage = Stage::fresh("r14-empty");
+    let empty = stage.write("empty.so", &[]);
+    let fb = plan::read_file_bounded(&empty.path, 0).unwrap();
+    assert!(fb.bytes.is_empty());
+    let one = stage.write("one.so", &[0x7fu8]);
+    let err = plan::read_file_bounded(&one.path, 0).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::FileTooLarge);
+}
+
+#[test]
+fn r14_legacy_wrapper_caps_single_object() {
+    // The old-spelling wrapper still serves small files (now
+    // bounded per object at the policy ceiling).
+    let stage = Stage::fresh("r14-wrapper");
+    let small = stage.write("small.so", &[0x7fu8; 32]);
+    let fb = plan::read_file_bound(&small.path).unwrap();
+    assert_eq!(fb.bytes.len(), 32);
+    assert_eq!((fb.dev, fb.ino), (small.device, small.ino));
+}

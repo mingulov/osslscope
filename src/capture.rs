@@ -2150,11 +2150,26 @@ impl ClockPort for LiveClock {
 pub trait ProcPort {
     fn read_maps(&mut self, pid: u32) -> anyhow::Result<Vec<maps::Mapping>>;
     fn read_file(&mut self, path: &str) -> anyhow::Result<Vec<u8>>;
-    /// Identity-bound read (F-A/A3): bytes plus the read-time
-    /// (encoded dev, ino) they were read as. Implementations pin
-    /// the file across the read (open once, fstat/read/fstat) so
-    /// the bytes cannot tear across a replacement.
-    fn read_file_bound(&mut self, path: &str) -> anyhow::Result<(Vec<u8>, (u64, u64))>;
+    /// Identity-bound read (F-A/A3), budgeted (R14): bytes plus
+    /// the read-time (encoded dev, ino) they were read as. Reads
+    /// past `max_bytes` refuse with `ErrorKind::FileTooLarge`
+    /// BEFORE allocating (callers skip the path and count loud
+    /// loss). Implementations pin the file across the read (open
+    /// once, fstat/read/fstat) so the bytes cannot tear across a
+    /// replacement.
+    fn read_file_bound(
+        &mut self,
+        path: &str,
+        max_bytes: usize,
+    ) -> std::io::Result<(Vec<u8>, (u64, u64))>;
+    /// Per-poll byte budget for relevant-file reads (R14): the
+    /// total allowance one `read_relevant_files` pass may newly
+    /// read; production allows [`MAX_CACHED_BYTES`]. Tests inject
+    /// small budgets to prove cumulative overflow without huge
+    /// allocations.
+    fn read_budget(&self) -> usize {
+        MAX_CACHED_BYTES
+    }
     /// Identity stat (F-D/A13, freshness per R20): the CURRENT
     /// [`FileStat`] of `path` without reading bytes — same (dev,
     /// ino) encoding domain as
@@ -2199,8 +2214,12 @@ impl ProcPort for LiveProc {
         Ok(std::fs::read(path)?)
     }
 
-    fn read_file_bound(&mut self, path: &str) -> anyhow::Result<(Vec<u8>, (u64, u64))> {
-        Ok(plan::read_file_bound(path).map(|f| (f.bytes, (f.dev, f.ino)))?)
+    fn read_file_bound(
+        &mut self,
+        path: &str,
+        max_bytes: usize,
+    ) -> std::io::Result<(Vec<u8>, (u64, u64))> {
+        plan::read_file_bounded(path, max_bytes).map(|f| (f.bytes, (f.dev, f.ino)))
     }
 
     fn stat_file(&mut self, path: &str) -> Option<FileStat> {
@@ -3956,19 +3975,34 @@ where
         live: &[maps::Mapping],
     ) -> HashMap<String, plan::FileBytes> {
         let (relevant, mut dropped) = relevant_paths(delta, live);
+        // R14: the round's byte budget binds BEFORE any read —
+        // every read carries the remaining allowance (capped per
+        // object), so even the first object cannot bypass the cap
+        // (F17: the old loop always read at least one path
+        // unbounded). Refusals skip the path — its rows miss
+        // "unreadable" — and join the dropped count, so skipped
+        // evidence always lands as `discovery.relevance_capped`
+        // loss (PARTIAL, never a completeness claim).
+        let round = self.proc.read_budget();
         let mut out = HashMap::new();
         let mut out_bytes: usize = 0;
         let mut remaining = relevant.len() as u64;
         for p in &relevant {
             remaining -= 1;
-            // Bytes cap: stop past MAX_CACHED_BYTES (always read
-            // at least one path — progress under a single huge
-            // file). Skipped paths join the dropped count: their
-            // rows miss "unreadable" and the loss counter says so.
-            if out_bytes > MAX_CACHED_BYTES && !out.is_empty() {
+            // Bytes cap: stop past the round budget. Skipped paths
+            // join the dropped count: their rows miss "unreadable"
+            // and the loss counter says so.
+            if out_bytes > round && !out.is_empty() {
                 dropped = dropped.saturating_add(remaining + 1);
                 break;
             }
+            // Per-read allowance: the remaining round budget,
+            // capped per object; checked arithmetic (an
+            // over-consumed accumulator yields zero, never wraps).
+            let allowance = round
+                .checked_sub(out_bytes)
+                .unwrap_or_default()
+                .min(plan::MAX_OBJECT_BYTES);
             let current = self.proc.stat_file(p);
             // Identity + freshness (R20): an in-place content change
             // keeps (dev, ino) but moves size and/or mtime, so
@@ -3984,7 +4018,7 @@ where
                         && cached.mtime_ns == cur.mtime_ns
             );
             if !hit {
-                match self.proc.read_file_bound(p) {
+                match self.proc.read_file_bound(p, allowance) {
                     Ok((bytes, (dev, ino))) => {
                         let read = plan::FileBytes { bytes, dev, ino };
                         // Torn-read guard: the file may have changed
@@ -4037,6 +4071,14 @@ where
                         }
                         out_bytes = out_bytes.saturating_add(read.bytes.len());
                         out.insert(p.clone(), read);
+                    }
+                    // Budget refusal: loud, like any other cap drop
+                    // (rows miss "unreadable"; the loss counter
+                    // says why).
+                    Err(e) if e.kind() == std::io::ErrorKind::FileTooLarge => {
+                        self.file_cache.remove(p);
+                        dropped = dropped.saturating_add(1);
+                        continue;
                     }
                     Err(_) => {
                         self.file_cache.remove(p);
@@ -8957,8 +8999,12 @@ mod tests {
             fn read_file(&mut self, _path: &str) -> anyhow::Result<Vec<u8>> {
                 anyhow::bail!("unstubbed")
             }
-            fn read_file_bound(&mut self, _path: &str) -> anyhow::Result<(Vec<u8>, (u64, u64))> {
-                anyhow::bail!("unstubbed")
+            fn read_file_bound(
+                &mut self,
+                _path: &str,
+                _max_bytes: usize,
+            ) -> std::io::Result<(Vec<u8>, (u64, u64))> {
+                Err(std::io::Error::new(std::io::ErrorKind::Other, "unstubbed"))
             }
             fn stat_file(&mut self, _path: &str) -> Option<FileStat> {
                 None
