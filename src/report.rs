@@ -740,6 +740,16 @@ fn doc_json(doc: &CaptureDocument) -> serde_json::Value {
                 .collect::<Vec<_>>()
         );
     }
+    // R12: execution context renders only when recorded (same
+    // optional-key rule). Unknown wall edges render explicit null,
+    // never fabricated zeros; JSON keeps the reversible original.
+    if let Some(context) = &doc.context {
+        out["context"] = serde_json::json!({
+            "kernel_release": context.kernel_release,
+            "wall_start_unix_ns": context.wall_start_unix_ns,
+            "wall_end_unix_ns": context.wall_end_unix_ns,
+        });
+    }
     out
 }
 
@@ -753,15 +763,50 @@ pub fn render_human(doc: &CaptureDocument) -> String {
     s.push_str(&format!(
         "osslscope report (observed-crypto-v2.1): pid={} ({}) window={}..{}ns effective={}..{}ns\n",
         doc.target.pid,
-        doc.target.comm,
+        safe_display(&doc.target.comm),
         doc.window.requested_start_ns,
         doc.window.requested_end_ns,
         doc.window.effective_start_ns,
         doc.window.effective_end_ns,
     ));
+    // R12/G08: explicit durations (monotonic window fields only —
+    // authoritative for deadlines) plus kernel and wall context
+    // (context only, never authoritative and never conflated with
+    // the monotonic window above).
+    let requested_dur = doc
+        .window
+        .requested_end_ns
+        .saturating_sub(doc.window.requested_start_ns);
+    let effective_dur = doc
+        .window
+        .effective_end_ns
+        .saturating_sub(doc.window.effective_start_ns);
+    s.push_str(&format!(
+        "duration: requested={requested_dur}ns effective={effective_dur}ns (monotonic; authoritative)\n",
+    ));
+    let kernel = doc
+        .context
+        .as_ref()
+        .map_or("", |c| c.kernel_release.as_str());
+    if kernel.is_empty() {
+        s.push_str("kernel: unknown\n");
+    } else {
+        s.push_str(&format!("kernel: {}\n", safe_display(kernel)));
+    }
+    let wall = |v: Option<u64>| v.map_or("unknown".to_string(), |n| n.to_string());
+    let (wall_start, wall_end) = match &doc.context {
+        Some(c) => (wall(c.wall_start_unix_ns), wall(c.wall_end_unix_ns)),
+        None => ("unknown".to_string(), "unknown".to_string()),
+    };
+    s.push_str(&format!(
+        "wall: start={wall_start} end={wall_end} (unix-ns; context only)\n",
+    ));
     match (&doc.openssl.state, &doc.openssl.version) {
         (OpensslVersionState::Verified, Some(version)) => {
-            s.push_str(&format!("openssl: {version} (verified object metadata)\n"));
+            s.push_str(&format!(
+                "openssl: {} (verified object metadata)\n",
+                safe_display(version)
+            ));
         }
         _ => s.push_str("openssl: unknown (no verified version)\n"),
     }
@@ -774,8 +819,8 @@ pub fn render_human(doc: &CaptureDocument) -> String {
     };
     s.push_str(&format!(
         "target: argv_redacted=true container_id={} image_digest={}\n",
-        or_none(&doc.target.container_id),
-        or_none(&doc.target.image_digest),
+        or_none(&safe_display(&doc.target.container_id)),
+        or_none(&safe_display(&doc.target.image_digest)),
     ));
     match &doc.disposition {
         Some(d) if d.outcome == DispositionOutcome::Exited => {
@@ -855,7 +900,7 @@ pub fn render_human(doc: &CaptureDocument) -> String {
             let name = crate::evidence::engine_name(o.entrypoint).unwrap_or("(unknown entrypoint)");
             s.push_str(&format!(
                 "  {} {} file-offset={} gen={} ({}) ({} calls)\n",
-                fp_short(&o.key.object.0),
+                safe_display(&fp_short(&o.key.object.0)),
                 name,
                 o.key.offset,
                 o.generation,
@@ -879,16 +924,24 @@ pub fn render_human(doc: &CaptureDocument) -> String {
                 };
                 s.push_str(&format!(
                     "  {}: expected={} discovered={} attached={} ({state})\n",
-                    scope.scope, sites, scope.discovered, scope.attached,
+                    safe_display(&scope.scope),
+                    sites,
+                    scope.discovered,
+                    scope.attached,
                 ));
             }
             ExpectedScope::NotApplicable => {
-                s.push_str(&format!("  {}: not applicable\n", scope.scope));
+                s.push_str(&format!(
+                    "  {}: not applicable\n",
+                    safe_display(&scope.scope)
+                ));
             }
             ExpectedScope::Unknown => {
                 s.push_str(&format!(
                     "  {}: expected=UNKNOWN discovered={} attached={} (gap)\n",
-                    scope.scope, scope.discovered, scope.attached,
+                    safe_display(&scope.scope),
+                    scope.discovered,
+                    scope.attached,
                 ));
             }
         }
@@ -906,7 +959,7 @@ pub fn render_human(doc: &CaptureDocument) -> String {
         s.push_str(&format!(
             "  {} {} ({} from {}) = {}\n",
             counter_kind_str(counter.kind),
-            counter.name,
+            safe_display(&counter.name),
             counter_units_str(counter.units),
             counter_source_str(counter.source),
             grouped(counter.value),
@@ -927,10 +980,10 @@ pub fn render_human(doc: &CaptureDocument) -> String {
                 s.push_str("fatal: attach-zero (no probes attached; no usable evidence)\n");
             }
             FatalKind::Environment(detail) => {
-                s.push_str(&format!("fatal: environment: {detail}\n"));
+                s.push_str(&format!("fatal: environment: {}\n", safe_display(detail)));
             }
             FatalKind::Runtime(detail) => {
-                s.push_str(&format!("fatal: runtime: {detail}\n"));
+                s.push_str(&format!("fatal: runtime: {}\n", safe_display(detail)));
             }
         }
         s.push('\n');
@@ -959,15 +1012,15 @@ pub fn render_human(doc: &CaptureDocument) -> String {
                     .unwrap_or_else(|| "unknown".to_string());
                 s.push_str(&format!(
                     "  rule {} ({}): {} (definite={}, possible={possible})\n",
-                    rule.rule,
-                    rule.predicate,
+                    safe_display(&rule.rule),
+                    safe_display(&rule.predicate),
                     rule_verdict_str(rule.result),
                     grouped(rule.definite),
                 ));
                 for evidence in &rule.evidence {
                     s.push_str(&format!(
                         "    evidence: {} file-offset={} gen={} ({} calls)\n",
-                        fp_short(&evidence.object.0),
+                        safe_display(&fp_short(&evidence.object.0)),
                         evidence.offset,
                         evidence.generation,
                         grouped(evidence.calls),
@@ -978,7 +1031,7 @@ pub fn render_human(doc: &CaptureDocument) -> String {
                         .unwrap_or("(unknown entrypoint)");
                     s.push_str(&format!(
                         "    engine evidence: {} {} file-offset={} gen={} ({} calls)\n",
-                        fp_short(&evidence.object.0),
+                        safe_display(&fp_short(&evidence.object.0)),
                         name,
                         evidence.offset,
                         evidence.generation,
@@ -1000,6 +1053,45 @@ pub fn render_human(doc: &CaptureDocument) -> String {
 /// assumed ASCII).
 fn fp_short(fp: &str) -> String {
     fp.chars().take(12).collect()
+}
+
+/// Neutralize target-controlled text for human (terminal/log)
+/// display (R12/F14): every control, bidi-override and
+/// zero-width/format character becomes `?`, so rendered lines
+/// cannot move the cursor, inject fake lines, or reorder displayed
+/// text. Identity on clean text. Applies at the human boundary to
+/// every free-text interpolation (comm, container/image, version,
+/// scopes, counters, rules, fingerprints, fatal detail); fixed
+/// vocabulary (status, verdicts, op names, numbers) needs none.
+/// JSON keeps the reversible original — only human rendering calls
+/// this.
+fn safe_display(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_control() || is_display_control(c) {
+                '?'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+/// Non-`is_control` characters that manipulate terminal/log
+/// display: bidi overrides/isolates, zero-width and invisible
+/// format characters, line/paragraph separators, and the
+/// interlinear-annotation controls.
+fn is_display_control(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}' // SOFT HYPHEN
+            | '\u{061C}' // ARABIC LETTER MARK (bidi)
+            | '\u{200B}'..='\u{200F}' // ZERO WIDTH SPACE .. RIGHT-TO-LEFT MARK
+            | '\u{2028}'..='\u{202E}' // LINE SEPARATOR .. RIGHT-TO-LEFT OVERRIDE
+            | '\u{2066}'..='\u{2069}' // bidi isolates
+            | '\u{FEFF}' // ZERO WIDTH NO-BREAK SPACE / BOM
+            | '\u{FFF9}'..='\u{FFFB}' // interlinear annotation
+    )
 }
 
 /// Attribution summary shared by the human render and the CBOM
@@ -1054,7 +1146,7 @@ fn definite_asset(site: &SiteExecution) -> Option<DefiniteAsset> {
 fn human_site(site: &SiteExecution, s: &mut String) {
     s.push_str(&format!(
         "  site {} file-offset={} gen={}: {} calls, ",
-        fp_short(&site.site.object.0),
+        safe_display(&fp_short(&site.site.object.0)),
         site.site.offset,
         site.generation,
         grouped(site.calls),
@@ -1070,9 +1162,9 @@ fn human_site(site: &SiteExecution, s: &mut String) {
     if let Some(asset) = definite_asset(site) {
         s.push_str(&format!(
             "definite: {} ({}) via {}{}\n",
-            asset.algorithm,
+            safe_display(&asset.algorithm),
             op_display(asset.op),
-            asset.provider_class,
+            safe_display(&asset.provider_class),
             if asset.weak { " [weak alias]" } else { "" },
         ));
         return;
@@ -1115,11 +1207,11 @@ fn human_candidates(site: &SiteExecution, s: &mut String) {
     for candidate in &site.candidates {
         s.push_str(&format!(
             "    candidate: provider={} class={} op={} funcid={} algs=[{}]{}\n",
-            fp_short(&candidate.provider.0),
-            candidate.provider_class,
+            safe_display(&fp_short(&candidate.provider.0)),
+            safe_display(&candidate.provider_class),
             op_display(candidate.op),
             candidate.funcid,
-            candidate.algorithm_classes.join(", "),
+            safe_display(&candidate.algorithm_classes.join(", ")),
             if candidate.weak_alias { " weak" } else { "" },
         ));
     }
@@ -1128,20 +1220,30 @@ fn human_candidates(site: &SiteExecution, s: &mut String) {
 fn gap_reason_human(reason: &GapReason) -> String {
     match reason {
         GapReason::UnknownDenominator { scope } => {
-            format!("unknown-denominator: {scope} (expected sites unknowable, never complete)")
+            format!(
+                "unknown-denominator: {} (expected sites unknowable, never complete)",
+                safe_display(scope)
+            )
         }
         GapReason::UndiscoveredSites { scope, missing } => {
-            format!("undiscovered-sites: {scope} missing={missing}")
+            format!(
+                "undiscovered-sites: {} missing={missing}",
+                safe_display(scope)
+            )
         }
         GapReason::UnattachedSites { scope, missing } => {
-            format!("unattached-sites: {scope} missing={missing}")
+            format!(
+                "unattached-sites: {} missing={missing}",
+                safe_display(scope)
+            )
         }
         GapReason::Loss {
             counter,
             source,
             value,
         } => format!(
-            "loss: {counter} ({}) = {}",
+            "loss: {} ({}) = {}",
+            safe_display(counter),
             counter_source_str(*source),
             grouped(*value),
         ),

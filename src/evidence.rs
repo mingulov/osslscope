@@ -385,6 +385,24 @@ impl CaptureWindow {
     }
 }
 
+/// Execution context retained in the finalized document (R12/G08):
+/// the host kernel release plus the wall-clock window edges in unix
+/// nanoseconds. Context only — the monotonic [`CaptureWindow`] fields
+/// stay authoritative for durations and deadlines; wall edges may run
+/// backward across a clock adjustment without affecting verdicts, and
+/// missing/unrepresentable wall times are explicit `None` (rendered
+/// JSON `null`, human `unknown`), never a fabricated zero. Carries no
+/// argv, pointers or payloads: kernel release plus two timestamps.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct CaptureContext {
+    /// Host kernel release (`uname -r`); empty means unknown.
+    pub kernel_release: String,
+    /// Wall-clock window start in unix nanoseconds (`None` = unknown).
+    pub wall_start_unix_ns: Option<u64>,
+    /// Wall-clock window end in unix nanoseconds (`None` = unknown).
+    pub wall_end_unix_ns: Option<u64>,
+}
+
 /// Observed code object: verified identity plus a display locator. The
 /// locator is provenance for operators, never identity.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -762,6 +780,13 @@ pub struct CaptureDocument {
     /// or the legacy partition (conserved provider-dispatch units).
     #[serde(default)]
     pub engine_observations: Vec<EngineObservation>,
+    /// Execution context (R12): kernel release plus wall-clock window
+    /// edges. Additive and old-reader-safe: missing in old documents
+    /// means unrecorded. Set post-finalization by the producer from
+    /// already-captured context; [`finalize`] leaves it `None` so
+    /// every existing producer keeps its exact shape.
+    #[serde(default)]
+    pub context: Option<CaptureContext>,
 }
 
 impl CaptureDocument {
@@ -882,5 +907,6 @@ pub fn finalize(mut input: FinalizeInput) -> CaptureDocument {
         policy: input.policy,
         legacy_partition: input.legacy_partition,
         engine_observations: input.engine_observations,
+        context: None,
     }
 }
