@@ -132,19 +132,20 @@ def site_definitely_matches_operation(site, op, algorithm_classes,
     """Definite single-site operation evidence (R09 fix-round-1).
 
     A site definitely witnesses an operation only when it executed,
-    its candidate set is complete, and EVERY alternative agrees on
-    the full tuple (evidence model: complete set + all-match). An
-    unknown (or any non-complete) set, an empty set, or conflicting
+    its candidate set is explicitly complete, and EVERY alternative
+    agrees on the full tuple (evidence model: complete set +
+    all-match). An unknown (or any non-complete) set, a missing
+    candidates_coverage key, an empty set, or conflicting
     alternatives are possible attribution, never definite. Missing
-    candidates_coverage is tolerated as complete for legacy
-    abbreviated fixtures; full-schema reports always carry it.
+    evidence of candidate-set completeness cannot establish
+    certainty (fail closed).
     """
     if site.get("calls", 0) < 1:
         return False
     cands = site.get("candidates", []) or []
     if not cands:
         return False
-    if site.get("candidates_coverage", "complete") != "complete":
+    if site.get("candidates_coverage") != "complete":
         return False
     return all(candidate_matches_operation(c, op, algorithm_classes,
                                            provider_classes, funcids)

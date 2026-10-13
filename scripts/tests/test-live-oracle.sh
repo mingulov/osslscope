@@ -41,7 +41,9 @@ mk_report_f() {
 }
 site() {
     # $1 = calls, $2 = inode, $3 = candidates JSON, $4 = generation (opt)
-    printf '{"calls": %s, "candidates": [%s], "object": "lib", "device": 1, "inode": %s, "offset": 4096, "generation": %s}' "$1" "$3" "$2" "${4:-0}"
+    # Declares candidates_coverage complete explicitly: definite
+    # operation evidence requires it (missing fails closed).
+    printf '{"calls": %s, "candidates": [%s], "object": "lib", "device": 1, "inode": %s, "offset": 4096, "generation": %s, "candidates_coverage": "complete"}' "$1" "$3" "$2" "${4:-0}"
 }
 
 # Candidates (full v2 shape: op + funcid + provider_class + classes).
@@ -518,7 +520,8 @@ mk_report_vf() {
 }
 site_i() {
     # $1 = calls, $2 = inode, $3 = candidates JSON, $4 = installed_at, $5 = generation (opt)
-    printf '{"calls": %s, "candidates": [%s], "object": "lib", "device": 1, "inode": %s, "offset": 4096, "generation": %s, "installed_at": %s}' "$1" "$3" "$2" "${5:-0}" "$4"
+    # Declares candidates_coverage complete explicitly (see site()).
+    printf '{"calls": %s, "candidates": [%s], "object": "lib", "device": 1, "inode": %s, "offset": 4096, "generation": %s, "installed_at": %s, "candidates_coverage": "complete"}' "$1" "$3" "$2" "${5:-0}" "$4"
 }
 
 S11I=$(site_i 3 101 "$C11" 5); S15I=$(site_i 2 102 "$C15" 6)
@@ -698,12 +701,13 @@ fi
 
 # R09 fix-round-1: full-schema fixtures with coherent object references
 # and conservation fields, plus conflicting/incomplete certainty controls.
-# Abbreviated builders above omit candidates_coverage/first_ns/last_ns and
-# provider/weak_alias; these builders emit structurally complete v2.1
-# documents. Definite operation evidence requires a complete candidate set
+# Abbreviated builders above declare candidates_coverage complete
+# explicitly but still omit first_ns/last_ns and provider/weak_alias;
+# these builders emit structurally complete v2.1 documents. Definite
+# operation evidence requires an explicitly complete candidate set
 # with every alternative agreeing on the full tuple (evidence model);
-# conflicting alternatives or unknown coverage are possible attribution,
-# never definite.
+# conflicting alternatives, unknown coverage, or a missing coverage
+# key are possible attribution, never definite (fail closed).
 full_cand() {
     # $1=provider $2=provider_class $3=op $4=funcid $5=classes JSON $6=weak_alias
     printf '{"provider": "%s", "provider_class": "%s", "op": %s, "funcid": %s, "algorithm_classes": %s, "weak_alias": %s}' "$1" "$2" "$3" "$4" "$5" "$6"
@@ -815,6 +819,16 @@ mk_full_report "$T/rep63combo.json" "[$S63A, $S63B, $S63C]" 12 0 12 0 0
 S64A=$(full_site 4 "obj-legacy" 8 200 8192 0 "$FMD4SETUP" "complete" 10 90)
 S64B=$(full_site 3 "obj-legacy" 8 200 12288 0 "$FMD4OP" "complete" 10 90)
 mk_full_report "$T/rep64combo.json" "[$S64A, $S64B]" 7 7 0 0 0
+# 65: missing-key control (fail closed): fixture-57 singletons with NO
+# candidates_coverage key must not establish definite attribution.
+full_site_nocov() {
+    # same shape as full_site minus the coverage key: $1=calls $2=object
+    # $3=device $4=inode $5=offset $6=generation $7=candidates $8=first $9=last
+    printf '{"calls": %s, "candidates": [%s], "object": "%s", "device": %s, "inode": %s, "offset": %s, "generation": %s, "first_ns": %s, "last_ns": %s}' "$1" "$7" "$2" "$3" "$4" "$5" "$6" "$8" "$9"
+}
+S65A=$(full_site_nocov 5 "obj-default" 8 100 12288 0 "$F11" 10 90)
+S65B=$(full_site_nocov 5 "obj-default" 8 100 16384 0 "$F15" 10 90)
+mk_full_report "$T/rep65nocov.json" "[$S65A, $S65B]" 10 0 10 0 0
 
 # 56. FAIL: conflicting ECDSA/DSA alternatives are possible, not definite.
 if python3 "$ORACLE" "$T/ecdsa.log" "$T/rep56conf.json" ecdsa >"$T/out" 2>&1; then
@@ -895,6 +909,15 @@ if python3 "$ORACLE" "$T/md4.log" "$T/rep64combo.json" md4 >"$T/out" 2>&1; then
         || bad "full-schema md4 combined passes"
 else
     bad "full-schema md4 combined passes (rc=$?)"
+fi
+
+# 65. FAIL: missing candidates_coverage cannot establish certainty.
+if python3 "$ORACLE" "$T/ecdsa.log" "$T/rep65nocov.json" ecdsa >"$T/out" 2>&1; then
+    bad "missing coverage fails closed (got exit 0)"
+else
+    grep -q 'ambiguous' "$T/out" \
+        && ok "missing coverage fails closed" \
+        || bad "missing coverage fails closed"
 fi
 
 echo "---"
