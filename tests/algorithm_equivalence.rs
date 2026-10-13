@@ -272,40 +272,34 @@ fn doc_for_alias(
     (doc, label, weak, status)
 }
 
-/// Run one mixed alias list end-to-end with its finite alternatives
-/// enumerated: classify the full list (production verdict), classify
-/// each `:` segment (production per-alternative identity), adapt one
-/// mixed-sourced arrival per recognized alternative (the row's `mixed`
-/// verdict rides every arrival — status is per provider row, one
-/// verdict per `(arr, idx)` slot — with the class/weak of its
-/// enumerated alternative), finalize with 7 calls. Returns the
-/// finalized document plus the full-list status.
-fn doc_for_mixed_alternatives(
+/// Run two alias lists end-to-end as two provider rows sharing one
+/// callback: classify each full row once (production verdicts), adapt
+/// both arrivals onto the SAME triple in one poll (one backing +
+/// offset — the shared implementation address), finalize with 7
+/// calls. Returns the finalized document plus both rows' verdicts.
+fn doc_for_shared_callback(
     stage_tag: &str,
     op: u32,
-    alias: &str,
+    row_a: &str,
+    row_b: &str,
     offset: u64,
-) -> (CaptureDocument, String) {
+) -> (
+    CaptureDocument,
+    (String, bool, String),
+    (String, bool, String),
+) {
     let table: HashMap<u64, wire::AlgClassValue> =
         build_alg_entries().unwrap().into_iter().collect();
-    let (_, _, status) = classify_list(&table, alias);
-    let mut alternatives = Vec::new();
-    for seg in alias.split(':') {
-        let (label, weak, seg_status) = classify_list(&table, seg);
-        assert_eq!(
-            seg_status, "ok",
-            "every enumerated alternative must be a recognized spelling: {seg:?} in {alias:?}"
-        );
-        alternatives.push((label, weak, "mixed".to_string()));
-    }
+    let va = classify_list(&table, row_a);
+    let vb = classify_list(&table, row_b);
     let stage = Stage::fresh(stage_tag);
     let bytes = self_bytes();
     let staged = stage.write("prov.so", &bytes);
     let live = vec![mapping(&staged)];
-    let (candidates, coverage) = adapt_many(&staged, &live, op, &alternatives, offset);
+    let (candidates, coverage) = adapt_many(&staged, &live, op, &[va.clone(), vb.clone()], offset);
     let site = site_with_calls(&staged, offset, candidates, coverage, 7);
     let doc = complete_doc(vec![site]);
-    (doc, status)
+    (doc, va, vb)
 }
 
 const KEM_OP: u32 = 14;
@@ -590,10 +584,14 @@ fn stock_provider_alias_rows_stay_ok() {
 #[test]
 fn same_family_distinct_algorithms_are_not_definite() {
     // Same macro family, distinct semantics: no definite either way.
-    // The full list mixes (production classifier verdict); its finite
-    // alternatives enumerate to a COMPLETE ambiguous site: definite 0,
-    // finite upper Some(7) per alternative, no definite CBOM asset,
-    // total 7.
+    // The full provider row classifies once (production verdict:
+    // one minimum class + mixed) and adapts as the SINGLE arrival
+    // production emits for that row — no per-segment synthesis
+    // (re-reviewer round 2: a test that passes while production
+    // still fails is itself a defect). Terminated tables prove no
+    // rows are missing, so the ambiguous site is COMPLETE with a
+    // finite upper: definite 0, Some(7) per spelling, no definite
+    // CBOM asset, total 7.
     let cases: &[(&str, u32, &[&str])] = &[
         (
             "ML-KEM-512:ML-KEM-768",
@@ -611,14 +609,19 @@ fn same_family_distinct_algorithms_are_not_definite() {
             alias.to_string(),
             alias.split(':').rev().collect::<Vec<_>>().join(":"),
         ] {
-            let (doc, status) = doc_for_mixed_alternatives("diff", *op, &ordered, 0x600);
+            let (doc, _label, _weak, status) = doc_for_alias("diff", *op, &ordered, 0x600);
             assert_eq!(
                 status, "mixed",
                 "distinct family members must mix: {ordered:?}"
             );
+            assert_eq!(
+                doc.sites[0].candidates_coverage,
+                CandidateCoverage::AmbiguousComplete,
+                "pure mixed row is bounded ambiguity: {ordered:?}"
+            );
             assert!(
                 matches!(doc.status, Completeness::Complete),
-                "finite alternatives stay COMPLETE: {ordered:?}"
+                "finite mixed row stays COMPLETE: {ordered:?}"
             );
             // No definite alternative in either direction; the finite
             // upper per alternative is the 7 observed calls.
@@ -653,35 +656,57 @@ fn same_family_distinct_algorithms_are_not_definite() {
         }
     }
 
-    // Cross-family control: still mixed, still no definite.
+    // Cross-family control: still mixed, still no definite — and
+    // still finite (terminated tables prove the row fully walked).
     let (doc, _, _, status) = doc_for_alias("diff-cross", DIGEST_OP, "AES-256-GCM:MD5", 0x700);
     assert_eq!(status, "mixed");
-    let v = evaluate_document(
-        std::slice::from_ref(&PolicyRule::deny_algorithm("AES-256-GCM")),
-        &doc,
+    assert_eq!(
+        doc.sites[0].candidates_coverage,
+        CandidateCoverage::AmbiguousComplete
     );
-    assert_eq!(v.rules[0].bounds.definite, 0);
+    assert!(matches!(doc.status, Completeness::Complete));
+    for spelling in ["AES-256-GCM", "MD5"] {
+        let v = evaluate_document(
+            std::slice::from_ref(&PolicyRule::deny_algorithm(spelling)),
+            &doc,
+        );
+        assert_eq!(v.rules[0].bounds.definite, 0, "{spelling:?}");
+        assert_eq!(v.rules[0].bounds.possible, Some(7), "{spelling:?}");
+        assert_eq!(
+            v.rules[0].verdict,
+            RuleVerdict::Inconclusive,
+            "{spelling:?}"
+        );
+    }
     assert_eq!(cbom_assets(&doc).len(), 0);
     assert_eq!(doc.total_calls(), 7);
 
     // Unknown control: unregistered spellings never become definite.
+    // An unreadable row is TRULY unknown (no terminated proof of what
+    // it hides): PARTIAL with an unbounded upper — the contrast to
+    // the finite mixed rows above.
     let (doc, label, _, status) =
         doc_for_alias("diff-unknown", DIGEST_OP, "canary-DOOM-7QZ", 0x800);
     assert_eq!(status, "unknown");
     assert_eq!(label, "other");
+    assert_eq!(doc.sites[0].candidates_coverage, CandidateCoverage::Unknown);
+    assert!(matches!(doc.status, Completeness::Partial { .. }));
     let v = evaluate_document(
         std::slice::from_ref(&PolicyRule::require_executed("SHA2-256")),
         &doc,
     );
     assert_eq!(v.rules[0].bounds.definite, 0);
+    assert_eq!(v.rules[0].bounds.possible, None);
     assert_eq!(cbom_assets(&doc).len(), 0);
 
     // Weak control: a mixed weak/strong family pair keeps weak but
     // yields no definite algorithm.
-    let (_doc, _, weak, status) = doc_for_alias("diff-weak", DIGEST_OP, "SHA2-256:SHA2-512", 0x900);
+    let (doc, _, weak, status) = doc_for_alias("diff-weak", DIGEST_OP, "SHA2-256:SHA2-512", 0x900);
     assert_eq!(status, "mixed");
     assert!(!weak);
-    // SHA1 (weak) vs MD5 (weak, distinct): mixed, weak preserved.
+    assert!(matches!(doc.status, Completeness::Complete));
+    // SHA1 (weak) vs MD5 (weak, distinct): mixed, weak preserved,
+    // finite — no definite algorithm either way.
     let table: HashMap<u64, wire::AlgClassValue> =
         build_alg_entries().unwrap().into_iter().collect();
     let (label, weak, status) = classify_list(&table, "SHA1:MD5");
@@ -692,7 +717,155 @@ fn same_family_distinct_algorithms_are_not_definite() {
     let staged = stage.write("prov.so", &bytes);
     let live = vec![mapping(&staged)];
     let (candidates, coverage) = adapt_one(&staged, &live, DIGEST_OP, &label, weak, &status, 0xA00);
-    assert_eq!(coverage, CandidateCoverage::Unknown);
+    assert_eq!(coverage, CandidateCoverage::AmbiguousComplete);
     assert!(candidates.iter().any(|c| c.weak_alias));
+    let site = site_with_calls(&staged, 0xA00, candidates, coverage, 7);
+    let doc = complete_doc(vec![site]);
+    assert!(
+        matches!(doc.status, Completeness::Complete),
+        "weak mixed row stays COMPLETE"
+    );
+    for spelling in ["SHA1", "MD5"] {
+        let v = evaluate_document(
+            std::slice::from_ref(&PolicyRule::require_executed(spelling)),
+            &doc,
+        );
+        assert_eq!(v.rules[0].bounds.definite, 0, "{spelling:?}");
+        assert_eq!(v.rules[0].bounds.possible, Some(7), "{spelling:?}");
+    }
+    assert_eq!(cbom_assets(&doc).len(), 0);
     let _ = label;
+}
+
+#[test]
+fn mixed_rows_sharing_one_callback_never_yield_definite() {
+    // Re-reviewer round-2 counterexample (permanent negative
+    // control): two distinct provider rows sharing one callback.
+    // The wire retains only the minimum class per row, so both
+    // arrivals name AES-128-GCM while hiding their second
+    // alternative (AES-256-GCM / RC4). Two distinct candidate
+    // identities (weak differs) must NEVER read as proof that all
+    // alternatives were enumerated: no definite attribution from
+    // candidate count, and the discarded alternatives must read
+    // unknown — never definite, never proved-absent.
+    let row_a = "AES-128-GCM:AES-256-GCM";
+    let row_b = "AES-128-GCM:RC4";
+    let (doc, va, vb) = doc_for_shared_callback("shared", CIPHER_OP, row_a, row_b, 0xC00);
+    // Preconditions, hardcoded (production verdicts, pinned):
+    // both rows mix, both retain the same minimum class, weak
+    // differs (RC4 is weak, AES is not) — distinct identities.
+    assert_eq!(va, ("AES-128-GCM".to_string(), false, "mixed".to_string()));
+    assert_eq!(vb, ("AES-128-GCM".to_string(), true, "mixed".to_string()));
+    assert_eq!(
+        doc.sites[0].candidates_coverage,
+        CandidateCoverage::AmbiguousComplete,
+        "shared mixed callback is bounded ambiguity, not definite"
+    );
+    assert!(
+        matches!(doc.status, Completeness::Complete),
+        "shared mixed callback stays COMPLETE"
+    );
+    // Retained spelling, discarded alternatives, and an unrelated
+    // spelling: every algorithm claim is (0, Some(7)) Inconclusive.
+    for spelling in [
+        "AES-128-GCM",
+        "AES-256-GCM",
+        "RC4",
+        "id-aes128-GCM",
+        "SHA2-256",
+    ] {
+        for rule in [
+            PolicyRule::require_executed(spelling),
+            PolicyRule::deny_algorithm(spelling),
+        ] {
+            let v = evaluate_document(std::slice::from_ref(&rule), &doc);
+            assert_eq!(v.rules[0].bounds.definite, 0, "{} {spelling:?}", rule.name);
+            assert_eq!(
+                v.rules[0].bounds.possible,
+                Some(7),
+                "{} {spelling:?}",
+                rule.name
+            );
+            assert_eq!(
+                v.rules[0].verdict,
+                RuleVerdict::Inconclusive,
+                "{} {spelling:?}",
+                rule.name
+            );
+        }
+    }
+    assert_eq!(doc.total_calls(), 7);
+    assert_eq!(cbom_assets(&doc).len(), 0);
+}
+
+#[test]
+fn mixed_ok_blend_withholds_finite_claim() {
+    // R01/H3: a triple that ever arrives `ok` is never pure-mixed —
+    // an `ok` row beside a mixed row (either poll order) withholds
+    // the finite claim (Unknown), however clean the tables. The
+    // mixed-then-ok direction is pinned in-loop by H3 t2; this pins
+    // the ok-then-mixed direction at the adapter seam that keys it
+    // (`sites_ok`): without it the second poll would wrongly claim
+    // AmbiguousComplete.
+    let stage = Stage::fresh("blend");
+    let bytes = self_bytes();
+    let staged = stage.write("prov.so", &bytes);
+    let live = vec![mapping(&staged)];
+    let files: HashMap<String, plan::FileBytes> = HashMap::new();
+    let fresh: HashSet<(String, u64)> = HashSet::new();
+    let mut state = AdapterState::default();
+    let offset = 0xD00;
+    let arrival = |class: &str, weak: bool, status: &str| DiscoveredCandidate {
+        advertising: staged.path.clone(),
+        advertising_dev: String::new(),
+        advertising_ino: 0,
+        backing: backing_of(&staged, offset),
+        op: CIPHER_OP,
+        funcid: 7,
+        class: class.to_string(),
+        weak,
+        status: status.to_string(),
+        epoch: 0,
+        impl_addr: 0,
+        arr: 0,
+    };
+    let ctx = AdapterCtx {
+        live: &live,
+        files: &files,
+        pinned_provider: None,
+        fresh: &fresh,
+        post_settle: false,
+        baseline: false,
+    };
+    // Poll 1: one clean row → Complete.
+    let adapted = adapt_delta(
+        &mut state,
+        &DiscoveryDelta {
+            candidates: vec![arrival("AES-128-GCM", false, "ok")],
+            tables: vec![terminated(CIPHER_OP, 0)],
+            ..DiscoveryDelta::default()
+        },
+        &ctx,
+    );
+    assert_eq!(adapted.delta.discovered.len(), 1);
+    assert_eq!(
+        adapted.delta.discovered[0].candidates_coverage,
+        CandidateCoverage::Complete
+    );
+    // Poll 2: a mixed row joins the same triple → blend → Unknown.
+    let adapted = adapt_delta(
+        &mut state,
+        &DiscoveryDelta {
+            candidates: vec![arrival("AES-128-GCM", false, "mixed")],
+            tables: vec![terminated(CIPHER_OP, 0)],
+            ..DiscoveryDelta::default()
+        },
+        &ctx,
+    );
+    assert_eq!(adapted.delta.discovered.len(), 1);
+    assert_eq!(
+        adapted.delta.discovered[0].candidates_coverage,
+        CandidateCoverage::Unknown,
+        "ok-then-mixed blend must withhold"
+    );
 }

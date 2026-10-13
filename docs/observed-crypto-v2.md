@@ -158,7 +158,13 @@ op, funcid and one single *resolved* algorithm class
 ambiguous (`complete` set, disagreeing or multi-class),
 unresolved (`complete` set stuck in the `other` bucket: provider,
 op and funcid are certain, the algorithm is not), unattributed
-(`unknown` set or no candidates), or quiet (zero calls). `fenced`
+(`unknown` set or no candidates), or quiet (zero calls). A site
+whose set is complete but every row mixed two or more algorithm
+identities renders `candidates_coverage: "ambiguous_complete"`:
+terminated tables prove no rows are missing, yet each retained
+class is only its row's minimum with the alternatives unlisted, so
+every predicate reads `(0, Some(calls))` — never definite, never
+proved-absent — and no definite asset is minted. `fenced`
 carries earlier generations in the same shape so fence crossings
 preserve candidates. Every site backing triple
 (fingerprint/device/inode) and every candidate advertising
