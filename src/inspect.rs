@@ -158,6 +158,12 @@ pub fn is_partial_doc(doc: &serde_json::Value) -> bool {
 // Production harvest-invocation spy (R07/F08 ordering proof).
 // Thread-local so parallel tests never observe each other's
 // setup calls; each test resets its own thread's counter first.
+// Scope: this counter proves *invocation* ordering only (run()
+// reaches harvest::run exactly once per admitted call). It cannot
+// observe an unmarked read elsewhere, so premature-read closure
+// rests on the read-syscall control
+// (cli_admission::ordering_inspect_no_read_syscall_before_admission),
+// which watches the actual read boundary, not this marker.
 thread_local! {
     static HARVEST_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
