@@ -33,16 +33,16 @@
 use aya_ebpf::{
     helpers,
     macros::{map, uprobe, uretprobe},
-    maps::{HashMap, PerCpuHashMap, RingBuf},
+    maps::{Array, HashMap, LruHashMap, PerCpuArray, PerCpuHashMap, RingBuf},
     programs::{ProbeContext, RetProbeContext},
     EbpfContext as _,
 };
 use osslscope_ebpf_common::{
-    classify_alg_with, AlgClassValue, AlgEvent, PendQuery, RowEvent, ALG_UNREADABLE, ALG_WINDOW,
-    KIND_ALG, KIND_ROW, LOSS_MAP_CALLS, LOSS_MAP_TRUNC, LOSS_MEMBER_COOKIE,
-    LOSS_PENDING_QUERY_FULL, LOSS_PENDING_QUERY_MISS, LOSS_RING_ALG, LOSS_RING_ROW,
-    MEMBER_ENTRY_COOKIE, OTHER_CLASS, TRUNC_ALGS, TRUNC_DISPATCH, TRUNC_NO_STORE, TRUNC_WALK_EMPTY,
-    TRUNC_WALK_NAME, TRUNC_WALK_NOIMP, TRUNC_WALK_READ,
+    classify_alg_with, AlgClassValue, AlgEvent, CtrlValue, PendQuery, RowEvent, ScanRec,
+    TCacheValue, ALG_UNREADABLE, ALG_WINDOW, KIND_ALG, KIND_ROW, LOSS_MAP_CALLS, LOSS_MAP_TRUNC,
+    LOSS_MEMBER_COOKIE, LOSS_PENDING_QUERY_FULL, LOSS_PENDING_QUERY_MISS, LOSS_RING_ALG,
+    LOSS_RING_ROW, MEMBER_ENTRY_COOKIE, OTHER_CLASS, TRUNC_ALGS, TRUNC_DISPATCH, TRUNC_NO_STORE,
+    TRUNC_WALK_EMPTY, TRUNC_WALK_NAME, TRUNC_WALK_NOIMP, TRUNC_WALK_READ,
 };
 
 /// `BPF_NOEXIST` for `insert` (kernel UAPI; aya-ebpf exposes no const).
@@ -96,6 +96,40 @@ static CALLS: PerCpuHashMap<u32, u64> = PerCpuHashMap::with_max_entries(64, 0);
 /// before any attach; no target bytes at rest.
 #[map]
 static ALG_CLASS: HashMap<u64, AlgClassValue> = HashMap::with_max_entries(1024, 0);
+/// One in-flight scan per thread (§5.1): the entry's take record,
+/// peeked by members. LRU: orphans from never-returning hits evict
+/// instead of leaking (eviction counted via the NULL+SEQ rule).
+#[map]
+static SCAN: LruHashMap<u32, ScanRec> = LruHashMap::with_max_entries(1024, 0);
+/// Invocation sequences (§5.1): tid → birth:16|ctr:48.
+/// Non-evictable (never reused across eviction or tid-reuse);
+/// insert-fail skips the query (LOSS_SEQ_FULL).
+#[map]
+static SEQ: HashMap<u32, u64> = HashMap::with_max_entries(4096, 0);
+/// Thread birth registry (§5.1): tid → u16 birth,
+/// userspace-superseded, never deleted (dead tids orphan; a later
+/// incarnation supersedes).
+#[map]
+static BIRTH: HashMap<u32, u16> = HashMap::with_max_entries(4096, 0);
+/// Per-thread member return counter (§5.1): bumped first-thing by
+/// every admitted-scan exit, reset by every admit. 4k lifecycle
+/// (never deleted; insert-fail unreachable — RCOUNT keys ⊆ SEQ
+/// keys, and the admit order inserts SEQ first).
+#[map]
+static RCOUNT: HashMap<u32, u64> = HashMap::with_max_entries(4096, 0);
+/// Terminator cache (§5.3): array → (T, GEN),
+/// single-userspace-writer. Members peek + validate GEN and
+/// skip-silent past T.
+#[map]
+static T_CACHE: HashMap<u64, TCacheValue> = HashMap::with_max_entries(1024, 0);
+/// Session control (§5.1/§5.4/§5.5): EXPECTED / epoch / SKIP-ALL /
+/// governor threshold. Loader-programmed at attach.
+#[map]
+static CTRL: Array<CtrlValue> = Array::with_max_entries(1, 0);
+/// Entry-hit attempts (§5.5): every hit including skips. Per-CPU
+/// array; userspace sums. ATTEMPT − CALLS = skipped queries.
+#[map]
+static ATTEMPT: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
 
 /// Per-CPU counter add (F-C/A8): shared-map lookup–increment–
 /// replace loses concurrent increments across CPUs, and `core`

@@ -18,6 +18,39 @@ pub const fn split_key(key: u64) -> (u32, u32) {
     ((key >> 32) as u32, key as u32)
 }
 
+/// Invocation sequence fold (P7 item 3, §5.1): birth:16 | ctr:48.
+/// Never reused across eviction or tid-reuse (SEQ map is
+/// supersede-only); the counter saturates (never wraps — a wrap
+/// would silently reuse an id).
+pub const SEQ_CTR_MASK: u64 = (1 << 48) - 1;
+pub const SEQ_CTR_MAX: u64 = (1 << 48) - 1;
+/// Birth value that freezes a tid (64k incarnations exhausted —
+/// fail-closed SKIP, §5.1).
+pub const BIRTH_FROZEN: u16 = u16::MAX;
+
+pub const fn make_seq(birth: u16, ctr: u64) -> u64 {
+    ((birth as u64) << 48) | (ctr & SEQ_CTR_MASK)
+}
+
+pub const fn split_seq(seq: u64) -> (u16, u64) {
+    ((seq >> 48) as u16, seq & SEQ_CTR_MASK)
+}
+
+/// Next counter value: saturates at 48 bits (the saturated regime
+/// yields duplicate seqs, which §5.2 rule 2 taints as
+/// NESTED-PARTIAL — honest degradation in an unreachable regime).
+pub const fn seq_ctr_next(ctr: u64) -> u64 {
+    if ctr >= SEQ_CTR_MAX {
+        SEQ_CTR_MAX
+    } else {
+        ctr + 1
+    }
+}
+
+pub const fn birth_frozen(birth: u16) -> bool {
+    birth == BIRTH_FROZEN
+}
+
 /// Per-key aggregate. `count` saturates (never wraps);
 /// `first_ns`/`last_ns` are `bpf_ktime_get_ns` window bounds, NOT
 /// latency (latency is v2+). 24 bytes, align 8.
@@ -105,6 +138,15 @@ pub const KIND_QUERY_RET: u32 = 2;
 pub const KIND_ROW: u32 = 3;
 pub const KIND_ALG: u32 = 4;
 pub const KIND_TRIP: u32 = 5;
+/// Scan-plane kinds (P7 item 3, members ring only): the §5.1
+/// QUERY_CALL take record, the §5.3 QUERY_RET member-0 return
+/// marker, and the §5.3 guard verdict. Fresh numbers — `KIND_QUERY_RET
+/// = 2` is the sampler's row-shaped cursor marker on a different
+/// ring, and aliasing it would corrupt any future shared decode.
+/// v2 reshapes all events (item 7); the numbers stay.
+pub const KIND_SCAN_CALL: u32 = 7;
+pub const KIND_SCAN_RET: u32 = 8;
+pub const KIND_GUARD: u32 = 9;
 
 /// Kernel string-read windows (bytes, NUL-inclusive).
 pub const ALG_WINDOW: usize = 128;
@@ -178,6 +220,63 @@ pub const LOSS_INIT_SCAN: u32 = 15;
 /// disagrees with its link cookie — a loader slot-permutation bug,
 /// never a kernel event. Fail-closed: skip the slot, count it.
 pub const LOSS_MEMBER_COOKIE: u32 = 16;
+/// Scan-plane loss vocabulary (P7 item 3, §5.1/§5.3/§5.4): every
+/// skip cause and every scan-plane failure has a source-tagged
+/// counter (userspace forces PARTIAL on any nonzero entry).
+/// 17–26 predate the ring trio; all fit the 32-cell LOSS map.
+pub const LOSS_BIRTH_PENDING: u32 = 17;
+pub const LOSS_SEQ_FULL: u32 = 18;
+pub const LOSS_BIRTH_WRAP: u32 = 19;
+pub const LOSS_SCAN_EVICTED: u32 = 20;
+pub const LOSS_RETIRE_FAIL: u32 = 21;
+pub const LOSS_GUARD_READ_ABORT: u32 = 22;
+pub const LOSS_RING_PRESSURE: u32 = 23;
+pub const LOSS_ENTRY_COOKIE: u32 = 24;
+pub const LOSS_SCAN_CHURNED: u32 = 25;
+pub const LOSS_SKIP_ALL: u32 = 26;
+pub const LOSS_RING_CALL: u32 = 27;
+pub const LOSS_RING_RET: u32 = 28;
+pub const LOSS_RING_GUARD: u32 = 29;
+
+/// Entry skip causes (P7 item 3): the `ScanCallEvent.flags` cause
+/// field. 0 = admitted (no counter); each nonzero cause maps to
+/// its loss-proof counter via [`loss_for_skip_cause`].
+pub const SKIP_ADMITTED: u8 = 0;
+pub const SKIP_BIRTH_PENDING: u8 = 1;
+pub const SKIP_SEQ_FULL: u8 = 2;
+pub const SKIP_BIRTH_WRAP: u8 = 3;
+pub const SKIP_RING_PRESSURE: u8 = 4;
+pub const SKIP_ALL: u8 = 5;
+pub const SKIP_ENTRY_COOKIE: u8 = 6;
+
+/// `ScanCallEvent.flags` layout: bit 0 = NESTED_HINT (advisory —
+/// §5.2 rules corroborate); cause in bits 8..16; all other bits
+/// reserved zero (parsers reject nonzero reserved bits).
+pub const CALL_FLAG_NESTED_HINT: u32 = 1 << 0;
+pub const CALL_CAUSE_SHIFT: u32 = 8;
+
+pub const fn make_call_flags(hint: bool, cause: u8) -> u32 {
+    ((hint as u32) & 1) | ((cause as u32) << CALL_CAUSE_SHIFT)
+}
+
+pub const fn split_call_flags(flags: u32) -> (bool, u8) {
+    (flags & 1 != 0, ((flags >> CALL_CAUSE_SHIFT) & 0xFF) as u8)
+}
+
+/// Loss-proof counter for a skip cause (0 = none — admitted
+/// queries are counted in CALLS, not LOSS). Callers only pass
+/// parse-gated causes 0..=6.
+pub const fn loss_for_skip_cause(cause: u8) -> u32 {
+    match cause {
+        SKIP_BIRTH_PENDING => LOSS_BIRTH_PENDING,
+        SKIP_SEQ_FULL => LOSS_SEQ_FULL,
+        SKIP_BIRTH_WRAP => LOSS_BIRTH_WRAP,
+        SKIP_RING_PRESSURE => LOSS_RING_PRESSURE,
+        SKIP_ALL => LOSS_SKIP_ALL,
+        SKIP_ENTRY_COOKIE => LOSS_ENTRY_COOKIE,
+        _ => 0,
+    }
+}
 
 /// Member-entry attach cookie (P7 item 2, single source for BPF +
 /// host): the loader attaches `member_entry` with this cookie and
@@ -211,6 +310,55 @@ pub struct PendQuery {
 }
 
 const _: () = assert!(size_of::<PendQuery>() == 16);
+
+/// `SCAN[tid]` record (P7 item 3, §5.1): one in-flight scan per
+/// thread. The ENTRY prog is the sole writer (taker semantics);
+/// members are peek-only readers. No T/proof fields (entry fires
+/// before the array address exists — T lives in `T_CACHE`, proofs
+/// in WALK-DONE/GUARD). 40 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScanRec {
+    pub op: u64,
+    pub ns_ptr: u64,
+    pub seq: u64,
+    pub expected: u32,
+    pub _pad: u32,
+    pub epoch: u64,
+}
+
+const _: () = assert!(size_of::<ScanRec>() == 40);
+const _: () = assert!(align_of::<ScanRec>() == 8);
+
+/// `T_CACHE[array]` entry (P7 item 3, §5.3): terminator index +
+/// generation, single-userspace-writer. Members peek + validate
+/// GEN (already in the walk path) and skip-silent past T.
+/// 16 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TCacheValue {
+    pub t: u64,
+    pub generation: u64,
+}
+
+const _: () = assert!(size_of::<TCacheValue>() == 16);
+
+/// `CTRL[0]` session control (P7 item 3, §5.1/§5.4/§5.5):
+/// userspace-owned EXPECTED / membership-epoch / SKIP-ALL /
+/// governor threshold (bytes of ring headroom required to
+/// admit). Programmed by the loader at attach. 24 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CtrlValue {
+    pub expected: u32,
+    pub skip_all: u8,
+    pub _pad: [u8; 3],
+    pub epoch: u64,
+    pub governor: u64,
+}
+
+const _: () = assert!(size_of::<CtrlValue>() == 24);
+const _: () = assert!(align_of::<CtrlValue>() == 8);
 
 /// Trip classes (u16 wire). Engine and load taxonomies share the
 /// numeric space; the probe program (cookie context) selects the
@@ -302,6 +450,71 @@ pub struct InitRetEvent {
 
 const _: () = assert!(size_of::<InitRetEvent>() == 32);
 const _: () = assert!(align_of::<InitRetEvent>() == 8);
+
+/// Entry take record (P7 item 3, §5.1 QUERY_CALL): one per entry
+/// hit, admitted or skipped-with-cause, so userspace sees every
+/// attempt (skips are evidence, never silence). `seq` is the
+/// birth:16|ctr:48 fold, minted only on the admit path (every
+/// skip gate precedes the SEQ step, so all skips carry seq 0).
+/// 24 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScanCallEvent {
+    pub kind: u32,
+    pub op: u32,
+    pub tid: u32,
+    pub flags: u32,
+    pub seq: u64,
+}
+
+const _: () = assert!(size_of::<ScanCallEvent>() == 24);
+const _: () = assert!(align_of::<ScanCallEvent>() == 8);
+
+/// Member-0 return marker (P7 item 3, §5.3 QUERY_RET): one per
+/// admitted invocation, emitted early (a slot-0 read abort must
+/// still present RET, else HOLE-0 is indistinguishable from
+/// abort). rv == 0 sets EMPTY (COMPLETE-EMPTY, members 1..511
+/// silent). 32 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScanRetEvent {
+    pub kind: u32,
+    pub op: u32,
+    pub flags: u32,
+    pub _pad: u32,
+    pub arr: u64,
+    pub generation: u64,
+}
+
+const _: () = assert!(size_of::<ScanRetEvent>() == 32);
+const _: () = assert!(align_of::<ScanRetEvent>() == 8);
+
+/// `ScanRetEvent.flags`: rv == 0 (COMPLETE-EMPTY).
+pub const RET_FLAG_EMPTY: u32 = 1 << 0;
+
+/// 511-guard verdict (P7 item 3, §5.3 T = 512 exception): member
+/// 511 also reads slot 512 on warm-T==512 scans. EMPTY = clean-full
+/// proof; VALID = contract violation (TRUNC_ALGS too); ERROR =
+/// read-abort/UNKNOWN-TERMINATOR (LOSS_GUARD_READ_ABORT too,
+/// re-covers on retry). 32 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GuardEvent {
+    pub kind: u32,
+    pub op: u32,
+    pub verdict: u32,
+    pub _pad: u32,
+    pub arr: u64,
+    pub generation: u64,
+}
+
+const _: () = assert!(size_of::<GuardEvent>() == 32);
+const _: () = assert!(align_of::<GuardEvent>() == 8);
+
+pub const GUARD_EMPTY: u32 = 0;
+pub const GUARD_VALID: u32 = 1;
+pub const GUARD_ERROR: u32 = 2;
+pub const GUARD_VERDICT_MAX: u32 = GUARD_ERROR;
 
 /// `ALG_CLASS` map value, keyed by FNV-1a-64 of the exact registry
 /// spelling: 42 bytes. Membership is hash+exact-length (`len` is
@@ -865,6 +1078,47 @@ pub fn parse_init_ret_event(b: &[u8]) -> Result<InitRetEvent, WireErr> {
     Ok(e)
 }
 
+/// Decode one `ScanCallEvent`: exact size + kind + cause range +
+/// zero reserved flag bits (bit 0 hint, cause bits 8..16).
+pub fn parse_scan_call_event(b: &[u8]) -> Result<ScanCallEvent, WireErr> {
+    let e: ScanCallEvent = read_event(b).ok_or(WireErr::Length)?;
+    if e.kind != KIND_SCAN_CALL {
+        return Err(WireErr::Kind);
+    }
+    let (hint, cause) = split_call_flags(e.flags);
+    if cause > SKIP_ENTRY_COOKIE {
+        return Err(WireErr::StatusRange);
+    }
+    if e.flags != make_call_flags(hint, cause) {
+        return Err(WireErr::StatusRange);
+    }
+    Ok(e)
+}
+
+/// Decode one `ScanRetEvent`: exact size + kind + EMPTY-only flags.
+pub fn parse_scan_ret_event(b: &[u8]) -> Result<ScanRetEvent, WireErr> {
+    let e: ScanRetEvent = read_event(b).ok_or(WireErr::Length)?;
+    if e.kind != KIND_SCAN_RET {
+        return Err(WireErr::Kind);
+    }
+    if e.flags & !RET_FLAG_EMPTY != 0 {
+        return Err(WireErr::StatusRange);
+    }
+    Ok(e)
+}
+
+/// Decode one `GuardEvent`: exact size + kind + verdict range.
+pub fn parse_guard_event(b: &[u8]) -> Result<GuardEvent, WireErr> {
+    let e: GuardEvent = read_event(b).ok_or(WireErr::Length)?;
+    if e.kind != KIND_GUARD {
+        return Err(WireErr::Kind);
+    }
+    if e.verdict > GUARD_VERDICT_MAX {
+        return Err(WireErr::StatusRange);
+    }
+    Ok(e)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -971,5 +1225,156 @@ mod tests {
         });
         assert_eq!(a.count, u64::MAX);
         assert_eq!((a.first_ns, a.last_ns), (0, 99));
+    }
+
+    #[test]
+    fn scan_wire_shapes() {
+        // Map-value + event layouts (P7 item 3 §2): exact wire.
+        assert_eq!(size_of::<ScanRec>(), 40);
+        assert_eq!(align_of::<ScanRec>(), 8);
+        assert_eq!(size_of::<TCacheValue>(), 16);
+        assert_eq!(size_of::<CtrlValue>(), 24);
+        assert_eq!(align_of::<CtrlValue>(), 8);
+        assert_eq!(size_of::<ScanCallEvent>(), 24);
+        assert_eq!(size_of::<ScanRetEvent>(), 32);
+        assert_eq!(size_of::<GuardEvent>(), 32);
+        assert_eq!(
+            (KIND_SCAN_CALL, KIND_SCAN_RET, KIND_GUARD),
+            (7, 8, 9),
+            "fresh kinds, no sampler aliasing"
+        );
+        // Tuples cap at 12 for PartialEq — two asserts.
+        assert_eq!(
+            (
+                LOSS_BIRTH_PENDING,
+                LOSS_SEQ_FULL,
+                LOSS_BIRTH_WRAP,
+                LOSS_SCAN_EVICTED,
+                LOSS_RETIRE_FAIL,
+                LOSS_GUARD_READ_ABORT,
+                LOSS_RING_PRESSURE,
+            ),
+            (17, 18, 19, 20, 21, 22, 23)
+        );
+        assert_eq!(
+            (
+                LOSS_ENTRY_COOKIE,
+                LOSS_SCAN_CHURNED,
+                LOSS_SKIP_ALL,
+                LOSS_RING_CALL,
+                LOSS_RING_RET,
+                LOSS_RING_GUARD
+            ),
+            (24, 25, 26, 27, 28, 29)
+        );
+    }
+
+    #[test]
+    fn seq_fold_unfold_saturates() {
+        assert_eq!(split_seq(make_seq(1, 0)), (1, 0));
+        assert_eq!(
+            split_seq(make_seq(0xABCD, (1 << 48) - 1)),
+            (0xABCD, (1 << 48) - 1)
+        );
+        // ctr wider than 48 bits truncates into the fold (callers
+        // saturate before folding — never wrap-and-reuse).
+        assert_eq!(split_seq(make_seq(2, 1 << 48)), (2, 0));
+        assert_eq!(seq_ctr_next((1 << 48) - 1), (1 << 48) - 1, "saturates");
+        assert_eq!(seq_ctr_next(41), 42);
+        assert!(!birth_frozen(0));
+        assert!(!birth_frozen(u16::MAX - 1));
+        assert!(birth_frozen(u16::MAX), "MAX birth freezes the tid");
+    }
+
+    #[test]
+    fn skip_cause_vocabulary() {
+        // Every skip cause maps to its loss-proof counter.
+        assert_eq!(
+            (
+                SKIP_ADMITTED,
+                SKIP_BIRTH_PENDING,
+                SKIP_SEQ_FULL,
+                SKIP_BIRTH_WRAP,
+                SKIP_RING_PRESSURE,
+                SKIP_ALL,
+                SKIP_ENTRY_COOKIE
+            ),
+            (0, 1, 2, 3, 4, 5, 6)
+        );
+        assert_eq!(loss_for_skip_cause(SKIP_BIRTH_PENDING), LOSS_BIRTH_PENDING);
+        assert_eq!(loss_for_skip_cause(SKIP_SEQ_FULL), LOSS_SEQ_FULL);
+        assert_eq!(loss_for_skip_cause(SKIP_BIRTH_WRAP), LOSS_BIRTH_WRAP);
+        assert_eq!(loss_for_skip_cause(SKIP_RING_PRESSURE), LOSS_RING_PRESSURE);
+        assert_eq!(loss_for_skip_cause(SKIP_ALL), LOSS_SKIP_ALL);
+        assert_eq!(loss_for_skip_cause(SKIP_ENTRY_COOKIE), LOSS_ENTRY_COOKIE);
+        // CALL flags: hint bit + cause nibble roundtrip.
+        assert_eq!(
+            split_call_flags(make_call_flags(true, SKIP_SEQ_FULL)),
+            (true, SKIP_SEQ_FULL)
+        );
+        assert_eq!(
+            split_call_flags(make_call_flags(false, SKIP_ADMITTED)),
+            (false, SKIP_ADMITTED)
+        );
+    }
+
+    #[test]
+    fn scan_event_parse_strict() {
+        // Roundtrips.
+        let call = ScanCallEvent {
+            kind: KIND_SCAN_CALL,
+            op: 3,
+            tid: 4242,
+            flags: make_call_flags(true, SKIP_RING_PRESSURE),
+            seq: make_seq(7, 9),
+        };
+        let cb = struct_bytes::<_, 24>(&call);
+        assert_eq!(parse_scan_call_event(&cb), Ok(call));
+        let ret = ScanRetEvent {
+            kind: KIND_SCAN_RET,
+            op: 3,
+            flags: RET_FLAG_EMPTY,
+            _pad: 0,
+            arr: 0x5000,
+            generation: 0,
+        };
+        let rb = struct_bytes::<_, 32>(&ret);
+        assert_eq!(parse_scan_ret_event(&rb), Ok(ret));
+        let guard = GuardEvent {
+            kind: KIND_GUARD,
+            op: 3,
+            verdict: GUARD_VALID,
+            _pad: 0,
+            arr: 0x5000,
+            generation: 0,
+        };
+        let gb = struct_bytes::<_, 32>(&guard);
+        assert_eq!(parse_guard_event(&gb), Ok(guard));
+        // Rejections: short, wrong kind, out-of-range cause /
+        // verdict, nonzero reserved flag bits.
+        assert_eq!(parse_scan_call_event(&cb[..8]), Err(WireErr::Length));
+        let mut bad = cb;
+        bad[0..4].copy_from_slice(&KIND_ROW.to_le_bytes());
+        assert_eq!(parse_scan_call_event(&bad), Err(WireErr::Kind));
+        let mut bad = cb;
+        bad[12..16].copy_from_slice(&make_call_flags(false, 7).to_le_bytes());
+        assert_eq!(parse_scan_call_event(&bad), Err(WireErr::StatusRange));
+        let mut bad = cb;
+        bad[12..16].copy_from_slice(&0x02u32.to_le_bytes());
+        assert_eq!(parse_scan_call_event(&bad), Err(WireErr::StatusRange));
+        let mut bad = rb;
+        bad[8..12].copy_from_slice(&0x02u32.to_le_bytes());
+        assert_eq!(parse_scan_ret_event(&bad), Err(WireErr::StatusRange));
+        let mut bad = gb;
+        bad[8..12].copy_from_slice(&3u32.to_le_bytes());
+        assert_eq!(parse_guard_event(&bad), Err(WireErr::StatusRange));
+    }
+
+    /// Native-endian struct bytes (same-host wire, like the ring).
+    fn struct_bytes<T: Copy, const N: usize>(v: &T) -> [u8; N] {
+        assert_eq!(size_of::<T>(), N);
+        let mut b = [0u8; N];
+        unsafe { b.as_mut_ptr().cast::<T>().write_unaligned(*v) };
+        b
     }
 }

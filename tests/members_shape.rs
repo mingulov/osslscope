@@ -2,7 +2,7 @@
 //!
 //! Pins the `osslscope-members` object contract via the pure
 //! `loader::prepare` path (no caps needed): 513 progs (512 baked-slot
-//! members + entry), exact 7-map dims, baked-slot distinctness, a
+//! members + entry), exact 14-map dims, baked-slot distinctness, a
 //! forbidden-helper scan, and size records. Behavioral proof (baking,
 //! walk contents) is the live `members_probe` suite's job.
 //!
@@ -176,7 +176,7 @@ fn s1_prepare_513() {
         return;
     };
     assert_eq!(prep.progs.len(), 513, "512 members + member_entry");
-    assert_eq!(prep.maps.len(), 7, "exactly the 7 member maps");
+    assert_eq!(prep.maps.len(), 14, "exactly the 14 member maps");
 }
 
 /// S2: symbol names and entry/return sections.
@@ -216,7 +216,8 @@ fn s3_bodies_distinct() {
     assert_eq!(hashes.len(), 512, "all 512 member bodies distinct");
 }
 
-/// S4: the 7 map dims pinned (mirror of harvest dims).
+/// S4: the 14 map dims pinned (7 item-2 + 7 item-3 scan-plane;
+/// PENDING drops in subtask C — end state 13).
 #[test]
 fn s4_map_dims() {
     let Some(prep) = prepared() else {
@@ -231,6 +232,15 @@ fn s4_map_dims() {
         ("TRUNC", 5, 4, 8, 64, 0),
         ("CALLS", 5, 4, 8, 64, 0),
         ("ALG_CLASS", 1, 8, 42, 1024, 0),
+        // Item-3 scan plane (bridge: PENDING drops in subtask C
+        // when members switch to SCAN; end state is 13).
+        ("SCAN", 9, 4, 40, 1024, 0),
+        ("SEQ", 1, 4, 8, 4096, 0),
+        ("BIRTH", 1, 4, 2, 4096, 0),
+        ("RCOUNT", 1, 4, 8, 4096, 0),
+        ("T_CACHE", 1, 8, 16, 1024, 0),
+        ("CTRL", 2, 4, 24, 1, 0),
+        ("ATTEMPT", 6, 4, 8, 1, 0),
     ];
     assert_eq!(prep.maps.len(), want.len());
     for (got, w) in prep.maps.iter().zip(want.iter()) {

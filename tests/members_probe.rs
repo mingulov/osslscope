@@ -672,7 +672,7 @@ fn l1_load_513_margins() {
     };
     let loaded = load_members(&obj);
     assert_eq!(loaded.progs.len(), 513, "all member progs loaded");
-    assert_eq!(loaded.maps.len(), 7, "all member maps created");
+    assert_eq!(loaded.maps.len(), 14, "all member maps created");
     let mut lens: Vec<(String, usize)> = loaded
         .progs
         .iter()
