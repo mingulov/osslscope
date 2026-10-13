@@ -317,7 +317,7 @@ pub const HARVEST_PROGS: [ProgSpec; 15] = [
     },
 ];
 
-/// Frozen member shape (P7 item 3, stage D): dims asserted vs
+/// Frozen member shape (P7 items 3–5): dims asserted vs
 /// `osslscope-members` by `prepare`, fail-closed on drift. The
 /// first 6 mirror harvest dims; TERMD/LGCALLS/QUERY_NEXT are
 /// deliberately absent (single-site CALLS only, no cursor — every
@@ -325,14 +325,23 @@ pub const HARVEST_PROGS: [ProgSpec; 15] = [
 /// scan plane (SCAN/SEQ/BIRTH/RCOUNT/T_CACHE/CTRL/ATTEMPT)
 /// arrives with item 3; members.o dropped its PENDING_QUERY
 /// scaffold in stage D when members switched to SCAN (R18 §6.1;
-/// the harvest path's cursor maps retire in item 9).
-pub const MEMBER_MAPS: [MapSpec; 13] = [
+/// the harvest path's cursor maps retire in item 9). Item 5 adds
+/// the tier-1 BUCKET map; item 7 grows EVENTS to 16MiB.
+pub const MEMBER_MAPS: [MapSpec; 14] = [
     MapSpec {
         name: "EVENTS",
         map_type: 27,
         key_size: 0,
         value_size: 0,
-        max_entries: 1 << 21,
+        max_entries: 1 << 24,
+        flags: 0,
+    },
+    MapSpec {
+        name: "BUCKET",
+        map_type: 1,
+        key_size: 4,
+        value_size: 8,
+        max_entries: 4096,
         flags: 0,
     },
     MapSpec {
@@ -2039,8 +2048,9 @@ pub fn ensure_members_fd_budget() -> anyhow::Result<()> {
 }
 
 /// Member-object EVENTS ring size in bytes (pinned here and in
-/// `MEMBER_MAPS`; item 7 grows it to 16MiB).
-pub const MEMBER_RING_BYTES: u64 = 1 << 21;
+/// `MEMBER_MAPS`; item 7 grew it to 16MiB — the 4MiB governor
+/// policy value is now live, not the small-ring fixture half).
+pub const MEMBER_RING_BYTES: u64 = 1 << 24;
 
 /// Production session-control value (R18 §5): EXPECTED = attached
 /// member count (1..=512 — item 6 programs fewer legitimately),
@@ -2108,6 +2118,80 @@ pub struct MembersAttached {
     pub loaded: Loaded,
     pub entry: OwnedFd,
     pub members: Vec<OwnedFd>,
+}
+
+/// Selective member attach (item 6): entry + exactly `slots`
+/// (cookie = slot), EXPECTED programmed from `ctrl` (which MUST
+/// equal `slots.len()` — the retire equation counts attached
+/// members; mismatch fails fast here, never silently in BPF).
+/// Unattached slots are OUT OF SCOPE (the oracle reports them as
+/// unobserved, never as holes — holes are missing evidence
+/// WITHIN the attached set). The entry is always attached (the
+/// CALLS census and the oracle's join root never drop). Order of
+/// `slots` is normalized (sorted, deduped); empty sets are
+/// rejected (a scan with no members retires nothing — attach
+/// nothing instead).
+pub fn attach_members_subset(
+    obj: &std::path::Path,
+    exe: &std::ffi::CStr,
+    off: u64,
+    pid: u32,
+    ctrl: &osslscope_ebpf_common::CtrlValue,
+    slots: &[u32],
+) -> anyhow::Result<MembersAttached> {
+    use anyhow::Context as _;
+    let mut want: Vec<u32> = slots.to_vec();
+    want.sort_unstable();
+    want.dedup();
+    if want.is_empty() {
+        anyhow::bail!("selective attach with no members");
+    }
+    if want.iter().any(|&j| j >= 512) {
+        anyhow::bail!("selective attach slot exceeds 511");
+    }
+    if ctrl.expected as usize != want.len() {
+        anyhow::bail!(
+            "CTRL EXPECTED {} != {} attached members",
+            ctrl.expected,
+            want.len()
+        );
+    }
+    ensure_members_fd_budget()?;
+    let bytes = std::fs::read(obj).with_context(|| format!("read {}", obj.display()))?;
+    let prep = prepare(&bytes, &MEMBER_MAPS, &MEMBER_PROGS).context("prepare members.o")?;
+    let loaded = load(&prep).context("load members.o")?;
+    program_ctrl(&loaded.maps, ctrl).context("program CTRL")?;
+    let entry = ossl_bpf_sys::link_create_uprobe_multi(
+        loaded.progs["member_entry"].as_raw_fd(),
+        exe,
+        &[off],
+        &[osslscope_ebpf_common::MEMBER_ENTRY_COOKIE],
+        pid,
+    )
+    .context("attach member_entry")?;
+    let mut members = Vec::with_capacity(want.len());
+    for j in want {
+        let name = format!("member_{j:03}");
+        let prog = loaded
+            .progs
+            .get(&name)
+            .with_context(|| format!("prog {name} missing"))?;
+        members.push(
+            ossl_bpf_sys::link_create_uretprobe_multi(
+                prog.as_raw_fd(),
+                exe,
+                &[off],
+                &[j as u64],
+                pid,
+            )
+            .with_context(|| format!("attach {name}"))?,
+        );
+    }
+    Ok(MembersAttached {
+        loaded,
+        entry,
+        members,
+    })
 }
 
 /// Production attach of the member chunk: fd budget → prepare →
@@ -3673,9 +3757,9 @@ mod tests {
     #[test]
     fn member_map_count_covers_scan_plane() {
         // The spec count is the prepare-time contract: 6 retained
-        // maps + the 7 scan-plane maps (stage D dropped PENDING —
-        // R18 §6.1 — → 13).
-        assert_eq!(MEMBER_MAPS.len(), 13);
+        // maps + the 7 scan-plane maps + item-5 BUCKET (stage D
+        // dropped PENDING — R18 §6.1 — → 13, then +1 → 14).
+        assert_eq!(MEMBER_MAPS.len(), 14);
         assert!(
             MEMBER_MAPS.iter().all(|m| m.name != "PENDING_QUERY"),
             "PENDING dropped in D"
@@ -3698,14 +3782,31 @@ mod tests {
         let c = default_ctrl(512, MEMBER_RING_BYTES).unwrap();
         assert_eq!(
             (c.expected, c.skip_all, c.epoch, c.governor),
-            (512, 0, 1, 1 << 20),
-            "2MiB ring: small-ring fixture half"
+            (512, 0, 1, 4 << 20),
+            "16MiB ring: 4MiB policy live"
         );
-        let c16 = default_ctrl(512, 1 << 24).unwrap();
-        assert_eq!(c16.governor, 4 << 20, "16MiB ring: 4MiB policy");
+        let c2 = default_ctrl(512, 1 << 21).unwrap();
+        assert_eq!(c2.governor, 1 << 20, "2MiB ring: small-ring fixture half");
         let sub = default_ctrl(7, MEMBER_RING_BYTES).unwrap();
         assert_eq!(sub.expected, 7, "item-6 selective EXPECTED allowed");
         assert!(default_ctrl(0, MEMBER_RING_BYTES).is_err());
         assert!(default_ctrl(513, MEMBER_RING_BYTES).is_err());
+    }
+
+    #[test]
+    fn attach_subset_validates_before_load() {
+        // Item 6: slot/EXPECTED validation precedes the fd budget
+        // and load — these fail offline (no object needed): empty
+        // slots, slot 512, and EXPECTED != slots.len() (the
+        // retire equation counts attached members; mismatch fails
+        // fast here, never silently in BPF).
+        use std::ffi::CString;
+        let exe = CString::new("/nonexistent").unwrap();
+        let obj = std::path::Path::new("/nonexistent.o");
+        let ctrl4 = default_ctrl(4, MEMBER_RING_BYTES).unwrap();
+        let ctrl5 = default_ctrl(5, MEMBER_RING_BYTES).unwrap();
+        assert!(attach_members_subset(obj, &exe, 0, 1, &ctrl4, &[]).is_err());
+        assert!(attach_members_subset(obj, &exe, 0, 1, &ctrl4, &[0, 512]).is_err());
+        assert!(attach_members_subset(obj, &exe, 0, 1, &ctrl5, &[0, 1, 2, 3]).is_err());
     }
 }

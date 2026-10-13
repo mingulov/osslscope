@@ -114,10 +114,11 @@ fn map_inventory_matches_sources() {
         "unexpected count map count: {src_count:?}"
     );
     // Stage D dropped PENDING (members read SCAN — R18 §6.1);
-    // end state 13 (the doc section moves with the stage).
+    // item 5 re-added BUCKET (tier-1 per-tid rate state) —
+    // end state 14 (the doc section moves with the stage).
     assert_eq!(
         src_members.len(),
-        13,
+        14,
         "unexpected members map count: {src_members:?}"
     );
     assert!(
