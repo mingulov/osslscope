@@ -2021,11 +2021,15 @@ pub fn adapt_delta(
 /// [`build`](Self::build) joins counts to meanings + pins +
 /// fingerprinted objects. Baseline/straddle gating stays with the
 /// caller (only in-window news reaches `accumulate`).
+/// Pinned attach identity per (module, program) group for one
+/// binding generation: (device id, inode).
+type TripGroupPins = HashMap<(String, String), (u64, u64)>;
+
 #[derive(Debug, Default)]
 pub struct EngineCollector {
     counts: HashMap<(u64, u64), u64>,
     probes: HashMap<u64, legacy::ProbeSet>,
-    pins: HashMap<u64, HashMap<String, (u64, u64)>>,
+    pins: HashMap<u64, TripGroupPins>,
     probed_generation: Option<u64>,
 }
 
@@ -2034,8 +2038,11 @@ impl EngineCollector {
         Self::default()
     }
 
-    /// Snapshot a bound generation's probe meanings + module pins
+    /// Snapshot a bound generation's probe meanings + group pins
     /// (once per generation). An absent binding consumes nothing.
+    /// Pins key per (module, program) attach group (fix-round-2
+    /// F1): one pathname bound through two programs keeps both
+    /// bindings.
     pub fn snapshot_binding(
         &mut self,
         generation: u64,
@@ -2045,10 +2052,10 @@ impl EngineCollector {
         if self.probed_generation != Some(generation) {
             if let Some(set) = probe_set {
                 self.probed_generation = Some(generation);
-                let mut pins: HashMap<String, (u64, u64)> = HashMap::new();
+                let mut pins: TripGroupPins = HashMap::new();
                 for p in module_pins {
                     if let Some(device) = plan::device_id_of_dev_str(&p.dev) {
-                        pins.insert(p.module.clone(), (device, p.ino));
+                        pins.insert((p.module.clone(), p.program.clone()), (device, p.ino));
                     }
                 }
                 self.pins.insert(generation, pins);
@@ -2107,7 +2114,8 @@ impl EngineCollector {
                 reject();
                 continue;
             };
-            let Some((device, ino)) = pins.get(&probe.module) else {
+            let group = (probe.module.clone(), probe.program.to_string());
+            let Some((device, ino)) = pins.get(&group) else {
                 reject();
                 continue;
             };
@@ -6407,6 +6415,7 @@ mod tests {
                 Some(set),
                 &[crate::discovery::session::TripModulePin {
                     module: "/app/caller.so".to_string(),
+                    program: "trip_count".to_string(),
                     dev: "08:01".to_string(),
                     ino: 200,
                 }],
@@ -6500,11 +6509,13 @@ mod tests {
                 &[
                     crate::discovery::session::TripModulePin {
                         module: "/app/a.so".to_string(),
+                        program: "trip_count".to_string(),
                         dev: "08:01".to_string(),
                         ino: 201,
                     },
                     crate::discovery::session::TripModulePin {
                         module: "/app/b.so".to_string(),
+                        program: "trip_count".to_string(),
                         dev: "08:01".to_string(),
                         ino: 202,
                     },
@@ -6522,6 +6533,100 @@ mod tests {
             }
             let inos: Vec<u64> = obs.iter().map(|o| o.key.inode).collect();
             assert!(inos.contains(&201) && inos.contains(&202));
+        }
+
+        #[test]
+        fn engine_observations_attribute_per_program_binding() {
+            // Fix-round-2 F1 RED: the pin-collapse schedule — one
+            // pathname bound through two (module, program) groups
+            // (`trip_count` through inode A, `trip_str0` through
+            // inode B after a pathname replacement). Each cookie
+            // must attribute to its own group's inode; attributing
+            // both to one collapses distinct bindings.
+            let cfg = stub_config();
+            let info = stub_info();
+            let clock = ClockStub::at(1_500);
+            let mut proc = ProcStub;
+            let cancelled = || false;
+            let count = CountSession::new(TPID, FakeCountBackend::new());
+            let mut runner = stub_runner(
+                &cfg,
+                &info,
+                DiscoveryStub {
+                    finish_err: false,
+                    poll_err: false,
+                    dispatch_attached: false,
+                    trip_set: None,
+                },
+                count,
+                &clock,
+                &mut proc,
+                &cancelled,
+            );
+            let device = plan::device_id_of_dev_str("08:01").unwrap();
+            for (id, ino) in [("build:a", 300), ("build:b", 301)] {
+                runner.adapter.objects.push(ObjectRecord {
+                    id: ObjectId(id.to_string()),
+                    device,
+                    inode: ino,
+                    display_locator: "/app/target".to_string(),
+                });
+            }
+            let mut set = legacy::ProbeSet::default();
+            set.probes = vec![
+                legacy::Probe {
+                    cookie: 7,
+                    symbol: "ENGINE_init".to_string(),
+                    offset: 0x100,
+                    module: "/app/target".to_string(),
+                    family: None,
+                    str_arg: None,
+                    program: "trip_count",
+                },
+                legacy::Probe {
+                    cookie: 8,
+                    symbol: "ENGINE_by_id".to_string(),
+                    offset: 0x200,
+                    module: "/app/target".to_string(),
+                    family: None,
+                    str_arg: Some(0),
+                    program: "trip_str0",
+                },
+            ];
+            set.libcrypto = Some(("/lib/libcrypto.so.3".to_string(), "08:01".to_string(), 100));
+            runner.engine_collector.snapshot_binding(
+                0,
+                Some(set),
+                &[
+                    crate::discovery::session::TripModulePin {
+                        module: "/app/target".to_string(),
+                        program: "trip_count".to_string(),
+                        dev: "08:01".to_string(),
+                        ino: 300,
+                    },
+                    crate::discovery::session::TripModulePin {
+                        module: "/app/target".to_string(),
+                        program: "trip_str0".to_string(),
+                        dev: "08:01".to_string(),
+                        ino: 301,
+                    },
+                ],
+            );
+            runner
+                .engine_collector
+                .accumulate(0, &[(7, 3), (8, 5)], &[]);
+            let (obs, unkeyed) = runner.build_engine_observations();
+            assert_eq!(unkeyed, 0);
+            assert_eq!(obs.len(), 2);
+            let by_offset = |off: u64| {
+                obs.iter()
+                    .find(|o| o.key.offset == off)
+                    .unwrap_or_else(|| panic!("missing observation at {off:#x}: {obs:?}"))
+                    .key
+                    .inode
+            };
+            assert_eq!(by_offset(0x100), 300, "trip_count cookie joins inode A");
+            assert_eq!(by_offset(0x200), 301, "trip_str0 cookie joins inode B");
         }
 
         #[test]
@@ -6594,6 +6699,7 @@ mod tests {
                 trip_generation: 0,
                 trip_module_pins: vec![crate::discovery::session::TripModulePin {
                     module: "/app/caller.so".to_string(),
+                    program: "trip_count".to_string(),
                     dev: "08:01".to_string(),
                     ino: 200,
                 }],
@@ -6670,6 +6776,7 @@ mod tests {
             let pins = || {
                 vec![crate::discovery::session::TripModulePin {
                     module: "/app/caller.so".to_string(),
+                    program: "trip_count".to_string(),
                     dev: "08:01".to_string(),
                     ino: 200,
                 }]
@@ -6777,6 +6884,7 @@ mod tests {
                 trip_generation: 0,
                 trip_module_pins: vec![crate::discovery::session::TripModulePin {
                     module: "/app/caller.so".to_string(),
+                    program: "trip_count".to_string(),
                     dev: "08:01".to_string(),
                     ino: 200,
                 }],
