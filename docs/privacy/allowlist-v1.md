@@ -6,8 +6,13 @@ capture path may emit. Anything not listed is a bug.
 
 Scope: osslscope never captures crypto-derived secret bytes. The
 allowlisted process/observer metadata below is not target memory, but
-it can reflect operator input. In particular, `cmdline` is bounded
-process metadata: operators must not pass secrets as target argv.
+it can reflect operator input. Target argv is never copied into
+evidence, logs, or debug output: spawn argv and `/proc/<pid>/cmdline`
+both redact to the fixed `(argv-redacted)` placeholder, and v2
+documents carry unconditional `argv_redacted: true` with no raw
+argv/cmdline carrier anywhere. Operators must still not pass
+secrets as target argv -- argv stays visible system-wide via
+`/proc` regardless of what the observer retains.
 
 ## 1. eBPF count program
 
@@ -116,6 +121,21 @@ fault pages in before nofault BPF walks. Those bytes land in a
 throwaway sink buffer and are never stored, classified, logged, or
 emitted.
 
+Workload output routing (not capture): a spawned workload's
+stdout+stderr follow an explicit operator-chosen destination --
+`/dev/null` by default, `--workload-out FILE` (create+truncate
+per run), or `--workload-out-fd N` (a caller-held fd, validated
+pre-fork with `fcntl(F_GETFD)`; the child never closes the
+caller's descriptor). Explicit fd destinations intentionally
+control workload routing: passing an observer-held fd (1/2)
+routes workload bytes into that observer channel, which can
+corrupt `--format json` or mix workload secrets into captured
+diagnostics -- prefer null/default, a file, or an independent
+fd (e.g. a harness pipe) to keep the channels separate.
+Supported fds 1/2 are never silently rejected: parsing accepts
+any non-negative integer, and only a fd that is not open fails
+(a setup error before any spawn, never silent null).
+
 Non-target provenance:
 
 - `provider`: observer-chosen provider path stem, not target memory.
@@ -123,8 +143,11 @@ Non-target provenance:
 - `offset`: file offset, stable across ASLR.
 - `addr_hash`: one-way hash over the attested backing triple.
 - `target.comm`: `/proc/<pid>/comm` task name.
-- `target.cmdline`: rendered `/proc/<pid>/cmdline`, capped at 8 KiB
-  with a truncation marker.
+- `target.argv_redacted`: unconditional `true`. Raw argv/cmdline
+  has no carrier anywhere; where a cmdline-shaped string must
+  render, the fixed `(argv-redacted)` placeholder is used
+  (`inspect --marker` matches `/proc` cmdline at admission and
+  likewise emits nothing).
 - `target.container_id`: selected cgroup path segment, else empty.
 - `image_digest`: caller-supplied CI value, not observed.
 - `kernel`: observer `uname` release.
@@ -198,7 +221,7 @@ tables by op id only — no diagnostic prints raw array addresses
 
 `report` JSON and human output:
 
-- `schema_version`, target pid/comm/cmdline/container/image,
+- `schema_version`, target pid/comm (`argv_redacted: true`)/container/image,
   planned/actual window plus epoch edges, kernel, provider
   path/build-id, completeness status/reasons/counters, executions
   as cookie/provider/op/funcid/`alg_class`/offset/count/first/last
@@ -218,8 +241,9 @@ tables by op id only — no diagnostic prints raw array addresses
 - report document plus `policy`: verdict, rule results, violations,
   unseen deny providers, parameter-blind caveat, KAT caveat.
 - Each violation carries rule/matcher/identity plus the same
-  capture-level actionability tuple: window, cmdline, container,
-  image, provider path/build-id. ENGINE-plane violations carry the
+  capture-level actionability tuple: window, pid/comm/container,
+  image, provider path/build-id. No cmdline: argv is redacted
+  (see the Scope rule above). ENGINE-plane violations carry the
   observation key (object/device/inode/offset), generation,
   entrypoint index + name, untimed flag, and calls — the same
   allowlisted triple shape as sites, never raw addresses.
