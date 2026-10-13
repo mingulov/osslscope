@@ -1,9 +1,9 @@
 //! P7 item 2 live legs (privileged lane only): functional proof
 //! for the 512-member chunk — load-513 + per-prog xlated margins
 //! (L1), exact slot/dispatch contents on an E=7 fixture (L2, warm +
-//! cold), boundary fixtures (L3 empty/one/tail, L4 128/129
-//! dispatch, L6 512-clean/513-live), no_store (L5), and the
-//! cookie-mismatch negative (L7).
+//! cold), boundary fixtures (L3 empty/one/tail, L4
+//! 127-clean/128-edge/129 dispatch, L6 512-clean/513-live),
+//! no_store (L5), and the cookie-mismatch negative (L7).
 //!
 //! Own-process target: this binary exports `osslscope_member_query`
 //! (query_operation shape); tables live in memfd-backed mappings
@@ -23,8 +23,9 @@
 //! --test-threads=1 --ignored`. Single-threaded execution is
 //! load-bearing (the uprobe filter covers the whole thread group;
 //! a sibling thread's stray query call would inflate counts).
-//! Two legs (`target_resolves`, `fixture_builds`) run offline
-//! (pure, unprivileged) and gate the harness itself.
+//! Three legs (`target_resolves`, `fixture_builds`,
+//! `temp_probe_is_nondestructive`) run offline (pure, unprivileged)
+//! and gate the harness itself.
 
 use osslscope::loader::{Loaded, MEMBER_MAPS, MEMBER_PROGS};
 use std::collections::HashSet;
@@ -514,13 +515,11 @@ impl Fixture {
         }
     }
 
-    /// Evict the mapping, then report its temperature ("cold" iff no
-    /// page is resident). Callers decide whether cold is required
-    /// (L2-cold gates it) or best-effort (recorded).
-    pub fn pageout_and_temp(&self) -> &'static str {
+    /// Report the mapping's temperature ("cold" iff no page is
+    /// resident). Mincore-only: no side effects, safe for warm legs
+    /// that must keep their fixture resident.
+    pub fn temp(&self) -> &'static str {
         unsafe {
-            let r = libc::madvise(self.ptr as *mut libc::c_void, self.len, MADV_PAGEOUT);
-            assert_eq!(r, 0, "madvise PAGEOUT failed");
             let page = libc::sysconf(libc::_SC_PAGESIZE) as usize;
             let mut vec = vec![0u8; self.len / page];
             assert_eq!(
@@ -534,6 +533,18 @@ impl Fixture {
                 "warm"
             }
         }
+    }
+
+    /// Evict the mapping, then report its temperature. DESTRUCTIVE:
+    /// the fixture is paged out as a side effect — cold legs only.
+    /// (Called once as a warm-leg diagnostic, it silently voided the
+    /// leg; warm legs use `pretouch` + `temp` instead.)
+    pub fn pageout_and_temp(&self) -> &'static str {
+        unsafe {
+            let r = libc::madvise(self.ptr as *mut libc::c_void, self.len, MADV_PAGEOUT);
+            assert_eq!(r, 0, "madvise PAGEOUT failed");
+        }
+        self.temp()
     }
 
     /// Fault every page back in (warm legs) and verify residence.
@@ -614,6 +625,25 @@ fn fixture_builds() {
         assert_eq!((d1.fid, d1.fptr), (12, 0x4101));
         assert_eq!((dt.fid, dt.fptr), (0, 0), "dispatch terminator zero");
     }
+}
+
+/// Offline: `temp()` is a pure probe — it must not evict. (L6a once
+/// called the destructive `pageout_and_temp` as a diagnostic and
+/// silently ran its full-chunk scan on an evicted fixture: 0 ALGs.)
+/// `pageout_and_temp` keeps the eviction for cold legs; on lanes
+/// without swap the evict is best-effort (no assert on its temp).
+#[test]
+fn temp_probe_is_nondestructive() {
+    let slots = vec![SlotSpec::live("MT0", 100, vec![(91, 0x4900)])];
+    let fx = Fixture::build(&slots, &[]);
+    fx.pretouch();
+    assert_eq!(fx.temp(), "warm");
+    assert_eq!(fx.temp(), "warm", "temp() must not evict");
+    // The destructive twin still evicts-then-reports (cold legs
+    // depend on the eviction happening inside this call).
+    let _ = fx.pageout_and_temp();
+    fx.pretouch();
+    assert_eq!(fx.temp(), "warm", "fixture recoverable after evict");
 }
 
 // ===== live legs (lane only) =====
@@ -1026,9 +1056,14 @@ fn l3_boundaries() {
     }
 }
 
-/// L4: dispatch bounds — 128 legs + terminator (clean, bit clear)
-/// vs 129 live legs unterminated (TRUNC_DISPATCH, first 128 ROWs
-/// kept, leg 128 never walked). Separate fixtures isolate each
+/// L4: dispatch bounds — 127 legs + terminator (128 entries,
+/// clean, bit clear) vs 128 legs + terminator (term@128 out of the
+/// walker's reach: TRUNC_DISPATCH despite the present term) vs 129
+/// live legs unterminated (TRUNC_DISPATCH, first 128 ROWs kept, leg
+/// 128 never walked). The PRD bound is 128 ENTRIES including the
+/// terminator (the walker reads at most 128 entries, indices
+/// 0..128); 128 live legs already overflow since their terminator
+/// sits at the unread index 128. Separate fixtures isolate each
 /// shape at op granularity (v1 TRUNC is per-op).
 #[test]
 #[ignore]
@@ -1040,9 +1075,9 @@ fn l4_dispatch_bounds() {
     };
     let exe = own_exe_cstr();
     let off = query_off();
-    // 128 + term: clean.
+    // 127 + term (128 entries): clean.
     {
-        let disp: Vec<(u32, u64)> = (0..128u32).map(|k| (5000 + k, 0x9000 + k as u64)).collect();
+        let disp: Vec<(u32, u64)> = (0..127u32).map(|k| (5000 + k, 0x9000 + k as u64)).collect();
         // Zero-padded: DISPATCH-clear reflects member 0's clean walk only.
         let fx = Fixture::build_padded(&[SlotSpec::live("M4A", 100, disp)], &[], 512);
         fx.pretouch();
@@ -1057,7 +1092,30 @@ fn l4_dispatch_bounds() {
         assert_eq!(
             read_percpu(&loaded, "TRUNC", OP, true) & wire::TRUNC_DISPATCH,
             0,
-            "128+term leaves DISPATCH clear"
+            "127+term leaves DISPATCH clear"
+        );
+        assert_eq!(algs.iter().filter(|a| a.idx == 0).count(), 2);
+        assert_eq!(rows.iter().filter(|r| r.idx == 0).count(), 254);
+        assert_loss_zero(&loaded);
+    }
+    // 128 + term@128: overflow — the terminator exists but the
+    // walker exhausts its 128 reads on live legs first.
+    {
+        let disp: Vec<(u32, u64)> = (0..128u32).map(|k| (5000 + k, 0x9000 + k as u64)).collect();
+        let fx = Fixture::build_padded(&[SlotSpec::live("M4E", 100, disp)], &[], 512);
+        fx.pretouch();
+        let loaded = load_members(&obj);
+        populate_alg_class(&loaded, &fx.classes);
+        FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
+        NS_VERDICT.store(0, Ordering::SeqCst);
+        let _links = attach_all(&loaded, &exe, off, None);
+        fire(OP as i32, 2);
+        let (algs, rows) = drain(&loaded);
+        assert_eq!(read_percpu(&loaded, "CALLS", OP, false), 2);
+        assert_ne!(
+            read_percpu(&loaded, "TRUNC", OP, true) & wire::TRUNC_DISPATCH,
+            0,
+            "128+term sets DISPATCH: term@128 unreachable"
         );
         assert_eq!(algs.iter().filter(|a| a.idx == 0).count(), 2);
         assert_eq!(rows.iter().filter(|r| r.idx == 0).count(), 256);
@@ -1169,7 +1227,8 @@ fn l6_full_chunk() {
             })
             .collect();
         let fx = Fixture::build(&slots, &[]);
-        eprintln!("l6a fixture temp: {}", fx.pageout_and_temp());
+        fx.pretouch();
+        eprintln!("l6a fixture temp: {}", fx.temp());
         let loaded = load_members(&obj);
         populate_alg_class(&loaded, &fx.classes);
         FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
