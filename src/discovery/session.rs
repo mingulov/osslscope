@@ -1929,7 +1929,12 @@ impl SessionCore {
         // the retired generation instead of the new binding's
         // fresh probe meanings. A failed drain refuses attribution
         // (loud snapshot loss; the later full join advances past
-        // the ambiguous counts without emitting them).
+        // the ambiguous counts without emitting them). A
+        // successful drain while provenance is still unresolved
+        // (fix-round-3: `trip_unfenced` already set) likewise
+        // refuses definite attribution — it re-baselines silently
+        // instead of relabeling older counts under the retiring
+        // generation.
         if pre_trip_live && !self.trip_live {
             let snap = env.join_maps();
             // Fix-round-2 F3: the two counter streams fail
@@ -1944,6 +1949,21 @@ impl SessionCore {
                 // trustworthy TRIP read re-baselines (see
                 // `join_snapshots`).
                 self.trip_unfenced = true;
+            } else if self.trip_unfenced {
+                // Fix-round-3: uncertainty gate for retirement
+                // reads. The cumulative counts mix the
+                // still-unresolved older binding with the retiring
+                // one, so no slice of them is proved retired
+                // evidence. Establish the high-water baseline
+                // without emitting definite generation
+                // attribution (same gate as `join_snapshots`).
+                for (cookie, n) in &snap.trip {
+                    let last = self.trip_joined.get(cookie).copied().unwrap_or(0);
+                    if *n > last {
+                        self.trip_joined.insert(*cookie, *n);
+                    }
+                }
+                self.trip_unfenced = false;
             } else {
                 let mut retired: Vec<RetiredTripDelta> = Vec::new();
                 for (cookie, n) in &snap.trip {
@@ -5101,6 +5121,13 @@ mod tests {
         // successful read re-baselines WITHOUT emitting (the
         // counts mix retired and new bindings). Emitting them as
         // ordinary gen-1 deltas relabels retired provenance.
+        // Fix-round-3: the recovery read is a SECOND replacement's
+        // retirement fence, not an ordinary join on the same
+        // binding. Five unread gen-0 hits + failed fence/full join
+        // (gen 1, latch set, watermark zero) + a second
+        // replacement retiring gen 1 (zero hits) whose fence reads
+        // cumulative 5: the fence must baseline silently, not emit
+        // a definite gen-1 retired delta for gen-0 counts.
         let mut env = MiniEnv::new();
         env.maps = vec![lc_mapping(100)];
         env.plan = Some(trip_set(100, &[0x100, 0x200]));
@@ -5116,13 +5143,23 @@ mod tests {
         assert_eq!(delta.trip_generation, 1);
         assert!(delta.retired_trip_deltas.is_empty());
         assert!(delta.tripwire.counter_deltas.is_empty());
-        // The next successful TRIP read re-baselines silently
-        // instead of emitting the ambiguous counts as gen-1
-        // deltas.
+        // Second replacement BEFORE any successful join: gen 1
+        // had zero hits, but the cumulative map still reads 5
+        // (gen-0 counts). The successful fence must establish a
+        // baseline without emitting definite gen-1 attribution,
+        // and the same poll's full join stays silent too.
+        env.maps = vec![lc_mapping(300)];
+        env.plan = Some(trip_set(300, &[0x118, 0x228]));
         let d3 = core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(d3.trip_generation, 2);
+        assert!(
+            d3.retired_trip_deltas.is_empty(),
+            "unfenced fence must baseline, not mislabel gen-0 counts as gen-1 retired: {:?}",
+            d3.retired_trip_deltas
+        );
         assert!(
             d3.tripwire.counter_deltas.is_empty(),
-            "unfenced counts must re-baseline, not emit as gen-1 deltas: {:?}",
+            "unfenced counts must re-baseline, not emit as gen-2 deltas: {:?}",
             d3.tripwire.counter_deltas
         );
         // High-water held: silence continues, then genuine news
