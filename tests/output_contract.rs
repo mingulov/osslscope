@@ -1052,6 +1052,14 @@ fn semantics_rejects_complete_contradicting_underlying_fields() {
         "COMPLETE with unattributed calls accepted"
     );
 
+    // R01: bounded ambiguity is attributed-but-unresolvable, not
+    // unattributed — a COMPLETE doc with an ambiguous_complete
+    // executed site validates structurally and semantically.
+    let mut v = json_of(&complete_doc());
+    v["sites"][0]["candidates_coverage"] = json!("ambiguous_complete");
+    validate_v2(&v).unwrap_or_else(|e| panic!("ambiguous_complete fails schema: {e}"));
+    check_v2_semantics(&v).unwrap_or_else(|e| panic!("ambiguous_complete fails semantics: {e}"));
+
     // PARTIAL keeps accepting all of these shapes (reconciliation
     // binds COMPLETE only).
     assert!(
