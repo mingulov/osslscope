@@ -155,8 +155,12 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             "--workload-out" => workload_out = Some(val(a)?),
             "--workload-out-fd" => workload_out_fd = Some(val(a)?),
             "--pid" => pid = Some(val(a)?.parse().map_err(|_| "--pid needs an integer")?),
-            "--require-provider" => rules.require_provider.push(val(a)?),
-            "--deny-provider" => rules.deny_provider.push(val(a)?),
+            "--require-provider" => rules
+                .require_provider
+                .push(crate::args::parse_provider_matcher(a, val(a)?)?),
+            "--deny-provider" => rules
+                .deny_provider
+                .push(crate::args::parse_provider_matcher(a, val(a)?)?),
             "--deny-engine" => {
                 rules.deny_engine = true;
                 i += 1;
@@ -1154,6 +1158,168 @@ mod tests {
             })),
             0
         );
+    }
+
+    #[test]
+    fn empty_provider_matchers_rejected_on_every_occurrence() {
+        let v = |s: Vec<&str>| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let base = vec![
+            "--provider",
+            "p",
+            "--object",
+            "o",
+            "--count-object",
+            "c",
+            "--pid",
+            "9",
+        ];
+        // Empty on either flag, first or repeat occurrence: usage error.
+        for extra in [
+            vec!["--deny-provider", ""],
+            vec!["--require-provider", ""],
+            vec!["--deny-provider", "default", "--deny-provider", ""],
+            vec!["--deny-provider", "", "--deny-provider", "default"],
+            vec!["--require-provider", "default", "--require-provider", ""],
+            vec!["--require-provider", "", "--require-provider", "default"],
+            vec!["--deny-provider", "default", "--require-provider", ""],
+            vec!["--require-provider", "default", "--deny-provider", ""],
+        ] {
+            let mut args = base.clone();
+            args.extend(extra.clone());
+            assert!(parse(&v(args)).is_err(), "reject {extra:?}");
+        }
+        // Nonempty opaque ids parse — third-party values are never
+        // enumerated, and matchers are NOT trimmed (" " is nonempty).
+        for extra in [
+            vec!["--deny-provider", "third-party:deadbeef"],
+            vec!["--require-provider", "third-party:deadbeef"],
+            vec!["--deny-provider", " "],
+        ] {
+            let mut args = base.clone();
+            args.extend(extra.clone());
+            assert!(parse(&v(args)).is_ok(), "accept {extra:?}");
+        }
+        // The shared helper rejects empty directly (per-occurrence).
+        assert!(crate::args::parse_provider_matcher("--deny-provider", String::new()).is_err());
+        assert_eq!(
+            crate::args::parse_provider_matcher("--deny-provider", "x".to_string()).unwrap(),
+            "x"
+        );
+    }
+
+    #[test]
+    fn accepted_provider_predicates_validate_against_producer_schema() {
+        use crate::evidence::{DispositionRecord, ObjectRecord};
+        use crate::policy::PolicyRule;
+        // Schema-valid fixture: declared object triple, activity
+        // inside the window, honest legacy partition.
+        let sites = vec![
+            SiteExecution {
+                site: SiteKey {
+                    object: ObjectId("exe-fingerprint".to_string()),
+                    device: 7,
+                    inode: 9,
+                    offset: 1,
+                },
+                generation: 0,
+                candidates: vec![cand(
+                    "exe-fingerprint",
+                    "default",
+                    2,
+                    21,
+                    &["AES-256-GCM"],
+                    false,
+                )],
+                candidates_coverage: CandidateCoverage::Complete,
+                calls: 500,
+                first_ns: 10,
+                last_ns: 90,
+                installed_at: None,
+            },
+            SiteExecution {
+                site: SiteKey {
+                    object: ObjectId("exe-fingerprint".to_string()),
+                    device: 7,
+                    inode: 9,
+                    offset: 2,
+                },
+                generation: 0,
+                candidates: vec![cand(
+                    "exe-fingerprint",
+                    "third-party:deadbeef",
+                    1,
+                    7,
+                    &["SHA2-256"],
+                    false,
+                )],
+                candidates_coverage: CandidateCoverage::Complete,
+                calls: 100,
+                first_ns: 10,
+                last_ns: 90,
+                installed_at: None,
+            },
+        ];
+        let doc_of = |rules: &[PolicyRule]| {
+            let input = FinalizeInput {
+                window: CaptureWindow {
+                    requested_start_ns: 0,
+                    requested_end_ns: 100,
+                    effective_start_ns: 0,
+                    effective_end_ns: 100,
+                    signal_cut: false,
+                },
+                sites: sites.clone(),
+                fenced: Vec::new(),
+                objects: vec![ObjectRecord {
+                    id: ObjectId("exe-fingerprint".to_string()),
+                    device: 7,
+                    inode: 9,
+                    display_locator: "/usr/lib/test/libcrypto.so".to_string(),
+                }],
+                coverage: Vec::new(),
+                counters: Vec::new(),
+                fatal: None,
+                target: TargetRecord::new(7, "demo".to_string(), String::new(), String::new()),
+                openssl: OpensslVersion::verified("3.5.1".to_string()),
+                disposition: Some(DispositionRecord::exited(0)),
+                policy: None,
+                legacy_partition: LegacyCallPartition {
+                    legacy_exclusive: 0,
+                    non_legacy_exclusive: 600,
+                    shared_ambiguous: 0,
+                    unfenced_tails: 0,
+                },
+            };
+            let bare = crate::evidence::finalize(input);
+            let verdict = evaluate_document(rules, &bare);
+            let mut with_policy = bare;
+            with_policy.policy = Some(policy_record(&verdict));
+            with_policy
+        };
+        // Every accepted provider-matcher shape: rule → policy record
+        // → render validates against the producer schema (F15: an
+        // empty predicate would violate minLength 1).
+        for (name, rule) in [
+            ("require-provider", PolicyRule::require_provider("default")),
+            (
+                "require-provider-third-party",
+                PolicyRule::require_provider("third-party:deadbeef"),
+            ),
+            ("deny-provider", PolicyRule::deny_provider("fips")),
+            (
+                "deny-provider-third-party",
+                PolicyRule::deny_provider("third-party:deadbeef"),
+            ),
+        ] {
+            let document = doc_of(std::slice::from_ref(&rule));
+            let bytes = crate::report::render_json(&document).expect("render_json succeeds");
+            let rendered: serde_json::Value =
+                serde_json::from_slice(&bytes).expect("rendered JSON parses");
+            crate::schema::validate_v2(&rendered)
+                .unwrap_or_else(|e| panic!("{name} fails schema: {e}"));
+            crate::schema::check_v2_semantics(&rendered)
+                .unwrap_or_else(|e| panic!("{name} fails semantics: {e}"));
+        }
     }
 
     // Delivery semantics (all-attempted, same-sink refusal,
