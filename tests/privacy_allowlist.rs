@@ -16,11 +16,12 @@ fn manifest_dir() -> PathBuf {
 /// hide behind a same-named map in the other object (H1's harvest
 /// `GEN` hid behind count's `GEN` — union count stayed 17 by
 /// coincidence).
-fn inventory_from_doc() -> (BTreeSet<String>, BTreeSet<String>) {
+fn inventory_from_doc() -> (BTreeSet<String>, BTreeSet<String>, BTreeSet<String>) {
     let text = fs::read_to_string(manifest_dir().join("docs/privacy/allowlist-v1.md")).unwrap();
     let mut in_block = false;
     let mut harvest = BTreeSet::new();
     let mut count = BTreeSet::new();
+    let mut members = BTreeSet::new();
     let mut section: Option<&mut BTreeSet<String>> = None;
     for line in text.lines() {
         let t = line.trim();
@@ -44,6 +45,7 @@ fn inventory_from_doc() -> (BTreeSet<String>, BTreeSet<String>) {
             section = Some(match name {
                 "harvest" => &mut harvest,
                 "count" => &mut count,
+                "members" => &mut members,
                 other => panic!("unknown inventory section: {other:?}"),
             });
             continue;
@@ -59,7 +61,8 @@ fn inventory_from_doc() -> (BTreeSet<String>, BTreeSet<String>) {
     }
     assert!(!harvest.is_empty(), "harvest inventory missing/empty");
     assert!(!count.is_empty(), "count inventory missing/empty");
-    (harvest, count)
+    assert!(!members.is_empty(), "members inventory missing/empty");
+    (harvest, count, members)
 }
 
 fn maps_from_source(path: &Path) -> BTreeSet<String> {
@@ -96,9 +99,10 @@ fn maps_from_source(path: &Path) -> BTreeSet<String> {
 
 #[test]
 fn map_inventory_matches_sources() {
-    let (doc_harvest, doc_count) = inventory_from_doc();
+    let (doc_harvest, doc_count, doc_members) = inventory_from_doc();
     let src_harvest = maps_from_source(&manifest_dir().join("crates/ebpf/src/bin/harvest.rs"));
     let src_count = maps_from_source(&manifest_dir().join("crates/ebpf/src/bin/count.rs"));
+    let src_members = maps_from_source(&manifest_dir().join("crates/ebpf/src/bin/members.rs"));
     assert_eq!(
         src_harvest.len(),
         14,
@@ -109,6 +113,13 @@ fn map_inventory_matches_sources() {
         5,
         "unexpected count map count: {src_count:?}"
     );
+    // Stage C keeps PENDING (entry-owned lifecycle, R18 §6.1); D
+    // drops it → 13 (the doc section moves with the stage).
+    assert_eq!(
+        src_members.len(),
+        14,
+        "unexpected members map count: {src_members:?}"
+    );
     assert_eq!(
         doc_harvest, src_harvest,
         "allowlist harvest inventory drifted from eBPF maps"
@@ -116,6 +127,10 @@ fn map_inventory_matches_sources() {
     assert_eq!(
         doc_count, src_count,
         "allowlist count inventory drifted from eBPF maps"
+    );
+    assert_eq!(
+        doc_members, src_members,
+        "allowlist members inventory drifted from eBPF maps"
     );
 }
 
@@ -204,6 +219,8 @@ fn probe_read_allowlist_is_complete() {
     let harvest =
         fs::read_to_string(manifest_dir().join("crates/ebpf/src/bin/harvest.rs")).unwrap();
     let count = fs::read_to_string(manifest_dir().join("crates/ebpf/src/bin/count.rs")).unwrap();
+    let members =
+        fs::read_to_string(manifest_dir().join("crates/ebpf/src/bin/members.rs")).unwrap();
     assert!(
         !count.contains("bpf_probe_read_user"),
         "count program must read no target memory"
@@ -218,6 +235,37 @@ fn probe_read_allowlist_is_complete() {
     assert!(
         harvest.contains("[0u8; 128]"),
         "alg-name string bound missing"
+    );
+    // Members (stage C): 7 source sites (walk_dispatch 2 + member
+    // slot tuple 2 + no_store pointee 1 + guard tail 1 + name
+    // string 1), 1 string read. The ENTRY plane (entry + skip-path
+    // helpers through `def_member`) reads NO target memory — args
+    // and map cells only (R18 §3: the entry cannot see rv).
+    let m_total = members.match_indices("bpf_probe_read_user").count();
+    let m_str = members
+        .match_indices("bpf_probe_read_user_str_bytes")
+        .count();
+    assert_eq!(m_total, 7, "expected 7 member read sites, found {m_total}");
+    assert_eq!(m_str, 1, "expected 1 member string read, found {m_str}");
+    // Entry plane = `bump_attempt` (first entry helper) through
+    // the member macro (exclusive): entry + skip-path helpers, all
+    // of which must read no target memory (walk_dispatch lives
+    // BEFORE this slice and keeps its 2 reads).
+    let plane_start = members.find("fn bump_attempt").expect("entry plane start");
+    let member_start = members
+        .find("macro_rules! def_member")
+        .expect("def_member present");
+    assert!(
+        members[plane_start..].contains("pub fn member_entry"),
+        "entry inside the plane slice"
+    );
+    assert!(
+        !members[plane_start..member_start].contains("bpf_probe_read_user"),
+        "entry plane must read no target memory"
+    );
+    assert!(
+        members.contains("[0u8; 128]"),
+        "member alg-name string bound missing"
     );
 }
 

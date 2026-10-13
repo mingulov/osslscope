@@ -260,31 +260,49 @@ fn s4_map_dims() {
 }
 
 /// S5: helper set pinned (raw bytes, exact, mains + `.text`
-/// subprograms): map_lookup (1), map_update (2),
-/// get_current_pid_tgid (14), probe_read_user (112),
+/// subprograms), SPLIT by plane (R18 §6.5 — stage C): map_lookup
+/// (1), map_update (2), map_delete (3 — entry skip-path deletes,
+/// `.text`-resident `skip`/`absent_ok`; member mains never delete
+/// in C), get_current_pid_tgid (14), probe_read_user (112),
 /// probe_read_user_str (114), ringbuf_reserve (131),
-/// ringbuf_submit (132), get_attach_cookie (174) — and nothing
-/// else. In particular: no tail_call (12 — members never chain),
-/// no ringbuf_query (134 — entry-only per §5.4), no bpf_loop
-/// (181), no map_delete (3 — peek-only proven). Ids verified
-/// against /usr/include/linux/bpf.h FN table; the set was read off
-/// the built object and reviewed (every id justified by the walk
-/// body), then pinned as a regression lock.
+/// ringbuf_submit (132), ringbuf_query (134 — ENTRY-ONLY, the
+/// governor occupancy read; members never query), get_attach_cookie
+/// (174) — and nothing else. In particular: no tail_call (12 —
+/// members never chain), no bpf_loop (181). Ids verified against
+/// /usr/include/linux/bpf.h FN table; the set was read off the
+/// built object and reviewed, then pinned as a regression lock.
+/// D re-pins (member epilogue retires → 3 reaches member mains).
 #[test]
 fn s5_no_forbidden_helpers() {
     let Some(obj) = object_bytes() else {
         eprintln!("SKIP(members-object): OSSL_MEMBERS_OBJECT unset");
         return;
     };
-    const FORBIDDEN: [i32; 3] = [12, 134, 181];
-    const PINNED: [i32; 8] = [1, 2, 14, 112, 114, 131, 132, 174];
+    const FORBIDDEN: [i32; 2] = [12, 181];
+    const PINNED: [i32; 10] = [1, 2, 3, 14, 112, 114, 131, 132, 134, 174];
     let mut observed: HashSet<i32> = HashSet::new();
     for (name, id) in collect_helpers(&obj) {
         observed.insert(id);
         assert!(
             !FORBIDDEN.contains(&id),
-            "{name}: forbidden helper {id} (12=tail 134=rbq 181=loop)"
+            "{name}: forbidden helper {id} (12=tail 181=loop)"
         );
+        // Split rule (C): 134 is entry-only (uprobe main), 3 never
+        // in a member main (entry skip path only — `.text` hosts
+        // the shared `skip`/`absent_ok` subprograms; the uprobe
+        // main itself inlines no delete).
+        if id == 134 {
+            assert_eq!(
+                name, "member_entry",
+                "ringbuf_query outside the entry main: {name}"
+            );
+        }
+        if id == 3 {
+            assert!(
+                name == "member_entry" || name.starts_with(".text:"),
+                "map_delete in a member main (C forbids): {name}"
+            );
+        }
     }
     let mut obs: Vec<i32> = observed.into_iter().collect();
     obs.sort_unstable();
