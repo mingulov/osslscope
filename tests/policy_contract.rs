@@ -16,9 +16,10 @@
 use osslscope::check::{exit_for, policy_json, policy_record};
 use osslscope::evidence::{
     CandidateCoverage, CandidateIdentity, CaptureDocument, CaptureWindow, Completeness,
-    CounterKind, CounterSource, CounterUnits, ExpectedScope, FatalKind, FencedGeneration,
-    FinalizeInput, GapCounter, LegacyCallPartition, MatchBounds, ObjectId, OpensslVersion,
-    RuleVerdict, ScopeCoverage, SiteExecution, SiteKey, TargetRecord, finalize,
+    CounterKind, CounterSource, CounterUnits, EngineObservation, EngineWindow, ExpectedScope,
+    FatalKind, FencedGeneration, FinalizeInput, GapCounter, LegacyCallPartition, MatchBounds,
+    ObjectId, OpensslVersion, RuleVerdict, ScopeCoverage, SiteExecution, SiteKey, TargetRecord,
+    engine_index, finalize,
 };
 use osslscope::policy::{ENGINE_PROVIDER_CLASS, PolicyOutcome, PolicyRule, evaluate_document};
 use osslscope::report::{
@@ -107,6 +108,7 @@ fn doc(
         disposition: None,
         policy: None,
         legacy_partition: LegacyCallPartition::default(),
+        engine_observations: Vec::new(),
     })
 }
 
@@ -1706,6 +1708,58 @@ fn legacy_engine_tripwire_fallback() {
     assert!(v.rules.is_empty());
 }
 
+fn engine_obs(
+    offset: u64,
+    generation: u64,
+    entrypoint: &str,
+    calls: u64,
+    window: EngineWindow,
+) -> EngineObservation {
+    EngineObservation {
+        key: SiteKey {
+            object: obj("libcrypto-fingerprint"),
+            device: 8,
+            inode: 11,
+            offset,
+        },
+        generation,
+        entrypoint: engine_index(entrypoint).expect("frozen ENGINE registry name"),
+        calls,
+        window,
+    }
+}
+
+/// COMPLETE document carrying typed ENGINE observations (no sites).
+fn engine_doc(obs: Vec<EngineObservation>) -> CaptureDocument {
+    finalize(FinalizeInput {
+        window: exact_window(),
+        sites: Vec::new(),
+        fenced: Vec::new(),
+        objects: Vec::new(),
+        coverage: Vec::new(),
+        counters: Vec::new(),
+        fatal: None,
+        target: TargetRecord::unknown(),
+        openssl: OpensslVersion::unknown(),
+        disposition: None,
+        policy: None,
+        legacy_partition: LegacyCallPartition::default(),
+        engine_observations: obs,
+    })
+}
+
+fn engine_ref_resolves(doc: &CaptureDocument, r: &osslscope::evidence::EngineEvidenceRef) -> bool {
+    doc.engine_observations.iter().any(|o| {
+        o.key.object == r.object
+            && o.key.device == r.device
+            && o.key.inode == r.inode
+            && o.key.offset == r.offset
+            && o.generation == r.generation
+            && o.entrypoint == r.entrypoint
+            && o.calls >= r.calls
+    })
+}
+
 /// `--deny-engine` matches the engine provider class, not file stems.
 #[test]
 fn deny_engine_matches_class() {
@@ -1733,4 +1787,280 @@ fn deny_engine_matches_class() {
     let quiet = complete_doc(Vec::new());
     let v = evaluate_document(std::slice::from_ref(&PolicyRule::deny_engine()), &quiet);
     assert_eq!(v.rules[0].verdict, RuleVerdict::Pass);
+}
+
+// ---------------------------------------------------------------- R05 (F06)
+
+/// R05: five in-window typed ENGINE observations drive the source
+/// check verdict, and independent serialized-document replay agrees
+/// with all evidence references resolving on both sides.
+#[test]
+fn engine_policy_replays_from_document() {
+    let mut doc = engine_doc(vec![
+        engine_obs(0x100, 0, "ENGINE_by_id", 1, EngineWindow::InWindow),
+        engine_obs(0x200, 0, "ENGINE_init", 1, EngineWindow::InWindow),
+        engine_obs(0x300, 0, "ENGINE_finish", 1, EngineWindow::InWindow),
+        engine_obs(0x400, 0, "ENGINE_free", 1, EngineWindow::InWindow),
+        engine_obs(0x500, 0, "ENGINE_ctrl", 1, EngineWindow::InWindow),
+    ]);
+    assert!(matches!(doc.status, Completeness::Complete));
+    let rules = vec![PolicyRule::deny_engine()];
+    let v = evaluate_document(&rules, &doc);
+    assert_eq!(v.overall(), PolicyOutcome::Violation);
+    assert_eq!(v.rules[0].bounds.definite, 5);
+    assert_eq!(v.rules[0].bounds.possible, Some(5));
+    assert_eq!(v.rules[0].engine_hits.len(), 5);
+    assert_eq!(v.rules[0].legacy_engine_calls, 0);
+    let rec = policy_record(&v);
+    assert_eq!(rec.rules[0].engine_evidence.len(), 5);
+    assert!(rec.rules[0].evidence.is_empty());
+    for r in &rec.rules[0].engine_evidence {
+        assert!(engine_ref_resolves(&doc, r), "ref resolves: {r:?}");
+    }
+    // The exported document carries the evaluated policy record.
+    doc.policy = Some(rec.clone());
+    // Independent replay from the serialized document alone: no
+    // side input, same verdict, same bounds, same record.
+    let bytes = serde_json::to_string(&doc).expect("document serializes");
+    let replayed: CaptureDocument = serde_json::from_str(&bytes).expect("document parses");
+    assert_eq!(replayed.engine_observations, doc.engine_observations);
+    let v2 = evaluate_document(&rules, &replayed);
+    assert_eq!(v2.overall(), PolicyOutcome::Violation);
+    assert_eq!(v2.rules[0].bounds, v.rules[0].bounds);
+    assert_eq!(v2.rules[0].engine_hits, v.rules[0].engine_hits);
+    assert_eq!(policy_record(&v2), rec);
+    for r in &policy_record(&v2).rules[0].engine_evidence {
+        assert!(engine_ref_resolves(&replayed, r), "replay ref resolves");
+    }
+    // Conserved provider unit: ENGINE calls never join site totals.
+    assert_eq!(doc.total_calls(), 0);
+    assert_eq!(replayed.total_calls(), 0);
+}
+
+#[test]
+fn engine_pre_window_only_passes() {
+    let doc = engine_doc(vec![engine_obs(
+        0x100,
+        0,
+        "ENGINE_init",
+        9,
+        EngineWindow::PreWindow,
+    )]);
+    assert!(matches!(doc.status, Completeness::Complete));
+    let v = evaluate_document(std::slice::from_ref(&PolicyRule::deny_engine()), &doc);
+    assert_eq!(v.rules[0].verdict, RuleVerdict::Pass);
+    assert_eq!(v.rules[0].bounds.definite, 0);
+    assert_eq!(v.rules[0].bounds.possible, Some(0));
+    assert!(v.rules[0].engine_hits.is_empty());
+}
+
+#[test]
+fn engine_untimed_is_inconclusive() {
+    let doc = engine_doc(vec![engine_obs(
+        0x100,
+        0,
+        "ENGINE_init",
+        9,
+        EngineWindow::Untimed,
+    )]);
+    let v = evaluate_document(std::slice::from_ref(&PolicyRule::deny_engine()), &doc);
+    // Never a violation without in-window evidence, never a pass
+    // over evidence the window cannot place: fail closed.
+    assert_eq!(v.rules[0].verdict, RuleVerdict::Inconclusive);
+    assert_eq!(v.rules[0].bounds.definite, 0);
+    assert_eq!(v.rules[0].bounds.possible, None);
+    assert!(v.rules[0].engine_hits.is_empty());
+    // Untimed evidence still replays with its limits intact.
+    let bytes = serde_json::to_string(&doc).unwrap();
+    let replayed: CaptureDocument = serde_json::from_str(&bytes).unwrap();
+    let v2 = evaluate_document(std::slice::from_ref(&PolicyRule::deny_engine()), &replayed);
+    assert_eq!(v2.rules[0].verdict, RuleVerdict::Inconclusive);
+    assert_eq!(v2.rules[0].bounds, v.rules[0].bounds);
+}
+
+#[test]
+fn engine_mixed_document_and_tripwire_no_double_count() {
+    use osslscope::policy::apply_legacy_engine_fallback;
+    // The typed document already proves the violation: the legacy
+    // side input must not double-count (document hits win).
+    let doc = engine_doc(vec![engine_obs(
+        0x100,
+        0,
+        "ENGINE_init",
+        5,
+        EngineWindow::InWindow,
+    )]);
+    let mut v = evaluate_document(std::slice::from_ref(&PolicyRule::deny_engine()), &doc);
+    assert_eq!(v.rules[0].verdict, RuleVerdict::Violation);
+    apply_legacy_engine_fallback(&mut v, 5);
+    assert_eq!(v.rules[0].bounds.definite, 5);
+    assert_eq!(v.rules[0].legacy_engine_calls, 0);
+    assert_eq!(policy_record(&v).rules[0].engine_evidence.len(), 1);
+    // And the fallback still fires when the document is silent
+    // (transitional parity until every caller uses typed input).
+    let quiet = complete_doc(Vec::new());
+    let mut v = evaluate_document(std::slice::from_ref(&PolicyRule::deny_engine()), &quiet);
+    apply_legacy_engine_fallback(&mut v, 5);
+    assert_eq!(v.rules[0].verdict, RuleVerdict::Violation);
+    assert_eq!(v.rules[0].bounds.definite, 5);
+    assert_eq!(v.rules[0].legacy_engine_calls, 5);
+    assert!(policy_record(&v).rules[0].engine_evidence.is_empty());
+}
+
+#[test]
+fn engine_setup_failure_has_no_verdict() {
+    let doc = doc(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        exact_window(),
+        Some(FatalKind::Environment("setup failed".to_string())),
+    );
+    // Evidence-free fatal documents never reach per-rule
+    // evaluation, however the evaluator is invoked.
+    let v = evaluate_document(std::slice::from_ref(&PolicyRule::deny_engine()), &doc);
+    assert_eq!(v.overall(), PolicyOutcome::NoVerdict);
+    assert!(v.rules.is_empty());
+}
+
+#[test]
+fn engine_zero_hits_passes() {
+    let quiet = complete_doc(Vec::new());
+    let v = evaluate_document(std::slice::from_ref(&PolicyRule::deny_engine()), &quiet);
+    assert_eq!(v.rules[0].verdict, RuleVerdict::Pass);
+    assert_eq!(v.rules[0].bounds.possible, Some(0));
+    // A zero-call observation is evidence of nothing.
+    let silent = engine_doc(vec![engine_obs(
+        0x100,
+        0,
+        "ENGINE_init",
+        0,
+        EngineWindow::InWindow,
+    )]);
+    let v = evaluate_document(std::slice::from_ref(&PolicyRule::deny_engine()), &silent);
+    assert_eq!(v.rules[0].verdict, RuleVerdict::Pass);
+    assert!(v.rules[0].engine_hits.is_empty());
+}
+
+#[test]
+fn engine_duplicate_cookie_joins_sum() {
+    // Same entrypoint probed in two modules: two cookies, two
+    // observations, one entrypoint — both definite, summed once.
+    let doc = engine_doc(vec![
+        engine_obs(0x100, 0, "ENGINE_init", 3, EngineWindow::InWindow),
+        engine_obs(0x900, 0, "ENGINE_init", 5, EngineWindow::InWindow),
+    ]);
+    let v = evaluate_document(std::slice::from_ref(&PolicyRule::deny_engine()), &doc);
+    assert_eq!(v.rules[0].verdict, RuleVerdict::Violation);
+    assert_eq!(v.rules[0].bounds.definite, 8);
+    assert_eq!(v.rules[0].bounds.possible, Some(8));
+    assert_eq!(v.rules[0].engine_hits.len(), 2);
+    let bytes = serde_json::to_string(&doc).unwrap();
+    let replayed: CaptureDocument = serde_json::from_str(&bytes).unwrap();
+    let v2 = evaluate_document(std::slice::from_ref(&PolicyRule::deny_engine()), &replayed);
+    assert_eq!(v2.rules[0].bounds, v.rules[0].bounds);
+}
+
+#[test]
+fn engine_retired_binding_replays_per_generation() {
+    // Binding turnover mid-window: generation 0 retired, generation
+    // 1 live. Both observed in-window under a live binding, so both
+    // are definite; replay preserves the per-generation split.
+    let doc = engine_doc(vec![
+        engine_obs(0x100, 0, "ENGINE_init", 2, EngineWindow::InWindow),
+        engine_obs(0x140, 1, "ENGINE_init", 4, EngineWindow::InWindow),
+    ]);
+    let v = evaluate_document(std::slice::from_ref(&PolicyRule::deny_engine()), &doc);
+    assert_eq!(v.rules[0].verdict, RuleVerdict::Violation);
+    assert_eq!(v.rules[0].bounds.definite, 6);
+    let rec = policy_record(&v);
+    assert_eq!(rec.rules[0].engine_evidence.len(), 2);
+    let mut gens: Vec<u64> = rec.rules[0]
+        .engine_evidence
+        .iter()
+        .map(|r| r.generation)
+        .collect();
+    gens.sort_unstable();
+    assert_eq!(gens, vec![0, 1]);
+    let bytes = serde_json::to_string(&doc).unwrap();
+    let replayed: CaptureDocument = serde_json::from_str(&bytes).unwrap();
+    assert_eq!(replayed.engine_observations, doc.engine_observations);
+    let v2 = evaluate_document(std::slice::from_ref(&PolicyRule::deny_engine()), &replayed);
+    assert_eq!(v2.rules[0].bounds, v.rules[0].bounds);
+    assert_eq!(policy_record(&v2), rec);
+}
+
+#[test]
+fn engine_runtime_salvage_evaluates() {
+    // Salvaged Runtime docs carry real observations: a proved
+    // ENGINE violation still evaluates (exit 10 via check).
+    let doc = finalize(FinalizeInput {
+        window: exact_window(),
+        sites: Vec::new(),
+        fenced: Vec::new(),
+        objects: Vec::new(),
+        coverage: Vec::new(),
+        counters: Vec::new(),
+        fatal: Some(FatalKind::Runtime("drain failed".to_string())),
+        target: TargetRecord::unknown(),
+        openssl: OpensslVersion::unknown(),
+        disposition: None,
+        policy: None,
+        legacy_partition: LegacyCallPartition::default(),
+        engine_observations: vec![engine_obs(
+            0x100,
+            0,
+            "ENGINE_init",
+            7,
+            EngineWindow::InWindow,
+        )],
+    });
+    let v = evaluate_document(std::slice::from_ref(&PolicyRule::deny_engine()), &doc);
+    assert_eq!(v.overall(), PolicyOutcome::Violation);
+    assert_eq!(v.rules[0].bounds.definite, 7);
+    assert_eq!(v.rules[0].bounds.possible, None);
+    assert_eq!(v.rules[0].engine_hits.len(), 1);
+    assert_eq!(exit_for(v.overall(), Some(0), &doc, &ok_delivery()), 10);
+}
+
+#[test]
+fn engine_unrelated_provider_calls_pass_and_conserve() {
+    // Provider-dispatch executions are not ENGINE evidence, and
+    // ENGINE observations never join provider totals.
+    let doc = finalize(FinalizeInput {
+        window: exact_window(),
+        sites: vec![site_at(
+            1,
+            0,
+            12,
+            vec![cand("p", "default", DIGEST, 7, &["SHA2-256"], false)],
+            CandidateCoverage::Complete,
+        )],
+        fenced: Vec::new(),
+        objects: Vec::new(),
+        coverage: Vec::new(),
+        counters: Vec::new(),
+        fatal: None,
+        target: TargetRecord::unknown(),
+        openssl: OpensslVersion::unknown(),
+        disposition: None,
+        policy: None,
+        legacy_partition: LegacyCallPartition {
+            legacy_exclusive: 0,
+            non_legacy_exclusive: 12,
+            shared_ambiguous: 0,
+            unfenced_tails: 0,
+        },
+        engine_observations: vec![engine_obs(
+            0x100,
+            0,
+            "ENGINE_init",
+            5,
+            EngineWindow::PreWindow,
+        )],
+    });
+    let v = evaluate_document(std::slice::from_ref(&PolicyRule::deny_engine()), &doc);
+    assert_eq!(v.rules[0].verdict, RuleVerdict::Pass);
+    assert_eq!(doc.total_calls(), 12);
 }
