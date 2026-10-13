@@ -916,8 +916,11 @@ pub struct SessionCore {
     /// (H10): distinguishes PENDING (never mapped → retain the
     /// kernel-pending links across unmapped polls) from GONE (was
     /// mapped, now unmapped → detach). Set on the first poll whose
-    /// maps carry the bound triple; cleared only by pid recycle (a
-    /// new process restarts the distinction).
+    /// maps carry the bound triple; cleared by pid recycle (a new
+    /// process restarts the distinction) and by every binding
+    /// replacement (R03: history belongs to the binding that earned
+    /// it — always swapped together via
+    /// [`SessionCore::install_dispatch_binding`]).
     dispatch_ever_mapped: bool,
     /// Bootstrap-original provider binding (H6): the identity
     /// pinned at attach, NEVER refreshed by reinstall (which
@@ -1031,12 +1034,30 @@ impl SessionCore {
         binding: Option<(String, String, u64)>,
     ) {
         self.dispatch_live = attached;
+        // R03: a fresh binding owns fresh mapped history (false on a
+        // fresh core; paired explicitly so no admission path can
+        // inherit a predecessor's state).
         self.dispatch_bound = binding.clone();
+        self.dispatch_ever_mapped = false;
         // H6: bootstrap-original binding (set once — reinstall
         // refreshes `dispatch_bound` but never this).
         self.bootstrap_binding = binding;
         self.preset_reason = preset_reason;
         self.resolution = resolution;
+    }
+
+    /// Install a (replacement) dispatch-anchor binding (R03): the new
+    /// binding starts never-mapped — mapped history belongs to the
+    /// binding that earned it, so a mapped-then-replaced A can never
+    /// classify its pending replacement B as GONE (which detached +
+    /// reinstalled B every poll). Returns the retired binding's
+    /// mapped history for the continuity caveat: A's gap stays
+    /// reported even though its state no longer classifies B.
+    fn install_dispatch_binding(&mut self, binding: (String, String, u64)) -> bool {
+        let prior_mapped = self.dispatch_ever_mapped;
+        self.dispatch_bound = Some(binding);
+        self.dispatch_ever_mapped = false;
+        prior_mapped
     }
 
     /// Record an attach-time stage-2 install (builtin mode
@@ -2159,7 +2180,10 @@ impl SessionCore {
                     });
                 }
                 Ok(fresh) => {
-                    self.dispatch_bound = Some(fresh.binding);
+                    // R03: the replacement binding starts
+                    // never-mapped; the caveat reads the RETIRED
+                    // binding's history, not the new one.
+                    let prior_mapped = self.install_dispatch_binding(fresh.binding);
                     self.dispatch_live = true;
                     self.dispatch_blind = false;
                     self.resolution = fresh.resolution;
@@ -2169,7 +2193,7 @@ impl SessionCore {
                     // could have fired on either inode — so it
                     // carries no continuity caveat. Only a
                     // post-map replacement keeps the caveat.
-                    let failed = self.dispatch_ever_mapped.then(|| {
+                    let failed = prior_mapped.then(|| {
                         "dispatch anchors re-established after replacement; \
                          continuity unproven"
                             .to_string()
@@ -5012,6 +5036,146 @@ mod tests {
         assert_eq!(env.reinstall_calls, 0, "stranger triggers no install");
         assert!(core.dispatch_live, "still pending on configured file");
         assert!(!core.dispatch_ever_mapped, "stranger is not our map");
+    }
+
+    #[test]
+    fn mapped_a_to_pending_b_survives_repeated_polls() {
+        // R03/F04: mapped A replaced by pending (never-mapped) B — B
+        // must survive repeated pending polls without churn: exactly
+        // one detach + one reinstall (the A→B turnover) and exactly
+        // one A continuity caveat. Pre-fix, A's `ever_mapped` state
+        // classified B as GONE every poll (1→4 detach churn).
+        let mut env = MiniEnv::new();
+        env.maps = vec![prov_mapping(50, 0x1000)];
+        let mut core = a11_core();
+        core.dispatch_bound = Some(("/p/provider.so".to_string(), "08:01".to_string(), 50));
+        core.dispatch_live = true;
+        core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(env.dispatch_detaches, 0);
+
+        // A unmapped; the path now serves B (pending: in no maps).
+        // Extra scripted reinstalls only feed the pre-fix churn —
+        // post-fix they stay unconsumed.
+        env.maps = vec![lc_mapping(99)];
+        env.provider_stat = Some(("08:01".to_string(), 60));
+        for _ in 0..4 {
+            env.reinstall_script.push_back(Ok(DispatchReinstall {
+                binding: ("/p/provider.so".to_string(), "08:01".to_string(), 60),
+                resolution: None,
+            }));
+        }
+        let delta = core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(env.dispatch_detaches, 1, "A turnover detaches once");
+        assert_eq!(env.reinstall_calls, 1, "B installs once");
+        assert!(core.dispatch_live, "B pending stays live");
+        assert_eq!(
+            core.dispatch_bound,
+            Some(("/p/provider.so".to_string(), "08:01".to_string(), 60))
+        );
+        // A's continuity gap is retained evidence: exactly one caveat.
+        let caveats = delta
+            .attaches
+            .iter()
+            .filter(|a| {
+                matches!(a.kind, AttachKind::DispatchAnchors { count: 2 }) && a.failed.is_some()
+            })
+            .count();
+        assert_eq!(caveats, 1, "one A continuity caveat: {:?}", delta.attaches);
+
+        // Three pending polls: B retained, no detach/reinstall churn.
+        for i in 0..3 {
+            let d = core.poll(&mut env, a11_budget()).unwrap();
+            assert!(core.dispatch_live, "B retained on pending poll {i}");
+            assert_eq!(
+                core.dispatch_bound,
+                Some(("/p/provider.so".to_string(), "08:01".to_string(), 60)),
+                "B retained on pending poll {i}"
+            );
+            assert!(
+                d.attaches
+                    .iter()
+                    .all(|a| !matches!(a.kind, AttachKind::DispatchAnchors { .. })),
+                "no dispatch outcome while B pending (poll {i}): {:?}",
+                d.attaches
+            );
+        }
+        assert_eq!(env.dispatch_detaches, 1, "no churn while B pending");
+        assert_eq!(env.reinstall_calls, 1, "no reinstall while B pending");
+        assert!(!core.dispatch_blind, "no blind latch while pending");
+        assert!(
+            core.snapshot().dispatch.attached,
+            "pending B still counts attached"
+        );
+    }
+
+    #[test]
+    fn pending_b_maps_then_unmaps_detaches_once() {
+        // R03 control: after the A→B turnover, B's own mapped history
+        // drives its lifecycle — map-in arms B (no churn), and a
+        // later unmap detaches exactly once (GONE, not pending).
+        let mut env = MiniEnv::new();
+        env.maps = vec![prov_mapping(50, 0x1000)];
+        let mut core = a11_core();
+        core.dispatch_bound = Some(("/p/provider.so".to_string(), "08:01".to_string(), 50));
+        core.dispatch_live = true;
+        core.poll(&mut env, a11_budget()).unwrap();
+
+        env.maps = vec![lc_mapping(99)];
+        env.provider_stat = Some(("08:01".to_string(), 60));
+        env.reinstall_script.push_back(Ok(DispatchReinstall {
+            binding: ("/p/provider.so".to_string(), "08:01".to_string(), 60),
+            resolution: None,
+        }));
+        core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(env.dispatch_detaches, 1);
+        assert_eq!(env.reinstall_calls, 1);
+
+        // B maps: the new links arm, detaching nothing.
+        env.maps = vec![prov_mapping(60, 0x1000)];
+        core.poll(&mut env, a11_budget()).unwrap();
+        assert!(core.dispatch_live, "mapped B stays live");
+        assert_eq!(env.dispatch_detaches, 1, "B map-in detaches nothing");
+        assert_eq!(env.reinstall_calls, 1, "B map-in reinstalls nothing");
+
+        // B unmaps (dlclose): GONE detaches exactly once.
+        env.maps = vec![lc_mapping(99)];
+        env.reinstall_script
+            .push_back(Err(anyhow::anyhow!("anchor unresolvable")));
+        let delta = core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(env.dispatch_detaches, 2, "B unmap detaches once");
+        assert!(!core.dispatch_live);
+        assert!(!core.snapshot().dispatch.attached);
+        assert!(
+            delta.attaches.iter().any(|a| matches!(
+                a.kind,
+                AttachKind::DispatchAnchors { .. }
+            ) && a.failed.is_some()),
+            "failed B reinstall must signal loss: {:?}",
+            delta.attaches
+        );
+
+        // Same fingerprint: no retry (blind latch holds for B too).
+        core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(env.reinstall_calls, 2);
+
+        // New fingerprint: retry, and success clears the latch.
+        env.maps = vec![prov_mapping(70, 0x1000)];
+        env.reinstall_script.push_back(Ok(DispatchReinstall {
+            binding: ("/p/provider.so".to_string(), "08:01".to_string(), 70),
+            resolution: None,
+        }));
+        let delta = core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(env.reinstall_calls, 3);
+        assert!(core.dispatch_live);
+        assert!(core.snapshot().dispatch.attached);
+        assert!(
+            delta.attaches.iter().any(|a| matches!(
+                a.kind,
+                AttachKind::DispatchAnchors { .. }
+            ) && a.failed.is_some()),
+            "post-map replacement keeps its caveat: {:?}",
+            delta.attaches
+        );
     }
 
     #[test]
