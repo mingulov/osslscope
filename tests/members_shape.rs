@@ -176,7 +176,11 @@ fn s1_prepare_513() {
         return;
     };
     assert_eq!(prep.progs.len(), 513, "512 members + member_entry");
-    assert_eq!(prep.maps.len(), 14, "exactly the 14 member maps");
+    assert_eq!(
+        prep.maps.len(),
+        13,
+        "exactly the 13 member maps (D dropped PENDING)"
+    );
 }
 
 /// S2: symbol names and entry/return sections.
@@ -216,8 +220,9 @@ fn s3_bodies_distinct() {
     assert_eq!(hashes.len(), 512, "all 512 member bodies distinct");
 }
 
-/// S4: the 14 map dims pinned (7 item-2 + 7 item-3 scan-plane;
-/// PENDING drops in subtask C — end state 13).
+/// S4: the 13 map dims pinned (6 retained + 7 item-3 scan-plane;
+/// PENDING dropped in stage D when members switched to SCAN —
+/// R18 §6.1 — end state 13).
 #[test]
 fn s4_map_dims() {
     let Some(prep) = prepared() else {
@@ -226,14 +231,12 @@ fn s4_map_dims() {
     };
     let want: &[(&str, u32, u32, u32, u32, u32)] = &[
         ("EVENTS", 27, 0, 0, 1 << 21, 0),
-        ("PENDING_QUERY", 1, 8, 16, 1024, 0),
         ("GEN", 1, 8, 8, 1024, 0),
         ("LOSS", 5, 4, 8, 32, 0),
         ("TRUNC", 5, 4, 8, 64, 0),
         ("CALLS", 5, 4, 8, 64, 0),
         ("ALG_CLASS", 1, 8, 42, 1024, 0),
-        // Item-3 scan plane (bridge: PENDING drops in subtask C
-        // when members switch to SCAN; end state is 13).
+        // Item-3 scan plane (D end state: members read SCAN).
         ("SCAN", 9, 4, 40, 1024, 0),
         ("SEQ", 1, 4, 8, 4096, 0),
         ("BIRTH", 1, 4, 2, 4096, 0),
@@ -260,18 +263,18 @@ fn s4_map_dims() {
 }
 
 /// S5: helper set pinned (raw bytes, exact, mains + `.text`
-/// subprograms), SPLIT by plane (R18 §6.5 — stage C): map_lookup
-/// (1), map_update (2), map_delete (3 — entry skip-path deletes,
-/// `.text`-resident `skip`/`absent_ok`; member mains never delete
-/// in C), get_current_pid_tgid (14), probe_read_user (112),
-/// probe_read_user_str (114), ringbuf_reserve (131),
-/// ringbuf_submit (132), ringbuf_query (134 — ENTRY-ONLY, the
-/// governor occupancy read; members never query), get_attach_cookie
-/// (174) — and nothing else. In particular: no tail_call (12 —
-/// members never chain), no bpf_loop (181). Ids verified against
+/// subprograms), SPLIT by plane (R18 §6.5 — stage D): map_lookup
+/// (1), map_update (2), map_delete (3 — entry skip-path deletes
+/// plus the member-epilogue retire, inlined into member mains and
+/// `.text`-resident shared paths), get_current_pid_tgid (14),
+/// probe_read_user (112), probe_read_user_str (114),
+/// ringbuf_reserve (131), ringbuf_submit (132), ringbuf_query
+/// (134 — ENTRY-ONLY, the governor occupancy read; members never
+/// query), get_attach_cookie (174) — and nothing else. In
+/// particular: no tail_call (12 — members never chain), no
+/// bpf_loop (181). Ids verified against
 /// /usr/include/linux/bpf.h FN table; the set was read off the
 /// built object and reviewed, then pinned as a regression lock.
-/// D re-pins (member epilogue retires → 3 reaches member mains).
 #[test]
 fn s5_no_forbidden_helpers() {
     let Some(obj) = object_bytes() else {
@@ -287,20 +290,13 @@ fn s5_no_forbidden_helpers() {
             !FORBIDDEN.contains(&id),
             "{name}: forbidden helper {id} (12=tail 181=loop)"
         );
-        // Split rule (C): 134 is entry-only (uprobe main), 3 never
-        // in a member main (entry skip path only — `.text` hosts
-        // the shared `skip`/`absent_ok` subprograms; the uprobe
-        // main itself inlines no delete).
+        // Split rule (D): 134 is entry-only (uprobe main); 3
+        // reaches member mains (the gated-epilogue retire) as
+        // well as the entry skip path.
         if id == 134 {
             assert_eq!(
                 name, "member_entry",
                 "ringbuf_query outside the entry main: {name}"
-            );
-        }
-        if id == 3 {
-            assert!(
-                name == "member_entry" || name.starts_with(".text:"),
-                "map_delete in a member main (C forbids): {name}"
             );
         }
     }
@@ -397,14 +393,19 @@ fn s7_retired_maps_absent() {
     }
 }
 
-/// S8: the const-folded specials — member_000 carries the CALLS
-/// bump + empty-slot gate, member_511 the overrun guard; members
-/// 1..510 are fold-free and near-uniform (same code modulo baked
-/// immediates). The one known variance: J=4 == KIND_ALG, so LLVM
-/// CSEs the idx/kind stores in both ALG emits (16B smaller —
-/// proven innocent via objdump diff; walk_dispatch/classify stay
-/// shared `.text`, so no other J gets this luck). Variance beyond
-/// 16B means a missed fold — investigate, don't widen.
+/// S8: the const-folded specials (stage D) — member_000 carries
+/// the ns-first read + RET emit + empty-slot gate, member_511 the
+/// guard eligibility + GUARD event; members 1..510 are fold-free
+/// and near-uniform (same code modulo baked immediates). Two known
+/// variances, both proven innocent via objdump diff (same helper
+/// sequence, same stores): J=4 == KIND_ALG, so LLVM CSEs the
+/// idx/kind stores in both ALG emits (16B smaller —
+/// walk_dispatch/classify stay shared `.text`, so no other J gets
+/// this luck); J=40 keeps its idx immediate in a register across
+/// the ALG emit (one extra mov, 8B larger — pure regalloc quirk;
+/// the T-gate itself compiles identically for all J as `t > J-1 ⟺
+/// walk`, verified at 040/041). Any other outlier fails loud —
+/// investigate, don't widen.
 #[test]
 fn s8_folded_specials() {
     let Some(obj) = object_bytes() else {
@@ -422,20 +423,46 @@ fn s8_folded_specials() {
     };
     let s000 = size("member_000");
     let s511 = size("member_511");
-    let mid: Vec<usize> = (1..511u32)
-        .map(|j| size(&format!("member_{j:03}")))
+    let mid: Vec<(String, usize)> = (1..511u32)
+        .map(|j| (format!("member_{j:03}"), size(&format!("member_{j:03}"))))
         .collect();
-    let (mid_min, mid_max) = (mid.iter().min().unwrap(), mid.iter().max().unwrap());
+    let (mid_min, mid_max) = (
+        mid.iter().map(|(_, s)| s).min().unwrap(),
+        mid.iter().map(|(_, s)| s).max().unwrap(),
+    );
     eprintln!(
         "raw main bytes: member_000={s000} member_511={s511} mid_min={mid_min} mid_max={mid_max}"
     );
     assert!(
         s000 > *mid_max,
-        "member_000 largest (CALLS bump + empty gate)"
+        "member_000 above middle (ns-first + RET emit + empty gate)"
     );
-    assert!(s511 > *mid_max, "member_511 above middle (overrun guard)");
     assert!(
-        mid_max - mid_min <= 16,
-        "members 1..510 near-uniform (only the J=4 CSE is known)"
+        s511 > *mid_max,
+        "member_511 above middle (guard eligibility + GUARD event)"
+    );
+    let mins: Vec<&str> = mid
+        .iter()
+        .filter(|(_, s)| s == mid_min)
+        .map(|(n, _)| n.as_str())
+        .collect();
+    let maxs: Vec<&str> = mid
+        .iter()
+        .filter(|(_, s)| s == mid_max)
+        .map(|(n, _)| n.as_str())
+        .collect();
+    assert_eq!(
+        mins,
+        ["member_004"],
+        "only known small outlier is J=4 (KIND_ALG CSE)"
+    );
+    assert_eq!(
+        maxs,
+        ["member_040"],
+        "only known large outlier is J=40 (regalloc mov)"
+    );
+    assert!(
+        mid_max - mid_min <= 24,
+        "members 1..510 near-uniform (16 + 8 known)"
     );
 }

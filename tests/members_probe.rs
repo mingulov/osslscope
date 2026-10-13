@@ -27,17 +27,20 @@
 //! `temp_probe_is_nondestructive`) run offline (pure, unprivileged)
 //! and gate the harness itself.
 //!
-//! Stage C (P7 item 3, R18): the entry plane. Every leg attaches
-//! through the production path AND registers BIRTH (the entry
-//! skips unregistered tids — cause 1). The drain collects CALLs
-//! alongside ALG/ROW; C legs assert ENTRY-OBSERVABLE state only
-//! (CALLs, cells, CALLS, LOSS, silence) — retirement/RET-dependent
-//! acceptance lives in D. C-LEG CONVENTION (no retirement exists
-//! in C): any same-tid admit over an unretired record carries
-//! NESTED-HINT — hint ⟺ prior record, not proven nesting.
-//! Multi-admit C legs use a fresh tid per admit sequence (spawned
-//! worker), interleave a skip to clear, or assert the hint as
-//! correct. Priming always uses sacrificial tids.
+//! Stage D (P7 item 3, R18): member conversion, T-gate, guard,
+//! retire. Every leg attaches through the production path AND
+//! registers BIRTH (the entry skips unregistered tids — cause 1).
+//! The drain collects CALL/RET/GUARD/ALG/ROW; legs join RET/GUARD
+//! to CALLs by (tid,seq), never by position. D retires every
+//! admitted return (SCAN absent + RCOUNT IDLE|0), so sequential
+//! same-tid admits are QUIET (retirement splits sequential from
+//! nested — only TRUE nesting hints). C legs persist per the §10.2
+//! split table (PERSIST/RE-PIN/REPLACE); D-only legs cover
+//! retire-quiet, order-independence, T-gate, guard, nested-skip-D,
+//! detach-stall, bump-absorption, quantum-D, and burst/drop.
+//! Priming always uses sacrificial tids. (D PERSIST note: C legs
+//! keep their take-classification asserts identical; retirement
+//! end-state + RET/guard-awareness are D's new facts.)
 
 use osslscope::loader::Loaded;
 use osslscope::scan::registry::BirthState;
@@ -142,45 +145,130 @@ fn populate_alg_class(loaded: &Loaded, entries: &[(String, u16)]) {
     }
 }
 
-/// Drain the member EVENTS ring to parsed (CALL, ALG, ROW)
-/// events. Drops nothing silently: unknown kinds fail loud (stage
-/// C emits CALL/ALG/ROW — no RET/GUARD until D). CALLs arrive in
-/// ring order; C legs join by (tid,seq), never by position.
-fn drain(
-    loaded: &Loaded,
-) -> (
-    Vec<osslscope_ebpf_common::ScanCallEvent>,
-    Vec<osslscope_ebpf_common::AlgEvent>,
-    Vec<osslscope_ebpf_common::RowEvent>,
-) {
+/// Drained scan-plane ring: CALL/RET/GUARD/ALG/ROW in ring
+/// order. Legs join RET/GUARD to CALLs by (tid,seq) + kind, never
+/// by position (order-independence is a leg, not an assumption).
+struct ScanDrain {
+    calls: Vec<osslscope_ebpf_common::ScanCallEvent>,
+    rets: Vec<osslscope_ebpf_common::ScanRetEvent>,
+    guards: Vec<osslscope_ebpf_common::GuardEvent>,
+    algs: Vec<osslscope_ebpf_common::AlgEvent>,
+    rows: Vec<osslscope_ebpf_common::RowEvent>,
+}
+
+/// Drain the member EVENTS ring to parsed events. Drops nothing
+/// silently: unknown kinds fail loud (stage D emits
+/// CALL/RET/GUARD/ALG/ROW).
+fn drain(loaded: &Loaded) -> ScanDrain {
     use aya::maps::{Map, MapData, RingBuf};
     use osslscope_ebpf_common as wire;
     let fd = loaded.maps["EVENTS"].try_clone().expect("clone EVENTS");
     let data = MapData::from_fd(fd).expect("EVENTS mapdata");
     let map = Map::from_map_data(data).expect("EVENTS map");
     let mut ring = RingBuf::try_from(map).expect("EVENTS ringbuf");
-    let mut calls = Vec::new();
-    let mut algs = Vec::new();
-    let mut rows = Vec::new();
+    let mut d = ScanDrain {
+        calls: Vec::new(),
+        rets: Vec::new(),
+        guards: Vec::new(),
+        algs: Vec::new(),
+        rows: Vec::new(),
+    };
     while let Some(item) = ring.next() {
         let b = item.to_vec();
         assert!(b.len() >= 4, "short ring item: {} bytes", b.len());
         let kind = u32::from_le_bytes(b[0..4].try_into().unwrap());
         match kind {
-            wire::KIND_SCAN_CALL => {
-                calls.push(wire::parse_scan_call_event(&b).expect("parse CALL"))
-            }
-            wire::KIND_ALG => algs.push(wire::parse_alg_event(&b, 4096).expect("parse ALG")),
-            wire::KIND_ROW => rows.push(wire::parse_row_event(&b).expect("parse ROW")),
-            k => panic!("unexpected ring kind {k} (C emits CALL/ALG/ROW only)"),
+            wire::KIND_SCAN_CALL => d
+                .calls
+                .push(wire::parse_scan_call_event(&b).expect("parse CALL")),
+            wire::KIND_SCAN_RET => d
+                .rets
+                .push(wire::parse_scan_ret_event(&b).expect("parse RET")),
+            wire::KIND_GUARD => d
+                .guards
+                .push(wire::parse_guard_event(&b).expect("parse GUARD")),
+            wire::KIND_ALG => d
+                .algs
+                .push(wire::parse_alg_event(&b, 4096).expect("parse ALG")),
+            wire::KIND_ROW => d.rows.push(wire::parse_row_event(&b).expect("parse ROW")),
+            k => panic!("unexpected ring kind {k} (D emits CALL/RET/GUARD/ALG/ROW only)"),
         }
     }
-    (calls, algs, rows)
+    d
 }
 
 /// Split CALL flags to (nested-hint, cause) (wire vocabulary).
 fn call_parts(c: &osslscope_ebpf_common::ScanCallEvent) -> (bool, u8) {
     osslscope_ebpf_common::split_call_flags(c.flags)
+}
+
+/// Join one RET to its CALL by (tid,seq): exactly one RET per
+/// admitted invocation (D emits RET for every admitted return,
+/// EMPTY or not).
+fn ret_for(
+    rets: &[osslscope_ebpf_common::ScanRetEvent],
+    tid: u32,
+    seq: u64,
+) -> &osslscope_ebpf_common::ScanRetEvent {
+    let hits: Vec<_> = rets
+        .iter()
+        .filter(|r| r.tid == tid && r.seq == seq)
+        .collect();
+    assert_eq!(hits.len(), 1, "exactly one RET for ({tid},{seq:#x})");
+    hits[0]
+}
+
+/// Join guards to their CALL by (tid,seq): at most one guard per
+/// admitted invocation (member 511 fires at most once per return).
+fn guards_for(
+    guards: &[osslscope_ebpf_common::GuardEvent],
+    tid: u32,
+    seq: u64,
+) -> Vec<&osslscope_ebpf_common::GuardEvent> {
+    let hits: Vec<_> = guards
+        .iter()
+        .filter(|g| g.tid == tid && g.seq == seq)
+        .collect();
+    assert!(hits.len() <= 1, "at most one guard for ({tid},{seq:#x})");
+    hits
+}
+
+/// Assert the retired end state (SCAN absent + RCOUNT IDLE|0) —
+/// the D per-return proof (every admitted return retires).
+fn assert_retired(loaded: &Loaded, tid: u32, tag: &str) {
+    use osslscope_ebpf_common as wire;
+    assert!(
+        read_scan_cell(loaded, tid).is_none(),
+        "{tag}: SCAN absent (retired)"
+    );
+    assert_eq!(
+        wire::split_rcount(read_u64_cell(loaded, "RCOUNT", tid).expect("RCOUNT kept")),
+        (0, wire::RCOUNT_STATE_IDLE),
+        "{tag}: RCOUNT IDLE|0"
+    );
+}
+
+/// D bridge-leg RET assert (live returns): one RET per CALL
+/// joined by (tid,seq), all non-EMPTY, guards empty, tid retired.
+fn assert_rets_live(
+    loaded: &Loaded,
+    calls: &[osslscope_ebpf_common::ScanCallEvent],
+    rets: &[osslscope_ebpf_common::ScanRetEvent],
+    guards: &[osslscope_ebpf_common::GuardEvent],
+    tag: &str,
+) {
+    use osslscope_ebpf_common as wire;
+    assert_eq!(rets.len(), calls.len(), "{tag}: one RET per query");
+    for c in calls {
+        let r = ret_for(rets, c.tid, c.seq);
+        assert_eq!(
+            (r.kind, r.op, r.flags),
+            (wire::KIND_SCAN_RET, OP, 0),
+            "{tag}: live RET shape"
+        );
+    }
+    assert!(guards.is_empty(), "{tag}: no guard");
+    assert_retired(loaded, self_tid(), tag);
 }
 
 /// Bridge-leg CALL assert: exactly `n` admitted CALLs on this tid
@@ -285,30 +373,6 @@ fn read_scan_cell(loaded: &Loaded, tid: u32) -> Option<osslscope_ebpf_common::Sc
     }
 }
 
-/// PENDING presence read (C-only — D drops the map): the 16B value
-/// decoded to (op, ns_ptr); None on ENOENT. The key namespaces by
-/// the entry cookie over this process's pid_tgid (BPF `pend_key`
-/// mirrored exactly).
-fn pend_key_for(pid: u32, tid: u32) -> u64 {
-    ((pid as u64) << 32 | tid as u64) ^ ((osslscope_ebpf_common::MEMBER_ENTRY_COOKIE + 1) << 56)
-}
-
-fn read_pending_cell(loaded: &Loaded, pid: u32, tid: u32) -> Option<(u64, u64)> {
-    use std::os::fd::AsRawFd as _;
-    let fd = loaded.maps["PENDING_QUERY"].as_raw_fd();
-    let mut val = [0u8; 16];
-    match unsafe {
-        ossl_bpf_sys::map_lookup_elem(fd, &pend_key_for(pid, tid).to_le_bytes(), &mut val)
-    } {
-        Ok(()) => Some((
-            u64::from_le_bytes(val[0..8].try_into().unwrap()),
-            u64::from_le_bytes(val[8..16].try_into().unwrap()),
-        )),
-        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => None,
-        Err(e) => panic!("lookup PENDING[{tid}]: {e}"),
-    }
-}
-
 /// ATTEMPT total (PerCpuArray[1] summed across CPUs).
 fn read_attempt(loaded: &Loaded) -> u64 {
     use aya::maps::{Map, MapData, PerCpuArray};
@@ -338,6 +402,15 @@ fn scan_bytes(r: &osslscope_ebpf_common::ScanRec) -> [u8; 40] {
     b[24..28].copy_from_slice(&r.expected.to_le_bytes());
     b[32..40].copy_from_slice(&r.epoch.to_le_bytes());
     b
+}
+
+/// T_CACHE test writer (harness helper, NOT production — the TRUE-T
+/// writer is item 4): inject (T, generation) for an array base.
+fn write_tcache(loaded: &Loaded, arr: u64, t: u64, generation: u64) {
+    let mut v = [0u8; 16];
+    v[0..8].copy_from_slice(&t.to_le_bytes());
+    v[8..16].copy_from_slice(&generation.to_le_bytes());
+    write_cell(loaded, "T_CACHE", &arr.to_le_bytes(), &v);
 }
 
 // ===== own-process query target =====
@@ -591,6 +664,7 @@ fn own_exe_cstr() -> std::ffi::CString {
 
 /// One live fixture slot: name + class + dispatch legs. A trailing
 /// terminator entry is appended automatically unless `no_term`.
+#[derive(Clone)]
 pub struct SlotSpec {
     pub name: String,
     pub class: u16,
@@ -603,6 +677,16 @@ pub struct SlotSpec {
 }
 
 impl SlotSpec {
+    pub fn noimp(name: &str, class: u16) -> SlotSpec {
+        SlotSpec {
+            name: name.to_string(),
+            class,
+            dispatch: Vec::new(),
+            no_term: false,
+            impl_null: true,
+        }
+    }
+
     pub fn live(name: &str, class: u16, dispatch: Vec<(u32, u64)>) -> SlotSpec {
         SlotSpec {
             name: name.to_string(),
@@ -942,7 +1026,11 @@ fn l1_load_513_margins() {
     let attached = attach_chunk(&obj, &exe, off);
     let loaded = &attached.loaded;
     assert_eq!(loaded.progs.len(), 513, "all member progs loaded");
-    assert_eq!(loaded.maps.len(), 14, "all member maps created");
+    assert_eq!(
+        loaded.maps.len(),
+        13,
+        "all member maps created (D dropped PENDING)"
+    );
     assert_eq!(attached.members.len(), 512, "all member links attached");
     let ctrl = osslscope::loader::read_ctrl(&loaded.maps).expect("read CTRL");
     assert_eq!(
@@ -1043,8 +1131,24 @@ fn run_e7(obj: &std::path::Path, exe: &std::ffi::CString, off: u64, cold: bool) 
         "e7-{temp}: {QUERIES} queries in {wall:?} ({:.1}µs/scan, recorded)",
         wall.as_micros() as f64 / QUERIES as f64
     );
-    let (calls, algs, rows) = drain(loaded);
-    assert_calls_admitted(&calls, QUERIES, "e7");
+    let d = drain(loaded);
+    assert_calls_admitted(&d.calls, QUERIES, "e7");
+    // D: one RET per query joined by (tid,seq), no guard (slot 511
+    // zero — cold boundary has no live 511), sequential admits
+    // quiet (retired between — D splits sequential from nested).
+    assert_eq!(d.rets.len(), QUERIES, "e7-{temp}: one RET per query");
+    assert!(d.guards.is_empty(), "e7-{temp}: no guard (slot 511 zero)");
+    for (k, c) in d.calls.iter().enumerate() {
+        assert!(
+            !call_parts(c).0,
+            "e7-{temp}: query {k} quiet (retired between)"
+        );
+        let r = ret_for(&d.rets, c.tid, c.seq);
+        assert_eq!((r.kind, r.op, r.flags), (wire::KIND_SCAN_RET, OP, 0));
+        assert_eq!(r.arr, fx.array, "e7-{temp}: RET array");
+    }
+    assert_retired(loaded, self_tid(), "e7");
+    let (algs, rows) = (d.algs, d.rows);
     assert_eq!(
         read_percpu(loaded, "CALLS", OP, false),
         QUERIES as u64,
@@ -1121,9 +1225,9 @@ fn run_e7_pageout(obj: &std::path::Path, exe: &std::ffi::CString, off: u64, fx: 
     FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
     NS_VERDICT.store(0, Ordering::SeqCst);
     fire(OP as i32, QUERIES);
-    let (calls, algs, rows) = drain(loaded);
-    assert_calls_admitted(&calls, QUERIES, "e7-cold");
-    assert_abort_clean(loaded, &algs, &rows, QUERIES as u64, "e7-cold");
+    let d = drain(loaded);
+    assert_calls_admitted(&d.calls, QUERIES, "e7-cold");
+    assert_abort_clean(loaded, &d, QUERIES as u64, "e7-cold");
 }
 
 /// Shared read-abort oracle (pageout-cold + munmap-hole).
@@ -1132,14 +1236,10 @@ fn run_e7_pageout(obj: &std::path::Path, exe: &std::ffi::CString, off: u64, fx: 
 /// the mapped zero tail reads fine and stays silent (names==0).
 /// Either way TRUNC holds WALK_READ alone, the member ring stays
 /// empty, the entry still counts (admit-bump precedes the walk),
-/// and nothing is lost.
-fn assert_abort_clean(
-    loaded: &Loaded,
-    algs: &[osslscope_ebpf_common::AlgEvent],
-    rows: &[osslscope_ebpf_common::RowEvent],
-    n: u64,
-    tag: &str,
-) {
+/// the invocation still retires with its RET (aborts never block
+/// retirement), no guard fires (slot 511 unreadable/zero), and
+/// nothing is lost.
+fn assert_abort_clean(loaded: &Loaded, d: &ScanDrain, n: u64, tag: &str) {
     use osslscope_ebpf_common as wire;
     assert_eq!(
         read_percpu(loaded, "TRUNC", OP, true),
@@ -1147,25 +1247,29 @@ fn assert_abort_clean(
         "{tag}: abort flags WALK_READ alone"
     );
     assert!(
-        algs.is_empty() && rows.is_empty(),
+        d.algs.is_empty() && d.rows.is_empty(),
         "{tag}: aborted members emit nothing"
     );
+    assert_eq!(d.rets.len(), n as usize, "{tag}: RETs still present");
+    assert!(d.guards.is_empty(), "{tag}: no guard on abort");
     assert_eq!(
         read_percpu(loaded, "CALLS", OP, false),
         n,
         "{tag}: aborted queries still counted"
     );
+    assert_retired(loaded, self_tid(), tag);
     assert_loss_zero(loaded);
 }
 
-/// Null queries (rv == 0) stay member-silent but are COUNTED in
-/// C (spec-mandated flip, R18 §6.2/§7C: the entry cannot see rv,
-/// so CALLS admit-bumps NULL too; member-0 QUERY_RET-EMPTY lands
-/// in D and asserts there). A positive control fires through the
-/// SAME links first: a dead attach would otherwise satisfy every
-/// null assert vacuously (T03 demands positive fire evidence per
+/// Null queries (rv == 0) stay ALG/ROW-silent but are COUNTED
+/// (spec-mandated flip, R18 §6.2/§7C: the entry cannot see rv, so
+/// CALLS admit-bumps NULL too) and present RET-EMPTY + retire
+/// (D re-pin, §10.2). A positive control fires through the SAME
+/// links first: a dead attach would otherwise satisfy every null
+/// assert vacuously (T03 demands positive fire evidence per
 /// firing leg).
 fn run_null(obj: &std::path::Path, exe: &std::ffi::CString, off: u64) {
+    use osslscope_ebpf_common as wire;
     let fx = Fixture::build(&e7_slots(), &[]);
     fx.pretouch();
     let attached = attach_chunk(obj, exe, off);
@@ -1175,39 +1279,51 @@ fn run_null(obj: &std::path::Path, exe: &std::ffi::CString, off: u64) {
     // Positive control: one live query proves these links fire.
     FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
     fire(OP as i32, 1);
-    let (calls, algs, rows) = drain(loaded);
-    assert_calls_admitted(&calls, 1, "null-control");
+    let d = drain(loaded);
+    assert_calls_admitted(&d.calls, 1, "null-control");
     assert_eq!(
         read_percpu(loaded, "CALLS", OP, false),
         1,
         "null-leg control: live query counted"
     );
     assert!(
-        !algs.is_empty() && !rows.is_empty(),
+        !d.algs.is_empty() && !d.rows.is_empty(),
         "null-leg control: live query emits"
     );
-    // Null phase: member silence, but the count advances (C flip:
-    // the entry cannot see rv — both nulls admitted + counted).
+    assert_eq!(d.rets.len(), 1, "null-leg control: RET");
+    assert_retired(loaded, self_tid(), "null-control");
+    // Null phase: ALG/ROW silence, but the count advances (the
+    // entry cannot see rv — both nulls admitted + counted) and
+    // each null presents RET-EMPTY + retires.
     FIXTURE_ARRAY.store(0, Ordering::SeqCst);
     fire(OP as i32, 2);
-    let (calls, algs, rows) = drain(loaded);
-    assert_calls_admitted(&calls, 2, "null-phase");
+    let d = drain(loaded);
+    assert_calls_admitted(&d.calls, 2, "null-phase");
     assert!(
-        algs.is_empty() && rows.is_empty(),
+        d.algs.is_empty() && d.rows.is_empty(),
         "null queries emit no member records"
     );
+    assert_eq!(d.rets.len(), 2, "null queries present RET");
+    for c in &d.calls {
+        let r = ret_for(&d.rets, c.tid, c.seq);
+        assert_eq!(r.flags, wire::RET_FLAG_EMPTY, "null marks EMPTY");
+        assert_eq!((r.op, r.arr), (OP, 0), "null RET shape");
+    }
+    assert!(d.guards.is_empty(), "null emits no guard");
+    assert_retired(loaded, self_tid(), "null-phase");
     assert_eq!(
         read_percpu(loaded, "CALLS", OP, false),
         3,
-        "null queries counted in C (control 1 + 2 nulls)"
+        "null queries counted (control 1 + 2 nulls)"
     );
     assert_loss_zero(loaded);
 }
 
 /// L3: empty / one / adjacent-tail / munmap-hole fixtures.
-/// Prefix-exact; the tail leg PINS v1's past-T reach (tail
-/// presence) — item 3's T-gate flips it to absence. The hole leg
-/// proves the read-abort path deterministically on every lane
+/// Prefix-exact; the tail block PINS cold presence (v1 reach on
+/// cold — the T-gate walks without a warm entry) while the
+/// L3-tail-warm D leg flips it to absence (T=3 injected). The hole
+/// leg proves the read-abort path deterministically on every lane
 /// (same member-side shape as swap-cold, no swap needed).
 #[test]
 #[ignore]
@@ -1229,8 +1345,15 @@ fn l3_boundaries() {
         FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
         NS_VERDICT.store(0, Ordering::SeqCst);
         fire(OP as i32, 2);
-        let (calls, algs, rows) = drain(loaded);
+        let ScanDrain {
+            calls,
+            rets,
+            guards,
+            algs,
+            rows,
+        } = drain(loaded);
         assert_calls_admitted(&calls, 2, "l3-empty");
+        assert_rets_live(loaded, &calls, &rets, &guards, "l3-empty");
         assert_eq!(read_percpu(loaded, "CALLS", OP, false), 2);
         assert_ne!(
             read_percpu(loaded, "TRUNC", OP, true) & wire::TRUNC_WALK_EMPTY,
@@ -1257,8 +1380,15 @@ fn l3_boundaries() {
         FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
         NS_VERDICT.store(0, Ordering::SeqCst);
         fire(OP as i32, 2);
-        let (calls, algs, rows) = drain(loaded);
+        let ScanDrain {
+            calls,
+            rets,
+            guards,
+            algs,
+            rows,
+        } = drain(loaded);
         assert_calls_admitted(&calls, 2, "l3-one");
+        assert_rets_live(loaded, &calls, &rets, &guards, "l3-one");
         assert_eq!(read_percpu(loaded, "CALLS", OP, false), 2);
         assert_eq!(
             read_percpu(loaded, "TRUNC", OP, true) & wire::TRUNC_WALK_EMPTY,
@@ -1291,7 +1421,9 @@ fn l3_boundaries() {
         assert_loss_zero(loaded);
     }
     // Adjacent tail: 3 live + term@3 + 3 planted @4..6. Prefix
-    // exact AND tail present (v1 walks past T — pinned gap).
+    // Cold presence pin (D: no warm entry → the T-gate walks —
+    // prefix exact AND tail present; the warm leg flips to
+    // absence).
     {
         let slots: Vec<SlotSpec> = (0..3u32)
             .map(|j| {
@@ -1323,8 +1455,15 @@ fn l3_boundaries() {
         FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
         NS_VERDICT.store(0, Ordering::SeqCst);
         fire(OP as i32, 2);
-        let (calls, algs, rows) = drain(loaded);
+        let ScanDrain {
+            calls,
+            rets,
+            guards,
+            algs,
+            rows,
+        } = drain(loaded);
         assert_calls_admitted(&calls, 2, "l3-tail");
+        assert_rets_live(loaded, &calls, &rets, &guards, "l3-tail");
         assert_eq!(read_percpu(loaded, "CALLS", OP, false), 2);
         for j in 0..3u64 {
             let got: Vec<_> = algs.iter().filter(|a| a.idx == j).collect();
@@ -1425,9 +1564,9 @@ fn l3_boundaries() {
             "hole errno is ENOMEM"
         );
         fire(OP as i32, 2);
-        let (calls, algs, rows) = drain(loaded);
-        assert_calls_admitted(&calls, 2, "l3-hole");
-        assert_abort_clean(loaded, &algs, &rows, 2, "l3-hole");
+        let d = drain(loaded);
+        assert_calls_admitted(&d.calls, 2, "l3-hole");
+        assert_abort_clean(loaded, &d, 2, "l3-hole");
     }
 }
 
@@ -1462,8 +1601,15 @@ fn l4_dispatch_bounds() {
         FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
         NS_VERDICT.store(0, Ordering::SeqCst);
         fire(OP as i32, 2);
-        let (calls, algs, rows) = drain(loaded);
+        let ScanDrain {
+            calls,
+            rets,
+            guards,
+            algs,
+            rows,
+        } = drain(loaded);
         assert_calls_admitted(&calls, 2, "l4a");
+        assert_rets_live(loaded, &calls, &rets, &guards, "l4a");
         assert_eq!(read_percpu(loaded, "CALLS", OP, false), 2);
         assert_eq!(
             read_percpu(loaded, "TRUNC", OP, true),
@@ -1511,8 +1657,15 @@ fn l4_dispatch_bounds() {
         FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
         NS_VERDICT.store(0, Ordering::SeqCst);
         fire(OP as i32, 2);
-        let (calls, algs, rows) = drain(loaded);
+        let ScanDrain {
+            calls,
+            rets,
+            guards,
+            algs,
+            rows,
+        } = drain(loaded);
         assert_calls_admitted(&calls, 2, "l4b");
+        assert_rets_live(loaded, &calls, &rets, &guards, "l4b");
         assert_eq!(read_percpu(loaded, "CALLS", OP, false), 2);
         assert_eq!(
             read_percpu(loaded, "TRUNC", OP, true),
@@ -1563,8 +1716,15 @@ fn l4_dispatch_bounds() {
         FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
         NS_VERDICT.store(0, Ordering::SeqCst);
         fire(OP as i32, 2);
-        let (calls, algs, rows) = drain(loaded);
+        let ScanDrain {
+            calls,
+            rets,
+            guards,
+            algs,
+            rows,
+        } = drain(loaded);
         assert_calls_admitted(&calls, 2, "l4c");
+        assert_rets_live(loaded, &calls, &rets, &guards, "l4c");
         assert_eq!(read_percpu(loaded, "CALLS", OP, false), 2);
         assert_eq!(
             read_percpu(loaded, "TRUNC", OP, true),
@@ -1638,8 +1798,15 @@ fn l5_no_store() {
     );
     NS_VERDICT.store(0, Ordering::SeqCst);
     fire(OP as i32, 1);
-    let (calls, algs, rows) = drain(loaded);
+    let ScanDrain {
+        calls,
+        rets,
+        guards,
+        algs,
+        rows,
+    } = drain(loaded);
     assert_calls_admitted(&calls, 3, "l5");
+    assert_rets_live(loaded, &calls, &rets, &guards, "l5");
     assert_eq!(read_percpu(loaded, "CALLS", OP, false), 3);
     // Masked, not exact: this fixture is unpadded, so members past
     // the terminator read names-region memory and may OR past-T soup
@@ -1730,8 +1897,36 @@ fn l6_full_chunk() {
         let t0 = Instant::now();
         fire(OP as i32, 2);
         eprintln!("l6a: 2 full scans in {:?} (recorded)", t0.elapsed());
-        let (calls, algs, rows) = drain(loaded);
+        let ScanDrain {
+            calls,
+            rets,
+            guards,
+            algs,
+            rows,
+        } = drain(loaded);
         assert_calls_admitted(&calls, 2, "l6a");
+        // D: RETs joined + cold guard (slot 511 live, slot 512
+        // term → GUARD EMPTY, no TRUNC) + retire.
+        assert_eq!(rets.len(), 2, "l6a: one RET per query");
+        for c in &calls {
+            let r = ret_for(&rets, c.tid, c.seq);
+            assert_eq!((r.kind, r.op, r.flags), (wire::KIND_SCAN_RET, OP, 0));
+        }
+        assert_eq!(
+            guards.len(),
+            2,
+            "l6a: guard fires per scan (cold, 511 live)"
+        );
+        for c in &calls {
+            let g = guards_for(&guards, c.tid, c.seq);
+            assert_eq!(g.len(), 1, "l6a: one guard per scan");
+            assert_eq!(
+                (g[0].kind, g[0].op, g[0].verdict, g[0].arr),
+                (wire::KIND_GUARD, OP, wire::GUARD_EMPTY, fx.array),
+                "l6a: GUARD EMPTY joined by (tid,seq)"
+            );
+        }
+        assert_retired(loaded, self_tid(), "l6a");
         assert_eq!(read_percpu(loaded, "CALLS", OP, false), 2);
         assert_eq!(
             read_percpu(loaded, "TRUNC", OP, true),
@@ -1787,8 +1982,37 @@ fn l6_full_chunk() {
         FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
         NS_VERDICT.store(0, Ordering::SeqCst);
         fire(OP as i32, 2);
-        let (calls, algs, rows) = drain(loaded);
+        let ScanDrain {
+            calls,
+            rets,
+            guards,
+            algs,
+            rows,
+        } = drain(loaded);
         assert_calls_admitted(&calls, 2, "l6b");
+        // D: RETs joined + cold guard (slot 511 live, slot 512
+        // live → GUARD VALID + TRUNC_ALGS, guard-exclusive) +
+        // retire.
+        assert_eq!(rets.len(), 2, "l6b: one RET per query");
+        for c in &calls {
+            let r = ret_for(&rets, c.tid, c.seq);
+            assert_eq!((r.kind, r.op, r.flags), (wire::KIND_SCAN_RET, OP, 0));
+        }
+        assert_eq!(
+            guards.len(),
+            2,
+            "l6b: guard fires per scan (cold, 511 live)"
+        );
+        for c in &calls {
+            let g = guards_for(&guards, c.tid, c.seq);
+            assert_eq!(g.len(), 1, "l6b: one guard per scan");
+            assert_eq!(
+                (g[0].kind, g[0].op, g[0].verdict, g[0].arr),
+                (wire::KIND_GUARD, OP, wire::GUARD_VALID, fx.array),
+                "l6b: GUARD VALID joined by (tid,seq)"
+            );
+        }
+        assert_retired(loaded, self_tid(), "l6b");
         assert_eq!(read_percpu(loaded, "CALLS", OP, false), 2);
         assert_eq!(
             read_percpu(loaded, "TRUNC", OP, true),
@@ -1872,8 +2096,18 @@ fn l7_cookie_mismatch() {
     .expect("re-attach member_3 with cookie 7");
     drop(std::mem::replace(&mut attached.members[3], m3));
     fire(OP as i32, 2);
-    let (calls, algs, rows) = drain(loaded);
+    let ScanDrain {
+        calls,
+        rets,
+        guards,
+        algs,
+        rows,
+    } = drain(loaded);
     assert_calls_admitted(&calls, 2, "l7");
+    // D: the mismatched member still bumps + runs the gated
+    // epilogue (the scan completes, its slot holes — §6.4) — RETs
+    // joined, retired, no guard (slot 511 zero).
+    assert_rets_live(loaded, &calls, &rets, &guards, "l7");
     assert_eq!(read_percpu(loaded, "CALLS", OP, false), 2);
     for j in [0u64, 1, 2] {
         let got: Vec<_> = algs.iter().filter(|a| a.idx == j).collect();
@@ -1927,85 +2161,15 @@ fn l7_cookie_mismatch() {
 
 // ===== stage-C legs (R18 §7C; lane only) =====
 
-/// C admit-shape: fresh tid admits (CALL + seq 0, no hint, SCAN
-/// cell exact, RCOUNT ACTIVE|0, PENDING present — C-only, CALLS 1);
-/// second admit on the same tid carries NESTED-HINT (asserted as
-/// correct-for-C — no retirement exists; D retires between and
-/// replaces these asserts with the retire-quiet pair, §10.2).
-#[test]
-#[ignore]
-fn c_admit_shape() {
-    use osslscope_ebpf_common as wire;
-    let Some(obj) = gated() else {
-        eprintln!("SKIP(members-live): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
-        return;
-    };
-    let exe = own_exe_cstr();
-    let off = query_off();
-    let attached = attach_chunk(&obj, &exe, off);
-    let loaded = &attached.loaded;
-    let tid = self_tid();
-    let pid = std::process::id();
-    FIXTURE_ARRAY.store(0, Ordering::SeqCst); // NULL: entry-side only
-    NS_VERDICT.store(0, Ordering::SeqCst);
-    fire(OP as i32, 1);
-    let (calls, algs, rows) = drain(loaded);
-    assert_eq!(calls.len(), 1, "one CALL per admit");
-    let c = &calls[0];
-    assert_eq!((c.kind, c.op, c.tid), (wire::KIND_SCAN_CALL, OP, tid));
-    assert_eq!(
-        call_parts(c),
-        (false, wire::SKIP_ADMITTED),
-        "seq-0 admit: silent"
-    );
-    assert_eq!(c.seq, wire::make_seq(0, 0), "fresh tid mints (0,0)");
-    assert!(algs.is_empty() && rows.is_empty(), "NULL: member silence");
-    let rec = read_scan_cell(loaded, tid).expect("SCAN published");
-    assert_eq!(
-        (rec.op, rec.seq, rec.expected, rec.epoch),
-        (OP as u64, wire::make_seq(0, 0), 512, 1),
-        "SCAN cell exact (EXPECTED+epoch frozen from CTRL)"
-    );
-    assert_ne!(rec.ns_ptr, 0, "SCAN stashes the caller out-pointer");
-    let rc = read_u64_cell(loaded, "RCOUNT", tid).expect("RCOUNT reset");
-    assert_eq!(
-        wire::split_rcount(rc),
-        (0, wire::RCOUNT_STATE_ACTIVE),
-        "RCOUNT ACTIVE|0"
-    );
-    let pend = read_pending_cell(loaded, pid, tid).expect("PENDING present (C-only)");
-    assert_eq!(pend.0, OP as u64, "PENDING op");
-    assert_ne!(pend.1, 0, "PENDING ns_ptr");
-    assert_eq!(
-        wire::split_seq(read_u64_cell(loaded, "SEQ", tid).expect("SEQ minted")),
-        (0, 0)
-    );
-    assert_eq!(read_percpu(loaded, "CALLS", OP, false), 1, "CALLS 1");
-    assert_eq!(read_attempt(loaded), 1, "ATTEMPT 1");
-    assert_loss_zero(loaded);
-    // Second admit, same tid: seq 1 WITH nested-hint
-    // (correct-for-C — the record is unretired, ACTIVE, count 0).
-    fire(OP as i32, 1);
-    let (calls, _, _) = drain(loaded);
-    assert_eq!(calls.len(), 1);
-    assert_eq!(
-        call_parts(&calls[0]),
-        (true, wire::SKIP_ADMITTED),
-        "second same-tid admit hints (C convention)"
-    );
-    assert_eq!(calls[0].seq, wire::make_seq(0, 1));
-    assert_eq!(read_percpu(loaded, "CALLS", OP, false), 2);
-    assert_eq!(read_attempt(loaded), 2);
-    assert_loss_zero(loaded);
-}
-
-/// Skip-case driver (R18 §7C 4-tuple): fresh attach, same-attach
-/// admit-control (positive fire evidence — T03), drain, baseline,
-/// `setup` arms the skip condition, one fire, exact 4-tuple
-/// (cause, ATTEMPTΔ==1 single count, CALLSΔ, state-delta) +
-/// member silence + loss pin. `check_cells` asserts the
-/// case-specific RCOUNT/SEQ end state (uniform parts assert here:
-/// PENDING absent + SCAN absent — C-only PENDING readback).
+/// Skip-case driver (R18 §7C 4-tuple, RE-PINNED for D — §10.2):
+/// fresh attach, same-attach admit-control (positive fire evidence
+/// — T03), drain, baseline, `setup` arms the skip condition, one
+/// fire, exact 4-tuple (cause, ATTEMPTΔ==1 single count, CALLSΔ,
+/// state-delta) + member silence + loss pin. D re-pins: the
+/// PENDING readback is dropped (map gone) and the skip phase
+/// asserts no-RET/no-guard member silence; the control asserts its
+/// RET + retirement. `check_cells` asserts the case-specific
+/// RCOUNT/SEQ end state (uniform SCAN-absent asserts here).
 #[allow(
     clippy::too_many_arguments,
     reason = "one driver for 8 skip shapes; bundling would hide the 4-tuple"
@@ -2024,24 +2188,20 @@ fn skip_case(
     let attached = attach_chunk(obj, exe, off);
     let loaded = &attached.loaded;
     let tid = self_tid();
-    let pid = std::process::id();
     FIXTURE_ARRAY.store(0, Ordering::SeqCst);
     NS_VERDICT.store(0, Ordering::SeqCst);
     // Admit-control: same attach, must admit (else the skip below
     // could be a dead attach, not the armed condition).
     fire(OP as i32, 1);
-    let (calls, _, _) = drain(loaded);
-    assert_eq!(calls.len(), 1, "{tag}: control CALL");
+    let d = drain(loaded);
+    assert_eq!(d.calls.len(), 1, "{tag}: control CALL");
     assert_eq!(
-        call_parts(&calls[0]),
+        call_parts(&d.calls[0]),
         (false, wire::SKIP_ADMITTED),
         "{tag}: control admits"
     );
-    assert!(
-        read_pending_cell(loaded, pid, tid).is_some(),
-        "{tag}: control PENDING"
-    );
-    assert!(read_scan_cell(loaded, tid).is_some(), "{tag}: control SCAN");
+    assert_eq!(d.rets.len(), 1, "{tag}: control RET");
+    assert_retired(loaded, tid, tag);
     let (attempt0, calls0, loss0) = (
         read_attempt(loaded),
         read_percpu(loaded, "CALLS", OP, false),
@@ -2049,9 +2209,9 @@ fn skip_case(
     );
     setup(loaded);
     fire(OP as i32, 1);
-    let (calls, algs, rows) = drain(loaded);
-    assert_eq!(calls.len(), 1, "{tag}: skip CALL");
-    let c = &calls[0];
+    let d = drain(loaded);
+    assert_eq!(d.calls.len(), 1, "{tag}: skip CALL");
+    let c = &d.calls[0];
     assert_eq!(c.tid, tid, "{tag}: skip CALL tid");
     assert_eq!(call_parts(c), (false, cause), "{tag}: skip cause");
     assert_eq!(c.seq, 0, "{tag}: skips carry seq 0");
@@ -2071,13 +2231,11 @@ fn skip_case(
         "{tag}: LOSS[{loss}]Δ==1"
     );
     assert!(
-        algs.is_empty() && rows.is_empty(),
+        d.algs.is_empty() && d.rows.is_empty(),
         "{tag}: skip member silence"
     );
-    assert!(
-        read_pending_cell(loaded, pid, tid).is_none(),
-        "{tag}: PENDING absent (C-only)"
-    );
+    assert!(d.rets.is_empty(), "{tag}: skip emits no RET");
+    assert!(d.guards.is_empty(), "{tag}: skip emits no guard");
     assert!(read_scan_cell(loaded, tid).is_none(), "{tag}: SCAN absent");
     check_cells(loaded, tid);
 }
@@ -2197,16 +2355,17 @@ fn c_skip_causes() {
         let mut attached = attach_chunk(&obj, &exe, off);
         let loaded = &attached.loaded;
         let tid = self_tid();
-        let pid = std::process::id();
         FIXTURE_ARRAY.store(0, Ordering::SeqCst);
         NS_VERDICT.store(0, Ordering::SeqCst);
         fire(OP as i32, 1);
-        let (calls, _, _) = drain(loaded);
+        let d = drain(loaded);
         assert_eq!(
-            call_parts(&calls[0]),
+            call_parts(&d.calls[0]),
             (false, wire::SKIP_ADMITTED),
             "cookie: control"
         );
+        assert_eq!(d.rets.len(), 1, "cookie: control RET");
+        assert_retired(loaded, tid, "cookie");
         let bad = ossl_bpf_sys::link_create_uprobe_multi(
             loaded.progs["member_entry"].as_raw_fd(),
             &exe,
@@ -2221,15 +2380,19 @@ fn c_skip_causes() {
             read_percpu(loaded, "CALLS", OP, false),
         );
         fire(OP as i32, 1);
-        let (calls, algs, rows) = drain(loaded);
-        assert_eq!(calls.len(), 1);
-        assert_eq!(call_parts(&calls[0]), (false, wire::SKIP_ENTRY_COOKIE));
-        assert_eq!(calls[0].seq, 0);
+        let d = drain(loaded);
+        assert_eq!(d.calls.len(), 1);
+        assert_eq!(call_parts(&d.calls[0]), (false, wire::SKIP_ENTRY_COOKIE));
+        assert_eq!(d.calls[0].seq, 0);
         assert_eq!(read_attempt(loaded) - attempt0, 1, "cookie: ATTEMPTΔ==1");
         assert_eq!(read_percpu(loaded, "CALLS", OP, false) - calls0, 0);
         assert_loss_only(loaded, wire::LOSS_ENTRY_COOKIE, 1, "cookie");
-        assert!(algs.is_empty() && rows.is_empty(), "cookie: member silence");
-        assert!(read_pending_cell(loaded, pid, tid).is_none());
+        assert!(
+            d.algs.is_empty() && d.rows.is_empty(),
+            "cookie: member silence"
+        );
+        assert!(d.rets.is_empty(), "cookie: skip emits no RET");
+        assert!(d.guards.is_empty(), "cookie: skip emits no guard");
         assert!(read_scan_cell(loaded, tid).is_none());
         assert_eq!(
             wire::split_rcount(read_u64_cell(loaded, "RCOUNT", tid).expect("RCOUNT kept")),
@@ -2263,11 +2426,12 @@ fn c_skip_causes() {
     }
 }
 
-/// C birth-pending (cause 1): the skip fires on a FRESH
-/// UNREGISTERED worker tid (no BIRTH row) after a same-attach
-/// main-tid admit-control. The skip creates nothing (RCOUNT/SEQ
-/// stay missing for the worker tid — the SKIP path never creates
-/// cells); main-tid cells are untouched.
+/// C birth-pending (cause 1), RE-PINNED for D: the skip fires on
+/// a FRESH UNREGISTERED worker tid (no BIRTH row) after a
+/// same-attach main-tid admit-control. The skip creates nothing
+/// (RCOUNT/SEQ stay missing for the worker tid — the SKIP path
+/// never creates cells) and emits no RET/guard; the control
+/// retired.
 #[test]
 #[ignore]
 fn c_skip_birth_pending() {
@@ -2281,16 +2445,17 @@ fn c_skip_birth_pending() {
     let attached = attach_chunk(&obj, &exe, off);
     let loaded = &attached.loaded;
     let tid = self_tid();
-    let pid = std::process::id();
     FIXTURE_ARRAY.store(0, Ordering::SeqCst);
     NS_VERDICT.store(0, Ordering::SeqCst);
     fire(OP as i32, 1);
-    let (calls, _, _) = drain(loaded);
+    let d = drain(loaded);
     assert_eq!(
-        call_parts(&calls[0]),
+        call_parts(&d.calls[0]),
         (false, wire::SKIP_ADMITTED),
         "control admits"
     );
+    assert_eq!(d.rets.len(), 1, "control RET");
+    assert_retired(loaded, tid, "control");
     let (attempt0, calls0) = (
         read_attempt(loaded),
         read_percpu(loaded, "CALLS", OP, false),
@@ -2306,11 +2471,11 @@ fn c_skip_birth_pending() {
         .expect("worker join")
     });
     assert_ne!(wtid, tid, "worker tid is fresh");
-    let (calls, algs, rows) = drain(loaded);
-    assert_eq!(calls.len(), 1, "skip CALL");
-    assert_eq!(calls[0].tid, wtid);
-    assert_eq!(call_parts(&calls[0]), (false, wire::SKIP_BIRTH_PENDING));
-    assert_eq!(calls[0].seq, 0);
+    let d = drain(loaded);
+    assert_eq!(d.calls.len(), 1, "skip CALL");
+    assert_eq!(d.calls[0].tid, wtid);
+    assert_eq!(call_parts(&d.calls[0]), (false, wire::SKIP_BIRTH_PENDING));
+    assert_eq!(d.calls[0].seq, 0);
     assert_eq!(read_attempt(loaded) - attempt0, 1, "ATTEMPTΔ==1");
     assert_eq!(
         read_percpu(loaded, "CALLS", OP, false) - calls0,
@@ -2318,9 +2483,13 @@ fn c_skip_birth_pending() {
         "CALLSΔ==0"
     );
     assert_loss_only(loaded, wire::LOSS_BIRTH_PENDING, 1, "birth-pending");
-    assert!(algs.is_empty() && rows.is_empty(), "skip member silence");
+    assert!(
+        d.algs.is_empty() && d.rows.is_empty(),
+        "skip member silence"
+    );
+    assert!(d.rets.is_empty(), "skip emits no RET");
+    assert!(d.guards.is_empty(), "skip emits no guard");
     // Skip creates nothing for the worker tid...
-    assert!(read_pending_cell(loaded, pid, wtid).is_none());
     assert!(read_scan_cell(loaded, wtid).is_none());
     assert!(
         read_u64_cell(loaded, "RCOUNT", wtid).is_none(),
@@ -2330,24 +2499,15 @@ fn c_skip_birth_pending() {
         read_u64_cell(loaded, "SEQ", wtid).is_none(),
         "SEQ never created"
     );
-    // ...and touches nothing of the control's cells.
-    assert!(
-        read_pending_cell(loaded, pid, tid).is_some(),
-        "control PENDING kept"
-    );
-    assert!(read_scan_cell(loaded, tid).is_some(), "control SCAN kept");
-    assert_eq!(
-        wire::split_rcount(read_u64_cell(loaded, "RCOUNT", tid).expect("control RCOUNT")),
-        (0, wire::RCOUNT_STATE_ACTIVE),
-        "control RCOUNT still ACTIVE"
-    );
+    // ...and the control's retired cells are untouched.
+    assert_retired(loaded, tid, "control");
 }
 
 /// C nested-hint via TRUE same-thread recursion (depth-1
 /// self-calling target — hint bit + supersede, no map
-/// programming). Persists in D (§10.2). Entry-side asserts only
-/// (the C interim PENDING overwrite duplicates outer evidence —
-/// asserted nonzero for vitality, never attributed).
+/// programming). Persists in D (§10.2): the CALL/hint asserts are
+/// identical; D adds the retirement consequence (inner return
+/// retires, outer SCAN-misses — inner evidence attributable).
 #[test]
 #[ignore]
 fn c_nested_hint() {
@@ -2375,111 +2535,43 @@ fn c_nested_hint() {
     FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
     NS_VERDICT.store(0, Ordering::SeqCst);
     fire_nested(OP as i32, 1);
-    let (calls, algs, rows) = drain(loaded);
-    assert_eq!(calls.len(), 2, "outer + inner CALLs");
+    let d = drain(loaded);
+    assert_eq!(d.calls.len(), 2, "outer + inner CALLs");
     assert_eq!(
-        call_parts(&calls[0]),
+        call_parts(&d.calls[0]),
         (false, wire::SKIP_ADMITTED),
         "outer: no hint"
     );
-    assert_eq!(calls[0].seq, wire::make_seq(0, 0));
+    assert_eq!(d.calls[0].seq, wire::make_seq(0, 0));
     assert_eq!(
-        call_parts(&calls[1]),
+        call_parts(&d.calls[1]),
         (true, wire::SKIP_ADMITTED),
         "inner: NESTED-HINT"
     );
-    assert_eq!(calls[1].seq, wire::make_seq(0, 1));
-    assert!(calls.iter().all(|c| c.tid == tid && c.op == OP));
-    // Supersede: the inner record stands (SCAN seq 1, PENDING inner).
-    let rec = read_scan_cell(loaded, tid).expect("SCAN stands");
-    assert_eq!(rec.seq, wire::make_seq(0, 1), "inner record supersedes");
-    assert_eq!(rec.expected, 512);
-    assert_eq!(rec.epoch, 1);
+    assert_eq!(d.calls[1].seq, wire::make_seq(0, 1));
+    assert!(d.calls.iter().all(|c| c.tid == tid && c.op == OP));
+    // D: the inner return retires (its 512 members reach expected)
+    // while the outer return SCAN-misses (inner evidence stands
+    // alone — attributable in D, unlike C's interim duplicate).
+    assert_eq!(d.rets.len(), 1, "inner RET only (outer SCAN-misses)");
+    let r = ret_for(&d.rets, tid, wire::make_seq(0, 1));
+    assert_eq!((r.kind, r.op, r.flags), (wire::KIND_SCAN_RET, OP, 0));
+    assert_eq!(r.arr, fx.array, "RET array");
+    assert!(d.guards.is_empty(), "no guard (slot 511 zero)");
+    assert!(read_scan_cell(loaded, tid).is_none(), "inner retired");
     assert_eq!(
         wire::split_rcount(read_u64_cell(loaded, "RCOUNT", tid).expect("RCOUNT")),
-        (0, wire::RCOUNT_STATE_ACTIVE)
+        (1024, wire::RCOUNT_STATE_IDLE),
+        "inner 512 + outer 512 bump-if-present (IDLE)"
     );
     assert_eq!(read_percpu(loaded, "CALLS", OP, false), 2, "both counted");
     assert_eq!(read_attempt(loaded), 2);
     assert_loss_zero(loaded);
-    // Vitality only: both returns walked (PENDING present at both —
-    // the interim overwrite duplicates inner evidence; C never
-    // attributes member evidence).
-    assert!(!algs.is_empty() && !rows.is_empty(), "both returns walked");
-}
-
-/// C nested-skip (§7C exact): prime 64B via two undrained NULL
-/// queries on a sacrificial tid, baseline counters after priming,
-/// execute outer/inner on a fresh tid at T=88 — outer admits at
-/// 64 (CALL → 96), inner pressure-skips. The nested skip deletes
-/// the outer record (tainted absence for item 4 — the ring CALLs
-/// retain the superseded invocation). Replaced by nested-skip-D
-/// (§10.2: IDLE|0 → IDLE|1024 + RET/guard absence).
-#[test]
-#[ignore]
-fn c_nested_skip() {
-    use osslscope_ebpf_common as wire;
-    let Some(obj) = gated() else {
-        eprintln!("SKIP(members-live): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
-        return;
-    };
-    let exe = own_exe_cstr();
-    let off = symbol_off("osslscope_member_query_nested");
-    let attached = attach_with_ctrl(&obj, &exe, off, &wire::ctrl_value(512, 1, 88));
-    let loaded = &attached.loaded;
-    let mut state = BirthState::new();
-    let tid = self_tid();
-    let pid = std::process::id();
-    FIXTURE_ARRAY.store(0, Ordering::SeqCst); // NULL throughout
-    NS_VERDICT.store(0, Ordering::SeqCst);
-    // Prime 64B on a sacrificial tid (two admitted NULL CALLs).
-    let sacrificial = fire_on_worker(loaded, OP as i32, 2);
-    assert_ne!(sacrificial, tid);
-    register(loaded, &mut state, &[tid]);
-    let (attempt0, calls0, loss0) = (
-        read_attempt(loaded),
-        read_percpu(loaded, "CALLS", OP, false),
-        read_percpu(loaded, "LOSS", wire::LOSS_RING_PRESSURE, false),
-    );
-    fire_nested(OP as i32, 1);
-    let (calls, algs, rows) = drain(loaded);
-    // Filter to the leg tid (priming CALLs still occupy the ring).
-    let mine: Vec<_> = calls.iter().filter(|c| c.tid == tid).collect();
-    assert_eq!(mine.len(), 2, "outer-CALL + inner-CALL");
-    assert_eq!(
-        call_parts(mine[0]),
-        (false, wire::SKIP_ADMITTED),
-        "outer admits at 64"
-    );
-    assert_eq!(mine[0].seq, wire::make_seq(0, 0));
-    assert_eq!(
-        call_parts(mine[1]),
-        (false, wire::SKIP_RING_PRESSURE),
-        "inner pressure-skips at 96"
-    );
-    assert_eq!(mine[1].seq, 0);
-    assert_eq!(
-        read_percpu(loaded, "CALLS", OP, false) - calls0,
-        1,
-        "CALLS Δ1"
-    );
-    assert_eq!(read_attempt(loaded) - attempt0, 2, "ATTEMPT Δ2");
-    assert_eq!(
-        read_percpu(loaded, "LOSS", wire::LOSS_RING_PRESSURE, false) - loss0,
-        1,
-        "LOSS23 Δ1"
-    );
-    assert!(algs.is_empty() && rows.is_empty(), "zero member emissions");
-    assert!(read_scan_cell(loaded, tid).is_none(), "SCAN absent");
-    assert_eq!(
-        wire::split_rcount(read_u64_cell(loaded, "RCOUNT", tid).expect("RCOUNT kept")),
-        (0, wire::RCOUNT_STATE_IDLE),
-        "RCOUNT IDLE|0 (v1 members don't bump)"
-    );
-    assert!(
-        read_pending_cell(loaded, pid, tid).is_none(),
-        "PENDING absent (C-only)"
-    );
+    // Inner evidence stands alone: exactly one walk of the 2 live
+    // slots (outer silent — SCAN-miss).
+    assert_eq!(d.algs.len(), 2, "inner walked once");
+    assert_eq!(d.rows.len(), 2);
+    assert!(d.algs.iter().all(|a| a.arr == fx.array));
 }
 
 /// C stale-complete trio via programmed cells (persists in D —
@@ -2519,20 +2611,19 @@ fn c_stale_trio() {
         &wire::make_rcount(0, wire::RCOUNT_STATE_IDLE).to_le_bytes(),
     );
     fire(OP as i32, 1);
-    let (calls, _, _) = drain(loaded);
-    assert_eq!(calls.len(), 1);
+    let d = drain(loaded);
+    assert_eq!(d.calls.len(), 1);
     assert_eq!(
-        call_parts(&calls[0]),
+        call_parts(&d.calls[0]),
         (false, wire::SKIP_ADMITTED),
         "(a): no hint"
     );
-    assert_eq!(calls[0].seq, wire::make_seq(0, 0));
+    assert_eq!(d.calls[0].seq, wire::make_seq(0, 0));
     assert_loss_zero(loaded);
-    assert_eq!(
-        read_scan_cell(loaded, tid).expect("SCAN republished").op,
-        OP as u64,
-        "(a): fresh record published"
-    );
+    // The fresh record published at entry, then retired at return
+    // (NULL: EMPTY RET + retire — D's new facts).
+    assert_eq!(d.rets.len(), 1, "(a): RET");
+    assert_retired(loaded, tid, "(a)");
     // (b) ACTIVE+expected: loud repair (LOSS 31).
     write_cell(loaded, "SCAN", &tid.to_le_bytes(), &scan_bytes(&stale));
     write_cell(
@@ -2542,15 +2633,17 @@ fn c_stale_trio() {
         &wire::make_rcount(512, wire::RCOUNT_STATE_ACTIVE).to_le_bytes(),
     );
     fire(OP as i32, 1);
-    let (calls, _, _) = drain(loaded);
-    assert_eq!(calls.len(), 1);
+    let d = drain(loaded);
+    assert_eq!(d.calls.len(), 1);
     assert_eq!(
-        call_parts(&calls[0]),
+        call_parts(&d.calls[0]),
         (false, wire::SKIP_ADMITTED),
         "(b): no hint"
     );
-    assert_eq!(calls[0].seq, wire::make_seq(0, 1));
+    assert_eq!(d.calls[0].seq, wire::make_seq(0, 1));
     assert_loss_only(loaded, wire::LOSS_STALE_REPAIRED, 1, "(b)");
+    assert_eq!(d.rets.len(), 1, "(b): RET");
+    assert_retired(loaded, tid, "(b)");
     // (c) SCAN-without-RCOUNT: loud repair (needs an RCOUNT-less
     // tid — a registered-but-unfired worker).
     let (wtid_tx, wtid_rx) = std::sync::mpsc::channel::<u32>();
@@ -2572,19 +2665,21 @@ fn c_stale_trio() {
         write_cell(loaded, "SCAN", &w.to_le_bytes(), &scan_bytes(&stale));
         go.wait();
     });
-    let (calls, _, _) = drain(loaded);
-    assert_eq!(calls.len(), 1);
+    let d = drain(loaded);
+    assert_eq!(d.calls.len(), 1);
     assert_eq!(
-        call_parts(&calls[0]),
+        call_parts(&d.calls[0]),
         (false, wire::SKIP_ADMITTED),
         "(c): no hint"
     );
     assert_eq!(
-        calls[0].seq,
+        d.calls[0].seq,
         wire::make_seq(0, 0),
         "(c): worker SEQ starts at 0"
     );
     assert_loss_only(loaded, wire::LOSS_STALE_REPAIRED, 2, "(c): second LOSS31");
+    assert_eq!(d.rets.len(), 1, "(c): RET");
+    assert_retired(loaded, d.calls[0].tid, "(c)");
 }
 
 /// C programmed-epoch churn (persists in D — §10.2): a record
@@ -2620,161 +2715,27 @@ fn c_churn_programmed() {
         &wire::make_rcount(0, wire::RCOUNT_STATE_ACTIVE).to_le_bytes(),
     );
     fire(OP as i32, 1);
-    let (calls, _, _) = drain(loaded);
-    assert_eq!(calls.len(), 1);
+    let d = drain(loaded);
+    assert_eq!(d.calls.len(), 1);
     assert_eq!(
-        call_parts(&calls[0]),
+        call_parts(&d.calls[0]),
         (false, wire::SKIP_ADMITTED),
         "churn: never a hint"
     );
     assert_loss_only(loaded, wire::LOSS_SCAN_CHURNED, 1, "churn");
-    let rec = read_scan_cell(loaded, tid).expect("fresh record published");
-    assert_eq!((rec.epoch, rec.expected), (1, 512), "fresh epoch frozen");
-}
-
-/// Pipe-blocked churn driver (C/D contrast pair — §10.2): a worker
-/// blocks inside its first query (entry admitted, return pending);
-/// the harness bumps epoch behind it (and, for detach-C, detaches
-/// member 7 first). C has no retirement, so the record survives →
-/// the worker's second take churns (LOSS 25). Entry-observable
-/// half only.
-fn run_blocked_churn(obj: &std::path::Path, detach_member_7: bool, tag: &str) {
-    use osslscope_ebpf_common as wire;
-    let exe = own_exe_cstr();
-    let off = symbol_off("osslscope_member_query_blocking");
-    let mut attached = attach_chunk(obj, &exe, off);
-    let loaded = &attached.loaded;
-    let pid = std::process::id();
-    let slots = vec![SlotSpec::live("MCH0", 100, vec![(63, 0x6300)])];
-    let fx = Fixture::build(&slots, &[]);
-    fx.pretouch();
-    populate_alg_class(loaded, &fx.classes);
-    FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
-    NS_VERDICT.store(0, Ordering::SeqCst);
-    // Pipe + latch for the one blocked call.
-    let mut fds = [0i32; 2];
-    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
-    BLOCK_PIPE_RD.store(fds[0], Ordering::SeqCst);
-    BLOCK_ENTERED.store(0, Ordering::SeqCst);
-    BLOCK_ONCE.store(1, Ordering::SeqCst);
-    let (wtid_tx, wtid_rx) = std::sync::mpsc::channel::<u32>();
-    let go = std::sync::Barrier::new(2);
-    std::thread::scope(|s| {
-        s.spawn(|| {
-            let w = self_tid();
-            wtid_tx.send(w).expect("report tid");
-            go.wait();
-            fire_blocking(OP as i32); // Call 1: blocks (latch armed).
-            fire_blocking(OP as i32); // Call 2: passes (latch spent).
-        });
-        let w = wtid_rx.recv().expect("worker tid");
-        write_cell(loaded, "BIRTH", &w.to_le_bytes(), &0u16.to_le_bytes());
-        go.wait();
-        // Bounded wait for the worker to block inside call 1 (fail,
-        // never hang).
-        let mut entered = false;
-        for _ in 0..10_000 {
-            if BLOCK_ENTERED.load(Ordering::SeqCst) == 1 {
-                entered = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-        assert!(entered, "{tag}: worker blocked inside call 1");
-        if detach_member_7 {
-            // Detach member 7 behind the blocked return (placeholder
-            // keeps the Vec dense; dropping the old link detaches).
-            let devnull: OwnedFd = std::fs::File::open("/dev/null").expect("devnull").into();
-            drop(std::mem::replace(&mut attached.members[7], devnull));
-        }
-        osslscope::loader::program_ctrl(&loaded.maps, &wire::ctrl_value(512, 2, 1 << 20))
-            .expect("bump epoch to 2");
-        let one = [1u8; 1];
-        assert_eq!(
-            unsafe { libc::write(fds[1], one.as_ptr() as *const libc::c_void, 1) },
-            1,
-            "{tag}: release worker"
-        );
-    });
-    unsafe {
-        libc::close(fds[0]);
-        libc::close(fds[1]);
-    }
-    let (calls, algs, rows) = drain(loaded);
-    assert_eq!(calls.len(), 2, "{tag}: two worker CALLs");
-    assert_eq!(
-        call_parts(&calls[0]),
-        (false, wire::SKIP_ADMITTED),
-        "{tag}: call 1 admits"
-    );
-    assert_eq!(calls[0].seq, wire::make_seq(0, 0));
-    assert_eq!(
-        call_parts(&calls[1]),
-        (false, wire::SKIP_ADMITTED),
-        "{tag}: call 2 admits, no hint"
-    );
-    assert_eq!(calls[1].seq, wire::make_seq(0, 1));
-    // The record survived call 1's return (C: no retirement — and
-    // with member 7 detached, nothing could complete it) → call 2's
-    // take churns on the epoch bump.
-    assert_loss_only(loaded, wire::LOSS_SCAN_CHURNED, 1, tag);
-    assert_eq!(
-        read_percpu(loaded, "CALLS", OP, false),
-        2,
-        "{tag}: both counted"
-    );
-    // Call 1's return walked (member vitality — the walk happened
-    // behind the epoch bump but before call 2's take).
-    assert!(
-        !algs.is_empty() && !rows.is_empty(),
-        "{tag}: call-1 return walked"
-    );
-    if detach_member_7 {
-        assert!(
-            algs.iter().all(|a| a.idx != 7) && rows.iter().all(|r| r.idx != 7),
-            "{tag}: detached member_7 silent"
-        );
-    }
-    // Post-churn record: fresh epoch frozen.
-    let rec = read_scan_cell(loaded, calls[1].tid).expect("fresh record");
-    assert_eq!(rec.epoch, 2, "{tag}: fresh epoch frozen");
-    assert!(
-        read_pending_cell(loaded, pid, calls[1].tid).is_some(),
-        "{tag}: PENDING (C-only)"
-    );
-}
-
-/// C detach-churn: member 7 detached behind a pipe-blocked
-/// invocation + epoch bump → record survives → next take churns.
-/// (C/D contrast pair — replaced by detach-D + bump-blocked-clean-retire.)
-#[test]
-#[ignore]
-fn c_churn_detach() {
-    let Some(obj) = gated() else {
-        eprintln!("SKIP(members-live): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
-        return;
-    };
-    run_blocked_churn(&obj, true, "detach-C");
-}
-
-/// C bump-behind-blocked: epoch bump behind a blocked invocation
-/// (no detach, no retirement exists) → next take churns.
-/// (C/D contrast pair.)
-#[test]
-#[ignore]
-fn c_churn_bump_blocked() {
-    let Some(obj) = gated() else {
-        eprintln!("SKIP(members-live): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
-        return;
-    };
-    run_blocked_churn(&obj, false, "bump-C");
+    // Fresh epoch frozen at entry, retired at return (NULL: EMPTY
+    // RET — D's new facts).
+    assert_eq!(d.rets.len(), 1, "churn: RET");
+    assert_retired(loaded, tid, "churn");
 }
 
 /// C LRU eviction (persists in D — §10.2): SCAN record + RCOUNT
 /// ACTIVE programmed for self, 2048 foreign inserts (pinned-CPU —
 /// self-eviction is structural by capacity, not order),
 /// read-back-absent loud check, then the take reports LOSS 20
-/// (NULL + ACTIVE ⟺ evicted).
+/// (NULL + ACTIVE ⟺ evicted). D re-pin: the record is programmed
+/// (a control's return would retire it), so the loud readback +
+/// the admitting fire are the positive evidence.
 #[test]
 #[ignore]
 fn c_eviction() {
@@ -2790,17 +2751,26 @@ fn c_eviction() {
     let tid = self_tid();
     FIXTURE_ARRAY.store(0, Ordering::SeqCst);
     NS_VERDICT.store(0, Ordering::SeqCst);
-    // Admit-control: a live record + ACTIVE counter for self.
-    fire(OP as i32, 1);
-    let (calls, _, _) = drain(loaded);
-    assert_eq!(
-        call_parts(&calls[0]),
-        (false, wire::SKIP_ADMITTED),
-        "control admits"
+    // Program a live record + ACTIVE counter for self (a control
+    // fire's return would retire it in D).
+    let mine = wire::ScanRec {
+        op: 7,
+        ns_ptr: 0,
+        seq: wire::make_seq(0, 0),
+        expected: 512,
+        _pad: 0,
+        epoch: 1,
+    };
+    write_cell(loaded, "SCAN", &tid.to_le_bytes(), &scan_bytes(&mine));
+    write_cell(
+        loaded,
+        "RCOUNT",
+        &tid.to_le_bytes(),
+        &wire::make_rcount(0, wire::RCOUNT_STATE_ACTIVE).to_le_bytes(),
     );
     assert!(
         read_scan_cell(loaded, tid).is_some(),
-        "control SCAN present"
+        "programmed SCAN present"
     );
     // 2048 foreign SCAN inserts evict self's record (1024-cap LRU).
     for i in 0..2048u32 {
@@ -2825,15 +2795,17 @@ fn c_eviction() {
         "RCOUNT (plain HASH) survives"
     );
     fire(OP as i32, 1);
-    let (calls, _, _) = drain(loaded);
-    assert_eq!(calls.len(), 1);
+    let d = drain(loaded);
+    assert_eq!(d.calls.len(), 1);
     assert_eq!(
-        call_parts(&calls[0]),
+        call_parts(&d.calls[0]),
         (false, wire::SKIP_ADMITTED),
         "post-evict admits, no hint"
     );
-    assert_eq!(calls[0].seq, wire::make_seq(0, 1));
+    assert_eq!(d.calls[0].seq, wire::make_seq(0, 0));
     assert_loss_only(loaded, wire::LOSS_SCAN_EVICTED, 1, "eviction");
+    assert_eq!(d.rets.len(), 1, "eviction: RET");
+    assert_retired(loaded, tid, "eviction");
 }
 
 /// C saturation boundary (RE-PIN in D — §10.2: + RET on the MAX
@@ -2853,7 +2825,6 @@ fn c_saturation() {
     let attached = attach_chunk(&obj, &exe, off);
     let loaded = &attached.loaded;
     let tid = self_tid();
-    let pid = std::process::id();
     FIXTURE_ARRAY.store(0, Ordering::SeqCst);
     NS_VERDICT.store(0, Ordering::SeqCst);
     write_cell(
@@ -2863,29 +2834,34 @@ fn c_saturation() {
         &wire::make_seq(0, wire::SEQ_CTR_MAX - 1).to_le_bytes(),
     );
     fire(OP as i32, 1);
-    let (calls, _, _) = drain(loaded);
-    assert_eq!(calls.len(), 1);
+    let d = drain(loaded);
+    assert_eq!(d.calls.len(), 1);
     assert_eq!(
-        call_parts(&calls[0]),
+        call_parts(&d.calls[0]),
         (false, wire::SKIP_ADMITTED),
         "MAX admits"
     );
-    assert_eq!(calls[0].seq, wire::make_seq(0, wire::SEQ_CTR_MAX));
+    assert_eq!(d.calls[0].seq, wire::make_seq(0, wire::SEQ_CTR_MAX));
     assert_eq!(read_percpu(loaded, "CALLS", OP, false), 1);
     assert_loss_zero(loaded);
+    // D re-pin: RET (EMPTY — NULL) on the MAX admit + retire.
+    assert_eq!(d.rets.len(), 1, "MAX admit RET");
+    let r = ret_for(&d.rets, tid, wire::make_seq(0, wire::SEQ_CTR_MAX));
+    assert_eq!(r.flags, wire::RET_FLAG_EMPTY, "NULL marks EMPTY");
+    assert_retired(loaded, tid, "saturation");
     let (attempt0, calls0) = (
         read_attempt(loaded),
         read_percpu(loaded, "CALLS", OP, false),
     );
     fire(OP as i32, 1);
-    let (calls, algs, rows) = drain(loaded);
-    assert_eq!(calls.len(), 1);
+    let d = drain(loaded);
+    assert_eq!(d.calls.len(), 1);
     assert_eq!(
-        call_parts(&calls[0]),
+        call_parts(&d.calls[0]),
         (false, wire::SKIP_SEQ_SATURATED),
         "reissue skips"
     );
-    assert_eq!(calls[0].seq, 0);
+    assert_eq!(d.calls[0].seq, 0);
     assert_eq!(read_attempt(loaded) - attempt0, 1, "ATTEMPTΔ==1");
     assert_eq!(
         read_percpu(loaded, "CALLS", OP, false) - calls0,
@@ -2893,22 +2869,25 @@ fn c_saturation() {
         "CALLSΔ==0"
     );
     assert_loss_only(loaded, wire::LOSS_SEQ_SATURATED, 1, "saturation");
-    assert!(algs.is_empty() && rows.is_empty(), "skip member silence");
     assert!(
-        read_pending_cell(loaded, pid, tid).is_none(),
-        "PENDING absent (C-only)"
+        d.algs.is_empty() && d.rows.is_empty(),
+        "skip member silence"
     );
+    assert!(d.rets.is_empty(), "cause-9 emits no RET");
+    assert!(d.guards.is_empty(), "cause-9 emits no guard");
     assert!(read_scan_cell(loaded, tid).is_none(), "SCAN absent");
     assert_eq!(
         wire::split_rcount(read_u64_cell(loaded, "RCOUNT", tid).expect("RCOUNT kept")),
-        (0, wire::RCOUNT_STATE_IDLE)
+        (512, wire::RCOUNT_STATE_IDLE),
+        "skipped return bumps-if-present (IDLE|512)"
     );
 }
 
-/// C sequential-quiet pair (RE-PIN in D — §10.2: between-count
-/// IDLE|0 in C, IDLE|512 in D): admit → skip → admit — no hint
-/// (the middle skip stands in for D's retirement), SCAN absent +
-/// IDLE between.
+/// C sequential-quiet pair (RE-PINNED in D — §10.2:
+/// between-count IDLE|512, not C's IDLE|0 — the skipped return's
+/// members bump-if-present while gated out of work): admit → skip
+/// → admit — no hint, SCAN absent + IDLE between, RETs on the
+/// admits only.
 #[test]
 #[ignore]
 fn c_sequential_pair() {
@@ -2926,13 +2905,16 @@ fn c_sequential_pair() {
     FIXTURE_ARRAY.store(0, Ordering::SeqCst);
     NS_VERDICT.store(0, Ordering::SeqCst);
     fire(OP as i32, 1);
-    let (calls, _, _) = drain(loaded);
+    let d = drain(loaded);
     assert_eq!(
-        call_parts(&calls[0]),
+        call_parts(&d.calls[0]),
         (false, wire::SKIP_ADMITTED),
         "first admits"
     );
-    // Middle skip (SKIP_ALL toggle): clears SCAN + IDLEs.
+    assert_eq!(d.rets.len(), 1, "first RET");
+    assert_retired(loaded, tid, "first");
+    // Middle skip (SKIP_ALL toggle): clears SCAN + IDLEs; the
+    // skipped return's members bump-if-present (IDLE|512).
     let off_ctrl = wire::CtrlValue {
         expected: 512,
         skip_all: 1,
@@ -2942,30 +2924,33 @@ fn c_sequential_pair() {
     };
     osslscope::loader::program_ctrl(&loaded.maps, &off_ctrl).expect("SKIP_ALL on");
     fire(OP as i32, 1);
-    let (calls, _, _) = drain(loaded);
+    let d = drain(loaded);
     assert_eq!(
-        call_parts(&calls[0]),
+        call_parts(&d.calls[0]),
         (false, wire::SKIP_ALL),
         "middle skips"
     );
+    assert!(d.rets.is_empty(), "skip emits no RET");
     assert!(read_scan_cell(loaded, tid).is_none(), "SCAN absent between");
     assert_eq!(
         wire::split_rcount(read_u64_cell(loaded, "RCOUNT", tid).expect("RCOUNT kept")),
-        (0, wire::RCOUNT_STATE_IDLE),
-        "between-count IDLE|0 in C"
+        (512, wire::RCOUNT_STATE_IDLE),
+        "between-count IDLE|512 in D"
     );
     // Re-admit: quiet (no hint — nothing unretired stands).
     osslscope::loader::program_ctrl(&loaded.maps, &wire::ctrl_value(512, 1, gov))
         .expect("SKIP_ALL off");
     fire(OP as i32, 1);
-    let (calls, _, _) = drain(loaded);
-    assert_eq!(calls.len(), 1);
+    let d = drain(loaded);
+    assert_eq!(d.calls.len(), 1);
     assert_eq!(
-        call_parts(&calls[0]),
+        call_parts(&d.calls[0]),
         (false, wire::SKIP_ADMITTED),
         "re-admit quiet (no hint)"
     );
-    assert_eq!(calls[0].seq, wire::make_seq(0, 1));
+    assert_eq!(d.calls[0].seq, wire::make_seq(0, 1));
+    assert_eq!(d.rets.len(), 1, "re-admit RET");
+    assert_retired(loaded, tid, "re-admit");
     assert_loss_only(loaded, wire::LOSS_SKIP_ALL, 1, "sequential");
 }
 
@@ -2986,16 +2971,17 @@ fn c_store_fail() {
     let attached = attach_chunk(&obj, &exe, off);
     let loaded = &attached.loaded;
     let tid = self_tid();
-    let pid = std::process::id();
     FIXTURE_ARRAY.store(0, Ordering::SeqCst);
     NS_VERDICT.store(0, Ordering::SeqCst);
     fire(OP as i32, 1);
-    let (calls, _, _) = drain(loaded);
+    let d = drain(loaded);
     assert_eq!(
-        call_parts(&calls[0]),
+        call_parts(&d.calls[0]),
         (false, wire::SKIP_ADMITTED),
         "control admits"
     );
+    assert_eq!(d.rets.len(), 1, "control RET");
+    assert_retired(loaded, tid, "control");
     // Fake-fill RCOUNT to 4096 WITHOUT the test tid (its row
     // exists from the control — fill around it: 4095 fakes +
     // control row = full for the test tid's step-11 create... but
@@ -3039,10 +3025,13 @@ fn c_store_fail() {
     });
     // Absolute counters (control fired once: CALLS 1, ATTEMPT 1
     // before the worker's single skip).
-    let (calls, algs, rows) = drain(loaded);
-    assert_eq!(calls.len(), 1, "worker skip CALL");
-    assert_eq!(call_parts(&calls[0]), (false, wire::SKIP_ADMIT_STORE_FAIL));
-    assert_eq!(calls[0].seq, 0);
+    let d = drain(loaded);
+    assert_eq!(d.calls.len(), 1, "worker skip CALL");
+    assert_eq!(
+        call_parts(&d.calls[0]),
+        (false, wire::SKIP_ADMIT_STORE_FAIL)
+    );
+    assert_eq!(d.calls[0].seq, 0);
     assert_eq!(read_attempt(loaded), 2, "ATTEMPT control + skip");
     assert_eq!(
         read_percpu(loaded, "CALLS", OP, false),
@@ -3050,12 +3039,13 @@ fn c_store_fail() {
         "CALLS control only"
     );
     assert_loss_only(loaded, wire::LOSS_ADMIT_STORE_FAIL, 1, "store-fail");
-    assert!(algs.is_empty() && rows.is_empty(), "skip member silence");
-    let w = calls[0].tid;
     assert!(
-        read_pending_cell(loaded, pid, w).is_none(),
-        "PENDING absent"
+        d.algs.is_empty() && d.rows.is_empty(),
+        "skip member silence"
     );
+    assert!(d.rets.is_empty(), "cause-8 emits no RET");
+    assert!(d.guards.is_empty(), "cause-8 emits no guard");
+    let w = d.calls[0].tid;
     assert!(read_scan_cell(loaded, w).is_none(), "SCAN absent");
     assert!(
         read_u64_cell(loaded, "RCOUNT", w).is_none(),
@@ -3067,197 +3057,6 @@ fn c_store_fail() {
         (0, 0),
         "spent seq (never observed)"
     );
-}
-
-/// C pending-capacity (C-ONLY — §10.2, map gone in D): 1024
-/// distinct tids admit-and-retain with no skips between, then a
-/// 1025th distinct tid → cause 8/LOSS32 with SEQ at 1025 of 4096
-/// (normal E2BIG fill, no fault injection); a same-tid re-admit on
-/// a RETAINED key still succeeds (BPF_ANY update — proving
-/// full-for-new-keys).
-#[test]
-#[ignore]
-fn c_pending_capacity() {
-    use osslscope_ebpf_common as wire;
-    let Some(obj) = gated() else {
-        eprintln!("SKIP(members-live): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
-        return;
-    };
-    let exe = own_exe_cstr();
-    let off = query_off();
-    let attached = attach_chunk(&obj, &exe, off);
-    let loaded = &attached.loaded;
-    FIXTURE_ARRAY.store(0, Ordering::SeqCst); // NULL: entry-side only
-    NS_VERDICT.store(0, Ordering::SeqCst);
-    // Worker A stays PARKED (alive, tid pinned) for the re-admit.
-    let (a_tx, a_rx) = std::sync::mpsc::channel::<u32>();
-    let phase1 = std::sync::Barrier::new(2);
-    let phase2 = std::sync::Barrier::new(2);
-    std::thread::scope(|s| {
-        s.spawn(|| {
-            let a = self_tid();
-            write_cell(loaded, "BIRTH", &a.to_le_bytes(), &0u16.to_le_bytes());
-            fire(OP as i32, 1); // Admit #1 (retained).
-            a_tx.send(a).expect("report A");
-            phase1.wait();
-            phase2.wait();
-            fire(OP as i32, 1); // Re-admit (BPF_ANY update on retained key).
-        });
-        let a = a_rx.recv().expect("worker A tid");
-        phase1.wait(); // A's PENDING retained before the fill.
-        // Workers 2..=1024: 1023 sequential admit-and-retain.
-        for _ in 2..=1024u32 {
-            std::thread::scope(|s2| {
-                s2.spawn(|| {
-                    let w = self_tid();
-                    assert_ne!(w, a, "fill tids distinct from A");
-                    write_cell(loaded, "BIRTH", &w.to_le_bytes(), &0u16.to_le_bytes());
-                    fire(OP as i32, 1);
-                })
-                .join()
-                .expect("fill worker join");
-            });
-        }
-        // 1025th distinct tid → PENDING-write E2BIG → cause 8.
-        let b = std::thread::scope(|s2| {
-            s2.spawn(|| {
-                let w = self_tid();
-                write_cell(loaded, "BIRTH", &w.to_le_bytes(), &0u16.to_le_bytes());
-                fire(OP as i32, 1);
-                w
-            })
-            .join()
-            .expect("B join")
-        });
-        assert_ne!(b, a, "1025th tid distinct");
-        phase2.wait(); // Release A's re-admit.
-    });
-    let (calls, algs, rows) = drain(loaded);
-    // 1024 admits + B skip + A re-admit = 1026 CALLs.
-    assert_eq!(calls.len(), 1026, "1024 + skip + re-admit");
-    assert!(algs.is_empty() && rows.is_empty(), "NULL: member silence");
-    let (admits, skips): (Vec<&_>, Vec<&_>) = calls
-        .iter()
-        .partition(|c| call_parts(c).1 == wire::SKIP_ADMITTED);
-    assert_eq!(admits.len(), 1025, "1024 + re-admit admitted");
-    assert_eq!(skips.len(), 1, "exactly the 1025th skips");
-    assert_eq!(call_parts(skips[0]), (false, wire::SKIP_ADMIT_STORE_FAIL));
-    assert_eq!(skips[0].seq, 0);
-    assert_loss_only(loaded, wire::LOSS_ADMIT_STORE_FAIL, 1, "pending-capacity");
-    assert_eq!(
-        read_percpu(loaded, "CALLS", OP, false),
-        1025,
-        "CALLS = admits"
-    );
-    assert_eq!(read_attempt(loaded), 1026, "ATTEMPT = all hits");
-}
-
-/// C governor quantum (REPLACED by quantum-D — §10.2): NULL
-/// queries no-drain at T ∈ {719, 720, 721} — 32B quantum:
-/// 23/23/23 admitted (fire k sees occ (k−1)×32: fire 23 sees 704 ≤
-/// T and admits → occ 736; fire 24 sees 736 > T and skips — for
-/// all three T). The skip index pins the byte-exact math: wrong
-/// quanta RED the transition. CALLS-read between fires, single
-/// drain at end.
-#[test]
-#[ignore]
-fn c_governor_quantum() {
-    use osslscope_ebpf_common as wire;
-    let Some(obj) = gated() else {
-        eprintln!("SKIP(members-live): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
-        return;
-    };
-    let exe = own_exe_cstr();
-    let off = query_off();
-    for t in [719u64, 720, 721] {
-        let attached = attach_with_ctrl(&obj, &exe, off, &wire::ctrl_value(512, 1, t));
-        let loaded = &attached.loaded;
-        let mut state = BirthState::new();
-        let tid = self_tid();
-        register(loaded, &mut state, &[tid]);
-        FIXTURE_ARRAY.store(0, Ordering::SeqCst);
-        NS_VERDICT.store(0, Ordering::SeqCst);
-        // Fire one at a time, reading CALLS between fires: the
-        // admit→skip transition index pins the quantum math live.
-        let mut admitted = 0u32;
-        for k in 1..=30u32 {
-            fire(OP as i32, 1);
-            let calls_now = read_percpu(loaded, "CALLS", OP, false);
-            if calls_now == admitted as u64 + 1 {
-                admitted += 1;
-            }
-            assert_eq!(
-                read_attempt(loaded),
-                k as u64,
-                "T={t}: ATTEMPT tracks fires (k={k})"
-            );
-        }
-        assert_eq!(admitted, 23, "T={t}: 23 admitted (32B quantum)");
-        let (calls, algs, rows) = drain(loaded);
-        assert_eq!(calls.len(), 30, "T={t}: 30 CALLs, single end drain");
-        assert!(algs.is_empty() && rows.is_empty(), "T={t}: NULL silence");
-        let (adm, skp): (Vec<&_>, Vec<&_>) = calls
-            .iter()
-            .partition(|c| call_parts(c).1 == wire::SKIP_ADMITTED);
-        assert_eq!(adm.len(), 23, "T={t}: drain agrees (23 admits)");
-        assert_eq!(skp.len(), 7, "T={t}: 7 skips");
-        assert!(
-            skp.iter()
-                .all(|c| call_parts(c) == (false, wire::SKIP_RING_PRESSURE) && c.seq == 0),
-            "T={t}: all skips cause 4, seq 0"
-        );
-        // C convention: first admit silent, later admits hint (no
-        // retirement between sequential admits).
-        assert!(!call_parts(adm[0]).0, "T={t}: first admit silent");
-        assert!(
-            adm[1..].iter().all(|c| call_parts(c).0),
-            "T={t}: later admits hint (C convention)"
-        );
-        assert_loss_only(loaded, wire::LOSS_RING_PRESSURE, 7, &format!("quantum-{t}"));
-    }
-}
-
-/// C pressure rewritten (RE-PIN in D — §10.2: second skip at occ
-/// 80): GOVERNOR=0 extreme — first admits at occ 0, second skips
-/// at 32. Clarifies GOVERNOR 0 is VALID (validation rejects only
-/// EXPECTED 0/>512 and epoch 0).
-#[test]
-#[ignore]
-fn c_pressure_gov0() {
-    use osslscope_ebpf_common as wire;
-    let Some(obj) = gated() else {
-        eprintln!("SKIP(members-live): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
-        return;
-    };
-    let exe = own_exe_cstr();
-    let off = query_off();
-    let attached = attach_with_ctrl(&obj, &exe, off, &wire::ctrl_value(512, 1, 0));
-    let loaded = &attached.loaded;
-    let mut state = BirthState::new();
-    let tid = self_tid();
-    register(loaded, &mut state, &[tid]);
-    FIXTURE_ARRAY.store(0, Ordering::SeqCst);
-    NS_VERDICT.store(0, Ordering::SeqCst);
-    fire(OP as i32, 2);
-    let (calls, algs, rows) = drain(loaded);
-    assert_eq!(calls.len(), 2);
-    assert_eq!(
-        call_parts(&calls[0]),
-        (false, wire::SKIP_ADMITTED),
-        "occ 0 admits"
-    );
-    assert_eq!(calls[0].seq, wire::make_seq(0, 0));
-    assert_eq!(
-        call_parts(&calls[1]),
-        (false, wire::SKIP_RING_PRESSURE),
-        "occ 32 skips"
-    );
-    assert_eq!(calls[1].seq, 0);
-    assert_eq!(read_percpu(loaded, "CALLS", OP, false), 1, "CALLS Δ1");
-    assert_eq!(read_attempt(loaded), 2, "ATTEMPT Δ2");
-    assert_loss_only(loaded, wire::LOSS_RING_PRESSURE, 1, "gov0");
-    assert!(algs.is_empty() && rows.is_empty(), "skip member silence");
-    assert!(read_scan_cell(loaded, tid).is_none(), "skip cleared SCAN");
 }
 
 // ===== item-3 subtask-E registry live legs (R18 §5/§7E; lane only) =====
@@ -3317,11 +3116,13 @@ fn e_registry_spawn_storm() {
             "BIRTH[{w}] readback"
         );
     }
-    let (calls, algs, rows) = drain(loaded);
-    assert_eq!(calls.len(), 2 * N, "skip + admit per worker");
-    assert!(algs.is_empty() && rows.is_empty(), "NULL silence");
+    let d = drain(loaded);
+    assert_eq!(d.calls.len(), 2 * N, "skip + admit per worker");
+    assert!(d.algs.is_empty() && d.rows.is_empty(), "NULL silence");
+    assert_eq!(d.rets.len(), N, "one RET per admit (skips emit none)");
+    assert!(d.guards.is_empty(), "no guards (NULL)");
     for w in &observed {
-        let mine: Vec<_> = calls.iter().filter(|c| c.tid == *w).collect();
+        let mine: Vec<_> = d.calls.iter().filter(|c| c.tid == *w).collect();
         assert_eq!(mine.len(), 2, "worker {w}: two CALLs");
         assert_eq!(
             call_parts(mine[0]),
@@ -3335,6 +3136,8 @@ fn e_registry_spawn_storm() {
             "worker {w}: poll-then-admit"
         );
         assert_eq!(mine[1].seq, wire::make_seq(0, 0));
+        ret_for(&d.rets, *w, wire::make_seq(0, 0));
+        assert_retired(loaded, *w, "storm");
     }
     assert_loss_only(loaded, wire::LOSS_BIRTH_PENDING, N as u64, "storm");
     assert_eq!(read_percpu(loaded, "CALLS", OP, false), N as u64);
@@ -3363,8 +3166,10 @@ fn e_registry_observed_reuse() {
     let mut state = BirthState::new();
     assert_eq!(register(loaded, &mut state, &[tid]), vec![(tid, 0)]);
     fire(OP as i32, 1);
-    let (calls, _, _) = drain(loaded);
-    assert_eq!(calls[0].seq, wire::make_seq(0, 0));
+    let d = drain(loaded);
+    assert_eq!(d.calls[0].seq, wire::make_seq(0, 0));
+    assert_eq!(d.rets.len(), 1, "first RET");
+    assert_retired(loaded, tid, "observed");
     // Observe absence (poll without the tid), then reappearance.
     assert!(
         register(loaded, &mut state, &[0x7FFF_FFFF])
@@ -3378,24 +3183,27 @@ fn e_registry_observed_reuse() {
     );
     assert_eq!(read_u16_cell(loaded, "BIRTH", tid), Some(1));
     fire(OP as i32, 1);
-    let (calls, _, _) = drain(loaded);
-    assert_eq!(calls.len(), 1);
+    let d = drain(loaded);
+    assert_eq!(d.calls.len(), 1);
     assert_eq!(
-        call_parts(&calls[0]),
+        call_parts(&d.calls[0]),
         (false, wire::SKIP_ADMITTED),
         "superseded tid admits"
     );
     assert_eq!(
-        calls[0].seq,
+        d.calls[0].seq,
         wire::make_seq(1, 0),
         "SEQ reset on birth mismatch"
     );
+    assert_eq!(d.rets.len(), 1, "second RET");
+    assert_retired(loaded, tid, "observed");
     assert_loss_zero(loaded);
 }
 
-/// E unobserved reuse: no poll between fires → the counter
-/// continues (seq 1, hint — the C convention), no skip (§5.1 quiet
-/// reuse).
+/// E unobserved reuse (D: retirement splits sequential from
+/// nested — the second admit is QUIET, not hinted): no poll
+/// between fires → the counter continues (seq 1), no skip (§5.1
+/// quiet reuse), RETs on both.
 #[test]
 #[ignore]
 fn e_registry_unobserved_reuse() {
@@ -3408,18 +3216,21 @@ fn e_registry_unobserved_reuse() {
     let off = query_off();
     let attached = attach_chunk(&obj, &exe, off);
     let loaded = &attached.loaded;
+    let tid = self_tid();
     FIXTURE_ARRAY.store(0, Ordering::SeqCst);
     NS_VERDICT.store(0, Ordering::SeqCst);
     fire(OP as i32, 2); // No poll between: quiet reuse.
-    let (calls, _, _) = drain(loaded);
-    assert_eq!(calls.len(), 2);
-    assert_eq!(calls[0].seq, wire::make_seq(0, 0));
-    assert_eq!(calls[1].seq, wire::make_seq(0, 1), "ctr continues");
+    let d = drain(loaded);
+    assert_eq!(d.calls.len(), 2);
+    assert_eq!(d.calls[0].seq, wire::make_seq(0, 0));
+    assert_eq!(d.calls[1].seq, wire::make_seq(0, 1), "ctr continues");
     assert_eq!(
-        call_parts(&calls[1]),
-        (true, wire::SKIP_ADMITTED),
-        "hint (C convention)"
+        call_parts(&d.calls[1]),
+        (false, wire::SKIP_ADMITTED),
+        "quiet (retired between — D splits sequential from nested)"
     );
+    assert_eq!(d.rets.len(), 2, "RETs on both");
+    assert_retired(loaded, tid, "unobserved");
     assert_loss_zero(loaded);
 }
 
@@ -3491,25 +3302,29 @@ fn e_registry_live_freeze() {
     let mut state = BirthState::new();
     assert_eq!(register(loaded, &mut state, &[tid]), vec![(tid, 0)]);
     fire(OP as i32, 1);
-    let (calls, _, _) = drain(loaded);
+    let d = drain(loaded);
     assert_eq!(
-        call_parts(&calls[0]),
+        call_parts(&d.calls[0]),
         (false, wire::SKIP_ADMITTED),
         "control admits"
     );
+    assert_eq!(d.rets.len(), 1, "control RET");
+    assert_retired(loaded, tid, "freeze");
     // Freeze through the registry program path (not a raw write).
     osslscope::scan::registry::program_births(&loaded.maps, &[(tid, wire::BIRTH_FROZEN)])
         .expect("program MAX");
     fire(OP as i32, 1);
-    let (calls, algs, rows) = drain(loaded);
-    assert_eq!(calls.len(), 1);
+    let d = drain(loaded);
+    assert_eq!(d.calls.len(), 1);
     assert_eq!(
-        call_parts(&calls[0]),
+        call_parts(&d.calls[0]),
         (false, wire::SKIP_BIRTH_WRAP),
         "frozen skips"
     );
     assert_loss_only(loaded, wire::LOSS_BIRTH_WRAP, 1, "freeze");
-    assert!(algs.is_empty() && rows.is_empty());
+    assert!(d.algs.is_empty() && d.rows.is_empty());
+    assert!(d.rets.is_empty(), "freeze emits no RET");
+    assert!(d.guards.is_empty(), "freeze emits no guard");
 }
 
 /// E registry-full: BIRTH 4k-filled → `program_births` errors LOUD
@@ -3537,4 +3352,1208 @@ fn e_registry_full() {
     let err = osslscope::scan::registry::program_births(&loaded.maps, &[(self_tid(), 0)])
         .expect_err("4k-full BIRTH programs LOUD");
     eprintln!("registry-full hard error (expected): {err:#}");
+}
+
+// ===== stage-D legs (R18 §7D/§10.2; lane only) =====
+
+/// D retire-quiet pair (REPLACES admit-shape — §10.2): exact
+/// outputs + SCAN absent + RCOUNT IDLE|0 after return; a second
+/// invocation is quiet (no hint — nothing unretired stands).
+/// Variants: clean, whole-array-abort (RET still presented +
+/// retire — aborts never block retirement), NOIMP@3 (flag +
+/// retire).
+#[test]
+#[ignore]
+fn d_retire_quiet() {
+    use osslscope_ebpf_common as wire;
+    let Some(obj) = gated() else {
+        eprintln!("SKIP(members-live): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
+        return;
+    };
+    let exe = own_exe_cstr();
+    let off = query_off();
+    // Clean: live E2, two quiet sequential invocations.
+    {
+        let attached = attach_chunk(&obj, &exe, off);
+        let loaded = &attached.loaded;
+        let tid = self_tid();
+        let slots = vec![
+            SlotSpec::live("MRQ0", 100, vec![(81, 0x8100)]),
+            SlotSpec::live("MRQ1", 101, vec![(82, 0x8101)]),
+        ];
+        let fx = Fixture::build(&slots, &[]);
+        fx.pretouch();
+        populate_alg_class(loaded, &fx.classes);
+        FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
+        NS_VERDICT.store(0, Ordering::SeqCst);
+        fire(OP as i32, 1);
+        let d = drain(loaded);
+        assert_eq!(d.calls.len(), 1);
+        assert_eq!(call_parts(&d.calls[0]), (false, wire::SKIP_ADMITTED));
+        assert_eq!(d.calls[0].seq, wire::make_seq(0, 0));
+        let r = ret_for(&d.rets, tid, wire::make_seq(0, 0));
+        assert_eq!(
+            (r.kind, r.op, r.flags, r.arr),
+            (wire::KIND_SCAN_RET, OP, 0, fx.array)
+        );
+        assert_eq!(r.generation, 0, "GEN uninstalled → 0-stamped");
+        assert_eq!(d.algs.len(), 2, "exact ALG outputs");
+        assert_eq!(d.rows.len(), 2, "exact ROW outputs");
+        assert!(d.guards.is_empty(), "no guard (slot 511 zero)");
+        assert_retired(loaded, tid, "retire-quiet");
+        assert_loss_zero(loaded);
+        // Second invocation: quiet (retired between).
+        fire(OP as i32, 1);
+        let d = drain(loaded);
+        assert_eq!(d.calls.len(), 1);
+        assert_eq!(
+            call_parts(&d.calls[0]),
+            (false, wire::SKIP_ADMITTED),
+            "second invocation quiet"
+        );
+        assert_eq!(d.calls[0].seq, wire::make_seq(0, 1));
+        assert_eq!(d.rets.len(), 1);
+        assert_retired(loaded, tid, "retire-quiet-2");
+        assert_loss_zero(loaded);
+    }
+    // Whole-array abort: RET still presented + retire.
+    {
+        let attached = attach_chunk(&obj, &exe, off);
+        let loaded = &attached.loaded;
+        let tid = self_tid();
+        let slots = vec![SlotSpec::live("MRQA", 100, vec![(83, 0x8102)])];
+        let fx = Fixture::build(&slots, &[]);
+        fx.pretouch();
+        populate_alg_class(loaded, &fx.classes);
+        FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
+        NS_VERDICT.store(0, Ordering::SeqCst);
+        fire(OP as i32, 1);
+        let d = drain(loaded);
+        assert!(!d.algs.is_empty(), "abort variant: live control emits");
+        assert_retired(loaded, tid, "abort-control");
+        // Unmap the array page: every slot read aborts (slot 0
+        // included) — RET must still present.
+        let page = 4096usize;
+        assert_eq!(fx.array as usize % page, 0, "array page-aligned");
+        let rc = unsafe { libc::munmap(fx.array as *mut libc::c_void, page) };
+        assert_eq!(rc, 0, "munmap array page");
+        fire(OP as i32, 1);
+        let d = drain(loaded);
+        assert_eq!(d.calls.len(), 1, "abort query admits");
+        assert_eq!(d.rets.len(), 1, "RET presented despite slot-0 abort");
+        let r = ret_for(&d.rets, tid, wire::make_seq(0, 1));
+        assert_eq!(r.flags, 0, "non-NULL return is not EMPTY");
+        assert!(
+            d.algs.is_empty() && d.rows.is_empty(),
+            "aborts emit nothing"
+        );
+        assert!(d.guards.is_empty(), "no guard (slot 511 unreadable)");
+        assert_eq!(
+            read_percpu(loaded, "TRUNC", OP, true),
+            wire::TRUNC_WALK_READ,
+            "abort flags WALK_READ alone"
+        );
+        assert_retired(loaded, tid, "abort-retires");
+        assert_loss_zero(loaded);
+    }
+    // NOIMP@3: flag + retire (eligibility ≠ walkability's cousin —
+    // NOIMP records and falls through to the epilogue).
+    {
+        let attached = attach_chunk(&obj, &exe, off);
+        let loaded = &attached.loaded;
+        let tid = self_tid();
+        let slots = vec![
+            SlotSpec::live("MRQN0", 100, vec![(84, 0x8103)]),
+            SlotSpec::live("MRQN1", 101, vec![(85, 0x8104)]),
+            SlotSpec::live("MRQN2", 102, vec![(86, 0x8105)]),
+            SlotSpec::noimp("MRQN3", 103),
+        ];
+        let fx = Fixture::build(&slots, &[]);
+        fx.pretouch();
+        populate_alg_class(loaded, &fx.classes);
+        FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
+        NS_VERDICT.store(0, Ordering::SeqCst);
+        fire(OP as i32, 1);
+        let d = drain(loaded);
+        assert_eq!(d.calls.len(), 1);
+        assert_eq!(d.algs.len(), 3, "NOIMP slot emits no ALG");
+        assert!(d.algs.iter().all(|a| a.idx <= 2));
+        assert_eq!(
+            read_percpu(loaded, "TRUNC", OP, true),
+            wire::TRUNC_WALK_NOIMP,
+            "NOIMP flags alone"
+        );
+        assert_eq!(d.rets.len(), 1, "NOIMP query RETs");
+        assert_retired(loaded, tid, "noimp-retires");
+        assert_loss_zero(loaded);
+    }
+}
+
+/// D member-0-last (order-independence): identical outputs under
+/// two different member fire orders. Production attach order fires
+/// members in one sequence; re-attaching member 0 moves it.
+/// Proof shape: the ALG idx-sequences DIFFER (order changed —
+/// observed, so the leg fails loud if fire order ever stops
+/// depending on attach order) while the evidence SETS + RET shape
+/// + retirement are IDENTICAL (order-independent).
+#[test]
+#[ignore]
+fn d_member_0_last() {
+    let Some(obj) = gated() else {
+        eprintln!("SKIP(members-live): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
+        return;
+    };
+    let exe = own_exe_cstr();
+    let off = query_off();
+    let mut attached = attach_chunk(&obj, &exe, off);
+    let slots = vec![
+        SlotSpec::live("MMZ0", 100, vec![(91, 0x9100)]),
+        SlotSpec::live("MMZ1", 101, vec![(92, 0x9101)]),
+    ];
+    let fx = Fixture::build(&slots, &[]);
+    fx.pretouch();
+    populate_alg_class(&attached.loaded, &fx.classes);
+    FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
+    NS_VERDICT.store(0, Ordering::SeqCst);
+    // Run 1: production attach order.
+    fire(OP as i32, 1);
+    let d1 = drain(&attached.loaded);
+    let seq1: Vec<u64> = d1.algs.iter().map(|a| a.idx).collect();
+    assert_eq!(d1.calls.len(), 1);
+    assert_eq!(d1.rets.len(), 1);
+    // Re-attach member 0 (same cookie, fresh link → moved in fire
+    // order), then run 2.
+    let m0 = ossl_bpf_sys::link_create_uretprobe_multi(
+        attached.loaded.progs["member_000"].as_raw_fd(),
+        &exe,
+        &[off],
+        &[0],
+        std::process::id(),
+    )
+    .expect("re-attach member_0");
+    drop(std::mem::replace(&mut attached.members[0], m0));
+    fire(OP as i32, 1);
+    let d2 = drain(&attached.loaded);
+    let seq2: Vec<u64> = d2.algs.iter().map(|a| a.idx).collect();
+    assert_ne!(seq1, seq2, "fire order changed (else the leg is vacuous)");
+    // Identical outputs: evidence sets, RET shape, retirement.
+    let mut set1: Vec<(u64, u16)> = d1.algs.iter().map(|a| (a.idx, a.class)).collect();
+    let mut set2: Vec<(u64, u16)> = d2.algs.iter().map(|a| (a.idx, a.class)).collect();
+    set1.sort_unstable();
+    set2.sort_unstable();
+    assert_eq!(set1, set2, "evidence sets identical");
+    assert_eq!(set1, vec![(0, 100), (1, 101)]);
+    assert_eq!(d2.calls.len(), 1);
+    assert_eq!(d2.rets.len(), 1, "RET identical");
+    assert_eq!(d2.rets[0].flags, d1.rets[0].flags);
+    assert_eq!(d2.rets[0].arr, d1.rets[0].arr);
+    assert_retired(&attached.loaded, self_tid(), "order");
+    assert_loss_zero(&attached.loaded);
+    // Quiet sequential (retired between — both runs).
+    assert!(!call_parts(&d1.calls[0]).0);
+    assert!(!call_parts(&d2.calls[0]).0);
+}
+
+/// D L3-tail-warm absence (T=3 injected — no read, no compare, no
+/// firing past T; prefix intact): members 4+ skip-silent despite
+/// LIVE memory (a read would emit — absence proves no firing);
+/// member 3 WALKS (j ≤ T). The bridge l3-tail block is the cold
+/// twin (presence on cold).
+#[test]
+#[ignore]
+fn d_l3_tail_warm() {
+    let Some(obj) = gated() else {
+        eprintln!("SKIP(members-live): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
+        return;
+    };
+    let exe = own_exe_cstr();
+    let off = query_off();
+    let attached = attach_chunk(&obj, &exe, off);
+    let loaded = &attached.loaded;
+    let tid = self_tid();
+    let slots: Vec<SlotSpec> = (0..3u32)
+        .map(|j| {
+            SlotSpec::live(
+                &format!("MDW{j}"),
+                100 + j as u16,
+                vec![(300 + j, 0x4400 + j as u64)],
+            )
+        })
+        .collect();
+    let tail: Vec<SlotSpec> = (0..3u32)
+        .map(|t| {
+            SlotSpec::live(
+                &format!("MDWT{t}"),
+                200 + t as u16,
+                vec![(900 + t, 0x9900 + t as u64)],
+            )
+        })
+        .collect();
+    let mut entries: Vec<(String, u16)> = slots.iter().map(|s| (s.name.clone(), s.class)).collect();
+    entries.extend(tail.iter().map(|s| (s.name.clone(), s.class)));
+    let fx = Fixture::build(&slots, &tail);
+    fx.pretouch();
+    populate_alg_class(loaded, &entries);
+    FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
+    NS_VERDICT.store(0, Ordering::SeqCst);
+    // Inject T=3 (gen 0 = live GEN — warm). Pointee is zero, so
+    // members 4+ skip-silent; member 3 (j == T) walks.
+    write_tcache(loaded, fx.array, 3, 0);
+    fire(OP as i32, 2);
+    let ScanDrain {
+        calls,
+        rets,
+        guards,
+        algs,
+        rows,
+    } = drain(loaded);
+    assert_calls_admitted(&calls, 2, "tail-warm");
+    assert_eq!(rets.len(), 2, "RETs joined");
+    for c in &calls {
+        ret_for(&rets, c.tid, c.seq);
+    }
+    assert!(guards.is_empty(), "warm T=3 ≠ 512 → no guard");
+    // Prefix + member 3 exact; slots 4+ absent DESPITE live memory.
+    for j in 0..4u64 {
+        assert_eq!(
+            algs.iter().filter(|a| a.idx == j).count(),
+            2,
+            "slot {j} walked (j ≤ T)"
+        );
+    }
+    assert!(
+        algs.iter().all(|a| a.idx <= 3) && rows.iter().all(|r| r.idx <= 3),
+        "members 4+ never fired (absence despite live memory)"
+    );
+    assert_eq!(
+        read_percpu(loaded, "TRUNC", OP, true),
+        0,
+        "warm skip leaves TRUNC clean"
+    );
+    assert_retired(loaded, tid, "tail-warm");
+    assert_loss_zero(loaded);
+}
+
+/// D terminator control at j == T (+READ contrast): member AT T
+/// must still READ (j > T skips — a j ≥ T gate would skip it).
+/// Slot 3's names pointer is poisoned (unmapped): member 3 walks
+/// (T=3) → name-read fails → TRUNC_WALK_NAME + ALG_UNREADABLE for
+/// idx 3 (proving the read); members 4+ skip-silent (no reads —
+/// live slots 4,5 absent).
+#[test]
+#[ignore]
+fn d_terminator_control() {
+    use osslscope_ebpf_common as wire;
+    let Some(obj) = gated() else {
+        eprintln!("SKIP(members-live): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
+        return;
+    };
+    let exe = own_exe_cstr();
+    let off = query_off();
+    let attached = attach_chunk(&obj, &exe, off);
+    let loaded = &attached.loaded;
+    let tid = self_tid();
+    let slots: Vec<SlotSpec> = (0..6u32)
+        .map(|j| {
+            SlotSpec::live(
+                &format!("MDT{j}"),
+                100 + j as u16,
+                vec![(300 + j, 0x4400 + j as u64)],
+            )
+        })
+        .collect();
+    let fx = Fixture::build(&slots, &[]);
+    fx.pretouch();
+    populate_alg_class(loaded, &fx.classes);
+    // Poison slot 3's names pointer (tuple stays readable — imp
+    // live — so member 3 attempts the name read and fails it).
+    unsafe {
+        ((fx.array + 3 * 32) as *mut u64).write(0x1234_5678_9abc_def0);
+    }
+    FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
+    NS_VERDICT.store(0, Ordering::SeqCst);
+    write_tcache(loaded, fx.array, 3, 0);
+    fire(OP as i32, 1);
+    let ScanDrain {
+        calls,
+        rets,
+        guards,
+        algs,
+        rows,
+    } = drain(loaded);
+    assert_calls_admitted(&calls, 1, "term-control");
+    assert_eq!(rets.len(), 1, "RET joined");
+    ret_for(&rets, calls[0].tid, calls[0].seq);
+    assert!(guards.is_empty(), "warm T=3 ≠ 512 → no guard");
+    // Member 3 READ (j == T walks): UNREADABLE record, not silence.
+    let idx3: Vec<_> = algs.iter().filter(|a| a.idx == 3).collect();
+    assert_eq!(idx3.len(), 1, "member 3 read (j == T walks)");
+    assert_eq!(idx3[0].status, wire::ALG_UNREADABLE);
+    // Members 4+ skipped (live slots 4,5 absent — no reads).
+    assert!(
+        algs.iter().all(|a| a.idx <= 3) && rows.iter().all(|r| r.idx <= 2),
+        "members 4+ never fired"
+    );
+    // Prefix 0..2 exact.
+    for j in 0..3u64 {
+        let got: Vec<_> = algs.iter().filter(|a| a.idx == j).collect();
+        assert_eq!(got.len(), 1, "slot {j} exact");
+        assert_eq!(got[0].status, wire::ALG_OK);
+    }
+    assert_eq!(
+        read_percpu(loaded, "TRUNC", OP, true),
+        wire::TRUNC_WALK_NAME,
+        "name-fail flags alone (skip path leaves no TRUNC)"
+    );
+    assert_retired(loaded, tid, "term-control");
+    assert_loss_zero(loaded);
+}
+
+/// D GEN-stale-smaller (stale T=3 < live T=6 walks more — the
+/// cache never narrows): a GEN-mismatched entry is logical
+/// invalidation (COLD), so the full live prefix walks despite the
+/// stale T.
+#[test]
+#[ignore]
+fn d_gen_stale_smaller() {
+    let Some(obj) = gated() else {
+        eprintln!("SKIP(members-live): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
+        return;
+    };
+    let exe = own_exe_cstr();
+    let off = query_off();
+    let attached = attach_chunk(&obj, &exe, off);
+    let loaded = &attached.loaded;
+    let tid = self_tid();
+    let slots: Vec<SlotSpec> = (0..6u32)
+        .map(|j| {
+            SlotSpec::live(
+                &format!("MDG{j}"),
+                100 + j as u16,
+                vec![(300 + j, 0x4400 + j as u64)],
+            )
+        })
+        .collect();
+    let fx = Fixture::build(&slots, &[]);
+    fx.pretouch();
+    populate_alg_class(loaded, &fx.classes);
+    FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
+    NS_VERDICT.store(0, Ordering::SeqCst);
+    // Stale entry: T=3 with generation 99 (live GEN is 0) —
+    // GEN-mismatch → COLD → full reach.
+    write_tcache(loaded, fx.array, 3, 99);
+    fire(OP as i32, 1);
+    let ScanDrain {
+        calls,
+        rets,
+        guards,
+        algs,
+        rows,
+    } = drain(loaded);
+    assert_calls_admitted(&calls, 1, "gen-stale");
+    assert_eq!(rets.len(), 1, "RET joined");
+    ret_for(&rets, calls[0].tid, calls[0].seq);
+    assert!(guards.is_empty(), "slot 511 zero → no guard");
+    // Cold reach despite stale T=3 (slots 4,5 walked — the cache
+    // never narrows).
+    for j in 0..6u64 {
+        assert_eq!(
+            algs.iter().filter(|a| a.idx == j).count(),
+            1,
+            "slot {j} walked (stale cache ignored)"
+        );
+    }
+    assert_eq!(algs.len(), 6);
+    assert_eq!(rows.len(), 6);
+    assert_eq!(read_percpu(loaded, "TRUNC", OP, true), 0);
+    assert_retired(loaded, tid, "gen-stale");
+    assert_loss_zero(loaded);
+}
+
+/// D no_store-prefix matrix (verdict × cache-state; R18 §4.1 — no
+/// shared prove, local reads): warm+zero skips past T; warm+
+/// nonzero cold-walks (full reach) with member-0's TRUNC_NO_STORE
+/// (skip-proof — the flag is evaluated on the always-walked
+/// member 0); cold walks regardless of verdict (cache ignored);
+/// cold+nonzero flags NO_STORE too. (NULL/unreadable pointees hit
+/// the same `_` arm as nonzero — `Ok(0)` vs `_` — covered by
+/// construction; the live target cannot pass them without
+/// crashing itself on the verdict store.)
+#[test]
+#[ignore]
+fn d_no_store_prefix() {
+    use osslscope_ebpf_common as wire;
+    let Some(obj) = gated() else {
+        eprintln!("SKIP(members-live): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
+        return;
+    };
+    let exe = own_exe_cstr();
+    let off = query_off();
+    let slots: Vec<SlotSpec> = (0..3u32)
+        .map(|j| {
+            SlotSpec::live(
+                &format!("MDN{j}"),
+                100 + j as u16,
+                vec![(300 + j, 0x4400 + j as u64)],
+            )
+        })
+        .collect();
+    let tail: Vec<SlotSpec> = (0..3u32)
+        .map(|t| {
+            SlotSpec::live(
+                &format!("MDNT{t}"),
+                200 + t as u16,
+                vec![(900 + t, 0x9900 + t as u64)],
+            )
+        })
+        .collect();
+    // (warm?, verdict, expect_skip_past_2, expect_no_store)
+    for (warm, verdict, skip, no_store) in [
+        (true, 0, true, false),
+        (true, 1, false, true),
+        (false, 0, false, false),
+        (false, 1, false, true),
+    ] {
+        let tag = format!("ns-w{warm}-v{verdict}");
+        let attached = attach_chunk(&obj, &exe, off);
+        let loaded = &attached.loaded;
+        let tid = self_tid();
+        let mut entries: Vec<(String, u16)> =
+            slots.iter().map(|s| (s.name.clone(), s.class)).collect();
+        entries.extend(tail.iter().map(|s| (s.name.clone(), s.class)));
+        let fx = Fixture::build(&slots, &tail);
+        fx.pretouch();
+        populate_alg_class(loaded, &entries);
+        FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
+        NS_VERDICT.store(verdict, Ordering::SeqCst);
+        if warm {
+            write_tcache(loaded, fx.array, 2, 0);
+        }
+        fire(OP as i32, 1);
+        let d = drain(loaded);
+        assert_eq!(d.calls.len(), 1, "{tag}: CALL");
+        assert_eq!(d.rets.len(), 1, "{tag}: RET");
+        assert!(d.guards.is_empty(), "{tag}: no guard (T ≤ 3)");
+        if skip {
+            assert!(
+                d.algs.iter().all(|a| a.idx <= 2) && d.rows.iter().all(|r| r.idx <= 2),
+                "{tag}: past-T skipped"
+            );
+        } else {
+            for j in 0..6u64 {
+                assert_eq!(
+                    d.algs.iter().filter(|a| a.idx == j).count(),
+                    1,
+                    "{tag}: slot {j} walked"
+                );
+            }
+        }
+        let trunc = read_percpu(loaded, "TRUNC", OP, true);
+        if no_store {
+            assert_eq!(
+                trunc,
+                wire::TRUNC_NO_STORE,
+                "{tag}: member-0 flags NO_STORE"
+            );
+        } else {
+            assert_eq!(trunc, 0, "{tag}: TRUNC clean");
+        }
+        assert_retired(loaded, tid, &tag);
+        assert_loss_zero(loaded);
+    }
+}
+
+/// D guard-cold-ERROR: cold + slot-511-live + slot-512-UNREADABLE
+/// → GUARD ERROR + LOSS_GUARD_READ_ABORT (re-covers on retry — no
+/// TRUNC from the guard; walk TRUNC stays clean).
+#[test]
+#[ignore]
+fn d_guard_cold_error() {
+    use osslscope_ebpf_common as wire;
+    let Some(obj) = gated() else {
+        eprintln!("SKIP(members-live): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
+        return;
+    };
+    let exe = own_exe_cstr();
+    let off = query_off();
+    let attached = attach_chunk(&obj, &exe, off);
+    let loaded = &attached.loaded;
+    let tid = self_tid();
+    let slots: Vec<SlotSpec> = (0..512u32)
+        .map(|j| {
+            SlotSpec::live(
+                &format!("MDG{j:03}"),
+                100 + (j % 512) as u16,
+                vec![(7000 + j, 0xA000 + j as u64)],
+            )
+        })
+        .collect();
+    let fx = Fixture::build(&slots, &[]);
+    fx.pretouch();
+    populate_alg_class(loaded, &fx.classes);
+    // Slot 512 starts exactly at page 4 of the page-aligned array
+    // (512 × 32B): unmap it (slot 511 stays readable).
+    let page = 4096usize;
+    assert_eq!(fx.array as usize % page, 0, "array page-aligned");
+    let rc = unsafe { libc::munmap((fx.array + 512 * 32) as *mut libc::c_void, page) };
+    assert_eq!(rc, 0, "munmap slot-512 page");
+    FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
+    NS_VERDICT.store(0, Ordering::SeqCst);
+    fire(OP as i32, 1);
+    let ScanDrain {
+        calls,
+        rets,
+        guards,
+        algs,
+        rows: _,
+    } = drain(loaded);
+    assert_calls_admitted(&calls, 1, "guard-error");
+    assert_eq!(rets.len(), 1, "RET joined");
+    ret_for(&rets, calls[0].tid, calls[0].seq);
+    assert_eq!(algs.len(), 512, "all walked slots emit");
+    // Guard: eligible (cold + 511 live), read fails → ERROR.
+    assert_eq!(guards.len(), 1, "one GUARD");
+    let g = &guards_for(&guards, calls[0].tid, calls[0].seq)[0];
+    assert_eq!(
+        (g.kind, g.op, g.verdict, g.arr),
+        (wire::KIND_GUARD, OP, wire::GUARD_ERROR, fx.array),
+        "GUARD ERROR joined by (tid,seq)"
+    );
+    assert_loss_only(loaded, wire::LOSS_GUARD_READ_ABORT, 1, "guard-error");
+    assert_eq!(
+        read_percpu(loaded, "TRUNC", OP, true),
+        0,
+        "guard ERROR adds LOSS, not TRUNC"
+    );
+    assert_retired(loaded, tid, "guard-error");
+}
+
+/// D guard-warm-512 trio (eligibility ≠ walkability): warm
+/// T=512 over 512-live + term → GUARD EMPTY; over 513-live →
+/// GUARD VALID + TRUNC_ALGS (guard-exclusive); NOIMP@511 → guard
+/// still executes (EMPTY, TRUNC NOIMP alone).
+#[test]
+#[ignore]
+fn d_guard_warm_512() {
+    use osslscope_ebpf_common as wire;
+    let Some(obj) = gated() else {
+        eprintln!("SKIP(members-live): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
+        return;
+    };
+    let exe = own_exe_cstr();
+    let off = query_off();
+    let live512: Vec<SlotSpec> = (0..512u32)
+        .map(|j| {
+            SlotSpec::live(
+                &format!("MDH{j:03}"),
+                100 + (j % 512) as u16,
+                vec![(7000 + j, 0xA000 + j as u64)],
+            )
+        })
+        .collect();
+    // EMPTY: 512 live + term@512, warm T=512.
+    {
+        let attached = attach_chunk(&obj, &exe, off);
+        let loaded = &attached.loaded;
+        let tid = self_tid();
+        let fx = Fixture::build(&live512, &[]);
+        fx.pretouch();
+        populate_alg_class(loaded, &fx.classes);
+        FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
+        NS_VERDICT.store(0, Ordering::SeqCst);
+        write_tcache(loaded, fx.array, 512, 0);
+        fire(OP as i32, 1);
+        let d = drain(loaded);
+        assert_eq!(d.calls.len(), 1);
+        assert_eq!(d.rets.len(), 1);
+        assert_eq!(d.algs.len(), 512, "warm T=512 walks all");
+        assert_eq!(d.guards.len(), 1, "guard fires (warm T=512)");
+        let g = &guards_for(&d.guards, d.calls[0].tid, d.calls[0].seq)[0];
+        assert_eq!(g.verdict, wire::GUARD_EMPTY, "GUARD EMPTY");
+        assert_eq!(g.arr, fx.array);
+        assert_eq!(read_percpu(loaded, "TRUNC", OP, true), 0);
+        assert_retired(loaded, tid, "guard-warm-empty");
+        assert_loss_zero(loaded);
+    }
+    // VALID: 513 live, warm T=512.
+    {
+        let attached = attach_chunk(&obj, &exe, off);
+        let loaded = &attached.loaded;
+        let tid = self_tid();
+        let mut slots513 = live512.clone();
+        slots513.push(SlotSpec::live("MDH513", 612, vec![(7513, 0xA513)]));
+        let fx = Fixture::build(&slots513, &[]);
+        fx.pretouch();
+        populate_alg_class(loaded, &fx.classes);
+        FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
+        NS_VERDICT.store(0, Ordering::SeqCst);
+        write_tcache(loaded, fx.array, 512, 0);
+        fire(OP as i32, 1);
+        let d = drain(loaded);
+        assert_eq!(d.calls.len(), 1);
+        assert_eq!(d.rets.len(), 1);
+        assert_eq!(d.guards.len(), 1, "guard fires (warm T=512)");
+        let g = &guards_for(&d.guards, d.calls[0].tid, d.calls[0].seq)[0];
+        assert_eq!(g.verdict, wire::GUARD_VALID, "GUARD VALID");
+        assert_eq!(
+            read_percpu(loaded, "TRUNC", OP, true),
+            wire::TRUNC_ALGS,
+            "VALID → TRUNC_ALGS alone (guard-exclusive)"
+        );
+        assert_retired(loaded, tid, "guard-warm-valid");
+        assert_loss_zero(loaded);
+    }
+    // NOIMP@511: guard still executes (eligibility ≠ walkability).
+    {
+        let attached = attach_chunk(&obj, &exe, off);
+        let loaded = &attached.loaded;
+        let tid = self_tid();
+        let mut slots = live512.clone();
+        slots[511] = SlotSpec::noimp("MDH511N", 611);
+        let fx = Fixture::build(&slots, &[]);
+        fx.pretouch();
+        populate_alg_class(loaded, &fx.classes);
+        FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
+        NS_VERDICT.store(0, Ordering::SeqCst);
+        write_tcache(loaded, fx.array, 512, 0);
+        fire(OP as i32, 1);
+        let d = drain(loaded);
+        assert_eq!(d.calls.len(), 1);
+        assert_eq!(d.rets.len(), 1);
+        assert_eq!(d.algs.len(), 511, "NOIMP slot emits no ALG");
+        assert_eq!(d.guards.len(), 1, "guard executes despite NOIMP@511");
+        let g = &guards_for(&d.guards, d.calls[0].tid, d.calls[0].seq)[0];
+        assert_eq!(g.verdict, wire::GUARD_EMPTY, "GUARD EMPTY (term@512)");
+        assert_eq!(
+            read_percpu(loaded, "TRUNC", OP, true),
+            wire::TRUNC_WALK_NOIMP,
+            "NOIMP flags alone (guard adds nothing on EMPTY)"
+        );
+        assert_retired(loaded, tid, "guard-warm-noimp");
+        assert_loss_zero(loaded);
+    }
+}
+
+/// D IDLE+record-silence (programmed failed-delete marker): with
+/// the entry link DETACHED (no take runs — ATTEMPT proves it), a
+/// return over a programmed IDLE+record does no work, emits no
+/// RET/guard/ALG/ROW, runs no epilogue — the record PERSISTS
+/// untouched for take-time silent recovery (bump-if-present still
+/// runs on the existing IDLE cell).
+#[test]
+#[ignore]
+fn d_idle_record_silence() {
+    use osslscope_ebpf_common as wire;
+    let Some(obj) = gated() else {
+        eprintln!("SKIP(members-live): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
+        return;
+    };
+    let exe = own_exe_cstr();
+    let off = query_off();
+    let mut attached = attach_chunk(&obj, &exe, off);
+    let tid = self_tid();
+    let slots = vec![SlotSpec::live("MDI0", 100, vec![(95, 0x9500)])];
+    let fx = Fixture::build(&slots, &[]);
+    fx.pretouch();
+    populate_alg_class(&attached.loaded, &fx.classes);
+    FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
+    NS_VERDICT.store(0, Ordering::SeqCst);
+    // Program the failed-delete marker: record + IDLE|0.
+    let marker = wire::ScanRec {
+        op: OP as u64,
+        ns_ptr: 0x5555,
+        seq: wire::make_seq(0, 0),
+        expected: 512,
+        _pad: 0,
+        epoch: 1,
+    };
+    write_cell(
+        &attached.loaded,
+        "SCAN",
+        &tid.to_le_bytes(),
+        &scan_bytes(&marker),
+    );
+    write_cell(
+        &attached.loaded,
+        "RCOUNT",
+        &tid.to_le_bytes(),
+        &wire::make_rcount(0, wire::RCOUNT_STATE_IDLE).to_le_bytes(),
+    );
+    // Detach the ENTRY link (members stay): no take runs.
+    let devnull: OwnedFd = std::fs::File::open("/dev/null").expect("devnull").into();
+    drop(std::mem::replace(&mut attached.entry, devnull));
+    let loaded = &attached.loaded;
+    let attempt0 = read_attempt(loaded);
+    fire(OP as i32, 1);
+    let d = drain(loaded);
+    assert!(d.calls.is_empty(), "entry detached: no CALL");
+    assert_eq!(
+        read_attempt(loaded) - attempt0,
+        0,
+        "entry detached: ATTEMPT still"
+    );
+    assert!(d.rets.is_empty(), "IDLE: no RET");
+    assert!(d.guards.is_empty(), "IDLE: no guard");
+    assert!(d.algs.is_empty() && d.rows.is_empty(), "IDLE: no work");
+    // The record persists byte-identical (no epilogue ran).
+    let back = read_scan_cell(loaded, tid).expect("record persists");
+    assert_eq!(
+        (back.op, back.ns_ptr, back.seq, back.expected, back.epoch),
+        (
+            marker.op,
+            marker.ns_ptr,
+            marker.seq,
+            marker.expected,
+            marker.epoch
+        ),
+        "record untouched"
+    );
+    // Bump-if-present ran on the existing IDLE cell (count+512,
+    // state preserved — NOT a retire).
+    assert_eq!(
+        wire::split_rcount(read_u64_cell(loaded, "RCOUNT", tid).expect("RCOUNT kept")),
+        (512, wire::RCOUNT_STATE_IDLE),
+        "bump-if-present on IDLE (no retire)"
+    );
+    assert_loss_zero(loaded);
+}
+
+/// D nested-skip (REPLACES nested-skip-C — §10.2): T=168 with
+/// 160B primed (two undrained NULL queries = 2× 80B CALL+RET
+/// pairs on a sacrificial tid) — outer admits at 160 (pair →
+/// 240), inner pressure-skips. Both returns SCAN-miss (outer
+/// record deleted by the nested skip): zero member emissions, NO
+/// RET/guard on either return; RCOUNT IDLE|1024 (both returns'
+/// members bump-if-present, gated out of work).
+#[test]
+#[ignore]
+fn d_nested_skip() {
+    use osslscope_ebpf_common as wire;
+    let Some(obj) = gated() else {
+        eprintln!("SKIP(members-live): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
+        return;
+    };
+    let exe = own_exe_cstr();
+    let off = symbol_off("osslscope_member_query_nested");
+    let attached = attach_with_ctrl(&obj, &exe, off, &wire::ctrl_value(512, 1, 168));
+    let loaded = &attached.loaded;
+    let mut state = BirthState::new();
+    let tid = self_tid();
+    FIXTURE_ARRAY.store(0, Ordering::SeqCst); // NULL throughout
+    NS_VERDICT.store(0, Ordering::SeqCst);
+    // Prime 160B on a sacrificial tid (two admitted NULL pairs).
+    let sacrificial = fire_on_worker(loaded, OP as i32, 2);
+    assert_ne!(sacrificial, tid);
+    register(loaded, &mut state, &[tid]);
+    let (attempt0, calls0, loss0) = (
+        read_attempt(loaded),
+        read_percpu(loaded, "CALLS", OP, false),
+        read_percpu(loaded, "LOSS", wire::LOSS_RING_PRESSURE, false),
+    );
+    fire_nested(OP as i32, 1);
+    let d = drain(loaded);
+    let mine: Vec<_> = d.calls.iter().filter(|c| c.tid == tid).collect();
+    assert_eq!(mine.len(), 2, "outer-CALL + inner-CALL");
+    assert_eq!(
+        call_parts(mine[0]),
+        (false, wire::SKIP_ADMITTED),
+        "outer admits at 160"
+    );
+    assert_eq!(mine[0].seq, wire::make_seq(0, 0));
+    assert_eq!(
+        call_parts(mine[1]),
+        (false, wire::SKIP_RING_PRESSURE),
+        "inner pressure-skips at 240"
+    );
+    assert_eq!(mine[1].seq, 0);
+    assert_eq!(
+        read_percpu(loaded, "CALLS", OP, false) - calls0,
+        1,
+        "CALLS Δ1"
+    );
+    assert_eq!(read_attempt(loaded) - attempt0, 2, "ATTEMPT Δ2");
+    assert_eq!(
+        read_percpu(loaded, "LOSS", wire::LOSS_RING_PRESSURE, false) - loss0,
+        1,
+        "LOSS23 Δ1"
+    );
+    assert!(
+        d.algs.is_empty() && d.rows.is_empty(),
+        "zero member emissions"
+    );
+    // Both returns SCAN-miss → NO RET/guard on either (D re-pin).
+    let my_rets: Vec<_> = d.rets.iter().filter(|r| r.tid == tid).collect();
+    assert!(my_rets.is_empty(), "no RET on either nested return");
+    assert!(
+        d.guards.iter().all(|g| g.tid != tid),
+        "no guard on either return"
+    );
+    assert!(read_scan_cell(loaded, tid).is_none(), "SCAN absent");
+    assert_eq!(
+        wire::split_rcount(read_u64_cell(loaded, "RCOUNT", tid).expect("RCOUNT kept")),
+        (1024, wire::RCOUNT_STATE_IDLE),
+        "RCOUNT IDLE|1024 (both returns bump-if-present)"
+    );
+}
+
+/// D detach-stall (REPLACES detach-C — §10.2): member 7 detached
+/// (no in-flight games — the stall is identical whether the
+/// detach lands before the fire or behind a blocked return) →
+/// count stalls at 511: no retire, record STANDS (ACTIVE|511),
+/// RET still emitted (member 0 fires); the NEXT take carries
+/// NESTED-HINT (proving the stall — unretired record stands).
+#[test]
+#[ignore]
+fn d_detach_stall() {
+    use osslscope_ebpf_common as wire;
+    let Some(obj) = gated() else {
+        eprintln!("SKIP(members-live): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
+        return;
+    };
+    let exe = own_exe_cstr();
+    let off = query_off();
+    let mut attached = attach_chunk(&obj, &exe, off);
+    let tid = self_tid();
+    let slots = vec![SlotSpec::live("MDD0", 100, vec![(96, 0x9600)])];
+    let fx = Fixture::build(&slots, &[]);
+    fx.pretouch();
+    populate_alg_class(&attached.loaded, &fx.classes);
+    FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
+    NS_VERDICT.store(0, Ordering::SeqCst);
+    // Detach member 7 (EXPECTED stays 512 — the retire equation
+    // can never complete).
+    let devnull: OwnedFd = std::fs::File::open("/dev/null").expect("devnull").into();
+    drop(std::mem::replace(&mut attached.members[7], devnull));
+    let loaded = &attached.loaded;
+    fire(OP as i32, 1);
+    let d = drain(loaded);
+    assert_eq!(d.calls.len(), 1);
+    assert_eq!(call_parts(&d.calls[0]), (false, wire::SKIP_ADMITTED));
+    assert_eq!(d.rets.len(), 1, "RET emitted (member 0 fires)");
+    // Stalled: record STANDS (no retire — count 511 ≠ 512).
+    let rec = read_scan_cell(loaded, tid).expect("stalled record stands");
+    assert_eq!(rec.seq, wire::make_seq(0, 0));
+    assert_eq!(
+        wire::split_rcount(read_u64_cell(loaded, "RCOUNT", tid).expect("RCOUNT kept")),
+        (511, wire::RCOUNT_STATE_ACTIVE),
+        "count stalls at 511 (ACTIVE)"
+    );
+    assert_loss_zero(loaded);
+    // Next take: NESTED-HINT over the stalled record (proving it
+    // stood unretired).
+    fire(OP as i32, 1);
+    let d = drain(loaded);
+    assert_eq!(d.calls.len(), 1);
+    assert_eq!(
+        call_parts(&d.calls[0]),
+        (true, wire::SKIP_ADMITTED),
+        "stalled record hints the next take"
+    );
+    assert_eq!(d.calls[0].seq, wire::make_seq(0, 1));
+    assert_loss_zero(loaded);
+}
+
+/// D bump-blocked-clean-retire (REPLACES bump-C — §10.2): epoch
+/// bump behind a pipe-blocked invocation (no detach) → the
+/// blocked return retires CLEANLY (all 512 bump, count reaches
+/// expected — retire checks no epoch) → the next take is
+/// fresh-silent (NO LOSS25 — the bump is absorbed by retirement;
+/// the C twin churned). The CTRL readback (epoch 2) proves the
+/// bump happened; the absence of churn proves absorption.
+#[test]
+#[ignore]
+fn d_bump_blocked_clean_retire() {
+    use osslscope_ebpf_common as wire;
+    let Some(obj) = gated() else {
+        eprintln!("SKIP(members-live): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
+        return;
+    };
+    let exe = own_exe_cstr();
+    let off = symbol_off("osslscope_member_query_blocking");
+    let attached = attach_chunk(&obj, &exe, off);
+    let loaded = &attached.loaded;
+    let slots = vec![SlotSpec::live("MDB0", 100, vec![(97, 0x9700)])];
+    let fx = Fixture::build(&slots, &[]);
+    fx.pretouch();
+    populate_alg_class(loaded, &fx.classes);
+    FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
+    NS_VERDICT.store(0, Ordering::SeqCst);
+    let mut fds = [0i32; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+    BLOCK_PIPE_RD.store(fds[0], Ordering::SeqCst);
+    BLOCK_ENTERED.store(0, Ordering::SeqCst);
+    BLOCK_ONCE.store(1, Ordering::SeqCst);
+    let (wtid_tx, wtid_rx) = std::sync::mpsc::channel::<u32>();
+    let go = std::sync::Barrier::new(2);
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            let w = self_tid();
+            wtid_tx.send(w).expect("report tid");
+            go.wait();
+            fire_blocking(OP as i32); // Call 1: blocks (latch armed).
+            fire_blocking(OP as i32); // Call 2: passes (latch spent).
+        });
+        let w = wtid_rx.recv().expect("worker tid");
+        write_cell(loaded, "BIRTH", &w.to_le_bytes(), &0u16.to_le_bytes());
+        go.wait();
+        let mut entered = false;
+        for _ in 0..10_000 {
+            if BLOCK_ENTERED.load(Ordering::SeqCst) == 1 {
+                entered = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(entered, "worker blocked inside call 1");
+        // Bump epoch behind the blocked return (no detach).
+        osslscope::loader::program_ctrl(&loaded.maps, &wire::ctrl_value(512, 2, 1 << 20))
+            .expect("bump epoch to 2");
+        let one = [1u8; 1];
+        assert_eq!(
+            unsafe { libc::write(fds[1], one.as_ptr() as *const libc::c_void, 1) },
+            1,
+            "release worker"
+        );
+    });
+    unsafe {
+        libc::close(fds[0]);
+        libc::close(fds[1]);
+    }
+    // The bump happened (CTRL readback) but the blocked return
+    // retired cleanly, so the next take is fresh-silent.
+    let ctrl = osslscope::loader::read_ctrl(&loaded.maps).expect("read CTRL");
+    assert_eq!(ctrl.epoch, 2, "bump landed");
+    let d = drain(loaded);
+    assert_eq!(d.calls.len(), 2, "two worker CALLs");
+    assert_eq!(
+        call_parts(&d.calls[0]),
+        (false, wire::SKIP_ADMITTED),
+        "call 1 admits"
+    );
+    assert_eq!(d.calls[0].seq, wire::make_seq(0, 0));
+    assert_eq!(
+        call_parts(&d.calls[1]),
+        (false, wire::SKIP_ADMITTED),
+        "call 2 admits, quiet (fresh — no churn)"
+    );
+    assert_eq!(d.calls[1].seq, wire::make_seq(0, 1));
+    assert_eq!(d.rets.len(), 2, "both calls RET");
+    assert_eq!(read_percpu(loaded, "CALLS", OP, false), 2);
+    assert_loss_zero(loaded);
+    assert_retired(loaded, d.calls[1].tid, "bump-clean");
+}
+
+/// D governor quantum (REPLACES quantum-C — §10.2): NULL queries
+/// no-drain at T ∈ {159, 160, 161} — 80B CALL+RET pairs:
+/// 2/3/3 admitted (fire k sees occ (k−1)×80: T=159 admits 2 —
+/// fire 3 sees 160 > 159; T=160 admits 3 — fire 3 sees 160 ≤
+/// 160; T=161 admits 3). The 159→160 step pins the ≤ (a <
+/// comparison would admit 2 at T=160 — boundary-sensitive).
+/// CALLS-read between fires, single drain at end, RETs paired.
+#[test]
+#[ignore]
+fn d_governor_quantum() {
+    use osslscope_ebpf_common as wire;
+    let Some(obj) = gated() else {
+        eprintln!("SKIP(members-live): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
+        return;
+    };
+    let exe = own_exe_cstr();
+    let off = query_off();
+    for (t, want) in [(159u64, 2usize), (160, 3), (161, 3)] {
+        let attached = attach_with_ctrl(&obj, &exe, off, &wire::ctrl_value(512, 1, t));
+        let loaded = &attached.loaded;
+        let mut state = BirthState::new();
+        let tid = self_tid();
+        register(loaded, &mut state, &[tid]);
+        FIXTURE_ARRAY.store(0, Ordering::SeqCst);
+        NS_VERDICT.store(0, Ordering::SeqCst);
+        let mut admitted = 0u32;
+        for k in 1..=6u32 {
+            fire(OP as i32, 1);
+            if read_percpu(loaded, "CALLS", OP, false) == admitted as u64 + 1 {
+                admitted += 1;
+            }
+            assert_eq!(
+                read_attempt(loaded),
+                k as u64,
+                "T={t}: ATTEMPT tracks fires"
+            );
+        }
+        assert_eq!(
+            admitted as usize, want,
+            "T={t}: {want} admitted (80B quantum)"
+        );
+        let d = drain(loaded);
+        assert_eq!(d.calls.len(), 6, "T={t}: 6 CALLs, single end drain");
+        assert!(
+            d.algs.is_empty() && d.rows.is_empty(),
+            "T={t}: NULL silence"
+        );
+        assert!(d.guards.is_empty(), "T={t}: no guards (NULL)");
+        let (adm, skp): (Vec<&_>, Vec<&_>) = d
+            .calls
+            .iter()
+            .partition(|c| call_parts(c).1 == wire::SKIP_ADMITTED);
+        assert_eq!(adm.len(), want, "T={t}: drain agrees");
+        assert_eq!(skp.len(), 6 - want, "T={t}: skips");
+        assert!(
+            skp.iter()
+                .all(|c| call_parts(c) == (false, wire::SKIP_RING_PRESSURE) && c.seq == 0),
+            "T={t}: all skips cause 4, seq 0"
+        );
+        // RETs pair every admit (occupancy arrives in CALL+RET pairs).
+        assert_eq!(d.rets.len(), want, "T={t}: RET per admit");
+        for c in adm {
+            ret_for(&d.rets, c.tid, c.seq);
+        }
+        // D: retired between → all admits quiet (no hints).
+        assert!(d.calls.iter().all(|c| !call_parts(c).0), "T={t}: all quiet");
+        assert_loss_only(
+            loaded,
+            wire::LOSS_RING_PRESSURE,
+            (6 - want) as u64,
+            &format!("quantum-{t}"),
+        );
+    }
+}
+
+/// D pressure re-pin (RE-PINNED — §10.2: second skip at occ 80,
+/// not C's 32): GOVERNOR=0 extreme — first admits at occ 0
+/// (CALL+RET pair → 80), second skips at 80.
+#[test]
+#[ignore]
+fn d_pressure_gov0() {
+    use osslscope_ebpf_common as wire;
+    let Some(obj) = gated() else {
+        eprintln!("SKIP(members-live): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
+        return;
+    };
+    let exe = own_exe_cstr();
+    let off = query_off();
+    let attached = attach_with_ctrl(&obj, &exe, off, &wire::ctrl_value(512, 1, 0));
+    let loaded = &attached.loaded;
+    let mut state = BirthState::new();
+    let tid = self_tid();
+    register(loaded, &mut state, &[tid]);
+    FIXTURE_ARRAY.store(0, Ordering::SeqCst);
+    NS_VERDICT.store(0, Ordering::SeqCst);
+    fire(OP as i32, 2);
+    let d = drain(loaded);
+    assert_eq!(d.calls.len(), 2);
+    assert_eq!(
+        call_parts(&d.calls[0]),
+        (false, wire::SKIP_ADMITTED),
+        "occ 0 admits"
+    );
+    assert_eq!(d.calls[0].seq, wire::make_seq(0, 0));
+    assert_eq!(
+        call_parts(&d.calls[1]),
+        (false, wire::SKIP_RING_PRESSURE),
+        "occ 80 skips"
+    );
+    assert_eq!(d.calls[1].seq, 0);
+    assert_eq!(read_percpu(loaded, "CALLS", OP, false), 1, "CALLS Δ1");
+    assert_eq!(read_attempt(loaded), 2, "ATTEMPT Δ2");
+    assert_loss_only(loaded, wire::LOSS_RING_PRESSURE, 1, "gov0");
+    assert_eq!(d.rets.len(), 1, "RET on the admit only");
+    ret_for(&d.rets, tid, wire::make_seq(0, 0));
+    assert!(d.guards.is_empty(), "no guards (NULL)");
+    assert!(
+        d.algs.is_empty() && d.rows.is_empty(),
+        "skip member silence"
+    );
+    assert!(read_scan_cell(loaded, tid).is_none(), "skip cleared SCAN");
+    assert_eq!(
+        wire::split_rcount(read_u64_cell(loaded, "RCOUNT", tid).expect("RCOUNT kept")),
+        (512, wire::RCOUNT_STATE_IDLE),
+        "skipped return bumps-if-present (IDLE|512)"
+    );
+}
+
+/// D burst-exactness + drop-path (§7D): (a) burst — 3× 512-live
+/// scans no-drain, per-(tid,seq) pairing exact (1 CALL + 1 RET +
+/// 512 ALG + 512 ROW + 1 GUARD each), each retired; (b) drop-path
+/// — 200 NULL no-drain at T=8000: exactly 101 admit (fire 101
+/// sees occ 8000 ≤ 8000), 99 skip cause 4; RETs == admits.
+#[test]
+#[ignore]
+fn d_burst_exactness() {
+    use osslscope_ebpf_common as wire;
+    let Some(obj) = gated() else {
+        eprintln!("SKIP(members-live): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
+        return;
+    };
+    let exe = own_exe_cstr();
+    let off = query_off();
+    // (a) Burst: 3 full scans, no drain between.
+    {
+        let attached = attach_chunk(&obj, &exe, off);
+        let loaded = &attached.loaded;
+        let tid = self_tid();
+        let slots: Vec<SlotSpec> = (0..512u32)
+            .map(|j| {
+                SlotSpec::live(
+                    &format!("MDB{j:03}"),
+                    100 + (j % 512) as u16,
+                    vec![(7000 + j, 0xA000 + j as u64)],
+                )
+            })
+            .collect();
+        let fx = Fixture::build(&slots, &[]);
+        fx.pretouch();
+        populate_alg_class(loaded, &fx.classes);
+        FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
+        NS_VERDICT.store(0, Ordering::SeqCst);
+        fire(OP as i32, 3);
+        let d = drain(loaded);
+        assert_eq!(d.calls.len(), 3, "burst: 3 CALLs");
+        assert_eq!(d.rets.len(), 3, "burst: 3 RETs");
+        assert_eq!(
+            d.guards.len(),
+            3,
+            "burst: 3 guards (cold, 511 live, term@512)"
+        );
+        for c in &d.calls {
+            assert_eq!(call_parts(c), (false, wire::SKIP_ADMITTED));
+            let r = ret_for(&d.rets, c.tid, c.seq);
+            assert_eq!(r.flags, 0);
+            let g = guards_for(&d.guards, c.tid, c.seq);
+            assert_eq!(g.len(), 1);
+            assert_eq!(g[0].verdict, wire::GUARD_EMPTY);
+        }
+        assert_eq!(d.algs.len(), 3 * 512, "burst: 512 ALG per scan");
+        assert_eq!(d.rows.len(), 3 * 512, "burst: 512 ROW per scan");
+        assert_eq!(read_percpu(loaded, "CALLS", OP, false), 3);
+        assert_eq!(read_percpu(loaded, "TRUNC", OP, true), 0);
+        assert_retired(loaded, tid, "burst");
+        assert_loss_zero(loaded);
+    }
+    // (b) Drop-path: 200 NULL at T=8000 → 101 admit / 99 skip.
+    {
+        let attached = attach_with_ctrl(&obj, &exe, off, &wire::ctrl_value(512, 1, 8000));
+        let loaded = &attached.loaded;
+        let mut state = BirthState::new();
+        register(loaded, &mut state, &[self_tid()]);
+        FIXTURE_ARRAY.store(0, Ordering::SeqCst);
+        NS_VERDICT.store(0, Ordering::SeqCst);
+        fire(OP as i32, 200);
+        let d = drain(loaded);
+        assert_eq!(d.calls.len(), 200, "drop: 200 CALLs, single drain");
+        let (adm, skp): (Vec<&_>, Vec<&_>) = d
+            .calls
+            .iter()
+            .partition(|c| call_parts(c).1 == wire::SKIP_ADMITTED);
+        assert_eq!(adm.len(), 101, "drop: 101 admit (fire 101 sees occ 8000)");
+        assert_eq!(skp.len(), 99, "drop: 99 pressure-skips");
+        assert!(
+            skp.iter()
+                .all(|c| call_parts(c).1 == wire::SKIP_RING_PRESSURE)
+        );
+        assert_eq!(d.rets.len(), 101, "drop: RET per admit");
+        assert!(d.algs.is_empty() && d.rows.is_empty(), "drop: NULL silence");
+        assert_eq!(read_percpu(loaded, "CALLS", OP, false), 101);
+        assert_eq!(read_attempt(loaded), 200);
+        assert_loss_only(loaded, wire::LOSS_RING_PRESSURE, 99, "drop");
+    }
 }

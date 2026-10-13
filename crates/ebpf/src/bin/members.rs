@@ -1,23 +1,27 @@
 //! SPDX-License-Identifier: GPL-2.0-only
 //! Member chunk: one object, 512 baked-slot query-return programs
-//! plus the shared entry (P7 item 2; criteria §6.2, §2.4).
+//! plus the shared entry (P7 item 3; criteria §6.3, §5.1/§5.3).
 //!
 //! Each `member_J` walks exactly slot J of the query-returned
 //! OSSL_ALGORITHM array plus its dispatch table — the sampler's
 //! proven slot-walk body (`harvest.rs query_return`) with the
 //! cursor/chain/proof machinery removed (no cursor: every scan is
-//! full; no tail calls; no TERMD: 512 writers would last-wins).
-//! Members peek (never take) the entry's PENDING record: a taker
-//! would starve whichever members fire after it, and attachment
-//! order must stay meaningless. The §5.1/§5.3 protocol layers
-//! (SCAN, counter-first/retire-last, T-cache peek, WALK-DONE) land
-//! in items 3–4; the PENDING scaffold retires in item 9.
+//! full; no tail calls; no TERMD: 512 writers would last-wins)
+//! under the §5.1/§5.3 protocol layers (R18): SCAN peek (never
+//! take — a taker would starve whichever members fire after it,
+//! and attachment order must stay meaningless),
+//! counter-first/retire-last, per-member T-cache peek with local
+//! pointee-read eligibility, member-0 verdict-first QUERY_RET,
+//! and the member-511 guard read. WALK-DONE + TRUE-T land with
+//! the item-4 join; the harvest path's PENDING scaffold retires
+//! in item 9 (members.o dropped its own PENDING in stage D).
 //!
-//! v1 honesty bounds (stated, tested): no T-gate, so slots past
-//! the true terminator read meaningless memory and may emit
-//! garbage — v1 claims prefix-exactness only, never completion.
-//! 513-live arrays flag TRUNC_ALGS; 512-clean scans stay silent
-//! (the clean-full proof is the item-4 join's job).
+//! Stage-D honesty bounds (stated, tested): the T-gate skips
+//! past-T members only on a warm cache entry with a
+//! successfully-read zero pointee (cold/GEN-stale/unreadable
+//! walks — v1 prefix reach); completion/termination proof is the
+//! item-4 join's job (GUARD/RET/ALG/ROW carry (tid,seq) for it;
+//! ALG/ROW keys land with that oracle).
 //!
 //! Helpers and the walk body are duplicated from `harvest.rs`
 //! (not shared): the codebase's established pattern — the P5a
@@ -39,15 +43,17 @@ use aya_ebpf::{
 };
 use osslscope_ebpf_common::{
     classify_alg_with, loss_for_skip_cause, make_call_flags, make_rcount, make_seq, split_rcount,
-    split_seq, AlgClassValue, AlgEvent, CtrlValue, PendQuery, RowEvent, ScanCallEvent, ScanRec,
-    TCacheValue, ALG_UNREADABLE, ALG_WINDOW, BIRTH_FROZEN, KIND_ALG, KIND_ROW, KIND_SCAN_CALL,
+    split_seq, AlgClassValue, AlgEvent, CtrlValue, GuardEvent, RowEvent, ScanCallEvent, ScanRec,
+    ScanRetEvent, TCacheValue, ALG_UNREADABLE, ALG_WINDOW, BIRTH_FROZEN, GUARD_EMPTY, GUARD_ERROR,
+    GUARD_VALID, KIND_ALG, KIND_GUARD, KIND_ROW, KIND_SCAN_CALL, KIND_SCAN_RET, LOSS_GUARD_READ_ABORT,
     LOSS_MAP_CALLS, LOSS_MAP_TRUNC, LOSS_MEMBER_COOKIE, LOSS_RETIRE_FAIL, LOSS_RING_ALG,
-    LOSS_RING_CALL, LOSS_RING_ROW, LOSS_SCAN_CHURNED, LOSS_SCAN_EVICTED, LOSS_STALE_REPAIRED,
-    MEMBER_ENTRY_COOKIE, OTHER_CLASS, RCOUNT_STATE_ACTIVE,
-    RCOUNT_STATE_IDLE, RINGBUF_AVAIL_DATA, SEQ_CTR_MAX, SKIP_ADMITTED, SKIP_ADMIT_STORE_FAIL,
-    SKIP_ALL, SKIP_BIRTH_PENDING, SKIP_BIRTH_WRAP, SKIP_CTRL_UNPROGRAMMED, SKIP_ENTRY_COOKIE,
-    SKIP_RING_PRESSURE, SKIP_SEQ_FULL, SKIP_SEQ_SATURATED, TRUNC_ALGS, TRUNC_DISPATCH,
-    TRUNC_NO_STORE, TRUNC_WALK_EMPTY, TRUNC_WALK_NAME, TRUNC_WALK_NOIMP, TRUNC_WALK_READ,
+    LOSS_RING_CALL, LOSS_RING_GUARD, LOSS_RING_RET, LOSS_RING_ROW, LOSS_SCAN_CHURNED,
+    LOSS_SCAN_EVICTED, LOSS_STALE_REPAIRED, MEMBER_ENTRY_COOKIE, OTHER_CLASS, RCOUNT_STATE_ACTIVE,
+    RCOUNT_STATE_IDLE, RET_FLAG_EMPTY, RINGBUF_AVAIL_DATA, SEQ_CTR_MAX, SKIP_ADMITTED,
+    SKIP_ADMIT_STORE_FAIL, SKIP_ALL, SKIP_BIRTH_PENDING, SKIP_BIRTH_WRAP, SKIP_CTRL_UNPROGRAMMED,
+    SKIP_ENTRY_COOKIE, SKIP_RING_PRESSURE, SKIP_SEQ_FULL, SKIP_SEQ_SATURATED, TRUNC_ALGS,
+    TRUNC_DISPATCH, TRUNC_NO_STORE, TRUNC_WALK_EMPTY, TRUNC_WALK_NAME, TRUNC_WALK_NOIMP,
+    TRUNC_WALK_READ,
 };
 
 /// `BPF_NOEXIST` for `insert` (kernel UAPI; aya-ebpf exposes no const).
@@ -71,11 +77,6 @@ const MAX_DISPATCH: u64 = 128;
 
 #[map]
 static EVENTS: RingBuf = RingBuf::with_byte_size(1 << 21, 0);
-/// Entry→return pairs: op + caller `no_store` out-pointer
-/// (16-byte values). V1 scaffold: peeked by all members under the
-/// entry cookie, replaced by SCAN in item 3 (retired item 9).
-#[map]
-static PENDING_QUERY: HashMap<u64, PendQuery> = HashMap::with_max_entries(1024, 0);
 
 /// Per-array incarnation generation (F-H/H1): the host installs
 /// `GEN[arr]` when an array's epoch is born or reborn and deletes
@@ -241,15 +242,6 @@ fn cookie_of(ctx: &ProbeContext) -> u64 {
     unsafe { helpers::bpf_get_attach_cookie(ctx.as_ptr()) }
 }
 
-/// PENDING key namespaced by attach cookie: members peek the
-/// entry's record under the entry-cookie namespace. Bits 56+ carry
-/// the namespace, collision-free while pid_tgid leaves them clear
-/// (true under default pid_max; a >2^24 TGID namespace would need
-/// a wider key — P5 stretch, never observed).
-fn pend_key(cookie: u64) -> u64 {
-    helpers::bpf_get_current_pid_tgid() ^ ((cookie + 1) << 56)
-}
-
 fn flag_trunc(op: u32, bit: u64) {
     if percpu_or(&TRUNC, &op, bit).is_err() {
         bump_loss(LOSS_MAP_TRUNC);
@@ -307,6 +299,57 @@ fn emit_call(ev: &ScanCallEvent) {
     }
 }
 
+fn emit_ret(ev: &ScanRetEvent) {
+    if let Some(mut e) = EVENTS.reserve::<ScanRetEvent>(0) {
+        e.write(*ev);
+        e.submit(0);
+    } else {
+        bump_loss(LOSS_RING_RET);
+    }
+}
+
+fn emit_guard(ev: &GuardEvent) {
+    if let Some(mut e) = EVENTS.reserve::<GuardEvent>(0) {
+        e.write(*ev);
+        e.submit(0);
+    } else {
+        bump_loss(LOSS_RING_GUARD);
+    }
+}
+
+/// Retire primitive (R18 §3, shared entry-recovery + member-
+/// epilogue paths): RCOUNT = IDLE|0 FIRST, then SCAN delete
+/// (non-ENOENT → LOSS_RETIRE_FAIL promptly via `absent_ok` —
+/// never delay a failure count to take time, or a never-coming
+/// take silences it; IDLE+record is the marker that take-time
+/// recovery must NOT recount; ENOENT → absent-ok).
+fn retire(tid: &u32) {
+    // The cell exists (the epilogue read it pre-bump in this same
+    // invocation — no same-tid interleaving), so BPF_ANY cannot
+    // fail; ignored regardless — retirement is best-effort, and a
+    // stale record is take-time LOUD (LOSS 31), never silent.
+    let _ = RCOUNT.insert(tid, make_rcount(0, RCOUNT_STATE_IDLE), 0);
+    absent_ok(SCAN.remove(tid));
+}
+
+/// Gated epilogue (R18 §4 — one epilogue, every path): retires iff
+/// the peek hit AND ACTIVE AND the EXPLICIT pre-bump read reaches
+/// the frozen expected (`old_count + 1 == expected` — comparing
+/// post-bump would retire after 511 firings).
+fn epilogue(gated: bool, old: Option<u32>, expected: u32, tid: &u32) {
+    if !gated {
+        return;
+    }
+    if let Some(c) = old {
+        // Wrapping: a corrupt count (u32::MAX) wraps to 0, which
+        // never equals the validated expected (1..=512) — no
+        // accidental retire.
+        if c.wrapping_add(1) == expected {
+            retire(tid);
+        }
+    }
+}
+
 /// Absent-ok delete (R18 §6.16 ENOENT-as-absent): `Ok`/`-ENOENT`
 /// mean the desired state is achieved (no LOSS); any other error
 /// is a cleanup failure (LOSS_RETIRE_FAIL now — a failure count is
@@ -321,14 +364,13 @@ fn absent_ok(r: Result<(), i32>) {
 }
 
 /// Uniform skip path (R18 §3, sol F1): every cause, including
-/// post-SEQ publication failures. Deletes PENDING[tid] (C — D
-/// drops the map) + SCAN[tid], RCOUNT→IDLE|0 iff present (never
-/// create — the SKIP path never creates cells), LOSS[cause],
-/// CALL(skipped, cause, seq 0). The RCOUNT→IDLE step runs
-/// REGARDLESS of delete outcomes, so a retained cell is always
-/// paired with IDLE-or-missing.
+/// post-SEQ publication failures. Deletes SCAN[tid] (D — the C
+/// PENDING delete is gone with the map), RCOUNT→IDLE|0 iff
+/// present (never create — the SKIP path never creates cells),
+/// LOSS[cause], CALL(skipped, cause, seq 0). The RCOUNT→IDLE step
+/// runs REGARDLESS of delete outcomes, so a retained cell is
+/// always paired with IDLE-or-missing.
 fn skip(tid: u32, op: u64, cause: u8) {
-    absent_ok(PENDING_QUERY.remove(&pend_key(MEMBER_ENTRY_COOKIE)));
     absent_ok(SCAN.remove(&tid));
     if RCOUNT.get_ptr(&tid).is_some() {
         // Existing-key update: cannot fail; ignored regardless —
@@ -345,16 +387,17 @@ fn skip(tid: u32, op: u64, cause: u8) {
     });
 }
 
-/// query_operation(provctx, operation_id, no_store): the stage-C
-/// entry plane (R18 §3). Fail-fast gates (cookie → CTRL →
-/// SKIP_ALL → BIRTH → wrap → governor), SEQ mint, C-interim
-/// PENDING write, SCAN take (snapshot-then-classify), RCOUNT
-/// reset, SCAN publish, then admit effects (CALLS bump + CALL).
-/// Every gate skips with its cause + LOSS + CALL(skipped, seq 0);
-/// admits freeze EXPECTED+epoch from CTRL into the record. Same
-/// arg positions for the core wrapper
-/// ossl_provider_query_operation(prov, op, no_cache) on
-/// 3.0/3.5/4.0. Straight-line: zero loops (R18 §10.3).
+/// query_operation(provctx, operation_id, no_store): the entry
+/// plane (R18 §3, stage D: the C-interim PENDING write is gone —
+/// members read SCAN). Fail-fast gates (cookie → CTRL → SKIP_ALL
+/// → BIRTH → wrap → governor), SEQ mint, SCAN take
+/// (snapshot-then-classify), RCOUNT reset, SCAN publish, then
+/// admit effects (CALLS bump + CALL). Every gate skips with its
+/// cause + LOSS + CALL(skipped, seq 0); admits freeze
+/// EXPECTED+epoch from CTRL into the record. Same arg positions
+/// for the core wrapper ossl_provider_query_operation(prov, op,
+/// no_cache) on 3.0/3.5/4.0. Straight-line: zero loops (R18
+/// §10.3).
 #[uprobe]
 pub fn member_entry(ctx: ProbeContext) -> u32 {
     // 1. ATTEMPT bump FIRST (before every exit incl. legacy).
@@ -444,15 +487,9 @@ pub fn member_entry(ctx: ProbeContext) -> u32 {
             }
         }
     };
-    // 9. C-interim PENDING write for the still-v1 members (fail →
-    // cause 8, BEFORE SCAN publish — D removes the map, R18 §6.1).
-    if PENDING_QUERY
-        .insert(&pend_key(MEMBER_ENTRY_COOKIE), PendQuery { op, ns_ptr }, 0)
-        .is_err()
-    {
-        skip(tid, op, SKIP_ADMIT_STORE_FAIL);
-        return 0;
-    }
+    // 9. (D: the C-interim PENDING write is gone with the map —
+    // members read SCAN now. Cause-8/LOSS-32 still cover the
+    // RCOUNT-reset + SCAN-publish failures below.)
     // 10. SCAN take: SNAPSHOT old SCAN + old RCOUNT into stack
     // FIRST, classify the snapshot (R18 §3 table), run the row's
     // effects. The repair rows' "delete" is subsumed by the step-12
@@ -540,160 +577,322 @@ pub fn member_entry(ctx: ProbeContext) -> u32 {
 /// (512 independent verifies — a member failure is a hole, never a
 /// load failure once item 6 lands; v1 keeps abort-whole).
 ///
-/// Body deltas vs the sampler's `query_return` (all else verbatim):
-/// PENDING peek (never take — a taker would starve later-firing
-/// members), entry-owned lifecycle in C (write-on-admit,
-/// delete-on-skip; miss silent — R18 §6.1); attach-cookie
-/// self-check (loader permutation bugs fail closed); CALLS counted
-/// by the entry (admit-bump, NULL included — R18 §6.2); no
+/// Stage-D body (R18 §4 — sampler-parity DECLARED broken, §6.5:
+/// classifier/dispatch/cacheability/privacy logic stays verbatim,
+/// the wrapper diverges): SCAN peek + bump-if-present + ACTIVE
+/// gate + member-0 verdict-first RET + per-member T-cache
+/// eligibility + 511 guard + uniform gated epilogue with retire.
+/// CALLS counted by the entry (admit-bump — R18 §6.2); no
 /// QUERY_NEXT cursor (every scan is full); no TERMD (512 writers
-/// would last-wins — TRUE-T is the item-4 join's job); no QUERY_RET
-/// (lands in D, member-0 verdict-first); no tail calls.
+/// would last-wins — TRUE-T is the item-4 join's job); no tail
+/// calls.
 macro_rules! def_member {
     ($name:ident, $j:literal) => {
         #[uretprobe]
         pub fn $name(ctx: RetProbeContext) -> u32 {
-            // Loader self-check FIRST: the link cookie must equal the
-            // baked slot, or slots silently permute (item-3
-            // membership leans on the same convention).
-            let cookie = unsafe { helpers::bpf_get_attach_cookie(ctx.as_ptr()) };
-            if cookie != $j {
+            let tid = helpers::bpf_get_current_pid_tgid() as u32;
+            // Loader self-check (recorded, not returned: a
+            // mismatched member still bumps + runs the gated
+            // epilogue — the scan completed, its slot evidence
+            // holes — R18 §6.4).
+            let cookie_ok =
+                unsafe { helpers::bpf_get_attach_cookie(ctx.as_ptr()) } == $j;
+            // SCAN peek (record kept for the epilogue).
+            let peek: Option<ScanRec> = unsafe { SCAN.get_ptr(&tid).map(|p| *p) };
+            // bump-if-present (never create — §2 invariant): the
+            // EXPLICIT pre-bump read feeds the retire equation.
+            // Single-threaded per cell (one tid = one thread, its
+            // 512 members fire sequentially), so the read-modify-
+            // write loses nothing.
+            let mut old: Option<u32> = None;
+            let mut was_active = false;
+            if let Some(cell) = unsafe { RCOUNT.get_ptr(&tid).map(|p| *p) } {
+                let (count, state) = split_rcount(cell);
+                old = Some(count);
+                was_active = state == RCOUNT_STATE_ACTIVE;
+                let _ = RCOUNT.insert(&tid, make_rcount(count.wrapping_add(1), state), 0);
+            }
+            // ACTIVE gate (R18 §6.4): work + epilogue require
+            // peek-hit AND RCOUNT ACTIVE.
+            let gated = peek.is_some() && old.is_some() && was_active;
+            if !cookie_ok {
                 bump_loss(LOSS_MEMBER_COOKIE);
-                return 0;
-            }
-            // Peek-only: taking would delete the record for the
-            // members that fire after this one (order-dependent
-            // holes). A MISS is the intentional skip (the entry
-            // deleted PENDING on its uniform skip path — R18 §6.1
-            // interim invariant: present ⟺ last entry event was
-            // admit), silent by design; the attach-race miss goes
-            // silent too as a documented interim divergence
-            // (matching D's SCAN-miss silence).
-            let pend: PendQuery = match PENDING_QUERY.get_ptr(&pend_key(MEMBER_ENTRY_COOKIE)) {
-                Some(p) => unsafe { *p },
-                    None => {
-                        return 0;
+                if let (Some(rec), Some(c)) = (peek, old) {
+                    if gated && c.wrapping_add(1) == rec.expected {
+                        retire(&tid);
                     }
-                };
-            let op = pend.op;
-            let rv: u64 = ctx.ret();
-            if rv == 0 {
+                }
                 return 0;
             }
-            // CALLS moved to the entry (admit-bump — R18 §6.2):
-            // only the entry is always attached (item-6 selective
-            // load may drop member 0), and the entry cannot see rv
-            // — so NULL flips to counted (spec-mandated).
-            // The provider's lifetime verdict, read once from the
-            // caller's out-pointer in this valid return context. Only
-            // an explicit 0 is cacheable; any nonzero verdict, NULL
-            // pointer, or read failure fails closed to `no_store`
-            // (flagged, still walked — never proven; v1 never
-            // proves anything).
-            let no_store = match unsafe { helpers::bpf_probe_read_user(pend.ns_ptr as *const u32) }
-            {
-                Ok(0) => false,
-                _ => true,
+            let rec = match peek {
+                Some(r) => r,
+                // SCAN-miss: skipped scans emit nothing member-side
+                // (no work, no RET, no guard).
+                None => return 0,
             };
-            if no_store {
-                flag_trunc(op as u32, TRUNC_NO_STORE);
+            if !gated {
+                // IDLE+record (or RCOUNT-less): no work, no
+                // epilogue — the record persists for take-time
+                // silent recovery.
+                return 0;
+            }
+            let op = rec.op;
+            let ns_ptr = rec.ns_ptr;
+            let seq = rec.seq;
+            // Frozen expected from the PEEKED record (never live
+            // CTRL — a membership change mid-scan must not move
+            // the retire equation).
+            let expected = rec.expected;
+            let rv: u64 = ctx.ret();
+            if $j == 0 {
+                // (1) Member 0 reads ns_ptr FIRST and flags
+                // TRUNC_NO_STORE (skip-proof cacheability — R18
+                // §4: T-skips and EMPTY paths must never lose a
+                // no_store verdict; member 0 always walks — j=0 ≤
+                // T — so the flag is always evaluated). Only an
+                // explicit 0 is cacheable; any nonzero verdict,
+                // NULL pointer, or read failure fails closed to
+                // `no_store` (flagged, still walked — never
+                // proven).
+                let no_store =
+                    match unsafe { helpers::bpf_probe_read_user(ns_ptr as *const u32) } {
+                        Ok(0) => false,
+                        _ => true,
+                    };
+                if no_store {
+                    flag_trunc(op as u32, TRUNC_NO_STORE);
+                }
+                // (2) Member 0 emits QUERY_RET early (a slot-0 read
+                // abort must still present RET, else HOLE-0 is
+                // indistinguishable from abort).
+                emit_ret(&ScanRetEvent {
+                    kind: KIND_SCAN_RET,
+                    op: op as u32,
+                    flags: if rv == 0 { RET_FLAG_EMPTY } else { 0 },
+                    tid,
+                    seq,
+                    arr: rv,
+                    generation: gen_of(rv),
+                });
+            }
+            if rv == 0 {
+                // EMPTY: all members run the gated epilogue and
+                // return (the invocation still retires; count
+                // reaches expected).
+                epilogue(gated, old, expected, &tid);
+                return 0;
+            }
+            // T-cache peek with LOCAL eligibility (R18 §6.12 — no
+            // shared cell, order-independent; member 0 skips the
+            // peek — it always walks). Miss OR GEN-mismatch →
+            // COLD (GEN-mismatch is logical invalidation for
+            // peek-only BPF; item 4 replaces the cache).
+            let mut warm_t: Option<u64> = None;
+            if $j != 0 {
+                if let Some(tc) = unsafe { T_CACHE.get_ptr(&rv).map(|p| *p) } {
+                    if tc.generation == gen_of(rv) {
+                        warm_t = Some(tc.t);
+                    }
+                }
+                if let Some(t) = warm_t {
+                    if $j > t {
+                        // Would-skip path: only a
+                        // successfully-read zero pointee skips (a
+                        // non-NULL pointer is NOT permission — the
+                        // OpenSSL provider-base contract assigns
+                        // cache permission to the integer
+                        // out-value). Nonzero / NULL / unreadable
+                        // → COLD walk.
+                        match unsafe {
+                            helpers::bpf_probe_read_user(ns_ptr as *const u32)
+                        } {
+                            Ok(0) => {
+                                epilogue(gated, old, expected, &tid);
+                                return 0;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
             }
             // Slot walk (OSSL_ALGORITHM = { names, props, impl,
-            // desc } @32B; only names+impl are read here).
+            // desc } @32B; only names+impl are read here; v1
+            // precedence: tuple-read-fail → TRUNC_WALK_READ;
+            // names == 0 → EMPTY-silent (slot 0: TRUNC_WALK_EMPTY
+            // flag); imp == 0 → NOIMP; pointed-to-name-read-fail →
+            // TRUNC_WALK_NAME + ALG_UNREADABLE). Aborts/NOIMP/
+            // name-fails record their TRUNC/LOSS and fall through
+            // to the guard check, never skipping it.
             let base = rv + $j * 32;
             let names = unsafe { helpers::bpf_probe_read_user(base as *const u64) };
             let imp = unsafe { helpers::bpf_probe_read_user((base + 16) as *const u64) };
-            let (Ok(names), Ok(imp)) = (names, imp) else {
-                // Unreadable slot aborts this member's walk (flagged;
-                // the next scan re-walks — every scan is full).
-                flag_trunc(op as u32, TRUNC_WALK_READ);
-                return 0;
-            };
-            if names == 0 {
-                // Terminator at this slot: silent (no proof without
-                // the item-4 T-join). Slot 0 empty = the query
-                // returned a table with no first alg (flagged).
-                if $j == 0 {
-                    flag_trunc(op as u32, TRUNC_WALK_EMPTY);
+            let mut names_present = false;
+            match (names, imp) {
+                (Ok(names), Ok(imp)) => {
+                    if names == 0 {
+                        // Terminator at this slot: silent (no proof
+                        // without the item-4 T-join). Slot 0 empty
+                        // = the query returned a table with no
+                        // first alg (flagged).
+                        if $j == 0 {
+                            flag_trunc(op as u32, TRUNC_WALK_EMPTY);
+                        }
+                    } else {
+                        names_present = true;
+                        if imp == 0 {
+                            // Alg without implementation: a stable
+                            // observation (the slot read fine),
+                            // explicit via NOIMP.
+                            flag_trunc(op as u32, TRUNC_WALK_NOIMP);
+                        } else {
+                            // Kernel scratch only: classified
+                            // below, never emitted.
+                            let mut name_buf = [0u8; 128];
+                            match unsafe {
+                                helpers::bpf_probe_read_user_str_bytes(
+                                    names as *const u8,
+                                    &mut name_buf,
+                                )
+                            } {
+                                Ok(slice) => {
+                                    // Copy the length out first:
+                                    // the window array is
+                                    // reborrowed shared below,
+                                    // which ends `slice`'s mutable
+                                    // borrow.
+                                    let len = slice.len();
+                                    let saturated = len == ALG_WINDOW - 1;
+                                    let v = classify_alg(&name_buf, len, saturated);
+                                    // ALG first: userspace drops
+                                    // rows whose (array, index) has
+                                    // no ALG record yet (orphan
+                                    // rule), so rows must follow
+                                    // their ALG.
+                                    emit_alg(&AlgEvent {
+                                        kind: KIND_ALG,
+                                        op: op as u32,
+                                        class: v.class,
+                                        status: v.status,
+                                        weak: u8::from(v.weak),
+                                        _pad: 0,
+                                        arr: rv,
+                                        idx: $j,
+                                        generation: gen_of(rv),
+                                    });
+                                    match walk_dispatch(imp, op as u32, rv, $j) {
+                                        // Overflow: rows 0..127 are
+                                        // kept, the rest is
+                                        // unwalkable — flagged, not
+                                        // silent.
+                                        1 => {
+                                            flag_trunc(op as u32, TRUNC_DISPATCH);
+                                        }
+                                        0 => {}
+                                        // Read abort: flag (the
+                                        // scan re-walks next
+                                        // query).
+                                        _ => {
+                                            flag_trunc(op as u32, TRUNC_WALK_READ);
+                                        }
+                                    }
+                                }
+                                Err(_) => {
+                                    flag_trunc(op as u32, TRUNC_WALK_NAME);
+                                    // Explicit unreadable record
+                                    // (cold page or hostile
+                                    // pointer).
+                                    emit_alg(&AlgEvent {
+                                        kind: KIND_ALG,
+                                        op: op as u32,
+                                        class: OTHER_CLASS,
+                                        status: ALG_UNREADABLE,
+                                        weak: 0,
+                                        _pad: 0,
+                                        arr: rv,
+                                        idx: $j,
+                                        generation: gen_of(rv),
+                                    });
+                                }
+                            }
+                        }
+                    }
                 }
-                return 0;
-            }
-            // Overrun guard on the last slot: entries 0..=511 all
-            // live means the array may extend past the bound — slot
-            // 512 decides (terminator = clean-silent in v1; anything
-            // else = TRUNC_ALGS). The §5.3 ERROR@512 split
-            // (UNKNOWN-TERMINATOR + re-cover) lands with item 3's
-            // guard-read work. Folds out of members 0..510.
-            if $j == MAX_ALGS - 1 {
-                let tail =
-                    unsafe { helpers::bpf_probe_read_user((rv + MAX_ALGS * 32) as *const u64) };
-                match tail {
-                    Ok(0) => {}
-                    _ => flag_trunc(op as u32, TRUNC_ALGS),
-                }
-            }
-            if imp == 0 {
-                // Alg without implementation: a stable observation
-                // (the slot read fine), explicit via NOIMP.
-                flag_trunc(op as u32, TRUNC_WALK_NOIMP);
-                return 0;
-            }
-            // Kernel scratch only: classified below, never emitted.
-            let mut name_buf = [0u8; 128];
-            let slice = match unsafe {
-                helpers::bpf_probe_read_user_str_bytes(names as *const u8, &mut name_buf)
-            } {
-                Ok(s) => s,
-                Err(_) => {
-                    flag_trunc(op as u32, TRUNC_WALK_NAME);
-                    // Explicit unreadable record (cold page or
-                    // hostile pointer).
-                    emit_alg(&AlgEvent {
-                        kind: KIND_ALG,
-                        op: op as u32,
-                        class: OTHER_CLASS,
-                        status: ALG_UNREADABLE,
-                        weak: 0,
-                        _pad: 0,
-                        arr: rv,
-                        idx: $j,
-                        generation: gen_of(rv),
-                    });
-                    return 0;
-                }
-            };
-            // Copy the length out first: the window array is
-            // reborrowed shared below, which ends `slice`'s mutable
-            // borrow.
-            let len = slice.len();
-            let saturated = len == ALG_WINDOW - 1;
-            let v = classify_alg(&name_buf, len, saturated);
-            // ALG first: userspace drops rows whose (array, index)
-            // has no ALG record yet (orphan rule), so rows must
-            // follow their ALG.
-            emit_alg(&AlgEvent {
-                kind: KIND_ALG,
-                op: op as u32,
-                class: v.class,
-                status: v.status,
-                weak: u8::from(v.weak),
-                _pad: 0,
-                arr: rv,
-                idx: $j,
-                generation: gen_of(rv),
-            });
-            match walk_dispatch(imp, op as u32, rv, $j) {
-                // Overflow: rows 0..127 are kept, the rest is
-                // unwalkable — flagged, not silent.
-                1 => {
-                    flag_trunc(op as u32, TRUNC_DISPATCH);
-                }
-                0 => {}
-                // Read abort: flag (the scan re-walks next query).
+                // Unreadable slot aborts this member's walk
+                // (flagged; the next scan re-walks — every scan is
+                // full).
                 _ => {
                     flag_trunc(op as u32, TRUNC_WALK_READ);
                 }
             }
+            // 511-only guard (R18 §4): eligible iff (warm AND T ==
+            // 512) OR ((cold OR GEN-miss) AND slot 511 read
+            // live/names-present). Cold boundary scans need the
+            // guard (else item 4 can never establish T = 512 or
+            // publish the first warm entry). The guard is NOT part
+            // of the walk: NOIMP/EMPTY/ERROR @511 still execute it
+            // when eligible (eligibility ≠ walkability);
+            // EMPTY@511 in cold means T ≤ 511 is established → no
+            // guard (silence justified); rv == 0 and SCAN-miss
+            // never guard (returned above). Folds out of members
+            // 0..510.
+            if $j == MAX_ALGS - 1 {
+                let eligible = match warm_t {
+                    Some(t) => t == MAX_ALGS,
+                    None => names_present,
+                };
+                if eligible {
+                    // Single positional read of slot 512.
+                    let tail = unsafe {
+                        helpers::bpf_probe_read_user((rv + MAX_ALGS * 32) as *const u64)
+                    };
+                    match tail {
+                        // EMPTY: clean-full proof (event only).
+                        Ok(0) => {
+                            emit_guard(&GuardEvent {
+                                kind: KIND_GUARD,
+                                op: op as u32,
+                                verdict: GUARD_EMPTY,
+                                tid,
+                                seq,
+                                arr: rv,
+                                generation: gen_of(rv),
+                            });
+                        }
+                        // VALID: contract violation (event +
+                        // TRUNC_ALGS — guard-VALID-exclusive in D;
+                        // the v1 tail check's ERROR/VALID
+                        // conflation is removed; members.o has no
+                        // other TRUNC_ALGS producer).
+                        Ok(_) => {
+                            flag_trunc(op as u32, TRUNC_ALGS);
+                            emit_guard(&GuardEvent {
+                                kind: KIND_GUARD,
+                                op: op as u32,
+                                verdict: GUARD_VALID,
+                                tid,
+                                seq,
+                                arr: rv,
+                                generation: gen_of(rv),
+                            });
+                        }
+                        // ERROR: read-abort/UNKNOWN-TERMINATOR
+                        // (event + LOSS — re-covers on retry).
+                        Err(_) => {
+                            bump_loss(LOSS_GUARD_READ_ABORT);
+                            emit_guard(&GuardEvent {
+                                kind: KIND_GUARD,
+                                op: op as u32,
+                                verdict: GUARD_ERROR,
+                                tid,
+                                seq,
+                                arr: rv,
+                                generation: gen_of(rv),
+                            });
+                        }
+                    }
+                }
+            }
+            epilogue(gated, old, expected, &tid);
             0
         }
     };

@@ -160,7 +160,6 @@ WINDOW
 DROPFAIL
 # members
 EVENTS
-PENDING_QUERY
 GEN
 LOSS
 TRUNC
@@ -197,20 +196,27 @@ tables by op id only — no diagnostic prints raw array addresses
 
 The members (traversal) object shares the `EVENTS`/`GEN`/`LOSS`/
 `TRUNC`/`CALLS`/`ALG_CLASS` shapes above (same numeric discipline;
-its `PENDING_QUERY` is the entry-owned interim scaffold — R18
-§6.1 — dropped in stage D). The scan-plane maps hold numeric
-observer state only: `SCAN` (one in-flight take record per thread:
-op, `no_store`-pointer, seq, frozen EXPECTED/epoch — pointers are
+its `PENDING_QUERY` interim scaffold is dropped in stage D — R18
+§6.1). The scan-plane maps hold numeric observer state only:
+`SCAN` (one in-flight take record per thread: op,
+`no_store`-pointer, seq, frozen EXPECTED/epoch — pointers are
 stashed for the return-side read, never emitted), `SEQ`
 (birth:16|ctr:48 invocation ids), `BIRTH` (registry births),
 `RCOUNT` (count:32|lifecycle:32), `T_CACHE` (array → terminator +
-generation, userspace-written), `CTRL` (EXPECTED/epoch/SKIP-ALL/
-governor occupancy bound), `ATTEMPT` (entry-hit census). The
-entry plane reads NO target memory (args + map cells only — the
-entry cannot see rv; pinned by `probe_read_allowlist_is_complete`),
-so admission/skip decisions never retain target bytes. `T_CACHE`
-and the guard/`no_store` pointee reads extend this section in
-stage D with their own justification.
+generation, userspace-written — the writer is item 4; members
+peek it read-only and treat GEN-mismatch as cold), `CTRL`
+(EXPECTED/epoch/SKIP-ALL/governor occupancy bound), `ATTEMPT`
+(entry-hit census). The entry plane reads NO target memory (args
++ map cells only — the entry cannot see rv; pinned by
+`probe_read_allowlist_is_complete`), so admission/skip decisions
+never retain target bytes. Stage-D member reads (8 sites,
+pinned): the slot tuple + dispatch + name (v1 shapes, same
+bounds), the member-0 `no_store` verdict read (u32 → TRUNC flag,
+never emitted), the would-skip-path `no_store` verdict re-read
+(u32 → branch only — only a successfully-read zero skips; the
+value is never retained past the branch), and the guard's single
+positional slot-512 names read (names-present verdict → GUARD
+event only — no pointee content is read or emitted).
 
 ## 5. Emitted artifacts
 
