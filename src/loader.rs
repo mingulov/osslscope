@@ -1997,6 +1997,149 @@ pub fn load(prep: &Prepared) -> anyhow::Result<Loaded> {
     Ok(Loaded { progs, maps })
 }
 
+/// Member-chunk fd budget: 513 prog fds + 14 map fds + 513 link fds
+/// (all held — drop = detach) + clones + stdio ≈ 1047 > the 1024
+/// default (EMFILE observed at member_499). NEED is the fail-closed
+/// floor; WANT is the unprivileged raise target under the hard cap.
+pub const MEMBERS_FD_NEED: u64 = 4096;
+pub const MEMBERS_FD_WANT: u64 = 8192;
+
+/// Pure gate: is this soft RLIMIT_NOFILE enough for the chunk?
+/// (Unit-tested; the effectful raise below is live-proven — every
+/// member leg attaches through it, EMFILE would RED.)
+pub const fn members_fd_budget_ok(soft: u64) -> bool {
+    soft >= MEMBERS_FD_NEED
+}
+
+/// Raise/check own RLIMIT_NOFILE for the chunk budget (fail-closed:
+/// errors when the hard cap itself is too small — no silent
+/// half-attach). Unprivileged soft raise; idempotent.
+pub fn ensure_members_fd_budget() -> anyhow::Result<()> {
+    // SAFETY: getrlimit/setrlimit on valid pointers; rlim_t widths
+    // are libc's. No threads are spawned here — the limit is
+    // process-wide by design (the attach needs it process-wide).
+    unsafe {
+        let mut r = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut r as *mut _) != 0 {
+            anyhow::bail!("getrlimit NOFILE failed");
+        }
+        if r.rlim_cur < MEMBERS_FD_WANT {
+            r.rlim_cur = std::cmp::min(MEMBERS_FD_WANT, r.rlim_max);
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &r as *const _) != 0 {
+                anyhow::bail!("setrlimit NOFILE failed");
+            }
+            if libc::getrlimit(libc::RLIMIT_NOFILE, &mut r as *mut _) != 0 {
+                anyhow::bail!("getrlimit NOFILE re-read failed");
+            }
+        }
+        if !members_fd_budget_ok(r.rlim_cur) {
+            anyhow::bail!(
+                "NOFILE {} below the {}-fd chunk budget (hard cap too small)",
+                r.rlim_cur,
+                MEMBERS_FD_NEED
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Program the scan-plane session control cell (`CTRL[0]`).
+/// Live-proven (L1 reads it back — a failed write REDs there).
+pub fn program_ctrl(
+    maps: &HashMap<String, OwnedFd>,
+    ctrl: &osslscope_ebpf_common::CtrlValue,
+) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    use aya::maps::{Array, Map, MapData};
+    let fd = maps
+        .get("CTRL")
+        .context("CTRL map missing")?
+        .try_clone()
+        .context("clone CTRL")?;
+    let data = MapData::from_fd(fd).context("CTRL mapdata")?;
+    let map = Map::from_map_data(data).context("CTRL map")?;
+    let mut arr =
+        Array::<_, osslscope_ebpf_common::CtrlValue>::try_from(map).context("CTRL array shape")?;
+    arr.set(0, *ctrl, 0).context("write CTRL[0]")?;
+    Ok(())
+}
+
+/// Read back the session control cell (legs + future daemon).
+pub fn read_ctrl(
+    maps: &HashMap<String, OwnedFd>,
+) -> anyhow::Result<osslscope_ebpf_common::CtrlValue> {
+    use anyhow::Context as _;
+    use aya::maps::{Array, Map, MapData};
+    let fd = maps
+        .get("CTRL")
+        .context("CTRL map missing")?
+        .try_clone()
+        .context("clone CTRL")?;
+    let data = MapData::from_fd(fd).context("CTRL mapdata")?;
+    let map = Map::from_map_data(data).context("CTRL map")?;
+    let arr =
+        Array::<_, osslscope_ebpf_common::CtrlValue>::try_from(map).context("CTRL array shape")?;
+    arr.get(&0, 0).context("read CTRL[0]")
+}
+
+/// A fully attached member chunk: loaded progs/maps + live links.
+/// Drop order detaches members first (Vec drop), then entry, then
+/// maps/progs (Loaded drop) — the reverse of construction.
+pub struct MembersAttached {
+    pub loaded: Loaded,
+    pub entry: OwnedFd,
+    pub members: Vec<OwnedFd>,
+}
+
+/// Production attach of the member chunk: fd budget → prepare →
+/// load → program CTRL → attach entry (cookie 512) + members
+/// (cookie = slot) at `off` in `exe` for `pid`. One entry point so
+/// the legs dogfood the exact production path (L7's cookie fault
+/// re-attaches a single member link surgically on top).
+/// Live-proven by every member leg (L1 first).
+pub fn attach_members(
+    obj: &std::path::Path,
+    exe: &std::ffi::CStr,
+    off: u64,
+    pid: u32,
+    ctrl: &osslscope_ebpf_common::CtrlValue,
+) -> anyhow::Result<MembersAttached> {
+    use anyhow::Context as _;
+    ensure_members_fd_budget()?;
+    let bytes = std::fs::read(obj).with_context(|| format!("read {}", obj.display()))?;
+    let prep = prepare(&bytes, &MEMBER_MAPS, &MEMBER_PROGS).context("prepare members.o")?;
+    let loaded = load(&prep).context("load members.o")?;
+    program_ctrl(&loaded.maps, ctrl).context("program CTRL")?;
+    let entry = ossl_bpf_sys::link_create_uprobe_multi(
+        loaded.progs["member_entry"].as_raw_fd(),
+        exe,
+        &[off],
+        &[osslscope_ebpf_common::MEMBER_ENTRY_COOKIE],
+        pid,
+    )
+    .context("attach member_entry")?;
+    let mut members = Vec::with_capacity(512);
+    for j in 0..512u64 {
+        let name = format!("member_{j:03}");
+        let prog = loaded
+            .progs
+            .get(&name)
+            .with_context(|| format!("prog {name} missing"))?;
+        members.push(
+            ossl_bpf_sys::link_create_uretprobe_multi(prog.as_raw_fd(), exe, &[off], &[j], pid)
+                .with_context(|| format!("attach {name}"))?,
+        );
+    }
+    Ok(MembersAttached {
+        loaded,
+        entry,
+        members,
+    })
+}
+
 /// Strip the kernel log buffer's NUL padding (the verifier writes a
 /// C string into our 1 MiB buffer).
 fn trim_nul(log: &[u8]) -> &[u8] {
@@ -3497,5 +3640,33 @@ mod tests {
             osslscope_ebpf_common::WINDOW_CELLS,
             "spec dims track the shared ABI"
         );
+    }
+
+    #[test]
+    fn members_fd_budget_predicate() {
+        // Pure gate for the chunk's fd budget (513 prog + 14 map +
+        // 513 link fds + clones ≈ 1047 > the 1024 default): soft
+        // limits below NEED fail closed before any attach.
+        assert!(!members_fd_budget_ok(1024), "default 1024 insufficient");
+        assert!(!members_fd_budget_ok(MEMBERS_FD_NEED - 1));
+        assert!(members_fd_budget_ok(MEMBERS_FD_NEED));
+        assert!(members_fd_budget_ok(MEMBERS_FD_WANT));
+        assert!(MEMBERS_FD_WANT >= MEMBERS_FD_NEED);
+    }
+
+    #[test]
+    fn member_map_count_covers_scan_plane() {
+        // The spec count is the prepare-time contract: 7 item-2
+        // maps + the 7 scan-plane maps (bridge; PENDING drops in
+        // subtask C → 13).
+        assert_eq!(MEMBER_MAPS.len(), 14);
+        for name in [
+            "SCAN", "SEQ", "BIRTH", "RCOUNT", "T_CACHE", "CTRL", "ATTEMPT",
+        ] {
+            assert!(
+                MEMBER_MAPS.iter().any(|m| m.name == name),
+                "spec names {name}"
+            );
+        }
     }
 }
