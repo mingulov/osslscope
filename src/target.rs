@@ -17,6 +17,7 @@
 //! observably stopped, so the residual window is microseconds, not
 //! the whole setup phase.
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ffi::CString;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, IntoRawFd as _, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
@@ -199,21 +200,29 @@ pub enum WorkloadDest {
     /// Both streams to /dev/null (default).
     Null,
     /// Both streams to this file (fresh empty inode per run,
-    /// parent-side, pre-fork). Preparation runs on ONE gated worker:
-    /// the destination is validated (never created, never truncated),
-    /// then a uniquely-owned staging file is created beside it, then the
-    /// abandonment check + atomic publish (`rename`) run under the ONE
-    /// lock the caller's abandonment setter shares — a worker delayed
-    /// past abandonment deletes its staging and publishes nothing, and
-    /// the caller never blocks in the open/stage itself. Accepted ONLY
-    /// as a regular file: missing parents, symlinks, FIFOs, directories,
-    /// sockets and devices fail setup pre-fork, naming the path with the
-    /// 126 setup marker. The published fd — not the path — is handed to
-    /// the child, so post-publish path replacement is harmless. Notes:
-    /// each run publishes a FRESH inode (hard links to a previous run's
-    /// file are not preserved; permission bits are carried over), and the
+    /// parent-side, pre-fork). Preparation runs on ONE worker: the
+    /// destination is validated (never created, never truncated), then a
+    /// provably-distinct staging file is created beside it, then the
+    /// worker re-checks the lock-free abandonment flag immediately before
+    /// the atomic publish (`rename`) — a worker that observes abandonment
+    /// deletes only its own staging and performs NO destination mutation.
+    /// The caller's abandonment path takes NO lock and performs NO file
+    /// syscalls (bounded by construction, however stuck the worker is).
+    /// A process-wide per-destination registry refuses a new OUR-setup
+    /// while a prior worker for that path is still live, so OUR-retry
+    /// successors never race a stale worker. Accepted ONLY as a regular
+    /// file: missing parents, symlinks, FIFOs, directories, sockets and
+    /// devices fail setup pre-fork, naming the path with the 126 setup
+    /// marker. The published fd — not the path — is handed to the child,
+    /// so post-publish path replacement is harmless. Notes: each run
+    /// publishes a FRESH inode (hard links to a previous run's file are
+    /// not preserved; permission bits are carried over); the
     /// destination's directory must be writable (staging + rename live
-    /// beside the destination).
+    /// beside the destination); destinations whose file name lies in the
+    /// staging namespace (`.osslscope-staging-*`) are refused before
+    /// anything is created. Residual: arbitrary EXTERNAL writers racing a
+    /// stale worker cannot be fenced by any userspace design — the
+    /// guarantee covers setups coordinated through this setup path.
     File(PathBuf),
     /// Both streams to a caller-held fd (harness pipe form; the
     /// child never closes the caller's fd). Validated pre-fork for
@@ -410,21 +419,95 @@ fn validate_sink_target(path: &Path) -> anyhow::Result<ValidatedTarget> {
     })
 }
 
+/// Staging file-name namespace (fix round 5): every generated staging
+/// name carries this prefix, and any REQUESTED destination whose file name
+/// carries it is refused before anything is created (see
+/// [`dest_in_staging_namespace`]) — a destination can therefore never equal
+/// a would-be staging name.
+const STAGING_PREFIX: &str = ".osslscope-staging-";
+
 /// Per-process staging sequence: staging names are unique per (pid,
-/// counter), so a worker delayed past abandonment can only ever touch
-/// its own staging file — never the destination, never another
+/// counter, random), so a worker delayed past abandonment can only ever
+/// touch its own staging file — never the destination, never another
 /// attempt's staging.
 static STAGING_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Create the uniquely-owned staging sink for `path` (fix round 4): a
+/// One random suffix for a staging name (fix round 5): `getrandom`, with a
+/// time/pid/counter mix as the fallback (uniqueness is still carried by the
+/// counter; the random component additionally separates stale files across
+/// pid reuse and crashed runs). Runs worker-side only.
+fn random_suffix() -> u64 {
+    let mut buf = [0u8; 8];
+    let r = unsafe { libc::getrandom(buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
+    if r == buf.len() as libc::ssize_t {
+        return u64::from_ne_bytes(buf);
+    }
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() ^ (d.subsec_nanos() as u64))
+        .unwrap_or(0);
+    t ^ (std::process::id() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ STAGING_COUNTER
+            .load(Ordering::Relaxed)
+            .wrapping_mul(0xBF58_476D_1CE4_E5B9)
+}
+
+/// Collision control, first layer (fix round 5): a destination whose file
+/// name lies in the staging namespace could equal a generated staging name,
+/// so the setup is refused BEFORE creating anything (no staging, no
+/// validation fd, no worker, no child). Pure path inspection — no syscalls.
+fn dest_in_staging_namespace(path: &Path) -> bool {
+    path.file_name()
+        .map(|n| n.as_bytes().starts_with(STAGING_PREFIX.as_bytes()))
+        .unwrap_or(false)
+}
+
+/// A staging sink the worker created itself (fix round 5): the fd, the path,
+/// and the device/inode identity recorded at creation. Cleanup unlinks the
+/// path ONLY while it still resolves to that recorded identity (see
+/// [`remove_own_staging`]) — a stale worker touches only what it created.
+/// Deliberately NO `Drop` impl: after a successful publish the path names
+/// the DESTINATION and must never be unlinked — every cleanup call is
+/// explicit, on failure paths only.
+struct StagingFile {
+    fd: OwnedFd,
+    path: PathBuf,
+    dev: u64,
+    ino: u64,
+}
+
+/// Delete a staging file the worker created itself (fix round 5): the path
+/// is unlinked only if it still resolves (via `lstat`, so a swapped-in
+/// symlink never matches) to the device/inode recorded at creation.
+/// Anything else — renamed away, replaced, unstatable, or never ours — is
+/// left untouched. Never called with the destination path.
+fn remove_own_staging(staging: &StagingFile) {
+    let Ok(c) = CString::new(staging.path.as_os_str().as_bytes()) else {
+        return;
+    };
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::lstat(c.as_ptr(), &mut st) } == 0
+        && st.st_dev == staging.dev
+        && st.st_ino == staging.ino
+    {
+        let _ = std::fs::remove_file(&staging.path);
+    }
+}
+
+/// Create the uniquely-owned staging sink for `path` (fix round 5): a
 /// fresh empty regular file in the destination's directory, opened
-/// `O_CREAT|O_EXCL` — born empty, so it is never truncated, and never the
-/// destination inode. `mode` carries the validated destination's
-/// permission bits when it exists (see [`ValidatedTarget`]). The staging
-/// path returns alongside the fd so every outcome either publishes it
-/// (atomic rename, exactly once) or deletes it. Every failure names the
-/// destination path with the 126 setup marker and spawns nothing.
-fn create_staging_sink(path: &Path, mode: Option<u32>) -> anyhow::Result<(OwnedFd, PathBuf)> {
+/// `O_CREAT|O_EXCL` — born empty, so it is never truncated. `mode` carries
+/// the validated destination's permission bits when it exists (see
+/// [`ValidatedTarget`]). Provably distinct from the destination in three
+/// layers: (1) the staging namespace is refused at the entrypoint before
+/// anything is created; (2) a generated candidate equal to the destination
+/// path is skipped without creating it; (3) after creation the staging
+/// identity (device/inode) is compared against the destination path — a
+/// same-file match (only reachable via symlinked-parent aliasing) deletes
+/// the just-created inode (new by `O_EXCL`, so nothing pre-existing is
+/// lost) and fails closed. Every failure names the destination path with
+/// the 126 setup marker and spawns nothing.
+fn create_staging_sink(path: &Path, mode: Option<u32>) -> anyhow::Result<StagingFile> {
     use anyhow::Context as _;
     let dir = path
         .parent()
@@ -434,7 +517,13 @@ fn create_staging_sink(path: &Path, mode: Option<u32>) -> anyhow::Result<(OwnedF
     let pid = std::process::id();
     for _ in 0..100 {
         let n = STAGING_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let staging = dir.join(format!(".osslscope-staging-{pid}-{n}"));
+        let staging = dir.join(format!(
+            "{STAGING_PREFIX}{pid}-{n}-{:016x}",
+            random_suffix()
+        ));
+        if staging == path {
+            continue; // Layer 2: never create onto the destination spelling.
+        }
         let c =
             CString::new(staging.as_os_str().as_bytes()).context("NUL in --workload-out path")?;
         let fd = unsafe {
@@ -471,6 +560,23 @@ fn create_staging_sink(path: &Path, mode: Option<u32>) -> anyhow::Result<(OwnedF
                 path.display(),
             );
         }
+        let (dev, ino) = (st.st_dev, st.st_ino);
+        // Layer 3: same-file comparison against the destination. An absent
+        // destination (or any other stat failure) cannot alias our new
+        // inode, so only a positive identity match fails closed.
+        let mut dst: libc::stat = unsafe { std::mem::zeroed() };
+        if let Ok(dc) = CString::new(path.as_os_str().as_bytes()) {
+            if unsafe { libc::stat(dc.as_ptr(), &mut dst) } == 0
+                && dst.st_dev == dev
+                && dst.st_ino == ino
+            {
+                let _ = std::fs::remove_file(&staging);
+                anyhow::bail!(
+                    "workload output {}: staging file aliases the destination (setup status 126)",
+                    path.display(),
+                );
+            }
+        }
         // Clear O_NONBLOCK: it only guarded the open itself; the
         // workload must inherit ordinary blocking stdio.
         let flags = unsafe { libc::fcntl(owned.as_raw_fd(), libc::F_GETFL) };
@@ -495,7 +601,12 @@ fn create_staging_sink(path: &Path, mode: Option<u32>) -> anyhow::Result<(OwnedF
                 );
             }
         }
-        return Ok((owned, staging));
+        return Ok(StagingFile {
+            fd: owned,
+            path: staging,
+            dev,
+            ino,
+        });
     }
     anyhow::bail!(
         "workload output {}: cannot pick a staging name after 100 attempts (setup status 126)",
@@ -503,54 +614,127 @@ fn create_staging_sink(path: &Path, mode: Option<u32>) -> anyhow::Result<(OwnedF
     );
 }
 
-/// Read the abandonment gate (fix round 4): poison-tolerant — a lock
-/// failure still yields the guarded value instead of panicking setup
-/// (no panicking operation runs under this lock, so poisoning should
-/// never occur).
-fn abandonment_get(gate: &Mutex<bool>) -> bool {
-    *gate.lock().unwrap_or_else(|e| e.into_inner())
+/// Process-wide per-destination setup registry (fix round 5): maps a
+/// lexically-normalized destination to the id of the setup whose prep
+/// worker is still live. A new OUR-setup for a path with a still-live
+/// prior worker REFUSES (fail fast — no bounded fence wait) instead of
+/// writing concurrently; once the prior worker finishes and unregisters, a
+/// successor setup runs normally. This closes OUR-retry successor races
+/// structurally: at most one OUR worker per destination is ever mutating
+/// it. The lock is held only for single map operations — never across file
+/// syscalls, sleeps, or joins — and NEVER on the caller's
+/// deadline/cancel (abandonment) path: an abandoning caller leaves its
+/// entry for its still-running worker to remove.
+fn setup_registry() -> &'static Mutex<HashMap<PathBuf, u64>> {
+    static REGISTRY: std::sync::OnceLock<Mutex<HashMap<PathBuf, u64>>> = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Set the abandonment gate (fix round 4): same poison tolerance.
-fn abandonment_set(gate: &Mutex<bool>) {
-    *gate.lock().unwrap_or_else(|e| e.into_inner()) = true;
+/// Unique setup-attempt ids for [`setup_registry`] ownership (an entry is
+/// removed only by the attempt that inserted it).
+static SETUP_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// Lexically normalize a destination for registry keying (fix round 5):
+/// collapse `.`, resolve `..` against normal components, drop duplicate
+/// separators — so `./a`, `a`, and `sub/../a` fence each other. Pure
+/// computation, NO syscalls: `canonicalize` would run blocking file I/O on
+/// the caller, which the setup path forbids. Residual: distinct spellings
+/// through symlinked parents key separately (documented; same class as
+/// external writers).
+fn normalize_setup_key(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::Prefix(p) => out.push(p.as_os_str()),
+            Component::RootDir => out.push(Component::RootDir.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => match out.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    out.pop();
+                }
+                _ => out.push(".."),
+            },
+            Component::Normal(n) => out.push(n),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        out
+    }
+}
+
+/// Try to register a new OUR-setup for `key` (fix round 5): `Some(id)` when
+/// no prior worker is live for it (the caller owns the entry until its
+/// worker finishes or the synchronous paths below reclaim it), `None` when
+/// a prior worker is still live (the setup must refuse without writing).
+/// Brief map operation only. Poison-tolerant (a poisoned registry still
+/// fences: the map is trusted, never the panic).
+fn registry_try_insert(key: &Path) -> Option<u64> {
+    let mut reg = setup_registry().lock().unwrap_or_else(|e| e.into_inner());
+    if reg.contains_key(key) {
+        return None;
+    }
+    let id = SETUP_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
+    reg.insert(key.to_path_buf(), id);
+    Some(id)
+}
+
+/// Remove the registry entry for `key` ONLY if it still belongs to `id`
+/// (fix round 5): idempotent, so the synchronous caller paths and the
+/// finishing worker can both call it — exactly one removes. Brief map
+/// operation only. Never called on the abandonment path.
+fn registry_remove_if(key: &Path, id: u64) {
+    let mut reg = setup_registry().lock().unwrap_or_else(|e| e.into_inner());
+    if reg.get(key) == Some(&id) {
+        reg.remove(key);
+    }
 }
 
 /// Prepare + publish a [`WorkloadDest::File`] sink, worker-side (fix
-/// round 4): the gated setup op. Staging first — [`validate_sink_target`]
-/// (never creates, never truncates) then [`create_staging_sink`] (a fresh
-/// empty file the worker uniquely owns) — then the ATOMIC publish: the
-/// abandonment check and the `rename` run under ONE mutual-exclusion lock
-/// shared with the caller's abandonment setter, so a late worker is
-/// physically incapable of touching the destination: if the caller
-/// abandoned first, the worker deletes its staging and publishes nothing;
-/// if the worker publishes first, the caller's abandonment lands after —
-/// and the rendezvous only delivers the published fd to a live receiver.
-/// After the caller abandons, no worker path truncates, writes, or
-/// renames onto the destination inode. `test_delay_ms` is a moved-in test
-/// copy (see `SETUP_TEST_HOOK`): a stall between staging and the publish
-/// decision, simulating a sink that answers preparation slowly. Inert
-/// (`0`) unless a test armed it. `publish_gate` is the moved-in poised
-/// rendezvous (see `SETUP_TEST_HOOK`): when armed, the worker signals
-/// readiness and waits (bounded) BEFORE taking the publish lock, so a
-/// test can order the caller's abandonment strictly before the atomic
-/// decision. Residual: the caller takes the publish lock to record
-/// abandonment, so it waits out an in-flight `rename` — microseconds on a
-/// local filesystem; a FUSE server withholding rename would stall
-/// abandonment past the deadline (strictly narrower than a caller-side
-/// truncate, which stalls on every slow SETATTR — and the price of an
-/// atomic publish, since there is no conditional-rename primitive).
+/// round 5): staging first — [`validate_sink_target`] (never creates, never
+/// truncates) then [`create_staging_sink`] (a fresh empty file provably
+/// distinct from the destination) — then the publish. The worker re-checks
+/// the lock-free abandonment flag immediately before EVERY destination
+/// step, and the final check sits immediately before the ONE destination
+/// mutation (`rename`): a worker that observes abandonment deletes ONLY its
+/// own staging (see [`remove_own_staging`]) and performs NO destination
+/// mutation — no truncate, write, rename, or unlink of the destination.
+/// OUR-retry successors never race this worker: the per-destination
+/// registry refused them while it was live, and the rendezvous only
+/// delivers the published fd to a live receiver. `test_delay_ms` is a
+/// moved-in test copy (see `SETUP_TEST_HOOK`): a stall between staging and
+/// the publish decision, simulating a sink that answers preparation
+/// slowly. Inert (`0`) unless a test armed it. `publish_gate` is the
+/// moved-in poised rendezvous (see `SETUP_TEST_HOOK`): when armed, the
+/// worker signals readiness and waits (bounded) BEFORE its final
+/// abandonment check, so a test can order the caller's abandonment strictly
+/// before the publish decision. `rename_hold_ms` / `rename_hold_ready`
+/// (see `SETUP_TEST_HOOK`): when armed, the worker signals readiness and
+/// sleeps AFTER its final check and BEFORE the rename trap — simulating a
+/// worker descheduled after the check (or blocked inside rename). There is
+/// deliberately NO re-check after that hold: it pins the documented
+/// residual (a post-check-descheduled worker still publishes; OUR
+/// successors were fenced by the registry, so only concurrent EXTERNAL
+/// writers are unfenced) while proving the caller stays bounded regardless.
 fn prepare_and_publish_sink(
     path: &Path,
-    gate: &Mutex<bool>,
+    abandoned: &AtomicBool,
     test_delay_ms: u64,
     publish_gate: Option<(Arc<AtomicBool>, Arc<AtomicBool>)>,
+    rename_hold_ms: u64,
+    rename_hold_ready: Option<Arc<AtomicBool>>,
 ) -> anyhow::Result<OwnedFd> {
-    if abandonment_get(gate) {
+    if abandoned.load(Ordering::SeqCst) {
         anyhow::bail!("pre-stop setup abandoned before file-sink preparation (no child spawned)");
     }
     let validated = validate_sink_target(path)?;
-    let (staging_fd, staging_path) = create_staging_sink(path, validated.mode)?;
+    if abandoned.load(Ordering::SeqCst) {
+        drop(validated.fd);
+        anyhow::bail!("pre-stop setup abandoned during file-sink preparation (no child spawned)");
+    }
+    let staging = create_staging_sink(path, validated.mode)?;
     if test_delay_ms > 0 {
         std::thread::sleep(Duration::from_millis(test_delay_ms));
     }
@@ -564,51 +748,39 @@ fn prepare_and_publish_sink(
             std::thread::sleep(Duration::from_millis(1));
         }
     }
-    // The atomic publish: abandonment check + rename under the ONE lock
-    // shared with the caller's abandonment setter. NOTHING else runs
-    // under this lock — every fd close and staging delete below is
-    // worker-owned (a FUSE stall there hangs only the detached worker,
-    // never the caller's abandonment).
-    enum Decision {
-        Published,
-        Abandoned,
-        Failed(anyhow::Error),
+    // The publish decision: the final abandonment check immediately before
+    // the ONE destination mutation. After abandonment this worker performs
+    // NO destination mutation — it deletes only its own staging.
+    if abandoned.load(Ordering::SeqCst) {
+        remove_own_staging(&staging);
+        drop(validated.fd);
+        drop(staging.fd);
+        anyhow::bail!("pre-stop setup abandoned during file-sink preparation (no child spawned)");
     }
-    let decision = {
-        let guard = gate.lock().unwrap_or_else(|e| e.into_inner());
-        if *guard {
-            Decision::Abandoned
-        } else {
-            match std::fs::rename(&staging_path, path) {
-                Ok(()) => Decision::Published,
-                Err(e) => Decision::Failed(anyhow::anyhow!(
-                    "workload output {}: cannot publish file sink: {e} (setup status 126)",
-                    path.display(),
-                )),
-            }
+    if rename_hold_ms > 0 {
+        if let Some(ready) = rename_hold_ready.as_ref() {
+            ready.store(true, Ordering::SeqCst);
         }
-    };
-    match decision {
-        Decision::Published => {
+        std::thread::sleep(Duration::from_millis(rename_hold_ms));
+    }
+    match std::fs::rename(&staging.path, path) {
+        Ok(()) => {
             // The validation fd refers to the REPLACED inode (or nothing,
             // when the destination was absent): drop it — the staging fd
-            // is the published sink the child inherits.
+            // is the published sink the child inherits. The staging path
+            // now names the DESTINATION: it is never unlinked (there is
+            // deliberately no `Drop` cleanup on `StagingFile`).
             drop(validated.fd);
-            Ok(staging_fd)
+            Ok(staging.fd)
         }
-        Decision::Abandoned => {
-            let _ = std::fs::remove_file(&staging_path);
+        Err(e) => {
+            remove_own_staging(&staging);
             drop(validated.fd);
-            drop(staging_fd);
-            anyhow::bail!(
-                "pre-stop setup abandoned during file-sink preparation (no child spawned)"
-            );
-        }
-        Decision::Failed(e) => {
-            let _ = std::fs::remove_file(&staging_path);
-            drop(validated.fd);
-            drop(staging_fd);
-            Err(e)
+            drop(staging.fd);
+            Err(anyhow::anyhow!(
+                "workload output {}: cannot publish file sink: {e} (setup status 126)",
+                path.display(),
+            ))
         }
     }
 }
@@ -621,11 +793,11 @@ enum Control<T> {
     /// The op finished; carries its value.
     Done(T),
     /// Cancellation was pending (checked before running, then while
-    /// waiting); the abandonment gate is set, so a worker that has not
+    /// waiting); the abandonment flag is stored, so a worker that has not
     /// started its op skips it — a started worker keeps running detached
     /// and owns its captures.
     Cancelled,
-    /// The deadline passed while waiting; the abandonment gate is set
+    /// The deadline passed while waiting; the abandonment flag is stored
     /// (as above) and a started worker keeps running detached and owns
     /// its captures.
     Expired,
@@ -637,26 +809,29 @@ enum Control<T> {
 /// the setup deadline and cancel flag (polled at 1ms). An already-dead
 /// setup never starts the op, and a worker that has not started its op
 /// when the caller abandons setup skips it (fix round 2: the abandonment
-/// gate — a late worker must not perform setup work after the caller
-/// gave up). The op receives the gate so a multi-phase op can decide its
-/// destructive half atomically with the caller's abandonment (fix round
-/// 4: staging, then check + publish under the ONE lock the abandonment
-/// setter shares — no check-then-act gap survives). The result channel is
-/// a rendezvous (fix round 2 / F1): a value is delivered only to a live
-/// receiver, so a discarded result is always dropped on the worker, never
-/// inline on the caller. On expiry the worker is detached — its ownership
-/// moves with it, so a stuck open's fd closes whenever the sink answers —
-/// and the caller fails WITHOUT forking (pre-fork) or resolves the
-/// guard-held child under custody (post-fork). `Err` = the worker thread
-/// itself could not start (fail-closed at the call site).
+/// flag — a late worker must not perform setup work after the caller
+/// gave up). The op receives the flag so a multi-phase op can re-check it
+/// immediately before every destination step (fix round 5: staging, then
+/// check, then publish — no lock anywhere on this path). The result
+/// channel is a rendezvous (fix round 2 / F1): a value is delivered only
+/// to a live receiver, so a discarded result is always dropped on the
+/// worker, never inline on the caller. `on_exit` runs on the worker on
+/// every non-panic exit (op completed or op skipped — always BEFORE the
+/// completion counter advances); a panicking op skips it (the `Lost`
+/// caller path reclaims instead). On expiry the worker is detached — its
+/// ownership moves with it, so a stuck open's fd closes whenever the sink
+/// answers — and the caller fails WITHOUT forking (pre-fork) or resolves
+/// the guard-held child under custody (post-fork). `Err` = the worker
+/// thread itself could not start (fail-closed at the call site).
 fn run_under_control<T, F>(
     deadline: Instant,
     cancel: &AtomicBool,
     op: F,
+    on_exit: Option<Box<dyn FnOnce() + Send + 'static>>,
 ) -> anyhow::Result<Control<T>>
 where
     T: Send + 'static,
-    F: FnOnce(&Mutex<bool>) -> T + Send + 'static,
+    F: FnOnce(&AtomicBool) -> T + Send + 'static,
 {
     if cancel.load(Ordering::SeqCst) {
         return Ok(Control::Cancelled);
@@ -664,10 +839,13 @@ where
     if Instant::now() >= deadline {
         return Ok(Control::Expired);
     }
-    // Abandonment gate: set by the caller (under the lock) when it stops
-    // waiting, read by the worker before running the op — and locked by
-    // the op itself around its atomic publish decision.
-    let abandoned = Arc::new(Mutex::new(false));
+    // Abandonment flag (fix round 5): lock-free — stored by the caller
+    // when it stops waiting, loaded by the worker before running the op
+    // and re-checked by the op itself before every destination step. The
+    // caller's abandonment path takes NO lock and performs NO blocking
+    // file syscalls (bounded by construction, however stuck the worker
+    // is — the round-4 lock-across-rename is rejected for exactly this).
+    let abandoned = Arc::new(AtomicBool::new(false));
     let abandoned_c = abandoned.clone();
     let (tx, rx) = std::sync::mpsc::sync_channel(0);
     let (test_delay_ms, test_counter) = read_setup_test_hook();
@@ -677,8 +855,11 @@ where
             if test_delay_ms > 0 {
                 std::thread::sleep(Duration::from_millis(test_delay_ms));
             }
-            if !abandonment_get(&abandoned_c) {
+            if !abandoned_c.load(Ordering::SeqCst) {
                 let _ = tx.send(op(abandoned_c.as_ref()));
+            }
+            if let Some(f) = on_exit {
+                f();
             }
             if let Some(c) = test_counter.as_ref() {
                 c.fetch_add(1, Ordering::SeqCst);
@@ -691,7 +872,7 @@ where
 /// Spawn the control worker and poll it. Close disposal calls this
 /// directly: a close must run (possibly late, on the detached worker)
 /// even on an already-dead setup — otherwise its fd would leak. There is
-/// deliberately NO abandonment gate here (unlike
+/// deliberately NO abandonment flag here (unlike
 /// [`run_under_control`]): disposal is never skipped. The result channel
 /// is a rendezvous (fix round 2 / F1), as above.
 fn spawn_controlled<T, F>(
@@ -721,19 +902,21 @@ where
 }
 
 /// Poll one control worker (the waiting half of [`run_under_control`] /
-/// [`spawn_controlled`]). When `abandoned` is present (gated ops), it is
-/// set — under the ONE lock the worker's atomic publish shares — before
-/// returning `Cancelled` / `Expired`, so a worker that has not started
-/// its op skips it, and a worker poised at publish loses the decision,
-/// instead of running setup work after the caller gave up. When the
-/// test-only poll gate is armed, the caller waits on it (bounded) before
-/// its first check, so a test can order abandonment strictly after a
-/// result completed (fix round 3 / F1-PROOF).
+/// [`spawn_controlled`]). When `abandoned` is present, it is STORED (one
+/// lock-free atomic store — no mutex, no file syscalls) before returning
+/// `Cancelled` / `Expired`, so a worker that has not started its op skips
+/// it, and a worker poised at publish observes it at its final check,
+/// instead of running setup work after the caller gave up. The registry
+/// entry (if any) is deliberately NOT touched here: the still-running
+/// worker removes it when it finishes. When the test-only poll gate is
+/// armed, the caller waits on it (bounded) before its first check, so a
+/// test can order abandonment strictly after a result completed (fix
+/// round 3 / F1-PROOF).
 fn poll_controlled<T>(
     deadline: Instant,
     cancel: &AtomicBool,
     rx: std::sync::mpsc::Receiver<T>,
-    abandoned: Option<&Mutex<bool>>,
+    abandoned: Option<&AtomicBool>,
 ) -> anyhow::Result<Control<T>> {
     if let Some(gate) = SETUP_TEST_HOOK.with(|h| h.borrow().poll_gate.clone()) {
         let end = Instant::now() + Duration::from_secs(10);
@@ -747,13 +930,13 @@ fn poll_controlled<T>(
     loop {
         if cancel.load(Ordering::SeqCst) {
             if let Some(a) = abandoned {
-                abandonment_set(a);
+                a.store(true, Ordering::SeqCst);
             }
             return Ok(Control::Cancelled);
         }
         if Instant::now() >= deadline {
             if let Some(a) = abandoned {
-                abandonment_set(a);
+                a.store(true, Ordering::SeqCst);
             }
             return Ok(Control::Expired);
         }
@@ -857,11 +1040,18 @@ pub fn __test_set_prestop_pid_sink(sink: Option<Arc<AtomicU32>>) {
 ///   abandonment strictly after a result completed.
 /// - `publish_gate` (fix round 4): when armed as `(ready, proceed)`,
 ///   file-sink preparation sets `ready` and waits (bounded) on `proceed`
-///   AFTER staging and BEFORE the atomic publish, so a test can order
-///   the caller's abandonment strictly before the publish decision. The
-///   spawning thread clones it BEFORE creating the worker; the worker
-///   uses only its moved clone. Production callers must never arm any of
-///   these.
+///   AFTER staging and BEFORE its final abandonment check, so a test can
+///   order the caller's abandonment strictly before the publish decision.
+///   The spawning thread clones it BEFORE creating the worker; the worker
+///   uses only its moved clone.
+/// - `rename_hold_ms` / `rename_hold_ready` (fix round 5): when armed,
+///   file-sink preparation sets `ready` and sleeps `rename_hold_ms` AFTER
+///   its final abandonment check and BEFORE the rename trap — simulating
+///   a worker descheduled after the check (or blocked inside rename), so
+///   a test can prove the caller stays bounded in exactly that window.
+///   The spawning thread copies them BEFORE creating the worker; the
+///   worker uses only its moved copies. Production callers must never arm
+///   any of these.
 struct SetupTestHook {
     setup_delay_ms: u64,
     worker_counter: Option<Arc<AtomicU32>>,
@@ -869,6 +1059,8 @@ struct SetupTestHook {
     truncate_delay_ms: u64,
     poll_gate: Option<Arc<AtomicBool>>,
     publish_gate: Option<(Arc<AtomicBool>, Arc<AtomicBool>)>,
+    rename_hold_ms: u64,
+    rename_hold_ready: Option<Arc<AtomicBool>>,
 }
 
 thread_local! {
@@ -880,6 +1072,8 @@ thread_local! {
             truncate_delay_ms: 0,
             poll_gate: None,
             publish_gate: None,
+            rename_hold_ms: 0,
+            rename_hold_ready: None,
         })
     };
 }
@@ -918,6 +1112,18 @@ pub fn __test_set_poll_gate(gate: Option<Arc<AtomicBool>>) {
 #[doc(hidden)]
 pub fn __test_set_publish_gate(gate: Option<(Arc<AtomicBool>, Arc<AtomicBool>)>) {
     SETUP_TEST_HOOK.with(|h| h.borrow_mut().publish_gate = gate);
+}
+
+/// Test-only: arm the post-check hold duration (see `SETUP_TEST_HOOK`).
+#[doc(hidden)]
+pub fn __test_set_rename_hold_ms(ms: u64) {
+    SETUP_TEST_HOOK.with(|h| h.borrow_mut().rename_hold_ms = ms);
+}
+
+/// Test-only: arm the post-check hold readiness flag (see `SETUP_TEST_HOOK`).
+#[doc(hidden)]
+pub fn __test_set_rename_hold_ready(ready: Option<Arc<AtomicBool>>) {
+    SETUP_TEST_HOOK.with(|h| h.borrow_mut().rename_hold_ready = ready);
 }
 
 /// Post-fork pre-stop custody (R06/F07): owns the just-forked pid
@@ -1084,18 +1290,22 @@ impl OwnedTarget {
     /// deadline and the live SIGINT/SIGTERM flag.
     ///
     /// Ordering: argv validation, then the cancel/deadline checks
-    /// (a dead setup forks nothing and publishes nothing), then
-    /// destination preparation — file sinks are validated, staged and
-    /// atomically published to a fresh regular file by the PARENT
-    /// pre-fork (see [`WorkloadDest::File`]), on ONE gated worker under
-    /// the same deadline + cancel (a stalled sink fails the setup; it
-    /// never hangs it; the abandonment check + publish run under the ONE
-    /// lock the abandonment setter shares, so a worker delayed past
+    /// (a dead setup forks nothing and publishes nothing), then staging
+    /// collision control (a destination in the staging namespace is
+    /// refused before anything is created), then the per-destination
+    /// registry (a new setup refuses while a prior worker for that path
+    /// is still live), then destination preparation — file sinks are
+    /// validated, staged and atomically published to a fresh regular file
+    /// by the PARENT pre-fork (see [`WorkloadDest::File`]), on ONE worker
+    /// under the same deadline + cancel (a stalled sink fails the setup;
+    /// it never hangs it; the worker re-checks the lock-free abandonment
+    /// flag before every destination step, so a worker that observes
     /// abandonment publishes nothing) — then a final cancel/deadline
     /// re-check, then fork. The caller performs no file syscalls itself
-    /// on this path: validate, stage, publish and close all run on
-    /// control workers (abandonment takes the publish lock only to set
-    /// the flag). Custody starts
+    /// on this path (validate, stage, publish and close all run on
+    /// control workers) and its abandonment path takes NO lock: it stores
+    /// one atomic flag and returns, leaving the registry entry for its
+    /// still-running worker to remove. Custody starts
     /// at the fork return, BEFORE the parent's sink copy is disposed
     /// (also under control) and before waiting for SIGSTOP; the wait
     /// polls with the checked deadline and the cancel flag, and every
@@ -1145,27 +1355,72 @@ impl OwnedTarget {
         let child_dest = match &dest {
             WorkloadDest::Null => ChildDest::Null,
             WorkloadDest::File(path) => {
-                // Staging + atomic publish inside ONE gated worker (fix
-                // round 4): validation never creates or truncates, the
-                // staging file is uniquely owned (a worker delayed past
-                // abandonment can only touch its own staging), and the
-                // abandonment check + rename run under the ONE lock the
-                // caller's abandonment setter shares — a late worker is
-                // physically incapable of touching the destination. The
-                // caller only polls the rendezvous (it takes the publish
-                // lock solely to record abandonment). (Fix round 3 ran a
-                // fenced ftruncate on the worker: bounded, but the fence
-                // load and the truncate could not be atomic — a worker
-                // descheduled between them erased successor bytes.)
+                // Staging + atomic publish inside ONE worker (fix round
+                // 5): the destination is refused first when it lies in the
+                // staging namespace (collision control — before anything
+                // is created) and when a prior OUR worker for it is still
+                // live (registry fencing — without writing); then
+                // validation never creates or truncates, the staging file
+                // is provably distinct from the destination, and the
+                // worker re-checks the lock-free abandonment flag before
+                // every destination step — a worker that observes
+                // abandonment deletes only its own staging and performs NO
+                // destination mutation. The caller only polls the
+                // rendezvous; its abandonment path stores one atomic flag
+                // and returns (no lock, no file syscalls). (Fix round 4
+                // ran check + rename under ONE lock the abandonment setter
+                // shared: bounded publish, but the caller waited out a
+                // worker stuck holding that lock — unbounded abandonment.)
+                if dest_in_staging_namespace(path) {
+                    anyhow::bail!(
+                        "workload output {}: destination lies in the staging namespace (setup status 126) (no child spawned)",
+                        path.display(),
+                    );
+                }
+                let reg_key = normalize_setup_key(path);
+                let Some(reg_id) = registry_try_insert(&reg_key) else {
+                    anyhow::bail!(
+                        "workload output {}: another setup for this destination is still in flight (no child spawned)",
+                        path.display(),
+                    );
+                };
                 let owned_path = path.clone();
                 let truncate_delay_ms = SETUP_TEST_HOOK.with(|h| h.borrow().truncate_delay_ms);
                 let publish_gate = SETUP_TEST_HOOK.with(|h| h.borrow().publish_gate.clone());
-                let prep = run_under_control(deadline, cancel, move |gate| {
-                    prepare_and_publish_sink(&owned_path, gate, truncate_delay_ms, publish_gate)
-                })
-                .map_err(|e| anyhow::anyhow!("{e:#} (no child spawned)"))?;
+                let rename_hold_ms = SETUP_TEST_HOOK.with(|h| h.borrow().rename_hold_ms);
+                let rename_hold_ready =
+                    SETUP_TEST_HOOK.with(|h| h.borrow().rename_hold_ready.clone());
+                // The finishing worker removes the registry entry on every
+                // non-panic exit (before the completion counter advances);
+                // the synchronous caller paths below reclaim it
+                // idempotently. The abandonment paths (Cancelled/Expired)
+                // deliberately touch NOTHING here — no lock, lock-free by
+                // construction.
+                let reg_key_w = reg_key.clone();
+                let prep = run_under_control(
+                    deadline,
+                    cancel,
+                    move |abandoned| {
+                        prepare_and_publish_sink(
+                            &owned_path,
+                            abandoned,
+                            truncate_delay_ms,
+                            publish_gate,
+                            rename_hold_ms,
+                            rename_hold_ready,
+                        )
+                    },
+                    Some(Box::new(move || registry_remove_if(&reg_key_w, reg_id))),
+                )
+                .map_err(|e| {
+                    registry_remove_if(&reg_key, reg_id);
+                    anyhow::anyhow!("{e:#} (no child spawned)")
+                })?;
                 let published = match prep {
-                    Control::Done(r) => r?,
+                    Control::Done(r) => {
+                        registry_remove_if(&reg_key, reg_id);
+                        r?
+                    }
                     Control::Cancelled => {
                         anyhow::bail!(
                             "pre-stop setup cancelled during file-sink preparation (no child spawned)"
@@ -1177,6 +1432,7 @@ impl OwnedTarget {
                         );
                     }
                     Control::Lost => {
+                        registry_remove_if(&reg_key, reg_id);
                         anyhow::bail!(
                             "pre-stop setup worker lost during file-sink preparation (no child spawned)"
                         );
@@ -1543,6 +1799,56 @@ impl OwnedTarget {
     }
 }
 
+impl Drop for OwnedTarget {
+    /// Backstop: a still-stopped child is signaled and reaped with
+    /// bounded effort (never left stopped); a released child is left
+    /// running; terminal states are untouched. Explicit
+    /// `resolve_setup_failure` / `finish_observation` remain the
+    /// primary paths — they block until custody is fully resolved.
+    fn drop(&mut self) {
+        match self.state {
+            CustodyState::Released => {
+                // Best effort: reap an already-exited child; a running
+                // one is left running.
+                if let Ok(Some(code)) = reap_once(self.pid) {
+                    self.exit_code = Some(code);
+                    self.state = CustodyState::Reaped;
+                }
+            }
+            CustodyState::Stopped => {
+                // Only a kernel-confirmed stopped child is signaled; a
+                // running child is left alone, an error (ECHILD: reaped
+                // elsewhere) has nothing left to do.
+                match query_child(self.pid) {
+                    Ok(ChildQuery::Exited(code)) => {
+                        self.exit_code = Some(code);
+                        self.state = CustodyState::Reaped;
+                    }
+                    Ok(ChildQuery::Stopped) => {
+                        unsafe {
+                            libc::kill(self.pid as libc::pid_t, libc::SIGKILL);
+                        }
+                        let end = Instant::now() + Duration::from_millis(200);
+                        while Instant::now() < end {
+                            match reap_once(self.pid) {
+                                Ok(Some(code)) => {
+                                    self.exit_code = Some(code);
+                                    self.state = CustodyState::Reaped;
+                                    return;
+                                }
+                                Ok(None) => std::thread::sleep(Duration::from_millis(1)),
+                                Err(_) => return,
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            CustodyState::Reaped | CustodyState::Detached => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod control_tests {
     //! F1 mechanism pins: blocking setup ops run under deadline +
@@ -1553,7 +1859,6 @@ mod control_tests {
     };
     use std::os::fd::{FromRawFd as _, OwnedFd};
     use std::os::unix::fs::PermissionsExt as _;
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::time::{Duration, Instant};
 
@@ -1562,10 +1867,15 @@ mod control_tests {
         let cancel = AtomicBool::new(false);
         let ran = std::sync::Arc::new(AtomicBool::new(false));
         let ran_c = ran.clone();
-        let out = run_under_control(Instant::now(), &cancel, move |_| {
-            ran_c.store(true, Ordering::SeqCst);
-            42
-        })
+        let out = run_under_control(
+            Instant::now(),
+            &cancel,
+            move |_| {
+                ran_c.store(true, Ordering::SeqCst);
+                42
+            },
+            None,
+        )
         .unwrap();
         assert!(matches!(out, Control::Expired));
         assert!(!ran.load(Ordering::SeqCst), "dead op must not run");
@@ -1583,6 +1893,7 @@ mod control_tests {
                 ran_c.store(true, Ordering::SeqCst);
                 42
             },
+            None,
         )
         .unwrap();
         assert!(matches!(out, Control::Cancelled));
@@ -1592,8 +1903,13 @@ mod control_tests {
     #[test]
     fn control_returns_value() {
         let cancel = AtomicBool::new(false);
-        let out =
-            run_under_control(Instant::now() + Duration::from_secs(30), &cancel, |_| 42).unwrap();
+        let out = run_under_control(
+            Instant::now() + Duration::from_secs(30),
+            &cancel,
+            |_| 42,
+            None,
+        )
+        .unwrap();
         assert!(matches!(out, Control::Done(42)));
     }
 
@@ -1611,9 +1927,12 @@ mod control_tests {
             // The op simulates an uninterruptible stall (a FUSE sink
             // that never answers): it sleeps past the test and is
             // abandoned, never awaited.
-            let out = run_under_control(Instant::now() + Duration::from_secs(30), &cancel, |_| {
-                std::thread::sleep(Duration::from_secs(30))
-            })
+            let out = run_under_control(
+                Instant::now() + Duration::from_secs(30),
+                &cancel,
+                |_| std::thread::sleep(Duration::from_secs(30)),
+                None,
+            )
             .unwrap();
             assert!(matches!(out, Control::Cancelled));
             assert!(t0.elapsed() < Duration::from_secs(5), "fail fast");
@@ -1624,9 +1943,12 @@ mod control_tests {
     fn control_slow_op_deadline_mid_run() {
         let cancel = AtomicBool::new(false);
         let t0 = Instant::now();
-        let out = run_under_control(Instant::now() + Duration::from_millis(100), &cancel, |_| {
-            std::thread::sleep(Duration::from_secs(30))
-        })
+        let out = run_under_control(
+            Instant::now() + Duration::from_millis(100),
+            &cancel,
+            |_| std::thread::sleep(Duration::from_secs(30)),
+            None,
+        )
         .unwrap();
         assert!(matches!(out, Control::Expired));
         assert!(t0.elapsed() < Duration::from_secs(5), "fail fast");
@@ -1685,9 +2007,12 @@ mod control_tests {
     #[test]
     fn control_panicking_worker_reports_lost() {
         let cancel = AtomicBool::new(false);
-        let out = run_under_control(Instant::now() + Duration::from_secs(30), &cancel, |_| {
-            panic!("r06 control probe panic")
-        })
+        let out = run_under_control(
+            Instant::now() + Duration::from_secs(30),
+            &cancel,
+            |_| panic!("r06 control probe panic"),
+            None,
+        )
         .unwrap();
         assert!(matches!(out, Control::Lost));
     }
@@ -1716,6 +2041,7 @@ mod control_tests {
                     ran_c.store(true, Ordering::SeqCst);
                     42
                 },
+                None,
             )
             .unwrap();
             assert!(matches!(out, Control::Cancelled));
@@ -1804,6 +2130,7 @@ mod control_tests {
                     op_done_c.store(true, Ordering::SeqCst);
                     probe
                 },
+                None,
             )
             .unwrap()
         });
@@ -1836,11 +2163,11 @@ mod control_tests {
 
     #[test]
     fn staged_sink_publishes_when_live_skips_when_abandoned() {
-        // Fix round 4, direct pin: the worker-side preparation op
-        // publishes a fresh empty inode over the destination when live
-        // (carrying the prior permission bits over), and publishes
-        // nothing — deleting its staging — once the abandonment gate is
-        // set.
+        // Fix round 4 (kept under round 5 with the lock-free flag), direct
+        // pin: the worker-side preparation op publishes a fresh empty
+        // inode over the destination when live (carrying the prior
+        // permission bits over), and publishes nothing — deleting only
+        // its own staging — once the abandonment flag is stored.
         let dir = std::env::temp_dir().join(format!("osslscope-trunc-pin-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1851,8 +2178,8 @@ mod control_tests {
         // A distinctive mode on the live target: the publish must carry
         // it onto the fresh inode (truncate-in-place preserved it).
         std::fs::set_permissions(&live, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let gate = Mutex::new(false);
-        let fd = prepare_and_publish_sink(&live, &gate, 0, None).unwrap();
+        let abandoned = AtomicBool::new(false);
+        let fd = prepare_and_publish_sink(&live, &abandoned, 0, None, 0, None).unwrap();
         drop(fd);
         assert_eq!(
             std::fs::read(&live).unwrap(),
@@ -1864,8 +2191,8 @@ mod control_tests {
             0o600,
             "publish carries the prior mode bits over"
         );
-        *gate.lock().unwrap() = true;
-        let err = prepare_and_publish_sink(&dead, &gate, 0, None).unwrap_err();
+        abandoned.store(true, Ordering::SeqCst);
+        let err = prepare_and_publish_sink(&dead, &abandoned, 0, None, 0, None).unwrap_err();
         assert!(
             err.to_string().contains("abandoned"),
             "abandonment surfaces: {err:#}"
@@ -1884,54 +2211,100 @@ mod control_tests {
         assert_eq!(names, vec!["dead.log".to_string(), "live.log".to_string()]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
-}
 
-impl Drop for OwnedTarget {
-    /// Backstop: a still-stopped child is signaled and reaped with
-    /// bounded effort (never left stopped); a released child is left
-    /// running; terminal states are untouched. Explicit
-    /// `resolve_setup_failure` / `finish_observation` remain the
-    /// primary paths — they block until custody is fully resolved.
-    fn drop(&mut self) {
-        match self.state {
-            CustodyState::Released => {
-                // Best effort: reap an already-exited child; a running
-                // one is left running.
-                if let Ok(Some(code)) = reap_once(self.pid) {
-                    self.exit_code = Some(code);
-                    self.state = CustodyState::Reaped;
-                }
-            }
-            CustodyState::Stopped => {
-                // Only a kernel-confirmed stopped child is signaled; a
-                // running child is left alone, an error (ECHILD: reaped
-                // elsewhere) has nothing left to do.
-                match query_child(self.pid) {
-                    Ok(ChildQuery::Exited(code)) => {
-                        self.exit_code = Some(code);
-                        self.state = CustodyState::Reaped;
-                    }
-                    Ok(ChildQuery::Stopped) => {
-                        unsafe {
-                            libc::kill(self.pid as libc::pid_t, libc::SIGKILL);
-                        }
-                        let end = Instant::now() + Duration::from_millis(200);
-                        while Instant::now() < end {
-                            match reap_once(self.pid) {
-                                Ok(Some(code)) => {
-                                    self.exit_code = Some(code);
-                                    self.state = CustodyState::Reaped;
-                                    return;
-                                }
-                                Ok(None) => std::thread::sleep(Duration::from_millis(1)),
-                                Err(_) => return,
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            CustodyState::Reaped | CustodyState::Detached => {}
-        }
+    #[test]
+    fn staging_namespace_collision_is_pure_path_inspection() {
+        // Fix round 5, direct pin: the first collision-control layer —
+        // destinations in the staging namespace are recognized without
+        // touching the filesystem (the entrypoint refuses them before
+        // creating anything; the behavioral refusal is pinned by the
+        // `staging_namespace_dest_refused_before_creating` integration
+        // test).
+        use super::{STAGING_PREFIX, dest_in_staging_namespace};
+        assert!(dest_in_staging_namespace(std::path::Path::new(
+            ".osslscope-staging-123-4-abcdef"
+        )));
+        assert!(dest_in_staging_namespace(std::path::Path::new(
+            "/tmp/x/.osslscope-staging-1-2-3"
+        )));
+        assert!(!dest_in_staging_namespace(std::path::Path::new(
+            "/tmp/x/workload.log"
+        )));
+        assert!(!dest_in_staging_namespace(std::path::Path::new(
+            "/tmp/.osslscope-staging-dir/workload.log",
+        )));
+        assert!(!dest_in_staging_namespace(std::path::Path::new(
+            ".osslscope-staging",
+        )));
+        assert!(STAGING_PREFIX.starts_with('.'), "hidden-file prefix");
+    }
+
+    #[test]
+    fn setup_key_normalizes_lexically_without_syscalls() {
+        // Fix round 5, direct pin: registry keys collapse `.`, `..`, and
+        // duplicate separators purely lexically (no `canonicalize` — the
+        // caller path forbids blocking file I/O), so equivalent spellings
+        // fence each other while distinct paths stay distinct.
+        use super::normalize_setup_key;
+        use std::path::PathBuf;
+        let a = normalize_setup_key(std::path::Path::new("/tmp/x/workload.log"));
+        assert_eq!(
+            a,
+            normalize_setup_key(std::path::Path::new("/tmp/x/./workload.log"))
+        );
+        assert_eq!(
+            a,
+            normalize_setup_key(std::path::Path::new("/tmp/x/sub/../workload.log"))
+        );
+        assert_eq!(
+            a,
+            normalize_setup_key(std::path::Path::new("/tmp//x/workload.log"))
+        );
+        assert_eq!(
+            normalize_setup_key(std::path::Path::new("a")),
+            normalize_setup_key(std::path::Path::new("./a"))
+        );
+        assert_ne!(
+            a,
+            normalize_setup_key(std::path::Path::new("/tmp/x/other.log"))
+        );
+        assert_ne!(
+            normalize_setup_key(std::path::Path::new("/tmp/x/workload.log")),
+            normalize_setup_key(std::path::Path::new("/tmp/y/workload.log"))
+        );
+        // Leading `..` is preserved (never collapsed onto a sibling).
+        assert_eq!(
+            normalize_setup_key(std::path::Path::new("../a")),
+            PathBuf::from("../a")
+        );
+    }
+
+    #[test]
+    fn registry_fences_distinct_ids_and_releases() {
+        // Fix round 5, direct pin: the per-destination registry refuses a
+        // second insert while the first is live, ignores removals from
+        // non-owners, and releases for a successor once the owner removes.
+        // (Uses a unique key: the registry is process-wide and lib tests
+        // run in parallel.)
+        use super::{normalize_setup_key, registry_remove_if, registry_try_insert};
+        let key = normalize_setup_key(std::path::Path::new(
+            "/tmp/osslscope-reg-pin/pin-registry-fences.log",
+        ));
+        let id = registry_try_insert(&key).expect("first insert wins");
+        assert!(
+            registry_try_insert(&key).is_none(),
+            "second insert refuses while live"
+        );
+        registry_remove_if(&key, id.wrapping_add(1));
+        assert!(
+            registry_try_insert(&key).is_none(),
+            "non-owner removal changes nothing"
+        );
+        registry_remove_if(&key, id);
+        let id2 = registry_try_insert(&key).expect("successor runs after release");
+        assert_ne!(id, id2, "ids are unique per attempt");
+        registry_remove_if(&key, id2);
+        let id3 = registry_try_insert(&key).expect("registry is empty afterwards");
+        registry_remove_if(&key, id3);
     }
 }
