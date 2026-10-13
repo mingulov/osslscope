@@ -57,6 +57,21 @@ cat >"$T/manifest.json" <<EOF
    {"role": "bpf-object", "bin": "osslscope-count", "path": "$T/count.o"}
  ]}
 EOF
+# A real build-dev.sh manifest records artifact identity (sha256 + byte
+# length); fill the fixture in place so manifest-selected installs verify.
+python3 - "$T/manifest.json" <<'EOF'
+import hashlib, json, os, sys
+p = sys.argv[1]
+m = json.load(open(p))
+for a in m["artifacts"]:
+    h = hashlib.sha256()
+    with open(a["path"], "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    a["sha256"] = h.hexdigest()
+    a["bytes"] = os.path.getsize(a["path"])
+json.dump(m, open(p, "w"), indent=2, sort_keys=True)
+EOF
 
 # ============ happy path: manifest-driven install ============
 if "$SH_BIN" "$INSTALL" --manifest "$T/manifest.json" --prefix "$T/pfx" >"$T/out" 2>&1; then
@@ -260,6 +275,263 @@ else
     bad "spaced prefix installs (rc=$?)"
 fi
 
+# ============ install receipt: verified selection + honest provenance ============
+# Manifest-driven install records manifest-verified selection with hashes
+# matching the staged sources, and keeps the manifest revision.
+if python3 -c "
+import hashlib, json
+m = json.load(open('$T/pfx/share/osslscope/install-manifest.json'))
+assert [a['selection'] for a in m['artifacts']] == ['manifest-verified'] * 3, m['artifacts']
+for a in m['artifacts']:
+    h = hashlib.sha256(open(a['src'], 'rb').read()).hexdigest()
+    assert a['sha256'] == h, (a['dest'], a['sha256'], h)
+    assert a['product_ref'] == 'deadbeef-test' and a['product_dirty'] is False, a
+assert m['product_ref'] == 'deadbeef-test' and m['product_dirty'] is False, m
+" 2>"$T/err"; then
+    ok "manifest install receipt: all manifest-verified, hashes match sources, revision kept"
+else
+    bad "manifest install receipt: all manifest-verified, hashes match sources, revision kept ($(cat "$T/err"))"
+fi
+
+# Full explicit override beside a manifest: nothing is asserted from the
+# unrelated manifest; provenance stays explicit/unknown.
+if python3 -c "
+import json
+m = json.load(open('$T/pfx2/share/osslscope/install-manifest.json'))
+assert [a['selection'] for a in m['artifacts']] == ['explicit-override'] * 3, m['artifacts']
+for a in m['artifacts']:
+    assert a['product_ref'] is None and a['product_dirty'] is None, a
+assert m['product_ref'] is None and m['product_dirty'] is None, m
+" 2>"$T/err"; then
+    ok "full-override receipt: all explicit-override, no revision from unrelated manifest"
+else
+    bad "full-override receipt: all explicit-override, no revision from unrelated manifest ($(cat "$T/err"))"
+fi
+
+# Mixed selection: the overridden harvest is explicit, the rest verified,
+# and the installed set claims no single build revision.
+if "$SH_BIN" "$INSTALL" --manifest "$T/manifest.json" --prefix "$T/pfxm" \
+        --harvest "$T/op-harvest.o" >/dev/null 2>&1 \
+   && python3 -c "
+import json
+m = json.load(open('$T/pfxm/share/osslscope/install-manifest.json'))
+sel = {a.get('bin', a['role']): a['selection'] for a in m['artifacts']}
+assert sel == {'host-binary': 'manifest-verified', 'osslscope-harvest': 'explicit-override', 'osslscope-count': 'manifest-verified'}, sel
+assert m['product_ref'] is None and m['product_dirty'] is None, m
+" 2>"$T/err"; then
+    ok "mixed install: per-artifact selection, set revision unknown"
+else
+    bad "mixed install: per-artifact selection, set revision unknown ($(cat "$T/err" 2>/dev/null))"
+fi
+
+# Explicit overrides stay functional when their bytes differ from the
+# manifest: the override is screened, not hash-checked against it.
+python3 -c "
+import struct
+e = struct.pack('<16sHHIQQQIHHHHHH',
+  b'\x7fELF\x02\x01\x01\x00' + b'\x00'*8, 1, 247, 1, 0, 0, 0, 0, 64, 0, 0, 0, 0, 0)
+open('$T/op2-harvest.o','wb').write(e + b'operator-built-padding')
+"
+if "$SH_BIN" "$INSTALL" --manifest "$T/manifest.json" --prefix "$T/pfxo" \
+        --harvest "$T/op2-harvest.o" >/dev/null 2>&1 \
+   && cmp -s "$T/op2-harvest.o" "$T/pfxo/lib/osslscope/osslscope-harvest" \
+   && ! cmp -s "$T/harvest.o" "$T/pfxo/lib/osslscope/osslscope-harvest" >/dev/null 2>&1; then
+    ok "override with non-manifest bytes installs the override bytes"
+else
+    bad "override with non-manifest bytes installs the override bytes"
+fi
+
+# ============ staged verification: manifest integrity negatives ============
+# Byte snapshot of every installed file for failure-atomicity checks.
+snapshot_prefix() { (cd "$1" && find . -type f -exec sha256sum {} + | LC_ALL=C sort) >"$2"; }
+
+# Existing prefix under test: install the good set once, then every negative
+# below must fail closed and leave it byte-identical.
+if "$SH_BIN" "$INSTALL" --manifest "$T/manifest.json" --prefix "$T/pfxv" >/dev/null 2>&1; then
+    ok "setup: good install into prefix-under-test"
+else
+    bad "setup: good install into prefix-under-test"
+fi
+snapshot_prefix "$T/pfxv" "$T/pfxv.snap"
+
+# Unchanged-manifest positive control: installing from the unmodified
+# manifest verifies every artifact.
+if python3 -c "
+import json
+m = json.load(open('$T/pfxv/share/osslscope/install-manifest.json'))
+assert [a['selection'] for a in m['artifacts']] == ['manifest-verified'] * 3, m['artifacts']
+assert m['product_ref'] == 'deadbeef-test', m
+" 2>"$T/err"; then
+    ok "unchanged manifest verifies all artifacts (positive control)"
+else
+    bad "unchanged manifest verifies all artifacts (positive control) ($(cat "$T/err"))"
+fi
+
+# Variant manifests: copies of the fixtures plus a freshly hashed manifest.
+mk_variant() {
+    mkdir -p "$1"
+    cp "$T/host-bin" "$1/host-bin"
+    cp "$T/harvest.o" "$1/harvest.o"
+    cp "$T/count.o" "$1/count.o"
+    python3 - "$1" <<'EOF'
+import hashlib, json, os, sys
+d = sys.argv[1]
+def ident(role, path, extra=None):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    a = {"role": role, "path": path, "sha256": h.hexdigest(),
+         "bytes": os.path.getsize(path)}
+    if extra:
+        a.update(extra)
+    return a
+m = {"schema": "osslscope-dev-build-manifest-v1",
+     "product_ref": "variant-ref", "product_dirty": False,
+     "artifacts": [
+        ident("host-binary", d + "/host-bin"),
+        ident("bpf-object", d + "/harvest.o", {"bin": "osslscope-harvest"}),
+        ident("bpf-object", d + "/count.o", {"bin": "osslscope-count"})]}
+json.dump(m, open(d + "/manifest.json", "w"), indent=2, sort_keys=True)
+EOF
+}
+
+# Mutated bytes, same length: sha256 must mismatch while length still matches.
+mk_variant "$T/v-mut"
+python3 -c "
+p = '$T/v-mut/harvest.o'
+b = bytearray(open(p, 'rb').read())
+b[40] ^= 0xff
+open(p, 'wb').write(bytes(b))
+"
+if "$SH_BIN" "$INSTALL" --manifest "$T/v-mut/manifest.json" --prefix "$T/pfxv" >"$T/out" 2>&1; then
+    bad "mutated-bytes manifest fails (got exit 0)"
+else
+    grep -q 'sha256' "$T/out" \
+        && ok "mutated bytes fail with sha256 diagnosis" \
+        || bad "mutated bytes fail with sha256 diagnosis (saw: $(head -1 "$T/out"))"
+    snapshot_prefix "$T/pfxv" "$T/pfxv.now"
+    cmp -s "$T/pfxv.snap" "$T/pfxv.now" \
+        && ok "mutated-bytes failure leaves existing prefix unchanged" \
+        || bad "mutated-bytes failure leaves existing prefix unchanged"
+fi
+
+# Missing recorded hash: a manifest-selected entry without sha256 fails.
+mk_variant "$T/v-nohash"
+python3 -c "
+import json
+p = '$T/v-nohash/manifest.json'
+m = json.load(open(p))
+for a in m['artifacts']:
+    if a.get('bin') == 'osslscope-count':
+        del a['sha256']
+json.dump(m, open(p, 'w'), indent=2, sort_keys=True)
+"
+if "$SH_BIN" "$INSTALL" --manifest "$T/v-nohash/manifest.json" --prefix "$T/pfxv" >"$T/out" 2>&1; then
+    bad "missing-hash manifest fails (got exit 0)"
+else
+    grep -q 'sha256' "$T/out" \
+        && ok "missing hash fails with sha256 diagnosis" \
+        || bad "missing hash fails with sha256 diagnosis (saw: $(head -1 "$T/out"))"
+    snapshot_prefix "$T/pfxv" "$T/pfxv.now"
+    cmp -s "$T/pfxv.snap" "$T/pfxv.now" \
+        && ok "missing-hash failure leaves existing prefix unchanged" \
+        || bad "missing-hash failure leaves existing prefix unchanged"
+fi
+
+# Wrong recorded length: the bytes field off by one fails even though the
+# unmutated file's sha256 would still match.
+mk_variant "$T/v-len"
+python3 -c "
+import json
+p = '$T/v-len/manifest.json'
+m = json.load(open(p))
+for a in m['artifacts']:
+    if a.get('role') == 'host-binary':
+        a['bytes'] += 1
+json.dump(m, open(p, 'w'), indent=2, sort_keys=True)
+"
+if "$SH_BIN" "$INSTALL" --manifest "$T/v-len/manifest.json" --prefix "$T/pfxv" >"$T/out" 2>&1; then
+    bad "wrong-length manifest fails (got exit 0)"
+else
+    grep -qi 'byte length' "$T/out" \
+        && ok "wrong length fails with byte-length diagnosis" \
+        || bad "wrong length fails with byte-length diagnosis (saw: $(head -1 "$T/out"))"
+    snapshot_prefix "$T/pfxv" "$T/pfxv.now"
+    cmp -s "$T/pfxv.snap" "$T/pfxv.now" \
+        && ok "wrong-length failure leaves existing prefix unchanged" \
+        || bad "wrong-length failure leaves existing prefix unchanged"
+fi
+
+# Malformed recorded hash (not 64 hex chars) fails like a missing one.
+mk_variant "$T/v-badhash"
+python3 -c "
+import json
+p = '$T/v-badhash/manifest.json'
+m = json.load(open(p))
+m['artifacts'][0]['sha256'] = 'not-a-hash'
+json.dump(m, open(p, 'w'), indent=2, sort_keys=True)
+"
+if "$SH_BIN" "$INSTALL" --manifest "$T/v-badhash/manifest.json" --prefix "$T/pfxv" >"$T/out" 2>&1; then
+    bad "malformed-hash manifest fails (got exit 0)"
+else
+    grep -q 'sha256' "$T/out" \
+        && ok "malformed hash fails with sha256 diagnosis" \
+        || bad "malformed hash fails with sha256 diagnosis (saw: $(head -1 "$T/out"))"
+    snapshot_prefix "$T/pfxv" "$T/pfxv.now"
+    cmp -s "$T/pfxv.snap" "$T/pfxv.now" \
+        && ok "malformed-hash failure leaves existing prefix unchanged" \
+        || bad "malformed-hash failure leaves existing prefix unchanged"
+fi
+
+# ============ staged verification: ELF64 LE EM_BPF ET_REL screen ============
+# Each variant passes the historical checks (file(1) says eBPF, readelf
+# Machine is BPF) and must be rejected by the new header screen — as explicit
+# overrides (screened, not hash-checked) against the existing prefix.
+python3 -c "
+import struct
+def hdr(cls, data, typ):
+    e = b'\x7fELF' + bytes([cls, data, 1, 0]) + b'\x00'*8
+    bo = '<' if data == 1 else '>'
+    if cls == 1:
+        return struct.pack(bo + '16sHHIIIIIHHHHHH', e, typ, 247, 1, 0, 0, 0, 0, 52, 0, 0, 0, 0, 0)
+    return struct.pack(bo + '16sHHIQQQIHHHHHH', e, typ, 247, 1, 0, 0, 0, 0, 64, 0, 0, 0, 0, 0)
+open('$T/bpf-exec.o', 'wb').write(hdr(2, 1, 2))
+open('$T/bpf-dyn.o', 'wb').write(hdr(2, 1, 3))
+open('$T/bpf-elf32.o', 'wb').write(hdr(1, 1, 1))
+open('$T/bpf-be.o', 'wb').write(hdr(2, 2, 1))
+"
+# Sanity: variants really do pass the historical checks (else the negatives
+# would prove nothing about the new screen).
+for _v in exec dyn elf32 be; do
+    case "$(file -b "$T/bpf-$_v.o")" in
+        *ELF*eBPF*) ok "fixture bpf-$_v.o passes historical file(1) eBPF check" ;;
+        *) bad "fixture bpf-$_v.o passes historical file(1) eBPF check" ;;
+    esac
+    case "$(readelf -h "$T/bpf-$_v.o" 2>/dev/null | grep 'Machine:' || true)" in
+        *BPF*) ok "fixture bpf-$_v.o passes historical Machine-BPF check" ;;
+        *) bad "fixture bpf-$_v.o passes historical Machine-BPF check" ;;
+    esac
+done
+check_elf_reject() {
+    if "$SH_BIN" "$INSTALL" --manifest "$T/manifest.json" --prefix "$T/pfxv" \
+            --harvest "$1" >"$T/out" 2>&1; then
+        bad "$2 rejected (got exit 0)"
+    else
+        grep -q "$3" "$T/out" \
+            && ok "$2 rejected with diagnosis ($3)" \
+            || bad "$2 rejected with diagnosis ($3) (saw: $(head -1 "$T/out"))"
+        snapshot_prefix "$T/pfxv" "$T/pfxv.now"
+        cmp -s "$T/pfxv.snap" "$T/pfxv.now" \
+            && ok "$2 failure leaves existing prefix unchanged" \
+            || bad "$2 failure leaves existing prefix unchanged"
+    fi
+}
+check_elf_reject "$T/bpf-exec.o" "ET_EXEC BPF object" "Type is EXEC"
+check_elf_reject "$T/bpf-dyn.o" "ET_DYN BPF object" "Type is DYN"
+check_elf_reject "$T/bpf-elf32.o" "ELF32 BPF object" "Class is ELF32"
+check_elf_reject "$T/bpf-be.o" "big-endian BPF object" "big endian"
+
 # ============ --setcap matrix ============
 mkdir -p "$T/stubbin"
 cat >"$T/stubbin/setcap" <<'EOF'
@@ -294,7 +566,7 @@ fi
 # installer needs except setcap/getcap (a bare /usr/bin:/bin still carries
 # setcap on merged-usr platforms).
 mkdir -p "$T/nocapbin"
-for tool in python3 file readelf cp mkdir chmod rm grep awk sed cat realpath; do
+for tool in python3 file readelf cp mkdir chmod mktemp rm grep awk sed cat realpath; do
     dest="$(command -v "$tool")" || { echo "test prereq missing: $tool" >&2; exit 1; }
     ln -s "$dest" "$T/nocapbin/$tool"
 done
