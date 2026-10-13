@@ -36,7 +36,11 @@ rides the poll tagged with its generation). The `TRIP` and
 discards the other's successful drain. A failed `TRIP` fence
 refuses attribution (loud snapshot loss) rather than joining
 ambiguous counts to fresh meanings, and the refusal latches until
-a trustworthy `TRIP` read re-baselines.
+a trustworthy `TRIP` read re-baselines. The gate covers
+retirement reads too: a successful fence while the latch is set
+re-baselines silently instead of emitting definite retired
+attribution for counts that mix the unresolved older binding with
+the retiring one.
 
 ## Window binding
 
