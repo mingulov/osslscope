@@ -18,12 +18,14 @@
 # asserted). Observer diagnostics stay in known-n-driver.log and are never
 # oracle input; the earlier fixture smoke (driver-smoke.txt) is not ledger
 # evidence either. The capability probe consumes doctor --format json plus
-# its process status: only allowlisted capability absences
-# (caps/kernel/lockdown/lsm) are a labeled SKIP, while artifact
-# incompatibility, malformed reports and abnormal exits are setup
-# failures, never skips. A missing live capability is a labeled SKIP in
-# the job summary, never "capture passed"; a setup failure is reported as
-# setup failure, never as a capability skip. A skip is not a passing
+# its process status: only recognized capability absences
+# (caps/kernel/lockdown/lsm rows with explicit absence
+# messages) are a labeled SKIP, while artifact incompatibility,
+# unexpected or unattributed failures, malformed reports and
+# abnormal exits are setup failures, never skips. A missing live
+# capability is a labeled SKIP in the job summary, never
+# "capture passed"; a setup failure is reported as setup failure,
+# never as a capability skip. A skip is not a passing
 # qualification window: required-runner qualification counts admitted
 # windows only.
 name: live-known-n
@@ -114,9 +116,10 @@ jobs:
           # with the same explicit flags the check step uses, or a capable
           # runner misclassifies as a capability skip on objects rows.
           # Typed disposition (F13): the JSON report plus the process
-          # status decide. Only allowlisted capability absences skip;
-          # artifact incompatibility, malformed reports and abnormal
-          # exits are setup failures, never skips.
+          # status decide. Only recognized capability absences skip;
+          # artifact incompatibility, unexpected or unattributed
+          # failures, malformed reports and abnormal exits are setup
+          # failures, never skips.
           rc=0
           "$PFX/bin/osslscope" doctor \
             --object "$PFX/lib/osslscope/osslscope-harvest" \
@@ -134,9 +137,31 @@ jobs:
 
           # Allowlisted capability absences: the runner lacks live BPF
           # capability (privilege, kernel features, lockdown, LSM
-          # denial). Every other failing check (objects-*, spawn-access,
-          # target rows, unknown ids) is a setup failure, never a skip.
+          # denial). Admission needs the recognized-absence message
+          # shape for the id (see recognized_absence): unexpected
+          # errnos and unattributed denials are setup failures even
+          # on allowlisted ids. Every other failing check
+          # (objects-*, spawn-access, target rows, unknown ids) is a
+          # setup failure, never a skip.
           ADMITTED_CAPABILITY_IDS = ("caps", "kernel", "lockdown", "lsm")
+
+          # Gate rows the disposition reasons about. The producer
+          # always emits them (doctor.rs: the base checks plus both
+          # objects rows), so a report missing any of them cannot
+          # authorize capture or a skip.
+          REQUIRED_GATE_IDS = (
+              "caps",
+              "kernel",
+              "lockdown",
+              "lsm",
+              "objects-harvest",
+              "objects-count",
+          )
+
+          # Producer row statuses (doctor.rs Status::as_str): only
+          # "fail" rows fail the verdict; anything outside this set
+          # is a malformed report, never silently ignored.
+          KNOWN_STATUSES = ("pass", "fail", "degraded", "info")
 
           rc = int(sys.argv[1])
           path = sys.argv[2]
@@ -157,6 +182,36 @@ jobs:
               return 1
 
 
+          def recognized_absence(cid, message):
+              """True only for explicit admitted-absence shapes."""
+              if cid == "caps":
+                  return message.startswith("missing caps:")
+              if cid == "kernel":
+                  # TooOld ("wrong kernel") plus denials attributed
+                  # to lockdown/LSM/seccomp. Unexpected errnos
+                  # ("{feature} failed (errno N)") and unexplained
+                  # denials ("no lockdown/LSM/seccomp") need
+                  # investigation, never a skip.
+                  return (
+                      message.startswith("wrong kernel:")
+                      or "blocked by lockdown=confidentiality" in message
+                      or "likely LSM:" in message
+                      or "seccomp filter" in message
+                  )
+              if cid == "lockdown":
+                  return message.startswith("lockdown=confidentiality")
+              if cid == "lsm":
+                  # The likely-LSM denial plus rows attributing to
+                  # lockdown/seccomp. The unattributed denial needs
+                  # investigation, never a skip.
+                  return (
+                      message.startswith("likely LSM denial")
+                      or "lockdown=confidentiality, not LSM" in message
+                      or "suspect the seccomp filter" in message
+                  )
+              return False
+
+
           def main():
               if rc not in (0, 4):
                   return setup("doctor exited %d, want 0 (capable) or 4 (fail-closed); abnormal termination is setup failure, never a capability skip" % rc)
@@ -171,25 +226,56 @@ jobs:
               checks = doc.get("checks")
               if verdict not in ("ok", "fail-closed") or not isinstance(checks, list):
                   return setup("malformed doctor report (verdict=%r)" % (verdict,))
-              fails = sorted(
-                  (c.get("id") for c in checks if isinstance(c, dict) and c.get("status") == "fail"),
-                  key=lambda v: str(v),
-              )
-              if "exit" in doc and doc["exit"] != rc:
-                  return setup("doctor report exit %r disagrees with process status %d" % (doc["exit"], rc))
+              exit_field = doc.get("exit")
+              if (
+                  "exit" not in doc
+                  or isinstance(exit_field, bool)
+                  or not isinstance(exit_field, int)
+                  or exit_field != rc
+              ):
+                  return setup("doctor report exit %r disagrees with process status %d" % (exit_field, rc))
+              seen = set()
+              fails = []
+              for row in checks:
+                  if not isinstance(row, dict):
+                      return setup("malformed doctor report: check row is not an object (%r)" % (row,))
+                  cid = row.get("id")
+                  status = row.get("status")
+                  message = row.get("message")
+                  if (
+                      not isinstance(cid, str)
+                      or not cid
+                      or not isinstance(status, str)
+                      or not isinstance(message, str)
+                  ):
+                      return setup("malformed doctor report: check row lacks id/status/message strings (%r)" % (row,))
+                  if status not in KNOWN_STATUSES:
+                      return setup("malformed doctor report: check %r has unrecognized status %r" % (cid, status))
+                  if cid in seen:
+                      return setup("malformed doctor report: duplicate check id %r" % (cid,))
+                  seen.add(cid)
+                  if status == "fail":
+                      fails.append((cid, message))
+              missing = [i for i in REQUIRED_GATE_IDS if i not in seen]
+              if missing:
+                  return setup("malformed doctor report: missing required gate rows %s" % (missing,))
+              fail_ids = sorted(i for i, _ in fails)
               if verdict == "ok":
                   if rc != 0 or fails:
-                      return setup("inconsistent ok report (rc=%d, failing=%s)" % (rc, fails))
+                      return setup("inconsistent ok report (rc=%d, failing=%s)" % (rc, fail_ids))
                   emit("capable=true", "verdict ok")
                   return 0
               if rc != 4:
                   return setup("inconsistent fail-closed report (rc=%d)" % rc)
               if not fails:
                   return setup("fail-closed verdict with no failing check")
-              foreign = [i for i in fails if i not in ADMITTED_CAPABILITY_IDS]
+              foreign = [i for i in fail_ids if i not in ADMITTED_CAPABILITY_IDS]
               if foreign:
-                  return setup("failing checks %s are not admitted capability absences (admitted: %s)" % (fails, list(ADMITTED_CAPABILITY_IDS)))
-              emit("capable=false", "admitted capability absence: %s" % (fails,))
+                  return setup("failing checks %s are not admitted capability absences (admitted: %s)" % (fail_ids, list(ADMITTED_CAPABILITY_IDS)))
+              unattributed = sorted(i for i, m in fails if not recognized_absence(i, m))
+              if unattributed:
+                  return setup("failing checks %s are unexpected or unattributed failures, not recognized capability absence" % (unattributed,))
+              emit("capable=false", "admitted capability absence: %s" % (fail_ids,))
               return 0
 
 
