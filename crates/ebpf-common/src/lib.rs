@@ -147,6 +147,12 @@ pub const KIND_TRIP: u32 = 5;
 pub const KIND_SCAN_CALL: u32 = 7;
 pub const KIND_SCAN_RET: u32 = 8;
 pub const KIND_GUARD: u32 = 9;
+/// Scan-plane ALG/ROW (item 4 freeze — R18 decision 15): NEW kinds
+/// (fail-closed vs the harvest decoders, which keep kinds 3/4 at
+/// 48/40B — same-kind reshape would make the shared parsers
+/// ambiguous across rings).
+pub const KIND_SCAN_ALG: u32 = 10;
+pub const KIND_SCAN_ROW: u32 = 11;
 
 /// Kernel string-read windows (bytes, NUL-inclusive).
 pub const ALG_WINDOW: usize = 128;
@@ -251,6 +257,9 @@ pub const LOSS_ADMIT_STORE_FAIL: u32 = 32;
 /// SEQ counter re-issuing MAX: fail-closed skip (cause 9), never
 /// silent invocation-id reuse (R18 §2, sol F10).
 pub const LOSS_SEQ_SATURATED: u32 = 33;
+/// Tier-1 token bucket empty (rate — cause 10; the bucket's
+/// INSERT-fail joins the admit-store class, cause 8/LOSS 32).
+pub const LOSS_BUCKET_EMPTY: u32 = 34;
 
 /// Entry skip causes (P7 item 3): the `ScanCallEvent.flags` cause
 /// field. 0 = admitted (no counter); each nonzero cause maps to
@@ -267,8 +276,10 @@ pub const SKIP_CTRL_UNPROGRAMMED: u8 = 7;
 pub const SKIP_ADMIT_STORE_FAIL: u8 = 8;
 /// SEQ counter saturated (re-issuing MAX — R18 §2, sol F10).
 pub const SKIP_SEQ_SATURATED: u8 = 9;
+/// Tier-1 token bucket empty (rate — item 5 §5.4).
+pub const SKIP_BUCKET_EMPTY: u8 = 10;
 /// Highest valid skip cause (decoders reject above this).
-pub const SKIP_CAUSE_MAX: u8 = SKIP_SEQ_SATURATED;
+pub const SKIP_CAUSE_MAX: u8 = SKIP_BUCKET_EMPTY;
 
 /// `ScanCallEvent.flags` layout: bit 0 = NESTED_HINT (advisory —
 /// §5.2 rules corroborate); cause in bits 8..16; all other bits
@@ -298,8 +309,33 @@ pub const fn loss_for_skip_cause(cause: u8) -> u32 {
         SKIP_CTRL_UNPROGRAMMED => LOSS_CTRL_UNPROGRAMMED,
         SKIP_ADMIT_STORE_FAIL => LOSS_ADMIT_STORE_FAIL,
         SKIP_SEQ_SATURATED => LOSS_SEQ_SATURATED,
+        SKIP_BUCKET_EMPTY => LOSS_BUCKET_EMPTY,
         _ => 0,
     }
+}
+
+/// Tier-1 token bucket (item 5, §5.4): per-thread kernel buckets,
+/// 40/s sustained, burst 4 — single-writer (one tid = one
+/// thread), race-free. The entry charges one token per
+/// would-admit query (after all other gates — tokens meter
+/// admitted scans, not attempts).
+pub const BUCKET_RATE_PER_S: u64 = 40;
+pub const BUCKET_BURST: u64 = 4;
+pub const BUCKET_PERIOD_NS: u64 = 1_000_000_000 / BUCKET_RATE_PER_S;
+/// Refill quantum in bucket-shifted space (ns>>8 — matches the
+/// fold; truncation 97656.25 → 97656 shortens the period by
+/// 64ns/25ms — negligible, and conservative).
+pub const BUCKET_PERIOD_SHIFTED: u64 = BUCKET_PERIOD_NS >> 8;
+
+/// `BUCKET[tid]` fold: tokens:8 in the low byte, last-refill
+/// (ktime_ns>>8) in the high 56 bits (256ns granularity, ~584y
+/// range — fits one u64 cell; refill math runs in shifted space).
+pub const fn make_bucket(tokens: u8, last_shifted: u64) -> u64 {
+    ((last_shifted & 0x00FF_FFFF_FFFF_FFFF) << 8) | (tokens as u64)
+}
+
+pub const fn split_bucket(v: u64) -> (u8, u64) {
+    ((v & 0xFF) as u8, v >> 8)
 }
 
 /// `RCOUNT[tid]` fold (P7 item 3, R18 §2/§6.9): count:32 in the low
@@ -610,6 +646,53 @@ pub struct GuardEvent {
 
 const _: () = assert!(size_of::<GuardEvent>() == 40);
 const _: () = assert!(align_of::<GuardEvent>() == 8);
+
+/// Scan-plane ALG record (item 4 freeze — R18 decision 15):
+/// `AlgEvent`'s harvest prefix byte-identical (kind/op/class/
+/// status/weak/pad/arr/idx/gen @0..40) + {tid u32, pad, seq u64}
+/// appended. The item-4 oracle joins ALGs to CALLs by (tid,seq);
+/// unattributed ALGs are never silently absorbed. 56 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScanAlgEvent {
+    pub kind: u32,
+    pub op: u32,
+    pub class: u16,
+    pub status: u8,
+    pub weak: u8,
+    pub _pad: u32,
+    pub arr: u64,
+    pub idx: u64,
+    pub generation: u64,
+    pub tid: u32,
+    pub _pad2: u32,
+    pub seq: u64,
+}
+
+const _: () = assert!(size_of::<ScanAlgEvent>() == 56);
+const _: () = assert!(align_of::<ScanAlgEvent>() == 8);
+
+/// Scan-plane ROW record (item 4 freeze): `RowEvent`'s harvest
+/// prefix byte-identical (kind/op/funcid/pad/addr/aux/idx/gen
+/// @0..48) + {tid u32, pad, seq u64} appended. 64 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScanRowEvent {
+    pub kind: u32,
+    pub op: u32,
+    pub funcid: u32,
+    pub _pad: u32,
+    pub addr: u64,
+    pub aux: u64,
+    pub idx: u64,
+    pub generation: u64,
+    pub tid: u32,
+    pub _pad2: u32,
+    pub seq: u64,
+}
+
+const _: () = assert!(size_of::<ScanRowEvent>() == 64);
+const _: () = assert!(align_of::<ScanRowEvent>() == 8);
 
 pub const GUARD_EMPTY: u32 = 0;
 pub const GUARD_VALID: u32 = 1;
@@ -1169,6 +1252,22 @@ pub fn parse_row_event(b: &[u8]) -> Result<RowEvent, WireErr> {
     Ok(e)
 }
 
+pub fn parse_scan_alg_event(b: &[u8]) -> Result<ScanAlgEvent, WireErr> {
+    let e: ScanAlgEvent = read_event(b).ok_or(WireErr::Length)?;
+    if e.kind != KIND_SCAN_ALG {
+        return Err(WireErr::Kind);
+    }
+    Ok(e)
+}
+
+pub fn parse_scan_row_event(b: &[u8]) -> Result<ScanRowEvent, WireErr> {
+    let e: ScanRowEvent = read_event(b).ok_or(WireErr::Length)?;
+    if e.kind != KIND_SCAN_ROW {
+        return Err(WireErr::Kind);
+    }
+    Ok(e)
+}
+
 /// Decode one `InitRetEvent` (stage-1 anchor report).
 pub fn parse_init_ret_event(b: &[u8]) -> Result<InitRetEvent, WireErr> {
     let e: InitRetEvent = read_event(b).ok_or(WireErr::Length)?;
@@ -1328,6 +1427,118 @@ mod tests {
     }
 
     #[test]
+    fn scan_item4_wire_freeze() {
+        // Item 4 freezes exact ALG/ROW layouts (R18 decision 15):
+        // scan-plane variants with (tid u32, seq u64) keys under
+        // NEW kinds (10/11 — fail-closed vs the harvest decoders,
+        // which keep kinds 4/5 at 40/48B). Layout = harvest
+        // prefix + {tid, pad, seq} appended (gen stays put).
+        assert_eq!((KIND_SCAN_ALG, KIND_SCAN_ROW), (10, 11));
+        assert_eq!(size_of::<ScanAlgEvent>(), 56, "SCAN-ALG is 56B");
+        assert_eq!(size_of::<ScanRowEvent>(), 64, "SCAN-ROW is 64B");
+        let alg = ScanAlgEvent {
+            kind: KIND_SCAN_ALG,
+            op: 7,
+            class: 100,
+            status: ALG_OK,
+            weak: 0,
+            _pad: 0,
+            arr: 0x5000,
+            idx: 3,
+            generation: 9,
+            tid: 4242,
+            _pad2: 0,
+            seq: make_seq(7, 9),
+        };
+        let ab = struct_bytes::<_, 56>(&alg);
+        // Harvest prefix byte-identical (gen @32).
+        assert_eq!(
+            u64::from_le_bytes(ab[32..40].try_into().unwrap()),
+            9,
+            "gen @32"
+        );
+        assert_eq!(
+            u32::from_le_bytes(ab[40..44].try_into().unwrap()),
+            4242,
+            "tid @40"
+        );
+        assert_eq!(
+            u64::from_le_bytes(ab[48..56].try_into().unwrap()),
+            make_seq(7, 9),
+            "seq @48"
+        );
+        assert_eq!(parse_scan_alg_event(&ab), Ok(alg));
+        let row = ScanRowEvent {
+            kind: KIND_SCAN_ROW,
+            op: 7,
+            funcid: 300,
+            _pad: 0,
+            addr: 0x4400,
+            aux: 0,
+            idx: 3,
+            generation: 9,
+            tid: 4242,
+            _pad2: 0,
+            seq: make_seq(7, 9),
+        };
+        let rb = struct_bytes::<_, 64>(&row);
+        assert_eq!(
+            u64::from_le_bytes(rb[40..48].try_into().unwrap()),
+            9,
+            "gen @40"
+        );
+        assert_eq!(
+            u32::from_le_bytes(rb[48..52].try_into().unwrap()),
+            4242,
+            "tid @48"
+        );
+        assert_eq!(
+            u64::from_le_bytes(rb[56..64].try_into().unwrap()),
+            make_seq(7, 9),
+            "seq @56"
+        );
+        assert_eq!(parse_scan_row_event(&rb), Ok(row));
+        // Cross-ring fail-closed: harvest parsers reject scan
+        // kinds/sizes and vice versa.
+        assert!(parse_alg_event(&ab, 4096).is_err());
+        assert!(parse_row_event(&rb).is_err());
+        assert!(
+            parse_scan_alg_event(&struct_bytes::<_, 40>(&AlgEvent {
+                kind: KIND_ALG,
+                op: 7,
+                class: 100,
+                status: ALG_OK,
+                weak: 0,
+                _pad: 0,
+                arr: 0x5000,
+                idx: 3,
+                generation: 9,
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn scan_tier1_vocab() {
+        // Item 5 tier-1 (§5.4): per-thread kernel token bucket
+        // (40/s, burst 4 — single-writer, race-free). Skip cause
+        // 10 + LOSS 34 when the bucket is empty.
+        assert_eq!(BUCKET_RATE_PER_S, 40);
+        assert_eq!(BUCKET_BURST, 4);
+        assert_eq!(BUCKET_PERIOD_NS, 25_000_000, "1e9/40");
+        assert_eq!(SKIP_BUCKET_EMPTY, 10);
+        assert_eq!(SKIP_CAUSE_MAX, 10);
+        assert_eq!(LOSS_BUCKET_EMPTY, 34);
+        assert_eq!(loss_for_skip_cause(SKIP_BUCKET_EMPTY), LOSS_BUCKET_EMPTY);
+        // Bucket INSERT-fail (map full) joins the admit-store
+        // class (cause 8 / LOSS 32 — same as RCOUNT/SCAN).
+        // Bucket fold: tokens:8 | last_ns:56 (ns>>8 — 4y range,
+        // 256ns granularity — fits one u64 cell).
+        assert_eq!(split_bucket(make_bucket(4, 1 << 40)), (4, 1 << 40));
+        assert_eq!(split_bucket(make_bucket(0, 0)), (0, 0));
+    }
+
+    #[test]
     fn scan_stage_d_wire() {
         // P7 item-3 D (R18 §2/§6.14): RET/GUARD reshape to 40B with
         // their producer (tid u32, seq u64 — the item-4 oracle
@@ -1451,7 +1662,7 @@ mod tests {
             0,
             "admitted has no loss"
         );
-        assert_eq!(loss_for_skip_cause(10), 0, "out-of-range cause has no loss");
+        assert_eq!(loss_for_skip_cause(11), 0, "out-of-range cause has no loss");
         // RCOUNT lifecycle fold: count:32 | state:32.
         assert_eq!((RCOUNT_STATE_IDLE, RCOUNT_STATE_ACTIVE), (0, 1));
         assert_eq!(split_rcount(make_rcount(0, RCOUNT_STATE_ACTIVE)), (0, 1));
@@ -1593,11 +1804,11 @@ mod tests {
         bad[0..4].copy_from_slice(&KIND_ROW.to_le_bytes());
         assert_eq!(parse_scan_call_event(&bad), Err(WireErr::Kind));
         let mut bad = cb;
-        bad[12..16].copy_from_slice(&make_call_flags(false, 10).to_le_bytes());
+        bad[12..16].copy_from_slice(&make_call_flags(false, 11).to_le_bytes());
         assert_eq!(parse_scan_call_event(&bad), Err(WireErr::StatusRange));
-        // Causes 8-9 are valid in stage C (admit-store/saturation).
+        // Causes 8-10 are valid (admit-store/saturation/bucket).
         let mut ok = cb;
-        ok[12..16].copy_from_slice(&make_call_flags(false, SKIP_SEQ_SATURATED).to_le_bytes());
+        ok[12..16].copy_from_slice(&make_call_flags(false, SKIP_BUCKET_EMPTY).to_le_bytes());
         assert!(parse_scan_call_event(&ok).is_ok());
         let mut bad = cb;
         bad[12..16].copy_from_slice(&0x02u32.to_le_bytes());

@@ -100,8 +100,8 @@ fn register(loaded: &Loaded, state: &mut BirthState, tids: &[u32]) -> Vec<(u32, 
 /// registration. Every leg attaches through here (or
 /// `attach_with_ctrl`), so the production path is live-proven
 /// along with the legs. CTRL: EXPECTED = 512 attached members,
-/// epoch 1, governor = min(4MiB policy, ring/2) — 1MiB on the 2MiB
-/// ring (small-ring fixture rule, R18 §2; item 7 re-derives).
+/// epoch 1, governor = min(4MiB policy, ring/2) — live at the 4MiB
+/// policy on the item-7 16MiB ring.
 fn attach_chunk(
     obj: &std::path::Path,
     exe: &std::ffi::CString,
@@ -148,17 +148,19 @@ fn populate_alg_class(loaded: &Loaded, entries: &[(String, u16)]) {
 /// Drained scan-plane ring: CALL/RET/GUARD/ALG/ROW in ring
 /// order. Legs join RET/GUARD to CALLs by (tid,seq) + kind, never
 /// by position (order-independence is a leg, not an assumption).
+/// Item 4: ALG/ROW are the scan-keyed kinds (10/11 — (tid,seq)
+/// joinable); the harvest kinds (4/5) never appear here.
 struct ScanDrain {
     calls: Vec<osslscope_ebpf_common::ScanCallEvent>,
     rets: Vec<osslscope_ebpf_common::ScanRetEvent>,
     guards: Vec<osslscope_ebpf_common::GuardEvent>,
-    algs: Vec<osslscope_ebpf_common::AlgEvent>,
-    rows: Vec<osslscope_ebpf_common::RowEvent>,
+    algs: Vec<osslscope_ebpf_common::ScanAlgEvent>,
+    rows: Vec<osslscope_ebpf_common::ScanRowEvent>,
 }
 
 /// Drain the member EVENTS ring to parsed events. Drops nothing
-/// silently: unknown kinds fail loud (stage D emits
-/// CALL/RET/GUARD/ALG/ROW).
+/// silently: unknown kinds fail loud (items 3–5 emit
+/// CALL/RET/GUARD/SCAN-ALG/SCAN-ROW).
 fn drain(loaded: &Loaded) -> ScanDrain {
     use aya::maps::{Map, MapData, RingBuf};
     use osslscope_ebpf_common as wire;
@@ -187,11 +189,13 @@ fn drain(loaded: &Loaded) -> ScanDrain {
             wire::KIND_GUARD => d
                 .guards
                 .push(wire::parse_guard_event(&b).expect("parse GUARD")),
-            wire::KIND_ALG => d
+            wire::KIND_SCAN_ALG => d
                 .algs
-                .push(wire::parse_alg_event(&b, 4096).expect("parse ALG")),
-            wire::KIND_ROW => d.rows.push(wire::parse_row_event(&b).expect("parse ROW")),
-            k => panic!("unexpected ring kind {k} (D emits CALL/RET/GUARD/ALG/ROW only)"),
+                .push(wire::parse_scan_alg_event(&b).expect("parse SCAN-ALG")),
+            wire::KIND_SCAN_ROW => d
+                .rows
+                .push(wire::parse_scan_row_event(&b).expect("parse SCAN-ROW")),
+            k => panic!("unexpected ring kind {k} (items 3-5 emit CALL/RET/GUARD/10/11 only)"),
         }
     }
     d
@@ -1028,15 +1032,15 @@ fn l1_load_513_margins() {
     assert_eq!(loaded.progs.len(), 513, "all member progs loaded");
     assert_eq!(
         loaded.maps.len(),
-        13,
-        "all member maps created (D dropped PENDING)"
+        14,
+        "all member maps created (D 13 + item-5 BUCKET)"
     );
     assert_eq!(attached.members.len(), 512, "all member links attached");
     let ctrl = osslscope::loader::read_ctrl(&loaded.maps).expect("read CTRL");
     assert_eq!(
         (ctrl.expected, ctrl.skip_all, ctrl.epoch, ctrl.governor),
-        (512, 0, 1, 1 << 20),
-        "production attach programmed CTRL"
+        (512, 0, 1, 4 << 20),
+        "production attach programmed CTRL (item-7 16MiB ring: governor live at 4MiB policy)"
     );
     let mut lens: Vec<(String, usize)> = loaded
         .progs
@@ -4475,7 +4479,10 @@ fn d_pressure_gov0() {
 /// scans no-drain, per-(tid,seq) pairing exact (1 CALL + 1 RET +
 /// 512 ALG + 512 ROW + 1 GUARD each), each retired; (b) drop-path
 /// — 200 NULL no-drain at T=8000: exactly 101 admit (fire 101
-/// sees occ 8000 ≤ 8000), 99 skip cause 4; RETs == admits.
+/// sees occ 8000 ≤ 8000), 99 skip cause 4; RETs == admits. The 200
+/// fires spread over 50 worker tids × 4 (item 5: a single tid's
+/// bucket burst is 4 — 200 on one tid would bucket-skip, not
+/// occupancy-skip; occupancy is global so the math is unchanged).
 #[test]
 #[ignore]
 fn d_burst_exactness() {
@@ -4533,11 +4540,15 @@ fn d_burst_exactness() {
     {
         let attached = attach_with_ctrl(&obj, &exe, off, &wire::ctrl_value(512, 1, 8000));
         let loaded = &attached.loaded;
-        let mut state = BirthState::new();
-        register(loaded, &mut state, &[self_tid()]);
         FIXTURE_ARRAY.store(0, Ordering::SeqCst);
         NS_VERDICT.store(0, Ordering::SeqCst);
-        fire(OP as i32, 200);
+        // 50 workers × 4 NULL fires each, sequential (each
+        // worker fires exactly the bucket burst; occupancy
+        // accumulates globally across workers, the bucket
+        // never binds).
+        for _ in 0..50 {
+            fire_on_worker(loaded, OP as i32, 4);
+        }
         let d = drain(loaded);
         assert_eq!(d.calls.len(), 200, "drop: 200 CALLs, single drain");
         let (adm, skp): (Vec<&_>, Vec<&_>) = d
@@ -4556,4 +4567,212 @@ fn d_burst_exactness() {
         assert_eq!(read_attempt(loaded), 200);
         assert_loss_only(loaded, wire::LOSS_RING_PRESSURE, 99, "drop");
     }
+}
+
+/// Tier-1 bucket live (item 5, §5.5): burst 4 admits back-to-back,
+/// 5th rapid fire skips cause 10 (no SEQ mint), 120ms later the
+/// refill (40/s) re-admits. NULL queries (occupancy never binds —
+/// the bucket is the only skip source). Margins: fires are
+/// back-to-back (µs ≪ 25ms period); the sleep is 4.8× the
+/// 1-token period.
+#[test]
+#[ignore]
+fn d_bucket_burst_refill() {
+    use osslscope_ebpf_common as wire;
+    let Some(obj) = gated() else {
+        eprintln!("SKIP(members-live): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
+        return;
+    };
+    let exe = own_exe_cstr();
+    let off = query_off();
+    let attached = attach_chunk(&obj, &exe, off);
+    let loaded = &attached.loaded;
+    let tid = self_tid();
+    FIXTURE_ARRAY.store(0, Ordering::SeqCst);
+    NS_VERDICT.store(0, Ordering::SeqCst);
+    fire(OP as i32, 4); // burst: all admit
+    fire(OP as i32, 1); // 5th: bucket empty → skip cause 10
+    std::thread::sleep(std::time::Duration::from_millis(120));
+    fire(OP as i32, 1); // refilled → admit
+    let d = drain(loaded);
+    assert_eq!(d.calls.len(), 6, "bucket: 6 CALLs, single drain");
+    let (adm, skp): (Vec<&_>, Vec<&_>) = d
+        .calls
+        .iter()
+        .partition(|c| call_parts(c).1 == wire::SKIP_ADMITTED);
+    assert_eq!(adm.len(), 5, "bucket: 4 burst + 1 refill admit");
+    assert_eq!(skp.len(), 1, "bucket: 1 empty-skip");
+    assert_eq!(
+        call_parts(skp[0]),
+        (false, wire::SKIP_BUCKET_EMPTY),
+        "bucket: skip cause 10, quiet"
+    );
+    assert_eq!(skp[0].seq, 0, "bucket: skip mints no SEQ");
+    let seqs: Vec<u64> = adm.iter().map(|c| c.seq).collect();
+    assert_eq!(
+        seqs,
+        (0..5).map(|i| wire::make_seq(0, i)).collect::<Vec<_>>(),
+        "bucket: admits mint ctr 0..4 (the skip minted nothing)"
+    );
+    assert_eq!(d.rets.len(), 5, "bucket: RET per admit");
+    assert!(
+        d.algs.is_empty() && d.rows.is_empty(),
+        "bucket: NULL silence"
+    );
+    assert_eq!(read_percpu(loaded, "CALLS", OP, false), 5);
+    assert_eq!(read_attempt(loaded), 6);
+    assert_loss_only(loaded, wire::LOSS_BUCKET_EMPTY, 1, "bucket");
+    assert_retired(loaded, tid, "bucket");
+}
+
+/// Selective load live (item 6): attach members {0,1,2,3} with
+/// EXPECTED=4 — the scan retires (count reaches attached
+/// EXPECTED), evidence covers the attached-live slots only, and
+/// unattached slots stay silent (out of scope — the oracle
+/// reports them as unobserved, never as holes).
+#[test]
+#[ignore]
+fn d_selective_scope() {
+    use osslscope_ebpf_common as wire;
+    let Some(obj) = gated() else {
+        eprintln!("SKIP(members-live): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
+        return;
+    };
+    let exe = own_exe_cstr();
+    let off = query_off();
+    let ctrl =
+        osslscope::loader::default_ctrl(4, osslscope::loader::MEMBER_RING_BYTES).expect("CTRL/4");
+    let attached = osslscope::loader::attach_members_subset(
+        &obj,
+        &exe,
+        off,
+        std::process::id(),
+        &ctrl,
+        &[0, 1, 2, 3],
+    )
+    .expect("selective attach");
+    assert_eq!(attached.members.len(), 4, "selective: 4 links");
+    let loaded = &attached.loaded;
+    let mut state = BirthState::new();
+    register(loaded, &mut state, &[self_tid()]);
+    let tid = self_tid();
+    let slots = vec![
+        SlotSpec::live("MS0", 101, vec![(21, 0x4200)]),
+        SlotSpec::live("MS1", 102, vec![(22, 0x4300)]),
+    ];
+    let fx = Fixture::build(&slots, &[]);
+    fx.pretouch();
+    populate_alg_class(loaded, &fx.classes);
+    FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
+    NS_VERDICT.store(0, Ordering::SeqCst);
+    fire(OP as i32, 1);
+    let d = drain(loaded);
+    assert_eq!(d.calls.len(), 1, "selective: 1 CALL");
+    assert_eq!(call_parts(&d.calls[0]), (false, wire::SKIP_ADMITTED));
+    assert_eq!(d.rets.len(), 1, "selective: RET (member 0 attached)");
+    let mut idxs: Vec<u64> = d.algs.iter().map(|a| a.idx).collect();
+    idxs.sort_unstable();
+    assert_eq!(idxs, vec![0, 1], "selective: attached-live slots only");
+    assert!(d.guards.is_empty(), "selective: no guard (511 unattached)");
+    assert_eq!(read_percpu(loaded, "CALLS", OP, false), 1);
+    assert_retired(loaded, tid, "selective");
+    assert_loss_zero(loaded);
+}
+
+/// Drain floor live (item 7, §5.6): 240 × 512-live scans in 6
+/// waves of 40 (each wave 10 worker tids × 4 fires — bucket-safe;
+/// ~2.7MB/wave < 4MiB governor so every fire admits), timed
+/// drains sustain ≥ 120MB/s aggregate (the ring criterion; P9
+/// verifies — typical ringbuf+parse is GB/s, 10×+ margin).
+#[test]
+#[ignore]
+fn d_drain_floor() {
+    use osslscope_ebpf_common as wire;
+    let Some(obj) = gated() else {
+        eprintln!("SKIP(members-live): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
+        return;
+    };
+    let exe = own_exe_cstr();
+    let off = query_off();
+    let attached = attach_chunk(&obj, &exe, off);
+    let loaded = &attached.loaded;
+    let slots: Vec<SlotSpec> = (0..512u32)
+        .map(|j| {
+            SlotSpec::live(
+                &format!("MDF{j:03}"),
+                100 + (j % 512) as u16,
+                vec![(7000 + j, 0xA000 + j as u64)],
+            )
+        })
+        .collect();
+    let fx = Fixture::build(&slots, &[]);
+    fx.pretouch();
+    populate_alg_class(loaded, &fx.classes);
+    FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
+    NS_VERDICT.store(0, Ordering::SeqCst);
+    let mut total_bytes: u64 = 0;
+    let mut total_drain = std::time::Duration::ZERO;
+    let mut total_calls = 0usize;
+    for wave in 0..6 {
+        for _ in 0..10 {
+            fire_on_worker(loaded, OP as i32, 4);
+        }
+        let t0 = std::time::Instant::now();
+        let d = drain(loaded);
+        let dt = t0.elapsed();
+        total_drain += dt;
+        total_calls += d.calls.len();
+        let bytes = d.calls.len() as u64 * 32
+            + d.rets.len() as u64 * 48
+            + d.guards.len() as u64 * 48
+            + d.algs.len() as u64 * 64
+            + d.rows.len() as u64 * 72;
+        total_bytes += bytes;
+        eprintln!(
+            "drain-floor wave {wave}: {} CALLs, {bytes} bytes in {dt:?}",
+            d.calls.len()
+        );
+        assert_eq!(d.calls.len(), 40, "drain-floor: wave admits all 40");
+        assert!(
+            d.calls
+                .iter()
+                .all(|c| call_parts(c).1 == wire::SKIP_ADMITTED),
+            "drain-floor: no skips (occupancy + bucket both clear)"
+        );
+    }
+    assert_eq!(total_calls, 240, "drain-floor: 240 scans");
+    let secs = total_drain.as_secs_f64();
+    let rate = total_bytes as f64 / secs;
+    eprintln!("drain-floor: {total_bytes} bytes in {total_drain:?} = {rate:.1} B/s");
+    assert!(
+        rate >= 120_000_000.0,
+        "drain-floor: {rate:.1} B/s < 120MB/s criterion"
+    );
+    assert_loss_zero(loaded);
+}
+
+/// Teardown wall live (item 7 resource): attach + drop of all 513
+/// links completes (hang-guard bound — P9 tightens from lane
+/// evidence; the measured split is reported for the record).
+#[test]
+#[ignore]
+fn d_detach_wall() {
+    let Some(obj) = gated() else {
+        eprintln!("SKIP(members-live): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
+        return;
+    };
+    let exe = own_exe_cstr();
+    let off = query_off();
+    let t0 = std::time::Instant::now();
+    let attached = attach_chunk(&obj, &exe, off);
+    let attach_dt = t0.elapsed();
+    assert_eq!(attached.members.len(), 512, "detach-wall: 512 links");
+    let t1 = std::time::Instant::now();
+    drop(attached);
+    let detach_dt = t1.elapsed();
+    eprintln!("detach-wall: attach {attach_dt:?}, detach {detach_dt:?}");
+    assert!(
+        attach_dt + detach_dt < std::time::Duration::from_secs(60),
+        "detach-wall: attach+detach {attach_dt:?}+{detach_dt:?} exceeds hang-guard 60s"
+    );
 }

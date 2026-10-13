@@ -82,10 +82,24 @@ its own):
   (array, index) join key, and the incarnation generation
   cookie. 40 bytes.
 - `TripEvent`: kind/cookie plus class id and status. 16 bytes.
+- `ScanCallEvent`: kind/op/tid plus hint+cause flags and the
+  invocation seq. 24 bytes.
+- `ScanRetEvent`: kind/op/flags/tid/seq plus the array id and
+  incarnation generation cookie. 40 bytes.
+- `GuardEvent`: kind/op/verdict/tid/seq plus the array id and
+  incarnation generation cookie. 40 bytes.
+- `ScanAlgEvent`: the `AlgEvent` harvest prefix byte-identical
+  plus the (tid, seq) join key. 56 bytes.
+- `ScanRowEvent`: the `RowEvent` harvest prefix byte-identical
+  plus the (tid, seq) join key. 64 bytes.
 
 No ring payload carries target string bytes, string lengths, or
 string prefixes: the wire structs are too small to hold the read
-windows, which the protocol tests pin by size.
+windows, which the protocol tests pin by size. The scan-plane
+join keys (tid, seq) are observer invocation ids, and the
+harvest-prefix bytes obey the same numeric discipline as the
+harvest kinds (kinds 10/11 share the prefix parsers' fail-closed
+vocabulary — `scan_item4_wire_freeze`).
 
 Addresses on the ring are transient internal structural-relocation
 transport only: array bases attribute rows to provider mappings,
@@ -195,6 +209,7 @@ RCOUNT
 T_CACHE
 CTRL
 ATTEMPT
+BUCKET
 ```
 
 All maps hold numeric keys/values/counters/cursors except `EVENTS`,
@@ -226,20 +241,24 @@ its `PENDING_QUERY` interim scaffold is dropped in stage D — R18
 stashed for the return-side read, never emitted), `SEQ`
 (birth:16|ctr:48 invocation ids), `BIRTH` (registry births),
 `RCOUNT` (count:32|lifecycle:32), `T_CACHE` (array → terminator +
-generation, userspace-written — the writer is item 4; members
-peek it read-only and treat GEN-mismatch as cold), `CTRL`
+generation, userspace-written — the writer is the item-4 backend
+(integration commit); members peek it read-only and treat
+GEN-mismatch as cold), `CTRL`
 (EXPECTED/epoch/SKIP-ALL/governor occupancy bound), `ATTEMPT`
-(entry-hit census). The entry plane reads NO target memory (args
-+ map cells only — the entry cannot see rv; pinned by
-`probe_read_allowlist_is_complete`), so admission/skip decisions
-never retain target bytes. Stage-D member reads (8 sites,
+(entry-hit census), `BUCKET` (tid → tokens:8|last-refill:56 —
+per-thread tier-1 rate state, numeric only). The entry plane reads
+NO target memory (args + map cells only — the entry cannot see rv;
+pinned by `probe_read_allowlist_is_complete`), so admission/skip
+decisions never retain target bytes. Stage-D member reads (8 sites,
 pinned): the slot tuple + dispatch + name (v1 shapes, same
 bounds), the member-0 `no_store` verdict read (u32 → TRUNC flag,
 never emitted), the would-skip-path `no_store` verdict re-read
 (u32 → branch only — only a successfully-read zero skips; the
 value is never retained past the branch), and the guard's single
 positional slot-512 names read (names-present verdict → GUARD
-event only — no pointee content is read or emitted).
+event only — no pointee content is read or emitted). Items 4–5 add
+no read sites (scan kinds re-emit the walked bytes; the bucket
+gate reads clock + cells only).
 
 ## 5. Emitted artifacts
 
