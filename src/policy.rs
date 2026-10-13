@@ -54,16 +54,36 @@ pub enum Predicate {
     Any(Vec<Predicate>),
 }
 
+/// True when two algorithm spellings name one semantic identity
+/// (R01): literal equality, or shared verified identity from
+/// [`crate::kinds::algorithm_semantic_id`]. Unregistered names
+/// are distinct singletons (equal only to themselves); the
+/// unresolved bucket never reaches here (callers return `Unknown`
+/// first).
+fn alg_spelling_match(a: &str, want: &str) -> bool {
+    if a == want {
+        return true;
+    }
+    match (
+        crate::kinds::algorithm_semantic_id(a),
+        crate::kinds::algorithm_semantic_id(want),
+    ) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
+}
+
 impl Predicate {
     /// Evaluate against one candidate. `Algorithm` is `Yes` only when
-    /// every recognized class equals the target, `No` only when none
-    /// does and none is unresolved; mixed lists, empty lists and lists
-    /// containing [`UNRESOLVED_ALGORITHM_CLASS`] are `Unknown`.
+    /// every recognized class matches the target by semantic
+    /// identity, `No` only when none does and none is unresolved;
+    /// mixed lists, empty lists and lists containing
+    /// [`UNRESOLVED_ALGORITHM_CLASS`] are `Unknown`.
     /// Class-list algorithm match shared by [`Predicate::Algorithm`]
     /// and [`Predicate::AlgorithmParamAware`]: `Yes` only when every
-    /// recognized class equals the target, `No` only when none does and
-    /// none is unresolved; mixed lists, empty lists and lists containing
-    /// [`UNRESOLVED_ALGORITHM_CLASS`] are `Unknown`.
+    /// recognized class matches the target, `No` only when none does
+    /// and none is unresolved; mixed lists, empty lists and lists
+    /// containing [`UNRESOLVED_ALGORITHM_CLASS`] are `Unknown`.
     fn eval_algorithm(want: &str, c: &CandidateIdentity) -> PredicateMatch {
         if c.algorithm_classes.is_empty() {
             return PredicateMatch::Unknown;
@@ -74,7 +94,11 @@ impl Predicate {
         {
             return PredicateMatch::Unknown;
         }
-        let matching = c.algorithm_classes.iter().filter(|a| *a == want).count();
+        let matching = c
+            .algorithm_classes
+            .iter()
+            .filter(|a| alg_spelling_match(a, want))
+            .count();
         if matching == c.algorithm_classes.len() {
             PredicateMatch::Yes
         } else if matching == 0 {

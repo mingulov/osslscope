@@ -549,10 +549,10 @@ pub const GUARD_VERDICT_MAX: u32 = GUARD_ERROR;
 /// checked; `name` is populated but unread — reserved; a byte
 /// confirm does not fit the 6.12 verifier budget, see
 /// `classify_alg_with`). `weak` is 0/1. `canon` is the
-/// BPF-internal group id (H3: alias spellings share their
-/// group's id, so multi-spelling lists stay OK while
-/// cross-group lists mix — first-appearance order at table
-/// build; only the mixed flag leaves the kernel).
+/// BPF-internal semantic id (R01: verified synonyms share one id
+/// so multi-spelling lists stay OK, while distinct algorithms —
+/// even in one macro family — mix; only the mixed flag leaves
+/// the kernel).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AlgClassValue {
@@ -666,14 +666,14 @@ pub struct AlgVerdict {
 /// matched segment, including weak-only table extras, which carry
 /// `OTHER_CLASS` and can never win the minimum). `ALG_OK` iff at
 /// least one segment is recognized and all recognized segments
-/// share one group (H3); a list no segment of which the registry
-/// knows is `ALG_UNKNOWN`, never a silent pick. A mixed-group
-/// list keeps the min label but reports `ALG_MIXED` — the
-/// ambiguity is explicit instead of collapsing silently.
-/// (Hostile providers are out of model since they can claim any
-/// name directly, exactly like hash preimages.) Groups are the
-/// registry `group` strings (alias spellings share one group);
-/// same-group multi-spelling lists stay OK.
+/// share one semantic identity (R01); a list no segment of which
+/// the registry knows is `ALG_UNKNOWN`, never a silent pick. A
+/// mixed-semantic list keeps the min label but reports
+/// `ALG_MIXED` — the ambiguity is explicit instead of collapsing
+/// silently. (Hostile providers are out of model since they can
+/// claim any name directly, exactly like hash preimages.)
+/// Semantic identities are the verified equivalence sets
+/// (synonyms share one id); same-family distinct algorithms mix.
 ///
 /// Matching is hash+length: an FNV-1a-64 prefilter plus an exact
 /// length check against the table entry. There is deliberately NO
@@ -729,7 +729,7 @@ where
     let mut seg_idx: u64 = 0;
     let mut class_min: u64 = OTHER_CLASS as u64;
     let mut weak_acc: u64 = 0;
-    // Mixed detection (H3): first-seen group id + flag. The
+    // Mixed detection (R01): first-seen semantic id + flag. The
     // `OTHER_CLASS` sentinel doubles as the unlatched marker —
     // recognized records never carry it (build-guarded), so no
     // separate seen bit (verifier states stay ~4-8, not ~8-16).
@@ -758,12 +758,12 @@ where
             let take = m & alu_lt(v.class as u64, class_min);
             class_min = select_u64(mask(take), v.class as u64, class_min);
             weak_acc |= (v.weak as u64) & m;
-            // Mixed detection (H3): also straight-line. Only
+            // Mixed detection (R01): also straight-line. Only
             // RECOGNIZED records participate (`rec` excludes
             // OTHER-class weak-only extras); the first one latches
-            // `first_canon`, later ones set the flag on group
-            // difference. Single-group lists (incl. multi-spelling
-            // alias lists) never set it.
+            // `first_canon`, later ones set the flag on semantic
+            // difference. Single-identity lists (incl. verified
+            // multi-spelling alias lists) never set it.
             let rec = m & (1 - alu_eq(v.class as u64, OTHER_CLASS as u64));
             let latched = 1 - alu_eq(first_canon, OTHER_CLASS as u64);
             mixed_acc |= rec & latched & (1 - alu_eq(v.canon as u64, first_canon));
@@ -793,11 +793,11 @@ where
                     class_min = v.class as u64;
                 }
                 weak_acc |= v.weak as u64;
-                // H3: the trailing segment can only DIFFER from the
-                // latched group — latching here would be a dead
+                // R01: the trailing segment can only DIFFER from the
+                // latched semantic id — latching here would be a dead
                 // store (no segments follow; the verdict reads
                 // only mixed_acc). An unlatched scan means the
-                // trailing segment is the sole group: not mixed.
+                // trailing segment is the sole identity: not mixed.
                 if v.class != OTHER_CLASS
                     && first_canon != OTHER_CLASS as u64
                     && v.canon as u64 != first_canon
@@ -812,7 +812,7 @@ where
         // Pathological alias list: the canonical minimum over the
         // observed segments is kept, but weak fails closed —
         // unseen tail segments may be weak — and the status stays
-        // explicit. TRUNCATED wins over MIXED (H3): the unseen
+        // explicit. TRUNCATED wins over MIXED: the unseen
         // tail may hold anything, so mixed-ness over the observed
         // prefix is not the verdict.
         return AlgVerdict {
