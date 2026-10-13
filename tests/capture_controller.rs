@@ -276,10 +276,14 @@ impl DiscoveryPort for FakeDiscovery {
 /// Proc-side read log (F-D/A13): every `read_file_bound` path and
 /// every `stat_file` path, in call order. Lets relevance/cache
 /// tests assert WHAT was read, not just the adapted outcome.
+/// (R14: `read_allowances` additionally records the per-read byte
+/// allowance each read carried, so budget tests prove the runner
+/// passed shrinking cumulative allowances.)
 #[derive(Debug, Default)]
 struct ProcLog {
     reads: Vec<String>,
     stats: Vec<String>,
+    read_allowances: Vec<(String, usize)>,
 }
 
 #[derive(Debug, Default)]
@@ -480,6 +484,10 @@ struct FakeProc {
     /// `None`/exhausted falls back to the staged identity with the
     /// staged bytes' length and mtime 0.
     stat_seq: VecDeque<Option<FileStat>>,
+    /// Per-poll byte budget (R14): small values prove cumulative
+    /// overflow without huge allocations; the harness default
+    /// mirrors the production round budget.
+    read_budget: usize,
 }
 
 impl ProcPort for FakeProc {
@@ -506,22 +514,60 @@ impl ProcPort for FakeProc {
             .ok_or_else(|| anyhow::anyhow!("no such staged file {path}"))
     }
 
-    fn read_file_bound(&mut self, path: &str) -> anyhow::Result<(Vec<u8>, (u64, u64))> {
+    fn read_file_bound(
+        &mut self,
+        path: &str,
+        max_bytes: usize,
+    ) -> std::io::Result<(Vec<u8>, (u64, u64))> {
         self.clock.advance_ns(self.file_delay_ns);
         self.proc_log.borrow_mut().reads.push(path.to_string());
+        self.proc_log
+            .borrow_mut()
+            .read_allowances
+            .push((path.to_string(), max_bytes));
         if self.file_err.contains(path) {
-            anyhow::bail!("injected file failure for {path}");
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("injected file failure for {path}"),
+            ));
         }
         if let Some(seq) = self.file_read_seq.pop_front() {
-            return seq
-                .get(path)
-                .map(|f| (f.bytes.clone(), (f.dev, f.ino)))
-                .ok_or_else(|| anyhow::anyhow!("no such staged file {path}"));
+            let f = seq.get(path).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("no such staged file {path}"),
+                )
+            })?;
+            if f.bytes.len() > max_bytes {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::FileTooLarge,
+                    format!("{path}: file exceeds {max_bytes}-byte read bound"),
+                ));
+            }
+            return Ok((f.bytes.clone(), (f.dev, f.ino)));
         }
-        self.files
-            .get(path)
-            .map(|f| (f.bytes.clone(), (f.dev, f.ino)))
-            .ok_or_else(|| anyhow::anyhow!("no such staged file {path}"))
+        let staged = self.files.get(path).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("no such staged file {path}"),
+            )
+        })?;
+        // Production-faithful budget refusal (R14): the live reader
+        // refuses past the allowance before allocating; the fake
+        // mirrors that contract so runner tests prove the
+        // skip-and-count-loss path (plan-level tests prove the live
+        // reader itself).
+        if staged.bytes.len() > max_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::FileTooLarge,
+                format!("{path}: file exceeds {max_bytes}-byte read bound"),
+            ));
+        }
+        Ok((staged.bytes.clone(), (staged.dev, staged.ino)))
+    }
+
+    fn read_budget(&self) -> usize {
+        self.read_budget
     }
 
     fn stat_file(&mut self, path: &str) -> Option<FileStat> {
@@ -778,6 +824,7 @@ struct Harness {
     /// flag closure, modelling an async signal landing mid-round
     /// (call-counted in tests — production signals are async).
     cancel_hook: Option<Rc<dyn Fn() -> bool>>,
+    read_budget: usize,
 }
 
 impl Harness {
@@ -862,6 +909,9 @@ impl Harness {
             release_fires: Vec::new(),
             lifecycle_advance_ns: 0,
             cancel_hook: None,
+            // Production round budget (128 MiB); R14 tests inject
+            // small values to prove budget behavior.
+            read_budget: 128 * 1024 * 1024,
         }
     }
 
@@ -952,6 +1002,7 @@ impl Harness {
             comm_settled: self.comm_settled,
             proc_log: self.proc_log.clone(),
             stat_seq: self.stat_seq,
+            read_budget: self.read_budget,
         };
         let flag = self.cancelled.clone();
         let hook = self.cancel_hook.clone();
@@ -5422,6 +5473,7 @@ fn live_observe_inner(
         comm_settled: None,
         proc_log: Rc::new(RefCell::new(ProcLog::default())),
         stat_seq: VecDeque::new(),
+        read_budget: 128 * 1024 * 1024,
     };
     let info = TargetInfo {
         pid,
@@ -8073,4 +8125,325 @@ fn missing_readiness_during_settle_withholds_complete() {
         7,
         "boundary call missed, post-attach calls counted: {c:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// R14: object-read budgets bind before allocation (covers F17).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn r14_first_oversized_object_cannot_bypass_cap() {
+    // F17: the old loop always read at least one path unbounded;
+    // now the FIRST relevant object carries the budget allowance
+    // like any other — its refusal skips loud (rows miss,
+    // `discovery.relevance_capped` loss, PARTIAL) while the rest
+    // of the round succeeds. Two paths only, so the file-count
+    // cap is provably uninvolved.
+    let mut h = Harness::fresh("r14-first");
+    h.snapshot_attached();
+    // Oversized decoy sorts FIRST, so it is the round's first
+    // read: staged junk larger than the budget (never parsed —
+    // refused before allocation). The real file stays tiny (its
+    // identity is all the fake serves from disk).
+    let elf_len = h.bytes.len();
+    let budget = elf_len + 512;
+    let big = h.stage.write("a-huge.so", &[0x7fu8; 64]);
+    h.files.insert(
+        big.path.clone(),
+        plan::FileBytes {
+            bytes: vec![0x7fu8; elf_len + 1024],
+            dev: big.device,
+            ino: big.ino,
+        },
+    );
+    h.read_budget = budget;
+    h.maps = vec![mapping(&big), mapping(&h.staged)];
+    let staged_path = h.staged.path.clone();
+    let big_path = big.path.clone();
+    assert!(
+        big_path < staged_path,
+        "decoy must sort first: {big_path} vs {staged_path}"
+    );
+    h.polls.push_back(DiscoveryDelta::default());
+    h.polls.push_back(DiscoveryDelta {
+        candidates: vec![
+            cand(
+                "/p/provider.so",
+                backing_of(&big, h.off),
+                1,
+                11,
+                "SHA-256",
+                false,
+                "ok",
+            ),
+            cand(
+                "/p/provider.so",
+                backing_of(&h.staged, h.off),
+                1,
+                11,
+                "SHA-256",
+                false,
+                "ok",
+            ),
+        ],
+        tables: vec![terminated(1, 0)],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    h.plans.insert(
+        2,
+        FirePlan {
+            fires: vec![(BASE_NS + 600_000_000, 7)],
+            shortfall: 0,
+            cancel: false,
+        },
+    );
+    h.exit_at_ns = Some(BASE_NS + 1_000_000_000);
+    h.exit_code = 0;
+    let (out, post) = h.run();
+    let c = out.unwrap();
+    // The first object was refused, not bypassed: exactly one
+    // loud budget drop, both paths attempted in sorted order.
+    assert_eq!(
+        counter_value(&c, "discovery.relevance_capped"),
+        1,
+        "one budget refusal: {:?}",
+        c.document.counters
+    );
+    let log = post.proc_log.borrow();
+    assert_eq!(
+        log.reads,
+        vec![big_path.clone(), staged_path.clone()],
+        "both paths attempted, oversized first"
+    );
+    assert_eq!(
+        log.read_allowances,
+        vec![(big_path.clone(), budget), (staged_path.clone(), budget)],
+        "first read carries the budget (no exemption); the refused object consumed nothing"
+    );
+    // The round otherwise succeeds: the surviving site attaches
+    // with its calls intact, but the window is PARTIAL — skipped
+    // evidence is typed loss, never a completeness claim.
+    assert_eq!(post.shared.borrow().attached.len(), 1);
+    assert_eq!(c.document.total_calls(), 7);
+    assert!(matches!(c.outcome, Outcome::Partial), "{:?}", c.outcome);
+    assert!(matches!(c.document.status, Completeness::Partial { .. }));
+    for scope in &c.document.coverage {
+        if scope.scope == "legacy" {
+            assert!(
+                matches!(scope.expected, ExpectedScope::NotApplicable),
+                "legacy scope must be untouched: {scope:?}"
+            );
+        } else {
+            assert!(
+                matches!(scope.expected, ExpectedScope::Unknown),
+                "budget loss must taint globally: {scope:?}"
+            );
+        }
+    }
+    for site in &c.document.sites {
+        assert_eq!(
+            site.candidates_coverage,
+            CandidateCoverage::Unknown,
+            "budget loss must revise emitted sites"
+        );
+    }
+}
+
+#[test]
+fn r14_cumulative_two_file_overflow_skips_second() {
+    // Two individually fine objects whose sum exceeds the round
+    // budget: the second read carries the REMAINDER (exact
+    // checked arithmetic, asserted below) and refuses loud. Two
+    // paths only, so the byte cap trips independently of the
+    // file-count cap.
+    let mut h = Harness::fresh("r14-cumulative");
+    h.snapshot_attached();
+    let elf_len = h.bytes.len();
+    let budget = elf_len + elf_len / 2;
+    let other = h.stage.write("a-second.so", &h.bytes.clone());
+    h.files.insert(
+        other.path.clone(),
+        plan::FileBytes {
+            bytes: h.bytes.clone(),
+            dev: other.device,
+            ino: other.ino,
+        },
+    );
+    h.read_budget = budget;
+    h.maps = vec![mapping(&other), mapping(&h.staged)];
+    let staged_path = h.staged.path.clone();
+    let other_path = other.path.clone();
+    assert!(
+        other_path < staged_path,
+        "second ELF must sort first: {other_path} vs {staged_path}"
+    );
+    h.polls.push_back(DiscoveryDelta::default());
+    h.polls.push_back(DiscoveryDelta {
+        candidates: vec![
+            cand(
+                "/p/provider.so",
+                backing_of(&other, h.off),
+                1,
+                11,
+                "SHA-256",
+                false,
+                "ok",
+            ),
+            cand(
+                "/p/provider.so",
+                backing_of(&h.staged, h.off),
+                1,
+                11,
+                "SHA-256",
+                false,
+                "ok",
+            ),
+        ],
+        tables: vec![terminated(1, 0)],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    h.plans.insert(
+        2,
+        FirePlan {
+            fires: vec![(BASE_NS + 600_000_000, 7)],
+            shortfall: 0,
+            cancel: false,
+        },
+    );
+    h.exit_at_ns = Some(BASE_NS + 1_000_000_000);
+    h.exit_code = 0;
+    let (out, post) = h.run();
+    let c = out.unwrap();
+    assert_eq!(
+        counter_value(&c, "discovery.relevance_capped"),
+        1,
+        "one cumulative overflow: {:?}",
+        c.document.counters
+    );
+    let log = post.proc_log.borrow();
+    assert_eq!(
+        log.reads,
+        vec![other_path.clone(), staged_path.clone()],
+        "both paths attempted (byte cap, not file-count cap, fired)"
+    );
+    assert_eq!(
+        log.read_allowances,
+        vec![
+            (other_path.clone(), budget),
+            (staged_path.clone(), budget - elf_len)
+        ],
+        "second read carries the exact remainder"
+    );
+    assert_eq!(post.shared.borrow().attached.len(), 1);
+    assert_eq!(c.document.total_calls(), 7);
+    assert!(matches!(c.outcome, Outcome::Partial), "{:?}", c.outcome);
+    assert!(matches!(c.document.status, Completeness::Partial { .. }));
+    for site in &c.document.sites {
+        assert_eq!(
+            site.candidates_coverage,
+            CandidateCoverage::Unknown,
+            "cumulative overflow must revise emitted sites"
+        );
+    }
+}
+
+#[test]
+fn r14_single_oversized_object_yields_loud_fatal() {
+    // One relevant object past the budget: refused on the first
+    // (only) read — loud misses plus the typed cap loss, fatal
+    // AttachZero, never a completeness claim.
+    let mut h = Harness::fresh("r14-single");
+    h.snapshot_attached();
+    h.read_budget = 64;
+    let staged_path = h.staged.path.clone();
+    h.polls.push_back(DiscoveryDelta::default());
+    h.polls.push_back(DiscoveryDelta {
+        candidates: vec![cand(
+            "/p/provider.so",
+            backing_of(&h.staged, h.off),
+            1,
+            11,
+            "SHA-256",
+            false,
+            "ok",
+        )],
+        tables: vec![terminated(1, 0)],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    let (out, post) = h.run();
+    let c = out.unwrap();
+    assert_eq!(
+        counter_value(&c, "discovery.relevance_capped"),
+        1,
+        "sole object refused loud: {:?}",
+        c.document.counters
+    );
+    let log = post.proc_log.borrow();
+    assert_eq!(log.reads, vec![staged_path.clone()]);
+    assert_eq!(
+        log.read_allowances,
+        vec![(staged_path.clone(), 64)],
+        "even the only read is budgeted"
+    );
+    assert!(post.shared.borrow().attached.is_empty());
+    assert!(matches!(c.outcome, Outcome::Fatal(_)), "{:?}", c.outcome);
+    assert!(has_reason(&c, "missed-attaches"), "{:?}", c.reasons);
+    assert!(c.counters.missed_attaches > 0);
+}
+
+#[test]
+fn r14_within_budget_round_reads_fully() {
+    // Negative control: a budget that fits the round reads
+    // everything — no refusal, no cap loss, COMPLETE (mirrors
+    // clean_exit with budget injection active).
+    let mut h = Harness::fresh("r14-within");
+    h.snapshot_attached();
+    let budget = h.bytes.len() + 1024;
+    h.read_budget = budget;
+    let staged_path = h.staged.path.clone();
+    h.polls.push_back(DiscoveryDelta::default());
+    h.polls.push_back(DiscoveryDelta {
+        candidates: vec![cand(
+            "/p/provider.so",
+            backing_of(&h.staged, h.off),
+            1,
+            11,
+            "SHA-256",
+            false,
+            "ok",
+        )],
+        tables: vec![terminated(1, 0)],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    h.plans.insert(
+        2,
+        FirePlan {
+            fires: vec![(BASE_NS + 600_000_000, 7)],
+            shortfall: 0,
+            cancel: false,
+        },
+    );
+    h.exit_at_ns = Some(BASE_NS + 1_000_000_000);
+    h.exit_code = 0;
+    let (out, post) = h.run();
+    let c = out.unwrap();
+    let log = post.proc_log.borrow();
+    assert_eq!(log.reads, vec![staged_path.clone()]);
+    assert_eq!(
+        log.read_allowances,
+        vec![(staged_path.clone(), budget)],
+        "injection plumbing reaches the read"
+    );
+    assert!(
+        !has_counter(&c, "discovery.relevance_capped"),
+        "no cap loss within budget: {:?}",
+        c.document.counters
+    );
+    assert!(matches!(c.outcome, Outcome::Complete), "{:?}", c.outcome);
+    assert!(matches!(c.document.status, Completeness::Complete));
+    assert_eq!(c.document.total_calls(), 7);
 }
