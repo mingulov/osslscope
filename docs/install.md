@@ -45,11 +45,27 @@ $PREFIX/share/osslscope/install-manifest.json
 The installer reads artifact paths from
 `target/dev-build-manifest.json`; pass `--manifest PATH` to use a
 different build, or `--binary F --harvest F --count F` to install
-explicit operator-built objects. Every object is validated before
-copying: the host binary must be an x86-64 ELF executable and the
-BPF objects eBPF relocatables — anything else fails closed with a
-diagnosis. Installing into `/` or `/usr` is refused: `/usr` is
-system package territory.
+explicit operator-built objects. The complete artifact set is staged
+and validated before anything in the prefix is replaced, so a failed
+install leaves an existing install byte-identical. Manifest-selected
+artifacts must match the recorded `sha256` and byte length — a stale
+manifest or modified bytes fail closed with a rebuild hint. Every
+object is also screened before copying: the host binary must be an
+x86-64 ELF executable and the BPF objects ELF64 little-endian EM_BPF
+relocatables; anything else fails closed with a diagnosis. Whether an
+object is usable for its role stays a loader/`doctor` decision, not the
+installer's. Explicit overrides are screened the same way but never
+hash-checked against the manifest. Installing into `/` or `/usr` is
+refused: `/usr` is system package territory.
+
+`share/osslscope/install-manifest.json` is the install receipt: per
+artifact it records the installed `sha256`/byte length plus how the
+artifact was selected — `manifest-verified` (bytes matched the build
+manifest, whose revision the entry keeps) or `explicit-override` (an
+operator-built object with no recorded revision, so its revision stays
+unknown rather than asserting the manifest's). The receipt's top-level
+revision is set only when every artifact is `manifest-verified`;
+any override leaves it unknown.
 
 Grant capabilities once (needs privilege), then verify:
 
@@ -78,8 +94,9 @@ Diagnostics to know:
 - `NoNewPrivs=1` in the install report or `NNP=1` in `doctor`
   means processes exec'd from that environment cannot gain file
   capabilities — run the installed binary outside it.
-- A stale manifest (artifacts moved or rebuilt elsewhere) fails
-  with a rebuild hint; rerun `scripts/build-dev.sh`.
+- A stale manifest (artifacts moved, rebuilt, or modified after the
+  build so the recorded hashes no longer match) fails with a rebuild
+  hint; rerun `scripts/build-dev.sh`.
 
 ## Debian/Ubuntu (.deb)
 
