@@ -532,6 +532,256 @@ check_elf_reject "$T/bpf-dyn.o" "ET_DYN BPF object" "Type is DYN"
 check_elf_reject "$T/bpf-elf32.o" "ELF32 BPF object" "Class is ELF32"
 check_elf_reject "$T/bpf-be.o" "big-endian BPF object" "big endian"
 
+# ============ fix round: newline-smuggled manifest identities ============
+# A host sha256 field carrying newline-separated values must not supply
+# identities for the other artifacts through positional reads; BPF
+# entries without recorded hashes fail even when the smuggled values
+# would verify.
+mk_variant "$T/v-smuggle"
+python3 - "$T/v-smuggle" <<'EOF'
+import hashlib, json, os, sys
+d = sys.argv[1]
+def ident(p):
+    return hashlib.sha256(open(p, "rb").read()).hexdigest(), os.path.getsize(p)
+hh, hl = ident(d + "/host-bin")
+vh, vl = ident(d + "/harvest.o")
+ch, cl = ident(d + "/count.o")
+p = d + "/manifest.json"
+m = json.load(open(p))
+for a in m["artifacts"]:
+    if a.get("role") == "host-binary":
+        a["sha256"] = "\n".join([hh, str(hl), vh, str(vl), ch, str(cl)])
+    else:
+        a.pop("sha256", None)
+        a.pop("bytes", None)
+json.dump(m, open(p, "w"), indent=2, sort_keys=True)
+EOF
+if "$SH_BIN" "$INSTALL" --manifest "$T/v-smuggle/manifest.json" --prefix "$T/pfxv" >"$T/out" 2>&1; then
+    bad "newline-smuggled manifest identities fail (got exit 0)"
+else
+    grep -q 'sha256\|newline' "$T/out" \
+        && ok "newline-smuggled identities fail closed with identity diagnosis" \
+        || bad "newline-smuggled identities fail closed with identity diagnosis (saw: $(head -1 "$T/out"))"
+    snapshot_prefix "$T/pfxv" "$T/pfxv.now"
+    cmp -s "$T/pfxv.snap" "$T/pfxv.now" \
+        && ok "smuggled-identity failure leaves existing prefix unchanged" \
+        || bad "smuggled-identity failure leaves existing prefix unchanged"
+fi
+
+# ============ fix round: aliased destinations keep verified identities ============
+# Distinct harvest/count bytes; existing destinations aliased (symlink and
+# hardlink). Reinstall must succeed with each destination holding its own
+# verified bytes and the receipt matching the verified staged sources.
+mk_variant "$T/v-distinct"
+python3 - "$T/v-distinct" <<'EOF'
+import hashlib, json, os, sys
+d = sys.argv[1]
+for name, pad in (("harvest.o", b"-harvest-pad"), ("count.o", b"-count-pad--")):
+    p = d + "/" + name
+    with open(p, "ab") as f:
+        f.write(pad)
+p = d + "/manifest.json"
+m = json.load(open(p))
+for a in m["artifacts"]:
+    a["sha256"] = hashlib.sha256(open(a["path"], "rb").read()).hexdigest()
+    a["bytes"] = os.path.getsize(a["path"])
+json.dump(m, open(p, "w"), indent=2, sort_keys=True)
+EOF
+check_aliased_reinstall() {
+    if "$SH_BIN" "$INSTALL" --manifest "$T/v-distinct/manifest.json" --prefix "$2" >/dev/null 2>&1; then
+        ok "setup: good distinct-bytes install into $1-alias prefix"
+    else
+        bad "setup: good distinct-bytes install into $1-alias prefix"
+        return 0
+    fi
+    rm "$2/lib/osslscope/osslscope-count"
+    if [ "$1" = "symlink" ]; then
+        ln -s osslscope-harvest "$2/lib/osslscope/osslscope-count"
+    else
+        ln "$2/lib/osslscope/osslscope-harvest" "$2/lib/osslscope/osslscope-count"
+    fi
+    if "$SH_BIN" "$INSTALL" --manifest "$T/v-distinct/manifest.json" --prefix "$2" >"$T/out" 2>&1; then
+        ok "reinstall over $1-aliased destinations exits 0"
+    else
+        bad "reinstall over $1-aliased destinations exits 0 (rc=$?; $(head -1 "$T/out"))"
+        return 0
+    fi
+    if cmp -s "$T/v-distinct/harvest.o" "$2/lib/osslscope/osslscope-harvest" \
+       && cmp -s "$T/v-distinct/count.o" "$2/lib/osslscope/osslscope-count"; then
+        ok "$1 alias: each destination holds its own verified bytes"
+    else
+        bad "$1 alias: each destination holds its own verified bytes"
+    fi
+    if python3 -c "
+import hashlib, json
+m = json.load(open('$2/share/osslscope/install-manifest.json'))
+h = {a.get('bin', a['role']): a for a in m['artifacts']}
+for name in ('osslscope-harvest', 'osslscope-count'):
+    src = '$T/v-distinct/' + name.split('-')[1] + '.o'
+    want = hashlib.sha256(open(src, 'rb').read()).hexdigest()
+    assert h[name]['sha256'] == want, (name, h[name]['sha256'], want)
+" 2>"$T/err"; then
+        ok "$1 alias: receipt hashes match the verified staged sources"
+    else
+        bad "$1 alias: receipt hashes match the verified staged sources ($(cat "$T/err"))"
+    fi
+}
+check_aliased_reinstall symlink "$T/pfxa-sym"
+check_aliased_reinstall hardlink "$T/pfxa-hard"
+
+# ============ fix round: final-write fault controls ============
+# Post-validation write failures (artifact copy, chmod, receipt publish)
+# fail deterministically; the receipt publish is atomic so a failure
+# never leaves a truncated receipt.
+REAL_CP="$(command -v cp)"
+mk_tool_farm() {
+    mkdir -p "$1"
+    for tool in python3 file readelf cp mkdir chmod mktemp mv cmp rm grep awk sed cat realpath; do
+        dest="$(command -v "$tool")" || { echo "test prereq missing: $tool" >&2; exit 1; }
+        ln -sf "$dest" "$1/$tool"
+    done
+}
+mk_tool_farm "$T/faultbin-cp"
+rm "$T/faultbin-cp/cp"
+cat >"$T/faultbin-cp/cp" <<EOF
+#!/bin/sh
+: "\${FAIL_CP_PREFIX:?test bug: FAIL_CP_PREFIX unset}"
+for _a in "\$@"; do
+    case "\$_a" in
+        "\$FAIL_CP_PREFIX"*) echo "fault-injected cp failure: \$_a" >&2; exit 1 ;;
+    esac
+done
+exec "$REAL_CP" "\$@"
+EOF
+chmod +x "$T/faultbin-cp/cp"
+
+# Artifact-copy failure at replacement start: deterministic error, prefix kept.
+if "$SH_BIN" "$INSTALL" --manifest "$T/manifest.json" --prefix "$T/pfxc" >/dev/null 2>&1; then
+    ok "setup: good install into copy-fault prefix"
+else
+    bad "setup: good install into copy-fault prefix"
+fi
+snapshot_prefix "$T/pfxc" "$T/pfxc.snap"
+if FAIL_CP_PREFIX="$T/pfxc" PATH="$T/faultbin-cp:$PATH" "$SH_BIN" "$INSTALL" \
+        --manifest "$T/manifest.json" --prefix "$T/pfxc" >"$T/out" 2>&1; then
+    bad "artifact-copy fault fails (got exit 0)"
+else
+    grep -q 'cannot install' "$T/out" \
+        && ok "artifact-copy fault fails with install diagnosis" \
+        || bad "artifact-copy fault fails with install diagnosis (saw: $(head -1 "$T/out"))"
+    snapshot_prefix "$T/pfxc" "$T/pfxc.now"
+    cmp -s "$T/pfxc.snap" "$T/pfxc.now" \
+        && ok "artifact-copy fault leaves existing prefix unchanged" \
+        || bad "artifact-copy fault leaves existing prefix unchanged"
+fi
+
+# Artifact-copy failure mid-replacement: the install stops; already
+# replaced artifacts keep validated bytes, the failed artifact and the
+# receipt keep prior bytes (rerun to complete).
+mk_variant "$T/v-new"
+python3 -c "
+import hashlib, json
+d = '$T/v-new'
+open(d + '/harvest.o', 'ab').write(b'-new-bytes-harvest')
+open(d + '/count.o', 'ab').write(b'-new-bytes-count--')
+open(d + '/host-bin', 'ab').write(b'new')
+p = d + '/manifest.json'
+m = json.load(open(p))
+for a in m['artifacts']:
+    a['sha256'] = hashlib.sha256(open(a['path'], 'rb').read()).hexdigest()
+    import os
+    a['bytes'] = os.path.getsize(a['path'])
+json.dump(m, open(p, 'w'), indent=2, sort_keys=True)
+"
+if "$SH_BIN" "$INSTALL" --manifest "$T/manifest.json" --prefix "$T/pfxm2" >/dev/null 2>&1; then
+    ok "setup: good install into mid-replacement prefix"
+else
+    bad "setup: good install into mid-replacement prefix"
+fi
+cp "$T/pfxm2/share/osslscope/install-manifest.json" "$T/pfxm2.receipt-orig"
+if FAIL_CP_PREFIX="$T/pfxm2/lib/osslscope/osslscope-count" PATH="$T/faultbin-cp:$PATH" "$SH_BIN" "$INSTALL" \
+        --manifest "$T/v-new/manifest.json" --prefix "$T/pfxm2" >"$T/out" 2>&1; then
+    bad "mid-replacement copy fault fails (got exit 0)"
+else
+    grep -q 'cannot install' "$T/out" \
+        && ok "mid-replacement copy fault fails with install diagnosis" \
+        || bad "mid-replacement copy fault fails with install diagnosis (saw: $(head -1 "$T/out"))"
+    cmp -s "$T/v-new/host-bin" "$T/pfxm2/bin/osslscope" \
+        && ok "mid-replacement fault: replaced artifact keeps validated bytes" \
+        || bad "mid-replacement fault: replaced artifact keeps validated bytes"
+    cmp -s "$T/count.o" "$T/pfxm2/lib/osslscope/osslscope-count" \
+        && ok "mid-replacement fault: failed artifact keeps prior bytes" \
+        || bad "mid-replacement fault: failed artifact keeps prior bytes"
+    cmp -s "$T/pfxm2.receipt-orig" "$T/pfxm2/share/osslscope/install-manifest.json" \
+        && ok "mid-replacement fault: receipt keeps prior bytes" \
+        || bad "mid-replacement fault: receipt keeps prior bytes"
+fi
+
+# chmod failure during replacement: deterministic permissions error.
+mk_tool_farm "$T/faultbin-chmod"
+rm "$T/faultbin-chmod/chmod"
+cat >"$T/faultbin-chmod/chmod" <<'EOF'
+#!/bin/sh
+echo "fault-injected chmod failure" >&2
+exit 1
+EOF
+chmod +x "$T/faultbin-chmod/chmod"
+if "$SH_BIN" "$INSTALL" --manifest "$T/manifest.json" --prefix "$T/pfxh" >/dev/null 2>&1; then
+    ok "setup: good install into chmod-fault prefix"
+else
+    bad "setup: good install into chmod-fault prefix"
+fi
+snapshot_prefix "$T/pfxh" "$T/pfxh.snap"
+if PATH="$T/faultbin-chmod:$PATH" "$SH_BIN" "$INSTALL" \
+        --manifest "$T/manifest.json" --prefix "$T/pfxh" >"$T/out" 2>&1; then
+    bad "chmod fault fails (got exit 0)"
+else
+    grep -q 'cannot set permissions' "$T/out" \
+        && ok "chmod fault fails with permissions diagnosis" \
+        || bad "chmod fault fails with permissions diagnosis (saw: $(head -1 "$T/out"))"
+    snapshot_prefix "$T/pfxh" "$T/pfxh.now"
+    cmp -s "$T/pfxh.snap" "$T/pfxh.now" \
+        && ok "chmod fault leaves existing prefix unchanged" \
+        || bad "chmod fault leaves existing prefix unchanged"
+fi
+
+# Receipt-publish failure: deterministic error and the prior receipt kept
+# byte-identical (atomic temp-file + rename publish).
+if "$SH_BIN" "$INSTALL" --manifest "$T/manifest.json" --prefix "$T/pfxr" >/dev/null 2>&1; then
+    ok "setup: good install into receipt-fault prefix"
+else
+    bad "setup: good install into receipt-fault prefix"
+fi
+cp "$T/pfxr/share/osslscope/install-manifest.json" "$T/pfxr.receipt-orig"
+mkdir "$T/pfxr/share/osslscope/install-manifest.json.install-tmp"
+if "$SH_BIN" "$INSTALL" --manifest "$T/manifest.json" --prefix "$T/pfxr" >"$T/out" 2>&1; then
+    bad "blocked receipt publish fails (got exit 0)"
+else
+    grep -qi 'receipt' "$T/out" \
+        && ok "blocked receipt publish fails with receipt diagnosis" \
+        || bad "blocked receipt publish fails with receipt diagnosis (saw: $(head -1 "$T/out"))"
+    cmp -s "$T/pfxr.receipt-orig" "$T/pfxr/share/osslscope/install-manifest.json" \
+        && ok "blocked receipt publish keeps the prior receipt byte-identical" \
+        || bad "blocked receipt publish keeps the prior receipt byte-identical"
+fi
+rmdir "$T/pfxr/share/osslscope/install-manifest.json.install-tmp" || true
+
+# Receipt path unusable (a directory): deterministic receipt error, no success.
+if "$SH_BIN" "$INSTALL" --manifest "$T/manifest.json" --prefix "$T/pfxr2" >/dev/null 2>&1; then
+    ok "setup: good install into receipt-path prefix"
+else
+    bad "setup: good install into receipt-path prefix"
+fi
+rm "$T/pfxr2/share/osslscope/install-manifest.json"
+mkdir "$T/pfxr2/share/osslscope/install-manifest.json"
+if "$SH_BIN" "$INSTALL" --manifest "$T/manifest.json" --prefix "$T/pfxr2" >"$T/out" 2>&1; then
+    bad "unwritable receipt path fails (got exit 0)"
+else
+    grep -qi 'receipt' "$T/out" \
+        && ok "unwritable receipt path fails with receipt diagnosis" \
+        || bad "unwritable receipt path fails with receipt diagnosis (saw: $(head -1 "$T/out"))"
+fi
+
 # ============ --setcap matrix ============
 mkdir -p "$T/stubbin"
 cat >"$T/stubbin/setcap" <<'EOF'
@@ -566,7 +816,7 @@ fi
 # installer needs except setcap/getcap (a bare /usr/bin:/bin still carries
 # setcap on merged-usr platforms).
 mkdir -p "$T/nocapbin"
-for tool in python3 file readelf cp mkdir chmod mktemp rm grep awk sed cat realpath; do
+for tool in python3 file readelf cp mkdir chmod mktemp mv cmp rm grep awk sed cat realpath; do
     dest="$(command -v "$tool")" || { echo "test prereq missing: $tool" >&2; exit 1; }
     ln -s "$dest" "$T/nocapbin/$tool"
 done
