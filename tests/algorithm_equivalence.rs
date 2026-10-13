@@ -116,15 +116,15 @@ fn classify_list(table: &HashMap<u64, wire::AlgClassValue>, names: &str) -> (Str
     (label, v.weak, status)
 }
 
-/// Adapt one classified candidate through production `adapt_delta`.
-/// Returns the discovered site's candidates + coverage.
-fn adapt_one(
+/// Adapt arrivals through production `adapt_delta`: one
+/// [`DiscoveredCandidate`] per `(class, weak, status)` triple, same
+/// triple, same poll. Returns the discovered site's candidates +
+/// coverage.
+fn adapt_many(
     staged: &Staged,
     live: &[Mapping],
     op: u32,
-    class: &str,
-    weak: bool,
-    status: &str,
+    arrivals: &[(String, bool, String)],
     offset: u64,
 ) -> (
     Vec<osslscope::evidence::CandidateIdentity>,
@@ -134,20 +134,23 @@ fn adapt_one(
     let fresh: HashSet<(String, u64)> = HashSet::new();
     let mut state = AdapterState::default();
     let delta = DiscoveryDelta {
-        candidates: vec![DiscoveredCandidate {
-            advertising: staged.path.clone(),
-            advertising_dev: String::new(),
-            advertising_ino: 0,
-            backing: backing_of(staged, offset),
-            op,
-            funcid: 7,
-            class: class.to_string(),
-            weak,
-            status: status.to_string(),
-            epoch: 0,
-            impl_addr: 0,
-            arr: 0,
-        }],
+        candidates: arrivals
+            .iter()
+            .map(|(class, weak, status)| DiscoveredCandidate {
+                advertising: staged.path.clone(),
+                advertising_dev: String::new(),
+                advertising_ino: 0,
+                backing: backing_of(staged, offset),
+                op,
+                funcid: 7,
+                class: class.clone(),
+                weak: *weak,
+                status: status.clone(),
+                epoch: 0,
+                impl_addr: 0,
+                arr: 0,
+            })
+            .collect(),
         tables: vec![terminated(op, 0)],
         ..DiscoveryDelta::default()
     };
@@ -166,6 +169,29 @@ fn adapt_one(
     assert_eq!(adapted.delta.discovered.len(), 1);
     let site = &adapted.delta.discovered[0];
     (site.candidates.clone(), site.candidates_coverage)
+}
+
+/// Adapt one classified candidate through production `adapt_delta`.
+/// Returns the discovered site's candidates + coverage.
+fn adapt_one(
+    staged: &Staged,
+    live: &[Mapping],
+    op: u32,
+    class: &str,
+    weak: bool,
+    status: &str,
+    offset: u64,
+) -> (
+    Vec<osslscope::evidence::CandidateIdentity>,
+    CandidateCoverage,
+) {
+    adapt_many(
+        staged,
+        live,
+        op,
+        &[(class.to_string(), weak, status.to_string())],
+        offset,
+    )
 }
 
 fn exact_window() -> CaptureWindow {
@@ -246,8 +272,46 @@ fn doc_for_alias(
     (doc, label, weak, status)
 }
 
+/// Run one mixed alias list end-to-end with its finite alternatives
+/// enumerated: classify the full list (production verdict), classify
+/// each `:` segment (production per-alternative identity), adapt one
+/// mixed-sourced arrival per recognized alternative (the row's `mixed`
+/// verdict rides every arrival — status is per provider row, one
+/// verdict per `(arr, idx)` slot — with the class/weak of its
+/// enumerated alternative), finalize with 7 calls. Returns the
+/// finalized document plus the full-list status.
+fn doc_for_mixed_alternatives(
+    stage_tag: &str,
+    op: u32,
+    alias: &str,
+    offset: u64,
+) -> (CaptureDocument, String) {
+    let table: HashMap<u64, wire::AlgClassValue> =
+        build_alg_entries().unwrap().into_iter().collect();
+    let (_, _, status) = classify_list(&table, alias);
+    let mut alternatives = Vec::new();
+    for seg in alias.split(':') {
+        let (label, weak, seg_status) = classify_list(&table, seg);
+        assert_eq!(
+            seg_status, "ok",
+            "every enumerated alternative must be a recognized spelling: {seg:?} in {alias:?}"
+        );
+        alternatives.push((label, weak, "mixed".to_string()));
+    }
+    let stage = Stage::fresh(stage_tag);
+    let bytes = self_bytes();
+    let staged = stage.write("prov.so", &bytes);
+    let live = vec![mapping(&staged)];
+    let (candidates, coverage) = adapt_many(&staged, &live, op, &alternatives, offset);
+    let site = site_with_calls(&staged, offset, candidates, coverage, 7);
+    let doc = complete_doc(vec![site]);
+    (doc, status)
+}
+
 const KEM_OP: u32 = 14;
 const DIGEST_OP: u32 = 1;
+const CIPHER_OP: u32 = 2;
+const KEYMGMT_OP: u32 = 10;
 
 #[test]
 fn synonyms_match_every_admitted_spelling() {
@@ -433,8 +497,103 @@ fn synonyms_match_every_admitted_spelling() {
 }
 
 #[test]
+fn stock_provider_alias_rows_stay_ok() {
+    // Verbatim OSSL_ALGORITHM rows from the pinned provider census
+    // (host OpenSSL 3.5.5, default provider, 2026-10-13; row strings
+    // copied character-for-character, expectations hardcoded — never
+    // derived via `kinds::algorithm_semantic_id`). Ordinary stock
+    // alias lists must classify OK with definite attribution in a
+    // COMPLETE document, in either alias order.
+    let rows: &[(&str, u32, &[&str])] = &[
+        (
+            "AES-128-GCM:id-aes128-GCM:2.16.840.1.101.3.4.1.6",
+            CIPHER_OP,
+            &["AES-128-GCM", "id-aes128-GCM", "2.16.840.1.101.3.4.1.6"],
+        ),
+        (
+            "AES-128-CBC:AES128:2.16.840.1.101.3.4.1.2",
+            CIPHER_OP,
+            &["AES-128-CBC", "AES128", "2.16.840.1.101.3.4.1.2"],
+        ),
+        (
+            "AES-256-CBC:AES256:2.16.840.1.101.3.4.1.42",
+            CIPHER_OP,
+            &["AES-256-CBC", "AES256", "2.16.840.1.101.3.4.1.42"],
+        ),
+        (
+            "SM3:1.2.156.10197.1.401",
+            DIGEST_OP,
+            &["SM3", "1.2.156.10197.1.401"],
+        ),
+        (
+            "RSA:rsaEncryption:1.2.840.113549.1.1.1",
+            KEYMGMT_OP,
+            &["RSA", "rsaEncryption", "1.2.840.113549.1.1.1"],
+        ),
+        (
+            "DES-EDE3-CBC:DES3:1.2.840.113549.3.7",
+            CIPHER_OP,
+            &["DES-EDE3-CBC", "DES3", "1.2.840.113549.3.7"],
+        ),
+    ];
+    for (row, op, spellings) in rows {
+        for ordered in [
+            row.to_string(),
+            row.split(':').rev().collect::<Vec<_>>().join(":"),
+        ] {
+            let (doc, label, weak, status) = doc_for_alias("stock", *op, &ordered, 0xB00);
+            assert_eq!(status, "ok", "stock row must stay OK: {ordered:?}");
+            assert!(!weak, "stock row is not weak: {ordered:?}");
+            assert!(
+                spellings.contains(&label.as_str()),
+                "min label {label:?} must be a row member for {ordered:?}"
+            );
+            assert!(
+                matches!(doc.status, Completeness::Complete),
+                "stock row stays COMPLETE: {ordered:?}"
+            );
+            for spelling in *spellings {
+                let req = PolicyRule::require_executed(spelling);
+                let v = evaluate_document(std::slice::from_ref(&req), &doc);
+                assert_eq!(
+                    v.rules[0].bounds.definite, 7,
+                    "require {spelling:?} over {ordered:?}"
+                );
+                assert_eq!(
+                    v.rules[0].bounds.possible,
+                    Some(7),
+                    "require {spelling:?} over {ordered:?}"
+                );
+                assert_eq!(
+                    v.rules[0].verdict,
+                    RuleVerdict::Pass,
+                    "require {spelling:?} over {ordered:?}"
+                );
+                let deny = PolicyRule::deny_algorithm(spelling);
+                let v = evaluate_document(std::slice::from_ref(&deny), &doc);
+                assert_eq!(
+                    v.rules[0].bounds.definite, 7,
+                    "deny {spelling:?} over {ordered:?}"
+                );
+                assert_eq!(
+                    v.rules[0].verdict,
+                    RuleVerdict::Violation,
+                    "deny {spelling:?} over {ordered:?}"
+                );
+            }
+            assert_eq!(cbom_assets(&doc).len(), 1, "row {ordered:?}");
+            assert_eq!(doc.total_calls(), 7, "row {ordered:?}");
+        }
+    }
+}
+
+#[test]
 fn same_family_distinct_algorithms_are_not_definite() {
     // Same macro family, distinct semantics: no definite either way.
+    // The full list mixes (production classifier verdict); its finite
+    // alternatives enumerate to a COMPLETE ambiguous site: definite 0,
+    // finite upper Some(7) per alternative, no definite CBOM asset,
+    // total 7.
     let cases: &[(&str, u32, &[&str])] = &[
         (
             "ML-KEM-512:ML-KEM-768",
@@ -452,12 +611,17 @@ fn same_family_distinct_algorithms_are_not_definite() {
             alias.to_string(),
             alias.split(':').rev().collect::<Vec<_>>().join(":"),
         ] {
-            let (doc, _label, _weak, status) = doc_for_alias("diff", *op, &ordered, 0x600);
+            let (doc, status) = doc_for_mixed_alternatives("diff", *op, &ordered, 0x600);
             assert_eq!(
                 status, "mixed",
                 "distinct family members must mix: {ordered:?}"
             );
-            // No definite alternative in either direction.
+            assert!(
+                matches!(doc.status, Completeness::Complete),
+                "finite alternatives stay COMPLETE: {ordered:?}"
+            );
+            // No definite alternative in either direction; the finite
+            // upper per alternative is the 7 observed calls.
             for spelling in *spellings {
                 for rule in [
                     PolicyRule::require_executed(spelling),
@@ -466,6 +630,12 @@ fn same_family_distinct_algorithms_are_not_definite() {
                     let v = evaluate_document(std::slice::from_ref(&rule), &doc);
                     assert_eq!(
                         v.rules[0].bounds.definite, 0,
+                        "{} {spelling:?} over {ordered:?}",
+                        rule.name
+                    );
+                    assert_eq!(
+                        v.rules[0].bounds.possible,
+                        Some(7),
                         "{} {spelling:?} over {ordered:?}",
                         rule.name
                     );
@@ -480,14 +650,6 @@ fn same_family_distinct_algorithms_are_not_definite() {
             // Physical-site conservation: 7 calls total, no definite asset.
             assert_eq!(doc.total_calls(), 7, "{ordered:?}");
             assert_eq!(cbom_assets(&doc).len(), 0, "{ordered:?}");
-            // The mixed site keeps its 7 observed calls as possible
-            // use (unknown upper over an incomplete set renders None;
-            // the conserved total stays 7).
-            let v = evaluate_document(
-                std::slice::from_ref(&PolicyRule::require_executed(spellings[0])),
-                &doc,
-            );
-            assert_eq!(v.rules[0].bounds.possible, None, "{ordered:?}");
         }
     }
 
