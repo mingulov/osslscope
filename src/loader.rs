@@ -317,31 +317,22 @@ pub const HARVEST_PROGS: [ProgSpec; 15] = [
     },
 ];
 
-/// Frozen member shape (P7 item 3): dims asserted vs
+/// Frozen member shape (P7 item 3, stage D): dims asserted vs
 /// `osslscope-members` by `prepare`, fail-closed on drift. The
-/// first 7 mirror harvest dims; TERMD/LGCALLS/QUERY_NEXT are
-/// deliberately absent (v1 never proves, single-site CALLS only,
-/// no cursor — every scan is full). The scan plane
-/// (SCAN/SEQ/BIRTH/RCOUNT/T_CACHE/CTRL/ATTEMPT) arrives with item
-/// 3; members.o drops its PENDING_QUERY scaffold in stage D when
-/// members switch to SCAN (stage C keeps it under entry-owned
-/// lifecycle, R18 §6.1; the harvest path's cursor maps retire in
-/// item 9).
-pub const MEMBER_MAPS: [MapSpec; 14] = [
+/// first 6 mirror harvest dims; TERMD/LGCALLS/QUERY_NEXT are
+/// deliberately absent (single-site CALLS only, no cursor — every
+/// scan is full; termination proof is the item-4 join's job). The
+/// scan plane (SCAN/SEQ/BIRTH/RCOUNT/T_CACHE/CTRL/ATTEMPT)
+/// arrives with item 3; members.o dropped its PENDING_QUERY
+/// scaffold in stage D when members switched to SCAN (R18 §6.1;
+/// the harvest path's cursor maps retire in item 9).
+pub const MEMBER_MAPS: [MapSpec; 13] = [
     MapSpec {
         name: "EVENTS",
         map_type: 27,
         key_size: 0,
         value_size: 0,
         max_entries: 1 << 21,
-        flags: 0,
-    },
-    MapSpec {
-        name: "PENDING_QUERY",
-        map_type: 1,
-        key_size: 8,
-        value_size: 16,
-        max_entries: 1024,
         flags: 0,
     },
     MapSpec {
@@ -3681,10 +3672,14 @@ mod tests {
 
     #[test]
     fn member_map_count_covers_scan_plane() {
-        // The spec count is the prepare-time contract: 7 item-2
-        // maps + the 7 scan-plane maps (stage C keeps PENDING —
-        // entry-owned lifecycle, R18 §6.1; D drops it → 13).
-        assert_eq!(MEMBER_MAPS.len(), 14);
+        // The spec count is the prepare-time contract: 6 retained
+        // maps + the 7 scan-plane maps (stage D dropped PENDING —
+        // R18 §6.1 — → 13).
+        assert_eq!(MEMBER_MAPS.len(), 13);
+        assert!(
+            MEMBER_MAPS.iter().all(|m| m.name != "PENDING_QUERY"),
+            "PENDING dropped in D"
+        );
         for name in [
             "SCAN", "SEQ", "BIRTH", "RCOUNT", "T_CACHE", "CTRL", "ATTEMPT",
         ] {

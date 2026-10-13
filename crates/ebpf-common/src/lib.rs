@@ -568,41 +568,47 @@ const _: () = assert!(align_of::<ScanCallEvent>() == 8);
 /// admitted invocation, emitted early (a slot-0 read abort must
 /// still present RET, else HOLE-0 is indistinguishable from
 /// abort). rv == 0 sets EMPTY (COMPLETE-EMPTY, members 1..511
-/// silent). 32 bytes.
+/// silent). (tid,seq) join keys (stage D reshape, R18 §2/§6.8 —
+/// the item-4 oracle cannot join uncorrelated RETs to CALLs).
+/// 40 bytes.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScanRetEvent {
     pub kind: u32,
     pub op: u32,
     pub flags: u32,
-    pub _pad: u32,
+    pub tid: u32,
+    pub seq: u64,
     pub arr: u64,
     pub generation: u64,
 }
 
-const _: () = assert!(size_of::<ScanRetEvent>() == 32);
+const _: () = assert!(size_of::<ScanRetEvent>() == 40);
 const _: () = assert!(align_of::<ScanRetEvent>() == 8);
 
 /// `ScanRetEvent.flags`: rv == 0 (COMPLETE-EMPTY).
 pub const RET_FLAG_EMPTY: u32 = 1 << 0;
 
 /// 511-guard verdict (P7 item 3, §5.3 T = 512 exception): member
-/// 511 also reads slot 512 on warm-T==512 scans. EMPTY = clean-full
-/// proof; VALID = contract violation (TRUNC_ALGS too); ERROR =
+/// 511 also reads slot 512 on guard-eligible scans. EMPTY =
+/// clean-full proof; VALID = contract violation (TRUNC_ALGS too —
+/// guard-VALID-exclusive in D); ERROR =
 /// read-abort/UNKNOWN-TERMINATOR (LOSS_GUARD_READ_ABORT too,
-/// re-covers on retry). 32 bytes.
+/// re-covers on retry). (tid,seq) join keys (stage D reshape).
+/// 40 bytes.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GuardEvent {
     pub kind: u32,
     pub op: u32,
     pub verdict: u32,
-    pub _pad: u32,
+    pub tid: u32,
+    pub seq: u64,
     pub arr: u64,
     pub generation: u64,
 }
 
-const _: () = assert!(size_of::<GuardEvent>() == 32);
+const _: () = assert!(size_of::<GuardEvent>() == 40);
 const _: () = assert!(align_of::<GuardEvent>() == 8);
 
 pub const GUARD_EMPTY: u32 = 0;
@@ -1322,6 +1328,60 @@ mod tests {
     }
 
     #[test]
+    fn scan_stage_d_wire() {
+        // P7 item-3 D (R18 §2/§6.14): RET/GUARD reshape to 40B with
+        // their producer (tid u32, seq u64 — the item-4 oracle
+        // cannot join them to CALLs otherwise). Exact layouts:
+        // {kind, op, flags|verdict, tid, seq, arr, gen}.
+        assert_eq!(size_of::<ScanRetEvent>(), 40, "D RET is 40B");
+        assert_eq!(size_of::<GuardEvent>(), 40, "D GUARD is 40B");
+        assert_eq!(align_of::<ScanRetEvent>(), 8);
+        assert_eq!(align_of::<GuardEvent>(), 8);
+        // Field offsets (the decoder/layout contract — BPF writes
+        // positional fields, the host joins on (tid,seq)).
+        let ret = ScanRetEvent {
+            kind: KIND_SCAN_RET,
+            op: 3,
+            flags: RET_FLAG_EMPTY,
+            tid: 4242,
+            seq: make_seq(7, 9),
+            arr: 0x5000,
+            generation: 11,
+        };
+        let rb = struct_bytes::<_, 40>(&ret);
+        assert_eq!(
+            u32::from_le_bytes(rb[12..16].try_into().unwrap()),
+            4242,
+            "RET tid @12"
+        );
+        assert_eq!(
+            u64::from_le_bytes(rb[16..24].try_into().unwrap()),
+            make_seq(7, 9),
+            "RET seq @16"
+        );
+        let guard = GuardEvent {
+            kind: KIND_GUARD,
+            op: 3,
+            verdict: GUARD_VALID,
+            tid: 4243,
+            seq: make_seq(7, 10),
+            arr: 0x5000,
+            generation: 11,
+        };
+        let gb = struct_bytes::<_, 40>(&guard);
+        assert_eq!(
+            u32::from_le_bytes(gb[12..16].try_into().unwrap()),
+            4243,
+            "GUARD tid @12"
+        );
+        assert_eq!(
+            u64::from_le_bytes(gb[16..24].try_into().unwrap()),
+            make_seq(7, 10),
+            "GUARD seq @16"
+        );
+    }
+
+    #[test]
     fn scan_wire_shapes() {
         // Map-value + event layouts (P7 item 3 §2): exact wire.
         assert_eq!(size_of::<ScanRec>(), 40);
@@ -1330,8 +1390,8 @@ mod tests {
         assert_eq!(size_of::<CtrlValue>(), 24);
         assert_eq!(align_of::<CtrlValue>(), 8);
         assert_eq!(size_of::<ScanCallEvent>(), 24);
-        assert_eq!(size_of::<ScanRetEvent>(), 32);
-        assert_eq!(size_of::<GuardEvent>(), 32);
+        assert_eq!(size_of::<ScanRetEvent>(), 40, "D reshape");
+        assert_eq!(size_of::<GuardEvent>(), 40, "D reshape");
         assert_eq!(
             (KIND_SCAN_CALL, KIND_SCAN_RET, KIND_GUARD),
             (7, 8, 9),
@@ -1508,21 +1568,23 @@ mod tests {
             kind: KIND_SCAN_RET,
             op: 3,
             flags: RET_FLAG_EMPTY,
-            _pad: 0,
+            tid: 4242,
+            seq: make_seq(7, 9),
             arr: 0x5000,
             generation: 0,
         };
-        let rb = struct_bytes::<_, 32>(&ret);
+        let rb = struct_bytes::<_, 40>(&ret);
         assert_eq!(parse_scan_ret_event(&rb), Ok(ret));
         let guard = GuardEvent {
             kind: KIND_GUARD,
             op: 3,
             verdict: GUARD_VALID,
-            _pad: 0,
+            tid: 4242,
+            seq: make_seq(7, 9),
             arr: 0x5000,
             generation: 0,
         };
-        let gb = struct_bytes::<_, 32>(&guard);
+        let gb = struct_bytes::<_, 40>(&guard);
         assert_eq!(parse_guard_event(&gb), Ok(guard));
         // Rejections: short, wrong kind, out-of-range cause /
         // verdict, nonzero reserved flag bits.
