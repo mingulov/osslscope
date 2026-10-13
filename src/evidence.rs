@@ -419,7 +419,9 @@ pub struct FencedGeneration {
     pub sites: Vec<SiteExecution>,
 }
 
-/// Fatal observation failure: nothing usable was captured.
+/// Fatal observation failure. Every kind discards the window's
+/// observations except [`FatalKind::Runtime`], which salvages them
+/// (see [`CaptureDocument::has_usable_evidence`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FatalKind {
     Recycled,
@@ -706,6 +708,20 @@ impl CaptureDocument {
         self.fenced.iter().fold(current, |acc, g| {
             acc.saturating_add(SiteExecution::sum_calls(&g.sites))
         })
+    }
+
+    /// Fatal-kind usability: salvaged Runtime-fatal documents retain
+    /// their observed sites for policy evaluation, semantic validation
+    /// and CBOM export; every other fatal kind discarded every
+    /// observation. Non-fatal documents are usable. This gates
+    /// eligibility only — per-site certainty/coverage tests still decide
+    /// definite vs possible use, so a usable Runtime site is not
+    /// automatically definite.
+    pub fn has_usable_evidence(&self) -> bool {
+        match &self.status {
+            Completeness::Complete | Completeness::Partial { .. } => true,
+            Completeness::Fatal { kind, .. } => matches!(kind, FatalKind::Runtime(_)),
+        }
     }
 
     /// Gap reasons; empty for COMPLETE and (by construction) for fatal

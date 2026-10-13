@@ -1118,8 +1118,12 @@ fn check_records(
     }
     // Policy verdict is the AND of its rules: any violation rules
     // the verdict a violation, else any inconclusive rules it
-    // inconclusive, else pass. `no-verdict` rides FATAL documents
-    // only (and FATAL documents with policy carry exactly that).
+    // inconclusive, else pass. `no-verdict` rides evidence-free
+    // documents only (non-Runtime fatal kinds); usable documents —
+    // including salvaged Runtime-fatal ones — carry the combined
+    // verdict. This mirrors `CaptureDocument::has_usable_evidence`
+    // (the JSON shape cannot call the helper, so the kind check is
+    // restated here and must stay in sync with it).
     if let Some(policy) = root.get("policy") {
         let policy_obj = policy
             .as_object()
@@ -1148,12 +1152,24 @@ fn check_records(
         } else {
             "pass"
         };
-        if status == "FATAL" {
+        // Fatal-kind usability restated over the validated JSON
+        // shape (fatal kinds were validated above, so this lookup
+        // cannot meet a malformed kind here).
+        let usable = status != "FATAL"
+            || root["completeness"]
+                .get("fatal_kind")
+                .and_then(|v| v.as_object())
+                .and_then(|o| o.get("kind"))
+                .and_then(|v| v.as_str())
+                == Some("runtime");
+        if !usable {
             if verdict != "no-verdict" {
-                return Err("doc.policy: FATAL documents carry no-verdict".to_string());
+                return Err(
+                    "doc.policy: evidence-free FATAL documents carry no-verdict".to_string()
+                );
             }
         } else if verdict == "no-verdict" {
-            return Err("doc.policy: no-verdict on a non-fatal document".to_string());
+            return Err("doc.policy: no-verdict on a document with usable evidence".to_string());
         } else if verdict != combined {
             return Err(format!(
                 "doc.policy: verdict {verdict:?} contradicts rule results {results:?}"
