@@ -294,10 +294,12 @@ fn s5_dottext_negative() {
         eprintln!("SKIP(members-object): OSSL_MEMBERS_OBJECT unset");
         return;
     };
-    let Some(off) = first_text_call_offset(&obj) else {
-        eprintln!("SKIP(s5-negative): no .text helper-form call to mutate");
+    if !has_section(&obj, ".text") {
+        eprintln!("SKIP(s5-negative): no .text section");
         return;
-    };
+    }
+    let off =
+        first_text_call_offset(&obj).expect(".text exists but has no helper-form call to mutate");
     let mut mutated = obj.clone();
     mutated[off + 4..off + 8].copy_from_slice(&181i32.to_le_bytes());
     let hits: Vec<(String, i32)> = collect_helpers(&mutated)
