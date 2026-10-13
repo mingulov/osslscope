@@ -12,80 +12,136 @@ of PQC handshakes.
 
 ## 1. Capture: report + CBOM
 
-One window, spawn mode, JSON evidence plus a CycloneDX CBOM:
+One window, spawn mode, JSON evidence plus a CycloneDX CBOM.
+With a trusted system install the BPF objects resolve
+implicitly; otherwise pass the same explicit pair to `doctor`
+(preflight) and to the capture:
 
 ```sh
+osslscope doctor || exit 4
+
 osslscope report \
   --provider /path/to/libcrypto.so.3 --builtin \
-  --object ./osslscope-harvest --count-object ./osslscope-count \
   --duration 30 --settle 5 \
   --format json --out story.json --cbom story.cdx.json \
-  run -- /path/to/service --foreground
+  --workload-out story.workload.log \
+  run -- /path/to/service --foreground \
+  >story.driver.log 2>&1
 ```
 
 Drive representative traffic in-window (warmup handshakes while the
 window opens, measured handshakes inside it), then quit the child
 cleanly before expiry. The example window ran 2 warmup + 10 measured
-PQC handshakes and exited 3: PARTIAL with the single structural
-reason `lowlevel-fallback-uninstrumented`, 62 execution rows,
-`child_exit` 0, all gap counters zero. Exit 3 with a clean policy
-read is the normal shape for TLS services -- see
-[who should NOT adopt](what-it-proves.md#who-should-not-adopt-read-before-installing)
-for why v1 never promises COMPLETE there.
+PQC handshakes and exited 3: PARTIAL with a structural low-level
+coverage gap (every TLS window carries it -- see [who should NOT
+adopt](what-it-proves.md#who-should-not-adopt-read-before-installing)),
+62 definite sites, disposition `exited` code 0, and no losses.
+Exit 3 with a clean policy read is the normal shape for TLS
+services. The workload's own output lands in `story.workload.log`;
+observer stdout stays a pure artifact channel and observer
+diagnostics stay in `story.driver.log`.
 
-The CBOM (`story.cdx.json`) carries one `cryptographic-asset`
-component per executed identity (62 here), each with algorithm,
-provider (+ object path / build-id), op, funcid, call count,
-generation, window edges, and per-component completeness. PARTIAL
-evidence travels as a `metadata` disclaimer property, so the
-completeness caveat survives export.
+The v2 JSON carries no raw argv: `target` holds pid, comm,
+container/image provenance, and unconditional
+`argv_redacted: true`. Window edges are monotonic nanoseconds
+(requested versus effective coverage); the optional `context`
+key adds host kernel release plus wall-clock edges for
+correlation only. The CBOM (`story.cdx.json`) carries one
+`cryptographic-asset` component per definite site (62 here),
+each with provider (+ object path / build-id), op, funcid, call
+count, generation, and window edges. Ambiguous sites contribute
+no components; their omitted counts stay explicit metadata, and
+PARTIAL evidence travels as a `metadata` disclaimer property, so
+both caveats survive export.
 
-## 2. Trust the bytes: the golden conformance test
+## 2. Trust the bytes: the v2 conformance test
 
-`tests/auditor_golden.json` freezes the auditor-visible report shape
-for a small deterministic fixture; `tests/auditor_report.rs` checks
-exact key sets, exact types, and the frozen vocabularies (status,
-the 29 PARTIAL reasons, the 6 rule names) -- and rejects tampered
-documents (dropped/added keys, type flips, off-vocabulary tokens
-all fail; the suite asserts each rejection). The same checker
-validates live story output, which never ships in this repo:
+`tests/auditor_golden_v2.json` freezes the auditor-visible v2
+report shape; `tests/auditor_report.rs` (v2 suite) checks exact
+key sets, exact types, and the frozen vocabularies -- and
+rejects tampered documents (dropped/added keys, type flips,
+off-vocabulary tokens all fail; the suite asserts each
+rejection). The same checker validates live story output, which
+never ships in this repo (the v1 suite and its
+`OSSLSCOPE_AUDITOR_STORY` / `story_output_conforms` pair are
+frozen history):
 
 ```sh
-OSSLSCOPE_AUDITOR_STORY=/path/to/story.json \
-  cargo test --offline --test auditor_report story_output_conforms
+OSSLSCOPE_AUDITOR_STORY_V2=/path/to/story.json \
+  cargo test --offline --test auditor_report story_v2_output_conforms
 ```
 
-The checker is deliberately stricter than the reader contract in
-`schemas/observed-crypto-v1.json` (readers must ignore unknown keys
-for forward compatibility). The auditor's job is the opposite:
-surface any unexpected byte, then update golden + checker together,
-by review.
+The checker runs both validation layers from [the v2
+contract](observed-crypto-v2.md#reader-contract): `validate_v2`
+(JSON Schema: types, enums, required fields,
+`additionalProperties: false` on every object) and
+`check_v2_semantics` (cross-field rules -- object reference
+integrity, effective-inside-requested windows, ordered site
+timestamps, status/reasons agreement, conserved policy bounds,
+legacy-partition conservation, and the forbidden
+argv/cmdline/address key sweep). It is deliberately stricter
+than field-level readers, which must ignore unknown keys for
+forward compatibility. The auditor's job is the opposite:
+surface any unexpected byte, then update golden + checker
+together, by review.
+
+Checked against produced v2 fixtures (R13 verification): the
+checker passes `tests/goldens/report-v2-violation.json` and
+`tests/goldens/report-v2-partial.json`, and rejects the same
+violation document with one added unknown key.
+
+Compatibility is deliberate: producers emit exactly
+`observed-crypto-v2.1`, readers accept `observed-crypto-v2` and
+`observed-crypto-v2.<digits>` and reject every other major, and
+minor versions add OPTIONAL keys only. A v2.0 validator fails
+closed on v2.1 keys it does not know (upgrade the validator);
+field-level readers keep working. Old readers never misparse
+across majors, and no one claims an older reader reconstructs
+new evidence it cannot represent.
 
 ## 3. Gate: violation detection on evidence
 
-CI gates on violations, never on COMPLETE. Two runs from the
-example window:
+CI gates on violations, never on COMPLETE. Three runs showing
+the three verdicts (same invocation shape as the example
+window):
 
 ```sh
 # Expected crypto executed: policy pass (exit 3 = PARTIAL, no violation).
 osslscope check ... --require-executed HKDF \
   --format json --out pass.json run -- /path/to/service --foreground
-# verdict: pass, HKDF matches 630.
+# verdict: pass, HKDF definite use proved.
 
-# Required crypto absent: fail closed (exit 10).
-osslscope check ... --require-executed SNMPKDF \
+# Banned crypto executed: violation (exit 10).
+osslscope check ... --deny-algorithm DES \
   --format json --out viol.json run -- /path/to/service --foreground
-# verdict: violation, matches 0.
+# verdict: violation, definite DES use proved.
+
+# Required crypto absent under a relevant gap: inconclusive (exit 11).
+osslscope check ... --require-executed SNMPKDF \
+  --format json --out inconc.json run -- /path/to/service --foreground
+# verdict: inconclusive, the requirement is unproven, never fabricated.
 ```
 
-Exit 10 dominates: it fires on COMPLETE or PARTIAL evidence alike.
+Exit 10 dominates: it fires on COMPLETE, PARTIAL, or salvaged
+`runtime`-fatal evidence alike, even when artifact delivery
+failed -- an artifact failure never overrides a proved
+violation. Exit 11 is the honest middle: relevant loss blocks
+the absence proof, while unrelated gaps preserve proved
+positive evidence. If the close flow itself breaks mid-run
+(drain, discovery finish, or disposition), the document is
+salvaged as `runtime`-fatal: every collected observation
+survives, policy still evaluates (a proved violation exits 10),
+and anything else exits 1.
+
 The violation entry carries the actionability tuple -- rule +
-matcher, the executed identity (or `absent: true` with zero counts
-when nothing matched), window epochs, full cmdline, container id,
-image digest, and provider object path + build-id -- which is what
-[violation triage](violation-triage.md) walks to the owning service.
-Wire it per [CI gate recipes](ci-recipes.md): exit 3 + `pass` is
-green-with-artifacts, exit 10 fails the gate.
+matcher, the executed identity (definite site evidence with
+conserved definite/possible bounds), window edges, pid/comm,
+container id, image digest, and provider object path + build-id
+(no cmdline: argv is redacted) -- which is what [violation
+triage](violation-triage.md) walks to the owning service. Wire
+it per [CI gate recipes](ci-recipes.md): exit 3 + `pass` is
+green-with-artifacts, exit 10 fails the gate, exit 11 fails
+pending gap triage.
 
 ## 4. Declared versus executed
 
@@ -93,19 +149,21 @@ A static inventory answers "what could run"; the CBOM answers "what
 ran". For the example window, `openssl list` across the cipher /
 digest / KDF / MAC / KEM / key-exchange / signature / key-manager /
 random groups declares 277 distinct primary names, while the window
-executed 62 identities in 16 algorithm classes (15 registry classes
+executed 62 definite sites in 16 algorithm classes (15 registry classes
 plus `other`). The delta has three parts worth naming to an auditor:
 
 - 262 declared names never executed in-window. Absence here means
   not-observed-in-window, never "not present / never used" -- a
   longer or differently-loaded window may execute them.
-- 18 executed rows classify as `other` (KEYMGMT / KEYEXCH / DECODER
-  dispatch for the negotiated PQC hybrid group): executed but
-  unclassified, because the provider alias-list primary is not a
-  registry spelling. Triage, never auto-deny.
-- `other`-class executions are counted in `weak.unknown_calls`,
-  not in any algorithm bucket: unknown spellings stay visible
-  without being misattributed.
+- 18 executed sites carry only `other`-bucket candidates (KEYMGMT
+  / KEYEXCH / DECODER dispatch for the negotiated PQC hybrid
+  group): executed but unresolved, because the provider
+  alias-list primary is not a registry spelling. Triage, never
+  auto-deny.
+- Unresolved sites stay visible with their candidate sets and
+  weak-alias flags rather than being misattributed to any
+  algorithm bucket; sites are counted once each no matter how
+  many candidates share them.
 
 ## 5. Downstream: Dependency-Track status
 
@@ -122,8 +180,9 @@ a DT project page.
 ## The one-paragraph version
 
 Observe the service in spawn mode, keep the JSON + CBOM + gate
-artifacts together, validate the JSON shape with the golden
-conformance test, gate CI on `check` violations (exit 10 fails,
-exit 3 + `pass` is normal), and read declared-vs-executed as
-"could run" versus "ran" -- with `other` rows and window-only
-absence stated explicitly. That packet is the v1 audit trail.
+artifacts together, validate the JSON shape with the v2
+conformance test, gate CI on `check` verdicts (exit 10 fails,
+exit 11 fails pending gap triage, exit 3 + `pass` is normal),
+and read declared-vs-executed as "could run" versus "ran" -- with
+ambiguous sites and window-only absence stated explicitly. That
+packet is the v2 audit trail.
