@@ -4,4 +4,6 @@
 //! governor policy (item 5, host half). The harness drives the
 //! registry explicitly; the daemon 100ms-loop integration is item 5.
 
+pub mod governor;
+pub mod oracle;
 pub mod registry;

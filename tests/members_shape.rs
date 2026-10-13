@@ -178,8 +178,8 @@ fn s1_prepare_513() {
     assert_eq!(prep.progs.len(), 513, "512 members + member_entry");
     assert_eq!(
         prep.maps.len(),
-        13,
-        "exactly the 13 member maps (D dropped PENDING)"
+        14,
+        "exactly the 14 member maps (D 13 + item-5 BUCKET)"
     );
 }
 
@@ -220,9 +220,8 @@ fn s3_bodies_distinct() {
     assert_eq!(hashes.len(), 512, "all 512 member bodies distinct");
 }
 
-/// S4: the 13 map dims pinned (6 retained + 7 item-3 scan-plane;
-/// PENDING dropped in stage D when members switched to SCAN —
-/// R18 §6.1 — end state 13).
+/// S4: the 14 map dims pinned (6 retained + 7 item-3 scan-plane
+/// + item-5 BUCKET; item-7 EVENTS at 16MiB).
 #[test]
 fn s4_map_dims() {
     let Some(prep) = prepared() else {
@@ -230,7 +229,8 @@ fn s4_map_dims() {
         return;
     };
     let want: &[(&str, u32, u32, u32, u32, u32)] = &[
-        ("EVENTS", 27, 0, 0, 1 << 21, 0),
+        ("EVENTS", 27, 0, 0, 1 << 24, 0),
+        ("BUCKET", 1, 4, 8, 4096, 0),
         ("GEN", 1, 8, 8, 1024, 0),
         ("LOSS", 5, 4, 8, 32, 0),
         ("TRUNC", 5, 4, 8, 64, 0),
@@ -263,18 +263,20 @@ fn s4_map_dims() {
 }
 
 /// S5: helper set pinned (raw bytes, exact, mains + `.text`
-/// subprograms), SPLIT by plane (R18 §6.5 — stage D): map_lookup
+/// subprograms), SPLIT by plane (R18 §6.5 + item 5): map_lookup
 /// (1), map_update (2), map_delete (3 — entry skip-path deletes
 /// plus the member-epilogue retire, inlined into member mains and
-/// `.text`-resident shared paths), get_current_pid_tgid (14),
-/// probe_read_user (112), probe_read_user_str (114),
-/// ringbuf_reserve (131), ringbuf_submit (132), ringbuf_query
-/// (134 — ENTRY-ONLY, the governor occupancy read; members never
-/// query), get_attach_cookie (174) — and nothing else. In
-/// particular: no tail_call (12 — members never chain), no
-/// bpf_loop (181). Ids verified against
-/// /usr/include/linux/bpf.h FN table; the set was read off the
-/// built object and reviewed, then pinned as a regression lock.
+/// `.text`-resident shared paths), ktime_get_ns (5 — ENTRY-ONLY,
+/// the tier-1 bucket refill clock; members never read time),
+/// get_current_pid_tgid (14), probe_read_user (112),
+/// probe_read_user_str (114), ringbuf_reserve (131),
+/// ringbuf_submit (132), ringbuf_query (134 — ENTRY-ONLY, the
+/// governor occupancy read; members never query),
+/// get_attach_cookie (174) — and nothing else. In particular: no
+/// tail_call (12 — members never chain), no bpf_loop (181). Ids
+/// verified against /usr/include/linux/bpf.h FN table; the set was
+/// read off the built object and reviewed, then pinned as a
+/// regression lock.
 #[test]
 fn s5_no_forbidden_helpers() {
     let Some(obj) = object_bytes() else {
@@ -282,7 +284,7 @@ fn s5_no_forbidden_helpers() {
         return;
     };
     const FORBIDDEN: [i32; 2] = [12, 181];
-    const PINNED: [i32; 10] = [1, 2, 3, 14, 112, 114, 131, 132, 134, 174];
+    const PINNED: [i32; 11] = [1, 2, 3, 5, 14, 112, 114, 131, 132, 134, 174];
     let mut observed: HashSet<i32> = HashSet::new();
     for (name, id) in collect_helpers(&obj) {
         observed.insert(id);
@@ -290,13 +292,13 @@ fn s5_no_forbidden_helpers() {
             !FORBIDDEN.contains(&id),
             "{name}: forbidden helper {id} (12=tail 181=loop)"
         );
-        // Split rule (D): 134 is entry-only (uprobe main); 3
-        // reaches member mains (the gated-epilogue retire) as
-        // well as the entry skip path.
-        if id == 134 {
+        // Split rule (items 3–5): 134 and 5 are entry-only
+        // (uprobe main); 3 reaches member mains (the
+        // gated-epilogue retire) as well as the entry skip path.
+        if id == 134 || id == 5 {
             assert_eq!(
                 name, "member_entry",
-                "ringbuf_query outside the entry main: {name}"
+                "entry-only helper {id} outside the entry main: {name}"
             );
         }
     }
@@ -393,19 +395,21 @@ fn s7_retired_maps_absent() {
     }
 }
 
-/// S8: the const-folded specials (stage D) — member_000 carries
+/// S8: the const-folded specials (items 3–5) — member_000 carries
 /// the ns-first read + RET emit + empty-slot gate, member_511 the
 /// guard eligibility + GUARD event; members 1..510 are fold-free
 /// and near-uniform (same code modulo baked immediates). Two known
 /// variances, both proven innocent via objdump diff (same helper
-/// sequence, same stores): J=4 == KIND_ALG, so LLVM CSEs the
-/// idx/kind stores in both ALG emits (16B smaller —
+/// sequence, same stores): J=10 == KIND_SCAN_ALG, so LLVM CSEs the
+/// idx/kind stores in both scan-ALG emits (16B smaller — the D
+/// J=4==KIND_ALG CSE moved with the scan kinds;
 /// walk_dispatch/classify stay shared `.text`, so no other J gets
-/// this luck); J=40 keeps its idx immediate in a register across
-/// the ALG emit (one extra mov, 8B larger — pure regalloc quirk;
-/// the T-gate itself compiles identically for all J as `t > J-1 ⟺
-/// walk`, verified at 040/041). Any other outlier fails loud —
-/// investigate, don't widen.
+/// this luck); J=56 keeps its idx immediate in a register across
+/// the scan-ALG emit (one extra mov, 8B larger — pure regalloc
+/// quirk, same class as D's J=40; the T-gate itself compiles
+/// identically for all J as `t > J-1 ⟺ walk`, verified at 056/057
+/// and 010/057). Any other outlier fails loud — investigate,
+/// don't widen.
 #[test]
 fn s8_folded_specials() {
     let Some(obj) = object_bytes() else {
@@ -453,13 +457,13 @@ fn s8_folded_specials() {
         .collect();
     assert_eq!(
         mins,
-        ["member_004"],
-        "only known small outlier is J=4 (KIND_ALG CSE)"
+        ["member_010"],
+        "only known small outlier is J=10 (KIND_SCAN_ALG CSE)"
     );
     assert_eq!(
         maxs,
-        ["member_040"],
-        "only known large outlier is J=40 (regalloc mov)"
+        ["member_056"],
+        "only known large outlier is J=56 (regalloc mov)"
     );
     assert!(
         mid_max - mid_min <= 24,
