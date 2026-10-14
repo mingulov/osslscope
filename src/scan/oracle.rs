@@ -24,12 +24,15 @@
 //!   every attached slot below TRUE-T covered with a known
 //!   status + explicit terminator (min-EMPTY, or GUARD EMPTY at
 //!   512) + no failed chunks + guard disposition consistent +
-//!   no unscoped structural TRUNC (ALGS/DISPATCH/NO_STORE ⟹
-//!   PARTIAL; WALK_READ/WALK_NAME explain prefix gaps, else they
-//!   are beyond-terminator noise and discarded with the reads
-//!   they came from). TRUNC WALK_EMPTY/WALK_NOIMP are stable
-//!   walk observations (Complete-compatible). COMPLETE requires
-//!   Proven — Candidate/Unknown never completes.
+//!   no retained TRUNC except beyond-terminator WALK_NAME noise
+//!   (ALGS/DISPATCH/NO_STORE/WALK_READ ⟹ PARTIAL — a dispatch
+//!   read failure hides behind a readable ALG prefix, so
+//!   WALK_READ is indistinguishable from past-terminator tuple
+//!   noise and retained fail-closed; WALK_NAME explains prefix
+//!   gaps, else it is discarded with its reads). TRUNC
+//!   WALK_EMPTY/WALK_NOIMP are stable walk observations
+//!   (Complete-compatible). COMPLETE requires Proven —
+//!   Candidate/Unknown never completes.
 //! - TRUE-T (R2): min-EMPTY over explicit records (beyond-T
 //!   observations are meaningless and discarded); no EMPTY in a
 //!   fully-covered full scope ⟹ the guard decides (EMPTY ⟹
@@ -37,8 +40,12 @@
 //!   Partial, missing ⟹ Candidate(512) + GuardMissing); RET
 //!   EMPTY → EmptyTable. Warm beliefs stand only uncontradicted:
 //!   fresh EMPTY below T ⟹ shrink (Proven(new) + CacheShrink);
-//!   walked evidence beyond T ⟹ stale (Proven(new) +
-//!   CacheStale); generation turnover ⟹ cold rules + GenStale.
+//!   positive walked evidence beyond T without a terminator ⟹
+//!   stale (Candidate(lowest-consistent) + CacheStale); a
+//!   walked-but-unproven terminator slot with nothing beyond ⟹
+//!   stale (Candidate(cached) + CacheStale — the cached T cannot
+//!   stand without its proof); generation turnover ⟹ cold rules
+//!   + GenStale.
 //! - TAINT (R3): the nesting rule-set (multi-array per key,
 //!   duplicate slot) taints BOTH invocations stickily, keeps the
 //!   slots (first record wins — array+idx are
@@ -56,8 +63,8 @@
 //!   invocation is a window finding.
 //! - PARTIAL (R5): holes, UNREADABLE, unobserved selective slots,
 //!   TRUNC, guard ERROR/VALID/missing, cache contradictions,
-//!   generation mismatch, drain-loss corroboration, and dangling
-//!   calls stay explicit (missing or failed chunks and drain
+//!   generation mismatch, retained drain loss, and raced TRUNC
+//!   drains stay explicit (missing or failed chunks and drain
 //!   loss are PARTIAL, never silent). Loss/TRUNC history is
 //!   retained per open across drains and evaluated over the full
 //!   invocation, not the closing batch.
@@ -169,6 +176,11 @@ pub struct ScanBatch {
     /// only sound quiesced — non-quiesced batches hold
     /// underdetermined invocations open (honest, never guessed).
     pub quiesced: bool,
+    /// The TRUNC drain raced a concurrent flag (the backend's
+    /// generation guard advanced across the clear window, so a
+    /// flag may have been erased unread) — every open this batch
+    /// spanned degrades explicitly.
+    pub trunc_race: bool,
 }
 
 /// Oracle scope: what the producer was asked to observe (item 6
@@ -310,13 +322,20 @@ pub enum PartialReason {
     /// Slot evidence generations disagree with the RET generation
     /// (cross-epoch join — inconsistent evidence).
     GenMixed,
-    /// Window closed with no RET joined (dangling call — the
-    /// trailing-scan backstop closes it explicitly).
+    /// Window closed with no RET joined (dangling call —
+    /// retained for taxonomy stability; the backstop taints both
+    /// correlated sequences instead of emitting this).
     DanglingCall,
     /// Defensive: a Candidate/Unknown TRUE-T reached the verdict
     /// with no other reason (unreachable by construction — every
     /// unproven-terminator path names its reason; fail-closed).
     TerminatorUnproven,
+    /// The TRUNC drain raced a concurrent producer flag (a flag
+    /// may have been erased unread — fail-closed PARTIAL).
+    TruncDrainRace,
+    /// A dispatch row carried a foreign array id (evidence
+    /// inconsistent with the joined RET's array).
+    RowArrayMismatch,
 }
 
 /// Why an invocation was abandoned.
@@ -392,6 +411,10 @@ pub struct WalkDone {
     /// its monotonic base at attach, so this is capture-ns in
     /// production — the inventory adaptation's event instant).
     pub event_ns: u64,
+    /// Retained dispatch rows (array/generation/callback data —
+    /// consistency-checked at close; rides the record for
+    /// callback relocation and inventory adaptation).
+    pub rows: Vec<wire::ScanRowEvent>,
 }
 
 /// One joined slot identity (the per-slot evidence a WALK-DONE
@@ -527,6 +550,9 @@ struct Open {
     /// Row indexes (multiset size = rows): consistency-checked at
     /// close (rows for non-walked slots are stray findings).
     row_idxs: Vec<u64>,
+    /// Retained row records (array/generation/callback data —
+    /// consistency-checked at close, then rides the WALK-DONE).
+    row_events: Vec<wire::ScanRowEvent>,
     /// Position of the CALL in its batch (ring order = causal
     /// order per tid — used for later-activity checks within a
     /// batch; cross-batch order is batch order).
@@ -540,8 +566,12 @@ struct Open {
     /// batch alone never decides).
     trunc_accum: u64,
     /// Accumulated ring-loss deltas over every drain the open
-    /// spanned (corroborates gaps; intact evidence stays intact).
+    /// spanned (any retained loss degrades the verdict — R18
+    /// COMPLETE requires ring-loss quiescence).
     ring_loss_accum: u64,
+    /// A TRUNC drain raced a concurrent flag while this open
+    /// spanned it (fail-closed PARTIAL at close).
+    trunc_race_accum: bool,
     /// A hinted successor take arrived over this open (recorded,
     /// never tainting alone — hint + rule-hit = nested certain).
     hint_seen: bool,
@@ -566,6 +596,41 @@ pub struct Oracle {
     findings: Vec<Finding>,
     stats: DrainStats,
     batches: u64,
+    /// Post-drain outcome evidence (bounded): production takes
+    /// `done` every poll, so late joins and straggler records
+    /// consult this after `done` — a consumed key is absorbed
+    /// (or LATE-joined when hung), never orphaned. Skipped
+    /// outcomes are not joinable and stay out.
+    recent: BTreeMap<(u32, u64), RecentClose>,
+    recent_order: std::collections::VecDeque<(u32, u64)>,
+}
+
+/// Post-drain close evidence for one key (the minimum a late join
+/// needs: existence + hung-ness — immune to retro-taint, which
+/// rewrites `done`, never this).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RecentClose {
+    hung: bool,
+}
+
+/// Bound on retained post-drain closes (FIFO eviction — late
+/// joins past the bound orphan honestly).
+const RECENT_CAP: usize = 4096;
+
+/// Where a closed key's evidence lives (live verdict or
+/// post-drain memory — both answer late joins).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClosedAs {
+    Done { hung: bool },
+    Recent { hung: bool },
+}
+
+impl ClosedAs {
+    fn hung(self) -> bool {
+        match self {
+            ClosedAs::Done { hung } | ClosedAs::Recent { hung } => hung,
+        }
+    }
 }
 
 impl Oracle {
@@ -632,8 +697,9 @@ impl Oracle {
     /// Window-edge close (the trailing-scan backstop): hung aging
     /// first (RET-less opens past 5s abandon as Hung), then every
     /// remaining open closes — RET-joined opens evaluate on their
-    /// retained evidence, RET-less opens close as explicit
-    /// dangling PARTIAL. Nothing is ever dropped.
+    /// retained evidence, RET-less opens taint both correlated
+    /// sequences (their own close carries UNKNOWN op). Nothing is
+    /// ever dropped.
     pub fn finish(&mut self, now_ns: u64) {
         self.age_opens(now_ns);
         let scope = self.scope.clone().expect("oracle scope set");
@@ -642,7 +708,7 @@ impl Oracle {
             let o = self.open.remove(&k).expect("finish open");
             self.check_stray_rows(&k, &o);
             if let Some(by_seq) = o.tainted_by {
-                self.done.push(WalkDone {
+                self.push_done(WalkDone {
                     tid: k.0,
                     seq: k.1,
                     op: UNKNOWN_OP,
@@ -654,17 +720,29 @@ impl Oracle {
                     guard: o.guard,
                     algs: open_identities(&o),
                     event_ns: o.first_seen_ns,
+                    rows: o.row_events.clone(),
                 });
                 continue;
             }
             if o.ret.is_none() {
-                self.done.push(WalkDone {
+                // Dangling CALL (no RET will ever join): the join
+                // key's 1:1 CALL/RET correspondence is broken, so
+                // BOTH correlated sequences taint — this close
+                // carries UNKNOWN op, and the pair taints
+                // stickily (open), by rewrite (live verdict), or
+                // by finding alone (consumed verdict).
+                let (pair, by_seq) = self.correlate(k.0, k.1);
+                self.taint_pair(k.0, k.1, pair, by_seq);
+                self.findings.push(Finding::Nested {
                     tid: k.0,
                     seq: k.1,
-                    op: o.call.op,
-                    outcome: Outcome::Partial {
-                        reasons: vec![PartialReason::DanglingCall],
-                    },
+                    by_seq,
+                });
+                self.push_done(WalkDone {
+                    tid: k.0,
+                    seq: k.1,
+                    op: UNKNOWN_OP,
+                    outcome: Outcome::Tainted { by_seq },
                     true_t: TrueT::Unknown,
                     arr: 0,
                     alg_count: o.algs.len(),
@@ -672,11 +750,12 @@ impl Oracle {
                     guard: o.guard,
                     algs: open_identities(&o),
                     event_ns: o.first_seen_ns,
+                    rows: o.row_events.clone(),
                 });
                 continue;
             }
             let w = Self::evaluate(&scope, &k, &o);
-            self.done.push(w);
+            self.push_done(w);
         }
     }
 
@@ -687,7 +766,7 @@ impl Oracle {
         let keys: Vec<(u32, u64)> = self.open.keys().copied().collect();
         for k in keys {
             let o = self.open.remove(&k).expect("open abandoned");
-            self.done.push(WalkDone {
+            self.push_done(WalkDone {
                 tid: k.0,
                 seq: k.1,
                 op: o.call.op,
@@ -699,6 +778,7 @@ impl Oracle {
                 guard: o.guard,
                 algs: open_identities(&o),
                 event_ns: o.first_seen_ns,
+                rows: o.row_events.clone(),
             });
         }
     }
@@ -712,6 +792,50 @@ impl Oracle {
     /// Drain findings (same incremental discipline as done).
     pub fn take_findings(&mut self) -> Vec<Finding> {
         std::mem::take(&mut self.findings)
+    }
+
+    /// Close one invocation: records the post-drain evidence,
+    /// then pushes the verdict (every close funnels here, so
+    /// `recent` observes every joinable outcome exactly once).
+    fn push_done(&mut self, w: WalkDone) {
+        let hung = matches!(
+            w.outcome,
+            Outcome::Abandoned {
+                reason: AbandonReason::Hung
+            }
+        );
+        let joinable = !matches!(w.outcome, Outcome::Skipped { .. });
+        if joinable {
+            let key = (w.tid, w.seq);
+            if !self.recent.contains_key(&key) {
+                self.recent_order.push_back(key);
+            }
+            self.recent.insert(key, RecentClose { hung });
+            while self.recent_order.len() > RECENT_CAP {
+                if let Some(old) = self.recent_order.pop_front() {
+                    self.recent.remove(&old);
+                }
+            }
+        }
+        self.done.push(w);
+    }
+
+    /// A key's close evidence, if any: live `done` first (it
+    /// carries retro-taints), post-drain `recent` after.
+    fn closed(&self, tid: u32, seq: u64) -> Option<ClosedAs> {
+        if let Some(w) = self.done.iter().find(|w| w.tid == tid && w.seq == seq) {
+            return Some(ClosedAs::Done {
+                hung: matches!(
+                    w.outcome,
+                    Outcome::Abandoned {
+                        reason: AbandonReason::Hung
+                    }
+                ),
+            });
+        }
+        self.recent
+            .get(&(tid, seq))
+            .map(|r| ClosedAs::Recent { hung: r.hung })
     }
 
     /// Ingest one drain batch (drain order across kinds when
@@ -769,6 +893,7 @@ impl Oracle {
         for o in self.open.values_mut() {
             o.ring_loss_accum = o.ring_loss_accum.saturating_add(ring_delta);
             o.trunc_accum |= b.trunc.get(&o.call.op).copied().unwrap_or(0);
+            o.trunc_race_accum |= b.trunc_race;
         }
         // Window-loss input: opens present after the joins absorb
         // the deltas above; with no opens the loss is window-level.
@@ -801,7 +926,7 @@ impl Oracle {
     fn ingest_call(&mut self, c: &wire::ScanCallEvent, batch: u64, pos: usize, now_ns: u64) {
         let (hint, cause) = wire::split_call_flags(c.flags);
         if cause != wire::SKIP_ADMITTED {
-            self.done.push(WalkDone {
+            self.push_done(WalkDone {
                 tid: c.tid,
                 seq: 0,
                 op: c.op,
@@ -813,6 +938,7 @@ impl Oracle {
                 guard: None,
                 algs: Vec::new(),
                 event_ns: now_ns,
+                rows: Vec::new(),
             });
             // R4: the skip deleted any standing record — opens
             // WITHOUT a joined RET can never complete (their
@@ -828,7 +954,7 @@ impl Oracle {
                 .collect();
             for k in victims {
                 let o = self.open.remove(&k).expect("victim open");
-                self.done.push(WalkDone {
+                self.push_done(WalkDone {
                     tid: k.0,
                     seq: k.1,
                     op: o.call.op,
@@ -842,6 +968,7 @@ impl Oracle {
                     guard: o.guard,
                     algs: open_identities(&o),
                     event_ns: o.first_seen_ns,
+                    rows: o.row_events.clone(),
                 });
             }
             return;
@@ -870,7 +997,7 @@ impl Oracle {
                 seq: c.seq,
                 by_seq: c.seq,
             });
-            self.done.push(WalkDone {
+            self.push_done(WalkDone {
                 tid: c.tid,
                 seq: c.seq,
                 op: UNKNOWN_OP,
@@ -882,6 +1009,7 @@ impl Oracle {
                 guard: old.guard,
                 algs: open_identities(&old),
                 event_ns: old.first_seen_ns,
+                rows: old.row_events.clone(),
             });
         }
         self.open.insert(
@@ -893,12 +1021,14 @@ impl Oracle {
                 algs: BTreeMap::new(),
                 rows: 0,
                 row_idxs: Vec::new(),
+                row_events: Vec::new(),
                 batch,
                 pos,
                 stalled: false,
                 first_seen_ns: now_ns,
                 trunc_accum: 0,
                 ring_loss_accum: 0,
+                trunc_race_accum: false,
                 hint_seen: false,
                 tainted_by: None,
                 arrs: BTreeSet::new(),
@@ -924,29 +1054,23 @@ impl Oracle {
                 tid: r.tid,
                 seq: r.seq,
             }),
-            None => {
-                if self.done.iter().any(|w| {
-                    w.tid == r.tid
-                        && w.seq == r.seq
-                        && matches!(
-                            w.outcome,
-                            Outcome::Abandoned {
-                                reason: AbandonReason::Hung
-                            }
-                        )
-                }) {
-                    self.findings.push(Finding::LateRet {
-                        tid: r.tid,
-                        seq: r.seq,
-                        arr: r.arr,
-                    });
-                } else if !self.done.iter().any(|w| w.tid == r.tid && w.seq == r.seq) {
-                    self.findings.push(Finding::OrphanRet {
-                        tid: r.tid,
-                        seq: r.seq,
-                    });
-                }
-            }
+            None => match self.closed(r.tid, r.seq) {
+                // Hung verdict (live or post-drain): LATE join,
+                // verdict standing.
+                Some(c) if c.hung() => self.findings.push(Finding::LateRet {
+                    tid: r.tid,
+                    seq: r.seq,
+                    arr: r.arr,
+                }),
+                // Straggler for a closed, consumed key: absorbed
+                // (cross-CPU ring skew delivers it after the
+                // close — the outcome evidence already stands).
+                Some(_) => {}
+                None => self.findings.push(Finding::OrphanRet {
+                    tid: r.tid,
+                    seq: r.seq,
+                }),
+            },
         }
     }
 
@@ -960,7 +1084,7 @@ impl Oracle {
                 seq: g.seq,
             }),
             None => {
-                if !self.done.iter().any(|w| w.tid == g.tid && w.seq == g.seq) {
+                if self.closed(g.tid, g.seq).is_none() {
                     self.findings.push(Finding::OrphanGuard {
                         tid: g.tid,
                         seq: g.seq,
@@ -977,7 +1101,7 @@ impl Oracle {
     fn ingest_alg(&mut self, a: &wire::ScanAlgEvent) {
         let key = (a.tid, a.seq);
         let Some(o) = self.open.get_mut(&key) else {
-            if !self.done.iter().any(|w| w.tid == a.tid && w.seq == a.seq) {
+            if self.closed(a.tid, a.seq).is_none() {
                 self.findings.push(Finding::OrphanAlg {
                     tid: a.tid,
                     seq: a.seq,
@@ -1017,16 +1141,19 @@ impl Oracle {
         }
     }
 
-    /// Ingest one ROW: counted with its index (consistency with
-    /// the slot verdict is checked at close).
+    /// Ingest one ROW: retained whole (array/generation/
+    /// callback data — consistency with the slot verdict and
+    /// the RET is checked at close; the record rides the
+    /// WALK-DONE for relocation and adaptation).
     fn ingest_row(&mut self, r: &wire::ScanRowEvent) {
         match self.open.get_mut(&(r.tid, r.seq)) {
             Some(o) => {
                 o.rows += 1;
                 o.row_idxs.push(r.idx);
+                o.row_events.push(*r);
             }
             None => {
-                if !self.done.iter().any(|w| w.tid == r.tid && w.seq == r.seq) {
+                if self.closed(r.tid, r.seq).is_none() {
                     self.findings.push(Finding::OrphanRow {
                         tid: r.tid,
                         seq: r.seq,
@@ -1037,15 +1164,29 @@ impl Oracle {
         }
     }
 
-    /// Fire the nesting rule-set on `key`: the current open closes
-    /// as Tainted immediately (evidence kept, op forced UNKNOWN)
-    /// and the correlated open on the tid carries the sticky taint
-    /// to its close. Always raises the Nested finding.
+    /// Fire the nesting rule-set on `key`: BOTH correlated
+    /// sequences taint stickily (the current open keeps
+    /// accumulating positive evidence — nothing is dropped at
+    /// fire time — and closes Tainted with all of it) and the
+    /// Nested finding names the correlation.
     fn fire_nesting(&mut self, tid: u32, seq: u64) {
-        // Correlated seq: the newest *other* open on the tid
-        // (sticky-tained), else the newest done seq on the tid
-        // (already closed — correlation noted), else the key
-        // itself (solo misattribution — defensive).
+        let (pair, by_seq) = self.correlate(tid, seq);
+        if let Some(k) = pair {
+            if let Some(o) = self.open.get_mut(&k) {
+                o.tainted_by = Some(seq);
+            }
+        }
+        if let Some(o) = self.open.get_mut(&(tid, seq)) {
+            o.tainted_by = Some(by_seq);
+        }
+        self.findings.push(Finding::Nested { tid, seq, by_seq });
+    }
+
+    /// Correlate `key` with its nesting pair: the newest *other*
+    /// open on the tid, else the newest done seq on the tid
+    /// (already closed — correlation noted), else the key itself
+    /// (solo misattribution — defensive).
+    fn correlate(&self, tid: u32, seq: u64) -> (Option<(u32, u64)>, u64) {
         let pair: Option<(u32, u64)> = self
             .open
             .keys()
@@ -1062,26 +1203,34 @@ impl Oracle {
                 .max()
                 .unwrap_or(seq),
         };
+        (pair, by_seq)
+    }
+
+    /// Taint the correlated sequence of a dangling close: a live
+    /// open taints stickily (its close verdict becomes Tainted);
+    /// an already-closed live verdict is rewritten in place
+    /// (evidence kept, op forced UNKNOWN — the standing verdict
+    /// rested on mixed evidence); a consumed (drained) verdict is
+    /// beyond rewriting, so the Nested finding below is its only
+    /// mark.
+    fn taint_pair(&mut self, tid: u32, seq: u64, pair: Option<(u32, u64)>, by_seq: u64) {
         if let Some(k) = pair {
             if let Some(o) = self.open.get_mut(&k) {
                 o.tainted_by = Some(seq);
             }
+            return;
         }
-        self.findings.push(Finding::Nested { tid, seq, by_seq });
-        if let Some(o) = self.open.remove(&(tid, seq)) {
-            self.done.push(WalkDone {
-                tid,
-                seq,
-                op: UNKNOWN_OP,
-                outcome: Outcome::Tainted { by_seq },
-                true_t: TrueT::Unknown,
-                arr: o.ret.map(|r| r.arr).unwrap_or(0),
-                alg_count: o.algs.len(),
-                row_count: o.rows as usize,
-                guard: o.guard,
-                algs: open_identities(&o),
-                event_ns: o.first_seen_ns,
-            });
+        if by_seq == seq {
+            return;
+        }
+        if let Some(w) = self
+            .done
+            .iter_mut()
+            .filter(|w| w.tid == tid && w.seq == by_seq)
+            .last()
+        {
+            w.outcome = Outcome::Tainted { by_seq: seq };
+            w.op = UNKNOWN_OP;
         }
     }
 
@@ -1149,7 +1298,7 @@ impl Oracle {
                 };
                 if let Some(k) = key {
                     let o = self.open.remove(&k).expect("attributed open");
-                    self.done.push(WalkDone {
+                    self.push_done(WalkDone {
                         tid: k.0,
                         seq: k.1,
                         op: o.call.op,
@@ -1161,6 +1310,7 @@ impl Oracle {
                         guard: o.guard,
                         algs: open_identities(&o),
                         event_ns: o.first_seen_ns,
+                        rows: o.row_events.clone(),
                     });
                     continue;
                 }
@@ -1202,7 +1352,7 @@ impl Oracle {
             .collect();
         for k in cascade {
             let o = self.open.remove(&k).expect("hung open");
-            self.done.push(WalkDone {
+            self.push_done(WalkDone {
                 tid: k.0,
                 seq: k.1,
                 op: o.call.op,
@@ -1216,6 +1366,7 @@ impl Oracle {
                 guard: o.guard,
                 algs: open_identities(&o),
                 event_ns: o.first_seen_ns,
+                rows: o.row_events.clone(),
             });
         }
     }
@@ -1291,7 +1442,7 @@ impl Oracle {
         }
         for k in stalled_quiet {
             if let Some(o) = self.open.remove(&k) {
-                self.done.push(WalkDone {
+                self.push_done(WalkDone {
                     tid: k.0,
                     seq: k.1,
                     op: o.call.op,
@@ -1305,6 +1456,7 @@ impl Oracle {
                     guard: o.guard,
                     algs: open_identities(&o),
                     event_ns: o.first_seen_ns,
+                    rows: o.row_events.clone(),
                 });
             }
         }
@@ -1316,7 +1468,7 @@ impl Oracle {
                 // Taint short-circuit keeps the evidence (the
                 // verdict carries the supersede).
                 if let Some(by_seq) = o.tainted_by {
-                    self.done.push(WalkDone {
+                    self.push_done(WalkDone {
                         tid: k.0,
                         seq: k.1,
                         op: UNKNOWN_OP,
@@ -1328,11 +1480,12 @@ impl Oracle {
                         guard: o.guard,
                         algs: open_identities(&o),
                         event_ns: o.first_seen_ns,
+                        rows: o.row_events.clone(),
                     });
                     continue;
                 }
                 let w = Self::evaluate(scope, &k, &o);
-                self.done.push(w);
+                self.push_done(w);
             }
         }
     }
@@ -1390,6 +1543,7 @@ impl Oracle {
                 guard: o.guard,
                 algs: open_identities(o),
                 event_ns: o.first_seen_ns,
+                rows: o.row_events.clone(),
             };
         }
 
@@ -1461,9 +1615,21 @@ impl Oracle {
             reasons.push(PartialReason::UnobservedSlots(unobs));
         }
 
-        // Generation consistency over the joined slot evidence.
-        if o.gen_mixed || o.algs.values().any(|a| a.generation != ret.generation) {
+        // Generation consistency over the joined slot and row
+        // evidence (checked both ALG directions at ingest; rows
+        // join here — a cross-epoch row is inconsistent evidence).
+        if o.gen_mixed
+            || o.algs.values().any(|a| a.generation != ret.generation)
+            || o.row_events.iter().any(|r| r.generation != ret.generation)
+        {
             reasons.push(PartialReason::GenMixed);
+        }
+
+        // ROW/array consistency over the retained dispatch rows
+        // (every row names its array — a foreign array is
+        // evidence inconsistent with the joined RET).
+        if o.row_events.iter().any(|r| r.aux != ret.arr) {
+            reasons.push(PartialReason::RowArrayMismatch);
         }
 
         // TRUE-T (R2): the explicit terminator decides; the warm
@@ -1490,21 +1656,37 @@ impl Oracle {
             }
             // Warm belief re-proven by a fresh terminator at T.
             (Some(tw), Some(_)) => TrueT::Proven(tw),
-            // Warm belief, terminator unobserved: walked evidence
-            // beyond T proves staleness; a silent window keeps
-            // the belief (holes, if any, already partial it).
+            // Warm belief, terminator unobserved: positive walked
+            // evidence beyond T proves growth (stale — the lowest
+            // consistent terminator bounds the new T); otherwise
+            // the terminator proof is missing — the walked
+            // terminator slot came back live, faulted, or
+            // unreadable, so the cached T cannot stand (stale —
+            // the backend invalidates and the next scan
+            // re-probes cold). Only a terminator slot outside
+            // the attached set keeps the belief (unobservable —
+            // the UnobservedSlots reason already partials).
             (Some(tw), None) => {
-                let walked_beyond = o
+                let positive_beyond: Vec<u64> = o
                     .algs
                     .iter()
-                    .any(|(j, a)| *j > tw && a.status != wire::ALG_EMPTY);
-                if walked_beyond {
+                    .filter(|(j, a)| {
+                        **j > tw
+                            && attached.contains(&(**j as u32))
+                            && !matches!(a.status, wire::ALG_EMPTY | wire::ALG_UNREADABLE)
+                    })
+                    .map(|(j, _)| *j)
+                    .collect();
+                if let Some(floor) = positive_beyond.iter().max().map(|m| m + 1) {
                     reasons.push(PartialReason::CacheStale { cached: tw });
-                    Self::cover_512(scope, o, &mut reasons)
+                    TrueT::Candidate(floor)
                 } else if tw == 512 {
                     // A 512 belief still needs its fresh boundary
                     // proof every scan (the guard read).
                     Self::cover_512(scope, o, &mut reasons)
+                } else if attached.contains(&(tw as u32)) {
+                    reasons.push(PartialReason::CacheStale { cached: tw });
+                    TrueT::Candidate(tw)
                 } else {
                     TrueT::Proven(tw)
                 }
@@ -1517,11 +1699,20 @@ impl Oracle {
 
         // Retained TRUNC (R5): ALGS/DISPATCH/NO_STORE are
         // unscoped-structural (always PARTIAL — NO_STORE is never
-        // Complete-compatible per the wire contract);
-        // WALK_READ/WALK_NAME explain prefix gaps, else they are
-        // beyond-terminator noise discarded with their reads.
-        let mut trunc_bits =
-            o.trunc_accum & (wire::TRUNC_ALGS | wire::TRUNC_DISPATCH | wire::TRUNC_NO_STORE);
+        // Complete-compatible per the wire contract). WALK_READ
+        // is always retained too: the producer emits ALG before
+        // walking dispatch, so a dispatch read failure hides
+        // behind a readable prefix — the bit is indistinguishable
+        // from past-terminator tuple noise, and fail-closed keeps
+        // it (same honesty class as DISPATCH overflow). WALK_NAME
+        // explains prefix gaps, else it is beyond-terminator
+        // noise discarded with its reads (a below-terminator
+        // name failure always leaves an UNREADABLE gap).
+        let mut trunc_bits = o.trunc_accum
+            & (wire::TRUNC_ALGS
+                | wire::TRUNC_DISPATCH
+                | wire::TRUNC_NO_STORE
+                | wire::TRUNC_WALK_READ);
         let gaps = reasons.iter().any(|r| {
             matches!(
                 r,
@@ -1531,17 +1722,25 @@ impl Oracle {
             )
         });
         if gaps {
-            trunc_bits |= o.trunc_accum & (wire::TRUNC_WALK_READ | wire::TRUNC_WALK_NAME);
+            trunc_bits |= o.trunc_accum & wire::TRUNC_WALK_NAME;
         }
         if trunc_bits != 0 {
             reasons.push(PartialReason::Trunc(trunc_bits));
         }
 
-        // Drain-loss corroboration: retained ring loss explains
-        // gaps (intact evidence exonerates the invocation — the
-        // loss provably hit another record).
-        if gaps && o.ring_loss_accum > 0 {
+        // Retained ring loss degrades the verdict unconditionally
+        // (R18 COMPLETE requires ring-loss quiescence — dropped
+        // ROWs leave ALG coverage intact but the dispatch
+        // evidence is provably incomplete).
+        if o.ring_loss_accum > 0 {
             reasons.push(PartialReason::DrainLoss);
+        }
+
+        // A raced TRUNC drain may have erased a concurrent flag
+        // unread — the invocation it spanned degrades
+        // explicitly, never silently.
+        if o.trunc_race_accum {
+            reasons.push(PartialReason::TruncDrainRace);
         }
 
         // COMPLETE requires Proven (defensive: unreachable by
@@ -1574,6 +1773,7 @@ impl Oracle {
             guard: o.guard,
             algs: open_identities(o),
             event_ns: o.first_seen_ns,
+            rows: o.row_events.clone(),
         }
     }
 

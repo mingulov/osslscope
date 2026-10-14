@@ -99,7 +99,7 @@ fn row(tid: u32, seq: u64, idx: u64) -> wire::ScanRowEvent {
         funcid: 300,
         _pad: 0,
         addr: 0x4400,
-        aux: 0,
+        aux: ARR,
         idx,
         generation: 0,
         tid,
