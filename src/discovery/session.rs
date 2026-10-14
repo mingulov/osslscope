@@ -769,6 +769,15 @@ fn trip_mapping_equal(a: &legacy::ProbeSet, b: &legacy::ProbeSet) -> bool {
     pairs(a) == pairs(b)
 }
 
+/// Fixed capacity for the flap-carry witness (R20-fix round 4,
+/// NEW-2): at most this many distinct churned ranges accumulate
+/// across a backlog episode — past it, the poll latches
+/// `flap_carry_overflow` and emits the churn-scoped overflow gap
+/// instead of storing history. 64 covers generous real churn (a
+/// library load changes a handful of ranges); overflow means
+/// pathological churn, and the gap keeps it honest and bounded.
+const MAX_FLAP_CARRY_RANGES: usize = 64;
+
 /// The mapped libcrypto entry a plan would resolve against, if any
 /// (shared by planning and blind-latch fingerprints so the two
 /// cannot select different entries).
@@ -903,42 +912,64 @@ pub struct SessionCore {
     /// array costs one spurious straggler (proven-fresh row meets
     /// stale memory), never silence.
     impl_backing: HashMap<u64, (u64, BackingRef)>,
-    /// Last-seen (dev, ino) per mapping range start (R20-fix round
-    /// 2, F4 mapping-flap witness): every poll's snapshot refreshes
-    /// this; a range whose triple CHANGED since the previous poll
-    /// lands in `flap_changed`, and a row attributing into a
-    /// changed range drops loud (the row may be queued pre-change —
-    /// continuity unprovable). Catches what the per-impl memory
-    /// cannot: an unseeded impl's first row after a maps-observed
+    /// Last-seen (dev, ino, offset) per mapping range start
+    /// (R20-fix round 2, F4 mapping-flap witness; offset added
+    /// round 4): every poll's snapshot refreshes this; a range
+    /// whose triple CHANGED since the previous poll lands in
+    /// `flap_changed`, and a row attributing into a changed range
+    /// drops loud (the row may be queued pre-change — continuity
+    /// unprovable). Attribution derives the backing offset from
+    /// the mapping (`attribute_impl`), so a same-file offset
+    /// change is an observed remap exactly like an identity
+    /// change. Catches what the per-impl memory cannot: an
+    /// unseeded impl's first row after a maps-observed
     /// replacement, and a flap-back (A→B→A) whose impl memory
     /// matches again. First sightings record silently; vanished
     /// ranges prune (a row can only attribute into a present range,
     /// and absence is the orphan path's territory); same-triple
-    /// resizes are not flaps (same file). Cleared on recycle (a new
-    /// address space). Bounded by distinct live range starts (the
-    /// live maps vec, already held per poll).
-    map_flap: HashMap<u64, (String, u64)>,
-    /// Ranges whose (dev, ino) changed into THIS poll's snapshot
-    /// (start, end): refreshed every poll (and at close), consulted
-    /// by the ROW arm. Per-poll (not accumulated): rows arriving
-    /// without truncation loss are fresh (emitted since the last
-    /// poll), so only the current poll's discontinuity taints —
-    /// plus [`Self::flap_carry`] while a ring backlog persists.
+    /// resizes are not flaps (same file, same offset). Cleared on
+    /// recycle (a new address space). Bounded by distinct live
+    /// range starts (the live maps vec, already held per poll).
+    map_flap: HashMap<u64, (String, u64, u64)>,
+    /// Ranges whose (dev, ino, offset) changed into THIS poll's
+    /// snapshot (start, end): refreshed every poll (and at close),
+    /// consulted by the ROW arm. Per-poll (not accumulated): rows
+    /// arriving without truncation loss are fresh (emitted since
+    /// the last poll), so only the current poll's discontinuity
+    /// taints — plus [`Self::flap_carry`] while a ring backlog
+    /// persists.
     flap_changed: Vec<(u64, u64)>,
-    /// Carried flap witness (R20-fix round 3, F4): when a poll
-    /// exhausts its ring budget, its queued rows (the stash slot
-    /// plus unread backlog) were emitted before this poll's drain
-    /// and may predate this poll's snapshot — the current
-    /// `flap_changed` alone cannot taint them next poll (it
-    /// resets), so the exhausted poll's ranges carry forward.
-    /// Unioned into the ROW arm's flap check; accumulates while
-    /// exhaustion persists (the backlog may span several polls)
-    /// and retires the first poll that empties the ring (its rows
-    /// are provably post-drain). Backpressure itself stays
-    /// Activity, never loss — the carry only taints rows whose
-    /// emission-time mapping is unprovable. Bounded by distinct
-    /// live range starts (same order as `map_flap`).
+    /// Carried flap witness (R20-fix round 3, F4; bounded round
+    /// 4, NEW-2): when a poll exhausts its ring budget, its
+    /// queued rows (the stash slot plus unread backlog) were
+    /// emitted before this poll's drain and may predate this
+    /// poll's snapshot — the current `flap_changed` alone cannot
+    /// taint them next poll (it resets), so the exhausted poll's
+    /// ranges carry forward. Unioned into the ROW arm's flap
+    /// check; accumulates while exhaustion persists (the backlog
+    /// may span several polls) and retires the first poll that
+    /// empties the ring (its rows are provably post-drain).
+    /// Backpressure itself stays Activity, never loss — the carry
+    /// only taints rows whose emission-time mapping is unprovable.
+    /// FIXED capacity ([`MAX_FLAP_CARRY_RANGES`]): ranges past the
+    /// cap are not stored — the poll instead sets
+    /// [`Self::flap_carry_overflow`] and emits a churn-scoped
+    /// overflow gap (unlocalizable host loss — the churn set is
+    /// unknowable, so it taints every op). ROW-arm membership is
+    /// O(per-poll changed + cap), never churn-history-sized.
     flap_carry: Vec<(u64, u64)>,
+    /// Flap-carry overflow latch (R20-fix round 4, NEW-2): set
+    /// when a backlog poll's churn exceeded
+    /// [`MAX_FLAP_CARRY_RANGES`] (emitted once per episode, with
+    /// the overflow gap). While set, EVERY row consumed from the
+    /// backlog taints as flapped (fail-closed — the untracked
+    /// churn may cover its vaddr) and drops loud through the
+    /// same op-localized straggler channel as ordinary flap
+    /// drops. Churn-scoped: cleared when the ring empties (the
+    /// same retire rule as [`Self::flap_carry` — post-drain rows
+    /// are provably fresh) and on recycle. Invariant: set only
+    /// while the carry is full.
+    flap_carry_overflow: bool,
     /// Remembered backing-file freshness per path (R20-fix finding
     /// 5): (size, mtime_ns) baselines for retained candidates'
     /// backing + advertising files. An in-place edit (same
@@ -1116,6 +1147,7 @@ impl SessionCore {
             map_flap: HashMap::new(),
             flap_changed: Vec::new(),
             flap_carry: Vec::new(),
+            flap_carry_overflow: false,
             backing_freshness: HashMap::new(),
             last_good_maps: Vec::new(),
             candidates: Vec::new(),
@@ -1371,17 +1403,18 @@ impl SessionCore {
     }
 
     /// Refresh the mapping-flap memory from this poll's snapshot
-    /// (R20-fix round 2, F4): ranges whose (dev, ino) changed since
-    /// the previous poll land in `flap_changed` for this poll's ROW
-    /// arm. STAT-domain dev (the attribution identity); ends are
-    /// carried for containment checks, never compared (a same-file
-    /// resize is not a flap).
+    /// (R20-fix round 2, F4; offset round 4): ranges whose (dev,
+    /// ino, offset) changed since the previous poll land in
+    /// `flap_changed` for this poll's ROW arm. STAT-domain dev
+    /// (the attribution identity); ends are carried for
+    /// containment checks, never compared (a same-file resize is
+    /// not a flap).
     fn refresh_mapping_flaps(&mut self, maps: &[maps::Mapping]) {
         let mut changed = Vec::new();
         let mut present = HashSet::new();
         for m in maps {
             present.insert(m.start);
-            let triple = (backing_dev(m), m.ino);
+            let triple = (backing_dev(m), m.ino, m.offset);
             match self.map_flap.get(&m.start) {
                 None => {
                     self.map_flap.insert(m.start, triple);
@@ -1413,13 +1446,16 @@ impl SessionCore {
     /// [`Self::check_slot_backing`] (its reseat keeps the cell
     /// memory aligned, so one turnover costs one loss, not two).
     ///
-    /// `flapped` (R20-fix round 2, F4) is the mapping-flap
-    /// witness: the row's vaddr sits in a range whose (dev, ino)
-    /// changed into this poll's snapshot, so the row may be
-    /// queued pre-change — continuity unprovable even for
-    /// unseeded impls (no memory to mismatch) and flap-backs
-    /// (A→B→A, memory matches again). Flapped rows take the same
-    /// loud-drop + reseat path (one loss, same channel).
+    /// `flapped` (R20-fix round 2, F4; offset + carry-overflow
+    /// round 4) is the mapping-flap witness: the row's vaddr sits
+    /// in a range whose (dev, ino, offset) changed into this
+    /// poll's snapshot — or the flap carry overflowed (the churn
+    /// set is unknowable, so every backlog row is suspect) — so
+    /// the row may be queued pre-change: continuity unprovable
+    /// even for unseeded impls (no memory to mismatch) and
+    /// flap-backs (A→B→A, memory matches again). Flapped rows
+    /// take the same loud-drop + reseat path (one loss, same
+    /// channel).
     fn check_impl_backing(
         &mut self,
         op: u32,
@@ -1925,6 +1961,7 @@ impl SessionCore {
         self.map_flap.clear();
         self.flap_changed.clear();
         self.flap_carry.clear();
+        self.flap_carry_overflow = false;
         self.backing_freshness.clear();
         self.candidates.clear();
         self.close_candidates.clear();
@@ -2415,12 +2452,31 @@ impl SessionCore {
         }
         if ring_exhausted {
             for r in self.flap_changed.clone() {
-                if !self.flap_carry.contains(&r) {
-                    self.flap_carry.push(r);
+                if self.flap_carry.contains(&r) {
+                    continue;
                 }
+                if self.flap_carry.len() >= MAX_FLAP_CARRY_RANGES {
+                    // Fixed capacity (R20-fix round 4, NEW-2):
+                    // the churn set is unknowable past the cap, so
+                    // latch the overflow (every backlog row taints
+                    // until the ring empties) and emit the
+                    // churn-scoped overflow gap once per episode
+                    // (unlocalizable host loss — taints every op).
+                    if !self.flap_carry_overflow {
+                        self.flap_carry_overflow = true;
+                        eprintln!(
+                            "flap carry overflow: churn past {MAX_FLAP_CARRY_RANGES} ranges; \
+                             backlog rows unattributable until the ring empties"
+                        );
+                        self.tracker.note_bad_event(coverage::HOST_BAD_EVENT);
+                    }
+                    continue;
+                }
+                self.flap_carry.push(r);
             }
         } else {
             self.flap_carry.clear();
+            self.flap_carry_overflow = false;
         }
 
         // Deterministic retirement order across the pre-drain
@@ -3110,11 +3166,16 @@ impl SessionCore {
                 // rides the same gate: a row inside a range whose
                 // triple changed into this snapshot may be queued
                 // pre-change (unprovable even unseeded/flapped-back).
-                let flapped = self
-                    .flap_changed
-                    .iter()
-                    .chain(&self.flap_carry)
-                    .any(|(s, e)| *s <= ev.addr && ev.addr < *e);
+                // A latched carry overflow (round 4, NEW-2) taints
+                // every backlog row — the untracked churn may cover
+                // its vaddr. Membership is O(per-poll changed +
+                // fixed carry cap), never churn-history-sized.
+                let flapped = self.flap_carry_overflow
+                    || self
+                        .flap_changed
+                        .iter()
+                        .chain(&self.flap_carry)
+                        .any(|(s, e)| *s <= ev.addr && ev.addr < *e);
                 if !self.check_impl_backing(ev.op, ev.aux, ev.idx, ev.addr, &backing, flapped) {
                     return;
                 }
@@ -7460,5 +7521,224 @@ mod tests {
         env.events.push_back(row_bytes(1, 11, 0x1600, 0x5500, 0, 0));
         let d2 = core.poll(&mut env, a11_budget()).unwrap();
         assert!(d2.losses.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // R20-fix round 4, F4: the mapping-flap witness must compare the
+    // mapping OFFSET as well as device+inode at a range start:
+    // attribution derives the backing offset from the mapping
+    // (`attribute_impl`), so a same-file offset change between
+    // snapshots is an observed remap — a queued row may predate it.
+    // RED tests (fail on FIX_BASE — silent adoption).
+    // ------------------------------------------------------------------
+
+    fn prov_mapping_offset(ino: u64, start: u64, offset: u64) -> maps::Mapping {
+        let mut m = prov_mapping(ino, start);
+        m.offset = offset;
+        m
+    }
+
+    #[test]
+    fn r20fix4_offset_only_remap_gaps_loud() {
+        // SAME file (dev, ino, path, start all identical), new
+        // mapping offset — an observed remap. Poll 1 observes the
+        // range (no row — the impl memory is unseeded); poll 2
+        // observes the new offset and a row arrives. The row may be
+        // queued pre-remap — continuity unprovable even unseeded:
+        // loud drop (op-localized straggler), no relabel. (The
+        // per-impl memory alone has nothing to mismatch.)
+        let mut env = MiniEnv::new();
+        env.maps = vec![stable_lib(50), prov_mapping_offset(100, 0x1000, 0)];
+        let mut core = a11_core();
+        let d1 = core.poll(&mut env, a11_budget()).unwrap();
+        assert!(d1.candidates.is_empty());
+        assert!(d1.losses.is_empty());
+        // Same-file offset change: same range, same inode, new offset.
+        env.maps = vec![stable_lib(50), prov_mapping_offset(100, 0x1000, 0x1000)];
+        env.events.push_back(alg_bytes(1, 0x5500, 0, 0));
+        env.events.push_back(row_bytes(1, 11, 0x1600, 0x5500, 0, 0));
+        let d2 = core.poll(&mut env, a11_budget()).unwrap();
+        assert!(
+            d2.candidates.is_empty(),
+            "offset-flapped row must not silently adopt: {:?}",
+            d2.candidates
+        );
+        assert!(
+            d2.losses
+                .iter()
+                .any(|l| l.source == coverage::HOST_STRAGGLER && l.op == Some(1)),
+            "offset-flapped row must drop loud: {:?}",
+            d2.losses
+        );
+    }
+
+    #[test]
+    fn r20fix4_offset_flap_back_gaps_loud() {
+        // Offset flap-back A→B→A: poll 1 seeds the impl memory under
+        // offset 0; poll 2 observes offset 0x1000 (no row — the impl
+        // memory still says offset 0); poll 3 observes offset 0
+        // again and a row arrives. The row may be queued under
+        // offset 0x1000 — the vaddr flapped under it — so
+        // attribution is unprovable: loud drop. (The per-impl
+        // memory alone matches offset==offset and stays silent.)
+        let mut env = MiniEnv::new();
+        env.maps = vec![stable_lib(50), prov_mapping_offset(100, 0x1000, 0)];
+        env.events.push_back(alg_bytes(1, 0x5500, 0, 0));
+        env.events.push_back(row_bytes(1, 11, 0x1600, 0x5500, 0, 0));
+        let mut core = a11_core();
+        let d1 = core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(d1.candidates.len(), 1);
+        env.maps = vec![stable_lib(50), prov_mapping_offset(100, 0x1000, 0x1000)];
+        let d2 = core.poll(&mut env, a11_budget()).unwrap();
+        assert!(d2.candidates.is_empty());
+        assert!(
+            d2.losses.is_empty(),
+            "a flap with no rows attributes nothing: {:?}",
+            d2.losses
+        );
+        env.maps = vec![stable_lib(50), prov_mapping_offset(100, 0x1000, 0)];
+        env.events.push_back(alg_bytes(1, 0x5500, 1, 0));
+        env.events.push_back(row_bytes(1, 11, 0x1600, 0x5500, 1, 0));
+        let d3 = core.poll(&mut env, a11_budget()).unwrap();
+        assert!(
+            d3.candidates.is_empty(),
+            "post-offset-flap row must not silently adopt: {:?}",
+            d3.candidates
+        );
+        assert!(
+            d3.losses
+                .iter()
+                .any(|l| l.source == coverage::HOST_STRAGGLER && l.op == Some(1)),
+            "post-offset-flap row must drop loud: {:?}",
+            d3.losses
+        );
+    }
+
+    #[test]
+    fn r20fix4_same_file_resize_stays_silent() {
+        // GUARD (passes pre+post): a same-file resize (same start,
+        // dev, ino, offset — only the end moves) is not a remap, so
+        // rows keep attributing silently. The offset comparison must
+        // not over-fire on mappings that merely grew.
+        let mut env = MiniEnv::new();
+        env.maps = vec![stable_lib(50), prov_mapping_offset(100, 0x1000, 0)];
+        env.events.push_back(alg_bytes(1, 0x5500, 0, 0));
+        env.events.push_back(row_bytes(1, 11, 0x1600, 0x5500, 0, 0));
+        let mut core = a11_core();
+        let d1 = core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(d1.candidates.len(), 1);
+        let mut grown = prov_mapping_offset(100, 0x1000, 0);
+        grown.end = 0x3000;
+        env.maps = vec![stable_lib(50), grown];
+        env.events.push_back(alg_bytes(1, 0x5500, 1, 0));
+        env.events.push_back(row_bytes(1, 11, 0x1600, 0x5500, 1, 0));
+        let d2 = core.poll(&mut env, a11_budget()).unwrap();
+        assert!(
+            d2.losses.is_empty(),
+            "resize must not flap: {:?}",
+            d2.losses
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // R20-fix round 4, NEW-2: flap-carry storage must have a FIXED
+    // capacity with a churn-scoped overflow gap — it must not
+    // accumulate distinct historical ranges for the whole backlog
+    // episode. RED test (fails on FIX_BASE — unbounded growth, no
+    // overflow gap).
+    // ------------------------------------------------------------------
+
+    /// One churning file mapping: distinct start per index, distinct
+    /// inode per generation (every generation change flaps).
+    fn churn_mapping(i: u64, generation: u64) -> maps::Mapping {
+        maps::Mapping {
+            start: 0x10000 + i * 0x2000,
+            end: 0x10000 + i * 0x2000 + 0x1000,
+            x: true,
+            offset: 0,
+            dev: "08:01".to_string(),
+            ino: 1000 + generation * 100_000 + i,
+            path: format!("/lib/churn{i}.so"),
+        }
+    }
+
+    #[test]
+    fn r20fix4_flap_carry_overflow_gaps_churn_scoped() {
+        // Past-capacity distinct ranges churn (gen A→B) under a
+        // ring backlog that never empties: the carry must cap at
+        // its fixed capacity and emit a churn-scoped overflow gap
+        // on the overflow poll — never accumulate the whole
+        // history. While the overflow stands, rows consumed from
+        // the backlog are unattributable (the churn set is
+        // unknowable) and drop loud; once the ring empties, the
+        // carry retires and fresh rows attribute silently again.
+        // (RED ran with literals — 70 churned, cap 64 — since the
+        // const did not exist on FIX_BASE.)
+        const CHURNED: u64 = MAX_FLAP_CARRY_RANGES as u64 + 6;
+        let mut env = MiniEnv::new();
+        let mut maps_a = vec![stable_lib(50), prov_mapping(100, 0x1000)];
+        maps_a.extend((0..CHURNED).map(|i| churn_mapping(i, 0)));
+        env.maps = maps_a;
+        let mut core = a11_core();
+        let d1 = core.poll(&mut env, a11_budget()).unwrap();
+        assert!(d1.candidates.is_empty());
+        assert!(d1.losses.is_empty());
+        // All 70 churn + budget exhaustion (1 consumed, rest queued).
+        let mut maps_b = vec![stable_lib(50), prov_mapping(100, 0x1000)];
+        maps_b.extend((0..CHURNED).map(|i| churn_mapping(i, 1)));
+        env.maps = maps_b;
+        env.events.push_back(alg_bytes(1, 0x5500, 0, 0));
+        env.events.push_back(alg_bytes(1, 0x5500, 1, 0));
+        env.events.push_back(alg_bytes(1, 0x5500, 2, 0));
+        let d2 = core.poll(&mut env, PollBudget::new(1, 64)).unwrap();
+        assert!(d2.budget_exhausted, "poll 2 must leave a backlog");
+        assert!(
+            core.flap_carry.len() <= MAX_FLAP_CARRY_RANGES,
+            "flap carry must cap at {} ranges, held {}",
+            MAX_FLAP_CARRY_RANGES,
+            core.flap_carry.len()
+        );
+        assert!(
+            d2.losses
+                .iter()
+                .any(|l| l.source == coverage::HOST_BAD_EVENT && l.op.is_none()),
+            "carry overflow must emit a churn-scoped gap on the overflow poll: {:?}",
+            d2.losses
+        );
+        // Stable maps; a row in the NEVER-churned provider range is
+        // consumed from the backlog while the overflow stands: the
+        // churn set is unknowable, so it drops loud anyway.
+        env.events.push_back(alg_bytes(1, 0x5500, 5, 0));
+        env.events.push_back(row_bytes(1, 11, 0x1600, 0x5500, 5, 0));
+        let d3 = core.poll(&mut env, a11_budget()).unwrap();
+        assert!(
+            d3.candidates.is_empty(),
+            "backlog row during carry overflow must not silently adopt: {:?}",
+            d3.candidates
+        );
+        assert!(
+            d3.losses
+                .iter()
+                .any(|l| l.source == coverage::HOST_STRAGGLER && l.op == Some(1)),
+            "backlog row during carry overflow must drop loud: {:?}",
+            d3.losses
+        );
+        // Retire pin: the ring emptied in poll 3, so poll 4's fresh
+        // row attributes silently — the overflow must not gap forever.
+        env.events.push_back(alg_bytes(1, 0x5500, 6, 0));
+        env.events.push_back(row_bytes(1, 11, 0x1600, 0x5500, 6, 0));
+        let d4 = core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(
+            d4.candidates.len(),
+            1,
+            "post-overflow fresh row must attribute: {:?} {:?}",
+            d4.candidates,
+            d4.losses
+        );
+        assert!(
+            d4.losses.is_empty(),
+            "overflow must retire: {:?}",
+            d4.losses
+        );
     }
 }

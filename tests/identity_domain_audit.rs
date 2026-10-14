@@ -569,6 +569,27 @@ fn h5_t3_every_device_site_names_one_domain() {
             ".map(|m| (m.path.clone(), backing_dev(m), m.ino))",
             1,
         ),
+        // session.rs: mapping-flap memory triple (R20-fix F4;
+        // offset added round 4): STAT dev via backing_dev,
+        // maps ino + maps offset — compared only against the
+        // same-domain remembered triple (dev STAT-vs-STAT, ino
+        // and offset maps-vs-maps) — single-domain.
+        (
+            "src/discovery/session.rs",
+            "stat",
+            "let triple = (backing_dev(m), m.ino, m.offset);",
+            1,
+        ),
+        // session.rs: backing-freshness path resolve (R20-fix
+        // F5): per-mapping STAT dev (`backing_dev`) vs the
+        // candidate's STAT backing dev; ino==ino is
+        // domain-agnostic — single-domain (stat-vs-stat).
+        (
+            "src/discovery/session.rs",
+            "stat",
+            ".find(|(m, d)| m.ino == backing.ino && *d == &backing.dev)",
+            1,
+        ),
         // session.rs: install decodes the stat plan ident.
         (
             "src/discovery/session.rs",
