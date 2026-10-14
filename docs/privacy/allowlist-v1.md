@@ -252,8 +252,8 @@ GEN-mismatch as cold), `CTRL`
 (EXPECTED/epoch/SKIP-ALL/governor occupancy bound), `ATTEMPT`
 (entry-hit census), `BUCKET` (tid → tokens:8|last-refill:56 —
 per-thread tier-1 rate state, numeric only), `TRUNC_SEQ` (op →
-flag-event generation — recurring faults re-report on advance,
-numeric only). The entry plane reads
+per-CPU flag-event generation, summed at drain — recurring
+faults re-report on advance, numeric only). The entry plane reads
 NO target memory (args + map cells only — the entry cannot see rv;
 pinned by `probe_read_allowlist_is_complete`), so admission/skip
 decisions never retain target bytes. Stage-D member reads (9 sites,

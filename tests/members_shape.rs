@@ -371,7 +371,7 @@ fn s4_map_dims() {
         ("T_CACHE", 1, 8, 16, 1024, 0),
         ("CTRL", 2, 4, 24, 1, 0),
         ("ATTEMPT", 6, 4, 8, 1, 0),
-        ("TRUNC_SEQ", 1, 4, 8, 64, 0),
+        ("TRUNC_SEQ", 5, 4, 8, 64, 0),
     ];
     assert_eq!(prep.maps.len(), want.len());
     for (got, w) in prep.maps.iter().zip(want.iter()) {
