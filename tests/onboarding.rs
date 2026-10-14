@@ -1657,6 +1657,26 @@ fn triple_missing_members_refused() {
 }
 
 #[test]
+fn onboard_error_kind_is_typed_not_prefix() {
+    // Spoof-proof: a found-but-broken error whose message happens
+    // to start with the not-found wording must NOT classify as
+    // not-found (classification is a typed kind, never a prefix).
+    let spoof = onboard::OnboardError::new(
+        "no BPF objects found (spoofed wording)".to_string(),
+        "fix".to_string(),
+    );
+    assert!(!spoof.is_not_found());
+    // And a not-found error classifies by kind whatever its
+    // wording (rewording the message must not flip the run-set
+    // decision).
+    let genuine = onboard::OnboardError::not_found(
+        "custom wording, still nothing found".to_string(),
+        "fix".to_string(),
+    );
+    assert!(genuine.is_not_found());
+}
+
+#[test]
 fn triple_receipt_verified_and_stale_refused() {
     let Some(objs) = built_objects() else {
         return;
@@ -1785,9 +1805,8 @@ fn fix2_run_set_pair_only_when_members_absent_everywhere() {
     // harvest-only — the only pair-fallback branch.
     let prefix = scratch("runset-pair-only");
     let pair_dir = install_fixture(&prefix, &objs, false, None);
-    let (run, _) =
-        onboard::resolve_run_set(None, None, None, &[pair_dir.clone()], &test_trust())
-            .expect("pair-only install stays harvest-only");
+    let (run, _) = onboard::resolve_run_set(None, None, None, &[pair_dir.clone()], &test_trust())
+        .expect("pair-only install stays harvest-only");
     match run {
         onboard::RunSet::PairOnly(pair) => {
             assert_eq!(pair.harvest, pair_dir.join("osslscope-harvest"));
