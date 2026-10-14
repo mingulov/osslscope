@@ -91,8 +91,10 @@ Notes:
   guessed).
 - Window edges are monotonic nanoseconds: requested versus
   effective coverage. The effective window may be narrower (gaps),
-  never wider. There is no wall clock in v2; correlate by pid,
-  disposition and counter evidence.
+  never wider. The monotonic `window` carries no wall clock;
+  correlate by pid, disposition and counter evidence, plus the
+  wall edges in optional `context` (correlation only, never
+  authoritative).
 - `disposition` mirrors custody: `exited` (code), `detached-running`
   (owned child left running), `foreign-observed` (`--pid` target
   left untouched).
@@ -241,7 +243,9 @@ units (`calls`, `sites`, `table-rows`, `events`, `probes`) and kind
 
 T10 evaluates rules and fills `PolicyRecord`; T11 renders it.
 `verdict` is `pass`, `violation`, `inconclusive` or `no-verdict`
-(`no-verdict` exactly on `FATAL` documents with policy). The
+(`no-verdict` exactly on evidence-free `FATAL` documents with
+policy — every fatal kind except salvaged `runtime`, which
+carries the evaluated verdict over its surviving observations). The
 verdict is the AND of its rules: any `violation` rules a
 violation, else any `inconclusive` rules inconclusive, else `pass`.
 Relevance is per-rule: a `--require-executed` name absent from
@@ -333,15 +337,21 @@ evidence refs stay explicit metadata, values verbatim from
 Evidence refs read `fingerprint12@file-offset#generation:calls`
 (16 refs max, then a count). The CBOM carries the same window on
 pass/violation/`PARTIAL`/inconclusive (plus `policy-verdict` when
-evaluated); `PARTIAL`/`FATAL` ride an in-band disclaimer and
-`FATAL` has zero components (the evidence is unusable).
+evaluated); `PARTIAL`/`FATAL` ride an in-band disclaimer. An
+evidence-free `FATAL` has zero components (the evidence is
+unusable); a salvaged `runtime`-fatal exports its definite
+assets exactly like any usable document.
 
 ## Human report
 
-Byte-verbatim `tests/goldens/report-v2-complete.txt`:
+Byte-verbatim `tests/goldens/report-v2-complete.txt` (R12 golden
+shape, with recorded execution context):
 
 ```text
 osslscope report (observed-crypto-v2.1): pid=7 (demo) window=0..100ns effective=0..100ns
+duration: requested=100ns effective=100ns (monotonic; authoritative)
+kernel: 6.9.0-test
+wall: start=1700000000000000000 end=1700000030000000000 (unix-ns; context only)
 openssl: 3.5.1 (verified object metadata)
 target: argv_redacted=true container_id=(none) image_digest=(none)
 disposition: exited code=0
@@ -375,22 +385,27 @@ Candidate lines never carry counts (the site total is shared, not
 per-alias). Offsets are decimal file offsets, explicitly labeled;
 no `0x` bytes appear anywhere (`output_contract` scans for them).
 
-When execution context is recorded, three lines follow the
-header (omitted when unrecorded; unknown wall edges render
-`unknown`):
+The three context lines after the header always render
+(`src/report.rs` `render_human`): `duration` derives from the
+monotonic window (always known), while `kernel` and the `wall`
+edges render `unknown` when execution context was never
+recorded:
 
 ```text
 duration: requested=100ns effective=100ns (monotonic; authoritative)
-kernel: 6.9.0-test
-wall: start=1700000000000000000 end=1700000030000000000 (unix-ns; context only)
+kernel: unknown
+wall: start=unknown end=unknown (unix-ns; context only)
 ```
 
-Every human-rendered string passes display neutralization:
-control characters plus bidi overrides/isolates, zero-width and
-invisible format characters, line/paragraph separators, and
-interlinear-annotation controls all render as `?`, so hostile
-comm/container/digest strings cannot reshape terminal or log
-output (`src/report.rs` `safe_display`).
+Every human-rendered string passes display neutralization
+(`src/report.rs` `safe_display`): control characters plus the
+finite `is_display_control` set -- bidi overrides/isolates,
+listed zero-width characters, WORD JOINER through INVISIBLE
+PLUS (U+2060-U+2064), line/paragraph separators, and
+interlinear-annotation controls -- render as `?`. Deprecated
+U+206A-U+206F and other unlisted format controls pass through,
+so the guarantee covers the listed set, not every invisible
+format character.
 
 ## Delivery API (T10 checkpoint)
 
@@ -431,10 +446,13 @@ records the refusal. Path comparison is lexical.
   characters); file offsets render decimal.
 - `display_locator` values are operator-visible provenance with
   stated limits, not target buffer dumps.
-- Human output neutralizes display controls (`?` for control,
-  bidi, zero-width/invisible, separator, and annotation
-  characters), so rendered provenance cannot reshape the
-  terminal or log that shows it.
+- Human output neutralizes display controls (`?` for control
+  characters and the finite `is_display_control` set: bidi,
+  listed zero-width, U+2060-U+2064, separators, and annotation
+  controls; U+206A-U+206F and other unlisted format controls
+  pass through), so listed hostile display characters in
+  rendered provenance cannot reshape the terminal or log that
+  shows it.
 
 ## v1 versus v2
 
@@ -452,8 +470,9 @@ JSON/CBOM/human examples: `tests/goldens/report-v2-*`,
 `output_contract::v2_goldens_pinned`, generated from the fixtures
 in `tests/output_contract.rs`). Auditor shape:
 `tests/auditor_golden_v2.json` (pinned by `tests/auditor_report.rs`
-v2 suite). The `context` JSON and the three human context lines
-above are verbatim from the `context`-carrying golden shape
-(optional keys, omitted when unrecorded). CLI wiring examples
-stay with T10; no command above was run against a live target
-for this document.
+v2 suite). The `context` JSON above is verbatim from the
+`context`-carrying golden shape (optional keys, omitted in JSON
+when unrecorded); the human report always renders the three
+context lines, with explicit `unknown`s when unrecorded. CLI
+wiring examples stay with T10; no command above was run against
+a live target for this document.
