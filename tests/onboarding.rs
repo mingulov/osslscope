@@ -1454,3 +1454,262 @@ fn built_objects_pass_loader_shape_check() {
     onboard::check_object_compatible(onboard::ObjectRole::Count, &c)
         .unwrap_or_else(|e| panic!("built count object fails loader shape check: {e}"));
 }
+
+// ---------------------------------------------------------------------------
+// Traversal triple resolution (R19 integration).
+// ---------------------------------------------------------------------------
+
+/// Just-built BPF objects (C2 builds them; host-only checkouts skip
+/// loud — same rule as `built_objects_pass_loader_shape_check`).
+fn built_objects() -> Option<(PathBuf, PathBuf, PathBuf)> {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("crates/ebpf/target/bpfel-unknown-none/release");
+    let h = dir.join("osslscope-harvest");
+    let c = dir.join("osslscope-count");
+    let m = dir.join("osslscope-members");
+    if !h.exists() || !c.exists() || !m.exists() {
+        eprintln!("SKIP triple test: BPF objects not built (run the C2 BPF build)");
+        return None;
+    }
+    Some((h, c, m))
+}
+
+fn chmod_trusted(p: &Path, dir: bool) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let mode = if dir { 0o755 } else { 0o644 };
+    std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// Install a triple (or pair) into `$prefix/lib/osslscope/`
+/// (trusted perms), optionally writing a receipt under
+/// `$prefix/share/osslscope/`.
+fn install_fixture(
+    prefix: &Path,
+    objs: &(PathBuf, PathBuf, PathBuf),
+    with_members: bool,
+    receipt: Option<&[(String, String)]>,
+) -> PathBuf {
+    let objdir = prefix.join("lib").join("osslscope");
+    std::fs::create_dir_all(&objdir).unwrap();
+    chmod_trusted(prefix, true);
+    chmod_trusted(&prefix.join("lib"), true);
+    chmod_trusted(&objdir, true);
+    let names = [("osslscope-harvest", &objs.0), ("osslscope-count", &objs.1)];
+    for (name, src) in names {
+        let dst = objdir.join(name);
+        std::fs::copy(src, &dst).unwrap();
+        chmod_trusted(&dst, false);
+    }
+    if with_members {
+        let dst = objdir.join("osslscope-members");
+        std::fs::copy(&objs.2, &dst).unwrap();
+        chmod_trusted(&dst, false);
+    }
+    if let Some(entries) = receipt {
+        let rdir = prefix.join("share").join("osslscope");
+        std::fs::create_dir_all(&rdir).unwrap();
+        let arts: Vec<serde_json::Value> = entries
+            .iter()
+            .map(|(dest, sha)| {
+                serde_json::json!({"role": "bpf-object", "dest": dest, "sha256": sha})
+            })
+            .collect();
+        let manifest = serde_json::json!({
+            "schema": "osslscope-install-manifest-v1",
+            "artifacts": arts,
+        });
+        std::fs::write(
+            rdir.join("install-manifest.json"),
+            serde_json::to_string(&manifest).unwrap(),
+        )
+        .unwrap();
+    }
+    objdir
+}
+
+#[test]
+fn triple_explicit_all_wins() {
+    let Some((h, c, m)) = built_objects() else {
+        return;
+    };
+    // The Members compat arm accepts the built object (and
+    // rejects a wrong-role object).
+    onboard::check_object_compatible(onboard::ObjectRole::Members, &std::fs::read(&m).unwrap())
+        .unwrap_or_else(|e| panic!("built members object fails loader shape check: {e}"));
+    assert!(
+        onboard::check_object_compatible(onboard::ObjectRole::Members, &std::fs::read(&h).unwrap())
+            .is_err()
+    );
+    let (set, _) = onboard::resolve_set(Some(&h), Some(&c), Some(&m), &[], &test_trust())
+        .expect("all-explicit triple resolves");
+    assert_eq!(set.harvest, h);
+    assert_eq!(set.count, c);
+    assert_eq!(set.members, m);
+}
+
+#[test]
+fn triple_implicit_complete_dir_no_receipt() {
+    let Some(objs) = built_objects() else {
+        return;
+    };
+    // No receipt: old installs stay compatible (shape-checked).
+    let prefix = scratch("triple-no-receipt");
+    let objdir = install_fixture(&prefix, &objs, true, None);
+    let (set, search) = onboard::resolve_set(None, None, None, &[objdir.clone()], &test_trust())
+        .expect("receipt-less triple resolves");
+    assert_eq!(set.members, objdir.join("osslscope-members"));
+    assert_eq!(search.searched, vec![objdir]);
+}
+
+#[test]
+fn triple_skips_old_pair_dir() {
+    let Some(objs) = built_objects() else {
+        return;
+    };
+    // First dir: old pair (no members) — skipped, not an error.
+    let pair_pfx = scratch("triple-pair-first");
+    let pair_dir = install_fixture(&pair_pfx, &objs, false, None);
+    let triple_pfx = scratch("triple-triple-second");
+    let triple_dir = install_fixture(&triple_pfx, &objs, true, None);
+    let (set, _) = onboard::resolve_set(
+        None,
+        None,
+        None,
+        &[pair_dir, triple_dir.clone()],
+        &test_trust(),
+    )
+    .expect("old-pair dir skipped for the triple");
+    assert_eq!(set.members, triple_dir.join("osslscope-members"));
+}
+
+#[test]
+fn triple_missing_members_refused() {
+    let Some(objs) = built_objects() else {
+        return;
+    };
+    // Only pair dirs: the triple cannot resolve — actionable
+    // refusal naming the members role (never a silent
+    // harvest-only fallback).
+    let prefix = scratch("triple-missing");
+    let pair_dir = install_fixture(&prefix, &objs, false, None);
+    let err = onboard::resolve_set(None, None, None, &[pair_dir], &test_trust()).unwrap_err();
+    assert!(
+        err.message.contains("harvest+count+members triple"),
+        "message: {}",
+        err.message
+    );
+    assert!(
+        err.remediation.contains("--members-object"),
+        "remediation: {}",
+        err.remediation
+    );
+}
+
+#[test]
+fn triple_receipt_verified_and_stale_refused() {
+    let Some(objs) = built_objects() else {
+        return;
+    };
+    // Receipted prefix, all hashes match: resolves.
+    let prefix = scratch("triple-receipt-ok");
+    let objdir = prefix.join("lib").join("osslscope");
+    let dests: Vec<(String, String)> =
+        ["osslscope-harvest", "osslscope-count", "osslscope-members"]
+            .iter()
+            .map(|n| {
+                let src = match *n {
+                    "osslscope-harvest" => &objs.0,
+                    "osslscope-count" => &objs.1,
+                    _ => &objs.2,
+                };
+                (
+                    objdir.join(n).display().to_string(),
+                    onboard::file_sha256_hex(src).unwrap(),
+                )
+            })
+            .collect();
+    let objdir = install_fixture(&prefix, &objs, true, Some(&dests));
+    onboard::resolve_set(None, None, None, &[objdir], &test_trust())
+        .expect("receipt-matching triple resolves");
+    // Same prefix, receipt claims the WRONG hash for members
+    // (stale receipt): refused as stale.
+    let prefix2 = scratch("triple-receipt-stale");
+    let objdir2 = prefix2.join("lib").join("osslscope");
+    let mut stale = dests.clone();
+    for (dest, sha) in stale.iter_mut() {
+        if dest.ends_with("osslscope-members") {
+            *dest = objdir2.join("osslscope-members").display().to_string();
+            *sha = "0".repeat(64);
+        } else {
+            let name = if dest.ends_with("osslscope-harvest") {
+                "osslscope-harvest"
+            } else {
+                "osslscope-count"
+            };
+            *dest = objdir2.join(name).display().to_string();
+        }
+    }
+    // Re-mint the two honest hashes for prefix2's dests (same
+    // bytes, so the recorded hashes still match the files).
+    let objdir2 = install_fixture(&prefix2, &objs, true, Some(&stale));
+    let err = onboard::resolve_set(None, None, None, &[objdir2], &test_trust()).unwrap_err();
+    assert!(err.message.contains("stale"), "message: {}", err.message);
+    assert!(
+        err.remediation.contains("install-dev.sh"),
+        "remediation: {}",
+        err.remediation
+    );
+}
+
+#[test]
+fn triple_unlisted_role_is_mixed_set() {
+    let Some(objs) = built_objects() else {
+        return;
+    };
+    // Receipt lists only the pair; members.o is hand-placed
+    // (present but unlisted): mixed set, refused.
+    let prefix = scratch("triple-mixed");
+    let objdir = prefix.join("lib").join("osslscope");
+    let pair_only: Vec<(String, String)> = ["osslscope-harvest", "osslscope-count"]
+        .iter()
+        .map(|n| {
+            let src = if *n == "osslscope-harvest" {
+                &objs.0
+            } else {
+                &objs.1
+            };
+            (
+                objdir.join(n).display().to_string(),
+                onboard::file_sha256_hex(src).unwrap(),
+            )
+        })
+        .collect();
+    let objdir = install_fixture(&prefix, &objs, true, Some(&pair_only));
+    let err = onboard::resolve_set(None, None, None, &[objdir], &test_trust()).unwrap_err();
+    assert!(
+        err.message.contains("mixed set"),
+        "message: {}",
+        err.message
+    );
+}
+
+#[test]
+fn triple_mixed_explicit_implicit_allowed() {
+    let Some(objs) = built_objects() else {
+        return;
+    };
+    // Members explicit + pair implicit (operator's stated mix):
+    // resolves (explicit roles bypass receipts — operator-trusted).
+    let prefix = scratch("triple-mixed-ok");
+    let pair_dir = install_fixture(&prefix, &objs, false, None);
+    let (set, _) = onboard::resolve_set(
+        None,
+        None,
+        Some(&objs.2),
+        &[pair_dir.clone()],
+        &test_trust(),
+    )
+    .expect("explicit-members + implicit pair resolves");
+    assert_eq!(set.members, objs.2);
+    assert_eq!(set.harvest, pair_dir.join("osslscope-harvest"));
+}
