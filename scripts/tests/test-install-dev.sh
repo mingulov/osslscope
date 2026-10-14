@@ -108,6 +108,11 @@ if python3 -c "import json; m=json.load(open('$T/pfx/share/osslscope/install-man
 else
     bad "install-manifest.json records prefix + 3 artifacts ($(cat "$T/err"))"
 fi
+if [ "$(stat -c %a "$T/pfx/share/osslscope/install-manifest.json")" = "644" ]; then
+    ok "install-manifest.json is world-readable (unprivileged runs read their own receipt)"
+else
+    bad "install-manifest.json is world-readable (mode $(stat -c %a "$T/pfx/share/osslscope/install-manifest.json"))"
+fi
 if grep -q 'NoNewPrivs' "$T/out"; then
     ok "install reports NoNewPrivs status"
 else
