@@ -388,8 +388,11 @@ else
 fi
 
 # Members never satisfies the required triple alone: --members with
-# no manifest still needs --binary/--harvest/--count.
-if "$SH_BIN" "$INSTALL" --members "$T/members.o" --prefix "$T/pfxd" >"$T/out" 2>&1; then
+# no manifest still needs --binary/--harvest/--count (explicit
+# missing manifest — hermetic whether or not a dev build ran in
+# this checkout and left the default manifest behind).
+if "$SH_BIN" "$INSTALL" --manifest "$T/does-not-exist.json" --members "$T/members.o" \
+        --prefix "$T/pfxd" >"$T/out" 2>&1; then
     bad "--members alone with no manifest fails (got exit 0)"
 else
     grep -q 'all three of --binary/--harvest/--count' "$T/out" \
