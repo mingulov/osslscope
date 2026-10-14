@@ -143,16 +143,22 @@ attach the same way. On failure it prints the concrete fix
 An unsuitable target exits 4. `--table FILE`,
 `--force-offset N`, and `--provider-table FILE` vet with
 explicit local enrollment; `--object O` / `--count-object
-C` vet explicit BPF objects; `--format json` emits
-machine-readable output. Implicitly trusted object
-locations are the root-owned system dirs
+C` / `--members-object M` vet explicit BPF objects;
+`--format json` emits machine-readable output. Implicitly
+trusted object locations are the root-owned system dirs
 (`/usr/local/lib/osslscope`, `/usr/local/lib64/osslscope`,
 `/usr/lib/osslscope`, `/usr/lib64/osslscope` -- first complete
 pair wins; user-owned prefixes never resolve implicitly);
 anything else needs explicit flags. `doctor` vets objects with
 the same primitives the backend composes, so preflight with
 the same explicit pair (or none) predicts exactly what
-`report`/`check` will resolve.
+`report`/`check` will resolve. The `objects-members`
+row covers the traversal object: `pass` when installed and
+compatible, `info` when absent (traversal unavailable — old
+harvest/count pair installs stay valid), `fail` when present
+but unresolvable (reinstall that object). `report`/`check`
+run harvest-only; traversal selection is not yet exposed on
+their CLIs.
 
 ## alias-audit — find shared dispatch addresses
 

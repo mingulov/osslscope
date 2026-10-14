@@ -1000,6 +1000,93 @@ else
     fi
 fi
 
+# ============ members object (traversal triple, R19) ============
+cp "$T/harvest.o" "$T/members.o"
+cat >"$T/manifest-members.json" <<EOF
+{"schema": "osslscope-dev-build-manifest-v1",
+ "product_ref": "deadbeef-test",
+ "product_ref_short": "deadbee",
+ "product_dirty": false,
+ "artifacts": [
+   {"role": "host-binary", "path": "$T/host-bin"},
+   {"role": "bpf-object", "bin": "osslscope-harvest", "path": "$T/harvest.o"},
+   {"role": "bpf-object", "bin": "osslscope-count", "path": "$T/count.o"},
+   {"role": "bpf-object", "bin": "osslscope-members", "path": "$T/members.o"}
+ ]}
+EOF
+
+# Manifest WITH members: triple installs, receipt names 4 artifacts.
+if "$SH_BIN" "$INSTALL" --manifest "$T/manifest-members.json" --prefix "$T/pfxm" >"$T/out" 2>&1 \
+   && [ -f "$T/pfxm/lib/osslscope/osslscope-members" ] \
+   && cmp -s "$T/members.o" "$T/pfxm/lib/osslscope/osslscope-members"; then
+    ok "manifest with members installs osslscope-members byte-identical"
+else
+    bad "manifest with members installs osslscope-members byte-identical"
+fi
+if python3 -c "import json; m=json.load(open('$T/pfxm/share/osslscope/install-manifest.json')); assert len(m['artifacts'])==4, m; assert any(a.get('bin')=='osslscope-members' and 'sha256' in a for a in m['artifacts']), m" 2>"$T/err"; then
+    ok "install-manifest.json records the members artifact with sha256"
+else
+    bad "install-manifest.json records the members artifact with sha256 ($(cat "$T/err"))"
+fi
+
+# Pair-only manifest stays valid: no members file, 3-artifact receipt.
+if "$SH_BIN" "$INSTALL" --manifest "$T/manifest.json" --prefix "$T/pfxp" >/dev/null 2>&1 \
+   && [ ! -e "$T/pfxp/lib/osslscope/osslscope-members" ]; then
+    ok "pair-only manifest installs without members (old installs valid)"
+else
+    bad "pair-only manifest installs without members (old installs valid)"
+fi
+
+# Explicit --members overrides the manifest (operator-built object).
+cp "$T/members.o" "$T/op-members.o"
+printf 'x' >>"$T/op-members.o"
+if "$SH_BIN" "$INSTALL" --manifest "$T/manifest-members.json" --prefix "$T/pfxo" \
+        --members "$T/op-members.o" >/dev/null 2>&1 \
+   && cmp -s "$T/op-members.o" "$T/pfxo/lib/osslscope/osslscope-members"; then
+    ok "explicit --members overrides the manifest path"
+else
+    bad "explicit --members overrides the manifest path"
+fi
+
+# Explicit --members onto a pair-only manifest adds the third object.
+if "$SH_BIN" "$INSTALL" --manifest "$T/manifest.json" --prefix "$T/pfxa" \
+        --members "$T/members.o" >/dev/null 2>&1 \
+   && cmp -s "$T/members.o" "$T/pfxa/lib/osslscope/osslscope-members"; then
+    ok "explicit --members extends a pair-only manifest install"
+else
+    bad "explicit --members extends a pair-only manifest install"
+fi
+
+# Incompatible --members fails closed with the eBPF diagnosis.
+if "$SH_BIN" "$INSTALL" --manifest "$T/manifest-members.json" --prefix "$T/pfxb" \
+        --members "$T/host-bin" >"$T/out" 2>&1; then
+    bad "x86-64 executable as members object fails closed (got exit 0)"
+else
+    grep -qi 'ebpf' "$T/out" \
+        && ok "x86-64 executable as members object fails closed with eBPF diagnosis" \
+        || bad "x86-64 executable as members object fails closed with eBPF diagnosis"
+fi
+
+# Missing --members file fails naming the artifact.
+if "$SH_BIN" "$INSTALL" --manifest "$T/manifest-members.json" --prefix "$T/pfxc" \
+        --members "$T/does-not-exist.o" >"$T/out" 2>&1; then
+    bad "missing --members file fails (got exit 0)"
+else
+    grep -q 'does-not-exist.o' "$T/out" \
+        && ok "missing --members file fails naming the artifact" \
+        || bad "missing --members file fails naming the artifact"
+fi
+
+# Members never satisfies the required triple alone: --members with
+# no manifest still needs --binary/--harvest/--count.
+if "$SH_BIN" "$INSTALL" --members "$T/members.o" --prefix "$T/pfxd" >"$T/out" 2>&1; then
+    bad "--members alone with no manifest fails (got exit 0)"
+else
+    grep -q 'all three of --binary/--harvest/--count' "$T/out" \
+        && ok "--members alone with no manifest still requires the base triple" \
+        || bad "--members alone with no manifest still requires the base triple"
+fi
+
 echo "---"
 echo "pass=$PASS fail=$FAIL"
 [ "$FAIL" -eq 0 ]
