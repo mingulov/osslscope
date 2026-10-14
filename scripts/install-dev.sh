@@ -1,7 +1,7 @@
 #!/bin/sh
 # install-dev.sh — local prefix install for development builds (R09/T13).
 #
-# Installs a build-dev.sh host binary plus both BPF objects into a
+# Installs a build-dev.sh host binary plus the BPF objects into a
 # user-owned prefix (default: $HOME/.local). This is the developer path to
 # a usable install; system packages (deb/rpm) remain the only /usr path and
 # are not final distributables during development.
@@ -10,12 +10,15 @@
 #   $PREFIX/bin/osslscope
 #   $PREFIX/lib/osslscope/osslscope-harvest
 #   $PREFIX/lib/osslscope/osslscope-count
+#   $PREFIX/lib/osslscope/osslscope-members (traversal runs only; pair-only
+#     installs stay valid — the members object installs only when the
+#     build manifest lists it or --members names it explicitly)
 #   $PREFIX/share/doc/osslscope/install.md
 #   $PREFIX/share/osslscope/install-manifest.json
 #
 # Artifact sources: the build-dev.sh manifest (default
 # <repo>/target/dev-build-manifest.json) or explicit operator-built object
-# paths (--binary/--harvest/--count), which override the manifest.
+# paths (--binary/--harvest/--count/--members), which override the manifest.
 #
 # Rules, not suggestions:
 #   - No auto-install: missing prerequisites fail with a diagnosis.
@@ -27,7 +30,8 @@
 #
 # Usage:
 #   scripts/install-dev.sh [--prefix PATH] [--manifest PATH]
-#                          [--binary F] [--harvest F] [--count F] [--setcap]
+#                          [--binary F] [--harvest F] [--count F] [--members F]
+#                          [--setcap]
 #
 # Exit codes: 0 ok; 2 usage error; 3 missing prerequisite (environment);
 # 1 install/validation/setup failure. A prerequisite failure is an
@@ -41,10 +45,11 @@ MANIFEST=""
 BIN_OVERRIDE=""
 HARVEST_OVERRIDE=""
 COUNT_OVERRIDE=""
+MEMBERS_OVERRIDE=""
 SETCAP=0
 
 usage() {
-    sed -n '2,24p' "$0"
+    sed -n '2,27p' "$0"
     echo "Exit codes: 0 ok; 2 usage; 3 missing prerequisite; 1 install/setup failure."
 }
 
@@ -60,6 +65,8 @@ while [ $# -gt 0 ]; do
         --harvest=*) HARVEST_OVERRIDE="${1#--harvest=}"; shift ;;
         --count) [ $# -ge 2 ] || { echo "error: --count needs a path" >&2; exit 2; }; COUNT_OVERRIDE="$2"; shift 2 ;;
         --count=*) COUNT_OVERRIDE="${1#--count=}"; shift ;;
+        --members) [ $# -ge 2 ] || { echo "error: --members needs a path" >&2; exit 2; }; MEMBERS_OVERRIDE="$2"; shift 2 ;;
+        --members=*) MEMBERS_OVERRIDE="${1#--members=}"; shift ;;
         --setcap) SETCAP=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "error: unknown argument: $1" >&2; usage >&2; exit 2 ;;
@@ -120,12 +127,12 @@ need_cmd mkdir "install coreutils, then re-run"
 need_cmd chmod "install coreutils, then re-run"
 
 # --- resolve artifact sources ---
-if [ -z "$BIN_OVERRIDE$HARVEST_OVERRIDE$COUNT_OVERRIDE" ] && [ ! -f "$MANIFEST" ]; then
+if [ -z "$BIN_OVERRIDE$HARVEST_OVERRIDE$COUNT_OVERRIDE$MEMBERS_OVERRIDE" ] && [ ! -f "$MANIFEST" ]; then
     echo "error: build manifest not found: $MANIFEST" >&2
     echo "hint: run scripts/build-dev.sh first, or pass explicit --binary/--harvest/--count paths." >&2
     exit 1
 fi
-if { [ -n "$BIN_OVERRIDE" ] || [ -n "$HARVEST_OVERRIDE" ] || [ -n "$COUNT_OVERRIDE" ]; } \
+if { [ -n "$BIN_OVERRIDE" ] || [ -n "$HARVEST_OVERRIDE" ] || [ -n "$COUNT_OVERRIDE" ] || [ -n "$MEMBERS_OVERRIDE" ]; } \
    && [ ! -f "$MANIFEST" ] \
    && { [ -z "$BIN_OVERRIDE" ] || [ -z "$HARVEST_OVERRIDE" ] || [ -z "$COUNT_OVERRIDE" ]; }; then
     echo "error: partial overrides with no manifest: pass all three of --binary/--harvest/--count, or build first with scripts/build-dev.sh." >&2
@@ -147,10 +154,11 @@ bpf = [a for a in m.get("artifacts", []) if a.get("role") == "bpf-object"]
 host = arts.get("host-binary", {}).get("path", "")
 harvest = next((a.get("path", "") for a in bpf if a.get("bin") == "osslscope-harvest"), "")
 count = next((a.get("path", "") for a in bpf if a.get("bin") == "osslscope-count"), "")
+members = next((a.get("path", "") for a in bpf if a.get("bin") == "osslscope-members"), "")
 # One value per line: tab cannot delimit here (tab is IFS whitespace, so
 # consecutive tabs collapse and empty fields vanish — a host-only manifest
 # would misparse). Paths with newlines are not supported.
-print("%s\n%s\n%s\n%s\n%s" % (host, harvest, count,
+print("%s\n%s\n%s\n%s\n%s\n%s" % (host, harvest, count, members,
       m.get("product_ref") or "", str(m.get("product_dirty", ""))))
 EOF
 )" || exit 1
@@ -159,17 +167,19 @@ fi
 HOST_BIN="$BIN_OVERRIDE"
 HARVEST_OBJ="$HARVEST_OVERRIDE"
 COUNT_OBJ="$COUNT_OVERRIDE"
+MEMBERS_OBJ="$MEMBERS_OVERRIDE"
 PRODUCT_REF=""
 PRODUCT_DIRTY=""
 if [ -n "$MANIFEST_PATHS" ]; then
     # Pre-initialized: command substitution strips trailing empty lines, so
     # a manifest without revision keys would otherwise make the last read
     # hit EOF and abort under set -e. Missing keys mean empty metadata.
-    _m_host=""; _m_harvest=""; _m_count=""; _m_ref=""; _m_dirty=""
+    _m_host=""; _m_harvest=""; _m_count=""; _m_members=""; _m_ref=""; _m_dirty=""
     {
         IFS= read -r _m_host || true
         IFS= read -r _m_harvest || true
         IFS= read -r _m_count || true
+        IFS= read -r _m_members || true
         IFS= read -r _m_ref || true
         IFS= read -r _m_dirty || true
     } <<EOF2
@@ -178,6 +188,7 @@ EOF2
     [ -n "$HOST_BIN" ] || HOST_BIN="$_m_host"
     [ -n "$HARVEST_OBJ" ] || HARVEST_OBJ="$_m_harvest"
     [ -n "$COUNT_OBJ" ] || COUNT_OBJ="$_m_count"
+    [ -n "$MEMBERS_OBJ" ] || MEMBERS_OBJ="$_m_members"
     PRODUCT_REF="$_m_ref"
     PRODUCT_DIRTY="$_m_dirty"
 fi
@@ -185,10 +196,16 @@ fi
 [ -n "$HOST_BIN" ] || { echo "error: no host binary: manifest lists no host-binary artifact and --binary was not given (build with scripts/build-dev.sh)" >&2; exit 1; }
 [ -n "$HARVEST_OBJ" ] || { echo "error: no harvest object: manifest lists no osslscope-harvest artifact and --harvest was not given (build with scripts/build-dev.sh)" >&2; exit 1; }
 [ -n "$COUNT_OBJ" ] || { echo "error: no count object: manifest lists no osslscope-count artifact and --count was not given (build with scripts/build-dev.sh)" >&2; exit 1; }
+# Members is optional (pair-only installs stay valid): required checks
+# apply only when a members source resolved (manifest entry or override).
 for _a in "$HOST_BIN" "$HARVEST_OBJ" "$COUNT_OBJ"; do
     [ -f "$_a" ] || { echo "error: artifact not found: $_a (stale manifest? rebuild with scripts/build-dev.sh)" >&2; exit 1; }
     [ -s "$_a" ] || { echo "error: artifact is empty: $_a" >&2; exit 1; }
 done
+if [ -n "$MEMBERS_OBJ" ]; then
+    [ -f "$MEMBERS_OBJ" ] || { echo "error: artifact not found: $MEMBERS_OBJ (stale manifest? rebuild with scripts/build-dev.sh)" >&2; exit 1; }
+    [ -s "$MEMBERS_OBJ" ] || { echo "error: artifact is empty: $MEMBERS_OBJ" >&2; exit 1; }
+fi
 
 # --- fail-closed object validation ---
 HOST_FILE="$(file -b "$HOST_BIN")"
@@ -216,6 +233,9 @@ check_bpf() {
 }
 check_bpf "$HARVEST_OBJ" harvest
 check_bpf "$COUNT_OBJ" count
+if [ -n "$MEMBERS_OBJ" ]; then
+    check_bpf "$MEMBERS_OBJ" members
+fi
 
 # --- install ---
 mkdir -p "$PREFIX/bin" "$PREFIX/lib/osslscope" "$PREFIX/share/doc/osslscope" "$PREFIX/share/osslscope"
@@ -224,6 +244,10 @@ chmod 755 "$PREFIX/bin/osslscope"
 cp "$HARVEST_OBJ" "$PREFIX/lib/osslscope/osslscope-harvest"
 cp "$COUNT_OBJ" "$PREFIX/lib/osslscope/osslscope-count"
 chmod 644 "$PREFIX/lib/osslscope/osslscope-harvest" "$PREFIX/lib/osslscope/osslscope-count"
+if [ -n "$MEMBERS_OBJ" ]; then
+    cp "$MEMBERS_OBJ" "$PREFIX/lib/osslscope/osslscope-members"
+    chmod 644 "$PREFIX/lib/osslscope/osslscope-members"
+fi
 if [ -f "$REPO/docs/install.md" ]; then
     cp "$REPO/docs/install.md" "$PREFIX/share/doc/osslscope/install.md"
     chmod 644 "$PREFIX/share/doc/osslscope/install.md"
@@ -250,7 +274,7 @@ fi
 
 # --- install manifest ---
 export PREFIX MANIFEST PRODUCT_REF PRODUCT_DIRTY SETCAP_STATE REPO
-export HOST_BIN HARVEST_OBJ COUNT_OBJ
+export HOST_BIN HARVEST_OBJ COUNT_OBJ MEMBERS_OBJ
 INST_MANIFEST="$PREFIX/share/osslscope/install-manifest.json"
 python3 - "$INST_MANIFEST" <<'EOF'
 import hashlib, json, os, subprocess, sys, datetime
@@ -287,6 +311,11 @@ arts = [
     {"role": "bpf-object", "bin": "osslscope-count",
      "src": e["COUNT_OBJ"], "dest": pfx + "/lib/osslscope/osslscope-count"},
 ]
+if e.get("MEMBERS_OBJ"):
+    arts.append(
+        {"role": "bpf-object", "bin": "osslscope-members",
+         "src": e["MEMBERS_OBJ"],
+         "dest": pfx + "/lib/osslscope/osslscope-members"})
 for a in arts:
     a.update(ident(a["dest"]))
 manifest = {
@@ -310,6 +339,9 @@ echo "installed:"
 echo "  binary:  $PREFIX/bin/osslscope"
 echo "  harvest: $PREFIX/lib/osslscope/osslscope-harvest"
 echo "  count:   $PREFIX/lib/osslscope/osslscope-count"
+if [ -n "$MEMBERS_OBJ" ]; then
+    echo "  members: $PREFIX/lib/osslscope/osslscope-members"
+fi
 if [ -r /proc/self/status ]; then
     _nnp="$(grep '^NoNewPrivs:' /proc/self/status | awk '{print $2}')"
     echo "  NoNewPrivs (this shell): ${_nnp:-unknown}"
