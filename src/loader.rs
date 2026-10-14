@@ -327,8 +327,9 @@ pub const HARVEST_PROGS: [ProgSpec; 15] = [
 /// arrives with item 3; members.o dropped its PENDING_QUERY
 /// scaffold in stage D when members switched to SCAN (R18 §6.1;
 /// the harvest path's cursor maps retire in item 9). Item 5 adds
-/// the tier-1 BUCKET map; item 7 grows EVENTS to 16MiB.
-pub const MEMBER_MAPS: [MapSpec; 14] = [
+/// the tier-1 BUCKET map; item 7 grows EVENTS to 16MiB. The
+/// TRUNC_SEQ drain-race guard arrives with the round-2 fix.
+pub const MEMBER_MAPS: [MapSpec; 15] = [
     MapSpec {
         name: "EVENTS",
         map_type: 27,
@@ -435,6 +436,14 @@ pub const MEMBER_MAPS: [MapSpec; 14] = [
     },
     MapSpec {
         name: "ATTEMPT",
+        map_type: 6,
+        key_size: 4,
+        value_size: 8,
+        max_entries: 1,
+        flags: 0,
+    },
+    MapSpec {
+        name: "TRUNC_SEQ",
         map_type: 6,
         key_size: 4,
         value_size: 8,
@@ -2138,8 +2147,8 @@ pub fn load_keep_good(prep: &Prepared) -> anyhow::Result<(Loaded, Vec<FailedProg
     Ok((Loaded { progs, maps }, failed))
 }
 
-/// Member-chunk fd budget: 513 prog fds + 14 map fds + 513 link fds
-/// (all held — drop = detach) + clones + stdio ≈ 1047 > the 1024
+/// Member-chunk fd budget: 513 prog fds + 15 map fds + 513 link fds
+/// (all held — drop = detach) + clones + stdio ≈ 1048 > the 1024
 /// default (EMFILE observed at member_499). NEED is the fail-closed
 /// floor; WANT is the unprivileged raise target under the hard cap.
 pub const MEMBERS_FD_NEED: u64 = 4096;
@@ -4049,8 +4058,8 @@ mod tests {
 
     #[test]
     fn members_fd_budget_predicate() {
-        // Pure gate for the chunk's fd budget (513 prog + 14 map +
-        // 513 link fds + clones ≈ 1047 > the 1024 default): soft
+        // Pure gate for the chunk's fd budget (513 prog + 15 map +
+        // 513 link fds + clones ≈ 1048 > the 1024 default): soft
         // limits below NEED fail closed before any attach.
         assert!(!members_fd_budget_ok(1024), "default 1024 insufficient");
         assert!(!members_fd_budget_ok(MEMBERS_FD_NEED - 1));
@@ -4063,8 +4072,9 @@ mod tests {
     fn member_map_count_covers_scan_plane() {
         // The spec count is the prepare-time contract: 6 retained
         // maps + the 7 scan-plane maps + item-5 BUCKET (stage D
-        // dropped PENDING — R18 §6.1 — → 13, then +1 → 14).
-        assert_eq!(MEMBER_MAPS.len(), 14);
+        // dropped PENDING — R18 §6.1 — → 13, then +1 → 14) +
+        // the round-2 TRUNC_SEQ drain-race guard (→ 15).
+        assert_eq!(MEMBER_MAPS.len(), 15);
         assert!(
             MEMBER_MAPS.iter().all(|m| m.name != "PENDING_QUERY"),
             "PENDING dropped in D"

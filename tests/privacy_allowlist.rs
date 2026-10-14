@@ -114,11 +114,12 @@ fn map_inventory_matches_sources() {
         "unexpected count map count: {src_count:?}"
     );
     // Stage D dropped PENDING (members read SCAN — R18 §6.1);
-    // item 5 re-added BUCKET (tier-1 per-tid rate state) —
-    // end state 14 (the doc section moves with the stage).
+    // item 5 re-added BUCKET (tier-1 per-tid rate state), and the
+    // round-2 fix adds TRUNC_SEQ (TRUNC drain-race guard) —
+    // end state 15 (the doc section moves with the stage).
     assert_eq!(
         src_members.len(),
-        14,
+        15,
         "unexpected members map count: {src_members:?}"
     );
     assert!(
@@ -241,21 +242,25 @@ fn probe_read_allowlist_is_complete() {
         harvest.contains("[0u8; 128]"),
         "alg-name string bound missing"
     );
-    // Members (stage D): 8 source sites (walk_dispatch 2 +
-    // member slot tuple 2 + member-0 no_store pointee 1 +
-    // would-skip no_store pointee 1 + guard tail 1 + name string
-    // 1), 1 string read. The D additions are the T-gate's local
-    // eligibility read (would-skip path — a u32 verdict, never
-    // retained past the branch) and the guard's single positional
-    // slot-512 read (names-present verdict → GUARD event only).
-    // The ENTRY plane (entry + skip-path helpers through
+    // Members (stage D + round-2): 9 source sites (walk_dispatch
+    // 2 + member slot tuple 2 + member-0 no_store pointee 1 +
+    // would-skip no_store pointee 1 + T+1 boundary names 1 +
+    // guard tail 1 + name string 1), 1 string read. The D
+    // additions are the T-gate's local eligibility read
+    // (would-skip path — a u32 verdict, never retained past the
+    // branch) and the guard's single positional slot-512 read
+    // (names-present verdict → GUARD event only). The round-2
+    // addition is the T+1 boundary proof (u64 names read — zero
+    // proves the terminator via an explicit ALG_EMPTY, anything
+    // else cold-walks; the value is never retained past the
+    // branch). The ENTRY plane (entry + skip-path helpers through
     // `def_member`) reads NO target memory — args and map cells
     // only (R18 §3: the entry cannot see rv).
     let m_total = members.match_indices("bpf_probe_read_user").count();
     let m_str = members
         .match_indices("bpf_probe_read_user_str_bytes")
         .count();
-    assert_eq!(m_total, 8, "expected 8 member read sites, found {m_total}");
+    assert_eq!(m_total, 9, "expected 9 member read sites, found {m_total}");
     assert_eq!(m_str, 1, "expected 1 member string read, found {m_str}");
     // Entry plane = `bump_attempt` (first entry helper) through
     // the member macro (exclusive): entry + skip-path helpers, all
