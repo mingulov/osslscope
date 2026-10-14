@@ -2,7 +2,9 @@
 //! T04 owned-target custody lifecycle (R05): explicit stopped /
 //! released / reaped / detached states on every return; no owned
 //! stopped child or zombie after cleanup; external `--pid` targets
-//! are never signaled. No BPF or privileges needed.
+//! are never signaled. No BPF or privileges needed — except the
+//! R20 F1 live lane (`ordinary_production_run_…`, `#[ignore]` +
+//! env-gated, root-only), which runs production `capture::run`.
 
 use osslscope::target::{
     __test_set_control_worker_counter, __test_set_fail_fork, __test_set_prestop_pid_sink,
@@ -12,30 +14,37 @@ use osslscope::target::{
 };
 use std::time::{Duration, Instant};
 
-/// Connector facility gate (R20-fix rounds 2-3 MINOR — mirrored
+/// Connector facility gate (R20-fix rounds 2-4 MINOR — mirrored
 /// in capture_controller.rs): two tiers, probed once per process
 /// (subscribing runs the initial watermark burst, so probing per
 /// test would spam). Tier 1 (`require_connector`) needs a working
 /// subscription; tier 2 (`require_clean_connector`) additionally
-/// needs the socket Drops row readable — COMPLETE/zero-loss tests
-/// use tier 2, so supported PARTIAL (drops-blind) environments
-/// skip them instead of failing. Either tier skips (pass) unless
-/// `OSSLSCOPE_REQUIRE_CONNECTOR=1` forces a hard failure.
-/// `OSSLSCOPE_CONNECTOR_TEST=force-absent` simulates absence;
-/// `=force-no-drops` simulates a drops-blind environment.
-fn connector_facility_cached() -> (bool, bool) {
+/// needs the socket Drops row readable AND a clean watermark
+/// burst (every online CPU pinned — restricted-affinity hosts
+/// record pinning loss by design). COMPLETE/zero-loss tests use
+/// tier 2, so supported PARTIAL (drops-blind or pin-limited)
+/// environments skip them instead of failing. Either tier skips
+/// (pass) unless `OSSLSCOPE_REQUIRE_CONNECTOR=1` forces a hard
+/// failure. `OSSLSCOPE_CONNECTOR_TEST=force-absent` simulates
+/// absence; `=force-no-drops` simulates a drops-blind
+/// environment; `=force-no-watermark` simulates restricted
+/// affinity (pin-limited) environments.
+fn connector_facility_cached() -> (bool, bool, bool) {
     use std::sync::OnceLock;
-    static PROBE: OnceLock<(bool, bool)> = OnceLock::new();
+    static PROBE: OnceLock<(bool, bool, bool)> = OnceLock::new();
     *PROBE.get_or_init(|| {
         let hook = std::env::var("OSSLSCOPE_CONNECTOR_TEST").unwrap_or_default();
         if hook == "force-absent" {
-            return (false, false);
+            return (false, false, false);
         }
         let f = osslscope::capture::connector_facility();
         if hook == "force-no-drops" {
-            return (f.subscribes, false);
+            return (f.subscribes, false, f.watermark_clean);
         }
-        (f.subscribes, f.drops_readable)
+        if hook == "force-no-watermark" {
+            return (f.subscribes, f.drops_readable, false);
+        }
+        (f.subscribes, f.drops_readable, f.watermark_clean)
     })
 }
 
@@ -44,7 +53,7 @@ fn connector_present() -> bool {
 }
 
 fn connector_clean() -> bool {
-    connector_facility_cached() == (true, true)
+    connector_facility_cached() == (true, true, true)
 }
 
 fn require_connector(test: &str) -> bool {
@@ -65,9 +74,16 @@ fn require_clean_connector(test: &str) -> bool {
     }
     assert!(
         std::env::var("OSSLSCOPE_REQUIRE_CONNECTOR").as_deref() != Ok("1"),
-        "{test} requires a working proc connector with readable Drops (OSSLSCOPE_REQUIRE_CONNECTOR=1)"
+        "{test} requires a working proc connector with readable Drops and clean watermark pinning (OSSLSCOPE_REQUIRE_CONNECTOR=1)"
     );
-    eprintln!("SKIP {test}: connector drops-blind here (supported PARTIAL, not zero-loss)");
+    let (_, drops, _) = connector_facility_cached();
+    if !drops {
+        eprintln!("SKIP {test}: connector drops-blind here (supported PARTIAL, not zero-loss)");
+    } else {
+        eprintln!(
+            "SKIP {test}: watermark pinning limited here (restricted affinity records loss by design; supported PARTIAL, not zero-loss)"
+        );
+    }
     false
 }
 
@@ -2497,6 +2513,17 @@ fn kernel_live_target_first_sighting_gaps_prefix() {
     );
 }
 
+/// Online CPU count established INDEPENDENTLY of the watermark
+/// machinery (R20-fix round 4, F2c): live watermark tests must not
+/// merely compare internally reported `seen` vs `sought` (`sought`
+/// counts successfully created helpers — a shortfalled burst
+/// would pass) — they pin the required set from the OS directly.
+fn r20_online_cpu_count() -> u32 {
+    let n = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
+    assert!(n >= 1, "this host must report at least one online CPU");
+    n as u32
+}
+
 #[test]
 fn kernel_subscribe_watermarks_all_cpus_pre_activity() {
     // F2 (live): subscribing to a STOPPED owned child watermarks
@@ -2504,10 +2531,16 @@ fn kernel_subscribe_watermarks_all_cpus_pre_activity() {
     // baseline while the target provably cannot emit, so later
     // traffic is interior (holes detected) with NO prefix gaps.
     // This is what keeps connector COMPLETE reachable honestly.
+    // Tier 2 (round 4, MINOR): the zero-dropped shape needs clean
+    // watermark pinning (restricted affinity records loss by
+    // design). The required set is established independently
+    // (round 4, F2c) — `sought` counts created helpers, so
+    // seen==sought alone would mask a shortfalled burst.
     use osslscope::capture::{KernelLifecycle, LifecyclePort};
-    if !require_connector("kernel_subscribe_watermarks_all_cpus_pre_activity") {
+    if !require_clean_connector("kernel_subscribe_watermarks_all_cpus_pre_activity") {
         return;
     }
+    let online = r20_online_cpu_count();
     let mut t = OwnedTarget::spawn_stopped(
         &["/bin/sleep".to_string(), "60".to_string()],
         WorkloadDest::Null,
@@ -2516,9 +2549,12 @@ fn kernel_subscribe_watermarks_all_cpus_pre_activity() {
     let pid = t.pid();
     let mut lc = KernelLifecycle::subscribe(pid, false).expect("subscribe stopped");
     let (sought, seen) = lc.watermark_status().expect("initial watermark ran");
-    assert!(sought >= 1, "at least one online CPU");
     assert_eq!(
-        seen, sought,
+        sought, online,
+        "initial watermark must seek every online CPU (independently: {online}), not just created helpers"
+    );
+    assert_eq!(
+        seen, online,
         "initial watermark must cover every online CPU"
     );
     let d = lc.poll();
@@ -2543,17 +2579,393 @@ fn kernel_close_drain_establishes_terminal_watermark() {
     if !require_clean_connector("kernel_close_drain_establishes_terminal_watermark") {
         return;
     }
+    // Required set established independently (round 4, F2c) —
+    // `sought` counts created helpers, so seen==sought alone
+    // would mask a shortfalled terminal burst.
+    let online = r20_online_cpu_count();
     let mut lc = KernelLifecycle::subscribe(std::process::id(), true).expect("subscribe");
     let _ = lc.poll();
     let tail = lc.close_drain().expect("kernel close witness");
     assert_eq!(tail.pending, 0, "close drain must reach the tail");
     let (sought, seen) = lc.watermark_status().expect("terminal watermark ran");
-    assert!(sought >= 1, "at least one online CPU");
     assert_eq!(
-        seen, sought,
+        sought, online,
+        "terminal watermark must seek every online CPU (independently: {online}), not just created helpers"
+    );
+    assert_eq!(
+        seen, online,
         "terminal successors must cover every online CPU"
     );
     assert_eq!(tail.loss, 0, "quiet close must not add terminal loss");
+}
+
+// ---------------------------------------------------------------------------
+// R20-fix round 4, F1: THE ordinary-supported-window qualification —
+// production `capture::run` on a supported crypto target with real
+// discovery, real counting, real mappings and real time. No empty
+// event source, no fake count backend, no fabricated provider
+// mapping, no bypassed resolution: the target is the pinned
+// `openssl speed` vehicle (real libcrypto queries under uprobes),
+// resolved through production resolution. The control FAILS if
+// ordinary production capture cannot run free of polling fallback
+// (deliberately NOT connector-gated — a fallback run reports
+// `lifecycle-polling-partial` and fails the teeth assertion).
+//
+// Live lane (mirrors the p5d legs): `#[ignore]` + env-gated
+// (`OSSL_R20_LIVE=1`, `OSSL_R20_HARVEST_OBJECT`, `OSSL_R20_COUNT_OBJECT`
+// pointing at built BPF objects), pinned-vehicle checks, orphan
+// backstop. Needs root (BPF load + uprobe attach) and MUST run
+// single-threaded (the orphan backstop attributes new process
+// children to this leg). Without the gate it skips quietly.
+// ---------------------------------------------------------------------------
+
+/// Pinned vehicle identity (Ubuntu 3.5.5-1ubuntu3.7, debian-amd64 —
+/// same pins as the p5d legs; duplicated because that file is
+/// outside R20's allowed list).
+const R20_VEHICLE_BIN: &str = "/usr/bin/openssl";
+const R20_VEHICLE_SHA256: &str = "1d72cbc5bf62be3f3dbd7626c295b63c5fdc1dd8439f323ac47998d8a062b4c9";
+const R20_VEHICLE_VERSION_MARK: &str = "3.5.5";
+const R20_LIBCRYPTO: &str = "/usr/lib/x86_64-linux-gnu/libcrypto.so.3";
+const R20_LIBCRYPTO_SHA256: &str =
+    "5385f0436ac2e284ba8c5fb1488874057c29c04be72dea32add832694f381e28";
+
+fn r20_live_gated() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    if std::env::var("OSSL_R20_LIVE").unwrap_or_default() != "1" {
+        eprintln!("r20 F1: set OSSL_R20_LIVE=1 with built BPF objects; skipping");
+        return None;
+    }
+    let harvest: std::path::PathBuf = std::env::var("OSSL_R20_HARVEST_OBJECT")
+        .expect("OSSL_R20_HARVEST_OBJECT=<harvest BPF .o>")
+        .into();
+    let count: std::path::PathBuf = std::env::var("OSSL_R20_COUNT_OBJECT")
+        .expect("OSSL_R20_COUNT_OBJECT=<count BPF .o>")
+        .into();
+    assert!(harvest.is_file(), "harvest object missing: {harvest:?}");
+    assert!(count.is_file(), "count object missing: {count:?}");
+    Some((harvest, count))
+}
+
+fn r20_sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    let mut h = sha2::Sha256::new();
+    h.update(bytes);
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Assert the vehicle is the pinned build and the loader
+/// environment is pristine (an `LD_LIBRARY_PATH` alternate or
+/// `LD_PRELOAD` interposition would silently substitute the
+/// measured library — fail closed instead).
+fn r20_assert_vehicle_pinned() {
+    assert!(
+        std::env::var_os("LD_LIBRARY_PATH").is_none(),
+        "refusing to measure under LD_LIBRARY_PATH (loader substitution risk)"
+    );
+    assert!(
+        std::env::var_os("LD_PRELOAD").is_none(),
+        "refusing to measure under LD_PRELOAD (interposition risk)"
+    );
+    let out = std::process::Command::new(R20_VEHICLE_BIN)
+        .arg("version")
+        .output()
+        .expect("vehicle runs");
+    assert!(out.status.success(), "vehicle `openssl version` failed");
+    let v = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        v.contains(R20_VEHICLE_VERSION_MARK),
+        "vehicle version drift: {v:?}"
+    );
+    let bytes = std::fs::read(R20_VEHICLE_BIN).expect("read vehicle");
+    assert_eq!(r20_sha256_hex(&bytes), R20_VEHICLE_SHA256, "vehicle drift");
+    let lib_bytes = std::fs::read(R20_LIBCRYPTO).expect("read libcrypto");
+    assert_eq!(
+        r20_sha256_hex(&lib_bytes),
+        R20_LIBCRYPTO_SHA256,
+        "libcrypto drift"
+    );
+}
+
+/// This process's children across all threads (orphan backstop —
+/// minimal mirror of the p5d guard; sound only under
+/// `--test-threads=1`). Returns (children, enumeration failures).
+fn r20_process_children() -> (Vec<i32>, usize) {
+    let mut out = Vec::new();
+    let mut failures = 0;
+    let Ok(tasks) = std::fs::read_dir("/proc/self/task") else {
+        return (out, 1);
+    };
+    for entry in tasks {
+        let Ok(t) = entry else {
+            failures += 1;
+            continue;
+        };
+        let Ok(s) = std::fs::read_to_string(t.path().join("children")) else {
+            failures += 1;
+            continue;
+        };
+        out.extend(s.split_whitespace().filter_map(|x| x.parse::<i32>().ok()));
+    }
+    out.sort_unstable();
+    out.dedup();
+    (out, failures)
+}
+
+/// Orphan backstop: `capture::run` owns its child internally and may
+/// detach it live on salvage paths — a capture error or a failed
+/// assertion after the run would otherwise leak a running workload.
+/// Snapshots this process's children at arming; on drop, SIGKILLs +
+/// reaps any child that appeared since. Drop never panics.
+struct R20OrphanGuard {
+    before: Vec<i32>,
+}
+
+impl R20OrphanGuard {
+    fn arm() -> Self {
+        let (before, failures) = r20_process_children();
+        if failures > 0 {
+            eprintln!("r20 orphan-guard: ARM DEGRADED ({failures} enumeration failures)");
+        }
+        Self { before }
+    }
+}
+
+impl Drop for R20OrphanGuard {
+    fn drop(&mut self) {
+        let (current, failures) = r20_process_children();
+        if failures > 0 {
+            eprintln!(
+                "r20 orphan-guard: drop enumeration had {failures} failures (sweep may miss)"
+            );
+        }
+        for pid in current {
+            if self.before.contains(&pid) {
+                continue;
+            }
+            eprintln!("r20 orphan-guard: reclaiming leaked child {pid}");
+            let r = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+            if r != 0 {
+                let e = std::io::Error::last_os_error();
+                if e.raw_os_error() != Some(libc::ESRCH) {
+                    eprintln!("r20 orphan-guard: SIGKILL {pid} failed: {e}");
+                }
+            }
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if Instant::now() >= deadline {
+                    eprintln!("r20 orphan-guard: child {pid} survived SIGKILL (LEAKED)");
+                    break;
+                }
+                let mut status = 0;
+                let r = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
+                if r == pid as libc::pid_t {
+                    break;
+                }
+                if r < 0 {
+                    let e = std::io::Error::last_os_error();
+                    if e.raw_os_error() == Some(libc::ECHILD) {
+                        break;
+                    }
+                    if e.raw_os_error() != Some(libc::EINTR) {
+                        eprintln!("r20 orphan-guard: waitpid {pid} failed: {e}");
+                        break;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+}
+
+/// Guarded enrollment fixture for the pinned build (runbook rung
+/// 2 — same measured fact as the p5d legs' fixture, duplicated
+/// because that file is outside R20's allowed list): offsets
+/// measured from the dbgsym twin (same build-id 0ebcfe...):
+/// `ossl_provider_query_operation` @ 0x275390, anchor
+/// `OSSL_PROVIDER_available` @ 0x275190. Production resolution
+/// REQUIRES enrollment for stripped builds (it rejects unenrolled
+/// stripped targets — observed live on HEAD), so this is the
+/// production-faithful shape, not a bypass. Unique path per run,
+/// removed on drop.
+struct R20EnrollmentTable {
+    path: std::path::PathBuf,
+}
+
+impl R20EnrollmentTable {
+    fn create() -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "r20-table-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        let content = r#"{"table_version": 1,
+    "entries": [{"build_id": "0ebcfeaee273dc860b29e067d255def704185b41",
+      "openssl": "3.5.5-1ubuntu3.7",
+      "query_offset": 2577296,
+      "anchor": "OSSL_PROVIDER_available",
+      "anchor_offset": 2576784}]}"#;
+        std::fs::write(&path, content).expect("write enrollment table");
+        Self { path }
+    }
+
+    fn path(&self) -> std::path::PathBuf {
+        self.path.clone()
+    }
+}
+
+impl Drop for R20EnrollmentTable {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn r20_doc_counter(cap: &osslscope::capture::Capture, name: &str) -> u64 {
+    cap.document
+        .counters
+        .iter()
+        .filter(|c| c.name == name)
+        .map(|c| c.value)
+        .sum()
+}
+
+#[test]
+#[ignore = "live lane only (OSSL_R20_LIVE=1 + root + BPF objects)"]
+fn ordinary_production_run_counts_real_crypto_free_of_polling_fallback() {
+    // F1 (round 4): the qualified ordinary supported production
+    // window. `openssl speed -seconds 1 aes-128-cbc` (real
+    // libcrypto queries) runs through PRODUCTION `capture::run`:
+    // production resolution accepts the target, production
+    // discovery attaches uprobes over live maps, production
+    // counting drains real query executions — nothing scripted,
+    // nothing fabricated. The honest verdict for an exited owned
+    // workload is PARTIAL via the exited-and-reaped close join
+    // (`discovery-loss`); the qualification is that the window
+    // runs COMPLETELY free of polling fallback with genuine
+    // counted calls. NOT connector-gated by design: if the
+    // connector is unavailable, production falls back and the
+    // polling-partial teeth below FAIL (that is the control).
+    let Some((harvest_object, count_object)) = r20_live_gated() else {
+        return;
+    };
+    r20_assert_vehicle_pinned();
+    // Arm BEFORE the run (no owned handle exists for capture's
+    // child — leaks on error/assert-failure paths reclaim here).
+    let _orphans = R20OrphanGuard::arm();
+    // Stripped pinned build: production resolution requires
+    // enrollment (observed live — unenrolled rejects).
+    let table = R20EnrollmentTable::create();
+    let cfg = osslscope::capture::Config {
+        harvest_object: Some(harvest_object),
+        count_object: Some(count_object),
+        provider: Some(std::path::PathBuf::from(R20_LIBCRYPTO)),
+        builtin: true,
+        table: Some(table.path()),
+        force_offset: None,
+        provider_enrollment: None,
+        resolved_provider: None,
+        duration: Duration::from_secs(15),
+        settle: Duration::from_secs(30),
+        harvest_timeout: Duration::from_secs(30),
+        grace: Duration::from_secs(5),
+        image_digest: String::new(),
+    };
+    let cap = osslscope::capture::run(
+        &cfg,
+        osslscope::capture::Target::Spawn {
+            argv: vec![
+                R20_VEHICLE_BIN.to_string(),
+                "speed".to_string(),
+                "-seconds".to_string(),
+                "1".to_string(),
+                "aes-128-cbc".to_string(),
+            ],
+            workload: WorkloadDest::Null,
+        },
+    )
+    .expect("production run must accept and complete the supported target");
+    let total_calls: u64 = cap.executions.iter().map(|e| e.count).sum();
+    eprintln!(
+        "r20 F1: outcome={:?} reasons={:?} executions={} calls={} child_exit={:?} \
+         build_id={:?} counters={:?}",
+        cap.outcome,
+        cap.reasons,
+        cap.executions.len(),
+        total_calls,
+        cap.child_exit,
+        cap.provider_build_id,
+        cap.document
+            .counters
+            .iter()
+            .map(|c| (c.name.as_str(), c.value))
+            .collect::<Vec<_>>()
+    );
+    // Genuineness: real queries executed and really counted.
+    assert!(
+        !cap.executions.is_empty(),
+        "production counting must observe executions: {cap:?}"
+    );
+    assert!(
+        total_calls > 0,
+        "production counting must count real calls: {cap:?}"
+    );
+    assert_eq!(cap.child_exit, Some(0), "workload must exit 0: {cap:?}");
+    assert_ne!(
+        cap.provider_build_id, "unknown",
+        "production resolution must genuinely resolve the provider: {cap:?}"
+    );
+    // THE teeth: free of polling fallback (fails if production
+    // capture fell back — the connector-gate inversion above).
+    assert!(
+        !cap.reasons.iter().any(|r| r == "lifecycle-polling-partial"),
+        "ordinary production capture must run free of polling fallback: {cap:?}"
+    );
+    // R20 lifecycle-witness pins: the kernel signal path carries
+    // the whole window with zero witness loss.
+    for name in [
+        "lifecycle.polling_fallback",
+        "lifecycle.scan_loss",
+        "lifecycle.signal_dropped",
+        "lifecycle.no_witness",
+        "lifecycle.drain_pending",
+        "lifecycle.exec_gap",
+        "lifecycle.fork_exec_ignored",
+    ] {
+        assert_eq!(
+            r20_doc_counter(&cap, name),
+            0,
+            "witness counter {name} must be zero: {cap:?}"
+        );
+    }
+    // Honest verdict shape (observed live, stable 3/3): the
+    // workload exits mid-window, so the exited-and-reaped close
+    // join withholds COMPLETE explicitly (PARTIAL). Exact reasons,
+    // each with its provenance: `discovery-loss` (the R20-owned
+    // close-join skip, counter `discovery.close_join_skipped` ==
+    // 1); `lowlevel-fallback-uninstrumented` (4 lowlevel syms on
+    // the pinned vehicle probed-but-uninstrumented — a static
+    // vehicle fact from the legacy plane, not a window loss);
+    // `unattributed` (op:2 unknown denominator — discovery/count
+    // synthesis planes, outside R20). Nothing lifecycle-owned.
+    assert!(
+        matches!(cap.outcome, osslscope::capture::Outcome::Partial),
+        "exited owned workload is honestly PARTIAL: {cap:?}"
+    );
+    assert_eq!(
+        cap.reasons,
+        vec![
+            "discovery-loss".to_string(),
+            "lowlevel-fallback-uninstrumented".to_string(),
+            "unattributed".to_string()
+        ],
+        "exact honest reason set: {cap:?}"
+    );
+    assert_eq!(
+        r20_doc_counter(&cap, "discovery.close_join_skipped"),
+        1,
+        "the close join is skipped exactly once (exited-and-reaped): {cap:?}"
+    );
 }
 
 const USERNS_PROBE_ENV: &str = "R20_USERNS_PROBE";

@@ -7453,36 +7453,42 @@ fn count_close_reap_precedes_drain_for_owned_exit() {
 // the real kernel lifecycle adapter (no fakes on the lifecycle path).
 // ---------------------------------------------------------------------------
 
-/// Connector facility gate (R20-fix rounds 2-3 MINOR — tier 1
+/// Connector facility gate (R20-fix rounds 2-4 MINOR — tier 1
 /// lives in target_lifecycle.rs; this file needs tier 2 only):
 /// probed once per process (subscribing runs the initial watermark
 /// burst, so probing per test would spam). Tier 2 needs a working
-/// subscription AND a readable socket Drops row — COMPLETE/zero-loss
-/// tests use it, so supported PARTIAL (drops-blind) environments
-/// skip them instead of failing. Skips (pass) unless
+/// subscription AND a readable socket Drops row AND a clean
+/// watermark burst (every online CPU pinned — restricted-affinity
+/// hosts record pinning loss by design). COMPLETE/zero-loss tests
+/// use it, so supported PARTIAL (drops-blind or pin-limited)
+/// environments skip them instead of failing. Skips (pass) unless
 /// `OSSLSCOPE_REQUIRE_CONNECTOR=1` forces a hard failure.
 /// `OSSLSCOPE_CONNECTOR_TEST=force-absent` simulates absence;
-/// `=force-no-drops` simulates a drops-blind environment (test
+/// `=force-no-drops` simulates a drops-blind environment;
+/// `=force-no-watermark` simulates restricted affinity (test
 /// hooks — prove the skip paths where the facility is present).
 /// The probe subscribe/unsubscribe pair is balanced (Drop unsubscribes).
-fn connector_facility_cached() -> (bool, bool) {
+fn connector_facility_cached() -> (bool, bool, bool) {
     use std::sync::OnceLock;
-    static PROBE: OnceLock<(bool, bool)> = OnceLock::new();
+    static PROBE: OnceLock<(bool, bool, bool)> = OnceLock::new();
     *PROBE.get_or_init(|| {
         let hook = std::env::var("OSSLSCOPE_CONNECTOR_TEST").unwrap_or_default();
         if hook == "force-absent" {
-            return (false, false);
+            return (false, false, false);
         }
         let f = osslscope::capture::connector_facility();
         if hook == "force-no-drops" {
-            return (f.subscribes, false);
+            return (f.subscribes, false, f.watermark_clean);
         }
-        (f.subscribes, f.drops_readable)
+        if hook == "force-no-watermark" {
+            return (f.subscribes, f.drops_readable, false);
+        }
+        (f.subscribes, f.drops_readable, f.watermark_clean)
     })
 }
 
 fn connector_clean() -> bool {
-    connector_facility_cached() == (true, true)
+    connector_facility_cached() == (true, true, true)
 }
 
 fn require_clean_connector(test: &str) -> bool {
@@ -7491,14 +7497,24 @@ fn require_clean_connector(test: &str) -> bool {
     }
     assert!(
         std::env::var("OSSLSCOPE_REQUIRE_CONNECTOR").as_deref() != Ok("1"),
-        "{test} requires a working proc connector with readable Drops (OSSLSCOPE_REQUIRE_CONNECTOR=1)"
+        "{test} requires a working proc connector with readable Drops and clean watermark pinning (OSSLSCOPE_REQUIRE_CONNECTOR=1)"
     );
-    eprintln!("SKIP {test}: connector drops-blind here (supported PARTIAL, not zero-loss)");
+    let (_, drops, _) = connector_facility_cached();
+    if !drops {
+        eprintln!("SKIP {test}: connector drops-blind here (supported PARTIAL, not zero-loss)");
+    } else {
+        eprintln!(
+            "SKIP {test}: watermark pinning limited here (restricted affinity records loss by design; supported PARTIAL, not zero-loss)"
+        );
+    }
     false
 }
 
 // ---------------------------------------------------------------------------
-// R20-fix round 3, F1: a genuinely-observed ordinary window. A plain
+// R20-fix round 3, F1-shape: an unprivileged no-query controller
+// composition pin (NOT the F1 qualification — that is the live
+// lane `ordinary_production_run_…` in target_lifecycle.rs, which
+// runs production `run()` on a supported crypto target). A plain
 // sleep runs through the production `observe` loop with REAL
 // discovery logic (SessionCore), REAL mappings (live /proc via the
 // production maps reader), REAL time (LiveClock), REAL lifecycle
@@ -7506,16 +7522,16 @@ fn require_clean_connector(test: &str) -> bool {
 // fabricated provider mapping, no pre-release attach, no scripted
 // calls. Sleep executes no provider code, so the honest verdict is
 // no-query PARTIAL with genuinely zero calls; every link of that
-// chain is asserted from observed state, not fixtures.
+// chain is asserted from observed state, not fixtures. This pins
+// the real exec witness + fallback-free + honest-PARTIAL shape
+// where BPF privileges are absent.
 // Facility boundary (honest, explicit): the BPF event/attach
-// surface is absent on this host (no privileges), so the ring feed
-// is empty and nothing installs — the no-query verdict reports
-// exactly that blindness. Live-BPF qualification is R21 work; the
-// no-provider-mapped structural zero below does not depend on it.
-// Resolution is likewise bypassed (production `run` refuses
-// non-crypto targets at resolve time): R20 owns window-time
-// assurance, and the plan's checkbox 4 explicitly includes
-// fast/no-query programs with honest gaps.
+// surface is absent without privileges, so the ring feed is empty
+// and nothing installs — the no-query verdict reports exactly
+// that blindness. Resolution is likewise bypassed (production
+// `run` refuses non-crypto targets at resolve time — observed
+// live by the F1 control). The plan's checkbox 4 explicitly
+// includes fast/no-query programs with honest gaps.
 // ---------------------------------------------------------------------------
 
 /// SessionEnv over LIVE target state with no BPF ring (F1): mappings
@@ -7696,16 +7712,18 @@ fn real_kernel_release() -> String {
 
 #[test]
 fn ordinary_production_capture_genuinely_observed_sleep_is_honest_noquery() {
-    // F1 (round 3): the qualified ordinary window, genuinely
-    // observed. A plain `/bin/sleep 1` runs the production loop
-    // with real discovery/mappings/time/lifecycle/counting; the
-    // test asserts the whole evidence chain from observed state:
+    // F1-shape (round 3 composition pin — NOT the F1
+    // qualification; see the live lane in target_lifecycle.rs).
+    // A plain `/bin/sleep 1` runs the production loop with real
+    // discovery/mappings/time/lifecycle/counting; the test
+    // asserts the whole evidence chain from observed state:
     // live maps never contain a provider (the core's own
     // predicate, every poll) → zero candidates → zero attaches →
     // zero calls → honest no-query PARTIAL, free of polling
     // fallback, with the real exec witnessed through the
     // ordinary sweep. Tier 2: the zero-ignored-activity shape
-    // needs readable Drops (blindness would add loss).
+    // needs readable Drops plus clean watermark pinning
+    // (blindness or pin limits would add loss).
     use osslscope::capture::{LiveClock, LiveLifecycle, LiveProc};
     use osslscope::target::{OwnedTarget, WorkloadDest};
     if !require_clean_connector(
