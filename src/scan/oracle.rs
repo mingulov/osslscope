@@ -180,6 +180,13 @@ pub enum AbandonReason {
     StaleRepaired,
     /// Stalled (detach) then superseded.
     Stalled,
+    /// Tier-3 storm detach cut observation mid-flight (the
+    /// capture layer reports PARTIAL+STORM).
+    Detached,
+    /// Pre-window open fenced at the window edge (baseline
+    /// discipline: a setup-slice CALL never joins an
+    /// in-window return).
+    PreWindow,
 }
 
 /// Per-invocation outcome.
@@ -211,6 +218,8 @@ pub struct WalkDone {
     pub tid: u32,
     pub seq: u64,
     pub op: u32,
+    /// Invocation array id (from the RET; 0 when no RET joined).
+    pub arr: u64,
     pub outcome: Outcome,
     pub true_t: TrueT,
     pub alg_count: usize,
@@ -313,6 +322,46 @@ impl Oracle {
         self.open.len()
     }
 
+    /// Record what the backend wrote to T_CACHE (keeps the warm
+    /// belief truthful — the oracle knows what item 4 wrote).
+    pub fn note_warm(&mut self, arr: u64, t: u64, generation: u64) {
+        if let Some(scope) = self.scope.as_mut() {
+            scope.known_t.insert(arr, (t, generation));
+        }
+    }
+
+    /// Abandon every open invocation (tier-3 detach: no member
+    /// will ever fire again, so no RET can join — the opens are
+    /// explicitly closed, never leaked across storms).
+    pub fn abandon_all(&mut self, reason: AbandonReason) {
+        let keys: Vec<(u32, u64)> = self.open.keys().copied().collect();
+        for k in keys {
+            let o = self.open.remove(&k).expect("open abandoned");
+            self.done.push(WalkDone {
+                tid: k.0,
+                seq: k.1,
+                op: o.call.op,
+                outcome: Outcome::Abandoned { reason },
+                true_t: TrueT::Unknown,
+                arr: o.ret.map(|r| r.arr).unwrap_or(0),
+                alg_count: o.algs.len(),
+                row_count: o.rows as usize,
+                guard: o.guard,
+            });
+        }
+    }
+
+    /// Drain completed records (report-scale consumption — long
+    /// runs take incrementally instead of growing `done`).
+    pub fn take_done(&mut self) -> Vec<WalkDone> {
+        std::mem::take(&mut self.done)
+    }
+
+    /// Drain findings (same incremental discipline as done).
+    pub fn take_findings(&mut self) -> Vec<Finding> {
+        std::mem::take(&mut self.findings)
+    }
+
     /// Ingest one drain batch (ring order within each vec).
     pub fn ingest(&mut self, b: &ScanBatch) {
         let scope = self.scope.clone().expect("oracle scope set");
@@ -330,6 +379,7 @@ impl Oracle {
                     seq: 0,
                     op: c.op,
                     outcome: Outcome::Skipped { cause },
+                    arr: 0,
                     true_t: TrueT::Unknown,
                     alg_count: 0,
                     row_count: 0,
@@ -357,6 +407,7 @@ impl Oracle {
                             reason: AbandonReason::SkipVictim,
                         },
                         true_t: TrueT::Unknown,
+                        arr: o.ret.map(|r| r.arr).unwrap_or(0),
                         alg_count: o.algs.len(),
                         row_count: o.rows as usize,
                         guard: o.guard,
@@ -383,6 +434,7 @@ impl Oracle {
                         op: o.call.op,
                         outcome: Outcome::Tainted { by_seq: c.seq },
                         true_t: TrueT::Unknown,
+                        arr: o.ret.map(|r| r.arr).unwrap_or(0),
                         alg_count: o.algs.len(),
                         row_count: o.rows as usize,
                         guard: o.guard,
@@ -537,6 +589,7 @@ impl Oracle {
                             op: o.call.op,
                             outcome: Outcome::Abandoned { reason },
                             true_t: TrueT::Unknown,
+                            arr: o.ret.map(|r| r.arr).unwrap_or(0),
                             alg_count: o.algs.len(),
                             row_count: o.rows as usize,
                             guard: o.guard,
@@ -638,6 +691,7 @@ impl Oracle {
                         reason: AbandonReason::Stalled,
                     },
                     true_t: TrueT::Unknown,
+                    arr: o.ret.map(|r| r.arr).unwrap_or(0),
                     alg_count: o.algs.len(),
                     row_count: o.rows as usize,
                     guard: o.guard,
@@ -668,6 +722,7 @@ impl Oracle {
                     cached: false,
                 },
                 true_t: TrueT::EmptyTable,
+                arr: ret.arr,
                 alg_count: o.algs.len(),
                 row_count: o.rows as usize,
                 guard: o.guard,
@@ -859,6 +914,7 @@ impl Oracle {
             op: o.call.op,
             outcome,
             true_t,
+            arr: ret.arr,
             alg_count: o.algs.len(),
             row_count: o.rows as usize,
             guard: o.guard,
@@ -1164,5 +1220,42 @@ mod tests {
         assert_eq!(s.batches, 1);
         assert_eq!(s.records, 2);
         assert_eq!(s.bytes, ONRING_CALL + ONRING_RET);
+    }
+
+    #[test]
+    fn oracle_note_warm_abandon_take() {
+        // Backend-support methods: note_warm keeps the belief
+        // truthful, abandon_all closes opens explicitly,
+        // take_* drains incrementally.
+        let mut o = Oracle::new(OracleScope::full());
+        o.note_warm(ARR, 9, 5);
+        let mut b = idle_batch();
+        b.calls.push(call(3, false, wire::SKIP_ADMITTED));
+        b.rets.push(ret(3, 5, false));
+        for j in 0..10 {
+            b.algs.push(alg(3, j, wire::ALG_OK));
+        }
+        // A second invocation stays open (no RET).
+        b.calls.push(call(4, false, wire::SKIP_ADMITTED));
+        o.ingest(&b);
+        assert_eq!(o.done.len(), 1);
+        assert!(matches!(
+            o.done[0].outcome,
+            Outcome::Complete { cached: true, .. }
+        ));
+        o.abandon_all(AbandonReason::Detached);
+        assert_eq!(o.open_count(), 0);
+        assert!(matches!(
+            o.done[1].outcome,
+            Outcome::Abandoned {
+                reason: AbandonReason::Detached
+            }
+        ));
+        assert_eq!(o.done[1].seq, 4);
+        let done = o.take_done();
+        assert_eq!(done.len(), 2);
+        assert!(o.done.is_empty());
+        let findings = o.take_findings();
+        assert!(findings.is_empty());
     }
 }
