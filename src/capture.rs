@@ -185,152 +185,14 @@ pub struct TripleProvenance {
     pub members: ObjectProvenance,
 }
 
-/// Traversal query anchor: the physical site the members
-/// backend observes (query-fn file offset in the anchor exe,
-/// fingerprinted once at attach — the inventory adaptation's
-/// site key).
-#[derive(Debug, Clone)]
-pub struct TraversalAnchor {
-    pub site: SiteKey,
-}
-
-/// Build the anchor site key from the live anchor exe (stat +
-/// build-id at attach — the exe must exist for the uprobes
-/// anyway, so an unreadable anchor refuses instead of guessing).
-/// Missing build-id falls back to `unverified:dev:ino` (the same
-/// fallback [`object_id_for_mapping`] uses for unmapped files).
-/// Bounded anchor-exe prefix for build-id fingerprinting (never
-/// a whole-file read — the anchor honors the read budget like
-/// every other object scan; build-id notes live early, so a
-/// prefix suffices and large exes keep their identity).
-fn read_anchor_prefix(exe_path: &Path) -> Option<Vec<u8>> {
-    onboard::read_prefix(exe_path, onboard::MAX_ANCHOR_SCAN_BYTES).ok()
-}
-
-fn traversal_anchor(exe_path: &Path, off: u64) -> anyhow::Result<TraversalAnchor> {
-    use std::os::unix::fs::MetadataExt as _;
-    let meta = std::fs::metadata(exe_path)
-        .map_err(|e| anyhow::anyhow!("traversal anchor {} unreadable: {e}", exe_path.display()))?;
-    let device = meta.dev();
-    let inode = meta.ino();
-    let object = read_anchor_prefix(exe_path)
-        .and_then(|bytes| crate::discovery::elf::read_build_id(&bytes))
-        .map(|id| ObjectId(format!("build:{id}")))
-        .unwrap_or_else(|| ObjectId(format!("unverified:{device}:{inode}")));
-    Ok(TraversalAnchor {
-        site: SiteKey {
-            object,
-            device,
-            inode,
-            offset: off,
-        },
-    })
-}
-
-/// Capture window bounds (capture-ns): the inventory adaptation
-/// only bills in-window records (post-window settles and
-/// pre-window strays never become executions).
-pub struct TraversalWindow {
-    pub start_ns: u64,
-    pub end_ns: u64,
-}
-
-/// Adapt completed traversal records into count-session sites
-/// (one [`SiteExecution`] per query op at the anchor). Every
-/// field derives from real evidence — never fabricated:
-/// - `calls` is the admitted-query census for the op
-///   (kernel-counted, complete) — never the observed record
-///   count (a traversal sample). An op with no census entry (or
-///   a zero count) bills nothing: its records stay in the
-///   traversal outcome section, but no execution is minted.
-/// - identities are per retained dispatch ROW (real funcids from
-///   the walked dispatch tables — never funcid 0, never the
-///   query anchor as a callback), each carrying its slot's
-///   registry class. Rows for slots with no ALG record are stray
-///   (a close finding already names them) and never inventoried.
-/// - coverage follows R01 evidence ambiguity exactly like the
-///   harvest path: MIXED rides along as Unknown (ambiguous names
-///   never complete), TRUNCATED/OVERLONG/UNKNOWN/UNREADABLE
-///   degrade like bad reads; only all-OK slots complete. A
-///   record with no rows at all proves an empty dispatch
-///   (Complete records are ring-loss quiescent) and bills an
-///   empty candidate list, honestly.
-///
-/// Only Complete in-window records adapt (proven tables);
-/// partial/tainted/abandoned/skipped records stay in the
-/// traversal outcome + PARTIAL reasons. `generation` is the
-/// count drain's current fence generation (R03) — adapted sites
-/// join the current shelf, so they stamp it like shelf-mates.
-pub fn adapt_traversal_sites(
-    done: &[WalkDone],
-    anchor: &TraversalAnchor,
-    admitted_by_op: &BTreeMap<u32, u64>,
-    window: &TraversalWindow,
-    generation: u32,
-) -> Vec<SiteExecution> {
-    let completes = done.iter().filter(|w| {
-        matches!(w.outcome, crate::scan::oracle::Outcome::Complete { .. })
-            && w.event_ns >= window.start_ns
-            && w.event_ns <= window.end_ns
-    });
-    let mut by_op: BTreeMap<u32, Vec<&WalkDone>> = BTreeMap::new();
-    for w in completes {
-        by_op.entry(w.op).or_default().push(w);
-    }
-    by_op
-        .into_iter()
-        .filter_map(|(op, records)| {
-            // Real count evidence or nothing: the census bills
-            // the executions; an uncounted op mints nothing.
-            let calls = match admitted_by_op.get(&op).copied().unwrap_or(0) {
-                0 => return None,
-                n => n,
-            };
-            let first_ns = records.iter().map(|w| w.event_ns).min().unwrap_or(0);
-            let last_ns = records.iter().map(|w| w.event_ns).max().unwrap_or(0);
-            let mut ambiguous = false;
-            let mut candidates: Vec<CandidateIdentity> = Vec::new();
-            for w in &records {
-                for r in &w.rows {
-                    let Some(slot) = w.algs.iter().find(|a| a.idx == r.idx) else {
-                        continue;
-                    };
-                    if slot.status != osslscope_ebpf_common::ALG_OK {
-                        // R01 ambiguity (harvest rule): mixed
-                        // rides along Unknown; every other non-OK
-                        // verdict degrades like a bad read.
-                        ambiguous = true;
-                    }
-                    candidates.push(CandidateIdentity::new(
-                        ObjectId("unknown".to_string()),
-                        "unknown".to_string(),
-                        op,
-                        r.funcid,
-                        vec![alg_class_name(slot.class)],
-                        slot.weak != 0,
-                    ));
-                }
-            }
-            candidates.sort();
-            candidates.dedup();
-            let candidates_coverage = if ambiguous {
-                CandidateCoverage::Unknown
-            } else {
-                CandidateCoverage::Complete
-            };
-            Some(SiteExecution {
-                site: anchor.site.clone(),
-                generation,
-                candidates,
-                candidates_coverage,
-                calls,
-                first_ns,
-                last_ns,
-                installed_at: None,
-            })
-        })
-        .collect()
-}
+// NOTE (round 3, F1): traversal records are NOT adapted into
+// count-session executions. Callback execution is unobservable
+// in v1, so any `SiteExecution` assembled from query visibility
+// would fabricate execution (fetch/query visibility is not
+// execution evidence). Traversal reports natively via
+// `TraversalCapture` (records + per-slot identities + TRUE-T +
+// outcomes + provenance) and the report `traversal` section; the
+// inventory carries only count-observed executions.
 
 /// Summarize a traversal outcome into the document's traversal
 /// record (the exact selected triple + counts — `None` when the
@@ -352,20 +214,6 @@ fn traversal_record(t: &TraversalCapture) -> Option<evidence::TraversalRecord> {
     })
 }
 
-/// Registry spelling for an ALG class index (`other` for the
-/// OTHER sentinel and out-of-range ids — the kernel and the
-/// registry share the frozen order, so out-of-range is
-/// version-skew evidence, bounded as `other`, never a panic).
-fn alg_class_name(class: u16) -> String {
-    if class == osslscope_ebpf_common::OTHER_CLASS {
-        return "other".to_string();
-    }
-    crate::kinds::ALG_NAMES
-        .get(class as usize)
-        .map(|a| a.name.to_string())
-        .unwrap_or_else(|| "other".to_string())
-}
-
 /// One traversal poll's outputs (port → Runner): completed
 /// invocation records, join findings, and the PARTIAL reasons
 /// this poll earned (storm cut observation, throttle skipped
@@ -378,10 +226,10 @@ pub struct TraversalDelta {
     /// In-window backend polls this delta covers (1 per round
     /// poll; the baseline poll contributes 0).
     pub polls: u64,
-    /// Admitted-query census snapshot (per op, cumulative since
-    /// attach): last-wins into the capture; the inventory
-    /// adaptation bills executions against it.
-    pub admitted: BTreeMap<u32, u64>,
+    /// Post-drain verdict corrections (the Runner applies them
+    /// to its held verdicts by (tid, seq) — a consumed verdict
+    /// never stands on mixed evidence).
+    pub corrections: Vec<crate::scan::oracle::Correction>,
 }
 
 /// Retained traversal outcome (on [`Capture`] when traversal ran;
@@ -399,28 +247,24 @@ pub struct TraversalCapture {
     /// The final tail drain failed (records kept are the
     /// drained-so-far prefix — proved facts, H7).
     pub finish_error: Option<String>,
-    /// Latest admitted-query census snapshot (per op): the real
-    /// count evidence the inventory adaptation bills executions
-    /// against (never the observed record count).
-    pub admitted_by_op: BTreeMap<u32, u64>,
+    /// Pending post-drain corrections (rewrites for already-held
+    /// verdicts — applied by [`TraversalCapture::merge`], never
+    /// left standing).
+    pub corrections: Vec<crate::scan::oracle::Correction>,
 }
 
 impl TraversalCapture {
     /// Merge a later drain (finish tail) into the accumulated
     /// outcome: records append, end-state flags refresh,
-    /// provenance/finish-error fill once.
+    /// provenance/finish-error fill once, then pending
+    /// corrections rewrite held verdicts by key.
     fn merge(&mut self, tail: TraversalCapture) {
         self.done.extend(tail.done);
         self.findings.extend(tail.findings);
+        apply_corrections(&mut self.done, &tail.corrections);
         self.polls += tail.polls;
         self.throttled = tail.throttled;
         self.detached = tail.detached;
-        // Census snapshots are cumulative (never shrink): the
-        // latest non-empty snapshot wins; an empty tail (no poll)
-        // keeps the accumulated one.
-        if !tail.admitted_by_op.is_empty() {
-            self.admitted_by_op = tail.admitted_by_op;
-        }
         if self.provenance.is_none() {
             self.provenance = tail.provenance;
         }
@@ -743,11 +587,6 @@ pub trait DiscoveryPort {
     fn traversal_active(&self) -> bool {
         false
     }
-    /// The traversal query anchor (adaptation site key; `None`
-    /// unless traversal is active).
-    fn traversal_anchor(&self) -> Option<TraversalAnchor> {
-        None
-    }
     /// Provider turnover fence (the backend retires its GEN/cache
     /// epoch with the discovery generation; harvest-only ports
     /// no-op).
@@ -834,7 +673,6 @@ pub struct LiveTraversalDiscovery {
     backend: ScanBackend,
     tasks: crate::scan::registry::ProcTaskSource,
     provenance: TripleProvenance,
-    anchor: TraversalAnchor,
 }
 
 impl LiveTraversalDiscovery {
@@ -843,14 +681,12 @@ impl LiveTraversalDiscovery {
         backend: ScanBackend,
         pid: u32,
         provenance: TripleProvenance,
-        anchor: TraversalAnchor,
     ) -> Self {
         Self {
             inner: LiveDiscovery::new(session),
             backend,
             tasks: crate::scan::registry::ProcTaskSource::new(pid),
             provenance,
-            anchor,
         }
     }
 }
@@ -892,7 +728,7 @@ impl DiscoveryPort for LiveTraversalDiscovery {
             findings: delta.findings,
             partial_reasons: reasons,
             polls: 1,
-            admitted: delta.admitted,
+            corrections: delta.corrections,
         })
     }
 
@@ -908,7 +744,7 @@ impl DiscoveryPort for LiveTraversalDiscovery {
             Ok(delta) => {
                 out.done = delta.done;
                 out.findings = delta.findings;
-                out.admitted_by_op = delta.admitted;
+                out.corrections = delta.corrections;
             }
             Err(e) => {
                 out.finish_error = Some(format!("{e:#}"));
@@ -925,10 +761,6 @@ impl DiscoveryPort for LiveTraversalDiscovery {
 
     fn traversal_active(&self) -> bool {
         true
-    }
-
-    fn traversal_anchor(&self) -> Option<TraversalAnchor> {
-        Some(self.anchor.clone())
     }
 
     fn note_provider_turnover(&mut self) -> anyhow::Result<()> {
@@ -984,13 +816,6 @@ impl DiscoveryPort for CaptureDiscovery {
         match self {
             CaptureDiscovery::HarvestOnly(d) => d.traversal_active(),
             CaptureDiscovery::Traversal(d) => d.traversal_active(),
-        }
-    }
-
-    fn traversal_anchor(&self) -> Option<TraversalAnchor> {
-        match self {
-            CaptureDiscovery::HarvestOnly(d) => d.traversal_anchor(),
-            CaptureDiscovery::Traversal(d) => d.traversal_anchor(),
         }
     }
 
@@ -5028,9 +4853,7 @@ where
                 t.done.extend(tdelta.done);
                 t.findings.extend(tdelta.findings);
                 t.polls += tdelta.polls;
-                if !tdelta.admitted.is_empty() {
-                    t.admitted_by_op = tdelta.admitted;
-                }
+                apply_corrections(&mut t.done, &tdelta.corrections);
             }
         }
         // One fence per round (Exec > ProviderChanged >
@@ -6582,46 +6405,12 @@ where
                 }
             }
         }
-        // Traversal inventory: completed query records adapt
-        // into count-session sites at the anchor (ordinary
-        // report/check production — the same evidence the
-        // traversal outcome retains, counted once here). Only
-        // in-window records bill (post-count-close settles never
-        // become executions); calls come from the admitted-query
-        // census, never the observed record count.
-        if let (Some(t), Some(anchor)) =
-            (self.traversal.as_ref(), self.discovery.traversal_anchor())
-        {
-            let window = TraversalWindow {
-                start_ns: self.window_start_ns,
-                end_ns: effective_end_ns,
-            };
-            // R03: adapted sites join the CURRENT shelf, so they
-            // stamp the current fence generation (the max over the
-            // current shelf; an empty current shelf means the
-            // latest fenced gen + 1, or 0 when nothing ever fenced).
-            let generation = drain
-                .current
-                .iter()
-                .map(|s| s.generation)
-                .max()
-                .or_else(|| {
-                    drain
-                        .fenced
-                        .iter()
-                        .map(|g| g.generation)
-                        .max()
-                        .map(|m| m + 1)
-                })
-                .unwrap_or(0);
-            drain.current.extend(adapt_traversal_sites(
-                &t.done,
-                &anchor,
-                &t.admitted_by_op,
-                &window,
-                generation,
-            ));
-        }
+        // Traversal evidence is NOT adapted into count-session
+        // sites (round 3, F1): manufacturing executions from
+        // query visibility fabricates execution. The traversal
+        // outcome (records + identities + TRUE-T + provenance)
+        // reports natively; the inventory below carries only
+        // count-observed executions.
         let mut counters = drain.counters.clone();
         counters.extend(self.activity.iter().cloned());
         counters.extend(self.extra_loss.iter().cloned());
@@ -7389,6 +7178,21 @@ fn triple_snapshot(set: &onboard::ObjectSet) -> anyhow::Result<(TripleProvenance
     ))
 }
 
+/// Apply post-drain corrections to held verdicts (pure):
+/// rewrite outcome + op by (tid, seq) key. Unknown keys are
+/// ignored (defensive — holders extend monotonically, so a
+/// correction always names a held verdict; a missing key means
+/// the holder never saw the verdict, and there is nothing
+/// false standing to fix).
+fn apply_corrections(done: &mut [WalkDone], corrections: &[crate::scan::oracle::Correction]) {
+    for c in corrections {
+        if let Some(w) = done.iter_mut().find(|w| w.tid == c.tid && w.seq == c.seq) {
+            w.outcome = c.outcome.clone();
+            w.op = c.op;
+        }
+    }
+}
+
 /// Anchor-or-degrade decision (pure): an explicit traversal
 /// request without an anchor refuses (the operator demanded the
 /// impossible); automatic selection without an anchor degrades
@@ -7452,9 +7256,8 @@ fn wrap_discovery(
         LiveClock.monotonic_ns(),
     )
     .map_err(|e| anyhow::anyhow!("members backend attach: {e:#}"))?;
-    let anchor = traversal_anchor(&exe_path, off)?;
     Ok(CaptureDiscovery::Traversal(Box::new(
-        LiveTraversalDiscovery::new(session, backend, pid, t.provenance.clone(), anchor),
+        LiveTraversalDiscovery::new(session, backend, pid, t.provenance.clone()),
     )))
 }
 
@@ -7833,22 +7636,6 @@ mod tests {
             msg.contains("does not match") || msg.contains("receipt"),
             "stale swap must name the receipt binding: {msg}"
         );
-    }
-
-    #[test]
-    fn fix2_anchor_prefix_truncates() {
-        // F11: the anchor read is a bounded prefix — a >1MiB exe
-        // yields exactly MAX_ANCHOR_SCAN_BYTES, never the whole
-        // file.
-        let n = F11_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let path =
-            std::env::temp_dir().join(format!("osslscope-f11-anchor-{}-{}", std::process::id(), n));
-        let cap = onboard::MAX_ANCHOR_SCAN_BYTES as usize;
-        let big = vec![0x41u8; cap + 64];
-        std::fs::write(&path, &big).unwrap();
-        let got = read_anchor_prefix(&path).expect("prefix reads");
-        assert_eq!(got.len(), cap, "anchor read must truncate to the cap");
-        assert_eq!(&got[..], &big[..cap]);
     }
 
     #[test]
@@ -10069,7 +9856,6 @@ mod tests {
             rounds: std::collections::VecDeque<TraversalDelta>,
             tail: TraversalCapture,
             baseline_calls: Vec<bool>,
-            anchor: Option<TraversalAnchor>,
         }
         impl TraversalStub {
             fn scripted(rounds: Vec<TraversalDelta>, tail: TraversalCapture) -> Self {
@@ -10082,17 +9868,7 @@ mod tests {
                     rounds: rounds.into(),
                     tail,
                     baseline_calls: Vec::new(),
-                    anchor: None,
                 }
-            }
-            fn anchored(
-                rounds: Vec<TraversalDelta>,
-                tail: TraversalCapture,
-                anchor: TraversalAnchor,
-            ) -> Self {
-                let mut s = Self::scripted(rounds, tail);
-                s.anchor = Some(anchor);
-                s
             }
         }
         impl DiscoveryPort for TraversalStub {
@@ -10117,9 +9893,6 @@ mod tests {
             }
             fn traversal_active(&self) -> bool {
                 true
-            }
-            fn traversal_anchor(&self) -> Option<TraversalAnchor> {
-                self.anchor.clone()
             }
         }
 
@@ -10180,28 +9953,6 @@ mod tests {
             }
         }
 
-        fn census(pairs: &[(u32, u64)]) -> std::collections::BTreeMap<u32, u64> {
-            pairs.iter().copied().collect()
-        }
-
-        fn full_window() -> TraversalWindow {
-            TraversalWindow {
-                start_ns: 0,
-                end_ns: u64::MAX,
-            }
-        }
-
-        fn anchor_stub() -> TraversalAnchor {
-            TraversalAnchor {
-                site: SiteKey {
-                    object: ObjectId("build:anchor".to_string()),
-                    device: 9,
-                    inode: 7,
-                    offset: 0x1234,
-                },
-            }
-        }
-
         fn ident(idx: u64, class: u16, status: u8, weak: u8) -> crate::scan::oracle::AlgIdentity {
             crate::scan::oracle::AlgIdentity {
                 idx,
@@ -10210,348 +9961,6 @@ mod tests {
                 weak,
             }
         }
-
-        #[test]
-        fn traversal_adaptation_groups_completes_by_op() {
-            use crate::scan::oracle::Outcome;
-            use osslscope_ebpf_common as wire;
-            let class_a = 0u16;
-            let name_a = crate::kinds::ALG_NAMES[0].name.to_string();
-            let done = vec![
-                walk_full(
-                    1,
-                    1,
-                    Outcome::Complete {
-                        true_t: 2,
-                        cached: false,
-                    },
-                    vec![
-                        ident(0, class_a, wire::ALG_OK, 0),
-                        ident(1, wire::OTHER_CLASS, wire::ALG_EMPTY, 0),
-                    ],
-                    vec![row_ev(0, 300)],
-                    100,
-                ),
-                walk_full(
-                    2,
-                    1,
-                    Outcome::Complete {
-                        true_t: 2,
-                        cached: false,
-                    },
-                    vec![
-                        ident(0, class_a, wire::ALG_OK, 1),
-                        ident(1, wire::OTHER_CLASS, wire::ALG_EMPTY, 0),
-                    ],
-                    vec![row_ev(0, 300)],
-                    200,
-                ),
-                // Partial records never adapt (proven tables only).
-                walk_full(
-                    3,
-                    1,
-                    Outcome::Partial {
-                        reasons: vec![crate::scan::oracle::PartialReason::DrainLoss],
-                    },
-                    vec![ident(0, class_a, wire::ALG_OK, 0)],
-                    vec![row_ev(0, 300)],
-                    300,
-                ),
-            ];
-            let sites =
-                adapt_traversal_sites(&done, &anchor_stub(), &census(&[(1, 7)]), &full_window(), 0);
-            assert_eq!(sites.len(), 1);
-            let s = &sites[0];
-            assert_eq!(s.site.offset, 0x1234);
-            assert_eq!(s.calls, 7, "the census bills executions, not records");
-            assert_eq!((s.first_ns, s.last_ns), (100, 200));
-            // Proven table, every served class named (EMPTY is
-            // shape, not a missing candidate).
-            assert_eq!(s.candidates_coverage, CandidateCoverage::Complete);
-            assert!(s.installed_at.is_none());
-            // One identity per (slot, funcid): the retained ROW's
-            // real funcid rides with its slot's class; the weak
-            // bit rides per-row candidates (dedup keeps both).
-            assert_eq!(s.candidates.len(), 2);
-            assert_eq!(s.candidates[0].algorithm_classes, vec![name_a.clone()]);
-            assert_eq!(s.candidates[0].op, 1);
-            assert_eq!(s.candidates[0].funcid, 300);
-            assert!(s.candidates.iter().any(|c| c.weak_alias));
-            assert!(s.candidates.iter().any(|c| !c.weak_alias));
-        }
-
-        #[test]
-        fn fix2_adaptation_stamps_current_generation() {
-            use crate::scan::oracle::Outcome;
-            use osslscope_ebpf_common as wire;
-            // Adapted sites join the count drain's CURRENT shelf —
-            // they stamp the current fence generation (R03), never
-            // a hardcoded 0 (which would claim initial-epoch
-            // binding after fences moved on).
-            let done = vec![walk_full(
-                1,
-                1,
-                Outcome::Complete {
-                    true_t: 2,
-                    cached: false,
-                },
-                vec![
-                    ident(0, 0, wire::ALG_OK, 0),
-                    ident(1, wire::OTHER_CLASS, wire::ALG_EMPTY, 0),
-                ],
-                vec![row_ev(0, 300)],
-                100,
-            )];
-            let sites =
-                adapt_traversal_sites(&done, &anchor_stub(), &census(&[(1, 7)]), &full_window(), 7);
-            assert_eq!(sites.len(), 1);
-            assert_eq!(sites[0].generation, 7, "current fence generation stamps");
-        }
-
-        #[test]
-        fn fix2_adaptation_bills_census_not_records() {
-            use crate::scan::oracle::Outcome;
-            use osslscope_ebpf_common as wire;
-            // Five observed records, seven kernel-counted admits:
-            // calls == 7 (the sample never becomes the count).
-            let done: Vec<WalkDone> = (0..5u64)
-                .map(|seq| {
-                    walk_full(
-                        seq,
-                        1,
-                        Outcome::Complete {
-                            true_t: 1,
-                            cached: false,
-                        },
-                        vec![
-                            ident(0, 0, wire::ALG_OK, 0),
-                            ident(1, wire::OTHER_CLASS, wire::ALG_EMPTY, 0),
-                        ],
-                        vec![row_ev(0, 300)],
-                        100 + seq,
-                    )
-                })
-                .collect();
-            let sites =
-                adapt_traversal_sites(&done, &anchor_stub(), &census(&[(1, 7)]), &full_window(), 0);
-            assert_eq!(sites.len(), 1);
-            assert_eq!(sites[0].calls, 7);
-        }
-
-        #[test]
-        fn fix2_adaptation_drops_uncounted_ops() {
-            use crate::scan::oracle::Outcome;
-            use osslscope_ebpf_common as wire;
-            // Complete records but no census entry: no execution
-            // is minted (the records stay in the traversal outcome
-            // section — nothing is fabricated).
-            let done = vec![walk_full(
-                1,
-                1,
-                Outcome::Complete {
-                    true_t: 1,
-                    cached: false,
-                },
-                vec![
-                    ident(0, 0, wire::ALG_OK, 0),
-                    ident(1, wire::OTHER_CLASS, wire::ALG_EMPTY, 0),
-                ],
-                vec![row_ev(0, 300)],
-                100,
-            )];
-            assert!(
-                adapt_traversal_sites(&done, &anchor_stub(), &census(&[]), &full_window(), 0)
-                    .is_empty()
-            );
-            assert!(
-                adapt_traversal_sites(&done, &anchor_stub(), &census(&[(1, 0)]), &full_window(), 0)
-                    .is_empty(),
-                "a zero census bills nothing"
-            );
-        }
-
-        #[test]
-        fn fix2_adaptation_filters_post_window_records() {
-            use crate::scan::oracle::Outcome;
-            use osslscope_ebpf_common as wire;
-            // The settle record (post-window) never becomes an
-            // execution; the in-window record bills.
-            let algs = vec![
-                ident(0, 0, wire::ALG_OK, 0),
-                ident(1, wire::OTHER_CLASS, wire::ALG_EMPTY, 0),
-            ];
-            let done = vec![
-                walk_full(
-                    1,
-                    1,
-                    Outcome::Complete {
-                        true_t: 1,
-                        cached: false,
-                    },
-                    algs.clone(),
-                    vec![row_ev(0, 300)],
-                    100,
-                ),
-                walk_full(
-                    2,
-                    1,
-                    Outcome::Complete {
-                        true_t: 1,
-                        cached: false,
-                    },
-                    algs,
-                    vec![row_ev(0, 300)],
-                    999,
-                ),
-            ];
-            let window = TraversalWindow {
-                start_ns: 0,
-                end_ns: 500,
-            };
-            let sites =
-                adapt_traversal_sites(&done, &anchor_stub(), &census(&[(1, 7)]), &window, 0);
-            assert_eq!(sites.len(), 1);
-            assert_eq!((sites[0].first_ns, sites[0].last_ns), (100, 100));
-        }
-
-        #[test]
-        fn fix2_adaptation_mixed_and_truncated_degrade() {
-            use crate::scan::oracle::Outcome;
-            use osslscope_ebpf_common as wire;
-            // R01 ambiguity: MIXED/TRUNCATED slots ride along but
-            // never Complete (harvest rule — mixed its own Unknown
-            // set, truncated a bad read).
-            for status in [wire::ALG_MIXED, wire::ALG_TRUNCATED] {
-                let done = vec![walk_full(
-                    1,
-                    1,
-                    Outcome::Complete {
-                        true_t: 1,
-                        cached: false,
-                    },
-                    vec![
-                        ident(0, 0, status, 0),
-                        ident(1, wire::OTHER_CLASS, wire::ALG_EMPTY, 0),
-                    ],
-                    vec![row_ev(0, 300)],
-                    100,
-                )];
-                let sites = adapt_traversal_sites(
-                    &done,
-                    &anchor_stub(),
-                    &census(&[(1, 7)]),
-                    &full_window(),
-                    0,
-                );
-                assert_eq!(sites.len(), 1);
-                assert_eq!(
-                    sites[0].candidates_coverage,
-                    CandidateCoverage::Unknown,
-                    "status {status} degrades"
-                );
-                assert_eq!(sites[0].candidates.len(), 1, "the class rides along");
-                assert_eq!(sites[0].candidates[0].funcid, 300);
-            }
-        }
-
-        #[test]
-        fn fix2_adaptation_skips_stray_rows() {
-            use crate::scan::oracle::Outcome;
-            use osslscope_ebpf_common as wire;
-            // A row for a slot with no ALG record is stray (a close
-            // finding names it) — never inventoried.
-            let done = vec![walk_full(
-                1,
-                1,
-                Outcome::Complete {
-                    true_t: 1,
-                    cached: false,
-                },
-                vec![
-                    ident(0, 0, wire::ALG_OK, 0),
-                    ident(1, wire::OTHER_CLASS, wire::ALG_EMPTY, 0),
-                ],
-                vec![row_ev(0, 300), row_ev(9, 301)],
-                100,
-            )];
-            let sites =
-                adapt_traversal_sites(&done, &anchor_stub(), &census(&[(1, 7)]), &full_window(), 0);
-            assert_eq!(sites.len(), 1);
-            assert_eq!(sites[0].candidates.len(), 1);
-            assert_eq!(sites[0].candidates[0].funcid, 300);
-            assert_eq!(sites[0].candidates_coverage, CandidateCoverage::Complete);
-        }
-
-        #[test]
-        fn traversal_adaptation_splits_ops_and_bounds_classes() {
-            use crate::scan::oracle::Outcome;
-            use osslscope_ebpf_common as wire;
-            let done = vec![
-                walk_full(
-                    1,
-                    1,
-                    Outcome::Complete {
-                        true_t: 1,
-                        cached: false,
-                    },
-                    vec![ident(0, wire::OTHER_CLASS, wire::ALG_UNREADABLE, 0)],
-                    vec![row_ev(0, 300)],
-                    100,
-                ),
-                walk_full(
-                    2,
-                    2,
-                    Outcome::Complete {
-                        true_t: 1,
-                        cached: false,
-                    },
-                    vec![ident(0, 0xBEEF, wire::ALG_OK, 0)],
-                    vec![row_ev(0, 301)],
-                    150,
-                ),
-                // NOIMP slots have no implementation (no dispatch
-                // walk, no rows): a Complete record with no rows at
-                // all proves an empty dispatch and bills an empty
-                // candidate list, honestly Complete.
-                walk_full(
-                    3,
-                    3,
-                    Outcome::Complete {
-                        true_t: 1,
-                        cached: false,
-                    },
-                    vec![
-                        ident(0, wire::OTHER_CLASS, wire::ALG_NOIMP, 0),
-                        ident(1, wire::OTHER_CLASS, wire::ALG_EMPTY, 0),
-                    ],
-                    vec![],
-                    180,
-                ),
-            ];
-            let counts = census(&[(1, 7), (2, 5), (3, 3)]);
-            let sites = adapt_traversal_sites(&done, &anchor_stub(), &counts, &full_window(), 0);
-            assert_eq!(sites.len(), 3);
-            // UNREADABLE bounds as `other` (and degrades — a bad
-            // read); out-of-range class ids (version skew) bound
-            // as `other`, never panic.
-            assert_eq!(sites[0].candidates[0].algorithm_classes, vec!["other"]);
-            assert_eq!(sites[1].candidates[0].algorithm_classes, vec!["other"]);
-            assert_eq!(sites[0].candidates[0].op, 1);
-            assert_eq!(sites[1].candidates[0].op, 2);
-            assert_eq!(sites[0].candidates[0].funcid, 300);
-            assert_eq!(sites[1].candidates[0].funcid, 301);
-            assert_eq!(sites[0].candidates_coverage, CandidateCoverage::Unknown);
-            assert_eq!(sites[1].candidates_coverage, CandidateCoverage::Complete);
-            assert_eq!(sites[2].candidates_coverage, CandidateCoverage::Complete);
-            assert!(sites[2].candidates.is_empty());
-            assert_eq!(sites[0].calls, 7);
-            assert_eq!(sites[1].calls, 5);
-            assert_eq!(sites[2].calls, 3);
-            assert!(
-                adapt_traversal_sites(&[], &anchor_stub(), &counts, &full_window(), 0).is_empty()
-            );
-        }
-
         fn triple_prov() -> TripleProvenance {
             let obj = |n: &str| ObjectProvenance {
                 path: PathBuf::from(format!("/prefix/lib/osslscope/{n}")),
@@ -10614,7 +10023,7 @@ mod tests {
                 findings: vec![],
                 partial_reasons: vec!["traversal-storm".to_string()],
                 polls: 1,
-                admitted: census(&[]),
+                corrections: vec![],
             };
             let d2 = TraversalDelta {
                 done: vec![walk(
@@ -10626,7 +10035,7 @@ mod tests {
                 findings: vec![OFinding::OrphanRet { tid: TPID, seq: 9 }],
                 partial_reasons: vec!["traversal-incomplete".to_string()],
                 polls: 1,
-                admitted: census(&[]),
+                corrections: vec![],
             };
             let tail = TraversalCapture {
                 provenance: Some(triple_prov()),
@@ -10639,10 +10048,10 @@ mod tests {
                 )],
                 findings: vec![],
                 polls: 1,
+                corrections: vec![],
                 throttled: true,
                 detached: false,
                 finish_error: None,
-                admitted_by_op: census(&[]),
             };
             let cfg = stub_config();
             let info = stub_info();
@@ -10675,16 +10084,82 @@ mod tests {
         }
 
         #[test]
-        fn traversal_completes_produce_inventory() {
-            // End-to-end through close_and_finalize: in-window
-            // completed traversal records adapt into document
-            // sites AND executions (ordinary report/check
-            // production), billed against the admitted-query
-            // census (not the count backend, not the record
-            // count), with per-row identities as candidates.
+        fn fix3_apply_corrections_rewrites_by_key() {
+            use crate::scan::oracle::{Correction, Outcome};
+            // Post-drain corrections rewrite the holder's copy by
+            // (tid, seq) (outcome + op); unknown keys are ignored
+            // (defensive — the holder extends monotonically, so a
+            // correction always names a held verdict).
+            let mut done = vec![
+                walk_full(
+                    1,
+                    1,
+                    Outcome::Complete {
+                        true_t: 1,
+                        cached: false,
+                    },
+                    vec![],
+                    vec![],
+                    100,
+                ),
+                walk_full(
+                    2,
+                    1,
+                    Outcome::Complete {
+                        true_t: 1,
+                        cached: false,
+                    },
+                    vec![],
+                    vec![],
+                    200,
+                ),
+            ];
+            let op0 = done[0].op;
+            apply_corrections(
+                &mut done,
+                &[Correction {
+                    tid: TPID + 1,
+                    seq: 1,
+                    outcome: Outcome::Tainted { by_seq: 2 },
+                    op: crate::scan::oracle::UNKNOWN_OP,
+                }],
+            );
+            // Wrong-tid correction ignored; right-tid rewrites.
+            assert_eq!(done[0].op, op0);
+            apply_corrections(
+                &mut done,
+                &[Correction {
+                    tid: TPID,
+                    seq: 1,
+                    outcome: Outcome::Tainted { by_seq: 2 },
+                    op: crate::scan::oracle::UNKNOWN_OP,
+                }],
+            );
+            assert!(
+                matches!(done[0].outcome, Outcome::Tainted { by_seq: 2 }),
+                "held verdict corrected: {:?}",
+                done[0].outcome
+            );
+            assert_eq!(done[0].op, crate::scan::oracle::UNKNOWN_OP);
+            assert!(
+                matches!(done[1].outcome, Outcome::Complete { .. }),
+                "uncorrected verdict untouched"
+            );
+        }
+
+        #[test]
+        fn traversal_close_produces_no_synthetic_sites() {
+            // Traversal evidence reports NATIVELY (records +
+            // per-slot identities + TRUE-T + outcomes + provenance)
+            // — never as manufactured count-session executions:
+            // callback execution is unobservable in v1, and
+            // fetch/query visibility is not execution evidence
+            // (Global Constraints). Close with a Complete record:
+            // document sites carry NO anchor-offset synthetic
+            // site, executions carry nothing synthetic, and the
+            // traversal outcome retains the record.
             use crate::scan::oracle::Outcome;
             use osslscope_ebpf_common as wire;
-            let name_a = crate::kinds::ALG_NAMES[0].name.to_string();
             let round = TraversalDelta {
                 done: vec![walk_full(
                     1,
@@ -10703,17 +10178,17 @@ mod tests {
                 findings: vec![],
                 partial_reasons: vec![],
                 polls: 1,
-                admitted: census(&[(1, 3)]),
+                corrections: vec![],
             };
             let tail = TraversalCapture {
                 provenance: Some(triple_prov()),
                 done: vec![],
                 findings: vec![],
                 polls: 1,
+                corrections: vec![],
                 throttled: false,
                 detached: false,
                 finish_error: None,
-                admitted_by_op: census(&[]),
             };
             let cfg = stub_config();
             let info = stub_info();
@@ -10724,30 +10199,27 @@ mod tests {
             let runner = stub_runner(
                 &cfg,
                 &info,
-                TraversalStub::anchored(vec![round], tail, anchor_stub()),
+                TraversalStub::scripted(vec![round], tail),
                 count,
                 &clock,
                 &mut proc,
                 &cancelled,
             );
             let cap = runner.setup_and_run().expect("stub run completes");
-            // The document carries the adapted site (calls = 3
-            // census admits, per-row identity, anchor key).
-            assert_eq!(cap.document.sites.len(), 1);
-            let site = &cap.document.sites[0];
-            assert_eq!(site.calls, 3);
-            assert_eq!(site.site.offset, 0x1234);
-            assert_eq!(site.candidates.len(), 1);
-            assert_eq!(site.candidates[0].algorithm_classes, vec![name_a.clone()]);
-            assert_eq!(site.candidates[0].funcid, 300);
-            // …and executions (what report/check render) include it.
-            assert_eq!(cap.executions.len(), 1);
-            assert_eq!(cap.executions[0].count, 3);
-            assert_eq!(cap.executions[0].id.alg_class, name_a);
-            // The traversal outcome still retains the records.
+            // The stub count backend observes nothing, and
+            // traversal manufactures nothing: the inventory is
+            // empty while the traversal outcome retains the
+            // record natively.
+            assert!(
+                cap.document.sites.is_empty(),
+                "no synthetic sites are manufactured"
+            );
+            assert!(
+                cap.executions.is_empty(),
+                "no synthetic executions are manufactured"
+            );
             assert_eq!(cap.traversal.as_ref().unwrap().done.len(), 1);
         }
-
         #[test]
         fn traversal_salvage_keeps_drained() {
             // RED: a close failure salvages the drained-so-far
@@ -10764,7 +10236,7 @@ mod tests {
                 findings: vec![],
                 partial_reasons: vec!["traversal-storm".to_string()],
                 polls: 1,
-                admitted: census(&[]),
+                corrections: vec![],
             };
             let tail = TraversalCapture {
                 provenance: Some(triple_prov()),
@@ -10777,10 +10249,10 @@ mod tests {
                 )],
                 findings: vec![],
                 polls: 1,
+                corrections: vec![],
                 throttled: false,
                 detached: true,
                 finish_error: None,
-                admitted_by_op: census(&[]),
             };
             let cfg = stub_config();
             let info = stub_info();
@@ -10921,10 +10393,10 @@ mod tests {
                 )],
                 findings: vec![],
                 polls: 1,
+                corrections: vec![],
                 throttled: false,
                 detached: true,
                 finish_error: Some("tail drained late".to_string()),
-                admitted_by_op: census(&[(1, 9)]),
             };
             acc.merge(tail);
             assert_eq!(
