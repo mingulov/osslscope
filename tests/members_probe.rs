@@ -382,12 +382,12 @@ impl Drop for ProtNonePage {
     }
 }
 
-/// Clear the op's TRUNC cell between sequenced fires (mirrors the
-/// backend's clear-on-read: each drain consumes its flags, so the
-/// next fire's TRUNC read is that fire's delta, exactly). An
-/// absent key succeeds (nothing flagged); anything else fails
-/// loud. Verified empty after (a failed clear REDs here, never
-/// as a misattributed delta downstream).
+/// Clear the op's TRUNC cell between sequenced fires (test-phase
+/// isolation: the backend never clears — sticky bits accumulate
+/// — so the leg resets the map to read each fire's flags
+/// exactly). An absent key succeeds (nothing flagged); anything
+/// else fails loud. Verified empty after (a failed clear REDs
+/// here, never as a misattributed delta downstream).
 fn clear_trunc(loaded: &Loaded, tag: &str) {
     use aya::maps::{Map, MapData, PerCpuHashMap};
     let fd = loaded.maps["TRUNC"].try_clone().expect("clone TRUNC");
@@ -528,22 +528,6 @@ fn read_scan_cell(loaded: &Loaded, tid: u32) -> Option<osslscope_ebpf_common::Sc
         Err(e) if e.raw_os_error() == Some(libc::ENOENT) => None,
         Err(e) => panic!("lookup SCAN[{tid}]: {e}"),
     }
-}
-
-/// TRUNC_SEQ total (PerCpuArray[1] summed across CPUs — the
-/// TRUNC flag-event generation for the drain-race guard).
-fn read_trunc_seq(loaded: &Loaded) -> u64 {
-    use aya::maps::{Map, MapData, PerCpuArray};
-    let fd = loaded.maps["TRUNC_SEQ"]
-        .try_clone()
-        .expect("clone TRUNC_SEQ");
-    let data = MapData::from_fd(fd).expect("mapdata");
-    let map = Map::from_map_data(data).expect("map");
-    let m = PerCpuArray::<_, u64>::try_from(map).expect("percpu-array shape");
-    m.get(&0, 0)
-        .expect("TRUNC_SEQ[0]")
-        .iter()
-        .fold(0u64, |a, &b| a.wrapping_add(b))
 }
 
 /// ATTEMPT total (PerCpuArray[1] summed across CPUs).
@@ -1251,11 +1235,11 @@ fn l1_load_513_margins() {
     assert_eq!(
         loaded.maps.len(),
         15,
-        "all member maps created (D 14 incl. TRUNC_SEQ + item-5 BUCKET)"
+        "all member maps created (D 13 + item-5 BUCKET + round-3 TRUNC_SEQ)"
     );
     assert!(
         loaded.maps.contains_key("TRUNC_SEQ"),
-        "drain-race guard map present"
+        "per-op generation map present"
     );
     assert_eq!(attached.members.len(), 512, "all member links attached");
     let ctrl = osslscope::loader::read_ctrl(&loaded.maps).expect("read CTRL");
@@ -3812,7 +3796,7 @@ fn d_retire_quiet() {
         let d = drain(loaded);
         assert!(!d.algs.is_empty(), "abort variant: live control emits");
         assert_retired(loaded, tid, "abort-control");
-        // Clear-between (mirrors clear-on-read): the control's
+        // Clear-between (test-phase isolation): the control's
         // unpadded soup may flag TRUNC bits — the abort query's
         // WALK_READ-alone pin needs a clean baseline.
         clear_trunc(loaded, "abort-control");
@@ -5809,7 +5793,7 @@ fn backend_chunk(obj: &std::path::Path, exe: &std::ffi::CString, off: u64) -> Sc
 }
 
 /// Per-CPU width of a percpu map (slot count of any row — the
-/// TRUNC_SEQ cell always exists, so it reports the width).
+/// ATTEMPT cell always exists, so it reports the width).
 fn percpu_width(loaded: &Loaded, name: &str) -> usize {
     use aya::maps::{Map, MapData, PerCpuArray};
     let fd = loaded.maps[name].try_clone().expect("clone width map");
@@ -5823,7 +5807,7 @@ fn percpu_width(loaded: &Loaded, name: &str) -> usize {
 /// flag would leave: the bit on CPU 0, zeros elsewhere).
 fn stage_trunc(loaded: &Loaded, op: u32, bit: u64) {
     use aya::maps::{Map, MapData, PerCpuHashMap, PerCpuValues};
-    let ncpu = percpu_width(loaded, "TRUNC_SEQ");
+    let ncpu = percpu_width(loaded, "ATTEMPT");
     let fd = loaded.maps["TRUNC"].try_clone().expect("clone TRUNC");
     let data = MapData::from_fd(fd).expect("mapdata");
     let map = Map::from_map_data(data).expect("map");
@@ -5834,77 +5818,18 @@ fn stage_trunc(loaded: &Loaded, op: u32, bit: u64) {
     m.insert(op, vals, 0).expect("stage TRUNC");
 }
 
-/// Bump the TRUNC_SEQ generation exactly like a flag event would
-/// (CPU-0 slot — the drain sums across CPUs).
-fn bump_trunc_seq(loaded: &Loaded, by: u64) {
-    use aya::maps::{Map, MapData, PerCpuArray, PerCpuValues};
-    let fd = loaded.maps["TRUNC_SEQ"]
-        .try_clone()
-        .expect("clone TRUNC_SEQ");
-    let data = MapData::from_fd(fd).expect("mapdata");
-    let map = Map::from_map_data(data).expect("map");
-    let mut m = PerCpuArray::<_, u64>::try_from(map).expect("percpu-array shape");
-    let mut slots: Vec<u64> = m.get(&0, 0).expect("TRUNC_SEQ[0]").to_vec();
-    slots[0] = slots[0].wrapping_add(by);
-    let vals = PerCpuValues::try_from(slots).expect("widths");
-    m.set(0, vals, 0).expect("bump TRUNC_SEQ");
-}
-
-/// Round-2 F3: the seq-guarded TRUNC drain against the live maps —
-/// quiet drains report the exact bits with `raced == false` and a
-/// cleared map (no false races on pre-existing flags), while a
-/// flag injected INSIDE the race window (the deterministic hook —
-/// no timing dependence) reports `raced == true` WITH the bit
-/// still attributed (the re-read catches it; the race flag covers
-/// the true-erasure case the hook cannot stage, by the same
-/// generation comparison the quiet control pins exact).
-#[test]
-#[ignore]
-fn r19_trunc_drain_race() {
-    use osslscope_ebpf_common as wire;
-    let Some(obj) = gated() else {
-        eprintln!("SKIP(members-live): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
-        return;
-    };
-    let exe = own_exe_cstr();
-    let off = query_off();
-    let backend = backend_chunk(&obj, &exe, off);
-    let loaded = backend.loaded();
-    // Quiet drain: a pre-existing flag attributes exactly, no
-    // race, map cleared after.
-    stage_trunc(loaded, OP, wire::TRUNC_WALK_READ);
-    let (delta, raced) = drain_trunc_flags(&loaded.maps, None).expect("quiet drain");
-    assert!(!raced, "quiet drain must not report a race");
-    assert_eq!(delta.get(&OP), Some(&wire::TRUNC_WALK_READ));
-    assert_eq!(
-        read_percpu(loaded, "TRUNC", OP, true),
-        0,
-        "quiet drain clears the map"
-    );
-    // Injected race: the hook stages a flag + its generation
-    // bump inside the clear window.
-    let hook = || {
-        stage_trunc(loaded, OP + 1, wire::TRUNC_ALGS);
-        bump_trunc_seq(loaded, 1);
-    };
-    let (delta, raced) = drain_trunc_flags(&loaded.maps, Some(&hook)).expect("raced drain");
-    assert!(raced, "in-window flag must report raced");
-    assert_eq!(
-        delta.get(&(OP + 1)),
-        Some(&wire::TRUNC_ALGS),
-        "the re-read still attributes the concurrent flag"
-    );
-    assert_eq!(
-        read_percpu(loaded, "TRUNC", OP + 1, true),
-        0,
-        "raced drain clears the map"
-    );
-}
-
-/// Round-2 F6: `finish()` quiesces the producer FIRST — post-window
-/// queries skip honestly (SKIP_ALL) instead of starting new scans
-/// after counting closed, while the in-flight scan still settles
-/// and closes through the backstop.
+/// Round-2 F6 (round-3 hardened): `finish()` quiesces the
+/// producer FIRST — post-window queries skip honestly (SKIP_ALL)
+/// instead of starting new scans after counting closed, while
+/// in-flight scans still settle and close through the backstop.
+/// The throttle is ENGAGED first (30 paced full-table queries —
+/// duty crosses the 100ms trip line well inside any 1s trailing
+/// window) and its samples EXPIRE
+/// (1.2s idle, no poll — the throttle sits stale-engaged), so
+/// the finish poll would idle-release the gate under ordinary
+/// tier aging: the leg pins that finish holds the gate anyway
+/// (tiers frozen — no age-release, no reattach, no storm-detach
+/// abandoning the trailing evidence).
 #[test]
 #[ignore]
 fn r19_finish_quiesces_producer() {
@@ -5916,27 +5841,62 @@ fn r19_finish_quiesces_producer() {
     let off = query_off();
     let mut backend = backend_chunk(&obj, &exe, off);
     backend.register(&[self_tid()]).expect("register self");
-    let slots = vec![
-        SlotSpec::live("FQP0", 100, vec![(300, 0x4400)]),
-        SlotSpec::live("FQP1", 101, vec![(301, 0x4401)]),
-    ];
+    // 512 live slots named with REAL registry spellings: the
+    // backend attach already populated ALG_CLASS from the
+    // production registry, so the members classify OK with zero
+    // fixture populate (a 512-name fixture populate would
+    // overflow the 1024-entry map atop production).
+    let reg: Vec<&str> = osslscope::kinds::ALG_NAMES
+        .iter()
+        .map(|a| a.name)
+        .take(512)
+        .collect();
+    assert_eq!(reg.len(), 512, "registry covers 512 live slots");
+    let slots: Vec<SlotSpec> = reg
+        .iter()
+        .enumerate()
+        .map(|(j, name)| SlotSpec::live(name, 0, vec![(300 + j as u32, 0x4400 + j as u64)]))
+        .collect();
     let fx = Fixture::build_padded(&slots, &[], 513);
     fx.pretouch();
-    populate_alg_class(backend.loaded(), &fx.classes);
     FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
     NS_VERDICT.store(0, Ordering::SeqCst);
-    fire(OP as i32, 1);
-    let calls_before = read_percpu(backend.loaded(), "CALLS", OP, false);
-    assert_eq!(calls_before, 1, "the window query admitted");
+    // Engage the throttle: 30 paced full-table queries (~6.5ms
+    // each — duty crosses the 100ms trip line well inside any 1s
+    // trailing window, while 33/s stays far under the 1k/s storm
+    // line). Engagement skips the tail of the loop (cause 5) —
+    // by design; every fire still closes (Complete or Skipped).
+    let mut dones = 0usize;
+    for _ in 0..30 {
+        pace_fire_gap();
+        fire(OP as i32, 1);
+        let d = backend.poll().expect("window poll drains");
+        dones += d.done.len();
+    }
+    assert!(
+        backend.snapshot().throttled,
+        "throttle engaged before finish (else this leg proves nothing)"
+    );
+    let admitted = read_percpu(backend.loaded(), "CALLS", OP, false);
+    assert!(
+        admitted >= 15,
+        "most queries admitted before the trip ({admitted})"
+    );
+    // Expire the samples WITHOUT polling (the throttle sits
+    // stale-engaged — an ordinary poll would idle-release now).
+    std::thread::sleep(std::time::Duration::from_millis(1200));
     let tail = backend.finish().expect("finish settles");
     let ctrl = osslscope::loader::read_ctrl(&backend.loaded().maps).expect("read CTRL");
-    assert_eq!(ctrl.skip_all, 1, "finish leaves the gate engaged");
-    assert_eq!(tail.done.len(), 1, "the window scan closes in the tail");
-    assert!(
-        matches!(tail.done[0].outcome, Outcome::Complete { .. }),
-        "in-flight scan settles clean: {:?}",
-        tail.done[0].outcome
+    assert_eq!(
+        ctrl.skip_all, 1,
+        "finish holds the gate (no tier-2 release)"
     );
+    assert!(
+        backend.snapshot().throttled,
+        "throttle state frozen, not released"
+    );
+    dones += tail.done.len();
+    assert_eq!(dones, 30, "every window fire closes (none abandoned)");
     // A post-window query skips honestly (never admitted, never
     // walked) instead of starting a scan after counting closed.
     pace_fire_gap();
@@ -5944,7 +5904,7 @@ fn r19_finish_quiesces_producer() {
     let post = backend.poll().expect("post-finish poll drains the skip");
     assert_eq!(
         read_percpu(backend.loaded(), "CALLS", OP, false),
-        1,
+        admitted,
         "post-window query never admitted"
     );
     assert_eq!(post.done.len(), 1, "the skip closes immediately");
@@ -5959,16 +5919,21 @@ fn r19_finish_quiesces_producer() {
     );
 }
 
-/// Round-2 F3: the TRUNC_SEQ drain-race guard counts flag EVENTS
-/// (one bump per flag_trunc — sticky TRUNC bits OR them away).
-/// Two NOIMP slots on a padded table flag exactly twice (same bit,
-/// two events): TRUNC_SEQ == 2 while TRUNC holds the single NOIMP
-/// bit. The backend's seq-guarded drain samples this around its
-/// clear window — an advance across the window degrades the drain
-/// explicitly instead of losing a concurrent flag silently.
+/// Round-3 F3: the lossless TRUNC drain (sticky snapshot +
+/// per-op flag-event generation, never cleared). First sighting
+/// attributes; a quiet re-drain is empty (consumed, never
+/// repeats) with the map bits intact (sticky, never cleared);
+/// a REPEAT fault (same bit re-flagged — the generation
+/// advanced) re-reports the op's set bits (recurring faults
+/// stay visible — hiding them would fail open on flag-only
+/// evidence like dispatch overflow); a flag injected just AFTER
+/// a snapshot (the deterministic hook — no timing dependence)
+/// appears in the NEXT drain (delayed one drain, never lost,
+/// never tainted, in any producer order — there is no clear to
+/// race at all).
 #[test]
 #[ignore]
-fn d_trunc_seq_guard() {
+fn d_trunc_lossless_deltas() {
     use osslscope_ebpf_common as wire;
     let Some(obj) = gated() else {
         eprintln!("SKIP(members-live): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
@@ -5992,32 +5957,80 @@ fn d_trunc_seq_guard() {
     NS_VERDICT.store(0, Ordering::SeqCst);
     fire(OP as i32, 1);
     let d = drain(loaded);
-    assert_calls_admitted(&d.calls, 1, "trunc-seq");
-    assert_eq!(d.rets.len(), 1, "trunc-seq: RET joined");
+    assert_calls_admitted(&d.calls, 1, "trunc-acc");
+    assert_eq!(d.rets.len(), 1, "trunc-lossless: RET joined");
     ret_for(&d.rets, d.calls[0].tid, d.calls[0].seq);
-    assert!(d.guards.is_empty(), "trunc-seq: slot 511 EMPTY → no guard");
+    assert!(
+        d.guards.is_empty(),
+        "trunc-lossless: slot 511 EMPTY → no guard"
+    );
     // Cold: every member walks — 2 OK + 2 NOIMP + 508 EMPTY.
-    assert_eq!(d.algs.len(), 512, "trunc-seq: every slot read once");
+    assert_eq!(d.algs.len(), 512, "trunc-lossless: every slot read once");
     assert_eq!(
         d.algs
             .iter()
             .filter(|a| a.status == wire::ALG_NOIMP)
             .count(),
         2,
-        "trunc-seq: both NOIMP slots explicit"
+        "trunc-lossless: both NOIMP slots explicit"
     );
-    assert_eq!(d.rows.len(), 2, "trunc-seq: live slots dispatch rows only");
+    assert_eq!(
+        d.rows.len(),
+        2,
+        "trunc-lossless: live slots dispatch rows only"
+    );
+    // First sighting attributes; quiet re-drain is empty
+    // (consumed); the map bit stays (sticky, never cleared).
+    let mut consumed = std::collections::BTreeMap::new();
+    let mut last_seq = std::collections::BTreeMap::new();
+    let delta =
+        drain_trunc_flags(&mut consumed, &mut last_seq, &loaded.maps, None).expect("drain 1");
+    assert_eq!(
+        delta.get(&OP),
+        Some(&wire::TRUNC_WALK_NOIMP),
+        "trunc-lossless: first sighting attributes"
+    );
+    let delta =
+        drain_trunc_flags(&mut consumed, &mut last_seq, &loaded.maps, None).expect("drain 2");
+    assert!(
+        delta.is_empty(),
+        "trunc-lossless: quiet re-drain reports nothing"
+    );
     assert_eq!(
         read_percpu(loaded, "TRUNC", OP, true),
         wire::TRUNC_WALK_NOIMP,
-        "trunc-seq: sticky bit holds NOIMP alone"
+        "trunc-lossless: map bit intact (never cleared)"
     );
+    // Repeat fault (same bit re-flagged by a second identical
+    // query): the generation advanced, so the op's set bits
+    // re-report (recurring faults stay visible).
+    pace_fire_gap();
+    fire(OP as i32, 1);
+    let _ = drain(loaded);
+    let delta =
+        drain_trunc_flags(&mut consumed, &mut last_seq, &loaded.maps, None).expect("drain 3");
     assert_eq!(
-        read_trunc_seq(loaded),
-        2,
-        "trunc-seq: one generation bump per flag event"
+        delta.get(&OP),
+        Some(&wire::TRUNC_WALK_NOIMP),
+        "trunc-lossless: repeat fault re-reports"
     );
-    assert_retired(loaded, tid, "trunc-seq");
+    // Injected just after the snapshot: absent from this delta,
+    // present in the next (delayed one drain, never lost).
+    let hook = || stage_trunc(loaded, OP + 1, wire::TRUNC_ALGS);
+    let delta = drain_trunc_flags(&mut consumed, &mut last_seq, &loaded.maps, Some(&hook))
+        .expect("drain 4");
+    assert!(
+        !delta.contains_key(&(OP + 1)),
+        "trunc-lossless: post-snapshot flag not in this delta"
+    );
+    let delta =
+        drain_trunc_flags(&mut consumed, &mut last_seq, &loaded.maps, None).expect("drain 5");
+    assert_eq!(
+        delta.get(&(OP + 1)),
+        Some(&wire::TRUNC_ALGS),
+        "trunc-lossless: post-snapshot flag lands next drain"
+    );
+    assert_retired(loaded, tid, "trunc-lossless");
     assert_loss_zero(loaded);
 }
 
@@ -6120,9 +6133,62 @@ fn d_warm_boundary_proof() {
         0,
         "warm-boundary-2: TRUNC clean"
     );
+    // Cell 3: 127 live slots, terminator at 127 (cached T=127),
+    // slot 128 (T+1) UNMAPPED. Inaccessible-beyond-T is not
+    // growth (live requires readable) — member 128 stays silent
+    // with NO flag (the walked terminator at 127 stands), so a
+    // valid warm table Completes instead of Partialling on a
+    // phantom READ.
+    let slots3: Vec<SlotSpec> = (0..127u32)
+        .map(|j| {
+            SlotSpec::live(
+                &format!("WBR{j}"),
+                300 + (j % 200) as u16,
+                vec![(600 + j, 0x6600 + j as u64)],
+            )
+        })
+        .collect();
+    // Array spans exactly 2 pages (256 cells); names/dispatch
+    // live on page 2+. Unmapping page 1 takes slots 128..255
+    // (T+1 inaccessible) and nothing else.
+    let fx3 = Fixture::build_padded(&slots3, &[], 256);
+    fx3.pretouch();
+    populate_alg_class(loaded, &fx3.classes);
+    pace_fire_gap();
+    clear_trunc(loaded, "warm-boundary-3");
+    FIXTURE_ARRAY.store(fx3.array, Ordering::SeqCst);
+    write_tcache(loaded, fx3.array, 127, 0);
+    assert_eq!(
+        unsafe { libc::munmap((fx3.array + 4096) as *mut libc::c_void, 4096) },
+        0,
+        "warm-boundary-3: unmap T+1 page"
+    );
+    fire(OP as i32, 1);
+    let d3 = drain(loaded);
+    assert_calls_admitted(&d3.calls, 1, "warm-boundary-3");
+    assert_eq!(d3.rets.len(), 1, "warm-boundary-3: RET joined");
+    ret_for(&d3.rets, d3.calls[0].tid, d3.calls[0].seq);
+    for j in 0..127u64 {
+        let got: Vec<_> = d3.algs.iter().filter(|a| a.idx == j).collect();
+        assert_eq!(got.len(), 1, "warm-boundary-3: slot {j} walked");
+        assert_eq!(got[0].status, wire::ALG_OK);
+    }
+    let t127: Vec<_> = d3.algs.iter().filter(|a| a.idx == 127).collect();
+    assert_eq!(t127.len(), 1, "warm-boundary-3: terminator walked");
+    assert_eq!(t127[0].status, wire::ALG_EMPTY);
+    assert!(
+        d3.algs.iter().all(|a| a.idx <= 127) && d3.rows.iter().all(|r| r.idx <= 126),
+        "warm-boundary-3: T+1 silent on inaccessible slot"
+    );
+    assert_eq!(
+        read_percpu(loaded, "TRUNC", OP, true),
+        0,
+        "warm-boundary-3: inaccessible T+1 flags nothing"
+    );
+    assert!(d3.guards.is_empty(), "warm-boundary-3: no guard");
     assert_retired(loaded, tid, "warm-boundary");
     assert_loss_zero(loaded);
-    assert_eq!(read_percpu(loaded, "CALLS", OP, false), 2);
+    assert_eq!(read_percpu(loaded, "CALLS", OP, false), 3);
 }
 
 /// R19: one query with later slots through the production backend
@@ -6398,7 +6464,7 @@ fn r19_backend_termination_512_513() {
     }
     // 513-live: Partial{Trunc, Overfull}, VALID guard, no warm.
     // The trailer re-fires the overfull walk, so its TRUNC_ALGS
-    // flag is a fresh delta under clear-on-read — Partial again
+    // flag re-reports (generation advanced) — Partial again
     // with the identical reasons, never a quiet downgrade.
     {
         let slots: Vec<SlotSpec> = (0..513u32)
@@ -6465,8 +6531,8 @@ fn r19_backend_termination_512_513() {
         assert_eq!(read_percpu(loaded, "CALLS", OP, false), 2);
         assert_eq!(
             read_percpu(loaded, "TRUNC", OP, true),
-            0,
-            "513-live: TRUNC consumed (clear-on-read — both flags landed in verdicts, none lost)"
+            wire::TRUNC_ALGS,
+            "513-live: TRUNC sticky (never cleared — both flags landed in verdicts via lossless deltas, none lost)"
         );
     }
 }
@@ -6480,9 +6546,6 @@ const F12_VEHICLE_SHA256: &str = "1d72cbc5bf62be3f3dbd7626c295b63c5fdc1dd8439f32
 const F12_LIBCRYPTO: &str = "/usr/lib/x86_64-linux-gnu/libcrypto.so.3";
 const F12_LIBCRYPTO_SHA256: &str =
     "5385f0436ac2e284ba8c5fb1488874057c29c04be72dea32add832694f381e28";
-/// Anchor file offset for the pinned build (dbgsym-measured —
-/// same value the P5d enrollment fixture pins).
-const F12_QUERY_OFF: u64 = 2577296;
 
 fn f12_sha256_hex(bytes: &[u8]) -> String {
     use sha2::Digest as _;
@@ -6713,11 +6776,9 @@ int main(void) {
 /// neighborhoods, so v1 full scans systematically observe
 /// past-terminator soup (VALID guard + dispatch overflow) and
 /// close Partial with explicit Trunc reasons — fail-closed per
-/// F2/F3/F5, not a defect. Complete-adaptation mechanics are
-/// proven host-side (`traversal_completes_produce_inventory`) and
-/// through the production backend (`r19_backend_*` legs); this leg
-/// additionally asserts the adapted anchor site whenever traffic
-/// Completes (logged either way).
+/// F2/F3/F5, not a defect. No inventory adaptation exists
+/// (round 3, F1): traversal evidence reports natively, and the
+/// document inventory carries only count-observed executions.
 #[test]
 #[ignore]
 fn r19_installed_positive_traffic() {
@@ -6847,11 +6908,10 @@ fn r19_installed_positive_traffic() {
         *hist.entry(k).or_insert(0u64) += 1;
     }
     eprintln!(
-        "f12: {} records, {} findings, {} polls, {} admitted-op keys, verdicts={:?}, detached={}",
+        "f12: {} records, {} findings, {} polls, verdicts={:?}, detached={}",
         t.done.len(),
         t.findings.len(),
         t.polls,
-        t.admitted_by_op.len(),
         hist,
         t.detached
     );
@@ -6907,28 +6967,10 @@ fn r19_installed_positive_traffic() {
         }),
         "f12: real algorithm names below TRUE-T"
     );
-    // Ordinary adaptation whenever traffic Completes (logged
-    // either way — real tables usually Partial by design, and
-    // Complete-adaptation mechanics are proven host-side).
-    let completes = hist.get("Complete").copied().unwrap_or(0);
-    eprintln!("f12: {completes} Complete closes (adaptation tier)");
-    if completes > 0 {
-        assert!(
-            cap.document
-                .sites
-                .iter()
-                .any(|s| s.site.offset == F12_QUERY_OFF),
-            "f12: anchor-offset inventory site adapts on Complete traffic"
-        );
-        let billed: u64 = cap
-            .document
-            .sites
-            .iter()
-            .filter(|s| s.site.offset == F12_QUERY_OFF)
-            .map(|s| s.calls)
-            .sum();
-        assert!(billed > 0, "f12: adapted site bills census calls");
-    }
+    // No inventory adaptation exists (round 3, F1): traversal
+    // evidence reports natively (records above), and the document
+    // inventory carries only count-observed executions — the leg
+    // asserts nothing synthetic here by construction.
     // Ordinary report rendering carries the traversal section with
     // the exact triple + positive record count.
     let json = osslscope::report::render_json(&cap.document).expect("f12: render");
