@@ -98,18 +98,23 @@ static GEN: HashMap<u64, u64> = HashMap::with_max_entries(1024, 0);
 static LOSS: PerCpuHashMap<u32, u64> = PerCpuHashMap::with_max_entries(32, 0);
 /// Walk-overflow flags per op id; userspace degrades to PARTIAL.
 /// Per-CPU (F-C/A8); userspace ORs across CPUs at drain.
+/// Sticky bits, never cleared (the lossless drain attributes
+/// snapshot-minus-consumed + generation-advance supersets —
+/// there is no clear to race at all).
 #[map]
 static TRUNC: PerCpuHashMap<u32, u64> = PerCpuHashMap::with_max_entries(64, 0);
-/// TRUNC flag generation (drain-race guard): bumped on EVERY
-/// flag event (even a map-full one — activity is activity).
-/// Userspace's seq-guarded drain reads this around its
-/// read/clear window; an advance across the window proves a
-/// concurrent flag may have been erased unread, and the drain
-/// degrades explicitly instead of losing it silently.
-/// Per-CPU array; userspace sums. Monotonic per boot (a
-/// wrapping add — 2^64 flags never wraps in practice).
+/// Per-op TRUNC flag-event generation: bumped on EVERY flag
+/// event for the op (even a repeat bit or a map-full one —
+/// activity is activity). Userspace re-reports the op's set
+/// bits when its generation advanced (recurring faults stay
+/// visible); first sightings never need it (freshness alone
+/// reports). Comparison semantics (changed/unchanged), so
+/// concurrent read-modify-write increments losing a count is
+/// harmless — any successful bump proves activity. A failed
+/// bump (map full) counts LOSS (the repeat it hides degrades
+/// via the loss path instead).
 #[map]
-static TRUNC_SEQ: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
+static TRUNC_SEQ: HashMap<u32, u64> = HashMap::with_max_entries(64, 0);
 /// Non-null query calls per op id, counted by member 0 (once per
 /// query — every member fires every hit, so member 0's bump is the
 /// per-query count; all-members bumping would inflate 512x).
@@ -271,12 +276,22 @@ fn flag_trunc(op: u32, bit: u64) {
     if percpu_or(&TRUNC, &op, bit).is_err() {
         bump_loss(LOSS_MAP_TRUNC);
     }
-    // Generation bump (drain-race guard — unconditional: a
-    // map-full flag is still concurrent activity, and its loss
-    // is already counted above). PerCpuArray cells pre-exist,
-    // so the slot cannot miss (same pattern as ATTEMPT).
-    if let Some(slot) = TRUNC_SEQ.get_ptr_mut(0) {
-        unsafe { *slot = (*slot).wrapping_add(1) };
+    bump_trunc_seq(op);
+}
+
+/// Per-op generation bump as a BPF subprogram (separate
+/// verification scope; one call per flag site instead of an
+/// inlined map read-modify-write per site — member bodies stay
+/// near-uniform for S8). Unconditional — a repeat bit or a
+/// map-full flag is still activity. Comparison semantics:
+/// read-modify-write races losing a count are harmless (any
+/// successful bump proves activity); a failed insert counts
+/// LOSS (fail-closed via the loss path).
+#[inline(never)]
+fn bump_trunc_seq(op: u32) {
+    let next = unsafe { TRUNC_SEQ.get_ptr(&op).map(|p| *p).unwrap_or(0) }.wrapping_add(1);
+    if TRUNC_SEQ.insert(&op, next, 0).is_err() {
+        bump_loss(LOSS_MAP_TRUNC);
     }
 }
 
@@ -776,16 +791,18 @@ macro_rules! def_member {
                         // cache permission to the integer
                         // out-value). Nonzero / NULL / unreadable
                         // → COLD walk. The FIRST would-skip slot
-                        // (T+1) never skips silently: it verifies
-                        // by reading its own slot names — zero
-                        // proves the terminator explicitly
-                        // (boundary ALG_EMPTY), anything else
+                        // (T+1) verifies by reading its own slot
+                        // names — zero proves the terminator
+                        // explicitly (boundary ALG_EMPTY), live
                         // falls through to the COLD walk below
                         // (growth evidence the oracle uses to
-                        // invalidate). Later slots stay silent —
-                        // the T+1 verdict covers them (a grown
-                        // table cold-walks T+1, so silence past
-                        // T+1 with a T+1 EMPTY is proven
+                        // invalidate), unreadable skips silent
+                        // (inaccessible is not growth — live
+                        // requires readable — so no walk, no
+                        // flag). Later slots stay silent — the
+                        // T+1 verdict covers them (a grown table
+                        // cold-walks T+1, so silence past T+1
+                        // with a T+1 EMPTY is proven
                         // termination, not absence).
                         match unsafe {
                             helpers::bpf_probe_read_user(ns_ptr as *const u32)
@@ -816,12 +833,28 @@ macro_rules! def_member {
                                             epilogue(gated, old, expected, &tid);
                                             return 0;
                                         }
-                                        // Live or unreadable:
-                                        // fall through to the
-                                        // COLD walk (growth
+                                        // Live: fall through to
+                                        // the COLD walk (growth
                                         // evidence, never a
                                         // silent skip).
-                                        _ => {}
+                                        Ok(_) => {}
+                                        // Unreadable: SILENT
+                                        // (epilogue + return, no
+                                        // flag).
+                                        // Inaccessible-beyond-T
+                                        // is not growth (live
+                                        // requires readable) —
+                                        // the walked terminator
+                                        // at T stands, so
+                                        // flagging READ would
+                                        // Partial every warm
+                                        // query on a valid table
+                                        // whose slot T+1 is
+                                        // unmapped.
+                                        Err(_) => {
+                                            epilogue(gated, old, expected, &tid);
+                                            return 0;
+                                        }
                                     }
                                 } else {
                                     epilogue(gated, old, expected, &tid);
