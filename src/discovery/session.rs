@@ -622,6 +622,17 @@ pub trait SessionEnv {
     /// dev-string is never compared). `None` when the file is
     /// unstatable (retained quietly — absence of evidence).
     fn provider_stat(&self) -> Option<(String, u64)>;
+    /// Current (size, mtime_ns) of one backing/array-owner file
+    /// (R20-fix finding 5): the core re-emits retained candidates
+    /// whose files changed in place (same identity, new bytes) so
+    /// capture re-validates their fingerprints instead of serving
+    /// stale bytes under a stale identity. Default `None`
+    /// (unknown — no opinion, no re-emit); the live env stats the
+    /// path. `None` per path (unstatable) skips quietly — capture
+    /// owns absence.
+    fn backing_stat(&mut self, _path: &str) -> Option<(u64, u64)> {
+        None
+    }
 }
 
 /// Pid recycle mid-observation: carries the discarded-state
@@ -874,6 +885,36 @@ pub struct SessionCore {
     /// belong to the array epoch) and wholly on recycle. Bounded
     /// by distinct (slot, impl) rows ever walked.
     slot_backing: HashMap<(u64, u64, u64), BackingRef>,
+    /// Remembered impl→backing per impl vaddr (R20-fix finding 4):
+    /// poll-persistent memory keyed by impl alone (value carries
+    /// the array for per-array retire). M4's cell memory only
+    /// covers tracked (array, slot, impl) cells — without this, a
+    /// queued row for a NOVEL cell on a known impl, arriving after
+    /// an impl-only turnover (array stable, no rebirth), silently
+    /// adopts the new backing for possibly-stale activity. A
+    /// remembered impl whose current backing differs drops loud
+    /// and re-seats both memories (the M4 doctrine extended across
+    /// polls); cleared for `arr` on array retire (the generation
+    /// bump is the continuity witness — new-stamp rows are
+    /// proven-fresh) and wholly on recycle. Bounded by distinct
+    /// impl vaddrs ever walked (same order as the cell memory).
+    /// Residual (fail-closed): one impl serving two arrays keeps
+    /// the first array's tag — a rebirth+remap under the other
+    /// array costs one spurious straggler (proven-fresh row meets
+    /// stale memory), never silence.
+    impl_backing: HashMap<u64, (u64, BackingRef)>,
+    /// Remembered backing-file freshness per path (R20-fix finding
+    /// 5): (size, mtime_ns) baselines for retained candidates'
+    /// backing + advertising files. An in-place edit (same
+    /// identity, new bytes) re-emits the candidate as an identity
+    /// refresh so capture re-validates the fingerprint — without
+    /// this the stat check never runs for already-counted sites.
+    /// Keyed by path (not identity: twins share ino, and the sweep
+    /// is only a re-emit trigger — capture re-validates dev-exact,
+    /// so a wrong-twin resolution can only spuriously refresh,
+    /// never misattribute). Pruned to live paths every poll;
+    /// cleared on recycle.
+    backing_freshness: HashMap<String, (u64, u64)>,
     /// Last successfully read mappings (F-D/Am1): a failed
     /// `current_maps` reconciles against this instead of reading
     /// the failure as empty. Starts empty (a first-poll failure
@@ -1035,6 +1076,8 @@ impl SessionCore {
             baselines: HashMap::new(),
             m1_poison: HashSet::new(),
             slot_backing: HashMap::new(),
+            impl_backing: HashMap::new(),
+            backing_freshness: HashMap::new(),
             last_good_maps: Vec::new(),
             candidates: Vec::new(),
             close_candidates: Vec::new(),
@@ -1288,6 +1331,48 @@ impl SessionCore {
         false
     }
 
+    /// Impl-turnover gate (R20-fix finding 4): the row's impl
+    /// backing must match the triple remembered for its impl
+    /// vaddr. M4's cell memory only covers tracked (array, slot,
+    /// impl) cells — a queued row for a NOVEL cell on a known
+    /// impl, arriving after an impl-only turnover (array stable,
+    /// no rebirth), would silently adopt the new backing for
+    /// possibly-stale activity. A remembered impl whose current
+    /// backing differs drops loud (op-localized straggler, the
+    /// same channel as M4) and re-seats BOTH memories — one loss
+    /// per impl per turnover, the M4 doctrine extended across
+    /// polls. Unknown impls record silently (no turnover
+    /// evidence); a missing backing now (transient unmap)
+    /// neither records nor compares. Callers run this BEFORE
+    /// [`Self::check_slot_backing`] (its reseat keeps the cell
+    /// memory aligned, so one turnover costs one loss, not two).
+    fn check_impl_backing(
+        &mut self,
+        op: u32,
+        arr: u64,
+        idx: u64,
+        imp: u64,
+        backing: &Option<BackingRef>,
+    ) -> bool {
+        let Some(current) = backing else {
+            return true;
+        };
+        match self.impl_backing.get(&imp) {
+            None => {
+                self.impl_backing.insert(imp, (arr, current.clone()));
+                true
+            }
+            Some((_, remembered)) if remembered == current => true,
+            Some(_) => {
+                eprintln!("stale impl backing: op={op} idx={idx}");
+                self.tracker.note_straggler(op);
+                self.impl_backing.insert(imp, (arr, current.clone()));
+                self.slot_backing.insert((arr, idx, imp), current.clone());
+                false
+            }
+        }
+    }
+
     /// Slot-backing gate (M4): the row's impl backing must match
     /// the triple remembered for its (array, slot, impl) — a
     /// backing-only replacement at the same vaddr is
@@ -1300,7 +1385,8 @@ impl SessionCore {
     /// backing now (transient unmap) neither records nor compares
     /// (like the refresh arm, it never overwrites attested
     /// state). Callers run this after the orphan check (only
-    /// validated rows participate) and before join/refresh.
+    /// validated rows participate) and before join/refresh (after
+    /// [`Self::check_impl_backing`]).
     fn check_slot_backing(
         &mut self,
         op: u32,
@@ -1454,6 +1540,63 @@ impl SessionCore {
         false
     }
 
+    /// Per-poll backing-freshness sweep (R20-fix finding 5):
+    /// for every retained candidate, compare the backing file's
+    /// (size, mtime) and the advertising file's against remembered
+    /// baselines; a change re-emits the candidate as an identity
+    /// refresh (capture then re-stats, re-reads, re-fingerprints,
+    /// and fences — the existing version/conserve chain). First
+    /// sightings baseline silently; unstatable paths skip quietly
+    /// (capture owns absence); unknown envs (the default `None`)
+    /// never re-emit. A re-emit here may duplicate a drain refresh
+    /// in the same delta — the adapter dedups by triple, so the
+    /// only cost is one redundant clone.
+    fn refresh_backing_freshness<E: SessionEnv>(
+        &mut self,
+        env: &mut E,
+        maps: &[maps::Mapping],
+        delta: &mut DiscoveryDelta,
+    ) {
+        let mut live: HashSet<String> = HashSet::new();
+        for i in 0..self.candidates.len() {
+            // Backing path: first same-ino mapping (ino-only —
+            // twin resolution can only spuriously refresh; capture
+            // re-validates dev-exact, so never misattribute).
+            let mut paths: [Option<String>; 2] = [None, None];
+            if let Some(backing) = self.candidates[i].backing.as_ref() {
+                let ino = backing.ino;
+                if ino != 0 {
+                    if let Some(m) = maps.iter().find(|m| m.ino == ino) {
+                        paths[0] = Some(m.path.clone());
+                    }
+                }
+            }
+            if !self.candidates[i].advertising.is_empty() {
+                paths[1] = Some(self.candidates[i].advertising.clone());
+            }
+            let mut changed = false;
+            for path in paths.iter().flatten() {
+                live.insert(path.clone());
+                if let Some(fresh) = env.backing_stat(path) {
+                    match self.backing_freshness.get(path) {
+                        None => {
+                            self.backing_freshness.insert(path.clone(), fresh);
+                        }
+                        Some(old) if *old != fresh => {
+                            self.backing_freshness.insert(path.clone(), fresh);
+                            changed = true;
+                        }
+                        Some(_) => {}
+                    }
+                }
+            }
+            if changed {
+                delta.candidates.push(self.candidates[i].clone());
+            }
+        }
+        self.backing_freshness.retain(|p, _| live.contains(p));
+    }
+
     /// Retire one table epoch: proof and walked set drop, gap
     /// retained, join records pruned, kernel walker state evicted.
     /// `now` is the array's current fingerprint: `Some` rebirths a
@@ -1489,6 +1632,7 @@ impl SessionCore {
         // array's, so the next epoch's first rows record fresh
         // instead of going falsely stale.
         self.slot_backing.retain(|(a, _, _), _| *a != arr);
+        self.impl_backing.retain(|_, (a, _)| *a != arr);
         let gap = self.tracker.retire_table(op, arr);
         self.retained.accumulate(&gap);
         self.alg_records.retain(|(a, _), _| *a != arr);
@@ -1668,6 +1812,8 @@ impl SessionCore {
         self.baselines.clear();
         self.m1_poison.clear();
         self.slot_backing.clear();
+        self.impl_backing.clear();
+        self.backing_freshness.clear();
         self.candidates.clear();
         self.close_candidates.clear();
         self.close_remembered.clear();
@@ -2521,6 +2667,11 @@ impl SessionCore {
             }
         }
 
+        // Backing-freshness sweep (R20-fix finding 5): in-place
+        // edits re-emit their candidates as identity refreshes
+        // (capture re-validates + fences via the existing chain).
+        self.refresh_backing_freshness(env, &maps, &mut delta);
+
         self.last_links = env.link_counts();
         Ok(delta)
     }
@@ -2815,6 +2966,13 @@ impl SessionCore {
                 );
                 let (advertising, advertising_dev, advertising_ino) = array_owner(maps, ev.aux);
                 let (backing, locator) = attribute_impl(maps, &self.provider, &self.canon, ev.addr);
+                // Impl-turnover gate (R20-fix finding 4) BEFORE the
+                // cell gate: a novel cell on a turned-over impl
+                // would sail through M4's first-sighting arm —
+                // this drops it loud and re-seats both memories.
+                if !self.check_impl_backing(ev.op, ev.aux, ev.idx, ev.addr, &backing) {
+                    return;
+                }
                 // Slot-backing gate (M4): compares BEFORE the
                 // refresh arm below can adopt a changed backing —
                 // a mismatched duplicate drops here instead.
@@ -4189,6 +4347,20 @@ impl SessionEnv for LiveEnv {
         Some((crate::plan::render_device(md.dev()), md.ino()))
     }
 
+    fn backing_stat(&mut self, path: &str) -> Option<(u64, u64)> {
+        // Freshness only (size, mtime_ns) — identity stays the
+        // core's (dev, ino) join, so no device-domain work here.
+        let md = std::fs::metadata(path).ok()?;
+        let mtime_ns = md
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_nanos()
+            .min(u128::from(u64::MAX)) as u64;
+        Some((md.len(), mtime_ns))
+    }
+
     fn detach_trips(&mut self) {
         // The whole tripwire plane, including the legacy-init
         // pairs installed with the batch (Init links carrying the
@@ -4758,6 +4930,10 @@ mod tests {
         /// Scripted `LGCALLS` read failures (fix-round-2): same
         /// countdown for the independent query-ledger stream.
         lgcalls_fail_first: u32,
+        /// Scripted backing-file freshness (R20-fix finding 5):
+        /// path → (size, mtime_ns). Absent paths answer `None`
+        /// (unknown — the pre-fix shape, never a re-emit).
+        file_stats: HashMap<String, (u64, u64)>,
     }
 
     impl MiniEnv {
@@ -4784,6 +4960,7 @@ mod tests {
                 lgcalls_map: 0,
                 trip_fail_first: 0,
                 lgcalls_fail_first: 0,
+                file_stats: HashMap::new(),
             }
         }
     }
@@ -4905,6 +5082,10 @@ mod tests {
 
         fn provider_stat(&self) -> Option<(String, u64)> {
             self.provider_stat.clone()
+        }
+
+        fn backing_stat(&mut self, path: &str) -> Option<(u64, u64)> {
+            self.file_stats.get(path).copied()
         }
     }
 
@@ -6656,5 +6837,174 @@ mod tests {
         let snap = core.snapshot();
         assert_eq!(snap.queries_observed, 14);
         assert_eq!(snap.queries_by_op, vec![(1, 9), (2, 5)]);
+    }
+
+    // ------------------------------------------------------------------
+    // R20-fix finding 5: backing freshness re-emits tracked candidates.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn r20fix_backing_freshness_change_reemits_candidate() {
+        let mut env = MiniEnv::new();
+        env.maps = vec![prov_mapping(100, 0x1000)];
+        env.file_stats
+            .insert("/p/provider.so".to_string(), (4096, 0));
+        env.events.push_back(alg_bytes(1, 0x1500, 0, 0));
+        env.events.push_back(row_bytes(1, 0, 0x1600, 0x1500, 0, 0));
+        let mut core = a11_core();
+        // First seen: emitted (freshness baseline recorded silently).
+        let d1 = core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(d1.candidates.len(), 1);
+        assert_eq!(d1.candidates[0].backing.as_ref().unwrap().ino, 100);
+        // Steady, no events: silent (no spurious re-emit).
+        let d2 = core.poll(&mut env, a11_budget()).unwrap();
+        assert!(d2.candidates.is_empty());
+        // In-place edit: same identity, new size/mtime — production
+        // must re-deliver the tracked candidate (identity refresh)
+        // so capture's stat check runs for the already-counted site.
+        env.file_stats
+            .insert("/p/provider.so".to_string(), (4096, 777));
+        let d3 = core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(
+            d3.candidates.len(),
+            1,
+            "freshness change must re-emit the tracked candidate"
+        );
+        assert_eq!(d3.candidates[0].backing.as_ref().unwrap().ino, 100);
+        // Settled: silent again.
+        let d4 = core.poll(&mut env, a11_budget()).unwrap();
+        assert!(d4.candidates.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // R20-fix finding 4: queued rows across unseen impl replacement.
+    // ------------------------------------------------------------------
+
+    fn stable_lib(ino: u64) -> maps::Mapping {
+        maps::Mapping {
+            start: 0x5000,
+            end: 0x6000,
+            x: true,
+            offset: 0,
+            dev: "08:01".to_string(),
+            ino,
+            path: "/lib/libcrypto.so.3".to_string(),
+        }
+    }
+
+    #[test]
+    fn r20fix_stale_queued_row_across_impl_turnover_drops_loud() {
+        // The impl backing turns over between polls while the ARRAY
+        // stays put (no rebirth — the generation check cannot see
+        // impl-only turnover). A queued row for a NOVEL cell on the
+        // known impl arrives post-turnover: it may predate the
+        // turnover (queued), so attribution to the new backing is
+        // unprovable — loud drop (straggler), no relabel; the next
+        // row flows after the reseat.
+        let mut env = MiniEnv::new();
+        env.maps = vec![stable_lib(50), prov_mapping(200, 0x1000)];
+        env.events.push_back(alg_bytes(1, 0x5500, 0, 0));
+        env.events.push_back(row_bytes(1, 11, 0x1600, 0x5500, 0, 0));
+        let mut core = a11_core();
+        let d1 = core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(d1.candidates.len(), 1);
+        assert_eq!(d1.candidates[0].backing.as_ref().unwrap().ino, 200);
+        // Turnover: provider replaced (same path/range, new ino);
+        // lib (array home) untouched.
+        env.maps = vec![stable_lib(50), prov_mapping(100, 0x1000)];
+        env.events.push_back(alg_bytes(2, 0x5600, 1, 0));
+        env.events.push_back(row_bytes(2, 12, 0x1600, 0x5600, 1, 0));
+        let d2 = core.poll(&mut env, a11_budget()).unwrap();
+        assert!(
+            d2.candidates.is_empty(),
+            "stale row must not relabel to the new backing: {:?}",
+            d2.candidates
+        );
+        assert!(
+            d2.losses
+                .iter()
+                .any(|l| l.source == coverage::HOST_STRAGGLER && l.op == Some(2)),
+            "turnover row must drop loud: {:?}",
+            d2.losses
+        );
+        // Reseat: the next row flows under the new backing.
+        env.events.push_back(alg_bytes(2, 0x5600, 1, 0));
+        env.events.push_back(row_bytes(2, 12, 0x1600, 0x5600, 1, 0));
+        let d3 = core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(d3.candidates.len(), 1);
+        assert_eq!(d3.candidates[0].backing.as_ref().unwrap().ino, 100);
+    }
+
+    #[test]
+    fn r20fix_stale_row_after_unmap_preserves_attested_triple() {
+        // Raw-record stale path (the capture-level stale test
+        // bypasses this): the pre-vanish triple re-emitted after
+        // its mapping vanished — through generation validation +
+        // address-to-backing relocation, not a pre-relocated
+        // candidate. The attested triple must stand (no relabel to
+        // nothing), with no spurious re-emit.
+        let mut env = MiniEnv::new();
+        env.maps = vec![prov_mapping(100, 0x1000)];
+        env.events.push_back(alg_bytes(1, 0x1500, 0, 0));
+        env.events.push_back(row_bytes(1, 11, 0x1600, 0x1500, 0, 0));
+        let mut core = a11_core();
+        let d1 = core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(d1.candidates.len(), 1);
+        // Mapping vanishes entirely; the queued pre-vanish row
+        // arrives late (same stamp — the alg record persists).
+        env.maps = vec![stable_lib(50)];
+        env.events.push_back(row_bytes(1, 11, 0x1600, 0x1500, 0, 0));
+        let d2 = core.poll(&mut env, a11_budget()).unwrap();
+        // No relabel, no spurious re-emit: the attested triple stands.
+        assert!(
+            d2.candidates.is_empty(),
+            "stale row must not re-emit: {:?}",
+            d2.candidates
+        );
+        // ... but never silent: the vanished array retires (explicit
+        // retirement gap), and the row for the retired incarnation
+        // drops as an orphan (loud, op-localized).
+        assert_eq!(d2.retirements.len(), 1);
+        assert_eq!(d2.retirements[0].op, 1);
+        assert!(
+            d2.losses
+                .iter()
+                .any(|l| l.source == coverage::HOST_ORPHAN_ROW && l.op == Some(1)),
+            "stale row must drop loud: {:?}",
+            d2.losses
+        );
+        let snap = core.snapshot();
+        assert_eq!(snap.candidates.len(), 1);
+        assert_eq!(
+            snap.candidates[0].backing.as_ref().unwrap().ino,
+            100,
+            "attested triple must stand"
+        );
+        assert!(snap.reasons.contains(&"discovery-loss".to_string()));
+    }
+
+    #[test]
+    fn r20fix_subpoll_never_snapshotted_backing_is_indistinguishable() {
+        // NAMED RESIDUAL (composition pin, passes pre+post by
+        // design): B is mapped and unmapped entirely between two
+        // polls — it appears in NO maps snapshot. The row ingested
+        // post-turnover resolves against current maps (A). No
+        // witness distinguishes "B never existed" from "B came and
+        // went" (maps agree A→A, stamps agree, generations agree),
+        // so attribution to current maps is the only sound action;
+        // NO gap can fire without manufacturing false positives on
+        // genuinely-A traffic. Closing this residual needs
+        // kernel-observed mapping events (future facility, same
+        // class as the R20-fix lifecycle connector) — out of scope
+        // for a snapshot-relocation design.
+        let mut env = MiniEnv::new();
+        env.maps = vec![prov_mapping(100, 0x1000)];
+        env.events.push_back(alg_bytes(1, 0x1500, 0, 0));
+        env.events.push_back(row_bytes(1, 11, 0x1600, 0x1500, 0, 0));
+        let mut core = a11_core();
+        let d = core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(d.candidates.len(), 1);
+        assert_eq!(d.candidates[0].backing.as_ref().unwrap().ino, 100);
+        assert!(d.losses.is_empty());
     }
 }

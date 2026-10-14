@@ -144,6 +144,7 @@ impl CountBackend for SharedBackend {
     ) -> anyhow::Result<()> {
         let mut st = self.shared.borrow_mut();
         st.log.push("count_open".to_string());
+        self.order.borrow_mut().push("count_open".to_string());
         st.backend
             .open_window(tgid, generation, start_ns, deadline_ns)
     }
@@ -299,6 +300,13 @@ struct FakeTarget {
     poll_err: bool,
     verify_err_after: Option<usize>,
     exited: bool,
+    /// Calls executing AT the release boundary (R20-fix finding 7):
+    /// (index into the attached-cookie vec, calls). Only attached
+    /// cookies fire — production-faithful (no probe → no hit);
+    /// attempts against unattached indexes record
+    /// `fire-missed:no-probe` instead of firing.
+    release_fires: Vec<(usize, u64)>,
+    shared: Option<Rc<RefCell<SharedState>>>,
 }
 
 impl TargetPort for FakeTarget {
@@ -315,6 +323,27 @@ impl TargetPort for FakeTarget {
             anyhow::bail!("injected release failure");
         }
         self.log.borrow_mut().released = true;
+        self.order.borrow_mut().push("released".to_string());
+        // Release-boundary calls (R20-fix finding 7): the child acts
+        // the instant release returns; only attached probes can hit.
+        if let Some(shared) = &self.shared {
+            let mut st = shared.borrow_mut();
+            let cookies = st.attached.clone();
+            let now = self.clock.monotonic_ns();
+            for (idx, n) in &self.release_fires {
+                match cookies.get(*idx) {
+                    Some(cookie) => {
+                        st.backend.fire(PID, *cookie, now, *n);
+                        self.order.borrow_mut().push(format!("fired:{cookie}"));
+                    }
+                    None => {
+                        self.order
+                            .borrow_mut()
+                            .push("fire-missed:no-probe".to_string());
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -724,6 +753,9 @@ struct Harness {
     comm_settled: Option<String>,
     cancelled: Rc<Cell<bool>>,
     cancel_on_poll: bool,
+    /// Calls executing AT the release boundary (R20-fix finding 7),
+    /// wired into the fake target's release hook.
+    release_fires: Vec<(usize, u64)>,
 }
 
 impl Harness {
@@ -786,7 +818,10 @@ impl Harness {
             verify_err_after: None,
             lifecycle_polls: VecDeque::new(),
             lifecycle_fallback: false,
-            lifecycle_close_drain: None,
+            // Kernel-signal shape by default: a clean close witness
+            // (drained, nothing happened). Tests modeling absent
+            // close evidence set this to None explicitly.
+            lifecycle_close_drain: Some(LifecycleDelta::default()),
             maps,
             maps_seq: VecDeque::new(),
             files,
@@ -802,6 +837,7 @@ impl Harness {
             comm_settled: None,
             cancelled: Rc::new(Cell::new(false)),
             cancel_on_poll: false,
+            release_fires: Vec::new(),
         }
     }
 
@@ -855,6 +891,8 @@ impl Harness {
             clock: self.clock.clone(),
             log: self.target_log.clone(),
             order: self.order.clone(),
+            release_fires: self.release_fires,
+            shared: Some(self.shared.clone()),
             pid: PID,
             owned: self.owned,
             release_err: self.release_err,
@@ -2516,6 +2554,7 @@ fn lifecycle_exec_is_fence_tracked_not_ignored() {
         ],
         loss: 0,
         dropped: 0,
+        pending: 0,
     });
     let (out, _) = h.run();
     let c = out.unwrap();
@@ -2539,6 +2578,7 @@ fn final_sweep_skipped_after_owned_exit() {
         events: vec![],
         loss: 1,
         dropped: 0,
+        pending: 0,
     });
     let (out, _) = h.run();
     let c = out.unwrap();
@@ -2571,6 +2611,7 @@ fn final_sweep_runs_while_target_lives() {
         events: vec![],
         loss: 1,
         dropped: 0,
+        pending: 0,
     });
     let (out, _) = h.run();
     let c = out.unwrap();
@@ -6143,6 +6184,7 @@ fn lifecycle_scan_loss_withholds_complete() {
         events: vec![],
         loss: 1,
         dropped: 0,
+        pending: 0,
     });
     h.exit_at_ns = Some(BASE_NS + 1_000_000_000);
     h.exit_code = 0;
@@ -6170,6 +6212,7 @@ fn lifecycle_signal_dropped_withholds_complete() {
         events: vec![],
         loss: 0,
         dropped: 3,
+        pending: 0,
     });
     // Exit lands in the second sleep: exactly one round runs, so the
     // round sweep consumes the overflow poll.
@@ -6199,6 +6242,7 @@ fn lifecycle_close_drain_folds_after_owned_exit() {
         }],
         loss: 0,
         dropped: 0,
+        pending: 0,
     });
     let (out, _) = h.run();
     let c = out.unwrap();
@@ -6219,6 +6263,7 @@ fn lifecycle_close_drain_loss_is_loud() {
         events: vec![],
         loss: 1,
         dropped: 2,
+        pending: 0,
     });
     let (out, _) = h.run();
     let c = out.unwrap();
@@ -6266,6 +6311,101 @@ fn lifecycle_empty_close_drain_preserves_complete() {
     assert!(matches!(c.outcome, Outcome::Complete), "{c:?}");
     assert!(matches!(c.document.status, Completeness::Complete));
     assert_eq!(c.document.total_calls(), 7);
+}
+
+#[test]
+fn lifecycle_missing_close_drain_withholds_complete() {
+    // Kernel-signal shape (fallback=false) with NO close witness
+    // (close_drain None): the observer never proved it covered the
+    // requested interval's tail — PARTIAL with explicit no-witness
+    // loss, never silent COMPLETE on absent evidence.
+    let mut h = Harness::fresh("no-witness-partial");
+    h.snapshot_attached();
+    let cand1 = cand(
+        "/p/provider.so",
+        backing_of(&h.staged, h.off),
+        1,
+        11,
+        "SHA-256",
+        false,
+        "ok",
+    );
+    h.polls.push_back(DiscoveryDelta::default());
+    h.polls.push_back(DiscoveryDelta {
+        candidates: vec![cand1],
+        tables: vec![terminated(1, 0)],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    h.plans.insert(
+        2,
+        FirePlan {
+            fires: vec![(BASE_NS + 600_000_000, 7)],
+            shortfall: 0,
+            cancel: false,
+        },
+    );
+    h.exit_at_ns = Some(BASE_NS + 1_000_000_000);
+    h.exit_code = 0;
+    h.lifecycle_fallback = false;
+    h.lifecycle_close_drain = None;
+    let (out, _) = h.run();
+    let c = out.unwrap();
+    assert_eq!(c.document.total_calls(), 7);
+    assert_eq!(counter_value(&c, "lifecycle.no_witness"), 1);
+    assert!(has_reason(&c, "fork-exec-ignored"), "{:?}", c.reasons);
+    assert!(matches!(c.outcome, Outcome::Partial), "{c:?}");
+    assert!(matches!(c.document.status, Completeness::Partial { .. }));
+}
+
+#[test]
+fn lifecycle_truncated_close_drain_withholds_complete() {
+    // The close drain stopped with records still queued
+    // (bounded-drain residual): the tail past the bound is
+    // uncovered — PARTIAL with explicit drain-pending loss, never
+    // silent COMPLETE on a nonempty ring tail.
+    let mut h = Harness::fresh("drain-pending-partial");
+    h.snapshot_attached();
+    let cand1 = cand(
+        "/p/provider.so",
+        backing_of(&h.staged, h.off),
+        1,
+        11,
+        "SHA-256",
+        false,
+        "ok",
+    );
+    h.polls.push_back(DiscoveryDelta::default());
+    h.polls.push_back(DiscoveryDelta {
+        candidates: vec![cand1],
+        tables: vec![terminated(1, 0)],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    h.plans.insert(
+        2,
+        FirePlan {
+            fires: vec![(BASE_NS + 600_000_000, 7)],
+            shortfall: 0,
+            cancel: false,
+        },
+    );
+    h.exit_at_ns = Some(BASE_NS + 1_000_000_000);
+    h.exit_code = 0;
+    h.lifecycle_fallback = false;
+    h.lifecycle_close_drain = Some(LifecycleDelta {
+        events: vec![],
+        loss: 0,
+        dropped: 0,
+        pending: 1,
+    });
+    let (out, _) = h.run();
+    let c = out.unwrap();
+    assert_eq!(c.document.total_calls(), 7);
+    assert_eq!(counter_value(&c, "lifecycle.drain_pending"), 1);
+    assert!(has_reason(&c, "fork-exec-ignored"), "{:?}", c.reasons);
+    assert!(matches!(c.outcome, Outcome::Partial), "{c:?}");
+    assert!(matches!(c.document.status, Completeness::Partial { .. }));
 }
 
 #[test]
@@ -6334,6 +6474,175 @@ fn lifecycle_exec_fences_generation_and_conserves() {
         .filter_map(|l| l.strip_prefix("gen:")?.parse().ok())
         .collect();
     assert_eq!(gens, vec![1]);
+}
+
+#[test]
+fn lifecycle_kernel_shape_fast_noquery_is_honest_partial() {
+    // Ordinary-window qualification (fast/no-query program): the
+    // kernel-signal shape (fallback=false, clean close witness)
+    // carries NO unconditional polling fallback — the fast exit
+    // yields the honest no-query PARTIAL (no trigger observed),
+    // with zero lifecycle loss and zero lifecycle reasons.
+    let mut h = Harness::fresh("kernel-fast-noquery");
+    h.snapshot_attached();
+    h.exit_at_ns = Some(BASE_NS + 1);
+    h.exit_code = 0;
+    h.lifecycle_fallback = false;
+    h.lifecycle_close_drain = Some(LifecycleDelta::default());
+    let (out, _) = h.run();
+    let c = out.unwrap();
+    assert_eq!(c.child_exit, Some(0));
+    assert!(has_reason(&c, "no-query"), "{:?}", c.reasons);
+    assert!(matches!(c.outcome, Outcome::Partial));
+    assert!(
+        !has_reason(&c, "lifecycle-polling-partial"),
+        "{:?}",
+        c.reasons
+    );
+    assert!(!has_reason(&c, "fork-exec-ignored"), "{:?}", c.reasons);
+    for name in [
+        "lifecycle.fork_exec_ignored",
+        "lifecycle.scan_loss",
+        "lifecycle.signal_dropped",
+        "lifecycle.polling_fallback",
+        "lifecycle.no_witness",
+        "lifecycle.drain_pending",
+        "lifecycle.exec_gap",
+    ] {
+        assert_eq!(counter_value(&c, name), 0, "{name} must be absent");
+    }
+}
+
+#[test]
+fn lifecycle_exec_witness_fences_without_snapshot_change() {
+    // Same-path exec: the exe link and mappings NEVER change, so the
+    // snapshot comparison detects nothing — but the lifecycle sweep
+    // delivers the kernel Exec witness for the target. The witness
+    // must drive exactly one Exec fence (no double-book as ignored):
+    // gen-0 counts stay fenced under gen-0 meaning, later counts
+    // land in gen 1, the total is conserved.
+    let mut h = Harness::fresh("exec-witness-fence");
+    h.snapshot_attached();
+    let cand1 = cand(
+        "/p/provider.so",
+        backing_of(&h.staged, h.off),
+        1,
+        11,
+        "SHA-256",
+        false,
+        "ok",
+    );
+    h.polls.push_back(DiscoveryDelta::default());
+    h.polls.push_back(DiscoveryDelta {
+        candidates: vec![cand1],
+        tables: vec![terminated(1, 0)],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    h.plans.insert(
+        2,
+        FirePlan {
+            fires: vec![(BASE_NS + 600_000_000, 3)],
+            shortfall: 0,
+            cancel: false,
+        },
+    );
+    h.plans.insert(
+        4,
+        FirePlan {
+            fires: vec![(BASE_NS + 1_200_000_000, 4)],
+            shortfall: 0,
+            cancel: false,
+        },
+    );
+    // Rounds 1-2 sweep clean; round 3 delivers the Exec witness for
+    // the target itself (exe snapshot unchanged throughout).
+    h.lifecycle_polls = VecDeque::from([
+        LifecycleDelta::default(),
+        LifecycleDelta::default(),
+        LifecycleDelta {
+            events: vec![LifecycleEvent {
+                kind: LifecycleKind::Exec,
+                pid: PID,
+            }],
+            loss: 0,
+            dropped: 0,
+            pending: 0,
+        },
+    ]);
+    let (out, post) = h.run();
+    let c = out.unwrap();
+    assert_eq!(c.document.total_calls(), 7);
+    assert_eq!(c.document.fenced.len(), 1);
+    assert_eq!(c.document.fenced[0].generation, 0);
+    assert_eq!(c.document.fenced[0].sites[0].calls, 3);
+    assert_eq!(c.document.sites.len(), 1);
+    assert_eq!(c.document.sites[0].generation, 1);
+    assert_eq!(c.document.sites[0].calls, 4);
+    assert_eq!(counter_value(&c, "lifecycle.fork_exec_ignored"), 0);
+    let gens: Vec<u32> = post
+        .shared
+        .borrow()
+        .log
+        .iter()
+        .filter_map(|l| l.strip_prefix("gen:")?.parse().ok())
+        .collect();
+    assert_eq!(gens, vec![1]);
+}
+
+#[test]
+fn lifecycle_close_drain_exec_withholds_complete() {
+    // An Exec witness arriving in the close drain (after the last
+    // round's fence opportunity): the tail may mix pre/post-exec
+    // identity under one fingerprint, and no fence can version it
+    // anymore — an explicit continuity gap (PARTIAL), never silent
+    // COMPLETE.
+    let mut h = Harness::fresh("close-exec-gap");
+    h.snapshot_attached();
+    let cand1 = cand(
+        "/p/provider.so",
+        backing_of(&h.staged, h.off),
+        1,
+        11,
+        "SHA-256",
+        false,
+        "ok",
+    );
+    h.polls.push_back(DiscoveryDelta::default());
+    h.polls.push_back(DiscoveryDelta {
+        candidates: vec![cand1],
+        tables: vec![terminated(1, 0)],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    h.plans.insert(
+        2,
+        FirePlan {
+            fires: vec![(BASE_NS + 600_000_000, 7)],
+            shortfall: 0,
+            cancel: false,
+        },
+    );
+    h.exit_at_ns = Some(BASE_NS + 1_000_000_000);
+    h.exit_code = 0;
+    h.lifecycle_fallback = false;
+    h.lifecycle_close_drain = Some(LifecycleDelta {
+        events: vec![LifecycleEvent {
+            kind: LifecycleKind::Exec,
+            pid: PID,
+        }],
+        loss: 0,
+        dropped: 0,
+        pending: 0,
+    });
+    let (out, _) = h.run();
+    let c = out.unwrap();
+    assert_eq!(c.document.total_calls(), 7);
+    assert_eq!(counter_value(&c, "lifecycle.exec_gap"), 1);
+    assert_eq!(counter_value(&c, "lifecycle.fork_exec_ignored"), 0);
+    assert!(has_reason(&c, "fork-exec-ignored"), "{:?}", c.reasons);
+    assert!(matches!(c.outcome, Outcome::Partial), "{c:?}");
+    assert!(matches!(c.document.status, Completeness::Partial { .. }));
 }
 
 #[test]
@@ -6557,6 +6866,13 @@ fn lifecycle_impl_only_replacement_versions_and_conserves() {
     // re-read, and forward the new fingerprint so the count session
     // versions at a fence: gen-0 counts stay fenced under the old
     // fingerprint, later counts land in gen 1 under the new one.
+    // (R20-fix finding 5: the scripted redelivery below models
+    // production's freshness re-emit — real discovery re-delivers
+    // the tracked candidate when its backing file's size/mtime
+    // moves, pinned by
+    // `discovery::session::tests::r20fix_backing_freshness_change_reemits_candidate`.
+    // Capture-side, the redelivered delta is what runs the stat
+    // check for the already-counted site.)
     let mut h = Harness::fresh("impl-only");
     h.snapshot_attached();
     let bytes_a = h.bytes.clone();
@@ -6663,7 +6979,314 @@ fn lifecycle_impl_only_replacement_versions_and_conserves() {
 }
 
 #[test]
+fn lifecycle_never_snapshotted_backing_misses_loud() {
+    // R20-fix finding 4 (capture half): replacement activity that
+    // disappears between snapshots — discovery attests a B-backed
+    // candidate (its own maps saw B), but capture's snapshots
+    // NEVER contain B (maps-vs-discovery TOCTOU). B's path never
+    // resolves, its bytes never read, no probe ever binds it: the
+    // miss rides loud (missed attach + PARTIAL), never relabeled
+    // onto A's fingerprint, while A's positive evidence survives.
+    let mut h = Harness::fresh("never-mapped");
+    h.snapshot_attached();
+    let bytes_b = flipped_build_id(&h.bytes.clone());
+    let newso = h.stage.write("new.so", &bytes_b);
+    h.files.insert(
+        newso.path.clone(),
+        plan::FileBytes {
+            bytes: bytes_b.clone(),
+            dev: newso.device,
+            ino: newso.ino,
+        },
+    );
+    // NOTE: B is staged (bytes exist) but NEVER mapped — every
+    // snapshot shows A only.
+    let new_off = x_offset(&bytes_b);
+    let cand_a = cand(
+        "/p/provider.so",
+        backing_of(&h.staged, h.off),
+        1,
+        11,
+        "SHA-256",
+        false,
+        "ok",
+    );
+    let cand_b = cand(
+        "/p/provider.so",
+        backing_of(&newso, new_off),
+        1,
+        11,
+        "SHA-256",
+        false,
+        "ok",
+    );
+    h.polls.push_back(DiscoveryDelta::default());
+    h.polls.push_back(DiscoveryDelta {
+        candidates: vec![cand_a, cand_b],
+        tables: vec![terminated(1, 0)],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    h.plans.insert(
+        2,
+        FirePlan {
+            fires: vec![(BASE_NS + 600_000_000, 7)],
+            shortfall: 0,
+            cancel: false,
+        },
+    );
+    h.exit_at_ns = Some(BASE_NS + 1_000_000_000);
+    h.exit_code = 0;
+    let (out, _) = h.run();
+    let c = out.unwrap();
+    // A's positive evidence survives under its verified build-id;
+    // B attaches nothing (never relabeled onto A), and the miss
+    // rides loud (unattached-sites + missed-attaches gaps).
+    assert_eq!(c.document.total_calls(), 7);
+    assert_eq!(c.document.sites.len(), 1);
+    assert_eq!(c.document.sites[0].calls, 7);
+    assert!(
+        c.document.sites[0].site.object.0.starts_with("build:"),
+        "{:?}",
+        c.document.sites[0].site.object.0
+    );
+    assert_eq!(counter_value(&c, "count.missed_attaches"), 1);
+    assert!(has_reason(&c, "missed-attaches"), "{:?}", c.reasons);
+    assert!(has_reason(&c, "discovery-loss"), "{:?}", c.reasons);
+    assert!(matches!(c.outcome, Outcome::Partial), "{c:?}");
+    assert!(matches!(c.document.status, Completeness::Partial { .. }));
+}
+
+#[test]
+fn lifecycle_raced_file_read_is_discarded_loud() {
+    // Freshness race on one of two sites (pre-stat A, bound read
+    // under A identity, post stat moved): the raced bytes may be
+    // torn across a same-size edit — they must be DISCARDED (never
+    // fingerprinted, never attached), with explicit
+    // unverified-read loss (PARTIAL). The clean sibling's positive
+    // evidence survives under its verified fingerprint.
+    let mut h = Harness::fresh("raced-read");
+    h.snapshot_attached();
+    let bytes_b = flipped_build_id(&h.bytes.clone());
+    let raced = h.stage.write("raced.so", &bytes_b);
+    h.files.insert(
+        raced.path.clone(),
+        plan::FileBytes {
+            bytes: bytes_b.clone(),
+            dev: raced.device,
+            ino: raced.ino,
+        },
+    );
+    h.maps = vec![mapping(&h.staged), mapping(&raced)];
+    let (dev, ino) = (raced.device, raced.ino);
+    let raced_path = raced.path.clone();
+    // Reads run in relevant-path (sorted) order: prov.so first
+    // (clean staged bytes), raced.so second (B bytes under the A
+    // identity — a same-size edit the fd-pinned read could not
+    // see — with a moved post-read stat proving the race).
+    h.file_read_seq = VecDeque::from([
+        HashMap::from([(
+            h.staged.path.clone(),
+            plan::FileBytes {
+                bytes: h.bytes.clone(),
+                dev: h.staged.device,
+                ino: h.staged.ino,
+            },
+        )]),
+        HashMap::from([(
+            raced_path.clone(),
+            plan::FileBytes {
+                bytes: bytes_b.clone(),
+                dev,
+                ino,
+            },
+        )]),
+    ]);
+    let stat_pre = FileStat {
+        dev,
+        ino,
+        size: bytes_b.len() as u64,
+        mtime_ns: 0,
+    };
+    let stat_post = FileStat {
+        dev,
+        ino,
+        size: bytes_b.len() as u64,
+        mtime_ns: 1,
+    };
+    // prov.so stats fall back to the staged identity (clean);
+    // raced.so pre/post stats prove the race.
+    h.stat_seq = VecDeque::from([None, None, Some(stat_pre), Some(stat_post)]);
+    let cand_clean = cand(
+        "/p/provider.so",
+        backing_of(&h.staged, h.off),
+        1,
+        11,
+        "SHA-256",
+        false,
+        "ok",
+    );
+    let cand_raced = cand(
+        "/p/provider.so",
+        backing_of(&raced, h.off),
+        1,
+        12,
+        "SHA-256",
+        false,
+        "ok",
+    );
+    h.polls.push_back(DiscoveryDelta::default());
+    h.polls.push_back(DiscoveryDelta {
+        candidates: vec![cand_clean, cand_raced],
+        tables: vec![terminated(1, 0)],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    h.plans.insert(
+        2,
+        FirePlan {
+            fires: vec![(BASE_NS + 600_000_000, 7)],
+            shortfall: 0,
+            cancel: false,
+        },
+    );
+    h.exit_at_ns = Some(BASE_NS + 1_000_000_000);
+    h.exit_code = 0;
+    let (out, _) = h.run();
+    let c = out.unwrap();
+    // The clean site counts under its verified fingerprint; the
+    // raced site attaches nothing (withheld, never torn).
+    assert_eq!(c.document.total_calls(), 7);
+    assert_eq!(c.document.sites.len(), 1);
+    assert!(
+        c.document.sites[0].site.object.0.starts_with("build:"),
+        "{:?}",
+        c.document.sites[0].site.object.0
+    );
+    assert_eq!(c.document.sites[0].calls, 7);
+    assert_eq!(counter_value(&c, "discovery.unverified_read"), 1);
+    assert_eq!(counter_value(&c, "count.missed_attaches"), 1);
+    assert!(has_reason(&c, "discovery-loss"), "{:?}", c.reasons);
+    assert!(has_reason(&c, "missed-attaches"), "{:?}", c.reasons);
+    assert!(matches!(c.outcome, Outcome::Partial), "{c:?}");
+    assert!(matches!(c.document.status, Completeness::Partial { .. }));
+}
+
+#[test]
+fn startup_release_boundary_call_is_captured_in_order() {
+    // The first call executes AT the release boundary. The site was
+    // discovered in the BASELINE poll (pre-release) and attached
+    // before release, so the boundary call is captured — with
+    // explicit ordering evidence (sequence log: count programmed →
+    // released → first-call hit). Sequence, not timestamps: open,
+    // release, and the boundary call share one fake instant by
+    // construction — asserting on timestamps would be vacuous.
+    let mut h = Harness::fresh("boundary-capture");
+    h.snapshot_attached();
+    let cand1 = cand(
+        "/p/provider.so",
+        backing_of(&h.staged, h.off),
+        1,
+        11,
+        "SHA-256",
+        false,
+        "ok",
+    );
+    h.polls.push_back(DiscoveryDelta {
+        candidates: vec![cand1],
+        tables: vec![terminated(1, 0)],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    h.release_fires = vec![(0, 1)];
+    h.exit_at_ns = Some(BASE_NS + 1_000_000_000);
+    h.exit_code = 0;
+    let (out, post) = h.run();
+    let c = out.unwrap();
+    assert_eq!(c.document.total_calls(), 1);
+    assert_eq!(c.document.sites.len(), 1);
+    assert_eq!(c.document.sites[0].calls, 1);
+    let order = post.order.borrow();
+    let open = order.iter().position(|e| e == "count_open");
+    let released = order.iter().position(|e| e == "released");
+    let fired = order.iter().position(|e| e.starts_with("fired:"));
+    assert!(
+        open.is_some() && released.is_some() && fired.is_some(),
+        "missing ordering evidence: {order:?}"
+    );
+    assert!(
+        open.unwrap() < released.unwrap() && released.unwrap() < fired.unwrap(),
+        "count must program before release before first hit: {order:?}"
+    );
+    assert!(matches!(c.outcome, Outcome::Complete), "{c:?}");
+}
+
+#[test]
+fn startup_missing_readiness_misses_boundary_call_loud() {
+    // Missing-readiness control: NO baseline candidate — nothing is
+    // attached at release, so the release-boundary call executes
+    // with no probe and is MISSED (the attempt records
+    // `fire-missed:no-probe`; production has no uprobe to hit).
+    // The site first appears post-settle, so the late attach rides
+    // loud (late-attach PARTIAL), and only post-attach calls count.
+    let mut h = Harness::fresh("boundary-miss");
+    h.snapshot_attached();
+    let cand1 = cand(
+        "/p/provider.so",
+        backing_of(&h.staged, h.off),
+        1,
+        11,
+        "SHA-256",
+        false,
+        "ok",
+    );
+    h.polls.push_back(DiscoveryDelta::default());
+    for _ in 0..4 {
+        h.polls.push_back(DiscoveryDelta::default());
+    }
+    h.polls.push_back(DiscoveryDelta {
+        candidates: vec![cand1],
+        tables: vec![terminated(1, 0)],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    h.plans.insert(
+        6,
+        FirePlan {
+            fires: vec![(BASE_NS + 1_600_000_000, 7)],
+            shortfall: 0,
+            cancel: false,
+        },
+    );
+    h.release_fires = vec![(0, 1)];
+    h.exit_at_ns = Some(BASE_NS + 1_800_000_000);
+    h.exit_code = 0;
+    let (out, post) = h.run();
+    let c = out.unwrap();
+    // The boundary call missed (no probe); only post-attach calls
+    // count.
+    assert_eq!(c.document.total_calls(), 7);
+    assert_eq!(counter_value(&c, "discovery.late_attach_sites"), 1);
+    assert!(has_reason(&c, "late-attach"), "{:?}", c.reasons);
+    assert!(matches!(c.outcome, Outcome::Partial), "{c:?}");
+    let order = post.order.borrow();
+    assert!(
+        order.iter().any(|e| e == "fire-missed:no-probe"),
+        "boundary attempt must record its miss: {order:?}"
+    );
+    assert!(
+        !order.iter().any(|e| e.starts_with("fired:")),
+        "no probe — no hit: {order:?}"
+    );
+}
+
+#[test]
 fn startup_count_window_programmed_before_release() {
+    // NOTE (R20-fix finding 7): this pins post-release capture with
+    // late (+600ms) calls; the actual first-call readiness proof is
+    // `startup_release_boundary_call_is_captured_in_order` (boundary
+    // capture + order) and `startup_missing_readiness_misses_…`
+    // (missing-readiness control).
     // Startup first-call evidence (owned spawn): the kernel window is
     // programmed before the stopped child is released, so the
     // requested window (starting at release) is covered from its
@@ -6755,8 +7378,13 @@ fn count_close_reap_precedes_drain_for_owned_exit() {
     let closed = order.iter().position(|e| e == "count_closed");
     assert_eq!(
         order.as_slice(),
-        &["reaped".to_string(), "count_closed".to_string()],
-        "reap must strictly precede count close"
+        &[
+            "count_open".to_string(),
+            "released".to_string(),
+            "reaped".to_string(),
+            "count_closed".to_string()
+        ],
+        "count programs before release; reap strictly precedes count close"
     );
     assert!(reap < closed);
 }
