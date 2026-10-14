@@ -1250,8 +1250,12 @@ fn l1_load_513_margins() {
     assert_eq!(loaded.progs.len(), 513, "all member progs loaded");
     assert_eq!(
         loaded.maps.len(),
-        14,
-        "all member maps created (D 13 + item-5 BUCKET)"
+        15,
+        "all member maps created (D 14 incl. TRUNC_SEQ + item-5 BUCKET)"
+    );
+    assert!(
+        loaded.maps.contains_key("TRUNC_SEQ"),
+        "drain-race guard map present"
     );
     assert_eq!(attached.members.len(), 512, "all member links attached");
     let ctrl = osslscope::loader::read_ctrl(&loaded.maps).expect("read CTRL");
@@ -3958,14 +3962,18 @@ fn d_member_0_last() {
     assert!(!call_parts(&d2.calls[0]).0);
 }
 
-/// D L3-tail-warm absence (T=3 injected — no read, no compare, no
-/// firing past T; prefix intact): members 4+ skip-silent despite
-/// LIVE memory (a read would emit — absence proves no firing);
-/// member 3 WALKS (j ≤ T). The bridge l3-tail block is the cold
-/// twin (presence on cold).
+/// D L3-tail-warm absence (T=3 injected — the T-gate narrows
+/// the walk; prefix intact): member 4 (T+1) cold-walks the LIVE
+/// tail slot (growth evidence — the cache claims T=3 but slot 4
+/// is live, so silence would hide growth); members 5+ stay
+/// silent despite LIVE memory (a read would emit — absence
+/// proves no firing — the T+1 verdict covers them); member 3
+/// WALKS (j ≤ T). The bridge l3-tail block is the cold twin
+/// (presence on cold).
 #[test]
 #[ignore]
 fn d_l3_tail_warm() {
+    use osslscope_ebpf_common as wire;
     let Some(obj) = gated() else {
         eprintln!("SKIP(members-live): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
         return;
@@ -4001,7 +4009,8 @@ fn d_l3_tail_warm() {
     FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
     NS_VERDICT.store(0, Ordering::SeqCst);
     // Inject T=3 (gen 0 = live GEN — warm). Pointee is zero, so
-    // members 4+ skip-silent; member 3 (j == T) walks.
+    // members 5+ skip-silent; member 3 (j == T) walks; member 4
+    // (T+1) cold-walks the live tail slot (growth evidence).
     write_tcache(loaded, fx.array, 3, 0);
     fire(OP as i32, 2);
     let ScanDrain {
@@ -4017,22 +4026,43 @@ fn d_l3_tail_warm() {
         ret_for(&rets, c.tid, c.seq);
     }
     assert!(guards.is_empty(), "warm T=3 ≠ 512 → no guard");
-    // Prefix + member 3 exact; slots 4+ absent DESPITE live memory.
-    for j in 0..4u64 {
+    // Prefix + member 3 exact (3 OK + terminator EMPTY).
+    for j in 0..3u64 {
+        let got: Vec<_> = algs.iter().filter(|a| a.idx == j).collect();
+        assert_eq!(got.len(), 2, "slot {j} walked (j < T)");
+        assert!(got.iter().all(|a| a.status == wire::ALG_OK), "slot {j} OK");
         assert_eq!(
-            algs.iter().filter(|a| a.idx == j).count(),
+            rows.iter().filter(|r| r.idx == j).count(),
             2,
-            "slot {j} walked (j ≤ T)"
+            "slot {j} rows"
         );
     }
+    let t3: Vec<_> = algs.iter().filter(|a| a.idx == 3).collect();
+    assert_eq!(t3.len(), 2, "slot 3 walked (j == T)");
     assert!(
-        algs.iter().all(|a| a.idx <= 3) && rows.iter().all(|r| r.idx <= 3),
-        "members 4+ never fired (absence despite live memory)"
+        t3.iter().all(|a| a.status == wire::ALG_EMPTY),
+        "slot 3 EMPTY"
+    );
+    // Member 4 (T+1) cold-walks the live tail slot (growth
+    // evidence — silence here would hide growth past T).
+    let g4: Vec<_> = algs.iter().filter(|a| a.idx == 4).collect();
+    assert_eq!(g4.len(), 2, "T+1 walks live slot 4");
+    assert!(g4.iter().all(|a| a.status == wire::ALG_OK), "slot 4 OK");
+    assert_eq!(
+        rows.iter().filter(|r| r.idx == 4).count(),
+        2,
+        "slot 4 rows (growth dispatch walked)"
+    );
+    // Members 5+ never fired (absence despite live memory — the
+    // T+1 verdict covers them).
+    assert!(
+        algs.iter().all(|a| a.idx <= 4) && rows.iter().all(|r| r.idx <= 4),
+        "members 5+ never fired (absence despite live memory)"
     );
     assert_eq!(
         read_percpu(loaded, "TRUNC", OP, true),
         0,
-        "warm skip leaves TRUNC clean"
+        "warm skip + T+1 walk leave TRUNC clean"
     );
     assert_retired(loaded, tid, "tail-warm");
     assert_loss_zero(loaded);
@@ -4048,7 +4078,10 @@ fn d_l3_tail_warm() {
 /// read faults while 0..2 stay readable (page-straddle layout),
 /// so member 3 aborts SILENT (no ALG record — the contrast with
 /// the NAME cell's explicit record) with TRUNC_WALK_READ alone.
-/// Members 4+ skip-silent in both cells (warm + zero verdict).
+/// Member 4 (T+1) cold-walks the live slot in the NAME cell
+/// (growth evidence) and aborts silent in the READ cell (same
+/// READ flag, no record); members 5+ skip-silent in both cells
+/// (warm + zero verdict).
 #[test]
 #[ignore]
 fn d_terminator_control() {
@@ -4099,10 +4132,19 @@ fn d_terminator_control() {
     let idx3: Vec<_> = algs.iter().filter(|a| a.idx == 3).collect();
     assert_eq!(idx3.len(), 1, "member 3 read (j == T walks)");
     assert_eq!(idx3[0].status, wire::ALG_UNREADABLE);
-    // Members 4+ skipped (live slots 4,5 never read).
+    // Member 4 (T+1) cold-walks the live slot (growth evidence);
+    // members 5+ skipped (live slot 5 never read).
+    let idx4: Vec<_> = algs.iter().filter(|a| a.idx == 4).collect();
+    assert_eq!(idx4.len(), 1, "T+1 walks live slot 4");
+    assert_eq!(idx4[0].status, wire::ALG_OK);
+    assert_eq!(
+        rows.iter().filter(|r| r.idx == 4).count(),
+        1,
+        "slot 4 row (growth dispatch walked)"
+    );
     assert!(
-        algs.iter().all(|a| a.idx <= 3) && rows.iter().all(|r| r.idx <= 2),
-        "members 4+ never fired"
+        algs.iter().all(|a| a.idx <= 4) && rows.iter().all(|r| r.idx <= 4),
+        "members 5+ never fired"
     );
     // Prefix 0..2 exact.
     for j in 0..3u64 {
@@ -4321,14 +4363,20 @@ fn d_no_store_prefix() {
         );
         assert_eq!(d.rows.len() as u64, live, "{tag}: rows = live only");
     }
-    /// Warm skip past T=3: members 0..=3 walk, 4+ skip-silent.
+    /// Warm skip past T=3: members 0..=3 walk, member 4 (T+1)
+    /// cold-walks the live slot (growth evidence), 5+ skip-silent.
     fn assert_skipped(d: &ScanDrain, tag: &str) {
         assert!(
-            d.algs.iter().all(|a| a.idx <= 3) && d.rows.iter().all(|r| r.idx <= 3),
-            "{tag}: past-T skipped"
+            d.algs.iter().all(|a| a.idx <= 4) && d.rows.iter().all(|r| r.idx <= 4),
+            "{tag}: past-T+1 skipped"
         );
-        assert_eq!(d.algs.len(), 4, "{tag}: members 0..=3 walked");
-        assert_eq!(d.rows.len(), 4, "{tag}: rows 0..=3");
+        assert_eq!(d.algs.len(), 5, "{tag}: members 0..=4 walked");
+        assert_eq!(
+            d.algs.iter().filter(|a| a.idx == 4).count(),
+            1,
+            "{tag}: T+1 walks live slot 4"
+        );
+        assert_eq!(d.rows.len(), 5, "{tag}: rows 0..=4");
     }
 
     // F1: cold + verdict 0 → full reach, TRUNC clean.
