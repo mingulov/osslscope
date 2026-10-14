@@ -327,8 +327,10 @@ pub const HARVEST_PROGS: [ProgSpec; 15] = [
 /// arrives with item 3; members.o dropped its PENDING_QUERY
 /// scaffold in stage D when members switched to SCAN (R18 §6.1;
 /// the harvest path's cursor maps retire in item 9). Item 5 adds
-/// the tier-1 BUCKET map; item 7 grows EVENTS to 16MiB. The
-/// TRUNC_SEQ drain-race guard arrives with the round-2 fix.
+/// the tier-1 BUCKET map; item 7 grows EVENTS to 16MiB. Round 3
+/// adds the per-op TRUNC_SEQ flag-event generation (recurring
+/// faults re-report on generation advance — the lossless drain
+/// never clears, so there is no clear to race at all).
 pub const MEMBER_MAPS: [MapSpec; 15] = [
     MapSpec {
         name: "EVENTS",
@@ -444,10 +446,10 @@ pub const MEMBER_MAPS: [MapSpec; 15] = [
     },
     MapSpec {
         name: "TRUNC_SEQ",
-        map_type: 6,
+        map_type: 1,
         key_size: 4,
         value_size: 8,
-        max_entries: 1,
+        max_entries: 64,
         flags: 0,
     },
 ];
@@ -4073,7 +4075,7 @@ mod tests {
         // The spec count is the prepare-time contract: 6 retained
         // maps + the 7 scan-plane maps + item-5 BUCKET (stage D
         // dropped PENDING — R18 §6.1 — → 13, then +1 → 14) +
-        // the round-2 TRUNC_SEQ drain-race guard (→ 15).
+        // round-3 per-op TRUNC_SEQ (→ 15).
         assert_eq!(MEMBER_MAPS.len(), 15);
         assert!(
             MEMBER_MAPS.iter().all(|m| m.name != "PENDING_QUERY"),
