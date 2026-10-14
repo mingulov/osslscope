@@ -110,6 +110,10 @@ pub struct PollDelta {
     /// drained keys — every downstream holder applies them by
     /// (tid, seq), or the false verdict survives there).
     pub corrections: Vec<Correction>,
+    /// Admitted-query census snapshot (CALLS per op, cumulative
+    /// since attach): honest observation metadata (reported,
+    /// never billed into executions).
+    pub admitted: BTreeMap<u32, u64>,
 }
 
 /// Point-in-time backend state (no record clones — long runs
@@ -367,6 +371,14 @@ impl ScanBackend {
         (self.oracle.take_done(), self.oracle.take_findings())
     }
 
+    /// Take pending post-drain corrections (salvage path: rewrites
+    /// for already-held verdicts — taken alongside records and
+    /// findings so failure recovery never strands a false
+    /// verdict).
+    pub fn take_corrections(&mut self) -> Vec<Correction> {
+        self.oracle.take_corrections()
+    }
+
     /// Poll once at `now` (drain → join → tiers → warm).
     /// `quiesced` = no query in flight (retirement/stall inference
     /// is only sound quiesced — legs pass true after joining
@@ -421,9 +433,13 @@ impl ScanBackend {
             }
         }
         // Tier-2 + cache warms/heals over newly closed invocations.
+        // (Corrections take AFTER the fallible cache loop below:
+        // a cache write error must not drop rewrites for already-
+        // held verdicts — untaken corrections stay in the oracle
+        // for the next poll or the salvage take.)
         let fresh: Vec<WalkDone> = self.oracle.take_done();
         let fresh_findings: Vec<Finding> = self.oracle.take_findings();
-        let fresh_corrections: Vec<Correction> = self.oracle.take_corrections();
+        let fresh_admitted = read_calls_by_op(&self.loaded.maps)?;
         self.done_total += fresh.len() as u64;
         self.findings_total += fresh_findings.len() as u64;
         for w in &fresh {
@@ -499,9 +515,14 @@ impl ScanBackend {
                 None => {}
             }
         }
+        // Corrections take here (after every fallible map write
+        // above — a cache error above leaves them in the oracle
+        // for the next poll or salvage, never dropped).
+        let fresh_corrections: Vec<Correction> = self.oracle.take_corrections();
         delta.done = fresh;
         delta.findings = fresh_findings;
         delta.corrections = fresh_corrections;
+        delta.admitted = fresh_admitted;
         Ok(delta)
     }
 
@@ -537,6 +558,7 @@ impl ScanBackend {
         delta.done.extend(done);
         delta.findings.extend(findings);
         delta.corrections.extend(self.oracle.take_corrections());
+        delta.admitted = read_calls_by_op(&self.loaded.maps)?;
         Ok(delta)
     }
 
@@ -806,6 +828,19 @@ fn accumulate_trunc(
     delta
 }
 
+/// Admitted-query census snapshot (CALLS per op, summed across
+/// CPUs — cumulative since attach; absence of a key means zero
+/// admits, never "unknown"). Honest observation metadata
+/// (reported, never billed into executions).
+fn read_calls_by_op(
+    maps: &std::collections::HashMap<String, OwnedFd>,
+) -> anyhow::Result<BTreeMap<u32, u64>> {
+    Ok(read_percpu_all(maps, "CALLS", false)?
+        .into_iter()
+        .filter(|(_, v)| *v != 0)
+        .collect())
+}
+
 /// Lossless TRUNC drain: sticky per-op flag bits plus the
 /// per-op flag-event generation, never cleared. First sightings
 /// report via freshness; repeats re-report via the generation
@@ -821,21 +856,12 @@ pub fn drain_trunc_flags(
     maps: &std::collections::HashMap<String, OwnedFd>,
     hook: Option<&dyn Fn()>,
 ) -> anyhow::Result<BTreeMap<u32, u64>> {
-    use anyhow::Context as _;
     let snap: BTreeMap<u32, u64> = read_percpu_all(maps, "TRUNC", true)?.into_iter().collect();
-    let fd = maps
-        .get("TRUNC_SEQ")
-        .context("map TRUNC_SEQ missing")?
-        .try_clone()
-        .context("clone TRUNC_SEQ")?;
-    let data = aya::maps::MapData::from_fd(fd).context("TRUNC_SEQ mapdata")?;
-    let map = aya::maps::Map::from_map_data(data).context("TRUNC_SEQ map")?;
-    let m = aya::maps::HashMap::<_, u32, u64>::try_from(map).context("TRUNC_SEQ hash shape")?;
-    let mut seq: BTreeMap<u32, u64> = BTreeMap::new();
-    for r in m.iter() {
-        let (k, v) = r.context("TRUNC_SEQ iter")?;
-        seq.insert(k, v);
-    }
+    // Per-op generation, summed across CPUs (single-writer
+    // slots — the sum is the exact event count, rollback-free).
+    let seq: BTreeMap<u32, u64> = read_percpu_all(maps, "TRUNC_SEQ", false)?
+        .into_iter()
+        .collect();
     if let Some(h) = hook {
         h();
     }
