@@ -100,6 +100,16 @@ static LOSS: PerCpuHashMap<u32, u64> = PerCpuHashMap::with_max_entries(32, 0);
 /// Per-CPU (F-C/A8); userspace ORs across CPUs at drain.
 #[map]
 static TRUNC: PerCpuHashMap<u32, u64> = PerCpuHashMap::with_max_entries(64, 0);
+/// TRUNC flag generation (drain-race guard): bumped on EVERY
+/// flag event (even a map-full one — activity is activity).
+/// Userspace's seq-guarded drain reads this around its
+/// read/clear window; an advance across the window proves a
+/// concurrent flag may have been erased unread, and the drain
+/// degrades explicitly instead of losing it silently.
+/// Per-CPU array; userspace sums. Monotonic per boot (a
+/// wrapping add — 2^64 flags never wraps in practice).
+#[map]
+static TRUNC_SEQ: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
 /// Non-null query calls per op id, counted by member 0 (once per
 /// query — every member fires every hit, so member 0's bump is the
 /// per-query count; all-members bumping would inflate 512x).
@@ -139,7 +149,9 @@ static BIRTH: HashMap<u32, u16> = HashMap::with_max_entries(4096, 0);
 static RCOUNT: HashMap<u32, u64> = HashMap::with_max_entries(4096, 0);
 /// Terminator cache (§5.3): array → (T, GEN),
 /// single-userspace-writer. Members peek + validate GEN and
-/// skip-silent past T.
+/// skip past T — silently past T+1, while the T+1 member proves
+/// termination explicitly (boundary EMPTY) or cold-walks
+/// (growth evidence).
 #[map]
 static T_CACHE: HashMap<u64, TCacheValue> = HashMap::with_max_entries(1024, 0);
 /// Tier-1 token bucket (item 5, §5.4): tid → tokens:8 |
@@ -258,6 +270,13 @@ fn cookie_of(ctx: &ProbeContext) -> u64 {
 fn flag_trunc(op: u32, bit: u64) {
     if percpu_or(&TRUNC, &op, bit).is_err() {
         bump_loss(LOSS_MAP_TRUNC);
+    }
+    // Generation bump (drain-race guard — unconditional: a
+    // map-full flag is still concurrent activity, and its loss
+    // is already counted above). PerCpuArray cells pre-exist,
+    // so the slot cannot miss (same pattern as ATTEMPT).
+    if let Some(slot) = TRUNC_SEQ.get_ptr_mut(0) {
+        unsafe { *slot = (*slot).wrapping_add(1) };
     }
 }
 
@@ -756,13 +775,58 @@ macro_rules! def_member {
                         // OpenSSL provider-base contract assigns
                         // cache permission to the integer
                         // out-value). Nonzero / NULL / unreadable
-                        // → COLD walk.
+                        // → COLD walk. The FIRST would-skip slot
+                        // (T+1) never skips silently: it verifies
+                        // by reading its own slot names — zero
+                        // proves the terminator explicitly
+                        // (boundary ALG_EMPTY), anything else
+                        // falls through to the COLD walk below
+                        // (growth evidence the oracle uses to
+                        // invalidate). Later slots stay silent —
+                        // the T+1 verdict covers them (a grown
+                        // table cold-walks T+1, so silence past
+                        // T+1 with a T+1 EMPTY is proven
+                        // termination, not absence).
                         match unsafe {
                             helpers::bpf_probe_read_user(ns_ptr as *const u32)
                         } {
                             Ok(0) => {
-                                epilogue(gated, old, expected, &tid);
-                                return 0;
+                                if $j == t.wrapping_add(1) {
+                                    let names_base = rv + $j * 32;
+                                    match unsafe {
+                                        helpers::bpf_probe_read_user(
+                                            names_base as *const u64,
+                                        )
+                                    } {
+                                        Ok(0) => {
+                                            emit_scan_alg(&ScanAlgEvent {
+                                                kind: KIND_SCAN_ALG,
+                                                op: op as u32,
+                                                class: OTHER_CLASS,
+                                                status: ALG_EMPTY,
+                                                weak: 0,
+                                                _pad: 0,
+                                                arr: rv,
+                                                idx: $j,
+                                                generation: gen_of(rv),
+                                                tid,
+                                                _pad2: 0,
+                                                seq,
+                                            });
+                                            epilogue(gated, old, expected, &tid);
+                                            return 0;
+                                        }
+                                        // Live or unreadable:
+                                        // fall through to the
+                                        // COLD walk (growth
+                                        // evidence, never a
+                                        // silent skip).
+                                        _ => {}
+                                    }
+                                } else {
+                                    epilogue(gated, old, expected, &tid);
+                                    return 0;
+                                }
                             }
                             _ => {}
                         }
