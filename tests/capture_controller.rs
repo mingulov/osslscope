@@ -184,6 +184,10 @@ struct FakeDiscovery {
     clock: Rc<FakeClock>,
     polls: VecDeque<DiscoveryDelta>,
     plans: HashMap<usize, FirePlan>,
+    /// Tgid fires bind to (the count session's target; PID for the
+    /// scripted harness, the real child for live-child runs — a
+    /// mismatched tgid would silently drop every fire).
+    fire_tgid: u32,
     poll_delay_ns: HashMap<usize, u64>,
     /// REAL (wall-clock) sleep per poll, never fake-advancing
     /// (F-D/A13): live-child tests need real time to pass for the
@@ -213,9 +217,10 @@ impl DiscoveryPort for FakeDiscovery {
                 st.backend.set_shortfall(plan.shortfall);
             }
             let cookies = st.attached.clone();
+            let tgid = self.fire_tgid;
             for (ns, n) in &plan.fires {
                 for cookie in &cookies {
-                    st.backend.fire(PID, *cookie, *ns, *n);
+                    st.backend.fire(tgid, *cookie, *ns, *n);
                 }
             }
             if plan.cancel {
@@ -419,10 +424,18 @@ struct FakeLifecycle {
     /// shape (no close witness); `Some` is the kernel-signal shape
     /// (drained through the tail even after the target exited).
     close_drain: Option<LifecycleDelta>,
+    /// Fake clock advanced by `advance_ns` on every poll (R20-fix
+    /// round 2, F3): models a slow lifecycle scan crossing the
+    /// deadline mid-round (production scans take real time).
+    clock: Option<Rc<FakeClock>>,
+    advance_ns: u64,
 }
 
 impl LifecyclePort for FakeLifecycle {
     fn poll(&mut self) -> LifecycleDelta {
+        if let Some(clock) = &self.clock {
+            clock.advance_ns(self.advance_ns);
+        }
         self.polls.pop_front().unwrap_or_default()
     }
 
@@ -756,6 +769,14 @@ struct Harness {
     /// Calls executing AT the release boundary (R20-fix finding 7),
     /// wired into the fake target's release hook.
     release_fires: Vec<(usize, u64)>,
+    /// Fake ns advanced by every lifecycle poll (R20-fix round 2,
+    /// F3): models a slow lifecycle scan crossing the deadline
+    /// mid-round (production scans take real time).
+    lifecycle_advance_ns: u64,
+    /// Custom cancellation hook (R20-fix round 2, F3): replaces the
+    /// flag closure, modelling an async signal landing mid-round
+    /// (call-counted in tests — production signals are async).
+    cancel_hook: Option<Rc<dyn Fn() -> bool>>,
 }
 
 impl Harness {
@@ -838,6 +859,8 @@ impl Harness {
             cancelled: Rc::new(Cell::new(false)),
             cancel_on_poll: false,
             release_fires: Vec::new(),
+            lifecycle_advance_ns: 0,
+            cancel_hook: None,
         }
     }
 
@@ -868,6 +891,7 @@ impl Harness {
             clock: self.clock.clone(),
             polls: self.polls,
             plans: self.plans,
+            fire_tgid: PID,
             poll_delay_ns: self.poll_delay_ns,
             poll_real_delay: Duration::ZERO,
             poll_err_at: self.poll_err_at,
@@ -906,6 +930,8 @@ impl Harness {
             polls: self.lifecycle_polls,
             fallback: self.lifecycle_fallback,
             close_drain: self.lifecycle_close_drain,
+            clock: Some(self.clock.clone()),
+            advance_ns: self.lifecycle_advance_ns,
         };
         let mut proc = FakeProc {
             clock: self.clock.clone(),
@@ -927,6 +953,12 @@ impl Harness {
             stat_seq: self.stat_seq,
         };
         let flag = self.cancelled.clone();
+        let hook = self.cancel_hook.clone();
+        let fallback = || flag.get();
+        let cancelled: &dyn Fn() -> bool = match &hook {
+            Some(h) => &**h,
+            None => &fallback,
+        };
         let out = observe(
             &self.cfg,
             &info,
@@ -938,7 +970,7 @@ impl Harness {
             },
             &*self.clock,
             &mut proc,
-            &|| flag.get(),
+            cancelled,
         );
         (
             out,
@@ -976,13 +1008,15 @@ fn clean_exit_yields_complete() {
         false,
         "ok",
     );
-    h.polls.push_back(DiscoveryDelta::default());
+    // Baseline attach (pre-release ready — the production-faithful
+    // ready-window shape under F7).
     h.polls.push_back(DiscoveryDelta {
         candidates: vec![cand1],
         tables: vec![terminated(1, 0)],
         trigger_observed: true,
         ..DiscoveryDelta::default()
     });
+    h.polls.push_back(DiscoveryDelta::default());
     h.plans.insert(
         2,
         FirePlan {
@@ -2313,13 +2347,15 @@ fn h3_t5_mixed_counter_counts_distinct_triples() {
             false,
             statuses[1],
         );
-        h.polls.push_back(DiscoveryDelta::default());
+        // Baseline attach (pre-release ready — F7: post-release
+        // attaches of pre-release mappings gap now).
         h.polls.push_back(DiscoveryDelta {
             candidates: vec![cand1, cand2],
             tables: vec![terminated(1, 0), terminated(2, 0)],
             trigger_observed: true,
             ..DiscoveryDelta::default()
         });
+        h.polls.push_back(DiscoveryDelta::default());
         h.plans.insert(
             2,
             FirePlan {
@@ -2385,13 +2421,15 @@ fn untracked_epoch_executions_are_unattributed_partial() {
         "ok",
     );
     cand_b.epoch = 9;
-    h.polls.push_back(DiscoveryDelta::default());
+    // Baseline attach (pre-release ready — F7 keeps this test's
+    // focus on epoch coverage, not attach timing).
     h.polls.push_back(DiscoveryDelta {
         candidates: vec![cand_a, cand_b],
         tables: vec![terminated(1, 0)],
         trigger_observed: true,
         ..DiscoveryDelta::default()
     });
+    h.polls.push_back(DiscoveryDelta::default());
     h.plans.insert(
         2,
         FirePlan {
@@ -2988,13 +3026,16 @@ fn late_provider_operation_attaches_with_loss() {
     );
     // Poll index == round index (one poll per round): the op-9
     // candidates arrive post-settle (round ≥4 ≈ 1s, settle 500ms).
-    h.polls.push_back(DiscoveryDelta::default());
+    // The op-1 site attaches at the BASELINE poll (pre-release
+    // ready — R20-fix round 2, F7: a post-release attach of a
+    // pre-release mapping gaps even inside the settle grace).
     h.polls.push_back(DiscoveryDelta {
         candidates: vec![cand_a],
         tables: vec![terminated(1, 0)],
         trigger_observed: true,
         ..DiscoveryDelta::default()
     });
+    h.polls.push_back(DiscoveryDelta::default());
     h.polls.push_back(DiscoveryDelta::default());
     h.polls.push_back(DiscoveryDelta::default());
     h.polls.push_back(DiscoveryDelta {
@@ -4060,6 +4101,7 @@ fn advertising_fallback_binds_mapping_not_path() {
                 pinned_provider: None,
                 fresh: &fresh,
                 post_settle: false,
+                post_release: false,
                 baseline: false,
             },
         );
@@ -4105,6 +4147,7 @@ fn advertising_fallback_unresolved_is_anonymous() {
             pinned_provider: None,
             fresh: &fresh,
             post_settle: false,
+            post_release: false,
             baseline: false,
         },
     );
@@ -4191,6 +4234,7 @@ fn provider_class_resolves_per_advertising_object() {
             }),
             fresh: &fresh,
             post_settle: false,
+            post_release: false,
             baseline: false,
         },
     );
@@ -4270,6 +4314,7 @@ fn stale_path_fingerprint_is_unverified() {
             pinned_provider: None,
             fresh: &fresh,
             post_settle: false,
+            post_release: false,
             baseline: false,
         },
     );
@@ -4354,6 +4399,7 @@ fn advertising_joins_exact_vma_not_first_path() {
             pinned_provider: None,
             fresh: &fresh,
             post_settle: false,
+            post_release: false,
             baseline: false,
         },
     );
@@ -4427,6 +4473,7 @@ fn advertising_turnover_is_anonymous() {
             pinned_provider: None,
             fresh: &fresh,
             post_settle: false,
+            post_release: false,
             baseline: false,
         },
     );
@@ -4535,6 +4582,7 @@ fn refreshed_site_fingerprint_is_forwarded() {
             pinned_provider: None,
             fresh: &fresh,
             post_settle: false,
+            post_release: false,
             baseline: false,
         },
     );
@@ -4558,6 +4606,7 @@ fn refreshed_site_fingerprint_is_forwarded() {
             pinned_provider: None,
             fresh: &fresh,
             post_settle: false,
+            post_release: false,
             baseline: false,
         },
     );
@@ -4634,6 +4683,7 @@ impl AdaptHarness {
                 pinned_provider: None,
                 fresh: &self.fresh,
                 post_settle: false,
+                post_release: false,
                 baseline: false,
             },
         )
@@ -5227,7 +5277,7 @@ fn bad_read_gap_never_heals_by_recompute() {
 // Live lifecycle fixtures: real pids, real custody, no privileges.
 // ---------------------------------------------------------------------------
 
-use osslscope::capture::{LiveProc, PollingLifecycle};
+use osslscope::capture::{KernelLifecycle, LiveLifecycle, LiveProc, PollingLifecycle};
 use osslscope::target::{
     __test_set_prestop_pid_sink, __test_set_prestop_stall_ms, OwnedTarget, WorkloadDest,
 };
@@ -5313,6 +5363,7 @@ fn live_observe_inner(
         clock: clock.clone(),
         polls: VecDeque::new(),
         plans: HashMap::new(),
+        fire_tgid: PID,
         poll_delay_ns: HashMap::new(),
         // 5ms real per poll (~120 polls over the 30s window):
         // the real child needs wall-clock time to exec+exit while
@@ -5340,6 +5391,8 @@ fn live_observe_inner(
         polls: VecDeque::new(),
         fallback: false,
         close_drain: None,
+        clock: None,
+        advance_ns: 0,
     };
     let mut files = HashMap::new();
     files.insert(
@@ -6288,13 +6341,14 @@ fn lifecycle_empty_close_drain_preserves_complete() {
         false,
         "ok",
     );
-    h.polls.push_back(DiscoveryDelta::default());
+    // Baseline attach (pre-release ready — F7).
     h.polls.push_back(DiscoveryDelta {
         candidates: vec![cand1],
         tables: vec![terminated(1, 0)],
         trigger_observed: true,
         ..DiscoveryDelta::default()
     });
+    h.polls.push_back(DiscoveryDelta::default());
     h.plans.insert(
         2,
         FirePlan {
@@ -7302,13 +7356,15 @@ fn startup_count_window_programmed_before_release() {
         false,
         "ok",
     );
-    h.polls.push_back(DiscoveryDelta::default());
+    // Baseline attach (pre-release ready — F7: the programmed-
+    // before-release contract needs a ready boundary).
     h.polls.push_back(DiscoveryDelta {
         candidates: vec![cand1],
         tables: vec![terminated(1, 0)],
         trigger_observed: true,
         ..DiscoveryDelta::default()
     });
+    h.polls.push_back(DiscoveryDelta::default());
     h.plans.insert(
         2,
         FirePlan {
@@ -7352,13 +7408,15 @@ fn count_close_reap_precedes_drain_for_owned_exit() {
         false,
         "ok",
     );
-    h.polls.push_back(DiscoveryDelta::default());
+    // Baseline attach (pre-release ready — F7 keeps this test's
+    // focus on the reap/close order, not attach timing).
     h.polls.push_back(DiscoveryDelta {
         candidates: vec![cand1],
         tables: vec![terminated(1, 0)],
         trigger_observed: true,
         ..DiscoveryDelta::default()
     });
+    h.polls.push_back(DiscoveryDelta::default());
     h.plans.insert(
         2,
         FirePlan {
@@ -7387,4 +7445,450 @@ fn count_close_reap_precedes_drain_for_owned_exit() {
         "count programs before release; reap strictly precedes count close"
     );
     assert!(reap < closed);
+}
+
+// ---------------------------------------------------------------------------
+// R20-fix round 2, finding 1: ordinary production capture qualified with
+// the real kernel lifecycle adapter (no fakes on the lifecycle path).
+// ---------------------------------------------------------------------------
+
+/// Connector facility gate (R20-fix round 2 MINOR): real-connector
+/// controls run only where the facility subscribes; elsewhere they
+/// skip (pass) unless `OSSLSCOPE_REQUIRE_CONNECTOR=1` forces a hard
+/// failure. `OSSLSCOPE_CONNECTOR_TEST=force-absent` simulates absence
+/// (test hook — proves the skip path where the facility is present).
+/// The probe subscribe/unsubscribe pair is balanced (Drop unsubscribes).
+fn connector_present() -> bool {
+    if std::env::var("OSSLSCOPE_CONNECTOR_TEST").as_deref() == Ok("force-absent") {
+        return false;
+    }
+    KernelLifecycle::subscribe(std::process::id()).is_ok()
+}
+
+fn require_connector(test: &str) -> bool {
+    if connector_present() {
+        return true;
+    }
+    assert!(
+        std::env::var("OSSLSCOPE_REQUIRE_CONNECTOR").as_deref() != Ok("1"),
+        "{test} requires a working proc connector (OSSLSCOPE_REQUIRE_CONNECTOR=1)"
+    );
+    eprintln!("SKIP {test}: proc connector unavailable (fallback/PARTIAL shape unsupported here)");
+    false
+}
+
+/// Real owned child + REAL kernel lifecycle through the real
+/// `observe` loop (scripted discovery/count/proc, injected clock with
+/// wall-clock pacing): the ordinary-production-capture shape with no
+/// fakes on the qualified (lifecycle) path. Returns `None` when the
+/// connector facility is absent (caller skips). Discovery polls are
+/// built inside (against the helper's own staged files): a full
+/// baseline attach plus one round-1 fire plan when asked.
+#[allow(clippy::too_many_arguments)]
+fn live_observe_kernel_lifecycle(
+    test: &str,
+    argv: &[&str],
+    duration: Duration,
+    baseline_attach: bool,
+    round1_fires: Vec<(u64, u64)>,
+) -> Option<(anyhow::Result<Capture>, u32)> {
+    let stage = Stage::fresh(test);
+    let bytes = self_bytes();
+    let off = x_offset(&bytes);
+    let staged = stage.write("prov.so", &bytes);
+    let mut polls = VecDeque::new();
+    if baseline_attach {
+        let cand1 = cand(
+            "/p/provider.so",
+            backing_of(&staged, off),
+            1,
+            11,
+            "SHA-256",
+            false,
+            "ok",
+        );
+        polls.push_back(DiscoveryDelta {
+            candidates: vec![cand1],
+            tables: vec![terminated(1, 0)],
+            trigger_observed: true,
+            ..DiscoveryDelta::default()
+        });
+    } else {
+        polls.push_back(DiscoveryDelta::default());
+    }
+    polls.push_back(DiscoveryDelta::default());
+    let mut plans = HashMap::new();
+    if !round1_fires.is_empty() {
+        plans.insert(
+            1,
+            FirePlan {
+                fires: round1_fires,
+                shortfall: 0,
+                cancel: false,
+            },
+        );
+    }
+    let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+    let mut owned = OwnedTarget::spawn_stopped(&argv, WorkloadDest::Null).unwrap();
+    let pid = owned.pid();
+    // Production order: subscribe while the child is stopped
+    // (pre-release), exactly like `run()` does.
+    let lifecycle = match LiveLifecycle::select(pid) {
+        kernel @ LiveLifecycle::Kernel(_) => kernel,
+        LiveLifecycle::Polling(_) => {
+            let _ = owned.resolve_setup_failure();
+            if std::env::var("OSSLSCOPE_REQUIRE_CONNECTOR").as_deref() == Ok("1") {
+                panic!("{test} requires a working proc connector");
+            }
+            eprintln!("SKIP {test}: proc connector unavailable");
+            return None;
+        }
+    };
+    assert!(
+        !lifecycle.fallback_partial(),
+        "kernel signals must not be the PARTIAL fallback"
+    );
+    let clock = FakeClock::new();
+    let shared = Rc::new(RefCell::new(SharedState::default()));
+    let mut snapshot = DiscoverySnapshot::default();
+    snapshot.dispatch.attached = true;
+    snapshot.dispatch.trigger_observed = true;
+    let discovery = FakeDiscovery {
+        shared: shared.clone(),
+        clock: clock.clone(),
+        polls,
+        plans,
+        fire_tgid: pid,
+        poll_delay_ns: HashMap::new(),
+        // Wall-clock pacing (live_observe pattern): the real child
+        // needs real time to exec+exit while the fake clock spins.
+        poll_real_delay: Duration::from_millis(5),
+        poll_err_at: HashSet::new(),
+        snapshot,
+        finish_err: false,
+        finish_recycled: false,
+        finish_final: None,
+        cancel_flag: None,
+        polls_done: 0,
+        finished: false,
+    };
+    let count = CountSession::new(
+        pid,
+        SharedBackend {
+            shared,
+            clock: clock.clone(),
+            order: Rc::new(RefCell::new(Vec::new())),
+        },
+    );
+    let mut files = HashMap::new();
+    files.insert(
+        staged.path.clone(),
+        plan::FileBytes {
+            bytes,
+            dev: staged.device,
+            ino: staged.ino,
+        },
+    );
+    let mut proc = FakeProc {
+        clock: clock.clone(),
+        maps: vec![mapping(&staged)],
+        maps_seq: VecDeque::new(),
+        files,
+        file_err: HashSet::new(),
+        // Scripted exe link stays put: any exec fence in this window
+        // comes ONLY from the real kernel witness, never from the
+        // snapshot arm — the witness path is isolated.
+        exe: Some(PathBuf::from("/bin/sleep")),
+        exe_seq: VecDeque::new(),
+        file_read_seq: VecDeque::new(),
+        maps_err_at: HashSet::new(),
+        maps_delay_ns: 0,
+        file_delay_ns: 0,
+        maps_calls: 0,
+        comm: None,
+        comm_settle_at_ns: None,
+        comm_settled: None,
+        proc_log: Rc::new(RefCell::new(ProcLog::default())),
+        stat_seq: VecDeque::new(),
+    };
+    let info = TargetInfo {
+        pid,
+        owned: true,
+        comm: "sleep".to_string(),
+        cmdline: "<redacted>".to_string(),
+        container_id: String::new(),
+        kernel_release: "test-kernel".to_string(),
+        provider_build_id: "unknown".to_string(),
+        provider_path: "/p/provider.so".to_string(),
+        image_digest: String::new(),
+        acquired_ns: BASE_NS,
+        acquired_instant: clock.now(),
+        acquired_wall: clock.wall_now(),
+    };
+    let cfg = Config {
+        harvest_object: Some(PathBuf::new()),
+        count_object: Some(PathBuf::new()),
+        provider: Some(PathBuf::from("/p/provider.so")),
+        builtin: false,
+        table: None,
+        force_offset: None,
+        provider_enrollment: None,
+        resolved_provider: None,
+        duration,
+        settle: Duration::from_millis(500),
+        harvest_timeout: Duration::from_secs(30),
+        grace: Duration::from_secs(5),
+        image_digest: String::new(),
+    };
+    let out = observe(
+        &cfg,
+        &info,
+        SessionSet {
+            discovery,
+            count,
+            target: owned,
+            lifecycle,
+        },
+        &*clock,
+        &mut proc,
+        &|| false,
+    );
+    Some((out, pid))
+}
+
+#[test]
+fn ordinary_production_capture_with_kernel_lifecycle_is_complete() {
+    // F1 qualification: an ORDINARY production capture — the real
+    // `observe` loop, a real owned child, the production
+    // `LiveLifecycle::select` wiring — runs free of polling fallback
+    // and reaches COMPLETE. The child is a plain `sleep` (one exec,
+    // zero forks: no ignored activity to PARTIAL the window); its
+    // real exec witnesses through the ordinary round sweep and
+    // fences (the scripted exe link never flips, so the fence proves
+    // the witness path). Discovery attaches at the BASELINE poll
+    // (pre-release ready — the production-faithful shape), calls fire
+    // in round 1, the child exits mid-window and is reaped before
+    // count close. Timing margins: fires by ~10ms real, exit at
+    // 1000ms, fake-expiry past 120s (≈2.4s real) — no flake.
+    if !require_connector("ordinary_production_capture_with_kernel_lifecycle_is_complete") {
+        return;
+    }
+    let (out, pid) = live_observe_kernel_lifecycle(
+        "ordinary-kernel-lifecycle",
+        &["/bin/sleep", "1"],
+        Duration::from_secs(120),
+        true,
+        vec![(BASE_NS + 600_000_000, 7)],
+    )
+    .expect("connector present (gated above)");
+    let c = out.unwrap();
+    assert!(matches!(c.outcome, Outcome::Complete), "{c:?}");
+    assert!(c.reasons.is_empty(), "{:?}", c.reasons);
+    assert!(matches!(c.document.status, Completeness::Complete));
+    assert_eq!(c.document.total_calls(), 7);
+    assert_eq!(c.child_exit, Some(0));
+    assert!(
+        !c.document.fenced.is_empty(),
+        "real exec witness must fence through the ordinary loop: {c:?}"
+    );
+    assert!(
+        !has_counter(&c, "lifecycle.polling_fallback"),
+        "ordinary window must be free of polling fallback: {c:?}"
+    );
+    assert_eq!(counter_value(&c, "lifecycle.signal_dropped"), 0);
+    assert_eq!(counter_value(&c, "discovery.late_attach_sites"), 0);
+    assert_reaped(pid);
+}
+
+// ---------------------------------------------------------------------------
+// R20-fix round 2, finding 3: the outstanding exec obligation persists
+// past cancellation/deadline returns to the close drain.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn exec_witness_consumed_before_deadline_return_survives_to_close() {
+    // F3 RED: round 1's sweep consumes an Exec witness, then the
+    // slow scan crosses the deadline — the round returns Expired
+    // before applying the fence. The obligation must persist to
+    // the close drain (consumed witness → exec gap), never
+    // evaporate with the local kinds. The owned target is reaped
+    // at expiry (no over-budget by the last-slice carve-out) — the
+    // gap is the ONLY record of the lost transition.
+    let mut h = Harness::fresh("exec-obligation-expired");
+    h.snapshot_attached();
+    let cand1 = cand(
+        "/p/provider.so",
+        backing_of(&h.staged, h.off),
+        1,
+        11,
+        "SHA-256",
+        false,
+        "ok",
+    );
+    h.polls.push_back(DiscoveryDelta {
+        candidates: vec![cand1],
+        tables: vec![terminated(1, 0)],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    h.lifecycle_polls = VecDeque::from([LifecycleDelta {
+        events: vec![LifecycleEvent {
+            kind: LifecycleKind::Exec,
+            pid: PID,
+        }],
+        loss: 0,
+        dropped: 0,
+        pending: 0,
+    }]);
+    // Slow scan: cross the 2s deadline inside round 1's sweep
+    // (production scans take real time).
+    h.lifecycle_advance_ns = 3_000_000_000;
+    h.exit_at_ns = Some(BASE_NS + 3_000_000_000);
+    h.exit_code = 0;
+    let (out, _post) = h.run();
+    let c = out.unwrap();
+    assert_eq!(
+        counter_value(&c, "lifecycle.exec_gap"),
+        1,
+        "consumed exec witness must survive the deadline return: {c:?}"
+    );
+    assert!(
+        matches!(c.outcome, Outcome::Partial),
+        "lost transition must withhold COMPLETE: {c:?}"
+    );
+    assert!(
+        has_reason(&c, "fork-exec-ignored"),
+        "gap rides the exec-continuity reason: {c:?}"
+    );
+    assert_eq!(
+        c.counters.over_budget, 0,
+        "reaped-at-expiry keeps the last-slice carve-out: {c:?}"
+    );
+}
+
+#[test]
+fn exec_witness_consumed_before_signal_cut_survives_to_close() {
+    // F3 RED (cancellation twin): the sweep consumes an Exec
+    // witness, then the async signal lands — the round returns
+    // Continue without fencing; the loop breaks on the cut. The
+    // obligation must still reach the close drain as an exec gap.
+    // (The verdict is already Partial via interrupted — the gap
+    // preserves the LOST TRANSITION, not the verdict.)
+    let mut h = Harness::fresh("exec-obligation-cut");
+    h.snapshot_attached();
+    let cand1 = cand(
+        "/p/provider.so",
+        backing_of(&h.staged, h.off),
+        1,
+        11,
+        "SHA-256",
+        false,
+        "ok",
+    );
+    h.polls.push_back(DiscoveryDelta {
+        candidates: vec![cand1],
+        tables: vec![terminated(1, 0)],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    h.lifecycle_polls = VecDeque::from([LifecycleDelta {
+        events: vec![LifecycleEvent {
+            kind: LifecycleKind::Exec,
+            pid: PID,
+        }],
+        loss: 0,
+        dropped: 0,
+        pending: 0,
+    }]);
+    // Async-signal model: alive through setup(1) + loop-top(2),
+    // cut from the round's mid-sweep check(3) on.
+    let calls = Rc::new(Cell::new(0u32));
+    let seen = calls.clone();
+    h.cancel_hook = Some(Rc::new(move || {
+        let n = seen.get() + 1;
+        seen.set(n);
+        n >= 3
+    }) as Rc<dyn Fn() -> bool>);
+    h.exit_at_ns = Some(BASE_NS + 1_000_000_000);
+    h.exit_code = 0;
+    let (out, _post) = h.run();
+    let c = out.unwrap();
+    assert!(
+        has_reason(&c, "interrupted"),
+        "hook must fire in-window (signal cut): {c:?}"
+    );
+    assert_eq!(
+        counter_value(&c, "lifecycle.exec_gap"),
+        1,
+        "consumed exec witness must survive the signal cut: {c:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// R20-fix round 2, finding 7: release-boundary readiness — a
+// post-release first-attach of a pre-release mapping gaps even
+// inside the settle grace (the settle suppresses only genuinely
+// fresh mappings).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn missing_readiness_during_settle_withholds_complete() {
+    // F7 RED: the boundary call executes without a probe (no
+    // baseline attach — the window is unready at release), THEN
+    // discovery arrives during settle. The [release, attach]
+    // sub-window is uncovered for a site whose mapping predates
+    // release — a readiness gap (late-attach loss), even inside
+    // the settle grace. Post-attach calls still count.
+    let mut h = Harness::fresh("readiness-during-settle");
+    h.snapshot_attached();
+    let cand1 = cand(
+        "/p/provider.so",
+        backing_of(&h.staged, h.off),
+        1,
+        11,
+        "SHA-256",
+        false,
+        "ok",
+    );
+    // Baseline poll: nothing attached (boundary-unready).
+    h.polls.push_back(DiscoveryDelta::default());
+    // Round 1 (~250ms, inside the 500ms settle): discovery arrives.
+    h.polls.push_back(DiscoveryDelta {
+        candidates: vec![cand1],
+        tables: vec![terminated(1, 0)],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    // Boundary call (no probe — missed) + post-attach calls.
+    h.release_fires = vec![(0, 1)];
+    h.plans.insert(
+        2,
+        FirePlan {
+            fires: vec![(BASE_NS + 600_000_000, 7)],
+            shortfall: 0,
+            cancel: false,
+        },
+    );
+    h.exit_at_ns = Some(BASE_NS + 1_000_000_000);
+    h.exit_code = 0;
+    let (out, _post) = h.run();
+    let c = out.unwrap();
+    assert_eq!(
+        counter_value(&c, "discovery.late_attach_sites"),
+        1,
+        "during-settle attach of a pre-release mapping must gap: {c:?}"
+    );
+    assert!(
+        has_reason(&c, "late-attach"),
+        "readiness gap rides the late-attach reason: {c:?}"
+    );
+    assert!(
+        matches!(c.outcome, Outcome::Partial),
+        "unready boundary must withhold COMPLETE: {c:?}"
+    );
+    assert_eq!(
+        c.document.total_calls(),
+        7,
+        "boundary call missed, post-attach calls counted: {c:?}"
+    );
 }
