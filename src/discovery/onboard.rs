@@ -309,12 +309,6 @@ pub fn is_trusted_file(path: &Path) -> bool {
 /// is refused rather than read into memory.
 pub const MAX_OBJECT_SCAN_BYTES: u64 = 512 << 20;
 
-/// Anchor-fingerprint read bound (traversal query-anchor exe):
-/// build-id notes live in the first kilobytes, so the anchor
-/// reads a bounded prefix (truncate, never refuse) rather than
-/// a whole file into memory.
-pub const MAX_ANCHOR_SCAN_BYTES: u64 = 1 << 20;
-
 /// Bounded file read: `Ok(bytes)` when the file fits, `Err` on I/O
 /// or oversize. Reads at most `max + 1` bytes (no metadata-length
 /// dependence, which races with writers anyway).
@@ -345,18 +339,6 @@ pub fn read_bounded(path: &Path, max: u64) -> Result<Vec<u8>, ReadBoundedError> 
     if buf.len() as u64 > max {
         return Err(ReadBoundedError::TooLarge(max));
     }
-    Ok(buf)
-}
-
-/// Read up to `max` bytes (truncate, never refuse): for
-/// fingerprinting reads (build-id notes live early) where a
-/// prefix suffices and a large file must degrade the parse, not
-/// the identity. Memory stays bounded either way.
-pub fn read_prefix(path: &Path, max: u64) -> std::io::Result<Vec<u8>> {
-    use std::io::Read as _;
-    let f = std::fs::File::open(path)?;
-    let mut buf = Vec::new();
-    f.take(max).read_to_end(&mut buf)?;
     Ok(buf)
 }
 
