@@ -96,6 +96,11 @@ pub struct DiscoveryConfig {
     pub provider: PathBuf,
     /// Harvest BPF object.
     pub object: PathBuf,
+    /// Verified harvest byte snapshot (triple runs): when present
+    /// the attach loads these bytes instead of re-reading the
+    /// path (no reread drift between identity and loading). The
+    /// path stays for identity/diags regardless.
+    pub object_bytes: Option<Vec<u8>>,
     /// Builtin mode: the in-libcrypto default provider.
     pub builtin: bool,
     /// Legacy tripwires (ENGINE/meth/load/low-level + legacy query).
@@ -4071,7 +4076,19 @@ impl DiscoverySession {
         let canon = std::fs::canonicalize(&cfg.provider)
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let obj_bytes = std::fs::read(&cfg.object)?;
+        // Triple runs load the retained harvest snapshot (no
+        // re-read — identity and loading share these bytes);
+        // otherwise a bounded path read (never unbounded).
+        let obj_bytes = match &cfg.object_bytes {
+            Some(snapshot) => snapshot.clone(),
+            None => crate::discovery::onboard::read_bounded(
+                &cfg.object,
+                crate::discovery::onboard::MAX_OBJECT_SCAN_BYTES,
+            )
+            .map_err(|e| {
+                anyhow::anyhow!("harvest object {}: {e}", cfg.object.display())
+            })?,
+        };
         if pin.verify().is_err() {
             let mut core = SessionCore::new(cfg.provider.clone(), canon, cfg.legacy, pid);
             core.mark_recycled();

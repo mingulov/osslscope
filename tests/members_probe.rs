@@ -43,7 +43,7 @@
 //! end-state + RET/guard-awareness are D's new facts.)
 
 use osslscope::loader::Loaded;
-use osslscope::scan::backend::{BackendAction, ScanBackend};
+use osslscope::scan::backend::{BackendAction, ScanBackend, drain_trunc_flags};
 use osslscope::scan::oracle::{Outcome, PartialReason, TrueT};
 use osslscope::scan::registry::BirthState;
 use std::collections::HashSet;
@@ -528,6 +528,20 @@ fn read_scan_cell(loaded: &Loaded, tid: u32) -> Option<osslscope_ebpf_common::Sc
         Err(e) if e.raw_os_error() == Some(libc::ENOENT) => None,
         Err(e) => panic!("lookup SCAN[{tid}]: {e}"),
     }
+}
+
+/// TRUNC_SEQ total (PerCpuArray[1] summed across CPUs — the
+/// TRUNC flag-event generation for the drain-race guard).
+fn read_trunc_seq(loaded: &Loaded) -> u64 {
+    use aya::maps::{Map, MapData, PerCpuArray};
+    let fd = loaded.maps["TRUNC_SEQ"].try_clone().expect("clone TRUNC_SEQ");
+    let data = MapData::from_fd(fd).expect("mapdata");
+    let map = Map::from_map_data(data).expect("map");
+    let m = PerCpuArray::<_, u64>::try_from(map).expect("percpu-array shape");
+    m.get(&0, 0)
+        .expect("TRUNC_SEQ[0]")
+        .iter()
+        .fold(0u64, |a, &b| a.wrapping_add(b))
 }
 
 /// ATTEMPT total (PerCpuArray[1] summed across CPUs).
@@ -5384,6 +5398,318 @@ fn backend_chunk(obj: &std::path::Path, exe: &std::ffi::CString, off: u64) -> Sc
             .expect("backend attach");
     backend.register(&[self_tid()]).expect("register self");
     backend
+}
+
+/// Per-CPU width of a percpu map (slot count of any row — the
+/// TRUNC_SEQ cell always exists, so it reports the width).
+fn percpu_width(loaded: &Loaded, name: &str) -> usize {
+    use aya::maps::{Map, MapData, PerCpuArray};
+    let fd = loaded.maps[name].try_clone().expect("clone width map");
+    let data = MapData::from_fd(fd).expect("mapdata");
+    let map = Map::from_map_data(data).expect("map");
+    let m = PerCpuArray::<_, u64>::try_from(map).expect("percpu-array shape");
+    m.get(&0, 0).expect("cell 0").len()
+}
+
+/// Stage one TRUNC sticky bit (harness-side exactly what a member
+/// flag would leave: the bit on CPU 0, zeros elsewhere).
+fn stage_trunc(loaded: &Loaded, op: u32, bit: u64) {
+    use aya::maps::{Map, MapData, PerCpuHashMap, PerCpuValues};
+    let ncpu = percpu_width(loaded, "TRUNC_SEQ");
+    let fd = loaded.maps["TRUNC"].try_clone().expect("clone TRUNC");
+    let data = MapData::from_fd(fd).expect("mapdata");
+    let map = Map::from_map_data(data).expect("map");
+    let mut m = PerCpuHashMap::<_, u32, u64>::try_from(map).expect("percpu shape");
+    let mut slots = vec![0u64; ncpu];
+    slots[0] = bit;
+    let vals = PerCpuValues::try_from(slots).expect("widths");
+    m.insert(op, vals, 0).expect("stage TRUNC");
+}
+
+/// Bump the TRUNC_SEQ generation exactly like a flag event would
+/// (CPU-0 slot — the drain sums across CPUs).
+fn bump_trunc_seq(loaded: &Loaded, by: u64) {
+    use aya::maps::{Map, MapData, PerCpuArray, PerCpuValues};
+    let fd = loaded.maps["TRUNC_SEQ"].try_clone().expect("clone TRUNC_SEQ");
+    let data = MapData::from_fd(fd).expect("mapdata");
+    let map = Map::from_map_data(data).expect("map");
+    let mut m = PerCpuArray::<_, u64>::try_from(map).expect("percpu-array shape");
+    let mut slots: Vec<u64> = m.get(&0, 0).expect("TRUNC_SEQ[0]").to_vec();
+    slots[0] = slots[0].wrapping_add(by);
+    let vals = PerCpuValues::try_from(slots).expect("widths");
+    m.set(0, vals, 0).expect("bump TRUNC_SEQ");
+}
+
+/// Round-2 F3: the seq-guarded TRUNC drain against the live maps —
+/// quiet drains report the exact bits with `raced == false` and a
+/// cleared map (no false races on pre-existing flags), while a
+/// flag injected INSIDE the race window (the deterministic hook —
+/// no timing dependence) reports `raced == true` WITH the bit
+/// still attributed (the re-read catches it; the race flag covers
+/// the true-erasure case the hook cannot stage, by the same
+/// generation comparison the quiet control pins exact).
+#[test]
+#[ignore]
+fn r19_trunc_drain_race() {
+    use osslscope_ebpf_common as wire;
+    let Some(obj) = gated() else {
+        eprintln!("SKIP(members-live): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
+        return;
+    };
+    let exe = own_exe_cstr();
+    let off = query_off();
+    let backend = backend_chunk(&obj, &exe, off);
+    let loaded = backend.loaded();
+    // Quiet drain: a pre-existing flag attributes exactly, no
+    // race, map cleared after.
+    stage_trunc(loaded, OP, wire::TRUNC_WALK_READ);
+    let (delta, raced) = drain_trunc_flags(&loaded.maps, None).expect("quiet drain");
+    assert!(!raced, "quiet drain must not report a race");
+    assert_eq!(delta.get(&OP), Some(&wire::TRUNC_WALK_READ));
+    assert_eq!(
+        read_percpu(loaded, "TRUNC", OP, true),
+        0,
+        "quiet drain clears the map"
+    );
+    // Injected race: the hook stages a flag + its generation
+    // bump inside the clear window.
+    let hook = || {
+        stage_trunc(loaded, OP + 1, wire::TRUNC_ALGS);
+        bump_trunc_seq(loaded, 1);
+    };
+    let (delta, raced) = drain_trunc_flags(&loaded.maps, Some(&hook)).expect("raced drain");
+    assert!(raced, "in-window flag must report raced");
+    assert_eq!(
+        delta.get(&(OP + 1)),
+        Some(&wire::TRUNC_ALGS),
+        "the re-read still attributes the concurrent flag"
+    );
+    assert_eq!(
+        read_percpu(loaded, "TRUNC", OP + 1, true),
+        0,
+        "raced drain clears the map"
+    );
+}
+
+/// Round-2 F6: `finish()` quiesces the producer FIRST — post-window
+/// queries skip honestly (SKIP_ALL) instead of starting new scans
+/// after counting closed, while the in-flight scan still settles
+/// and closes through the backstop.
+#[test]
+#[ignore]
+fn r19_finish_quiesces_producer() {
+    let Some(obj) = gated() else {
+        eprintln!("SKIP(members-live): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
+        return;
+    };
+    let exe = own_exe_cstr();
+    let off = query_off();
+    let mut backend = backend_chunk(&obj, &exe, off);
+    backend.register(&[self_tid()]).expect("register self");
+    let slots = vec![
+        SlotSpec::live("FQP0", 100, vec![(300, 0x4400)]),
+        SlotSpec::live("FQP1", 101, vec![(301, 0x4401)]),
+    ];
+    let fx = Fixture::build_padded(&slots, &[], 513);
+    fx.pretouch();
+    populate_alg_class(backend.loaded(), &fx.classes);
+    FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
+    NS_VERDICT.store(0, Ordering::SeqCst);
+    fire(OP as i32, 1);
+    let calls_before = read_percpu(backend.loaded(), "CALLS", OP, false);
+    assert_eq!(calls_before, 1, "the window query admitted");
+    let tail = backend.finish().expect("finish settles");
+    let ctrl = osslscope::loader::read_ctrl(&backend.loaded().maps).expect("read CTRL");
+    assert_eq!(ctrl.skip_all, 1, "finish leaves the gate engaged");
+    assert_eq!(tail.done.len(), 1, "the window scan closes in the tail");
+    assert!(
+        matches!(tail.done[0].outcome, Outcome::Complete { .. }),
+        "in-flight scan settles clean: {:?}",
+        tail.done[0].outcome
+    );
+    // A post-window query skips honestly (never admitted, never
+    // walked) instead of starting a scan after counting closed.
+    pace_fire_gap();
+    fire(OP as i32, 1);
+    let post = backend.poll().expect("post-finish poll drains the skip");
+    assert_eq!(
+        read_percpu(backend.loaded(), "CALLS", OP, false),
+        1,
+        "post-window query never admitted"
+    );
+    assert_eq!(post.done.len(), 1, "the skip closes immediately");
+    assert!(
+        matches!(post.done[0].outcome, Outcome::Skipped { .. }),
+        "post-window query skips: {:?}",
+        post.done[0].outcome
+    );
+    assert!(
+        post.done[0].algs.is_empty(),
+        "a skipped query walks nothing"
+    );
+}
+
+/// Round-2 F3: the TRUNC_SEQ drain-race guard counts flag EVENTS
+/// (one bump per flag_trunc — sticky TRUNC bits OR them away).
+/// Two NOIMP slots on a padded table flag exactly twice (same bit,
+/// two events): TRUNC_SEQ == 2 while TRUNC holds the single NOIMP
+/// bit. The backend's seq-guarded drain samples this around its
+/// clear window — an advance across the window degrades the drain
+/// explicitly instead of losing a concurrent flag silently.
+#[test]
+#[ignore]
+fn d_trunc_seq_guard() {
+    use osslscope_ebpf_common as wire;
+    let Some(obj) = gated() else {
+        eprintln!("SKIP(members-live): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
+        return;
+    };
+    let exe = own_exe_cstr();
+    let off = query_off();
+    let attached = attach_chunk(&obj, &exe, off);
+    let loaded = &attached.loaded;
+    let tid = self_tid();
+    let slots = vec![
+        SlotSpec::live("TSG0", 100, vec![(300, 0x4400)]),
+        SlotSpec::live("TSG1", 101, vec![(301, 0x4401)]),
+        SlotSpec::noimp("TSG2", 102),
+        SlotSpec::noimp("TSG3", 103),
+    ];
+    let fx = Fixture::build_padded(&slots, &[], 513);
+    fx.pretouch();
+    populate_alg_class(loaded, &fx.classes);
+    FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
+    NS_VERDICT.store(0, Ordering::SeqCst);
+    fire(OP as i32, 1);
+    let d = drain(loaded);
+    assert_calls_admitted(&d.calls, 1, "trunc-seq");
+    assert_eq!(d.rets.len(), 1, "trunc-seq: RET joined");
+    ret_for(&d.rets, d.calls[0].tid, d.calls[0].seq);
+    assert!(d.guards.is_empty(), "trunc-seq: slot 511 EMPTY → no guard");
+    // Cold: every member walks — 2 OK + 2 NOIMP + 508 EMPTY.
+    assert_eq!(d.algs.len(), 512, "trunc-seq: every slot read once");
+    assert_eq!(
+        d.algs.iter().filter(|a| a.status == wire::ALG_NOIMP).count(),
+        2,
+        "trunc-seq: both NOIMP slots explicit"
+    );
+    assert_eq!(d.rows.len(), 2, "trunc-seq: live slots dispatch rows only");
+    assert_eq!(
+        read_percpu(loaded, "TRUNC", OP, true),
+        wire::TRUNC_WALK_NOIMP,
+        "trunc-seq: sticky bit holds NOIMP alone"
+    );
+    assert_eq!(
+        read_trunc_seq(loaded),
+        2,
+        "trunc-seq: one generation bump per flag event"
+    );
+    assert_retired(loaded, tid, "trunc-seq");
+    assert_loss_zero(loaded);
+}
+
+/// Round-2 F5: the T+1 member never skips silently (warm T=3 +
+/// zero verdict). Cell 1 — growth by one (table T=4): member 4
+/// reads zero and emits the boundary ALG_EMPTY (the fresh
+/// terminator proof the oracle stales the cache from); members 5+
+/// stay silent. Cell 2 — growth by N (slots 4,5 live, terminator
+/// at 6): member 4 cold-walks the live slot (growth evidence —
+/// an OK record, never EMPTY), members 5+ stay silent (the
+/// silent terminator at 6 is covered by member 4's walked
+/// evidence — the oracle stales from walked-beyond).
+#[test]
+#[ignore]
+fn d_warm_boundary_proof() {
+    use osslscope_ebpf_common as wire;
+    let Some(obj) = gated() else {
+        eprintln!("SKIP(members-live): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
+        return;
+    };
+    let exe = own_exe_cstr();
+    let off = query_off();
+    let attached = attach_chunk(&obj, &exe, off);
+    let loaded = &attached.loaded;
+    let tid = self_tid();
+    // Cell 1: slots 0..=3 live, terminator at 4 (cached T=3).
+    let slots1: Vec<SlotSpec> = (0..4u32)
+        .map(|j| {
+            SlotSpec::live(
+                &format!("WBP{j}"),
+                100 + j as u16,
+                vec![(300 + j, 0x4400 + j as u64)],
+            )
+        })
+        .collect();
+    let fx1 = Fixture::build_padded(&slots1, &[], 513);
+    fx1.pretouch();
+    populate_alg_class(loaded, &fx1.classes);
+    FIXTURE_ARRAY.store(fx1.array, Ordering::SeqCst);
+    NS_VERDICT.store(0, Ordering::SeqCst);
+    write_tcache(loaded, fx1.array, 3, 0);
+    fire(OP as i32, 1);
+    let d1 = drain(loaded);
+    assert_calls_admitted(&d1.calls, 1, "warm-boundary-1");
+    assert_eq!(d1.rets.len(), 1, "warm-boundary-1: RET joined");
+    ret_for(&d1.rets, d1.calls[0].tid, d1.calls[0].seq);
+    for j in 0..4u64 {
+        let got: Vec<_> = d1.algs.iter().filter(|a| a.idx == j).collect();
+        assert_eq!(got.len(), 1, "warm-boundary-1: slot {j} walked");
+        assert_eq!(got[0].status, wire::ALG_OK);
+    }
+    let b1: Vec<_> = d1.algs.iter().filter(|a| a.idx == 4).collect();
+    assert_eq!(b1.len(), 1, "warm-boundary-1: T+1 proves termination");
+    assert_eq!(b1[0].status, wire::ALG_EMPTY);
+    assert!(
+        d1.algs.iter().all(|a| a.idx <= 4) && d1.rows.iter().all(|r| r.idx <= 3),
+        "warm-boundary-1: members 5+ silent"
+    );
+    assert_eq!(
+        read_percpu(loaded, "TRUNC", OP, true),
+        0,
+        "warm-boundary-1: TRUNC clean"
+    );
+    // Cell 2: slots 0..=5 live, terminator at 6 (cached T=3).
+    let slots2: Vec<SlotSpec> = (0..6u32)
+        .map(|j| {
+            SlotSpec::live(
+                &format!("WBQ{j}"),
+                200 + j as u16,
+                vec![(400 + j, 0x5500 + j as u64)],
+            )
+        })
+        .collect();
+    let fx2 = Fixture::build_padded(&slots2, &[], 513);
+    fx2.pretouch();
+    populate_alg_class(loaded, &fx2.classes);
+    pace_fire_gap();
+    clear_trunc(loaded, "warm-boundary-2");
+    FIXTURE_ARRAY.store(fx2.array, Ordering::SeqCst);
+    write_tcache(loaded, fx2.array, 3, 0);
+    fire(OP as i32, 1);
+    let d2 = drain(loaded);
+    assert_calls_admitted(&d2.calls, 1, "warm-boundary-2");
+    assert_eq!(d2.rets.len(), 1, "warm-boundary-2: RET joined");
+    ret_for(&d2.rets, d2.calls[0].tid, d2.calls[0].seq);
+    let w4: Vec<_> = d2.algs.iter().filter(|a| a.idx == 4).collect();
+    assert_eq!(w4.len(), 1, "warm-boundary-2: T+1 cold-walks live slot");
+    assert_eq!(w4[0].status, wire::ALG_OK);
+    assert_eq!(
+        d2.rows.iter().filter(|r| r.idx == 4).count(),
+        1,
+        "warm-boundary-2: walked slot dispatches its row"
+    );
+    assert!(
+        d2.algs.iter().all(|a| a.idx <= 4) && d2.rows.iter().all(|r| r.idx <= 4),
+        "warm-boundary-2: members 5+ silent (terminator at 6 covered)"
+    );
+    assert_eq!(
+        read_percpu(loaded, "TRUNC", OP, true),
+        0,
+        "warm-boundary-2: TRUNC clean"
+    );
+    assert_retired(loaded, tid, "warm-boundary");
+    assert_loss_zero(loaded);
+    assert_eq!(read_percpu(loaded, "CALLS", OP, false), 2);
 }
 
 /// R19: one query with later slots through the production backend

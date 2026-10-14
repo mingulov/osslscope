@@ -1387,15 +1387,14 @@ fn objects_checks_in(
         Ok(p)
     };
     match (harvest, count, members) {
-        // Fully automatic: ONE matched-set resolution — the pair
-        // rows and the members row come from the same set (never
-        // split prefixes, never a quiet pass while traversal
-        // rejects the same set). No complete triple + no members
-        // file anywhere ⟹ the old-pair install (pair rows as
-        // usual, members INFO). Any other failure refuses all
-        // three (the same refusal a run reports).
-        (None, None, None) => match onboard::resolve_set(None, None, None, dirs, trust) {
-            Ok((set, _)) => vec![
+        // Fully automatic: the ONE shared run-set decision (F9) —
+        // doctor renders exactly what capture runs (Triple rows,
+        // PairOnly rows + members INFO, or fail-all-three).
+        // Missing/mixed/stale sets behave identically in both by
+        // construction; an empty install fails all three (no pair
+        // exists to call compatible).
+        (None, None, None) => match onboard::resolve_run_set(None, None, None, dirs, trust) {
+            Ok((onboard::RunSet::Triple(set), _)) => vec![
                 Check::pass(
                     "objects-harvest",
                     format!(
@@ -1418,35 +1417,38 @@ fn objects_checks_in(
                     ),
                 ),
             ],
-            Err(e) if e.is_not_found() && !onboard::role_file_in_trusted(Members, dirs, trust) => {
-                let mut rows = match onboard::resolve_implicit_pair(dirs, trust, &mut search) {
-                    Ok(pair) => vec![
-                        Check::pass(
-                            "objects-harvest",
-                            format!(
-                                "harvest object: {} (installed, compatible)",
-                                pair.harvest.display()
-                            ),
-                        ),
-                        Check::pass(
-                            "objects-count",
-                            format!(
-                                "count object: {} (installed, compatible)",
-                                pair.count.display()
-                            ),
-                        ),
-                    ],
-                    Err(e) => vec![
-                        Check::fail("objects-harvest", e.message.clone(), e.remediation.clone()),
-                        Check::fail("objects-count", e.message, e.remediation),
-                    ],
-                };
-                rows.push(Check::info(
+            Ok((onboard::RunSet::PairOnly(pair), _)) => vec![
+                Check::pass(
+                    "objects-harvest",
+                    format!(
+                        "harvest object: {} (installed, compatible)",
+                        pair.harvest.display()
+                    ),
+                ),
+                Check::pass(
+                    "objects-count",
+                    format!(
+                        "count object: {} (installed, compatible)",
+                        pair.count.display()
+                    ),
+                ),
+                Check::info(
                     "objects-members",
                     "members object: not installed (traversal unavailable — old harvest/count pair compatible)".to_string(),
-                ));
-                rows
-            }
+                ),
+            ],
+            Ok((onboard::RunSet::NoObjects(pair_e), _)) => vec![
+                Check::fail(
+                    "objects-harvest",
+                    pair_e.message.clone(),
+                    pair_e.remediation.clone(),
+                ),
+                Check::fail("objects-count", pair_e.message, pair_e.remediation),
+                Check::info(
+                    "objects-members",
+                    "members object: not installed (traversal unavailable — old harvest/count pair compatible)".to_string(),
+                ),
+            ],
             Err(e) => vec![
                 Check::fail("objects-harvest", e.message.clone(), e.remediation.clone()),
                 Check::fail("objects-count", e.message.clone(), e.remediation.clone()),
