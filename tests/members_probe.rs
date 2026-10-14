@@ -534,7 +534,9 @@ fn read_scan_cell(loaded: &Loaded, tid: u32) -> Option<osslscope_ebpf_common::Sc
 /// TRUNC flag-event generation for the drain-race guard).
 fn read_trunc_seq(loaded: &Loaded) -> u64 {
     use aya::maps::{Map, MapData, PerCpuArray};
-    let fd = loaded.maps["TRUNC_SEQ"].try_clone().expect("clone TRUNC_SEQ");
+    let fd = loaded.maps["TRUNC_SEQ"]
+        .try_clone()
+        .expect("clone TRUNC_SEQ");
     let data = MapData::from_fd(fd).expect("mapdata");
     let map = Map::from_map_data(data).expect("map");
     let m = PerCpuArray::<_, u64>::try_from(map).expect("percpu-array shape");
@@ -825,6 +827,22 @@ fn fire_on_worker(loaded: &Loaded, op: i32, n: usize) -> u32 {
             let tid = self_tid();
             write_cell(loaded, "BIRTH", &tid.to_le_bytes(), &0u16.to_le_bytes());
             fire(op, n);
+            tid
+        });
+        h.join().expect("worker join")
+    })
+}
+
+/// Nested-target worker fire (nested legs attach the nested symbol
+/// only — an ordinary `fire` hits no probe and primes nothing).
+fn fire_nested_on_worker(loaded: &Loaded, op: i32, depth: i32, n: usize) -> u32 {
+    std::thread::scope(|s| {
+        let h = s.spawn(|| {
+            let tid = self_tid();
+            write_cell(loaded, "BIRTH", &tid.to_le_bytes(), &0u16.to_le_bytes());
+            for _ in 0..n {
+                fire_nested(op, depth);
+            }
             tid
         });
         h.join().expect("worker join")
@@ -1293,7 +1311,7 @@ fn e7_slots() -> Vec<SlotSpec> {
 /// L2: exact E=7 scan (warm) + swap-cold fail-closed + null-query
 /// silence. Warm: every ALG/ROW byte-asserted on the live prefix;
 /// the array is zero-padded to the full chunk so TRUNC==0 and
-/// beyond-T silence are real asserts (v1 has no T-gate — unpadded
+/// beyond-T EMPTY are real asserts (v1 has no T-gate — unpadded
 /// past-T memory yields flag soup). Cold: evicted pages are
 /// unreadable via nofault (kernel contract), so the leg asserts
 /// the fail-closed shape (WALK_READ alone, silent ring, counted);
@@ -1364,7 +1382,19 @@ fn run_e7(obj: &std::path::Path, exe: &std::ffi::CString, off: u64, cold: bool) 
         "e7-{temp}: no TRUNC on the clean walk"
     );
     assert_loss_zero(loaded);
-    assert_eq!(algs.len(), 7 * QUERIES, "e7-{temp}: 7 slots × N ALG");
+    // Explicit EMPTY emits: every scan walks all 512 (7 OK + 505
+    // EMPTY per query).
+    assert_eq!(algs.len(), 512 * QUERIES, "e7-{temp}: 512 × N ALG");
+    assert_eq!(
+        algs.iter().filter(|a| a.status == wire::ALG_OK).count(),
+        7 * QUERIES,
+        "e7-{temp}: 7 slots × N OK"
+    );
+    assert_eq!(
+        algs.iter().filter(|a| a.status == wire::ALG_EMPTY).count(),
+        505 * QUERIES,
+        "e7-{temp}: 505 × N EMPTY"
+    );
     for j in 0..7u64 {
         let got: Vec<_> = algs.iter().filter(|a| a.idx == j).collect();
         assert_eq!(got.len(), QUERIES, "e7-{temp}: slot {j} ALG count");
@@ -1400,12 +1430,15 @@ fn run_e7(obj: &std::path::Path, exe: &std::ffi::CString, off: u64, cold: bool) 
             assert_eq!(n, QUERIES, "e7-{temp}: slot {j} leg {k} exact");
         }
     }
-    // Zero tail ⇒ beyond-T silence is a REAL assert here (a
-    // member emitting for a zero slot is a bug); the nonzero-tail
-    // reach is pinned separately by L3-tail.
+    // Zero tail ⇒ beyond-T EMPTY is a REAL assert here (with
+    // explicit emits, a zero slot MUST emit EMPTY — silence would
+    // be a hole); the nonzero-tail reach is pinned separately by
+    // L3-tail.
     assert!(
-        algs.iter().all(|a| a.idx < 7) && rows.iter().all(|r| r.idx < 7),
-        "e7-{temp}: zero tail stays silent"
+        algs.iter()
+            .all(|a| a.idx < 7 || a.status == wire::ALG_EMPTY)
+            && rows.iter().all(|r| r.idx < 7),
+        "e7-{temp}: zero tail emits EMPTY only"
     );
 }
 
@@ -1539,9 +1572,10 @@ fn l3_boundaries() {
     };
     let exe = own_exe_cstr();
     let off = query_off();
-    // Empty: slot 0 silent (names==0 → return), EMPTY flagged.
+    // Empty: slot 0 emits explicit ALG_EMPTY (×2), EMPTY flagged
+    // (member 0 only — other EMPTY slots emit without the flag).
     {
-        let fx = Fixture::build(&[], &[]);
+        let fx = Fixture::build_padded(&[], &[], 513);
         fx.pretouch();
         let attached = attach_chunk(&obj, &exe, off);
         let loaded = &attached.loaded;
@@ -1559,24 +1593,26 @@ fn l3_boundaries() {
         assert_calls_admitted(&calls, 2, "l3-empty");
         assert_rets_live(loaded, &calls, &rets, &guards, "l3-empty");
         assert_eq!(read_percpu(loaded, "CALLS", OP, false), 2);
-        assert_ne!(
-            read_percpu(loaded, "TRUNC", OP, true) & wire::TRUNC_WALK_EMPTY,
-            0,
-            "empty slot 0 flagged"
+        assert_eq!(
+            read_percpu(loaded, "TRUNC", OP, true),
+            wire::TRUNC_WALK_EMPTY,
+            "empty slot 0 flagged alone"
         );
-        assert!(algs.iter().all(|a| a.idx != 0), "slot 0 silent");
-        assert!(rows.iter().all(|r| r.idx != 0), "slot 0 rowless");
-        eprintln!(
-            "l3-empty: {} ALG + {} ROW beyond slot 0 (recorded, v1 gap)",
-            algs.len(),
-            rows.len()
+        assert_eq!(algs.len(), 1024, "512 EMPTY × 2");
+        assert!(
+            algs.iter().all(|a| a.status == wire::ALG_EMPTY),
+            "every slot EMPTY"
         );
+        let s0: Vec<_> = algs.iter().filter(|a| a.idx == 0).collect();
+        assert_eq!(s0.len(), 2, "slot-0 EMPTY × 2");
+        assert!(rows.is_empty(), "EMPTY dispatches nothing");
         assert_loss_zero(loaded);
     }
     // One: slot 0 exact, EMPTY bit clear.
     {
         let slots = vec![SlotSpec::live("M3A", 100, vec![(31, 0x4300), (32, 0x4301)])];
-        let fx = Fixture::build(&slots, &[]);
+        // Padded: slot-0 asserts stay exact, past-T deterministic.
+        let fx = Fixture::build_padded(&slots, &[], 513);
         fx.pretouch();
         let attached = attach_chunk(&obj, &exe, off);
         let loaded = &attached.loaded;
@@ -1649,7 +1685,9 @@ fn l3_boundaries() {
             .collect();
         let tail_classes: Vec<(String, u16)> =
             tail.iter().map(|s| (s.name.clone(), s.class)).collect();
-        let fx = Fixture::build(&slots, &tail);
+        // Padded: prefix/tail presence asserts stay exact, past-tail
+        // deterministic (no heap soup past the planted tail).
+        let fx = Fixture::build_padded(&slots, &tail, 513);
         fx.pretouch();
         let attached = attach_chunk(&obj, &exe, off);
         let loaded = &attached.loaded;
@@ -1732,13 +1770,15 @@ fn l3_boundaries() {
         }
         assert_loss_zero(loaded);
     }
-    // Munmap hole: array page 0 (slots 0..127, incl. the live
-    // prefix) unmapped ⇒ every slot read in the hole aborts:
-    // TRUNC_WALK_READ exactly, zero emissions, queries counted.
-    // Same member-side path as swap-cold, but deterministic on
-    // every lane (no swap needed). ORDERING: no mmap/malloc may run
-    // between the munmap and the end of fire (an allocator mmap
-    // could reuse the hole); attach/load/allocations all precede it.
+    // Munmap hole: the whole array region (all 512 slots) unmapped
+    // ⇒ every slot read aborts: TRUNC_WALK_READ exactly, zero
+    // emissions, queries counted. A single-page hole no longer
+    // silences the drain (mapped zero slots emit explicit EMPTY),
+    // so the hole covers the full array. Same member-side path as
+    // swap-cold, but deterministic on every lane (no swap needed).
+    // ORDERING: no mmap/malloc may run between the munmap and the
+    // end of fire (an allocator mmap could reuse the hole);
+    // attach/load/allocations all precede it.
     {
         let slots = vec![
             SlotSpec::live("M3H0", 100, vec![(41, 0x4600)]),
@@ -1754,10 +1794,11 @@ fn l3_boundaries() {
         // Hoisted: no allocation may run between the munmap and the
         // end of fire (see the ordering note above).
         let mut probe = vec![0u8; 1];
+        assert_eq!(512 * 32 % page, 0, "array region is page-multiple");
         assert_eq!(
-            unsafe { libc::munmap(fx.array as *mut libc::c_void, page) },
+            unsafe { libc::munmap(fx.array as *mut libc::c_void, 512 * 32) },
             0,
-            "munmap hole page"
+            "munmap hole pages"
         );
         // Prove the hole (mincore on unmapped memory fails ENOMEM).
         let mc = unsafe { libc::mincore(fx.array as *mut libc::c_void, page, probe.as_mut_ptr()) };
@@ -2477,10 +2518,13 @@ fn c_skip_causes() {
             osslscope::loader::program_ctrl(&loaded.maps, &ctrl).expect("SKIP_ALL on");
         },
         |loaded, tid| {
+            // D: the control retired (IDLE|0), the skip re-IDLEs,
+            // then the skipped return's 512 members bump-if-present
+            // (SCAN-miss — silence, but the RCOUNT cell exists).
             assert_eq!(
                 wire::split_rcount(read_u64_cell(loaded, "RCOUNT", tid).expect("RCOUNT kept")),
-                (0, wire::RCOUNT_STATE_IDLE),
-                "skip-all: RCOUNT IDLE|0"
+                (512, wire::RCOUNT_STATE_IDLE),
+                "skip-all: RCOUNT IDLE|512 in D"
             );
             assert_eq!(
                 wire::split_seq(read_u64_cell(loaded, "SEQ", tid).expect("SEQ kept")),
@@ -2507,10 +2551,11 @@ fn c_skip_causes() {
             );
         },
         |loaded, tid| {
+            // D: skipped return's members bump-if-present (IDLE|512).
             assert_eq!(
                 wire::split_rcount(read_u64_cell(loaded, "RCOUNT", tid).expect("RCOUNT kept")),
-                (0, wire::RCOUNT_STATE_IDLE),
-                "freeze: RCOUNT IDLE|0"
+                (512, wire::RCOUNT_STATE_IDLE),
+                "freeze: RCOUNT IDLE|512 in D"
             );
             assert_eq!(
                 wire::split_seq(read_u64_cell(loaded, "SEQ", tid).expect("SEQ kept")),
@@ -2519,17 +2564,58 @@ fn c_skip_causes() {
             );
         },
     );
-    // SEQ-full (cause 2): 4k-fill EXCLUDING the test tid (else the
-    // present-key update succeeds and no cause-2 fires).
-    skip_case(
-        &obj,
-        &exe,
-        off,
-        "seq-full",
-        wire::SKIP_SEQ_FULL,
-        wire::LOSS_SEQ_FULL,
-        |loaded| {
-            for i in 0..4096u32 {
+    // SEQ-full (cause 2): the SEQ gate's BPF_NOEXIST insert fails
+    // only for a KEYLESS tid (a present key updates in place even
+    // when full — so the same-tid control + fill can never fire
+    // cause-2 for the test tid). Standalone block: same-attach
+    // main-tid admit-control, then a REGISTERED worker tid (BIRTH
+    // row, no SEQ key) fires against the full map (control key +
+    // 4095 fill = 4096 = capacity).
+    {
+        let attached = attach_chunk(&obj, &exe, off);
+        let loaded = &attached.loaded;
+        let tid = self_tid();
+        FIXTURE_ARRAY.store(0, Ordering::SeqCst);
+        NS_VERDICT.store(0, Ordering::SeqCst);
+        fire(OP as i32, 1);
+        let d = drain(loaded);
+        assert_eq!(d.calls.len(), 1, "seq-full: control CALL");
+        assert_eq!(
+            call_parts(&d.calls[0]),
+            (false, wire::SKIP_ADMITTED),
+            "seq-full: control admits"
+        );
+        assert_eq!(d.rets.len(), 1, "seq-full: control RET");
+        assert_retired(loaded, tid, "seq-full: control");
+        // Register the worker tid BEFORE filling (BIRTH row without
+        // a SEQ key — the keyless precondition for cause-2). The
+        // worker publishes its real tid (no peek-then-respawn —
+        // Linux hands a fresh tid per spawn) and waits for
+        // registration + fill before firing.
+        let barrier = std::sync::Barrier::new(2);
+        let wtid_cell = std::sync::atomic::AtomicU32::new(0);
+        let base_cell = std::sync::atomic::AtomicU64::new(0);
+        let base_calls = std::sync::atomic::AtomicU64::new(0);
+        let base_loss = std::sync::atomic::AtomicU64::new(0);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                wtid_cell.store(self_tid(), Ordering::SeqCst);
+                barrier.wait();
+                barrier.wait();
+                fire(OP as i32, 1);
+            });
+            barrier.wait();
+            let wtid = wtid_cell.load(Ordering::SeqCst);
+            assert_ne!(wtid, tid, "seq-full: worker tid is fresh");
+            assert!(
+                tid < 0x4000_0000 && wtid < 0x4000_0000,
+                "seq-full: fill keys exclude both tids"
+            );
+            {
+                let mut state = BirthState::new();
+                register(loaded, &mut state, &[wtid]);
+            }
+            for i in 0..4095u32 {
                 let k = 0x4000_0000u32.wrapping_add(i);
                 write_cell(
                     loaded,
@@ -2538,20 +2624,67 @@ fn c_skip_causes() {
                     &wire::make_seq(0, 0).to_le_bytes(),
                 );
             }
-        },
-        |loaded, tid| {
-            assert_eq!(
-                wire::split_rcount(read_u64_cell(loaded, "RCOUNT", tid).expect("RCOUNT kept")),
-                (0, wire::RCOUNT_STATE_IDLE),
-                "seq-full: RCOUNT IDLE|0"
+            base_cell.store(read_attempt(loaded), Ordering::SeqCst);
+            base_calls.store(read_percpu(loaded, "CALLS", OP, false), Ordering::SeqCst);
+            base_loss.store(
+                read_percpu(loaded, "LOSS", wire::LOSS_SEQ_FULL, false),
+                Ordering::SeqCst,
             );
-            assert_eq!(
-                wire::split_seq(read_u64_cell(loaded, "SEQ", tid).expect("SEQ kept")),
-                (0, 0),
-                "seq-full: no mint on insert-fail"
-            );
-        },
-    );
+            barrier.wait();
+        });
+        let wtid = wtid_cell.load(Ordering::SeqCst);
+        let (attempt0, calls0, loss0) = (
+            base_cell.load(Ordering::SeqCst),
+            base_calls.load(Ordering::SeqCst),
+            base_loss.load(Ordering::SeqCst),
+        );
+        let d = drain(loaded);
+        assert_eq!(d.calls.len(), 1, "seq-full: skip CALL");
+        assert_eq!(d.calls[0].tid, wtid, "seq-full: skip CALL tid");
+        assert_eq!(
+            call_parts(&d.calls[0]),
+            (false, wire::SKIP_SEQ_FULL),
+            "seq-full: skip cause"
+        );
+        assert_eq!(d.calls[0].seq, 0, "seq-full: skips carry seq 0");
+        assert_eq!(
+            read_attempt(loaded) - attempt0,
+            1,
+            "seq-full: ATTEMPTΔ==1 (single count)"
+        );
+        assert_eq!(
+            read_percpu(loaded, "CALLS", OP, false) - calls0,
+            0,
+            "seq-full: CALLSΔ==0"
+        );
+        assert_eq!(
+            read_percpu(loaded, "LOSS", wire::LOSS_SEQ_FULL, false) - loss0,
+            1,
+            "seq-full: LOSSΔ==1"
+        );
+        assert!(
+            d.algs.is_empty() && d.rows.is_empty(),
+            "seq-full: skip member silence"
+        );
+        assert!(d.rets.is_empty(), "seq-full: skip emits no RET");
+        assert!(d.guards.is_empty(), "seq-full: skip emits no guard");
+        assert!(
+            read_scan_cell(loaded, wtid).is_none(),
+            "seq-full: SCAN absent"
+        );
+        // The skip creates nothing for the keyless worker tid (the
+        // SKIP path never creates cells; bump-if-present misses)...
+        assert!(
+            read_u64_cell(loaded, "RCOUNT", wtid).is_none(),
+            "seq-full: worker RCOUNT never created"
+        );
+        assert!(
+            read_u64_cell(loaded, "SEQ", wtid).is_none(),
+            "seq-full: no mint on insert-fail"
+        );
+        // ...and the control's retired cells are untouched.
+        assert_retired(loaded, tid, "seq-full: control");
+    }
     // Legacy cookie (cause 6): surgical entry re-attach with cookie
     // 7 behind the control (loader-bug shape, fail-fast before any
     // map read).
@@ -2598,9 +2731,11 @@ fn c_skip_causes() {
         assert!(d.rets.is_empty(), "cookie: skip emits no RET");
         assert!(d.guards.is_empty(), "cookie: skip emits no guard");
         assert!(read_scan_cell(loaded, tid).is_none());
+        // D: skipped return's members bump-if-present (IDLE|512).
         assert_eq!(
             wire::split_rcount(read_u64_cell(loaded, "RCOUNT", tid).expect("RCOUNT kept")),
-            (0, wire::RCOUNT_STATE_IDLE)
+            (512, wire::RCOUNT_STATE_IDLE),
+            "cookie: RCOUNT IDLE|512 in D"
         );
     }
     // CTRL-invalid ×3 (cause 7): EXPECTED 0, EXPECTED 513, epoch 0.
@@ -2620,10 +2755,11 @@ fn c_skip_causes() {
                 osslscope::loader::program_ctrl(&loaded.maps, &ctrl).expect("program bad CTRL");
             },
             |loaded, tid| {
+                // D: skipped return's members bump-if-present (IDLE|512).
                 assert_eq!(
                     wire::split_rcount(read_u64_cell(loaded, "RCOUNT", tid).expect("RCOUNT kept")),
-                    (0, wire::RCOUNT_STATE_IDLE),
-                    "{tag}: RCOUNT IDLE|0"
+                    (512, wire::RCOUNT_STATE_IDLE),
+                    "{tag}: RCOUNT IDLE|512 in D"
                 );
             },
         );
@@ -2711,7 +2847,11 @@ fn c_skip_birth_pending() {
 /// self-calling target — hint bit + supersede, no map
 /// programming). Persists in D (§10.2): the CALL/hint asserts are
 /// identical; D adds the retirement consequence (inner return
-/// retires, outer SCAN-misses — inner evidence attributable).
+/// retires — RCOUNT IDLE|0 + SCAN delete — then the outer
+/// return's 512 members bump-if-present to IDLE|512 while their
+/// SCAN-miss stays silent, so inner evidence stands alone and is
+/// attributable). Padded table: member evidence is deterministic
+/// (unpadded past-T reads heap soup).
 #[test]
 #[ignore]
 fn c_nested_hint() {
@@ -2733,7 +2873,7 @@ fn c_nested_hint() {
         SlotSpec::live("MNH0", 100, vec![(61, 0x6100)]),
         SlotSpec::live("MNH1", 101, vec![(62, 0x6101)]),
     ];
-    let fx = Fixture::build(&slots, &[]);
+    let fx = Fixture::build_padded(&slots, &[], 513);
     fx.pretouch();
     populate_alg_class(loaded, &fx.classes);
     FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
@@ -2763,17 +2903,34 @@ fn c_nested_hint() {
     assert_eq!(r.arr, fx.array, "RET array");
     assert!(d.guards.is_empty(), "no guard (slot 511 zero)");
     assert!(read_scan_cell(loaded, tid).is_none(), "inner retired");
+    // Inner walk bumps 0→512, then the last member's epilogue
+    // retires (IDLE|0 + SCAN delete); the outer return's 512
+    // members bump-if-present (IDLE|0→IDLE|512) while their
+    // SCAN-miss emits nothing.
     assert_eq!(
         wire::split_rcount(read_u64_cell(loaded, "RCOUNT", tid).expect("RCOUNT")),
-        (1024, wire::RCOUNT_STATE_IDLE),
-        "inner 512 + outer 512 bump-if-present (IDLE)"
+        (512, wire::RCOUNT_STATE_IDLE),
+        "retire-then-bump end state (IDLE|512)"
     );
     assert_eq!(read_percpu(loaded, "CALLS", OP, false), 2, "both counted");
     assert_eq!(read_attempt(loaded), 2);
     assert_loss_zero(loaded);
-    // Inner evidence stands alone: exactly one walk of the 2 live
-    // slots (outer silent — SCAN-miss).
-    assert_eq!(d.algs.len(), 2, "inner walked once");
+    // Inner evidence stands alone: exactly one cold walk of the
+    // padded table (2 OK + 510 EMPTY, outer silent — SCAN-miss).
+    assert_eq!(d.algs.len(), 512, "inner walked once");
+    assert_eq!(
+        d.algs.iter().filter(|a| a.status == wire::ALG_OK).count(),
+        2,
+        "the 2 live slots"
+    );
+    assert_eq!(
+        d.algs
+            .iter()
+            .filter(|a| a.status == wire::ALG_EMPTY)
+            .count(),
+        510,
+        "the zero tail"
+    );
     assert_eq!(d.rows.len(), 2);
     assert!(d.algs.iter().all(|a| a.arr == fx.array));
 }
@@ -3585,7 +3742,10 @@ fn d_retire_quiet() {
             SlotSpec::live("MRQ0", 100, vec![(81, 0x8100)]),
             SlotSpec::live("MRQ1", 101, vec![(82, 0x8101)]),
         ];
-        let fx = Fixture::build(&slots, &[]);
+        // Padded: member evidence is deterministic (unpadded
+        // past-T reads names/blob bytes + unmapped faults — soup
+        // to the 128-member cliff, never exact).
+        let fx = Fixture::build_padded(&slots, &[], 513);
         fx.pretouch();
         populate_alg_class(loaded, &fx.classes);
         FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
@@ -3601,7 +3761,20 @@ fn d_retire_quiet() {
             (wire::KIND_SCAN_RET, OP, 0, fx.array)
         );
         assert_eq!(r.generation, 0, "GEN uninstalled → 0-stamped");
-        assert_eq!(d.algs.len(), 2, "exact ALG outputs");
+        assert_eq!(d.algs.len(), 512, "exact ALG outputs");
+        assert_eq!(
+            d.algs.iter().filter(|a| a.status == wire::ALG_OK).count(),
+            2,
+            "the 2 live slots"
+        );
+        assert_eq!(
+            d.algs
+                .iter()
+                .filter(|a| a.status == wire::ALG_EMPTY)
+                .count(),
+            510,
+            "the zero tail"
+        );
         assert_eq!(d.rows.len(), 2, "exact ROW outputs");
         assert!(d.guards.is_empty(), "no guard (slot 511 zero)");
         assert_retired(loaded, tid, "retire-quiet");
@@ -3635,6 +3808,10 @@ fn d_retire_quiet() {
         let d = drain(loaded);
         assert!(!d.algs.is_empty(), "abort variant: live control emits");
         assert_retired(loaded, tid, "abort-control");
+        // Clear-between (mirrors clear-on-read): the control's
+        // unpadded soup may flag TRUNC bits — the abort query's
+        // WALK_READ-alone pin needs a clean baseline.
+        clear_trunc(loaded, "abort-control");
         // Unmap the array page: every slot read aborts (slot 0
         // included) — RET must still present.
         let page = 4096usize;
@@ -3672,7 +3849,10 @@ fn d_retire_quiet() {
             SlotSpec::live("MRQN2", 102, vec![(86, 0x8105)]),
             SlotSpec::noimp("MRQN3", 103),
         ];
-        let fx = Fixture::build(&slots, &[]);
+        // Padded: the NOIMP slot emits its explicit ALG_NOIMP
+        // record (eligibility ≠ walkability — NOIMP records and
+        // falls through to the epilogue).
+        let fx = Fixture::build_padded(&slots, &[], 513);
         fx.pretouch();
         populate_alg_class(loaded, &fx.classes);
         FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
@@ -3680,8 +3860,19 @@ fn d_retire_quiet() {
         fire(OP as i32, 1);
         let d = drain(loaded);
         assert_eq!(d.calls.len(), 1);
-        assert_eq!(d.algs.len(), 3, "NOIMP slot emits no ALG");
-        assert!(d.algs.iter().all(|a| a.idx <= 2));
+        assert_eq!(d.algs.len(), 512, "3 OK + NOIMP + 508 EMPTY");
+        assert_eq!(
+            d.algs.iter().filter(|a| a.status == wire::ALG_OK).count(),
+            3,
+            "the 3 live slots"
+        );
+        let noimp: Vec<_> = d
+            .algs
+            .iter()
+            .filter(|a| a.status == wire::ALG_NOIMP)
+            .collect();
+        assert_eq!(noimp.len(), 1, "NOIMP slot emits its ALG");
+        assert_eq!(noimp[0].idx, 3);
         assert_eq!(
             read_percpu(loaded, "TRUNC", OP, true),
             wire::TRUNC_WALK_NOIMP,
@@ -3714,7 +3905,9 @@ fn d_member_0_last() {
         SlotSpec::live("MMZ0", 100, vec![(91, 0x9100)]),
         SlotSpec::live("MMZ1", 101, vec![(92, 0x9101)]),
     ];
-    let fx = Fixture::build(&slots, &[]);
+    // Padded: both runs walk the identical deterministic table
+    // (unpadded past-T reads heap soup to the 128-member cliff).
+    let fx = Fixture::build_padded(&slots, &[], 513);
     fx.pretouch();
     populate_alg_class(&attached.loaded, &fx.classes);
     FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
@@ -3746,7 +3939,14 @@ fn d_member_0_last() {
     set1.sort_unstable();
     set2.sort_unstable();
     assert_eq!(set1, set2, "evidence sets identical");
-    assert_eq!(set1, vec![(0, 100), (1, 101)]);
+    assert_eq!(set1.len(), 512, "full cold walk both runs");
+    assert_eq!(&set1[..2], &[(0, 100), (1, 101)], "the 2 live slots");
+    let tail_idx: Vec<u64> = set1[2..].iter().map(|(idx, _)| *idx).collect();
+    assert_eq!(
+        tail_idx,
+        (2..512u64).collect::<Vec<_>>(),
+        "the zero tail rides along"
+    );
     assert_eq!(d2.calls.len(), 1);
     assert_eq!(d2.rets.len(), 1, "RET identical");
     assert_eq!(d2.rets[0].flags, d1.rets[0].flags);
@@ -3967,6 +4167,7 @@ fn d_terminator_control() {
 #[test]
 #[ignore]
 fn d_gen_stale_smaller() {
+    use osslscope_ebpf_common as wire;
     let Some(obj) = gated() else {
         eprintln!("SKIP(members-live): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
         return;
@@ -3985,7 +4186,9 @@ fn d_gen_stale_smaller() {
             )
         })
         .collect();
-    let fx = Fixture::build(&slots, &[]);
+    // Padded: GEN-mismatch cold-walks the deterministic table
+    // (unpadded past-T reads heap soup to the 128-member cliff).
+    let fx = Fixture::build_padded(&slots, &[], 513);
     fx.pretouch();
     populate_alg_class(loaded, &fx.classes);
     FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
@@ -4014,7 +4217,12 @@ fn d_gen_stale_smaller() {
             "slot {j} walked (stale cache ignored)"
         );
     }
-    assert_eq!(algs.len(), 6);
+    assert_eq!(algs.len(), 512, "full cold walk + zero tail");
+    assert_eq!(
+        algs.iter().filter(|a| a.status == wire::ALG_OK).count(),
+        6,
+        "the 6 live slots"
+    );
     assert_eq!(rows.len(), 6);
     assert_eq!(read_percpu(loaded, "TRUNC", OP, true), 0);
     assert_retired(loaded, tid, "gen-stale");
@@ -4235,13 +4443,17 @@ fn d_guard_cold_error() {
             )
         })
         .collect();
-    let fx = Fixture::build(&slots, &[]);
+    // Array sized to 640 cells (5 pages): slot 512 starts exactly
+    // at page 4 (512 × 32B) and the names blob starts at page 5
+    // (640 × 32B) — unmapping page 4 isolates the slot-512 read
+    // fault (an unpadded 513-cell array shares page 4 between slot
+    // 512 and name storage, faulting name reads into WALK_NAME).
+    let fx = Fixture::build_padded(&slots, &[], 640);
     fx.pretouch();
     populate_alg_class(loaded, &fx.classes);
-    // Slot 512 starts exactly at page 4 of the page-aligned array
-    // (512 × 32B): unmap it (slot 511 stays readable).
     let page = 4096usize;
     assert_eq!(fx.array as usize % page, 0, "array page-aligned");
+    assert_eq!(640 * 32 % page, 0, "names start on page 5");
     let rc = unsafe { libc::munmap((fx.array + 512 * 32) as *mut libc::c_void, page) };
     assert_eq!(rc, 0, "munmap slot-512 page");
     FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
@@ -4367,7 +4579,16 @@ fn d_guard_warm_512() {
         let d = drain(loaded);
         assert_eq!(d.calls.len(), 1);
         assert_eq!(d.rets.len(), 1);
-        assert_eq!(d.algs.len(), 511, "NOIMP slot emits no ALG");
+        // Explicit NOIMP emit (eligibility ≠ walkability — NOIMP
+        // records and falls through to the epilogue).
+        assert_eq!(d.algs.len(), 512, "511 OK + NOIMP@511");
+        let noimp: Vec<_> = d
+            .algs
+            .iter()
+            .filter(|a| a.status == wire::ALG_NOIMP)
+            .collect();
+        assert_eq!(noimp.len(), 1, "NOIMP slot emits its ALG");
+        assert_eq!(noimp[0].idx, 511);
         assert_eq!(d.guards.len(), 1, "guard executes despite NOIMP@511");
         let g = &guards_for(&d.guards, d.calls[0].tid, d.calls[0].seq)[0];
         assert_eq!(g.verdict, wire::GUARD_EMPTY, "GUARD EMPTY (term@512)");
@@ -4488,8 +4709,10 @@ fn d_nested_skip() {
     let tid = self_tid();
     FIXTURE_ARRAY.store(0, Ordering::SeqCst); // NULL throughout
     NS_VERDICT.store(0, Ordering::SeqCst);
-    // Prime 160B on a sacrificial tid (two admitted NULL pairs).
-    let sacrificial = fire_on_worker(loaded, OP as i32, 2);
+    // Prime 160B on a sacrificial tid (two admitted NULL pairs
+    // through the NESTED target — the attach observes the nested
+    // symbol only, so ordinary fires prime nothing).
+    let sacrificial = fire_nested_on_worker(loaded, OP as i32, 0, 2);
     assert_ne!(sacrificial, tid);
     register(loaded, &mut state, &[tid]);
     let (attempt0, calls0, loss0) = (
@@ -5190,14 +5413,89 @@ fn d_bucket_burst_refill() {
     assert_retired(loaded, tid, "bucket");
 }
 
+/// Corrupt exactly one member's first helper call (keep-good
+/// live forcing): parse the object's symtab for `member_J`, scan
+/// its code for the first BPF `call` with a helper (non-pseudo)
+/// target, and rewrite its imm to an unknown helper id.
+/// ELF/shape/relocs stay intact (prepare passes — only one code
+/// immediate changes, at a relocation-free offset), while the
+/// verifier rejects exactly this prog at load (keep-good records
+/// it, the rest proceed). Returns the corrupted bytes.
+fn corrupt_member_first_call(obj: &std::path::Path, slot: u32) -> Vec<u8> {
+    let mut bytes = std::fs::read(obj).expect("read members.o");
+    let elf = goblin::elf::Elf::parse(&bytes).expect("parse members.o");
+    let sec_idx = elf
+        .section_headers
+        .iter()
+        .position(|s| &elf.shdr_strtab[s.sh_name] == "uretprobe")
+        .expect("uretprobe section");
+    let sec = &elf.section_headers[sec_idx];
+    let sec_off = sec.sh_offset as usize;
+    let name = format!("member_{slot:03}");
+    let sym = elf
+        .syms
+        .iter()
+        .find(|s| elf.strtab.get_at(s.st_name) == Some(name.as_str()))
+        .unwrap_or_else(|| panic!("symbol {name} present"));
+    assert_eq!(sym.st_shndx as usize, sec_idx, "{name} lives in uretprobe");
+    let code_off = sec_off + sym.st_value as usize;
+    let code_len = sym.st_size as usize;
+    assert!(code_len % 8 == 0 && code_len > 0, "{name} has code");
+    // Relocation targets within uretprobe (section-relative):
+    // the corruption must not sit on one (prepare would repair
+    // it back — or worse, the reloc would apply onto garbage).
+    let mut relocs = std::collections::HashSet::new();
+    for s in &elf.section_headers {
+        if &elf.shdr_strtab[s.sh_name] == ".reluretprobe" {
+            let o = s.sh_offset as usize;
+            let e = o + s.sh_size as usize;
+            for ent in bytes[o..e].chunks_exact(16) {
+                let r_off = u64::from_le_bytes(ent[0..8].try_into().unwrap());
+                relocs.insert(r_off);
+            }
+        }
+    }
+    // First helper call (opcode 0x85, src_reg 0 — pseudo-calls
+    // carry relocs and src_reg 1; lddw spans two slots).
+    let mut at = None;
+    let mut o = 0usize;
+    while o + 8 <= code_len {
+        let op = bytes[code_off + o];
+        if op == 0x18 {
+            o += 16;
+            continue;
+        }
+        if op == 0x85 && (bytes[code_off + o + 1] >> 4) == 0 {
+            at = Some(o);
+            break;
+        }
+        o += 8;
+    }
+    let insn = at.unwrap_or_else(|| panic!("{name} has a helper call"));
+    let sec_rel = sym.st_value + insn as u64;
+    assert!(
+        !relocs.contains(&sec_rel),
+        "{name}: first call is relocation-free"
+    );
+    bytes[code_off + insn + 4..code_off + insn + 8].copy_from_slice(&0x7fffffffi32.to_le_bytes());
+    eprintln!(
+        "selective-reject: corrupted {name} call at file+{:#x}",
+        code_off + insn
+    );
+    bytes
+}
+
 /// Selective load live (item 6): attach members {0,1,2,3} with
 /// EXPECTED=4 — only the entry + 4 members prepare/load (never
 /// the full 513), the scan retires (count reaches attached
 /// EXPECTED), evidence covers the attached window (live slots +
 /// explicit EMPTY terminator), and unattached slots stay silent
 /// (out of scope — the oracle reports them as unobserved, never
-/// as holes). Keep-good: no failures here (the failed list is
-/// empty on a clean subset).
+/// as holes). Keep-good is FORCED, not just asserted empty: the
+/// rejection cell corrupts member_003's first helper call (the
+/// verifier rejects exactly it at load), the rest attach,
+/// EXPECTED reprograms to 3, the scan retires, and slot 3 stays
+/// out of the evidence.
 #[test]
 #[ignore]
 fn d_selective_scope() {
@@ -5230,7 +5528,9 @@ fn d_selective_scope() {
         SlotSpec::live("MS0", 101, vec![(21, 0x4200)]),
         SlotSpec::live("MS1", 102, vec![(22, 0x4300)]),
     ];
-    let fx = Fixture::build(&slots, &[]);
+    // Padded: slot 3 reads past-T zero (an unpadded array feeds
+    // slot 3 names-blob bytes → UNREADABLE, not EMPTY).
+    let fx = Fixture::build_padded(&slots, &[], 513);
     fx.pretouch();
     populate_alg_class(loaded, &fx.classes);
     FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
@@ -5260,6 +5560,66 @@ fn d_selective_scope() {
     assert_eq!(read_percpu(loaded, "CALLS", OP, false), 1);
     assert_retired(loaded, tid, "selective");
     assert_loss_zero(loaded);
+    // Rejection cell: member_003 corrupted (unknown helper) — the
+    // verifier rejects exactly it at load (keep-good records
+    // stage=load), members {0,1,2} attach, EXPECTED reprograms to
+    // 3, the scan retires, and slot 3 stays out of the evidence
+    // (unattached — the oracle scope excludes it, never a hole).
+    {
+        let bad = corrupt_member_first_call(&obj, 3);
+        let ctrl4 = osslscope::loader::default_ctrl(4, osslscope::loader::MEMBER_RING_BYTES)
+            .expect("CTRL/4");
+        let sub = osslscope::loader::attach_members_subset_from_bytes(
+            &bad,
+            &exe,
+            off,
+            std::process::id(),
+            &ctrl4,
+            &[0, 1, 2, 3],
+        )
+        .expect("keep-good attach proceeds");
+        assert_eq!(sub.slots, vec![0, 1, 2], "selective: attached set");
+        assert_eq!(sub.failed.len(), 1, "selective: exactly one rejection");
+        assert_eq!(sub.failed[0].slot, 3, "selective: slot 3 rejected");
+        assert_eq!(sub.failed[0].stage, "load", "selective: load-stage");
+        assert!(
+            !sub.failed[0].error.is_empty(),
+            "selective: rejection recorded"
+        );
+        let loaded = &sub.attached.loaded;
+        let mut state = BirthState::new();
+        register(loaded, &mut state, &[self_tid()]);
+        let tid = self_tid();
+        let slots = vec![
+            SlotSpec::live("MSR0", 101, vec![(21, 0x4200)]),
+            SlotSpec::live("MSR1", 102, vec![(22, 0x4300)]),
+        ];
+        let fx = Fixture::build_padded(&slots, &[], 513);
+        fx.pretouch();
+        populate_alg_class(loaded, &fx.classes);
+        FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
+        NS_VERDICT.store(0, Ordering::SeqCst);
+        fire(OP as i32, 1);
+        let d = drain(loaded);
+        assert_eq!(d.calls.len(), 1, "selective-reject: 1 CALL");
+        assert_eq!(
+            call_parts(&d.calls[0]),
+            (false, wire::SKIP_ADMITTED),
+            "selective-reject: admits"
+        );
+        assert_eq!(d.rets.len(), 1, "selective-reject: RET (member 0 attached)");
+        let mut idxs: Vec<u64> = d.algs.iter().map(|a| a.idx).collect();
+        idxs.sort_unstable();
+        assert_eq!(
+            idxs,
+            vec![0, 1, 2],
+            "selective-reject: attached window only"
+        );
+        assert!(d.guards.is_empty(), "selective-reject: no guard");
+        assert_eq!(read_percpu(loaded, "CALLS", OP, false), 1);
+        assert_retired(loaded, tid, "selective-reject");
+        assert_loss_zero(loaded);
+    }
 }
 
 /// Drain floor live (item 7, §5.6): 240 × 512-live scans in 6
@@ -5430,7 +5790,9 @@ fn stage_trunc(loaded: &Loaded, op: u32, bit: u64) {
 /// (CPU-0 slot — the drain sums across CPUs).
 fn bump_trunc_seq(loaded: &Loaded, by: u64) {
     use aya::maps::{Map, MapData, PerCpuArray, PerCpuValues};
-    let fd = loaded.maps["TRUNC_SEQ"].try_clone().expect("clone TRUNC_SEQ");
+    let fd = loaded.maps["TRUNC_SEQ"]
+        .try_clone()
+        .expect("clone TRUNC_SEQ");
     let data = MapData::from_fd(fd).expect("mapdata");
     let map = Map::from_map_data(data).expect("map");
     let mut m = PerCpuArray::<_, u64>::try_from(map).expect("percpu-array shape");
@@ -5589,7 +5951,10 @@ fn d_trunc_seq_guard() {
     // Cold: every member walks — 2 OK + 2 NOIMP + 508 EMPTY.
     assert_eq!(d.algs.len(), 512, "trunc-seq: every slot read once");
     assert_eq!(
-        d.algs.iter().filter(|a| a.status == wire::ALG_NOIMP).count(),
+        d.algs
+            .iter()
+            .filter(|a| a.status == wire::ALG_NOIMP)
+            .count(),
         2,
         "trunc-seq: both NOIMP slots explicit"
     );
@@ -5827,9 +6192,10 @@ fn r19_backend_later_slots() {
     );
     // Window edge: the backstop closes query 3 — the true cached
     // ride (fired post-warming, stamped gen 1, T-gated walk: the
-    // 256 live slots emit ALG/ROW evidence and member 256
-    // re-confirms the EMPTY terminator every scan — the warm
-    // verdict never coasts on an unverified T).
+    // 256 live slots emit ALG/ROW evidence, member 256 walks the
+    // EMPTY terminator, and member 257 (T+1) emits the boundary
+    // EMPTY — the warm verdict never coasts on an unverified T,
+    // and growth by one is caught at the boundary).
     let d4 = backend.finish().expect("backend finish");
     assert_eq!(d4.done.len(), 1, "later-slots: backstop closes query 3");
     let w3 = &d4.done[0];
@@ -5842,7 +6208,9 @@ fn r19_backend_later_slots() {
         "later-slots: cached Complete @256"
     );
     assert_eq!(w3.true_t, TrueT::Proven(256));
-    assert_eq!((w3.alg_count, w3.row_count), (257, 256));
+    // 256 OK + walked EMPTY@256 + T+1 boundary EMPTY@257 (members
+    // 258+ stay silent — covered by T+1).
+    assert_eq!((w3.alg_count, w3.row_count), (258, 256));
     assert!(
         w3.guard.is_none(),
         "later-slots: no guard on the warm close (T=256 ≠ 512)"
@@ -6053,4 +6421,547 @@ fn r19_backend_termination_512_513() {
             "513-live: TRUNC consumed (clear-on-read — both flags landed in verdicts, none lost)"
         );
     }
+}
+
+// ===== R19 installed-path proof (F12) =====
+
+/// Pinned vehicle (Ubuntu 3.5.5-1ubuntu3.7 — same pins as the P5d
+/// suite: binary + libcrypto sha256 asserted before the run).
+const F12_VEHICLE_BIN: &str = "/usr/bin/openssl";
+const F12_VEHICLE_SHA256: &str = "1d72cbc5bf62be3f3dbd7626c295b63c5fdc1dd8439f323ac47998d8a062b4c9";
+const F12_LIBCRYPTO: &str = "/usr/lib/x86_64-linux-gnu/libcrypto.so.3";
+const F12_LIBCRYPTO_SHA256: &str =
+    "5385f0436ac2e284ba8c5fb1488874057c29c04be72dea32add832694f381e28";
+/// Anchor file offset for the pinned build (dbgsym-measured —
+/// same value the P5d enrollment fixture pins).
+const F12_QUERY_OFF: u64 = 2577296;
+
+fn f12_sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    let mut h = sha2::Sha256::new();
+    h.update(bytes);
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn f12_assert_vehicle_pinned() {
+    assert!(
+        std::env::var_os("LD_LIBRARY_PATH").is_none(),
+        "refusing to measure under LD_LIBRARY_PATH (loader substitution risk)"
+    );
+    assert!(
+        std::env::var_os("LD_PRELOAD").is_none(),
+        "refusing to measure under LD_PRELOAD (interposition risk)"
+    );
+    let out = std::process::Command::new(F12_VEHICLE_BIN)
+        .arg("version")
+        .output()
+        .expect("vehicle runs");
+    assert!(out.status.success(), "vehicle `openssl version` failed");
+    let v = String::from_utf8_lossy(&out.stdout);
+    assert!(v.contains("3.5.5"), "vehicle version drift: {v:?}");
+    let digest = f12_sha256_hex(&std::fs::read(F12_VEHICLE_BIN).expect("read vehicle"));
+    assert_eq!(digest, F12_VEHICLE_SHA256, "vehicle binary drift");
+    let lib_digest = f12_sha256_hex(&std::fs::read(F12_LIBCRYPTO).expect("read libcrypto"));
+    assert_eq!(lib_digest, F12_LIBCRYPTO_SHA256, "libcrypto drift");
+}
+
+/// Explicit enrollment table for the pinned build (same offsets
+/// the P5d fixture pins — build-id + query + anchor). Unique path
+/// per run, removed on drop.
+struct F12Enrollment {
+    path: std::path::PathBuf,
+}
+
+impl F12Enrollment {
+    fn create() -> Self {
+        let path = std::env::temp_dir().join(format!("f12-table-{}.json", std::process::id()));
+        let content = r#"{"table_version": 1,
+    "entries": [{"build_id": "0ebcfeaee273dc860b29e067d255def704185b41",
+      "openssl": "3.5.5-1ubuntu3.7",
+      "query_offset": 2577296,
+      "anchor": "OSSL_PROVIDER_available",
+      "anchor_offset": 2576784}]}"#;
+        std::fs::write(&path, content).expect("write enrollment table");
+        Self { path }
+    }
+}
+
+impl Drop for F12Enrollment {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Root-owned install prefix under /usr/local (production trust
+/// needs root-owned, non-writable ancestry — /tmp can never pass).
+/// Removed (best-effort sudo) on drop, including unwind paths.
+struct F12Prefix {
+    path: std::path::PathBuf,
+}
+
+impl Drop for F12Prefix {
+    fn drop(&mut self) {
+        let st = std::process::Command::new("sudo")
+            .args(["-n", "rm", "-rf"])
+            .arg(&self.path)
+            .status();
+        if !st.map(|s| s.success()).unwrap_or(false) {
+            eprintln!(
+                "f12: WARN prefix cleanup failed for {}",
+                self.path.display()
+            );
+        }
+    }
+}
+
+/// Installed-path live prerequisites (shared by the F12 +
+/// dispatch-blind legs): live gate, built triple, host binary,
+/// passwordless sudo. Returns harvest/count/members/host-bin/
+/// installer paths, or None after the labeled SKIP.
+fn f12_prereqs(
+    tag: &str,
+) -> Option<(
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+)> {
+    let live = gated().or_else(|| {
+        eprintln!("SKIP({tag}): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
+        None
+    })?;
+    let members_obj = live;
+    let objdir = members_obj
+        .parent()
+        .expect("members object has a parent dir")
+        .to_path_buf();
+    let harvest_obj = objdir.join("osslscope-harvest");
+    let count_obj = objdir.join("osslscope-count");
+    for p in [&harvest_obj, &count_obj, &members_obj] {
+        if !p.is_file() {
+            eprintln!("SKIP({tag}): triple object missing: {}", p.display());
+            return None;
+        }
+    }
+    let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let host_bin = manifest_dir.join("target/debug/osslscope");
+    if !host_bin.is_file() {
+        eprintln!(
+            "SKIP({tag}): host binary missing (cargo build first): {}",
+            host_bin.display()
+        );
+        return None;
+    }
+    let sudo = std::process::Command::new("sudo")
+        .args(["-n", "true"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !sudo {
+        eprintln!("SKIP({tag}): needs passwordless sudo for the root-owned prefix");
+        return None;
+    }
+    let installer = manifest_dir.join("scripts/install-dev.sh");
+    Some((harvest_obj, count_obj, members_obj, host_bin, installer))
+}
+
+/// Installer-laid prefix (the REAL installer, explicit object
+/// overrides — no manifest dependence). Returns the prefix guard
+/// + installed object dir.
+fn f12_install_prefix(
+    tag: &str,
+    harvest_obj: &std::path::Path,
+    count_obj: &std::path::Path,
+    members_obj: &std::path::Path,
+    host_bin: &std::path::Path,
+    installer: &std::path::Path,
+) -> (F12Prefix, std::path::PathBuf) {
+    let prefix = F12Prefix {
+        path: std::path::PathBuf::from(format!("/usr/local/osslscope-f12-{}", std::process::id())),
+    };
+    let st = std::process::Command::new("sudo")
+        .arg("-n")
+        .arg(installer)
+        .arg("--prefix")
+        .arg(&prefix.path)
+        .arg("--binary")
+        .arg(host_bin)
+        .arg("--harvest")
+        .arg(harvest_obj)
+        .arg("--count")
+        .arg(count_obj)
+        .arg("--members")
+        .arg(members_obj)
+        .status()
+        .expect("run installer");
+    assert!(st.success(), "{tag}: installer lays the triple");
+    let installed_dir = prefix.path.join("lib").join("osslscope");
+    assert!(
+        installed_dir.join("osslscope-members").is_file(),
+        "{tag}: members installed"
+    );
+    (prefix, installed_dir)
+}
+
+/// F12 paced multi-op workload (C, compiled to temp): one
+/// fresh-libctx fetch per iteration, 300ms apart — every query
+/// admits (tier-1 bucket: burst 4, 40/s refill), unlike a burst
+/// workload that correctly skips almost everything. Each fetch
+/// queries the default provider through the traversal anchor;
+/// alternating digest/cipher ops spreads verdicts across provider
+/// tables. Attachments: none (links `-lcrypto`, default paths).
+const F12_WORKLOAD_C: &str = r#"
+#include <openssl/evp.h>
+#include <openssl/provider.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+int main(void) {
+    const char *mds[] = {"SHA256", "SHA512"};
+    const char *ciphers[] = {"AES-128-CBC", "AES-256-CBC"};
+    unsigned char buf[64];
+    size_t len = 0;
+    size_t olen = 0;
+    for (int i = 0; i < 12; i++) {
+        OSSL_LIB_CTX *ctx = OSSL_LIB_CTX_new();
+        if (!ctx) { fprintf(stderr, "f12work: libctx\n"); return 1; }
+        OSSL_PROVIDER *def = OSSL_PROVIDER_load(ctx, "default");
+        if (!def) { fprintf(stderr, "f12work: provider\n"); return 1; }
+        /* One fetch per iteration (alternate ops): intra-iteration
+           queries stay under the tier-1 burst. */
+        if (i % 2 == 0) {
+            EVP_MD *md = EVP_MD_fetch(ctx, mds[(i / 2) % 2], NULL);
+            if (!md) { fprintf(stderr, "f12work: md fetch\n"); return 1; }
+            if (!EVP_Q_digest(ctx, mds[(i / 2) % 2], NULL, "abc", 3, buf, &len))
+                { fprintf(stderr, "f12work: digest\n"); return 1; }
+            EVP_MD_free(md);
+        } else {
+            EVP_CIPHER *c = EVP_CIPHER_fetch(ctx, ciphers[(i / 2) % 2], NULL);
+            if (!c) { fprintf(stderr, "f12work: cipher fetch\n"); return 1; }
+            EVP_CIPHER_free(c);
+            olen++;
+        }
+        OSSL_PROVIDER_unload(def);
+        OSSL_LIB_CTX_free(ctx);
+        if (i < 11) usleep(300000);
+    }
+    if (len == 0 || olen == 0) { fprintf(stderr, "f12work: void\n"); return 1; }
+    return 0;
+}
+"#;
+
+/// R19 F12: the installed triple observes REAL provider traffic
+/// through the ordinary run — installer-laid prefix (production
+/// trust), automatic triple selection (no explicit object flags),
+/// paced multi-op workload (provider queries during the window),
+/// ordinary close + report rendering. Asserts positive traversal
+/// records with explicit verdicts, real below-terminator evidence
+/// (registry classes — a misprobed offset walks garbage that can
+/// never hash-match a known name), the exact installed triple in
+/// the capture provenance and the rendered `traversal` section.
+///
+/// Verdict-shape note: real provider tables live in mapped
+/// neighborhoods, so v1 full scans systematically observe
+/// past-terminator soup (VALID guard + dispatch overflow) and
+/// close Partial with explicit Trunc reasons — fail-closed per
+/// F2/F3/F5, not a defect. Complete-adaptation mechanics are
+/// proven host-side (`traversal_completes_produce_inventory`) and
+/// through the production backend (`r19_backend_*` legs); this leg
+/// additionally asserts the adapted anchor site whenever traffic
+/// Completes (logged either way).
+#[test]
+#[ignore]
+fn r19_installed_positive_traffic() {
+    use osslscope_ebpf_common as wire;
+    let Some((harvest_obj, count_obj, members_obj, host_bin, installer)) = f12_prereqs("f12")
+    else {
+        return;
+    };
+    f12_assert_vehicle_pinned();
+    // Compile the paced workload (needs a C compiler + system
+    // libcrypto headers — lane prerequisites, skipped labeled).
+    let work_src = std::env::temp_dir().join(format!("f12work-{}.c", std::process::id()));
+    let work_bin = std::env::temp_dir().join(format!("f12work-{}", std::process::id()));
+    std::fs::write(&work_src, F12_WORKLOAD_C).expect("write workload");
+    let cc = std::process::Command::new("cc")
+        .args([
+            "-O2",
+            "-o",
+            work_bin.to_str().unwrap(),
+            work_src.to_str().unwrap(),
+            "-lcrypto",
+        ])
+        .status();
+    std::fs::remove_file(&work_src).ok();
+    match cc {
+        Ok(s) if s.success() && work_bin.is_file() => {}
+        _ => {
+            eprintln!("SKIP(f12): C workload did not compile (needs cc + libcrypto headers)");
+            return;
+        }
+    }
+    struct F12WorkBin {
+        path: std::path::PathBuf,
+    }
+    impl Drop for F12WorkBin {
+        fn drop(&mut self) {
+            std::fs::remove_file(&self.path).ok();
+        }
+    }
+    let _work_bin = F12WorkBin {
+        path: work_bin.clone(),
+    };
+    let enrollment = F12Enrollment::create();
+    let (_prefix, installed_dir) = f12_install_prefix(
+        "f12",
+        &harvest_obj,
+        &count_obj,
+        &members_obj,
+        &host_bin,
+        &installer,
+    );
+    // Ordinary run, FULLY automatic (no explicit object flags —
+    // the installed triple resolves via production trust +
+    // receipt, exactly like a deployed run).
+    let cfg = osslscope::capture::Config {
+        harvest_object: None,
+        count_object: None,
+        members_object: None,
+        provider: Some(std::path::PathBuf::from(F12_LIBCRYPTO)),
+        builtin: true,
+        table: Some(enrollment.path.clone()),
+        force_offset: None,
+        provider_enrollment: None,
+        resolved_provider: None,
+        duration: std::time::Duration::from_secs(10),
+        settle: std::time::Duration::from_secs(2),
+        harvest_timeout: std::time::Duration::from_secs(30),
+        grace: std::time::Duration::from_secs(5),
+        image_digest: String::new(),
+    };
+    let cap = osslscope::capture::run_with_dirs(
+        &cfg,
+        osslscope::capture::Target::Spawn {
+            argv: vec![work_bin.to_str().unwrap().to_string()],
+            workload: osslscope::target::WorkloadDest::Null,
+        },
+        std::slice::from_ref(&installed_dir),
+        &osslscope::discovery::onboard::TrustPolicy::production(),
+    )
+    .expect("f12: ordinary run traverses");
+    // The workload itself succeeded (a failing workload would
+    // void the traffic evidence — fail loud, never vacuous).
+    let disp = cap
+        .document
+        .disposition
+        .as_ref()
+        .expect("f12: disposition recorded");
+    assert_eq!(
+        (disp.outcome, disp.code),
+        (osslscope::evidence::DispositionOutcome::Exited, Some(0)),
+        "f12: workload exits 0"
+    );
+    // Traversal ran (not harvest-only) with the exact installed
+    // triple (paths under the prefix, hashes of the installed
+    // bytes — the reported identity IS the loaded bytes).
+    let t = cap.traversal.as_ref().expect("f12: traversal ran");
+    let prov = t.provenance.as_ref().expect("f12: triple provenance");
+    for (role, p, installed) in [
+        (
+            "harvest",
+            &prov.harvest,
+            installed_dir.join("osslscope-harvest"),
+        ),
+        ("count", &prov.count, installed_dir.join("osslscope-count")),
+        (
+            "members",
+            &prov.members,
+            installed_dir.join("osslscope-members"),
+        ),
+    ] {
+        assert_eq!(p.path, installed, "f12: {role} is the installed object");
+        let digest = f12_sha256_hex(&std::fs::read(&installed).expect("read installed"));
+        assert_eq!(p.sha256, digest, "f12: {role} hash binds installed bytes");
+    }
+    // POSITIVE records from real traffic (the core F12 ask —
+    // round-1's smoke had polls but zero records), with explicit
+    // verdicts (nothing silent, nothing dropped).
+    let mut hist = std::collections::BTreeMap::new();
+    for w in &t.done {
+        let k = match &w.outcome {
+            osslscope::scan::oracle::Outcome::Complete { .. } => "Complete",
+            osslscope::scan::oracle::Outcome::Partial { .. } => "Partial",
+            osslscope::scan::oracle::Outcome::Skipped { .. } => "Skipped",
+            osslscope::scan::oracle::Outcome::Tainted { .. } => "Tainted",
+            osslscope::scan::oracle::Outcome::Abandoned { .. } => "Abandoned",
+        };
+        *hist.entry(k).or_insert(0u64) += 1;
+    }
+    eprintln!(
+        "f12: {} records, {} findings, {} polls, {} admitted-op keys, verdicts={:?}, detached={}",
+        t.done.len(),
+        t.findings.len(),
+        t.polls,
+        t.admitted_by_op.len(),
+        hist,
+        t.detached
+    );
+    assert!(!t.done.is_empty(), "f12: positive traversal records");
+    let admitted = t.done.len() - hist.get("Skipped").copied().unwrap_or(0) as usize;
+    assert!(
+        admitted >= 8,
+        "f12: paced queries admit (got {admitted} admitted of {})",
+        t.done.len()
+    );
+    assert!(
+        !t.detached,
+        "f12: paced traffic never storms (no tier-3 detach)"
+    );
+    for w in &t.done {
+        if let osslscope::scan::oracle::Outcome::Partial { reasons } = &w.outcome {
+            assert!(
+                !reasons.is_empty(),
+                "f12: Partial reasons explicit, never silent"
+            );
+        }
+    }
+    // Log one sample Partial's reasons + TRUE-T (mechanism
+    // evidence: past-terminator soup degrades explicitly).
+    if let Some(sample) = t
+        .done
+        .iter()
+        .find(|w| matches!(w.outcome, osslscope::scan::oracle::Outcome::Partial { .. }))
+    {
+        eprintln!(
+            "f12: sample Partial: outcome={:?} true_t={:?} algs={} rows={} guard={}",
+            sample.outcome,
+            sample.true_t,
+            sample.alg_count,
+            sample.row_count,
+            sample.guard.is_some()
+        );
+    }
+    // Real below-terminator evidence (registry classes below the
+    // evidenced TRUE-T — a misprobed offset walks garbage that
+    // can never hash-match a known name, so this validates the
+    // anchor end to end).
+    assert!(
+        t.done.iter().any(|w| {
+            let bound = match w.true_t {
+                osslscope::scan::oracle::TrueT::Proven(t)
+                | osslscope::scan::oracle::TrueT::Candidate(t) => t,
+                _ => return false,
+            };
+            w.algs
+                .iter()
+                .any(|a| a.idx < bound && a.status == wire::ALG_OK && a.class != wire::OTHER_CLASS)
+        }),
+        "f12: real algorithm names below TRUE-T"
+    );
+    // Ordinary adaptation whenever traffic Completes (logged
+    // either way — real tables usually Partial by design, and
+    // Complete-adaptation mechanics are proven host-side).
+    let completes = hist.get("Complete").copied().unwrap_or(0);
+    eprintln!("f12: {completes} Complete closes (adaptation tier)");
+    if completes > 0 {
+        assert!(
+            cap.document
+                .sites
+                .iter()
+                .any(|s| s.site.offset == F12_QUERY_OFF),
+            "f12: anchor-offset inventory site adapts on Complete traffic"
+        );
+        let billed: u64 = cap
+            .document
+            .sites
+            .iter()
+            .filter(|s| s.site.offset == F12_QUERY_OFF)
+            .map(|s| s.calls)
+            .sum();
+        assert!(billed > 0, "f12: adapted site bills census calls");
+    }
+    // Ordinary report rendering carries the traversal section with
+    // the exact triple + positive record count.
+    let json = osslscope::report::render_json(&cap.document).expect("f12: render");
+    let v: serde_json::Value = serde_json::from_slice(&json).expect("f12: json parses");
+    let tr = v.get("traversal").expect("f12: traversal section renders");
+    assert!(
+        tr.get("records").and_then(|n| n.as_u64()).unwrap_or(0) > 0,
+        "f12: rendered records positive"
+    );
+    assert_eq!(
+        tr.get("members")
+            .and_then(|m| m.get("path"))
+            .and_then(|p| p.as_str()),
+        Some(installed_dir.join("osslscope-members").to_str().unwrap()),
+        "f12: rendered triple names the installed members"
+    );
+}
+
+/// R19 F6/init-mode: automatic selection for an init-mode
+/// (file-provider) run degrades to harvest-only — the triple
+/// resolves, the session attaches the init pair, but no builtin
+/// query anchor ever pins, so traversal stands down (never
+/// refuses the run, never guesses an offset). Asserts the run
+/// succeeds with NO traversal capture and NO traversal section
+/// in the rendered report (harvest-only, exactly like round 0).
+#[test]
+#[ignore]
+fn r19_init_mode_degrades_harvest_only() {
+    let Some((harvest_obj, count_obj, members_obj, host_bin, installer)) = f12_prereqs("degrade")
+    else {
+        return;
+    };
+    // System legacy provider (init anchor via dynsym — drift-proof,
+    // no pin needed). Skipped labeled when the lane lacks it.
+    let legacy = std::path::PathBuf::from("/usr/lib/x86_64-linux-gnu/ossl-modules/legacy.so");
+    if !legacy.is_file() {
+        eprintln!("SKIP(degrade): no system legacy provider module");
+        return;
+    }
+    let (_prefix, installed_dir) = f12_install_prefix(
+        "degrade",
+        &harvest_obj,
+        &count_obj,
+        &members_obj,
+        &host_bin,
+        &installer,
+    );
+    let cfg = osslscope::capture::Config {
+        harvest_object: None,
+        count_object: None,
+        members_object: None,
+        provider: Some(legacy),
+        builtin: false,
+        table: None,
+        force_offset: None,
+        provider_enrollment: None,
+        resolved_provider: None,
+        duration: std::time::Duration::from_secs(6),
+        settle: std::time::Duration::from_secs(2),
+        harvest_timeout: std::time::Duration::from_secs(30),
+        grace: std::time::Duration::from_secs(5),
+        image_digest: String::new(),
+    };
+    let cap = osslscope::capture::run_with_dirs(
+        &cfg,
+        osslscope::capture::Target::Spawn {
+            argv: vec![F12_VEHICLE_BIN.to_string(), "version".to_string()],
+            workload: osslscope::target::WorkloadDest::Null,
+        },
+        std::slice::from_ref(&installed_dir),
+        &osslscope::discovery::onboard::TrustPolicy::production(),
+    )
+    .expect("degrade: init-mode run succeeds harvest-only");
+    assert!(
+        cap.traversal.is_none(),
+        "degrade: no traversal without an anchor"
+    );
+    let json = osslscope::report::render_json(&cap.document).expect("degrade: render");
+    let v: serde_json::Value = serde_json::from_slice(&json).expect("degrade: json parses");
+    assert!(
+        v.get("traversal").is_none(),
+        "degrade: harvest-only report carries no traversal section"
+    );
 }
