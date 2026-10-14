@@ -1026,14 +1026,21 @@ fn drops_delta(baseline: Option<u64>, cur: Option<u64>) -> (Option<u64>, u64, bo
     }
 }
 
-/// Per-CPU watermark watch (R20-fix round 3, F2): the burst
-/// forks one short-lived child per online CPU (pinned, so its
-/// FORK lands on that CPU); each CPU needs ≥1 sync message (its
-/// child's FORK or EXIT — either proves the stream alive past the
-/// burst). Children stay unreaped until after the await (a zombie
-/// pins its pid — no reuse race in matching).
+/// Per-CPU watermark watch (R20-fix round 3, F2; received-CPU
+/// validation round 4): the burst forks one short-lived child per
+/// online CPU (pinned, so its FORK lands on that CPU); each CPU
+/// needs ≥1 sync message (its child's FORK or EXIT — either proves
+/// the stream alive past the burst). Children stay unreaped until
+/// after the await (a zombie pins its pid — no reuse race in
+/// matching). A message marks the RECEIVED event's CPU — never the
+/// helper's intended CPU: the kernel migrates tasks off a CPU
+/// going offline, so a migrated helper's EXIT must not complete
+/// another lane (its intended lane stays unwitnessed and gaps
+/// honestly, while the arrival lane genuinely advanced past the
+/// burst — either way the per-lane proof is exact).
 struct SyncWatch {
     sought: HashMap<u32, u32>,
+    lanes: HashSet<u32>,
     seen: HashSet<u32>,
 }
 
@@ -1041,18 +1048,19 @@ impl SyncWatch {
     fn new(pids: &[(u32, u32)]) -> Self {
         Self {
             sought: pids.iter().copied().collect(),
+            lanes: pids.iter().map(|(_, cpu)| *cpu).collect(),
             seen: HashSet::new(),
         }
     }
 
-    fn note(&mut self, pid: u32) {
-        if let Some(cpu) = self.sought.get(&pid) {
-            self.seen.insert(*cpu);
+    fn note(&mut self, pid: u32, cpu: u32) {
+        if self.sought.contains_key(&pid) && self.lanes.contains(&cpu) {
+            self.seen.insert(cpu);
         }
     }
 
     fn complete(&self) -> bool {
-        self.sought.values().all(|c| self.seen.contains(c))
+        self.lanes.iter().all(|c| self.seen.contains(c))
     }
 
     fn sought_count(&self) -> u32 {
@@ -1075,6 +1083,46 @@ fn online_cpus() -> Vec<u32> {
     (0..n as u32).collect()
 }
 
+/// Close-time per-CPU watermark plan (R20-fix round 4, F2a): the
+/// required lane set is preserved across the window (subscribe-time
+/// ∪ close-time online), never rebuilt from the current online
+/// count — a previously active CPU that went offline keeps its
+/// required lane (gapped explicitly, never silently dropped).
+/// `burst` covers the closable lanes (required ∩ current online —
+/// newly-online CPUs join, so their suffix proves too); `offlined`
+/// names required lanes no burst can close (topology gap).
+#[derive(Debug, PartialEq, Eq)]
+struct CloseCpuPlan {
+    required: Vec<u32>,
+    burst: Vec<u32>,
+    offlined: Vec<u32>,
+}
+
+fn plan_close_cpus(subscribed: &[u32], current: &[u32]) -> CloseCpuPlan {
+    let mut required: Vec<u32> = subscribed.to_vec();
+    for c in current {
+        if !required.contains(c) {
+            required.push(*c);
+        }
+    }
+    required.sort_unstable();
+    let burst: Vec<u32> = required
+        .iter()
+        .copied()
+        .filter(|c| current.contains(c))
+        .collect();
+    let offlined: Vec<u32> = required
+        .iter()
+        .copied()
+        .filter(|c| !current.contains(c))
+        .collect();
+    CloseCpuPlan {
+        required,
+        burst,
+        offlined,
+    }
+}
+
 /// Fork one immediate-exit child per CPU, pinned in turn (R20-fix
 /// round 3, F2): each CPU then delivers a watermark message on its
 /// own lane. Returns the (pid, cpu) pairs plus a shortfall flag
@@ -1082,7 +1130,7 @@ fn online_cpus() -> Vec<u32> {
 /// prefix/suffix gaps honestly later). The caller's affinity mask
 /// is restored before returning (every iteration and at the end).
 /// Children must stay unreaped until their messages are awaited
-/// (see [`SyncWatch`); reap with `wait_sync_children` after).
+/// (see [`SyncWatch`); reap with `reap_sync_children` after).
 fn watermark_burst(cpus: &[u32]) -> (Vec<(u32, u32)>, bool) {
     let mut out = Vec::new();
     let mut shortfall = false;
@@ -1129,24 +1177,85 @@ fn watermark_burst(cpus: &[u32]) -> (Vec<(u32, u32)>, bool) {
     (out, shortfall)
 }
 
-/// Reap watermark children (after their messages are awaited —
-/// EXIT is generated at exit, delivery never waits for the reap).
-/// Failures proceed silently: the EXIT was generated regardless,
-/// so assurance is intact (a stuck zombie is transient hygiene,
-/// not an observation gap).
-fn wait_sync_children(pids: &[(u32, u32)]) {
-    for (pid, _) in pids {
-        loop {
+/// Graceful reap window for watermark children (R20-fix round
+/// 4, NEW-1): helpers exit immediately, so this bound is generous
+/// (normal reaps land on the first pass); a helper stopped before
+/// `_exit` exhausts it and escalates to SIGKILL below instead of
+/// blocking subscription or close indefinitely.
+const SYNC_REAP_GRACE: Duration = Duration::from_secs(2);
+/// Post-SIGKILL reap window: a SIGKILLed helper is already dead —
+/// this only bounds the zombie's collection (essentially instant;
+/// the bound is belt-and-braces against pid-namespace pathologies).
+const SYNC_KILL_REAP_GRACE: Duration = Duration::from_secs(1);
+/// Reap-poll nap between WNOHANG sweeps (bounded loops only —
+/// every path below terminates at its deadline).
+const SYNC_REAP_NAP: Duration = Duration::from_millis(5);
+
+/// Reap watermark children — the bounded cleanup owner (after
+/// their messages are awaited: EXIT is generated at exit, delivery
+/// never waits for the reap). Grace window first (WNOHANG sweeps),
+/// then SIGKILL escalation with its own bounded reap window for
+/// leftovers (a helper stopped before `_exit` dies on SIGKILL —
+/// stopped processes are killable). EINTR retries everywhere;
+/// ECHILD means gone (reaped — done); any other wait error or a
+/// survivor past both windows reports LOUD on stderr and gives up
+/// (a stuck zombie is transient hygiene until process exit, never
+/// an observation gap — and never an unbounded block). Worst-case
+/// added latency per burst: grace + kill window (normal: instant).
+fn reap_sync_children(pids: &[(u32, u32)]) {
+    reap_sync_children_grace(pids, SYNC_REAP_GRACE, SYNC_KILL_REAP_GRACE)
+}
+
+/// Bounded reap with explicit windows (the production path above
+/// delegates; tests drive short windows directly).
+fn reap_sync_children_grace(pids: &[(u32, u32)], grace: Duration, kill_grace: Duration) {
+    let mut pending: Vec<u32> = pids.iter().map(|(pid, _)| *pid).collect();
+    reap_sweep(&mut pending, Instant::now() + grace);
+    if pending.is_empty() {
+        return;
+    }
+    for pid in &pending {
+        // Best-effort: the child may have exited between the last
+        // sweep and now (its reap lands in the window below, or
+        // ECHILD there means another sweeper's wait won — but this
+        // owner holds the only handle, so that is just the race).
+        unsafe {
+            libc::kill(*pid as libc::pid_t, libc::SIGKILL);
+        }
+    }
+    reap_sweep(&mut pending, Instant::now() + kill_grace);
+    if !pending.is_empty() {
+        eprintln!(
+            "lifecycle: watermark helper(s) survived SIGKILL+reap, giving up bounded: {pending:?}"
+        );
+    }
+}
+
+/// WNOHANG reap sweeps until `pending` empties or `deadline`
+/// passes. EINTR retries; ECHILD counts as reaped; other errors
+/// drop the pid loud (unreapable is hygiene, never a block).
+fn reap_sweep(pending: &mut Vec<u32>, deadline: Instant) {
+    while !pending.is_empty() && Instant::now() < deadline {
+        pending.retain(|pid| {
             let mut status = 0;
-            let r = unsafe { libc::waitpid(*pid as libc::pid_t, &mut status, 0) };
-            if r >= 0 {
-                break;
+            let r = unsafe { libc::waitpid(*pid as libc::pid_t, &mut status, libc::WNOHANG) };
+            if r > 0 {
+                return false;
+            }
+            if r == 0 {
+                return true;
             }
             let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
             if e == libc::EINTR {
-                continue;
+                return true;
             }
-            break;
+            if e != libc::ECHILD {
+                eprintln!("lifecycle: watermark reap of {pid} failed ({e}); giving up on it");
+            }
+            false
+        });
+        if !pending.is_empty() && Instant::now() < deadline {
+            std::thread::sleep(SYNC_REAP_NAP);
         }
     }
 }
@@ -1192,6 +1301,20 @@ pub struct KernelLifecycle {
     /// terminal burst's. Test-visible via
     /// [`KernelLifecycle::watermark_status`].
     last_watermark: Option<(u32, u32)>,
+    /// Subscribe-time required lane set (R20-fix round 4, F2a):
+    /// the CPUs the initial burst covered. Close preserves this
+    /// set (union with close-time online) instead of rebuilding
+    /// from the current online count — an offlined CPU keeps its
+    /// required lane and gaps explicitly rather than vanishing.
+    watermark_cpus: Vec<u32>,
+    /// The subscribe-time watermark burst shortfell (R20-fix
+    /// round 4, MINOR): some CPU could not be pinned/forked
+    /// (restricted affinity, offline CPU) — its lane gaps
+    /// honestly by design, so the environment is supported
+    /// PARTIAL, never zero-loss. Feeds the facility probe
+    /// ([`ConnectorFacility::watermark_clean`]) so zero-loss
+    /// tests skip there instead of failing.
+    subscribe_shortfall: bool,
 }
 
 impl KernelLifecycle {
@@ -1305,6 +1428,8 @@ impl KernelLifecycle {
             released: activity_started,
             pending_delta: LifecycleDelta::default(),
             last_watermark: None,
+            watermark_cpus: Vec::new(),
+            subscribe_shortfall: false,
         };
         // Subscribe drain: the pre-ack stash first (arrival order —
         // pre-ack traffic precedes everything after, so ingesting
@@ -1318,6 +1443,7 @@ impl KernelLifecycle {
             this.ingest_datagram(bytes, &mut delta0, None);
         }
         let cpus = online_cpus();
+        this.watermark_cpus = cpus.clone();
         let (sync_pids, shortfall) = watermark_burst(&cpus);
         let mut watch = SyncWatch::new(&sync_pids);
         this.drain_await_sync(
@@ -1325,8 +1451,9 @@ impl KernelLifecycle {
             &mut watch,
             Instant::now() + SYNC_WATERMARK_TIMEOUT,
         );
-        wait_sync_children(&sync_pids);
+        reap_sync_children(&sync_pids);
         this.last_watermark = Some((watch.sought_count(), watch.seen_count()));
+        this.subscribe_shortfall = shortfall;
         if shortfall {
             // Diagnostic, fail-closed: the burst could not cover
             // every CPU (affinity/fork) — unwatermarked CPUs gap
@@ -1476,6 +1603,14 @@ impl KernelLifecycle {
         self.last_watermark
     }
 
+    /// Close-time watermark plan (R20-fix round 4, F2a): the
+    /// subscribe-time required lane set unioned with the current
+    /// online set — never a fresh set from the current count
+    /// alone (an offlined CPU would silently lose its lane).
+    fn close_cpu_plan(&self) -> CloseCpuPlan {
+        plan_close_cpus(&self.watermark_cpus, &online_cpus())
+    }
+
     /// Ingest one connector payload (`cn_msg` body): filter to the
     /// target subtree, map fork/exec to events, ignore exits (never
     /// pruned — see the EXIT arm). Malformed records are host-side
@@ -1490,7 +1625,8 @@ impl KernelLifecycle {
     /// coredump) create no processes and replace no images, so no
     /// uncaptured execution can hide behind them: ignored.
     /// `sync` (watermark awaits only) notes FORK/EXIT messages of
-    /// the burst children — either marks its CPU witnessed.
+    /// the burst children — either marks the RECEIVED event's CPU
+    /// witnessed (a migrated helper never completes another lane).
     fn ingest_cn(&mut self, body: &[u8], delta: &mut LifecycleDelta, sync: Option<&mut SyncWatch>) {
         if body.len() < CN_HDRLEN + PROC_EVENT_HDRLEN {
             delta.loss += 1;
@@ -1536,7 +1672,7 @@ impl KernelLifecycle {
                     return;
                 };
                 if let Some(w) = sync {
-                    w.note(child_pid);
+                    w.note(child_pid, cpu);
                 }
                 if parent_tgid == self.target_tgid || self.known.contains(&parent_tgid) {
                     if child_tgid == parent_tgid {
@@ -1579,7 +1715,7 @@ impl KernelLifecycle {
                     return;
                 }
                 if let (Some(pid), Some(w)) = (le_u32_at(ev, PROC_EVENT_HDRLEN), sync) {
-                    w.note(pid);
+                    w.note(pid, cpu);
                 }
             }
             _ => {}
@@ -1801,16 +1937,26 @@ impl LifecyclePort for KernelLifecycle {
         // pre-close loss surfaces as an interior hole when its
         // successor ingests, and a lost final message without a
         // successor is impossible once every lane advanced past
-        // the close. An incomplete watermark gaps explicit.
-        let cpus = online_cpus();
-        let (sync_pids, shortfall) = watermark_burst(&cpus);
+        // the close. An incomplete watermark gaps explicit. The
+        // required lane set is preserved across the window (round
+        // 4, F2a): required-but-offlined lanes gap explicitly as
+        // topology changes that prevent closure — never vanish.
+        let plan = self.close_cpu_plan();
+        if !plan.offlined.is_empty() {
+            eprintln!(
+                "lifecycle: watermark lane(s) offlined mid-window, gap explicit: {:?}",
+                plan.offlined
+            );
+            delta.loss += 1;
+        }
+        let (sync_pids, shortfall) = watermark_burst(&plan.burst);
         let mut watch = SyncWatch::new(&sync_pids);
         self.drain_await_sync(
             &mut delta,
             &mut watch,
             Instant::now() + SYNC_WATERMARK_TIMEOUT,
         );
-        wait_sync_children(&sync_pids);
+        reap_sync_children(&sync_pids);
         self.last_watermark = Some((watch.sought_count(), watch.seen_count()));
         if shortfall {
             delta.loss += 1;
@@ -1840,30 +1986,43 @@ pub enum LiveLifecycle {
     Polling(PollingLifecycle),
 }
 
-/// Connector facility probe outcome (R20-fix round 3, MINOR-A):
-/// whether a subscription succeeds and whether its socket Drops
-/// row is readable. COMPLETE/zero-loss tests need BOTH — an
-/// unreadable Drops table fails closed to loss, so drops-blind
-/// environments are supported PARTIAL, never COMPLETE. Test
-/// gates cache one probe per process (subscribing runs the
-/// initial watermark burst, so probing per test would spam).
+/// Connector facility probe outcome (R20-fix round 3, MINOR-A;
+/// watermark-clean round 4, MINOR): whether a subscription
+/// succeeds, whether its socket Drops row is readable, and
+/// whether the subscribe-time watermark burst covered every
+/// online CPU with no shortfall. COMPLETE/zero-loss tests need
+/// ALL THREE — an unreadable Drops table fails closed to loss,
+/// and restricted-affinity pinning records loss by design, so
+/// drops-blind or pin-limited environments are supported
+/// PARTIAL, never COMPLETE. Test gates cache one probe per
+/// process (subscribing runs the initial watermark burst, so
+/// probing per test would spam).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConnectorFacility {
     pub subscribes: bool,
     pub drops_readable: bool,
+    pub watermark_clean: bool,
 }
 
 /// Probe the connector facility once (balanced: the probe
 /// subscription unsubscribes on drop).
 pub fn connector_facility() -> ConnectorFacility {
     match KernelLifecycle::subscribe(std::process::id(), true) {
-        Ok(lc) => ConnectorFacility {
-            subscribes: true,
-            drops_readable: socket_drops(lc.sock_inode).is_some(),
-        },
+        Ok(lc) => {
+            let drops_readable = socket_drops(lc.sock_inode).is_some();
+            let online = online_cpus().len() as u32;
+            let watermark_clean = !lc.subscribe_shortfall
+                && matches!(lc.last_watermark, Some((s, v)) if s == v && s == online && s >= 1);
+            ConnectorFacility {
+                subscribes: true,
+                drops_readable,
+                watermark_clean,
+            }
+        }
         Err(_) => ConnectorFacility {
             subscribes: false,
             drops_readable: false,
+            watermark_clean: false,
         },
     }
 }
@@ -6289,6 +6448,8 @@ mod tests {
             released,
             pending_delta: LifecycleDelta::default(),
             last_watermark: None,
+            watermark_cpus: Vec::new(),
+            subscribe_shortfall: false,
         }
     }
 
@@ -6637,18 +6798,223 @@ mod tests {
     #[test]
     fn kernel_sync_watch_marks_fork_or_exit() {
         // F2: either watermark message (its child's FORK or EXIT)
-        // marks its CPU witnessed; foreign pids never mark.
+        // marks the RECEIVED event's CPU witnessed (round 4: the
+        // helper's intended CPU is never credited — migration
+        // matrix below); foreign pids never mark.
         let mut w = SyncWatch::new(&[(11, 0), (22, 1)]);
         assert!(!w.complete());
-        w.note(999);
+        w.note(999, 0);
         assert!(!w.complete());
         assert_eq!(w.seen_count(), 0);
-        w.note(11);
+        // Migrated FORK: pid 11's message arrives on lane 1 — lane
+        // 1 (genuinely advanced) marks, lane 0 stays unwitnessed.
+        w.note(11, 1);
         assert_eq!(w.seen_count(), 1);
         assert!(!w.complete());
-        w.note(22);
+        // A message on a non-required lane marks nothing.
+        w.note(11, 7);
+        assert_eq!(w.seen_count(), 1);
+        assert!(!w.complete());
+        // Home-lane message completes the remaining lane.
+        w.note(11, 0);
         assert!(w.complete());
         assert_eq!((w.sought_count(), w.seen_count()), (2, 2));
+    }
+
+    #[test]
+    fn kernel_migrated_sync_exit_must_not_complete_intended_lane() {
+        // R20-fix round 4, F2b RED (fails on FIX_BASE — the watch
+        // credits the helper's intended CPU from its pid without
+        // checking the received event's CPU): a sync helper pinned
+        // for CPU 0 whose EXIT arrives on CPU 1 (migrated — the
+        // kernel migrates tasks off a CPU going offline) must NOT
+        // complete lane 0's watermark. Forged EXIT ingested through
+        // the production `ingest_datagram` + watch path.
+        let mut lc = std::mem::ManuallyDrop::new(ingest_fixture(
+            HashSet::from([100u32]),
+            SeqState::default(),
+            false,
+        ));
+        let mut watch = SyncWatch::new(&[(11, 0)]);
+        let mut delta = LifecycleDelta::default();
+        // EXIT of CPU-0's helper (pid 11) arriving on CPU 1.
+        let migrated = cn_datagram_seq(
+            &proc_event_cpu(PROC_EVENT_EXIT, 1, &[11, 11, 0, 0, 0, 0]),
+            7,
+            0,
+        );
+        lc.ingest_datagram(&migrated, &mut delta, Some(&mut watch));
+        assert_eq!(delta.loss, 0, "well-formed EXIT is not scan loss");
+        assert!(
+            !watch.complete(),
+            "a migrated helper EXIT must not complete its intended lane"
+        );
+        assert_eq!(
+            watch.seen_count(),
+            0,
+            "no required lane witnessed yet: sought={} seen={}",
+            watch.sought_count(),
+            watch.seen_count()
+        );
+        // Positive control (passes pre+post): the same EXIT arriving
+        // on its intended lane completes the watermark.
+        let home = cn_datagram_seq(
+            &proc_event_cpu(PROC_EVENT_EXIT, 0, &[11, 11, 0, 0, 0, 0]),
+            8,
+            0,
+        );
+        lc.ingest_datagram(&home, &mut delta, Some(&mut watch));
+        assert!(watch.complete(), "home-lane EXIT must mark its lane");
+        unsafe { libc::close(lc.fd.as_raw_fd()) };
+    }
+
+    #[test]
+    fn kernel_close_cpu_plan_preserves_offlined_lanes() {
+        // R20-fix round 4, F2a RED (new-surface — `plan_close_cpus`
+        // does not exist on FIX_BASE): close must preserve the
+        // subscribe-time required lane set, not rebuild it from the
+        // current online count — a previously active CPU that went
+        // offline keeps its required lane (gapped explicitly, never
+        // silently dropped), and newly-online CPUs join the burst.
+        let stable = plan_close_cpus(&[0, 1, 2, 3], &[0, 1, 2, 3]);
+        assert_eq!(stable.required, vec![0, 1, 2, 3]);
+        assert!(stable.offlined.is_empty());
+        assert_eq!(stable.burst, vec![0, 1, 2, 3]);
+        let offlined = plan_close_cpus(&[0, 1, 2, 3], &[0, 1, 2]);
+        assert_eq!(
+            offlined.required,
+            vec![0, 1, 2, 3],
+            "the required lane set survives the offlining"
+        );
+        assert_eq!(offlined.offlined, vec![3]);
+        assert_eq!(
+            offlined.burst,
+            vec![0, 1, 2],
+            "the burst covers closable lanes; the offlined lane gaps explicitly"
+        );
+        let grown = plan_close_cpus(&[0, 1], &[0, 1, 2]);
+        assert_eq!(grown.required, vec![0, 1, 2]);
+        assert!(grown.offlined.is_empty());
+        assert_eq!(grown.burst, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn kernel_close_cpu_plan_reads_subscribe_time_set() {
+        // F2a wiring: the plan is built from the subscription's
+        // stored lane set (`watermark_cpus`), not from a fresh
+        // online count — a forged offlined lane (present at
+        // subscribe, absent now) must surface in the plan.
+        let mut lc = std::mem::ManuallyDrop::new(ingest_fixture(
+            HashSet::from([100u32]),
+            SeqState::default(),
+            false,
+        ));
+        let mut stored = online_cpus();
+        stored.push(u32::MAX);
+        stored.sort_unstable();
+        lc.watermark_cpus = stored.clone();
+        let plan = lc.close_cpu_plan();
+        assert!(
+            plan.required.contains(&u32::MAX),
+            "required set must preserve the subscribe-time lane: {:?}",
+            plan.required
+        );
+        assert_eq!(plan.offlined, vec![u32::MAX]);
+        assert!(
+            !plan.burst.contains(&u32::MAX),
+            "an offlined lane is gapped, not burst: {:?}",
+            plan.burst
+        );
+        unsafe { libc::close(lc.fd.as_raw_fd()) };
+    }
+
+    #[test]
+    fn kernel_stopped_sync_helper_must_not_block_reap() {
+        // R20-fix round 4, NEW-1: a watermark helper stopped before
+        // `_exit` (SIGSTOP — its FORK receipt may already have been
+        // awaited) must not block reaping indefinitely — the
+        // bounded owner escalates to SIGKILL and reaps. (RED ran
+        // against the BASE reaper on a thread with a bounded join:
+        // `reap of a stopped helper must be bounded (blocked >3s)`
+        // — the unbounded `waitpid(pid, …, 0)` never returned.
+        // Same property, new API — the old fn is deleted.)
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork for stopped helper");
+        if pid == 0 {
+            unsafe {
+                libc::raise(libc::SIGSTOP);
+                libc::pause();
+                libc::_exit(0);
+            }
+        }
+        let pid_u = pid as u32;
+        // Prove the fixture: the child is STOPPED (not exited).
+        let stop_end = Instant::now() + Duration::from_secs(5);
+        let stopped = loop {
+            let mut status = 0;
+            let r = unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED | libc::WNOHANG) };
+            if r == pid && libc::WIFSTOPPED(status) {
+                break true;
+            }
+            if Instant::now() >= stop_end {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert!(stopped, "fixture child must reach the stopped state");
+        // Short windows: grace must exhaust (the helper never
+        // exits on its own) and SIGKILL escalation must collect
+        // it — all promptly and with no zombie left behind.
+        let t0 = Instant::now();
+        reap_sync_children_grace(
+            &[(pid_u, 0)],
+            Duration::from_millis(100),
+            Duration::from_millis(200),
+        );
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "the reap must be bounded"
+        );
+        let mut status = 0;
+        let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        assert!(
+            r < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD),
+            "the stopped helper must be killed and reaped (no zombie): r={r}"
+        );
+        assert!(
+            std::fs::read_to_string(format!("/proc/{pid}/stat")).is_err(),
+            "no /proc residue for the reaped helper"
+        );
+    }
+
+    #[test]
+    fn kernel_reap_collects_exited_helpers_promptly() {
+        // NEW-1 positive control (passes pre+post by design — the
+        // ordinary path): immediate-exit helpers reap on the first
+        // sweep with no escalation and no residue.
+        let mut pids = Vec::new();
+        for _ in 0..4 {
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0, "fork for exited helper");
+            if pid == 0 {
+                unsafe { libc::_exit(0) };
+            }
+            pids.push((pid as u32, 0u32));
+        }
+        let t0 = Instant::now();
+        reap_sync_children_grace(&pids, Duration::from_secs(2), Duration::from_secs(1));
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "exited helpers must reap promptly"
+        );
+        for (pid, _) in &pids {
+            let mut status = 0;
+            let r = unsafe { libc::waitpid(*pid as libc::pid_t, &mut status, libc::WNOHANG) };
+            assert!(
+                r < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD),
+                "helper {pid} must be reaped: r={r}"
+            );
+        }
     }
 
     #[test]
