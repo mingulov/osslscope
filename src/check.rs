@@ -108,6 +108,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
     let mut builtin = false;
     let mut object: Option<String> = None;
     let mut count_object: Option<String> = None;
+    let mut members_object: Option<String> = None;
     let mut table_raw: Option<String> = None;
     let mut force_offset_raw: Option<String> = None;
     let mut provider_table_raw: Option<String> = None;
@@ -145,6 +146,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             }
             "--object" => object = Some(val(a)?),
             "--count-object" => count_object = Some(val(a)?),
+            "--members-object" => members_object = Some(val(a)?),
             "--table" => table_raw = Some(val(a)?),
             "--force-offset" => force_offset_raw = Some(val(a)?),
             "--provider-table" => provider_table_raw = Some(val(a)?),
@@ -265,6 +267,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         cfg: capture::Config {
             harvest_object: object.map(PathBuf::from),
             count_object: count_object.map(PathBuf::from),
+            members_object: members_object.map(PathBuf::from),
             provider: provider.map(PathBuf::from),
             builtin,
             table,
@@ -515,7 +518,7 @@ pub(crate) fn assemble_checked_document(
 }
 
 const USAGE: [&str; 2] = [
-    "usage: check [--duration S] [--provider P] [--object O] [--count-object C] [--table F] [--force-offset N] [--provider-table F] [rules] [--format human|json] [--out F] [--cbom FILE] [--builtin] [--settle S] [--timeout S] [--grace S] [--image-digest D] [--workload-out F] [--workload-out-fd N] {--pid P | run -- <cmd>}",
+    "usage: check [--duration S] [--provider P] [--object O] [--count-object C] [--members-object M] [--table F] [--force-offset N] [--provider-table F] [rules] [--format human|json] [--out F] [--cbom FILE] [--builtin] [--settle S] [--timeout S] [--grace S] [--image-digest D] [--workload-out F] [--workload-out-fd N] {--pid P | run -- <cmd>}",
     "rules: [--require-provider P] [--deny-provider P] [--deny-engine] [--deny-algorithm X] [--deny-weak] [--require-executed X] (repeatable; at least one required)",
 ];
 
@@ -673,6 +676,7 @@ mod tests {
             policy: None,
             legacy_partition: LegacyCallPartition::default(),
             engine_observations: Vec::new(),
+            traversal: None,
         })
     }
 
@@ -882,6 +886,7 @@ mod tests {
             policy: None,
             legacy_partition: LegacyCallPartition::default(),
             engine_observations: Vec::new(),
+            traversal: None,
         });
         let inconclusive = evaluate_document(
             std::slice::from_ref(&PolicyRule::deny_algorithm("AES-256-GCM")),
@@ -951,6 +956,7 @@ mod tests {
             policy: None,
             legacy_partition: LegacyCallPartition::default(),
             engine_observations: Vec::new(),
+            traversal: None,
         });
         let v = evaluate_document(
             &[
@@ -1092,6 +1098,7 @@ mod tests {
             policy: None,
             legacy_partition: LegacyCallPartition::default(),
             engine_observations: Vec::new(),
+            traversal: None,
         });
         let v = evaluate_document(
             std::slice::from_ref(&PolicyRule::deny_algorithm("DES")),

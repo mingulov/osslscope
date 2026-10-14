@@ -384,6 +384,38 @@ pub struct WalkDone {
     pub alg_count: usize,
     pub row_count: usize,
     pub guard: Option<wire::GuardEvent>,
+    /// Joined slot identities, idx order (Complete, Partial, and
+    /// Tainted records retain them; Skipped/Abandoned/Empty carry
+    /// what joined, possibly none).
+    pub algs: Vec<AlgIdentity>,
+    /// CALL-time in the backend clock domain (the capture passes
+    /// its monotonic base at attach, so this is capture-ns in
+    /// production — the inventory adaptation's event instant).
+    pub event_ns: u64,
+}
+
+/// One joined slot identity (the per-slot evidence a WALK-DONE
+/// retains for inventory adaptation — class + read status, not
+/// the full ring record).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AlgIdentity {
+    pub idx: u64,
+    pub class: u16,
+    pub status: u8,
+    pub weak: u8,
+}
+
+/// Joined slot identities of an open, in idx order.
+fn open_identities(o: &Open) -> Vec<AlgIdentity> {
+    o.algs
+        .iter()
+        .map(|(idx, a)| AlgIdentity {
+            idx: *idx,
+            class: a.class,
+            status: a.status,
+            weak: a.weak,
+        })
+        .collect()
 }
 
 /// Oracle finding (join-correctness and accounting — explicit).
@@ -573,6 +605,12 @@ impl Oracle {
         }
     }
 
+    /// Standing warm belief for an array, if any (the backend
+    /// warms idempotently — an identical rewrite reports nothing).
+    pub fn warm_belief(&self, arr: u64) -> Option<(u64, u64)> {
+        self.scope.as_ref()?.known_t.get(&arr).copied()
+    }
+
     /// Drop a warm belief (cache healing: grown tables and
     /// generation turnover invalidate; the next scan re-probes
     /// cold).
@@ -614,6 +652,8 @@ impl Oracle {
                     alg_count: o.algs.len(),
                     row_count: o.rows as usize,
                     guard: o.guard,
+                    algs: open_identities(&o),
+                    event_ns: o.first_seen_ns,
                 });
                 continue;
             }
@@ -630,6 +670,8 @@ impl Oracle {
                     alg_count: o.algs.len(),
                     row_count: o.rows as usize,
                     guard: o.guard,
+                    algs: open_identities(&o),
+                    event_ns: o.first_seen_ns,
                 });
                 continue;
             }
@@ -655,6 +697,8 @@ impl Oracle {
                 alg_count: o.algs.len(),
                 row_count: o.rows as usize,
                 guard: o.guard,
+                algs: open_identities(&o),
+                event_ns: o.first_seen_ns,
             });
         }
     }
@@ -767,6 +811,8 @@ impl Oracle {
                 alg_count: 0,
                 row_count: 0,
                 guard: None,
+                algs: Vec::new(),
+                event_ns: now_ns,
             });
             // R4: the skip deleted any standing record — opens
             // WITHOUT a joined RET can never complete (their
@@ -794,6 +840,8 @@ impl Oracle {
                     alg_count: o.algs.len(),
                     row_count: o.rows as usize,
                     guard: o.guard,
+                    algs: open_identities(&o),
+                    event_ns: o.first_seen_ns,
                 });
             }
             return;
@@ -832,6 +880,8 @@ impl Oracle {
                 alg_count: old.algs.len(),
                 row_count: old.rows as usize,
                 guard: old.guard,
+                algs: open_identities(&old),
+                event_ns: old.first_seen_ns,
             });
         }
         self.open.insert(
@@ -1029,6 +1079,8 @@ impl Oracle {
                 alg_count: o.algs.len(),
                 row_count: o.rows as usize,
                 guard: o.guard,
+                algs: open_identities(&o),
+                event_ns: o.first_seen_ns,
             });
         }
     }
@@ -1107,6 +1159,8 @@ impl Oracle {
                         alg_count: o.algs.len(),
                         row_count: o.rows as usize,
                         guard: o.guard,
+                        algs: open_identities(&o),
+                        event_ns: o.first_seen_ns,
                     });
                     continue;
                 }
@@ -1160,6 +1214,8 @@ impl Oracle {
                 alg_count: o.algs.len(),
                 row_count: o.rows as usize,
                 guard: o.guard,
+                algs: open_identities(&o),
+                event_ns: o.first_seen_ns,
             });
         }
     }
@@ -1247,6 +1303,8 @@ impl Oracle {
                     alg_count: o.algs.len(),
                     row_count: o.rows as usize,
                     guard: o.guard,
+                    algs: open_identities(&o),
+                    event_ns: o.first_seen_ns,
                 });
             }
         }
@@ -1268,6 +1326,8 @@ impl Oracle {
                         alg_count: o.algs.len(),
                         row_count: o.rows as usize,
                         guard: o.guard,
+                        algs: open_identities(&o),
+                        event_ns: o.first_seen_ns,
                     });
                     continue;
                 }
@@ -1328,17 +1388,26 @@ impl Oracle {
                 alg_count: o.algs.len(),
                 row_count: o.rows as usize,
                 guard: o.guard,
+                algs: open_identities(o),
+                event_ns: o.first_seen_ns,
             };
         }
 
         // Warm belief: the RET carries the invocation's array id +
         // generation directly (no ALG inference needed). A cached
         // entry under a foreign generation is turnover (cold
-        // rules + the stale row flagged for invalidation).
+        // rules + the stale row flagged for invalidation) —
+        // except generation 0, which the producer stamps when no
+        // epoch was recorded at fire time (GEN install happens at
+        // the first close, so the successor always stamps 0 and
+        // closes against epoch 1). Turnover-spanning opens never
+        // close normally (turnover abandons them), so observed 0
+        // is unrecorded-at-fire, never a superseded epoch: cold
+        // rules re-prove, no GenStale.
         let cached: Option<(u64, u64)> = scope.known_t.get(&ret.arr).copied();
         let warm: Option<u64> = cached.filter(|(_, g)| *g == ret.generation).map(|(t, _)| t);
         if let Some((_, g)) = cached {
-            if g != ret.generation {
+            if g != ret.generation && ret.generation != 0 {
                 reasons.push(PartialReason::GenStale {
                     expected: g,
                     observed: ret.generation,
@@ -1503,6 +1572,8 @@ impl Oracle {
             alg_count: o.algs.len(),
             row_count: o.rows as usize,
             guard: o.guard,
+            algs: open_identities(o),
+            event_ns: o.first_seen_ns,
         }
     }
 
