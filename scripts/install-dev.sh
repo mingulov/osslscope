@@ -1,7 +1,7 @@
 #!/bin/sh
 # install-dev.sh — local prefix install for development builds (R09/T13).
 #
-# Installs a build-dev.sh host binary plus both BPF objects into a
+# Installs a build-dev.sh host binary plus the BPF objects into a
 # user-owned prefix (default: $HOME/.local). This is the developer path to
 # a usable install; system packages (deb/rpm) remain the only /usr path and
 # are not final distributables during development.
@@ -10,12 +10,15 @@
 #   $PREFIX/bin/osslscope
 #   $PREFIX/lib/osslscope/osslscope-harvest
 #   $PREFIX/lib/osslscope/osslscope-count
+#   $PREFIX/lib/osslscope/osslscope-members (traversal runs only; pair-only
+#     installs stay valid — the members object installs only when the
+#     build manifest lists it or --members names it explicitly)
 #   $PREFIX/share/doc/osslscope/install.md
 #   $PREFIX/share/osslscope/install-manifest.json
 #
 # Artifact sources: the build-dev.sh manifest (default
 # <repo>/target/dev-build-manifest.json) or explicit operator-built object
-# paths (--binary/--harvest/--count), which override the manifest.
+# paths (--binary/--harvest/--count/--members), which override the manifest.
 #
 # Rules, not suggestions:
 #   - No auto-install: missing prerequisites fail with a diagnosis.
@@ -40,7 +43,8 @@
 #
 # Usage:
 #   scripts/install-dev.sh [--prefix PATH] [--manifest PATH]
-#                          [--binary F] [--harvest F] [--count F] [--setcap]
+#                          [--binary F] [--harvest F] [--count F] [--members F]
+#                          [--setcap]
 #
 # Exit codes: 0 ok; 2 usage error; 3 missing prerequisite (environment);
 # 1 install/validation/setup failure. A prerequisite failure is an
@@ -54,10 +58,11 @@ MANIFEST=""
 BIN_OVERRIDE=""
 HARVEST_OVERRIDE=""
 COUNT_OVERRIDE=""
+MEMBERS_OVERRIDE=""
 SETCAP=0
 
 usage() {
-    sed -n '2,39p' "$0"
+    sed -n '2,48p' "$0"
     echo "Exit codes: 0 ok; 2 usage; 3 missing prerequisite; 1 install/setup failure."
 }
 
@@ -73,6 +78,8 @@ while [ $# -gt 0 ]; do
         --harvest=*) HARVEST_OVERRIDE="${1#--harvest=}"; shift ;;
         --count) [ $# -ge 2 ] || { echo "error: --count needs a path" >&2; exit 2; }; COUNT_OVERRIDE="$2"; shift 2 ;;
         --count=*) COUNT_OVERRIDE="${1#--count=}"; shift ;;
+        --members) [ $# -ge 2 ] || { echo "error: --members needs a path" >&2; exit 2; }; MEMBERS_OVERRIDE="$2"; shift 2 ;;
+        --members=*) MEMBERS_OVERRIDE="${1#--members=}"; shift ;;
         --setcap) SETCAP=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "error: unknown argument: $1" >&2; usage >&2; exit 2 ;;
@@ -136,12 +143,12 @@ need_cmd mv "install coreutils, then re-run"
 need_cmd cmp "install diffutils, then re-run"
 
 # --- resolve artifact sources ---
-if [ -z "$BIN_OVERRIDE$HARVEST_OVERRIDE$COUNT_OVERRIDE" ] && [ ! -f "$MANIFEST" ]; then
+if [ -z "$BIN_OVERRIDE$HARVEST_OVERRIDE$COUNT_OVERRIDE$MEMBERS_OVERRIDE" ] && [ ! -f "$MANIFEST" ]; then
     echo "error: build manifest not found: $MANIFEST" >&2
     echo "hint: run scripts/build-dev.sh first, or pass explicit --binary/--harvest/--count paths." >&2
     exit 1
 fi
-if { [ -n "$BIN_OVERRIDE" ] || [ -n "$HARVEST_OVERRIDE" ] || [ -n "$COUNT_OVERRIDE" ]; } \
+if { [ -n "$BIN_OVERRIDE" ] || [ -n "$HARVEST_OVERRIDE" ] || [ -n "$COUNT_OVERRIDE" ] || [ -n "$MEMBERS_OVERRIDE" ]; } \
    && [ ! -f "$MANIFEST" ] \
    && { [ -z "$BIN_OVERRIDE" ] || [ -z "$HARVEST_OVERRIDE" ] || [ -z "$COUNT_OVERRIDE" ]; }; then
     echo "error: partial overrides with no manifest: pass all three of --binary/--harvest/--count, or build first with scripts/build-dev.sh." >&2
@@ -177,6 +184,7 @@ bpf = [a for a in m.get("artifacts", []) if a.get("role") == "bpf-object"]
 host = arts.get("host-binary", {})
 harvest = next((a for a in bpf if a.get("bin") == "osslscope-harvest"), {})
 count = next((a for a in bpf if a.get("bin") == "osslscope-count"), {})
+members = next((a for a in bpf if a.get("bin") == "osslscope-members"), {})
 def s(v):
     return "" if v is None else str(v)
 # One value per line: tab cannot delimit here (tab is IFS whitespace, so
@@ -187,7 +195,7 @@ def s(v):
 # identity. A newline in any emitted field is refused outright.
 vals = [
     s(host.get("path") or ""), s(harvest.get("path") or ""),
-    s(count.get("path") or ""),
+    s(count.get("path") or ""), s(members.get("path") or ""),
     s(m.get("product_ref") or ""), s(m.get("product_dirty", ""))]
 for v in vals:
     if "\n" in v or "\r" in v:
@@ -201,20 +209,23 @@ fi
 HOST_BIN="$BIN_OVERRIDE"
 HARVEST_OBJ="$HARVEST_OVERRIDE"
 COUNT_OBJ="$COUNT_OVERRIDE"
+MEMBERS_OBJ="$MEMBERS_OVERRIDE"
 PRODUCT_REF=""
 PRODUCT_DIRTY=""
 SEL_HOST="explicit-override"
 SEL_HARVEST="explicit-override"
 SEL_COUNT="explicit-override"
+SEL_MEMBERS="explicit-override"
 if [ -n "$MANIFEST_PATHS" ]; then
     # Pre-initialized: command substitution strips trailing empty lines, so
     # a manifest without revision keys would otherwise make the last read
     # hit EOF and abort under set -e. Missing keys mean empty metadata.
-    _m_host=""; _m_harvest=""; _m_count=""; _m_ref=""; _m_dirty=""
+    _m_host=""; _m_harvest=""; _m_count=""; _m_members=""; _m_ref=""; _m_dirty=""
     {
         IFS= read -r _m_host || true
         IFS= read -r _m_harvest || true
         IFS= read -r _m_count || true
+        IFS= read -r _m_members || true
         IFS= read -r _m_ref || true
         IFS= read -r _m_dirty || true
     } <<EOF2
@@ -223,6 +234,7 @@ EOF2
     if [ -z "$HOST_BIN" ]; then HOST_BIN="$_m_host"; SEL_HOST="manifest-verified"; fi
     if [ -z "$HARVEST_OBJ" ]; then HARVEST_OBJ="$_m_harvest"; SEL_HARVEST="manifest-verified"; fi
     if [ -z "$COUNT_OBJ" ]; then COUNT_OBJ="$_m_count"; SEL_COUNT="manifest-verified"; fi
+    if [ -z "$MEMBERS_OBJ" ]; then MEMBERS_OBJ="$_m_members"; SEL_MEMBERS="manifest-verified"; fi
     PRODUCT_REF="$_m_ref"
     PRODUCT_DIRTY="$_m_dirty"
 fi
@@ -230,10 +242,16 @@ fi
 [ -n "$HOST_BIN" ] || { echo "error: no host binary: manifest lists no host-binary artifact and --binary was not given (build with scripts/build-dev.sh)" >&2; exit 1; }
 [ -n "$HARVEST_OBJ" ] || { echo "error: no harvest object: manifest lists no osslscope-harvest artifact and --harvest was not given (build with scripts/build-dev.sh)" >&2; exit 1; }
 [ -n "$COUNT_OBJ" ] || { echo "error: no count object: manifest lists no osslscope-count artifact and --count was not given (build with scripts/build-dev.sh)" >&2; exit 1; }
+# Members is optional (pair-only installs stay valid): required checks
+# apply only when a members source resolved (manifest entry or override).
 for _a in "$HOST_BIN" "$HARVEST_OBJ" "$COUNT_OBJ"; do
     [ -f "$_a" ] || { echo "error: artifact not found: $_a (stale manifest? rebuild with scripts/build-dev.sh)" >&2; exit 1; }
     [ -s "$_a" ] || { echo "error: artifact is empty: $_a" >&2; exit 1; }
 done
+if [ -n "$MEMBERS_OBJ" ]; then
+    [ -f "$MEMBERS_OBJ" ] || { echo "error: artifact not found: $MEMBERS_OBJ (stale manifest? rebuild with scripts/build-dev.sh)" >&2; exit 1; }
+    [ -s "$MEMBERS_OBJ" ] || { echo "error: artifact is empty: $MEMBERS_OBJ" >&2; exit 1; }
+fi
 
 # --- stage: copy the complete artifact set aside, then validate the staged
 # bytes before touching the prefix, so any failure leaves an existing
@@ -242,18 +260,23 @@ done
 STAGE_HOST="$STAGE/host-binary"
 STAGE_HARVEST="$STAGE/bpf-harvest"
 STAGE_COUNT="$STAGE/bpf-count"
+STAGE_MEMBERS="$STAGE/bpf-members"
 cp "$HOST_BIN" "$STAGE_HOST" \
     || { echo "error: cannot stage host binary: $HOST_BIN" >&2; exit 1; }
 cp "$HARVEST_OBJ" "$STAGE_HARVEST" \
     || { echo "error: cannot stage harvest object: $HARVEST_OBJ" >&2; exit 1; }
 cp "$COUNT_OBJ" "$STAGE_COUNT" \
     || { echo "error: cannot stage count object: $COUNT_OBJ" >&2; exit 1; }
+if [ -n "$MEMBERS_OBJ" ]; then
+    cp "$MEMBERS_OBJ" "$STAGE_MEMBERS" \
+        || { echo "error: cannot stage members object: $MEMBERS_OBJ" >&2; exit 1; }
+fi
 
 # --- manifest integrity: manifest-selected entries must carry a valid
 # recorded sha256 + byte length and match the staged bytes that will be
 # installed. Explicit overrides are never checked against the manifest. ---
-export STAGE_HOST STAGE_HARVEST STAGE_COUNT MANIFEST MANIFEST_SNAP
-export SEL_HOST SEL_HARVEST SEL_COUNT
+export STAGE_HOST STAGE_HARVEST STAGE_COUNT STAGE_MEMBERS MANIFEST MANIFEST_SNAP
+export SEL_HOST SEL_HARVEST SEL_COUNT SEL_MEMBERS
 verify_staged() {
     # Checks staged bytes against the single manifest snapshot; called
     # before replacement and again before the receipt publishes.
@@ -265,6 +288,9 @@ jobs = [
     ("harvest object", e["STAGE_HARVEST"], e["SEL_HARVEST"]),
     ("count object", e["STAGE_COUNT"], e["SEL_COUNT"]),
 ]
+# Members is optional: verify only when a staged members object exists.
+if os.path.isfile(e.get("STAGE_MEMBERS") or ""):
+    jobs.append(("members object", e["STAGE_MEMBERS"], e.get("SEL_MEMBERS", "explicit-override")))
 # Selection and verification together: recorded identities come from the
 # single manifest snapshot, never through the flattened shell channel,
 # so a newline-bearing JSON value cannot spoof another artifact's
@@ -282,6 +308,7 @@ if any(sel == "manifest-verified" for _, _, sel in jobs):
         "host binary": arts.get("host-binary", {}),
         "harvest object": next((a for a in bpf if a.get("bin") == "osslscope-harvest"), {}),
         "count object": next((a for a in bpf if a.get("bin") == "osslscope-count"), {}),
+        "members object": next((a for a in bpf if a.get("bin") == "osslscope-members"), {}),
     }
 for role, staged, sel in jobs:
     if sel != "manifest-verified":
@@ -363,12 +390,16 @@ check_bpf() {
 }
 check_bpf "$STAGE_HARVEST" "$HARVEST_OBJ" harvest
 check_bpf "$STAGE_COUNT" "$COUNT_OBJ" count
+if [ -n "$MEMBERS_OBJ" ]; then
+    check_bpf "$STAGE_MEMBERS" "$MEMBERS_OBJ" members
+fi
 
 # --- install (from staged bytes: everything above already passed) ---
 mkdir -p "$PREFIX/bin" "$PREFIX/lib/osslscope" "$PREFIX/share/doc/osslscope" "$PREFIX/share/osslscope"
 BIN_DEST="$PREFIX/bin/osslscope"
 HARVEST_DEST="$PREFIX/lib/osslscope/osslscope-harvest"
 COUNT_DEST="$PREFIX/lib/osslscope/osslscope-count"
+MEMBERS_DEST="$PREFIX/lib/osslscope/osslscope-members"
 DOC_DEST="$PREFIX/share/doc/osslscope/install.md"
 INST_MANIFEST="$PREFIX/share/osslscope/install-manifest.json"
 # Each destination is replaced through a FRESH uniquely-owned temporary
@@ -379,7 +410,8 @@ INST_MANIFEST="$PREFIX/share/osslscope/install-manifest.json"
 # the install outright instead of being followed or reused, and the
 # cleanup trap below only ever removes paths this run created.
 for _legacy in "$BIN_DEST.install-tmp" "$HARVEST_DEST.install-tmp" \
-        "$COUNT_DEST.install-tmp" "$DOC_DEST.install-tmp" \
+        "$COUNT_DEST.install-tmp" "$MEMBERS_DEST.install-tmp" \
+        "$DOC_DEST.install-tmp" \
         "$INST_MANIFEST.install-tmp"; do
     if [ -e "$_legacy" ] || [ -L "$_legacy" ]; then
         if [ "$_legacy" = "$INST_MANIFEST.install-tmp" ]; then
@@ -396,11 +428,13 @@ HARVEST_TMP="$(mktemp "$HARVEST_DEST.install-tmp.XXXXXX")" \
     || { echo "error: cannot create temporary file for $HARVEST_DEST" >&2; exit 1; }
 COUNT_TMP="$(mktemp "$COUNT_DEST.install-tmp.XXXXXX")" \
     || { echo "error: cannot create temporary file for $COUNT_DEST" >&2; exit 1; }
+MEMBERS_TMP="$(mktemp "$MEMBERS_DEST.install-tmp.XXXXXX")" \
+    || { echo "error: cannot create temporary file for $MEMBERS_DEST" >&2; exit 1; }
 DOC_TMP="$(mktemp "$DOC_DEST.install-tmp.XXXXXX")" \
     || { echo "error: cannot create temporary file for $DOC_DEST" >&2; exit 1; }
 RECEIPT_TMP="$(mktemp "$INST_MANIFEST.install-tmp.XXXXXX")" \
     || { echo "error: cannot create temporary file for $INST_MANIFEST" >&2; exit 1; }
-trap 'rm -rf "$STAGE"; rm -f "$BIN_TMP" "$HARVEST_TMP" "$COUNT_TMP" "$DOC_TMP" "$RECEIPT_TMP"' EXIT INT TERM
+trap 'rm -rf "$STAGE"; rm -f "$BIN_TMP" "$HARVEST_TMP" "$COUNT_TMP" "$MEMBERS_TMP" "$DOC_TMP" "$RECEIPT_TMP"' EXIT INT TERM
 install_one() {
     # $1 = staged source, $2 = destination, $3 = temp file, $4 = mode, $5 = role label.
     # The temp file is a fresh mktemp path owned by this run; never write
@@ -419,6 +453,9 @@ install_one() {
 install_one "$STAGE_HOST" "$BIN_DEST" "$BIN_TMP" 755 "host binary"
 install_one "$STAGE_HARVEST" "$HARVEST_DEST" "$HARVEST_TMP" 644 "harvest object"
 install_one "$STAGE_COUNT" "$COUNT_DEST" "$COUNT_TMP" 644 "count object"
+if [ -n "$MEMBERS_OBJ" ]; then
+    install_one "$STAGE_MEMBERS" "$MEMBERS_DEST" "$MEMBERS_TMP" 644 "members object"
+fi
 # Publication verifies the bytes actually retained: the installed set
 # must still match the verified staged set before any receipt is written.
 cmp -s "$STAGE_HOST" "$BIN_DEST" \
@@ -427,6 +464,10 @@ cmp -s "$STAGE_HARVEST" "$HARVEST_DEST" \
     || { echo "error: installed harvest object no longer matches verified staged bytes: $HARVEST_DEST" >&2; exit 1; }
 cmp -s "$STAGE_COUNT" "$COUNT_DEST" \
     || { echo "error: installed count object no longer matches verified staged bytes: $COUNT_DEST" >&2; exit 1; }
+if [ -n "$MEMBERS_OBJ" ]; then
+    cmp -s "$STAGE_MEMBERS" "$MEMBERS_DEST" \
+        || { echo "error: installed members object no longer matches verified staged bytes: $MEMBERS_DEST" >&2; exit 1; }
+fi
 if [ -f "$REPO/docs/install.md" ]; then
     install_one "$REPO/docs/install.md" "$DOC_DEST" "$DOC_TMP" 644 "install doc"
 else
@@ -455,7 +496,7 @@ fi
 # publishing, so the receipt only ever records still-verified bytes.
 verify_staged
 export PREFIX MANIFEST PRODUCT_REF PRODUCT_DIRTY SETCAP_STATE REPO RECEIPT_TMP
-export HOST_BIN HARVEST_OBJ COUNT_OBJ
+export HOST_BIN HARVEST_OBJ COUNT_OBJ MEMBERS_OBJ
 python3 - "$INST_MANIFEST" <<'EOF' || exit 1
 import hashlib, json, os, subprocess, sys, datetime
 
@@ -505,6 +546,14 @@ arts = [
      "selection": e["SEL_COUNT"],
      "product_ref": ref(e["SEL_COUNT"]), "product_dirty": dirty(e["SEL_COUNT"])},
 ]
+if e.get("MEMBERS_OBJ"):
+    _msel = e.get("SEL_MEMBERS", "explicit-override")
+    arts.append(
+        {"role": "bpf-object", "bin": "osslscope-members",
+         "src": e["MEMBERS_OBJ"],
+         "dest": pfx + "/lib/osslscope/osslscope-members",
+         "selection": _msel,
+         "product_ref": ref(_msel), "product_dirty": dirty(_msel)})
 for a in arts:
     # Hashes of the installed bytes, which the retained-identity check
     # above proved still match the verified staged bytes.
@@ -541,6 +590,9 @@ echo "installed:"
 echo "  binary:  $PREFIX/bin/osslscope"
 echo "  harvest: $PREFIX/lib/osslscope/osslscope-harvest"
 echo "  count:   $PREFIX/lib/osslscope/osslscope-count"
+if [ -n "$MEMBERS_OBJ" ]; then
+    echo "  members: $PREFIX/lib/osslscope/osslscope-members"
+fi
 if [ -r /proc/self/status ]; then
     _nnp="$(grep '^NoNewPrivs:' /proc/self/status | awk '{print $2}')"
     echo "  NoNewPrivs (this shell): ${_nnp:-unknown}"

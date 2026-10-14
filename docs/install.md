@@ -29,7 +29,8 @@ prefix (default `$HOME/.local`):
 The prefix layout mirrors the system layout that automatic
 object discovery trusts — but a user-owned prefix is never
 trusted implicitly, so every `doctor`/`report`/`check` run from
-this prefix passes explicit `--object`/`--count-object` flags.
+this prefix passes explicit `--object`/`--count-object` flags
+(`--members-object` for the traversal object, when installed).
 Only the same `lib/osslscope/` layout under a root-owned system
 dir (`/usr/local/lib{,64}/osslscope`, `/usr/lib{,64}/osslscope`)
 resolves without flags:
@@ -38,6 +39,7 @@ resolves without flags:
 $PREFIX/bin/osslscope
 $PREFIX/lib/osslscope/osslscope-harvest
 $PREFIX/lib/osslscope/osslscope-count
+$PREFIX/lib/osslscope/osslscope-members   # traversal runs only; pair-only installs stay valid
 $PREFIX/share/doc/osslscope/install.md
 $PREFIX/share/osslscope/install-manifest.json
 ```
@@ -45,7 +47,9 @@ $PREFIX/share/osslscope/install-manifest.json
 The installer reads artifact paths from
 `target/dev-build-manifest.json`; pass `--manifest PATH` to use a
 different build, or `--binary F --harvest F --count F` to install
-explicit operator-built objects. The build manifest is read once per
+explicit operator-built objects (`--members F` adds an explicit
+traversal object — without it the members object installs only
+when the build manifest lists it). The build manifest is read once per
 run — revision metadata, hashes, and lengths all come from that single
 snapshot, and staged bytes are re-verified against it before the
 receipt publishes. The complete artifact set is staged
@@ -84,8 +88,11 @@ sudo setcap cap_bpf,cap_perfmon+ep "$HOME/.local/bin/osslscope"
 getcap "$HOME/.local/bin/osslscope"   # expect: cap_bpf,cap_perfmon+ep
 "$HOME/.local/bin/osslscope" doctor \
   --object "$HOME/.local/lib/osslscope/osslscope-harvest" \
-  --count-object "$HOME/.local/lib/osslscope/osslscope-count"
-# expect: verdict: ok
+  --count-object "$HOME/.local/lib/osslscope/osslscope-count" \
+  --members-object "$HOME/.local/lib/osslscope/osslscope-members"
+# expect: verdict: ok (the objects-members row reports pass; on a
+# pair-only install it reports info — traversal unavailable, the
+# harvest/count pair unaffected)
 "$HOME/.local/bin/osslscope" --help   # lists doctor|inspect|report|check|alias-audit
 ```
 

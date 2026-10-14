@@ -162,6 +162,10 @@ Non-target provenance:
   render, the fixed `(argv-redacted)` placeholder is used
   (`inspect --marker` matches `/proc` cmdline at admission and
   likewise emits nothing).
+- traversal tids: `/proc/<pid>/task` entry names (numeric tids for
+  BIRTH registration; the backend reads directory names only —
+  no target memory, and its map I/O touches only the §4
+  observer-owned maps).
 - `target.container_id`: selected cgroup path segment, else empty.
 - `image_digest`: caller-supplied CI value, not observed.
 - `kernel`: observer `uname` release.
