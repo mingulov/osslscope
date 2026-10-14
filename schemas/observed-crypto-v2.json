@@ -230,9 +230,33 @@
           }
         }
       }
+    },
+    "traversal": {
+      "description": "Traversal outcome (v2.1, optional — present iff the window ran the members backend): the exact selected triple plus record/findings/poll counts. Absent on harvest-only runs.",
+      "type": "object",
+      "required": ["harvest", "count", "members", "records", "findings", "polls"],
+      "additionalProperties": false,
+      "properties": {
+        "harvest": { "$ref": "#/$defs/traversal-object" },
+        "count": { "$ref": "#/$defs/traversal-object" },
+        "members": { "$ref": "#/$defs/traversal-object" },
+        "records": { "$ref": "#/$defs/u64" },
+        "findings": { "$ref": "#/$defs/u64" },
+        "polls": { "$ref": "#/$defs/u64" }
+      }
     }
   },
   "$defs": {
+    "traversal-object": {
+      "description": "One BPF object selected for the window: path locates for display, sha256 defines identity.",
+      "type": "object",
+      "required": ["path", "sha256"],
+      "additionalProperties": false,
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
     "u64": {
       "type": "integer",
       "minimum": 0,

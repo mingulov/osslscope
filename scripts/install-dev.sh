@@ -24,6 +24,13 @@
 #   - No auto-install: missing prerequisites fail with a diagnosis.
 #   - Fail closed on incompatible objects: the host binary must be an
 #     x86-64 ELF executable; BPF objects must be eBPF relocatables.
+#   - Staged verification (R08 mechanics, members included): the
+#     complete artifact set is copied aside, manifest-selected
+#     artifacts are checked against the build manifest's recorded
+#     sha256 + byte lengths, and the staged bytes are validated
+#     before the prefix is touched — any failure leaves an existing
+#     install byte-identical. Receipts publish only still-verified
+#     bytes (re-verified immediately before publication).
 #   - Never install into system package territory (/ or /usr).
 #   - --setcap is explicit and privileged in practice: failure is a
 #     deterministic error with a labeled-sudo fallback, never silent.
@@ -105,7 +112,10 @@ case "$_NORM" in
     /|/usr) echo "error: refusing system prefix '$PREFIX' (canonical path '$_NORM'): /usr is system package territory (use deb/rpm there); pick a local prefix such as \$HOME/.local" >&2; exit 2 ;;
 esac
 
-REPO="$(cd "$(dirname "$0")/.." && pwd)"
+# POSIX parameter expansion instead of dirname(1): this runs before the
+# prerequisite checks, so it cannot depend on any external tool.
+_d="${0%/*}"; [ "$_d" = "$0" ] && _d="."
+REPO="$(cd "$_d/.." && pwd)"
 if [ -z "$MANIFEST" ]; then MANIFEST="$REPO/target/dev-build-manifest.json"; fi
 
 fail_prereq() {
@@ -125,6 +135,10 @@ need_cmd readelf "install binutils (readelf validates object identity), then re-
 need_cmd cp "install coreutils, then re-run"
 need_cmd mkdir "install coreutils, then re-run"
 need_cmd chmod "install coreutils, then re-run"
+need_cmd mktemp "install coreutils (staging directory), then re-run"
+need_cmd cmp "install diffutils (staged/installed byte comparison), then re-run"
+need_cmd mv "install coreutils (atomic staged replacement), then re-run"
+need_cmd sed "install sed (ELF header screening), then re-run"
 
 # --- resolve artifact sources ---
 if [ -z "$BIN_OVERRIDE$HARVEST_OVERRIDE$COUNT_OVERRIDE$MEMBERS_OVERRIDE" ] && [ ! -f "$MANIFEST" ]; then
@@ -139,27 +153,53 @@ if { [ -n "$BIN_OVERRIDE" ] || [ -n "$HARVEST_OVERRIDE" ] || [ -n "$COUNT_OVERRI
     exit 1
 fi
 
-MANIFEST_PATHS=""
+# --- snapshot the manifest bytes once per run, before any read: every
+# later derivation (paths, revision, hashes, lengths) comes from this
+# single snapshot, so a manifest replaced mid-run cannot mix revision A
+# metadata with revision B hashes. ---
+STAGE="$(mktemp -d "${TMPDIR:-/tmp}/osslscope-install.XXXXXX")" \
+    || { echo "error: cannot create staging directory" >&2; exit 1; }
+trap 'rm -rf "$STAGE"' EXIT INT TERM
+MANIFEST_SNAP=""
 if [ -f "$MANIFEST" ]; then
-    MANIFEST_PATHS="$(python3 - "$MANIFEST" <<'EOF'
+    MANIFEST_SNAP="$STAGE/build-manifest.snapshot.json"
+    cp "$MANIFEST" "$MANIFEST_SNAP" \
+        || { echo "error: cannot snapshot build manifest: $MANIFEST" >&2; exit 1; }
+fi
+
+MANIFEST_PATHS=""
+if [ -n "$MANIFEST_SNAP" ]; then
+    MANIFEST_PATHS="$(python3 - "$MANIFEST_SNAP" "$MANIFEST" <<'EOF'
 import json, sys
 try:
     m = json.load(open(sys.argv[1]))
 except (OSError, ValueError) as e:
-    sys.exit("error: cannot parse build manifest %s: %s" % (sys.argv[1], e))
+    sys.exit("error: cannot parse build manifest %s: %s" % (sys.argv[2], e))
 if m.get("schema") != "osslscope-dev-build-manifest-v1":
-    sys.exit("error: unsupported build manifest schema %r in %s (want osslscope-dev-build-manifest-v1; rebuild with scripts/build-dev.sh)" % (m.get("schema"), sys.argv[1]))
+    sys.exit("error: unsupported build manifest schema %r in %s (want osslscope-dev-build-manifest-v1; rebuild with scripts/build-dev.sh)" % (m.get("schema"), sys.argv[2]))
 arts = {a.get("role"): a for a in m.get("artifacts", [])}
 bpf = [a for a in m.get("artifacts", []) if a.get("role") == "bpf-object"]
-host = arts.get("host-binary", {}).get("path", "")
-harvest = next((a.get("path", "") for a in bpf if a.get("bin") == "osslscope-harvest"), "")
-count = next((a.get("path", "") for a in bpf if a.get("bin") == "osslscope-count"), "")
-members = next((a.get("path", "") for a in bpf if a.get("bin") == "osslscope-members"), "")
+host = arts.get("host-binary", {})
+harvest = next((a for a in bpf if a.get("bin") == "osslscope-harvest"), {})
+count = next((a for a in bpf if a.get("bin") == "osslscope-count"), {})
+members = next((a for a in bpf if a.get("bin") == "osslscope-members"), {})
+def s(v):
+    return "" if v is None else str(v)
 # One value per line: tab cannot delimit here (tab is IFS whitespace, so
 # consecutive tabs collapse and empty fields vanish — a host-only manifest
-# would misparse). Paths with newlines are not supported.
-print("%s\n%s\n%s\n%s\n%s\n%s" % (host, harvest, count, members,
-      m.get("product_ref") or "", str(m.get("product_dirty", ""))))
+# would misparse). Recorded sha256/byte lengths are NOT flattened here:
+# the verifier below reads them from the manifest itself, so a hostile
+# field value cannot shift positional reads and spoof another artifact's
+# identity. A newline in any emitted field is refused outright.
+vals = [
+    s(host.get("path") or ""), s(harvest.get("path") or ""),
+    s(count.get("path") or ""), s(members.get("path") or ""),
+    s(m.get("product_ref") or ""), s(m.get("product_dirty", ""))]
+for v in vals:
+    if "\n" in v or "\r" in v:
+        sys.exit("error: build manifest %s carries a newline in a field "
+                 "value (refusing to parse)" % sys.argv[2])
+print("\n".join(vals))
 EOF
 )" || exit 1
 fi
@@ -170,6 +210,10 @@ COUNT_OBJ="$COUNT_OVERRIDE"
 MEMBERS_OBJ="$MEMBERS_OVERRIDE"
 PRODUCT_REF=""
 PRODUCT_DIRTY=""
+SEL_HOST="explicit-override"
+SEL_HARVEST="explicit-override"
+SEL_COUNT="explicit-override"
+SEL_MEMBERS="explicit-override"
 if [ -n "$MANIFEST_PATHS" ]; then
     # Pre-initialized: command substitution strips trailing empty lines, so
     # a manifest without revision keys would otherwise make the last read
@@ -185,13 +229,19 @@ if [ -n "$MANIFEST_PATHS" ]; then
     } <<EOF2
 $MANIFEST_PATHS
 EOF2
-    [ -n "$HOST_BIN" ] || HOST_BIN="$_m_host"
-    [ -n "$HARVEST_OBJ" ] || HARVEST_OBJ="$_m_harvest"
-    [ -n "$COUNT_OBJ" ] || COUNT_OBJ="$_m_count"
-    [ -n "$MEMBERS_OBJ" ] || MEMBERS_OBJ="$_m_members"
+    if [ -z "$HOST_BIN" ]; then HOST_BIN="$_m_host"; SEL_HOST="manifest-verified"; fi
+    if [ -z "$HARVEST_OBJ" ]; then HARVEST_OBJ="$_m_harvest"; SEL_HARVEST="manifest-verified"; fi
+    if [ -z "$COUNT_OBJ" ]; then COUNT_OBJ="$_m_count"; SEL_COUNT="manifest-verified"; fi
+    # Members is optional (pair-only installs stay valid): an empty
+    # manifest entry is not-installed, never verified.
+    if [ -z "$MEMBERS_OBJ" ]; then
+        MEMBERS_OBJ="$_m_members"
+        if [ -n "$MEMBERS_OBJ" ]; then SEL_MEMBERS="manifest-verified"; else SEL_MEMBERS="not-installed"; fi
+    fi
     PRODUCT_REF="$_m_ref"
     PRODUCT_DIRTY="$_m_dirty"
 fi
+if [ -z "$MEMBERS_OBJ" ]; then SEL_MEMBERS="not-installed"; fi
 
 [ -n "$HOST_BIN" ] || { echo "error: no host binary: manifest lists no host-binary artifact and --binary was not given (build with scripts/build-dev.sh)" >&2; exit 1; }
 [ -n "$HARVEST_OBJ" ] || { echo "error: no harvest object: manifest lists no osslscope-harvest artifact and --harvest was not given (build with scripts/build-dev.sh)" >&2; exit 1; }
@@ -207,50 +257,226 @@ if [ -n "$MEMBERS_OBJ" ]; then
     [ -s "$MEMBERS_OBJ" ] || { echo "error: artifact is empty: $MEMBERS_OBJ" >&2; exit 1; }
 fi
 
-# --- fail-closed object validation ---
-HOST_FILE="$(file -b "$HOST_BIN")"
+# --- stage: copy the complete artifact set aside, then validate the staged
+# bytes before touching the prefix, so any failure leaves an existing
+# install byte-identical (the staging dir was created beside the manifest
+# snapshot above, before any read) ---
+STAGE_HOST="$STAGE/host-binary"
+STAGE_HARVEST="$STAGE/bpf-harvest"
+STAGE_COUNT="$STAGE/bpf-count"
+STAGE_MEMBERS="$STAGE/bpf-members"
+cp "$HOST_BIN" "$STAGE_HOST" \
+    || { echo "error: cannot stage host binary: $HOST_BIN" >&2; exit 1; }
+cp "$HARVEST_OBJ" "$STAGE_HARVEST" \
+    || { echo "error: cannot stage harvest object: $HARVEST_OBJ" >&2; exit 1; }
+cp "$COUNT_OBJ" "$STAGE_COUNT" \
+    || { echo "error: cannot stage count object: $COUNT_OBJ" >&2; exit 1; }
+if [ -n "$MEMBERS_OBJ" ]; then
+    cp "$MEMBERS_OBJ" "$STAGE_MEMBERS" \
+        || { echo "error: cannot stage members object: $MEMBERS_OBJ" >&2; exit 1; }
+fi
+
+# --- manifest integrity: manifest-selected entries must carry a valid
+# recorded sha256 + byte length and match the staged bytes that will be
+# installed. Explicit overrides are never checked against the manifest. ---
+export STAGE_HOST STAGE_HARVEST STAGE_COUNT STAGE_MEMBERS MANIFEST MANIFEST_SNAP
+export SEL_HOST SEL_HARVEST SEL_COUNT SEL_MEMBERS
+verify_staged() {
+    # Checks staged bytes against the single manifest snapshot; called
+    # before replacement and again before the receipt publishes.
+    python3 - <<'EOF' || exit 1
+import hashlib, json, os, re, sys
+e = os.environ
+jobs = [
+    ("host binary", e["STAGE_HOST"], e["SEL_HOST"]),
+    ("harvest object", e["STAGE_HARVEST"], e["SEL_HARVEST"]),
+    ("count object", e["STAGE_COUNT"], e["SEL_COUNT"]),
+]
+if e.get("SEL_MEMBERS") == "manifest-verified":
+    jobs.append(("members object", e["STAGE_MEMBERS"], e["SEL_MEMBERS"]))
+# Selection and verification together: recorded identities come from the
+# single manifest snapshot, never through the flattened shell channel,
+# so a newline-bearing JSON value cannot spoof another artifact's
+# identity and a mid-run manifest swap cannot mix revisions.
+recorded = {}
+if any(sel == "manifest-verified" for _, _, sel in jobs):
+    try:
+        with open(e.get("MANIFEST_SNAP")) as f:
+            m = json.load(f)
+    except (OSError, ValueError, TypeError) as ex:
+        sys.exit("error: cannot re-read build manifest %s: %s" % (e.get("MANIFEST"), ex))
+    arts = {a.get("role"): a for a in m.get("artifacts", [])}
+    bpf = [a for a in m.get("artifacts", []) if a.get("role") == "bpf-object"]
+    recorded = {
+        "host binary": arts.get("host-binary", {}),
+        "harvest object": next((a for a in bpf if a.get("bin") == "osslscope-harvest"), {}),
+        "count object": next((a for a in bpf if a.get("bin") == "osslscope-count"), {}),
+        "members object": next((a for a in bpf if a.get("bin") == "osslscope-members"), {}),
+    }
+for role, staged, sel in jobs:
+    if sel != "manifest-verified":
+        continue
+    where = "build manifest %s" % e.get("MANIFEST")
+    rec = recorded.get(role, {})
+    sha = rec.get("sha256")
+    nbytes = rec.get("bytes")
+    if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", sha):
+        sys.exit("error: %s entry in %s records no valid sha256 "
+                 "(rebuild with scripts/build-dev.sh to re-record artifact identity)" % (role, where))
+    if isinstance(nbytes, bool) or not (isinstance(nbytes, int)
+            or (isinstance(nbytes, str) and re.fullmatch(r"[0-9]+", nbytes))):
+        sys.exit("error: %s entry in %s records no valid byte length "
+                 "(rebuild with scripts/build-dev.sh to re-record artifact identity)" % (role, where))
+    actual_len = os.path.getsize(staged)
+    if actual_len != int(nbytes):
+        sys.exit("error: staged %s does not match %s: byte length %d != recorded %s "
+                 "(stale manifest or modified bytes? rebuild with scripts/build-dev.sh)" % (role, where, actual_len, nbytes))
+    h = hashlib.sha256()
+    with open(staged, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    if h.hexdigest() != sha.lower():
+        sys.exit("error: staged %s does not match %s: sha256 %s != recorded %s "
+                 "(stale manifest or modified bytes? rebuild with scripts/build-dev.sh)" % (role, where, h.hexdigest(), sha.lower()))
+EOF
+}
+verify_staged
+
+# --- fail-closed object validation (on staged bytes) ---
+HOST_FILE="$(file -b "$STAGE_HOST")"
 case "$HOST_FILE" in
     *ELF*x86-64*)
-        [ -x "$HOST_BIN" ] || { echo "error: host binary is not executable: $HOST_BIN" >&2; exit 1; }
+        [ -x "$STAGE_HOST" ] || { echo "error: host binary is not executable: $HOST_BIN" >&2; exit 1; }
         ;;
     *) echo "error: incompatible host binary (want x86-64 ELF executable): $HOST_BIN: $HOST_FILE" >&2; exit 1 ;;
 esac
 
 check_bpf() {
-    # $1 = path, $2 = which flag (for the hint)
+    # $1 = staged path, $2 = operator-facing source path, $3 = which flag (for the hint).
+    # Screens the ELF header for a relocatable BPF object; whether the
+    # object is usable for a role stays a loader/doctor decision, not the
+    # installer's.
+    _hdr="$(readelf -h "$1" 2>/dev/null || true)"
+    _val() { echo "$_hdr" | sed -n "s/^ *$1: *//p"; }
+    _class="$(_val Class)"; _data="$(_val Data)"
+    _type="$(_val Type)"; _mach="$(_val Machine)"
+    _want="want eBPF relocatable (ELF64 little-endian EM_BPF ET_REL)"
+    # Positional params inside _bad_elf are its own, so the operator-facing
+    # source and flag name travel in (global) shell variables.
+    _bpf_src="$2"; _bpf_which="$3"
+    _bad_elf() {
+        echo "error: incompatible BPF object ($_want): $_bpf_src: $1" >&2
+        echo "hint: rebuild with scripts/build-dev.sh, or pass an operator-built $_bpf_which object for this machine." >&2
+        exit 1
+    }
+    case " $_class " in
+        *" ELF64 "*) ;;
+        *) _bad_elf "Class is ${_class:-unreadable ELF header}" ;;
+    esac
+    case " $_data " in
+        *" little endian "*) ;;
+        *) _bad_elf "Data is ${_data:-unreadable ELF header}" ;;
+    esac
+    case " $_type " in
+        *" REL "*) ;;
+        *) _bad_elf "Type is ${_type:-unreadable ELF header}" ;;
+    esac
+    case " $_mach " in
+        *" BPF "*) ;;
+        *) _bad_elf "Machine is ${_mach:-unreadable ELF header}" ;;
+    esac
     _f="$(file -b "$1")"
     case "$_f" in
         *ELF*eBPF*) ;;
-        *) echo "error: incompatible BPF object (want eBPF relocatable): $1: $_f" >&2
-           echo "hint: rebuild with scripts/build-dev.sh, or pass an operator-built $2 object for this machine." >&2
-           exit 1 ;;
-    esac
-    _m="$(readelf -h "$1" 2>/dev/null | grep 'Machine:' || true)"
-    case "$_m" in
-        *BPF*) ;;
-        *) echo "error: incompatible BPF object (readelf Machine is not BPF): $1: ${_m:-unreadable}" >&2; exit 1 ;;
+        *) _bad_elf "$_f" ;;
     esac
 }
-check_bpf "$HARVEST_OBJ" harvest
-check_bpf "$COUNT_OBJ" count
+check_bpf "$STAGE_HARVEST" "$HARVEST_OBJ" harvest
+check_bpf "$STAGE_COUNT" "$COUNT_OBJ" count
 if [ -n "$MEMBERS_OBJ" ]; then
-    check_bpf "$MEMBERS_OBJ" members
+    check_bpf "$STAGE_MEMBERS" "$MEMBERS_OBJ" members
 fi
 
-# --- install ---
+# --- install (from staged bytes: everything above already passed) ---
 mkdir -p "$PREFIX/bin" "$PREFIX/lib/osslscope" "$PREFIX/share/doc/osslscope" "$PREFIX/share/osslscope"
-cp "$HOST_BIN" "$PREFIX/bin/osslscope"
-chmod 755 "$PREFIX/bin/osslscope"
-cp "$HARVEST_OBJ" "$PREFIX/lib/osslscope/osslscope-harvest"
-cp "$COUNT_OBJ" "$PREFIX/lib/osslscope/osslscope-count"
-chmod 644 "$PREFIX/lib/osslscope/osslscope-harvest" "$PREFIX/lib/osslscope/osslscope-count"
+BIN_DEST="$PREFIX/bin/osslscope"
+HARVEST_DEST="$PREFIX/lib/osslscope/osslscope-harvest"
+COUNT_DEST="$PREFIX/lib/osslscope/osslscope-count"
+MEMBERS_DEST="$PREFIX/lib/osslscope/osslscope-members"
+DOC_DEST="$PREFIX/share/doc/osslscope/install.md"
+INST_MANIFEST="$PREFIX/share/osslscope/install-manifest.json"
+# Each destination is replaced through a FRESH uniquely-owned temporary
+# file (mktemp, one per run: copy plus chmod plus rename), so a symlink
+# or hardlink alias at an existing destination cannot clobber an already
+# installed artifact, and each single-file replacement is atomic. A
+# pre-existing "<dest>.install-tmp" path — leftover or alias — refuses
+# the install outright instead of being followed or reused, and the
+# cleanup trap below only ever removes paths this run created.
+for _legacy in "$BIN_DEST.install-tmp" "$HARVEST_DEST.install-tmp" \
+        "$COUNT_DEST.install-tmp" "$MEMBERS_DEST.install-tmp" \
+        "$DOC_DEST.install-tmp" \
+        "$INST_MANIFEST.install-tmp"; do
+    if [ -e "$_legacy" ] || [ -L "$_legacy" ]; then
+        if [ "$_legacy" = "$INST_MANIFEST.install-tmp" ]; then
+            echo "error: refusing to publish install receipt: stale temporary path already exists: $_legacy (remove it and re-run)" >&2
+        else
+            echo "error: refusing to install: stale temporary path already exists: $_legacy (remove it and re-run)" >&2
+        fi
+        exit 1
+    fi
+done
+BIN_TMP="$(mktemp "$BIN_DEST.install-tmp.XXXXXX")" \
+    || { echo "error: cannot create temporary file for $BIN_DEST" >&2; exit 1; }
+HARVEST_TMP="$(mktemp "$HARVEST_DEST.install-tmp.XXXXXX")" \
+    || { echo "error: cannot create temporary file for $HARVEST_DEST" >&2; exit 1; }
+COUNT_TMP="$(mktemp "$COUNT_DEST.install-tmp.XXXXXX")" \
+    || { echo "error: cannot create temporary file for $COUNT_DEST" >&2; exit 1; }
+DOC_TMP="$(mktemp "$DOC_DEST.install-tmp.XXXXXX")" \
+    || { echo "error: cannot create temporary file for $DOC_DEST" >&2; exit 1; }
+RECEIPT_TMP="$(mktemp "$INST_MANIFEST.install-tmp.XXXXXX")" \
+    || { echo "error: cannot create temporary file for $INST_MANIFEST" >&2; exit 1; }
 if [ -n "$MEMBERS_OBJ" ]; then
-    cp "$MEMBERS_OBJ" "$PREFIX/lib/osslscope/osslscope-members"
-    chmod 644 "$PREFIX/lib/osslscope/osslscope-members"
+    MEMBERS_TMP="$(mktemp "$MEMBERS_DEST.install-tmp.XXXXXX")" \
+        || { echo "error: cannot create temporary file for $MEMBERS_DEST" >&2; exit 1; }
+else
+    MEMBERS_TMP=""
+fi
+trap 'rm -rf "$STAGE"; rm -f "$BIN_TMP" "$HARVEST_TMP" "$COUNT_TMP" "$DOC_TMP" "$RECEIPT_TMP" "$MEMBERS_TMP"' EXIT INT TERM
+install_one() {
+    # $1 = staged source, $2 = destination, $3 = temp file, $4 = mode, $5 = role label.
+    # The temp file is a fresh mktemp path owned by this run; never write
+    # through it if it stopped being a plain file.
+    if [ -L "$3" ]; then
+        echo "error: refusing to install $5: temporary path is no longer a plain file: $3" >&2
+        exit 1
+    fi
+    cp "$1" "$3" \
+        || { echo "error: cannot install $5 to $2" >&2; exit 1; }
+    chmod "$4" "$3" \
+        || { echo "error: cannot set permissions on $2" >&2; exit 1; }
+    mv "$3" "$2" \
+        || { echo "error: cannot install $5 to $2" >&2; exit 1; }
+}
+install_one "$STAGE_HOST" "$BIN_DEST" "$BIN_TMP" 755 "host binary"
+install_one "$STAGE_HARVEST" "$HARVEST_DEST" "$HARVEST_TMP" 644 "harvest object"
+install_one "$STAGE_COUNT" "$COUNT_DEST" "$COUNT_TMP" 644 "count object"
+if [ -n "$MEMBERS_OBJ" ]; then
+    install_one "$STAGE_MEMBERS" "$MEMBERS_DEST" "$MEMBERS_TMP" 644 "members object"
+fi
+# Publication verifies the bytes actually retained: the installed set
+# must still match the verified staged set before any receipt is written.
+cmp -s "$STAGE_HOST" "$BIN_DEST" \
+    || { echo "error: installed binary no longer matches verified staged bytes: $BIN_DEST" >&2; exit 1; }
+cmp -s "$STAGE_HARVEST" "$HARVEST_DEST" \
+    || { echo "error: installed harvest object no longer matches verified staged bytes: $HARVEST_DEST" >&2; exit 1; }
+cmp -s "$STAGE_COUNT" "$COUNT_DEST" \
+    || { echo "error: installed count object no longer matches verified staged bytes: $COUNT_DEST" >&2; exit 1; }
+if [ -n "$MEMBERS_OBJ" ]; then
+    cmp -s "$STAGE_MEMBERS" "$MEMBERS_DEST" \
+        || { echo "error: installed members object no longer matches verified staged bytes: $MEMBERS_DEST" >&2; exit 1; }
 fi
 if [ -f "$REPO/docs/install.md" ]; then
-    cp "$REPO/docs/install.md" "$PREFIX/share/doc/osslscope/install.md"
-    chmod 644 "$PREFIX/share/doc/osslscope/install.md"
+    install_one "$REPO/docs/install.md" "$DOC_DEST" "$DOC_TMP" 644 "install doc"
 else
     echo "note: $REPO/docs/install.md absent; skipping doc install." >&2
 fi
@@ -272,11 +498,14 @@ if [ "$SETCAP" -eq 1 ]; then
     fi
 fi
 
-# --- install manifest ---
-export PREFIX MANIFEST PRODUCT_REF PRODUCT_DIRTY SETCAP_STATE REPO
+# --- install manifest (published atomically via temp file + rename) ---
+# Re-verify the staged bytes against the single manifest snapshot before
+# publishing, so the receipt only ever records still-verified bytes.
+verify_staged
+export PREFIX MANIFEST PRODUCT_REF PRODUCT_DIRTY SETCAP_STATE REPO RECEIPT_TMP
 export HOST_BIN HARVEST_OBJ COUNT_OBJ MEMBERS_OBJ
-INST_MANIFEST="$PREFIX/share/osslscope/install-manifest.json"
-python3 - "$INST_MANIFEST" <<'EOF'
+export SEL_HOST SEL_HARVEST SEL_COUNT SEL_MEMBERS
+python3 - "$INST_MANIFEST" <<'EOF' || exit 1
 import hashlib, json, os, subprocess, sys, datetime
 
 def ident(path):
@@ -303,34 +532,64 @@ def ident(path):
 
 e = os.environ
 pfx = e["PREFIX"]
+# Provenance is per artifact: a manifest-verified artifact keeps the build
+# manifest's revision; an explicit override has no recorded revision, so it
+# stays unknown (null) rather than asserting the unrelated manifest's.
+def ref(sel):
+    return (e.get("PRODUCT_REF") or None) if sel == "manifest-verified" else None
+def dirty(sel):
+    return {"True": True, "False": False}.get(e.get("PRODUCT_DIRTY")) \
+        if sel == "manifest-verified" else None
 arts = [
     {"role": "host-binary", "src": e["HOST_BIN"],
-     "dest": pfx + "/bin/osslscope"},
+     "dest": pfx + "/bin/osslscope",
+     "selection": e["SEL_HOST"],
+     "product_ref": ref(e["SEL_HOST"]), "product_dirty": dirty(e["SEL_HOST"])},
     {"role": "bpf-object", "bin": "osslscope-harvest",
-     "src": e["HARVEST_OBJ"], "dest": pfx + "/lib/osslscope/osslscope-harvest"},
+     "src": e["HARVEST_OBJ"], "dest": pfx + "/lib/osslscope/osslscope-harvest",
+     "selection": e["SEL_HARVEST"],
+     "product_ref": ref(e["SEL_HARVEST"]), "product_dirty": dirty(e["SEL_HARVEST"])},
     {"role": "bpf-object", "bin": "osslscope-count",
-     "src": e["COUNT_OBJ"], "dest": pfx + "/lib/osslscope/osslscope-count"},
+     "src": e["COUNT_OBJ"], "dest": pfx + "/lib/osslscope/osslscope-count",
+     "selection": e["SEL_COUNT"],
+     "product_ref": ref(e["SEL_COUNT"]), "product_dirty": dirty(e["SEL_COUNT"])},
 ]
 if e.get("MEMBERS_OBJ"):
     arts.append(
         {"role": "bpf-object", "bin": "osslscope-members",
          "src": e["MEMBERS_OBJ"],
-         "dest": pfx + "/lib/osslscope/osslscope-members"})
+         "dest": pfx + "/lib/osslscope/osslscope-members",
+         "selection": e["SEL_MEMBERS"],
+         "product_ref": ref(e["SEL_MEMBERS"]), "product_dirty": dirty(e["SEL_MEMBERS"])},
+    )
 for a in arts:
+    # Hashes of the installed bytes, which the retained-identity check
+    # above proved still match the verified staged bytes.
     a.update(ident(a["dest"]))
+all_verified = all(a["selection"] == "manifest-verified" for a in arts)
 manifest = {
     "schema": "osslscope-install-manifest-v1",
     "installed_at_utc": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     "prefix": pfx,
     "build_manifest": e.get("MANIFEST") or None,
-    "product_ref": e.get("PRODUCT_REF") or None,
-    "product_dirty": {"True": True, "False": False}.get(e.get("PRODUCT_DIRTY")),
+    "product_ref": (e.get("PRODUCT_REF") or None) if all_verified else None,
+    "product_dirty": {"True": True, "False": False}.get(e.get("PRODUCT_DIRTY")) if all_verified else None,
     "setcap": e.get("SETCAP_STATE"),
     "artifacts": arts,
 }
-with open(sys.argv[1], "w") as f:
-    json.dump(manifest, f, indent=2, sort_keys=True)
-    f.write("\n")
+tmp = e.get("RECEIPT_TMP") or None
+if not tmp:
+    sys.exit("error: cannot write install receipt %s: no temporary path" % sys.argv[1])
+try:
+    # The temp file is a fresh mktemp path owned by this run; O_NOFOLLOW
+    # refuses to write through it if it stopped being a plain file.
+    fd = os.open(tmp, os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW)
+    with os.fdopen(fd, "w") as f:
+        json.dump(manifest, f, indent=2, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp, sys.argv[1])
+except OSError as ex:
+    sys.exit("error: cannot write install receipt %s: %s" % (sys.argv[1], ex))
 print("install manifest: " + sys.argv[1])
 EOF
 

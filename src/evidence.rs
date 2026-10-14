@@ -632,6 +632,7 @@ pub struct FinalizeInput {
     pub disposition: Option<DispositionRecord>,
     pub policy: Option<PolicyRecord>,
     pub legacy_partition: LegacyCallPartition,
+    pub traversal: Option<TraversalRecord>,
 }
 
 /// Legacy call partition (H8): per-site callback executions split
@@ -681,6 +682,30 @@ pub struct CaptureDocument {
     pub disposition: Option<DispositionRecord>,
     pub policy: Option<PolicyRecord>,
     pub legacy_partition: LegacyCallPartition,
+    /// Traversal outcome (v2.1, optional — present iff the window
+    /// ran the members backend): the exact selected triple
+    /// (paths + sha256, so doctor/report/check agree) plus
+    /// record/findings/poll counts. Absent on harvest-only runs.
+    pub traversal: Option<TraversalRecord>,
+}
+
+/// One BPF object selected for the window (path locates for
+/// display; sha256 defines identity).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct TraversalObject {
+    pub path: String,
+    pub sha256: String,
+}
+
+/// Traversal outcome summary (see [`CaptureDocument::traversal`]).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct TraversalRecord {
+    pub harvest: TraversalObject,
+    pub count: TraversalObject,
+    pub members: TraversalObject,
+    pub records: u64,
+    pub findings: u64,
+    pub polls: u64,
 }
 
 impl CaptureDocument {
@@ -798,5 +823,6 @@ pub fn finalize(mut input: FinalizeInput) -> CaptureDocument {
         disposition: input.disposition,
         policy: input.policy,
         legacy_partition: input.legacy_partition,
+        traversal: input.traversal,
     }
 }
