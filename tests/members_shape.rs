@@ -32,7 +32,7 @@ fn is_required() -> bool {
     matches!(std::env::var("OSSL_MEMBERS_REQUIRED").as_deref(), Ok("1"))
 }
 
-/// Missing-object branch shared by the nine object-backed tests:
+/// Missing-object branch shared by the object-backed tests:
 /// loud FAIL in required mode, clearly labeled optional-mode SKIP
 /// otherwise.
 fn no_object() {
@@ -389,10 +389,10 @@ fn s4_map_dims() {
     }
 }
 
-/// S4-negative: a tampered required map definition must fail
-/// `prepare` with the map-dims error — not an ELF-parse error.
-/// Bumps the `CALLS` max_entries 64 -> 65 in an in-memory COPY (one
-/// byte; section headers and symtab untouched, still parses) and
+/// S4-negative: a tampered map definition must fail `prepare`
+/// with the dims-mismatch error — not an ELF-parse error. Bumps
+/// `CALLS` max_entries 64 -> 65 in an in-memory COPY (one byte;
+/// section headers and symtab untouched, still parses) and
 /// pins the exact failure.
 #[test]
 fn s4_map_dims_negative() {
@@ -565,15 +565,15 @@ fn s7_retired_maps_absent() {
 /// and near-uniform (same code modulo baked immediates). Two known
 /// variances, both proven innocent via objdump diff (same helper
 /// sequence, same stores): J=10 == KIND_SCAN_ALG, so LLVM CSEs the
-/// idx/kind stores in both scan-ALG emits (16B smaller — the D
-/// J=4==KIND_ALG CSE moved with the scan kinds;
-/// walk_dispatch/classify stay shared `.text`, so no other J gets
-/// this luck); J=56 keeps its idx immediate in a register across
-/// the scan-ALG emit (one extra mov, 8B larger — pure regalloc
-/// quirk, same class as D's J=40; the T-gate itself compiles
-/// identically for all J as `t > J-1 ⟺ walk`, verified at 056/057
-/// and 010/057). Any other outlier fails loud — investigate,
-/// don't widen.
+/// idx/kind stores at three scan-ALG emit sites (48B smaller —
+/// the explicit EMPTY/NOIMP emits added two more CSE-eligible
+/// sites to the one OK-site CSE; walk_dispatch/classify stay
+/// shared `.text`, so no other J gets this luck); J=56 keeps its
+/// idx immediate in a register across the scan-ALG emits (three
+/// extra reload/mov insns, 24B larger — pure regalloc quirk, same
+/// class as D's J=40; the T-gate itself compiles identically for
+/// all J as `t > J-1 ⟺ walk`, verified at 056/057 and 010/011).
+/// Any other outlier fails loud — investigate, don't widen.
 #[test]
 fn s8_folded_specials() {
     let Some(obj) = object_bytes() else {
@@ -630,7 +630,7 @@ fn s8_folded_specials() {
         "only known large outlier is J=56 (regalloc mov)"
     );
     assert!(
-        mid_max - mid_min <= 24,
-        "members 1..510 near-uniform (16 + 8 known)"
+        mid_max - mid_min <= 72,
+        "members 1..510 near-uniform (48 + 24 known)"
     );
 }
