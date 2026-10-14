@@ -176,11 +176,6 @@ pub struct ScanBatch {
     /// only sound quiesced — non-quiesced batches hold
     /// underdetermined invocations open (honest, never guessed).
     pub quiesced: bool,
-    /// The TRUNC drain raced a concurrent flag (the backend's
-    /// generation guard advanced across the clear window, so a
-    /// flag may have been erased unread) — every open this batch
-    /// spanned degrades explicitly.
-    pub trunc_race: bool,
 }
 
 /// Oracle scope: what the producer was asked to observe (item 6
@@ -330,9 +325,6 @@ pub enum PartialReason {
     /// with no other reason (unreachable by construction — every
     /// unproven-terminator path names its reason; fail-closed).
     TerminatorUnproven,
-    /// The TRUNC drain raced a concurrent producer flag (a flag
-    /// may have been erased unread — fail-closed PARTIAL).
-    TruncDrainRace,
     /// A dispatch row carried a foreign array id (evidence
     /// inconsistent with the joined RET's array).
     RowArrayMismatch,
@@ -409,17 +401,17 @@ pub struct WalkDone {
     pub algs: Vec<AlgIdentity>,
     /// CALL-time in the backend clock domain (the capture passes
     /// its monotonic base at attach, so this is capture-ns in
-    /// production — the inventory adaptation's event instant).
+    /// production).
     pub event_ns: u64,
     /// Retained dispatch rows (array/generation/callback data —
-    /// consistency-checked at close; rides the record for
-    /// callback relocation and inventory adaptation).
+    /// consistency-checked at close; rides the record as the
+    /// callback evidence the native traversal report carries).
     pub rows: Vec<wire::ScanRowEvent>,
 }
 
 /// One joined slot identity (the per-slot evidence a WALK-DONE
-/// retains for inventory adaptation — class + read status, not
-/// the full ring record).
+/// retains natively — class + read status, not the full ring
+/// record).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AlgIdentity {
     pub idx: u64,
@@ -511,6 +503,26 @@ pub enum Finding {
         seq: u64,
         idx: u64,
     },
+    /// ALG for an already-closed key (cross-CPU ring skew
+    /// delivers it after the close — positive recovery evidence
+    /// with its slot data, never silently discarded; the
+    /// standing verdict was correct on the evidence available at
+    /// close time).
+    LateAlg {
+        tid: u32,
+        seq: u64,
+        idx: u64,
+        status: u8,
+        class: u16,
+    },
+    /// ROW for an already-closed key (same recovery semantics as
+    /// [`Finding::LateAlg`] — the callback evidence rides along).
+    LateRow {
+        tid: u32,
+        seq: u64,
+        idx: u64,
+        funcid: u32,
+    },
 }
 
 /// Drain timing hook (item 7, host half): per-batch record/byte
@@ -569,9 +581,6 @@ struct Open {
     /// spanned (any retained loss degrades the verdict — R18
     /// COMPLETE requires ring-loss quiescence).
     ring_loss_accum: u64,
-    /// A TRUNC drain raced a concurrent flag while this open
-    /// spanned it (fail-closed PARTIAL at close).
-    trunc_race_accum: bool,
     /// A hinted successor take arrived over this open (recorded,
     /// never tainting alone — hint + rule-hit = nested certain).
     hint_seen: bool,
@@ -603,19 +612,48 @@ pub struct Oracle {
     /// outcomes are not joinable and stay out.
     recent: BTreeMap<(u32, u64), RecentClose>,
     recent_order: std::collections::VecDeque<(u32, u64)>,
+    corrections: Vec<Correction>,
 }
 
-/// Post-drain close evidence for one key (the minimum a late join
-/// needs: existence + hung-ness — immune to retro-taint, which
-/// rewrites `done`, never this).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Post-drain close evidence for one key: existence + hung-ness
+/// for late joins, plus the correctable verdict (outcome + op) —
+/// a later dangling close rewrites these in place and emits a
+/// [`Correction`], so a consumed Complete never stands on mixed
+/// evidence (evicted keys are honestly uncorrectable — the
+/// Nested finding is their only mark).
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct RecentClose {
     hung: bool,
+    outcome: Outcome,
+    op: u32,
+}
+
+/// Post-drain verdict correction (a consumed verdict's rewrite —
+/// drained by [`Oracle::take_corrections`], applied downstream
+/// by (tid, seq) key; every holder rewrites or the false
+/// verdict survives somewhere).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Correction {
+    pub tid: u32,
+    pub seq: u64,
+    pub outcome: Outcome,
+    pub op: u32,
 }
 
 /// Bound on retained post-drain closes (FIFO eviction — late
 /// joins past the bound orphan honestly).
 const RECENT_CAP: usize = 4096;
+
+/// Where a correlated nesting pair's verdict lives (routes the
+/// taint to the sticky open, the live done rewrite, or the
+/// consumed recent rewrite + correction).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PairSite {
+    Open,
+    Done,
+    Recent,
+    Solo,
+}
 
 /// Where a closed key's evidence lives (live verdict or
 /// post-drain memory — both answer late joins).
@@ -729,10 +767,11 @@ impl Oracle {
                 // key's 1:1 CALL/RET correspondence is broken, so
                 // BOTH correlated sequences taint — this close
                 // carries UNKNOWN op, and the pair taints
-                // stickily (open), by rewrite (live verdict), or
-                // by finding alone (consumed verdict).
-                let (pair, by_seq) = self.correlate(k.0, k.1);
-                self.taint_pair(k.0, k.1, pair, by_seq);
+                // stickily (open), by rewrite (live verdict),
+                // or by rewrite + correction (consumed
+                // verdict — every holder rewrites its copy).
+                let (pair, by_seq, site) = self.correlate(k.0, k.1);
+                self.taint_pair(k.0, k.1, pair, by_seq, site);
                 self.findings.push(Finding::Nested {
                     tid: k.0,
                     seq: k.1,
@@ -794,6 +833,13 @@ impl Oracle {
         std::mem::take(&mut self.findings)
     }
 
+    /// Drain post-drain corrections (verdict rewrites for already-
+    /// drained keys — every downstream holder applies them by
+    /// (tid, seq), or the false verdict survives there).
+    pub fn take_corrections(&mut self) -> Vec<Correction> {
+        std::mem::take(&mut self.corrections)
+    }
+
     /// Close one invocation: records the post-drain evidence,
     /// then pushes the verdict (every close funnels here, so
     /// `recent` observes every joinable outcome exactly once).
@@ -810,7 +856,14 @@ impl Oracle {
             if !self.recent.contains_key(&key) {
                 self.recent_order.push_back(key);
             }
-            self.recent.insert(key, RecentClose { hung });
+            self.recent.insert(
+                key,
+                RecentClose {
+                    hung,
+                    outcome: w.outcome.clone(),
+                    op: w.op,
+                },
+            );
             while self.recent_order.len() > RECENT_CAP {
                 if let Some(old) = self.recent_order.pop_front() {
                     self.recent.remove(&old);
@@ -893,7 +946,6 @@ impl Oracle {
         for o in self.open.values_mut() {
             o.ring_loss_accum = o.ring_loss_accum.saturating_add(ring_delta);
             o.trunc_accum |= b.trunc.get(&o.call.op).copied().unwrap_or(0);
-            o.trunc_race_accum |= b.trunc_race;
         }
         // Window-loss input: opens present after the joins absorb
         // the deltas above; with no opens the loss is window-level.
@@ -1028,7 +1080,6 @@ impl Oracle {
                 first_seen_ns: now_ns,
                 trunc_accum: 0,
                 ring_loss_accum: 0,
-                trunc_race_accum: false,
                 hint_seen: false,
                 tainted_by: None,
                 arrs: BTreeSet::new(),
@@ -1107,6 +1158,16 @@ impl Oracle {
                     seq: a.seq,
                     idx: a.idx,
                 });
+            } else {
+                // Straggler for a closed key: recovery evidence
+                // (never silently discarded).
+                self.findings.push(Finding::LateAlg {
+                    tid: a.tid,
+                    seq: a.seq,
+                    idx: a.idx,
+                    status: a.status,
+                    class: a.class,
+                });
             }
             return;
         };
@@ -1159,23 +1220,29 @@ impl Oracle {
                         seq: r.seq,
                         idx: r.idx,
                     });
+                } else {
+                    // Straggler for a closed key: recovery
+                    // evidence (never silently discarded).
+                    self.findings.push(Finding::LateRow {
+                        tid: r.tid,
+                        seq: r.seq,
+                        idx: r.idx,
+                        funcid: r.funcid,
+                    });
                 }
             }
         }
     }
 
     /// Fire the nesting rule-set on `key`: BOTH correlated
-    /// sequences taint stickily (the current open keeps
-    /// accumulating positive evidence — nothing is dropped at
-    /// fire time — and closes Tainted with all of it) and the
-    /// Nested finding names the correlation.
+    /// sequences taint (the current open keeps accumulating
+    /// positive evidence — nothing is dropped at fire time —
+    /// and closes Tainted with all of it; the pair taints by
+    /// site — sticky open, live rewrite, or consumed rewrite +
+    /// correction) and the Nested finding names the correlation.
     fn fire_nesting(&mut self, tid: u32, seq: u64) {
-        let (pair, by_seq) = self.correlate(tid, seq);
-        if let Some(k) = pair {
-            if let Some(o) = self.open.get_mut(&k) {
-                o.tainted_by = Some(seq);
-            }
-        }
+        let (pair, by_seq, site) = self.correlate(tid, seq);
+        self.taint_pair(tid, seq, pair, by_seq, site);
         if let Some(o) = self.open.get_mut(&(tid, seq)) {
             o.tainted_by = Some(by_seq);
         }
@@ -1183,27 +1250,39 @@ impl Oracle {
     }
 
     /// Correlate `key` with its nesting pair: the newest *other*
-    /// open on the tid, else the newest done seq on the tid
-    /// (already closed — correlation noted), else the key itself
-    /// (solo misattribution — defensive).
-    fn correlate(&self, tid: u32, seq: u64) -> (Option<(u32, u64)>, u64) {
-        let pair: Option<(u32, u64)> = self
+    /// open on the tid, else the newest undrained done seq on the
+    /// tid, else the newest consumed (post-drain `recent`) seq on
+    /// the tid, else the key itself (solo misattribution —
+    /// defensive). The site routes the taint (open: sticky,
+    /// done: in-place rewrite, recent: rewrite + correction).
+    fn correlate(&self, tid: u32, seq: u64) -> (Option<(u32, u64)>, u64, PairSite) {
+        if let Some(k) = self
             .open
             .keys()
             .filter(|(t, s)| *t == tid && *s != seq)
             .max_by_key(|(_, s)| *s)
-            .copied();
-        let by_seq = match pair {
-            Some((_, s)) => s,
-            None => self
-                .done
-                .iter()
-                .filter(|w| w.tid == tid && w.seq != seq)
-                .map(|w| w.seq)
-                .max()
-                .unwrap_or(seq),
-        };
-        (pair, by_seq)
+            .copied()
+        {
+            return (Some(k), k.1, PairSite::Open);
+        }
+        if let Some(s) = self
+            .done
+            .iter()
+            .filter(|w| w.tid == tid && w.seq != seq)
+            .map(|w| w.seq)
+            .max()
+        {
+            return (None, s, PairSite::Done);
+        }
+        if let Some((_, s)) = self
+            .recent
+            .keys()
+            .filter(|(t, _)| *t == tid)
+            .max_by_key(|(_, s)| *s)
+        {
+            return (None, *s, PairSite::Recent);
+        }
+        (None, seq, PairSite::Solo)
     }
 
     /// Taint the correlated sequence of a dangling close: a live
@@ -1211,26 +1290,49 @@ impl Oracle {
     /// an already-closed live verdict is rewritten in place
     /// (evidence kept, op forced UNKNOWN — the standing verdict
     /// rested on mixed evidence); a consumed (drained) verdict is
-    /// beyond rewriting, so the Nested finding below is its only
-    /// mark.
-    fn taint_pair(&mut self, tid: u32, seq: u64, pair: Option<(u32, u64)>, by_seq: u64) {
-        if let Some(k) = pair {
-            if let Some(o) = self.open.get_mut(&k) {
-                o.tainted_by = Some(seq);
+    /// rewritten in `recent` AND a [`Correction`] is recorded, so
+    /// every downstream holder rewrites its copy (a Nested
+    /// finding alone would leave a false Complete standing).
+    fn taint_pair(
+        &mut self,
+        tid: u32,
+        seq: u64,
+        pair: Option<(u32, u64)>,
+        by_seq: u64,
+        site: PairSite,
+    ) {
+        match site {
+            PairSite::Open => {
+                if let Some(k) = pair {
+                    if let Some(o) = self.open.get_mut(&k) {
+                        o.tainted_by = Some(seq);
+                    }
+                }
             }
-            return;
-        }
-        if by_seq == seq {
-            return;
-        }
-        if let Some(w) = self
-            .done
-            .iter_mut()
-            .filter(|w| w.tid == tid && w.seq == by_seq)
-            .last()
-        {
-            w.outcome = Outcome::Tainted { by_seq: seq };
-            w.op = UNKNOWN_OP;
+            PairSite::Solo => {}
+            PairSite::Done => {
+                if let Some(w) = self
+                    .done
+                    .iter_mut()
+                    .filter(|w| w.tid == tid && w.seq == by_seq)
+                    .last()
+                {
+                    w.outcome = Outcome::Tainted { by_seq: seq };
+                    w.op = UNKNOWN_OP;
+                }
+            }
+            PairSite::Recent => {
+                if let Some(r) = self.recent.get_mut(&(tid, by_seq)) {
+                    r.outcome = Outcome::Tainted { by_seq: seq };
+                    r.op = UNKNOWN_OP;
+                    self.corrections.push(Correction {
+                        tid,
+                        seq: by_seq,
+                        outcome: r.outcome.clone(),
+                        op: r.op,
+                    });
+                }
+            }
         }
     }
 
@@ -1734,13 +1836,6 @@ impl Oracle {
         // evidence is provably incomplete).
         if o.ring_loss_accum > 0 {
             reasons.push(PartialReason::DrainLoss);
-        }
-
-        // A raced TRUNC drain may have erased a concurrent flag
-        // unread — the invocation it spanned degrades
-        // explicitly, never silently.
-        if o.trunc_race_accum {
-            reasons.push(PartialReason::TruncDrainRace);
         }
 
         // COMPLETE requires Proven (defensive: unreachable by
