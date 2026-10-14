@@ -93,15 +93,27 @@ fn alg_arr(
 }
 
 fn row(tid: u32, seq: u64, idx: u64) -> wire::ScanRowEvent {
+    row_full(tid, seq, idx, ARR, 0, 300, 0x4400)
+}
+
+fn row_full(
+    tid: u32,
+    seq: u64,
+    idx: u64,
+    aux: u64,
+    generation: u64,
+    funcid: u32,
+    addr: u64,
+) -> wire::ScanRowEvent {
     wire::ScanRowEvent {
         kind: wire::KIND_SCAN_ROW,
         op: OP,
-        funcid: 300,
+        funcid,
         _pad: 0,
-        addr: 0x4400,
-        aux: ARR,
+        addr,
+        aux,
         idx,
-        generation: 0,
+        generation,
         tid,
         _pad2: 0,
         seq,
@@ -828,8 +840,12 @@ fn fix1_shrink_partial_updates() {
 }
 
 /// Finding 5: walked evidence beyond the cached T proves staleness
-/// (grow) — PARTIAL with the fresh terminator (the backend
-/// invalidates the cache from this reason; cold re-probe heals).
+/// (grow) — PARTIAL with the lowest consistent terminator (the
+/// backend invalidates the cache from this reason; cold re-probe
+/// heals). Models production exactly: grown-by-N members
+/// cold-walk (probe-nonzero) while the fresh terminator member
+/// probe-skips silently (only cached_T + 1 emits its boundary
+/// EMPTY) — no EMPTY record arrives.
 #[test]
 fn fix1_grow_partial_invalidates() {
     let mut scope = OracleScope::full();
@@ -841,7 +857,6 @@ fn fix1_grow_partial_invalidates() {
     for j in 0..6 {
         b.push_alg(alg(TIDA, 0, j, wire::ALG_OK));
     }
-    b.push_alg(alg_arr(TIDA, 0, 6, wire::ALG_EMPTY, ARR, 5));
     // Generations must agree with the RET (else GenMixed): the
     // helper above pins gen 0, so rewrite gens for this fixture.
     for a in b.algs.iter_mut() {
@@ -849,7 +864,7 @@ fn fix1_grow_partial_invalidates() {
     }
     o.ingest(&b);
     assert_eq!(o.done().len(), 1);
-    assert_eq!(o.done()[0].true_t, TrueT::Proven(6));
+    assert_eq!(o.done()[0].true_t, TrueT::Candidate(6));
     assert!(matches!(
         o.done()[0].outcome,
         Outcome::Partial { ref reasons } if reasons.contains(&PartialReason::CacheStale { cached: 2 })
@@ -936,6 +951,353 @@ fn fix1_stray_row_finding() {
         seq: 0,
         idx: 1
     }));
+}
+
+/// Round-2 F2: a dispatch read failure behind a readable ALG
+/// prefix closes PARTIAL, never COMPLETE (the producer emits ALG
+/// before walking dispatch, so the bit is the only signal — it
+/// must not be discarded for lack of ALG-prefix gaps).
+#[test]
+fn fix2_walk_read_behind_clean_prefix_partial() {
+    let mut o = Oracle::new(OracleScope::full());
+    let mut b = quiesced_idle(&[TIDA]);
+    b.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b.push_ret(ret(TIDA, 0, 0));
+    for j in 0..3 {
+        b.push_alg(alg(TIDA, 0, j, wire::ALG_OK));
+    }
+    b.push_alg(alg_arr(TIDA, 0, 3, wire::ALG_EMPTY, ARR, 0));
+    b.trunc.insert(OP, wire::TRUNC_WALK_READ);
+    o.ingest(&b);
+    assert_eq!(o.done().len(), 1);
+    assert!(
+        matches!(
+            o.done()[0].outcome,
+            Outcome::Partial { ref reasons } if reasons
+                .iter()
+                .any(|r| matches!(r, PartialReason::Trunc(b) if b & wire::TRUNC_WALK_READ != 0))
+        ),
+        "dispatch-read failure must degrade completion: {:?}",
+        o.done()[0].outcome
+    );
+}
+
+/// Round-2 F2: beyond-terminator name noise still discards (the
+/// UNREADABLE sits past the evidenced terminator, so the walk
+/// failure explains nothing below T).
+#[test]
+fn fix2_walk_name_beyond_terminator_still_complete() {
+    let mut o = Oracle::new(OracleScope::full());
+    let mut b = quiesced_idle(&[TIDA]);
+    b.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b.push_ret(ret(TIDA, 0, 0));
+    for j in 0..3 {
+        b.push_alg(alg(TIDA, 0, j, wire::ALG_OK));
+    }
+    b.push_alg(alg_arr(TIDA, 0, 3, wire::ALG_EMPTY, ARR, 0));
+    b.push_alg(alg(TIDA, 0, 5, wire::ALG_UNREADABLE));
+    b.trunc.insert(OP, wire::TRUNC_WALK_NAME);
+    o.ingest(&b);
+    assert_eq!(o.done().len(), 1);
+    assert!(
+        matches!(o.done()[0].outcome, Outcome::Complete { .. }),
+        "past-terminator name noise must not degrade: {:?}",
+        o.done()[0].outcome
+    );
+}
+
+/// Round-2 F3: dropped ROWs with intact ALG coverage degrade
+/// completion (no holes — the loss itself is the evidence).
+#[test]
+fn fix2_row_loss_intact_prefix_partial() {
+    let mut o = Oracle::new(OracleScope::full());
+    let mut b1 = ScanBatch {
+        quiesced: false,
+        ..ScanBatch::default()
+    };
+    b1.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b1.push_ret(ret(TIDA, 0, 0));
+    for j in 0..3 {
+        b1.push_alg(alg(TIDA, 0, j, wire::ALG_OK));
+    }
+    b1.push_alg(alg_arr(TIDA, 0, 3, wire::ALG_EMPTY, ARR, 0));
+    b1.push_row(row(TIDA, 0, 0));
+    b1.loss.insert(wire::LOSS_RING_ROW, 2);
+    o.ingest(&b1);
+    assert_eq!(o.open_count(), 1);
+    let mut b2 = ScanBatch {
+        quiesced: false,
+        ..ScanBatch::default()
+    };
+    b2.push_call(call(TIDA, 1, false, wire::SKIP_ADMITTED));
+    o.ingest(&b2);
+    assert_eq!(o.done().len(), 1);
+    assert!(
+        matches!(
+            o.done()[0].outcome,
+            Outcome::Partial { ref reasons } if reasons.contains(&PartialReason::DrainLoss)
+                && !reasons.iter().any(|r| matches!(r, PartialReason::Holes(_)))
+        ),
+        "ROW loss with intact ALGs must surface without holes: {:?}",
+        o.done()[0].outcome
+    );
+}
+
+/// Round-2 F3: a raced TRUNC drain degrades every open it spanned
+/// (the backend could not prove no concurrent flag was erased).
+#[test]
+fn fix2_trunc_race_flag_partial() {
+    let mut o = Oracle::new(OracleScope::full());
+    let mut b = quiesced_idle(&[TIDA]);
+    b.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b.push_ret(ret(TIDA, 0, 0));
+    for j in 0..3 {
+        b.push_alg(alg(TIDA, 0, j, wire::ALG_OK));
+    }
+    b.push_alg(alg_arr(TIDA, 0, 3, wire::ALG_EMPTY, ARR, 0));
+    b.trunc_race = true;
+    o.ingest(&b);
+    assert_eq!(o.done().len(), 1);
+    assert!(
+        matches!(
+            o.done()[0].outcome,
+            Outcome::Partial { ref reasons } if reasons.contains(&PartialReason::TruncDrainRace)
+        ),
+        "raced TRUNC drain must degrade: {:?}",
+        o.done()[0].outcome
+    );
+}
+
+/// Round-2 F4: the nesting rule-set taints stickily — the current
+/// open keeps accumulating positive evidence and closes Tainted
+/// with all of it (nothing is dropped at fire time).
+#[test]
+fn fix2_nesting_keeps_accumulating() {
+    let mut o = Oracle::new(OracleScope::full());
+    let mut b1 = ScanBatch {
+        quiesced: false,
+        now_ns: 1_000,
+        ..ScanBatch::default()
+    };
+    b1.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b1.push_ret(ret(TIDA, 0, 0));
+    b1.push_alg(alg_arr(TIDA, 0, 0, wire::ALG_OK, ARR, 0));
+    b1.push_alg(alg_arr(TIDA, 0, 1, wire::ALG_OK, ARR + 0x1000, 0)); // multi-array: nesting fires
+    b1.push_alg(alg_arr(TIDA, 0, 2, wire::ALG_OK, ARR, 0)); // post-fire positive evidence
+    b1.push_row(row(TIDA, 0, 0));
+    o.ingest(&b1);
+    assert_eq!(o.open_count(), 1, "fire must not drop the open");
+    assert!(o.done().is_empty());
+    assert!(o.findings().iter().any(|f| matches!(
+        f,
+        Finding::Nested {
+            tid: TIDA,
+            seq: 0,
+            ..
+        }
+    )));
+    let mut b2 = ScanBatch {
+        quiesced: false,
+        now_ns: 2_000,
+        ..ScanBatch::default()
+    };
+    b2.push_call(call(TIDA, 1, false, wire::SKIP_ADMITTED));
+    o.ingest(&b2);
+    assert_eq!(o.done().len(), 1);
+    assert!(
+        matches!(o.done()[0].outcome, Outcome::Tainted { .. }),
+        "sticky taint closes Tainted: {:?}",
+        o.done()[0].outcome
+    );
+    assert_eq!(o.done()[0].alg_count, 3, "post-fire ALG retained");
+    assert_eq!(o.done()[0].row_count, 1, "post-fire ROW retained");
+    assert_eq!(o.done()[0].op, UNKNOWN_OP);
+}
+
+/// Round-2 F4: a dangling CALL taints both correlated sequences
+/// (its own close carries UNKNOWN op; the correlated record is
+/// tainted too, never left standing on mixed evidence).
+#[test]
+fn fix2_dangling_taints_both() {
+    let mut o = Oracle::new(OracleScope::full());
+    let mut b = ScanBatch {
+        quiesced: false,
+        now_ns: 1_000,
+        ..ScanBatch::default()
+    };
+    b.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b.push_ret(ret(TIDA, 0, 0));
+    b.push_alg(alg(TIDA, 0, 0, wire::ALG_OK));
+    b.push_alg(alg_arr(TIDA, 0, 1, wire::ALG_EMPTY, ARR, 0));
+    b.push_call(call(TIDA, 1, false, wire::SKIP_ADMITTED)); // successor closes 0; trails RET-less
+    o.ingest(&b);
+    assert_eq!(o.open_count(), 1);
+    o.finish(2_000);
+    assert_eq!(o.open_count(), 0);
+    assert_eq!(o.done().len(), 2);
+    let dangle = o.done().iter().find(|w| w.seq == 1).unwrap();
+    assert!(
+        matches!(dangle.outcome, Outcome::Tainted { .. }),
+        "dangling CALL closes Tainted: {:?}",
+        dangle.outcome
+    );
+    assert_eq!(dangle.op, UNKNOWN_OP);
+    let pair = o.done().iter().find(|w| w.seq == 0).unwrap();
+    assert!(
+        matches!(pair.outcome, Outcome::Tainted { .. }),
+        "correlated sequence tainted too: {:?}",
+        pair.outcome
+    );
+}
+
+/// Round-2 F4: ROWs retain array/generation/callback data — a row
+/// for a foreign array degrades the close explicitly.
+#[test]
+fn fix2_row_array_mismatch_partial() {
+    let mut o = Oracle::new(OracleScope::full());
+    let mut b = quiesced_idle(&[TIDA]);
+    b.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b.push_ret(ret(TIDA, 0, 0));
+    b.push_alg(alg(TIDA, 0, 0, wire::ALG_OK));
+    b.push_alg(alg_arr(TIDA, 0, 1, wire::ALG_EMPTY, ARR, 0));
+    b.push_row(row_full(TIDA, 0, 0, ARR + 0x5000, 0, 300, 0x4400)); // foreign array
+    o.ingest(&b);
+    assert_eq!(o.done().len(), 1);
+    assert!(
+        matches!(
+            o.done()[0].outcome,
+            Outcome::Partial { ref reasons } if reasons.contains(&PartialReason::RowArrayMismatch)
+        ),
+        "foreign-array ROW must degrade: {:?}",
+        o.done()[0].outcome
+    );
+}
+
+/// Round-2 F4: retained ROWs ride the record for consistency
+/// checks and callback relocation (full callback data, not
+/// count+index).
+#[test]
+fn fix2_rows_retained_for_relocation() {
+    let mut o = Oracle::new(OracleScope::full());
+    let mut b = quiesced_idle(&[TIDA]);
+    b.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b.push_ret(ret(TIDA, 0, 0));
+    b.push_alg(alg(TIDA, 0, 0, wire::ALG_OK));
+    b.push_alg(alg_arr(TIDA, 0, 1, wire::ALG_EMPTY, ARR, 0));
+    b.push_row(row_full(TIDA, 0, 0, ARR, 0, 301, 0x4500));
+    b.push_row(row_full(TIDA, 0, 0, ARR, 0, 302, 0x4600));
+    o.ingest(&b);
+    assert_eq!(o.done().len(), 1);
+    assert!(matches!(o.done()[0].outcome, Outcome::Complete { .. }));
+    let rows = &o.done()[0].rows;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].funcid, 301);
+    assert_eq!(rows[0].addr, 0x4500);
+    assert_eq!(rows[1].funcid, 302);
+    assert_eq!(rows[1].addr, 0x4600);
+}
+
+/// Round-2 F5: warm growth the producer skips silently still
+/// invalidates — no EMPTY, no beyond-T evidence, terminator slot
+/// walked live: the cached Proven(T) cannot stand.
+#[test]
+fn fix2_warm_silent_growth_stale() {
+    let mut scope = OracleScope::full();
+    scope.known_t.insert(ARR, (2, 5));
+    let mut o = Oracle::new(scope);
+    let mut b = quiesced_idle(&[TIDA]);
+    b.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b.push_ret(ret(TIDA, 0, 5));
+    // Production warm scan of a grown table: members 0..=2 walk
+    // (slot 2 now live), members 3..=511 probe-skip silently —
+    // no EMPTY anywhere, nothing beyond T.
+    for j in 0..3 {
+        b.push_alg(alg_arr(TIDA, 0, j, wire::ALG_OK, ARR, 5));
+    }
+    o.ingest(&b);
+    assert_eq!(o.done().len(), 1);
+    assert_eq!(o.done()[0].true_t, TrueT::Candidate(2));
+    assert!(matches!(
+        o.done()[0].outcome,
+        Outcome::Partial { ref reasons } if reasons.contains(&PartialReason::CacheStale { cached: 2 })
+    ));
+}
+
+/// Round-2 F5: a hole where the cached terminator should be
+/// re-proven invalidates (holes trigger invalidation).
+#[test]
+fn fix2_warm_terminator_hole_stale() {
+    let mut scope = OracleScope::full();
+    scope.known_t.insert(ARR, (2, 5));
+    let mut o = Oracle::new(scope);
+    let mut b = quiesced_idle(&[TIDA]);
+    b.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b.push_ret(ret(TIDA, 0, 5));
+    for j in 0..2 {
+        b.push_alg(alg_arr(TIDA, 0, j, wire::ALG_OK, ARR, 5));
+    }
+    // Slot 2 (the cached terminator) faulted silently; members
+    // 3..=511 probe-skipped. No EMPTY, no beyond-T evidence.
+    o.ingest(&b);
+    assert_eq!(o.done().len(), 1);
+    assert!(matches!(
+        o.done()[0].outcome,
+        Outcome::Partial { ref reasons } if reasons.contains(&PartialReason::CacheStale { cached: 2 })
+            && reasons.iter().any(|r| matches!(r, PartialReason::Holes(_)))
+    ));
+}
+
+/// Round-2 F5: growth by exactly one slot carries the boundary
+/// EMPTY the producer emits (first would-skip member proves
+/// termination) — stale with the fresh proven T.
+#[test]
+fn fix2_grow_by_one_boundary_empty() {
+    let mut scope = OracleScope::full();
+    scope.known_t.insert(ARR, (2, 5));
+    let mut o = Oracle::new(scope);
+    let mut b = quiesced_idle(&[TIDA]);
+    b.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b.push_ret(ret(TIDA, 0, 5));
+    for j in 0..3 {
+        b.push_alg(alg_arr(TIDA, 0, j, wire::ALG_OK, ARR, 5));
+    }
+    // Member 3 == cached_T + 1: probe-zero proves the fresh
+    // terminator explicitly (production would-skip emission).
+    b.push_alg(alg_arr(TIDA, 0, 3, wire::ALG_EMPTY, ARR, 5));
+    o.ingest(&b);
+    assert_eq!(o.done().len(), 1);
+    assert_eq!(o.done()[0].true_t, TrueT::Proven(3));
+    assert!(matches!(
+        o.done()[0].outcome,
+        Outcome::Partial { ref reasons } if reasons.contains(&PartialReason::CacheStale { cached: 2 })
+    ));
+}
+
+/// Round-2 F5: selective scope keeps the belief when the
+/// terminator slot is outside the attached set (unobservable —
+/// the UnobservedSlots reason already partials).
+#[test]
+fn fix2_selective_unattached_terminator_keeps_belief() {
+    let mut scope = OracleScope::full();
+    scope.attached = (0..2).collect();
+    scope.expected = 2;
+    scope.known_t.insert(ARR, (2, 5));
+    let mut o = Oracle::new(scope);
+    let mut b = quiesced_idle(&[TIDA]);
+    b.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b.push_ret(ret(TIDA, 0, 5));
+    for j in 0..2 {
+        b.push_alg(alg_arr(TIDA, 0, j, wire::ALG_OK, ARR, 5));
+    }
+    o.ingest(&b);
+    assert_eq!(o.done().len(), 1);
+    assert_eq!(o.done()[0].true_t, TrueT::Proven(2));
+    assert!(matches!(
+        o.done()[0].outcome,
+        Outcome::Partial { ref reasons } if reasons
+            .iter()
+            .any(|r| matches!(r, PartialReason::UnobservedSlots(_)))
+    ));
 }
 
 #[test]

@@ -110,7 +110,7 @@ impl ObjectRole {
         }
     }
 
-    fn describe(&self) -> &'static str {
+    pub fn describe(&self) -> &'static str {
         match self {
             ObjectRole::Harvest => "harvest",
             ObjectRole::Count => "count",
@@ -287,6 +287,12 @@ pub fn is_trusted_file(path: &Path) -> bool {
 /// is refused rather than read into memory.
 pub const MAX_OBJECT_SCAN_BYTES: u64 = 512 << 20;
 
+/// Anchor-fingerprint read bound (traversal query-anchor exe):
+/// build-id notes live in the first kilobytes, so the anchor
+/// reads a bounded prefix (truncate, never refuse) rather than
+/// a whole file into memory.
+pub const MAX_ANCHOR_SCAN_BYTES: u64 = 1 << 20;
+
 /// Bounded file read: `Ok(bytes)` when the file fits, `Err` on I/O
 /// or oversize. Reads at most `max + 1` bytes (no metadata-length
 /// dependence, which races with writers anyway).
@@ -317,6 +323,18 @@ pub fn read_bounded(path: &Path, max: u64) -> Result<Vec<u8>, ReadBoundedError> 
     if buf.len() as u64 > max {
         return Err(ReadBoundedError::TooLarge(max));
     }
+    Ok(buf)
+}
+
+/// Read up to `max` bytes (truncate, never refuse): for
+/// fingerprinting reads (build-id notes live early) where a
+/// prefix suffices and a large file must degrade the parse, not
+/// the identity. Memory stays bounded either way.
+pub fn read_prefix(path: &Path, max: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    let f = std::fs::File::open(path)?;
+    let mut buf = Vec::new();
+    f.take(max).read_to_end(&mut buf)?;
     Ok(buf)
 }
 
@@ -583,11 +601,16 @@ pub fn resolve_implicit_pair(
 /// Resolved BPF-object triple (traversal runs): harvest + count +
 /// members. The pair path ([`resolve_objects`]) is unchanged;
 /// traversal runs resolve the triple through [`resolve_set`].
+/// `explicit` records per-role provenance in (harvest, count,
+/// members) order — the snapshot re-verifies implicit roles
+/// against their receipt (explicit roles stay operator-trusted,
+/// never receipt-checked).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectSet {
     pub harvest: PathBuf,
     pub count: PathBuf,
     pub members: PathBuf,
+    pub explicit: [bool; 3],
 }
 
 /// Resolve the BPF-object triple for a traversal run: explicit
@@ -626,6 +649,7 @@ pub fn resolve_set(
                 harvest: h.clone(),
                 count: c.clone(),
                 members: m.clone(),
+                explicit: [true, true, true],
             },
             search,
         )),
@@ -667,10 +691,55 @@ pub fn resolve_set(
                     harvest: h,
                     count: c,
                     members: m,
+                    explicit: [harvest.is_some(), count.is_some(), members.is_some()],
                 },
                 search,
             ))
         }
+    }
+}
+
+/// What a run traverses with: the full receipt-verified triple,
+/// the harvest-only pair (old installs predate members), or
+/// nothing installed at all (the pair resolution failed too —
+/// capture refuses with the pair error; doctor renders pair-fail
+/// rows + members INFO).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunSet {
+    Triple(ObjectSet),
+    PairOnly(ObjectPaths),
+    NoObjects(OnboardError),
+}
+
+/// The ONE run-set decision shared by capture and doctor (F9):
+/// resolve the triple; fall back to the pair ONLY when members
+/// were not explicitly demanded, the triple is merely absent
+/// (not broken — stale/mixed/unlisted refuse), AND no trusted
+/// dir holds a members file anywhere (a members file in another
+/// prefix is a mixed set, never a quiet pair — capture and doctor
+/// refuse it identically). Explicit members always demands the
+/// triple (no fallback). Missing/mixed/stale sets therefore
+/// behave identically in both callers by construction.
+pub fn resolve_run_set(
+    harvest: Option<&Path>,
+    count: Option<&Path>,
+    members: Option<&Path>,
+    dirs: &[PathBuf],
+    trust: &TrustPolicy,
+) -> Result<(RunSet, ObjectSearch), OnboardError> {
+    match resolve_set(harvest, count, members, dirs, trust) {
+        Ok((set, search)) => Ok((RunSet::Triple(set), search)),
+        Err(e)
+            if members.is_none()
+                && e.is_not_found()
+                && !role_file_in_trusted(ObjectRole::Members, dirs, trust) =>
+        {
+            match resolve_objects(harvest, count, dirs, trust) {
+                Ok((pair, search)) => Ok((RunSet::PairOnly(pair), search)),
+                Err(pair_e) => Ok((RunSet::NoObjects(pair_e), ObjectSearch::default())),
+            }
+        }
+        Err(e) => Err(e),
     }
 }
 
@@ -706,6 +775,7 @@ pub fn resolve_implicit_triple(
             harvest: h,
             count: c,
             members: m,
+            explicit: [false, false, false],
         });
     }
     let mut message = format!(
@@ -770,6 +840,19 @@ pub fn file_sha256_hex(path: &Path) -> std::io::Result<String> {
 /// stale/swapped object; an unlisted path is a mixed set — both
 /// refused with reinstall remediation, never silently used).
 pub fn verify_role_receipt(role: ObjectRole, path: &Path) -> Result<(), OnboardError> {
+    verify_role_receipt_bytes(role, path).map(|_| ())
+}
+
+/// [`verify_role_receipt`], returning the verified bytes: one
+/// bounded read binds content to identity (the caller hashes and
+/// loads THESE bytes — no re-read can drift between verify and
+/// use). Receipt-absent pair roles return the bounded read
+/// unverified (old installs); every other rule matches
+/// [`verify_role_receipt`] exactly.
+pub fn verify_role_receipt_bytes(
+    role: ObjectRole,
+    path: &Path,
+) -> Result<Vec<u8>, OnboardError> {
     let dir = path.parent().ok_or_else(|| {
         OnboardError::new(
             format!(
@@ -794,7 +877,18 @@ pub fn verify_role_receipt(role: ObjectRole, path: &Path) -> Result<(), OnboardE
                         .to_string(),
                 ));
             }
-            return Ok(());
+            // Receiptless pair role (old install): the bounded
+            // read stands unverified.
+            return read_bounded(path, MAX_OBJECT_SCAN_BYTES).map_err(|e| {
+                OnboardError::new(
+                    format!(
+                        "{} object {} unreadable: {e}",
+                        role.describe(),
+                        path.display()
+                    ),
+                    "check permissions on the installed objects".to_string(),
+                )
+            });
         }
     };
     let text = read_bounded(&receipt, MAX_OBJECT_SCAN_BYTES).map_err(|e| {
@@ -872,7 +966,7 @@ pub fn verify_role_receipt(role: ObjectRole, path: &Path) -> Result<(), OnboardE
             "reinstall matched objects with scripts/install-dev.sh; a swapped object after install is the usual cause".to_string(),
         ));
     }
-    Ok(())
+    Ok(bytes)
 }
 
 /// Read + validate an explicit offset-table file (`--table`): usage
