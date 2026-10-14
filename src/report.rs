@@ -47,6 +47,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
     let mut builtin = false;
     let mut object: Option<String> = None;
     let mut count_object: Option<String> = None;
+    let mut members_object: Option<String> = None;
     let mut table_raw: Option<String> = None;
     let mut force_offset_raw: Option<String> = None;
     let mut provider_table_raw: Option<String> = None;
@@ -83,6 +84,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             }
             "--object" => object = Some(val(a)?),
             "--count-object" => count_object = Some(val(a)?),
+            "--members-object" => members_object = Some(val(a)?),
             "--table" => table_raw = Some(val(a)?),
             "--force-offset" => force_offset_raw = Some(val(a)?),
             "--provider-table" => provider_table_raw = Some(val(a)?),
@@ -171,6 +173,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         cfg: capture::Config {
             harvest_object: object.map(PathBuf::from),
             count_object: count_object.map(PathBuf::from),
+            members_object: members_object.map(PathBuf::from),
             provider: provider.map(PathBuf::from),
             builtin,
             table,
@@ -286,7 +289,7 @@ pub(crate) fn grouped(n: u64) -> String {
     out
 }
 
-const USAGE: &str = "usage: report [--duration S] [--provider P] [--object O] [--count-object C] [--table F] [--force-offset N] [--provider-table F] [--format human|json] [--out F] [--cbom FILE] [--builtin] [--settle S] [--timeout S] [--grace S] [--image-digest D] [--workload-out F] [--workload-out-fd N] {--pid P | run -- <cmd>}";
+const USAGE: &str = "usage: report [--duration S] [--provider P] [--object O] [--count-object C] [--members-object M] [--table F] [--force-offset N] [--provider-table F] [--format human|json] [--out F] [--cbom FILE] [--builtin] [--settle S] [--timeout S] [--grace S] [--image-digest D] [--workload-out F] [--workload-out-fd N] {--pid P | run -- <cmd>}";
 
 pub fn run(argv: &[String]) -> ExitCode {
     // --help anywhere on the osslscope side (a target command after
@@ -656,6 +659,20 @@ fn doc_json(doc: &CaptureDocument) -> serde_json::Value {
     });
     // Report/check convention (v1-compatible): unevaluated policy
     // and unrecorded disposition omit their sections.
+    // v2.1 traversal: runs without the members backend omit the
+    // section; traversal runs name the exact selected triple
+    // (paths + sha256 — the same provenance doctor verifies).
+    if let Some(t) = &doc.traversal {
+        let obj = |o: &crate::evidence::TraversalObject| serde_json::json!({"path": o.path, "sha256": o.sha256});
+        out["traversal"] = serde_json::json!({
+            "harvest": obj(&t.harvest),
+            "count": obj(&t.count),
+            "members": obj(&t.members),
+            "records": t.records,
+            "findings": t.findings,
+            "polls": t.polls,
+        });
+    }
     if let Some(disposition) = &doc.disposition {
         let (outcome, code, pid) = match disposition.outcome {
             DispositionOutcome::Exited => ("exited", disposition.code, None),
@@ -1409,6 +1426,7 @@ pub fn setup_failure_document(fatal: FatalKind) -> CaptureDocument {
         disposition: None,
         policy: None,
         legacy_partition: LegacyCallPartition::default(),
+        traversal: None,
     })
 }
 

@@ -136,6 +136,11 @@ pub struct ScanBackend {
     storm: StormDetector,
     births: BirthState,
     epoch_start: Instant,
+    /// Capture-monotonic ns at attach (production passes its clock
+    /// — batch times land in the capture domain, so WALK-DONE
+    /// event instants join the evidence document honestly; 0 in
+    /// legs = backend-local domain).
+    clock_base_ns: u64,
     last_loss: BTreeMap<u32, u64>,
     done_total: u64,
     findings_total: u64,
@@ -163,11 +168,12 @@ impl ScanBackend {
         pid: u32,
         ctrl: &wire::CtrlValue,
         slots: Option<&[u32]>,
+        clock_base_ns: u64,
     ) -> anyhow::Result<Self> {
         let bytes = std::fs::read(obj)
             .with_context(|| format!("read {}", obj.display()))
             .map_err(|e| anyhow::anyhow!("{e:#}"))?;
-        Self::attach_bytes(&bytes, obj, exe, off, pid, ctrl, slots)
+        Self::attach_bytes(&bytes, obj, exe, off, pid, ctrl, slots, clock_base_ns)
     }
 
     /// Attach over verified bytes (no path re-read — the caller
@@ -176,6 +182,7 @@ impl ScanBackend {
     /// members and report failed slots (the oracle scope covers
     /// exactly what attached — failed slots are unobserved
     /// PARTIAL there, never holes).
+    #[allow(clippy::too_many_arguments, reason = "one coherent attach spec")]
     pub fn attach_bytes(
         bytes: &[u8],
         obj: &Path,
@@ -184,7 +191,19 @@ impl ScanBackend {
         pid: u32,
         ctrl: &wire::CtrlValue,
         slots: Option<&[u32]>,
+        clock_base_ns: u64,
     ) -> anyhow::Result<Self> {
+        // The snapshot was size-bounded at resolution; refuse an
+        // over-cap caller buffer anyway (no post-onboarding
+        // enlargement bypass — identity and loading share these
+        // exact bytes).
+        if bytes.len() as u64 > crate::discovery::onboard::MAX_OBJECT_SCAN_BYTES {
+            anyhow::bail!(
+                "members snapshot {} bytes exceeds the {} cap",
+                bytes.len(),
+                crate::discovery::onboard::MAX_OBJECT_SCAN_BYTES
+            );
+        }
         let (attached, attached_slots, failed): (
             MembersAttached,
             BTreeSet<u32>,
@@ -244,6 +263,7 @@ impl ScanBackend {
             storm: StormDetector::new(),
             births: BirthState::new(),
             epoch_start: Instant::now(),
+            clock_base_ns,
             last_loss: BTreeMap::new(),
             done_total: 0,
             findings_total: 0,
@@ -333,7 +353,9 @@ impl ScanBackend {
     /// acceleration, never load-bearing for production joins).
     pub fn poll_at(&mut self, now: Instant, quiesced: bool) -> anyhow::Result<PollDelta> {
         let mut delta = PollDelta::default();
-        let now_ns = now.duration_since(self.epoch_start).as_nanos() as u64;
+        let now_ns = self
+            .clock_base_ns
+            .saturating_add(now.duration_since(self.epoch_start).as_nanos() as u64);
         // Every poll drains (even storm-detached: the entry still
         // emits skip CALLs, and the ring must not fill with them).
         let batch = self.drain_batch(quiesced, now_ns)?;
@@ -395,8 +417,12 @@ impl ScanBackend {
             // Warm the cache ONLY on fresh-Proven completes: the
             // table's termination is proven AND the cache doesn't
             // already hold it (cached completes re-prove the
-            // standing entry — no write needed). NO_STORE can
-            // never warm (it never completes).
+            // standing entry — no write needed — and so do cold
+            // re-proofs, which prove the same T uncached when the
+            // successor fired pre-close). Warming is idempotent:
+            // an identical rewrite reports no CacheWarmed (the
+            // event means the cache changed). NO_STORE can never
+            // warm (it never completes).
             if let crate::scan::oracle::Outcome::Complete {
                 true_t,
                 cached: false,
@@ -405,12 +431,15 @@ impl ScanBackend {
                 let proven = matches!(w.true_t, TrueT::Proven(t) if t == *true_t);
                 if proven && w.arr != 0 {
                     let incarnation = ensure_gen(&self.loaded.maps, w.arr)?;
-                    write_tcache(&self.loaded.maps, w.arr, *true_t, incarnation)?;
-                    self.oracle.note_warm(w.arr, *true_t, incarnation);
-                    delta.actions.push(BackendAction::CacheWarmed {
-                        arr: w.arr,
-                        t: *true_t,
-                    });
+                    let standing = self.oracle.warm_belief(w.arr);
+                    if standing != Some((*true_t, incarnation)) {
+                        write_tcache(&self.loaded.maps, w.arr, *true_t, incarnation)?;
+                        self.oracle.note_warm(w.arr, *true_t, incarnation);
+                        delta.actions.push(BackendAction::CacheWarmed {
+                            arr: w.arr,
+                            t: *true_t,
+                        });
+                    }
                 }
             }
             // Heal the cache from the oracle's contradiction
@@ -446,7 +475,9 @@ impl ScanBackend {
     /// flags settle honestly.
     pub fn finish(&mut self) -> anyhow::Result<PollDelta> {
         let mut delta = self.poll()?;
-        let now_ns = Instant::now().duration_since(self.epoch_start).as_nanos() as u64;
+        let now_ns = self
+            .clock_base_ns
+            .saturating_add(Instant::now().duration_since(self.epoch_start).as_nanos() as u64);
         self.oracle.finish(now_ns);
         if let Some(ThrottleAction::ReleaseSkipAll) = self.throttle.age(now_ns) {
             if !self.storm_detached {
@@ -916,6 +947,27 @@ mod tests {
     }
 
     #[test]
+    fn attach_bytes_refuses_over_cap_before_bpf() {
+        // Finding 11: the onboarding cap binds loading too — an
+        // over-cap caller buffer refuses before any BPF work (no
+        // post-onboarding enlargement bypass). Host-safe: the
+        // refusal precedes the loader, so no privilege needed.
+        let big = vec![0u8; (crate::discovery::onboard::MAX_OBJECT_SCAN_BYTES + 1) as usize];
+        let exe = CString::new("/exe").unwrap();
+        let ctrl = wire::ctrl_value(512, 1, 1 << 22);
+        let e = ScanBackend::attach_bytes(&big, Path::new("obj"), &exe, 0, 0, &ctrl, None, 0)
+            .err()
+            .expect("over-cap refuses");
+        // The backend layer's own message (the loader repeats the
+        // check deeper — defense in depth with a distinct text).
+        let want = format!(
+            "exceeds the {} cap",
+            crate::discovery::onboard::MAX_OBJECT_SCAN_BYTES
+        );
+        assert!(e.to_string().contains(&want), "{e:#}");
+    }
+
+    #[test]
     fn decode_unknown_kind_bails() {
         let mut raw = call_bytes();
         raw[0..4].copy_from_slice(&99u32.to_le_bytes());
@@ -968,6 +1020,8 @@ mod tests {
             alg_count: 5,
             row_count: 0,
             guard: None,
+            algs: Vec::new(),
+            event_ns: 0,
         }
     }
 
