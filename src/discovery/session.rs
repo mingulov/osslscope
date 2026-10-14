@@ -892,6 +892,13 @@ pub struct SessionCore {
     /// path). A repeat init resolving elsewhere re-attaches instead
     /// of trusting a stale offset.
     attached_targets: HashMap<u64, (u64, String, String, u64)>,
+    /// Bootstrap builtin-query anchor (attach path, file offset)
+    /// for the traversal backend: written ONLY by
+    /// [`SessionCore::mark_query_attached`] (whose sole caller is
+    /// the builtin bootstrap path), never by poll-time stage-2
+    /// installs — so an init-mode stage-2 cookie-0 install cannot
+    /// collide with it. `None` in init mode and when dispatch-blind.
+    bootstrap_query_anchor: Option<(String, u64)>,
     attach_failures: HashMap<u64, String>,
     reloads: HashMap<u64, u64>,
     pending_stage2: std::collections::VecDeque<(u64, u64)>,
@@ -994,6 +1001,7 @@ impl SessionCore {
             legacy_note: None,
             attached_queries: HashSet::new(),
             attached_targets: HashMap::new(),
+            bootstrap_query_anchor: None,
             attach_failures: HashMap::new(),
             reloads: HashMap::new(),
             pending_stage2: std::collections::VecDeque::new(),
@@ -1055,7 +1063,21 @@ impl SessionCore {
     ) {
         self.attached_queries.insert(cookie);
         self.attached_targets
-            .insert(cookie, (offset, path, dev, ino));
+            .insert(cookie, (offset, path.clone(), dev, ino));
+        // Bootstrap-only caller: the builtin query anchor the
+        // traversal backend attaches to (poll-time stage-2
+        // installs write `attached_targets` directly, never this).
+        self.bootstrap_query_anchor = Some((path, offset));
+    }
+
+    /// Bootstrap builtin-query anchor (attach path, file offset)
+    /// for the traversal backend. `None` in init mode and when
+    /// dispatch-blind — traversal refuses, it never guesses an
+    /// offset. Cleared on recycle with all lineage.
+    pub(crate) fn builtin_anchor(&self) -> Option<(PathBuf, u64)> {
+        self.bootstrap_query_anchor
+            .as_ref()
+            .map(|(path, off)| (PathBuf::from(path), *off))
     }
 
     /// Adopt an attach-time legacy plan (first poll planning goes
@@ -1585,6 +1607,7 @@ impl SessionCore {
         self.legacy_note = None;
         self.attached_queries.clear();
         self.attached_targets.clear();
+        self.bootstrap_query_anchor = None;
         self.attach_failures.clear();
         self.reloads.clear();
         self.pending_stage2.clear();
@@ -4256,6 +4279,15 @@ impl DiscoverySession {
         self.core.snapshot()
     }
 
+    /// Builtin query anchor (attach path, file offset) for the
+    /// traversal backend: pinned at bootstrap when the builtin
+    /// query pair attaches. `None` in init mode and when
+    /// dispatch-blind (no builtin anchor — traversal refuses, it
+    /// never guesses an offset).
+    pub fn query_anchor(&self) -> Option<(PathBuf, u64)> {
+        self.core.builtin_anchor()
+    }
+
     /// Quiesce-then-PROCESS teardown; see [`SessionCore::close`].
     /// Prefer this over `drop()` for exact tail accounting.
     pub fn close(mut self) -> anyhow::Result<DiscoverySnapshot> {
@@ -5835,5 +5867,44 @@ mod tests {
         let snap = core.snapshot();
         assert_eq!(snap.queries_observed, 14);
         assert_eq!(snap.queries_by_op, vec![(1, 9), (2, 5)]);
+    }
+
+    #[test]
+    fn builtin_anchor_bootstrap_only_and_recycle_cleared() {
+        // Traversal anchor: None fresh; set by the bootstrap
+        // mark; poll-time stage-2 cookie-0 installs (init anchor)
+        // write `attached_targets` directly and must NOT move it;
+        // recycle clears it with all lineage.
+        let mut core = a11_core();
+        assert_eq!(core.builtin_anchor(), None);
+        core.mark_query_attached(
+            0,
+            0x1234,
+            "/p/libcrypto.so.3".to_string(),
+            "08:01".to_string(),
+            99,
+        );
+        assert_eq!(
+            core.builtin_anchor(),
+            Some((PathBuf::from("/p/libcrypto.so.3"), 0x1234))
+        );
+        // A poll-time stage-2 cookie-0 install (init mode):
+        // overwrites the cookie row, leaves the anchor pinned.
+        core.attached_queries.insert(0);
+        core.attached_targets.insert(
+            0,
+            (
+                0x9999,
+                "/p/libcrypto.so.3".to_string(),
+                "08:01".to_string(),
+                99,
+            ),
+        );
+        assert_eq!(
+            core.builtin_anchor(),
+            Some((PathBuf::from("/p/libcrypto.so.3"), 0x1234))
+        );
+        core.mark_recycled();
+        assert_eq!(core.builtin_anchor(), None);
     }
 }
