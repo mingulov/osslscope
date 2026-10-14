@@ -312,6 +312,157 @@ fn read_percpu(loaded: &Loaded, name: &str, key: u32, or: bool) -> u64 {
     0
 }
 
+/// Folded LOSS[id] read (absent id reads 0).
+fn loss_val(loaded: &Loaded, id: u32) -> u64 {
+    use aya::maps::{Map, MapData, PerCpuHashMap};
+    let fd = loaded.maps["LOSS"].try_clone().expect("clone LOSS");
+    let data = MapData::from_fd(fd).expect("mapdata");
+    let map = Map::from_map_data(data).expect("map");
+    let m = PerCpuHashMap::<_, u32, u64>::try_from(map).expect("percpu shape");
+    for r in m.iter() {
+        let (k, slots) = r.expect("percpu iter");
+        if k == id {
+            return slots.iter().fold(0, |a, &b| a.wrapping_add(b));
+        }
+    }
+    0
+}
+
+/// Assert exact LOSS counts for the listed ids and zero for every
+/// other id (drop-path reconciliation: named losses exact, no
+/// stray loss hides in an unlisted plane).
+fn assert_loss_exact(loaded: &Loaded, want: &[(u32, u64)], tag: &str) {
+    use aya::maps::{Map, MapData, PerCpuHashMap};
+    let fd = loaded.maps["LOSS"].try_clone().expect("clone LOSS");
+    let data = MapData::from_fd(fd).expect("mapdata");
+    let map = Map::from_map_data(data).expect("map");
+    let m = PerCpuHashMap::<_, u32, u64>::try_from(map).expect("percpu shape");
+    let mut seen = std::collections::HashSet::new();
+    for r in m.iter() {
+        let (k, slots) = r.expect("percpu iter");
+        let sum: u64 = slots.iter().fold(0, |a, &b| a.wrapping_add(b));
+        seen.insert(k);
+        match want.iter().find(|(id, _)| *id == k) {
+            Some((_, v)) => assert_eq!(sum, *v, "{tag}: LOSS[{k}]"),
+            None => assert_eq!(sum, 0, "{tag}: LOSS[{k}] must be zero"),
+        }
+    }
+    for (id, v) in want {
+        if !seen.contains(id) {
+            assert_eq!(*v, 0, "{tag}: LOSS[{id}] row present");
+        }
+    }
+}
+
+/// Map one unreadable page (PROT_NONE — mapped but faulting) for
+/// unreadable-pointee variants. Returns the base address; the
+/// caller munmaps (RAII via [`ProtNonePage`]).
+fn map_prot_none() -> u64 {
+    unsafe {
+        let ptr = libc::mmap(
+            std::ptr::null_mut(),
+            4096,
+            libc::PROT_NONE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        );
+        assert_ne!(ptr, libc::MAP_FAILED, "mmap PROT_NONE");
+        ptr as u64
+    }
+}
+
+/// RAII for [`map_prot_none`] (legs must not leak mappings).
+struct ProtNonePage(u64);
+impl Drop for ProtNonePage {
+    fn drop(&mut self) {
+        unsafe {
+            libc::munmap(self.0 as *mut libc::c_void, 4096);
+        }
+    }
+}
+
+/// Clear the op's TRUNC cell between sequenced fires (mirrors the
+/// backend's clear-on-read: each drain consumes its flags, so the
+/// next fire's TRUNC read is that fire's delta, exactly). An
+/// absent key succeeds (nothing flagged); anything else fails
+/// loud. Verified empty after (a failed clear REDs here, never
+/// as a misattributed delta downstream).
+fn clear_trunc(loaded: &Loaded, tag: &str) {
+    use aya::maps::{Map, MapData, PerCpuHashMap};
+    let fd = loaded.maps["TRUNC"].try_clone().expect("clone TRUNC");
+    let data = MapData::from_fd(fd).expect("mapdata");
+    let map = Map::from_map_data(data).expect("map");
+    let mut m = PerCpuHashMap::<_, u32, u64>::try_from(map).expect("percpu shape");
+    match m.remove(&OP) {
+        Ok(()) => {}
+        Err(aya::maps::MapError::SyscallError(e))
+            if e.io_error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => panic!("{tag}: clear TRUNC: {e}"),
+    }
+    assert_eq!(
+        read_percpu(loaded, "TRUNC", OP, true),
+        0,
+        "{tag}: TRUNC cleared"
+    );
+}
+
+/// Pace sequenced single-tid fires (the tier-1 bucket bursts 4
+/// and refills 40/s — back-to-back fires past the burst skip
+/// cause 10, which would masquerade as the behavior under test).
+fn pace_fire_gap() {
+    std::thread::sleep(std::time::Duration::from_millis(30));
+}
+
+/// Two-page mapping whose second page is PROT_NONE, with `ncell`
+/// array cells copied to straddle the boundary: cells fully
+/// inside page 1 stay readable; a tuple read crossing into page 2
+/// faults (BPF probe_read fails the whole read atomically).
+/// Returns the array base (page 1 end − `ncell`×32 − 4, so the
+/// next cell's 8-byte tuple read spans the boundary); RAII
+/// munmaps both pages.
+struct StraddleMap {
+    ptr: u64,
+    page: usize,
+}
+impl StraddleMap {
+    fn build(src_array: u64, ncell: usize) -> (Self, u64) {
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let ptr = unsafe {
+            let p = libc::mmap(
+                std::ptr::null_mut(),
+                2 * page,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            );
+            assert_ne!(p, libc::MAP_FAILED, "mmap straddle");
+            p as u64
+        };
+        let rc = unsafe {
+            libc::mprotect(
+                (ptr + page as u64) as *mut libc::c_void,
+                page,
+                libc::PROT_NONE,
+            )
+        };
+        assert_eq!(rc, 0, "mprotect straddle page 2");
+        let base = ptr + page as u64 - (ncell * 32) as u64 - 4;
+        unsafe {
+            std::ptr::copy_nonoverlapping(src_array as *const u8, base as *mut u8, ncell * 32);
+        }
+        (Self { ptr, page }, base)
+    }
+}
+impl Drop for StraddleMap {
+    fn drop(&mut self) {
+        unsafe {
+            libc::munmap(self.ptr as *mut libc::c_void, 2 * self.page);
+        }
+    }
+}
+
 /// Assert every LOSS entry is zero (clean legs must lose nothing).
 fn assert_loss_zero(loaded: &Loaded) {
     use aya::maps::{Map, MapData, PerCpuHashMap};
@@ -445,6 +596,13 @@ const _: () = assert!(size_of::<FakeDispatch>() == 16);
 static FIXTURE_ARRAY: AtomicU64 = AtomicU64::new(0);
 /// Leg-configured provider lifetime verdict (0 cacheable, else no_store).
 static NS_VERDICT: AtomicI32 = AtomicI32::new(0);
+/// Leg-controlled verdict-store skip (NULL/unreadable-ns_ptr
+/// variants): when nonzero, the query target returns the fixture
+/// array WITHOUT storing through `no_store` (a store through a
+/// NULL/unmapped out-param would crash the leg; the BPF entry
+/// still records the raw arg2 — the member reads are what's under
+/// test, not the fixture store).
+static NS_SKIP_STORE: AtomicI32 = AtomicI32::new(0);
 
 /// query_operation-shaped target: stashes nothing itself (the BPF
 /// entry does), returns the leg's fixture array, stamps the leg's
@@ -455,7 +613,9 @@ static NS_VERDICT: AtomicI32 = AtomicI32::new(0);
 ///
 /// # Safety
 ///
-/// `no_store` must point to a live writable `c_int` for the call.
+/// `no_store` must point to a live writable `c_int` for the call,
+/// unless `NS_SKIP_STORE` is set (NULL/unreadable variants — the
+/// target never touches it, the BPF entry records the raw arg2).
 #[unsafe(no_mangle)]
 #[inline(never)]
 pub unsafe extern "C" fn osslscope_member_query(
@@ -464,7 +624,9 @@ pub unsafe extern "C" fn osslscope_member_query(
     no_store: *mut std::ffi::c_int,
 ) -> *const FakeAlg {
     unsafe {
-        *no_store = NS_VERDICT.load(Ordering::SeqCst);
+        if NS_SKIP_STORE.load(Ordering::SeqCst) == 0 {
+            *no_store = NS_VERDICT.load(Ordering::SeqCst);
+        }
         FIXTURE_ARRAY.load(Ordering::SeqCst) as *const FakeAlg
     }
 }
@@ -485,6 +647,28 @@ fn fire(op: i32, n: usize) {
             osslscope_member_query(std::ptr::null_mut(), op, &mut ns as *mut std::ffi::c_int)
         };
         std::hint::black_box(_rv);
+    }
+}
+
+/// Fire once with an explicit `no_store` out-param (NULL/unreadable
+/// variants — the caller sets `NS_SKIP_STORE` first so the target
+/// never touches it; the BPF entry records the raw arg2).
+fn fire_ns_raw(op: i32, no_store: *mut std::ffi::c_int) {
+    // SAFETY: caller upholds the target's contract (live slot or
+    // NS_SKIP_STORE set).
+    let _rv = unsafe { osslscope_member_query(std::ptr::null_mut(), op, no_store) };
+    std::hint::black_box(_rv);
+}
+
+/// Fire `n` times paced `gap_ms` apart (bucket-safe flooding: the
+/// tier-1 bucket refills 40/s, so 30ms gaps keep every fire
+/// admitted — drops come from ring exhaustion, never the bucket).
+fn fire_paced(op: i32, n: usize, gap_ms: u64) {
+    for i in 0..n {
+        if i > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(gap_ms));
+        }
+        fire(op, 1);
     }
 }
 
@@ -3642,10 +3826,15 @@ fn d_l3_tail_warm() {
 
 /// D terminator control at j == T (+READ contrast): member AT T
 /// must still READ (j > T skips — a j ≥ T gate would skip it).
-/// Slot 3's names pointer is poisoned (unmapped): member 3 walks
-/// (T=3) → name-read fails → TRUNC_WALK_NAME + ALG_UNREADABLE for
-/// idx 3 (proving the read); members 4+ skip-silent (no reads —
-/// live slots 4,5 absent).
+/// Two cells, one attach (warm T=3, verdict 0, drain between):
+/// NAME — slot 3's names pointer is poisoned (unmapped) while
+/// its tuple stays readable, so member 3 attempts the name read
+/// and fails it → TRUNC_WALK_NAME + ALG_UNREADABLE for idx 3
+/// (proving the read); READ — a second array whose slot-3 tuple
+/// read faults while 0..2 stay readable (page-straddle layout),
+/// so member 3 aborts SILENT (no ALG record — the contrast with
+/// the NAME cell's explicit record) with TRUNC_WALK_READ alone.
+/// Members 4+ skip-silent in both cells (warm + zero verdict).
 #[test]
 #[ignore]
 fn d_terminator_control() {
@@ -3679,6 +3868,7 @@ fn d_terminator_control() {
     FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
     NS_VERDICT.store(0, Ordering::SeqCst);
     write_tcache(loaded, fx.array, 3, 0);
+    // NAME cell.
     fire(OP as i32, 1);
     let ScanDrain {
         calls,
@@ -3687,7 +3877,7 @@ fn d_terminator_control() {
         algs,
         rows,
     } = drain(loaded);
-    assert_calls_admitted(&calls, 1, "term-control");
+    assert_calls_admitted(&calls, 1, "term-name");
     assert_eq!(rets.len(), 1, "RET joined");
     ret_for(&rets, calls[0].tid, calls[0].seq);
     assert!(guards.is_empty(), "warm T=3 ≠ 512 → no guard");
@@ -3695,7 +3885,7 @@ fn d_terminator_control() {
     let idx3: Vec<_> = algs.iter().filter(|a| a.idx == 3).collect();
     assert_eq!(idx3.len(), 1, "member 3 read (j == T walks)");
     assert_eq!(idx3[0].status, wire::ALG_UNREADABLE);
-    // Members 4+ skipped (live slots 4,5 absent — no reads).
+    // Members 4+ skipped (live slots 4,5 never read).
     assert!(
         algs.iter().all(|a| a.idx <= 3) && rows.iter().all(|r| r.idx <= 2),
         "members 4+ never fired"
@@ -3711,8 +3901,49 @@ fn d_terminator_control() {
         wire::TRUNC_WALK_NAME,
         "name-fail flags alone (skip path leaves no TRUNC)"
     );
+    // READ cell: cells 0..2 copied to straddle the mapped/PROT_NONE
+    // boundary (names/dispatch pointers still reach the fixture
+    // above, which outlives this fire); member 3's tuple read
+    // spans the boundary and faults.
+    let (_straddle, base) = StraddleMap::build(fx.array, 3);
+    pace_fire_gap();
+    clear_trunc(loaded, "term-read");
+    FIXTURE_ARRAY.store(base, Ordering::SeqCst);
+    write_tcache(loaded, base, 3, 0);
+    fire(OP as i32, 1);
+    let d = drain(loaded);
+    assert_calls_admitted(&d.calls, 1, "term-read");
+    assert_eq!(d.rets.len(), 1, "term-read: RET joined");
+    ret_for(&d.rets, d.calls[0].tid, d.calls[0].seq);
+    assert!(d.guards.is_empty(), "term-read: no guard");
+    // Prefix 0..2 exact (readable side of the straddle).
+    for j in 0..3u64 {
+        let got: Vec<_> = d.algs.iter().filter(|a| a.idx == j).collect();
+        assert_eq!(got.len(), 1, "term-read: slot {j} exact");
+        assert_eq!(got[0].status, wire::ALG_OK);
+        assert_eq!(
+            d.rows.iter().filter(|r| r.idx == j).count(),
+            1,
+            "term-read: slot {j} row"
+        );
+    }
+    // Member 3 aborted SILENT (tuple-read fault — no ALG record,
+    // contrasting the NAME cell's explicit UNREADABLE record);
+    // members 4+ skipped as before.
+    assert!(
+        d.algs.iter().all(|a| a.idx <= 2) && d.rows.iter().all(|r| r.idx <= 2),
+        "term-read: member 3 silent, members 4+ skipped"
+    );
+    assert_eq!(d.algs.len(), 3, "term-read: exactly the readable prefix");
+    assert_eq!(
+        read_percpu(loaded, "TRUNC", OP, true),
+        wire::TRUNC_WALK_READ,
+        "term-read: tuple abort flags READ alone"
+    );
+    // End-state: both queries retired + counted, no loss.
     assert_retired(loaded, tid, "term-control");
     assert_loss_zero(loaded);
+    assert_eq!(read_percpu(loaded, "CALLS", OP, false), 2);
 }
 
 /// D GEN-stale-smaller (stale T=3 < live T=6 walks more — the
@@ -3776,15 +4007,19 @@ fn d_gen_stale_smaller() {
     assert_loss_zero(loaded);
 }
 
-/// D no_store-prefix matrix (verdict × cache-state; R18 §4.1 — no
-/// shared prove, local reads): warm+zero skips past T; warm+
-/// nonzero cold-walks (full reach) with member-0's TRUNC_NO_STORE
-/// (skip-proof — the flag is evaluated on the always-walked
-/// member 0); cold walks regardless of verdict (cache ignored);
-/// cold+nonzero flags NO_STORE too. (NULL/unreadable pointees hit
-/// the same `_` arm as nonzero — `Ok(0)` vs `_` — covered by
-/// construction; the live target cannot pass them without
-/// crashing itself on the verdict store.)
+/// D no_store-prefix matrix (R18 §4.1 + RR-04 — no shared
+/// prove, per-member local reads): warm T=3 injected, the array
+/// holds 7 live slots. One attach, sequenced fires with a drain
+/// between (TRUNC accumulates — deltas per fire):
+/// cold walks regardless of verdict (cache ignored);
+/// warm+zero skips past T (members 0..=3 walk);
+/// warm+nonzero cold-walks all 7 (full reach) with TRUNC_NO_STORE;
+/// NULL-ns_ptr and unreadable-ns_ptr walk cold too (fail-closed —
+/// only a successfully-read zero pointee skips);
+/// and both verdict orders pin order-independence (a verdict-1
+/// fire neither poisons the next skip nor is needed for it —
+/// member-0-first is flag publisher only, LIFO fire order
+/// depended on nothing).
 #[test]
 #[ignore]
 fn d_no_store_prefix() {
@@ -3795,7 +4030,10 @@ fn d_no_store_prefix() {
     };
     let exe = own_exe_cstr();
     let off = query_off();
-    let slots: Vec<SlotSpec> = (0..3u32)
+    let attached = attach_chunk(&obj, &exe, off);
+    let loaded = &attached.loaded;
+    let tid = self_tid();
+    let slots: Vec<SlotSpec> = (0..7u32)
         .map(|j| {
             SlotSpec::live(
                 &format!("MDN{j}"),
@@ -3804,69 +4042,158 @@ fn d_no_store_prefix() {
             )
         })
         .collect();
-    let tail: Vec<SlotSpec> = (0..3u32)
-        .map(|t| {
-            SlotSpec::live(
-                &format!("MDNT{t}"),
-                200 + t as u16,
-                vec![(900 + t, 0x9900 + t as u64)],
-            )
-        })
-        .collect();
-    // (warm?, verdict, expect_skip_past_2, expect_no_store)
-    for (warm, verdict, skip, no_store) in [
-        (true, 0, true, false),
-        (true, 1, false, true),
-        (false, 0, false, false),
-        (false, 1, false, true),
-    ] {
-        let tag = format!("ns-w{warm}-v{verdict}");
-        let attached = attach_chunk(&obj, &exe, off);
-        let loaded = &attached.loaded;
-        let tid = self_tid();
-        let mut entries: Vec<(String, u16)> =
-            slots.iter().map(|s| (s.name.clone(), s.class)).collect();
-        entries.extend(tail.iter().map(|s| (s.name.clone(), s.class)));
-        let fx = Fixture::build(&slots, &tail);
-        fx.pretouch();
-        populate_alg_class(loaded, &entries);
-        FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
-        NS_VERDICT.store(verdict, Ordering::SeqCst);
-        if warm {
-            write_tcache(loaded, fx.array, 2, 0);
-        }
-        fire(OP as i32, 1);
+    // Zero-padded to the full chunk: cold members all walk, so
+    // every slot past the live prefix must read names==0
+    // (explicit EMPTY) — an unpadded array would feed
+    // members 8+ names/blob bytes and unmapped faults
+    // (READ/NOIMP/NAME soup + silent aborts past member 128).
+    let fx = Fixture::build_padded(&slots, &[], 512);
+    fx.pretouch();
+    populate_alg_class(loaded, &fx.classes);
+    FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
+    // Unreadable pointee: mapped but faulting (PROT_NONE).
+    let _prot_none = ProtNonePage(map_prot_none());
+    let unreadable = _prot_none.0 as *mut std::ffi::c_int;
+
+    /// Drain one fire: exactly one admitted CALL + one live RET, no
+    /// guard (slot 511 zero); returns the drain + this fire's
+    /// TRUNC flags (the leg clears TRUNC before every fire, so the
+    /// read is the fire's delta, exactly).
+    fn one_fire(loaded: &Loaded, tag: &str) -> (ScanDrain, u64) {
         let d = drain(loaded);
-        assert_eq!(d.calls.len(), 1, "{tag}: CALL");
+        assert_calls_admitted(&d.calls, 1, tag);
         assert_eq!(d.rets.len(), 1, "{tag}: RET");
-        assert!(d.guards.is_empty(), "{tag}: no guard (T ≤ 3)");
-        if skip {
-            assert!(
-                d.algs.iter().all(|a| a.idx <= 2) && d.rows.iter().all(|r| r.idx <= 2),
-                "{tag}: past-T skipped"
-            );
-        } else {
-            for j in 0..6u64 {
-                assert_eq!(
-                    d.algs.iter().filter(|a| a.idx == j).count(),
-                    1,
-                    "{tag}: slot {j} walked"
-                );
-            }
-        }
-        let trunc = read_percpu(loaded, "TRUNC", OP, true);
-        if no_store {
-            assert_eq!(
-                trunc,
-                wire::TRUNC_NO_STORE,
-                "{tag}: member-0 flags NO_STORE"
-            );
-        } else {
-            assert_eq!(trunc, 0, "{tag}: TRUNC clean");
-        }
-        assert_retired(loaded, tid, &tag);
-        assert_loss_zero(loaded);
+        let r = ret_for(&d.rets, d.calls[0].tid, d.calls[0].seq);
+        assert_eq!(
+            (r.kind, r.op, r.flags),
+            (osslscope_ebpf_common::KIND_SCAN_RET, OP, 0)
+        );
+        assert!(d.guards.is_empty(), "{tag}: no guard (T ≤ 7)");
+        (d, read_percpu(loaded, "TRUNC", OP, true))
     }
+    /// Full cold reach: live prefix exact (1 ALG_OK + 1 ROW per
+    /// slot), every slot past it an explicit EMPTY (cold members
+    /// all walk — 512 ALGs; the T-gate is warm-only).
+    fn assert_full_reach(d: &ScanDrain, live: u64, tag: &str) {
+        assert_eq!(d.algs.len(), 512, "{tag}: cold members all walk");
+        for j in 0..live {
+            let got: Vec<_> = d.algs.iter().filter(|a| a.idx == j).collect();
+            assert_eq!(got.len(), 1, "{tag}: slot {j} walked");
+            assert_eq!(
+                got[0].status,
+                osslscope_ebpf_common::ALG_OK,
+                "{tag}: slot {j} live"
+            );
+            assert_eq!(
+                d.rows.iter().filter(|r| r.idx == j).count(),
+                1,
+                "{tag}: slot {j} row"
+            );
+        }
+        assert!(
+            d.algs
+                .iter()
+                .filter(|a| a.idx >= live)
+                .all(|a| a.status == osslscope_ebpf_common::ALG_EMPTY),
+            "{tag}: past-live slots explicit EMPTY"
+        );
+        assert_eq!(d.rows.len() as u64, live, "{tag}: rows = live only");
+    }
+    /// Warm skip past T=3: members 0..=3 walk, 4+ skip-silent.
+    fn assert_skipped(d: &ScanDrain, tag: &str) {
+        assert!(
+            d.algs.iter().all(|a| a.idx <= 3) && d.rows.iter().all(|r| r.idx <= 3),
+            "{tag}: past-T skipped"
+        );
+        assert_eq!(d.algs.len(), 4, "{tag}: members 0..=3 walked");
+        assert_eq!(d.rows.len(), 4, "{tag}: rows 0..=3");
+    }
+
+    // F1: cold + verdict 0 → full reach, TRUNC clean.
+    clear_trunc(loaded, "ns-cold-0");
+    NS_VERDICT.store(0, Ordering::SeqCst);
+    fire(OP as i32, 1);
+    let (d, dt) = one_fire(loaded, "ns-cold-0");
+    assert_full_reach(&d, 7, "ns-cold-0");
+    assert_eq!(dt, 0, "ns-cold-0: TRUNC clean");
+    // F2: cold + verdict 1 → full reach (cache ignored anyway) +
+    // NO_STORE flagged (member 0 always evaluates the verdict).
+    pace_fire_gap();
+    clear_trunc(loaded, "ns-cold-1");
+    NS_VERDICT.store(1, Ordering::SeqCst);
+    fire(OP as i32, 1);
+    let (d, dt) = one_fire(loaded, "ns-cold-1");
+    assert_full_reach(&d, 7, "ns-cold-1");
+    assert_eq!(dt, wire::TRUNC_NO_STORE, "ns-cold-1: NO_STORE flagged");
+    // Inject warm T=3 (gen 0 = live GEN).
+    write_tcache(loaded, fx.array, 3, 0);
+    // F3: warm + verdict 0 → skips past T, TRUNC clean.
+    pace_fire_gap();
+    clear_trunc(loaded, "ns-warm-0");
+    NS_VERDICT.store(0, Ordering::SeqCst);
+    fire(OP as i32, 1);
+    let (d, dt) = one_fire(loaded, "ns-warm-0");
+    assert_skipped(&d, "ns-warm-0");
+    assert_eq!(dt, 0, "ns-warm-0: TRUNC clean");
+    // F4: warm + verdict 1 → all 7 walk (order 0-then-1) + NO_STORE.
+    pace_fire_gap();
+    clear_trunc(loaded, "ns-warm-1");
+    NS_VERDICT.store(1, Ordering::SeqCst);
+    fire(OP as i32, 1);
+    let (d, dt) = one_fire(loaded, "ns-warm-1");
+    assert_full_reach(&d, 7, "ns-warm-1");
+    assert_eq!(dt, wire::TRUNC_NO_STORE, "ns-warm-1: NO_STORE flagged");
+    // F5: warm + verdict 0 again → skips (order 1-then-0: the
+    // verdict-1 fire poisons nothing), TRUNC clean.
+    pace_fire_gap();
+    clear_trunc(loaded, "ns-warm-0-again");
+    NS_VERDICT.store(0, Ordering::SeqCst);
+    fire(OP as i32, 1);
+    let (d, dt) = one_fire(loaded, "ns-warm-0-again");
+    assert_skipped(&d, "ns-warm-0-again");
+    assert_eq!(dt, 0, "ns-warm-0-again: TRUNC clean");
+    // F6: warm + NULL ns_ptr → all 7 walk cold (fail-closed) +
+    // NO_STORE flagged.
+    pace_fire_gap();
+    clear_trunc(loaded, "ns-warm-null");
+    NS_SKIP_STORE.store(1, Ordering::SeqCst);
+    fire_ns_raw(OP as i32, std::ptr::null_mut());
+    NS_SKIP_STORE.store(0, Ordering::SeqCst);
+    let (d, dt) = one_fire(loaded, "ns-warm-null");
+    assert_full_reach(&d, 7, "ns-warm-null");
+    assert_eq!(dt, wire::TRUNC_NO_STORE, "ns-warm-null: NO_STORE flagged");
+    // F7: warm + unreadable ns_ptr → all 7 walk cold + NO_STORE.
+    pace_fire_gap();
+    clear_trunc(loaded, "ns-warm-unreadable");
+    NS_SKIP_STORE.store(1, Ordering::SeqCst);
+    fire_ns_raw(OP as i32, unreadable);
+    NS_SKIP_STORE.store(0, Ordering::SeqCst);
+    let (d, dt) = one_fire(loaded, "ns-warm-unreadable");
+    assert_full_reach(&d, 7, "ns-warm-unreadable");
+    assert_eq!(
+        dt,
+        wire::TRUNC_NO_STORE,
+        "ns-warm-unreadable: NO_STORE flagged"
+    );
+    // F8: warm + verdict 0 → skips (bad-pointer fires poison
+    // nothing either), TRUNC clean.
+    pace_fire_gap();
+    clear_trunc(loaded, "ns-warm-0-final");
+    NS_VERDICT.store(0, Ordering::SeqCst);
+    fire(OP as i32, 1);
+    let (d, dt) = one_fire(loaded, "ns-warm-0-final");
+    assert_skipped(&d, "ns-warm-0-final");
+    assert_eq!(dt, 0, "ns-warm-0-final: TRUNC clean");
+    // End-state: retired + silent loss planes (reservation drops:
+    // none — the ring is far from full) + 8 queries counted.
+    assert_retired(loaded, tid, "ns-matrix");
+    assert_loss_zero(loaded);
+    assert_eq!(read_percpu(loaded, "CALLS", OP, false), 8);
+    assert_eq!(
+        read_percpu(loaded, "TRUNC", OP, true),
+        0,
+        "ns-matrix: F8 clean"
+    );
 }
 
 /// D guard-cold-ERROR: cold + slot-511-live + slot-512-UNREADABLE
@@ -4477,14 +4804,17 @@ fn d_pressure_gov0() {
     );
 }
 
-/// D burst-exactness + drop-path (§7D): (a) burst — 3× 512-live
+/// D burst-exactness + pressure-skip (§7D): (a) burst — 3× 512-live
 /// scans no-drain, per-(tid,seq) pairing exact (1 CALL + 1 RET +
-/// 512 ALG + 512 ROW + 1 GUARD each), each retired; (b) drop-path
-/// — 200 NULL no-drain at T=8000: exactly 101 admit (fire 101
-/// sees occ 8000 ≤ 8000), 99 skip cause 4; RETs == admits. The 200
-/// fires spread over 50 worker tids × 4 (item 5: a single tid's
-/// bucket burst is 4 — 200 on one tid would bucket-skip, not
-/// occupancy-skip; occupancy is global so the math is unchanged).
+/// 512 ALG + 512 ROW + 1 GUARD each), each retired; (b)
+/// pressure-skip — 200 NULL no-drain at T=8000: exactly 101 admit
+/// (fire 101 sees occ 8000 ≤ 8000), 99 skip cause 4; RETs ==
+/// admits. The 200 fires spread over 50 worker tids × 4 (item 5: a
+/// single tid's bucket burst is 4 — 200 on one tid would
+/// bucket-skip, not occupancy-skip; occupancy is global so the
+/// math is unchanged). (This cell proves governor backpressure,
+/// not reservation failure — the drop-path control is
+/// `d_drop_path_reservation`.)
 #[test]
 #[ignore]
 fn d_burst_exactness() {
@@ -4538,7 +4868,7 @@ fn d_burst_exactness() {
         assert_retired(loaded, tid, "burst");
         assert_loss_zero(loaded);
     }
-    // (b) Drop-path: 200 NULL at T=8000 → 101 admit / 99 skip.
+    // (b) Pressure-skip: 200 NULL at T=8000 → 101 admit / 99 skip.
     {
         let attached = attach_with_ctrl(&obj, &exe, off, &wire::ctrl_value(512, 1, 8000));
         let loaded = &attached.loaded;
@@ -4552,23 +4882,242 @@ fn d_burst_exactness() {
             fire_on_worker(loaded, OP as i32, 4);
         }
         let d = drain(loaded);
-        assert_eq!(d.calls.len(), 200, "drop: 200 CALLs, single drain");
+        assert_eq!(d.calls.len(), 200, "pressure: 200 CALLs, single drain");
         let (adm, skp): (Vec<&_>, Vec<&_>) = d
             .calls
             .iter()
             .partition(|c| call_parts(c).1 == wire::SKIP_ADMITTED);
-        assert_eq!(adm.len(), 101, "drop: 101 admit (fire 101 sees occ 8000)");
-        assert_eq!(skp.len(), 99, "drop: 99 pressure-skips");
+        assert_eq!(
+            adm.len(),
+            101,
+            "pressure: 101 admit (fire 101 sees occ 8000)"
+        );
+        assert_eq!(skp.len(), 99, "pressure: 99 pressure-skips");
         assert!(
             skp.iter()
                 .all(|c| call_parts(c).1 == wire::SKIP_RING_PRESSURE)
         );
-        assert_eq!(d.rets.len(), 101, "drop: RET per admit");
-        assert!(d.algs.is_empty() && d.rows.is_empty(), "drop: NULL silence");
+        assert_eq!(d.rets.len(), 101, "pressure: RET per admit");
+        assert!(
+            d.algs.is_empty() && d.rows.is_empty(),
+            "pressure: NULL silence"
+        );
         assert_eq!(read_percpu(loaded, "CALLS", OP, false), 101);
         assert_eq!(read_attempt(loaded), 200);
-        assert_loss_only(loaded, wire::LOSS_RING_PRESSURE, 99, "drop");
+        assert_loss_only(loaded, wire::LOSS_RING_PRESSURE, 99, "pressure");
     }
+}
+
+/// D drop-path: forced reservation failure + per-kind
+/// reconciliation (R18 §7D — the accepted control, recomputed
+/// for the current wire format and 16MiB ring: R18's "2979th of
+/// 2MiB" predates explicit EMPTY emits and the item-7 ring
+/// growth). 600 cold T=6 1-ROW scans, no drain, ring-permissive
+/// governor (occupancy can never exceed the ring, so cause 4
+/// cannot trip — backpressure arrives only as reservation
+/// failure), bucket-safe pacing (no cause-10 skips).
+/// One scan = CALL(32) + RET(48) + 512×ALG(64) + 6×ROW(72) =
+/// 33,280B on the ring (8B header + 8-rounding per record — the
+/// 80B NULL quantum pins the framing); the 16MiB ring holds 504
+/// full scans, then scan 505 lands a partial prefix and every
+/// later reservation fails. Members fire descending (511 first,
+/// 0 last — LIFO), so scan 505's prefix is CALL + 63 ALGs (idx
+/// 511..=449): member 0's RET finds 32B left and drops, as does
+/// member 0's ALG; the 6 live-slot ROWs attempt and drop too.
+/// Attempts: CALL/RET 600, ALG 512×600, ROW 6×600, GUARD 0.
+/// Reconcile: emitted + LOSS_RING_* == attempted per kind; zero
+/// cause-4 (ATTEMPT−CALLS==0 — every fire admitted); TRUNC clean
+/// (reservation drops are LOSS, never TRUNC); every query still
+/// retires (emission failure never aborts the member epilogue).
+#[test]
+#[ignore]
+fn d_drop_path_reservation() {
+    use osslscope_ebpf_common as wire;
+    let Some(obj) = gated() else {
+        eprintln!("SKIP(members-live): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
+        return;
+    };
+    const N: usize = 600;
+    const LIVE: u64 = 6;
+    // Ring capacity in whole scans + the partial tail (recomputed
+    // above — pinned here so a wire-format change REDs loudly
+    // instead of silently re-baselining). Scan 505 emits CALL +
+    // 63 ALGs but no RET (member 0 fires last).
+    const FULL_SCANS: usize = 504;
+    const TAIL_ALGS: usize = 63;
+    let exe = own_exe_cstr();
+    let off = query_off();
+    // Ring-permissive governor: occupancy never exceeds the ring,
+    // so the governor cannot trip (cause 4 impossible by
+    // construction — drops prove reservation failure, only it).
+    let ctrl = wire::ctrl_value(512, 1, osslscope::loader::MEMBER_RING_BYTES);
+    let attached = attach_with_ctrl(&obj, &exe, off, &ctrl);
+    let loaded = &attached.loaded;
+    let tid = self_tid();
+    let mut births = BirthState::new();
+    register(loaded, &mut births, &[tid]);
+    let slots: Vec<SlotSpec> = (0..LIVE as u32)
+        .map(|j| {
+            SlotSpec::live(
+                &format!("MDP{j}"),
+                100 + j as u16,
+                vec![(300 + j, 0x4400 + j as u64)],
+            )
+        })
+        .collect();
+    // Zero-padded to the full chunk (cold members all walk —
+    // every scan emits exactly 512 ALGs: 6 live + 506 EMPTY).
+    let fx = Fixture::build_padded(&slots, &[], 512);
+    fx.pretouch();
+    populate_alg_class(loaded, &fx.classes);
+    FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
+    NS_VERDICT.store(0, Ordering::SeqCst);
+    fire_paced(OP as i32, N, 30);
+    let d = drain(loaded);
+    // CALLs: scans 1..=505 emitted (seqs 0..=504, ring FIFO
+    // order), all admitted — scans 506.. never reserved.
+    assert_eq!(d.calls.len(), FULL_SCANS + 1, "drop: 505 CALLs");
+    let seqs: Vec<u64> = d.calls.iter().map(|c| c.seq).collect();
+    assert_eq!(
+        seqs,
+        (0..(FULL_SCANS + 1) as u64).collect::<Vec<_>>(),
+        "drop: CALL seqs 0..=504 in order"
+    );
+    assert_calls_admitted(&d.calls, FULL_SCANS + 1, "drop");
+    // RETs join the complete scans 1:1, all live; scan 505's RET
+    // dropped (member 0 fires last — the ring filled first).
+    assert_eq!(d.rets.len(), FULL_SCANS, "drop: 504 RETs");
+    for c in d.calls.iter().take(FULL_SCANS) {
+        let r = ret_for(&d.rets, c.tid, c.seq);
+        assert_eq!(
+            (r.kind, r.op, r.flags, r.arr),
+            (wire::KIND_SCAN_RET, OP, 0, fx.array),
+            "drop: live RET shape"
+        );
+    }
+    assert!(d.guards.is_empty(), "drop: no guard (slot 511 zero)");
+    // ALGs/ROWs group per seq: full scans complete, scan 505 a
+    // 62-ALG 0-ROW prefix, later seqs absent.
+    let mut alg_per_seq = std::collections::HashMap::new();
+    for a in &d.algs {
+        assert_eq!(a.tid, tid, "drop: ALG tid");
+        *alg_per_seq.entry(a.seq).or_insert(0usize) += 1;
+    }
+    let mut row_per_seq = std::collections::HashMap::new();
+    for r in &d.rows {
+        *row_per_seq.entry(r.seq).or_insert(0usize) += 1;
+    }
+    assert_eq!(
+        d.algs.len(),
+        FULL_SCANS * 512 + TAIL_ALGS,
+        "drop: 504×512 + 63 ALGs"
+    );
+    assert_eq!(d.rows.len(), FULL_SCANS * LIVE as usize, "drop: 504×6 ROWs");
+    for seq in 0..FULL_SCANS as u64 {
+        assert_eq!(
+            alg_per_seq.get(&seq),
+            Some(&512),
+            "drop: seq {seq} complete (512 ALGs)"
+        );
+        assert_eq!(
+            row_per_seq.get(&seq),
+            Some(&(LIVE as usize)),
+            "drop: seq {seq} complete (6 ROWs)"
+        );
+    }
+    assert_eq!(
+        alg_per_seq.get(&(FULL_SCANS as u64)),
+        Some(&TAIL_ALGS),
+        "drop: scan 505 a 63-ALG prefix"
+    );
+    // The prefix is the DESCENDING fire order made visible (511
+    // first): idx 511..=449 landed, member 0's ALG did not.
+    let mut tail_idx: Vec<u64> = d
+        .algs
+        .iter()
+        .filter(|a| a.seq == FULL_SCANS as u64)
+        .map(|a| a.idx)
+        .collect();
+    tail_idx.sort_unstable();
+    assert_eq!(
+        tail_idx,
+        (449..512u64).collect::<Vec<_>>(),
+        "drop: scan 505 prefix is idx 511..=449"
+    );
+    assert!(
+        !row_per_seq.contains_key(&(FULL_SCANS as u64)),
+        "drop: scan 505 has 0 ROWs (ring filled mid-scan)"
+    );
+    assert_eq!(alg_per_seq.len(), FULL_SCANS + 1, "drop: no seq past 504");
+    // Full-scan shape on samples (live prefix exact, past-live
+    // explicit EMPTY — the flood emits honest evidence, not soup).
+    for seq in [0u64, 250, 503] {
+        let live_ok = d
+            .algs
+            .iter()
+            .filter(|a| a.seq == seq && a.status == wire::ALG_OK)
+            .count();
+        assert_eq!(live_ok, LIVE as usize, "drop: seq {seq} 6 live ALGs");
+        assert!(
+            d.algs
+                .iter()
+                .filter(|a| a.seq == seq && a.idx >= LIVE)
+                .all(|a| a.status == wire::ALG_EMPTY),
+            "drop: seq {seq} past-live EMPTY"
+        );
+    }
+    // Reconcile: emitted + dropped == attempted per kind.
+    let l_call = loss_val(loaded, wire::LOSS_RING_CALL);
+    let l_ret = loss_val(loaded, wire::LOSS_RING_RET);
+    let l_alg = loss_val(loaded, wire::LOSS_RING_ALG);
+    let l_row = loss_val(loaded, wire::LOSS_RING_ROW);
+    assert_eq!(
+        d.calls.len() as u64 + l_call,
+        N as u64,
+        "drop: CALL reconcile"
+    );
+    assert_eq!(d.rets.len() as u64 + l_ret, N as u64, "drop: RET reconcile");
+    assert_eq!(
+        d.algs.len() as u64 + l_alg,
+        512 * N as u64,
+        "drop: ALG reconcile"
+    );
+    assert_eq!(
+        d.rows.len() as u64 + l_row,
+        LIVE * N as u64,
+        "drop: ROW reconcile"
+    );
+    assert_loss_exact(
+        loaded,
+        &[
+            (wire::LOSS_RING_CALL, (N - FULL_SCANS - 1) as u64),
+            // Scan 505's RET dropped with the 95 never-attempted.
+            (wire::LOSS_RING_RET, (N - FULL_SCANS) as u64),
+            (
+                wire::LOSS_RING_ALG,
+                (512 * N - (FULL_SCANS * 512 + TAIL_ALGS)) as u64,
+            ),
+            (
+                wire::LOSS_RING_ROW,
+                (LIVE as usize * N - FULL_SCANS * LIVE as usize) as u64,
+            ),
+        ],
+        "drop",
+    );
+    // Zero cause-4 (governor never tripped) — and zero skips of
+    // any cause: every fire admitted.
+    assert_eq!(read_attempt(loaded), N as u64, "drop: 600 attempts");
+    assert_eq!(
+        read_percpu(loaded, "CALLS", OP, false),
+        N as u64,
+        "drop: 600 admits"
+    );
+    assert_eq!(
+        read_percpu(loaded, "TRUNC", OP, true),
+        0,
+        "drop: TRUNC clean (drops are LOSS, never TRUNC)"
+    );
+    assert_retired(loaded, tid, "drop");
 }
 
 /// Tier-1 bucket live (item 5, §5.5): burst 4 admits back-to-back,
@@ -4576,7 +5125,7 @@ fn d_burst_exactness() {
 /// refill (40/s) re-admits. NULL queries (occupancy never binds —
 /// the bucket is the only skip source). Margins: fires are
 /// back-to-back (µs ≪ 25ms period); the sleep is 4.8× the
-/// 1-token period.
+/// 1token period.
 #[test]
 #[ignore]
 fn d_bucket_burst_refill() {
@@ -4811,14 +5360,28 @@ fn d_detach_wall() {
 // the D legs (OSSL_B_LIVE=1, OSSL_MEMBERS_OBJECT,
 // --test-threads=1, #[ignore]).
 
-/// Attach the production backend (full 512, production CTRL) and
-/// register this thread (BIRTH must exist before the entry fires —
-/// the entry skips unregistered tids).
+/// Attach the production backend over a single verified byte
+/// snapshot (full 512, production CTRL) and register this thread
+/// (BIRTH must exist before the entry fires — the entry skips
+/// unregistered tids). This is the production attach: the snapshot
+/// is size-capped exactly as at resolution, the same bytes identity
+/// would hash are the bytes the loader consumes (no path re-read
+/// can interpose a swap), and ALG_CLASS arrives populated from the
+/// single registry — legs never hand-fill it. Closure is
+/// production too: `poll()` (quiesced=false, opens close on
+/// successor takes) with `finish()` as the window-edge backstop —
+/// never quiesced inference.
 fn backend_chunk(obj: &std::path::Path, exe: &std::ffi::CString, off: u64) -> ScanBackend {
+    let bytes = std::fs::read(obj).expect("read members object");
+    assert!(
+        bytes.len() as u64 <= osslscope::discovery::onboard::MAX_OBJECT_SCAN_BYTES,
+        "production cap applies to the snapshot the backend loads"
+    );
     let ctrl =
         osslscope::loader::default_ctrl(512, osslscope::loader::MEMBER_RING_BYTES).expect("CTRL");
-    let mut backend = ScanBackend::attach(obj, exe, off, std::process::id(), &ctrl, None)
-        .expect("backend attach");
+    let mut backend =
+        ScanBackend::attach_bytes(&bytes, obj, exe, off, std::process::id(), &ctrl, None, 0)
+            .expect("backend attach");
     backend.register(&[self_tid()]).expect("register self");
     backend
 }
@@ -4827,12 +5390,18 @@ fn backend_chunk(obj: &std::path::Path, exe: &std::ffi::CString, off: u64) -> Sc
 /// (E=256 — the terminator sits deep in the array, past the early
 /// prefix the small fixtures exercise). Past-T is zero by
 /// construction (padded) — the T-gate is D's proven fact; what's
-/// under test here is the backend join at depth: exact TRUE-T,
-/// exact counts, the EMPTY guard, then the T_CACHE-cached close.
+/// under test here is the backend join at depth through production
+/// closure: the lone query stays open on its poll (quiesced=false
+/// — no successor), the successor's take closes it (exact TRUE-T,
+/// exact counts, warms T_CACHE @256), and the window-edge
+/// backstop closes the trailing warm query (cached close, no
+/// rewrite). No guard joins either verdict: slot 511 is EMPTY, so
+/// the cold scan is guard-ineligible (eligibility gates on slot
+/// 511 names, not on slot 512) — and T ≤ 511 is established by
+/// the explicit EMPTY terminator, which needs no positional proof.
 #[test]
 #[ignore]
 fn r19_backend_later_slots() {
-    use osslscope_ebpf_common as wire;
     let Some(obj) = gated() else {
         eprintln!("SKIP(members-live): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
         return;
@@ -4851,17 +5420,26 @@ fn r19_backend_later_slots() {
         .collect();
     let fx = Fixture::build_padded(&slots, &[], 513);
     fx.pretouch();
-    populate_alg_class(backend.loaded(), &fx.classes);
     FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
     NS_VERDICT.store(0, Ordering::SeqCst);
-    // Fire 1 (cold): completes uncached, warms T_CACHE @256.
+    // Fire 1 (cold): the lone query stays open — production polls
+    // quiesced=false, so opens close on successor takes, never on
+    // retirement inference.
     fire(OP as i32, 1);
-    let d1 = backend
-        .poll_at(std::time::Instant::now(), true)
-        .expect("backend poll 1");
+    let d1 = backend.poll().expect("backend poll 1");
     assert!(d1.findings.is_empty(), "later-slots: no findings");
-    assert_eq!(d1.done.len(), 1, "later-slots: one WalkDone");
-    let w1 = &d1.done[0];
+    assert!(
+        d1.done.is_empty(),
+        "later-slots: lone query stays open (no successor)"
+    );
+    // Fire 2: the successor's take closes query 1 — cold Complete
+    // @256, warms T_CACHE @256. Every walked slot emits exactly
+    // one ALG read-status (256 live + 256 explicit EMPTY); only
+    // live slots dispatch rows.
+    fire(OP as i32, 1);
+    let d2 = backend.poll().expect("backend poll 2");
+    assert_eq!(d2.done.len(), 1, "later-slots: successor closes query 1");
+    let w1 = &d2.done[0];
     assert_eq!((w1.tid, w1.op, w1.arr), (self_tid(), OP, fx.array));
     assert_eq!(
         w1.outcome,
@@ -4872,62 +5450,102 @@ fn r19_backend_later_slots() {
         "later-slots: cold Complete @256"
     );
     assert_eq!(w1.true_t, TrueT::Proven(256));
-    assert_eq!((w1.alg_count, w1.row_count), (256, 256));
-    let g = w1.guard.as_ref().expect("later-slots: guard joined");
-    assert_eq!(
-        (g.kind, g.op, g.verdict, g.arr),
-        (wire::KIND_GUARD, OP, wire::GUARD_EMPTY, fx.array),
-        "later-slots: EMPTY guard (slot 512 zero)"
+    assert_eq!((w1.alg_count, w1.row_count), (512, 256));
+    assert!(
+        w1.guard.is_none(),
+        "later-slots: no guard (slot 511 EMPTY → cold-ineligible)"
     );
     assert!(
-        d1.actions.iter().any(
+        d2.actions.iter().any(
             |a| matches!(a, BackendAction::CacheWarmed { arr, t } if *arr == fx.array && *t == 256)
         ),
         "later-slots: warms T_CACHE @256, got {:?}",
-        d1.actions
+        d2.actions
     );
     assert!(
-        d1.actions
+        d2.actions
             .iter()
             .all(|a| !matches!(a, BackendAction::Detached | BackendAction::SkipAllEngaged)),
         "later-slots: no storm/throttle"
     );
-    // Fire 2 (warm): completes cached, no T_CACHE rewrite.
+    // Fire 3: the successor's take closes query 2 — a cold
+    // re-proof, not a cached ride (query 2 fired before query 1
+    // closed, so the cache was empty at its fire time; its gen-0
+    // stamp against epoch 1 is the benign unrecorded-at-fire
+    // race, never GenStale). Full cold evidence re-proves
+    // T=256: Complete, uncached, no rewrite.
     fire(OP as i32, 1);
-    let d2 = backend
-        .poll_at(std::time::Instant::now(), true)
-        .expect("backend poll 2");
-    assert_eq!(d2.done.len(), 1, "later-slots: one WalkDone (warm)");
-    let w2 = &d2.done[0];
+    let d3 = backend.poll().expect("backend poll 3");
+    assert_eq!(d3.done.len(), 1, "later-slots: successor closes query 2");
+    let w2 = &d3.done[0];
     assert_eq!(
         w2.outcome,
+        Outcome::Complete {
+            true_t: 256,
+            cached: false
+        },
+        "later-slots: cold re-proof Complete @256"
+    );
+    assert_eq!(w2.true_t, TrueT::Proven(256));
+    assert_eq!((w2.alg_count, w2.row_count), (512, 256));
+    assert!(
+        w2.guard.is_none(),
+        "later-slots: no guard on the re-proof either (slot 511 EMPTY)"
+    );
+    assert_eq!(w2.seq, w1.seq + 1, "later-slots: seq advances");
+    assert!(
+        d3.actions
+            .iter()
+            .all(|a| !matches!(a, BackendAction::CacheWarmed { .. })),
+        "later-slots: no rewrite on re-proof"
+    );
+    // Window edge: the backstop closes query 3 — the true cached
+    // ride (fired post-warming, stamped gen 1, T-gated walk: the
+    // 256 live slots emit ALG/ROW evidence and member 256
+    // re-confirms the EMPTY terminator every scan — the warm
+    // verdict never coasts on an unverified T).
+    let d4 = backend.finish().expect("backend finish");
+    assert_eq!(d4.done.len(), 1, "later-slots: backstop closes query 3");
+    let w3 = &d4.done[0];
+    assert_eq!(
+        w3.outcome,
         Outcome::Complete {
             true_t: 256,
             cached: true
         },
         "later-slots: cached Complete @256"
     );
-    assert_eq!(w2.seq, w1.seq + 1, "later-slots: seq advances");
+    assert_eq!(w3.true_t, TrueT::Proven(256));
+    assert_eq!((w3.alg_count, w3.row_count), (257, 256));
     assert!(
-        d2.actions
+        w3.guard.is_none(),
+        "later-slots: no guard on the warm close (T=256 ≠ 512)"
+    );
+    assert_eq!(w3.seq, w2.seq + 1, "later-slots: seq advances");
+    assert!(
+        d4.actions
             .iter()
             .all(|a| !matches!(a, BackendAction::CacheWarmed { .. })),
         "later-slots: no rewrite on cached close"
     );
-    // End-state: retired + silent loss planes + both queries counted.
+    // End-state: retired + silent loss planes + all queries counted.
     let loaded = backend.loaded();
     assert_retired(loaded, self_tid(), "later-slots");
     assert_loss_zero(loaded);
-    assert_eq!(read_percpu(loaded, "CALLS", OP, false), 2);
+    assert_eq!(read_percpu(loaded, "CALLS", OP, false), 3);
     assert_eq!(read_percpu(loaded, "TRUNC", OP, true), 0);
 }
 
 /// R19: the 512/513 termination boundary through the production
-/// backend. Producer shapes mirror L6 (512-clean: GUARD EMPTY,
-/// TRUNC clear; 513-live: GUARD VALID, TRUNC_ALGS, slot 512
-/// unwalked); what's under test is the backend close — 512
-/// completes (then caches), 513 closes Partial with the Overfull
-/// reason and TRUE-T demoted to Candidate(512), never Proven.
+/// backend and production closure. Producer shapes mirror L6
+/// (512-clean: GUARD EMPTY, TRUNC clear; 513-live: GUARD VALID,
+/// TRUNC_ALGS, slot 512 unwalked); what's under test is the
+/// backend close — 512 completes (cold, then cached with a fresh
+/// boundary proof every scan), 513 closes Partial with the
+/// Overfull reason and TRUE-T demoted to Candidate(512), never
+/// Proven. Each lone query stays open on its own poll; the
+/// successor's take closes the predecessor and the window-edge
+/// backstop closes the trailer.
 #[test]
 #[ignore]
 fn r19_backend_termination_512_513() {
@@ -4938,7 +5556,9 @@ fn r19_backend_termination_512_513() {
     };
     let exe = own_exe_cstr();
     let off = query_off();
-    // 512-clean: completes uncached, then cached.
+    // 512-clean: cold Complete, then the cached close with its own
+    // fresh EMPTY guard (a 512 belief still needs its boundary
+    // proof every scan — the warm verdict never coasts).
     {
         let slots: Vec<SlotSpec> = (0..512u32)
             .map(|j| {
@@ -4952,15 +5572,18 @@ fn r19_backend_termination_512_513() {
         let fx = Fixture::build(&slots, &[]);
         fx.pretouch();
         let mut backend = backend_chunk(&obj, &exe, off);
-        populate_alg_class(backend.loaded(), &fx.classes);
         FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
         NS_VERDICT.store(0, Ordering::SeqCst);
         fire(OP as i32, 1);
-        let d1 = backend
-            .poll_at(std::time::Instant::now(), true)
-            .expect("backend poll 512-1");
-        assert_eq!(d1.done.len(), 1, "512-clean: one WalkDone");
-        let w1 = &d1.done[0];
+        let d1 = backend.poll().expect("backend poll 512-1");
+        assert!(
+            d1.done.is_empty(),
+            "512-clean: lone query stays open (no successor)"
+        );
+        fire(OP as i32, 1);
+        let d2 = backend.poll().expect("backend poll 512-2");
+        assert_eq!(d2.done.len(), 1, "512-clean: successor closes query 1");
+        let w1 = &d2.done[0];
         assert_eq!(
             w1.outcome,
             Outcome::Complete {
@@ -4972,27 +5595,69 @@ fn r19_backend_termination_512_513() {
         assert_eq!(w1.true_t, TrueT::Proven(512));
         assert_eq!((w1.alg_count, w1.row_count), (512, 512));
         let g = w1.guard.as_ref().expect("512-clean: guard joined");
-        assert_eq!(g.verdict, wire::GUARD_EMPTY, "512-clean: EMPTY guard");
-        fire(OP as i32, 1);
-        let d2 = backend
-            .poll_at(std::time::Instant::now(), true)
-            .expect("backend poll 512-2");
-        assert_eq!(d2.done.len(), 1, "512-clean: one WalkDone (warm)");
         assert_eq!(
-            d2.done[0].outcome,
+            (g.kind, g.op, g.verdict, g.arr),
+            (wire::KIND_GUARD, OP, wire::GUARD_EMPTY, fx.array),
+            "512-clean: EMPTY guard"
+        );
+        // Query 2 fired before query 1 closed (cache empty at
+        // its fire time): a cold re-proof — full 512 walk, fresh
+        // EMPTY guard, Complete uncached. The gen-0 stamp against
+        // epoch 1 is the benign race, never GenStale.
+        fire(OP as i32, 1);
+        let d3 = backend.poll().expect("backend poll 512-3");
+        assert_eq!(d3.done.len(), 1, "512-clean: successor closes query 2");
+        let w2 = &d3.done[0];
+        assert_eq!(
+            w2.outcome,
+            Outcome::Complete {
+                true_t: 512,
+                cached: false
+            },
+            "512-clean: cold re-proof Complete @512"
+        );
+        assert_eq!(w2.true_t, TrueT::Proven(512));
+        assert_eq!((w2.alg_count, w2.row_count), (512, 512));
+        let g2 = w2.guard.as_ref().expect("512-clean: re-proof guard joined");
+        assert_eq!(
+            g2.verdict,
+            wire::GUARD_EMPTY,
+            "512-clean: re-proof carries its own fresh EMPTY guard"
+        );
+        assert_eq!(w2.seq, w1.seq + 1, "512-clean: seq advances");
+        // Query 3 fired post-warming: the true cached ride (warm
+        // T=512 walk + its own fresh EMPTY guard — a 512 belief
+        // still needs its boundary proof every scan; the warm
+        // verdict never coasts).
+        let d4 = backend.finish().expect("backend finish 512");
+        assert_eq!(d4.done.len(), 1, "512-clean: backstop closes query 3");
+        let w3 = &d4.done[0];
+        assert_eq!(
+            w3.outcome,
             Outcome::Complete {
                 true_t: 512,
                 cached: true
             },
             "512-clean: cached Complete @512"
         );
+        assert_eq!(w3.true_t, TrueT::Proven(512));
+        let g3 = w3.guard.as_ref().expect("512-clean: warm guard joined");
+        assert_eq!(
+            g3.verdict,
+            wire::GUARD_EMPTY,
+            "512-clean: warm close carries its own fresh EMPTY guard"
+        );
+        assert_eq!(w3.seq, w2.seq + 1, "512-clean: seq advances");
         let loaded = backend.loaded();
         assert_retired(loaded, self_tid(), "512-clean");
         assert_loss_zero(loaded);
-        assert_eq!(read_percpu(loaded, "CALLS", OP, false), 2);
+        assert_eq!(read_percpu(loaded, "CALLS", OP, false), 3);
         assert_eq!(read_percpu(loaded, "TRUNC", OP, true), 0);
     }
     // 513-live: Partial{Trunc, Overfull}, VALID guard, no warm.
+    // The trailer re-fires the overfull walk, so its TRUNC_ALGS
+    // flag is a fresh delta under clear-on-read — Partial again
+    // with the identical reasons, never a quiet downgrade.
     {
         let slots: Vec<SlotSpec> = (0..513u32)
             .map(|j| {
@@ -5006,25 +5671,28 @@ fn r19_backend_termination_512_513() {
         let fx = Fixture::build(&slots, &[]);
         fx.pretouch();
         let mut backend = backend_chunk(&obj, &exe, off);
-        populate_alg_class(backend.loaded(), &fx.classes);
         FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
         NS_VERDICT.store(0, Ordering::SeqCst);
         fire(OP as i32, 1);
-        let d1 = backend
-            .poll_at(std::time::Instant::now(), true)
-            .expect("backend poll 513-1");
+        let d1 = backend.poll().expect("backend poll 513-1");
         assert!(d1.findings.is_empty(), "513-live: no findings");
-        assert_eq!(d1.done.len(), 1, "513-live: one WalkDone");
-        let w1 = &d1.done[0];
+        assert!(
+            d1.done.is_empty(),
+            "513-live: lone query stays open (no successor)"
+        );
+        fire(OP as i32, 1);
+        let d2 = backend.poll().expect("backend poll 513-2");
+        assert_eq!(d2.done.len(), 1, "513-live: successor closes query 1");
+        let w1 = &d2.done[0];
         assert_eq!(
             w1.outcome,
             Outcome::Partial {
                 reasons: vec![
-                    PartialReason::Trunc(wire::TRUNC_ALGS),
                     PartialReason::Overfull,
+                    PartialReason::Trunc(wire::TRUNC_ALGS),
                 ]
             },
-            "513-live: Partial{{Trunc, Overfull}}"
+            "513-live: Partial{{Overfull, Trunc}}"
         );
         assert_eq!(w1.true_t, TrueT::Candidate(512));
         assert_eq!((w1.alg_count, w1.row_count), (512, 512));
@@ -5035,26 +5703,28 @@ fn r19_backend_termination_512_513() {
             "513-live: VALID guard"
         );
         assert!(
-            d1.actions
+            d2.actions
                 .iter()
                 .all(|a| !matches!(a, BackendAction::CacheWarmed { .. })),
             "513-live: Partial never warms"
         );
-        // Second fire: still Partial (nothing warmed).
-        fire(OP as i32, 1);
-        let d2 = backend
-            .poll_at(std::time::Instant::now(), true)
-            .expect("backend poll 513-2");
-        assert_eq!(d2.done.len(), 1, "513-live: one WalkDone (again)");
-        assert_eq!(d2.done[0].outcome, w1.outcome, "513-live: Partial again");
+        // Trailer: still Partial with identical reasons (nothing
+        // warmed; the re-fired walk re-flags TRUNC_ALGS).
+        let d3 = backend.finish().expect("backend finish 513");
+        assert_eq!(d3.done.len(), 1, "513-live: backstop closes query 2");
+        assert_eq!(
+            d3.done[0].outcome, w1.outcome,
+            "513-live: Partial again, identical reasons"
+        );
+        assert_eq!(d3.done[0].true_t, TrueT::Candidate(512));
         let loaded = backend.loaded();
         assert_retired(loaded, self_tid(), "513-live");
         assert_loss_zero(loaded);
         assert_eq!(read_percpu(loaded, "CALLS", OP, false), 2);
         assert_eq!(
             read_percpu(loaded, "TRUNC", OP, true),
-            wire::TRUNC_ALGS,
-            "513-live: TRUNC_ALGS alone"
+            0,
+            "513-live: TRUNC consumed (clear-on-read — both flags landed in verdicts, none lost)"
         );
     }
 }

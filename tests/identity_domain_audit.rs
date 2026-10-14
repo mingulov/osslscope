@@ -135,6 +135,10 @@ fn h5_t3_every_device_site_names_one_domain() {
             1,
         ),
         ("src/capture.rs", "stat", ".map(|o| (o.device, o.inode))", 1),
+        // capture.rs (R19 traversal anchor): stat dev_t of the
+        // anchor exe — stat-vs-stat (the anchor SiteKey joins
+        // inventory keyed by the same stat triple).
+        ("src/capture.rs", "stat", "let device = meta.dev();", 1),
         // capture.rs: object-id bind against the full identity
         // (P6: carries the path for the build-id cache key; the
         // bind itself is still stat (dev, ino)).

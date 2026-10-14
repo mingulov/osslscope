@@ -107,6 +107,7 @@ fn doc(
         disposition: None,
         policy: None,
         legacy_partition: LegacyCallPartition::default(),
+        traversal: None,
     })
 }
 

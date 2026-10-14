@@ -142,6 +142,7 @@ fn input_base() -> FinalizeInput {
         disposition: Some(DispositionRecord::exited(0)),
         policy: None,
         legacy_partition: LegacyCallPartition::default(),
+        traversal: None,
     }
 }
 
