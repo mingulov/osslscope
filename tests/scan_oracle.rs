@@ -64,6 +64,50 @@ fn guard(tid: u32, seq: u64, verdict: u32) -> wire::GuardEvent {
     }
 }
 
+fn alg_arr(
+    tid: u32,
+    seq: u64,
+    idx: u64,
+    status: u8,
+    arr: u64,
+    generation: u64,
+) -> wire::ScanAlgEvent {
+    wire::ScanAlgEvent {
+        kind: wire::KIND_SCAN_ALG,
+        op: OP,
+        class: if status == wire::ALG_OK {
+            1
+        } else {
+            wire::OTHER_CLASS
+        },
+        status,
+        weak: 0,
+        _pad: 0,
+        arr,
+        idx,
+        generation,
+        tid,
+        _pad2: 0,
+        seq,
+    }
+}
+
+fn row(tid: u32, seq: u64, idx: u64) -> wire::ScanRowEvent {
+    wire::ScanRowEvent {
+        kind: wire::KIND_SCAN_ROW,
+        op: OP,
+        funcid: 300,
+        _pad: 0,
+        addr: 0x4400,
+        aux: 0,
+        idx,
+        generation: 0,
+        tid,
+        _pad2: 0,
+        seq,
+    }
+}
+
 fn quiesced_idle(tids: &[u32]) -> ScanBatch {
     let mut b = ScanBatch {
         quiesced: true,
@@ -80,16 +124,18 @@ fn quiesced_idle(tids: &[u32]) -> ScanBatch {
 fn stream_two_tids_cold_complete() {
     let mut o = Oracle::new(OracleScope::full());
     let mut b = quiesced_idle(&[TIDA, TIDB]);
-    b.calls.push(call(TIDA, 0, false, wire::SKIP_ADMITTED));
-    b.calls.push(call(TIDB, 0, false, wire::SKIP_ADMITTED));
-    b.rets.push(ret(TIDA, 0, 0));
-    b.rets.push(ret(TIDB, 0, 0));
+    b.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b.push_call(call(TIDB, 0, false, wire::SKIP_ADMITTED));
+    b.push_ret(ret(TIDA, 0, 0));
+    b.push_ret(ret(TIDB, 0, 0));
     for j in 0..2 {
-        b.algs.push(alg(TIDA, 0, j, wire::ALG_OK));
+        b.push_alg(alg(TIDA, 0, j, wire::ALG_OK));
     }
+    b.push_alg(alg_arr(TIDA, 0, 2, wire::ALG_EMPTY, ARR, 0));
     for j in 0..5 {
-        b.algs.push(alg(TIDB, 0, j, wire::ALG_OK));
+        b.push_alg(alg(TIDB, 0, j, wire::ALG_OK));
     }
+    b.push_alg(alg_arr(TIDB, 0, 5, wire::ALG_EMPTY, ARR, 0));
     o.ingest(&b);
     assert_eq!(o.done().len(), 2);
     let a = o.done().iter().find(|w| w.tid == TIDA).unwrap();
@@ -108,12 +154,12 @@ fn stream_two_tids_cold_complete() {
 fn stream_full_table_guard_empty() {
     let mut o = Oracle::new(OracleScope::full());
     let mut b = quiesced_idle(&[TIDA]);
-    b.calls.push(call(TIDA, 0, false, wire::SKIP_ADMITTED));
-    b.rets.push(ret(TIDA, 0, 0));
+    b.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b.push_ret(ret(TIDA, 0, 0));
     for j in 0..512 {
-        b.algs.push(alg(TIDA, 0, j, wire::ALG_OK));
+        b.push_alg(alg(TIDA, 0, j, wire::ALG_OK));
     }
-    b.guards.push(guard(TIDA, 0, wire::GUARD_EMPTY));
+    b.push_guard(guard(TIDA, 0, wire::GUARD_EMPTY));
     o.ingest(&b);
     assert_eq!(o.done().len(), 1);
     assert_eq!(o.done()[0].true_t, TrueT::Proven(512));
@@ -127,12 +173,12 @@ fn stream_full_table_guard_empty() {
 fn stream_guard_valid_overfull() {
     let mut o = Oracle::new(OracleScope::full());
     let mut b = quiesced_idle(&[TIDA]);
-    b.calls.push(call(TIDA, 0, false, wire::SKIP_ADMITTED));
-    b.rets.push(ret(TIDA, 0, 0));
+    b.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b.push_ret(ret(TIDA, 0, 0));
     for j in 0..512 {
-        b.algs.push(alg(TIDA, 0, j, wire::ALG_OK));
+        b.push_alg(alg(TIDA, 0, j, wire::ALG_OK));
     }
-    b.guards.push(guard(TIDA, 0, wire::GUARD_VALID));
+    b.push_guard(guard(TIDA, 0, wire::GUARD_VALID));
     b.trunc.insert(OP, wire::TRUNC_ALGS);
     o.ingest(&b);
     assert_eq!(o.done().len(), 1);
@@ -148,12 +194,12 @@ fn stream_guard_valid_overfull() {
 fn stream_guard_error_partial() {
     let mut o = Oracle::new(OracleScope::full());
     let mut b = quiesced_idle(&[TIDA]);
-    b.calls.push(call(TIDA, 0, false, wire::SKIP_ADMITTED));
-    b.rets.push(ret(TIDA, 0, 0));
+    b.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b.push_ret(ret(TIDA, 0, 0));
     for j in 0..512 {
-        b.algs.push(alg(TIDA, 0, j, wire::ALG_OK));
+        b.push_alg(alg(TIDA, 0, j, wire::ALG_OK));
     }
-    b.guards.push(guard(TIDA, 0, wire::GUARD_ERROR));
+    b.push_guard(guard(TIDA, 0, wire::GUARD_ERROR));
     o.ingest(&b);
     assert_eq!(o.done().len(), 1);
     assert!(matches!(
@@ -167,11 +213,11 @@ fn stream_guard_error_partial() {
 fn stream_unreadable_partial() {
     let mut o = Oracle::new(OracleScope::full());
     let mut b = quiesced_idle(&[TIDA]);
-    b.calls.push(call(TIDA, 0, false, wire::SKIP_ADMITTED));
-    b.rets.push(ret(TIDA, 0, 0));
-    b.algs.push(alg(TIDA, 0, 0, wire::ALG_OK));
-    b.algs.push(alg(TIDA, 0, 1, wire::ALG_UNREADABLE));
-    b.algs.push(alg(TIDA, 0, 2, wire::ALG_OK));
+    b.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b.push_ret(ret(TIDA, 0, 0));
+    b.push_alg(alg(TIDA, 0, 0, wire::ALG_OK));
+    b.push_alg(alg(TIDA, 0, 1, wire::ALG_UNREADABLE));
+    b.push_alg(alg(TIDA, 0, 2, wire::ALG_OK));
     o.ingest(&b);
     assert_eq!(o.done().len(), 1);
     assert!(matches!(
@@ -181,55 +227,72 @@ fn stream_unreadable_partial() {
 }
 
 /// Structural TRUNC bits ⟹ PARTIAL; observation bits
-/// (WALK_EMPTY/WALK_NOIMP/NO_STORE) stay Complete-compatible.
+/// (WALK_EMPTY/WALK_NOIMP) stay Complete-compatible; NO_STORE is
+/// never Complete-compatible (wire contract).
 #[test]
 fn stream_trunc_structural_vs_observation() {
     // Structural: TRUNC_DISPATCH ⟹ PARTIAL.
     let mut o = Oracle::new(OracleScope::full());
     let mut b = quiesced_idle(&[TIDA]);
-    b.calls.push(call(TIDA, 0, false, wire::SKIP_ADMITTED));
-    b.rets.push(ret(TIDA, 0, 0));
-    b.algs.push(alg(TIDA, 0, 0, wire::ALG_OK));
+    b.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b.push_ret(ret(TIDA, 0, 0));
+    b.push_alg(alg(TIDA, 0, 0, wire::ALG_OK));
+    b.push_alg(alg_arr(TIDA, 0, 1, wire::ALG_EMPTY, ARR, 0));
     b.trunc.insert(OP, wire::TRUNC_DISPATCH);
     o.ingest(&b);
     assert!(matches!(
         o.done()[0].outcome,
         Outcome::Partial { ref reasons } if reasons.contains(&PartialReason::Trunc(wire::TRUNC_DISPATCH))
     ));
-    // Observation: NOIMP + EMPTY + NO_STORE ⟹ Complete.
+    // Observation: NOIMP + EMPTY ⟹ Complete.
     let mut o = Oracle::new(OracleScope::full());
     let mut b = quiesced_idle(&[TIDA]);
-    b.calls.push(call(TIDA, 0, false, wire::SKIP_ADMITTED));
-    b.rets.push(ret(TIDA, 0, 0));
-    b.algs.push(alg(TIDA, 0, 0, wire::ALG_OK));
-    b.trunc.insert(
-        OP,
-        wire::TRUNC_WALK_NOIMP | wire::TRUNC_WALK_EMPTY | wire::TRUNC_NO_STORE,
-    );
+    b.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b.push_ret(ret(TIDA, 0, 0));
+    b.push_alg(alg(TIDA, 0, 0, wire::ALG_OK));
+    b.push_alg(alg_arr(TIDA, 0, 1, wire::ALG_EMPTY, ARR, 0));
+    b.trunc
+        .insert(OP, wire::TRUNC_WALK_NOIMP | wire::TRUNC_WALK_EMPTY);
     o.ingest(&b);
     assert!(matches!(o.done()[0].outcome, Outcome::Complete { .. }));
+    // NO_STORE ⟹ PARTIAL (never Complete-compatible).
+    let mut o = Oracle::new(OracleScope::full());
+    let mut b = quiesced_idle(&[TIDA]);
+    b.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b.push_ret(ret(TIDA, 0, 0));
+    b.push_alg(alg(TIDA, 0, 0, wire::ALG_OK));
+    b.push_alg(alg_arr(TIDA, 0, 1, wire::ALG_EMPTY, ARR, 0));
+    b.trunc.insert(OP, wire::TRUNC_NO_STORE);
+    o.ingest(&b);
+    assert!(matches!(
+        o.done()[0].outcome,
+        Outcome::Partial { ref reasons } if reasons.contains(&PartialReason::Trunc(wire::TRUNC_NO_STORE))
+    ));
 }
 
-/// Warm + walked beyond the cached T ⟹ stale belief ⟹
-/// Candidate (the walkers prove the members ran cold).
+/// Warm + walked beyond the cached T ⟹ stale belief ⟹ fresh
+/// terminator proven + CacheStale PARTIAL (the backend
+/// invalidates from the reason; cold re-probe heals).
 #[test]
 fn stream_warm_stale_candidate() {
     let mut scope = OracleScope::full();
     scope.known_t.insert(ARR, (2, 5));
     let mut o = Oracle::new(scope);
     let mut b = quiesced_idle(&[TIDA]);
-    b.calls.push(call(TIDA, 0, false, wire::SKIP_ADMITTED));
-    b.rets.push(ret(TIDA, 0, 5));
+    b.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b.push_ret(ret(TIDA, 0, 5));
     for j in 0..6 {
-        b.algs.push(alg(TIDA, 0, j, wire::ALG_OK));
+        b.push_alg(alg_arr(TIDA, 0, j, wire::ALG_OK, ARR, 5));
     }
+    b.push_alg(alg_arr(TIDA, 0, 6, wire::ALG_EMPTY, ARR, 5));
     o.ingest(&b);
     assert_eq!(o.done().len(), 1);
-    // Table runs to 6 (all covered, first absence 6) but the
-    // belief said 2 ⟹ Candidate(6), still Complete (no holes
-    // in the evidenced range).
-    assert_eq!(o.done()[0].true_t, TrueT::Candidate(6));
-    assert!(matches!(o.done()[0].outcome, Outcome::Complete { .. }));
+    // Fresh EMPTY@6 proves T=6, contradicting the cached 2.
+    assert_eq!(o.done()[0].true_t, TrueT::Proven(6));
+    assert!(matches!(
+        o.done()[0].outcome,
+        Outcome::Partial { ref reasons } if reasons.contains(&PartialReason::CacheStale { cached: 2 })
+    ));
 }
 
 /// Churn attribution: a hinted take + LOSS_SCAN_CHURNED with a
@@ -241,13 +304,13 @@ fn stream_churn_attributed() {
         quiesced: false,
         ..ScanBatch::default()
     };
-    b1.calls.push(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b1.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
     o.ingest(&b1);
     let mut b2 = ScanBatch {
         quiesced: false,
         ..ScanBatch::default()
     };
-    b2.calls.push(call(TIDA, 1, true, wire::SKIP_ADMITTED));
+    b2.push_call(call(TIDA, 1, true, wire::SKIP_ADMITTED));
     b2.loss.insert(wire::LOSS_SCAN_CHURNED, 1);
     o.ingest(&b2);
     assert!(matches!(
@@ -268,24 +331,21 @@ fn stream_loss_unattributed_two_candidates() {
         quiesced: false,
         ..ScanBatch::default()
     };
-    b1.calls.push(call(TIDA, 0, false, wire::SKIP_ADMITTED));
-    b1.calls.push(call(TIDB, 0, false, wire::SKIP_ADMITTED));
+    b1.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b1.push_call(call(TIDB, 0, false, wire::SKIP_ADMITTED));
     o.ingest(&b1);
     let mut b2 = ScanBatch {
         quiesced: false,
         ..ScanBatch::default()
     };
-    b2.calls.push(call(TIDA, 1, true, wire::SKIP_ADMITTED));
-    b2.calls.push(call(TIDB, 1, true, wire::SKIP_ADMITTED));
+    b2.push_call(call(TIDA, 1, true, wire::SKIP_ADMITTED));
+    b2.push_call(call(TIDB, 1, true, wire::SKIP_ADMITTED));
     b2.loss.insert(wire::LOSS_SCAN_EVICTED, 1);
     o.ingest(&b2);
-    // Both predecessors stay Tainted; the delta is an explicit
-    // unattributed-loss finding.
-    assert!(
-        o.done()
-            .iter()
-            .all(|w| matches!(w.outcome, Outcome::Tainted { .. }))
-    );
+    // Hints alone never taint (all four stay open); the delta is
+    // an explicit unattributed-loss finding.
+    assert_eq!(o.open_count(), 4);
+    assert!(o.done().is_empty());
     assert!(o.findings().contains(&Finding::UnattributedLoss {
         id: wire::LOSS_SCAN_EVICTED,
         delta: 1
@@ -297,10 +357,10 @@ fn stream_loss_unattributed_two_candidates() {
 fn stream_drain_loss_corroborates_holes() {
     let mut o = Oracle::new(OracleScope::full());
     let mut b = quiesced_idle(&[TIDA]);
-    b.calls.push(call(TIDA, 0, false, wire::SKIP_ADMITTED));
-    b.rets.push(ret(TIDA, 0, 0));
-    b.algs.push(alg(TIDA, 0, 0, wire::ALG_OK));
-    b.algs.push(alg(TIDA, 0, 2, wire::ALG_OK)); // hole at 1
+    b.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b.push_ret(ret(TIDA, 0, 0));
+    b.push_alg(alg(TIDA, 0, 0, wire::ALG_OK));
+    b.push_alg(alg(TIDA, 0, 2, wire::ALG_OK)); // hole at 1
     b.loss.insert(wire::LOSS_RING_ALG, 1);
     o.ingest(&b);
     assert!(matches!(
@@ -319,12 +379,13 @@ fn stream_ret_across_drain_boundary() {
         quiesced: false,
         ..ScanBatch::default()
     };
-    b1.calls.push(call(TIDA, 0, false, wire::SKIP_ADMITTED));
-    b1.algs.push(alg(TIDA, 0, 0, wire::ALG_OK));
+    b1.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b1.push_alg(alg(TIDA, 0, 0, wire::ALG_OK));
+    b1.push_alg(alg_arr(TIDA, 0, 1, wire::ALG_EMPTY, ARR, 0));
     o.ingest(&b1);
     assert_eq!(o.open_count(), 1);
     let mut b2 = quiesced_idle(&[TIDA]);
-    b2.rets.push(ret(TIDA, 0, 0));
+    b2.push_ret(ret(TIDA, 0, 0));
     o.ingest(&b2);
     assert_eq!(o.done().len(), 1);
     assert_eq!(o.done()[0].true_t, TrueT::Proven(1));
@@ -355,14 +416,502 @@ fn stream_scope_expected_mismatch_panics() {
     let _ = Oracle::new(scope);
 }
 
+/// Finding 2: silence is not a terminator. Cold slots 0..2 with
+/// no explicit EMPTY must NOT prove T=3 — the terminator is
+/// unobserved (holes beyond the evidence + unproven T).
+#[test]
+fn fix1_cold_requires_explicit_terminator() {
+    let mut o = Oracle::new(OracleScope::full());
+    let mut b = quiesced_idle(&[TIDA]);
+    b.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b.push_ret(ret(TIDA, 0, 0));
+    b.push_alg(alg(TIDA, 0, 0, wire::ALG_OK));
+    b.push_alg(alg(TIDA, 0, 1, wire::ALG_OK));
+    assert!(b.order_sound());
+    o.ingest(&b);
+    assert_eq!(o.done().len(), 1);
+    assert!(
+        !matches!(o.done()[0].outcome, Outcome::Complete { .. }),
+        "silence must never complete: {:?}",
+        o.done()[0]
+    );
+    assert!(
+        !matches!(o.done()[0].true_t, TrueT::Proven(_)),
+        "silence must never prove T: {:?}",
+        o.done()[0]
+    );
+}
+
+/// Finding 2: an explicit EMPTY record IS the terminator proof
+/// (min-EMPTY over explicit records; beyond-T discarded).
+#[test]
+fn fix1_cold_explicit_empty_proves() {
+    let mut o = Oracle::new(OracleScope::full());
+    let mut b = quiesced_idle(&[TIDA]);
+    b.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b.push_ret(ret(TIDA, 0, 0));
+    b.push_alg(alg(TIDA, 0, 0, wire::ALG_OK));
+    b.push_alg(alg(TIDA, 0, 1, wire::ALG_OK));
+    b.push_alg(alg_arr(TIDA, 0, 2, wire::ALG_EMPTY, ARR, 0));
+    o.ingest(&b);
+    assert_eq!(o.done().len(), 1);
+    assert_eq!(o.done()[0].true_t, TrueT::Proven(2));
+    assert!(matches!(
+        o.done()[0].outcome,
+        Outcome::Complete {
+            true_t: 2,
+            cached: false
+        }
+    ));
+}
+
+/// Finding 2: 512 covered slots prove nothing without GUARD EMPTY
+/// (the guard is the 512-terminator evidence).
+#[test]
+fn fix1_512_requires_guard_empty() {
+    let mut o = Oracle::new(OracleScope::full());
+    let mut b = quiesced_idle(&[TIDA]);
+    b.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b.push_ret(ret(TIDA, 0, 0));
+    for j in 0..512 {
+        b.push_alg(alg(TIDA, 0, j, wire::ALG_OK));
+    }
+    o.ingest(&b);
+    assert_eq!(o.done().len(), 1);
+    assert_eq!(o.done()[0].true_t, TrueT::Candidate(512));
+    assert!(matches!(
+        o.done()[0].outcome,
+        Outcome::Partial { ref reasons } if reasons.contains(&PartialReason::GuardMissing)
+    ));
+}
+
+/// Finding 2: NOIMP slots are stable walk observations (explicit
+/// records) — compatible with a proven terminator, never a
+/// shorter-table proof.
+#[test]
+fn fix1_noimp_slot_compatible() {
+    let mut o = Oracle::new(OracleScope::full());
+    let mut b = quiesced_idle(&[TIDA]);
+    b.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b.push_ret(ret(TIDA, 0, 0));
+    b.push_alg(alg(TIDA, 0, 0, wire::ALG_OK));
+    b.push_alg(alg_arr(TIDA, 0, 1, wire::ALG_NOIMP, ARR, 0));
+    b.push_alg(alg(TIDA, 0, 2, wire::ALG_OK));
+    b.push_alg(alg_arr(TIDA, 0, 3, wire::ALG_EMPTY, ARR, 0));
+    o.ingest(&b);
+    assert_eq!(o.done().len(), 1);
+    assert_eq!(o.done()[0].true_t, TrueT::Proven(3));
+    assert!(matches!(o.done()[0].outcome, Outcome::Complete { .. }));
+}
+
+/// Findings 2+8: a fully-covered selective window proves the
+/// window, not the terminator — Candidate + explicit PARTIAL for
+/// the unobserved slots beyond the window.
+#[test]
+fn fix1_selective_edge_partial() {
+    let mut scope = OracleScope::full();
+    scope.attached = (0..4).collect();
+    scope.expected = 4;
+    let mut o = Oracle::new(scope);
+    let mut b = quiesced_idle(&[TIDA]);
+    b.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b.push_ret(ret(TIDA, 0, 0));
+    for j in 0..4 {
+        b.push_alg(alg(TIDA, 0, j, wire::ALG_OK));
+    }
+    o.ingest(&b);
+    assert_eq!(o.done().len(), 1);
+    assert_eq!(o.done()[0].true_t, TrueT::Candidate(4));
+    assert!(matches!(
+        o.done()[0].outcome,
+        Outcome::Partial { ref reasons } if reasons
+            .iter()
+            .any(|r| matches!(r, PartialReason::UnobservedSlots(_)))
+    ));
+}
+
+/// Finding 3: ring loss observed mid-invocation is retained — a
+/// quiet closing batch does not wash it away.
+#[test]
+fn fix1_loss_retained_across_drains() {
+    let mut o = Oracle::new(OracleScope::full());
+    let mut b1 = ScanBatch {
+        quiesced: false,
+        ..ScanBatch::default()
+    };
+    b1.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b1.push_ret(ret(TIDA, 0, 0));
+    b1.push_alg(alg(TIDA, 0, 0, wire::ALG_OK));
+    b1.push_alg(alg(TIDA, 0, 2, wire::ALG_OK)); // hole at 1
+    b1.loss.insert(wire::LOSS_RING_ALG, 1);
+    o.ingest(&b1);
+    assert_eq!(o.open_count(), 1);
+    let mut b2 = ScanBatch {
+        quiesced: false,
+        ..ScanBatch::default()
+    };
+    b2.push_call(call(TIDA, 1, false, wire::SKIP_ADMITTED));
+    o.ingest(&b2);
+    assert_eq!(o.done().len(), 1);
+    assert!(matches!(
+        o.done()[0].outcome,
+        Outcome::Partial { ref reasons } if reasons.contains(&PartialReason::DrainLoss)
+            && reasons
+                .iter()
+                .any(|r| matches!(r, PartialReason::Holes(h) if h.contains(&1)))
+    ));
+}
+
+/// Finding 3: structural TRUNC observed mid-invocation is retained
+/// across the drain boundary.
+#[test]
+fn fix1_trunc_retained_across_drains() {
+    let mut o = Oracle::new(OracleScope::full());
+    let mut b1 = ScanBatch {
+        quiesced: false,
+        ..ScanBatch::default()
+    };
+    b1.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b1.push_ret(ret(TIDA, 0, 0));
+    b1.push_alg(alg(TIDA, 0, 0, wire::ALG_OK));
+    b1.push_alg(alg_arr(TIDA, 0, 1, wire::ALG_EMPTY, ARR, 0));
+    b1.trunc.insert(OP, wire::TRUNC_DISPATCH);
+    o.ingest(&b1);
+    let mut b2 = ScanBatch {
+        quiesced: false,
+        ..ScanBatch::default()
+    };
+    b2.push_call(call(TIDA, 1, false, wire::SKIP_ADMITTED));
+    o.ingest(&b2);
+    assert_eq!(o.done().len(), 1);
+    assert!(matches!(
+        o.done()[0].outcome,
+        Outcome::Partial { ref reasons } if reasons
+            .contains(&PartialReason::Trunc(wire::TRUNC_DISPATCH))
+    ));
+}
+
+/// Finding 3: ring loss with no evaluable invocation is a window
+/// finding, never dropped.
+#[test]
+fn fix1_window_loss_finding() {
+    let mut o = Oracle::new(OracleScope::full());
+    let mut b = ScanBatch {
+        quiesced: false,
+        ..ScanBatch::default()
+    };
+    b.loss.insert(wire::LOSS_RING_ALG, 3);
+    o.ingest(&b);
+    assert!(o.done().is_empty());
+    assert!(o.findings().contains(&Finding::WindowLoss { delta: 3 }));
+}
+
+/// Finding 4: a skip AFTER the RET in the same drain leaves the
+/// RET-joined invocation closable (CALLs-before-RETs processing
+/// would abandon it before its earlier RET joins).
+#[test]
+fn fix1_causal_close_before_skip() {
+    let mut o = Oracle::new(OracleScope::full());
+    let mut b = quiesced_idle(&[TIDA]);
+    b.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b.push_ret(ret(TIDA, 0, 0));
+    b.push_alg(alg(TIDA, 0, 0, wire::ALG_OK));
+    b.push_alg(alg_arr(TIDA, 0, 1, wire::ALG_EMPTY, ARR, 0));
+    b.push_call(call(TIDA, 0, false, wire::SKIP_RING_PRESSURE));
+    assert!(b.order_sound());
+    o.ingest(&b);
+    // (Skipped records also carry seq 0 — select the admitted key.)
+    let seq0 = o
+        .done()
+        .iter()
+        .find(|w| w.seq == 0 && !matches!(w.outcome, Outcome::Skipped { .. }))
+        .unwrap();
+    assert!(matches!(seq0.outcome, Outcome::Complete { .. }), "{seq0:?}");
+    assert!(o.done().iter().any(|w| matches!(
+        w.outcome,
+        Outcome::Skipped { cause } if cause == wire::SKIP_RING_PRESSURE
+    )));
+}
+
+/// Finding 4: a kernel hint alone never taints (hint +
+/// rule-hit = nested certain; hint alone = stale-retire race,
+/// ignored when the evidence closes clean).
+#[test]
+fn fix1_hint_alone_no_taint() {
+    let mut o = Oracle::new(OracleScope::full());
+    let mut b1 = ScanBatch {
+        quiesced: false,
+        ..ScanBatch::default()
+    };
+    b1.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    o.ingest(&b1);
+    let mut b2 = ScanBatch {
+        quiesced: false,
+        ..ScanBatch::default()
+    };
+    b2.push_call(call(TIDA, 1, true, wire::SKIP_ADMITTED));
+    o.ingest(&b2);
+    assert_eq!(o.open_count(), 2, "hint alone keeps both open");
+    assert!(o.done().is_empty());
+    let mut b3 = quiesced_idle(&[TIDA]);
+    b3.push_ret(ret(TIDA, 0, 0));
+    b3.push_alg(alg(TIDA, 0, 0, wire::ALG_OK));
+    b3.push_alg(alg_arr(TIDA, 0, 1, wire::ALG_EMPTY, ARR, 0));
+    b3.push_ret(ret(TIDA, 1, 0));
+    b3.push_alg(alg(TIDA, 1, 0, wire::ALG_OK));
+    b3.push_alg(alg_arr(TIDA, 1, 1, wire::ALG_EMPTY, ARR, 0));
+    o.ingest(&b3);
+    assert_eq!(o.done().len(), 2);
+    assert!(
+        o.done()
+            .iter()
+            .all(|w| matches!(w.outcome, Outcome::Complete { .. })),
+        "{:?}",
+        o.done()
+    );
+}
+
+/// Finding 4: a duplicate slot taints BOTH invocations, keeps the
+/// first record, and raises explicit findings.
+#[test]
+fn fix1_duplicate_slot_taints_both() {
+    let mut o = Oracle::new(OracleScope::full());
+    let mut b1 = ScanBatch {
+        quiesced: false,
+        ..ScanBatch::default()
+    };
+    b1.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    o.ingest(&b1);
+    let mut b2 = ScanBatch {
+        quiesced: false,
+        ..ScanBatch::default()
+    };
+    b2.push_call(call(TIDA, 1, true, wire::SKIP_ADMITTED));
+    b2.push_ret(ret(TIDA, 0, 0));
+    b2.push_alg(alg(TIDA, 0, 0, wire::ALG_OK));
+    b2.push_alg(alg_arr(TIDA, 0, 0, wire::ALG_OK, ARR, 0)); // same slot again
+    o.ingest(&b2);
+    // Predecessor taints immediately; the successor carries the
+    // sticky taint to its close.
+    assert!(matches!(
+        o.done()[0].outcome,
+        Outcome::Tainted { by_seq: 1 }
+    ));
+    assert_eq!(o.done()[0].op, UNKNOWN_OP);
+    assert_eq!(o.done()[0].alg_count, 1, "first record kept");
+    assert!(o.findings().contains(&Finding::DuplicateSlot {
+        tid: TIDA,
+        seq: 0,
+        idx: 0
+    }));
+    assert!(o.findings().contains(&Finding::Nested {
+        tid: TIDA,
+        seq: 0,
+        by_seq: 1
+    }));
+    let mut b3 = quiesced_idle(&[TIDA]);
+    b3.push_ret(ret(TIDA, 1, 0));
+    b3.push_alg(alg(TIDA, 1, 0, wire::ALG_OK));
+    b3.push_alg(alg_arr(TIDA, 1, 1, wire::ALG_EMPTY, ARR, 0));
+    o.ingest(&b3);
+    let s1 = o.done().iter().find(|w| w.seq == 1).unwrap();
+    assert!(matches!(s1.outcome, Outcome::Tainted { .. }), "{s1:?}");
+    assert_eq!(s1.op, UNKNOWN_OP);
+}
+
+/// Finding 4: slot evidence from a second array under one key
+/// taints both invocations (multi-array rule).
+#[test]
+fn fix1_multi_array_taints_both() {
+    const ARRB: u64 = 0x8000;
+    let mut o = Oracle::new(OracleScope::full());
+    let mut b1 = ScanBatch {
+        quiesced: false,
+        ..ScanBatch::default()
+    };
+    b1.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    o.ingest(&b1);
+    let mut b2 = ScanBatch {
+        quiesced: false,
+        ..ScanBatch::default()
+    };
+    b2.push_call(call(TIDA, 1, true, wire::SKIP_ADMITTED));
+    b2.push_ret(ret(TIDA, 0, 0));
+    b2.push_alg(alg(TIDA, 0, 0, wire::ALG_OK));
+    b2.push_alg(alg_arr(TIDA, 0, 1, wire::ALG_OK, ARRB, 0));
+    o.ingest(&b2);
+    assert!(matches!(
+        o.done()[0].outcome,
+        Outcome::Tainted { by_seq: 1 }
+    ));
+    assert_eq!(o.done()[0].op, UNKNOWN_OP);
+    assert!(o.findings().contains(&Finding::Nested {
+        tid: TIDA,
+        seq: 0,
+        by_seq: 1
+    }));
+    let mut b3 = quiesced_idle(&[TIDA]);
+    b3.push_ret(ret(TIDA, 1, 0));
+    b3.push_alg(alg(TIDA, 1, 0, wire::ALG_OK));
+    b3.push_alg(alg_arr(TIDA, 1, 1, wire::ALG_EMPTY, ARR, 0));
+    o.ingest(&b3);
+    let s1 = o.done().iter().find(|w| w.seq == 1).unwrap();
+    assert!(matches!(s1.outcome, Outcome::Tainted { .. }), "{s1:?}");
+}
+
+/// Finding 4: slot evidence generations must agree with the RET
+/// generation (cross-epoch joins are explicit PARTIAL).
+#[test]
+fn fix1_gen_mismatch_partial() {
+    let mut o = Oracle::new(OracleScope::full());
+    let mut b = quiesced_idle(&[TIDA]);
+    b.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b.push_ret(ret(TIDA, 0, 5));
+    b.push_alg(alg_arr(TIDA, 0, 0, wire::ALG_OK, ARR, 0));
+    b.push_alg(alg_arr(TIDA, 0, 1, wire::ALG_EMPTY, ARR, 0));
+    o.ingest(&b);
+    assert_eq!(o.done().len(), 1);
+    assert!(matches!(
+        o.done()[0].outcome,
+        Outcome::Partial { ref reasons } if reasons.contains(&PartialReason::GenMixed)
+    ));
+}
+
+/// Finding 5: NO_STORE is never Complete-compatible (wire doc:
+/// "never COMPLETE") and blocks warming.
+#[test]
+fn fix1_no_store_never_complete() {
+    let mut o = Oracle::new(OracleScope::full());
+    let mut b = quiesced_idle(&[TIDA]);
+    b.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b.push_ret(ret(TIDA, 0, 0));
+    b.push_alg(alg(TIDA, 0, 0, wire::ALG_OK));
+    b.push_alg(alg_arr(TIDA, 0, 1, wire::ALG_EMPTY, ARR, 0));
+    b.trunc.insert(OP, wire::TRUNC_NO_STORE);
+    o.ingest(&b);
+    assert_eq!(o.done().len(), 1);
+    assert!(matches!(
+        o.done()[0].outcome,
+        Outcome::Partial { ref reasons } if reasons.contains(&PartialReason::Trunc(wire::TRUNC_NO_STORE))
+    ));
+}
+
+/// Finding 5: a fresh terminator below the cached T proves a
+/// shrink — PARTIAL with the observed T (the backend updates the
+/// cache from this reason).
+#[test]
+fn fix1_shrink_partial_updates() {
+    let mut scope = OracleScope::full();
+    scope.known_t.insert(ARR, (9, 5));
+    let mut o = Oracle::new(scope);
+    let mut b = quiesced_idle(&[TIDA]);
+    b.push_call(call(TIDA, 3, false, wire::SKIP_ADMITTED));
+    b.push_ret(ret(TIDA, 3, 5));
+    for j in 0..4 {
+        b.push_alg(alg(TIDA, 3, j, wire::ALG_OK));
+    }
+    b.push_alg(alg_arr(TIDA, 3, 4, wire::ALG_EMPTY, ARR, 5));
+    // Generations must agree with the RET (else GenMixed).
+    for a in b.algs.iter_mut() {
+        a.generation = 5;
+    }
+    o.ingest(&b);
+    assert_eq!(o.done().len(), 1);
+    assert_eq!(o.done()[0].true_t, TrueT::Proven(4));
+    assert!(matches!(
+        o.done()[0].outcome,
+        Outcome::Partial { ref reasons } if reasons.contains(&PartialReason::CacheShrink {
+            cached: 9,
+            observed: 4
+        })
+    ));
+}
+
+/// Finding 5: walked evidence beyond the cached T proves staleness
+/// (grow) — PARTIAL with the fresh terminator (the backend
+/// invalidates the cache from this reason; cold re-probe heals).
+#[test]
+fn fix1_grow_partial_invalidates() {
+    let mut scope = OracleScope::full();
+    scope.known_t.insert(ARR, (2, 5));
+    let mut o = Oracle::new(scope);
+    let mut b = quiesced_idle(&[TIDA]);
+    b.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b.push_ret(ret(TIDA, 0, 5));
+    for j in 0..6 {
+        b.push_alg(alg(TIDA, 0, j, wire::ALG_OK));
+    }
+    b.push_alg(alg_arr(TIDA, 0, 6, wire::ALG_EMPTY, ARR, 5));
+    // Generations must agree with the RET (else GenMixed): the
+    // helper above pins gen 0, so rewrite gens for this fixture.
+    for a in b.algs.iter_mut() {
+        a.generation = 5;
+    }
+    o.ingest(&b);
+    assert_eq!(o.done().len(), 1);
+    assert_eq!(o.done()[0].true_t, TrueT::Proven(6));
+    assert!(matches!(
+        o.done()[0].outcome,
+        Outcome::Partial { ref reasons } if reasons.contains(&PartialReason::CacheStale { cached: 2 })
+    ));
+}
+
+/// Finding 5: a generation turnover against a cached entry falls
+/// back to cold rules and flags the stale row for invalidation.
+#[test]
+fn fix1_gen_turnover_cold_plus_stale() {
+    let mut scope = OracleScope::full();
+    scope.known_t.insert(ARR, (9, 5));
+    let mut o = Oracle::new(scope);
+    let mut b = quiesced_idle(&[TIDA]);
+    b.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b.push_ret(ret(TIDA, 0, 6));
+    b.push_alg(alg_arr(TIDA, 0, 0, wire::ALG_OK, ARR, 6));
+    b.push_alg(alg_arr(TIDA, 0, 1, wire::ALG_OK, ARR, 6));
+    b.push_alg(alg_arr(TIDA, 0, 2, wire::ALG_OK, ARR, 6));
+    b.push_alg(alg_arr(TIDA, 0, 3, wire::ALG_EMPTY, ARR, 6));
+    o.ingest(&b);
+    assert_eq!(o.done().len(), 1);
+    assert_eq!(o.done()[0].true_t, TrueT::Proven(3));
+    assert!(matches!(
+        o.done()[0].outcome,
+        Outcome::Partial { ref reasons } if reasons.contains(&PartialReason::GenStale {
+            expected: 5,
+            observed: 6
+        })
+    ));
+}
+
+/// Finding 4: ROWs for slots with no walked classifier verdict are
+/// explicit findings (EMPTY/NOIMP/UNREADABLE slots emit no rows).
+#[test]
+fn fix1_stray_row_finding() {
+    let mut o = Oracle::new(OracleScope::full());
+    let mut b = quiesced_idle(&[TIDA]);
+    b.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b.push_ret(ret(TIDA, 0, 0));
+    b.push_alg(alg(TIDA, 0, 0, wire::ALG_OK));
+    b.push_row(row(TIDA, 0, 0));
+    b.push_alg(alg_arr(TIDA, 0, 1, wire::ALG_EMPTY, ARR, 0));
+    b.push_row(row(TIDA, 0, 1)); // no rows should follow an EMPTY slot
+    o.ingest(&b);
+    assert_eq!(o.done().len(), 1);
+    assert!(matches!(o.done()[0].outcome, Outcome::Complete { .. }));
+    assert!(o.findings().contains(&Finding::StrayRow {
+        tid: TIDA,
+        seq: 0,
+        idx: 1
+    }));
+}
+
 #[test]
 fn stream_drain_stats_accumulate() {
     let mut o = Oracle::new(OracleScope::full());
     let mut b1 = quiesced_idle(&[TIDA]);
-    b1.calls.push(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b1.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
     o.ingest(&b1);
     let mut b2 = quiesced_idle(&[TIDA]);
-    b2.calls.push(call(TIDA, 1, false, wire::SKIP_ADMITTED));
+    b2.push_call(call(TIDA, 1, false, wire::SKIP_ADMITTED));
     o.ingest(&b2);
     let s = o.stats();
     assert_eq!(s.batches, 2);

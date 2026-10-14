@@ -44,7 +44,8 @@ use aya_ebpf::{
 use osslscope_ebpf_common::{
     classify_alg_with, loss_for_skip_cause, make_bucket, make_call_flags, make_rcount, make_seq,
     split_bucket, split_rcount, split_seq, AlgClassValue, CtrlValue, GuardEvent, ScanAlgEvent,
-    ScanCallEvent, ScanRec, ScanRetEvent, ScanRowEvent, TCacheValue, ALG_UNREADABLE, ALG_WINDOW,
+    ScanCallEvent, ScanRec, ScanRetEvent, ScanRowEvent, TCacheValue, ALG_EMPTY, ALG_NOIMP,
+    ALG_UNREADABLE, ALG_WINDOW,
     BIRTH_FROZEN, BUCKET_BURST, BUCKET_PERIOD_SHIFTED, GUARD_EMPTY, GUARD_ERROR, GUARD_VALID,
     KIND_GUARD, KIND_SCAN_ALG, KIND_SCAN_CALL, KIND_SCAN_RET, KIND_SCAN_ROW, LOSS_GUARD_READ_ABORT,
     LOSS_MAP_CALLS, LOSS_MAP_TRUNC, LOSS_MEMBER_COOKIE, LOSS_RETIRE_FAIL, LOSS_RING_ALG,
@@ -769,13 +770,17 @@ macro_rules! def_member {
                 }
             }
             // Slot walk (OSSL_ALGORITHM = { names, props, impl,
-            // desc } @32B; only names+impl are read here; v1
-            // precedence: tuple-read-fail → TRUNC_WALK_READ;
-            // names == 0 → EMPTY-silent (slot 0: TRUNC_WALK_EMPTY
-            // flag); imp == 0 → NOIMP; pointed-to-name-read-fail →
-            // TRUNC_WALK_NAME + ALG_UNREADABLE). Aborts/NOIMP/
-            // name-fails record their TRUNC/LOSS and fall through
-            // to the guard check, never skipping it.
+            // desc } @32B; only names+impl are read here;
+            // precedence: tuple-read-fail → TRUNC_WALK_READ
+            // (silent — the abort re-walks next scan);
+            // names == 0 → ALG_EMPTY record (slot 0 additionally
+            // TRUNC_WALK_EMPTY); imp == 0 → ALG_NOIMP record +
+            // TRUNC_WALK_NOIMP; pointed-to-name-read-fail →
+            // TRUNC_WALK_NAME + ALG_UNREADABLE). Every
+            // successfully-read slot emits exactly one ALG
+            // read-status record; only tuple-read aborts stay
+            // silent (flagged). Aborts/records fall through to
+            // the guard check, never skipping it.
             let base = rv + $j * 32;
             let names = unsafe { helpers::bpf_probe_read_user(base as *const u64) };
             let imp = unsafe { helpers::bpf_probe_read_user((base + 16) as *const u64) };
@@ -783,20 +788,51 @@ macro_rules! def_member {
             match (names, imp) {
                 (Ok(names), Ok(imp)) => {
                     if names == 0 {
-                        // Terminator at this slot: silent (no proof
-                        // without the item-4 T-join). Slot 0 empty
-                        // = the query returned a table with no
-                        // first alg (flagged).
+                        // Terminator candidate at this slot:
+                        // EXPLICIT read-status (per-slot completion
+                        // evidence — the oracle proves TRUE-T from
+                        // min-EMPTY over explicit records, never
+                        // from absence). Slot 0 empty = the query
+                        // returned a table with no first alg
+                        // (flagged, as before).
                         if $j == 0 {
                             flag_trunc(op as u32, TRUNC_WALK_EMPTY);
                         }
+                        emit_scan_alg(&ScanAlgEvent {
+                            kind: KIND_SCAN_ALG,
+                            op: op as u32,
+                            class: OTHER_CLASS,
+                            status: ALG_EMPTY,
+                            weak: 0,
+                            _pad: 0,
+                            arr: rv,
+                            idx: $j,
+                            generation: gen_of(rv),
+                            tid,
+                            _pad2: 0,
+                            seq,
+                        });
                     } else {
                         names_present = true;
                         if imp == 0 {
                             // Alg without implementation: a stable
                             // observation (the slot read fine),
-                            // explicit via NOIMP.
+                            // explicit via NOIMP record + flag.
                             flag_trunc(op as u32, TRUNC_WALK_NOIMP);
+                            emit_scan_alg(&ScanAlgEvent {
+                                kind: KIND_SCAN_ALG,
+                                op: op as u32,
+                                class: OTHER_CLASS,
+                                status: ALG_NOIMP,
+                                weak: 0,
+                                _pad: 0,
+                                arr: rv,
+                                idx: $j,
+                                generation: gen_of(rv),
+                                tid,
+                                _pad2: 0,
+                                seq,
+                            });
                         } else {
                             // Kernel scratch only: classified
                             // below, never emitted.

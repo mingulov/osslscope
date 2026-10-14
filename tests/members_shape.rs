@@ -6,9 +6,15 @@
 //! forbidden-helper scan, and size records. Behavioral proof (baking,
 //! walk contents) is the live `members_probe` suite's job.
 //!
-//! Run: `OSSL_MEMBERS_OBJECT=<members.o> cargo +1.88.0 test
+//! Run (optional mode, the local default):
+//! `OSSL_MEMBERS_OBJECT=<members.o> cargo +1.88.0 test
 //! --test members_shape`. Unset object → labeled SKIP (CI has no
 //! BPF artifacts in the host job); set-but-bad → FAIL.
+//!
+//! Run (required mode, the CI gate): prepend
+//! `OSSL_MEMBERS_REQUIRED=1`. Unset/empty object → FAIL — no
+//! silent skips; the suite must run against the job's freshly
+//! built members object. Set-but-bad → FAIL in both modes.
 
 use osslscope::loader::{MEMBER_MAPS, MEMBER_PROGS, MapSpec};
 use std::collections::{HashMap, HashSet};
@@ -17,6 +23,29 @@ fn object_path() -> Option<String> {
     std::env::var("OSSL_MEMBERS_OBJECT")
         .ok()
         .filter(|s| !s.is_empty())
+}
+
+/// Required mode (the CI gate): `OSSL_MEMBERS_REQUIRED=1` fails
+/// closed on a missing object. Any other value, including unset,
+/// keeps the optional local default.
+fn is_required() -> bool {
+    matches!(std::env::var("OSSL_MEMBERS_REQUIRED").as_deref(), Ok("1"))
+}
+
+/// Missing-object branch shared by the object-backed tests:
+/// loud FAIL in required mode, clearly labeled optional-mode SKIP
+/// otherwise.
+fn no_object() {
+    if is_required() {
+        panic!(
+            "FAIL(members-required): OSSL_MEMBERS_OBJECT unset or empty; \
+             required mode refuses silent skips"
+        );
+    }
+    eprintln!(
+        "SKIP(members-object,optional-mode): OSSL_MEMBERS_OBJECT unset \
+         (set OSSL_MEMBERS_REQUIRED=1 to fail closed)"
+    );
 }
 
 fn object_bytes() -> Option<Vec<u8>> {
@@ -126,6 +155,58 @@ fn collect_helpers(obj: &[u8]) -> Vec<(String, i32)> {
     out
 }
 
+/// File offset of the `CALLS` max_entries low byte in the
+/// `maps` section (for the S4 negative: bump 64 -> 65 in a COPY).
+/// The def record is the loader's 28-byte aya legacy shape with
+/// max_entries at +12; the 0x40 assertion fails loudly on layout
+/// drift instead of mutating the wrong byte.
+fn calls_max_entries_offset(obj: &[u8]) -> usize {
+    let elf = goblin::elf::Elf::parse(obj).expect("parse members.o");
+    let (idx, sh) = elf
+        .section_headers
+        .iter()
+        .enumerate()
+        .find(|(_, s)| &elf.shdr_strtab[s.sh_name] == "maps")
+        .unwrap_or_else(|| panic!("section maps missing"));
+    let sym = elf
+        .syms
+        .iter()
+        .find(|s| {
+            s.st_type() == goblin::elf::sym::STT_OBJECT
+                && s.st_shndx == idx
+                && elf.strtab.get_at(s.st_name) == Some("CALLS")
+        })
+        .expect("CALLS map sym present");
+    assert_eq!(sym.st_size as usize, 28, "CALLS def record is 7 x u32");
+    let off = sh.sh_offset as usize + sym.st_value as usize + 12;
+    assert_eq!(obj[off], 0x40, "CALLS max_entries low byte is 64");
+    off
+}
+
+/// File offset of the last `0` in the `member_000` strtab name (for
+/// the S2 negative: rename to `member_00x` in a COPY). Same length,
+/// NUL preserved, section headers and symtab untouched.
+fn member_000_name_offset(obj: &[u8]) -> usize {
+    let elf = goblin::elf::Elf::parse(obj).expect("parse members.o");
+    let strtab = elf
+        .section_headers
+        .iter()
+        .find(|s| &elf.shdr_strtab[s.sh_name] == ".strtab")
+        .expect(".strtab present");
+    let sym = elf
+        .syms
+        .iter()
+        .find(|s| {
+            s.st_type() == goblin::elf::sym::STT_FUNC
+                && elf.strtab.get_at(s.st_name) == Some("member_000")
+        })
+        .expect("member_000 sym present");
+    let off = strtab.sh_offset as usize + sym.st_name + "member_000".len() - 1;
+    assert_eq!(obj[off], b'0', "member_000 name ends in 0");
+    assert_eq!(obj[off + 1], 0, "member_000 NUL terminator intact");
+    off
+}
+
 /// File offset of the first helper-form call in `.text` (for the
 /// S5 negative: flip it to a forbidden id in a COPY of the
 /// object). `None` when `.text` is absent or call-free.
@@ -172,7 +253,7 @@ fn scanner_unit() {
 #[test]
 fn s1_prepare_513() {
     let Some(prep) = prepared() else {
-        eprintln!("SKIP(members-object): OSSL_MEMBERS_OBJECT unset");
+        no_object();
         return;
     };
     assert_eq!(prep.progs.len(), 513, "512 members + member_entry");
@@ -187,7 +268,7 @@ fn s1_prepare_513() {
 #[test]
 fn s2_names_sections() {
     let Some(prep) = prepared() else {
-        eprintln!("SKIP(members-object): OSSL_MEMBERS_OBJECT unset");
+        no_object();
         return;
     };
     let by_name: HashMap<&str, &osslscope::loader::PreparedProg> =
@@ -203,13 +284,59 @@ fn s2_names_sections() {
     }
 }
 
+/// S2-negative: a renamed required program symbol must fail
+/// `prepare` with the prog-missing error — not an ELF-parse error.
+/// Renames `member_000` -> `member_00x` in an in-memory COPY (one
+/// strtab byte; same length, NUL preserved, still parses) and pins
+/// the exact failure.
+#[test]
+fn s2_prog_sym_negative() {
+    let Some(obj) = object_bytes() else {
+        no_object();
+        return;
+    };
+    let off = member_000_name_offset(&obj);
+    let mut mutated = obj.clone();
+    mutated[off] = b'x';
+    assert_eq!(
+        obj.iter()
+            .zip(mutated.iter())
+            .filter(|(a, b)| a != b)
+            .count(),
+        1,
+        "exactly one byte differs (surgical prog-sym mutation)"
+    );
+    let elf = goblin::elf::Elf::parse(&mutated).expect("mutated object still parses");
+    let names: Vec<&str> = elf
+        .syms
+        .iter()
+        .filter_map(|s| elf.strtab.get_at(s.st_name))
+        .collect();
+    assert!(
+        !names.contains(&"member_000"),
+        "member_000 gone after rename"
+    );
+    assert!(
+        names.contains(&"member_00x"),
+        "member_00x present after rename"
+    );
+    let err = osslscope::loader::prepare(&mutated, &MEMBER_MAPS, &MEMBER_PROGS)
+        .err()
+        .expect("renamed member_000 must fail prepare");
+    assert_eq!(
+        err.to_string(),
+        "prog member_000 missing",
+        "specific prog-symbol failure"
+    );
+}
+
 /// S3: all 512 member bodies pairwise distinct (baking necessary
 /// condition — identical bodies would disprove baked slots; the
 /// live suite proves baking behaviorally).
 #[test]
 fn s3_bodies_distinct() {
     let Some(obj) = object_bytes() else {
-        eprintln!("SKIP(members-object): OSSL_MEMBERS_OBJECT unset");
+        no_object();
         return;
     };
     let mains = section_mains(&obj, "uretprobe");
@@ -225,7 +352,7 @@ fn s3_bodies_distinct() {
 #[test]
 fn s4_map_dims() {
     let Some(prep) = prepared() else {
-        eprintln!("SKIP(members-object): OSSL_MEMBERS_OBJECT unset");
+        no_object();
         return;
     };
     let want: &[(&str, u32, u32, u32, u32, u32)] = &[
@@ -262,6 +389,38 @@ fn s4_map_dims() {
     }
 }
 
+/// S4-negative: a tampered map definition must fail `prepare`
+/// with the dims-mismatch error — not an ELF-parse error. Bumps
+/// `CALLS` max_entries 64 -> 65 in an in-memory COPY (one byte)
+/// and pins the exact failure.
+#[test]
+fn s4_map_dims_negative() {
+    let Some(obj) = object_bytes() else {
+        no_object();
+        return;
+    };
+    let off = calls_max_entries_offset(&obj);
+    let mut mutated = obj.clone();
+    mutated[off] = 0x41;
+    assert_eq!(
+        obj.iter()
+            .zip(mutated.iter())
+            .filter(|(a, b)| a != b)
+            .count(),
+        1,
+        "exactly one byte differs (surgical map-def mutation)"
+    );
+    goblin::elf::Elf::parse(&mutated).expect("mutated object still parses");
+    let err = osslscope::loader::prepare(&mutated, &MEMBER_MAPS, &MEMBER_PROGS)
+        .err()
+        .expect("tampered CALLS dims must fail prepare");
+    assert_eq!(
+        err.to_string(),
+        "map CALLS: dims [5, 4, 8, 65, 0] != spec [5, 4, 8, 64, 0]",
+        "specific map-definition failure"
+    );
+}
+
 /// S5: helper set pinned (raw bytes, exact, mains + `.text`
 /// subprograms), SPLIT by plane (R18 §6.5 + item 5): map_lookup
 /// (1), map_update (2), map_delete (3 — entry skip-path deletes
@@ -280,7 +439,7 @@ fn s4_map_dims() {
 #[test]
 fn s5_no_forbidden_helpers() {
     let Some(obj) = object_bytes() else {
-        eprintln!("SKIP(members-object): OSSL_MEMBERS_OBJECT unset");
+        no_object();
         return;
     };
     const FORBIDDEN: [i32; 2] = [12, 181];
@@ -317,7 +476,7 @@ fn s5_no_forbidden_helpers() {
 #[test]
 fn s5_dottext_negative() {
     let Some(obj) = object_bytes() else {
-        eprintln!("SKIP(members-object): OSSL_MEMBERS_OBJECT unset");
+        no_object();
         return;
     };
     if !has_section(&obj, ".text") {
@@ -345,7 +504,7 @@ fn s5_dottext_negative() {
 #[test]
 fn s6_size_cap() {
     let Some(prep) = prepared() else {
-        eprintln!("SKIP(members-object): OSSL_MEMBERS_OBJECT unset");
+        no_object();
         return;
     };
     let mut sizes: Vec<(String, usize)> = prep
@@ -370,7 +529,7 @@ fn s6_size_cap() {
 #[test]
 fn s7_retired_maps_absent() {
     let Some(obj) = object_bytes() else {
-        eprintln!("SKIP(members-object): OSSL_MEMBERS_OBJECT unset");
+        no_object();
         return;
     };
     for retired in ["QUERY_NEXT", "TERMD", "LGCALLS"] {
@@ -388,9 +547,13 @@ fn s7_retired_maps_absent() {
             .unwrap_or_else(|| panic!("{retired} dims known from HARVEST_MAPS"));
         let mut maps: Vec<MapSpec> = MEMBER_MAPS.to_vec();
         maps.push(spec);
-        assert!(
-            osslscope::loader::prepare(&obj, &maps, &MEMBER_PROGS).is_err(),
-            "{retired} must be absent from members.o"
+        let err = osslscope::loader::prepare(&obj, &maps, &MEMBER_PROGS)
+            .err()
+            .unwrap_or_else(|| panic!("{retired} must be absent from members.o"));
+        assert_eq!(
+            err.to_string(),
+            format!("map {retired} missing"),
+            "retired map fails for its absence, not any error"
         );
     }
 }
@@ -401,19 +564,19 @@ fn s7_retired_maps_absent() {
 /// and near-uniform (same code modulo baked immediates). Two known
 /// variances, both proven innocent via objdump diff (same helper
 /// sequence, same stores): J=10 == KIND_SCAN_ALG, so LLVM CSEs the
-/// idx/kind stores in both scan-ALG emits (16B smaller — the D
-/// J=4==KIND_ALG CSE moved with the scan kinds;
-/// walk_dispatch/classify stay shared `.text`, so no other J gets
-/// this luck); J=56 keeps its idx immediate in a register across
-/// the scan-ALG emit (one extra mov, 8B larger — pure regalloc
-/// quirk, same class as D's J=40; the T-gate itself compiles
-/// identically for all J as `t > J-1 ⟺ walk`, verified at 056/057
-/// and 010/057). Any other outlier fails loud — investigate,
-/// don't widen.
+/// idx/kind stores at three scan-ALG emit sites (48B smaller —
+/// the explicit EMPTY/NOIMP emits added two more CSE-eligible
+/// sites to the one OK-site CSE; walk_dispatch/classify stay
+/// shared `.text`, so no other J gets this luck); J=56 keeps its
+/// idx immediate in a register across the scan-ALG emits (three
+/// extra reload/mov insns, 24B larger — pure regalloc quirk, same
+/// class as D's J=40; the T-gate itself compiles identically for
+/// all J as `t > J-1 ⟺ walk`, verified at 056/057 and 010/011).
+/// Any other outlier fails loud — investigate, don't widen.
 #[test]
 fn s8_folded_specials() {
     let Some(obj) = object_bytes() else {
-        eprintln!("SKIP(members-object): OSSL_MEMBERS_OBJECT unset");
+        no_object();
         return;
     };
     let mains = section_mains(&obj, "uretprobe");
@@ -466,7 +629,7 @@ fn s8_folded_specials() {
         "only known large outlier is J=56 (regalloc mov)"
     );
     assert!(
-        mid_max - mid_min <= 24,
-        "members 1..510 near-uniform (16 + 8 known)"
+        mid_max - mid_min <= 72,
+        "members 1..510 near-uniform (48 + 24 known)"
     );
 }

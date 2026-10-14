@@ -44,6 +44,7 @@ pub struct MapSpec {
 }
 
 /// Wanted program: looked up by symbol in its section.
+#[derive(Debug, Clone, Copy)]
 pub struct ProgSpec {
     pub name: &'static str,
     /// "uprobe" (entry) or "uretprobe" (return).
@@ -1957,6 +1958,117 @@ pub fn prepare(obj: &[u8], maps: &[MapSpec], progs: &[ProgSpec]) -> anyhow::Resu
 /// Load a prepared object: create maps, apply map-fd fixups (with
 /// the `BPF_PSEUDO_MAP_FD` assertion), load progs raw. Needs caps.
 /// Verifier output travels in the error on failure.
+/// Load one prepared program (map-fd fixups + quiet load with
+/// a logging retry on failure). Shared by all-or-nothing
+/// [`load`] and keep-good [`load_keep_good`]; `spill` gates the
+/// full-verifier-log temp file.
+fn load_prog(
+    p: &PreparedProg,
+    maps: &HashMap<String, OwnedFd>,
+    spill: bool,
+) -> anyhow::Result<OwnedFd> {
+    use anyhow::Context as _;
+    let mut insns = p.insns.clone();
+    for f in &p.map_fixups {
+        // Full 16-byte range first (checked: `Prepared` fields
+        // are public, so a huge hand-built offset must ERR, not
+        // panic on overflow), then shape, then patch. The borrow
+        // below cannot overflow: the validator proved
+        // `off + 16 <= len`.
+        check_ld_imm64_site(&insns, f.insn_off, &p.name)?;
+        let insn = insns
+            .get_mut(f.insn_off..f.insn_off + 8)
+            .ok_or_else(|| anyhow::anyhow!("{}: fixup out of range", p.name))?;
+        // The compiler emits map sites with src=0; the reloc means
+        // "this imm64 is a map" — the loader sets src AND fd.
+        // Anything else is an already-relocated (or corrupt) object.
+        let fd = maps
+            .get(&f.map)
+            .ok_or_else(|| anyhow::anyhow!("{}: unknown map {}", p.name, f.map))?;
+        insn[1] = (insn[1] & 0x0f) | (BPF_PSEUDO_MAP_FD << 4);
+        insn[4..8].copy_from_slice(&(fd.as_raw_fd() as u32).to_le_bytes());
+    }
+    let license = c"GPL";
+    // Callback shapes only: synthesize BTF + func_info and load
+    // it (the kernel needs the callback's FUNC_PROTO — without
+    // it `bpf_loop` fails `missing btf func_info`). Every other
+    // prog loads BTF-less exactly as before. The BTF fd outlives
+    // both load attempts (drop closes it; loaded progs hold
+    // their own refs).
+    let mut btf_fd: Option<std::os::fd::OwnedFd> = None;
+    let mut func_info_bytes: Vec<u8> = Vec::new();
+    if p.subprogs.iter().any(|s| s.is_callback) {
+        let (btf, info) =
+            synth_btf(&p.subprogs).with_context(|| format!("synth_btf {}", p.name))?;
+        for (off, id) in &info {
+            func_info_bytes.extend_from_slice(&off.to_le_bytes());
+            func_info_bytes.extend_from_slice(&id.to_le_bytes());
+        }
+        let mut btf_log = vec![0u8; 1 << 16];
+        let fd = ossl_bpf_sys::btf_load(&btf, &mut btf_log).map_err(|e| {
+            let detail = String::from_utf8_lossy(trim_nul(&btf_log))
+                .chars()
+                .take(1000)
+                .collect::<String>();
+            anyhow::anyhow!("btf_load {}: {e}\n{detail}", p.name)
+        })?;
+        btf_fd = Some(fd);
+    }
+    let prog_btf = |fd: &Option<std::os::fd::OwnedFd>| -> Option<ossl_bpf_sys::ProgBtf<'_>> {
+        fd.as_ref().map(|f| ossl_bpf_sys::ProgBtf {
+            btf_fd: std::os::fd::AsRawFd::as_raw_fd(f),
+            func_info: &func_info_bytes,
+        })
+    };
+    // Quiet load first: success needs no diagnostics, and a
+    // large-but-valid verification can overflow a fixed log
+    // buffer (`ENOSPC`) even when the program verifies. On
+    // failure, retry with the log buffer to capture the
+    // verifier's report (a 4 MiB buffer: failure explorations
+    // run to ~0.9 MiB, and an overflowed buffer would eat the
+    // very diagnostics the retry exists for).
+    let fd = match ossl_bpf_sys::prog_load_kprobe_quiet(
+        &insns,
+        license,
+        None,
+        &p.name,
+        prog_btf(&btf_fd),
+    ) {
+        Ok(fd) => fd,
+        Err(_) => {
+            let mut log = vec![0u8; 4 << 20];
+            match ossl_bpf_sys::prog_load_kprobe(
+                &insns,
+                license,
+                None,
+                &mut log,
+                &p.name,
+                prog_btf(&btf_fd),
+            ) {
+                Ok(fd) => fd,
+                Err(e) => {
+                    let full = trim_nul(&log);
+                    let detail = String::from_utf8_lossy(full)
+                        .chars()
+                        .take(2000)
+                        .collect::<String>();
+                    // Keep-good loads cap verifier-log spills (a pathological
+                    // all-rejected object must not fill the temp dir).
+                    let spill = spill.then(|| spill_verifier_log(&p.name, full)).flatten();
+                    return Err(anyhow::anyhow!(
+                        "prog_load {}: {e}\n{detail}{}",
+                        p.name,
+                        spill
+                            .map(|p| format!("\n(full verifier log: {})", p.display()))
+                            .unwrap_or_default()
+                    ));
+                }
+            }
+        }
+    };
+    Ok(fd)
+}
+
 pub fn load(prep: &Prepared) -> anyhow::Result<Loaded> {
     use anyhow::Context as _;
     let mut maps = HashMap::new();
@@ -1974,105 +2086,56 @@ pub fn load(prep: &Prepared) -> anyhow::Result<Loaded> {
     }
     let mut progs = HashMap::new();
     for p in &prep.progs {
-        let mut insns = p.insns.clone();
-        for f in &p.map_fixups {
-            // Full 16-byte range first (checked: `Prepared` fields
-            // are public, so a huge hand-built offset must ERR, not
-            // panic on overflow), then shape, then patch. The borrow
-            // below cannot overflow: the validator proved
-            // `off + 16 <= len`.
-            check_ld_imm64_site(&insns, f.insn_off, &p.name)?;
-            let insn = insns
-                .get_mut(f.insn_off..f.insn_off + 8)
-                .ok_or_else(|| anyhow::anyhow!("{}: fixup out of range", p.name))?;
-            // The compiler emits map sites with src=0; the reloc means
-            // "this imm64 is a map" — the loader sets src AND fd.
-            // Anything else is an already-relocated (or corrupt) object.
-            let fd = maps
-                .get(&f.map)
-                .ok_or_else(|| anyhow::anyhow!("{}: unknown map {}", p.name, f.map))?;
-            insn[1] = (insn[1] & 0x0f) | (BPF_PSEUDO_MAP_FD << 4);
-            insn[4..8].copy_from_slice(&(fd.as_raw_fd() as u32).to_le_bytes());
-        }
-        let license = c"GPL";
-        // Callback shapes only: synthesize BTF + func_info and load
-        // it (the kernel needs the callback's FUNC_PROTO — without
-        // it `bpf_loop` fails `missing btf func_info`). Every other
-        // prog loads BTF-less exactly as before. The BTF fd outlives
-        // both load attempts (drop closes it; loaded progs hold
-        // their own refs).
-        let mut btf_fd: Option<std::os::fd::OwnedFd> = None;
-        let mut func_info_bytes: Vec<u8> = Vec::new();
-        if p.subprogs.iter().any(|s| s.is_callback) {
-            let (btf, info) =
-                synth_btf(&p.subprogs).with_context(|| format!("synth_btf {}", p.name))?;
-            for (off, id) in &info {
-                func_info_bytes.extend_from_slice(&off.to_le_bytes());
-                func_info_bytes.extend_from_slice(&id.to_le_bytes());
-            }
-            let mut btf_log = vec![0u8; 1 << 16];
-            let fd = ossl_bpf_sys::btf_load(&btf, &mut btf_log).map_err(|e| {
-                let detail = String::from_utf8_lossy(trim_nul(&btf_log))
-                    .chars()
-                    .take(1000)
-                    .collect::<String>();
-                anyhow::anyhow!("btf_load {}: {e}\n{detail}", p.name)
-            })?;
-            btf_fd = Some(fd);
-        }
-        let prog_btf = |fd: &Option<std::os::fd::OwnedFd>| -> Option<ossl_bpf_sys::ProgBtf<'_>> {
-            fd.as_ref().map(|f| ossl_bpf_sys::ProgBtf {
-                btf_fd: std::os::fd::AsRawFd::as_raw_fd(f),
-                func_info: &func_info_bytes,
-            })
-        };
-        // Quiet load first: success needs no diagnostics, and a
-        // large-but-valid verification can overflow a fixed log
-        // buffer (`ENOSPC`) even when the program verifies. On
-        // failure, retry with the log buffer to capture the
-        // verifier's report (a 4 MiB buffer: failure explorations
-        // run to ~0.9 MiB, and an overflowed buffer would eat the
-        // very diagnostics the retry exists for).
-        let fd = match ossl_bpf_sys::prog_load_kprobe_quiet(
-            &insns,
-            license,
-            None,
-            &p.name,
-            prog_btf(&btf_fd),
-        ) {
-            Ok(fd) => fd,
-            Err(_) => {
-                let mut log = vec![0u8; 4 << 20];
-                match ossl_bpf_sys::prog_load_kprobe(
-                    &insns,
-                    license,
-                    None,
-                    &mut log,
-                    &p.name,
-                    prog_btf(&btf_fd),
-                ) {
-                    Ok(fd) => fd,
-                    Err(e) => {
-                        let full = trim_nul(&log);
-                        let detail = String::from_utf8_lossy(full)
-                            .chars()
-                            .take(2000)
-                            .collect::<String>();
-                        let spill = spill_verifier_log(&p.name, full);
-                        return Err(anyhow::anyhow!(
-                            "prog_load {}: {e}\n{detail}{}",
-                            p.name,
-                            spill
-                                .map(|p| format!("\n(full verifier log: {})", p.display()))
-                                .unwrap_or_default()
-                        ));
-                    }
-                }
-            }
-        };
+        let fd = load_prog(p, &maps, true)?;
         progs.insert(p.name.clone(), fd);
     }
     Ok(Loaded { progs, maps })
+}
+
+/// One rejected program under keep-good loading (the slot is
+/// reported, never silently dropped — the oracle marks it
+/// unobserved PARTIAL).
+#[derive(Debug, Clone)]
+pub struct FailedProg {
+    pub prog: String,
+    pub error: String,
+}
+
+/// Keep-good load: maps are all-or-nothing (shared by every
+/// member — a map failure fails the load), but each program loads
+/// independently — one rejection is recorded and the rest proceed.
+/// Verifier-log spills are capped at 8 (a pathological
+/// all-rejected object must not fill the temp dir; every failure
+/// still carries its 2000-char summary in `error`).
+pub fn load_keep_good(prep: &Prepared) -> anyhow::Result<(Loaded, Vec<FailedProg>)> {
+    use anyhow::Context as _;
+    let mut maps = HashMap::new();
+    for m in &prep.maps {
+        let fd = ossl_bpf_sys::map_create(
+            m.map_type,
+            m.key_size,
+            m.value_size,
+            m.max_entries,
+            None,
+            &m.name,
+        )
+        .with_context(|| format!("map_create {}", m.name))?;
+        maps.insert(m.name.clone(), fd);
+    }
+    let mut progs = HashMap::new();
+    let mut failed = Vec::new();
+    for p in &prep.progs {
+        match load_prog(p, &maps, failed.len() < 8) {
+            Ok(fd) => {
+                progs.insert(p.name.clone(), fd);
+            }
+            Err(e) => failed.push(FailedProg {
+                prog: p.name.clone(),
+                error: format!("{e:#}"),
+            }),
+        }
+    }
+    Ok((Loaded { progs, maps }, failed))
 }
 
 /// Member-chunk fd budget: 513 prog fds + 14 map fds + 513 link fds
@@ -2197,6 +2260,36 @@ pub struct MembersAttached {
     pub members: Vec<OwnedFd>,
 }
 
+/// Normalize + validate a selective slot set (sorted, deduped;
+/// rejects empty sets and slots ≥ 512 — a scan with no members
+/// retires nothing, so attach nothing instead).
+pub fn normalize_slots(slots: &[u32]) -> anyhow::Result<Vec<u32>> {
+    let mut want: Vec<u32> = slots.to_vec();
+    want.sort_unstable();
+    want.dedup();
+    if want.is_empty() {
+        anyhow::bail!("selective attach with no members");
+    }
+    if want.iter().any(|&j| j >= 512) {
+        anyhow::bail!("selective attach slot exceeds 511");
+    }
+    Ok(want)
+}
+
+/// Prog specs for a selective attach: the entry + exactly the
+/// wanted members (selective prepare loads ONLY these programs —
+/// never the full 513 — so unselected members cost no verify
+/// time and cannot fail the attach).
+pub fn member_specs_for_slots(slots: &[u32]) -> anyhow::Result<Vec<ProgSpec>> {
+    let want = normalize_slots(slots)?;
+    let mut specs = Vec::with_capacity(want.len() + 1);
+    specs.push(MEMBER_PROGS[0]);
+    for j in want {
+        specs.push(MEMBER_PROGS[1 + j as usize]);
+    }
+    Ok(specs)
+}
+
 /// Selective member attach (item 6): entry + exactly `slots`
 /// (cookie = slot), EXPECTED programmed from `ctrl` (which MUST
 /// equal `slots.len()` — the retire equation counts attached
@@ -2208,6 +2301,25 @@ pub struct MembersAttached {
 /// `slots` is normalized (sorted, deduped); empty sets are
 /// rejected (a scan with no members retires nothing — attach
 /// nothing instead).
+/// One slot that did not attach under a selective attach
+/// (load rejection or link failure — reported, never silent).
+#[derive(Debug, Clone)]
+pub struct FailedSlot {
+    pub slot: u32,
+    pub stage: &'static str,
+    pub error: String,
+}
+
+/// Selective-attach outcome: what attached (with EXPECTED
+/// programmed to the attached count) plus every failed slot.
+pub struct SubsetAttached {
+    pub attached: MembersAttached,
+    /// Actually-attached slots, sorted (the oracle scope — failed
+    /// slots are unobserved PARTIAL there, never holes).
+    pub slots: Vec<u32>,
+    pub failed: Vec<FailedSlot>,
+}
+
 pub fn attach_members_subset(
     obj: &std::path::Path,
     exe: &std::ffi::CStr,
@@ -2215,29 +2327,43 @@ pub fn attach_members_subset(
     pid: u32,
     ctrl: &osslscope_ebpf_common::CtrlValue,
     slots: &[u32],
-) -> anyhow::Result<MembersAttached> {
+) -> anyhow::Result<SubsetAttached> {
     use anyhow::Context as _;
-    let mut want: Vec<u32> = slots.to_vec();
-    want.sort_unstable();
-    want.dedup();
-    if want.is_empty() {
-        anyhow::bail!("selective attach with no members");
-    }
-    if want.iter().any(|&j| j >= 512) {
-        anyhow::bail!("selective attach slot exceeds 511");
-    }
+    let bytes = std::fs::read(obj).with_context(|| format!("read {}", obj.display()))?;
+    attach_members_subset_from_bytes(&bytes, exe, off, pid, ctrl, slots)
+}
+
+/// Selective attach over verified bytes (no path re-read — the
+/// caller hashes these same bytes for provenance, so identity and
+/// loading cannot drift).
+pub fn attach_members_subset_from_bytes(
+    bytes: &[u8],
+    exe: &std::ffi::CStr,
+    off: u64,
+    pid: u32,
+    ctrl: &osslscope_ebpf_common::CtrlValue,
+    slots: &[u32],
+) -> anyhow::Result<SubsetAttached> {
+    use anyhow::Context as _;
+    let want = normalize_slots(slots)?;
     if ctrl.expected as usize != want.len() {
         anyhow::bail!(
-            "CTRL EXPECTED {} != {} attached members",
+            "CTRL EXPECTED {} != {} wanted members",
             ctrl.expected,
             want.len()
         );
     }
     ensure_members_fd_budget()?;
-    let bytes = std::fs::read(obj).with_context(|| format!("read {}", obj.display()))?;
-    let prep = prepare(&bytes, &MEMBER_MAPS, &MEMBER_PROGS).context("prepare members.o")?;
-    let loaded = load(&prep).context("load members.o")?;
-    program_ctrl(&loaded.maps, ctrl).context("program CTRL")?;
+    // Selective prepare: ONLY the entry + wanted members (never
+    // the full 513 — unselected members cost no verify time and
+    // cannot fail the attach).
+    let specs = member_specs_for_slots(&want)?;
+    let prep = prepare(bytes, &MEMBER_MAPS, &specs).context("prepare members.o subset")?;
+    // Keep-good load: one rejection is recorded, the rest proceed.
+    let (loaded, load_failed) = load_keep_good(&prep).context("load members.o subset")?;
+    if !loaded.progs.contains_key("member_entry") {
+        anyhow::bail!("selective attach: member_entry rejected, no census possible");
+    }
     let entry = ossl_bpf_sys::link_create_uprobe_multi(
         loaded.progs["member_entry"].as_raw_fd(),
         exe,
@@ -2246,28 +2372,62 @@ pub fn attach_members_subset(
         pid,
     )
     .context("attach member_entry")?;
-    let mut members = Vec::with_capacity(want.len());
+    // Keep-good attach: one link failure is recorded, the rest
+    // proceed. EXPECTED programs to the ATTACHED count (the
+    // retire equation counts attached members, not wanted ones).
+    let mut members = Vec::new();
+    let mut attached_slots = Vec::new();
+    let mut failed: Vec<FailedSlot> = load_failed
+        .into_iter()
+        .filter_map(|f| {
+            f.prog
+                .strip_prefix("member_")
+                .and_then(|s| s.parse::<u32>().ok())
+                .map(|slot| FailedSlot {
+                    slot,
+                    stage: "load",
+                    error: f.error,
+                })
+        })
+        .collect();
     for j in want {
         let name = format!("member_{j:03}");
-        let prog = loaded
-            .progs
-            .get(&name)
-            .with_context(|| format!("prog {name} missing"))?;
-        members.push(
-            ossl_bpf_sys::link_create_uretprobe_multi(
-                prog.as_raw_fd(),
-                exe,
-                &[off],
-                &[j as u64],
-                pid,
-            )
-            .with_context(|| format!("attach {name}"))?,
-        );
+        let Some(prog) = loaded.progs.get(&name) else {
+            continue; // load rejection already recorded above
+        };
+        match ossl_bpf_sys::link_create_uretprobe_multi(
+            prog.as_raw_fd(),
+            exe,
+            &[off],
+            &[j as u64],
+            pid,
+        ) {
+            Ok(link) => {
+                members.push(link);
+                attached_slots.push(j);
+            }
+            Err(e) => failed.push(FailedSlot {
+                slot: j,
+                stage: "attach",
+                error: format!("{e:#}"),
+            }),
+        }
     }
-    Ok(MembersAttached {
-        loaded,
-        entry,
-        members,
+    if attached_slots.is_empty() {
+        anyhow::bail!("selective attach: every wanted member failed");
+    }
+    let mut actual_ctrl = *ctrl;
+    actual_ctrl.expected = attached_slots.len() as u32;
+    program_ctrl(&loaded.maps, &actual_ctrl).context("program CTRL")?;
+    failed.sort_by_key(|f| f.slot);
+    Ok(SubsetAttached {
+        attached: MembersAttached {
+            loaded,
+            entry,
+            members,
+        },
+        slots: attached_slots,
+        failed,
     })
 }
 
@@ -2285,9 +2445,24 @@ pub fn attach_members(
     ctrl: &osslscope_ebpf_common::CtrlValue,
 ) -> anyhow::Result<MembersAttached> {
     use anyhow::Context as _;
-    ensure_members_fd_budget()?;
     let bytes = std::fs::read(obj).with_context(|| format!("read {}", obj.display()))?;
-    let prep = prepare(&bytes, &MEMBER_MAPS, &MEMBER_PROGS).context("prepare members.o")?;
+    attach_members_from_bytes(&bytes, exe, off, pid, ctrl)
+}
+
+/// Full attach over verified bytes (no path re-read — the caller
+/// hashes these same bytes for provenance, so identity and loading
+/// cannot drift). All-or-nothing (a full-table scan with holes
+/// from load failure refuses instead of half-observing).
+pub fn attach_members_from_bytes(
+    bytes: &[u8],
+    exe: &std::ffi::CStr,
+    off: u64,
+    pid: u32,
+    ctrl: &osslscope_ebpf_common::CtrlValue,
+) -> anyhow::Result<MembersAttached> {
+    use anyhow::Context as _;
+    ensure_members_fd_budget()?;
+    let prep = prepare(bytes, &MEMBER_MAPS, &MEMBER_PROGS).context("prepare members.o")?;
     let loaded = load(&prep).context("load members.o")?;
     program_ctrl(&loaded.maps, ctrl).context("program CTRL")?;
     let entry = ossl_bpf_sys::link_create_uprobe_multi(
@@ -2362,6 +2537,29 @@ mod tests {
     }
     fn u64(v: u64) -> [u8; 8] {
         v.to_le_bytes()
+    }
+
+    #[test]
+    fn selective_specs_cover_entry_plus_wanted_only() {
+        // Normalized (sorted, deduped): entry + exactly the
+        // wanted members — unselected members are never
+        // prepared, loaded, or attached.
+        let specs = member_specs_for_slots(&[3, 1, 1]).unwrap();
+        let names: Vec<&str> = specs.iter().map(|s| s.name).collect();
+        assert_eq!(names, ["member_entry", "member_001", "member_003"]);
+        assert_eq!(specs[0].section, "uprobe");
+        assert!(specs[1..].iter().all(|s| s.section == "uretprobe"));
+        // Full-range edge: slot 511 resolves, 512 rejects.
+        let specs = member_specs_for_slots(&[511]).unwrap();
+        assert_eq!(specs[1].name, "member_511");
+        assert!(member_specs_for_slots(&[512]).is_err());
+        assert!(member_specs_for_slots(&[]).is_err());
+        // Every slot resolves to its baked name (no off-by-one
+        // in the frozen table index).
+        for j in [0u32, 9, 10, 56, 255, 511] {
+            let specs = member_specs_for_slots(&[j]).unwrap();
+            assert_eq!(specs[1].name, MEMBER_PROGS[1 + j as usize].name);
+        }
     }
 
     #[test]
