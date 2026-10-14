@@ -177,12 +177,19 @@ pub const OTHER_CLASS: u16 = u16::MAX;
 /// `ALG_UNREADABLE` is emitted by BPF when the string helper fails
 /// (the pure [`classify_alg_with`] never returns it: its input is
 /// already-read bytes, and saturation maps to `ALG_OVERLONG`).
+/// `ALG_EMPTY` / `ALG_NOIMP` are scan-plane (`KIND_SCAN_ALG`) only:
+/// per-slot read-status evidence — the names cell read zero
+/// (terminator candidate) or the slot read names-present with a
+/// NULL implementation. The harvest plane never emits them (its
+/// `parse_alg_event` vocabulary is unchanged).
 pub const ALG_OK: u8 = 0;
 pub const ALG_UNKNOWN: u8 = 1;
 pub const ALG_OVERLONG: u8 = 2;
 pub const ALG_TRUNCATED: u8 = 3;
 pub const ALG_UNREADABLE: u8 = 4;
 pub const ALG_MIXED: u8 = 5;
+pub const ALG_EMPTY: u8 = 6;
+pub const ALG_NOIMP: u8 = 7;
 
 /// Trip verdict statuses (u8 wire; strict vocabulary).
 pub const TRIP_OK: u8 = 0;
@@ -1182,6 +1189,8 @@ pub fn alg_status_name(s: u8) -> Option<&'static str> {
         ALG_TRUNCATED => Some("truncated"),
         ALG_UNREADABLE => Some("unreadable"),
         ALG_MIXED => Some("mixed"),
+        ALG_EMPTY => Some("empty"),
+        ALG_NOIMP => Some("noimp"),
         _ => None,
     }
 }
@@ -1256,6 +1265,31 @@ pub fn parse_scan_alg_event(b: &[u8]) -> Result<ScanAlgEvent, WireErr> {
     let e: ScanAlgEvent = read_event(b).ok_or(WireErr::Length)?;
     if e.kind != KIND_SCAN_ALG {
         return Err(WireErr::Kind);
+    }
+    // Strict scan vocabulary (fail-closed: a corrupted or
+    // version-skewed record never joins an invocation silently).
+    // The scan plane adds EMPTY/NOIMP read-status to the harvest
+    // classifier vocabulary; class range stays caller-checked
+    // (registry-sized, like the harvest path).
+    match e.status {
+        ALG_OK | ALG_UNKNOWN | ALG_OVERLONG | ALG_TRUNCATED | ALG_UNREADABLE | ALG_MIXED
+        | ALG_EMPTY | ALG_NOIMP => {}
+        _ => return Err(WireErr::StatusRange),
+    }
+    if e.weak > 1 {
+        return Err(WireErr::WeakRange);
+    }
+    let combo_ok = match e.status {
+        ALG_OK | ALG_MIXED => e.class != OTHER_CLASS,
+        ALG_UNKNOWN => e.class == OTHER_CLASS,
+        ALG_OVERLONG | ALG_UNREADABLE | ALG_EMPTY | ALG_NOIMP => {
+            e.class == OTHER_CLASS && e.weak == 0
+        }
+        ALG_TRUNCATED => e.weak == 1,
+        _ => false,
+    };
+    if !combo_ok {
+        return Err(WireErr::Contradiction);
     }
     Ok(e)
 }

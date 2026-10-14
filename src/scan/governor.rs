@@ -51,13 +51,23 @@ impl DutyThrottle {
         self.throttled
     }
 
-    /// Observe one completed invocation (oracle TRUE-T, proven or
-    /// candidate) at `now_ns`. Returns the control actioniff the
-    /// throttle state flips.
-    pub fn observe(&mut self, now_ns: u64, true_t: u64) -> Option<ThrottleAction> {
-        let cost = estimate_cost_ns(true_t);
-        self.samples.push_back((now_ns, cost));
-        self.window_cost_ns += cost;
+    /// Age the window without a completion (idle polls release an
+    /// engaged throttle once the trailing cost decays below the
+    /// floor — otherwise only completions could release it).
+    pub fn age(&mut self, now_ns: u64) -> Option<ThrottleAction> {
+        self.gc(now_ns);
+        if self.throttled {
+            let duty_ppm = self.window_cost_ns * 1_000_000 / TIER2_WINDOW_NS;
+            if duty_ppm < TIER2_OFF_PPM {
+                self.throttled = false;
+                return Some(ThrottleAction::ReleaseSkipAll);
+            }
+        }
+        None
+    }
+
+    /// Expire samples outside the trailing window.
+    fn gc(&mut self, now_ns: u64) {
         while let Some(&(t, c)) = self.samples.front() {
             if now_ns.saturating_sub(t) >= TIER2_WINDOW_NS {
                 self.samples.pop_front();
@@ -66,6 +76,16 @@ impl DutyThrottle {
                 break;
             }
         }
+    }
+
+    /// Observe one completed invocation (oracle TRUE-T, proven or
+    /// candidate) at `now_ns`. Returns the control actioniff the
+    /// throttle state flips.
+    pub fn observe(&mut self, now_ns: u64, true_t: u64) -> Option<ThrottleAction> {
+        let cost = estimate_cost_ns(true_t);
+        self.samples.push_back((now_ns, cost));
+        self.window_cost_ns += cost;
+        self.gc(now_ns);
         // Duty in ppm over the trailing window (window shorter
         // than 1s at startup still compares against the full
         // 1s — conservative: startup bursts throttle early).
@@ -123,17 +143,20 @@ impl StormDetector {
                 break;
             }
         }
-        // Rate over the trailing 100ms window.
-        let cutoff = now_ns.saturating_sub(TIER3_WINDOW_NS);
-        let mut first = attempts;
-        for &(t, a) in self.samples.iter() {
-            if t >= cutoff {
-                first = a;
-                break;
-            }
-            first = a;
-        }
-        let rate_per_s = (attempts.saturating_sub(first)).saturating_mul(10);
+        // Rate from the last two retained samples, annualized over
+        // their real span: sparse 250ms production polls report
+        // their true rate (a first-sample-in-100ms rule reports
+        // zero at that spacing — the sample is the current one).
+        // A lone sample reports zero, never a guess; counter
+        // resets saturate to zero.
+        let rate_per_s = match (self.samples.iter().rev().nth(1), self.samples.back()) {
+            (Some(&(t0, a0)), Some(&(t1, a1))) if t1 > t0 => a1
+                .saturating_sub(a0)
+                .saturating_mul(1_000_000_000)
+                .checked_div(t1 - t0)
+                .unwrap_or(0),
+            _ => 0,
+        };
         if !self.detached && rate_per_s > TIER3_TRIP_PER_S {
             self.detached = true;
             self.quiet_since = None;

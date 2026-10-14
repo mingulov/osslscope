@@ -4628,10 +4628,13 @@ fn d_bucket_burst_refill() {
 }
 
 /// Selective load live (item 6): attach members {0,1,2,3} with
-/// EXPECTED=4 — the scan retires (count reaches attached
-/// EXPECTED), evidence covers the attached-live slots only, and
-/// unattached slots stay silent (out of scope — the oracle
-/// reports them as unobserved, never as holes).
+/// EXPECTED=4 — only the entry + 4 members prepare/load (never
+/// the full 513), the scan retires (count reaches attached
+/// EXPECTED), evidence covers the attached window (live slots +
+/// explicit EMPTY terminator), and unattached slots stay silent
+/// (out of scope — the oracle reports them as unobserved, never
+/// as holes). Keep-good: no failures here (the failed list is
+/// empty on a clean subset).
 #[test]
 #[ignore]
 fn d_selective_scope() {
@@ -4644,7 +4647,7 @@ fn d_selective_scope() {
     let off = query_off();
     let ctrl =
         osslscope::loader::default_ctrl(4, osslscope::loader::MEMBER_RING_BYTES).expect("CTRL/4");
-    let attached = osslscope::loader::attach_members_subset(
+    let sub = osslscope::loader::attach_members_subset(
         &obj,
         &exe,
         off,
@@ -4653,8 +4656,10 @@ fn d_selective_scope() {
         &[0, 1, 2, 3],
     )
     .expect("selective attach");
-    assert_eq!(attached.members.len(), 4, "selective: 4 links");
-    let loaded = &attached.loaded;
+    assert_eq!(sub.attached.members.len(), 4, "selective: 4 links");
+    assert_eq!(sub.slots, vec![0, 1, 2, 3], "selective: actual slots");
+    assert!(sub.failed.is_empty(), "selective: no failures");
+    let loaded = &sub.attached.loaded;
     let mut state = BirthState::new();
     register(loaded, &mut state, &[self_tid()]);
     let tid = self_tid();
@@ -4674,7 +4679,20 @@ fn d_selective_scope() {
     assert_eq!(d.rets.len(), 1, "selective: RET (member 0 attached)");
     let mut idxs: Vec<u64> = d.algs.iter().map(|a| a.idx).collect();
     idxs.sort_unstable();
-    assert_eq!(idxs, vec![0, 1], "selective: attached-live slots only");
+    // Attached window fully evidenced: 2 live + explicit EMPTY
+    // terminator at 2 AND the walked EMPTY at 3 (every attached
+    // slot emits its read-status; slot 3 reads past-T zero).
+    assert_eq!(idxs, vec![0, 1, 2, 3], "selective: full window");
+    let st: Vec<u8> = {
+        let mut v: Vec<(u64, u8)> = d.algs.iter().map(|a| (a.idx, a.status)).collect();
+        v.sort_unstable();
+        v.into_iter().map(|(_, s)| s).collect()
+    };
+    assert_eq!(
+        st,
+        vec![wire::ALG_OK, wire::ALG_OK, wire::ALG_EMPTY, wire::ALG_EMPTY],
+        "selective: live + explicit terminator + past-T zero"
+    );
     assert!(d.guards.is_empty(), "selective: no guard (511 unattached)");
     assert_eq!(read_percpu(loaded, "CALLS", OP, false), 1);
     assert_retired(loaded, tid, "selective");
