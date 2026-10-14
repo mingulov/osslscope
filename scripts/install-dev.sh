@@ -592,6 +592,11 @@ except OSError as ex:
     sys.exit("error: cannot write install receipt %s: %s" % (sys.argv[1], ex))
 print("install manifest: " + sys.argv[1])
 EOF
+# The receipt publishes via a mktemp (0600) rename: chmod it
+# world-readable like every other installed artifact (unprivileged
+# runs must read their own install receipt).
+chmod 644 "$INST_MANIFEST" \
+    || { echo "error: cannot set permissions on $INST_MANIFEST" >&2; exit 1; }
 
 # --- report ---
 echo "installed:"
