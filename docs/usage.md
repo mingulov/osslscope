@@ -160,10 +160,12 @@ but unresolvable (reinstall that object). `report`/`check`
 traverse automatically when the installed triple resolves
 (receipt-verified, trusted) and the target is builtin-mode
 with a resolved dispatch anchor; otherwise they stay
-harvest-only (pair-only installs, `--init` runs, and
-dispatch-blind targets never traverse). There is no
-traversal CLI flag — selection is automatic and the report's
-`traversal` section names the exact triple that ran.
+harvest-only (pair-only installs, file-provider runs, and
+dispatch-blind targets never traverse). `--members-object`
+explicitly demands traversal (missing/mixed/stale sets are
+actionable refusals, never silent harvest-only); without it,
+selection is automatic and the report's `traversal` section
+names the exact triple that ran.
 
 ## alias-audit — find shared dispatch addresses
 
