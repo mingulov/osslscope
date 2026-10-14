@@ -222,23 +222,29 @@ tables by op id only — no diagnostic prints raw array addresses
 `report` JSON and human output:
 
 - `schema_version`, target pid/comm (`argv_redacted: true`)/container/image,
-  planned/actual window plus epoch edges, kernel, provider
-  path/build-id, completeness status/reasons/counters, executions
-  as cookie/provider/op/funcid/`alg_class`/offset/count/first/last
-  plus aliases, adopted `legacy` block plus executed-weak rollup,
-  fenced generations, `drain_wall_us`, optional `child_exit`.
+  requested/effective window edges, openssl state/version,
+  completeness status/`fatal_kind`/reasons/counters, `sites` as
+  object/device/inode/offset/generation/calls/first/last plus
+  candidates, `fenced` generations in the same shape, `objects`
+  (verified fingerprint plus display locator), per-scope
+  `coverage`, the conserving `legacy_partition`, optional
+  `context` (kernel release plus wall edges), and optional
+  `disposition` (custody outcome, replacing `child_exit`).
 - Human output renders the same fields plus fixed doctrine notes.
 - Runtime addresses are absent; offsets are file offsets.
 
 `check` JSON and human output:
 
-- report document plus `policy`: verdict, rule results, violations,
-  unseen deny providers, parameter-blind caveat, KAT caveat.
+- report document plus `policy`: `verdict` and `rules` (each rule
+  carries rule/predicate names, a three-valued result, conserved
+  definite/possible bounds, and site evidence refs).
 - Each violation carries rule/matcher/identity plus the same
   capture-level actionability tuple: window, pid/comm/container,
   image, provider path/build-id. No cmdline: argv is redacted
   (see the Scope rule above).
-- No verdict on fatal evidence.
+- No verdict on evidence-free fatal documents (every fatal kind
+  except salvaged `runtime`, which carries the evaluated
+  verdict over its surviving observations).
 
 CBOM:
 

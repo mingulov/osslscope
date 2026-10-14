@@ -31,13 +31,16 @@ osslscope report \
 
 Drive representative traffic in-window (warmup handshakes while the
 window opens, measured handshakes inside it), then quit the child
-cleanly before expiry. The example window ran 2 warmup + 10 measured
-PQC handshakes and exited 3: PARTIAL with a structural low-level
-coverage gap (every TLS window carries it -- see [who should NOT
+cleanly before expiry. The staging record replayed here ran 2
+warmup + 10 measured PQC handshakes and exited 3: PARTIAL with
+a structural low-level coverage gap (every TLS window carries it
+-- see [who should NOT
 adopt](what-it-proves.md#who-should-not-adopt-read-before-installing)),
-62 definite sites, disposition `exited` code 0, and no losses.
-Exit 3 with a clean policy read is the normal shape for TLS
-services. The workload's own output lands in `story.workload.log`;
+62 counted sites, disposition `exited` code 0, and no losses.
+These are historical measurements, not a v2 site/component
+mapping: re-run to get the current definite-asset count, since
+unresolved `other` sites never qualify as definite. Exit 3 with
+a clean policy read is the normal shape for TLS services. The workload's own output lands in `story.workload.log`;
 observer stdout stays a pure artifact channel and observer
 diagnostics stay in `story.driver.log`.
 
@@ -47,10 +50,12 @@ container/image provenance, and unconditional
 (requested versus effective coverage); the optional `context`
 key adds host kernel release plus wall-clock edges for
 correlation only. The CBOM (`story.cdx.json`) carries one
-`cryptographic-asset` component per definite site (62 here),
-each with provider (+ object path / build-id), op, funcid, call
-count, generation, and window edges. Ambiguous sites contribute
-no components; their omitted counts stay explicit metadata, and
+`cryptographic-asset` component per definite site, each with
+provider (+ object path / build-id), op, funcid, call count,
+generation, and window edges (the staging record historically
+counted 62 sites; the v2 definite-component count needs a
+re-run). Ambiguous and unresolved sites contribute no
+components; their omitted counts stay explicit metadata, and
 PARTIAL evidence travels as a `metadata` disclaimer property, so
 both caveats survive export.
 
@@ -146,11 +151,14 @@ pending gap triage.
 ## 4. Declared versus executed
 
 A static inventory answers "what could run"; the CBOM answers "what
-ran". For the example window, `openssl list` across the cipher /
-digest / KDF / MAC / KEM / key-exchange / signature / key-manager /
-random groups declares 277 distinct primary names, while the window
-executed 62 definite sites in 16 algorithm classes (15 registry classes
-plus `other`). The delta has three parts worth naming to an auditor:
+ran". For the staging record replayed here, `openssl list`
+across the cipher / digest / KDF / MAC / KEM / key-exchange /
+signature / key-manager / random groups declares 277 distinct
+primary names, while the window counted 62 executed sites across
+16 algorithm classes (15 registry classes plus `other`). All
+counts in this section are that historical measurement, not a
+current v2 mapping. The delta has three parts worth naming to an
+auditor:
 
 - 262 declared names never executed in-window. Absence here means
   not-observed-in-window, never "not present / never used" -- a
@@ -158,8 +166,10 @@ plus `other`). The delta has three parts worth naming to an auditor:
 - 18 executed sites carry only `other`-bucket candidates (KEYMGMT
   / KEYEXCH / DECODER dispatch for the negotiated PQC hybrid
   group): executed but unresolved, because the provider
-  alias-list primary is not a registry spelling. Triage, never
-  auto-deny.
+  alias-list primary is not a registry spelling. Under v2
+  accounting these 18 never qualify as definite assets, so the
+  historical 62-site count is not a 62-component claim.
+  Triage, never auto-deny.
 - Unresolved sites stay visible with their candidate sets and
   weak-alias flags rather than being misattributed to any
   algorithm bucket; sites are counted once each no matter how
@@ -167,11 +177,12 @@ plus `other`). The delta has three parts worth naming to an auditor:
 
 ## 5. Downstream: Dependency-Track status
 
-The CBOM is schema-valid CycloneDX 1.6 (62 components). Uploading it
-to Dependency-Track 4.14.4 accepts the BOM (HTTP 200 + token) and
-creates the project, but the async import task fails: DT's
-`Classifier` enum has no `CRYPTOGRAPHIC_ASSET` member, so 0 of 62
-components land and finding queries return empty. Re-verify the DT
+The historical CBOM is schema-valid CycloneDX 1.6 (62 components
+in that staging record). Uploading it to Dependency-Track 4.14.4
+accepts the BOM (HTTP 200 + token) and creates the project, but
+the async import task fails: DT's `Classifier` enum has no
+`CRYPTOGRAPHIC_ASSET` member, so 0 of 62 components land and
+finding queries return empty. Re-verify the DT
 leg on a release whose classifier model covers cryptographic
 assets; until then the DT path is documented-but-blocked, and the
 auditor trail is the report JSON + CBOM + gate artifacts above, not
