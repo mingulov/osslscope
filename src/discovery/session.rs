@@ -4821,9 +4821,7 @@ impl DiscoverySession {
                 &cfg.object,
                 crate::discovery::onboard::MAX_OBJECT_SCAN_BYTES,
             )
-            .map_err(|e| {
-                anyhow::anyhow!("harvest object {}: {e}", cfg.object.display())
-            })?,
+            .map_err(|e| anyhow::anyhow!("harvest object {}: {e}", cfg.object.display()))?,
         };
         if pin.verify().is_err() {
             let mut core = SessionCore::new(cfg.provider.clone(), canon, cfg.legacy, pid);
