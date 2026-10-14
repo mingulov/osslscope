@@ -1022,6 +1022,7 @@ mod tests {
             guard: None,
             algs: Vec::new(),
             event_ns: 0,
+            rows: Vec::new(),
         }
     }
 
