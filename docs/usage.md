@@ -30,9 +30,9 @@ osslscope inspect --pid 1234 --provider /opt/openssl/lib64/ossl-modules/legacy.s
   trigger-wait phases; `--marker M` requires the target's
   cmdline to contain `M` (matched at admission, never emitted);
   `--out FILE` writes the JSON doc instead of stdout.
-- A degraded inventory is `PARTIAL` in the JSON doc but the
-  process still exits 0 — always read `status` (only
-  `report`/`check` exit 3 on PARTIAL).
+- A degraded inventory is `PARTIAL` in the JSON doc and the
+  process exits 3 — always read `status` (`inspect` shares
+  the 3-on-PARTIAL rule with `report`/`check`).
 
 ## report — human/JSON summary over a capture window
 
@@ -171,7 +171,7 @@ addresses claimed by several (provider, op, funcid) triples.
 | 0 | ok (check: no violation) |
 | 1 | tool failure: observed child failed (`run --`), artifact delivery failed, or a post-observation close failure (salvaged `runtime`-fatal doc — observations kept, see JSON) |
 | 2 | usage error |
-| 3 | PARTIAL — degraded evidence, see JSON (`report`/`check` only; `inspect` reports PARTIAL in-doc with exit 0) |
+| 3 | PARTIAL — degraded evidence, see JSON (`inspect`/`report`/`check` all exit 3 on PARTIAL) |
 | 4 | fatal setup failure — evidence unusable because observation never started (incl. unsuitable target, pid recycled, environment/attach failure) |
 | 10 | policy violation (`check`) — dominates every tool failure (a proved violation in salvaged sites still exits 10) |
 | 11 | inconclusive (`check`) — requirement unproven under relevant uncertainty |

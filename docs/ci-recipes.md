@@ -152,19 +152,29 @@ test baseline:
 CI timeout >= duration + grace + test-baseline x 2
 ```
 
-With defaults (30 s window, 5 s grace) and a 60 s smoke test,
-set the step timeout above 155 s. A live child at window expiry
-is PARTIAL by design (`loss` reason, counter
-`capture.over_budget`; the observer never kills its child),
-and a signal-cut window is always PARTIAL -- both are
-avoided by sizing the timeout, not by raising the duration.
+With defaults (30 s window, 5 s grace) and a 60 s smoke-test
+baseline, set the step timeout above 155 s so the runner never
+kills the observer mid-window (a signal-cut window is always
+PARTIAL). That outer timeout is protection against the kill,
+not against over-budget: `capture.over_budget` fires whenever
+the target is still alive at window expiry, however generous
+the CI timeout (the observer never kills its child). Fit the
+workload inside the requested window instead --
+quit-before-expiry discipline, split windows, or a `--duration`
+the workload actually fits in (a 60 s smoke test needs a window
+above 60 s, not a 30 s window with a long timeout).
 <!-- source: timeout rule: PLAN.md P6 exit 2; over-budget/signal
      semantics: PRD.md sections 5-6 -->
 
 At window end the observer detaches a still-running owned child
 and leaves it running (`disposition: detached-running` with its
-pid; the child is never signaled). Waiting for and cleaning up
-that intentionally detached workload is the CI step's job, not
-the observer's: the step owns the workload process lifetime
-after detach, so size the timeout for the workload's own
-shutdown and reap it in the step.
+pid; the child is never signaled). The observer forked that
+child, so once the observer exits the workload reparents away
+from the invoking shell -- the shell cannot `wait()` on a
+grandchild it never parented. Run the step under a
+supervisor/sub-reaper arrangement (the CI agent's own process
+supervision, a supervisor such as `tini`/`dumb-init`, or an init
+that adopts orphans): the step monitors the pid from
+`disposition` and shuts the workload down (signal, wait for
+exit), while the supervisor is what actually reaps it. Size the
+timeout for the workload's own shutdown either way.
