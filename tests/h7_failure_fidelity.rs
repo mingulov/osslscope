@@ -115,6 +115,7 @@ fn doc_with(sites: Vec<SiteExecution>, fatal: Option<FatalKind>) -> CaptureDocum
         policy: None,
         legacy_partition: LegacyCallPartition::default(),
         engine_observations: Vec::new(),
+        traversal: None,
     })
 }
 
