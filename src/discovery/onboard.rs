@@ -74,12 +74,15 @@ impl std::error::Error for OnboardError {}
 pub const HARVEST_OBJECT_NAME: &str = "osslscope-harvest";
 /// Installed count-object file name (same naming rule).
 pub const COUNT_OBJECT_NAME: &str = "osslscope-count";
+/// Installed members-object (traversal) file name (same rule).
+pub const MEMBERS_OBJECT_NAME: &str = "osslscope-members";
 
 /// Which BPF object a path/bytes claim to be.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObjectRole {
     Harvest,
     Count,
+    Members,
 }
 
 impl ObjectRole {
@@ -87,6 +90,7 @@ impl ObjectRole {
         match self {
             ObjectRole::Harvest => HARVEST_OBJECT_NAME,
             ObjectRole::Count => COUNT_OBJECT_NAME,
+            ObjectRole::Members => MEMBERS_OBJECT_NAME,
         }
     }
 
@@ -94,6 +98,7 @@ impl ObjectRole {
         match self {
             ObjectRole::Harvest => "--object",
             ObjectRole::Count => "--count-object",
+            ObjectRole::Members => "--members-object",
         }
     }
 
@@ -101,6 +106,7 @@ impl ObjectRole {
         match self {
             ObjectRole::Harvest => "harvest",
             ObjectRole::Count => "count",
+            ObjectRole::Members => "members",
         }
     }
 }
@@ -227,6 +233,14 @@ pub fn is_trusted_dir(path: &Path) -> bool {
     is_trusted_dir_with(path, &TrustPolicy::production())
 }
 
+/// Whether a role's file exists in any trusted dir (doctor: a
+/// present-but-unresolvable members object fails — broken install,
+/// actionable — while a simply absent one is info).
+pub fn role_file_in_trusted(role: ObjectRole, dirs: &[PathBuf], trust: &TrustPolicy) -> bool {
+    dirs.iter()
+        .any(|d| is_trusted_dir_with(d, trust) && d.join(role.file_name()).exists())
+}
+
 /// Trusted object file under `trust`: a regular file owned by a
 /// trusted uid with no group/other write bit, in a trusted
 /// ancestry (defense in depth alongside the directory check).
@@ -314,6 +328,11 @@ pub fn check_object_compatible(role: ObjectRole, bytes: &[u8]) -> Result<(), Str
             bytes,
             &crate::loader::COUNT_MAPS,
             &crate::loader::COUNT_PROGS,
+        ),
+        ObjectRole::Members => crate::loader::prepare(
+            bytes,
+            &crate::loader::MEMBER_MAPS,
+            &crate::loader::MEMBER_PROGS,
         ),
     };
     r.map(|_| ()).map_err(|e| format!("{e:#}"))
@@ -551,6 +570,284 @@ pub fn resolve_implicit_pair(
                 .join(", "),
         ),
     ))
+}
+
+/// Resolved BPF-object triple (traversal runs): harvest + count +
+/// members. The pair path ([`resolve_objects`]) is unchanged;
+/// traversal runs resolve the triple through [`resolve_set`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectSet {
+    pub harvest: PathBuf,
+    pub count: PathBuf,
+    pub members: PathBuf,
+}
+
+/// Resolve the BPF-object triple for a traversal run: explicit
+/// paths win per role (operator-trusted; existence + compatibility
+/// still checked); a fully automatic triple comes from the first
+/// trusted directory holding a complete compatible triple (matched
+/// builds stay together — never roles from two installs; old-pair
+/// dirs without members are skipped, not an error). Implicitly
+/// resolved roles are additionally verified against that
+/// directory's install receipt when one exists (mixed/stale sets
+/// refused — see [`verify_role_receipt`]).
+pub fn resolve_set(
+    harvest: Option<&Path>,
+    count: Option<&Path>,
+    members: Option<&Path>,
+    dirs: &[PathBuf],
+    trust: &TrustPolicy,
+) -> Result<(ObjectSet, ObjectSearch), OnboardError> {
+    use ObjectRole::{Count, Harvest, Members};
+    let mut search = ObjectSearch::default();
+    let h = match harvest {
+        Some(p) => Some(resolve_explicit(Harvest, p)?),
+        None => None,
+    };
+    let c = match count {
+        Some(p) => Some(resolve_explicit(Count, p)?),
+        None => None,
+    };
+    let m = match members {
+        Some(p) => Some(resolve_explicit(Members, p)?),
+        None => None,
+    };
+    match (&h, &c, &m) {
+        (Some(h), Some(c), Some(m)) => Ok((
+            ObjectSet {
+                harvest: h.clone(),
+                count: c.clone(),
+                members: m.clone(),
+            },
+            search,
+        )),
+        (None, None, None) => {
+            let set = resolve_implicit_triple(dirs, trust, &mut search)?;
+            Ok((set, search))
+        }
+        _ => {
+            // Mixed explicit/implicit (the operator chose the mix
+            // by going explicit): each missing role resolves from
+            // the first trusted dir holding it, receipt-verified
+            // against its own prefix.
+            let h = match h {
+                Some(p) => p,
+                None => {
+                    let p = resolve_implicit_role(Harvest, dirs, trust, &mut search)?;
+                    verify_role_receipt(Harvest, &p)?;
+                    p
+                }
+            };
+            let c = match c {
+                Some(p) => p,
+                None => {
+                    let p = resolve_implicit_role(Count, dirs, trust, &mut search)?;
+                    verify_role_receipt(Count, &p)?;
+                    p
+                }
+            };
+            let m = match m {
+                Some(p) => p,
+                None => {
+                    let p = resolve_implicit_role(Members, dirs, trust, &mut search)?;
+                    verify_role_receipt(Members, &p)?;
+                    p
+                }
+            };
+            Ok((
+                ObjectSet {
+                    harvest: h,
+                    count: c,
+                    members: m,
+                },
+                search,
+            ))
+        }
+    }
+}
+
+/// Resolve the fully automatic triple: first trusted directory
+/// holding a complete compatible triple (receipt-verified — the
+/// three hashes must match ONE receipt). Incomplete directories
+/// (including old-pair installs) are skipped; a complete but
+/// broken directory fails closed.
+pub fn resolve_implicit_triple(
+    dirs: &[PathBuf],
+    trust: &TrustPolicy,
+    search: &mut ObjectSearch,
+) -> Result<ObjectSet, OnboardError> {
+    use ObjectRole::{Count, Harvest, Members};
+    for dir in dirs {
+        note_dir(dir, trust, search);
+        if !is_trusted_dir_with(dir, trust) {
+            continue;
+        }
+        let h = dir.join(Harvest.file_name());
+        let c = dir.join(Count.file_name());
+        let m = dir.join(Members.file_name());
+        if !h.exists() || !c.exists() || !m.exists() {
+            continue;
+        }
+        check_candidate(Harvest, &h, trust)?;
+        check_candidate(Count, &c, trust)?;
+        check_candidate(Members, &m, trust)?;
+        verify_role_receipt(Harvest, &h)?;
+        verify_role_receipt(Count, &c)?;
+        verify_role_receipt(Members, &m)?;
+        return Ok(ObjectSet {
+            harvest: h,
+            count: c,
+            members: m,
+        });
+    }
+    let mut message = format!(
+        "no BPF objects found (no trusted dir holds the harvest+count+members triple; searched {} trusted dirs)",
+        search.searched.len()
+    );
+    if !search.skipped_untrusted.is_empty() {
+        message.push_str(&format!(
+            "; skipped {} untrusted dirs (missing, wrong owner, or writable)",
+            search.skipped_untrusted.len()
+        ));
+    }
+    Err(OnboardError::new(
+        message,
+        format!(
+            "install objects to a trusted dir ({}) or pass --object/--count-object/--members-object explicitly",
+            default_object_dirs()
+                .iter()
+                .map(|d| d.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
+    ))
+}
+
+/// Install-receipt file name (written by `scripts/install-dev.sh`
+/// under `$PREFIX/share/osslscope/`).
+pub const INSTALL_RECEIPT_NAME: &str = "install-manifest.json";
+
+/// Locate the install receipt for an object directory
+/// (`$PREFIX/lib[/64]/osslscope` → `$PREFIX/share/osslscope/…`);
+/// `None` when the layout carries no receipt (old installs and
+/// custom dirs stay compatible — receipt checks are skipped).
+pub fn receipt_for_object_dir(dir: &Path) -> Option<PathBuf> {
+    let prefix = dir.parent()?.parent()?;
+    let cand = prefix
+        .join("share")
+        .join("osslscope")
+        .join(INSTALL_RECEIPT_NAME);
+    cand.exists().then_some(cand)
+}
+
+/// SHA-256 hex of a file's bytes (receipt identity; also mints
+/// test receipts).
+pub fn file_sha256_hex(path: &Path) -> std::io::Result<String> {
+    use sha2::Digest as _;
+    let bytes = std::fs::read(path)?;
+    Ok(sha2::Sha256::digest(&bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
+}
+
+/// Verify an implicitly resolved object against its prefix's
+/// install receipt (matched-set identity): no receipt ⟹
+/// compatible (old installs); receipt present ⟹ the resolved path
+/// must be listed with a matching sha256 (a hash mismatch is a
+/// stale/swapped object; an unlisted path is a mixed set — both
+/// refused with reinstall remediation, never silently used).
+pub fn verify_role_receipt(role: ObjectRole, path: &Path) -> Result<(), OnboardError> {
+    let dir = path.parent().ok_or_else(|| {
+        OnboardError::new(
+            format!(
+                "{} object {} has no parent directory",
+                role.describe(),
+                path.display()
+            ),
+            "pass an explicit object path instead".to_string(),
+        )
+    })?;
+    let receipt = match receipt_for_object_dir(dir) {
+        Some(r) => r,
+        None => return Ok(()),
+    };
+    let text = read_bounded(&receipt, MAX_OBJECT_SCAN_BYTES).map_err(|e| {
+        OnboardError::new(
+            format!("install receipt {} unreadable: {e}", receipt.display()),
+            "reinstall with scripts/install-dev.sh".to_string(),
+        )
+    })?;
+    let text = String::from_utf8(text).map_err(|_| {
+        OnboardError::new(
+            format!("install receipt {} is not UTF-8", receipt.display()),
+            "reinstall with scripts/install-dev.sh".to_string(),
+        )
+    })?;
+    let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+        OnboardError::new(
+            format!("install receipt {} unparsable: {e}", receipt.display()),
+            "reinstall with scripts/install-dev.sh".to_string(),
+        )
+    })?;
+    let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut listed: Option<String> = None;
+    if let Some(arts) = v.get("artifacts").and_then(|a| a.as_array()) {
+        for a in arts {
+            let dest = a.get("dest").and_then(|d| d.as_str()).unwrap_or("");
+            let dest_canon = std::fs::canonicalize(dest).unwrap_or_else(|_| PathBuf::from(dest));
+            if dest_canon == canon {
+                listed = a.get("sha256").and_then(|s| s.as_str()).map(str::to_string);
+                break;
+            }
+        }
+    }
+    let want = match listed {
+        Some(h) => h,
+        None => {
+            return Err(OnboardError::new(
+                format!(
+                    "{} object {} is not listed in install receipt {} (mixed set)",
+                    role.describe(),
+                    path.display(),
+                    receipt.display()
+                ),
+                "reinstall the full triple with scripts/install-dev.sh so the receipt covers every role".to_string(),
+            ));
+        }
+    };
+    // Bounded re-read (a swap between resolve and hash fails loud,
+    // never huge).
+    let bytes = read_bounded(path, MAX_OBJECT_SCAN_BYTES).map_err(|e| {
+        OnboardError::new(
+            format!(
+                "{} object {} unreadable: {e}",
+                role.describe(),
+                path.display()
+            ),
+            "check permissions on the installed objects".to_string(),
+        )
+    })?;
+    let got: String = {
+        use sha2::Digest as _;
+        sha2::Sha256::digest(&bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    };
+    if got != want {
+        return Err(OnboardError::new(
+            format!(
+                "{} object {} is stale (sha256 {} != receipt {})",
+                role.describe(),
+                path.display(),
+                &got[..16.min(got.len())],
+                &want[..16.min(want.len())]
+            ),
+            "reinstall matched objects with scripts/install-dev.sh; a swapped object after install is the usual cause".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Read + validate an explicit offset-table file (`--table`): usage
