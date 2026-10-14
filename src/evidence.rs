@@ -16,6 +16,7 @@
 //! [`Completeness`]. Nothing else in the tree may mint a COMPLETE
 //! status.
 
+use crate::scan::oracle::{Outcome, TrueT};
 use serde::{Deserialize, Serialize};
 
 /// Schema identity carried by every finalized capture document.
@@ -821,6 +822,22 @@ pub struct TraversalObject {
     pub sha256: String,
 }
 
+/// One traversal record's native facts (per-record summary —
+/// full slot arrays stay in-capture like raw ring events; the
+/// document carries the verdict-relevant facts per record).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct TraversalRecordEntry {
+    pub tid: u32,
+    pub seq: u64,
+    pub op: u32,
+    pub outcome: Outcome,
+    pub true_t: TrueT,
+    pub alg_count: usize,
+    pub row_count: usize,
+    /// Agreed array incarnation (None when mixed or slotless).
+    pub generation: Option<u64>,
+}
+
 /// Traversal outcome summary (see [`CaptureDocument::traversal`]).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct TraversalRecord {
@@ -830,6 +847,15 @@ pub struct TraversalRecord {
     pub records: u64,
     pub findings: u64,
     pub polls: u64,
+    /// Admitted queries per op (loss-independent observation
+    /// census — record count is not a census; additive round-4
+    /// field, old readers ignore it).
+    #[serde(default)]
+    pub admitted: std::collections::BTreeMap<u32, u64>,
+    /// Per-record native facts, close order (additive round-4
+    /// field, old readers ignore it).
+    #[serde(default)]
+    pub entries: Vec<TraversalRecordEntry>,
 }
 
 impl CaptureDocument {

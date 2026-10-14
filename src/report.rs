@@ -677,6 +677,8 @@ fn doc_json(doc: &CaptureDocument) -> serde_json::Value {
             "records": t.records,
             "findings": t.findings,
             "polls": t.polls,
+            "admitted": t.admitted,
+            "entries": t.entries,
         });
     }
     if let Some(disposition) = &doc.disposition {
