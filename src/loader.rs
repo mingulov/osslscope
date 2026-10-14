@@ -446,7 +446,7 @@ pub const MEMBER_MAPS: [MapSpec; 15] = [
     },
     MapSpec {
         name: "TRUNC_SEQ",
-        map_type: 1,
+        map_type: 5,
         key_size: 4,
         value_size: 8,
         max_entries: 64,
