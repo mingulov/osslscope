@@ -114,9 +114,9 @@ fn map_inventory_matches_sources() {
         "unexpected count map count: {src_count:?}"
     );
     // Stage D dropped PENDING (members read SCAN — R18 §6.1);
-    // item 5 re-added BUCKET (tier-1 per-tid rate state), and the
-    // round-2 fix adds TRUNC_SEQ (TRUNC drain-race guard) —
-    // end state 15 (the doc section moves with the stage).
+    // item 5 re-added BUCKET (tier-1 per-tid rate state), and
+    // round 3 adds per-op TRUNC_SEQ (flag-event generation for
+    // repeat re-report) — end state 15.
     assert_eq!(
         src_members.len(),
         15,
