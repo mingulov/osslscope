@@ -12,6 +12,30 @@ use osslscope::target::{
 };
 use std::time::{Duration, Instant};
 
+/// Connector facility gate (R20-fix round 2 MINOR — mirrored in
+/// capture_controller.rs): real-connector controls run only where
+/// the facility subscribes; elsewhere they skip (pass) unless
+/// `OSSLSCOPE_REQUIRE_CONNECTOR=1` forces a hard failure.
+/// `OSSLSCOPE_CONNECTOR_TEST=force-absent` simulates absence.
+fn connector_present() -> bool {
+    if std::env::var("OSSLSCOPE_CONNECTOR_TEST").as_deref() == Ok("force-absent") {
+        return false;
+    }
+    osslscope::capture::KernelLifecycle::subscribe(std::process::id()).is_ok()
+}
+
+fn require_connector(test: &str) -> bool {
+    if connector_present() {
+        return true;
+    }
+    assert!(
+        std::env::var("OSSLSCOPE_REQUIRE_CONNECTOR").as_deref() != Ok("1"),
+        "{test} requires a working proc connector (OSSLSCOPE_REQUIRE_CONNECTOR=1)"
+    );
+    eprintln!("SKIP {test}: proc connector unavailable (fallback/PARTIAL shape unsupported here)");
+    false
+}
+
 /// Poll until the child is reaped or the budget expires.
 fn wait_for_exit(t: &mut OwnedTarget, budget: Duration) -> Option<i32> {
     let end = Instant::now() + budget;
@@ -2158,6 +2182,9 @@ fn r20fix_kernel_lifecycle_witnesses_real_fork_exec_exit() {
     use osslscope::capture::{KernelLifecycle, LifecycleKind, LifecyclePort};
     use std::collections::HashSet;
 
+    if !require_connector("r20fix_kernel_lifecycle_witnesses_real_fork_exec_exit") {
+        return;
+    }
     let mut t = OwnedTarget::spawn_stopped(
         &[
             "/bin/sh".to_string(),
@@ -2168,7 +2195,13 @@ fn r20fix_kernel_lifecycle_witnesses_real_fork_exec_exit() {
     )
     .unwrap();
     let pid = t.pid();
-    let mut lc = KernelLifecycle::subscribe(pid).expect("connector subscribe");
+    let mut lc = match KernelLifecycle::subscribe(pid) {
+        Ok(lc) => lc,
+        Err(e) => {
+            let _ = t.resolve_setup_failure();
+            panic!("connector subscribe failed after gating present: {e:#}");
+        }
+    };
     assert!(
         !lc.fallback_partial(),
         "kernel signals must not be the PARTIAL fallback"
@@ -2214,4 +2247,229 @@ fn r20fix_kernel_lifecycle_witnesses_real_fork_exec_exit() {
     assert_eq!(tail.dropped, 0);
     assert!(tail.events.is_empty(), "no stragglers: {:?}", tail.events);
     assert_reaped_no_zombie(pid);
+}
+
+// ---------------------------------------------------------------------------
+// R20-fix round 2: balanced registration (NEW) + namespace failure (F2).
+// ---------------------------------------------------------------------------
+
+/// Protocol constants (uapi `connector.h` / `cn_proc.h` — test-local
+/// copies; production parses with its own).
+const TEST_CN_IDX_PROC: u32 = 1;
+const TEST_CN_VAL_PROC: u32 = 1;
+const TEST_NLMSG_HDRLEN: usize = 16;
+const TEST_CN_HDRLEN: usize = 20;
+const TEST_PROC_EVENT_HDRLEN: usize = 16;
+
+/// Raw group member (bound, never LISTENed — group membership alone
+/// receives multicasts): observes our IGNORE ack on the wire.
+fn bind_proc_group_sniffer() -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    let raw = unsafe {
+        libc::socket(
+            libc::AF_NETLINK,
+            libc::SOCK_DGRAM | libc::SOCK_CLOEXEC,
+            libc::NETLINK_CONNECTOR,
+        )
+    };
+    if raw < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+    use std::os::fd::AsRawFd;
+    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0
+        || unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+    addr.nl_family = libc::AF_NETLINK as u16;
+    addr.nl_pid = 0; // autobind (several observer sockets coexist)
+    addr.nl_groups = TEST_CN_IDX_PROC;
+    let bound = unsafe {
+        libc::bind(
+            fd.as_raw_fd(),
+            &addr as *const libc::sockaddr_nl as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+        )
+    };
+    if bound < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(fd)
+}
+
+fn le_u32(b: &[u8], off: usize) -> Option<u32> {
+    b.get(off..off + 4)
+        .and_then(|w| w.try_into().ok())
+        .map(u32::from_le_bytes)
+}
+
+/// Await the NONE ack echoing `our_ack` on the sniffer (other group
+/// traffic is skipped): returns its err field. Positive wire proof —
+/// a missing ack times out instead of passing vacuously.
+fn await_none_ack(
+    fd: &std::os::fd::OwnedFd,
+    our_ack: u32,
+    budget: Duration,
+) -> anyhow::Result<u32> {
+    use std::os::fd::AsRawFd;
+    let mut buf = vec![0u8; 65536];
+    let end = Instant::now() + budget;
+    while Instant::now() < end {
+        let mut pfd = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let pr = unsafe { libc::poll(&mut pfd, 1, 50) };
+        if pr <= 0 {
+            continue;
+        }
+        let r = unsafe {
+            libc::recv(
+                fd.as_raw_fd(),
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.len(),
+                libc::MSG_DONTWAIT,
+            )
+        };
+        if r <= 0 {
+            continue;
+        }
+        let bytes = &buf[..r as usize];
+        let mut off = 0usize;
+        while off + TEST_NLMSG_HDRLEN <= bytes.len() {
+            let (Some(len), Some(typ)) = (
+                le_u32(bytes, off).map(|l| l as usize),
+                le_u32(bytes, off + 4).map(|t| t as u16),
+            ) else {
+                break;
+            };
+            if len < TEST_NLMSG_HDRLEN || off + len > bytes.len() || typ == 2 {
+                break;
+            }
+            let body = &bytes[off + TEST_NLMSG_HDRLEN..off + len];
+            if body.len() >= TEST_CN_HDRLEN + TEST_PROC_EVENT_HDRLEN
+                && le_u32(body, 0) == Some(TEST_CN_IDX_PROC)
+                && le_u32(body, 4) == Some(TEST_CN_VAL_PROC)
+                && le_u32(body, 12) == Some(our_ack)
+            {
+                let ev = &body[TEST_CN_HDRLEN..];
+                if le_u32(ev, 0) == Some(0) {
+                    if let Some(err) = le_u32(ev, TEST_PROC_EVENT_HDRLEN) {
+                        return Ok(err);
+                    }
+                }
+            }
+            off += (len + 3) & !3;
+        }
+    }
+    anyhow::bail!("IGNORE ack not observed on the wire")
+}
+
+#[test]
+fn kernel_unsubscribe_is_accepted_live() {
+    // NEW (balanced registration): IGNORE must be ACCEPTED by the
+    // kernel (err 0 on the echoed NONE ack — a wrong op would answer
+    // EINVAL and leak the listener count). A holder keeps the global
+    // count ≥ 1 so the ack is emitted; a raw group sniffer bound
+    // AFTER both subscribes observes the ack on the wire (positive
+    // proof — silence would time out, never pass). Repeat + Drop
+    // after unsubscribe are safe (kernel guards double-IGNORE), and
+    // a fresh subscribe still works afterwards (no wedged state).
+    use osslscope::capture::{KernelLifecycle, LifecyclePort};
+    if !require_connector("kernel_unsubscribe_is_accepted_live") {
+        return;
+    }
+    let holder = KernelLifecycle::subscribe(std::process::id()).expect("holder subscribe");
+    let mut lc = KernelLifecycle::subscribe(std::process::id()).expect("subscribe");
+    let sniff = bind_proc_group_sniffer().expect("sniffer bind");
+    lc.unsubscribe().expect("unsubscribe sends");
+    let our_ack = std::process::id().wrapping_add(1);
+    let err = await_none_ack(&sniff, our_ack, Duration::from_secs(5)).expect("IGNORE ack on wire");
+    assert_eq!(err, 0, "kernel must ACCEPT the IGNORE (err=EINVAL leaks)");
+    // Corroboration through the adapter itself: our own socket also
+    // receives the ack (err 0 → silent, never loss).
+    let end = Instant::now() + Duration::from_millis(500);
+    loop {
+        let d = lc.poll();
+        assert_eq!(d.loss, 0, "accepted IGNORE ack is silent: {d:?}");
+        if Instant::now() >= end {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    lc.unsubscribe().expect("repeat unsubscribe sends");
+    drop(lc);
+    let resub = KernelLifecycle::subscribe(std::process::id()).expect("resubscribe works");
+    drop(resub);
+    drop(holder);
+}
+
+const USERNS_PROBE_ENV: &str = "R20_USERNS_PROBE";
+
+#[test]
+fn helper_userns_subscribe_probe() {
+    // Hidden probe worker for `kernel_subscribe_in_user_namespace_
+    // fails_closed` (re-executed in a child test-binary process —
+    // never forked in-process, so no post-fork lock hazard). No-op
+    // in normal suite runs.
+    if std::env::var(USERNS_PROBE_ENV).as_deref() != Ok("1") {
+        return;
+    }
+    let code = unsafe {
+        if libc::unshare(libc::CLONE_NEWUSER) != 0 {
+            44 // userns unavailable (EPERM) — environmental skip
+        } else {
+            match osslscope::capture::KernelLifecycle::subscribe(std::process::id()) {
+                Ok(_) => 43,  // namespace silence NOT observed — real failure
+                Err(_) => 42, // expected: ignored namespace, no ack
+            }
+        }
+    };
+    std::process::exit(code);
+}
+
+#[test]
+fn kernel_subscribe_in_user_namespace_fails_closed() {
+    // F2 (unsupported-namespace registration failure): the kernel
+    // ignores LISTEN from non-init namespaces with SILENCE (no ack)
+    // — subscribe must bail (loud fallback), never manufacture a
+    // clean witness from the empty socket. The probe runs in a child
+    // process (re-executed test binary — no in-process fork). The
+    // positive control gates first: if the facility is broken
+    // in-parent, a child failure would pass vacuously.
+    if !require_connector("kernel_subscribe_in_user_namespace_fails_closed") {
+        return;
+    }
+    let exe = std::env::current_exe().expect("test exe");
+    let mut child = std::process::Command::new(exe)
+        .arg("--exact")
+        .arg("helper_userns_subscribe_probe")
+        .arg("--nocapture")
+        .env(USERNS_PROBE_ENV, "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("probe spawn");
+    let end = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(s) = child.try_wait().expect("try_wait") {
+            break s;
+        }
+        if Instant::now() >= end {
+            child.kill().ok();
+            panic!("userns probe hung (30s)");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    match status.code() {
+        Some(42) => {}
+        Some(44) => eprintln!("SKIP: userns unavailable in this environment"),
+        Some(43) => panic!("subscribe SUCCEEDED in a child userns (silence not observed)"),
+        other => panic!("userns probe unexpected status: {other:?}"),
+    }
 }
