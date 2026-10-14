@@ -1336,8 +1336,26 @@ fn check_seccomp(env: &Env) -> Check {
 /// backend composes, so doctor agrees with `report`/`check`. A
 /// failed pair fails both rows (neither role is usable without
 /// its mate).
-fn objects_checks(harvest: Option<&str>, count: Option<&str>) -> Vec<Check> {
-    use onboard::ObjectRole::{Count, Harvest};
+fn objects_checks(harvest: Option<&str>, count: Option<&str>, members: Option<&str>) -> Vec<Check> {
+    objects_checks_in(
+        harvest,
+        count,
+        members,
+        &onboard::default_object_dirs(),
+        &onboard::TrustPolicy::production(),
+    )
+}
+
+/// Installed-object rows over explicit dirs/trust (production
+/// passes the installed defaults; tests pass fixtures).
+fn objects_checks_in(
+    harvest: Option<&str>,
+    count: Option<&str>,
+    members: Option<&str>,
+    dirs: &[PathBuf],
+    trust: &onboard::TrustPolicy,
+) -> Vec<Check> {
+    use onboard::ObjectRole::{Count, Harvest, Members};
     let row = |role: onboard::ObjectRole,
                r: Result<PathBuf, onboard::OnboardError>,
                how: &str|
@@ -1345,6 +1363,7 @@ fn objects_checks(harvest: Option<&str>, count: Option<&str>) -> Vec<Check> {
         let (id, noun) = match role {
             Harvest => ("objects-harvest", "harvest"),
             Count => ("objects-count", "count"),
+            Members => ("objects-members", "members"),
         };
         match r {
             Ok(path) => Check::pass(
@@ -1354,10 +1373,8 @@ fn objects_checks(harvest: Option<&str>, count: Option<&str>) -> Vec<Check> {
             Err(e) => Check::fail(id, e.message, e.remediation),
         }
     };
-    let dirs = onboard::default_object_dirs();
-    let trust = onboard::TrustPolicy::production();
     let mut search = onboard::ObjectSearch::default();
-    match (harvest, count) {
+    let mut rows = match (harvest, count) {
         (Some(h), Some(c)) => vec![
             row(
                 Harvest,
@@ -1378,14 +1395,14 @@ fn objects_checks(harvest: Option<&str>, count: Option<&str>) -> Vec<Check> {
             ),
             row(
                 Count,
-                onboard::resolve_implicit_role(Count, &dirs, &trust, &mut search),
+                onboard::resolve_implicit_role(Count, dirs, trust, &mut search),
                 "installed",
             ),
         ],
         (None, Some(c)) => vec![
             row(
                 Harvest,
-                onboard::resolve_implicit_role(Harvest, &dirs, &trust, &mut search),
+                onboard::resolve_implicit_role(Harvest, dirs, trust, &mut search),
                 "installed",
             ),
             row(
@@ -1394,7 +1411,7 @@ fn objects_checks(harvest: Option<&str>, count: Option<&str>) -> Vec<Check> {
                 "explicit",
             ),
         ],
-        (None, None) => match onboard::resolve_implicit_pair(&dirs, &trust, &mut search) {
+        (None, None) => match onboard::resolve_implicit_pair(dirs, trust, &mut search) {
             Ok(pair) => vec![
                 Check::pass(
                     "objects-harvest",
@@ -1416,7 +1433,39 @@ fn objects_checks(harvest: Option<&str>, count: Option<&str>) -> Vec<Check> {
                 Check::fail("objects-count", e.message, e.remediation),
             ],
         },
-    }
+    };
+    // Members (traversal) row: an explicit path vets pass/fail;
+    // implicit reports the installed state — installed+compatible
+    // passes, absent is INFO (old pair compatible, traversal
+    // unavailable), present-but-unresolvable FAILS (broken install,
+    // actionable — same fail-closed stance as the pair rows).
+    rows.push(match members {
+        Some(m) => row(
+            Members,
+            onboard::resolve_explicit(Members, Path::new(m)),
+            "explicit",
+        ),
+        None => match onboard::resolve_implicit_role(Members, dirs, trust, &mut search) {
+            Ok(path) => Check::pass(
+                "objects-members",
+                format!(
+                    "members object: {} (installed, compatible)",
+                    path.display()
+                ),
+            ),
+            Err(e) => {
+                if onboard::role_file_in_trusted(Members, dirs, trust) {
+                    Check::fail("objects-members", e.message, e.remediation)
+                } else {
+                    Check::info(
+                        "objects-members",
+                        "members object: not installed (traversal unavailable — old harvest/count pair compatible)".to_string(),
+                    )
+                }
+            }
+        },
+    });
+    rows
 }
 
 /// Maximum caller modules doctor scans for the address-taken
@@ -1824,7 +1873,7 @@ fn check_byte_rows(path: &str, bytes: &[u8], static_exe: bool, ctx: &TargetCtx) 
 
 // ---- entry point ----
 
-const USAGE: &str = "usage: osslscope doctor [--pid PID | --libcrypto PATH | --exe PATH] [--table FILE] [--force-offset N] [--provider-table FILE] [--object O] [--count-object C] [--format human|json]";
+const USAGE: &str = "usage: osslscope doctor [--pid PID | --libcrypto PATH | --exe PATH] [--table FILE] [--force-offset N] [--provider-table FILE] [--object O] [--count-object C] [--members-object M] [--format human|json]";
 
 pub fn run(args: &[String]) -> ExitCode {
     let mut pid: Option<u32> = None;
@@ -1835,6 +1884,7 @@ pub fn run(args: &[String]) -> ExitCode {
     let mut provider_table_path: Option<String> = None;
     let mut object: Option<String> = None;
     let mut count_object: Option<String> = None;
+    let mut members_object: Option<String> = None;
     let mut format = "human".to_string();
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -1851,7 +1901,7 @@ pub fn run(args: &[String]) -> ExitCode {
                 "  --table FILE | --force-offset N | --provider-table FILE: vet with explicit local enrollment"
             );
             println!(
-                "  --object O | --count-object C: vet explicit BPF objects instead of installed defaults"
+                "  --object O | --count-object C | --members-object M: vet explicit BPF objects instead of installed defaults"
             );
             println!("  --format human|json (default human)");
             return ExitCode::SUCCESS;
@@ -1871,6 +1921,7 @@ pub fn run(args: &[String]) -> ExitCode {
                 "--provider-table" => provider_table_path = Some(val(&mut it)?),
                 "--object" => object = Some(val(&mut it)?),
                 "--count-object" => count_object = Some(val(&mut it)?),
+                "--members-object" => members_object = Some(val(&mut it)?),
                 "--format" => {
                     let f = val(&mut it)?;
                     if f != "human" && f != "json" {
@@ -1970,7 +2021,11 @@ pub fn run(args: &[String]) -> ExitCode {
         check_seccomp(&env),
         check_spawn_access(),
     ];
-    checks.extend(objects_checks(object.as_deref(), count_object.as_deref()));
+    checks.extend(objects_checks(
+        object.as_deref(),
+        count_object.as_deref(),
+        members_object.as_deref(),
+    ));
 
     let mut target: Option<Target> = None;
     if let Some(p) = pid {
@@ -2709,5 +2764,116 @@ mod tests {
             assert!(c.message.contains("self dumpable="), "{}", c.message);
             assert_eq!(children(), 0, "probe leaked a child (zombie or stopped)");
         }
+    }
+
+    static DOCTOR_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    fn doctor_scratch(test: &str) -> PathBuf {
+        let n = DOCTOR_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "osslscope-doctor-{}-{}-{}",
+            std::process::id(),
+            test,
+            n
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn doctor_trust() -> onboard::TrustPolicy {
+        onboard::TrustPolicy {
+            // SAFETY: getuid takes no arguments and always succeeds.
+            trusted_uids: vec![unsafe { libc::getuid() }],
+            check_ancestry: false,
+        }
+    }
+
+    /// A scratch dir the test trust accepts (root-only off, own
+    /// uid allowed, tight perms cap inherited).
+    fn trusted_fixture(test: &str) -> PathBuf {
+        let dir = doctor_scratch(test);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&dir, perms).unwrap();
+        }
+        let trust = doctor_trust();
+        assert!(
+            onboard::is_trusted_dir_with(&dir, &trust),
+            "fixture dir must be trusted"
+        );
+        dir
+    }
+
+    fn members_row(rows: &[Check]) -> &Check {
+        rows.iter()
+            .find(|c| c.id == "objects-members")
+            .expect("objects-members row present")
+    }
+
+    fn built_members() -> Option<PathBuf> {
+        let cand = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("crates/ebpf/target/bpfel-unknown-none/release/osslscope-members");
+        cand.exists().then_some(cand)
+    }
+
+    #[test]
+    fn members_row_absent_is_info() {
+        // No members object installed anywhere: INFO, never fail —
+        // old pair installs stay valid (traversal unavailable).
+        let dir = trusted_fixture("members-absent");
+        let rows = objects_checks_in(None, None, None, &[dir], &doctor_trust());
+        let m = members_row(&rows);
+        assert_eq!(m.status, Status::Info, "{}", m.message);
+        assert!(m.message.contains("not installed"), "{}", m.message);
+    }
+
+    #[test]
+    fn members_row_broken_is_fail() {
+        // A members file that fails vetting: FAIL with the
+        // resolution diagnostic (broken install, actionable).
+        let dir = trusted_fixture("members-broken");
+        std::fs::write(dir.join("osslscope-members"), b"not an elf object").unwrap();
+        let rows = objects_checks_in(None, None, None, &[dir], &doctor_trust());
+        let m = members_row(&rows);
+        assert_eq!(m.status, Status::Fail, "{}", m.message);
+        assert!(m.remediation.is_some());
+    }
+
+    #[test]
+    fn members_row_installed_is_pass() {
+        // A vetted installed members object: PASS (needs the built
+        // object — skips loud when the BPF tree was never built).
+        let Some(obj) = built_members() else {
+            eprintln!("SKIP members_row_installed_is_pass: no built members object");
+            return;
+        };
+        let dir = trusted_fixture("members-installed");
+        std::fs::copy(&obj, dir.join("osslscope-members")).unwrap();
+        let rows = objects_checks_in(None, None, None, &[dir], &doctor_trust());
+        let m = members_row(&rows);
+        assert_eq!(m.status, Status::Pass, "{}", m.message);
+        assert!(m.message.contains("installed, compatible"), "{}", m.message);
+    }
+
+    #[test]
+    fn members_row_explicit_vets() {
+        // Explicit paths vet pass/fail individually (garbage fails
+        // naming the object — hermetic, no built objects needed).
+        let dir = doctor_scratch("members-explicit");
+        let bad = dir.join("bad-members.o");
+        std::fs::write(&bad, b"not an elf object").unwrap();
+        let rows = objects_checks_in(
+            None,
+            None,
+            Some(bad.to_str().unwrap()),
+            &[],
+            &doctor_trust(),
+        );
+        let m = members_row(&rows);
+        assert_eq!(m.status, Status::Fail, "{}", m.message);
+        assert!(m.message.contains("bad-members.o"), "{}", m.message);
     }
 }
