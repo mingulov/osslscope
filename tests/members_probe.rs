@@ -1277,10 +1277,12 @@ fn l1_load_513_margins() {
         lens.last().unwrap().1 <= 65536,
         "xlated per-prog sanity envelope (64KiB)"
     );
-    assert!(
-        m000 > *mid_max && m511 > *mid_max,
-        "folds visible at xlated level too"
-    );
+    // Fold structure (matches S8's raw pin): member_000 smallest
+    // (no T+1 verifier — it always walks — while the middle
+    // members carry the T+1 probe incl. its silent-Err arm),
+    // member_511 largest (guard eligibility + GUARD event).
+    assert!(m000 < *mid_min, "member_000 smallest at xlated level too");
+    assert!(m511 > *mid_max, "member_511 largest at xlated level too");
 }
 
 /// L2 fixture: 7 live slots (§2.2 fixture E) × 7-entry dispatch,
