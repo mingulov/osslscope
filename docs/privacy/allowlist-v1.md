@@ -137,6 +137,10 @@ Non-target provenance:
 - `offset`: file offset, stable across ASLR.
 - `addr_hash`: one-way hash over the attested backing triple.
 - `target.comm`: `/proc/<pid>/comm` task name.
+- traversal tids: `/proc/<pid>/task` entry names (numeric tids for
+  BIRTH registration; the backend reads directory names only —
+  no target memory, and its map I/O touches only the §4
+  observer-owned maps).
 - `target.cmdline`: rendered `/proc/<pid>/cmdline`, capped at 8 KiB
   with a truncation marker.
 - `target.container_id`: selected cgroup path segment, else empty.

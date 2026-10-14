@@ -136,10 +136,16 @@ attach the same way. On failure it prints the concrete fix
 An unsuitable target exits 4. `--table FILE`,
 `--force-offset N`, and `--provider-table FILE` vet with
 explicit local enrollment; `--object O` / `--count-object
-C` vet explicit BPF objects; `--format json` emits
-machine-readable output. Implicitly trusted object
-locations are root-owned system dirs; anything else needs
-explicit flags.
+C` / `--members-object M` vet explicit BPF objects;
+`--format json` emits machine-readable output. Implicitly
+trusted object locations are root-owned system dirs;
+anything else needs explicit flags. The `objects-members`
+row covers the traversal object: `pass` when installed and
+compatible, `info` when absent (traversal unavailable — old
+harvest/count pair installs stay valid), `fail` when present
+but unresolvable (reinstall that object). `report`/`check`
+run harvest-only; traversal selection is not yet exposed on
+their CLIs.
 
 ## alias-audit — find shared dispatch addresses
 
