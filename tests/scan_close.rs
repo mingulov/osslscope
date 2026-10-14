@@ -205,6 +205,129 @@ fn fix1_storm_detector_sparse_polls_trip() {
     assert!(d.detached());
 }
 
+/// Round-2 F6: late-RET recovery survives production drains —
+/// the RET for a hung-abandoned invocation joins as LATE even
+/// after `take_done` consumed the verdict (no orphaning).
+#[test]
+fn fix2_late_ret_after_production_drain() {
+    let mut o = Oracle::new(OracleScope::full());
+    let mut b1 = ScanBatch {
+        quiesced: false,
+        now_ns: 1_000,
+        ..ScanBatch::default()
+    };
+    b1.push_call(call(0, false, wire::SKIP_ADMITTED));
+    o.ingest(&b1);
+    assert_eq!(o.open_count(), 1);
+    // Age past the 5s hung line, then drain like production
+    // (every poll takes `done`).
+    let b2 = ScanBatch {
+        quiesced: false,
+        now_ns: 6_000_000_001,
+        ..ScanBatch::default()
+    };
+    o.ingest(&b2);
+    assert!(o.done().iter().any(|w| w.seq == 0
+        && matches!(
+            w.outcome,
+            Outcome::Abandoned {
+                reason: AbandonReason::Hung
+            }
+        )));
+    let drained = o.take_done();
+    assert_eq!(drained.len(), 1);
+    assert!(o.done().is_empty());
+    // The late RET arrives after the drain: LATE join, verdict
+    // standing — never an orphan.
+    let mut b3 = ScanBatch {
+        quiesced: false,
+        now_ns: 6_000_000_002,
+        ..ScanBatch::default()
+    };
+    b3.push_ret(ret(0));
+    o.ingest(&b3);
+    assert!(
+        o.findings().contains(&Finding::LateRet {
+            tid: TID,
+            seq: 0,
+            arr: ARR
+        }),
+        "late RET after drain must join LATE: {:?}",
+        o.findings()
+    );
+    assert!(
+        !o.findings()
+            .iter()
+            .any(|f| matches!(f, Finding::OrphanRet { seq: 0, .. }))
+    );
+}
+
+/// Round-2 F6: straggler records for consumed invocations are not
+/// orphans (cross-CPU ring skew delivers them after the close;
+/// the oracle retains the outcome evidence across drains).
+#[test]
+fn fix2_consumed_no_false_orphans() {
+    let mut o = Oracle::new(OracleScope::full());
+    let mut b1 = ScanBatch {
+        quiesced: false,
+        now_ns: 1_000,
+        ..ScanBatch::default()
+    };
+    b1.push_call(call(0, false, wire::SKIP_ADMITTED));
+    b1.push_ret(ret(0));
+    b1.push_alg(alg(0, 0, wire::ALG_OK));
+    b1.push_alg(alg(0, 1, wire::ALG_EMPTY));
+    o.ingest(&b1);
+    let mut b2 = ScanBatch {
+        quiesced: false,
+        now_ns: 2_000,
+        ..ScanBatch::default()
+    };
+    b2.push_call(call(1, false, wire::SKIP_ADMITTED));
+    o.ingest(&b2);
+    assert_eq!(o.done().len(), 1);
+    let _ = o.take_done();
+    // Stragglers for the consumed key arrive late: absorbed, not
+    // orphan findings.
+    let mut b3 = ScanBatch {
+        quiesced: false,
+        now_ns: 3_000,
+        ..ScanBatch::default()
+    };
+    b3.push_alg(alg(0, 2, wire::ALG_OK));
+    b3.push_guard(wire::GuardEvent {
+        kind: wire::KIND_GUARD,
+        op: OP,
+        verdict: wire::GUARD_EMPTY,
+        tid: TID,
+        seq: 0,
+        arr: ARR,
+        generation: 0,
+    });
+    o.ingest(&b3);
+    assert!(
+        !o.findings().iter().any(|f| matches!(
+            f,
+            Finding::OrphanAlg { seq: 0, .. } | Finding::OrphanGuard { seq: 0, .. }
+        )),
+        "consumed-key stragglers must not orphan: {:?}",
+        o.findings()
+    );
+    // A truly unknown key still orphans.
+    let mut b4 = ScanBatch {
+        quiesced: false,
+        now_ns: 4_000,
+        ..ScanBatch::default()
+    };
+    b4.push_alg(alg(9, 0, wire::ALG_OK));
+    o.ingest(&b4);
+    assert!(
+        o.findings()
+            .iter()
+            .any(|f| matches!(f, Finding::OrphanAlg { seq: 9, .. }))
+    );
+}
+
 /// Finding 7: idle polls age the tier-2 window (an engaged
 /// throttle releases once the trailing cost decays, without
 /// needing a completion to trigger the recheck).

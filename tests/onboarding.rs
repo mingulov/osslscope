@@ -1768,3 +1768,122 @@ fn triple_mixed_explicit_implicit_allowed() {
     assert_eq!(set.members, objs.2);
     assert_eq!(set.harvest, pair_dir.join("osslscope-harvest"));
 }
+
+// ---------------------------------------------------------------------------
+// Shared run-set decision (round-2 F9): capture and doctor resolve
+// through ONE function, so missing/mixed/stale sets behave
+// identically in both — no silent pair fallback where doctor
+// rejects, no receiptless matched-build claims.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn fix2_run_set_pair_only_when_members_absent_everywhere() {
+    let Some(objs) = built_objects() else {
+        return;
+    };
+    // Old-pair install (no members file anywhere): the run stays
+    // harvest-only — the only pair-fallback branch.
+    let prefix = scratch("runset-pair-only");
+    let pair_dir = install_fixture(&prefix, &objs, false, None);
+    let (run, _) =
+        onboard::resolve_run_set(None, None, None, &[pair_dir.clone()], &test_trust())
+            .expect("pair-only install stays harvest-only");
+    match run {
+        onboard::RunSet::PairOnly(pair) => {
+            assert_eq!(pair.harvest, pair_dir.join("osslscope-harvest"));
+            assert_eq!(pair.count, pair_dir.join("osslscope-count"));
+        }
+        onboard::RunSet::Triple(_) => panic!("pair-only install must not claim a triple"),
+        onboard::RunSet::NoObjects(e) => panic!("pair resolves here: {}", e.full()),
+    }
+}
+
+#[test]
+fn fix2_run_set_members_elsewhere_refuses() {
+    let Some(objs) = built_objects() else {
+        return;
+    };
+    // Pair in A, members alone in B: a mixed set — the run
+    // refuses (never a quiet pair while doctor rejects the same
+    // set). This is the F9 capture/doctor agreement case.
+    let pair_pfx = scratch("runset-mixed-pair");
+    let pair_dir = install_fixture(&pair_pfx, &objs, false, None);
+    let mem_pfx = scratch("runset-mixed-members");
+    let mem_objdir = mem_pfx.join("lib").join("osslscope");
+    std::fs::create_dir_all(&mem_objdir).unwrap();
+    chmod_trusted(&mem_pfx, true);
+    chmod_trusted(&mem_pfx.join("lib"), true);
+    chmod_trusted(&mem_objdir, true);
+    let mem_dst = mem_objdir.join("osslscope-members");
+    std::fs::copy(&objs.2, &mem_dst).unwrap();
+    chmod_trusted(&mem_dst, false);
+    let err = onboard::resolve_run_set(None, None, None, &[pair_dir, mem_objdir], &test_trust())
+        .unwrap_err();
+    assert!(
+        err.message.contains("harvest+count+members triple"),
+        "mixed set refuses with the triple error: {}",
+        err.message
+    );
+}
+
+#[test]
+fn fix2_run_set_stale_refuses_without_fallback() {
+    let Some(objs) = built_objects() else {
+        return;
+    };
+    // Complete triple, one role swapped after install: stale is
+    // found-but-broken (never not-found) — no pair fallback.
+    let prefix = scratch("runset-stale");
+    let dests = receipt_dests(&prefix, &objs);
+    let objdir = install_fixture(&prefix, &objs, true, Some(&dests));
+    std::fs::write(objdir.join("osslscope-count"), b"swapped-bytes").unwrap();
+    let err = onboard::resolve_run_set(None, None, None, &[objdir], &test_trust()).unwrap_err();
+    assert!(
+        err.message.contains("stale"),
+        "stale triple refuses: {}",
+        err.message
+    );
+}
+
+#[test]
+fn fix2_run_set_explicit_members_never_falls_back() {
+    let Some(objs) = built_objects() else {
+        return;
+    };
+    // Explicit members demanded but pair unresolvable: the
+    // operator demanded traversal — refuse, never harvest-only.
+    let missing = scratch("runset-explicit-missing").join("nope-count");
+    let err = onboard::resolve_run_set(None, Some(&missing), Some(&objs.2), &[], &test_trust())
+        .unwrap_err();
+    assert!(
+        err.message.contains("missing"),
+        "explicit-members failure refuses: {}",
+        err.message
+    );
+}
+
+#[test]
+fn fix2_run_set_explicit_pair_provenance_kept() {
+    let Some(objs) = built_objects() else {
+        return;
+    };
+    // Provenance rides the set: explicit roles are flagged so the
+    // snapshot never receipt-checks operator-trusted bytes.
+    let mix_pfx = scratch("runset-prov-mixed");
+    let mix_dir = install_fixture(&mix_pfx, &objs, false, None);
+    let (set, _) = onboard::resolve_set(
+        Some(&objs.0),
+        None,
+        Some(&objs.2),
+        &[mix_dir],
+        &test_trust(),
+    )
+    .expect("mixed set resolves");
+    assert_eq!(set.explicit, [true, false, true]);
+    let prefix = scratch("runset-prov-implicit");
+    let dests = receipt_dests(&prefix, &objs);
+    let objdir = install_fixture(&prefix, &objs, true, Some(&dests));
+    let (set, _) = onboard::resolve_set(None, None, None, &[objdir], &test_trust())
+        .expect("implicit triple resolves");
+    assert_eq!(set.explicit, [false, false, false]);
+}
