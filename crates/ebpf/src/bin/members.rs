@@ -103,18 +103,20 @@ static LOSS: PerCpuHashMap<u32, u64> = PerCpuHashMap::with_max_entries(32, 0);
 /// there is no clear to race at all).
 #[map]
 static TRUNC: PerCpuHashMap<u32, u64> = PerCpuHashMap::with_max_entries(64, 0);
-/// Per-op TRUNC flag-event generation: bumped on EVERY flag
-/// event for the op (even a repeat bit or a map-full one —
-/// activity is activity). Userspace re-reports the op's set
-/// bits when its generation advanced (recurring faults stay
-/// visible); first sightings never need it (freshness alone
-/// reports). Comparison semantics (changed/unchanged), so
-/// concurrent read-modify-write increments losing a count is
-/// harmless — any successful bump proves activity. A failed
-/// bump (map full) counts LOSS (the repeat it hides degrades
-/// via the loss path instead).
+/// Per-op TRUNC flag-event generation (per-CPU): bumped on
+/// EVERY flag event for the op (even a repeat bit or a map-full
+/// one — activity is activity). Userspace sums across CPUs and
+/// re-reports the op's set bits when its generation advanced
+/// (recurring faults stay visible); first sightings never need
+/// it (freshness alone reports). Per-CPU slots are
+/// single-writer (no migration mid-BPF, no same-CPU nesting
+/// for uretprobe members), so increments are exact — no lost
+/// counts and no stale-writer rollback, which a shared-map
+/// read-modify-write would allow. A failed bump (map full)
+/// counts LOSS (the repeat it hides degrades via the loss path
+/// instead).
 #[map]
-static TRUNC_SEQ: HashMap<u32, u64> = HashMap::with_max_entries(64, 0);
+static TRUNC_SEQ: PerCpuHashMap<u32, u64> = PerCpuHashMap::with_max_entries(64, 0);
 /// Non-null query calls per op id, counted by member 0 (once per
 /// query — every member fires every hit, so member 0's bump is the
 /// per-query count; all-members bumping would inflate 512x).
@@ -281,16 +283,14 @@ fn flag_trunc(op: u32, bit: u64) {
 
 /// Per-op generation bump as a BPF subprogram (separate
 /// verification scope; one call per flag site instead of an
-/// inlined map read-modify-write per site — member bodies stay
-/// near-uniform for S8). Unconditional — a repeat bit or a
-/// map-full flag is still activity. Comparison semantics:
-/// read-modify-write races losing a count are harmless (any
-/// successful bump proves activity); a failed insert counts
-/// LOSS (fail-closed via the loss path).
+/// inlined bump per site — member bodies stay near-uniform for
+/// S8). Unconditional — a repeat bit or a map-full flag is
+/// still activity. Per-CPU exact add (single-writer slots);
+/// only a full map fails, and that counts LOSS (fail-closed
+/// via the loss path).
 #[inline(never)]
 fn bump_trunc_seq(op: u32) {
-    let next = unsafe { TRUNC_SEQ.get_ptr(&op).map(|p| *p).unwrap_or(0) }.wrapping_add(1);
-    if TRUNC_SEQ.insert(&op, next, 0).is_err() {
+    if percpu_add(&TRUNC_SEQ, &op).is_err() {
         bump_loss(LOSS_MAP_TRUNC);
     }
 }
