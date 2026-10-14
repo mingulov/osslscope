@@ -34,6 +34,18 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+/// Onboarding failure kind: nothing was found (a valid
+/// pair-only install stays harvest-only) vs found-but-broken
+/// (trust/compat/receipt failures — the ordinary run refuses).
+/// Typed, never a message prefix (rewording a message must not
+/// flip the run-set decision, and a spoofed message must not
+/// open the harvest-only fallback).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnboardErrorKind {
+    NotFound,
+    Invalid,
+}
+
 /// Actionable onboarding failure: what happened plus the operator's
 /// fix. Callers render [`OnboardError::full`] (usage/exit-4 paths) or
 /// map the fields into diagnostic rows (doctor).
@@ -41,6 +53,7 @@ use std::path::{Path, PathBuf};
 pub struct OnboardError {
     pub message: String,
     pub remediation: String,
+    pub kind: OnboardErrorKind,
 }
 
 impl OnboardError {
@@ -48,6 +61,15 @@ impl OnboardError {
         OnboardError {
             message,
             remediation,
+            kind: OnboardErrorKind::Invalid,
+        }
+    }
+
+    pub fn not_found(message: String, remediation: String) -> Self {
+        OnboardError {
+            message,
+            remediation,
+            kind: OnboardErrorKind::NotFound,
         }
     }
 
@@ -61,7 +83,7 @@ impl OnboardError {
     /// ordinary run uses this to tell a pair-only install (valid
     /// harvest-only) from a broken triple (fail-closed).
     pub fn is_not_found(&self) -> bool {
-        self.message.starts_with("no BPF objects found")
+        self.kind == OnboardErrorKind::NotFound
     }
 }
 
@@ -535,7 +557,7 @@ pub fn resolve_implicit_role(
             search.skipped_untrusted.len()
         ));
     }
-    Err(OnboardError::new(
+    Err(OnboardError::not_found(
         message,
         format!(
             "install objects to a trusted dir ({}) or pass {} explicitly",
@@ -585,7 +607,7 @@ pub fn resolve_implicit_pair(
             search.skipped_untrusted.len()
         ));
     }
-    Err(OnboardError::new(
+    Err(OnboardError::not_found(
         message,
         format!(
             "install objects to a trusted dir ({}) or pass --object/--count-object explicitly",
@@ -788,7 +810,7 @@ pub fn resolve_implicit_triple(
             search.skipped_untrusted.len()
         ));
     }
-    Err(OnboardError::new(
+    Err(OnboardError::not_found(
         message,
         format!(
             "install objects to a trusted dir ({}) or pass --object/--count-object/--members-object explicitly",
@@ -849,10 +871,7 @@ pub fn verify_role_receipt(role: ObjectRole, path: &Path) -> Result<(), OnboardE
 /// use). Receipt-absent pair roles return the bounded read
 /// unverified (old installs); every other rule matches
 /// [`verify_role_receipt`] exactly.
-pub fn verify_role_receipt_bytes(
-    role: ObjectRole,
-    path: &Path,
-) -> Result<Vec<u8>, OnboardError> {
+pub fn verify_role_receipt_bytes(role: ObjectRole, path: &Path) -> Result<Vec<u8>, OnboardError> {
     let dir = path.parent().ok_or_else(|| {
         OnboardError::new(
             format!(
