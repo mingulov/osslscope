@@ -260,7 +260,7 @@ fn s1_prepare_513() {
     assert_eq!(
         prep.maps.len(),
         15,
-        "exactly the 15 member maps (D 13 + item-5 BUCKET + round-2 TRUNC_SEQ)"
+        "exactly the 15 member maps (D 13 + item-5 BUCKET + round-3 TRUNC_SEQ)"
     );
 }
 
@@ -348,7 +348,7 @@ fn s3_bodies_distinct() {
 }
 
 /// S4: the 15 map dims pinned (6 retained + 7 item-3 scan-plane
-/// + item-5 BUCKET + round-2 TRUNC_SEQ; item-7 EVENTS at 16MiB).
+/// + item-5 BUCKET + round-3 TRUNC_SEQ; item-7 EVENTS at 16MiB).
 #[test]
 fn s4_map_dims() {
     let Some(prep) = prepared() else {
@@ -371,7 +371,7 @@ fn s4_map_dims() {
         ("T_CACHE", 1, 8, 16, 1024, 0),
         ("CTRL", 2, 4, 24, 1, 0),
         ("ATTEMPT", 6, 4, 8, 1, 0),
-        ("TRUNC_SEQ", 6, 4, 8, 1, 0),
+        ("TRUNC_SEQ", 1, 4, 8, 64, 0),
     ];
     assert_eq!(prep.maps.len(), want.len());
     for (got, w) in prep.maps.iter().zip(want.iter()) {
