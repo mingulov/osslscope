@@ -54,7 +54,11 @@ use crate::evidence::{
     LegacyCallPartition, ObjectId, ObjectRecord, OpensslVersion, ScopeCoverage, SiteExecution,
     SiteKey, TargetRecord,
 };
+use crate::scan::backend::{BackendAction as ScanAction, ScanBackend};
+use crate::scan::oracle::{Finding, Outcome as ScanOutcome, WalkDone};
+use crate::scan::registry::TidSource as _;
 use crate::{args, kinds, pin, plan, target};
+use anyhow::Context as _;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::path::{Path, PathBuf};
@@ -146,6 +150,83 @@ pub enum Outcome {
     Complete,
     Partial,
     Fatal(FatalKind),
+}
+
+/// Traversal selection for [`run_traversal`] (opt-in per run —
+/// [`run`] stays harvest-only). `None` members means automatic
+/// triple discovery from the trusted object dirs; `Some` is an
+/// explicit operator override for the members role.
+#[derive(Debug, Clone, Default)]
+pub struct TraversalRequest {
+    pub members_object: Option<PathBuf>,
+}
+
+/// Provenance of one resolved BPF object (matched-set identity:
+/// the path that was loaded plus the sha256 of the bytes read).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectProvenance {
+    pub path: PathBuf,
+    pub sha256: String,
+}
+
+/// Resolved triple provenance (recorded on the capture when
+/// traversal runs — the exact selected objects, so doctor and the
+/// capture agree; report/check CLI selection is follow-up work).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TripleProvenance {
+    pub harvest: ObjectProvenance,
+    pub count: ObjectProvenance,
+    pub members: ObjectProvenance,
+}
+
+/// One traversal poll's outputs (port → Runner): completed
+/// invocation records, join findings, and the PARTIAL reasons
+/// this poll earned (storm cut observation, throttle skipped
+/// queries, invocations incomplete/unjoined).
+#[derive(Debug, Default)]
+pub struct TraversalDelta {
+    pub done: Vec<WalkDone>,
+    pub findings: Vec<Finding>,
+    pub partial_reasons: Vec<String>,
+    /// In-window backend polls this delta covers (1 per round
+    /// poll; the baseline poll contributes 0).
+    pub polls: u64,
+}
+
+/// Retained traversal outcome (on [`Capture`] when traversal ran;
+/// `None` on harvest-only runs — no behavior change there).
+#[derive(Debug, Clone, Default)]
+pub struct TraversalCapture {
+    pub provenance: Option<TripleProvenance>,
+    pub done: Vec<WalkDone>,
+    pub findings: Vec<Finding>,
+    pub polls: u64,
+    /// Backend throttled (SKIP_ALL) at the final drain.
+    pub throttled: bool,
+    /// Backend detached (tier-3 storm) at the final drain.
+    pub detached: bool,
+    /// The final tail drain failed (records kept are the
+    /// drained-so-far prefix — proved facts, H7).
+    pub finish_error: Option<String>,
+}
+
+impl TraversalCapture {
+    /// Merge a later drain (finish tail) into the accumulated
+    /// outcome: records append, end-state flags refresh,
+    /// provenance/finish-error fill once.
+    fn merge(&mut self, tail: TraversalCapture) {
+        self.done.extend(tail.done);
+        self.findings.extend(tail.findings);
+        self.polls += tail.polls;
+        self.throttled = tail.throttled;
+        self.detached = tail.detached;
+        if self.provenance.is_none() {
+            self.provenance = tail.provenance;
+        }
+        if self.finish_error.is_none() {
+            self.finish_error = tail.finish_error;
+        }
+    }
 }
 
 /// §4 gap counters (PRD key = TOTAL; `_bpf`/`_userspace` the split).
@@ -240,6 +321,10 @@ pub struct Capture {
     /// status preserved, or the detached pid that was left running.
     /// `None` for foreign `--pid` targets that recycled mid-window.
     pub disposition: Option<target::TargetDisposition>,
+    /// Traversal outcome (opt-in [`run_traversal`] runs only):
+    /// resolved-triple provenance plus the drained per-invocation
+    /// records. `None` on harvest-only runs.
+    pub traversal: Option<TraversalCapture>,
 }
 
 /// Minimal document for test constructors outside this module (real
@@ -439,6 +524,23 @@ pub trait DiscoveryPort {
     /// Quiesce-then-PROCESS teardown: exact tail accounting for the
     /// final drain. Called once, at close.
     fn finish(&mut self) -> anyhow::Result<DiscoverySnapshot>;
+    /// Traversal backend poll (same cadence as [`DiscoveryPort::poll`];
+    /// `baseline` drains the setup slice and fences pre-window opens —
+    /// same seed-then-discard discipline as the discovery baseline).
+    /// Harvest-only ports keep the default (inactive, empty delta).
+    fn poll_traversal(&mut self, _baseline: bool) -> anyhow::Result<TraversalDelta> {
+        Ok(TraversalDelta::default())
+    }
+    /// Traversal tail drain at close (infallible: a failed tail
+    /// drain rides inside as `finish_error`, never fails teardown).
+    fn finish_traversal(&mut self) -> TraversalCapture {
+        TraversalCapture::default()
+    }
+    /// Whether this port carries a live traversal backend (the
+    /// Runner retains a [`TraversalCapture`] only then).
+    fn traversal_active(&self) -> bool {
+        false
+    }
 }
 
 /// Live discovery engine behind the port: `DiscoverySession::close`
@@ -471,6 +573,189 @@ impl DiscoveryPort for LiveDiscovery {
         match self.0.take() {
             Some(session) => session.close(),
             None => anyhow::bail!("discovery session already finished"),
+        }
+    }
+}
+
+/// PARTIAL reasons one traversal poll earned: a storm detach cut
+/// observation (`traversal-storm`), the tier-2 throttle skipped
+/// queries (`traversal-throttled`), an invocation closed
+/// incomplete (`traversal-incomplete`), a record never joined
+/// (`traversal-unjoined`). Reattach/release/warm actions are
+/// recovery, never loss.
+fn traversal_reasons(
+    actions: &[ScanAction],
+    done: &[WalkDone],
+    findings: &[Finding],
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if actions.iter().any(|a| matches!(a, ScanAction::Detached)) {
+        reasons.push("traversal-storm".to_string());
+    }
+    if actions
+        .iter()
+        .any(|a| matches!(a, ScanAction::SkipAllEngaged))
+    {
+        reasons.push("traversal-throttled".to_string());
+    }
+    if done
+        .iter()
+        .any(|w| !matches!(w.outcome, ScanOutcome::Complete { .. }))
+    {
+        reasons.push("traversal-incomplete".to_string());
+    }
+    if !findings.is_empty() {
+        reasons.push("traversal-unjoined".to_string());
+    }
+    reasons
+}
+
+/// Live discovery engine with an attached traversal backend
+/// (opt-in [`run_traversal`] runs): harvest polling delegates to
+/// the inner session; traversal polls register the target's live
+/// tids (a vanished `/proc/<pid>/task` drains the tail against an
+/// empty set — a dead target grows no tids) and drain the members
+/// ring through the production backend.
+pub struct LiveTraversalDiscovery {
+    inner: LiveDiscovery,
+    backend: ScanBackend,
+    tasks: crate::scan::registry::ProcTaskSource,
+    provenance: TripleProvenance,
+}
+
+impl LiveTraversalDiscovery {
+    pub fn new(
+        session: DiscoverySession,
+        backend: ScanBackend,
+        pid: u32,
+        provenance: TripleProvenance,
+    ) -> Self {
+        Self {
+            inner: LiveDiscovery::new(session),
+            backend,
+            tasks: crate::scan::registry::ProcTaskSource::new(pid),
+            provenance,
+        }
+    }
+}
+
+impl DiscoveryPort for LiveTraversalDiscovery {
+    fn poll(&mut self, budget: PollBudget) -> anyhow::Result<DiscoveryDelta> {
+        self.inner.poll(budget)
+    }
+
+    fn snapshot(&self) -> DiscoverySnapshot {
+        self.inner.snapshot()
+    }
+
+    fn finish(&mut self) -> anyhow::Result<DiscoverySnapshot> {
+        self.inner.finish()
+    }
+
+    fn poll_traversal(&mut self, baseline: bool) -> anyhow::Result<TraversalDelta> {
+        use std::io::ErrorKind;
+        let tids = match self.tasks.tids() {
+            Ok(tids) => tids,
+            Err(e) if e.kind() == ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(e).context("enumerate target tasks"),
+        };
+        // BIRTH registration failure is a HARD error (the run
+        // fails loud, never silently unregistered).
+        self.backend.register(&tids)?;
+        if baseline {
+            // Seed-then-discard (fence order lives in the
+            // backend — pre-window news never becomes
+            // in-window evidence).
+            self.backend.baseline()?;
+            return Ok(TraversalDelta::default());
+        }
+        let delta = self.backend.poll()?;
+        let reasons = traversal_reasons(&delta.actions, &delta.done, &delta.findings);
+        Ok(TraversalDelta {
+            done: delta.done,
+            findings: delta.findings,
+            partial_reasons: reasons,
+            polls: 1,
+        })
+    }
+
+    fn finish_traversal(&mut self) -> TraversalCapture {
+        let mut out = TraversalCapture {
+            provenance: Some(self.provenance.clone()),
+            polls: 1,
+            ..TraversalCapture::default()
+        };
+        match self.backend.poll() {
+            Ok(delta) => {
+                out.done = delta.done;
+                out.findings = delta.findings;
+            }
+            Err(e) => {
+                out.finish_error = Some(format!("{e:#}"));
+                let (done, findings) = self.backend.take_completed();
+                out.done = done;
+                out.findings = findings;
+            }
+        }
+        let snap = self.backend.snapshot();
+        out.throttled = snap.throttled;
+        out.detached = snap.detached;
+        out
+    }
+
+    fn traversal_active(&self) -> bool {
+        true
+    }
+}
+
+/// Discovery engine behind the port: harvest-only by default,
+/// traversal-carrying on opt-in runs. One concrete type keeps
+/// [`SessionSet`] and [`observe`] unchanged for every caller.
+pub enum CaptureDiscovery {
+    HarvestOnly(Box<LiveDiscovery>),
+    Traversal(Box<LiveTraversalDiscovery>),
+}
+
+impl DiscoveryPort for CaptureDiscovery {
+    fn poll(&mut self, budget: PollBudget) -> anyhow::Result<DiscoveryDelta> {
+        match self {
+            CaptureDiscovery::HarvestOnly(d) => d.poll(budget),
+            CaptureDiscovery::Traversal(d) => d.poll(budget),
+        }
+    }
+
+    fn snapshot(&self) -> DiscoverySnapshot {
+        match self {
+            CaptureDiscovery::HarvestOnly(d) => d.snapshot(),
+            CaptureDiscovery::Traversal(d) => d.snapshot(),
+        }
+    }
+
+    fn finish(&mut self) -> anyhow::Result<DiscoverySnapshot> {
+        match self {
+            CaptureDiscovery::HarvestOnly(d) => d.finish(),
+            CaptureDiscovery::Traversal(d) => d.finish(),
+        }
+    }
+
+    fn poll_traversal(&mut self, baseline: bool) -> anyhow::Result<TraversalDelta> {
+        match self {
+            CaptureDiscovery::HarvestOnly(d) => d.poll_traversal(baseline),
+            CaptureDiscovery::Traversal(d) => d.poll_traversal(baseline),
+        }
+    }
+
+    fn finish_traversal(&mut self) -> TraversalCapture {
+        match self {
+            CaptureDiscovery::HarvestOnly(d) => d.finish_traversal(),
+            CaptureDiscovery::Traversal(d) => d.finish_traversal(),
+        }
+    }
+
+    fn traversal_active(&self) -> bool {
+        match self {
+            CaptureDiscovery::HarvestOnly(d) => d.traversal_active(),
+            CaptureDiscovery::Traversal(d) => d.traversal_active(),
         }
     }
 }
@@ -3807,6 +4092,10 @@ struct Runner<'x, D, B: CountBackend, T, L, C: ClockPort, P: ProcPort> {
     /// Once set, failures salvage into fatal-Runtime captures
     /// (exit 1) instead of returning Err.
     observation_started: bool,
+    /// Traversal accumulator (`Some` once an active port's
+    /// baseline poll ran; deepened every round, merged with the
+    /// finish tail at close; discarded on recycle/no-window).
+    traversal: Option<TraversalCapture>,
 }
 
 /// Maximum distinct file paths read per discovery poll
@@ -3942,6 +4231,40 @@ where
 {
     fn reason(&mut self, r: &str) {
         self.reasons.insert(r.to_string());
+    }
+
+    /// Merge the traversal finish tail into the accumulator and
+    /// raise the PARTIAL reasons its end state earns (a storm or
+    /// throttle still in force at close, a failed tail drain,
+    /// incomplete/unjoined tail records). No-op when traversal
+    /// never ran.
+    fn absorb_traversal_tail(&mut self) {
+        if self.traversal.is_none() {
+            return;
+        }
+        let tail = self.discovery.finish_traversal();
+        if tail.detached {
+            self.reason("traversal-storm");
+        }
+        if tail.throttled {
+            self.reason("traversal-throttled");
+        }
+        if tail.finish_error.is_some() {
+            self.reason("traversal-finish-error");
+        }
+        if tail
+            .done
+            .iter()
+            .any(|w| !matches!(w.outcome, ScanOutcome::Complete { .. }))
+        {
+            self.reason("traversal-incomplete");
+        }
+        if !tail.findings.is_empty() {
+            self.reason("traversal-unjoined");
+        }
+        if let Some(t) = self.traversal.as_mut() {
+            t.merge(tail);
+        }
     }
 
     /// Post-exec comm settle (owned only): refresh until the
@@ -4450,6 +4773,21 @@ where
                 break;
             }
         }
+        // Traversal poll (same cadence, active ports only — the
+        // harvest-only default no-ops): fold records/findings and
+        // the PARTIAL reasons this round earned. Errors propagate
+        // to salvage like any mid-window infrastructure failure.
+        if self.discovery.traversal_active() {
+            let tdelta = self.discovery.poll_traversal(false)?;
+            if let Some(t) = self.traversal.as_mut() {
+                for r in tdelta.partial_reasons {
+                    self.reasons.insert(r);
+                }
+                t.done.extend(tdelta.done);
+                t.findings.extend(tdelta.findings);
+                t.polls += tdelta.polls;
+            }
+        }
         // One fence per round (Exec > ProviderChanged >
         // MappingsChanged > CandidatesChanged).
         let fence_reason = if kinds.contains(&FenceKind::Exec) {
@@ -4529,6 +4867,10 @@ where
     /// caller already attempted (a `Some` seed piece is used as-is).
     fn salvage(mut self, seed: SalvageSeed, err: anyhow::Error) -> Capture {
         self.reason("close-failure");
+        // Traversal best-effort tail (drained-so-far survives:
+        // proved facts — H7; the finish error rides inside, never
+        // fails salvage).
+        self.absorb_traversal_tail();
         let mut failures = vec![format!("{err:#}")];
         let drain_failed: bool;
         let drain = match seed.drain {
@@ -4625,6 +4967,8 @@ where
         // R12: the single close sample (no window was observed, but
         // the pair still closes here) — reused below.
         self.wall_end = self.clock.wall_now();
+        // No window opened: nothing retained, traversal included.
+        self.traversal = None;
         let requested_end = self
             .requested_start_ns
             .saturating_add(duration_ns(self.cfg.duration));
@@ -4696,6 +5040,9 @@ where
         // H7: post-observation close — errors recorded as loss, not
         // swallowed (the recycle verdict dominates, but close
         // failures stay visible as typed counters + reason).
+        // Pid-scoped traversal evidence is tainted like the rest:
+        // discarded, never retained.
+        self.traversal = None;
         let mut close_failed = false;
         if self.count.close_and_drain(self.cfg.grace).is_err() {
             self.extra_loss.push(typed_counter(
@@ -4917,6 +5264,7 @@ where
         relevance_capped: 0,
         unverified_reads: 0,
         observation_started: false,
+        traversal: None,
     };
     runner.fallback_partial = runner.lifecycle.fallback_partial();
     runner.setup_and_run()
@@ -4993,6 +5341,18 @@ where
                 let _ = self.target.resolve_setup_failure();
                 return Err(e.context("setup discovery poll"));
             }
+        }
+        // Traversal baseline (active ports only): drain the setup
+        // slice and fence pre-window opens — pre-window traversal
+        // news never becomes in-window evidence (same
+        // seed-then-discard discipline as the discovery baseline).
+        if self.discovery.traversal_active() {
+            if let Err(e) = self.discovery.poll_traversal(true) {
+                let _ = self.count.close_and_drain(self.cfg.grace);
+                let _ = self.target.resolve_setup_failure();
+                return Err(e.context("setup traversal poll"));
+            }
+            self.traversal = Some(TraversalCapture::default());
         }
         if (self.cancelled)() {
             self.signal_cut = true;
@@ -5323,6 +5683,11 @@ where
         if let target::TargetDisposition::Exited { code } = disposition {
             self.child_exit = Some(code);
         }
+        // Traversal tail (last drain before assembly: the quiesce
+        // slice lands here too — same class as the harvest tail
+        // join; salvage-seed paths absorb inside salvage instead,
+        // so every close absorbs exactly once).
+        self.absorb_traversal_tail();
         Ok(self.assemble(snapshot, drain, Some(disposition), effective_end_ns, None))
     }
 
@@ -6269,6 +6634,7 @@ where
             image_digest: self.info.image_digest.clone(),
             document,
             disposition: parts.disposition,
+            traversal: self.traversal,
         }
     }
 }
@@ -6388,6 +6754,7 @@ fn recycled_capture(cfg: &Config, info: &TargetInfo) -> Capture {
         image_digest: info.image_digest.clone(),
         document,
         disposition: None,
+        traversal: None,
     }
 }
 
@@ -6505,7 +6872,8 @@ fn resolve_capture_provider(
     }
 }
 
-/// Run a full capture window against `target`.
+/// Run a full capture window against `target` (harvest-only:
+/// the qualified default — pair resolution, unchanged behavior).
 pub fn run(cfg: &Config, target: Target) -> anyhow::Result<Capture> {
     if cfg.duration.is_zero() {
         anyhow::bail!("--duration must be > 0 (no --forever in v1)");
@@ -6519,6 +6887,122 @@ pub fn run(cfg: &Config, target: Target) -> anyhow::Result<Capture> {
         &onboard::TrustPolicy::production(),
     )
     .map_err(|e| anyhow::anyhow!("BPF objects: {}", e.full()))?;
+    run_inner(cfg, target, objects, None)
+}
+
+/// Run a full capture window with the traversal backend attached
+/// (opt-in per run): the harvest/count/members triple resolves
+/// first — missing/mixed/stale sets refuse before any side effect,
+/// never a silent harvest-only fallback — then the ordinary
+/// window runs with the members backend draining alongside
+/// discovery (records + triple provenance retained on the
+/// capture; report/check CLI selection is follow-up work — the
+/// CLI flags live outside this task's file list).
+pub fn run_traversal(
+    cfg: &Config,
+    target: Target,
+    req: &TraversalRequest,
+) -> anyhow::Result<Capture> {
+    if cfg.duration.is_zero() {
+        anyhow::bail!("--duration must be > 0 (no --forever in v1)");
+    }
+    let (set, _) = onboard::resolve_set(
+        cfg.harvest_object.as_deref(),
+        cfg.count_object.as_deref(),
+        req.members_object.as_deref(),
+        &onboard::default_object_dirs(),
+        &onboard::TrustPolicy::production(),
+    )
+    .map_err(|e| anyhow::anyhow!("BPF objects: {}", e.full()))?;
+    let provenance = triple_provenance(&set)?;
+    let objects = onboard::ObjectPaths {
+        harvest: set.harvest,
+        count: set.count.clone(),
+    };
+    run_inner(
+        cfg,
+        target,
+        objects,
+        Some(TraversalAttach {
+            members: set.members,
+            provenance,
+        }),
+    )
+}
+
+/// Traversal attach request (resolved members object + the
+/// matched-set provenance the capture retains).
+struct TraversalAttach {
+    members: PathBuf,
+    provenance: TripleProvenance,
+}
+
+/// Mint matched-set provenance for a resolved triple (bounded
+/// re-reads — a swap between resolve and hash fails loud, never
+/// huge).
+fn triple_provenance(set: &onboard::ObjectSet) -> anyhow::Result<TripleProvenance> {
+    use sha2::Digest as _;
+    let hash = |role: &str, path: &Path| -> anyhow::Result<ObjectProvenance> {
+        let bytes = onboard::read_bounded(path, onboard::MAX_OBJECT_SCAN_BYTES)
+            .map_err(|e| anyhow::anyhow!("{role} object {}: {e}", path.display()))?;
+        Ok(ObjectProvenance {
+            path: path.to_path_buf(),
+            sha256: sha2::Sha256::digest(&bytes)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect(),
+        })
+    };
+    Ok(TripleProvenance {
+        harvest: hash("harvest", &set.harvest)?,
+        count: hash("count", &set.count)?,
+        members: hash("members", &set.members)?,
+    })
+}
+
+/// Wrap an attached discovery session for the run: harvest-only
+/// by default; traversal runs pin the builtin query anchor and
+/// attach the members backend (full 512, production CTRL). Anchor
+/// refusal (init mode / dispatch-blind — traversal never guesses
+/// an offset) and backend-attach failure refuse BEFORE the window
+/// opens (no release yet — the caller resolves custody exactly
+/// like a discovery-attach failure).
+fn wrap_discovery(
+    session: DiscoverySession,
+    traversal: Option<&TraversalAttach>,
+    pid: u32,
+) -> anyhow::Result<CaptureDiscovery> {
+    let Some(t) = traversal else {
+        return Ok(CaptureDiscovery::HarvestOnly(Box::new(LiveDiscovery::new(
+            session,
+        ))));
+    };
+    let (exe_path, off) = session.query_anchor().ok_or_else(|| {
+        anyhow::anyhow!(
+            "traversal requires the builtin query anchor (init-mode and dispatch-blind targets cannot traverse)"
+        )
+    })?;
+    let exe_str = exe_path.to_str().ok_or_else(|| {
+        anyhow::anyhow!("traversal anchor path is not UTF-8: {}", exe_path.display())
+    })?;
+    let exe = std::ffi::CString::new(exe_str)?;
+    let ctrl = crate::loader::default_ctrl(512, crate::loader::MEMBER_RING_BYTES)?;
+    let backend = ScanBackend::attach(&t.members, &exe, off, pid, &ctrl, None)
+        .map_err(|e| anyhow::anyhow!("members backend attach: {e:#}"))?;
+    Ok(CaptureDiscovery::Traversal(Box::new(
+        LiveTraversalDiscovery::new(session, backend, pid, t.provenance.clone()),
+    )))
+}
+
+/// Shared window setup over resolved objects (both entries funnel
+/// here after their own resolution; `traversal` selects the
+/// backend attach after discovery attaches, before release).
+fn run_inner(
+    cfg: &Config,
+    target: Target,
+    objects: onboard::ObjectPaths,
+    traversal: Option<TraversalAttach>,
+) -> anyhow::Result<Capture> {
     arm_signals();
     // Already size-bounded by resolution; re-read bounded anyway
     // (a swap between resolve and load fails loud, never huge).
@@ -6636,11 +7120,27 @@ pub fn run(cfg: &Config, target: Target) -> anyhow::Result<Capture> {
                     return Err(e.context(format!("discovery attach{exit_note}")));
                 }
             };
+            // Traversal opt-in: the backend attaches before release
+            // (probes arm while the child is still stopped, like
+            // every other plane); refusal custody mirrors discovery.
+            let discovery = match wrap_discovery(discovery, traversal.as_ref(), pid) {
+                Ok(discovery) => discovery,
+                Err(e) => {
+                    let exit_note = owned
+                        .poll_exit()
+                        .ok()
+                        .flatten()
+                        .map(|code| format!(" (child status {code})"))
+                        .unwrap_or_default();
+                    let _ = owned.resolve_setup_failure();
+                    return Err(e.context(format!("traversal attach{exit_note}")));
+                }
+            };
             observe(
                 &effective,
                 &info,
                 SessionSet {
-                    discovery: LiveDiscovery::new(discovery),
+                    discovery,
                     count,
                     target: owned,
                     lifecycle: LiveLifecycle::select(pid, false),
@@ -6696,11 +7196,17 @@ pub fn run(cfg: &Config, target: Target) -> anyhow::Result<Capture> {
                     return Err(e.context("discovery attach"));
                 }
             };
+            // Traversal opt-in (same pre-window attach; a refusal
+            // here is an anchor/attach failure, never a recycle).
+            let discovery = match wrap_discovery(discovery, traversal.as_ref(), p) {
+                Ok(discovery) => discovery,
+                Err(e) => return Err(e.context("traversal attach")),
+            };
             observe(
                 &effective,
                 &info,
                 SessionSet {
-                    discovery: LiveDiscovery::new(discovery),
+                    discovery,
                     count,
                     target: PinnedTarget::new(p, pin_guard),
                     lifecycle: LiveLifecycle::select(p, true),
@@ -8930,6 +9436,397 @@ mod tests {
             }
         }
 
+        /// Scripted traversal port: harvest behavior delegates to
+        /// the inner stub; traversal serves canned round deltas +
+        /// a finish tail (the baseline poll drops, like the live
+        /// port — it never consumes a canned round).
+        struct TraversalStub {
+            inner: DiscoveryStub,
+            rounds: std::collections::VecDeque<TraversalDelta>,
+            tail: TraversalCapture,
+            baseline_calls: Vec<bool>,
+        }
+        impl TraversalStub {
+            fn scripted(rounds: Vec<TraversalDelta>, tail: TraversalCapture) -> Self {
+                Self {
+                    inner: DiscoveryStub {
+                        finish_err: false,
+                        poll_err: false,
+                        dispatch_attached: false,
+                    },
+                    rounds: rounds.into(),
+                    tail,
+                    baseline_calls: Vec::new(),
+                }
+            }
+        }
+        impl DiscoveryPort for TraversalStub {
+            fn poll(&mut self, budget: PollBudget) -> anyhow::Result<DiscoveryDelta> {
+                self.inner.poll(budget)
+            }
+            fn snapshot(&self) -> DiscoverySnapshot {
+                self.inner.snapshot()
+            }
+            fn finish(&mut self) -> anyhow::Result<DiscoverySnapshot> {
+                self.inner.finish()
+            }
+            fn poll_traversal(&mut self, baseline: bool) -> anyhow::Result<TraversalDelta> {
+                self.baseline_calls.push(baseline);
+                if baseline {
+                    return Ok(TraversalDelta::default());
+                }
+                Ok(self.rounds.pop_front().unwrap_or_default())
+            }
+            fn finish_traversal(&mut self) -> TraversalCapture {
+                std::mem::take(&mut self.tail)
+            }
+            fn traversal_active(&self) -> bool {
+                true
+            }
+        }
+
+        fn walk(seq: u64, outcome: crate::scan::oracle::Outcome) -> WalkDone {
+            WalkDone {
+                tid: TPID,
+                seq,
+                op: 1,
+                arr: 0xa000,
+                outcome,
+                true_t: crate::scan::oracle::TrueT::Proven(6),
+                alg_count: 6,
+                row_count: 6,
+                guard: None,
+            }
+        }
+
+        fn triple_prov() -> TripleProvenance {
+            let obj = |n: &str| ObjectProvenance {
+                path: PathBuf::from(format!("/prefix/lib/osslscope/{n}")),
+                sha256: format!("hash-{n}"),
+            };
+            TripleProvenance {
+                harvest: obj("osslscope-harvest"),
+                count: obj("osslscope-count"),
+                members: obj("osslscope-members"),
+            }
+        }
+
+        #[test]
+        fn traversal_off_by_default_never_polls() {
+            // Harvest-only ports (the default methods) are never
+            // polled for traversal and retain no outcome.
+            let cfg = stub_config();
+            let info = stub_info();
+            let clock = ClockStub::at(5_000_000_000);
+            let mut proc = ProcStub;
+            let cancelled = || false;
+            let count = CountSession::new(TPID, FakeCountBackend::new());
+            let mut runner = stub_runner(
+                &cfg,
+                &info,
+                DiscoveryStub {
+                    finish_err: false,
+                    poll_err: false,
+                    dispatch_attached: false,
+                },
+                count,
+                &clock,
+                &mut proc,
+                &cancelled,
+            );
+            let deadline = clock.now() + Duration::from_secs(10);
+            let action = runner
+                .round(deadline, clock.now())
+                .expect("stub round runs");
+            assert!(matches!(action, RoundAction::Continue));
+            assert!(runner.traversal.is_none());
+            let cap = runner.close_and_finalize().expect("stub close finalizes");
+            assert!(cap.traversal.is_none());
+        }
+
+        #[test]
+        fn traversal_baseline_rounds_and_close_fold() {
+            // RED: an active port's baseline fences (first call,
+            // contributes nothing), rounds fold records/reasons,
+            // and the finish tail merges with provenance.
+            use crate::scan::oracle::{Finding as OFinding, Outcome, PartialReason};
+            let d1 = TraversalDelta {
+                done: vec![walk(
+                    1,
+                    Outcome::Complete {
+                        true_t: 6,
+                        cached: false,
+                    },
+                )],
+                findings: vec![],
+                partial_reasons: vec!["traversal-storm".to_string()],
+                polls: 1,
+            };
+            let d2 = TraversalDelta {
+                done: vec![walk(
+                    2,
+                    Outcome::Partial {
+                        reasons: vec![PartialReason::DrainLoss],
+                    },
+                )],
+                findings: vec![OFinding::OrphanRet { tid: TPID, seq: 9 }],
+                partial_reasons: vec!["traversal-incomplete".to_string()],
+                polls: 1,
+            };
+            let tail = TraversalCapture {
+                provenance: Some(triple_prov()),
+                done: vec![walk(
+                    3,
+                    Outcome::Complete {
+                        true_t: 6,
+                        cached: true,
+                    },
+                )],
+                findings: vec![],
+                polls: 1,
+                throttled: true,
+                detached: false,
+                finish_error: None,
+            };
+            let cfg = stub_config();
+            let info = stub_info();
+            let clock = ClockStub::at(5_000_000_000);
+            let mut proc = ProcStub;
+            let cancelled = || false;
+            let count = CountSession::new(TPID, FakeCountBackend::new());
+            let runner = stub_runner(
+                &cfg,
+                &info,
+                TraversalStub::scripted(vec![d1, d2], tail),
+                count,
+                &clock,
+                &mut proc,
+                &cancelled,
+            );
+            let cap = runner.setup_and_run().expect("stub run completes");
+            let t = cap.traversal.expect("active traversal retained");
+            assert_eq!(
+                t.done.iter().map(|w| w.seq).collect::<Vec<_>>(),
+                vec![1, 2, 3]
+            );
+            assert_eq!(t.findings.len(), 1);
+            assert!(t.polls >= 2, "rounds + finish tail, got {}", t.polls);
+            assert_eq!(t.provenance, Some(triple_prov()));
+            assert!(t.throttled);
+            assert!(t.finish_error.is_none());
+            assert!(cap.reasons.iter().any(|r| r == "traversal-storm"));
+            assert!(cap.reasons.iter().any(|r| r == "traversal-incomplete"));
+        }
+
+        #[test]
+        fn traversal_salvage_keeps_drained() {
+            // RED: a close failure salvages the drained-so-far
+            // traversal records (proved facts, H7) with the tail.
+            use crate::scan::oracle::Outcome;
+            let d1 = TraversalDelta {
+                done: vec![walk(
+                    1,
+                    Outcome::Complete {
+                        true_t: 6,
+                        cached: false,
+                    },
+                )],
+                findings: vec![],
+                partial_reasons: vec!["traversal-storm".to_string()],
+                polls: 1,
+            };
+            let tail = TraversalCapture {
+                provenance: Some(triple_prov()),
+                done: vec![walk(
+                    2,
+                    Outcome::Complete {
+                        true_t: 6,
+                        cached: true,
+                    },
+                )],
+                findings: vec![],
+                polls: 1,
+                throttled: false,
+                detached: true,
+                finish_error: None,
+            };
+            let cfg = stub_config();
+            let info = stub_info();
+            let clock = ClockStub::at(5_000_000_000);
+            let mut proc = ProcStub;
+            let cancelled = || false;
+            let count = CountSession::new(TPID, FakeCountBackend::new());
+            let mut stub = TraversalStub::scripted(vec![d1], tail);
+            stub.inner.finish_err = true;
+            let runner = stub_runner(&cfg, &info, stub, count, &clock, &mut proc, &cancelled);
+            let cap = runner
+                .setup_and_run()
+                .expect("close failure must salvage, not Err");
+            let t = cap.traversal.expect("salvage keeps traversal");
+            assert_eq!(t.done.iter().map(|w| w.seq).collect::<Vec<_>>(), vec![1, 2]);
+            assert!(t.detached);
+            assert!(cap.reasons.iter().any(|r| r == "close-failure"));
+            assert!(cap.reasons.iter().any(|r| r == "traversal-storm"));
+        }
+
+        #[test]
+        fn traversal_reasons_map_loss_not_recovery() {
+            // Storm/throttle/incomplete/unjoined earn PARTIAL
+            // reasons; reattach/release/warm are recovery, never
+            // loss; a clean complete poll earns nothing.
+            use crate::scan::oracle::{Finding as OFinding, Outcome};
+            let clean = walk(
+                1,
+                Outcome::Complete {
+                    true_t: 6,
+                    cached: false,
+                },
+            );
+            assert!(traversal_reasons(&[], &[clean], &[]).is_empty());
+            let stormy = traversal_reasons(
+                &[
+                    ScanAction::Detached,
+                    ScanAction::Reattached,
+                    ScanAction::CacheWarmed { arr: 1, t: 6 },
+                ],
+                &[walk(
+                    2,
+                    Outcome::Complete {
+                        true_t: 6,
+                        cached: true,
+                    },
+                )],
+                &[],
+            );
+            assert_eq!(stormy, vec!["traversal-storm".to_string()]);
+            let rough = traversal_reasons(
+                &[ScanAction::SkipAllEngaged, ScanAction::SkipAllReleased],
+                &[walk(3, Outcome::Skipped { cause: 1 })],
+                &[OFinding::OrphanRet { tid: TPID, seq: 9 }],
+            );
+            assert_eq!(
+                rough,
+                vec![
+                    "traversal-throttled".to_string(),
+                    "traversal-incomplete".to_string(),
+                    "traversal-unjoined".to_string(),
+                ]
+            );
+        }
+
+        #[test]
+        fn run_traversal_refuses_roles_before_effects() {
+            // Role-set refusal lands before any target side effect:
+            // a bogus spawn that would fail at exec still reports
+            // the role error (object resolution first — never a
+            // silent harvest-only fallback, never the spawn error).
+            let cfg = stub_config();
+            let spawn = || Target::Spawn {
+                argv: vec!["/nonexistent-target-xyz".to_string()],
+                workload: target::WorkloadDest::Null,
+            };
+            let req = TraversalRequest {
+                members_object: Some(PathBuf::from("/nonexistent/members.o")),
+            };
+            let err = run_traversal(&cfg, spawn(), &req).expect_err("bogus members must refuse");
+            let msg = format!("{err:#}");
+            assert!(msg.contains("explicit members object"), "unexpected: {msg}");
+            let mut pair_cfg = stub_config();
+            pair_cfg.harvest_object = Some(PathBuf::from("/nonexistent/harvest.o"));
+            let err = run_traversal(&pair_cfg, spawn(), &TraversalRequest::default())
+                .expect_err("bogus harvest must refuse");
+            let msg = format!("{err:#}");
+            assert!(msg.contains("explicit harvest object"), "unexpected: {msg}");
+        }
+
+        #[test]
+        fn traversal_recycled_discards() {
+            // Recycle discards pid-scoped traversal evidence like
+            // the rest (tainted, never retained).
+            let cfg = stub_config();
+            let info = stub_info();
+            let clock = ClockStub::at(5_000_000_000);
+            let mut proc = ProcStub;
+            let cancelled = || false;
+            let count = CountSession::new(TPID, FakeCountBackend::new());
+            let runner = stub_runner(
+                &cfg,
+                &info,
+                TraversalStub::scripted(vec![], TraversalCapture::default()),
+                count,
+                &clock,
+                &mut proc,
+                &cancelled,
+            );
+            let cap = runner.recycled();
+            assert!(cap.traversal.is_none());
+            assert!(cap.reasons.iter().any(|r| r == "pid-recycled"));
+        }
+
+        #[test]
+        fn traversal_capture_merge() {
+            // Records append, end-state flags refresh, provenance
+            // and finish-error fill once (first wins).
+            use crate::scan::oracle::Outcome;
+            let mut acc = TraversalCapture::default();
+            acc.done.push(walk(
+                1,
+                Outcome::Complete {
+                    true_t: 6,
+                    cached: false,
+                },
+            ));
+            acc.polls = 2;
+            acc.throttled = true;
+            let tail = TraversalCapture {
+                provenance: Some(triple_prov()),
+                done: vec![walk(
+                    2,
+                    Outcome::Complete {
+                        true_t: 6,
+                        cached: true,
+                    },
+                )],
+                findings: vec![],
+                polls: 1,
+                throttled: false,
+                detached: true,
+                finish_error: Some("tail drained late".to_string()),
+            };
+            acc.merge(tail);
+            assert_eq!(
+                acc.done.iter().map(|w| w.seq).collect::<Vec<_>>(),
+                vec![1, 2]
+            );
+            assert_eq!(acc.polls, 3);
+            assert!(!acc.throttled);
+            assert!(acc.detached);
+            assert_eq!(acc.provenance, Some(triple_prov()));
+            assert_eq!(acc.finish_error.as_deref(), Some("tail drained late"));
+            // Fill-once: a second tail does not overwrite.
+            let tail2 = TraversalCapture {
+                provenance: Some(TripleProvenance {
+                    harvest: ObjectProvenance {
+                        path: PathBuf::from("/other"),
+                        sha256: "x".to_string(),
+                    },
+                    count: ObjectProvenance {
+                        path: PathBuf::from("/other"),
+                        sha256: "x".to_string(),
+                    },
+                    members: ObjectProvenance {
+                        path: PathBuf::from("/other"),
+                        sha256: "x".to_string(),
+                    },
+                }),
+                finish_error: Some("second".to_string()),
+                ..TraversalCapture::default()
+            };
+            acc.merge(tail2);
+            assert_eq!(acc.provenance, Some(triple_prov()));
+            assert_eq!(acc.finish_error.as_deref(), Some("tail drained late"));
+        }
+
         struct TargetStub;
         impl TargetPort for TargetStub {
             fn pid(&self) -> u32 {
@@ -9068,26 +9965,17 @@ mod tests {
             }
         }
 
-        type StubRunner<'x> = Runner<
-            'x,
-            DiscoveryStub,
-            FakeCountBackend,
-            TargetStub,
-            LifecycleStub,
-            ClockStub,
-            ProcStub,
-        >;
-
         #[allow(clippy::too_many_arguments)]
-        fn stub_runner<'x>(
+        fn stub_runner<'x, D: DiscoveryPort>(
             cfg: &'x Config,
             info: &'x TargetInfo,
-            discovery: DiscoveryStub,
+            discovery: D,
             count: CountSession<FakeCountBackend>,
             clock: &'x ClockStub,
             proc: &'x mut ProcStub,
             cancelled: &'x dyn Fn() -> bool,
-        ) -> StubRunner<'x> {
+        ) -> Runner<'x, D, FakeCountBackend, TargetStub, LifecycleStub, ClockStub, ProcStub>
+        {
             let wall = clock.wall_now();
             Runner {
                 cfg,
@@ -9143,6 +10031,7 @@ mod tests {
                 relevance_capped: 0,
                 unverified_reads: 0,
                 observation_started: false,
+                traversal: None,
             }
         }
 
