@@ -46,17 +46,36 @@ e = struct.pack('<16sHHIQQQIHHHHHH',
 open('$T/harvest.o','wb').write(e)
 open('$T/count.o','wb').write(e)
 "
-cat >"$T/manifest.json" <<EOF
-{"schema": "osslscope-dev-build-manifest-v1",
- "product_ref": "deadbeef-test",
- "product_ref_short": "deadbee",
- "product_dirty": false,
- "artifacts": [
-   {"role": "host-binary", "path": "$T/host-bin"},
-   {"role": "bpf-object", "bin": "osslscope-harvest", "path": "$T/harvest.o"},
-   {"role": "bpf-object", "bin": "osslscope-count", "path": "$T/count.o"}
- ]}
+# Fixture manifests record sha256 + byte lengths exactly like a real
+# build-dev.sh manifest (staged verification requires them).
+mk_manifest() {
+    # $1 = out path, $2.. = "role:bin:path" entries (bin empty for host-binary).
+    _out="$1"; shift
+    python3 - "$_out" "$@" <<'EOF'
+import hashlib, json, os, sys
+arts = []
+for spec in sys.argv[2:]:
+    role, bin_, path = spec.split(":", 2)
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    a = {"role": role, "path": path,
+         "sha256": h.hexdigest(), "bytes": os.path.getsize(path)}
+    if bin_:
+        a["bin"] = bin_
+    arts.append(a)
+json.dump({"schema": "osslscope-dev-build-manifest-v1",
+           "product_ref": "deadbeef-test",
+           "product_ref_short": "deadbee",
+           "product_dirty": False,
+           "artifacts": arts}, open(sys.argv[1], "w"))
 EOF
+}
+mk_manifest "$T/manifest.json" \
+    "host-binary::$T/host-bin" \
+    "bpf-object:osslscope-harvest:$T/harvest.o" \
+    "bpf-object:osslscope-count:$T/count.o"
 
 # ============ happy path: manifest-driven install ============
 if "$SH_BIN" "$INSTALL" --manifest "$T/manifest.json" --prefix "$T/pfx" >"$T/out" 2>&1; then
@@ -294,7 +313,7 @@ fi
 # installer needs except setcap/getcap (a bare /usr/bin:/bin still carries
 # setcap on merged-usr platforms).
 mkdir -p "$T/nocapbin"
-for tool in python3 file readelf cp mkdir chmod rm grep awk sed cat realpath; do
+for tool in python3 file readelf cp mkdir chmod mktemp cmp mv rm grep awk sed cat realpath; do
     dest="$(command -v "$tool")" || { echo "test prereq missing: $tool" >&2; exit 1; }
     ln -s "$dest" "$T/nocapbin/$tool"
 done
@@ -312,18 +331,11 @@ fi
 
 # ============ members object (traversal triple, R19) ============
 cp "$T/harvest.o" "$T/members.o"
-cat >"$T/manifest-members.json" <<EOF
-{"schema": "osslscope-dev-build-manifest-v1",
- "product_ref": "deadbeef-test",
- "product_ref_short": "deadbee",
- "product_dirty": false,
- "artifacts": [
-   {"role": "host-binary", "path": "$T/host-bin"},
-   {"role": "bpf-object", "bin": "osslscope-harvest", "path": "$T/harvest.o"},
-   {"role": "bpf-object", "bin": "osslscope-count", "path": "$T/count.o"},
-   {"role": "bpf-object", "bin": "osslscope-members", "path": "$T/members.o"}
- ]}
-EOF
+mk_manifest "$T/manifest-members.json" \
+    "host-binary::$T/host-bin" \
+    "bpf-object:osslscope-harvest:$T/harvest.o" \
+    "bpf-object:osslscope-count:$T/count.o" \
+    "bpf-object:osslscope-members:$T/members.o"
 
 # Manifest WITH members: triple installs, receipt names 4 artifacts.
 if "$SH_BIN" "$INSTALL" --manifest "$T/manifest-members.json" --prefix "$T/pfxm" >"$T/out" 2>&1 \
@@ -398,6 +410,125 @@ else
     grep -q 'all three of --binary/--harvest/--count' "$T/out" \
         && ok "--members alone with no manifest still requires the base triple" \
         || bad "--members alone with no manifest still requires the base triple"
+fi
+
+# ============ staged verification (bytes proved before replace) ============
+receipt_q() {
+    # $1 = receipt, $2 = python expression over m (the manifest dict).
+    python3 -c "import json,sys; m=json.load(open('$1')); print($2)"
+}
+mkdir -p "$T/tamper" && cp "$T/host-bin" "$T/harvest.o" "$T/count.o" "$T/tamper/"
+mk_manifest "$T/tamper-manifest.json" \
+    "host-binary::$T/tamper/host-bin" \
+    "bpf-object:osslscope-harvest:$T/tamper/harvest.o" \
+    "bpf-object:osslscope-count:$T/tamper/count.o"
+
+# Same-length content tamper: flip a padding byte (offset 8) so the ELF
+# header stays valid but the recorded sha256 no longer matches.
+printf 'x' | dd of="$T/tamper/harvest.o" bs=1 seek=8 conv=notrunc status=none
+if "$SH_BIN" "$INSTALL" --manifest "$T/tamper-manifest.json" --prefix "$T/pfx-tamper" >"$T/out" 2>&1; then
+    bad "content-tampered harvest fails (got exit 0)"
+else
+    grep -q 'harvest object' "$T/out" && grep -q 'sha256' "$T/out" \
+        && ok "content-tampered harvest fails naming the artifact + sha256 mismatch" \
+        || bad "content-tampered harvest fails naming the artifact + sha256 mismatch"
+fi
+if [ ! -e "$T/pfx-tamper" ]; then
+    ok "refused install leaves the prefix untouched"
+else
+    bad "refused install leaves the prefix untouched"
+fi
+
+# Length tamper on the count object: appended byte trips the recorded
+# length (fresh dir so only the count entry is stale).
+mkdir -p "$T/tamper2" && cp "$T/host-bin" "$T/harvest.o" "$T/count.o" "$T/tamper2/"
+mk_manifest "$T/tamper-manifest2.json" \
+    "host-binary::$T/tamper2/host-bin" \
+    "bpf-object:osslscope-harvest:$T/tamper2/harvest.o" \
+    "bpf-object:osslscope-count:$T/tamper2/count.o"
+printf 'x' >>"$T/tamper2/count.o"
+if "$SH_BIN" "$INSTALL" --manifest "$T/tamper-manifest2.json" --prefix "$T/pfx-tamper2" >"$T/out" 2>&1; then
+    bad "length-tampered count fails (got exit 0)"
+else
+    grep -q 'count object' "$T/out" && grep -q 'byte length' "$T/out" \
+        && ok "length-tampered count fails naming the byte-length mismatch" \
+        || bad "length-tampered count fails naming the byte-length mismatch"
+fi
+
+# Members tamper: the 4th artifact gets the same proof as the base triple.
+mkdir -p "$T/tamperm" && cp "$T/host-bin" "$T/harvest.o" "$T/count.o" "$T/members.o" "$T/tamperm/"
+mk_manifest "$T/tamperm-manifest.json" \
+    "host-binary::$T/tamperm/host-bin" \
+    "bpf-object:osslscope-harvest:$T/tamperm/harvest.o" \
+    "bpf-object:osslscope-count:$T/tamperm/count.o" \
+    "bpf-object:osslscope-members:$T/tamperm/members.o"
+printf 'x' | dd of="$T/tamperm/members.o" bs=1 seek=8 conv=notrunc status=none
+if "$SH_BIN" "$INSTALL" --manifest "$T/tamperm-manifest.json" --prefix "$T/pfx-tamperm" >"$T/out" 2>&1; then
+    bad "content-tampered members fails (got exit 0)"
+else
+    grep -q 'members object' "$T/out" \
+        && ok "content-tampered members fails naming the members object" \
+        || bad "content-tampered members fails naming the members object"
+fi
+if [ ! -e "$T/pfx-tamperm" ]; then
+    ok "refused members install leaves the prefix untouched"
+else
+    bad "refused members install leaves the prefix untouched"
+fi
+
+# A manifest entry without recorded identity refuses (never installs
+# unverified bytes), naming the artifact and the missing sha256.
+cat >"$T/noid-manifest.json" <<EOF
+{"schema": "osslscope-dev-build-manifest-v1",
+ "product_ref": "deadbeef-test", "product_dirty": false,
+ "artifacts": [
+   {"role": "host-binary", "path": "$T/host-bin"},
+   {"role": "bpf-object", "bin": "osslscope-harvest", "path": "$T/harvest.o"},
+   {"role": "bpf-object", "bin": "osslscope-count", "path": "$T/count.o"}
+ ]}
+EOF
+if "$SH_BIN" "$INSTALL" --manifest "$T/noid-manifest.json" --prefix "$T/pfx-noid" >"$T/out" 2>&1; then
+    bad "manifest without recorded identity fails (got exit 0)"
+else
+    grep -q 'host binary' "$T/out" && grep -q 'no valid sha256' "$T/out" \
+        && ok "manifest without recorded identity fails naming artifact + missing sha256" \
+        || bad "manifest without recorded identity fails naming artifact + missing sha256"
+fi
+if [ ! -e "$T/pfx-noid" ]; then
+    ok "identity-refused install leaves the prefix untouched"
+else
+    bad "identity-refused install leaves the prefix untouched"
+fi
+
+# Selection labels: a full-manifest install records manifest-verified for
+# every artifact and keeps the build revision at the top level.
+if [ "$(receipt_q "$T/pfxm/share/osslscope/install-manifest.json" \
+        "sorted(set(a['selection'] for a in m['artifacts']))")" = "['manifest-verified']" ]; then
+    ok "manifest install records manifest-verified for all 4 artifacts"
+else
+    bad "manifest install records manifest-verified for all 4 artifacts"
+fi
+if [ "$(receipt_q "$T/pfxm/share/osslscope/install-manifest.json" "m['product_ref']")" = "deadbeef-test" ]; then
+    ok "all-verified install keeps the build revision"
+else
+    bad "all-verified install keeps the build revision"
+fi
+# The explicit --members install ($T/pfxo) records the override and drops
+# the inherited revision for that artifact and the top level.
+if [ "$(receipt_q "$T/pfxo/share/osslscope/install-manifest.json" \
+        "[a['selection'] for a in m['artifacts'] if a.get('bin')=='osslscope-members']")" = "['explicit-override']" ]; then
+    ok "explicit --members install records explicit-override for members"
+else
+    bad "explicit --members install records explicit-override for members"
+fi
+if [ "$(receipt_q "$T/pfxo/share/osslscope/install-manifest.json" "m['product_ref']")" = "None" ] \
+   && [ "$(receipt_q "$T/pfxo/share/osslscope/install-manifest.json" \
+        "[a['product_ref'] for a in m['artifacts'] if a.get('bin')=='osslscope-members']")" = "[None]" ] \
+   && [ "$(receipt_q "$T/pfxo/share/osslscope/install-manifest.json" \
+        "[a['product_ref'] for a in m['artifacts'] if a.get('bin')=='osslscope-harvest']")" = "['deadbeef-test']" ]; then
+    ok "explicit override clears inherited revision (artifact + top level), keeps verified peers"
+else
+    bad "explicit override clears inherited revision (artifact + top level), keeps verified peers"
 fi
 
 echo "---"

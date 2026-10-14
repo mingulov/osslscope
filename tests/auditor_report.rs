@@ -986,6 +986,7 @@ fn auditor_v2_fixture() -> CaptureDocument {
             shared_ambiguous: 0,
             unfenced_tails: 0,
         },
+        traversal: None,
     };
     finalize(input)
 }
