@@ -115,6 +115,7 @@ fn doc(
         policy: None,
         legacy_partition: LegacyCallPartition::default(),
         engine_observations: Vec::new(),
+        traversal: None,
     })
 }
 

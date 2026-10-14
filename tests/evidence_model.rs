@@ -90,6 +90,7 @@ fn clean_input(sites: Vec<SiteExecution>) -> FinalizeInput {
         policy: None,
         legacy_partition: LegacyCallPartition::default(),
         engine_observations: Vec::new(),
+        traversal: None,
     }
 }
 

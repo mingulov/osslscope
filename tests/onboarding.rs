@@ -1460,7 +1460,9 @@ fn built_objects_pass_loader_shape_check() {
 // ---------------------------------------------------------------------------
 
 /// Just-built BPF objects (C2 builds them; host-only checkouts skip
-/// loud — same rule as `built_objects_pass_loader_shape_check`).
+/// loud — same rule as `built_objects_pass_loader_shape_check` —
+/// except in required mode, where a missing triple fails closed
+/// like the shape suite: no skips under `OSSL_MEMBERS_REQUIRED=1`).
 fn built_objects() -> Option<(PathBuf, PathBuf, PathBuf)> {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("crates/ebpf/target/bpfel-unknown-none/release");
@@ -1468,6 +1470,12 @@ fn built_objects() -> Option<(PathBuf, PathBuf, PathBuf)> {
     let c = dir.join("osslscope-count");
     let m = dir.join("osslscope-members");
     if !h.exists() || !c.exists() || !m.exists() {
+        if matches!(std::env::var("OSSL_MEMBERS_REQUIRED").as_deref(), Ok("1")) {
+            panic!(
+                "FAIL(members-required): BPF triple not built; \
+                 required mode refuses silent skips"
+            );
+        }
         eprintln!("SKIP triple test: BPF objects not built (run the C2 BPF build)");
         return None;
     }
@@ -1547,18 +1555,57 @@ fn triple_explicit_all_wins() {
     assert_eq!(set.members, m);
 }
 
+/// Receipt dests for a fixture prefix (all three roles, honest
+/// hashes — mirrors what install-dev.sh writes).
+fn receipt_dests(prefix: &Path, objs: &(PathBuf, PathBuf, PathBuf)) -> Vec<(String, String)> {
+    let objdir = prefix.join("lib").join("osslscope");
+    ["osslscope-harvest", "osslscope-count", "osslscope-members"]
+        .iter()
+        .map(|n| {
+            let src = match *n {
+                "osslscope-harvest" => &objs.0,
+                "osslscope-count" => &objs.1,
+                _ => &objs.2,
+            };
+            (
+                objdir.join(n).display().to_string(),
+                onboard::file_sha256_hex(src).unwrap(),
+            )
+        })
+        .collect()
+}
+
 #[test]
-fn triple_implicit_complete_dir_no_receipt() {
+fn triple_implicit_receiptless_members_refused() {
     let Some(objs) = built_objects() else {
         return;
     };
-    // No receipt: old installs stay compatible (shape-checked).
+    // No receipt: the pair roles stay compatible (old installs),
+    // but the members role refuses — a receiptless members file
+    // is a hand-placed object whose matched-build identity is not
+    // established (explicit --members-object operator-trusts it).
     let prefix = scratch("triple-no-receipt");
     let objdir = install_fixture(&prefix, &objs, true, None);
-    let (set, search) = onboard::resolve_set(None, None, None, &[objdir.clone()], &test_trust())
-        .expect("receipt-less triple resolves");
-    assert_eq!(set.members, objdir.join("osslscope-members"));
-    assert_eq!(search.searched, vec![objdir]);
+    let err = onboard::resolve_set(None, None, None, &[objdir], &test_trust()).unwrap_err();
+    assert!(
+        err.message.contains("no install receipt"),
+        "message: {}",
+        err.message
+    );
+    assert!(
+        err.remediation.contains("install-dev.sh"),
+        "remediation: {}",
+        err.remediation
+    );
+    assert!(
+        err.remediation.contains("--members-object"),
+        "remediation: {}",
+        err.remediation
+    );
+    // Found-but-broken is never not-found (the ordinary run
+    // refuses a receiptless-members triple — no harvest-only
+    // fallback for unproven matched-build identity).
+    assert!(!err.is_not_found());
 }
 
 #[test]
@@ -1570,7 +1617,8 @@ fn triple_skips_old_pair_dir() {
     let pair_pfx = scratch("triple-pair-first");
     let pair_dir = install_fixture(&pair_pfx, &objs, false, None);
     let triple_pfx = scratch("triple-triple-second");
-    let triple_dir = install_fixture(&triple_pfx, &objs, true, None);
+    let triple_dests = receipt_dests(&triple_pfx, &objs);
+    let triple_dir = install_fixture(&triple_pfx, &objs, true, Some(&triple_dests));
     let (set, _) = onboard::resolve_set(
         None,
         None,
@@ -1603,6 +1651,9 @@ fn triple_missing_members_refused() {
         "remediation: {}",
         err.remediation
     );
+    // Pair-only is not-found (the ordinary run stays harvest-only
+    // here — the only silent-fallback-free branch).
+    assert!(err.is_not_found());
 }
 
 #[test]
@@ -1659,6 +1710,8 @@ fn triple_receipt_verified_and_stale_refused() {
         "remediation: {}",
         err.remediation
     );
+    // Stale is found-but-broken (refuse, never harvest-only).
+    assert!(!err.is_not_found());
 }
 
 #[test]
@@ -1691,6 +1744,8 @@ fn triple_unlisted_role_is_mixed_set() {
         "message: {}",
         err.message
     );
+    // Mixed is found-but-broken (refuse, never harvest-only).
+    assert!(!err.is_not_found());
 }
 
 #[test]

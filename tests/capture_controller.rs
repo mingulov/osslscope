@@ -858,6 +858,7 @@ impl Harness {
             cfg: Config {
                 harvest_object: Some(PathBuf::new()),
                 count_object: Some(PathBuf::new()),
+                members_object: Some(PathBuf::new()),
                 provider: Some(PathBuf::from("/p/provider.so")),
                 builtin: false,
                 table: None,
@@ -5492,6 +5493,7 @@ fn live_observe_inner(
     let cfg = Config {
         harvest_object: Some(PathBuf::new()),
         count_object: Some(PathBuf::new()),
+        members_object: Some(PathBuf::new()),
         provider: Some(PathBuf::from("/p/provider.so")),
         builtin: false,
         table: None,

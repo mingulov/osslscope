@@ -989,6 +989,7 @@ fn auditor_v2_fixture() -> CaptureDocument {
             unfenced_tails: 0,
         },
         engine_observations: Vec::new(),
+        traversal: None,
     };
     finalize(input)
 }

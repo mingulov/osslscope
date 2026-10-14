@@ -882,6 +882,40 @@ fn fix1_gen_turnover_cold_plus_stale() {
     ));
 }
 
+/// Finding 5 (live-lane race): a scan stamped generation 0 fired
+/// before its array's epoch was recorded (GEN install happens at
+/// the first close — the successor always fires pre-close — so
+/// every window's second query stamps 0 and closes against epoch
+/// 1). Turnover-spanning opens cannot close normally (turnover
+/// abandons them), so observed 0 is unrecorded-at-fire, never a
+/// superseded epoch: no GenStale, cold rules re-prove from the
+/// scan's own full evidence (cached:false — it never consulted
+/// the cache; cached:true keeps meaning "this scan rode the
+/// cache").
+#[test]
+fn fix1_gen_zero_never_stale() {
+    let mut scope = OracleScope::full();
+    scope.known_t.insert(ARR, (3, 1));
+    let mut o = Oracle::new(scope);
+    let mut b = quiesced_idle(&[TIDA]);
+    b.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b.push_ret(ret(TIDA, 0, 0));
+    b.push_alg(alg_arr(TIDA, 0, 0, wire::ALG_OK, ARR, 0));
+    b.push_alg(alg_arr(TIDA, 0, 1, wire::ALG_OK, ARR, 0));
+    b.push_alg(alg_arr(TIDA, 0, 2, wire::ALG_OK, ARR, 0));
+    b.push_alg(alg_arr(TIDA, 0, 3, wire::ALG_EMPTY, ARR, 0));
+    o.ingest(&b);
+    assert_eq!(o.done().len(), 1);
+    assert_eq!(o.done()[0].true_t, TrueT::Proven(3));
+    assert!(matches!(
+        o.done()[0].outcome,
+        Outcome::Complete {
+            true_t: 3,
+            cached: false
+        }
+    ));
+}
+
 /// Finding 4: ROWs for slots with no walked classifier verdict are
 /// explicit findings (EMPTY/NOIMP/UNREADABLE slots emit no rows).
 #[test]
