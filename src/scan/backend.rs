@@ -20,7 +20,7 @@ use super::governor::{DutyThrottle, StormAction, StormDetector, ThrottleAction};
 use super::registry::BirthState;
 use crate::loader::{Loaded, MembersAttached};
 use crate::scan::oracle::{
-    AbandonReason, Finding, Oracle, OracleScope, ScanBatch, TrueT, WalkDone,
+    AbandonReason, Correction, Finding, Oracle, OracleScope, ScanBatch, TrueT, WalkDone,
 };
 use anyhow::Context as _;
 use osslscope_ebpf_common as wire;
@@ -106,11 +106,10 @@ pub struct PollDelta {
     pub done: Vec<WalkDone>,
     pub findings: Vec<Finding>,
     pub actions: Vec<BackendAction>,
-    /// Admitted-query census snapshot (CALLS per op, cumulative
-    /// since attach): the real count evidence the inventory
-    /// adaptation bills executions against (never the observed
-    /// record count).
-    pub admitted: BTreeMap<u32, u64>,
+    /// Post-drain verdict corrections (rewrites for already-
+    /// drained keys — every downstream holder applies them by
+    /// (tid, seq), or the false verdict survives there).
+    pub corrections: Vec<Correction>,
 }
 
 /// Point-in-time backend state (no record clones — long runs
@@ -135,6 +134,15 @@ pub struct ScanBackend {
     /// re-attach gate observes the real rate — a full detach
     /// would freeze the census it decides on).
     storm_detached: bool,
+    /// Window-edge close in progress (set by [`ScanBackend::finish`]
+    /// before its settle poll, never cleared — finish is
+    /// terminal): tier actions freeze (no storm observe/detach/
+    /// reattach, no throttle age/observe — the gate SKIP_ALL set
+    /// at finish entry stays engaged past the close, and the
+    /// trailing evidence closes through the backstop instead of
+    /// being storm-abandoned). End-state flags report the last
+    /// in-window tier state.
+    finishing: bool,
     ring: aya::maps::RingBuf<aya::maps::MapData>,
     oracle: Oracle,
     throttle: DutyThrottle,
@@ -147,6 +155,13 @@ pub struct ScanBackend {
     /// legs = backend-local domain).
     clock_base_ns: u64,
     last_loss: BTreeMap<u32, u64>,
+    /// TRUNC consumed mask (per-op sticky bits already
+    /// attributed) + last-seen per-op flag-event generation:
+    /// the lossless drain baseline — fresh bits report always,
+    /// repeats re-report on generation advance, quiet re-drains
+    /// report nothing, and nothing is ever cleared.
+    trunc_consumed: BTreeMap<u32, u64>,
+    trunc_seq: BTreeMap<u32, u64>,
     done_total: u64,
     findings_total: u64,
     /// Selective-attach failures (load/attach stage per slot —
@@ -262,6 +277,7 @@ impl ScanBackend {
                 members: attached.members,
             }),
             storm_detached: false,
+            finishing: false,
             ring,
             oracle: Oracle::new(scope),
             throttle: DutyThrottle::new(),
@@ -270,6 +286,8 @@ impl ScanBackend {
             epoch_start: Instant::now(),
             clock_base_ns,
             last_loss: BTreeMap::new(),
+            trunc_consumed: BTreeMap::new(),
+            trunc_seq: BTreeMap::new(),
             done_total: 0,
             findings_total: 0,
             failed_slots: failed,
@@ -315,6 +333,7 @@ impl ScanBackend {
     pub fn drop_completed(&mut self) {
         self.oracle.take_done();
         self.oracle.take_findings();
+        self.oracle.take_corrections();
     }
 
     /// Baseline poll (window-edge fence): drain the setup slice,
@@ -367,36 +386,44 @@ impl ScanBackend {
         self.oracle.ingest(&batch);
         // Tier-3 (storm owns the gate): ATTEMPT total. The entry
         // link stays attached through a storm cut, so this census
-        // remains live while detached.
+        // remains live while detached. Frozen while finishing
+        // (a storm-detach would abandon the trailing evidence
+        // the backstop is about to close WITH that evidence; a
+        // reattach would reactivate members past the close).
         let attempts = read_attempt_total(&self.loaded.maps)?;
-        // Admitted-query census snapshot (per op): the count
-        // evidence the inventory adaptation bills against.
-        delta.admitted = read_calls_by_op(&self.loaded.maps)?;
-        match self.storm.observe(now_ns, attempts) {
-            Some(StormAction::Detach) if !self.storm_detached => {
-                self.detach()?;
-                self.oracle.abandon_all(AbandonReason::Detached);
-                delta.actions.push(BackendAction::Detached);
+        if !self.finishing {
+            match self.storm.observe(now_ns, attempts) {
+                Some(StormAction::Detach) if !self.storm_detached => {
+                    self.detach()?;
+                    self.oracle.abandon_all(AbandonReason::Detached);
+                    delta.actions.push(BackendAction::Detached);
+                }
+                Some(StormAction::Reattach) if self.storm_detached => {
+                    self.reattach()?;
+                    delta.actions.push(BackendAction::Reattached);
+                }
+                _ => {}
             }
-            Some(StormAction::Reattach) if self.storm_detached => {
-                self.reattach()?;
-                delta.actions.push(BackendAction::Reattached);
-            }
-            _ => {}
         }
         // Tier-2 aging runs on EVERY poll (idle polls release an
         // engaged throttle once the trailing cost decays — the
         // storm owns SKIP_ALL while detached, so a storm-time
-        // release only flips state, never the map).
-        if let Some(ThrottleAction::ReleaseSkipAll) = self.throttle.age(now_ns) {
-            if !self.storm_detached {
-                self.set_skip_all(false)?;
-                delta.actions.push(BackendAction::SkipAllReleased);
+        // release only flips state, never the map). Frozen while
+        // finishing (the gate set at finish entry stays engaged
+        // past the close — members must not stay active after
+        // counting closed).
+        if !self.finishing {
+            if let Some(ThrottleAction::ReleaseSkipAll) = self.throttle.age(now_ns) {
+                if !self.storm_detached {
+                    self.set_skip_all(false)?;
+                    delta.actions.push(BackendAction::SkipAllReleased);
+                }
             }
         }
         // Tier-2 + cache warms/heals over newly closed invocations.
         let fresh: Vec<WalkDone> = self.oracle.take_done();
         let fresh_findings: Vec<Finding> = self.oracle.take_findings();
+        let fresh_corrections: Vec<Correction> = self.oracle.take_corrections();
         self.done_total += fresh.len() as u64;
         self.findings_total += fresh_findings.len() as u64;
         for w in &fresh {
@@ -404,8 +431,9 @@ impl ScanBackend {
             // count otherwise (walked evidence ≈ paid cost;
             // skipped/tainted/abandoned scale by what fired).
             // While storm-detached the storm owns the gate (skip
-            // records charge nothing).
-            if !self.storm_detached {
+            // records charge nothing). Frozen while finishing
+            // (trailing closes must not flip the gate).
+            if !self.storm_detached && !self.finishing {
                 let t_eff = match &w.outcome {
                     crate::scan::oracle::Outcome::Complete { true_t, .. } => *true_t,
                     _ => w.alg_count as u64,
@@ -473,19 +501,28 @@ impl ScanBackend {
         }
         delta.done = fresh;
         delta.findings = fresh_findings;
+        delta.corrections = fresh_corrections;
         Ok(delta)
     }
 
-    /// Window-edge close: quiesce FIRST (the Runner calls finish
-    /// after counting closes — no new query may start past the
-    /// window; SKIP_ALL keeps post-window hits honest-skipped,
-    /// never half-observed, while in-flight scans still retire),
-    /// then one settle drain (the trailing records land), then
-    /// the oracle backstop closes every remaining open. The gate
-    /// stays engaged past the close (no tier-2 release — members
+    /// Window-edge close: freeze tiers FIRST, quiesce the gate
+    /// (the Runner calls finish after counting closes — no new
+    /// query may start past the window; SKIP_ALL keeps
+    /// post-window hits honest-skipped, never half-observed,
+    /// while in-flight scans still retire), then one settle drain
+    /// (the trailing records land), then the oracle backstop
+    /// closes every remaining open. The gate stays engaged past
+    /// the close (frozen tiers: no age-release, no reattach, no
+    /// storm-detach abandoning the trailing evidence — members
     /// must not stay active after counting closed); the
     /// end-state flags report the last in-window state.
     pub fn finish(&mut self) -> anyhow::Result<PollDelta> {
+        // Freeze tiers FIRST (never cleared — finish is
+        // terminal): the settle poll below drains trailing
+        // records but takes no tier action (no age-release, no
+        // reattach, no storm-detach), so the gate set here stays
+        // engaged past the close.
+        self.finishing = true;
         if !self.storm_detached {
             self.set_skip_all(true)?;
         }
@@ -499,6 +536,7 @@ impl ScanBackend {
         self.findings_total += findings.len() as u64;
         delta.done.extend(done);
         delta.findings.extend(findings);
+        delta.corrections.extend(self.oracle.take_corrections());
         Ok(delta)
     }
 
@@ -578,10 +616,10 @@ impl ScanBackend {
     /// Drain the ring + sample cells/counters into one batch.
     /// Counter reads are checked (a failed map iteration errors,
     /// never a silent partial sum); LOSS deltas are computed
-    /// against the last poll's totals; TRUNC bits are
-    /// clear-on-read (every drain's read is that drain's delta,
-    /// so repeated faults re-appear instead of hiding under the
-    /// sticky bit they set before).
+    /// against the last poll's totals; TRUNC deltas are
+    /// snapshot-minus-consumed (sticky bits never clear, so no
+    /// concurrent flag can be erased — every flag lands in
+    /// exactly one delta).
     fn drain_batch(&mut self, quiesced: bool, now_ns: u64) -> anyhow::Result<ScanBatch> {
         let mut b = ScanBatch {
             quiesced,
@@ -611,14 +649,17 @@ impl ScanBackend {
             // Dips (row eviction + recount) keep the high-water
             // baseline — same discipline as the harvest core.
         }
-        // TRUNC is sticky bits (OR-fold): the seq-guarded drain
-        // removes the old read/clear race — a flag landing inside
-        // the clear window is DETECTED via the generation guard
-        // and degrades explicitly (b.trunc_race), never
-        // erased-unread and never sticky-forever.
-        let (trunc_delta, trunc_race) = drain_trunc_flags(&self.loaded.maps, None)?;
-        b.trunc = trunc_delta;
-        b.trunc_race = trunc_race;
+        // TRUNC is sticky bits (OR-fold) plus the per-op
+        // flag-event generation: fresh bits report, repeats
+        // re-report on generation advance, quiet re-drains
+        // report nothing — and nothing is ever cleared, so no
+        // concurrent flag can be erased in any producer order.
+        b.trunc = drain_trunc_flags(
+            &mut self.trunc_consumed,
+            &mut self.trunc_seq,
+            &self.loaded.maps,
+            None,
+        )?;
         Ok(b)
     }
 }
@@ -729,10 +770,59 @@ fn read_attempt_total(maps: &std::collections::HashMap<String, OwnedFd>) -> anyh
     Ok(slots.iter().fold(0u64, |a, &x| a.wrapping_add(x)))
 }
 
-/// TRUNC flag-event generation (TRUNC_SEQ summed across CPUs —
-/// the drain-race guard: every flag_trunc bumps it exactly once).
-fn read_trunc_seq(maps: &std::collections::HashMap<String, OwnedFd>) -> anyhow::Result<u64> {
+/// Pure accumulate core (host-testable): per op, fresh bits
+/// (snapshot minus consumed) report always (first sightings
+/// never need the generation — a flag visible before its
+/// generation bump still reports); when the op's generation
+/// advanced since the last drain, the op's full set bits
+/// re-report (a repeat fault re-flagged an already-set bit —
+/// recurring faults stay visible instead of hiding under their
+/// sticky bit, which would fail open on flag-only evidence).
+/// Consumed and last-seen generation advance to the snapshots.
+/// Nothing is ever cleared, so no interleaving in either
+/// producer order can erase a flag (a flag past our snapshot
+/// lands next drain via stickiness and/or the generation
+/// advance — delayed, never lost, never tainted).
+fn accumulate_trunc(
+    consumed: &mut BTreeMap<u32, u64>,
+    last_seq: &mut BTreeMap<u32, u64>,
+    snap: BTreeMap<u32, u64>,
+    seq: BTreeMap<u32, u64>,
+) -> BTreeMap<u32, u64> {
+    let mut delta: BTreeMap<u32, u64> = BTreeMap::new();
+    for (op, bits) in snap.iter() {
+        let fresh = bits & !consumed.get(op).copied().unwrap_or(0);
+        let advanced = seq.get(op).copied().unwrap_or(0) != last_seq.get(op).copied().unwrap_or(0);
+        if fresh != 0 || (advanced && *bits != 0) {
+            delta.insert(*op, if advanced { *bits } else { fresh });
+        }
+    }
+    for (op, bits) in snap {
+        *consumed.entry(op).or_insert(0) |= bits;
+    }
+    for (op, s) in seq {
+        last_seq.insert(op, s);
+    }
+    delta
+}
+
+/// Lossless TRUNC drain: sticky per-op flag bits plus the
+/// per-op flag-event generation, never cleared. First sightings
+/// report via freshness; repeats re-report via the generation
+/// advance (no taint — re-faults are real faults, not races).
+///
+/// `hook` runs AFTER the snapshots: production passes `None`;
+/// the live control injects a flag there (a flag landing just
+/// after our read) to prove it appears in the NEXT drain —
+/// deterministic stickiness, no timing dependence.
+pub fn drain_trunc_flags(
+    consumed: &mut BTreeMap<u32, u64>,
+    last_seq: &mut BTreeMap<u32, u64>,
+    maps: &std::collections::HashMap<String, OwnedFd>,
+    hook: Option<&dyn Fn()>,
+) -> anyhow::Result<BTreeMap<u32, u64>> {
     use anyhow::Context as _;
+    let snap: BTreeMap<u32, u64> = read_percpu_all(maps, "TRUNC", true)?.into_iter().collect();
     let fd = maps
         .get("TRUNC_SEQ")
         .context("map TRUNC_SEQ missing")?
@@ -740,56 +830,16 @@ fn read_trunc_seq(maps: &std::collections::HashMap<String, OwnedFd>) -> anyhow::
         .context("clone TRUNC_SEQ")?;
     let data = aya::maps::MapData::from_fd(fd).context("TRUNC_SEQ mapdata")?;
     let map = aya::maps::Map::from_map_data(data).context("TRUNC_SEQ map")?;
-    let m = aya::maps::PerCpuArray::<_, u64>::try_from(map).context("TRUNC_SEQ percpu shape")?;
-    let slots = m.get(&0, 0).context("TRUNC_SEQ[0]")?;
-    Ok(slots.iter().fold(0u64, |a, &x| a.wrapping_add(x)))
-}
-
-/// Admitted-query census snapshot (CALLS per op, summed across
-/// CPUs — cumulative since attach; absence of a key means zero
-/// admits, never "unknown").
-fn read_calls_by_op(
-    maps: &std::collections::HashMap<String, OwnedFd>,
-) -> anyhow::Result<BTreeMap<u32, u64>> {
-    Ok(read_percpu_all(maps, "CALLS", false)?
-        .into_iter()
-        .filter(|(_, v)| *v != 0)
-        .collect())
-}
-
-/// Seq-guarded TRUNC drain: sample the flag generation around a
-/// read/clear/read/clear window and merge both reads. A flag
-/// landing between the first read and the first clear would be
-/// erased unread — but its generation bump survives (clear only
-/// touches TRUNC), so `raced` is set exactly when a concurrent
-/// flag may have been erased, and the oracle degrades every open
-/// the batch spanned instead of losing the flag silently. Quiet
-/// drains (the common case) report `raced == false` with the
-/// exact bits and a cleared map.
-///
-/// `hook` runs inside the race window (between the first clear
-/// and the re-read): production passes `None`; the live race
-/// control injects a flag there to prove detection is exact
-/// (deterministic — no timing dependence).
-pub fn drain_trunc_flags(
-    maps: &std::collections::HashMap<String, OwnedFd>,
-    hook: Option<&dyn Fn()>,
-) -> anyhow::Result<(BTreeMap<u32, u64>, bool)> {
-    let s0 = read_trunc_seq(maps)?;
-    let b0 = read_percpu_all(maps, "TRUNC", true)?;
-    clear_percpu_all(maps, "TRUNC")?;
+    let m = aya::maps::HashMap::<_, u32, u64>::try_from(map).context("TRUNC_SEQ hash shape")?;
+    let mut seq: BTreeMap<u32, u64> = BTreeMap::new();
+    for r in m.iter() {
+        let (k, v) = r.context("TRUNC_SEQ iter")?;
+        seq.insert(k, v);
+    }
     if let Some(h) = hook {
         h();
     }
-    let b1 = read_percpu_all(maps, "TRUNC", true)?;
-    clear_percpu_all(maps, "TRUNC")?;
-    let s1 = read_trunc_seq(maps)?;
-    let mut delta: BTreeMap<u32, u64> = BTreeMap::new();
-    for (op, bits) in b0.into_iter().chain(b1) {
-        *delta.entry(op).or_insert(0) |= bits;
-    }
-    delta.retain(|_, bits| *bits != 0);
-    Ok((delta, s1 != s0))
+    Ok(accumulate_trunc(consumed, last_seq, snap, seq))
 }
 
 /// Single u64-cell lookup (GEN): None on ENOENT, error otherwise.
@@ -951,38 +1001,6 @@ fn clear_tcache(maps: &std::collections::HashMap<String, OwnedFd>) -> anyhow::Re
     Ok(())
 }
 
-/// Zero every row of a u32→u64 percpu hash (TRUNC clear-on-read:
-/// each drain's read is that drain's delta — repeated faults
-/// re-appear instead of hiding under their sticky bit).
-fn clear_percpu_all(
-    maps: &std::collections::HashMap<String, OwnedFd>,
-    name: &str,
-) -> anyhow::Result<()> {
-    use anyhow::Context as _;
-    use std::convert::TryFrom as _;
-    let fd = maps
-        .get(name)
-        .with_context(|| format!("map {name} missing"))?
-        .try_clone()
-        .with_context(|| format!("clone {name}"))?;
-    let data = aya::maps::MapData::from_fd(fd).with_context(|| format!("{name} mapdata"))?;
-    let map = aya::maps::Map::from_map_data(data).with_context(|| format!("{name} map"))?;
-    let mut m = aya::maps::PerCpuHashMap::<_, u32, u64>::try_from(map)
-        .with_context(|| format!("{name} percpu shape"))?;
-    let mut rows: Vec<(u32, usize)> = Vec::new();
-    for r in m.iter() {
-        let (k, slots) = r.with_context(|| format!("{name} iter"))?;
-        rows.push((k, slots.len()));
-    }
-    for (k, ncpu) in rows {
-        let zeros = aya::maps::PerCpuValues::<u64>::try_from(vec![0u64; ncpu])
-            .with_context(|| format!("{name} zero widths"))?;
-        m.insert(k, zeros, 0)
-            .with_context(|| format!("{name} clear"))?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1009,6 +1027,72 @@ mod tests {
     fn decode_short_bails() {
         let mut b = ScanBatch::default();
         assert!(decode_ring_record(&[7u8, 0, 0], &mut b).is_err());
+    }
+
+    #[test]
+    fn fix3_accumulate_trunc_lossless_with_repeats() {
+        use std::collections::BTreeMap;
+        // No-clear accumulate + per-op generation: fresh bits
+        // report (first sighting, seq-independent); a quiet
+        // re-drain (same bits, same generation) reports nothing;
+        // a REPEAT fault (same bits, generation advanced)
+        // re-reports the op's set bits (recurring faults stay
+        // visible — hiding them would fail open on flag-only
+        // evidence). Nothing is ever cleared, so no interleaving
+        // in either producer order can erase a flag (a flag past
+        // our snapshot lands next drain via stickiness and/or the
+        // generation advance — delayed, never lost).
+        let mut consumed: BTreeMap<u32, u64> = BTreeMap::new();
+        let mut last_seq: BTreeMap<u32, u64> = BTreeMap::new();
+        let snap = |pairs: &[(u32, u64)]| -> BTreeMap<u32, u64> { pairs.iter().copied().collect() };
+        // First sighting reports (generation observed).
+        let d1 = accumulate_trunc(
+            &mut consumed,
+            &mut last_seq,
+            snap(&[(1, 0b011)]),
+            snap(&[(1, 2)]),
+        );
+        assert_eq!(d1.get(&1), Some(&0b011));
+        // Identical re-snapshot, same generation: nothing.
+        let d2 = accumulate_trunc(
+            &mut consumed,
+            &mut last_seq,
+            snap(&[(1, 0b011)]),
+            snap(&[(1, 2)]),
+        );
+        assert!(d2.is_empty(), "quiet re-drain reports nothing");
+        // New bits report (generation advances with them).
+        let d3 = accumulate_trunc(
+            &mut consumed,
+            &mut last_seq,
+            snap(&[(1, 0b111), (2, 0b001)]),
+            snap(&[(1, 3), (2, 1)]),
+        );
+        assert_eq!(
+            d3.get(&1),
+            Some(&0b111),
+            "advanced op re-reports its set bits"
+        );
+        assert_eq!(d3.get(&2), Some(&0b001), "new op reports");
+        // Repeat fault, same bits, generation advanced:
+        // re-reports (never hidden).
+        let d4 = accumulate_trunc(
+            &mut consumed,
+            &mut last_seq,
+            snap(&[(1, 0b111), (2, 0b001)]),
+            snap(&[(1, 5), (2, 1)]),
+        );
+        assert_eq!(d4.get(&1), Some(&0b111), "repeat fault re-reports");
+        assert!(!d4.contains_key(&2), "quiet op stays quiet");
+        // A flag landing after our snapshot is present (sticky)
+        // next drain — first sighting then, regardless of seq.
+        let d5 = accumulate_trunc(
+            &mut consumed,
+            &mut last_seq,
+            snap(&[(1, 0b111), (2, 0b011)]),
+            snap(&[(1, 5), (2, 1)]),
+        );
+        assert_eq!(d5.get(&2), Some(&0b010), "new bit reports via freshness");
     }
 
     #[test]
