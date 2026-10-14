@@ -9809,6 +9809,7 @@ mod tests {
                 guard: None,
                 algs: Vec::new(),
                 event_ns: 100,
+                rows: Vec::new(),
             }
         }
 
@@ -9831,6 +9832,7 @@ mod tests {
                 guard: None,
                 algs,
                 event_ns,
+                rows: Vec::new(),
             }
         }
 

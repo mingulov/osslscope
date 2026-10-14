@@ -58,7 +58,8 @@ fn alg(seq: u64, idx: u64, status: u8) -> wire::ScanAlgEvent {
 
 /// Finding 6: the window edge closes trailing queries — RET-joined
 /// opens evaluate on retained evidence (backstop), RET-less opens
-/// close as explicit dangling PARTIAL (never dropped).
+/// taint both correlated sequences (never dropped, never standing
+/// on mixed evidence).
 #[test]
 fn fix1_finish_closes_trailing() {
     let mut o = Oracle::new(OracleScope::full());
@@ -82,14 +83,12 @@ fn fix1_finish_closes_trailing() {
     assert_eq!(o.done().len(), 2);
     let s0 = o.done().iter().find(|w| w.seq == 0).unwrap();
     assert!(
-        matches!(s0.outcome, Outcome::Complete { .. }),
-        "backstop evaluates retained evidence: {s0:?}"
+        matches!(s0.outcome, Outcome::Tainted { .. }),
+        "dangling successor taints the correlated record: {s0:?}"
     );
     let s1 = o.done().iter().find(|w| w.seq == 1).unwrap();
-    assert!(matches!(
-        s1.outcome,
-        Outcome::Partial { ref reasons } if reasons.contains(&PartialReason::DanglingCall)
-    ));
+    assert!(matches!(s1.outcome, Outcome::Tainted { .. }));
+    assert_eq!(s1.op, UNKNOWN_OP);
     // A lone completed query with NO successor trails honestly
     // open mid-window, then the backstop evaluates it.
     let mut o = Oracle::new(OracleScope::full());
