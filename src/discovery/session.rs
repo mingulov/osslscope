@@ -970,6 +970,28 @@ pub struct SessionCore {
     /// are provably fresh) and on recycle. Invariant: set only
     /// while the carry is full.
     flap_carry_overflow: bool,
+    /// Newly-installed generation per rebirthed (op, array) for
+    /// THIS poll only (R20-fix round 5, R31): a row stamped with
+    /// the generation this poll's reconcile installed is provably
+    /// post-change — the generation first exists at install
+    /// (monotonic installs), the kernel stamps at walk time, and
+    /// install runs after this poll's snapshot, so the walk
+    /// postdates every maps-observed replacement the flap witness
+    /// could taint (the M4 doctrine: "the generation bump is the
+    /// continuity witness — new-stamp rows are proven-fresh").
+    /// Such rows bypass flap gapping (only the flap witness — the
+    /// impl/slot memory gates still apply); same-stamp rows on
+    /// stable arrays keep gapping per the R29 residual. Recorded
+    /// in [`SessionCore::retire_table_epoch`] on the rebirth path
+    /// (covers maps-turnover reconcile AND mid-drain repeat-init
+    /// suspects — both install after this poll's snapshot);
+    /// cleared at each poll's start and at close's start, so a
+    /// carried backlog row re-evaluates against the consuming
+    /// poll's snapshot (a LATER replacement may postdate its
+    /// walk — genuinely unprovable, still gaps). Cleared on
+    /// recycle with all lineage. Bounded by tables rebirthed per
+    /// poll (≤ tracked tables).
+    rebirth_gen_this_poll: HashMap<(u32, u64), u64>,
     /// Remembered backing-file freshness per path (R20-fix finding
     /// 5): (size, mtime_ns) baselines for retained candidates'
     /// backing + advertising files. An in-place edit (same
@@ -1148,6 +1170,7 @@ impl SessionCore {
             flap_changed: Vec::new(),
             flap_carry: Vec::new(),
             flap_carry_overflow: false,
+            rebirth_gen_this_poll: HashMap::new(),
             backing_freshness: HashMap::new(),
             last_good_maps: Vec::new(),
             candidates: Vec::new(),
@@ -1455,7 +1478,10 @@ impl SessionCore {
     /// even for unseeded impls (no memory to mismatch) and
     /// flap-backs (A→B→A, memory matches again). Flapped rows
     /// take the same loud-drop + reseat path (one loss, same
-    /// channel).
+    /// channel). R31 (round 5): the ROW arm withholds `flapped`
+    /// from rows stamped with a generation installed this poll
+    /// (provably post-snapshot — the M4 proven-fresh doctrine),
+    /// so this gate never fires on proven-fresh rows.
     fn check_impl_backing(
         &mut self,
         op: u32,
@@ -1810,6 +1836,11 @@ impl SessionCore {
                     return (TableRetirement { op, epoch, gap }, false);
                 }
                 self.record_generation_install(arr, generation);
+                // R31 rebirth-this-poll witness (round 5): rows
+                // stamped with this newly-installed generation are
+                // provably post-snapshot — the ROW arm carves them
+                // out of flap gapping.
+                self.rebirth_gen_this_poll.insert((op, arr), generation);
                 // Retirement invalidates bootstrap grace (P6 §6ii):
                 // the previous drain's M2 stamp-0 tolerance belongs
                 // to the retired incarnation, never the replacement
@@ -1962,6 +1993,7 @@ impl SessionCore {
         self.flap_changed.clear();
         self.flap_carry.clear();
         self.flap_carry_overflow = false;
+        self.rebirth_gen_this_poll.clear();
         self.backing_freshness.clear();
         self.candidates.clear();
         self.close_candidates.clear();
@@ -2215,6 +2247,9 @@ impl SessionCore {
         // Mapping-flap witness (R20-fix round 2, F4): refresh from
         // this poll's snapshot BEFORE the drain, so this poll's
         // rows check against the current discontinuity set.
+        // R31 (round 5): last poll's rebirth witness retires here
+        // — only THIS poll's installs prove post-snapshot walks.
+        self.rebirth_gen_this_poll.clear();
         self.refresh_mapping_flaps(&maps);
 
         // F-D/A11: validate anchor bindings before planning or
@@ -3170,12 +3205,22 @@ impl SessionCore {
                 // every backlog row — the untracked churn may cover
                 // its vaddr. Membership is O(per-poll changed +
                 // fixed carry cap), never churn-history-sized.
-                let flapped = self.flap_carry_overflow
-                    || self
-                        .flap_changed
-                        .iter()
-                        .chain(&self.flap_carry)
-                        .any(|(s, e)| *s <= ev.addr && ev.addr < *e);
+                // R31 carve-out (round 5): a row stamped with a
+                // generation installed THIS poll walked after this
+                // poll's snapshot (the M4 proven-fresh doctrine) —
+                // every maps-observed replacement predates it, so
+                // the flap witness (changed, carry, AND overflow
+                // latch — all pre-snapshot churn) cannot taint it.
+                // The impl/slot memory gates below still apply.
+                let fresh_rebirth = self.rebirth_gen_this_poll.get(&(ev.op, ev.aux)).copied()
+                    == Some(ev.generation);
+                let flapped = !fresh_rebirth
+                    && (self.flap_carry_overflow
+                        || self
+                            .flap_changed
+                            .iter()
+                            .chain(&self.flap_carry)
+                            .any(|(s, e)| *s <= ev.addr && ev.addr < *e));
                 if !self.check_impl_backing(ev.op, ev.aux, ev.idx, ev.addr, &backing, flapped) {
                     return;
                 }
@@ -3453,6 +3498,10 @@ impl SessionCore {
         // A failed read reconciles against last-good (F-D/Am1),
         // not empty — with explicit loss.
         let maps = self.poll_maps(env);
+        // R31 (round 5): the tail join below re-evaluates under
+        // close-time rebirths only — last poll's installs prove
+        // nothing against this snapshot.
+        self.rebirth_gen_this_poll.clear();
         self.refresh_mapping_flaps(&maps);
         self.reconcile_epochs(env, &maps);
         env.quiesce();
@@ -7739,6 +7788,74 @@ mod tests {
             d4.losses.is_empty(),
             "overflow must retire: {:?}",
             d4.losses
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // R20-fix round 5, R31: the flap witness carves out rows stamped
+    // with a generation installed THIS poll (provably post-snapshot
+    // — the M4 proven-fresh doctrine) while same-stamp rows on
+    // stable arrays keep gapping per the R29 residual.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn r20fix5_rebirth_carve_out_is_per_array_and_stamp() {
+        // PAIRED control in one rebirth poll: array A (0x5500, in
+        // stable_lib) rebirths when stable_lib turns over 50→51;
+        // array B (0x1500, in the stable provider range) does not.
+        // A's new-stamp (gen 2) row through a novel impl inside the
+        // flapped range is proven-fresh and attributes silently;
+        // B's same-stamp row through a NOVEL impl in the SAME
+        // flapped range is genuinely unprovable (queued pre-change
+        // vs fresh — the per-impl memory has nothing to mismatch)
+        // and must gap loud. Pins both halves of R31: the carve-out
+        // fires, and it is scoped to (op, array, new stamp) — never
+        // the whole poll.
+        let mut env = MiniEnv::new();
+        env.maps = vec![stable_lib(50), prov_mapping(100, 0x1000)];
+        // Bind both arrays under the stable maps (bootstrap rows).
+        env.events.push_back(alg_bytes(1, 0x5500, 0, 0));
+        env.events.push_back(row_bytes(1, 11, 0x1600, 0x5500, 0, 0));
+        env.events.push_back(alg_bytes(1, 0x1500, 0, 0));
+        env.events.push_back(row_bytes(1, 12, 0x1700, 0x1500, 0, 0));
+        let mut core = a11_core();
+        let d1 = core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(d1.candidates.len(), 2, "both arrays must bind");
+        assert!(
+            d1.losses.is_empty(),
+            "bind must be lossless: {:?}",
+            d1.losses
+        );
+        // stable_lib turns over: A rebirths (gen 2 installs), B's
+        // array mapping is untouched. Both rows target novel impls
+        // inside the flapped range.
+        env.maps = vec![stable_lib(51), prov_mapping(100, 0x1000)];
+        env.events.push_back(alg_bytes(1, 0x5500, 1, 2));
+        env.events.push_back(row_bytes(1, 11, 0x5700, 0x5500, 1, 2));
+        env.events.push_back(alg_bytes(1, 0x1500, 1, 0));
+        env.events.push_back(row_bytes(1, 12, 0x5600, 0x1500, 1, 0));
+        let d2 = core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(
+            d2.candidates.len(),
+            1,
+            "only the proven-fresh row may attribute: {:?}",
+            d2.candidates
+        );
+        assert_eq!(
+            d2.candidates[0].backing.as_ref().unwrap().ino,
+            51,
+            "proven-fresh row attributes to the new mapping"
+        );
+        let stragglers: u64 = d2
+            .losses
+            .iter()
+            .filter(|l| l.source == coverage::HOST_STRAGGLER && l.op == Some(1))
+            .map(|l| l.count)
+            .sum();
+        assert_eq!(
+            stragglers, 1,
+            "the same-stamp row must drop loud exactly once: {:?}",
+            d2.losses
         );
     }
 }
