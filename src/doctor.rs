@@ -3020,6 +3020,68 @@ mod tests {
         assert!(m.message.contains("no install receipt"), "{}", m.message);
     }
 
+    fn write_prefix_receipt(prefix: &Path, objdir: &Path, names: &[&str]) {
+        let rdir = prefix.join("share").join("osslscope");
+        std::fs::create_dir_all(&rdir).unwrap();
+        let arts: Vec<serde_json::Value> = names
+            .iter()
+            .map(|n| {
+                let dest = objdir.join(n).display().to_string();
+                let sha = onboard::file_sha256_hex(&objdir.join(n)).unwrap();
+                serde_json::json!({"role": "bpf-object", "dest": dest, "sha256": sha})
+            })
+            .collect();
+        std::fs::write(
+            rdir.join("install-manifest.json"),
+            serde_json::to_string(&serde_json::json!({
+                "schema": "osslscope-install-manifest-v1",
+                "artifacts": arts,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn members_row_mixed_set_fails_all_three() {
+        // Mixed install (receipted pair in one trusted dir,
+        // receipted members in another): doctor fails ALL THREE
+        // rows with the shared run-set refusal — exactly what
+        // capture runs (no pair fallback for a mixed triple).
+        let Some((h, c, m)) = built_triple() else {
+            eprintln!("SKIP members_row_mixed_set_fails_all_three: no built BPF triple");
+            return;
+        };
+        let pair_pfx = trusted_fixture("members-mixed-pair");
+        let pair_dir = pair_pfx.join("lib").join("osslscope");
+        std::fs::create_dir_all(&pair_dir).unwrap();
+        std::fs::copy(&h, pair_dir.join("osslscope-harvest")).unwrap();
+        std::fs::copy(&c, pair_dir.join("osslscope-count")).unwrap();
+        write_prefix_receipt(
+            &pair_pfx,
+            &pair_dir,
+            &["osslscope-harvest", "osslscope-count"],
+        );
+        let mem_pfx = trusted_fixture("members-mixed-members");
+        let mem_dir = mem_pfx.join("lib").join("osslscope");
+        std::fs::create_dir_all(&mem_dir).unwrap();
+        std::fs::copy(&m, mem_dir.join("osslscope-members")).unwrap();
+        write_prefix_receipt(&mem_pfx, &mem_dir, &["osslscope-members"]);
+        let rows = objects_checks_in(None, None, None, &[pair_dir, mem_dir], &doctor_trust());
+        for id in ["objects-harvest", "objects-count", "objects-members"] {
+            let row = rows.iter().find(|c| c.id == id).expect("row present");
+            assert_eq!(row.status, Status::Fail, "{id}: {}", row.message);
+        }
+        // Same shared refusal a run surfaces (the triple error —
+        // the resolve-level contract pins this message).
+        let m = members_row(&rows);
+        assert!(
+            m.message.contains("harvest+count+members triple"),
+            "mixed refusal carries the triple error: {}",
+            m.message
+        );
+    }
+
     #[test]
     fn members_row_explicit_vets() {
         // Explicit paths vet pass/fail individually (garbage fails
