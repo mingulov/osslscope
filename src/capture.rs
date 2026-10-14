@@ -185,10 +185,13 @@ pub struct TripleProvenance {
 // count-session executions. Callback execution is unobservable
 // in v1, so any `SiteExecution` assembled from query visibility
 // would fabricate execution (fetch/query visibility is not
-// execution evidence). Traversal reports natively via
-// `TraversalCapture` (records + per-slot identities + TRUE-T +
-// outcomes + provenance) and the report `traversal` section; the
-// inventory carries only count-observed executions.
+// execution evidence). Traversal reports natively:
+// `TraversalCapture` retains full records (per-slot identities
+// with generations + TRUE-T + outcomes + provenance + admitted
+// census); the report `traversal` section carries the triple,
+// the census, and per-record summaries (full slot arrays stay
+// in-capture like raw ring events). The inventory carries only
+// count-observed executions.
 
 /// Summarize a traversal outcome into the document's traversal
 /// record (the exact selected triple + counts — `None` when the
@@ -207,6 +210,21 @@ fn traversal_record(t: &TraversalCapture) -> Option<evidence::TraversalRecord> {
         records: t.done.len() as u64,
         findings: t.findings.len() as u64,
         polls: t.polls,
+        admitted: t.admitted_by_op.clone(),
+        entries: t
+            .done
+            .iter()
+            .map(|w| evidence::TraversalRecordEntry {
+                tid: w.tid,
+                seq: w.seq,
+                op: w.op,
+                outcome: w.outcome.clone(),
+                true_t: w.true_t,
+                alg_count: w.alg_count,
+                row_count: w.row_count,
+                generation: w.generation(),
+            })
+            .collect(),
     })
 }
 
@@ -226,6 +244,10 @@ pub struct TraversalDelta {
     /// to its held verdicts by (tid, seq) — a consumed verdict
     /// never stands on mixed evidence).
     pub corrections: Vec<crate::scan::oracle::Correction>,
+    /// Admitted-query census snapshot (per op, cumulative since
+    /// attach): honest observation metadata (loss-independent —
+    /// record count is not a census).
+    pub admitted: BTreeMap<u32, u64>,
 }
 
 /// Retained traversal outcome (on [`Capture`] when traversal ran;
@@ -247,6 +269,10 @@ pub struct TraversalCapture {
     /// verdicts — applied by [`TraversalCapture::merge`], never
     /// left standing).
     pub corrections: Vec<crate::scan::oracle::Correction>,
+    /// Latest admitted-query census snapshot (per op): honest
+    /// observation metadata (loss-independent — record count
+    /// is not a census; never billed into executions).
+    pub admitted_by_op: BTreeMap<u32, u64>,
 }
 
 impl TraversalCapture {
@@ -258,6 +284,12 @@ impl TraversalCapture {
         self.done.extend(tail.done);
         self.findings.extend(tail.findings);
         apply_corrections(&mut self.done, &tail.corrections);
+        // Census snapshots are cumulative (never shrink): the
+        // latest non-empty snapshot wins; an empty tail (no poll)
+        // keeps the accumulated one.
+        if !tail.admitted_by_op.is_empty() {
+            self.admitted_by_op = tail.admitted_by_op;
+        }
         self.polls += tail.polls;
         self.throttled = tail.throttled;
         self.detached = tail.detached;
@@ -695,6 +727,7 @@ impl DiscoveryPort for LiveTraversalDiscovery {
             partial_reasons: reasons,
             polls: 1,
             corrections: delta.corrections,
+            admitted: delta.admitted,
         })
     }
 
@@ -711,12 +744,18 @@ impl DiscoveryPort for LiveTraversalDiscovery {
                 out.done = delta.done;
                 out.findings = delta.findings;
                 out.corrections = delta.corrections;
+                out.admitted_by_op = delta.admitted;
             }
             Err(e) => {
                 out.finish_error = Some(format!("{e:#}"));
                 let (done, findings) = self.backend.take_completed();
                 out.done = done;
                 out.findings = findings;
+                // Salvage corrections too (pending rewrites for
+                // already-held verdicts — the merge below
+                // applies them; dropping them would strand a
+                // false verdict while saving everything else).
+                out.corrections = self.backend.take_corrections();
             }
         }
         let snap = self.backend.snapshot();
@@ -2946,6 +2985,9 @@ where
                 t.findings.extend(tdelta.findings);
                 t.polls += tdelta.polls;
                 apply_corrections(&mut t.done, &tdelta.corrections);
+                if !tdelta.admitted.is_empty() {
+                    t.admitted_by_op = tdelta.admitted;
+                }
             }
         }
         // One fence per round (Exec > ProviderChanged >
@@ -6826,6 +6868,7 @@ mod tests {
                 class,
                 status,
                 weak,
+                generation: 0,
             }
         }
         fn triple_prov() -> TripleProvenance {
@@ -6891,6 +6934,7 @@ mod tests {
                 partial_reasons: vec!["traversal-storm".to_string()],
                 polls: 1,
                 corrections: vec![],
+                admitted: std::collections::BTreeMap::new(),
             };
             let d2 = TraversalDelta {
                 done: vec![walk(
@@ -6903,6 +6947,7 @@ mod tests {
                 partial_reasons: vec!["traversal-incomplete".to_string()],
                 polls: 1,
                 corrections: vec![],
+                admitted: std::collections::BTreeMap::new(),
             };
             let tail = TraversalCapture {
                 provenance: Some(triple_prov()),
@@ -6916,6 +6961,7 @@ mod tests {
                 findings: vec![],
                 polls: 1,
                 corrections: vec![],
+                admitted_by_op: std::collections::BTreeMap::new(),
                 throttled: true,
                 detached: false,
                 finish_error: None,
@@ -7046,6 +7092,7 @@ mod tests {
                 partial_reasons: vec![],
                 polls: 1,
                 corrections: vec![],
+                admitted: std::collections::BTreeMap::new(),
             };
             let tail = TraversalCapture {
                 provenance: Some(triple_prov()),
@@ -7053,6 +7100,7 @@ mod tests {
                 findings: vec![],
                 polls: 1,
                 corrections: vec![],
+                admitted_by_op: std::collections::BTreeMap::new(),
                 throttled: false,
                 detached: false,
                 finish_error: None,
@@ -7087,6 +7135,101 @@ mod tests {
             );
             assert_eq!(cap.traversal.as_ref().unwrap().done.len(), 1);
         }
+
+        #[test]
+        fn fix4_admitted_census_retained_and_rendered() {
+            // The admitted-query census (per-op CALLS) is honest
+            // observation metadata (loss-independent — record
+            // count is not a census): deltas carry it, the
+            // capture retains the latest snapshot, and the
+            // rendered traversal section reports it (additive
+            // `admitted` map — old readers ignore unknown keys).
+            use crate::scan::oracle::Outcome;
+            use osslscope_ebpf_common as wire;
+            let admitted: std::collections::BTreeMap<u32, u64> =
+                [(1u32, 3u64)].into_iter().collect();
+            let round = TraversalDelta {
+                done: vec![walk_full(
+                    1,
+                    1,
+                    Outcome::Complete {
+                        true_t: 1,
+                        cached: false,
+                    },
+                    vec![
+                        ident(0, 0, wire::ALG_OK, 0),
+                        ident(1, wire::OTHER_CLASS, wire::ALG_EMPTY, 0),
+                    ],
+                    vec![row_ev(0, 300)],
+                    5_000_000_000,
+                )],
+                findings: vec![],
+                partial_reasons: vec![],
+                polls: 1,
+                corrections: vec![],
+                admitted: admitted.clone(),
+            };
+            let tail = TraversalCapture {
+                provenance: Some(triple_prov()),
+                done: vec![],
+                findings: vec![],
+                polls: 1,
+                corrections: vec![],
+                admitted_by_op: std::collections::BTreeMap::new(),
+                throttled: false,
+                detached: false,
+                finish_error: None,
+            };
+            let cfg = stub_config();
+            let info = stub_info();
+            let clock = ClockStub::at(5_000_000_000);
+            let mut proc = ProcStub;
+            let cancelled = || false;
+            let count = CountSession::new(TPID, FakeCountBackend::new());
+            let runner = stub_runner(
+                &cfg,
+                &info,
+                TraversalStub::scripted(vec![round], tail),
+                count,
+                &clock,
+                &mut proc,
+                &cancelled,
+            );
+            let cap = runner.setup_and_run().expect("stub run completes");
+            assert_eq!(
+                cap.traversal.as_ref().unwrap().admitted_by_op,
+                admitted,
+                "capture retains the admitted census"
+            );
+            let json = crate::report::render_json(&cap.document).expect("render");
+            let v: serde_json::Value = serde_json::from_slice(&json).expect("parse");
+            assert_eq!(
+                v["traversal"]["admitted"]["1"], 3,
+                "rendered census reports per-op admissions"
+            );
+            // Per-record native facts (one entry per close, close
+            // order — verdict-relevant facts, not slot arrays).
+            let entries = v["traversal"]["entries"]
+                .as_array()
+                .expect("entries render");
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0]["seq"], 1);
+            assert_eq!(entries[0]["op"], 1);
+            assert_eq!(entries[0]["outcome"]["Complete"]["true_t"], 1);
+            assert_eq!(entries[0]["true_t"], serde_json::json!({"Proven": 6}));
+            assert_eq!(entries[0]["alg_count"], 2);
+            assert_eq!(entries[0]["row_count"], 1);
+            assert_eq!(entries[0]["generation"], 0);
+            // Old-reader compatibility: a reader that knows only
+            // the round-3 shape parses the new document fine.
+            #[derive(serde::Deserialize)]
+            struct OldTraversal {
+                records: u64,
+            }
+            let old: OldTraversal =
+                serde_json::from_value(v["traversal"].clone()).expect("old reader parses");
+            assert_eq!(old.records, 1);
+        }
         #[test]
         fn traversal_salvage_keeps_drained() {
             // RED: a close failure salvages the drained-so-far
@@ -7104,6 +7247,7 @@ mod tests {
                 partial_reasons: vec!["traversal-storm".to_string()],
                 polls: 1,
                 corrections: vec![],
+                admitted: std::collections::BTreeMap::new(),
             };
             let tail = TraversalCapture {
                 provenance: Some(triple_prov()),
@@ -7117,6 +7261,7 @@ mod tests {
                 findings: vec![],
                 polls: 1,
                 corrections: vec![],
+                admitted_by_op: std::collections::BTreeMap::new(),
                 throttled: false,
                 detached: true,
                 finish_error: None,
@@ -7261,6 +7406,7 @@ mod tests {
                 findings: vec![],
                 polls: 1,
                 corrections: vec![],
+                admitted_by_op: std::collections::BTreeMap::new(),
                 throttled: false,
                 detached: true,
                 finish_error: Some("tail drained late".to_string()),
@@ -7297,6 +7443,38 @@ mod tests {
             acc.merge(tail2);
             assert_eq!(acc.provenance, Some(triple_prov()));
             assert_eq!(acc.finish_error.as_deref(), Some("tail drained late"));
+        }
+
+        #[test]
+        fn traversal_capture_merge_applies_corrections() {
+            // A tail carrying pending corrections rewrites the
+            // accumulated held verdicts by key (salvage and
+            // finish tails never strand a false verdict).
+            use crate::scan::oracle::{Correction, Outcome};
+            let mut acc = TraversalCapture::default();
+            acc.done.push(walk(
+                1,
+                Outcome::Complete {
+                    true_t: 6,
+                    cached: false,
+                },
+            ));
+            let tail = TraversalCapture {
+                corrections: vec![Correction {
+                    tid: TPID,
+                    seq: 1,
+                    outcome: Outcome::Tainted { by_seq: 2 },
+                    op: crate::scan::oracle::UNKNOWN_OP,
+                }],
+                ..TraversalCapture::default()
+            };
+            acc.merge(tail);
+            assert!(
+                matches!(acc.done[0].outcome, Outcome::Tainted { by_seq: 2 }),
+                "merged tail corrects the held verdict: {:?}",
+                acc.done[0].outcome
+            );
+            assert_eq!(acc.done[0].op, crate::scan::oracle::UNKNOWN_OP);
         }
 
         struct TargetStub;
