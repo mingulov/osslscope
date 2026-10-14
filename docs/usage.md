@@ -144,8 +144,13 @@ row covers the traversal object: `pass` when installed and
 compatible, `info` when absent (traversal unavailable — old
 harvest/count pair installs stay valid), `fail` when present
 but unresolvable (reinstall that object). `report`/`check`
-run harvest-only; traversal selection is not yet exposed on
-their CLIs.
+traverse automatically when the installed triple resolves
+(receipt-verified, trusted) and the target is builtin-mode
+with a resolved dispatch anchor; otherwise they stay
+harvest-only (pair-only installs, `--init` runs, and
+dispatch-blind targets never traverse). There is no
+traversal CLI flag — selection is automatic and the report's
+`traversal` section names the exact triple that ran.
 
 ## alias-audit — find shared dispatch addresses
 
