@@ -2140,3 +2140,78 @@ fn r20_exec_replaces_image_custody_survives() {
     assert_eq!(t.exit_code(), Some(0));
     assert_reaped_no_zombie(pid);
 }
+
+// ---------------------------------------------------------------------------
+// R20-fix finding 1: kernel-observed lifecycle (proc connector).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn r20fix_kernel_lifecycle_witnesses_real_fork_exec_exit() {
+    // Real-kernel control (no fakes, no privileges): subscribe BEFORE
+    // release — the stopped child cannot act until released, so no
+    // activity can precede the subscription — then release a workload
+    // that execs (the target's own exec) and forks a sub-poll
+    // grandchild (invisible to any snapshot poll). The adapter must
+    // witness both, report zero drops/loss, and close with an empty
+    // tail. The target's own exit is custody's verdict, never a
+    // lifecycle event.
+    use osslscope::capture::{KernelLifecycle, LifecycleKind, LifecyclePort};
+    use std::collections::HashSet;
+
+    let mut t = OwnedTarget::spawn_stopped(
+        &[
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "(exit 3) & wait".to_string(),
+        ],
+        WorkloadDest::Null,
+    )
+    .unwrap();
+    let pid = t.pid();
+    let mut lc = KernelLifecycle::subscribe(pid).expect("connector subscribe");
+    assert!(
+        !lc.fallback_partial(),
+        "kernel signals must not be the PARTIAL fallback"
+    );
+    t.release().unwrap();
+    assert_eq!(wait_for_exit(&mut t, Duration::from_secs(10)), Some(0));
+    // Drain until both witnesses arrive (bounded): delivery into the
+    // socket is kernel-queued, so this loop only waits out scheduling.
+    let mut forks: HashSet<u32> = HashSet::new();
+    let mut execs: HashSet<u32> = HashSet::new();
+    let mut loss = 0u64;
+    let mut dropped = 0u64;
+    let end = Instant::now() + Duration::from_secs(10);
+    while (forks.is_empty() || execs.is_empty()) && Instant::now() < end {
+        let delta = lc.poll();
+        loss += delta.loss;
+        dropped += delta.dropped;
+        assert_eq!(delta.pending, 0, "quiet test must not truncate drains");
+        for e in &delta.events {
+            match e.kind {
+                LifecycleKind::Fork => {
+                    forks.insert(e.pid);
+                }
+                LifecycleKind::Exec => {
+                    execs.insert(e.pid);
+                }
+            }
+        }
+        if forks.is_empty() || execs.is_empty() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    assert_eq!(execs, HashSet::from([pid]), "target exec must witness");
+    assert_eq!(forks.len(), 1, "one sub-poll grandchild fork: {forks:?}");
+    let gc: u32 = *forks.iter().next().unwrap();
+    assert_ne!(gc, pid, "grandchild is not the target");
+    assert_eq!(loss, 0, "no scan loss on a quiet window");
+    assert_eq!(dropped, 0, "no kernel drops on a quiet window");
+    // Close drain: witnessed, complete, still lossless.
+    let tail = lc.close_drain().expect("kernel close witness");
+    assert_eq!(tail.pending, 0, "close drain must reach the tail");
+    assert_eq!(tail.loss, 0);
+    assert_eq!(tail.dropped, 0);
+    assert!(tail.events.is_empty(), "no stragglers: {:?}", tail.events);
+    assert_reaped_no_zombie(pid);
+}
