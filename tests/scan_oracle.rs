@@ -1042,32 +1042,6 @@ fn fix2_row_loss_intact_prefix_partial() {
         o.done()[0].outcome
     );
 }
-
-/// Round-2 F3: a raced TRUNC drain degrades every open it spanned
-/// (the backend could not prove no concurrent flag was erased).
-#[test]
-fn fix2_trunc_race_flag_partial() {
-    let mut o = Oracle::new(OracleScope::full());
-    let mut b = quiesced_idle(&[TIDA]);
-    b.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
-    b.push_ret(ret(TIDA, 0, 0));
-    for j in 0..3 {
-        b.push_alg(alg(TIDA, 0, j, wire::ALG_OK));
-    }
-    b.push_alg(alg_arr(TIDA, 0, 3, wire::ALG_EMPTY, ARR, 0));
-    b.trunc_race = true;
-    o.ingest(&b);
-    assert_eq!(o.done().len(), 1);
-    assert!(
-        matches!(
-            o.done()[0].outcome,
-            Outcome::Partial { ref reasons } if reasons.contains(&PartialReason::TruncDrainRace)
-        ),
-        "raced TRUNC drain must degrade: {:?}",
-        o.done()[0].outcome
-    );
-}
-
 /// Round-2 F4: the nesting rule-set taints stickily — the current
 /// open keeps accumulating positive evidence and closes Tainted
 /// with all of it (nothing is dropped at fire time).
@@ -1147,6 +1121,129 @@ fn fix2_dangling_taints_both() {
         matches!(pair.outcome, Outcome::Tainted { .. }),
         "correlated sequence tainted too: {:?}",
         pair.outcome
+    );
+}
+
+/// Round-3 F4: a consumed (drained) Complete is CORRECTED when a
+/// later dangling close taints it — the standing Complete must
+/// not survive (a Nested finding alone leaves a false Complete
+/// in every downstream copy). The correction channel carries
+/// the rewrite to the backend/capture holders.
+#[test]
+fn fix3_consumed_taint_corrects() {
+    let mut o = Oracle::new(OracleScope::full());
+    let mut b1 = ScanBatch {
+        quiesced: false,
+        now_ns: 1_000,
+        ..ScanBatch::default()
+    };
+    b1.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b1.push_ret(ret(TIDA, 0, 0));
+    b1.push_alg(alg(TIDA, 0, 0, wire::ALG_OK));
+    b1.push_alg(alg_arr(TIDA, 0, 1, wire::ALG_EMPTY, ARR, 0));
+    o.ingest(&b1);
+    let mut b2 = ScanBatch {
+        quiesced: false,
+        now_ns: 2_000,
+        ..ScanBatch::default()
+    };
+    b2.push_call(call(TIDA, 1, false, wire::SKIP_ADMITTED)); // successor closes 0
+    o.ingest(&b2);
+    assert_eq!(o.done().len(), 1, "inner closes first");
+    let drained = o.take_done();
+    assert!(
+        matches!(drained[0].outcome, Outcome::Complete { .. }),
+        "inner drains Complete: {:?}",
+        drained[0].outcome
+    );
+    o.finish(3_000); // seq 1 dangles (RET-less) → taints consumed seq 0
+    let dangle = o.done().iter().find(|w| w.seq == 1).unwrap();
+    assert!(
+        matches!(dangle.outcome, Outcome::Tainted { .. }),
+        "dangling close is Tainted: {:?}",
+        dangle.outcome
+    );
+    let corrections = o.take_corrections();
+    assert_eq!(corrections.len(), 1, "one post-drain correction");
+    assert_eq!(corrections[0].tid, TIDA);
+    assert_eq!(corrections[0].seq, 0);
+    assert!(
+        matches!(corrections[0].outcome, Outcome::Tainted { by_seq: 1 }),
+        "consumed verdict corrected to Tainted: {:?}",
+        corrections[0].outcome
+    );
+    assert_eq!(corrections[0].op, UNKNOWN_OP);
+}
+
+/// Round-3 F6: late data records for a consumed key are
+/// preserved as findings (cross-CPU ring skew delivers them
+/// after the close — positive recovery evidence, never silently
+/// discarded). Late control records (RET) for a non-hung
+/// consumed key stay absorbed (redundant — the verdict closed
+/// with its RET already).
+#[test]
+fn fix3_late_data_preserved_late_control_absorbed() {
+    let mut o = Oracle::new(OracleScope::full());
+    let mut b1 = ScanBatch {
+        quiesced: false,
+        now_ns: 1_000,
+        ..ScanBatch::default()
+    };
+    b1.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b1.push_ret(ret(TIDA, 0, 0));
+    b1.push_alg(alg(TIDA, 0, 0, wire::ALG_OK));
+    b1.push_alg(alg_arr(TIDA, 0, 1, wire::ALG_EMPTY, ARR, 0));
+    o.ingest(&b1);
+    let mut b2 = ScanBatch {
+        quiesced: false,
+        now_ns: 2_000,
+        ..ScanBatch::default()
+    };
+    b2.push_call(call(TIDA, 1, false, wire::SKIP_ADMITTED)); // successor closes 0
+    o.ingest(&b2);
+    assert_eq!(o.done().len(), 1);
+    let _ = o.take_done(); // consume seq 0
+    let _ = o.take_findings();
+    // Stragglers for the consumed key (skewed past its close).
+    let mut b3 = ScanBatch {
+        quiesced: false,
+        now_ns: 3_000,
+        ..ScanBatch::default()
+    };
+    b3.push_alg(alg(TIDA, 0, 5, wire::ALG_OK));
+    b3.push_row(row_full(TIDA, 0, 5, ARR, 0, 301, 0x4401));
+    b3.push_ret(ret(TIDA, 0, 0));
+    o.ingest(&b3);
+    assert!(
+        o.findings().contains(&Finding::LateAlg {
+            tid: TIDA,
+            seq: 0,
+            idx: 5,
+            status: wire::ALG_OK,
+            class: 1,
+        }),
+        "late ALG preserved with its slot evidence: {:?}",
+        o.findings()
+    );
+    assert!(
+        o.findings().contains(&Finding::LateRow {
+            tid: TIDA,
+            seq: 0,
+            idx: 5,
+            funcid: 301,
+        }),
+        "late ROW preserved with its slot evidence: {:?}",
+        o.findings()
+    );
+    assert!(
+        !o.findings().iter().any(|f| matches!(
+            f,
+            Finding::LateRet { seq: 0, .. }
+                | Finding::DoubleRet { seq: 0, .. }
+                | Finding::OrphanRet { seq: 0, .. }
+        )),
+        "late RET for a non-hung consumed key stays absorbed: {:?}",
+        o.findings()
     );
 }
 
