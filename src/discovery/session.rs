@@ -854,6 +854,27 @@ pub struct SessionCore {
     /// array costs one spurious straggler (proven-fresh row meets
     /// stale memory), never silence.
     impl_backing: HashMap<u64, (u64, BackingRef)>,
+    /// Last-seen (dev, ino) per mapping range start (R20-fix round
+    /// 2, F4 mapping-flap witness): every poll's snapshot refreshes
+    /// this; a range whose triple CHANGED since the previous poll
+    /// lands in `flap_changed`, and a row attributing into a
+    /// changed range drops loud (the row may be queued pre-change —
+    /// continuity unprovable). Catches what the per-impl memory
+    /// cannot: an unseeded impl's first row after a maps-observed
+    /// replacement, and a flap-back (A→B→A) whose impl memory
+    /// matches again. First sightings record silently; vanished
+    /// ranges prune (a row can only attribute into a present range,
+    /// and absence is the orphan path's territory); same-triple
+    /// resizes are not flaps (same file). Cleared on recycle (a new
+    /// address space). Bounded by distinct live range starts (the
+    /// live maps vec, already held per poll).
+    map_flap: HashMap<u64, (String, u64)>,
+    /// Ranges whose (dev, ino) changed into THIS poll's snapshot
+    /// (start, end): refreshed every poll (and at close), consulted
+    /// by the ROW arm. Per-poll (not accumulated): rows arriving
+    /// without truncation loss are fresh (emitted since the last
+    /// poll), so only the current poll's discontinuity taints.
+    flap_changed: Vec<(u64, u64)>,
     /// Remembered backing-file freshness per path (R20-fix finding
     /// 5): (size, mtime_ns) baselines for retained candidates'
     /// backing + advertising files. An in-place edit (same
@@ -1005,6 +1026,8 @@ impl SessionCore {
             m1_poison: HashSet::new(),
             slot_backing: HashMap::new(),
             impl_backing: HashMap::new(),
+            map_flap: HashMap::new(),
+            flap_changed: Vec::new(),
             backing_freshness: HashMap::new(),
             last_good_maps: Vec::new(),
             candidates: Vec::new(),
@@ -1219,6 +1242,33 @@ impl SessionCore {
         false
     }
 
+    /// Refresh the mapping-flap memory from this poll's snapshot
+    /// (R20-fix round 2, F4): ranges whose (dev, ino) changed since
+    /// the previous poll land in `flap_changed` for this poll's ROW
+    /// arm. STAT-domain dev (the attribution identity); ends are
+    /// carried for containment checks, never compared (a same-file
+    /// resize is not a flap).
+    fn refresh_mapping_flaps(&mut self, maps: &[maps::Mapping]) {
+        let mut changed = Vec::new();
+        let mut present = HashSet::new();
+        for m in maps {
+            present.insert(m.start);
+            let triple = (backing_dev(m), m.ino);
+            match self.map_flap.get(&m.start) {
+                None => {
+                    self.map_flap.insert(m.start, triple);
+                }
+                Some(old) if *old != triple => {
+                    changed.push((m.start, m.end));
+                    self.map_flap.insert(m.start, triple);
+                }
+                Some(_) => {}
+            }
+        }
+        self.map_flap.retain(|s, _| present.contains(s));
+        self.flap_changed = changed;
+    }
+
     /// Impl-turnover gate (R20-fix finding 4): the row's impl
     /// backing must match the triple remembered for its impl
     /// vaddr. M4's cell memory only covers tracked (array, slot,
@@ -1234,6 +1284,14 @@ impl SessionCore {
     /// neither records nor compares. Callers run this BEFORE
     /// [`Self::check_slot_backing`] (its reseat keeps the cell
     /// memory aligned, so one turnover costs one loss, not two).
+    ///
+    /// `flapped` (R20-fix round 2, F4) is the mapping-flap
+    /// witness: the row's vaddr sits in a range whose (dev, ino)
+    /// changed into this poll's snapshot, so the row may be
+    /// queued pre-change — continuity unprovable even for
+    /// unseeded impls (no memory to mismatch) and flap-backs
+    /// (A→B→A, memory matches again). Flapped rows take the same
+    /// loud-drop + reseat path (one loss, same channel).
     fn check_impl_backing(
         &mut self,
         op: u32,
@@ -1241,18 +1299,23 @@ impl SessionCore {
         idx: u64,
         imp: u64,
         backing: &Option<BackingRef>,
+        flapped: bool,
     ) -> bool {
         let Some(current) = backing else {
             return true;
         };
         match self.impl_backing.get(&imp) {
-            None => {
+            None if !flapped => {
                 self.impl_backing.insert(imp, (arr, current.clone()));
                 true
             }
-            Some((_, remembered)) if remembered == current => true,
-            Some(_) => {
-                eprintln!("stale impl backing: op={op} idx={idx}");
+            Some((_, remembered)) if remembered == current && !flapped => true,
+            _ => {
+                if flapped {
+                    eprintln!("flapped impl backing: op={op} idx={idx}");
+                } else {
+                    eprintln!("stale impl backing: op={op} idx={idx}");
+                }
                 self.tracker.note_straggler(op);
                 self.impl_backing.insert(imp, (arr, current.clone()));
                 self.slot_backing.insert((arr, idx, imp), current.clone());
@@ -1439,46 +1502,76 @@ impl SessionCore {
     /// never re-emit. A re-emit here may duplicate a drain refresh
     /// in the same delta — the adapter dedups by triple, so the
     /// only cost is one redundant clone.
+    ///
+    /// Two passes (R20-fix round 2, F5): pass 1 resolves every
+    /// candidate's paths and compares ALL of them against the
+    /// PRE-sweep baselines, collecting the changed set; pass 2
+    /// refreshes baselines and re-emits every affected candidate.
+    /// Single-pass updating let the first-visited candidate silence
+    /// its siblings (C1's update hid the change from C2, whose
+    /// fingerprint then stayed stale indefinitely). Backing
+    /// resolution is (device, inode) — STAT-domain dev, the same
+    /// identity the attribution arm binds — so a cross-device twin
+    /// (same ino, other dev) can neither shadow the real backing's
+    /// mutation nor trigger on the twin's.
     fn refresh_backing_freshness<E: SessionEnv>(
         &mut self,
         env: &mut E,
         maps: &[maps::Mapping],
         delta: &mut DiscoveryDelta,
     ) {
+        // STAT-domain dev per mapping, once per sweep (O(M) stats,
+        // not O(candidates × M)).
+        let devs: Vec<String> = maps.iter().map(backing_dev).collect();
+        // Pass 1: resolve + compare against pre-sweep baselines.
+        let mut resolved: Vec<(Option<String>, Option<String>)> =
+            Vec::with_capacity(self.candidates.len());
         let mut live: HashSet<String> = HashSet::new();
-        for i in 0..self.candidates.len() {
-            // Backing path: first same-ino mapping (ino-only —
-            // twin resolution can only spuriously refresh; capture
-            // re-validates dev-exact, so never misattribute).
-            let mut paths: [Option<String>; 2] = [None, None];
-            if let Some(backing) = self.candidates[i].backing.as_ref() {
-                let ino = backing.ino;
-                if ino != 0 {
-                    if let Some(m) = maps.iter().find(|m| m.ino == ino) {
-                        paths[0] = Some(m.path.clone());
-                    }
+        let mut changed: HashMap<String, (u64, u64)> = HashMap::new();
+        for candidate in &self.candidates {
+            let mut paths: (Option<String>, Option<String>) = (None, None);
+            if let Some(backing) = candidate.backing.as_ref() {
+                if backing.ino != 0 {
+                    paths.0 = maps
+                        .iter()
+                        .zip(devs.iter())
+                        .find(|(m, d)| m.ino == backing.ino && *d == &backing.dev)
+                        .map(|(m, _)| m.path.clone());
                 }
             }
-            if !self.candidates[i].advertising.is_empty() {
-                paths[1] = Some(self.candidates[i].advertising.clone());
+            if !candidate.advertising.is_empty() {
+                paths.1 = Some(candidate.advertising.clone());
             }
-            let mut changed = false;
-            for path in paths.iter().flatten() {
+            for path in [&paths.0, &paths.1].into_iter().flatten() {
                 live.insert(path.clone());
                 if let Some(fresh) = env.backing_stat(path) {
                     match self.backing_freshness.get(path) {
+                        // First sighting: order-safe (never emits).
                         None => {
                             self.backing_freshness.insert(path.clone(), fresh);
                         }
+                        // Changed: collect (baselines refresh in
+                        // pass 2 — every candidate compares against
+                        // the same pre-sweep values).
                         Some(old) if *old != fresh => {
-                            self.backing_freshness.insert(path.clone(), fresh);
-                            changed = true;
+                            changed.insert(path.clone(), fresh);
                         }
                         Some(_) => {}
                     }
                 }
             }
-            if changed {
+            resolved.push(paths);
+        }
+        // Pass 2: refresh baselines, re-emit every affected candidate.
+        for (path, fresh) in &changed {
+            self.backing_freshness.insert(path.clone(), *fresh);
+        }
+        for (i, paths) in resolved.iter().enumerate() {
+            let hit = [&paths.0, &paths.1]
+                .into_iter()
+                .flatten()
+                .any(|p| changed.contains_key(p));
+            if hit {
                 delta.candidates.push(self.candidates[i].clone());
             }
         }
@@ -1701,6 +1794,8 @@ impl SessionCore {
         self.m1_poison.clear();
         self.slot_backing.clear();
         self.impl_backing.clear();
+        self.map_flap.clear();
+        self.flap_changed.clear();
         self.backing_freshness.clear();
         self.candidates.clear();
         self.close_candidates.clear();
@@ -1948,6 +2043,11 @@ impl SessionCore {
         let mut maps = self.poll_maps(env);
         let mut delta = DiscoveryDelta::default();
         let mut touched: HashSet<(u32, u64)> = HashSet::new();
+
+        // Mapping-flap witness (R20-fix round 2, F4): refresh from
+        // this poll's snapshot BEFORE the drain, so this poll's
+        // rows check against the current discontinuity set.
+        self.refresh_mapping_flaps(&maps);
 
         // F-D/A11: validate anchor bindings before planning or
         // installing anything — replacement invalidates pins, and
@@ -2682,7 +2782,15 @@ impl SessionCore {
                 // cell gate: a novel cell on a turned-over impl
                 // would sail through M4's first-sighting arm —
                 // this drops it loud and re-seats both memories.
-                if !self.check_impl_backing(ev.op, ev.aux, ev.idx, ev.addr, &backing) {
+                // The mapping-flap witness (R20-fix round 2, F4)
+                // rides the same gate: a row inside a range whose
+                // triple changed into this snapshot may be queued
+                // pre-change (unprovable even unseeded/flapped-back).
+                let flapped = self
+                    .flap_changed
+                    .iter()
+                    .any(|(s, e)| *s <= ev.addr && ev.addr < *e);
+                if !self.check_impl_backing(ev.op, ev.aux, ev.idx, ev.addr, &backing, flapped) {
                     return;
                 }
                 // Slot-backing gate (M4): compares BEFORE the
@@ -2959,6 +3067,7 @@ impl SessionCore {
         // A failed read reconciles against last-good (F-D/Am1),
         // not empty — with explicit loss.
         let maps = self.poll_maps(env);
+        self.refresh_mapping_flaps(&maps);
         self.reconcile_epochs(env, &maps);
         env.quiesce();
         // Tail join (P6 §6ii): a fast-dying target's in-ring wave
@@ -6056,6 +6165,84 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // R20-fix round 2, finding 5: independent changed-path detection
+    // with (device, inode) identity. RED tests (fail on FIX_BASE —
+    // C1's baseline update silences C2; ino-only twins misresolve).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn r20fix2_shared_backing_change_reemits_every_candidate() {
+        // C1 and C2 share one backing file; the sweep must compare
+        // EVERY candidate against the PRE-sweep baselines (C1's
+        // update must not silence C2 — its fingerprint would stay
+        // stale indefinitely).
+        let mut env = MiniEnv::new();
+        env.maps = vec![stable_lib(50), prov_mapping(100, 0x1000)];
+        env.file_stats
+            .insert("/p/provider.so".to_string(), (4096, 0));
+        env.events.push_back(alg_bytes(1, 0x5500, 0, 0));
+        env.events.push_back(row_bytes(1, 11, 0x1600, 0x5500, 0, 0));
+        env.events.push_back(alg_bytes(1, 0x5500, 1, 0));
+        env.events.push_back(row_bytes(1, 12, 0x1600, 0x5500, 1, 0));
+        let mut core = a11_core();
+        let d1 = core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(d1.candidates.len(), 2);
+        let d2 = core.poll(&mut env, a11_budget()).unwrap();
+        assert!(d2.candidates.is_empty());
+        env.file_stats
+            .insert("/p/provider.so".to_string(), (4096, 777));
+        let d3 = core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(
+            d3.candidates.len(),
+            2,
+            "every candidate on the changed file must re-emit, not just the first visited"
+        );
+    }
+
+    #[test]
+    fn r20fix2_freshness_resolves_cross_device_twins_by_dev_ino() {
+        // Same ino on two devices: the sweep must resolve the
+        // candidate's backing by (dev, ino) — ino-only takes the
+        // first twin and misses the real backing's mutation.
+        fn twin(dev: &str, path: &str, start: u64) -> maps::Mapping {
+            maps::Mapping {
+                start,
+                end: start + 0x1000,
+                x: true,
+                offset: 0,
+                dev: dev.to_string(),
+                ino: 100,
+                path: path.to_string(),
+            }
+        }
+        let mut env = MiniEnv::new();
+        env.maps = vec![
+            stable_lib(50),
+            twin("08:01", "/a/x.so", 0x1000),
+            twin("08:02", "/b/y.so", 0x3000),
+        ];
+        env.file_stats.insert("/a/x.so".to_string(), (100, 0));
+        env.file_stats.insert("/b/y.so".to_string(), (200, 0));
+        // Row attributed from the 08:02 twin's range.
+        env.events.push_back(alg_bytes(1, 0x5500, 0, 0));
+        env.events.push_back(row_bytes(1, 11, 0x3600, 0x5500, 0, 0));
+        let mut core = a11_core();
+        let d1 = core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(d1.candidates.len(), 1);
+        assert_eq!(d1.candidates[0].backing.as_ref().unwrap().dev, "08:02");
+        let d2 = core.poll(&mut env, a11_budget()).unwrap();
+        assert!(d2.candidates.is_empty());
+        // Only the REAL backing mutates.
+        env.file_stats.insert("/b/y.so".to_string(), (200, 777));
+        let d3 = core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(
+            d3.candidates.len(),
+            1,
+            "the (dev, ino)-resolved backing's mutation must re-emit"
+        );
+    }
+
+    // ------------------------------------------------------------------
     // R20-fix finding 4: queued rows across unseen impl replacement.
     // ------------------------------------------------------------------
 
@@ -6176,6 +6363,13 @@ mod tests {
         // kernel-observed mapping events (future facility, same
         // class as the R20-fix lifecycle connector) — out of scope
         // for a snapshot-relocation design.
+        //
+        // R20-fix round 2 (F4): this residual is NARROWED, not
+        // removed — any maps-OBSERVED discontinuity at the row's
+        // vaddr now gaps (the flap witness below); what remains is
+        // strictly within-poll different-path A→B→A (session-input-
+        // identical to no-B — untestable by construction, see
+        // `r20fix2_stable_bracketing_witnesses_continuity`).
         let mut env = MiniEnv::new();
         env.maps = vec![prov_mapping(100, 0x1000)];
         env.events.push_back(alg_bytes(1, 0x1500, 0, 0));
@@ -6185,5 +6379,107 @@ mod tests {
         assert_eq!(d.candidates.len(), 1);
         assert_eq!(d.candidates[0].backing.as_ref().unwrap().ino, 100);
         assert!(d.losses.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // R20-fix round 2, finding 4: mapping-flap witness (maps-observed
+    // discontinuity at the row's vaddr gaps — the row may be queued
+    // pre-change). RED tests (fail on FIX_BASE — silent adoption).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn r20fix2_unseeded_impl_flap_gaps_loud() {
+        // B REPLACEMENT, PERFORMED: poll 1 observes A (no row — the
+        // impl memory is unseeded); poll 2 observes B at the same
+        // range and a row arrives. The row may be A's queued row
+        // (stale) or B's fresh row — same stamp, same generation,
+        // indistinguishable — so continuity is unprovable: loud drop
+        // (op-localized straggler), no relabel.
+        let mut env = MiniEnv::new();
+        env.maps = vec![stable_lib(50), prov_mapping(100, 0x1000)];
+        let mut core = a11_core();
+        let d1 = core.poll(&mut env, a11_budget()).unwrap();
+        assert!(d1.candidates.is_empty());
+        assert!(d1.losses.is_empty());
+        // Replacement: same range, new inode.
+        env.maps = vec![stable_lib(50), prov_mapping(200, 0x1000)];
+        env.events.push_back(alg_bytes(1, 0x5500, 0, 0));
+        env.events.push_back(row_bytes(1, 11, 0x1600, 0x5500, 0, 0));
+        let d2 = core.poll(&mut env, a11_budget()).unwrap();
+        assert!(
+            d2.candidates.is_empty(),
+            "flapped row must not silently adopt: {:?}",
+            d2.candidates
+        );
+        assert!(
+            d2.losses
+                .iter()
+                .any(|l| l.source == coverage::HOST_STRAGGLER && l.op == Some(1)),
+            "flapped row must drop loud: {:?}",
+            d2.losses
+        );
+    }
+
+    #[test]
+    fn r20fix2_flap_back_gaps_loud() {
+        // B REPLACEMENT, PERFORMED, then restored: poll 1 seeds the
+        // impl memory under A; poll 2 observes B (no row — the impl
+        // memory still says A); poll 3 observes A again and a row
+        // arrives. The row may be B's queued row — the vaddr flapped
+        // under it — so attribution to A is unprovable: loud drop.
+        // (The per-impl memory alone matches A==A and stays silent.)
+        let mut env = MiniEnv::new();
+        env.maps = vec![stable_lib(50), prov_mapping(100, 0x1000)];
+        env.events.push_back(alg_bytes(1, 0x5500, 0, 0));
+        env.events.push_back(row_bytes(1, 11, 0x1600, 0x5500, 0, 0));
+        let mut core = a11_core();
+        let d1 = core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(d1.candidates.len(), 1);
+        env.maps = vec![stable_lib(50), prov_mapping(200, 0x1000)];
+        let d2 = core.poll(&mut env, a11_budget()).unwrap();
+        assert!(d2.candidates.is_empty());
+        assert!(d2.losses.is_empty());
+        env.maps = vec![stable_lib(50), prov_mapping(100, 0x1000)];
+        env.events.push_back(alg_bytes(1, 0x5500, 0, 0));
+        env.events.push_back(row_bytes(1, 11, 0x1600, 0x5500, 0, 0));
+        let d3 = core.poll(&mut env, a11_budget()).unwrap();
+        assert!(
+            d3.candidates.is_empty(),
+            "post-flap row must not silently adopt: {:?}",
+            d3.candidates
+        );
+        assert!(
+            d3.losses
+                .iter()
+                .any(|l| l.source == coverage::HOST_STRAGGLER && l.op == Some(1)),
+            "post-flap row must drop loud: {:?}",
+            d3.losses
+        );
+    }
+
+    #[test]
+    fn r20fix2_stable_bracketing_witnesses_continuity() {
+        // Stable bracketing snapshots (A→A, no observed change) let a
+        // row attribute silently — the alternative (gapping every
+        // row) would false-positive on all genuinely-A traffic and
+        // make COMPLETE unreachable. What this CANNOT see — and no
+        // host-side rule can — is within-poll different-path A→B→A
+        // (B in zero snapshots ⟹ session input identical to no-B ⟹
+        // any gap fires on clean traffic too). Same-path churn
+        // between polls is witnessed independently (freshness sweep →
+        // re-emit → capture re-fingerprint + fence). Closing the
+        // different-path sliver needs kernel mapping events.
+        let mut env = MiniEnv::new();
+        env.maps = vec![stable_lib(50), prov_mapping(100, 0x1000)];
+        env.events.push_back(alg_bytes(1, 0x5500, 0, 0));
+        env.events.push_back(row_bytes(1, 11, 0x1600, 0x5500, 0, 0));
+        let mut core = a11_core();
+        let d1 = core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(d1.candidates.len(), 1);
+        // Second poll, same maps, fresh row: silent attribution.
+        env.events.push_back(alg_bytes(1, 0x5500, 0, 0));
+        env.events.push_back(row_bytes(1, 11, 0x1600, 0x5500, 0, 0));
+        let d2 = core.poll(&mut env, a11_budget()).unwrap();
+        assert!(d2.losses.is_empty());
     }
 }

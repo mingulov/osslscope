@@ -54,7 +54,7 @@ use crate::evidence::{
     OpensslVersion, ScopeCoverage, SiteExecution, SiteKey, TargetRecord,
 };
 use crate::{args, kinds, pin, plan, target};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -737,8 +737,11 @@ impl LifecyclePort for PollingLifecycle {
 
 /// Proc-connector group: process events.
 const CN_IDX_PROC: u32 = 1;
-/// Proc-connector command: (un)subscribe.
+/// Proc-connector commands: subscribe / unsubscribe (uapi
+/// `proc_cn_mcast_op` — IGNORE is 2, not 0; 0 hits `default: EINVAL`
+/// and unsubscribes nothing).
 const PROC_CN_MCAST_LISTEN: u32 = 1;
+const PROC_CN_MCAST_IGNORE: u32 = 2;
 /// Proc-connector event value (numerically 1, like the listen
 /// command above — a distinct constant for readability).
 const CN_VAL_PROC: u32 = 1;
@@ -748,6 +751,12 @@ const CN_VAL_PROC: u32 = 1;
 const PROC_EVENT_FORK: u32 = 1;
 const PROC_EVENT_EXEC: u32 = 2;
 const PROC_EVENT_EXIT: u32 = 0x8000_0000;
+/// Connector acknowledgement marker (uapi `proc_cn_event`): the
+/// kernel answers (un)subscribe with a `PROC_EVENT_NONE` message
+/// whose `event_data.ack.err` (first union u32, positive errno,
+/// 0 = accepted) is the registration verdict. Namespaces the kernel
+/// ignores answer with NOTHING (silence, not an error ack).
+const PROC_EVENT_NONE: u32 = 0;
 /// Netlink message header length + ACK/error type. Note the
 /// connector marks event datagrams `NLMSG_DONE` (3, verified live)
 /// — every non-error message on this dedicated socket is a
@@ -757,8 +766,15 @@ const NLMSG_HDRLEN: usize = 16;
 const NLMSG_ERROR: u16 = 2;
 /// Connector message header length (`cn_msg` without payload).
 const CN_HDRLEN: usize = 20;
+/// `cn_msg` field offsets (uapi `struct cn_msg`: idx, val, seq, ack,
+/// len, flags): seq carries the kernel's per-CPU continuity counter,
+/// ack the (un)subscribe correlation echo.
+const CN_SEQ_OFF: usize = 8;
+const CN_ACK_OFF: usize = 12;
 /// `proc_event` fixed prefix (`what`, `cpu`, `timestamp_ns`) length.
 const PROC_EVENT_HDRLEN: usize = 16;
+/// `proc_event.cpu` offset (the seq counter's per-CPU lane).
+const PROC_EVENT_CPU_OFF: usize = 4;
 /// Bounded drain: datagrams consumed per `poll` / per close round.
 /// Fork/exec/exit are rare (a quiet window drains in one call);
 /// the cap bounds poll latency under system-wide fork storms, and
@@ -772,6 +788,17 @@ const CLOSE_DRAIN_ROUNDS: u32 = 4;
 /// Socket receive buffer target (best-effort: uncapped kernels
 /// clamp it; drops stay exactly accounted either way).
 const CONNECTOR_RCVBUF: libc::c_int = 1 << 20;
+/// Bounded subscription-acceptance wait: the kernel acks LISTEN via
+/// workqueue multicast (millisecond-scale); silence past this bound
+/// (ignored namespace, lost ack) fails the subscribe — never an
+/// assumed-clean witness.
+const SUBSCRIBE_ACK_TIMEOUT: Duration = Duration::from_secs(2);
+/// Subscribe-wait stash caps (datagrams arriving before the ack are
+/// replayed into the first drain in arrival order — witnesses, never
+/// dropped): a storm past either cap bails to loud fallback instead
+/// of an unwitnessable prefix.
+const SUBSCRIBE_STASH_MAX_MSGS: usize = 256;
+const SUBSCRIBE_STASH_MAX_BYTES: usize = 4 << 20;
 
 fn le_u32_at(b: &[u8], off: usize) -> Option<u32> {
     b.get(off..off + 4)
@@ -816,6 +843,151 @@ fn socket_has_pending(fd: &OwnedFd) -> bool {
     r != 0 || pending > 0
 }
 
+/// One (un)subscribe request: nlmsghdr + cn_msg + bare u32 op (a
+/// 4-byte payload makes the kernel treat the data as a bare
+/// `proc_cn_mcast_op` with `ev_type = ALL` — unfiltered delivery).
+/// `ack` is our correlation nonce (the kernel echoes ack+1 on its
+/// NONE acknowledgement, distinguishing ours from other
+/// subscribers' acks on the shared multicast group).
+fn mcast_msg(op: u32, ack: u32) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(NLMSG_HDRLEN + CN_HDRLEN + 4);
+    let total = (NLMSG_HDRLEN + CN_HDRLEN + 4) as u32;
+    msg.extend_from_slice(&total.to_le_bytes());
+    msg.extend_from_slice(&0u16.to_le_bytes());
+    msg.extend_from_slice(&0u16.to_le_bytes());
+    msg.extend_from_slice(&0u32.to_le_bytes());
+    msg.extend_from_slice(&std::process::id().to_le_bytes());
+    msg.extend_from_slice(&CN_IDX_PROC.to_le_bytes());
+    msg.extend_from_slice(&CN_VAL_PROC.to_le_bytes());
+    msg.extend_from_slice(&0u32.to_le_bytes());
+    msg.extend_from_slice(&ack.to_le_bytes());
+    msg.extend_from_slice(&4u16.to_le_bytes());
+    msg.extend_from_slice(&0u16.to_le_bytes());
+    msg.extend_from_slice(&op.to_le_bytes());
+    msg
+}
+
+fn send_connector(fd: &OwnedFd, msg: &[u8]) -> anyhow::Result<()> {
+    let sent = unsafe {
+        libc::send(
+            fd.as_raw_fd(),
+            msg.as_ptr() as *const libc::c_void,
+            msg.len(),
+            0,
+        )
+    };
+    if sent < 0 {
+        anyhow::bail!("connector send: {}", std::io::Error::last_os_error());
+    }
+    if (sent as usize) != msg.len() {
+        anyhow::bail!("connector short send ({sent} of {})", msg.len());
+    }
+    Ok(())
+}
+
+/// Per-CPU kernel sequence continuity: the kernel numbers every proc
+/// message per sending CPU (`send_msg`, strictly +1 — including
+/// ignored `what` values and NONE acks, which also consume a seq).
+/// A hole is signals never received — pre-delivery allocation
+/// failure (`GFP_NOWAIT` in `cn_netlink_send`) or socket overrun —
+/// counted exact into `dropped` (kernel-side missing signals, the
+/// same witness class as the socket Drops delta; one loss event may
+/// appear in both counters — an upper bound, fail-closed, never an
+/// under-count). First sightings baseline (per-CPU counters start at
+/// boot; mid-stream subscribes join at arbitrary seqs); a repeated
+/// or backward seq is a corrupt stream (scan loss, no advance).
+#[derive(Debug, Default)]
+struct SeqState {
+    last: HashMap<u32, u32>,
+}
+
+impl SeqState {
+    fn observe(&mut self, cpu: u32, seq: u32, delta: &mut LifecycleDelta) {
+        let Some(prev) = self.last.get(&cpu).copied() else {
+            self.last.insert(cpu, seq);
+            return;
+        };
+        let step = seq.wrapping_sub(prev);
+        if step == 1 {
+            self.last.insert(cpu, seq);
+        } else if step == 0 {
+            delta.loss += 1;
+        } else if step <= u32::MAX / 2 {
+            delta.dropped = delta.dropped.saturating_add(u64::from(step) - 1);
+            self.last.insert(cpu, seq);
+        } else {
+            delta.loss += 1;
+        }
+    }
+}
+
+/// Subscription-acceptance scan of one received datagram: our ack is
+/// the NONE message echoing our correlation ack+1 (its err field is
+/// the registration verdict); a nonzero NLMSG_ERROR is a transport
+/// rejection. A transport error wins over a co-bundled ack
+/// (fail-closed: the request path reported failure).
+enum AckScan {
+    Absent,
+    Ours(u32),
+    TransportError(i32),
+}
+
+fn scan_ack(buf: &[u8], our_ack: u32) -> AckScan {
+    let mut off = 0usize;
+    let mut ours = None;
+    while off + NLMSG_HDRLEN <= buf.len() {
+        let (Some(len), Some(typ)) = (
+            le_u32_at(buf, off).map(|l| l as usize),
+            le_u32_at(buf, off + 4).map(|t| t as u16),
+        ) else {
+            return AckScan::Absent;
+        };
+        if len < NLMSG_HDRLEN || off + len > buf.len() {
+            return AckScan::Absent;
+        }
+        let body = &buf[off + NLMSG_HDRLEN..off + len];
+        if typ == NLMSG_ERROR {
+            match le_i32_at(body, 0) {
+                Some(0) | None => {}
+                Some(e) => return AckScan::TransportError(e),
+            }
+        } else if body.len() >= CN_HDRLEN + PROC_EVENT_HDRLEN
+            && le_u32_at(body, 0) == Some(CN_IDX_PROC)
+            && le_u32_at(body, 4) == Some(CN_VAL_PROC)
+            && le_u32_at(body, CN_ACK_OFF) == Some(our_ack)
+        {
+            let ev = &body[CN_HDRLEN..];
+            if le_u32_at(ev, 0) == Some(PROC_EVENT_NONE) {
+                match le_u32_at(ev, PROC_EVENT_HDRLEN) {
+                    // Malformed ack: unproven, keep waiting — the
+                    // bound bails (a corrupt single ack must not
+                    // manufacture acceptance).
+                    None => {}
+                    Some(err) => ours = Some(err),
+                }
+            }
+        }
+        off += (len + 3) & !3;
+    }
+    match ours {
+        Some(err) => AckScan::Ours(err),
+        None => AckScan::Absent,
+    }
+}
+
+/// Drops-table fold: `(new_baseline, fresh_drops, blind)`. An
+/// unreadable table is accounting blindness (loss, never assumed
+/// zero); a first read after subscribe-time blindness re-anchors
+/// WITHOUT backfilling (the blind interval's drops are unknowable —
+/// the blindness loss already withholds COMPLETE).
+fn drops_delta(baseline: Option<u64>, cur: Option<u64>) -> (Option<u64>, u64, bool) {
+    match (baseline, cur) {
+        (_, None) => (baseline, 0, true),
+        (Some(b), Some(c)) => (Some(c), c.saturating_sub(b), false),
+        (None, Some(c)) => (Some(c), 0, true),
+    }
+}
+
 /// Kernel-observed lifecycle port: fork/exec/exit pushed by the
 /// kernel over NETLINK_CONNECTOR, filtered to the target subtree
 /// (target tgid + fork-observed descendants; grandchildren join by
@@ -823,13 +995,19 @@ fn socket_has_pending(fd: &OwnedFd) -> bool {
 /// Same-tgid clones are thread creation (non-events, like polling);
 /// exits are non-events (never pruned — an EXIT never proves its
 /// group dead); the target's own exit is custody's verdict.
+/// Registration is balanced (Drop unsubscribes) and validated (the
+/// kernel's NONE ack must accept before any witness is trusted).
 pub struct KernelLifecycle {
     fd: OwnedFd,
     sock_inode: u64,
     target_pid: u32,
     target_tgid: u32,
     known: HashSet<u32>,
-    drops_baseline: u64,
+    seqs: SeqState,
+    drops_baseline: Option<u64>,
+    mcast_ack: u32,
+    pending_rx: VecDeque<Vec<u8>>,
+    wait_enobufs: bool,
     subscribed_ns: u64,
     dead: bool,
 }
@@ -838,7 +1016,10 @@ impl KernelLifecycle {
     /// Subscribe to process events for `target`'s thread group.
     /// Fails (caller falls back to polling, explicit PARTIAL) when
     /// the target has no readable tgid, the socket/bind/send fails,
-    /// or the fd cannot go nonblocking.
+    /// the fd cannot go nonblocking, or the kernel does not ACCEPT
+    /// the subscription (see [`Self::await_acceptance`]): a sent
+    /// LISTEN alone proves nothing (ignored namespaces answer with
+    /// silence, failed registrations with a nonzero NONE ack).
     pub fn subscribe(target: u32) -> anyhow::Result<Self> {
         let tgid = tgid_of(target)
             .ok_or_else(|| anyhow::anyhow!("target {target} has no readable Tgid"))?;
@@ -873,7 +1054,12 @@ impl KernelLifecycle {
         };
         let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
         addr.nl_family = libc::AF_NETLINK as u16;
-        addr.nl_pid = std::process::id();
+        // Autobind (nl_pid 0): several observer sockets may coexist
+        // in one process (probe + holder + session) — a fixed pid
+        // would collide with EADDRINUSE. Nothing keys on the portid
+        // (Drops rows match by socket inode; acks return by
+        // multicast, not unicast).
+        addr.nl_pid = 0;
         addr.nl_groups = CN_IDX_PROC;
         let bound = unsafe {
             libc::bind(
@@ -885,32 +1071,6 @@ impl KernelLifecycle {
         if bound < 0 {
             anyhow::bail!("connector bind: {}", std::io::Error::last_os_error());
         }
-        // PROC_CN_MCAST_LISTEN(1): nlmsghdr + cn_msg + u32 listen.
-        let mut msg = Vec::with_capacity(NLMSG_HDRLEN + CN_HDRLEN + 4);
-        let total = (NLMSG_HDRLEN + CN_HDRLEN + 4) as u32;
-        msg.extend_from_slice(&total.to_le_bytes());
-        msg.extend_from_slice(&0u16.to_le_bytes());
-        msg.extend_from_slice(&0u16.to_le_bytes());
-        msg.extend_from_slice(&0u32.to_le_bytes());
-        msg.extend_from_slice(&std::process::id().to_le_bytes());
-        msg.extend_from_slice(&CN_IDX_PROC.to_le_bytes());
-        msg.extend_from_slice(&PROC_CN_MCAST_LISTEN.to_le_bytes());
-        msg.extend_from_slice(&0u32.to_le_bytes());
-        msg.extend_from_slice(&0u32.to_le_bytes());
-        msg.extend_from_slice(&4u16.to_le_bytes());
-        msg.extend_from_slice(&0u16.to_le_bytes());
-        msg.extend_from_slice(&1u32.to_le_bytes());
-        let sent = unsafe {
-            libc::send(
-                fd.as_raw_fd(),
-                msg.as_ptr() as *const libc::c_void,
-                msg.len(),
-                0,
-            )
-        };
-        if sent < 0 {
-            anyhow::bail!("connector listen: {}", std::io::Error::last_os_error());
-        }
         let sock_inode = {
             let mut st: libc::stat = unsafe { std::mem::zeroed() };
             if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } < 0 {
@@ -918,7 +1078,25 @@ impl KernelLifecycle {
             }
             st.st_ino
         };
-        let drops_baseline = socket_drops(sock_inode).unwrap_or(0);
+        // Baseline BEFORE the LISTEN send: drops during the
+        // acceptance wait are already our loss (the subscription may
+        // activate mid-wait), and must not hide inside the baseline.
+        let drops_baseline = socket_drops(sock_inode);
+        let mcast_ack = std::process::id();
+        send_connector(&fd, &mcast_msg(PROC_CN_MCAST_LISTEN, mcast_ack))
+            .map_err(|e| e.context("connector listen"))?;
+        // Acceptance wait (bounded): a sent LISTEN is not coverage.
+        // Any wait failure cleans up best-effort (the LISTEN may
+        // have registered before its ack was lost — balance it)
+        // before bailing to loud fallback.
+        let (pending_rx, wait_enobufs) =
+            match Self::await_acceptance(&fd, mcast_ack.wrapping_add(1)) {
+                Ok(prefix) => prefix,
+                Err(e) => {
+                    let _ = send_connector(&fd, &mcast_msg(PROC_CN_MCAST_IGNORE, mcast_ack));
+                    return Err(e);
+                }
+            };
         let mut known = HashSet::new();
         known.insert(tgid);
         Ok(Self {
@@ -927,10 +1105,112 @@ impl KernelLifecycle {
             target_pid: target,
             target_tgid: tgid,
             known,
+            seqs: SeqState::default(),
             drops_baseline,
+            mcast_ack,
+            pending_rx,
+            wait_enobufs,
             subscribed_ns: ClockPort::monotonic_ns(&LiveClock),
             dead: false,
         })
+    }
+
+    /// Await the kernel's acceptance of our LISTEN: the NONE ack
+    /// echoing our correlation ack with err == 0. Namespaces the
+    /// kernel ignores answer with silence (timeout → bail);
+    /// registration failures answer with err != 0 (bail); transport
+    /// errors bail. Datagrams arriving before the ack are STASHED
+    /// (replayed into the first drain in arrival order — the
+    /// subscription may already be live, so they are witnesses, and
+    /// the ack itself stays stashed so per-CPU continuity observes
+    /// the unbroken stream). A storm past the stash caps bails (an
+    /// unwitnessable prefix must not become a clean baseline).
+    fn await_acceptance(fd: &OwnedFd, our_ack: u32) -> anyhow::Result<(VecDeque<Vec<u8>>, bool)> {
+        let mut stash: VecDeque<Vec<u8>> = VecDeque::new();
+        let mut stashed_bytes = 0usize;
+        let mut wait_enobufs = false;
+        let mut buf = vec![0u8; 65536];
+        let t0 = Instant::now();
+        'wait: loop {
+            if t0.elapsed() > SUBSCRIBE_ACK_TIMEOUT {
+                anyhow::bail!(
+                    "connector subscribe not acknowledged within {SUBSCRIBE_ACK_TIMEOUT:?} \
+                     (unsupported namespace answers with silence)"
+                );
+            }
+            let mut pfd = libc::pollfd {
+                fd: fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let pr = unsafe { libc::poll(&mut pfd, 1, 50) };
+            if pr < 0 {
+                let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                if e == libc::EINTR {
+                    continue;
+                }
+                anyhow::bail!("connector accept poll: {}", std::io::Error::last_os_error());
+            }
+            if pr == 0 {
+                continue;
+            }
+            loop {
+                let r = unsafe {
+                    libc::recv(
+                        fd.as_raw_fd(),
+                        buf.as_mut_ptr() as *mut libc::c_void,
+                        buf.len(),
+                        libc::MSG_DONTWAIT,
+                    )
+                };
+                if r < 0 {
+                    let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                    if e == libc::EAGAIN || e == libc::EWOULDBLOCK {
+                        break;
+                    }
+                    if e == libc::ENOBUFS {
+                        wait_enobufs = true;
+                        continue;
+                    }
+                    anyhow::bail!("connector accept recv: {}", std::io::Error::last_os_error());
+                }
+                if r == 0 {
+                    break;
+                }
+                let bytes = buf[..r as usize].to_vec();
+                match scan_ack(&bytes, our_ack) {
+                    AckScan::Ours(0) => {
+                        stash.push_back(bytes);
+                        break 'wait;
+                    }
+                    AckScan::Ours(err) => {
+                        anyhow::bail!("connector rejected subscribe (err={err})");
+                    }
+                    AckScan::TransportError(e) => {
+                        anyhow::bail!("connector subscribe transport error ({e})");
+                    }
+                    AckScan::Absent => {
+                        stashed_bytes += bytes.len();
+                        stash.push_back(bytes);
+                        if stash.len() > SUBSCRIBE_STASH_MAX_MSGS
+                            || stashed_bytes > SUBSCRIBE_STASH_MAX_BYTES
+                        {
+                            anyhow::bail!("connector subscribe storm during acceptance wait");
+                        }
+                    }
+                }
+            }
+        }
+        Ok((stash, wait_enobufs))
+    }
+
+    /// Unsubscribe (IGNORE): balances the LISTEN registration count
+    /// so proc-event generation stops when the observer leaves. The
+    /// kernel guards repeats (IGNORE-after-IGNORE is a no-op), so
+    /// this is safe ahead of Drop.
+    pub fn unsubscribe(&mut self) -> anyhow::Result<()> {
+        send_connector(&self.fd, &mcast_msg(PROC_CN_MCAST_IGNORE, self.mcast_ack))
+            .map_err(|e| e.context("connector unsubscribe"))
     }
 
     /// Monotonic subscription instant (ordering evidence: production
@@ -943,15 +1223,22 @@ impl KernelLifecycle {
     /// Ingest one connector payload (`cn_msg` body): filter to the
     /// target subtree, map fork/exec to events, ignore exits (never
     /// pruned — see the EXIT arm). Malformed records are host-side
-    /// observation uncertainty (scan loss), never silent skips. Non-fork/exec/
-    /// exit `what` values (uid/gid/sid/ptrace/comm/coredump — plus
-    /// the all-zero registration artifact the kernel emits at
-    /// listen time) create no processes and replace no images, so
-    /// no uncaptured execution can hide behind them: ignored.
+    /// observation uncertainty (scan loss), never silent skips.
+    /// EVERY valid proc message feeds per-CPU sequence continuity
+    /// (ignored `what` values and NONE acks consume kernel seqs too —
+    /// skipping them would manufacture false gaps). NONE messages
+    /// echoing our correlation ack carry OUR registration verdict
+    /// (err != 0 fails closed); other subscribers' acks ride the
+    /// shared group — continuity-tracked, verdict ignored. All other
+    /// non-fork/exec/exit `what` values (uid/gid/sid/ptrace/comm/
+    /// coredump) create no processes and replace no images, so no
+    /// uncaptured execution can hide behind them: ignored.
     fn ingest_cn(
         known: &mut HashSet<u32>,
+        seqs: &mut SeqState,
         target_pid: u32,
         target_tgid: u32,
+        our_ack: u32,
         body: &[u8],
         delta: &mut LifecycleDelta,
     ) {
@@ -967,11 +1254,25 @@ impl KernelLifecycle {
             return;
         }
         let ev = &body[CN_HDRLEN..];
-        let Some(what) = le_u32_at(ev, 0) else {
+        let (Some(what), Some(cpu), Some(seq), Some(ack)) = (
+            le_u32_at(ev, 0),
+            le_u32_at(ev, PROC_EVENT_CPU_OFF),
+            le_u32_at(body, CN_SEQ_OFF),
+            le_u32_at(body, CN_ACK_OFF),
+        ) else {
             delta.loss += 1;
             return;
         };
+        seqs.observe(cpu, seq, delta);
         match what {
+            PROC_EVENT_NONE => {
+                if ack == our_ack {
+                    match le_u32_at(ev, PROC_EVENT_HDRLEN) {
+                        Some(0) => {}
+                        _ => delta.loss += 1,
+                    }
+                }
+            }
             PROC_EVENT_FORK => {
                 // parent_pid, parent_tgid, child_pid, child_tgid.
                 let (Some(parent_tgid), Some(child_pid), Some(child_tgid)) = (
@@ -1034,8 +1335,10 @@ impl KernelLifecycle {
     /// group; the `cn_msg` idx/val check rejects strays).
     fn ingest_datagram(
         known: &mut HashSet<u32>,
+        seqs: &mut SeqState,
         target_pid: u32,
         target_tgid: u32,
+        our_ack: u32,
         buf: &[u8],
         delta: &mut LifecycleDelta,
     ) {
@@ -1061,7 +1364,7 @@ impl KernelLifecycle {
                     _ => delta.loss += 1,
                 }
             } else {
-                Self::ingest_cn(known, target_pid, target_tgid, body, delta);
+                Self::ingest_cn(known, seqs, target_pid, target_tgid, our_ack, body, delta);
             }
             consumed_any = true;
             off += (len + 3) & !3;
@@ -1072,7 +1375,9 @@ impl KernelLifecycle {
     }
 
     /// Bounded drain into `delta` (at most `max_records`
-    /// datagrams): events filter to the subtree, kernel drops ride
+    /// datagrams): the subscribe-wait stash replays first (FIFO —
+    /// arrival order preserved, continuity unbroken), then the
+    /// socket. Events filter to the subtree, kernel drops ride
     /// exact via the Drops delta (ENOBUFS backstops a same-poll
     /// counter race with an at-least-one), an unreadable Drops
     /// table fails closed to scan loss, and a nonempty tail after
@@ -1082,8 +1387,24 @@ impl KernelLifecycle {
             delta.loss += 1;
             return;
         }
-        let mut buf = vec![0u8; 65536];
+        let our_ack = self.mcast_ack.wrapping_add(1);
         let mut records = 0usize;
+        while records < max_records {
+            let Some(bytes) = self.pending_rx.pop_front() else {
+                break;
+            };
+            Self::ingest_datagram(
+                &mut self.known,
+                &mut self.seqs,
+                self.target_pid,
+                self.target_tgid,
+                our_ack,
+                &bytes,
+                delta,
+            );
+            records += 1;
+        }
+        let mut buf = vec![0u8; 65536];
         let mut enobufs = false;
         loop {
             if records >= max_records {
@@ -1117,34 +1438,42 @@ impl KernelLifecycle {
             }
             Self::ingest_datagram(
                 &mut self.known,
+                &mut self.seqs,
                 self.target_pid,
                 self.target_tgid,
+                our_ack,
                 &buf[..r as usize],
                 delta,
             );
             records += 1;
         }
-        match socket_drops(self.sock_inode) {
-            Some(cur) => {
-                let fresh = cur.saturating_sub(self.drops_baseline);
-                self.drops_baseline = cur;
-                delta.dropped = delta.dropped.saturating_add(fresh);
-                if enobufs && fresh == 0 {
-                    // Overrun proven, counter unmoved (same-poll
-                    // read race): at-least-one.
-                    delta.dropped = delta.dropped.saturating_add(1);
-                }
-            }
-            None => {
-                // Accounting blind: cannot prove no-loss.
-                delta.loss += 1;
-                if enobufs {
-                    delta.dropped = delta.dropped.saturating_add(1);
-                }
-            }
+        let (baseline, fresh, blind) =
+            drops_delta(self.drops_baseline, socket_drops(self.sock_inode));
+        self.drops_baseline = baseline;
+        delta.dropped = delta.dropped.saturating_add(fresh);
+        if blind {
+            // Accounting blind: cannot prove no-loss.
+            delta.loss += 1;
         }
-        if records >= max_records && socket_has_pending(&self.fd) {
+        if (enobufs || std::mem::replace(&mut self.wait_enobufs, false)) && fresh == 0 {
+            // Overrun proven, counter unmoved (same-poll read race
+            // or a wait-period overrun): at-least-one.
+            delta.dropped = delta.dropped.saturating_add(1);
+        }
+        if records >= max_records && (!self.pending_rx.is_empty() || socket_has_pending(&self.fd)) {
             delta.pending = 1;
+        }
+    }
+}
+
+impl Drop for KernelLifecycle {
+    /// Balance the LISTEN registration (socket release alone does
+    /// not decrement the kernel's listener count — generation would
+    /// stay enabled after the observer exits). Best-effort: a failed
+    /// send is loud on stderr, never a panic.
+    fn drop(&mut self) {
+        if let Err(e) = self.unsubscribe() {
+            eprintln!("lifecycle: connector unsubscribe failed ({e:#})");
         }
     }
 }
@@ -1940,6 +2269,15 @@ pub struct AdapterCtx<'a> {
     /// late-attach loss (the settle phase is the accepted
     /// query→attach residual, documented like the drain residual).
     pub post_settle: bool,
+    /// Owned target released (R20-fix round 2, F7): a post-release
+    /// first-attach of a LONG-PRESENT site (mapped at release) is a
+    /// readiness gap — the [release, attach] sub-window executed
+    /// without a probe — even inside the settle grace (which now
+    /// covers only genuinely fresh mappings). The baseline poll
+    /// runs pre-release and always sets false; --pid rounds set
+    /// false (acquire-then-attach is unavoidable there, and the
+    /// pid-prewindow-blind reason already withholds COMPLETE).
+    pub post_release: bool,
     /// Baselining poll: tripwire news is pre-window and dropped;
     /// queries are pre-window (cold gap), never in-window arrivals.
     pub baseline: bool,
@@ -2342,8 +2680,14 @@ pub fn adapt_delta(
                 touched.insert(triple, site);
             }
         }
-        // Late-attach classification for first emits past settle.
-        if first_emit && ctx.post_settle {
+        // Late-attach classification for first emits past settle
+        // — or past the release boundary (R20-fix round 2, F7): an
+        // owned post-release attach of a long-present site missed
+        // the [release, attach] sub-window (a boundary call then is
+        // uncaptured), so the settle no longer suppresses it; only
+        // genuinely fresh mappings (nothing to miss before they
+        // existed) stay Activity.
+        if first_emit && (ctx.post_settle || ctx.post_release) {
             if ctx.fresh.contains(&(dev_str, ino)) {
                 fresh_mapped += 1;
             } else {
@@ -2638,6 +2982,13 @@ struct Runner<'x, D, B: CountBackend, T, L, C: ClockPort, P: ProcPort> {
     /// Exec witnesses past the last fence opportunity (final sweep
     /// and close drain): the tail may mix pre/post-exec identity.
     lifecycle_exec_gap: u64,
+    /// Outstanding exec obligation (R20-fix round 2, F3): exec
+    /// witnesses a round consumed but did not fence (the round
+    /// returned on cancellation or deadline before applying its
+    /// kinds). Persisted on the runner — never in round-locals —
+    /// so the consumed witness survives to the close drain, which
+    /// converts it to an exec gap. Cleared when a fence applies.
+    pending_exec_obligation: u64,
     maps_read_failed: u64,
     scan_budget_exhaustions: u64,
     provider_changed_fences: u64,
@@ -3192,6 +3543,14 @@ where
         if Self::exec_witnesses(&sweep) > 0 && !kinds.contains(&FenceKind::Exec) {
             kinds.push(FenceKind::Exec);
         }
+        // Persist the exec obligation BEFORE the early returns
+        // below (R20-fix round 2, F3): a witness consumed here must
+        // survive a cancellation/deadline return to the close
+        // drain (which converts it to an exec gap) — a round-local
+        // would evaporate with `kinds`.
+        self.pending_exec_obligation = self
+            .pending_exec_obligation
+            .saturating_add(Self::exec_witnesses(&sweep));
         // Slow metadata work above (fence snapshots, lifecycle
         // scan — file reads moved per-poll below, F-D/A13) may have
         // crossed the deadline — or a signal may have landed —
@@ -3222,6 +3581,10 @@ where
                 pinned_provider: pinned,
                 fresh: &fresh,
                 post_settle,
+                // Rounds run post-release; --pid has no release
+                // boundary (its pre-acquire blindness already
+                // withholds COMPLETE).
+                post_release: self.info.owned,
                 baseline: false,
             };
             let (exhausted, fence) = self.apply_delta(&delta, poll_end, &ctx, Some(deadline))?;
@@ -3253,6 +3616,13 @@ where
         };
         if let Some(reason) = fence_reason {
             self.count.fence(reason)?;
+            // The fence consumed this round's witness (F3): one
+            // fence per round covers the round's exec-ness (local
+            // or snapshot-sourced — either versions the
+            // generation), so the persisted obligation clears.
+            if kinds.contains(&FenceKind::Exec) {
+                self.pending_exec_obligation = 0;
+            }
         }
         if kinds.contains(&FenceKind::ProviderChanged) {
             self.provider_changed_fences += 1;
@@ -3265,6 +3635,12 @@ where
     /// cleanup, cleanup failures chained onto the original error);
     /// once observing, it salvages into a fatal-Runtime capture.
     fn fail(mut self, err: anyhow::Error) -> anyhow::Result<Capture> {
+        // Outstanding exec obligation (F3): a consumed-but-unfenced
+        // witness rides into salvage as a gap (the fatal verdict
+        // dominates, but the lost transition stays exact).
+        self.lifecycle_exec_gap = self
+            .lifecycle_exec_gap
+            .saturating_add(std::mem::replace(&mut self.pending_exec_obligation, 0));
         if self.observation_started {
             let effective_end_ns = self.clock.monotonic_ns().min(self.kernel_deadline_ns);
             return Ok(self.salvage(
@@ -3637,6 +4013,7 @@ where
         lifecycle_no_witness: 0,
         lifecycle_pending: 0,
         lifecycle_exec_gap: 0,
+        pending_exec_obligation: 0,
         maps_read_failed: 0,
         scan_budget_exhaustions: 0,
         provider_changed_fences: 0,
@@ -3713,6 +4090,10 @@ where
                 pinned_provider: pinned,
                 fresh: &fresh,
                 post_settle: false,
+                // The baseline poll runs pre-release (the child is
+                // still stopped): attaches here ARE the ready
+                // boundary, never late.
+                post_release: false,
                 baseline: true,
             };
             self.apply_delta(&delta, poll_end, &ctx, None)
@@ -3936,6 +4317,16 @@ where
                 .lifecycle_exec_gap
                 .saturating_add(Self::exec_witnesses(&drained));
         }
+        // Outstanding exec obligation (R20-fix round 2, F3): a
+        // round consumed this witness but returned on
+        // cancellation/deadline before fencing — no generation
+        // left to version into, so it gaps (the reaped-at-expiry
+        // path included: the carve-out from over-budget stays,
+        // since the target died in-window, but the lost
+        // transition still records here).
+        self.lifecycle_exec_gap = self
+            .lifecycle_exec_gap
+            .saturating_add(std::mem::replace(&mut self.pending_exec_obligation, 0));
         // TEST HOOK (exit-3 kernel-proof): hold the final drain past
         // close so a still-counting kernel would advance last_ns
         // beyond the window edge. Production behavior unchanged when
@@ -5468,6 +5859,12 @@ mod tests {
     /// One connector datagram: nlmsghdr (type 3, like the kernel
     /// marks event datagrams) + cn_msg + `payload`.
     fn cn_datagram(payload: &[u8]) -> Vec<u8> {
+        cn_datagram_seq(payload, 0, 0)
+    }
+
+    /// One connector datagram with explicit cn_msg seq/ack (R20-fix
+    /// round 2, F2: per-CPU sequence continuity + ack correlation).
+    fn cn_datagram_seq(payload: &[u8], seq: u32, ack: u32) -> Vec<u8> {
         let mut b = Vec::new();
         let total = (NLMSG_HDRLEN + CN_HDRLEN + payload.len()) as u32;
         b.extend_from_slice(&total.to_le_bytes());
@@ -5477,8 +5874,8 @@ mod tests {
         b.extend_from_slice(&0u32.to_le_bytes());
         b.extend_from_slice(&CN_IDX_PROC.to_le_bytes());
         b.extend_from_slice(&CN_VAL_PROC.to_le_bytes());
-        b.extend_from_slice(&0u32.to_le_bytes());
-        b.extend_from_slice(&0u32.to_le_bytes());
+        b.extend_from_slice(&seq.to_le_bytes());
+        b.extend_from_slice(&ack.to_le_bytes());
         b.extend_from_slice(&(payload.len() as u16).to_le_bytes());
         b.extend_from_slice(&0u16.to_le_bytes());
         b.extend_from_slice(payload);
@@ -5487,9 +5884,14 @@ mod tests {
 
     /// One `proc_event`: what/cpu/timestamp + u32 union fields.
     fn proc_event(what: u32, fields: &[u32]) -> Vec<u8> {
+        proc_event_cpu(what, 0, fields)
+    }
+
+    /// One `proc_event` on an explicit CPU (F2 continuity).
+    fn proc_event_cpu(what: u32, cpu: u32, fields: &[u32]) -> Vec<u8> {
         let mut b = Vec::new();
         b.extend_from_slice(&what.to_le_bytes());
-        b.extend_from_slice(&0u32.to_le_bytes());
+        b.extend_from_slice(&cpu.to_le_bytes());
         b.extend_from_slice(&0u64.to_le_bytes());
         for f in fields {
             b.extend_from_slice(&f.to_le_bytes());
@@ -5497,9 +5899,23 @@ mod tests {
         b
     }
 
+    /// Concatenate single-message datagrams into one multi-message
+    /// datagram (netlink alignment: every part length is a multiple
+    /// of 4 for even field counts — enforced here).
+    fn multi_datagram(parts: &[Vec<u8>]) -> Vec<u8> {
+        for p in parts {
+            assert_eq!(p.len() % 4, 0, "part must be nlmsg-aligned");
+        }
+        parts.concat()
+    }
+
     fn fresh_ingest(known: &mut HashSet<u32>, buf: &[u8]) -> LifecycleDelta {
+        // Fresh continuity state per call (each crafted datagram is
+        // its own first sighting — continuity ACROSS datagrams is
+        // production state, covered by multi-message datagrams here).
         let mut delta = LifecycleDelta::default();
-        KernelLifecycle::ingest_datagram(known, 100, 100, buf, &mut delta);
+        let mut seqs = SeqState::default();
+        KernelLifecycle::ingest_datagram(known, &mut seqs, 100, 100, TEST_OUR_ACK, buf, &mut delta);
         delta
     }
 
@@ -5626,6 +6042,271 @@ mod tests {
         assert!(d.events.is_empty() && d.loss == 0);
     }
 
+    // ------------------------------------------------------------------
+    // R20-fix round 2, F2: subscription acceptance + (seq, cpu)
+    // continuity. RED tests (fail on FIX_BASE behavior — the decoder
+    // ignores NONE acks and per-CPU sequence entirely).
+    // ------------------------------------------------------------------
+
+    /// Correlated ack for crafted NONE messages (unit-test stand-in
+    /// for the pid+1 the kernel echoes back to our LISTEN).
+    const TEST_OUR_ACK: u32 = 4243;
+
+    #[test]
+    fn kernel_none_ack_error_is_loss_not_silence() {
+        // A connector acknowledgement carrying a nonzero error is a
+        // kernel-reported registration/operation failure — failing
+        // closed (scan loss), never silently ignored.
+        let mut known = HashSet::from([100u32]);
+        let d = fresh_ingest(
+            &mut known,
+            &cn_datagram_seq(&proc_event_cpu(0, 0, &[12, 0, 0, 0]), 9, TEST_OUR_ACK),
+        );
+        assert!(d.events.is_empty());
+        assert_eq!(d.loss, 1, "NONE ack err=12 must taint observation");
+    }
+
+    #[test]
+    fn kernel_percpu_seq_gap_counts_dropped() {
+        // Per-CPU cn_msg seq is gapless per sender (kernel send_msg);
+        // a hole is signals never received (pre-delivery allocation
+        // failure or socket overrun) — kernel-side drops, exact count.
+        let mut known = HashSet::from([100u32]);
+        let buf = multi_datagram(&[
+            cn_datagram_seq(
+                &proc_event_cpu(PROC_EVENT_FORK, 0, &[100, 100, 200, 200]),
+                5,
+                0,
+            ),
+            cn_datagram_seq(
+                &proc_event_cpu(PROC_EVENT_FORK, 0, &[100, 100, 201, 201]),
+                7,
+                0,
+            ),
+        ]);
+        let d = fresh_ingest(&mut known, &buf);
+        assert_eq!(d.events.len(), 2);
+        assert_eq!(d.loss, 0);
+        assert_eq!(d.dropped, 1, "seq 5→7 on cpu0 misses exactly one signal");
+    }
+
+    #[test]
+    fn kernel_percpu_seq_duplicate_and_backward_are_loss() {
+        // A repeated or backward per-CPU seq is a corrupt stream
+        // (the kernel counter strictly increases) — fail closed.
+        let mut known = HashSet::from([100u32]);
+        let dupe = multi_datagram(&[
+            cn_datagram_seq(
+                &proc_event_cpu(PROC_EVENT_FORK, 0, &[100, 100, 200, 200]),
+                5,
+                0,
+            ),
+            cn_datagram_seq(
+                &proc_event_cpu(PROC_EVENT_FORK, 0, &[100, 100, 201, 201]),
+                5,
+                0,
+            ),
+        ]);
+        assert_eq!(fresh_ingest(&mut known, &dupe).loss, 1);
+        let back = multi_datagram(&[
+            cn_datagram_seq(
+                &proc_event_cpu(PROC_EVENT_FORK, 0, &[100, 100, 200, 200]),
+                7,
+                0,
+            ),
+            cn_datagram_seq(
+                &proc_event_cpu(PROC_EVENT_FORK, 0, &[100, 100, 201, 201]),
+                5,
+                0,
+            ),
+        ]);
+        assert_eq!(fresh_ingest(&mut known, &back).loss, 1);
+    }
+
+    #[test]
+    fn kernel_percpu_seq_first_seen_baselines_silently() {
+        // GUARD (passes pre+post — pins no-false-positive): first
+        // sightings per CPU baseline (per-CPU counters start at boot,
+        // mid-stream subscribes join at arbitrary seqs).
+        let mut known = HashSet::from([100u32]);
+        let buf = multi_datagram(&[
+            cn_datagram_seq(
+                &proc_event_cpu(PROC_EVENT_FORK, 0, &[100, 100, 200, 200]),
+                900,
+                0,
+            ),
+            cn_datagram_seq(
+                &proc_event_cpu(PROC_EVENT_FORK, 1, &[100, 100, 201, 201]),
+                5,
+                0,
+            ),
+        ]);
+        let d = fresh_ingest(&mut known, &buf);
+        assert_eq!(d.events.len(), 2);
+        assert_eq!(d.dropped, 0);
+        assert_eq!(d.loss, 0);
+    }
+
+    #[test]
+    fn kernel_none_ack_success_stays_silent() {
+        // GUARD (passes pre+post): a zero-error ack is the expected
+        // subscription receipt — evidence, not loss.
+        let mut known = HashSet::from([100u32]);
+        let d = fresh_ingest(
+            &mut known,
+            &cn_datagram_seq(&proc_event_cpu(0, 0, &[0, 0, 0, 0]), 9, TEST_OUR_ACK),
+        );
+        assert!(d.events.is_empty());
+        assert_eq!(d.dropped, 0);
+        assert_eq!(d.loss, 0);
+    }
+
+    /// Ingest sharing one continuity state across datagrams (the
+    /// production shape — `fresh_ingest` baselines per call).
+    fn seq_ingest(known: &mut HashSet<u32>, seqs: &mut SeqState, buf: &[u8]) -> LifecycleDelta {
+        let mut delta = LifecycleDelta::default();
+        KernelLifecycle::ingest_datagram(known, seqs, 100, 100, TEST_OUR_ACK, buf, &mut delta);
+        delta
+    }
+
+    #[test]
+    fn kernel_foreign_none_ack_err_is_not_ours() {
+        // Another subscriber's failed LISTEN rides our shared group
+        // (continuity-tracked — it consumed a kernel seq) but its
+        // verdict must not taint OUR window.
+        let mut known = HashSet::from([100u32]);
+        let buf = multi_datagram(&[
+            cn_datagram_seq(&proc_event_cpu(0, 0, &[12, 0, 0, 0]), 9, 7),
+            cn_datagram_seq(
+                &proc_event_cpu(PROC_EVENT_FORK, 0, &[100, 100, 200, 200]),
+                10,
+                0,
+            ),
+        ]);
+        let d = fresh_ingest(&mut known, &buf);
+        assert_eq!(d.events.len(), 1);
+        assert_eq!(d.dropped, 0, "foreign ack consumes seq 9 — no gap");
+        assert_eq!(d.loss, 0, "foreign verdict is not our loss");
+    }
+
+    #[test]
+    fn kernel_seq_continuity_spans_datagrams() {
+        // Production drains several datagrams per poll through one
+        // persistent state — a hole across the boundary counts.
+        let mut known = HashSet::from([100u32]);
+        let mut seqs = SeqState::default();
+        let d1 = seq_ingest(
+            &mut known,
+            &mut seqs,
+            &cn_datagram_seq(
+                &proc_event_cpu(PROC_EVENT_FORK, 0, &[100, 100, 200, 200]),
+                5,
+                0,
+            ),
+        );
+        assert_eq!(d1.dropped, 0);
+        assert_eq!(d1.loss, 0);
+        let d2 = seq_ingest(
+            &mut known,
+            &mut seqs,
+            &cn_datagram_seq(
+                &proc_event_cpu(PROC_EVENT_FORK, 0, &[100, 100, 201, 201]),
+                7,
+                0,
+            ),
+        );
+        assert_eq!(d2.dropped, 1);
+        assert_eq!(d2.loss, 0);
+        // And the stream resyncs (no compounding).
+        let d3 = seq_ingest(
+            &mut known,
+            &mut seqs,
+            &cn_datagram_seq(
+                &proc_event_cpu(PROC_EVENT_FORK, 0, &[100, 100, 202, 202]),
+                8,
+                0,
+            ),
+        );
+        assert_eq!(d3.dropped, 0);
+        assert_eq!(d3.loss, 0);
+    }
+
+    #[test]
+    fn kernel_mcast_msg_bytes_are_exact() {
+        // LISTEN / IGNORE wire shape: nlmsghdr + cn_msg + bare op.
+        let pid = std::process::id();
+        let listen = mcast_msg(PROC_CN_MCAST_LISTEN, pid);
+        assert_eq!(listen.len(), NLMSG_HDRLEN + CN_HDRLEN + 4);
+        assert_eq!(u32::from_le_bytes(listen[0..4].try_into().unwrap()), 40);
+        assert_eq!(u32::from_le_bytes(listen[12..16].try_into().unwrap()), pid);
+        assert_eq!(
+            u32::from_le_bytes(listen[16..20].try_into().unwrap()),
+            CN_IDX_PROC
+        );
+        assert_eq!(
+            u32::from_le_bytes(listen[20..24].try_into().unwrap()),
+            CN_VAL_PROC
+        );
+        assert_eq!(u32::from_le_bytes(listen[24..28].try_into().unwrap()), 0);
+        assert_eq!(u32::from_le_bytes(listen[28..32].try_into().unwrap()), pid);
+        assert_eq!(u16::from_le_bytes(listen[32..34].try_into().unwrap()), 4);
+        assert_eq!(
+            u32::from_le_bytes(listen[36..40].try_into().unwrap()),
+            PROC_CN_MCAST_LISTEN
+        );
+        let ignore = mcast_msg(PROC_CN_MCAST_IGNORE, pid);
+        assert_eq!(
+            u32::from_le_bytes(ignore[36..40].try_into().unwrap()),
+            PROC_CN_MCAST_IGNORE
+        );
+        assert_eq!(PROC_CN_MCAST_IGNORE, 2, "uapi op (0 would be EINVAL)");
+    }
+
+    #[test]
+    fn kernel_scan_ack_finds_ours_and_rejects() {
+        let ours_ok = cn_datagram_seq(&proc_event_cpu(0, 0, &[0, 0, 0, 0]), 9, TEST_OUR_ACK);
+        assert!(matches!(scan_ack(&ours_ok, TEST_OUR_ACK), AckScan::Ours(0)));
+        let ours_err = cn_datagram_seq(&proc_event_cpu(0, 0, &[12, 0, 0, 0]), 9, TEST_OUR_ACK);
+        assert!(matches!(
+            scan_ack(&ours_err, TEST_OUR_ACK),
+            AckScan::Ours(12)
+        ));
+        // Foreign ack (another subscriber): not ours.
+        let foreign = cn_datagram_seq(&proc_event_cpu(0, 0, &[0, 0, 0, 0]), 9, 7);
+        assert!(matches!(scan_ack(&foreign, TEST_OUR_ACK), AckScan::Absent));
+        // Plain event: not an ack.
+        let ev = cn_datagram(&proc_event(PROC_EVENT_FORK, &[100, 100, 200, 200]));
+        assert!(matches!(scan_ack(&ev, TEST_OUR_ACK), AckScan::Absent));
+        // Bundled with an event: still found.
+        let bundled = multi_datagram(&[ev, ours_ok]);
+        assert!(matches!(scan_ack(&bundled, TEST_OUR_ACK), AckScan::Ours(0)));
+        // Transport rejection wins.
+        let mut err = Vec::new();
+        err.extend_from_slice(&20u32.to_le_bytes());
+        err.extend_from_slice(&NLMSG_ERROR.to_le_bytes());
+        err.extend_from_slice(&0u16.to_le_bytes());
+        err.extend_from_slice(&0u32.to_le_bytes());
+        err.extend_from_slice(&0u32.to_le_bytes());
+        err.extend_from_slice(&(-5i32).to_le_bytes());
+        assert!(matches!(
+            scan_ack(&err, TEST_OUR_ACK),
+            AckScan::TransportError(-5)
+        ));
+        // Truncated input: unproven, never accepted.
+        assert!(matches!(scan_ack(&[1u8; 7], TEST_OUR_ACK), AckScan::Absent));
+    }
+
+    #[test]
+    fn kernel_drops_delta_folds_blindness() {
+        assert_eq!(drops_delta(Some(10), Some(13)), (Some(13), 3, false));
+        assert_eq!(drops_delta(Some(10), Some(10)), (Some(10), 0, false));
+        assert_eq!(drops_delta(Some(10), None), (Some(10), 0, true));
+        // Blind-then-readable re-anchors WITHOUT backfilling (the
+        // blind interval is unknowable — its loss already fired).
+        assert_eq!(drops_delta(None, Some(13)), (Some(13), 0, true));
+        assert_eq!(drops_delta(None, None), (None, 0, true));
+    }
+
     #[test]
     fn kernel_drops_parser_reads_own_row() {
         let text = "sk Eth Pid Groups Rmem Wmem Dump Locks Drops Inode\n\
@@ -5639,19 +6320,29 @@ mod tests {
 
     #[test]
     fn kernel_select_uses_signals_or_falls_back_loud() {
-        // Live self: the connector subscribes (same assumption as
-        // the real-kernel integration control).
-        assert!(
-            matches!(
-                LiveLifecycle::select(std::process::id()),
-                LiveLifecycle::Kernel(_)
-            ),
-            "select must use kernel signals when available"
-        );
-        // No such pid: tgid unreadable → explicit polling fallback.
+        // No such pid: tgid unreadable → explicit polling fallback
+        // (deterministic contract — unconditional).
         let polled = LiveLifecycle::select(u32::MAX);
         assert!(matches!(polled, LiveLifecycle::Polling(_)));
         assert!(polled.fallback_partial());
+        // Live self: kernel signals where the facility subscribes
+        // (facility-gated — default suites pass where only the
+        // fallback/PARTIAL shape is supported; REQUIRE forces the
+        // live half in proving environments).
+        if std::env::var("OSSLSCOPE_CONNECTOR_TEST").as_deref() == Ok("force-absent") {
+            eprintln!("SKIP kernel half: forced-absent facility gate");
+            return;
+        }
+        match LiveLifecycle::select(std::process::id()) {
+            LiveLifecycle::Kernel(_) => {}
+            LiveLifecycle::Polling(_) => {
+                assert!(
+                    std::env::var("OSSLSCOPE_REQUIRE_CONNECTOR").as_deref() != Ok("1"),
+                    "select must use kernel signals when required"
+                );
+                eprintln!("SKIP kernel half: connector unavailable");
+            }
+        }
     }
 
     #[test]
@@ -5888,6 +6579,7 @@ mod tests {
             pinned_provider: None,
             fresh,
             post_settle: false,
+            post_release: false,
             baseline: false,
         }
     }
@@ -5905,6 +6597,7 @@ mod tests {
                 pinned_provider: None,
                 fresh: &fresh,
                 post_settle: false,
+                post_release: false,
                 baseline: false,
             },
         );
@@ -6348,6 +7041,7 @@ mod tests {
                 }),
                 fresh: &fresh,
                 post_settle: false,
+                post_release: false,
                 baseline: false,
             },
         );
@@ -6397,6 +7091,68 @@ mod tests {
                 pinned_provider: None,
                 fresh: &fresh,
                 post_settle: true,
+                post_release: false,
+                baseline: false,
+            },
+        );
+        assert_eq!(out.delta.discovered.len(), 2);
+        let loss = out
+            .delta
+            .losses
+            .iter()
+            .find(|c| c.name == "discovery.late_attach_sites")
+            .unwrap();
+        assert_eq!(loss.value, 1);
+        let fresh_row = out
+            .activity
+            .iter()
+            .find(|c| c.name == "discovery.new_mapping_sites")
+            .unwrap();
+        assert_eq!(fresh_row.value, 1);
+    }
+
+    #[test]
+    fn adapt_post_release_first_emit_gaps_long_present() {
+        // R20-fix round 2, F7 (adapter level): a first-attach past
+        // the release boundary gaps for long-present sites even
+        // pre-settle; fresh mappings stay Activity.
+        let delta = DiscoveryDelta {
+            candidates: vec![
+                candidate(
+                    "/p/provider.so",
+                    backing("08:01", 7, 0x100),
+                    1,
+                    11,
+                    "SHA-256",
+                    false,
+                    "ok",
+                ),
+                candidate(
+                    "/p/new.so",
+                    backing("08:01", 8, 0x200),
+                    1,
+                    12,
+                    "SHA-512",
+                    false,
+                    "ok",
+                ),
+            ],
+            tables: vec![in_progress(1, 0)],
+            ..DiscoveryDelta::default()
+        };
+        let mut state = AdapterState::default();
+        let files = HashMap::new();
+        let fresh: HashSet<(String, u64)> = HashSet::from([("08:01".to_string(), 8)]);
+        let out = adapt_delta(
+            &mut state,
+            &delta,
+            &AdapterCtx {
+                live: &[],
+                files: &files,
+                pinned_provider: None,
+                fresh: &fresh,
+                post_settle: false,
+                post_release: true,
                 baseline: false,
             },
         );
@@ -6445,6 +7201,7 @@ mod tests {
                 pinned_provider: None,
                 fresh: &fresh,
                 post_settle: false,
+                post_release: false,
                 baseline: true,
             },
         );
@@ -6968,6 +7725,7 @@ mod tests {
                 lifecycle_no_witness: 0,
                 lifecycle_pending: 0,
                 lifecycle_exec_gap: 0,
+                pending_exec_obligation: 0,
                 maps_read_failed: 0,
                 scan_budget_exhaustions: 0,
                 provider_changed_fences: 0,
