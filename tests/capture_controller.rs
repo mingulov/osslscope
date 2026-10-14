@@ -21,7 +21,8 @@ use osslscope::count_session::{
 use osslscope::discovery::maps::Mapping;
 use osslscope::discovery::session::{
     BackingRef, CoverageState, DiscoveredCandidate, DiscoveryDelta, DiscoveryLoss,
-    DiscoverySnapshot, PollBudget, Recycled, TableCoverage, TableRetirement, TripwireDelta,
+    DiscoverySnapshot, MapSnapshots, PollBudget, Recycled, SessionCore, SessionEnv, TableCoverage,
+    TableRetirement, TripwireDelta,
 };
 use osslscope::evidence::{
     CandidateCoverage, Completeness, ExpectedScope, PredicateMatch, match_bounds,
@@ -5277,7 +5278,7 @@ fn bad_read_gap_never_heals_by_recompute() {
 // Live lifecycle fixtures: real pids, real custody, no privileges.
 // ---------------------------------------------------------------------------
 
-use osslscope::capture::{KernelLifecycle, LiveLifecycle, LiveProc, PollingLifecycle};
+use osslscope::capture::{LiveProc, PollingLifecycle};
 use osslscope::target::{
     __test_set_prestop_pid_sink, __test_set_prestop_stall_ms, OwnedTarget, WorkloadDest,
 };
@@ -7452,164 +7453,315 @@ fn count_close_reap_precedes_drain_for_owned_exit() {
 // the real kernel lifecycle adapter (no fakes on the lifecycle path).
 // ---------------------------------------------------------------------------
 
-/// Connector facility gate (R20-fix round 2 MINOR): real-connector
-/// controls run only where the facility subscribes; elsewhere they
-/// skip (pass) unless `OSSLSCOPE_REQUIRE_CONNECTOR=1` forces a hard
-/// failure. `OSSLSCOPE_CONNECTOR_TEST=force-absent` simulates absence
-/// (test hook — proves the skip path where the facility is present).
+/// Connector facility gate (R20-fix rounds 2-3 MINOR — tier 1
+/// lives in target_lifecycle.rs; this file needs tier 2 only):
+/// probed once per process (subscribing runs the initial watermark
+/// burst, so probing per test would spam). Tier 2 needs a working
+/// subscription AND a readable socket Drops row — COMPLETE/zero-loss
+/// tests use it, so supported PARTIAL (drops-blind) environments
+/// skip them instead of failing. Skips (pass) unless
+/// `OSSLSCOPE_REQUIRE_CONNECTOR=1` forces a hard failure.
+/// `OSSLSCOPE_CONNECTOR_TEST=force-absent` simulates absence;
+/// `=force-no-drops` simulates a drops-blind environment (test
+/// hooks — prove the skip paths where the facility is present).
 /// The probe subscribe/unsubscribe pair is balanced (Drop unsubscribes).
-fn connector_present() -> bool {
-    if std::env::var("OSSLSCOPE_CONNECTOR_TEST").as_deref() == Ok("force-absent") {
-        return false;
-    }
-    KernelLifecycle::subscribe(std::process::id()).is_ok()
+fn connector_facility_cached() -> (bool, bool) {
+    use std::sync::OnceLock;
+    static PROBE: OnceLock<(bool, bool)> = OnceLock::new();
+    *PROBE.get_or_init(|| {
+        let hook = std::env::var("OSSLSCOPE_CONNECTOR_TEST").unwrap_or_default();
+        if hook == "force-absent" {
+            return (false, false);
+        }
+        let f = osslscope::capture::connector_facility();
+        if hook == "force-no-drops" {
+            return (f.subscribes, false);
+        }
+        (f.subscribes, f.drops_readable)
+    })
 }
 
-fn require_connector(test: &str) -> bool {
-    if connector_present() {
+fn connector_clean() -> bool {
+    connector_facility_cached() == (true, true)
+}
+
+fn require_clean_connector(test: &str) -> bool {
+    if connector_clean() {
         return true;
     }
     assert!(
         std::env::var("OSSLSCOPE_REQUIRE_CONNECTOR").as_deref() != Ok("1"),
-        "{test} requires a working proc connector (OSSLSCOPE_REQUIRE_CONNECTOR=1)"
+        "{test} requires a working proc connector with readable Drops (OSSLSCOPE_REQUIRE_CONNECTOR=1)"
     );
-    eprintln!("SKIP {test}: proc connector unavailable (fallback/PARTIAL shape unsupported here)");
+    eprintln!("SKIP {test}: connector drops-blind here (supported PARTIAL, not zero-loss)");
     false
 }
 
-/// Real owned child + REAL kernel lifecycle through the real
-/// `observe` loop (scripted discovery/count/proc, injected clock with
-/// wall-clock pacing): the ordinary-production-capture shape with no
-/// fakes on the qualified (lifecycle) path. Returns `None` when the
-/// connector facility is absent (caller skips). Discovery polls are
-/// built inside (against the helper's own staged files): a full
-/// baseline attach plus one round-1 fire plan when asked.
-#[allow(clippy::too_many_arguments)]
-fn live_observe_kernel_lifecycle(
-    test: &str,
-    argv: &[&str],
-    duration: Duration,
-    baseline_attach: bool,
-    round1_fires: Vec<(u64, u64)>,
-) -> Option<(anyhow::Result<Capture>, u32)> {
-    let stage = Stage::fresh(test);
-    let bytes = self_bytes();
-    let off = x_offset(&bytes);
-    let staged = stage.write("prov.so", &bytes);
-    let mut polls = VecDeque::new();
-    if baseline_attach {
-        let cand1 = cand(
-            "/p/provider.so",
-            backing_of(&staged, off),
-            1,
-            11,
-            "SHA-256",
-            false,
-            "ok",
-        );
-        polls.push_back(DiscoveryDelta {
-            candidates: vec![cand1],
-            tables: vec![terminated(1, 0)],
-            trigger_observed: true,
-            ..DiscoveryDelta::default()
-        });
-    } else {
-        polls.push_back(DiscoveryDelta::default());
+// ---------------------------------------------------------------------------
+// R20-fix round 3, F1: a genuinely-observed ordinary window. A plain
+// sleep runs through the production `observe` loop with REAL
+// discovery logic (SessionCore), REAL mappings (live /proc via the
+// production maps reader), REAL time (LiveClock), REAL lifecycle
+// (kernel connector), and REAL counting logic (CountSession) — no
+// fabricated provider mapping, no pre-release attach, no scripted
+// calls. Sleep executes no provider code, so the honest verdict is
+// no-query PARTIAL with genuinely zero calls; every link of that
+// chain is asserted from observed state, not fixtures.
+// Facility boundary (honest, explicit): the BPF event/attach
+// surface is absent on this host (no privileges), so the ring feed
+// is empty and nothing installs — the no-query verdict reports
+// exactly that blindness. Live-BPF qualification is R21 work; the
+// no-provider-mapped structural zero below does not depend on it.
+// Resolution is likewise bypassed (production `run` refuses
+// non-crypto targets at resolve time): R20 owns window-time
+// assurance, and the plan's checkbox 4 explicitly includes
+// fast/no-query programs with honest gaps.
+// ---------------------------------------------------------------------------
+
+/// SessionEnv over LIVE target state with no BPF ring (F1): mappings
+/// via the production maps reader (every snapshot recorded for the
+/// genuineness assertions), identity via a real target pin, file
+/// stats via real metadata. Install/reinstall entry points are
+/// loud tripwires (`unreachable!`): nothing is installable without
+/// the ring, and this window maps no provider (asserted post-hoc
+/// from the recorded snapshots with the core's own predicate) — a
+/// call there fails the test instead of faking an attach.
+struct LiveMapsNoBpfEnv {
+    pid: u32,
+    pin: osslscope::pin::TargetPin,
+    provider: PathBuf,
+    maps_log: Rc<RefCell<Vec<Vec<Mapping>>>>,
+}
+
+impl SessionEnv for LiveMapsNoBpfEnv {
+    fn next_event(&mut self) -> Option<Vec<u8>> {
+        // No BPF ring on this host: genuinely no events (nothing
+        // installed without BPF attach).
+        None
     }
-    polls.push_back(DiscoveryDelta::default());
-    let mut plans = HashMap::new();
-    if !round1_fires.is_empty() {
-        plans.insert(
-            1,
-            FirePlan {
-                fires: round1_fires,
-                shortfall: 0,
-                cancel: false,
-            },
+
+    fn current_maps(&mut self) -> Option<Vec<Mapping>> {
+        let maps = osslscope::discovery::maps::read_maps(self.pid).ok()?;
+        self.maps_log.borrow_mut().push(maps.clone());
+        Some(maps)
+    }
+
+    fn join_maps(&mut self) -> MapSnapshots {
+        MapSnapshots::default()
+    }
+
+    fn install_stage2(
+        &mut self,
+        _cookie: u64,
+        _offset: u64,
+        _path: &std::path::Path,
+        _pid: u32,
+        _expected: Option<(u64, u64)>,
+    ) -> anyhow::Result<()> {
+        unreachable!("no stage-2 installs without ring INITs");
+    }
+
+    fn install_trips(
+        &mut self,
+        _set: &osslscope::discovery::legacy::ProbeSet,
+        _pid: u32,
+        _maps: &[Mapping],
+    ) -> anyhow::Result<Option<String>> {
+        unreachable!("no tripwires without a mapped libcrypto");
+    }
+
+    fn plan_trips(
+        &mut self,
+        maps: &[Mapping],
+    ) -> anyhow::Result<Option<osslscope::discovery::legacy::ProbeSet>> {
+        unreachable!(
+            "plan_trips is gated on mapped libcrypto ({} mappings)",
+            maps.len()
         );
     }
-    let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
-    let mut owned = OwnedTarget::spawn_stopped(&argv, WorkloadDest::Null).unwrap();
-    let pid = owned.pid();
-    // Production order: subscribe while the child is stopped
-    // (pre-release), exactly like `run()` does.
-    let lifecycle = match LiveLifecycle::select(pid) {
-        kernel @ LiveLifecycle::Kernel(_) => kernel,
-        LiveLifecycle::Polling(_) => {
-            let _ = owned.resolve_setup_failure();
-            if std::env::var("OSSLSCOPE_REQUIRE_CONNECTOR").as_deref() == Ok("1") {
-                panic!("{test} requires a working proc connector");
-            }
-            eprintln!("SKIP {test}: proc connector unavailable");
-            return None;
+
+    fn pretouch(&mut self, _cookie: u64, _addr: u64) {}
+
+    fn evict_array_state(&mut self, _arr: u64) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn install_generation(&mut self, _arr: u64, _generation: u64) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn verify_pin(&self) -> anyhow::Result<()> {
+        self.pin.verify().map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    fn quiesce(&mut self) {}
+
+    fn link_counts(&self) -> (u64, u64) {
+        (0, 0)
+    }
+
+    fn detach_trips(&mut self) {}
+
+    fn detach_dispatch_anchors(&mut self) {}
+
+    fn detach_stage2(&mut self, _cookie: u64) {}
+
+    fn reinstall_dispatch(
+        &mut self,
+    ) -> anyhow::Result<osslscope::discovery::session::DispatchReinstall> {
+        unreachable!("no dispatch anchor without BPF bootstrap");
+    }
+
+    fn provider_stat(&self) -> Option<(String, u64)> {
+        use std::os::unix::fs::MetadataExt as _;
+        let md = std::fs::metadata(&self.provider).ok()?;
+        Some((plan::render_device(md.dev()), md.ino()))
+    }
+
+    fn backing_stat(&mut self, path: &str) -> Option<(u64, u64)> {
+        let md = std::fs::metadata(path).ok()?;
+        let mtime_ns = md
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_nanos()
+            .min(u128::from(u64::MAX)) as u64;
+        Some((md.len(), mtime_ns))
+    }
+}
+
+/// Production discovery logic behind the port: the real
+/// `SessionCore` state machine (poll/refresh/reconcile/flap and
+/// freshness machinery — not a script).
+struct CoreDiscovery {
+    core: SessionCore,
+    env: LiveMapsNoBpfEnv,
+}
+
+impl DiscoveryPort for CoreDiscovery {
+    fn poll(&mut self, budget: PollBudget) -> anyhow::Result<DiscoveryDelta> {
+        self.core.poll(&mut self.env, budget)
+    }
+
+    fn snapshot(&self) -> DiscoverySnapshot {
+        self.core.snapshot()
+    }
+
+    fn finish(&mut self) -> anyhow::Result<DiscoverySnapshot> {
+        self.core.close(&mut self.env)
+    }
+}
+
+/// Lifecycle spy: forwards to the real port while recording every
+/// delta, so the test proves the exec came through the ordinary
+/// witness sweep (not the exe-link snapshot arm alone).
+struct SpyLifecycle<L: LifecyclePort> {
+    inner: L,
+    deltas: Rc<RefCell<Vec<LifecycleDelta>>>,
+}
+
+impl<L: LifecyclePort> LifecyclePort for SpyLifecycle<L> {
+    fn poll(&mut self) -> LifecycleDelta {
+        let d = self.inner.poll();
+        self.deltas.borrow_mut().push(d.clone());
+        d
+    }
+
+    fn fallback_partial(&self) -> bool {
+        self.inner.fallback_partial()
+    }
+
+    fn close_drain(&mut self) -> Option<LifecycleDelta> {
+        let d = self.inner.close_drain();
+        if let Some(x) = &d {
+            self.deltas.borrow_mut().push(x.clone());
         }
-    };
+        d
+    }
+
+    fn mark_released(&mut self) {
+        self.inner.mark_released();
+    }
+}
+
+fn real_kernel_release() -> String {
+    let mut u: libc::utsname = unsafe { std::mem::zeroed() };
+    if unsafe { libc::uname(&mut u) } != 0 {
+        return "unknown".to_string();
+    }
+    let bytes = unsafe { std::ffi::CStr::from_ptr(u.release.as_ptr()) }.to_bytes();
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+#[test]
+fn ordinary_production_capture_genuinely_observed_sleep_is_honest_noquery() {
+    // F1 (round 3): the qualified ordinary window, genuinely
+    // observed. A plain `/bin/sleep 1` runs the production loop
+    // with real discovery/mappings/time/lifecycle/counting; the
+    // test asserts the whole evidence chain from observed state:
+    // live maps never contain a provider (the core's own
+    // predicate, every poll) → zero candidates → zero attaches →
+    // zero calls → honest no-query PARTIAL, free of polling
+    // fallback, with the real exec witnessed through the
+    // ordinary sweep. Tier 2: the zero-ignored-activity shape
+    // needs readable Drops (blindness would add loss).
+    use osslscope::capture::{LiveClock, LiveLifecycle, LiveProc};
+    use osslscope::target::{OwnedTarget, WorkloadDest};
+    if !require_clean_connector(
+        "ordinary_production_capture_genuinely_observed_sleep_is_honest_noquery",
+    ) {
+        return;
+    }
+    let provider = PathBuf::from("/usr/lib/x86_64-linux-gnu/libcrypto.so.3");
     assert!(
-        !lifecycle.fallback_partial(),
-        "kernel signals must not be the PARTIAL fallback"
+        provider.is_file(),
+        "the genuine provider path must exist: {}",
+        provider.display()
     );
-    let clock = FakeClock::new();
-    let shared = Rc::new(RefCell::new(SharedState::default()));
-    let mut snapshot = DiscoverySnapshot::default();
-    snapshot.dispatch.attached = true;
-    snapshot.dispatch.trigger_observed = true;
-    let discovery = FakeDiscovery {
-        shared: shared.clone(),
-        clock: clock.clone(),
-        polls,
-        plans,
-        fire_tgid: pid,
-        poll_delay_ns: HashMap::new(),
-        // Wall-clock pacing (live_observe pattern): the real child
-        // needs real time to exec+exit while the fake clock spins.
-        poll_real_delay: Duration::from_millis(5),
-        poll_err_at: HashSet::new(),
-        snapshot,
-        finish_err: false,
-        finish_recycled: false,
-        finish_final: None,
-        cancel_flag: None,
-        polls_done: 0,
-        finished: false,
+    let owned = OwnedTarget::spawn_stopped(
+        &["/bin/sleep".to_string(), "1".to_string()],
+        WorkloadDest::Null,
+    )
+    .unwrap();
+    let pid = owned.pid();
+    let pin = osslscope::pin::pin(pid).expect("pin live child");
+    let canon = std::fs::canonicalize(&provider)
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let core = SessionCore::new(provider.clone(), canon, true, pid);
+    let maps_log: Rc<RefCell<Vec<Vec<Mapping>>>> = Rc::new(RefCell::new(Vec::new()));
+    let discovery = CoreDiscovery {
+        core,
+        env: LiveMapsNoBpfEnv {
+            pid,
+            pin,
+            provider: provider.clone(),
+            maps_log: maps_log.clone(),
+        },
     };
+    let shared = Rc::new(RefCell::new(SharedState::default()));
+    // Zero offered fires: sleep executes no provider code (the
+    // backend only counts at attached sites, and none attach —
+    // the zero is structural, asserted via the chain below).
     let count = CountSession::new(
         pid,
         SharedBackend {
             shared,
-            clock: clock.clone(),
+            clock: FakeClock::new(),
             order: Rc::new(RefCell::new(Vec::new())),
         },
     );
-    let mut files = HashMap::new();
-    files.insert(
-        staged.path.clone(),
-        plan::FileBytes {
-            bytes,
-            dev: staged.device,
-            ino: staged.ino,
-        },
+    let lifecycle = LiveLifecycle::select(pid, false);
+    assert!(
+        !lifecycle.fallback_partial(),
+        "ordinary window must select kernel signals, not the PARTIAL fallback"
     );
-    let mut proc = FakeProc {
-        clock: clock.clone(),
-        maps: vec![mapping(&staged)],
-        maps_seq: VecDeque::new(),
-        files,
-        file_err: HashSet::new(),
-        // Scripted exe link stays put: any exec fence in this window
-        // comes ONLY from the real kernel witness, never from the
-        // snapshot arm — the witness path is isolated.
-        exe: Some(PathBuf::from("/bin/sleep")),
-        exe_seq: VecDeque::new(),
-        file_read_seq: VecDeque::new(),
-        maps_err_at: HashSet::new(),
-        maps_delay_ns: 0,
-        file_delay_ns: 0,
-        maps_calls: 0,
-        comm: None,
-        comm_settle_at_ns: None,
-        comm_settled: None,
-        proc_log: Rc::new(RefCell::new(ProcLog::default())),
-        stat_seq: VecDeque::new(),
+    let deltas: Rc<RefCell<Vec<LifecycleDelta>>> = Rc::new(RefCell::new(Vec::new()));
+    let lifecycle = SpyLifecycle {
+        inner: lifecycle,
+        deltas: deltas.clone(),
     };
     let info = TargetInfo {
         pid,
@@ -7617,24 +7769,26 @@ fn live_observe_kernel_lifecycle(
         comm: "sleep".to_string(),
         cmdline: "<redacted>".to_string(),
         container_id: String::new(),
-        kernel_release: "test-kernel".to_string(),
+        kernel_release: real_kernel_release(),
+        // Resolution bypassed (R20 owns window-time, not
+        // resolve-time): honestly unknown, never fabricated.
         provider_build_id: "unknown".to_string(),
-        provider_path: "/p/provider.so".to_string(),
+        provider_path: provider.to_string_lossy().into_owned(),
         image_digest: String::new(),
-        acquired_ns: BASE_NS,
-        acquired_instant: clock.now(),
-        acquired_wall: clock.wall_now(),
+        acquired_ns: LiveClock.monotonic_ns(),
+        acquired_instant: LiveClock.now(),
+        acquired_wall: LiveClock.wall_now(),
     };
     let cfg = Config {
         harvest_object: Some(PathBuf::new()),
         count_object: Some(PathBuf::new()),
-        provider: Some(PathBuf::from("/p/provider.so")),
+        provider: Some(provider),
         builtin: false,
         table: None,
         force_offset: None,
         provider_enrollment: None,
         resolved_provider: None,
-        duration,
+        duration: Duration::from_secs(10),
         settle: Duration::from_millis(500),
         harvest_timeout: Duration::from_secs(30),
         grace: Duration::from_secs(5),
@@ -7649,54 +7803,63 @@ fn live_observe_kernel_lifecycle(
             target: owned,
             lifecycle,
         },
-        &*clock,
-        &mut proc,
+        &LiveClock,
+        &mut LiveProc,
         &|| false,
     );
-    Some((out, pid))
-}
-
-#[test]
-fn ordinary_production_capture_with_kernel_lifecycle_is_complete() {
-    // F1 qualification: an ORDINARY production capture — the real
-    // `observe` loop, a real owned child, the production
-    // `LiveLifecycle::select` wiring — runs free of polling fallback
-    // and reaches COMPLETE. The child is a plain `sleep` (one exec,
-    // zero forks: no ignored activity to PARTIAL the window); its
-    // real exec witnesses through the ordinary round sweep and
-    // fences (the scripted exe link never flips, so the fence proves
-    // the witness path). Discovery attaches at the BASELINE poll
-    // (pre-release ready — the production-faithful shape), calls fire
-    // in round 1, the child exits mid-window and is reaped before
-    // count close. Timing margins: fires by ~10ms real, exit at
-    // 1000ms, fake-expiry past 120s (≈2.4s real) — no flake.
-    if !require_connector("ordinary_production_capture_with_kernel_lifecycle_is_complete") {
-        return;
-    }
-    let (out, pid) = live_observe_kernel_lifecycle(
-        "ordinary-kernel-lifecycle",
-        &["/bin/sleep", "1"],
-        Duration::from_secs(120),
-        true,
-        vec![(BASE_NS + 600_000_000, 7)],
-    )
-    .expect("connector present (gated above)");
     let c = out.unwrap();
-    assert!(matches!(c.outcome, Outcome::Complete), "{c:?}");
-    assert!(c.reasons.is_empty(), "{:?}", c.reasons);
-    assert!(matches!(c.document.status, Completeness::Complete));
-    assert_eq!(c.document.total_calls(), 7);
+    // The genuine chain, link by link.
+    assert!(
+        matches!(c.outcome, Outcome::Partial),
+        "sleep with no queries is honestly PARTIAL, never COMPLETE: {c:?}"
+    );
+    // Exact honest shape: no-query (zero observed queries) plus
+    // discovery-loss (the reaped-owned close join — the child
+    // exited mid-window and was reaped before count close, so the
+    // discovery tail join is skipped explicitly per the
+    // exited-and-reaped design). Nothing else: in particular no
+    // polling fallback, no ignored activity, no exec/prefix/
+    // terminal gaps, no late attach, no over-budget.
+    assert_eq!(
+        c.reasons,
+        vec!["discovery-loss".to_string(), "no-query".to_string()],
+        "exact honest reason set: {c:?}"
+    );
+    assert_eq!(c.document.total_calls(), 0, "genuine zero calls: {c:?}");
     assert_eq!(c.child_exit, Some(0));
     assert!(
         !c.document.fenced.is_empty(),
-        "real exec witness must fence through the ordinary loop: {c:?}"
+        "the real exec must fence through the ordinary loop: {c:?}"
     );
     assert!(
-        !has_counter(&c, "lifecycle.polling_fallback"),
-        "ordinary window must be free of polling fallback: {c:?}"
+        deltas
+            .borrow()
+            .iter()
+            .flat_map(|d| d.events.iter())
+            .any(|e| e.kind == LifecycleKind::Exec),
+        "the real exec must witness through the ordinary sweep: {c:?}"
     );
-    assert_eq!(counter_value(&c, "lifecycle.signal_dropped"), 0);
-    assert_eq!(counter_value(&c, "discovery.late_attach_sites"), 0);
+    // Mappings genuineness: sampled every poll (baseline pre-exec
+    // plus rounds), never containing a provider by the core's own
+    // predicate — and the post-exec image genuinely observed.
+    let log = maps_log.borrow();
+    assert!(
+        log.len() >= 2,
+        "mappings must be sampled across the window (baseline + rounds): {}",
+        log.len()
+    );
+    for (i, snap) in log.iter().enumerate() {
+        assert!(
+            osslscope::discovery::legacy::find_libcrypto(snap).is_none(),
+            "poll {i}: live maps must contain no provider: {:?}",
+            snap.iter().map(|m| &m.path).collect::<Vec<_>>()
+        );
+    }
+    assert!(
+        log.iter()
+            .any(|snap| snap.iter().any(|m| m.path.contains("sleep"))),
+        "post-exec sleep image must be genuinely observed in some poll"
+    );
     assert_reaped(pid);
 }
 
@@ -7711,9 +7874,10 @@ fn exec_witness_consumed_before_deadline_return_survives_to_close() {
     // slow scan crosses the deadline — the round returns Expired
     // before applying the fence. The obligation must persist to
     // the close drain (consumed witness → exec gap), never
-    // evaporate with the local kinds. The owned target is reaped
-    // at expiry (no over-budget by the last-slice carve-out) — the
-    // gap is the ONLY record of the lost transition.
+    // evaporate with the local kinds. The owned target exits past
+    // the deadline (3s exit, 2s window) and is reaped at close —
+    // over-budget records per the alive-at-expiry contract (a
+    // post-expiry reap cannot prove pre-expiry death).
     let mut h = Harness::fresh("exec-obligation-expired");
     h.snapshot_attached();
     let cand1 = cand(
@@ -7761,8 +7925,8 @@ fn exec_witness_consumed_before_deadline_return_survives_to_close() {
         "gap rides the exec-continuity reason: {c:?}"
     );
     assert_eq!(
-        c.counters.over_budget, 0,
-        "reaped-at-expiry keeps the last-slice carve-out: {c:?}"
+        c.counters.over_budget, 1,
+        "reaped-at-expiry is still over-budget (reap cannot prove pre-expiry death): {c:?}"
     );
 }
 

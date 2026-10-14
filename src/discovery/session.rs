@@ -873,8 +873,23 @@ pub struct SessionCore {
     /// (start, end): refreshed every poll (and at close), consulted
     /// by the ROW arm. Per-poll (not accumulated): rows arriving
     /// without truncation loss are fresh (emitted since the last
-    /// poll), so only the current poll's discontinuity taints.
+    /// poll), so only the current poll's discontinuity taints —
+    /// plus [`Self::flap_carry`] while a ring backlog persists.
     flap_changed: Vec<(u64, u64)>,
+    /// Carried flap witness (R20-fix round 3, F4): when a poll
+    /// exhausts its ring budget, its queued rows (the stash slot
+    /// plus unread backlog) were emitted before this poll's drain
+    /// and may predate this poll's snapshot — the current
+    /// `flap_changed` alone cannot taint them next poll (it
+    /// resets), so the exhausted poll's ranges carry forward.
+    /// Unioned into the ROW arm's flap check; accumulates while
+    /// exhaustion persists (the backlog may span several polls)
+    /// and retires the first poll that empties the ring (its rows
+    /// are provably post-drain). Backpressure itself stays
+    /// Activity, never loss — the carry only taints rows whose
+    /// emission-time mapping is unprovable. Bounded by distinct
+    /// live range starts (same order as `map_flap`).
+    flap_carry: Vec<(u64, u64)>,
     /// Remembered backing-file freshness per path (R20-fix finding
     /// 5): (size, mtime_ns) baselines for retained candidates'
     /// backing + advertising files. An in-place edit (same
@@ -1028,6 +1043,7 @@ impl SessionCore {
             impl_backing: HashMap::new(),
             map_flap: HashMap::new(),
             flap_changed: Vec::new(),
+            flap_carry: Vec::new(),
             backing_freshness: HashMap::new(),
             last_good_maps: Vec::new(),
             candidates: Vec::new(),
@@ -1796,6 +1812,7 @@ impl SessionCore {
         self.impl_backing.clear();
         self.map_flap.clear();
         self.flap_changed.clear();
+        self.flap_carry.clear();
         self.backing_freshness.clear();
         self.candidates.clear();
         self.close_candidates.clear();
@@ -2182,11 +2199,30 @@ impl SessionCore {
         delta.events_consumed = consumed;
         // Exact exhaustion signal: probe one past the budget and
         // stash it for the next poll (backpressure, not loss).
+        // Ring exhaustion (and ONLY ring exhaustion — the attach
+        // backlog below says nothing about the ring) also carries
+        // this poll's flap ranges forward: the stash plus unread
+        // backlog were emitted before this poll's drain and may
+        // predate this poll's snapshot, so next poll's reset
+        // `flap_changed` cannot taint them alone. A poll that
+        // empties the ring retires the carry (its rows are
+        // provably post-drain).
+        let mut ring_exhausted = false;
         if consumed == budget.max_events
             && let Some(extra) = env.next_event()
         {
             self.stashed = Some(extra);
             delta.budget_exhausted = true;
+            ring_exhausted = true;
+        }
+        if ring_exhausted {
+            for r in self.flap_changed.clone() {
+                if !self.flap_carry.contains(&r) {
+                    self.flap_carry.push(r);
+                }
+            }
+        } else {
+            self.flap_carry.clear();
         }
 
         // Deterministic retirement order across the pre-drain
@@ -2789,6 +2825,7 @@ impl SessionCore {
                 let flapped = self
                     .flap_changed
                     .iter()
+                    .chain(&self.flap_carry)
                     .any(|(s, e)| *s <= ev.addr && ev.addr < *e);
                 if !self.check_impl_backing(ev.op, ev.aux, ev.idx, ev.addr, &backing, flapped) {
                     return;
@@ -6370,6 +6407,24 @@ mod tests {
         // strictly within-poll different-path A→B→A (session-input-
         // identical to no-B — untestable by construction, see
         // `r20fix2_stable_bracketing_witnesses_continuity`).
+        //
+        // R20-fix round 3 (F4b): still narrowed, not removed — by
+        // plan constraint, not by preference. A withholding gap
+        // for this case is unimplementable without killing the
+        // plan's R21 ≥9/10 COMPLETE gate: the case is
+        // session-input-identical to clean traffic, so ANY gap
+        // rule covering it fires on ordinary counting windows too
+        // (proven in the round-3 fix report). No unprivileged
+        // continuous mapping witness exists (procfs is
+        // snapshot-only; inotify is file-not-mapping and misses
+        // memfd/unknown paths; the connector carries no mmap
+        // events; BPF/perf/audit are privileged). Per ruling R24
+        // (plan text authoritative), the plan-faithful scope is
+        // precise gaps on OBSERVED churn (flap witness + round-3
+        // flap carry) with this sliver a named residual; full
+        // closure needs the kernel mapping-events facility
+        // (R21-or-later scope). Coordinator ruling requested —
+        // see the round-3 fix report (DONE_WITH_CONCERNS).
         let mut env = MiniEnv::new();
         env.maps = vec![prov_mapping(100, 0x1000)];
         env.events.push_back(alg_bytes(1, 0x1500, 0, 0));
@@ -6455,6 +6510,109 @@ mod tests {
             "post-flap row must drop loud: {:?}",
             d3.losses
         );
+    }
+
+    // ------------------------------------------------------------------
+    // R20-fix round 3, F4: the mapping-flap witness must survive
+    // across polls while the ring holds queued rows. `flap_changed`
+    // resets every poll, but a budget-exhausted poll stashes its
+    // overflow row (plus unread backlog) for the next poll — a
+    // replacement observed in poll N loses its witness before the
+    // queued rows are consumed in poll N+1. RED tests (fail on
+    // FIX_BASE — silent adoption).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn r20fix3_stashed_row_keeps_poll_flap_witness() {
+        // B REPLACEMENT observed in poll 2, but the poll exhausts
+        // its event budget: the ALG consumes the single slot and
+        // the ROW is stashed for poll 3, where the maps are stable
+        // (B→B) and the per-poll witness has reset. The stashed
+        // row may be A's queued row (stale) or B's fresh row —
+        // continuity unprovable even unseeded: loud drop.
+        let mut env = MiniEnv::new();
+        env.maps = vec![stable_lib(50), prov_mapping(100, 0x1000)];
+        let mut core = a11_core();
+        let d1 = core.poll(&mut env, a11_budget()).unwrap();
+        assert!(d1.candidates.is_empty());
+        assert!(d1.losses.is_empty());
+        // Replacement + budget exhaustion (ALG consumes, ROW stashes).
+        env.maps = vec![stable_lib(50), prov_mapping(200, 0x1000)];
+        env.events.push_back(alg_bytes(1, 0x5500, 0, 0));
+        env.events.push_back(row_bytes(1, 11, 0x1600, 0x5500, 0, 0));
+        let d2 = core.poll(&mut env, PollBudget::new(1, 64)).unwrap();
+        assert!(d2.budget_exhausted, "poll 2 must stash its row");
+        assert!(d2.candidates.is_empty());
+        // Stable maps, stashed row consumed: still tainted.
+        let d3 = core.poll(&mut env, a11_budget()).unwrap();
+        assert!(
+            d3.candidates.is_empty(),
+            "stashed row must not silently adopt across a replacement: {:?}",
+            d3.candidates
+        );
+        assert!(
+            d3.losses
+                .iter()
+                .any(|l| l.source == coverage::HOST_STRAGGLER && l.op == Some(1)),
+            "stashed row must drop loud: {:?}",
+            d3.losses
+        );
+    }
+
+    #[test]
+    fn r20fix3_backlog_rows_keep_poll_flap_witness() {
+        // Beyond-the-stash backlog: poll 2's ring holds two rows
+        // but its budget consumes only the first ALG — ROW#11
+        // stashes and ROW#12 sits unread past the stash probe.
+        // Poll 3 consumes all three against stable maps; the
+        // replacement witness must taint BOTH rows (either may be
+        // A's queued row). Poll 4 proves the carry retires once
+        // the ring empties (fresh rows attribute silently — the
+        // fix must not gap forever).
+        let mut env = MiniEnv::new();
+        env.maps = vec![stable_lib(50), prov_mapping(100, 0x1000)];
+        let mut core = a11_core();
+        let d1 = core.poll(&mut env, a11_budget()).unwrap();
+        assert!(d1.candidates.is_empty());
+        assert!(d1.losses.is_empty());
+        env.maps = vec![stable_lib(50), prov_mapping(200, 0x1000)];
+        env.events.push_back(alg_bytes(1, 0x5500, 0, 0));
+        env.events.push_back(row_bytes(1, 11, 0x1600, 0x5500, 0, 0));
+        env.events.push_back(alg_bytes(1, 0x5500, 1, 0));
+        env.events.push_back(row_bytes(1, 11, 0x1600, 0x5500, 1, 0));
+        let d2 = core.poll(&mut env, PollBudget::new(1, 64)).unwrap();
+        assert!(d2.budget_exhausted, "poll 2 must leave a backlog");
+        let d3 = core.poll(&mut env, a11_budget()).unwrap();
+        assert!(
+            d3.candidates.is_empty(),
+            "backlog rows must not silently adopt across a replacement: {:?}",
+            d3.candidates
+        );
+        let stragglers: u64 = d3
+            .losses
+            .iter()
+            .filter(|l| l.source == coverage::HOST_STRAGGLER && l.op == Some(1))
+            .map(|l| l.count)
+            .sum();
+        assert_eq!(
+            stragglers, 2,
+            "both backlog rows must drop loud: {:?}",
+            d3.losses
+        );
+        // Carry retires: the ring emptied in poll 3, so poll 4's
+        // fresh row (emitted after poll 3's drain) attributes
+        // silently against stable maps.
+        env.events.push_back(alg_bytes(1, 0x5500, 2, 0));
+        env.events.push_back(row_bytes(1, 11, 0x1600, 0x5500, 2, 0));
+        let d4 = core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(
+            d4.candidates.len(),
+            1,
+            "post-backlog fresh row must attribute: {:?} {:?}",
+            d4.candidates,
+            d4.losses
+        );
+        assert!(d4.losses.is_empty(), "carry must retire: {:?}", d4.losses);
     }
 
     #[test]

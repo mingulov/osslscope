@@ -12,16 +12,39 @@ use osslscope::target::{
 };
 use std::time::{Duration, Instant};
 
-/// Connector facility gate (R20-fix round 2 MINOR — mirrored in
-/// capture_controller.rs): real-connector controls run only where
-/// the facility subscribes; elsewhere they skip (pass) unless
+/// Connector facility gate (R20-fix rounds 2-3 MINOR — mirrored
+/// in capture_controller.rs): two tiers, probed once per process
+/// (subscribing runs the initial watermark burst, so probing per
+/// test would spam). Tier 1 (`require_connector`) needs a working
+/// subscription; tier 2 (`require_clean_connector`) additionally
+/// needs the socket Drops row readable — COMPLETE/zero-loss tests
+/// use tier 2, so supported PARTIAL (drops-blind) environments
+/// skip them instead of failing. Either tier skips (pass) unless
 /// `OSSLSCOPE_REQUIRE_CONNECTOR=1` forces a hard failure.
-/// `OSSLSCOPE_CONNECTOR_TEST=force-absent` simulates absence.
+/// `OSSLSCOPE_CONNECTOR_TEST=force-absent` simulates absence;
+/// `=force-no-drops` simulates a drops-blind environment.
+fn connector_facility_cached() -> (bool, bool) {
+    use std::sync::OnceLock;
+    static PROBE: OnceLock<(bool, bool)> = OnceLock::new();
+    *PROBE.get_or_init(|| {
+        let hook = std::env::var("OSSLSCOPE_CONNECTOR_TEST").unwrap_or_default();
+        if hook == "force-absent" {
+            return (false, false);
+        }
+        let f = osslscope::capture::connector_facility();
+        if hook == "force-no-drops" {
+            return (f.subscribes, false);
+        }
+        (f.subscribes, f.drops_readable)
+    })
+}
+
 fn connector_present() -> bool {
-    if std::env::var("OSSLSCOPE_CONNECTOR_TEST").as_deref() == Ok("force-absent") {
-        return false;
-    }
-    osslscope::capture::KernelLifecycle::subscribe(std::process::id()).is_ok()
+    connector_facility_cached().0
+}
+
+fn connector_clean() -> bool {
+    connector_facility_cached() == (true, true)
 }
 
 fn require_connector(test: &str) -> bool {
@@ -33,6 +56,18 @@ fn require_connector(test: &str) -> bool {
         "{test} requires a working proc connector (OSSLSCOPE_REQUIRE_CONNECTOR=1)"
     );
     eprintln!("SKIP {test}: proc connector unavailable (fallback/PARTIAL shape unsupported here)");
+    false
+}
+
+fn require_clean_connector(test: &str) -> bool {
+    if connector_clean() {
+        return true;
+    }
+    assert!(
+        std::env::var("OSSLSCOPE_REQUIRE_CONNECTOR").as_deref() != Ok("1"),
+        "{test} requires a working proc connector with readable Drops (OSSLSCOPE_REQUIRE_CONNECTOR=1)"
+    );
+    eprintln!("SKIP {test}: connector drops-blind here (supported PARTIAL, not zero-loss)");
     false
 }
 
@@ -2182,7 +2217,7 @@ fn r20fix_kernel_lifecycle_witnesses_real_fork_exec_exit() {
     use osslscope::capture::{KernelLifecycle, LifecycleKind, LifecyclePort};
     use std::collections::HashSet;
 
-    if !require_connector("r20fix_kernel_lifecycle_witnesses_real_fork_exec_exit") {
+    if !require_clean_connector("r20fix_kernel_lifecycle_witnesses_real_fork_exec_exit") {
         return;
     }
     let mut t = OwnedTarget::spawn_stopped(
@@ -2195,7 +2230,7 @@ fn r20fix_kernel_lifecycle_witnesses_real_fork_exec_exit() {
     )
     .unwrap();
     let pid = t.pid();
-    let mut lc = match KernelLifecycle::subscribe(pid) {
+    let mut lc = match KernelLifecycle::subscribe(pid, false) {
         Ok(lc) => lc,
         Err(e) => {
             let _ = t.resolve_setup_failure();
@@ -2207,6 +2242,7 @@ fn r20fix_kernel_lifecycle_witnesses_real_fork_exec_exit() {
         "kernel signals must not be the PARTIAL fallback"
     );
     t.release().unwrap();
+    lc.mark_released();
     assert_eq!(wait_for_exit(&mut t, Duration::from_secs(10)), Some(0));
     // Drain until both witnesses arrive (bounded): delivery into the
     // socket is kernel-queued, so this loop only waits out scheduling.
@@ -2380,14 +2416,19 @@ fn kernel_unsubscribe_is_accepted_live() {
     // after unsubscribe are safe (kernel guards double-IGNORE), and
     // a fresh subscribe still works afterwards (no wedged state).
     use osslscope::capture::{KernelLifecycle, LifecyclePort};
-    if !require_connector("kernel_unsubscribe_is_accepted_live") {
+    if !require_clean_connector("kernel_unsubscribe_is_accepted_live") {
         return;
     }
-    let holder = KernelLifecycle::subscribe(std::process::id()).expect("holder subscribe");
-    let mut lc = KernelLifecycle::subscribe(std::process::id()).expect("subscribe");
+    let holder = KernelLifecycle::subscribe(std::process::id(), true).expect("holder subscribe");
+    let mut lc = KernelLifecycle::subscribe(std::process::id(), true).expect("subscribe");
+    assert_ne!(
+        holder.ack_token(),
+        lc.ack_token(),
+        "concurrent same-process subscriptions must hold distinct tokens"
+    );
     let sniff = bind_proc_group_sniffer().expect("sniffer bind");
     lc.unsubscribe().expect("unsubscribe sends");
-    let our_ack = std::process::id().wrapping_add(1);
+    let our_ack = lc.ack_token().wrapping_add(1);
     let err = await_none_ack(&sniff, our_ack, Duration::from_secs(5)).expect("IGNORE ack on wire");
     assert_eq!(err, 0, "kernel must ACCEPT the IGNORE (err=EINVAL leaks)");
     // Corroboration through the adapter itself: our own socket also
@@ -2403,9 +2444,116 @@ fn kernel_unsubscribe_is_accepted_live() {
     }
     lc.unsubscribe().expect("repeat unsubscribe sends");
     drop(lc);
-    let resub = KernelLifecycle::subscribe(std::process::id()).expect("resubscribe works");
+    let resub = KernelLifecycle::subscribe(std::process::id(), true).expect("resubscribe works");
     drop(resub);
     drop(holder);
+}
+
+// ---------------------------------------------------------------------------
+// R20-fix round 3, F2: per-CPU sequence watermarks — a CPU's first
+// received sequence must not silently establish its baseline, and
+// close needs a terminal per-CPU watermark.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn kernel_live_target_first_sighting_gaps_prefix() {
+    // F2 RED (live): subscribing to a LIVE target — activity
+    // possible throughout, so no first sighting is preceded by a
+    // proven-quiet interval — must not silently baseline per-CPU
+    // sequences. First sightings gap their unwitnessed prefix
+    // (a fork lost before the first message is otherwise
+    // invisible with zero socket Drops).
+    use osslscope::capture::{KernelLifecycle, LifecyclePort};
+    if !require_connector("kernel_live_target_first_sighting_gaps_prefix") {
+        return;
+    }
+    let mut lc = KernelLifecycle::subscribe(std::process::id(), true).expect("subscribe live");
+    // Deterministic traffic: our own short-lived child (FORK +
+    // EXIT, kernel-queued — no scheduling race).
+    let child = unsafe { libc::fork() };
+    assert!(child >= 0, "fork for sync traffic");
+    if child == 0 {
+        unsafe { libc::_exit(0) };
+    }
+    let mut status = 0;
+    assert!(unsafe { libc::waitpid(child, &mut status, 0) } >= 0);
+    let mut dropped = 0u64;
+    let mut saw_fork = false;
+    let end = Instant::now() + Duration::from_secs(10);
+    while !saw_fork && Instant::now() < end {
+        let d = lc.poll();
+        dropped += d.dropped;
+        saw_fork = d.events.iter().any(|e| {
+            matches!(e.kind, osslscope::capture::LifecycleKind::Fork) && e.pid as i32 == child
+        });
+        if !saw_fork {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    assert!(saw_fork, "our child's fork must witness");
+    assert!(
+        dropped >= 1,
+        "live-target first sightings must gap their prefix, not baseline silently: dropped={dropped}"
+    );
+}
+
+#[test]
+fn kernel_subscribe_watermarks_all_cpus_pre_activity() {
+    // F2 (live): subscribing to a STOPPED owned child watermarks
+    // every online CPU pre-activity — each CPU delivers a
+    // baseline while the target provably cannot emit, so later
+    // traffic is interior (holes detected) with NO prefix gaps.
+    // This is what keeps connector COMPLETE reachable honestly.
+    use osslscope::capture::{KernelLifecycle, LifecyclePort};
+    if !require_connector("kernel_subscribe_watermarks_all_cpus_pre_activity") {
+        return;
+    }
+    let mut t = OwnedTarget::spawn_stopped(
+        &["/bin/sleep".to_string(), "60".to_string()],
+        WorkloadDest::Null,
+    )
+    .unwrap();
+    let pid = t.pid();
+    let mut lc = KernelLifecycle::subscribe(pid, false).expect("subscribe stopped");
+    let (sought, seen) = lc.watermark_status().expect("initial watermark ran");
+    assert!(sought >= 1, "at least one online CPU");
+    assert_eq!(
+        seen, sought,
+        "initial watermark must cover every online CPU"
+    );
+    let d = lc.poll();
+    assert_eq!(
+        d.dropped, 0,
+        "pre-activity baselines must stay silent: {d:?}"
+    );
+    assert!(d.events.is_empty(), "stopped child emits nothing: {d:?}");
+    t.resolve_setup_failure().unwrap();
+    assert_reaped_no_zombie(pid);
+}
+
+#[test]
+fn kernel_close_drain_establishes_terminal_watermark() {
+    // F2 (live): close establishes a terminal per-CPU watermark —
+    // successors on every online CPU prove the suffix (any
+    // pre-close loss surfaces as an interior hole when its
+    // successor ingests). In a quiet window the watermark
+    // completes with no terminal loss. (Prefix gaps from the
+    // live self-target land in the first poll, ignored here.)
+    use osslscope::capture::{KernelLifecycle, LifecyclePort};
+    if !require_clean_connector("kernel_close_drain_establishes_terminal_watermark") {
+        return;
+    }
+    let mut lc = KernelLifecycle::subscribe(std::process::id(), true).expect("subscribe");
+    let _ = lc.poll();
+    let tail = lc.close_drain().expect("kernel close witness");
+    assert_eq!(tail.pending, 0, "close drain must reach the tail");
+    let (sought, seen) = lc.watermark_status().expect("terminal watermark ran");
+    assert!(sought >= 1, "at least one online CPU");
+    assert_eq!(
+        seen, sought,
+        "terminal successors must cover every online CPU"
+    );
+    assert_eq!(tail.loss, 0, "quiet close must not add terminal loss");
 }
 
 const USERNS_PROBE_ENV: &str = "R20_USERNS_PROBE";
@@ -2421,11 +2569,33 @@ fn helper_userns_subscribe_probe() {
     }
     let code = unsafe {
         if libc::unshare(libc::CLONE_NEWUSER) != 0 {
-            44 // userns unavailable (EPERM) — environmental skip
+            let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            if e == libc::EPERM || e == libc::EINVAL {
+                // Namespace creation blocked by the environment
+                // (unprivileged userns disabled, seccomp/apparmor
+                // policy, full namespace table) — skip, claiming
+                // no timeout evidence here.
+                44
+            } else {
+                eprintln!("userns probe: unshare failed: errno {e}");
+                45 // unexpected: the timeout path is unverified here
+            }
         } else {
-            match osslscope::capture::KernelLifecycle::subscribe(std::process::id()) {
-                Ok(_) => 43,  // namespace silence NOT observed — real failure
-                Err(_) => 42, // expected: ignored namespace, no ack
+            match osslscope::capture::KernelLifecycle::subscribe(std::process::id(), true) {
+                Ok(_) => 43, // namespace silence NOT observed — real failure
+                Err(e) => {
+                    // MINOR-B: only the TIMEOUT proves the
+                    // silence mechanism — any other error is a
+                    // different failure (45), never timeout
+                    // evidence (42).
+                    let msg = format!("{e:#}");
+                    eprintln!("{msg}");
+                    if msg.contains("not acknowledged") {
+                        42 // expected: ignored namespace, no ack
+                    } else {
+                        45
+                    }
+                }
             }
         }
     };
@@ -2466,10 +2636,22 @@ fn kernel_subscribe_in_user_namespace_fails_closed() {
         }
         std::thread::sleep(Duration::from_millis(20));
     };
+    let mut stderr = String::new();
+    if let Some(mut err) = child.stderr.take() {
+        use std::io::Read as _;
+        err.read_to_string(&mut stderr).ok();
+    }
     match status.code() {
-        Some(42) => {}
+        // MINOR-B: 42 alone is not timeout evidence — the probe's
+        // error text must name the timeout (a 42 without it fails:
+        // the silence mechanism is unproven).
+        Some(42) => assert!(
+            stderr.contains("not acknowledged"),
+            "userns 42 without timeout evidence proves nothing: {stderr:?}"
+        ),
         Some(44) => eprintln!("SKIP: userns unavailable in this environment"),
         Some(43) => panic!("subscribe SUCCEEDED in a child userns (silence not observed)"),
+        Some(45) => panic!("userns probe could not verify the timeout path: {stderr:?}"),
         other => panic!("userns probe unexpected status: {other:?}"),
     }
 }
