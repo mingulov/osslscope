@@ -1615,12 +1615,59 @@ pub fn prepare(obj: &[u8], maps: &[MapSpec], progs: &[ProgSpec]) -> anyhow::Resu
             text_fns.push((f.value, f.value + f.size, f.name.clone()));
         }
     }
-    let text_owner = |off: usize| {
-        text_fns
+    // Owner indexes (built once): section relocs grouped by owning
+    // function, plus the ownerless offsets in file order. The per-prog
+    // loops below used to re-scan every section's func ranges per reloc
+    // — O(progs x relocs x fns), ~54s on the 513-prog members object.
+    // Same ownership predicate, run once per reloc (ranges are
+    // disjoint, so first-hit == only-hit); the per-prog walk merges
+    // owned + ownerless in file order, so error precedence is
+    // identical to the old full scan, including multi-fault inputs.
+    let mut sec_groups: HashMap<String, HashMap<String, Vec<(usize, usize)>>> = HashMap::new();
+    let mut sec_ownerless: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+    for (sec, ranges) in &funcs {
+        let mut groups: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+        let mut ownerless: Vec<(usize, usize)> = Vec::new();
+        for (i, r) in relocs
+            .get(sec)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
             .iter()
-            .find(|(a, b, _)| *a <= off && off < *b)
-            .map(|(a, b, n)| (*a, *b, n.clone()))
-    };
+            .enumerate()
+        {
+            match ranges.iter().find(|(a, b, _)| *a <= r.off && r.off < *b) {
+                Some((_, ob, oname)) => {
+                    groups.entry(oname.clone()).or_default().push((i, *ob));
+                }
+                None => ownerless.push((i, r.off)),
+            }
+        }
+        sec_groups.insert(sec.clone(), groups);
+        sec_ownerless.insert(sec.clone(), ownerless);
+    }
+    let mut text_owner_map: HashMap<usize, (usize, usize, String)> = HashMap::new();
+    for r in relocs.get(".text").map(Vec::as_slice).unwrap_or(&[]) {
+        if let Some((a, b, n)) = text_fns.iter().find(|(a, b, _)| *a <= r.off && r.off < *b) {
+            text_owner_map.insert(r.off, (*a, *b, n.clone()));
+        }
+    }
+    // `.text` relocs grouped by owning fn (file order preserved per
+    // fn — the closure walk below sees the same sequence as the old
+    // filter-over-all scan).
+    let mut text_by_fn: HashMap<String, Vec<usize>> = HashMap::new();
+    if let Some(rs) = relocs.get(".text") {
+        for (i, r) in rs.iter().enumerate() {
+            if let Some((_, _, owner)) = text_owner_map.get(&r.off) {
+                text_by_fn.entry(owner.clone()).or_default().push(i);
+            }
+        }
+    }
+    // `.text` fn ranges by name (names are unique — the duplicate
+    // check above bails — so this matches the old linear finds).
+    let mut text_fn_range: HashMap<String, (usize, usize)> = HashMap::new();
+    for (a, b, n) in &text_fns {
+        text_fn_range.insert(n.clone(), (*a, *b));
+    }
 
     let mut out = Vec::new();
     for p in progs {
@@ -1649,16 +1696,25 @@ pub fn prepare(obj: &[u8], maps: &[MapSpec], progs: &[ProgSpec]) -> anyhow::Resu
         // function-pointer targets rooted.
         let mut roots: Vec<(usize, String)> = Vec::new(); // (local off, fn)
         let mut func_roots: Vec<(usize, String)> = Vec::new(); // (local off, fn)
-        for r in relocs.get(p.section).map(Vec::as_slice).unwrap_or(&[]) {
-            let owner = funcs
-                .get(p.section)
-                .and_then(|v| v.iter().find(|(a, b, _)| *a <= r.off && r.off < *b));
-            let Some((_, ob, oname)) = owner else {
-                anyhow::bail!("prog {}: reloc @{} ownerless (drift)", p.name, r.off);
-            };
-            if *oname != p.name {
-                continue; // belongs to an unloaded sibling prog
-            }
+        let sec_rs = relocs.get(p.section).map(Vec::as_slice).unwrap_or(&[]);
+        let empty_group: &[(usize, usize)] = &[];
+        // Owned relocs (file order) + ownerless relocs (file order);
+        // the walk below merges both in file order (same encounter
+        // order as the old full scan — sibling relocs skipped
+        // without ever being visited).
+        let own = sec_groups
+            .get(p.section)
+            .and_then(|g| g.get(p.name))
+            .map(Vec::as_slice)
+            .unwrap_or(empty_group);
+        let less = sec_ownerless
+            .get(p.section)
+            .map(Vec::as_slice)
+            .unwrap_or(empty_group);
+        // One owned reloc's checks (the old loop body minus the
+        // owner scan/sibling skip — grouping already selected;
+        // `oname` there always equaled `p.name` here).
+        let mut process = |r: &Reloc, ob: usize| -> anyhow::Result<()> {
             // Calls patch 8 bytes, `ld_imm64` sites (func and map)
             // 16: the whole site must sit inside its owner.
             let width = match r.typ {
@@ -1666,7 +1722,7 @@ pub fn prepare(obj: &[u8], maps: &[MapSpec], progs: &[ProgSpec]) -> anyhow::Resu
                 R_BPF_64_32 => 8,
                 t => anyhow::bail!("prog {}: reloc type {t} unsupported", p.name),
             };
-            check_site_contained(r.off, width, *ob, oname, p.name)?;
+            check_site_contained(r.off, width, ob, p.name, p.name)?;
             let rsym = syms
                 .get(r.sym)
                 .ok_or_else(|| anyhow::anyhow!("prog {}: bad reloc sym", p.name))?;
@@ -1699,35 +1755,56 @@ pub fn prepare(obj: &[u8], maps: &[MapSpec], progs: &[ProgSpec]) -> anyhow::Resu
                 }
                 t => anyhow::bail!("prog {}: reloc type {t} unsupported", p.name),
             }
+            Ok(())
+        };
+        // `b` never advances: the first ownerless reloc reached
+        // always bails (same as the old scan encountering it).
+        let (mut a, b) = (0usize, 0usize);
+        while a < own.len() || b < less.len() {
+            let own_first = b >= less.len() || (a < own.len() && own[a].0 < less[b].0);
+            if own_first {
+                let (i, ob) = own[a];
+                a += 1;
+                process(&sec_rs[i], ob)?;
+            } else {
+                anyhow::bail!("prog {}: reloc @{} ownerless (drift)", p.name, less[b].1);
+            }
         }
         // Reachable closure over `.text` call and function-pointer
         // relocs (transitive). Only reachable subprograms are linked:
         // the verifier rejects unreachable trailing insns, so blind
         // `.text` appends fail.
         let mut included: Vec<String> = Vec::new();
+        let mut included_set: HashSet<String> = HashSet::new();
         let mut work: Vec<String> = roots
             .iter()
             .chain(func_roots.iter())
             .map(|(_, n)| n.clone())
             .collect();
+        let text_rs = relocs.get(".text").map(Vec::as_slice).unwrap_or(&[]);
         while let Some(next) = work.pop() {
-            if included.contains(&next) {
+            if !included_set.insert(next.clone()) {
                 continue;
             }
             included.push(next.clone());
-            let (f0, f1, _) = text_fns
-                .iter()
-                .find(|(_, _, n)| *n == next)
+            let (f0, f1) = text_fn_range
+                .get(&next)
+                .copied()
                 .ok_or_else(|| anyhow::anyhow!("prog {}: call vs unknown {next}", p.name))?;
-            for r in relocs.get(".text").map(Vec::as_slice).unwrap_or(&[]) {
-                if *f0 <= r.off && r.off < *f1 {
+            let empty: &[usize] = &[];
+            for &i in text_by_fn.get(&next).map(Vec::as_slice).unwrap_or(empty) {
+                let r = &text_rs[i];
+                // Range guard retained: grouping already restricts
+                // to this fn's relocs (same predicate, same file
+                // order) — belt and suspenders.
+                if f0 <= r.off && r.off < f1 {
                     let width = match r.typ {
                         R_BPF_64_32 => 8,
                         R_BPF_64_64 => 16,
                         // Unknown types bail in the apply loop below.
                         _ => continue,
                     };
-                    check_site_contained(r.off, width, *f1, &next, p.name)?;
+                    check_site_contained(r.off, width, f1, &next, p.name)?;
                     if r.typ == R_BPF_64_32 {
                         let tidx = text_idx.ok_or_else(|| {
                             anyhow::anyhow!("prog {}: call reloc but no .text", p.name)
@@ -1748,14 +1825,14 @@ pub fn prepare(obj: &[u8], maps: &[MapSpec], progs: &[ProgSpec]) -> anyhow::Resu
                 }
             }
         }
-        included.sort_by_key(|n| text_fns.iter().find(|(_, _, m)| m == n).map(|(v, _, _)| *v));
+        included.sort_by_key(|n| text_fn_range.get(n).map(|(v, _)| *v));
         // Layout: main + included subprograms in `.text` order.
         let mut insns = main.to_vec();
         let mut base: HashMap<String, usize> = HashMap::new();
         for name in &included {
-            let (f0, f1, _) = text_fns.iter().find(|(_, _, n)| n == name).unwrap();
+            let (f0, f1) = text_fn_range.get(name).copied().unwrap();
             let bytes = text
-                .get(*f0..*f1)
+                .get(f0..f1)
                 .ok_or_else(|| anyhow::anyhow!("prog {}: .text fn {name} out of range", p.name))?;
             base.insert(name.clone(), insns.len());
             insns.extend_from_slice(bytes);
@@ -1783,10 +1860,10 @@ pub fn prepare(obj: &[u8], maps: &[MapSpec], progs: &[ProgSpec]) -> anyhow::Resu
             callbacks.insert(target.clone());
         }
         for r in relocs.get(".text").map(Vec::as_slice).unwrap_or(&[]) {
-            let Some((f0, f1, owner)) = text_owner(r.off) else {
+            let Some((f0, f1, owner)) = text_owner_map.get(&r.off) else {
                 anyhow::bail!("prog {}: text reloc @{} ownerless (drift)", p.name, r.off);
             };
-            let Some(obase) = base.get(&owner) else {
+            let Some(obase) = base.get(owner.as_str()) else {
                 continue; // subprogram unreachable from this prog
             };
             let width = match r.typ {
@@ -1794,7 +1871,7 @@ pub fn prepare(obj: &[u8], maps: &[MapSpec], progs: &[ProgSpec]) -> anyhow::Resu
                 R_BPF_64_32 => 8,
                 t => anyhow::bail!("prog {}: text reloc type {t} unsupported", p.name),
             };
-            check_site_contained(r.off, width, f1, &owner, p.name)?;
+            check_site_contained(r.off, width, *f1, owner, p.name)?;
             let rsym = syms
                 .get(r.sym)
                 .ok_or_else(|| anyhow::anyhow!("prog {}: bad text reloc sym", p.name))?;
@@ -1805,13 +1882,13 @@ pub fn prepare(obj: &[u8], maps: &[MapSpec], progs: &[ProgSpec]) -> anyhow::Resu
                             anyhow::anyhow!("prog {}: func reloc but no .text", p.name)
                         })?;
                         let target = func_ptr_target(&syms, &text_fns, tidx, text, r, p.name)?;
-                        if !included.contains(&target) {
+                        if !included_set.contains(&target) {
                             anyhow::bail!("prog {}: func vs excluded {}", p.name, target);
                         }
                         let t = base.get(&target).ok_or_else(|| {
                             anyhow::anyhow!("prog {}: func vs unlinked {}", p.name, target)
                         })?;
-                        let site = obase + (r.off - f0);
+                        let site = obase + (r.off - *f0);
                         apply_func_ptr(&mut insns, site, *t, p.name)?;
                         rewritten.insert(site);
                         callbacks.insert(target.clone());
@@ -1822,7 +1899,7 @@ pub fn prepare(obj: &[u8], maps: &[MapSpec], progs: &[ProgSpec]) -> anyhow::Resu
                     }
                     check_ld_imm64_site(text, r.off, p.name)?;
                     fixups.push(MapFixup {
-                        insn_off: obase + (r.off - f0),
+                        insn_off: obase + (r.off - *f0),
                         map: rsym.name.clone(),
                     });
                 }
@@ -1832,13 +1909,13 @@ pub fn prepare(obj: &[u8], maps: &[MapSpec], progs: &[ProgSpec]) -> anyhow::Resu
                     })?;
                     let target = call_target(&syms, &text_fns, tidx, text, r, p.name)?;
                     // Call targets must be entries (closure invariant).
-                    if !included.contains(&target) {
+                    if !included_set.contains(&target) {
                         anyhow::bail!("prog {}: call vs excluded {}", p.name, target);
                     }
                     let t = base.get(&target).ok_or_else(|| {
                         anyhow::anyhow!("prog {}: call vs unlinked {}", p.name, target)
                     })?;
-                    let site = obase + (r.off - f0);
+                    let site = obase + (r.off - *f0);
                     apply_call(&mut insns, site, *t, p.name)?;
                     rewritten.insert(site);
                 }
