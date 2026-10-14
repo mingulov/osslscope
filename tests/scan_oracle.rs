@@ -364,6 +364,42 @@ fn stream_loss_unattributed_two_candidates() {
     }));
 }
 
+/// Round-4 F3: TRUNC-subsystem map pressure (LOSS_MAP_TRUNC —
+/// a flag bit or its generation bump lost to a full map)
+/// degrades spanned opens (fail-closed) and surfaces
+/// window-level with no opens (never silently dropped).
+#[test]
+fn fix3_map_pressure_loss_degrades() {
+    let mut o = Oracle::new(OracleScope::full());
+    let mut b = quiesced_idle(&[TIDA]);
+    b.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b.push_ret(ret(TIDA, 0, 0));
+    b.push_alg(alg(TIDA, 0, 0, wire::ALG_OK));
+    b.push_alg(alg_arr(TIDA, 0, 1, wire::ALG_EMPTY, ARR, 0));
+    b.loss.insert(wire::LOSS_MAP_TRUNC, 1);
+    o.ingest(&b);
+    assert!(
+        matches!(
+            o.done()[0].outcome,
+            Outcome::Partial { ref reasons } if reasons.contains(&PartialReason::DrainLoss)
+        ),
+        "map-pressure loss must degrade: {:?}",
+        o.done()[0].outcome
+    );
+    // Window-level with no opens (never dropped).
+    let mut o2 = Oracle::new(OracleScope::full());
+    let mut w = quiesced_idle(&[TIDA]);
+    w.loss.insert(wire::LOSS_MAP_TRUNC, 2);
+    o2.ingest(&w);
+    assert!(
+        o2.findings()
+            .iter()
+            .any(|f| matches!(f, Finding::WindowLoss { delta: 2 })),
+        "map-pressure loss surfaces window-level: {:?}",
+        o2.findings()
+    );
+}
+
 /// Ring loss corroborates holes (DrainLoss reason).
 #[test]
 fn stream_drain_loss_corroborates_holes() {
@@ -1175,14 +1211,11 @@ fn fix3_consumed_taint_corrects() {
     assert_eq!(corrections[0].op, UNKNOWN_OP);
 }
 
-/// Round-3 F6: late data records for a consumed key are
-/// preserved as findings (cross-CPU ring skew delivers them
-/// after the close — positive recovery evidence, never silently
-/// discarded). Late control records (RET) for a non-hung
-/// consumed key stay absorbed (redundant — the verdict closed
-/// with its RET already).
+/// Round-4 F4: foreign closes never evict a nesting pair —
+/// per-tid recent queues (an outer open on tid A keeps its
+/// consumed inner correctable past 5000 closes on tid B).
 #[test]
-fn fix3_late_data_preserved_late_control_absorbed() {
+fn fix4_recent_survives_foreign_flood() {
     let mut o = Oracle::new(OracleScope::full());
     let mut b1 = ScanBatch {
         quiesced: false,
@@ -1202,48 +1235,337 @@ fn fix3_late_data_preserved_late_control_absorbed() {
     b2.push_call(call(TIDA, 1, false, wire::SKIP_ADMITTED)); // successor closes 0
     o.ingest(&b2);
     assert_eq!(o.done().len(), 1);
+    let _ = o.take_done(); // consume the inner (outer still open)
+    // 5000 foreign closes via successor-takes (would evict a 4096
+    // global FIFO; quiesced batches would close the outer early,
+    // so each batch carries evidence(N) + call(N+1)).
+    let mut bf0 = ScanBatch {
+        quiesced: false,
+        now_ns: 3_000,
+        ..ScanBatch::default()
+    };
+    bf0.push_call(call(TIDB, 0, false, wire::SKIP_ADMITTED));
+    o.ingest(&bf0);
+    let mut flooded = 0usize;
+    for seq in 0..5000u64 {
+        let mut bf = ScanBatch {
+            quiesced: false,
+            now_ns: 4_000 + seq,
+            ..ScanBatch::default()
+        };
+        bf.push_ret(ret(TIDB, seq, 0));
+        bf.push_alg(alg(TIDB, seq, 0, wire::ALG_OK));
+        bf.push_alg(alg_arr(TIDB, seq, 1, wire::ALG_EMPTY, ARR, 0));
+        bf.push_call(call(TIDB, seq + 1, false, wire::SKIP_ADMITTED));
+        o.ingest(&bf);
+        flooded += o.take_done().len();
+        let _ = o.take_findings();
+    }
+    assert_eq!(
+        flooded, 5000,
+        "the flood must actually close (else vacuous)"
+    );
+    // Close the trailing foreign open quiesced (RET-joined —
+    // the RET-less outer must stay open for the finish dangle).
+    let mut bq = quiesced_idle(&[TIDB]);
+    bq.push_ret(ret(TIDB, 5000, 0));
+    bq.push_alg(alg(TIDB, 5000, 0, wire::ALG_OK));
+    bq.push_alg(alg_arr(TIDB, 5000, 1, wire::ALG_EMPTY, ARR, 0));
+    o.ingest(&bq);
+    let _ = o.take_done();
+    let _ = o.take_findings();
+    assert_eq!(o.open_count(), 1, "only the outer stays open");
+    o.finish(10_000_000); // outer dangles → must still correct the inner
+    let corrections = o.take_corrections();
+    assert_eq!(corrections.len(), 1, "flood must not evict the pair");
+    assert_eq!((corrections[0].tid, corrections[0].seq), (TIDA, 0));
+}
+
+/// Round-4 F6: late REQUIRED-prefix data for a consumed key is
+/// preserved as findings (a hole-filling ALG/ROW skewed past
+/// its Partial close — positive recovery evidence); past-T
+/// stragglers stay silent (beyond-terminator observations are
+/// meaningless); late control (RET) for a non-hung consumed key
+/// stays absorbed (redundant).
+#[test]
+fn fix4_late_prefix_data_preserved_beyond_t_silent() {
+    let mut o = Oracle::new(OracleScope::full());
+    let mut b1 = ScanBatch {
+        quiesced: false,
+        now_ns: 1_000,
+        ..ScanBatch::default()
+    };
+    b1.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b1.push_ret(ret(TIDA, 0, 0));
+    b1.push_alg(alg(TIDA, 0, 0, wire::ALG_OK));
+    b1.push_alg(alg(TIDA, 0, 2, wire::ALG_OK)); // hole at 1
+    b1.push_alg(alg_arr(TIDA, 0, 3, wire::ALG_EMPTY, ARR, 0)); // terminator at 3
+    o.ingest(&b1);
+    let mut b2 = ScanBatch {
+        quiesced: false,
+        now_ns: 2_000,
+        ..ScanBatch::default()
+    };
+    b2.push_call(call(TIDA, 1, false, wire::SKIP_ADMITTED)); // successor closes 0
+    o.ingest(&b2);
+    assert_eq!(o.done().len(), 1);
+    assert!(
+        matches!(o.done()[0].outcome, Outcome::Partial { .. }),
+        "holed close is Partial: {:?}",
+        o.done()[0].outcome
+    );
     let _ = o.take_done(); // consume seq 0
     let _ = o.take_findings();
-    // Stragglers for the consumed key (skewed past its close).
+    // Stragglers: hole-filling prefix pair (recovery!) + a
+    // past-terminator ALG (meaningless) + a redundant RET.
     let mut b3 = ScanBatch {
         quiesced: false,
         now_ns: 3_000,
         ..ScanBatch::default()
     };
-    b3.push_alg(alg(TIDA, 0, 5, wire::ALG_OK));
-    b3.push_row(row_full(TIDA, 0, 5, ARR, 0, 301, 0x4401));
+    b3.push_alg(alg(TIDA, 0, 1, wire::ALG_OK));
+    b3.push_row(row_full(TIDA, 0, 1, ARR, 0, 301, 0x4401));
+    b3.push_alg(alg(TIDA, 0, 9, wire::ALG_OK));
     b3.push_ret(ret(TIDA, 0, 0));
     o.ingest(&b3);
     assert!(
         o.findings().contains(&Finding::LateAlg {
             tid: TIDA,
             seq: 0,
-            idx: 5,
+            idx: 1,
             status: wire::ALG_OK,
             class: 1,
         }),
-        "late ALG preserved with its slot evidence: {:?}",
+        "late hole-filling ALG preserved: {:?}",
         o.findings()
     );
     assert!(
         o.findings().contains(&Finding::LateRow {
             tid: TIDA,
             seq: 0,
-            idx: 5,
+            idx: 1,
             funcid: 301,
         }),
-        "late ROW preserved with its slot evidence: {:?}",
+        "late hole-filling ROW preserved: {:?}",
         o.findings()
     );
     assert!(
         !o.findings().iter().any(|f| matches!(
             f,
-            Finding::LateRet { seq: 0, .. }
+            Finding::LateAlg { idx: 9, .. }
+                | Finding::LateRet { seq: 0, .. }
                 | Finding::DoubleRet { seq: 0, .. }
                 | Finding::OrphanRet { seq: 0, .. }
         )),
-        "late RET for a non-hung consumed key stays absorbed: {:?}",
+        "past-T stragglers and redundant RET stay silent: {:?}",
         o.findings()
+    );
+}
+
+/// Round-4 F1: every retained ALG identity carries its event
+/// generation (copied at join), and the record derives its
+/// agreed incarnation — a NOIMP-only record with no ROW or
+/// guard keeps its generation (nothing to lose it through).
+#[test]
+fn fix4_slot_identities_carry_generation() {
+    let mut o = Oracle::new(OracleScope::full());
+    let mut b = quiesced_idle(&[TIDA]);
+    b.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    let mut r = ret(TIDA, 0, 0);
+    r.generation = 7;
+    b.push_ret(r);
+    let mut a0 = alg(TIDA, 0, 0, wire::ALG_NOIMP);
+    a0.generation = 7;
+    b.push_alg(a0);
+    let mut a1 = alg_arr(TIDA, 0, 1, wire::ALG_NOIMP, ARR, 0);
+    a1.generation = 7;
+    b.push_alg(a1);
+    o.ingest(&b);
+    assert_eq!(o.done().len(), 1);
+    let w = &o.done()[0];
+    assert!(
+        w.algs.iter().all(|a| a.generation == 7),
+        "every identity carries its event generation: {:?}",
+        w.algs
+    );
+    assert_eq!(
+        w.generation(),
+        Some(7),
+        "agreed incarnation derives from unanimous slots"
+    );
+}
+
+/// Round-4 F1: mixed-generation evidence degrades (GenMixed)
+/// and the record derives no agreed incarnation (per-slot
+/// generations name the disagreeing slots instead).
+#[test]
+fn fix4_mixed_generation_derives_none() {
+    let mut o = Oracle::new(OracleScope::full());
+    let mut b = quiesced_idle(&[TIDA]);
+    b.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    let mut r = ret(TIDA, 0, 0);
+    r.generation = 7;
+    b.push_ret(r);
+    let mut a0 = alg(TIDA, 0, 0, wire::ALG_OK);
+    a0.generation = 7;
+    b.push_alg(a0);
+    let mut a1 = alg_arr(TIDA, 0, 1, wire::ALG_EMPTY, ARR, 0);
+    a1.generation = 9;
+    b.push_alg(a1);
+    o.ingest(&b);
+    assert_eq!(o.done().len(), 1);
+    let w = &o.done()[0];
+    assert!(
+        matches!(
+            w.outcome,
+            Outcome::Partial { ref reasons } if reasons.contains(&PartialReason::GenMixed)
+        ),
+        "mixed generations degrade: {:?}",
+        w.outcome
+    );
+    assert_eq!(w.generation(), None, "no agreed incarnation when mixed");
+    assert_eq!(w.algs.iter().find(|a| a.idx == 0).unwrap().generation, 7);
+    assert_eq!(w.algs.iter().find(|a| a.idx == 1).unwrap().generation, 9);
+}
+
+/// Round-4 reg3: verified terminator + fully-evidenced prefix +
+/// T+1-ONLY beyond evidence discards the DISPATCH/READ bits
+/// (they can only come from the T+1 garbage walk — every
+/// below-T slot read clean and dispatched, so no below-T gap
+/// could have produced them). Prefix-exact L3-tail rule: a
+/// valid warm table Completes instead of Partialling on
+/// adjacent-nonzero noise.
+#[test]
+fn fix4_t1_garbage_filtered_prefix_exact() {
+    let mut scope = OracleScope::full();
+    scope.known_t.insert(ARR, (3, 0));
+    let mut o = Oracle::new(scope);
+    let mut b = ScanBatch {
+        quiesced: false,
+        now_ns: 1_000,
+        ..ScanBatch::default()
+    };
+    b.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    let mut r = ret(TIDA, 0, 0);
+    r.generation = 0;
+    b.push_ret(r);
+    for j in 0..3u64 {
+        let mut a = alg(TIDA, 0, j, wire::ALG_OK);
+        a.generation = 0;
+        b.push_alg(a);
+        let mut row = row(TIDA, 0, j);
+        row.generation = 0;
+        b.push_row(row);
+    }
+    let mut t = alg_arr(TIDA, 0, 3, wire::ALG_EMPTY, ARR, 0);
+    t.generation = 0;
+    b.push_alg(t);
+    // T+1 garbage walk (readable nonzero past the verified
+    // terminator) + its fault bits.
+    let mut g = alg(TIDA, 0, 4, wire::ALG_OK);
+    g.generation = 0;
+    b.push_alg(g);
+    b.trunc
+        .insert(OP, wire::TRUNC_DISPATCH | wire::TRUNC_WALK_READ);
+    o.ingest(&b);
+    o.finish(2_000);
+    assert_eq!(o.done().len(), 1);
+    assert!(
+        matches!(o.done()[0].outcome, Outcome::Complete { .. }),
+        "T+1-only garbage filters prefix-exact: {:?}",
+        o.done()[0].outcome
+    );
+    assert_eq!(o.done()[0].true_t, TrueT::Proven(3));
+}
+
+/// Round-4 reg3 (F5 preserved): no verified terminator (stale
+/// cache, slot T live) keeps the T+1 walk surfacing growth —
+/// the filter never fires without its terminator.
+#[test]
+fn fix4_t1_filter_needs_verified_terminator() {
+    let mut scope = OracleScope::full();
+    scope.known_t.insert(ARR, (3, 0));
+    let mut o = Oracle::new(scope);
+    let mut b = ScanBatch {
+        quiesced: false,
+        now_ns: 1_000,
+        ..ScanBatch::default()
+    };
+    b.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    let mut r = ret(TIDA, 0, 0);
+    r.generation = 0;
+    b.push_ret(r);
+    for j in 0..5u64 {
+        let mut a = alg(TIDA, 0, j, wire::ALG_OK);
+        a.generation = 0;
+        b.push_alg(a);
+        let mut row = row(TIDA, 0, j);
+        row.generation = 0;
+        b.push_row(row);
+    }
+    b.trunc
+        .insert(OP, wire::TRUNC_DISPATCH | wire::TRUNC_WALK_READ);
+    o.ingest(&b);
+    o.finish(2_000);
+    assert_eq!(o.done().len(), 1);
+    assert!(
+        matches!(
+            o.done()[0].outcome,
+            Outcome::Partial { ref reasons } if reasons
+                .iter()
+                .any(|r| matches!(r, PartialReason::CacheStale { .. }))
+        ),
+        "stale cache still surfaces via T+1 walk: {:?}",
+        o.done()[0].outcome
+    );
+}
+
+/// Round-4 reg3 (F2 preserved): a below-T hole keeps the
+/// DISPATCH/READ bits (attribution needs a fully-evidenced
+/// prefix — gaps fail closed).
+#[test]
+fn fix4_t1_filter_needs_clean_prefix() {
+    let mut scope = OracleScope::full();
+    scope.known_t.insert(ARR, (3, 0));
+    let mut o = Oracle::new(scope);
+    let mut b = ScanBatch {
+        quiesced: false,
+        now_ns: 1_000,
+        ..ScanBatch::default()
+    };
+    b.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    let mut r = ret(TIDA, 0, 0);
+    r.generation = 0;
+    b.push_ret(r);
+    // Hole at 1 (prefix NOT fully evidenced).
+    for j in [0u64, 2] {
+        let mut a = alg(TIDA, 0, j, wire::ALG_OK);
+        a.generation = 0;
+        b.push_alg(a);
+        let mut row = row(TIDA, 0, j);
+        row.generation = 0;
+        b.push_row(row);
+    }
+    let mut t = alg_arr(TIDA, 0, 3, wire::ALG_EMPTY, ARR, 0);
+    t.generation = 0;
+    b.push_alg(t);
+    let mut g = alg(TIDA, 0, 4, wire::ALG_OK);
+    g.generation = 0;
+    b.push_alg(g);
+    b.trunc
+        .insert(OP, wire::TRUNC_DISPATCH | wire::TRUNC_WALK_READ);
+    o.ingest(&b);
+    o.finish(2_000);
+    assert_eq!(o.done().len(), 1);
+    assert!(
+        matches!(
+            o.done()[0].outcome,
+            Outcome::Partial { ref reasons } if reasons.contains(&PartialReason::Trunc(
+                wire::TRUNC_DISPATCH | wire::TRUNC_WALK_READ
+            ))
+        ),
+        "holed prefix keeps the bits (F2): {:?}",
+        o.done()[0].outcome
     );
 }
 

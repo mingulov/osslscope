@@ -98,6 +98,7 @@
 //! one ALG), so the worst case is unchanged.
 
 use osslscope_ebpf_common as wire;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// On-ring record sizes (payload rounded to 8 + 8B ringbuf header).
@@ -266,7 +267,7 @@ impl ScanBatch {
 }
 
 /// Termination confidence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum TrueT {
     Proven(u64),
     Candidate(u64),
@@ -276,7 +277,7 @@ pub enum TrueT {
 }
 
 /// Why an invocation is partial (explicit, never silent).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum PartialReason {
     Holes(Vec<u64>),
     Unreadable(Vec<u64>),
@@ -331,7 +332,7 @@ pub enum PartialReason {
 }
 
 /// Why an invocation was abandoned.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum AbandonReason {
     /// A skip landed over its unretired, RET-less record.
     SkipVictim,
@@ -360,7 +361,7 @@ pub enum AbandonReason {
 }
 
 /// Per-invocation outcome.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Outcome {
     Complete {
         true_t: u64,
@@ -409,15 +410,38 @@ pub struct WalkDone {
     pub rows: Vec<wire::ScanRowEvent>,
 }
 
+impl WalkDone {
+    /// Agreed array incarnation across the retained slot
+    /// identities (all slots agree and at least one exists),
+    /// else None (mixed incarnations — the GenMixed reason
+    /// fired and per-slot generations name the disagreeing
+    /// slots — or no slot evidence at all). Derived honestly
+    /// from retained evidence, never stamped.
+    pub fn generation(&self) -> Option<u64> {
+        let mut it = self.algs.iter().map(|a| a.generation);
+        let first = it.next()?;
+        if it.all(|g| g == first) {
+            Some(first)
+        } else {
+            None
+        }
+    }
+}
+
 /// One joined slot identity (the per-slot evidence a WALK-DONE
-/// retains natively — class + read status, not the full ring
-/// record).
+/// retains natively — class + read status + event generation,
+/// not the full ring record).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AlgIdentity {
     pub idx: u64,
     pub class: u16,
     pub status: u8,
     pub weak: u8,
+    /// Array incarnation the slot was read under (copied from
+    /// the ALG event at join — per-slot generation evidence,
+    /// so mixed incarnations name their slots instead of
+    /// vanishing into a GenMixed reason alone).
+    pub generation: u64,
 }
 
 /// Joined slot identities of an open, in idx order.
@@ -429,6 +453,7 @@ fn open_identities(o: &Open) -> Vec<AlgIdentity> {
             class: a.class,
             status: a.status,
             weak: a.weak,
+            generation: a.generation,
         })
         .collect()
 }
@@ -605,27 +630,29 @@ pub struct Oracle {
     findings: Vec<Finding>,
     stats: DrainStats,
     batches: u64,
-    /// Post-drain outcome evidence (bounded): production takes
-    /// `done` every poll, so late joins and straggler records
-    /// consult this after `done` — a consumed key is absorbed
-    /// (or LATE-joined when hung), never orphaned. Skipped
-    /// outcomes are not joinable and stay out.
-    recent: BTreeMap<(u32, u64), RecentClose>,
-    recent_order: std::collections::VecDeque<(u32, u64)>,
+    /// Post-drain outcome evidence (bounded, per-tid): production
+    /// takes `done` every poll, so late joins, straggler records
+    /// and nesting correlation consult this after `done` — a
+    /// consumed key is absorbed (or LATE-joined when hung),
+    /// never orphaned. Skipped outcomes are not joinable and
+    /// stay out. Per-tid queues (never a global FIFO) so foreign
+    /// closes can never evict a nesting pair.
+    recent: BTreeMap<u32, TidRecent>,
     corrections: Vec<Correction>,
 }
 
 /// Post-drain close evidence for one key: existence + hung-ness
-/// for late joins, plus the correctable verdict (outcome + op) —
-/// a later dangling close rewrites these in place and emits a
-/// [`Correction`], so a consumed Complete never stands on mixed
-/// evidence (evicted keys are honestly uncorrectable — the
-/// Nested finding is their only mark).
+/// for late joins, plus the correctable verdict (outcome + op +
+/// TRUE-T) — a later dangling close rewrites outcome/op in
+/// place and emits a [`Correction`], so a consumed Complete
+/// never stands on mixed evidence; TRUE-T scopes late-data
+/// findings to the required prefix.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RecentClose {
     hung: bool,
     outcome: Outcome,
     op: u32,
+    true_t: TrueT,
 }
 
 /// Post-drain verdict correction (a consumed verdict's rewrite —
@@ -640,9 +667,30 @@ pub struct Correction {
     pub op: u32,
 }
 
-/// Bound on retained post-drain closes (FIFO eviction — late
-/// joins past the bound orphan honestly).
-const RECENT_CAP: usize = 4096;
+/// Post-drain closes for one tid (FIFO — eviction always drops
+/// the oldest sibling, never the newest the nesting rule
+/// correlates; foreign tids have their own queues and can
+/// never evict this tid's pairs).
+#[derive(Debug, Default)]
+struct TidRecent {
+    order: std::collections::VecDeque<u64>,
+    closes: BTreeMap<u64, RecentClose>,
+    last_batch: u64,
+}
+
+/// Per-tid retained closes (nesting depth is single digits in
+/// practice — 64 nested inners under one open outer is already
+/// absurd; the cap only ever drops unselectable older
+/// siblings).
+const RECENT_PER_TID_CAP: usize = 64;
+
+/// Distinct tids retained (LRU-evicted when idle AND without
+/// opens — a tid with an open invocation is never evicted, so
+/// its pairs are present whenever it can taint; if every tid
+/// has an open past the cap (a thousand concurrent in-flight
+/// queries — absurd), the map grows past it rather than
+/// dropping a live tid's evidence).
+const RECENT_TID_CAP: usize = 1024;
 
 /// Where a correlated nesting pair's verdict lives (routes the
 /// taint to the sticky open, the live done rewrite, or the
@@ -653,6 +701,40 @@ enum PairSite {
     Done,
     Recent,
     Solo,
+}
+
+/// Late-data scope for one closed key (which straggler slots
+/// are recovery evidence worth a finding).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LateScope {
+    /// Tainted verdict (terminal — late evidence unactionable).
+    Silent,
+    /// Required prefix through T (terminator slot included —
+    /// a late terminator proves termination post-close).
+    Through(u64),
+    /// No terminator (every slot is required prefix).
+    All,
+}
+
+impl LateScope {
+    fn of(outcome: &Outcome, true_t: TrueT) -> Self {
+        if matches!(outcome, Outcome::Tainted { .. }) {
+            return LateScope::Silent;
+        }
+        match true_t {
+            TrueT::Proven(t) | TrueT::Candidate(t) => LateScope::Through(t),
+            TrueT::EmptyTable => LateScope::Through(0),
+            TrueT::Unknown => LateScope::All,
+        }
+    }
+
+    fn keeps(self, idx: u64) -> bool {
+        match self {
+            LateScope::Silent => false,
+            LateScope::Through(t) => idx <= t,
+            LateScope::All => true,
+        }
+    }
 }
 
 /// Where a closed key's evidence lives (live verdict or
@@ -852,25 +934,54 @@ impl Oracle {
         );
         let joinable = !matches!(w.outcome, Outcome::Skipped { .. });
         if joinable {
-            let key = (w.tid, w.seq);
-            if !self.recent.contains_key(&key) {
-                self.recent_order.push_back(key);
+            let tid = w.tid;
+            let seq = w.seq;
+            let qr = self.recent.entry(tid).or_default();
+            if !qr.closes.contains_key(&seq) {
+                qr.order.push_back(seq);
             }
-            self.recent.insert(
-                key,
+            qr.closes.insert(
+                seq,
                 RecentClose {
                     hung,
                     outcome: w.outcome.clone(),
                     op: w.op,
+                    true_t: w.true_t,
                 },
             );
-            while self.recent_order.len() > RECENT_CAP {
-                if let Some(old) = self.recent_order.pop_front() {
-                    self.recent.remove(&old);
+            qr.last_batch = self.batches;
+            while qr.order.len() > RECENT_PER_TID_CAP {
+                if let Some(old) = qr.order.pop_front() {
+                    qr.closes.remove(&old);
                 }
             }
+            self.evict_idle_tids();
         }
         self.done.push(w);
+    }
+
+    /// Enforce the global tid cap: evict the least-recently-used
+    /// tid that has no open invocation (its closes can never be
+    /// correlated — correlation only fires on live tids). Tids
+    /// with opens are never evicted; if every tid has an open
+    /// past the cap, the map grows (a thousand concurrent
+    /// in-flight queries is absurd — soundness over bounds
+    /// there).
+    fn evict_idle_tids(&mut self) {
+        while self.recent.len() > RECENT_TID_CAP {
+            let victim = self
+                .recent
+                .iter()
+                .filter(|(t, _)| !self.open.keys().any(|(ot, _)| ot == *t))
+                .min_by_key(|(_, qr)| qr.last_batch)
+                .map(|(t, _)| *t);
+            match victim {
+                Some(t) => {
+                    self.recent.remove(&t);
+                }
+                None => break,
+            }
+        }
     }
 
     /// A key's close evidence, if any: live `done` first (it
@@ -887,8 +998,27 @@ impl Oracle {
             });
         }
         self.recent
-            .get(&(tid, seq))
+            .get(&tid)
+            .and_then(|qr| qr.closes.get(&seq))
             .map(|r| ClosedAs::Recent { hung: r.hung })
+    }
+
+    /// Late-data scope for a closed key (None = unknown key, an
+    /// orphan): Tainted verdicts are terminal (late evidence is
+    /// unactionable — silent); proven/candidate TRUE-T scopes to
+    /// the required prefix (idx ≤ T — past-terminator stragglers
+    /// are meaningless, silent); EmptyTable scopes to slot 0
+    /// (only a slot-0 record contradicts empty); anything else
+    /// (no terminator) keeps every slot (recovery has no
+    /// boundary to be past).
+    fn late_scope(&self, tid: u32, seq: u64) -> Option<LateScope> {
+        if let Some(w) = self.done.iter().find(|w| w.tid == tid && w.seq == seq) {
+            return Some(LateScope::of(&w.outcome, w.true_t));
+        }
+        self.recent
+            .get(&tid)
+            .and_then(|qr| qr.closes.get(&seq))
+            .map(|r| LateScope::of(&r.outcome, r.true_t))
     }
 
     /// Ingest one drain batch (drain order across kinds when
@@ -932,13 +1062,17 @@ impl Oracle {
 
         // 2. Retain loss/TRUNC history on every open spanning this
         // drain (R5 — evaluated over the full invocation, never
-        // the closing batch alone).
+        // the closing batch alone). The retained set covers ring
+        // drops AND TRUNC-subsystem map pressure (a lost flag bit
+        // or generation bump hides evidence exactly like a ring
+        // drop — both degrade via DrainLoss, batch-wide).
         let ring_delta: u64 = [
             wire::LOSS_RING_CALL,
             wire::LOSS_RING_RET,
             wire::LOSS_RING_GUARD,
             wire::LOSS_RING_ALG,
             wire::LOSS_RING_ROW,
+            wire::LOSS_MAP_TRUNC,
         ]
         .iter()
         .map(|id| b.loss.get(id).copied().unwrap_or(0))
@@ -1152,22 +1286,28 @@ impl Oracle {
     fn ingest_alg(&mut self, a: &wire::ScanAlgEvent) {
         let key = (a.tid, a.seq);
         let Some(o) = self.open.get_mut(&key) else {
-            if self.closed(a.tid, a.seq).is_none() {
-                self.findings.push(Finding::OrphanAlg {
-                    tid: a.tid,
-                    seq: a.seq,
-                    idx: a.idx,
-                });
-            } else {
-                // Straggler for a closed key: recovery evidence
-                // (never silently discarded).
-                self.findings.push(Finding::LateAlg {
-                    tid: a.tid,
-                    seq: a.seq,
-                    idx: a.idx,
-                    status: a.status,
-                    class: a.class,
-                });
+            match self.late_scope(a.tid, a.seq) {
+                None => {
+                    self.findings.push(Finding::OrphanAlg {
+                        tid: a.tid,
+                        seq: a.seq,
+                        idx: a.idx,
+                    });
+                }
+                Some(scope) if scope.keeps(a.idx) => {
+                    // Required-prefix straggler: recovery
+                    // evidence (never silently discarded).
+                    self.findings.push(Finding::LateAlg {
+                        tid: a.tid,
+                        seq: a.seq,
+                        idx: a.idx,
+                        status: a.status,
+                        class: a.class,
+                    });
+                }
+                // Tainted-terminal or past-terminator: silent
+                // (unactionable or meaningless).
+                Some(_) => {}
             }
             return;
         };
@@ -1205,7 +1345,7 @@ impl Oracle {
     /// Ingest one ROW: retained whole (array/generation/
     /// callback data — consistency with the slot verdict and
     /// the RET is checked at close; the record rides the
-    /// WALK-DONE for relocation and adaptation).
+    /// WALK-DONE as the native callback evidence).
     fn ingest_row(&mut self, r: &wire::ScanRowEvent) {
         match self.open.get_mut(&(r.tid, r.seq)) {
             Some(o) => {
@@ -1214,21 +1354,27 @@ impl Oracle {
                 o.row_events.push(*r);
             }
             None => {
-                if self.closed(r.tid, r.seq).is_none() {
-                    self.findings.push(Finding::OrphanRow {
-                        tid: r.tid,
-                        seq: r.seq,
-                        idx: r.idx,
-                    });
-                } else {
-                    // Straggler for a closed key: recovery
-                    // evidence (never silently discarded).
-                    self.findings.push(Finding::LateRow {
-                        tid: r.tid,
-                        seq: r.seq,
-                        idx: r.idx,
-                        funcid: r.funcid,
-                    });
+                match self.late_scope(r.tid, r.seq) {
+                    None => {
+                        self.findings.push(Finding::OrphanRow {
+                            tid: r.tid,
+                            seq: r.seq,
+                            idx: r.idx,
+                        });
+                    }
+                    Some(scope) if scope.keeps(r.idx) => {
+                        // Required-prefix straggler: recovery
+                        // evidence (never silently discarded).
+                        self.findings.push(Finding::LateRow {
+                            tid: r.tid,
+                            seq: r.seq,
+                            idx: r.idx,
+                            funcid: r.funcid,
+                        });
+                    }
+                    // Tainted-terminal or past-terminator:
+                    // silent (unactionable or meaningless).
+                    Some(_) => {}
                 }
             }
         }
@@ -1274,13 +1420,14 @@ impl Oracle {
         {
             return (None, s, PairSite::Done);
         }
-        if let Some((_, s)) = self
+        // Consumed closes on this tid (per-tid queue — foreign
+        // tids can never evict the pair).
+        if let Some(s) = self
             .recent
-            .keys()
-            .filter(|(t, _)| *t == tid)
-            .max_by_key(|(_, s)| *s)
+            .get(&tid)
+            .and_then(|qr| qr.closes.keys().filter(|s| **s != seq).max().copied())
         {
-            return (None, *s, PairSite::Recent);
+            return (None, s, PairSite::Recent);
         }
         (None, seq, PairSite::Solo)
     }
@@ -1322,7 +1469,11 @@ impl Oracle {
                 }
             }
             PairSite::Recent => {
-                if let Some(r) = self.recent.get_mut(&(tid, by_seq)) {
+                if let Some(r) = self
+                    .recent
+                    .get_mut(&tid)
+                    .and_then(|qr| qr.closes.get_mut(&by_seq))
+                {
                     r.outcome = Outcome::Tainted { by_seq: seq };
                     r.op = UNKNOWN_OP;
                     self.corrections.push(Correction {
@@ -1707,6 +1858,32 @@ impl Oracle {
         let unobs: Vec<u64> = (0..unobs_limit)
             .filter(|j| !attached.contains(&(*j as u32)))
             .collect();
+        // T+1 garbage filter, prefix half (evaluated before the
+        // gap lists move into reasons below): verified
+        // terminator + fully-evidenced prefix. The TRUNC block
+        // further below conjoins the T+1-only beyond evidence.
+        let prefix_for_t1_filter = match min_empty {
+            Some(t) if t >= 1 => {
+                holes.is_empty()
+                    && unread.is_empty()
+                    && unobs.is_empty()
+                    && attached.iter().all(|j| {
+                        let j = *j as u64;
+                        if j >= t {
+                            return true;
+                        }
+                        match o.algs.get(&j) {
+                            Some(a) if a.status == wire::ALG_OK => {
+                                let n = o.row_events.iter().filter(|r| r.idx == j).count();
+                                (1..=127).contains(&n)
+                            }
+                            Some(a) if a.status == wire::ALG_NOIMP => true,
+                            _ => false,
+                        }
+                    })
+            }
+            _ => false,
+        };
         if !holes.is_empty() {
             reasons.push(PartialReason::Holes(holes));
         }
@@ -1810,11 +1987,37 @@ impl Oracle {
         // explains prefix gaps, else it is beyond-terminator
         // noise discarded with its reads (a below-terminator
         // name failure always leaves an UNREADABLE gap).
+        //
+        // T+1 garbage filter, beyond half (conjoined with the
+        // prefix half above): beyond evidence confined to T+1 (a
+        // single non-EMPTY record there, or none at all) ⟹ the
+        // DISPATCH/READ bits can only come from beyond-T noise
+        // (the T+1 garbage walk, aborts past it, or healed
+        // below-T transients whose evidence is complete NOW) →
+        // mask them (prefix-exact L3-tail rule). Anything else
+        // keeps them: multi-slot beyond evidence
+        // (unattributable soup — F12 stays Partial). NOIMP/NAME/
+        // ALGS bits are never masked here (below-T real evidence
+        // or guard contract — inseparable from T+1 garbage of
+        // the same kind).
+        let t1_only = match min_empty {
+            Some(t) if t >= 1 => o
+                .algs
+                .iter()
+                .filter(|(j, a)| {
+                    **j > t && attached.contains(&(**j as u32)) && a.status != wire::ALG_EMPTY
+                })
+                .all(|(j, _)| *j == t + 1),
+            _ => false,
+        };
         let mut trunc_bits = o.trunc_accum
             & (wire::TRUNC_ALGS
                 | wire::TRUNC_DISPATCH
                 | wire::TRUNC_NO_STORE
                 | wire::TRUNC_WALK_READ);
+        if t1_only && prefix_for_t1_filter {
+            trunc_bits &= !(wire::TRUNC_DISPATCH | wire::TRUNC_WALK_READ);
+        }
         let gaps = reasons.iter().any(|r| {
             matches!(
                 r,
