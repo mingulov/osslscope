@@ -251,14 +251,18 @@ pub struct TraversalWindow {
 ///   record with no rows at all proves an empty dispatch
 ///   (Complete records are ring-loss quiescent) and bills an
 ///   empty candidate list, honestly.
+///
 /// Only Complete in-window records adapt (proven tables);
 /// partial/tainted/abandoned/skipped records stay in the
-/// traversal outcome + PARTIAL reasons.
+/// traversal outcome + PARTIAL reasons. `generation` is the
+/// count drain's current fence generation (R03) — adapted sites
+/// join the current shelf, so they stamp it like shelf-mates.
 pub fn adapt_traversal_sites(
     done: &[WalkDone],
     anchor: &TraversalAnchor,
     admitted_by_op: &BTreeMap<u32, u64>,
     window: &TraversalWindow,
+    generation: u32,
 ) -> Vec<SiteExecution> {
     let completes = done.iter().filter(|w| {
         matches!(w.outcome, crate::scan::oracle::Outcome::Complete { .. })
@@ -312,7 +316,7 @@ pub fn adapt_traversal_sites(
             };
             Some(SiteExecution {
                 site: anchor.site.clone(),
-                generation: 0,
+                generation,
                 candidates,
                 candidates_coverage,
                 calls,
@@ -4530,11 +4534,30 @@ where
                 start_ns: self.window_start_ns,
                 end_ns: effective_end_ns,
             };
+            // R03: adapted sites join the CURRENT shelf, so they
+            // stamp the current fence generation (the max over the
+            // current shelf; an empty current shelf means the
+            // latest fenced gen + 1, or 0 when nothing ever fenced).
+            let generation = drain
+                .current
+                .iter()
+                .map(|s| s.generation)
+                .max()
+                .or_else(|| {
+                    drain
+                        .fenced
+                        .iter()
+                        .map(|g| g.generation)
+                        .max()
+                        .map(|m| m + 1)
+                })
+                .unwrap_or(0);
             drain.current.extend(adapt_traversal_sites(
                 &t.done,
                 &anchor,
                 &t.admitted_by_op,
                 &window,
+                generation,
             ));
         }
         let mut counters = drain.counters.clone();
@@ -5090,17 +5113,15 @@ pub fn run_with_dirs(
         dirs,
         trust,
     ) {
-        Ok((onboard::RunSet::Triple(set), _)) => {
-            run_inner(
-                cfg,
-                target,
-                onboard::ObjectPaths {
-                    harvest: set.harvest.clone(),
-                    count: set.count.clone(),
-                },
-                Some(traversal_attach(&set, true)?),
-            )
-        }
+        Ok((onboard::RunSet::Triple(set), _)) => run_inner(
+            cfg,
+            target,
+            onboard::ObjectPaths {
+                harvest: set.harvest.clone(),
+                count: set.count.clone(),
+            },
+            Some(traversal_attach(&set, true)?),
+        ),
         Ok((onboard::RunSet::PairOnly(objects), _)) => {
             // Pair-only install (no members file anywhere): the
             // ordinary harvest-only run, exactly as before.
@@ -5216,6 +5237,7 @@ struct TraversalAttach {
 /// Verified byte snapshots for a resolved triple (one bounded
 /// read per role — the same bytes the provenance hashes, the
 /// backend loads, and the harvest/count loaders consume).
+#[derive(Debug)]
 struct TripleBytes {
     harvest: Vec<u8>,
     count: Vec<u8>,
@@ -5234,8 +5256,9 @@ fn triple_snapshot(set: &onboard::ObjectSet) -> anyhow::Result<(TripleProvenance
                 explicit: bool|
      -> anyhow::Result<(ObjectProvenance, Vec<u8>)> {
         let bytes = if explicit {
-            onboard::read_bounded(path, onboard::MAX_OBJECT_SCAN_BYTES)
-                .map_err(|e| anyhow::anyhow!("{} object {}: {e}", role.describe(), path.display()))?
+            onboard::read_bounded(path, onboard::MAX_OBJECT_SCAN_BYTES).map_err(|e| {
+                anyhow::anyhow!("{} object {}: {e}", role.describe(), path.display())
+            })?
         } else {
             onboard::verify_role_receipt_bytes(role, path)
                 .map_err(|e| anyhow::anyhow!("BPF objects: {}", e.full()))?
@@ -5251,7 +5274,8 @@ fn triple_snapshot(set: &onboard::ObjectSet) -> anyhow::Result<(TripleProvenance
             bytes,
         ))
     };
-    let (harvest, harvest_bytes) = snap(onboard::ObjectRole::Harvest, &set.harvest, set.explicit[0])?;
+    let (harvest, harvest_bytes) =
+        snap(onboard::ObjectRole::Harvest, &set.harvest, set.explicit[0])?;
     let (count, count_bytes) = snap(onboard::ObjectRole::Count, &set.count, set.explicit[1])?;
     let (members, members_bytes) =
         snap(onboard::ObjectRole::Members, &set.members, set.explicit[2])?;
@@ -5267,6 +5291,25 @@ fn triple_snapshot(set: &onboard::ObjectSet) -> anyhow::Result<(TripleProvenance
             members: members_bytes,
         },
     ))
+}
+
+/// Anchor-or-degrade decision (pure): an explicit traversal
+/// request without an anchor refuses (the operator demanded the
+/// impossible); automatic selection without an anchor degrades
+/// to harvest-only (init-mode and dispatch-blind runs keep
+/// working exactly as before — the operator never asked for
+/// traversal). Traversal never guesses an offset either way.
+fn anchor_or_degrade(
+    anchor: Option<(PathBuf, u64)>,
+    auto: bool,
+) -> anyhow::Result<Option<(PathBuf, u64)>> {
+    match (anchor, auto) {
+        (Some(a), _) => Ok(Some(a)),
+        (None, true) => Ok(None),
+        (None, false) => anyhow::bail!(
+            "traversal requires the builtin query anchor (init-mode and dispatch-blind targets cannot traverse)"
+        ),
+    }
 }
 
 /// Wrap an attached discovery session for the run: harvest-only
@@ -5289,15 +5332,10 @@ fn wrap_discovery(
             session,
         ))));
     };
-    let Some((exe_path, off)) = session.query_anchor() else {
-        if t.auto {
-            return Ok(CaptureDiscovery::HarvestOnly(Box::new(LiveDiscovery::new(
-                session,
-            ))));
-        }
-        anyhow::bail!(
-            "traversal requires the builtin query anchor (init-mode and dispatch-blind targets cannot traverse)"
-        );
+    let Some((exe_path, off)) = anchor_or_degrade(session.query_anchor(), t.auto)? else {
+        return Ok(CaptureDiscovery::HarvestOnly(Box::new(LiveDiscovery::new(
+            session,
+        ))));
     };
     let exe_str = exe_path.to_str().ok_or_else(|| {
         anyhow::anyhow!("traversal anchor path is not UTF-8: {}", exe_path.display())
@@ -5548,6 +5586,24 @@ mod tests {
         TableRetirement,
     };
 
+    #[test]
+    fn fix2_anchor_or_degrade_decision_table() {
+        // Anchor present: both modes proceed (decision carries it).
+        let a = Some((PathBuf::from("/lib/libcrypto.so.3"), 0x26e4a0u64));
+        assert_eq!(anchor_or_degrade(a.clone(), true).unwrap(), a);
+        assert_eq!(anchor_or_degrade(a.clone(), false).unwrap(), a);
+        // Anchor missing: automatic selection degrades (init-mode
+        // and dispatch-blind runs keep working harvest-only)...
+        assert_eq!(anchor_or_degrade(None, true).unwrap(), None);
+        // ...while an explicit traversal request refuses loud (the
+        // operator demanded the impossible).
+        let err = anchor_or_degrade(None, false).unwrap_err();
+        assert!(
+            err.to_string().contains("builtin query anchor"),
+            "refusal names the anchor: {err:#}"
+        );
+    }
+
     static F11_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
     /// A receipt-backed fixture prefix: copies the three built BPF
@@ -5673,20 +5729,13 @@ mod tests {
         // yields exactly MAX_ANCHOR_SCAN_BYTES, never the whole
         // file.
         let n = F11_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let path = std::env::temp_dir().join(format!(
-            "osslscope-f11-anchor-{}-{}",
-            std::process::id(),
-            n
-        ));
+        let path =
+            std::env::temp_dir().join(format!("osslscope-f11-anchor-{}-{}", std::process::id(), n));
         let cap = onboard::MAX_ANCHOR_SCAN_BYTES as usize;
         let big = vec![0x41u8; cap + 64];
         std::fs::write(&path, &big).unwrap();
         let got = read_anchor_prefix(&path).expect("prefix reads");
-        assert_eq!(
-            got.len(),
-            cap,
-            "anchor read must truncate to the cap"
-        );
+        assert_eq!(got.len(), cap, "anchor read must truncate to the cap");
         assert_eq!(&got[..], &big[..cap]);
     }
 
@@ -7076,7 +7125,8 @@ mod tests {
                     300,
                 ),
             ];
-            let sites = adapt_traversal_sites(&done, &anchor_stub(), &census(&[(1, 7)]), &full_window());
+            let sites =
+                adapt_traversal_sites(&done, &anchor_stub(), &census(&[(1, 7)]), &full_window(), 0);
             assert_eq!(sites.len(), 1);
             let s = &sites[0];
             assert_eq!(s.site.offset, 0x1234);
@@ -7095,6 +7145,34 @@ mod tests {
             assert_eq!(s.candidates[0].funcid, 300);
             assert!(s.candidates.iter().any(|c| c.weak_alias));
             assert!(s.candidates.iter().any(|c| !c.weak_alias));
+        }
+
+        #[test]
+        fn fix2_adaptation_stamps_current_generation() {
+            use crate::scan::oracle::Outcome;
+            use osslscope_ebpf_common as wire;
+            // Adapted sites join the count drain's CURRENT shelf —
+            // they stamp the current fence generation (R03), never
+            // a hardcoded 0 (which would claim initial-epoch
+            // binding after fences moved on).
+            let done = vec![walk_full(
+                1,
+                1,
+                Outcome::Complete {
+                    true_t: 2,
+                    cached: false,
+                },
+                vec![
+                    ident(0, 0, wire::ALG_OK, 0),
+                    ident(1, wire::OTHER_CLASS, wire::ALG_EMPTY, 0),
+                ],
+                vec![row_ev(0, 300)],
+                100,
+            )];
+            let sites =
+                adapt_traversal_sites(&done, &anchor_stub(), &census(&[(1, 7)]), &full_window(), 7);
+            assert_eq!(sites.len(), 1);
+            assert_eq!(sites[0].generation, 7, "current fence generation stamps");
         }
 
         #[test]
@@ -7121,7 +7199,8 @@ mod tests {
                     )
                 })
                 .collect();
-            let sites = adapt_traversal_sites(&done, &anchor_stub(), &census(&[(1, 7)]), &full_window());
+            let sites =
+                adapt_traversal_sites(&done, &anchor_stub(), &census(&[(1, 7)]), &full_window(), 0);
             assert_eq!(sites.len(), 1);
             assert_eq!(sites[0].calls, 7);
         }
@@ -7147,9 +7226,13 @@ mod tests {
                 vec![row_ev(0, 300)],
                 100,
             )];
-            assert!(adapt_traversal_sites(&done, &anchor_stub(), &census(&[]), &full_window()).is_empty());
             assert!(
-                adapt_traversal_sites(&done, &anchor_stub(), &census(&[(1, 0)]), &full_window()).is_empty(),
+                adapt_traversal_sites(&done, &anchor_stub(), &census(&[]), &full_window(), 0)
+                    .is_empty()
+            );
+            assert!(
+                adapt_traversal_sites(&done, &anchor_stub(), &census(&[(1, 0)]), &full_window(), 0)
+                    .is_empty(),
                 "a zero census bills nothing"
             );
         }
@@ -7192,7 +7275,8 @@ mod tests {
                 start_ns: 0,
                 end_ns: 500,
             };
-            let sites = adapt_traversal_sites(&done, &anchor_stub(), &census(&[(1, 7)]), &window);
+            let sites =
+                adapt_traversal_sites(&done, &anchor_stub(), &census(&[(1, 7)]), &window, 0);
             assert_eq!(sites.len(), 1);
             assert_eq!((sites[0].first_ns, sites[0].last_ns), (100, 100));
         }
@@ -7219,8 +7303,13 @@ mod tests {
                     vec![row_ev(0, 300)],
                     100,
                 )];
-                let sites =
-                    adapt_traversal_sites(&done, &anchor_stub(), &census(&[(1, 7)]), &full_window());
+                let sites = adapt_traversal_sites(
+                    &done,
+                    &anchor_stub(),
+                    &census(&[(1, 7)]),
+                    &full_window(),
+                    0,
+                );
                 assert_eq!(sites.len(), 1);
                 assert_eq!(
                     sites[0].candidates_coverage,
@@ -7252,7 +7341,8 @@ mod tests {
                 vec![row_ev(0, 300), row_ev(9, 301)],
                 100,
             )];
-            let sites = adapt_traversal_sites(&done, &anchor_stub(), &census(&[(1, 7)]), &full_window());
+            let sites =
+                adapt_traversal_sites(&done, &anchor_stub(), &census(&[(1, 7)]), &full_window(), 0);
             assert_eq!(sites.len(), 1);
             assert_eq!(sites[0].candidates.len(), 1);
             assert_eq!(sites[0].candidates[0].funcid, 300);
@@ -7306,7 +7396,7 @@ mod tests {
                 ),
             ];
             let counts = census(&[(1, 7), (2, 5), (3, 3)]);
-            let sites = adapt_traversal_sites(&done, &anchor_stub(), &counts, &full_window());
+            let sites = adapt_traversal_sites(&done, &anchor_stub(), &counts, &full_window(), 0);
             assert_eq!(sites.len(), 3);
             // UNREADABLE bounds as `other` (and degrades — a bad
             // read); out-of-range class ids (version skew) bound
@@ -7324,7 +7414,9 @@ mod tests {
             assert_eq!(sites[0].calls, 7);
             assert_eq!(sites[1].calls, 5);
             assert_eq!(sites[2].calls, 3);
-            assert!(adapt_traversal_sites(&[], &anchor_stub(), &counts, &full_window()).is_empty());
+            assert!(
+                adapt_traversal_sites(&[], &anchor_stub(), &counts, &full_window(), 0).is_empty()
+            );
         }
 
         fn triple_prov() -> TripleProvenance {
