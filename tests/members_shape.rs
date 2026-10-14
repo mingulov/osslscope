@@ -2,7 +2,7 @@
 //!
 //! Pins the `osslscope-members` object contract via the pure
 //! `loader::prepare` path (no caps needed): 513 progs (512 baked-slot
-//! members + entry), exact 14-map dims, baked-slot distinctness, a
+//! members + entry), exact 15-map dims, baked-slot distinctness, a
 //! forbidden-helper scan, and size records. Behavioral proof (baking,
 //! walk contents) is the live `members_probe` suite's job.
 //!
@@ -259,8 +259,8 @@ fn s1_prepare_513() {
     assert_eq!(prep.progs.len(), 513, "512 members + member_entry");
     assert_eq!(
         prep.maps.len(),
-        14,
-        "exactly the 14 member maps (D 13 + item-5 BUCKET)"
+        15,
+        "exactly the 15 member maps (D 13 + item-5 BUCKET + round-2 TRUNC_SEQ)"
     );
 }
 
@@ -347,8 +347,8 @@ fn s3_bodies_distinct() {
     assert_eq!(hashes.len(), 512, "all 512 member bodies distinct");
 }
 
-/// S4: the 14 map dims pinned (6 retained + 7 item-3 scan-plane
-/// + item-5 BUCKET; item-7 EVENTS at 16MiB).
+/// S4: the 15 map dims pinned (6 retained + 7 item-3 scan-plane
+/// + item-5 BUCKET + round-2 TRUNC_SEQ; item-7 EVENTS at 16MiB).
 #[test]
 fn s4_map_dims() {
     let Some(prep) = prepared() else {
@@ -371,6 +371,7 @@ fn s4_map_dims() {
         ("T_CACHE", 1, 8, 16, 1024, 0),
         ("CTRL", 2, 4, 24, 1, 0),
         ("ATTEMPT", 6, 4, 8, 1, 0),
+        ("TRUNC_SEQ", 6, 4, 8, 1, 0),
     ];
     assert_eq!(prep.maps.len(), want.len());
     for (got, w) in prep.maps.iter().zip(want.iter()) {
@@ -558,21 +559,24 @@ fn s7_retired_maps_absent() {
     }
 }
 
-/// S8: the const-folded specials (items 3–5) — member_000 carries
-/// the ns-first read + RET emit + empty-slot gate, member_511 the
-/// guard eligibility + GUARD event; members 1..510 are fold-free
-/// and near-uniform (same code modulo baked immediates). Two known
-/// variances, both proven innocent via objdump diff (same helper
-/// sequence, same stores): J=10 == KIND_SCAN_ALG, so LLVM CSEs the
-/// idx/kind stores at three scan-ALG emit sites (48B smaller —
-/// the explicit EMPTY/NOIMP emits added two more CSE-eligible
-/// sites to the one OK-site CSE; walk_dispatch/classify stay
-/// shared `.text`, so no other J gets this luck); J=56 keeps its
-/// idx immediate in a register across the scan-ALG emits (three
-/// extra reload/mov insns, 24B larger — pure regalloc quirk, same
-/// class as D's J=40; the T-gate itself compiles identically for
-/// all J as `t > J-1 ⟺ walk`, verified at 056/057 and 010/011).
-/// Any other outlier fails loud — investigate, don't widen.
+/// S8: the const-folded specials (items 3–5 + round-2) —
+/// member_511 carries the guard eligibility + GUARD event (above
+/// the middle); member_000 is the SMALLEST (its ns-first read +
+/// RET emit + empty-slot gate no longer outweigh the middle's
+/// T+1 verification block, which member_0 lacks — dead-code
+/// eliminated, since it always walks and T+1 == 0 is
+/// impossible); members 1..510 carry the T+1 verifier uniformly.
+/// Three known variances, all proven innocent via objdump diff
+/// (identical helper-call multisets; J=1 additionally identical
+/// stack stores): J=1 folds `1 == t+1` to `t == 0` (128B smaller
+/// — arithmetically exact for all u64, 5 fewer branches, same
+/// effects); J=10 == KIND_SCAN_ALG keeps its idx/kind CSE at the
+/// scan-ALG emit sites (interior now — the J=1 fold undercuts
+/// it); J=56 keeps its idx immediate in a register across the
+/// scan-ALG emits (24B larger — pure regalloc quirk, identical
+/// +24 delta as before; the T-gate compiles identically for all
+/// other J). Any other outlier fails loud — investigate, don't
+/// widen.
 #[test]
 fn s8_folded_specials() {
     let Some(obj) = object_bytes() else {
@@ -601,8 +605,8 @@ fn s8_folded_specials() {
         "raw main bytes: member_000={s000} member_511={s511} mid_min={mid_min} mid_max={mid_max}"
     );
     assert!(
-        s000 > *mid_max,
-        "member_000 above middle (ns-first + RET emit + empty gate)"
+        s000 < *mid_min,
+        "member_000 smallest (no T+1 verifier — it always walks)"
     );
     assert!(
         s511 > *mid_max,
@@ -620,8 +624,8 @@ fn s8_folded_specials() {
         .collect();
     assert_eq!(
         mins,
-        ["member_010"],
-        "only known small outlier is J=10 (KIND_SCAN_ALG CSE)"
+        ["member_001"],
+        "only known small outlier is J=1 (1 == t+1 folds to t == 0)"
     );
     assert_eq!(
         maxs,
@@ -629,7 +633,7 @@ fn s8_folded_specials() {
         "only known large outlier is J=56 (regalloc mov)"
     );
     assert!(
-        mid_max - mid_min <= 72,
-        "members 1..510 near-uniform (48 + 24 known)"
+        mid_max - mid_min <= 152,
+        "members 1..510 near-uniform (128 J=1 fold + 24 J=56 regalloc)"
     );
 }

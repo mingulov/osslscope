@@ -191,6 +191,7 @@ T_CACHE
 CTRL
 ATTEMPT
 BUCKET
+TRUNC_SEQ
 ```
 
 All maps hold numeric keys/values/counters/cursors except `EVENTS`,
@@ -227,15 +228,20 @@ generation, userspace-written — the writer is the item-4 backend
 GEN-mismatch as cold), `CTRL`
 (EXPECTED/epoch/SKIP-ALL/governor occupancy bound), `ATTEMPT`
 (entry-hit census), `BUCKET` (tid → tokens:8|last-refill:56 —
-per-thread tier-1 rate state, numeric only). The entry plane reads
+per-thread tier-1 rate state, numeric only), `TRUNC_SEQ`
+(monotonic TRUNC flag-event generation — the drain-race guard,
+numeric only). The entry plane reads
 NO target memory (args + map cells only — the entry cannot see rv;
 pinned by `probe_read_allowlist_is_complete`), so admission/skip
-decisions never retain target bytes. Stage-D member reads (8 sites,
+decisions never retain target bytes. Stage-D member reads (9 sites,
 pinned): the slot tuple + dispatch + name (v1 shapes, same
 bounds), the member-0 `no_store` verdict read (u32 → TRUNC flag,
 never emitted), the would-skip-path `no_store` verdict re-read
 (u32 → branch only — only a successfully-read zero skips; the
-value is never retained past the branch), and the guard's single
+value is never retained past the branch), the T+1 boundary names
+read (u64 → branch only — zero proves the terminator via an
+explicit ALG_EMPTY, anything else cold-walks; the value is never
+retained past the branch), and the guard's single
 positional slot-512 names read (names-present verdict → GUARD
 event only — no pointee content is read or emitted). Items 4–5 add
 no read sites (scan kinds re-emit the walked bytes; the bucket
