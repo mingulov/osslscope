@@ -525,6 +525,7 @@ pub fn run_detailed(
     let session_cfg = session::DiscoveryConfig {
         provider: cfg.provider.clone(),
         object: cfg.object.clone(),
+        object_bytes: None,
         builtin: cfg.builtin,
         legacy: cfg.legacy,
         table: cfg.table.clone(),

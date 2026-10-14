@@ -195,14 +195,21 @@ pub struct TraversalAnchor {
 /// anyway, so an unreadable anchor refuses instead of guessing).
 /// Missing build-id falls back to `unverified:dev:ino` (the same
 /// fallback [`object_id_for_mapping`] uses for unmapped files).
+/// Bounded anchor-exe prefix for build-id fingerprinting (never
+/// a whole-file read — the anchor honors the read budget like
+/// every other object scan; build-id notes live early, so a
+/// prefix suffices and large exes keep their identity).
+fn read_anchor_prefix(exe_path: &Path) -> Option<Vec<u8>> {
+    onboard::read_prefix(exe_path, onboard::MAX_ANCHOR_SCAN_BYTES).ok()
+}
+
 fn traversal_anchor(exe_path: &Path, off: u64) -> anyhow::Result<TraversalAnchor> {
     use std::os::unix::fs::MetadataExt as _;
     let meta = std::fs::metadata(exe_path)
         .map_err(|e| anyhow::anyhow!("traversal anchor {} unreadable: {e}", exe_path.display()))?;
     let device = meta.dev();
     let inode = meta.ino();
-    let object = std::fs::read(exe_path)
-        .ok()
+    let object = read_anchor_prefix(exe_path)
         .and_then(|bytes| crate::discovery::elf::read_build_id(&bytes))
         .map(|id| ObjectId(format!("build:{id}")))
         .unwrap_or_else(|| ObjectId(format!("unverified:{device}:{inode}")));
@@ -216,80 +223,94 @@ fn traversal_anchor(exe_path: &Path, off: u64) -> anyhow::Result<TraversalAnchor
     })
 }
 
+/// Capture window bounds (capture-ns): the inventory adaptation
+/// only bills in-window records (post-window settles and
+/// pre-window strays never become executions).
+pub struct TraversalWindow {
+    pub start_ns: u64,
+    pub end_ns: u64,
+}
+
 /// Adapt completed traversal records into count-session sites
-/// (one [`SiteExecution`] per query op at the anchor): the
-/// ALG/ROW identities become candidate algorithm classes
-/// (registry spellings; EMPTY slots prove table shape, not
-/// served algorithms, so they contribute no class; UNREADABLE
-/// contributes `other`); `calls` counts completed queries. Only
-/// `Complete` records adapt (proven tables); partial/tainted/
-/// abandoned/skipped records stay in the traversal outcome +
-/// PARTIAL reasons. Coverage is `Complete` when every adapted
-/// record's served classes are fully named (a proven table
-/// classifies every live slot — the advertising provider stays
-/// explicitly `unknown`, which is attribution, not a missing
-/// candidate); NOIMP slots serve names the walker does not read,
-/// so any NOIMP in the group degrades the site to `Unknown`.
-pub fn adapt_traversal_sites(done: &[WalkDone], anchor: &TraversalAnchor) -> Vec<SiteExecution> {
-    use std::collections::BTreeMap;
-    let completes = done
-        .iter()
-        .filter(|w| matches!(w.outcome, crate::scan::oracle::Outcome::Complete { .. }));
+/// (one [`SiteExecution`] per query op at the anchor). Every
+/// field derives from real evidence — never fabricated:
+/// - `calls` is the admitted-query census for the op
+///   (kernel-counted, complete) — never the observed record
+///   count (a traversal sample). An op with no census entry (or
+///   a zero count) bills nothing: its records stay in the
+///   traversal outcome section, but no execution is minted.
+/// - identities are per retained dispatch ROW (real funcids from
+///   the walked dispatch tables — never funcid 0, never the
+///   query anchor as a callback), each carrying its slot's
+///   registry class. Rows for slots with no ALG record are stray
+///   (a close finding already names them) and never inventoried.
+/// - coverage follows R01 evidence ambiguity exactly like the
+///   harvest path: MIXED rides along as Unknown (ambiguous names
+///   never complete), TRUNCATED/OVERLONG/UNKNOWN/UNREADABLE
+///   degrade like bad reads; only all-OK slots complete. A
+///   record with no rows at all proves an empty dispatch
+///   (Complete records are ring-loss quiescent) and bills an
+///   empty candidate list, honestly.
+/// Only Complete in-window records adapt (proven tables);
+/// partial/tainted/abandoned/skipped records stay in the
+/// traversal outcome + PARTIAL reasons.
+pub fn adapt_traversal_sites(
+    done: &[WalkDone],
+    anchor: &TraversalAnchor,
+    admitted_by_op: &BTreeMap<u32, u64>,
+    window: &TraversalWindow,
+) -> Vec<SiteExecution> {
+    let completes = done.iter().filter(|w| {
+        matches!(w.outcome, crate::scan::oracle::Outcome::Complete { .. })
+            && w.event_ns >= window.start_ns
+            && w.event_ns <= window.end_ns
+    });
     let mut by_op: BTreeMap<u32, Vec<&WalkDone>> = BTreeMap::new();
     for w in completes {
         by_op.entry(w.op).or_default().push(w);
     }
     by_op
         .into_iter()
-        .map(|(op, records)| {
-            let calls = records.len() as u64;
+        .filter_map(|(op, records)| {
+            // Real count evidence or nothing: the census bills
+            // the executions; an uncounted op mints nothing.
+            let calls = match admitted_by_op.get(&op).copied().unwrap_or(0) {
+                0 => return None,
+                n => n,
+            };
             let first_ns = records.iter().map(|w| w.event_ns).min().unwrap_or(0);
             let last_ns = records.iter().map(|w| w.event_ns).max().unwrap_or(0);
-            let has_noimp = records.iter().any(|w| {
-                w.algs
-                    .iter()
-                    .any(|a| a.status == osslscope_ebpf_common::ALG_NOIMP)
-            });
-            let candidates_coverage = if has_noimp {
+            let mut ambiguous = false;
+            let mut candidates: Vec<CandidateIdentity> = Vec::new();
+            for w in &records {
+                for r in &w.rows {
+                    let Some(slot) = w.algs.iter().find(|a| a.idx == r.idx) else {
+                        continue;
+                    };
+                    if slot.status != osslscope_ebpf_common::ALG_OK {
+                        // R01 ambiguity (harvest rule): mixed
+                        // rides along Unknown; every other non-OK
+                        // verdict degrades like a bad read.
+                        ambiguous = true;
+                    }
+                    candidates.push(CandidateIdentity::new(
+                        ObjectId("unknown".to_string()),
+                        "unknown".to_string(),
+                        op,
+                        r.funcid,
+                        vec![alg_class_name(slot.class)],
+                        slot.weak != 0,
+                    ));
+                }
+            }
+            candidates.sort();
+            candidates.dedup();
+            let candidates_coverage = if ambiguous {
                 CandidateCoverage::Unknown
             } else {
                 CandidateCoverage::Complete
             };
-            let mut candidates: Vec<CandidateIdentity> = records
-                .iter()
-                .map(|w| {
-                    let mut classes: Vec<String> = w
-                        .algs
-                        .iter()
-                        .filter_map(|a| {
-                            use osslscope_ebpf_common as wire;
-                            match a.status {
-                                wire::ALG_OK
-                                | wire::ALG_UNKNOWN
-                                | wire::ALG_OVERLONG
-                                | wire::ALG_TRUNCATED
-                                | wire::ALG_MIXED => Some(alg_class_name(a.class)),
-                                wire::ALG_UNREADABLE => Some("other".to_string()),
-                                _ => None,
-                            }
-                        })
-                        .collect();
-                    classes.sort();
-                    classes.dedup();
-                    let weak = w.algs.iter().any(|a| a.weak != 0);
-                    CandidateIdentity::new(
-                        ObjectId("unknown".to_string()),
-                        "unknown".to_string(),
-                        op,
-                        0,
-                        classes,
-                        weak,
-                    )
-                })
-                .collect();
-            candidates.sort();
-            candidates.dedup();
-            SiteExecution {
+            Some(SiteExecution {
                 site: anchor.site.clone(),
                 generation: 0,
                 candidates,
@@ -298,7 +319,7 @@ pub fn adapt_traversal_sites(done: &[WalkDone], anchor: &TraversalAnchor) -> Vec
                 first_ns,
                 last_ns,
                 installed_at: None,
-            }
+            })
         })
         .collect()
 }
@@ -349,6 +370,10 @@ pub struct TraversalDelta {
     /// In-window backend polls this delta covers (1 per round
     /// poll; the baseline poll contributes 0).
     pub polls: u64,
+    /// Admitted-query census snapshot (per op, cumulative since
+    /// attach): last-wins into the capture; the inventory
+    /// adaptation bills executions against it.
+    pub admitted: BTreeMap<u32, u64>,
 }
 
 /// Retained traversal outcome (on [`Capture`] when traversal ran;
@@ -366,6 +391,10 @@ pub struct TraversalCapture {
     /// The final tail drain failed (records kept are the
     /// drained-so-far prefix — proved facts, H7).
     pub finish_error: Option<String>,
+    /// Latest admitted-query census snapshot (per op): the real
+    /// count evidence the inventory adaptation bills executions
+    /// against (never the observed record count).
+    pub admitted_by_op: BTreeMap<u32, u64>,
 }
 
 impl TraversalCapture {
@@ -378,6 +407,12 @@ impl TraversalCapture {
         self.polls += tail.polls;
         self.throttled = tail.throttled;
         self.detached = tail.detached;
+        // Census snapshots are cumulative (never shrink): the
+        // latest non-empty snapshot wins; an empty tail (no poll)
+        // keeps the accumulated one.
+        if !tail.admitted_by_op.is_empty() {
+            self.admitted_by_op = tail.admitted_by_op;
+        }
         if self.provenance.is_none() {
             self.provenance = tail.provenance;
         }
@@ -819,6 +854,7 @@ impl DiscoveryPort for LiveTraversalDiscovery {
             findings: delta.findings,
             partial_reasons: reasons,
             polls: 1,
+            admitted: delta.admitted,
         })
     }
 
@@ -834,6 +870,7 @@ impl DiscoveryPort for LiveTraversalDiscovery {
             Ok(delta) => {
                 out.done = delta.done;
                 out.findings = delta.findings;
+                out.admitted_by_op = delta.admitted;
             }
             Err(e) => {
                 out.finish_error = Some(format!("{e:#}"));
@@ -3079,6 +3116,9 @@ where
                 t.done.extend(tdelta.done);
                 t.findings.extend(tdelta.findings);
                 t.polls += tdelta.polls;
+                if !tdelta.admitted.is_empty() {
+                    t.admitted_by_op = tdelta.admitted;
+                }
             }
         }
         // One fence per round (Exec > ProviderChanged >
@@ -4479,13 +4519,23 @@ where
         // Traversal inventory: completed query records adapt
         // into count-session sites at the anchor (ordinary
         // report/check production — the same evidence the
-        // traversal outcome retains, counted once here).
+        // traversal outcome retains, counted once here). Only
+        // in-window records bill (post-count-close settles never
+        // become executions); calls come from the admitted-query
+        // census, never the observed record count.
         if let (Some(t), Some(anchor)) =
             (self.traversal.as_ref(), self.discovery.traversal_anchor())
         {
-            drain
-                .current
-                .extend(adapt_traversal_sites(&t.done, &anchor));
+            let window = TraversalWindow {
+                start_ns: self.window_start_ns,
+                end_ns: effective_end_ns,
+            };
+            drain.current.extend(adapt_traversal_sites(
+                &t.done,
+                &anchor,
+                &t.admitted_by_op,
+                &window,
+            ));
         }
         let mut counters = drain.counters.clone();
         counters.extend(self.activity.iter().cloned());
@@ -5003,50 +5053,61 @@ pub fn run(cfg: &Config, target: Target) -> anyhow::Result<Capture> {
     if cfg.duration.is_zero() {
         anyhow::bail!("--duration must be > 0 (no --forever in v1)");
     }
-    // Full coexistence with automatic selection (Decision 8R): an
-    // explicit members object demands the triple (fail-closed);
-    // otherwise the automatic triple is attempted — complete
-    // compatible sets traverse, pair-only installs stay
-    // harvest-only (unchanged), and broken triples refuse (never
-    // a silent harvest-only fallback).
-    if cfg.members_object.is_some() {
-        return run_with_traversal(cfg, target, cfg.members_object.as_deref());
+    // Full coexistence with automatic selection (Decision 8R) over
+    // the production search set (see `run_with_dirs`).
+    run_with_dirs(
+        cfg,
+        target,
+        &onboard::default_object_dirs(),
+        &onboard::TrustPolicy::production(),
+    )
+}
+
+/// Ordinary run over an explicit object search set: an explicit
+/// members object demands the triple (fail-closed); otherwise the
+/// shared run-set decision runs — complete compatible sets
+/// traverse, pair-only prefixes stay harvest-only (unchanged),
+/// and mixed/stale/broken sets refuse exactly like doctor (never
+/// a silent harvest-only fallback where doctor rejects). `run` is
+/// this with the production default dirs + trust; lanes and
+/// custom prefixes pass their own.
+pub fn run_with_dirs(
+    cfg: &Config,
+    target: Target,
+    dirs: &[PathBuf],
+    trust: &onboard::TrustPolicy,
+) -> anyhow::Result<Capture> {
+    if cfg.duration.is_zero() {
+        anyhow::bail!("--duration must be > 0 (no --forever in v1)");
     }
-    match onboard::resolve_set(
+    if cfg.members_object.is_some() {
+        return run_with_traversal_in(cfg, target, cfg.members_object.as_deref(), dirs, trust);
+    }
+    match onboard::resolve_run_set(
         cfg.harvest_object.as_deref(),
         cfg.count_object.as_deref(),
         None,
-        &onboard::default_object_dirs(),
-        &onboard::TrustPolicy::production(),
+        dirs,
+        trust,
     ) {
-        Ok((set, _)) => {
-            let (provenance, members_bytes) = triple_snapshot(&set)?;
-            let objects = onboard::ObjectPaths {
-                harvest: set.harvest,
-                count: set.count.clone(),
-            };
+        Ok((onboard::RunSet::Triple(set), _)) => {
             run_inner(
                 cfg,
                 target,
-                objects,
-                Some(TraversalAttach {
-                    members: set.members,
-                    members_bytes,
-                    provenance,
-                }),
+                onboard::ObjectPaths {
+                    harvest: set.harvest.clone(),
+                    count: set.count.clone(),
+                },
+                Some(traversal_attach(&set, true)?),
             )
         }
-        Err(e) if e.is_not_found() => {
-            // Pair-only install (no members role anywhere): the
+        Ok((onboard::RunSet::PairOnly(objects), _)) => {
+            // Pair-only install (no members file anywhere): the
             // ordinary harvest-only run, exactly as before.
-            let (objects, _) = onboard::resolve_objects(
-                cfg.harvest_object.as_deref(),
-                cfg.count_object.as_deref(),
-                &onboard::default_object_dirs(),
-                &onboard::TrustPolicy::production(),
-            )
-            .map_err(|e| anyhow::anyhow!("BPF objects: {}", e.full()))?;
             run_inner(cfg, target, objects, None)
+        }
+        Ok((onboard::RunSet::NoObjects(pair_e), _)) => {
+            Err(anyhow::anyhow!("BPF objects: {}", pair_e.full()))
         }
         Err(e) => Err(anyhow::anyhow!("BPF objects: {}", e.full())),
     }
@@ -5062,29 +5123,62 @@ fn run_with_traversal(
     target: Target,
     members: Option<&Path>,
 ) -> anyhow::Result<Capture> {
-    let (set, _) = onboard::resolve_set(
-        cfg.harvest_object.as_deref(),
-        cfg.count_object.as_deref(),
+    run_with_traversal_in(
+        cfg,
+        target,
         members,
         &onboard::default_object_dirs(),
         &onboard::TrustPolicy::production(),
     )
+}
+
+/// `run_with_traversal` over an explicit search set (see
+/// `run_with_dirs`).
+fn run_with_traversal_in(
+    cfg: &Config,
+    target: Target,
+    members: Option<&Path>,
+    dirs: &[PathBuf],
+    trust: &onboard::TrustPolicy,
+) -> anyhow::Result<Capture> {
+    let (set, _) = onboard::resolve_set(
+        cfg.harvest_object.as_deref(),
+        cfg.count_object.as_deref(),
+        members,
+        dirs,
+        trust,
+    )
     .map_err(|e| anyhow::anyhow!("BPF objects: {}", e.full()))?;
-    let (provenance, members_bytes) = triple_snapshot(&set)?;
-    let objects = onboard::ObjectPaths {
-        harvest: set.harvest,
-        count: set.count.clone(),
-    };
     run_inner(
         cfg,
         target,
-        objects,
-        Some(TraversalAttach {
-            members: set.members,
-            members_bytes,
-            provenance,
-        }),
+        onboard::ObjectPaths {
+            harvest: set.harvest.clone(),
+            count: set.count.clone(),
+        },
+        Some(traversal_attach(&set, false)?),
     )
+}
+
+/// Build the traversal attach from a resolved triple: snapshot
+/// every role's bytes (implicit roles re-verified against their
+/// receipt — a swap between resolve and snapshot fails loud —
+/// explicit roles bounded-read, never receipt-checked) and retain
+/// all three snapshots so no loader re-reads a path (no reread
+/// drift between identity and loading). `auto` marks automatic
+/// selection (init-mode targets degrade to harvest-only —
+/// round-0 behavior preserved); explicit requests refuse loud on
+/// a missing anchor instead.
+fn traversal_attach(set: &onboard::ObjectSet, auto: bool) -> anyhow::Result<TraversalAttach> {
+    let (provenance, bytes) = triple_snapshot(set)?;
+    Ok(TraversalAttach {
+        members: set.members.clone(),
+        members_bytes: bytes.members,
+        harvest_bytes: bytes.harvest,
+        count_bytes: bytes.count,
+        provenance,
+        auto,
+    })
 }
 
 /// Run a full capture window with the traversal backend attached
@@ -5105,25 +5199,47 @@ pub fn run_traversal(
     run_with_traversal(cfg, target, req.members_object.as_deref())
 }
 
-/// Traversal attach request (resolved members object + its
-/// verified byte snapshot + the matched-set provenance the capture
-/// retains). Identity and loading share `members_bytes` — the
-/// backend never re-opens the path, so no swap can interpose
-/// between the hash and the load.
+/// Traversal attach request (resolved members object + every
+/// role's verified byte snapshot + the matched-set provenance the
+/// capture retains). Identity and loading share these bytes — no
+/// loader re-opens a path, so no swap can interpose between the
+/// hash and any load.
 struct TraversalAttach {
     members: PathBuf,
     members_bytes: Vec<u8>,
+    harvest_bytes: Vec<u8>,
+    count_bytes: Vec<u8>,
     provenance: TripleProvenance,
+    auto: bool,
 }
 
-/// Mint matched-set provenance for a resolved triple (bounded
-/// re-reads — a swap between resolve and hash fails loud, never
-/// huge) and retain the members byte snapshot the backend loads.
-fn triple_snapshot(set: &onboard::ObjectSet) -> anyhow::Result<(TripleProvenance, Vec<u8>)> {
+/// Verified byte snapshots for a resolved triple (one bounded
+/// read per role — the same bytes the provenance hashes, the
+/// backend loads, and the harvest/count loaders consume).
+struct TripleBytes {
+    harvest: Vec<u8>,
+    count: Vec<u8>,
+    members: Vec<u8>,
+}
+
+/// Mint matched-set provenance for a resolved triple and retain
+/// every role's byte snapshot. Implicit roles re-verify against
+/// their receipt HERE (a swap between resolve and snapshot fails
+/// loud — identity binds to THESE bytes); explicit roles are
+/// bounded-read only (operator-trusted, never receipt-checked).
+fn triple_snapshot(set: &onboard::ObjectSet) -> anyhow::Result<(TripleProvenance, TripleBytes)> {
     use sha2::Digest as _;
-    let hash = |role: &str, path: &Path| -> anyhow::Result<(ObjectProvenance, Vec<u8>)> {
-        let bytes = onboard::read_bounded(path, onboard::MAX_OBJECT_SCAN_BYTES)
-            .map_err(|e| anyhow::anyhow!("{role} object {}: {e}", path.display()))?;
+    let snap = |role: onboard::ObjectRole,
+                path: &Path,
+                explicit: bool|
+     -> anyhow::Result<(ObjectProvenance, Vec<u8>)> {
+        let bytes = if explicit {
+            onboard::read_bounded(path, onboard::MAX_OBJECT_SCAN_BYTES)
+                .map_err(|e| anyhow::anyhow!("{} object {}: {e}", role.describe(), path.display()))?
+        } else {
+            onboard::verify_role_receipt_bytes(role, path)
+                .map_err(|e| anyhow::anyhow!("BPF objects: {}", e.full()))?
+        };
         Ok((
             ObjectProvenance {
                 path: path.to_path_buf(),
@@ -5135,26 +5251,34 @@ fn triple_snapshot(set: &onboard::ObjectSet) -> anyhow::Result<(TripleProvenance
             bytes,
         ))
     };
-    let (harvest, _) = hash("harvest", &set.harvest)?;
-    let (count, _) = hash("count", &set.count)?;
-    let (members, members_bytes) = hash("members", &set.members)?;
+    let (harvest, harvest_bytes) = snap(onboard::ObjectRole::Harvest, &set.harvest, set.explicit[0])?;
+    let (count, count_bytes) = snap(onboard::ObjectRole::Count, &set.count, set.explicit[1])?;
+    let (members, members_bytes) =
+        snap(onboard::ObjectRole::Members, &set.members, set.explicit[2])?;
     Ok((
         TripleProvenance {
             harvest,
             count,
             members,
         },
-        members_bytes,
+        TripleBytes {
+            harvest: harvest_bytes,
+            count: count_bytes,
+            members: members_bytes,
+        },
     ))
 }
 
 /// Wrap an attached discovery session for the run: harvest-only
 /// by default; traversal runs pin the builtin query anchor and
-/// attach the members backend (full 512, production CTRL). Anchor
-/// refusal (init mode / dispatch-blind — traversal never guesses
-/// an offset) and backend-attach failure refuse BEFORE the window
-/// opens (no release yet — the caller resolves custody exactly
-/// like a discovery-attach failure).
+/// attach the members backend (full 512, production CTRL).
+/// Explicit traversal without an anchor (init mode /
+/// dispatch-blind — traversal never guesses an offset) refuses
+/// BEFORE the window opens (no release yet — the caller resolves
+/// custody exactly like a discovery-attach failure); automatic
+/// selection without an anchor degrades to harvest-only instead
+/// (existing init-mode runs keep working exactly as before —
+/// the operator never asked for traversal).
 fn wrap_discovery(
     session: DiscoverySession,
     traversal: Option<&TraversalAttach>,
@@ -5165,11 +5289,16 @@ fn wrap_discovery(
             session,
         ))));
     };
-    let (exe_path, off) = session.query_anchor().ok_or_else(|| {
-        anyhow::anyhow!(
+    let Some((exe_path, off)) = session.query_anchor() else {
+        if t.auto {
+            return Ok(CaptureDiscovery::HarvestOnly(Box::new(LiveDiscovery::new(
+                session,
+            ))));
+        }
+        anyhow::bail!(
             "traversal requires the builtin query anchor (init-mode and dispatch-blind targets cannot traverse)"
-        )
-    })?;
+        );
+    };
     let exe_str = exe_path.to_str().ok_or_else(|| {
         anyhow::anyhow!("traversal anchor path is not UTF-8: {}", exe_path.display())
     })?;
@@ -5205,10 +5334,15 @@ fn run_inner(
     traversal: Option<TraversalAttach>,
 ) -> anyhow::Result<Capture> {
     arm_signals();
-    // Already size-bounded by resolution; re-read bounded anyway
-    // (a swap between resolve and load fails loud, never huge).
-    let obj_bytes = onboard::read_bounded(&objects.count, onboard::MAX_OBJECT_SCAN_BYTES)
-        .map_err(|e| anyhow::anyhow!("count object {}: {e}", objects.count.display()))?;
+    // Triple runs load the retained count snapshot (no re-read —
+    // identity and loading share these bytes); harvest-only runs
+    // bounded-read the resolved path (a swap between resolve and
+    // load fails loud, never huge).
+    let obj_bytes = match traversal.as_ref() {
+        Some(t) => t.count_bytes.clone(),
+        None => onboard::read_bounded(&objects.count, onboard::MAX_OBJECT_SCAN_BYTES)
+            .map_err(|e| anyhow::anyhow!("count object {}: {e}", objects.count.display()))?,
+    };
     let prep = crate::loader::prepare(
         &obj_bytes,
         &crate::loader::COUNT_MAPS,
@@ -5281,6 +5415,7 @@ fn run_inner(
                 &crate::discovery::session::DiscoveryConfig {
                     provider: resolved.path,
                     object: objects.harvest,
+                    object_bytes: traversal.as_ref().map(|t| t.harvest_bytes.clone()),
                     builtin: resolved.builtin,
                     legacy: true,
                     table: cfg.table.clone(),
@@ -5362,6 +5497,7 @@ fn run_inner(
                 &crate::discovery::session::DiscoveryConfig {
                     provider: resolved.path,
                     object: objects.harvest,
+                    object_bytes: traversal.as_ref().map(|t| t.harvest_bytes.clone()),
                     builtin: resolved.builtin,
                     legacy: true,
                     table: cfg.table.clone(),
@@ -5411,6 +5547,148 @@ mod tests {
         AttachEvent, AttachKind, BackingRef, DiscoveredCandidate, DiscoveredObject, TableCoverage,
         TableRetirement,
     };
+
+    static F11_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// A receipt-backed fixture prefix: copies the three built BPF
+    /// objects under `<prefix>/lib/osslscope/` and writes an honest
+    /// install manifest, returning the object dir. Mirrors what
+    /// `scripts/install-dev.sh` lays down.
+    fn f11_prefix(test: &str) -> Option<PathBuf> {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("crates/ebpf/target/bpfel-unknown-none/release");
+        let h = dir.join("osslscope-harvest");
+        let c = dir.join("osslscope-count");
+        let m = dir.join("osslscope-members");
+        if !(h.exists() && c.exists() && m.exists()) {
+            return None;
+        }
+        let n = F11_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let prefix = std::env::temp_dir().join(format!(
+            "osslscope-f11-{}-{}-{}",
+            std::process::id(),
+            test,
+            n
+        ));
+        let objdir = prefix.join("lib").join("osslscope");
+        std::fs::create_dir_all(&objdir).unwrap();
+        let dsts = [
+            (objdir.join("osslscope-harvest"), &h),
+            (objdir.join("osslscope-count"), &c),
+            (objdir.join("osslscope-members"), &m),
+        ];
+        let mut arts = Vec::new();
+        for (dst, src) in &dsts {
+            std::fs::copy(src, dst).unwrap();
+            let sha = onboard::file_sha256_hex(dst).unwrap();
+            arts.push(serde_json::json!({
+                "role": "bpf-object",
+                "dest": dst.to_string_lossy(),
+                "sha256": sha,
+            }));
+        }
+        let rdir = prefix.join("share").join("osslscope");
+        std::fs::create_dir_all(&rdir).unwrap();
+        let manifest = serde_json::json!({
+            "schema": "osslscope-install-manifest-v1",
+            "artifacts": arts,
+        });
+        std::fs::write(
+            rdir.join(onboard::INSTALL_RECEIPT_NAME),
+            serde_json::to_string(&manifest).unwrap(),
+        )
+        .unwrap();
+        Some(objdir)
+    }
+
+    fn f11_trust() -> onboard::TrustPolicy {
+        onboard::TrustPolicy {
+            // SAFETY: getuid takes no arguments and always succeeds.
+            trusted_uids: vec![unsafe { libc::getuid() }],
+            check_ancestry: false,
+        }
+    }
+
+    #[test]
+    fn fix2_triple_snapshot_binds_one_read() {
+        // F11: the snapshot binds ONE read per role to identity —
+        // provenance hashes equal the loaded bytes' hashes, so the
+        // reported identity IS the loaded bytes (no reread drift).
+        let Some(objdir) = f11_prefix("bind") else {
+            return;
+        };
+        let trust = f11_trust();
+        let run = onboard::resolve_run_set(None, None, None, std::slice::from_ref(&objdir), &trust)
+            .expect("fixture triple resolves");
+        let onboard::RunSet::Triple(set) = run.0 else {
+            panic!("receipt-backed prefix must resolve a triple");
+        };
+        let (prov, bytes) = triple_snapshot(&set).expect("snapshot binds");
+        use sha2::Digest as _;
+        for (p, b) in [
+            (&prov.harvest, &bytes.harvest),
+            (&prov.count, &bytes.count),
+            (&prov.members, &bytes.members),
+        ] {
+            let hex: String = sha2::Sha256::digest(b)
+                .iter()
+                .map(|x| format!("{x:02x}"))
+                .collect();
+            assert_eq!(p.sha256, hex, "provenance must hash the loaded bytes");
+            assert!(!b.is_empty(), "snapshot must carry every role's bytes");
+        }
+    }
+
+    #[test]
+    fn fix2_triple_snapshot_stale_swap_refuses() {
+        // F11: a role file swapped after resolve (stale bytes under
+        // a live identity) refuses at snapshot time — the snapshot
+        // re-verifies implicit roles against the receipt instead of
+        // trusting the resolve-time read.
+        let Some(objdir) = f11_prefix("stale") else {
+            return;
+        };
+        let trust = f11_trust();
+        let run = onboard::resolve_run_set(None, None, None, std::slice::from_ref(&objdir), &trust)
+            .expect("fixture triple resolves");
+        let onboard::RunSet::Triple(set) = run.0 else {
+            panic!("receipt-backed prefix must resolve a triple");
+        };
+        triple_snapshot(&set).expect("honest snapshot binds");
+        // Swap the members file (same length, hostile bytes).
+        let mpath = objdir.join("osslscope-members");
+        let len = std::fs::metadata(&mpath).unwrap().len() as usize;
+        std::fs::write(&mpath, vec![0x7Fu8; len]).unwrap();
+        let err = triple_snapshot(&set).expect_err("swapped role must refuse");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("does not match") || msg.contains("receipt"),
+            "stale swap must name the receipt binding: {msg}"
+        );
+    }
+
+    #[test]
+    fn fix2_anchor_prefix_truncates() {
+        // F11: the anchor read is a bounded prefix — a >1MiB exe
+        // yields exactly MAX_ANCHOR_SCAN_BYTES, never the whole
+        // file.
+        let n = F11_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!(
+            "osslscope-f11-anchor-{}-{}",
+            std::process::id(),
+            n
+        ));
+        let cap = onboard::MAX_ANCHOR_SCAN_BYTES as usize;
+        let big = vec![0x41u8; cap + 64];
+        std::fs::write(&path, &big).unwrap();
+        let got = read_anchor_prefix(&path).expect("prefix reads");
+        assert_eq!(
+            got.len(),
+            cap,
+            "anchor read must truncate to the cap"
+        );
+        assert_eq!(&got[..], &big[..cap]);
+    }
 
     #[test]
     fn build_id_cache_parses_once_per_identity() {
@@ -6685,6 +6963,7 @@ mod tests {
             op: u32,
             outcome: crate::scan::oracle::Outcome,
             algs: Vec<crate::scan::oracle::AlgIdentity>,
+            rows: Vec<osslscope_ebpf_common::ScanRowEvent>,
             event_ns: u64,
         ) -> WalkDone {
             WalkDone {
@@ -6695,11 +6974,38 @@ mod tests {
                 outcome,
                 true_t: crate::scan::oracle::TrueT::Proven(6),
                 alg_count: algs.len(),
-                row_count: 0,
+                row_count: rows.len(),
                 guard: None,
                 algs,
                 event_ns,
-                rows: Vec::new(),
+                rows,
+            }
+        }
+
+        fn row_ev(idx: u64, funcid: u32) -> osslscope_ebpf_common::ScanRowEvent {
+            osslscope_ebpf_common::ScanRowEvent {
+                kind: osslscope_ebpf_common::KIND_SCAN_ROW,
+                op: 0,
+                funcid,
+                _pad: 0,
+                addr: 0x4400 + funcid as u64,
+                aux: 0xa000,
+                idx,
+                generation: 0,
+                tid: TPID,
+                _pad2: 0,
+                seq: 0,
+            }
+        }
+
+        fn census(pairs: &[(u32, u64)]) -> std::collections::BTreeMap<u32, u64> {
+            pairs.iter().copied().collect()
+        }
+
+        fn full_window() -> TraversalWindow {
+            TraversalWindow {
+                start_ns: 0,
+                end_ns: u64::MAX,
             }
         }
 
@@ -6741,6 +7047,7 @@ mod tests {
                         ident(0, class_a, wire::ALG_OK, 0),
                         ident(1, wire::OTHER_CLASS, wire::ALG_EMPTY, 0),
                     ],
+                    vec![row_ev(0, 300)],
                     100,
                 ),
                 walk_full(
@@ -6754,6 +7061,7 @@ mod tests {
                         ident(0, class_a, wire::ALG_OK, 1),
                         ident(1, wire::OTHER_CLASS, wire::ALG_EMPTY, 0),
                     ],
+                    vec![row_ev(0, 300)],
                     200,
                 ),
                 // Partial records never adapt (proven tables only).
@@ -6764,27 +7072,191 @@ mod tests {
                         reasons: vec![crate::scan::oracle::PartialReason::DrainLoss],
                     },
                     vec![ident(0, class_a, wire::ALG_OK, 0)],
+                    vec![row_ev(0, 300)],
                     300,
                 ),
             ];
-            let sites = adapt_traversal_sites(&done, &anchor_stub());
+            let sites = adapt_traversal_sites(&done, &anchor_stub(), &census(&[(1, 7)]), &full_window());
             assert_eq!(sites.len(), 1);
             let s = &sites[0];
             assert_eq!(s.site.offset, 0x1234);
-            assert_eq!(s.calls, 2, "completes count, partials excluded");
+            assert_eq!(s.calls, 7, "the census bills executions, not records");
             assert_eq!((s.first_ns, s.last_ns), (100, 200));
             // Proven table, every served class named (EMPTY is
             // shape, not a missing candidate).
             assert_eq!(s.candidates_coverage, CandidateCoverage::Complete);
             assert!(s.installed_at.is_none());
-            // EMPTY slots prove shape, not served algorithms (no
-            // class); the weak bit rides per-record candidates.
+            // One identity per (slot, funcid): the retained ROW's
+            // real funcid rides with its slot's class; the weak
+            // bit rides per-row candidates (dedup keeps both).
             assert_eq!(s.candidates.len(), 2);
             assert_eq!(s.candidates[0].algorithm_classes, vec![name_a.clone()]);
             assert_eq!(s.candidates[0].op, 1);
-            assert_eq!(s.candidates[0].funcid, 0);
+            assert_eq!(s.candidates[0].funcid, 300);
             assert!(s.candidates.iter().any(|c| c.weak_alias));
             assert!(s.candidates.iter().any(|c| !c.weak_alias));
+        }
+
+        #[test]
+        fn fix2_adaptation_bills_census_not_records() {
+            use crate::scan::oracle::Outcome;
+            use osslscope_ebpf_common as wire;
+            // Five observed records, seven kernel-counted admits:
+            // calls == 7 (the sample never becomes the count).
+            let done: Vec<WalkDone> = (0..5u64)
+                .map(|seq| {
+                    walk_full(
+                        seq,
+                        1,
+                        Outcome::Complete {
+                            true_t: 1,
+                            cached: false,
+                        },
+                        vec![
+                            ident(0, 0, wire::ALG_OK, 0),
+                            ident(1, wire::OTHER_CLASS, wire::ALG_EMPTY, 0),
+                        ],
+                        vec![row_ev(0, 300)],
+                        100 + seq,
+                    )
+                })
+                .collect();
+            let sites = adapt_traversal_sites(&done, &anchor_stub(), &census(&[(1, 7)]), &full_window());
+            assert_eq!(sites.len(), 1);
+            assert_eq!(sites[0].calls, 7);
+        }
+
+        #[test]
+        fn fix2_adaptation_drops_uncounted_ops() {
+            use crate::scan::oracle::Outcome;
+            use osslscope_ebpf_common as wire;
+            // Complete records but no census entry: no execution
+            // is minted (the records stay in the traversal outcome
+            // section — nothing is fabricated).
+            let done = vec![walk_full(
+                1,
+                1,
+                Outcome::Complete {
+                    true_t: 1,
+                    cached: false,
+                },
+                vec![
+                    ident(0, 0, wire::ALG_OK, 0),
+                    ident(1, wire::OTHER_CLASS, wire::ALG_EMPTY, 0),
+                ],
+                vec![row_ev(0, 300)],
+                100,
+            )];
+            assert!(adapt_traversal_sites(&done, &anchor_stub(), &census(&[]), &full_window()).is_empty());
+            assert!(
+                adapt_traversal_sites(&done, &anchor_stub(), &census(&[(1, 0)]), &full_window()).is_empty(),
+                "a zero census bills nothing"
+            );
+        }
+
+        #[test]
+        fn fix2_adaptation_filters_post_window_records() {
+            use crate::scan::oracle::Outcome;
+            use osslscope_ebpf_common as wire;
+            // The settle record (post-window) never becomes an
+            // execution; the in-window record bills.
+            let algs = vec![
+                ident(0, 0, wire::ALG_OK, 0),
+                ident(1, wire::OTHER_CLASS, wire::ALG_EMPTY, 0),
+            ];
+            let done = vec![
+                walk_full(
+                    1,
+                    1,
+                    Outcome::Complete {
+                        true_t: 1,
+                        cached: false,
+                    },
+                    algs.clone(),
+                    vec![row_ev(0, 300)],
+                    100,
+                ),
+                walk_full(
+                    2,
+                    1,
+                    Outcome::Complete {
+                        true_t: 1,
+                        cached: false,
+                    },
+                    algs,
+                    vec![row_ev(0, 300)],
+                    999,
+                ),
+            ];
+            let window = TraversalWindow {
+                start_ns: 0,
+                end_ns: 500,
+            };
+            let sites = adapt_traversal_sites(&done, &anchor_stub(), &census(&[(1, 7)]), &window);
+            assert_eq!(sites.len(), 1);
+            assert_eq!((sites[0].first_ns, sites[0].last_ns), (100, 100));
+        }
+
+        #[test]
+        fn fix2_adaptation_mixed_and_truncated_degrade() {
+            use crate::scan::oracle::Outcome;
+            use osslscope_ebpf_common as wire;
+            // R01 ambiguity: MIXED/TRUNCATED slots ride along but
+            // never Complete (harvest rule — mixed its own Unknown
+            // set, truncated a bad read).
+            for status in [wire::ALG_MIXED, wire::ALG_TRUNCATED] {
+                let done = vec![walk_full(
+                    1,
+                    1,
+                    Outcome::Complete {
+                        true_t: 1,
+                        cached: false,
+                    },
+                    vec![
+                        ident(0, 0, status, 0),
+                        ident(1, wire::OTHER_CLASS, wire::ALG_EMPTY, 0),
+                    ],
+                    vec![row_ev(0, 300)],
+                    100,
+                )];
+                let sites =
+                    adapt_traversal_sites(&done, &anchor_stub(), &census(&[(1, 7)]), &full_window());
+                assert_eq!(sites.len(), 1);
+                assert_eq!(
+                    sites[0].candidates_coverage,
+                    CandidateCoverage::Unknown,
+                    "status {status} degrades"
+                );
+                assert_eq!(sites[0].candidates.len(), 1, "the class rides along");
+                assert_eq!(sites[0].candidates[0].funcid, 300);
+            }
+        }
+
+        #[test]
+        fn fix2_adaptation_skips_stray_rows() {
+            use crate::scan::oracle::Outcome;
+            use osslscope_ebpf_common as wire;
+            // A row for a slot with no ALG record is stray (a close
+            // finding names it) — never inventoried.
+            let done = vec![walk_full(
+                1,
+                1,
+                Outcome::Complete {
+                    true_t: 1,
+                    cached: false,
+                },
+                vec![
+                    ident(0, 0, wire::ALG_OK, 0),
+                    ident(1, wire::OTHER_CLASS, wire::ALG_EMPTY, 0),
+                ],
+                vec![row_ev(0, 300), row_ev(9, 301)],
+                100,
+            )];
+            let sites = adapt_traversal_sites(&done, &anchor_stub(), &census(&[(1, 7)]), &full_window());
+            assert_eq!(sites.len(), 1);
+            assert_eq!(sites[0].candidates.len(), 1);
+            assert_eq!(sites[0].candidates[0].funcid, 300);
+            assert_eq!(sites[0].candidates_coverage, CandidateCoverage::Complete);
         }
 
         #[test]
@@ -6800,6 +7272,7 @@ mod tests {
                         cached: false,
                     },
                     vec![ident(0, wire::OTHER_CLASS, wire::ALG_UNREADABLE, 0)],
+                    vec![row_ev(0, 300)],
                     100,
                 ),
                 walk_full(
@@ -6810,11 +7283,13 @@ mod tests {
                         cached: false,
                     },
                     vec![ident(0, 0xBEEF, wire::ALG_OK, 0)],
+                    vec![row_ev(0, 301)],
                     150,
                 ),
-                // NOIMP serves a name the walker never reads (the
-                // record carries no class for it) — the op group
-                // degrades to Unknown (candidates may be missing).
+                // NOIMP slots have no implementation (no dispatch
+                // walk, no rows): a Complete record with no rows at
+                // all proves an empty dispatch and bills an empty
+                // candidate list, honestly Complete.
                 walk_full(
                     3,
                     3,
@@ -6826,21 +7301,30 @@ mod tests {
                         ident(0, wire::OTHER_CLASS, wire::ALG_NOIMP, 0),
                         ident(1, wire::OTHER_CLASS, wire::ALG_EMPTY, 0),
                     ],
+                    vec![],
                     180,
                 ),
             ];
-            let sites = adapt_traversal_sites(&done, &anchor_stub());
+            let counts = census(&[(1, 7), (2, 5), (3, 3)]);
+            let sites = adapt_traversal_sites(&done, &anchor_stub(), &counts, &full_window());
             assert_eq!(sites.len(), 3);
-            // UNREADABLE bounds as `other`; out-of-range class ids
-            // (version skew) bound as `other`, never panic.
+            // UNREADABLE bounds as `other` (and degrades — a bad
+            // read); out-of-range class ids (version skew) bound
+            // as `other`, never panic.
             assert_eq!(sites[0].candidates[0].algorithm_classes, vec!["other"]);
             assert_eq!(sites[1].candidates[0].algorithm_classes, vec!["other"]);
             assert_eq!(sites[0].candidates[0].op, 1);
             assert_eq!(sites[1].candidates[0].op, 2);
-            assert_eq!(sites[0].candidates_coverage, CandidateCoverage::Complete);
-            assert_eq!(sites[2].candidates_coverage, CandidateCoverage::Unknown);
-            assert!(sites[2].candidates[0].algorithm_classes.is_empty());
-            assert!(adapt_traversal_sites(&[], &anchor_stub()).is_empty());
+            assert_eq!(sites[0].candidates[0].funcid, 300);
+            assert_eq!(sites[1].candidates[0].funcid, 301);
+            assert_eq!(sites[0].candidates_coverage, CandidateCoverage::Unknown);
+            assert_eq!(sites[1].candidates_coverage, CandidateCoverage::Complete);
+            assert_eq!(sites[2].candidates_coverage, CandidateCoverage::Complete);
+            assert!(sites[2].candidates.is_empty());
+            assert_eq!(sites[0].calls, 7);
+            assert_eq!(sites[1].calls, 5);
+            assert_eq!(sites[2].calls, 3);
+            assert!(adapt_traversal_sites(&[], &anchor_stub(), &counts, &full_window()).is_empty());
         }
 
         fn triple_prov() -> TripleProvenance {
@@ -6905,6 +7389,7 @@ mod tests {
                 findings: vec![],
                 partial_reasons: vec!["traversal-storm".to_string()],
                 polls: 1,
+                admitted: census(&[]),
             };
             let d2 = TraversalDelta {
                 done: vec![walk(
@@ -6916,6 +7401,7 @@ mod tests {
                 findings: vec![OFinding::OrphanRet { tid: TPID, seq: 9 }],
                 partial_reasons: vec!["traversal-incomplete".to_string()],
                 polls: 1,
+                admitted: census(&[]),
             };
             let tail = TraversalCapture {
                 provenance: Some(triple_prov()),
@@ -6931,6 +7417,7 @@ mod tests {
                 throttled: true,
                 detached: false,
                 finish_error: None,
+                admitted_by_op: census(&[]),
             };
             let cfg = stub_config();
             let info = stub_info();
@@ -6964,10 +7451,12 @@ mod tests {
 
         #[test]
         fn traversal_completes_produce_inventory() {
-            // End-to-end through close_and_finalize: completed
-            // traversal records adapt into document sites AND
-            // executions (ordinary report/check production), with
-            // the exact ALG identities as candidate classes.
+            // End-to-end through close_and_finalize: in-window
+            // completed traversal records adapt into document
+            // sites AND executions (ordinary report/check
+            // production), billed against the admitted-query
+            // census (not the count backend, not the record
+            // count), with per-row identities as candidates.
             use crate::scan::oracle::Outcome;
             use osslscope_ebpf_common as wire;
             let name_a = crate::kinds::ALG_NAMES[0].name.to_string();
@@ -6983,11 +7472,13 @@ mod tests {
                         ident(0, 0, wire::ALG_OK, 0),
                         ident(1, wire::OTHER_CLASS, wire::ALG_EMPTY, 0),
                     ],
-                    6_000_000_000,
+                    vec![row_ev(0, 300)],
+                    5_000_000_000,
                 )],
                 findings: vec![],
                 partial_reasons: vec![],
                 polls: 1,
+                admitted: census(&[(1, 3)]),
             };
             let tail = TraversalCapture {
                 provenance: Some(triple_prov()),
@@ -6997,6 +7488,7 @@ mod tests {
                 throttled: false,
                 detached: false,
                 finish_error: None,
+                admitted_by_op: census(&[]),
             };
             let cfg = stub_config();
             let info = stub_info();
@@ -7014,17 +7506,18 @@ mod tests {
                 &cancelled,
             );
             let cap = runner.setup_and_run().expect("stub run completes");
-            // The document carries the adapted site (calls = 1
-            // completed query, exact identities, anchor key).
+            // The document carries the adapted site (calls = 3
+            // census admits, per-row identity, anchor key).
             assert_eq!(cap.document.sites.len(), 1);
             let site = &cap.document.sites[0];
-            assert_eq!(site.calls, 1);
+            assert_eq!(site.calls, 3);
             assert_eq!(site.site.offset, 0x1234);
             assert_eq!(site.candidates.len(), 1);
             assert_eq!(site.candidates[0].algorithm_classes, vec![name_a.clone()]);
+            assert_eq!(site.candidates[0].funcid, 300);
             // …and executions (what report/check render) include it.
             assert_eq!(cap.executions.len(), 1);
-            assert_eq!(cap.executions[0].count, 1);
+            assert_eq!(cap.executions[0].count, 3);
             assert_eq!(cap.executions[0].id.alg_class, name_a);
             // The traversal outcome still retains the records.
             assert_eq!(cap.traversal.as_ref().unwrap().done.len(), 1);
@@ -7046,6 +7539,7 @@ mod tests {
                 findings: vec![],
                 partial_reasons: vec!["traversal-storm".to_string()],
                 polls: 1,
+                admitted: census(&[]),
             };
             let tail = TraversalCapture {
                 provenance: Some(triple_prov()),
@@ -7061,6 +7555,7 @@ mod tests {
                 throttled: false,
                 detached: true,
                 finish_error: None,
+                admitted_by_op: census(&[]),
             };
             let cfg = stub_config();
             let info = stub_info();
@@ -7204,6 +7699,7 @@ mod tests {
                 throttled: false,
                 detached: true,
                 finish_error: Some("tail drained late".to_string()),
+                admitted_by_op: census(&[(1, 9)]),
             };
             acc.merge(tail);
             assert_eq!(
