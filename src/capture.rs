@@ -55,6 +55,7 @@ use crate::evidence::{
 };
 use crate::{args, kinds, pin, plan, target};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
@@ -557,7 +558,8 @@ pub struct LifecycleEvent {
 /// reads that may have missed activity) plus kernel-side signal
 /// drops (the kernel producer's own overflow count between drains,
 /// as reported through the port — distinct from host scan loss so
-/// the two sources stay attributable).
+/// the two sources stay attributable) plus the bounded-drain
+/// residual (records still queued when the drain stopped).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LifecycleDelta {
     pub events: Vec<LifecycleEvent>,
@@ -565,6 +567,16 @@ pub struct LifecycleDelta {
     /// Kernel-side signals known-dropped (ring overflow). Zero for
     /// ports with no kernel producer (polling).
     pub dropped: u64,
+    /// Bounded-drain residual: nonzero when this drain stopped
+    /// with records still queued (1 = tail remains; the exact
+    /// queued depth is transport-specific, so presence — not a
+    /// count — is the contract). Round sweeps carry the residual
+    /// losslessly (the next round continues the same queue); at
+    /// close it is an uncovered tail and the controller records
+    /// `lifecycle.drain_pending` loss. Always zero for polling
+    /// ports (their close drain is `None` — absence, not a
+    /// truncated drain).
+    pub pending: u64,
 }
 
 /// Short fork/exec + lifecycle-loss observer. The T08 selection is
@@ -702,6 +714,518 @@ impl LifecyclePort for PollingLifecycle {
 
     fn fallback_partial(&self) -> bool {
         true
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kernel-observed lifecycle (proc connector, R20-fix finding 1).
+//
+// The kernel pushes fork/exec/exit (plus uids/gids/sids/ptrace/comm/
+// coredump, which carry no execution information and are ignored)
+// over a dedicated NETLINK_CONNECTOR socket: sub-poll activity that
+// no /proc snapshot can catch is queued by the kernel and drained
+// here. Identity is (pid, tgid) per event filtered to the target
+// subtree; loss accounting is exact (socket Drops delta — every
+// overrun the kernel counted) with an in-band ENOBUFS tripwire.
+//
+// COMPLETE-capable when: subscribed before first activity (owned
+// children are stopped pre-exec at subscribe time, so this holds
+// structurally), drops-delta zero, and the close drain reaches an
+// empty tail. Anything else degrades loud (scan loss, signal
+// drops, no-witness, drain-pending) — never silent, never polling.
+//
+
+/// Proc-connector group: process events.
+const CN_IDX_PROC: u32 = 1;
+/// Proc-connector command: (un)subscribe.
+const PROC_CN_MCAST_LISTEN: u32 = 1;
+/// Proc-connector event value (numerically 1, like the listen
+/// command above — a distinct constant for readability).
+const CN_VAL_PROC: u32 = 1;
+/// `proc_event.what` values we consume (fork/exec/exit create or
+/// replace executing code; every other value is ignored — see
+/// [`KernelLifecycle::ingest_cn`]).
+const PROC_EVENT_FORK: u32 = 1;
+const PROC_EVENT_EXEC: u32 = 2;
+const PROC_EVENT_EXIT: u32 = 0x8000_0000;
+/// Netlink message header length + ACK/error type. Note the
+/// connector marks event datagrams `NLMSG_DONE` (3, verified live)
+/// — every non-error message on this dedicated socket is a
+/// connector payload (the `cn_msg` idx/val check inside is the
+/// real gatekeeper).
+const NLMSG_HDRLEN: usize = 16;
+const NLMSG_ERROR: u16 = 2;
+/// Connector message header length (`cn_msg` without payload).
+const CN_HDRLEN: usize = 20;
+/// `proc_event` fixed prefix (`what`, `cpu`, `timestamp_ns`) length.
+const PROC_EVENT_HDRLEN: usize = 16;
+/// Bounded drain: datagrams consumed per `poll` / per close round.
+/// Fork/exec/exit are rare (a quiet window drains in one call);
+/// the cap bounds poll latency under system-wide fork storms, and
+/// the residual reports via `pending` (carried across rounds,
+/// loud at close).
+const MAX_LIFECYCLE_DRAIN: usize = 256;
+/// Close-drain loop rounds (4 × 256): a quiet tail empties on the
+/// first round; only sustained arrivals past 1024 datagrams leave
+/// a `pending` residual (explicit drain-pending loss).
+const CLOSE_DRAIN_ROUNDS: u32 = 4;
+/// Socket receive buffer target (best-effort: uncapped kernels
+/// clamp it; drops stay exactly accounted either way).
+const CONNECTOR_RCVBUF: libc::c_int = 1 << 20;
+
+fn le_u32_at(b: &[u8], off: usize) -> Option<u32> {
+    b.get(off..off + 4)
+        .and_then(|w| w.try_into().ok())
+        .map(u32::from_le_bytes)
+}
+
+fn le_i32_at(b: &[u8], off: usize) -> Option<i32> {
+    b.get(off..off + 4)
+        .and_then(|w| w.try_into().ok())
+        .map(i32::from_le_bytes)
+}
+
+/// Exact kernel-side drops for one netlink socket, via its
+/// `/proc/net/netlink` row (matched by socket inode): the Drops
+/// column counts every overrun the kernel took on that socket
+/// (verified live: a 400-fork flood against a 4KiB buffer reports
+/// exactly 812). `None` when the table is unreadable or the socket
+/// is absent — the caller fails closed (loss, never assumed zero).
+fn socket_drops(sock_inode: u64) -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/net/netlink").ok()?;
+    parse_netlink_drops(&text, sock_inode)
+}
+
+fn parse_netlink_drops(text: &str, sock_inode: u64) -> Option<u64> {
+    // Columns: sk Eth Pid Groups Rmem Wmem Dump Locks Drops Inode.
+    let want = sock_inode.to_string();
+    for line in text.lines().skip(1) {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() > 9 && f[9] == want {
+            return f[8].parse().ok();
+        }
+    }
+    None
+}
+
+/// True when `fd` has queued input bytes (nonempty tail).
+/// ioctl failure fails closed to true.
+fn socket_has_pending(fd: &OwnedFd) -> bool {
+    let mut pending: libc::c_int = 0;
+    let r = unsafe { libc::ioctl(fd.as_raw_fd(), libc::FIONREAD, &mut pending) };
+    r != 0 || pending > 0
+}
+
+/// Kernel-observed lifecycle port: fork/exec/exit pushed by the
+/// kernel over NETLINK_CONNECTOR, filtered to the target subtree
+/// (target tgid + fork-observed descendants; grandchildren join by
+/// parentage, double-forks stay counted after reparenting).
+/// Same-tgid clones are thread creation (non-events, like polling);
+/// exits are non-events (never pruned — an EXIT never proves its
+/// group dead); the target's own exit is custody's verdict.
+pub struct KernelLifecycle {
+    fd: OwnedFd,
+    sock_inode: u64,
+    target_pid: u32,
+    target_tgid: u32,
+    known: HashSet<u32>,
+    drops_baseline: u64,
+    subscribed_ns: u64,
+    dead: bool,
+}
+
+impl KernelLifecycle {
+    /// Subscribe to process events for `target`'s thread group.
+    /// Fails (caller falls back to polling, explicit PARTIAL) when
+    /// the target has no readable tgid, the socket/bind/send fails,
+    /// or the fd cannot go nonblocking.
+    pub fn subscribe(target: u32) -> anyhow::Result<Self> {
+        let tgid = tgid_of(target)
+            .ok_or_else(|| anyhow::anyhow!("target {target} has no readable Tgid"))?;
+        let raw = unsafe {
+            libc::socket(
+                libc::AF_NETLINK,
+                libc::SOCK_DGRAM | libc::SOCK_CLOEXEC,
+                libc::NETLINK_CONNECTOR,
+            )
+        };
+        if raw < 0 {
+            anyhow::bail!("connector socket: {}", std::io::Error::last_os_error());
+        }
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+        if flags < 0
+            || unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+        {
+            anyhow::bail!("connector nonblock: {}", std::io::Error::last_os_error());
+        }
+        // Best-effort sizing (clamped by rmem_max on tight kernels;
+        // drops stay exactly accounted regardless).
+        let rcv = CONNECTOR_RCVBUF;
+        let _ = unsafe {
+            libc::setsockopt(
+                fd.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                &rcv as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+        addr.nl_family = libc::AF_NETLINK as u16;
+        addr.nl_pid = std::process::id();
+        addr.nl_groups = CN_IDX_PROC;
+        let bound = unsafe {
+            libc::bind(
+                fd.as_raw_fd(),
+                &addr as *const libc::sockaddr_nl as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+            )
+        };
+        if bound < 0 {
+            anyhow::bail!("connector bind: {}", std::io::Error::last_os_error());
+        }
+        // PROC_CN_MCAST_LISTEN(1): nlmsghdr + cn_msg + u32 listen.
+        let mut msg = Vec::with_capacity(NLMSG_HDRLEN + CN_HDRLEN + 4);
+        let total = (NLMSG_HDRLEN + CN_HDRLEN + 4) as u32;
+        msg.extend_from_slice(&total.to_le_bytes());
+        msg.extend_from_slice(&0u16.to_le_bytes());
+        msg.extend_from_slice(&0u16.to_le_bytes());
+        msg.extend_from_slice(&0u32.to_le_bytes());
+        msg.extend_from_slice(&std::process::id().to_le_bytes());
+        msg.extend_from_slice(&CN_IDX_PROC.to_le_bytes());
+        msg.extend_from_slice(&PROC_CN_MCAST_LISTEN.to_le_bytes());
+        msg.extend_from_slice(&0u32.to_le_bytes());
+        msg.extend_from_slice(&0u32.to_le_bytes());
+        msg.extend_from_slice(&4u16.to_le_bytes());
+        msg.extend_from_slice(&0u16.to_le_bytes());
+        msg.extend_from_slice(&1u32.to_le_bytes());
+        let sent = unsafe {
+            libc::send(
+                fd.as_raw_fd(),
+                msg.as_ptr() as *const libc::c_void,
+                msg.len(),
+                0,
+            )
+        };
+        if sent < 0 {
+            anyhow::bail!("connector listen: {}", std::io::Error::last_os_error());
+        }
+        let sock_inode = {
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } < 0 {
+                anyhow::bail!("connector fstat: {}", std::io::Error::last_os_error());
+            }
+            st.st_ino
+        };
+        let drops_baseline = socket_drops(sock_inode).unwrap_or(0);
+        let mut known = HashSet::new();
+        known.insert(tgid);
+        Ok(Self {
+            fd,
+            sock_inode,
+            target_pid: target,
+            target_tgid: tgid,
+            known,
+            drops_baseline,
+            subscribed_ns: ClockPort::monotonic_ns(&LiveClock),
+            dead: false,
+        })
+    }
+
+    /// Monotonic subscription instant (ordering evidence: production
+    /// subscribes before the window opens — structurally earlier
+    /// than any owned activity, which starts at release).
+    pub fn subscribed_ns(&self) -> u64 {
+        self.subscribed_ns
+    }
+
+    /// Ingest one connector payload (`cn_msg` body): filter to the
+    /// target subtree, map fork/exec to events, ignore exits (never
+    /// pruned — see the EXIT arm). Malformed records are host-side
+    /// observation uncertainty (scan loss), never silent skips. Non-fork/exec/
+    /// exit `what` values (uid/gid/sid/ptrace/comm/coredump — plus
+    /// the all-zero registration artifact the kernel emits at
+    /// listen time) create no processes and replace no images, so
+    /// no uncaptured execution can hide behind them: ignored.
+    fn ingest_cn(
+        known: &mut HashSet<u32>,
+        target_pid: u32,
+        target_tgid: u32,
+        body: &[u8],
+        delta: &mut LifecycleDelta,
+    ) {
+        if body.len() < CN_HDRLEN + PROC_EVENT_HDRLEN {
+            delta.loss += 1;
+            return;
+        }
+        let (Some(idx), Some(val)) = (le_u32_at(body, 0), le_u32_at(body, 4)) else {
+            delta.loss += 1;
+            return;
+        };
+        if idx != CN_IDX_PROC || val != CN_VAL_PROC {
+            return;
+        }
+        let ev = &body[CN_HDRLEN..];
+        let Some(what) = le_u32_at(ev, 0) else {
+            delta.loss += 1;
+            return;
+        };
+        match what {
+            PROC_EVENT_FORK => {
+                // parent_pid, parent_tgid, child_pid, child_tgid.
+                let (Some(parent_tgid), Some(child_pid), Some(child_tgid)) = (
+                    le_u32_at(ev, PROC_EVENT_HDRLEN + 4),
+                    le_u32_at(ev, PROC_EVENT_HDRLEN + 8),
+                    le_u32_at(ev, PROC_EVENT_HDRLEN + 12),
+                ) else {
+                    delta.loss += 1;
+                    return;
+                };
+                if parent_tgid == target_tgid || known.contains(&parent_tgid) {
+                    if child_tgid == parent_tgid {
+                        // Same-tgid clone: thread creation, not an
+                        // ignored process (polling parity).
+                    } else {
+                        known.insert(child_tgid);
+                        delta.events.push(LifecycleEvent {
+                            kind: LifecycleKind::Fork,
+                            pid: child_pid,
+                        });
+                    }
+                }
+            }
+            PROC_EVENT_EXEC => {
+                let Some(process_tgid) = le_u32_at(ev, PROC_EVENT_HDRLEN + 4) else {
+                    delta.loss += 1;
+                    return;
+                };
+                if process_tgid == target_tgid {
+                    delta.events.push(LifecycleEvent {
+                        kind: LifecycleKind::Exec,
+                        pid: target_pid,
+                    });
+                }
+            }
+            PROC_EVENT_EXIT => {
+                // Length-validated, then ignored: the payload must
+                // still parse (else scan loss), but no exit proves
+                // its group dead — verified live, thread exits emit
+                // EXIT with the surviving group as tgid, so pruning
+                // on EXIT would untrack live children and silently
+                // miss their later forks. The set is never pruned
+                // (polling `seen` parity — stale entries from tgid
+                // reuse can only spuriously count, never silently
+                // miss: fail-closed). Target death is custody's
+                // verdict regardless.
+                if le_u32_at(ev, PROC_EVENT_HDRLEN + 4).is_none() {
+                    delta.loss += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Ingest one socket datagram (one or more netlink messages):
+    /// ACKs and ENOBUFS reports pass (drops count authoritatively
+    /// via the Drops delta), other errors and truncations are scan
+    /// loss, and every other message is a connector payload for
+    /// [`Self::ingest_cn`] (the socket is dedicated to the proc
+    /// group; the `cn_msg` idx/val check rejects strays).
+    fn ingest_datagram(
+        known: &mut HashSet<u32>,
+        target_pid: u32,
+        target_tgid: u32,
+        buf: &[u8],
+        delta: &mut LifecycleDelta,
+    ) {
+        let mut off = 0usize;
+        let mut consumed_any = false;
+        while off + NLMSG_HDRLEN <= buf.len() {
+            let (Some(len), Some(typ)) = (
+                le_u32_at(buf, off).map(|l| l as usize),
+                le_u32_at(buf, off + 4).map(|t| t as u16),
+            ) else {
+                delta.loss += 1;
+                return;
+            };
+            if len < NLMSG_HDRLEN || off + len > buf.len() {
+                delta.loss += 1;
+                return;
+            }
+            let body = &buf[off + NLMSG_HDRLEN..off + len];
+            if typ == NLMSG_ERROR {
+                match le_i32_at(body, 0) {
+                    Some(0) => {}
+                    Some(e) if e == -libc::ENOBUFS => {}
+                    _ => delta.loss += 1,
+                }
+            } else {
+                Self::ingest_cn(known, target_pid, target_tgid, body, delta);
+            }
+            consumed_any = true;
+            off += (len + 3) & !3;
+        }
+        if !consumed_any && !buf.is_empty() {
+            delta.loss += 1;
+        }
+    }
+
+    /// Bounded drain into `delta` (at most `max_records`
+    /// datagrams): events filter to the subtree, kernel drops ride
+    /// exact via the Drops delta (ENOBUFS backstops a same-poll
+    /// counter race with an at-least-one), an unreadable Drops
+    /// table fails closed to scan loss, and a nonempty tail after
+    /// the bound reports `pending`.
+    fn drain_into(&mut self, delta: &mut LifecycleDelta, max_records: usize) {
+        if self.dead {
+            delta.loss += 1;
+            return;
+        }
+        let mut buf = vec![0u8; 65536];
+        let mut records = 0usize;
+        let mut enobufs = false;
+        loop {
+            if records >= max_records {
+                break;
+            }
+            let r = unsafe {
+                libc::recv(
+                    self.fd.as_raw_fd(),
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    buf.len(),
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            if r < 0 {
+                let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                if e == libc::EAGAIN || e == libc::EWOULDBLOCK {
+                    break;
+                }
+                if e == libc::ENOBUFS {
+                    // In-band overrun tripwire: the Drops delta
+                    // below counts it; keep draining.
+                    enobufs = true;
+                    continue;
+                }
+                self.dead = true;
+                delta.loss += 1;
+                break;
+            }
+            if r == 0 {
+                break;
+            }
+            Self::ingest_datagram(
+                &mut self.known,
+                self.target_pid,
+                self.target_tgid,
+                &buf[..r as usize],
+                delta,
+            );
+            records += 1;
+        }
+        match socket_drops(self.sock_inode) {
+            Some(cur) => {
+                let fresh = cur.saturating_sub(self.drops_baseline);
+                self.drops_baseline = cur;
+                delta.dropped = delta.dropped.saturating_add(fresh);
+                if enobufs && fresh == 0 {
+                    // Overrun proven, counter unmoved (same-poll
+                    // read race): at-least-one.
+                    delta.dropped = delta.dropped.saturating_add(1);
+                }
+            }
+            None => {
+                // Accounting blind: cannot prove no-loss.
+                delta.loss += 1;
+                if enobufs {
+                    delta.dropped = delta.dropped.saturating_add(1);
+                }
+            }
+        }
+        if records >= max_records && socket_has_pending(&self.fd) {
+            delta.pending = 1;
+        }
+    }
+}
+
+impl LifecyclePort for KernelLifecycle {
+    fn poll(&mut self) -> LifecycleDelta {
+        let mut delta = LifecycleDelta::default();
+        self.drain_into(&mut delta, MAX_LIFECYCLE_DRAIN);
+        delta
+    }
+
+    fn fallback_partial(&self) -> bool {
+        false
+    }
+
+    fn close_drain(&mut self) -> Option<LifecycleDelta> {
+        if self.dead {
+            // Missing evidence: the controller records no-witness
+            // loss (a dead stream proves nothing about the tail).
+            return None;
+        }
+        let mut delta = LifecycleDelta::default();
+        for _ in 0..CLOSE_DRAIN_ROUNDS {
+            if self.dead {
+                // Drained prefix survives (events preserved, loss
+                // loud); only the unwitnessed remainder is missing.
+                break;
+            }
+            delta.pending = 0;
+            self.drain_into(&mut delta, MAX_LIFECYCLE_DRAIN);
+            if delta.pending == 0 {
+                break;
+            }
+        }
+        Some(delta)
+    }
+}
+
+/// Production lifecycle selection: kernel-observed signals when
+/// the connector subscribes, the explicit PARTIAL polling fallback
+/// otherwise (never silent — the fallback announces on stderr and
+/// the polling-fallback loss withholds COMPLETE downstream).
+pub enum LiveLifecycle {
+    Kernel(KernelLifecycle),
+    Polling(PollingLifecycle),
+}
+
+impl LiveLifecycle {
+    pub fn select(target: u32) -> Self {
+        match KernelLifecycle::subscribe(target) {
+            Ok(kernel) => LiveLifecycle::Kernel(kernel),
+            Err(e) => {
+                eprintln!(
+                    "lifecycle: kernel signals unavailable ({e:#}); explicit polling fallback (PARTIAL)"
+                );
+                LiveLifecycle::Polling(PollingLifecycle::new(target))
+            }
+        }
+    }
+}
+
+impl LifecyclePort for LiveLifecycle {
+    fn poll(&mut self) -> LifecycleDelta {
+        match self {
+            LiveLifecycle::Kernel(k) => k.poll(),
+            LiveLifecycle::Polling(p) => p.poll(),
+        }
+    }
+
+    fn fallback_partial(&self) -> bool {
+        match self {
+            LiveLifecycle::Kernel(k) => k.fallback_partial(),
+            LiveLifecycle::Polling(p) => p.fallback_partial(),
+        }
+    }
+
+    fn close_drain(&mut self) -> Option<LifecycleDelta> {
+        match self {
+            LiveLifecycle::Kernel(k) => k.close_drain(),
+            LiveLifecycle::Polling(p) => p.close_drain(),
+        }
     }
 }
 
@@ -2104,6 +2628,16 @@ struct Runner<'x, D, B: CountBackend, T, L, C: ClockPort, P: ProcPort> {
     /// Kernel-side lifecycle signals known-dropped (ring overflow
     /// reported through the port).
     lifecycle_dropped: u64,
+    /// Close drains with missing evidence (non-fallback port,
+    /// `close_drain` None): the observer never proved it covered
+    /// the tail.
+    lifecycle_no_witness: u64,
+    /// Close-drain bounded residual (records still queued when the
+    /// close drain stopped): an uncovered tail.
+    lifecycle_pending: u64,
+    /// Exec witnesses past the last fence opportunity (final sweep
+    /// and close drain): the tail may mix pre/post-exec identity.
+    lifecycle_exec_gap: u64,
     maps_read_failed: u64,
     scan_budget_exhaustions: u64,
     provider_changed_fences: u64,
@@ -2141,6 +2675,10 @@ struct Runner<'x, D, B: CountBackend, T, L, C: ClockPort, P: ProcPort> {
     /// Relevant paths dropped by the per-poll relevance/bytes
     /// caps (loud loss at finalize).
     relevance_capped: u64,
+    /// File reads discarded by the freshness-race guard
+    /// (pre/post metadata disagreed): served to nobody, loud loss
+    /// at finalize, evidence-tainting (the rows miss).
+    unverified_reads: u64,
     /// Setup-vs-runtime classifier (H7/B-6): false until the
     /// observation loop starts (the baseline poll and count fence
     /// are setup machinery — attach phase, exit 4 on failure).
@@ -2254,6 +2792,23 @@ fn relevant_paths(delta: &DiscoveryDelta, live: &[maps::Mapping]) -> (BTreeSet<S
     (paths, dropped)
 }
 
+/// Post-read stat check with race signal (R20-fix finding 6):
+/// true when the file still stats `cur` (verified); false with
+/// `raced` set when it moved (proven mutation during the read —
+/// the caller discards the bytes). Called only when the read
+/// identity matched pre-stat (guard short-circuit at the call
+/// site), preserving stat-call alignment; read drift (pre-stat
+/// raced, consistent bytes) keeps the legacy serve-uncached
+/// shape and is NOT a race.
+fn post_stat_matches<P: ProcPort>(proc: &mut P, p: &str, cur: FileStat, raced: &mut bool) -> bool {
+    if proc.stat_file(p) == Some(cur) {
+        true
+    } else {
+        *raced = true;
+        false
+    }
+}
+
 impl<D, B, T, L, C, P> Runner<'_, D, B, T, L, C, P>
 where
     D: DiscoveryPort,
@@ -2341,15 +2896,35 @@ where
                         // serve these bytes this round uncached and
                         // re-read next poll. An unstatable path never
                         // caches (freshness unprovable).
+                        let mut raced = false;
                         let verified = match current {
                             Some(cur)
                                 if (dev, ino) == (cur.dev, cur.ino)
-                                    && self.proc.stat_file(p) == Some(cur) =>
+                                    && post_stat_matches(&mut *self.proc, p, cur, &mut raced) =>
                             {
                                 Some(cur)
                             }
                             _ => None,
                         };
+                        // Proven mid-read mutation (R20-fix finding
+                        // 6): the read identity matched pre-stat
+                        // but the post-read stat moved — the bytes
+                        // may be torn across a same-size edit.
+                        // DISCARD: never cached, never forwarded
+                        // for fingerprinting (the rows miss exactly
+                        // like an unreadable file, and the next
+                        // poll re-reads). Loud via
+                        // `discovery.unverified_read` + evidence
+                        // taint. Read drift (pre-stat raced, the
+                        // bound read is a consistent-inode
+                        // snapshot) and unstatable paths keep the
+                        // legacy serve-uncached shape — no mutation
+                        // of the read bytes was proven there.
+                        if raced {
+                            self.unverified_reads = self.unverified_reads.saturating_add(1);
+                            self.file_cache.remove(p);
+                            continue;
+                        }
                         if let Some(cur) = verified {
                             self.file_cache.insert(
                                 p.clone(),
@@ -2491,6 +3066,18 @@ where
         Ok((exhausted, report.candidates_changed))
     }
 
+    /// Exec witnesses in one lifecycle delta: the target's own
+    /// execs are fence-tracked (round sweeps) or continuity-gapped
+    /// (final sweep and close drain — no generation left to version
+    /// into), never ignored-counted.
+    fn exec_witnesses(delta: &LifecycleDelta) -> u64 {
+        delta
+            .events
+            .iter()
+            .filter(|e| e.kind == LifecycleKind::Exec)
+            .count() as u64
+    }
+
     /// Fold one lifecycle delta (round sweep, final sweep, or
     /// close-time ring drain) into the accumulators. Only Fork events
     /// count as ignored: the target's own execs are fence-tracked by
@@ -2588,7 +3175,7 @@ where
         }
         let planned: Vec<String> = self.planned_paths.iter().cloned().collect();
         let next = snapshot(exe, &live, &planned, &sizes);
-        let kinds = detect_fence(&self.snapshot, &next);
+        let mut kinds = detect_fence(&self.snapshot, &next);
         self.snapshot = next;
         self.last_live = live.clone();
         // Fork/exec detection: every NEW child counted once. Only
@@ -2597,6 +3184,14 @@ where
         // here double-books the observed spawn-exec as ignored).
         let sweep = self.lifecycle.poll();
         self.fold_lifecycle(&sweep);
+        // Witness-driven exec fence (R20-fix): a kernel Exec witness
+        // fences even when the exe snapshot cannot see it (same-path
+        // exec with unchanged mappings). The snapshot arm above
+        // already flagged genuine exe-link flips, so this OR-ing
+        // never double-fences — one fence per round either way.
+        if Self::exec_witnesses(&sweep) > 0 && !kinds.contains(&FenceKind::Exec) {
+            kinds.push(FenceKind::Exec);
+        }
         // Slow metadata work above (fence snapshots, lifecycle
         // scan — file reads moved per-poll below, F-D/A13) may have
         // crossed the deadline — or a signal may have landed —
@@ -3039,6 +3634,9 @@ where
         fork_exec_ignored: 0,
         lifecycle_loss: 0,
         lifecycle_dropped: 0,
+        lifecycle_no_witness: 0,
+        lifecycle_pending: 0,
+        lifecycle_exec_gap: 0,
         maps_read_failed: 0,
         scan_budget_exhaustions: 0,
         provider_changed_fences: 0,
@@ -3060,6 +3658,7 @@ where
         drain_wall_us: 0,
         file_cache: HashMap::new(),
         relevance_capped: 0,
+        unverified_reads: 0,
         observation_started: false,
     };
     runner.fallback_partial = runner.lifecycle.fallback_partial();
@@ -3302,18 +3901,40 @@ where
         // children reparented, its exe link gone), so a sweep can
         // only find its own unreadable-exe loss, never activity.
         // (Fork events only, as in the round sweep above: execs are
-        // fence-tracked, never ignored.)
+        // fence-tracked, never ignored. Post-round Exec witnesses
+        // cannot fence — no generation left to version into — so
+        // they gap instead: the tail may mix pre/post-exec identity
+        // under one fingerprint.)
         if self.child_exit.is_none() {
             let sweep = self.lifecycle.poll();
             self.fold_lifecycle(&sweep);
+            self.lifecycle_exec_gap = self
+                .lifecycle_exec_gap
+                .saturating_add(Self::exec_witnesses(&sweep));
         }
-        // Kernel-signal close drain (R20): consume the signal ring
-        // through the current tail even when the target already
-        // exited — a ring drain needs no /proc scan, so it is safe
-        // on corpses. Polling ports return `None` (their close sweep
-        // above stays skipped once reaped).
-        if let Some(drained) = self.lifecycle.close_drain() {
+        // Kernel-signal close drain (R20, witness-completeness per
+        // R20-fix): consume the signal ring through the current tail
+        // even when the target already exited — a ring drain needs
+        // no /proc scan, so it is safe on corpses. A non-fallback
+        // port MUST witness the tail: `None` is missing evidence
+        // (explicit no-witness loss — absence never passes silent),
+        // and a nonzero `pending` residual is an uncovered tail
+        // (explicit drain-pending loss). Polling ports return `None`
+        // (their close sweep above stays skipped once reaped, and
+        // the standing polling-fallback loss already withholds
+        // COMPLETE).
+        let drained = self.lifecycle.close_drain();
+        if !self.fallback_partial && drained.is_none() {
+            self.lifecycle_no_witness = self.lifecycle_no_witness.saturating_add(1);
+        }
+        if let Some(drained) = drained {
             self.fold_lifecycle(&drained);
+            if drained.pending > 0 {
+                self.lifecycle_pending = self.lifecycle_pending.saturating_add(drained.pending);
+            }
+            self.lifecycle_exec_gap = self
+                .lifecycle_exec_gap
+                .saturating_add(Self::exec_witnesses(&drained));
         }
         // TEST HOOK (exit-3 kernel-proof): hold the final drain past
         // close so a still-counting kernel would advance last_ns
@@ -3491,6 +4112,33 @@ where
                 self.lifecycle_dropped,
             ));
         }
+        if self.lifecycle_no_witness > 0 {
+            self.extra_loss.push(typed_counter(
+                "lifecycle.no_witness",
+                CounterKind::Loss,
+                CounterUnits::Events,
+                CounterSource::Lifecycle,
+                self.lifecycle_no_witness,
+            ));
+        }
+        if self.lifecycle_pending > 0 {
+            self.extra_loss.push(typed_counter(
+                "lifecycle.drain_pending",
+                CounterKind::Loss,
+                CounterUnits::Events,
+                CounterSource::Lifecycle,
+                self.lifecycle_pending,
+            ));
+        }
+        if self.lifecycle_exec_gap > 0 {
+            self.extra_loss.push(typed_counter(
+                "lifecycle.exec_gap",
+                CounterKind::Loss,
+                CounterUnits::Events,
+                CounterSource::Lifecycle,
+                self.lifecycle_exec_gap,
+            ));
+        }
         // H3: mixed-withheld sites are ambiguity, not loss —
         // Activity (the observation is complete; the verdict is
         // withheld). Distinct triples ever marked mixed; absent
@@ -3531,6 +4179,15 @@ where
                 CounterUnits::Sites,
                 CounterSource::Discovery,
                 self.relevance_capped,
+            ));
+        }
+        if self.unverified_reads > 0 {
+            self.extra_loss.push(typed_counter(
+                "discovery.unverified_read",
+                CounterKind::Loss,
+                CounterUnits::Sites,
+                CounterSource::Discovery,
+                self.unverified_reads,
             ));
         }
         // Post-exit maps reads miss nothing (the target is reaped,
@@ -3780,6 +4437,7 @@ where
             || !snapshot.dispatch.attach_failures.is_empty()
             || !snapshot.retained_reasons.is_empty()
             || self.relevance_capped > 0
+            || self.unverified_reads > 0
             || drain_shortfall > 0
             || self.maps_read_failed > 0
             || salvage.as_ref().is_some_and(|s| s.taint_evidence);
@@ -3878,6 +4536,9 @@ where
         let close_census_global = self.cold_gap_queries > 0
             || self.lifecycle_loss > 0
             || self.lifecycle_dropped > 0
+            || self.lifecycle_no_witness > 0
+            || self.lifecycle_pending > 0
+            || self.lifecycle_exec_gap > 0
             || self.fallback_partial;
         let mut coverage = Vec::new();
         for op in self.adapter.ops() {
@@ -4255,12 +4916,16 @@ where
             "count.missed_attaches" => self.reason("missed-attaches"),
             "count.unresolved_offsets" => self.reason("unresolved-offsets"),
             "capture.over_budget" => self.reason("over-budget"),
-            "lifecycle.fork_exec_ignored" | "lifecycle.scan_loss" | "lifecycle.signal_dropped" => {
-                self.reason("fork-exec-ignored")
-            }
+            "lifecycle.fork_exec_ignored"
+            | "lifecycle.scan_loss"
+            | "lifecycle.signal_dropped"
+            | "lifecycle.no_witness"
+            | "lifecycle.drain_pending"
+            | "lifecycle.exec_gap" => self.reason("fork-exec-ignored"),
             "lifecycle.polling_fallback" => self.reason("lifecycle-polling-partial"),
             "discovery.pre_window_queries" => self.reason("cold-gap"),
             "discovery.late_attach_sites" => self.reason("late-attach"),
+            "discovery.unverified_read" => self.reason("discovery-loss"),
             "legacy.engine_uninstrumented" => self.reason("engine-fallback-uninstrumented"),
             "legacy.meth_uninstrumented" => self.reason("meth-fallback-uninstrumented"),
             "legacy.lowlevel_uninstrumented" => self.reason("lowlevel-fallback-uninstrumented"),
@@ -4661,7 +5326,7 @@ pub fn run(cfg: &Config, target: Target) -> anyhow::Result<Capture> {
                     discovery: LiveDiscovery::new(discovery),
                     count,
                     target: owned,
-                    lifecycle: PollingLifecycle::new(pid),
+                    lifecycle: LiveLifecycle::select(pid),
                 },
                 &LiveClock,
                 &mut LiveProc,
@@ -4721,7 +5386,7 @@ pub fn run(cfg: &Config, target: Target) -> anyhow::Result<Capture> {
                     discovery: LiveDiscovery::new(discovery),
                     count,
                     target: PinnedTarget::new(p, pin_guard),
-                    lifecycle: PollingLifecycle::new(p),
+                    lifecycle: LiveLifecycle::select(p),
                 },
                 &LiveClock,
                 &mut LiveProc,
@@ -4793,6 +5458,200 @@ mod tests {
         assert_eq!(parse_stat_ppid("1 (systemd) S 0 0"), Some((1, 0)));
         assert!(parse_stat_ppid("garbage").is_none());
         assert!(parse_stat_ppid("9 (x) S").is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // R20-fix finding 1: kernel-lifecycle ingest mapping (synthetic
+    // datagrams — deterministic, no kernel needed).
+    // ------------------------------------------------------------------
+
+    /// One connector datagram: nlmsghdr (type 3, like the kernel
+    /// marks event datagrams) + cn_msg + `payload`.
+    fn cn_datagram(payload: &[u8]) -> Vec<u8> {
+        let mut b = Vec::new();
+        let total = (NLMSG_HDRLEN + CN_HDRLEN + payload.len()) as u32;
+        b.extend_from_slice(&total.to_le_bytes());
+        b.extend_from_slice(&3u16.to_le_bytes());
+        b.extend_from_slice(&0u16.to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes());
+        b.extend_from_slice(&CN_IDX_PROC.to_le_bytes());
+        b.extend_from_slice(&CN_VAL_PROC.to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes());
+        b.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+        b.extend_from_slice(&0u16.to_le_bytes());
+        b.extend_from_slice(payload);
+        b
+    }
+
+    /// One `proc_event`: what/cpu/timestamp + u32 union fields.
+    fn proc_event(what: u32, fields: &[u32]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&what.to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes());
+        b.extend_from_slice(&0u64.to_le_bytes());
+        for f in fields {
+            b.extend_from_slice(&f.to_le_bytes());
+        }
+        b
+    }
+
+    fn fresh_ingest(known: &mut HashSet<u32>, buf: &[u8]) -> LifecycleDelta {
+        let mut delta = LifecycleDelta::default();
+        KernelLifecycle::ingest_datagram(known, 100, 100, buf, &mut delta);
+        delta
+    }
+
+    #[test]
+    fn kernel_ingest_maps_subtree_fork_exec_exit() {
+        let mut known = HashSet::from([100u32]);
+        // Target forks a process child: event + tracked.
+        let d = fresh_ingest(
+            &mut known,
+            &cn_datagram(&proc_event(PROC_EVENT_FORK, &[100, 100, 200, 200])),
+        );
+        assert_eq!(
+            d.events,
+            vec![LifecycleEvent {
+                kind: LifecycleKind::Fork,
+                pid: 200
+            }]
+        );
+        assert!(known.contains(&200));
+        // Same-tgid clone: thread creation, non-event.
+        let d = fresh_ingest(
+            &mut known,
+            &cn_datagram(&proc_event(PROC_EVENT_FORK, &[100, 100, 101, 100])),
+        );
+        assert!(d.events.is_empty() && d.loss == 0);
+        // Grandchild by parentage (parent = known child).
+        let d = fresh_ingest(
+            &mut known,
+            &cn_datagram(&proc_event(PROC_EVENT_FORK, &[200, 200, 300, 300])),
+        );
+        assert_eq!(d.events.len(), 1);
+        assert_eq!(d.events[0].pid, 300);
+        // Foreign fork: ignored.
+        let d = fresh_ingest(
+            &mut known,
+            &cn_datagram(&proc_event(PROC_EVENT_FORK, &[900, 900, 901, 901])),
+        );
+        assert!(d.events.is_empty() && d.loss == 0);
+        // Target exec: event under the target pid.
+        let d = fresh_ingest(
+            &mut known,
+            &cn_datagram(&proc_event(PROC_EVENT_EXEC, &[100, 100])),
+        );
+        assert_eq!(
+            d.events,
+            vec![LifecycleEvent {
+                kind: LifecycleKind::Exec,
+                pid: 100
+            }]
+        );
+        // Known-child exec: already ignored, non-event.
+        let d = fresh_ingest(
+            &mut known,
+            &cn_datagram(&proc_event(PROC_EVENT_EXEC, &[200, 200])),
+        );
+        assert!(d.events.is_empty() && d.loss == 0);
+        // Target exit: custody's verdict, non-event.
+        let d = fresh_ingest(
+            &mut known,
+            &cn_datagram(&proc_event(PROC_EVENT_EXIT, &[100, 100, 0, 0, 1, 1])),
+        );
+        assert!(d.events.is_empty() && d.loss == 0);
+        assert!(known.contains(&100));
+        // Exits never prune: a thread exit (pid != tgid) must not
+        // untrack the live group — the next grandchild fork still
+        // witnesses.
+        let d = fresh_ingest(
+            &mut known,
+            &cn_datagram(&proc_event(PROC_EVENT_EXIT, &[201, 200, 0, 0, 100, 100])),
+        );
+        assert!(d.events.is_empty() && d.loss == 0);
+        assert!(known.contains(&200));
+        let d = fresh_ingest(
+            &mut known,
+            &cn_datagram(&proc_event(PROC_EVENT_FORK, &[200, 200, 400, 400])),
+        );
+        assert_eq!(d.events.len(), 1);
+        assert_eq!(d.events[0].pid, 400);
+        // Whole-process exit: still no prune (an EXIT never proves
+        // its group dead — polling `seen` parity).
+        let d = fresh_ingest(
+            &mut known,
+            &cn_datagram(&proc_event(PROC_EVENT_EXIT, &[200, 200, 0, 0, 100, 100])),
+        );
+        assert!(d.events.is_empty() && d.loss == 0);
+        assert!(known.contains(&200));
+        // Unknown `what` (incl. the zero registration artifact):
+        // creates no process, replaces no image — ignored.
+        let d = fresh_ingest(
+            &mut known,
+            &cn_datagram(&proc_event(0, &[0, 0, 0, 0, 0, 0])),
+        );
+        assert!(d.events.is_empty() && d.loss == 0);
+        let d = fresh_ingest(
+            &mut known,
+            &cn_datagram(&proc_event(0x200, &[100, 100, 0, 0, 0, 0])),
+        );
+        assert!(d.events.is_empty() && d.loss == 0);
+    }
+
+    #[test]
+    fn kernel_ingest_truncation_is_loss_not_silence() {
+        let mut known = HashSet::from([100u32]);
+        // Truncated datagram (no full header).
+        let d = fresh_ingest(&mut known, &[1u8; 7]);
+        assert_eq!(d.loss, 1);
+        // Declared length overruns the buffer.
+        let mut bad = cn_datagram(&proc_event(PROC_EVENT_FORK, &[100, 100, 200, 200]));
+        bad.truncate(bad.len() - 5);
+        let d = fresh_ingest(&mut known, &bad);
+        assert_eq!(d.loss, 1);
+        // Truncated fork payload.
+        let d = fresh_ingest(
+            &mut known,
+            &cn_datagram(&proc_event(PROC_EVENT_FORK, &[100])),
+        );
+        assert_eq!(d.loss, 1);
+        assert!(d.events.is_empty());
+        // Foreign cn index: stray, ignored (loss would misattribute
+        // another subsystem's traffic on a shared socket).
+        let mut stray = cn_datagram(&proc_event(PROC_EVENT_FORK, &[100, 100, 200, 200]));
+        stray[NLMSG_HDRLEN..NLMSG_HDRLEN + 4].copy_from_slice(&7u32.to_le_bytes());
+        let d = fresh_ingest(&mut known, &stray);
+        assert!(d.events.is_empty() && d.loss == 0);
+    }
+
+    #[test]
+    fn kernel_drops_parser_reads_own_row() {
+        let text = "sk Eth Pid Groups Rmem Wmem Dump Locks Drops Inode\n\
+             0000000000000000 0 111 00000440 0 0 0 2 0 100724\n\
+             0000000000000000 11 222 00000001 0 0 0 2 812 673319\n";
+        assert_eq!(parse_netlink_drops(text, 673319), Some(812));
+        assert_eq!(parse_netlink_drops(text, 100724), Some(0));
+        assert_eq!(parse_netlink_drops(text, 1), None);
+        assert_eq!(parse_netlink_drops("sk Eth Pid Groups\n", 673319), None);
+    }
+
+    #[test]
+    fn kernel_select_uses_signals_or_falls_back_loud() {
+        // Live self: the connector subscribes (same assumption as
+        // the real-kernel integration control).
+        assert!(
+            matches!(
+                LiveLifecycle::select(std::process::id()),
+                LiveLifecycle::Kernel(_)
+            ),
+            "select must use kernel signals when available"
+        );
+        // No such pid: tgid unreadable → explicit polling fallback.
+        let polled = LiveLifecycle::select(u32::MAX);
+        assert!(matches!(polled, LiveLifecycle::Polling(_)));
+        assert!(polled.fallback_partial());
     }
 
     #[test]
@@ -5959,6 +6818,7 @@ mod tests {
                     events: Vec::new(),
                     loss: 0,
                     dropped: 0,
+                    pending: 0,
                 }
             }
             fn fallback_partial(&self) -> bool {
@@ -6105,6 +6965,9 @@ mod tests {
                 fork_exec_ignored: 0,
                 lifecycle_loss: 0,
                 lifecycle_dropped: 0,
+                lifecycle_no_witness: 0,
+                lifecycle_pending: 0,
+                lifecycle_exec_gap: 0,
                 maps_read_failed: 0,
                 scan_budget_exhaustions: 0,
                 provider_changed_fences: 0,
@@ -6126,6 +6989,7 @@ mod tests {
                 drain_wall_us: 0,
                 file_cache: HashMap::new(),
                 relevance_capped: 0,
+                unverified_reads: 0,
                 observation_started: false,
             }
         }
