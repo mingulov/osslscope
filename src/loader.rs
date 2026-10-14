@@ -2345,6 +2345,12 @@ pub fn attach_members_subset_from_bytes(
     slots: &[u32],
 ) -> anyhow::Result<SubsetAttached> {
     use anyhow::Context as _;
+    if bytes.len() as u64 > crate::discovery::onboard::MAX_OBJECT_SCAN_BYTES {
+        anyhow::bail!(
+            "members snapshot {} bytes exceeds the onboarding cap",
+            bytes.len()
+        );
+    }
     let want = normalize_slots(slots)?;
     if ctrl.expected as usize != want.len() {
         anyhow::bail!(
@@ -2461,6 +2467,12 @@ pub fn attach_members_from_bytes(
     ctrl: &osslscope_ebpf_common::CtrlValue,
 ) -> anyhow::Result<MembersAttached> {
     use anyhow::Context as _;
+    if bytes.len() as u64 > crate::discovery::onboard::MAX_OBJECT_SCAN_BYTES {
+        anyhow::bail!(
+            "members snapshot {} bytes exceeds the onboarding cap",
+            bytes.len()
+        );
+    }
     ensure_members_fd_budget()?;
     let prep = prepare(bytes, &MEMBER_MAPS, &MEMBER_PROGS).context("prepare members.o")?;
     let loaded = load(&prep).context("load members.o")?;
@@ -2537,6 +2549,24 @@ mod tests {
     }
     fn u64(v: u64) -> [u8; 8] {
         v.to_le_bytes()
+    }
+
+    #[test]
+    fn subset_from_bytes_refuses_over_cap_before_bpf() {
+        // Finding 11 (loader layer): an over-cap caller buffer
+        // refuses before prepare/load (no post-onboarding
+        // enlargement bypass). Host-safe: the refusal precedes
+        // all BPF work.
+        let big = vec![0u8; (crate::discovery::onboard::MAX_OBJECT_SCAN_BYTES + 1) as usize];
+        let exe = std::ffi::CString::new("/exe").unwrap();
+        let ctrl = osslscope_ebpf_common::ctrl_value(2, 1, 1 << 22);
+        let e = attach_members_subset_from_bytes(&big, &exe, 0, 0, &ctrl, &[0, 1])
+            .err()
+            .expect("over-cap refuses");
+        assert!(
+            e.to_string().contains("exceeds the onboarding cap"),
+            "{e:#}"
+        );
     }
 
     #[test]

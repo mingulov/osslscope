@@ -55,6 +55,14 @@ impl OnboardError {
     pub fn full(&self) -> String {
         format!("{}; fix: {}", self.message, self.remediation)
     }
+
+    /// True when nothing was found (as opposed to found-but-broken:
+    /// trust/compat/receipt failures are never not-found). The
+    /// ordinary run uses this to tell a pair-only install (valid
+    /// harvest-only) from a broken triple (fail-closed).
+    pub fn is_not_found(&self) -> bool {
+        self.message.starts_with("no BPF objects found")
+    }
 }
 
 impl fmt::Display for OnboardError {
@@ -753,8 +761,12 @@ pub fn file_sha256_hex(path: &Path) -> std::io::Result<String> {
 
 /// Verify an implicitly resolved object against its prefix's
 /// install receipt (matched-set identity): no receipt ⟹
-/// compatible (old installs); receipt present ⟹ the resolved path
-/// must be listed with a matching sha256 (a hash mismatch is a
+/// compatible for the pair roles (old installs predate receipts),
+/// but REFUSED for the members role (every legitimate members
+/// install ships with a receipt — a receiptless members file is a
+/// hand-placed object whose matched-build identity is not
+/// established); receipt present ⟹ the resolved path must be
+/// listed with a matching sha256 (a hash mismatch is a
 /// stale/swapped object; an unlisted path is a mixed set — both
 /// refused with reinstall remediation, never silently used).
 pub fn verify_role_receipt(role: ObjectRole, path: &Path) -> Result<(), OnboardError> {
@@ -770,7 +782,20 @@ pub fn verify_role_receipt(role: ObjectRole, path: &Path) -> Result<(), OnboardE
     })?;
     let receipt = match receipt_for_object_dir(dir) {
         Some(r) => r,
-        None => return Ok(()),
+        None => {
+            if role == ObjectRole::Members {
+                return Err(OnboardError::new(
+                    format!(
+                        "members object {} has no install receipt (unproven matched-build identity)",
+                        path.display()
+                    ),
+                    "reinstall the full triple with scripts/install-dev.sh so the receipt covers every role, \
+                     or pass --members-object explicitly to operator-trust this file"
+                        .to_string(),
+                ));
+            }
+            return Ok(());
+        }
     };
     let text = read_bounded(&receipt, MAX_OBJECT_SCAN_BYTES).map_err(|e| {
         OnboardError::new(

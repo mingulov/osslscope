@@ -92,6 +92,12 @@ const CORPSE_WAIT: Duration = Duration::from_millis(100);
 pub struct Config {
     pub harvest_object: Option<PathBuf>,
     pub count_object: Option<PathBuf>,
+    /// Explicit members object (`--members-object`): the operator
+    /// asked for traversal — the triple must resolve (fail-closed,
+    /// no harvest-only fallback). `None` attempts the automatic
+    /// triple (receipt-verified); pair-only installs stay
+    /// harvest-only; broken triples refuse.
+    pub members_object: Option<PathBuf>,
     pub provider: Option<PathBuf>,
     pub builtin: bool,
     /// Explicit local offset table (`--table`), or None for the
@@ -177,6 +183,162 @@ pub struct TripleProvenance {
     pub harvest: ObjectProvenance,
     pub count: ObjectProvenance,
     pub members: ObjectProvenance,
+}
+
+/// Traversal query anchor: the physical site the members
+/// backend observes (query-fn file offset in the anchor exe,
+/// fingerprinted once at attach — the inventory adaptation's
+/// site key).
+#[derive(Debug, Clone)]
+pub struct TraversalAnchor {
+    pub site: SiteKey,
+}
+
+/// Build the anchor site key from the live anchor exe (stat +
+/// build-id at attach — the exe must exist for the uprobes
+/// anyway, so an unreadable anchor refuses instead of guessing).
+/// Missing build-id falls back to `unverified:dev:ino` (the same
+/// fallback [`object_id_for_mapping`] uses for unmapped files).
+fn traversal_anchor(exe_path: &Path, off: u64) -> anyhow::Result<TraversalAnchor> {
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = std::fs::metadata(exe_path)
+        .map_err(|e| anyhow::anyhow!("traversal anchor {} unreadable: {e}", exe_path.display()))?;
+    let device = meta.dev();
+    let inode = meta.ino();
+    let object = std::fs::read(exe_path)
+        .ok()
+        .and_then(|bytes| crate::discovery::elf::read_build_id(&bytes))
+        .map(|id| ObjectId(format!("build:{id}")))
+        .unwrap_or_else(|| ObjectId(format!("unverified:{device}:{inode}")));
+    Ok(TraversalAnchor {
+        site: SiteKey {
+            object,
+            device,
+            inode,
+            offset: off,
+        },
+    })
+}
+
+/// Adapt completed traversal records into count-session sites
+/// (one [`SiteExecution`] per query op at the anchor): the
+/// ALG/ROW identities become candidate algorithm classes
+/// (registry spellings; EMPTY slots prove table shape, not
+/// served algorithms, so they contribute no class; UNREADABLE
+/// contributes `other`); `calls` counts completed queries. Only
+/// `Complete` records adapt (proven tables); partial/tainted/
+/// abandoned/skipped records stay in the traversal outcome +
+/// PARTIAL reasons. Coverage is `Complete` when every adapted
+/// record's served classes are fully named (a proven table
+/// classifies every live slot — the advertising provider stays
+/// explicitly `unknown`, which is attribution, not a missing
+/// candidate); NOIMP slots serve names the walker does not read,
+/// so any NOIMP in the group degrades the site to `Unknown`.
+pub fn adapt_traversal_sites(done: &[WalkDone], anchor: &TraversalAnchor) -> Vec<SiteExecution> {
+    use std::collections::BTreeMap;
+    let completes = done
+        .iter()
+        .filter(|w| matches!(w.outcome, crate::scan::oracle::Outcome::Complete { .. }));
+    let mut by_op: BTreeMap<u32, Vec<&WalkDone>> = BTreeMap::new();
+    for w in completes {
+        by_op.entry(w.op).or_default().push(w);
+    }
+    by_op
+        .into_iter()
+        .map(|(op, records)| {
+            let calls = records.len() as u64;
+            let first_ns = records.iter().map(|w| w.event_ns).min().unwrap_or(0);
+            let last_ns = records.iter().map(|w| w.event_ns).max().unwrap_or(0);
+            let has_noimp = records.iter().any(|w| {
+                w.algs
+                    .iter()
+                    .any(|a| a.status == osslscope_ebpf_common::ALG_NOIMP)
+            });
+            let candidates_coverage = if has_noimp {
+                CandidateCoverage::Unknown
+            } else {
+                CandidateCoverage::Complete
+            };
+            let mut candidates: Vec<CandidateIdentity> = records
+                .iter()
+                .map(|w| {
+                    let mut classes: Vec<String> = w
+                        .algs
+                        .iter()
+                        .filter_map(|a| {
+                            use osslscope_ebpf_common as wire;
+                            match a.status {
+                                wire::ALG_OK
+                                | wire::ALG_UNKNOWN
+                                | wire::ALG_OVERLONG
+                                | wire::ALG_TRUNCATED
+                                | wire::ALG_MIXED => Some(alg_class_name(a.class)),
+                                wire::ALG_UNREADABLE => Some("other".to_string()),
+                                _ => None,
+                            }
+                        })
+                        .collect();
+                    classes.sort();
+                    classes.dedup();
+                    let weak = w.algs.iter().any(|a| a.weak != 0);
+                    CandidateIdentity::new(
+                        ObjectId("unknown".to_string()),
+                        "unknown".to_string(),
+                        op,
+                        0,
+                        classes,
+                        weak,
+                    )
+                })
+                .collect();
+            candidates.sort();
+            candidates.dedup();
+            SiteExecution {
+                site: anchor.site.clone(),
+                generation: 0,
+                candidates,
+                candidates_coverage,
+                calls,
+                first_ns,
+                last_ns,
+                installed_at: None,
+            }
+        })
+        .collect()
+}
+
+/// Summarize a traversal outcome into the document's traversal
+/// record (the exact selected triple + counts — `None` when the
+/// run never resolved provenance, i.e. harvest-only or a stub
+/// without one, so the document key stays absent there).
+fn traversal_record(t: &TraversalCapture) -> Option<evidence::TraversalRecord> {
+    let p = t.provenance.as_ref()?;
+    let obj = |o: &ObjectProvenance| evidence::TraversalObject {
+        path: o.path.display().to_string(),
+        sha256: o.sha256.clone(),
+    };
+    Some(evidence::TraversalRecord {
+        harvest: obj(&p.harvest),
+        count: obj(&p.count),
+        members: obj(&p.members),
+        records: t.done.len() as u64,
+        findings: t.findings.len() as u64,
+        polls: t.polls,
+    })
+}
+
+/// Registry spelling for an ALG class index (`other` for the
+/// OTHER sentinel and out-of-range ids — the kernel and the
+/// registry share the frozen order, so out-of-range is
+/// version-skew evidence, bounded as `other`, never a panic).
+fn alg_class_name(class: u16) -> String {
+    if class == osslscope_ebpf_common::OTHER_CLASS {
+        return "other".to_string();
+    }
+    crate::kinds::ALG_NAMES
+        .get(class as usize)
+        .map(|a| a.name.to_string())
+        .unwrap_or_else(|| "other".to_string())
 }
 
 /// One traversal poll's outputs (port → Runner): completed
@@ -350,6 +512,7 @@ pub fn empty_document() -> CaptureDocument {
         policy: None,
         legacy_partition: LegacyCallPartition::default(),
         engine_observations: Vec::new(),
+        traversal: None,
     })
 }
 
@@ -541,6 +704,17 @@ pub trait DiscoveryPort {
     fn traversal_active(&self) -> bool {
         false
     }
+    /// The traversal query anchor (adaptation site key; `None`
+    /// unless traversal is active).
+    fn traversal_anchor(&self) -> Option<TraversalAnchor> {
+        None
+    }
+    /// Provider turnover fence (the backend retires its GEN/cache
+    /// epoch with the discovery generation; harvest-only ports
+    /// no-op).
+    fn note_provider_turnover(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 /// Live discovery engine behind the port: `DiscoverySession::close`
@@ -621,6 +795,7 @@ pub struct LiveTraversalDiscovery {
     backend: ScanBackend,
     tasks: crate::scan::registry::ProcTaskSource,
     provenance: TripleProvenance,
+    anchor: TraversalAnchor,
 }
 
 impl LiveTraversalDiscovery {
@@ -629,12 +804,14 @@ impl LiveTraversalDiscovery {
         backend: ScanBackend,
         pid: u32,
         provenance: TripleProvenance,
+        anchor: TraversalAnchor,
     ) -> Self {
         Self {
             inner: LiveDiscovery::new(session),
             backend,
             tasks: crate::scan::registry::ProcTaskSource::new(pid),
             provenance,
+            anchor,
         }
     }
 }
@@ -685,7 +862,9 @@ impl DiscoveryPort for LiveTraversalDiscovery {
             polls: 1,
             ..TraversalCapture::default()
         };
-        match self.backend.poll() {
+        // Settle + backstop (trailing queries close here —
+        // RET-joined evaluate, RET-less dangle — never dropped).
+        match self.backend.finish() {
             Ok(delta) => {
                 out.done = delta.done;
                 out.findings = delta.findings;
@@ -705,6 +884,14 @@ impl DiscoveryPort for LiveTraversalDiscovery {
 
     fn traversal_active(&self) -> bool {
         true
+    }
+
+    fn traversal_anchor(&self) -> Option<TraversalAnchor> {
+        Some(self.anchor.clone())
+    }
+
+    fn note_provider_turnover(&mut self) -> anyhow::Result<()> {
+        self.backend.note_provider_turnover()
     }
 }
 
@@ -756,6 +943,20 @@ impl DiscoveryPort for CaptureDiscovery {
         match self {
             CaptureDiscovery::HarvestOnly(d) => d.traversal_active(),
             CaptureDiscovery::Traversal(d) => d.traversal_active(),
+        }
+    }
+
+    fn traversal_anchor(&self) -> Option<TraversalAnchor> {
+        match self {
+            CaptureDiscovery::HarvestOnly(d) => d.traversal_anchor(),
+            CaptureDiscovery::Traversal(d) => d.traversal_anchor(),
+        }
+    }
+
+    fn note_provider_turnover(&mut self) -> anyhow::Result<()> {
+        match self {
+            CaptureDiscovery::HarvestOnly(d) => d.note_provider_turnover(),
+            CaptureDiscovery::Traversal(d) => d.note_provider_turnover(),
         }
     }
 }
@@ -4813,6 +5014,11 @@ where
         }
         if kinds.contains(&FenceKind::ProviderChanged) {
             self.provider_changed_fences += 1;
+            // The discovery generation turned over: the traversal
+            // backend retires its GEN/cache epoch with it
+            // (in-flight opens abandon as Churned — their arrays
+            // may be freed/reused by the new provider).
+            self.discovery.note_provider_turnover()?;
         }
         Ok(RoundAction::Continue)
     }
@@ -4998,6 +5204,7 @@ where
             policy: None,
             legacy_partition: LegacyCallPartition::default(),
             engine_observations: Vec::new(),
+            traversal: None,
         });
         // R12: retain the one consistently captured pair (no window
         // was observed, but the host context is still honest context).
@@ -5096,6 +5303,7 @@ where
             policy: None,
             legacy_partition: LegacyCallPartition::default(),
             engine_observations: Vec::new(),
+            traversal: None,
         });
         // R12: retain the one consistently captured pair (the
         // observations are discarded, but the host context stands).
@@ -6330,6 +6538,17 @@ where
                 }
             }
         }
+        // Traversal inventory: completed query records adapt
+        // into count-session sites at the anchor (ordinary
+        // report/check production — the same evidence the
+        // traversal outcome retains, counted once here).
+        if let (Some(t), Some(anchor)) =
+            (self.traversal.as_ref(), self.discovery.traversal_anchor())
+        {
+            drain
+                .current
+                .extend(adapt_traversal_sites(&t.done, &anchor));
+        }
         let mut counters = drain.counters.clone();
         counters.extend(self.activity.iter().cloned());
         counters.extend(self.extra_loss.iter().cloned());
@@ -6380,6 +6599,7 @@ where
             policy: None,
             legacy_partition: evidence_partition(call_partition),
             engine_observations,
+            traversal: self.traversal.as_ref().and_then(traversal_record),
         });
         // R12: retain the one consistently captured pair
         // (monotonic fields stay authoritative).
@@ -6722,6 +6942,7 @@ fn recycled_capture(cfg: &Config, info: &TargetInfo) -> Capture {
         policy: None,
         legacy_partition: LegacyCallPartition::default(),
         engine_observations: Vec::new(),
+        traversal: None,
     });
     // R12: the pre-attach recycle carries the acquisition instant in
     // both wall edges, mirroring the legacy Capture wall fields.
@@ -6878,43 +7099,74 @@ pub fn run(cfg: &Config, target: Target) -> anyhow::Result<Capture> {
     if cfg.duration.is_zero() {
         anyhow::bail!("--duration must be > 0 (no --forever in v1)");
     }
-    // T12 onboarding: installed BPF objects first (no target needed;
-    // missing/incompatible objects fail before any side effect).
-    let (objects, _) = onboard::resolve_objects(
+    // Full coexistence with automatic selection (Decision 8R): an
+    // explicit members object demands the triple (fail-closed);
+    // otherwise the automatic triple is attempted — complete
+    // compatible sets traverse, pair-only installs stay
+    // harvest-only (unchanged), and broken triples refuse (never
+    // a silent harvest-only fallback).
+    if cfg.members_object.is_some() {
+        return run_with_traversal(cfg, target, cfg.members_object.as_deref());
+    }
+    match onboard::resolve_set(
         cfg.harvest_object.as_deref(),
         cfg.count_object.as_deref(),
+        None,
         &onboard::default_object_dirs(),
         &onboard::TrustPolicy::production(),
-    )
-    .map_err(|e| anyhow::anyhow!("BPF objects: {}", e.full()))?;
-    run_inner(cfg, target, objects, None)
+    ) {
+        Ok((set, _)) => {
+            let (provenance, members_bytes) = triple_snapshot(&set)?;
+            let objects = onboard::ObjectPaths {
+                harvest: set.harvest,
+                count: set.count.clone(),
+            };
+            run_inner(
+                cfg,
+                target,
+                objects,
+                Some(TraversalAttach {
+                    members: set.members,
+                    members_bytes,
+                    provenance,
+                }),
+            )
+        }
+        Err(e) if e.is_not_found() => {
+            // Pair-only install (no members role anywhere): the
+            // ordinary harvest-only run, exactly as before.
+            let (objects, _) = onboard::resolve_objects(
+                cfg.harvest_object.as_deref(),
+                cfg.count_object.as_deref(),
+                &onboard::default_object_dirs(),
+                &onboard::TrustPolicy::production(),
+            )
+            .map_err(|e| anyhow::anyhow!("BPF objects: {}", e.full()))?;
+            run_inner(cfg, target, objects, None)
+        }
+        Err(e) => Err(anyhow::anyhow!("BPF objects: {}", e.full())),
+    }
 }
 
-/// Run a full capture window with the traversal backend attached
-/// (opt-in per run): the harvest/count/members triple resolves
-/// first — missing/mixed/stale sets refuse before any side effect,
-/// never a silent harvest-only fallback — then the ordinary
-/// window runs with the members backend draining alongside
-/// discovery (records + triple provenance retained on the
-/// capture; report/check CLI selection is follow-up work — the
-/// CLI flags live outside this task's file list).
-pub fn run_traversal(
+/// Ordinary run with an explicitly requested triple (shared by
+/// `run` with `--members-object` and `run_traversal`): the triple
+/// resolves first — missing/mixed/stale sets refuse before any
+/// side effect — then the ordinary window runs with the members
+/// backend draining alongside discovery.
+fn run_with_traversal(
     cfg: &Config,
     target: Target,
-    req: &TraversalRequest,
+    members: Option<&Path>,
 ) -> anyhow::Result<Capture> {
-    if cfg.duration.is_zero() {
-        anyhow::bail!("--duration must be > 0 (no --forever in v1)");
-    }
     let (set, _) = onboard::resolve_set(
         cfg.harvest_object.as_deref(),
         cfg.count_object.as_deref(),
-        req.members_object.as_deref(),
+        members,
         &onboard::default_object_dirs(),
         &onboard::TrustPolicy::production(),
     )
     .map_err(|e| anyhow::anyhow!("BPF objects: {}", e.full()))?;
-    let provenance = triple_provenance(&set)?;
+    let (provenance, members_bytes) = triple_snapshot(&set)?;
     let objects = onboard::ObjectPaths {
         harvest: set.harvest,
         count: set.count.clone(),
@@ -6925,39 +7177,71 @@ pub fn run_traversal(
         objects,
         Some(TraversalAttach {
             members: set.members,
+            members_bytes,
             provenance,
         }),
     )
 }
 
-/// Traversal attach request (resolved members object + the
-/// matched-set provenance the capture retains).
+/// Run a full capture window with the traversal backend attached
+/// (explicit per-run request — the same triple `run` selects
+/// automatically when available): the harvest/count/members triple
+/// resolves first — missing/mixed/stale sets refuse before any
+/// side effect, never a silent harvest-only fallback — then the
+/// ordinary window runs with the members backend draining
+/// alongside discovery.
+pub fn run_traversal(
+    cfg: &Config,
+    target: Target,
+    req: &TraversalRequest,
+) -> anyhow::Result<Capture> {
+    if cfg.duration.is_zero() {
+        anyhow::bail!("--duration must be > 0 (no --forever in v1)");
+    }
+    run_with_traversal(cfg, target, req.members_object.as_deref())
+}
+
+/// Traversal attach request (resolved members object + its
+/// verified byte snapshot + the matched-set provenance the capture
+/// retains). Identity and loading share `members_bytes` — the
+/// backend never re-opens the path, so no swap can interpose
+/// between the hash and the load.
 struct TraversalAttach {
     members: PathBuf,
+    members_bytes: Vec<u8>,
     provenance: TripleProvenance,
 }
 
 /// Mint matched-set provenance for a resolved triple (bounded
 /// re-reads — a swap between resolve and hash fails loud, never
-/// huge).
-fn triple_provenance(set: &onboard::ObjectSet) -> anyhow::Result<TripleProvenance> {
+/// huge) and retain the members byte snapshot the backend loads.
+fn triple_snapshot(set: &onboard::ObjectSet) -> anyhow::Result<(TripleProvenance, Vec<u8>)> {
     use sha2::Digest as _;
-    let hash = |role: &str, path: &Path| -> anyhow::Result<ObjectProvenance> {
+    let hash = |role: &str, path: &Path| -> anyhow::Result<(ObjectProvenance, Vec<u8>)> {
         let bytes = onboard::read_bounded(path, onboard::MAX_OBJECT_SCAN_BYTES)
             .map_err(|e| anyhow::anyhow!("{role} object {}: {e}", path.display()))?;
-        Ok(ObjectProvenance {
-            path: path.to_path_buf(),
-            sha256: sha2::Sha256::digest(&bytes)
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect(),
-        })
+        Ok((
+            ObjectProvenance {
+                path: path.to_path_buf(),
+                sha256: sha2::Sha256::digest(&bytes)
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect(),
+            },
+            bytes,
+        ))
     };
-    Ok(TripleProvenance {
-        harvest: hash("harvest", &set.harvest)?,
-        count: hash("count", &set.count)?,
-        members: hash("members", &set.members)?,
-    })
+    let (harvest, _) = hash("harvest", &set.harvest)?;
+    let (count, _) = hash("count", &set.count)?;
+    let (members, members_bytes) = hash("members", &set.members)?;
+    Ok((
+        TripleProvenance {
+            harvest,
+            count,
+            members,
+        },
+        members_bytes,
+    ))
 }
 
 /// Wrap an attached discovery session for the run: harvest-only
@@ -6987,10 +7271,23 @@ fn wrap_discovery(
     })?;
     let exe = std::ffi::CString::new(exe_str)?;
     let ctrl = crate::loader::default_ctrl(512, crate::loader::MEMBER_RING_BYTES)?;
-    let backend = ScanBackend::attach(&t.members, &exe, off, pid, &ctrl, None)
-        .map_err(|e| anyhow::anyhow!("members backend attach: {e:#}"))?;
+    // The backend loads the verified snapshot (never re-opens the
+    // path) on the capture clock (WALK-DONE instants are
+    // capture-ns, joining the evidence document honestly).
+    let backend = ScanBackend::attach_bytes(
+        &t.members_bytes,
+        &t.members,
+        &exe,
+        off,
+        pid,
+        &ctrl,
+        None,
+        LiveClock.monotonic_ns(),
+    )
+    .map_err(|e| anyhow::anyhow!("members backend attach: {e:#}"))?;
+    let anchor = traversal_anchor(&exe_path, off)?;
     Ok(CaptureDiscovery::Traversal(Box::new(
-        LiveTraversalDiscovery::new(session, backend, pid, t.provenance.clone()),
+        LiveTraversalDiscovery::new(session, backend, pid, t.provenance.clone(), anchor),
     )))
 }
 
@@ -9445,6 +9742,7 @@ mod tests {
             rounds: std::collections::VecDeque<TraversalDelta>,
             tail: TraversalCapture,
             baseline_calls: Vec<bool>,
+            anchor: Option<TraversalAnchor>,
         }
         impl TraversalStub {
             fn scripted(rounds: Vec<TraversalDelta>, tail: TraversalCapture) -> Self {
@@ -9457,7 +9755,17 @@ mod tests {
                     rounds: rounds.into(),
                     tail,
                     baseline_calls: Vec::new(),
+                    anchor: None,
                 }
+            }
+            fn anchored(
+                rounds: Vec<TraversalDelta>,
+                tail: TraversalCapture,
+                anchor: TraversalAnchor,
+            ) -> Self {
+                let mut s = Self::scripted(rounds, tail);
+                s.anchor = Some(anchor);
+                s
             }
         }
         impl DiscoveryPort for TraversalStub {
@@ -9483,6 +9791,9 @@ mod tests {
             fn traversal_active(&self) -> bool {
                 true
             }
+            fn traversal_anchor(&self) -> Option<TraversalAnchor> {
+                self.anchor.clone()
+            }
         }
 
         fn walk(seq: u64, outcome: crate::scan::oracle::Outcome) -> WalkDone {
@@ -9496,7 +9807,171 @@ mod tests {
                 alg_count: 6,
                 row_count: 6,
                 guard: None,
+                algs: Vec::new(),
+                event_ns: 100,
             }
+        }
+
+        fn walk_full(
+            seq: u64,
+            op: u32,
+            outcome: crate::scan::oracle::Outcome,
+            algs: Vec<crate::scan::oracle::AlgIdentity>,
+            event_ns: u64,
+        ) -> WalkDone {
+            WalkDone {
+                tid: TPID,
+                seq,
+                op,
+                arr: 0xa000,
+                outcome,
+                true_t: crate::scan::oracle::TrueT::Proven(6),
+                alg_count: algs.len(),
+                row_count: 0,
+                guard: None,
+                algs,
+                event_ns,
+            }
+        }
+
+        fn anchor_stub() -> TraversalAnchor {
+            TraversalAnchor {
+                site: SiteKey {
+                    object: ObjectId("build:anchor".to_string()),
+                    device: 9,
+                    inode: 7,
+                    offset: 0x1234,
+                },
+            }
+        }
+
+        fn ident(idx: u64, class: u16, status: u8, weak: u8) -> crate::scan::oracle::AlgIdentity {
+            crate::scan::oracle::AlgIdentity {
+                idx,
+                class,
+                status,
+                weak,
+            }
+        }
+
+        #[test]
+        fn traversal_adaptation_groups_completes_by_op() {
+            use crate::scan::oracle::Outcome;
+            use osslscope_ebpf_common as wire;
+            let class_a = 0u16;
+            let name_a = crate::kinds::ALG_NAMES[0].name.to_string();
+            let done = vec![
+                walk_full(
+                    1,
+                    1,
+                    Outcome::Complete {
+                        true_t: 2,
+                        cached: false,
+                    },
+                    vec![
+                        ident(0, class_a, wire::ALG_OK, 0),
+                        ident(1, wire::OTHER_CLASS, wire::ALG_EMPTY, 0),
+                    ],
+                    100,
+                ),
+                walk_full(
+                    2,
+                    1,
+                    Outcome::Complete {
+                        true_t: 2,
+                        cached: false,
+                    },
+                    vec![
+                        ident(0, class_a, wire::ALG_OK, 1),
+                        ident(1, wire::OTHER_CLASS, wire::ALG_EMPTY, 0),
+                    ],
+                    200,
+                ),
+                // Partial records never adapt (proven tables only).
+                walk_full(
+                    3,
+                    1,
+                    Outcome::Partial {
+                        reasons: vec![crate::scan::oracle::PartialReason::DrainLoss],
+                    },
+                    vec![ident(0, class_a, wire::ALG_OK, 0)],
+                    300,
+                ),
+            ];
+            let sites = adapt_traversal_sites(&done, &anchor_stub());
+            assert_eq!(sites.len(), 1);
+            let s = &sites[0];
+            assert_eq!(s.site.offset, 0x1234);
+            assert_eq!(s.calls, 2, "completes count, partials excluded");
+            assert_eq!((s.first_ns, s.last_ns), (100, 200));
+            // Proven table, every served class named (EMPTY is
+            // shape, not a missing candidate).
+            assert_eq!(s.candidates_coverage, CandidateCoverage::Complete);
+            assert!(s.installed_at.is_none());
+            // EMPTY slots prove shape, not served algorithms (no
+            // class); the weak bit rides per-record candidates.
+            assert_eq!(s.candidates.len(), 2);
+            assert_eq!(s.candidates[0].algorithm_classes, vec![name_a.clone()]);
+            assert_eq!(s.candidates[0].op, 1);
+            assert_eq!(s.candidates[0].funcid, 0);
+            assert!(s.candidates.iter().any(|c| c.weak_alias));
+            assert!(s.candidates.iter().any(|c| !c.weak_alias));
+        }
+
+        #[test]
+        fn traversal_adaptation_splits_ops_and_bounds_classes() {
+            use crate::scan::oracle::Outcome;
+            use osslscope_ebpf_common as wire;
+            let done = vec![
+                walk_full(
+                    1,
+                    1,
+                    Outcome::Complete {
+                        true_t: 1,
+                        cached: false,
+                    },
+                    vec![ident(0, wire::OTHER_CLASS, wire::ALG_UNREADABLE, 0)],
+                    100,
+                ),
+                walk_full(
+                    2,
+                    2,
+                    Outcome::Complete {
+                        true_t: 1,
+                        cached: false,
+                    },
+                    vec![ident(0, 0xBEEF, wire::ALG_OK, 0)],
+                    150,
+                ),
+                // NOIMP serves a name the walker never reads (the
+                // record carries no class for it) — the op group
+                // degrades to Unknown (candidates may be missing).
+                walk_full(
+                    3,
+                    3,
+                    Outcome::Complete {
+                        true_t: 1,
+                        cached: false,
+                    },
+                    vec![
+                        ident(0, wire::OTHER_CLASS, wire::ALG_NOIMP, 0),
+                        ident(1, wire::OTHER_CLASS, wire::ALG_EMPTY, 0),
+                    ],
+                    180,
+                ),
+            ];
+            let sites = adapt_traversal_sites(&done, &anchor_stub());
+            assert_eq!(sites.len(), 3);
+            // UNREADABLE bounds as `other`; out-of-range class ids
+            // (version skew) bound as `other`, never panic.
+            assert_eq!(sites[0].candidates[0].algorithm_classes, vec!["other"]);
+            assert_eq!(sites[1].candidates[0].algorithm_classes, vec!["other"]);
+            assert_eq!(sites[0].candidates[0].op, 1);
+            assert_eq!(sites[1].candidates[0].op, 2);
+            assert_eq!(sites[0].candidates_coverage, CandidateCoverage::Complete);
+            assert_eq!(sites[2].candidates_coverage, CandidateCoverage::Unknown);
+            assert!(sites[2].candidates[0].algorithm_classes.is_empty());
+            assert!(adapt_traversal_sites(&[], &anchor_stub()).is_empty());
         }
 
         fn triple_prov() -> TripleProvenance {
@@ -9616,6 +10091,74 @@ mod tests {
             assert!(t.finish_error.is_none());
             assert!(cap.reasons.iter().any(|r| r == "traversal-storm"));
             assert!(cap.reasons.iter().any(|r| r == "traversal-incomplete"));
+        }
+
+        #[test]
+        fn traversal_completes_produce_inventory() {
+            // End-to-end through close_and_finalize: completed
+            // traversal records adapt into document sites AND
+            // executions (ordinary report/check production), with
+            // the exact ALG identities as candidate classes.
+            use crate::scan::oracle::Outcome;
+            use osslscope_ebpf_common as wire;
+            let name_a = crate::kinds::ALG_NAMES[0].name.to_string();
+            let round = TraversalDelta {
+                done: vec![walk_full(
+                    1,
+                    1,
+                    Outcome::Complete {
+                        true_t: 1,
+                        cached: false,
+                    },
+                    vec![
+                        ident(0, 0, wire::ALG_OK, 0),
+                        ident(1, wire::OTHER_CLASS, wire::ALG_EMPTY, 0),
+                    ],
+                    6_000_000_000,
+                )],
+                findings: vec![],
+                partial_reasons: vec![],
+                polls: 1,
+            };
+            let tail = TraversalCapture {
+                provenance: Some(triple_prov()),
+                done: vec![],
+                findings: vec![],
+                polls: 1,
+                throttled: false,
+                detached: false,
+                finish_error: None,
+            };
+            let cfg = stub_config();
+            let info = stub_info();
+            let clock = ClockStub::at(5_000_000_000);
+            let mut proc = ProcStub;
+            let cancelled = || false;
+            let count = CountSession::new(TPID, FakeCountBackend::new());
+            let runner = stub_runner(
+                &cfg,
+                &info,
+                TraversalStub::anchored(vec![round], tail, anchor_stub()),
+                count,
+                &clock,
+                &mut proc,
+                &cancelled,
+            );
+            let cap = runner.setup_and_run().expect("stub run completes");
+            // The document carries the adapted site (calls = 1
+            // completed query, exact identities, anchor key).
+            assert_eq!(cap.document.sites.len(), 1);
+            let site = &cap.document.sites[0];
+            assert_eq!(site.calls, 1);
+            assert_eq!(site.site.offset, 0x1234);
+            assert_eq!(site.candidates.len(), 1);
+            assert_eq!(site.candidates[0].algorithm_classes, vec![name_a.clone()]);
+            // …and executions (what report/check render) include it.
+            assert_eq!(cap.executions.len(), 1);
+            assert_eq!(cap.executions[0].count, 1);
+            assert_eq!(cap.executions[0].id.alg_class, name_a);
+            // The traversal outcome still retains the records.
+            assert_eq!(cap.traversal.as_ref().unwrap().done.len(), 1);
         }
 
         #[test]
@@ -9934,6 +10477,7 @@ mod tests {
             Config {
                 harvest_object: None,
                 count_object: None,
+                members_object: None,
                 provider: None,
                 builtin: false,
                 table: None,

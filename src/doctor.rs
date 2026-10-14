@@ -1374,84 +1374,178 @@ fn objects_checks_in(
         }
     };
     let mut search = onboard::ObjectSearch::default();
-    let mut rows = match (harvest, count) {
-        (Some(h), Some(c)) => vec![
-            row(
-                Harvest,
-                onboard::resolve_explicit(Harvest, Path::new(h)),
-                "explicit",
-            ),
-            row(
-                Count,
-                onboard::resolve_explicit(Count, Path::new(c)),
-                "explicit",
-            ),
-        ],
-        (Some(h), None) => vec![
-            row(
-                Harvest,
-                onboard::resolve_explicit(Harvest, Path::new(h)),
-                "explicit",
-            ),
-            row(
-                Count,
-                onboard::resolve_implicit_role(Count, dirs, trust, &mut search),
-                "installed",
-            ),
-        ],
-        (None, Some(c)) => vec![
-            row(
-                Harvest,
-                onboard::resolve_implicit_role(Harvest, dirs, trust, &mut search),
-                "installed",
-            ),
-            row(
-                Count,
-                onboard::resolve_explicit(Count, Path::new(c)),
-                "explicit",
-            ),
-        ],
-        (None, None) => match onboard::resolve_implicit_pair(dirs, trust, &mut search) {
-            Ok(pair) => vec![
+    // Implicit roles verify against the prefix receipt exactly
+    // like the run's mixed arm (receiptless pair roles stay
+    // compatible for old installs — Decision 4; a receiptless
+    // members role refuses — its matched-build identity is not
+    // established).
+    let implicit = |role: onboard::ObjectRole,
+                    search: &mut onboard::ObjectSearch|
+     -> Result<PathBuf, onboard::OnboardError> {
+        let p = onboard::resolve_implicit_role(role, dirs, trust, search)?;
+        onboard::verify_role_receipt(role, &p)?;
+        Ok(p)
+    };
+    match (harvest, count, members) {
+        // Fully automatic: ONE matched-set resolution — the pair
+        // rows and the members row come from the same set (never
+        // split prefixes, never a quiet pass while traversal
+        // rejects the same set). No complete triple + no members
+        // file anywhere ⟹ the old-pair install (pair rows as
+        // usual, members INFO). Any other failure refuses all
+        // three (the same refusal a run reports).
+        (None, None, None) => match onboard::resolve_set(None, None, None, dirs, trust) {
+            Ok((set, _)) => vec![
                 Check::pass(
                     "objects-harvest",
                     format!(
                         "harvest object: {} (installed, compatible)",
-                        pair.harvest.display()
+                        set.harvest.display()
                     ),
                 ),
                 Check::pass(
                     "objects-count",
                     format!(
                         "count object: {} (installed, compatible)",
-                        pair.count.display()
+                        set.count.display()
+                    ),
+                ),
+                Check::pass(
+                    "objects-members",
+                    format!(
+                        "members object: {} (installed, compatible)",
+                        set.members.display()
                     ),
                 ),
             ],
+            Err(e) if e.is_not_found() && !onboard::role_file_in_trusted(Members, dirs, trust) => {
+                let mut rows = match onboard::resolve_implicit_pair(dirs, trust, &mut search) {
+                    Ok(pair) => vec![
+                        Check::pass(
+                            "objects-harvest",
+                            format!(
+                                "harvest object: {} (installed, compatible)",
+                                pair.harvest.display()
+                            ),
+                        ),
+                        Check::pass(
+                            "objects-count",
+                            format!(
+                                "count object: {} (installed, compatible)",
+                                pair.count.display()
+                            ),
+                        ),
+                    ],
+                    Err(e) => vec![
+                        Check::fail("objects-harvest", e.message.clone(), e.remediation.clone()),
+                        Check::fail("objects-count", e.message, e.remediation),
+                    ],
+                };
+                rows.push(Check::info(
+                    "objects-members",
+                    "members object: not installed (traversal unavailable — old harvest/count pair compatible)".to_string(),
+                ));
+                rows
+            }
             Err(e) => vec![
                 Check::fail("objects-harvest", e.message.clone(), e.remediation.clone()),
-                Check::fail("objects-count", e.message, e.remediation),
+                Check::fail("objects-count", e.message.clone(), e.remediation.clone()),
+                Check::fail("objects-members", e.message, e.remediation),
             ],
         },
-    };
-    // Members (traversal) row: an explicit path vets pass/fail;
-    // implicit reports the installed state — installed+compatible
-    // passes, absent is INFO (old pair compatible, traversal
-    // unavailable), present-but-unresolvable FAILS (broken install,
-    // actionable — same fail-closed stance as the pair rows).
-    rows.push(match members {
-        Some(m) => row(
-            Members,
-            onboard::resolve_explicit(Members, Path::new(m)),
-            "explicit",
-        ),
-        None => match onboard::resolve_implicit_role(Members, dirs, trust, &mut search) {
+        // Explicit members: the operator demanded traversal — the
+        // same matched-set resolution a run performs (mixed
+        // explicit/implicit arms identical). One error fails all
+        // three (matched-set semantics, like the pair rows).
+        (_, _, Some(_)) => {
+            match onboard::resolve_set(
+                harvest.map(Path::new),
+                count.map(Path::new),
+                members.map(Path::new),
+                dirs,
+                trust,
+            ) {
+                Ok((set, _)) => vec![
+                    row(Harvest, Ok(set.harvest), "explicit"),
+                    row(Count, Ok(set.count), "explicit"),
+                    row(Members, Ok(set.members), "explicit"),
+                ],
+                Err(e) => vec![
+                    Check::fail("objects-harvest", e.message.clone(), e.remediation.clone()),
+                    Check::fail("objects-count", e.message.clone(), e.remediation.clone()),
+                    Check::fail("objects-members", e.message, e.remediation),
+                ],
+            }
+        }
+        // Explicit pair roles, implicit members: pair rows as
+        // usual; members INFOs when absent, resolves
+        // receipt-required when a trusted dir holds it.
+        (Some(h), Some(c), None) => vec![
+            row(
+                Harvest,
+                onboard::resolve_explicit(Harvest, Path::new(h)),
+                "explicit",
+            ),
+            row(
+                Count,
+                onboard::resolve_explicit(Count, Path::new(c)),
+                "explicit",
+            ),
+            members_row(members, dirs, trust, &mut search, &implicit),
+        ],
+        (Some(h), None, None) => vec![
+            row(
+                Harvest,
+                onboard::resolve_explicit(Harvest, Path::new(h)),
+                "explicit",
+            ),
+            row(Count, implicit(Count, &mut search), "installed"),
+            members_row(members, dirs, trust, &mut search, &implicit),
+        ],
+        (None, Some(c), None) => vec![
+            row(Harvest, implicit(Harvest, &mut search), "installed"),
+            row(
+                Count,
+                onboard::resolve_explicit(Count, Path::new(c)),
+                "explicit",
+            ),
+            members_row(members, dirs, trust, &mut search, &implicit),
+        ],
+    }
+}
+
+/// Members (traversal) row for mixed explicit/implicit selections:
+/// absent INFOs on old installs (the pair still works —
+/// Decision 7); a trusted dir holding the role resolves
+/// receipt-required (pass/fail); present-but-unresolvable FAILS
+/// (broken install, actionable — same fail-closed stance as the
+/// pair rows).
+fn members_row(
+    members: Option<&str>,
+    dirs: &[PathBuf],
+    trust: &onboard::TrustPolicy,
+    search: &mut onboard::ObjectSearch,
+    implicit: &dyn Fn(
+        onboard::ObjectRole,
+        &mut onboard::ObjectSearch,
+    ) -> Result<PathBuf, onboard::OnboardError>,
+) -> Check {
+    use onboard::ObjectRole::Members;
+    match members {
+        Some(m) => {
+            let r = onboard::resolve_explicit(Members, Path::new(m));
+            match r {
+                Ok(path) => Check::pass(
+                    "objects-members",
+                    format!("members object: {} (explicit, compatible)", path.display()),
+                ),
+                Err(e) => Check::fail("objects-members", e.message, e.remediation),
+            }
+        }
+        None => match implicit(Members, search) {
             Ok(path) => Check::pass(
                 "objects-members",
-                format!(
-                    "members object: {} (installed, compatible)",
-                    path.display()
-                ),
+                format!("members object: {} (installed, compatible)", path.display()),
             ),
             Err(e) => {
                 if onboard::role_file_in_trusted(Members, dirs, trust) {
@@ -1464,8 +1558,7 @@ fn objects_checks_in(
                 }
             }
         },
-    });
-    rows
+    }
 }
 
 /// Maximum caller modules doctor scans for the address-taken
@@ -2819,6 +2912,15 @@ mod tests {
         cand.exists().then_some(cand)
     }
 
+    fn built_triple() -> Option<(PathBuf, PathBuf, PathBuf)> {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("crates/ebpf/target/bpfel-unknown-none/release");
+        let h = dir.join("osslscope-harvest");
+        let c = dir.join("osslscope-count");
+        let m = dir.join("osslscope-members");
+        (h.exists() && c.exists() && m.exists()).then_some((h, c, m))
+    }
+
     #[test]
     fn members_row_absent_is_info() {
         // No members object installed anywhere: INFO, never fail —
@@ -2845,17 +2947,75 @@ mod tests {
     #[test]
     fn members_row_installed_is_pass() {
         // A vetted installed members object: PASS (needs the built
-        // object — skips loud when the BPF tree was never built).
-        let Some(obj) = built_members() else {
-            eprintln!("SKIP members_row_installed_is_pass: no built members object");
+        // triple — skips loud when the BPF tree was never built,
+        // fails closed in required mode like the shape suite).
+        // The fixture is a full receipted prefix (all three
+        // roles + install manifest, mirroring install-dev.sh),
+        // so the all-implicit matched-set resolution passes —
+        // the same set a run would traverse.
+        let Some((h, c, m)) = built_triple() else {
+            if matches!(std::env::var("OSSL_MEMBERS_REQUIRED").as_deref(), Ok("1")) {
+                panic!(
+                    "FAIL(members-required): no built BPF triple; \
+                     required mode refuses silent skips"
+                );
+            }
+            eprintln!("SKIP members_row_installed_is_pass: no built BPF triple");
             return;
         };
-        let dir = trusted_fixture("members-installed");
-        std::fs::copy(&obj, dir.join("osslscope-members")).unwrap();
-        let rows = objects_checks_in(None, None, None, &[dir], &doctor_trust());
+        let prefix = trusted_fixture("members-installed");
+        let objdir = prefix.join("lib").join("osslscope");
+        std::fs::create_dir_all(&objdir).unwrap();
+        for (name, src) in [
+            ("osslscope-harvest", &h),
+            ("osslscope-count", &c),
+            ("osslscope-members", &m),
+        ] {
+            std::fs::copy(src, objdir.join(name)).unwrap();
+        }
+        let rdir = prefix.join("share").join("osslscope");
+        std::fs::create_dir_all(&rdir).unwrap();
+        let arts: Vec<serde_json::Value> =
+            ["osslscope-harvest", "osslscope-count", "osslscope-members"]
+                .iter()
+                .map(|n| {
+                    let dest = objdir.join(n).display().to_string();
+                    let sha = onboard::file_sha256_hex(&objdir.join(n)).unwrap();
+                    serde_json::json!({"role": "bpf-object", "dest": dest, "sha256": sha})
+                })
+                .collect();
+        std::fs::write(
+            rdir.join("install-manifest.json"),
+            serde_json::to_string(&serde_json::json!({
+                "schema": "osslscope-install-manifest-v1",
+                "artifacts": arts,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let rows = objects_checks_in(None, None, None, &[objdir], &doctor_trust());
         let m = members_row(&rows);
         assert_eq!(m.status, Status::Pass, "{}", m.message);
         assert!(m.message.contains("installed, compatible"), "{}", m.message);
+    }
+
+    #[test]
+    fn members_row_receiptless_is_fail() {
+        // A receiptless members file next to a pair: FAIL (a
+        // hand-placed object whose matched-build identity is not
+        // established — doctor refuses exactly like traversal).
+        let Some((h, c, m)) = built_triple() else {
+            eprintln!("SKIP members_row_receiptless_is_fail: no built BPF triple");
+            return;
+        };
+        let dir = trusted_fixture("members-receiptless");
+        std::fs::copy(&h, dir.join("osslscope-harvest")).unwrap();
+        std::fs::copy(&c, dir.join("osslscope-count")).unwrap();
+        std::fs::copy(&m, dir.join("osslscope-members")).unwrap();
+        let rows = objects_checks_in(None, None, None, &[dir], &doctor_trust());
+        let m = members_row(&rows);
+        assert_eq!(m.status, Status::Fail, "{}", m.message);
+        assert!(m.message.contains("no install receipt"), "{}", m.message);
     }
 
     #[test]

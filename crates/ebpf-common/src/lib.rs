@@ -379,8 +379,13 @@ pub const fn governor_for_ring(ring_bytes: u64) -> u64 {
 }
 
 /// `bpf_ringbuf_query` flag for occupied bytes (kernel UAPI
-/// `BPF_RB_AVAIL_DATA`, include/uapi/linux/bpf.h).
-pub const RINGBUF_AVAIL_DATA: u64 = 4;
+/// `BPF_RB_AVAIL_DATA`, include/uapi/linux/bpf.h — the query
+/// flags are NOT bit positions: AVAIL_DATA=0, RING_SIZE=1,
+/// CONS_POS=2, PROD_POS=3, OVERWRITE_POS=4. A stale 4 here
+/// queried the overwrite position (always 0 on a normal ringbuf)
+/// and silently disabled the occupancy governor — the
+/// pressure-skip leg pins the trip live).
+pub const RINGBUF_AVAIL_DATA: u64 = 0;
 
 /// Per-record ringbuf header (the occupancy math adds this per
 /// record; on-ring sizes are payload rounded up to 8 + 8).
@@ -1728,8 +1733,9 @@ mod tests {
         assert_eq!(RINGBUF_HDR, 8);
         assert_eq!(SCAN_QUANTUM_C, 32, "C: CALL-only 24+8");
         assert_eq!(SCAN_QUANTUM_D, 80, "D: CALL+RET 32+48");
-        // ringbuf_query flag: kernel UAPI BPF_RB_AVAIL_DATA.
-        assert_eq!(RINGBUF_AVAIL_DATA, 4);
+        // ringbuf_query flag: kernel UAPI BPF_RB_AVAIL_DATA (= 0;
+        // the flags are an enum, not bits — 4 is OVERWRITE_POS).
+        assert_eq!(RINGBUF_AVAIL_DATA, 0);
     }
 
     #[test]

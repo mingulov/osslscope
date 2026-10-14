@@ -33,7 +33,8 @@
 #     path refuses the install instead of being reused.
 #   - Fail closed on incompatible objects: the host binary must be an
 #     x86-64 ELF executable; BPF objects must be ELF64 little-endian
-#     EM_BPF relocatables (role usability stays a loader/doctor gate).
+#     EM_BPF relocatables (role usability stays a loader/doctor gate;
+#     staged verification covers members too when resolved).
 #   - Explicit --binary/--harvest/--count overrides stay supported: they
 #     are screened like any object but never hash-checked against the
 #     manifest, and the receipt records them as explicit-override.
@@ -62,7 +63,7 @@ MEMBERS_OVERRIDE=""
 SETCAP=0
 
 usage() {
-    sed -n '2,48p' "$0"
+    sed -n '2,49p' "$0"
     echo "Exit codes: 0 ok; 2 usage; 3 missing prerequisite; 1 install/setup failure."
 }
 
@@ -118,7 +119,10 @@ case "$_NORM" in
     /|/usr) echo "error: refusing system prefix '$PREFIX' (canonical path '$_NORM'): /usr is system package territory (use deb/rpm there); pick a local prefix such as \$HOME/.local" >&2; exit 2 ;;
 esac
 
-REPO="$(cd "$(dirname "$0")/.." && pwd)"
+# POSIX parameter expansion instead of dirname(1): this runs before the
+# prerequisite checks, so it cannot depend on any external tool.
+_d="${0%/*}"; [ "$_d" = "$0" ] && _d="."
+REPO="$(cd "$_d/.." && pwd)"
 if [ -z "$MANIFEST" ]; then MANIFEST="$REPO/target/dev-build-manifest.json"; fi
 
 fail_prereq() {
@@ -139,8 +143,9 @@ need_cmd cp "install coreutils, then re-run"
 need_cmd mkdir "install coreutils, then re-run"
 need_cmd chmod "install coreutils, then re-run"
 need_cmd mktemp "install coreutils (staging directory), then re-run"
-need_cmd mv "install coreutils, then re-run"
-need_cmd cmp "install diffutils, then re-run"
+need_cmd mv "install coreutils (atomic staged replacement), then re-run"
+need_cmd cmp "install diffutils (staged/installed byte comparison), then re-run"
+need_cmd sed "install sed (ELF header screening), then re-run"
 
 # --- resolve artifact sources ---
 if [ -z "$BIN_OVERRIDE$HARVEST_OVERRIDE$COUNT_OVERRIDE$MEMBERS_OVERRIDE" ] && [ ! -f "$MANIFEST" ]; then
@@ -234,10 +239,16 @@ EOF2
     if [ -z "$HOST_BIN" ]; then HOST_BIN="$_m_host"; SEL_HOST="manifest-verified"; fi
     if [ -z "$HARVEST_OBJ" ]; then HARVEST_OBJ="$_m_harvest"; SEL_HARVEST="manifest-verified"; fi
     if [ -z "$COUNT_OBJ" ]; then COUNT_OBJ="$_m_count"; SEL_COUNT="manifest-verified"; fi
-    if [ -z "$MEMBERS_OBJ" ]; then MEMBERS_OBJ="$_m_members"; SEL_MEMBERS="manifest-verified"; fi
+    # Members is optional (pair-only installs stay valid): an empty
+    # manifest entry is not-installed, never verified.
+    if [ -z "$MEMBERS_OBJ" ]; then
+        MEMBERS_OBJ="$_m_members"
+        if [ -n "$MEMBERS_OBJ" ]; then SEL_MEMBERS="manifest-verified"; else SEL_MEMBERS="not-installed"; fi
+    fi
     PRODUCT_REF="$_m_ref"
     PRODUCT_DIRTY="$_m_dirty"
 fi
+if [ -z "$MEMBERS_OBJ" ]; then SEL_MEMBERS="not-installed"; fi
 
 [ -n "$HOST_BIN" ] || { echo "error: no host binary: manifest lists no host-binary artifact and --binary was not given (build with scripts/build-dev.sh)" >&2; exit 1; }
 [ -n "$HARVEST_OBJ" ] || { echo "error: no harvest object: manifest lists no osslscope-harvest artifact and --harvest was not given (build with scripts/build-dev.sh)" >&2; exit 1; }
@@ -288,9 +299,8 @@ jobs = [
     ("harvest object", e["STAGE_HARVEST"], e["SEL_HARVEST"]),
     ("count object", e["STAGE_COUNT"], e["SEL_COUNT"]),
 ]
-# Members is optional: verify only when a staged members object exists.
-if os.path.isfile(e.get("STAGE_MEMBERS") or ""):
-    jobs.append(("members object", e["STAGE_MEMBERS"], e.get("SEL_MEMBERS", "explicit-override")))
+if e.get("SEL_MEMBERS") == "manifest-verified":
+    jobs.append(("members object", e["STAGE_MEMBERS"], e["SEL_MEMBERS"]))
 # Selection and verification together: recorded identities come from the
 # single manifest snapshot, never through the flattened shell channel,
 # so a newline-bearing JSON value cannot spoof another artifact's
@@ -428,13 +438,17 @@ HARVEST_TMP="$(mktemp "$HARVEST_DEST.install-tmp.XXXXXX")" \
     || { echo "error: cannot create temporary file for $HARVEST_DEST" >&2; exit 1; }
 COUNT_TMP="$(mktemp "$COUNT_DEST.install-tmp.XXXXXX")" \
     || { echo "error: cannot create temporary file for $COUNT_DEST" >&2; exit 1; }
-MEMBERS_TMP="$(mktemp "$MEMBERS_DEST.install-tmp.XXXXXX")" \
-    || { echo "error: cannot create temporary file for $MEMBERS_DEST" >&2; exit 1; }
 DOC_TMP="$(mktemp "$DOC_DEST.install-tmp.XXXXXX")" \
     || { echo "error: cannot create temporary file for $DOC_DEST" >&2; exit 1; }
 RECEIPT_TMP="$(mktemp "$INST_MANIFEST.install-tmp.XXXXXX")" \
     || { echo "error: cannot create temporary file for $INST_MANIFEST" >&2; exit 1; }
-trap 'rm -rf "$STAGE"; rm -f "$BIN_TMP" "$HARVEST_TMP" "$COUNT_TMP" "$MEMBERS_TMP" "$DOC_TMP" "$RECEIPT_TMP"' EXIT INT TERM
+if [ -n "$MEMBERS_OBJ" ]; then
+    MEMBERS_TMP="$(mktemp "$MEMBERS_DEST.install-tmp.XXXXXX")" \
+        || { echo "error: cannot create temporary file for $MEMBERS_DEST" >&2; exit 1; }
+else
+    MEMBERS_TMP=""
+fi
+trap 'rm -rf "$STAGE"; rm -f "$BIN_TMP" "$HARVEST_TMP" "$COUNT_TMP" "$DOC_TMP" "$RECEIPT_TMP" "$MEMBERS_TMP"' EXIT INT TERM
 install_one() {
     # $1 = staged source, $2 = destination, $3 = temp file, $4 = mode, $5 = role label.
     # The temp file is a fresh mktemp path owned by this run; never write
@@ -547,13 +561,13 @@ arts = [
      "product_ref": ref(e["SEL_COUNT"]), "product_dirty": dirty(e["SEL_COUNT"])},
 ]
 if e.get("MEMBERS_OBJ"):
-    _msel = e.get("SEL_MEMBERS", "explicit-override")
     arts.append(
         {"role": "bpf-object", "bin": "osslscope-members",
          "src": e["MEMBERS_OBJ"],
          "dest": pfx + "/lib/osslscope/osslscope-members",
-         "selection": _msel,
-         "product_ref": ref(_msel), "product_dirty": dirty(_msel)})
+         "selection": e["SEL_MEMBERS"],
+         "product_ref": ref(e["SEL_MEMBERS"]), "product_dirty": dirty(e["SEL_MEMBERS"])},
+    )
 for a in arts:
     # Hashes of the installed bytes, which the retained-identity check
     # above proved still match the verified staged bytes.
