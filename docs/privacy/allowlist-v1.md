@@ -251,8 +251,8 @@ generation, userspace-written — the writer is the item-4 backend
 GEN-mismatch as cold), `CTRL`
 (EXPECTED/epoch/SKIP-ALL/governor occupancy bound), `ATTEMPT`
 (entry-hit census), `BUCKET` (tid → tokens:8|last-refill:56 —
-per-thread tier-1 rate state, numeric only), `TRUNC_SEQ`
-(monotonic TRUNC flag-event generation — the drain-race guard,
+per-thread tier-1 rate state, numeric only), `TRUNC_SEQ` (op →
+flag-event generation — recurring faults re-report on advance,
 numeric only). The entry plane reads
 NO target memory (args + map cells only — the entry cannot see rv;
 pinned by `probe_read_allowlist_is_complete`), so admission/skip
