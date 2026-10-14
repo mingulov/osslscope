@@ -43,6 +43,8 @@
 //! end-state + RET/guard-awareness are D's new facts.)
 
 use osslscope::loader::Loaded;
+use osslscope::scan::backend::{BackendAction, ScanBackend};
+use osslscope::scan::oracle::{Outcome, PartialReason, TrueT};
 use osslscope::scan::registry::BirthState;
 use std::collections::HashSet;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -4775,4 +4777,266 @@ fn d_detach_wall() {
         attach_dt + detach_dt < std::time::Duration::from_secs(60),
         "detach-wall: attach+detach {attach_dt:?}+{detach_dt:?} exceeds hang-guard 60s"
     );
+}
+
+// ===== R19 production-path proof legs (integration) =====
+//
+// The legs above attach through `loader::attach_members` and drain
+// the ring by hand. These legs drive the PRODUCTION backend
+// (`ScanBackend`: attach → register → poll → completed — the same
+// API `capture::run_traversal` composes) against the real object:
+// one query with later slots (E=256, terminator deep in the array —
+// first fire completes uncached + warms T_CACHE, second completes
+// cached) and the 512/513 termination boundary (512-clean
+// completes; 513-live closes Partial{Trunc, Overfull} with a VALID
+// guard and TRUE-T demoted to Candidate(512)). Same lane rules as
+// the D legs (OSSL_B_LIVE=1, OSSL_MEMBERS_OBJECT,
+// --test-threads=1, #[ignore]).
+
+/// Attach the production backend (full 512, production CTRL) and
+/// register this thread (BIRTH must exist before the entry fires —
+/// the entry skips unregistered tids).
+fn backend_chunk(obj: &std::path::Path, exe: &std::ffi::CString, off: u64) -> ScanBackend {
+    let ctrl =
+        osslscope::loader::default_ctrl(512, osslscope::loader::MEMBER_RING_BYTES).expect("CTRL");
+    let mut backend = ScanBackend::attach(obj, exe, off, std::process::id(), &ctrl, None)
+        .expect("backend attach");
+    backend.register(&[self_tid()]).expect("register self");
+    backend
+}
+
+/// R19: one query with later slots through the production backend
+/// (E=256 — the terminator sits deep in the array, past the early
+/// prefix the small fixtures exercise). Past-T is zero by
+/// construction (padded) — the T-gate is D's proven fact; what's
+/// under test here is the backend join at depth: exact TRUE-T,
+/// exact counts, the EMPTY guard, then the T_CACHE-cached close.
+#[test]
+#[ignore]
+fn r19_backend_later_slots() {
+    use osslscope_ebpf_common as wire;
+    let Some(obj) = gated() else {
+        eprintln!("SKIP(members-live): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
+        return;
+    };
+    let exe = own_exe_cstr();
+    let off = query_off();
+    let mut backend = backend_chunk(&obj, &exe, off);
+    let slots: Vec<SlotSpec> = (0..256u32)
+        .map(|j| {
+            SlotSpec::live(
+                &format!("M9A{j:03}"),
+                100 + j as u16,
+                vec![(7000 + j, 0xA000 + j as u64)],
+            )
+        })
+        .collect();
+    let fx = Fixture::build_padded(&slots, &[], 513);
+    fx.pretouch();
+    populate_alg_class(backend.loaded(), &fx.classes);
+    FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
+    NS_VERDICT.store(0, Ordering::SeqCst);
+    // Fire 1 (cold): completes uncached, warms T_CACHE @256.
+    fire(OP as i32, 1);
+    let d1 = backend
+        .poll_at(std::time::Instant::now(), true)
+        .expect("backend poll 1");
+    assert!(d1.findings.is_empty(), "later-slots: no findings");
+    assert_eq!(d1.done.len(), 1, "later-slots: one WalkDone");
+    let w1 = &d1.done[0];
+    assert_eq!((w1.tid, w1.op, w1.arr), (self_tid(), OP, fx.array));
+    assert_eq!(
+        w1.outcome,
+        Outcome::Complete {
+            true_t: 256,
+            cached: false
+        },
+        "later-slots: cold Complete @256"
+    );
+    assert_eq!(w1.true_t, TrueT::Proven(256));
+    assert_eq!((w1.alg_count, w1.row_count), (256, 256));
+    let g = w1.guard.as_ref().expect("later-slots: guard joined");
+    assert_eq!(
+        (g.kind, g.op, g.verdict, g.arr),
+        (wire::KIND_GUARD, OP, wire::GUARD_EMPTY, fx.array),
+        "later-slots: EMPTY guard (slot 512 zero)"
+    );
+    assert!(
+        d1.actions.iter().any(
+            |a| matches!(a, BackendAction::CacheWarmed { arr, t } if *arr == fx.array && *t == 256)
+        ),
+        "later-slots: warms T_CACHE @256, got {:?}",
+        d1.actions
+    );
+    assert!(
+        d1.actions
+            .iter()
+            .all(|a| !matches!(a, BackendAction::Detached | BackendAction::SkipAllEngaged)),
+        "later-slots: no storm/throttle"
+    );
+    // Fire 2 (warm): completes cached, no T_CACHE rewrite.
+    fire(OP as i32, 1);
+    let d2 = backend
+        .poll_at(std::time::Instant::now(), true)
+        .expect("backend poll 2");
+    assert_eq!(d2.done.len(), 1, "later-slots: one WalkDone (warm)");
+    let w2 = &d2.done[0];
+    assert_eq!(
+        w2.outcome,
+        Outcome::Complete {
+            true_t: 256,
+            cached: true
+        },
+        "later-slots: cached Complete @256"
+    );
+    assert_eq!(w2.seq, w1.seq + 1, "later-slots: seq advances");
+    assert!(
+        d2.actions
+            .iter()
+            .all(|a| !matches!(a, BackendAction::CacheWarmed { .. })),
+        "later-slots: no rewrite on cached close"
+    );
+    // End-state: retired + silent loss planes + both queries counted.
+    let loaded = backend.loaded();
+    assert_retired(loaded, self_tid(), "later-slots");
+    assert_loss_zero(loaded);
+    assert_eq!(read_percpu(loaded, "CALLS", OP, false), 2);
+    assert_eq!(read_percpu(loaded, "TRUNC", OP, true), 0);
+}
+
+/// R19: the 512/513 termination boundary through the production
+/// backend. Producer shapes mirror L6 (512-clean: GUARD EMPTY,
+/// TRUNC clear; 513-live: GUARD VALID, TRUNC_ALGS, slot 512
+/// unwalked); what's under test is the backend close — 512
+/// completes (then caches), 513 closes Partial with the Overfull
+/// reason and TRUE-T demoted to Candidate(512), never Proven.
+#[test]
+#[ignore]
+fn r19_backend_termination_512_513() {
+    use osslscope_ebpf_common as wire;
+    let Some(obj) = gated() else {
+        eprintln!("SKIP(members-live): OSSL_B_LIVE/OSSL_MEMBERS_OBJECT unset");
+        return;
+    };
+    let exe = own_exe_cstr();
+    let off = query_off();
+    // 512-clean: completes uncached, then cached.
+    {
+        let slots: Vec<SlotSpec> = (0..512u32)
+            .map(|j| {
+                SlotSpec::live(
+                    &format!("M9B{j:03}"),
+                    100 + j as u16,
+                    vec![(7000 + j, 0xA000 + j as u64)],
+                )
+            })
+            .collect();
+        let fx = Fixture::build(&slots, &[]);
+        fx.pretouch();
+        let mut backend = backend_chunk(&obj, &exe, off);
+        populate_alg_class(backend.loaded(), &fx.classes);
+        FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
+        NS_VERDICT.store(0, Ordering::SeqCst);
+        fire(OP as i32, 1);
+        let d1 = backend
+            .poll_at(std::time::Instant::now(), true)
+            .expect("backend poll 512-1");
+        assert_eq!(d1.done.len(), 1, "512-clean: one WalkDone");
+        let w1 = &d1.done[0];
+        assert_eq!(
+            w1.outcome,
+            Outcome::Complete {
+                true_t: 512,
+                cached: false
+            },
+            "512-clean: cold Complete @512"
+        );
+        assert_eq!(w1.true_t, TrueT::Proven(512));
+        assert_eq!((w1.alg_count, w1.row_count), (512, 512));
+        let g = w1.guard.as_ref().expect("512-clean: guard joined");
+        assert_eq!(g.verdict, wire::GUARD_EMPTY, "512-clean: EMPTY guard");
+        fire(OP as i32, 1);
+        let d2 = backend
+            .poll_at(std::time::Instant::now(), true)
+            .expect("backend poll 512-2");
+        assert_eq!(d2.done.len(), 1, "512-clean: one WalkDone (warm)");
+        assert_eq!(
+            d2.done[0].outcome,
+            Outcome::Complete {
+                true_t: 512,
+                cached: true
+            },
+            "512-clean: cached Complete @512"
+        );
+        let loaded = backend.loaded();
+        assert_retired(loaded, self_tid(), "512-clean");
+        assert_loss_zero(loaded);
+        assert_eq!(read_percpu(loaded, "CALLS", OP, false), 2);
+        assert_eq!(read_percpu(loaded, "TRUNC", OP, true), 0);
+    }
+    // 513-live: Partial{Trunc, Overfull}, VALID guard, no warm.
+    {
+        let slots: Vec<SlotSpec> = (0..513u32)
+            .map(|j| {
+                SlotSpec::live(
+                    &format!("M9C{j:03}"),
+                    100 + (j % 512) as u16,
+                    vec![(7000 + j, 0xA000 + j as u64)],
+                )
+            })
+            .collect();
+        let fx = Fixture::build(&slots, &[]);
+        fx.pretouch();
+        let mut backend = backend_chunk(&obj, &exe, off);
+        populate_alg_class(backend.loaded(), &fx.classes);
+        FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
+        NS_VERDICT.store(0, Ordering::SeqCst);
+        fire(OP as i32, 1);
+        let d1 = backend
+            .poll_at(std::time::Instant::now(), true)
+            .expect("backend poll 513-1");
+        assert!(d1.findings.is_empty(), "513-live: no findings");
+        assert_eq!(d1.done.len(), 1, "513-live: one WalkDone");
+        let w1 = &d1.done[0];
+        assert_eq!(
+            w1.outcome,
+            Outcome::Partial {
+                reasons: vec![
+                    PartialReason::Trunc(wire::TRUNC_ALGS),
+                    PartialReason::Overfull,
+                ]
+            },
+            "513-live: Partial{{Trunc, Overfull}}"
+        );
+        assert_eq!(w1.true_t, TrueT::Candidate(512));
+        assert_eq!((w1.alg_count, w1.row_count), (512, 512));
+        let g = w1.guard.as_ref().expect("513-live: guard joined");
+        assert_eq!(
+            (g.op, g.verdict, g.arr),
+            (OP, wire::GUARD_VALID, fx.array),
+            "513-live: VALID guard"
+        );
+        assert!(
+            d1.actions
+                .iter()
+                .all(|a| !matches!(a, BackendAction::CacheWarmed { .. })),
+            "513-live: Partial never warms"
+        );
+        // Second fire: still Partial (nothing warmed).
+        fire(OP as i32, 1);
+        let d2 = backend
+            .poll_at(std::time::Instant::now(), true)
+            .expect("backend poll 513-2");
+        assert_eq!(d2.done.len(), 1, "513-live: one WalkDone (again)");
+        assert_eq!(d2.done[0].outcome, w1.outcome, "513-live: Partial again");
+        let loaded = backend.loaded();
+        assert_retired(loaded, self_tid(), "513-live");
+        assert_loss_zero(loaded);
+        assert_eq!(read_percpu(loaded, "CALLS", OP, false), 2);
+        assert_eq!(
+            read_percpu(loaded, "TRUNC", OP, true),
+            wire::TRUNC_ALGS,
+            "513-live: TRUNC_ALGS alone"
+        );
+    }
 }
