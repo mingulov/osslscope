@@ -695,6 +695,11 @@ fn h5_t3_every_device_site_names_one_domain() {
             1,
         ),
         ("src/report.rs", "display", "site.site.device,", 1),
+        // target.rs: staging-cleanup unlink guard (R06: lstat dev_t
+        // vs the fstat-recorded dev_t — a raw-vs-raw same-file check
+        // so a stale worker unlinks only the inode it created; no
+        // maps text or rendered dev strings in this file).
+        ("src/target.rs", "raw", "&& st.st_dev == staging.dev", 1),
     ];
     for (file, domain, _, _) in pinned {
         assert!(
