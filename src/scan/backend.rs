@@ -445,10 +445,14 @@ impl ScanBackend {
         // (Corrections take AFTER the fallible cache loop below:
         // a cache write error must not drop rewrites for already-
         // held verdicts — untaken corrections stay in the oracle
-        // for the next poll or the salvage take.)
-        let fresh: Vec<WalkDone> = self.oracle.take_done();
-        let fresh_findings: Vec<Finding> = self.oracle.take_findings();
-        let fresh_admitted = read_calls_by_op(&self.loaded.maps)?;
+        // for the next poll or the salvage take. The census read
+        // likewise precedes its takes — see take_after_census.)
+        let maps = &self.loaded.maps;
+        let oracle = &mut self.oracle;
+        let (fresh_admitted, fresh, fresh_findings) = take_after_census(
+            || read_calls_by_op(maps),
+            || (oracle.take_done(), oracle.take_findings()),
+        )?;
         self.done_total += fresh.len() as u64;
         self.findings_total += fresh_findings.len() as u64;
         for w in &fresh {
@@ -586,7 +590,13 @@ impl ScanBackend {
         delta.done.extend(done);
         delta.findings.extend(findings);
         delta.corrections.extend(self.oracle.take_corrections());
-        delta.admitted = read_calls_by_op(&self.loaded.maps)?;
+        // No second census read: SKIP_ALL froze admits at finish
+        // entry (the entry gate precedes the CALLS bump, so no
+        // admission lands past it), and the settle poll above
+        // already snapshotted that frozen census — a re-read
+        // would add only a post-take failure mode stranding the
+        // batch it just took. Nothing after the takes above can
+        // fail, so the full batch + corrections always survive.
         Ok(delta)
     }
 
@@ -869,6 +879,25 @@ fn read_calls_by_op(
         .into_iter()
         .filter(|(_, v)| *v != 0)
         .collect())
+}
+
+/// Ordered-take outputs: census snapshot + records + findings.
+type CensusTake = (BTreeMap<u32, u64>, Vec<WalkDone>, Vec<Finding>);
+
+/// Ordered take: the fallible census read runs BEFORE any
+/// oracle take, so a read failure leaves every record and
+/// finding in the oracle for the next poll or the salvage take
+/// (taking first would strand them in a dropped delta while
+/// salvage finds nothing). The closures keep this host-testable
+/// with a real oracle: production passes the map read and the
+/// oracle takes.
+fn take_after_census(
+    read_census: impl FnOnce() -> anyhow::Result<BTreeMap<u32, u64>>,
+    take: impl FnOnce() -> (Vec<WalkDone>, Vec<Finding>),
+) -> anyhow::Result<CensusTake> {
+    let census = read_census()?;
+    let (done, findings) = take();
+    Ok((census, done, findings))
 }
 
 /// Ops with records in `done` but no census entry (pure,
@@ -1246,6 +1275,120 @@ mod tests {
             ),
             BTreeSet::from([99])
         );
+    }
+
+    /// Oracle holding one closed record + one finding (a
+    /// cold T=1 close plus an orphan RET for an unknown key —
+    /// the batch the failure-ordering controls take from).
+    /// Asserts non-consumingly (the batch stays for the take).
+    fn oracle_with_batch() -> Oracle {
+        use crate::scan::oracle::{Oracle, OracleScope, ScanBatch};
+        let mut o = Oracle::new(OracleScope::full());
+        let mut b = ScanBatch {
+            quiesced: true,
+            ..ScanBatch::default()
+        };
+        b.rcount.insert(4242, (0, wire::RCOUNT_STATE_IDLE));
+        b.push_call(wire::ScanCallEvent {
+            kind: wire::KIND_SCAN_CALL,
+            op: 7,
+            tid: 4242,
+            flags: wire::make_call_flags(false, wire::SKIP_ADMITTED),
+            seq: 0,
+        });
+        b.push_ret(wire::ScanRetEvent {
+            kind: wire::KIND_SCAN_RET,
+            op: 7,
+            flags: 0,
+            tid: 4242,
+            seq: 0,
+            arr: 0x7000,
+            generation: 0,
+        });
+        b.push_alg(wire::ScanAlgEvent {
+            kind: wire::KIND_SCAN_ALG,
+            op: 7,
+            class: 1,
+            status: wire::ALG_OK,
+            weak: 0,
+            _pad: 0,
+            arr: 0x7000,
+            idx: 0,
+            generation: 0,
+            tid: 4242,
+            _pad2: 0,
+            seq: 0,
+        });
+        b.push_alg(wire::ScanAlgEvent {
+            kind: wire::KIND_SCAN_ALG,
+            op: 7,
+            class: wire::OTHER_CLASS,
+            status: wire::ALG_EMPTY,
+            weak: 0,
+            _pad: 0,
+            arr: 0x7000,
+            idx: 1,
+            generation: 0,
+            tid: 4242,
+            _pad2: 0,
+            seq: 0,
+        });
+        b.push_ret(wire::ScanRetEvent {
+            kind: wire::KIND_SCAN_RET,
+            op: 7,
+            flags: 0,
+            tid: 4242,
+            seq: 9,
+            arr: 0x7000,
+            generation: 0,
+        });
+        o.ingest(&b);
+        assert_eq!(o.done().len(), 1, "setup closes one record");
+        assert_eq!(o.findings().len(), 1, "setup raises one finding");
+        o
+    }
+
+    #[test]
+    fn fix5_census_failure_preserves_takes() {
+        use std::cell::Cell;
+        // A failing census read consumes NOTHING: the takes never
+        // run, and the full output batch (records + findings)
+        // stays in the oracle for the next poll or the salvage
+        // take.
+        let mut o = oracle_with_batch();
+        let takes = Cell::new(0u32);
+        let r = take_after_census(
+            || anyhow::bail!("injected census failure"),
+            || {
+                takes.set(takes.get() + 1);
+                (o.take_done(), o.take_findings())
+            },
+        );
+        assert!(r.is_err(), "the read failure must propagate");
+        assert_eq!(takes.get(), 0, "failing read must not consume takes");
+        assert_eq!(o.take_done().len(), 1, "the record stays for salvage");
+        assert_eq!(o.take_findings().len(), 1, "the finding stays for salvage");
+    }
+
+    #[test]
+    fn fix5_census_success_takes_batch_once() {
+        use std::cell::Cell;
+        // A passing census read takes the full batch exactly once
+        // (records + findings + snapshot all flow through).
+        let mut o = oracle_with_batch();
+        let takes = Cell::new(0u32);
+        let (census, done, findings) = take_after_census(
+            || Ok(BTreeMap::from([(7u32, 10u64)])),
+            || {
+                takes.set(takes.get() + 1);
+                (o.take_done(), o.take_findings())
+            },
+        )
+        .expect("passing read takes");
+        assert_eq!(takes.get(), 1, "takes run exactly once");
+        assert_eq!(census.get(&7), Some(&10));
+        assert_eq!(done.len(), 1, "the record flows through");
+        assert_eq!(findings.len(), 1, "the finding flows through");
     }
 
     #[test]
