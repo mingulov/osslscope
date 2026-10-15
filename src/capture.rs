@@ -211,6 +211,8 @@ fn traversal_record(t: &TraversalCapture) -> Option<evidence::TraversalRecord> {
         findings: t.findings.len() as u64,
         polls: t.polls,
         admitted: t.admitted_by_op.clone(),
+        admitted_unknown: t.admitted_unknown_by_op.iter().copied().collect(),
+        census_loss: t.census_loss,
         entries: t
             .done
             .iter()
@@ -248,6 +250,11 @@ pub struct TraversalDelta {
     /// attach): honest observation metadata (loss-independent —
     /// record count is not a census).
     pub admitted: BTreeMap<u32, u64>,
+    /// Ops with records in this delta but no census entry while
+    /// the census lost increments: UNKNOWN, never zero.
+    pub admitted_unknown: BTreeSet<u32>,
+    /// Cumulative admitted-increment loss (CALLS map pressure).
+    pub census_loss: u64,
 }
 
 /// Retained traversal outcome (on [`Capture`] when traversal ran;
@@ -273,6 +280,12 @@ pub struct TraversalCapture {
     /// observation metadata (loss-independent — record count
     /// is not a census; never billed into executions).
     pub admitted_by_op: BTreeMap<u32, u64>,
+    /// Ops observed (records retained) but missing from the
+    /// census while increments were lost: UNKNOWN, never zero
+    /// (unioned across polls — keys never un-observe).
+    pub admitted_unknown_by_op: BTreeSet<u32>,
+    /// Cumulative admitted-increment loss (CALLS map pressure).
+    pub census_loss: u64,
 }
 
 impl TraversalCapture {
@@ -286,10 +299,14 @@ impl TraversalCapture {
         apply_corrections(&mut self.done, &tail.corrections);
         // Census snapshots are cumulative (never shrink): the
         // latest non-empty snapshot wins; an empty tail (no poll)
-        // keeps the accumulated one.
+        // keeps the accumulated one. Unknown-flags union and
+        // census loss keeps its high-water (same monotonicity).
         if !tail.admitted_by_op.is_empty() {
             self.admitted_by_op = tail.admitted_by_op;
         }
+        self.admitted_unknown_by_op
+            .extend(tail.admitted_unknown_by_op);
+        self.census_loss = self.census_loss.max(tail.census_loss);
         self.polls += tail.polls;
         self.throttled = tail.throttled;
         self.detached = tail.detached;
@@ -728,6 +745,8 @@ impl DiscoveryPort for LiveTraversalDiscovery {
             polls: 1,
             corrections: delta.corrections,
             admitted: delta.admitted,
+            admitted_unknown: delta.admitted_unknown,
+            census_loss: delta.census_loss,
         })
     }
 
@@ -745,6 +764,8 @@ impl DiscoveryPort for LiveTraversalDiscovery {
                 out.findings = delta.findings;
                 out.corrections = delta.corrections;
                 out.admitted_by_op = delta.admitted;
+                out.admitted_unknown_by_op = delta.admitted_unknown;
+                out.census_loss = delta.census_loss;
             }
             Err(e) => {
                 out.finish_error = Some(format!("{e:#}"));
@@ -2988,6 +3009,11 @@ where
                 if !tdelta.admitted.is_empty() {
                     t.admitted_by_op = tdelta.admitted;
                 }
+                // Unknown-flags union (keys never un-observe);
+                // census loss keeps its high-water (cumulative,
+                // never shrinks).
+                t.admitted_unknown_by_op.extend(tdelta.admitted_unknown);
+                t.census_loss = t.census_loss.max(tdelta.census_loss);
             }
         }
         // One fence per round (Exec > ProviderChanged >
@@ -6935,6 +6961,8 @@ mod tests {
                 polls: 1,
                 corrections: vec![],
                 admitted: std::collections::BTreeMap::new(),
+                admitted_unknown: std::collections::BTreeSet::new(),
+                census_loss: 0,
             };
             let d2 = TraversalDelta {
                 done: vec![walk(
@@ -6948,6 +6976,8 @@ mod tests {
                 polls: 1,
                 corrections: vec![],
                 admitted: std::collections::BTreeMap::new(),
+                admitted_unknown: std::collections::BTreeSet::new(),
+                census_loss: 0,
             };
             let tail = TraversalCapture {
                 provenance: Some(triple_prov()),
@@ -6962,6 +6992,8 @@ mod tests {
                 polls: 1,
                 corrections: vec![],
                 admitted_by_op: std::collections::BTreeMap::new(),
+                admitted_unknown_by_op: std::collections::BTreeSet::new(),
+                census_loss: 0,
                 throttled: true,
                 detached: false,
                 finish_error: None,
@@ -7008,7 +7040,7 @@ mod tests {
                     1,
                     1,
                     Outcome::Complete {
-                        true_t: 1,
+                        true_t: 6,
                         cached: false,
                     },
                     vec![],
@@ -7019,7 +7051,7 @@ mod tests {
                     2,
                     1,
                     Outcome::Complete {
-                        true_t: 1,
+                        true_t: 6,
                         cached: false,
                     },
                     vec![],
@@ -7078,7 +7110,7 @@ mod tests {
                     1,
                     1,
                     Outcome::Complete {
-                        true_t: 1,
+                        true_t: 6,
                         cached: false,
                     },
                     vec![
@@ -7093,6 +7125,8 @@ mod tests {
                 polls: 1,
                 corrections: vec![],
                 admitted: std::collections::BTreeMap::new(),
+                admitted_unknown: std::collections::BTreeSet::new(),
+                census_loss: 0,
             };
             let tail = TraversalCapture {
                 provenance: Some(triple_prov()),
@@ -7101,6 +7135,8 @@ mod tests {
                 polls: 1,
                 corrections: vec![],
                 admitted_by_op: std::collections::BTreeMap::new(),
+                admitted_unknown_by_op: std::collections::BTreeSet::new(),
+                census_loss: 0,
                 throttled: false,
                 detached: false,
                 finish_error: None,
@@ -7153,7 +7189,7 @@ mod tests {
                     1,
                     1,
                     Outcome::Complete {
-                        true_t: 1,
+                        true_t: 6,
                         cached: false,
                     },
                     vec![
@@ -7168,6 +7204,8 @@ mod tests {
                 polls: 1,
                 corrections: vec![],
                 admitted: admitted.clone(),
+                admitted_unknown: std::collections::BTreeSet::new(),
+                census_loss: 0,
             };
             let tail = TraversalCapture {
                 provenance: Some(triple_prov()),
@@ -7176,6 +7214,8 @@ mod tests {
                 polls: 1,
                 corrections: vec![],
                 admitted_by_op: std::collections::BTreeMap::new(),
+                admitted_unknown_by_op: std::collections::BTreeSet::new(),
+                census_loss: 0,
                 throttled: false,
                 detached: false,
                 finish_error: None,
@@ -7215,7 +7255,7 @@ mod tests {
             assert_eq!(entries.len(), 1);
             assert_eq!(entries[0]["seq"], 1);
             assert_eq!(entries[0]["op"], 1);
-            assert_eq!(entries[0]["outcome"]["Complete"]["true_t"], 1);
+            assert_eq!(entries[0]["outcome"]["Complete"]["true_t"], 6);
             assert_eq!(entries[0]["true_t"], serde_json::json!({"Proven": 6}));
             assert_eq!(entries[0]["alg_count"], 2);
             assert_eq!(entries[0]["row_count"], 1);
@@ -7230,6 +7270,97 @@ mod tests {
                 serde_json::from_value(v["traversal"].clone()).expect("old reader parses");
             assert_eq!(old.records, 1);
         }
+        #[test]
+        fn fix5_admitted_unknown_retained_and_rendered() {
+            // An op past CALLS map pressure has records but no
+            // census entry: its count is UNKNOWN, never silently
+            // zero. Deltas carry the unknown set + cumulative
+            // loss, the capture unions them across rounds, and
+            // the rendered traversal section reports both
+            // (additive keys — old readers ignore them).
+            use crate::scan::oracle::Outcome;
+            use osslscope_ebpf_common as wire;
+            let round = |seq: u64, op: u32, unknown: u32, loss: u64| TraversalDelta {
+                done: vec![walk_full(
+                    seq,
+                    op,
+                    Outcome::Complete {
+                        true_t: 6,
+                        cached: false,
+                    },
+                    vec![
+                        ident(0, 0, wire::ALG_OK, 0),
+                        ident(1, wire::OTHER_CLASS, wire::ALG_EMPTY, 0),
+                    ],
+                    vec![row_ev(0, 300)],
+                    5_000_000_000,
+                )],
+                findings: vec![],
+                partial_reasons: vec![],
+                polls: 1,
+                corrections: vec![],
+                admitted: [(1u32, 3u64)].into_iter().collect(),
+                admitted_unknown: [unknown].into_iter().collect(),
+                census_loss: loss,
+            };
+            let tail = TraversalCapture {
+                provenance: Some(triple_prov()),
+                done: vec![],
+                findings: vec![],
+                polls: 1,
+                corrections: vec![],
+                admitted_by_op: std::collections::BTreeMap::new(),
+                admitted_unknown_by_op: std::collections::BTreeSet::new(),
+                census_loss: 0,
+                throttled: false,
+                detached: false,
+                finish_error: None,
+            };
+            let cfg = stub_config();
+            let info = stub_info();
+            let clock = ClockStub::at(5_000_000_000);
+            let mut proc = ProcStub;
+            let cancelled = || false;
+            let count = CountSession::new(TPID, FakeCountBackend::new());
+            let runner = stub_runner(
+                &cfg,
+                &info,
+                TraversalStub::scripted(vec![round(1, 99, 99, 2), round(2, 100, 100, 3)], tail),
+                count,
+                &clock,
+                &mut proc,
+                &cancelled,
+            );
+            let cap = runner.setup_and_run().expect("stub run completes");
+            let t = cap.traversal.as_ref().unwrap();
+            assert_eq!(
+                t.admitted_unknown_by_op,
+                [99u32, 100].into_iter().collect(),
+                "capture unions unknown ops across rounds"
+            );
+            assert_eq!(t.census_loss, 3, "capture keeps the loss high-water");
+            let json = crate::report::render_json(&cap.document).expect("render");
+            let v: serde_json::Value = serde_json::from_slice(&json).expect("parse");
+            assert_eq!(
+                v["traversal"]["admitted_unknown"],
+                serde_json::json!([99, 100]),
+                "rendered unknown set names the uncounted ops"
+            );
+            assert_eq!(
+                v["traversal"]["census_loss"], 3,
+                "rendered census loss marks the snapshot incomplete"
+            );
+            // Old-reader compatibility: a reader that knows only
+            // the round-3 shape parses the new document fine.
+            #[derive(serde::Deserialize)]
+            struct OldTraversal {
+                records: u64,
+            }
+            let old: OldTraversal =
+                serde_json::from_value(v["traversal"].clone()).expect("old reader parses");
+            assert_eq!(old.records, 2);
+        }
+
         #[test]
         fn traversal_salvage_keeps_drained() {
             // RED: a close failure salvages the drained-so-far
@@ -7248,6 +7379,8 @@ mod tests {
                 polls: 1,
                 corrections: vec![],
                 admitted: std::collections::BTreeMap::new(),
+                admitted_unknown: std::collections::BTreeSet::new(),
+                census_loss: 0,
             };
             let tail = TraversalCapture {
                 provenance: Some(triple_prov()),
@@ -7262,6 +7395,8 @@ mod tests {
                 polls: 1,
                 corrections: vec![],
                 admitted_by_op: std::collections::BTreeMap::new(),
+                admitted_unknown_by_op: std::collections::BTreeSet::new(),
+                census_loss: 0,
                 throttled: false,
                 detached: true,
                 finish_error: None,
@@ -7407,6 +7542,8 @@ mod tests {
                 polls: 1,
                 corrections: vec![],
                 admitted_by_op: std::collections::BTreeMap::new(),
+                admitted_unknown_by_op: std::collections::BTreeSet::new(),
+                census_loss: 0,
                 throttled: false,
                 detached: true,
                 finish_error: Some("tail drained late".to_string()),
