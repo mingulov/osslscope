@@ -1070,9 +1070,10 @@ impl Oracle {
         // 2. Retain loss/TRUNC history on every open spanning this
         // drain (R5 — evaluated over the full invocation, never
         // the closing batch alone). The retained set covers ring
-        // drops AND TRUNC-subsystem map pressure (a lost flag bit
-        // or generation bump hides evidence exactly like a ring
-        // drop — both degrade via DrainLoss, batch-wide).
+        // drops AND map pressure in the TRUNC and CALLS
+        // subsystems (a lost flag bit, generation bump, or
+        // admitted-increment hides evidence exactly like a ring
+        // drop — all degrade via DrainLoss, batch-wide).
         let ring_delta: u64 = [
             wire::LOSS_RING_CALL,
             wire::LOSS_RING_RET,
@@ -1080,6 +1081,7 @@ impl Oracle {
             wire::LOSS_RING_ALG,
             wire::LOSS_RING_ROW,
             wire::LOSS_MAP_TRUNC,
+            wire::LOSS_MAP_CALLS,
         ]
         .iter()
         .map(|id| b.loss.get(id).copied().unwrap_or(0))

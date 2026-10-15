@@ -678,6 +678,8 @@ fn doc_json(doc: &CaptureDocument) -> serde_json::Value {
             "findings": t.findings,
             "polls": t.polls,
             "admitted": t.admitted,
+            "admitted_unknown": t.admitted_unknown,
+            "census_loss": t.census_loss,
             "entries": t.entries,
         });
     }
