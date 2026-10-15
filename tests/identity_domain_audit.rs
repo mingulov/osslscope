@@ -569,6 +569,17 @@ fn h5_t3_every_device_site_names_one_domain() {
             "let stat_devs: Vec<Option<String>> = maps.iter().map(|m| stat_dev_of(&m.path)).collect();",
             1,
         ),
+        // session.rs: reinstall stat-facet pass (R03 seeds the
+        // replacement binding's mapped history from install-poll
+        // evidence; stat strings feed bindings_alive against the
+        // stat-domain fresh binding — same single-domain shape as
+        // the reconcile pass above, maps text never compared).
+        (
+            "src/discovery/session.rs",
+            "stat",
+            "maps.iter().map(|m| stat_dev_of(&m.path)).collect();",
+            1,
+        ),
         // session.rs: install targets from stat resolves (×2).
         (
             "src/discovery/session.rs",
