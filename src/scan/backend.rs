@@ -114,6 +114,15 @@ pub struct PollDelta {
     /// since attach): honest observation metadata (reported,
     /// never billed into executions).
     pub admitted: BTreeMap<u32, u64>,
+    /// Ops with records in this delta but no census entry while
+    /// the census lost increments (map pressure): their counts
+    /// are UNKNOWN, never zero (a missing key reads zero only
+    /// while [`census_loss`](PollDelta::census_loss) is zero).
+    pub admitted_unknown: BTreeSet<u32>,
+    /// Cumulative admitted-increment loss (LOSS_MAP_CALLS total
+    /// since attach): nonzero means the census snapshot is
+    /// incomplete (some admission went uncounted).
+    pub census_loss: u64,
 }
 
 /// Point-in-time backend state (no record clones — long runs
@@ -519,6 +528,17 @@ impl ScanBackend {
         // above — a cache error above leaves them in the oracle
         // for the next poll or salvage, never dropped).
         let fresh_corrections: Vec<Correction> = self.oracle.take_corrections();
+        // Census honesty: ops observed here but missing from the
+        // snapshot are UNKNOWN once increments were lost (never
+        // silently zero). The CALLS-loss high-water is current —
+        // drain_batch refreshed it before the takes above.
+        let calls_loss = self
+            .last_loss
+            .get(&wire::LOSS_MAP_CALLS)
+            .copied()
+            .unwrap_or(0);
+        delta.admitted_unknown = census_unknown_ops(&fresh, &fresh_admitted, calls_loss);
+        delta.census_loss = calls_loss;
         delta.done = fresh;
         delta.findings = fresh_findings;
         delta.corrections = fresh_corrections;
@@ -555,6 +575,14 @@ impl ScanBackend {
         let (done, findings) = self.take_completed();
         self.done_total += done.len() as u64;
         self.findings_total += findings.len() as u64;
+        // Backstop closes may observe ops the settle poll never
+        // saw — union their unknown-flags into the poll's set
+        // (same snapshot the poll read; no drain ran since).
+        delta.admitted_unknown.extend(census_unknown_ops(
+            &done,
+            &delta.admitted,
+            delta.census_loss,
+        ));
         delta.done.extend(done);
         delta.findings.extend(findings);
         delta.corrections.extend(self.oracle.take_corrections());
@@ -829,9 +857,11 @@ fn accumulate_trunc(
 }
 
 /// Admitted-query census snapshot (CALLS per op, summed across
-/// CPUs — cumulative since attach; absence of a key means zero
-/// admits, never "unknown"). Honest observation metadata
-/// (reported, never billed into executions).
+/// CPUs — cumulative since attach). Honest observation metadata
+/// (reported, never billed into executions). A missing key reads
+/// zero ONLY while the census never lost an increment (see
+/// [`census_unknown_ops`]); past CALLS map pressure the count
+/// for an observed-but-missing op is UNKNOWN, never zero.
 fn read_calls_by_op(
     maps: &std::collections::HashMap<String, OwnedFd>,
 ) -> anyhow::Result<BTreeMap<u32, u64>> {
@@ -839,6 +869,32 @@ fn read_calls_by_op(
         .into_iter()
         .filter(|(_, v)| *v != 0)
         .collect())
+}
+
+/// Ops with records in `done` but no census entry (pure,
+/// host-testable): present CALLS keys are exact (plain-hash
+/// keys never evict), so a missing key is zero only while
+/// `census_loss` is zero — once increments were lost, an
+/// observed-but-missing op is UNKNOWN. Skipped-only ops never
+/// flag (skips are never admitted, so their absence is a true
+/// zero), and UNKNOWN_OP never flags (taint-forced, not a real
+/// op — its admission is unattributable by design).
+fn census_unknown_ops(
+    done: &[WalkDone],
+    admitted: &BTreeMap<u32, u64>,
+    census_loss: u64,
+) -> BTreeSet<u32> {
+    if census_loss == 0 {
+        return BTreeSet::new();
+    }
+    done.iter()
+        .filter(|w| {
+            w.op != crate::scan::oracle::UNKNOWN_OP
+                && !matches!(w.outcome, crate::scan::oracle::Outcome::Skipped { .. })
+                && !admitted.contains_key(&w.op)
+        })
+        .map(|w| w.op)
+        .collect()
 }
 
 /// Lossless TRUNC drain: sticky per-op flag bits plus the
@@ -1119,6 +1175,77 @@ mod tests {
             snap(&[(1, 5), (2, 1)]),
         );
         assert_eq!(d5.get(&2), Some(&0b010), "new bit reports via freshness");
+    }
+
+    #[test]
+    fn fix5_census_unknown_ops_under_map_pressure() {
+        use crate::scan::oracle::{Outcome, TrueT, UNKNOWN_OP};
+        use std::collections::{BTreeMap, BTreeSet};
+        let walk = |op: u32, outcome: Outcome| WalkDone {
+            tid: 1,
+            seq: 1,
+            op,
+            arr: 0,
+            outcome,
+            true_t: TrueT::Proven(1),
+            alg_count: 0,
+            row_count: 0,
+            guard: None,
+            algs: Vec::new(),
+            event_ns: 0,
+            rows: Vec::new(),
+        };
+        let complete = || Outcome::Complete {
+            true_t: 1,
+            cached: false,
+        };
+        // No loss: a missing key is a true zero (never unknown).
+        assert_eq!(
+            census_unknown_ops(&[walk(99, complete())], &BTreeMap::new(), 0),
+            BTreeSet::new()
+        );
+        // Loss + observed-but-missing op: UNKNOWN (never zero).
+        assert_eq!(
+            census_unknown_ops(&[walk(99, complete())], &BTreeMap::new(), 3),
+            BTreeSet::from([99])
+        );
+        // Loss + present key: exact (never flagged).
+        assert_eq!(
+            census_unknown_ops(&[walk(7, complete())], &BTreeMap::from([(7, 10)]), 3),
+            BTreeSet::new()
+        );
+        // Loss + skipped-only op: true zero (skips never admit).
+        assert_eq!(
+            census_unknown_ops(
+                &[walk(5, Outcome::Skipped { cause: 1 })],
+                &BTreeMap::new(),
+                3
+            ),
+            BTreeSet::new()
+        );
+        // Loss + taint-forced op: unattributable (never flagged).
+        assert_eq!(
+            census_unknown_ops(
+                &[walk(UNKNOWN_OP, Outcome::Tainted { by_seq: 2 })],
+                &BTreeMap::new(),
+                3
+            ),
+            BTreeSet::new()
+        );
+        // Mixed batch flags exactly the observed-but-missing op.
+        assert_eq!(
+            census_unknown_ops(
+                &[
+                    walk(99, complete()),
+                    walk(7, complete()),
+                    walk(5, Outcome::Skipped { cause: 1 }),
+                    walk(UNKNOWN_OP, Outcome::Tainted { by_seq: 2 }),
+                ],
+                &BTreeMap::from([(7, 10)]),
+                3
+            ),
+            BTreeSet::from([99])
+        );
     }
 
     #[test]
