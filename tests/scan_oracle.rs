@@ -1719,6 +1719,168 @@ fn fix2_selective_unattached_terminator_keeps_belief() {
     ));
 }
 
+/// Round-5 F2 (rereview counterexample): slot 0 emits ALG_OK +
+/// one ROW, then the next dispatch-entry read fails
+/// (TRUNC_WALK_READ); slot 1 is a valid terminator. ROW
+/// presence does not prove dispatch termination (the producer
+/// emits ROWs before a later entry read can abort), and
+/// vacuous beyond-T silence is not T+1 evidence — the
+/// invocation stays PARTIAL, never Complete.
+#[test]
+fn fix5_f2_row_then_abort_not_masked() {
+    let mut o = Oracle::new(OracleScope::full());
+    let mut b = quiesced_idle(&[TIDA]);
+    b.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b.push_ret(ret(TIDA, 0, 0));
+    b.push_alg(alg(TIDA, 0, 0, wire::ALG_OK));
+    b.push_row(row(TIDA, 0, 0));
+    b.push_alg(alg_arr(TIDA, 0, 1, wire::ALG_EMPTY, ARR, 0));
+    b.trunc.insert(OP, wire::TRUNC_WALK_READ);
+    o.ingest(&b);
+    assert_eq!(o.done().len(), 1);
+    assert!(
+        matches!(
+            o.done()[0].outcome,
+            Outcome::Partial { ref reasons } if reasons
+                .iter()
+                .any(|r| matches!(r, PartialReason::Trunc(b) if b & wire::TRUNC_WALK_READ != 0))
+        ),
+        "aborted dispatch behind a ROW-bearing prefix must stay Partial: {:?}",
+        o.done()[0].outcome
+    );
+}
+
+/// Round-5 F2 (warm variant): the same abort under a standing
+/// warm belief still degrades — warmth does not turn vacuous
+/// beyond-T silence into T+1 noise evidence.
+#[test]
+fn fix5_f2_row_then_abort_warm_not_masked() {
+    let mut scope = OracleScope::full();
+    scope.known_t.insert(ARR, (1, 0));
+    let mut o = Oracle::new(scope);
+    let mut b = quiesced_idle(&[TIDA]);
+    b.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b.push_ret(ret(TIDA, 0, 0));
+    b.push_alg(alg(TIDA, 0, 0, wire::ALG_OK));
+    b.push_row(row(TIDA, 0, 0));
+    b.push_alg(alg_arr(TIDA, 0, 1, wire::ALG_EMPTY, ARR, 0));
+    b.trunc.insert(OP, wire::TRUNC_WALK_READ);
+    o.ingest(&b);
+    assert_eq!(o.done().len(), 1);
+    assert!(
+        matches!(
+            o.done()[0].outcome,
+            Outcome::Partial { ref reasons } if reasons
+                .iter()
+                .any(|r| matches!(r, PartialReason::Trunc(b) if b & wire::TRUNC_WALK_READ != 0))
+        ),
+        "warmth without T+1 activity must not mask a below-T abort: {:?}",
+        o.done()[0].outcome
+    );
+}
+
+/// Round-5 warm seam (zero-ROW inclusion): a verified
+/// terminator + fully-evidenced prefix whose OK slots carry no
+/// ROWs (immediate-terminator dispatches) + actual T+1 live
+/// evidence still filters T+1 noise — zero-ROW prefixes are
+/// valid warm tables, not dirty ones.
+#[test]
+fn fix5_t1_filter_allows_zero_row_prefix() {
+    let mut scope = OracleScope::full();
+    scope.known_t.insert(ARR, (3, 0));
+    let mut o = Oracle::new(scope);
+    let mut b = ScanBatch {
+        quiesced: false,
+        now_ns: 1_000,
+        ..ScanBatch::default()
+    };
+    b.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b.push_ret(ret(TIDA, 0, 0));
+    for j in 0..3u64 {
+        b.push_alg(alg(TIDA, 0, j, wire::ALG_OK));
+    }
+    b.push_alg(alg_arr(TIDA, 0, 3, wire::ALG_EMPTY, ARR, 0));
+    b.push_alg(alg(TIDA, 0, 4, wire::ALG_OK));
+    b.trunc
+        .insert(OP, wire::TRUNC_DISPATCH | wire::TRUNC_WALK_READ);
+    o.ingest(&b);
+    o.finish(2_000);
+    assert_eq!(o.done().len(), 1);
+    assert!(
+        matches!(o.done()[0].outcome, Outcome::Complete { .. }),
+        "zero-ROW prefix with T+1 evidence must filter: {:?}",
+        o.done()[0].outcome
+    );
+    assert_eq!(o.done()[0].true_t, TrueT::Proven(3));
+}
+
+/// Round-5 warm seam (T=0 inclusion): an empty prefix under a
+/// verified T=0 terminator + actual T+1 live evidence filters
+/// like any other T — T=0 is a valid warm table.
+#[test]
+fn fix5_t1_filter_allows_t_zero() {
+    let mut scope = OracleScope::full();
+    scope.known_t.insert(ARR, (0, 0));
+    let mut o = Oracle::new(scope);
+    let mut b = ScanBatch {
+        quiesced: false,
+        now_ns: 1_000,
+        ..ScanBatch::default()
+    };
+    b.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b.push_ret(ret(TIDA, 0, 0));
+    b.push_alg(alg_arr(TIDA, 0, 0, wire::ALG_EMPTY, ARR, 0));
+    b.push_alg(alg(TIDA, 0, 1, wire::ALG_OK));
+    b.trunc
+        .insert(OP, wire::TRUNC_DISPATCH | wire::TRUNC_WALK_READ);
+    o.ingest(&b);
+    o.finish(2_000);
+    assert_eq!(o.done().len(), 1);
+    assert!(
+        matches!(o.done()[0].outcome, Outcome::Complete { .. }),
+        "T=0 with T+1 evidence must filter: {:?}",
+        o.done()[0].outcome
+    );
+    assert_eq!(o.done()[0].true_t, TrueT::Proven(0));
+}
+
+/// Round-5 warm seam (cold exclusion): without a standing warm
+/// belief there is no T+1 verification walk, so T+1-looking
+/// evidence + fault bits on a cold scan stay PARTIAL
+/// (unattributable — fail closed).
+#[test]
+fn fix5_t1_filter_needs_warm_belief() {
+    let mut o = Oracle::new(OracleScope::full());
+    let mut b = ScanBatch {
+        quiesced: false,
+        now_ns: 1_000,
+        ..ScanBatch::default()
+    };
+    b.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b.push_ret(ret(TIDA, 0, 0));
+    for j in 0..3u64 {
+        b.push_alg(alg(TIDA, 0, j, wire::ALG_OK));
+        b.push_row(row(TIDA, 0, j));
+    }
+    b.push_alg(alg_arr(TIDA, 0, 3, wire::ALG_EMPTY, ARR, 0));
+    b.push_alg(alg(TIDA, 0, 4, wire::ALG_OK));
+    b.trunc
+        .insert(OP, wire::TRUNC_DISPATCH | wire::TRUNC_WALK_READ);
+    o.ingest(&b);
+    o.finish(2_000);
+    assert_eq!(o.done().len(), 1);
+    assert!(
+        matches!(
+            o.done()[0].outcome,
+            Outcome::Partial { ref reasons } if reasons.contains(&PartialReason::Trunc(
+                wire::TRUNC_DISPATCH | wire::TRUNC_WALK_READ
+            ))
+        ),
+        "cold scan must not mask fault bits as T+1 noise: {:?}",
+        o.done()[0].outcome
+    );
+}
+
 #[test]
 fn stream_drain_stats_accumulate() {
     let mut o = Oracle::new(OracleScope::full());

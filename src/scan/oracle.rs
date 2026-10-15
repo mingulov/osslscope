@@ -1859,12 +1859,18 @@ impl Oracle {
             .filter(|j| !attached.contains(&(*j as u32)))
             .collect();
         // T+1 garbage filter, prefix half (evaluated before the
-        // gap lists move into reasons below): verified
-        // terminator + fully-evidenced prefix. The TRUNC block
-        // further below conjoins the T+1-only beyond evidence.
+        // gap lists move into reasons below): standing warm
+        // belief + verified terminator (any T including 0) +
+        // fully-evidenced ALG prefix. The TRUNC block further
+        // below conjoins the actual-T+1 beyond evidence.
         let prefix_for_t1_filter = match min_empty {
-            Some(t) if t >= 1 => {
-                holes.is_empty()
+            Some(t) => {
+                // The T+1 verification walk exists only under a
+                // standing warm belief (cold scans walk every
+                // member fully — their fault bits are
+                // unattributable, never T+1 noise).
+                warm.is_some()
+                    && holes.is_empty()
                     && unread.is_empty()
                     && unobs.is_empty()
                     && attached.iter().all(|j| {
@@ -1874,8 +1880,18 @@ impl Oracle {
                         }
                         match o.algs.get(&j) {
                             Some(a) if a.status == wire::ALG_OK => {
+                                // Below-128 ROWs: ROW presence
+                                // proves nothing about dispatch
+                                // termination (ROWs emit before a
+                                // later entry read can abort), so
+                                // zero-ROW prefixes are valid —
+                                // but 128 ROWs prove a below-T
+                                // overflow (the walk emits one ROW
+                                // per entry over 128 slots),
+                                // whose DISPATCH is genuine and
+                                // never masked.
                                 let n = o.row_events.iter().filter(|r| r.idx == j).count();
-                                (1..=127).contains(&n)
+                                (0..=127).contains(&n)
                             }
                             Some(a) if a.status == wire::ALG_NOIMP => true,
                             _ => false,
@@ -1989,25 +2005,45 @@ impl Oracle {
         // name failure always leaves an UNREADABLE gap).
         //
         // T+1 garbage filter, beyond half (conjoined with the
-        // prefix half above): beyond evidence confined to T+1 (a
-        // single non-EMPTY record there, or none at all) ⟹ the
-        // DISPATCH/READ bits can only come from beyond-T noise
-        // (the T+1 garbage walk, aborts past it, or healed
-        // below-T transients whose evidence is complete NOW) →
-        // mask them (prefix-exact L3-tail rule). Anything else
-        // keeps them: multi-slot beyond evidence
-        // (unattributable soup — F12 stays Partial). NOIMP/NAME/
-        // ALGS bits are never masked here (below-T real evidence
-        // or guard contract — inseparable from T+1 garbage of
-        // the same kind).
+        // prefix half above): an actual dispatch-walking record
+        // AT T+1 (a live T+1 walk ran the flagging path, so its
+        // noise can explain the bits) + beyond-non-EMPTY
+        // confined to T+1 ⟹ mask DISPATCH/READ (warm L3-tail
+        // rule). Vacuous beyond-T silence never filters (a
+        // below-T abort behind a clean prefix is genuine
+        // incomplete evidence, not T+1 noise), and non-walking
+        // T+1 records (EMPTY/NOIMP/UNREADABLE never reach the
+        // dispatch walk) cannot have produced dispatch noise
+        // either. Anything else keeps the bits: multi-slot
+        // beyond evidence (unattributable soup — F12 stays
+        // Partial). NOIMP/NAME/ALGS bits are never masked here.
+        // Residual: per-op TRUNC bits are unattributable to
+        // slots, so a below-T fault coinciding with live T+1
+        // activity still masks — full attribution needs
+        // per-slot dispatch evidence (wire change, future work).
         let t1_only = match min_empty {
-            Some(t) if t >= 1 => o
-                .algs
-                .iter()
-                .filter(|(j, a)| {
-                    **j > t && attached.contains(&(**j as u32)) && a.status != wire::ALG_EMPTY
-                })
-                .all(|(j, _)| *j == t + 1),
+            Some(t) => {
+                let t1_walked = o.algs.get(&(t + 1)).is_some_and(|a| {
+                    attached.contains(&((t + 1) as u32))
+                        && matches!(
+                            a.status,
+                            wire::ALG_OK
+                                | wire::ALG_UNKNOWN
+                                | wire::ALG_OVERLONG
+                                | wire::ALG_TRUNCATED
+                                | wire::ALG_MIXED
+                        )
+                });
+                t1_walked
+                    && o.algs
+                        .iter()
+                        .filter(|(j, a)| {
+                            **j > t
+                                && attached.contains(&(**j as u32))
+                                && a.status != wire::ALG_EMPTY
+                        })
+                        .all(|(j, _)| *j == t + 1)
+            }
             _ => false,
         };
         let mut trunc_bits = o.trunc_accum
