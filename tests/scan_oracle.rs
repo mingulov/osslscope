@@ -2058,6 +2058,68 @@ fn fix5_late_tainted_rewrite_preserved() {
     );
 }
 
+/// Round-5 F1: census loss (CALLS map pressure) degrades
+/// spanning verdicts — a failed admitted-increment hides an
+/// admission exactly like a ring drop hides a record, so the
+/// retained-loss rule (R18: nonzero loss ⟹ PARTIAL) covers it.
+#[test]
+fn fix5_calls_loss_degrades_open() {
+    let mut o = Oracle::new(OracleScope::full());
+    let mut b1 = ScanBatch {
+        quiesced: false,
+        ..ScanBatch::default()
+    };
+    b1.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b1.push_ret(ret(TIDA, 0, 0));
+    for j in 0..3 {
+        b1.push_alg(alg(TIDA, 0, j, wire::ALG_OK));
+    }
+    b1.push_alg(alg_arr(TIDA, 0, 3, wire::ALG_EMPTY, ARR, 0));
+    b1.push_row(row(TIDA, 0, 0));
+    b1.loss.insert(wire::LOSS_MAP_CALLS, 1);
+    o.ingest(&b1);
+    assert_eq!(o.open_count(), 1);
+    let mut b2 = ScanBatch {
+        quiesced: false,
+        ..ScanBatch::default()
+    };
+    b2.push_call(call(TIDA, 1, false, wire::SKIP_ADMITTED));
+    o.ingest(&b2);
+    assert_eq!(o.done().len(), 1);
+    assert!(
+        matches!(
+            o.done()[0].outcome,
+            Outcome::Partial { ref reasons } if reasons.contains(&PartialReason::DrainLoss)
+                && !reasons.iter().any(|r| matches!(r, PartialReason::Holes(_)))
+        ),
+        "census loss with intact ALGs must surface without holes: {:?}",
+        o.done()[0].outcome
+    );
+}
+
+/// Round-5 F1: census loss with no evaluable invocation is a
+/// window finding, never dropped (same rule as ring loss).
+#[test]
+fn fix5_calls_loss_window_finding() {
+    let mut o = Oracle::new(OracleScope::full());
+    let mut b = ScanBatch {
+        quiesced: false,
+        ..ScanBatch::default()
+    };
+    b.loss.insert(wire::LOSS_MAP_CALLS, 2);
+    o.ingest(&b);
+    assert!(
+        o.done().is_empty(),
+        "loss alone closes nothing: {:?}",
+        o.done()
+    );
+    assert!(
+        o.findings().contains(&Finding::WindowLoss { delta: 2 }),
+        "census loss with no opens must surface window-level: {:?}",
+        o.findings()
+    );
+}
+
 #[test]
 fn stream_drain_stats_accumulate() {
     let mut o = Oracle::new(OracleScope::full());

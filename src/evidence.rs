@@ -732,6 +732,17 @@ pub struct TraversalRecord {
     /// field, old readers ignore it).
     #[serde(default)]
     pub entries: Vec<TraversalRecordEntry>,
+    /// Ops observed (records retained) but missing from the
+    /// census while increments were lost (additive round-5
+    /// field, old readers ignore it): UNKNOWN counts, never
+    /// zero. Sorted (BTreeSet order at the producer).
+    #[serde(default)]
+    pub admitted_unknown: Vec<u32>,
+    /// Cumulative admitted-increment loss (additive round-5
+    /// field, old readers ignore it): nonzero means the
+    /// census snapshot is incomplete.
+    #[serde(default)]
+    pub census_loss: u64,
 }
 
 impl CaptureDocument {
