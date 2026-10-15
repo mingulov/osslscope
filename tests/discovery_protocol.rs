@@ -699,6 +699,113 @@ fn assert_no_addr_key(v: &serde_json::Value, path: &str) {
     }
 }
 
+/// Recursively assert no staged impl address reaches the document.
+///
+/// What IS a raw address here: any staged impl_addr spelling — decimal
+/// ("4096") or lowercase hex ("0x1000") — appearing as a whole JSON number,
+/// or embedded anywhere inside a non-provenance string or object key. A
+/// regression emitting `"addr_hash":"impl=4096"` or a key like
+/// `"debug_0x1010"` is a genuine disclosure and must fail. All three staged
+/// impls are covered (the original check covered only the first).
+///
+/// What is NOT (exempt, and why): the VALUES of `backing.dev`, `backing.ino`
+/// and `backing.offset`. `backing.offset` is a FILE offset — schema.rs
+/// computes `impl_addr - m.start + m.offset`, so the runtime mapping base
+/// cancels out — and dev:ino:offset is the ASLR-stable file-identity triple
+/// capture joins on. Its decimal rendering can embed an address digit run
+/// (CI: offset 344096 embeds "4096") without disclosing anything, so these
+/// three values keep whole-value comparison only. Residual: a legitimate
+/// offset numerically EQUAL to a staged impl would still trip (a false
+/// positive, not a disclosure); first-X-LOAD p_offset near 4 KiB would need
+/// ~100x shrinkage of this binary, so theoretical only.
+///
+/// Fail-closed: object keys are never provenance (always scanned), and an
+/// unexpected shape under `backing` (non-object, extra keys, containers as
+/// values) falls back to the strict rule.
+fn assert_no_raw_impl(v: &serde_json::Value, impls: &[u64], path: &str) {
+    match v {
+        serde_json::Value::Number(n) => {
+            if let Some(u) = n.as_u64() {
+                assert!(!impls.contains(&u), "raw addr leaked at {path}: {u}");
+            }
+        }
+        serde_json::Value::String(s) => {
+            for i in impls {
+                assert!(
+                    !s.contains(&i.to_string()),
+                    "raw addr leaked at {path}: {s:?} embeds {i}"
+                );
+                assert!(
+                    !s.contains(&format!("{i:#x}")),
+                    "raw addr leaked at {path}: {s:?} embeds {i:#x}"
+                );
+            }
+        }
+        serde_json::Value::Array(a) => {
+            for (idx, vv) in a.iter().enumerate() {
+                assert_no_raw_impl(vv, impls, &format!("{path}[{idx}]"));
+            }
+        }
+        serde_json::Value::Object(m) => {
+            for (k, vv) in m {
+                assert_no_raw_impl_in_key(k, impls, path);
+                if k == "backing" {
+                    if let Some(b) = vv.as_object() {
+                        for (bk, bv) in b {
+                            let bpath = format!("{path}.{k}.{bk}");
+                            assert_no_raw_impl_in_key(bk, impls, path);
+                            if matches!(bk.as_str(), "dev" | "ino" | "offset") {
+                                assert_provenance_value(bv, impls, &bpath);
+                            } else {
+                                assert_no_raw_impl(bv, impls, &bpath);
+                            }
+                        }
+                        continue;
+                    }
+                }
+                assert_no_raw_impl(vv, impls, &format!("{path}.{k}"));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Object keys are never provenance values: any embedded staged-address
+/// spelling fails.
+fn assert_no_raw_impl_in_key(k: &str, impls: &[u64], path: &str) {
+    for i in impls {
+        assert!(
+            !k.contains(&i.to_string()),
+            "raw addr leaked in key at {path}.{k}: embeds {i}"
+        );
+        assert!(
+            !k.contains(&format!("{i:#x}")),
+            "raw addr leaked in key at {path}.{k}: embeds {i:#x}"
+        );
+    }
+}
+
+/// Whole-value comparison for validated provenance values
+/// (`backing.dev`/`.ino`/`.offset` — file identity, not runtime addresses;
+/// see `assert_no_raw_impl`). Unexpected container shapes recurse strictly
+/// (fail-closed).
+fn assert_provenance_value(v: &serde_json::Value, impls: &[u64], path: &str) {
+    match v {
+        serde_json::Value::Number(n) => {
+            if let Some(u) = n.as_u64() {
+                assert!(!impls.contains(&u), "raw addr leaked at {path}: {u}");
+            }
+        }
+        serde_json::Value::String(s) => {
+            for i in impls {
+                assert_ne!(s, &i.to_string(), "raw addr leaked at {path}");
+                assert_ne!(s, &format!("{i:#x}"), "raw addr leaked at {path}");
+            }
+        }
+        _ => assert_no_raw_impl(v, impls, path),
+    }
+}
+
 #[test]
 fn inspect_rows_carry_no_raw_addresses() {
     // Backed rows emit class/backing/hash — never the runtime address.
@@ -796,46 +903,89 @@ fn inspect_rows_carry_no_raw_addresses() {
         .map(|r| r["status"].as_str().unwrap())
         .collect();
     assert_eq!(statuses, vec!["ok", "ok", "unknown"]);
-    // The raw impl addresses are unrecoverable from the document.
-    // Whole JSON values are compared — never text substrings. A
-    // backing offset is file-identity provenance (the dev:ino:offset
-    // triple, ASLR-stable, the same triple capture joins on), NOT a
-    // runtime address — yet its decimal rendering can embed an
-    // address's digit run (CI: offset 344096 embeds "4096", the
-    // decimal form of staged impl 0x1000 — a false "leak" from the
-    // old substring check). What IS an address here: a whole value
-    // equal to a staged impl_addr (or an "addr" key, pinned absent
-    // above). What is NOT: a digit run embedded in a larger offset,
-    // inode, dev string, or hash. All three staged impls are covered
-    // (the old check covered only the first).
-    fn assert_no_raw_impl(v: &serde_json::Value, impls: &[u64], path: &str) {
-        match v {
-            serde_json::Value::Number(n) => {
-                if let Some(u) = n.as_u64() {
-                    assert!(!impls.contains(&u), "raw addr leaked at {path}: {u}");
-                }
-            }
-            serde_json::Value::String(s) => {
-                for i in impls {
-                    assert_ne!(s, &i.to_string(), "raw addr leaked at {path}");
-                    assert_ne!(s, &format!("{i:#x}"), "raw addr leaked at {path}");
-                }
-            }
-            serde_json::Value::Array(a) => {
-                for (idx, vv) in a.iter().enumerate() {
-                    assert_no_raw_impl(vv, impls, &format!("{path}[{idx}]"));
-                }
-            }
-            serde_json::Value::Object(m) => {
-                for (k, vv) in m {
-                    assert_no_raw_impl(vv, impls, &format!("{path}.{k}"));
-                }
-            }
-            _ => {}
-        }
-    }
+    // The raw impl addresses are unrecoverable from the document
+    // (rule documented on the shared matcher above).
     let staged: Vec<u64> = rows.iter().map(|r| r.impl_addr).collect();
     assert_no_raw_impl(&doc, &staged, "$");
+}
+
+/// True when the shared no-raw-address matcher rejects the document.
+fn matcher_catches(doc: &serde_json::Value, staged: &[u64]) -> bool {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert_no_raw_impl(doc, staged, "$");
+    }))
+    .is_err()
+}
+
+#[test]
+fn no_raw_address_matcher_catches_embedded_leaks_but_allows_provenance() {
+    // Pin for the R01 round-2 finding: whole-value-only comparison lets
+    // `"addr_hash":"impl=4096"` and address-bearing object keys escape,
+    // while validated backing provenance (dev/ino/offset — file identity,
+    // schema.rs:143) must pass even when its decimal rendering embeds an
+    // address digit run (CI: offset 344096 embeds "4096").
+    let staged: Vec<u64> = vec![0x1000, 0x1010, 0x1020];
+    // Legitimate CI-shaped JSON: the exact backing offsets from the CI
+    // failure plus real addr_hash values over the CI triple.
+    let rows: Vec<serde_json::Value> = [344064u64, 344080u64, 344096u64]
+        .iter()
+        .map(|off| {
+            serde_json::json!({
+                "provider": "t",
+                "op": 1,
+                "alg_class": "SHA2-256",
+                "weak": false,
+                "status": "ok",
+                "funcid": 7,
+                "addr_hash": kinds::addr_hash("08:01", 9179714, *off),
+                "addr_backed": true,
+                "backing": {"dev": "08:01", "ino": 9179714u64, "offset": *off},
+                "gen": 0,
+            })
+        })
+        .collect();
+    let ci_doc = serde_json::json!({
+        "provider": "t",
+        "trigger_observed": "",
+        "gen": 0,
+        "rows": rows,
+    });
+    // Legitimate provenance passes (and the fixture is non-vacuous: the
+    // old naive whole-text substring rule fires on it).
+    assert_no_raw_impl(&ci_doc, &staged, "$");
+    assert!(
+        serde_json::to_string(&ci_doc).unwrap().contains("4096"),
+        "fixture must embed the CI digit run"
+    );
+    // Every injected leak below must be caught; collect escapes so one
+    // run reports each blind spot.
+    let mut escaped = Vec::new();
+    let mut leak = ci_doc.clone();
+    leak["rows"][0]["addr_hash"] = serde_json::json!("impl=4096");
+    if !matcher_catches(&leak, &staged) {
+        escaped.push("embedded addr in string value");
+    }
+    let mut key_leak = ci_doc.clone();
+    key_leak["rows"][1]["debug_0x1010"] = serde_json::json!(true);
+    if !matcher_catches(&key_leak, &staged) {
+        escaped.push("embedded addr in object key");
+    }
+    let mut whole = ci_doc.clone();
+    whole["rows"][2]["status"] = serde_json::json!("4112");
+    if !matcher_catches(&whole, &staged) {
+        escaped.push("whole-value addr in non-provenance string");
+    }
+    let mut numeric = ci_doc.clone();
+    numeric["rows"][0]["impl_addr"] = serde_json::json!(4096u64);
+    if !matcher_catches(&numeric, &staged) {
+        escaped.push("numeric addr leak");
+    }
+    let mut hex = ci_doc.clone();
+    hex["rows"][0]["note"] = serde_json::json!("0x1010");
+    if !matcher_catches(&hex, &staged) {
+        escaped.push("hex-string addr leak");
+    }
+    assert!(escaped.is_empty(), "leaks escaped: {escaped:?}");
 }
 
 #[test]
