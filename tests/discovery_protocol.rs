@@ -796,9 +796,46 @@ fn inspect_rows_carry_no_raw_addresses() {
         .map(|r| r["status"].as_str().unwrap())
         .collect();
     assert_eq!(statuses, vec!["ok", "ok", "unknown"]);
-    // The raw impl address is unrecoverable from the document.
-    let text = serde_json::to_string(&doc).unwrap();
-    assert!(!text.contains("4096"), "raw addr leaked: {text}");
+    // The raw impl addresses are unrecoverable from the document.
+    // Whole JSON values are compared — never text substrings. A
+    // backing offset is file-identity provenance (the dev:ino:offset
+    // triple, ASLR-stable, the same triple capture joins on), NOT a
+    // runtime address — yet its decimal rendering can embed an
+    // address's digit run (CI: offset 344096 embeds "4096", the
+    // decimal form of staged impl 0x1000 — a false "leak" from the
+    // old substring check). What IS an address here: a whole value
+    // equal to a staged impl_addr (or an "addr" key, pinned absent
+    // above). What is NOT: a digit run embedded in a larger offset,
+    // inode, dev string, or hash. All three staged impls are covered
+    // (the old check covered only the first).
+    fn assert_no_raw_impl(v: &serde_json::Value, impls: &[u64], path: &str) {
+        match v {
+            serde_json::Value::Number(n) => {
+                if let Some(u) = n.as_u64() {
+                    assert!(!impls.contains(&u), "raw addr leaked at {path}: {u}");
+                }
+            }
+            serde_json::Value::String(s) => {
+                for i in impls {
+                    assert_ne!(s, &i.to_string(), "raw addr leaked at {path}");
+                    assert_ne!(s, &format!("{i:#x}"), "raw addr leaked at {path}");
+                }
+            }
+            serde_json::Value::Array(a) => {
+                for (idx, vv) in a.iter().enumerate() {
+                    assert_no_raw_impl(vv, impls, &format!("{path}[{idx}]"));
+                }
+            }
+            serde_json::Value::Object(m) => {
+                for (k, vv) in m {
+                    assert_no_raw_impl(vv, impls, &format!("{path}.{k}"));
+                }
+            }
+            _ => {}
+        }
+    }
+    let staged: Vec<u64> = rows.iter().map(|r| r.impl_addr).collect();
+    assert_no_raw_impl(&doc, &staged, "$");
 }
 
 #[test]
