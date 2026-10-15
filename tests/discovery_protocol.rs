@@ -700,13 +700,22 @@ fn assert_no_addr_key(v: &serde_json::Value, path: &str) {
     }
 }
 
-/// True when `path` names a row element of the top-level `rows` array
-/// (`$.rows[<idx>]`) — the ONLY location where emission places a
-/// `backing` object (schema.rs emits one per backed row).
-fn is_emit_row_path(path: &str) -> bool {
-    path.strip_prefix("$.rows[")
-        .and_then(|rest| rest.strip_suffix(']'))
-        .is_some_and(|idx| !idx.is_empty() && idx.bytes().all(|b| b.is_ascii_digit()))
+/// Structural traversal position for the no-raw-address matcher: row
+/// location is proven by ACTUAL traversal (doc root -> `rows` array ->
+/// index), never by matching the diagnostic path string — object keys
+/// are unescaped text, so a literal key like `"rows[0]"` would forge
+/// any string-based row path. Diagnostic `path` strings remain for
+/// failure messages only and never gate the exemption.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TraversalLoc {
+    /// The whole document (matcher entry).
+    DocRoot,
+    /// An element of the top-level `rows` array — the ONLY location
+    /// where emission places a `backing` object (schema.rs emits one
+    /// per backed row).
+    EmitRow,
+    /// Anything else (fail-closed: strict scanning, no exemption).
+    Else,
 }
 
 /// Validate a row `backing` object as genuine emission provenance:
@@ -744,8 +753,10 @@ fn validated_backing_triple<'a>(
 /// impls are covered (the original check covered only the first).
 ///
 /// What is NOT (exempt, and why): the VALUES of a VALIDATED row
-/// `backing` triple only — `backing` at the emitted row location
-/// (`$.rows[<idx>]`), with the emitted schema (`dev`: `MM:mm` string,
+/// `backing` triple only — `backing` on a row whose location is proven
+/// STRUCTURALLY (an actual element of the top-level `rows` array reached
+/// by array traversal; diagnostic paths are unescaped text and never
+/// gate the exemption), with the emitted schema (`dev`: `MM:mm` string,
 /// `ino`/`offset`: u64 integers), and hash-bound to the row's sibling
 /// `addr_hash` (the frozen preimage over the triple, schema.rs).
 /// `backing.offset` is a FILE offset — schema.rs computes
@@ -763,6 +774,15 @@ fn validated_backing_triple<'a>(
 /// malformed dev, hash mismatch, extra keys, containers as values —
 /// falls back to the strict rule.
 fn assert_no_raw_impl(v: &serde_json::Value, impls: &[u64], path: &str) {
+    assert_no_raw_impl_inner(v, impls, path, TraversalLoc::DocRoot)
+}
+
+/// Inner matcher carrying the structural location proof (`TraversalLoc`)
+/// alongside the diagnostic `path`. Every recursive call passes an
+/// explicit location — never the `DocRoot` entry default — so nested
+/// values (extra backing keys, provenance containers, spoofed keys) can
+/// never re-enter the row exemption.
+fn assert_no_raw_impl_inner(v: &serde_json::Value, impls: &[u64], path: &str, loc: TraversalLoc) {
     match v {
         serde_json::Value::Number(n) => {
             if let Some(u) = n.as_u64() {
@@ -783,18 +803,41 @@ fn assert_no_raw_impl(v: &serde_json::Value, impls: &[u64], path: &str) {
         }
         serde_json::Value::Array(a) => {
             for (idx, vv) in a.iter().enumerate() {
-                assert_no_raw_impl(vv, impls, &format!("{path}[{idx}]"));
+                // Row elements are dispatched structurally from the
+                // doc-root `rows` array below; every other array holds
+                // non-rows.
+                assert_no_raw_impl_inner(vv, impls, &format!("{path}[{idx}]"), TraversalLoc::Else);
             }
         }
         serde_json::Value::Object(m) => {
             for (k, vv) in m {
                 assert_no_raw_impl_in_key(k, impls, path);
+                // Structural row-array descent: only a REAL `rows` array
+                // on the doc root yields row elements. A literal key like
+                // `"rows[0]"` (or a non-array `rows` value) falls through
+                // to strict scanning.
+                if loc == TraversalLoc::DocRoot && k == "rows" {
+                    if let Some(a) = vv.as_array() {
+                        for (idx, elem) in a.iter().enumerate() {
+                            assert_no_raw_impl_inner(
+                                elem,
+                                impls,
+                                &format!("{path}.{k}[{idx}]"),
+                                TraversalLoc::EmitRow,
+                            );
+                        }
+                        continue;
+                    }
+                    assert_no_raw_impl_inner(vv, impls, &format!("{path}.{k}"), TraversalLoc::Else);
+                    continue;
+                }
                 if k == "backing" {
                     let bpath = format!("{path}.{k}");
                     // Relaxed scanning ONLY for validated row provenance
-                    // (location + schema + hash-bound triple); anything
-                    // else recurses strictly (fail-closed).
-                    if is_emit_row_path(path) {
+                    // (structural row location + schema + hash-bound
+                    // triple); anything else recurses strictly
+                    // (fail-closed).
+                    if loc == TraversalLoc::EmitRow {
                         if let Some(b) = validated_backing_triple(m, vv) {
                             for (bk, bv) in b {
                                 let kbpath = format!("{bpath}.{bk}");
@@ -802,16 +845,21 @@ fn assert_no_raw_impl(v: &serde_json::Value, impls: &[u64], path: &str) {
                                 if matches!(bk.as_str(), "dev" | "ino" | "offset") {
                                     assert_provenance_value(bv, impls, &kbpath);
                                 } else {
-                                    assert_no_raw_impl(bv, impls, &kbpath);
+                                    assert_no_raw_impl_inner(
+                                        bv,
+                                        impls,
+                                        &kbpath,
+                                        TraversalLoc::Else,
+                                    );
                                 }
                             }
                             continue;
                         }
                     }
-                    assert_no_raw_impl(vv, impls, &bpath);
+                    assert_no_raw_impl_inner(vv, impls, &bpath, TraversalLoc::Else);
                     continue;
                 }
-                assert_no_raw_impl(vv, impls, &format!("{path}.{k}"));
+                assert_no_raw_impl_inner(vv, impls, &format!("{path}.{k}"), TraversalLoc::Else);
             }
         }
         _ => {}
@@ -836,7 +884,8 @@ fn assert_no_raw_impl_in_key(k: &str, impls: &[u64], path: &str) {
 /// Whole-value comparison for validated provenance values
 /// (`backing.dev`/`.ino`/`.offset` — file identity, not runtime addresses;
 /// see `assert_no_raw_impl`). Unexpected container shapes recurse strictly
-/// (fail-closed).
+/// as non-rows (fail-closed: never the `DocRoot` entry, so a nested
+/// `rows` array here cannot re-enter the exemption).
 fn assert_provenance_value(v: &serde_json::Value, impls: &[u64], path: &str) {
     match v {
         serde_json::Value::Number(n) => {
@@ -850,7 +899,7 @@ fn assert_provenance_value(v: &serde_json::Value, impls: &[u64], path: &str) {
                 assert_ne!(s, &format!("{i:#x}"), "raw addr leaked at {path}");
             }
         }
-        _ => assert_no_raw_impl(v, impls, path),
+        _ => assert_no_raw_impl_inner(v, impls, path, TraversalLoc::Else),
     }
 }
 
@@ -1139,6 +1188,37 @@ fn no_raw_address_matcher_rejects_malformed_provenance() {
         escaped.push("malformed dev string embedding addr");
     }
     assert!(escaped.is_empty(), "leaks escaped: {escaped:?}");
+}
+
+#[test]
+fn no_raw_address_matcher_rejects_spoofed_row_path() {
+    // Pin for the R01 round-4 finding: the round-3 location gate matched
+    // the DIAGNOSTIC path string (`$.rows[<idx>]`), but object traversal
+    // appended unescaped keys — so a literal top-level key `"rows[0]"`
+    // forged the same path as an actual array element and reopened the
+    // exemption off-row. Only structural array traversal (doc root ->
+    // `rows` array -> index) may prove row location.
+    let staged: Vec<u64> = vec![0x1000, 0x1010, 0x1020];
+    let ci_doc = legit_ci_shaped_doc();
+    assert_no_raw_impl(&ci_doc, &staged, "$");
+    // The reviewer's counterexample: the legitimate `rows` array is kept
+    // and a sibling `"rows[0]"` carries the schema-valid triple plus the
+    // matching clean hash from the round-3 wrong-location control. The
+    // dev embeds decimal "4096" while staying valid `MM:mm`.
+    assert_eq!(
+        kinds::addr_hash("4096:01", 9179714, 344064),
+        "c299f7448630944c",
+        "spoof hash must be the clean round-3 vector"
+    );
+    let mut spoof = ci_doc.clone();
+    spoof["rows[0]"] = serde_json::json!({
+        "addr_hash": kinds::addr_hash("4096:01", 9179714, 344064),
+        "backing": {"dev": "4096:01", "ino": 9179714u64, "offset": 344064u64}
+    });
+    assert!(
+        matcher_catches(&spoof, &staged),
+        "spoofed row path escaped the location gate"
+    );
 }
 
 #[test]
