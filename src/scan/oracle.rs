@@ -704,33 +704,40 @@ enum PairSite {
 }
 
 /// Late-data scope for one closed key (which straggler slots
-/// are recovery evidence worth a finding).
+/// are recovery evidence worth a finding). Only a PROVEN
+/// boundary scopes (past-T observations are meaningless);
+/// unproven terminators (Candidate/Unknown) and tainted
+/// verdicts (mixed evidence — the contract keeps slots and
+/// forces op UNKNOWN) keep every slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LateScope {
-    /// Tainted verdict (terminal — late evidence unactionable).
-    Silent,
     /// Required prefix through T (terminator slot included —
     /// a late terminator proves termination post-close).
     Through(u64),
-    /// No terminator (every slot is required prefix).
+    /// No proven terminator (every slot may be required
+    /// prefix — kept as recovery evidence).
     All,
 }
 
 impl LateScope {
     fn of(outcome: &Outcome, true_t: TrueT) -> Self {
+        // Tainted verdicts rest on mixed evidence (nesting),
+        // so even a proven-looking terminator is suspect —
+        // keep every slot (the contract keeps slots and
+        // forces op UNKNOWN; a spurious recovery finding is
+        // noise, silenced recovery is loss).
         if matches!(outcome, Outcome::Tainted { .. }) {
-            return LateScope::Silent;
+            return LateScope::All;
         }
         match true_t {
-            TrueT::Proven(t) | TrueT::Candidate(t) => LateScope::Through(t),
+            TrueT::Proven(t) => LateScope::Through(t),
             TrueT::EmptyTable => LateScope::Through(0),
-            TrueT::Unknown => LateScope::All,
+            TrueT::Candidate(_) | TrueT::Unknown => LateScope::All,
         }
     }
 
     fn keeps(self, idx: u64) -> bool {
         match self {
-            LateScope::Silent => false,
             LateScope::Through(t) => idx <= t,
             LateScope::All => true,
         }
@@ -1004,13 +1011,13 @@ impl Oracle {
     }
 
     /// Late-data scope for a closed key (None = unknown key, an
-    /// orphan): Tainted verdicts are terminal (late evidence is
-    /// unactionable — silent); proven/candidate TRUE-T scopes to
-    /// the required prefix (idx ≤ T — past-terminator stragglers
-    /// are meaningless, silent); EmptyTable scopes to slot 0
-    /// (only a slot-0 record contradicts empty); anything else
-    /// (no terminator) keeps every slot (recovery has no
-    /// boundary to be past).
+    /// orphan): proven TRUE-T scopes to the required prefix
+    /// (idx ≤ T — past-terminator stragglers are meaningless,
+    /// silent); EmptyTable scopes to slot 0 (only a slot-0
+    /// record contradicts empty); unproven terminators
+    /// (Candidate/Unknown) and tainted verdicts keep every
+    /// slot (recovery has no proven boundary to be past, and
+    /// taint keeps slots by contract).
     fn late_scope(&self, tid: u32, seq: u64) -> Option<LateScope> {
         if let Some(w) = self.done.iter().find(|w| w.tid == tid && w.seq == seq) {
             return Some(LateScope::of(&w.outcome, w.true_t));
@@ -1305,8 +1312,9 @@ impl Oracle {
                         class: a.class,
                     });
                 }
-                // Tainted-terminal or past-terminator: silent
-                // (unactionable or meaningless).
+                // Past a proven terminator: silent
+                // (meaningless — beyond-terminator
+                // observations prove nothing).
                 Some(_) => {}
             }
             return;
@@ -1372,8 +1380,9 @@ impl Oracle {
                             funcid: r.funcid,
                         });
                     }
-                    // Tainted-terminal or past-terminator:
-                    // silent (unactionable or meaningless).
+                    // Past a proven terminator: silent
+                    // (meaningless — beyond-terminator
+                    // observations prove nothing).
                     Some(_) => {}
                 }
             }

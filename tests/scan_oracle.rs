@@ -1881,6 +1881,183 @@ fn fix5_t1_filter_needs_warm_belief() {
     );
 }
 
+/// Round-5 F6: Candidate termination is unproven, so late
+/// valid evidence beyond the candidate still belongs to the
+/// required prefix — a selective Candidate(4) close followed by
+/// skewed ALG/ROW at 5 preserves both as recovery findings.
+#[test]
+fn fix5_late_beyond_candidate_preserved() {
+    let mut scope = OracleScope::full();
+    scope.attached = (0..4).collect();
+    scope.expected = 4;
+    let mut o = Oracle::new(scope);
+    let mut b1 = quiesced_idle(&[TIDA]);
+    b1.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b1.push_ret(ret(TIDA, 0, 0));
+    for j in 0..4 {
+        b1.push_alg(alg(TIDA, 0, j, wire::ALG_OK));
+    }
+    o.ingest(&b1);
+    assert_eq!(o.done().len(), 1);
+    assert_eq!(o.done()[0].true_t, TrueT::Candidate(4));
+    let _ = o.take_done();
+    let _ = o.take_findings();
+    let mut b2 = ScanBatch {
+        quiesced: false,
+        now_ns: 2_000,
+        ..ScanBatch::default()
+    };
+    b2.push_alg(alg(TIDA, 0, 5, wire::ALG_OK));
+    b2.push_row(row_full(TIDA, 0, 5, ARR, 0, 301, 0x4401));
+    o.ingest(&b2);
+    assert!(
+        o.findings().contains(&Finding::LateAlg {
+            tid: TIDA,
+            seq: 0,
+            idx: 5,
+            status: wire::ALG_OK,
+            class: 1,
+        }),
+        "late valid ALG beyond an unproven candidate is recovery: {:?}",
+        o.findings()
+    );
+    assert!(
+        o.findings().contains(&Finding::LateRow {
+            tid: TIDA,
+            seq: 0,
+            idx: 5,
+            funcid: 301,
+        }),
+        "late valid ROW beyond an unproven candidate is recovery: {:?}",
+        o.findings()
+    );
+}
+
+/// Round-5 F6: sticky taint keeps slots and forces op UNKNOWN —
+/// it never discards positive array/index evidence. Late ALG/ROW
+/// for a tainted close are recovery findings, not silence.
+#[test]
+fn fix5_late_tainted_prefix_preserved() {
+    let mut o = Oracle::new(OracleScope::full());
+    let mut b1 = ScanBatch {
+        quiesced: false,
+        now_ns: 1_000,
+        ..ScanBatch::default()
+    };
+    b1.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b1.push_ret(ret(TIDA, 0, 0));
+    b1.push_alg(alg(TIDA, 0, 0, wire::ALG_OK));
+    b1.push_alg(alg(TIDA, 0, 0, wire::ALG_OK)); // duplicate slot: nesting fires
+    o.ingest(&b1);
+    let mut b2 = ScanBatch {
+        quiesced: false,
+        now_ns: 2_000,
+        ..ScanBatch::default()
+    };
+    b2.push_call(call(TIDA, 1, false, wire::SKIP_ADMITTED)); // successor closes 0
+    o.ingest(&b2);
+    assert_eq!(o.done().len(), 1);
+    assert!(
+        matches!(o.done()[0].outcome, Outcome::Tainted { .. }),
+        "duplicate slot closes Tainted: {:?}",
+        o.done()[0].outcome
+    );
+    assert_eq!(o.done()[0].op, UNKNOWN_OP);
+    let _ = o.take_done();
+    let _ = o.take_findings();
+    let mut b3 = ScanBatch {
+        quiesced: false,
+        now_ns: 3_000,
+        ..ScanBatch::default()
+    };
+    b3.push_alg(alg(TIDA, 0, 1, wire::ALG_OK));
+    b3.push_row(row_full(TIDA, 0, 1, ARR, 0, 302, 0x4402));
+    o.ingest(&b3);
+    assert!(
+        o.findings().contains(&Finding::LateAlg {
+            tid: TIDA,
+            seq: 0,
+            idx: 1,
+            status: wire::ALG_OK,
+            class: 1,
+        }),
+        "taint must keep late slot evidence: {:?}",
+        o.findings()
+    );
+    assert!(
+        o.findings().contains(&Finding::LateRow {
+            tid: TIDA,
+            seq: 0,
+            idx: 1,
+            funcid: 302,
+        }),
+        "taint must keep late callback evidence: {:?}",
+        o.findings()
+    );
+}
+
+/// Round-5 F6 (correlated-rewrite variant): a consumed Complete
+/// rewritten to Tainted by a later dangling close still keeps
+/// late in-prefix evidence — the correction changes the
+/// verdict, never the retention rule.
+#[test]
+fn fix5_late_tainted_rewrite_preserved() {
+    let mut o = Oracle::new(OracleScope::full());
+    let mut b1 = ScanBatch {
+        quiesced: false,
+        now_ns: 1_000,
+        ..ScanBatch::default()
+    };
+    b1.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b1.push_ret(ret(TIDA, 0, 0));
+    b1.push_alg(alg(TIDA, 0, 0, wire::ALG_OK));
+    b1.push_alg(alg_arr(TIDA, 0, 1, wire::ALG_EMPTY, ARR, 0));
+    o.ingest(&b1);
+    let mut b2 = ScanBatch {
+        quiesced: false,
+        now_ns: 2_000,
+        ..ScanBatch::default()
+    };
+    b2.push_call(call(TIDA, 1, false, wire::SKIP_ADMITTED)); // successor closes 0
+    o.ingest(&b2);
+    assert_eq!(o.done().len(), 1);
+    let drained = o.take_done();
+    assert!(matches!(drained[0].outcome, Outcome::Complete { .. }));
+    o.finish(3_000); // seq 1 dangles → taints consumed seq 0
+    assert_eq!(o.take_corrections().len(), 1);
+    let _ = o.take_done();
+    let _ = o.take_findings();
+    let mut b3 = ScanBatch {
+        quiesced: false,
+        now_ns: 4_000,
+        ..ScanBatch::default()
+    };
+    b3.push_alg(alg(TIDA, 0, 2, wire::ALG_OK));
+    b3.push_row(row_full(TIDA, 0, 2, ARR, 0, 303, 0x4403));
+    o.ingest(&b3);
+    assert!(
+        o.findings().contains(&Finding::LateAlg {
+            tid: TIDA,
+            seq: 0,
+            idx: 2,
+            status: wire::ALG_OK,
+            class: 1,
+        }),
+        "corrected-tainted close must keep late slot evidence: {:?}",
+        o.findings()
+    );
+    assert!(
+        o.findings().contains(&Finding::LateRow {
+            tid: TIDA,
+            seq: 0,
+            idx: 2,
+            funcid: 303,
+        }),
+        "corrected-tainted close must keep late callback evidence: {:?}",
+        o.findings()
+    );
+}
+
 #[test]
 fn stream_drain_stats_accumulate() {
     let mut o = Oracle::new(OracleScope::full());
