@@ -13,6 +13,7 @@ use osslscope::discovery::harvest::{build_alg_entries, build_trip_entries};
 use osslscope::discovery::legacy::{self, SectionInputs, TripHit};
 use osslscope::discovery::schema::{self, Row, Stats};
 use osslscope::kinds;
+use osslscope::plan;
 use osslscope_ebpf_common as wire;
 use std::collections::{HashMap, HashSet};
 
@@ -699,6 +700,40 @@ fn assert_no_addr_key(v: &serde_json::Value, path: &str) {
     }
 }
 
+/// True when `path` names a row element of the top-level `rows` array
+/// (`$.rows[<idx>]`) — the ONLY location where emission places a
+/// `backing` object (schema.rs emits one per backed row).
+fn is_emit_row_path(path: &str) -> bool {
+    path.strip_prefix("$.rows[")
+        .and_then(|rest| rest.strip_suffix(']'))
+        .is_some_and(|idx| !idx.is_empty() && idx.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Validate a row `backing` object as genuine emission provenance:
+/// `dev` is an `MM:mm` device string (stat-rendered or maps-fallback —
+/// same shape, `plan::parse_dev_str`), `ino`/`offset` are u64 integers,
+/// and the row's sibling `addr_hash` equals the frozen preimage hash
+/// over the triple (schema.rs) — proving these values are the attested
+/// file-identity triple, not an injected lookalike. Returns the backing
+/// map on success; `None` means "not validated" and the caller scans
+/// the value strictly (fail-closed).
+fn validated_backing_triple<'a>(
+    row: &'a serde_json::Map<String, serde_json::Value>,
+    vv: &'a serde_json::Value,
+) -> Option<&'a serde_json::Map<String, serde_json::Value>> {
+    let b = vv.as_object()?;
+    let dev = b.get("dev")?.as_str()?;
+    if plan::parse_dev_str(dev).is_none() {
+        return None;
+    }
+    let ino = b.get("ino")?.as_u64()?;
+    let off = b.get("offset")?.as_u64()?;
+    if row.get("addr_hash")?.as_str()? != kinds::addr_hash(dev, ino, off) {
+        return None;
+    }
+    Some(b)
+}
+
 /// Recursively assert no staged impl address reaches the document.
 ///
 /// What IS a raw address here: any staged impl_addr spelling — decimal
@@ -708,20 +743,25 @@ fn assert_no_addr_key(v: &serde_json::Value, path: &str) {
 /// `"debug_0x1010"` is a genuine disclosure and must fail. All three staged
 /// impls are covered (the original check covered only the first).
 ///
-/// What is NOT (exempt, and why): the VALUES of `backing.dev`, `backing.ino`
-/// and `backing.offset`. `backing.offset` is a FILE offset — schema.rs
-/// computes `impl_addr - m.start + m.offset`, so the runtime mapping base
-/// cancels out — and dev:ino:offset is the ASLR-stable file-identity triple
+/// What is NOT (exempt, and why): the VALUES of a VALIDATED row
+/// `backing` triple only — `backing` at the emitted row location
+/// (`$.rows[<idx>]`), with the emitted schema (`dev`: `MM:mm` string,
+/// `ino`/`offset`: u64 integers), and hash-bound to the row's sibling
+/// `addr_hash` (the frozen preimage over the triple, schema.rs).
+/// `backing.offset` is a FILE offset — schema.rs computes
+/// `impl_addr - m.start + m.offset`, so the runtime mapping base cancels
+/// out — and dev:ino:offset is the ASLR-stable file-identity triple
 /// capture joins on. Its decimal rendering can embed an address digit run
-/// (CI: offset 344096 embeds "4096") without disclosing anything, so these
-/// three values keep whole-value comparison only. Residual: a legitimate
-/// offset numerically EQUAL to a staged impl would still trip (a false
-/// positive, not a disclosure); first-X-LOAD p_offset near 4 KiB would need
-/// ~100x shrinkage of this binary, so theoretical only.
+/// (CI: offset 344096 embeds "4096") without disclosing anything, so the
+/// three validated values keep whole-value comparison only. Residual: a
+/// legitimate offset numerically EQUAL to a staged impl would still trip
+/// (a false positive, not a disclosure); first-X-LOAD p_offset near 4 KiB
+/// would need ~100x shrinkage of this binary, so theoretical only.
 ///
-/// Fail-closed: object keys are never provenance (always scanned), and an
-/// unexpected shape under `backing` (non-object, extra keys, containers as
-/// values) falls back to the strict rule.
+/// Fail-closed: object keys are never provenance (always scanned), and
+/// anything unvalidated — wrong location, non-object, wrong field types,
+/// malformed dev, hash mismatch, extra keys, containers as values —
+/// falls back to the strict rule.
 fn assert_no_raw_impl(v: &serde_json::Value, impls: &[u64], path: &str) {
     match v {
         serde_json::Value::Number(n) => {
@@ -750,18 +790,26 @@ fn assert_no_raw_impl(v: &serde_json::Value, impls: &[u64], path: &str) {
             for (k, vv) in m {
                 assert_no_raw_impl_in_key(k, impls, path);
                 if k == "backing" {
-                    if let Some(b) = vv.as_object() {
-                        for (bk, bv) in b {
-                            let bpath = format!("{path}.{k}.{bk}");
-                            assert_no_raw_impl_in_key(bk, impls, path);
-                            if matches!(bk.as_str(), "dev" | "ino" | "offset") {
-                                assert_provenance_value(bv, impls, &bpath);
-                            } else {
-                                assert_no_raw_impl(bv, impls, &bpath);
+                    let bpath = format!("{path}.{k}");
+                    // Relaxed scanning ONLY for validated row provenance
+                    // (location + schema + hash-bound triple); anything
+                    // else recurses strictly (fail-closed).
+                    if is_emit_row_path(path) {
+                        if let Some(b) = validated_backing_triple(m, vv) {
+                            for (bk, bv) in b {
+                                let kbpath = format!("{bpath}.{bk}");
+                                assert_no_raw_impl_in_key(bk, impls, path);
+                                if matches!(bk.as_str(), "dev" | "ino" | "offset") {
+                                    assert_provenance_value(bv, impls, &kbpath);
+                                } else {
+                                    assert_no_raw_impl(bv, impls, &kbpath);
+                                }
                             }
+                            continue;
                         }
-                        continue;
                     }
+                    assert_no_raw_impl(vv, impls, &bpath);
+                    continue;
                 }
                 assert_no_raw_impl(vv, impls, &format!("{path}.{k}"));
             }
@@ -984,6 +1032,111 @@ fn no_raw_address_matcher_catches_embedded_leaks_but_allows_provenance() {
     hex["rows"][0]["note"] = serde_json::json!("0x1010");
     if !matcher_catches(&hex, &staged) {
         escaped.push("hex-string addr leak");
+    }
+    assert!(escaped.is_empty(), "leaks escaped: {escaped:?}");
+}
+
+/// Legitimate CI-shaped harvest document for malformed-provenance
+/// controls: the exact backing offsets from the CI failure
+/// (344064/344080/344096) plus real `addr_hash` values over the CI
+/// triple. Mirrors the round-2 fixture (kept separate so the accepted
+/// round-2 test stays untouched).
+fn legit_ci_shaped_doc() -> serde_json::Value {
+    let rows: Vec<serde_json::Value> = [344064u64, 344080u64, 344096u64]
+        .iter()
+        .map(|off| {
+            serde_json::json!({
+                "provider": "t",
+                "op": 1,
+                "alg_class": "SHA2-256",
+                "weak": false,
+                "status": "ok",
+                "funcid": 7,
+                "addr_hash": kinds::addr_hash("08:01", 9179714, *off),
+                "addr_backed": true,
+                "backing": {"dev": "08:01", "ino": 9179714u64, "offset": *off},
+                "gen": 0,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "provider": "t",
+        "trigger_observed": "",
+        "gen": 0,
+        "rows": rows,
+    })
+}
+
+#[test]
+fn no_raw_address_matcher_rejects_malformed_provenance() {
+    // Pin for the R01 round-3 finding: the round-2 exemption trusted any
+    // object named `backing` with `dev`/`ino`/`offset` keys — validating
+    // neither location, field types, nor provenance. Every malformed
+    // shape below embeds a staged address spelling yet escaped under the
+    // name-based exemption; all must now be caught, while the legitimate
+    // CI-shaped fixture (validated row provenance) still passes.
+    let staged: Vec<u64> = vec![0x1000, 0x1010, 0x1020];
+    let ci_doc = legit_ci_shaped_doc();
+    assert_no_raw_impl(&ci_doc, &staged, "$");
+    let mut escaped = Vec::new();
+    // (a) String-typed offset embedding a staged addr at the row location
+    // (schema.rs emits `offset` as a u64 file offset — never a string).
+    let mut string_off = ci_doc.clone();
+    string_off["rows"][0]["backing"]["offset"] = serde_json::json!("impl=4096");
+    if !matcher_catches(&string_off, &staged) {
+        escaped.push("string-typed offset embedding addr");
+    }
+    // (b1) Backing at an unexpected location (under a debug key) with an
+    // embedded leak — the exemption must not apply off-row.
+    let mut debug = ci_doc.clone();
+    debug["debug"] = serde_json::json!({
+        "backing": {"dev": "08:01", "ino": 9179714u64, "offset": "impl=4096"}
+    });
+    if !matcher_catches(&debug, &staged) {
+        escaped.push("backing under unexpected debug location");
+    }
+    // (b2) Location isolation: schema-valid triple (`MM:mm` dev, u64
+    // ino/offset) with a MATCHING sibling hash at the wrong location —
+    // only the location is wrong. The dev embeds decimal "4096" while
+    // staying valid `MM:mm` (major 0x4096); the sibling hash is clean of
+    // staged spellings by construction (c299f7448630944c).
+    let mut debug_valid = ci_doc.clone();
+    debug_valid["debug"] = serde_json::json!({
+        "addr_hash": kinds::addr_hash("4096:01", 9179714, 344064),
+        "backing": {"dev": "4096:01", "ino": 9179714u64, "offset": 344064u64}
+    });
+    if !matcher_catches(&debug_valid, &staged) {
+        escaped.push("schema+provenance-valid backing at wrong location");
+    }
+    // (c1) Nested backing-inside-backing: an extra key under a row backing
+    // reopens a nested `backing` object carrying an embedded leak.
+    let mut nested = ci_doc.clone();
+    nested["rows"][0]["backing"]["extra"] = serde_json::json!({
+        "backing": {"dev": "08:01", "ino": 9179714u64, "offset": "impl=4096"}
+    });
+    if !matcher_catches(&nested, &staged) {
+        escaped.push("nested backing-inside-backing");
+    }
+    // (c2) Nested backing inside a container under a row backing.
+    let mut nested_arr = ci_doc.clone();
+    nested_arr["rows"][0]["backing"]["notes"] = serde_json::json!([
+        {"backing": {"dev": "08:01", "ino": 9179714u64, "offset": "impl=4096"}}
+    ]);
+    if !matcher_catches(&nested_arr, &staged) {
+        escaped.push("backing nested in container under backing");
+    }
+    // Wrong-type ino: string embedding an addr (schema.rs emits u64).
+    let mut string_ino = ci_doc.clone();
+    string_ino["rows"][0]["backing"]["ino"] = serde_json::json!("ino=4096");
+    if !matcher_catches(&string_ino, &staged) {
+        escaped.push("string-typed ino embedding addr");
+    }
+    // Malformed dev: string embedding an addr that is neither valid
+    // `MM:mm` nor consistent with the sibling hash.
+    let mut bad_dev = ci_doc.clone();
+    bad_dev["rows"][0]["backing"]["dev"] = serde_json::json!("impl=4096");
+    if !matcher_catches(&bad_dev, &staged) {
+        escaped.push("malformed dev string embedding addr");
     }
     assert!(escaped.is_empty(), "leaks escaped: {escaped:?}");
 }
