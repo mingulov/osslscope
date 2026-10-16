@@ -2629,10 +2629,12 @@ const R20_LIBCRYPTO: &str = "/usr/lib/x86_64-linux-gnu/libcrypto.so.3";
 const R20_LIBCRYPTO_SHA256: &str =
     "5385f0436ac2e284ba8c5fb1488874057c29c04be72dea32add832694f381e28";
 
-/// Runner contract: the object env vars are required on the FIRST
-/// attempt — `OSSL_R20_LIVE=1` without them fails fast naming the
-/// missing var, before any side effect (pinned by
-/// `f1_runner_requires_object_env_on_first_attempt` below).
+/// Leg gate contract: the object env vars are required whenever
+/// `OSSL_R20_LIVE=1` is set — without them the leg fails fast
+/// naming the missing var, before any side effect (pinned by
+/// `f1_runner_requires_object_env_on_first_attempt` below). (The
+/// "first attempt" is the live procedure's obligation — OPEN for
+/// live verification; this gate makes a missing export loud.)
 fn r20_live_gated() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
     if std::env::var("OSSL_R20_LIVE").unwrap_or_default() != "1" {
         eprintln!("r20 F1: set OSSL_R20_LIVE=1 with built BPF objects; skipping");
@@ -2649,13 +2651,19 @@ fn r20_live_gated() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
     Some((harvest, count))
 }
 
-/// F1 runner contract (R21 §5 "F1 env obligations" — the R21
+/// F1 gate contract (R21 §5 "F1 env obligations" — the R21
 /// runner's first F1 attempt lacked the object env vars, so the
-/// leg never ran): the runner MUST export the required object env
-/// vars on the FIRST attempt. `OSSL_R20_LIVE=1` without them fails
-/// fast naming the missing var — never a quiet skip, never a late
-/// failure past side effects. Host-runnable: drives the F1 leg in
-/// a subprocess with controlled env (parallel-safe — no
+/// leg never ran): `OSSL_R20_LIVE=1` without them fails fast
+/// naming the missing var — never a quiet skip, never a late
+/// failure past side effects. This pins the LEG's contract only
+/// (a missing export is LOUD instead of a silent skip, which is
+/// what converts the R21 silent-skip into a visible failure). It
+/// is NOT a runner repair: no F1 runner exists in-tree (the R21
+/// runner is the out-of-tree live procedure), so first-attempt
+/// exports stay OPEN for live verification — the targeted live
+/// re-run must export the vars on attempt 1, and this gate is
+/// what fails loudly if it does not. Host-runnable: drives the
+/// F1 leg in a subprocess with controlled env (parallel-safe — no
 /// in-process env mutation). T1-ACCEPT preserved: without the
 /// LIVE flag the leg still skips quietly.
 #[test]
