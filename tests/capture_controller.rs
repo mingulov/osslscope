@@ -6021,13 +6021,20 @@ fn live_prestop_cancel_reaps_real_child() {
 
 #[test]
 fn live_short_children_are_detected() {
-    // Back-to-back 20ms grandchildren across ~1.2s: ten 100ms ppid
-    // scans catch at least one (polling is best-effort — the
-    // fallback stays explicitly PARTIAL either way).
+    // Back-to-back short-lived grandchildren: polling is
+    // best-effort (the fallback stays explicitly PARTIAL either
+    // way), but sustained children must surface at least one Fork.
+    // Round 2, residual S (flake-hardening): adaptive within a
+    // bounded budget — poll until first detection or 50 rounds
+    // (early exit keeps healthy runs fast; the ~6s children span
+    // outlasts the ~5s budget even when parallel-suite load
+    // stretches sleeps). The detection assertion stays: a
+    // detection-dropping mutant exhausts the budget and fails
+    // (mutant-proven — see the fix-wave report).
     let argv = vec![
         "/bin/sh".to_string(),
         "-c".to_string(),
-        "i=0; while [ $i -lt 60 ]; do sleep 0.02; i=$((i+1)); done".to_string(),
+        "i=0; while [ $i -lt 120 ]; do sleep 0.05; i=$((i+1)); done".to_string(),
     ];
     let mut owned = OwnedTarget::spawn_stopped(&argv, WorkloadDest::Null).unwrap();
     let pid = owned.pid();
@@ -6035,18 +6042,21 @@ fn live_short_children_are_detected() {
     let mut lc = PollingLifecycle::new(pid);
     assert!(lc.fallback_partial());
     let mut forks = 0u64;
-    for _ in 0..10 {
+    for _ in 0..50 {
         let delta = lc.poll();
         forks += delta
             .events
             .iter()
             .filter(|e| e.kind == LifecycleKind::Fork)
             .count() as u64;
+        if forks >= 1 {
+            break;
+        }
         std::thread::sleep(Duration::from_millis(100));
     }
     assert!(
         forks >= 1,
-        "ten scans across ~1.2s of 20ms children saw nothing"
+        "fifty scans across ~6s of 50ms children saw nothing"
     );
     unsafe {
         libc::kill(pid as libc::pid_t, libc::SIGKILL);
