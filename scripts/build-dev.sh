@@ -413,6 +413,7 @@ manifest = {
         "host-binary": "bin/osslscope",
         "bpf-object:osslscope-harvest": "lib/osslscope/osslscope-harvest",
         "bpf-object:osslscope-count": "lib/osslscope/osslscope-count",
+        "bpf-object:osslscope-members": "lib/osslscope/osslscope-members",
     },
 }
 mpath = e["MANIFEST"]
