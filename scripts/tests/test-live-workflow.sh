@@ -622,7 +622,7 @@ cp "$T/rep10.json" "$T/o-oddshort/known-n.json"
 ln -s "$REPO/scripts" "$T/o-oddshort/scripts"
 run_oracle_block o-oddshort ecdsa
 if [ "$ORACLE_RC" -ne 0 ] \
-    && grep -q 'ORACLE FAIL' "$T/o-oddshort/oracle.txt" 2>/dev/null; then
+    && grep -q 'mode-op calls 10 below ledgered 11 iterations' "$T/o-oddshort/oracle.txt" 2>/dev/null; then
     ok "oracle block fails 10 op calls under 11 ledgered"
 else
     bad "oracle block fails 10 op calls under 11 ledgered (rc=$ORACLE_RC)"
