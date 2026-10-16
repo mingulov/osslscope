@@ -2576,11 +2576,11 @@ impl SessionCore {
             }
             match harvest::resolve_query_target(&maps, &self.provider, &self.canon, addr, cookie) {
                 Err(e) => {
-                    self.record_attach_failure(
-                        &mut delta,
-                        cookie,
-                        format!("resolve stage-2 for cookie {cookie}: {e:#}"),
-                    );
+                    // The resolve error is already an approved
+                    // literal (cookie rides structurally) — no
+                    // wrapper (a wrapper would reintroduce the
+                    // cookie number into the text).
+                    self.record_attach_failure(&mut delta, cookie, format!("{e:#}"));
                     // Unmapped (no identity to compare): retry from
                     // the next poll until it maps.
                     self.retry_stage2.insert(
@@ -3842,9 +3842,55 @@ impl LinkSet {
 
 /// Path for a multi link: the kernel resolves it per mapping, so
 /// the caller's (possibly relative) path is passed through as-is.
+/// Approved attach-diagnostic vocabulary (round 2, residual F —
+/// allowlist-v1 `attach_diagnostics`): producer-literal failure
+/// texts — no paths, no pointers, no target strings, no runtime
+/// addresses. Every `AttachEvent.failed` text is one of these
+/// literals or a kind-token template below (the cookie and probe
+/// identity ride structurally on the attach record, never in the
+/// text). Session unit tests pin each producer's exact text; the
+/// privacy suite pins the no-pathname property over the set.
 fn link_path(path: &Path) -> anyhow::Result<CString> {
-    CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| anyhow!("attach path contains NUL: {}", path.display()))
+    CString::new(path.as_os_str().as_bytes()).map_err(|_| anyhow!("attach path contains NUL"))
+}
+
+/// Reword an OS failure to approved-vocabulary text, KEEPING its
+/// `ErrorKind`: transient-race detection keys on InvalidData via
+/// outermost downcast — a kind-dropping reword would silently
+/// convert retries into blind-latches. Non-OS inners collapse to
+/// an uncategorized marker (never rendered detail, never a retry
+/// marker — unreachable at current call sites, whose inners are
+/// all OS errors).
+fn reword_os_error(op: &str, e: anyhow::Error) -> anyhow::Error {
+    match e.downcast::<std::io::Error>() {
+        Ok(io) => {
+            let kind = io.kind();
+            anyhow!(std::io::Error::new(
+                kind,
+                format!("{op} failed (kind={kind:?})")
+            ))
+        }
+        Err(_) => anyhow!(std::io::Error::other(format!("{op} failed (kind=error)"))),
+    }
+}
+
+/// Stage-2 pin-open failure (host-testable): the path is the
+/// install target (never rendered); the kind token names the
+/// failure class (a mapped module disappearing before pin-open
+/// reads `kind=NotFound`).
+fn stage2_pin_open_text(err: &std::io::Error) -> String {
+    format!(
+        "stage-2 pin open failed (kind={:?}; cookie retries next poll)",
+        err.kind()
+    )
+}
+
+/// BPF link-attach failure (host-testable): the entry name is a
+/// static program name and the offset a file offset (both
+/// permitted, both retained for diagnosis); the OS error
+/// collapses to its kind token.
+fn link_attach_text(entry: &str, offset: u64, err: &std::io::Error) -> String {
+    format!("attach {entry}@{offset:#x} failed (kind={:?})", err.kind())
 }
 
 fn prog_fd(loaded: &Loaded, name: &str) -> anyhow::Result<std::os::fd::RawFd> {
@@ -3884,7 +3930,7 @@ fn attach_pair(
         &[cookie],
         pid,
     )
-    .map_err(|e| anyhow!("attach {entry}@{offset:#x}: {e}"))?;
+    .map_err(|e| anyhow!(link_attach_text(entry, offset, &e)))?;
     let ret_link = ossl_bpf_sys::link_create_uretprobe_multi(
         prog_fd(loaded, ret)?,
         &cpath,
@@ -3892,12 +3938,20 @@ fn attach_pair(
         &[cookie],
         pid,
     )
-    .map_err(|e| anyhow!("attach {ret}@{offset:#x}: {e}"))?;
+    .map_err(|e| anyhow!(link_attach_text(ret, offset, &e)))?;
     // Dup both pins BEFORE publishing either link (a dup can only
     // fail on fd exhaustion, but a half-published pair would
     // strand a firing entry link — same rule as the attaches).
-    let entry_pin = pin.fd.try_clone()?;
-    let ret_pin = pin.fd.try_clone()?;
+    // The pair separator is `+` (a `/` would read as a pathname —
+    // diagnostics carry none).
+    let entry_pin = pin
+        .fd
+        .try_clone()
+        .map_err(|e| anyhow!("attach {entry}+{ret} pin dup failed (kind={:?})", e.kind()))?;
+    let ret_pin = pin
+        .fd
+        .try_clone()
+        .map_err(|e| anyhow!("attach {entry}+{ret} pin dup failed (kind={:?})", e.kind()))?;
     links.push(entry_link, entry_pin, kind, vec![cookie]);
     links.push(ret_link, ret_pin, kind, vec![cookie]);
     Ok(())
@@ -4412,12 +4466,7 @@ impl SessionEnv for LiveEnv {
         let path_str = path.to_string_lossy();
         let pin =
             crate::plan::resolve_pinned_retry(|| crate::plan::resolve_pinned(path_str.as_ref()))
-                .map_err(|e| {
-                    anyhow!(
-                        "stage-2 pin open failed for {} (cookie retries next poll): {e}",
-                        path.display()
-                    )
-                })?;
+                .map_err(|e| anyhow!(stage2_pin_open_text(&e)))?;
         let matches = expected.is_some_and(|(raw_dev, ino)| {
             let enc = crate::plan::encode_device(
                 libc::major(raw_dev as libc::dev_t),
@@ -4426,10 +4475,7 @@ impl SessionEnv for LiveEnv {
             pin.device == enc && pin.ino == ino
         });
         if !matches {
-            bail!(
-                "stage-2 pin for {} misses the resolve-time identity (cookie retries next poll)",
-                path.display()
-            );
+            bail!("stage-2 pin misses the resolve-time identity (cookie retries next poll)");
         }
         attach_pair(
             &self.loaded,
@@ -4692,7 +4738,8 @@ impl SessionEnv for LiveEnv {
             .dispatch_spec
             .clone()
             .context("no dispatch anchor to reinstall")?;
-        let live = maps::read_maps(self.pid)?;
+        let live =
+            maps::read_maps(self.pid).map_err(|e| reword_os_error("dispatch maps read", e))?;
         let prov_path = self.provider.to_string_lossy().into_owned();
         let entry = live
             .iter()
@@ -4708,7 +4755,12 @@ impl SessionEnv for LiveEnv {
                     format!("provider {prov_path} unopenable during reinstall: {e}"),
                 )
             })?;
-        let bound = crate::plan::read_file_bound(&pin.link_path())?;
+        let bound = crate::plan::read_file_bound(&pin.link_path()).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("dispatch provider read failed (kind={:?})", e.kind()),
+            )
+        })?;
         // H5 (was F-D/A11 mixed-domain): the bound read binds the
         // CURRENT file at the provider path; the maps entry backs
         // the file the TARGET still maps. Ino (domain-agnostic)
@@ -4728,13 +4780,18 @@ impl SessionEnv for LiveEnv {
         }
         let (off, prog_entry, prog_ret, resolution) = match &spec {
             DispatchSpec::Init => {
+                // Approved literal (round 2, residual F): the ELF
+                // error carries binary-derived detail (section
+                // names, offsets) that must not reach diagnostics
+                // — the init-vs-builtin distinction is the
+                // retained diagnosis.
                 let (off, res) = elf::dynsym_file_offset(&bound.bytes, INIT_ANCHOR)
                     .map(|off| (off, None))
                     .or_else(|_| {
                         elf::symtab_file_offset(&bound.bytes, INIT_ANCHOR)
                             .map(|off| (off, Some("symtab".to_string())))
                     })
-                    .map_err(|e| anyhow!("reinstall anchor unresolved: {e:#}"))?;
+                    .map_err(|_| anyhow!("reinstall init anchor unresolved"))?;
                 (off, "init_entry", "init_return", res)
             }
             DispatchSpec::Builtin {
@@ -4742,12 +4799,16 @@ impl SessionEnv for LiveEnv {
                 force_offset,
                 explicit_offsets,
             } => {
+                // Approved literal (round 2, residual F): the table
+                // is operator config (dynamic — never rendered) and
+                // the resolver error binary-derived — both stay out
+                // of diagnostics.
                 let (off, r) = if *explicit_offsets {
                     builtin::resolve_query_offset(&bound.bytes, table, *force_offset)
                 } else {
                     builtin::resolve_supported_offset(&bound.bytes, table)
                 }
-                .map_err(|e| anyhow!("reinstall anchor unresolved: {e:#}"))?;
+                .map_err(|_| anyhow!("reinstall builtin anchor unresolved"))?;
                 let res = (r != builtin::Resolution::Table).then(|| r.as_str().to_string());
                 (off, "query_entry", "query_return", res)
             }
@@ -5061,6 +5122,72 @@ impl DiscoverySession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Round 2, residual F: each diagnostic producer's exact text.
+    /// The live attach paths are unconstructible on host (BPF
+    /// state), so the message constructors they call are pinned
+    /// directly — a pathname, cookie, or OS-text fragment sneaking
+    /// back into any template fails here and in the privacy
+    /// suite (`tests/privacy_allowlist.rs`).
+    #[test]
+    fn diagnostic_texts_use_approved_vocabulary() {
+        use std::io::{Error, ErrorKind};
+        // Pin-open failure: kind token, no path (the installing
+        // path is an argument, never rendered). The review's
+        // scenario — a mapped module disappearing before
+        // pin-open — reads kind=NotFound.
+        let t = stage2_pin_open_text(&Error::new(ErrorKind::NotFound, "gone"));
+        assert_eq!(
+            t,
+            "stage-2 pin open failed (kind=NotFound; cookie retries next poll)"
+        );
+        assert!(!t.contains('/'), "diagnostics carry no pathnames: {t}");
+        let t = stage2_pin_open_text(&Error::new(ErrorKind::PermissionDenied, "nope"));
+        assert_eq!(
+            t,
+            "stage-2 pin open failed (kind=PermissionDenied; cookie retries next poll)"
+        );
+        // Link failure: static entry name + file offset + kind
+        // token (no fd-paths, no OS text).
+        let t = link_attach_text(
+            "query_entry",
+            0x1234,
+            &Error::new(ErrorKind::PermissionDenied, "x"),
+        );
+        assert_eq!(
+            t,
+            "attach query_entry@0x1234 failed (kind=PermissionDenied)"
+        );
+        assert!(!t.contains("proc"), "diagnostics carry no paths: {t}");
+        // Reword keeps the kind (InvalidData transients still
+        // retry) while replacing free OS text.
+        let e = reword_os_error(
+            "dispatch maps read",
+            anyhow!(Error::new(ErrorKind::InvalidData, "bad utf8: /proc/1/maps")),
+        );
+        assert_eq!(
+            format!("{e:#}"),
+            "dispatch maps read failed (kind=InvalidData)"
+        );
+        assert!(
+            is_transient_race(&e),
+            "kind-preserving reword keeps the retry marker"
+        );
+        let e = reword_os_error(
+            "dispatch maps read",
+            anyhow!(Error::new(ErrorKind::NotFound, "gone")),
+        );
+        assert_eq!(
+            format!("{e:#}"),
+            "dispatch maps read failed (kind=NotFound)"
+        );
+        assert!(!is_transient_race(&e));
+        // Non-OS inners collapse (never rendered detail, never a
+        // retry marker).
+        let e = reword_os_error("dispatch maps read", anyhow!("custom /path/detail"));
+        assert_eq!(format!("{e:#}"), "dispatch maps read failed (kind=error)");
+        assert!(!is_transient_race(&e));
+    }
 
     #[test]
     fn provider_stat_renders_stat_dev_domain() {
@@ -6455,6 +6582,49 @@ mod tests {
                 .any(|a| matches!(a.kind, AttachKind::Stage2 { .. }) && a.failed.is_none()),
             "retry success reports its install: {:?}",
             d.attaches
+        );
+    }
+
+    /// Round 2, residual F (behavioral sink pin): a stage-2
+    /// resolve failure through the real poll path lands its
+    /// approved literal in the attach record (the text that feeds
+    /// both the delta and the final snapshot — i.e. what becomes
+    /// `attach_diagnostics`) — the provider pathname and cookie
+    /// never reach the text.
+    #[test]
+    fn poll_stage2_resolve_failure_text_is_literal() {
+        let mut env = MiniEnv::new();
+        env.maps = vec![];
+        let mut core = a11_core();
+        core.pending_stage2.push_back((42, 0x1500));
+        let d = core.poll(&mut env, a11_budget()).unwrap();
+        let failed: Vec<&str> = d
+            .attaches
+            .iter()
+            .filter_map(|a| a.failed.as_deref())
+            .collect();
+        assert_eq!(failed, vec!["stage-2 attach has no provider mapping"]);
+        assert!(
+            !failed[0].contains('/'),
+            "diagnostics carry no pathnames: {:?}",
+            failed
+        );
+        assert!(
+            !failed[0].contains("42"),
+            "the cookie rides structurally, never in text: {:?}",
+            failed
+        );
+        let snap = core.snapshot();
+        let snap_failed: Vec<&str> = snap
+            .dispatch
+            .attach_failures
+            .iter()
+            .map(|f| f.error.as_str())
+            .collect();
+        assert_eq!(
+            snap_failed,
+            vec!["stage-2 attach has no provider mapping"],
+            "snapshot path carries the same literal"
         );
     }
 

@@ -313,7 +313,34 @@ gate reads clock + cells only).
 - Optional `attach_diagnostics` (R06, rendered only when an attach
   failed): sorted, deduped, capped array of producer-literal
   failure texts. No paths, no pointers, no target strings, no
-  runtime addresses.
+  runtime addresses. Approved vocabulary (exact — the session
+  unit pins plus `tests/privacy_allowlist.rs` enforce it):
+  `stage-2 target unmapped; link detached`,
+  `libcrypto unmapped after replacement; tripwire anchors blind`,
+  `tripwire mapping changed across replacement; anchors blind
+  (cookie meanings shifted)`,
+  `stage-2 target superseded by replacement; old link detached`,
+  `stage-2 retry superseded by replacement; awaiting fresh init`,
+  `legacy stage-2 attach has no file mapping`,
+  `stage-2 attach has no provider mapping`,
+  `stage-2 pin open failed (kind=<ErrorKind>; cookie retries next
+  poll)`,
+  `stage-2 pin misses the resolve-time identity (cookie retries
+  next poll)`,
+  `attach <entry>@<file-offset> failed (kind=<ErrorKind>)`,
+  `attach <entry>+<ret> pin dup failed (kind=<ErrorKind>)`,
+  `attach path contains NUL`,
+  `dispatch reinstall failed: <inner>`,
+  `dispatch maps read failed (kind=<ErrorKind>)`,
+  `dispatch provider read failed (kind=<ErrorKind>)`,
+  `reinstall init anchor unresolved`,
+  `reinstall builtin anchor unresolved`,
+  `no dispatch anchor to reinstall`, `missing program <name>`.
+  `<ErrorKind>` is a std io error kind name (fixed vocabulary);
+  `<entry>`/`<ret>`/`<name>` are static program names; offsets
+  are file offsets; `<inner>` is one of the above. The cookie and
+  probe identity ride structurally on the attach record, never in
+  text.
 - Human output is a summary, not the same fields: sites omit
   JSON's first/last timestamps, device, and inode, and fenced
   generations render summary counts with detail deferred to
