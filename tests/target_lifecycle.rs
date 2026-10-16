@@ -3007,18 +3007,23 @@ fn ordinary_production_run_counts_real_crypto_free_of_polling_fallback() {
         );
     }
     // Honest verdict shape (observed live, stable 3/3): the
-    // workload exits mid-window; PARTIAL via `unattributed` (op:2
-    // unknown denominator — discovery/count synthesis planes,
-    // outside R20) plus `lowlevel-fallback-uninstrumented` (4
-    // lowlevel syms on the pinned vehicle probed-but-
-    // uninstrumented — a static vehicle fact from the legacy
-    // plane, not a window loss). Nothing lifecycle-owned.
-    // Premise change (justified — R21-F1): the exited-and-reaped
-    // close-join skip no longer withholds COMPLETE (it is
-    // inapplicable, not missed — the reaped child cannot execute
-    // past its death), so `discovery-loss` leaves this exact set;
-    // the skip stays visible as the Activity counter
-    // `discovery.close_join_skipped` == 1.
+    // workload exits mid-window, so PARTIAL. Exact reasons, each
+    // with its provenance: `discovery-loss` (live discovery Loss
+    // sources in this shape — the close-join skip and the
+    // post-reap maps single are Activity now, but R21's owned-exit
+    // windows carried further live Loss counters feeding this
+    // reason (attach_failed, close_tail_trip), whose status in
+    // THIS shape is unestablished from available evidence);
+    // `lowlevel-fallback-uninstrumented` (4 lowlevel syms on the
+    // pinned vehicle probed-but-uninstrumented — a static vehicle
+    // fact from the legacy plane, not a window loss);
+    // `unattributed` (op:2 unknown denominator — discovery/count
+    // synthesis planes, outside R20). Nothing lifecycle-owned.
+    // Round-2 revert (the wave-1 removal was premature — the
+    // production maps residual alone forced `discovery-loss`):
+    // the exact live set re-gates in the targeted live re-run,
+    // which drops `discovery-loss` then iff live evidence shows
+    // no remaining live Loss source.
     assert!(
         matches!(cap.outcome, osslscope::capture::Outcome::Partial),
         "exited owned workload is honestly PARTIAL: {cap:?}"
@@ -3026,6 +3031,7 @@ fn ordinary_production_run_counts_real_crypto_free_of_polling_fallback() {
     assert_eq!(
         cap.reasons,
         vec![
+            "discovery-loss".to_string(),
             "lowlevel-fallback-uninstrumented".to_string(),
             "unattributed".to_string()
         ],

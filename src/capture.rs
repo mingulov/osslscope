@@ -6086,7 +6086,20 @@ where
             let adapted = self.adapter.loss_sums.get(source).copied().unwrap_or(0);
             if let Some(residual) = total.checked_sub(adapted) {
                 if residual > 0 {
-                    self.extra_counters.push(classify_loss(*source, residual));
+                    // R21-F1 (round 2): the post-reap maps single
+                    // under an exited target is the benign
+                    // close-only read (reaped child, /proc gone,
+                    // nothing missable — the H2/T5 exemption's
+                    // counter half): an Activity counter (audit
+                    // trail, same name), never a Loss — the same
+                    // treatment as the skipped close join. Every
+                    // other source, and maps under a live target,
+                    // stays Loss.
+                    let mut counter = classify_loss(*source, residual);
+                    if target_exited && *source == coverage::HOST_MAPS_READ {
+                        counter.kind = CounterKind::Activity;
+                    }
+                    self.extra_counters.push(counter);
                     // H2/T5: mid-run maps failures rode the deltas
                     // (op None → poll-global taint already fired),
                     // so a maps residual under an exited target is
