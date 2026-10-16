@@ -56,7 +56,10 @@ Required: `schema_version`, `target`, `openssl`, `window`,
 Optional: `disposition` (omitted when never recorded), `policy`
 (`check` documents only; `report` omits it), `context`
 (omitted when unrecorded), `engine_observations` (omitted when
-none were observed).
+none were observed), `attach_diagnostics` (omitted when no
+attach failed: sorted, deduped, capped producer literals
+identifying failed attaches — diagnostic only, counters stay
+the exact counts).
 
 Target, OpenSSL version, window and disposition, values verbatim
 from `tests/goldens/report-v2-violation.json` (whitespace

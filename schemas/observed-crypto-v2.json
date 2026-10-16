@@ -260,6 +260,11 @@
         }
       }
     },
+    "attach_diagnostics": {
+      "description": "Failed-attach diagnostic texts (R06, optional): sorted, deduped, capped producer literals (no paths/pointers) identifying failed attaches. Omitted when none failed. Diagnostic only: counters stay the exact counts; old field readers ignore this key.",
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
     "traversal": {
       "description": "Traversal outcome (v2.1, optional — present iff the window ran the members backend): the exact selected triple plus record/findings/poll counts. Absent on harvest-only runs.",
       "type": "object",

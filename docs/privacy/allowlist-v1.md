@@ -303,6 +303,10 @@ gate reads clock + cells only).
   frozen-registry entrypoint index + display name, window
   (`in-window`/`pre-window`/`untimed`), untimed call count. No
   timestamps, no target strings, no runtime addresses.
+- Optional `attach_diagnostics` (R06, rendered only when an attach
+  failed): sorted, deduped, capped array of producer-literal
+  failure texts. No paths, no pointers, no target strings, no
+  runtime addresses.
 - Human output renders the same fields plus fixed doctrine notes.
 - Runtime addresses are absent; offsets are file offsets.
 
