@@ -668,6 +668,7 @@ fn rendered_fixtures_validate_against_v2_schema() {
         ("violation", violation_doc()),
         ("inconclusive", inconclusive_doc()),
         ("pass", pass_doc()),
+        ("traversal", traversal_doc()),
     ] {
         let v = json_of(&doc);
         validate_v2(&v).unwrap_or_else(|e| panic!("{name} fails schema: {e}"));
@@ -1587,6 +1588,7 @@ fn human_contains_no_address_shaped_bytes() {
         fatal_doc(),
         violation_doc(),
         inconclusive_doc(),
+        traversal_doc(),
     ] {
         let text = render_human(&doc);
         assert!(
@@ -2207,6 +2209,54 @@ fn traversal_section_conforms() {
     assert!(entries[1]["generation"].is_null());
 }
 
+#[test]
+fn traversal_emission_matches_allowlist_inventory() {
+    // T2-2 (emission side): every emitted traversal key must be
+    // allowlisted. The doc's Optional `traversal` bullet
+    // enumerates the approved field inventory as backtick idents;
+    // the rendered section must add nothing beyond it. (Exact
+    // rendered shape is pinned by traversal_section_conforms;
+    // the doc-side approved baseline by
+    // privacy_allowlist::traversal_inventory_is_approved.)
+    let text = std::fs::read_to_string(format!(
+        "{}/docs/privacy/allowlist-v1.md",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .unwrap();
+    let mut bullet = String::new();
+    let mut in_bullet = false;
+    for line in text.lines() {
+        if line.starts_with("- Optional `traversal`") {
+            in_bullet = true;
+        } else if in_bullet && !line.starts_with(' ') && !line.is_empty() {
+            break;
+        }
+        if in_bullet {
+            bullet.push_str(line);
+            bullet.push('\n');
+        }
+    }
+    assert!(
+        !bullet.is_empty(),
+        "allowlist lacks the Optional `traversal` bullet"
+    );
+    let listed: std::collections::BTreeSet<&str> = bullet
+        .split('`')
+        .enumerate()
+        .filter(|(i, _)| i % 2 == 1)
+        .map(|(_, s)| s)
+        .collect();
+    let bytes = render_json(&traversal_doc()).unwrap();
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    let t = v["traversal"].as_object().expect("traversal section");
+    for key in t.keys() {
+        assert!(
+            listed.contains(key.as_str()),
+            "emitted traversal key {key:?} is not in the allowlist inventory"
+        );
+    }
+}
+
 /// Parse the variant names of `pub enum {name}` from Rust source
 /// (leading identifiers of non-comment, non-attribute lines up to
 /// the closing brace).
@@ -2340,6 +2390,7 @@ fn rendered_artifacts_contain_no_forbidden_keys() {
         ("violation", violation_doc()),
         ("inconclusive", inconclusive_doc()),
         ("pass", pass_doc()),
+        ("traversal", traversal_doc()),
     ] {
         let json_bytes = render_json(&doc).unwrap();
         let v: Value = serde_json::from_slice(&json_bytes).unwrap();

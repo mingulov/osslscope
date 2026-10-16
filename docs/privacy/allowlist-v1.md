@@ -298,12 +298,12 @@ gate reads clock + cells only).
   `context` (kernel release plus wall edges), and optional
   `disposition` (custody outcome, replacing `child_exit`).
 - Optional `traversal` (rendered only on traversal runs): the
-  selected harvest/count/members triple (host object paths plus
-  sha256 — the same provenance class as `objects` display
-  locators, never target paths) plus numeric per-record facts
-  (`records`, `findings`, `polls`, `admitted`,
-  `admitted_unknown`, `census_loss`, `entries`). No target
-  strings, no runtime addresses.
+  selected triple — `harvest`, `count`, `members` (host object
+  paths plus sha256 each; the same provenance class as
+  `objects` display locators, never target paths) — plus
+  numeric per-record facts: `records`, `findings`, `polls`,
+  `admitted`, `admitted_unknown`, `census_loss`, `entries`.
+  No target strings, no runtime addresses.
 - Optional `engine_observations` (R05, rendered only when observed):
   per-observation pinned caller-module triple (object fingerprint,
   encoded device, inode), stub file offset, binding generation,
