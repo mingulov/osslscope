@@ -4522,8 +4522,15 @@ where
                                 },
                             );
                         }
+                        // Fresh reads always fit the allowance (the
+                        // reader refuses past it first), so admit
+                        // directly — never fall through to the hit
+                        // admission below (that would count the bytes
+                        // twice AND serve a stale entry over bytes
+                        // deliberately served uncached).
                         out_bytes = out_bytes.saturating_add(read.bytes.len());
                         out.insert(p.clone(), read);
+                        continue;
                     }
                     // Budget refusal: loud, like any other cap drop
                     // (rows miss "unreadable"; the loss counter
