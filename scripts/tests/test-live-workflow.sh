@@ -235,7 +235,9 @@ printf 'osslscope check: observation window complete\nLEDGER mode=ecdsa loop_sec
 C11='{"op": 12, "funcid": 11, "provider_class": "default", "algorithm_classes": ["ECDSA"]}'
 C15='{"op": 12, "funcid": 15, "provider_class": "default", "algorithm_classes": ["ECDSA"]}'
 site() {
-    printf '{"calls": %s, "candidates": [%s], "object": "lib", "device": 1, "inode": %s, "offset": 4096, "generation": 0}' "$1" "$3" "$2"
+    # Declares candidates_coverage complete explicitly: definite
+    # operation evidence requires it (missing fails closed).
+    printf '{"calls": %s, "candidates": [%s], "object": "lib", "device": 1, "inode": %s, "offset": 4096, "generation": 0, "candidates_coverage": "complete"}' "$1" "$3" "$2"
 }
 S11=$(site 3 101 "$C11"); S15=$(site 2 102 "$C15")
 printf '{"schema_version": "observed-crypto-v2.0", "completeness": {"status": "PARTIAL"}, "sites": [%s, %s]}' "$S11" "$S15" >"$T/rep.json"
