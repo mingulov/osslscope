@@ -587,6 +587,46 @@ pub fn check_v2_semantics(doc: &serde_json::Value) -> Result<(), String> {
     check_object_refs(root)?;
     check_records(root, effective_start, effective_end)?;
     check_legacy_partition(root)?;
+    check_traversal_fingerprints(root)?;
+    Ok(())
+}
+
+/// Traversal object fingerprints (K3, round 2 residual O): the
+/// producer guarantees lowercase hex, and the embedded semantic
+/// layer enforces it (the JSON Schema carries min/maxLength only
+/// — `pattern` is unsupported by the embedded validator, so
+/// external validators accept any 64 chars; disclosed in the
+/// schema description). Absent traversal skips; present-but-
+/// malformed fails closed (the semantic layer never assumes
+/// schema validation ran first).
+fn check_traversal_fingerprints(
+    root: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
+    let Some(t) = root.get("traversal") else {
+        return Ok(());
+    };
+    let t = t
+        .as_object()
+        .ok_or_else(|| "doc.traversal: expected object".to_string())?;
+    for slot in ["harvest", "count", "members"] {
+        let obj = t
+            .get(slot)
+            .and_then(|v| v.as_object())
+            .ok_or_else(|| format!("doc.traversal.{slot}: expected object"))?;
+        let sha = obj
+            .get("sha256")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("doc.traversal.{slot}.sha256: expected string"))?;
+        if !(sha.len() == 64
+            && sha
+                .bytes()
+                .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f')))
+        {
+            return Err(format!(
+                "doc.traversal.{slot}.sha256: expected 64 lowercase hex chars"
+            ));
+        }
+    }
     Ok(())
 }
 
