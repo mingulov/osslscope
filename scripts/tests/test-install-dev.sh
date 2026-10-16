@@ -113,6 +113,21 @@ if [ "$(stat -c %a "$T/pfx/share/osslscope/install-manifest.json")" = "644" ]; t
 else
     bad "install-manifest.json is world-readable (mode $(stat -c %a "$T/pfx/share/osslscope/install-manifest.json"))"
 fi
+# S2: a restrictive umask (root-style 077) still yields traversable
+# install directories (mkdir alone would leave 0700 the observer
+# cannot traverse; the receipt chmod fixes files only).
+(
+    umask 077
+    "$SH_BIN" "$INSTALL" --manifest "$T/manifest.json" --prefix "$T/pfxu" >/dev/null 2>&1
+)
+if [ "$(stat -c %a "$T/pfxu/bin")" = "755" ] \
+   && [ "$(stat -c %a "$T/pfxu/lib/osslscope")" = "755" ] \
+   && [ "$(stat -c %a "$T/pfxu/share/doc/osslscope")" = "755" ] \
+   && [ "$(stat -c %a "$T/pfxu/share/osslscope")" = "755" ]; then
+    ok "install under umask 077 leaves traversable (755) directories"
+else
+    bad "install under umask 077 leaves traversable (755) directories (bin=$(stat -c %a "$T/pfxu/bin") lib=$(stat -c %a "$T/pfxu/lib/osslscope"))"
+fi
 if grep -q 'NoNewPrivs' "$T/out"; then
     ok "install reports NoNewPrivs status"
 else

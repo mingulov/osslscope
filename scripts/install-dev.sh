@@ -406,6 +406,11 @@ fi
 
 # --- install (from staged bytes: everything above already passed) ---
 mkdir -p "$PREFIX/bin" "$PREFIX/lib/osslscope" "$PREFIX/share/doc/osslscope" "$PREFIX/share/osslscope"
+# S2: establish traversable directory modes explicitly (mkdir honors the
+# caller umask — a root 077 umask would leave 0700 dirs the unprivileged
+# observer cannot traverse; the receipt chmod below fixes files only).
+chmod 755 "$PREFIX/bin" "$PREFIX/lib/osslscope" "$PREFIX/share/doc/osslscope" "$PREFIX/share/osslscope" \
+    || { echo "error: cannot set permissions on install directories under $PREFIX" >&2; exit 1; }
 BIN_DEST="$PREFIX/bin/osslscope"
 HARVEST_DEST="$PREFIX/lib/osslscope/osslscope-harvest"
 COUNT_DEST="$PREFIX/lib/osslscope/osslscope-count"
