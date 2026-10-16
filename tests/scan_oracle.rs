@@ -1779,13 +1779,19 @@ fn fix5_f2_row_then_abort_warm_not_masked() {
     );
 }
 
-/// Round-5 warm seam (zero-ROW inclusion): a verified
-/// terminator + fully-evidenced prefix whose OK slots carry no
-/// ROWs (immediate-terminator dispatches) + actual T+1 live
-/// evidence still filters T+1 noise — zero-ROW prefixes are
-/// valid warm tables, not dirty ones.
+/// R36/I3 (premise change, justified: round 5 admitted
+/// zero-ROW prefixes into the T+1 filter, so a below-T
+/// first-dispatch-read failure masked to Complete whenever live
+/// T+1 activity coincided — the F2 regression. Base rejected
+/// zero-ROW first-read failure; restored here): a verified
+/// terminator + prefix whose OK slots carry no ROWs +
+/// fault bits + actual T+1 live evidence stays PARTIAL — the
+/// bits are unattributable (below-T abort vs T+1 noise), so the
+/// filter must not fire. Zero-ROW prefixes stay valid (Complete)
+/// absent fault bits (the cold-complete pins carry no ROWs and
+/// no bits).
 #[test]
-fn fix5_t1_filter_allows_zero_row_prefix() {
+fn fix5_t1_filter_rejects_zero_row_prefix_with_faults() {
     let mut scope = OracleScope::full();
     scope.known_t.insert(ARR, (3, 0));
     let mut o = Oracle::new(scope);
@@ -1807,8 +1813,13 @@ fn fix5_t1_filter_allows_zero_row_prefix() {
     o.finish(2_000);
     assert_eq!(o.done().len(), 1);
     assert!(
-        matches!(o.done()[0].outcome, Outcome::Complete { .. }),
-        "zero-ROW prefix with T+1 evidence must filter: {:?}",
+        matches!(
+            o.done()[0].outcome,
+            Outcome::Partial { ref reasons } if reasons.contains(&PartialReason::Trunc(
+                wire::TRUNC_DISPATCH | wire::TRUNC_WALK_READ
+            ))
+        ),
+        "zero-ROW prefix with faults must not filter: {:?}",
         o.done()[0].outcome
     );
     assert_eq!(o.done()[0].true_t, TrueT::Proven(3));
@@ -1842,6 +1853,38 @@ fn fix5_t1_filter_allows_t_zero() {
         o.done()[0].outcome
     );
     assert_eq!(o.done()[0].true_t, TrueT::Proven(0));
+}
+
+/// R36/I3 warm counterexample: warm T=1, ALG_OK@0 with ZERO
+/// ROWs (its dispatch walk may have aborted on the first entry
+/// read), EMPTY@1, independently readable ALG_OK@2 (live T+1),
+/// TRUNC WALK_READ. The bit is unattributable to a slot
+/// (below-T first-read failure vs T+1 noise) → fail closed,
+/// never masked to Complete.
+#[test]
+fn r36_warm_below_t_fault_with_live_t1_not_masked() {
+    let mut scope = OracleScope::full();
+    scope.known_t.insert(ARR, (1, 0));
+    let mut o = Oracle::new(scope);
+    let mut b = quiesced_idle(&[TIDA]);
+    b.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b.push_ret(ret(TIDA, 0, 0));
+    b.push_alg(alg(TIDA, 0, 0, wire::ALG_OK));
+    b.push_alg(alg_arr(TIDA, 0, 1, wire::ALG_EMPTY, ARR, 0));
+    b.push_alg(alg(TIDA, 0, 2, wire::ALG_OK));
+    b.trunc.insert(OP, wire::TRUNC_WALK_READ);
+    o.ingest(&b);
+    assert_eq!(o.done().len(), 1);
+    assert!(
+        matches!(
+            o.done()[0].outcome,
+            Outcome::Partial { ref reasons } if reasons
+                .iter()
+                .any(|r| matches!(r, PartialReason::Trunc(b) if b & wire::TRUNC_WALK_READ != 0))
+        ),
+        "warm below-T fault coinciding with live T+1 must stay Partial: {:?}",
+        o.done()[0].outcome
+    );
 }
 
 /// Round-5 warm seam (cold exclusion): without a standing warm
