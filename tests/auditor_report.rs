@@ -989,9 +989,77 @@ fn auditor_v2_fixture() -> CaptureDocument {
             unfenced_tails: 0,
         },
         engine_observations: Vec::new(),
-        traversal: None,
+        traversal: Some(traversal_record_fixture()),
     };
     finalize(input)
+}
+
+/// I4/T2-1: the auditor's traversal section (same fully-populated
+/// shape as the output-contract fixture — all ten keys incl. the
+/// census/entry fields — so the auditor checker exercises the
+/// traversal defs on every run).
+fn traversal_record_fixture() -> osslscope::evidence::TraversalRecord {
+    use osslscope::evidence::{TraversalObject, TraversalRecord, TraversalRecordEntry};
+    use osslscope::scan::oracle::{Outcome, PartialReason, TrueT};
+    use std::collections::BTreeMap;
+    TraversalRecord {
+        harvest: TraversalObject {
+            path: "/lib/osslscope/osslscope-harvest".to_string(),
+            sha256: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+                .to_string(),
+        },
+        count: TraversalObject {
+            path: "/lib/osslscope/osslscope-count".to_string(),
+            sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                .to_string(),
+        },
+        members: TraversalObject {
+            path: "/lib/osslscope/osslscope-members".to_string(),
+            sha256: "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae"
+                .to_string(),
+        },
+        records: 2,
+        findings: 1,
+        polls: 3,
+        admitted: BTreeMap::from([(7u32, 10u64), (12u32, 4u64)]),
+        entries: vec![
+            TraversalRecordEntry {
+                tid: 7,
+                seq: 0,
+                op: 7,
+                outcome: Outcome::Complete {
+                    true_t: 6,
+                    cached: false,
+                },
+                true_t: TrueT::Proven(6),
+                alg_count: 7,
+                row_count: 3,
+                generation: Some(9),
+            },
+            TraversalRecordEntry {
+                tid: 7,
+                seq: 1,
+                op: 12,
+                outcome: Outcome::Partial {
+                    reasons: vec![
+                        PartialReason::Holes(vec![3]),
+                        PartialReason::Trunc(6),
+                        PartialReason::CacheShrink {
+                            cached: 9,
+                            observed: 4,
+                        },
+                        PartialReason::DrainLoss,
+                    ],
+                },
+                true_t: TrueT::Candidate(4),
+                alg_count: 5,
+                row_count: 0,
+                generation: None,
+            },
+        ],
+        admitted_unknown: vec![9],
+        census_loss: 2,
+    }
 }
 
 fn load_golden_v2() -> (String, Value) {
@@ -1073,6 +1141,26 @@ fn golden_v2_exercises_branches() {
     // conservation (500 = 400 + 0 + 60 current + 40 fenced).
     let part = o["legacy_partition"].as_object().unwrap();
     assert_eq!(part["non_legacy_exclusive_calls"], 500);
+    // I4/T2-1: the golden pins the traversal section (all ten
+    // keys incl. the census/entry fields — the auditor checker
+    // exercises the traversal defs on every conformance run).
+    let t = o["traversal"].as_object().unwrap();
+    for key in [
+        "harvest",
+        "count",
+        "members",
+        "records",
+        "findings",
+        "polls",
+        "admitted",
+        "entries",
+        "admitted_unknown",
+        "census_loss",
+    ] {
+        assert!(t.contains_key(key), "v2 golden needs traversal.{key}");
+    }
+    assert_eq!(t["entries"].as_array().unwrap().len(), 2);
+    assert_eq!(t["census_loss"], 2);
     assert_eq!(
         part["legacy_exclusive_calls"]
             .as_u64()

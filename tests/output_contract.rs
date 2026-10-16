@@ -313,6 +313,76 @@ fn partial_doc() -> CaptureDocument {
     doc
 }
 
+/// Traversal-bearing report document: the complete shape plus a
+/// fully-populated traversal section (all ten keys incl. the
+/// round-4/5 additive census/entry fields) — the I4 conformance
+/// subject: emitter evidence the schema must accept.
+pub(crate) fn traversal_doc() -> CaptureDocument {
+    use osslscope::evidence::{TraversalObject, TraversalRecord, TraversalRecordEntry};
+    use osslscope::scan::oracle::{Outcome, PartialReason, TrueT};
+    use std::collections::BTreeMap;
+    let mut doc = complete_doc();
+    doc.traversal = Some(TraversalRecord {
+        harvest: TraversalObject {
+            path: "/lib/osslscope/osslscope-harvest".to_string(),
+            sha256: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+                .to_string(),
+        },
+        count: TraversalObject {
+            path: "/lib/osslscope/osslscope-count".to_string(),
+            sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                .to_string(),
+        },
+        members: TraversalObject {
+            path: "/lib/osslscope/osslscope-members".to_string(),
+            sha256: "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae"
+                .to_string(),
+        },
+        records: 2,
+        findings: 1,
+        polls: 3,
+        admitted: BTreeMap::from([(7u32, 10u64), (12u32, 4u64)]),
+        entries: vec![
+            TraversalRecordEntry {
+                tid: 7,
+                seq: 0,
+                op: 7,
+                outcome: Outcome::Complete {
+                    true_t: 6,
+                    cached: false,
+                },
+                true_t: TrueT::Proven(6),
+                alg_count: 7,
+                row_count: 3,
+                generation: Some(9),
+            },
+            TraversalRecordEntry {
+                tid: 7,
+                seq: 1,
+                op: 12,
+                outcome: Outcome::Partial {
+                    reasons: vec![
+                        PartialReason::Holes(vec![3]),
+                        PartialReason::Trunc(6),
+                        PartialReason::CacheShrink {
+                            cached: 9,
+                            observed: 4,
+                        },
+                        PartialReason::DrainLoss,
+                    ],
+                },
+                true_t: TrueT::Candidate(4),
+                alg_count: 5,
+                row_count: 0,
+                generation: None,
+            },
+        ],
+        admitted_unknown: vec![9],
+        census_loss: 2,
+    });
+    doc
+}
+
 /// FATAL document: recycled pid, no usable evidence.
 fn fatal_doc() -> CaptureDocument {
     let mut input = input_base();
@@ -2074,6 +2144,166 @@ fn v2_goldens_pinned() {
         "report-v2-inconclusive.json",
         &String::from_utf8(render_json(&inconclusive).unwrap()).unwrap(),
     );
+    let traversal = traversal_doc();
+    assert_golden(
+        "report-v2-traversal.json",
+        &String::from_utf8(render_json(&traversal).unwrap()).unwrap(),
+    );
+}
+
+#[test]
+fn traversal_section_conforms() {
+    // I4/T2-1: the traversal-bearing document passes rendered
+    // schema validation + cross-field semantics, and the section
+    // pins its published shape (all ten keys, entry envelopes,
+    // census fields). On the pre-fix schema this FAILS (unknown
+    // keys + unsupported `pattern` keyword) — the emitter
+    // evidence the schema must accept.
+    let doc = traversal_doc();
+    let bytes = render_json(&doc).unwrap();
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    validate_v2(&v).expect("traversal doc validates");
+    check_v2_semantics(&v).expect("traversal doc semantics hold");
+    let t = v["traversal"].as_object().expect("traversal section");
+    let mut keys: Vec<&str> = t.keys().map(|k| k.as_str()).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec![
+            "admitted",
+            "admitted_unknown",
+            "census_loss",
+            "count",
+            "entries",
+            "findings",
+            "harvest",
+            "members",
+            "polls",
+            "records"
+        ],
+        "published traversal keys"
+    );
+    assert_eq!(t["admitted"], json!({"7": 10, "12": 4}));
+    assert_eq!(t["admitted_unknown"], json!([9]));
+    assert_eq!(t["census_loss"], json!(2));
+    let entries = t["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(
+        entries[0]["outcome"],
+        json!({"Complete": {"true_t": 6, "cached": false}})
+    );
+    assert_eq!(entries[0]["true_t"], json!({"Proven": 6}));
+    assert_eq!(entries[0]["generation"], json!(9));
+    assert_eq!(
+        entries[1]["outcome"]["Partial"]["reasons"],
+        json!([
+            {"Holes": [3]},
+            {"Trunc": 6},
+            {"CacheShrink": {"cached": 9, "observed": 4}},
+            "DrainLoss"
+        ])
+    );
+    assert_eq!(entries[1]["true_t"], json!({"Candidate": 4}));
+    assert!(entries[1]["generation"].is_null());
+}
+
+/// Parse the variant names of `pub enum {name}` from Rust source
+/// (leading identifiers of non-comment, non-attribute lines up to
+/// the closing brace).
+fn enum_variants(src: &str, name: &str) -> Vec<String> {
+    let decl = format!("pub enum {name} {{");
+    let start = src
+        .find(&decl)
+        .unwrap_or_else(|| panic!("enum {name} declaration not found"));
+    let mut out = Vec::new();
+    for line in src[start..].lines().skip(1) {
+        let t = line.trim();
+        if t == "}" {
+            break;
+        }
+        if t.is_empty() || t.starts_with('/') || t.starts_with('#') {
+            continue;
+        }
+        let ident: String = t
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        if !ident.is_empty() && ident.chars().next().unwrap().is_uppercase() {
+            out.push(ident);
+        }
+    }
+    out
+}
+
+/// Parse the field names of `pub struct {name}` from Rust source
+/// (`pub name:` lines up to the closing brace).
+fn struct_fields(src: &str, name: &str) -> Vec<String> {
+    let decl = format!("pub struct {name} {{");
+    let start = src
+        .find(&decl)
+        .unwrap_or_else(|| panic!("struct {name} declaration not found"));
+    let mut out = Vec::new();
+    for line in src[start..].lines().skip(1) {
+        let t = line.trim();
+        if t == "}" {
+            break;
+        }
+        if let Some(rest) = t.strip_prefix("pub ") {
+            let ident: String = rest
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if !ident.is_empty() {
+                out.push(ident);
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn traversal_schema_covers_oracle_vocabulary() {
+    // I4/T2-1 drift guard: every Outcome / TrueT / PartialReason /
+    // AbandonReason variant and every TraversalRecord field must
+    // appear in the shipped schema — a new variant/field without
+    // a schema def fails here (emitter evidence the schema must
+    // accept, never silently reject via additionalProperties or
+    // an unmatched anyOf).
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let oracle = std::fs::read_to_string(root.join("src/scan/oracle.rs")).unwrap();
+    let evidence = std::fs::read_to_string(root.join("src/evidence.rs")).unwrap();
+    let schema = std::fs::read_to_string(root.join("schemas/observed-crypto-v2.json")).unwrap();
+    for (ty, names) in [
+        ("Outcome", enum_variants(&oracle, "Outcome")),
+        ("TrueT", enum_variants(&oracle, "TrueT")),
+        (
+            "PartialReason",
+            enum_variants(&oracle, "PartialReason"),
+        ),
+        (
+            "AbandonReason",
+            enum_variants(&oracle, "AbandonReason"),
+        ),
+    ] {
+        assert!(
+            !names.is_empty(),
+            "{ty}: no variants parsed (scanner broke?)"
+        );
+        for v in &names {
+            assert!(
+                schema.contains(&format!("\"{v}\"")),
+                "{ty}::{v} missing from the shipped schema"
+            );
+        }
+    }
+    let fields = struct_fields(&evidence, "TraversalRecord");
+    assert!(!fields.is_empty(), "no TraversalRecord fields parsed");
+    for f in &fields {
+        assert!(
+            schema.contains(&format!("\"{f}\"")),
+            "TraversalRecord::{f} missing from the shipped schema"
+        );
+    }
 }
 
 // ---------------------------------------------------------------- privacy sweep

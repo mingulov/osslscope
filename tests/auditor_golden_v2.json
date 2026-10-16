@@ -210,6 +210,82 @@
     "image_digest": "sha256:auditor",
     "pid": 42
   },
+  "traversal": {
+    "admitted": {
+      "12": 4,
+      "7": 10
+    },
+    "admitted_unknown": [
+      9
+    ],
+    "census_loss": 2,
+    "count": {
+      "path": "/lib/osslscope/osslscope-count",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "entries": [
+      {
+        "alg_count": 7,
+        "generation": 9,
+        "op": 7,
+        "outcome": {
+          "Complete": {
+            "cached": false,
+            "true_t": 6
+          }
+        },
+        "row_count": 3,
+        "seq": 0,
+        "tid": 7,
+        "true_t": {
+          "Proven": 6
+        }
+      },
+      {
+        "alg_count": 5,
+        "generation": null,
+        "op": 12,
+        "outcome": {
+          "Partial": {
+            "reasons": [
+              {
+                "Holes": [
+                  3
+                ]
+              },
+              {
+                "Trunc": 6
+              },
+              {
+                "CacheShrink": {
+                  "cached": 9,
+                  "observed": 4
+                }
+              },
+              "DrainLoss"
+            ]
+          }
+        },
+        "row_count": 0,
+        "seq": 1,
+        "tid": 7,
+        "true_t": {
+          "Candidate": 4
+        }
+      }
+    ],
+    "findings": 1,
+    "harvest": {
+      "path": "/lib/osslscope/osslscope-harvest",
+      "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+    },
+    "members": {
+      "path": "/lib/osslscope/osslscope-members",
+      "sha256": "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae"
+    },
+    "polls": 3,
+    "records": 2
+  },
   "window": {
     "effective_end_ns": 30000000000,
     "effective_start_ns": 0,
