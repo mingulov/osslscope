@@ -960,6 +960,20 @@ impl Oracle {
         }
     }
 
+    /// Restore taken corrections after a failed finish-entry join
+    /// (round 3, residual B-1): the settle poll takes corrections
+    /// too, so a CTRL-write failure must return them here
+    /// alongside the records — dropping them would strand a
+    /// false verdict while saving everything else. Prepend (the
+    /// take inverse — same discipline as [`Oracle::restore_taken`]).
+    pub fn restore_corrections(&mut self, corrections: Vec<Correction>) {
+        if !corrections.is_empty() {
+            let mut c = corrections;
+            c.extend(std::mem::take(&mut self.corrections));
+            self.corrections = c;
+        }
+    }
+
     /// Close one invocation: records the post-drain evidence,
     /// then pushes the verdict (every close funnels here, so
     /// `recent` observes every joinable outcome exactly once).

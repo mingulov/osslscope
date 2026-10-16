@@ -645,8 +645,7 @@ impl ScanBackend {
         self.oracle.finish(now_ns);
         // Earliest failure first (the CTRL write precedes the
         // poll), only after the backstop above secured salvage.
-        ctrl_result?;
-        let mut delta = poll_result?;
+        let mut delta = join_settle(&mut self.oracle, ctrl_result, poll_result)?;
         let (done, findings) = self.take_completed();
         self.done_total += done.len() as u64;
         self.findings_total += findings.len() as u64;
@@ -999,6 +998,33 @@ fn read_calls_by_op(
         .into_iter()
         .filter(|(_, v)| *v != 0)
         .collect())
+}
+
+/// Finish-entry join (host-testable composition): the backstop
+/// already ran — merge the settle-poll delta under the CTRL
+/// result. Earliest failure first (the CTRL write precedes the
+/// poll). Round 3, residual B-1: a CTRL-write failure with a
+/// successful settle poll must NOT drop that delta — `poll()`
+/// destructively took completed records, findings and
+/// corrections into it, so the join restores all three into the
+/// oracle (prepend: older first, ahead of the backstop closes)
+/// before returning the error, and capture salvage retrieves
+/// them. Without the restore the backstop alone cannot secure
+/// salvage (it only closes still-open invocations).
+fn join_settle(
+    oracle: &mut Oracle,
+    ctrl_result: anyhow::Result<()>,
+    poll_result: anyhow::Result<PollDelta>,
+) -> anyhow::Result<PollDelta> {
+    match (ctrl_result, poll_result) {
+        (Err(e), Ok(delta)) => {
+            oracle.restore_taken(delta.done, delta.findings);
+            oracle.restore_corrections(delta.corrections);
+            Err(e)
+        }
+        (Err(e), Err(_)) => Err(e),
+        (Ok(()), poll_result) => poll_result,
+    }
 }
 
 /// Ordered-take outputs: census snapshot + records + findings.
@@ -1704,6 +1730,74 @@ mod tests {
         o.restore_taken(Vec::new(), Vec::new());
         assert!(o.take_done().is_empty());
         assert!(o.take_findings().is_empty());
+    }
+
+    #[test]
+    fn r3_ctrl_failure_preserves_settle_delta_for_salvage() {
+        // Round 3, residual B-1 (review's schedule): an earlier
+        // poll ingested evidence; the settle poll takes it into
+        // its delta — then the finish-entry CTRL write fails. The
+        // delta must restore into the oracle (records + findings
+        // + corrections, in order) so capture salvage retrieves
+        // it (BASE behavior: queues stayed salvageable). The
+        // CTRL error still propagates (earliest failure first).
+        let mut o = oracle_with_batch();
+        let done = o.take_done();
+        let findings = o.take_findings();
+        assert_eq!(done.len(), 1);
+        assert_eq!(findings.len(), 1);
+        let corrections = vec![crate::scan::oracle::Correction {
+            tid: 4242,
+            seq: 0,
+            outcome: crate::scan::oracle::Outcome::Partial {
+                reasons: vec![crate::scan::oracle::PartialReason::DrainLoss],
+            },
+            op: 7,
+        }];
+        let delta = PollDelta {
+            done,
+            findings,
+            corrections,
+            ..PollDelta::default()
+        };
+        let err = join_settle(&mut o, Err(anyhow::anyhow!("ctrl write failed")), Ok(delta))
+            .err()
+            .expect("CTRL error propagates");
+        assert!(err.to_string().contains("ctrl write failed"), "{err:#}");
+        let salvaged = o.take_done();
+        assert_eq!(salvaged.len(), 1, "settle records stay salvageable");
+        assert_eq!(salvaged[0].seq, 0);
+        assert_eq!(o.take_findings().len(), 1, "findings stay salvageable");
+        let salvaged_corrections = o.take_corrections();
+        assert_eq!(
+            salvaged_corrections.len(),
+            1,
+            "corrections stay salvageable (never strand a false verdict)"
+        );
+        assert_eq!(salvaged_corrections[0].seq, 0);
+    }
+
+    #[test]
+    fn r3_ctrl_failure_after_poll_error_keeps_queued_evidence() {
+        // Round 3, residual B-1 (second arm): the settle poll
+        // itself failed (e.g. census read — takes never ran, so
+        // the ingested evidence still queues in the oracle) AND
+        // the CTRL write failed. Earliest failure (CTRL)
+        // propagates; the queued evidence stays for salvage.
+        let mut o = oracle_with_batch();
+        let err = join_settle(
+            &mut o,
+            Err(anyhow::anyhow!("ctrl write failed")),
+            Err(anyhow::anyhow!("census read failed")),
+        )
+        .err()
+        .expect("a failure propagates");
+        assert!(
+            err.to_string().contains("ctrl write failed"),
+            "earliest failure first, as before: {err:#}"
+        );
+        assert_eq!(o.take_done().len(), 1, "queued evidence survives");
+        assert_eq!(o.take_findings().len(), 1, "queued findings survive");
     }
 
     #[test]
