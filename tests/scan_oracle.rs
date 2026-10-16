@@ -39,7 +39,14 @@ fn alg(tid: u32, seq: u64, idx: u64, status: u8) -> wire::ScanAlgEvent {
     wire::ScanAlgEvent {
         kind: wire::KIND_SCAN_ALG,
         op: OP,
-        class: 1,
+        // Round 3, fixtures-wire: producer-admissible class per
+        // status (the wire parser's combo rule — OK/MIXED carry
+        // a real class, every other status carries OTHER_CLASS).
+        class: if status == wire::ALG_OK || status == wire::ALG_MIXED {
+            1
+        } else {
+            wire::OTHER_CLASS
+        },
         status,
         weak: 0,
         _pad: 0,
@@ -75,7 +82,9 @@ fn alg_arr(
     wire::ScanAlgEvent {
         kind: wire::KIND_SCAN_ALG,
         op: OP,
-        class: if status == wire::ALG_OK {
+        // Round 3, fixtures-wire: same producer-admissible rule
+        // as `alg` (OK/MIXED carry a real class).
+        class: if status == wire::ALG_OK || status == wire::ALG_MIXED {
             1
         } else {
             wire::OTHER_CLASS
@@ -2749,6 +2758,42 @@ fn r3_backstop_marks_unavailable_fault_view_uncertain() {
     // Drained evidence is retained (uncertain, never dropped).
     assert_eq!(o.done()[0].alg_count, 2);
     assert_eq!(o.done()[0].true_t, TrueT::Proven(1));
+}
+
+/// Round 3, fixtures-wire: every fixture ALG status the
+/// battery uses must survive the wire parser — the positive
+/// battery feeds producer-admissible records (no class/status
+/// contradictions like class-1 NOIMP/UNKNOWN/UNREADABLE).
+#[test]
+fn r3_fixture_algs_are_wire_admissible() {
+    fn alg_bytes(e: &wire::ScanAlgEvent) -> Vec<u8> {
+        assert_eq!(std::mem::size_of::<wire::ScanAlgEvent>(), 56);
+        let p = e as *const wire::ScanAlgEvent as *const u8;
+        unsafe { std::slice::from_raw_parts(p, 56) }.to_vec()
+    }
+    for status in [
+        wire::ALG_OK,
+        wire::ALG_NOIMP,
+        wire::ALG_UNKNOWN,
+        wire::ALG_UNREADABLE,
+        wire::ALG_MIXED,
+        wire::ALG_EMPTY,
+    ] {
+        let e = alg(TIDA, 0, 3, status);
+        let bytes = alg_bytes(&e);
+        assert!(
+            wire::parse_scan_alg_event(&bytes).is_ok(),
+            "status-{status} fixture must be wire-admissible: {:?}",
+            wire::parse_scan_alg_event(&bytes).unwrap_err()
+        );
+        let e = alg_arr(TIDA, 0, 3, status, ARR, 0);
+        let bytes = alg_bytes(&e);
+        assert!(
+            wire::parse_scan_alg_event(&bytes).is_ok(),
+            "status-{status} alg_arr fixture must be wire-admissible: {:?}",
+            wire::parse_scan_alg_event(&bytes).unwrap_err()
+        );
+    }
 }
 
 /// Round 3, residual B-2 (control): the same shape with an
