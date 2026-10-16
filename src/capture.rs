@@ -9790,10 +9790,7 @@ mod tests {
         };
         let (state, _) = adapt_fresh(&delta, &[]);
         assert_eq!(
-            state
-                .attach_diagnostics
-                .into_iter()
-                .collect::<Vec<_>>(),
+            state.attach_diagnostics.into_iter().collect::<Vec<_>>(),
             vec!["EBUSY".to_string()],
             "failed-attach text retained once (deduped)"
         );
@@ -10861,7 +10858,12 @@ mod tests {
                     .counters
                     .iter()
                     .find(|c| c.name == name)
-                    .unwrap_or_else(|| panic!("typed gap counter {name} missing: {:?}", cap.document.counters));
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "typed gap counter {name} missing: {:?}",
+                            cap.document.counters
+                        )
+                    });
                 assert_eq!(c.kind, CounterKind::Loss, "{name} forces PARTIAL");
                 assert!(c.value > 0, "{name} is positive");
                 assert!(
@@ -10934,7 +10936,13 @@ mod tests {
             // from the same backend actions — drift here would
             // split typed gaps from compat reasons).
             use crate::scan::oracle::Outcome;
-            let clean = walk(1, Outcome::Complete { true_t: 6, cached: false });
+            let clean = walk(
+                1,
+                Outcome::Complete {
+                    true_t: 6,
+                    cached: false,
+                },
+            );
             for actions in [
                 vec![],
                 vec![ScanAction::Detached],
@@ -11348,8 +11356,7 @@ mod tests {
             clock: &'x C,
             proc: &'x mut ProcStub,
             cancelled: &'x dyn Fn() -> bool,
-        ) -> Runner<'x, D, FakeCountBackend, TargetStub, LifecycleStub, C, ProcStub>
-        {
+        ) -> Runner<'x, D, FakeCountBackend, TargetStub, LifecycleStub, C, ProcStub> {
             let wall = clock.wall_now();
             Runner {
                 cfg,

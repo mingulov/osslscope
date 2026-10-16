@@ -397,10 +397,7 @@ impl ScanBackend {
     /// Census salvage for a failed finish (R34/I1): the last known
     /// admitted snapshot + the unknown set recomputed over the
     /// salvaged records + the current CALLS-loss high-water.
-    pub fn salvage_census(
-        &self,
-        done: &[WalkDone],
-    ) -> (BTreeMap<u32, u64>, BTreeSet<u32>, u64) {
+    pub fn salvage_census(&self, done: &[WalkDone]) -> (BTreeMap<u32, u64>, BTreeSet<u32>, u64) {
         let calls_loss = self
             .last_loss
             .get(&wire::LOSS_MAP_CALLS)

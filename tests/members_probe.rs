@@ -1206,10 +1206,7 @@ fn abort_fixture_carries_prot_none_guards() {
         let Some((s, e)) = range.split_once('-') else {
             continue;
         };
-        let (Ok(s), Ok(e)) = (
-            usize::from_str_radix(s, 16),
-            usize::from_str_radix(e, 16),
-        ) else {
+        let (Ok(s), Ok(e)) = (usize::from_str_radix(s, 16), usize::from_str_radix(e, 16)) else {
             continue;
         };
         if s < guard_start + 5 * page && e > guard_start {
