@@ -2366,6 +2366,32 @@ fn struct_fields(src: &str, name: &str) -> Vec<String> {
     out
 }
 
+/// Round 2, residual O (K3 producer guarantee): traversal object
+/// fingerprints are lowercase hex (producer-guaranteed) — the
+/// embedded semantic layer enforces it. The JSON Schema itself
+/// carries min/maxLength only (external validators accept any 64
+/// chars — disclosed in the schema description), so this pins the
+/// semantic layer as the enforcement point.
+#[test]
+fn traversal_sha256_is_lowercase_hex() {
+    let bytes = render_json(&traversal_doc()).unwrap();
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    // Uppercase hex and non-hex (both length-64, so structural
+    // validation passes) must fail semantics.
+    for bad in [
+        "9F86D081884C7D659A2FEAA0C55AD015A3BF4F1B2B0B822CD15D6C15B0F00A08",
+        "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+    ] {
+        let mut t = v.clone();
+        t["traversal"]["harvest"]["sha256"] = json!(bad);
+        validate_v2(&t).unwrap();
+        check_v2_semantics(&t).expect_err("non-lowercase-hex sha256 must fail");
+    }
+    // The good fixture validates on both layers (control).
+    validate_v2(&v).unwrap();
+    check_v2_semantics(&v).unwrap();
+}
+
 #[test]
 fn traversal_schema_covers_oracle_vocabulary() {
     // I4/T2-1 drift guard: every Outcome / TrueT / PartialReason /

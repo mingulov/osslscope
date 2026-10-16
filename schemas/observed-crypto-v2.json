@@ -301,7 +301,7 @@
   },
   "$defs": {
     "traversal-object": {
-      "description": "One BPF object selected for the window: path locates for display, sha256 defines identity. The sha256 pins to 64 chars (min/maxLength — the only string-shape keywords the embedded validator implements; hex-ness is producer-guaranteed).",
+      "description": "One BPF object selected for the window: path locates for display, sha256 defines identity. The sha256 is 64 lowercase hex chars: this schema carries min/maxLength only (the only string-shape keywords the embedded validator implements — 'pattern' is unsupported, so external validators accept any 64 chars), and the embedded semantic layer enforces the lowercase-hex producer guarantee.",
       "type": "object",
       "required": ["path", "sha256"],
       "additionalProperties": false,
