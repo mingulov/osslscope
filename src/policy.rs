@@ -9,8 +9,8 @@
 //! definite/possible bounds; there is no boolean-first-alias shortcut.
 
 use crate::evidence::{
-    CandidateCoverage, CandidateIdentity, CaptureDocument, Completeness, EngineWindow,
-    GapReason, MatchBounds, PredicateMatch, RuleVerdict, SiteExecution, SiteKey, match_bounds,
+    CandidateCoverage, CandidateIdentity, CaptureDocument, Completeness, EngineWindow, GapReason,
+    MatchBounds, PredicateMatch, RuleVerdict, SiteExecution, SiteKey, match_bounds,
 };
 
 /// Classification bucket for unknown, aliased, overlong or unreadable
