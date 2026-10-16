@@ -923,13 +923,33 @@ fn auditor_v2_fixture() -> CaptureDocument {
             discovered: 3,
             attached: 3,
         }],
-        counters: vec![GapCounter {
-            name: "count.map_insert_dropped".to_string(),
-            kind: CounterKind::Loss,
-            units: CounterUnits::Events,
-            source: CounterSource::KernelMap,
-            value: 0,
-        }],
+        // Round 2, residual M: the lossy traversal content (one
+        // non-Complete entry, one finding) carries the Loss
+        // counters assembly emits for exactly that content — the
+        // fixture is honestly PARTIAL, like assembly's.
+        counters: vec![
+            GapCounter {
+                name: "count.map_insert_dropped".to_string(),
+                kind: CounterKind::Loss,
+                units: CounterUnits::Events,
+                source: CounterSource::KernelMap,
+                value: 0,
+            },
+            GapCounter {
+                name: "traversal.incomplete".to_string(),
+                kind: CounterKind::Loss,
+                units: CounterUnits::Events,
+                source: CounterSource::Discovery,
+                value: 1,
+            },
+            GapCounter {
+                name: "traversal.unjoined".to_string(),
+                kind: CounterKind::Loss,
+                units: CounterUnits::Events,
+                source: CounterSource::Discovery,
+                value: 1,
+            },
+        ],
         fatal: None,
         target: TargetRecord::new(
             42,
@@ -991,7 +1011,19 @@ fn auditor_v2_fixture() -> CaptureDocument {
         engine_observations: Vec::new(),
         traversal: Some(traversal_record_fixture()),
     };
-    finalize(input)
+    // Round 2, residual M: the lossy traversal content finalizes
+    // PARTIAL (the traversal Loss counters above), like
+    // assembly's — never COMPLETE.
+    let doc = finalize(input);
+    assert!(
+        matches!(
+            doc.status,
+            osslscope::evidence::Completeness::Partial { .. }
+        ),
+        "lossy-traversal auditor fixture must be PARTIAL: {:?}",
+        doc.status
+    );
+    doc
 }
 
 /// I4/T2-1: the auditor's traversal section (same fully-populated

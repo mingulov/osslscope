@@ -14,11 +14,38 @@
         "source": "drain",
         "units": "events",
         "value": 1
+      },
+      {
+        "kind": "loss",
+        "name": "traversal.incomplete",
+        "source": "discovery",
+        "units": "events",
+        "value": 1
+      },
+      {
+        "kind": "loss",
+        "name": "traversal.unjoined",
+        "source": "discovery",
+        "units": "events",
+        "value": 1
       }
     ],
     "fatal_kind": null,
-    "reasons": [],
-    "status": "COMPLETE"
+    "reasons": [
+      {
+        "counter": "traversal.incomplete",
+        "kind": "loss",
+        "source": "discovery",
+        "value": 1
+      },
+      {
+        "counter": "traversal.unjoined",
+        "kind": "loss",
+        "source": "discovery",
+        "value": 1
+      }
+    ],
+    "status": "PARTIAL"
   },
   "context": {
     "kernel_release": "6.9.0-test",
