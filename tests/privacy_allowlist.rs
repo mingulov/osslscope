@@ -354,7 +354,9 @@ fn traversal_inventory_is_approved() {
     // (rendered keys ⊆ bullet idents) is pinned by
     // output_contract::traversal_emission_matches_allowlist_inventory;
     // this pins the doc baseline so neither side can silently
-    // shrink or grow.
+    // shrink or grow. Round 2, residual N: the check is exact
+    // (an inclusion check lets extra backtick names pass both
+    // agreement tests silently).
     let text = fs::read_to_string(manifest_dir().join("docs/privacy/allowlist-v1.md")).unwrap();
     let mut bullet = String::new();
     let mut in_bullet = false;
@@ -379,7 +381,12 @@ fn traversal_inventory_is_approved() {
         .filter(|(i, _)| i % 2 == 1)
         .map(|(_, s)| s)
         .collect();
-    for key in [
+    // The bullet's subject (`traversal`), the `objects`
+    // cross-reference, plus exactly the ten section keys —
+    // nothing else backticked.
+    let approved: BTreeSet<&str> = [
+        "traversal",
+        "objects",
         "harvest",
         "count",
         "members",
@@ -390,12 +397,13 @@ fn traversal_inventory_is_approved() {
         "admitted_unknown",
         "census_loss",
         "entries",
-    ] {
-        assert!(
-            listed.contains(key),
-            "allowlist traversal bullet omits approved key {key:?}: {listed:?}"
-        );
-    }
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(
+        listed, approved,
+        "allowlist traversal bullet drifted from the approved inventory"
+    );
 }
 
 /// Round 2, residual F (source-pinned): no diagnostic-text
