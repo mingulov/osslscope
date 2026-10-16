@@ -792,18 +792,28 @@ impl ScanBackend {
         // against the stale read. Best-effort by design: a failed
         // re-read keeps the pre-drain read (the drain already
         // succeeded — failing here would R35-drop drained items).
+        // Round 3, residual B-2: that failure is no longer silent
+        // — the batch marks its fault view unavailable, so the
+        // terminal backstop (no next batch exists at finish)
+        // treats the retained evidence as uncertain instead of
+        // evaluating it against a possibly stale view.
         // RCOUNT/SEQ stay pre-drain (quiesced/idle-path and
         // turnover-timing inputs — no verdict evaluates against
         // them, so no stale-fault defect there). The oracle's
         // quiet-batch rule covers the cross-CPU-visibility
-        // residual on the take path; the terminal backstop (no
-        // next batch exists at finish) relies on this union.
-        if let Ok(post_rows) = read_percpu_all(&self.loaded.maps, "LOSS", false) {
-            union_loss_rows(&mut loss_rows, post_rows);
+        // residual on the take path.
+        let mut fault_view_uncertain = false;
+        match read_percpu_all(&self.loaded.maps, "LOSS", false) {
+            Ok(post_rows) => union_loss_rows(&mut loss_rows, post_rows),
+            Err(_) => fault_view_uncertain = true,
         }
-        if let Ok((post_snap, post_seq)) = snapshot_trunc(&self.loaded.maps) {
-            union_trunc_snap(&mut trunc_snap, &mut trunc_seq, post_snap, post_seq);
+        match snapshot_trunc(&self.loaded.maps) {
+            Ok((post_snap, post_seq)) => {
+                union_trunc_snap(&mut trunc_snap, &mut trunc_seq, post_snap, post_seq);
+            }
+            Err(_) => fault_view_uncertain = true,
         }
+        b.fault_view_uncertain = fault_view_uncertain;
         let (loss_deltas, loss_high) = fold_loss_deltas(&self.last_loss, &loss_rows);
         b.loss = loss_deltas;
         for (id, total) in loss_high {

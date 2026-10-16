@@ -1827,7 +1827,7 @@ mod tests {
                      {"GenStale": {"expected": 1, "observed": 2}},
                      "GuardError", "Overfull", "DrainLoss", "GuardMissing",
                      "GenMixed", "DanglingCall", "TerminatorUnproven",
-                     "RowArrayMismatch"
+                     "RowArrayMismatch", "FaultViewUncertain"
                  ]}},
                  "true_t": {"Candidate": 4}, "alg_count": 5, "row_count": 0,
                  "generation": null},

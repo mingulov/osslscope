@@ -371,7 +371,8 @@
         { "type": "string", "const": "GenMixed" },
         { "type": "string", "const": "DanglingCall" },
         { "type": "string", "const": "TerminatorUnproven" },
-        { "type": "string", "const": "RowArrayMismatch" }
+        { "type": "string", "const": "RowArrayMismatch" },
+        { "type": "string", "const": "FaultViewUncertain" }
       ]
     },
     "u64": {
