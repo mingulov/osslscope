@@ -1953,8 +1953,11 @@ impl Oracle {
         // T+1 garbage filter, prefix half (evaluated before the
         // gap lists move into reasons below): standing warm
         // belief + verified terminator (any T including 0) +
-        // fully-evidenced ALG prefix. The TRUNC block further
-        // below conjoins the actual-T+1 beyond evidence.
+        // non-walking below-T prefix (only slots that provably
+        // never reached the dispatch walk — a walked slot may have
+        // faulted, and the bits are unattributable). The TRUNC
+        // block further below conjoins the actual-T+1 beyond
+        // evidence.
         let prefix_for_t1_filter = match min_empty {
             Some(t) => {
                 // The T+1 verification walk exists only under a
@@ -1971,29 +1974,36 @@ impl Oracle {
                             return true;
                         }
                         match o.algs.get(&j) {
-                            Some(a) if a.status == wire::ALG_OK => {
-                                // R36: 1..=127 ROWs. ROW presence
-                                // proves nothing about dispatch
-                                // termination (ROWs emit before a
-                                // later entry read can abort),
-                                // but a zero-ROW live slot is
-                                // attributable below-T
-                                // failed-read evidence (its first
-                                // entry read demonstrably never
-                                // produced) — with fault bits
-                                // present it may be the bits'
-                                // source, so the T+1 filter must
-                                // not fire (base rejected
-                                // zero-ROW first-read failure;
-                                // round 5's admission was the F2
-                                // regression). 128 ROWs prove a
-                                // below-T overflow (the walk emits
-                                // one ROW per entry over 128
-                                // slots), whose DISPATCH is
-                                // genuine and never masked.
-                                let n = o.row_events.iter().filter(|r| r.idx == j).count();
-                                (1..=127).contains(&n)
-                            }
+                            // R36 (round 2, fault attribution): a
+                            // walked below-T slot vetoes the filter
+                            // at ANY ROW count. The producer emits
+                            // the ALG record before walking
+                            // dispatch, and ROWs stream before a
+                            // later entry read can abort — so
+                            // ALG_OK + n ROWs is
+                            // wire-indistinguishable between a
+                            // clean short walk and an aborted
+                            // longer one, while the per-op fault
+                            // bits are unattributable to slots.
+                            // ROW presence proves neither
+                            // termination nor origin; masking
+                            // would launder a genuine below-T
+                            // abort as T+1 noise. Only slots that
+                            // provably never walked (NOIMP — the
+                            // producer classifies
+                            // implementation-less slots without
+                            // ever reaching the dispatch walk)
+                            // pass: with no below-T walk in the
+                            // invocation, the bits' only
+                            // in-invocation source is the live T+1
+                            // walk the beyond half pins. Residual:
+                            // same-op cross-query contamination
+                            // (per-op cells are shared across
+                            // queries) can still misattribute a
+                            // neighbor's genuine fault — scoping
+                            // faults per query needs a wire change
+                            // (future work).
+                            Some(a) if a.status == wire::ALG_OK => false,
                             Some(a) if a.status == wire::ALG_NOIMP => true,
                             _ => false,
                         }
@@ -2119,9 +2129,13 @@ impl Oracle {
         // beyond evidence (unattributable soup — F12 stays
         // Partial). NOIMP/NAME/ALGS bits are never masked here.
         // Residual: per-op TRUNC bits are unattributable to
-        // slots, so a below-T fault coinciding with live T+1
-        // activity still masks — full attribution needs
-        // per-slot dispatch evidence (wire change, future work).
+        // slots AND shared across same-op queries, so a
+        // neighbor query's genuine fault coinciding with live
+        // T+1 activity still masks — full attribution needs
+        // per-query fault scoping (wire change, future work).
+        // Within one invocation the rule is now sound: below-T
+        // walks veto (ROW counts prove no termination), so the
+        // only masking shape has no below-T walk at all.
         let t1_only = match min_empty {
             Some(t) => {
                 let t1_walked = o.algs.get(&(t + 1)).is_some_and(|a| {
