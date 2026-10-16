@@ -1737,9 +1737,7 @@ mod tests {
         let schema: serde_json::Value = serde_json::from_str(V2_SCHEMA_JSON).unwrap();
         let node = schema["properties"]["traversal"].clone();
         let check = |v: &serde_json::Value| validate_against(&node, v, &schema, "$", 0);
-        let obj = |sha: &str| {
-            json!({"path": "/lib/osslscope/osslscope-harvest", "sha256": sha})
-        };
+        let obj = |sha: &str| json!({"path": "/lib/osslscope/osslscope-harvest", "sha256": sha});
         let sha = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
         let good = json!({
             "harvest": obj(sha),
@@ -1786,8 +1784,15 @@ mod tests {
         check(&good).expect("emitter traversal shape validates");
         // Every abandon reason spelling validates.
         for reason in [
-            "SkipVictim", "Churned", "Evicted", "RetireFailed", "StaleRepaired",
-            "Stalled", "Detached", "PreWindow", "Hung",
+            "SkipVictim",
+            "Churned",
+            "Evicted",
+            "RetireFailed",
+            "StaleRepaired",
+            "Stalled",
+            "Detached",
+            "PreWindow",
+            "Hung",
         ] {
             let mut v = good.clone();
             v["entries"][4]["outcome"] = json!({"Abandoned": {"reason": reason}});

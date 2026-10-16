@@ -264,9 +264,8 @@ fn c1_two_slots_per_query() {
     // Query volume from the exact in-memory totals, not the doc
     // field (R21 finding 6 — same trap c_chain_scale::run_leg
     // documents: a clean COMPLETE doc omits `queries_observed`).
-    let (doc, totals) =
-        osslscope::discovery::harvest::run_detailed(&cfg, &|| Ok(()), &|| false)
-            .expect("harvest run");
+    let (doc, totals) = osslscope::discovery::harvest::run_detailed(&cfg, &|| Ok(()), &|| false)
+        .expect("harvest run");
     let _ = child.kill();
     let _ = child.wait();
     let vlog_text = std::fs::read_to_string(&vlog).unwrap_or_default();

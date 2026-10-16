@@ -325,18 +325,15 @@ pub(crate) fn traversal_doc() -> CaptureDocument {
     doc.traversal = Some(TraversalRecord {
         harvest: TraversalObject {
             path: "/lib/osslscope/osslscope-harvest".to_string(),
-            sha256: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
-                .to_string(),
+            sha256: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08".to_string(),
         },
         count: TraversalObject {
             path: "/lib/osslscope/osslscope-count".to_string(),
-            sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-                .to_string(),
+            sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string(),
         },
         members: TraversalObject {
             path: "/lib/osslscope/osslscope-members".to_string(),
-            sha256: "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae"
-                .to_string(),
+            sha256: "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae".to_string(),
         },
         records: 2,
         findings: 1,
@@ -2326,14 +2323,8 @@ fn traversal_schema_covers_oracle_vocabulary() {
     for (ty, names) in [
         ("Outcome", enum_variants(&oracle, "Outcome")),
         ("TrueT", enum_variants(&oracle, "TrueT")),
-        (
-            "PartialReason",
-            enum_variants(&oracle, "PartialReason"),
-        ),
-        (
-            "AbandonReason",
-            enum_variants(&oracle, "AbandonReason"),
-        ),
+        ("PartialReason", enum_variants(&oracle, "PartialReason")),
+        ("AbandonReason", enum_variants(&oracle, "AbandonReason")),
     ] {
         assert!(
             !names.is_empty(),

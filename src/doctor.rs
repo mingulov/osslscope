@@ -3037,11 +3037,7 @@ mod tests {
         std::fs::copy(&h, objdir.join("osslscope-harvest")).unwrap();
         std::fs::copy(&c, objdir.join("osslscope-count")).unwrap();
         std::fs::copy(&m, objdir.join("osslscope-members")).unwrap();
-        write_prefix_receipt(
-            &prefix,
-            &objdir,
-            &["osslscope-harvest", "osslscope-count"],
-        );
+        write_prefix_receipt(&prefix, &objdir, &["osslscope-harvest", "osslscope-count"]);
         let rows = objects_checks_in(None, None, None, &[objdir], &doctor_trust());
         let m = members_row(&rows);
         assert_eq!(m.status, Status::Fail, "{}", m.message);
@@ -3068,11 +3064,7 @@ mod tests {
         std::fs::create_dir_all(&objdir).unwrap();
         std::fs::copy(&h, objdir.join("osslscope-harvest")).unwrap();
         std::fs::copy(&c, objdir.join("osslscope-count")).unwrap();
-        write_prefix_receipt(
-            &prefix,
-            &objdir,
-            &["osslscope-harvest", "osslscope-count"],
-        );
+        write_prefix_receipt(&prefix, &objdir, &["osslscope-harvest", "osslscope-count"]);
         let rows = objects_checks_in(None, None, None, &[objdir], &doctor_trust());
         let m = members_row(&rows);
         assert_eq!(m.status, Status::Info, "{}", m.message);

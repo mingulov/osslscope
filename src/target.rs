@@ -2338,14 +2338,10 @@ mod control_tests {
         // early Cancelled/Expired returns (worker never spawned)
         // must run the cleanup callback — otherwise the registry
         // entry orphans and the destination refuses forever.
-        use super::{run_under_control, Control};
+        use super::{Control, run_under_control};
         for (deadline, cancel, tag) in [
             (Instant::now(), false, "expired"),
-            (
-                Instant::now() + Duration::from_secs(30),
-                true,
-                "cancelled",
-            ),
+            (Instant::now() + Duration::from_secs(30), true, "cancelled"),
         ] {
             let flag = AtomicBool::new(cancel);
             let ran = std::sync::Arc::new(AtomicBool::new(false));
@@ -2359,9 +2355,7 @@ mod control_tests {
                     ran_c.store(true, Ordering::SeqCst);
                     42
                 },
-                Some(Box::new(move || {
-                    cleaned_c.store(true, Ordering::SeqCst)
-                })),
+                Some(Box::new(move || cleaned_c.store(true, Ordering::SeqCst))),
             )
             .unwrap();
             assert!(
