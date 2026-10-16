@@ -5275,7 +5275,10 @@ where
             window: CaptureWindow {
                 requested_start_ns: self.requested_start_ns,
                 requested_end_ns: requested_end,
-                effective_start_ns: self.window_start_ns,
+                effective_start_ns: effective_start_ns(
+                    self.window_start_ns,
+                    self.requested_start_ns,
+                ),
                 effective_end_ns: now_ns.min(requested_end),
                 signal_cut: false,
             },
@@ -5334,6 +5337,16 @@ where
 /// below overflow; saturation fails closed, never wraps).
 fn duration_ns(d: Duration) -> u64 {
     u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// Effective observation start (R21-F4): the kernel window opens
+/// pre-release (probes armed while the child is stopped), but
+/// observation coverage starts at release — clamp the kernel-open
+/// instant up to the requested start so effective ⊆ requested
+/// (the semantic validator's containment rule). `--pid` runs are
+/// unaffected (acquisition predates the open, so the open wins).
+fn effective_start_ns(window_start_ns: u64, requested_start_ns: u64) -> u64 {
+    window_start_ns.max(requested_start_ns)
 }
 
 /// Run one requested observation over already-attached sessions.
@@ -6633,7 +6646,10 @@ where
             window: CaptureWindow {
                 requested_start_ns: self.requested_start_ns,
                 requested_end_ns: requested_end,
-                effective_start_ns: self.window_start_ns,
+                effective_start_ns: effective_start_ns(
+                    self.window_start_ns,
+                    self.requested_start_ns,
+                ),
                 effective_end_ns,
                 signal_cut: self.signal_cut,
             },
@@ -10798,6 +10814,53 @@ mod tests {
         }
 
         #[test]
+        fn owned_setup_skew_clamps_effective_start() {
+            // R21-F4: owned setup does real work between the
+            // kernel-window open and release (1.17–2.05 ms on
+            // every live owned-run doc) — the document's
+            // effective start must never predate the requested
+            // start (the semantic validator's containment rule:
+            // effective ⊆ requested). The ticking clock
+            // reproduces the production skew deterministically.
+            let cfg = stub_config();
+            let mut info = stub_info();
+            info.owned = true;
+            let clock = TickClock {
+                ns: Cell::new(5_000_000_000),
+                step: 1_000_000,
+                now: Cell::new(Instant::now()),
+                wall: SystemTime::now(),
+            };
+            let mut proc = ProcStub;
+            let cancelled = || false;
+            let count = CountSession::new(TPID, FakeCountBackend::new());
+            let runner = stub_runner(
+                &cfg,
+                &info,
+                DiscoveryStub {
+                    finish_err: false,
+                    poll_err: false,
+                    dispatch_attached: false,
+                    trip_set: None,
+                },
+                count,
+                &clock,
+                &mut proc,
+                &cancelled,
+            );
+            let cap = runner.setup_and_run().expect("stub run");
+            let w = &cap.document.window;
+            assert!(
+                w.requested_start_ns > 5_000_000_000,
+                "setup must consume ticks (skew premise): {w:?}"
+            );
+            assert!(
+                w.effective_start_ns >= w.requested_start_ns,
+                "effective start escapes the requested window: {w:?}"
+            );
+        }
+
+        #[test]
         fn traversal_gate_flags_agree_with_reasons() {
             // P1: the typed storm/throttle flags match exactly the
             // actions that earn the compat reasons (both derive
@@ -11082,6 +11145,38 @@ mod tests {
                 }
             }
         }
+        /// Ticking test clock (R21-F4): every monotonic read
+        /// advances time by `step` — production setup does real
+        /// work between the kernel-window open and release (1–2 ms
+        /// live), which the fixed ClockStub cannot reproduce.
+        struct TickClock {
+            ns: Cell<u64>,
+            step: u64,
+            now: Cell<Instant>,
+            wall: SystemTime,
+        }
+        impl ClockPort for TickClock {
+            fn monotonic_ns(&self) -> u64 {
+                let v = self.ns.get();
+                self.ns.set(v.saturating_add(self.step));
+                v
+            }
+            fn now(&self) -> Instant {
+                self.now.get()
+            }
+            fn wall_now(&self) -> SystemTime {
+                self.wall
+            }
+            fn sleep(&self, d: Duration) {
+                self.ns.set(
+                    self.ns
+                        .get()
+                        .saturating_add(u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)),
+                );
+                self.now.set(self.now.get() + d);
+            }
+        }
+
         impl ClockPort for ClockStub {
             fn monotonic_ns(&self) -> u64 {
                 self.ns.get()
@@ -11178,15 +11273,15 @@ mod tests {
             ProcStub,
         >;
 
-        fn stub_runner<'x, D: DiscoveryPort>(
+        fn stub_runner<'x, D: DiscoveryPort, C: ClockPort>(
             cfg: &'x Config,
             info: &'x TargetInfo,
             discovery: D,
             count: CountSession<FakeCountBackend>,
-            clock: &'x ClockStub,
+            clock: &'x C,
             proc: &'x mut ProcStub,
             cancelled: &'x dyn Fn() -> bool,
-        ) -> Runner<'x, D, FakeCountBackend, TargetStub, LifecycleStub, ClockStub, ProcStub>
+        ) -> Runner<'x, D, FakeCountBackend, TargetStub, LifecycleStub, C, ProcStub>
         {
             let wall = clock.wall_now();
             Runner {
