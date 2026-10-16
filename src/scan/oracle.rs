@@ -1907,18 +1907,27 @@ impl Oracle {
                         }
                         match o.algs.get(&j) {
                             Some(a) if a.status == wire::ALG_OK => {
-                                // Below-128 ROWs: ROW presence
+                                // R36: 1..=127 ROWs. ROW presence
                                 // proves nothing about dispatch
                                 // termination (ROWs emit before a
-                                // later entry read can abort), so
-                                // zero-ROW prefixes are valid —
-                                // but 128 ROWs prove a below-T
-                                // overflow (the walk emits one ROW
-                                // per entry over 128 slots),
-                                // whose DISPATCH is genuine and
-                                // never masked.
+                                // later entry read can abort),
+                                // but a zero-ROW live slot is
+                                // attributable below-T
+                                // failed-read evidence (its first
+                                // entry read demonstrably never
+                                // produced) — with fault bits
+                                // present it may be the bits'
+                                // source, so the T+1 filter must
+                                // not fire (base rejected
+                                // zero-ROW first-read failure;
+                                // round 5's admission was the F2
+                                // regression). 128 ROWs prove a
+                                // below-T overflow (the walk emits
+                                // one ROW per entry over 128
+                                // slots), whose DISPATCH is
+                                // genuine and never masked.
                                 let n = o.row_events.iter().filter(|r| r.idx == j).count();
-                                (0..=127).contains(&n)
+                                (1..=127).contains(&n)
                             }
                             Some(a) if a.status == wire::ALG_NOIMP => true,
                             _ => false,
