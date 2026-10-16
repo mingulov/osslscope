@@ -2714,3 +2714,61 @@ fn r35_take_before_ret_closes_after_quiet_batch() {
     assert_eq!(o.done().len(), 1, "quiet batch closes the take-marked open");
     assert_eq!((o.done()[0].tid, o.done()[0].seq), (TIDA, 0));
 }
+
+/// Round 3, residual B-2 (review's schedule): a dispatch read
+/// faults during the drain and the post-drain re-read fails —
+/// the batch carries an unavailable fault view. The terminal
+/// backstop (no next batch to settle against) must retain the
+/// drained evidence while treating the verdict as UNCERTAIN —
+/// never silently Complete.
+#[test]
+fn r3_backstop_marks_unavailable_fault_view_uncertain() {
+    let mut o = Oracle::new(OracleScope::full());
+    let mut b = nonquiesced(1_000);
+    b.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b.push_ret(ret(TIDA, 0, 0));
+    b.push_alg(alg(TIDA, 0, 0, wire::ALG_OK));
+    b.push_alg(alg_arr(TIDA, 0, 1, wire::ALG_EMPTY, ARR, 0));
+    // The post-drain LOSS/TRUNC re-read failed mid-drain faults
+    // may be missing from this batch.
+    b.fault_view_uncertain = true;
+    o.ingest(&b);
+    assert_eq!(o.open_count(), 1, "no successor: honestly open");
+    o.finish(2_000);
+    assert_eq!(o.done().len(), 1);
+    assert!(
+        matches!(
+            o.done()[0].outcome,
+            Outcome::Partial { ref reasons } if reasons
+                .iter()
+                .any(|r| matches!(r, PartialReason::FaultViewUncertain))
+        ),
+        "unavailable fault view must not silently Complete: {:?}",
+        o.done()[0].outcome
+    );
+    // Drained evidence is retained (uncertain, never dropped).
+    assert_eq!(o.done()[0].alg_count, 2);
+    assert_eq!(o.done()[0].true_t, TrueT::Proven(1));
+}
+
+/// Round 3, residual B-2 (control): the same shape with an
+/// available fault view Completes — the uncertainty rule fires
+/// only on the marked view, never by default.
+#[test]
+fn r3_backstop_completes_with_available_fault_view() {
+    let mut o = Oracle::new(OracleScope::full());
+    let mut b = nonquiesced(1_000);
+    b.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b.push_ret(ret(TIDA, 0, 0));
+    b.push_alg(alg(TIDA, 0, 0, wire::ALG_OK));
+    b.push_alg(alg_arr(TIDA, 0, 1, wire::ALG_EMPTY, ARR, 0));
+    assert!(!b.fault_view_uncertain, "default view is available");
+    o.ingest(&b);
+    o.finish(2_000);
+    assert_eq!(o.done().len(), 1);
+    assert!(
+        matches!(o.done()[0].outcome, Outcome::Complete { .. }),
+        "available fault view still Completes: {:?}",
+        o.done()[0].outcome
+    );
+}

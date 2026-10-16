@@ -177,6 +177,16 @@ pub struct ScanBatch {
     /// only sound quiesced — non-quiesced batches hold
     /// underdetermined invocations open (honest, never guessed).
     pub quiesced: bool,
+    /// The current fault view is unavailable (round 3, residual
+    /// B-2): a post-drain LOSS/TRUNC re-read failed, so a fault
+    /// landing mid-drain (after the pre-drain snapshot) may be
+    /// missing from this batch. Opens spanning the drain retain
+    /// the marking; the terminal backstop — which has no next
+    /// batch to settle against — treats marked invocations as
+    /// uncertain (never silently Complete). The take path needs
+    /// no marking effect (the next drain's fresh snapshot
+    /// re-reads the sticky fault planes).
+    pub fault_view_uncertain: bool,
 }
 
 /// Oracle scope: what the producer was asked to observe (item 6
@@ -329,6 +339,13 @@ pub enum PartialReason {
     /// A dispatch row carried a foreign array id (evidence
     /// inconsistent with the joined RET's array).
     RowArrayMismatch,
+    /// The current fault view was unavailable at the terminal
+    /// backstop (round 3, residual B-2): a post-drain LOSS/TRUNC
+    /// re-read failed while this invocation was open, so a fault
+    /// landing mid-drain may be missing from the retained
+    /// evidence. The evidence stays; the verdict cannot be
+    /// Complete.
+    FaultViewUncertain,
 }
 
 /// Why an invocation was abandoned.
@@ -629,6 +646,10 @@ struct Open {
     /// Slot evidence generations disagree with the RET generation
     /// (checked both directions — ALG-after-RET and RET-after-ALG).
     gen_mixed: bool,
+    /// A post-drain fault re-read failed while this invocation
+    /// was open (round 3, residual B-2): the current fault view
+    /// is unavailable, so the terminal backstop cannot Complete.
+    fault_uncertain: bool,
 }
 
 /// The per-invocation join oracle (stateful across drains —
@@ -893,7 +914,30 @@ impl Oracle {
                 });
                 continue;
             }
-            let w = Self::evaluate(&scope, &k, &o);
+            let mut w = Self::evaluate(&scope, &k, &o);
+            // Round 3, residual B-2: the backstop has no next
+            // batch to settle against — when the current fault
+            // view is unavailable (a post-drain re-read failed
+            // while this invocation was open), a dispatch fault
+            // may have landed mid-drain, invisible to the
+            // pre-drain snapshot. The retained evidence stays
+            // (counts, identities, TRUE-T); the verdict cannot
+            // be Complete — downgrade explicitly, never silently.
+            if o.fault_uncertain {
+                match &mut w.outcome {
+                    Outcome::Partial { reasons } => {
+                        reasons.push(PartialReason::FaultViewUncertain);
+                    }
+                    Outcome::Complete { .. } => {
+                        w.outcome = Outcome::Partial {
+                            reasons: vec![PartialReason::FaultViewUncertain],
+                        };
+                    }
+                    Outcome::Skipped { .. }
+                    | Outcome::Tainted { .. }
+                    | Outcome::Abandoned { .. } => {}
+                }
+            }
             self.push_done(w);
         }
     }
@@ -1134,6 +1178,11 @@ impl Oracle {
         for o in self.open.values_mut() {
             o.ring_loss_accum = o.ring_loss_accum.saturating_add(ring_delta);
             o.trunc_accum |= b.trunc.get(&o.call.op).copied().unwrap_or(0);
+            // Round 3, residual B-2: an unavailable current fault
+            // view marks every open spanning this drain (sticky —
+            // the terminal backstop treats marked invocations as
+            // uncertain, never silently Complete).
+            o.fault_uncertain |= b.fault_view_uncertain;
         }
         // Window-loss input: opens present after the joins absorb
         // the deltas above; with no opens the loss is window-level.
@@ -1274,6 +1323,7 @@ impl Oracle {
                 tainted_by: None,
                 arrs: BTreeSet::new(),
                 gen_mixed: false,
+                fault_uncertain: false,
             },
         );
         // R35 quiescence: this admitted take marks every same-tid
