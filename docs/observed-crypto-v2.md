@@ -394,8 +394,10 @@ per-alias). Offsets are decimal file offsets, explicitly labeled;
 numeric offsets and addresses never render `0x`-shaped
 (`output_contract` scans for address-shaped bytes). That
 guarantee covers numeric formatting only: arbitrary
-`--image-digest` text is accepted verbatim and rendered as-is,
-so operator-supplied text may contain `0x`.
+`--image-digest` text passes through control neutralization
+(`safe_display` maps control/display-control characters to `?`)
+but is otherwise preserved byte-for-byte, so operator-supplied
+text may contain `0x`.
 
 The three context lines after the header always render
 (`src/report.rs` `render_human`): `duration` derives from the
