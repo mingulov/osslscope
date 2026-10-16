@@ -1261,12 +1261,14 @@ fn check_records(
     }
     // Policy verdict is the AND of its rules: any violation rules
     // the verdict a violation, else any inconclusive rules it
-    // inconclusive, else pass. `no-verdict` rides evidence-free
-    // documents only (non-Runtime fatal kinds); usable documents —
-    // including salvaged Runtime-fatal ones — carry the combined
-    // verdict. This mirrors `CaptureDocument::has_usable_evidence`
-    // (the JSON shape cannot call the helper, so the kind check is
-    // restated here and must stay in sync with it).
+    // inconclusive, else pass. `no-verdict` rides documents
+    // without usable evidence only (Recycled/Environment fatals,
+    // and AttachZero fatals without proved ENGINE evidence);
+    // usable documents — including salvaged Runtime-fatal and
+    // proved-ENGINE AttachZero ones — carry the combined verdict.
+    // This mirrors `CaptureDocument::has_usable_evidence` (the
+    // JSON shape cannot call the helper, so the kind + ENGINE
+    // checks are restated here and must stay in sync with it).
     if let Some(policy) = root.get("policy") {
         let policy_obj = policy
             .as_object()
@@ -1297,18 +1299,25 @@ fn check_records(
         };
         // Fatal-kind usability restated over the validated JSON
         // shape (fatal kinds were validated above, so this lookup
-        // cannot meet a malformed kind here).
+        // cannot meet a malformed kind here): Runtime, plus
+        // AttachZero carrying proved ENGINE evidence (any
+        // in-window observation with calls > 0 — the P2 plane the
+        // attach-zero classification cannot suppress). Recycled
+        // and Environment are never usable (the kind disclaims
+        // carried observations).
+        let fatal_kind = root["completeness"]
+            .get("fatal_kind")
+            .and_then(|v| v.as_object())
+            .and_then(|o| o.get("kind"))
+            .and_then(|v| v.as_str());
         let usable = status != "FATAL"
-            || root["completeness"]
-                .get("fatal_kind")
-                .and_then(|v| v.as_object())
-                .and_then(|o| o.get("kind"))
-                .and_then(|v| v.as_str())
-                == Some("runtime");
+            || fatal_kind == Some("runtime")
+            || (fatal_kind == Some("attach-zero") && json_has_proved_engine_evidence(root));
         if !usable {
             if verdict != "no-verdict" {
                 return Err(
-                    "doc.policy: evidence-free FATAL documents carry no-verdict".to_string()
+                    "doc.policy: FATAL documents without usable evidence carry no-verdict"
+                        .to_string(),
                 );
             }
         } else if verdict == "no-verdict" {
@@ -1320,6 +1329,23 @@ fn check_records(
         }
     }
     Ok(())
+}
+
+/// Proved ENGINE evidence restated over the validated JSON shape
+/// (mirrors `CaptureDocument::has_proved_engine_evidence` — must
+/// stay in sync): any `engine_observations` entry with calls > 0
+/// and window `in-window`. Defensive over shape (a missing or
+/// non-array field reads as no evidence — structural validation
+/// rejects malformed shapes separately).
+fn json_has_proved_engine_evidence(root: &serde_json::Map<String, serde_json::Value>) -> bool {
+    root.get("engine_observations")
+        .and_then(|v| v.as_array())
+        .is_some_and(|items| {
+            items.iter().any(|o| {
+                o.get("calls").and_then(|v| v.as_u64()).unwrap_or(0) > 0
+                    && o.get("window").and_then(|v| v.as_str()) == Some("in-window")
+            })
+        })
 }
 
 /// COMPLETE/underlying-field reconciliation (F-B/Bm1): a COMPLETE

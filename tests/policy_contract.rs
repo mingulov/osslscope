@@ -1181,6 +1181,241 @@ fn attach_zero_with_proved_engine_evidence_reports_violation() {
     assert_eq!(exit_for(vb.overall(), None, &bare, &ok_delivery()), 4);
 }
 
+/// P2 AttachZero+ENGINE fixture (shared by the round-2 artifact
+/// battery): 7 proved in-window ENGINE_init executions on an
+/// otherwise evidence-free AttachZero document.
+fn attach_zero_engine_doc() -> CaptureDocument {
+    let obs = EngineObservation {
+        key: SiteKey {
+            object: obj("exe-fingerprint"),
+            device: 7,
+            inode: 9,
+            offset: 0x100,
+        },
+        generation: 1,
+        entrypoint: engine_index("ENGINE_init").expect("frozen registry"),
+        calls: 7,
+        window: EngineWindow::InWindow,
+    };
+    finalize(FinalizeInput {
+        window: exact_window(),
+        sites: Vec::new(),
+        fenced: Vec::new(),
+        objects: vec![ObjectRecord {
+            id: obj("exe-fingerprint"),
+            device: 7,
+            inode: 9,
+            display_locator: "/usr/bin/workload".to_string(),
+        }],
+        coverage: Vec::new(),
+        counters: Vec::new(),
+        fatal: Some(FatalKind::AttachZero),
+        target: TargetRecord::unknown(),
+        openssl: OpensslVersion::unknown(),
+        disposition: None,
+        policy: None,
+        legacy_partition: LegacyCallPartition::default(),
+        engine_observations: vec![obs],
+        traversal: None,
+    })
+}
+
+/// Round 2, residual A (P2 artifact validity): the evaluated
+/// AttachZero+ENGINE policy artifact must VALIDATE under the
+/// shipped auditor (structural + semantic) — evaluation/exit pins
+/// alone shipped an artifact the auditor rejects
+/// (`FATAL documents without usable evidence carry no-verdict`).
+#[test]
+fn p2_attach_zero_engine_artifact_validates() {
+    let mut doc = attach_zero_engine_doc();
+    let v = evaluate_document(std::slice::from_ref(&PolicyRule::deny_engine()), &doc);
+    assert!(!v.no_verdict, "proved ENGINE evidence defeats no-verdict");
+    doc.policy = Some(policy_record(&v));
+    let bytes = osslscope::report::render_json(&doc).unwrap();
+    let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(val["policy"]["verdict"], "violation");
+    osslscope::schema::validate_v2(&val).unwrap();
+    osslscope::schema::check_v2_semantics(&val).unwrap();
+    assert_eq!(exit_for(v.overall(), Some(0), &doc, &ok_delivery()), 10);
+}
+
+/// Round 2, residual A (wording honesty): human and CBOM output
+/// must not claim "no usable evidence" for a fatal document
+/// carrying proved ENGINE evidence; the bare-AttachZero control
+/// keeps the wording (it is true there).
+#[test]
+fn p2_engine_fatal_renders_honest_wording() {
+    let mut doc = attach_zero_engine_doc();
+    let v = evaluate_document(std::slice::from_ref(&PolicyRule::deny_engine()), &doc);
+    doc.policy = Some(policy_record(&v));
+    let human = osslscope::report::render_human(&doc);
+    assert!(
+        !human.contains("no usable evidence"),
+        "ENGINE evidence is usable evidence:\n{human}"
+    );
+    assert!(
+        human.contains("engine evidence retained"),
+        "attach-zero line must name the retained plane:\n{human}"
+    );
+    let cbom = osslscope::report::render_cbom(&doc).unwrap();
+    let cbom: serde_json::Value = serde_json::from_slice(&cbom).unwrap();
+    let disclaimer = cbom["metadata"]["properties"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "osslscope:completeness-disclaimer")
+        .unwrap()["value"]
+        .as_str()
+        .unwrap();
+    assert!(
+        !disclaimer.contains("no usable evidence"),
+        "CBOM must not disclaim retained ENGINE evidence: {disclaimer}"
+    );
+    assert!(
+        disclaimer.contains("attach-zero"),
+        "CBOM disclaimer must name the fatal kind, not runtime: {disclaimer}"
+    );
+    // Control: bare AttachZero keeps the refusal wording.
+    let bare = finalize(FinalizeInput {
+        window: exact_window(),
+        sites: Vec::new(),
+        fenced: Vec::new(),
+        objects: Vec::new(),
+        coverage: Vec::new(),
+        counters: Vec::new(),
+        fatal: Some(FatalKind::AttachZero),
+        target: TargetRecord::unknown(),
+        openssl: OpensslVersion::unknown(),
+        disposition: None,
+        policy: None,
+        legacy_partition: LegacyCallPartition::default(),
+        engine_observations: Vec::new(),
+        traversal: None,
+    });
+    let human = osslscope::report::render_human(&bare);
+    assert!(
+        human.contains("no usable evidence"),
+        "bare attach-zero is honestly evidence-free:\n{human}"
+    );
+}
+
+/// Round 2, residual A (broader-evaluation pin, justified): proved
+/// ENGINE evidence enables evaluation of EVERY rule (not solely
+/// deny-engine) — the no-verdict gate's purpose ("never a
+/// violation without evidence") is preserved because violations
+/// still require definite evidence: undecidable rules go
+/// inconclusive over the empty site planes, never violation, and
+/// the combined verdict validates. This matches the accepted
+/// Runtime-fatal precedent (salvaged docs evaluate all rules).
+#[test]
+fn p2_non_engine_rules_evaluate_without_fabrication() {
+    let mut doc = attach_zero_engine_doc();
+    let rules = [
+        PolicyRule::deny_engine(),
+        PolicyRule::deny_weak(),
+        PolicyRule::require_executed("SHA2-256"),
+    ];
+    let v = evaluate_document(&rules, &doc);
+    assert!(!v.no_verdict);
+    assert_eq!(v.rules.len(), 3, "every rule evaluates: {v:?}");
+    assert_eq!(v.rules[0].verdict, RuleVerdict::Violation);
+    assert_eq!(
+        v.rules[1].verdict,
+        RuleVerdict::Inconclusive,
+        "empty sites + incomplete coverage cannot pass or violate: {v:?}"
+    );
+    assert_eq!(
+        v.rules[2].verdict,
+        RuleVerdict::Inconclusive,
+        "unproven requirement is inconclusive, never fabricated: {v:?}"
+    );
+    assert_eq!(v.overall(), PolicyOutcome::Violation);
+    doc.policy = Some(policy_record(&v));
+    let bytes = osslscope::report::render_json(&doc).unwrap();
+    let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    osslscope::schema::validate_v2(&val).unwrap();
+    osslscope::schema::check_v2_semantics(&val).unwrap();
+}
+
+/// Round 2, residual A (kind narrowing): Recycled and Environment
+/// fatals NEVER evaluate — their observations are discarded
+/// (recycled: wrong-process taint; environment: setup observed
+/// nothing), so carried ENGINE observations contradict the kind
+/// and fail closed to no-verdict. Only AttachZero (independent
+/// ENGINE plane) and Runtime (salvaged sites) evaluate.
+#[test]
+fn p2_recycled_and_environment_never_evaluate() {
+    for kind in [
+        FatalKind::Recycled,
+        FatalKind::Environment("setup blew up".to_string()),
+    ] {
+        let obs = EngineObservation {
+            key: SiteKey {
+                object: obj("exe-fingerprint"),
+                device: 7,
+                inode: 9,
+                offset: 0x100,
+            },
+            generation: 1,
+            entrypoint: engine_index("ENGINE_init").expect("frozen registry"),
+            calls: 7,
+            window: EngineWindow::InWindow,
+        };
+        let doc = finalize(FinalizeInput {
+            window: exact_window(),
+            sites: Vec::new(),
+            fenced: Vec::new(),
+            objects: vec![ObjectRecord {
+                id: obj("exe-fingerprint"),
+                device: 7,
+                inode: 9,
+                display_locator: "/usr/bin/workload".to_string(),
+            }],
+            coverage: Vec::new(),
+            counters: Vec::new(),
+            fatal: Some(kind.clone()),
+            target: TargetRecord::unknown(),
+            openssl: OpensslVersion::unknown(),
+            disposition: None,
+            policy: None,
+            legacy_partition: LegacyCallPartition::default(),
+            engine_observations: vec![obs],
+            traversal: None,
+        });
+        let v = evaluate_document(std::slice::from_ref(&PolicyRule::deny_engine()), &doc);
+        assert_eq!(
+            v.overall(),
+            PolicyOutcome::NoVerdict,
+            "{kind:?} disclaims its observations and must not evaluate"
+        );
+        assert_eq!(exit_for(v.overall(), None, &doc, &ok_delivery()), 4);
+        // And the validator agrees: an evaluated policy on such a
+        // document is rejected (the producer can never emit it).
+        let mut bad = doc;
+        bad.policy = Some(policy_record(&evaluate_document(
+            std::slice::from_ref(&PolicyRule::deny_engine()),
+            &attach_zero_engine_doc(),
+        )));
+        let bytes = osslscope::report::render_json(&bad).unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let err = osslscope::schema::check_v2_semantics(&val)
+            .expect_err("evaluated policy on disclaimed evidence must fail");
+        assert!(err.contains("no-verdict"), "unexpected: {err}");
+    }
+}
+
+/// Round 2, residual A: an AttachZero+ENGINE document evaluated
+/// without violation (non-engine rules only) is a usable-evidence
+/// fatal — exit 1 (tool failure below a proved violation, above
+/// setup-no-verdict), never exit 4.
+#[test]
+fn p2_engine_fatal_inconclusive_exits_above_no_verdict() {
+    let doc = attach_zero_engine_doc();
+    let v = evaluate_document(std::slice::from_ref(&PolicyRule::deny_weak()), &doc);
+    assert_eq!(v.overall(), PolicyOutcome::Inconclusive);
+    assert_eq!(exit_for(v.overall(), None, &doc, &ok_delivery()), 1);
+}
+
 #[test]
 fn fatal_capture_has_no_verdict() {
     let fatal = doc(

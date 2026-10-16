@@ -887,17 +887,39 @@ impl CaptureDocument {
         })
     }
 
+    /// Proved in-window ENGINE executions (P2): typed tripwire
+    /// observations the attach-zero/fetch planes cannot suppress —
+    /// an AttachZero-classified document carrying these still
+    /// proves a violation (the classification describes provider
+    /// attachment, not the independent ENGINE evidence plane).
+    pub fn has_proved_engine_evidence(&self) -> bool {
+        self.engine_observations
+            .iter()
+            .any(|o| o.calls > 0 && o.window == EngineWindow::InWindow)
+    }
+
     /// Fatal-kind usability: salvaged Runtime-fatal documents retain
     /// their observed sites for policy evaluation, semantic validation
-    /// and CBOM export; every other fatal kind discarded every
-    /// observation. Non-fatal documents are usable. This gates
-    /// eligibility only — per-site certainty/coverage tests still decide
-    /// definite vs possible use, so a usable Runtime site is not
-    /// automatically definite.
+    /// and CBOM export; AttachZero documents carrying proved ENGINE
+    /// evidence retain that independent plane (P2 — the attach-zero
+    /// classification describes provider attachment, never the
+    /// tripwire plane). Recycled and Environment fatals are never
+    /// usable (recycled observations are wrong-process-tainted and
+    /// discarded by construction; setup observed nothing), even if
+    /// observations are carried — the kind disclaims them.
+    /// Non-fatal documents are usable. This gates eligibility only —
+    /// per-site certainty/coverage tests still decide definite vs
+    /// possible use, so a usable Runtime site is not automatically
+    /// definite. This is the single source of truth for the
+    /// policy no-verdict gate AND the report/CBOM wording AND the
+    /// schema's JSON restatement (which must stay in sync).
     pub fn has_usable_evidence(&self) -> bool {
         match &self.status {
             Completeness::Complete | Completeness::Partial { .. } => true,
-            Completeness::Fatal { kind, .. } => matches!(kind, FatalKind::Runtime(_)),
+            Completeness::Fatal { kind, .. } => {
+                matches!(kind, FatalKind::Runtime(_))
+                    || (matches!(kind, FatalKind::AttachZero) && self.has_proved_engine_evidence())
+            }
         }
     }
 

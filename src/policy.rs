@@ -9,7 +9,7 @@
 //! definite/possible bounds; there is no boolean-first-alias shortcut.
 
 use crate::evidence::{
-    CandidateCoverage, CandidateIdentity, CaptureDocument, Completeness, EngineWindow, FatalKind,
+    CandidateCoverage, CandidateIdentity, CaptureDocument, Completeness, EngineWindow,
     GapReason, MatchBounds, PredicateMatch, RuleVerdict, SiteExecution, SiteKey, match_bounds,
 };
 
@@ -565,33 +565,23 @@ pub fn engine_match_bounds(doc: &CaptureDocument) -> MatchBounds {
 
 /// Evaluate every rule over a finalized document (current plus fenced
 /// sites, conserved — no site counted twice; engine-area rules also
-/// evaluate the typed ENGINE observation plane, R05). Evidence-free
-/// fatal documents yield no verdict and no per-rule results: never a
-/// violation without evidence. Salvaged (runtime-fatal) documents
-/// carry real observed sites, so they evaluate like any doc — a
-/// proved violation still exits 10 (H7-T3).
-/// Proved in-window ENGINE executions (P2): typed tripwire
-/// observations the attach-zero/fetch planes cannot suppress — an
-/// AttachZero-classified document carrying these still proves a
-/// violation (the classification describes provider attachment,
-/// not the independent ENGINE evidence plane).
-fn has_proved_engine_evidence(doc: &CaptureDocument) -> bool {
-    doc.engine_observations
-        .iter()
-        .any(|o| o.calls > 0 && o.window == EngineWindow::InWindow)
-}
-
+/// evaluate the typed ENGINE observation plane, R05). Documents
+/// without usable evidence yield no verdict and no per-rule results:
+/// never a violation without evidence. Salvaged (runtime-fatal)
+/// documents carry real observed sites, so they evaluate like any
+/// doc — a proved violation still exits 10 (H7-T3) — and so do
+/// AttachZero documents carrying proved in-window ENGINE evidence
+/// (P2 — the attach-zero classification describes provider
+/// attachment, not the independent tripwire plane). The gate is
+/// the shared usability predicate (no restatement drift), and it
+/// enables EVERY rule on a usable fatal — never solely deny-engine:
+/// violations still require definite evidence (empty site planes
+/// with incomplete coverage evaluate inconclusive, never
+/// violation or pass), so undecidable rules report unknown
+/// instead of fabricating — the same all-rules precedent
+/// salvaged Runtime documents already set.
 pub fn evaluate_document(rules: &[PolicyRule], doc: &CaptureDocument) -> PolicyVerdict {
-    if matches!(doc.status, Completeness::Fatal { .. })
-        && !matches!(
-            doc.status,
-            Completeness::Fatal {
-                kind: FatalKind::Runtime(_),
-                ..
-            }
-        )
-        && !has_proved_engine_evidence(doc)
-    {
+    if matches!(doc.status, Completeness::Fatal { .. }) && !doc.has_usable_evidence() {
         return PolicyVerdict {
             no_verdict: true,
             rules: Vec::new(),
