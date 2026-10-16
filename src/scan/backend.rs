@@ -613,9 +613,17 @@ impl ScanBackend {
         // reattach, no storm-detach), so the gate set here stays
         // engaged past the close.
         self.finishing = true;
-        if !self.storm_detached {
-            self.set_skip_all(true)?;
-        }
+        // R35 (round 2): a finish-entry CTRL-write failure must not
+        // bypass the backstop (stranded opens that will never
+        // close) — the settle poll + backstop run regardless, and
+        // the earliest failure propagates only after salvage is
+        // secured (takes below on success; the caller's salvage
+        // take on error — same contract as the settle-poll path).
+        let ctrl_result = if !self.storm_detached {
+            self.set_skip_all(true)
+        } else {
+            Ok(())
+        };
         // R35/I2: the backstop runs even when the settle poll fails
         // (opens close + partner corrections generate — the
         // caller's salvage takes them via take_completed /
@@ -635,6 +643,9 @@ impl ScanBackend {
             .clock_base_ns
             .saturating_add(Instant::now().duration_since(self.epoch_start).as_nanos() as u64);
         self.oracle.finish(now_ns);
+        // Earliest failure first (the CTRL write precedes the
+        // poll), only after the backstop above secured salvage.
+        ctrl_result?;
         let mut delta = poll_result?;
         let (done, findings) = self.take_completed();
         self.done_total += done.len() as u64;
@@ -760,21 +771,42 @@ impl ScanBackend {
             let (birth, ctr) = wire::split_seq(v);
             b.seq.insert(tid, (birth, ctr));
         }
-        let loss_rows = read_percpu_all(&self.loaded.maps, "LOSS", false)?;
-        let (loss_deltas, loss_high) = fold_loss_deltas(&self.last_loss, &loss_rows);
-        b.loss = loss_deltas;
+        let mut loss_rows = read_percpu_all(&self.loaded.maps, "LOSS", false)?;
         // TRUNC is sticky bits (OR-fold) plus the per-op
         // flag-event generation: fresh bits report, repeats
         // re-report on generation advance, quiet re-drains
         // report nothing — and nothing is ever cleared, so no
         // concurrent flag can be erased in any producer order.
         // Snapshots read here; consumption defers past the drain.
-        let (trunc_snap, trunc_seq) = snapshot_trunc(&self.loaded.maps)?;
+        let (mut trunc_snap, mut trunc_seq) = snapshot_trunc(&self.loaded.maps)?;
         while let Some(item) = self.ring.next() {
             let bytes = item.to_vec();
             decode_ring_record(&bytes, &mut b)?;
         }
         debug_assert!(b.order_sound(), "drain preserves ring order");
+        // R35 stale-snapshot race (round 2): best-effort post-drain
+        // re-sample of the fault planes, unioned into the pre-drain
+        // reads — a flag write or loss bump landing mid-drain
+        // (after the pre-drain snapshot the R35 reorder requires
+        // before the destructive drain) joins THIS batch instead
+        // of leaking to the next drain while closes evaluate
+        // against the stale read. Best-effort by design: a failed
+        // re-read keeps the pre-drain read (the drain already
+        // succeeded — failing here would R35-drop drained items).
+        // RCOUNT/SEQ stay pre-drain (quiesced/idle-path and
+        // turnover-timing inputs — no verdict evaluates against
+        // them, so no stale-fault defect there). The oracle's
+        // quiet-batch rule covers the cross-CPU-visibility
+        // residual on the take path; the terminal backstop (no
+        // next batch exists at finish) relies on this union.
+        if let Ok(post_rows) = read_percpu_all(&self.loaded.maps, "LOSS", false) {
+            union_loss_rows(&mut loss_rows, post_rows);
+        }
+        if let Ok((post_snap, post_seq)) = snapshot_trunc(&self.loaded.maps) {
+            union_trunc_snap(&mut trunc_snap, &mut trunc_seq, post_snap, post_seq);
+        }
+        let (loss_deltas, loss_high) = fold_loss_deltas(&self.last_loss, &loss_rows);
+        b.loss = loss_deltas;
         for (id, total) in loss_high {
             self.last_loss.insert(id, total);
         }
@@ -1054,6 +1086,42 @@ fn fold_loss_deltas(
         }
     }
     (deltas, high)
+}
+
+/// Union a post-drain TRUNC snapshot into the pre-drain one (R35
+/// stale-snapshot race, pure/host-testable): sticky bits never
+/// clear and the per-op flag-event generation never rolls back,
+/// so the union (bit-OR, generation max) observes every flag
+/// write visible at EITHER read — a flag landing mid-drain joins
+/// this batch, never leaks past a close evaluated against the
+/// stale pre-drain read.
+fn union_trunc_snap(
+    snap: &mut BTreeMap<u32, u64>,
+    seq: &mut BTreeMap<u32, u64>,
+    post_snap: BTreeMap<u32, u64>,
+    post_seq: BTreeMap<u32, u64>,
+) {
+    for (op, bits) in post_snap {
+        *snap.entry(op).or_insert(0) |= bits;
+    }
+    for (op, post_gen) in post_seq {
+        let slot = seq.entry(op).or_insert(0);
+        *slot = (*slot).max(post_gen);
+    }
+}
+
+/// Union a post-drain LOSS row-set into the pre-drain one (R35,
+/// pure/host-testable): percpu LOSS cells are monotonic totals,
+/// so the union is the per-id max — a loss bump landing
+/// mid-drain folds into this batch's deltas instead of leaking
+/// past a close. Small-n linear scan (LOSS ids are dozens).
+fn union_loss_rows(rows: &mut Vec<(u32, u64)>, post_rows: Vec<(u32, u64)>) {
+    for (id, total) in post_rows {
+        match rows.iter_mut().find(|(i, _)| *i == id) {
+            Some(slot) => slot.1 = slot.1.max(total),
+            None => rows.push((id, total)),
+        }
+    }
 }
 
 /// Pure TRUNC snapshot reads (R35): the sticky flag bits plus the
@@ -1800,5 +1868,65 @@ mod tests {
             cached: true,
         };
         assert_eq!(healing_action(&w), None);
+    }
+
+    /// R35 race: the post-drain TRUNC re-sample unions into the
+    /// pre-drain read (sticky bit-OR + generation max) — a flag
+    /// landing mid-drain (empty pre, set post) joins this batch;
+    /// disjoint ops merge; the generation takes the fresher read;
+    /// a bit seen pre-drain but (impossibly) missing post-drain
+    /// survives (OR, never intersection).
+    #[test]
+    fn union_trunc_snap_merges_mid_drain_flags() {
+        use std::collections::BTreeMap;
+        let snap = |rows: &[(u32, u64)]| -> BTreeMap<u32, u64> { rows.iter().copied().collect() };
+        // Mid-drain flag: pre empty, post set.
+        let mut s = snap(&[]);
+        let mut g = snap(&[]);
+        union_trunc_snap(&mut s, &mut g, snap(&[(7, 0b100)]), snap(&[(7, 1)]));
+        assert_eq!(s.get(&7), Some(&0b100));
+        assert_eq!(g.get(&7), Some(&1));
+        // Disjoint ops merge; overlapping bits OR; gen takes max.
+        let mut s = snap(&[(7, 0b001)]);
+        let mut g = snap(&[(7, 2)]);
+        union_trunc_snap(
+            &mut s,
+            &mut g,
+            snap(&[(7, 0b100), (9, 0b010)]),
+            snap(&[(7, 3)]),
+        );
+        assert_eq!(s.get(&7), Some(&0b101));
+        assert_eq!(s.get(&9), Some(&0b010));
+        assert_eq!(g.get(&7), Some(&3));
+        // Op 9 has flag bits but no generation in either read — no
+        // seq entry (accumulate_trunc reads missing seq as 0, as
+        // before; the union invents no generations).
+        assert_eq!(g.get(&9), None);
+        // Post-drain can never erase the pre-drain read.
+        let mut s = snap(&[(7, 0b111)]);
+        let mut g = snap(&[(7, 5)]);
+        union_trunc_snap(&mut s, &mut g, snap(&[]), snap(&[]));
+        assert_eq!(s.get(&7), Some(&0b111));
+        assert_eq!(g.get(&7), Some(&5));
+    }
+
+    /// R35 race: the post-drain LOSS re-read unions by per-id max
+    /// (monotonic totals) — a mid-drain bump joins this batch's
+    /// fold; new ids append; a post-drain dip keeps the pre-drain
+    /// high (the fold's dip-guard never sees it).
+    #[test]
+    fn union_loss_rows_takes_per_id_max() {
+        let mut rows = vec![(20u32, 5u64), (21, 9)];
+        union_loss_rows(&mut rows, vec![(20, 7), (25, 1)]);
+        assert_eq!(rows.iter().find(|(i, _)| *i == 20), Some(&(20, 7)));
+        assert_eq!(rows.iter().find(|(i, _)| *i == 21), Some(&(21, 9)));
+        assert_eq!(rows.iter().find(|(i, _)| *i == 25), Some(&(25, 1)));
+        // Dip keeps the high.
+        union_loss_rows(&mut rows, vec![(20, 2)]);
+        assert_eq!(rows.iter().find(|(i, _)| *i == 20), Some(&(20, 7)));
+        // The union folds into deltas against the high-water.
+        let last = std::collections::BTreeMap::from([(20u32, 5u64)]);
+        let (deltas, _) = fold_loss_deltas(&last, &rows);
+        assert_eq!(deltas.get(&20), Some(&2));
     }
 }

@@ -595,6 +595,17 @@ struct Open {
     /// batch; cross-batch order is batch order).
     batch: u64,
     pos: usize,
+    /// Sticky successor take (R35 quiescence): a later admitted
+    /// take arrived on this tid after this open (same batch/pos
+    /// rule as the take-close scan, recorded at ingest so a take
+    /// from an older batch is never forgotten).
+    succ_seen: bool,
+    /// Batch of the newest ring evidence joined (RET/ALG/ROW/
+    /// GUARD; the CALL's batch at open): take-closure waits for a
+    /// quiet batch past this one — the batch's fault snapshot
+    /// predates its ring drain, so an open with same-batch ring
+    /// may face stale faults.
+    last_ring_batch: u64,
     stalled: bool,
     /// First-seen batch time (hung-scan age baseline).
     first_seen_ns: u64,
@@ -1063,10 +1074,10 @@ impl Oracle {
             for (pos, p) in b.order.iter().enumerate() {
                 match *p {
                     BatchPos::Call(i) => self.ingest_call(&b.calls[i], batch, pos, b.now_ns),
-                    BatchPos::Ret(i) => self.ingest_ret(&b.rets[i]),
-                    BatchPos::Guard(i) => self.ingest_guard(&b.guards[i]),
-                    BatchPos::Alg(i) => self.ingest_alg(&b.algs[i]),
-                    BatchPos::Row(i) => self.ingest_row(&b.rows[i]),
+                    BatchPos::Ret(i) => self.ingest_ret(&b.rets[i], batch),
+                    BatchPos::Guard(i) => self.ingest_guard(&b.guards[i], batch),
+                    BatchPos::Alg(i) => self.ingest_alg(&b.algs[i], batch),
+                    BatchPos::Row(i) => self.ingest_row(&b.rows[i], batch),
                 }
             }
         } else {
@@ -1074,16 +1085,16 @@ impl Oracle {
                 self.ingest_call(c, batch, pos, b.now_ns);
             }
             for r in &b.rets {
-                self.ingest_ret(r);
+                self.ingest_ret(r, batch);
             }
             for g in &b.guards {
-                self.ingest_guard(g);
+                self.ingest_guard(g, batch);
             }
             for a in &b.algs {
-                self.ingest_alg(a);
+                self.ingest_alg(a, batch);
             }
             for r in &b.rows {
-                self.ingest_row(r);
+                self.ingest_row(r, batch);
             }
         }
 
@@ -1239,6 +1250,8 @@ impl Oracle {
                 row_events: Vec::new(),
                 batch,
                 pos,
+                succ_seen: false,
+                last_ring_batch: batch,
                 stalled: false,
                 first_seen_ns: now_ns,
                 trunc_accum: 0,
@@ -1249,13 +1262,22 @@ impl Oracle {
                 gen_mixed: false,
             },
         );
+        // R35 quiescence: this admitted take marks every same-tid
+        // predecessor (sticky successor — the close scan consumes
+        // it; the batch/pos rule matches that scan exactly, and
+        // the just-inserted self is excluded by seq).
+        for ((t, s), o) in self.open.iter_mut() {
+            if *t == c.tid && *s != c.seq && (o.batch != batch || pos > o.pos) {
+                o.succ_seen = true;
+            }
+        }
     }
 
     /// Ingest one RET: joins by key (double joins are findings);
     /// unknown keys are orphans — except a RET for a
     /// hung-abandoned invocation, which joins as LATE (coverage
     /// noted, verdict standing).
-    fn ingest_ret(&mut self, r: &wire::ScanRetEvent) {
+    fn ingest_ret(&mut self, r: &wire::ScanRetEvent, batch: u64) {
         match self.open.get_mut(&(r.tid, r.seq)) {
             Some(o) if o.ret.is_none() => {
                 // ALG-before-RET direction of the generation check.
@@ -1263,6 +1285,7 @@ impl Oracle {
                     o.gen_mixed = true;
                 }
                 o.ret = Some(*r);
+                o.last_ring_batch = batch;
             }
             Some(_) => self.findings.push(Finding::DoubleRet {
                 tid: r.tid,
@@ -1290,9 +1313,12 @@ impl Oracle {
 
     /// Ingest one GUARD: joins by key, kept-first (a second guard
     /// for one key is a finding, never an overwrite).
-    fn ingest_guard(&mut self, g: &wire::GuardEvent) {
+    fn ingest_guard(&mut self, g: &wire::GuardEvent, batch: u64) {
         match self.open.get_mut(&(g.tid, g.seq)) {
-            Some(o) if o.guard.is_none() => o.guard = Some(*g),
+            Some(o) if o.guard.is_none() => {
+                o.guard = Some(*g);
+                o.last_ring_batch = batch;
+            }
             Some(_) => self.findings.push(Finding::DoubleGuard {
                 tid: g.tid,
                 seq: g.seq,
@@ -1312,7 +1338,7 @@ impl Oracle {
     /// slots), enforcing the nesting rule-set inline —
     /// multi-array and duplicate-slot evidence taints both
     /// invocations with the slots kept.
-    fn ingest_alg(&mut self, a: &wire::ScanAlgEvent) {
+    fn ingest_alg(&mut self, a: &wire::ScanAlgEvent, batch: u64) {
         let key = (a.tid, a.seq);
         let Some(o) = self.open.get_mut(&key) else {
             match self.late_scope(a.tid, a.seq) {
@@ -1367,6 +1393,7 @@ impl Oracle {
             }
         }
         o.algs.insert(a.idx, *a);
+        o.last_ring_batch = batch;
         if multi && self.open.get(&key).and_then(|o| o.tainted_by).is_none() {
             self.fire_nesting(a.tid, a.seq);
         }
@@ -1376,12 +1403,13 @@ impl Oracle {
     /// callback data — consistency with the slot verdict and
     /// the RET is checked at close; the record rides the
     /// WALK-DONE as the native callback evidence).
-    fn ingest_row(&mut self, r: &wire::ScanRowEvent) {
+    fn ingest_row(&mut self, r: &wire::ScanRowEvent, batch: u64) {
         match self.open.get_mut(&(r.tid, r.seq)) {
             Some(o) => {
                 o.rows += 1;
                 o.row_idxs.push(r.idx);
                 o.row_events.push(*r);
+                o.last_ring_batch = batch;
             }
             None => {
                 match self.late_scope(r.tid, r.seq) {
@@ -1656,9 +1684,15 @@ impl Oracle {
     }
 
     /// Closure (R6): for each open with a joined RET, a later
-    /// *admitted* take on the tid closes it (stalled opens abandon
-    /// instead — the detach-stall ambiguity); with no later
-    /// admitted take, quiesced cells decide (IDLE/missing ⟹
+    /// *admitted* take on the tid closes it — over SETTLED ring
+    /// evidence only (R35 quiescence: the batch's fault snapshot
+    /// predates its ring drain, so an open with same-batch ring
+    /// holds one quiet batch for the next drain's faults; the
+    /// successor mark is sticky, so older-batch takes still close
+    /// once the evidence settles). Stalled opens abandon on a
+    /// same-batch take instead, without waiting (abandonment
+    /// evaluates no evidence — the detach-stall ambiguity); with
+    /// no take at all, quiesced cells decide (IDLE/missing ⟹
     /// close, ACTIVE ⟹ stall); non-quiesced batches hold
     /// underdetermined invocations open. Later skips never block
     /// evaluation (cut-off members surface as holes).
@@ -1690,6 +1724,15 @@ impl Oracle {
             if o.ret.is_none() {
                 continue;
             }
+            // Take-path quiescence (R35): the sticky successor
+            // take closes a non-stalled open only over settled
+            // ring evidence — same-batch ring waits out one quiet
+            // batch (this batch's fault snapshot predates its
+            // drain, so the next drain's faults join first).
+            if !o.stalled && o.succ_seen && o.last_ring_batch < batch {
+                closable.push((*t, *s));
+                continue;
+            }
             let later_admitted = admitted
                 .iter()
                 .any(|(pos, c)| c.tid == *t && (o.batch != batch || *pos > o.pos) && c.seq != *s);
@@ -1715,11 +1758,13 @@ impl Oracle {
             }
             // A later admitted take closed the window on this
             // invocation: stalled opens abandon (the thread moved
-            // on without retiring — detach-stall resolved),
-            // others evaluate on retained evidence.
+            // on without retiring — detach-stall resolved —
+            // abandonment evaluates no evidence, so no quiet wait),
+            // others evaluate on retained evidence once it settles
+            // (same-batch ring holds for the next drain's faults).
             if o.stalled {
                 stalled_quiet.push((*t, *s));
-            } else {
+            } else if o.last_ring_batch < batch {
                 closable.push((*t, *s));
             }
         }
@@ -2337,7 +2382,8 @@ mod tests {
         assert_eq!(o.open_count(), 1);
         // Batch 2: nested admitted take with hint (recorded, not
         // tainting) + a duplicate slot under seq 0 (rule-hit ⟹
-        // both tainted, predecessor closes immediately).
+        // both tainted; R35 quiescence: the take marks, the quiet
+        // batch closes — the taint verdict is unchanged).
         let mut b2 = ScanBatch {
             quiesced: false,
             ..ScanBatch::default()
@@ -2347,6 +2393,10 @@ mod tests {
         b2.push_alg(alg(0, 0, wire::ALG_OK));
         b2.push_alg(alg(0, 0, wire::ALG_OK));
         o.ingest(&b2);
+        o.ingest(&ScanBatch {
+            quiesced: false,
+            ..ScanBatch::default()
+        });
         assert!(matches!(o.done[0].outcome, Outcome::Tainted { by_seq: 1 }));
         assert_eq!(o.done[0].op, UNKNOWN_OP);
         assert_eq!(o.done[0].alg_count, 1, "first record kept");
@@ -2551,6 +2601,13 @@ mod tests {
         // A second invocation stays open (no RET).
         b.push_call(call(4, false, wire::SKIP_ADMITTED));
         o.ingest(&b);
+        // R35 quiescence: the take marks, the quiet batch closes
+        // (verdict unchanged — Complete still lands here, before
+        // the abandon below).
+        o.ingest(&ScanBatch {
+            quiesced: false,
+            ..ScanBatch::default()
+        });
         assert_eq!(o.done.len(), 1);
         assert!(matches!(
             o.done[0].outcome,

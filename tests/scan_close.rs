@@ -74,8 +74,13 @@ fn fix1_finish_closes_trailing() {
     b.push_alg(alg(0, 1, wire::ALG_EMPTY));
     b.push_call(call(1, false, wire::SKIP_ADMITTED)); // no RET: dangling
     o.ingest(&b);
-    // The quiet successor already retired seq 0 (successor close);
-    // seq 1 trails with no RET.
+    // R35 quiescence: the successor take marks seq 0, the quiet
+    // batch retires it; seq 1 trails with no RET.
+    o.ingest(&ScanBatch {
+        quiesced: false,
+        now_ns: 1_500,
+        ..ScanBatch::default()
+    });
     assert_eq!(o.open_count(), 1);
     assert_eq!(o.done().len(), 1);
     o.finish(2_000);
