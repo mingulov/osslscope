@@ -2629,6 +2629,10 @@ const R20_LIBCRYPTO: &str = "/usr/lib/x86_64-linux-gnu/libcrypto.so.3";
 const R20_LIBCRYPTO_SHA256: &str =
     "5385f0436ac2e284ba8c5fb1488874057c29c04be72dea32add832694f381e28";
 
+/// Runner contract: the object env vars are required on the FIRST
+/// attempt — `OSSL_R20_LIVE=1` without them fails fast naming the
+/// missing var, before any side effect (pinned by
+/// `f1_runner_requires_object_env_on_first_attempt` below).
 fn r20_live_gated() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
     if std::env::var("OSSL_R20_LIVE").unwrap_or_default() != "1" {
         eprintln!("r20 F1: set OSSL_R20_LIVE=1 with built BPF objects; skipping");
@@ -2643,6 +2647,69 @@ fn r20_live_gated() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
     assert!(harvest.is_file(), "harvest object missing: {harvest:?}");
     assert!(count.is_file(), "count object missing: {count:?}");
     Some((harvest, count))
+}
+
+/// F1 runner contract (R21 §5 "F1 env obligations" — the R21
+/// runner's first F1 attempt lacked the object env vars, so the
+/// leg never ran): the runner MUST export the required object env
+/// vars on the FIRST attempt. `OSSL_R20_LIVE=1` without them fails
+/// fast naming the missing var — never a quiet skip, never a late
+/// failure past side effects. Host-runnable: drives the F1 leg in
+/// a subprocess with controlled env (parallel-safe — no
+/// in-process env mutation). T1-ACCEPT preserved: without the
+/// LIVE flag the leg still skips quietly.
+#[test]
+fn f1_runner_requires_object_env_on_first_attempt() {
+    fn run_f1(extra_env: &[(&str, &str)]) -> std::process::Output {
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.args([
+            "--exact",
+            "ordinary_production_run_counts_real_crypto_free_of_polling_fallback",
+            "--ignored",
+            "--nocapture",
+        ]);
+        // Hygiene: ambient lane env must not leak into cases.
+        cmd.env_remove("OSSL_R20_LIVE")
+            .env_remove("OSSL_R20_HARVEST_OBJECT")
+            .env_remove("OSSL_R20_COUNT_OBJECT");
+        for (k, v) in extra_env {
+            cmd.env(k, v);
+        }
+        cmd.output().expect("spawn F1 leg subprocess")
+    }
+    // (a) LIVE without objects: LOUD fail-fast naming the var.
+    let out = run_f1(&[("OSSL_R20_LIVE", "1")]);
+    assert!(
+        !out.status.success(),
+        "LIVE=1 without objects must fail, but the leg passed"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("OSSL_R20_HARVEST_OBJECT"),
+        "fail-fast must name the missing var: {err}"
+    );
+    // (b) LIVE with dangling paths: LOUD missing-file failure.
+    let out = run_f1(&[
+        ("OSSL_R20_LIVE", "1"),
+        ("OSSL_R20_HARVEST_OBJECT", "/nonexistent-harvest.o"),
+        ("OSSL_R20_COUNT_OBJECT", "/nonexistent-count.o"),
+    ]);
+    assert!(
+        !out.status.success(),
+        "LIVE=1 with dangling objects must fail, but the leg passed"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("missing"),
+        "dangling objects must fail missing: {err}"
+    );
+    // (c) No LIVE flag: quiet skip (T1-ACCEPT gate shape kept).
+    let out = run_f1(&[]);
+    assert!(
+        out.status.success(),
+        "unset LIVE must skip quietly: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 fn r20_sha256_hex(bytes: &[u8]) -> String {
