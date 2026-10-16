@@ -4551,7 +4551,6 @@ where
                 out_bytes = out_bytes.saturating_add(cached.file.bytes.len());
                 out.insert(p.clone(), cached.file.clone());
             }
-            }
         }
         self.relevance_capped = self.relevance_capped.saturating_add(dropped);
         self.prune_file_cache(live, &relevant);
