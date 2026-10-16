@@ -3020,6 +3020,69 @@ mod tests {
         assert!(m.message.contains("no install receipt"), "{}", m.message);
     }
 
+    #[test]
+    fn members_row_stale_file_blocks_pair_fallback() {
+        // S1: a stale members file on a pair-receipted prefix (the
+        // pre-fix reinstall state — triple prefix reinstalled
+        // pair-only without removing the leftover) blocks pair
+        // fallback with the mixed-set error (the unlisted file
+        // refuses, exactly like traversal would).
+        let Some((h, c, m)) = built_triple() else {
+            eprintln!("SKIP members_row_stale_file_blocks_pair_fallback: no built BPF triple");
+            return;
+        };
+        let prefix = trusted_fixture("members-stale");
+        let objdir = prefix.join("lib").join("osslscope");
+        std::fs::create_dir_all(&objdir).unwrap();
+        std::fs::copy(&h, objdir.join("osslscope-harvest")).unwrap();
+        std::fs::copy(&c, objdir.join("osslscope-count")).unwrap();
+        std::fs::copy(&m, objdir.join("osslscope-members")).unwrap();
+        write_prefix_receipt(
+            &prefix,
+            &objdir,
+            &["osslscope-harvest", "osslscope-count"],
+        );
+        let rows = objects_checks_in(None, None, None, &[objdir], &doctor_trust());
+        let m = members_row(&rows);
+        assert_eq!(m.status, Status::Fail, "{}", m.message);
+        assert!(
+            m.message.contains("not listed in install receipt"),
+            "{}",
+            m.message
+        );
+    }
+
+    #[test]
+    fn members_row_used_prefix_pair_after_stale_removal() {
+        // S1: the post-reinstall state (pair files + pair receipt,
+        // stale members file removed) resolves pair-only — INFO,
+        // never fail (old installs stay valid; traversal
+        // unavailable). Proves the installer's stale removal
+        // restores resolution.
+        let Some((h, c)) = built_triple().map(|(h, c, _)| (h, c)) else {
+            eprintln!("SKIP members_row_used_prefix_pair_after_stale_removal: no built BPF triple");
+            return;
+        };
+        let prefix = trusted_fixture("members-used-pair");
+        let objdir = prefix.join("lib").join("osslscope");
+        std::fs::create_dir_all(&objdir).unwrap();
+        std::fs::copy(&h, objdir.join("osslscope-harvest")).unwrap();
+        std::fs::copy(&c, objdir.join("osslscope-count")).unwrap();
+        write_prefix_receipt(
+            &prefix,
+            &objdir,
+            &["osslscope-harvest", "osslscope-count"],
+        );
+        let rows = objects_checks_in(None, None, None, &[objdir], &doctor_trust());
+        let m = members_row(&rows);
+        assert_eq!(m.status, Status::Info, "{}", m.message);
+        assert!(m.message.contains("not installed"), "{}", m.message);
+        for id in ["objects-harvest", "objects-count"] {
+            let row = rows.iter().find(|c| c.id == id).expect("pair row");
+            assert_eq!(row.status, Status::Pass, "{}", row.message);
+        }
+    }
+
     fn write_prefix_receipt(prefix: &Path, objdir: &Path, names: &[&str]) {
         let rdir = prefix.join("share").join("osslscope");
         std::fs::create_dir_all(&rdir).unwrap();
