@@ -928,6 +928,29 @@ mod tests {
     }
 
     #[test]
+    fn complete_nonbuiltin_omits_counts_despite_queries() {
+        // R21 finding 6 (the c1 trap): `counts = builtin ||
+        // partial`, so a clean non-builtin COMPLETE omits
+        // `queries_observed` even with nonzero queries — legs
+        // must read the in-memory totals, never the doc field.
+        let stats = Stats {
+            queries_observed: 4,
+            ..Stats::trivial()
+        };
+        let rows: Vec<Row> = sample_rows()
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut r)| {
+                r.impl_addr = backed_addr(i as u64);
+                r
+            })
+            .collect();
+        let doc = emit_backed(&rows, &stats);
+        assert!(doc.get("status").is_none());
+        assert!(doc.get("queries_observed").is_none());
+    }
+
+    #[test]
     fn shared_code_row_relocates_to_containing_file() {
         // Legacy re-exports libcrypto implementations: rows outside the
         // provider file relocate against their containing mapping.

@@ -261,7 +261,12 @@ fn c1_two_slots_per_query() {
         force_offset: None,
         observed_from_birth: false,
     };
-    let doc = osslscope::discovery::harvest::run(&cfg).expect("harvest run");
+    // Query volume from the exact in-memory totals, not the doc
+    // field (R21 finding 6 — same trap c_chain_scale::run_leg
+    // documents: a clean COMPLETE doc omits `queries_observed`).
+    let (doc, totals) =
+        osslscope::discovery::harvest::run_detailed(&cfg, &|| Ok(()), &|| false)
+            .expect("harvest run");
     let _ = child.kill();
     let _ = child.wait();
     let vlog_text = std::fs::read_to_string(&vlog).unwrap_or_default();
@@ -278,7 +283,7 @@ fn c1_two_slots_per_query() {
     );
     let rows = doc["rows"].as_array().cloned().unwrap_or_default();
     let dispatch_rows = rows.iter().filter(|r| r["funcid"] != 0).count();
-    let queries = doc["queries_observed"].as_u64().unwrap_or(0) as usize;
+    let queries = totals.queries_observed as usize;
     assert!(
         queries >= 2,
         "too few queries observed for a ratio ({}), flaky attach?",
@@ -334,4 +339,25 @@ fn c1_frozen_shape_has_chain_support() {
         .find(|p| p.name == "c0")
         .expect("HARVEST_PROGS carries c0");
     assert_eq!(callee.section, "uretprobe");
+}
+
+/// R21 finding 6: the c1 leg must read query volume from the
+/// exact in-memory totals (`run_detailed`), never the doc field
+/// — `schema::emit` reports `queries_observed` only when
+/// `builtin || partial`, so a clean COMPLETE doc omits it and a
+/// leg reading the field goes 0 (live FAIL). Host-runnable
+/// self-scan: this file must not index the doc for it.
+#[test]
+fn c1_leg_reads_in_memory_totals_not_the_doc_field() {
+    let src = std::fs::read_to_string(file!()).unwrap();
+    // (Built piecewise so this scan's own source never trips it.)
+    let doc_field = ["doc[", "\"queries_observed\"]"].concat();
+    assert!(
+        !src.contains(&doc_field),
+        "c1 leg reads the conditionally-omitted doc field (R21 finding 6)"
+    );
+    assert!(
+        src.contains("run_detailed") && src.contains("totals.queries_observed"),
+        "c1 leg must use run_detailed in-memory totals like c_chain_scale::run_leg"
+    );
 }
