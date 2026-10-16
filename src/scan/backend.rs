@@ -751,6 +751,17 @@ fn decode_ring_record(bytes: &[u8], b: &mut ScanBatch) -> anyhow::Result<()> {
         wire::KIND_SCAN_ALG => {
             let e = wire::parse_scan_alg_event(bytes)
                 .map_err(|e| anyhow::anyhow!("parse scan ALG: {e:?}"))?;
+            // K1: the parser leaves class range caller-checked
+            // (registry-sized, like the harvest path) — enforce it
+            // here (fail-closed: a mismatched set is the only
+            // source of an out-of-range class).
+            let class_count = crate::kinds::ALG_NAMES.len() as u16;
+            if e.class != wire::OTHER_CLASS && e.class >= class_count {
+                anyhow::bail!(
+                    "scan ALG class {} out of range (registry len {class_count})",
+                    e.class
+                );
+            }
             b.push_alg(e);
         }
         wire::KIND_SCAN_ROW => {
@@ -1138,6 +1149,42 @@ mod tests {
     fn decode_short_bails() {
         let mut b = ScanBatch::default();
         assert!(decode_ring_record(&[7u8, 0, 0], &mut b).is_err());
+    }
+
+    fn alg_bytes(class: u16, status: u8, idx: u64) -> Vec<u8> {
+        // ScanAlgEvent layout (56B): kind@0 op@4 class@8
+        // status@10 weak@11 pad@12 arr@16 idx@24 gen@32 tid@40
+        // pad2@44 seq@48.
+        let mut b = vec![0u8; 56];
+        b[0..4].copy_from_slice(&wire::KIND_SCAN_ALG.to_le_bytes());
+        b[4..8].copy_from_slice(&7u32.to_le_bytes());
+        b[8..10].copy_from_slice(&class.to_le_bytes());
+        b[10] = status;
+        b[16..24].copy_from_slice(&0x5000u64.to_le_bytes());
+        b[24..32].copy_from_slice(&idx.to_le_bytes());
+        b[32..40].copy_from_slice(&9u64.to_le_bytes());
+        b[40..44].copy_from_slice(&4242u32.to_le_bytes());
+        b[48..56].copy_from_slice(&wire::make_seq(7, 9).to_le_bytes());
+        b
+    }
+
+    /// K1: the scan parser leaves class range caller-checked
+    /// (registry-sized) — the backend boundary enforces it
+    /// (OTHER always passes; a live-registry class passes; at/above
+    /// the registry length fails closed).
+    #[test]
+    fn decode_scan_alg_enforces_class_range() {
+        let n = crate::kinds::ALG_NAMES.len() as u16;
+        assert!(n > 1, "registry must hold live classes");
+        let mut b = ScanBatch::default();
+        decode_ring_record(&alg_bytes(1, wire::ALG_OK, 3), &mut b).unwrap();
+        assert_eq!(b.algs.len(), 1);
+        let mut b = ScanBatch::default();
+        decode_ring_record(&alg_bytes(wire::OTHER_CLASS, wire::ALG_EMPTY, 3), &mut b).unwrap();
+        assert_eq!(b.algs.len(), 1);
+        let mut b = ScanBatch::default();
+        assert!(decode_ring_record(&alg_bytes(n, wire::ALG_OK, 3), &mut b).is_err());
+        assert!(b.algs.is_empty());
     }
 
     #[test]
