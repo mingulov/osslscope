@@ -4296,6 +4296,17 @@ fn evict_cursors(maps: &HashMap<String, OwnedFd>, arr: u64) -> anyhow::Result<()
 /// Load-mandated init anchor, present even in stripped modules.
 pub(crate) const INIT_ANCHOR: &str = "OSSL_provider_init";
 
+/// Provider identity stat (R06, pure/host-testable): the raw stat
+/// dev_t renders through `render_stat_dev` (major/minor split) —
+/// the encoded-word `render_device` domain would corrupt
+/// pending-binding reconciliation (which compares against
+/// `render_stat_dev` identities).
+fn stat_dev_string(path: &Path) -> Option<(String, u64)> {
+    use std::os::unix::fs::MetadataExt as _;
+    let md = std::fs::metadata(path).ok()?;
+    Some((crate::plan::render_stat_dev(md.dev()), md.ino()))
+}
+
 /// The privileged [`SessionEnv`]: real ring, maps, links, pin, and
 /// `/proc` reads. Owned by [`DiscoverySession`] until session drop.
 pub struct LiveEnv {
@@ -4626,9 +4637,7 @@ impl SessionEnv for LiveEnv {
     }
 
     fn provider_stat(&self) -> Option<(String, u64)> {
-        use std::os::unix::fs::MetadataExt as _;
-        let md = std::fs::metadata(&self.provider).ok()?;
-        Some((crate::plan::render_device(md.dev()), md.ino()))
+        stat_dev_string(&self.provider)
     }
 
     fn backing_stat(&mut self, path: &str) -> Option<(u64, u64)> {
@@ -5052,6 +5061,32 @@ impl DiscoverySession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_stat_renders_stat_dev_domain() {
+        // R06 (session device): provider_stat must render the raw
+        // stat dev_t through render_stat_dev (major/minor split),
+        // not render_device (encoded-word domain) — the wrong
+        // domain corrupts pending-binding reconciliation (which
+        // compares against render_stat_dev identities).
+        use std::os::unix::fs::MetadataExt as _;
+        let exe = std::env::current_exe().expect("test exe");
+        let (rendered, ino) = stat_dev_string(&exe).expect("exe stats");
+        let md = std::fs::metadata(&exe).expect("stat");
+        assert_eq!(ino, md.ino());
+        assert_eq!(rendered, crate::plan::render_stat_dev(md.dev()));
+        // The domains genuinely differ where dev_t carries major
+        // bits (real disks — e.g. 8:1 renders "08:01" via
+        // render_stat_dev but "00:801" via render_device): the
+        // live distinction this fix restores. (The assert_eq pins
+        // the contract everywhere; it REDs behaviorally on
+        // major-nonzero filesystems and coincides on major-0
+        // mounts.)
+        assert_ne!(
+            crate::plan::render_stat_dev(0x0801),
+            crate::plan::render_device(0x0801)
+        );
+    }
 
     #[test]
     fn jump_hole_parses_in_range_only() {
