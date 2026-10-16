@@ -482,6 +482,21 @@ if [ -n "$MEMBERS_OBJ" ]; then
     cmp -s "$STAGE_MEMBERS" "$MEMBERS_DEST" \
         || { echo "error: installed members object no longer matches verified staged bytes: $MEMBERS_DEST" >&2; exit 1; }
 fi
+# S1: a pair-only install over a prefix that still carries a members
+# object from an earlier triple install must not leave the stale file
+# behind (auto-resolution finds the unlisted leftover and refuses the
+# mixed set, blocking pair fallback). Remove plain-file leftovers so
+# the installed set matches the receipt; a symlink here fails closed
+# for operator review (never follow it).
+if [ -z "$MEMBERS_OBJ" ]; then
+    if [ -L "$MEMBERS_DEST" ]; then
+        echo "error: refusing pair-only install: $MEMBERS_DEST is a symlink (inspect and remove it manually)" >&2
+        exit 1
+    elif [ -f "$MEMBERS_DEST" ]; then
+        rm -f "$MEMBERS_DEST"
+        echo "note: removed stale $MEMBERS_DEST (pair-only install over a triple prefix)" >&2
+    fi
+fi
 if [ -f "$REPO/docs/install.md" ]; then
     install_one "$REPO/docs/install.md" "$DOC_DEST" "$DOC_TMP" 644 "install doc"
 else

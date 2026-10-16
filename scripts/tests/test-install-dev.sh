@@ -1059,6 +1059,37 @@ else
     bad "explicit --members extends a pair-only manifest install"
 fi
 
+# S1: pair-only reinstall over a USED triple prefix removes the stale
+# members object (a leftover would break auto-resolution: the unlisted
+# file blocks pair fallback with a mixed-set error — the doctor
+# members-row pins prove removal restores resolution).
+if "$SH_BIN" "$INSTALL" --manifest "$T/manifest-members.json" --prefix "$T/pfxr" >/dev/null 2>&1 \
+   && [ -f "$T/pfxr/lib/osslscope/osslscope-members" ] \
+   && "$SH_BIN" "$INSTALL" --manifest "$T/manifest.json" --prefix "$T/pfxr" >/dev/null 2>&1 \
+   && [ ! -e "$T/pfxr/lib/osslscope/osslscope-members" ] \
+   && cmp -s "$T/harvest.o" "$T/pfxr/lib/osslscope/osslscope-harvest" \
+   && cmp -s "$T/count.o" "$T/pfxr/lib/osslscope/osslscope-count"; then
+    ok "pair-only reinstall on a used triple prefix removes the stale members object"
+else
+    bad "pair-only reinstall on a used triple prefix removes the stale members object"
+fi
+if python3 -c "import json; m=json.load(open('$T/pfxr/share/osslscope/install-manifest.json')); assert len(m['artifacts'])==3, m" 2>"$T/err"; then
+    ok "reinstalled receipt lists exactly the pair (no stale members entry)"
+else
+    bad "reinstalled receipt lists exactly the pair (no stale members entry) ($(cat "$T/err"))"
+fi
+
+# S1 fail-closed: a symlinked members destination refuses (never followed).
+if "$SH_BIN" "$INSTALL" --manifest "$T/manifest.json" --prefix "$T/pfxs" >/dev/null 2>&1 \
+   && ln -s "$T/members.o" "$T/pfxs/lib/osslscope/osslscope-members" \
+   && "$SH_BIN" "$INSTALL" --manifest "$T/manifest.json" --prefix "$T/pfxs" >"$T/out" 2>&1; then
+    bad "pair-only reinstall over a symlinked members destination refuses (got exit 0)"
+elif grep -q 'symlink' "$T/out" && [ -L "$T/pfxs/lib/osslscope/osslscope-members" ]; then
+    ok "pair-only reinstall over a symlinked members destination refuses without following"
+else
+    bad "pair-only reinstall over a symlinked members destination refuses without following"
+fi
+
 # Incompatible --members fails closed with the eBPF diagnosis.
 if "$SH_BIN" "$INSTALL" --manifest "$T/manifest-members.json" --prefix "$T/pfxb" \
         --members "$T/host-bin" >"$T/out" 2>&1; then
