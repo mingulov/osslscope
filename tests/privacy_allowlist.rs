@@ -345,3 +345,55 @@ fn userspace_target_memory_reads_are_pinned() {
         readers[0].display()
     );
 }
+
+#[test]
+fn traversal_inventory_is_approved() {
+    // T2-2 (doc side): the allowlist's Optional `traversal`
+    // bullet must enumerate exactly the approved emitted-field
+    // inventory — the ten section keys. Emission-side agreement
+    // (rendered keys ⊆ bullet idents) is pinned by
+    // output_contract::traversal_emission_matches_allowlist_inventory;
+    // this pins the doc baseline so neither side can silently
+    // shrink or grow.
+    let text = fs::read_to_string(manifest_dir().join("docs/privacy/allowlist-v1.md")).unwrap();
+    let mut bullet = String::new();
+    let mut in_bullet = false;
+    for line in text.lines() {
+        if line.starts_with("- Optional `traversal`") {
+            in_bullet = true;
+        } else if in_bullet && !line.starts_with(' ') && !line.is_empty() {
+            break;
+        }
+        if in_bullet {
+            bullet.push_str(line);
+            bullet.push('\n');
+        }
+    }
+    assert!(
+        !bullet.is_empty(),
+        "allowlist lacks the Optional `traversal` bullet"
+    );
+    let listed: BTreeSet<&str> = bullet
+        .split('`')
+        .enumerate()
+        .filter(|(i, _)| i % 2 == 1)
+        .map(|(_, s)| s)
+        .collect();
+    for key in [
+        "harvest",
+        "count",
+        "members",
+        "records",
+        "findings",
+        "polls",
+        "admitted",
+        "admitted_unknown",
+        "census_loss",
+        "entries",
+    ] {
+        assert!(
+            listed.contains(key),
+            "allowlist traversal bullet omits approved key {key:?}: {listed:?}"
+        );
+    }
+}
