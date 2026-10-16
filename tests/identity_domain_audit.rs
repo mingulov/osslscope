@@ -463,11 +463,14 @@ fn h5_t3_every_device_site_names_one_domain() {
         // session.rs: D2 records from BackingRef strings (stat, ×2).
         ("src/discovery/session.rs", "stat", "dev: b.dev.clone(),", 2),
         // session.rs (H10): pending re-resolve stats the provider
-        // path (stat-vs-stat against the bound triple).
+        // path (stat-vs-stat against the bound triple). R06
+        // re-pin (justified — the item-13 domain fix): the raw
+        // dev_t renders through render_stat_dev (major/minor
+        // split), not render_device (encoded-word domain).
         (
             "src/discovery/session.rs",
             "stat",
-            "Some((crate::plan::render_device(md.dev()), md.ino()))",
+            "Some((crate::plan::render_stat_dev(md.dev()), md.ino()))",
             1,
         ),
         // session.rs (R05 fix): tripwire module pins — fstat word
