@@ -2135,3 +2135,38 @@ fn stream_drain_stats_accumulate() {
     assert_eq!(s.records, 2);
     assert_eq!(s.bytes, 2 * ONRING_CALL);
 }
+
+/// K1: the terminator-region consumer range is bounded
+/// independently of the wire parser (synthetic batches bypass
+/// it): a corrupted EMPTY idx inside a synthetic attached set
+/// must not loop-allocate the unobserved list (the production
+/// parser rejects idx >= 512 before joining; this pins the
+/// consumer's own bound).
+#[test]
+fn k1_corrupt_idx_bounds_consumer_range() {
+    let mut scope = OracleScope::full();
+    scope.attached = [0u32, 100_000].into_iter().collect();
+    scope.expected = 2;
+    let mut o = Oracle::new(scope);
+    let mut b = quiesced_idle(&[TIDA]);
+    b.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b.push_ret(ret(TIDA, 0, 0));
+    b.push_alg(alg_arr(TIDA, 0, 100_000, wire::ALG_EMPTY, ARR, 0));
+    o.ingest(&b);
+    assert_eq!(o.done().len(), 1);
+    let Outcome::Partial { reasons } = &o.done()[0].outcome else {
+        panic!(
+            "corrupt terminator must stay partial: {:?}",
+            o.done()[0].outcome
+        );
+    };
+    for r in reasons {
+        if let PartialReason::UnobservedSlots(v) = r {
+            assert!(
+                v.len() <= wire::SCAN_SLOTS as usize,
+                "unobserved list unbounded ({} slots): corrupt idx loop-allocated",
+                v.len()
+            );
+        }
+    }
+}

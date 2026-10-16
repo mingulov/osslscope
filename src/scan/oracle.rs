@@ -1865,7 +1865,16 @@ impl Oracle {
         // terminator are unobserved (never silent); when no
         // terminator lands in the window, every unattached slot
         // below 512 is terminator-region unobserved.
-        let unobs_limit = if min_empty.is_some() { t_obs } else { 512 };
+        // K1: bound the consumer range independently of the wire
+        // parser (synthetic batches bypass it): the table has 512
+        // slots, so terminator-region unobserved never ranges past
+        // it — an unclamped collect here loop-allocates on a
+        // corrupted idx that narrows into the attached set.
+        let unobs_limit = if min_empty.is_some() {
+            t_obs.min(wire::SCAN_SLOTS)
+        } else {
+            wire::SCAN_SLOTS
+        };
         let unobs: Vec<u64> = (0..unobs_limit)
             .filter(|j| !attached.contains(&(*j as u32)))
             .collect();

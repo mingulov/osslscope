@@ -402,6 +402,11 @@ pub const SCAN_QUANTUM_D: u64 = 80;
 /// under `pend_key` of this cookie. First non-member index.
 pub const MEMBER_ENTRY_COOKIE: u64 = 512;
 
+/// Scan-plane slot count (K1): ALG/ROW `idx` is 0..512 — the
+/// producer walks 512 members, so anything at/above is a
+/// corrupt/skewed record, never a slot.
+pub const SCAN_SLOTS: u64 = 512;
+
 /// `TERMD[arr]` termination proof (T03): keyed by query-returned
 /// array base, value packs the op (low 32) and the proven live-slot
 /// count (high 32). Recorded exactly when the walker reads the
@@ -1170,6 +1175,7 @@ pub enum WireErr {
     StatusRange,
     WeakRange,
     Contradiction,
+    IdxRange,
 }
 
 fn read_event<T: Copy>(b: &[u8]) -> Option<T> {
@@ -1271,6 +1277,11 @@ pub fn parse_scan_alg_event(b: &[u8]) -> Result<ScanAlgEvent, WireErr> {
     if e.kind != KIND_SCAN_ALG {
         return Err(WireErr::Kind);
     }
+    // K1: slot indices are 0..512 (a corrupted idx would join an
+    // invocation and drive the oracle's terminator-region range).
+    if e.idx >= SCAN_SLOTS {
+        return Err(WireErr::IdxRange);
+    }
     // Strict scan vocabulary (fail-closed: a corrupted or
     // version-skewed record never joins an invocation silently).
     // The scan plane adds EMPTY/NOIMP read-status to the harvest
@@ -1303,6 +1314,10 @@ pub fn parse_scan_row_event(b: &[u8]) -> Result<ScanRowEvent, WireErr> {
     let e: ScanRowEvent = read_event(b).ok_or(WireErr::Length)?;
     if e.kind != KIND_SCAN_ROW {
         return Err(WireErr::Kind);
+    }
+    // K1: slot indices are 0..512 (same corrupt-record bar as ALG).
+    if e.idx >= SCAN_SLOTS {
+        return Err(WireErr::IdxRange);
     }
     Ok(e)
 }
@@ -1867,5 +1882,60 @@ mod tests {
         let mut b = [0u8; N];
         unsafe { b.as_mut_ptr().cast::<T>().write_unaligned(*v) };
         b
+    }
+
+    /// K1 RED: scan-plane slot indices are 0..512 — an
+    /// out-of-range idx (corrupt/skewed record) must never join
+    /// an invocation (the oracle's terminator-region consumer
+    /// ranges over it).
+    #[test]
+    fn scan_idx_out_of_range_rejected() {
+        let alg = ScanAlgEvent {
+            kind: KIND_SCAN_ALG,
+            op: 7,
+            class: OTHER_CLASS,
+            status: ALG_EMPTY,
+            weak: 0,
+            _pad: 0,
+            arr: 0x5000,
+            idx: 511,
+            generation: 9,
+            tid: 4242,
+            _pad2: 0,
+            seq: make_seq(7, 9),
+        };
+        assert!(parse_scan_alg_event(&struct_bytes::<_, 56>(&alg)).is_ok());
+        for bad_idx in [512u64, 100_000, 0x1_0000_0000] {
+            let mut a = alg;
+            a.idx = bad_idx;
+            assert_eq!(
+                parse_scan_alg_event(&struct_bytes::<_, 56>(&a)),
+                Err(WireErr::IdxRange),
+                "ALG idx {bad_idx} must reject"
+            );
+        }
+        let row = ScanRowEvent {
+            kind: KIND_SCAN_ROW,
+            op: 7,
+            funcid: 300,
+            _pad: 0,
+            addr: 0x4400,
+            aux: 0,
+            idx: 511,
+            generation: 9,
+            tid: 4242,
+            _pad2: 0,
+            seq: make_seq(7, 9),
+        };
+        assert!(parse_scan_row_event(&struct_bytes::<_, 64>(&row)).is_ok());
+        for bad_idx in [512u64, 100_000, 0x1_0000_0000] {
+            let mut r = row;
+            r.idx = bad_idx;
+            assert_eq!(
+                parse_scan_row_event(&struct_bytes::<_, 64>(&r)),
+                Err(WireErr::IdxRange),
+                "ROW idx {bad_idx} must reject"
+            );
+        }
     }
 }
