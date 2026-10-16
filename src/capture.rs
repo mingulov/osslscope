@@ -5286,15 +5286,17 @@ where
         // R12: the single close sample, alongside the monotonic end
         // stamp — reused by the document and the Capture.
         self.wall_end = self.clock.wall_now();
+        // R21-F4 (round 2, residual E): same setup-overrun collapse
+        // as the assembly path (a close sample predating the
+        // clamped start would invert the window — collapse to the
+        // empty window at the effective start instead).
+        let recycled_start = effective_start_ns(self.window_start_ns, self.requested_start_ns);
         let mut document = evidence::finalize(FinalizeInput {
             window: CaptureWindow {
                 requested_start_ns: self.requested_start_ns,
                 requested_end_ns: requested_end,
-                effective_start_ns: effective_start_ns(
-                    self.window_start_ns,
-                    self.requested_start_ns,
-                ),
-                effective_end_ns: now_ns.min(requested_end),
+                effective_start_ns: recycled_start,
+                effective_end_ns: now_ns.min(requested_end).max(recycled_start),
                 signal_cut: false,
             },
             sites: Vec::new(),
@@ -6543,6 +6545,18 @@ where
                 .min(effective_end_ns)
                 .max(self.requested_start_ns);
         }
+        // R21-F4 (round 2, residual E): setup can outlast the
+        // requested window (accepted tiny --duration) — the kernel
+        // deadline then predates the requested start, and the
+        // capped effective end would invert the window (the
+        // semantic validator rejects inversion). Collapse honestly
+        // to the empty window at the effective start (the deadline
+        // passed during setup, so the whole requested window is
+        // tail gap; the loop also records over-budget, so COMPLETE
+        // is unreachable here). Never widens: the clamp only fires
+        // when the capped end predates the start.
+        let effective_start = effective_start_ns(self.window_start_ns, self.requested_start_ns);
+        let effective_end_ns = effective_end_ns.max(effective_start);
         // H7: a salvage fatal dominates the attach-zero
         // computation (the close failure is the verdict; zero
         // attaches stay visible in the coverage rows).
@@ -6682,10 +6696,7 @@ where
             window: CaptureWindow {
                 requested_start_ns: self.requested_start_ns,
                 requested_end_ns: requested_end,
-                effective_start_ns: effective_start_ns(
-                    self.window_start_ns,
-                    self.requested_start_ns,
-                ),
+                effective_start_ns: effective_start,
                 effective_end_ns,
                 signal_cut: self.signal_cut,
             },
@@ -10940,6 +10951,74 @@ mod tests {
                 w.effective_start_ns >= w.requested_start_ns,
                 "effective start escapes the requested window: {w:?}"
             );
+        }
+
+        #[test]
+        fn tiny_duration_setup_overrun_collapses_window_without_inversion() {
+            // R21-F4 (round 2, residual E): an accepted tiny
+            // --duration (1ns) with ordinary setup: setup consumes
+            // the whole window (the kernel deadline predates the
+            // requested start), so the capped effective end would
+            // invert the window (schema rejects effective
+            // inversion). The window must collapse honestly to the
+            // empty window at the effective start (tail gap +
+            // over-budget PARTIAL) and validate end to end.
+            let mut cfg = stub_config();
+            cfg.duration = Duration::from_nanos(1);
+            let mut info = stub_info();
+            info.owned = true;
+            let clock = TickClock {
+                ns: Cell::new(5_000_000_000),
+                step: 1_000_000,
+                now: Cell::new(Instant::now()),
+                wall: SystemTime::now(),
+            };
+            let mut proc = ProcStub;
+            let cancelled = || false;
+            let count = CountSession::new(TPID, FakeCountBackend::new());
+            let mut runner = stub_runner(
+                &cfg,
+                &info,
+                DiscoveryStub {
+                    finish_err: false,
+                    poll_err: false,
+                    dispatch_attached: false,
+                    trip_set: None,
+                },
+                count,
+                &clock,
+                &mut proc,
+                &cancelled,
+            );
+            // Production-faithful kernel deadline (run_observation
+            // derives declared-start + duration; the stub default
+            // would mask the overrun).
+            runner.kernel_deadline_ns = 5_000_000_001;
+            let cap = runner.setup_and_run().expect("stub run");
+            let w = &cap.document.window;
+            assert!(
+                w.requested_start_ns > 5_000_000_001,
+                "setup must outlast the 1ns window (overrun premise): {w:?}"
+            );
+            assert!(
+                w.effective_start_ns <= w.effective_end_ns,
+                "effective window inverted by setup overrun: {w:?}"
+            );
+            assert!(
+                w.effective_start_ns >= w.requested_start_ns
+                    && w.effective_end_ns <= w.requested_end_ns,
+                "effective window escapes the requested window: {w:?}"
+            );
+            assert!(
+                matches!(cap.document.status, Completeness::Partial { .. }),
+                "overrun is an honest PARTIAL (tail gap + over-budget): {:?}",
+                cap.document.status
+            );
+            // End-to-end: the collapsed document validates.
+            let bytes = crate::report::render_json(&cap.document).unwrap();
+            let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            crate::schema::validate_v2(&val).unwrap();
+            crate::schema::check_v2_semantics(&val).unwrap();
         }
 
         #[test]
