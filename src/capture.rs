@@ -259,6 +259,12 @@ pub struct TraversalDelta {
     pub admitted_unknown: BTreeSet<u32>,
     /// Cumulative admitted-increment loss (CALLS map pressure).
     pub census_loss: u64,
+    /// A storm detach cut observation this poll (typed form of
+    /// the `traversal-storm` reason — feeds the finalizer).
+    pub storm: bool,
+    /// The tier-2 throttle skipped queries this poll (typed form
+    /// of the `traversal-throttled` reason — feeds the finalizer).
+    pub throttled: bool,
 }
 
 /// Retained traversal outcome (on [`Capture`] when traversal ran;
@@ -269,6 +275,12 @@ pub struct TraversalCapture {
     pub done: Vec<WalkDone>,
     pub findings: Vec<Finding>,
     pub polls: u64,
+    /// Cumulative storm-cut observations, rounds plus the close
+    /// drain (P1: feeds the `traversal.storm` typed gap).
+    pub storm_polls: u64,
+    /// Cumulative throttle observations, rounds plus the close
+    /// drain (P1: feeds the `traversal.throttled` typed gap).
+    pub throttled_polls: u64,
     /// Backend throttled (SKIP_ALL) at the final drain.
     pub throttled: bool,
     /// Backend detached (tier-3 storm) at the final drain.
@@ -312,6 +324,12 @@ impl TraversalCapture {
             .extend(tail.admitted_unknown_by_op);
         self.census_loss = self.census_loss.max(tail.census_loss);
         self.polls += tail.polls;
+        // P1: typed gate observations union (cumulative, never
+        // shrink — same monotonicity as the census); end-state
+        // gates still in force at the close drain count as
+        // observations (the close drain is a poll).
+        self.storm_polls += tail.storm_polls + u64::from(tail.detached);
+        self.throttled_polls += tail.throttled_polls + u64::from(tail.throttled);
         self.throttled = tail.throttled;
         self.detached = tail.detached;
         if self.provenance.is_none() {
@@ -678,6 +696,20 @@ impl DiscoveryPort for LiveDiscovery {
     }
 }
 
+/// Storm/throttle gate flags one traversal poll earned: the typed
+/// form of the `traversal-storm` / `traversal-throttled` reasons
+/// (P1 — feeds the finalizer). Matches the same backend actions
+/// as [`traversal_reasons`] by construction; the agreement test
+/// below pins them together.
+fn traversal_gate_flags(actions: &[ScanAction]) -> (bool, bool) {
+    (
+        actions.iter().any(|a| matches!(a, ScanAction::Detached)),
+        actions
+            .iter()
+            .any(|a| matches!(a, ScanAction::SkipAllEngaged)),
+    )
+}
+
 /// PARTIAL reasons one traversal poll earned: a storm detach cut
 /// observation (`traversal-storm`), the tier-2 throttle skipped
 /// queries (`traversal-throttled`), an invocation closed
@@ -772,6 +804,7 @@ impl DiscoveryPort for LiveTraversalDiscovery {
         }
         let delta = self.backend.poll()?;
         let reasons = traversal_reasons(&delta.actions, &delta.done, &delta.findings);
+        let (storm, throttled) = traversal_gate_flags(&delta.actions);
         Ok(TraversalDelta {
             done: delta.done,
             findings: delta.findings,
@@ -781,6 +814,8 @@ impl DiscoveryPort for LiveTraversalDiscovery {
             admitted: delta.admitted,
             admitted_unknown: delta.admitted_unknown,
             census_loss: delta.census_loss,
+            storm,
+            throttled,
         })
     }
 
@@ -4928,6 +4963,11 @@ where
                 t.done.extend(tdelta.done);
                 t.findings.extend(tdelta.findings);
                 t.polls += tdelta.polls;
+                // P1: typed gate observations accumulate with the
+                // compat reasons above (a mid-window storm that
+                // recovered still cut observation).
+                t.storm_polls += u64::from(tdelta.storm);
+                t.throttled_polls += u64::from(tdelta.throttled);
                 apply_corrections(&mut t.done, &tdelta.corrections);
                 if !tdelta.admitted.is_empty() {
                     t.admitted_by_op = tdelta.admitted;
@@ -6511,6 +6551,65 @@ where
                 engine_unkeyed,
             ));
         }
+        // P1: traversal losses feed the sole finalizer as typed
+        // gaps (a compat Capture reason alone does not restore
+        // document completeness — storm/throttle/incomplete/
+        // unjoined/finish-error windows must partial the document
+        // with named reasons). Observed records are preserved
+        // untouched (done/findings flow to the traversal section
+        // as before — only the gaps are newly typed).
+        if let Some(t) = self.traversal.as_ref() {
+            if t.storm_polls > 0 {
+                counters.push(typed_counter(
+                    "traversal.storm",
+                    CounterKind::Loss,
+                    CounterUnits::Events,
+                    CounterSource::Discovery,
+                    t.storm_polls,
+                ));
+            }
+            if t.throttled_polls > 0 {
+                counters.push(typed_counter(
+                    "traversal.throttled",
+                    CounterKind::Loss,
+                    CounterUnits::Events,
+                    CounterSource::Discovery,
+                    t.throttled_polls,
+                ));
+            }
+            if t.finish_error.is_some() {
+                counters.push(typed_counter(
+                    "traversal.finish_error",
+                    CounterKind::Loss,
+                    CounterUnits::Events,
+                    CounterSource::Discovery,
+                    1,
+                ));
+            }
+            let incomplete = t
+                .done
+                .iter()
+                .filter(|w| !matches!(w.outcome, ScanOutcome::Complete { .. }))
+                .count() as u64;
+            if incomplete > 0 {
+                counters.push(typed_counter(
+                    "traversal.incomplete",
+                    CounterKind::Loss,
+                    CounterUnits::Events,
+                    CounterSource::Discovery,
+                    incomplete,
+                ));
+            }
+            if !t.findings.is_empty() {
+                counters.push(typed_counter(
+                    "traversal.unjoined",
+                    CounterKind::Loss,
+                    CounterUnits::Events,
+                    CounterSource::Discovery,
+                    t.findings.len() as u64,
+                ));
+            }
+        }
         // H8: legacy call partition over the claimed sites (taint
         // revisions applied above; finalize only sorts/dedups
         // candidates, never calls, so pre-finalize values equal the
@@ -6768,6 +6867,14 @@ where
             "legacy.engine_uninstrumented" => self.reason("engine-fallback-uninstrumented"),
             "legacy.meth_uninstrumented" => self.reason("meth-fallback-uninstrumented"),
             "legacy.lowlevel_uninstrumented" => self.reason("lowlevel-fallback-uninstrumented"),
+            // P1: typed traversal gaps map back onto their compat
+            // reasons (same strings the round/tail folds insert —
+            // the set dedups, so typed + compat never double-report).
+            "traversal.storm" => self.reason("traversal-storm"),
+            "traversal.throttled" => self.reason("traversal-throttled"),
+            "traversal.finish_error" => self.reason("traversal-finish-error"),
+            "traversal.incomplete" => self.reason("traversal-incomplete"),
+            "traversal.unjoined" => self.reason("traversal-unjoined"),
             _ => self.reason("discovery-loss"),
         }
     }
@@ -10113,6 +10220,8 @@ mod tests {
                 admitted: std::collections::BTreeMap::new(),
                 admitted_unknown: std::collections::BTreeSet::new(),
                 census_loss: 0,
+                storm: true,
+                throttled: false,
             };
             let d2 = TraversalDelta {
                 done: vec![walk(
@@ -10128,6 +10237,8 @@ mod tests {
                 admitted: std::collections::BTreeMap::new(),
                 admitted_unknown: std::collections::BTreeSet::new(),
                 census_loss: 0,
+                storm: false,
+                throttled: false,
             };
             let tail = TraversalCapture {
                 provenance: Some(triple_prov()),
@@ -10147,6 +10258,8 @@ mod tests {
                 throttled: true,
                 detached: false,
                 finish_error: None,
+                storm_polls: 0,
+                throttled_polls: 0,
             };
             let cfg = stub_config();
             let info = stub_info();
@@ -10277,6 +10390,8 @@ mod tests {
                 admitted: std::collections::BTreeMap::new(),
                 admitted_unknown: std::collections::BTreeSet::new(),
                 census_loss: 0,
+                storm: false,
+                throttled: false,
             };
             let tail = TraversalCapture {
                 provenance: Some(triple_prov()),
@@ -10290,6 +10405,8 @@ mod tests {
                 throttled: false,
                 detached: false,
                 finish_error: None,
+                storm_polls: 0,
+                throttled_polls: 0,
             };
             let cfg = stub_config();
             let info = stub_info();
@@ -10356,6 +10473,8 @@ mod tests {
                 admitted: admitted.clone(),
                 admitted_unknown: std::collections::BTreeSet::new(),
                 census_loss: 0,
+                storm: false,
+                throttled: false,
             };
             let tail = TraversalCapture {
                 provenance: Some(triple_prov()),
@@ -10369,6 +10488,8 @@ mod tests {
                 throttled: false,
                 detached: false,
                 finish_error: None,
+                storm_polls: 0,
+                throttled_polls: 0,
             };
             let cfg = stub_config();
             let info = stub_info();
@@ -10452,6 +10573,8 @@ mod tests {
                 admitted: [(1u32, 3u64)].into_iter().collect(),
                 admitted_unknown: [unknown].into_iter().collect(),
                 census_loss: loss,
+                storm: false,
+                throttled: false,
             };
             let tail = TraversalCapture {
                 provenance: Some(triple_prov()),
@@ -10465,6 +10588,8 @@ mod tests {
                 throttled: false,
                 detached: false,
                 finish_error: None,
+                storm_polls: 0,
+                throttled_polls: 0,
             };
             let cfg = stub_config();
             let info = stub_info();
@@ -10531,6 +10656,8 @@ mod tests {
                 admitted: std::collections::BTreeMap::new(),
                 admitted_unknown: std::collections::BTreeSet::new(),
                 census_loss: 0,
+                storm: true,
+                throttled: false,
             };
             let tail = TraversalCapture {
                 provenance: Some(triple_prov()),
@@ -10550,6 +10677,8 @@ mod tests {
                 throttled: false,
                 detached: true,
                 finish_error: None,
+                storm_polls: 0,
+                throttled_polls: 0,
             };
             let cfg = stub_config();
             let info = stub_info();
@@ -10568,6 +10697,128 @@ mod tests {
             assert!(t.detached);
             assert!(cap.reasons.iter().any(|r| r == "close-failure"));
             assert!(cap.reasons.iter().any(|r| r == "traversal-storm"));
+        }
+
+        #[test]
+        fn traversal_losses_yield_typed_document_gaps() {
+            // P1: traversal failures (storm in force at close,
+            // throttled round, finish error, incomplete records,
+            // unjoined findings) must surface as TYPED document
+            // gaps (Loss counters → Partial reasons feeding the
+            // sole finalizer) — a compat Capture reason alone does
+            // not restore document completeness, and observed
+            // records must survive untouched.
+            use crate::scan::oracle::Outcome;
+            let d1 = TraversalDelta {
+                done: vec![walk(1, Outcome::Skipped { cause: 1 })],
+                findings: vec![crate::scan::oracle::Finding::OrphanRet { tid: TPID, seq: 9 }],
+                partial_reasons: vec![
+                    "traversal-throttled".to_string(),
+                    "traversal-incomplete".to_string(),
+                    "traversal-unjoined".to_string(),
+                ],
+                polls: 1,
+                corrections: vec![],
+                admitted: std::collections::BTreeMap::new(),
+                admitted_unknown: std::collections::BTreeSet::new(),
+                census_loss: 0,
+                storm: false,
+                throttled: true,
+            };
+            let tail = TraversalCapture {
+                provenance: Some(triple_prov()),
+                done: vec![],
+                findings: vec![],
+                polls: 1,
+                corrections: vec![],
+                admitted_by_op: std::collections::BTreeMap::new(),
+                admitted_unknown_by_op: std::collections::BTreeSet::new(),
+                census_loss: 0,
+                throttled: false,
+                detached: true,
+                finish_error: Some("tail drain failed".to_string()),
+                storm_polls: 0,
+                throttled_polls: 0,
+            };
+            let cfg = stub_config();
+            let info = stub_info();
+            let clock = ClockStub::at(5_000_000_000);
+            let mut proc = ProcStub;
+            let cancelled = || false;
+            let count = CountSession::new(TPID, FakeCountBackend::new());
+            let stub = TraversalStub::scripted(vec![d1], tail);
+            let runner = stub_runner(&cfg, &info, stub, count, &clock, &mut proc, &cancelled);
+            let cap = runner.setup_and_run().expect("stub run");
+            // Observed records preserved (skipped record + finding
+            // survive into the retained traversal outcome).
+            let t = cap.traversal.as_ref().expect("traversal retained");
+            assert_eq!(t.done.len(), 1);
+            assert_eq!(t.findings.len(), 1);
+            // Typed gaps present in the finalized document.
+            for name in [
+                "traversal.storm",
+                "traversal.throttled",
+                "traversal.finish_error",
+                "traversal.incomplete",
+                "traversal.unjoined",
+            ] {
+                let c = cap
+                    .document
+                    .counters
+                    .iter()
+                    .find(|c| c.name == name)
+                    .unwrap_or_else(|| panic!("typed gap counter {name} missing: {:?}", cap.document.counters));
+                assert_eq!(c.kind, CounterKind::Loss, "{name} forces PARTIAL");
+                assert!(c.value > 0, "{name} is positive");
+                assert!(
+                    cap.document.reasons().iter().any(|r| matches!(
+                        r,
+                        GapReason::Loss { counter, .. } if counter == name
+                    )),
+                    "typed gap reason {name} missing: {:?}",
+                    cap.document.reasons()
+                );
+            }
+            assert!(
+                matches!(cap.document.status, Completeness::Partial { .. }),
+                "traversal losses partial the document: {:?}",
+                cap.document.status
+            );
+        }
+
+        #[test]
+        fn traversal_gate_flags_agree_with_reasons() {
+            // P1: the typed storm/throttle flags match exactly the
+            // actions that earn the compat reasons (both derive
+            // from the same backend actions — drift here would
+            // split typed gaps from compat reasons).
+            use crate::scan::oracle::Outcome;
+            let clean = walk(1, Outcome::Complete { true_t: 6, cached: false });
+            for actions in [
+                vec![],
+                vec![ScanAction::Detached],
+                vec![ScanAction::SkipAllEngaged],
+                vec![
+                    ScanAction::Detached,
+                    ScanAction::SkipAllEngaged,
+                    ScanAction::Reattached,
+                    ScanAction::SkipAllReleased,
+                    ScanAction::CacheWarmed { arr: 1, t: 6 },
+                ],
+            ] {
+                let (storm, throttled) = traversal_gate_flags(&actions);
+                let reasons = traversal_reasons(&actions, &[clean.clone()], &[]);
+                assert_eq!(
+                    storm,
+                    reasons.iter().any(|r| r == "traversal-storm"),
+                    "storm flag ⟺ reason for {actions:?}"
+                );
+                assert_eq!(
+                    throttled,
+                    reasons.iter().any(|r| r == "traversal-throttled"),
+                    "throttle flag ⟺ reason for {actions:?}"
+                );
+            }
         }
 
         #[test]
@@ -10697,6 +10948,8 @@ mod tests {
                 throttled: false,
                 detached: true,
                 finish_error: Some("tail drained late".to_string()),
+                storm_polls: 0,
+                throttled_polls: 0,
             };
             acc.merge(tail);
             assert_eq!(
