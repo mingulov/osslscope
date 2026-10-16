@@ -929,6 +929,26 @@ impl Oracle {
         std::mem::take(&mut self.corrections)
     }
 
+    /// Restore a taken batch after a failed post-take section
+    /// (R35/I2): takes precede fallible throttle/cache writes, so
+    /// a write error returns the batch here instead of dropping it
+    /// (the next poll or the salvage take redelivers, in order).
+    /// Prepend (older first) — takes drain fully and no ingest
+    /// runs between take and restore, so this is exactly the take
+    /// inverse.
+    pub fn restore_taken(&mut self, done: Vec<WalkDone>, findings: Vec<Finding>) {
+        if !done.is_empty() {
+            let mut d = done;
+            d.extend(std::mem::take(&mut self.done));
+            self.done = d;
+        }
+        if !findings.is_empty() {
+            let mut f = findings;
+            f.extend(std::mem::take(&mut self.findings));
+            self.findings = f;
+        }
+    }
+
     /// Close one invocation: records the post-drain evidence,
     /// then pushes the verdict (every close funnels here, so
     /// `recent` observes every joinable outcome exactly once).

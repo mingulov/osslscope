@@ -442,7 +442,7 @@ impl ScanBackend {
             }
         }
         // Tier-2 + cache warms/heals over newly closed invocations.
-        // (Corrections take AFTER the fallible cache loop below:
+        // (Corrections take AFTER the fallible warm section below:
         // a cache write error must not drop rewrites for already-
         // held verdicts — untaken corrections stay in the oracle
         // for the next poll or the salvage take. The census read
@@ -453,9 +453,51 @@ impl ScanBackend {
             || read_calls_by_op(maps),
             || (oracle.take_done(), oracle.take_findings()),
         )?;
+        // R35/I2: the warm section below is fallible (throttle +
+        // cache map writes) but runs AFTER the takes above — on
+        // error the taken batch restores into the oracle (next
+        // poll or the salvage take redelivers), never drops. The
+        // totals increment only past the fallible section (a
+        // restored batch must not count twice).
+        if let Err(e) = self.warm_heal(&fresh, now_ns, &mut delta) {
+            self.oracle.restore_taken(fresh, fresh_findings);
+            return Err(e);
+        }
         self.done_total += fresh.len() as u64;
         self.findings_total += fresh_findings.len() as u64;
-        for w in &fresh {
+        // Corrections take here (after every fallible map write
+        // above — a cache error above leaves them in the oracle
+        // for the next poll or salvage, never dropped).
+        let fresh_corrections: Vec<Correction> = self.oracle.take_corrections();
+        // Census honesty: ops observed here but missing from the
+        // snapshot are UNKNOWN once increments were lost (never
+        // silently zero). The CALLS-loss high-water is current —
+        // drain_batch refreshed it before the takes above.
+        let calls_loss = self
+            .last_loss
+            .get(&wire::LOSS_MAP_CALLS)
+            .copied()
+            .unwrap_or(0);
+        delta.admitted_unknown = census_unknown_ops(&fresh, &fresh_admitted, calls_loss);
+        delta.census_loss = calls_loss;
+        delta.done = fresh;
+        delta.findings = fresh_findings;
+        delta.corrections = fresh_corrections;
+        delta.admitted = fresh_admitted;
+        Ok(delta)
+    }
+
+    /// Tier-2 throttle + cache warm/heal over newly closed
+    /// invocations (R35: the fallible post-take section as one
+    /// error edge — the caller restores the taken batch into the
+    /// oracle on `Err`, never drops it).
+    fn warm_heal(
+        &mut self,
+        fresh: &[WalkDone],
+        now_ns: u64,
+        delta: &mut PollDelta,
+    ) -> anyhow::Result<()> {
+        for w in fresh {
             // Cost proxy: proven T for completes, joined-ALG
             // count otherwise (walked evidence ≈ paid cost;
             // skipped/tainted/abandoned scale by what fired).
@@ -528,26 +570,7 @@ impl ScanBackend {
                 None => {}
             }
         }
-        // Corrections take here (after every fallible map write
-        // above — a cache error above leaves them in the oracle
-        // for the next poll or salvage, never dropped).
-        let fresh_corrections: Vec<Correction> = self.oracle.take_corrections();
-        // Census honesty: ops observed here but missing from the
-        // snapshot are UNKNOWN once increments were lost (never
-        // silently zero). The CALLS-loss high-water is current —
-        // drain_batch refreshed it before the takes above.
-        let calls_loss = self
-            .last_loss
-            .get(&wire::LOSS_MAP_CALLS)
-            .copied()
-            .unwrap_or(0);
-        delta.admitted_unknown = census_unknown_ops(&fresh, &fresh_admitted, calls_loss);
-        delta.census_loss = calls_loss;
-        delta.done = fresh;
-        delta.findings = fresh_findings;
-        delta.corrections = fresh_corrections;
-        delta.admitted = fresh_admitted;
-        Ok(delta)
+        Ok(())
     }
 
     /// Window-edge close: freeze tiers FIRST, quiesce the gate
@@ -571,11 +594,17 @@ impl ScanBackend {
         if !self.storm_detached {
             self.set_skip_all(true)?;
         }
-        let mut delta = self.poll()?;
         let now_ns = self
             .clock_base_ns
             .saturating_add(Instant::now().duration_since(self.epoch_start).as_nanos() as u64);
+        // R35/I2: the backstop runs even when the settle poll fails
+        // (opens close + partner corrections generate — the
+        // caller's salvage takes them via take_completed /
+        // take_corrections; returning before the backstop would
+        // strand opens that will never close).
+        let poll_result = self.poll();
         self.oracle.finish(now_ns);
+        let mut delta = poll_result?;
         let (done, findings) = self.take_completed();
         self.done_total += done.len() as u64;
         self.findings_total += findings.len() as u64;
@@ -686,11 +715,13 @@ impl ScanBackend {
             now_ns,
             ..ScanBatch::default()
         };
-        while let Some(item) = self.ring.next() {
-            let bytes = item.to_vec();
-            decode_ring_record(&bytes, &mut b)?;
-        }
-        debug_assert!(b.order_sound(), "drain preserves ring order");
+        // R35/I2: every fallible map read runs BEFORE the
+        // destructive ring drain, and every persistent baseline
+        // (LOSS high-water, TRUNC consumed) publishes only after
+        // the drain decodes clean — a failed map read drops
+        // re-readable snapshots, never already-drained ring
+        // items, and a failed ring decode leaves every baseline
+        // pristine for the next poll.
         for (tid, v) in read_u64_all(&self.loaded.maps, "RCOUNT")? {
             b.rcount.insert(tid, split_rcount_checked(v)?);
         }
@@ -698,28 +729,30 @@ impl ScanBackend {
             let (birth, ctr) = wire::split_seq(v);
             b.seq.insert(tid, (birth, ctr));
         }
-        for (id, total) in read_percpu_all(&self.loaded.maps, "LOSS", false)? {
-            let last = self.last_loss.get(&id).copied().unwrap_or(0);
-            if total >= last {
-                if total > last {
-                    b.loss.insert(id, total - last);
-                }
-                self.last_loss.insert(id, total);
-            }
-            // Dips (row eviction + recount) keep the high-water
-            // baseline — same discipline as the harvest core.
-        }
+        let loss_rows = read_percpu_all(&self.loaded.maps, "LOSS", false)?;
+        let (loss_deltas, loss_high) = fold_loss_deltas(&self.last_loss, &loss_rows);
+        b.loss = loss_deltas;
         // TRUNC is sticky bits (OR-fold) plus the per-op
         // flag-event generation: fresh bits report, repeats
         // re-report on generation advance, quiet re-drains
         // report nothing — and nothing is ever cleared, so no
         // concurrent flag can be erased in any producer order.
-        b.trunc = drain_trunc_flags(
+        // Snapshots read here; consumption defers past the drain.
+        let (trunc_snap, trunc_seq) = snapshot_trunc(&self.loaded.maps)?;
+        while let Some(item) = self.ring.next() {
+            let bytes = item.to_vec();
+            decode_ring_record(&bytes, &mut b)?;
+        }
+        debug_assert!(b.order_sound(), "drain preserves ring order");
+        for (id, total) in loss_high {
+            self.last_loss.insert(id, total);
+        }
+        b.trunc = accumulate_trunc(
             &mut self.trunc_consumed,
             &mut self.trunc_seq,
-            &self.loaded.maps,
-            None,
-        )?;
+            trunc_snap,
+            trunc_seq,
+        );
         Ok(b)
     }
 }
@@ -950,6 +983,48 @@ fn census_unknown_ops(
         .collect()
 }
 
+/// Pure LOSS-delta fold (R35, host-testable): deltas over a
+/// fully-read snapshot plus the high-water baselines to publish.
+/// Deltas ride the batch; baselines publish only after the ring
+/// drains clean (a failed drain must not advance some baselines
+/// while dropping their deltas). Dips (row eviction + recount)
+/// keep the high-water baseline — same discipline as the harvest
+/// core.
+fn fold_loss_deltas(
+    last: &BTreeMap<u32, u64>,
+    rows: &[(u32, u64)],
+) -> (BTreeMap<u32, u64>, Vec<(u32, u64)>) {
+    let mut deltas = BTreeMap::new();
+    let mut high = Vec::new();
+    for (id, total) in rows {
+        let prev = last.get(id).copied().unwrap_or(0);
+        if *total >= prev {
+            if *total > prev {
+                deltas.insert(*id, total - prev);
+            }
+            high.push((*id, *total));
+        }
+    }
+    (deltas, high)
+}
+
+/// Pure TRUNC snapshot reads (R35): the sticky flag bits plus the
+/// per-op flag-event generation, read with the other maps before
+/// the destructive ring drain. Consumption stays deferred:
+/// [`accumulate_trunc`] runs only after the drain decodes clean
+/// (a failed drain must not consume deltas it drops).
+fn snapshot_trunc(
+    maps: &std::collections::HashMap<String, OwnedFd>,
+) -> anyhow::Result<(BTreeMap<u32, u64>, BTreeMap<u32, u64>)> {
+    let snap: BTreeMap<u32, u64> = read_percpu_all(maps, "TRUNC", true)?.into_iter().collect();
+    // Per-op generation, summed across CPUs (single-writer
+    // slots — the sum is the exact event count, rollback-free).
+    let seq: BTreeMap<u32, u64> = read_percpu_all(maps, "TRUNC_SEQ", false)?
+        .into_iter()
+        .collect();
+    Ok((snap, seq))
+}
+
 /// Lossless TRUNC drain: sticky per-op flag bits plus the
 /// per-op flag-event generation, never cleared. First sightings
 /// report via freshness; repeats re-report via the generation
@@ -965,12 +1040,7 @@ pub fn drain_trunc_flags(
     maps: &std::collections::HashMap<String, OwnedFd>,
     hook: Option<&dyn Fn()>,
 ) -> anyhow::Result<BTreeMap<u32, u64>> {
-    let snap: BTreeMap<u32, u64> = read_percpu_all(maps, "TRUNC", true)?.into_iter().collect();
-    // Per-op generation, summed across CPUs (single-writer
-    // slots — the sum is the exact event count, rollback-free).
-    let seq: BTreeMap<u32, u64> = read_percpu_all(maps, "TRUNC_SEQ", false)?
-        .into_iter()
-        .collect();
+    let (snap, seq) = snapshot_trunc(maps)?;
     if let Some(h) = hook {
         h();
     }
@@ -1470,6 +1540,49 @@ mod tests {
         assert_eq!(census.get(&7), Some(&10));
         assert_eq!(done.len(), 1, "the record flows through");
         assert_eq!(findings.len(), 1, "the finding flows through");
+    }
+
+    #[test]
+    fn r35_restore_taken_redelivers_batch_in_order() {
+        // R35/I2 (a): a failed post-take section restores the
+        // taken batch into the oracle — the next take redelivers
+        // every record + finding, in take order (the take inverse).
+        let mut o = oracle_with_batch();
+        let done = o.take_done();
+        let findings = o.take_findings();
+        assert_eq!(done.len(), 1);
+        assert_eq!(findings.len(), 1);
+        assert!(o.take_done().is_empty(), "takes drain fully");
+        o.restore_taken(done, findings);
+        let done2 = o.take_done();
+        let findings2 = o.take_findings();
+        assert_eq!(done2.len(), 1, "the record restores for salvage");
+        assert_eq!(findings2.len(), 1, "the finding restores for salvage");
+        assert_eq!(done2[0].seq, 0);
+        // Empty restores are no-ops (never fabricate).
+        o.restore_taken(Vec::new(), Vec::new());
+        assert!(o.take_done().is_empty());
+        assert!(o.take_findings().is_empty());
+    }
+
+    #[test]
+    fn r35_fold_loss_deltas_defers_baselines() {
+        use std::collections::BTreeMap;
+        // R35/I2 (c): deltas compute over the fully-read snapshot;
+        // baselines publish separately (the caller publishes only
+        // after the ring drains clean). Dips keep the high-water.
+        let last = BTreeMap::from([(1u32, 10u64), (2u32, 5u64), (3u32, 7u64)]);
+        let (deltas, high) = fold_loss_deltas(&last, &[(1, 12), (2, 5), (3, 4)]);
+        assert_eq!(deltas.get(&1), Some(&2), "risen id reports its delta");
+        assert!(!deltas.contains_key(&2), "flat id reports nothing");
+        assert!(!deltas.contains_key(&3), "dipped id reports nothing");
+        assert_eq!(
+            high,
+            vec![(1u32, 12u64), (2u32, 5u64)],
+            "risen+flat publish; dips keep the high-water"
+        );
+        let (deltas0, high0) = fold_loss_deltas(&BTreeMap::new(), &[]);
+        assert!(deltas0.is_empty() && high0.is_empty());
     }
 
     #[test]
