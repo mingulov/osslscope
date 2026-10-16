@@ -723,6 +723,22 @@ fn system_libcrypto() -> Option<String> {
         })
 }
 
+/// Vehicle-tolerant quiet-unknown reason (R21 finding 9): when the
+/// lane libcrypto resolves its dispatch anchor, mid-life quiet
+/// yields `no-query-trigger` from the quiet table (the R18-vehicle
+/// reason); on stripped unenrolled builds `resolve_supported_offset`
+/// fails and the preset `anchor-unresolved` short-circuits instead —
+/// the more honest reason there (no query probes attached at all).
+/// Both are PARTIAL-correct; the legs pin the unknown verdict, not
+/// the vehicle (status/legacy-section assertions stay exact).
+fn assert_quiet_unknown_reason(doc: &serde_json::Value, ctx: &str) {
+    let reason = doc["reason"].as_str().unwrap_or("<missing>");
+    assert!(
+        reason == "no-query-trigger" || reason == "anchor-unresolved",
+        "{ctx}: quiet keeps the unknown verdict, got reason {reason:?}: {doc}"
+    );
+}
+
 /// Live legacy-quiet attach verdict (NOT RUN here: needs a privileged
 /// lane + C2-built BPF object via OSSL_T03_LIVE=1 and OSSL_T03_OBJECT).
 /// The child imports `ssl` BEFORE attach (2s pre-sleep: cached
@@ -781,10 +797,7 @@ fn legacy_quiet_attach_with_tripwires_is_partial() {
     let _ = child.kill();
     let _ = child.wait();
     assert_eq!(doc["status"], "PARTIAL", "mid-life quiet is unknown: {doc}");
-    assert_eq!(
-        doc["reason"], "no-query-trigger",
-        "quiet attach keeps the unknown verdict: {doc}"
-    );
+    assert_quiet_unknown_reason(&doc, "quiet attach keeps the unknown verdict");
     assert!(
         doc.get("legacy").is_some(),
         "legacy section must travel with the PARTIAL: {doc}"
@@ -840,8 +853,26 @@ fn legacy_blind_quiet_is_partial() {
         doc["status"], "PARTIAL",
         "blind is unknown, not empty: {doc}"
     );
-    assert_eq!(
-        doc["reason"], "no-query-trigger",
-        "blind quiet keeps the unknown verdict: {doc}"
+    assert_quiet_unknown_reason(&doc, "blind quiet keeps the unknown verdict");
+}
+
+/// R21 finding 9: the t03 legacy legs must assert the
+/// vehicle-tolerant quiet-reason union, never an exact
+/// `no-query-trigger` — on stripped unenrolled lane builds the
+/// preset `anchor-unresolved` honestly short-circuits the quiet
+/// table instead. Host-runnable self-scan (the legs are
+/// live-ignored; the follow-on live task re-runs them).
+#[test]
+fn t03_legacy_legs_assert_the_quiet_reason_union() {
+    let src = std::fs::read_to_string(file!()).unwrap();
+    // (Built piecewise so this scan's own source never trips it.)
+    let exact = ["doc[", "\"reason\"],", " \"no-query-trigger\""].concat();
+    assert!(
+        !src.contains(&exact),
+        "t03 legacy leg pins an exact no-query-trigger reason (R21 finding 9)"
+    );
+    assert!(
+        src.match_indices("assert_quiet_unknown_reason").count() >= 3,
+        "both t03 legacy legs must route through assert_quiet_unknown_reason"
     );
 }
