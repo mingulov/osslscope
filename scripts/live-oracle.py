@@ -81,10 +81,14 @@ MODE_PROVIDERS_BIND = {
 # provider). Frozen ABI ids from src/kinds.rs; call paths
 # source-confirmed in OpenSSL 3.5.8 crypto/evp/ (DigestSign/
 # DigestVerify one-shots; EVP_Digest is Init+Update+Final, never the
-# one-shot 5). Setup-only funcids (newctx/init/freectx/params) never
+# one-shot 5). ECDSA exception (R21 finding 3, vendor-verified):
+# the default provider implements NO one-shot digest_sign/verify
+# (ecdsa_sig.c "shouldn't do digest_sign") — EVP falls through to
+# init/update/final, so the streaming UPDATE/FINAL funcids satisfy
+# the legs. Setup-only funcids (newctx/init/freectx/params) never
 # satisfy an operation counter.
 MODE_OPFUNC = {
-    "ecdsa": (("signs", {11}), ("verifies", {15})),
+    "ecdsa": (("signs", {9, 10, 11}), ("verifies", {13, 14, 15})),
     "keyexch": (("derives", {3}),),
     "kdf": (("derives", {5}),),
     "kem": (("encaps", {3}), ("decaps", {5})),
@@ -96,7 +100,9 @@ FUNC_NAMES = {
     (1, 3): "UPDATE", (1, 4): "FINAL",
     (4, 5): "DERIVE",
     (11, 3): "DERIVE",
-    (12, 11): "DIGEST_SIGN", (12, 15): "DIGEST_VERIFY",
+    (12, 9): "DIGEST_SIGN_UPDATE", (12, 10): "DIGEST_SIGN_FINAL",
+    (12, 11): "DIGEST_SIGN", (12, 13): "DIGEST_VERIFY_UPDATE",
+    (12, 14): "DIGEST_VERIFY_FINAL", (12, 15): "DIGEST_VERIFY",
     (14, 3): "ENCAPSULATE", (14, 5): "DECAPSULATE",
 }
 

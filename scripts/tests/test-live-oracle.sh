@@ -49,6 +49,12 @@ site() {
 # Candidates (full v2 shape: op + funcid + provider_class + classes).
 C11='{"op": 12, "funcid": 11, "provider_class": "default", "algorithm_classes": ["ECDSA"]}'
 C15='{"op": 12, "funcid": 15, "provider_class": "default", "algorithm_classes": ["ECDSA"]}'
+C9='{"op": 12, "funcid": 9, "provider_class": "default", "algorithm_classes": ["ECDSA"]}'
+C10='{"op": 12, "funcid": 10, "provider_class": "default", "algorithm_classes": ["ECDSA"]}'
+C13='{"op": 12, "funcid": 13, "provider_class": "default", "algorithm_classes": ["ECDSA"]}'
+C14='{"op": 12, "funcid": 14, "provider_class": "default", "algorithm_classes": ["ECDSA"]}'
+C8='{"op": 12, "funcid": 8, "provider_class": "default", "algorithm_classes": ["ECDSA"]}'
+C12='{"op": 12, "funcid": 12, "provider_class": "default", "algorithm_classes": ["ECDSA"]}'
 C3SIG='{"op": 12, "funcid": 3, "provider_class": "default", "algorithm_classes": ["ECDSA"]}'
 C5SIG='{"op": 12, "funcid": 5, "provider_class": "default", "algorithm_classes": ["ECDSA"]}'
 C16='{"op": 12, "funcid": 16, "provider_class": "default", "algorithm_classes": ["ECDSA"]}'
@@ -141,6 +147,13 @@ S5SIG=$(site 2 129 "$C5SIG")
 mk_report "$T/rep12s5.json" "[$S11, $S5SIG]"
 S16=$(site 5 130 "$C16")
 mk_report "$T/rep12life.json" "[$S16]"
+S9=$(site 3 401 "$C9"); S13=$(site 2 402 "$C13")
+mk_report "$T/rep12stream9.json" "[$S9, $S13]"
+S10=$(site 3 403 "$C10"); S14=$(site 2 404 "$C14")
+mk_report "$T/rep12stream10.json" "[$S10, $S14]"
+S8=$(site 4 405 "$C8"); S12=$(site 4 406 "$C12")
+mk_report "$T/rep12init.json" "[$S8, $S12]"
+mk_report "$T/rep12liveshape.json" "[$S8, $S9, $S10, $S12, $S13, $S14]"
 
 F11=$(site 3 201 "$C11"); F15=$(site 2 202 "$C15")
 mk_report_f "$T/rep12fence.json" "[]" \
@@ -918,6 +931,49 @@ else
     grep -q 'ambiguous' "$T/out" \
         && ok "missing coverage fails closed" \
         || bad "missing coverage fails closed"
+fi
+
+# R21 finding 3: default-provider ECDSA has no one-shot
+# digest_sign/verify (ecdsa_sig.c "shouldn't do digest_sign";
+# EVP falls through to init/update/final). The legs accept the
+# streaming UPDATE/FINAL funcids; the INIT funcids stay
+# setup-only and never satisfy a counter.
+# 66. PASS: signs/verifies satisfied by streaming UPDATE (9/13).
+if python3 "$ORACLE" "$T/ecdsa.log" "$T/rep12stream9.json" ecdsa >"$T/out" 2>&1; then
+    grep -q 'ORACLE PASS' "$T/out" \
+        && ok "ecdsa streaming UPDATE satisfies legs" \
+        || bad "ecdsa streaming UPDATE satisfies legs"
+else
+    bad "ecdsa streaming UPDATE satisfies legs (rc=$?)"
+fi
+
+# 67. PASS: signs/verifies satisfied by streaming FINAL (10/14).
+if python3 "$ORACLE" "$T/ecdsa.log" "$T/rep12stream10.json" ecdsa >"$T/out" 2>&1; then
+    grep -q 'ORACLE PASS' "$T/out" \
+        && ok "ecdsa streaming FINAL satisfies legs" \
+        || bad "ecdsa streaming FINAL satisfies legs"
+else
+    bad "ecdsa streaming FINAL satisfies legs (rc=$?)"
+fi
+
+# 68. PASS: the R21 live shape (INIT + UPDATE + FINAL executed)
+# passes — INIT sites are present but UPDATE/FINAL satisfy.
+if python3 "$ORACLE" "$T/ecdsa.log" "$T/rep12liveshape.json" ecdsa >"$T/out" 2>&1; then
+    grep -q 'ORACLE PASS' "$T/out" \
+        && ok "ecdsa INIT+UPDATE+FINAL live shape passes" \
+        || bad "ecdsa INIT+UPDATE+FINAL live shape passes"
+else
+    bad "ecdsa INIT+UPDATE+FINAL live shape passes (rc=$?)"
+fi
+
+# 69. FAIL: signs/verifies ledgered but only INIT executed (8/12
+# are setup-only — wrong function).
+if python3 "$ORACLE" "$T/ecdsa.log" "$T/rep12init.json" ecdsa >"$T/out" 2>&1; then
+    bad "ecdsa INIT-only fails (got exit 0)"
+else
+    grep -q 'function' "$T/out" \
+        && ok "ecdsa INIT-only fails" \
+        || bad "ecdsa INIT-only fails"
 fi
 
 echo "---"
