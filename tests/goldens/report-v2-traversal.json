@@ -1,0 +1,279 @@
+{
+  "completeness": {
+    "counters": [
+      {
+        "kind": "loss",
+        "name": "count.map_insert_dropped",
+        "source": "kernel-map",
+        "units": "events",
+        "value": 0
+      },
+      {
+        "kind": "activity",
+        "name": "count.windows_closed",
+        "source": "drain",
+        "units": "events",
+        "value": 1
+      }
+    ],
+    "fatal_kind": null,
+    "reasons": [],
+    "status": "COMPLETE"
+  },
+  "context": {
+    "kernel_release": "6.9.0-test",
+    "wall_end_unix_ns": 1700000030000000000,
+    "wall_start_unix_ns": 1700000000000000000
+  },
+  "coverage": [
+    {
+      "attached": 3,
+      "discovered": 3,
+      "expected": {
+        "sites": 3,
+        "state": "applicable"
+      },
+      "scope": "provider/default"
+    },
+    {
+      "attached": 0,
+      "discovered": 0,
+      "expected": {
+        "sites": null,
+        "state": "not-applicable"
+      },
+      "scope": "provider/legacy"
+    }
+  ],
+  "disposition": {
+    "code": 0,
+    "outcome": "exited",
+    "pid": null
+  },
+  "fenced": [],
+  "legacy_partition": {
+    "legacy_exclusive_calls": 0,
+    "non_legacy_exclusive_calls": 900,
+    "shared_ambiguous_calls": 0,
+    "unfenced_tail_calls": 0
+  },
+  "objects": [
+    {
+      "device": 8,
+      "display_locator": "/usr/lib/x86_64-linux-gnu/ossl-modules/default.so",
+      "id": "build:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "inode": 100
+    },
+    {
+      "device": 8,
+      "display_locator": "/usr/lib/x86_64-linux-gnu/ossl-modules/legacy.so",
+      "id": "build:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+      "inode": 200
+    },
+    {
+      "device": 8,
+      "display_locator": "/opt/vendor/lib/third-party.so",
+      "id": "unverified:8:123456",
+      "inode": 300
+    }
+  ],
+  "openssl": {
+    "state": "verified",
+    "version": "3.5.1"
+  },
+  "schema_version": "observed-crypto-v2.1",
+  "sites": [
+    {
+      "calls": 500,
+      "candidates": [
+        {
+          "algorithm_classes": [
+            "AES-128-GCM"
+          ],
+          "funcid": 21,
+          "op": 2,
+          "provider": "build:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+          "provider_class": "default",
+          "weak_alias": false
+        }
+      ],
+      "candidates_coverage": "complete",
+      "device": 8,
+      "first_ns": 10,
+      "generation": 0,
+      "inode": 100,
+      "last_ns": 90,
+      "object": "build:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "offset": 4096
+    },
+    {
+      "calls": 300,
+      "candidates": [
+        {
+          "algorithm_classes": [
+            "SHA-256"
+          ],
+          "funcid": 7,
+          "op": 1,
+          "provider": "build:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+          "provider_class": "default",
+          "weak_alias": false
+        }
+      ],
+      "candidates_coverage": "complete",
+      "device": 8,
+      "first_ns": 10,
+      "generation": 0,
+      "inode": 100,
+      "last_ns": 90,
+      "object": "build:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "offset": 8192
+    },
+    {
+      "calls": 100,
+      "candidates": [
+        {
+          "algorithm_classes": [
+            "AES-256-GCM"
+          ],
+          "funcid": 21,
+          "op": 2,
+          "provider": "build:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+          "provider_class": "default",
+          "weak_alias": false
+        },
+        {
+          "algorithm_classes": [
+            "ARIA-256-GCM"
+          ],
+          "funcid": 21,
+          "op": 2,
+          "provider": "build:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+          "provider_class": "default",
+          "weak_alias": true
+        }
+      ],
+      "candidates_coverage": "complete",
+      "device": 8,
+      "first_ns": 10,
+      "generation": 0,
+      "inode": 200,
+      "last_ns": 90,
+      "object": "build:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+      "offset": 4096
+    },
+    {
+      "calls": 0,
+      "candidates": [
+        {
+          "algorithm_classes": [
+            "SHA-384"
+          ],
+          "funcid": 9,
+          "op": 1,
+          "provider": "unverified:8:123456",
+          "provider_class": "third-party:xyz",
+          "weak_alias": false
+        }
+      ],
+      "candidates_coverage": "complete",
+      "device": 8,
+      "first_ns": 10,
+      "generation": 0,
+      "inode": 300,
+      "last_ns": 90,
+      "object": "unverified:8:123456",
+      "offset": 12288
+    }
+  ],
+  "target": {
+    "argv_redacted": true,
+    "comm": "demo",
+    "container_id": "",
+    "image_digest": "",
+    "pid": 7
+  },
+  "traversal": {
+    "admitted": {
+      "12": 4,
+      "7": 10
+    },
+    "admitted_unknown": [
+      9
+    ],
+    "census_loss": 2,
+    "count": {
+      "path": "/lib/osslscope/osslscope-count",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "entries": [
+      {
+        "alg_count": 7,
+        "generation": 9,
+        "op": 7,
+        "outcome": {
+          "Complete": {
+            "cached": false,
+            "true_t": 6
+          }
+        },
+        "row_count": 3,
+        "seq": 0,
+        "tid": 7,
+        "true_t": {
+          "Proven": 6
+        }
+      },
+      {
+        "alg_count": 5,
+        "generation": null,
+        "op": 12,
+        "outcome": {
+          "Partial": {
+            "reasons": [
+              {
+                "Holes": [
+                  3
+                ]
+              },
+              {
+                "Trunc": 6
+              },
+              {
+                "CacheShrink": {
+                  "cached": 9,
+                  "observed": 4
+                }
+              },
+              "DrainLoss"
+            ]
+          }
+        },
+        "row_count": 0,
+        "seq": 1,
+        "tid": 7,
+        "true_t": {
+          "Candidate": 4
+        }
+      }
+    ],
+    "findings": 1,
+    "harvest": {
+      "path": "/lib/osslscope/osslscope-harvest",
+      "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+    },
+    "members": {
+      "path": "/lib/osslscope/osslscope-members",
+      "sha256": "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae"
+    },
+    "polls": 3,
+    "records": 2
+  },
+  "window": {
+    "effective_end_ns": 100,
+    "effective_start_ns": 0,
+    "requested_end_ns": 100,
+    "requested_start_ns": 0,
+    "signal_cut": false
+  }
+}
