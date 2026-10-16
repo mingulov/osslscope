@@ -739,6 +739,13 @@ fn fix1_duplicate_slot_taints_both() {
     b2.push_alg(alg(TIDA, 0, 0, wire::ALG_OK));
     b2.push_alg(alg_arr(TIDA, 0, 0, wire::ALG_OK, ARR, 0)); // same slot again
     o.ingest(&b2);
+    // R35 quiescence: the take marks, the quiet batch closes (the
+    // taint verdict is unchanged — only its delivery waits out one
+    // drain for the batch's faults).
+    o.ingest(&ScanBatch {
+        quiesced: false,
+        ..ScanBatch::default()
+    });
     // Predecessor taints immediately; the successor carries the
     // sticky taint to its close.
     assert!(matches!(
@@ -788,6 +795,13 @@ fn fix1_multi_array_taints_both() {
     b2.push_alg(alg(TIDA, 0, 0, wire::ALG_OK));
     b2.push_alg(alg_arr(TIDA, 0, 1, wire::ALG_OK, ARRB, 0));
     o.ingest(&b2);
+    // R35 quiescence: the take marks, the quiet batch closes (the
+    // taint verdict is unchanged — only its delivery waits out one
+    // drain for the batch's faults).
+    o.ingest(&ScanBatch {
+        quiesced: false,
+        ..ScanBatch::default()
+    });
     assert!(matches!(
         o.done()[0].outcome,
         Outcome::Tainted { by_seq: 1 }
@@ -1139,8 +1153,11 @@ fn fix2_dangling_taints_both() {
     b.push_ret(ret(TIDA, 0, 0));
     b.push_alg(alg(TIDA, 0, 0, wire::ALG_OK));
     b.push_alg(alg_arr(TIDA, 0, 1, wire::ALG_EMPTY, ARR, 0));
-    b.push_call(call(TIDA, 1, false, wire::SKIP_ADMITTED)); // successor closes 0; trails RET-less
+    b.push_call(call(TIDA, 1, false, wire::SKIP_ADMITTED)); // successor marks 0; trails RET-less
     o.ingest(&b);
+    // R35 quiescence: the take marks, the quiet batch retires seq 0
+    // (verdicts below unchanged — the backstop still taints both).
+    o.ingest(&nonquiesced(1_500));
     assert_eq!(o.open_count(), 1);
     o.finish(2_000);
     assert_eq!(o.open_count(), 0);
@@ -1261,6 +1278,12 @@ fn fix4_recent_survives_foreign_flood() {
         flooded += o.take_done().len();
         let _ = o.take_findings();
     }
+    // R35 quiescence: same-batch ring + take holds one quiet batch,
+    // so each flood batch retires its predecessor (one-batch lag) —
+    // flush the trailing open before counting (verdicts unchanged).
+    o.ingest(&nonquiesced(9_000));
+    flooded += o.take_done().len();
+    let _ = o.take_findings();
     assert_eq!(
         flooded, 5000,
         "the flood must actually close (else vacuous)"
@@ -2244,4 +2267,214 @@ fn k1_corrupt_idx_bounds_consumer_range() {
             );
         }
     }
+}
+
+/// Successor operation on the same thread (the R35 schedule's
+/// later admitted query of another op — its take must not close
+/// a predecessor whose fault data is still in flight).
+const OP_SUCC: u32 = 9;
+const ARR_SUCC: u64 = 0x8000;
+
+fn call_op(tid: u32, seq: u64, op: u32) -> wire::ScanCallEvent {
+    wire::ScanCallEvent {
+        kind: wire::KIND_SCAN_CALL,
+        op,
+        tid,
+        flags: wire::make_call_flags(false, wire::SKIP_ADMITTED),
+        seq,
+    }
+}
+
+fn nonquiesced(now_ns: u64) -> ScanBatch {
+    ScanBatch {
+        quiesced: false,
+        now_ns,
+        ..ScanBatch::default()
+    }
+}
+
+/// Two-slot scope (terminator at 1, no holes below it): the shape
+/// under which a fault-free predecessor honestly Completes, so a
+/// stale-fault masking shows as Complete (the R35 NEW regression).
+fn two_slot_scope() -> OracleScope {
+    let mut scope = OracleScope::full();
+    scope.attached = [0u32, 1].into_iter().collect();
+    scope.expected = 2;
+    scope
+}
+
+/// Round 2, residual B (R35 stale-snapshot race — the review's
+/// exact schedule): ALG_OK@0, one ROW, dispatch-read abort,
+/// EMPTY@1, then a successor admitted take of another op on the
+/// same thread. The backend snapshots TRUNC before draining the
+/// ring, so the first batch carries the ring evidence with stale
+/// empty faults; the abort's flag lands in the NEXT drain. The
+/// successor's take must NOT close the predecessor against the
+/// stale snapshot (pre-fix: Complete); the predecessor holds one
+/// quiet batch, the next poll's fault joins it, and it closes
+/// Partial with the retained WALK_READ bit. The successor then
+/// closes normally through the real backstop (`finish`).
+#[test]
+fn r35_successor_holds_predecessor_for_next_poll_fault() {
+    let mut o = Oracle::new(two_slot_scope());
+    let mut b1 = nonquiesced(1_000);
+    b1.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b1.push_ret(ret(TIDA, 0, 0));
+    b1.push_alg(alg(TIDA, 0, 0, wire::ALG_OK));
+    b1.push_row(row(TIDA, 0, 0));
+    b1.push_alg(alg_arr(TIDA, 0, 1, wire::ALG_EMPTY, ARR, 0));
+    b1.push_call(call_op(TIDA, 1, OP_SUCC));
+    // No TRUNC in this batch: the pre-drain snapshot predates the
+    // abort's flag write (stale empty faults — the race).
+    o.ingest(&b1);
+    assert!(
+        o.done().is_empty(),
+        "successor take must hold a predecessor with same-batch ring evidence \
+         (fault data may be stale): {:?}",
+        o.done().iter().map(|w| &w.outcome).collect::<Vec<_>>()
+    );
+    // Next poll: the abort's flag lands; the successor's own
+    // evidence arrives (RET-joined, so the backstop evaluates it
+    // instead of tainting the pair).
+    let mut b2 = nonquiesced(2_000);
+    b2.trunc.insert(OP, wire::TRUNC_WALK_READ);
+    let mut succ_ret = ret(TIDA, 1, 0);
+    succ_ret.op = OP_SUCC;
+    succ_ret.arr = ARR_SUCC;
+    b2.push_ret(succ_ret);
+    let mut succ_empty = alg_arr(TIDA, 1, 0, wire::ALG_EMPTY, ARR_SUCC, 0);
+    succ_empty.op = OP_SUCC;
+    b2.push_alg(succ_empty);
+    o.ingest(&b2);
+    assert_eq!(o.done().len(), 1, "predecessor closes on the quiet batch");
+    let pred = &o.done()[0];
+    assert_eq!((pred.tid, pred.seq), (TIDA, 0));
+    assert!(
+        matches!(
+            pred.outcome,
+            Outcome::Partial { ref reasons } if reasons
+                .iter()
+                .any(|r| matches!(r, PartialReason::Trunc(b) if b & wire::TRUNC_WALK_READ != 0))
+        ),
+        "late fault must degrade the held predecessor: {:?}",
+        pred.outcome
+    );
+    // The successor closes through the real backstop (RET-joined:
+    // evaluated, never tainting its partner).
+    o.finish(3_000);
+    assert_eq!(o.done().len(), 2);
+    assert_eq!((o.done()[1].tid, o.done()[1].seq), (TIDA, 1));
+    assert!(
+        !matches!(
+            o.done()[1].outcome,
+            Outcome::Tainted { .. } | Outcome::Abandoned { .. }
+        ),
+        "successor closes normally: {:?}",
+        o.done()[1].outcome
+    );
+}
+
+/// R35 battery: no fault anywhere — the deferral is purely timing
+/// (verdict-preserving). Same-batch ring + successor holds, then
+/// the quiet batch closes Complete.
+#[test]
+fn r35_hold_is_verdict_preserving_without_faults() {
+    let mut o = Oracle::new(two_slot_scope());
+    let mut b1 = nonquiesced(1_000);
+    b1.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b1.push_ret(ret(TIDA, 0, 0));
+    b1.push_alg(alg(TIDA, 0, 0, wire::ALG_OK));
+    b1.push_row(row(TIDA, 0, 0));
+    b1.push_alg(alg_arr(TIDA, 0, 1, wire::ALG_EMPTY, ARR, 0));
+    b1.push_call(call_op(TIDA, 1, OP_SUCC));
+    o.ingest(&b1);
+    assert!(
+        o.done().is_empty(),
+        "fault-free take still holds: {:?}",
+        o.done()
+    );
+    o.ingest(&nonquiesced(2_000));
+    assert_eq!(o.done().len(), 1);
+    assert!(
+        matches!(o.done()[0].outcome, Outcome::Complete { .. }),
+        "quiet batch closes the fault-free predecessor Complete: {:?}",
+        o.done()[0].outcome
+    );
+}
+
+/// R35 battery: settled evidence + a fresh successor take closes in
+/// the SAME batch (no deferral when the ring predates the fault
+/// snapshot — only same-batch ring waits out one drain).
+#[test]
+fn r35_settled_evidence_closes_on_fresh_take() {
+    let mut o = Oracle::new(two_slot_scope());
+    let mut b1 = nonquiesced(1_000);
+    b1.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b1.push_ret(ret(TIDA, 0, 0));
+    b1.push_alg(alg(TIDA, 0, 0, wire::ALG_OK));
+    b1.push_alg(alg_arr(TIDA, 0, 1, wire::ALG_EMPTY, ARR, 0));
+    o.ingest(&b1);
+    assert!(o.done().is_empty());
+    let mut b2 = nonquiesced(2_000);
+    b2.push_call(call_op(TIDA, 1, OP_SUCC));
+    o.ingest(&b2);
+    assert_eq!(o.done().len(), 1, "fresh take closes settled evidence");
+    assert_eq!((o.done()[0].tid, o.done()[0].seq), (TIDA, 0));
+    assert!(
+        matches!(o.done()[0].outcome, Outcome::Complete { .. }),
+        "settled fault-free predecessor Completes: {:?}",
+        o.done()[0].outcome
+    );
+}
+
+/// R35 battery: a fault for the SUCCESSOR's op alone does not
+/// degrade the held predecessor (per-op fault scoping survives
+/// the deferral — the predecessor still Completes).
+#[test]
+fn r35_unrelated_op_fault_does_not_degrade_held_predecessor() {
+    let mut o = Oracle::new(two_slot_scope());
+    let mut b1 = nonquiesced(1_000);
+    b1.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b1.push_ret(ret(TIDA, 0, 0));
+    b1.push_alg(alg(TIDA, 0, 0, wire::ALG_OK));
+    b1.push_alg(alg_arr(TIDA, 0, 1, wire::ALG_EMPTY, ARR, 0));
+    b1.push_call(call_op(TIDA, 1, OP_SUCC));
+    o.ingest(&b1);
+    assert!(o.done().is_empty());
+    let mut b2 = nonquiesced(2_000);
+    b2.trunc.insert(OP_SUCC, wire::TRUNC_WALK_READ);
+    o.ingest(&b2);
+    assert_eq!(o.done().len(), 1);
+    assert!(
+        matches!(o.done()[0].outcome, Outcome::Complete { .. }),
+        "successor-op fault must not touch the predecessor: {:?}",
+        o.done()[0].outcome
+    );
+}
+
+/// R35 battery: successor take arriving BEFORE the predecessor's
+/// RET no longer strands it to the backstop (sticky successor —
+/// the pre-fix per-batch take scan forgot takes from older
+/// batches; now the close lands one quiet batch after the RET).
+#[test]
+fn r35_take_before_ret_closes_after_quiet_batch() {
+    let mut o = Oracle::new(two_slot_scope());
+    let mut b1 = nonquiesced(1_000);
+    b1.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b1.push_call(call_op(TIDA, 1, OP_SUCC));
+    o.ingest(&b1);
+    assert!(o.done().is_empty());
+    let mut b2 = nonquiesced(2_000);
+    b2.push_ret(ret(TIDA, 0, 0));
+    b2.push_alg(alg(TIDA, 0, 0, wire::ALG_NOIMP));
+    b2.push_alg(alg_arr(TIDA, 0, 1, wire::ALG_EMPTY, ARR, 0));
+    o.ingest(&b2);
+    assert!(
+        o.done().is_empty(),
+        "RET batch is not quiet (fault data may lag the RET): {:?}",
+        o.done()
+    );
+    o.ingest(&nonquiesced(3_000));
+    assert_eq!(o.done().len(), 1, "quiet batch closes the take-marked open");
+    assert_eq!((o.done()[0].tid, o.done()[0].seq), (TIDA, 0));
 }
