@@ -911,6 +911,9 @@ impl SlotSpec {
 pub struct Fixture {
     ptr: *mut u8,
     len: usize,
+    /// Total mapped span incl. guard pages (Drop only — `len`
+    /// stays the fixture RW span for temp/pageout/pretouch).
+    span: usize,
     #[allow(dead_code)]
     fd: OwnedFd,
     pub array: u64,
@@ -938,6 +941,31 @@ impl Fixture {
     /// a "clean" E=7 walk). The past-T reach itself is pinned by
     /// L3-tail, not hidden here.
     pub fn build_padded(slots: &[SlotSpec], tail: &[SlotSpec], array_slots: usize) -> Fixture {
+        Self::build_padded_guarded(slots, tail, array_slots, 0)
+    }
+
+    /// Abort-variant fixture (R21 finding 8): the members walk reads
+    /// 513 slot cells (0..=512 × 32B = 16416B) from the array base,
+    /// so a bare 1-page munmap leaves slots 128+ at the mercy of the
+    /// lane's neighbor mappings (lane-b's readable neighbor emitted
+    /// 256 ALGs). Five PROT_NONE guard pages make the post-munmap
+    /// neighborhood lane-independent: every slot read aborts.
+    pub fn build_abort_isolated(slots: &[SlotSpec]) -> Fixture {
+        Self::build_padded_guarded(slots, &[], slots.len() + 1, 5)
+    }
+
+    /// Fixture mapping length: the part the leg may munmap (the
+    /// guard tail stays PROT_NONE for the fixture's life).
+    pub fn mapped_len(&self) -> usize {
+        self.len
+    }
+
+    fn build_padded_guarded(
+        slots: &[SlotSpec],
+        tail: &[SlotSpec],
+        array_slots: usize,
+        guard_pages: usize,
+    ) -> Fixture {
         assert!(
             array_slots >= slots.len() + 1 + tail.len(),
             "array must fit live + terminator + tail"
@@ -965,6 +993,7 @@ impl Fixture {
         let total = disp_base + disp_len;
         let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
         let len = total.div_ceil(page) * page;
+        let span = len + guard_pages * page;
         let fd = unsafe {
             let cname = std::ffi::CString::new("members_fixture").unwrap();
             let fd = libc::memfd_create(cname.as_ptr(), 0);
@@ -972,7 +1001,7 @@ impl Fixture {
             assert_eq!(libc::ftruncate(fd, len as libc::off_t), 0, "ftruncate");
             let ptr = libc::mmap(
                 std::ptr::null_mut(),
-                len,
+                span,
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_SHARED,
                 fd,
@@ -980,6 +1009,17 @@ impl Fixture {
             );
             assert_ne!(ptr, libc::MAP_FAILED, "mmap fixture");
             std::ptr::write_bytes(ptr as *mut u8, 0, len);
+            if guard_pages > 0 {
+                assert_eq!(
+                    libc::mprotect(
+                        (ptr as *mut u8).add(len) as *mut libc::c_void,
+                        guard_pages * page,
+                        libc::PROT_NONE,
+                    ),
+                    0,
+                    "mprotect guard tail"
+                );
+            }
             (OwnedFd::from_raw_fd(fd), ptr as *mut u8)
         };
         let base = fd.1 as u64;
@@ -1003,6 +1043,7 @@ impl Fixture {
         Fixture {
             ptr: fd.1,
             len,
+            span,
             fd: fd.0,
             array: base,
             live: slots.len(),
@@ -1130,9 +1171,56 @@ impl Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         unsafe {
-            libc::munmap(self.ptr as *mut libc::c_void, self.len);
+            libc::munmap(self.ptr as *mut libc::c_void, self.span);
         }
     }
+}
+
+/// R21 finding 8: the abort-variant fixture isolates its own
+/// neighborhood — PROT_NONE guard pages after the fixture mapping
+/// covering the walker's max reach (slots 0..=512 × 32B), so a
+/// 1-page munmap deterministically aborts every slot read on every
+/// lane (no readable-neighbor emits). Host-runnable: pure
+/// userspace layout, verified against /proc/self/maps.
+#[test]
+fn abort_fixture_carries_prot_none_guards() {
+    let slots = vec![SlotSpec::live("MRQA", 100, vec![(83, 0x8102)])];
+    let fx = Fixture::build_abort_isolated(&slots);
+    let page = 4096usize;
+    assert_eq!(fx.array as usize % page, 0, "array page-aligned");
+    let base = fx.array as usize;
+    // The walker's farthest target read: slot-512 cell end.
+    let reach_end = base + 513 * 32;
+    let guard_start = base + fx.mapped_len();
+    assert!(
+        reach_end <= guard_start + 5 * page,
+        "guard span must cover slot 512 (reach_end={reach_end:#x})"
+    );
+    let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+    let mut guard_seen = false;
+    for line in maps.lines() {
+        let mut f = line.split_whitespace();
+        let (Some(range), Some(perms)) = (f.next(), f.next()) else {
+            continue;
+        };
+        let Some((s, e)) = range.split_once('-') else {
+            continue;
+        };
+        let (Ok(s), Ok(e)) = (
+            usize::from_str_radix(s, 16),
+            usize::from_str_radix(e, 16),
+        ) else {
+            continue;
+        };
+        if s < guard_start + 5 * page && e > guard_start {
+            guard_seen = true;
+            assert!(
+                perms.starts_with("---"),
+                "guard span must be PROT_NONE, found {perms} on {range}"
+            );
+        }
+    }
+    assert!(guard_seen, "guard span missing from maps");
 }
 
 /// Offline: the query target resolves to a real function offset.
@@ -3789,7 +3877,9 @@ fn d_retire_quiet() {
         let loaded = &attached.loaded;
         let tid = self_tid();
         let slots = vec![SlotSpec::live("MRQA", 100, vec![(83, 0x8102)])];
-        let fx = Fixture::build(&slots, &[]);
+        // Neighbor-isolated (R21 finding 8): without guards, slots
+        // 128+ read the lane's neighbor mappings post-munmap.
+        let fx = Fixture::build_abort_isolated(&slots);
         fx.pretouch();
         populate_alg_class(loaded, &fx.classes);
         FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
@@ -3803,10 +3893,12 @@ fn d_retire_quiet() {
         // WALK_READ-alone pin needs a clean baseline.
         clear_trunc(loaded, "abort-control");
         // Unmap the array page: every slot read aborts (slot 0
-        // included) — RET must still present.
+        // included) — RET must still present. The PROT_NONE guard
+        // tail (never unmapped) keeps slots 128+ aborting
+        // deterministically on every lane (R21 finding 8).
         let page = 4096usize;
         assert_eq!(fx.array as usize % page, 0, "array page-aligned");
-        let rc = unsafe { libc::munmap(fx.array as *mut libc::c_void, page) };
+        let rc = unsafe { libc::munmap(fx.array as *mut libc::c_void, fx.mapped_len()) };
         assert_eq!(rc, 0, "munmap array page");
         fire(OP as i32, 1);
         let d = drain(loaded);
