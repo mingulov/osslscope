@@ -246,6 +246,8 @@ fn finalize_doc(sites: Vec<SiteExecution>) -> CaptureDocument {
         disposition: None,
         policy: None,
         legacy_partition: LegacyCallPartition::default(),
+        traversal: None,
+        engine_observations: Vec::new(),
     })
 }
 

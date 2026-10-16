@@ -1752,6 +1752,7 @@ fn engine_doc(obs: Vec<EngineObservation>) -> CaptureDocument {
         policy: None,
         legacy_partition: LegacyCallPartition::default(),
         engine_observations: obs,
+        traversal: None,
     })
 }
 
@@ -1968,6 +1969,7 @@ fn real_engine_doc(scripts: Vec<PollScript>, objects: Vec<ObjectRecord>) -> Capt
         policy: None,
         legacy_partition: LegacyCallPartition::default(),
         engine_observations: obs,
+        traversal: None,
     });
     assert!(matches!(doc.status, Completeness::Complete));
     // Attach the evaluated policy record, as `check` does.
@@ -2384,6 +2386,7 @@ fn engine_runtime_salvage_evaluates() {
         policy: None,
         legacy_partition: LegacyCallPartition::default(),
         engine_observations: obs,
+        traversal: None,
     });
     let v = evaluate_document(std::slice::from_ref(&PolicyRule::deny_engine()), &doc);
     assert_eq!(v.overall(), PolicyOutcome::Violation);
@@ -2492,6 +2495,7 @@ fn engine_unrelated_provider_calls_pass_and_conserve() {
             5,
             EngineWindow::PreWindow,
         )],
+        traversal: None,
     });
     let v = evaluate_document(std::slice::from_ref(&PolicyRule::deny_engine()), &doc);
     assert_eq!(v.rules[0].verdict, RuleVerdict::Pass);

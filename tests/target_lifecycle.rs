@@ -2870,6 +2870,7 @@ fn ordinary_production_run_counts_real_crypto_free_of_polling_fallback() {
         harvest_timeout: Duration::from_secs(30),
         grace: Duration::from_secs(5),
         image_digest: String::new(),
+        members_object: None,
     };
     let cap = osslscope::capture::run(
         &cfg,

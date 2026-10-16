@@ -461,6 +461,7 @@ fn runtime_violation_doc() -> CaptureDocument {
             definite: 500,
             possible: None,
             evidence: vec![evidence_ref(FP_A, 8, 100, 0x1000, 0, 500)],
+            engine_evidence: Vec::new(),
         }],
     });
     let doc = finalize_honest(input);
