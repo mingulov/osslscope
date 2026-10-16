@@ -15,7 +15,8 @@ CI: pid attach is racy and staging-only by contract.
   [who should NOT adopt](what-it-proves.md#who-should-not-adopt-read-before-installing)).
 - On Ubuntu 24.04 **servers** (which default to the GA kernel),
   install the HWE kernel first -- the 6.8 GA kernel is below the
-  6.9 floor and `doctor` will refuse it:
+  6.9 support floor and fails `doctor`'s functional feature
+  probe (`doctor` gates features, never the release number):
 
 ```sh
 sudo apt-get install -y linux-generic-hwe-24.04

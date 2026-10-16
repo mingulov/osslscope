@@ -90,9 +90,14 @@ getcap "$HOME/.local/bin/osslscope"   # expect: cap_bpf,cap_perfmon+ep
   --object "$HOME/.local/lib/osslscope/osslscope-harvest" \
   --count-object "$HOME/.local/lib/osslscope/osslscope-count" \
   --members-object "$HOME/.local/lib/osslscope/osslscope-members"
-# expect: verdict: ok (the objects-members row reports pass; on a
-# pair-only install it reports info — traversal unavailable, the
-# harvest/count pair unaffected)
+# expect: verdict: ok (the objects-members row reports pass)
+# On a pair-only install, omit --members-object entirely (passing
+# an explicit path to a missing object fails the row instead):
+"$HOME/.local/bin/osslscope" doctor \
+  --object "$HOME/.local/lib/osslscope/osslscope-harvest" \
+  --count-object "$HOME/.local/lib/osslscope/osslscope-count"
+# expect: verdict: ok; the objects-members row reports info —
+# traversal unavailable, the harvest/count pair unaffected
 "$HOME/.local/bin/osslscope" --help   # lists doctor|inspect|report|check|alias-audit
 ```
 
@@ -105,9 +110,11 @@ fallback otherwise).
 Diagnostics to know:
 
 - Missing `setcap` (`libcap2-bin` on Debian/Ubuntu, `libcap` on
-  Fedora/RHEL) never fails an install or a package transaction;
-  every script prints the labeled-sudo fallback and `doctor`
-  repeats the remediation.
+  Fedora/RHEL) never fails a default install or a package
+  transaction; every script prints the labeled-sudo fallback
+  and `doctor` repeats the remediation. Explicit
+  `install-dev.sh --setcap` is the exception: it exits 3 with
+  a libcap install hint when the tool is absent.
 - `NoNewPrivs=1` in the install report or `NNP=1` in `doctor`
   means processes exec'd from that environment cannot gain file
   capabilities — run the installed binary outside it.

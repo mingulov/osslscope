@@ -56,7 +56,11 @@ Required: `schema_version`, `target`, `openssl`, `window`,
 Optional: `disposition` (omitted when never recorded), `policy`
 (`check` documents only; `report` omits it), `context`
 (omitted when unrecorded), `engine_observations` (omitted when
-none were observed), `attach_diagnostics` (omitted when no
+none were observed), `traversal` (omitted on harvest-only
+runs; traversal runs name the exact selected triple plus
+provenance and per-record facts: records, findings, polls,
+admitted, admitted_unknown, census_loss, entries),
+`attach_diagnostics` (omitted when no
 attach failed: sorted, deduped, capped producer literals
 identifying failed attaches — diagnostic only, counters stay
 the exact counts).
@@ -179,10 +183,11 @@ key renders above.) Since v2.1, sites carry the optional
 ns, omitted when the producer never recorded it. Installed is not
 counted — `installed_at` bounds the install moment while
 `first_ns` stamps the first counted execution, so per site
-installed-at vs first-counted is distinguishable; a site with no
-counted executions never renders (quiet cookies stay covered by
-`ScopeCoverage.attached`, not gaps — the per-site never-counted
-rendering is P7's per-site spec).
+installed-at vs first-counted is distinguishable. Zero-call
+sites still render in the document (`0 calls, quiet`); the
+never-counted omission applies only to live capture's
+counted-executions list (quiet cookies stay covered by
+`ScopeCoverage.attached`, not gaps).
 
 A site is *definite* only when it executed, its candidate set is
 complete, and every candidate agrees on provider, provider class,
@@ -386,7 +391,11 @@ note: argv redacted; file offsets are not runtime addresses; window-only claims
 
 Candidate lines never carry counts (the site total is shared, not
 per-alias). Offsets are decimal file offsets, explicitly labeled;
-no `0x` bytes appear anywhere (`output_contract` scans for them).
+numeric offsets and addresses never render `0x`-shaped
+(`output_contract` scans for address-shaped bytes). That
+guarantee covers numeric formatting only: arbitrary
+`--image-digest` text is accepted verbatim and rendered as-is,
+so operator-supplied text may contain `0x`.
 
 The three context lines after the header always render
 (`src/report.rs` `render_human`): `duration` derives from the

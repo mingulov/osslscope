@@ -51,10 +51,12 @@ container/image provenance, and unconditional
 key adds host kernel release plus wall-clock edges for
 correlation only. The CBOM (`story.cdx.json`) carries one
 `cryptographic-asset` component per definite site, each with
-provider (+ object path / build-id), op, funcid, call count,
+provider and backing-object fingerprints (no display paths),
+op, funcid, call count,
 generation, and window edges (the staging record historically
 counted 62 sites; the v2 definite-component count needs a
-re-run). Ambiguous and unresolved sites contribute no
+re-run). Display paths live in the report's `objects`
+section, joined by fingerprint. Ambiguous and unresolved sites contribute no
 components; their omitted counts stay explicit metadata, and
 PARTIAL evidence travels as a `metadata` disclaimer property, so
 both caveats survive export.
@@ -138,11 +140,14 @@ salvaged as `runtime`-fatal: every collected observation
 survives, policy still evaluates (a proved violation exits 10),
 and anything else exits 1.
 
-The violation entry carries the actionability tuple -- rule +
-matcher, the executed identity (definite site evidence with
-conserved definite/possible bounds), window edges, pid/comm,
-container id, image digest, and provider object path + build-id
-(no cmdline: argv is redacted) -- which is what [violation
+The violation entry carries rule + matcher and the executed
+identity as site evidence refs (object/device/inode/offset,
+generation, calls) with conserved definite/possible bounds;
+the rest of the actionability tuple -- window edges,
+pid/comm, container id, image digest, provider display paths
+(no cmdline: argv is redacted) -- joins through the
+`target`, `window`, `sites`, `objects`, and
+`engine_observations` sections, which is what [violation
 triage](violation-triage.md) walks to the owning service. Wire
 it per [CI gate recipes](ci-recipes.md): exit 3 + `pass` is
 green-with-artifacts, exit 10 fails the gate, exit 11 fails
