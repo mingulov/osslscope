@@ -1182,7 +1182,7 @@ fn h2_t1_close_tail_residual_downgrades_denominators_and_sites() {
     // A-6: a close-tail loss residual (snapshot counters beyond
     // what polls adapted) must propagate through taint into
     // per-op denominators AND already-emitted site coverages —
-    // not sit in extra_loss while Complete claims stand.
+    // not sit in extra_counters while Complete claims stand.
     // The target exits cleanly here, so this also pins that the
     // H2/T5 exemption is source-scoped (maps only): a ring-row
     // residual under an exited target still taints.
@@ -2693,12 +2693,61 @@ fn already_exited_child_preserves_status() {
 }
 
 #[test]
+fn owned_exit_close_join_skip_is_not_a_gap() {
+    // R21-F1: a reaped owned child cannot execute past its death,
+    // so the skipped final join (the pin check misreads the gone
+    // /proc entry as a recycle) is inapplicable, not missed — the
+    // clean owned-exit shape reaches COMPLETE with the skip
+    // recorded as an Activity counter (audit trail), never a Loss.
+    // (The over-budget and --pid startup-gap forcers stand: expiry
+    // is PARTIAL by PRD, pre-window --pid blindness is honest.)
+    let mut h = Harness::fresh("exit-recycle-complete");
+    h.snapshot_attached();
+    let cand1 = cand(
+        "/p/provider.so",
+        backing_of(&h.staged, h.off),
+        1,
+        11,
+        "SHA-256",
+        false,
+        "ok",
+    );
+    h.polls.push_back(DiscoveryDelta {
+        candidates: vec![cand1],
+        tables: vec![terminated(1, 0)],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    h.polls.push_back(DiscoveryDelta::default());
+    h.plans.insert(
+        2,
+        FirePlan {
+            fires: vec![(BASE_NS + 600_000_000, 7)],
+            shortfall: 0,
+            cancel: false,
+        },
+    );
+    h.exit_at_ns = Some(BASE_NS + 1_000_000_000);
+    h.exit_code = 0;
+    h.finish_recycled = true;
+    let (out, _) = h.run();
+    let c = out.unwrap();
+    assert!(matches!(c.outcome, Outcome::Complete), "{c:?}");
+    assert!(c.reasons.is_empty(), "{:?}", c.reasons);
+    assert!(matches!(c.document.status, Completeness::Complete));
+    assert_eq!(counter_value(&c, "discovery.close_join_skipped"), 1);
+}
+
+#[test]
 fn owned_exit_survives_spurious_recycle_at_finish() {
     // Owned child exits mid-window and is reaped before the
     // discovery close, whose pin check then misreads the gone
     // /proc entry as a recycle. The capture survives on the
     // pre-close snapshot: exit and disposition preserved, the
-    // skipped final join explicit loss — never a lost capture.
+    // skipped final join an explicit Activity counter — never a
+    // lost capture. (PARTIAL here via no-query: no trigger ever
+    // observed — not via the skipped join; see
+    // owned_exit_close_join_skip_is_not_a_gap.)
     let mut h = Harness::fresh("exit-recycle");
     h.snapshot_attached();
     h.exit_at_ns = Some(BASE_NS + 100_000_000);

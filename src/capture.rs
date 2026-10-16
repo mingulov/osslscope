@@ -4163,7 +4163,10 @@ struct Runner<'x, D, B: CountBackend, T, L, C: ClockPort, P: ProcPort> {
     reasons: HashSet<String>,
     adapter: AdapterState,
     activity: Vec<GapCounter>,
-    extra_loss: Vec<GapCounter>,
+    /// Close/salvage-path counters beyond the standard set (Loss
+    /// forces PARTIAL; Activity rides as audit trail — e.g. the
+    /// reaped-owned-child skipped join).
+    extra_counters: Vec<GapCounter>,
     in_window_trip: HashMap<u64, u64>,
     in_window_hits: Vec<legacy::TripHit>,
     in_window_lgcalls: u64,
@@ -5080,7 +5083,7 @@ where
                     Some(drained)
                 }
                 Err(e) => {
-                    self.extra_loss.push(typed_counter(
+                    self.extra_counters.push(typed_counter(
                         "count.close_failed",
                         CounterKind::Loss,
                         CounterUnits::Events,
@@ -5103,7 +5106,7 @@ where
                 match self.discovery.finish() {
                     Ok(snapshot) => snapshot,
                     Err(e) => {
-                        self.extra_loss.push(typed_counter(
+                        self.extra_counters.push(typed_counter(
                             "discovery.finish_failed",
                             CounterKind::Loss,
                             CounterUnits::Events,
@@ -5121,7 +5124,7 @@ where
             None => match self.target.finish_observation() {
                 Ok(disposition) => Some(disposition),
                 Err(e) => {
-                    self.extra_loss.push(typed_counter(
+                    self.extra_counters.push(typed_counter(
                         "target.finish_failed",
                         CounterKind::Loss,
                         CounterUnits::Events,
@@ -5242,7 +5245,7 @@ where
         self.traversal = None;
         let mut close_failed = false;
         if self.count.close_and_drain(self.cfg.grace).is_err() {
-            self.extra_loss.push(typed_counter(
+            self.extra_counters.push(typed_counter(
                 "count.close_failed",
                 CounterKind::Loss,
                 CounterUnits::Events,
@@ -5252,7 +5255,7 @@ where
             close_failed = true;
         }
         if self.discovery.finish().is_err() {
-            self.extra_loss.push(typed_counter(
+            self.extra_counters.push(typed_counter(
                 "discovery.finish_failed",
                 CounterKind::Loss,
                 CounterUnits::Events,
@@ -5280,7 +5283,7 @@ where
             fenced: Vec::new(),
             objects: Vec::new(),
             coverage: Vec::new(),
-            counters: self.extra_loss.clone(),
+            counters: self.extra_counters.clone(),
             fatal: Some(evidence::FatalKind::Recycled),
             target: doc_target(
                 self.info.pid,
@@ -5421,7 +5424,7 @@ where
         reasons: HashSet::new(),
         adapter: AdapterState::default(),
         activity: Vec::new(),
-        extra_loss: Vec::new(),
+        extra_counters: Vec::new(),
         in_window_trip: HashMap::new(),
         in_window_hits: Vec::new(),
         in_window_lgcalls: 0,
@@ -5713,7 +5716,7 @@ where
                     self.child_exit = Some(code);
                 }
             }
-            self.extra_loss.push(typed_counter(
+            self.extra_counters.push(typed_counter(
                 "capture.over_budget",
                 CounterKind::Loss,
                 CounterUnits::Events,
@@ -5825,7 +5828,8 @@ where
         // so its /proc entry is gone and the discovery close misreads
         // that as a pid recycle. Snapshot first: on a spurious
         // recycle the pre-close state (plus an explicit skipped-join
-        // loss for the missed final map join) survives instead of
+        // Activity counter — audit trail, not a gap: the reaped
+        // child cannot execute past its death) survives instead of
         // losing the whole capture. Foreign targets keep the loud
         // recycle verdict — their pids really can be reused.
         let pre_close =
@@ -5836,9 +5840,16 @@ where
                 let recycled = e.downcast_ref::<Recycled>();
                 match (pre_close, recycled) {
                     (Some(pre), Some(r)) => {
-                        self.extra_loss.push(typed_counter(
+                        // R21-F1: a reaped owned child cannot execute
+                        // past its death, so the skipped final join
+                        // is inapplicable, not missed — an Activity
+                        // counter (audit trail), never a Loss (the
+                        // window is fulfilled through the exit; the
+                        // pre-close arm only exists with a known
+                        // child exit).
+                        self.extra_counters.push(typed_counter(
                             "discovery.close_join_skipped",
-                            CounterKind::Loss,
+                            CounterKind::Activity,
                             CounterUnits::Events,
                             CounterSource::Discovery,
                             1,
@@ -5920,7 +5931,7 @@ where
         salvage: Option<SalvageContext>,
     ) -> Capture {
         if self.cold_gap_queries > 0 {
-            self.extra_loss.push(typed_counter(
+            self.extra_counters.push(typed_counter(
                 "discovery.pre_window_queries",
                 CounterKind::Loss,
                 CounterUnits::Events,
@@ -5929,7 +5940,7 @@ where
             ));
         }
         if self.fork_exec_ignored > 0 {
-            self.extra_loss.push(typed_counter(
+            self.extra_counters.push(typed_counter(
                 "lifecycle.fork_exec_ignored",
                 CounterKind::Loss,
                 CounterUnits::Events,
@@ -5938,7 +5949,7 @@ where
             ));
         }
         if self.lifecycle_loss > 0 {
-            self.extra_loss.push(typed_counter(
+            self.extra_counters.push(typed_counter(
                 "lifecycle.scan_loss",
                 CounterKind::Loss,
                 CounterUnits::Events,
@@ -5947,7 +5958,7 @@ where
             ));
         }
         if self.lifecycle_dropped > 0 {
-            self.extra_loss.push(typed_counter(
+            self.extra_counters.push(typed_counter(
                 "lifecycle.signal_dropped",
                 CounterKind::Loss,
                 CounterUnits::Events,
@@ -5956,7 +5967,7 @@ where
             ));
         }
         if self.lifecycle_no_witness > 0 {
-            self.extra_loss.push(typed_counter(
+            self.extra_counters.push(typed_counter(
                 "lifecycle.no_witness",
                 CounterKind::Loss,
                 CounterUnits::Events,
@@ -5965,7 +5976,7 @@ where
             ));
         }
         if self.lifecycle_pending > 0 {
-            self.extra_loss.push(typed_counter(
+            self.extra_counters.push(typed_counter(
                 "lifecycle.drain_pending",
                 CounterKind::Loss,
                 CounterUnits::Events,
@@ -5974,7 +5985,7 @@ where
             ));
         }
         if self.lifecycle_exec_gap > 0 {
-            self.extra_loss.push(typed_counter(
+            self.extra_counters.push(typed_counter(
                 "lifecycle.exec_gap",
                 CounterKind::Loss,
                 CounterUnits::Events,
@@ -5998,7 +6009,7 @@ where
             ));
         }
         if self.fallback_partial {
-            self.extra_loss.push(typed_counter(
+            self.extra_counters.push(typed_counter(
                 "lifecycle.polling_fallback",
                 CounterKind::Loss,
                 CounterUnits::Events,
@@ -6007,7 +6018,7 @@ where
             ));
         }
         if self.maps_read_failed > 0 {
-            self.extra_loss.push(typed_counter(
+            self.extra_counters.push(typed_counter(
                 "discovery.maps_read_failed",
                 CounterKind::Loss,
                 CounterUnits::Events,
@@ -6016,7 +6027,7 @@ where
             ));
         }
         if self.relevance_capped > 0 {
-            self.extra_loss.push(typed_counter(
+            self.extra_counters.push(typed_counter(
                 "discovery.relevance_capped",
                 CounterKind::Loss,
                 CounterUnits::Sites,
@@ -6025,7 +6036,7 @@ where
             ));
         }
         if self.unverified_reads > 0 {
-            self.extra_loss.push(typed_counter(
+            self.extra_counters.push(typed_counter(
                 "discovery.unverified_read",
                 CounterKind::Loss,
                 CounterUnits::Sites,
@@ -6047,7 +6058,7 @@ where
             let adapted = self.adapter.loss_sums.get(source).copied().unwrap_or(0);
             if let Some(residual) = total.checked_sub(adapted) {
                 if residual > 0 {
-                    self.extra_loss.push(classify_loss(*source, residual));
+                    self.extra_counters.push(classify_loss(*source, residual));
                     // H2/T5: mid-run maps failures rode the deltas
                     // (op None → poll-global taint already fired),
                     // so a maps residual under an exited target is
@@ -6062,7 +6073,7 @@ where
             }
         }
         if snapshot.lossy_slots > 0 {
-            self.extra_loss.push(typed_counter(
+            self.extra_counters.push(typed_counter(
                 "discovery.lossy_slots",
                 CounterKind::Loss,
                 CounterUnits::TableRows,
@@ -6071,7 +6082,7 @@ where
             ));
         }
         if !snapshot.truncated_ops.is_empty() {
-            self.extra_loss.push(typed_counter(
+            self.extra_counters.push(typed_counter(
                 "discovery.truncated_walk",
                 CounterKind::Loss,
                 CounterUnits::Events,
@@ -6080,7 +6091,7 @@ where
             ));
         }
         if !snapshot.dispatch.attach_failures.is_empty() {
-            self.extra_loss.push(typed_counter(
+            self.extra_counters.push(typed_counter(
                 "discovery.unresolved_stage2",
                 CounterKind::Loss,
                 CounterUnits::Probes,
@@ -6091,7 +6102,7 @@ where
         // Retained epoch gaps stay PARTIAL even when every live table
         // terminates (rows survive; completion does not).
         for reason in &snapshot.retained_reasons {
-            self.extra_loss.push(typed_counter(
+            self.extra_counters.push(typed_counter(
                 &format!("discovery.retained_{}", reason.replace('-', "_")),
                 CounterKind::Loss,
                 CounterUnits::Events,
@@ -6138,7 +6149,7 @@ where
             .values()
             .fold(0u64, |a, &b| a.saturating_add(b));
         if straddling_trip > 0 {
-            self.extra_loss.push(typed_counter(
+            self.extra_counters.push(typed_counter(
                 "legacy.straddling_poll_trip",
                 CounterKind::Loss,
                 CounterUnits::Events,
@@ -6147,7 +6158,7 @@ where
             ));
         }
         if self.straddling_lgcalls > 0 {
-            self.extra_loss.push(typed_counter(
+            self.extra_counters.push(typed_counter(
                 "legacy.straddling_poll_lgcalls",
                 CounterKind::Loss,
                 CounterUnits::Events,
@@ -6174,7 +6185,7 @@ where
             }
         }
         if tail_trip > 0 {
-            self.extra_loss.push(typed_counter(
+            self.extra_counters.push(typed_counter(
                 "legacy.close_tail_trip",
                 CounterKind::Loss,
                 CounterUnits::Events,
@@ -6190,7 +6201,7 @@ where
             && let Some(tail_lgcalls) = after_window.checked_sub(self.straddling_lgcalls)
             && tail_lgcalls > 0
         {
-            self.extra_loss.push(typed_counter(
+            self.extra_counters.push(typed_counter(
                 "legacy.close_tail_lgcalls",
                 CounterKind::Loss,
                 CounterUnits::Events,
@@ -6211,7 +6222,7 @@ where
             })
             .unwrap_or((0, 0, 0));
         if engine_un > 0 {
-            self.extra_loss.push(typed_counter(
+            self.extra_counters.push(typed_counter(
                 "legacy.engine_uninstrumented",
                 CounterKind::Loss,
                 CounterUnits::Sites,
@@ -6220,7 +6231,7 @@ where
             ));
         }
         if meth_un > 0 {
-            self.extra_loss.push(typed_counter(
+            self.extra_counters.push(typed_counter(
                 "legacy.meth_uninstrumented",
                 CounterKind::Loss,
                 CounterUnits::Sites,
@@ -6229,7 +6240,7 @@ where
             ));
         }
         if low_un > 0 {
-            self.extra_loss.push(typed_counter(
+            self.extra_counters.push(typed_counter(
                 "legacy.lowlevel_uninstrumented",
                 CounterKind::Loss,
                 CounterUnits::Sites,
@@ -6348,7 +6359,7 @@ where
             close_backings.insert((*ino, *offset));
         }
         if !snapshot.close_remembered.is_empty() {
-            self.extra_loss.push(typed_counter(
+            self.extra_counters.push(typed_counter(
                 "discovery.close_remembered",
                 CounterKind::Loss,
                 CounterUnits::Sites,
@@ -6357,7 +6368,7 @@ where
             ));
         }
         if close_joined > 0 {
-            self.extra_loss.push(typed_counter(
+            self.extra_counters.push(typed_counter(
                 "discovery.close_candidates",
                 CounterKind::Loss,
                 CounterUnits::Sites,
@@ -6366,7 +6377,7 @@ where
             ));
         }
         if close_unbacked > 0 {
-            self.extra_loss.push(typed_counter(
+            self.extra_counters.push(typed_counter(
                 "discovery.unbacked_candidate",
                 CounterKind::Loss,
                 CounterUnits::Sites,
@@ -6536,7 +6547,7 @@ where
         // count-observed executions.
         let mut counters = drain.counters.clone();
         counters.extend(self.activity.iter().cloned());
-        counters.extend(self.extra_loss.iter().cloned());
+        counters.extend(self.extra_counters.iter().cloned());
         // R05: typed ENGINE observations join the finalized
         // document once, from the same in-window tripwire evidence
         // the legacy block below renders. Unjoinable increments
@@ -11191,7 +11202,7 @@ mod tests {
                 reasons: HashSet::new(),
                 adapter: AdapterState::default(),
                 activity: Vec::new(),
-                extra_loss: Vec::new(),
+                extra_counters: Vec::new(),
                 in_window_trip: HashMap::new(),
                 in_window_hits: Vec::new(),
                 in_window_lgcalls: 0,
