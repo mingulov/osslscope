@@ -147,6 +147,77 @@ if [ "$(stat -c %a "$T/pfxu/bin")" = "755" ] \
 else
     bad "install under umask 077 leaves traversable (755) directories (bin=$(stat -c %a "$T/pfxu/bin") lib=$(stat -c %a "$T/pfxu/lib/osslscope"))"
 fi
+# S2 round 2: leaves alone do not prove traversal — under umask
+# 077 mkdir -p also creates $PREFIX, lib, share, and share/doc as
+# 0700, and any one of them strands the unprivileged observer.
+# The FULL ancestry must be 755, pinned by an unprivileged
+# traversal drill (not just stat).
+_ancestry_ok=1
+_ancestry_bad=""
+for _d in "$T/pfxu" "$T/pfxu/bin" "$T/pfxu/lib" "$T/pfxu/lib/osslscope" \
+          "$T/pfxu/share" "$T/pfxu/share/osslscope" \
+          "$T/pfxu/share/doc" "$T/pfxu/share/doc/osslscope"; do
+    if [ "$(stat -c %a "$_d")" != "755" ]; then
+        _ancestry_ok=0
+        _ancestry_bad="$_ancestry_bad ${_d##*/}=$(stat -c %a "$_d")"
+    fi
+done
+if [ "$_ancestry_ok" = "1" ]; then
+    ok "install under umask 077 leaves traversable (755) FULL ancestry"
+else
+    bad "install under umask 077 leaves traversable (755) FULL ancestry ($_ancestry_bad )"
+fi
+# Unprivileged traversal drill: walk the installed tree as a uid
+# that owns nothing (live proof the mode bits suffice — no ACL
+# or ownership accident). Mechanism: setpriv-as-nobody when root,
+# else passwordless sudo; without either, a static bit-walk over
+# the full ancestry (still a real pin — other-x/other-r bits ARE
+# the traversal mechanism).
+_d="$T/pfxu"
+while [ "$_d" != "/" ] && [ "$_d" != "." ]; do
+    if [ "$(stat -c %u "$_d" 2>/dev/null)" = "$(id -u)" ]; then
+        chmod o+x "$_d" 2>/dev/null || true
+    else
+        break
+    fi
+    _d="$(dirname "$_d")"
+done
+_as_nobody=""
+if [ "$(id -u)" = "0" ] && command -v setpriv >/dev/null 2>&1; then
+    _as_nobody="setpriv --reuid=65534 --regid=65534 --clear-groups"
+elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null \
+     && (id nobody >/dev/null 2>&1 || id 65534 >/dev/null 2>&1); then
+    _as_nobody="sudo -n -u nobody"
+fi
+_drill_ok=1
+if [ -n "$_as_nobody" ]; then
+    for _d in "$T/pfxu" "$T/pfxu/bin" "$T/pfxu/lib" "$T/pfxu/lib/osslscope" \
+              "$T/pfxu/share" "$T/pfxu/share/osslscope" \
+              "$T/pfxu/share/doc" "$T/pfxu/share/doc/osslscope"; do
+        $_as_nobody test -x "$_d" 2>/dev/null || _drill_ok=0
+    done
+    $_as_nobody test -r "$T/pfxu/share/osslscope/install-manifest.json" 2>/dev/null \
+        || _drill_ok=0
+    if [ "$_drill_ok" = "1" ]; then
+        ok "unprivileged traversal drill walks the installed tree (live nobody)"
+    else
+        bad "unprivileged traversal drill walks the installed tree (live nobody)"
+    fi
+else
+    for _d in "$T/pfxu" "$T/pfxu/bin" "$T/pfxu/lib" "$T/pfxu/lib/osslscope" \
+              "$T/pfxu/share" "$T/pfxu/share/osslscope" \
+              "$T/pfxu/share/doc" "$T/pfxu/share/doc/osslscope"; do
+        _m="$(stat -c %a "$_d")"
+        case "$_m" in ?55|?51|?01|?05) ;; *) _drill_ok=0 ;; esac
+    done
+    _m="$(stat -c %a "$T/pfxu/share/osslscope/install-manifest.json")"
+    case "$_m" in ??4|??5|??6|??7) ;; *) _drill_ok=0 ;; esac
+    if [ "$_drill_ok" = "1" ]; then
+        ok "unprivileged traversal drill walks the installed tree (mode-bit walk, no user-switch)"
+    else
+        bad "unprivileged traversal drill walks the installed tree (mode-bit walk, no user-switch)"
+    fi
+fi
 if grep -q 'NoNewPrivs' "$T/out"; then
     ok "install reports NoNewPrivs status"
 else
