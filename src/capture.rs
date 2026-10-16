@@ -811,6 +811,15 @@ impl DiscoveryPort for LiveTraversalDiscovery {
                 // applies them; dropping them would strand a
                 // false verdict while saving everything else).
                 out.corrections = self.backend.take_corrections();
+                // R34/I1: the census does not default on the
+                // failure path — propagate the backend's loss
+                // high-water + unknown set over the salvaged
+                // records, so uncounted ops render with their
+                // known loss.
+                let (admitted, unknown, loss) = self.backend.salvage_census(&out.done);
+                out.admitted_by_op = admitted;
+                out.admitted_unknown_by_op = unknown;
+                out.census_loss = loss;
             }
         }
         let snap = self.backend.snapshot();
