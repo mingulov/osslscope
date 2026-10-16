@@ -406,6 +406,82 @@ fn traversal_inventory_is_approved() {
     );
 }
 
+/// Diagnostic-text trigger spellings (round 3, residual F):
+/// every `AttachEvent.failed` construction — `failed: Some(..)`
+/// literals, `failed: replan.then(..)` conditional
+/// re-establishment, shorthand `failed` (value from a
+/// `x.then(..)` binding, whose own line triggers too), and
+/// `record_attach_failure` — opens a scanned window.
+fn is_diagnostic_trigger(t: &str) -> bool {
+    t.contains("failed: Some")
+        || t.contains("record_attach_failure(&mut delta")
+        || (t.contains("failed") && t.contains(".then("))
+        || t.starts_with("failed,")
+}
+
+/// Round 3, residuals F+R (publication half of the composed
+/// chain): the allowlist bullet carries the exact producer
+/// literals for the two re-established-anchor texts (the
+/// session suite pins the producers emit them; the
+/// rendered-doc test pins they publish pathname-free).
+#[test]
+fn reestablished_anchor_texts_are_allowlisted() {
+    let text = fs::read_to_string(manifest_dir().join("docs/privacy/allowlist-v1.md")).unwrap();
+    let mut bullet = String::new();
+    let mut in_bullet = false;
+    for line in text.lines() {
+        if line.starts_with("- Optional `attach_diagnostics`") {
+            in_bullet = true;
+        } else if in_bullet && !line.starts_with(' ') && !line.is_empty() {
+            break;
+        }
+        if in_bullet {
+            bullet.push_str(line);
+            bullet.push('\n');
+        }
+    }
+    assert!(
+        !bullet.is_empty(),
+        "allowlist lacks the Optional `attach_diagnostics` bullet"
+    );
+    let spans: Vec<String> = bullet
+        .split('`')
+        .enumerate()
+        .filter(|(i, _)| i % 2 == 1)
+        .map(|(_, s)| s.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect();
+    for want in [
+        "tripwire anchors re-established after replacement (identical mapping)",
+        "dispatch anchors re-established after replacement; continuity unproven",
+    ] {
+        assert!(
+            spans.iter().any(|s| s == want),
+            "allowlist bullet must carry the producer literal {want:?}"
+        );
+    }
+}
+
+/// Round 3, residual F: the scanner covers every diagnostic
+/// construction spelling — the `replan.then(..)` conditional
+/// and the shorthand `failed` field included (both missed in
+/// round 2, hiding two production texts from the inventory).
+#[test]
+fn diagnostic_scanner_covers_all_constructions() {
+    assert!(is_diagnostic_trigger("failed: Some("));
+    assert!(
+        is_diagnostic_trigger("failed: replan.then(|| {"),
+        "replan.then(..) conditional must open a window"
+    );
+    assert!(
+        is_diagnostic_trigger("let failed = prior_mapped.then(|| {"),
+        ".then(..) binding must open a window"
+    );
+    assert!(
+        is_diagnostic_trigger("failed,"),
+        "shorthand failed field must open a window"
+    );
+}
+
 /// Round 2, residual F (source-pinned): no diagnostic-text
 /// construction interpolates a path, cookie, or target string.
 /// Every `AttachEvent.failed` / `record_attach_failure` text
@@ -444,7 +520,7 @@ fn no_paths_in_diagnostic_text_windows() {
             if in_test_mod {
                 continue;
             }
-            if !(t.contains("failed: Some") || t.contains("record_attach_failure(&mut delta")) {
+            if !is_diagnostic_trigger(t) {
                 continue;
             }
             // Code part only (`//` comments are not emitted text —
@@ -538,6 +614,8 @@ fn attach_diagnostics_vocabulary_has_no_pathnames() {
         "stage-2 pin misses the resolve-time identity (cookie retries next poll)",
         "attach query_entry@0x1234 failed (kind=PermissionDenied)",
         "attach query_entry+query_return pin dup failed (kind=NotFound)",
+        "tripwire anchors re-established after replacement (identical mapping)",
+        "dispatch anchors re-established after replacement; continuity unproven",
         "attach path contains NUL",
         "dispatch reinstall failed: reinstall init anchor unresolved",
         "dispatch reinstall failed: no dispatch anchor to reinstall",
@@ -597,6 +675,8 @@ fn attach_diagnostics_vocabulary_has_no_pathnames() {
             "legacy stage-2 attach has no file mapping",
             "stage-2 attach has no provider mapping",
             "stage-2 pin misses the resolve-time identity (cookie retries next poll)",
+            "tripwire anchors re-established after replacement (identical mapping)",
+            "dispatch anchors re-established after replacement; continuity unproven",
             "attach path contains NUL",
             "reinstall init anchor unresolved",
             "reinstall builtin anchor unresolved",

@@ -5955,6 +5955,56 @@ mod tests {
     }
 
     #[test]
+    fn reestablished_anchor_texts_are_approved_literals() {
+        // Round 3, residuals F+R (producer half of the composed
+        // chain): real replacement polls emit the exact approved
+        // literals — no paths, no cookies, no OS text (the
+        // privacy suite pins the same literals in the allowlist
+        // bullet + rendered publication).
+        // Tripwire replan over an identical mapping:
+        let mut env = MiniEnv::new();
+        env.maps = vec![lc_mapping(100)];
+        env.plan = Some(trip_set(100, &[0x100, 0x200]));
+        let mut core = a11_core();
+        core.poll(&mut env, a11_budget()).unwrap();
+        env.maps = vec![lc_mapping(200)];
+        env.plan = Some(trip_set(200, &[0x110, 0x220]));
+        let delta = core.poll(&mut env, a11_budget()).unwrap();
+        let trip_text = delta
+            .attaches
+            .iter()
+            .filter(|a| matches!(a.kind, AttachKind::Tripwires { .. }))
+            .find_map(|a| a.failed.clone());
+        assert_eq!(
+            trip_text.as_deref(),
+            Some("tripwire anchors re-established after replacement (identical mapping)"),
+        );
+        // Dispatch reinstall over a previously mapped binding
+        // (H10: the post-map replacement keeps its caveat):
+        let mut env = MiniEnv::new();
+        env.maps = vec![prov_mapping(50, 0x1000)];
+        let mut core = a11_core();
+        core.dispatch_bound = Some(("/p/provider.so".to_string(), "08:01".to_string(), 50));
+        core.dispatch_live = true;
+        core.poll(&mut env, a11_budget()).unwrap();
+        env.maps = vec![prov_mapping(60, 0x1000)];
+        env.reinstall_script.push_back(Ok(DispatchReinstall {
+            binding: ("/p/provider.so".to_string(), "08:01".to_string(), 60),
+            resolution: None,
+        }));
+        let delta = core.poll(&mut env, a11_budget()).unwrap();
+        let dispatch_text = delta
+            .attaches
+            .iter()
+            .filter(|a| matches!(a.kind, AttachKind::DispatchAnchors { .. }))
+            .find_map(|a| a.failed.clone());
+        assert_eq!(
+            dispatch_text.as_deref(),
+            Some("dispatch anchors re-established after replacement; continuity unproven"),
+        );
+    }
+
+    #[test]
     fn trip_replacement_changed_mapping_goes_blind() {
         // F-D/A11: replacement with a changed probe mapping (cookie
         // meanings shifted) — detach, but do NOT re-attach (new
