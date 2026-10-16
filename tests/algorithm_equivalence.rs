@@ -164,6 +164,7 @@ fn adapt_many(
             fresh: &fresh,
             post_settle: false,
             baseline: false,
+            post_release: false,
         },
     );
     assert_eq!(adapted.delta.discovered.len(), 1);
@@ -242,6 +243,8 @@ fn complete_doc(sites: Vec<SiteExecution>) -> CaptureDocument {
         disposition: None,
         policy: None,
         legacy_partition: LegacyCallPartition::default(),
+        traversal: None,
+        engine_observations: Vec::new(),
     })
 }
 
@@ -448,6 +451,8 @@ fn synonyms_match_every_admitted_spelling() {
         disposition: None,
         policy: None,
         legacy_partition: LegacyCallPartition::default(),
+        traversal: None,
+        engine_observations: Vec::new(),
     });
     let v = evaluate_document(
         std::slice::from_ref(&PolicyRule::require_executed("MLKEM768")),
@@ -479,6 +484,8 @@ fn synonyms_match_every_admitted_spelling() {
         disposition: None,
         policy: None,
         legacy_partition: LegacyCallPartition::default(),
+        traversal: None,
+        engine_observations: Vec::new(),
     });
     assert!(matches!(doc.status, Completeness::Partial { .. }));
     let v = evaluate_document(
@@ -836,6 +843,7 @@ fn mixed_ok_blend_withholds_finite_claim() {
         fresh: &fresh,
         post_settle: false,
         baseline: false,
+        post_release: false,
     };
     // Poll 1: one clean row → Complete.
     let adapted = adapt_delta(

@@ -1296,6 +1296,8 @@ mod tests {
                     shared_ambiguous: 0,
                     unfenced_tails: 0,
                 },
+                traversal: None,
+                engine_observations: Vec::new(),
             };
             let bare = crate::evidence::finalize(input);
             let verdict = evaluate_document(rules, &bare);

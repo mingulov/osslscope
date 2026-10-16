@@ -9931,6 +9931,7 @@ mod tests {
                         finish_err: false,
                         poll_err: false,
                         dispatch_attached: false,
+                        trip_set: None,
                     },
                     rounds: rounds.into(),
                     tail,
@@ -10058,6 +10059,7 @@ mod tests {
                     finish_err: false,
                     poll_err: false,
                     dispatch_attached: false,
+                    trip_set: None,
                 },
                 count,
                 &clock,
@@ -10886,6 +10888,16 @@ mod tests {
         }
 
         #[allow(clippy::too_many_arguments)]
+        type StubRunner<'x> = Runner<
+            'x,
+            DiscoveryStub,
+            FakeCountBackend,
+            TargetStub,
+            LifecycleStub,
+            ClockStub,
+            ProcStub,
+        >;
+
         fn stub_runner<'x, D: DiscoveryPort>(
             cfg: &'x Config,
             info: &'x TargetInfo,
@@ -11372,6 +11384,7 @@ mod tests {
                 fresh: &fresh,
                 post_settle: false,
                 baseline: false,
+                post_release: false,
             };
             runner
                 .apply_delta(&d1, clock.now(), &ctx, None)
@@ -11412,6 +11425,7 @@ mod tests {
                 fresh: &fresh,
                 post_settle: false,
                 baseline: false,
+                post_release: false,
             };
             runner
                 .apply_delta(&d2, clock.now(), &ctx2, None)
@@ -11467,6 +11481,7 @@ mod tests {
                 fresh: &fresh,
                 post_settle: false,
                 baseline: false,
+                post_release: false,
             };
             let pins = || {
                 vec![crate::discovery::session::TripModulePin {
@@ -11597,6 +11612,7 @@ mod tests {
                 fresh: &fresh,
                 post_settle: false,
                 baseline: false,
+                post_release: false,
             };
             runner
                 .apply_delta(&delta, clock.now(), &ctx, None)
@@ -12248,6 +12264,7 @@ mod tests {
                     finish_err: true,
                     poll_err: false,
                     dispatch_attached: false,
+                    trip_set: None,
                 },
                 count,
                 &clock,
@@ -12400,6 +12417,7 @@ mod tests {
                     finish_err: true,
                     poll_err: false,
                     dispatch_attached: false,
+                    trip_set: None,
                 },
                 count,
                 &clock,
@@ -12507,6 +12525,7 @@ mod tests {
                     finish_err: true,
                     poll_err: false,
                     dispatch_attached: false,
+                    trip_set: None,
                 },
                 count,
                 &clock,

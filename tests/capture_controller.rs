@@ -6769,7 +6769,7 @@ fn lifecycle_subpoll_object_replacement_fences_provenance() {
     h.files.insert(
         newso.path.clone(),
         plan::FileBytes {
-            bytes: bytes_b.clone(),
+            bytes: bytes_b.clone().into(),
             dev: newso.device,
             ino: newso.ino,
         },
@@ -6886,7 +6886,7 @@ fn lifecycle_stale_queued_record_creates_no_evidence() {
     h.files.insert(
         newso.path.clone(),
         plan::FileBytes {
-            bytes: bytes_b.clone(),
+            bytes: bytes_b.clone().into(),
             dev: newso.device,
             ino: newso.ino,
         },
@@ -6992,7 +6992,7 @@ fn lifecycle_impl_only_replacement_versions_and_conserves() {
     let files_a: HashMap<String, plan::FileBytes> = HashMap::from([(
         staged_path.clone(),
         plan::FileBytes {
-            bytes: bytes_a.clone(),
+            bytes: bytes_a.clone().into(),
             dev,
             ino,
         },
@@ -7000,7 +7000,7 @@ fn lifecycle_impl_only_replacement_versions_and_conserves() {
     let files_b: HashMap<String, plan::FileBytes> = HashMap::from([(
         staged_path.clone(),
         plan::FileBytes {
-            bytes: bytes_b.clone(),
+            bytes: bytes_b.clone().into(),
             dev,
             ino,
         },
@@ -7103,7 +7103,7 @@ fn lifecycle_never_snapshotted_backing_misses_loud() {
     h.files.insert(
         newso.path.clone(),
         plan::FileBytes {
-            bytes: bytes_b.clone(),
+            bytes: bytes_b.clone().into(),
             dev: newso.device,
             ino: newso.ino,
         },
@@ -7181,7 +7181,7 @@ fn lifecycle_raced_file_read_is_discarded_loud() {
     h.files.insert(
         raced.path.clone(),
         plan::FileBytes {
-            bytes: bytes_b.clone(),
+            bytes: bytes_b.clone().into(),
             dev: raced.device,
             ino: raced.ino,
         },
@@ -7197,7 +7197,7 @@ fn lifecycle_raced_file_read_is_discarded_loud() {
         HashMap::from([(
             h.staged.path.clone(),
             plan::FileBytes {
-                bytes: h.bytes.clone(),
+                bytes: h.bytes.clone().into(),
                 dev: h.staged.device,
                 ino: h.staged.ino,
             },
@@ -7205,7 +7205,7 @@ fn lifecycle_raced_file_read_is_discarded_loud() {
         HashMap::from([(
             raced_path.clone(),
             plan::FileBytes {
-                bytes: bytes_b.clone(),
+                bytes: bytes_b.clone().into(),
                 dev,
                 ino,
             },
@@ -7854,6 +7854,7 @@ fn ordinary_production_capture_genuinely_observed_sleep_is_honest_noquery() {
     let cfg = Config {
         harvest_object: Some(PathBuf::new()),
         count_object: Some(PathBuf::new()),
+        members_object: None,
         provider: Some(provider),
         builtin: false,
         table: None,

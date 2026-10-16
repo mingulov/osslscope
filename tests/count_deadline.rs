@@ -1239,7 +1239,7 @@ fn close_quiesce_recovers_row_landing_mid_drain() {
     let files = HashMap::from([(
         a.path.clone(),
         plan::FileBytes {
-            bytes: std::fs::read(&a.path).unwrap(),
+            bytes: std::fs::read(&a.path).unwrap().into(),
             dev: a.device,
             ino: a.ino,
         },
@@ -1290,7 +1290,7 @@ fn close_delayed_hit_after_drain_is_uncounted_countermodel() {
     let files = HashMap::from([(
         a.path.clone(),
         plan::FileBytes {
-            bytes: std::fs::read(&a.path).unwrap(),
+            bytes: std::fs::read(&a.path).unwrap().into(),
             dev: a.device,
             ino: a.ino,
         },
