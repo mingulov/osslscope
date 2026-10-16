@@ -634,17 +634,32 @@ fn setup_registry() -> &'static Mutex<HashMap<PathBuf, u64>> {
 /// removed only by the attempt that inserted it).
 static SETUP_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
-/// Lexically normalize a destination for registry keying (fix round 5):
+/// Lexically normalize a destination for registry keying (fix round 5,
+/// R06-a): absolutize relative spellings against the process cwd, then
 /// collapse `.`, resolve `..` against normal components, drop duplicate
-/// separators — so `./a`, `a`, and `sub/../a` fence each other. Pure
-/// computation, NO syscalls: `canonicalize` would run blocking file I/O on
-/// the caller, which the setup path forbids. Residual: distinct spellings
-/// through symlinked parents key separately (documented; same class as
+/// separators — so `a`, `./a`, `sub/../a`, and `$CWD/a` fence each other.
+/// Only `current_dir` (one bounded getcwd, no destination I/O — never
+/// `canonicalize`, whose blocking file I/O the setup path forbids); a
+/// getcwd failure falls back to the lexical key (today's behavior, never
+/// an error). Residual: distinct spellings through symlinked parents key
+/// separately (unresolvable without syscalls — documented; same class as
 /// external writers).
 fn normalize_setup_key(path: &Path) -> PathBuf {
     use std::path::Component;
+    let absolute;
+    let effective = if path.is_absolute() {
+        path
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => {
+                absolute = cwd.join(path);
+                &absolute
+            }
+            Err(_) => path,
+        }
+    };
     let mut out = PathBuf::new();
-    for c in path.components() {
+    for c in effective.components() {
         match c {
             Component::Prefix(p) => out.push(p.as_os_str()),
             Component::RootDir => out.push(Component::RootDir.as_os_str()),
@@ -818,11 +833,17 @@ enum Control<T> {
 /// worker, never inline on the caller. `on_exit` runs on the worker on
 /// every non-panic exit (op completed or op skipped — always BEFORE the
 /// completion counter advances); a panicking op skips it (the `Lost`
-/// caller path reclaims instead). On expiry the worker is detached — its
-/// ownership moves with it, so a stuck open's fd closes whenever the sink
-/// answers — and the caller fails WITHOUT forking (pre-fork) or resolves
-/// the guard-held child under custody (post-fork). `Err` = the worker
-/// thread itself could not start (fail-closed at the call site).
+/// caller path reclaims instead). R06-b: the two EARLY returns below
+/// (already-cancelled / already-expired — the worker never spawns) run
+/// `on_exit` inline on the caller instead: registration precedes this
+/// call, so skipping cleanup there would orphan the entry (the caller's
+/// post-spawn Cancelled/Expired arms deliberately do NOT clean — the
+/// still-live worker owns the entry and removes it at exit). On expiry
+/// the worker is detached — its ownership moves with it, so a stuck
+/// open's fd closes whenever the sink answers — and the caller fails
+/// WITHOUT forking (pre-fork) or resolves the guard-held child under
+/// custody (post-fork). `Err` = the worker thread itself could not start
+/// (fail-closed at the call site).
 fn run_under_control<T, F>(
     deadline: Instant,
     cancel: &AtomicBool,
@@ -833,11 +854,21 @@ where
     T: Send + 'static,
     F: FnOnce(&AtomicBool) -> T + Send + 'static,
 {
-    if cancel.load(Ordering::SeqCst) {
-        return Ok(Control::Cancelled);
-    }
-    if Instant::now() >= deadline {
-        return Ok(Control::Expired);
+    // R06-b: the early returns run `on_exit` inline (the worker
+    // never spawns, so the caller owns cleanup — see the doc
+    // comment above). Precedence unchanged: cancel first, then
+    // deadline.
+    let cancelled = cancel.load(Ordering::SeqCst);
+    let expired = Instant::now() >= deadline;
+    if cancelled || expired {
+        if let Some(f) = on_exit {
+            f();
+        }
+        return Ok(if cancelled {
+            Control::Cancelled
+        } else {
+            Control::Expired
+        });
     }
     // Abandonment flag (fix round 5): lock-free — stored by the caller
     // when it stops waiting, loaded by the worker before running the op
@@ -1393,9 +1424,12 @@ impl OwnedTarget {
                 // The finishing worker removes the registry entry on every
                 // non-panic exit (before the completion counter advances);
                 // the synchronous caller paths below reclaim it
-                // idempotently. The abandonment paths (Cancelled/Expired)
-                // deliberately touch NOTHING here — no lock, lock-free by
-                // construction.
+                // idempotently. The post-spawn abandonment paths
+                // (Cancelled/Expired) deliberately touch NOTHING here —
+                // no lock, lock-free by construction (the still-live
+                // worker owns the entry); only the pre-spawn early
+                // returns clean inline via on_exit (R06-b — the worker
+                // never spawns there, so the caller owns cleanup).
                 let reg_key_w = reg_key.clone();
                 let prep = run_under_control(
                     deadline,
@@ -2246,7 +2280,6 @@ mod control_tests {
         // caller path forbids blocking file I/O), so equivalent spellings
         // fence each other while distinct paths stay distinct.
         use super::normalize_setup_key;
-        use std::path::PathBuf;
         let a = normalize_setup_key(std::path::Path::new("/tmp/x/workload.log"));
         assert_eq!(
             a,
@@ -2272,11 +2305,75 @@ mod control_tests {
             normalize_setup_key(std::path::Path::new("/tmp/x/workload.log")),
             normalize_setup_key(std::path::Path::new("/tmp/y/workload.log"))
         );
-        // Leading `..` is preserved (never collapsed onto a sibling).
+        // Leading `..` resolves against the process cwd (R06-a
+        // premise change, justified: relative inputs absolutize, so
+        // `..` pops the cwd's last component instead of persisting
+        // lexically — never collapses onto a sibling).
+        let cwd = std::env::current_dir().expect("test cwd");
+        let mut parent = cwd;
+        assert!(parent.pop(), "test cwd has a parent");
         assert_eq!(
             normalize_setup_key(std::path::Path::new("../a")),
-            PathBuf::from("../a")
+            parent.join("a")
         );
+    }
+
+    #[test]
+    fn setup_key_unifies_relative_and_absolute_spellings() {
+        // R06-a: one destination spelled relative and absolute
+        // must fence together (aliases must not bypass the
+        // per-destination registry).
+        use super::normalize_setup_key;
+        let cwd = std::env::current_dir().expect("test cwd");
+        assert_eq!(
+            normalize_setup_key(std::path::Path::new("r06-alias-pin.log")),
+            normalize_setup_key(&cwd.join("r06-alias-pin.log")),
+            "relative and absolute spellings must key together"
+        );
+    }
+
+    #[test]
+    fn control_early_cancel_and_expiry_run_on_exit() {
+        // R06-b: registration precedes run_under_control, so the
+        // early Cancelled/Expired returns (worker never spawned)
+        // must run the cleanup callback — otherwise the registry
+        // entry orphans and the destination refuses forever.
+        use super::{run_under_control, Control};
+        for (deadline, cancel, tag) in [
+            (Instant::now(), false, "expired"),
+            (
+                Instant::now() + Duration::from_secs(30),
+                true,
+                "cancelled",
+            ),
+        ] {
+            let flag = AtomicBool::new(cancel);
+            let ran = std::sync::Arc::new(AtomicBool::new(false));
+            let cleaned = std::sync::Arc::new(AtomicBool::new(false));
+            let ran_c = ran.clone();
+            let cleaned_c = cleaned.clone();
+            let out = run_under_control(
+                deadline,
+                &flag,
+                move |_| {
+                    ran_c.store(true, Ordering::SeqCst);
+                    42
+                },
+                Some(Box::new(move || {
+                    cleaned_c.store(true, Ordering::SeqCst)
+                })),
+            )
+            .unwrap();
+            assert!(
+                matches!(out, Control::Expired | Control::Cancelled),
+                "{tag}: early return expected"
+            );
+            assert!(!ran.load(Ordering::SeqCst), "{tag}: dead op must not run");
+            assert!(
+                cleaned.load(Ordering::SeqCst),
+                "{tag}: on_exit must run on the early return"
+            );
+        }
     }
 
     #[test]
