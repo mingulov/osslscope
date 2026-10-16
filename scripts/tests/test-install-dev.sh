@@ -34,6 +34,25 @@ else
     bad "sh -n passes: scripts/install-dev.sh ($(cat "$T/err"))"
 fi
 
+# --- build-dev.sh: emitted manifest install_layout ships the members mapping ---
+# The dev-build manifest's install_layout is consumed by install-dev.sh and
+# (later) default object resolution; the members object entry must be present.
+# Structural check: parse the layout dict emitted by the build script.
+BUILD_DEV="$REPO/scripts/build-dev.sh"
+if python3 -c "
+import json, re, sys
+src = open('$BUILD_DEV').read()
+m = re.search(r'\"install_layout\": \{([^}]*)\}', src)
+assert m, 'install_layout block not found in build-dev.sh'
+body = re.sub(r',\s*$', '', m.group(1))
+layout = json.loads('{' + body + '}')
+assert layout.get('bpf-object:osslscope-members') == 'lib/osslscope/osslscope-members', layout
+" 2>"$T/err"; then
+    ok "build-dev.sh install_layout ships the members mapping"
+else
+    bad "build-dev.sh install_layout ships the members mapping ($(cat "$T/err"))"
+fi
+
 # --- fixtures ---
 cp "$SH_BIN" "$T/host-bin"
 chmod +x "$T/host-bin"
