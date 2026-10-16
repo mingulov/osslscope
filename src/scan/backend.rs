@@ -616,15 +616,24 @@ impl ScanBackend {
         if !self.storm_detached {
             self.set_skip_all(true)?;
         }
-        let now_ns = self
-            .clock_base_ns
-            .saturating_add(Instant::now().duration_since(self.epoch_start).as_nanos() as u64);
         // R35/I2: the backstop runs even when the settle poll fails
         // (opens close + partner corrections generate — the
         // caller's salvage takes them via take_completed /
         // take_corrections; returning before the backstop would
         // strand opens that will never close).
         let poll_result = self.poll();
+        // Round 2, residual P: the backstop clock samples AFTER the
+        // settle poll (BASE order — a slow settle crossing the 5s
+        // Hung boundary ages opens against settle-inclusive time,
+        // as BASE did; pre-poll sampling flipped those Hung closes
+        // into dangling/Tainted backstop verdicts with different
+        // partner corrections). On the poll-error path this stamp
+        // is post-failed-poll — no BASE counterpart exists there
+        // (BASE never reached the backstop on error), so no order
+        // is violated and the R35 salvage guarantee stands.
+        let now_ns = self
+            .clock_base_ns
+            .saturating_add(Instant::now().duration_since(self.epoch_start).as_nanos() as u64);
         self.oracle.finish(now_ns);
         let mut delta = poll_result?;
         let (done, findings) = self.take_completed();
