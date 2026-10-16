@@ -299,6 +299,49 @@ fn h7_runtime_json_shape_and_schema() {
 }
 
 #[test]
+fn c3_fatal_detail_normalizes_target_proc_paths() {
+    // Round 3, residual C.3 (publication): fatal detail carries
+    // bounded observer-setup provenance — operation names and
+    // observer paths pass through bounded; target-namespaced
+    // /proc/<pid> paths normalize to the fixed /proc/<pid>
+    // token (the pid already publishes structurally — the path
+    // form never does). Both detail-carrying kinds, both text
+    // renders, schema-validated.
+    for (kind, want) in [
+        (
+            FatalKind::Environment(
+                "open /opt/osslscope/members.o: read /proc/12345/maps failed".to_string(),
+            ),
+            "open /opt/osslscope/members.o: read /proc/<pid>/maps failed",
+        ),
+        (
+            FatalKind::Runtime(
+                "discovery finish: read /proc/987/maps: No such file or directory (os error 2)"
+                    .to_string(),
+            ),
+            "discovery finish: read /proc/<pid>/maps: No such file or directory (os error 2)",
+        ),
+    ] {
+        let doc = setup_failure_document(kind);
+        let bytes = render_json(&doc).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            v["completeness"]["fatal_kind"]["detail"].as_str(),
+            Some(want),
+            "JSON detail must normalize"
+        );
+        osslscope::schema::validate_v2(&v).unwrap();
+        osslscope::schema::check_v2_semantics(&v).unwrap();
+        let text = render_human(&doc);
+        assert!(text.contains(want), "human detail must normalize:\n{text}");
+        assert!(
+            !text.contains("/proc/12345") && !text.contains("/proc/987"),
+            "no raw target pid path survives:\n{text}"
+        );
+    }
+}
+
+#[test]
 fn h7_runtime_human_shape() {
     // Contract: the human renderer names the runtime failure.
     let text = render_human(&runtime_doc());
