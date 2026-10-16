@@ -209,6 +209,14 @@ impl DiscoveryPort for FakeDiscovery {
     fn poll(&mut self, _budget: PollBudget) -> anyhow::Result<DiscoveryDelta> {
         let idx = self.polls_done;
         self.polls_done += 1;
+        // Scripted poll latency (deadline-straddle model): the poll
+        // starts pre-deadline and completes after advancing the clock.
+        // Runs before the injected failure (a failing poll consumes
+        // time too — a death-during-poll schedule needs the clock to
+        // advance past the exit even though the poll fails).
+        if let Some(ns) = self.poll_delay_ns.get(&idx) {
+            self.clock.sleep(Duration::from_nanos(*ns));
+        }
         if self.poll_err_at.contains(&idx) {
             anyhow::bail!("injected poll failure");
         }
@@ -229,11 +237,6 @@ impl DiscoveryPort for FakeDiscovery {
                     flag.set(true);
                 }
             }
-        }
-        // Scripted poll latency (deadline-straddle model): the poll
-        // starts pre-deadline and completes after advancing the clock.
-        if let Some(ns) = self.poll_delay_ns.get(&idx) {
-            self.clock.sleep(Duration::from_nanos(*ns));
         }
         // Wall-clock pacing for live-child tests (zero elsewhere):
         // lets a real target run while fake time stays scripted.
@@ -1291,6 +1294,10 @@ fn h2_t5_exited_target_maps_residual_is_exempt() {
     h.exit_at_ns = Some(BASE_NS + 1_000_000_000);
     h.exit_code = 0;
     h.snapshot.losses = vec![(osslscope::discovery::coverage::HOST_MAPS_READ, 1)];
+    // Round 3, residual D: the benign single is close-phase loss
+    // (recorded by the post-reap close read — the child was
+    // reaped mid-window, before the close).
+    h.snapshot.maps_loss_close = 1;
     let (out, _) = h.run();
     let c = out.unwrap();
     assert!(
@@ -2735,6 +2742,64 @@ fn failed_attach_diagnostic_reaches_document() {
 }
 
 #[test]
+fn live_maps_loss_before_predelta_failure_stays_loss() {
+    // Round 3, residual D (review's schedule): a live poll
+    // records a maps-read loss, then fails planning pre-delta
+    // (nothing adapts); salvage runs; the target — dead during
+    // the failing poll — dispositions Exited. The poll-phase
+    // loss is genuine live loss: it must stay a Loss counter
+    // (and keep its `discovery-loss` taint), never relabel as
+    // Activity from the eventual Exited disposition. (Runtime
+    // fatal still prevents false COMPLETE — this pins the
+    // classification half.)
+    let mut h = Harness::fresh("d-live-loss");
+    h.snapshot_attached();
+    // Setup poll (idx 0) succeeds; the first round poll (idx 1)
+    // fails pre-delta while live. Its scripted latency carries
+    // the clock past the exit — death during the failing poll —
+    // so salvage dispositions Exited.
+    h.poll_err_at.insert(1);
+    h.poll_delay_ns.insert(1, 1_500_000_000);
+    h.exit_at_ns = Some(BASE_NS + 1_000_000_000);
+    h.exit_code = 0;
+    // The failed poll's maps loss: poll-phase (no close-phase
+    // tag — the close never recorded it).
+    h.snapshot.losses = vec![(osslscope::discovery::coverage::HOST_MAPS_READ, 1)];
+    assert_eq!(h.snapshot.maps_loss_close, 0);
+    let (out, _) = h.run();
+    let c = out.unwrap();
+    assert!(
+        matches!(
+            c.disposition,
+            Some(target::TargetDisposition::Exited { code: 0 })
+        ),
+        "schedule must salvage under Exited: {:?}",
+        c.disposition
+    );
+    assert!(
+        matches!(c.outcome, Outcome::Fatal(_)),
+        "salvage stays fatal: {:?}",
+        c.outcome
+    );
+    let maps = c
+        .document
+        .counters
+        .iter()
+        .find(|c| c.name == "discovery.maps_read")
+        .expect("D4 record preserved");
+    assert_eq!(
+        maps.kind,
+        osslscope::evidence::CounterKind::Loss,
+        "live poll-phase maps loss is Loss, never Activity: {maps:?}"
+    );
+    assert!(
+        has_reason(&c, "discovery-loss"),
+        "poll-phase residual keeps its taint: {:?}",
+        c.reasons
+    );
+}
+
+#[test]
 fn owned_exit_close_join_skip_is_not_a_gap() {
     // R21-F1: a reaped owned child cannot execute past its death,
     // so the skipped final join (the pin check misreads the gone
@@ -2778,8 +2843,11 @@ fn owned_exit_close_join_skip_is_not_a_gap() {
     h.finish_recycled = true;
     // Production post-reap residual: the discovery close reads
     // maps after the child is reaped (/proc gone) — the benign
-    // close-only single.
+    // close-only single. Round 3, residual D: seeded with its
+    // close-phase tag (the production close recorded it before
+    // erroring with the staged final).
     h.snapshot.losses = vec![(osslscope::discovery::coverage::HOST_MAPS_READ, 1)];
+    h.snapshot.maps_loss_close = 1;
     let (out, _) = h.run();
     let c = out.unwrap();
     assert!(matches!(c.outcome, Outcome::Complete), "{c:?}");

@@ -456,6 +456,13 @@ pub struct DiscoverySnapshot {
     pub retained_reasons: Vec<String>,
     /// Accumulated source-tagged losses, sorted by source.
     pub losses: Vec<(u32, u64)>,
+    /// Close-phase maps-read loss (round 3, residual D): the
+    /// portion of the HOST_MAPS_READ total recorded by
+    /// [`SessionCore::close`]'s read (post-reap provenance —
+    /// the only portion eligible for the benign close-single
+    /// Activity treatment, and only under a reaped-before-close
+    /// Exited target). Poll-phase loss is genuine live loss.
+    pub maps_loss_close: u64,
     /// Sticky per-op walk-shape bits (never retired).
     pub truncated_ops: Vec<(u32, u64)>,
     /// Walked slots whose identity was lost.
@@ -1151,6 +1158,13 @@ pub struct SessionCore {
     pid_recycled: u64,
     closed: bool,
     recycled: bool,
+    /// Maps-read loss recorded by close-phase reads (round 3,
+    /// residual D): the post-reap-provenance half of the
+    /// HOST_MAPS_READ total — only this portion may become the
+    /// benign close-single Activity counter (and only under a
+    /// reaped-before-close Exited target); poll-phase loss is
+    /// genuine live loss, never relabeled.
+    maps_loss_close: u64,
 }
 
 impl SessionCore {
@@ -1240,6 +1254,7 @@ impl SessionCore {
             pid_recycled: 0,
             closed: false,
             recycled: false,
+            maps_loss_close: 0,
         }
     }
 
@@ -2223,7 +2238,7 @@ impl SessionCore {
     /// successfully, while a live address space always carries
     /// mappings — clobbering last-good with it terminally
     /// detached every plane in the death-during-poll race.
-    fn poll_maps<E: SessionEnv>(&mut self, env: &mut E) -> Vec<maps::Mapping> {
+    fn poll_maps<E: SessionEnv>(&mut self, env: &mut E, close_phase: bool) -> Vec<maps::Mapping> {
         match env.current_maps() {
             Some(maps) if !maps.is_empty() => {
                 // M1: every fresh snapshot sights its new ranges
@@ -2234,6 +2249,13 @@ impl SessionCore {
             }
             _ => {
                 self.tracker.note_maps_read();
+                // Round 3, residual D: close-phase reads tag
+                // their loss (the only portion eligible for the
+                // post-reap benign-single treatment); poll-phase
+                // loss is genuine live loss, never relabeled.
+                if close_phase {
+                    self.maps_loss_close += 1;
+                }
                 self.last_good_maps.clone()
             }
         }
@@ -2268,7 +2290,7 @@ impl SessionCore {
             self.mark_recycled();
             return Err(self.recycled_err());
         }
-        let mut maps = self.poll_maps(env);
+        let mut maps = self.poll_maps(env, false);
         let mut delta = DiscoveryDelta::default();
         let mut touched: HashSet<(u32, u64)> = HashSet::new();
 
@@ -2555,7 +2577,7 @@ impl SessionCore {
         // after the poll-start snapshot (file reads sit between the
         // snapshot and this drain) must still resolve.
         if !self.pending_stage2.is_empty() {
-            maps = self.poll_maps(env);
+            maps = self.poll_maps(env, false);
         }
         // Bounded pending stage-2 installs (FIFO across polls),
         // sharing the budget with the tripwire batch above.
@@ -3464,6 +3486,7 @@ impl SessionCore {
             reasons: union_reasons(&self.retained.reasons, &self.tracker.reasons()),
             retained_reasons: self.retained.reasons.clone(),
             losses: self.tracker.losses(),
+            maps_loss_close: self.maps_loss_close,
             truncated_ops,
             lossy_slots: self.tracker.lossy_slots(),
             queries_observed: self.queries_total(),
@@ -3525,7 +3548,7 @@ impl SessionCore {
         // stale-epoch table (retirements feed the retained gaps).
         // A failed read reconciles against last-good (F-D/Am1),
         // not empty — with explicit loss.
-        let maps = self.poll_maps(env);
+        let maps = self.poll_maps(env, true);
         // R31 (round 5): the tail join below re-evaluates under
         // close-time rebirths only — last poll's installs prove
         // nothing against this snapshot.
@@ -7267,6 +7290,40 @@ mod tests {
                 .any(|(s, n)| *s == coverage::HOST_MAPS_READ && *n == 1),
             "close-time maps failure must be explicit loss: {:?}",
             snap.losses
+        );
+    }
+
+    #[test]
+    fn r3_maps_loss_close_tags_only_close_phase_reads() {
+        // Round 3, residual D: poll-phase maps loss is untagged
+        // (genuine live loss, never relabeled); close-phase loss
+        // carries the tag (post-reap-provenance eligible).
+        fn maps_total(snap: &DiscoverySnapshot) -> u64 {
+            snap.losses
+                .iter()
+                .find(|(s, _)| *s == coverage::HOST_MAPS_READ)
+                .map(|(_, n)| *n)
+                .unwrap_or(0)
+        }
+        let mut env = MiniEnv::new();
+        env.maps = vec![lc_mapping(100)];
+        let mut core = a11_core();
+        core.poll(&mut env, a11_budget()).unwrap();
+        assert_eq!(maps_total(&core.snapshot()), 0);
+        env.maps_fail_first = 1;
+        core.poll(&mut env, a11_budget()).unwrap();
+        let after_poll = core.snapshot();
+        assert_eq!(maps_total(&after_poll), 1, "live read failure is loss");
+        assert_eq!(
+            after_poll.maps_loss_close, 0,
+            "poll-phase loss carries no close tag"
+        );
+        env.maps_fail_first = 1;
+        let after_close = core.close(&mut env).unwrap();
+        assert_eq!(maps_total(&after_close), 2);
+        assert_eq!(
+            after_close.maps_loss_close, 1,
+            "close-phase read tags its loss"
         );
     }
 

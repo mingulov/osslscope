@@ -4238,6 +4238,14 @@ struct Runner<'x, D, B: CountBackend, T, L, C: ClockPort, P: ProcPort> {
     /// until it differs (foreign targets never refresh).
     comm: String,
     child_exit: Option<i32>,
+    /// Post-reap provenance (round 3, residual D): the owned
+    /// child was already reaped when the discovery close ran
+    /// (`child_exit` known at finish entry — a mid-window reap),
+    /// so the close-phase maps read is reaped-then-read. Gates
+    /// the benign close-single Activity treatment together with
+    /// the snapshot's close-phase tag and the Exited
+    /// disposition; a mere eventual exit never exempts.
+    reaped_before_close: bool,
     signal_cut: bool,
     expired: bool,
     fallback_partial: bool,
@@ -5117,6 +5125,11 @@ where
                 // Snapshot BEFORE attempting finish: on failure the
                 // live session is taken and only this pre-state
                 // survives for assembly.
+                // Round 3, residual D: post-reap provenance for the
+                // maps-loss exemption — captured at finish entry (a
+                // later reap during finish_observation must not
+                // backdate the close read as reaped-then-read).
+                self.reaped_before_close = self.info.owned && self.child_exit.is_some();
                 let pre = self.discovery.snapshot();
                 match self.discovery.finish() {
                     Ok(snapshot) => snapshot,
@@ -5481,6 +5494,7 @@ where
         last_live: Vec::new(),
         comm: info.comm.clone(),
         child_exit: None,
+        reaped_before_close: false,
         signal_cut: false,
         expired: false,
         fallback_partial: false,
@@ -5864,6 +5878,12 @@ where
         // recycle verdict — their pids really can be reused.
         let pre_close =
             (self.info.owned && self.child_exit.is_some()).then(|| self.discovery.snapshot());
+        // Round 3, residual D: post-reap provenance for the
+        // maps-loss exemption — captured at finish entry (the
+        // same mid-window-reap fact arming the pre-close arm
+        // above; a later reap during finish_observation must not
+        // backdate the close read as reaped-then-read).
+        self.reaped_before_close = self.info.owned && self.child_exit.is_some();
         let snapshot = match self.discovery.finish() {
             Ok(snapshot) => snapshot,
             Err(e) => {
@@ -6088,28 +6108,43 @@ where
             let adapted = self.adapter.loss_sums.get(source).copied().unwrap_or(0);
             if let Some(residual) = total.checked_sub(adapted) {
                 if residual > 0 {
-                    // R21-F1 (round 2): the post-reap maps single
-                    // under an exited target is the benign
-                    // close-only read (reaped child, /proc gone,
-                    // nothing missable — the H2/T5 exemption's
-                    // counter half): an Activity counter (audit
-                    // trail, same name), never a Loss — the same
-                    // treatment as the skipped close join. Every
-                    // other source, and maps under a live target,
-                    // stays Loss.
-                    let mut counter = classify_loss(*source, residual);
-                    if target_exited && *source == coverage::HOST_MAPS_READ {
-                        counter.kind = CounterKind::Activity;
+                    // R21-F1 (round 2) + round-3 D provenance: only
+                    // the close-phase maps portion under a
+                    // reaped-before-close Exited target is the
+                    // benign close-only read (reaped child, /proc
+                    // gone, nothing missable — the H2/T5
+                    // exemption's counter half): an Activity
+                    // counter (audit trail, same name), never a
+                    // Loss — the same treatment as the skipped
+                    // close join. Every other source, maps under
+                    // a live target, maps without reaped-before-
+                    // close provenance, and any poll-phase maps
+                    // remainder stay Loss. A poll that recorded
+                    // live maps loss then failed pre-delta leaves
+                    // a poll-phase residual — the eventual Exited
+                    // disposition never relabels it.
+                    let mut close_part = 0;
+                    if target_exited
+                        && self.reaped_before_close
+                        && *source == coverage::HOST_MAPS_READ
+                    {
+                        close_part = snapshot.maps_loss_close.min(residual);
                     }
-                    self.extra_counters.push(counter);
-                    // H2/T5: mid-run maps failures rode the deltas
-                    // (op None → poll-global taint already fired),
-                    // so a maps residual under an exited target is
-                    // the close-only benign single — exempt. Every
-                    // other source, and maps under a live target,
-                    // taints: round errors are fatal (fail, never a
-                    // silent delta drop), so residuals are real.
-                    if !target_exited || *source != coverage::HOST_MAPS_READ {
+                    if close_part > 0 {
+                        let mut benign = classify_loss(*source, close_part);
+                        benign.kind = CounterKind::Activity;
+                        self.extra_counters.push(benign);
+                    }
+                    let loss_part = residual - close_part;
+                    if loss_part > 0 {
+                        self.extra_counters.push(classify_loss(*source, loss_part));
+                        // H2/T5: mid-run maps failures rode the
+                        // deltas (op None → poll-global taint
+                        // already fired); only the proven
+                        // post-reap close portion above is exempt
+                        // — every other residual taints. Round
+                        // errors are fatal (fail, never a silent
+                        // delta drop), so residuals are real.
                         loss_residual_any = true;
                     }
                 }
@@ -11490,6 +11525,7 @@ mod tests {
                 last_live: Vec::new(),
                 comm: info.comm.clone(),
                 child_exit: None,
+                reaped_before_close: false,
                 signal_cut: false,
                 expired: false,
                 fallback_partial: false,
