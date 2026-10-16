@@ -692,7 +692,7 @@ impl ScanBackend {
         }
         debug_assert!(b.order_sound(), "drain preserves ring order");
         for (tid, v) in read_u64_all(&self.loaded.maps, "RCOUNT")? {
-            b.rcount.insert(tid, wire::split_rcount(v));
+            b.rcount.insert(tid, split_rcount_checked(v)?);
         }
         for (tid, v) in read_u64_all(&self.loaded.maps, "SEQ")? {
             let (birth, ctr) = wire::split_seq(v);
@@ -722,6 +722,19 @@ impl ScanBackend {
         )?;
         Ok(b)
     }
+}
+
+/// Validated RCOUNT split (K2, pure/host-testable): unknown
+/// lifecycle states are corrupt transport (fail-closed — a
+/// mismatched/corrupt set is the only source), never silently
+/// joined (an unknown state must not read as retired at the
+/// oracle's quiesced wildcard).
+fn split_rcount_checked(v: u64) -> anyhow::Result<(u32, u32)> {
+    let (count, state) = wire::split_rcount(v);
+    if state != wire::RCOUNT_STATE_IDLE && state != wire::RCOUNT_STATE_ACTIVE {
+        anyhow::bail!("RCOUNT state {state} out of range (want 0 IDLE / 1 ACTIVE)");
+    }
+    Ok((count, state))
 }
 
 /// Decode one ring record into the batch (fail-closed: short
@@ -1166,6 +1179,27 @@ mod tests {
         b[40..44].copy_from_slice(&4242u32.to_le_bytes());
         b[48..56].copy_from_slice(&wire::make_seq(7, 9).to_le_bytes());
         b
+    }
+
+    /// K2: unknown RCOUNT lifecycle states reject (IDLE/ACTIVE
+    /// join; anything else — e.g. state 2 — is corrupt transport,
+    /// never a retirement signal).
+    #[test]
+    fn split_rcount_checked_rejects_unknown_states() {
+        assert_eq!(
+            split_rcount_checked(wire::make_rcount(3, wire::RCOUNT_STATE_IDLE)).unwrap(),
+            (3, wire::RCOUNT_STATE_IDLE)
+        );
+        assert_eq!(
+            split_rcount_checked(wire::make_rcount(3, wire::RCOUNT_STATE_ACTIVE)).unwrap(),
+            (3, wire::RCOUNT_STATE_ACTIVE)
+        );
+        for bad in [2u32, 3, u32::MAX] {
+            assert!(
+                split_rcount_checked(wire::make_rcount(3, bad)).is_err(),
+                "state {bad} must reject"
+            );
+        }
     }
 
     /// K1: the scan parser leaves class range caller-checked

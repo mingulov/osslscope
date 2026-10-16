@@ -1682,7 +1682,14 @@ impl Oracle {
                     Some((_, st)) if *st == wire::RCOUNT_STATE_ACTIVE => {
                         stallable.push((*t, *s));
                     }
-                    _ => closable.push((*t, *s)), // no record + quiesced ⟹ retired
+                    // No record + quiesced ⟹ retired.
+                    None => closable.push((*t, *s)),
+                    // K2: unknown lifecycle states stall (like
+                    // ACTIVE) — invalid content must never acquire
+                    // the meaning of an absent/retired record (the
+                    // backend rejects these before joining; this arm
+                    // covers synthetic batches).
+                    Some(_) => stallable.push((*t, *s)),
                 }
                 continue;
             }
