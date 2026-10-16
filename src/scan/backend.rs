@@ -180,6 +180,11 @@ pub struct ScanBackend {
     /// Selective-attach failures (load/attach stage per slot —
     /// reported, never silent; the oracle scope excludes them).
     failed_slots: Vec<crate::loader::FailedSlot>,
+    /// Last admitted-query census snapshot (R34): refreshed on
+    /// every successful poll (baseline included — best-known
+    /// state), so a failed finish salvages the census view
+    /// instead of defaulting it.
+    last_admitted: BTreeMap<u32, u64>,
 }
 
 /// Owned link fds (never read — the fds ARE the attachment;
@@ -304,6 +309,7 @@ impl ScanBackend {
             done_total: 0,
             findings_total: 0,
             failed_slots: failed,
+            last_admitted: BTreeMap::new(),
         })
     }
 
@@ -388,6 +394,21 @@ impl ScanBackend {
         self.oracle.take_corrections()
     }
 
+    /// Census salvage for a failed finish (R34/I1): the last known
+    /// admitted snapshot + the unknown set recomputed over the
+    /// salvaged records + the current CALLS-loss high-water.
+    pub fn salvage_census(
+        &self,
+        done: &[WalkDone],
+    ) -> (BTreeMap<u32, u64>, BTreeSet<u32>, u64) {
+        let calls_loss = self
+            .last_loss
+            .get(&wire::LOSS_MAP_CALLS)
+            .copied()
+            .unwrap_or(0);
+        salvage_census_view(&self.last_admitted, calls_loss, done)
+    }
+
     /// Poll once at `now` (drain → join → tiers → warm).
     /// `quiesced` = no query in flight (retirement/stall inference
     /// is only sound quiesced — legs pass true after joining
@@ -453,6 +474,10 @@ impl ScanBackend {
             || read_calls_by_op(maps),
             || (oracle.take_done(), oracle.take_findings()),
         )?;
+        // R34: refresh the salvage snapshot on every successful
+        // census read (a failed finish salvages this, never
+        // defaults).
+        self.last_admitted = fresh_admitted.clone();
         // R35/I2: the warm section below is fallible (throttle +
         // cache map writes) but runs AFTER the takes above — on
         // error the taken batch restores into the oracle (next
@@ -965,6 +990,23 @@ fn take_after_census(
 /// flag (skips are never admitted, so their absence is a true
 /// zero), and UNKNOWN_OP never flags (taint-forced, not a real
 /// op — its admission is unattributable by design).
+/// Salvage census view (R34, pure/host-testable): the last known
+/// admitted snapshot + the unknown set recomputed over salvaged
+/// records + the current CALLS-loss high-water — never defaulted
+/// (an uncounted op renders with its known loss, never as a
+/// clean zero with an empty unknown set).
+fn salvage_census_view(
+    last_admitted: &BTreeMap<u32, u64>,
+    calls_loss: u64,
+    done: &[WalkDone],
+) -> (BTreeMap<u32, u64>, BTreeSet<u32>, u64) {
+    (
+        last_admitted.clone(),
+        census_unknown_ops(done, last_admitted, calls_loss),
+        calls_loss,
+    )
+}
+
 fn census_unknown_ops(
     done: &[WalkDone],
     admitted: &BTreeMap<u32, u64>,
@@ -1540,6 +1582,31 @@ mod tests {
         assert_eq!(census.get(&7), Some(&10));
         assert_eq!(done.len(), 1, "the record flows through");
         assert_eq!(findings.len(), 1, "the finding flows through");
+    }
+
+    #[test]
+    fn r34_salvage_census_propagates_loss_and_unknown() {
+        // R34/I1: a failed finish salvages the census view — last
+        // known snapshot + unknown set over salvaged records +
+        // current CALLS-loss high-water — never census_loss=0 with
+        // an empty unknown set (uncounted ops render with known
+        // loss, not as clean zeros).
+        let mut o = oracle_with_batch();
+        let done = o.take_done();
+        assert_eq!(done.len(), 1);
+        let op = done[0].op;
+        // Observed op missing from the snapshot while increments
+        // were lost → UNKNOWN + loss propagate (not defaults).
+        let (admitted, unknown, loss) = salvage_census_view(&BTreeMap::new(), 2, &done);
+        assert!(admitted.is_empty());
+        assert_eq!(unknown, BTreeSet::from([op]));
+        assert_eq!(loss, 2);
+        // Present op + zero loss → clean view.
+        let (admitted2, unknown2, loss2) =
+            salvage_census_view(&BTreeMap::from([(op, 9u64)]), 0, &done);
+        assert_eq!(admitted2.get(&op), Some(&9));
+        assert!(unknown2.is_empty());
+        assert_eq!(loss2, 0);
     }
 
     #[test]
