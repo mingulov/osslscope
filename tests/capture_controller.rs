@@ -5736,6 +5736,10 @@ fn live_owned_exit_survives_pin_recycle_at_finish() {
     // (custody reaps it, so /proc goes away) and the discovery
     // close reports the spurious pin recycle — the capture still
     // lands with the exit preserved and no zombie left behind.
+    // R21-F4: the kernel window opens pre-release (real setup
+    // time passes), but observation coverage starts at release —
+    // the document's effective start never predates the requested
+    // start (the semantic validator's containment rule).
     let (out, pid) = live_observe(
         "live-exit-recycle",
         &["/bin/sh", "-c", "exit 7"],
@@ -5744,6 +5748,11 @@ fn live_owned_exit_survives_pin_recycle_at_finish() {
     );
     let pid = pid.expect("spawned");
     let c = out.unwrap();
+    assert!(
+        c.document.window.effective_start_ns >= c.document.window.requested_start_ns,
+        "effective start escapes the requested window: {:?}",
+        c.document.window
+    );
     assert_eq!(c.child_exit, Some(7));
     assert!(matches!(
         c.disposition,
