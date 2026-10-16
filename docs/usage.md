@@ -37,7 +37,9 @@ osslscope inspect --pid 1234 --provider /opt/openssl/lib64/ossl-modules/legacy.s
 ## report — human/JSON summary over a capture window
 
 `report` runs a bounded capture of `OSSL_FUNC_*` dispatch
-calls (with wall-clock timestamps) and renders the verdict
+calls (with monotonic execution timestamps from
+`bpf_ktime_get_ns`; wall-clock window edges are separate
+correlation context) and renders the verdict
 directly. Discovery is automatic: BPF objects resolve from
 trusted installed locations and the target's libcrypto from
 its live mappings (in-libcrypto default provider mode):
@@ -64,9 +66,11 @@ osslscope report --format json --out report.json --cbom bom.json run -- ./my-app
   workload bytes into that observer channel (JSON corruption,
   secret mixing), so prefer an independent fd. Validity is
   checked pre-fork: a fd that is not open fails setup before
-  any spawn. A child-side log-open failure exits 126 and
-  fails setup naming the path (never silent null); a nonzero
-  child exit without a destination prints one re-run hint
+  any spawn. File preparation happens parent-side before
+  fork: a log-open failure fails setup naming the path
+  (never silent null) and the run exits 4; exit 126 stays
+  for the remaining child-side stdio-redirect failures. A
+  nonzero child exit without a destination prints one re-run hint
   line (exit + `--workload-out FILE`) and no workload bytes.
   `run --` predicts the target libcrypto pre-exec from the
   exe's `DT_NEEDED` closure plus loader search
@@ -147,8 +151,12 @@ C` / `--members-object M` vet explicit BPF objects;
 `--format json` emits machine-readable output. Implicitly
 trusted object locations are the root-owned system dirs
 (`/usr/local/lib/osslscope`, `/usr/local/lib64/osslscope`,
-`/usr/lib/osslscope`, `/usr/lib64/osslscope` -- first complete
-pair wins; user-owned prefixes never resolve implicitly);
+`/usr/lib/osslscope`, `/usr/lib64/osslscope` -- triple-first:
+pair-only directories are skipped while searching, so a
+later complete triple supersedes an earlier pair-only
+directory; pair fallback applies only when no trusted
+members object exists anywhere; user-owned prefixes never
+resolve implicitly);
 anything else needs explicit flags. `doctor` vets objects with
 the same primitives the backend composes, so preflight with
 the same explicit pair (or none) predicts exactly what
@@ -193,8 +201,12 @@ Priority (PRD §14, H7-extended): 2 usage > 10 violation > 1 salvaged runtime-fa
 
 ## Current limitations (honest)
 
-- x86-64 Linux only; kernel ≥ 6.9 for stable BPF token /
-  `bpf_timer` behavior the probes rely on.
+- x86-64 Linux only; kernel 6.9+ is the verified support
+  floor (6.12-LTS oldest tested). Admission is by functional
+  feature probe (kprobe-load, ringbuf, uprobe-multi+cookies,
+  `probe_read_user`) with the release itself informational;
+  BPF tokens are a debug-only floor signal, never used for
+  privilege.
 - `--pid` attach cannot see pre-attach history (cold-start
   gap); use `run --` when completeness matters.
 - Under sustained high dispatch rates the ring buffer can

@@ -37,14 +37,14 @@ General rules:
 |---|---|---|---|
 | `unknown-denominator` (`scope`) | blind | The denominator is unknown for `scope` (`op:<id>`, `legacy`, or `dispatch`): a tainted or unterminated op walk, superseded legacy anchors, or an unattached dispatch surface. | Read the matching `coverage` row (`expected`/`discovered`/`attached`). Re-run a quieter or narrower window; if the gap is stable, record it as disclosed blindness and check whether the blind scope matters for your rule. |
 | `undiscovered-sites` (`scope`, `missing`) | blind | Expected sites were never discovered (`missing` short). | Add warmup traffic during harvest so queries fire; check the target actually performs crypto in-window. Unknown stripped builds need explicit enrollment per [the built-in runbook](builtin-runbook.md) -- never a guessed offset. |
-| `unattached-sites` (`scope`, `missing`) | blind | Sites were discovered but probes attached nowhere (`missing` short). Refusals can be kernel-specific and stable across runs. | Run `doctor`, remediate, re-run (see [attach failures](attach-failures.md)). If the count is stable, record it as disclosed blindness and check whether the blind sites matter for your rule. |
+| `unattached-sites` (`scope`, `missing`) | blind | Expected sites lack attached probes: `missing` is expected − attached, so it also counts never-discovered sites, not only discovered-but-refused ones. Refusals can be kernel-specific and stable across runs. | Compare with the `undiscovered-sites` row to split never-discovered from refused. For refused sites run `doctor`, remediate, re-run (see [attach failures](attach-failures.md)). If the count is stable, record it as disclosed blindness and check whether the blind sites matter for your rule. |
 
 ## Loss and attribution reasons
 
 | Kind | Class | Meaning | Response |
 |---|---|---|---|
 | `loss` (`counter`, `source`, `value`) | blind | A positive loss counter: named evidence went unobserved. Common names: `capture.over_budget` (source `lifecycle`: the target was still alive at window expiry -- the observer never kills its child) and `count.drain_shortfall` (source `drain`: keys remained unpolled at grace expiry). | Read the named counter and its source. For `over_budget`: shorten the workload or split it into several windows with quit-before-expiry discipline; raise `--duration` only if the workload then fits inside one window. For drain shortfall: raise `--grace` and re-run. For ring/map pressure: shorten the window or reduce the dispatch rate under observation, then re-run. Losses are counted, never silent. |
-| `unattributed-calls` (`sites`, `calls`) | blind | Executed calls arrived for keys with no stable backing (staleness race). | Re-run; persistent cases indicate mapping churn under the window -- narrow the window to a quieter phase. |
+| `unattributed-calls` (`sites`, `calls`) | blind | Executed calls arrived at sites whose candidate coverage is unknown: tainted or unterminated op walks, or unlocalizable loss, degraded the site set. No staleness race is required. | Read the accompanying `unknown-denominator` / `loss` reasons -- they name the taint. Re-run a quieter or narrower window; if the gap is stable, record it as disclosed blindness and check whether the blind calls matter for your rule. |
 
 ## Window-edge reasons
 
@@ -54,10 +54,13 @@ General rules:
 | `tail-gap` (`missing_ns`) | blind | The effective window ends `missing_ns` before the requested end: the tail of the window went unobserved. | Same discipline as `over_budget` above: quit-before-expiry, split windows, or a fitting `--duration`. |
 | `signal-cut` (no fields) | blind | SIGTERM/SIGINT cut the window; signal-cut windows are always PARTIAL by construction. | Size the CI timeout per [the recipes](ci-recipes.md#ci-timeout) and re-run undisturbed. |
 
-## Structural coverage caveats (not per-window reasons)
+## Structural coverage caveats
 
-These are disclosed limits of the observation surface, not
-reasons on any single document:
+These are disclosed limits of the observation surface. The
+low-level fallback also surfaces on each affected document
+as a `loss` reason (counter
+`legacy.lowlevel_uninstrumented`), so check the document's
+reasons rather than assuming silence:
 
 - Low-level fallback: on libssl-linked targets, four digest
   `Transform` imports arrive via `R_X86_64_GLOB_DAT` (no

@@ -22,7 +22,7 @@ Reads nothing from target memory. It combines an attach-time cookie,
 a generation cell, the current TGID, and kernel timestamps into
 per-key counters. It emits no strings, pointers, or target bytes.
 
-Maps: `COUNTS`, `GEN`, `TARGET`, `DROPFAIL` (see §4).
+Maps: `COUNTS`, `GEN`, `TARGET`, `WINDOW`, `DROPFAIL` (see §4).
 
 ## 2. eBPF harvest programs
 
@@ -297,6 +297,13 @@ gate reads clock + cells only).
   `coverage`, the conserving `legacy_partition`, optional
   `context` (kernel release plus wall edges), and optional
   `disposition` (custody outcome, replacing `child_exit`).
+- Optional `traversal` (rendered only on traversal runs): the
+  selected harvest/count/members triple (host object paths plus
+  sha256 — the same provenance class as `objects` display
+  locators, never target paths) plus numeric per-record facts
+  (`records`, `findings`, `polls`, `admitted`,
+  `admitted_unknown`, `census_loss`, `entries`). No target
+  strings, no runtime addresses.
 - Optional `engine_observations` (R05, rendered only when observed):
   per-observation pinned caller-module triple (object fingerprint,
   encoded device, inode), stub file offset, binding generation,
@@ -307,7 +314,10 @@ gate reads clock + cells only).
   failed): sorted, deduped, capped array of producer-literal
   failure texts. No paths, no pointers, no target strings, no
   runtime addresses.
-- Human output renders the same fields plus fixed doctrine notes.
+- Human output is a summary, not the same fields: sites omit
+  JSON's first/last timestamps, device, and inode, and fenced
+  generations render summary counts with detail deferred to
+  JSON — plus fixed doctrine notes.
 - Runtime addresses are absent; offsets are file offsets.
 
 `check` JSON and human output:
@@ -315,13 +325,17 @@ gate reads clock + cells only).
 - report document plus `policy`: `verdict` and `rules` (each rule
   carries rule/predicate names, a three-valued result, conserved
   definite/possible bounds, and site evidence refs).
-- Each violation carries rule/matcher/identity plus the same
-  capture-level actionability tuple: window, pid/comm/container,
-  image, provider path/build-id. No cmdline: argv is redacted
+- Each violation carries rule/matcher/identity refs; the rest of
+  the capture-level actionability tuple (window, pid/comm/container,
+  image, provider display paths) joins through the `target`,
+  `window`, `sites`, `objects`, and `engine_observations`
+  sections. No cmdline: argv is redacted
   (see the Scope rule above). ENGINE-plane violations carry the
   observation key (object/device/inode/offset), generation,
-  entrypoint index + name, untimed flag, and calls — the same
-  allowlisted triple shape as sites, never raw addresses.
+  entrypoint index, and calls — the same
+  allowlisted triple shape as sites, never raw addresses; the
+  entrypoint display name and window classification join from
+  `engine_observations` via the observation key.
 - Per-rule `engine_evidence` refs (R05, rendered only when present):
   the resolving observation key plus generation/entrypoint/calls.
 - No verdict on evidence-free fatal documents (every fatal kind
