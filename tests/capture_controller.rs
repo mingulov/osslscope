@@ -2451,23 +2451,55 @@ fn h3_t5_mixed_counter_counts_distinct_triples() {
     ] {
         let mut h = Harness::fresh(name);
         h.snapshot_attached();
-        // Companion file is small-ELF with its own X offset (two
-        // full test-binary copies overflow the 128MiB round budget;
-        // plan rows validate the offset against the file's bytes).
-        let small2 = small_elf(0xB2);
-        let staged2 = h.stage.write("prov2.so", &small2);
+        // Both staged files share IDENTICAL small-ELF bytes at the
+        // SAME X offset (distinct inodes): the counter counts
+        // physical triples, so a (fingerprint, offset)-pair counter
+        // must NOT satisfy 2/1/0. (Two full test-binary copies
+        // overflow the 128MiB round budget; plan rows validate the
+        // offset against the file's bytes.)
+        let small = small_elf(0xB2);
+        let off = x_offset(&small);
+        h.files.insert(
+            h.staged.path.clone(),
+            plan::FileBytes {
+                bytes: small.clone().into(),
+                dev: h.staged.device,
+                ino: h.staged.ino,
+            },
+        );
+        let staged2 = h.stage.write("prov2.so", &small);
         h.maps.push(mapping(&staged2));
         h.files.insert(
             staged2.path.clone(),
             plan::FileBytes {
-                bytes: small2.clone().into(),
+                bytes: small.clone().into(),
                 dev: staged2.device,
                 ino: staged2.ino,
             },
         );
+        // Validity pin: this test proves nothing unless the served
+        // companions share fingerprint bytes AND offset at distinct
+        // inodes — a silent drift here stays green on the 2/1/0
+        // assertions while unproving the physical-triple claim.
+        let f1 = h.files.get(&h.staged.path).unwrap();
+        let f2 = h.files.get(&staged2.path).unwrap();
+        assert_eq!(
+            osslscope::discovery::elf::read_build_id(&f1.bytes).unwrap(),
+            osslscope::discovery::elf::read_build_id(&f2.bytes).unwrap(),
+            "{name}: staged companions must share fingerprint bytes"
+        );
+        assert_eq!(
+            x_offset(&f1.bytes),
+            x_offset(&f2.bytes),
+            "{name}: staged companions must share the X offset"
+        );
+        assert_ne!(
+            h.staged.ino, staged2.ino,
+            "{name}: staged companions must keep distinct inodes"
+        );
         let cand1 = cand(
             "/p/provider.so",
-            backing_of(&h.staged, h.off),
+            backing_of(&h.staged, off),
             1,
             11,
             "SHA-256",
@@ -2476,7 +2508,7 @@ fn h3_t5_mixed_counter_counts_distinct_triples() {
         );
         let cand2 = cand(
             "/p/provider.so",
-            backing_of(&staged2, x_offset(&small2)),
+            backing_of(&staged2, off),
             2,
             12,
             "SHA-256",
