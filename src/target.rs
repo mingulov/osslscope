@@ -638,12 +638,16 @@ static SETUP_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 /// R06-a): absolutize relative spellings against the process cwd, then
 /// collapse `.`, resolve `..` against normal components, drop duplicate
 /// separators — so `a`, `./a`, `sub/../a`, and `$CWD/a` fence each other.
-/// Only `current_dir` (one bounded getcwd, no destination I/O — never
-/// `canonicalize`, whose blocking file I/O the setup path forbids); a
-/// getcwd failure falls back to the lexical key (today's behavior, never
-/// an error). Residual: distinct spellings through symlinked parents key
-/// separately (unresolvable without syscalls — documented; same class as
-/// external writers).
+/// A `..` with no normal component to pop resolves against the root on
+/// absolute paths (the root's parent is the root — the kernel's own
+/// rule, still purely lexical, so `/../tmp/x` and `/tmp/x` fence each
+/// other); on relative paths (getcwd-failure fallback only) it persists
+/// lexically. Only `current_dir` (one bounded getcwd, no destination
+/// I/O — never `canonicalize`, whose blocking file I/O the setup path
+/// forbids); a getcwd failure falls back to the lexical key (today's
+/// behavior, never an error). Residual: distinct spellings through
+/// symlinked parents key separately (unresolvable without syscalls —
+/// documented; same class as external writers).
 fn normalize_setup_key(path: &Path) -> PathBuf {
     use std::path::Component;
     let absolute;
@@ -658,6 +662,7 @@ fn normalize_setup_key(path: &Path) -> PathBuf {
             Err(_) => path,
         }
     };
+    let absolute_effective = effective.is_absolute();
     let mut out = PathBuf::new();
     for c in effective.components() {
         match c {
@@ -668,6 +673,10 @@ fn normalize_setup_key(path: &Path) -> PathBuf {
                 Some(Component::Normal(_)) => {
                     out.pop();
                 }
+                // Root's parent is the root (absolute paths only —
+                // relative `..` stays meaningful); dropping is the
+                // kernel's rule, no syscalls involved.
+                _ if absolute_effective => {}
                 _ => out.push(".."),
             },
             Component::Normal(n) => out.push(n),
@@ -2315,6 +2324,37 @@ mod control_tests {
         assert_eq!(
             normalize_setup_key(std::path::Path::new("../a")),
             parent.join("a")
+        );
+    }
+
+    #[test]
+    fn setup_key_root_parent_aliases_key_identically() {
+        // Round 2, residual H (R06-a lexical alias): a `..` against the
+        // filesystem root resolves to the root itself (pure lexical
+        // rule — the kernel does the same), so root-parent spellings
+        // must fence with their collapsed forms. Needs no syscalls.
+        use super::normalize_setup_key;
+        use std::path::{Path, PathBuf};
+        for (alias, canon) in [
+            ("/../tmp/x", "/tmp/x"),
+            ("/..", "/"),
+            ("/../..", "/"),
+            ("/a/../../b", "/b"),
+            ("/a/b/../..", "/"),
+            ("/tmp/x/../../y", "/y"),
+            ("/tmp/./../tmp/x", "/tmp/x"),
+        ] {
+            assert_eq!(
+                normalize_setup_key(Path::new(alias)),
+                PathBuf::from(canon),
+                "alias {alias:?} must key as {canon:?}"
+            );
+        }
+        // Distinct roots stay distinct; relative `..` still resolves
+        // against the cwd (never collapses onto a sibling).
+        assert_ne!(
+            normalize_setup_key(Path::new("/../tmp/x")),
+            normalize_setup_key(Path::new("/../tmp/y"))
         );
     }
 
