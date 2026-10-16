@@ -592,11 +592,11 @@ fn doc_json(doc: &CaptureDocument) -> serde_json::Value {
         Completeness::Fatal {
             kind: FatalKind::Environment(detail),
             ..
-        } => serde_json::json!({"kind": "environment", "detail": detail}),
+        } => serde_json::json!({"kind": "environment", "detail": normalize_fatal_detail(detail)}),
         Completeness::Fatal {
             kind: FatalKind::Runtime(detail),
             ..
-        } => serde_json::json!({"kind": "runtime", "detail": detail}),
+        } => serde_json::json!({"kind": "runtime", "detail": normalize_fatal_detail(detail)}),
         _ => serde_json::Value::Null,
     };
     let mut out = serde_json::json!({
@@ -1024,10 +1024,16 @@ pub fn render_human(doc: &CaptureDocument) -> String {
                 }
             }
             FatalKind::Environment(detail) => {
-                s.push_str(&format!("fatal: environment: {}\n", safe_display(detail)));
+                s.push_str(&format!(
+                    "fatal: environment: {}\n",
+                    safe_display(&normalize_fatal_detail(detail))
+                ));
             }
             FatalKind::Runtime(detail) => {
-                s.push_str(&format!("fatal: runtime: {}\n", safe_display(detail)));
+                s.push_str(&format!(
+                    "fatal: runtime: {}\n",
+                    safe_display(&normalize_fatal_detail(detail))
+                ));
             }
         }
         s.push('\n');
@@ -1621,6 +1627,37 @@ pub(crate) fn bound_line(text: &str) -> String {
     format!("{}...", flat.chars().take(197).collect::<String>())
 }
 
+/// Publication normalization for `fatal_kind.detail` (round 3,
+/// residual C.3): the privacy allowlist permits bounded
+/// observer-setup provenance (operation names, observer
+/// object/config/destination paths, OS error text) and nothing
+/// else. Target-namespaced `/proc/<pid>` paths normalize to the
+/// fixed `/proc/<pid>` token (the pid already publishes
+/// structurally — the path form never does); `/proc/self` and
+/// other non-numeric `/proc` names pass through (observer-self,
+/// never target-namespaced). Redaction precedes bounding, so the
+/// published text is always one line of at most 200 chars.
+/// Applied at every detail-carrying render (JSON + human; CBOM
+/// carries the kind word only).
+pub(crate) fn normalize_fatal_detail(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(pos) = rest.find("/proc/") {
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos + "/proc/".len()..];
+        let digits = after.bytes().take_while(|b| b.is_ascii_digit()).count();
+        if digits > 0 {
+            out.push_str("/proc/<pid>");
+            rest = &after[digits..];
+        } else {
+            out.push_str("/proc/");
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    bound_line(&out)
+}
+
 fn dest_display(dest: &OutputDest) -> String {
     match dest {
         OutputDest::Stdout => "stdout".to_string(),
@@ -1803,6 +1840,36 @@ pub fn err_line(text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn c3_normalize_fatal_detail_redacts_proc_pids() {
+        // Round 3, residual C.3: observer-setup provenance
+        // passes through bounded; every target-namespaced
+        // /proc/<pid> normalizes; /proc/self is observer-self.
+        assert_eq!(
+            normalize_fatal_detail("open /opt/osslscope/members.o: ok"),
+            "open /opt/osslscope/members.o: ok",
+        );
+        assert_eq!(
+            normalize_fatal_detail("read /proc/12345/maps + /proc/9/stat failed"),
+            "read /proc/<pid>/maps + /proc/<pid>/stat failed",
+        );
+        assert_eq!(
+            normalize_fatal_detail("read /proc/self/maps failed"),
+            "read /proc/self/maps failed",
+        );
+        // Redaction precedes bounding: the published text is one
+        // line of at most 200 chars.
+        let long = format!("x{} /proc/1234567890/maps", "y".repeat(300));
+        let norm = normalize_fatal_detail(&long);
+        assert!(norm.chars().count() <= 200, "bounded: {norm}");
+        assert!(!norm.contains("1234567890"), "no pid survives: {norm}");
+        assert!(
+            !normalize_fatal_detail("a\nb\tc")
+                .chars()
+                .any(|c| c.is_control())
+        );
+    }
 
     #[test]
     fn h9_t4_hint_names_exit_and_rerun_only_when_discarded() {

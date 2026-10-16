@@ -297,6 +297,15 @@ gate reads clock + cells only).
   `coverage`, the conserving `legacy_partition`, optional
   `context` (kernel release plus wall edges), and optional
   `disposition` (custody outcome, replacing `child_exit`).
+- `fatal_kind.detail` (environment/runtime only;
+  recycled/attach-zero carry null): bounded observer-setup
+  provenance — operation names, observer object/config/
+  destination paths, OS error text; one line, at most 200
+  chars. Target-namespaced `/proc/<pid>` paths normalize to
+  the fixed `/proc/<pid>` token at render (the pid already
+  publishes structurally — the path form never does). No
+  other target-derived content is admitted — error chains
+  publish only through this normalization, never verbatim.
 - Optional `traversal` (rendered only on traversal runs): the
   selected triple — `harvest`, `count`, `members` (host object
   paths plus sha256 each; the same provenance class as
