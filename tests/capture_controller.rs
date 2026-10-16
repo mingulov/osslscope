@@ -1255,9 +1255,13 @@ fn h2_t5_exited_target_maps_residual_is_exempt() {
     // nothing missable) — taints no denominator and revises no
     // site. Mid-run maps failures already rode the deltas (op
     // None → poll-global taint), so the residual is close-only.
-    // The D4 counter record is preserved: the exemption is
-    // taint-only (status stays PARTIAL via the loss counter —
-    // finalize is unchanged by H2).
+    // Premise change (justified — R21-F1 round 2: the benign
+    // single is inapplicable, not missed, so it is an Activity
+    // counter, never a Loss): the D4 record is preserved as
+    // Activity, and the old PARTIAL-via-`discovery-loss` premise
+    // (the production COMPLETE blocker the review established)
+    // is gone — this shape stays PARTIAL only via its honest
+    // independent gap (the poll-2 candidate is a late attach).
     let mut h = Harness::fresh("h2-t5");
     h.snapshot_attached();
     let cand1 = cand(
@@ -1302,6 +1306,22 @@ fn h2_t5_exited_target_maps_residual_is_exempt() {
         1,
         "the benign single must still land as a D4 record: {:?}",
         c.document.counters
+    );
+    let maps = c
+        .document
+        .counters
+        .iter()
+        .find(|c| c.name == "discovery.maps_read")
+        .expect("D4 record preserved");
+    assert_eq!(
+        maps.kind,
+        osslscope::evidence::CounterKind::Activity,
+        "the benign single is audit trail, not Loss: {maps:?}"
+    );
+    assert_eq!(
+        c.reasons,
+        vec!["late-attach".to_string()],
+        "only the honest late-attach gap remains (no discovery-loss): {c:?}"
     );
     for scope in &c.document.coverage {
         if scope.scope == "legacy" {
@@ -2723,6 +2743,10 @@ fn owned_exit_close_join_skip_is_not_a_gap() {
     // recorded as an Activity counter (audit trail), never a Loss.
     // (The over-budget and --pid startup-gap forcers stand: expiry
     // is PARTIAL by PRD, pre-window --pid blindness is honest.)
+    // Round 2: the fixture carries the production post-reap maps
+    // residual too (HOST_MAPS_READ close single — every clean
+    // owned exit produces it; a COMPLETE pin without it is
+    // vacuous) — also Activity, never Loss.
     let mut h = Harness::fresh("exit-recycle-complete");
     h.snapshot_attached();
     let cand1 = cand(
@@ -2752,12 +2776,28 @@ fn owned_exit_close_join_skip_is_not_a_gap() {
     h.exit_at_ns = Some(BASE_NS + 1_000_000_000);
     h.exit_code = 0;
     h.finish_recycled = true;
+    // Production post-reap residual: the discovery close reads
+    // maps after the child is reaped (/proc gone) — the benign
+    // close-only single.
+    h.snapshot.losses = vec![(osslscope::discovery::coverage::HOST_MAPS_READ, 1)];
     let (out, _) = h.run();
     let c = out.unwrap();
     assert!(matches!(c.outcome, Outcome::Complete), "{c:?}");
     assert!(c.reasons.is_empty(), "{:?}", c.reasons);
     assert!(matches!(c.document.status, Completeness::Complete));
     assert_eq!(counter_value(&c, "discovery.close_join_skipped"), 1);
+    assert_eq!(counter_value(&c, "discovery.maps_read"), 1);
+    let maps = c
+        .document
+        .counters
+        .iter()
+        .find(|c| c.name == "discovery.maps_read")
+        .expect("D4 record preserved");
+    assert_eq!(
+        maps.kind,
+        osslscope::evidence::CounterKind::Activity,
+        "the benign post-reap single is audit trail, not Loss: {maps:?}"
+    );
 }
 
 #[test]
