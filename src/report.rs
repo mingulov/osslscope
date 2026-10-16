@@ -219,9 +219,11 @@ pub fn exit_for(
     if outcome == crate::policy::PolicyOutcome::Violation {
         return 10;
     }
-    // A salvaged (usable-evidence) fatal doc is a tool failure
-    // below a proved violation but above setup-no-verdict. Fatal-kind
-    // eligibility is the shared has_usable_evidence distinction.
+    // A usable-evidence fatal doc (salvaged Runtime sites, or
+    // proved ENGINE evidence on AttachZero — P2) is a tool failure
+    // below a proved violation but above setup-no-verdict.
+    // Fatal-kind eligibility is the shared has_usable_evidence
+    // distinction.
     if matches!(&doc.status, Completeness::Fatal { .. }) && doc.has_usable_evidence() {
         return 1;
     }
@@ -886,7 +888,15 @@ pub fn render_human(doc: &CaptureDocument) -> String {
         ));
     }
     if doc.sites.is_empty() && fenced_sites == 0 {
-        s.push_str("  none (no usable evidence)\n");
+        // The parenthetical is an evidence claim, not a site
+        // count: withhold it whenever the document carries usable
+        // evidence on another plane (proved ENGINE observations —
+        // P2 — or any non-fatal shape).
+        if doc.has_usable_evidence() {
+            s.push_str("  none\n");
+        } else {
+            s.push_str("  none (no usable evidence)\n");
+        }
     }
     for site in &doc.sites {
         human_site(site, &mut s);
@@ -1001,7 +1011,17 @@ pub fn render_human(doc: &CaptureDocument) -> String {
                 s.push_str("fatal: recycled (pid reused mid-window; all observations discarded)\n");
             }
             FatalKind::AttachZero => {
-                s.push_str("fatal: attach-zero (no probes attached; no usable evidence)\n");
+                // P2: the classification describes provider
+                // attachment — proved ENGINE evidence survives it,
+                // so the refusal wording must go when the ENGINE
+                // plane is retained.
+                if doc.has_usable_evidence() {
+                    s.push_str(
+                        "fatal: attach-zero (no probes attached; engine evidence retained)\n",
+                    );
+                } else {
+                    s.push_str("fatal: attach-zero (no probes attached; no usable evidence)\n");
+                }
             }
             FatalKind::Environment(detail) => {
                 s.push_str(&format!("fatal: environment: {}\n", safe_display(detail)));
@@ -1356,9 +1376,11 @@ fn bom_slug(text: &str) -> String {
 
 fn cbom_json(doc: &CaptureDocument) -> serde_json::Value {
     // Eligibility is the shared fatal-kind distinction
-    // (has_usable_evidence): salvaged Runtime docs enumerate
-    // definite assets with the same per-site accounting as any
-    // usable doc, while evidence-free fatal docs stay empty.
+    // (has_usable_evidence): usable fatal docs enumerate definite
+    // assets with the same per-site accounting as any usable doc
+    // (salvaged Runtime sites; AttachZero+ENGINE docs carry no
+    // sites, so they enumerate none), while evidence-free fatal
+    // docs stay empty.
     let usable = doc.has_usable_evidence();
     let prop = |name: &str, value: String| serde_json::json!({"name": name, "value": value});
     let window_props = || {
@@ -1551,24 +1573,25 @@ fn cbom_json(doc: &CaptureDocument) -> serde_json::Value {
                 .map(gap_reason_short)
                 .collect::<Vec<_>>()
                 .join(",");
+            let kind_word = match kind {
+                FatalKind::Recycled => "recycled",
+                FatalKind::AttachZero => "attach-zero",
+                FatalKind::Environment(_) => "environment",
+                FatalKind::Runtime(_) => "runtime",
+            };
             let why = if why.is_empty() {
-                match kind {
-                    FatalKind::Recycled => "recycled",
-                    FatalKind::AttachZero => "attach-zero",
-                    FatalKind::Environment(_) => "environment",
-                    FatalKind::Runtime(_) => "runtime",
-                }
-                .to_string()
+                kind_word.to_string()
             } else {
                 why
             };
-            // A usable (Runtime) fatal still names FATAL — absence
-            // stays unprovable — but reports the salvaged evidence
-            // instead of claiming none exists. Evidence-free kinds
-            // keep the refusal wording.
+            // A usable fatal still names FATAL — absence stays
+            // unprovable — but reports the retained evidence
+            // (salvaged Runtime sites, or the proved ENGINE plane
+            // on AttachZero — P2) instead of claiming none exists.
+            // Evidence-free kinds keep the refusal wording.
             let disclaimer = if doc.has_usable_evidence() {
                 format!(
-                    "FATAL runtime failure ({why}); salvaged evidence retained, absence = not-observed in window"
+                    "FATAL {kind_word} failure ({why}); salvaged evidence retained, absence = not-observed in window"
                 )
             } else {
                 format!("FATAL: no usable evidence ({why})")
