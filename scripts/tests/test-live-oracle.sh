@@ -182,7 +182,7 @@ fi
 if python3 "$ORACLE" "$T/ecdsa.log" "$T/rep1.json" ecdsa >"$T/out" 2>&1; then
     bad "ecdsa ledger + digest-only report fails (got exit 0)"
 else
-    grep -q 'FAIL' "$T/out" \
+    grep -q 'no executed site carries op' "$T/out" \
         && ok "ecdsa ledger + digest-only report fails" \
         || bad "ecdsa ledger + digest-only report fails"
 fi
@@ -874,7 +874,7 @@ fi
 if python3 "$ORACLE" "$T/ecdsa.log" "$T/rep59empty.json" ecdsa >"$T/out" 2>&1; then
     bad "full-schema empty candidates fail (got exit 0)"
 else
-    grep -q 'FAIL' "$T/out" \
+    grep -q 'no executed site carries op' "$T/out" \
         && ok "full-schema empty candidates fail" \
         || bad "full-schema empty candidates fail"
 fi
