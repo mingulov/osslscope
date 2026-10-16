@@ -175,10 +175,12 @@ fn finalize_honest(mut input: FinalizeInput) -> CaptureDocument {
     doc
 }
 
-/// COMPLETE report document: two definite sites (500 + 300 calls),
-/// one ambiguous site (2 candidates incl. a weak alias, 100 calls),
-/// one quiet site, full coverage, zero loss.
-fn complete_doc() -> CaptureDocument {
+/// COMPLETE-shape finalize input (shared: `complete_doc`
+/// finalizes it as-is; `traversal_doc` adds the traversal Loss
+/// counters assembly would emit for its lossy traversal content
+/// before finalizing — a lossy traversal never finalizes
+/// COMPLETE).
+fn complete_input() -> FinalizeInput {
     let mut input = input_base();
     input.sites = vec![
         site_at(
@@ -249,7 +251,14 @@ fn complete_doc() -> CaptureDocument {
             value: 1,
         },
     ];
-    let doc = finalize_honest(input);
+    input
+}
+
+/// COMPLETE report document: two definite sites (500 + 300 calls),
+/// one ambiguous site (2 candidates incl. a weak alias, 100 calls),
+/// one quiet site, full coverage, zero loss.
+fn complete_doc() -> CaptureDocument {
+    let doc = finalize_honest(complete_input());
     assert_eq!(doc.status, Completeness::Complete);
     assert_eq!(doc.total_calls(), 900);
     doc
@@ -313,6 +322,39 @@ fn partial_doc() -> CaptureDocument {
     doc
 }
 
+/// Round 2, residual M (fixture/finalize consistency): a fixture
+/// pairing a lossy traversal (a non-Complete entry, a finding)
+/// with COMPLETE contradicts assembly semantics — assembly emits
+/// `traversal.incomplete`/`traversal.unjoined` Loss counters for
+/// exactly that content, so the fixture must carry them and be
+/// honestly PARTIAL (census_loss/admitted_unknown carry no
+/// counter — assembly treats them as informational record facts).
+#[test]
+fn traversal_fixture_matches_assembly_semantics() {
+    let doc = traversal_doc();
+    for (name, want) in [("traversal.incomplete", 1), ("traversal.unjoined", 1)] {
+        let c = doc
+            .counters
+            .iter()
+            .find(|c| c.name == name)
+            .unwrap_or_else(|| panic!("fixture lacks assembly counter {name}: {:?}", doc.counters));
+        assert_eq!(
+            c.value, want,
+            "fixture counter {name} disagrees with its traversal"
+        );
+        assert_eq!(
+            c.kind,
+            osslscope::evidence::CounterKind::Loss,
+            "fixture counter {name} must be Loss like assembly's"
+        );
+    }
+    assert!(
+        matches!(doc.status, Completeness::Partial { .. }),
+        "lossy-traversal fixture must be PARTIAL like assembly's: {:?}",
+        doc.status
+    );
+}
+
 /// Traversal-bearing report document: the complete shape plus a
 /// fully-populated traversal section (all ten keys incl. the
 /// round-4/5 additive census/entry fields) — the I4 conformance
@@ -321,7 +363,23 @@ pub(crate) fn traversal_doc() -> CaptureDocument {
     use osslscope::evidence::{TraversalObject, TraversalRecord, TraversalRecordEntry};
     use osslscope::scan::oracle::{Outcome, PartialReason, TrueT};
     use std::collections::BTreeMap;
-    let mut doc = complete_doc();
+    // Round 2, residual M: the lossy traversal content (one
+    // non-Complete entry, one finding) finalizes with the Loss
+    // counters assembly emits for exactly that content — the
+    // fixture is honestly PARTIAL, like assembly's.
+    let mut input = complete_input();
+    input.counters.push(loss_counter(
+        "traversal.incomplete",
+        CounterSource::Discovery,
+        1,
+    ));
+    input.counters.push(loss_counter(
+        "traversal.unjoined",
+        CounterSource::Discovery,
+        1,
+    ));
+    let mut doc = finalize_honest(input);
+    assert!(matches!(doc.status, Completeness::Partial { .. }));
     doc.traversal = Some(TraversalRecord {
         harvest: TraversalObject {
             path: "/lib/osslscope/osslscope-harvest".to_string(),
