@@ -1451,13 +1451,17 @@ fn fix4_mixed_generation_derives_none() {
     assert_eq!(w.algs.iter().find(|a| a.idx == 1).unwrap().generation, 9);
 }
 
-/// Round-4 reg3: verified terminator + fully-evidenced prefix +
-/// T+1-ONLY beyond evidence discards the DISPATCH/READ bits
-/// (they can only come from the T+1 garbage walk — every
-/// below-T slot read clean and dispatched, so no below-T gap
-/// could have produced them). Prefix-exact L3-tail rule: a
-/// valid warm table Completes instead of Partialling on
-/// adjacent-nonzero noise.
+/// Round-4 reg3, flipped in round 2 (premise change, justified —
+/// the review established this pin's premise is unattributed): a
+/// ROW-bearing below-T prefix (ALG_OK + ROWs) + live T+1 + fault
+/// bits used to mask to Complete. ROW presence proves neither
+/// dispatch termination nor fault origin (a below-T walk may have
+/// aborted mid-walk; the per-op bits are unattributable to
+/// slots), so the walked prefix vetoes the filter and the bits
+/// stay Partial. The T+1 filter survives only for provably
+/// non-walking below-T prefixes (NOIMP — see
+/// `r36_nowalk_prefix_with_live_t1_filters`) and vacuous T=0
+/// prefixes (see `fix5_t1_filter_allows_t_zero`).
 #[test]
 fn fix4_t1_garbage_filtered_prefix_exact() {
     let mut scope = OracleScope::full();
@@ -1494,8 +1498,13 @@ fn fix4_t1_garbage_filtered_prefix_exact() {
     o.finish(2_000);
     assert_eq!(o.done().len(), 1);
     assert!(
-        matches!(o.done()[0].outcome, Outcome::Complete { .. }),
-        "T+1-only garbage filters prefix-exact: {:?}",
+        matches!(
+            o.done()[0].outcome,
+            Outcome::Partial { ref reasons } if reasons.contains(&PartialReason::Trunc(
+                wire::TRUNC_DISPATCH | wire::TRUNC_WALK_READ
+            ))
+        ),
+        "walked below-T prefix vetoes the T+1 filter (bits kept): {:?}",
         o.done()[0].outcome
     );
     assert_eq!(o.done()[0].true_t, TrueT::Proven(3));
@@ -2448,6 +2457,233 @@ fn r35_unrelated_op_fault_does_not_degrade_held_predecessor() {
     assert!(
         matches!(o.done()[0].outcome, Outcome::Complete { .. }),
         "successor-op fault must not touch the predecessor: {:?}",
+        o.done()[0].outcome
+    );
+}
+
+/// Round 2, residual C (R36 fault class — the review's exact
+/// fixture: `fix5_f2_row_then_abort_warm_not_masked` + ALG_OK@2):
+/// warm T=1, ALG_OK@0 with one ROW (its dispatch walk may have
+/// aborted on the second entry read), EMPTY@1, live ALG_OK@2
+/// (T+1), TRUNC fault bits. ROW presence proves neither dispatch
+/// termination (ROWs emit before a later entry read can abort)
+/// nor fault origin (the per-op bits are unattributable to
+/// slots) — a walked below-T slot vetoes the T+1 filter, and the
+/// bits stay Partial. Pre-fix the 1..=127 ROW predicate passed
+/// and the filter masked to Complete.
+#[test]
+fn r36_row_bearing_below_t_with_live_t1_not_masked() {
+    let mut scope = OracleScope::full();
+    scope.known_t.insert(ARR, (1, 0));
+    let mut o = Oracle::new(scope);
+    let mut b = quiesced_idle(&[TIDA]);
+    b.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b.push_ret(ret(TIDA, 0, 0));
+    b.push_alg(alg(TIDA, 0, 0, wire::ALG_OK));
+    b.push_row(row(TIDA, 0, 0));
+    b.push_alg(alg_arr(TIDA, 0, 1, wire::ALG_EMPTY, ARR, 0));
+    b.push_alg(alg(TIDA, 0, 2, wire::ALG_OK));
+    b.trunc
+        .insert(OP, wire::TRUNC_DISPATCH | wire::TRUNC_WALK_READ);
+    o.ingest(&b);
+    assert_eq!(o.done().len(), 1);
+    assert!(
+        matches!(
+            o.done()[0].outcome,
+            Outcome::Partial { ref reasons } if reasons.contains(&PartialReason::Trunc(
+                wire::TRUNC_DISPATCH | wire::TRUNC_WALK_READ
+            ))
+        ),
+        "ROW-bearing below-T walk must veto the T+1 filter: {:?}",
+        o.done()[0].outcome
+    );
+}
+
+/// R36 battery: the veto is ROW-count-independent (0 and 128 are
+/// pinned elsewhere; every walked count in between — short-clean
+/// vs aborted-mid-walk are wire-indistinguishable — vetoes too).
+#[test]
+fn r36_walked_prefix_vetoes_at_any_row_count() {
+    for n in [2u32, 64, 127] {
+        let mut scope = OracleScope::full();
+        scope.known_t.insert(ARR, (1, 0));
+        let mut o = Oracle::new(scope);
+        let mut b = quiesced_idle(&[TIDA]);
+        b.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+        b.push_ret(ret(TIDA, 0, 0));
+        b.push_alg(alg(TIDA, 0, 0, wire::ALG_OK));
+        for _ in 0..n {
+            b.push_row(row(TIDA, 0, 0));
+        }
+        b.push_alg(alg_arr(TIDA, 0, 1, wire::ALG_EMPTY, ARR, 0));
+        b.push_alg(alg(TIDA, 0, 2, wire::ALG_OK));
+        b.trunc.insert(OP, wire::TRUNC_WALK_READ);
+        o.ingest(&b);
+        assert_eq!(o.done().len(), 1);
+        assert!(
+            matches!(
+                o.done()[0].outcome,
+                Outcome::Partial { ref reasons } if reasons
+                    .iter()
+                    .any(|r| matches!(r, PartialReason::Trunc(_)))
+            ),
+            "{n} ROWs prove no termination — must veto the filter: {:?}",
+            o.done()[0].outcome
+        );
+    }
+}
+
+/// R36 battery: 128 ROWs prove the below-T walk itself overflowed
+/// (one ROW per entry over 128 slots) — its DISPATCH is genuine,
+/// never T+1 noise.
+#[test]
+fn r36_full_walk_overflow_is_genuine_below_t_fault() {
+    let mut scope = OracleScope::full();
+    scope.known_t.insert(ARR, (1, 0));
+    let mut o = Oracle::new(scope);
+    let mut b = quiesced_idle(&[TIDA]);
+    b.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b.push_ret(ret(TIDA, 0, 0));
+    b.push_alg(alg(TIDA, 0, 0, wire::ALG_OK));
+    for _ in 0..128 {
+        b.push_row(row(TIDA, 0, 0));
+    }
+    b.push_alg(alg_arr(TIDA, 0, 1, wire::ALG_EMPTY, ARR, 0));
+    b.push_alg(alg(TIDA, 0, 2, wire::ALG_OK));
+    b.trunc.insert(OP, wire::TRUNC_DISPATCH);
+    o.ingest(&b);
+    assert_eq!(o.done().len(), 1);
+    assert!(
+        matches!(
+            o.done()[0].outcome,
+            Outcome::Partial { ref reasons } if reasons
+                .iter()
+                .any(|r| matches!(r, PartialReason::Trunc(b) if b & wire::TRUNC_DISPATCH != 0))
+        ),
+        "below-T overflow must keep its DISPATCH bit: {:?}",
+        o.done()[0].outcome
+    );
+}
+
+/// R36 battery: every walking below-T status vetoes (OK, UNKNOWN,
+/// MIXED — each reaches the dispatch walk, so each may have
+/// faulted); multi-slot below-T prefixes veto as a class.
+#[test]
+fn r36_every_walking_prefix_status_vetoes() {
+    for status in [wire::ALG_OK, wire::ALG_UNKNOWN, wire::ALG_MIXED] {
+        let mut scope = OracleScope::full();
+        scope.known_t.insert(ARR, (2, 0));
+        let mut o = Oracle::new(scope);
+        let mut b = quiesced_idle(&[TIDA]);
+        b.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+        b.push_ret(ret(TIDA, 0, 0));
+        for j in 0..2u64 {
+            b.push_alg(alg(TIDA, 0, j, status));
+            b.push_row(row(TIDA, 0, j));
+        }
+        b.push_alg(alg_arr(TIDA, 0, 2, wire::ALG_EMPTY, ARR, 0));
+        b.push_alg(alg(TIDA, 0, 3, wire::ALG_OK));
+        b.trunc
+            .insert(OP, wire::TRUNC_DISPATCH | wire::TRUNC_WALK_READ);
+        o.ingest(&b);
+        assert_eq!(o.done().len(), 1);
+        assert!(
+            matches!(
+                o.done()[0].outcome,
+                Outcome::Partial { ref reasons } if reasons
+                    .iter()
+                    .any(|r| matches!(r, PartialReason::Trunc(_)))
+            ),
+            "walking status {status} below-T must veto the filter: {:?}",
+            o.done()[0].outcome
+        );
+    }
+}
+
+/// R36 battery: a DISPATCH-only fault with a ROW-bearing below-T
+/// prefix still vetoes (overflow may be below-T — 128 ROWs are
+/// sufficient, never necessary, to prove it).
+#[test]
+fn r36_dispatch_only_fault_with_walked_prefix_not_masked() {
+    let mut scope = OracleScope::full();
+    scope.known_t.insert(ARR, (1, 0));
+    let mut o = Oracle::new(scope);
+    let mut b = quiesced_idle(&[TIDA]);
+    b.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b.push_ret(ret(TIDA, 0, 0));
+    b.push_alg(alg(TIDA, 0, 0, wire::ALG_OK));
+    b.push_row(row(TIDA, 0, 0));
+    b.push_alg(alg_arr(TIDA, 0, 1, wire::ALG_EMPTY, ARR, 0));
+    b.push_alg(alg(TIDA, 0, 2, wire::ALG_OK));
+    b.trunc.insert(OP, wire::TRUNC_DISPATCH);
+    o.ingest(&b);
+    assert_eq!(o.done().len(), 1);
+    assert!(
+        matches!(
+            o.done()[0].outcome,
+            Outcome::Partial { ref reasons } if reasons
+                .iter()
+                .any(|r| matches!(r, PartialReason::Trunc(b) if b & wire::TRUNC_DISPATCH != 0))
+        ),
+        "DISPATCH with a walked below-T prefix must stay Partial: {:?}",
+        o.done()[0].outcome
+    );
+}
+
+/// R36 battery (the remaining positive pin): below-T slots that
+/// provably NEVER walked (ALG_NOIMP — the producer classifies
+/// without implementation and never reaches the dispatch walk)
+/// cannot have faulted, so live-T+1 fault bits attribute to the
+/// T+1 walk and the filter fires. This is the only masking shape:
+/// every below-T slot non-walking, terminator verified, T+1
+/// walked, beyond-T confined to T+1.
+#[test]
+fn r36_nowalk_prefix_with_live_t1_filters() {
+    let mut scope = OracleScope::full();
+    scope.known_t.insert(ARR, (2, 0));
+    let mut o = Oracle::new(scope);
+    let mut b = quiesced_idle(&[TIDA]);
+    b.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b.push_ret(ret(TIDA, 0, 0));
+    for j in 0..2u64 {
+        b.push_alg(alg(TIDA, 0, j, wire::ALG_NOIMP));
+    }
+    b.push_alg(alg_arr(TIDA, 0, 2, wire::ALG_EMPTY, ARR, 0));
+    b.push_alg(alg(TIDA, 0, 3, wire::ALG_OK));
+    b.push_row(row(TIDA, 0, 3));
+    b.trunc
+        .insert(OP, wire::TRUNC_DISPATCH | wire::TRUNC_WALK_READ);
+    o.ingest(&b);
+    assert_eq!(o.done().len(), 1);
+    assert!(
+        matches!(o.done()[0].outcome, Outcome::Complete { .. }),
+        "non-walking below-T cannot explain the bits — T+1 noise filters: {:?}",
+        o.done()[0].outcome
+    );
+    assert_eq!(o.done()[0].true_t, TrueT::Proven(2));
+}
+
+/// R36 battery: a non-walking T+1 record (UNREADABLE never reaches
+/// the dispatch walk) is not T+1 noise evidence — with a walked
+/// below-T prefix the bits stay Partial on both halves.
+#[test]
+fn r36_nonwalking_t1_is_not_noise_evidence() {
+    let mut scope = OracleScope::full();
+    scope.known_t.insert(ARR, (1, 0));
+    let mut o = Oracle::new(scope);
+    let mut b = quiesced_idle(&[TIDA]);
+    b.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b.push_ret(ret(TIDA, 0, 0));
+    b.push_alg(alg(TIDA, 0, 0, wire::ALG_OK));
+    b.push_row(row(TIDA, 0, 0));
+    b.push_alg(alg_arr(TIDA, 0, 1, wire::ALG_EMPTY, ARR, 0));
+    b.push_alg(alg(TIDA, 0, 2, wire::ALG_UNREADABLE));
+    b.trunc.insert(OP, wire::TRUNC_WALK_READ);
+    o.ingest(&b);
+    assert_eq!(o.done().len(), 1);
+    assert!(
+        matches!(o.done()[0].outcome, Outcome::Partial { .. }),
+        "non-walking T+1 + walked prefix must stay Partial: {:?}",
         o.done()[0].outcome
     );
 }
