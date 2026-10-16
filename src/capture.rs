@@ -3195,7 +3195,18 @@ pub struct AdapterState {
     /// close-tail residual reconcile at assembly time.
     baseline_trip: HashMap<u64, u64>,
     baseline_lgcalls: u64,
+    /// Failed-attach diagnostic texts (R06): retained sorted +
+    /// deduped for the document path (the systematic attach
+    /// failure must identify itself in JSON, not just count).
+    /// Producer literals only (no paths/pointers) — capped at
+    /// assembly ([`ATTACH_DIAGNOSTICS_CAP]).
+    attach_diagnostics: BTreeSet<String>,
 }
+
+/// Cap on retained attach diagnostics (R06): sorted take — the
+/// first N distinct texts (deterministic; counts stay exact in
+/// the counters regardless).
+pub const ATTACH_DIAGNOSTICS_CAP: usize = 16;
 
 impl AdapterState {
     /// Distinct backing triples seen per op (coverage census).
@@ -3872,8 +3883,12 @@ pub fn adapt_delta(
     let mut attaches_ok = 0u64;
     let mut attaches_failed = 0u64;
     for attach in &delta.attaches {
-        if attach.failed.is_some() {
+        if let Some(failed) = attach.failed.as_ref() {
             attaches_failed += 1;
+            // R06: retain the diagnostic text (sorted + deduped
+            // in the set) for the document path — the failure
+            // identifies itself, not just counts.
+            state.attach_diagnostics.insert(failed.clone());
         } else {
             attaches_ok += 1;
         }
@@ -6111,6 +6126,14 @@ where
                 CounterSource::Discovery,
                 snapshot.dispatch.attach_failures.len() as u64,
             ));
+            // R06: close-time failure texts join the retained
+            // diagnostics (same set, same dedup — the close drain
+            // identifies itself too).
+            for failure in &snapshot.dispatch.attach_failures {
+                self.adapter
+                    .attach_diagnostics
+                    .insert(failure.error.clone());
+            }
         }
         // Retained epoch gaps stay PARTIAL even when every live table
         // terminates (rows survive; completion does not).
@@ -6679,6 +6702,16 @@ where
             self.wall_start,
             self.wall_end,
         ));
+        // R06: failed-attach diagnostics ride the document (sorted
+        // set take, capped — deterministic; the counters stay the
+        // exact counts regardless).
+        document.attach_diagnostics = self
+            .adapter
+            .attach_diagnostics
+            .iter()
+            .take(ATTACH_DIAGNOSTICS_CAP)
+            .cloned()
+            .collect();
 
         // Legacy `legacy` block from IN-WINDOW tripwire evidence only
         // (baselined at the declared boundary; the post-count-close
@@ -9729,6 +9762,40 @@ mod tests {
             out.activity
                 .iter()
                 .all(|c| c.name != "discovery.queries_observed")
+        );
+    }
+
+    #[test]
+    fn adapt_failed_attach_diagnostic_retained() {
+        // R06 (attach diagnostics): a failed attach's diagnostic
+        // text is retained (sorted, deduped) for the document
+        // path — the systematic attach failure must identify
+        // itself in JSON, not just count.
+        let delta = DiscoveryDelta {
+            attaches: vec![
+                AttachEvent {
+                    kind: AttachKind::Stage2 { cookie: 7 },
+                    failed: Some("EBUSY".to_string()),
+                },
+                AttachEvent {
+                    kind: AttachKind::Tripwires { count: 3 },
+                    failed: Some("EBUSY".to_string()),
+                },
+                AttachEvent {
+                    kind: AttachKind::Stage2 { cookie: 9 },
+                    failed: None,
+                },
+            ],
+            ..DiscoveryDelta::default()
+        };
+        let (state, _) = adapt_fresh(&delta, &[]);
+        assert_eq!(
+            state
+                .attach_diagnostics
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec!["EBUSY".to_string()],
+            "failed-attach text retained once (deduped)"
         );
     }
 

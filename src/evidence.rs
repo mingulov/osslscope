@@ -812,6 +812,15 @@ pub struct CaptureDocument {
     /// (paths + sha256, so doctor/report/check agree) plus
     /// record/findings/poll counts. Absent on harvest-only runs.
     pub traversal: Option<TraversalRecord>,
+    /// Failed-attach diagnostic texts (R06): sorted, deduped,
+    /// capped producer literals (no paths/pointers) — the failed
+    /// attach identifies itself, not just counts. Additive and
+    /// old-reader-safe: missing in old documents means none
+    /// recorded. Set post-finalization by the producer;
+    /// [`finalize`] leaves it empty so every existing producer
+    /// keeps its exact shape.
+    #[serde(default)]
+    pub attach_diagnostics: Vec<String>,
 }
 
 /// One BPF object selected for the window (path locates for
@@ -1003,5 +1012,6 @@ pub fn finalize(mut input: FinalizeInput) -> CaptureDocument {
         engine_observations: input.engine_observations,
         context: None,
         traversal: input.traversal,
+        attach_diagnostics: Vec::new(),
     }
 }

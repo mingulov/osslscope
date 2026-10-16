@@ -20,9 +20,9 @@ use osslscope::count_session::{
 };
 use osslscope::discovery::maps::Mapping;
 use osslscope::discovery::session::{
-    BackingRef, CoverageState, DiscoveredCandidate, DiscoveryDelta, DiscoveryLoss,
-    DiscoverySnapshot, MapSnapshots, PollBudget, Recycled, SessionCore, SessionEnv, TableCoverage,
-    TableRetirement, TripwireDelta,
+    AttachEvent, AttachKind, BackingRef, CoverageState, DiscoveredCandidate, DiscoveryDelta,
+    DiscoveryLoss, DiscoverySnapshot, MapSnapshots, PollBudget, Recycled, SessionCore, SessionEnv,
+    TableCoverage, TableRetirement, TripwireDelta,
 };
 use osslscope::evidence::{
     CandidateCoverage, Completeness, ExpectedScope, PredicateMatch, match_bounds,
@@ -2690,6 +2690,28 @@ fn already_exited_child_preserves_status() {
     assert!(log.released);
     assert!(log.finished);
     assert!(log.polls >= 1);
+}
+
+#[test]
+fn failed_attach_diagnostic_reaches_document() {
+    // R06 (attach diagnostics, end-to-end): a failed attach's
+    // diagnostic text flows poll → adapter → document (the
+    // systematic-1 attach failure identifies itself in JSON).
+    let mut h = Harness::fresh("attach-diag");
+    h.snapshot_attached();
+    h.polls.push_back(DiscoveryDelta {
+        trigger_observed: true,
+        attaches: vec![AttachEvent {
+            kind: AttachKind::Stage2 { cookie: 7 },
+            failed: Some("EBUSY".to_string()),
+        }],
+        ..DiscoveryDelta::default()
+    });
+    h.exit_at_ns = Some(BASE_NS + 100_000_000);
+    h.exit_code = 0;
+    let (out, _) = h.run();
+    let c = out.unwrap();
+    assert_eq!(c.document.attach_diagnostics, vec!["EBUSY".to_string()]);
 }
 
 #[test]

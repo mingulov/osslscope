@@ -769,6 +769,11 @@ fn doc_json(doc: &CaptureDocument) -> serde_json::Value {
             "wall_end_unix_ns": context.wall_end_unix_ns,
         });
     }
+    // R06: attach diagnostics render only when recorded (same
+    // optional-key rule — producer literals, capped upstream).
+    if !doc.attach_diagnostics.is_empty() {
+        out["attach_diagnostics"] = serde_json::json!(doc.attach_diagnostics);
+    }
     out
 }
 
@@ -1011,6 +1016,15 @@ pub fn render_human(doc: &CaptureDocument) -> String {
         s.push_str("reasons:\n");
         for reason in doc.reasons() {
             s.push_str(&format!("  - {}\n", gap_reason_human(reason)));
+        }
+        s.push('\n');
+    }
+    // R06: failed-attach diagnostics (producer literals only when
+    // recorded — the failure identifies itself).
+    if !doc.attach_diagnostics.is_empty() {
+        s.push_str("attach diagnostics:\n");
+        for diagnostic in &doc.attach_diagnostics {
+            s.push_str(&format!("  - {}\n", safe_display(diagnostic)));
         }
         s.push('\n');
     }
@@ -1815,6 +1829,26 @@ mod tests {
         let mut d = capture::empty_document();
         d.status = status;
         d
+    }
+
+    #[test]
+    fn attach_diagnostics_render_only_when_recorded() {
+        // R06: the diagnostics key renders in JSON (validating
+        // against the schema) and as a human block only when
+        // recorded; empty documents omit both (existing shapes
+        // unchanged).
+        let mut doc = capture::empty_document();
+        let clean: serde_json::Value =
+            serde_json::from_slice(&render_json(&doc).expect("render")).expect("json");
+        assert!(clean.get("attach_diagnostics").is_none());
+        assert!(!render_human(&doc).contains("attach diagnostics:"));
+        doc.attach_diagnostics = vec!["EBUSY".to_string()];
+        let rendered = render_json(&doc).expect("render");
+        let v: serde_json::Value = serde_json::from_slice(&rendered).expect("json");
+        assert_eq!(v["attach_diagnostics"], serde_json::json!(["EBUSY"]));
+        crate::schema::validate_v2(&v).expect("diagnostics key validates");
+        let human = render_human(&doc);
+        assert!(human.contains("attach diagnostics:\n  - EBUSY"), "{human}");
     }
 
     #[test]
