@@ -1118,6 +1118,70 @@ fn fenced_counts_evaluated() {
 
 /// Fatal capture yields no verdict at all, never a violation.
 #[test]
+fn attach_zero_with_proved_engine_evidence_reports_violation() {
+    // P2: an AttachZero document carrying proved in-window ENGINE
+    // tripwire observations still proves a violation under
+    // --deny-engine (exit 10) — never no-verdict exit 4. The
+    // attach-zero classification describes provider attachment,
+    // not the independent ENGINE evidence plane.
+    let obs = EngineObservation {
+        key: SiteKey {
+            object: obj("exe-fingerprint"),
+            device: 7,
+            inode: 9,
+            offset: 0x100,
+        },
+        generation: 1,
+        entrypoint: engine_index("ENGINE_init").expect("frozen registry"),
+        calls: 7,
+        window: EngineWindow::InWindow,
+    };
+    let doc = finalize(FinalizeInput {
+        window: exact_window(),
+        sites: Vec::new(),
+        fenced: Vec::new(),
+        objects: Vec::new(),
+        coverage: Vec::new(),
+        counters: Vec::new(),
+        fatal: Some(FatalKind::AttachZero),
+        target: TargetRecord::unknown(),
+        openssl: OpensslVersion::unknown(),
+        disposition: None,
+        policy: None,
+        legacy_partition: LegacyCallPartition::default(),
+        engine_observations: vec![obs],
+        traversal: None,
+    });
+    let v = evaluate_document(std::slice::from_ref(&PolicyRule::deny_engine()), &doc);
+    assert!(!v.no_verdict, "proved ENGINE evidence defeats no-verdict");
+    assert_eq!(v.overall(), PolicyOutcome::Violation);
+    assert_eq!(v.rules[0].bounds.definite, 7);
+    assert_eq!(v.rules[0].engine_hits.len(), 1);
+    assert_eq!(exit_for(v.overall(), Some(0), &doc, &ok_delivery()), 10);
+    // Control: the same fatal without ENGINE evidence stays
+    // no-verdict (the gate still holds for evidence-free fatals).
+    let bare = finalize(FinalizeInput {
+        window: exact_window(),
+        sites: Vec::new(),
+        fenced: Vec::new(),
+        objects: Vec::new(),
+        coverage: Vec::new(),
+        counters: Vec::new(),
+        fatal: Some(FatalKind::AttachZero),
+        target: TargetRecord::unknown(),
+        openssl: OpensslVersion::unknown(),
+        disposition: None,
+        policy: None,
+        legacy_partition: LegacyCallPartition::default(),
+        engine_observations: Vec::new(),
+        traversal: None,
+    });
+    let vb = evaluate_document(std::slice::from_ref(&PolicyRule::deny_engine()), &bare);
+    assert_eq!(vb.overall(), PolicyOutcome::NoVerdict);
+    assert_eq!(exit_for(vb.overall(), None, &bare, &ok_delivery()), 4);
+}
+
+#[test]
 fn fatal_capture_has_no_verdict() {
     let fatal = doc(
         vec![site_at(

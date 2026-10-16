@@ -570,6 +570,17 @@ pub fn engine_match_bounds(doc: &CaptureDocument) -> MatchBounds {
 /// violation without evidence. Salvaged (runtime-fatal) documents
 /// carry real observed sites, so they evaluate like any doc — a
 /// proved violation still exits 10 (H7-T3).
+/// Proved in-window ENGINE executions (P2): typed tripwire
+/// observations the attach-zero/fetch planes cannot suppress — an
+/// AttachZero-classified document carrying these still proves a
+/// violation (the classification describes provider attachment,
+/// not the independent ENGINE evidence plane).
+fn has_proved_engine_evidence(doc: &CaptureDocument) -> bool {
+    doc.engine_observations
+        .iter()
+        .any(|o| o.calls > 0 && o.window == EngineWindow::InWindow)
+}
+
 pub fn evaluate_document(rules: &[PolicyRule], doc: &CaptureDocument) -> PolicyVerdict {
     if matches!(doc.status, Completeness::Fatal { .. })
         && !matches!(
@@ -579,6 +590,7 @@ pub fn evaluate_document(rules: &[PolicyRule], doc: &CaptureDocument) -> PolicyV
                 ..
             }
         )
+        && !has_proved_engine_evidence(doc)
     {
         return PolicyVerdict {
             no_verdict: true,
