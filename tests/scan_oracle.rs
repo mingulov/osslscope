@@ -2136,6 +2136,38 @@ fn stream_drain_stats_accumulate() {
     assert_eq!(s.bytes, 2 * ONRING_CALL);
 }
 
+/// K2: unknown RCOUNT lifecycle states must not retire (an
+/// invalid state is corrupt content, never an absent/retired
+/// record): state 2 stalls exactly like ACTIVE (open held +
+/// Stall finding at ingest), never Complete — with otherwise
+/// complete evidence.
+#[test]
+fn k2_unknown_rcount_state_stalls_like_active() {
+    for (state, tag) in [(wire::RCOUNT_STATE_ACTIVE, "active"), (2u32, "unknown-2")] {
+        let mut o = Oracle::new(OracleScope::full());
+        let mut b = ScanBatch {
+            quiesced: true,
+            ..ScanBatch::default()
+        };
+        b.rcount.insert(TIDA, (0, state));
+        b.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+        b.push_ret(ret(TIDA, 0, 0));
+        b.push_alg(alg(TIDA, 0, 0, wire::ALG_OK));
+        b.push_alg(alg_arr(TIDA, 0, 1, wire::ALG_EMPTY, ARR, 0));
+        o.ingest(&b);
+        assert!(
+            o.done().is_empty(),
+            "{tag}: must not retire at ingest: {:?}",
+            o.done()
+        );
+        assert!(
+            o.findings().contains(&Finding::Stall { tid: TIDA, seq: 0 }),
+            "{tag}: stall finding missing: {:?}",
+            o.findings()
+        );
+    }
+}
+
 /// K1: the terminator-region consumer range is bounded
 /// independently of the wire parser (synthetic batches bypass
 /// it): a corrupted EMPTY idx inside a synthetic attached set
