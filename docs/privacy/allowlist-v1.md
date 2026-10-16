@@ -329,6 +329,10 @@ gate reads clock + cells only).
   next poll)`,
   `attach <entry>@<file-offset> failed (kind=<ErrorKind>)`,
   `attach <entry>+<ret> pin dup failed (kind=<ErrorKind>)`,
+  `tripwire anchors re-established after replacement (identical
+  mapping)`,
+  `dispatch anchors re-established after replacement; continuity
+  unproven`,
   `attach path contains NUL`,
   `dispatch reinstall failed: <inner>`,
   `dispatch maps read failed (kind=<ErrorKind>)`,
