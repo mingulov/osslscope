@@ -1727,6 +1727,91 @@ mod tests {
     }
 
     #[test]
+    fn v2_traversal_section_accepts_emitter_shapes() {
+        // I4/K3: the shipped schema accepts the full traversal
+        // section the emitter produces (all ten keys, every
+        // outcome/true_t/reason/abandon variant shape) and rejects
+        // malformed ones (unknown keys, short sha256, wrong
+        // variant envelopes).
+        use serde_json::json;
+        let schema: serde_json::Value = serde_json::from_str(V2_SCHEMA_JSON).unwrap();
+        let node = schema["properties"]["traversal"].clone();
+        let check = |v: &serde_json::Value| validate_against(&node, v, &schema, "$", 0);
+        let obj = |sha: &str| {
+            json!({"path": "/lib/osslscope/osslscope-harvest", "sha256": sha})
+        };
+        let sha = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+        let good = json!({
+            "harvest": obj(sha),
+            "count": obj(sha),
+            "members": obj(sha),
+            "records": 14,
+            "findings": 1,
+            "polls": 3,
+            "admitted": {"7": 10, "12": 4},
+            "entries": [
+                {"tid": 7, "seq": 0, "op": 7,
+                 "outcome": {"Complete": {"true_t": 6, "cached": false}},
+                 "true_t": {"Proven": 6}, "alg_count": 7, "row_count": 3,
+                 "generation": 9},
+                {"tid": 7, "seq": 1, "op": 12,
+                 "outcome": {"Partial": {"reasons": [
+                     {"Holes": [3]}, {"Unreadable": [4]}, {"Trunc": 6},
+                     {"UnobservedSlots": [9]},
+                     {"CacheShrink": {"cached": 9, "observed": 4}},
+                     {"CacheStale": {"cached": 9}},
+                     {"GenStale": {"expected": 1, "observed": 2}},
+                     "GuardError", "Overfull", "DrainLoss", "GuardMissing",
+                     "GenMixed", "DanglingCall", "TerminatorUnproven",
+                     "RowArrayMismatch"
+                 ]}},
+                 "true_t": {"Candidate": 4}, "alg_count": 5, "row_count": 0,
+                 "generation": null},
+                {"tid": 8, "seq": 0, "op": 7,
+                 "outcome": {"Skipped": {"cause": 1}},
+                 "true_t": "EmptyTable", "alg_count": 0, "row_count": 0,
+                 "generation": null},
+                {"tid": 8, "seq": 1, "op": 7,
+                 "outcome": {"Tainted": {"by_seq": 3}},
+                 "true_t": "Unknown", "alg_count": 1, "row_count": 0,
+                 "generation": 2},
+                {"tid": 9, "seq": 0, "op": 7,
+                 "outcome": {"Abandoned": {"reason": "Hung"}},
+                 "true_t": {"Proven": 1}, "alg_count": 0, "row_count": 0,
+                 "generation": null}
+            ],
+            "admitted_unknown": [9],
+            "census_loss": 2
+        });
+        check(&good).expect("emitter traversal shape validates");
+        // Every abandon reason spelling validates.
+        for reason in [
+            "SkipVictim", "Churned", "Evicted", "RetireFailed", "StaleRepaired",
+            "Stalled", "Detached", "PreWindow", "Hung",
+        ] {
+            let mut v = good.clone();
+            v["entries"][4]["outcome"] = json!({"Abandoned": {"reason": reason}});
+            check(&v).expect(format!("abandon reason {reason} validates").as_str());
+        }
+        // Malformed shapes reject.
+        let mut unknown_key = good.clone();
+        unknown_key["entries"][0]["bogus"] = json!(1);
+        assert!(check(&unknown_key).is_err(), "unknown entry key rejects");
+        let mut short_sha = good.clone();
+        short_sha["harvest"]["sha256"] = json!("abc");
+        assert!(check(&short_sha).is_err(), "short sha256 rejects");
+        let mut bad_outcome = good.clone();
+        bad_outcome["entries"][0]["outcome"] = json!({"Complete": {"true_t": 6}});
+        assert!(check(&bad_outcome).is_err(), "short Complete rejects");
+        let mut bad_reason = good.clone();
+        bad_reason["entries"][1]["outcome"]["Partial"]["reasons"] = json!(["Nope"]);
+        assert!(check(&bad_reason).is_err(), "unknown reason rejects");
+        let mut bad_gen = good.clone();
+        bad_gen["entries"][0]["generation"] = json!("9");
+        assert!(check(&bad_gen).is_err(), "string generation rejects");
+    }
+
+    #[test]
     fn v2_schema_uses_only_supported_keywords() {
         // The shipped v2 schema must load under the validator: any
         // future keyword addition fails here until validator support

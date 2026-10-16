@@ -266,7 +266,7 @@
       "items": { "type": "string", "minLength": 1 }
     },
     "traversal": {
-      "description": "Traversal outcome (v2.1, optional — present iff the window ran the members backend): the exact selected triple plus record/findings/poll counts. Absent on harvest-only runs.",
+      "description": "Traversal outcome (v2.1, optional — present iff the window ran the members backend): the exact selected triple plus record/findings/poll counts, the admitted-query census, per-record native facts, and census loss. Absent on harvest-only runs. The six triple/count keys are required; the census/entry keys are optional (additive — old readers ignore them) but always emitted by current producers.",
       "type": "object",
       "required": ["harvest", "count", "members", "records", "findings", "polls"],
       "additionalProperties": false,
@@ -276,20 +276,103 @@
         "members": { "$ref": "#/$defs/traversal-object" },
         "records": { "$ref": "#/$defs/u64" },
         "findings": { "$ref": "#/$defs/u64" },
-        "polls": { "$ref": "#/$defs/u64" }
+        "polls": { "$ref": "#/$defs/u64" },
+        "admitted": {
+          "description": "Admitted queries per op (op → count; JSON object keys are decimal op ids).",
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/u64" }
+        },
+        "entries": {
+          "description": "Per-record native facts, close order.",
+          "type": "array",
+          "items": { "$ref": "#/$defs/traversal_entry" }
+        },
+        "admitted_unknown": {
+          "description": "Ops observed (records retained) but missing from the census while increments were lost: UNKNOWN counts, never zero.",
+          "type": "array",
+          "items": { "$ref": "#/$defs/u32" }
+        },
+        "census_loss": {
+          "description": "Cumulative admitted-increment loss (CALLS map pressure).",
+          "$ref": "#/$defs/u64"
+        }
       }
     }
   },
   "$defs": {
     "traversal-object": {
-      "description": "One BPF object selected for the window: path locates for display, sha256 defines identity.",
+      "description": "One BPF object selected for the window: path locates for display, sha256 defines identity. The sha256 pins to 64 chars (min/maxLength — the only string-shape keywords the embedded validator implements; hex-ness is producer-guaranteed).",
       "type": "object",
       "required": ["path", "sha256"],
       "additionalProperties": false,
       "properties": {
         "path": { "type": "string", "minLength": 1 },
-        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+        "sha256": { "type": "string", "minLength": 64, "maxLength": 64 }
       }
+    },
+    "traversal_entry": {
+      "description": "One traversal record's native facts (per-record summary — counts and verdicts only, never the walked arrays).",
+      "type": "object",
+      "required": ["tid", "seq", "op", "outcome", "true_t", "alg_count", "row_count", "generation"],
+      "additionalProperties": false,
+      "properties": {
+        "tid": { "$ref": "#/$defs/u32" },
+        "seq": { "$ref": "#/$defs/u64" },
+        "op": { "$ref": "#/$defs/u32" },
+        "outcome": { "$ref": "#/$defs/traversal_outcome" },
+        "true_t": { "$ref": "#/$defs/traversal_true_t" },
+        "alg_count": { "$ref": "#/$defs/u64" },
+        "row_count": { "$ref": "#/$defs/u64" },
+        "generation": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        }
+      }
+    },
+    "traversal_true_t": {
+      "description": "Terminator belief (externally-tagged enum shape: newtype variants are single-key objects, unit variants are plain strings).",
+      "anyOf": [
+        { "type": "object", "required": ["Proven"], "additionalProperties": false, "properties": { "Proven": { "$ref": "#/$defs/u64" } } },
+        { "type": "object", "required": ["Candidate"], "additionalProperties": false, "properties": { "Candidate": { "$ref": "#/$defs/u64" } } },
+        { "type": "string", "const": "EmptyTable" },
+        { "type": "string", "const": "Unknown" }
+      ]
+    },
+    "traversal_outcome": {
+      "description": "Invocation outcome (externally-tagged enum shape).",
+      "anyOf": [
+        { "type": "object", "required": ["Complete"], "additionalProperties": false, "properties": { "Complete": { "type": "object", "required": ["true_t", "cached"], "additionalProperties": false, "properties": { "true_t": { "$ref": "#/$defs/u64" }, "cached": { "type": "boolean" } } } } },
+        { "type": "object", "required": ["Partial"], "additionalProperties": false, "properties": { "Partial": { "type": "object", "required": ["reasons"], "additionalProperties": false, "properties": { "reasons": { "type": "array", "items": { "$ref": "#/$defs/traversal_partial_reason" } } } } } },
+        { "type": "object", "required": ["Skipped"], "additionalProperties": false, "properties": { "Skipped": { "type": "object", "required": ["cause"], "additionalProperties": false, "properties": { "cause": { "type": "integer", "minimum": 0, "maximum": 255 } } } } },
+        { "type": "object", "required": ["Tainted"], "additionalProperties": false, "properties": { "Tainted": { "type": "object", "required": ["by_seq"], "additionalProperties": false, "properties": { "by_seq": { "$ref": "#/$defs/u64" } } } } },
+        { "type": "object", "required": ["Abandoned"], "additionalProperties": false, "properties": { "Abandoned": { "type": "object", "required": ["reason"], "additionalProperties": false, "properties": { "reason": { "$ref": "#/$defs/traversal_abandon_reason" } } } } }
+      ]
+    },
+    "traversal_abandon_reason": {
+      "description": "Why an invocation was abandoned (unit enum — plain string).",
+      "type": "string",
+      "enum": ["SkipVictim", "Churned", "Evicted", "RetireFailed", "StaleRepaired", "Stalled", "Detached", "PreWindow", "Hung"]
+    },
+    "traversal_partial_reason": {
+      "description": "Why an invocation is partial (externally-tagged enum shape: newtype/struct variants are single-key objects, unit variants are plain strings).",
+      "anyOf": [
+        { "type": "object", "required": ["Holes"], "additionalProperties": false, "properties": { "Holes": { "type": "array", "items": { "$ref": "#/$defs/u64" } } } },
+        { "type": "object", "required": ["Unreadable"], "additionalProperties": false, "properties": { "Unreadable": { "type": "array", "items": { "$ref": "#/$defs/u64" } } } },
+        { "type": "object", "required": ["Trunc"], "additionalProperties": false, "properties": { "Trunc": { "$ref": "#/$defs/u64" } } },
+        { "type": "object", "required": ["UnobservedSlots"], "additionalProperties": false, "properties": { "UnobservedSlots": { "type": "array", "items": { "$ref": "#/$defs/u64" } } } },
+        { "type": "object", "required": ["CacheShrink"], "additionalProperties": false, "properties": { "CacheShrink": { "type": "object", "required": ["cached", "observed"], "additionalProperties": false, "properties": { "cached": { "$ref": "#/$defs/u64" }, "observed": { "$ref": "#/$defs/u64" } } } } },
+        { "type": "object", "required": ["CacheStale"], "additionalProperties": false, "properties": { "CacheStale": { "type": "object", "required": ["cached"], "additionalProperties": false, "properties": { "cached": { "$ref": "#/$defs/u64" } } } } },
+        { "type": "object", "required": ["GenStale"], "additionalProperties": false, "properties": { "GenStale": { "type": "object", "required": ["expected", "observed"], "additionalProperties": false, "properties": { "expected": { "$ref": "#/$defs/u64" }, "observed": { "$ref": "#/$defs/u64" } } } } },
+        { "type": "string", "const": "GuardError" },
+        { "type": "string", "const": "Overfull" },
+        { "type": "string", "const": "DrainLoss" },
+        { "type": "string", "const": "GuardMissing" },
+        { "type": "string", "const": "GenMixed" },
+        { "type": "string", "const": "DanglingCall" },
+        { "type": "string", "const": "TerminatorUnproven" },
+        { "type": "string", "const": "RowArrayMismatch" }
+      ]
     },
     "u64": {
       "type": "integer",
