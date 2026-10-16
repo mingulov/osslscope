@@ -671,6 +671,78 @@ fn x_offset(bytes: &[u8]) -> u64 {
     ph.p_offset + 8
 }
 
+/// Minimal valid ELF64 (~200 bytes) with a GNU build-id note, for
+/// multi-file fixtures: staging the 70MB+ test binary twice
+/// overflows the 128MiB round budget (R14 refuses the second read
+/// loud), so tests that need every staged file READ use these for
+/// their companion files. Distinct seeds give distinct build-ids
+/// (distinct fingerprints); parse/build-id/flip behavior matches
+/// the real binary (pinned by `small_elf_fixture_is_valid`).
+fn small_elf(seed: u8) -> Vec<u8> {
+    let mut v = vec![0u8; 212];
+    // ELF header.
+    v[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+    v[4] = 2; // 64-bit
+    v[5] = 1; // little-endian
+    v[6] = 1; // version
+    v[16..18].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN
+    v[18..20].copy_from_slice(&62u16.to_le_bytes()); // x86-64
+    v[20..24].copy_from_slice(&1u32.to_le_bytes()); // version
+    v[32..40].copy_from_slice(&64u64.to_le_bytes()); // phoff
+    v[52..54].copy_from_slice(&64u16.to_le_bytes()); // ehsize
+    v[54..56].copy_from_slice(&56u16.to_le_bytes()); // phentsize
+    v[56..58].copy_from_slice(&2u16.to_le_bytes()); // phnum
+    // PH0: PT_LOAD + R|X covering the whole image.
+    v[64..68].copy_from_slice(&1u32.to_le_bytes());
+    v[68..72].copy_from_slice(&5u32.to_le_bytes());
+    v[72..80].copy_from_slice(&0u64.to_le_bytes()); // offset
+    v[80..88].copy_from_slice(&0x1000u64.to_le_bytes()); // vaddr
+    v[96..104].copy_from_slice(&212u64.to_le_bytes()); // filesz
+    v[104..112].copy_from_slice(&212u64.to_le_bytes()); // memsz
+    v[112..120].copy_from_slice(&0x1000u64.to_le_bytes()); // align
+    // PH1: PT_NOTE holding the build-id note at 176.
+    v[120..124].copy_from_slice(&4u32.to_le_bytes());
+    v[124..128].copy_from_slice(&4u32.to_le_bytes());
+    v[128..136].copy_from_slice(&176u64.to_le_bytes()); // offset
+    v[136..144].copy_from_slice(&0x10b0u64.to_le_bytes()); // vaddr
+    v[152..160].copy_from_slice(&36u64.to_le_bytes()); // filesz
+    v[160..168].copy_from_slice(&36u64.to_le_bytes()); // memsz
+    v[168..176].copy_from_slice(&4u64.to_le_bytes()); // align
+    // Note: namesz 4, descsz 20, type NT_GNU_BUILD_ID.
+    v[176..180].copy_from_slice(&4u32.to_le_bytes());
+    v[180..184].copy_from_slice(&20u32.to_le_bytes());
+    v[184..188].copy_from_slice(&3u32.to_le_bytes());
+    v[188..192].copy_from_slice(b"GNU\0");
+    for (i, b) in v[192..212].iter_mut().enumerate() {
+        *b = seed
+            .wrapping_add((i as u8).wrapping_mul(31))
+            .wrapping_add(1);
+    }
+    v
+}
+
+#[test]
+fn small_elf_fixture_is_valid() {
+    // The companion-file fixture parses, fingerprints distinctly
+    // per seed, and flips like the real binary.
+    for seed in [0xA1u8, 0xB2, 0xC3, 0xD4] {
+        let bytes = small_elf(seed);
+        let id = osslscope::discovery::elf::read_build_id(&bytes)
+            .unwrap_or_else(|| panic!("seed {seed:#x} must carry a build-id"));
+        assert_eq!(id.len(), 40, "20-byte descriptor hex: {id}");
+        let _ = x_offset(&bytes);
+        let flipped = flipped_build_id(&bytes);
+        assert_ne!(
+            osslscope::discovery::elf::read_build_id(&flipped).unwrap(),
+            id,
+            "flip must change the build-id"
+        );
+    }
+    let a = osslscope::discovery::elf::read_build_id(&small_elf(0xA1)).unwrap();
+    let b = osslscope::discovery::elf::read_build_id(&small_elf(0xB2)).unwrap();
+    assert_ne!(a, b, "distinct seeds fingerprint distinctly");
+}
+
 fn mapping(staged: &Staged) -> Mapping {
     Mapping {
         start: 0x7f00_0000_0000,
@@ -1745,12 +1817,19 @@ fn h2_t2_close_truncation_taints_only_its_op() {
     // dispatch table — only global evidence taint moves dispatch).
     let mut h = Harness::fresh("h2-t2");
     h.snapshot_attached();
-    let staged2 = h.stage.write("prov2.so", &h.bytes.clone());
+    // Companion file is small-ELF: two full test-binary copies
+    // overflow the 128MiB round budget (R14 refuses the second
+    // read), and this test needs both files read (size is
+    // incidental to the op-localized taint it proves). Its
+    // backing offset is its own X offset (plan rows validate the
+    // offset against the file's bytes: past-EOF misses attach).
+    let small2 = small_elf(0xA1);
+    let staged2 = h.stage.write("prov2.so", &small2);
     h.maps.push(mapping(&staged2));
     h.files.insert(
         staged2.path.clone(),
         plan::FileBytes {
-            bytes: h.bytes.clone().into(),
+            bytes: small2.clone().into(),
             dev: staged2.device,
             ino: staged2.ino,
         },
@@ -1766,7 +1845,7 @@ fn h2_t2_close_truncation_taints_only_its_op() {
     );
     let cand2 = cand(
         "/p/provider.so",
-        backing_of(&staged2, h.off),
+        backing_of(&staged2, x_offset(&small2)),
         2,
         12,
         "SHA-256",
@@ -2372,12 +2451,16 @@ fn h3_t5_mixed_counter_counts_distinct_triples() {
     ] {
         let mut h = Harness::fresh(name);
         h.snapshot_attached();
-        let staged2 = h.stage.write("prov2.so", &h.bytes.clone());
+        // Companion file is small-ELF with its own X offset (two
+        // full test-binary copies overflow the 128MiB round budget;
+        // plan rows validate the offset against the file's bytes).
+        let small2 = small_elf(0xB2);
+        let staged2 = h.stage.write("prov2.so", &small2);
         h.maps.push(mapping(&staged2));
         h.files.insert(
             staged2.path.clone(),
             plan::FileBytes {
-                bytes: h.bytes.clone().into(),
+                bytes: small2.clone().into(),
                 dev: staged2.device,
                 ino: staged2.ino,
             },
@@ -2393,7 +2476,7 @@ fn h3_t5_mixed_counter_counts_distinct_triples() {
         );
         let cand2 = cand(
             "/p/provider.so",
-            backing_of(&staged2, h.off),
+            backing_of(&staged2, x_offset(&small2)),
             2,
             12,
             "SHA-256",
@@ -2445,11 +2528,15 @@ fn untracked_epoch_executions_are_unattributed_partial() {
     // epoch the tables never observed).
     let mut h = Harness::fresh("untracked-exec");
     h.snapshot_attached();
-    let prov2 = h.stage.write("prov2.so", &h.bytes.clone());
+    // Companion file is small-ELF (two full test-binary copies
+    // overflow the 128MiB round budget; plan rows validate the
+    // offset against the file's bytes).
+    let small2 = small_elf(0xC3);
+    let prov2 = h.stage.write("prov2.so", &small2);
     h.files.insert(
         prov2.path.clone(),
         plan::FileBytes {
-            bytes: h.bytes.clone().into(),
+            bytes: small2.clone().into(),
             dev: prov2.device,
             ino: prov2.ino,
         },
@@ -2466,7 +2553,7 @@ fn untracked_epoch_executions_are_unattributed_partial() {
     );
     let mut cand_b = cand(
         "/p/prov2.so",
-        backing_of(&prov2, h.off),
+        backing_of(&prov2, x_offset(&small2)),
         1,
         12,
         "SHA-512",
@@ -7176,7 +7263,12 @@ fn lifecycle_raced_file_read_is_discarded_loud() {
     // evidence survives under its verified fingerprint.
     let mut h = Harness::fresh("raced-read");
     h.snapshot_attached();
-    let bytes_b = flipped_build_id(&h.bytes.clone());
+    // Raced companion is small-ELF (already distinct from the
+    // staged bytes): two full test-binary copies overflow the
+    // 128MiB round budget and the raced read would refuse before
+    // its race is detected. Same-size-edit shape preserved via
+    // the scripted pre/post stats below.
+    let bytes_b = small_elf(0xD4);
     let raced = h.stage.write("raced.so", &bytes_b);
     h.files.insert(
         raced.path.clone(),
@@ -7237,7 +7329,7 @@ fn lifecycle_raced_file_read_is_discarded_loud() {
     );
     let cand_raced = cand(
         "/p/provider.so",
-        backing_of(&raced, h.off),
+        backing_of(&raced, x_offset(&bytes_b)),
         1,
         12,
         "SHA-256",
@@ -8407,7 +8499,11 @@ fn r14_within_budget_round_reads_fully() {
     let budget = h.bytes.len() + 1024;
     h.read_budget = budget;
     let staged_path = h.staged.path.clone();
-    h.polls.push_back(DiscoveryDelta::default());
+    // Baseline attach (pre-release ready): a post-release first
+    // attach of this long-present mapping is late-attach loss
+    // (R20-F7), which would withhold the COMPLETE this budget
+    // control asserts — attach timing is incidental here (same
+    // triage R20-F7 applied to clean_exit et al.).
     h.polls.push_back(DiscoveryDelta {
         candidates: vec![cand(
             "/p/provider.so",
@@ -8422,6 +8518,7 @@ fn r14_within_budget_round_reads_fully() {
         trigger_observed: true,
         ..DiscoveryDelta::default()
     });
+    h.polls.push_back(DiscoveryDelta::default());
     h.plans.insert(
         2,
         FirePlan {
