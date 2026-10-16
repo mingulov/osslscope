@@ -187,11 +187,17 @@ else
         || bad "ecdsa ledger + digest-only report fails"
 fi
 
-# 3. FAIL: zero-call matching site does not satisfy.
+# 3. FAIL: zero-call matching site does not satisfy (the op-12
+# candidate never executed, so no executed site carries op 12 —
+# pinned to the specific reason, like leg 2: a bare exit-code
+# check would also pass on a missing LEDGER or driver-rc
+# failure).
 if python3 "$ORACLE" "$T/ecdsa.log" "$T/rep12zero.json" ecdsa >"$T/out" 2>&1; then
     bad "zero-call op-12 site fails (got exit 0)"
 else
-    ok "zero-call op-12 site fails"
+    grep -q 'no executed site carries op \[12\] for mode ecdsa' "$T/out" \
+        && ok "zero-call op-12 site fails" \
+        || bad "zero-call op-12 site fails"
 fi
 
 # 4. FAIL: no LEDGER line.
