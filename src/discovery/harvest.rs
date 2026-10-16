@@ -172,9 +172,11 @@ pub(crate) struct ResolvedTarget {
 /// target. The backing identity rides along so attach reuse
 /// compares bytes, not just the locator: a same-path replacement
 /// keeps path+offset but changes (dev,ino) and must re-attach
-/// (T14r4-2b). Errors carry the provider path and cookie (observer
-/// inputs) — never the runtime address (stderr is a scanned
-/// artifact, so error paths redact like emission).
+/// (T14r4-2b). Errors are approved-vocabulary literals (round 2,
+/// residual F): they surface in `attach_diagnostics`, so they
+/// carry no provider path and no cookie — the cookie already rides
+/// structurally (`AttachKind::Stage2`), and stderr is a scanned
+/// artifact, so error paths redact like emission.
 pub(crate) fn resolve_query_target(
     live: &[maps::Mapping],
     provider: &Path,
@@ -186,9 +188,7 @@ pub(crate) fn resolve_query_target(
         let m = live
             .iter()
             .find(|m| m.start <= addr && addr < m.end && m.ino != 0)
-            .ok_or_else(|| {
-                anyhow::anyhow!("legacy stage-2 attach has no file mapping (cookie {cookie})")
-            })?;
+            .ok_or_else(|| anyhow::anyhow!("legacy stage-2 attach has no file mapping"))?;
         // Expected identity pins the maps-time inode (the VMA pins
         // it — a same-path replacement cannot reuse the number)
         // with the resolve-time raw dev; unstatable paths bind
@@ -211,12 +211,8 @@ pub(crate) fn resolve_query_target(
             expected,
         })
     } else {
-        let (m, raw) = maps::provider_mapping(live, provider, canon, addr).ok_or_else(|| {
-            anyhow::anyhow!(
-                "stage-2 attach has no provider mapping for {}",
-                provider.display()
-            )
-        })?;
+        let (m, raw) = maps::provider_mapping(live, provider, canon, addr)
+            .ok_or_else(|| anyhow::anyhow!("stage-2 attach has no provider mapping"))?;
         // H5: `raw` is the provider's resolve-time stat identity
         // (provider_mapping binds stat-vs-stat) — render it for
         // the target dev (stat-domain, like the legacy branch).
@@ -1269,5 +1265,44 @@ mod tests {
         assert!(super::decode_trip_hit(11, wire::TRIP_OTHER, wire::TRIP_OK, &set).is_none());
         assert!(super::decode_trip_hit(9, 99, wire::TRIP_OK, &set).is_none());
         assert!(super::decode_trip_hit(10, 99, wire::TRIP_OK, &set).is_none());
+    }
+
+    /// Round 2, residual F (diagnostics vocabulary): resolve
+    /// failures surface in `attach_diagnostics`, whose approved
+    /// vocabulary (allowlist-v1) is producer-literal failure texts
+    /// — no paths, no pointers, no target strings, no runtime
+    /// addresses. The query cookie already rides structurally
+    /// (`AttachKind::Stage2`), so the text carries no numbers
+    /// either — pure literals.
+    #[test]
+    fn resolve_failures_use_literal_diagnostics() {
+        // Legacy cookie, no file mapping for the address.
+        let err = super::resolve_query_target(
+            &[],
+            std::path::Path::new("/opt/lib/libprovider.so"),
+            "canon",
+            0x1000,
+            super::LEGACY_COOKIE,
+        )
+        .expect_err("unmapped legacy address must fail");
+        assert_eq!(
+            format!("{err:#}"),
+            "legacy stage-2 attach has no file mapping"
+        );
+        // Provider cookie, provider unmapped.
+        let err = super::resolve_query_target(
+            &[],
+            std::path::Path::new("/opt/lib/libprovider.so"),
+            "canon",
+            0x1000,
+            42,
+        )
+        .expect_err("unmapped provider must fail");
+        let text = format!("{err:#}");
+        assert_eq!(text, "stage-2 attach has no provider mapping");
+        assert!(
+            !text.contains('/'),
+            "diagnostics carry no pathnames: {text}"
+        );
     }
 }

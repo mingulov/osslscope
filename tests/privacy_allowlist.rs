@@ -397,3 +397,250 @@ fn traversal_inventory_is_approved() {
         );
     }
 }
+
+/// Round 2, residual F (source-pinned): no diagnostic-text
+/// construction interpolates a path, cookie, or target string.
+/// Every `AttachEvent.failed` / `record_attach_failure` text
+/// window is scanned: literals stay literal, and the only
+/// allowed interpolation is `{e:#}` of an already-approved error
+/// (resolve/install/reinstall producers emit approved texts by
+/// construction — pinned exactly in the session/harvest unit
+/// suites). A pathname sneaking back into any producer fails
+/// here. `#[cfg(test)]` modules are exempt (they assert the
+/// vocabulary itself).
+#[test]
+fn no_paths_in_diagnostic_text_windows() {
+    fn check(path: &Path) {
+        let text = fs::read_to_string(path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        let mut in_test_mod = false;
+        let mut depth: i32 = 0;
+        let mut test_depth: Option<i32> = None;
+        let mut cfg_test_armed = false;
+        for (n, line) in lines.iter().enumerate() {
+            let t = line.trim();
+            if t == "#[cfg(test)]" {
+                cfg_test_armed = true;
+            } else if cfg_test_armed && t.starts_with("mod ") {
+                test_depth = Some(depth);
+                cfg_test_armed = false;
+            }
+            depth += line.bytes().filter(|b| *b == b'{').count() as i32;
+            depth -= line.bytes().filter(|b| *b == b'}').count() as i32;
+            if let Some(d) = test_depth {
+                in_test_mod = depth > d;
+                if !in_test_mod {
+                    test_depth = None;
+                }
+            }
+            if in_test_mod {
+                continue;
+            }
+            if !(t.contains("failed: Some") || t.contains("record_attach_failure(&mut delta")) {
+                continue;
+            }
+            // Code part only (`//` comments are not emitted text —
+            // split before scanning so comment slashes cannot trip
+            // the pathname check; no window line holds `//` inside
+            // a string literal).
+            let window: String = lines[n..lines.len().min(n + 7)]
+                .iter()
+                .map(|l| l.split("//").next().unwrap_or(""))
+                .collect::<Vec<_>>()
+                .join("\n");
+            for banned in [
+                ".display()",
+                "{cookie",
+                "{path",
+                "{prov",
+                "{lc_",
+                "cookie {",
+                "{e}",
+                "path.display",
+                // A literal pathname reads as `/...` in the text
+                // (the approved vocabulary's only `/`-free
+                // exception is none — even the pin-dup pair
+                // separator is `+`).
+                "/",
+            ] {
+                assert!(
+                    !window.contains(banned),
+                    "diagnostic text interpolates {banned:?} ({}:{}):\n{window}",
+                    path.display(),
+                    n + 1
+                );
+            }
+        }
+    }
+    fn check_harvest(path: &Path) {
+        // Resolve-error literals (the texts the sink test pins
+        // behaviorally): exact-match, so any interpolation or
+        // pathname fails here too.
+        let text = fs::read_to_string(path).unwrap();
+        for (n, line) in text.lines().enumerate() {
+            let t = line.trim();
+            if t.contains("has no file mapping") {
+                assert!(
+                    t.contains("\"legacy stage-2 attach has no file mapping\""),
+                    "resolve literal drifted ({}:{}): {t:?}",
+                    path.display(),
+                    n + 1
+                );
+            }
+            if t.contains("has no provider mapping") {
+                assert!(
+                    t.contains("\"stage-2 attach has no provider mapping\""),
+                    "resolve literal drifted ({}:{}): {t:?}",
+                    path.display(),
+                    n + 1
+                );
+            }
+        }
+    }
+    check(&manifest_dir().join("src/discovery/session.rs"));
+    check_harvest(&manifest_dir().join("src/discovery/harvest.rs"));
+}
+
+/// Round 2, residual F (rendered-doc property): the full
+/// representative diagnostic vocabulary renders with no pathname
+/// in any text, and every text is a member of the approved set
+/// (literals verbatim; kind-token templates with an alphanumeric
+/// kind token and hex file offsets only). The producers' exact
+/// texts are pinned in the session/harvest unit suites; this pins
+/// the shipped property over what they emit.
+#[test]
+fn attach_diagnostics_vocabulary_has_no_pathnames() {
+    use osslscope::evidence::{
+        CaptureWindow, FinalizeInput, LegacyCallPartition, OpensslVersion, TargetRecord, finalize,
+    };
+    // One of each producer shape (literals verbatim from the
+    // allowlist bullet; templates instantiated with
+    // representative kinds — NotFound/PermissionDenied/InvalidData
+    // plus the collapse token).
+    let diags = [
+        "stage-2 target unmapped; link detached",
+        "libcrypto unmapped after replacement; tripwire anchors blind",
+        "tripwire mapping changed across replacement; anchors blind (cookie meanings shifted)",
+        "stage-2 target superseded by replacement; old link detached",
+        "stage-2 retry superseded by replacement; awaiting fresh init",
+        "legacy stage-2 attach has no file mapping",
+        "stage-2 attach has no provider mapping",
+        "stage-2 pin open failed (kind=NotFound; cookie retries next poll)",
+        "stage-2 pin open failed (kind=PermissionDenied; cookie retries next poll)",
+        "stage-2 pin misses the resolve-time identity (cookie retries next poll)",
+        "attach query_entry@0x1234 failed (kind=PermissionDenied)",
+        "attach query_entry+query_return pin dup failed (kind=NotFound)",
+        "attach path contains NUL",
+        "dispatch reinstall failed: reinstall init anchor unresolved",
+        "dispatch reinstall failed: no dispatch anchor to reinstall",
+        "dispatch maps read failed (kind=InvalidData)",
+        "dispatch provider read failed (kind=error)",
+        "reinstall init anchor unresolved",
+        "reinstall builtin anchor unresolved",
+        "no dispatch anchor to reinstall",
+        "missing program query_entry",
+    ];
+    let mut doc = finalize(FinalizeInput {
+        window: CaptureWindow {
+            requested_start_ns: 0,
+            requested_end_ns: 0,
+            effective_start_ns: 0,
+            effective_end_ns: 0,
+            signal_cut: false,
+        },
+        sites: Vec::new(),
+        fenced: Vec::new(),
+        objects: Vec::new(),
+        coverage: Vec::new(),
+        counters: Vec::new(),
+        fatal: None,
+        target: TargetRecord::unknown(),
+        openssl: OpensslVersion::unknown(),
+        disposition: None,
+        policy: None,
+        legacy_partition: LegacyCallPartition::default(),
+        engine_observations: Vec::new(),
+        traversal: None,
+    });
+    doc.attach_diagnostics = diags.iter().map(|s| s.to_string()).collect();
+    let bytes = osslscope::report::render_json(&doc).unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let rendered: Vec<&str> = v["attach_diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d.as_str().unwrap())
+        .collect();
+    assert_eq!(rendered.len(), diags.len());
+    fn is_kind_token(s: &str) -> bool {
+        !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric())
+    }
+    fn is_hex_offset(s: &str) -> bool {
+        s.strip_prefix("0x")
+            .is_some_and(|h| !h.is_empty() && h.bytes().all(|b| b.is_ascii_hexdigit()))
+    }
+    fn approved(text: &str) -> bool {
+        const LITERALS: &[&str] = &[
+            "stage-2 target unmapped; link detached",
+            "libcrypto unmapped after replacement; tripwire anchors blind",
+            "tripwire mapping changed across replacement; anchors blind (cookie meanings shifted)",
+            "stage-2 target superseded by replacement; old link detached",
+            "stage-2 retry superseded by replacement; awaiting fresh init",
+            "legacy stage-2 attach has no file mapping",
+            "stage-2 attach has no provider mapping",
+            "stage-2 pin misses the resolve-time identity (cookie retries next poll)",
+            "attach path contains NUL",
+            "reinstall init anchor unresolved",
+            "reinstall builtin anchor unresolved",
+            "no dispatch anchor to reinstall",
+        ];
+        if LITERALS.contains(&text) {
+            return true;
+        }
+        if let Some(rest) = text.strip_prefix("stage-2 pin open failed (kind=") {
+            return rest
+                .strip_suffix("; cookie retries next poll)")
+                .is_some_and(is_kind_token);
+        }
+        if let Some(rest) = text.strip_prefix("attach ") {
+            // Link form `<name>@<hex-offset>` or pin-dup form
+            // `<name>+<name> pin dup` — static names only.
+            fn is_prog_name(s: &str) -> bool {
+                !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            }
+            if let Some((head, kind)) = rest.rsplit_once(" failed (kind=") {
+                let kind_ok = kind.strip_suffix(')').is_some_and(is_kind_token);
+                let link_ok = head
+                    .split_once('@')
+                    .is_some_and(|(name, off)| is_prog_name(name) && is_hex_offset(off));
+                let dup_ok = head
+                    .strip_suffix(" pin dup")
+                    .and_then(|pair| pair.split_once('+'))
+                    .is_some_and(|(a, b)| is_prog_name(a) && is_prog_name(b));
+                return kind_ok && (link_ok || dup_ok);
+            }
+            return false;
+        }
+        if let Some(rest) = text.strip_prefix("dispatch reinstall failed: ") {
+            return approved(rest);
+        }
+        if let Some(rest) = text.strip_prefix("dispatch maps read failed (kind=") {
+            return rest.strip_suffix(')').is_some_and(is_kind_token);
+        }
+        if let Some(rest) = text.strip_prefix("dispatch provider read failed (kind=") {
+            return rest.strip_suffix(')').is_some_and(is_kind_token);
+        }
+        if let Some(name) = text.strip_prefix("missing program ") {
+            return !name.is_empty()
+                && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+        }
+        false
+    }
+    for d in &rendered {
+        assert!(!d.contains('/'), "diagnostic carries a pathname: {d}");
+        assert!(
+            approved(d),
+            "diagnostic outside the approved vocabulary: {d}"
+        );
+    }
+}
