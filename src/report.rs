@@ -1122,8 +1122,8 @@ fn fp_short(fp: &str) -> String {
 /// Neutralize target-controlled text for human (terminal/log)
 /// display (R12/F14): every control, bidi-override/isolate and
 /// listed zero-width/format character becomes `?` (coverage is the
-/// `is_display_control` set only: U+2060-U+2064 neutralized, while
-/// deprecated U+206A-U+206F and other unlisted Cf controls pass
+/// `is_display_control` set only: U+2060-U+2064 and deprecated
+/// U+206A-U+206F neutralized, while other unlisted Cf controls pass
 /// through), so rendered lines cannot move the cursor, inject fake
 /// lines, or reorder displayed text. Identity on clean text. Applies
 /// at the human boundary to
@@ -1158,6 +1158,7 @@ fn is_display_control(c: char) -> bool {
             | '\u{2028}'..='\u{202E}' // LINE SEPARATOR .. RIGHT-TO-LEFT OVERRIDE
             | '\u{2060}'..='\u{2064}' // WORD JOINER .. INVISIBLE PLUS
             | '\u{2066}'..='\u{2069}' // bidi isolates
+            | '\u{206A}'..='\u{206F}' // deprecated Cf: INHIBIT SYMMETRIC SWAPPING .. NOMINAL DIGIT SHAPES (R12 minor)
             | '\u{FEFF}' // ZERO WIDTH NO-BREAK SPACE / BOM
             | '\u{FFF9}'..='\u{FFFB}' // interlinear annotation
     )

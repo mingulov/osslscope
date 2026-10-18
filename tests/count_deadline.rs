@@ -436,6 +436,14 @@ fn kernel_source_enforces_window() {
         !src.contains("bpf_probe_read"),
         "count program stays entry-only: no target-memory reads"
     );
+    assert!(
+        src.contains("bump(slot, now)"),
+        "count program must bump the present slot on the slow path"
+    );
+    assert!(
+        src.matches("bump(slot, now)").count() >= 2,
+        "both hit paths (fast + slow) must bump"
+    );
 }
 
 /// Backend double that swaps the attached file mid-attach (models a

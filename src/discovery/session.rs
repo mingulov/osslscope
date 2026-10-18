@@ -6350,6 +6350,7 @@ mod tests {
         assert!(!core.dispatch_ever_mapped, "stranger is not our map");
     }
 
+    // R03 placement (accepted): these turnover tests stay inline (they drive crate-private SessionCore + MiniEnv fakes) and run under 'cargo test --locked --lib', which CI's full-workspace gate includes — NOT under '--test discovery_session'.
     #[test]
     fn mapped_a_to_pending_b_survives_repeated_polls() {
         // R03/F04: mapped A replaced by pending (never-mapped) B — B
