@@ -18,8 +18,9 @@ Every violation carries the actionability tuple:
 - `rule` + `matcher` (which rule, which name matched or was absent)
 - identity: provider label, op, `alg_class`, funcid, count,
   first/last-seen window position
-- target: pid, `target.comm`, full `target.cmdline` (capped with a
-  truncation marker), `target.container_id`, `image_digest` (empty
+- target: pid, `target.comm`, `target.argv_redacted: true` (raw argv
+  never publishes — the fixed `(argv-redacted)` placeholder renders
+  instead), `target.container_id`, `image_digest` (empty
   on bare metal)
 - provider object path + `provider.build_id`
 
@@ -39,12 +40,14 @@ Two fail-closed shapes to recognize immediately:
 
 ## 2. Walk to the owning service
 
-`target.comm` names the process image; `target.cmdline` names the
-invocation; `target.container_id` + `image_digest` name the
-deployed unit. Map that tuple to the owning service and config
-in your inventory (the image digest is the join key in container
-fleets). On bare metal, pid/`target.comm`/`target.cmdline` plus
-the provider path/`provider.build_id` identify the deployment.
+`target.comm` names the process image (raw argv never publishes —
+see `target.argv_redacted`); `target.container_id` +
+`image_digest` name the deployed unit. Map that tuple to the
+owning service and config in your inventory (the image digest is
+the join key in container fleets). On bare metal, pid/
+`target.comm` plus the provider path/`provider.build_id`
+identify the deployment; join invocations via your own process
+accounting, never the redacted argv.
 
 ## 3. Reproduce with `report`
 
