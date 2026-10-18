@@ -736,6 +736,60 @@ fn canonical_setup_key(path: &Path) -> anyhow::Result<PathBuf> {
     )))
 }
 
+/// RAII registry admission (v0.2 R20): owns one
+/// [`registry_try_insert`] entry. Dropping an armed admission
+/// reclaims it, so every caller-side early return (cancel,
+/// expiry, thread-spawn failure, worker loss) cleans up by
+/// construction — the R20 registration→admission wedge cannot
+/// recur. Two deliberate non-drop exits: [`release`](Self::release)
+/// reclaims eagerly on the synchronous paths (idempotent with the
+/// worker's `on_exit` reclaim), and [`disarm`](Self::disarm)
+/// relinquishes ownership WITHOUT reclaiming on the
+/// Cancelled/Expired arms, where the still-live worker owns the
+/// entry and removes it at exit. The abandonment path itself
+/// takes no lock (disarm is a plain field move).
+struct RegistryAdmission {
+    key: Option<PathBuf>,
+    id: u64,
+}
+
+impl RegistryAdmission {
+    fn insert(key: PathBuf) -> anyhow::Result<Self> {
+        let id = registry_try_insert(&key).ok_or_else(|| {
+            anyhow::anyhow!(
+                "workload output {}: another setup for this destination is still in flight (no child spawned)",
+                key.display(),
+            )
+        })?;
+        Ok(Self { key: Some(key), id })
+    }
+
+    fn id(&self) -> u64 {
+        self.id
+    }
+
+    fn release(&mut self) {
+        if let Some(k) = self.key.take() {
+            registry_remove_if(&k, self.id);
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.key = None;
+    }
+
+    #[cfg(test)]
+    fn id_for_test(&self) -> u64 {
+        self.id
+    }
+}
+
+impl Drop for RegistryAdmission {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 /// Try to register a new OUR-setup for `key` (fix round 5): `Some(id)` when
 /// no prior worker is live for it (the caller owns the entry until its
 /// worker finishes or the synchronous paths below reclaim it), `None` when
@@ -1513,12 +1567,8 @@ impl OwnedTarget {
                         "pre-stop setup worker lost before file-sink preparation (no child spawned)"
                     ),
                 };
-                let Some(reg_id) = registry_try_insert(&reg_key) else {
-                    anyhow::bail!(
-                        "workload output {}: another setup for this destination is still in flight (no child spawned)",
-                        path.display(),
-                    );
-                };
+                let mut admission = RegistryAdmission::insert(reg_key.clone())?;
+                let worker_id = admission.id();
                 let owned_path = path.clone();
                 let truncate_delay_ms = SETUP_TEST_HOOK.with(|h| h.borrow().truncate_delay_ms);
                 let publish_gate = SETUP_TEST_HOOK.with(|h| h.borrow().publish_gate.clone());
@@ -1548,29 +1598,31 @@ impl OwnedTarget {
                             rename_hold_ready,
                         )
                     },
-                    Some(Box::new(move || registry_remove_if(&reg_key_w, reg_id))),
+                    Some(Box::new(move || registry_remove_if(&reg_key_w, worker_id))),
                 )
                 .map_err(|e| {
-                    registry_remove_if(&reg_key, reg_id);
+                    admission.release();
                     anyhow::anyhow!("{e:#} (no child spawned)")
                 })?;
                 let published = match prep {
                     Control::Done(r) => {
-                        registry_remove_if(&reg_key, reg_id);
+                        admission.release();
                         r?
                     }
                     Control::Cancelled => {
+                        admission.disarm();
                         anyhow::bail!(
                             "pre-stop setup cancelled during file-sink preparation (no child spawned)"
                         );
                     }
                     Control::Expired => {
+                        admission.disarm();
                         anyhow::bail!(
                             "pre-stop setup deadline exceeded during file-sink preparation (no child spawned)"
                         );
                     }
                     Control::Lost => {
-                        registry_remove_if(&reg_key, reg_id);
+                        admission.release();
                         anyhow::bail!(
                             "pre-stop setup worker lost during file-sink preparation (no child spawned)"
                         );
@@ -2553,5 +2605,48 @@ mod control_tests {
         registry_remove_if(&key, id2);
         let id3 = registry_try_insert(&key).expect("registry is empty afterwards");
         registry_remove_if(&key, id3);
+    }
+
+    #[test]
+    fn registry_admission_drop_releases_entry() {
+        let key = super::normalize_setup_key(std::path::Path::new("/tmp/r06-guard-a.log"));
+        {
+            let _held = super::RegistryAdmission::insert(key.clone()).expect("first insert wins");
+            assert!(
+                super::registry_try_insert(&key).is_none(),
+                "live admission refuses"
+            );
+        }
+        let id = super::registry_try_insert(&key).expect("drop must release the entry");
+        super::registry_remove_if(&key, id);
+    }
+
+    #[test]
+    fn registry_admission_disarm_survives_drop_for_live_worker() {
+        let key = super::normalize_setup_key(std::path::Path::new("/tmp/r06-guard-b.log"));
+        let id = {
+            let mut held =
+                super::RegistryAdmission::insert(key.clone()).expect("first insert wins");
+            held.disarm();
+            held.id_for_test()
+        };
+        assert!(
+            super::registry_try_insert(&key).is_none(),
+            "disarmed drop must keep the worker entry"
+        );
+        super::registry_remove_if(&key, id);
+        let id2 = super::registry_try_insert(&key).expect("worker reclaim still releases");
+        super::registry_remove_if(&key, id2);
+    }
+
+    #[test]
+    fn registry_admission_release_is_idempotent_with_worker_reclaim() {
+        let key = super::normalize_setup_key(std::path::Path::new("/tmp/r06-guard-c.log"));
+        let mut held = super::RegistryAdmission::insert(key.clone()).expect("first insert wins");
+        let id = held.id_for_test();
+        held.release();
+        super::registry_remove_if(&key, id);
+        let id2 = super::registry_try_insert(&key).expect("double reclaim must stay idempotent");
+        super::registry_remove_if(&key, id2);
     }
 }
