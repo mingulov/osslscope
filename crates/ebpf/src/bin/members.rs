@@ -794,6 +794,15 @@ macro_rules! def_member {
                     }
                 }
                 if let Some(t) = warm_t {
+                    // Member 0 always walks (j=0 ≤ T — see the
+                    // member-0 notes above), so this comparison's
+                    // member_000 expansion is vacuously false by
+                    // construction; the other 511 expansions are
+                    // genuine. One shared macro arm keeps all 512
+                    // members textually identical for the
+                    // verifier — hence the scoped allow, not a
+                    // second arm (v0.2 gap-accept 13/14).
+                    #[allow(unused_comparisons)]
                     if $j > t {
                         // Would-skip path: only a
                         // successfully-read zero pointee skips (a
