@@ -645,9 +645,9 @@ static SETUP_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 /// lexically. Only `current_dir` (one bounded getcwd, no destination
 /// I/O — never `canonicalize`, whose blocking file I/O the setup path
 /// forbids); a getcwd failure falls back to the lexical key (today's
-/// behavior, never an error). Residual: distinct spellings through
-/// symlinked parents key separately (unresolvable without syscalls —
-/// documented; same class as external writers).
+/// behavior, never an error). Symlinked parents are resolved by
+/// [`canonical_setup_key`] (worker-side); this lexical form is its
+/// documented fallback only.
 fn normalize_setup_key(path: &Path) -> PathBuf {
     use std::path::Component;
     let absolute;
@@ -687,6 +687,53 @@ fn normalize_setup_key(path: &Path) -> PathBuf {
     } else {
         out
     }
+}
+
+/// Canonical registry key (v0.2 R19): the destination's parent
+/// directory resolved by the kernel (symlinks, `..`, bind
+/// mounts) plus its device/inode identity plus the file name —
+/// `canon:<dev>:<ino>/<file_name>`. Two spellings through
+/// symlinked parents collapse to one key, closing the R19 alias
+/// bypass. WORKER-SIDE ONLY: `canonicalize` + `metadata`
+/// perform blocking file I/O, which the setup caller forbids
+/// (a hung FUSE parent must never hang the caller); callers run
+/// this under [`run_under_control`] (phase 0) and register the
+/// returned key. Fallbacks (documented, fail-open-free): a
+/// relative path whose cwd is unavailable, a path without a file
+/// name, or an unresolvable parent falls back to
+/// [`normalize_setup_key`] — the exact v0.1 lexical behavior —
+/// because such destinations fail later at validation/staging
+/// with byte-identical errors. Residual: a parent directory
+/// replaced between canonicalization and staging create races
+/// the fence (same class as external writers — an uncooperative
+/// local writer renaming parent dirs mid-setup).
+fn canonical_setup_key(path: &Path) -> anyhow::Result<PathBuf> {
+    use std::os::unix::fs::MetadataExt as _;
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(path),
+            Err(_) => return Ok(normalize_setup_key(path)),
+        }
+    };
+    let (Some(parent), Some(name)) = (abs.parent(), abs.file_name()) else {
+        return Ok(normalize_setup_key(path));
+    };
+    let resolved = match std::fs::canonicalize(parent) {
+        Ok(p) => p,
+        Err(_) => return Ok(normalize_setup_key(path)),
+    };
+    let md = match std::fs::metadata(&resolved) {
+        Ok(m) => m,
+        Err(_) => return Ok(normalize_setup_key(path)),
+    };
+    Ok(PathBuf::from(format!(
+        "canon:{}:{}/{}",
+        md.dev(),
+        md.ino(),
+        name.to_string_lossy()
+    )))
 }
 
 /// Try to register a new OUR-setup for `key` (fix round 5): `Some(id)` when
@@ -1417,7 +1464,55 @@ impl OwnedTarget {
                         path.display(),
                     );
                 }
-                let reg_key = normalize_setup_key(path);
+                // Phase 0 (v0.2 R19): canonicalize the destination
+                // identity on a bounded worker (blocking file I/O is
+                // forbidden on the caller). No registry entry exists
+                // yet, so every non-Done arm bails with nothing to
+                // clean — no orphan is constructible here.
+                let owned_path_c = path.clone();
+                // V2-18: phase 0 bypasses the test hooks
+                // (save/clear/restore): `run_under_control` reads the
+                // single-worker hook namespace (startup delay,
+                // completion counter, poll gate), which tests arm for
+                // the main setup worker only — phase 0 must neither
+                // consume nor observe it. Restored before `?` so an
+                // `Err` (worker spawn failure) cannot leak cleared
+                // hooks; production hooks are inert, so this is a
+                // no-op there.
+                let saved_hooks = SETUP_TEST_HOOK.with(|h| {
+                    let mut h = h.borrow_mut();
+                    (
+                        std::mem::replace(&mut h.setup_delay_ms, 0),
+                        h.worker_counter.take(),
+                        h.poll_gate.take(),
+                    )
+                });
+                let canon_result = run_under_control(
+                    deadline,
+                    cancel,
+                    move |_abandoned| canonical_setup_key(&owned_path_c),
+                    None,
+                );
+                SETUP_TEST_HOOK.with(|h| {
+                    let mut h = h.borrow_mut();
+                    h.setup_delay_ms = saved_hooks.0;
+                    h.worker_counter = saved_hooks.1;
+                    h.poll_gate = saved_hooks.2;
+                });
+                let canon =
+                    canon_result.map_err(|e| anyhow::anyhow!("{e:#} (no child spawned)"))?;
+                let reg_key = match canon {
+                    Control::Done(r) => r?,
+                    Control::Cancelled => anyhow::bail!(
+                        "pre-stop setup cancelled before file-sink preparation (no child spawned)"
+                    ),
+                    Control::Expired => anyhow::bail!(
+                        "pre-stop setup deadline exceeded before file-sink preparation (no child spawned)"
+                    ),
+                    Control::Lost => anyhow::bail!(
+                        "pre-stop setup worker lost before file-sink preparation (no child spawned)"
+                    ),
+                };
                 let Some(reg_id) = registry_try_insert(&reg_key) else {
                     anyhow::bail!(
                         "workload output {}: another setup for this destination is still in flight (no child spawned)",
@@ -2370,6 +2465,27 @@ mod control_tests {
             normalize_setup_key(&cwd.join("r06-alias-pin.log")),
             "relative and absolute spellings must key together"
         );
+    }
+
+    #[test]
+    fn setup_key_canonicalizes_symlinked_parent_dirs() {
+        use super::canonical_setup_key;
+        let root = std::env::temp_dir().join(format!("r06-canon-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("real")).unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("link")).unwrap();
+        let a = canonical_setup_key(&root.join("real").join("w.log")).unwrap();
+        let b = canonical_setup_key(&root.join("link").join("w.log")).unwrap();
+        assert_eq!(a, b, "symlinked parents fence together: {a:?} vs {b:?}");
+        let other = canonical_setup_key(&root.join("real").join("other.log")).unwrap();
+        assert_ne!(a, other, "distinct names still fence apart");
+        let missing = canonical_setup_key(&root.join("no-such-dir").join("w.log")).unwrap();
+        assert_eq!(
+            missing,
+            super::normalize_setup_key(&root.join("no-such-dir").join("w.log")),
+            "unresolvable parents fall back to the lexical key"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

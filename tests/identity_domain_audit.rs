@@ -784,6 +784,11 @@ fn h5_t3_every_device_site_names_one_domain() {
         // so a stale worker unlinks only the inode it created; no
         // maps text or rendered dev strings in this file).
         ("src/target.rs", "raw", "&& st.st_dev == staging.dev", 1),
+        // target.rs: canonical registry key (v0.2 R19: raw dev_t
+        // from `metadata` embedded in `canon:<dev>:<ino>/<name>`
+        // keys, compared only against same-constructed keys —
+        // raw-vs-raw, run-local, never cross-domain joined).
+        ("src/target.rs", "raw", "md.dev(),", 1),
     ];
     for (file, domain, _, _) in pinned {
         assert!(

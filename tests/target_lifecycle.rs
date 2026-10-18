@@ -2036,6 +2036,84 @@ fn retry_setup_refuses_while_prior_worker_live() {
 }
 
 #[test]
+fn retry_setup_refuses_across_symlinked_parent_spellings() {
+    // v0.2 R19: distinct spellings through symlinked parents name
+    // one destination — the second OUR-setup must refuse while the
+    // first worker is live, exactly like identical spellings.
+    use std::os::unix::fs::symlink;
+    let dir = r06_scratch("registry-alias");
+    let real = dir.join("real");
+    std::fs::create_dir(&real).unwrap();
+    symlink(&real, dir.join("link")).unwrap();
+    let log_a = real.join("workload.log");
+    let log_b = dir.join("link").join("workload.log");
+    std::fs::write(&log_a, b"original\n").unwrap();
+    let sentinel = dir.join("SENTINEL");
+    let argv = r06_sentinel_argv(&sentinel);
+    let ready = Arc::new(AtomicBool::new(false));
+    let proceed = Arc::new(AtomicBool::new(false));
+    let counter = Arc::new(AtomicU32::new(0));
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (worker, sink, rx) = r06_spawn_async_setup(
+        argv,
+        WorkloadDest::File(log_a.clone()),
+        Instant::now() + Duration::from_secs(60),
+        R06Cancel::Shared(cancel.clone()),
+        0,
+        R06SetupHooks {
+            publish_gate: Some((ready.clone(), proceed.clone())),
+            worker_counter: Some(counter.clone()),
+            ..R06SetupHooks::default()
+        },
+    );
+    let end = Instant::now() + Duration::from_secs(10);
+    while !ready.load(Ordering::SeqCst) {
+        assert!(Instant::now() < end, "worker never poised at publish");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let retry_cancel = AtomicBool::new(false);
+    let retry = OwnedTarget::spawn_stopped_with_control(
+        &r06_sentinel_argv(&sentinel),
+        WorkloadDest::File(log_b.clone()),
+        Instant::now() + Duration::from_secs(5),
+        &retry_cancel,
+    );
+    match retry {
+        Err(e) => {
+            let msg = e.to_string();
+            assert!(msg.contains("in flight"), "refusal names fencing: {msg}");
+            assert!(msg.contains("no child spawned"), "nothing forked: {msg}");
+        }
+        Ok(mut t) => {
+            let pid = t.pid();
+            t.resolve_setup_failure().unwrap();
+            assert_reaped_no_zombie(pid);
+            panic!(
+                "aliased retry must refuse while the prior worker is live, but spawned pid {pid}"
+            );
+        }
+    }
+    assert_eq!(
+        std::fs::read(&log_a).unwrap(),
+        b"original\n",
+        "refused retry writes nothing"
+    );
+    cancel.store(true, Ordering::SeqCst);
+    let result = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("first setup returns after abandonment");
+    match result {
+        Err(e) => assert!(e.to_string().contains("cancelled")),
+        Ok(t) => r06_unexpected_child(t, "cancelled setup must fail"),
+    }
+    proceed.store(true, Ordering::SeqCst);
+    worker.join().unwrap();
+    assert_eq!(sink.load(Ordering::SeqCst), 0, "no fork may happen");
+    assert!(!sentinel.exists(), "sentinel must never execute");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn staging_namespace_dest_refused_before_creating() {
     // Fix round 5 / (iv): staging paths are provably distinct from the
     // destination — any destination whose file name lies in the staging
