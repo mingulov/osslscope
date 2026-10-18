@@ -2943,6 +2943,7 @@ fn lifecycle_exec_is_fence_tracked_not_ignored() {
         ],
         loss: 0,
         dropped: 0,
+        prefix_unwitnessed: 0,
         pending: 0,
     });
     let (out, _) = h.run();
@@ -2967,6 +2968,7 @@ fn final_sweep_skipped_after_owned_exit() {
         events: vec![],
         loss: 1,
         dropped: 0,
+        prefix_unwitnessed: 0,
         pending: 0,
     });
     let (out, _) = h.run();
@@ -3000,6 +3002,7 @@ fn final_sweep_runs_while_target_lives() {
         events: vec![],
         loss: 1,
         dropped: 0,
+        prefix_unwitnessed: 0,
         pending: 0,
     });
     let (out, _) = h.run();
@@ -6609,6 +6612,7 @@ fn lifecycle_scan_loss_withholds_complete() {
         events: vec![],
         loss: 1,
         dropped: 0,
+        prefix_unwitnessed: 0,
         pending: 0,
     });
     h.exit_at_ns = Some(BASE_NS + 1_000_000_000);
@@ -6637,6 +6641,7 @@ fn lifecycle_signal_dropped_withholds_complete() {
         events: vec![],
         loss: 0,
         dropped: 3,
+        prefix_unwitnessed: 0,
         pending: 0,
     });
     // Exit lands in the second sleep: exactly one round runs, so the
@@ -6645,6 +6650,7 @@ fn lifecycle_signal_dropped_withholds_complete() {
     let (out, _) = h.run();
     let c = out.unwrap();
     assert_eq!(counter_value(&c, "lifecycle.signal_dropped"), 3);
+    assert_eq!(counter_value(&c, "lifecycle.signal_prefix_unwitnessed"), 0);
     assert_eq!(counter_value(&c, "lifecycle.scan_loss"), 0);
     assert!(has_reason(&c, "fork-exec-ignored"), "{:?}", c.reasons);
     assert!(matches!(c.outcome, Outcome::Partial), "{c:?}");
@@ -6667,6 +6673,7 @@ fn lifecycle_close_drain_folds_after_owned_exit() {
         }],
         loss: 0,
         dropped: 0,
+        prefix_unwitnessed: 0,
         pending: 0,
     });
     let (out, _) = h.run();
@@ -6688,12 +6695,14 @@ fn lifecycle_close_drain_loss_is_loud() {
         events: vec![],
         loss: 1,
         dropped: 2,
+        prefix_unwitnessed: 0,
         pending: 0,
     });
     let (out, _) = h.run();
     let c = out.unwrap();
     assert_eq!(counter_value(&c, "lifecycle.scan_loss"), 1);
     assert_eq!(counter_value(&c, "lifecycle.signal_dropped"), 2);
+    assert_eq!(counter_value(&c, "lifecycle.signal_prefix_unwitnessed"), 0);
     assert!(matches!(c.outcome, Outcome::Partial), "{c:?}");
 }
 
@@ -6823,6 +6832,7 @@ fn lifecycle_truncated_close_drain_withholds_complete() {
         events: vec![],
         loss: 0,
         dropped: 0,
+        prefix_unwitnessed: 0,
         pending: 1,
     });
     let (out, _) = h.run();
@@ -6930,6 +6940,7 @@ fn lifecycle_kernel_shape_fast_noquery_is_honest_partial() {
         "lifecycle.fork_exec_ignored",
         "lifecycle.scan_loss",
         "lifecycle.signal_dropped",
+        "lifecycle.signal_prefix_unwitnessed",
         "lifecycle.polling_fallback",
         "lifecycle.no_witness",
         "lifecycle.drain_pending",
@@ -6993,6 +7004,7 @@ fn lifecycle_exec_witness_fences_without_snapshot_change() {
             }],
             loss: 0,
             dropped: 0,
+            prefix_unwitnessed: 0,
             pending: 0,
         },
     ]);
@@ -7059,6 +7071,7 @@ fn lifecycle_close_drain_exec_withholds_complete() {
         }],
         loss: 0,
         dropped: 0,
+        prefix_unwitnessed: 0,
         pending: 0,
     });
     let (out, _) = h.run();
@@ -8297,6 +8310,7 @@ fn exec_witness_consumed_before_deadline_return_survives_to_close() {
         }],
         loss: 0,
         dropped: 0,
+        prefix_unwitnessed: 0,
         pending: 0,
     }]);
     // Slow scan: cross the 2s deadline inside round 1's sweep
@@ -8357,6 +8371,7 @@ fn exec_witness_consumed_before_signal_cut_survives_to_close() {
         }],
         loss: 0,
         dropped: 0,
+        prefix_unwitnessed: 0,
         pending: 0,
     }]);
     // Async-signal model: alive through setup(1) + loop-top(2),

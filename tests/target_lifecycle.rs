@@ -2344,11 +2344,13 @@ fn r20fix_kernel_lifecycle_witnesses_real_fork_exec_exit() {
     let mut execs: HashSet<u32> = HashSet::new();
     let mut loss = 0u64;
     let mut dropped = 0u64;
+    let mut prefix_unwitnessed = 0u64;
     let end = Instant::now() + Duration::from_secs(10);
     while (forks.is_empty() || execs.is_empty()) && Instant::now() < end {
         let delta = lc.poll();
         loss += delta.loss;
         dropped += delta.dropped;
+        prefix_unwitnessed += delta.prefix_unwitnessed;
         assert_eq!(delta.pending, 0, "quiet test must not truncate drains");
         for e in &delta.events {
             match e.kind {
@@ -2370,11 +2372,13 @@ fn r20fix_kernel_lifecycle_witnesses_real_fork_exec_exit() {
     assert_ne!(gc, pid, "grandchild is not the target");
     assert_eq!(loss, 0, "no scan loss on a quiet window");
     assert_eq!(dropped, 0, "no kernel drops on a quiet window");
+    assert_eq!(prefix_unwitnessed, 0, "no prefix gaps on a quiet window");
     // Close drain: witnessed, complete, still lossless.
     let tail = lc.close_drain().expect("kernel close witness");
     assert_eq!(tail.pending, 0, "close drain must reach the tail");
     assert_eq!(tail.loss, 0);
     assert_eq!(tail.dropped, 0);
+    assert_eq!(tail.prefix_unwitnessed, 0);
     assert!(tail.events.is_empty(), "no stragglers: {:?}", tail.events);
     assert_reaped_no_zombie(pid);
 }
@@ -2571,12 +2575,12 @@ fn kernel_live_target_first_sighting_gaps_prefix() {
     }
     let mut status = 0;
     assert!(unsafe { libc::waitpid(child, &mut status, 0) } >= 0);
-    let mut dropped = 0u64;
+    let mut prefix_unwitnessed = 0u64;
     let mut saw_fork = false;
     let end = Instant::now() + Duration::from_secs(10);
     while !saw_fork && Instant::now() < end {
         let d = lc.poll();
-        dropped += d.dropped;
+        prefix_unwitnessed += d.prefix_unwitnessed;
         saw_fork = d.events.iter().any(|e| {
             matches!(e.kind, osslscope::capture::LifecycleKind::Fork) && e.pid as i32 == child
         });
@@ -2586,8 +2590,8 @@ fn kernel_live_target_first_sighting_gaps_prefix() {
     }
     assert!(saw_fork, "our child's fork must witness");
     assert!(
-        dropped >= 1,
-        "live-target first sightings must gap their prefix, not baseline silently: dropped={dropped}"
+        prefix_unwitnessed >= 1,
+        "live-target first sightings must gap their prefix, not baseline silently: prefix_unwitnessed={prefix_unwitnessed}"
     );
 }
 
@@ -3081,6 +3085,7 @@ fn ordinary_production_run_counts_real_crypto_free_of_polling_fallback() {
         "lifecycle.polling_fallback",
         "lifecycle.scan_loss",
         "lifecycle.signal_dropped",
+        "lifecycle.signal_prefix_unwitnessed",
         "lifecycle.no_witness",
         "lifecycle.drain_pending",
         "lifecycle.exec_gap",

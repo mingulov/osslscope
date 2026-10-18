@@ -46,6 +46,8 @@ General rules:
 | `loss` (`counter`, `source`, `value`) | blind | A positive loss counter: named evidence went unobserved. Common names: `capture.over_budget` (source `lifecycle`: the target was still alive at window expiry -- the observer never kills its child) and `count.drain_shortfall` (source `drain`: keys remained unpolled at grace expiry). | Read the named counter and its source. For `over_budget`: shorten the workload or split it into several windows with quit-before-expiry discipline; raise `--duration` only if the workload then fits inside one window. For drain shortfall: raise `--grace` and re-run. For ring/map pressure: shorten the window or reduce the dispatch rate under observation, then re-run. Losses are counted, never silent. |
 | `unattributed-calls` (`sites`, `calls`) | blind | Executed calls arrived at sites whose candidate coverage is unknown: tainted or unterminated op walks, or unlocalizable loss, degraded the site set. No staleness race is required. | Read the accompanying `unknown-denominator` / `loss` reasons -- they name the taint. Re-run a quieter or narrower window; if the gap is stable, record it as disclosed blindness and check whether the blind calls matter for your rule. |
 
+- `lifecycle.signal_prefix_unwitnessed`: conservative at-least-one prefix gaps on post-activity first sightings (one per CPU whose prefix was unwitnessed — notably every `--pid` window). NEVER a proven transport-drop count; use `lifecycle.signal_dropped` (proven seq holes + Drops delta) for loss magnitude. Both are Loss and both withhold COMPLETE.
+
 ## Window-edge reasons
 
 | Kind | Class | Meaning | Response |
