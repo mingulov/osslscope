@@ -821,6 +821,16 @@ pub struct CaptureDocument {
     /// keeps its exact shape.
     #[serde(default)]
     pub attach_diagnostics: Vec<String>,
+    /// Budget-refusal diagnostic entries (R14 minor): sorted,
+    /// deduped, capped numeric entries — each names the refused
+    /// object by (dev, ino) plus kind/bytes/allowance, so the
+    /// refusal identifies itself, not just counts. Additive and
+    /// old-reader-safe: missing in old documents means none
+    /// recorded. Set post-finalization by the producer;
+    /// [`finalize`] leaves it empty so every existing producer
+    /// keeps its exact shape.
+    #[serde(default)]
+    pub refusal_diagnostics: Vec<String>,
 }
 
 /// One BPF object selected for the window (path locates for
@@ -1035,5 +1045,6 @@ pub fn finalize(mut input: FinalizeInput) -> CaptureDocument {
         context: None,
         traversal: input.traversal,
         attach_diagnostics: Vec::new(),
+        refusal_diagnostics: Vec::new(),
     }
 }

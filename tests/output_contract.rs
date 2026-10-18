@@ -3872,3 +3872,53 @@ fn r12_context_carries_no_forbidden_keys() {
     }
     assert_no_forbidden_keys(&v, "context-doc.json");
 }
+
+/// Pre-refusal wire-reader shape: the supported-evidence subset
+/// an old (pre-`refusal_diagnostics`) reader parses from the
+/// PUBLISHED artifact layout (`render_json` bytes). No
+/// `refusal_diagnostics` field; serde ignores that unknown key
+/// by default — exactly like a real old field reader. Inner
+/// objects deny unknown fields, so the shape provably matches
+/// the published layout instead of loosely parsing it.
+#[derive(serde::Deserialize, Debug)]
+#[allow(dead_code)]
+struct PreRefusalWireDocument {
+    schema_version: String,
+    sites: Vec<PreR12WireSite>,
+    objects: Vec<PreR12WireObject>,
+}
+
+#[test]
+fn r14_refusal_diagnostics_additive_old_reader_safe() {
+    // Correct direction: the UNCHANGED refusal-bearing RENDERED
+    // artifact (`render_json` bytes — one of each producer kind)
+    // validates against the schema and feeds a frozen pre-key
+    // wire-reader shape. The old reader parses the published
+    // layout and its supported evidence survives intact; the
+    // unknown key is ignored.
+    let mut doc = complete_doc();
+    doc.refusal_diagnostics = vec![
+        "dev=8 ino=100 kind=file_too_large bytes=2048 allowance=1024".to_string(),
+        "dev=8 ino=200 kind=over_allowance bytes=1536 allowance=1024".to_string(),
+    ];
+    let bytes = render_json(&doc).expect("rendered artifact serializes");
+    let rendered: Value = serde_json::from_slice(&bytes).expect("rendered artifact parses");
+    validate_v2(&rendered).expect("rendered artifact fails schema");
+    check_v2_semantics(&rendered).expect("rendered artifact fails semantics");
+    assert_eq!(
+        rendered["refusal_diagnostics"].as_array().unwrap().len(),
+        2,
+        "artifact must carry refusals into the old reader"
+    );
+    let back: PreRefusalWireDocument =
+        serde_json::from_value(rendered).expect("old reader parses new bytes");
+    assert_eq!(back.schema_version, "observed-crypto-v2.1");
+    assert_eq!(back.sites.len(), doc.sites.len());
+    assert_eq!(back.objects.len(), doc.objects.len());
+    let calls: u64 = back.sites.iter().map(|s| s.calls).sum();
+    assert_eq!(
+        calls,
+        doc.total_calls(),
+        "calls conserved through the old reader"
+    );
+}

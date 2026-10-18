@@ -3208,6 +3208,9 @@ pub struct AdapterState {
 /// the counters regardless).
 pub const ATTACH_DIAGNOSTICS_CAP: usize = 16;
 
+/// Cap on retained refusal diagnostics (R14 minor): sorted take.
+pub const REFUSAL_DIAGNOSTICS_CAP: usize = 16;
+
 impl AdapterState {
     /// Distinct backing triples seen per op (coverage census).
     pub fn op_discovered(&self, op: u32) -> u64 {
@@ -4279,6 +4282,11 @@ struct Runner<'x, D, B: CountBackend, T, L, C: ClockPort, P: ProcPort> {
     /// Relevant paths dropped by the per-poll relevance/bytes
     /// caps (loud loss at finalize).
     relevance_capped: u64,
+    /// Budget-refusal diagnostic entries (R14 minor): retained
+    /// sorted + deduped, capped — each names the refused object by
+    /// (dev, ino) plus kind/bytes/allowance. Numeric-only, no
+    /// paths (privacy: target paths never render).
+    refusal_diagnostics: BTreeSet<String>,
     /// File reads discarded by the freshness-race guard
     /// (pre/post metadata disagreed): served to nobody, loud loss
     /// at finalize, evidence-tainting (the rows miss).
@@ -4323,6 +4331,15 @@ const MAX_CACHED_FILES: usize = 256;
 /// growing into the gigabytes the old read-all round map
 /// routinely held.
 const MAX_CACHED_BYTES: usize = 128 * 1024 * 1024;
+
+/// Numeric refusal tag for a path (metadata dev/ino; `0/0` when
+/// the path cannot be stated — never the path itself).
+fn refusal_tag(p: &std::path::Path) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt as _;
+    std::fs::metadata(p)
+        .map(|m| (m.dev(), m.ino()))
+        .unwrap_or((0, 0))
+}
 
 /// File paths a discovery poll's consumers can touch (F-D/A13):
 /// candidate backing identities + array-owner identities (a
@@ -4608,6 +4625,11 @@ where
                     Err(e) if e.kind() == std::io::ErrorKind::FileTooLarge => {
                         self.file_cache.remove(p);
                         dropped = dropped.saturating_add(1);
+                        let (dev, ino) = refusal_tag(std::path::Path::new(p));
+                        let len = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+                        self.refusal_diagnostics.insert(format!(
+                            "dev={dev} ino={ino} kind=file_too_large bytes={len} allowance={allowance}"
+                        ));
                         continue;
                     }
                     Err(_) => {
@@ -4620,13 +4642,26 @@ where
             // within the remaining allowance — a hit past it skips
             // loud like a fresh-read refusal (a fresh read always
             // fits: the reader refuses past `allowance` first).
-            if let Some(cached) = self.file_cache.get(p) {
-                if cached.file.bytes.len() > allowance {
-                    dropped = dropped.saturating_add(1);
-                    continue;
-                }
+            if let Some(cached) = self
+                .file_cache
+                .get(p)
+                .filter(|c| c.file.bytes.len() <= allowance)
+            {
                 out_bytes = out_bytes.saturating_add(cached.file.bytes.len());
                 out.insert(p.clone(), cached.file.clone());
+            } else if self.file_cache.contains_key(p) {
+                let entry = {
+                    let cached = self.file_cache.get(p).expect("contains_key");
+                    format!(
+                        "dev={} ino={} kind=over_allowance bytes={} allowance={allowance}",
+                        cached.file.dev,
+                        cached.file.ino,
+                        cached.file.bytes.len()
+                    )
+                };
+                self.refusal_diagnostics.insert(entry);
+                dropped = dropped.saturating_add(1);
+                continue;
             }
         }
         self.relevance_capped = self.relevance_capped.saturating_add(dropped);
@@ -5507,6 +5542,7 @@ where
         drain_wall_us: 0,
         file_cache: HashMap::new(),
         relevance_capped: 0,
+        refusal_diagnostics: BTreeSet::new(),
         unverified_reads: 0,
         observation_started: false,
         traversal: None,
@@ -6769,6 +6805,14 @@ where
             .attach_diagnostics
             .iter()
             .take(ATTACH_DIAGNOSTICS_CAP)
+            .cloned()
+            .collect();
+        // R14 minor: refusal diagnostics ride the document (sorted
+        // + deduped + capped upstream, same rule as attach_diagnostics).
+        document.refusal_diagnostics = self
+            .refusal_diagnostics
+            .iter()
+            .take(REFUSAL_DIAGNOSTICS_CAP)
             .cloned()
             .collect();
 
@@ -11538,6 +11582,7 @@ mod tests {
                 drain_wall_us: 0,
                 file_cache: HashMap::new(),
                 relevance_capped: 0,
+                refusal_diagnostics: BTreeSet::new(),
                 unverified_reads: 0,
                 observation_started: false,
                 traversal: None,

@@ -265,6 +265,11 @@
       "type": "array",
       "items": { "type": "string", "minLength": 1 }
     },
+    "refusal_diagnostics": {
+      "description": "Budget-refusal diagnostic entries (R14 minor, optional): sorted, deduped, capped numeric entries (dev/ino/kind/bytes/allowance, no paths) identifying refused objects. Omitted when none refused. Diagnostic only: counters stay the exact counts; old field readers ignore this key.",
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
     "traversal": {
       "description": "Traversal outcome (v2.1, optional — present iff the window ran the members backend): the exact selected triple plus record/findings/poll counts, the admitted-query census, per-record native facts, and census loss. Absent on harvest-only runs. The six triple/count keys are required; the census/entry keys are optional (additive — old readers ignore them) but always emitted by current producers.",
       "type": "object",

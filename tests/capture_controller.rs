@@ -8904,3 +8904,187 @@ fn r14_fix_cached_payload_over_remaining_budget_skips_loud() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// R14 minor: bounded numeric refusal diagnostics ride the document
+// alongside the `discovery.relevance_capped` aggregate.
+// ---------------------------------------------------------------------------
+
+/// Shape pin for one refusal entry (no regex crate in dev-deps,
+/// so the `^dev=\d+ ino=\d+ kind=[a-z_]+ bytes=\d+
+/// allowance=\d+$` grammar is checked by hand): numeric-only, no
+/// paths.
+fn assert_refusal_shape(entry: &str) {
+    let parts: Vec<&str> = entry.split(' ').collect();
+    assert_eq!(parts.len(), 5, "five space-separated fields: {entry:?}");
+    fn num(v: &str) -> bool {
+        !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit())
+    }
+    fn kind(v: &str) -> bool {
+        !v.is_empty() && v.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
+    }
+    let (k, v) = parts[0].split_once('=').unwrap_or(("", ""));
+    assert_eq!(k, "dev", "field 1 key: {entry:?}");
+    assert!(num(v), "dev numeric: {entry:?}");
+    let (k, v) = parts[1].split_once('=').unwrap_or(("", ""));
+    assert_eq!(k, "ino", "field 2 key: {entry:?}");
+    assert!(num(v), "ino numeric: {entry:?}");
+    let (k, v) = parts[2].split_once('=').unwrap_or(("", ""));
+    assert_eq!(k, "kind", "field 3 key: {entry:?}");
+    assert!(kind(v), "kind token: {entry:?}");
+    let (k, v) = parts[3].split_once('=').unwrap_or(("", ""));
+    assert_eq!(k, "bytes", "field 4 key: {entry:?}");
+    assert!(num(v), "bytes numeric: {entry:?}");
+    let (k, v) = parts[4].split_once('=').unwrap_or(("", ""));
+    assert_eq!(k, "allowance", "field 5 key: {entry:?}");
+    assert!(num(v), "allowance numeric: {entry:?}");
+}
+
+#[test]
+fn refusal_diagnostics_records_one_refusal() {
+    // Mirrors `r14_first_oversized_object_cannot_bypass_cap`:
+    // the oversized decoy sorts first and refuses loud; the
+    // aggregate counts it AND the document names it once.
+    let mut h = Harness::fresh("refusal-diag-one");
+    h.snapshot_attached();
+    let elf_len = h.bytes.len();
+    let budget = elf_len + 512;
+    let big = h.stage.write("a-huge.so", &[0x7fu8; 64]);
+    h.files.insert(
+        big.path.clone(),
+        plan::FileBytes {
+            bytes: vec![0x7fu8; elf_len + 1024].into(),
+            dev: big.device,
+            ino: big.ino,
+        },
+    );
+    h.read_budget = budget;
+    h.maps = vec![mapping(&big), mapping(&h.staged)];
+    let staged_path = h.staged.path.clone();
+    let big_path = big.path.clone();
+    assert!(
+        big_path < staged_path,
+        "decoy must sort first: {big_path} vs {staged_path}"
+    );
+    h.polls.push_back(DiscoveryDelta::default());
+    h.polls.push_back(DiscoveryDelta {
+        candidates: vec![
+            cand(
+                "/p/provider.so",
+                backing_of(&big, h.off),
+                1,
+                11,
+                "SHA-256",
+                false,
+                "ok",
+            ),
+            cand(
+                "/p/provider.so",
+                backing_of(&h.staged, h.off),
+                1,
+                11,
+                "SHA-256",
+                false,
+                "ok",
+            ),
+        ],
+        tables: vec![terminated(1, 0)],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    h.plans.insert(
+        2,
+        FirePlan {
+            fires: vec![(BASE_NS + 600_000_000, 7)],
+            shortfall: 0,
+            cancel: false,
+        },
+    );
+    h.exit_at_ns = Some(BASE_NS + 1_000_000_000);
+    h.exit_code = 0;
+    let (out, _post) = h.run();
+    let c = out.unwrap();
+    assert_eq!(
+        counter_value(&c, "discovery.relevance_capped"),
+        1,
+        "one budget refusal: {:?}",
+        c.document.counters
+    );
+    assert_eq!(
+        c.document.refusal_diagnostics.len(),
+        1,
+        "exactly one refusal entry: {:?}",
+        c.document.refusal_diagnostics
+    );
+    assert_refusal_shape(&c.document.refusal_diagnostics[0]);
+}
+
+#[test]
+fn refusal_diagnostics_bounded_sorted_sixteen() {
+    // Twenty oversized objects in one round: all refuse loud
+    // (aggregate counts every one), but the document retains only
+    // the first sixteen entries in sorted order.
+    let mut h = Harness::fresh("refusal-diag-cap");
+    h.snapshot_attached();
+    let budget = 1024;
+    let mut staged_all = Vec::new();
+    for i in 0..20u32 {
+        let name = format!("a-huge-{i:02}.so");
+        let s = h.stage.write(&name, &[0x7fu8; 64]);
+        h.files.insert(
+            s.path.clone(),
+            plan::FileBytes {
+                bytes: vec![0x7fu8; budget + 512].into(),
+                dev: s.device,
+                ino: s.ino,
+            },
+        );
+        staged_all.push(s);
+    }
+    h.read_budget = budget;
+    h.maps = staged_all.iter().map(mapping).collect();
+    let off = h.off;
+    h.polls.push_back(DiscoveryDelta::default());
+    h.polls.push_back(DiscoveryDelta {
+        candidates: staged_all
+            .iter()
+            .map(|s| {
+                cand(
+                    "/p/provider.so",
+                    backing_of(s, off),
+                    1,
+                    11,
+                    "SHA-256",
+                    false,
+                    "ok",
+                )
+            })
+            .collect(),
+        tables: vec![terminated(1, 0)],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    let (out, _post) = h.run();
+    let c = out.unwrap();
+    assert_eq!(
+        counter_value(&c, "discovery.relevance_capped"),
+        20,
+        "every refusal counted: {:?}",
+        c.document.counters
+    );
+    assert_eq!(
+        c.document.refusal_diagnostics.len(),
+        16,
+        "retention is capped at sixteen: {:?}",
+        c.document.refusal_diagnostics
+    );
+    let mut sorted = c.document.refusal_diagnostics.clone();
+    sorted.sort();
+    assert_eq!(
+        c.document.refusal_diagnostics, sorted,
+        "retained entries are sorted"
+    );
+    for entry in &c.document.refusal_diagnostics {
+        assert_refusal_shape(entry);
+    }
+}

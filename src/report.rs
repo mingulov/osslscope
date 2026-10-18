@@ -776,6 +776,11 @@ fn doc_json(doc: &CaptureDocument) -> serde_json::Value {
     if !doc.attach_diagnostics.is_empty() {
         out["attach_diagnostics"] = serde_json::json!(doc.attach_diagnostics);
     }
+    // R14 minor: refusal diagnostics render only when recorded
+    // (same optional-key rule — numeric entries, capped upstream).
+    if !doc.refusal_diagnostics.is_empty() {
+        out["refusal_diagnostics"] = serde_json::json!(doc.refusal_diagnostics);
+    }
     out
 }
 

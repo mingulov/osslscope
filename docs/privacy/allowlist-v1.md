@@ -354,6 +354,13 @@ gate reads clock + cells only).
   are file offsets; `<inner>` is one of the above. The cookie and
   probe identity ride structurally on the attach record, never in
   text.
+- Optional `refusal_diagnostics` (R14 minor, rendered only when a
+  budget refusal occurred): sorted, deduped, capped array of
+  numeric refusal entries, each
+  `dev=<n> ino=<n> kind=<file_too_large|over_allowance>
+  bytes=<n> allowance=<n>`. No paths, no target strings, no
+  runtime addresses. (Unreadable-path `Err(_)` arms record no
+  entry — out of scope.)
 - Human output is a summary, not the same fields: sites omit
   JSON's first/last timestamps, device, and inode, and fenced
   generations render summary counts with detail deferred to
