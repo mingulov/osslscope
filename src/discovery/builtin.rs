@@ -139,10 +139,16 @@ pub fn load_table_str(s: &str) -> anyhow::Result<Table> {
             .get("openssl")
             .and_then(|s| s.as_str())
             .ok_or_else(|| anyhow!("fallback lacks openssl version"))?;
+        // Round 4, residual C.3-config: FIXED wording — the
+        // version is raw configuration content (it travels the
+        // onboard chain-preservation + capture
+        // environment-failure route into published fatal detail,
+        // where the narrow allowance admits no raw configuration
+        // values), so it must never interpolate here.
         let (maj, min) = ver
             .split_once('.')
             .and_then(|(a, b)| Some((a.parse::<u32>().ok()?, b.parse::<u32>().ok()?)))
-            .ok_or_else(|| anyhow!("bad fallback version {ver}"))?;
+            .ok_or_else(|| anyhow!("bad fallback version (want numeric major.minor)"))?;
         t.fallback.insert(
             (maj, min),
             FallbackEntry {
@@ -297,6 +303,32 @@ mod tests {
     fn force_short_circuits_garbage() {
         let (off, r) = resolve_query_offset(b"junk", &Table::empty(), Some(0x42)).unwrap();
         assert_eq!((off, r), (0x42, Resolution::Forced));
+    }
+
+    #[test]
+    fn fallback_version_error_is_fixed_wording() {
+        // Round 4, residual C.3-config: an unparseable fallback
+        // version is raw configuration content — the diagnostic
+        // must use FIXED wording (the value travels the
+        // onboard chain-preservation + capture
+        // environment-failure route into published fatal
+        // detail, where the narrow allowance admits no raw
+        // configuration values).
+        let t = load_table_str(
+            r#"{"table_version":1,"entries":[],
+                "fallback":[{"openssl":"unexpected-config-value",
+                             "anchor":"OSSL_PROVIDER_available","delta":8}]}"#,
+        );
+        let e = t.unwrap_err();
+        let text = format!("{e:#}");
+        assert!(
+            text.contains("bad fallback version (want numeric major.minor)"),
+            "fixed diagnostic wording required, got: {text}"
+        );
+        assert!(
+            !text.contains("unexpected-config-value"),
+            "raw configuration value must not interpolate, got: {text}"
+        );
     }
 
     #[test]
