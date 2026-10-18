@@ -177,15 +177,18 @@ pub struct ScanBatch {
     /// only sound quiesced — non-quiesced batches hold
     /// underdetermined invocations open (honest, never guessed).
     pub quiesced: bool,
-    /// The current fault view is unavailable (round 3, residual
-    /// B-2): a post-drain LOSS/TRUNC re-read failed, so a fault
-    /// landing mid-drain (after the pre-drain snapshot) may be
-    /// missing from this batch. Opens spanning the drain retain
-    /// the marking; the terminal backstop — which has no next
-    /// batch to settle against — treats marked invocations as
-    /// uncertain (never silently Complete). The take path needs
-    /// no marking effect (the next drain's fresh snapshot
-    /// re-reads the sticky fault planes).
+    /// The current fault view is unavailable (round 3,
+    /// residual B-2; round 4 extends the rule to every
+    /// evaluation close): a post-drain LOSS/TRUNC re-read
+    /// failed, so a fault landing mid-drain (after the
+    /// pre-drain snapshot) may be missing from this batch.
+    /// Opens spanning the drain retain the marking; every
+    /// evaluation close of a marked invocation — take,
+    /// quiesced-cell, or terminal backstop — treats it as
+    /// uncertain (never silently Complete). Round 3's
+    /// terminal-only scope was unsound: a successor take
+    /// consumed in the uncertain batch closes the marked open
+    /// before any next drain's snapshot can settle it.
     pub fault_view_uncertain: bool,
 }
 
@@ -339,12 +342,12 @@ pub enum PartialReason {
     /// A dispatch row carried a foreign array id (evidence
     /// inconsistent with the joined RET's array).
     RowArrayMismatch,
-    /// The current fault view was unavailable at the terminal
-    /// backstop (round 3, residual B-2): a post-drain LOSS/TRUNC
-    /// re-read failed while this invocation was open, so a fault
-    /// landing mid-drain may be missing from the retained
-    /// evidence. The evidence stays; the verdict cannot be
-    /// Complete.
+    /// The current fault view was unavailable while this
+    /// invocation was open (round 3, residual B-2; round 4
+    /// extends the rule to every evaluation close): a
+    /// post-drain LOSS/TRUNC re-read failed, so a fault landing
+    /// mid-drain may be missing from the retained evidence. The
+    /// evidence stays; the verdict cannot be Complete.
     FaultViewUncertain,
 }
 
@@ -647,8 +650,10 @@ struct Open {
     /// (checked both directions — ALG-after-RET and RET-after-ALG).
     gen_mixed: bool,
     /// A post-drain fault re-read failed while this invocation
-    /// was open (round 3, residual B-2): the current fault view
-    /// is unavailable, so the terminal backstop cannot Complete.
+    /// was open (round 3, residual B-2; round 4 extends the rule
+    /// to every evaluation close): the current fault view is
+    /// unavailable, so no evaluation close (take,
+    /// quiesced-cell, or terminal backstop) can Complete.
     fault_uncertain: bool,
 }
 
@@ -915,28 +920,17 @@ impl Oracle {
                 continue;
             }
             let mut w = Self::evaluate(&scope, &k, &o);
-            // Round 3, residual B-2: the backstop has no next
-            // batch to settle against — when the current fault
-            // view is unavailable (a post-drain re-read failed
-            // while this invocation was open), a dispatch fault
-            // may have landed mid-drain, invisible to the
-            // pre-drain snapshot. The retained evidence stays
-            // (counts, identities, TRUE-T); the verdict cannot
-            // be Complete — downgrade explicitly, never silently.
+            // Round 3, residual B-2 (round 4: shared helper —
+            // every evaluation close applies it): when the
+            // current fault view is unavailable (a post-drain
+            // re-read failed while this invocation was open), a
+            // dispatch fault may have landed mid-drain, invisible
+            // to the pre-drain snapshot. The retained evidence
+            // stays (counts, identities, TRUE-T); the verdict
+            // cannot be Complete — downgrade explicitly, never
+            // silently.
             if o.fault_uncertain {
-                match &mut w.outcome {
-                    Outcome::Partial { reasons } => {
-                        reasons.push(PartialReason::FaultViewUncertain);
-                    }
-                    Outcome::Complete { .. } => {
-                        w.outcome = Outcome::Partial {
-                            reasons: vec![PartialReason::FaultViewUncertain],
-                        };
-                    }
-                    Outcome::Skipped { .. }
-                    | Outcome::Tainted { .. }
-                    | Outcome::Abandoned { .. } => {}
-                }
+                Self::downgrade_fault_uncertain(&mut w.outcome);
             }
             self.push_done(w);
         }
@@ -1178,9 +1172,10 @@ impl Oracle {
         for o in self.open.values_mut() {
             o.ring_loss_accum = o.ring_loss_accum.saturating_add(ring_delta);
             o.trunc_accum |= b.trunc.get(&o.call.op).copied().unwrap_or(0);
-            // Round 3, residual B-2: an unavailable current fault
-            // view marks every open spanning this drain (sticky —
-            // the terminal backstop treats marked invocations as
+            // Round 3, residual B-2 (round 4: every evaluation
+            // close): an unavailable current fault view marks
+            // every open spanning this drain (sticky — every
+            // evaluation close treats marked invocations as
             // uncertain, never silently Complete).
             o.fault_uncertain |= b.fault_view_uncertain;
         }
@@ -1884,7 +1879,20 @@ impl Oracle {
                     });
                     continue;
                 }
-                let w = Self::evaluate(scope, &k, &o);
+                let mut w = Self::evaluate(scope, &k, &o);
+                // Round 4, residual B-2-take: the take selector
+                // above accepts fault-uncertain marked opens —
+                // closure here must downgrade exactly like the
+                // terminal backstop (a successor consumed in the
+                // uncertain batch closes the open before any next
+                // drain can settle it). Take and quiesced-cell
+                // closes funnel through this same loop, so one
+                // application covers both routes — the uncertainty
+                // is about the retained fault evidence, identical
+                // on both.
+                if o.fault_uncertain {
+                    Self::downgrade_fault_uncertain(&mut w.outcome);
+                }
                 self.push_done(w);
             }
         }
@@ -1913,6 +1921,29 @@ impl Oracle {
                     idx: *idx,
                 }),
             }
+        }
+    }
+
+    /// Downgrade a marked invocation's evaluated verdict
+    /// (residual B-2, rounds 3-4 — one home, no drift): the
+    /// retained fault evidence may miss a mid-drain fault, so
+    /// the verdict cannot be Complete. Complete downgrades
+    /// explicitly (evidence retained on the record); Partial
+    /// preserves its evaluated reasons and gains the marker;
+    /// non-evaluated outcomes (Tainted/Abandoned/Skipped) pass
+    /// through untouched. Every evaluation close — take,
+    /// quiesced-cell, and terminal backstop — applies it.
+    fn downgrade_fault_uncertain(outcome: &mut Outcome) {
+        match outcome {
+            Outcome::Partial { reasons } => {
+                reasons.push(PartialReason::FaultViewUncertain);
+            }
+            Outcome::Complete { .. } => {
+                *outcome = Outcome::Partial {
+                    reasons: vec![PartialReason::FaultViewUncertain],
+                };
+            }
+            Outcome::Skipped { .. } | Outcome::Tainted { .. } | Outcome::Abandoned { .. } => {}
         }
     }
 

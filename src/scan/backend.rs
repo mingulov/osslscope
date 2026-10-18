@@ -792,11 +792,13 @@ impl ScanBackend {
         // against the stale read. Best-effort by design: a failed
         // re-read keeps the pre-drain read (the drain already
         // succeeded — failing here would R35-drop drained items).
-        // Round 3, residual B-2: that failure is no longer silent
-        // — the batch marks its fault view unavailable, so the
-        // terminal backstop (no next batch exists at finish)
-        // treats the retained evidence as uncertain instead of
-        // evaluating it against a possibly stale view.
+        // Round 3, residual B-2 (round 4: every evaluation
+        // close): that failure is no longer silent — the batch
+        // marks its fault view unavailable, so every evaluation
+        // close of a marked invocation (take, quiesced-cell, or
+        // terminal backstop) treats the retained evidence as
+        // uncertain instead of evaluating it against a possibly
+        // stale view.
         // RCOUNT/SEQ stay pre-drain (quiesced/idle-path and
         // turnover-timing inputs — no verdict evaluates against
         // them, so no stale-fault defect there). The oracle's

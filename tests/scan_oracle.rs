@@ -2817,3 +2817,353 @@ fn r3_backstop_completes_with_available_fault_view() {
         o.done()[0].outcome
     );
 }
+
+/// Round 4, residual B-2-take (review's 6-step schedule): member
+/// 1 emits EMPTY before member 0; member 0 emits RET, ALG_OK
+/// and one ROW; batch 1 drains those records; batch 2 reads
+/// empty pre-drain fault snapshots, then the dispatch read
+/// faults (WALK_READ, retires) and the same thread issues a
+/// successor CALL consumed during batch 2; batch 2's
+/// post-TRUNC read fails with no new predecessor ring. The
+/// take selector accepts the fault-uncertain marked open —
+/// closure through the TAKE path must downgrade exactly like
+/// the terminal backstop, never silently Complete.
+#[test]
+fn r4_take_marks_review_schedule_uncertain() {
+    let mut o = Oracle::new(OracleScope::full());
+    let mut b1 = nonquiesced(1_000);
+    b1.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b1.push_alg(alg(TIDA, 0, 0, wire::ALG_OK));
+    b1.push_alg(alg_arr(TIDA, 0, 1, wire::ALG_EMPTY, ARR, 0));
+    b1.push_ret(ret(TIDA, 0, 0));
+    b1.push_row(row(TIDA, 0, 0));
+    assert!(b1.order_sound());
+    o.ingest(&b1);
+    assert_eq!(o.open_count(), 1, "no successor: honestly open");
+    // Batch 2: unavailable fault view + the successor CALL, no
+    // new predecessor ring (last ring evidence precedes the
+    // fault write).
+    let mut b2 = nonquiesced(2_000);
+    b2.push_call(call(TIDA, 1, false, wire::SKIP_ADMITTED));
+    b2.fault_view_uncertain = true;
+    o.ingest(&b2);
+    assert_eq!(o.done().len(), 1, "successor take closes seq 0");
+    assert_eq!((o.done()[0].tid, o.done()[0].seq), (TIDA, 0));
+    assert!(
+        matches!(
+            o.done()[0].outcome,
+            Outcome::Partial { ref reasons } if reasons
+                .iter()
+                .any(|r| matches!(r, PartialReason::FaultViewUncertain))
+        ),
+        "take-path close of a marked open must not silently Complete: {:?}",
+        o.done()[0].outcome
+    );
+    // Drained evidence is retained (uncertain, never dropped).
+    assert_eq!(o.done()[0].alg_count, 2);
+    assert_eq!(o.done()[0].row_count, 1);
+    assert_eq!(o.done()[0].true_t, TrueT::Proven(1));
+}
+
+/// Round 4, residual B-2-take (sticky marking): the uncertain
+/// batch only MARKS the open (same-batch ring holds the take
+/// close); a later quiet batch closes it through the sticky
+/// successor mark. The sticky mark must survive to that close
+/// — the verdict cannot be Complete.
+#[test]
+fn r4_take_sticky_mark_closes_uncertain_later() {
+    let mut o = Oracle::new(OracleScope::full());
+    let mut b1 = nonquiesced(1_000);
+    b1.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b1.push_ret(ret(TIDA, 0, 0));
+    b1.push_alg(alg(TIDA, 0, 0, wire::ALG_OK));
+    b1.push_alg(alg_arr(TIDA, 0, 1, wire::ALG_EMPTY, ARR, 0));
+    o.ingest(&b1);
+    // Batch 2 (uncertain): successor CALL plus same-batch
+    // predecessor ring (beyond-terminator EMPTY — discarded,
+    // but it holds the take close one quiet batch).
+    let mut b2 = nonquiesced(2_000);
+    b2.push_call(call(TIDA, 1, false, wire::SKIP_ADMITTED));
+    b2.push_alg(alg_arr(TIDA, 0, 2, wire::ALG_EMPTY, ARR, 0));
+    b2.fault_view_uncertain = true;
+    o.ingest(&b2);
+    assert_eq!(o.done().len(), 0, "same-batch ring holds the take");
+    // Batch 3 (certain, quiet): the sticky successor mark
+    // closes seq 0 — still marked, still uncertain.
+    o.ingest(&nonquiesced(3_000));
+    assert_eq!(o.done().len(), 1);
+    assert!(
+        matches!(
+            o.done()[0].outcome,
+            Outcome::Partial { ref reasons } if reasons
+                .iter()
+                .any(|r| matches!(r, PartialReason::FaultViewUncertain))
+        ),
+        "sticky take close of a marked open must not silently Complete: {:?}",
+        o.done()[0].outcome
+    );
+    assert_eq!(o.done()[0].true_t, TrueT::Proven(1));
+}
+
+/// Round 4, residual B-2-take (predecessor-chain order): two
+/// RET-joined opens span the uncertain batch; one successor
+/// CALL take-closes both. Every marked open downgrades —
+/// closure order across the chain changes nothing.
+#[test]
+fn r4_take_marked_chain_downgrades_every_open() {
+    let mut o = Oracle::new(OracleScope::full());
+    let mut b1 = nonquiesced(1_000);
+    for seq in [0, 1] {
+        b1.push_call(call(TIDA, seq, false, wire::SKIP_ADMITTED));
+        b1.push_ret(ret(TIDA, seq, 0));
+        b1.push_alg(alg(TIDA, seq, 0, wire::ALG_OK));
+        b1.push_alg(alg_arr(TIDA, seq, 1, wire::ALG_EMPTY, ARR, 0));
+    }
+    o.ingest(&b1);
+    assert_eq!(o.open_count(), 2);
+    let mut b2 = nonquiesced(2_000);
+    b2.push_call(call(TIDA, 2, false, wire::SKIP_ADMITTED));
+    b2.fault_view_uncertain = true;
+    o.ingest(&b2);
+    assert_eq!(o.done().len(), 2, "one take closes both opens");
+    for w in o.done() {
+        assert!(
+            matches!(
+                w.outcome,
+                Outcome::Partial { ref reasons } if reasons
+                    .iter()
+                    .any(|r| matches!(r, PartialReason::FaultViewUncertain))
+            ),
+            "marked seq {} must not silently Complete: {:?}",
+            w.seq,
+            w.outcome
+        );
+    }
+}
+
+/// Round 4, residual B-2-take (RET-first order variant): the
+/// same uncertain take close with RET joined before the slot
+/// records. Drain order within the settled batch changes
+/// neither the marking nor the downgrade.
+#[test]
+fn r4_take_ret_first_order_closes_uncertain() {
+    let mut o = Oracle::new(OracleScope::full());
+    let mut b1 = nonquiesced(1_000);
+    b1.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b1.push_ret(ret(TIDA, 0, 0));
+    b1.push_alg(alg(TIDA, 0, 0, wire::ALG_OK));
+    b1.push_alg(alg_arr(TIDA, 0, 1, wire::ALG_EMPTY, ARR, 0));
+    o.ingest(&b1);
+    let mut b2 = nonquiesced(2_000);
+    b2.push_call(call(TIDA, 1, false, wire::SKIP_ADMITTED));
+    b2.fault_view_uncertain = true;
+    o.ingest(&b2);
+    assert_eq!(o.done().len(), 1);
+    assert!(
+        matches!(
+            o.done()[0].outcome,
+            Outcome::Partial { ref reasons } if reasons
+                .iter()
+                .any(|r| matches!(r, PartialReason::FaultViewUncertain))
+        ),
+        "RET-first take close of a marked open must not silently Complete: {:?}",
+        o.done()[0].outcome
+    );
+}
+
+/// Round 4, residual B-2-take (Partial preservation): a marked
+/// open that already earns Partial keeps its evaluated
+/// reasons — the uncertainty marker is APPENDED, never a
+/// replacement.
+#[test]
+fn r4_take_marked_hole_preserves_reasons() {
+    let mut o = Oracle::new(OracleScope::full());
+    let mut b1 = nonquiesced(1_000);
+    b1.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b1.push_ret(ret(TIDA, 0, 0));
+    b1.push_alg(alg(TIDA, 0, 0, wire::ALG_OK));
+    b1.push_alg(alg(TIDA, 0, 2, wire::ALG_OK)); // slot 1: hole
+    b1.push_alg(alg_arr(TIDA, 0, 3, wire::ALG_EMPTY, ARR, 0));
+    o.ingest(&b1);
+    let mut b2 = nonquiesced(2_000);
+    b2.push_call(call(TIDA, 1, false, wire::SKIP_ADMITTED));
+    b2.fault_view_uncertain = true;
+    o.ingest(&b2);
+    assert_eq!(o.done().len(), 1);
+    match &o.done()[0].outcome {
+        Outcome::Partial { reasons } => {
+            assert!(
+                reasons.contains(&PartialReason::Holes(vec![1])),
+                "evaluated hole reason must survive: {reasons:?}"
+            );
+            assert!(
+                reasons
+                    .iter()
+                    .any(|r| matches!(r, PartialReason::FaultViewUncertain)),
+                "uncertainty marker must append: {reasons:?}"
+            );
+        }
+        other => panic!("marked holed take close must stay Partial: {other:?}"),
+    }
+}
+
+/// Round 4, residual B-2-take (quiesced route): the same
+/// closable funnel serves take closes AND quiesced-cell
+/// closes — a marked open closed on IDLE cells in an
+/// uncertain batch downgrades identically (the uncertainty is
+/// about the retained fault evidence, identical on both
+/// routes).
+#[test]
+fn r4_quiesced_marked_close_downgrades() {
+    let mut o = Oracle::new(OracleScope::full());
+    let mut b1 = nonquiesced(1_000);
+    b1.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b1.push_ret(ret(TIDA, 0, 0));
+    b1.push_alg(alg(TIDA, 0, 0, wire::ALG_OK));
+    b1.push_alg(alg_arr(TIDA, 0, 1, wire::ALG_EMPTY, ARR, 0));
+    o.ingest(&b1);
+    let mut b2 = quiesced_idle(&[TIDA]);
+    b2.fault_view_uncertain = true;
+    o.ingest(&b2);
+    assert_eq!(o.done().len(), 1, "IDLE cells close the open");
+    assert!(
+        matches!(
+            o.done()[0].outcome,
+            Outcome::Partial { ref reasons } if reasons
+                .iter()
+                .any(|r| matches!(r, PartialReason::FaultViewUncertain))
+        ),
+        "quiesced close of a marked open must not silently Complete: {:?}",
+        o.done()[0].outcome
+    );
+}
+
+/// Round 4, residual B-2-take (RET-EMPTY parity): the take path
+/// mirrors the terminal rule EXACTLY — even a RET-EMPTY
+/// marked open downgrades (the backstop's Complete arm fires
+/// there too; parity, not precision, is the contract).
+#[test]
+fn r4_take_marked_ret_empty_downgrades() {
+    let mut o = Oracle::new(OracleScope::full());
+    let mut b1 = nonquiesced(1_000);
+    b1.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    let mut r = ret(TIDA, 0, 0);
+    r.flags = wire::RET_FLAG_EMPTY;
+    b1.push_ret(r);
+    o.ingest(&b1);
+    let mut b2 = nonquiesced(2_000);
+    b2.push_call(call(TIDA, 1, false, wire::SKIP_ADMITTED));
+    b2.fault_view_uncertain = true;
+    o.ingest(&b2);
+    assert_eq!(o.done().len(), 1);
+    assert!(
+        matches!(
+            o.done()[0].outcome,
+            Outcome::Partial { ref reasons } if reasons
+                .iter()
+                .any(|r| matches!(r, PartialReason::FaultViewUncertain))
+        ),
+        "RET-EMPTY take close of a marked open must mirror the backstop: {:?}",
+        o.done()[0].outcome
+    );
+    assert_eq!(o.done()[0].true_t, TrueT::EmptyTable);
+}
+
+/// Round 4, residual B-2-take (taint control): uncertainty
+/// never rewrites a nesting verdict — a marked open carrying
+/// a taint still closes Tainted (terminal rule parity for
+/// non-evaluated outcomes).
+#[test]
+fn r4_take_marked_taint_stands() {
+    let mut o = Oracle::new(OracleScope::full());
+    let mut b1 = nonquiesced(1_000);
+    b1.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b1.push_ret(ret(TIDA, 0, 0));
+    b1.push_alg(alg(TIDA, 0, 0, wire::ALG_OK));
+    b1.push_alg(alg(TIDA, 0, 0, wire::ALG_OK)); // duplicate slot: taint
+    b1.push_alg(alg_arr(TIDA, 0, 1, wire::ALG_EMPTY, ARR, 0));
+    o.ingest(&b1);
+    let mut b2 = nonquiesced(2_000);
+    b2.push_call(call(TIDA, 1, false, wire::SKIP_ADMITTED));
+    b2.fault_view_uncertain = true;
+    o.ingest(&b2);
+    assert_eq!(o.done().len(), 1);
+    assert!(
+        matches!(o.done()[0].outcome, Outcome::Tainted { .. }),
+        "marked tainted take close must stay Tainted: {:?}",
+        o.done()[0].outcome
+    );
+}
+
+/// Round 4, residual B-2-take (available-view control): the
+/// review-schedule shape with a CERTAIN view take-closes
+/// Complete — the uncertainty rule fires only on the marked
+/// view, never by default.
+#[test]
+fn r4_take_certain_view_completes() {
+    let mut o = Oracle::new(OracleScope::full());
+    let mut b1 = nonquiesced(1_000);
+    b1.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b1.push_alg(alg(TIDA, 0, 0, wire::ALG_OK));
+    b1.push_alg(alg_arr(TIDA, 0, 1, wire::ALG_EMPTY, ARR, 0));
+    b1.push_ret(ret(TIDA, 0, 0));
+    b1.push_row(row(TIDA, 0, 0));
+    o.ingest(&b1);
+    let mut b2 = nonquiesced(2_000);
+    b2.push_call(call(TIDA, 1, false, wire::SKIP_ADMITTED));
+    assert!(!b2.fault_view_uncertain, "default view is available");
+    o.ingest(&b2);
+    assert_eq!(o.done().len(), 1);
+    assert!(
+        matches!(o.done()[0].outcome, Outcome::Complete { .. }),
+        "certain-view take close still Completes: {:?}",
+        o.done()[0].outcome
+    );
+}
+
+/// Round 4, residual B-2-take (sticky available-view control):
+/// the sticky-hold shape with CERTAIN views throughout
+/// take-closes Complete — stickiness alone never downgrades.
+#[test]
+fn r4_take_sticky_certain_view_completes() {
+    let mut o = Oracle::new(OracleScope::full());
+    let mut b1 = nonquiesced(1_000);
+    b1.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b1.push_ret(ret(TIDA, 0, 0));
+    b1.push_alg(alg(TIDA, 0, 0, wire::ALG_OK));
+    b1.push_alg(alg_arr(TIDA, 0, 1, wire::ALG_EMPTY, ARR, 0));
+    o.ingest(&b1);
+    let mut b2 = nonquiesced(2_000);
+    b2.push_call(call(TIDA, 1, false, wire::SKIP_ADMITTED));
+    b2.push_alg(alg_arr(TIDA, 0, 2, wire::ALG_EMPTY, ARR, 0));
+    o.ingest(&b2);
+    assert_eq!(o.done().len(), 0, "same-batch ring holds the take");
+    o.ingest(&nonquiesced(3_000));
+    assert_eq!(o.done().len(), 1);
+    assert!(
+        matches!(o.done()[0].outcome, Outcome::Complete { .. }),
+        "certain-view sticky take close still Completes: {:?}",
+        o.done()[0].outcome
+    );
+}
+
+/// Round 4, residual B-2-take (quiesced available-view
+/// control): an IDLE-cell close with a CERTAIN view Completes
+/// — the quiesced route downgrades only marked opens.
+#[test]
+fn r4_quiesced_certain_view_completes() {
+    let mut o = Oracle::new(OracleScope::full());
+    let mut b1 = nonquiesced(1_000);
+    b1.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    b1.push_ret(ret(TIDA, 0, 0));
+    b1.push_alg(alg(TIDA, 0, 0, wire::ALG_OK));
+    b1.push_alg(alg_arr(TIDA, 0, 1, wire::ALG_EMPTY, ARR, 0));
+    o.ingest(&b1);
+    o.ingest(&quiesced_idle(&[TIDA]));
+    assert_eq!(o.done().len(), 1);
+    assert!(
+        matches!(o.done()[0].outcome, Outcome::Complete { .. }),
+        "certain-view quiesced close still Completes: {:?}",
+        o.done()[0].outcome
+    );
+}
