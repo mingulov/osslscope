@@ -1526,18 +1526,21 @@ impl OwnedTarget {
         } else {
             unsafe { libc::fork() }
         };
+        let fork_errno = std::io::Error::last_os_error();
         if pid < 0 {
             // F1: a prepared sink disposes under control here too — never
             // by dropping it inline (a FUSE FLUSH in that drop would hang
             // setup on the caller). No child exists, so the outcome needs
-            // no custody.
+            // no custody. fork_errno was captured BEFORE this disposal:
+            // thread creation and timed waits inside can overwrite errno
+            // (R06 fork-errno minor).
             if let Some(sink) = owned_sink.take() {
                 let _ = close_under_control(sink, deadline, cancel);
             }
             if fail_fork {
                 anyhow::bail!("fork: test-injected fork failure");
             }
-            anyhow::bail!("fork: {}", std::io::Error::last_os_error());
+            anyhow::bail!("fork: {fork_errno}");
         }
         if pid == 0 {
             unsafe {
