@@ -1,16 +1,18 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Changelog
 
-## 1.0.0
+## 0.1.0 (2026-10-18)
 
 First release. Execution-backed OpenSSL crypto inventory on eBPF
 uprobes: `doctor`, `inspect`, `report`, `check`, `alias-audit`.
+(The tree previously carried an unreleased 1.0.0 label; 0.1.0 is
+the first version actually cut, qualified, and tagged.)
 
 - License: GPL-3.0-or-later for userspace, docs, and scripts
   (`LICENSE`); GPL-2.0-only for BPF programs in `crates/ebpf/`
   (`LICENSES/GPL-2.0-only.txt`); per-file SPDX tags. Contributions
   under `CONTRIBUTING.md` (broad sublicensing/relicensing grant).
-- Version 1.0.0 across the root crate and
+- Version 0.1.0 across the root crate and
   `crates/{ossl-discover,manifest,ebpf-common,bpf-sys}`.
   `crates/ebpf` stays 0.0.0 by design: unpublished-internal (own
   workspace + lockfile + nightly toolchain, `publish = false`),
@@ -21,6 +23,17 @@ uprobes: `doctor`, `inspect`, `report`, `check`, `alias-audit`.
 - Docs: claim chain + who-should-NOT-adopt, overhead matrix, CI
   recipes, PARTIAL/attach/violation runbooks, install guide
   (see `docs/`).
+- Qualification: full 23-item remediation plan executed with
+  independent review gates (review-accepted fixes, RED-first
+  proofs, sealed-candidate live re-qualification on lane-b).
+  Suite 1171/0, CI green.
+- Known limitations (tracked for 0.2): COMPLETE verdict 0/10 on
+  real shapes (genuine attach/late-attach/close-tail losses —
+  T14 gated); deep observability obligations open (physical
+  callback ledger, hot-key/per-key counts, P6-live
+  compositions, callback-latency distributions, second
+  kernel/libc profile); R06 registry alias/cancel hardening
+  parked; several arms unit-covered only (see plan record).
 
 ### P6 auditor story
 
