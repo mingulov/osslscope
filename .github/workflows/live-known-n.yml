@@ -124,6 +124,7 @@ jobs:
           "$PFX/bin/osslscope" doctor \
             --object "$PFX/lib/osslscope/osslscope-harvest" \
             --count-object "$PFX/lib/osslscope/osslscope-count" \
+            --members-object "$PFX/lib/osslscope/osslscope-members" \
             --format json \
             >doctor.json 2>doctor.stderr || rc=$?
           echo "$rc" >doctor-rc.txt
@@ -306,6 +307,7 @@ jobs:
             --provider "$LIBCRYPTO" --builtin \
             --object "$PFX/lib/osslscope/osslscope-harvest" \
             --count-object "$PFX/lib/osslscope/osslscope-count" \
+            --members-object "$PFX/lib/osslscope/osslscope-members" \
             --deny-weak \
             --duration 30 --timeout 60 --grace 5 \
             --format json --out known-n.json \
