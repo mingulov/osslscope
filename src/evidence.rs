@@ -958,9 +958,11 @@ impl CaptureDocument {
     /// Non-fatal documents are usable. This gates eligibility only —
     /// per-site certainty/coverage tests still decide definite vs
     /// possible use, so a usable Runtime site is not automatically
-    /// definite. This is the single source of truth for the
-    /// policy no-verdict gate AND the report/CBOM wording AND the
-    /// schema's JSON restatement (which must stay in sync).
+    /// definite. The kind rule itself lives in the shared
+    /// [`fatal_kind_usable`] decision (this method and the schema
+    /// validator's policy check both consume it — no restated rule
+    /// remains to drift); this method is its typed-side consumer
+    /// for the policy no-verdict gate and the report/CBOM wording.
     pub fn has_usable_evidence(&self) -> bool {
         match &self.status {
             Completeness::Complete | Completeness::Partial { .. } => true,

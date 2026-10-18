@@ -1337,9 +1337,10 @@ fn check_records(
         } else {
             "pass"
         };
-        // Fatal-kind usability restated over the validated JSON
-        // shape (fatal kinds were validated above, so this lookup
-        // cannot meet a malformed kind here): Runtime, plus
+        // Fatal-kind usability via the shared `fatal_kind_usable`
+        // rule over the validated JSON shape (fatal kinds were
+        // validated above, so this lookup cannot meet a malformed
+        // kind here): Runtime, plus
         // AttachZero carrying proved ENGINE evidence (any
         // in-window observation with calls > 0 — the P2 plane the
         // attach-zero classification cannot suppress). Recycled

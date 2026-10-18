@@ -2263,8 +2263,9 @@ pub fn read_ctrl(
 }
 
 /// A fully attached member chunk: loaded progs/maps + live links.
-/// Drop order detaches members first (Vec drop), then entry, then
-/// maps/progs (Loaded drop) — the reverse of construction.
+/// Fields drop in declaration order (no manual `Drop` impl):
+/// maps/progs (`Loaded` drop) first, then entry, then members —
+/// the same order as construction.
 pub struct MembersAttached {
     pub loaded: Loaded,
     pub entry: OwnedFd,
