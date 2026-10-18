@@ -401,10 +401,21 @@ pub struct Capture {
     pub window_planned: Duration,
     pub window_actual: Duration,
     pub outcome: Outcome,
+    /// Compatibility reason strings (v0.2 R22 seam 2 — RETAINED):
+    /// write-only diagnostics; production report/check consume
+    /// the typed `document` gaps, and no decision reads these
+    /// strings — so removal would churn test pins without
+    /// removing any duplicate decision. The P1 typed gaps map
+    /// back onto the same vocabulary (deduped, never
+    /// double-reported).
     pub reasons: Vec<String>,
     pub executions: Vec<Execution>,
     pub stale: Vec<StaleBucket>,
     pub counters: Counters,
+    /// Legacy child-exit carrier (v0.2 R22 seam 3 — RETAINED):
+    /// live consumers in report/check (`workload_hint`,
+    /// exit mapping) require it; removal fails the plan R22
+    /// checkbox-1 gate (parity + zero consumers unproven).
     pub child_exit: Option<i32>,
     pub drain_wall_us: u64,
     pub harvest_doc: serde_json::Value,
