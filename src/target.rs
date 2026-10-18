@@ -754,11 +754,13 @@ struct RegistryAdmission {
 }
 
 impl RegistryAdmission {
-    fn insert(key: PathBuf) -> anyhow::Result<Self> {
+    /// `display` is the caller's path, named in the refusal error
+    /// (the key may be a `canon:...` alias — never user-facing).
+    fn insert(key: PathBuf, display: &Path) -> anyhow::Result<Self> {
         let id = registry_try_insert(&key).ok_or_else(|| {
             anyhow::anyhow!(
                 "workload output {}: another setup for this destination is still in flight (no child spawned)",
-                key.display(),
+                display.display(),
             )
         })?;
         Ok(Self { key: Some(key), id })
@@ -1567,7 +1569,7 @@ impl OwnedTarget {
                         "pre-stop setup worker lost before file-sink preparation (no child spawned)"
                     ),
                 };
-                let mut admission = RegistryAdmission::insert(reg_key.clone())?;
+                let mut admission = RegistryAdmission::insert(reg_key.clone(), path)?;
                 let worker_id = admission.id();
                 let owned_path = path.clone();
                 let truncate_delay_ms = SETUP_TEST_HOOK.with(|h| h.borrow().truncate_delay_ms);
@@ -2611,7 +2613,8 @@ mod control_tests {
     fn registry_admission_drop_releases_entry() {
         let key = super::normalize_setup_key(std::path::Path::new("/tmp/r06-guard-a.log"));
         {
-            let _held = super::RegistryAdmission::insert(key.clone()).expect("first insert wins");
+            let _held =
+                super::RegistryAdmission::insert(key.clone(), &key).expect("first insert wins");
             assert!(
                 super::registry_try_insert(&key).is_none(),
                 "live admission refuses"
@@ -2626,7 +2629,7 @@ mod control_tests {
         let key = super::normalize_setup_key(std::path::Path::new("/tmp/r06-guard-b.log"));
         let id = {
             let mut held =
-                super::RegistryAdmission::insert(key.clone()).expect("first insert wins");
+                super::RegistryAdmission::insert(key.clone(), &key).expect("first insert wins");
             held.disarm();
             held.id_for_test()
         };
@@ -2640,9 +2643,55 @@ mod control_tests {
     }
 
     #[test]
+    fn registry_admission_refusal_reports_user_path() {
+        // V2-19: the refusal names the caller's path, never the
+        // registry key (a `canon:...` alias in the Task-2 case).
+        // Pin the exact pre-Task-3 text in both cases.
+        let expected = |display: &std::path::Path| {
+            format!(
+                "workload output {}: another setup for this destination is still in flight (no child spawned)",
+                display.display(),
+            )
+        };
+        let refusal_text = |key: std::path::PathBuf, display: &std::path::Path| {
+            let mut held =
+                super::RegistryAdmission::insert(key.clone(), display).expect("first insert wins");
+            let err = match super::RegistryAdmission::insert(key, display) {
+                Ok(_) => panic!("live admission refuses"),
+                Err(e) => e,
+            };
+            held.release();
+            err.to_string()
+        };
+        // Plain case: user path and key agree.
+        let user = std::path::PathBuf::from("/tmp/r06-guard-msg-plain.log");
+        let key = super::normalize_setup_key(&user);
+        assert_eq!(refusal_text(key, &user), expected(&user));
+        // Alias case: symlinked parent spellings key canonically.
+        let root = std::env::temp_dir().join(format!("r06-guard-msg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("real")).unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("link")).unwrap();
+        let alias_user = root.join("link").join("w.log");
+        let alias_key = super::canonical_setup_key(&alias_user).unwrap();
+        assert!(
+            alias_key.to_string_lossy().starts_with("canon:"),
+            "alias fixture must key canonically: {alias_key:?}"
+        );
+        let alias_msg = refusal_text(alias_key, &alias_user);
+        assert_eq!(alias_msg, expected(&alias_user));
+        assert!(
+            !alias_msg.contains("canon:"),
+            "refusal must never leak the registry key: {alias_msg}"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn registry_admission_release_is_idempotent_with_worker_reclaim() {
         let key = super::normalize_setup_key(std::path::Path::new("/tmp/r06-guard-c.log"));
-        let mut held = super::RegistryAdmission::insert(key.clone()).expect("first insert wins");
+        let mut held =
+            super::RegistryAdmission::insert(key.clone(), &key).expect("first insert wins");
         let id = held.id_for_test();
         held.release();
         super::registry_remove_if(&key, id);
