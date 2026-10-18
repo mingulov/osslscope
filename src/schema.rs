@@ -1306,9 +1306,9 @@ fn check_records(
     // and AttachZero fatals without proved ENGINE evidence);
     // usable documents — including salvaged Runtime-fatal and
     // proved-ENGINE AttachZero ones — carry the combined verdict.
-    // This mirrors `CaptureDocument::has_usable_evidence` (the
-    // JSON shape cannot call the helper, so the kind + ENGINE
-    // checks are restated here and must stay in sync with it).
+    // This consumes the shared `fatal_kind_usable` rule (the JSON
+    // shape maps its validated kind token onto it — no restated
+    // rule remains to drift).
     if let Some(policy) = root.get("policy") {
         let policy_obj = policy
             .as_object()
@@ -1351,8 +1351,10 @@ fn check_records(
             .and_then(|o| o.get("kind"))
             .and_then(|v| v.as_str());
         let usable = status != "FATAL"
-            || fatal_kind == Some("runtime")
-            || (fatal_kind == Some("attach-zero") && json_has_proved_engine_evidence(root));
+            || crate::evidence::fatal_kind_usable(
+                crate::evidence::FatalUsabilityKind::of_token(fatal_kind.unwrap_or("")),
+                json_has_proved_engine_evidence(root),
+            );
         if !usable {
             if verdict != "no-verdict" {
                 return Err(

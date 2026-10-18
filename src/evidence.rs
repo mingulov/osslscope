@@ -878,6 +878,54 @@ pub struct TraversalRecord {
     pub census_loss: u64,
 }
 
+/// Fatal-kind usability classes for the shared usability rule
+/// (v0.2 R22: the single decision behind
+/// [`CaptureDocument::has_usable_evidence`] and the schema
+/// validator's policy check — both sides map onto this, so the
+/// rule can never drift on one side again).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FatalUsabilityKind {
+    Runtime,
+    AttachZero,
+    Other,
+}
+
+impl FatalUsabilityKind {
+    pub fn of(kind: &FatalKind) -> Self {
+        match kind {
+            FatalKind::Runtime(_) => Self::Runtime,
+            FatalKind::AttachZero => Self::AttachZero,
+            _ => Self::Other,
+        }
+    }
+
+    pub fn of_token(token: &str) -> Self {
+        match token {
+            "runtime" => Self::Runtime,
+            "attach-zero" => Self::AttachZero,
+            _ => Self::Other,
+        }
+    }
+}
+
+/// Shared fatal-usability rule: runtime-salvageable kinds are
+/// usable; attach-zero is usable only with proved ENGINE
+/// evidence; everything else is unusable (fail-closed).
+///
+/// ```rust
+/// use osslscope::evidence::{fatal_kind_usable, FatalUsabilityKind};
+/// assert!(fatal_kind_usable(FatalUsabilityKind::Runtime, false));
+/// assert!(fatal_kind_usable(FatalUsabilityKind::Runtime, true));
+/// assert!(fatal_kind_usable(FatalUsabilityKind::AttachZero, true));
+/// assert!(!fatal_kind_usable(FatalUsabilityKind::AttachZero, false));
+/// assert!(!fatal_kind_usable(FatalUsabilityKind::Other, true));
+/// assert!(!fatal_kind_usable(FatalUsabilityKind::Other, false));
+/// ```
+pub fn fatal_kind_usable(kind: FatalUsabilityKind, proved_engine: bool) -> bool {
+    matches!(kind, FatalUsabilityKind::Runtime)
+        || (matches!(kind, FatalUsabilityKind::AttachZero) && proved_engine)
+}
+
 impl CaptureDocument {
     /// Conserved total across current and fenced sites.
     pub fn total_calls(&self) -> u64 {
@@ -916,10 +964,10 @@ impl CaptureDocument {
     pub fn has_usable_evidence(&self) -> bool {
         match &self.status {
             Completeness::Complete | Completeness::Partial { .. } => true,
-            Completeness::Fatal { kind, .. } => {
-                matches!(kind, FatalKind::Runtime(_))
-                    || (matches!(kind, FatalKind::AttachZero) && self.has_proved_engine_evidence())
-            }
+            Completeness::Fatal { kind, .. } => fatal_kind_usable(
+                FatalUsabilityKind::of(kind),
+                self.has_proved_engine_evidence(),
+            ),
         }
     }
 
