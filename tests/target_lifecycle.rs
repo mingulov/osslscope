@@ -382,6 +382,27 @@ fn sentinel_argv() -> Vec<String> {
     ]
 }
 
+/// Precise setup-status markers (v0.2 flake fix): production
+/// names file-sink setup failures with `(setup status 126)`
+/// and child-side stdio failure with `(status 126)`; exec
+/// failure surfaces as `(status 127)`. Bare `"126"`/`"127"`
+/// substrings also match the random staging pathname
+/// (`.osslscope-staging-<pid>-<n>-<hex16>`), so match the
+/// parenthesized markers, never the digits.
+fn assert_setup_126_marker(err: &str) {
+    assert!(
+        err.contains("(setup status 126)") || err.contains("(status 126)"),
+        "126 setup marker: {err}"
+    );
+}
+
+fn assert_no_127_marker(err: &str) {
+    assert!(
+        !err.contains("(status 127)") && !err.contains("(setup status 127)"),
+        "never 127-confused: {err}"
+    );
+}
+
 #[test]
 fn h9_t1_default_null_discards_both_streams() {
     // T1 (RED): default destination sinks both workload streams
@@ -455,7 +476,11 @@ fn h9_t3b_invalid_fd_fails_without_spawn() {
         .expect("invalid fd must fail")
         .to_string();
     assert!(err.contains("999999"), "names the fd: {err}");
-    assert!(!err.contains("127"), "nothing spawned: {err}");
+    assert_no_127_marker(&err);
+    assert!(
+        !err.contains("(status ") && !err.contains("(setup status "),
+        "nothing spawned, no status rides: {err}"
+    );
 }
 
 #[test]
@@ -481,8 +506,8 @@ fn h9_t5_unwritable_path_maps_126_naming_path() {
         .err()
         .expect("unwritable path must fail")
         .to_string();
-    assert!(err.contains("126"), "126 mapping: {err}");
-    assert!(!err.contains("127"), "never 127-confused: {err}");
+    assert_setup_126_marker(&err);
+    assert_no_127_marker(&err);
     assert!(err.contains(path), "names the path: {err}");
 }
 
@@ -1131,9 +1156,19 @@ fn file_open_failure_names_path_with_126() {
     .err()
     .expect("unwritable path must fail")
     .to_string();
-    assert!(err.contains("126"), "126 mapping: {err}");
-    assert!(!err.contains("127"), "never 127-confused: {err}");
+    assert_setup_126_marker(&err);
+    assert_no_127_marker(&err);
     assert!(err.contains(path), "names the path: {err}");
+}
+
+#[test]
+fn setup_marker_matching_ignores_staging_digits() {
+    // v0.2 flake regression pin: the exact staging-failure
+    // shape from src/target.rs `create_staging_sink`, with a
+    // staging name whose pid/counter/hex all carry "127".
+    let err = "workload output /nonexistent-r06-dir-xyz/workload.log: cannot create staging file /nonexistent-r06-dir-xyz/.osslscope-staging-127-127-0000000000000127: No such file or directory (os error 2) (setup status 126)";
+    assert_setup_126_marker(err);
+    assert_no_127_marker(err);
 }
 
 #[test]
