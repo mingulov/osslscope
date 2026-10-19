@@ -10347,6 +10347,71 @@ mod tests {
                 generation: 0,
             }
         }
+
+        fn assert_completion_coherent(w: &WalkDone) {
+            // R19 minor-2: a Complete record's underlying slots must
+            // cohere with its verdict (cold terminator proves T —
+            // oracle.rs:2196; OK carries a real class, EMPTY carries
+            // OTHER_CLASS — R3-fixtures rule).
+            use crate::scan::oracle::{Outcome, TrueT};
+            use osslscope_ebpf_common as wire;
+            let Outcome::Complete { true_t, .. } = &w.outcome else {
+                return;
+            };
+            let min_empty = w
+                .algs
+                .iter()
+                .filter(|a| a.status == wire::ALG_EMPTY)
+                .map(|a| a.idx)
+                .min()
+                .expect("complete record needs a terminator");
+            assert_eq!(min_empty, *true_t, "min-EMPTY slot must equal true_t");
+            assert_eq!(w.true_t, TrueT::Proven(*true_t), "true_t must be Proven(t)");
+            for a in &w.algs {
+                if a.status == wire::ALG_OK {
+                    assert_ne!(a.class, wire::OTHER_CLASS, "OK carries a real class");
+                }
+            }
+        }
+
+        fn coherent_complete_walk(seq: u64, op: u32) -> WalkDone {
+            // Six members (ALG_OK@0..5) + min-EMPTY terminator@6:
+            // cold terminator proves T=6 (oracle.rs:2196).
+            use crate::scan::oracle::Outcome;
+            use osslscope_ebpf_common as wire;
+            walk_full(
+                seq,
+                op,
+                Outcome::Complete {
+                    true_t: 6,
+                    cached: false,
+                },
+                vec![
+                    ident(0, 0, wire::ALG_OK, 0),
+                    ident(1, 0, wire::ALG_OK, 0),
+                    ident(2, 0, wire::ALG_OK, 0),
+                    ident(3, 0, wire::ALG_OK, 0),
+                    ident(4, 0, wire::ALG_OK, 0),
+                    ident(5, 0, wire::ALG_OK, 0),
+                    ident(6, wire::OTHER_CLASS, wire::ALG_EMPTY, 0),
+                ],
+                vec![
+                    row_ev(0, 300),
+                    row_ev(1, 300),
+                    row_ev(2, 300),
+                    row_ev(3, 300),
+                    row_ev(4, 300),
+                    row_ev(5, 300),
+                ],
+                5_000_000_000,
+            )
+        }
+
+        #[test]
+        fn traversal_complete_fixtures_are_completion_coherent() {
+            let w = coherent_complete_walk(1, 1);
+            assert_completion_coherent(&w);
+        }
         fn triple_prov() -> TripleProvenance {
             let obj = |n: &str| ObjectProvenance {
                 path: PathBuf::from(format!("/prefix/lib/osslscope/{n}")),
@@ -10560,23 +10625,8 @@ mod tests {
             // document sites carry NO anchor-offset synthetic
             // site, executions carry nothing synthetic, and the
             // traversal outcome retains the record.
-            use crate::scan::oracle::Outcome;
-            use osslscope_ebpf_common as wire;
             let round = TraversalDelta {
-                done: vec![walk_full(
-                    1,
-                    1,
-                    Outcome::Complete {
-                        true_t: 6,
-                        cached: false,
-                    },
-                    vec![
-                        ident(0, 0, wire::ALG_OK, 0),
-                        ident(1, wire::OTHER_CLASS, wire::ALG_EMPTY, 0),
-                    ],
-                    vec![row_ev(0, 300)],
-                    5_000_000_000,
-                )],
+                done: vec![coherent_complete_walk(1, 1)],
                 findings: vec![],
                 partial_reasons: vec![],
                 polls: 1,
@@ -10641,25 +10691,10 @@ mod tests {
             // capture retains the latest snapshot, and the
             // rendered traversal section reports it (additive
             // `admitted` map — old readers ignore unknown keys).
-            use crate::scan::oracle::Outcome;
-            use osslscope_ebpf_common as wire;
             let admitted: std::collections::BTreeMap<u32, u64> =
                 [(1u32, 3u64)].into_iter().collect();
             let round = TraversalDelta {
-                done: vec![walk_full(
-                    1,
-                    1,
-                    Outcome::Complete {
-                        true_t: 6,
-                        cached: false,
-                    },
-                    vec![
-                        ident(0, 0, wire::ALG_OK, 0),
-                        ident(1, wire::OTHER_CLASS, wire::ALG_EMPTY, 0),
-                    ],
-                    vec![row_ev(0, 300)],
-                    5_000_000_000,
-                )],
+                done: vec![coherent_complete_walk(1, 1)],
                 findings: vec![],
                 partial_reasons: vec![],
                 polls: 1,
@@ -10722,8 +10757,8 @@ mod tests {
             assert_eq!(entries[0]["op"], 1);
             assert_eq!(entries[0]["outcome"]["Complete"]["true_t"], 6);
             assert_eq!(entries[0]["true_t"], serde_json::json!({"Proven": 6}));
-            assert_eq!(entries[0]["alg_count"], 2);
-            assert_eq!(entries[0]["row_count"], 1);
+            assert_eq!(entries[0]["alg_count"], 7);
+            assert_eq!(entries[0]["row_count"], 6);
             assert_eq!(entries[0]["generation"], 0);
             // Old-reader compatibility: a reader that knows only
             // the round-3 shape parses the new document fine.
@@ -10743,23 +10778,8 @@ mod tests {
             // loss, the capture unions them across rounds, and
             // the rendered traversal section reports both
             // (additive keys — old readers ignore them).
-            use crate::scan::oracle::Outcome;
-            use osslscope_ebpf_common as wire;
             let round = |seq: u64, op: u32, unknown: u32, loss: u64| TraversalDelta {
-                done: vec![walk_full(
-                    seq,
-                    op,
-                    Outcome::Complete {
-                        true_t: 6,
-                        cached: false,
-                    },
-                    vec![
-                        ident(0, 0, wire::ALG_OK, 0),
-                        ident(1, wire::OTHER_CLASS, wire::ALG_EMPTY, 0),
-                    ],
-                    vec![row_ev(0, 300)],
-                    5_000_000_000,
-                )],
+                done: vec![coherent_complete_walk(seq, op)],
                 findings: vec![],
                 partial_reasons: vec![],
                 polls: 1,

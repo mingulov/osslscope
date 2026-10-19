@@ -1278,6 +1278,40 @@ fn close_quiesce_recovers_row_landing_mid_drain() {
 }
 
 #[test]
+fn close_pending_admitted_work_completes_in_quiesce() {
+    // R20: hits admitted pre-close complete through the bounded
+    // quiesce passes — eventual completion of pending work (the
+    // positive twin of the delayed-hit countermodel below).
+    let stage = Stage::fresh("pending-work");
+    let bytes = self_bytes();
+    let off = x_offsets(&bytes, 1)[0];
+    let a = stage.write("prov.so", &bytes);
+    let live = vec![mapping(&a)];
+    let files = HashMap::from([(
+        a.path.clone(),
+        plan::FileBytes {
+            bytes: std::fs::read(&a.path).unwrap().into(),
+            dev: a.device,
+            ino: a.ino,
+        },
+    )]);
+    let mut s = session_with(FakeCountBackend::new());
+    let d = CountDelta {
+        discovered: vec![site(&a, off, 7)],
+        losses: Vec::new(),
+    };
+    s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
+    let cookie = s.cookie_for(a.device, a.ino, off).unwrap();
+    s.open_window(1000, 2000).unwrap();
+    s.backend_mut().fire(PID, cookie, 1500, 5);
+    let drain = s.close_and_drain(Duration::from_secs(5)).unwrap();
+    assert_eq!(drain.total_calls(), 5, "pending pre-close hits complete");
+    assert_eq!(counter_value(&drain, "count.map_insert_dropped"), Some(0));
+    assert_eq!(counter_value(&drain, "count.unattributed"), Some(0));
+    assert_eq!(counter_value(&drain, "count.drain_shortfall"), Some(0));
+}
+
+#[test]
 fn close_delayed_hit_after_drain_is_uncounted_countermodel() {
     // R20 count-close countermodel (pins the limitation, not a bug):
     // a hit admitted pre-close but completing AFTER the final drain
@@ -1324,9 +1358,16 @@ fn close_delayed_hit_after_drain_is_uncounted_countermodel() {
             last_ns: 1500,
         },
     );
-    // The returned drain neither includes it nor records any loss
-    // for it: quiesce passes cannot prove completion.
+    // The drain-vs-backend divergence (not drain-vs-itself) proves
+    // the hit is invisible everywhere: the backend ledger holds
+    // 5 + 3 while the returned drain still reports 5 with no loss
+    // recorded — quiesce passes cannot prove completion.
     assert_eq!(drain.total_calls(), 5, "post-drain hit excluded");
+    assert_eq!(
+        s.backend().ledger_total(cookie, 0),
+        8,
+        "backend holds the delayed hit the drain cannot see"
+    );
     assert_eq!(counter_value(&drain, "count.map_insert_dropped"), Some(0));
     assert_eq!(counter_value(&drain, "count.unattributed"), Some(0));
     assert_eq!(counter_value(&drain, "count.drain_shortfall"), Some(0));
