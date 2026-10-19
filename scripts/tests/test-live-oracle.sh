@@ -624,7 +624,7 @@ fi
 # they never satisfy an operation counter.
 CSETUP='{"op": 12, "funcid": 1, "provider_class": "default", "algorithm_classes": ["ECDSA"]}'
 CMD4SETUP='{"op": 1, "funcid": 2, "provider_class": "legacy", "algorithm_classes": ["MD4"]}'
-printf 'LEDGER mode=ecdsa fetches=102 signs=1 verifies=1\nLEDGER mode=ecdsa loop_secs=30 ops=100 fetches=102\nORDDONE mode=ecdsa rc=0\n' >"$T/loop100.log"
+printf 'LEDGER mode=ecdsa fetches=102 signs=100 verifies=100\nLEDGER mode=ecdsa loop_secs=30 ops=100 fetches=102\nORDDONE mode=ecdsa rc=0\n' >"$T/loop100.log"
 
 S48A=$(site 5 301 "$CSETUP"); S48B=$(site 3 302 "$CDSA"); S48C=$(site 2 303 "$CDSA15")
 mk_report "$T/rep48split.json" "[$S48A, $S48B, $S48C]"
@@ -707,6 +707,15 @@ else
     grep -q 'below ledgered' "$T/out" \
         && ok "aggregate shortfall 99-under-100 fails" \
         || bad "aggregate shortfall 99-under-100 fails"
+fi
+
+# R09 minor-4: loop100 must pin 100-iteration ledger magnitude.
+LOOP_SIGNS=$(sed -n 's/.*signs=\([0-9]*\).*/\1/p' "$T/loop100.log" | head -1)
+LOOP_VERIFIES=$(sed -n 's/.*verifies=\([0-9]*\).*/\1/p' "$T/loop100.log" | head -1)
+if [ "${LOOP_SIGNS:-0}" -ge 100 ] && [ "${LOOP_VERIFIES:-0}" -ge 100 ]; then
+    ok "loop100 ledger pins 100-iteration magnitude"
+else
+    bad "loop100 ledger pins 100-iteration magnitude (signs=${LOOP_SIGNS:-?} verifies=${LOOP_VERIFIES:-?})"
 fi
 
 # 55. FAIL: duplicate physical join on a multi-candidate site.
