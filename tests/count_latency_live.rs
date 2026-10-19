@@ -89,6 +89,13 @@ fn build_flood(dir: &Path) -> PathBuf {
     bin
 }
 
+/// The target libcrypto is named explicitly (`--provider` +
+/// `--builtin`): pre-exec auto-discovery predicts "no NEEDED
+/// libcrypto" for the Fedora-guest gcc flood binary and refuses
+/// the exe as an unrecognized library (cycle-1 exit 4; T3-49a88a6
+/// pinned shape + fix). Explicit provider is the
+/// product-sanctioned path (`docs/usage.md`); leg assertions
+/// unaffected.
 fn run_leg(bin: &Path, dir: &Path, tag: &str, flood: &Path, args: &[&str]) -> serde_json::Value {
     let doc_path = dir.join(format!("{tag}.json"));
     let mut cmd = vec![
@@ -101,6 +108,9 @@ fn run_leg(bin: &Path, dir: &Path, tag: &str, flood: &Path, args: &[&str]) -> se
         "100".to_string(),
         "--timeout".to_string(),
         "120".to_string(),
+        "--provider".to_string(),
+        format!("{OPT_LIB}/libcrypto.so.3"),
+        "--builtin".to_string(),
         "run".to_string(),
         "--".to_string(),
         flood.to_string_lossy().into_owned(),
@@ -238,6 +248,13 @@ fn latency_paced_distribution_measured() {
 /// Observed workload-only wall: the child times itself with
 /// `date +%s%N` into a file (attach time excluded from the
 /// ratio). Returns (doc, workload_ns).
+///
+/// The target libcrypto is named explicitly (`--provider` +
+/// `--builtin`): the observed `sh -c ...` resolves to
+/// /usr/sbin/sh, which auto-discovery refuses with exit 4
+/// (cycle-1 `not OpenSSL` shape; T4-670a5f4 pinned fix).
+/// Explicit provider is the product-sanctioned path
+/// (`docs/usage.md`); leg assertions unaffected.
 fn run_wall(
     bin: &Path,
     dir: &Path,
@@ -247,6 +264,7 @@ fn run_wall(
 ) -> (serde_json::Value, u64) {
     let doc_path = dir.join(format!("{tag}.json"));
     let wall_path = dir.join(format!("{tag}.wallns"));
+    let prov_lib = format!("{OPT_LIB}/libcrypto.so.3");
     let mut inner = format!("start=$(date +%s%N); '{}'", flood.to_string_lossy());
     for a in args {
         inner.push(' ');
@@ -269,6 +287,9 @@ fn run_wall(
             "100",
             "--timeout",
             "120",
+            "--provider",
+            &prov_lib,
+            "--builtin",
             "run",
             "--",
             "sh",
