@@ -6253,19 +6253,56 @@ fn live_same_tgid_exec_is_detected() {
     ];
     let mut owned = OwnedTarget::spawn_stopped(&argv, WorkloadDest::Null).unwrap();
     let pid = owned.pid();
-    owned.release().unwrap();
-    std::thread::sleep(Duration::from_millis(200));
+    // v0.2 flake hardening, construct-before-release: the child is
+    // SIGSTOP-stopped pre-exec, so this baseline snapshots the pre-exec
+    // image deterministically — zero race with either exec.
     let mut lc = PollingLifecycle::new(pid);
-    let before = lc.poll();
+    owned.release().unwrap();
+    // Phase 1 — settle the initial `sh` exec: the baseline above is the
+    // pre-exec image, so the first Exec to surface is the stopped-child
+    // → sh transition; drain it before targeting `sh → sleep` below.
+    let t_settle = Instant::now();
+    let mut settled = false;
+    while t_settle.elapsed() < Duration::from_secs(10) {
+        let sample = lc.poll();
+        if sample.events.iter().any(|e| e.kind == LifecycleKind::Exec) {
+            settled = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(settled, "initial sh exec must surface within 10 s");
+    // Phase 2 — target the `sh → sleep` exec quiet-first.
+    // `PollingLifecycle::new` snapshots /proc/pid/exe at construction and
+    // Exec fires only on an exe-link change; the initial exec already
+    // settled in phase 1, so this baseline is the post-sh image and polls
+    // stay quiet until the 400 ms exec point.
+    let mut lc = PollingLifecycle::new(pid);
+    let t0 = Instant::now();
+    let mut saw_pre_exec_quiet = false;
+    let mut exec_seen = false;
+    while t0.elapsed() < Duration::from_secs(10) {
+        let sample = lc.poll();
+        let execs: Vec<_> = sample
+            .events
+            .iter()
+            .filter(|e| e.kind == LifecycleKind::Exec)
+            .collect();
+        if execs.is_empty() {
+            saw_pre_exec_quiet = true;
+        } else {
+            assert_eq!(execs.len(), 1, "exactly one Exec surfaces: {sample:?}");
+            assert_eq!(execs[0].pid, pid, "exec belongs to the target: {sample:?}");
+            exec_seen = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
     assert!(
-        before.events.iter().all(|e| e.kind != LifecycleKind::Exec),
-        "no exec before the exec point: {before:?}"
+        saw_pre_exec_quiet,
+        "at least one quiet poll before the exec point"
     );
-    std::thread::sleep(Duration::from_millis(600));
-    let after = lc.poll();
-    assert_eq!(after.events.len(), 1, "{after:?}");
-    assert_eq!(after.events[0].kind, LifecycleKind::Exec);
-    assert_eq!(after.events[0].pid, pid);
+    assert!(exec_seen, "exec must surface within 10 s");
     unsafe {
         libc::kill(pid as libc::pid_t, libc::SIGKILL);
     }
