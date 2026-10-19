@@ -1189,6 +1189,46 @@ fn drain_scan_tail_counts_exactly() {
 }
 
 #[test]
+fn lat_fence_partial_deltas_fold_once() {
+    // fence()+latency partial deltas (review-5 §2 probe): 80
+    // samples in bucket 5 + 10 in bucket 14 pre-fence fold at
+    // fence(); 20 more in bucket 5 post-fence; close folds only
+    // the remainder — 110/100/10, each sample exactly once.
+    let stage = Stage::fresh("lat-fence");
+    let bytes = self_bytes();
+    let offs = x_offsets(&bytes, 1);
+    let a = stage.write("prov.so", &bytes);
+    let live = vec![mapping(&a)];
+    let files = HashMap::from([(
+        a.path.clone(),
+        plan::FileBytes {
+            bytes: std::fs::read(&a.path).unwrap().into(),
+            dev: a.device,
+            ino: a.ino,
+        },
+    )]);
+    let mut s = session_with(FakeCountBackend::new());
+    let d = CountDelta {
+        discovered: vec![site(&a, offs[0], 7)],
+        losses: Vec::new(),
+    };
+    s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
+    let cookie = s.cookie_for(a.device, a.ino, offs[0]).unwrap();
+    s.open_window(1000, 2000).unwrap();
+    s.backend_mut().fire(PID, cookie, 1500, 10);
+    s.backend_mut().inject_latency(5, 80);
+    s.backend_mut().inject_latency(14, 10);
+    s.fence(osslscope::count_session::FenceReason::MappingsChanged)
+        .unwrap();
+    s.backend_mut().fire(PID, cookie, 1500, 5);
+    s.backend_mut().inject_latency(5, 20);
+    let drain = s.close_and_drain(Duration::from_secs(5)).unwrap();
+    assert_eq!(counter_value(&drain, "count.lat_samples"), Some(110));
+    assert_eq!(counter_value(&drain, "count.lat_bucket_05"), Some(100));
+    assert_eq!(counter_value(&drain, "count.lat_bucket_14"), Some(10));
+}
+
+#[test]
 fn kernel_source_enforces_window() {
     // Tripwire, not execution proof (same precedent as the privacy
     // source-shape pins): the BPF program must declare the WINDOW
