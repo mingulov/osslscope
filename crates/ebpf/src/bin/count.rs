@@ -58,6 +58,16 @@ static WINDOW: Array<u64> = Array::with_max_entries(WINDOW_CELLS, 0);
 #[map]
 static DROPFAIL: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
 
+/// BPF-side admitted-hits ledger (independent of `COUNTS`): one
+/// per-CPU u64 bumped once per admitted hit (passed `TARGET` +
+/// window), including `DROPFAIL` hits. Invariant (checked
+/// userspace-side on every drain):
+/// `ADMITTED == sum(COUNTS.count) + DROPFAIL`.
+/// A second map drained through a second read path — shared
+/// aggregation bugs cannot hide in both.
+#[map]
+static ADMITTED: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
+
 #[uprobe]
 pub fn count_entry(ctx: ProbeContext) -> u32 {
     let target = match TARGET.get(0) {
@@ -77,6 +87,9 @@ pub fn count_entry(ctx: ProbeContext) -> u32 {
     if now < start || now >= deadline {
         return 0;
     }
+    // Independent ledger: every hit admitted past TARGET + window,
+    // including cookie-wide and map-full drops below.
+    admitted();
     let cookie = unsafe { helpers::bpf_get_attach_cookie(ctx.as_ptr()) };
     // Plan indices are u32 by construction; a wider cookie is a
     // userspace bug — counted in DROPFAIL, never truncated silently.
@@ -132,6 +145,13 @@ fn bump(slot: *mut CountValue, now: u64) {
 
 fn dropfail() {
     if let Some(slot) = DROPFAIL.get_ptr_mut(0) {
+        let c = unsafe { &mut *slot };
+        *c = c.saturating_add(1);
+    }
+}
+
+fn admitted() {
+    if let Some(slot) = ADMITTED.get_ptr_mut(0) {
         let c = unsafe { &mut *slot };
         *c = c.saturating_add(1);
     }

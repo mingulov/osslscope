@@ -51,6 +51,9 @@ pub const fn birth_frozen(birth: u16) -> bool {
     birth == BIRTH_FROZEN
 }
 
+/// `ADMITTED` cells: one per-CPU u64 summed by userspace.
+pub const ADMITTED_ENTRIES: u32 = 1;
+
 /// Per-key aggregate. `count` saturates (never wraps);
 /// `first_ns`/`last_ns` are `bpf_ktime_get_ns` window bounds, NOT
 /// latency (latency is v2+). 24 bytes, align 8.

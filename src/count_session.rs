@@ -88,6 +88,8 @@ pub struct DrainedCounts {
     pub rows: Vec<(u64, CountValue)>,
     /// Monotonic `DROPFAIL` total (map-full insert failures).
     pub dropfail_total: u64,
+    /// Monotonic `ADMITTED` total (every hit past TARGET + window).
+    pub admitted_total: u64,
     /// Keys left unprocessed when the drain deadline expired.
     pub shortfall: u64,
 }
@@ -373,6 +375,10 @@ pub struct CountSession<B: CountBackend> {
     /// would race in-flight increments).
     seen: HashMap<(u32, u32), u64>,
     last_dropfail: u64,
+    /// Cumulative admitted hits across drains (delta-read like
+    /// `dropfail`, from `DrainedCounts.admitted_total`).
+    admitted: u64,
+    last_admitted: u64,
     generation: u32,
     window_open: bool,
     closed: bool,
@@ -405,6 +411,8 @@ impl<B: CountBackend> CountSession<B> {
             retired: HashMap::new(),
             seen: HashMap::new(),
             last_dropfail: 0,
+            admitted: 0,
+            last_admitted: 0,
             generation: 0,
             window_open: false,
             closed: false,
@@ -911,6 +919,13 @@ impl<B: CountBackend> CountSession<B> {
                 self.shortfall,
             ),
             counter(
+                "count.ledger_admitted",
+                CounterKind::Activity,
+                CounterUnits::Calls,
+                CounterSource::KernelMap,
+                self.admitted,
+            ),
+            counter(
                 "count.missed_attaches",
                 CounterKind::Loss,
                 CounterUnits::Sites,
@@ -946,6 +961,40 @@ impl<B: CountBackend> CountSession<B> {
                 self.drained_keys,
             ),
         ];
+        // Independent-ledger reconciliation (c6): every admitted
+        // hit must account into routed calls (current + fenced +
+        // unattributed) or map-full drops. `stale_events` is a
+        // memo, not additive (stragglers already fold into their
+        // fenced bucket at route). Under drain shortfall the
+        // unread keys' calls are unknowable — the gap stays open
+        // as Activity, never forced to zero, never a silent Loss.
+        let mut routed: u64 = self.unattributed;
+        for exec in &current {
+            routed = routed.saturating_add(exec.calls);
+        }
+        for fenced in &self.fenced {
+            for exec in &fenced.sites {
+                routed = routed.saturating_add(exec.calls);
+            }
+        }
+        let accounted = routed.saturating_add(self.dropfail);
+        if self.shortfall == 0 {
+            counters.push(counter(
+                "count.ledger_delta",
+                CounterKind::Loss,
+                CounterUnits::Calls,
+                CounterSource::Drain,
+                self.admitted.abs_diff(accounted),
+            ));
+        } else {
+            counters.push(counter(
+                "count.ledger_unreconciled",
+                CounterKind::Activity,
+                CounterUnits::Calls,
+                CounterSource::Drain,
+                self.admitted.saturating_sub(accounted),
+            ));
+        }
         counters.extend(self.passthrough.iter().cloned());
         counters.sort();
         self.closed = true;
@@ -1041,6 +1090,8 @@ impl<B: CountBackend> CountSession<B> {
         }
         self.dropfail += drained.dropfail_total.saturating_sub(self.last_dropfail);
         self.last_dropfail = drained.dropfail_total;
+        self.admitted += drained.admitted_total.saturating_sub(self.last_admitted);
+        self.last_admitted = drained.admitted_total;
         self.shortfall += drained.shortfall;
         progress
     }
@@ -1071,6 +1122,7 @@ pub struct FakeCountBackend {
     attached: HashMap<u32, (String, u64)>,
     ledger: HashMap<(u32, u32), CountValue>,
     dropfail: u64,
+    admitted: u64,
     capacity: usize,
     poison: HashSet<u64>,
     shortfall_hook: u64,
@@ -1088,6 +1140,7 @@ impl FakeCountBackend {
             attached: HashMap::new(),
             ledger: HashMap::new(),
             dropfail: 0,
+            admitted: 0,
             capacity: usize::MAX,
             poison: HashSet::new(),
             shortfall_hook: 0,
@@ -1136,6 +1189,9 @@ impl FakeCountBackend {
         if !self.open || u64::from(tgid) != self.tgid {
             return;
         }
+        // Independent ledger: every hit admitted past the window +
+        // target guards, including map-full drops below.
+        self.admitted = self.admitted.saturating_add(n);
         let key = (cookie, self.generation);
         if let Some(slot) = self.ledger.get_mut(&key) {
             slot.count = slot.count.saturating_add(n);
@@ -1159,6 +1215,12 @@ impl FakeCountBackend {
                 last_ns: now_ns,
             },
         );
+    }
+
+    /// Independent admitted-hits total (test oracle for the
+    /// `count.ledger_*` reconciliation).
+    pub fn admitted_ledger(&self) -> u64 {
+        self.admitted
     }
 
     /// Independent ledger total for one (cookie, generation).
@@ -1274,6 +1336,7 @@ impl CountBackend for FakeCountBackend {
         Ok(DrainedCounts {
             rows,
             dropfail_total: self.dropfail,
+            admitted_total: self.admitted,
             shortfall,
         })
     }
@@ -1418,6 +1481,7 @@ impl CountBackend for LiveBackend {
         let mut out = DrainedCounts {
             rows: Vec::new(),
             dropfail_total: 0,
+            admitted_total: 0,
             shortfall: 0,
         };
         let counts = dup("COUNTS")?;
@@ -1461,7 +1525,16 @@ impl CountBackend for LiveBackend {
             let per_cpu = r.map_err(|e| anyhow::anyhow!("DROPFAIL iter: {e}"))?;
             total_drop += per_cpu.iter().sum::<u64>();
         }
+        let admitted = dup("ADMITTED")?;
+        let admitted = aya::maps::PerCpuArray::<_, u64>::try_from(admitted)
+            .map_err(|e| anyhow::anyhow!("ADMITTED typed: {e}"))?;
+        let mut total_admitted = 0u64;
+        for r in admitted.iter() {
+            let per_cpu = r.map_err(|e| anyhow::anyhow!("ADMITTED iter: {e}"))?;
+            total_admitted += per_cpu.iter().sum::<u64>();
+        }
         out.dropfail_total = total_drop;
+        out.admitted_total = total_admitted;
         Ok(out)
     }
 }
@@ -1517,6 +1590,25 @@ mod tests {
         assert_eq!(normalize_bad(vec![2, 0, 2], 3), vec![true, false, true]);
         assert_eq!(normalize_bad(vec![9], 1), vec![false]);
         assert_eq!(normalize_bad(vec![0, 1, 2], 2), vec![true, true]);
+    }
+
+    #[test]
+    fn admitted_spec_mirrors_dropfail_percpu_array() {
+        // ADMITTED is drained exactly like DROPFAIL (per-CPU u64
+        // array): the loader specs must agree on type and dims or
+        // the live drain misreads the map. RED: ADMITTED unnamed.
+        let spec = |name: &str| {
+            crate::loader::COUNT_MAPS
+                .iter()
+                .find(|m| m.name == name)
+                .unwrap_or_else(|| panic!("COUNT_MAPS names {name}"))
+        };
+        let drops = spec("DROPFAIL");
+        let adm = spec("ADMITTED");
+        assert_eq!(adm.map_type, drops.map_type);
+        assert_eq!(adm.key_size, drops.key_size);
+        assert_eq!(adm.value_size, drops.value_size);
+        assert_eq!(adm.max_entries, 1);
     }
 
     #[test]

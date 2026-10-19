@@ -110,7 +110,7 @@ fn map_inventory_matches_sources() {
     );
     assert_eq!(
         src_count.len(),
-        5,
+        6,
         "unexpected count map count: {src_count:?}"
     );
     // Stage D dropped PENDING (members read SCAN — R18 §6.1);

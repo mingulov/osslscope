@@ -410,6 +410,139 @@ fn per_key_threaded_counts() {
 }
 
 #[test]
+fn ledger_admitted_reconciles_to_zero() {
+    // c6 independent physical ledger: every admitted hit accounts
+    // into routed calls or map-full drops — the reconciliation
+    // delta is exactly zero on a clean window.
+    const KEYS: usize = 4;
+    const PER_KEY: u64 = 250;
+    let stage = Stage::fresh("ledger-clean");
+    let bytes = self_bytes();
+    let offs = x_offsets(&bytes, KEYS);
+    let a = stage.write("prov.so", &bytes);
+    let live = vec![mapping(&a)];
+    let files = HashMap::from([(
+        a.path.clone(),
+        plan::FileBytes {
+            bytes: std::fs::read(&a.path).unwrap().into(),
+            dev: a.device,
+            ino: a.ino,
+        },
+    )]);
+    let mut s = session_with(FakeCountBackend::new());
+    let d = CountDelta {
+        discovered: offs
+            .iter()
+            .enumerate()
+            .map(|(i, off)| site(&a, *off, 7 + i as u32))
+            .collect(),
+        losses: Vec::new(),
+    };
+    s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
+    let cookies: Vec<u32> = offs
+        .iter()
+        .map(|off| s.cookie_for(a.device, a.ino, *off).unwrap())
+        .collect();
+    s.open_window(1000, 2000).unwrap();
+    for (k, cookie) in cookies.iter().enumerate() {
+        for m in 0..PER_KEY {
+            let now = 1000 + ((m * 17 + k as u64 * 7) % 999);
+            s.backend_mut().fire(PID, *cookie, now, 1);
+        }
+    }
+    let expect = KEYS as u64 * PER_KEY;
+    assert_eq!(s.backend().admitted_ledger(), expect);
+    let drain = s.close_and_drain(Duration::from_secs(5)).unwrap();
+    assert_eq!(drain.total_calls(), expect);
+    assert_eq!(counter_value(&drain, "count.ledger_admitted"), Some(expect));
+    assert_eq!(counter_value(&drain, "count.ledger_delta"), Some(0));
+}
+
+#[test]
+fn ledger_delta_sounds_on_unaccounted_admission() {
+    // The ledger is INDEPENDENT of the routed rows: a row that
+    // bypasses admission (inject_row models a backend anomaly)
+    // sounds count.ledger_delta instead of vanishing.
+    let stage = Stage::fresh("ledger-anomaly");
+    let bytes = self_bytes();
+    let offs = x_offsets(&bytes, 1);
+    let a = stage.write("prov.so", &bytes);
+    let live = vec![mapping(&a)];
+    let files = HashMap::from([(
+        a.path.clone(),
+        plan::FileBytes {
+            bytes: std::fs::read(&a.path).unwrap().into(),
+            dev: a.device,
+            ino: a.ino,
+        },
+    )]);
+    let mut s = session_with(FakeCountBackend::new());
+    let d = CountDelta {
+        discovered: vec![site(&a, offs[0], 7)],
+        losses: Vec::new(),
+    };
+    s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
+    let cookie = s.cookie_for(a.device, a.ino, offs[0]).unwrap();
+    s.open_window(1000, 2000).unwrap();
+    s.backend_mut().fire(PID, cookie, 1500, 10);
+    s.backend_mut().inject_row(
+        cookie,
+        0,
+        osslscope_ebpf_common::CountValue {
+            count: 5,
+            first_ns: 1500,
+            last_ns: 1500,
+        },
+    );
+    let drain = s.close_and_drain(Duration::from_secs(5)).unwrap();
+    assert_eq!(drain.total_calls(), 15);
+    assert_eq!(counter_value(&drain, "count.ledger_admitted"), Some(10));
+    assert_eq!(counter_value(&drain, "count.ledger_delta"), Some(5));
+}
+
+#[test]
+fn ledger_unreconciled_under_shortfall() {
+    // Under drain shortfall the unread keys' calls are unknowable:
+    // no count.ledger_delta Loss is emitted (it would be a lie);
+    // the open gap stays visible as count.ledger_unreconciled.
+    let stage = Stage::fresh("ledger-shortfall");
+    let bytes = self_bytes();
+    let offs = x_offsets(&bytes, 2);
+    let a = stage.write("prov.so", &bytes);
+    let live = vec![mapping(&a)];
+    let files = HashMap::from([(
+        a.path.clone(),
+        plan::FileBytes {
+            bytes: std::fs::read(&a.path).unwrap().into(),
+            dev: a.device,
+            ino: a.ino,
+        },
+    )]);
+    let mut s = session_with(FakeCountBackend::new());
+    let d = CountDelta {
+        discovered: offs.iter().map(|off| site(&a, *off, 7)).collect(),
+        losses: Vec::new(),
+    };
+    s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
+    let mut opened = false;
+    for off in &offs {
+        let cookie = s.cookie_for(a.device, a.ino, *off).unwrap();
+        if !opened {
+            assert!(s.open_window(1000, 2000).is_ok());
+            opened = true;
+        } else {
+            s.open_window(1000, 2000).unwrap_or(());
+        }
+        s.backend_mut().fire(PID, cookie, 1500, 10);
+    }
+    s.backend_mut().set_shortfall(2);
+    let drain = s.close_and_drain(Duration::from_secs(5)).unwrap();
+    assert_eq!(counter_value(&drain, "count.drain_shortfall"), Some(2));
+    assert_eq!(counter_value(&drain, "count.ledger_delta"), None);
+    assert!(counter_value(&drain, "count.ledger_unreconciled").is_some());
+}
+
+#[test]
 fn kernel_source_enforces_window() {
     // Tripwire, not execution proof (same precedent as the privacy
     // source-shape pins): the BPF program must declare the WINDOW
@@ -1267,6 +1400,9 @@ fn close_quiesce_recovers_row_landing_mid_drain() {
     assert_eq!(counter_value(&drain, "count.drain_shortfall"), Some(0));
     assert_eq!(counter_value(&drain, "count.unattributed"), Some(0));
     assert_eq!(counter_value(&drain, "count.map_insert_dropped"), Some(0));
+    // c6: the mid-drain injected row bypasses admission (5
+    // admitted, 7 routed) — the anomaly hook sounds the delta.
+    assert_eq!(counter_value(&drain, "count.ledger_delta"), Some(2));
 }
 
 #[test]
