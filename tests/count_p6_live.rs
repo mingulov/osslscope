@@ -243,13 +243,11 @@ fn build_prov(dir: &Path, file: &str, lower: &str, upper: &str, provider: &str, 
 ///
 /// The target libcrypto is named explicitly (`--provider` +
 /// `--builtin`): pre-exec auto-discovery predicts "no NEEDED
-/// libcrypto" for the vehicle shape (observed `sh -c ...` resolves
-/// to /usr/sbin/sh; the python grandchild dlopens libcrypto at
-/// runtime, so it links none either) and refuses the exe with exit
-/// 4. In-guest `doctor --exe` on both shapes verdicts FAIL-CLOSED;
-/// an explicit-provider probe over `sh -c` reaches INSPECT via
-/// symtab. Explicit provider is the product-sanctioned path
-/// (`docs/usage.md`); all leg assertions are unaffected.
+/// libcrypto" for the vehicle shape (python3 dlopens libcrypto
+/// at runtime via ctypes, so it links none) and refuses the exe
+/// with exit 4 (diag1: `doctor --exe` verdicts FAIL-CLOSED).
+/// Explicit provider is the product-sanctioned path
+/// (`docs/usage.md`).
 ///
 /// The vehicle runs as the DIRECT observed child (`python3 ...`,
 /// no `sh -c`): the product ignores fork/exec grandchildren
