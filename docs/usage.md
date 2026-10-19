@@ -72,6 +72,9 @@ osslscope report --format json --out report.json --cbom bom.json run -- ./my-app
   for the remaining child-side stdio-redirect failures. A
   nonzero child exit without a destination prints one re-run hint
   line (exit + `--workload-out FILE`) and no workload bytes.
+  Future rejection of shared-fd sinks is a separate policy change
+  (announced, versioned, with a migration path) — never a silent
+  fix. No v0.2 change rejects them.
   `run --` predicts the target libcrypto pre-exec from the
   exe's `DT_NEEDED` closure plus loader search
   (`LD_LIBRARY_PATH`, rpath/runpath, system defaults);
