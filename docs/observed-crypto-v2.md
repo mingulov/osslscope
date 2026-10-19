@@ -490,3 +490,18 @@ when unrecorded); the human report always renders the three
 context lines, with explicit `unknown`s when unrecorded. CLI
 wiring examples stay with T10; no command above was run against
 a live target for this document.
+
+## Accepted R19 residuals (v0.2)
+
+- Tainted+Proven beyond-T recovery findings (rereview5 concern 4):
+  keeping uncertain positive evidence is deliberate conservative
+  recovery (`oracle.rs` retention policy; final P-review: no-action).
+  Emits recovery findings without restoring Complete.
+- Real-traffic Complete adaptation without live proof (concern 5):
+  execution adaptation was removed; native traversal evidence is
+  retained instead. Broader real-traffic qualification stays with
+  the live suite (R21/R21b: F4 collapse re-gated live, attempt-4).
+- Per-op TRUNC unattributability with live T+1, cache-write-after-take,
+  settle-poll strands, and drain_batch ordering (concerns 1-3) were
+  routed load-bearing (R34-R36) and closed in the fix wave — see the
+  scan_oracle control battery, not this note.
