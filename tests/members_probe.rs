@@ -5817,6 +5817,37 @@ fn d_drain_floor() {
     assert_loss_zero(loaded);
 }
 
+/// Lane-calibrated teardown budget (v0.2): 512-link attach +
+/// drop. R21 95.324+0.376 s FAIL vs R21b 53.50+0.11 s PASS on
+/// the same lane/image; the fedora 7-run splits and the
+/// recomputation are in the commit message. Default 360 s =
+/// max(120, round_up_30(2 * 165.1)); override per lane via
+/// OSSLSCOPE_DETACH_BUDGET_SECS (floor 60 s).
+const DEFAULT_DETACH_BUDGET_SECS: u64 = 360;
+
+fn detach_budget_secs(raw: Option<&str>) -> u64 {
+    raw.and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_DETACH_BUDGET_SECS)
+        .max(60)
+}
+
+fn detach_budget() -> std::time::Duration {
+    std::time::Duration::from_secs(detach_budget_secs(
+        std::env::var("OSSLSCOPE_DETACH_BUDGET_SECS")
+            .ok()
+            .as_deref(),
+    ))
+}
+
+#[test]
+fn detach_budget_parser_pins() {
+    assert_eq!(detach_budget_secs(None), 360);
+    assert_eq!(detach_budget_secs(Some("90")), 90);
+    assert_eq!(detach_budget_secs(Some("30")), 60);
+    assert_eq!(detach_budget_secs(Some("abc")), 360);
+    assert_eq!(detach_budget_secs(Some("")), 360);
+}
+
 /// Teardown wall live (item 7 resource): attach + drop of all 513
 /// links completes (hang-guard bound — P9 tightens from lane
 /// evidence; the measured split is reported for the record).
@@ -5837,9 +5868,10 @@ fn d_detach_wall() {
     drop(attached);
     let detach_dt = t1.elapsed();
     eprintln!("detach-wall: attach {attach_dt:?}, detach {detach_dt:?}");
+    let budget = detach_budget();
     assert!(
-        attach_dt + detach_dt < std::time::Duration::from_secs(60),
-        "detach-wall: attach+detach {attach_dt:?}+{detach_dt:?} exceeds hang-guard 60s"
+        attach_dt + detach_dt < budget,
+        "detach-wall: attach+detach {attach_dt:?}+{detach_dt:?} exceeds lane budget {budget:?} (override OSSLSCOPE_DETACH_BUDGET_SECS)"
     );
 }
 
