@@ -90,6 +90,13 @@
       "query_offset": 2401648,
       "anchor": "OSSL_PROVIDER_available",
       "anchor_offset": 2401216
+    },
+    {
+      "build_id": "29f37f118914c04b276fbff66f3f9963a6b7f326",
+      "openssl": "3.5.9",
+      "query_offset": 2469008,
+      "anchor": "OSSL_PROVIDER_available",
+      "anchor_offset": 2468608
     }
   ],
   "fallback": [

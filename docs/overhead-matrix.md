@@ -37,6 +37,7 @@ relative budget would be unachievable by construction.)
 | Arch rolling | 7.2 | 3.6 | 0.8-1.4 us | 1.44 us / 0.90x | PASS |
 | openSUSE Tumbleweed | 7.2 | 3.5 | 0.8-0.9 us | 3.37 us / 0.54x | PASS |
 | Alpine 3.24 (musl) | 6.18-lts | 4.0 | 0.8-3.1 us | 1.08 us / 1.02x | PASS |
+| Debian 13 (v0.2 profile B) | 6.12.107+deb13-cloud-amd64 | 3.5 (/opt source 3.5.9) | n/a (enrollment profile, no overhead lane) | n/a | RECORDED: profile legs green; /opt build enrolled as table entry 11; system libcrypto unenrolled (stripped, anchor-unresolved stays honest) |
 
 Overhead is GREEN on 7 of 8 platforms; the worst passing absolute
 cell is the Alpine 504-entry attach shape at 3.14 us, inside the
