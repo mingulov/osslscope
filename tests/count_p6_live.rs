@@ -4,9 +4,11 @@
 //! One observed process loads provider A (8 digest algs), executes
 //! EVP digests through it, unloads it, then loads provider B (16
 //! algs) and executes through that. The doc must version the
-//! replacement: fenced gen 0 keeps A's exact candidate meaning
-//! (no relabel — compared against a pure-A reference run),
-//! current carries B, ledger clean, A/A swap rerun exact.
+//! replacement: the A-fenced generation (unique non-empty fenced
+//! gen, latest version — startup fences precede it empty) keeps A's
+//! exact candidate meaning (no relabel vs the pure-A reference);
+//! swap current carries B's distinct meaning; ledger clean; swap
+//! rerun exact.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -338,9 +340,11 @@ fn counter(doc: &serde_json::Value, name: &str) -> Option<u64> {
         .and_then(|c| c["value"].as_u64())
 }
 
-/// P6 live: A->B replacement versions; fenced gen 0 keeps A's exact
-/// candidate meaning (no relabel vs the pure-A reference); current
-/// carries B; ledger clean; swap rerun exact.
+/// P6 live: A->B replacement versions; the A-fenced generation
+/// (unique non-empty fenced gen — fence numbers are product
+/// internals, V2-39) keeps A's exact candidate meaning (no relabel
+/// vs the pure-A reference); current carries B's distinct meaning;
+/// ledger clean; swap rerun exact.
 #[test]
 #[ignore = "live lane only (needs caps + /opt/openssl-live + OSSL_P6_LIVE=1)"]
 fn p6_live_replacement_keeps_old_meaning() {
@@ -379,19 +383,41 @@ fn p6_live_replacement_keeps_old_meaning() {
         doc_s["completeness"]["status"],
         doc_s["completeness"]["reasons"],
     );
-    let gen0 = fenced
+    // Pre-query fences (Exec + libcrypto map-in) are always empty when
+    // discovery starts blind (diag5: gens 0/1 empty); the A-fenced
+    // generation is the unique non-empty one and the latest version.
+    // Fence numbers are product internals, never content slots (V2-39).
+    let nonempty: Vec<&serde_json::Value> = fenced
         .iter()
-        .find(|g| g["generation"] == 0)
-        .expect("gen 0 sealed");
+        .filter(|g| {
+            !g["sites"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .is_empty()
+        })
+        .collect();
     assert_eq!(
-        candidates_multiset(&gen0["sites"]),
-        candidates_multiset(&doc_a["sites"]),
-        "fenced gen 0 must keep A's exact candidate meaning (no relabel)"
+        nonempty.len(),
+        1,
+        "expected exactly one non-empty fenced generation, saw {fenced:?}"
+    );
+    let agen = nonempty[0];
+    let max_gen = fenced.iter().filter_map(|g| g["generation"].as_u64()).max();
+    assert_eq!(
+        agen["generation"].as_u64(),
+        max_gen,
+        "A-fenced generation must be the latest fenced version"
     );
     assert_eq!(
-        gen0["sites"].as_array().map(|s| s.len()),
+        candidates_multiset(&agen["sites"]),
+        candidates_multiset(&doc_a["sites"]),
+        "fenced A-generation must keep A's exact candidate meaning (no relabel)"
+    );
+    assert_eq!(
+        agen["sites"].as_array().map(|s| s.len()),
         doc_a["sites"].as_array().map(|s| s.len()),
-        "fenced gen 0 must keep A's 8-site shape"
+        "fenced A-generation must keep A's site shape"
     );
     assert!(
         !doc_s["sites"]
@@ -400,6 +426,11 @@ fn p6_live_replacement_keeps_old_meaning() {
             .unwrap_or_default()
             .is_empty(),
         "swap run current (B phase) is empty"
+    );
+    assert_ne!(
+        candidates_multiset(&doc_s["sites"]),
+        candidates_multiset(&doc_a["sites"]),
+        "swap current must carry B's meaning, distinct from A's reference"
     );
     assert_eq!(counter(&doc_s, "count.ledger_delta"), Some(0));
     assert_eq!(counter(&doc_a, "count.ledger_delta"), Some(0));
