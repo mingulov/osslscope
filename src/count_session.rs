@@ -1121,6 +1121,10 @@ pub struct FakeCountBackend {
     open: bool,
     attached: HashMap<u32, (String, u64)>,
     ledger: HashMap<(u32, u32), CountValue>,
+    /// Per-CPU slots `(cpu, cookie, generation)`: the N-CPU
+    /// fan-out model, folded per key at drain like the kernel
+    /// per-CPU slots composed by the userspace fold.
+    cpu_slots: HashMap<(u32, u32, u32), CountValue>,
     dropfail: u64,
     admitted: u64,
     capacity: usize,
@@ -1139,6 +1143,7 @@ impl FakeCountBackend {
             open: false,
             attached: HashMap::new(),
             ledger: HashMap::new(),
+            cpu_slots: HashMap::new(),
             dropfail: 0,
             admitted: 0,
             capacity: usize::MAX,
@@ -1217,6 +1222,44 @@ impl FakeCountBackend {
         );
     }
 
+    /// Model a hit landing on one CPU's slot (N-CPU fan-out
+    /// model): same admission guards as [`fire`](Self::fire),
+    /// recorded per CPU and folded at drain. Capacity counts
+    /// distinct (cookie, generation) keys across both stores.
+    pub fn fire_cpu(&mut self, cpu: u32, tgid: u32, cookie: u32, now_ns: u64, n: u64) {
+        if n == 0 {
+            return;
+        }
+        if now_ns < self.start_ns || now_ns >= self.deadline_ns {
+            return;
+        }
+        if !self.open || u64::from(tgid) != self.tgid {
+            return;
+        }
+        self.admitted = self.admitted.saturating_add(n);
+        let key = (cpu, cookie, self.generation);
+        if let Some(slot) = self.cpu_slots.get_mut(&key) {
+            slot.count = slot.count.saturating_add(n);
+            slot.first_ns = slot.first_ns.min(now_ns);
+            slot.last_ns = slot.last_ns.max(now_ns);
+            return;
+        }
+        let mut keys: HashSet<(u32, u32)> = self.ledger.keys().copied().collect();
+        keys.extend(self.cpu_slots.keys().map(|(_, c, g)| (*c, *g)));
+        if keys.len() >= self.capacity {
+            self.dropfail = self.dropfail.saturating_add(n);
+            return;
+        }
+        self.cpu_slots.insert(
+            key,
+            CountValue {
+                count: n,
+                first_ns: now_ns,
+                last_ns: now_ns,
+            },
+        );
+    }
+
     /// Independent admitted-hits total (test oracle for the
     /// `count.ledger_*` reconciliation).
     pub fn admitted_ledger(&self) -> u64 {
@@ -1225,10 +1268,17 @@ impl FakeCountBackend {
 
     /// Independent ledger total for one (cookie, generation).
     pub fn ledger_total(&self, cookie: u32, generation: u32) -> u64 {
-        self.ledger
+        let mut total = self
+            .ledger
             .get(&(cookie, generation))
             .map(|v| v.count)
-            .unwrap_or(0)
+            .unwrap_or(0);
+        for ((_, c, g), v) in self.cpu_slots.iter() {
+            if (*c, *g) == (cookie, generation) {
+                total = total.saturating_add(v.count);
+            }
+        }
+        total
     }
 
     /// Inject a raw ledger row, bypassing admission (models a hit the
@@ -1325,11 +1375,22 @@ impl CountBackend for FakeCountBackend {
     fn drain(&mut self, _deadline: Option<Instant>) -> anyhow::Result<DrainedCounts> {
         // Host double drains instantly; grace-expiry shortfall is
         // scripted through `set_shortfall` instead.
-        let mut rows: Vec<(u64, CountValue)> = self
-            .ledger
-            .iter()
-            .filter(|(_, v)| v.count > 0)
-            .map(|((cookie, generation), v)| (make_key(*cookie, *generation), *v))
+        let mut folded: HashMap<(u32, u32), CountValue> = HashMap::new();
+        for ((cookie, generation), v) in self.ledger.iter() {
+            if v.count == 0 {
+                continue;
+            }
+            folded.entry((*cookie, *generation)).or_default().fold(v);
+        }
+        for ((_, cookie, generation), v) in self.cpu_slots.iter() {
+            if v.count == 0 {
+                continue;
+            }
+            folded.entry((*cookie, *generation)).or_default().fold(v);
+        }
+        let mut rows: Vec<(u64, CountValue)> = folded
+            .into_iter()
+            .map(|((cookie, generation), v)| (make_key(cookie, generation), v))
             .collect();
         rows.sort_by_key(|(k, _)| *k);
         let shortfall = std::mem::take(&mut self.shortfall_hook);

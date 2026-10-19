@@ -543,6 +543,296 @@ fn ledger_unreconciled_under_shortfall() {
 }
 
 #[test]
+fn hot_key_concentration_exact() {
+    // c6 hot-key conservation: one 100k hot key plus cold keys —
+    // every per-key total and the grand total exact, ledger silent.
+    const COLD: usize = 7;
+    const HOT_N: u64 = 100_000;
+    const COLD_N: u64 = 13;
+    let stage = Stage::fresh("hotkey");
+    let bytes = self_bytes();
+    let offs = x_offsets(&bytes, 1 + COLD);
+    let a = stage.write("prov.so", &bytes);
+    let live = vec![mapping(&a)];
+    let files = HashMap::from([(
+        a.path.clone(),
+        plan::FileBytes {
+            bytes: std::fs::read(&a.path).unwrap().into(),
+            dev: a.device,
+            ino: a.ino,
+        },
+    )]);
+    let mut s = session_with(FakeCountBackend::new());
+    let d = CountDelta {
+        discovered: offs
+            .iter()
+            .enumerate()
+            .map(|(i, off)| site(&a, *off, 7 + i as u32))
+            .collect(),
+        losses: Vec::new(),
+    };
+    s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
+    let cookies: Vec<u32> = offs
+        .iter()
+        .map(|off| s.cookie_for(a.device, a.ino, *off).unwrap())
+        .collect();
+    s.open_window(1000, 2000).unwrap();
+    for m in 0..HOT_N {
+        s.backend_mut().fire(PID, cookies[0], 1000 + (m % 999), 1);
+    }
+    for (k, cookie) in cookies.iter().enumerate().skip(1) {
+        for m in 0..COLD_N {
+            s.backend_mut()
+                .fire(PID, *cookie, 1000 + ((m * 17 + k as u64) % 999), 1);
+        }
+    }
+    let drain = s.close_and_drain(Duration::from_secs(5)).unwrap();
+    let by_offset: HashMap<u64, u64> = drain
+        .current
+        .iter()
+        .map(|e| (e.site.offset, e.calls))
+        .collect();
+    assert_eq!(by_offset.get(&offs[0]), Some(&HOT_N));
+    for off in offs.iter().skip(1) {
+        assert_eq!(by_offset.get(off), Some(&COLD_N));
+    }
+    assert_eq!(drain.total_calls(), HOT_N + COLD as u64 * COLD_N);
+    assert_eq!(counter_value(&drain, "count.ledger_delta"), Some(0));
+}
+
+#[test]
+fn fanout_eight_cpus_fold_exact() {
+    // c6 >2-CPU fan-out fold: 8 CPUs x 6 keys land in per-CPU
+    // slots and fold to exact per-key totals with in-window
+    // bounds. Compile-RED: fire_cpu is new this task.
+    const CPUS: u32 = 8;
+    const KEYS: usize = 6;
+    const PER_CPU_PER_KEY: u64 = 250;
+    let stage = Stage::fresh("fanout8");
+    let bytes = self_bytes();
+    let offs = x_offsets(&bytes, KEYS);
+    let a = stage.write("prov.so", &bytes);
+    let live = vec![mapping(&a)];
+    let files = HashMap::from([(
+        a.path.clone(),
+        plan::FileBytes {
+            bytes: std::fs::read(&a.path).unwrap().into(),
+            dev: a.device,
+            ino: a.ino,
+        },
+    )]);
+    let mut s = session_with(FakeCountBackend::new());
+    let d = CountDelta {
+        discovered: offs
+            .iter()
+            .enumerate()
+            .map(|(i, off)| site(&a, *off, 7 + i as u32))
+            .collect(),
+        losses: Vec::new(),
+    };
+    s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
+    let cookies: Vec<u32> = offs
+        .iter()
+        .map(|off| s.cookie_for(a.device, a.ino, *off).unwrap())
+        .collect();
+    s.open_window(1000, 2000).unwrap();
+    for cpu in 0..CPUS {
+        for (k, cookie) in cookies.iter().enumerate() {
+            for m in 0..PER_CPU_PER_KEY {
+                let now = 1000 + ((cpu as u64 * 131 + m * 17 + k as u64 * 7) % 999);
+                s.backend_mut().fire_cpu(cpu, PID, *cookie, now, 1);
+            }
+        }
+    }
+    let drain = s.close_and_drain(Duration::from_secs(5)).unwrap();
+    let expect_per_key = CPUS as u64 * PER_CPU_PER_KEY;
+    let by_offset: HashMap<u64, u64> = drain
+        .current
+        .iter()
+        .map(|e| (e.site.offset, e.calls))
+        .collect();
+    assert_eq!(by_offset.len(), KEYS);
+    for off in &offs {
+        assert_eq!(by_offset.get(off), Some(&expect_per_key));
+    }
+    for exec in &drain.current {
+        assert!(exec.first_ns <= exec.last_ns);
+        assert!((1000..2000).contains(&exec.first_ns));
+    }
+    assert_eq!(drain.total_calls(), KEYS as u64 * expect_per_key);
+    for cookie in &cookies {
+        assert_eq!(s.backend().ledger_total(*cookie, 0), expect_per_key);
+    }
+    assert_eq!(counter_value(&drain, "count.ledger_delta"), Some(0));
+}
+
+#[test]
+fn fanout_mixed_fire_and_fire_cpu_conserves() {
+    // Mixed single-slot and per-CPU fires on one key sum exactly
+    // once — no double-count, no bleed into the sibling key.
+    let stage = Stage::fresh("fanout-mixed");
+    let bytes = self_bytes();
+    let offs = x_offsets(&bytes, 2);
+    let a = stage.write("prov.so", &bytes);
+    let live = vec![mapping(&a)];
+    let files = HashMap::from([(
+        a.path.clone(),
+        plan::FileBytes {
+            bytes: std::fs::read(&a.path).unwrap().into(),
+            dev: a.device,
+            ino: a.ino,
+        },
+    )]);
+    let mut s = session_with(FakeCountBackend::new());
+    let d = CountDelta {
+        discovered: offs.iter().map(|off| site(&a, *off, 7)).collect(),
+        losses: Vec::new(),
+    };
+    s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
+    let c0 = s.cookie_for(a.device, a.ino, offs[0]).unwrap();
+    let c1 = s.cookie_for(a.device, a.ino, offs[1]).unwrap();
+    s.open_window(1000, 2000).unwrap();
+    s.backend_mut().fire(PID, c0, 1500, 40);
+    s.backend_mut().fire_cpu(3, PID, c0, 1501, 60);
+    s.backend_mut().fire_cpu(7, PID, c1, 1502, 25);
+    let drain = s.close_and_drain(Duration::from_secs(5)).unwrap();
+    let by_offset: HashMap<u64, u64> = drain
+        .current
+        .iter()
+        .map(|e| (e.site.offset, e.calls))
+        .collect();
+    assert_eq!(by_offset.get(&offs[0]), Some(&100));
+    assert_eq!(by_offset.get(&offs[1]), Some(&25));
+    assert_eq!(drain.total_calls(), 125);
+    assert_eq!(s.backend().ledger_total(c0, 0), 100);
+    assert_eq!(counter_value(&drain, "count.ledger_delta"), Some(0));
+}
+
+#[test]
+fn fresh_key_churn_across_fence_conserves() {
+    // c6 fresh-key churn: 64 fresh keys fire once in gen 0 and
+    // once in gen 1 — every key totals exactly 2 across the
+    // fence, nothing relabeled, ledger silent.
+    const KEYS: usize = 64;
+    let stage = Stage::fresh("churn");
+    let bytes = self_bytes();
+    let offs = x_offsets(&bytes, KEYS);
+    let a = stage.write("prov.so", &bytes);
+    let live = vec![mapping(&a)];
+    let files = HashMap::from([(
+        a.path.clone(),
+        plan::FileBytes {
+            bytes: std::fs::read(&a.path).unwrap().into(),
+            dev: a.device,
+            ino: a.ino,
+        },
+    )]);
+    let mut s = session_with(FakeCountBackend::new());
+    let d = CountDelta {
+        discovered: offs
+            .iter()
+            .enumerate()
+            .map(|(i, off)| site(&a, *off, 7 + i as u32))
+            .collect(),
+        losses: Vec::new(),
+    };
+    s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
+    let cookies: Vec<u32> = offs
+        .iter()
+        .map(|off| s.cookie_for(a.device, a.ino, *off).unwrap())
+        .collect();
+    s.open_window(1000, 3000).unwrap();
+    for (k, cookie) in cookies.iter().enumerate() {
+        s.backend_mut().fire(PID, *cookie, 1100 + k as u64, 1);
+    }
+    s.fence(osslscope::count_session::FenceReason::MappingsChanged)
+        .unwrap();
+    for (k, cookie) in cookies.iter().enumerate() {
+        s.backend_mut().fire(PID, *cookie, 2100 + k as u64, 1);
+    }
+    let drain = s.close_and_drain(Duration::from_secs(5)).unwrap();
+    assert_eq!(drain.fenced.len(), 1);
+    assert_eq!(drain.fenced[0].generation, 0);
+    let fenced_calls: u64 = drain.fenced[0].sites.iter().map(|e| e.calls).sum();
+    let current_calls: u64 = drain.current.iter().map(|e| e.calls).sum();
+    assert_eq!(fenced_calls, KEYS as u64);
+    assert_eq!(current_calls, KEYS as u64);
+    assert_eq!(drain.total_calls(), 2 * KEYS as u64);
+    for exec in drain.fenced[0].sites.iter().chain(drain.current.iter()) {
+        assert_eq!(exec.calls, 1);
+    }
+    assert_eq!(counter_value(&drain, "count.ledger_delta"), Some(0));
+}
+
+#[test]
+fn per_key_conservation_across_two_fences() {
+    // Per-key totals stay exact across two fences with distinct
+    // per-generation counts (10/20/30 per key).
+    const KEYS: usize = 4;
+    let stage = Stage::fresh("two-fences");
+    let bytes = self_bytes();
+    let offs = x_offsets(&bytes, KEYS);
+    let a = stage.write("prov.so", &bytes);
+    let live = vec![mapping(&a)];
+    let files = HashMap::from([(
+        a.path.clone(),
+        plan::FileBytes {
+            bytes: std::fs::read(&a.path).unwrap().into(),
+            dev: a.device,
+            ino: a.ino,
+        },
+    )]);
+    let mut s = session_with(FakeCountBackend::new());
+    let d = CountDelta {
+        discovered: offs
+            .iter()
+            .enumerate()
+            .map(|(i, off)| site(&a, *off, 7 + i as u32))
+            .collect(),
+        losses: Vec::new(),
+    };
+    s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
+    let cookies: Vec<u32> = offs
+        .iter()
+        .map(|off| s.cookie_for(a.device, a.ino, *off).unwrap())
+        .collect();
+    s.open_window(1000, 4000).unwrap();
+    for (round, n) in [10u64, 20, 30].into_iter().enumerate() {
+        for (k, cookie) in cookies.iter().enumerate() {
+            let now = 1100 + round as u64 * 1000 + k as u64;
+            s.backend_mut().fire(PID, *cookie, now, n);
+        }
+        if round < 2 {
+            s.fence(osslscope::count_session::FenceReason::MappingsChanged)
+                .unwrap();
+        }
+    }
+    let drain = s.close_and_drain(Duration::from_secs(5)).unwrap();
+    assert_eq!(drain.fenced.len(), 2);
+    for (g, expect) in [(0usize, 10u64), (1, 20)] {
+        assert_eq!(drain.fenced[g].generation, g as u32);
+        let by_offset: HashMap<u64, u64> = drain.fenced[g]
+            .sites
+            .iter()
+            .map(|e| (e.site.offset, e.calls))
+            .collect();
+        for off in &offs {
+            assert_eq!(by_offset.get(off), Some(&expect));
+        }
+    }
+    let by_offset: HashMap<u64, u64> = drain
+        .current
+        .iter()
+        .map(|e| (e.site.offset, e.calls))
+        .collect();
+    for off in &offs {
+        assert_eq!(by_offset.get(off), Some(&30));
+    }
+    assert_eq!(drain.total_calls(), KEYS as u64 * 60);
+    assert_eq!(counter_value(&drain, "count.ledger_delta"), Some(0));
+}
+
+#[test]
 fn kernel_source_enforces_window() {
     // Tripwire, not execution proof (same precedent as the privacy
     // source-shape pins): the BPF program must declare the WINDOW
