@@ -28,7 +28,7 @@ use aya_ebpf::{
     programs::ProbeContext,
     EbpfContext as _,
 };
-use osslscope_ebpf_common::{CountValue, WINDOW_CELLS, WINDOW_DEADLINE, WINDOW_START, make_key};
+use osslscope_ebpf_common::{CountValue, WINDOW_CELLS, WINDOW_DEADLINE, WINDOW_START, lat_bucket, make_key};
 
 /// `BPF_NOEXIST` for `insert` (kernel UAPI; aya-ebpf exposes no const).
 const BPF_NOEXIST: u64 = 1;
@@ -68,8 +68,18 @@ static DROPFAIL: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
 #[map]
 static ADMITTED: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
 
+/// Per-hit admitted-path probe-body latency histogram (per-CPU
+/// log2-ns buckets, `lat_bucket`): entry→exit `bpf_ktime_get_ns`
+/// delta sampled once per counted hit at the single tail.
+/// Admitted-path-only is conservative for the <=4us budget: every
+/// reject path is a strict instruction prefix of the admitted
+/// path, so the all-path median never exceeds this median.
+#[map]
+static LATC: PerCpuArray<u64> = PerCpuArray::with_max_entries(16, 0);
+
 #[uprobe]
 pub fn count_entry(ctx: ProbeContext) -> u32 {
+    let t0 = unsafe { helpers::bpf_ktime_get_ns() };
     let target = match TARGET.get(0) {
         Some(t) if *t != 0 => *t,
         _ => return 0,
@@ -125,6 +135,11 @@ pub fn count_entry(ctx: ProbeContext) -> u32 {
         bump(slot, now);
     } else {
         dropfail();
+    }
+    let dt = unsafe { helpers::bpf_ktime_get_ns() }.saturating_sub(t0);
+    if let Some(slot) = LATC.get_ptr_mut(lat_bucket(dt) as u32) {
+        let c = unsafe { &mut *slot };
+        *c = c.saturating_add(1);
     }
     0
 }

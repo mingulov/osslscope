@@ -1056,6 +1056,139 @@ fn p6_impl_only_backing_replacement_never_relabels() {
 }
 
 #[test]
+fn lat_bucket_boundaries_exact() {
+    // Log2-ns buckets: k covers [2^k, 2^(k+1)); 15 clamps >=32768.
+    use osslscope_ebpf_common::lat_bucket;
+    assert_eq!(lat_bucket(0), 0);
+    assert_eq!(lat_bucket(1), 0);
+    assert_eq!(lat_bucket(2), 1);
+    assert_eq!(lat_bucket(3), 1);
+    assert_eq!(lat_bucket(2048), 11);
+    assert_eq!(lat_bucket(4000), 11, "4us budget line sits in bucket 11");
+    assert_eq!(lat_bucket(4095), 11);
+    assert_eq!(lat_bucket(4096), 12);
+    assert_eq!(lat_bucket(32767), 14);
+    assert_eq!(lat_bucket(32768), 15);
+    assert_eq!(lat_bucket(u64::MAX), 15);
+}
+
+#[test]
+fn lat_median_p99_from_buckets() {
+    // Upper-bucket-edge quantiles: 90 samples in bucket 5
+    // ([32,64)) + 10 in bucket 14 ([16384,32768)) -> median 64,
+    // p99 32768, samples 100.
+    let stage = Stage::fresh("lat-quant");
+    let bytes = self_bytes();
+    let offs = x_offsets(&bytes, 1);
+    let a = stage.write("prov.so", &bytes);
+    let live = vec![mapping(&a)];
+    let files = HashMap::from([(
+        a.path.clone(),
+        plan::FileBytes {
+            bytes: std::fs::read(&a.path).unwrap().into(),
+            dev: a.device,
+            ino: a.ino,
+        },
+    )]);
+    let mut s = session_with(FakeCountBackend::new());
+    let d = CountDelta {
+        discovered: vec![site(&a, offs[0], 7)],
+        losses: Vec::new(),
+    };
+    s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
+    let cookie = s.cookie_for(a.device, a.ino, offs[0]).unwrap();
+    s.open_window(1000, 2000).unwrap();
+    s.backend_mut().fire(PID, cookie, 1500, 10);
+    s.backend_mut().inject_latency(5, 90);
+    s.backend_mut().inject_latency(14, 10);
+    let drain = s.close_and_drain(Duration::from_secs(5)).unwrap();
+    assert_eq!(counter_value(&drain, "count.lat_samples"), Some(100));
+    assert_eq!(counter_value(&drain, "count.lat_median_ns"), Some(64));
+    assert_eq!(counter_value(&drain, "count.lat_p99_ns"), Some(32768));
+    assert_eq!(counter_value(&drain, "count.lat_bucket_05"), Some(90));
+    assert_eq!(counter_value(&drain, "count.lat_bucket_14"), Some(10));
+    assert_eq!(counter_value(&drain, "count.lat_bucket_00"), Some(0));
+}
+
+#[test]
+fn drain_stats_shape_recorded() {
+    // c8 drain/memory score shape: a clean close runs exactly 2
+    // quiesce passes (route + clean), total >= max, RSS sampled.
+    let stage = Stage::fresh("drain-stats");
+    let bytes = self_bytes();
+    let offs = x_offsets(&bytes, 2);
+    let a = stage.write("prov.so", &bytes);
+    let live = vec![mapping(&a)];
+    let files = HashMap::from([(
+        a.path.clone(),
+        plan::FileBytes {
+            bytes: std::fs::read(&a.path).unwrap().into(),
+            dev: a.device,
+            ino: a.ino,
+        },
+    )]);
+    let mut s = session_with(FakeCountBackend::new());
+    let d = CountDelta {
+        discovered: offs.iter().map(|off| site(&a, *off, 7)).collect(),
+        losses: Vec::new(),
+    };
+    s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
+    for off in &offs {
+        let cookie = s.cookie_for(a.device, a.ino, *off).unwrap();
+        s.backend_mut().fire(PID, cookie, 1500, 5);
+    }
+    s.open_window(1000, 2000).unwrap();
+    for off in &offs {
+        let cookie = s.cookie_for(a.device, a.ino, *off).unwrap();
+        s.backend_mut().fire(PID, cookie, 1500, 5);
+    }
+    let drain = s.close_and_drain(Duration::from_secs(5)).unwrap();
+    assert_eq!(drain.total_calls(), 10);
+    assert_eq!(counter_value(&drain, "count.drain_passes"), Some(2));
+    let total = counter_value(&drain, "count.drain_pass_ns_total").unwrap();
+    let max = counter_value(&drain, "count.drain_pass_ns_max").unwrap();
+    assert!(total >= max, "total {total} < max {max}");
+    assert!(counter_value(&drain, "count.drain_rss_bytes").unwrap() > 0);
+}
+
+#[test]
+fn drain_scan_tail_counts_exactly() {
+    // c8 scan-tail: an expired drain stops re-scanning after one
+    // pass (passes == 1) and the shortfall keys count exactly as
+    // shortfall — never folded, never re-added.
+    let stage = Stage::fresh("drain-tail");
+    let bytes = self_bytes();
+    let offs = x_offsets(&bytes, 2);
+    let a = stage.write("prov.so", &bytes);
+    let live = vec![mapping(&a)];
+    let files = HashMap::from([(
+        a.path.clone(),
+        plan::FileBytes {
+            bytes: std::fs::read(&a.path).unwrap().into(),
+            dev: a.device,
+            ino: a.ino,
+        },
+    )]);
+    let mut s = session_with(FakeCountBackend::new());
+    let d = CountDelta {
+        discovered: offs.iter().map(|off| site(&a, *off, 7)).collect(),
+        losses: Vec::new(),
+    };
+    s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
+    s.open_window(1000, 2000).unwrap();
+    for off in &offs {
+        let cookie = s.cookie_for(a.device, a.ino, *off).unwrap();
+        s.backend_mut().fire(PID, cookie, 1500, 10);
+    }
+    s.backend_mut().set_shortfall(3);
+    let drain = s.close_and_drain(Duration::from_secs(5)).unwrap();
+    assert_eq!(counter_value(&drain, "count.drain_passes"), Some(1));
+    assert_eq!(counter_value(&drain, "count.drain_shortfall"), Some(3));
+    assert_eq!(counter_value(&drain, "count.ledger_delta"), None);
+    assert_eq!(counter_value(&drain, "count.ledger_unreconciled"), Some(0));
+}
+
+#[test]
 fn kernel_source_enforces_window() {
     // Tripwire, not execution proof (same precedent as the privacy
     // source-shape pins): the BPF program must declare the WINDOW

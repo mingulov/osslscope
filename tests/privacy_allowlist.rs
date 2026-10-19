@@ -108,9 +108,11 @@ fn map_inventory_matches_sources() {
         14,
         "unexpected harvest map count: {src_harvest:?}"
     );
+    // Task 5 adds LATC (c8 log2-ns callback-latency histogram) — end
+    // state 7.
     assert_eq!(
         src_count.len(),
-        6,
+        7,
         "unexpected count map count: {src_count:?}"
     );
     // Stage D dropped PENDING (members read SCAN — R18 §6.1);
