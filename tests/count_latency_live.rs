@@ -375,8 +375,10 @@ fn latency_wall_ratio_recorded() {
     .unwrap();
 }
 
-/// Cold/fresh-process cost: single-op observed run completes with
-/// valid drain accounting; full wall + counters recorded.
+/// Cold/fresh-process cost: single-op run completes with valid
+/// drain accounting; full wall + counters recorded (V2-42: the
+/// single op exits before uprobes attach on this lane — sites are
+/// recorded, not required; cycles 2+3 evidence).
 #[test]
 #[ignore = "live lane only (needs caps + /opt/openssl-live + OSSL_LAT_LIVE=1)"]
 fn latency_cold_cost_recorded() {
@@ -388,14 +390,6 @@ fn latency_cold_cost_recorded() {
     let t0 = std::time::Instant::now();
     let doc = run_leg(&bin, &dir, "lat-cold", &flood, &["1", "1", "0", "sha256"]);
     let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
-    assert!(
-        !doc["sites"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-            .is_empty(),
-        "cold run observed no sites"
-    );
     let c = counters(&doc);
     assert_eq!(c.get("count.ledger_delta"), Some(&0));
     let record = serde_json::json!({
@@ -405,6 +399,7 @@ fn latency_cold_cost_recorded() {
         "drain_pass_ns_total": c.get("count.drain_pass_ns_total").copied(),
         "drain_rss_bytes": c.get("count.drain_rss_bytes").copied(),
         "status": doc["completeness"]["status"],
+        "reasons": doc["completeness"]["reasons"],
     });
     std::fs::write(
         out_dir().join("lat-cold.json"),
