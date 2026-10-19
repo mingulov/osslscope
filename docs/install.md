@@ -201,3 +201,19 @@ rm -rf "$HOME/.local/bin/osslscope" "$HOME/.local/lib/osslscope" \
 
 The last line removes a default-prefix local install; adjust paths
 for a custom `--prefix`.
+
+## Frozen object roles (v0.2, Decision 8R)
+
+Traversal COEXISTS with the harvest role as a third shipping
+object with automatic selection (plan R19 freeze requirement;
+reviewed SOUND, shipped in v0.1.0 installed integration):
+
+- explicit `--members-object` demands the receipt-verified triple,
+  fail-closed;
+- ordinary runs traverse when the triple resolves complete,
+  stay harvest-only on pair-only installs, and refuse broken
+  triples (receiptless/stale/mixed);
+- provenance hashes the loaded bytes (`triple_snapshot`).
+
+Replacing the harvest role, or any other arrangement, needs a new
+reviewed decision — this note is the freeze record.
