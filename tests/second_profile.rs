@@ -220,11 +220,14 @@ fn profile_conservation_spot() {
     let dir = stage("cons");
     let flood = build_flood(&dir);
     let flood_s = flood.to_string_lossy().into_owned();
+    // Paced (1000us): diag-proven minimal attaching pace —
+    // unpaced 2x500 yields zero sites via exec_gap (T3 finding 3;
+    // 100us still gaps, 1000us attaches with a clean ledger).
     let (doc, code) = run_report(
         &bin,
         &dir,
         "profile-cons",
-        &[&flood_s, "2", "500", "0", "sha256"],
+        &[&flood_s, "2", "500", "1000", "sha256"],
     );
     assert!(
         !doc["sites"]
@@ -258,11 +261,13 @@ fn profile_latency_spot() {
     let dir = stage("latspot");
     let flood = build_flood(&dir);
     let flood_s = flood.to_string_lossy().into_owned();
+    // Paced (1000us): diag-proven minimal attaching pace (see
+    // conservation spot: unpaced/100us gap, 1000us attaches).
     let (doc, _) = run_report(
         &bin,
         &dir,
         "profile-lat",
-        &[&flood_s, "2", "500", "0", "sha256"],
+        &[&flood_s, "2", "500", "1000", "sha256"],
     );
     let c = counters(&doc);
     let samples = c.get("count.lat_samples").copied().unwrap_or(0);
