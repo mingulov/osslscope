@@ -109,8 +109,8 @@ fleet ships stripped static binaries, v1 cannot inventory them.
 <!-- source: static boundary probe (0 rows stripped, 62 rows
      unstripped): p6-entry-envs note -->
 
-**Cold-gap preflight in `doctor`: deferred.** v1 `doctor` has no
-pre-flight check for the late-attach cold gap; disclosure rides
+**Cold-gap preflight in `doctor`: warned.** v0.2 `doctor --pid`
+reports a `cold-gap-preflight` degraded check; disclosure rides
 these docs plus the post-hoc `pid-prewindow-blind` / `cold-gap`
 emission in capture documents. `--pid` windows are blind to
 pre-attach execution by architecture; use `run --` with warmup

@@ -1906,3 +1906,31 @@ fn fix2_run_set_explicit_pair_provenance_kept() {
         .expect("implicit triple resolves");
     assert_eq!(set.explicit, [false, false, false]);
 }
+
+#[test]
+fn doctor_pid_reports_cold_gap_preflight() {
+    // v0.2 cold-gap preflight: doctor --pid must surface the
+    // late-attach blindness warning (degraded, never a refusal).
+    let bin = env!("CARGO_BIN_EXE_osslscope");
+    let out = Command::new(bin)
+        .arg("doctor")
+        .arg("--pid")
+        .arg(format!("{}", std::process::id()))
+        .arg("--format")
+        .arg("json")
+        .env_remove("LD_LIBRARY_PATH")
+        .output()
+        .expect("run doctor");
+    let doc: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("doctor json parses");
+    let pre = check_row(&doc, "cold-gap-preflight");
+    assert_eq!(pre["status"], "degraded", "{pre}");
+    assert!(
+        pre["message"].as_str().unwrap().contains("pre-attach"),
+        "{pre}"
+    );
+    assert!(
+        pre["remediation"].as_str().unwrap().contains("run --"),
+        "{pre}"
+    );
+}

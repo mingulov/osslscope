@@ -2127,6 +2127,16 @@ pub fn run(args: &[String]) -> ExitCode {
         let exe = proc_exe_name(p).unwrap_or_else(|| "?".into());
         let tuid = proc_uid(p).unwrap_or(u32::MAX);
         checks.push(check_pidns(p));
+        // v0.2 cold-gap preflight: --pid windows are blind to
+        // pre-attach execution by architecture. Degraded, never a
+        // refusal — --pid stays usable; post-hoc pid-prewindow-blind
+        // / cold-gap emission still applies (what-it-proves.md).
+        checks.push(Check::degraded(
+            "cold-gap-preflight",
+            "--pid windows are blind to pre-attach execution by architecture".into(),
+            "use 'run --' with warmup traffic when completeness matters (docs/what-it-proves.md)"
+                .into(),
+        ));
         checks.push(check_foreign_uid(p, tuid, &env));
         match crate::discovery::maps::read_maps(p) {
             Ok(maps) => {
