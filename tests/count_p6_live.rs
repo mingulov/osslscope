@@ -237,6 +237,16 @@ fn build_prov(dir: &Path, file: &str, lower: &str, upper: &str, provider: &str, 
     );
 }
 /// One observed swap run; returns (doc, vehicle log).
+///
+/// The target libcrypto is named explicitly (`--provider` +
+/// `--builtin`): pre-exec auto-discovery predicts "no NEEDED
+/// libcrypto" for the vehicle shape (observed `sh -c ...` resolves
+/// to /usr/sbin/sh; the python grandchild dlopens libcrypto at
+/// runtime, so it links none either) and refuses the exe with exit
+/// 4. In-guest `doctor --exe` on both shapes verdicts FAIL-CLOSED;
+/// an explicit-provider probe over `sh -c` reaches INSPECT via
+/// symtab. Explicit provider is the product-sanctioned path
+/// (`docs/usage.md`); all leg assertions are unaffected.
 fn run_swap(
     bin: &Path,
     dir: &Path,
@@ -247,6 +257,7 @@ fn run_swap(
 ) -> (serde_json::Value, String) {
     let doc_path = dir.join(format!("{tag}.json"));
     let vlog_path = dir.join(format!("{tag}.vlog"));
+    let prov_lib = format!("{OPT_LIB}/libcrypto.so.3");
     // The vehicle log goes to a file via sh redirect (robust
     // whether or not the product surfaces child stdout).
     let script = format!(
@@ -270,6 +281,9 @@ fn run_swap(
             "100",
             "--timeout",
             "120",
+            "--provider",
+            &prov_lib,
+            "--builtin",
             "run",
             "--",
             "sh",
