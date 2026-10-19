@@ -833,6 +833,229 @@ fn per_key_conservation_across_two_fences() {
 }
 
 #[test]
+fn p6_subpoll_replacement_keeps_old_meaning() {
+    // P6 sub-poll replacement: a changed candidate set stages a
+    // pending meaning; pre-fence hits keep the OLD meaning and
+    // seal under it — old records are never relabeled.
+    let stage = Stage::fresh("p6-subpoll");
+    let bytes = self_bytes();
+    let offs = x_offsets(&bytes, 1);
+    let a = stage.write("prov.so", &bytes);
+    let live = vec![mapping(&a)];
+    let files = HashMap::from([(
+        a.path.clone(),
+        plan::FileBytes {
+            bytes: std::fs::read(&a.path).unwrap().into(),
+            dev: a.device,
+            ino: a.ino,
+        },
+    )]);
+    let mut s = session_with(FakeCountBackend::new());
+    let d0 = CountDelta {
+        discovered: vec![site(&a, offs[0], 7)],
+        losses: Vec::new(),
+    };
+    s.attach_delta(&d0, &live, &files, ATTACH_AT).unwrap();
+    let cookie = s.cookie_for(a.device, a.ino, offs[0]).unwrap();
+    let before = s.provenance(cookie).unwrap().candidates.clone();
+    s.open_window(1000, 3000).unwrap();
+    s.backend_mut().fire(PID, cookie, 1500, 50);
+    // Sub-poll replacement: same triple, new candidates.
+    let d1 = CountDelta {
+        discovered: vec![site(&a, offs[0], 9)],
+        losses: Vec::new(),
+    };
+    let report = s.attach_delta(&d1, &live, &files, ATTACH_AT).unwrap();
+    assert!(
+        report.candidates_changed,
+        "replacement must stage an update"
+    );
+    s.backend_mut().fire(PID, cookie, 1600, 30);
+    s.fence(osslscope::count_session::FenceReason::CandidatesChanged)
+        .unwrap();
+    s.backend_mut().fire(PID, cookie, 2500, 20);
+    let drain = s.close_and_drain(Duration::from_secs(5)).unwrap();
+    assert_eq!(drain.fenced.len(), 1);
+    assert_eq!(drain.fenced[0].sites.len(), 1);
+    assert_eq!(drain.fenced[0].sites[0].calls, 80);
+    assert_eq!(
+        drain.fenced[0].sites[0].candidates, before,
+        "fenced generation must keep the pre-replacement meaning"
+    );
+    assert_eq!(drain.current.len(), 1);
+    assert_eq!(drain.current[0].calls, 20);
+    assert_ne!(
+        drain.current[0].candidates, before,
+        "current generation must carry the replacement meaning"
+    );
+    assert_eq!(counter_value(&drain, "count.stale_events"), Some(0));
+    assert_eq!(counter_value(&drain, "count.ledger_delta"), Some(0));
+    assert_eq!(drain.total_calls(), 100);
+}
+
+#[test]
+fn p6_stale_queued_events_keep_old_generation() {
+    // P6 stale queued: old-generation hits landing after their
+    // fence drain attribute under the OLD meaning while the
+    // staleness memo records the crossing.
+    let stage = Stage::fresh("p6-stale");
+    let bytes = self_bytes();
+    let offs = x_offsets(&bytes, 1);
+    let a = stage.write("prov.so", &bytes);
+    let live = vec![mapping(&a)];
+    let files = HashMap::from([(
+        a.path.clone(),
+        plan::FileBytes {
+            bytes: std::fs::read(&a.path).unwrap().into(),
+            dev: a.device,
+            ino: a.ino,
+        },
+    )]);
+    let mut s = session_with(FakeCountBackend::new());
+    let d = CountDelta {
+        discovered: vec![site(&a, offs[0], 7)],
+        losses: Vec::new(),
+    };
+    s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
+    let cookie = s.cookie_for(a.device, a.ino, offs[0]).unwrap();
+    let before = s.provenance(cookie).unwrap().candidates.clone();
+    s.open_window(1000, 3000).unwrap();
+    s.backend_mut().fire(PID, cookie, 1500, 40);
+    s.fence(osslscope::count_session::FenceReason::MappingsChanged)
+        .unwrap();
+    // Queued pre-fence hit lands after the fence drain.
+    s.backend_mut().inject_row(
+        cookie,
+        0,
+        osslscope_ebpf_common::CountValue {
+            count: 15,
+            first_ns: 1500,
+            last_ns: 1500,
+        },
+    );
+    let drain = s.close_and_drain(Duration::from_secs(5)).unwrap();
+    assert_eq!(drain.fenced.len(), 1);
+    assert_eq!(drain.fenced[0].sites.len(), 1);
+    assert_eq!(drain.fenced[0].sites[0].calls, 55);
+    assert_eq!(drain.fenced[0].sites[0].candidates, before);
+    assert!(drain.current.is_empty());
+    assert_eq!(counter_value(&drain, "count.stale_events"), Some(15));
+    // The injected row bypasses admission, so the independent
+    // ledger sounds exactly its 15 (Task 1 semantics).
+    assert_eq!(counter_value(&drain, "count.ledger_delta"), Some(15));
+    assert_eq!(drain.total_calls(), 55);
+}
+
+#[test]
+fn p6_unknown_generation_stays_unattributed() {
+    // Defensive P6 arm: a generation never fenced is conserved
+    // as explicit unattributed loss, never misattributed to the
+    // live meaning — unavailable continuity stays a precise gap.
+    let stage = Stage::fresh("p6-unknowngen");
+    let bytes = self_bytes();
+    let offs = x_offsets(&bytes, 1);
+    let a = stage.write("prov.so", &bytes);
+    let live = vec![mapping(&a)];
+    let files = HashMap::from([(
+        a.path.clone(),
+        plan::FileBytes {
+            bytes: std::fs::read(&a.path).unwrap().into(),
+            dev: a.device,
+            ino: a.ino,
+        },
+    )]);
+    let mut s = session_with(FakeCountBackend::new());
+    let d = CountDelta {
+        discovered: vec![site(&a, offs[0], 7)],
+        losses: Vec::new(),
+    };
+    s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
+    let cookie = s.cookie_for(a.device, a.ino, offs[0]).unwrap();
+    s.open_window(1000, 2000).unwrap();
+    s.backend_mut().inject_row(
+        cookie,
+        9,
+        osslscope_ebpf_common::CountValue {
+            count: 5,
+            first_ns: 1500,
+            last_ns: 1500,
+        },
+    );
+    let drain = s.close_and_drain(Duration::from_secs(5)).unwrap();
+    assert!(drain.current.is_empty());
+    assert!(drain.fenced.is_empty());
+    assert_eq!(counter_value(&drain, "count.unattributed"), Some(5));
+    assert_eq!(counter_value(&drain, "count.ledger_delta"), Some(5));
+}
+
+#[test]
+fn p6_impl_only_backing_replacement_never_relabels() {
+    // P6 impl-only backing replacement: same candidates on a new
+    // backing triple mints a new cookie; the old cookie's records
+    // seal under gen 0 and are never relabeled as the replacement.
+    let stage = Stage::fresh("p6-implonly");
+    let bytes = self_bytes();
+    let offs = x_offsets(&bytes, 1);
+    let a = stage.write("prov.so", &bytes);
+    let b = stage.write("prov2.so", &bytes);
+    let live = vec![mapping(&a), mapping(&b)];
+    let files = HashMap::from([
+        (
+            a.path.clone(),
+            plan::FileBytes {
+                bytes: std::fs::read(&a.path).unwrap().into(),
+                dev: a.device,
+                ino: a.ino,
+            },
+        ),
+        (
+            b.path.clone(),
+            plan::FileBytes {
+                bytes: std::fs::read(&b.path).unwrap().into(),
+                dev: b.device,
+                ino: b.ino,
+            },
+        ),
+    ]);
+    let mut s = session_with(FakeCountBackend::new());
+    let d0 = CountDelta {
+        discovered: vec![site(&a, offs[0], 7)],
+        losses: Vec::new(),
+    };
+    s.attach_delta(&d0, &live, &files, ATTACH_AT).unwrap();
+    let c1 = s.cookie_for(a.device, a.ino, offs[0]).unwrap();
+    let meaning1 = s.provenance(c1).unwrap().clone();
+    s.open_window(1000, 3000).unwrap();
+    s.backend_mut().fire(PID, c1, 1500, 40);
+    // Same candidates, new backing triple (impl-only change).
+    let d1 = CountDelta {
+        discovered: vec![site(&b, offs[0], 7)],
+        losses: Vec::new(),
+    };
+    s.attach_delta(&d1, &live, &files, ATTACH_AT).unwrap();
+    let c2 = s.cookie_for(b.device, b.ino, offs[0]).unwrap();
+    assert_ne!(c1, c2, "new backing triple must mint a new cookie");
+    assert_ne!(
+        s.provenance(c1).unwrap().site,
+        s.provenance(c2).unwrap().site
+    );
+    s.fence(osslscope::count_session::FenceReason::ProviderChanged)
+        .unwrap();
+    s.backend_mut().fire(PID, c2, 2500, 25);
+    let drain = s.close_and_drain(Duration::from_secs(5)).unwrap();
+    assert_eq!(drain.fenced.len(), 1);
+    assert_eq!(drain.fenced[0].sites.len(), 1);
+    assert_eq!(drain.fenced[0].sites[0].calls, 40);
+    assert_eq!(drain.fenced[0].sites[0].site, meaning1.site);
+    assert_eq!(drain.fenced[0].sites[0].candidates, meaning1.candidates);
+    assert_eq!(drain.current.len(), 1);
+    assert_eq!(drain.current[0].calls, 25);
+    assert_eq!(drain.current[0].site, s.provenance(c2).unwrap().site);
+    assert_eq!(counter_value(&drain, "count.ledger_delta"), Some(0));
+    assert_eq!(drain.total_calls(), 65);
+}
+
+#[test]
 fn kernel_source_enforces_window() {
     // Tripwire, not execution proof (same precedent as the privacy
     // source-shape pins): the BPF program must declare the WINDOW
