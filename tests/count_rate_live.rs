@@ -107,6 +107,14 @@ fn build_flood(dir: &Path) -> PathBuf {
 /// One observed run: `report run` over the flood; returns the parsed
 /// doc. Exit 0 or 3 (honest PARTIAL) both acceptable; anything else
 /// (incl. wrapper timeout 124) fails loudly.
+///
+/// The target libcrypto is named explicitly (`--provider` +
+/// `--builtin`): pre-exec auto-discovery predicts "no NEEDED
+/// libcrypto" for the Fedora-guest gcc flood binary (readelf shows
+/// the NEEDED + RUNPATH; the loader resolves it) and refuses the
+/// exe as an unrecognized library. Explicit provider is the
+/// product-sanctioned path (`docs/usage.md`); all leg assertions
+/// (determinism, scaling, ledger identity) are unaffected.
 fn run_leg(bin: &Path, dir: &Path, tag: &str, flood: &Path, args: &[&str]) -> serde_json::Value {
     let doc_path = dir.join(format!("{tag}.json"));
     let mut cmd = vec![
@@ -119,6 +127,9 @@ fn run_leg(bin: &Path, dir: &Path, tag: &str, flood: &Path, args: &[&str]) -> se
         "100".to_string(),
         "--timeout".to_string(),
         "120".to_string(),
+        "--provider".to_string(),
+        format!("{OPT_LIB}/libcrypto.so.3"),
+        "--builtin".to_string(),
         "run".to_string(),
         "--".to_string(),
         flood.to_string_lossy().into_owned(),
