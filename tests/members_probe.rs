@@ -5848,7 +5848,7 @@ fn detach_budget_parser_pins() {
     assert_eq!(detach_budget_secs(Some("")), 360);
 }
 
-/// Teardown wall live (item 7 resource): attach + drop of all 513
+/// Teardown wall live (item 7 resource): attach + drop of all 512
 /// links completes (hang-guard bound — P9 tightens from lane
 /// evidence; the measured split is reported for the record).
 #[test]
