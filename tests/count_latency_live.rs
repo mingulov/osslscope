@@ -196,8 +196,11 @@ fn score_regime(doc: &serde_json::Value, tag: &str, out: &Path) {
     assert_eq!(c.get("count.ledger_delta"), Some(&0), "{tag}: ledger");
 }
 
-/// Fast regime: 4x25000 unpaced ops. Scores the budget on the
-/// measured distribution (R21 recorded amortized estimates here).
+/// Fast regime: 4x25000 ops at the minimal 100us pace that
+/// attaches (diag-proven: unpaced yields zero samples via
+/// exec_gap, T3 finding 3; 100us keeps the high-rate intent).
+/// Scores the budget on the measured distribution (R21 recorded
+/// amortized estimates here).
 #[test]
 #[ignore = "live lane only (needs caps + /opt/openssl-live + OSSL_LAT_LIVE=1)"]
 fn latency_fast_distribution_measured() {
@@ -211,7 +214,7 @@ fn latency_fast_distribution_measured() {
         &dir,
         "lat-fast",
         &flood,
-        &["4", "25000", "0", "sha256"],
+        &["4", "25000", "100", "sha256"],
     );
     score_regime(&doc, "fast", &out_dir());
     std::fs::copy(
