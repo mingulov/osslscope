@@ -302,6 +302,17 @@
           "$ref": "#/$defs/u64"
         }
       }
+    },
+    "selected_objects": {
+      "description": "Run-set selection provenance (v0.2, optional — recorded on every run): the exact objects the run resolved, so doctor/report/check agree on the selection. Pair-only runs omit `members`. Additive and old-reader-safe.",
+      "type": "object",
+      "required": ["harvest", "count"],
+      "additionalProperties": false,
+      "properties": {
+        "harvest": { "$ref": "#/$defs/traversal-object" },
+        "count": { "$ref": "#/$defs/traversal-object" },
+        "members": { "$ref": "#/$defs/traversal-object" }
+      }
     }
   },
   "$defs": {

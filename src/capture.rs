@@ -175,9 +175,7 @@ pub struct ObjectProvenance {
     pub sha256: String,
 }
 
-/// Resolved triple provenance (recorded on the capture when
-/// traversal runs — the exact selected objects, so doctor and the
-/// capture agree; report/check CLI selection is follow-up work).
+/// Resolved triple provenance (recorded on the capture when traversal runs — the exact selected objects; run-set selection for ALL runs lives in Document.selected_objects, so doctor/report/check agree; refusal-on-mismatch is v0.3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TripleProvenance {
     pub harvest: ObjectProvenance,
@@ -437,6 +435,13 @@ pub struct Capture {
     /// resolved-triple provenance plus the drained per-invocation
     /// records. `None` on harvest-only runs.
     pub traversal: Option<TraversalCapture>,
+    /// Run-set selection provenance (v0.2): the exact objects the
+    /// run resolved — recorded on EVERY document (pair-only runs
+    /// carry `members: None`), so doctor/report/check agree on the
+    /// selection. Set by `run_inner` on every production run;
+    /// `None` on stubbed `observe` captures, which resolve no
+    /// objects.
+    pub selected_objects: Option<evidence::RunSetProvenance>,
 }
 
 /// Minimal document for test constructors outside this module (real
@@ -7070,6 +7075,10 @@ where
             document,
             disposition: parts.disposition,
             traversal: self.traversal,
+            // `run_inner` stamps the resolved selection post-hoc
+            // (the Runner never sees it, so `observe` keeps its
+            // signature); stubbed captures honestly carry `None`.
+            selected_objects: None,
         }
     }
 }
@@ -7135,7 +7144,11 @@ fn fips_configured(provider: &Path) -> bool {
 
 /// Pre-attach recycle capture (`--pid` only): the pin failed during
 /// discovery attach, so no session was ever held.
-fn recycled_capture(cfg: &Config, info: &TargetInfo) -> Capture {
+fn recycled_capture(
+    cfg: &Config,
+    info: &TargetInfo,
+    selected_objects: Option<evidence::RunSetProvenance>,
+) -> Capture {
     let requested_end = info.acquired_ns.saturating_add(duration_ns(cfg.duration));
     let mut document = evidence::finalize(FinalizeInput {
         window: CaptureWindow {
@@ -7166,6 +7179,9 @@ fn recycled_capture(cfg: &Config, info: &TargetInfo) -> Capture {
         info.acquired_wall,
         info.acquired_wall,
     ));
+    // v0.2: the objects resolved before the recycle still record
+    // (the selection happened; only the window never opened).
+    document.selected_objects = selected_objects.clone();
     Capture {
         target_pid: info.pid,
         target_comm: info.comm.clone(),
@@ -7191,6 +7207,7 @@ fn recycled_capture(cfg: &Config, info: &TargetInfo) -> Capture {
         document,
         disposition: None,
         traversal: None,
+        selected_objects,
     }
 }
 
@@ -7351,19 +7368,28 @@ pub fn run_with_dirs(
         dirs,
         trust,
     ) {
-        Ok((onboard::RunSet::Triple(set), _)) => run_inner(
-            cfg,
-            target,
-            onboard::ObjectPaths {
-                harvest: set.harvest.clone(),
-                count: set.count.clone(),
-            },
-            Some(traversal_attach(&set, true)?),
-        ),
+        Ok((onboard::RunSet::Triple(set), _)) => {
+            let attach = traversal_attach(&set, true)?;
+            // v0.2: the run-set selection records on the document —
+            // the same identities the snapshot minted (no re-read).
+            let selected = run_set_from_triple(&attach.provenance);
+            run_inner(
+                cfg,
+                target,
+                onboard::ObjectPaths {
+                    harvest: set.harvest.clone(),
+                    count: set.count.clone(),
+                },
+                Some(attach),
+                Some(selected),
+            )
+        }
         Ok((onboard::RunSet::PairOnly(objects), _)) => {
             // Pair-only install (no members file anywhere): the
-            // ordinary harvest-only run, exactly as before.
-            run_inner(cfg, target, objects, None)
+            // ordinary harvest-only run, exactly as before — plus
+            // the run-set selection every document records.
+            let selected = selected_objects_for(&objects.harvest, &objects.count, None)?;
+            run_inner(cfg, target, objects, None, Some(selected))
         }
         Ok((onboard::RunSet::NoObjects(pair_e), _)) => {
             Err(anyhow::anyhow!("BPF objects: {}", pair_e.full()))
@@ -7408,6 +7434,10 @@ fn run_with_traversal_in(
         trust,
     )
     .map_err(|e| anyhow::anyhow!("BPF objects: {}", e.full()))?;
+    let attach = traversal_attach(&set, false)?;
+    // v0.2: explicit traversal runs record their selection too —
+    // the same identities the snapshot minted (no re-read).
+    let selected = run_set_from_triple(&attach.provenance);
     run_inner(
         cfg,
         target,
@@ -7415,7 +7445,8 @@ fn run_with_traversal_in(
             harvest: set.harvest.clone(),
             count: set.count.clone(),
         },
-        Some(traversal_attach(&set, false)?),
+        Some(attach),
+        Some(selected),
     )
 }
 
@@ -7531,6 +7562,43 @@ fn triple_snapshot(set: &onboard::ObjectSet) -> anyhow::Result<(TripleProvenance
     ))
 }
 
+/// Read + hash one run-set selection (v0.2 follow-up of the
+/// traversal-only `TripleProvenance`): the SAME bytes-and-sha256
+/// rule as `triple_snapshot`, for pair-only runs too.
+fn selected_objects_for(
+    harvest: &std::path::Path,
+    count: &std::path::Path,
+    members: Option<&std::path::Path>,
+) -> anyhow::Result<evidence::RunSetProvenance> {
+    let one = |p: &std::path::Path| -> anyhow::Result<evidence::TraversalObject> {
+        Ok(evidence::TraversalObject {
+            path: p.display().to_string(),
+            sha256: onboard::file_sha256_hex(p)?,
+        })
+    };
+    Ok(evidence::RunSetProvenance {
+        harvest: one(harvest)?,
+        count: one(count)?,
+        members: members.map(one).transpose()?,
+    })
+}
+
+/// Convert traversal-only provenance into run-set selection
+/// provenance (v0.2): the same identities `triple_snapshot`
+/// minted, shared with every document — no re-read, so no
+/// reread drift between the snapshot and the record.
+fn run_set_from_triple(p: &TripleProvenance) -> evidence::RunSetProvenance {
+    let obj = |o: &ObjectProvenance| evidence::TraversalObject {
+        path: o.path.display().to_string(),
+        sha256: o.sha256.clone(),
+    };
+    evidence::RunSetProvenance {
+        harvest: obj(&p.harvest),
+        count: obj(&p.count),
+        members: Some(obj(&p.members)),
+    }
+}
+
 /// Apply post-drain corrections to held verdicts (pure):
 /// rewrite outcome + op by (tid, seq) key. Unknown keys are
 /// ignored (defensive — holders extend monotonically, so a
@@ -7616,12 +7684,15 @@ fn wrap_discovery(
 
 /// Shared window setup over resolved objects (both entries funnel
 /// here after their own resolution; `traversal` selects the
-/// backend attach after discovery attaches, before release).
+/// backend attach after discovery attaches, before release;
+/// `selected_objects` is the run-set selection the caller resolved,
+/// stamped onto the capture and its document before return).
 fn run_inner(
     cfg: &Config,
     target: Target,
     objects: onboard::ObjectPaths,
     traversal: Option<TraversalAttach>,
+    selected_objects: Option<evidence::RunSetProvenance>,
 ) -> anyhow::Result<Capture> {
     arm_signals();
     // Triple runs load the retained count snapshot (no re-read —
@@ -7658,7 +7729,7 @@ fn run_inner(
         .provider_enrollment
         .as_ref()
         .unwrap_or(&empty_enrollment);
-    match target {
+    let cap = match target {
         Target::Spawn { argv, workload } => {
             let cmdline = args::redact_spawn_argv(&argv);
             // R06/F07: pre-stop setup runs under the checked
@@ -7818,7 +7889,7 @@ fn run_inner(
                     // Mid-attach recycle: fatal verdict, no sessions
                     // held (the count object drops unused).
                     if e.downcast_ref::<Recycled>().is_some() {
-                        return Ok(recycled_capture(&effective, &info));
+                        return Ok(recycled_capture(&effective, &info, selected_objects));
                     }
                     return Err(e.context("discovery attach"));
                 }
@@ -7843,7 +7914,15 @@ fn run_inner(
                 &interrupted,
             )
         }
-    }
+    };
+    // v0.2: every production run records its run-set selection —
+    // on the capture and its document alike (post-hoc: the Runner
+    // never sees it, so `observe` keeps its signature for the
+    // stubbed tests, which honestly carry `None`).
+    let mut cap = cap?;
+    cap.selected_objects = selected_objects.clone();
+    cap.document.selected_objects = selected_objects;
+    Ok(cap)
 }
 
 #[cfg(test)]
@@ -7931,6 +8010,28 @@ mod tests {
             trusted_uids: vec![unsafe { libc::getuid() }],
             check_ancestry: false,
         }
+    }
+
+    #[test]
+    fn selection_reader_hashes_pair() {
+        // capture.rs:180 follow-up: the pure selection reader records
+        // path + sha256 per object (members None on pair-only).
+        let dir = std::env::temp_dir().join("osslscope-selprobe");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("h.o"), b"harvest-bytes").unwrap();
+        std::fs::write(dir.join("c.o"), b"count-bytes").unwrap();
+        let sel = selected_objects_for(&dir.join("h.o"), &dir.join("c.o"), None).unwrap();
+        assert_eq!(sel.harvest.path, dir.join("h.o").display().to_string());
+        assert_eq!(
+            sel.harvest.sha256,
+            onboard::file_sha256_hex(&dir.join("h.o")).unwrap()
+        );
+        assert_eq!(
+            sel.count.sha256,
+            onboard::file_sha256_hex(&dir.join("c.o")).unwrap()
+        );
+        assert!(sel.members.is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

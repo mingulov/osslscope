@@ -313,6 +313,12 @@ gate reads clock + cells only).
   numeric per-record facts: `records`, `findings`, `polls`,
   `admitted`, `admitted_unknown`, `census_loss`, `entries`.
   No target strings, no runtime addresses.
+- Optional `selected_objects` (run-set selection, recorded on
+  every run — the key omits when the producer resolved no
+  selection): `harvest`, `count` (host object paths plus
+  sha256 each; the same provenance class as `objects`
+  display locators, never target paths), plus `members` on
+  triple runs only. No target strings, no runtime addresses.
 - Optional `engine_observations` (R05, rendered only when observed):
   per-observation pinned caller-module triple (object fingerprint,
   encoded device, inode), stub file offset, binding generation,

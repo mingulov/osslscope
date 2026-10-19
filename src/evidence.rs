@@ -812,6 +812,12 @@ pub struct CaptureDocument {
     /// (paths + sha256, so doctor/report/check agree) plus
     /// record/findings/poll counts. Absent on harvest-only runs.
     pub traversal: Option<TraversalRecord>,
+    /// Run-set selection provenance (v0.2): the exact objects the
+    /// run resolved — recorded on EVERY document (pair-only runs
+    /// carry `members: None`), so doctor/report/check agree on the
+    /// selection. Additive and old-reader-safe.
+    #[serde(default)]
+    pub selected_objects: Option<RunSetProvenance>,
     /// Failed-attach diagnostic texts (R06): sorted, deduped,
     /// capped producer literals (no paths/pointers) — the failed
     /// attach identifies itself, not just counts. Additive and
@@ -835,10 +841,21 @@ pub struct CaptureDocument {
 
 /// One BPF object selected for the window (path locates for
 /// display; sha256 defines identity).
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct TraversalObject {
     pub path: String,
     pub sha256: String,
+}
+
+/// Run-set selection provenance (v0.2): the exact objects the
+/// run resolved — recorded on EVERY document (pair-only runs
+/// carry `members: None`), so doctor/report/check agree on the
+/// selection. Additive and old-reader-safe.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct RunSetProvenance {
+    pub harvest: TraversalObject,
+    pub count: TraversalObject,
+    pub members: Option<TraversalObject>,
 }
 
 /// One traversal record's native facts (per-record summary —
@@ -1044,6 +1061,7 @@ pub fn finalize(mut input: FinalizeInput) -> CaptureDocument {
         engine_observations: input.engine_observations,
         context: None,
         traversal: input.traversal,
+        selected_objects: None,
         attach_diagnostics: Vec::new(),
         refusal_diagnostics: Vec::new(),
     }

@@ -2312,6 +2312,80 @@ fn traversal_emission_matches_allowlist_inventory() {
     }
 }
 
+#[test]
+fn selected_objects_rendered_and_old_reader_safe() {
+    use osslscope::evidence::{RunSetProvenance, TraversalObject};
+    // v0.2 follow-up: EVERY run records its run-set selection —
+    // pair-only runs carry members: None (key omitted from the
+    // render, like the absent traversal section). The rendered
+    // key validates, pins its published shape, feeds the human
+    // line, and stays additive (a frozen pre-key reader parses
+    // the bytes).
+    let obj = |path: &str, sha256: &str| TraversalObject {
+        path: path.to_string(),
+        sha256: sha256.to_string(),
+    };
+    // Engine-bearing fixture: the frozen pre-key reader requires
+    // the keys a fully-populated render carries (same reader the
+    // R12 additivity test feeds).
+    let mut doc = engine_doc_fixture();
+    doc.selected_objects = Some(RunSetProvenance {
+        harvest: obj(
+            "/lib/osslscope/osslscope-harvest",
+            "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+        ),
+        count: obj(
+            "/lib/osslscope/osslscope-count",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ),
+        members: None,
+    });
+    let bytes = render_json(&doc).unwrap();
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    validate_v2(&v).expect("pair-only selection validates");
+    check_v2_semantics(&v).expect("pair-only selection semantics hold");
+    let sel = v["selected_objects"]
+        .as_object()
+        .expect("selected_objects section");
+    assert_eq!(sel["harvest"]["path"], "/lib/osslscope/osslscope-harvest");
+    assert_eq!(
+        sel["count"]["sha256"],
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    );
+    assert!(
+        sel.get("members").is_none(),
+        "pair-only selection omits members"
+    );
+    let human = render_human(&doc);
+    assert!(
+        human.contains("objects: harvest=/lib/osslscope/osslscope-harvest count=/lib/osslscope/osslscope-count\n"),
+        "human line names the pair selection, no members segment:\n{human}"
+    );
+    // Triple shape: members present renders + validates.
+    doc.selected_objects.as_mut().unwrap().members = Some(obj(
+        "/lib/osslscope/osslscope-members",
+        "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae",
+    ));
+    let bytes = render_json(&doc).unwrap();
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    validate_v2(&v).expect("triple selection validates");
+    check_v2_semantics(&v).expect("triple selection semantics hold");
+    assert_eq!(
+        v["selected_objects"]["members"]["path"],
+        "/lib/osslscope/osslscope-members"
+    );
+    let human = render_human(&doc);
+    assert!(
+        human.contains("members=/lib/osslscope/osslscope-members"),
+        "human line names the members object on triple runs:\n{human}"
+    );
+    // Additive proof: a frozen pre-key wire reader (no
+    // selected_objects field) parses the new bytes.
+    let back: PreR12WireDocument = serde_json::from_value(v).expect("old reader parses new bytes");
+    assert_eq!(back.schema_version, "observed-crypto-v2.1");
+    assert_eq!(back.completeness.status, "COMPLETE");
+}
+
 /// Parse the variant names of `pub enum {name}` from Rust source
 /// (leading identifiers of non-comment, non-attribute lines up to
 /// the closing brace).

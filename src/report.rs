@@ -685,6 +685,21 @@ fn doc_json(doc: &CaptureDocument) -> serde_json::Value {
             "entries": t.entries,
         });
     }
+    // v0.2 run-set selection: every run records the exact
+    // objects it resolved (pair-only runs omit `members` — the
+    // same provenance class as `traversal`'s triple, never
+    // target paths).
+    if let Some(sel) = &doc.selected_objects {
+        let obj = |o: &crate::evidence::TraversalObject| serde_json::json!({"path": o.path, "sha256": o.sha256});
+        let mut section = serde_json::json!({
+            "harvest": obj(&sel.harvest),
+            "count": obj(&sel.count),
+        });
+        if let Some(members) = &sel.members {
+            section["members"] = obj(members);
+        }
+        out["selected_objects"] = section;
+    }
     if let Some(disposition) = &doc.disposition {
         let (outcome, code, pid) = match disposition.outcome {
             DispositionOutcome::Exited => ("exited", disposition.code, None),
@@ -853,6 +868,20 @@ pub fn render_human(doc: &CaptureDocument) -> String {
         or_none(&safe_display(&doc.target.container_id)),
         or_none(&safe_display(&doc.target.image_digest)),
     ));
+    // v0.2 run-set selection: the exact objects the run resolved
+    // (members segment only on triple runs).
+    if let Some(sel) = &doc.selected_objects {
+        let mut line = format!(
+            "objects: harvest={} count={}",
+            safe_display(&sel.harvest.path),
+            safe_display(&sel.count.path),
+        );
+        if let Some(members) = &sel.members {
+            line.push_str(&format!(" members={}", safe_display(&members.path)));
+        }
+        line.push('\n');
+        s.push_str(&line);
+    }
     match &doc.disposition {
         Some(d) if d.outcome == DispositionOutcome::Exited => {
             s.push_str(&format!(
