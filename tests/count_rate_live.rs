@@ -117,8 +117,8 @@ fn build_flood(dir: &Path) -> PathBuf {
 /// libcrypto" for the Fedora-guest gcc flood binary (readelf shows
 /// the NEEDED + RUNPATH; the loader resolves it) and refuses the
 /// exe as an unrecognized library. Explicit provider is the
-/// product-sanctioned path (`docs/usage.md`); all leg assertions
-/// (determinism, scaling, ledger identity) are unaffected.
+/// product-sanctioned path (`docs/usage.md`); the ledger identity +
+/// coverage assertions are unaffected.
 fn run_leg(bin: &Path, dir: &Path, tag: &str, flood: &Path, args: &[&str]) -> serde_json::Value {
     let doc_path = dir.join(format!("{tag}.json"));
     let mut cmd = vec![
@@ -174,7 +174,7 @@ fn counters(doc: &serde_json::Value) -> HashMap<String, u64> {
 }
 
 /// Sorted per-site calls multiset (identity-free: first/last_ns vary
-/// run to run, so A/A equality is exact multiset equality).
+/// run to run; used for coverage sanity, never shape equality).
 fn calls_multiset(doc: &serde_json::Value) -> Vec<u64> {
     let mut v: Vec<u64> = doc["sites"]
         .as_array()
