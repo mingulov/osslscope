@@ -839,7 +839,7 @@ fi
 # 59. Guard 16 is scoped to the live-gates block: a mutant check.yml
 # with live execution inside live-gates (SKIP echo kept) fools the
 # old anywhere-grep yet fails the scoped block check.
-awk '/^  beachhead:/{print "      - run: cargo test --live"} {print}' "$CHECK_YML" >"$T/check-mutant.yml"
+awk '{print} /live-known-n workflow is dispatch-only/{print "      - run: cargo test --live"}' "$CHECK_YML" >"$T/check-mutant.yml"
 MUTANT_BLOCK=$(awk '/^  live-gates:/{f=1} f{print} f&&/^  [a-z-]+:/&&!/live-gates/{exit}' "$T/check-mutant.yml")
 if grep -q 'SKIP(live-capability)' "$T/check-mutant.yml" \
     && echo "$MUTANT_BLOCK" | grep -q 'SKIP(live-capability)' \

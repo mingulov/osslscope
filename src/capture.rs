@@ -175,7 +175,7 @@ pub struct ObjectProvenance {
     pub sha256: String,
 }
 
-/// Resolved triple provenance (recorded on the capture when traversal runs — the exact selected objects; run-set selection for ALL runs lives in Document.selected_objects, so doctor/report/check agree; refusal-on-mismatch is v0.3).
+/// Resolved triple provenance (recorded on the capture when traversal runs — the exact selected objects; run-set selection for ALL runs lives in CaptureDocument.selected_objects, so doctor/report/check agree; refusal-on-mismatch is v0.3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TripleProvenance {
     pub harvest: ObjectProvenance,
@@ -436,11 +436,11 @@ pub struct Capture {
     /// records. `None` on harvest-only runs.
     pub traversal: Option<TraversalCapture>,
     /// Run-set selection provenance (v0.2): the exact objects the
-    /// run resolved — recorded on EVERY document (pair-only runs
-    /// carry `members: None`), so doctor/report/check agree on the
-    /// selection. Set by `run_inner` on every production run;
-    /// `None` on stubbed `observe` captures, which resolve no
-    /// objects.
+    /// run resolved — recorded on every production run's document
+    /// (pair-only runs carry `members: None`), so
+    /// doctor/report/check agree on the selection. Set by
+    /// `run_inner` on every production run; `None` on stubbed
+    /// `observe` captures, which resolve no objects.
     pub selected_objects: Option<evidence::RunSetProvenance>,
 }
 
@@ -8035,6 +8035,23 @@ mod tests {
     }
 
     #[test]
+    fn selection_reader_missing_object_errors() {
+        // capture.rs:180 follow-up: a missing/unreadable object is
+        // a hard error (the run fails) — never a silent skip.
+        let dir = std::env::temp_dir().join("osslscope-selprobe-gone");
+        let missing = dir.join("no-such-dir").join("h.o");
+        assert!(std::fs::metadata(&missing).is_err());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("c.o"), b"count-bytes").unwrap();
+        let err = selected_objects_for(&missing, &dir.join("c.o"), None).unwrap_err();
+        assert!(
+            !err.to_string().is_empty(),
+            "missing harvest must explain itself"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn fix2_triple_snapshot_binds_one_read() {
         // F11: the snapshot binds ONE read per role to identity —
         // provenance hashes equal the loaded bytes' hashes, so the
@@ -10523,6 +10540,19 @@ mod tests {
                 count: obj("osslscope-count"),
                 members: obj("osslscope-members"),
             }
+        }
+
+        #[test]
+        fn run_set_from_triple_maps_roles() {
+            let t = triple_prov();
+            let sel = run_set_from_triple(&t);
+            assert_eq!(sel.harvest.path, t.harvest.path.display().to_string());
+            assert_eq!(sel.harvest.sha256, t.harvest.sha256);
+            assert_eq!(sel.count.path, t.count.path.display().to_string());
+            assert_eq!(sel.count.sha256, t.count.sha256);
+            let m = sel.members.expect("triple carries members");
+            assert_eq!(m.path, t.members.path.display().to_string());
+            assert_eq!(m.sha256, t.members.sha256);
         }
 
         #[test]

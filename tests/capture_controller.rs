@@ -8883,6 +8883,18 @@ fn r14_fix_cached_payload_over_remaining_budget_skips_loud() {
         "one cached-over-budget refusal: {:?}",
         c.document.counters
     );
+    assert_eq!(
+        c.document.refusal_diagnostics.len(),
+        1,
+        "exactly one refusal entry: {:?}",
+        c.document.refusal_diagnostics
+    );
+    assert!(
+        c.document.refusal_diagnostics[0].contains("kind=over_allowance"),
+        "cached refusal names over_allowance: {:?}",
+        c.document.refusal_diagnostics
+    );
+    assert_refusal_shape(&c.document.refusal_diagnostics[0]);
     let log = post.proc_log.borrow();
     assert_eq!(
         log.reads,
@@ -9087,4 +9099,108 @@ fn refusal_diagnostics_bounded_sorted_sixteen() {
     for entry in &c.document.refusal_diagnostics {
         assert_refusal_shape(entry);
     }
+}
+
+#[test]
+fn refusal_diagnostics_unstatable_path_falls_back_to_zero_zero() {
+    // Mirrors `refusal_diagnostics_records_one_refusal`: the
+    // oversized decoy sorts first and refuses loud — but its path
+    // lives under a removed dir (never stated), so the entry
+    // carries the `refusal_tag` (0, 0) fallback identity instead
+    // of a device number.
+    let mut h = Harness::fresh("refusal-diag-unstatable");
+    h.snapshot_attached();
+    let elf_len = h.bytes.len();
+    let budget = elf_len + 512;
+    let seed = h.stage.write("a-huge.so", &[0x7fu8; 64]);
+    let ghost = Staged {
+        path: h
+            .stage
+            .dir
+            .join("a-removed")
+            .join("a-huge.so")
+            .to_str()
+            .unwrap()
+            .to_string(),
+        device: seed.device,
+        ino: seed.ino,
+    };
+    assert!(
+        std::fs::metadata(&ghost.path).is_err(),
+        "ghost path must not stat: {}",
+        ghost.path
+    );
+    h.files.insert(
+        ghost.path.clone(),
+        plan::FileBytes {
+            bytes: vec![0x7fu8; elf_len + 1024].into(),
+            dev: ghost.device,
+            ino: ghost.ino,
+        },
+    );
+    h.read_budget = budget;
+    h.maps = vec![mapping(&ghost), mapping(&h.staged)];
+    let staged_path = h.staged.path.clone();
+    let ghost_path = ghost.path.clone();
+    assert!(
+        ghost_path < staged_path,
+        "decoy must sort first: {ghost_path} vs {staged_path}"
+    );
+    h.polls.push_back(DiscoveryDelta::default());
+    h.polls.push_back(DiscoveryDelta {
+        candidates: vec![
+            cand(
+                "/p/provider.so",
+                backing_of(&ghost, h.off),
+                1,
+                11,
+                "SHA-256",
+                false,
+                "ok",
+            ),
+            cand(
+                "/p/provider.so",
+                backing_of(&h.staged, h.off),
+                1,
+                11,
+                "SHA-256",
+                false,
+                "ok",
+            ),
+        ],
+        tables: vec![terminated(1, 0)],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    h.plans.insert(
+        2,
+        FirePlan {
+            fires: vec![(BASE_NS + 600_000_000, 7)],
+            shortfall: 0,
+            cancel: false,
+        },
+    );
+    h.exit_at_ns = Some(BASE_NS + 1_000_000_000);
+    h.exit_code = 0;
+    let (out, _post) = h.run();
+    let c = out.unwrap();
+    assert_eq!(
+        counter_value(&c, "discovery.relevance_capped"),
+        1,
+        "one budget refusal: {:?}",
+        c.document.counters
+    );
+    assert_eq!(
+        c.document.refusal_diagnostics.len(),
+        1,
+        "exactly one refusal entry: {:?}",
+        c.document.refusal_diagnostics
+    );
+    let entry = &c.document.refusal_diagnostics[0];
+    assert_refusal_shape(entry);
+    assert_eq!(
+        *entry,
+        format!("dev=0 ino=0 kind=file_too_large bytes=0 allowance={budget}"),
+        "unstatable path falls back to (0, 0): {entry:?}"
+    );
 }

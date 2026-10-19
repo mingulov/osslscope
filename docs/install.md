@@ -208,7 +208,8 @@ Traversal COEXISTS with the harvest role as a third shipping
 object with automatic selection (plan R19 freeze requirement;
 reviewed SOUND, shipped in v0.1.0 installed integration):
 
-- explicit `--members-object` demands the receipt-verified triple,
+- explicit `--members-object` demands the triple (implicit roles
+  receipt-verified; the explicit role is operator-trusted),
   fail-closed;
 - ordinary runs traverse when the triple resolves complete,
   stay harvest-only on pair-only installs, and refuse broken

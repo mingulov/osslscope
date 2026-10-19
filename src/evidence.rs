@@ -813,9 +813,11 @@ pub struct CaptureDocument {
     /// record/findings/poll counts. Absent on harvest-only runs.
     pub traversal: Option<TraversalRecord>,
     /// Run-set selection provenance (v0.2): the exact objects the
-    /// run resolved — recorded on EVERY document (pair-only runs
-    /// carry `members: None`), so doctor/report/check agree on the
-    /// selection. Additive and old-reader-safe.
+    /// run resolved — recorded on every production run's document
+    /// (`None` on stubbed `observe` captures, which resolve no
+    /// objects; pair-only runs carry `members: None`), so
+    /// doctor/report/check agree on the selection. Additive and
+    /// old-reader-safe.
     #[serde(default)]
     pub selected_objects: Option<RunSetProvenance>,
     /// Failed-attach diagnostic texts (R06): sorted, deduped,
