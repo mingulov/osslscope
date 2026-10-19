@@ -105,7 +105,8 @@ int OSSL_provider_init(const OSSL_CORE_HANDLE *handle, const OSSL_DISPATCH *in,
 const SWAP_VEHICLE_PY: &str = r#"
 import ctypes, sys, time
 c = ctypes
-lc_path, rounds_a, rounds_b = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+lc_path, rounds_a, rounds_b, vlog_path = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
+sys.stdout = sys.stderr = open(vlog_path, "w")
 lc = c.CDLL(lc_path)
 lc.OPENSSL_init_crypto.argtypes = [c.c_uint64, c.c_void_p]
 lc.OSSL_PROVIDER_load.restype = c.c_void_p
@@ -247,6 +248,16 @@ fn build_prov(dir: &Path, file: &str, lower: &str, upper: &str, provider: &str, 
 /// an explicit-provider probe over `sh -c` reaches INSPECT via
 /// symtab. Explicit provider is the product-sanctioned path
 /// (`docs/usage.md`); all leg assertions are unaffected.
+///
+/// The vehicle runs as the DIRECT observed child (`python3 ...`,
+/// no `sh -c`): the product ignores fork/exec grandchildren
+/// (`lifecycle.fork_exec_ignored`), so the sh-redirected shape
+/// observed zero sites at 4 AND 400 rounds. Python dlopens the
+/// named libcrypto milliseconds after exec and repeated session
+/// polls arm the map-in (in-guest direct probe: 5 sites, 400/400
+/// calls exact, ledger_delta=0). The vehicle redirects its own
+/// stdout/stderr to the vlog file (the product does not surface
+/// child stdout).
 fn run_swap(
     bin: &Path,
     dir: &Path,
@@ -258,16 +269,10 @@ fn run_swap(
     let doc_path = dir.join(format!("{tag}.json"));
     let vlog_path = dir.join(format!("{tag}.vlog"));
     let prov_lib = format!("{OPT_LIB}/libcrypto.so.3");
-    // The vehicle log goes to a file via sh redirect (robust
-    // whether or not the product surfaces child stdout).
-    let script = format!(
-        "python3 '{}' '{}' {} {} > '{}' 2>&1",
-        vehicle.to_string_lossy(),
-        OPT_CRYPTO,
-        rounds_a,
-        rounds_b,
-        vlog_path.to_string_lossy(),
-    );
+    let rounds_a_arg = rounds_a.to_string();
+    let rounds_b_arg = rounds_b.to_string();
+    // Direct-python observation (no sh -c: fork/exec grandchildren
+    // are never followed); the vehicle writes its own vlog file.
     let out = Command::new("timeout")
         .arg("400")
         .arg(bin)
@@ -286,9 +291,12 @@ fn run_swap(
             "--builtin",
             "run",
             "--",
-            "sh",
-            "-c",
-            &script,
+            "python3",
+            &vehicle.to_string_lossy(),
+            OPT_CRYPTO,
+            &rounds_a_arg,
+            &rounds_b_arg,
+            &vlog_path.to_string_lossy(),
         ])
         .env("OPENSSL_MODULES", dir)
         .output()
