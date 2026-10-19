@@ -91,6 +91,17 @@ fn build_flood(dir: &Path) -> PathBuf {
     bin
 }
 
+/// One observed run: `report run` over the target; returns the
+/// parsed doc + exit. Exit 0 or 3 (honest PARTIAL) both
+/// acceptable; anything else (incl. wrapper timeout 124) fails
+/// loudly.
+///
+/// The target libcrypto is named explicitly (`--provider` +
+/// `--builtin`): pre-exec auto-discovery refuses the flood exe
+/// as an unrecognized library and /bin/true as not OpenSSL
+/// (cycle-1 exit-4 shape; T3-09cc413/T4-670a5f4/T6-32ff2d6
+/// pinned fix). Explicit provider is the product-sanctioned
+/// path (`docs/usage.md`); leg assertions unaffected.
 fn run_report(bin: &Path, dir: &Path, tag: &str, target: &[&str]) -> (serde_json::Value, i32) {
     let doc_path = dir.join(format!("{tag}.json"));
     let mut cmd = vec![
@@ -103,6 +114,9 @@ fn run_report(bin: &Path, dir: &Path, tag: &str, target: &[&str]) -> (serde_json
         "60".to_string(),
         "--timeout".to_string(),
         "120".to_string(),
+        "--provider".to_string(),
+        format!("{OPT_LIB}/libcrypto.so.3"),
+        "--builtin".to_string(),
         "run".to_string(),
         "--".to_string(),
     ];
