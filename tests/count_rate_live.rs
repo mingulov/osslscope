@@ -52,8 +52,7 @@ fn prereqs() -> Option<PathBuf> {
 }
 
 fn stage(tag: &str) -> PathBuf {
-    let dir =
-        std::env::temp_dir().join(format!("osslscope-ratelive-{tag}-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("osslscope-ratelive-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
@@ -73,8 +72,7 @@ fn out_dir() -> PathBuf {
 /// Build count_flood against the /opt source build (rpath-pinned so
 /// the observed child resolves the same libcrypto deterministically).
 fn build_flood(dir: &Path) -> PathBuf {
-    let src =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/count_flood.c");
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/count_flood.c");
     assert!(src.exists(), "fixture missing: {}", src.display());
     let bin = dir.join("count_flood");
     let st = Command::new("gcc")
@@ -109,13 +107,7 @@ fn build_flood(dir: &Path) -> PathBuf {
 /// One observed run: `report run` over the flood; returns the parsed
 /// doc. Exit 0 or 3 (honest PARTIAL) both acceptable; anything else
 /// (incl. wrapper timeout 124) fails loudly.
-fn run_leg(
-    bin: &Path,
-    dir: &Path,
-    tag: &str,
-    flood: &Path,
-    args: &[&str],
-) -> serde_json::Value {
+fn run_leg(bin: &Path, dir: &Path, tag: &str, flood: &Path, args: &[&str]) -> serde_json::Value {
     let doc_path = dir.join(format!("{tag}.json"));
     let mut cmd = vec![
         "report".to_string(),
@@ -197,11 +189,7 @@ fn assert_ledger_clean(doc: &serde_json::Value, tag: &str) {
         "{tag}: dropfail"
     );
     assert_eq!(c.get("count.unattributed"), Some(&0), "{tag}: unattributed");
-    assert_eq!(
-        c.get("count.drain_shortfall"),
-        Some(&0),
-        "{tag}: shortfall"
-    );
+    assert_eq!(c.get("count.drain_shortfall"), Some(&0), "{tag}: shortfall");
 }
 
 /// A/A determinism: two identical 4x2000 runs observe identical
@@ -217,7 +205,11 @@ fn rate_aa_determinism_exact() {
     let a = run_leg(&bin, &dir, "aa-a", &flood, &["4", "2000", "0", "sha256"]);
     let b = run_leg(&bin, &dir, "aa-b", &flood, &["4", "2000", "0", "sha256"]);
     assert!(!calls_multiset(&a).is_empty(), "leg A observed no sites");
-    assert_eq!(calls_multiset(&a), calls_multiset(&b), "A/A multisets differ");
+    assert_eq!(
+        calls_multiset(&a),
+        calls_multiset(&b),
+        "A/A multisets differ"
+    );
     assert_eq!(total_calls(&a), total_calls(&b));
     assert_ledger_clean(&a, "aa-a");
     assert_ledger_clean(&b, "aa-b");
@@ -261,7 +253,10 @@ fn rate_hot_key_live_exact() {
     let a = run_leg(&bin, &dir, "hot-a", &flood, &["8", "1000", "0", "mixed"]);
     let b = run_leg(&bin, &dir, "hot-b", &flood, &["8", "1000", "0", "mixed"]);
     let ma = calls_multiset(&a);
-    assert!(ma.len() >= 2, "mixed leg must show 2+ hot sites, saw {ma:?}");
+    assert!(
+        ma.len() >= 2,
+        "mixed leg must show 2+ hot sites, saw {ma:?}"
+    );
     assert_eq!(ma, calls_multiset(&b), "hot-key A/A multisets differ");
     assert_ledger_clean(&a, "hot-a");
     assert_ledger_clean(&b, "hot-b");
@@ -271,8 +266,11 @@ fn rate_hot_key_live_exact() {
         "top2_calls": top2,
         "total_calls": total_calls(&a),
     });
-    std::fs::write(out_dir().join("rate-hot.json"), serde_json::to_string_pretty(&record).unwrap())
-        .unwrap();
+    std::fs::write(
+        out_dir().join("rate-hot.json"),
+        serde_json::to_string_pretty(&record).unwrap(),
+    )
+    .unwrap();
 }
 
 /// Loss-knee characterization: sweep 1/2/4/8 threads at fixed ops;
@@ -323,7 +321,11 @@ fn rate_knee_characterization_recorded() {
             "status": doc["completeness"]["status"],
         }));
     }
-    assert_ne!(knee_at, Some(1), "knee at 1 thread: single-threaded loss is a defect");
+    assert_ne!(
+        knee_at,
+        Some(1),
+        "knee at 1 thread: single-threaded loss is a defect"
+    );
     let record = serde_json::json!({"knee_at_threads": knee_at, "points": points});
     std::fs::write(
         out_dir().join("rate-knee.json"),
