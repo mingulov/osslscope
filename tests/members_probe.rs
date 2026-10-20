@@ -5817,9 +5817,17 @@ fn d_drain_floor() {
     assert_loss_zero(loaded);
 }
 
+// Hang-guard budget, lane-calibrated (V2-53): attach takes 53.5/95.3 s
+// (R21b finding 6) and 135.35/147.97 s (T8 fixwave-2, in-suite and
+// isolated) on this lane, so the 60 s value never fit; 2x the observed
+// max keeps a true hang guard. P9 note: the leg's `P9 tightens from
+// lane evidence` premise is inverted by this evidence on this lane.
+const DETACH_WALL_BUDGET_SECS: u64 = 300;
+
 /// Teardown wall live (item 7 resource): attach + drop of all 513
 /// links completes (hang-guard bound — P9 tightens from lane
-/// evidence; the measured split is reported for the record).
+/// evidence (V2-53: calibrated to 300 s); the measured split is
+/// reported for the record).
 #[test]
 #[ignore]
 fn d_detach_wall() {
@@ -5838,8 +5846,8 @@ fn d_detach_wall() {
     let detach_dt = t1.elapsed();
     eprintln!("detach-wall: attach {attach_dt:?}, detach {detach_dt:?}");
     assert!(
-        attach_dt + detach_dt < std::time::Duration::from_secs(60),
-        "detach-wall: attach+detach {attach_dt:?}+{detach_dt:?} exceeds hang-guard 60s"
+        attach_dt + detach_dt < std::time::Duration::from_secs(DETACH_WALL_BUDGET_SECS),
+        "detach-wall: attach+detach {attach_dt:?}+{detach_dt:?} exceeds hang-guard {DETACH_WALL_BUDGET_SECS}s"
     );
 }
 
