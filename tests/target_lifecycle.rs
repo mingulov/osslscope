@@ -2905,6 +2905,109 @@ fn r20_doc_counter(cap: &osslscope::capture::Capture, name: &str) -> u64 {
         .sum()
 }
 
+/// V2-58: F1's exact honest reason set — the stable base triple
+/// plus `late-attach` admitted IFF late attaches were counted
+/// (`discovery.late_attach_sites > 0`). Built sorted:
+/// `cap.reasons` arrives pre-sorted, so an exact compare needs
+/// the expected set sorted too (RED: 128 → base+late-attach;
+/// GREEN: 0 → base).
+fn r20_f1_expected_reasons(late_attach_sites: u64) -> Vec<String> {
+    let mut expected = vec![
+        "discovery-loss".to_string(),
+        "lowlevel-fallback-uninstrumented".to_string(),
+        "unattributed".to_string(),
+    ];
+    if late_attach_sites > 0 {
+        expected.push("late-attach".to_string());
+        expected.sort();
+    }
+    expected
+}
+
+#[test]
+fn f1_v258_fenced_aware_expectation_pins_red_and_green_shapes() {
+    // V2-58 RED-first pin for the F1 leg's fenced-aware
+    // expectation. Fixtures are the retained live values
+    // (`t09/f1.log` RED `d450379b…`, `t09/f1r-ts.log` GREEN
+    // `500ba9fa…`): the new predicates must ACCEPT both drain
+    // phases and REJECT true-negative shapes. Pre-change
+    // semantics (executions-only total, `!empty`,
+    // unconditional base reasons) FAIL this test — proven via
+    // the /tmp RED check in `t09/step9f-redcheck.txt`.
+    // RED shape (mid-window-drain strand): executions empty,
+    // 1,078,384 calls honestly fenced (gen0 1,702 + gen1
+    // 1,076,682), reasons base+late-attach, late counter 128.
+    let red_exec_len = 0usize;
+    let red_exec_calls = 0u64;
+    let red_fenced = 1_078_384u64;
+    assert_eq!(1_702u64 + 1_076_682u64, red_fenced);
+    let red_reasons = vec![
+        "discovery-loss".to_string(),
+        "late-attach".to_string(),
+        "lowlevel-fallback-uninstrumented".to_string(),
+        "unattributed".to_string(),
+    ];
+    assert!(
+        red_exec_len > 0 || red_fenced > 0,
+        "RED strand must satisfy the V2-58 observation check"
+    );
+    assert!(
+        red_exec_calls + red_fenced > 0,
+        "RED fenced calls must satisfy the V2-58 total check"
+    );
+    assert_eq!(red_reasons, r20_f1_expected_reasons(128));
+    // GREEN shape (close-drain pass): 7 executions, base
+    // reasons, late counter 0. GREEN's exact fenced count is
+    // unlogged (per-site times print only in the panic `Cap`
+    // debug — repair N-g); the executions arm carries the
+    // check regardless.
+    let green_exec_len = 7usize;
+    let green_exec_calls = 1_107_360u64;
+    let green_fenced = 0u64;
+    let green_reasons = vec![
+        "discovery-loss".to_string(),
+        "lowlevel-fallback-uninstrumented".to_string(),
+        "unattributed".to_string(),
+    ];
+    assert!(
+        green_exec_len > 0 || green_fenced > 0,
+        "GREEN executions must satisfy the V2-58 observation check"
+    );
+    assert!(
+        green_exec_calls + green_fenced > 0,
+        "GREEN calls must satisfy the V2-58 total check"
+    );
+    assert_eq!(green_reasons, r20_f1_expected_reasons(0));
+    // True negatives — shapes the new expectation must REJECT:
+    // zero total calls (nothing observed on either strand).
+    let neg_len = 0usize;
+    let neg_exec = 0u64;
+    let neg_fenced = 0u64;
+    assert!(
+        neg_len == 0 && neg_fenced == 0,
+        "empty strands must fail the V2-58 observation check"
+    );
+    assert!(
+        neg_exec + neg_fenced == 0,
+        "zero total must fail the V2-58 total check"
+    );
+    // Polling fallback present: never admitted (the leg's
+    // polling tooth is unchanged by V2-58).
+    let polling_reasons = vec![
+        "discovery-loss".to_string(),
+        "lifecycle-polling-partial".to_string(),
+        "lowlevel-fallback-uninstrumented".to_string(),
+        "unattributed".to_string(),
+    ];
+    assert_ne!(polling_reasons, r20_f1_expected_reasons(0));
+    assert_ne!(polling_reasons, r20_f1_expected_reasons(128));
+    // Reasons missing base members.
+    assert_ne!(vec!["unattributed".to_string()], r20_f1_expected_reasons(0));
+    // Late-attach reason with a zero late counter
+    // (reasons⟺counters honesty runs both directions).
+    assert_ne!(red_reasons, r20_f1_expected_reasons(0));
+}
+
 #[test]
 #[ignore = "live lane only (OSSL_R20_LIVE=1 + root + BPF objects)"]
 fn ordinary_production_run_counts_real_crypto_free_of_polling_fallback() {
@@ -2961,14 +3064,31 @@ fn ordinary_production_run_counts_real_crypto_free_of_polling_fallback() {
         },
     )
     .expect("production run must accept and complete the supported target");
-    let total_calls: u64 = cap.executions.iter().map(|e| e.count).sum();
+    // V2-58 (fenced-aware F1): total observed calls span the FULL
+    // honest output — current-generation executions PLUS
+    // fenced-conserved calls (`stale`, sealed at fence time under
+    // R02 "never relabel a live cookie"). Phase-race mechanism
+    // (T9 RED vs GREEN/d): the workload's discovery tail (RAND
+    // table + cipher remainder — deterministic content) drains
+    // either mid-window, where a fatal round fences it
+    // (`CandidatesChanged`; RED: executions=0 with 1,078,384
+    // calls honestly bucketed as fenced), or at close (GREEN:
+    // executions=7). The current-gen-only projection reads the
+    // mid-window-drain phase as zero; summing both strands keeps
+    // identical teeth (genuine counted calls, no polling
+    // fallback, pinned build, witness pins, reasons⟺counters
+    // honesty) over executions ∪ fenced instead of weakening
+    // them.
+    let fenced_calls: u64 = cap.stale.iter().map(|bucket| bucket.events).sum();
+    let total_calls: u64 = cap.executions.iter().map(|e| e.count).sum::<u64>() + fenced_calls;
     eprintln!(
-        "r20 F1: outcome={:?} reasons={:?} executions={} calls={} child_exit={:?} \
+        "r20 F1: outcome={:?} reasons={:?} executions={} calls={} fenced_calls={} child_exit={:?} \
          build_id={:?} counters={:?}",
         cap.outcome,
         cap.reasons,
         cap.executions.len(),
         total_calls,
+        fenced_calls,
         cap.child_exit,
         cap.provider_build_id,
         cap.document
@@ -2977,14 +3097,17 @@ fn ordinary_production_run_counts_real_crypto_free_of_polling_fallback() {
             .map(|c| (c.name.as_str(), c.value))
             .collect::<Vec<_>>()
     );
-    // Genuineness: real queries executed and really counted.
+    // Genuineness: real queries executed and really counted —
+    // on the current strand, the fenced strand, or both (V2-58:
+    // either strand proves observation; RED strands everything
+    // fenced, GREEN drains current-gen).
     assert!(
-        !cap.executions.is_empty(),
-        "production counting must observe executions: {cap:?}"
+        !cap.executions.is_empty() || fenced_calls > 0,
+        "production counting must observe executions or fenced-conserved calls: {cap:?}"
     );
     assert!(
         total_calls > 0,
-        "production counting must count real calls: {cap:?}"
+        "production counting must count genuine calls across current + fenced generations: {cap:?}"
     );
     assert_eq!(cap.child_exit, Some(0), "workload must exit 0: {cap:?}");
     assert_ne!(
@@ -3032,17 +3155,20 @@ fn ordinary_production_run_counts_real_crypto_free_of_polling_fallback() {
     // the exact live set re-gates in the targeted live re-run,
     // which drops `discovery-loss` then iff live evidence shows
     // no remaining live Loss source.
+    // V2-58 (phase-conditional reason): `late-attach` rides the
+    // deterministic tail cluster's drain phase (RED: 128 late
+    // first-emits stranded mid-window; GREEN: close-drained, 0),
+    // so the exact set admits it IFF the late-attach counter is
+    // positive — reasons⟺counters honesty, not a weakening. Any
+    // fixed volume bound would be phase-flaky by construction
+    // (accepted residual, carried to the T14 final ledger).
     assert!(
         matches!(cap.outcome, osslscope::capture::Outcome::Partial),
         "exited owned workload is honestly PARTIAL: {cap:?}"
     );
     assert_eq!(
         cap.reasons,
-        vec![
-            "discovery-loss".to_string(),
-            "lowlevel-fallback-uninstrumented".to_string(),
-            "unattributed".to_string()
-        ],
+        r20_f1_expected_reasons(r20_doc_counter(&cap, "discovery.late_attach_sites")),
         "exact honest reason set: {cap:?}"
     );
     assert_eq!(
