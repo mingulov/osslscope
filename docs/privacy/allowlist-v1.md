@@ -313,6 +313,12 @@ gate reads clock + cells only).
   numeric per-record facts: `records`, `findings`, `polls`,
   `admitted`, `admitted_unknown`, `census_loss`, `entries`.
   No target strings, no runtime addresses.
+- Optional `selected_objects` (run-set selection, recorded on
+  every run — the key omits when the producer resolved no
+  selection): `harvest`, `count` (host object paths plus
+  sha256 each; the same provenance class as `objects`
+  display locators, never target paths), plus `members` on
+  triple runs only. No target strings, no runtime addresses.
 - Optional `engine_observations` (R05, rendered only when observed):
   per-observation pinned caller-module triple (object fingerprint,
   encoded device, inode), stub file offset, binding generation,
@@ -354,6 +360,13 @@ gate reads clock + cells only).
   are file offsets; `<inner>` is one of the above. The cookie and
   probe identity ride structurally on the attach record, never in
   text.
+- Optional `refusal_diagnostics` (R14 minor, rendered only when a
+  budget refusal occurred): sorted, deduped, capped array of
+  numeric refusal entries, each
+  `dev=<n> ino=<n> kind=<file_too_large|over_allowance>
+  bytes=<n> allowance=<n>`. No paths, no target strings, no
+  runtime addresses. (Unreadable-path `Err(_)` arms record no
+  entry — out of scope.)
 - Human output is a summary, not the same fields: sites omit
   JSON's first/last timestamps, device, and inode, and fenced
   generations render summary counts with detail deferred to

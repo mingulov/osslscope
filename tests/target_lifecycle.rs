@@ -3277,3 +3277,90 @@ fn kernel_subscribe_in_user_namespace_fails_closed() {
         other => panic!("userns probe unexpected status: {other:?}"),
     }
 }
+
+#[test]
+fn r18_stale_worker_touches_only_own_staging() {
+    // R18 residual: mid-prep abandonment — the worker creates its
+    // own staging file, then stalls past the setup deadline; the
+    // caller abandons on the deadline (no fork ever happens), and
+    // the late worker wakes, observes abandonment, and deletes ONLY
+    // its own staging — the neighbor file is untouched and nothing
+    // is published.
+    let dir = r06_scratch("r18-staging");
+    let sentinel = dir.join("neighbor.txt");
+    std::fs::write(&sentinel, b"untouched\n").unwrap();
+    let log = dir.join("workload.log");
+    let argv = r06_sentinel_argv(&dir.join("SENTINEL"));
+    let cancel = AtomicBool::new(false);
+    let counter = Arc::new(AtomicU32::new(0));
+    let mut before: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    before.sort();
+    __test_set_control_worker_counter(Some(counter.clone()));
+    __test_set_truncate_delay_ms(30_000);
+    let res = OwnedTarget::spawn_stopped_with_control(
+        &argv,
+        WorkloadDest::File(log.clone()),
+        Instant::now() + Duration::from_secs(2),
+        &cancel,
+    );
+    __test_set_truncate_delay_ms(0);
+    __test_set_control_worker_counter(None);
+    let err = res.err().expect("deadline-bound setup must fail");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("deadline") || msg.contains("expir"),
+        "names the bound: {msg}"
+    );
+    // The worker is still asleep in its mid-prep stall when the
+    // caller abandons; wait (bounded) for it to wake, observe
+    // abandonment, and delete its own staging before asserting the
+    // final state.
+    let end = Instant::now() + Duration::from_secs(45);
+    while counter.load(Ordering::SeqCst) < 1 {
+        assert!(Instant::now() < end, "worker never finished");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"untouched\n");
+    assert!(!log.exists(), "abandoned setup publishes nothing");
+    let mut after: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    after.sort();
+    assert_eq!(
+        after, before,
+        "stale worker created then deleted only its own staging"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn r18_abandoned_setup_never_hangs_caller() {
+    // R18 residual: bounded abandonment — the caller never hangs
+    // even when the worker stalls past the deadline.
+    let dir = r06_scratch("r18-abandon");
+    let log = dir.join("workload.log");
+    let argv = r06_sentinel_argv(&dir.join("SENTINEL"));
+    let cancel = AtomicBool::new(false);
+    __test_set_setup_delay_ms(30_000);
+    let t0 = Instant::now();
+    let res = OwnedTarget::spawn_stopped_with_control(
+        &argv,
+        WorkloadDest::File(log),
+        Instant::now() + Duration::from_secs(2),
+        &cancel,
+    );
+    __test_set_setup_delay_ms(0);
+    let err = res.err().expect("deadline-bound setup must fail");
+    let elapsed = t0.elapsed();
+    assert!(elapsed < Duration::from_secs(10), "bounded: {elapsed:?}");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("deadline") || msg.contains("expir") || msg.contains("cancel"),
+        "names the bound: {msg}"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}

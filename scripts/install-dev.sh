@@ -444,6 +444,8 @@ for _legacy in "$BIN_DEST.install-tmp" "$HARVEST_DEST.install-tmp" \
         exit 1
     fi
 done
+BIN_TMP=""; HARVEST_TMP=""; COUNT_TMP=""; DOC_TMP=""; RECEIPT_TMP=""; MEMBERS_TMP=""
+trap 'rm -rf "$STAGE"; rm -f "$BIN_TMP" "$HARVEST_TMP" "$COUNT_TMP" "$DOC_TMP" "$RECEIPT_TMP" "$MEMBERS_TMP"' EXIT INT TERM
 BIN_TMP="$(mktemp "$BIN_DEST.install-tmp.XXXXXX")" \
     || { echo "error: cannot create temporary file for $BIN_DEST" >&2; exit 1; }
 HARVEST_TMP="$(mktemp "$HARVEST_DEST.install-tmp.XXXXXX")" \
@@ -460,7 +462,6 @@ if [ -n "$MEMBERS_OBJ" ]; then
 else
     MEMBERS_TMP=""
 fi
-trap 'rm -rf "$STAGE"; rm -f "$BIN_TMP" "$HARVEST_TMP" "$COUNT_TMP" "$DOC_TMP" "$RECEIPT_TMP" "$MEMBERS_TMP"' EXIT INT TERM
 install_one() {
     # $1 = staged source, $2 = destination, $3 = temp file, $4 = mode, $5 = role label.
     # The temp file is a fresh mktemp path owned by this run; never write

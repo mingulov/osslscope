@@ -2312,6 +2312,80 @@ fn traversal_emission_matches_allowlist_inventory() {
     }
 }
 
+#[test]
+fn selected_objects_rendered_and_old_reader_safe() {
+    use osslscope::evidence::{RunSetProvenance, TraversalObject};
+    // v0.2 follow-up: EVERY run records its run-set selection —
+    // pair-only runs carry members: None (key omitted from the
+    // render, like the absent traversal section). The rendered
+    // key validates, pins its published shape, feeds the human
+    // line, and stays additive (a frozen pre-key reader parses
+    // the bytes).
+    let obj = |path: &str, sha256: &str| TraversalObject {
+        path: path.to_string(),
+        sha256: sha256.to_string(),
+    };
+    // Engine-bearing fixture: the frozen pre-key reader requires
+    // the keys a fully-populated render carries (same reader the
+    // R12 additivity test feeds).
+    let mut doc = engine_doc_fixture();
+    doc.selected_objects = Some(RunSetProvenance {
+        harvest: obj(
+            "/lib/osslscope/osslscope-harvest",
+            "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+        ),
+        count: obj(
+            "/lib/osslscope/osslscope-count",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ),
+        members: None,
+    });
+    let bytes = render_json(&doc).unwrap();
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    validate_v2(&v).expect("pair-only selection validates");
+    check_v2_semantics(&v).expect("pair-only selection semantics hold");
+    let sel = v["selected_objects"]
+        .as_object()
+        .expect("selected_objects section");
+    assert_eq!(sel["harvest"]["path"], "/lib/osslscope/osslscope-harvest");
+    assert_eq!(
+        sel["count"]["sha256"],
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    );
+    assert!(
+        sel.get("members").is_none(),
+        "pair-only selection omits members"
+    );
+    let human = render_human(&doc);
+    assert!(
+        human.contains("objects: harvest=/lib/osslscope/osslscope-harvest count=/lib/osslscope/osslscope-count\n"),
+        "human line names the pair selection, no members segment:\n{human}"
+    );
+    // Triple shape: members present renders + validates.
+    doc.selected_objects.as_mut().unwrap().members = Some(obj(
+        "/lib/osslscope/osslscope-members",
+        "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae",
+    ));
+    let bytes = render_json(&doc).unwrap();
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    validate_v2(&v).expect("triple selection validates");
+    check_v2_semantics(&v).expect("triple selection semantics hold");
+    assert_eq!(
+        v["selected_objects"]["members"]["path"],
+        "/lib/osslscope/osslscope-members"
+    );
+    let human = render_human(&doc);
+    assert!(
+        human.contains("members=/lib/osslscope/osslscope-members"),
+        "human line names the members object on triple runs:\n{human}"
+    );
+    // Additive proof: a frozen pre-key wire reader (no
+    // selected_objects field) parses the new bytes.
+    let back: PreR12WireDocument = serde_json::from_value(v).expect("old reader parses new bytes");
+    assert_eq!(back.schema_version, "observed-crypto-v2.1");
+    assert_eq!(back.completeness.status, "COMPLETE");
+}
+
 /// Parse the variant names of `pub enum {name}` from Rust source
 /// (leading identifiers of non-comment, non-attribute lines up to
 /// the closing brace).
@@ -2706,11 +2780,8 @@ fn semantics_rejects_inconsistent_policy_verdict() {
 }
 
 #[test]
-fn semantics_accepts_evaluated_runtime_verdicts() {
-    // R02: a FATAL/runtime doc carries an evaluated verdict (the AND
-    // of its rules) — violation, pass and inconclusive shapes all
-    // validate; no-verdict on usable evidence is rejected, as is any
-    // verdict contradicting its rules.
+fn semantics_accepts_aggregate_consistent_runtime_verdicts() {
+    // R02: aggregate-verdict consistency on a FATAL/runtime doc — violation, pass and inconclusive shapes validate when consistent with their rules. These pin CONSISTENCY, not evaluated Runtime outcomes: the retained 500-call DES site evidence means real evaluation would still violate.
     let v = json_of(&runtime_violation_doc());
     validate_v2(&v).expect("runtime violation shape validates");
     check_v2_semantics(&v).expect("runtime violation is consistent");
@@ -3203,13 +3274,16 @@ const EVIL_COMM_WIDE: &str =
 const EVIL_COMM_TAB_SHORT: &str = "a\tb\u{202E}c";
 const EVIL_COMM_BIDI_SHORT: &str = "\u{202E}RTL\u{202C}";
 
-/// Omitted invisible format controls (U+2060–U+2064): WORD JOINER,
-/// FUNCTION APPLICATION, INVISIBLE TIMES, INVISIBLE SEPARATOR,
-/// INVISIBLE PLUS. General_Category=Cf, outside `is_control`, so a
-/// renderer matching only C0/C1 passes them through. Each `x{c}y`
-/// comm below is 5 bytes — Linux-permitted.
+/// Invisible format controls (U+2060–U+2064 + deprecated
+/// U+206A–U+206F): WORD JOINER, FUNCTION APPLICATION, INVISIBLE
+/// TIMES, INVISIBLE SEPARATOR, INVISIBLE PLUS, plus INHIBIT
+/// SYMMETRIC SWAPPING .. NOMINAL DIGIT SHAPES. General_Category=Cf,
+/// outside `is_control`, so a renderer matching only C0/C1 passes
+/// them through. Each `x{c}y` comm below is 5 bytes —
+/// Linux-permitted.
 fn evil_comm_invisible() -> Vec<String> {
     (0x2060..=0x2064)
+        .chain(0x206A..=0x206F)
         .map(|cp| format!("x{}y", char::from_u32(cp).unwrap()))
         .collect()
 }
@@ -3223,16 +3297,15 @@ fn evil_comm_invisible() -> Vec<String> {
 /// copy of the renderer list), frozen as codepoint ranges below. Cc
 /// controls are covered by `char::is_control` (the std Cc property).
 /// Because the oracle embeds the whole category — 172 codepoints,
-/// including 145 the renderer does NOT neutralize (e.g. deprecated
-/// U+206A-U+206F, U+180E, TAGs) — a renderer omission cannot hide by
-/// shared selection: any Cf/Zl/Zp char in test inputs fails here
-/// unless neutralized.
+/// including 139 the renderer does NOT neutralize (e.g. U+180E,
+/// TAGs) — a renderer omission cannot hide by shared selection:
+/// any Cf/Zl/Zp char in test inputs fails here unless neutralized.
 ///
 /// Regenerate (must reproduce these ranges exactly; exact command in
 /// the R12 report): classify every scalar value with
 /// `unicodedata.category`, keep Cf/Zl/Zp, compress to ranges.
 ///
-/// Scope note: the renderer covers 27 of these 172 (see
+/// Scope note: the renderer covers 33 of these 172 (see
 /// `is_display_control`); the remainder pass through today. No
 /// fixture scanned below contains them, so the suite is green;
 /// feeding any uncovered Cf through the renderer now FAILS the
@@ -3314,11 +3387,12 @@ fn r12_context_renders_in_json_with_exact_values() {
 
 #[test]
 fn r12_oracle_covers_invisible_format_controls() {
-    // The oracle guards itself: it must forbid the omitted-format
-    // range (U+2060-U+2064) plus one representative of every other
-    // forbidden class — and it must NOT be a copy of the renderer
-    // list, so it additionally forbids Cf controls the renderer
-    // passes through (U+206A-U+206F, U+180E, ...), proves
+    // The oracle guards itself: it must forbid the invisible-format
+    // ranges (U+2060-U+2064 + deprecated U+206A-U+206F, both now
+    // neutralized by the renderer) plus one representative of every
+    // other forbidden class — and it must NOT be a copy of the
+    // renderer list, so it additionally forbids Cf controls the
+    // renderer passes through (U+180E, U+0600, TAGs, ...), proves
     // category-precision on unassigned neighbors (U+2065, U+E0000
     // are Cn, not forbidden), and pins the frozen UCD 16.0
     // population (172) against row erosion. Ordinary printable
@@ -3352,13 +3426,19 @@ fn r12_oracle_covers_invisible_format_controls() {
         let c = char::from_u32(cp).unwrap();
         assert!(forbidden(c), "oracle must forbid U+{cp:04X}");
     }
+    // Deprecated Cf range: the oracle forbids U+206A-U+206F and
+    // the renderer neutralizes them too (R12 minor) — both lists
+    // cover this range.
+    for cp in 0x206Au32..=0x206F {
+        let c = char::from_u32(cp).unwrap();
+        assert!(!c.is_control(), "U+{cp:04X} must be outside is_control");
+        assert!(ucd_is_format_control(c), "oracle must forbid U+{cp:04X}");
+    }
     // Non-copy proof: the oracle forbids Cf controls the renderer
     // does NOT neutralize (none of these appear in
     // `is_display_control`), so the oracle cannot be a copy of the
     // renderer list.
-    for cp in [
-        0x206Au32, 0x206B, 0x206C, 0x206D, 0x206E, 0x206F, 0x180E, 0x0600, 0xE0020,
-    ] {
+    for cp in [0x180Eu32, 0x0600, 0xE0020] {
         let c = char::from_u32(cp).unwrap();
         assert!(!c.is_control(), "U+{cp:04X} must be outside is_control");
         assert!(
@@ -3395,7 +3475,11 @@ fn r12_human_neutralizes_target_controlled_comm() {
         "tab/bidi comms must be short"
     );
     let invisible = evil_comm_invisible();
-    assert_eq!(invisible.len(), 5, "one comm per U+2060–U+2064");
+    assert_eq!(
+        invisible.len(),
+        11,
+        "one comm per U+2060–U+2064 + U+206A–U+206F"
+    );
     for comm in &invisible {
         assert_eq!(comm.len(), 5, "invisible-format comm must be 5 bytes");
     }
@@ -3425,6 +3509,32 @@ fn r12_human_neutralizes_target_controlled_comm() {
         assert!(text.contains("status=COMPLETE"), "{text}");
         assert!(text.contains("policy: violation"), "{text}");
         assert!(text.contains("absence = not-observed in window"), "{text}");
+    }
+}
+
+#[test]
+fn r12_human_neutralizes_deprecated_format_controls() {
+    // R12 Cf minor (reviewer-named range): deprecated U+206A–U+206F
+    // neutralize to `?` in human rendering, exactly like
+    // U+2060–U+2064 — while JSON keeps the reversible original.
+    for cp in 0x206Au32..=0x206F {
+        let comm = format!("x{}y", char::from_u32(cp).unwrap());
+        assert_eq!(comm.len(), 5, "deprecated-format comm must be 5 bytes");
+        let mut doc = violation_doc();
+        doc.target.comm = comm.clone();
+        let text = render_human(&doc);
+        assert_no_active_display_controls(&text);
+        assert!(
+            text.contains("x?y"),
+            "U+{cp:04X} must render as `?`:\n{text}"
+        );
+        let mut jdoc = complete_doc();
+        jdoc.target.comm = comm.clone();
+        assert_eq!(
+            json_of(&jdoc)["target"]["comm"],
+            comm,
+            "JSON must round-trip U+{cp:04X}"
+        );
     }
 }
 
@@ -3683,6 +3793,8 @@ struct PreR12WireSite {
     calls: u64,
     first_ns: u64,
     last_ns: u64,
+    #[serde(default)]
+    installed_at: Option<u64>,
 }
 
 #[derive(serde::Deserialize, Debug)]
@@ -3871,4 +3983,121 @@ fn r12_context_carries_no_forbidden_keys() {
         );
     }
     assert_no_forbidden_keys(&v, "context-doc.json");
+}
+
+/// Pre-refusal wire-reader shape: the supported-evidence subset
+/// an old (pre-`refusal_diagnostics`) reader parses from the
+/// PUBLISHED artifact layout (`render_json` bytes). No
+/// `refusal_diagnostics` field; serde ignores that unknown key
+/// by default — exactly like a real old field reader. Inner
+/// objects deny unknown fields, so the shape provably matches
+/// the published layout instead of loosely parsing it.
+#[derive(serde::Deserialize, Debug)]
+#[allow(dead_code)]
+struct PreRefusalWireDocument {
+    schema_version: String,
+    sites: Vec<PreR12WireSite>,
+    objects: Vec<PreR12WireObject>,
+}
+
+#[test]
+fn r14_refusal_diagnostics_additive_old_reader_safe() {
+    // Correct direction: the UNCHANGED refusal-bearing RENDERED
+    // artifact (`render_json` bytes — one of each producer kind)
+    // validates against the schema and feeds a frozen pre-key
+    // wire-reader shape. The old reader parses the published
+    // layout and its supported evidence survives intact; the
+    // unknown key is ignored.
+    let mut doc = complete_doc();
+    doc.refusal_diagnostics = vec![
+        "dev=8 ino=100 kind=file_too_large bytes=2048 allowance=1024".to_string(),
+        "dev=8 ino=200 kind=over_allowance bytes=1536 allowance=1024".to_string(),
+    ];
+    let bytes = render_json(&doc).expect("rendered artifact serializes");
+    let rendered: Value = serde_json::from_slice(&bytes).expect("rendered artifact parses");
+    validate_v2(&rendered).expect("rendered artifact fails schema");
+    check_v2_semantics(&rendered).expect("rendered artifact fails semantics");
+    assert_eq!(
+        rendered["refusal_diagnostics"].as_array().unwrap().len(),
+        2,
+        "artifact must carry refusals into the old reader"
+    );
+    let back: PreRefusalWireDocument =
+        serde_json::from_value(rendered).expect("old reader parses new bytes");
+    assert_eq!(back.schema_version, "observed-crypto-v2.1");
+    assert_eq!(back.sites.len(), doc.sites.len());
+    assert_eq!(back.objects.len(), doc.objects.len());
+    let calls: u64 = back.sites.iter().map(|s| s.calls).sum();
+    assert_eq!(
+        calls,
+        doc.total_calls(),
+        "calls conserved through the old reader"
+    );
+}
+
+#[test]
+fn r12_old_reader_accepts_installed_at_variant() {
+    // R12 installed_at minor: the frozen pre-R12 wire reader must
+    // tolerate the existing optional installed_at field. Fixture
+    // mirrors the existing R12 leg (engine observations present —
+    // the shape requires them; a bare violation doc omits the key).
+    let mut doc = engine_doc_fixture();
+    doc.sites[0].installed_at = Some(5);
+    let bytes = render_json(&doc).expect("render");
+    let wire: PreR12WireDocument =
+        serde_json::from_slice(&bytes).expect("old reader parses installed_at bytes");
+    assert_eq!(wire.sites[0].installed_at, Some(5));
+}
+
+/// Frozen pre-R01 coverage reader: the wire values an old (pre-R01)
+/// reader knew (`complete`, `unknown`). Serde rejects unknown enum
+/// variants by default, so a reader that types coverage as this enum
+/// fails LOUD on the newer `ambiguous_complete` value instead of
+/// silently misreading it as a `String` reader would.
+///
+/// v2.1 upgrade obligation: any reader frozen at this shape MUST be
+/// extended with the `ambiguous_complete` variant (attributed-but-
+/// unresolvable — NOT unattributed) before it consumes v2.1
+/// artifacts, or it will loudly reject executed-site records.
+#[derive(serde::Deserialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[allow(dead_code)]
+enum PreR01Coverage {
+    Complete,
+    Unknown,
+}
+
+/// Minimal frozen pre-R01 site wrapper: pins only the coverage wire
+/// value. Unknown object keys are ignored (like a real old field
+/// reader); the coverage VALUE itself is strictly typed.
+#[derive(serde::Deserialize, Debug)]
+#[allow(dead_code)]
+struct PreR01Site {
+    candidates_coverage: PreR01Coverage,
+}
+
+#[test]
+fn r01_old_reader_rejects_ambiguous_complete_loud() {
+    // Strict old readers fail LOUD, never silently misread: a real
+    // rendered site carrying ambiguous_complete (schema-valid) must
+    // be rejected with unknown-variant by the frozen pre-R01 shape,
+    // while the values the old reader knew still parse.
+    let mut v = json_of(&complete_doc());
+    v["sites"][0]["candidates_coverage"] = json!("ambiguous_complete");
+    validate_v2(&v).expect("ambiguous_complete fails schema");
+    let err = serde_json::from_value::<PreR01Site>(v["sites"][0].clone())
+        .expect_err("old reader must fail LOUD on ambiguous_complete");
+    assert!(
+        err.to_string().contains("unknown variant"),
+        "expected unknown-variant rejection, got: {err}"
+    );
+    let mut v = json_of(&complete_doc());
+    v["sites"][0]["candidates_coverage"] = json!("complete");
+    let site: PreR01Site =
+        serde_json::from_value(v["sites"][0].clone()).expect("old reader parses complete");
+    assert_eq!(site.candidates_coverage, PreR01Coverage::Complete);
+    v["sites"][0]["candidates_coverage"] = json!("unknown");
+    let site: PreR01Site =
+        serde_json::from_value(v["sites"][0].clone()).expect("old reader parses unknown");
+    assert_eq!(site.candidates_coverage, PreR01Coverage::Unknown);
 }

@@ -313,6 +313,13 @@ fn h5_t3_every_device_site_names_one_domain() {
             "dev: plan::encode_device(libc::major(m.dev()), libc::minor(m.dev())),",
             1,
         ),
+        // capture.rs (R14): refusal-tag identity — raw dev_t from
+        // fs metadata, rendered into the numeric diagnostic string
+        // only, never joined/compared.
+        ("src/capture.rs", "raw", ".map(|m| (m.dev(), m.ino()))", 1),
+        // capture.rs (R14): cached-over-allowance refusal —
+        // fstat-encoded word rendered only, never joined/compared.
+        ("src/capture.rs", "display", "cached.file.dev,", 1),
         // target.rs: staging self-delete guard (R06: raw lstat
         // dev_t vs the raw dev_t recorded at staging creation —
         // both raw, never encoded; re-pinned during R20 while the

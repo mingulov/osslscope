@@ -312,6 +312,23 @@ fn read_percpu(loaded: &Loaded, name: &str, key: u32, or: bool) -> u64 {
     0
 }
 
+/// Per-CPU slot vector for one u32 key (R19 minor-1: the
+/// concurrent-leg cross-CPU proof reads slots, not the fold).
+fn read_percpu_slots(loaded: &Loaded, name: &str, key: u32) -> Vec<u64> {
+    use aya::maps::{Map, MapData, PerCpuHashMap};
+    let fd = loaded.maps[name].try_clone().expect("clone map");
+    let data = MapData::from_fd(fd).expect("mapdata");
+    let map = Map::from_map_data(data).expect("map");
+    let m = PerCpuHashMap::<_, u32, u64>::try_from(map).expect("percpu shape");
+    for r in m.iter() {
+        let (k, slots) = r.expect("percpu iter");
+        if k == key {
+            return slots.to_vec();
+        }
+    }
+    Vec::new()
+}
+
 /// Folded LOSS[id] read (absent id reads 0).
 fn loss_val(loaded: &Loaded, id: u32) -> u64 {
     use aya::maps::{Map, MapData, PerCpuHashMap};
@@ -6145,22 +6162,25 @@ fn d_trunc_lossless_deltas() {
         FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
         let barrier = std::sync::Barrier::new(3);
         let tids = std::sync::Mutex::new(Vec::new());
+        let pins = std::sync::Mutex::new(Vec::new());
         std::thread::scope(|s| {
             for cpu in [0usize, 1usize] {
                 let barrier = &barrier;
                 let tids = &tids;
+                let pins = &pins;
                 s.spawn(move || {
-                    // Pin to force cross-CPU increments
-                    // (best-effort — the sum is exact either
-                    // way; unpinned threads just share a slot
-                    // serially).
-                    unsafe {
+                    // Pin to force cross-CPU increments; each
+                    // worker records its pin outcome for the
+                    // slot proof below (R19 minor-1).
+                    let ok = unsafe {
                         let mut set: libc::cpu_set_t = std::mem::zeroed();
                         libc::CPU_SET(cpu, &mut set);
-                        if libc::sched_setaffinity(0, std::mem::size_of_val(&set), &set) != 0 {
-                            eprintln!("trunc-lossless: pin to CPU {cpu} failed, continuing");
-                        }
+                        libc::sched_setaffinity(0, std::mem::size_of_val(&set), &set) == 0
+                    };
+                    if !ok {
+                        eprintln!("trunc-lossless: pin to CPU {cpu} failed, continuing");
                     }
+                    pins.lock().unwrap().push(ok);
                     let tid = self_tid();
                     tids.lock().unwrap().push(tid);
                     barrier.wait();
@@ -6180,10 +6200,30 @@ fn d_trunc_lossless_deltas() {
             barrier.wait();
         });
         let _ = drain(loaded2);
+        // R19 minor-1: the cross-CPU proof needs two online CPUs
+        // and two successful pins; without either, the slot
+        // assertion would prove nothing.
+        let ncpu = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
+        if ncpu < 2 {
+            eprintln!("SKIP: single-CPU host cannot prove cross-CPU placement");
+            return;
+        }
+        {
+            let pins = pins.lock().unwrap();
+            assert_eq!(pins.len(), 2, "trunc-lossless: two workers report pins");
+            if !pins.iter().all(|p| *p) {
+                panic!("affinity failure on multi-CPU host: cross-CPU proof impossible");
+            }
+        }
         assert_eq!(
             read_percpu(loaded2, "TRUNC_SEQ", OP, false),
             40,
             "trunc-lossless: concurrent generations sum exactly (2 threads x 10 fires x 2 NOIMP)"
+        );
+        let slots = read_percpu_slots(loaded2, "TRUNC_SEQ", OP);
+        assert!(
+            slots.iter().filter(|s| **s > 0).count() >= 2,
+            "trunc-lossless: two contributing CPU slots prove cross-CPU placement: {slots:?}"
         );
         assert_eq!(
             read_percpu(loaded2, "TRUNC", OP, true),

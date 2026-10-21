@@ -685,6 +685,21 @@ fn doc_json(doc: &CaptureDocument) -> serde_json::Value {
             "entries": t.entries,
         });
     }
+    // v0.2 run-set selection: every run records the exact
+    // objects it resolved (pair-only runs omit `members` — the
+    // same provenance class as `traversal`'s triple, never
+    // target paths).
+    if let Some(sel) = &doc.selected_objects {
+        let obj = |o: &crate::evidence::TraversalObject| serde_json::json!({"path": o.path, "sha256": o.sha256});
+        let mut section = serde_json::json!({
+            "harvest": obj(&sel.harvest),
+            "count": obj(&sel.count),
+        });
+        if let Some(members) = &sel.members {
+            section["members"] = obj(members);
+        }
+        out["selected_objects"] = section;
+    }
     if let Some(disposition) = &doc.disposition {
         let (outcome, code, pid) = match disposition.outcome {
             DispositionOutcome::Exited => ("exited", disposition.code, None),
@@ -776,6 +791,11 @@ fn doc_json(doc: &CaptureDocument) -> serde_json::Value {
     if !doc.attach_diagnostics.is_empty() {
         out["attach_diagnostics"] = serde_json::json!(doc.attach_diagnostics);
     }
+    // R14 minor: refusal diagnostics render only when recorded
+    // (same optional-key rule — numeric entries, capped upstream).
+    if !doc.refusal_diagnostics.is_empty() {
+        out["refusal_diagnostics"] = serde_json::json!(doc.refusal_diagnostics);
+    }
     out
 }
 
@@ -848,6 +868,20 @@ pub fn render_human(doc: &CaptureDocument) -> String {
         or_none(&safe_display(&doc.target.container_id)),
         or_none(&safe_display(&doc.target.image_digest)),
     ));
+    // v0.2 run-set selection: the exact objects the run resolved
+    // (members segment only on triple runs).
+    if let Some(sel) = &doc.selected_objects {
+        let mut line = format!(
+            "objects: harvest={} count={}",
+            safe_display(&sel.harvest.path),
+            safe_display(&sel.count.path),
+        );
+        if let Some(members) = &sel.members {
+            line.push_str(&format!(" members={}", safe_display(&members.path)));
+        }
+        line.push('\n');
+        s.push_str(&line);
+    }
     match &doc.disposition {
         Some(d) if d.outcome == DispositionOutcome::Exited => {
             s.push_str(&format!(
@@ -1117,8 +1151,8 @@ fn fp_short(fp: &str) -> String {
 /// Neutralize target-controlled text for human (terminal/log)
 /// display (R12/F14): every control, bidi-override/isolate and
 /// listed zero-width/format character becomes `?` (coverage is the
-/// `is_display_control` set only: U+2060-U+2064 neutralized, while
-/// deprecated U+206A-U+206F and other unlisted Cf controls pass
+/// `is_display_control` set only: U+2060-U+2064 and deprecated
+/// U+206A-U+206F neutralized, while other unlisted Cf controls pass
 /// through), so rendered lines cannot move the cursor, inject fake
 /// lines, or reorder displayed text. Identity on clean text. Applies
 /// at the human boundary to
@@ -1153,6 +1187,7 @@ fn is_display_control(c: char) -> bool {
             | '\u{2028}'..='\u{202E}' // LINE SEPARATOR .. RIGHT-TO-LEFT OVERRIDE
             | '\u{2060}'..='\u{2064}' // WORD JOINER .. INVISIBLE PLUS
             | '\u{2066}'..='\u{2069}' // bidi isolates
+            | '\u{206A}'..='\u{206F}' // deprecated Cf: INHIBIT SYMMETRIC SWAPPING .. NOMINAL DIGIT SHAPES (R12 minor)
             | '\u{FEFF}' // ZERO WIDTH NO-BREAK SPACE / BOM
             | '\u{FFF9}'..='\u{FFFB}' // interlinear annotation
     )

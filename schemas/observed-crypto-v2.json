@@ -265,6 +265,11 @@
       "type": "array",
       "items": { "type": "string", "minLength": 1 }
     },
+    "refusal_diagnostics": {
+      "description": "Budget-refusal diagnostic entries (R14 minor, optional): sorted, deduped, capped numeric entries (dev/ino/kind/bytes/allowance, no paths) identifying refused objects. Omitted when none refused. Diagnostic only: counters stay the exact counts; old field readers ignore this key.",
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
     "traversal": {
       "description": "Traversal outcome (v2.1, optional — present iff the window ran the members backend): the exact selected triple plus record/findings/poll counts, the admitted-query census, per-record native facts, and census loss. Absent on harvest-only runs. The six triple/count keys are required; the census/entry keys are optional (additive — old readers ignore them) but always emitted by current producers.",
       "type": "object",
@@ -296,6 +301,17 @@
           "description": "Cumulative admitted-increment loss (CALLS map pressure).",
           "$ref": "#/$defs/u64"
         }
+      }
+    },
+    "selected_objects": {
+      "description": "Run-set selection provenance (v0.2, optional — recorded on every production run's document, absent on stubbed `observe` captures): the exact objects the run resolved, so doctor/report/check agree on the selection. Pair-only runs omit `members`. Additive and old-reader-safe.",
+      "type": "object",
+      "required": ["harvest", "count"],
+      "additionalProperties": false,
+      "properties": {
+        "harvest": { "$ref": "#/$defs/traversal-object" },
+        "count": { "$ref": "#/$defs/traversal-object" },
+        "members": { "$ref": "#/$defs/traversal-object" }
       }
     }
   },

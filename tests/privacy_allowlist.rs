@@ -732,3 +732,67 @@ fn attach_diagnostics_vocabulary_has_no_pathnames() {
         );
     }
 }
+
+/// R14 minor: every rendered refusal entry matches the numeric
+/// grammar `dev=<n> ino=<n> kind=<a-z_> bytes=<n>
+/// allowance=<n>` — identities and sizes only, never paths. One
+/// of each producer kind (no regex crate in dev-deps, so the
+/// grammar is checked by hand).
+#[test]
+fn refusal_diagnostics_shape_is_numeric_only() {
+    use osslscope::evidence::{
+        CaptureWindow, FinalizeInput, LegacyCallPartition, OpensslVersion, TargetRecord, finalize,
+    };
+    let diags = [
+        "dev=8 ino=100 kind=file_too_large bytes=2048 allowance=1024",
+        "dev=8 ino=200 kind=over_allowance bytes=1536 allowance=1024",
+    ];
+    let mut doc = finalize(FinalizeInput {
+        window: CaptureWindow {
+            requested_start_ns: 0,
+            requested_end_ns: 0,
+            effective_start_ns: 0,
+            effective_end_ns: 0,
+            signal_cut: false,
+        },
+        sites: Vec::new(),
+        fenced: Vec::new(),
+        objects: Vec::new(),
+        coverage: Vec::new(),
+        counters: Vec::new(),
+        fatal: None,
+        target: TargetRecord::unknown(),
+        openssl: OpensslVersion::unknown(),
+        disposition: None,
+        policy: None,
+        legacy_partition: LegacyCallPartition::default(),
+        engine_observations: Vec::new(),
+        traversal: None,
+    });
+    doc.refusal_diagnostics = diags.iter().map(|s| s.to_string()).collect();
+    let bytes = osslscope::report::render_json(&doc).unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let rendered: Vec<&str> = v["refusal_diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d.as_str().unwrap())
+        .collect();
+    assert_eq!(rendered.len(), diags.len());
+    fn num(v: &str) -> bool {
+        !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit())
+    }
+    fn kind(v: &str) -> bool {
+        !v.is_empty() && v.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
+    }
+    for d in &rendered {
+        assert!(!d.contains('/'), "refusal carries a pathname: {d}");
+        let parts: Vec<&str> = d.split(' ').collect();
+        assert_eq!(parts.len(), 5, "five space-separated fields: {d}");
+        assert!(parts[0].strip_prefix("dev=").is_some_and(num));
+        assert!(parts[1].strip_prefix("ino=").is_some_and(num));
+        assert!(parts[2].strip_prefix("kind=").is_some_and(kind));
+        assert!(parts[3].strip_prefix("bytes=").is_some_and(num));
+        assert!(parts[4].strip_prefix("allowance=").is_some_and(num));
+    }
+}

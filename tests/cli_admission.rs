@@ -916,3 +916,33 @@ fn inspect_outcome_usage_is_exit2() {
     assert_eq!(run_inspect(&argv(&["--help"])), ExitCode::from(0));
     assert_eq!(run_inspect(&base_inspect(&["--help"])), ExitCode::from(0));
 }
+
+#[test]
+fn help_token_in_operand_position_is_not_help() {
+    // R07 help-scan minor: --help/-h consumed as an OPTION VALUE
+    // must not print help (exit 0). Free-string values reach
+    // setup (exit 4 on the bogus paths); a mistyped value is a
+    // usage error (exit 2) — never help.
+    assert_eq!(
+        run_inspect(&base_inspect(&["--marker", "--help"])),
+        ExitCode::from(4),
+        "marker value --help reaches setup"
+    );
+    assert_eq!(
+        run_inspect(&base_inspect(&["--out", "-h"])),
+        ExitCode::from(4),
+        "out value -h reaches setup"
+    );
+    assert_eq!(
+        run_inspect(&base_inspect(&["--timeout", "--help"])),
+        ExitCode::from(2),
+        "timeout value --help is a usage error"
+    );
+}
+
+#[test]
+fn help_token_in_flag_position_is_help() {
+    // Positive controls: bare --help/-h still short-circuit.
+    assert_eq!(run_inspect(&base_inspect(&["--help"])), ExitCode::SUCCESS);
+    assert_eq!(run_inspect(&base_inspect(&["-h"])), ExitCode::SUCCESS);
+}

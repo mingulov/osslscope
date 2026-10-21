@@ -59,6 +59,36 @@ impl InspectArgs {
 
 const USAGE: &str = "usage: osslscope inspect --pid PID --provider SO --object BPF [--out FILE] [--marker M] [--settle S] [--timeout S] [--builtin [--table FILE] [--force-offset N]] [--legacy]";
 
+/// Value-taking inspect flags (must stay in sync with [`parse`]).
+/// Help recognition skips the token after one of these, so
+/// `--marker --help` passes "--help" as the marker (R07 minor).
+const VALUE_FLAGS: &[&str] = &[
+    "--pid",
+    "--provider",
+    "--object",
+    "--out",
+    "--settle",
+    "--timeout",
+    "--marker",
+    "--table",
+    "--force-offset",
+];
+
+/// True when `--help`/`-h` appears at flag position (never when
+/// consumed as an option value).
+fn wants_help(args: &[String]) -> bool {
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "--help" || a == "-h" {
+            return true;
+        }
+        if VALUE_FLAGS.contains(&a.as_str()) {
+            let _ = it.next();
+        }
+    }
+    false
+}
+
 fn print_help() {
     println!("{USAGE}");
     println!("  --pid PID: live target to inventory (pinned against pid reuse)");
@@ -260,7 +290,7 @@ pub fn run_with(
 }
 
 pub fn run(args: &[String]) -> ExitCode {
-    if args.iter().any(|a| a == "--help" || a == "-h") {
+    if wants_help(args) {
         print_help();
         return ExitCode::SUCCESS;
     }

@@ -366,14 +366,18 @@ else
     bad "workflow stays dispatch-only NOT-RUN"
 fi
 
-# 10. The owned-lane placement is unchanged.
-if grep -q 'osslscope-bpf' "$WF"; then
+# 10. The owned-lane placement is unchanged (scoped to runs-on: a
+# comment naming the lane must not satisfy this guard — see leg 58).
+if grep -q 'runs-on:.*osslscope-bpf' "$WF"; then
     ok "workflow stays on the self-hosted osslscope-bpf lane"
 else
     bad "workflow stays on the self-hosted osslscope-bpf lane"
 fi
 
 # 11. The oracle still propagates its own return code.
+# Single quotes below are intentional: grep -F matches the literal
+# text `exit $rc` (double quotes would expand $rc and break this).
+# shellcheck disable=SC2016
 if step_text "Ledger oracle (independent counts)" | grep -q -F 'exit $rc'; then
     ok "oracle step still propagates exit rc"
 else
@@ -415,8 +419,11 @@ else
     bad "check.yml packaging job runs test-live-workflow.sh"
 fi
 
-# 16. The live-gates job stays SKIP-only.
-if grep -q 'SKIP(live-capability)' "$CHECK_YML"; then
+# 16. The live-gates job stays SKIP-only (scoped to the job block:
+# carries the SKIP echo and no live execution).
+GATES_BLOCK=$(awk '/^  live-gates:/{f=1} f{print} f&&/^  [a-z-]+:/&&!/live-gates/{exit}' "$CHECK_YML")
+if echo "$GATES_BLOCK" | grep -q 'SKIP(live-capability)' \
+    && ! echo "$GATES_BLOCK" | grep -qE 'cargo (test|run)|test-live-|live-oracle|osslscope run'; then
     ok "check.yml live-gates stay SKIP-only"
 else
     bad "check.yml live-gates stay SKIP-only"
@@ -813,6 +820,33 @@ if [ "$PROBE_RC" -ne 0 ] && gh_no_capable p-nospawn-fc; then
     ok "probe fail-closed report missing spawn-access fails setup without capable="
 else
     bad "probe fail-closed report missing spawn-access fails setup without capable= (rc=$PROBE_RC)"
+fi
+
+# --- R10 guard-scope mutants (RED-proven) ---
+
+# 58. Guard 10 is scoped to runs-on: a mutant workflow with the lane
+# removed from runs-on but named in a comment fools the old
+# anywhere-grep yet fails the scoped check.
+sed -e 's/^\( *runs-on:.*\)osslscope-bpf/\1mutant-lane/' "$WF" >"$T/wf-mutant.yml"
+echo "# mutant: osslscope-bpf named in a comment only" >>"$T/wf-mutant.yml"
+if grep -q 'osslscope-bpf' "$T/wf-mutant.yml" \
+    && ! grep -q 'runs-on:.*osslscope-bpf' "$T/wf-mutant.yml"; then
+    ok "guard 10 mutant: comment-only lane fools anywhere-grep, fails scoped check"
+else
+    bad "guard 10 mutant: comment-only lane fools anywhere-grep, fails scoped check"
+fi
+
+# 59. Guard 16 is scoped to the live-gates block: a mutant check.yml
+# with live execution inside live-gates (SKIP echo kept) fools the
+# old anywhere-grep yet fails the scoped block check.
+awk '{print} /live-known-n workflow is dispatch-only/{print "      - run: cargo test --live"}' "$CHECK_YML" >"$T/check-mutant.yml"
+MUTANT_BLOCK=$(awk '/^  live-gates:/{f=1} f{print} f&&/^  [a-z-]+:/&&!/live-gates/{exit}' "$T/check-mutant.yml")
+if grep -q 'SKIP(live-capability)' "$T/check-mutant.yml" \
+    && echo "$MUTANT_BLOCK" | grep -q 'SKIP(live-capability)' \
+    && echo "$MUTANT_BLOCK" | grep -qE 'cargo (test|run)|test-live-|live-oracle|osslscope run'; then
+    ok "guard 16 mutant: live execution in live-gates fools anywhere-grep, fails scoped check"
+else
+    bad "guard 16 mutant: live execution in live-gates fools anywhere-grep, fails scoped check"
 fi
 
 echo "---"

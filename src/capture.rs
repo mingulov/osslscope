@@ -175,9 +175,7 @@ pub struct ObjectProvenance {
     pub sha256: String,
 }
 
-/// Resolved triple provenance (recorded on the capture when
-/// traversal runs — the exact selected objects, so doctor and the
-/// capture agree; report/check CLI selection is follow-up work).
+/// Resolved triple provenance (recorded on the capture when traversal runs — the exact selected objects; run-set selection for ALL runs lives in CaptureDocument.selected_objects, so doctor/report/check agree; refusal-on-mismatch is v0.3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TripleProvenance {
     pub harvest: ObjectProvenance,
@@ -437,6 +435,13 @@ pub struct Capture {
     /// resolved-triple provenance plus the drained per-invocation
     /// records. `None` on harvest-only runs.
     pub traversal: Option<TraversalCapture>,
+    /// Run-set selection provenance (v0.2): the exact objects the
+    /// run resolved — recorded on every production run's document
+    /// (pair-only runs carry `members: None`), so
+    /// doctor/report/check agree on the selection. Set by
+    /// `run_inner` on every production run; `None` on stubbed
+    /// `observe` captures, which resolve no objects.
+    pub selected_objects: Option<evidence::RunSetProvenance>,
 }
 
 /// Minimal document for test constructors outside this module (real
@@ -3208,6 +3213,9 @@ pub struct AdapterState {
 /// the counters regardless).
 pub const ATTACH_DIAGNOSTICS_CAP: usize = 16;
 
+/// Cap on retained refusal diagnostics (R14 minor): sorted take.
+pub const REFUSAL_DIAGNOSTICS_CAP: usize = 16;
+
 impl AdapterState {
     /// Distinct backing triples seen per op (coverage census).
     pub fn op_discovered(&self, op: u32) -> u64 {
@@ -4279,6 +4287,11 @@ struct Runner<'x, D, B: CountBackend, T, L, C: ClockPort, P: ProcPort> {
     /// Relevant paths dropped by the per-poll relevance/bytes
     /// caps (loud loss at finalize).
     relevance_capped: u64,
+    /// Budget-refusal diagnostic entries (R14 minor): retained
+    /// sorted + deduped, capped — each names the refused object by
+    /// (dev, ino) plus kind/bytes/allowance. Numeric-only, no
+    /// paths (privacy: target paths never render).
+    refusal_diagnostics: BTreeSet<String>,
     /// File reads discarded by the freshness-race guard
     /// (pre/post metadata disagreed): served to nobody, loud loss
     /// at finalize, evidence-tainting (the rows miss).
@@ -4323,6 +4336,15 @@ const MAX_CACHED_FILES: usize = 256;
 /// growing into the gigabytes the old read-all round map
 /// routinely held.
 const MAX_CACHED_BYTES: usize = 128 * 1024 * 1024;
+
+/// Numeric refusal tag for a path (metadata dev/ino; `0/0` when
+/// the path cannot be stated — never the path itself).
+fn refusal_tag(p: &std::path::Path) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt as _;
+    std::fs::metadata(p)
+        .map(|m| (m.dev(), m.ino()))
+        .unwrap_or((0, 0))
+}
 
 /// File paths a discovery poll's consumers can touch (F-D/A13):
 /// candidate backing identities + array-owner identities (a
@@ -4608,6 +4630,11 @@ where
                     Err(e) if e.kind() == std::io::ErrorKind::FileTooLarge => {
                         self.file_cache.remove(p);
                         dropped = dropped.saturating_add(1);
+                        let (dev, ino) = refusal_tag(std::path::Path::new(p));
+                        let len = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+                        self.refusal_diagnostics.insert(format!(
+                            "dev={dev} ino={ino} kind=file_too_large bytes={len} allowance={allowance}"
+                        ));
                         continue;
                     }
                     Err(_) => {
@@ -4620,13 +4647,26 @@ where
             // within the remaining allowance — a hit past it skips
             // loud like a fresh-read refusal (a fresh read always
             // fits: the reader refuses past `allowance` first).
-            if let Some(cached) = self.file_cache.get(p) {
-                if cached.file.bytes.len() > allowance {
-                    dropped = dropped.saturating_add(1);
-                    continue;
-                }
+            if let Some(cached) = self
+                .file_cache
+                .get(p)
+                .filter(|c| c.file.bytes.len() <= allowance)
+            {
                 out_bytes = out_bytes.saturating_add(cached.file.bytes.len());
                 out.insert(p.clone(), cached.file.clone());
+            } else if self.file_cache.contains_key(p) {
+                let entry = {
+                    let cached = self.file_cache.get(p).expect("contains_key");
+                    format!(
+                        "dev={} ino={} kind=over_allowance bytes={} allowance={allowance}",
+                        cached.file.dev,
+                        cached.file.ino,
+                        cached.file.bytes.len()
+                    )
+                };
+                self.refusal_diagnostics.insert(entry);
+                dropped = dropped.saturating_add(1);
+                continue;
             }
         }
         self.relevance_capped = self.relevance_capped.saturating_add(dropped);
@@ -5507,6 +5547,7 @@ where
         drain_wall_us: 0,
         file_cache: HashMap::new(),
         relevance_capped: 0,
+        refusal_diagnostics: BTreeSet::new(),
         unverified_reads: 0,
         observation_started: false,
         traversal: None,
@@ -6771,6 +6812,14 @@ where
             .take(ATTACH_DIAGNOSTICS_CAP)
             .cloned()
             .collect();
+        // R14 minor: refusal diagnostics ride the document (sorted
+        // + deduped + capped upstream, same rule as attach_diagnostics).
+        document.refusal_diagnostics = self
+            .refusal_diagnostics
+            .iter()
+            .take(REFUSAL_DIAGNOSTICS_CAP)
+            .cloned()
+            .collect();
 
         // Legacy `legacy` block from IN-WINDOW tripwire evidence only
         // (baselined at the declared boundary; the post-count-close
@@ -7026,6 +7075,10 @@ where
             document,
             disposition: parts.disposition,
             traversal: self.traversal,
+            // `run_inner` stamps the resolved selection post-hoc
+            // (the Runner never sees it, so `observe` keeps its
+            // signature); stubbed captures honestly carry `None`.
+            selected_objects: None,
         }
     }
 }
@@ -7091,7 +7144,11 @@ fn fips_configured(provider: &Path) -> bool {
 
 /// Pre-attach recycle capture (`--pid` only): the pin failed during
 /// discovery attach, so no session was ever held.
-fn recycled_capture(cfg: &Config, info: &TargetInfo) -> Capture {
+fn recycled_capture(
+    cfg: &Config,
+    info: &TargetInfo,
+    selected_objects: Option<evidence::RunSetProvenance>,
+) -> Capture {
     let requested_end = info.acquired_ns.saturating_add(duration_ns(cfg.duration));
     let mut document = evidence::finalize(FinalizeInput {
         window: CaptureWindow {
@@ -7122,6 +7179,9 @@ fn recycled_capture(cfg: &Config, info: &TargetInfo) -> Capture {
         info.acquired_wall,
         info.acquired_wall,
     ));
+    // v0.2: the objects resolved before the recycle still record
+    // (the selection happened; only the window never opened).
+    document.selected_objects = selected_objects.clone();
     Capture {
         target_pid: info.pid,
         target_comm: info.comm.clone(),
@@ -7147,6 +7207,7 @@ fn recycled_capture(cfg: &Config, info: &TargetInfo) -> Capture {
         document,
         disposition: None,
         traversal: None,
+        selected_objects,
     }
 }
 
@@ -7307,19 +7368,28 @@ pub fn run_with_dirs(
         dirs,
         trust,
     ) {
-        Ok((onboard::RunSet::Triple(set), _)) => run_inner(
-            cfg,
-            target,
-            onboard::ObjectPaths {
-                harvest: set.harvest.clone(),
-                count: set.count.clone(),
-            },
-            Some(traversal_attach(&set, true)?),
-        ),
+        Ok((onboard::RunSet::Triple(set), _)) => {
+            let attach = traversal_attach(&set, true)?;
+            // v0.2: the run-set selection records on the document —
+            // the same identities the snapshot minted (no re-read).
+            let selected = run_set_from_triple(&attach.provenance);
+            run_inner(
+                cfg,
+                target,
+                onboard::ObjectPaths {
+                    harvest: set.harvest.clone(),
+                    count: set.count.clone(),
+                },
+                Some(attach),
+                Some(selected),
+            )
+        }
         Ok((onboard::RunSet::PairOnly(objects), _)) => {
             // Pair-only install (no members file anywhere): the
-            // ordinary harvest-only run, exactly as before.
-            run_inner(cfg, target, objects, None)
+            // ordinary harvest-only run, exactly as before — plus
+            // the run-set selection every document records.
+            let selected = selected_objects_for(&objects.harvest, &objects.count, None)?;
+            run_inner(cfg, target, objects, None, Some(selected))
         }
         Ok((onboard::RunSet::NoObjects(pair_e), _)) => {
             Err(anyhow::anyhow!("BPF objects: {}", pair_e.full()))
@@ -7364,6 +7434,10 @@ fn run_with_traversal_in(
         trust,
     )
     .map_err(|e| anyhow::anyhow!("BPF objects: {}", e.full()))?;
+    let attach = traversal_attach(&set, false)?;
+    // v0.2: explicit traversal runs record their selection too —
+    // the same identities the snapshot minted (no re-read).
+    let selected = run_set_from_triple(&attach.provenance);
     run_inner(
         cfg,
         target,
@@ -7371,7 +7445,8 @@ fn run_with_traversal_in(
             harvest: set.harvest.clone(),
             count: set.count.clone(),
         },
-        Some(traversal_attach(&set, false)?),
+        Some(attach),
+        Some(selected),
     )
 }
 
@@ -7487,6 +7562,43 @@ fn triple_snapshot(set: &onboard::ObjectSet) -> anyhow::Result<(TripleProvenance
     ))
 }
 
+/// Read + hash one run-set selection (v0.2 follow-up of the
+/// traversal-only `TripleProvenance`): the SAME bytes-and-sha256
+/// rule as `triple_snapshot`, for pair-only runs too.
+fn selected_objects_for(
+    harvest: &std::path::Path,
+    count: &std::path::Path,
+    members: Option<&std::path::Path>,
+) -> anyhow::Result<evidence::RunSetProvenance> {
+    let one = |p: &std::path::Path| -> anyhow::Result<evidence::TraversalObject> {
+        Ok(evidence::TraversalObject {
+            path: p.display().to_string(),
+            sha256: onboard::file_sha256_hex(p)?,
+        })
+    };
+    Ok(evidence::RunSetProvenance {
+        harvest: one(harvest)?,
+        count: one(count)?,
+        members: members.map(one).transpose()?,
+    })
+}
+
+/// Convert traversal-only provenance into run-set selection
+/// provenance (v0.2): the same identities `triple_snapshot`
+/// minted, shared with every document — no re-read, so no
+/// reread drift between the snapshot and the record.
+fn run_set_from_triple(p: &TripleProvenance) -> evidence::RunSetProvenance {
+    let obj = |o: &ObjectProvenance| evidence::TraversalObject {
+        path: o.path.display().to_string(),
+        sha256: o.sha256.clone(),
+    };
+    evidence::RunSetProvenance {
+        harvest: obj(&p.harvest),
+        count: obj(&p.count),
+        members: Some(obj(&p.members)),
+    }
+}
+
 /// Apply post-drain corrections to held verdicts (pure):
 /// rewrite outcome + op by (tid, seq) key. Unknown keys are
 /// ignored (defensive — holders extend monotonically, so a
@@ -7572,12 +7684,15 @@ fn wrap_discovery(
 
 /// Shared window setup over resolved objects (both entries funnel
 /// here after their own resolution; `traversal` selects the
-/// backend attach after discovery attaches, before release).
+/// backend attach after discovery attaches, before release;
+/// `selected_objects` is the run-set selection the caller resolved,
+/// stamped onto the capture and its document before return).
 fn run_inner(
     cfg: &Config,
     target: Target,
     objects: onboard::ObjectPaths,
     traversal: Option<TraversalAttach>,
+    selected_objects: Option<evidence::RunSetProvenance>,
 ) -> anyhow::Result<Capture> {
     arm_signals();
     // Triple runs load the retained count snapshot (no re-read —
@@ -7614,7 +7729,7 @@ fn run_inner(
         .provider_enrollment
         .as_ref()
         .unwrap_or(&empty_enrollment);
-    match target {
+    let cap = match target {
         Target::Spawn { argv, workload } => {
             let cmdline = args::redact_spawn_argv(&argv);
             // R06/F07: pre-stop setup runs under the checked
@@ -7774,7 +7889,7 @@ fn run_inner(
                     // Mid-attach recycle: fatal verdict, no sessions
                     // held (the count object drops unused).
                     if e.downcast_ref::<Recycled>().is_some() {
-                        return Ok(recycled_capture(&effective, &info));
+                        return Ok(recycled_capture(&effective, &info, selected_objects));
                     }
                     return Err(e.context("discovery attach"));
                 }
@@ -7799,7 +7914,15 @@ fn run_inner(
                 &interrupted,
             )
         }
-    }
+    };
+    // v0.2: every production run records its run-set selection —
+    // on the capture and its document alike (post-hoc: the Runner
+    // never sees it, so `observe` keeps its signature for the
+    // stubbed tests, which honestly carry `None`).
+    let mut cap = cap?;
+    cap.selected_objects = selected_objects.clone();
+    cap.document.selected_objects = selected_objects;
+    Ok(cap)
 }
 
 #[cfg(test)]
@@ -7887,6 +8010,45 @@ mod tests {
             trusted_uids: vec![unsafe { libc::getuid() }],
             check_ancestry: false,
         }
+    }
+
+    #[test]
+    fn selection_reader_hashes_pair() {
+        // capture.rs:180 follow-up: the pure selection reader records
+        // path + sha256 per object (members None on pair-only).
+        let dir = std::env::temp_dir().join("osslscope-selprobe");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("h.o"), b"harvest-bytes").unwrap();
+        std::fs::write(dir.join("c.o"), b"count-bytes").unwrap();
+        let sel = selected_objects_for(&dir.join("h.o"), &dir.join("c.o"), None).unwrap();
+        assert_eq!(sel.harvest.path, dir.join("h.o").display().to_string());
+        assert_eq!(
+            sel.harvest.sha256,
+            onboard::file_sha256_hex(&dir.join("h.o")).unwrap()
+        );
+        assert_eq!(
+            sel.count.sha256,
+            onboard::file_sha256_hex(&dir.join("c.o")).unwrap()
+        );
+        assert!(sel.members.is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn selection_reader_missing_object_errors() {
+        // capture.rs:180 follow-up: a missing/unreadable object is
+        // a hard error (the run fails) — never a silent skip.
+        let dir = std::env::temp_dir().join("osslscope-selprobe-gone");
+        let missing = dir.join("no-such-dir").join("h.o");
+        assert!(std::fs::metadata(&missing).is_err());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("c.o"), b"count-bytes").unwrap();
+        let err = selected_objects_for(&missing, &dir.join("c.o"), None).unwrap_err();
+        assert!(
+            !err.to_string().is_empty(),
+            "missing harvest must explain itself"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -10303,6 +10465,71 @@ mod tests {
                 generation: 0,
             }
         }
+
+        fn assert_completion_coherent(w: &WalkDone) {
+            // R19 minor-2: a Complete record's underlying slots must
+            // cohere with its verdict (cold terminator proves T —
+            // oracle.rs:2196; OK carries a real class, EMPTY carries
+            // OTHER_CLASS — R3-fixtures rule).
+            use crate::scan::oracle::{Outcome, TrueT};
+            use osslscope_ebpf_common as wire;
+            let Outcome::Complete { true_t, .. } = &w.outcome else {
+                return;
+            };
+            let min_empty = w
+                .algs
+                .iter()
+                .filter(|a| a.status == wire::ALG_EMPTY)
+                .map(|a| a.idx)
+                .min()
+                .expect("complete record needs a terminator");
+            assert_eq!(min_empty, *true_t, "min-EMPTY slot must equal true_t");
+            assert_eq!(w.true_t, TrueT::Proven(*true_t), "true_t must be Proven(t)");
+            for a in &w.algs {
+                if a.status == wire::ALG_OK {
+                    assert_ne!(a.class, wire::OTHER_CLASS, "OK carries a real class");
+                }
+            }
+        }
+
+        fn coherent_complete_walk(seq: u64, op: u32) -> WalkDone {
+            // Six members (ALG_OK@0..5) + min-EMPTY terminator@6:
+            // cold terminator proves T=6 (oracle.rs:2196).
+            use crate::scan::oracle::Outcome;
+            use osslscope_ebpf_common as wire;
+            walk_full(
+                seq,
+                op,
+                Outcome::Complete {
+                    true_t: 6,
+                    cached: false,
+                },
+                vec![
+                    ident(0, 0, wire::ALG_OK, 0),
+                    ident(1, 0, wire::ALG_OK, 0),
+                    ident(2, 0, wire::ALG_OK, 0),
+                    ident(3, 0, wire::ALG_OK, 0),
+                    ident(4, 0, wire::ALG_OK, 0),
+                    ident(5, 0, wire::ALG_OK, 0),
+                    ident(6, wire::OTHER_CLASS, wire::ALG_EMPTY, 0),
+                ],
+                vec![
+                    row_ev(0, 300),
+                    row_ev(1, 300),
+                    row_ev(2, 300),
+                    row_ev(3, 300),
+                    row_ev(4, 300),
+                    row_ev(5, 300),
+                ],
+                5_000_000_000,
+            )
+        }
+
+        #[test]
+        fn traversal_complete_fixtures_are_completion_coherent() {
+            let w = coherent_complete_walk(1, 1);
+            assert_completion_coherent(&w);
+        }
         fn triple_prov() -> TripleProvenance {
             let obj = |n: &str| ObjectProvenance {
                 path: PathBuf::from(format!("/prefix/lib/osslscope/{n}")),
@@ -10313,6 +10540,19 @@ mod tests {
                 count: obj("osslscope-count"),
                 members: obj("osslscope-members"),
             }
+        }
+
+        #[test]
+        fn run_set_from_triple_maps_roles() {
+            let t = triple_prov();
+            let sel = run_set_from_triple(&t);
+            assert_eq!(sel.harvest.path, t.harvest.path.display().to_string());
+            assert_eq!(sel.harvest.sha256, t.harvest.sha256);
+            assert_eq!(sel.count.path, t.count.path.display().to_string());
+            assert_eq!(sel.count.sha256, t.count.sha256);
+            let m = sel.members.expect("triple carries members");
+            assert_eq!(m.path, t.members.path.display().to_string());
+            assert_eq!(m.sha256, t.members.sha256);
         }
 
         #[test]
@@ -10516,23 +10756,8 @@ mod tests {
             // document sites carry NO anchor-offset synthetic
             // site, executions carry nothing synthetic, and the
             // traversal outcome retains the record.
-            use crate::scan::oracle::Outcome;
-            use osslscope_ebpf_common as wire;
             let round = TraversalDelta {
-                done: vec![walk_full(
-                    1,
-                    1,
-                    Outcome::Complete {
-                        true_t: 6,
-                        cached: false,
-                    },
-                    vec![
-                        ident(0, 0, wire::ALG_OK, 0),
-                        ident(1, wire::OTHER_CLASS, wire::ALG_EMPTY, 0),
-                    ],
-                    vec![row_ev(0, 300)],
-                    5_000_000_000,
-                )],
+                done: vec![coherent_complete_walk(1, 1)],
                 findings: vec![],
                 partial_reasons: vec![],
                 polls: 1,
@@ -10597,25 +10822,10 @@ mod tests {
             // capture retains the latest snapshot, and the
             // rendered traversal section reports it (additive
             // `admitted` map — old readers ignore unknown keys).
-            use crate::scan::oracle::Outcome;
-            use osslscope_ebpf_common as wire;
             let admitted: std::collections::BTreeMap<u32, u64> =
                 [(1u32, 3u64)].into_iter().collect();
             let round = TraversalDelta {
-                done: vec![walk_full(
-                    1,
-                    1,
-                    Outcome::Complete {
-                        true_t: 6,
-                        cached: false,
-                    },
-                    vec![
-                        ident(0, 0, wire::ALG_OK, 0),
-                        ident(1, wire::OTHER_CLASS, wire::ALG_EMPTY, 0),
-                    ],
-                    vec![row_ev(0, 300)],
-                    5_000_000_000,
-                )],
+                done: vec![coherent_complete_walk(1, 1)],
                 findings: vec![],
                 partial_reasons: vec![],
                 polls: 1,
@@ -10678,8 +10888,8 @@ mod tests {
             assert_eq!(entries[0]["op"], 1);
             assert_eq!(entries[0]["outcome"]["Complete"]["true_t"], 6);
             assert_eq!(entries[0]["true_t"], serde_json::json!({"Proven": 6}));
-            assert_eq!(entries[0]["alg_count"], 2);
-            assert_eq!(entries[0]["row_count"], 1);
+            assert_eq!(entries[0]["alg_count"], 7);
+            assert_eq!(entries[0]["row_count"], 6);
             assert_eq!(entries[0]["generation"], 0);
             // Old-reader compatibility: a reader that knows only
             // the round-3 shape parses the new document fine.
@@ -10699,23 +10909,8 @@ mod tests {
             // loss, the capture unions them across rounds, and
             // the rendered traversal section reports both
             // (additive keys — old readers ignore them).
-            use crate::scan::oracle::Outcome;
-            use osslscope_ebpf_common as wire;
             let round = |seq: u64, op: u32, unknown: u32, loss: u64| TraversalDelta {
-                done: vec![walk_full(
-                    seq,
-                    op,
-                    Outcome::Complete {
-                        true_t: 6,
-                        cached: false,
-                    },
-                    vec![
-                        ident(0, 0, wire::ALG_OK, 0),
-                        ident(1, wire::OTHER_CLASS, wire::ALG_EMPTY, 0),
-                    ],
-                    vec![row_ev(0, 300)],
-                    5_000_000_000,
-                )],
+                done: vec![coherent_complete_walk(seq, op)],
                 findings: vec![],
                 partial_reasons: vec![],
                 polls: 1,
@@ -11538,6 +11733,7 @@ mod tests {
                 drain_wall_us: 0,
                 file_cache: HashMap::new(),
                 relevance_capped: 0,
+                refusal_diagnostics: BTreeSet::new(),
                 unverified_reads: 0,
                 observation_started: false,
                 traversal: None,

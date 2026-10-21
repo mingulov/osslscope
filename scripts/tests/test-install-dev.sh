@@ -127,6 +127,24 @@ if python3 -c "import json; m=json.load(open('$T/pfx/share/osslscope/install-man
 else
     bad "install-manifest.json records prefix + 3 artifacts ($(cat "$T/err"))"
 fi
+# R08 finding-4: receipt version pin + frozen v1 old-reader compat.
+if python3 -c "import json; m=json.load(open('$T/pfx/share/osslscope/install-manifest.json')); assert m['schema']=='osslscope-install-manifest-v1', m.get('schema')" 2>"$T/err"; then
+    ok "receipt pins schema osslscope-install-manifest-v1"
+else
+    bad "receipt pins schema osslscope-install-manifest-v1 ($(cat "$T/err"))"
+fi
+if python3 -c "
+import json
+m = json.load(open('$T/pfx/share/osslscope/install-manifest.json'))
+v1 = {'schema','installed_at_utc','prefix','build_manifest','product_ref','product_dirty','setcap','artifacts'}
+assert v1 <= set(m), sorted(set(m))
+for a in m['artifacts']:
+    assert {'role','src','dest','selection','product_ref','product_dirty','sha256','bytes','file','build_id'} <= set(a), sorted(set(a))
+" 2>"$T/err"; then
+    ok "frozen v1 reader accepts the receipt (additive-field rule)"
+else
+    bad "frozen v1 reader accepts the receipt ($(cat "$T/err"))"
+fi
 if [ "$(stat -c %a "$T/pfx/share/osslscope/install-manifest.json")" = "644" ]; then
     ok "install-manifest.json is world-readable (unprivileged runs read their own receipt)"
 else
@@ -802,6 +820,44 @@ else
     cmp -s "$T/pfxc.snap" "$T/pfxc.now" \
         && ok "artifact-copy fault leaves existing prefix unchanged" \
         || bad "artifact-copy fault leaves existing prefix unchanged"
+fi
+# ============ R08: allocation-failure cleanup ============
+# Cleanup must be registered BEFORE allocation: a mktemp failure
+# partway must not leak the earlier zero-byte .install-tmp files.
+mk_tool_farm "$T/faultbin-mktemp"
+rm "$T/faultbin-mktemp/mktemp"
+cat >"$T/faultbin-mktemp/mktemp" <<EOF
+#!/bin/sh
+# Fail the 3rd install-tmp allocation only (COUNT_DEST).
+for _a in "\$@"; do
+    case "\$_a" in
+        *install-tmp.*)
+            _n=\$(cat "$T/mktemp-count" 2>/dev/null || echo 0)
+            _n=\$((_n + 1))
+            echo "\$_n" >"$T/mktemp-count"
+            if [ "\$_n" -eq 3 ]; then
+                echo "fault-injected mktemp failure: \$_a" >&2
+                exit 1
+            fi
+            ;;
+    esac
+done
+exec "$(command -v mktemp)" "\$@"
+EOF
+chmod +x "$T/faultbin-mktemp/mktemp"
+echo 0 >"$T/mktemp-count"
+if PATH="$T/faultbin-mktemp:$PATH" "$SH_BIN" "$INSTALL" \
+        --manifest "$T/manifest.json" --prefix "$T/pfxmk" >"$T/out" 2>&1; then
+    bad "mktemp fault fails (got exit 0)"
+else
+    grep -q 'cannot create temporary file' "$T/out" \
+        && ok "mktemp fault fails with diagnosis" \
+        || bad "mktemp fault fails with diagnosis (saw: $(head -1 "$T/out"))"
+fi
+if find "$T/pfxmk" -name '*.install-tmp.*' | grep -q .; then
+    bad "mktemp fault leaks .install-tmp files: $(find "$T/pfxmk" -name '*.install-tmp.*')"
+else
+    ok "mktemp fault leaks no .install-tmp files"
 fi
 
 # Artifact-copy failure mid-replacement: the install stops; already
