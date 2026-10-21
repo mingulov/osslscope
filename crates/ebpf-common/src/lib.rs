@@ -51,6 +51,28 @@ pub const fn birth_frozen(birth: u16) -> bool {
     birth == BIRTH_FROZEN
 }
 
+/// `ADMITTED` cells: one per-CPU u64 summed by userspace.
+pub const ADMITTED_ENTRIES: u32 = 1;
+
+/// Latency histogram buckets (log2 nanoseconds): bucket `k`
+/// covers `[2^k, 2^(k+1))` ns; bucket 15 clamps everything
+/// \>= 32768 ns. The 4us budget line (4000 ns) falls in bucket 11.
+/// Shared verbatim between BPF sampling and userspace scoring.
+pub const LAT_BUCKETS: usize = 16;
+
+pub const fn lat_bucket(delta_ns: u64) -> usize {
+    let mut b = 0;
+    let mut edge = 1u64;
+    while b < 15 {
+        if delta_ns < edge << 1 {
+            return b;
+        }
+        edge <<= 1;
+        b += 1;
+    }
+    15
+}
+
 /// Per-key aggregate. `count` saturates (never wraps);
 /// `first_ns`/`last_ns` are `bpf_ktime_get_ns` window bounds, NOT
 /// latency (latency is v2+). 24 bytes, align 8.

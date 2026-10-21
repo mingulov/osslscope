@@ -22,7 +22,7 @@ Reads nothing from target memory. It combines an attach-time cookie,
 a generation cell, the current TGID, and kernel timestamps into
 per-key counters. It emits no strings, pointers, or target bytes.
 
-Maps: `COUNTS`, `GEN`, `TARGET`, `WINDOW`, `DROPFAIL` (see §4).
+Maps: `COUNTS`, `GEN`, `TARGET`, `WINDOW`, `DROPFAIL`, `ADMITTED`, `LATC` (see §4).
 
 ## 2. eBPF harvest programs
 
@@ -199,6 +199,8 @@ GEN
 TARGET
 WINDOW
 DROPFAIL
+ADMITTED
+LATC
 # members
 EVENTS
 GEN

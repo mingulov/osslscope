@@ -118,6 +118,15 @@ else
     bad "deb control.in substitutes version+revision with no leftover placeholders"
 fi
 
+# Required control fields render (Package/Version/Architecture/Depends).
+if grep -q '^Package: osslscope$' "$T/control" \
+   && grep -q '^Architecture: amd64$' "$T/control" \
+   && grep -q '^Depends: libcap2-bin$' "$T/control"; then
+    ok "deb control carries Package/Architecture/Depends"
+else
+    bad "deb control carries Package/Architecture/Depends"
+fi
+
 # ============ deb matrix ============
 : >"$SETCAP_LOG"
 if run_with_stub sh "$POSTINST" configure 2>"$T/err"; then
@@ -157,6 +166,37 @@ if run_with_stub sh "$PRERM" upgrade 2>"$T/err"; then
     fi
 else
     bad "deb prerm upgrade exits 0 (got nonzero)"
+fi
+
+: >"$SETCAP_LOG"
+if run_with_stub sh "$POSTINST" abort-upgrade 2>"$T/err"; then
+    if [ ! -s "$SETCAP_LOG" ]; then
+        ok "deb postinst unknown arg exits 0 with no setcap call"
+    else
+        bad "deb postinst unknown arg exits 0 with no setcap call (saw: $(cat "$SETCAP_LOG"))"
+    fi
+else
+    bad "deb postinst unknown arg exits 0 (got nonzero)"
+fi
+
+: >"$SETCAP_LOG"
+if STUB_SETCAP_EXIT=1 run_with_stub sh "$POSTINST" configure 2>"$T/err"; then
+    if grep -q 'setcap failed' "$T/err"; then
+        ok "deb postinst with failing setcap warns, exit 0"
+    else
+        bad "deb postinst with failing setcap warns, exit 0"
+    fi
+else
+    bad "deb postinst with failing setcap still exits 0 (got nonzero)"
+fi
+
+: >"$SETCAP_LOG"
+if run_with_stub sh "$PRERM" deconfigure 2>"$T/err"; then
+    grep -q -- '-r /usr/bin/osslscope' "$SETCAP_LOG" \
+        && ok "deb prerm deconfigure clears caps" \
+        || bad "deb prerm deconfigure clears caps"
+else
+    bad "deb prerm deconfigure exits 0 (got nonzero)"
 fi
 
 # ============ rpm matrix (bodies extracted from spec) ============

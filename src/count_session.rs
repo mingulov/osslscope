@@ -88,6 +88,9 @@ pub struct DrainedCounts {
     pub rows: Vec<(u64, CountValue)>,
     /// Monotonic `DROPFAIL` total (map-full insert failures).
     pub dropfail_total: u64,
+    /// Monotonic `ADMITTED` total (every hit past TARGET + window).
+    pub admitted_total: u64,
+    pub lat_buckets: [u64; 16],
     /// Keys left unprocessed when the drain deadline expired.
     pub shortfall: u64,
 }
@@ -373,6 +376,16 @@ pub struct CountSession<B: CountBackend> {
     /// would race in-flight increments).
     seen: HashMap<(u32, u32), u64>,
     last_dropfail: u64,
+    /// Cumulative admitted hits across drains (delta-read like
+    /// `dropfail`, from `DrainedCounts.admitted_total`).
+    admitted: u64,
+    last_admitted: u64,
+    /// Cumulative callback-latency histogram (c8), folded across
+    /// drains from `DrainedCounts.lat_buckets`.
+    lat_cum: [u64; 16],
+    /// Previous drain's histogram snapshot for delta-vs-last
+    /// folding (V2-41: backends report cumulative histograms).
+    last_lat: [u64; 16],
     generation: u32,
     window_open: bool,
     closed: bool,
@@ -405,6 +418,10 @@ impl<B: CountBackend> CountSession<B> {
             retired: HashMap::new(),
             seen: HashMap::new(),
             last_dropfail: 0,
+            admitted: 0,
+            last_admitted: 0,
+            lat_cum: [0; 16],
+            last_lat: [0; 16],
             generation: 0,
             window_open: false,
             closed: false,
@@ -856,8 +873,14 @@ impl<B: CountBackend> CountSession<B> {
         // expired drain would recount the same keys as shortfall).
         let mut progress = true;
         let mut passes = 0u32;
+        let mut pass_ns_total = 0u64;
+        let mut pass_ns_max = 0u64;
         while progress && passes < 3 {
+            let t0 = Instant::now();
             let drained = self.backend.drain(deadline)?;
+            let dt = t0.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+            pass_ns_total = pass_ns_total.saturating_add(dt);
+            pass_ns_max = pass_ns_max.max(dt);
             let had_shortfall = drained.shortfall > 0;
             progress = self.route(drained);
             passes += 1;
@@ -888,6 +911,10 @@ impl<B: CountBackend> CountSession<B> {
             });
         }
         current.sort();
+        // Own-process RSS at drain (Linux `/proc/self/statm`,
+        // resident field x page size). Fail-loud: unreadable statm
+        // yields 0 and the live leg gates rss > 0.
+        let drain_rss_bytes = Self::drain_rss_sample().unwrap_or(0);
         let mut counters = vec![
             counter(
                 "count.map_insert_dropped",
@@ -909,6 +936,13 @@ impl<B: CountBackend> CountSession<B> {
                 CounterUnits::Events,
                 CounterSource::Drain,
                 self.shortfall,
+            ),
+            counter(
+                "count.ledger_admitted",
+                CounterKind::Activity,
+                CounterUnits::Calls,
+                CounterSource::KernelMap,
+                self.admitted,
             ),
             counter(
                 "count.missed_attaches",
@@ -945,7 +979,114 @@ impl<B: CountBackend> CountSession<B> {
                 CounterSource::Drain,
                 self.drained_keys,
             ),
+            counter(
+                "count.drain_passes",
+                CounterKind::Activity,
+                CounterUnits::Events,
+                CounterSource::Drain,
+                u64::from(passes),
+            ),
+            counter(
+                "count.drain_pass_ns_total",
+                CounterKind::Activity,
+                CounterUnits::Events,
+                CounterSource::Drain,
+                pass_ns_total,
+            ),
+            counter(
+                "count.drain_pass_ns_max",
+                CounterKind::Activity,
+                CounterUnits::Events,
+                CounterSource::Drain,
+                pass_ns_max,
+            ),
+            counter(
+                "count.drain_rss_bytes",
+                CounterKind::Activity,
+                CounterUnits::Events,
+                CounterSource::Drain,
+                drain_rss_bytes,
+            ),
         ];
+        // c8 latency distribution: full histogram plus
+        // upper-bucket-edge quantiles (conservative — bucket k
+        // covers [2^k, 2^(k+1)), so the edge never under-reports;
+        // the clamp bucket reports u64::MAX). Empty histogram
+        // scores 0/0 with 0 samples (nothing measured, not "fast").
+        for (k, n) in self.lat_cum.iter().enumerate() {
+            let bucket_name = format!("count.lat_bucket_{k:02}");
+            counters.push(counter(
+                bucket_name.as_str(),
+                CounterKind::Activity,
+                CounterUnits::Events,
+                CounterSource::KernelMap,
+                *n,
+            ));
+        }
+        let lat_total: u64 = self.lat_cum.iter().sum();
+        let (mut lat_median, mut lat_p99) = (0u64, 0u64);
+        if lat_total > 0 {
+            let mut acc = 0u64;
+            let half = lat_total.div_ceil(2);
+            let rank99 = (lat_total.saturating_mul(99)).div_ceil(100).max(1);
+            for (k, n) in self.lat_cum.iter().enumerate() {
+                acc = acc.saturating_add(*n);
+                let edge = if k >= 15 { u64::MAX } else { 1u64 << (k + 1) };
+                if lat_median == 0 && acc >= half {
+                    lat_median = edge;
+                }
+                if lat_p99 == 0 && acc >= rank99 {
+                    lat_p99 = edge;
+                }
+            }
+        }
+        for (name, value) in [
+            ("count.lat_samples", lat_total),
+            ("count.lat_median_ns", lat_median),
+            ("count.lat_p99_ns", lat_p99),
+        ] {
+            counters.push(counter(
+                name,
+                CounterKind::Activity,
+                CounterUnits::Events,
+                CounterSource::KernelMap,
+                value,
+            ));
+        }
+        // Independent-ledger reconciliation (c6): every admitted
+        // hit must account into routed calls (current + fenced +
+        // unattributed) or map-full drops. `stale_events` is a
+        // memo, not additive (stragglers already fold into their
+        // fenced bucket at route). Under drain shortfall the
+        // unread keys' calls are unknowable — the gap stays open
+        // as Activity, never forced to zero, never a silent Loss.
+        let mut routed: u64 = self.unattributed;
+        for exec in &current {
+            routed = routed.saturating_add(exec.calls);
+        }
+        for fenced in &self.fenced {
+            for exec in &fenced.sites {
+                routed = routed.saturating_add(exec.calls);
+            }
+        }
+        let accounted = routed.saturating_add(self.dropfail);
+        if self.shortfall == 0 {
+            counters.push(counter(
+                "count.ledger_delta",
+                CounterKind::Loss,
+                CounterUnits::Calls,
+                CounterSource::Drain,
+                self.admitted.abs_diff(accounted),
+            ));
+        } else {
+            counters.push(counter(
+                "count.ledger_unreconciled",
+                CounterKind::Activity,
+                CounterUnits::Calls,
+                CounterSource::Drain,
+                self.admitted.saturating_sub(accounted),
+            ));
+        }
         counters.extend(self.passthrough.iter().cloned());
         counters.sort();
         self.closed = true;
@@ -954,6 +1095,20 @@ impl<B: CountBackend> CountSession<B> {
             fenced: self.fenced.clone(),
             counters,
         })
+    }
+
+    /// Own-process RSS in bytes (Linux-only sampler for the c8
+    /// drain/memory score). `None` when statm is unreadable.
+    fn drain_rss_sample() -> Option<u64> {
+        let text = std::fs::read_to_string("/proc/self/statm").ok()?;
+        let resident_pages: u64 = text.split_whitespace().nth(1)?.parse().ok()?;
+        // SAFETY: sysconf with a valid name is async-signal-safe
+        // and has no preconditions on our state.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if page <= 0 {
+            return None;
+        }
+        resident_pages.checked_mul(page as u64)
     }
 
     /// Route one raw drain: delta-reads per (cookie, generation),
@@ -1041,6 +1196,17 @@ impl<B: CountBackend> CountSession<B> {
         }
         self.dropfail += drained.dropfail_total.saturating_sub(self.last_dropfail);
         self.last_dropfail = drained.dropfail_total;
+        self.admitted += drained.admitted_total.saturating_sub(self.last_admitted);
+        self.last_admitted = drained.admitted_total;
+        for ((cum, last), n) in self
+            .lat_cum
+            .iter_mut()
+            .zip(self.last_lat.iter_mut())
+            .zip(drained.lat_buckets.iter())
+        {
+            *cum = cum.saturating_add(n.saturating_sub(*last));
+            *last = *n;
+        }
         self.shortfall += drained.shortfall;
         progress
     }
@@ -1070,11 +1236,17 @@ pub struct FakeCountBackend {
     open: bool,
     attached: HashMap<u32, (String, u64)>,
     ledger: HashMap<(u32, u32), CountValue>,
+    /// Per-CPU slots `(cpu, cookie, generation)`: the N-CPU
+    /// fan-out model, folded per key at drain like the kernel
+    /// per-CPU slots composed by the userspace fold.
+    cpu_slots: HashMap<(u32, u32, u32), CountValue>,
     dropfail: u64,
+    admitted: u64,
     capacity: usize,
     poison: HashSet<u64>,
     shortfall_hook: u64,
     programmed: Vec<(u64, u32, u64, u64)>,
+    lat_samples: [u64; 16],
 }
 
 impl FakeCountBackend {
@@ -1087,11 +1259,14 @@ impl FakeCountBackend {
             open: false,
             attached: HashMap::new(),
             ledger: HashMap::new(),
+            cpu_slots: HashMap::new(),
             dropfail: 0,
+            admitted: 0,
             capacity: usize::MAX,
             poison: HashSet::new(),
             shortfall_hook: 0,
             programmed: Vec::new(),
+            lat_samples: [0; 16],
         }
     }
 
@@ -1136,6 +1311,9 @@ impl FakeCountBackend {
         if !self.open || u64::from(tgid) != self.tgid {
             return;
         }
+        // Independent ledger: every hit admitted past the window +
+        // target guards, including map-full drops below.
+        self.admitted = self.admitted.saturating_add(n);
         let key = (cookie, self.generation);
         if let Some(slot) = self.ledger.get_mut(&key) {
             slot.count = slot.count.saturating_add(n);
@@ -1161,12 +1339,70 @@ impl FakeCountBackend {
         );
     }
 
+    /// Model a hit landing on one CPU's slot (N-CPU fan-out
+    /// model): same admission guards as [`fire`](Self::fire),
+    /// recorded per CPU and folded at drain. Capacity counts
+    /// distinct (cookie, generation) keys across both stores.
+    pub fn fire_cpu(&mut self, cpu: u32, tgid: u32, cookie: u32, now_ns: u64, n: u64) {
+        if n == 0 {
+            return;
+        }
+        if now_ns < self.start_ns || now_ns >= self.deadline_ns {
+            return;
+        }
+        if !self.open || u64::from(tgid) != self.tgid {
+            return;
+        }
+        self.admitted = self.admitted.saturating_add(n);
+        let key = (cpu, cookie, self.generation);
+        if let Some(slot) = self.cpu_slots.get_mut(&key) {
+            slot.count = slot.count.saturating_add(n);
+            slot.first_ns = slot.first_ns.min(now_ns);
+            slot.last_ns = slot.last_ns.max(now_ns);
+            return;
+        }
+        let mut keys: HashSet<(u32, u32)> = self.ledger.keys().copied().collect();
+        keys.extend(self.cpu_slots.keys().map(|(_, c, g)| (*c, *g)));
+        if keys.len() >= self.capacity {
+            self.dropfail = self.dropfail.saturating_add(n);
+            return;
+        }
+        self.cpu_slots.insert(
+            key,
+            CountValue {
+                count: n,
+                first_ns: now_ns,
+                last_ns: now_ns,
+            },
+        );
+    }
+
+    /// Independent admitted-hits total (test oracle for the
+    /// `count.ledger_*` reconciliation).
+    pub fn admitted_ledger(&self) -> u64 {
+        self.admitted
+    }
+
+    /// Script latency samples into one bucket (drain emits them
+    /// verbatim). Panics on bucket >= 16 (fail loud, tests only).
+    pub fn inject_latency(&mut self, bucket: usize, n: u64) {
+        assert!(bucket < 16, "latency bucket {bucket} out of range");
+        self.lat_samples[bucket] = self.lat_samples[bucket].saturating_add(n);
+    }
+
     /// Independent ledger total for one (cookie, generation).
     pub fn ledger_total(&self, cookie: u32, generation: u32) -> u64 {
-        self.ledger
+        let mut total = self
+            .ledger
             .get(&(cookie, generation))
             .map(|v| v.count)
-            .unwrap_or(0)
+            .unwrap_or(0);
+        for ((_, c, g), v) in self.cpu_slots.iter() {
+            if (*c, *g) == (cookie, generation) {
+                total = total.saturating_add(v.count);
+            }
+        }
+        total
     }
 
     /// Inject a raw ledger row, bypassing admission (models a hit the
@@ -1263,17 +1499,30 @@ impl CountBackend for FakeCountBackend {
     fn drain(&mut self, _deadline: Option<Instant>) -> anyhow::Result<DrainedCounts> {
         // Host double drains instantly; grace-expiry shortfall is
         // scripted through `set_shortfall` instead.
-        let mut rows: Vec<(u64, CountValue)> = self
-            .ledger
-            .iter()
-            .filter(|(_, v)| v.count > 0)
-            .map(|((cookie, generation), v)| (make_key(*cookie, *generation), *v))
+        let mut folded: HashMap<(u32, u32), CountValue> = HashMap::new();
+        for ((cookie, generation), v) in self.ledger.iter() {
+            if v.count == 0 {
+                continue;
+            }
+            folded.entry((*cookie, *generation)).or_default().fold(v);
+        }
+        for ((_, cookie, generation), v) in self.cpu_slots.iter() {
+            if v.count == 0 {
+                continue;
+            }
+            folded.entry((*cookie, *generation)).or_default().fold(v);
+        }
+        let mut rows: Vec<(u64, CountValue)> = folded
+            .into_iter()
+            .map(|((cookie, generation), v)| (make_key(cookie, generation), v))
             .collect();
         rows.sort_by_key(|(k, _)| *k);
         let shortfall = std::mem::take(&mut self.shortfall_hook);
         Ok(DrainedCounts {
             rows,
             dropfail_total: self.dropfail,
+            admitted_total: self.admitted,
+            lat_buckets: self.lat_samples,
             shortfall,
         })
     }
@@ -1418,6 +1667,8 @@ impl CountBackend for LiveBackend {
         let mut out = DrainedCounts {
             rows: Vec::new(),
             dropfail_total: 0,
+            admitted_total: 0,
+            lat_buckets: [0; 16],
             shortfall: 0,
         };
         let counts = dup("COUNTS")?;
@@ -1461,7 +1712,30 @@ impl CountBackend for LiveBackend {
             let per_cpu = r.map_err(|e| anyhow::anyhow!("DROPFAIL iter: {e}"))?;
             total_drop += per_cpu.iter().sum::<u64>();
         }
+        let admitted = dup("ADMITTED")?;
+        let admitted = aya::maps::PerCpuArray::<_, u64>::try_from(admitted)
+            .map_err(|e| anyhow::anyhow!("ADMITTED typed: {e}"))?;
+        let mut total_admitted = 0u64;
+        for r in admitted.iter() {
+            let per_cpu = r.map_err(|e| anyhow::anyhow!("ADMITTED iter: {e}"))?;
+            total_admitted += per_cpu.iter().sum::<u64>();
+        }
+        let latc = dup("LATC")?;
+        let latc = aya::maps::PerCpuArray::<_, u64>::try_from(latc)
+            .map_err(|e| anyhow::anyhow!("LATC typed: {e}"))?;
+        let mut lat_buckets = [0u64; 16];
+        // PerCpuArray iterates keys in order (same shape as the
+        // DROPFAIL read above); scores are multiset-invariant
+        // anyway, so even a reorder could not move median/p99.
+        for (k, r) in latc.iter().enumerate() {
+            let per_cpu = r.map_err(|e| anyhow::anyhow!("LATC iter: {e}"))?;
+            if k < 16 {
+                lat_buckets[k] = per_cpu.iter().sum::<u64>();
+            }
+        }
         out.dropfail_total = total_drop;
+        out.admitted_total = total_admitted;
+        out.lat_buckets = lat_buckets;
         Ok(out)
     }
 }
@@ -1517,6 +1791,43 @@ mod tests {
         assert_eq!(normalize_bad(vec![2, 0, 2], 3), vec![true, false, true]);
         assert_eq!(normalize_bad(vec![9], 1), vec![false]);
         assert_eq!(normalize_bad(vec![0, 1, 2], 2), vec![true, true]);
+    }
+
+    #[test]
+    fn admitted_spec_mirrors_dropfail_percpu_array() {
+        // ADMITTED is drained exactly like DROPFAIL (per-CPU u64
+        // array): the loader specs must agree on type and dims or
+        // the live drain misreads the map. RED: ADMITTED unnamed.
+        let spec = |name: &str| {
+            crate::loader::COUNT_MAPS
+                .iter()
+                .find(|m| m.name == name)
+                .unwrap_or_else(|| panic!("COUNT_MAPS names {name}"))
+        };
+        let drops = spec("DROPFAIL");
+        let adm = spec("ADMITTED");
+        assert_eq!(adm.map_type, drops.map_type);
+        assert_eq!(adm.key_size, drops.key_size);
+        assert_eq!(adm.value_size, drops.value_size);
+        assert_eq!(adm.max_entries, 1);
+    }
+
+    #[test]
+    fn lat_spec_is_percpu_array_16() {
+        // LATC is drained like DROPFAIL (per-CPU u64 array) with
+        // exactly LAT_BUCKETS cells. RED: LATC unnamed.
+        let spec = crate::loader::COUNT_MAPS
+            .iter()
+            .find(|m| m.name == "LATC")
+            .expect("COUNT_MAPS names LATC");
+        let drops = crate::loader::COUNT_MAPS
+            .iter()
+            .find(|m| m.name == "DROPFAIL")
+            .expect("COUNT_MAPS names DROPFAIL");
+        assert_eq!(spec.map_type, drops.map_type);
+        assert_eq!(spec.key_size, drops.key_size);
+        assert_eq!(spec.value_size, drops.value_size);
+        assert_eq!(spec.max_entries, 16);
     }
 
     #[test]

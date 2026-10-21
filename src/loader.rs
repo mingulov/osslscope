@@ -201,13 +201,29 @@ pub const HARVEST_MAPS: [MapSpec; 14] = [
 /// `osslscope-count` object (maps-section records). T07 count ABI
 /// v2 adds `WINDOW` (2 u64 cells: start/deadline); an object without
 /// it fails `prepare` rather than running deadline-blind.
-pub const COUNT_MAPS: [MapSpec; 5] = [
+pub const COUNT_MAPS: [MapSpec; 7] = [
     MapSpec {
         name: "COUNTS",
         map_type: 5,
         key_size: 8,
         value_size: 24,
         max_entries: 8192,
+        flags: 0,
+    },
+    MapSpec {
+        name: "ADMITTED",
+        map_type: 6,
+        key_size: 4,
+        value_size: 8,
+        max_entries: 1,
+        flags: 0,
+    },
+    MapSpec {
+        name: "LATC",
+        map_type: 6,
+        key_size: 4,
+        value_size: 8,
+        max_entries: 16,
         flags: 0,
     },
     MapSpec {

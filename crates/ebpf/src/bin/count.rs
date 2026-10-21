@@ -28,7 +28,7 @@ use aya_ebpf::{
     programs::ProbeContext,
     EbpfContext as _,
 };
-use osslscope_ebpf_common::{CountValue, WINDOW_CELLS, WINDOW_DEADLINE, WINDOW_START, make_key};
+use osslscope_ebpf_common::{CountValue, WINDOW_CELLS, WINDOW_DEADLINE, WINDOW_START, lat_bucket, make_key};
 
 /// `BPF_NOEXIST` for `insert` (kernel UAPI; aya-ebpf exposes no const).
 const BPF_NOEXIST: u64 = 1;
@@ -58,8 +58,28 @@ static WINDOW: Array<u64> = Array::with_max_entries(WINDOW_CELLS, 0);
 #[map]
 static DROPFAIL: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
 
+/// BPF-side admitted-hits ledger (independent of `COUNTS`): one
+/// per-CPU u64 bumped once per admitted hit (passed `TARGET` +
+/// window), including `DROPFAIL` hits. Invariant (checked
+/// userspace-side on every drain):
+/// `ADMITTED == sum(COUNTS.count) + DROPFAIL`.
+/// A second map drained through a second read path — shared
+/// aggregation bugs cannot hide in both.
+#[map]
+static ADMITTED: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
+
+/// Per-hit admitted-path probe-body latency histogram (per-CPU
+/// log2-ns buckets, `lat_bucket`): entry→exit `bpf_ktime_get_ns`
+/// delta sampled once per counted hit at the single tail.
+/// Admitted-path-only is conservative for the <=4us budget: every
+/// reject path is a strict instruction prefix of the admitted
+/// path, so the all-path median never exceeds this median.
+#[map]
+static LATC: PerCpuArray<u64> = PerCpuArray::with_max_entries(16, 0);
+
 #[uprobe]
 pub fn count_entry(ctx: ProbeContext) -> u32 {
+    let t0 = unsafe { helpers::bpf_ktime_get_ns() };
     let target = match TARGET.get(0) {
         Some(t) if *t != 0 => *t,
         _ => return 0,
@@ -77,6 +97,9 @@ pub fn count_entry(ctx: ProbeContext) -> u32 {
     if now < start || now >= deadline {
         return 0;
     }
+    // Independent ledger: every hit admitted past TARGET + window,
+    // including cookie-wide and map-full drops below.
+    admitted();
     let cookie = unsafe { helpers::bpf_get_attach_cookie(ctx.as_ptr()) };
     // Plan indices are u32 by construction; a wider cookie is a
     // userspace bug — counted in DROPFAIL, never truncated silently.
@@ -113,6 +136,11 @@ pub fn count_entry(ctx: ProbeContext) -> u32 {
     } else {
         dropfail();
     }
+    let dt = unsafe { helpers::bpf_ktime_get_ns() }.saturating_sub(t0);
+    if let Some(slot) = LATC.get_ptr_mut(lat_bucket(dt) as u32) {
+        let c = unsafe { &mut *slot };
+        *c = c.saturating_add(1);
+    }
     0
 }
 
@@ -132,6 +160,13 @@ fn bump(slot: *mut CountValue, now: u64) {
 
 fn dropfail() {
     if let Some(slot) = DROPFAIL.get_ptr_mut(0) {
+        let c = unsafe { &mut *slot };
+        *c = c.saturating_add(1);
+    }
+}
+
+fn admitted() {
+    if let Some(slot) = ADMITTED.get_ptr_mut(0) {
         let c = unsafe { &mut *slot };
         *c = c.saturating_add(1);
     }

@@ -478,7 +478,7 @@ fn system_libcrypto_stripped_unknown_is_not_silently_supported() {
     let bytes = std::fs::read(&path).unwrap();
     let build_id = elf::read_build_id(&bytes).expect("system libcrypto has a build-id");
     // Guard the test's premise: the system build is unknown to the
-    // shipped table (ten historical rows never imply this binary).
+    // shipped table (eleven historical rows never imply this binary).
     assert!(
         shipped().by_build_id(&build_id).is_none(),
         "premise broken: system build {build_id} is enrolled?"
