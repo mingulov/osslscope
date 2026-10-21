@@ -2833,10 +2833,21 @@ fn r4_take_marks_review_schedule_uncertain() {
     let mut o = Oracle::new(OracleScope::full());
     let mut b1 = nonquiesced(1_000);
     b1.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
-    b1.push_alg(alg(TIDA, 0, 0, wire::ALG_OK));
     b1.push_alg(alg_arr(TIDA, 0, 1, wire::ALG_EMPTY, ARR, 0));
     b1.push_ret(ret(TIDA, 0, 0));
+    b1.push_alg(alg(TIDA, 0, 0, wire::ALG_OK));
     b1.push_row(row(TIDA, 0, 0));
+    assert_eq!(
+        b1.order,
+        [
+            BatchPos::Call(0),
+            BatchPos::Alg(0),
+            BatchPos::Ret(0),
+            BatchPos::Alg(1),
+            BatchPos::Row(0),
+        ],
+        "review schedule matches member emission order (member 1 EMPTY, member 0 RET-then-ALG_OK, ROW)"
+    );
     assert!(b1.order_sound());
     o.ingest(&b1);
     assert_eq!(o.open_count(), 1, "no successor: honestly open");
@@ -3069,6 +3080,37 @@ fn r4_take_marked_ret_empty_downgrades() {
     assert_eq!(o.done()[0].true_t, TrueT::EmptyTable);
 }
 
+#[test]
+fn r4_ret_empty_certain_completion_carries_true_t_zero() {
+    // v0.2 errata pin: RET-EMPTY certain completion carries
+    // true_t 0 (record EmptyTable), not the true_t:1 stated
+    // for every Complete case in fix-wave report R4-B2.
+    let mut o = Oracle::new(OracleScope::full());
+    let mut b1 = nonquiesced(1_000);
+    b1.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
+    let mut r = ret(TIDA, 0, 0);
+    r.flags = wire::RET_FLAG_EMPTY;
+    b1.push_ret(r);
+    o.ingest(&b1);
+    let mut b2 = nonquiesced(2_000);
+    b2.push_call(call(TIDA, 1, false, wire::SKIP_ADMITTED));
+    assert!(!b2.fault_view_uncertain, "default view is available");
+    o.ingest(&b2);
+    assert_eq!(o.done().len(), 1);
+    assert!(
+        matches!(
+            o.done()[0].outcome,
+            Outcome::Complete {
+                true_t: 0,
+                cached: false
+            }
+        ),
+        "RET-EMPTY certain completion carries true_t 0, not 1: {:?}",
+        o.done()[0].outcome
+    );
+    assert_eq!(o.done()[0].true_t, TrueT::EmptyTable);
+}
+
 /// Round 4, residual B-2-take (taint control): uncertainty
 /// never rewrites a nesting verdict — a marked open carrying
 /// a taint still closes Tainted (terminal rule parity for
@@ -3104,10 +3146,21 @@ fn r4_take_certain_view_completes() {
     let mut o = Oracle::new(OracleScope::full());
     let mut b1 = nonquiesced(1_000);
     b1.push_call(call(TIDA, 0, false, wire::SKIP_ADMITTED));
-    b1.push_alg(alg(TIDA, 0, 0, wire::ALG_OK));
     b1.push_alg(alg_arr(TIDA, 0, 1, wire::ALG_EMPTY, ARR, 0));
     b1.push_ret(ret(TIDA, 0, 0));
+    b1.push_alg(alg(TIDA, 0, 0, wire::ALG_OK));
     b1.push_row(row(TIDA, 0, 0));
+    assert_eq!(
+        b1.order,
+        [
+            BatchPos::Call(0),
+            BatchPos::Alg(0),
+            BatchPos::Ret(0),
+            BatchPos::Alg(1),
+            BatchPos::Row(0),
+        ],
+        "review schedule matches member emission order (member 1 EMPTY, member 0 RET-then-ALG_OK, ROW)"
+    );
     o.ingest(&b1);
     let mut b2 = nonquiesced(2_000);
     b2.push_call(call(TIDA, 1, false, wire::SKIP_ADMITTED));

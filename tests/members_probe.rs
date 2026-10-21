@@ -5834,17 +5834,44 @@ fn d_drain_floor() {
     assert_loss_zero(loaded);
 }
 
-// Hang-guard budget, lane-calibrated (V2-53): attach takes 53.5/95.3 s
-// (R21b finding 6) and 135.35/147.97 s (T8 fixwave-2, in-suite and
-// isolated) on this lane, so the 60 s value never fit; 2x the observed
-// max keeps a true hang guard. P9 note: the leg's `P9 tightens from
-// lane evidence` premise is inverted by this evidence on this lane.
-const DETACH_WALL_BUDGET_SECS: u64 = 300;
+// Earlier V2-53 calibration used a 300 s hang guard after a 147.97 s
+// observed attach. The later seven-run calibration below also covers
+// the 165.1 s split and supplies the current configurable guard.
+/// Lane-calibrated teardown budget (v0.2): 512-link attach +
+/// drop. R21 95.324+0.376 s FAIL vs R21b 53.50+0.11 s PASS on
+/// the same lane/image; the fedora 7-run splits and the
+/// recomputation are in the commit message. Default 360 s =
+/// max(120, round_up_30(2 * 165.1)); override per lane via
+/// OSSLSCOPE_DETACH_BUDGET_SECS (floor 60 s).
+const DEFAULT_DETACH_BUDGET_SECS: u64 = 360;
 
-/// Teardown wall live (item 7 resource): attach + drop of all 513
-/// links completes (hang-guard bound — P9 tightens from lane
-/// evidence (V2-53: calibrated to 300 s); the measured split is
-/// reported for the record).
+fn detach_budget_secs(raw: Option<&str>) -> u64 {
+    raw.and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_DETACH_BUDGET_SECS)
+        .max(60)
+}
+
+fn detach_budget() -> std::time::Duration {
+    std::time::Duration::from_secs(detach_budget_secs(
+        std::env::var("OSSLSCOPE_DETACH_BUDGET_SECS")
+            .ok()
+            .as_deref(),
+    ))
+}
+
+#[test]
+fn detach_budget_parser_pins() {
+    assert_eq!(detach_budget_secs(None), 360);
+    assert_eq!(detach_budget_secs(Some("90")), 90);
+    assert_eq!(detach_budget_secs(Some("30")), 60);
+    assert_eq!(detach_budget_secs(Some("abc")), 360);
+    assert_eq!(detach_budget_secs(Some("")), 360);
+}
+
+/// Teardown wall live (item 7 resource): attach + drop of all 512
+/// links completes within the configured lane hang guard (360 s by
+/// default). The measured split is reported; P9 performance
+/// qualification is separate from this test timeout.
 #[test]
 #[ignore]
 fn d_detach_wall() {
@@ -5862,9 +5889,10 @@ fn d_detach_wall() {
     drop(attached);
     let detach_dt = t1.elapsed();
     eprintln!("detach-wall: attach {attach_dt:?}, detach {detach_dt:?}");
+    let budget = detach_budget();
     assert!(
-        attach_dt + detach_dt < std::time::Duration::from_secs(DETACH_WALL_BUDGET_SECS),
-        "detach-wall: attach+detach {attach_dt:?}+{detach_dt:?} exceeds hang-guard {DETACH_WALL_BUDGET_SECS}s"
+        attach_dt + detach_dt < budget,
+        "detach-wall: attach+detach {attach_dt:?}+{detach_dt:?} exceeds lane budget {budget:?} (override OSSLSCOPE_DETACH_BUDGET_SECS)"
     );
 }
 
