@@ -7,24 +7,31 @@ not listed there is a bug, and a canary suite fails the release
 if any secret byte reaches any artifact. This note discloses what
 that guarantee does NOT cover. Field names below mirror the
 allowlist legend exactly.
-<!-- source: residual list: PRD.md section 7; field tokens:
-     docs/privacy/allowlist-v1.md -->
+<!-- source: docs/privacy/allowlist-v1.md; src/evidence.rs;
+     src/report.rs; schemas/observed-crypto-v2.json -->
 
 ## alg-name-only strength
 
-`alg_class` carries the algorithm NAME class only. Key sizes,
+Algorithm classes (`alg_class` in inspect, `algorithm_classes` in
+v2 candidates) carry NAME classes only. Key sizes,
 modes, and parameters are unobservable by design: RSA-1024 and
 RSA-2048 are the same class to this tool, as are any two key
-lengths of one algorithm. Every human report ends with the
-footer note "alg-name-only strength (key sizes unobservable);
-window-only claims" so the limit travels with the evidence.
-Size compliance questions need a different instrument.
+lengths of one algorithm. MAC/KDF/SIGNATURE/ASYM_CIPHER can select
+digests or ciphers through parameters that the observer never
+captures. Current human output ends with argv-redaction,
+file-offset and window-only notes; it does not emit a dedicated
+strength/parameter warning on every run. Apply these limits to
+all formats. Size/parameter compliance questions need a different
+instrument.
 
 ## Counts as a side channel
 
-Per-key execution counts are exact -- and exact counts of crypto
-operations can leak workload shape (how much signing, how many
-handshakes, when). Treat report/JSON/CBOM artifacts as
+Counts record physical callback entries once per site/generation,
+under the document's coverage and loss limits. Candidate identities
+are attribution possibilities; a shared count is not a separate
+count for each algorithm. Counts and first/last execution timing
+can still reveal workload shape and activity patterns. Treat
+report/JSON/CBOM artifacts as
 operational telemetry: retain them under the same access
 controls as other production counters, and redact before
 sharing outside the trust boundary.
@@ -51,36 +58,40 @@ to count-only, never trusted.
 
 ## Weaker built-in-provider provenance
 
-External provider modules are pinned by object path plus
-build-id; the built-in provider lives inside libcrypto, so its
-provenance is only as strong as the libcrypto identification.
-Pin the observed libcrypto by `provider.build_id` (GNU
-build-id) and object hash, enroll exact builds before gating,
-and treat unknown build-ids as fail-closed (see
-[attach failures](../attach-failures.md)).
+External providers and libcrypto need exact-byte provenance;
+the built-in provider's identity depends on its backing libcrypto.
+Use v2 opaque fingerprints joined through `objects`, plus available
+disk-ELF GNU build-id and hashes. A display path alone is not identity,
+and v2 has no `provider.build_id` carrier. Recheck admission after
+rebuilds: supported symtab builds can qualify without a table hit,
+whereas unknown stripped builds need explicit exact enrollment
+(see [attach failures](../attach-failures.md)).
 
-## Stripped targets degrade to count-only / PARTIAL
+## Stripped targets need explicit admission
 
-Stripped binaries lose the symtab resolution rung; where no
-enrolled build-id row or live fallback covers the build,
-harvest degrades to count-only or zero-row PARTIAL rather than
-guessing. The degradation is explicit in `status`/`reasons[]`
--- but a stripped fleet without enrolled twins yields
-blindness, not inventory (see
+Stripped binaries lose the symtab resolution rung. Without an
+enrolled build-id row or explicitly selected supported fallback,
+report/check refuse with enrollment remediation; inspect can
+expose degraded or zero-row harvest rather than guessing.
+Read the actual status and reasons. A stripped fleet without
+admitted anchors yields blindness, not inventory (see
 [who should NOT adopt](../what-it-proves.md#who-should-not-adopt-read-before-installing)).
 
 ## Root-operator model
 
 The observer runs with `CAP_BPF`+`CAP_PERFMON` (at minimum) and
-reads target process metadata (`target.comm`,
-`target.cmdline` capped at 8 KiB, `target.container_id`) plus
-mappings and disk ELF. A root operator can already read target
+reads process identity/admission metadata plus mappings and disk
+ELF. Artifacts retain safe pid, `target.comm`, container/image
+provenance and unconditional `target.argv_redacted: true`.
+There is no raw argv/cmdline field: paths that need a cmdline-shaped
+value use `(argv-redacted)`, and inspect's marker admission emits
+no matched argv. A root operator can already read target
 memory; osslscope adds no new privilege to that model, but it
 is not a least-privilege-everywhere tool: anyone who can run
 captures can observe crypto counts and process metadata for
-the targets they may attach to. `target.cmdline` is bounded
-process metadata that can reflect operator input -- never pass
-secrets as target argv.
+the targets they may attach to. Never pass secrets as target argv:
+system-wide `/proc` exposure remains even though osslscope redacts
+argv from its artifacts (see the allowlist's Scope rule).
 
 ## What is never captured (recap)
 

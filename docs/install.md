@@ -11,10 +11,11 @@ lockdown) and prints `verdict: ok` when the machine can observe, or
 Prerequisites: Linux x86-64, kernel >= 6.9.
 
 > Development status: this branch is unreleased work. No deb/rpm
-> built from it is a final distributable; BPF objects are always
-> operator-built (see [build](build.md)) and are never shipped in a
-> package. For day-to-day development use the local prefix install
-> below.
+> built from it is a final distributable. Current builders omit BPF;
+> build and install matching development roles per [build](build.md).
+> Matched redistributable host+BPF packages remain forthcoming,
+> subject to licensing, provenance and exact-package qualification.
+> For day-to-day development use the local prefix install below.
 
 ## Local prefix install (development)
 
@@ -151,11 +152,16 @@ osslscope doctor            # expect: verdict: ok once objects are staged (below
 osslscope --help            # lists doctor|inspect|report|check|alias-audit
 ```
 
-Packages never ship BPF objects, so a bare `doctor` reports the
-objects rows `FAIL` until the operator stages them: build per
-[build](build.md), then either copy both objects into root-owned
-`/usr/local/lib/osslscope/` (implicitly trusted) or pass
-`--object`/`--count-object` explicitly on every run.
+Current packages omit BPF objects, so a bare `doctor` reports the
+objects rows `FAIL` until compatible objects are available. Build
+the matching roles per [build](build.md), then pass explicit
+`--object`/`--count-object`/`--members-object` paths on both
+preflight and capture, as in the local-prefix recipe. For automatic
+traversal use `scripts/install-dev.sh` into a trusted system prefix
+with its matching receipt. Copying three loose files into
+`/usr/local/lib/osslscope/` does not establish that receipt.
+A deliberate pair-only harvest/count install remains supported;
+it supplies no traversal. See the selection rules below.
 
 If the caps are missing (e.g. the cap hook warned at install),
 re-apply them and re-run doctor:
@@ -185,10 +191,10 @@ says so explicitly for that target.
 - Vet a target before observing: `osslscope doctor --pid PID` (or
   `--libcrypto PATH`).
 - `report`/`check` need BPF objects: a user-owned prefix install
-  always needs `--object`/`--count-object` pointing at
-  `$PREFIX/lib/osslscope/`; packages never ship objects, so build
-  per [build](build.md) and either stage them into root-owned
-  `/usr/local/lib/osslscope/` (auto-discovered) or pass the flags.
+  needs explicit role paths into `$PREFIX/lib/osslscope/`, including
+  `--members-object` for the triple. Current packages omit objects;
+  build per [build](build.md). Reuse the selected objects for
+  doctor and capture; implicit traversal requires a verified receipt.
 
 ## Uninstall
 
@@ -202,19 +208,32 @@ rm -rf "$HOME/.local/bin/osslscope" "$HOME/.local/lib/osslscope" \
 The last line removes a default-prefix local install; adjust paths
 for a custom `--prefix`.
 
-## Frozen object roles (v0.2, Decision 8R)
+## Object roles and selection
 
-Traversal COEXISTS with the harvest role as a third shipping
-object with automatic selection (plan R19 freeze requirement;
-reviewed SOUND, shipped in v0.1.0 installed integration):
+Members is the third installed/loadable BPF role, alongside harvest
+and count (`scripts/build-dev.sh`, `src/discovery/onboard.rs`).
+Local integration does not mean current packages distribute it:
 
-- explicit `--members-object` demands the triple (implicit roles
-  receipt-verified; the explicit role is operator-trusted),
-  fail-closed;
+- explicit `--members-object` demands the triple and requires a
+  resolved builtin query anchor. Explicit roles are operator-trusted.
+  The implicit members role needs a matching receipt; legacy implicit
+  harvest/count roles may be receiptless. When a receipt is present,
+  implicit roles are verified against it and stale/mismatched entries
+  refuse. Explicit members with a receiptless implicit harvest/count
+  pair is supported without receipt-backed matching provenance;
 - ordinary runs traverse when the triple resolves complete,
-  stay harvest-only on pair-only installs, and refuse broken
-  triples (receiptless/stale/mixed);
-- provenance hashes the loaded bytes (`triple_snapshot`).
+  the target is builtin-mode and a dispatch anchor is resolved;
+  pair-only installs stay harvest-only. Automatic triple selection
+  without an anchor (including file-provider mode) also stays
+  harvest-only; an explicit traversal request refuses instead;
+- trusted-directory selection searches for a complete triple
+  before falling back to a pair. Pair fallback requires members
+  to be absent everywhere in the trusted search; a found broken
+  triple (receiptless/stale/mixed) refuses;
+- provenance hashes loaded bytes; `selected_objects` also records
+  pair-only selection, while `traversal` describes runs using members.
 
-Replacing the harvest role, or any other arrangement, needs a new
-reviewed decision — this note is the freeze record.
+All-explicit triples are supported operator overrides. They bypass
+receipt verification for those roles; the operator must select
+matching bytes. See `tests/onboarding.rs` for selection/refusal
+controls and [usage](usage.md#doctor--environment-diagnosis).

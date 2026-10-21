@@ -1,10 +1,12 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # What osslscope proves (and what it does not)
 
-osslscope is a runtime cryptographic observer for OpenSSL. It proves
-which provider-dispatch implementation callbacks actually execute in
-a running Linux application, without changing the application, its
-configuration, or its environment.
+osslscope observes OpenSSL provider-dispatch callback execution in
+supported Linux targets without changing the application or its
+configuration. Current development emits the
+[v2.1 evidence contract](observed-crypto-v2.md); integrated live and
+package qualification remains open. The historical `v0.1.0` release
+has its own source-specific qualification and limitations.
 
 ## The claim chain
 
@@ -17,122 +19,121 @@ installed
     != EXECUTED
 ```
 
-osslscope reports the last stage: the `OSSL_DISPATCH` callback that
-ran, identified by `(provider, operation, algorithm class,
-function id)` plus an attested file offset. Fetch/selection stages
-are supporting context only. Claim granularity stops at the dispatch
-callback: hardware variants selected inside one callback are out of
-claim.
+The counted unit is entry into a physical `OSSL_DISPATCH` callback,
+identified by backing object, device, inode, file offset and
+generation. Candidate metadata describes possible provider,
+operation, algorithm-class and function identities. A shared site
+with N calls contributes N calls once; it does not prove N calls
+for each candidate. Fetch/selection stages supply context only.
+Hardware variants selected inside one callback remain unobservable.
 
-Every report states its observation window (target, start/end,
-duration). Claims are window-only: "none observed in window" never
-means "not present / never used".
+Every report states its target and requested/effective window.
+"None observed in window" never means "not present / never used".
 
 ## COMPLETE vs PARTIAL
 
-- `COMPLETE`: every entry in the window is attributed to a
-  generation-valid key; no gap counter is nonzero; no FIPS module
-  was harvested.
-- `PARTIAL` plus `reasons[]`: exactly one honest story per reason.
-  PARTIAL is a result, not a failure: the evidence it carries is
-  usable, and policy rules still evaluate over it. See
-  [the PARTIAL runbook](partial-runbook.md) for the per-reason
-  response.
-- Absence of a trigger (a window in which no provider query fired)
-  is PARTIAL (`no-query`), never COMPLETE-zero.
+Count conservation, attribution certainty and observation coverage
+are separate axes:
 
-Counts are entry counts: N for one identity means "N entries
-observed in the window". v0.2 does not split success from failure and
-records no per-call latency (first/last-seen timestamps per key
-only).
+- `COMPLETE` requires no fatal failure, no instrumentation coverage
+  gap, no positive loss counter, no executed unknown-coverage
+  candidate set, and full requested/effective window coverage
+  without a signal cut. Fully attached quiet sites are covered.
+  Nonzero activity counters and ambiguous complete candidate sets
+  are compatible with COMPLETE.
+- `PARTIAL` carries typed `completeness.reasons[]` describing
+  coverage, loss, attribution or window gaps. Its observations
+  remain useful under those limits; missing observations cannot
+  be turned into absence proofs where a gap is relevant.
+- `FATAL` describes a tool or target failure. Runtime failures
+  remain eligible for policy evaluation, even with zero calls.
+  AttachZero is eligible only with proved in-window ENGINE
+  evidence. Environment, Recycled and bare AttachZero are
+  unusable and yield no policy verdict. Eligibility alone proves
+  no rule; see [exit handling](usage.md#exit-codes).
 
-## Non-goals
+A missing provider query is harvest context, not an independent
+v2 completeness rule. Read the actual coverage and typed reasons;
+do not translate legacy `no-query` text into a COMPLETE-zero or
+PARTIAL conclusion without them. See [the PARTIAL runbook](partial-runbook.md)
+and `src/evidence.rs` (`finalize`).
 
-v0.2 does not do TLS/libssl tracing, handshake observation,
-cipher-suite inventory, PCAP, network tracing, plaintext/key
-extraction, per-call trace output, latency histograms, cgroup or
-multi-target attach, daemon mode, or `--exe` inspection. Pre-3.0
-OpenSSL (the ENGINE-era method tables, with no `OSSL_DISPATCH`) is
-out of scope, as is any always-on production agent posture
-(always-on is post-v0.2).
+Counts are callback entries under disclosed coverage and loss,
+without a success/error split. First/last timestamps locate counted
+entries; they are not callback-duration measurements. Algorithm
+names do not reveal key sizes or parameter-selected digests/ciphers.
+
+## Permanent boundaries and forthcoming capabilities
+
+No TLS/libssl tracing, handshake observation, cipher-suite inventory,
+PCAP, network tracing, plaintext/key extraction, passwords, or
+application payload capture. Pre-3.0 OpenSSL method-table observation
+is outside the provider-dispatch surface. The
+[capture allowlist](privacy/allowlist-v1.md) remains binding.
+
+Current capture is bounded and targets one process. Metadata-only
+per-call trace, latency histograms, cgroup/multiple-target capture,
+executable-based observation/following and a service posture are
+forthcoming capabilities; they are not implemented by these docs.
+`doctor --exe` already preflights executable discovery, which is
+distinct from an executable-based capture mode.
 
 ## Who should NOT adopt (read before installing)
 
-This section is the headline, not a footnote. Each item below is a
-measured v0.2 boundary.
+**CI gating on COMPLETE status: not qualified.** Current integrated
+COMPLETE-window qualification is open. A real structural gap remains
+for address-taken taxonomy imports using `R_X86_64_GLOB_DAT`: even
+uniquely resolved imports have no instrumented PLT stub. Affected
+low-level imports produce a typed `loss` reason with counter
+`legacy.lowlevel_uninstrumented` (`src/discovery/legacy.rs`,
+`src/capture.rs`; pinned by `tests/provider_coverage.rs`). This can
+make affected TLS workloads PARTIAL, but does not prove that every
+TLS workload has the same imports or that COMPLETE is universally
+unreachable. Duration/grace changes cannot instrument a missing
+site. Gate on actual policy results and disclosed gaps per
+[the CI recipes](ci-recipes.md); do not assume every TLS run exits 3.
 
-**CI gating on COMPLETE status: not qualified.** v0.2 is NOT
-qualified for CI gating on COMPLETE. On real TLS-terminating apps
-COMPLETE is structurally unreachable: libssl takes the addresses of
-four digest `Transform` routines through `R_X86_64_GLOB_DAT` (no
-PLT stub), so four low-level imports stay unprobed and every window
-ends PARTIAL with `lowlevel-fallback-uninstrumented`.
-<!-- source: p5-gate-record.md; staging verdict 0/12 COMPLETE at
-     durations 30/60/120 x grace 5/15, over_budget=0 throughout,
-     cold_gap/drain_shortfall p50/p99 0/0: staging-nginx note -->
-Twelve measured windows at three durations and two graces returned
-0% COMPLETE with zero over-budget expiries, so no duration/grace
-re-tune can fix it. Gate on policy verdicts (exit 10 on violation,
-exit 3 as warn-plus-artifacts) instead; see
-[the CI recipes](ci-recipes.md). PARTIAL evidence, policy rules,
-and violation detection remain fully supported.
+**Kernels below 6.9 and non-x86-64 targets: unsupported.** Admission
+uses functional feature probes and target ELF checks, not a kernel
+version string alone. The historical matrix includes a 6.9 lane;
+it does not qualify every current artifact on every newer kernel.
+See [the scoped matrix](overhead-matrix.md).
 
-**Kernels below 6.9: not supported.** The floor is kernel 6.9 with
-`uprobe_multi`. Do not adopt on RHEL 9 / EL9 (5.14, no multi
-backport), Ubuntu 22.04 (GA 5.15, HWE 6.8 -- both below the floor),
-Ubuntu 24.04 GA (6.8; install the HWE kernel to qualify), or Debian
-12 (6.1).
-<!-- source: PRD.md section 8; kernel/distro matrix: ebpf-privileges note -->
-`doctor` refuses these environments fail-closed via a functional
-feature probe, never a version-string match.
+**Secure Boot qualification: not claimed.** Enabled-state
+qualification remains open. Keep Secure Boot, lockdown and SELinux
+controls in the required state; a disabled-state or alternative-host
+success does not qualify the enabled environment. `doctor` supplies
+environment admission evidence, not platform certification.
 
-**Non-x86-64 targets: not supported.** v0.2 is x86-64-only. No ARM64
-(or 32-bit) observation evidence exists for v0.2, and none is
-claimed: `doctor` refuses non-x86-64 targets fail-closed (exit 4),
-and the refusal paths are covered by committed goldens.
-<!-- source: arch decision + clean-refusal goldens: p5-gate-record.md -->
+**Stripped/static targets need an admitted anchor.** Supported
+symtab resolution can admit unstripped builds, including static
+targets in `--builtin` mode. Unknown stripped builds need explicit
+exact-binary enrollment; otherwise report/check refuse, while inspect
+can expose zero-row blindness. No guessed offset is an inventory.
+See [the built-in runbook](builtin-runbook.md).
 
-**SecureBoot-qualified operation: not claimed.** SecureBoot
-qualification is deferred post-v0.2: the qualification attempt
-failed on the host hypervisor (KVM rejects the firmware's SMM
-entry, so no SecureBoot-enabled guest reaches userspace), which
-leaves open what SecureBoot blocks for BPF attach. v0.2 claims no
-SecureBoot-qualified status.
-<!-- source: SecureBoot cell + deferral: p5-exit1-cells note, p5-gate-record.md -->
+**Live-process attachment misses history.** `--pid` cannot observe
+pre-attach execution and carries startup coverage limits. `run --`
+improves custody and enables pre-exec setup; it and warmup do not
+guarantee first-call or COMPLETE coverage. Inspect effective window
+edges and the typed startup/loss reasons.
 
-**Stripped static binaries: disclosed blindness, not evidence.**
-Observing a stripped statically linked binary yields zero rows
-(PARTIAL with anchor/trigger reasons): there is no dynamic symbol
-table to resolve the harvest anchor and no enrolled build-id row.
-Unstripped static binaries observe normally via symtab. If your
-fleet ships stripped static binaries, v0.2 cannot inventory them.
-<!-- source: static boundary probe (0 rows stripped, 62 rows
-     unstripped): p6-entry-envs note -->
+**Rebuilt OpenSSL must be rechecked.** Rebuilds can change build-id
+and offsets. Pin exact bytes and repeat admission after a rebuild.
+The current table contains eleven exact-build entries; an unknown
+build with a supported symtab route need not gain a table row,
+whereas an unknown stripped build needs explicit enrollment.
+Enrollment is not live or performance qualification.
 
-**Cold-gap preflight in `doctor`: warned.** v0.2 `doctor --pid`
-reports a `cold-gap-preflight` degraded check; disclosure rides
-these docs plus the post-hoc `pid-prewindow-blind` / `cold-gap`
-emission in capture documents. `--pid` windows are blind to
-pre-attach execution by architecture; use `run --` with warmup
-traffic when completeness matters.
-<!-- source: R4 deferral: p5-gate-record.md; trigger matrix: trigger-matrix.md -->
-
-**Rebuilt OpenSSL needs re-enrollment.** OpenSSL source builds
-embed build dates, so ANY rebuild mints new GNU build-ids even
-from identical sources. A rebuilt libcrypto is an unknown build
-to `doctor` until its build-id row is enrolled (see
-[the built-in runbook](builtin-runbook.md)). Pin and enroll the
-exact binaries you observe; after any rebuild, re-enroll before
-re-gating.
-<!-- source: rebuild/re-enrollment standing rule, build-id table
-     (10 entries): p5-gate-record.md -->
+**FIPS counts need manual interpretation.** There is no KAT
+discriminator and no FIPS certification inference. A COMPLETE
+coverage status does not exclude self-tests from counts. See
+[the FIPS interim rule](fips-interim.md).
 
 ## Further reading
 
-- [Overhead and support matrix](overhead-matrix.md): budgets,
-  worst-cell numbers, qualified platforms.
+- [Overhead and support matrix](overhead-matrix.md): historical
+  fixture results and current qualification boundaries.
 - [CI recipes](ci-recipes.md): runner choice, gate wiring, timeouts.
-- [Privacy residuals](privacy/residuals.md): what the no-secret
-  guarantee does not cover.
-- [The OSSL_TRACE gap](trace-gap.md): why built-in tracing is not
-  a substitute.
+- [Privacy residuals](privacy/residuals.md): limits beyond the allowlist.
+- [The OSSL_TRACE gap](trace-gap.md): observation-surface comparison.

@@ -1,13 +1,13 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # PARTIAL runbook: per-reason response
 
-A PARTIAL window (exit 3) carries `completeness.reasons[]`,
+A PARTIAL document carries `completeness.reasons[]`,
 typed objects with a `kind` discriminator (see [the v2
 contract](observed-crypto-v2.md#completeness-coverage-counters)).
 Find your reason `kind` below and follow the response. Every
-typed reason is **blind**: it describes evidence that exists
-but is unobserved -- treat those windows as lower bounds, not
-inventories. (An empty-but-honest window with full coverage is
+typed reason is **blind**: some observation, attribution or coverage
+proof is missing. Treat counts under those limits as lower bounds,
+not complete inventories. (An empty-but-honest window with full coverage is
 COMPLETE, not PARTIAL.)
 <!-- source: reason vocabulary: src/evidence.rs (GapReason) -->
 
@@ -18,16 +18,23 @@ General rules:
   code. Fix the cause, then re-run; never average PARTIAL
   windows into a COMPLETE claim.
 - Policy is three-valued: a `--require-executed` name absent
-  from PARTIAL evidence is **inconclusive** (exit 11) when
+  from PARTIAL evidence is an **inconclusive rule** when
   the gap is relevant to the rule -- never a violation and
-  never a pass. A violation needs definite evidence, and a
-  proved violation still exits 10 on PARTIAL evidence.
+  never a pass. Under complete relevant coverage, proved absence
+  can violate require even when an unrelated gap makes the whole
+  document PARTIAL. Definite positive use passes require or violates
+  deny. A proved violation exits 10; aggregate inconclusive exits
+  11 only when no higher priority condition applies.
 - Window-only claims still hold: "none observed in window"
   never means "not present".
-- FATAL is not PARTIAL: a salvaged `runtime`-fatal document
-  keeps every collected observation and still evaluates
-  policy (proved violation exits 10, otherwise exit 1);
-  every other fatal kind carries no verdict (exit 4). See
+- FATAL is not PARTIAL. Runtime is eligible for policy even with
+  zero positive counts and retains collected observations.
+  AttachZero is also eligible when it carries proved positive
+  in-window ENGINE evidence. Eligibility proves no particular
+  rule. A proved violation exits 10; other usable fatal outcomes
+  exit 1. Environment, Recycled and bare AttachZero yield no
+  verdict (exit 4). Child/delivery failures can also outrank
+  inconclusive or PARTIAL. See
   [the v2 contract](observed-crypto-v2.md#completeness-coverage-counters)
   and [the exit table](usage.md#exit-codes).
 
@@ -52,7 +59,7 @@ General rules:
 
 | Kind | Class | Meaning | Response |
 |---|---|---|---|
-| `startup-gap` (`missing_ns`) | blind | The effective window starts `missing_ns` after the requested start: executions before readiness are unobserved. `--pid` attach always carries this shape (pre-window target activity is invisible), so `--pid` COMPLETE is unreachable by design. | Use `run --` (pre-exec attach) plus warmup traffic during harvest so fetches query before plan/attach. `--pid` is staging-only (see [staging deploy](staging-deploy.md)). |
+| `startup-gap` (`missing_ns`) | blind | The effective window starts `missing_ns` after the requested start: executions before readiness are unobserved. `--pid` has unavoidable pre-attach blindness. | Prefer `run --` for target custody and drive representative warmup/traffic; neither establishes first-call or COMPLETE coverage. Read the actual effective window and loss reasons. See [staging deploy](staging-deploy.md) for live attach. |
 | `tail-gap` (`missing_ns`) | blind | The effective window ends `missing_ns` before the requested end: the tail of the window went unobserved. | Same discipline as `over_budget` above: quit-before-expiry, split windows, or a fitting `--duration`. |
 | `signal-cut` (no fields) | blind | SIGTERM/SIGINT cut the window; signal-cut windows are always PARTIAL by construction. | Size the CI timeout per [the recipes](ci-recipes.md#ci-timeout) and re-run undisturbed. |
 
@@ -64,10 +71,12 @@ as a `loss` reason (counter
 `legacy.lowlevel_uninstrumented`), so check the document's
 reasons rather than assuming silence:
 
-- Low-level fallback: on libssl-linked targets, four digest
-  `Transform` imports arrive via `R_X86_64_GLOB_DAT` (no
-  PLT stub) and stay unprobed, so real TLS windows end
-  PARTIAL. Evidence and policy rules stay usable -- see
+- Low-level fallback: affected address-taken taxonomy imports
+  use `R_X86_64_GLOB_DAT` without an instrumented PLT stub.
+  They remain unprobed even when uniquely resolved. Inspect
+  the actual imports and typed loss; do not infer the same
+  four imports or PARTIAL shape for every TLS workload.
+  Evidence and policy rules remain usable under their limits — see
   [who should NOT adopt](what-it-proves.md#who-should-not-adopt-read-before-installing).
   On OpenSSL 4.x the ENGINE shape is absent by upstream
   design.

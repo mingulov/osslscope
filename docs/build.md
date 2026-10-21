@@ -1,8 +1,9 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Build from source
 
-One reproducible entrypoint builds the host binary and both BPF
-objects with pinned toolchains and locked dependencies:
+One reproducible entrypoint builds the host binary and three BPF
+objects (harvest, count, members) with pinned toolchains and locked
+dependencies:
 
 ```sh
 ./scripts/build-dev.sh --check-only   # prerequisites only; exit 0 here means ready
@@ -37,7 +38,7 @@ target directories, and the job/network/mode selection.
 
 ```sh
 ./scripts/build-dev.sh --host-only    # host workspace only
-./scripts/build-dev.sh --bpf-only     # both BPF objects only
+./scripts/build-dev.sh --bpf-only     # harvest/count/members BPF objects only
 ./scripts/build-dev.sh --release      # host in release mode (BPF is always release)
 ./scripts/build-dev.sh --offline      # refuse any network; fail if the cache is incomplete
 ```
@@ -78,6 +79,7 @@ the cargo log path, and the `install_layout` mapping that
 - host binary → `bin/osslscope`
 - `osslscope-harvest` → `lib/osslscope/osslscope-harvest`
 - `osslscope-count` → `lib/osslscope/osslscope-count`
+- `osslscope-members` → `lib/osslscope/osslscope-members`
 
 The objects land at:
 
@@ -85,16 +87,23 @@ The objects land at:
   `--release`)
 - `crates/ebpf/target/bpfel-unknown-none/release/osslscope-harvest`
 - `crates/ebpf/target/bpfel-unknown-none/release/osslscope-count`
+- `crates/ebpf/target/bpfel-unknown-none/release/osslscope-members`
 
 Confirm their identity with:
 
 ```sh
 file target/debug/osslscope \
   crates/ebpf/target/bpfel-unknown-none/release/osslscope-harvest \
-  crates/ebpf/target/bpfel-unknown-none/release/osslscope-count
+  crates/ebpf/target/bpfel-unknown-none/release/osslscope-count \
+  crates/ebpf/target/bpfel-unknown-none/release/osslscope-members
 ```
 
-expecting an x86-64 ELF executable plus two eBPF relocatables.
+expecting an x86-64 ELF executable plus three eBPF relocatables.
+The installer consumes all three roles from a normal manifest.
+A deliberate harvest/count-only install stays valid without
+traversal; automatic traversal uses a selected triple whose
+implicit roles match the install receipt. Explicit flags are
+operator-trusted overrides, not a matched-package qualification.
 
 ## Known linker warning
 

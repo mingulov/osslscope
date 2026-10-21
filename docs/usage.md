@@ -9,8 +9,8 @@ missing and how to fix it.
 
 ## inspect — inventory a live process
 
-Attach eBPF probes to a running process and list every OpenSSL
-provider it has loaded, with per-provider algorithm coverage:
+Attach eBPF probes to a running process and harvest provider
+algorithms exposed by observed post-attach queries, with coverage:
 
 ```sh
 osslscope inspect --pid 1234 --provider /opt/openssl/lib64/ossl-modules/legacy.so \
@@ -50,9 +50,11 @@ osslscope report --pid 1234 --duration 60
 osslscope report --format json --out report.json --cbom bom.json run -- ./my-app --serve
 ```
 
-- `run -- <cmd>` (spawn-and-observe) is the reliable mode;
+- `run -- <cmd>` (spawn-and-observe) improves target custody;
   `--pid` (attach to live) is inherently racy — anything the
   target did before attach is invisible (cold-start gap).
+  Spawn mode and warmup do not guarantee first-call or COMPLETE
+  coverage; inspect effective window edges and typed reasons.
 - Output policy: the spawned workload's stdout and stderr both
   go to /dev/null by default — observer stderr carries ONLY
   observer diagnostics, and observer stdout stays a pure
@@ -74,7 +76,7 @@ osslscope report --format json --out report.json --cbom bom.json run -- ./my-app
   line (exit + `--workload-out FILE`) and no workload bytes.
   Future rejection of shared-fd sinks is a separate policy change
   (announced, versioned, with a migration path) — never a silent
-  fix. No v0.2 change rejects them.
+  fix. The current implementation accepts them.
   `run --` predicts the target libcrypto pre-exec from the
   exe's `DT_NEEDED` closure plus loader search
   (`LD_LIBRARY_PATH`, rpath/runpath, system defaults);
@@ -86,8 +88,13 @@ osslscope report --format json --out report.json --cbom bom.json run -- ./my-app
 - `--provider P` names a provider file explicitly (a `.so`
   for file-provider mode, or libcrypto with `--builtin`);
   `--object O` / `--count-object C` name explicit BPF
-  objects. These are diagnosis/developer overrides — the
-  defaults above are the normal path.
+  objects; `--members-object M` demands traversal, which requires
+  a resolved builtin query anchor. File-provider/dispatch-blind
+  runs without an anchor refuse that explicit request; automatic
+  triple selection can stay harvest-only instead.
+  Trusted installed selection is automatic. User-owned prefixes
+  need explicit role flags; use the same selected pair/triple
+  for preflight and capture per [install](install.md).
 - `--table F` / `--force-offset N` / `--provider-table F`
   enroll an unknown local build explicitly (see [the
   built-in runbook](builtin-runbook.md)); unknown stripped
@@ -106,9 +113,9 @@ osslscope report --format json --out report.json --cbom bom.json run -- ./my-app
 
 ## check — policy gate (CI)
 
-`check` captures and evaluates policy rules, exiting 10 on
-violation, 11 when a rule is unproven under relevant
-uncertainty (clean exit 0; at least one rule is required):
+`check` captures and evaluates policy rules. A proved violation
+exits 10. An aggregate inconclusive verdict exits 11 when no
+higher priority failure applies; at least one rule is required:
 
 ```sh
 osslscope check --deny-engine --deny-weak run -- ./my-app --self-test
@@ -120,10 +127,13 @@ Rules: `--require-provider P`, `--deny-provider P`,
 `--require-executed X` (repeatable; provider matchers must be
 nonempty -- an empty value is a usage error, exit 2, before
 any side effect). Discovery and overrides work exactly as in
-`report`. Verdicts are three-valued: violation on definite
-evidence (exit 10), pass (exit 0/3), or inconclusive (exit 11)
-when a requirement is unproven under relevant uncertainty --
-see the result JSON, not just the exit code.
+`report`. Each rule's `result` is pass, violation or inconclusive;
+aggregate `policy.verdict` can also be `no-verdict` on unusable
+fatal evidence. Require rules pass on definite use, violate only
+on proved absence under complete relevant coverage, and otherwise
+remain inconclusive. Deny rules violate on definite use and pass
+only on proved relevant absence. Read `policy.rules[]` bounds and
+evidence as well as the [exit precedence](#exit-codes).
 
 ## doctor — environment diagnosis
 
@@ -162,7 +172,7 @@ members object exists anywhere; user-owned prefixes never
 resolve implicitly);
 anything else needs explicit flags. `doctor` vets objects with
 the same primitives the backend composes, so preflight with
-the same explicit pair (or none) predicts exactly what
+the same explicit pair/triple (or none) predicts what
 `report`/`check` will resolve. The `objects-members`
 row covers the traversal object: `pass` when installed and
 compatible, `info` when absent (traversal unavailable — old
@@ -192,32 +202,49 @@ addresses claimed by several (provider, op, funcid) triples.
 
 | Code | Meaning |
 | ---- | ------- |
-| 0 | ok (check: no violation) |
-| 1 | tool failure: observed child failed (`run --`), artifact delivery failed, or a post-observation close failure (salvaged `runtime`-fatal doc — observations kept, see JSON) |
+| 0 | COMPLETE with passing policy, or a successful non-capture command |
+| 1 | usable fatal document, failed observed child (`run --`), or failed artifact delivery; see precedence below |
 | 2 | usage error |
-| 3 | PARTIAL — degraded evidence, see JSON (`inspect`/`report`/`check` all exit 3 on PARTIAL) |
-| 4 | fatal setup failure — evidence unusable because observation never started (incl. unsuitable target, pid recycled, environment/attach failure) |
-| 10 | policy violation (`check`) — dominates every tool failure (a proved violation in salvaged sites still exits 10) |
-| 11 | inconclusive (`check`) — requirement unproven under relevant uncertainty |
+| 3 | PARTIAL when no higher priority result applies (`check`: passing policy); inspect also uses 3 for degraded harvest |
+| 4 | unusable fatal/no policy verdict, including environment, recycled target and bare AttachZero; doctor also uses 4 for failed preflight |
+| 10 | proved policy violation (`check`), including on usable fatal evidence; dominates tool/delivery failure |
+| 11 | aggregate inconclusive policy when no higher priority result applies |
 
-Priority (PRD §14, H7-extended): 2 usage > 10 violation > 1 salvaged runtime-fatal > 4 setup-no-verdict > 1 failed child / failed delivery > 11 inconclusive > 3 partial > 0 clean. Exit 1 says "the tool broke" (with observations kept on the salvaged row); exit 3 says "the observation is incomplete"; exit 4 says "observation never started".
+Priority (`src/report.rs` `exit_for`): 2 usage (before capture) >
+10 violation > 1 usable fatal > 4 no-verdict > 1 failed child /
+failed delivery > 11 inconclusive > 3 PARTIAL > 0 clean.
+
+Runtime fatal is eligible for policy even with no positive counts.
+AttachZero is eligible only with proved positive in-window typed
+ENGINE evidence; it describes provider attachment, not the
+independent ENGINE plane. Environment, Recycled and bare AttachZero
+remain unusable. Eligibility does not make a rule decidable or a
+candidate definite. A usable fatal without a violation exits 1,
+including when its policy is inconclusive. Exit 4 is not a universal
+claim that no observation ever occurred: a recycled target's evidence
+is discarded as unusable. Requested artifacts are attempted
+independently, including fatal output; delivery is not guaranteed.
 
 ## Current limitations (honest)
 
-- x86-64 Linux only; kernel 6.9+ is the verified support
-  floor (6.12-LTS oldest tested). Admission is by functional
+- x86-64 Linux only; kernel 6.9 is the support floor.
+  The [historical matrix](overhead-matrix.md) includes a 6.9
+  lane; current integrated artifacts still need qualification.
+  Admission is by functional
   feature probe (kprobe-load, ringbuf, uprobe-multi+cookies,
   `probe_read_user`) with the release itself informational;
   BPF tokens are a debug-only floor signal, never used for
   privilege.
 - `--pid` attach cannot see pre-attach history (cold-start
-  gap); use `run --` when completeness matters.
+  gap); `run --` improves custody without proving completeness.
 - Under sustained high dispatch rates the ring buffer can
   drop events; drops are counted and reported (PARTIAL),
   never silent — but size `--duration` windows accordingly.
 - Stripped libcrypto needs `--table`/`--force-offset` help
   for built-in observation unless the build is enrolled
   ([recipe](builtin-runbook.md)); the shipped table covers
-  ten historical builds only, not arbitrary binaries.
+  eleven exact builds only, not arbitrary binaries. Supported
+  symtab resolution can admit an unknown unstripped build without
+  adding a table row; enrollment does not qualify performance.
 - FIPS-provider builds change dispatch shapes; support is
   best-effort and explicitly versioned per release.

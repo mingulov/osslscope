@@ -1,9 +1,14 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Overhead and support matrix
 
-Overhead claims match the worst passing cell, never the best case.
-All numbers below are medians over repeated runs against fixture
-providers on real (VM or bare-metal) kernels.
+The tables below preserve historical fixture-era results, separate
+from current integrated v2 qualification. They are source/kernel/
+workload-specific medians from repeated fixture-provider runs on
+VM or bare-metal kernels, not standing support or performance
+certification for the current tree. Historical `v0.1.0` release
+credit remains on its recorded terms; current live, overhead,
+COMPLETE-window and exact-package acceptance remains open.
+An enrollment-only profile is listed separately from performance.
 
 ## Budgets
 
@@ -12,20 +17,15 @@ Two absolute budgets, both must hold:
 - At most 4.0 us median added latency per intercepted call.
 - At most 2.0x wall-clock at realistic rates (paced to 100k ops/s).
 
-<!-- source: absolute budgets (G4 restatement): PRD.md section 8,
-     wallclock-record.md sections 1-2 -->
 Absolute means absolute: the per-call baseline is reported
-alongside, never folded into the budget. (The uprobe trap floor of
-about 0.5 us exceeds typical sub-microsecond baselines, so a
-relative budget would be unachievable by construction.)
-<!-- source: uprobe trap floor (any uprobe costs >=0.5us):
-     wallclock-record.md section 2 -->
+alongside, never folded into the budget. In the historical setup,
+the uprobe trap cost of about 0.5 us already exceeded typical
+sub-microsecond callback baselines; relative ratios alone did not
+describe the added latency usefully.
 
 ## Worst-cell numbers
 
-<!-- source: per-platform rows: p5-gate-record.md (recomputed from
-     committed logs); platform detail: wallclock-record.md,
-     perf-rhel10 note, alpine/arch/fedora44/tw lane notes -->
+Historical performance results, not a new measurement:
 
 | Platform | Kernel | OpenSSL | Overhead added/call | Wall small / paced | Verdict |
 |---|---|---|---|---|---|
@@ -37,36 +37,45 @@ relative budget would be unachievable by construction.)
 | Arch rolling | 7.2 | 3.6 | 0.8-1.4 us | 1.44 us / 0.90x | PASS |
 | openSUSE Tumbleweed | 7.2 | 3.5 | 0.8-0.9 us | 3.37 us / 0.54x | PASS |
 | Alpine 3.24 (musl) | 6.18-lts | 4.0 | 0.8-3.1 us | 1.08 us / 1.02x | PASS |
-| Debian 13 (v0.2 profile B) | 6.12.107+deb13-cloud-amd64 | 3.5 (/opt source 3.5.9) | n/a (enrollment profile, no overhead lane) | n/a | RECORDED: profile legs green; /opt build enrolled as table entry 11; system libcrypto unenrolled (stripped, anchor-unresolved stays honest) |
 
-Overhead is GREEN on 7 of 8 platforms; the worst passing absolute
+Historical enrollment-only profile (excluded from the performance
+denominator): Debian 13, kernel `6.12.107+deb13-cloud-amd64`, OpenSSL
+3.5.9 source build under `/opt`, enrolled as table entry 11. That
+profile recorded passing profile legs but no overhead measurement;
+its stripped system libcrypto remained unenrolled/anchor-unresolved.
+Neither table presence nor those profile legs qualify current
+integrated performance (`tests/build_id_table.rs`).
+
+In the historical eight-platform fixture set, overhead passed on
+7 of 8 platforms; the worst passing absolute
 cell is the Alpine 504-entry attach shape at 3.14 us, inside the
-4.0 us budget. Wall-clock is GREEN on 7 of 8 in both cells. (The
+4.0 us budget. Wall-clock passed on 7 of 8 in both cells. (The
 Tumbleweed paced ratio below 1.0 is pacer slack noise, a pass
 under the 2.0x budget, not a speedup claim.)
 
 The single outlier -- Ubuntu 24.04 on kernel 6.9 observing
 CET-built (`endbr64`) targets under nested virtualization -- is
-report-only and fully root-caused: that guest kernel cannot
-emulate `endbr`, so it single-steps every uprobe hit at two nested
+report-only in that measured setup: its recorded cause was that
+the guest kernel could not emulate `endbr`, so it single-stepped
+every uprobe hit at two nested
 exits per hit (about 5 us each). The BPF probe body itself is
-isolated at about 0.3-0.5 us per hit on every platform, so no
-product change can move the outlier: the trap path belongs to the
-guest kernel. Correctness gates (including exactness) stay green
-there; only overhead is documented-slow, not broken.
-<!-- source: root-cause chain (single-step + nested exits, BPF body
-     isolated): wallclock-record.md section 3 -->
+isolated at about 0.3-0.5 us per hit in those runs. Historical
+correctness gates, including keyed exactness, passed there; that
+does not prove current correctness or establish a new kernel-floor
+exclusion. Re-measure the exact current target/kernel/observer.
 
 Practical guidance: pin overhead-sensitive gates to 6.12+
-runners. `doctor` carries no overhead probe in v1 (trap cost is
-not cheaply probed); this matrix plus the CI recipes carry the
-guidance instead.
+runners as a starting point, then measure both budgets. `doctor`
+has no overhead qualification probe; a functional admission pass
+does not establish latency, rate or wall-clock acceptance.
 
 ## Support matrix
 
-Qualified for v1 observation (all correctness gates green,
-attach 26/26 or via canary/capture/fence cells, builtin parity
-100%, wallclock as above):
+Historical observation matrix (fixture-era correctness/attach,
+canary/capture/fence and builtin-parity results, with wall-clock
+as above). It includes a real 6.9 lane, so 6.12 is not the oldest
+historically exercised kernel. No row grants current matrix-wide
+qualification:
 
 | Platform | Kernel | OpenSSL | Notes |
 |---|---|---|---|
@@ -79,42 +88,42 @@ attach 26/26 or via canary/capture/fence cells, builtin parity
 | openSUSE Tumbleweed | 7.2 | 3.5 | rolling newest-kernel lane |
 | Alpine 3.24 (musl) | 6.18-lts | 4.0 | musl lane; musl fence shape asserted |
 
-<!-- source: gate verdicts per platform (all PASS except 6.9
-     overhead/wallclock report-only): p5-gate-record.md -->
-
-Standing claims across the matrix:
+Recorded historical fixture checks across that matrix:
 
 - Attach SLO: file-caps least-priv attach (`CAP_BPF` +
   `CAP_PERFMON`) green in 40 of 40 cells (5 per platform).
-  <!-- source: 40/40 filecaps GREEN: p5-gate-record.md -->
 - Exactness: keyed counts match known-N drivers with zero delta
   (12/12 cells per platform), including the single-hot-key
   100k/s cell.
-  <!-- source: exact 12/12 delta=0: p5-gate-record.md -->
 - Harvest scale: per-operation dispatch walks paginate to 512
   algorithms with userspace/loader lockstep (third-party
   re-proof clean at the raised bound).
-  <!-- source: MAX_ALGS 512 raise + oqsprovider re-proof:
-       p5-gate-record.md, oqs-spike note -->
 - Third-party providers: oqsprovider harvest attributed 100%
   both unstripped and stripped (4876/4876 rows file-backed),
   COMPLETE, stripped-vs-unstripped row multisets identical --
   against a bar of 95% stripped.
-  <!-- source: oqsprovider 0.11.0 + liboqs 0.15.0 re-proof:
-       oqs-spike note, p5-gate-record.md -->
+  The historical third-party setup used oqsprovider 0.11.0 and
+  liboqs 0.15.0; harvest parity is not a current count-window proof.
 - No-secret guarantee: the canary suite (29 sentinels through
   digest/sign/cipher/MAC/KEM/KDF/RAND/password/salt paths,
   hostile names, overlong arrays, live-map scan) reports zero
   secret bytes in any artifact on every platform.
-  <!-- source: canary 8/8 green, scanned=120 fails=0 (147 incl
-       FIPS on the FIPS host): p5-gate-record.md -->
-- SELinux Enforcing/targeted: green. 6.18-LTS watch kernel:
-  green. SecureBoot: RED -- host-blocked, deferred post-v1, no
-  v1 claim (see [what it proves](what-it-proves.md)).
-  <!-- source: SELinux/6.18/SecureBoot cells:
-       p5-exit1-cells note, p5-gate-record.md -->
+- SELinux Enforcing/targeted and the 6.18-LTS watch kernel passed
+  their historical cells. Secure Boot qualification was host-blocked
+  and remains unclaimed; no current enabled-state success follows
+  from these tables. AlmaLinux is not an actual RHEL 10 receipt.
 
-Not qualified (see [who should NOT adopt](what-it-proves.md)):
-pre-6.9 kernels and distros (EL9, Ubuntu 22.04, Ubuntu 24.04 GA,
-Debian 12), non-x86-64 targets, stripped static binaries,
-always-on production attach, and CI gating on COMPLETE status.
+Current qualification must use the exact integrated artifacts and
+actual required platforms, including actual RHEL 10 and enabled
+Secure Boot/lockdown/enforcing SELinux states with the required
+controls preserved. A disabled-state control or approved alternative
+environment does not qualify an enabled state. Ordinary failed and
+PARTIAL windows remain in completeness denominators; exclude only
+predeclared expected-PARTIAL negatives. See
+[the promotion checklist](promotion-checklist.md).
+
+Current unsupported shapes include pre-6.9 kernels and non-x86-64
+targets. Unknown stripped builds need explicit admission, not
+guessed offsets. Always-on service operation is forthcoming and
+current COMPLETE-window gating is unqualified; see
+[who should NOT adopt](what-it-proves.md).

@@ -3,14 +3,15 @@
 
 CI gates use `check` in spawn mode (`run --`). Never `--pid` in
 CI: pid attach is racy and staging-only by contract.
-<!-- source: CI MUST use run: PRD.md section 6 -->
+Spawn mode improves custody; it and warmup do not prove first-call
+or COMPLETE coverage. Current integrated live/package qualification
+remains open; these recipes describe current invocation semantics.
 
 ## Runner image
 
 - Preferred: GHA `ubuntu-24.04` runners (full VM with sudo) or
   self-hosted 6.9+ runners with sudo for the one-time file-caps
   setup. The gate itself then runs unprivileged.
-  <!-- source: beachhead + setup/assert split: ebpf-privileges note -->
 - Avoid `ubuntu-22.04` images (below the kernel floor; see
   [who should NOT adopt](what-it-proves.md#who-should-not-adopt-read-before-installing)).
 - On Ubuntu 24.04 **servers** (which default to the GA kernel),
@@ -26,8 +27,6 @@ sudo reboot
 # after reboot: uname -r must show a 6.9+ kernel
 ```
 
-<!-- source: Server-defaults-GA + HWE recipe: ebpf-privileges note -->
-
 ## Setup phase (privileged, once per runner)
 
 ```sh
@@ -35,11 +34,16 @@ sudo dpkg -i osslscope_<ver>-1_amd64.deb   # or: sudo dnf install ./osslscope-<v
 getcap /usr/bin/osslscope                  # expect: cap_bpf,cap_perfmon+ep
 ```
 
-Build the BPF objects the gate needs (nightly toolchain, see the
-project README), then install them into a trusted system
-location (`/usr/local/lib/osslscope` or `/usr/local/lib64/osslscope`;
-the distro `/usr/lib{,64}/osslscope` pair is the fallback) so the
-gate step below resolves them without flags. If the install hook
+Current packages contain the host binary and install docs only.
+Build the matching harvest/count/members roles with the pinned
+toolchains (see [build](build.md)). For implicit traversal, install
+through `scripts/install-dev.sh` into a trusted system prefix with
+its matching receipt; three copied files do not establish it.
+Selection searches trusted directories for a triple before a
+pair; pair fallback requires members to be absent everywhere.
+Alternatively use the explicit local-prefix recipe below.
+Deliberate harvest/count-only installs remain valid without traversal.
+If the install hook
 warned about caps, re-apply:
 `sudo setcap cap_bpf,cap_perfmon+ep /usr/bin/osslscope`.
 See [install](install.md).
@@ -49,7 +53,7 @@ See [install](install.md).
 Preflight with the same objects the gate will use, then gate.
 With a trusted system install, both resolve the BPF objects
 implicitly; with a user-owned prefix (never trusted implicitly),
-pass the same explicit `--object`/`--count-object` pair to both:
+pass the same explicit harvest/count/members flags to both:
 
 ```sh
 osslscope doctor || exit 4                      # preflight first, always
@@ -65,17 +69,25 @@ osslscope check \
   >driver.log 2>&1                             # observer diagnostics only
 ```
 
-User-owned-prefix variant (explicit pair, same on both lines):
+User-owned-prefix variant (normal three-role install, same selected
+objects on both commands):
 
 ```sh
-osslscope doctor --object "$PFX/lib/osslscope/osslscope-harvest" \
-  --count-object "$PFX/lib/osslscope/osslscope-count" || exit 4
+PFX="$HOME/.local"
+"$PFX/bin/osslscope" doctor --object "$PFX/lib/osslscope/osslscope-harvest" \
+  --count-object "$PFX/lib/osslscope/osslscope-count" \
+  --members-object "$PFX/lib/osslscope/osslscope-members" || exit 4
 
-osslscope check \
+"$PFX/bin/osslscope" check \
   --provider /path/to/libcrypto.so.3 --builtin \
   --object "$PFX/lib/osslscope/osslscope-harvest" \
   --count-object "$PFX/lib/osslscope/osslscope-count" \
-  ... # same rules, window, and outputs as above
+  --members-object "$PFX/lib/osslscope/osslscope-members" \
+  --deny-weak --deny-provider legacy \
+  --require-executed ML-KEM-768 --duration 30 --grace 5 \
+  --format json --out gate.json --image-digest "$IMAGE_DIGEST" \
+  --workload-out workload.log \
+  run -- ./my-app --smoke-test >driver.log 2>&1
 ```
 
 Notes:
@@ -84,7 +96,9 @@ Notes:
   error (exit 2), never a green gate.
 - `--builtin` observes libcrypto's built-in provider; drop it
   and point `--provider` at a provider `.so` to observe an
-  external provider module instead.
+  external provider module instead. Omit explicit `--members-object`
+  for that mode: traversal requires a builtin query anchor;
+  automatic triple selection can degrade to harvest-only.
 - `--image-digest` records the container digest in the actionability
   tuple (empty string on bare metal).
 - `--workload-out workload.log` captures the workload's own
@@ -98,30 +112,34 @@ Notes:
 
 ## Exit handling
 
-<!-- source: CI handling table: PRD.md section 6 -->
-
 | Exit | Meaning | Gate action |
 |---|---|---|
 | 0 | clean (COMPLETE, no violation) | pass |
 | 3 | PARTIAL evidence, passing policy verdict | warn + upload artifacts; gate passes by default (strict-fail is team policy) |
-| 10 | policy violation (on COMPLETE, PARTIAL, or salvaged `runtime`-fatal) | fail; triage per [violation triage](violation-triage.md) |
+| 10 | proved policy violation (on COMPLETE, PARTIAL or usable FATAL) | fail; triage per [violation triage](violation-triage.md) |
 | 11 | inconclusive: a requirement is unproven under relevant uncertainty | fail; triage the relevant gap per [the PARTIAL runbook](partial-runbook.md) -- the requirement is unproven, never fabricated |
-| 4 | setup failure: observation never started (environment/attach failure) | fail; run `doctor`, remediate, retry (see [attach failures](attach-failures.md)) |
-| 1 | child failed (`disposition: exited` with nonzero code), delivery failed, or salvaged close failure (`fatal_kind: runtime` in gate.json — observations kept) | fail; branch on `disposition` / `fatal_kind` in gate.json |
+| 4 | unusable fatal/no verdict (environment, recycled target, bare AttachZero) | fail; run `doctor`, remediate, retry (see [attach failures](attach-failures.md)) |
+| 1 | usable fatal, child failure or delivery failure | fail; read `disposition`, `completeness.fatal_kind` and delivery diagnostics |
 | 2 | usage/config error | fail; fix the invocation |
 
-Do NOT gate on COMPLETE status or exit 0 on real TLS apps: v1 is
-explicitly not qualified for that (see [who should NOT
+Current integrated COMPLETE-window qualification is open (see [who should NOT
 adopt](what-it-proves.md#who-should-not-adopt-read-before-installing)).
-Exit 3 with a passing policy verdict is the normal shape for
-TLS-terminating services. A proved violation dominates every
-tool failure: exit 10 fires even when delivery failed or the
-document is a salvaged `runtime`-fatal.
+Affected GLOB_DAT imports remain uninstrumented, but not every TLS
+target has the same reason or count shape. Gate on actual policy
+and disclosed gaps. A proved violation dominates every tool failure,
+including failed delivery or usable fatal evidence. Runtime is
+eligible even with zero counts; AttachZero needs proved positive
+in-window ENGINE evidence. Usability proves no particular rule.
+A usable fatal without violation exits 1. Child/delivery failures
+also outrank inconclusive, so a per-rule inconclusive result does
+not guarantee exit 11. See [the full precedence](usage.md#exit-codes).
 
 ## Artifact upload
 
-Always upload the gate artifacts, even on violation/PARTIAL --
-they are written in all non-fatal outcomes:
+Always upload available artifacts, including on violation, PARTIAL
+and fatal outcomes. The capture paths attempt each requested primary
+and CBOM independently, including typed fatal output. A destination
+can fail: retain delivery diagnostics and do not assume a file exists.
 
 - `gate.json` (the full evidence document: window, completeness,
   sites, coverage, legacy partition, policy).
@@ -166,8 +184,8 @@ workload inside the requested window instead --
 quit-before-expiry discipline, split windows, or a `--duration`
 the workload actually fits in (a 60 s smoke test needs a window
 above 60 s, not a 30 s window with a long timeout).
-<!-- source: timeout rule: PLAN.md P6 exit 2; over-budget/signal
-     semantics: PRD.md sections 5-6 -->
+<!-- source: window/disposition behavior: src/capture.rs;
+     typed completeness: src/evidence.rs -->
 
 At window end the observer detaches a still-running owned child
 and leaves it running (`disposition: detached-running` with its

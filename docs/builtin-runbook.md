@@ -9,7 +9,7 @@ in order and reports which one won (`resolution`):
 1. `--force-offset N` — your explicit offset, always wins.
 2. Build-id table — the stripped binary's `.note.gnu.build-id`
    looked up in the shipped table (`etc/build-id-table.json`,
-   ten historical builds) or your `--table FILE`. A hit is
+   eleven exact builds) or your `--table FILE`. A hit is
    verified against the object's own anchor symbol; a
    mismatch fails closed, never silently.
 3. Symtab — direct symbol lookup; works only when the binary
@@ -18,6 +18,14 @@ in order and reports which one won (`resolution`):
    delta from an **explicitly selected** `--table FILE` only.
    This rung never runs automatically: unknown stripped
    builds need explicit enrollment, never a guessed offset.
+
+An unknown build-id alone does not imply refusal: supported symtab
+resolution can admit an unstripped build without a new table row.
+Rebuilds can change identities and offsets; recheck the exact bytes
+and repeat admission rather than assuming every rebuild changes
+the id. Table enrollment proves an anchor, not current live or
+performance qualification (`tests/build_id_table.rs`,
+`tests/onboarding.rs`).
 
 If every rung fails, `report`/`check` refuse with enrollment
 remediation (exit 4) and `inspect` reports PARTIAL
@@ -70,9 +78,11 @@ shows the same prediction before you run).
      --builtin --force-offset 0x27df00 --out inspect.json
    ```
 
-   `--force-offset` takes decimal or `0x` hex. Demand a COMPLETE
-   verdict with rows; zero rows means the offset is dead —
-   re-derive, never ship the guess.
+   `--force-offset` takes decimal or `0x` hex. Require independent
+   confirmation of the anchor and expected rows under representative
+   traffic. Zero rows can reflect a dead offset or a missing trigger;
+   diagnose both, never ship a guess. COMPLETE coverage alone does
+   not validate the offset or settle candidate identity.
 
 4. To persist it, write a `--table` entry (only `build_id`,
    `query_offset`, `anchor`, and `anchor_offset` are required):

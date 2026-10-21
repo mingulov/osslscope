@@ -1,6 +1,33 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Changelog
 
+## Unreleased development
+
+- Current report/check emits `observed-crypto-v2.1`: conserved
+  physical-site counts, candidate uncertainty, typed coverage/loss/
+  window gaps, argv redaction, and three-valued policy rules with
+  site and optional ENGINE evidence. See
+  [the current contract](docs/observed-crypto-v2.md).
+- Source includes the admitted physical-count ledger, per-key
+  accounting, callback-latency collection, traversal integration
+  and an eleven-entry exact-build table. These implementations and
+  their source/fixture checks do not establish current integrated
+  live, overhead, COMPLETE-window or package qualification.
+- The normal development build produces the host binary plus
+  harvest/count/members BPF roles; deliberate pair-only installs
+  remain supported. Current deb/rpm builders contain the host
+  binary and install documentation only. Matched redistributable
+  host+BPF packages remain forthcoming, subject to licensing,
+  provenance and exact-package qualification.
+- Metadata-only trace, latency histograms, expanded targeting and
+  service operation remain forthcoming. Permanent privacy and
+  observation exclusions remain unchanged; see
+  [what it proves](docs/what-it-proves.md).
+
+This is not a new release. `v0.1.0` remains the historical tagged
+baseline; its source-specific results below do not qualify the
+current development tree.
+
 ## 0.1.0 (2026-10-18)
 
 First release. Execution-backed OpenSSL crypto inventory on eBPF
@@ -16,8 +43,8 @@ the first version actually cut, qualified, and tagged.)
   `crates/{ossl-discover,manifest,ebpf-common,bpf-sys}`.
   `crates/ebpf` stays 0.0.0 by design: unpublished-internal (own
   workspace + lockfile + nightly toolchain, `publish = false`),
-  its BPF objects are operator-built and never shipped, so it sits
-  off the release line.
+  its BPF objects were operator-built outside the packages for
+  that release, so it sits off the release line.
 - Packaging: deb + rpm with file-caps default install
   (`packaging/`); version read from `Cargo.toml` at build time.
 - Docs: claim chain + who-should-NOT-adopt, overhead matrix, CI
@@ -27,13 +54,14 @@ the first version actually cut, qualified, and tagged.)
   independent review gates (review-accepted fixes, RED-first
   proofs, sealed-candidate live re-qualification on lane-b).
   Suite 1171/0, CI green.
-- Known limitations (tracked for 0.2): COMPLETE verdict 0/10 on
-  real shapes (genuine attach/late-attach/close-tail losses —
-  T14 gated); deep observability obligations open (physical
-  callback ledger, hot-key/per-key counts, P6-live
-  compositions, callback-latency distributions, second
-  kernel/libc profile); R06 registry alias/cancel hardening
-  parked; several arms unit-covered only (see plan record).
+- Known limitations recorded at that baseline: COMPLETE verdict
+  0/10 on real shapes (attach/late-attach/close-tail losses);
+  physical callback ledger, hot-key/per-key counts, live
+  compositions, callback-latency distributions and a second
+  kernel/libc profile remained open; registry alias/cancel
+  hardening was parked and several arms had unit coverage only.
+  Later source implementation is described under Unreleased;
+  historical open lists are not the current qualification record.
 
 ### P6 auditor story
 

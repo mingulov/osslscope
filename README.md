@@ -1,10 +1,9 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # osslscope
 
-Prove which OpenSSL crypto implementations actually execute in a running
-Linux application -- provider, operation, algorithm, and the dispatch
-callback that ran -- **without changing the application or its
-configuration**.
+Observe which OpenSSL provider-dispatch callbacks execute in supported
+Linux targets, with physical-site counts and explicit candidate
+uncertainty -- **without changing the application or its configuration**.
 
 `osslscope` is a non-interposing OpenSSL execution observer
 built on eBPF uprobes. It traces the provider architecture down to the
@@ -21,10 +20,12 @@ installed
     != EXECUTED
 ```
 
-> **Status: development (unreleased).** The tree is mid-continuation toward
-> the v2 evidence contract (`docs/observed-crypto-v2.md`); the last
-> packaged baseline is 1.0.0 and no packages built from this branch are
-> final distributables. Build and install locally per
+> **Status: development (unreleased).** Current report/check output follows
+> the [v2.1 evidence contract](docs/observed-crypto-v2.md). The historical
+> tagged baseline is `v0.1.0`; 1.0.0 was an earlier unreleased label.
+> Current integrated live and package qualification remains open, and
+> packages built from this branch are development snapshots.
+> Build and install locally per
 > [build](docs/build.md) and [install](docs/install.md).
 > Stack: Rust 1.88 + Aya 0.14 (raw multi-link primary).
 > Specs appear under `docs/`; see `docs/README.md`.
@@ -34,9 +35,10 @@ installed
 - **Migration verification** -- "We moved this app to PQC. Is it really
   performing ML-KEM / ML-DSA, or is some old RSA/ECDSA/ECDH path still
   executing somewhere?"
-- **Runtime crypto inventory / CBOM** -- which (operation, algorithm,
-  provider) triples execute, with entry-observed counts (no
-  success/error split: v1 observes entry only).
+- **Runtime crypto inventory / CBOM** -- physical callback entries with
+  candidate (operation, algorithm, provider) identities. Counts are
+  conserved once per site; CBOM assets require definite attribution.
+  There is no success/error split.
 - **Legacy-path detection** -- "You think the app migrated to providers,
   but this code path still drops into an old `ENGINE` or the legacy
   provider." (OpenSSL 3.x; `ENGINE` was removed in 4.x.)
@@ -50,7 +52,7 @@ See [the side-by-side gap matrix](docs/trace-gap.md).
 - [What it proves (and what it does not)](docs/what-it-proves.md) --
   claim chain, non-goals, who should NOT adopt
 - [Overhead and support matrix](docs/overhead-matrix.md) --
-  budgets, worst-cell numbers, qualified platforms
+  budgets, historical fixture results and qualification limits
 - [CI gate recipes](docs/ci-recipes.md) --
   runner choice, gate wiring, timeouts, artifacts
 - [PARTIAL runbook](docs/partial-runbook.md) -- per-reason response
@@ -62,7 +64,7 @@ See [the side-by-side gap matrix](docs/trace-gap.md).
 - [Staging deploy](docs/staging-deploy.md) --
   debug-container observation, gate-disable procedure
 - [FIPS interim rule](docs/fips-interim.md) --
-  manual triage with quantified rates
+  manual triage with historical self-test measurements
 - [Promotion checklist](docs/promotion-checklist.md) --
   staging to production
 - [Operator's guide](docs/usage.md) -- CLI usage for all commands
@@ -80,7 +82,8 @@ See [the side-by-side gap matrix](docs/trace-gap.md).
 
 Prerequisites: Linux x86-64, kernel >= 6.9, Rust 1.88 plus
 nightly-2026-05-20 with `rust-src` and `bpf-linker` 0.10.4 — see
-[build](docs/build.md). One entrypoint builds host + BPF:
+[build](docs/build.md). One entrypoint builds the host plus the
+harvest, count and members BPF objects:
 
 ```sh
 ./scripts/build-dev.sh                # writes target/dev-build-manifest.json
@@ -93,32 +96,49 @@ First run (one-time setup, then least-privilege runs):
 sudo setcap 'cap_bpf,cap_perfmon=ep' "$HOME/.local/bin/osslscope"
 "$HOME/.local/bin/osslscope" doctor \
   --object "$HOME/.local/lib/osslscope/osslscope-harvest" \
-  --count-object "$HOME/.local/lib/osslscope/osslscope-count"
+  --count-object "$HOME/.local/lib/osslscope/osslscope-count" \
+  --members-object "$HOME/.local/lib/osslscope/osslscope-members"
 # preflight; must print verdict: ok
 ```
 
-The prefix layout is `$PREFIX/bin/osslscope` plus both BPF objects
+The prefix layout is `$PREFIX/bin/osslscope` plus three BPF objects
 under `$PREFIX/lib/osslscope/`. A user-owned prefix is never
 trusted implicitly, so `report`/`check` (and `doctor`) need the
-explicit flags below; only the same layout under a root-owned
-system dir auto-resolves (see [install](docs/install.md)):
+explicit flags below. Trusted system locations support automatic
+selection. A fully automatic triple requires a matching install
+receipt, not just three copied files. The implicit members role needs a
+matching receipt; explicit roles are operator-trusted. Legacy
+implicit harvest/count roles may be receiptless; when a receipt is
+present, implicit roles must match it and stale/mismatched entries
+refuse. Explicit members with a legacy receiptless implicit pair is
+supported without receipt-backed matching provenance (see
+[install](docs/install.md)). Deliberate harvest/count-only installs
+remain valid without traversal:
 
 ```sh
-"$HOME/.local/bin/osslscope" report --provider /path/to/provider.so \
+"$HOME/.local/bin/osslscope" report --provider /path/to/libcrypto.so.3 --builtin \
     --object "$HOME/.local/lib/osslscope/osslscope-harvest" \
     --count-object "$HOME/.local/lib/osslscope/osslscope-count" \
+    --members-object "$HOME/.local/lib/osslscope/osslscope-members" \
     run -- my-app --serve
 ```
 
 Gate a window in CI (one rule minimum; `--help` lists all rules):
 
 ```sh
-"$HOME/.local/bin/osslscope" check --provider /path/to/provider.so \
-    --object <harvest above> --count-object <count above> \
+"$HOME/.local/bin/osslscope" check --provider /path/to/libcrypto.so.3 --builtin \
+    --object "$HOME/.local/lib/osslscope/osslscope-harvest" \
+    --count-object "$HOME/.local/lib/osslscope/osslscope-count" \
+    --members-object "$HOME/.local/lib/osslscope/osslscope-members" \
     --deny-weak --deny-provider legacy --format json --out gate.json \
     run -- my-app --smoke-test
-echo $?  # 0 clean, 10 violation, 11 inconclusive, 3 PARTIAL, 4 environment, 2 usage, 1 child/artifact failure
+echo $?  # see docs/usage.md: 10 violation dominates; 1 also covers usable fatal evidence
 ```
+
+Explicit traversal requires a resolved builtin query anchor. For
+file-provider mode (`--provider /path/to/provider.so`, no `--builtin`),
+omit `--members-object`; automatic installed selection can retain
+the triple's provenance while using harvest-only discovery.
 
 System packages (deb/rpm): build per
 [packaging/README.md](packaging/README.md), then follow

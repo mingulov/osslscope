@@ -1,74 +1,72 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Staging-to-production promotion checklist
 
-v1 promotes bounded, evidence-carrying observation from staging
-to production-like capture. Always-on production attach is v2+
-and out of scope: every item below assumes time-boxed windows
-with artifacts. Promote only when every item passes.
-<!-- source: checklist shape: PLAN.md P6 exit 2; evidence:
-     p5-gate-record.md, p6-entry-envs note -->
+Current development supports bounded observation with artifacts.
+The historical `v0.1.0` baseline and matrix do not qualify the
+current integrated artifact. Service operation and expanded target
+selection remain forthcoming; permanent privacy boundaries remain
+in force. These acceptance checks do not declare release readiness.
 
 ## Platform
 
-- [ ] **Matrix green on the prod-class platform.** Target OS,
-  kernel, and OpenSSL release are all inside
-  [the support matrix](overhead-matrix.md#support-matrix), and
-  `doctor` (env plus `--pid`/`--libcrypto` target checks)
-  reports green there -- not just on the CI runner.
-- [ ] **Worst-cell budgets sustained.** The prod kernel class
-  carries a passing overhead row in the matrix (pin
-  overhead-sensitive gates to 6.12+ runners); the known
-  report-only outlier class (6.9 guest kernel with CET-built
-  targets under nested virt) is either absent from prod or
-  accepted as documented-slow with correctness intact.
-- [ ] **No SecureBoot-qualified claim.** If prod boots with
-  SecureBoot enabled, v1 claims no qualified status there
-  (qualification deferred post-v1). Record the gap or move
-  observation to a non-SB host.
+- [ ] **Exact prod-class artifact qualified.** Retain current
+  evidence for the target OS, kernel, libc, OpenSSL and installed
+  artifact combination. Use the [historical matrix](overhead-matrix.md#support-matrix)
+  for context; `doctor` environment/target admission alone is not
+  integrated correctness or performance qualification.
+- [ ] **Both overhead budgets measured.** Measure latency and
+  wall-clock at representative rates on the actual platform.
+  Historical fixture passes and the documented 6.9 nested-virt
+  outlier do not replace a current measurement.
+- [ ] **Security controls preserved.** Qualify required Secure Boot,
+  lockdown and enforcing SELinux states as enabled. A disabled-state
+  control, root/container success or a different distro does not
+  qualify them. Secure Boot operation remains unqualified until
+  enabled-state evidence exists; do not disable controls to pass.
 
 ## Evidence quality
 
-- [ ] **PARTIAL rate and reasons stable.** The staging PARTIAL
-  shape is understood and attributed per
-  [the PARTIAL runbook](partial-runbook.md) (for TLS
-  terminators: single structural reason, exact
-  traffic-scaled counts, passing require rules). Prod-class
-  windows show the same reasons -- any NEW reason blocks
-  promotion until attributed.
-- [ ] **Zero silent misattributions.** Generation fencing is
-  intact (remap/reload counts land in fenced stale buckets,
-  never on stale keys); the no-secret canary suite is green
-  on the release build. A fenced count is honest evidence; a
-  misattributed one would be a product lie -- the latter
-  blocks promotion absolutely.
-- [ ] **Change control on observed binaries.** Every libcrypto
-  build in prod is enrolled (known build-id) BEFORE the
-  deploy that ships it. Rebuilds mint new build-ids even from
-  identical sources, so the deploy pipeline re-enrolls (or
-  fails closed on unknown ids) rather than observing blind.
-- [ ] **FIPS lanes under the interim rule.** Any FIPS-provider
-  window in prod is triaged manually per
-  [the FIPS interim rule](fips-interim.md); no auto
-  pass/fail on `fips-unlabeled` counts.
+- [ ] **Coverage and PARTIAL reasons attributed.** Inspect typed
+  reasons, loss counters and candidate uncertainty per
+  [the PARTIAL runbook](partial-runbook.md). Bound address-taken
+  GLOB_DAT gaps to the actual target. New or unexplained gaps block
+  acceptance; never assume one universal TLS reason or count shape.
+  Keep ordinary failed/PARTIAL windows in completeness-rate
+  denominators; exclude only predeclared expected-PARTIAL negatives.
+- [ ] **No silent misattribution or secret capture.** Verify
+  generation fencing, conserved physical counts and the no-secret
+  canary suite on the exact artifact. Candidate alternatives are
+  not separately executed algorithms.
+- [ ] **Exact observed binaries admitted.** Recheck hashes,
+  build-ids and anchors after rebuilds. Unknown supported symtab
+  builds can qualify without a table row; unknown stripped builds
+  require explicit enrollment per [the built-in runbook](builtin-runbook.md).
+  Enrollment alone proves no live/performance acceptance.
+- [ ] **FIPS results interpreted manually.** Preserve the original
+  counts and policy verdict, self-test uncertainty and independent
+  rationale per [the FIPS interim rule](fips-interim.md). Do not
+  rely on a guaranteed `fips-unlabeled` v2 reason or infer
+  certification.
 
 ## Operations
 
-- [ ] **Time-boxed capture only.** All captures carry explicit
-  `--duration`/`--grace`, and step timeouts follow the
-  `duration + grace + test-baseline x 2` rule. No unbounded
-  runs exist anywhere in the pipeline (there is no
-  `--forever` in v1).
-- [ ] **Violation triage exercised.** An operator unfamiliar
-  with the fixture has walked a staged violation from the
-  JSON record to the owning service and re-verified the fix
-  with the same gate (see [violation
-  triage](violation-triage.md)). Image digests flow into the
-  actionability tuple for container fleets.
-- [ ] **Evidence retained.** Gate artifacts (JSON report,
-  CBOM) upload on every outcome including violation and
-  PARTIAL; PARTIAL CBOMs carry the completeness disclaimer
-  for downstream consumers.
-- [ ] **Gate-disable procedure known.** The on-call path for a
-  blocking gate is warn-plus-artifacts with recorded
-  approval -- never deleting the gate step (see
-  [staging deploy](staging-deploy.md#gate-disable-procedure)).
+- [ ] **Time-boxed capture.** Set duration/grace and size outer
+  timeouts per [CI recipes](ci-recipes.md#ci-timeout). Spawn mode,
+  warmup and a long timeout alone prove no complete window.
+- [ ] **Policy and exit handling exercised.** An operator has
+  traced a rule's actual evidence to its service and re-verified
+  the correction per [violation triage](violation-triage.md).
+  Respect [exit precedence](usage.md#exit-codes), including usable
+  fatal and inconclusive outcomes.
+- [ ] **Evidence retained.** Upload available JSON/CBOM on every
+  outcome, including fatal. Requested artifacts are attempted
+  independently; verify delivery and retain diagnostics when a
+  destination fails. Keep workload logs under appropriate access
+  controls.
+- [ ] **Installed journey qualified.** Current package builders
+  contain the host binary and install documentation only. A local
+  development triple/receipt is not acceptance of a forthcoming
+  matched redistributable host+BPF package; see [install](install.md).
+- [ ] **Gate-disable procedure known.** Use approved
+  warn-plus-artifacts handling while triaging a blocking gate;
+  retain collection per [staging deploy](staging-deploy.md#gate-disable-procedure).

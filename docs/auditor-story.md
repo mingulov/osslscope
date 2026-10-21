@@ -4,18 +4,19 @@
 This is the end-to-end story an auditor walks: capture evidence,
 check its shape, gate on violations, and compare declared versus
 executed crypto. It ties the reference docs together with one
-worked example: a TLS-terminating service observed over a window
-of PQC handshakes.
-<!-- source: worked example: staging end-to-end record (private);
-     observer at cf7f9a0; T9/T10 changed packaging + docs only, so
-     observation behavior equals current -->
+worked example: a historical TLS-terminating service window of PQC
+handshakes, followed by current v2 contract guidance. The old
+measurement used an earlier observer; it is not current integrated
+live or package qualification. Current output must be recaptured.
 
 ## 1. Capture: report + CBOM
 
 One window, spawn mode, JSON evidence plus a CycloneDX CBOM.
 With a trusted system install the BPF objects resolve
-implicitly; otherwise pass the same explicit pair to `doctor`
-(preflight) and to the capture:
+implicitly when the selected roles pass trust/receipt checks.
+Otherwise pass the same explicit harvest/count/members paths to
+`doctor` and capture, as in [install](install.md). Deliberate
+pair-only installs stay harvest-only:
 
 ```sh
 osslscope doctor || exit 4
@@ -33,14 +34,16 @@ Drive representative traffic in-window (warmup handshakes while the
 window opens, measured handshakes inside it), then quit the child
 cleanly before expiry. The staging record replayed here ran 2
 warmup + 10 measured PQC handshakes and exited 3: PARTIAL with
-a structural low-level coverage gap (every TLS window carries it
--- see [who should NOT
+a structural low-level coverage gap in that target (see [who should NOT
 adopt](what-it-proves.md#who-should-not-adopt-read-before-installing)),
-62 counted sites, disposition `exited` code 0, and no losses.
+62 counted sites, disposition `exited` code 0, and no counted
+transport drops in that historical accounting.
 These are historical measurements, not a v2 site/component
 mapping: re-run to get the current definite-asset count, since
-unresolved `other` sites never qualify as definite. Exit 3 with
-a clean policy read is the normal shape for TLS services. The workload's own output lands in `story.workload.log`;
+unresolved `other` sites never qualify as definite. Neither this
+traffic shape nor one PARTIAL reason is a universal TLS result.
+Spawn custody and warmup do not prove first-call or COMPLETE
+coverage. The workload's own output lands in `story.workload.log`;
 observer stdout stays a pure artifact channel and observer
 diagnostics stay in `story.driver.log`.
 
@@ -92,10 +95,11 @@ forward compatibility. The auditor's job is the opposite:
 surface any unexpected byte, then update golden + checker
 together, by review.
 
-Checked against produced v2 fixtures (R13 verification): the
-checker passes `tests/goldens/report-v2-violation.json` and
-`tests/goldens/report-v2-partial.json`, and rejects the same
-violation document with one added unknown key.
+The committed fixture controls cover
+`tests/goldens/report-v2-violation.json` and
+`tests/goldens/report-v2-partial.json`, and reject the same
+violation document with one added unknown key. These source/fixture
+controls are distinct from a new live run.
 
 Compatibility is deliberate: producers emit exactly
 `observed-crypto-v2.1`, readers accept `observed-crypto-v2` and
@@ -108,9 +112,9 @@ new evidence it cannot represent.
 
 ## 3. Gate: violation detection on evidence
 
-CI gates on violations, never on COMPLETE. Three runs showing
-the three verdicts (same invocation shape as the example
-window):
+Current integrated COMPLETE-window gating remains unqualified.
+These illustrative runs show policy verdicts using the example's
+invocation shape. Exit comments assume no higher priority failure:
 
 ```sh
 # Expected crypto executed: policy pass (exit 3 = PARTIAL, no violation).
@@ -129,8 +133,8 @@ osslscope check ... --require-executed SNMPKDF \
 # verdict: inconclusive, the requirement is unproven, never fabricated.
 ```
 
-Exit 10 dominates: it fires on COMPLETE, PARTIAL, or salvaged
-`runtime`-fatal evidence alike, even when artifact delivery
+Exit 10 dominates: it fires on COMPLETE, PARTIAL or usable FATAL
+evidence alike, even when artifact delivery
 failed -- an artifact failure never overrides a proved
 violation. Exit 11 is the honest middle: relevant loss blocks
 the absence proof, while unrelated gaps preserve proved
@@ -138,15 +142,22 @@ positive evidence. If the close flow itself breaks mid-run
 (drain, discovery finish, or disposition), the document is
 salvaged as `runtime`-fatal: every collected observation
 survives, policy still evaluates (a proved violation exits 10),
-and anything else exits 1.
+and anything else exits 1. Runtime eligibility holds even with no
+positive counts. AttachZero with proved positive in-window ENGINE
+evidence is also policy-eligible; Environment, Recycled and bare
+AttachZero are not. Eligibility does not make an individual rule
+decidable. A usable fatal, child failure or delivery failure can
+outrank an inconclusive policy; see [the exit table](usage.md#exit-codes).
 
-The violation entry carries rule + matcher and the executed
-identity as site evidence refs (object/device/inode/offset,
-generation, calls) with conserved definite/possible bounds;
+Select `policy.rules[]` entries whose `result` is `violation`.
+Their `rule`, `predicate`, conserved definite/possible bounds and
+site `evidence` refs (object/device/inode/offset, generation, calls)
+explain the rule; optional `engine_evidence` refs identify ENGINE
+observations. There is no separate `violations[]` wire field;
 the rest of the actionability tuple -- window edges,
 pid/comm, container id, image digest, provider display paths
 (no cmdline: argv is redacted) -- joins through the
-`target`, `window`, `sites`, `objects`, and
+`target`, `window`, `sites`, `fenced`, `objects`, and
 `engine_observations` sections, which is what [violation
 triage](violation-triage.md) walks to the owning service. Wire
 it per [CI gate recipes](ci-recipes.md): exit 3 + `pass` is

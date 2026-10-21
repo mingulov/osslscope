@@ -1,83 +1,82 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # FIPS interim rule
 
-v1 has no KAT discriminator: it cannot distinguish the FIPS
-module's self-test calls (startup KATs, deferred first-use
-KATs, conditional pairwise-consistency tests) from workload
-crypto, because both execute the same provider dispatch
-functions. Any capture whose harvested rows name the `fips`
-provider module therefore finishes PARTIAL with reason
-`fips-unlabeled`. Silently dropping KAT calls would undercount
-real executions that share entry points with self-tests;
-unlabeled-plus-loud beats filtered-plus-wrong.
-<!-- source: no-discriminator decision: capture-semantics.md;
-     fips_touched wiring: src/capture.rs -->
+There is no KAT discriminator: self-tests, deferred first-use KATs
+and conditional pairwise-consistency tests can execute the same
+provider callbacks as workload crypto. Their calls remain counted;
+policy does not subtract them. Provider-class enrollment describes
+exact binary provenance, never FIPS certification.
 
-**The rule: FIPS-lane violations need manual triage.** Do not
-auto-pass or auto-fail a `fips-unlabeled` window on counts
-alone. Read the window composition against the quantified
-rates below, decide by human judgment, and record the
-rationale with the artifact.
+**FIPS-lane policy results require manual interpretation.** Do not
+infer application use or compliance from counts alone. Record the
+workload, self-test context, independent oracle and rationale with
+the artifact.
 
-## Quantified rates
+## Read the current evidence
 
-Measured on OpenSSL 4.0.2, default install unless noted:
+Report/check use v2 `sites`, candidate metadata, typed coverage/loss/
+window reasons and per-rule evidence. FIPS identity is pinned
+provider-class metadata when enrolled, not a filename inference.
+The finalizer has no categorical FIPS exclusion from COMPLETE, and
+COMPLETE does not establish that counts exclude self-tests.
 
-| Workload | Self-test content of `executions` |
+Legacy harvest/inspect and capture display vocabulary differs from
+the v2 document. In particular, `src/capture.rs` adds
+`fips-unlabeled` to legacy display reasons for a configured
+`fips`-shaped provider path with positive provider-plane calls,
+after finalizing the v2 document. That is not a guaranteed
+machine-readable v2 caveat or a promise of one exact PARTIAL reason.
+Likewise, legacy `no-query` / `pid-prewindow-blind` text must not be
+substituted for current typed reasons. See
+[the evidence contract](observed-crypto-v2.md#completeness-coverage-counters).
+
+## Historical self-test measurements
+
+The following OpenSSL 4.0.2 setup measurements are historical,
+source/workload-specific observations, not current integrated
+qualification or universal timing guarantees:
+
+| Workload | Self-test content observed in the historical setup |
 |---|---|
-| Load burst (45 KAT tests, about 86 ms) | 0 counted -- always pre-window, never observed |
-| Steady digest / cipher | 0 observed (0 non-workload executions in about 2M counted per run) |
-| EC P-256 keygen | At least 8 self-test executions per keygen (53% of 15 counted; lower bound -- the PCT sign/verify calls sit outside the v1 harvest prefix) |
-| RSA-2048 keygen | 1 PCT per keygen (oracle-confirmed; count partition not run) |
-| `defer-tests=1` (non-default, 4.0+): first use per algorithm family | One-time 43+ executions inside the window when first use lands there (43 measured for first AES-ECB use) |
+| Load burst (45 KAT tests, about 86 ms) | 0 counted; the measured burst preceded that setup's count window |
+| Steady digest / cipher | 0 non-workload executions observed in about 2M counted per run |
+| EC P-256 keygen | At least 8 self-test executions per keygen (53% of 15 counted); PCT sign/verify lay outside that harvest prefix |
+| RSA-2048 keygen | 1 PCT per keygen, oracle-confirmed; count partition was not run |
+| `defer-tests=1` (non-default, 4.0+), first use | One-time 43+ in-window executions; 43 measured for first AES-ECB use |
 
-<!-- source: KAT noise rates + 4.0 deferred-KAT timing:
-     fips-rates note -->
-
-Reading guidance:
-
-- Steady digest/cipher windows: the caveat is pure conservatism
-  (measured noise 0). Triage these nearly as normal windows.
-- Keygen-heavy windows: majority noise by count. Partition the
-  keygen contribution before judging any require/deny rule.
-- `defer-tests=1` installs: first-use KATs land inside the
-  window. Tiny windows dominated by a first use are mostly KAT;
-  the KAT is one-time per process, so longer windows dilute it.
-- Load KATs never count. A load-only target yields `no-query`
-  PARTIAL with no window at all.
+These numbers do not justify subtracting a fixed noise allowance
+from a new capture. Startup KATs are not universally pre-window;
+deferred tests and keygen can occur in-window. Longer windows may
+dilute a one-time burst without making its calls application crypto.
 
 ## Observation recipe
 
-- Observe the FIPS provider module in provider mode:
-  `--provider .../ossl-modules/fips.so`, NOT `--builtin`.
-  (`doctor --libcrypto` on the FIPS libcrypto reports an
-  unknown build-id; provider-mode observation is the supported
-  path.)
-- Ensure a real in-window crypto workload: load-only targets
-  exit before the window opens (`no-query`). The workload must
-  still be running when harvest settles and the window opens.
-- `--pid` onto a pre-loaded provider yields zero rows (init
-  predates attach) -- same pre-window blindness as any `--pid`
-  run, not a FIPS bug.
-
-<!-- source: provider-mode recipe + recipe constraints:
-     p6-entry-envs note (FIPS env), fips-rates note -->
+- Use provider mode for the module: `--provider
+  .../ossl-modules/fips.so`, without `--builtin`. Run `doctor`
+  with the same selected BPF objects and target settings first.
+  Omit explicit `--members-object`: traversal needs a builtin query
+  anchor, while automatic triple selection can stay harvest-only
+  for file-provider observation.
+- Drive representative crypto during the effective count window;
+  record whether load/first-use/keygen overlaps it. A load-only
+  attempt or a preloaded `--pid` target may yield no harvest rows;
+  read the actual typed gaps and exit status rather than assuming
+  a fixed `no-query` result.
+- Keep startup and pre-attach limits explicit. `run --` improves
+  custody but supplies no first-call or COMPLETE guarantee.
 
 ## Triage steps
 
-1. Confirm the shape: exit 3, `status: PARTIAL`, reasons
-   exactly [`fips-unlabeled`], child exited cleanly, gap
-   counters otherwise zero.
-2. Classify the window: steady (digest/cipher bulk) vs keygen
-   counts vs first-use-under-defer-tests, using the rates
-   above.
-3. For a violation on the window: re-derive what the counts
-   would be minus the expected self-test contribution. If the
-   verdict still stands without the KAT component, treat it as
-   a real violation and follow [violation
-   triage](violation-triage.md); if the verdict depends on the
-   KAT component, record a manual pass with the arithmetic
-   attached.
-4. Keep the oracle in mind for keygen: the 53% is an observed
-   lower bound (PCT sign/verify unobserved). Keygen-heavy
-   manual passes should say so explicitly.
+1. Read completeness, fatal eligibility, typed reasons, counters,
+   candidate certainty and child disposition. Attribute each gap;
+   do not demand one particular FIPS-only reason shape.
+2. Classify the workload and gather an independent self-test oracle.
+   Historical steady/keygen/first-use rates are context only.
+3. Inspect `policy.rules[]` results and their site/ENGINE evidence.
+   Distinguish observed callback execution from application crypto
+   where the oracle permits it. If it does not, record uncertainty
+   or a documented manual gate exception; retain the original
+   machine verdict and counts.
+4. Re-verify under a comparable window and preserve the rationale.
+   No manual adjustment establishes certification or recovers
+   unobserved parameter values.

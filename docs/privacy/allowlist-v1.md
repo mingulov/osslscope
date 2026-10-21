@@ -169,7 +169,8 @@ Non-target provenance:
 - `target.container_id`: selected cgroup path segment, else empty.
 - `image_digest`: caller-supplied CI value, not observed.
 - `kernel`: observer `uname` release.
-- `provider.build_id`: disk-ELF GNU build-id.
+- disk-ELF GNU build-id: object provenance (`provider.build_id` in
+  legacy shapes; v2 uses opaque fingerprints joined through `objects`).
 - window epochs/counters/reasons/status: observer clocks and state.
 
 ## 4. Observer-owned BPF map inventory
@@ -380,10 +381,11 @@ gate reads clock + cells only).
 - report document plus `policy`: `verdict` and `rules` (each rule
   carries rule/predicate names, a three-valued result, conserved
   definite/possible bounds, and site evidence refs).
-- Each violation carries rule/matcher/identity refs; the rest of
+- Each rule result carries `rule`/`predicate`, bounds and identity
+  refs in `policy.rules[]` (select `result: "violation"`); the rest of
   the capture-level actionability tuple (window, pid/comm/container,
   image, provider display paths) joins through the `target`,
-  `window`, `sites`, `objects`, and `engine_observations`
+  `window`, `sites`, `fenced`, `objects`, and `engine_observations`
   sections. No cmdline: argv is redacted
   (see the Scope rule above). ENGINE-plane violations carry the
   observation key (object/device/inode/offset), generation,
@@ -393,9 +395,11 @@ gate reads clock + cells only).
   `engine_observations` via the observation key.
 - Per-rule `engine_evidence` refs (R05, rendered only when present):
   the resolving observation key plus generation/entrypoint/calls.
-- No verdict on evidence-free fatal documents (every fatal kind
-  except salvaged `runtime`, which carries the evaluated
-  verdict over its surviving observations).
+- No verdict on unusable fatal documents: Environment, Recycled
+  and AttachZero without proved positive in-window ENGINE evidence.
+  Runtime is policy-eligible even without positive counts;
+  AttachZero with that independent ENGINE evidence is also eligible.
+  Eligibility does not make a rule decidable or a site definite.
 
 CBOM:
 

@@ -4,12 +4,14 @@
 CI gates with `run --`. Staging observes already-running
 services with `report --pid` from an ephemeral privileged
 debug container that shares the target's pid namespace.
-`--pid` windows are PARTIAL by architecture
-(`pid-prewindow-blind` plus usually `no-query` on warm
-targets), so staging evidence is triage-grade: good for
-confirming what executes, never a COMPLETE inventory.
-<!-- source: --pid blind by design: src/capture.rs; run-vs-pid
-     trigger behavior: trigger-matrix.md -->
+`--pid` cannot recover pre-attach execution. Read current typed
+startup/coverage/loss reasons and candidate uncertainty rather
+than expecting the legacy display strings `pid-prewindow-blind`
+or `no-query` in v2 JSON. A failed provider attachment may instead
+produce AttachZero; its policy eligibility depends on proved
+in-window ENGINE evidence. See [the exit table](usage.md#exit-codes).
+Staging evidence confirms observed execution under disclosed
+limits; it supplies no complete historical inventory.
 
 ## Debug container shape
 
@@ -21,9 +23,12 @@ Requirements for the ephemeral container:
   `CAP_BPF`+`CAP_PERFMON` on the osslscope binary (plus
   `CAP_SYS_PTRACE` when the target runs as a foreign uid), or
   full privilege as the documented fallback.
-- Carries the osslscope binary plus the two BPF objects
-  (`--object`, `--count-object`) and the provider path the
-  target uses.
+- Carries the matching osslscope binary and harvest/count/members
+  development roles (explicit `--object`, `--count-object`,
+  `--members-object`) plus access to the target provider file.
+  A deliberate pair-only image stays harvest-only. Current package
+  builders do not supply BPF; implicit traversal requires a trusted
+  install with matching receipt, not three loose files.
 
 Example (Kubernetes; plain-docker equivalent uses
 `--pid container:<name> --privileged --rm`):
@@ -39,32 +44,34 @@ artifacts out, exit. Nothing persists in the target.
 ## Observe
 
 ```sh
-osslscope doctor --pid <PID>     # target preflight; exit 4 refuses unsuitable targets
+osslscope doctor --pid <PID> \
+  --object ./osslscope-harvest --count-object ./osslscope-count \
+  --members-object ./osslscope-members
 osslscope report --provider /path/to/libcrypto.so.3 --builtin \
   --object ./osslscope-harvest --count-object ./osslscope-count \
+  --members-object ./osslscope-members \
   --duration 60 --format json --out staging.json --cbom staging.cbom.json \
   --pid <PID>
 ```
 
 Generate real traffic during the window (staging load or a
-handshake driver); an idle target yields `no-query` PARTIAL
-with zero rows. Expect PARTIAL: harvest needs a post-attach
-query, and pre-attach history is invisible. The measured
-staging shape for a TLS terminator is PARTIAL with a single
-structural `lowlevel-fallback-uninstrumented` reason, exact
-traffic-scaled counts (handshake multiples), and a passing
-`--require-executed` rule -- actionable evidence despite the
-PARTIAL status.
-<!-- source: frozen staging recipe (run + warmup + quit
-     discipline) and measured shape: staging-nginx note;
-     design-partner env verdicts (TLS, static, FIPS):
-     p6-entry-envs note -->
+handshake driver). Harvest needs observed provider queries; an idle
+or preloaded target can yield no rows. Read actual typed reasons,
+physical-site counts and policy evidence. Affected GLOB_DAT imports
+remain uninstrumented and surface as `loss` with
+`legacy.lowlevel_uninstrumented`; this is not a universal TLS
+reason/count shape. Historical spawn-and-warmup staging results do
+not qualify this current live-attach recipe. Current integrated
+COMPLETE-window qualification remains open; switching to `run --`
+improves custody without guaranteeing startup/first-call coverage.
 
 For a statically linked target, point `--provider` at the
 static binary with `--builtin` (unstripped: harvest resolves
-via symtab; stripped: expect disclosed zero-row blindness).
+via supported symtab; unknown stripped: report/check need explicit
+enrollment, while inspect can expose zero-row blindness).
 For a FIPS provider module, use provider mode (`--provider
-.../fips.so`, not `--builtin`) per
+.../fips.so`, not `--builtin`), omitting explicit `--members-object`
+from both preflight and capture, per
 [the FIPS interim rule](fips-interim.md).
 
 ## Gate-disable procedure

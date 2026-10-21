@@ -60,10 +60,19 @@ none were observed), `traversal` (omitted on harvest-only
 runs; traversal runs name the exact selected triple plus
 provenance and per-record facts: records, findings, polls,
 admitted, admitted_unknown, census_loss, entries),
+`selected_objects` (omitted when no run-set selection was recorded;
+otherwise harvest/count paths and sha256, with members only for a
+selected triple — pair-only selection is recorded too),
 `attach_diagnostics` (omitted when no
 attach failed: sorted, deduped, capped producer literals
 identifying failed attaches — diagnostic only, counters stay
-the exact counts).
+the exact counts), and `refusal_diagnostics` (omitted when no
+budget refusal was recorded: sorted, deduped, capped numeric
+entries identifying device/inode, refusal kind, bytes and allowance;
+diagnostic only, not an exhaustive refusal count). Both diagnostic
+sections contain no target strings or runtime addresses;
+refusal entries contain no paths. Selection paths identify
+observer BPF objects, not target memory.
 
 Target, OpenSSL version, window and disposition, values verbatim
 from `tests/goldens/report-v2-violation.json` (whitespace
@@ -224,11 +233,14 @@ their sum equals the sites plus fenced call total, enforced by
 
 `completeness.status` is `COMPLETE`, `PARTIAL` or `FATAL`.
 `fatal_kind` is null unless `FATAL` (`recycled`, `attach-zero`, or
-`environment`/`runtime` with detail). `runtime` is a salvaged
-post-observation tool failure: the close flow broke mid-run, every
-collected observation survives, and policy still evaluates (a proved
-violation exits 10; otherwise exit 1). `reasons` are typed objects
-with a `kind` discriminator:
+`environment`/`runtime` with detail). Runtime fatal retains collected
+observations and is policy-eligible by kind, even without positive
+counts. AttachZero is also eligible when it carries proved positive
+in-window typed ENGINE evidence: provider attachment failure does
+not erase that independent plane. Environment, Recycled and bare
+AttachZero are unusable. Usability establishes no rule or candidate
+certainty. A proved violation exits 10; other usable fatal outcomes
+exit 1. `reasons` are typed objects with a `kind` discriminator:
 
 | kind | fields |
 |---|---|
@@ -246,25 +258,36 @@ with a `kind` discriminator:
 covered, not gaps. `counters` are source-tagged with published
 units (`calls`, `sites`, `table-rows`, `events`, `probes`) and kind
 (`loss`, `activity`); only a positive loss forces `PARTIAL`.
+The sole finalizer (`src/evidence.rs` `finalize`) also checks
+unknown candidate coverage on executed sites and requested/effective
+window gaps. COMPLETE can contain ambiguous complete candidate sets
+and nonzero activity counters. FIPS identity is not a categorical
+COMPLETE exclusion; counts can include self-tests. Flat legacy
+display reasons such as `no-query` and `fips-unlabeled` are not v2
+typed reasons. See [the FIPS interim rule](fips-interim.md).
 
 ## Policy section (`check` only)
 
-T10 evaluates rules and fills `PolicyRecord`; T11 renders it.
+`src/policy.rs` evaluates rules; `src/check.rs` fills `PolicyRecord`
+and `src/report.rs` renders it.
 `verdict` is `pass`, `violation`, `inconclusive` or `no-verdict`
-(`no-verdict` exactly on evidence-free `FATAL` documents with
-policy — every fatal kind except salvaged `runtime`, which
-carries the evaluated verdict over its surviving observations). The
+(`no-verdict` exactly on unusable `FATAL` documents with policy,
+under the shared eligibility rule above). Runtime and qualifying
+AttachZero documents evaluate every requested rule; uncertain
+rules stay inconclusive. The
 verdict is the AND of its rules: any `violation` rules a
 violation, else any `inconclusive` rules inconclusive, else `pass`.
 Relevance is per-rule: a `--require-executed` name absent from
 the evidence violates only when the relevant coverage is
 complete with zero possible use; under a relevant gap the rule
-is inconclusive (exit 11) -- the requirement is unproven, never
+is inconclusive -- the requirement is unproven, never
 fabricated into a violation or a pass. Deny rules mirror this:
 only definite use violates. Positive evidence dominates: a
-proved violation exits 10 on COMPLETE, PARTIAL, or salvaged
-`runtime`-fatal documents alike, even when artifact delivery
-failed.
+proved violation exits 10 on COMPLETE, PARTIAL, or usable FATAL
+documents alike, even when artifact delivery failed. A rule's
+inconclusive result is not an unconditional exit-11 promise;
+violations, usable fatal, child and delivery failures have higher
+priority. See [the exit table](usage.md#exit-codes).
 Each rule carries three-valued `result`, conserved
 `definite`/`possible` bounds (`possible: null` means the upper
 bound is unknown; `definite` never exceeds a known `possible`) and
@@ -346,13 +369,14 @@ Evidence refs read `fingerprint12@file-offset#generation:calls`
 (16 refs max, then a count). The CBOM carries the same window on
 pass/violation/`PARTIAL`/inconclusive (plus `policy-verdict` when
 evaluated); `PARTIAL`/`FATAL` ride an in-band disclaimer. An
-evidence-free `FATAL` has zero components (the evidence is
-unusable); a salvaged `runtime`-fatal exports its definite
-assets exactly like any usable document.
+unusable `FATAL` has zero components; usable Runtime and qualifying
+AttachZero documents export any definite sites under the same
+certainty rules as non-fatal documents. ENGINE observations stay
+separate count metadata, never provider-site assets.
 
 ## Human report
 
-Byte-verbatim `tests/goldens/report-v2-complete.txt` (R12 golden
+Byte-verbatim `tests/goldens/report-v2-complete.txt` (golden
 shape, with recorded execution context):
 
 ```text
@@ -421,7 +445,7 @@ U+206A-U+206F and other unlisted format controls pass through,
 so the guarantee covers the listed set, not every invisible
 format character.
 
-## Delivery API (T10 checkpoint)
+## Delivery API
 
 ```rust
 pub fn render_json(doc: &CaptureDocument) -> anyhow::Result<Vec<u8>>;
@@ -433,14 +457,16 @@ pub fn write_artifacts(doc: &CaptureDocument, req: &OutputRequest) -> DeliveryRe
 `OutputRequest` selects the primary format (`Human`/`Json`), the
 primary destination (`Stdout`/`File`) and an optional CBOM sidecar.
 `write_artifacts` renders once per format and attempts every
-destination independently: a failed primary never suppresses the
-CBOM attempt and vice versa. `DeliveryResult` carries per-artifact
+destination independently, including fatal primary/CBOM output:
+a failed primary never suppresses the CBOM attempt and vice versa.
+An attempt does not guarantee successful delivery. `DeliveryResult`
+carries per-artifact
 outcomes plus bounded stderr diagnostics (at most 8 lines, 200
 chars each; `emit_diagnostics` prints them).
 
-Exit mapping (R06, owned by T10; PRD §14 order, H7-extended): 2
+Exit mapping (`src/report.rs` `exit_for`): 2
 usage > 10 violation (even when delivery failed, even on salvaged
-docs) > 1 salvaged `runtime`-fatal doc > 4 setup-no-verdict > 1
+docs) > 1 usable fatal doc > 4 no-verdict > 1
 failed child / failed delivery > 11 inconclusive > `PARTIAL` 3 >
 clean 0. `DeliveryResult` preserves this priority via
 `failed()`/`delivered_all()` — it reports, never decides.
@@ -460,6 +486,11 @@ records the refusal. Path comparison is lexical.
   characters); file offsets render decimal.
 - `display_locator` values are operator-visible provenance with
   stated limits, not target buffer dumps.
+- Algorithm names do not reveal key sizes or parameter-selected
+  digest/cipher identities in MAC, KDF, SIGNATURE or ASYM_CIPHER.
+  The current human footer states argv redaction, file-offset and
+  window-only limits; it does not emit an automatic strength or
+  parameter warning. These doctrinal limits apply to every format.
 - Human output neutralizes display controls (`?` for control
   characters and the finite `is_display_control` set: bidi,
   listed zero-width, U+2060-U+2064, separators, and annotation
@@ -488,20 +519,15 @@ v2 suite). The `context` JSON above is verbatim from the
 `context`-carrying golden shape (optional keys, omitted in JSON
 when unrecorded); the human report always renders the three
 context lines, with explicit `unknown`s when unrecorded. CLI
-wiring examples stay with T10; no command above was run against
-a live target for this document.
+wiring is in `src/report.rs` and `src/check.rs`; these fixtures
+are not current live or package qualification.
 
-## Accepted R19 residuals (v0.2)
+## Traversal evidence limits
 
-- Tainted+Proven beyond-T recovery findings (rereview5 concern 4):
-  keeping uncertain positive evidence is deliberate conservative
-  recovery (`oracle.rs` retention policy; final P-review: no-action).
-  Emits recovery findings without restoring Complete.
-- Real-traffic Complete adaptation without live proof (concern 5):
-  execution adaptation was removed; native traversal evidence is
-  retained instead. Broader real-traffic qualification stays with
-  the live suite (R21/R21b: F4 collapse re-gated live, attempt-4).
-- Per-op TRUNC unattributability with live T+1, cache-write-after-take,
-  settle-poll strands, and drain_batch ordering (concerns 1-3) were
-  routed load-bearing (R34-R36) and closed in the fix wave — see the
-  scan_oracle control battery, not this note.
+- Conservative recovery can retain uncertain positive findings
+  without restoring COMPLETE (`src/scan/oracle.rs`).
+- Native traversal records do not establish a complete real-traffic
+  window. Current integrated qualification remains open.
+- Inspect `tests/scan_oracle.rs` controls for truncation, cache,
+  settle and drain ordering behavior; source/fixture checks do not
+  substitute for current live acceptance.

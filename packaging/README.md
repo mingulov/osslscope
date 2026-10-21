@@ -2,18 +2,20 @@
 # Packaging (deb + rpm)
 
 > Development status: packages built from this branch are
-> development snapshots, not final distributables. BPF objects are
-> always operator-built (see [build](../docs/build.md)) and are never
-> shipped in a package; distribution paperwork stays a separate,
-> later decision that does not block local capture development.
+> development snapshots, not final distributables. Current builders
+> omit BPF objects; operators build matching roles for development
+> (see [build](../docs/build.md)). Matched redistributable host+BPF
+> packages remain forthcoming, subject to licensing, provenance and
+> exact-package qualification. This note grants no distribution rights.
 
 File-caps default install: both packages ship the `osslscope` binary
 plus `docs/install.md`, and a post-install hook grants
 `CAP_BPF`+`CAP_PERFMON` file capabilities so the tool runs
-unprivileged. The BPF objects (`--object`/`--count-object`) and the
-`tests/goldens/` fixtures stay out of the packages: objects are
-operator-built (nightly, see the project README) and passed by
-flag; goldens are test-only.
+unprivileged. The current builders include no BPF objects
+(harvest/count/members) or `tests/goldens/` fixtures. Development
+objects use the pinned nightly and explicit role flags, or a trusted
+local-prefix install with matching receipt for automatic traversal;
+goldens are test-only. See [install](../docs/install.md).
 
 Package contents:
 
@@ -33,7 +35,8 @@ upgrade, and removal (removal takes the caps with the binary).
 - rpm: `%post` applies caps; `%preun` is erase-only (`$1 == 0`) so
   upgrades skip cleanup; `%posttrans` re-applies caps idempotently
   at the end of every install/upgrade transaction. The `%posttrans`
-  step is the migration path: upgrading *from* the 1.0.0 package
+  step is the migration path: upgrading *from* an older development
+  package carrying the unreleased 1.0.0 label
   still runs that package's old unguarded `%preun` *after* the new
   `%post`, which would strip the new binary's caps — guarding only
   the new `%preun` cannot prevent the old script from running.
@@ -95,11 +98,12 @@ Privileged lifecycle witness (prepared, NOT-RUN without an approved
 guest — dry-run by default):
 
 ```sh
-./packaging/tests/guest-lifecycle.sh --pkg rpm --old-ref <1.0.0-ref> --new-ref <rev>
-./packaging/tests/guest-lifecycle.sh --pkg rpm --old-ref <1.0.0-ref> --new-ref <rev> --execute
+./packaging/tests/guest-lifecycle.sh --pkg rpm --old-ref <old-development-ref> --new-ref <rev>
+./packaging/tests/guest-lifecycle.sh --pkg rpm --old-ref <old-development-ref> --new-ref <rev> --execute
 ```
 
 `--execute` builds both packages from clean refs, then asserts
 `getcap` keeps `cap_bpf+cap_perfmon` across install, upgrade,
 reinstall, and that removal cleans up. It runs only on the approved
-`installed`-suite lane.
+guest. Scriptlet fixtures and local installs do not qualify a final
+matched redistributable package.
