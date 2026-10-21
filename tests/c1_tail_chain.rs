@@ -127,7 +127,8 @@ lc.OSSL_PROVIDER_load.argtypes = [c.c_void_p, c.c_char_p]
 lc.OSSL_PROVIDER_query_operation.restype = c.c_void_p
 lc.OSSL_PROVIDER_query_operation.argtypes = [c.c_void_p, c.c_int, c.POINTER(c.c_int)]
 lc.OPENSSL_init_crypto(0, None)
-time.sleep(3)
+# V2-64: 8s pre-init sleep outlives observer attach (~3.59s measured)
+time.sleep(8)
 prov = lc.OSSL_PROVIDER_load(None, b"c1prov")
 print("C1PROV", "ok" if prov else "FAIL", flush=True)
 if not prov:
