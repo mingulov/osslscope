@@ -5,8 +5,8 @@
 //! loaded BPF programs/maps, the attach links, the ring consumer,
 //! the target pin, and all discovery state until the session drops.
 //! Callers poll it in bounded batches and consume typed
-//! [`DiscoveryDelta`]s — there is no blocking full harvest and no
-//! JSON reparse in the (future T08) count loop. `inspect` and the
+//! [`DiscoveryDelta`]s — there is no blocking full harvest or
+//! JSON reparse in the T08 capture loop. `inspect` and the
 //! capture harvest path are thin run-policies over this session
 //! (see `harvest::run_detailed`).
 //!
@@ -67,10 +67,10 @@
 //! accounting. Prefer `close()` over `drop()`: the `Drop` impl
 //! only releases file descriptors and cannot report the tail.
 //!
-//! The session performs no ELF reads in the poll path: backing
-//! triples come from `/proc` maps alone, and foreign-object ELF
-//! checks stay at the (cached, per-emit) document-render layer, so
-//! only relevant objects are ever read.
+//! `SessionCore` delegates file/BPF operations to [`SessionEnv`].
+//! [`LiveEnv`] can read ELF bytes while attaching or reinstalling
+//! anchors and tripwires; the capture adapter separately reads relevant
+//! identity-bound file bytes for count planning and fingerprints.
 
 use crate::discovery::{builtin, coverage, elf, harvest, legacy, maps};
 use crate::loader::Loaded;
@@ -187,10 +187,11 @@ pub struct TableCoverage {
     pub trunc_bits: u64,
 }
 
-/// Verified backing triple for one callback implementation: the
-/// `(device, inode, file offset)` the address relocated to. The
-/// mapping executable bit and ELF segment checks stay at the
-/// document-render layer; this triple is the claimed relocation.
+/// Relocated backing triple for one callback implementation:
+/// `(device, inode, file offset)`. This is the discovery claim;
+/// count planning validates executable file offsets, and the capture
+/// adapter binds file bytes and fingerprints when build-id bytes are
+/// available, retaining an opaque/unverified fallback otherwise.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct BackingRef {
     pub dev: String,
@@ -199,9 +200,10 @@ pub struct BackingRef {
 }
 
 /// One observed backing object (code provenance for operators).
-/// Verified fingerprints are T07 work; this carries the
-/// `(device, inode)` identity plus a display locator, never an
-/// authority claim.
+/// This discovery record carries `(device, inode)` plus a display
+/// locator. The capture adapter binds file bytes and constructs the
+/// object fingerprint when build-id bytes are available; otherwise it
+/// retains an opaque/unverified identity through finalized output.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiscoveredObject {
     pub dev: String,

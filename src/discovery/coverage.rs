@@ -320,14 +320,13 @@ impl CoverageTracker {
             // A proof for another op at the same base (address reuse
             // across reloads) proves nothing about this table.
             if top == op {
-                // Exact coverage: the proof names `len` live slots
-                // and the walked set must be exactly 0..len.
-                // Anything else — skipped impl-less slots, lost
-                // records, or a stale proof reused by a reloaded
-                // array at the same base (ABA growth) — is still in
-                // progress, never complete. (ABA shrinkage can feed
-                // the walker out-of-bound reads; incarnation binding
-                // is T06 epoch work — see the handoff residual.)
+                // Exact coverage within the supplied incarnation: the
+                // proof names `len` live slots and the walked set must
+                // be exactly 0..len. Missing or out-of-range slots
+                // remain in progress. Incarnation binding and kernel
+                // state eviction are owned by session::SessionCore;
+                // this tracker checks the slot set and termination
+                // proof it is given.
                 let set = self.walked.get(&(op, arr));
                 let n = set.map(|s| s.len()).unwrap_or(0);
                 let exact =

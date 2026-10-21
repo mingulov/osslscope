@@ -1,11 +1,11 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
-//! `observed-crypto-v1` reader contract (P3 exit-3).
+//! Historical v1 reader support and current v2 document validation.
 //!
-//! The schema file lives at `schemas/observed-crypto-v1.json`.
-//! Readers accept v1.x documents and reject other majors or
-//! garbage (`check_version`); producers emit `observed-crypto-v1.0`
-//! today. Minor versions add OPTIONAL keys only — readers must
-//! ignore unknown keys.
+//! [`check_version`] accepts historical v1.x documents; its schema is
+//! `schemas/observed-crypto-v1.json`. Live report/check producers emit
+//! `observed-crypto-v2.1`; [`check_version_v2`], [`validate_v2`] and
+//! [`check_v2_semantics`] own that contract. Minor additions are optional;
+//! field readers ignore unknown keys while validators stay strict.
 
 /// True iff a v1.x reader accepts this `schema_version`: accepts
 /// `observed-crypto-v1` (implicit .0) and `observed-crypto-v1.<minor>`;

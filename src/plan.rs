@@ -291,16 +291,12 @@ pub struct FileBytes {
     pub ino: u64,
 }
 
-/// Identity-bound byte lookup (F-A/A3): the bytes read for `path`
-/// serve a mapping with inode `ino` only when the read-time inode
-/// matches. No lookup-time stat: maps and files are round-consistent
-/// artifacts (both sampled in-round), so a replacement between the
-/// two samples surfaces as an identity mismatch, while a replacement
-/// after both keeps the round consistently old. Device domains are
-/// never compared (maps text vs stat diverge on overlayfs — the
-/// inode suffices because a mapped inode's number cannot be reused
-/// while the mapping pins it). Cross-mount-namespace observation is
-/// out of model (operator co-locates; see attach-failures.md pidns).
+/// Identity-bound byte lookup (F-A/A3): maps and files are round-consistent
+/// sampled artifacts; lookup performs no fresh path stat. A replacement
+/// between samples surfaces as an identity mismatch, while a replacement
+/// after both leaves the round consistently old. Cross-mount-namespace
+/// observation is out of model (operator co-locates; see attach-failures.md
+/// pidns).
 /// Identity-bound bytes lookup (F-A/A3, H5): serve `files[path]`
 /// only when the entry's FULL identity matches the claim —
 /// encoded stat-dev AND ino, both stat-domain. Ino-only used to

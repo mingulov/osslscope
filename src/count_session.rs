@@ -848,19 +848,17 @@ impl<B: CountBackend> CountSession<B> {
         Ok(())
     }
 
-    /// Close the window in-kernel first (`TARGET=0`, drop-all — no
-    /// userspace delay can extend counting past this point), then
-    /// drain under the grace deadline and finalize the [`CountDrain`].
-    /// Keys left unread past the grace expiry count exactly into the
-    /// drain-shortfall loss counter. The final drain quiesces: while
-    /// a pass routes new deltas (an increment admitted pre-close
-    /// landing after the previous scan), another bounded pass runs,
-    /// so in-flight hits settle instead of vanishing. No userspace
-    /// loop can quiesce an increment that lands after the last scan
-    /// — that nanosecond-scale residual matches the capture engine's
-    /// single-scan behavior and is documented, not hidden; a
-    /// kernel-side admitted-hits ledger would be needed to count it
-    /// loud. Consumes the session for further attach/fence calls.
+    /// Close future admission with `TARGET=0`, then collect bounded
+    /// count-map snapshots under the grace deadline and finalize the
+    /// [`CountDrain`]. Keys left unread at expiry contribute drain
+    /// shortfall. Up to three passes run while routed row deltas make
+    /// progress; this is not an in-flight callback completion barrier.
+    /// A zero-progress or final pass can precede a previously admitted
+    /// increment. The backend already samples the independent ADMITTED
+    /// ledger: no-shortfall drains publish `count.ledger_delta`, while
+    /// shortfall publishes unreconciled activity. Those sampled totals
+    /// do not prove terminal quiescence or eliminate post-scan tails.
+    /// Consumes the session for further attach/fence calls.
     pub fn close_and_drain(&mut self, grace: Duration) -> anyhow::Result<CountDrain> {
         if self.closed {
             anyhow::bail!("count session is already drained");
@@ -868,9 +866,9 @@ impl<B: CountBackend> CountSession<B> {
         self.backend.close_window()?;
         self.window_open = false;
         let deadline = Instant::now().checked_add(grace);
-        // Bounded quiesce: at most three passes, stopping early on a
-        // clean pass, grace expiry, or any shortfall (re-scanning an
-        // expired drain would recount the same keys as shortfall).
+        // Bounded multi-pass drain: at most three passes, stopping
+        // on zero routed row delta, grace expiry, or shortfall
+        // (re-scanning an expired drain would recount shortfall).
         let mut progress = true;
         let mut passes = 0u32;
         let mut pass_ns_total = 0u64;
@@ -1122,7 +1120,7 @@ impl<B: CountBackend> CountSession<B> {
     /// and candidate meaning it never had. Every drained delta lands
     /// in exactly one bucket — current, fenced, or unattributed —
     /// so counts are conserved per generation. Returns whether any
-    /// count delta routed (the close quiesce loop's progress bit).
+    /// count delta routed (the bounded close-drain loop's progress bit).
     fn route(&mut self, drained: DrainedCounts) -> bool {
         let mut progress = false;
         self.drained_keys += drained.rows.len() as u64;

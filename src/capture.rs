@@ -8,8 +8,8 @@
 //! callback counts. Discovery deltas apply incrementally through the
 //! [`adapt_delta`] adapter; legacy tripwire counters baseline at the
 //! declared window boundary; counting closes before the final
-//! discovery drain; and the window finalizes through
-//! [`evidence::finalize`] only after every counter is known.
+//! discovery drain; and [`evidence::finalize`] assigns completeness
+//! from the collected window, coverage and counter evidence.
 //!
 //! Window order for `run` (R05: requested begins at child release):
 //! spawn stopped → attach discovery → open the kernel count window →
@@ -19,19 +19,18 @@
 //! `--pid` (requested begins at acquisition, necessarily before the
 //! window opens) stays explicitly PARTIAL, as before.
 //!
-//! The `Capture`/`Counters`/`Outcome` surface below is the T10/T11
-//! seam: reports and policy still consume it, now mapped from the
-//! finalized [`evidence::CaptureDocument`] (carried in
-//! [`Capture::document`]) instead of the retired Engine. Reason
-//! strings stay inside the `REASON_TAXONOMY` vocabulary in
-//! `report.rs` (extended by review for the session-driven gaps).
+//! [`Capture::document`] carries the finalized
+//! [`evidence::CaptureDocument`] consumed by current reports and policy.
+//! `Capture`/`Counters`/`Outcome` also retain the historical T10/T11
+//! compatibility projection. Its reason strings are diagnostics;
+//! current decisions use typed document gaps (see `Capture::reasons`).
 //!
-//! Lifecycle (R05): short fork/exec detection uses the EXPLICIT
-//! PARTIAL polling fallback ([`PollingLifecycle`]); polling alone
-//! cannot prove no such activity, so every live capture carries the
-//! `lifecycle.polling_fallback` loss until the bounded kernel signal
-//! path lands (recorded gap, see the T08 handoff). No multi-target
-//! capture: one TGID throughout.
+//! Lifecycle (R05): [`LiveLifecycle`] selects bounded kernel-observed
+//! signals when proc-connector subscription succeeds, otherwise the
+//! explicit PARTIAL [`PollingLifecycle`] fallback. Polling alone cannot
+//! exclude short-lived activity and emits `lifecycle.polling_fallback`;
+//! kernel signals retain their own prefix/loss/drain checks. No
+//! multi-target capture: one TGID remains the count target.
 //!
 //! The controller is generic over [`DiscoveryPort`], [`TargetPort`],
 //! [`LifecyclePort`], [`ClockPort`] and [`ProcPort`] so the
@@ -158,10 +157,10 @@ pub enum Outcome {
     Fatal(FatalKind),
 }
 
-/// Traversal selection for [`run_traversal`] (opt-in per run —
-/// [`run`] stays harvest-only). `None` members means automatic
-/// triple discovery from the trusted object dirs; `Some` is an
-/// explicit operator override for the members role.
+/// Explicit traversal selection for [`run_traversal`]. Ordinary
+/// [`run`] also selects traversal automatically when eligible.
+/// `None` discovers a trusted triple; `Some` explicitly overrides
+/// the members role.
 #[derive(Debug, Clone, Default)]
 pub struct TraversalRequest {
     pub members_object: Option<PathBuf>,
@@ -184,10 +183,9 @@ pub struct TripleProvenance {
 }
 
 // NOTE (round 3, F1): traversal records are NOT adapted into
-// count-session executions. Callback execution is unobservable
-// in v1, so any `SiteExecution` assembled from query visibility
-// would fabricate execution (fetch/query visibility is not
-// execution evidence). Traversal reports natively:
+// count-session executions. Query/traversal visibility does not
+// observe callback execution, so assembling `SiteExecution` from
+// it would fabricate execution evidence. Traversal reports natively:
 // `TraversalCapture` retains full records (per-slot identities
 // with generations + TRUE-T + outcomes + provenance + admitted
 // census); the report `traversal` section carries the triple,
@@ -435,16 +433,16 @@ pub struct Capture {
     pub provider_build_id: String,
     pub provider_path: String,
     pub image_digest: String,
-    /// Finalized v2 evidence document (T08 produces it; T10/T11
-    /// rewire reports/policy onto it).
+    /// Finalized v2 evidence document (T08 producer; T10/T11
+    /// report/policy integration consumes this document).
     pub document: CaptureDocument,
     /// End-of-observation target disposition (T04 custody): exit
     /// status preserved, or the detached pid that was left running.
     /// `None` for foreign `--pid` targets that recycled mid-window.
     pub disposition: Option<target::TargetDisposition>,
-    /// Traversal outcome (opt-in [`run_traversal`] runs only):
-    /// resolved-triple provenance plus the drained per-invocation
-    /// records. `None` on harvest-only runs.
+    /// Traversal outcome when automatic or explicit selection
+    /// activated the backend: resolved-triple provenance plus drained
+    /// per-invocation records. `None` on harvest-only runs.
     pub traversal: Option<TraversalCapture>,
     /// Run-set selection provenance (v0.2): the exact objects the
     /// run resolved — recorded on every production run's document
@@ -759,12 +757,12 @@ fn traversal_reasons(
     reasons
 }
 
-/// Live discovery engine with an attached traversal backend
-/// (opt-in [`run_traversal`] runs): harvest polling delegates to
-/// the inner session; traversal polls register the target's live
-/// tids (a vanished `/proc/<pid>/task` drains the tail against an
-/// empty set — a dead target grows no tids) and drain the members
-/// ring through the production backend.
+/// Live discovery engine with a selected traversal backend
+/// (automatic or explicit): harvest polling delegates to the inner
+/// session; traversal polls register the target's live tids (a
+/// vanished `/proc/<pid>/task` drains the tail against an empty set —
+/// a dead target grows no tids) and drain the members ring through
+/// the production backend.
 pub struct LiveTraversalDiscovery {
     inner: LiveDiscovery,
     backend: ScanBackend,
@@ -888,9 +886,9 @@ impl DiscoveryPort for LiveTraversalDiscovery {
     }
 }
 
-/// Discovery engine behind the port: harvest-only by default,
-/// traversal-carrying on opt-in runs. One concrete type keeps
-/// [`SessionSet`] and [`observe`] unchanged for every caller.
+/// Discovery engine behind the port: harvest-only or traversal,
+/// according to the resolved object set and target anchor. One
+/// concrete type keeps [`SessionSet`] and [`observe`] shared.
 pub enum CaptureDiscovery {
     HarvestOnly(Box<LiveDiscovery>),
     Traversal(Box<LiveTraversalDiscovery>),
@@ -1094,11 +1092,11 @@ pub struct LifecycleDelta {
     pub pending: u64,
 }
 
-/// Short fork/exec + lifecycle-loss observer. The T08 selection is
-/// the EXPLICIT PARTIAL polling fallback: `fallback_partial()` is
-/// true, and the controller records the `lifecycle.polling_fallback`
-/// loss on every observation using it, because polling alone cannot
-/// prove no short-lived activity occurred between scans.
+/// Short fork/exec and lifecycle-loss observer. Production selects
+/// [`LiveLifecycle`]; ports returning `fallback_partial() == true`
+/// record `lifecycle.polling_fallback`, because polling alone cannot
+/// exclude short-lived activity between scans. Kernel ports expose
+/// their signal loss and close-drain evidence separately.
 pub trait LifecyclePort {
     fn poll(&mut self) -> LifecycleDelta;
     fn fallback_partial(&self) -> bool;
@@ -2996,14 +2994,13 @@ fn classify_loss(source: u32, count: u64) -> GapCounter {
 /// hint, never as identity).
 /// Memoized build-id reads (P6): one ELF parse per bound file per
 /// adapt call. The parse closure runs at most once per (path, dev,
-/// ino) identity (absence caches too); a same-path replacement
-/// carries a new inode, so it re-parses. The cache is call-local
-/// (fresh per adapt_delta) and adds no persistence beyond the byte
-/// cache: it inherits `files`-map freshness — an in-place rewrite
-/// that keeps (dev, ino) keeps serving the previously read bytes
-/// (read_relevant_files reuses cache hits across polls), so its
-/// ids stay exactly as stale as those bytes. Within one immutable
-/// `files` map, every result is exact.
+/// ino) identity (absence caches too); the cache is call-local to
+/// `adapt_delta` and inherits the supplied `files` map's freshness.
+/// Production `read_relevant_files` validates dev/inode/size/mtime
+/// on every cache use and re-reads on mismatch or stat failure;
+/// proven mid-read mutation is discarded. This memoizer adds no
+/// independent freshness proof or protection against changes the
+/// underlying metadata checks cannot observe.
 type BuildIdCache = HashMap<(String, u64, u64), Option<String>>;
 
 fn cached_build_id(
@@ -7364,8 +7361,8 @@ fn resolve_capture_provider(
     }
 }
 
-/// Run a full capture window against `target` (harvest-only:
-/// the qualified default — pair resolution, unchanged behavior).
+/// Run a full capture window against `target` with automatic
+/// object-set selection (see [`run_with_dirs`]).
 pub fn run(cfg: &Config, target: Target) -> anyhow::Result<Capture> {
     if cfg.duration.is_zero() {
         anyhow::bail!("--duration must be > 0 (no --forever in v1)");
@@ -7672,9 +7669,9 @@ fn anchor_or_degrade(
     }
 }
 
-/// Wrap an attached discovery session for the run: harvest-only
-/// by default; traversal runs pin the builtin query anchor and
-/// attach the members backend (full 512, production CTRL).
+/// Wrap an attached discovery session according to the selected
+/// object set: traversal pins the builtin query anchor and attaches
+/// the members backend (full 512, production CTRL).
 /// Explicit traversal without an anchor (init mode /
 /// dispatch-blind — traversal never guesses an offset) refuses
 /// BEFORE the window opens (no release yet — the caller resolves
@@ -7856,9 +7853,9 @@ fn run_inner(
                     return Err(e.context(format!("discovery attach{exit_note}")));
                 }
             };
-            // Traversal opt-in: the backend attaches before release
-            // (probes arm while the child is still stopped, like
-            // every other plane); refusal custody mirrors discovery.
+            // Selected traversal attaches before release (probes arm
+            // while the child is still stopped, like every other
+            // plane); refusal custody mirrors discovery.
             let discovery = match wrap_discovery(discovery, traversal.as_ref(), pid) {
                 Ok(discovery) => discovery,
                 Err(e) => {
@@ -7933,8 +7930,8 @@ fn run_inner(
                     return Err(e.context("discovery attach"));
                 }
             };
-            // Traversal opt-in (same pre-window attach; a refusal
-            // here is an anchor/attach failure, never a recycle).
+            // Selected traversal uses the same pre-window attach;
+            // a refusal here is an anchor/attach failure, not recycle.
             let discovery = match wrap_discovery(discovery, traversal.as_ref(), p) {
                 Ok(discovery) => discovery,
                 Err(e) => return Err(e.context("traversal attach")),

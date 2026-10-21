@@ -406,9 +406,9 @@ manifest = {
     "bpf_cmd": e.get("BPF_CMD") or None,
     "diagnostics": e.get("DIAGNOSTICS") or "",
     "artifacts": artifacts,
-    # Prefix-install layout contract (consumed by scripts/install-dev.sh
-    # and, later, default object resolution): install destination per
-    # artifact role, relative to the prefix.
+    # Prefix-install layout contract (consumed by scripts/install-dev.sh;
+    # trusted system installs use this layout for default object resolution):
+    # install destination per artifact role, relative to the prefix.
     "install_layout": {
         "host-binary": "bin/osslscope",
         "bpf-object:osslscope-harvest": "lib/osslscope/osslscope-harvest",

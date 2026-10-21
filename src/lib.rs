@@ -1,9 +1,9 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 //! osslscope — non-interposing OpenSSL observer on eBPF uprobes.
 //!
-//! Module build order per PLAN §4: P1 owns `cli`, `doctor`, `kinds`,
-//! `discovery` + `crates/ossl-discover`. Later phases add attach (P2),
-//! semantics (P3), hardening (P4+) — no stub modules until owned.
+//! Discovery, capture, policy and reporting are implemented by the modules
+//! below. The current report/check path uses the finalized v2 evidence
+//! document; live and release qualification remain separate.
 
 pub mod aliases;
 // T04 (coordinator review): new modules for owned-target custody +
@@ -26,8 +26,8 @@ pub mod plan;
 // T01 (coordinator review): pure policy predicate primitives, no CLI wiring.
 pub mod policy;
 pub mod report;
-// R19 (P7 item 3): scan-plane host modules (birth registry first;
-// oracle + governor follow in later commits on this branch).
+// R19 (P7 item 3): scan-plane birth registry, join oracle, governor
+// and production backend (see scan's module documentation).
 pub mod scan;
 pub mod schema;
 pub mod target;

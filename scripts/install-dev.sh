@@ -6,7 +6,7 @@
 # a usable install; system packages (deb/rpm) remain the only /usr path and
 # are not final distributables during development.
 #
-# Prefix layout (the contract future default object resolution consumes):
+# Prefix layout (also used by trusted system default object resolution):
 #   $PREFIX/bin/osslscope
 #   $PREFIX/lib/osslscope/osslscope-harvest
 #   $PREFIX/lib/osslscope/osslscope-count
