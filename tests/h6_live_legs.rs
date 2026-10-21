@@ -77,7 +77,7 @@ fn run_harvest(
     osslscope::discovery::harvest::run(&cfg).expect("harvest run")
 }
 
-/// L4: mid-run chmod-000 (expected identity unstatable; the
+/// L4: mid-run unlink (expected identity unstatable; the
 /// target keeps mapping it, probes stay on the held fd) +
 /// birth + NO hook → PARTIAL on both trees (H6:
 /// absent-unproven via the hook gate; base: present-quiet).
@@ -105,18 +105,13 @@ fn h6_l4_absent_birth_no_hook_is_partial() {
     let object_c = object.clone();
     let doc = std::thread::scope(|s| {
         let h = s.spawn(move || run_harvest(&object_c, &prov_c, pid, false, true));
-        // Mid-run chmod-000 on the DIR: the expected identity
-        // goes unstatable (stat needs dir-x); the mapping +
-        // held-fd probes continue unaffected.
+        // Mid-run UNLINK of prov.so (V2-65: chmod-000 is a
+        // root-noop — root stats through 0o000): the expected
+        // identity goes unstatable for everyone incl. root;
+        // the mapping + held-fd probes continue unaffected.
         std::thread::sleep(std::time::Duration::from_secs(4));
-        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
-        use std::os::unix::fs::PermissionsExt as _;
-        perms.set_mode(0o000);
-        std::fs::set_permissions(&dir, perms.clone()).unwrap();
-        let doc = h.join().unwrap();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&dir, perms.clone()).unwrap();
-        doc
+        std::fs::remove_file(&prov).unwrap();
+        h.join().unwrap()
     });
     let _ = child.kill();
     let _ = child.wait();
@@ -147,16 +142,10 @@ fn h6_l5_absent_birth_quiet_hook_completes() {
     let object_c = object.clone();
     let doc = std::thread::scope(|s| {
         let h = s.spawn(move || run_harvest(&object_c, &prov_c, pid, true, true));
-        // Mid-run chmod-000 on the DIR (see L4).
+        // Mid-run UNLINK of prov.so (V2-65, see L4).
         std::thread::sleep(std::time::Duration::from_secs(4));
-        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
-        use std::os::unix::fs::PermissionsExt as _;
-        perms.set_mode(0o000);
-        std::fs::set_permissions(&dir, perms.clone()).unwrap();
-        let doc = h.join().unwrap();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&dir, perms.clone()).unwrap();
-        doc
+        std::fs::remove_file(&prov).unwrap();
+        h.join().unwrap()
     });
     let _ = child.kill();
     let _ = child.wait();
