@@ -2036,6 +2036,84 @@ fn retry_setup_refuses_while_prior_worker_live() {
 }
 
 #[test]
+fn retry_setup_refuses_across_symlinked_parent_spellings() {
+    // v0.2 R19: distinct spellings through symlinked parents name
+    // one destination — the second OUR-setup must refuse while the
+    // first worker is live, exactly like identical spellings.
+    use std::os::unix::fs::symlink;
+    let dir = r06_scratch("registry-alias");
+    let real = dir.join("real");
+    std::fs::create_dir(&real).unwrap();
+    symlink(&real, dir.join("link")).unwrap();
+    let log_a = real.join("workload.log");
+    let log_b = dir.join("link").join("workload.log");
+    std::fs::write(&log_a, b"original\n").unwrap();
+    let sentinel = dir.join("SENTINEL");
+    let argv = r06_sentinel_argv(&sentinel);
+    let ready = Arc::new(AtomicBool::new(false));
+    let proceed = Arc::new(AtomicBool::new(false));
+    let counter = Arc::new(AtomicU32::new(0));
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (worker, sink, rx) = r06_spawn_async_setup(
+        argv,
+        WorkloadDest::File(log_a.clone()),
+        Instant::now() + Duration::from_secs(60),
+        R06Cancel::Shared(cancel.clone()),
+        0,
+        R06SetupHooks {
+            publish_gate: Some((ready.clone(), proceed.clone())),
+            worker_counter: Some(counter.clone()),
+            ..R06SetupHooks::default()
+        },
+    );
+    let end = Instant::now() + Duration::from_secs(10);
+    while !ready.load(Ordering::SeqCst) {
+        assert!(Instant::now() < end, "worker never poised at publish");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let retry_cancel = AtomicBool::new(false);
+    let retry = OwnedTarget::spawn_stopped_with_control(
+        &r06_sentinel_argv(&sentinel),
+        WorkloadDest::File(log_b.clone()),
+        Instant::now() + Duration::from_secs(5),
+        &retry_cancel,
+    );
+    match retry {
+        Err(e) => {
+            let msg = e.to_string();
+            assert!(msg.contains("in flight"), "refusal names fencing: {msg}");
+            assert!(msg.contains("no child spawned"), "nothing forked: {msg}");
+        }
+        Ok(mut t) => {
+            let pid = t.pid();
+            t.resolve_setup_failure().unwrap();
+            assert_reaped_no_zombie(pid);
+            panic!(
+                "aliased retry must refuse while the prior worker is live, but spawned pid {pid}"
+            );
+        }
+    }
+    assert_eq!(
+        std::fs::read(&log_a).unwrap(),
+        b"original\n",
+        "refused retry writes nothing"
+    );
+    cancel.store(true, Ordering::SeqCst);
+    let result = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("first setup returns after abandonment");
+    match result {
+        Err(e) => assert!(e.to_string().contains("cancelled")),
+        Ok(t) => r06_unexpected_child(t, "cancelled setup must fail"),
+    }
+    proceed.store(true, Ordering::SeqCst);
+    worker.join().unwrap();
+    assert_eq!(sink.load(Ordering::SeqCst), 0, "no fork may happen");
+    assert!(!sentinel.exists(), "sentinel must never execute");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn staging_namespace_dest_refused_before_creating() {
     // Fix round 5 / (iv): staging paths are provably distinct from the
     // destination — any destination whose file name lies in the staging
@@ -2266,11 +2344,13 @@ fn r20fix_kernel_lifecycle_witnesses_real_fork_exec_exit() {
     let mut execs: HashSet<u32> = HashSet::new();
     let mut loss = 0u64;
     let mut dropped = 0u64;
+    let mut prefix_unwitnessed = 0u64;
     let end = Instant::now() + Duration::from_secs(10);
     while (forks.is_empty() || execs.is_empty()) && Instant::now() < end {
         let delta = lc.poll();
         loss += delta.loss;
         dropped += delta.dropped;
+        prefix_unwitnessed += delta.prefix_unwitnessed;
         assert_eq!(delta.pending, 0, "quiet test must not truncate drains");
         for e in &delta.events {
             match e.kind {
@@ -2292,11 +2372,13 @@ fn r20fix_kernel_lifecycle_witnesses_real_fork_exec_exit() {
     assert_ne!(gc, pid, "grandchild is not the target");
     assert_eq!(loss, 0, "no scan loss on a quiet window");
     assert_eq!(dropped, 0, "no kernel drops on a quiet window");
+    assert_eq!(prefix_unwitnessed, 0, "no prefix gaps on a quiet window");
     // Close drain: witnessed, complete, still lossless.
     let tail = lc.close_drain().expect("kernel close witness");
     assert_eq!(tail.pending, 0, "close drain must reach the tail");
     assert_eq!(tail.loss, 0);
     assert_eq!(tail.dropped, 0);
+    assert_eq!(tail.prefix_unwitnessed, 0);
     assert!(tail.events.is_empty(), "no stragglers: {:?}", tail.events);
     assert_reaped_no_zombie(pid);
 }
@@ -2493,12 +2575,12 @@ fn kernel_live_target_first_sighting_gaps_prefix() {
     }
     let mut status = 0;
     assert!(unsafe { libc::waitpid(child, &mut status, 0) } >= 0);
-    let mut dropped = 0u64;
+    let mut prefix_unwitnessed = 0u64;
     let mut saw_fork = false;
     let end = Instant::now() + Duration::from_secs(10);
     while !saw_fork && Instant::now() < end {
         let d = lc.poll();
-        dropped += d.dropped;
+        prefix_unwitnessed += d.prefix_unwitnessed;
         saw_fork = d.events.iter().any(|e| {
             matches!(e.kind, osslscope::capture::LifecycleKind::Fork) && e.pid as i32 == child
         });
@@ -2508,8 +2590,8 @@ fn kernel_live_target_first_sighting_gaps_prefix() {
     }
     assert!(saw_fork, "our child's fork must witness");
     assert!(
-        dropped >= 1,
-        "live-target first sightings must gap their prefix, not baseline silently: dropped={dropped}"
+        prefix_unwitnessed >= 1,
+        "live-target first sightings must gap their prefix, not baseline silently: prefix_unwitnessed={prefix_unwitnessed}"
     );
 }
 
@@ -3126,6 +3208,7 @@ fn ordinary_production_run_counts_real_crypto_free_of_polling_fallback() {
         "lifecycle.polling_fallback",
         "lifecycle.scan_loss",
         "lifecycle.signal_dropped",
+        "lifecycle.signal_prefix_unwitnessed",
         "lifecycle.no_witness",
         "lifecycle.drain_pending",
         "lifecycle.exec_gap",

@@ -42,26 +42,26 @@ means "not present / never used".
   is PARTIAL (`no-query`), never COMPLETE-zero.
 
 Counts are entry counts: N for one identity means "N entries
-observed in the window". v1 does not split success from failure and
+observed in the window". v0.2 does not split success from failure and
 records no per-call latency (first/last-seen timestamps per key
 only).
 
 ## Non-goals
 
-v1 does not do TLS/libssl tracing, handshake observation,
+v0.2 does not do TLS/libssl tracing, handshake observation,
 cipher-suite inventory, PCAP, network tracing, plaintext/key
 extraction, per-call trace output, latency histograms, cgroup or
 multi-target attach, daemon mode, or `--exe` inspection. Pre-3.0
 OpenSSL (the ENGINE-era method tables, with no `OSSL_DISPATCH`) is
 out of scope, as is any always-on production agent posture
-(always-on is post-v1).
+(always-on is post-v0.2).
 
 ## Who should NOT adopt (read before installing)
 
 This section is the headline, not a footnote. Each item below is a
-measured v1 boundary.
+measured v0.2 boundary.
 
-**CI gating on COMPLETE status: not qualified.** v1 is NOT
+**CI gating on COMPLETE status: not qualified.** v0.2 is NOT
 qualified for CI gating on COMPLETE. On real TLS-terminating apps
 COMPLETE is structurally unreachable: libssl takes the addresses of
 four digest `Transform` routines through `R_X86_64_GLOB_DAT` (no
@@ -86,17 +86,17 @@ Ubuntu 24.04 GA (6.8; install the HWE kernel to qualify), or Debian
 `doctor` refuses these environments fail-closed via a functional
 feature probe, never a version-string match.
 
-**Non-x86-64 targets: not supported.** v1 is x86-64-only. No ARM64
-(or 32-bit) observation evidence exists for v1, and none is
+**Non-x86-64 targets: not supported.** v0.2 is x86-64-only. No ARM64
+(or 32-bit) observation evidence exists for v0.2, and none is
 claimed: `doctor` refuses non-x86-64 targets fail-closed (exit 4),
 and the refusal paths are covered by committed goldens.
 <!-- source: arch decision + clean-refusal goldens: p5-gate-record.md -->
 
 **SecureBoot-qualified operation: not claimed.** SecureBoot
-qualification is deferred post-v1: the qualification attempt
+qualification is deferred post-v0.2: the qualification attempt
 failed on the host hypervisor (KVM rejects the firmware's SMM
 entry, so no SecureBoot-enabled guest reaches userspace), which
-leaves open what SecureBoot blocks for BPF attach. v1 claims no
+leaves open what SecureBoot blocks for BPF attach. v0.2 claims no
 SecureBoot-qualified status.
 <!-- source: SecureBoot cell + deferral: p5-exit1-cells note, p5-gate-record.md -->
 
@@ -105,7 +105,7 @@ Observing a stripped statically linked binary yields zero rows
 (PARTIAL with anchor/trigger reasons): there is no dynamic symbol
 table to resolve the harvest anchor and no enrolled build-id row.
 Unstripped static binaries observe normally via symtab. If your
-fleet ships stripped static binaries, v1 cannot inventory them.
+fleet ships stripped static binaries, v0.2 cannot inventory them.
 <!-- source: static boundary probe (0 rows stripped, 62 rows
      unstripped): p6-entry-envs note -->
 

@@ -399,10 +399,21 @@ pub struct Capture {
     pub window_planned: Duration,
     pub window_actual: Duration,
     pub outcome: Outcome,
+    /// Compatibility reason strings (v0.2 R22 seam 2 — RETAINED):
+    /// write-only diagnostics; production report/check consume
+    /// the typed `document` gaps, and no decision reads these
+    /// strings — so removal would churn test pins without
+    /// removing any duplicate decision. The P1 typed gaps map
+    /// back onto the same vocabulary (deduped, never
+    /// double-reported).
     pub reasons: Vec<String>,
     pub executions: Vec<Execution>,
     pub stale: Vec<StaleBucket>,
     pub counters: Counters,
+    /// Legacy child-exit carrier (v0.2 R22 seam 3 — RETAINED):
+    /// live consumers in report/check (`workload_hint`,
+    /// exit mapping) require it; removal fails the plan R22
+    /// checkbox-1 gate (parity + zero consumers unproven).
     pub child_exit: Option<i32>,
     pub drain_wall_us: u64,
     pub harvest_doc: serde_json::Value,
@@ -1058,9 +1069,19 @@ pub struct LifecycleEvent {
 pub struct LifecycleDelta {
     pub events: Vec<LifecycleEvent>,
     pub loss: u64,
-    /// Kernel-side signals known-dropped (ring overflow). Zero for
-    /// ports with no kernel producer (polling).
+    /// Kernel-side signals known-dropped (proven seq holes plus the
+    /// socket Drops delta; the ENOBUFS-unmoved at-least-one at the
+    /// drain also lands here and stays documented there). Zero for
+    /// ports with no kernel producer (polling). Conservative
+    /// first-sighting prefix gaps are NOT counted here — see
+    /// `prefix_unwitnessed`.
     pub dropped: u64,
+    /// Kernel-side signals conservatively unwitnessed (prefix gaps
+    /// on post-activity first sightings): at-least-one per CPU with
+    /// an ungapped prefix — NEVER read as a proven transport-drop
+    /// count. Rendered as `lifecycle.signal_prefix_unwitnessed`
+    /// Loss; blocks COMPLETE exactly like proven drops.
+    pub prefix_unwitnessed: u64,
     /// Bounded-drain residual: nonzero when this drain stopped
     /// with records still queued (1 = tail remains; the exact
     /// queued depth is transport-specific, so presence — not a
@@ -1434,7 +1455,7 @@ impl SeqState {
         let Some(prev) = self.last.get(&cpu).copied() else {
             self.last.insert(cpu, seq);
             if post_release {
-                delta.dropped = delta.dropped.saturating_add(1);
+                delta.prefix_unwitnessed = delta.prefix_unwitnessed.saturating_add(1);
             }
             return;
         };
@@ -4213,6 +4234,9 @@ struct Runner<'x, D, B: CountBackend, T, L, C: ClockPort, P: ProcPort> {
     /// Kernel-side lifecycle signals known-dropped (ring overflow
     /// reported through the port).
     lifecycle_dropped: u64,
+    /// Conservative prefix gaps accumulated from
+    /// `LifecycleDelta.prefix_unwitnessed` (at-least-one; Loss).
+    lifecycle_prefix_unwitnessed: u64,
     /// Close drains with missing evidence (non-fallback port,
     /// `close_drain` None): the observer never proved it covered
     /// the tail.
@@ -4861,6 +4885,9 @@ where
         );
         self.lifecycle_loss = self.lifecycle_loss.saturating_add(delta.loss);
         self.lifecycle_dropped = self.lifecycle_dropped.saturating_add(delta.dropped);
+        self.lifecycle_prefix_unwitnessed = self
+            .lifecycle_prefix_unwitnessed
+            .saturating_add(delta.prefix_unwitnessed);
     }
 
     /// One bounded poll round: maps, corpse check, fence compare,
@@ -5520,6 +5547,7 @@ where
         fork_exec_ignored: 0,
         lifecycle_loss: 0,
         lifecycle_dropped: 0,
+        lifecycle_prefix_unwitnessed: 0,
         lifecycle_no_witness: 0,
         lifecycle_pending: 0,
         lifecycle_exec_gap: 0,
@@ -6057,6 +6085,15 @@ where
                 self.lifecycle_dropped,
             ));
         }
+        if self.lifecycle_prefix_unwitnessed > 0 {
+            self.extra_counters.push(typed_counter(
+                "lifecycle.signal_prefix_unwitnessed",
+                CounterKind::Loss,
+                CounterUnits::Events,
+                CounterSource::Lifecycle,
+                self.lifecycle_prefix_unwitnessed,
+            ));
+        }
         if self.lifecycle_no_witness > 0 {
             self.extra_counters.push(typed_counter(
                 "lifecycle.no_witness",
@@ -6517,6 +6554,7 @@ where
         let close_census_global = self.cold_gap_queries > 0
             || self.lifecycle_loss > 0
             || self.lifecycle_dropped > 0
+            || self.lifecycle_prefix_unwitnessed > 0
             || self.lifecycle_no_witness > 0
             || self.lifecycle_pending > 0
             || self.lifecycle_exec_gap > 0
@@ -7025,6 +7063,7 @@ where
             "lifecycle.fork_exec_ignored"
             | "lifecycle.scan_loss"
             | "lifecycle.signal_dropped"
+            | "lifecycle.signal_prefix_unwitnessed"
             | "lifecycle.no_witness"
             | "lifecycle.drain_pending"
             | "lifecycle.exec_gap" => self.reason("fork-exec-ignored"),
@@ -8445,6 +8484,7 @@ mod tests {
         assert_eq!(d.events.len(), 2);
         assert_eq!(d.loss, 0);
         assert_eq!(d.dropped, 1, "seq 5→7 on cpu0 misses exactly one signal");
+        assert_eq!(d.prefix_unwitnessed, 0);
     }
 
     #[test]
@@ -8504,6 +8544,7 @@ mod tests {
         let d = fresh_ingest(&mut known, &buf);
         assert_eq!(d.events.len(), 2);
         assert_eq!(d.dropped, 0);
+        assert_eq!(d.prefix_unwitnessed, 0);
         assert_eq!(d.loss, 0);
     }
 
@@ -8520,8 +8561,9 @@ mod tests {
         let mut seqs = SeqState::default();
         let mut delta = LifecycleDelta::default();
         seqs.observe(0, 900, &mut delta, true);
+        assert_eq!(delta.dropped, 0);
         assert_eq!(
-            delta.dropped, 1,
+            delta.prefix_unwitnessed, 1,
             "post-activity first sighting must gap its unwitnessed prefix"
         );
         // ...and the stream still baselines (no compounding: the
@@ -8529,6 +8571,7 @@ mod tests {
         let mut delta2 = LifecycleDelta::default();
         seqs.observe(0, 901, &mut delta2, true);
         assert_eq!(delta2.dropped, 0);
+        assert_eq!(delta2.prefix_unwitnessed, 0);
         assert_eq!(delta2.loss, 0);
         // Pre-release first sightings stay silent (stopped target:
         // predecessors provably non-target).
@@ -8536,7 +8579,23 @@ mod tests {
         let mut delta_pre = LifecycleDelta::default();
         seqs_pre.observe(0, 900, &mut delta_pre, false);
         assert_eq!(delta_pre.dropped, 0);
+        assert_eq!(delta_pre.prefix_unwitnessed, 0);
         assert_eq!(delta_pre.loss, 0);
+    }
+
+    #[test]
+    fn kernel_seq_first_seen_prefix_is_conservative_not_proven() {
+        // v0.2 gap-accept 2/14: post-activity first sightings gap
+        // the unwitnessed prefix WITHOUT claiming a proven
+        // transport drop.
+        let mut seqs = SeqState::default();
+        let mut delta = LifecycleDelta::default();
+        seqs.observe(0, 900, &mut delta, true);
+        assert_eq!(delta.dropped, 0, "prefix gap is not a proven drop");
+        assert_eq!(
+            delta.prefix_unwitnessed, 1,
+            "prefix gap records conservatively"
+        );
     }
 
     #[test]
@@ -8553,11 +8612,16 @@ mod tests {
         );
         let d = fresh_ingest_as(&mut known, &buf, true);
         assert_eq!(d.events.len(), 1, "witness still maps to its event");
-        assert_eq!(d.dropped, 1, "post-release first sighting must gap");
+        assert_eq!(d.dropped, 0, "post-release first sighting must gap");
+        assert_eq!(
+            d.prefix_unwitnessed, 1,
+            "post-release first sighting must gap"
+        );
         let mut known_pre = HashSet::from([100u32]);
         let d_pre = fresh_ingest_as(&mut known_pre, &buf, false);
         assert_eq!(d_pre.events.len(), 1);
         assert_eq!(d_pre.dropped, 0, "pre-release baseline stays silent");
+        assert_eq!(d_pre.prefix_unwitnessed, 0);
     }
 
     #[test]
@@ -8828,6 +8892,7 @@ mod tests {
         );
         assert!(d.events.is_empty());
         assert_eq!(d.dropped, 0);
+        assert_eq!(d.prefix_unwitnessed, 0);
         assert_eq!(d.loss, 0);
     }
 
@@ -8873,6 +8938,7 @@ mod tests {
         let d = fresh_ingest(&mut known, &buf);
         assert_eq!(d.events.len(), 1);
         assert_eq!(d.dropped, 0, "foreign ack consumes seq 9 — no gap");
+        assert_eq!(d.prefix_unwitnessed, 0);
         assert_eq!(d.loss, 0, "foreign verdict is not our loss");
     }
 
@@ -8892,6 +8958,7 @@ mod tests {
             ),
         );
         assert_eq!(d1.dropped, 0);
+        assert_eq!(d1.prefix_unwitnessed, 0);
         assert_eq!(d1.loss, 0);
         let d2 = seq_ingest(
             &mut known,
@@ -8903,6 +8970,7 @@ mod tests {
             ),
         );
         assert_eq!(d2.dropped, 1);
+        assert_eq!(d2.prefix_unwitnessed, 0);
         assert_eq!(d2.loss, 0);
         // And the stream resyncs (no compounding).
         let d3 = seq_ingest(
@@ -8915,6 +8983,7 @@ mod tests {
             ),
         );
         assert_eq!(d3.dropped, 0);
+        assert_eq!(d3.prefix_unwitnessed, 0);
         assert_eq!(d3.loss, 0);
     }
 
@@ -11520,6 +11589,7 @@ mod tests {
                     events: Vec::new(),
                     loss: 0,
                     dropped: 0,
+                    prefix_unwitnessed: 0,
                     pending: 0,
                 }
             }
@@ -11706,6 +11776,7 @@ mod tests {
                 fork_exec_ignored: 0,
                 lifecycle_loss: 0,
                 lifecycle_dropped: 0,
+                lifecycle_prefix_unwitnessed: 0,
                 lifecycle_no_witness: 0,
                 lifecycle_pending: 0,
                 lifecycle_exec_gap: 0,

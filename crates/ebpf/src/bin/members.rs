@@ -459,6 +459,17 @@ fn skip(tid: u32, op: u64, cause: u8) {
 /// Same arg positions for the core wrapper
 /// ossl_provider_query_operation(prov, op, no_cache) on
 /// 3.0/3.5/4.0. Straight-line: zero loops (R18 §10.3).
+/// Complexity budget (v0.2 gap-accept 11/14): Trailmark 4→35 is
+/// accepted — the growth is 13 straight-line fail-fast gates
+/// (cookie → CTRL → SKIP_ALL → BIRTH → governor → bucket → SEQ →
+/// SCAN take → RCOUNT reset → SCAN publish → admit effects), each
+/// exiting through the uniform skip path; the dispatch walk stays
+/// bounded at MAX_DISPATCH=128 rows (walk_dispatch). No
+/// duplicate decision exists to extract (K-triage no-action), and
+/// I03 preserves verifier-driven shape — do not split for line
+/// count. Revisit only with a demonstrated verifier rejection or
+/// a duplicated gate decision. Verifier acceptance is evidenced
+/// per release by the lane doctor triple-vet (Task 8 receipt).
 #[uprobe]
 pub fn member_entry(ctx: ProbeContext) -> u32 {
     // 1. ATTEMPT bump FIRST (before every exit incl. legacy).
@@ -783,6 +794,15 @@ macro_rules! def_member {
                     }
                 }
                 if let Some(t) = warm_t {
+                    // Member 0 always walks (j=0 ≤ T — see the
+                    // member-0 notes above), so this comparison's
+                    // member_000 expansion is vacuously false by
+                    // construction; the other 511 expansions are
+                    // genuine. One shared macro arm keeps all 512
+                    // members textually identical for the
+                    // verifier — hence the scoped allow, not a
+                    // second arm (v0.2 gap-accept 13/14).
+                    #[allow(unused_comparisons)]
                     if $j > t {
                         // Would-skip path: only a
                         // successfully-read zero pointee skips (a

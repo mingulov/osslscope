@@ -849,6 +849,23 @@ else
     bad "guard 16 mutant: live execution in live-gates fools anywhere-grep, fails scoped check"
 fi
 
+# 60. The doctor probe selects the full triple (v0.2 gap-accept
+# 12/14): user-prefix objects are never implicitly trusted, so
+# the probe must pass the same explicit members object the
+# check step uses.
+if step_text "Probe live capability (doctor)" | grep -q -F -- '--members-object "$PFX/lib/osslscope/osslscope-members"'; then
+    ok "probe step passes --members-object"
+else
+    bad "probe step passes --members-object"
+fi
+
+# 61. The bounded live check selects the full triple.
+if step_text "Bounded live check (known workload)" | grep -q -F -- '--members-object "$PFX/lib/osslscope/osslscope-members"'; then
+    ok "capture step passes --members-object"
+else
+    bad "capture step passes --members-object"
+fi
+
 echo "---"
 echo "pass=$PASS fail=$FAIL"
 [ "$FAIL" -eq 0 ]

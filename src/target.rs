@@ -645,9 +645,9 @@ static SETUP_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 /// lexically. Only `current_dir` (one bounded getcwd, no destination
 /// I/O — never `canonicalize`, whose blocking file I/O the setup path
 /// forbids); a getcwd failure falls back to the lexical key (today's
-/// behavior, never an error). Residual: distinct spellings through
-/// symlinked parents key separately (unresolvable without syscalls —
-/// documented; same class as external writers).
+/// behavior, never an error). Symlinked parents are resolved by
+/// [`canonical_setup_key`] (worker-side); this lexical form is its
+/// documented fallback only.
 fn normalize_setup_key(path: &Path) -> PathBuf {
     use std::path::Component;
     let absolute;
@@ -686,6 +686,109 @@ fn normalize_setup_key(path: &Path) -> PathBuf {
         PathBuf::from(".")
     } else {
         out
+    }
+}
+
+/// Canonical registry key (v0.2 R19): the destination's parent
+/// directory resolved by the kernel (symlinks, `..`, bind
+/// mounts) plus its device/inode identity plus the file name —
+/// `canon:<dev>:<ino>/<file_name>`. Two spellings through
+/// symlinked parents collapse to one key, closing the R19 alias
+/// bypass. WORKER-SIDE ONLY: `canonicalize` + `metadata`
+/// perform blocking file I/O, which the setup caller forbids
+/// (a hung FUSE parent must never hang the caller); callers run
+/// this under [`run_under_control`] (phase 0) and register the
+/// returned key. Fallbacks (documented, fail-open-free): a
+/// relative path whose cwd is unavailable, a path without a file
+/// name, or an unresolvable parent falls back to
+/// [`normalize_setup_key`] — the exact v0.1 lexical behavior —
+/// because such destinations fail later at validation/staging
+/// with byte-identical errors. Residual: a parent directory
+/// replaced between canonicalization and staging create races
+/// the fence (same class as external writers — an uncooperative
+/// local writer renaming parent dirs mid-setup).
+fn canonical_setup_key(path: &Path) -> anyhow::Result<PathBuf> {
+    use std::os::unix::fs::MetadataExt as _;
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(path),
+            Err(_) => return Ok(normalize_setup_key(path)),
+        }
+    };
+    let (Some(parent), Some(name)) = (abs.parent(), abs.file_name()) else {
+        return Ok(normalize_setup_key(path));
+    };
+    let resolved = match std::fs::canonicalize(parent) {
+        Ok(p) => p,
+        Err(_) => return Ok(normalize_setup_key(path)),
+    };
+    let md = match std::fs::metadata(&resolved) {
+        Ok(m) => m,
+        Err(_) => return Ok(normalize_setup_key(path)),
+    };
+    Ok(PathBuf::from(format!(
+        "canon:{}:{}/{}",
+        md.dev(),
+        md.ino(),
+        name.to_string_lossy()
+    )))
+}
+
+/// RAII registry admission (v0.2 R20): owns one
+/// [`registry_try_insert`] entry. Dropping an armed admission
+/// reclaims it, so every caller-side early return (cancel,
+/// expiry, thread-spawn failure, worker loss) cleans up by
+/// construction — the R20 registration→admission wedge cannot
+/// recur. Two deliberate non-drop exits: [`release`](Self::release)
+/// reclaims eagerly on the synchronous paths (idempotent with the
+/// worker's `on_exit` reclaim), and [`disarm`](Self::disarm)
+/// relinquishes ownership WITHOUT reclaiming on the
+/// Cancelled/Expired arms, where the still-live worker owns the
+/// entry and removes it at exit. The abandonment path itself
+/// takes no lock (disarm is a plain field move).
+struct RegistryAdmission {
+    key: Option<PathBuf>,
+    id: u64,
+}
+
+impl RegistryAdmission {
+    /// `display` is the caller's path, named in the refusal error
+    /// (the key may be a `canon:...` alias — never user-facing).
+    fn insert(key: PathBuf, display: &Path) -> anyhow::Result<Self> {
+        let id = registry_try_insert(&key).ok_or_else(|| {
+            anyhow::anyhow!(
+                "workload output {}: another setup for this destination is still in flight (no child spawned)",
+                display.display(),
+            )
+        })?;
+        Ok(Self { key: Some(key), id })
+    }
+
+    fn id(&self) -> u64 {
+        self.id
+    }
+
+    fn release(&mut self) {
+        if let Some(k) = self.key.take() {
+            registry_remove_if(&k, self.id);
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.key = None;
+    }
+
+    #[cfg(test)]
+    fn id_for_test(&self) -> u64 {
+        self.id
+    }
+}
+
+impl Drop for RegistryAdmission {
+    fn drop(&mut self) {
+        self.release();
     }
 }
 
@@ -1417,13 +1520,57 @@ impl OwnedTarget {
                         path.display(),
                     );
                 }
-                let reg_key = normalize_setup_key(path);
-                let Some(reg_id) = registry_try_insert(&reg_key) else {
-                    anyhow::bail!(
-                        "workload output {}: another setup for this destination is still in flight (no child spawned)",
-                        path.display(),
-                    );
+                // Phase 0 (v0.2 R19): canonicalize the destination
+                // identity on a bounded worker (blocking file I/O is
+                // forbidden on the caller). No registry entry exists
+                // yet, so every non-Done arm bails with nothing to
+                // clean — no orphan is constructible here.
+                let owned_path_c = path.clone();
+                // V2-18: phase 0 bypasses the test hooks
+                // (save/clear/restore): `run_under_control` reads the
+                // single-worker hook namespace (startup delay,
+                // completion counter, poll gate), which tests arm for
+                // the main setup worker only — phase 0 must neither
+                // consume nor observe it. Restored before `?` so an
+                // `Err` (worker spawn failure) cannot leak cleared
+                // hooks; production hooks are inert, so this is a
+                // no-op there.
+                let saved_hooks = SETUP_TEST_HOOK.with(|h| {
+                    let mut h = h.borrow_mut();
+                    (
+                        std::mem::replace(&mut h.setup_delay_ms, 0),
+                        h.worker_counter.take(),
+                        h.poll_gate.take(),
+                    )
+                });
+                let canon_result = run_under_control(
+                    deadline,
+                    cancel,
+                    move |_abandoned| canonical_setup_key(&owned_path_c),
+                    None,
+                );
+                SETUP_TEST_HOOK.with(|h| {
+                    let mut h = h.borrow_mut();
+                    h.setup_delay_ms = saved_hooks.0;
+                    h.worker_counter = saved_hooks.1;
+                    h.poll_gate = saved_hooks.2;
+                });
+                let canon =
+                    canon_result.map_err(|e| anyhow::anyhow!("{e:#} (no child spawned)"))?;
+                let reg_key = match canon {
+                    Control::Done(r) => r?,
+                    Control::Cancelled => anyhow::bail!(
+                        "pre-stop setup cancelled before file-sink preparation (no child spawned)"
+                    ),
+                    Control::Expired => anyhow::bail!(
+                        "pre-stop setup deadline exceeded before file-sink preparation (no child spawned)"
+                    ),
+                    Control::Lost => anyhow::bail!(
+                        "pre-stop setup worker lost before file-sink preparation (no child spawned)"
+                    ),
                 };
+                let mut admission = RegistryAdmission::insert(reg_key.clone(), path)?;
+                let worker_id = admission.id();
                 let owned_path = path.clone();
                 let truncate_delay_ms = SETUP_TEST_HOOK.with(|h| h.borrow().truncate_delay_ms);
                 let publish_gate = SETUP_TEST_HOOK.with(|h| h.borrow().publish_gate.clone());
@@ -1453,29 +1600,31 @@ impl OwnedTarget {
                             rename_hold_ready,
                         )
                     },
-                    Some(Box::new(move || registry_remove_if(&reg_key_w, reg_id))),
+                    Some(Box::new(move || registry_remove_if(&reg_key_w, worker_id))),
                 )
                 .map_err(|e| {
-                    registry_remove_if(&reg_key, reg_id);
+                    admission.release();
                     anyhow::anyhow!("{e:#} (no child spawned)")
                 })?;
                 let published = match prep {
                     Control::Done(r) => {
-                        registry_remove_if(&reg_key, reg_id);
+                        admission.release();
                         r?
                     }
                     Control::Cancelled => {
+                        admission.disarm();
                         anyhow::bail!(
                             "pre-stop setup cancelled during file-sink preparation (no child spawned)"
                         );
                     }
                     Control::Expired => {
+                        admission.disarm();
                         anyhow::bail!(
                             "pre-stop setup deadline exceeded during file-sink preparation (no child spawned)"
                         );
                     }
                     Control::Lost => {
-                        registry_remove_if(&reg_key, reg_id);
+                        admission.release();
                         anyhow::bail!(
                             "pre-stop setup worker lost during file-sink preparation (no child spawned)"
                         );
@@ -2376,6 +2525,27 @@ mod control_tests {
     }
 
     #[test]
+    fn setup_key_canonicalizes_symlinked_parent_dirs() {
+        use super::canonical_setup_key;
+        let root = std::env::temp_dir().join(format!("r06-canon-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("real")).unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("link")).unwrap();
+        let a = canonical_setup_key(&root.join("real").join("w.log")).unwrap();
+        let b = canonical_setup_key(&root.join("link").join("w.log")).unwrap();
+        assert_eq!(a, b, "symlinked parents fence together: {a:?} vs {b:?}");
+        let other = canonical_setup_key(&root.join("real").join("other.log")).unwrap();
+        assert_ne!(a, other, "distinct names still fence apart");
+        let missing = canonical_setup_key(&root.join("no-such-dir").join("w.log")).unwrap();
+        assert_eq!(
+            missing,
+            super::normalize_setup_key(&root.join("no-such-dir").join("w.log")),
+            "unresolvable parents fall back to the lexical key"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn control_early_cancel_and_expiry_run_on_exit() {
         // R06-b: registration precedes run_under_control, so the
         // early Cancelled/Expired returns (worker never spawned)
@@ -2440,5 +2610,95 @@ mod control_tests {
         registry_remove_if(&key, id2);
         let id3 = registry_try_insert(&key).expect("registry is empty afterwards");
         registry_remove_if(&key, id3);
+    }
+
+    #[test]
+    fn registry_admission_drop_releases_entry() {
+        let key = super::normalize_setup_key(std::path::Path::new("/tmp/r06-guard-a.log"));
+        {
+            let _held =
+                super::RegistryAdmission::insert(key.clone(), &key).expect("first insert wins");
+            assert!(
+                super::registry_try_insert(&key).is_none(),
+                "live admission refuses"
+            );
+        }
+        let id = super::registry_try_insert(&key).expect("drop must release the entry");
+        super::registry_remove_if(&key, id);
+    }
+
+    #[test]
+    fn registry_admission_disarm_survives_drop_for_live_worker() {
+        let key = super::normalize_setup_key(std::path::Path::new("/tmp/r06-guard-b.log"));
+        let id = {
+            let mut held =
+                super::RegistryAdmission::insert(key.clone(), &key).expect("first insert wins");
+            held.disarm();
+            held.id_for_test()
+        };
+        assert!(
+            super::registry_try_insert(&key).is_none(),
+            "disarmed drop must keep the worker entry"
+        );
+        super::registry_remove_if(&key, id);
+        let id2 = super::registry_try_insert(&key).expect("worker reclaim still releases");
+        super::registry_remove_if(&key, id2);
+    }
+
+    #[test]
+    fn registry_admission_refusal_reports_user_path() {
+        // V2-19: the refusal names the caller's path, never the
+        // registry key (a `canon:...` alias in the Task-2 case).
+        // Pin the exact pre-Task-3 text in both cases.
+        let expected = |display: &std::path::Path| {
+            format!(
+                "workload output {}: another setup for this destination is still in flight (no child spawned)",
+                display.display(),
+            )
+        };
+        let refusal_text = |key: std::path::PathBuf, display: &std::path::Path| {
+            let mut held =
+                super::RegistryAdmission::insert(key.clone(), display).expect("first insert wins");
+            let err = match super::RegistryAdmission::insert(key, display) {
+                Ok(_) => panic!("live admission refuses"),
+                Err(e) => e,
+            };
+            held.release();
+            err.to_string()
+        };
+        // Plain case: user path and key agree.
+        let user = std::path::PathBuf::from("/tmp/r06-guard-msg-plain.log");
+        let key = super::normalize_setup_key(&user);
+        assert_eq!(refusal_text(key, &user), expected(&user));
+        // Alias case: symlinked parent spellings key canonically.
+        let root = std::env::temp_dir().join(format!("r06-guard-msg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("real")).unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("link")).unwrap();
+        let alias_user = root.join("link").join("w.log");
+        let alias_key = super::canonical_setup_key(&alias_user).unwrap();
+        assert!(
+            alias_key.to_string_lossy().starts_with("canon:"),
+            "alias fixture must key canonically: {alias_key:?}"
+        );
+        let alias_msg = refusal_text(alias_key, &alias_user);
+        assert_eq!(alias_msg, expected(&alias_user));
+        assert!(
+            !alias_msg.contains("canon:"),
+            "refusal must never leak the registry key: {alias_msg}"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn registry_admission_release_is_idempotent_with_worker_reclaim() {
+        let key = super::normalize_setup_key(std::path::Path::new("/tmp/r06-guard-c.log"));
+        let mut held =
+            super::RegistryAdmission::insert(key.clone(), &key).expect("first insert wins");
+        let id = held.id_for_test();
+        held.release();
+        super::registry_remove_if(&key, id);
+        let id2 = super::registry_try_insert(&key).expect("double reclaim must stay idempotent");
+        super::registry_remove_if(&key, id2);
     }
 }

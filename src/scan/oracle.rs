@@ -762,7 +762,12 @@ impl LateScope {
         // so even a proven-looking terminator is suspect —
         // keep every slot (the contract keeps slots and
         // forces op UNKNOWN; a spurious recovery finding is
-        // noise, silenced recovery is loss).
+        // noise, silenced recovery is loss). Deliberate F6
+        // consequence (R19 concern 4, P-triage no-action,
+        // v0.2 gap-accept 10/14): scoping tainted verdicts to
+        // Through(t) would discard required-prefix recovery
+        // evidence — the F6-H defect. Revisit only with
+        // straggler-precision evidence from live traffic.
         if matches!(outcome, Outcome::Tainted { .. }) {
             return LateScope::All;
         }
@@ -2736,5 +2741,56 @@ mod tests {
         assert!(o.done.is_empty());
         let findings = o.take_findings();
         assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn late_scope_tainted_keeps_every_slot_despite_proven_terminator() {
+        // v0.2 gap-accept 10/14 (R19 concern 4): tainted verdicts
+        // rest on mixed evidence, so even a proven-looking
+        // terminator is suspect — beyond-T stragglers emit
+        // recovery findings (noise), never silence (loss).
+        let scope = super::LateScope::of(
+            &super::Outcome::Tainted { by_seq: 7 },
+            super::TrueT::Proven(3),
+        );
+        assert_eq!(scope, super::LateScope::All);
+    }
+
+    #[test]
+    fn late_scope_tainted_empty_table_keeps_every_slot() {
+        let scope = super::LateScope::of(
+            &super::Outcome::Tainted { by_seq: 7 },
+            super::TrueT::EmptyTable,
+        );
+        assert_eq!(scope, super::LateScope::All);
+    }
+
+    #[test]
+    fn late_scope_proven_untainted_scopes_through_terminator() {
+        // Control: the scoping half of the F6 contract — a proven
+        // terminator on untainted evidence bounds recovery.
+        let scope = super::LateScope::of(
+            &super::Outcome::Complete {
+                true_t: 3,
+                cached: false,
+            },
+            super::TrueT::Proven(3),
+        );
+        assert_eq!(scope, super::LateScope::Through(3));
+    }
+
+    #[test]
+    fn late_scope_candidate_and_unknown_keep_every_slot() {
+        // Control: unproven terminators never scope (F6-H).
+        for true_t in [super::TrueT::Candidate(3), super::TrueT::Unknown] {
+            let scope = super::LateScope::of(
+                &super::Outcome::Complete {
+                    true_t: 3,
+                    cached: false,
+                },
+                true_t,
+            );
+            assert_eq!(scope, super::LateScope::All);
+        }
     }
 }
