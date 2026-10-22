@@ -15,7 +15,7 @@
 //! /usr/include/linux/bpf.h + aya-obj bindings).
 use std::ffi::CStr;
 use std::io;
-use std::os::fd::{FromRawFd as _, OwnedFd, RawFd};
+use std::os::fd::{FromRawFd as _, IntoRawFd as _, OwnedFd, RawFd};
 
 pub const BPF_MAP_CREATE: u32 = 0;
 pub const BPF_MAP_LOOKUP_ELEM: u32 = 1;
@@ -145,6 +145,28 @@ struct ElemAttr {
     key: u64,
     value: u64,
     flags: u64,
+}
+
+/// Close an owned descriptor once using Linux's raw `SYS_close` syscall.
+///
+/// Ownership is consumed before the syscall. Only return value zero is success;
+/// an error preserves errno and never restores ownership or retries the numeric
+/// descriptor, which Linux may already have released and reused even on EINTR.
+/// This explicit result, unlike `OwnedFd`'s destructor, can acknowledge failure.
+pub fn close_owned(fd: OwnedFd) -> io::Result<()> {
+    close_owned_with(fd, |raw| {
+        // SAFETY: ownership was consumed before this single Linux close syscall.
+        let result = unsafe { libc::syscall(libc::SYS_close, raw) };
+        match result {
+            0 => Ok(()),
+            -1 => Err(io::Error::last_os_error()),
+            _ => Err(io::Error::other("close syscall returned a nonzero result")),
+        }
+    })
+}
+
+fn close_owned_with(fd: OwnedFd, call: impl FnOnce(RawFd) -> io::Result<()>) -> io::Result<()> {
+    call(fd.into_raw_fd())
 }
 
 fn bpf(cmd: u32, attr: *mut std::ffi::c_void, size: usize) -> io::Result<i32> {
@@ -549,6 +571,153 @@ pub fn token_create(bpffs_fd: RawFd) -> io::Result<OwnedFd> {
 mod tests {
     use super::*;
     use std::io::ErrorKind;
+
+    use std::os::fd::AsRawFd as _;
+    use std::sync::Mutex;
+
+    static G1_FD_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn pipe() -> (OwnedFd, OwnedFd) {
+        let mut fds = [-1; 2];
+        // SAFETY: pipe2 writes two fresh descriptor numbers into this array.
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        // SAFETY: both successful pipe2 results are fresh and uniquely owned.
+        unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
+    }
+
+    fn high_pipe() -> (OwnedFd, OwnedFd) {
+        let (read, write) = pipe();
+        // Keep the tested number away from ordinary harness allocations while
+        // it is briefly closed, before dup2 installs the controlled replacement.
+        // SAFETY: read is live and F_DUPFD_CLOEXEC returns a fresh descriptor.
+        let raw = unsafe { libc::fcntl(read.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 256) };
+        assert!(raw >= 256, "{}", io::Error::last_os_error());
+        // SAFETY: the successful duplicate is fresh and uniquely owned.
+        (unsafe { OwnedFd::from_raw_fd(raw) }, write)
+    }
+
+    fn fd_is_open(raw: RawFd) -> bool {
+        // SAFETY: F_GETFD only queries the number, including when it is closed.
+        let result = unsafe { libc::fcntl(raw, libc::F_GETFD) };
+        if result == -1 {
+            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+            false
+        } else {
+            true
+        }
+    }
+
+    // A raw owner is deliberate: if a regressed implementation closes the
+    // replacement, cleanup must not drop an invalid OwnedFd or close it twice.
+    // Arm it before handing ownership to the helper so early failures also clean up.
+    struct Replacement(Option<RawFd>);
+
+    impl Replacement {
+        fn install(&mut self, source: RawFd, destination: RawFd) {
+            assert_eq!(self.0, Some(destination));
+            // SAFETY: source is a live borrowed pipe end; destination was just
+            // closed by the injected call. No other test uses this high number.
+            assert_eq!(unsafe { libc::dup2(source, destination) }, destination);
+            self.0 = Some(destination);
+        }
+    }
+
+    impl Drop for Replacement {
+        fn drop(&mut self) {
+            if let Some(raw) = self.0.take() {
+                // Do not close twice if the implementation under test already
+                // closed the replacement. This also makes assertion unwinding safe.
+                // SAFETY: F_GETFD accepts any numeric descriptor.
+                let result = unsafe { libc::fcntl(raw, libc::F_GETFD) };
+                let already_closed =
+                    result == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::EBADF);
+                if !already_closed {
+                    // SAFETY: this fixture uniquely owns the installed duplicate.
+                    unsafe { libc::close(raw) };
+                }
+            }
+        }
+    }
+
+    fn legacy_ignored_result_close_owned_with(
+        fd: OwnedFd,
+        call: impl FnOnce(RawFd) -> io::Result<()>,
+    ) -> io::Result<()> {
+        // Negative control: the old ignored-result policy fabricates a receipt.
+        let _ = call(fd.into_raw_fd());
+        Ok(())
+    }
+
+    #[test]
+    fn g1_close_success_consumes_once() {
+        let _lock = G1_FD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (read, write) = high_pipe();
+        let raw = read.as_raw_fd();
+        let _cleanup = Replacement(Some(raw));
+        let result = close_owned(read);
+        result.expect("a real pipe close must succeed");
+        assert!(!fd_is_open(raw), "the consumed descriptor must be EBADF");
+        assert!(fd_is_open(write.as_raw_fd()), "the peer must survive");
+    }
+
+    #[test]
+    fn g1_close_eintr_never_retries_reused_fd() {
+        let _lock = G1_FD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for errno in [libc::EINTR, libc::EBADF, libc::EIO] {
+            let (read, write) = high_pipe();
+            let raw = read.as_raw_fd();
+            let mut replacement = Replacement(Some(raw));
+            let mut calls = 0;
+            let result = close_owned_with(read, |number| {
+                calls += 1;
+                assert_eq!(number, raw);
+                // SAFETY: the injected operation receives the consumed end and
+                // really closes it before installing a new descriptor there.
+                assert_eq!(unsafe { libc::syscall(libc::SYS_close, number) }, 0);
+                replacement.install(write.as_raw_fd(), number);
+                Err(io::Error::from_raw_os_error(errno))
+            });
+            assert_eq!(calls, 1);
+            assert!(fd_is_open(raw), "an extra close killed the replacement");
+            assert!(fd_is_open(write.as_raw_fd()), "the peer must survive");
+            assert_eq!(result.unwrap_err().raw_os_error(), Some(errno));
+        }
+    }
+
+    #[test]
+    fn g1_close_error_is_not_acknowledged() {
+        let _lock = G1_FD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (read, write) = high_pipe();
+        let raw = read.as_raw_fd();
+        let _cleanup = Replacement(Some(raw));
+        let result = close_owned_with(read, |number| {
+            // SAFETY: this is the one close of the consumed pipe end.
+            assert_eq!(unsafe { libc::syscall(libc::SYS_close, number) }, 0);
+            Err(io::Error::from_raw_os_error(libc::EIO))
+        });
+        assert!(!fd_is_open(raw));
+        assert!(fd_is_open(write.as_raw_fd()));
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EIO));
+    }
+
+    #[test]
+    fn g1_close_legacy_ignored_result_negative_control() {
+        let _lock = G1_FD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (read, write) = high_pipe();
+        let raw = read.as_raw_fd();
+        let _cleanup = Replacement(Some(raw));
+        let result = legacy_ignored_result_close_owned_with(read, |number| {
+            // SAFETY: this is the one close of the consumed pipe end.
+            assert_eq!(unsafe { libc::syscall(libc::SYS_close, number) }, 0);
+            Err(io::Error::from_raw_os_error(libc::EIO))
+        });
+        assert!(
+            result.is_ok(),
+            "the negative control ignores a real failure"
+        );
+        assert!(!fd_is_open(raw));
+        assert!(fd_is_open(write.as_raw_fd()));
+    }
 
     const OURS: u64 = 0x7fff_0000;
 
