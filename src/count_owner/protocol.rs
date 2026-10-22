@@ -336,3 +336,236 @@ impl IdCounter {
         Self { last }
     }
 }
+
+#[derive(Debug)]
+pub struct AttachRequest {
+    pub seq: CommandSeq,
+    pub deadline: std::time::Instant,
+    pub expected_backing: BackingIdentity,
+    pub locator: String,
+    pub offsets: Vec<u64>,
+    pub cookies: Vec<u64>,
+}
+impl AttachRequest {
+    pub(super) fn validate(&self) -> Result<(), OwnerFailure> {
+        if self.offsets.is_empty()
+            || self.offsets.len() > 8192
+            || self.offsets.len() != self.cookies.len()
+            || self.locator.is_empty()
+            || self.locator.len() > 4095
+            || self.locator.as_bytes().contains(&0)
+        {
+            return Err(OwnerFailure::engine(
+                CountOperation::Attach,
+                FailureClass::InvalidInput,
+            ));
+        }
+        Ok(())
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachRefusalReason {
+    Unreadable,
+    Replaced,
+    KernelRefused,
+    Capacity,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttachRefusal {
+    pub position: usize,
+    pub reason: AttachRefusalReason,
+}
+#[derive(Debug)]
+pub struct AttachAck<Link> {
+    pub links: Vec<Link>,
+    pub refused: Vec<AttachRefusal>,
+}
+#[derive(Debug)]
+pub struct CommandAck<T> {
+    pub seq: CommandSeq,
+    pub value: T,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandCompletion {
+    NotEntered,
+    Completed,
+    Unknown,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommandFailure {
+    pub seq: CommandSeq,
+    pub failure: OwnerFailure,
+    pub completion: CommandCompletion,
+    pub cleanup_ticket: Option<CleanupTicket>,
+}
+impl CommandFailure {
+    /// Projection is outside bounded owner state and is consumed by the session.
+    pub fn capacity_loss(&self) -> Option<crate::evidence::GapCounter> {
+        (self.failure.class == FailureClass::Capacity).then(|| crate::evidence::GapCounter {
+            name: "count.owner_capacity".into(),
+            kind: crate::evidence::CounterKind::Loss,
+            units: crate::evidence::CounterUnits::Events,
+            source: crate::evidence::CounterSource::Attach,
+            value: 1,
+        })
+    }
+}
+pub type CommandResult<T> = Result<CommandAck<T>, CommandFailure>;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingCommandId {
+    pub seq: CommandSeq,
+    pub operation: CountOperation,
+}
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ControllerFrontier {
+    pub last_acked: Option<CommandSeq>,
+    pub acknowledged_links: Vec<LinkId>,
+    pub pending: Option<PendingCommandId>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriterIdentity {
+    pub owner_epoch: OwnerEpoch,
+    pub object_sha256: [u8; 32],
+    // Epoch + named registry slot uniquely identifies each actual tracked load;
+    // no link/map census or descriptor alias is needed to inspect identity.
+    pub program: ResourceId,
+    pub maps: [ResourceId; 7],
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttachedMembership {
+    pub offset: u64,
+    pub cookie: u64,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreateOutcome {
+    Creating,
+    Succeeded,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublicationState {
+    Unpublished,
+    Published,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreationRecord {
+    pub id: LinkId,
+    pub command: CommandSeq,
+    pub writer: WriterIdentity,
+    pub backing: BackingIdentity,
+    pub pin_slot: usize,
+    /// Exact range in SealedInventory::memberships (one epoch-wide bounded pool).
+    pub memberships: std::ops::Range<usize>,
+    pub outcome: CreateOutcome,
+    pub publication: PublicationState,
+    pub close_state: ResourceState,
+    pub close_errno: Option<i32>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InventoryFailure {
+    Duplicate,
+    Missing,
+    Frontier,
+    Unresolved,
+    Membership,
+    AlreadySealed,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SealedInventory {
+    pub owner_epoch: OwnerEpoch,
+    pub writer: WriterIdentity,
+    pub records: Vec<CreationRecord>,
+    pub memberships: Vec<AttachedMembership>,
+    pub acknowledged_links: Vec<LinkId>,
+    pub unpublished_links: Vec<LinkId>,
+    pub last_acked: Option<CommandSeq>,
+    pub pending: Option<PendingCommandId>,
+}
+impl SealedInventory {
+    pub fn validate(&self, frontier: &ControllerFrontier) -> Result<(), InventoryFailure> {
+        if self.last_acked != frontier.last_acked || self.pending != frontier.pending {
+            return Err(InventoryFailure::Frontier);
+        }
+        if self.records.len() > 8192
+            || self.memberships.len() > 8192
+            || self.acknowledged_links.len() > 8192
+            || self.unpublished_links.len() > 8192
+            || frontier.acknowledged_links.len() > 8192
+        {
+            return Err(InventoryFailure::Frontier);
+        }
+        for (i, id) in frontier.acknowledged_links.iter().enumerate() {
+            if frontier.acknowledged_links[..i].contains(id) {
+                return Err(InventoryFailure::Duplicate);
+            }
+            if !self.acknowledged_links.contains(id) {
+                return Err(InventoryFailure::Missing);
+            }
+        }
+        if self.acknowledged_links.len() != frontier.acknowledged_links.len()
+            || self.records.len() != self.acknowledged_links.len() + self.unpublished_links.len()
+            || self.records.len() > 8192
+            || self.memberships.len() > 8192
+        {
+            return Err(InventoryFailure::Missing);
+        }
+        let mut end = 0;
+        for (i, record) in self.records.iter().enumerate() {
+            if record.id.owner_epoch != self.owner_epoch
+                || record.writer.owner_epoch != self.owner_epoch
+                || record.writer != self.writer
+                || record.outcome != CreateOutcome::Succeeded
+            {
+                return Err(InventoryFailure::Unresolved);
+            }
+            if self.records[..i].iter().any(|r| r.id == record.id) {
+                return Err(InventoryFailure::Duplicate);
+            }
+            if i > 0 && self.records[i - 1].id.serial >= record.id.serial {
+                return Err(InventoryFailure::Frontier);
+            }
+            if record.memberships.start != end
+                || record.memberships.end <= end
+                || record.memberships.end > self.memberships.len()
+            {
+                return Err(InventoryFailure::Membership);
+            }
+            end = record.memberships.end;
+            let acknowledged = self
+                .acknowledged_links
+                .iter()
+                .filter(|id| **id == record.id)
+                .count();
+            let unpublished = self
+                .unpublished_links
+                .iter()
+                .filter(|id| **id == record.id)
+                .count();
+            if acknowledged + unpublished != 1 {
+                return Err(InventoryFailure::Missing);
+            }
+            if acknowledged == 1 {
+                if record.publication != PublicationState::Published
+                    || self.last_acked.is_none_or(|seq| record.command > seq)
+                {
+                    return Err(InventoryFailure::Frontier);
+                }
+            } else if self.pending
+                != Some(PendingCommandId {
+                    seq: record.command,
+                    operation: CountOperation::Attach,
+                })
+            {
+                return Err(InventoryFailure::Frontier);
+            }
+        }
+        if end != self.memberships.len() {
+            return Err(InventoryFailure::Membership);
+        }
+        Ok(())
+    }
+}
+impl LinkToken {
+    pub(super) fn new(id: LinkId) -> Self {
+        Self { id }
+    }
+}

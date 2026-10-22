@@ -7,8 +7,8 @@ use std::io;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::time::Instant;
 
-// The remaining methods are the binding interfaces for the serial attach/read
-// tasks. The live implementation is real even before those handlers are wired.
+// The remaining map methods are the binding interfaces for the serial read
+// task. The live implementation is real before that handler is wired.
 #[allow(dead_code)]
 pub(crate) trait CountIoDriver: Send {
     fn map_create(&mut self, spec: &MapSpecLite) -> io::Result<OwnedFd>;
@@ -92,7 +92,7 @@ impl CountIoDriver for LiveCountIoDriver {
         // SAFETY: fstat succeeded.
         let stat = unsafe { stat.assume_init() };
         Ok(BackingIdentity {
-            device: stat.st_dev,
+            device: crate::plan::encode_device(libc::major(stat.st_dev), libc::minor(stat.st_dev)),
             inode: stat.st_ino,
         })
     }

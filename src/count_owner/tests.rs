@@ -20,6 +20,13 @@ enum Event {
     EnterClose,
     Closed(Option<i32>),
     LogBuffer(usize),
+    PinOpen,
+    PinOpened(i32),
+    PinIdentity(i32),
+    AttachEntered(usize, Vec<u64>, Vec<u64>, String),
+    AttachCreated(usize),
+    PinClose,
+    PinCloseResult(Option<i32>),
 }
 struct InvocationLog {
     events: Vec<(ThreadId, Event)>,
@@ -1257,4 +1264,1554 @@ fn count_elf() -> Vec<u8> {
         }
     }
     elf
+}
+
+// Task 3 tests use real pipe descriptors and an invocation log independent of
+// the registry. A syscall attempt ordinal is the expected never-reused serial.
+#[derive(Clone, Copy, Default)]
+enum IdentityFault {
+    #[default]
+    None,
+    Io,
+    Replaced,
+    Panic,
+    Hold,
+}
+#[derive(Default)]
+struct AttachFaults {
+    open_error: bool,
+    open_errno: Option<i32>,
+    attach_errno: Option<i32>,
+    attach_errno_from: usize,
+    identity: IdentityFault,
+    bad_offset: Option<u64>,
+    all_bad: bool,
+    hold_attempt: Option<usize>,
+    hold_pin_close: bool,
+    pin_close_errno: Option<i32>,
+    real_pin: bool,
+    post_handler_clock_panic: bool,
+}
+struct AttachDriver {
+    base: PipeDriver,
+    faults: AttachFaults,
+    pin: Option<i32>,
+    attaches: usize,
+    clock_after_create: std::cell::Cell<usize>,
+}
+impl CountIoDriver for AttachDriver {
+    fn map_create(&mut self, s: &crate::loader::MapSpecLite) -> io::Result<OwnedFd> {
+        self.base.map_create(s)
+    }
+    fn load_program(&mut self, i: &[u8], n: &str, l: Option<&mut [u8]>) -> io::Result<OwnedFd> {
+        self.base.load_program(i, n, l)
+    }
+    fn open_pin(&mut self, locator: &CStr) -> io::Result<OwnedFd> {
+        self.base.probe.event(Event::PinOpen);
+        if let Some(errno) = self.faults.open_errno {
+            return Err(io::Error::from_raw_os_error(errno));
+        }
+        if self.faults.open_error {
+            return Err(io::Error::from_raw_os_error(libc::ENOENT));
+        }
+        let pin = if self.faults.real_pin {
+            self.base.attempts += 1;
+            self.base
+                .probe
+                .event(Event::EnterAcquire(self.base.attempts));
+            let pin = LiveCountIoDriver.open_pin(locator)?;
+            self.base.acquired += 1;
+            self.base.probe.event(Event::Acquired(self.base.acquired));
+            pin
+        } else {
+            self.base.acquire()?
+        };
+        self.pin = Some(pin.as_raw_fd());
+        self.base.probe.event(Event::PinOpened(pin.as_raw_fd()));
+        Ok(pin)
+    }
+    fn pin_identity(&mut self, pin: BorrowedFd<'_>) -> io::Result<BackingIdentity> {
+        assert_eq!(Some(pin.as_raw_fd()), self.pin);
+        self.base.probe.event(Event::PinIdentity(pin.as_raw_fd()));
+        if self.faults.real_pin {
+            return LiveCountIoDriver.pin_identity(pin);
+        }
+        match self.faults.identity {
+            IdentityFault::Io => return Err(io::Error::from_raw_os_error(libc::EIO)),
+            IdentityFault::Replaced => {
+                return Ok(BackingIdentity {
+                    device: 1,
+                    inode: 3,
+                });
+            }
+            IdentityFault::Panic => panic!("installed-pin fstat unwind control"),
+            IdentityFault::Hold => self.base.probe.hold(),
+            IdentityFault::None => {}
+        }
+        Ok(BackingIdentity {
+            device: 1,
+            inode: 2,
+        })
+    }
+    fn attach(
+        &mut self,
+        _: BorrowedFd<'_>,
+        path: &CStr,
+        offsets: &[u64],
+        cookies: &[u64],
+        tgid: u32,
+    ) -> io::Result<OwnedFd> {
+        self.attaches += 1;
+        assert_eq!(tgid, 1);
+        let path = path.to_str().unwrap().to_owned();
+        assert_eq!(path, format!("/proc/self/fd/{}", self.pin.unwrap()));
+        self.base.probe.event(Event::AttachEntered(
+            self.attaches,
+            offsets.to_vec(),
+            cookies.to_vec(),
+            path,
+        ));
+        if self.faults.hold_attempt == Some(self.attaches) {
+            self.base.probe.hold();
+        }
+        if let Some(errno) = self
+            .faults
+            .attach_errno
+            .filter(|_| self.attaches >= self.faults.attach_errno_from)
+        {
+            return Err(io::Error::from_raw_os_error(errno));
+        }
+        if self.faults.all_bad
+            || self
+                .faults
+                .bad_offset
+                .is_some_and(|bad| offsets.contains(&bad))
+        {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        let fd = self.base.acquire()?;
+        self.base.probe.event(Event::AttachCreated(self.attaches));
+        Ok(fd)
+    }
+    unsafe fn update(&mut self, _: BorrowedFd<'_>, _: &[u8], _: &[u8]) -> io::Result<()> {
+        unreachable!()
+    }
+    unsafe fn lookup(&mut self, _: BorrowedFd<'_>, _: &[u8], _: &mut [u8]) -> io::Result<()> {
+        unreachable!()
+    }
+    unsafe fn next_key(
+        &mut self,
+        _: BorrowedFd<'_>,
+        _: Option<&[u8]>,
+        _: &mut [u8],
+    ) -> io::Result<()> {
+        unreachable!()
+    }
+    fn close(&mut self, fd: OwnedFd) -> io::Result<()> {
+        if self.pin == Some(fd.as_raw_fd()) {
+            let fd = std::mem::ManuallyDrop::new(fd);
+            self.base.probe.event(Event::PinClose);
+            if self.faults.hold_pin_close {
+                self.base.probe.hold();
+            }
+            let result = self.base.close(std::mem::ManuallyDrop::into_inner(fd));
+            if let Some(errno) = self.faults.pin_close_errno {
+                result.unwrap();
+                self.base.probe.event(Event::PinCloseResult(Some(errno)));
+                return Err(io::Error::from_raw_os_error(errno));
+            }
+            self.base.probe.event(Event::PinCloseResult(
+                result.as_ref().err().and_then(io::Error::raw_os_error),
+            ));
+            return result;
+        }
+        self.base.close(fd)
+    }
+    fn now(&self) -> Instant {
+        if self.faults.post_handler_clock_panic && self.attaches > 0 {
+            let n = self.clock_after_create.get() + 1;
+            self.clock_after_create.set(n);
+            assert_ne!(n, 2, "post-attach clock unwind control");
+        }
+        Instant::now()
+    }
+    fn monotonic_ns(&self) -> Option<u64> {
+        Some(1)
+    }
+}
+fn attach_engine(
+    probe: &Arc<Probe>,
+    faults: AttachFaults,
+    links: usize,
+    fail_publication: bool,
+) -> CountEngine {
+    let observed = Arc::clone(probe);
+    let mut hooks = PrepareHooks::host();
+    hooks.registry_observer = Some(Arc::new(move |event| {
+        observed.event(Event::Registry(event))
+    }));
+    hooks.fail_attach_publication = fail_publication;
+    let probe = Arc::clone(probe);
+    CountEngine::prepare_with(
+        input(Arc::new(CountForkBarrier::new())),
+        CountOwnerLimits::from_allowance((links as u64) * 2 + 16, 2).unwrap(),
+        Instant::now() + Duration::from_secs(5),
+        hooks,
+        move || {
+            probe.event(Event::Started);
+            AttachDriver {
+                base: PipeDriver {
+                    probe,
+                    faults: Faults::default(),
+                    deadline: Instant::now(),
+                    attempts: 0,
+                    acquired: 0,
+                    closes: 0,
+                },
+                faults,
+                pin: None,
+                attaches: 0,
+                clock_after_create: std::cell::Cell::new(0),
+            }
+        },
+        spawn_owner,
+    )
+    .unwrap()
+}
+fn attach_request(seq: u64, n: usize) -> AttachRequest {
+    AttachRequest {
+        seq: CommandSeq::checked(seq).unwrap(),
+        deadline: Instant::now() + Duration::from_secs(10),
+        expected_backing: BackingIdentity {
+            device: 1,
+            inode: 2,
+        },
+        locator: "/provider".into(),
+        offsets: (0..n as u64).collect(),
+        cookies: (100..100 + n as u64).collect(),
+    }
+}
+fn task3_inventory(engine: &CountEngine) -> Result<SealedInventory, InventoryFailure> {
+    let cutoff = Instant::now() + Duration::from_secs(5);
+    let mut state = locked(&engine.shared.state);
+    loop {
+        if let Some(inventory) = &state.inventory {
+            return inventory.clone();
+        }
+        let remaining = cutoff.saturating_duration_since(Instant::now());
+        assert!(!remaining.is_zero(), "owner did not seal inventory");
+        state = engine
+            .shared
+            .changed
+            .wait_timeout(state, remaining)
+            .unwrap()
+            .0;
+    }
+}
+fn task3_cleanup(probe: &Probe, expected: usize) {
+    probe.wait(|events| {
+        events
+            .iter()
+            .filter(|(_, e)| matches!(e, Event::Closed(_)))
+            .count()
+            == expected
+            && events
+                .iter()
+                .filter(|(_, e)| matches!(e, Event::Registry(RegistryEvent::CloseReturned(_))))
+                .count()
+                == expected
+    });
+    let log = probe.log.lock().unwrap();
+    assert_eq!(
+        log.events
+            .iter()
+            .filter(|(_, e)| matches!(e, Event::Acquired(_)))
+            .count(),
+        expected
+    );
+    assert_eq!(
+        log.events
+            .iter()
+            .filter(|(_, e)| matches!(e, Event::EnterClose))
+            .count(),
+        expected
+    );
+    let owner = log
+        .events
+        .iter()
+        .find(|(_, e)| matches!(e, Event::Started))
+        .unwrap()
+        .0;
+    assert_ne!(owner, std::thread::current().id());
+    assert!(
+        log.events
+            .iter()
+            .filter(|(_, e)| !matches!(e, Event::Mailbox(_)))
+            .all(|(thread, _)| *thread == owner),
+        "count I/O or registry work escaped the prepared owner"
+    );
+    assert_eq!(
+        log.events
+            .iter()
+            .filter(|(_, e)| matches!(e, Event::Registry(RegistryEvent::CloseIssued(_))))
+            .count(),
+        expected
+    );
+    assert_eq!(
+        log.events
+            .iter()
+            .filter(|(_, e)| matches!(e, Event::Registry(RegistryEvent::CloseReturned(_))))
+            .count(),
+        expected
+    );
+    // This bounded pipe oracle accounts for the existing raw-fork CLOEXEC
+    // fixture, and grants no writer-completion or fork-permit credit.
+    for witness in &log.witnesses {
+        let mut p = libc::pollfd {
+            fd: witness.as_raw_fd(),
+            events: 0,
+            revents: 0,
+        };
+        let cutoff = Instant::now() + Duration::from_secs(3);
+        loop {
+            let remaining = cutoff.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "independent pipe still has a reader");
+            // SAFETY: p is a live initialized one-element poll array.
+            let result = unsafe { libc::poll(&mut p, 1, remaining.as_millis().max(1) as i32) };
+            if result < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            assert_eq!(result, 1);
+            assert_ne!(p.revents & libc::POLLERR, 0);
+            break;
+        }
+    }
+}
+fn independent_successes(probe: &Probe) -> Vec<u64> {
+    probe
+        .log
+        .lock()
+        .unwrap()
+        .events
+        .iter()
+        .filter_map(|(_, e)| {
+            if let Event::AttachCreated(n) = e {
+                Some(*n as u64)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn g1_unpublished_bisection_survivor() {
+    // Dropping a successful-but-unpublished survivor or its pin must fail this
+    // independent syscall/journal equality and exact owner cleanup control.
+    let probe = Probe::new();
+    let engine = attach_engine(
+        &probe,
+        AttachFaults {
+            bad_offset: Some(1),
+            ..Default::default()
+        },
+        3,
+        true,
+    );
+    let failure = engine.attach(attach_request(1, 3)).unwrap_err();
+    assert_eq!(failure.failure.class, FailureClass::Publication);
+    assert_eq!(failure.completion, CommandCompletion::Completed);
+    assert!(failure.cleanup_ticket.is_some());
+    let inventory = task3_inventory(&engine).unwrap();
+    assert_eq!(independent_successes(&probe), vec![2, 5]);
+    assert_eq!(
+        inventory
+            .records
+            .iter()
+            .map(|r| r.id.serial.value())
+            .collect::<Vec<_>>(),
+        vec![2, 5]
+    );
+    assert_eq!(inventory.unpublished_links.len(), 2);
+    assert!(inventory.acknowledged_links.is_empty());
+    assert_eq!(
+        inventory
+            .memberships
+            .iter()
+            .map(|m| (m.offset, m.cookie))
+            .collect::<Vec<_>>(),
+        vec![(0, 100), (2, 102)]
+    );
+    assert!(
+        inventory
+            .records
+            .iter()
+            .all(|r| r.publication == PublicationState::Unpublished)
+    );
+    task3_cleanup(&probe, 11);
+}
+
+#[test]
+fn g1_attach_stops_after_sealed_create() {
+    let probe = Probe::new();
+    let engine = attach_engine(
+        &probe,
+        AttachFaults {
+            bad_offset: Some(1),
+            hold_attempt: Some(2),
+            ..Default::default()
+        },
+        3,
+        false,
+    );
+    std::thread::scope(|scope| {
+        let caller = scope.spawn(|| engine.attach(attach_request(1, 3)));
+        probe.wait(|events| {
+            events
+                .iter()
+                .any(|(_, e)| matches!(e, Event::AttachEntered(2, ..)))
+        });
+        let deadline = Instant::now();
+        let ticket = engine.shared.seal(deadline);
+        assert!(engine.fork_permit(Instant::now()).is_err());
+        probe.release();
+        let failure = caller.join().unwrap().unwrap_err();
+        assert_eq!(failure.cleanup_ticket, Some(ticket));
+        assert_eq!(failure.failure.class, FailureClass::Disconnected);
+        assert_eq!(
+            engine.shared.seal(Instant::now() + Duration::from_secs(5)),
+            ticket
+        );
+        assert_eq!(
+            locked(&engine.shared.state).terminal.unwrap().deadline,
+            deadline
+        );
+    });
+    let inventory = task3_inventory(&engine).unwrap();
+    assert_eq!(inventory.records.len(), 1);
+    assert_eq!(inventory.unpublished_links.len(), 1);
+    assert_eq!(independent_successes(&probe), vec![2]);
+    assert_eq!(
+        probe
+            .log
+            .lock()
+            .unwrap()
+            .events
+            .iter()
+            .filter(|(_, e)| matches!(e, Event::AttachEntered(..)))
+            .count(),
+        2,
+        "a bisection create followed sealing"
+    );
+    task3_cleanup(&probe, 10);
+    assert!(
+        engine
+            .fork_permit(Instant::now() + Duration::from_secs(1))
+            .is_ok()
+    );
+}
+
+#[test]
+fn g1_attach_boundaries() {
+    let probe = Probe::new();
+    let engine = attach_engine(&probe, AttachFaults::default(), 2, false);
+    for (i, mut request) in [
+        {
+            let mut r = attach_request(1, 1);
+            r.locator = "x".repeat(4096);
+            r
+        },
+        {
+            let mut r = attach_request(1, 1);
+            r.locator = "bad\0path".into();
+            r
+        },
+        {
+            let mut r = attach_request(1, 1);
+            r.cookies.clear();
+            r
+        },
+        attach_request(1, 8193),
+        attach_request(1, 0),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        request.seq = CommandSeq::checked(i as u64 + 1).unwrap();
+        let failure = engine.attach(request).unwrap_err();
+        assert_eq!(failure.failure.class, FailureClass::InvalidInput);
+        assert_eq!(failure.completion, CommandCompletion::NotEntered);
+    }
+    assert!(
+        !probe
+            .log
+            .lock()
+            .unwrap()
+            .events
+            .iter()
+            .any(|(_, e)| matches!(e, Event::PinOpen | Event::AttachEntered(..)))
+    );
+    let mut request = attach_request(6, 1);
+    request.locator = "x".repeat(4095);
+    assert_eq!(engine.attach(request).unwrap().value.links.len(), 1);
+    engine.abandon();
+    task3_cleanup(&probe, 10);
+    assert!(
+        engine
+            .fork_permit(Instant::now() + Duration::from_secs(1))
+            .is_ok()
+    );
+
+    // The actual driver must see 16,383 attempts for the all-bad 8192-position
+    // batch. An accidental 8192-attempt ceiling cannot satisfy this control.
+    let probe = Probe::new();
+    let engine = attach_engine(
+        &probe,
+        AttachFaults {
+            all_bad: true,
+            ..Default::default()
+        },
+        1,
+        false,
+    );
+    let ack = engine.attach(attach_request(1, 8192)).unwrap().value;
+    assert_eq!(ack.refused.len(), 8192);
+    assert_eq!(
+        ack.refused.iter().map(|r| r.position).collect::<Vec<_>>(),
+        (0..8192).collect::<Vec<_>>()
+    );
+    assert!(ack.links.is_empty());
+    assert_eq!(
+        probe
+            .log
+            .lock()
+            .unwrap()
+            .events
+            .iter()
+            .filter(|(_, e)| matches!(e, Event::AttachEntered(..)))
+            .count(),
+        16383
+    );
+    engine.abandon();
+    assert!(task3_inventory(&engine).unwrap().records.is_empty());
+    task3_cleanup(&probe, 9);
+}
+
+#[test]
+fn g1_attach_identity_is_owner_verified() {
+    let probe = Probe::new();
+    let engine = attach_engine(
+        &probe,
+        AttachFaults {
+            identity: IdentityFault::Replaced,
+            ..Default::default()
+        },
+        1,
+        false,
+    );
+    let ack = engine.attach(attach_request(1, 1)).unwrap().value;
+    assert!(ack.links.is_empty());
+    assert_eq!(
+        ack.refused,
+        vec![AttachRefusal {
+            position: 0,
+            reason: AttachRefusalReason::Replaced
+        }]
+    );
+    assert!(independent_successes(&probe).is_empty());
+    engine.abandon();
+    task3_cleanup(&probe, 9);
+
+    let probe = Probe::new();
+    let engine = attach_engine(&probe, AttachFaults::default(), 1, false);
+    let first = engine
+        .attach(attach_request(1, 1))
+        .unwrap()
+        .value
+        .links
+        .pop()
+        .unwrap()
+        .id();
+    let second = engine
+        .attach(attach_request(2, 1))
+        .unwrap()
+        .value
+        .links
+        .pop()
+        .unwrap()
+        .id();
+    assert_eq!(first, second);
+    assert_eq!(independent_successes(&probe), vec![1]);
+    engine.abandon();
+    let inventory = task3_inventory(&engine).unwrap();
+    assert_eq!(inventory.records.len(), 1);
+    assert_eq!(inventory.memberships.len(), 1);
+    task3_cleanup(&probe, 10);
+}
+
+#[test]
+fn g1_pin_open_install_before_identity() {
+    for fault in [
+        IdentityFault::Io,
+        IdentityFault::Replaced,
+        IdentityFault::Panic,
+        IdentityFault::None,
+    ] {
+        let probe = Probe::new();
+        let engine = attach_engine(
+            &probe,
+            AttachFaults {
+                identity: fault,
+                ..Default::default()
+            },
+            1,
+            false,
+        );
+        let result = engine.attach(attach_request(1, 1));
+        let acquired = !matches!(fault, IdentityFault::None);
+        if acquired {
+            if matches!(fault, IdentityFault::Replaced) {
+                assert!(result.unwrap().value.links.is_empty());
+            } else {
+                assert!(result.is_err());
+            }
+        } else {
+            assert_eq!(result.unwrap().value.links.len(), 1);
+        }
+        engine.abandon();
+        let event_snapshot = probe.log.lock().unwrap().events.clone();
+        let events = &event_snapshot;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|(_, e)| matches!(e, Event::PinOpened(_)))
+                .count(),
+            1,
+            "the fault control must first acquire a real pin"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|(_, e)| matches!(e, Event::PinIdentity(_))),
+            "the injected identity operation must actually run"
+        );
+        let installed = events
+            .iter()
+            .position(|(_, e)| {
+                matches!(
+                    e,
+                    Event::Registry(RegistryEvent::Installed(ResourceId::Pin(_)))
+                )
+            })
+            .expect("acquired pin absent from registry");
+        let identity = events
+            .iter()
+            .position(|(_, e)| matches!(e, Event::PinIdentity(_)))
+            .unwrap();
+        assert!(
+            installed < identity,
+            "fallible fstat ran before pin custody was installed"
+        );
+        if acquired {
+            assert!(
+                !events
+                    .iter()
+                    .any(|(_, e)| matches!(e, Event::AttachEntered(..)))
+            );
+        }
+        task3_cleanup(&probe, if acquired { 9 } else { 10 });
+        assert_eq!(
+            probe
+                .log
+                .lock()
+                .unwrap()
+                .events
+                .iter()
+                .filter(|(_, e)| matches!(e, Event::PinClose))
+                .count(),
+            1
+        );
+    }
+    let probe = Probe::new();
+    let engine = attach_engine(
+        &probe,
+        AttachFaults {
+            open_error: true,
+            ..Default::default()
+        },
+        1,
+        false,
+    );
+    let ack = engine.attach(attach_request(1, 1)).unwrap().value;
+    assert_eq!(ack.refused[0].reason, AttachRefusalReason::Unreadable);
+    engine.abandon();
+    task3_cleanup(&probe, 8);
+    assert!(
+        !probe
+            .log
+            .lock()
+            .unwrap()
+            .events
+            .iter()
+            .any(|(_, e)| matches!(
+                e,
+                Event::PinOpened(_)
+                    | Event::PinIdentity(_)
+                    | Event::PinClose
+                    | Event::Registry(RegistryEvent::Installed(ResourceId::Pin(_)))
+            ))
+    );
+}
+
+#[test]
+fn g1_pin_identity_cutoff_and_close_outcomes() {
+    for close_errno in [None, Some(libc::EINTR), Some(libc::EIO)] {
+        let probe = Probe::new();
+        let engine = attach_engine(
+            &probe,
+            AttachFaults {
+                identity: IdentityFault::Hold,
+                pin_close_errno: close_errno,
+                ..Default::default()
+            },
+            1,
+            false,
+        );
+        std::thread::scope(|scope| {
+            let caller = scope.spawn(|| {
+                let mut r = attach_request(1, 1);
+                r.deadline = Instant::now() + Duration::from_millis(60);
+                engine.attach(r)
+            });
+            probe.wait(|events| {
+                events
+                    .iter()
+                    .any(|(_, e)| matches!(e, Event::PinIdentity(_)))
+            });
+            let failure = caller.join().unwrap().unwrap_err();
+            assert_eq!(failure.failure.class, FailureClass::Deadline);
+            assert_eq!(failure.completion, CommandCompletion::Unknown);
+            assert_eq!(
+                locked(&engine.shared.state).active_operation,
+                Some(CountOperation::PinIdentity)
+            );
+            assert!(engine.fork_permit(Instant::now()).is_err());
+            let ticket = engine.shared.seal(Instant::now() + Duration::from_secs(5));
+            assert_eq!(failure.cleanup_ticket, Some(ticket));
+            probe.release();
+        });
+        task3_cleanup(&probe, 9);
+        let events = &probe.log.lock().unwrap().events;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|(_, e)| matches!(e, Event::PinClose))
+                .count(),
+            1
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|(_, e)| matches!(e, Event::AttachEntered(..)))
+        );
+        if close_errno.is_some() {
+            assert!(
+                events
+                    .iter()
+                    .any(|(_, e)| matches!(e,Event::PinCloseResult(errno) if *errno==close_errno))
+            );
+            assert!(engine.fork_permit(Instant::now()).is_err());
+            assert!(engine.resource_summary().resources.iter().any(|r| matches!(
+                r.resource,
+                ResourceId::Pin(_)
+            ) && r.state
+                == ResourceState::ConsumedError
+                && r.errno == close_errno));
+        } else {
+            assert!(
+                engine
+                    .fork_permit(Instant::now() + Duration::from_secs(1))
+                    .is_ok()
+            );
+        }
+    }
+    let probe = Probe::new();
+    let engine = attach_engine(
+        &probe,
+        AttachFaults {
+            hold_pin_close: true,
+            ..Default::default()
+        },
+        1,
+        false,
+    );
+    assert!(engine.attach(attach_request(1, 1)).is_ok());
+    engine.abandon();
+    probe.wait(|events| events.iter().any(|(_, e)| matches!(e, Event::PinClose)));
+    assert!(engine.fork_permit(Instant::now()).is_err());
+    assert!(engine.resource_summary().resources.iter().any(|r| matches!(
+        r.resource,
+        ResourceId::Pin(_)
+    ) && r.state
+        == ResourceState::CloseIssued));
+    probe.release();
+    task3_cleanup(&probe, 10);
+    assert!(
+        engine
+            .fork_permit(Instant::now() + Duration::from_secs(1))
+            .is_ok()
+    );
+}
+
+#[test]
+fn g1_inventory_exact_set() {
+    let probe = Probe::new();
+    let engine = attach_engine(&probe, AttachFaults::default(), 3, false);
+    let first = engine
+        .attach(attach_request(1, 1))
+        .unwrap()
+        .value
+        .links
+        .pop()
+        .unwrap()
+        .id();
+    let mut request = attach_request(2, 1);
+    request.offsets[0] = 9;
+    request.cookies[0] = 109;
+    let second = engine
+        .attach(request)
+        .unwrap()
+        .value
+        .links
+        .pop()
+        .unwrap()
+        .id();
+    engine.abandon();
+    let inventory = task3_inventory(&engine).unwrap();
+    assert_eq!(inventory.acknowledged_links, vec![first, second]);
+    assert!(inventory.unpublished_links.is_empty());
+    assert_eq!(
+        inventory.records.iter().map(|r| r.id).collect::<Vec<_>>(),
+        vec![first, second]
+    );
+    assert_eq!(independent_successes(&probe), vec![1, 2]);
+    assert_eq!(
+        inventory
+            .records
+            .iter()
+            .map(|r| r.command.value())
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    for record in &inventory.records {
+        assert_eq!(record.writer.owner_epoch, engine.ready().owner_epoch);
+        assert_eq!(
+            record.writer.object_sha256,
+            engine.ready().writer_object_identity
+        );
+        assert_eq!(
+            record.backing,
+            BackingIdentity {
+                device: 1,
+                inode: 2
+            }
+        );
+        assert_eq!(record.outcome, CreateOutcome::Succeeded);
+        assert!(record.memberships.end <= inventory.memberships.len());
+    }
+    let frontier = ControllerFrontier {
+        last_acked: Some(CommandSeq::checked(2).unwrap()),
+        acknowledged_links: vec![first, second],
+        pending: None,
+    };
+    assert!(inventory.validate(&frontier).is_ok());
+    let mut duplicate = frontier.clone();
+    duplicate.acknowledged_links.push(first);
+    assert!(inventory.validate(&duplicate).is_err());
+    let mut missing = frontier.clone();
+    missing.acknowledged_links.pop();
+    assert!(inventory.validate(&missing).is_err());
+    let mut duplicate_manifest = inventory.clone();
+    duplicate_manifest
+        .records
+        .push(inventory.records[0].clone());
+    assert!(duplicate_manifest.validate(&frontier).is_err());
+    let mut missing_manifest = inventory.clone();
+    missing_manifest.records.pop();
+    assert!(missing_manifest.validate(&frontier).is_err());
+    let mut wrong_writer = inventory.clone();
+    wrong_writer.records[0].writer.object_sha256[0] ^= 1;
+    assert!(wrong_writer.validate(&frontier).is_err());
+    task3_cleanup(&probe, 11);
+}
+
+#[test]
+fn g1_attach_capacity_is_loss_and_runtime_failure() {
+    for membership_capacity in [false, true] {
+        let probe = Probe::new();
+        let engine = attach_engine(
+            &probe,
+            AttachFaults::default(),
+            if membership_capacity { 2 } else { 1 },
+            false,
+        );
+        let n = if membership_capacity { 8192 } else { 1 };
+        assert!(engine.attach(attach_request(1, n)).is_ok());
+        let mut request = attach_request(2, 1);
+        request.offsets[0] = 9000;
+        request.cookies[0] = 9100;
+        let failure = engine.attach(request).unwrap_err();
+        assert_eq!(failure.failure.class, FailureClass::Capacity);
+        let loss = failure
+            .capacity_loss()
+            .expect("owner capacity must be explicit loss");
+        assert_eq!(loss.name, "count.owner_capacity");
+        assert_eq!(loss.kind, crate::evidence::CounterKind::Loss);
+        assert_eq!(loss.units, crate::evidence::CounterUnits::Events);
+        assert_eq!(loss.source, crate::evidence::CounterSource::Attach);
+        assert_eq!(loss.value, 1);
+        assert_eq!(
+            task3_inventory(&engine).unwrap().records.len(),
+            1,
+            "capacity erased prior facts"
+        );
+        assert_eq!(independent_successes(&probe), vec![1]);
+        task3_cleanup(&probe, 10);
+    }
+}
+
+#[test]
+fn g1_attach_failed_attempt_storage_is_bounded() {
+    let probe = Probe::new();
+    let engine = attach_engine(
+        &probe,
+        AttachFaults {
+            all_bad: true,
+            ..Default::default()
+        },
+        1,
+        false,
+    );
+    for seq in 1..=64 {
+        let ack = engine.attach(attach_request(seq, 3)).unwrap().value;
+        assert!(ack.links.is_empty());
+        assert_eq!(ack.refused.len(), 3);
+        assert!(
+            ack.refused
+                .iter()
+                .all(|r| r.reason == AttachRefusalReason::KernelRefused)
+        );
+    }
+    engine.abandon();
+    assert!(task3_inventory(&engine).unwrap().records.is_empty());
+    task3_cleanup(&probe, 72);
+    assert!(
+        engine
+            .fork_permit(Instant::now() + Duration::from_secs(1))
+            .is_ok()
+    );
+    let log = probe.log.lock().unwrap();
+    assert_eq!(
+        log.events
+            .iter()
+            .filter(|(_, e)| matches!(e, Event::AttachEntered(..)))
+            .count(),
+        320
+    );
+    let snapshots = log
+        .events
+        .iter()
+        .filter_map(|(_, e)| {
+            if let Event::Registry(RegistryEvent::AttachStorage {
+                attempts,
+                attempt_capacity,
+                attempt_address,
+                records,
+                memberships,
+                refusals,
+                refusal_capacity,
+                refusal_address,
+            }) = e
+            {
+                assert_eq!((*attempts, *records, *memberships, *refusals), (5, 0, 0, 3));
+                assert_eq!((*attempt_capacity, *refusal_capacity), (16383, 8192));
+                Some((*attempt_address, *refusal_address))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(snapshots.len(), 64);
+    assert!(
+        snapshots.iter().all(|addresses| *addresses == snapshots[0]),
+        "failed retries grew or replaced safety storage"
+    );
+    assert!(independent_successes_unlocked(&log).is_empty());
+}
+fn independent_successes_unlocked(log: &InvocationLog) -> Vec<u64> {
+    log.events
+        .iter()
+        .filter_map(|(_, e)| {
+            if let Event::AttachCreated(n) = e {
+                Some(*n as u64)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn g1_pin_real_locator_swap_is_replaced() {
+    use std::os::unix::fs::MetadataExt as _;
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let directory = std::env::temp_dir().join(format!(
+        "osslscope-owner-pin-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir(&directory).unwrap();
+    let locator = directory.join("provider");
+    let replacement = directory.join("replacement");
+    std::fs::write(&locator, b"old host fixture").unwrap();
+    std::fs::write(&replacement, b"replacement host fixture").unwrap();
+    let old = std::fs::metadata(&locator).unwrap();
+    let expected = BackingIdentity {
+        device: crate::plan::encode_device(libc::major(old.dev()), libc::minor(old.dev())),
+        inode: old.ino(),
+    };
+    std::fs::rename(&replacement, &locator).unwrap();
+    let probe = Probe::new();
+    let engine = attach_engine(
+        &probe,
+        AttachFaults {
+            real_pin: true,
+            ..Default::default()
+        },
+        1,
+        false,
+    );
+    let mut request = attach_request(1, 1);
+    request.locator = locator.to_str().unwrap().into();
+    request.expected_backing = expected;
+    let ack = engine.attach(request).unwrap().value;
+    assert!(ack.links.is_empty());
+    assert_eq!(
+        ack.refused,
+        vec![AttachRefusal {
+            position: 0,
+            reason: AttachRefusalReason::Replaced
+        }]
+    );
+    assert!(independent_successes(&probe).is_empty());
+    engine.abandon();
+    task3_cleanup(&probe, 9);
+    assert!(
+        engine
+            .fork_permit(Instant::now() + Duration::from_secs(1))
+            .is_ok()
+    );
+    let current = std::fs::metadata(&locator).unwrap();
+    let probe = Probe::new();
+    let engine = attach_engine(
+        &probe,
+        AttachFaults {
+            real_pin: true,
+            ..Default::default()
+        },
+        1,
+        false,
+    );
+    let mut request = attach_request(1, 1);
+    request.locator = locator.to_str().unwrap().into();
+    request.expected_backing = BackingIdentity {
+        device: crate::plan::encode_device(libc::major(current.dev()), libc::minor(current.dev())),
+        inode: current.ino(),
+    };
+    assert_eq!(
+        engine.attach(request).unwrap().value.links.len(),
+        1,
+        "matching real fstat must use the planned device encoding"
+    );
+    engine.abandon();
+    task3_cleanup(&probe, 10);
+    assert!(
+        engine
+            .fork_permit(Instant::now() + Duration::from_secs(1))
+            .is_ok()
+    );
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn g1_attach_sealed_queued_request_never_enters_io() {
+    let probe = Probe::new();
+    let engine = attach_engine(&probe, AttachFaults::default(), 1, false);
+    let request = attach_request(1, 3);
+    let seq = request.seq;
+    let ack = AttachAck {
+        links: registry::preallocated(1).unwrap(),
+        refused: registry::preallocated(3).unwrap(),
+    };
+    let ticket = {
+        // Submit and seal atomically, so this discriminates the queued case
+        // from the separate held-create test without timing a scheduler race.
+        let mut state = locked(&engine.shared.state);
+        state.last_command_seq = Some(seq);
+        state.frontier.pending = Some(PendingCommandId {
+            seq,
+            operation: CountOperation::Attach,
+        });
+        assert!(
+            state
+                .ordinary
+                .publish_request(OwnerRequest::Attach { request, ack })
+                .is_ok()
+        );
+        engine.shared.seal_locked(&mut state, Instant::now())
+    };
+    engine.shared.worker.get().unwrap().unpark();
+    let inventory = task3_inventory(&engine).unwrap();
+    assert!(inventory.records.is_empty());
+    assert_eq!(
+        inventory.pending,
+        Some(PendingCommandId {
+            seq,
+            operation: CountOperation::Attach
+        })
+    );
+    let Some(OwnerReply::Attached(result)) = locked(&engine.shared.state).ordinary.take_reply()
+    else {
+        panic!("queued request was not explicitly resolved")
+    };
+    let failure = result.unwrap_err();
+    assert_eq!(failure.cleanup_ticket, Some(ticket));
+    assert_eq!(failure.completion, CommandCompletion::NotEntered);
+    assert!(
+        !probe
+            .log
+            .lock()
+            .unwrap()
+            .events
+            .iter()
+            .any(|(_, e)| matches!(e, Event::PinOpen | Event::AttachEntered(..)))
+    );
+    task3_cleanup(&probe, 8);
+    assert!(
+        engine
+            .fork_permit(Instant::now() + Duration::from_secs(1))
+            .is_ok()
+    );
+}
+
+#[test]
+fn g1_attach_one_in_flight_and_nonwrapping_sequence() {
+    let probe = Probe::new();
+    let engine = attach_engine(
+        &probe,
+        AttachFaults {
+            identity: IdentityFault::Hold,
+            ..Default::default()
+        },
+        1,
+        false,
+    );
+    std::thread::scope(|scope| {
+        let first = scope.spawn(|| engine.attach(attach_request(1, 1)));
+        probe.wait(|events| {
+            events
+                .iter()
+                .any(|(_, e)| matches!(e, Event::PinIdentity(_)))
+        });
+        let overlapping = engine.attach(attach_request(2, 1)).unwrap_err();
+        assert_eq!(overlapping.failure.class, FailureClass::Capacity);
+        assert_eq!(overlapping.completion, CommandCompletion::NotEntered);
+        assert_eq!(
+            probe
+                .log
+                .lock()
+                .unwrap()
+                .events
+                .iter()
+                .filter(|(_, e)| matches!(e, Event::PinOpen))
+                .count(),
+            1
+        );
+        probe.release();
+        assert!(first.join().unwrap().is_ok());
+    });
+    assert_eq!(
+        engine
+            .attach(attach_request(1, 1))
+            .unwrap_err()
+            .failure
+            .class,
+        FailureClass::InvalidInput
+    );
+    assert!(engine.attach(attach_request(u64::MAX, 1)).is_ok());
+    assert_eq!(
+        engine
+            .attach(attach_request(2, 1))
+            .unwrap_err()
+            .failure
+            .class,
+        FailureClass::InvalidInput
+    );
+    assert_eq!(independent_successes(&probe), vec![1]);
+    engine.abandon();
+    assert_eq!(task3_inventory(&engine).unwrap().records.len(), 1);
+    task3_cleanup(&probe, 10);
+}
+
+#[test]
+fn g1_attach_pin_capacity_preserves_prior_fact() {
+    let probe = Probe::new();
+    let worker_probe = Arc::clone(&probe);
+    // One prestarted host owner exercises the registry's independent pin guard.
+    // The extra provider pin is tracked and closed; it is never a link alias.
+    let (failure, inventory, summary) = std::thread::spawn(move || {
+        worker_probe.event(Event::Started);
+        let limits = CountOwnerLimits::from_allowance(20, 2).unwrap();
+        let mut registry = Registry::allocate(limits).unwrap();
+        let observed = Arc::clone(&worker_probe);
+        registry.observer = Some(Arc::new(move |e| observed.event(Event::Registry(e))));
+        let source = input(Arc::new(CountForkBarrier::new()));
+        let prepared = crate::loader::prepare(
+            &source.object_bytes,
+            &crate::loader::COUNT_MAPS,
+            &crate::loader::COUNT_PROGS,
+        )
+        .unwrap();
+        let mut driver = AttachDriver {
+            base: PipeDriver {
+                probe: worker_probe,
+                faults: Faults::default(),
+                deadline: Instant::now() + Duration::from_secs(5),
+                attempts: 0,
+                acquired: 0,
+                closes: 0,
+            },
+            faults: AttachFaults::default(),
+            pin: None,
+            attaches: 0,
+            clock_after_create: std::cell::Cell::new(0),
+        };
+        let loaded = crate::loader::load_count_tracked(
+            &prepared,
+            &mut registry,
+            &mut driver,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .map_err(|f| f.failure)
+        .unwrap();
+        registry
+            .journal
+            .bind(OwnerEpoch::checked(1).unwrap(), source.object_sha256);
+        let request = attach_request(1, 1);
+        registry.journal.begin(request.seq);
+        let ack = registry
+            .attach(
+                &mut driver,
+                loaded.program,
+                1,
+                &request,
+                AttachAck {
+                    links: registry::preallocated(2).unwrap(),
+                    refused: registry::preallocated(1).unwrap(),
+                },
+            )
+            .unwrap();
+        let id = ack.links[0].id();
+        registry.journal.published(request.seq);
+        registry.journal.acknowledged(Some(request.seq));
+        let spare = registry.reserve(ResourceKind::Pin).unwrap();
+        let fd = driver.open_pin(c"/tracked-spare-provider-pin").unwrap();
+        registry.install(spare, fd);
+        driver.pin_identity(registry.borrow(spare)).unwrap();
+        let mut request = attach_request(2, 1);
+        request.expected_backing.inode = 99;
+        registry.journal.begin(request.seq);
+        let failure = registry
+            .attach(
+                &mut driver,
+                loaded.program,
+                1,
+                &request,
+                AttachAck {
+                    links: registry::preallocated(2).unwrap(),
+                    refused: registry::preallocated(1).unwrap(),
+                },
+            )
+            .unwrap_err();
+        assert_eq!(failure.operation, CountOperation::PinOpen);
+        let inventory = registry
+            .journal
+            .seal(&ControllerFrontier {
+                last_acked: Some(CommandSeq::checked(1).unwrap()),
+                acknowledged_links: vec![id],
+                pending: Some(PendingCommandId {
+                    seq: request.seq,
+                    operation: CountOperation::Attach,
+                }),
+            })
+            .unwrap();
+        registry.cleanup(&mut driver);
+        (failure, inventory, registry.summary())
+    })
+    .join()
+    .unwrap();
+    assert_eq!(failure.class, FailureClass::Capacity);
+    assert_eq!(inventory.records.len(), 1);
+    assert_eq!(independent_successes(&probe), vec![1]);
+    task3_cleanup(&probe, 11);
+    assert!(summary.cleanup_complete);
+    assert_eq!(
+        probe
+            .log
+            .lock()
+            .unwrap()
+            .events
+            .iter()
+            .filter(|(_, e)| matches!(e, Event::PinOpen))
+            .count(),
+        2,
+        "capacity refusal acquired another pin"
+    );
+}
+
+#[test]
+fn g1_attach_duplicate_physical_membership_is_reused() {
+    let probe = Probe::new();
+    let engine = attach_engine(&probe, AttachFaults::default(), 1, false);
+    let mut request = attach_request(1, 3);
+    request.offsets = vec![7, 7, 7];
+    request.cookies = vec![107, 107, 107];
+    assert_eq!(engine.attach(request).unwrap().value.links.len(), 1);
+    let mut request = attach_request(2, 1);
+    request.offsets[0] = 7;
+    request.cookies[0] = 107;
+    assert_eq!(engine.attach(request).unwrap().value.links.len(), 1);
+    assert_eq!(independent_successes(&probe), vec![1]);
+    engine.abandon();
+    let inventory = task3_inventory(&engine).unwrap();
+    assert_eq!(inventory.records.len(), 1);
+    assert_eq!(
+        inventory.memberships,
+        vec![AttachedMembership {
+            offset: 7,
+            cookie: 107
+        }]
+    );
+    let log = probe.log.lock().unwrap();
+    let supplied = log
+        .events
+        .iter()
+        .find_map(|(_, e)| {
+            if let Event::AttachEntered(_, offsets, cookies, _) = e {
+                Some((offsets.clone(), cookies.clone()))
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    assert_eq!(supplied, (vec![7], vec![107]));
+    drop(log);
+    task3_cleanup(&probe, 10);
+}
+
+#[test]
+fn g1_attach_post_handler_unwind_keeps_owner_custody() {
+    let probe = Probe::new();
+    let engine = attach_engine(
+        &probe,
+        AttachFaults {
+            post_handler_clock_panic: true,
+            ..Default::default()
+        },
+        1,
+        false,
+    );
+    let mut request = attach_request(1, 1);
+    request.deadline = Instant::now() + Duration::from_secs(2);
+    let failure = engine.attach(request).unwrap_err();
+    assert_eq!(failure.failure.class, FailureClass::Panic);
+    assert_eq!(failure.completion, CommandCompletion::Unknown);
+    assert!(failure.cleanup_ticket.is_some());
+    let inventory = task3_inventory(&engine).unwrap();
+    assert_eq!(inventory.records.len(), 1);
+    assert_eq!(inventory.unpublished_links.len(), 1);
+    assert_eq!(independent_successes(&probe), vec![1]);
+    task3_cleanup(&probe, 10);
+    assert!(
+        engine
+            .fork_permit(Instant::now() + Duration::from_secs(1))
+            .is_ok()
+    );
+}
+
+#[test]
+fn g1_attach_failed_slot_reuse_never_reuses_serial() {
+    let probe = Probe::new();
+    let engine = attach_engine(
+        &probe,
+        AttachFaults {
+            bad_offset: Some(0),
+            ..Default::default()
+        },
+        1,
+        false,
+    );
+    let refused = engine.attach(attach_request(1, 1)).unwrap().value;
+    assert!(refused.links.is_empty());
+    assert_eq!(
+        refused.refused,
+        vec![AttachRefusal {
+            position: 0,
+            reason: AttachRefusalReason::KernelRefused
+        }]
+    );
+    let mut request = attach_request(2, 1);
+    request.offsets[0] = 9;
+    request.cookies[0] = 109;
+    let id = engine.attach(request).unwrap().value.links[0].id();
+    assert_eq!(
+        id.serial.value(),
+        2,
+        "a known-failed serial was reused with its physical slot"
+    );
+    engine.abandon();
+    let inventory = task3_inventory(&engine).unwrap();
+    assert_eq!(
+        inventory
+            .records
+            .iter()
+            .map(|r| r.id.serial.value())
+            .collect::<Vec<_>>(),
+        vec![2]
+    );
+    assert_eq!(
+        inventory.memberships,
+        vec![AttachedMembership {
+            offset: 9,
+            cookie: 109
+        }]
+    );
+    assert_eq!(independent_successes(&probe), vec![2]);
+    task3_cleanup(&probe, 11);
+    assert!(
+        engine
+            .fork_permit(Instant::now() + Duration::from_secs(1))
+            .is_ok()
+    );
+}
+
+fn system_fd_exhaustion_is_runtime_failure(at_pin_open: bool) {
+    for errno in [libc::EMFILE, libc::ENFILE] {
+        let probe = Probe::new();
+        let faults = if at_pin_open {
+            AttachFaults {
+                open_errno: Some(errno),
+                ..Default::default()
+            }
+        } else {
+            AttachFaults {
+                attach_errno: Some(errno),
+                ..Default::default()
+            }
+        };
+        let engine = attach_engine(&probe, faults, 3, false);
+        let failure = engine.attach(attach_request(1, 3)).unwrap_err();
+        assert_eq!(failure.failure.class, FailureClass::Capacity);
+        assert_eq!(
+            failure.failure.operation,
+            if at_pin_open {
+                CountOperation::PinOpen
+            } else {
+                CountOperation::Attach
+            }
+        );
+        assert_eq!(failure.failure.errno, Some(errno));
+        assert!(failure.capacity_loss().unwrap().forces_partial());
+        assert!(failure.cleanup_ticket.is_some());
+        assert!(task3_inventory(&engine).unwrap().records.is_empty());
+        assert!(independent_successes(&probe).is_empty());
+        task3_cleanup(&probe, if at_pin_open { 8 } else { 9 });
+        assert!(
+            engine
+                .fork_permit(Instant::now() + Duration::from_secs(1))
+                .is_ok()
+        );
+        let log = probe.log.lock().unwrap();
+        assert_eq!(
+            log.events
+                .iter()
+                .filter(|(_, e)| matches!(e, Event::AttachEntered(..)))
+                .count(),
+            if at_pin_open { 0 } else { 1 },
+            "system FD exhaustion caused futile bisection retries"
+        );
+    }
+}
+#[test]
+fn g1_pin_system_fd_exhaustion_is_runtime_failure() {
+    system_fd_exhaustion_is_runtime_failure(true)
+}
+#[test]
+fn g1_attach_system_fd_exhaustion_is_runtime_failure() {
+    system_fd_exhaustion_is_runtime_failure(false)
+}
+
+#[test]
+fn g1_attach_system_fd_exhaustion_preserves_prior_positive() {
+    let probe = Probe::new();
+    let engine = attach_engine(
+        &probe,
+        AttachFaults {
+            attach_errno: Some(libc::EMFILE),
+            attach_errno_from: 2,
+            ..Default::default()
+        },
+        3,
+        false,
+    );
+    let id = engine.attach(attach_request(1, 1)).unwrap().value.links[0].id();
+    let mut request = attach_request(2, 3);
+    request.offsets = vec![9, 10, 11];
+    request.cookies = vec![109, 110, 111];
+    let failure = engine.attach(request).unwrap_err();
+    assert_eq!(failure.failure.class, FailureClass::Capacity);
+    assert_eq!(failure.failure.errno, Some(libc::EMFILE));
+    let inventory = task3_inventory(&engine).unwrap();
+    assert_eq!(
+        inventory.records.iter().map(|r| r.id).collect::<Vec<_>>(),
+        vec![id]
+    );
+    assert_eq!(inventory.acknowledged_links, vec![id]);
+    assert!(inventory.unpublished_links.is_empty());
+    assert_eq!(
+        inventory.memberships,
+        vec![AttachedMembership {
+            offset: 0,
+            cookie: 100
+        }]
+    );
+    assert_eq!(independent_successes(&probe), vec![1]);
+    task3_cleanup(&probe, 10);
+    assert_eq!(
+        probe
+            .log
+            .lock()
+            .unwrap()
+            .events
+            .iter()
+            .filter(|(_, e)| matches!(e, Event::AttachEntered(..)))
+            .count(),
+        2,
+        "systemic resource failure was bisected after a prior success"
+    );
+    assert!(
+        engine
+            .fork_permit(Instant::now() + Duration::from_secs(1))
+            .is_ok()
+    );
 }

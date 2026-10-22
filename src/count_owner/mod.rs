@@ -249,9 +249,8 @@ impl<Request, Reply> OrdinaryCells<Request, Reply> {
         }
     }
 }
-// Preparation already uses the same concrete cells that the later serial
-// command task will extend. Only this setup request is admitted/processed now;
-// attach/open/read request variants and their handlers remain absent.
+// Preparation and attach share these physically preallocated cells. The
+// sticky seal remains independent of ordinary-command admission.
 struct PreparationRequest {
     owner_epoch: OwnerEpoch,
     deadline: Instant,
@@ -260,9 +259,17 @@ struct PreparationRequest {
 }
 enum OwnerRequest {
     Prepare(PreparationRequest),
+    Attach {
+        request: AttachRequest,
+        ack: AttachAck<LinkToken>,
+    },
 }
+// One bounded inline reply cell exists before count acquisition. Boxing Ready
+// here would introduce a publication allocation; the 344-byte cell is intended.
+#[allow(clippy::large_enum_variant)]
 enum OwnerReply {
     Prepared(Result<Ready, OwnerFailure>),
+    Attached(CommandResult<AttachAck<LinkToken>>),
 }
 struct SharedState {
     ordinary: OrdinaryCells<OwnerRequest, OwnerReply>,
@@ -270,11 +277,16 @@ struct SharedState {
     terminal_ids: protocol::IdCounter,
     resources: ResourceSummary,
     phase: OwnerPhase,
+    active_operation: Option<CountOperation>,
+    last_command_seq: Option<CommandSeq>,
+    frontier: ControllerFrontier,
+    inventory: Option<Result<SealedInventory, InventoryFailure>>,
 }
 struct Shared {
     epoch: OwnerEpoch,
     barrier: Arc<CountForkBarrier>,
     setup_deadline: Instant,
+    link_limit: usize,
     abandoned: Arc<AtomicBool>,
     worker: OnceLock<thread::Thread>,
     state: Mutex<SharedState>,
@@ -283,6 +295,14 @@ struct Shared {
 impl Shared {
     fn seal(&self, deadline: Instant) -> CleanupTicket {
         let mut state = locked(&self.state);
+        let ticket = self.seal_locked(&mut state, deadline);
+        self.changed.notify_all();
+        if let Some(worker) = self.worker.get() {
+            worker.unpark();
+        }
+        ticket
+    }
+    fn seal_locked(&self, state: &mut SharedState, deadline: Instant) -> CleanupTicket {
         if let Some(seal) = state.terminal {
             return seal.ticket;
         }
@@ -365,6 +385,150 @@ impl CountEngine {
         locked(&self.shared.state).resources.clone()
     }
 
+    pub fn attach(&self, request: AttachRequest) -> CommandResult<AttachAck<LinkToken>> {
+        let seq = request.seq;
+        let deadline = request.deadline;
+        let refused = |failure, completion, cleanup_ticket| CommandFailure {
+            seq,
+            failure,
+            completion,
+            cleanup_ticket,
+        };
+        request
+            .validate()
+            .map_err(|failure| refused(failure, CommandCompletion::NotEntered, None))?;
+        if Instant::now() >= deadline {
+            return Err(refused(
+                OwnerFailure::engine(CountOperation::Attach, FailureClass::Deadline),
+                CommandCompletion::NotEntered,
+                None,
+            ));
+        }
+        // Reply allocations are checked before publication, outside the lock
+        // and before the owner can acquire anything for this command.
+        let ack = AttachAck {
+            links: registry::preallocated(self.shared.link_limit).map_err(|mut failure| {
+                failure.operation = CountOperation::Attach;
+                refused(failure, CommandCompletion::NotEntered, None)
+            })?,
+            refused: registry::preallocated(request.offsets.len()).map_err(|mut failure| {
+                failure.operation = CountOperation::Attach;
+                refused(failure, CommandCompletion::NotEntered, None)
+            })?,
+        };
+        let mut state = locked(&self.shared.state);
+        if let Some(seal) = state.terminal {
+            return Err(refused(
+                OwnerFailure::engine(CountOperation::Attach, FailureClass::Disconnected),
+                CommandCompletion::NotEntered,
+                Some(seal.ticket),
+            ));
+        }
+        if self.shared.abandoned.load(Ordering::Acquire)
+            || !matches!(state.phase, OwnerPhase::Ready | OwnerPhase::Observing)
+        {
+            return Err(refused(
+                OwnerFailure::engine(CountOperation::Attach, FailureClass::Disconnected),
+                CommandCompletion::NotEntered,
+                None,
+            ));
+        }
+        if state.last_command_seq.is_some_and(|last| seq <= last) {
+            return Err(refused(
+                OwnerFailure::engine(CountOperation::Attach, FailureClass::InvalidInput),
+                CommandCompletion::NotEntered,
+                None,
+            ));
+        }
+        if state.ordinary.in_flight {
+            return Err(refused(
+                OwnerFailure::engine(CountOperation::Attach, FailureClass::Capacity),
+                CommandCompletion::NotEntered,
+                None,
+            ));
+        }
+        state.last_command_seq = Some(seq);
+        state.frontier.pending = Some(PendingCommandId {
+            seq,
+            operation: CountOperation::Attach,
+        });
+        // Admission was checked under this lock; publication cannot overwrite.
+        assert!(
+            state
+                .ordinary
+                .publish_request(OwnerRequest::Attach { request, ack })
+                .is_ok()
+        );
+        self.shared.worker.get().expect("prepared owner").unpark();
+        loop {
+            if Instant::now() >= deadline {
+                let ticket = self.shared.seal_locked(&mut state, deadline);
+                drop(state);
+                self.shared.abandon();
+                return Err(refused(
+                    OwnerFailure::engine(CountOperation::Attach, FailureClass::Deadline),
+                    CommandCompletion::Unknown,
+                    Some(ticket),
+                ));
+            }
+            if let Some(OwnerReply::Attached(result)) = state.ordinary.take_reply() {
+                match result {
+                    Ok(ack) => {
+                        if let Some(seal) = state.terminal {
+                            return Err(refused(
+                                OwnerFailure::engine(
+                                    CountOperation::Attach,
+                                    FailureClass::Disconnected,
+                                ),
+                                CommandCompletion::Completed,
+                                Some(seal.ticket),
+                            ));
+                        }
+                        if ack.seq != seq {
+                            return Err(refused(
+                                OwnerFailure::engine(
+                                    CountOperation::Attach,
+                                    FailureClass::Inventory,
+                                ),
+                                CommandCompletion::Unknown,
+                                None,
+                            ));
+                        }
+                        for link in &ack.value.links {
+                            if !state.frontier.acknowledged_links.contains(&link.id()) {
+                                // One record per reserved link slot; capacity was
+                                // fixed before loading and is never grown here.
+                                assert!(
+                                    state.frontier.acknowledged_links.len()
+                                        < self.shared.link_limit
+                                );
+                                state.frontier.acknowledged_links.push(link.id());
+                            }
+                        }
+                        state.frontier.last_acked = Some(seq);
+                        state.frontier.pending = None;
+                        self.shared.worker.get().unwrap().unpark();
+                        return Ok(ack);
+                    }
+                    Err(failure) => return Err(failure),
+                }
+            }
+            if let Some(seal) = state.terminal {
+                return Err(refused(
+                    OwnerFailure::engine(CountOperation::Attach, FailureClass::Disconnected),
+                    CommandCompletion::Unknown,
+                    Some(seal.ticket),
+                ));
+            }
+            state = self
+                .shared
+                .changed
+                .wait_timeout(state, deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+        }
+    }
+
     fn prepare_with<D, F, S>(
         input: CountInput,
         limits: CountOwnerLimits,
@@ -403,6 +567,7 @@ impl CountEngine {
         }
         let mut registry = Registry::allocate(limits)?;
         let resources = registry.summary_storage()?;
+        let acknowledged_links = registry::preallocated(limits.link_slots)?;
         #[cfg(test)]
         {
             registry.observer = hooks.registry_observer.clone();
@@ -431,6 +596,7 @@ impl CountEngine {
             epoch,
             barrier: Arc::clone(&input.fork_barrier),
             setup_deadline: deadline,
+            link_limit: limits.link_slots,
             abandoned: Arc::clone(&registry.abandoned),
             worker: OnceLock::new(),
             state: Mutex::new(SharedState {
@@ -439,6 +605,13 @@ impl CountEngine {
                 terminal_ids: protocol::IdCounter::default(),
                 resources,
                 phase: OwnerPhase::Preparing,
+                active_operation: None,
+                last_command_seq: None,
+                frontier: ControllerFrontier {
+                    acknowledged_links,
+                    ..ControllerFrontier::default()
+                },
+                inventory: None,
             }),
             changed: Condvar::new(),
         });
@@ -524,6 +697,7 @@ struct PrepareHooks {
     domain: EvidenceDomain,
     fail_allocation: bool,
     fail_ready_publication: bool,
+    fail_attach_publication: bool,
     #[cfg(test)]
     registry_observer: Option<Arc<dyn Fn(registry::RegistryEvent) + Send + Sync>>,
     #[cfg(test)]
@@ -535,6 +709,7 @@ impl PrepareHooks {
             domain: EvidenceDomain::Live,
             fail_allocation: false,
             fail_ready_publication: false,
+            fail_attach_publication: false,
             #[cfg(test)]
             registry_observer: None,
             #[cfg(test)]
@@ -593,6 +768,9 @@ where
             return;
         }
     };
+    registry
+        .journal
+        .bind(shared.epoch, request.input.object_sha256);
     let setup = catch_unwind(AssertUnwindSafe(|| {
         if shared.abandoned.load(Ordering::Acquire) {
             return Err(OwnerFailure::engine(
@@ -625,8 +803,8 @@ where
                 FailureClass::Publication,
             ));
         }
-        // Keep data-only load slots in this owner's stack through cleanup.
-        let _loaded = loaded;
+        // Data-only load slots remain in the owner through every command.
+
         let mut state = locked(&shared.state);
         if shared.abandoned.load(Ordering::Acquire) {
             return Err(OwnerFailure::engine(
@@ -653,12 +831,118 @@ where
             ));
         }
         shared.changed.notify_all();
-        Ok(())
+        Ok(loaded)
     }));
+    let mut active_deadline = shared.setup_deadline;
     match setup {
-        Ok(Ok(())) => {
-            while !shared.abandoned.load(Ordering::Acquire) {
-                thread::park();
+        Ok(Ok(loaded)) => {
+            loop {
+                let command = {
+                    let mut state = locked(&shared.state);
+                    registry.journal.acknowledged(state.frontier.last_acked);
+                    let command = state.ordinary.take_request();
+                    if command.is_none()
+                        && (state.terminal.is_some() || shared.abandoned.load(Ordering::Acquire))
+                    {
+                        break;
+                    }
+                    command
+                };
+                let Some(OwnerRequest::Attach {
+                    request: attach_request,
+                    ack,
+                }) = command
+                else {
+                    thread::park();
+                    continue;
+                };
+                active_deadline = attach_request.deadline;
+                registry.journal.begin(attach_request.seq);
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    let result = registry.attach(
+                        &mut driver,
+                        loaded.program,
+                        request.input.target_tgid,
+                        &attach_request,
+                        ack,
+                    );
+                    (result, driver.now())
+                }));
+                let (result, command_finished) = match result {
+                    Ok(result) => result,
+                    Err(_) => {
+                        let operation = locked(&shared.state)
+                            .active_operation
+                            .unwrap_or(CountOperation::Attach);
+                        (
+                            Err(OwnerFailure::engine(operation, FailureClass::Panic)),
+                            Instant::now(),
+                        )
+                    }
+                };
+                #[cfg(test)]
+                registry.observe_attach_storage();
+                let mut state = locked(&shared.state);
+                let entered = state.active_operation.take().is_some();
+                let result = result.and_then(|ack| {
+                    if hooks.fail_attach_publication {
+                        Err(OwnerFailure::engine(
+                            CountOperation::Attach,
+                            FailureClass::Publication,
+                        ))
+                    } else if command_finished >= attach_request.deadline {
+                        Err(OwnerFailure::engine(
+                            CountOperation::Attach,
+                            FailureClass::Deadline,
+                        ))
+                    } else if state.terminal.is_some() || shared.abandoned.load(Ordering::Acquire) {
+                        Err(OwnerFailure::engine(
+                            CountOperation::Attach,
+                            FailureClass::Disconnected,
+                        ))
+                    } else {
+                        Ok(ack)
+                    }
+                });
+                let response = match result {
+                    Ok(ack) => {
+                        state.phase = OwnerPhase::Observing;
+                        Ok(CommandAck {
+                            seq: attach_request.seq,
+                            value: ack,
+                        })
+                    }
+                    Err(failure) => {
+                        let ticket = shared.seal_locked(&mut state, attach_request.deadline);
+                        state.phase = OwnerPhase::Sealing;
+                        Err(CommandFailure {
+                            seq: attach_request.seq,
+                            failure,
+                            completion: if failure.class == FailureClass::Panic {
+                                CommandCompletion::Unknown
+                            } else if entered {
+                                CommandCompletion::Completed
+                            } else {
+                                CommandCompletion::NotEntered
+                            },
+                            cleanup_ticket: Some(ticket),
+                        })
+                    }
+                };
+                // Both vectors were reserved before this command. Publishing
+                // moves metadata only; successful FDs already have custody.
+                let successful_reply = response.is_ok();
+                if state
+                    .ordinary
+                    .publish_reply(OwnerReply::Attached(response))
+                    .is_err()
+                {
+                    shared.seal_locked(&mut state, attach_request.deadline);
+                    state.phase = OwnerPhase::Sealing;
+                } else if successful_reply {
+                    registry.journal.published(attach_request.seq);
+                }
+                shared.changed.notify_all();
             }
         }
         Ok(Err(failure)) => shared.failed(failure),
@@ -667,7 +951,18 @@ where
             FailureClass::Panic,
         )),
     }
-    shared.seal(shared.setup_deadline);
+    shared.seal(active_deadline);
+    let frontier = {
+        let mut state = locked(&shared.state);
+        registry.journal.acknowledged(state.frontier.last_acked);
+        std::mem::take(&mut state.frontier)
+    };
+    let inventory = registry.journal.seal(&frontier);
+    {
+        let mut state = locked(&shared.state);
+        state.inventory = Some(inventory);
+        shared.changed.notify_all();
+    }
     shared.cleanup_progress(&registry, OwnerPhase::Cleaning);
     let cleanup = catch_unwind(AssertUnwindSafe(|| registry.cleanup(&mut driver)));
     shared.cleanup_progress(&registry, OwnerPhase::Cleaning);

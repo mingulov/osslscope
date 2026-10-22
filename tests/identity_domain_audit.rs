@@ -331,6 +331,26 @@ fn h5_t3_every_device_site_names_one_domain() {
         // the stat word (same plumbing, tripwire key).
         ("src/check.rs", "stat", "device: h.key.device,", 1),
         ("src/check.rs", "stat", "\"device\": h.key.device,", 1),
+        // Count owner: borrowed-fstat raw dev_t is encoded into the planned
+        // stat identity. The two real host fixtures use that same conversion.
+        (
+            "src/count_owner/io.rs",
+            "raw",
+            "device: crate::plan::encode_device(libc::major(stat.st_dev), libc::minor(stat.st_dev)),",
+            1,
+        ),
+        (
+            "src/count_owner/tests.rs",
+            "raw",
+            "device: crate::plan::encode_device(libc::major(old.dev()), libc::minor(old.dev())),",
+            1,
+        ),
+        (
+            "src/count_owner/tests.rs",
+            "raw",
+            "device: crate::plan::encode_device(libc::major(current.dev()), libc::minor(current.dev())),",
+            1,
+        ),
         // count_session.rs: triple keys (stat words, ×3).
         (
             "src/count_session.rs",
