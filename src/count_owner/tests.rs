@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 enum Event {
     Started,
     Registry(RegistryEvent),
+    Mailbox(MailboxEvent),
     EnterAcquire(usize),
     Acquired(usize),
     EnterClose,
@@ -115,7 +116,10 @@ impl Probe {
             "coordinator_close_calls"
         );
         assert!(
-            log.events.iter().all(|(t, _)| *t != controller),
+            log.events
+                .iter()
+                .filter(|(_, e)| !matches!(e, Event::Mailbox(_)))
+                .all(|(t, _)| *t != controller),
             "count I/O escaped the owner"
         );
         if let Some((owner, _)) = log
@@ -124,13 +128,90 @@ impl Probe {
             .find(|(_, event)| matches!(event, Event::Started))
         {
             assert!(
-                log.events.iter().all(|(thread, _)| thread == owner),
+                log.events
+                    .iter()
+                    .filter(|(_, e)| !matches!(e, Event::Mailbox(_)))
+                    .all(|(thread, _)| thread == owner),
                 "count I/O moved to another worker"
             );
         }
         for (_, event) in &log.events {
             if let Event::Registry(event) = event {
                 assert_ne!(event.resource(), ResourceId::Engine);
+            }
+        }
+        // One probe can include a pre-epoch admission refusal followed by the
+        // real FD-owning attempt. Inspect the cells of that actual attempt.
+        let first_acquire = log
+            .events
+            .iter()
+            .position(|(_, e)| matches!(e, Event::EnterAcquire(_)))
+            .unwrap_or(log.events.len());
+        if let Some((constructed_at, (request_cell, reply_cell))) = log.events[..first_acquire]
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(i, (_, e))| {
+                if let Event::Mailbox(MailboxEvent::Constructed { request, reply }) = e {
+                    Some((i, (*request, *reply)))
+                } else {
+                    None
+                }
+            })
+        {
+            assert_ne!(request_cell, 0);
+            assert_ne!(reply_cell, 0);
+            assert_ne!(request_cell, reply_cell);
+            let mut published = None;
+            let mut taken = None;
+            let mut replies = 0;
+            let mut received = 0;
+            for (i, (thread, event)) in log.events.iter().enumerate().skip(constructed_at) {
+                match event {
+                    Event::Mailbox(MailboxEvent::RequestPublished(cell)) => {
+                        assert_eq!(*cell, request_cell);
+                        assert_eq!(*thread, controller);
+                        assert!(
+                            published.replace(i).is_none(),
+                            "another preparation request was admitted"
+                        );
+                    }
+                    Event::Mailbox(MailboxEvent::RequestTaken(cell)) => {
+                        assert_eq!(*cell, request_cell);
+                        assert_ne!(*thread, controller);
+                        assert!(
+                            taken.replace(i).is_none(),
+                            "request payload was consumed twice"
+                        );
+                    }
+                    Event::Mailbox(MailboxEvent::ReplyPublished(cell)) => {
+                        assert_eq!(*cell, reply_cell);
+                        assert_ne!(*thread, controller);
+                        replies += 1;
+                    }
+                    Event::Mailbox(MailboxEvent::ReplyTaken(cell)) => {
+                        assert_eq!(*cell, reply_cell);
+                        assert_eq!(*thread, controller);
+                        received += 1;
+                    }
+                    _ => {}
+                }
+            }
+            assert!(
+                replies <= 1 && received <= 1,
+                "setup reply cell was overwritten or consumed twice"
+            );
+            if let Some(first_acquire) = log
+                .events
+                .iter()
+                .position(|(_, e)| matches!(e, Event::EnterAcquire(_)))
+            {
+                assert!(
+                    constructed_at < published.unwrap()
+                        && published.unwrap() < taken.unwrap()
+                        && taken.unwrap() < first_acquire,
+                    "actual request ownership did not precede acquisition"
+                );
             }
         }
         for witness in &log.witnesses {
@@ -306,6 +387,8 @@ fn injected(
     hooks.registry_observer = Some(Arc::new(move |event| {
         observed.event(Event::Registry(event))
     }));
+    let observed = Arc::clone(&probe);
+    hooks.mailbox_observer = Some(Arc::new(move |event| observed.event(Event::Mailbox(event))));
     CountEngine::prepare_with(
         input(barrier),
         CountOwnerLimits::from_allowance(18, 2).unwrap(),
@@ -325,6 +408,215 @@ fn injected(
         spawn_owner,
     )
 }
+#[test]
+fn g1_prepare_mailbox_before_first_fd() {
+    let probe = Probe::new();
+    let controller = std::thread::current().id();
+    let engine = injected(
+        Arc::clone(&probe),
+        Faults::default(),
+        Arc::new(CountForkBarrier::new()),
+        Instant::now() + Duration::from_secs(2),
+        PrepareHooks::host(),
+    )
+    .unwrap();
+    drop(engine);
+    probe.assert_cleanup(8, controller);
+    let events = probe.log.lock().unwrap().events.clone();
+    let first_acquire = events
+        .iter()
+        .position(|(_, e)| matches!(e, Event::EnterAcquire(_)))
+        .unwrap();
+    let constructed = events
+        .iter()
+        .position(|(_, e)| matches!(e, Event::Mailbox(MailboxEvent::Constructed { .. })));
+    assert!(
+        constructed.is_some_and(|i| i < first_acquire),
+        "real preparation acquired eight FDs without the preallocated request/reply cells before acquisition: constructed={constructed:?}, first_acquire={first_acquire}"
+    );
+    let submitted = events
+        .iter()
+        .position(|(_, e)| matches!(e, Event::Mailbox(MailboxEvent::RequestPublished(_))))
+        .unwrap();
+    let taken = events
+        .iter()
+        .position(|(_, e)| matches!(e, Event::Mailbox(MailboxEvent::RequestTaken(_))))
+        .unwrap();
+    let replied = events
+        .iter()
+        .position(|(_, e)| matches!(e, Event::Mailbox(MailboxEvent::ReplyPublished(_))))
+        .unwrap();
+    let received = events
+        .iter()
+        .position(|(_, e)| matches!(e, Event::Mailbox(MailboxEvent::ReplyTaken(_))))
+        .unwrap();
+    assert!(
+        constructed.unwrap() < submitted
+            && submitted < taken
+            && taken < first_acquire
+            && first_acquire < replied
+            && replied < received
+    );
+}
+
+#[test]
+fn g1_prepare_mailbox_capacity_and_ownership() {
+    #[derive(Debug)]
+    struct Payload {
+        id: u8,
+        drops: Arc<Mutex<Vec<u8>>>,
+    }
+    impl Drop for Payload {
+        fn drop(&mut self) {
+            self.drops.lock().unwrap().push(self.id);
+        }
+    }
+    let drops = Arc::new(Mutex::new(Vec::with_capacity(7)));
+    let payload = |id| Payload {
+        id,
+        drops: Arc::clone(&drops),
+    };
+    let mut cells = OrdinaryCells::<Payload, Payload>::new();
+    let request_address = &cells.request as *const _ as usize;
+    let reply_address = &cells.reply as *const _ as usize;
+    assert_ne!(request_address, reply_address);
+    let unsolicited = cells.publish_reply(payload(0)).unwrap_err();
+    assert!(drops.lock().unwrap().is_empty());
+    drop(unsolicited);
+    cells.publish_request(payload(1)).unwrap();
+    let rejected_request = cells.publish_request(payload(2)).unwrap_err();
+    assert_eq!(rejected_request.id, 2);
+    let owned_request = cells.take_request().unwrap();
+    assert_eq!(owned_request.id, 1);
+    assert!(cells.take_request().is_none());
+    let while_executing = cells.publish_request(payload(3)).unwrap_err();
+    assert_eq!(
+        while_executing.id, 3,
+        "taking the request freed the in-flight command allowance"
+    );
+    cells.publish_reply(payload(4)).unwrap();
+    let rejected_reply = cells.publish_reply(payload(5)).unwrap_err();
+    assert_eq!(rejected_reply.id, 5);
+    let while_reply_pending = cells.publish_request(payload(6)).unwrap_err();
+    assert_eq!(
+        while_reply_pending.id, 6,
+        "a pending reply admitted another request"
+    );
+    assert_eq!(
+        *drops.lock().unwrap(),
+        vec![0],
+        "refused or moved payloads were silently dropped"
+    );
+    let received = cells.take_reply().unwrap();
+    assert_eq!(
+        received.id, 4,
+        "the duplicate reply replaced the original payload"
+    );
+    assert!(cells.take_reply().is_none());
+    cells.publish_request(while_reply_pending).unwrap();
+    assert_eq!(&cells.request as *const _ as usize, request_address);
+    assert_eq!(&cells.reply as *const _ as usize, reply_address);
+    drop((
+        cells,
+        owned_request,
+        received,
+        rejected_request,
+        while_executing,
+        rejected_reply,
+    ));
+    let mut actual = drops.lock().unwrap().clone();
+    actual.sort_unstable();
+    assert_eq!(
+        actual,
+        (0..=6).collect::<Vec<_>>(),
+        "mailbox payload ownership was duplicated or lost"
+    );
+}
+
+#[test]
+fn g1_prepare_mailbox_pre_spawn_abort_releases_input() {
+    for allocation_failure in [true, false] {
+        let probe = Probe::new();
+        let barrier = Arc::new(CountForkBarrier::new());
+        let input = input(Arc::clone(&barrier));
+        let source = Arc::downgrade(&input.object_bytes);
+        let during_spawn = source.clone();
+        let observed = Arc::clone(&probe);
+        let mut hooks = PrepareHooks::host();
+        hooks.fail_allocation = allocation_failure;
+        hooks.mailbox_observer = Some(Arc::new(move |event| observed.event(Event::Mailbox(event))));
+        let at_spawn = Arc::clone(&probe);
+        let failure = CountEngine::prepare_with(
+            input,
+            CountOwnerLimits::from_allowance(18, 1).unwrap(),
+            Instant::now() + Duration::from_secs(2),
+            hooks,
+            || -> PipeDriver {
+                panic!("failed preparation must not construct a driver");
+            },
+            move |task| {
+                assert!(
+                    during_spawn.upgrade().is_some(),
+                    "the request lost its owned source bytes before spawn"
+                );
+                {
+                    let log = at_spawn.log.lock().unwrap();
+                    assert_eq!(
+                        log.events
+                            .iter()
+                            .filter(|(_, e)| matches!(
+                                e,
+                                Event::Mailbox(MailboxEvent::Constructed { .. })
+                            ))
+                            .count(),
+                        1
+                    );
+                    assert_eq!(
+                        log.events
+                            .iter()
+                            .filter(|(_, e)| matches!(
+                                e,
+                                Event::Mailbox(MailboxEvent::RequestPublished(_))
+                            ))
+                            .count(),
+                        1
+                    );
+                }
+                drop(task);
+                assert!(
+                    during_spawn.upgrade().is_some(),
+                    "dropping the unstarted task erased the shared request cell's ownership"
+                );
+                Err(io::Error::from_raw_os_error(libc::EAGAIN))
+            },
+        )
+        .err()
+        .unwrap();
+        assert_eq!(failure.cleanup_ticket, None);
+        assert_eq!(
+            failure.failure.class,
+            if allocation_failure {
+                FailureClass::Allocation
+            } else {
+                FailureClass::Io
+            }
+        );
+        assert!(
+            source.upgrade().is_none(),
+            "an aborted, unstarted request retained its source bytes"
+        );
+        let log = probe.log.lock().unwrap();
+        assert!(
+            log.events
+                .iter()
+                .all(|(_, e)| matches!(e, Event::Mailbox(_))),
+            "pre-spawn abort entered count I/O"
+        );
+        assert_eq!(log.events.len(), if allocation_failure { 0 } else { 2 });
+        assert!(barrier.prefix_permit(Instant::now()).is_ok());
+    }
+}
+
 #[test]
 fn g1_prepare_before_first_fd() {
     let probe = Probe::new();
@@ -353,7 +645,10 @@ fn g1_prepare_before_first_fd() {
             .position(|(_, e)| matches!(e, Event::EnterAcquire(_)));
         assert!(first.is_none_or(|i| started < i));
         assert!(
-            log.events.iter().all(|(thread, _)| *thread != controller),
+            log.events
+                .iter()
+                .filter(|(_, e)| !matches!(e, Event::Mailbox(_)))
+                .all(|(thread, _)| *thread != controller),
             "all count acquisition must run on the already-started owner, never the controller"
         );
         let entered: Vec<_> = log
@@ -554,7 +849,13 @@ fn g1_prepare_blocked_cancellation_keeps_one_ticket() {
         .is_err()
     );
     assert!(
-        second.log.lock().unwrap().events.is_empty(),
+        second
+            .log
+            .lock()
+            .unwrap()
+            .events
+            .iter()
+            .all(|(_, e)| matches!(e, Event::Mailbox(_))),
         "unresolved epoch admitted another owner"
     );
     probe.release();
@@ -580,7 +881,15 @@ fn g1_prepare_fork_permits_exclude_acquisition() {
         )
         .is_err()
     );
-    assert!(probe.log.lock().unwrap().events.is_empty());
+    assert!(
+        probe
+            .log
+            .lock()
+            .unwrap()
+            .events
+            .iter()
+            .all(|(_, e)| matches!(e, Event::Mailbox(_)))
+    );
     drop(permit);
     let engine = injected(
         Arc::clone(&probe),
@@ -607,7 +916,15 @@ fn g1_prepare_fork_permits_exclude_acquisition() {
         )
         .is_err()
     );
-    assert!(second.log.lock().unwrap().events.is_empty());
+    assert!(
+        second
+            .log
+            .lock()
+            .unwrap()
+            .events
+            .iter()
+            .all(|(_, e)| matches!(e, Event::Mailbox(_)))
+    );
     drop(permit);
     probe.assert_cleanup(8, std::thread::current().id());
 }

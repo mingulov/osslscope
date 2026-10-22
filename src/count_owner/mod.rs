@@ -164,8 +164,108 @@ struct Seal {
     ticket: CleanupTicket,
     deadline: Instant,
 }
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+enum MailboxEvent {
+    Constructed { request: usize, reply: usize },
+    RequestPublished(usize),
+    RequestTaken(usize),
+    ReplyPublished(usize),
+    ReplyTaken(usize),
+}
+/// One inline request cell and one inline reply cell. Taking a request does not
+/// release its admission allowance: that happens only when its reply is taken.
+/// These cells are part of the preallocated SharedState, never grown at Ready.
+struct OrdinaryCells<Request, Reply> {
+    request: Option<Request>,
+    reply: Option<Reply>,
+    in_flight: bool,
+    #[cfg(test)]
+    observer: Option<Arc<dyn Fn(MailboxEvent) + Send + Sync>>,
+}
+impl<Request, Reply> OrdinaryCells<Request, Reply> {
+    fn new() -> Self {
+        Self {
+            request: None,
+            reply: None,
+            in_flight: false,
+            #[cfg(test)]
+            observer: None,
+        }
+    }
+    fn publish_request(&mut self, request: Request) -> Result<(), Request> {
+        if self.in_flight {
+            return Err(request);
+        }
+        self.request = Some(request);
+        self.in_flight = true;
+        #[cfg(test)]
+        if let Some(observer) = &self.observer {
+            observer(MailboxEvent::RequestPublished(
+                &self.request as *const _ as usize,
+            ));
+        }
+        Ok(())
+    }
+    fn take_request(&mut self) -> Option<Request> {
+        let request = self.request.take()?;
+        #[cfg(test)]
+        if let Some(observer) = &self.observer {
+            observer(MailboxEvent::RequestTaken(
+                &self.request as *const _ as usize,
+            ));
+        }
+        Some(request)
+    }
+    fn publish_reply(&mut self, reply: Reply) -> Result<(), Reply> {
+        if !self.in_flight || self.request.is_some() || self.reply.is_some() {
+            return Err(reply);
+        }
+        self.reply = Some(reply);
+        #[cfg(test)]
+        if let Some(observer) = &self.observer {
+            observer(MailboxEvent::ReplyPublished(
+                &self.reply as *const _ as usize,
+            ));
+        }
+        Ok(())
+    }
+    fn take_reply(&mut self) -> Option<Reply> {
+        let reply = self.reply.take()?;
+        self.in_flight = false;
+        #[cfg(test)]
+        if let Some(observer) = &self.observer {
+            observer(MailboxEvent::ReplyTaken(&self.reply as *const _ as usize));
+        }
+        Some(reply)
+    }
+    #[cfg(test)]
+    fn observe_constructed(&self) {
+        if let Some(observer) = &self.observer {
+            observer(MailboxEvent::Constructed {
+                request: &self.request as *const _ as usize,
+                reply: &self.reply as *const _ as usize,
+            });
+        }
+    }
+}
+// Preparation already uses the same concrete cells that the later serial
+// command task will extend. Only this setup request is admitted/processed now;
+// attach/open/read request variants and their handlers remain absent.
+struct PreparationRequest {
+    owner_epoch: OwnerEpoch,
+    deadline: Instant,
+    input: CountInput,
+    prepared: crate::loader::Prepared,
+}
+enum OwnerRequest {
+    Prepare(PreparationRequest),
+}
+enum OwnerReply {
+    Prepared(Result<Ready, OwnerFailure>),
+}
 struct SharedState {
-    ready: Option<Result<Ready, OwnerFailure>>,
+    ordinary: OrdinaryCells<OwnerRequest, OwnerReply>,
     terminal: Option<Seal>,
     terminal_ids: protocol::IdCounter,
     resources: ResourceSummary,
@@ -212,9 +312,9 @@ impl Shared {
     fn failed(&self, failure: OwnerFailure) {
         self.seal(self.setup_deadline);
         let mut state = locked(&self.state);
-        if state.ready.is_none() {
-            state.ready = Some(Err(failure));
-        }
+        let _ = state
+            .ordinary
+            .publish_reply(OwnerReply::Prepared(Err(failure)));
         self.changed.notify_all();
     }
     fn cleanup_progress(&self, registry: &Registry, phase: OwnerPhase) {
@@ -318,8 +418,15 @@ impl CountEngine {
                 .checked_add(1)
                 .ok_or_else(|| preflight_failure(FailureClass::IdExhausted))?,
         )?;
-        // All registry, ready/reply, sticky-terminal and progress cells exist
-        // before the worker starts. No ordinary command is admitted in Preparing.
+        // Both ordinary cells, the registry, sticky terminal and progress state
+        // exist before spawn. Preparation itself owns the first request/reply;
+        // later count commands cannot be submitted or processed yet.
+        let ordinary = OrdinaryCells::new();
+        #[cfg(test)]
+        let ordinary = OrdinaryCells {
+            observer: hooks.mailbox_observer.clone(),
+            ..ordinary
+        };
         let shared = Arc::new(Shared {
             epoch,
             barrier: Arc::clone(&input.fork_barrier),
@@ -327,7 +434,7 @@ impl CountEngine {
             abandoned: Arc::clone(&registry.abandoned),
             worker: OnceLock::new(),
             state: Mutex::new(SharedState {
-                ready: None,
+                ordinary,
                 terminal: None,
                 terminal_ids: protocol::IdCounter::default(),
                 resources,
@@ -335,11 +442,27 @@ impl CountEngine {
             }),
             changed: Condvar::new(),
         });
+        {
+            let mut state = locked(&shared.state);
+            #[cfg(test)]
+            state.ordinary.observe_constructed();
+            if state
+                .ordinary
+                .publish_request(OwnerRequest::Prepare(PreparationRequest {
+                    owner_epoch: epoch,
+                    deadline,
+                    input,
+                    prepared,
+                }))
+                .is_err()
+            {
+                return Err(preflight_failure(FailureClass::Publication));
+            }
+        }
         registry.shared = Some(Arc::clone(&shared));
-        input.fork_barrier.admit(epoch, deadline)?;
+        shared.barrier.admit(epoch, deadline)?;
         let owner_shared = Arc::clone(&shared);
-        let task =
-            Box::new(move || owner_main(owner_shared, input, prepared, registry, hooks, factory));
+        let task = Box::new(move || owner_main(owner_shared, registry, hooks, factory));
         if let Err(error) = spawner(task) {
             shared.barrier.spawn_failed(epoch);
             return Err(CountPrepareFailure::from(OwnerFailure::io(
@@ -361,7 +484,7 @@ impl CountEngine {
                     cleanup_ticket: Some(ticket),
                 });
             }
-            if let Some(result) = state.ready.take() {
+            if let Some(OwnerReply::Prepared(result)) = state.ordinary.take_reply() {
                 drop(state);
                 return match result {
                     Ok(ready) => Ok(Self { shared, ready }),
@@ -403,6 +526,8 @@ struct PrepareHooks {
     fail_ready_publication: bool,
     #[cfg(test)]
     registry_observer: Option<Arc<dyn Fn(registry::RegistryEvent) + Send + Sync>>,
+    #[cfg(test)]
+    mailbox_observer: Option<Arc<dyn Fn(MailboxEvent) + Send + Sync>>,
 }
 impl PrepareHooks {
     fn live() -> Self {
@@ -412,6 +537,8 @@ impl PrepareHooks {
             fail_ready_publication: false,
             #[cfg(test)]
             registry_observer: None,
+            #[cfg(test)]
+            mailbox_observer: None,
         }
     }
     #[cfg(test)]
@@ -422,14 +549,8 @@ impl PrepareHooks {
         }
     }
 }
-fn owner_main<D, F>(
-    shared: Arc<Shared>,
-    input: CountInput,
-    prepared: crate::loader::Prepared,
-    mut registry: Registry,
-    hooks: PrepareHooks,
-    factory: F,
-) where
+fn owner_main<D, F>(shared: Arc<Shared>, mut registry: Registry, hooks: PrepareHooks, factory: F)
+where
     D: CountIoDriver,
     F: FnOnce() -> D,
 {
@@ -438,13 +559,31 @@ fn owner_main<D, F>(
     shared.barrier.started(shared.epoch);
     // Construct injected drivers here, after successful owner creation; no test
     // factory can create a count FD on the controller through this entry point.
-    let mut driver = match catch_unwind(AssertUnwindSafe(factory)) {
-        Ok(driver) => driver,
-        Err(_) => {
-            shared.failed(OwnerFailure::engine(
+    let initialization = catch_unwind(AssertUnwindSafe(|| {
+        let Some(OwnerRequest::Prepare(request)) = locked(&shared.state).ordinary.take_request()
+        else {
+            return Err(OwnerFailure::engine(
                 CountOperation::Load,
-                FailureClass::Panic,
+                FailureClass::Inventory,
             ));
+        };
+        if request.owner_epoch != shared.epoch || request.deadline != shared.setup_deadline {
+            return Err(OwnerFailure::engine(
+                CountOperation::Load,
+                FailureClass::Inventory,
+            ));
+        }
+        Ok((request, factory()))
+    }));
+    let (request, mut driver) = match initialization {
+        Ok(Ok(initialized)) => initialized,
+        failed => {
+            let failure = match failed {
+                Ok(Err(failure)) => failure,
+                Err(_) => OwnerFailure::engine(CountOperation::Load, FailureClass::Panic),
+                Ok(Ok(_)) => unreachable!(),
+            };
+            shared.failed(failure);
             // No syscall seam was entered. Resolve the actual empty registry,
             // rather than manufacturing a cleanup acknowledgment from a count.
             registry.seal_unentered();
@@ -462,7 +601,7 @@ fn owner_main<D, F>(
             ));
         }
         let loaded = crate::loader::load_count_tracked(
-            &prepared,
+            &request.prepared,
             &mut registry,
             &mut driver,
             shared.setup_deadline,
@@ -497,12 +636,22 @@ fn owner_main<D, F>(
         }
         registry.publish_into(&mut state.resources);
         state.phase = OwnerPhase::Ready;
-        state.ready = Some(Ok(Ready {
+        let ready = Ready {
             owner_epoch: shared.epoch,
-            writer_object_identity: input.object_sha256,
+            writer_object_identity: request.input.object_sha256,
             dimensions: CountDimensions::validated(),
             evidence_domain: hooks.domain,
-        }));
+        };
+        if state
+            .ordinary
+            .publish_reply(OwnerReply::Prepared(Ok(ready)))
+            .is_err()
+        {
+            return Err(OwnerFailure::engine(
+                CountOperation::Load,
+                FailureClass::Publication,
+            ));
+        }
         shared.changed.notify_all();
         Ok(())
     }));
