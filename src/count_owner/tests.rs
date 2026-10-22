@@ -2415,7 +2415,9 @@ fn g1_prepare_blocked_cleanup_publishes_exact_progress() {
         PrepareHooks::host(),
     )
     .unwrap();
+    let abandonment_before = Instant::now();
     engine.abandon();
+    let abandonment_after = Instant::now();
     probe.wait(|events| {
         events
             .iter()
@@ -2425,6 +2427,7 @@ fn g1_prepare_blocked_cleanup_publishes_exact_progress() {
     });
     // Capture first, release the hold before any assertion can unwind the test.
     let summary = engine.resource_summary();
+    let first_deadline = locked(&engine.shared.state).terminal.unwrap().deadline;
     let ticket = engine.shared.seal(deadline + Duration::from_secs(1));
     let actual_deadline = locked(&engine.shared.state).terminal.unwrap().deadline;
     probe.release();
@@ -2451,9 +2454,10 @@ fn g1_prepare_blocked_cleanup_publishes_exact_progress() {
     assert!(!summary.cleanup_complete);
     assert_eq!(ticket.owner_epoch, engine.ready().owner_epoch);
     assert_eq!(
-        actual_deadline, deadline,
+        actual_deadline, first_deadline,
         "a repeated seal extended the canonical deadline"
     );
+    assert!(abandonment_before <= first_deadline && first_deadline <= abandonment_after);
 }
 
 #[test]
@@ -4473,6 +4477,10 @@ struct TerminalFaults {
     family: CountDimensions,
     fail_publication: bool,
     clock_panic_after_close: bool,
+    clock: Option<Arc<ControlledClock>>,
+    publication_gate: Option<Arc<Probe>>,
+    registry_hook: Option<Arc<dyn Fn(RegistryEvent) + Send + Sync>>,
+    seal_claim_gate: Option<Arc<Probe>>,
 }
 impl Default for TerminalFaults {
     fn default() -> Self {
@@ -4484,6 +4492,10 @@ impl Default for TerminalFaults {
             family: CountDimensions::validated(),
             fail_publication: false,
             clock_panic_after_close: false,
+            clock: None,
+            publication_gate: None,
+            registry_hook: None,
+            seal_claim_gate: None,
         }
     }
 }
@@ -4501,6 +4513,7 @@ struct TerminalDriver {
     links: Vec<i32>,
     timeline: Arc<Mutex<Vec<(TerminalEvent, Instant)>>>,
     clock_panic_after_close: bool,
+    clock: Option<Arc<ControlledClock>>,
 }
 impl CountIoDriver for TerminalDriver {
     fn map_create(&mut self, spec: &crate::loader::MapSpecLite) -> io::Result<OwnedFd> {
@@ -4658,7 +4671,9 @@ impl CountIoDriver for TerminalDriver {
             !self.clock_panic_after_close || self.map.base.closes == 0,
             "terminal post-close clock unwind control"
         );
-        self.map.now()
+        self.clock
+            .as_ref()
+            .map_or_else(|| self.map.now(), |clock| clock.now())
     }
     fn monotonic_ns(&self) -> Option<u64> {
         self.map.monotonic_ns()
@@ -4670,13 +4685,35 @@ fn terminal_engine(
     faults: TerminalFaults,
 ) -> (CountEngine, Arc<Mutex<Vec<(TerminalEvent, Instant)>>>) {
     let observed = Arc::clone(&probe.owner);
+    let registry_hook = faults.registry_hook.clone();
     let mut hooks = PrepareHooks::host();
     hooks.kernel_profile = faults.profile;
     hooks.final_references = faults.references;
     hooks.writer_family = faults.family;
     hooks.fail_attach_publication = faults.fail_publication;
+    hooks.clock = faults.clock.as_ref().map(|clock| {
+        let clock = Arc::clone(clock);
+        Arc::new(move || clock.now()) as Arc<dyn Fn() -> Instant + Send + Sync>
+    });
+    hooks.before_terminal_publication = faults.publication_gate.as_ref().map(|gate| {
+        let gate = Arc::clone(gate);
+        Arc::new(move || {
+            gate.event(Event::Started);
+            gate.hold();
+        }) as Arc<dyn Fn() + Send + Sync>
+    });
+    hooks.seal_claim_observer = faults.seal_claim_gate.as_ref().map(|gate| {
+        let gate = Arc::clone(gate);
+        Arc::new(move || {
+            gate.event(Event::Started);
+            gate.hold();
+        }) as Arc<dyn Fn() + Send + Sync>
+    });
     hooks.registry_observer = Some(Arc::new(move |event| {
-        observed.event(Event::Registry(event))
+        observed.event(Event::Registry(event));
+        if let Some(hook) = &registry_hook {
+            hook(event);
+        }
     }));
     let probe = Arc::clone(probe);
     let cutoff = Instant::now() + Duration::from_secs(30);
@@ -4712,6 +4749,7 @@ fn terminal_engine(
                 links: Vec::with_capacity(4),
                 timeline: observed,
                 clock_panic_after_close: faults.clock_panic_after_close,
+                clock: faults.clock,
             }
         },
         spawn_owner,
@@ -5618,25 +5656,42 @@ fn g1_terminal_cleanup_complete_and_failed_are_actual_registry_results() {
         let deadline = Instant::now();
         engine.shared.seal(deadline);
         task3_cleanup(&probe.owner, 8);
+        let mut barrier = locked(&engine.shared.barrier.state);
+        while !barrier.sealed {
+            barrier = engine.shared.barrier.changed.wait(barrier).unwrap();
+        }
+        drop(barrier);
         let receipt = engine.terminal(terminal_request(&engine, deadline));
-        assert!(matches!(receipt.writers, WriterCompletion::Unknown(_)));
+        assert!(matches!(receipt.writers, WriterCompletion::KnownEmpty(_)));
+        assert!(matches!(receipt.cleanup_state, CleanupState::Pending(_)));
+        let diagnostic = engine.cleanup_progress().unwrap();
         if fail {
-            let CleanupState::Failed(summary) = &receipt.cleanup_state else {
-                panic!("consumed error was erased")
-            };
+            let summary = engine.resource_summary();
             assert!(
                 summary.resources.iter().any(
                     |r| r.state == ResourceState::ConsumedError && r.errno == Some(libc::EINTR)
                 )
             );
             assert!(!summary.cleanup_complete);
+            assert_eq!(diagnostic.status, CleanupStatus::Failed);
+            assert_eq!(
+                diagnostic.failures.operations[CountOperation::Cleanup as usize]
+                    .unwrap()
+                    .errno,
+                Some(libc::EINTR)
+            );
             assert!(engine.fork_permit(Instant::now()).is_err());
         } else {
-            assert_eq!(receipt.cleanup_state, CleanupState::Complete);
+            assert_eq!(diagnostic.status, CleanupStatus::Complete);
             engine
                 .fork_permit(Instant::now() + Duration::from_secs(3))
                 .unwrap();
         }
+        assert_eq!(diagnostic.ticket, receipt.cleanup_ticket);
+        assert!(Arc::ptr_eq(
+            &receipt.0,
+            &engine.salvage_view(receipt.terminal_id).0
+        ));
     }
 }
 
@@ -5754,6 +5809,9 @@ fn g1_terminal_late_cleanup_error_refuses_fork_after_finished_snapshot() {
             TerminalFaults {
                 close: Faults {
                     fail_close: Some(close),
+                    // Make "late" independent of coordinator scheduling: the
+                    // error cannot return until this artifact is selected.
+                    hold_close: Some(close),
                     ..Faults::default()
                 },
                 ..TerminalFaults::default()
@@ -5766,6 +5824,8 @@ fn g1_terminal_late_cleanup_error_refuses_fork_after_finished_snapshot() {
         ));
         assert!(matches!(receipt.writers, WriterCompletion::Finished(_)));
         assert_eq!(receipt.read_status, ReadStatus::Complete);
+        assert!(matches!(receipt.cleanup_state, CleanupState::Pending(_)));
+        probe.owner.release();
         task3_cleanup(&probe.owner, 10);
         let summary = engine.resource_summary();
         assert!(summary.resources.iter().any(|r| r.resource == resource
@@ -5779,6 +5839,63 @@ fn g1_terminal_late_cleanup_error_refuses_fork_after_finished_snapshot() {
             Some(ForkBlocked::Unresolved)
         );
         assert!(matches!(receipt.cleanup_state, CleanupState::Pending(_)));
+    }
+}
+
+#[test]
+fn g1_terminal_cleanup_error_observed_before_selection_is_fatal() {
+    for (close, resource) in [
+        (2, ResourceId::Pin(0)),
+        (3, ResourceId::Program),
+        (4, ResourceId::Map(CountMap::Counts)),
+    ] {
+        let probe = MapProbe::new();
+        let (engine, _) = terminal_engine(
+            &probe,
+            None,
+            TerminalFaults {
+                close: Faults {
+                    fail_close: Some(close),
+                    ..Faults::default()
+                },
+                ..TerminalFaults::default()
+            },
+        );
+        engine.attach(attach_request(1, 1)).unwrap();
+        let request = terminal_request(&engine, Instant::now() + Duration::from_secs(5));
+        {
+            let mut state = locked(&engine.shared.state);
+            engine.shared.seal_locked(&mut state, request.deadline);
+            state.terminal_expected = Some(request.clone());
+        }
+        engine.shared.worker.get().unwrap().unpark();
+        task3_cleanup(&probe.owner, 10);
+        let mut barrier = locked(&engine.shared.barrier.state);
+        while !barrier.sealed {
+            barrier = engine.shared.barrier.changed.wait(barrier).unwrap();
+        }
+        drop(barrier);
+        // All error acknowledgments are established before this coordinator's
+        // first observation, unlike the held late-cleanup timing twin above.
+        let receipt = engine.terminal(request.clone());
+        assert!(matches!(receipt.writers, WriterCompletion::Finished(_)));
+        assert_eq!(receipt.read_status, ReadStatus::Complete);
+        assert!(matches!(receipt.cleanup_state, CleanupState::Failed(_)));
+        let failure = receipt.failures.operations[CountOperation::Cleanup as usize].unwrap();
+        assert_eq!(
+            (failure.class, failure.errno, failure.resource),
+            (FailureClass::Io, Some(libc::EINTR), resource)
+        );
+        assert_eq!(validate_terminal(&request, &receipt), Ok(()));
+        assert_eq!(
+            engine.cleanup_progress().unwrap().status,
+            CleanupStatus::Failed
+        );
+        assert!(engine.fork_permit(Instant::now()).is_err());
+        assert!(Arc::ptr_eq(
+            &receipt.0,
+            &engine.salvage_view(receipt.terminal_id).0
+        ));
     }
 }
 
@@ -6134,4 +6251,1105 @@ fn g1_terminal_close_progress_with_invalid_inventory_does_not_panic() {
         FailureClass::Inventory
     );
     assert!(validate_terminal(&request, &receipt).is_err());
+}
+
+// Catches treating the cutoff as an inclusive result-acceptance edge.
+#[test]
+fn g1_zero_grace_cutoff() {
+    let probe = MapProbe::new();
+    let (engine, _) = terminal_engine(&probe, None, TerminalFaults::default());
+    let request = terminal_request(&engine, Instant::now() + Duration::from_secs(3));
+    let receipt = engine.terminal(request.clone());
+    assert!(matches!(receipt.writers, WriterCompletion::Finished(_)));
+    for (delta, want) in [
+        (-1i32, Ok(())),
+        (0, Err(ReceiptFailure::Cutoff)),
+        (1, Err(ReceiptFailure::Cutoff)),
+    ] {
+        let instant = if delta < 0 {
+            request.deadline - Duration::from_nanos(1)
+        } else {
+            request.deadline + Duration::from_nanos(delta as u64)
+        };
+        let boundary = mutate_terminal(&receipt, |data| {
+            let WriterCompletion::Finished(witness) = &mut data.writers else {
+                unreachable!()
+            };
+            witness.established_at = instant;
+            let binding = data.snapshot_binding.as_mut().unwrap();
+            binding.started_at = instant;
+            binding.completed_at = instant;
+            data.checkpoint.as_mut().unwrap().published_at = instant;
+        });
+        assert_eq!(
+            validate_terminal(&request, &boundary),
+            want,
+            "cutoff delta {delta}"
+        );
+    }
+    task3_cleanup(&probe.owner, 8);
+}
+
+#[test]
+fn g1_zero_grace_confirmed_empty_is_not_a_queued_seal() {
+    let probe = MapProbe::new();
+    let (engine, _) = terminal_engine(&probe, None, TerminalFaults::default());
+    let request = terminal_request(&engine, Instant::now());
+    let receipt = engine.terminal(request.clone());
+    assert!(
+        matches!(receipt.writers, WriterCompletion::KnownEmpty(_)),
+        "confirmed never-commanded Ready family must be distinguishable from an unproven queued seal"
+    );
+    assert_eq!(receipt.read_status, ReadStatus::NotStarted);
+    assert!(receipt.checkpoint.is_none());
+    assert!(probe.calls.lock().unwrap().is_empty());
+    assert_eq!(validate_terminal(&request, &receipt), Ok(()));
+    for control in 0..10 {
+        let forged = mutate_terminal(&receipt, |data| {
+            let WriterCompletion::KnownEmpty(witness) = &mut data.writers else {
+                unreachable!()
+            };
+            match control {
+                0 => {
+                    witness.owner_epoch =
+                        OwnerEpoch::checked(witness.owner_epoch.value() + 1).unwrap()
+                }
+                1 => witness.writer_object_identity = [7; 32],
+                2 => witness.ready_published_at = request.deadline,
+                3 => data.last_command_seq = Some(CommandSeq::checked(1).unwrap()),
+                4 => data.read_status = ReadStatus::Complete,
+                5 => data.seal.result = StopResult::Stopped,
+                6 => data.failures.record(OwnerFailure::engine(
+                    CountOperation::Attach,
+                    FailureClass::Panic,
+                )),
+                7..=9 => {
+                    data.inventory = Some(Arc::new(SealedInventory {
+                        owner_epoch: receipt.owner_epoch,
+                        writer: WriterIdentity {
+                            owner_epoch: if control == 8 {
+                                OwnerEpoch::checked(receipt.owner_epoch.value() + 1).unwrap()
+                            } else {
+                                receipt.owner_epoch
+                            },
+                            object_sha256: receipt.writer_object_identity,
+                            program: if control == 7 {
+                                ResourceId::Engine
+                            } else {
+                                ResourceId::Program
+                            },
+                            maps: if control == 9 {
+                                [ResourceId::Engine; 7]
+                            } else {
+                                CountMap::ALL.map(ResourceId::Map)
+                            },
+                        },
+                        records: vec![],
+                        memberships: vec![],
+                        acknowledged_links: vec![],
+                        unpublished_links: vec![],
+                        last_acked: None,
+                        pending: None,
+                        last_completed: None,
+                        resolved_open: None,
+                    }));
+                }
+                _ => unreachable!(),
+            }
+        });
+        assert!(
+            validate_terminal(&request, &forged).is_err(),
+            "forged empty proof {control}"
+        );
+    }
+    let mut pending = request.clone();
+    pending.frontier.pending = Some(PendingCommandId {
+        seq: CommandSeq::checked(1).unwrap(),
+        operation: CountOperation::Attach,
+    });
+    assert!(validate_terminal(&pending, &receipt).is_err());
+    task3_cleanup(&probe.owner, 8);
+}
+
+// Catches putting terminal admission behind a full ordinary cell or waiting
+// for either progress publication mutex while raw GEN remains entered.
+#[test]
+fn g1_terminal_bypasses_full_slot() {
+    let probe = MapProbe::new();
+    let (engine, _) = terminal_engine(
+        &probe,
+        None,
+        TerminalFaults {
+            map: MapFaults {
+                hold_call: Some(1),
+                ..MapFaults::default()
+            },
+            ..TerminalFaults::default()
+        },
+    );
+    thread::scope(|scope| {
+        let generation = scope.spawn(|| {
+            engine.set_generation(GenerationRequest {
+                seq: CommandSeq::checked(1).unwrap(),
+                deadline: Instant::now() + Duration::from_secs(3),
+                generation: 7,
+            })
+        });
+        probe.wait_calls(1);
+        assert!(locked(&engine.shared.state).ordinary.in_flight);
+        let request = terminal_request(&engine, Instant::now());
+        let _latest = locked(&engine.shared.latest_progress);
+        let _retained = locked(&engine.shared.controller_progress);
+        assert!(engine.progress().is_none());
+        let receipt = engine.terminal(request.clone());
+        assert_eq!(receipt.terminal_id, request.id);
+        assert_eq!(receipt.deadline, request.deadline);
+        assert_eq!(
+            locked(&engine.shared.state).active_operation,
+            Some(CountOperation::Generation)
+        );
+        assert_eq!(probe.calls.lock().unwrap().len(), 1);
+        assert!(engine.fork_permit(Instant::now()).is_err());
+        probe.owner.release();
+        assert!(generation.join().unwrap().is_err());
+    });
+    task3_cleanup(&probe.owner, 8);
+}
+
+// Catches resetting the grace or retrying raw I/O when a caller requests
+// terminal completion again after the first deadline.
+#[test]
+fn g1_one_deadline_all_phases() {
+    let probe = MapProbe::new();
+    let (engine, _) = terminal_engine(
+        &probe,
+        None,
+        TerminalFaults {
+            close: Faults {
+                hold_close: Some(1),
+                ..Faults::default()
+            },
+            ..TerminalFaults::default()
+        },
+    );
+    engine.attach(attach_request(1, 1)).unwrap();
+    let request = terminal_request(&engine, Instant::now() + Duration::from_millis(50));
+    let receipt = engine.terminal(request.clone());
+    let mut repeated = request;
+    repeated.deadline += Duration::from_secs(20);
+    assert!(Arc::ptr_eq(&receipt.0, &engine.terminal(repeated).0));
+    probe.owner.release();
+    task3_cleanup(&probe.owner, 10);
+    assert_eq!(probe.calls.lock().unwrap().len(), 1);
+    assert_eq!(receipt.terminal_id, receipt.cleanup_ticket.terminal_id);
+}
+
+// Catches dropping the cleanup unwind result and falsely treating the final
+// physical close as a checked cleanup acknowledgment after a panic.
+#[test]
+fn g1_panic_disconnect_retains_one_owner() {
+    let probe = Probe::new();
+    let observed = Arc::clone(&probe);
+    let mut hooks = PrepareHooks::host();
+    hooks.registry_observer = Some(Arc::new(move |event| {
+        observed.event(Event::Registry(event));
+        if matches!(
+            event,
+            RegistryEvent::CloseReturned(ResourceId::Map(CountMap::Dropfail))
+        ) {
+            panic!("cleanup acknowledgment unwind control");
+        }
+    }));
+    let factory_probe = Arc::clone(&probe);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let engine = CountEngine::prepare_with(
+        input(Arc::new(CountForkBarrier::new())),
+        CountOwnerLimits::from_allowance(18, 2).unwrap(),
+        deadline,
+        hooks,
+        move || {
+            factory_probe.event(Event::Started);
+            PipeDriver {
+                probe: factory_probe,
+                faults: Faults::default(),
+                deadline,
+                attempts: 0,
+                acquired: 0,
+                closes: 0,
+            }
+        },
+        spawn_owner,
+    )
+    .unwrap();
+    engine.abandon();
+    probe.wait(|events| {
+        events.iter().any(|(_, event)| {
+            matches!(
+                event,
+                Event::Registry(RegistryEvent::CloseReturned(ResourceId::Map(
+                    CountMap::Dropfail
+                )))
+            )
+        })
+    });
+    // Wait for the owner to leave the protected cleanup body, never by sleep.
+    let mut barrier = locked(&engine.shared.barrier.state);
+    while !barrier.sealed {
+        barrier = engine.shared.barrier.changed.wait(barrier).unwrap();
+    }
+    drop(barrier);
+    let state = locked(&engine.shared.state);
+    assert_eq!(
+        state.failures.operations[CountOperation::Cleanup as usize].map(|f| f.class),
+        Some(FailureClass::Panic)
+    );
+    drop(state);
+    let diagnostic = engine.cleanup_progress().unwrap();
+    assert_eq!(diagnostic.status, CleanupStatus::Stranded);
+    assert_eq!(diagnostic.unresolved_resources, 0);
+    assert_eq!(diagnostic.actual_phase, OwnerPhase::Cleaning);
+    assert!(engine.fork_permit(Instant::now()).is_err());
+    task3_cleanup(&probe, 8);
+}
+
+#[test]
+fn g1_panic_disconnect_retains_one_owner_operation_matrix() {
+    for control in 0..5 {
+        let probe = MapProbe::new();
+        let (engine, _) = terminal_engine(
+            &probe,
+            None,
+            TerminalFaults {
+                map: MapFaults {
+                    keys: vec![5, 7],
+                    panic_call: match control {
+                        3 => Some(1),
+                        4 => Some(6),
+                        _ => None,
+                    },
+                    ..MapFaults::default()
+                },
+                fail_publication: control == 2,
+                registry_hook: (control < 2).then(|| {
+                    Arc::new(move |event| {
+                        if (control == 0
+                            && matches!(event, RegistryEvent::Reserved(ResourceId::Link(_))))
+                            || (control == 1
+                                && matches!(event, RegistryEvent::Installed(ResourceId::Link(_))))
+                        {
+                            panic!("bounded owner-operation unwind {control}");
+                        }
+                    }) as Arc<dyn Fn(RegistryEvent) + Send + Sync>
+                }),
+                ..TerminalFaults::default()
+            },
+        );
+        let failure = match control {
+            0..=2 => engine.attach(attach_request(1, 1)).err().unwrap(),
+            3 => engine
+                .set_generation(GenerationRequest {
+                    seq: CommandSeq::checked(1).unwrap(),
+                    deadline: Instant::now() + Duration::from_secs(3),
+                    generation: 2,
+                })
+                .err()
+                .unwrap(),
+            4 => engine.drain(read_request(1)).err().unwrap(),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            failure.failure.class,
+            if control == 2 {
+                FailureClass::Publication
+            } else {
+                FailureClass::Panic
+            }
+        );
+        let ticket = failure.cleanup_ticket.unwrap();
+        let receipt = engine.salvage_view(ticket.terminal_id);
+        assert_eq!(receipt.cleanup_ticket, ticket);
+        if control == 4 {
+            assert_eq!(receipt.checkpoint.as_ref().unwrap().snapshot.rows.len(), 2);
+        }
+        assert!(!matches!(receipt.writers, WriterCompletion::KnownEmpty(_)));
+        assert!(Arc::ptr_eq(
+            &receipt.0,
+            &engine.salvage_view(ticket.terminal_id).0
+        ));
+        task3_cleanup(
+            &probe.owner,
+            if control == 0 {
+                9
+            } else if control < 3 {
+                10
+            } else {
+                8
+            },
+        );
+        engine
+            .fork_permit(Instant::now() + Duration::from_secs(3))
+            .unwrap();
+        let diagnostic = engine.cleanup_progress().unwrap();
+        assert_eq!(diagnostic.ticket, ticket);
+        assert_eq!(diagnostic.status, CleanupStatus::Complete);
+        let log = probe.owner.log.lock().unwrap();
+        assert_eq!(
+            log.events
+                .iter()
+                .filter(|(_, event)| matches!(event, Event::Started))
+                .count(),
+            1
+        );
+        assert!(
+            probe
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(thread, _)| *thread != std::thread::current().id())
+        );
+    }
+}
+
+#[test]
+fn g1_one_deadline_runtime_error_at_cutoff_is_only_custody_diagnostic() {
+    for delta in [-1, 0, 1] {
+        let probe = MapProbe::new();
+        let clock = ControlledClock::new();
+        let (engine, _) = terminal_engine(
+            &probe,
+            None,
+            TerminalFaults {
+                map: MapFaults {
+                    hold_call: Some(1),
+                    write_error: Some(1),
+                    ..MapFaults::default()
+                },
+                clock: Some(Arc::clone(&clock)),
+                ..TerminalFaults::default()
+            },
+        );
+        engine.attach(attach_request(1, 1)).unwrap();
+        let request = terminal_request(&engine, clock.cutoff());
+        let receipt = thread::scope(|scope| {
+            let terminal = scope.spawn(|| engine.terminal(request));
+            probe.wait_calls(1);
+            clock.advance(delta, &engine);
+            if delta < 0 {
+                probe.owner.release();
+                terminal.join().unwrap()
+            } else {
+                let receipt = terminal.join().unwrap();
+                probe.owner.release();
+                receipt
+            }
+        });
+        let captured = receipt.failures.operations[CountOperation::Stop as usize].unwrap();
+        assert_eq!(
+            captured.class,
+            if delta < 0 {
+                FailureClass::Io
+            } else {
+                FailureClass::Deadline
+            }
+        );
+        task3_cleanup(&probe.owner, 10);
+        engine
+            .fork_permit(Instant::now() + Duration::from_secs(3))
+            .unwrap();
+        let diagnostic = engine.cleanup_progress().unwrap();
+        assert_eq!(
+            diagnostic.failures.operations[CountOperation::Stop as usize]
+                .unwrap()
+                .errno,
+            Some(libc::EIO)
+        );
+        assert_eq!(diagnostic.ticket, receipt.cleanup_ticket);
+        assert!(Arc::ptr_eq(
+            &receipt.0,
+            &engine.salvage_view(receipt.terminal_id).0
+        ));
+    }
+}
+
+/// Virtual time is advanced only at an acknowledged syscall/publication hold.
+/// Its cutoff is the real start instant, so raw prefix timestamps created later
+/// cannot accidentally become pre-cutoff authority in these model controls.
+struct ControlledClock {
+    origin: Instant,
+    tick: AtomicU64,
+}
+impl ControlledClock {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            origin: Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
+            tick: AtomicU64::new(999_999_990),
+        })
+    }
+    fn now(&self) -> Instant {
+        self.origin + Duration::from_nanos(self.tick.load(Ordering::Acquire))
+    }
+    fn cutoff(&self) -> Instant {
+        self.origin + Duration::from_secs(1)
+    }
+    fn advance(&self, delta: i32, engine: &CountEngine) {
+        self.tick.store(
+            (1_000_000_000i64 + i64::from(delta)) as u64,
+            Ordering::Release,
+        );
+        engine.shared.changed.notify_all();
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CutoffPhase {
+    Submission,
+    Stop,
+    LastLink,
+    Row,
+    Publication,
+}
+
+// Catches extending one phase's budget, accepting a late result, claiming that
+// an entered syscall was canceled, or replacing a selected artifact afterward.
+#[test]
+fn g1_one_deadline_all_phases_controllable_boundaries() {
+    for phase in [
+        CutoffPhase::Submission,
+        CutoffPhase::Stop,
+        CutoffPhase::LastLink,
+        CutoffPhase::Row,
+        CutoffPhase::Publication,
+    ] {
+        for delta in [-1, 0, 1] {
+            let probe = MapProbe::new();
+            let clock = ControlledClock::new();
+            let publication = Probe::new();
+            let (engine, _) = terminal_engine(
+                &probe,
+                None,
+                TerminalFaults {
+                    map: MapFaults {
+                        keys: vec![5],
+                        hold_call: match phase {
+                            CutoffPhase::Stop => Some(1),
+                            CutoffPhase::Row => Some(3),
+                            _ => None,
+                        },
+                        ..MapFaults::default()
+                    },
+                    close: Faults {
+                        hold_close: matches!(phase, CutoffPhase::LastLink).then_some(1),
+                        ..Faults::default()
+                    },
+                    clock: Some(Arc::clone(&clock)),
+                    publication_gate: matches!(phase, CutoffPhase::Publication)
+                        .then(|| Arc::clone(&publication)),
+                    ..TerminalFaults::default()
+                },
+            );
+            engine.attach(attach_request(1, 1)).unwrap();
+            let request = terminal_request(&engine, clock.cutoff());
+            let receipt = thread::scope(|scope| {
+                if matches!(phase, CutoffPhase::Submission) {
+                    clock.advance(delta, &engine);
+                    return engine.terminal(request.clone());
+                }
+                let posted = request.clone();
+                let owner = &engine;
+                let terminal = scope.spawn(move || owner.terminal(posted));
+                match phase {
+                    CutoffPhase::Stop => probe.wait_calls(1),
+                    CutoffPhase::Row => probe.wait_calls(3),
+                    CutoffPhase::LastLink => probe.owner.wait(|events| {
+                        events
+                            .iter()
+                            .any(|(_, event)| matches!(event, Event::EnterClose))
+                    }),
+                    CutoffPhase::Publication => publication.wait(|events| {
+                        events
+                            .iter()
+                            .any(|(_, event)| matches!(event, Event::Started))
+                    }),
+                    CutoffPhase::Submission => unreachable!(),
+                }
+                clock.advance(delta, &engine);
+                if delta < 0 {
+                    probe.owner.release();
+                    publication.release();
+                    terminal.join().unwrap()
+                } else {
+                    let receipt = terminal.join().unwrap();
+                    let diagnostic = engine.cleanup_progress().unwrap();
+                    assert_eq!(
+                        diagnostic.status,
+                        CleanupStatus::Pending,
+                        "{phase:?} {delta}"
+                    );
+                    assert_eq!(diagnostic.ticket, receipt.cleanup_ticket);
+                    assert!(diagnostic.coordinator_finalized);
+                    assert!(engine.fork_permit(Instant::now()).is_err());
+                    if !matches!(phase, CutoffPhase::Publication) {
+                        assert!(
+                            diagnostic.active_operation.is_some(),
+                            "held raw operation was falsely canceled: {phase:?}"
+                        );
+                    }
+                    probe.owner.release();
+                    publication.release();
+                    receipt
+                }
+            });
+            assert_eq!(receipt.deadline, clock.cutoff(), "{phase:?} {delta}");
+            assert_eq!(receipt.terminal_id, request.id);
+            if delta < 0 {
+                assert!(
+                    matches!(receipt.writers, WriterCompletion::Finished(_)),
+                    "{phase:?}"
+                );
+                assert_eq!(receipt.read_status, ReadStatus::Complete, "{phase:?}");
+                assert_eq!(receipt.checkpoint.as_ref().unwrap().snapshot.rows.len(), 1);
+                assert_eq!(validate_terminal(&request, &receipt), Ok(()), "{phase:?}");
+            } else {
+                assert_ne!(
+                    receipt.read_status,
+                    ReadStatus::Complete,
+                    "late promotion: {phase:?} {delta}"
+                );
+                if matches!(
+                    phase,
+                    CutoffPhase::Submission | CutoffPhase::Stop | CutoffPhase::LastLink
+                ) {
+                    assert!(
+                        matches!(receipt.writers, WriterCompletion::Unknown(_)),
+                        "{phase:?}"
+                    );
+                }
+            }
+            task3_cleanup(&probe.owner, 10);
+            engine
+                .fork_permit(Instant::now() + Duration::from_secs(3))
+                .unwrap();
+            let after = engine.salvage_view(receipt.terminal_id);
+            assert!(Arc::ptr_eq(&receipt.0, &after.0));
+            let diagnostic = engine.cleanup_progress().unwrap();
+            assert_eq!(diagnostic.ticket, receipt.cleanup_ticket);
+            assert_eq!(diagnostic.status, CleanupStatus::Complete);
+            if delta >= 0 && matches!(phase, CutoffPhase::Submission) {
+                assert!(probe.calls.lock().unwrap().is_empty());
+            }
+        }
+    }
+}
+
+// Catches using owner publication as if the coordinator had already observed
+// that result: the first coordinator observation is independently controlled.
+#[test]
+fn g1_zero_grace_candidate_first_observed_at_cutoff_cannot_promote() {
+    for delta in [-1, 0, 1] {
+        let probe = MapProbe::new();
+        let clock = ControlledClock::new();
+        let (engine, _) = terminal_engine(
+            &probe,
+            None,
+            TerminalFaults {
+                clock: Some(Arc::clone(&clock)),
+                ..TerminalFaults::default()
+            },
+        );
+        engine.attach(attach_request(1, 1)).unwrap();
+        let request = terminal_request(&engine, clock.cutoff());
+        {
+            let mut state = locked(&engine.shared.state);
+            engine.shared.seal_locked(&mut state, request.deadline);
+            state.terminal_expected = Some(request.clone());
+        }
+        engine.shared.worker.get().unwrap().unpark();
+        let mut state = locked(&engine.shared.state);
+        while state.terminal_candidate.is_none() {
+            state = engine.shared.changed.wait(state).unwrap();
+        }
+        assert!(state.terminal_result.is_none());
+        drop(state);
+        clock.advance(delta, &engine);
+        let receipt = engine.terminal(request);
+        assert_eq!(
+            receipt.read_status == ReadStatus::Complete,
+            delta < 0,
+            "first observed at cutoff delta {delta}"
+        );
+        assert!(Arc::ptr_eq(
+            &receipt.0,
+            &engine.salvage_view(receipt.terminal_id).0
+        ));
+        task3_cleanup(&probe.owner, 10);
+    }
+}
+
+#[test]
+fn g1_panic_disconnect_retains_one_owner_first_abandonment_edge() {
+    let probe = MapProbe::new();
+    let clock = ControlledClock::new();
+    let (engine, _) = terminal_engine(
+        &probe,
+        None,
+        TerminalFaults {
+            map: MapFaults {
+                hold_call: Some(1),
+                ..MapFaults::default()
+            },
+            clock: Some(Arc::clone(&clock)),
+            ..TerminalFaults::default()
+        },
+    );
+    thread::scope(|scope| {
+        let ordinary = scope.spawn(|| {
+            engine.set_generation(GenerationRequest {
+                seq: CommandSeq::checked(1).unwrap(),
+                deadline: Instant::now() + Duration::from_secs(3),
+                generation: 7,
+            })
+        });
+        probe.wait_calls(1);
+        let first_edge = clock.now();
+        engine.abandon();
+        clock.advance(0, &engine);
+        let id = TerminalId {
+            owner_epoch: engine.ready.owner_epoch,
+            sequence: TerminalSeq::checked(1).unwrap(),
+        };
+        let receipt = engine.salvage_view(id);
+        assert_eq!(
+            receipt.deadline, first_edge,
+            "salvage manufactured a later abandonment budget"
+        );
+        assert_eq!(
+            engine.cleanup_progress().unwrap().active_operation,
+            Some(CountOperation::Generation)
+        );
+        assert!(engine.fork_permit(Instant::now()).is_err());
+        assert_eq!(probe.calls.lock().unwrap().len(), 1);
+        probe.owner.release();
+        assert_eq!(
+            ordinary.join().unwrap().err().unwrap().cleanup_ticket,
+            Some(receipt.cleanup_ticket)
+        );
+        task3_cleanup(&probe.owner, 8);
+        engine
+            .fork_permit(Instant::now() + Duration::from_secs(3))
+            .unwrap();
+        assert_eq!(
+            probe.calls.lock().unwrap().len(),
+            1,
+            "abandonment initiated new observation I/O"
+        );
+        assert!(Arc::ptr_eq(&receipt.0, &engine.salvage_view(id).0));
+    });
+}
+
+#[test]
+fn g1_one_deadline_all_phases_second_trigger_shortens_wait() {
+    let probe = MapProbe::new();
+    let clock = ControlledClock::new();
+    let (engine, _) = terminal_engine(
+        &probe,
+        None,
+        TerminalFaults {
+            close: Faults {
+                hold_close: Some(1),
+                ..Faults::default()
+            },
+            clock: Some(Arc::clone(&clock)),
+            ..TerminalFaults::default()
+        },
+    );
+    engine.attach(attach_request(1, 1)).unwrap();
+    let request = terminal_request(&engine, clock.cutoff());
+    let receipt = thread::scope(|scope| {
+        let id = request.id;
+        let terminal = scope.spawn(|| engine.terminal(request));
+        probe.owner.wait(|events| {
+            events
+                .iter()
+                .any(|(_, event)| matches!(event, Event::EnterClose))
+        });
+        let shortened = engine.salvage_view(id);
+        let waited = terminal.join().unwrap();
+        assert!(Arc::ptr_eq(&shortened.0, &waited.0));
+        assert_eq!(shortened.deadline, clock.cutoff());
+        assert_eq!(
+            engine.cleanup_progress().unwrap().active_operation,
+            Some(CountOperation::Close)
+        );
+        assert!(engine.fork_permit(Instant::now()).is_err());
+        probe.owner.release();
+        shortened
+    });
+    task3_cleanup(&probe.owner, 10);
+    engine
+        .fork_permit(Instant::now() + Duration::from_secs(3))
+        .unwrap();
+    assert!(Arc::ptr_eq(
+        &receipt.0,
+        &engine.salvage_view(receipt.terminal_id).0
+    ));
+}
+
+#[test]
+fn g1_panic_disconnect_retains_one_owner_lost_terminal_reply_and_drop() {
+    let probe = MapProbe::new();
+    let publication = Probe::new();
+    let (engine, _) = terminal_engine(
+        &probe,
+        None,
+        TerminalFaults {
+            publication_gate: Some(Arc::clone(&publication)),
+            ..TerminalFaults::default()
+        },
+    );
+    engine.attach(attach_request(1, 1)).unwrap();
+    let request = terminal_request(&engine, Instant::now() + Duration::from_secs(3));
+    {
+        let mut state = locked(&engine.shared.state);
+        engine.shared.seal_locked(&mut state, request.deadline);
+        state.terminal_expected = Some(request.clone());
+    }
+    engine.shared.worker.get().unwrap().unpark();
+    publication.wait(|events| {
+        events
+            .iter()
+            .any(|(_, event)| matches!(event, Event::Started))
+    });
+    let shared = Arc::clone(&engine.shared);
+    drop(engine);
+    assert!(shared.abandoned.load(Ordering::Acquire));
+    assert_eq!(
+        locked(&shared.state).terminal.unwrap().deadline,
+        request.deadline
+    );
+    publication.release();
+    task3_cleanup(&probe.owner, 10);
+    shared
+        .barrier
+        .terminal_permit(shared.epoch, Instant::now() + Duration::from_secs(3))
+        .unwrap();
+    let state = locked(&shared.state);
+    assert!(
+        state.terminal_result.is_none(),
+        "worker pretended the departed coordinator selected an artifact"
+    );
+    let candidate = &state.terminal_candidate.as_ref().unwrap().1;
+    assert_eq!(candidate.terminal_id, request.id);
+    assert_eq!(candidate.cleanup_ticket.terminal_id, request.id);
+    assert!(state.resources.cleanup_complete);
+    assert_eq!(state.phase, OwnerPhase::Idle);
+    assert_eq!(
+        probe
+            .owner
+            .log
+            .lock()
+            .unwrap()
+            .events
+            .iter()
+            .filter(|(_, event)| matches!(event, Event::Started))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn g1_panic_disconnect_retains_one_owner_competing_first_triggers() {
+    for explicit_first in [false, true] {
+        let probe = MapProbe::new();
+        let clock = ControlledClock::new();
+        let (engine, _) = terminal_engine(
+            &probe,
+            None,
+            TerminalFaults {
+                map: MapFaults {
+                    hold_call: Some(1),
+                    ..MapFaults::default()
+                },
+                clock: Some(Arc::clone(&clock)),
+                ..TerminalFaults::default()
+            },
+        );
+        thread::scope(|scope| {
+            let ordinary = scope.spawn(|| {
+                engine.set_generation(GenerationRequest {
+                    seq: CommandSeq::checked(1).unwrap(),
+                    deadline: Instant::now() + Duration::from_secs(3),
+                    generation: 7,
+                })
+            });
+            probe.wait_calls(1);
+            let first_edge = clock.now();
+            if explicit_first {
+                engine.shared.seal(clock.cutoff());
+            }
+            // Both calls still compete with an entered owner operation. The
+            // two orders independently pin each side of the first-trigger CAS.
+            engine.abandon();
+            if !explicit_first {
+                engine.shared.seal(clock.cutoff());
+            }
+            let seal = locked(&engine.shared.state).terminal.unwrap();
+            assert_eq!(
+                seal.deadline,
+                if explicit_first {
+                    clock.cutoff()
+                } else {
+                    first_edge
+                }
+            );
+            clock.advance(1, &engine);
+            let receipt = engine.salvage_view(seal.ticket.terminal_id);
+            assert_eq!(receipt.deadline, seal.deadline);
+            engine.abandon();
+            assert!(Arc::ptr_eq(
+                &receipt.0,
+                &engine.salvage_view(seal.ticket.terminal_id).0
+            ));
+            probe.owner.release();
+            let failure = ordinary.join().unwrap().err().unwrap();
+            assert_eq!(failure.cleanup_ticket, Some(seal.ticket));
+            task3_cleanup(&probe.owner, 8);
+            engine
+                .fork_permit(Instant::now() + Duration::from_secs(3))
+                .unwrap();
+            assert_eq!(probe.calls.lock().unwrap().len(), 1);
+        });
+    }
+}
+
+#[test]
+fn g1_zero_grace_unknown_abandonment_offset_fails_closed() {
+    assert_eq!(abandonment_code(None), 1);
+    assert_eq!(abandonment_code(Some(Duration::MAX)), 1);
+    assert_eq!(
+        abandonment_code(Some(Duration::from_nanos(u64::MAX - 2))),
+        1
+    );
+    let probe = MapProbe::new();
+    let clock = ControlledClock::new();
+    let (engine, _) = terminal_engine(
+        &probe,
+        None,
+        TerminalFaults {
+            clock: Some(Arc::clone(&clock)),
+            ..TerminalFaults::default()
+        },
+    );
+    engine.attach(attach_request(1, 1)).unwrap();
+    // A backwards/inconsistent clock cannot create a usable offset or grace.
+    clock.advance(-11, &engine);
+    engine.abandon();
+    let receipt = engine.salvage_view(TerminalId {
+        owner_epoch: engine.ready.owner_epoch,
+        sequence: TerminalSeq::checked(1).unwrap(),
+    });
+    assert!(receipt.deadline <= clock.now());
+    assert!(matches!(receipt.writers, WriterCompletion::Unknown(_)));
+    task3_cleanup(&probe.owner, 10);
+    assert!(probe.calls.lock().unwrap().is_empty());
+    engine
+        .fork_permit(Instant::now() + Duration::from_secs(3))
+        .unwrap();
+    assert_eq!(
+        engine.cleanup_progress().unwrap().ticket,
+        receipt.cleanup_ticket
+    );
+}
+
+#[test]
+fn g1_zero_grace_known_empty_withdrawn_before_terminal_observation() {
+    let probe = MapProbe::new();
+    let clock = ControlledClock::new();
+    let (engine, _) = terminal_engine(
+        &probe,
+        None,
+        TerminalFaults {
+            clock: Some(Arc::clone(&clock)),
+            ..TerminalFaults::default()
+        },
+    );
+    let request = terminal_request(&engine, clock.cutoff());
+    {
+        let mut state = locked(&engine.shared.state);
+        engine.shared.seal_locked(&mut state, request.deadline);
+        state.terminal_expected = Some(request.clone());
+    }
+    engine.shared.worker.get().unwrap().unpark();
+    let mut state = locked(&engine.shared.state);
+    while state.terminal_candidate.is_none() {
+        state = engine.shared.changed.wait(state).unwrap();
+    }
+    drop(state);
+    clock.advance(0, &engine);
+    let receipt = engine.terminal(request.clone());
+    assert!(
+        !matches!(receipt.writers, WriterCompletion::KnownEmpty(_)),
+        "terminal observation I/O retained pristine Ready authority"
+    );
+    assert_eq!(validate_terminal(&request, &receipt), Ok(()));
+    task3_cleanup(&probe.owner, 8);
+}
+
+#[test]
+fn g1_panic_disconnect_retains_one_owner_claim_gap_binds_deadline() {
+    for explicit_first in [false, true] {
+        let probe = MapProbe::new();
+        let claim = Probe::new();
+        let (engine, _) = terminal_engine(
+            &probe,
+            None,
+            TerminalFaults {
+                map: MapFaults {
+                    hold_call: Some(1),
+                    panic_call: Some(1),
+                    ..MapFaults::default()
+                },
+                seal_claim_gate: Some(Arc::clone(&claim)),
+                ..TerminalFaults::default()
+            },
+        );
+        let operation_deadline = Instant::now() + Duration::from_secs(3);
+        let explicit_deadline = operation_deadline + Duration::from_secs(1);
+        thread::scope(|scope| {
+            let ordinary = scope.spawn(|| {
+                engine.set_generation(GenerationRequest {
+                    seq: CommandSeq::checked(1).unwrap(),
+                    deadline: operation_deadline,
+                    generation: 7,
+                })
+            });
+            probe.wait_calls(1);
+            let mut explicit = None;
+            if explicit_first {
+                explicit = Some(scope.spawn(|| engine.shared.seal(explicit_deadline)));
+            } else {
+                probe.owner.release();
+            }
+            // The real first seal caller has claimed MAX but deliberately has
+            // not installed its deadline yet, and still holds SharedState.
+            claim.wait(|events| {
+                events
+                    .iter()
+                    .any(|(_, event)| matches!(event, Event::Started))
+            });
+            if !explicit_first {
+                explicit = Some(scope.spawn(|| engine.shared.seal(explicit_deadline)));
+            } else {
+                probe.owner.release();
+            }
+            let (sent, received) = std::sync::mpsc::channel();
+            let owner = &engine;
+            let abandon = scope.spawn(move || {
+                owner.abandon();
+                sent.send(()).unwrap();
+            });
+            let nonblocking_drop = received.recv_timeout(Duration::from_secs(1));
+            // Always release before asserting, so the negative control remains
+            // finite even if a regression makes abandonment take this mutex.
+            claim.release();
+            abandon.join().unwrap();
+            assert!(
+                nonblocking_drop.is_ok(),
+                "abandonment waited for the first seal's mutex"
+            );
+            let ticket = explicit.unwrap().join().unwrap();
+            let failure = ordinary.join().unwrap().err().unwrap();
+            assert_eq!(failure.cleanup_ticket, Some(ticket));
+            let seal = locked(&engine.shared.state).terminal.unwrap();
+            assert_eq!(
+                seal.deadline,
+                if explicit_first {
+                    explicit_deadline
+                } else {
+                    operation_deadline
+                }
+            );
+            assert_eq!(seal.ticket, ticket);
+            let receipt = engine.salvage_view(ticket.terminal_id);
+            assert_eq!(receipt.deadline, seal.deadline);
+            assert!(Arc::ptr_eq(
+                &receipt.0,
+                &engine.salvage_view(ticket.terminal_id).0
+            ));
+        });
+        task3_cleanup(&probe.owner, 8);
+        engine
+            .fork_permit(Instant::now() + Duration::from_secs(3))
+            .unwrap();
+        assert_eq!(probe.calls.lock().unwrap().len(), 1);
+    }
+}
+
+#[test]
+fn g1_panic_disconnect_retains_one_owner_drop_never_takes_owner_lock() {
+    let probe = Probe::new();
+    let engine = injected(
+        Arc::clone(&probe),
+        Faults::default(),
+        Arc::new(CountForkBarrier::new()),
+        Instant::now() + Duration::from_secs(3),
+        PrepareHooks::host(),
+    )
+    .unwrap();
+    let shared = Arc::clone(&engine.shared);
+    let state = locked(&shared.state);
+    let (sent, received) = std::sync::mpsc::channel();
+    let dropper = thread::spawn(move || {
+        drop(engine);
+        sent.send(()).unwrap();
+    });
+    let returned = received.recv_timeout(Duration::from_secs(1));
+    assert!(shared.abandoned.load(Ordering::Acquire) || returned.is_err());
+    drop(state);
+    dropper.join().unwrap();
+    assert!(
+        returned.is_ok(),
+        "CountEngine::drop waited for owner publication state"
+    );
+    task3_cleanup(&probe, 8);
+    shared
+        .barrier
+        .terminal_permit(shared.epoch, Instant::now() + Duration::from_secs(3))
+        .unwrap();
+}
+
+#[test]
+fn g1_panic_disconnect_retains_one_owner_unknown_create_is_stranded() {
+    let probe = MapProbe::new();
+    let (engine, _) = terminal_engine(
+        &probe,
+        None,
+        TerminalFaults {
+            registry_hook: Some(Arc::new(|event| {
+                if matches!(event, RegistryEvent::Creating(ResourceId::Link(_))) {
+                    panic!("unknown creation unwind control");
+                }
+            })),
+            ..TerminalFaults::default()
+        },
+    );
+    let failure = engine.attach(attach_request(1, 1)).err().unwrap();
+    let ticket = failure.cleanup_ticket.unwrap();
+    let receipt = engine.salvage_view(ticket.terminal_id);
+    task3_cleanup(&probe.owner, 9);
+    let mut barrier = locked(&engine.shared.barrier.state);
+    while !barrier.sealed {
+        barrier = engine.shared.barrier.changed.wait(barrier).unwrap();
+    }
+    drop(barrier);
+    let diagnostic = engine.cleanup_progress().unwrap();
+    assert_eq!(diagnostic.status, CleanupStatus::Stranded);
+    assert_eq!(diagnostic.unresolved_resources, 1);
+    assert_eq!(diagnostic.ticket, ticket);
+    assert!(engine.fork_permit(Instant::now()).is_err());
+    assert!(!matches!(receipt.writers, WriterCompletion::KnownEmpty(_)));
+    assert!(Arc::ptr_eq(
+        &receipt.0,
+        &engine.salvage_view(ticket.terminal_id).0
+    ));
 }

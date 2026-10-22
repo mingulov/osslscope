@@ -163,6 +163,7 @@ impl CountForkBarrier {
 struct Seal {
     ticket: CleanupTicket,
     deadline: Instant,
+    submitted_at: Instant,
 }
 #[cfg(test)]
 #[derive(Debug, Clone, Copy)]
@@ -298,8 +299,11 @@ struct SharedState {
     terminal_expected: Option<TerminalRequest>,
     terminal_contradiction: bool,
     terminal_fallback: Option<Arc<RawTerminalData>>,
+    terminal_candidate: Option<(Instant, RawTerminal)>,
     terminal_result: Option<RawTerminal>,
     terminal_read_started: Option<Instant>,
+    initial_empty: Option<EmptyFamily>,
+    cleanup_stranded: bool,
 }
 struct Shared {
     epoch: OwnerEpoch,
@@ -308,13 +312,45 @@ struct Shared {
     link_limit: usize,
     target_tgid: u32,
     abandoned: Arc<AtomicBool>,
+    trigger_origin: Instant,
+    // 0 = unclaimed, 1 = invalid/expired abandonment, MAX = explicit trigger;
+    // other values encode the first abandonment offset plus two. A single CAS
+    // arbitrates explicit admission versus flag-only Drop, without waiting for
+    // an initializer or taking the owner publication mutex in Drop.
+    first_trigger: AtomicU64,
     worker: OnceLock<thread::Thread>,
     state: Mutex<SharedState>,
     latest_progress: Mutex<Option<RawCheckpoint>>,
     controller_progress: Mutex<Option<RawCheckpoint>>,
     changed: Condvar,
+    #[cfg(test)]
+    clock: Option<Arc<dyn Fn() -> Instant + Send + Sync>>,
+    #[cfg(test)]
+    seal_claim_observer: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 impl Shared {
+    fn now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some(clock) = &self.clock {
+            return clock();
+        }
+        Instant::now()
+    }
+    /// Only pre-cutoff progress may change the unpublished fallback envelope.
+    /// The first local seal records already-known state even for grace=0.
+    fn refresh_fallback_locked(&self, state: &mut SharedState, first_seal: bool) {
+        let Some(seal) = state.terminal else { return };
+        if state.terminal_result.is_some() || (!first_seal && self.now() >= seal.deadline) {
+            return;
+        }
+        if let Some(mut fallback) = state.terminal_fallback.take() {
+            fill_terminal_shared(
+                state,
+                Arc::get_mut(&mut fallback).expect("private fallback"),
+            );
+            state.terminal_fallback = Some(fallback);
+        }
+    }
     fn seal(&self, deadline: Instant) -> CleanupTicket {
         let mut state = locked(&self.state);
         let ticket = self.seal_locked(&mut state, deadline);
@@ -342,18 +378,51 @@ impl Shared {
                 sequence,
             },
         };
-        state.terminal = Some(Seal { ticket, deadline });
+        let submitted_at = self.now();
+        let trigger = self
+            .first_trigger
+            .compare_exchange(0, u64::MAX, Ordering::AcqRel, Ordering::Acquire)
+            .unwrap_or_else(|prior| prior);
+        // Explicit/operation claims and installing their actual deadline share
+        // this one SharedState guard. MAX is never visible to another seal
+        // caller without that already-bound slot; Drop merely sets its flag.
+        #[cfg(test)]
+        if trigger == 0
+            && let Some(observer) = &self.seal_claim_observer
+        {
+            observer();
+        }
+        let deadline = match trigger {
+            0 | u64::MAX => deadline,
+            1 => submitted_at.min(self.trigger_origin),
+            offset => self
+                .trigger_origin
+                .checked_add(std::time::Duration::from_nanos(offset - 2))
+                .unwrap_or_else(|| submitted_at.min(self.trigger_origin)),
+        };
+        state.terminal = Some(Seal {
+            ticket,
+            deadline,
+            submitted_at,
+        });
+        self.refresh_fallback_locked(state, true);
         ticket
     }
     fn abandon(&self) {
+        let code = abandonment_code(self.now().checked_duration_since(self.trigger_origin));
+        let _ = self
+            .first_trigger
+            .compare_exchange(0, code, Ordering::AcqRel, Ordering::Acquire);
         self.abandoned.store(true, Ordering::Release);
+        self.changed.notify_all();
         if let Some(worker) = self.worker.get() {
             worker.unpark();
         }
     }
     fn failed(&self, failure: OwnerFailure) {
-        self.seal(self.setup_deadline);
         let mut state = locked(&self.state);
+        state.failures.record_at(failure, self.now());
+        self.seal_locked(&mut state, self.setup_deadline);
         let _ = state
             .ordinary
             .publish_reply(OwnerReply::Prepared(Err(failure)));
@@ -363,19 +432,24 @@ impl Shared {
         let mut state = locked(&self.state);
         state.phase = phase;
         registry.publish_into(&mut state.resources);
+        self.refresh_fallback_locked(&mut state, false);
         self.changed.notify_all();
     }
     fn registry_progress(&self, registry: &Registry) {
         let mut state = locked(&self.state);
         registry.publish_into(&mut state.resources);
+        self.refresh_fallback_locked(&mut state, false);
         self.changed.notify_all();
     }
     fn terminal_close_progress(&self, outcome: LinkCloseOutcome, failure: Option<OwnerFailure>) {
         let mut state = locked(&self.state);
         if let Some(failure) = failure {
-            state.failures.record(failure);
+            state.failures.record_at(failure, self.now());
         }
-        if let Some(fallback) = state.terminal_fallback.as_mut() {
+        let eligible = state
+            .terminal
+            .is_some_and(|seal| self.now() < seal.deadline);
+        if eligible && let Some(fallback) = state.terminal_fallback.as_mut() {
             let data = Arc::get_mut(fallback).expect("unpublished close progress");
             if let Some(previous) = data.close_outcomes.iter_mut().find(|c| c.id == outcome.id) {
                 *previous = outcome;
@@ -384,11 +458,18 @@ impl Shared {
                 data.close_outcomes.push(outcome);
             }
             if let Some(failure) = failure {
-                data.failures.record(failure);
+                data.failures.record_at(failure, self.now());
             }
         }
         self.changed.notify_all();
     }
+}
+fn abandonment_code(offset: Option<std::time::Duration>) -> u64 {
+    offset
+        .and_then(|offset| u64::try_from(offset.as_nanos()).ok())
+        .and_then(|offset| offset.checked_add(2))
+        .filter(|code| *code < u64::MAX)
+        .unwrap_or(1)
 }
 /// Ready contains data only; the worker retains every map/program/pin/link.
 pub struct CountEngine {
@@ -456,6 +537,57 @@ impl CountEngine {
         view
     }
 
+    /// Nonblocking, bounded diagnostics; never a replacement capture result.
+    pub fn cleanup_progress(&self) -> Option<CleanupProgress> {
+        let state = self.shared.state.try_lock().ok()?;
+        let seal = state.terminal?;
+        let unresolved_resources = state
+            .resources
+            .resources
+            .iter()
+            .filter(|resource| {
+                !matches!(
+                    resource.state,
+                    ResourceState::Unused
+                        | ResourceState::CreateFailed
+                        | ResourceState::CloseReturned
+                )
+            })
+            .count();
+        let status = if state.cleanup_stranded {
+            CleanupStatus::Stranded
+        } else if state.phase == OwnerPhase::Idle && state.resources.cleanup_complete {
+            CleanupStatus::Complete
+        } else if state
+            .resources
+            .resources
+            .iter()
+            .any(|r| r.state == ResourceState::ConsumedError)
+            && !state.resources.resources.iter().any(|r| {
+                matches!(
+                    r.state,
+                    ResourceState::Reserved
+                        | ResourceState::Creating
+                        | ResourceState::Held
+                        | ResourceState::CloseIssued
+                )
+            })
+        {
+            CleanupStatus::Failed
+        } else {
+            CleanupStatus::Pending
+        };
+        Some(CleanupProgress {
+            ticket: seal.ticket,
+            actual_phase: state.phase,
+            active_operation: state.active_operation,
+            coordinator_finalized: state.terminal_result.is_some(),
+            status,
+            unresolved_resources,
+            failures: state.failures,
+        })
+    }
+
     pub fn terminal(&self, request: TerminalRequest) -> RawTerminal {
         let mut state = locked(&self.shared.state);
         let ticket = self.shared.seal_locked(&mut state, request.deadline);
@@ -474,78 +606,156 @@ impl CountEngine {
                 return result.clone();
             }
             let seal = state.terminal.expect("terminal admission");
-            if Instant::now() >= seal.deadline {
-                let mut fallback = state
-                    .terminal_fallback
-                    .take()
-                    .expect("one fallback builder");
-                let data = Arc::get_mut(&mut fallback).expect("unpublished fallback");
-                fill_terminal_shared(&state, data);
-                // The owner may have published a completed prefix before
-                // blocking on another link. Preserve those actual outcomes and
-                // represent every remaining serial without inventing an ack.
-                let completed_prefix = data.close_outcomes.len();
-                for record in data.manifest.iter().skip(completed_prefix) {
-                    data.close_outcomes.push(LinkCloseOutcome {
-                        id: record.id,
-                        issued_at: None,
-                        returned_at: None,
-                        state: record.close_state,
-                        errno: record.close_errno,
-                    });
-                }
-                if data.seal.result == StopResult::NotAttempted {
-                    data.failures.record(OwnerFailure::engine(
-                        CountOperation::Stop,
-                        FailureClass::Deadline,
-                    ));
-                }
-                let finished = matches!(data.writers, WriterCompletion::Finished(_));
-                if !finished {
-                    data.writers = WriterCompletion::Unknown(QuiescenceReason::Deadline);
-                }
-                data.failures.record(OwnerFailure::engine(
-                    if finished {
-                        CountOperation::Read
-                    } else {
-                        CountOperation::Close
-                    },
-                    FailureClass::Deadline,
-                ));
-                // Nonblocking last published image only. A late syscall return
-                // cannot replace this canonical capture view.
-                data.checkpoint = self
-                    .shared
-                    .latest_progress
-                    .try_lock()
-                    .ok()
-                    .and_then(|view| view.clone())
-                    .filter(|view| view.published_at <= seal.deadline);
-                if let Some(start) = state.terminal_read_started {
-                    bind_terminal_prefix(data, start);
-                }
-                record_terminal_components(data);
-                let old_cleanup = state
-                    .resources
-                    .cleanup_complete
-                    .then(|| std::mem::replace(&mut data.cleanup_state, CleanupState::Complete));
-                let result = RawTerminal(fallback);
-                state.terminal_result = Some(result.clone());
-                self.shared.changed.notify_all();
-                drop(state);
-                drop(old_cleanup);
-                return result;
+            // Observation precedes candidate acceptance. Publication alone is
+            // not coordinator observation, and equality is already too late.
+            let observed_at = self.shared.now();
+            let expired = observed_at >= seal.deadline;
+            if expired || state.terminal_candidate.is_some() {
+                return self.select_terminal(state, expired);
             }
             state = self
                 .shared
                 .changed
-                .wait_timeout(
-                    state,
-                    seal.deadline.saturating_duration_since(Instant::now()),
-                )
+                .wait_timeout(state, seal.deadline.saturating_duration_since(observed_at))
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .0;
         }
+    }
+
+    /// Salvage never waits, retries I/O, creates a new deadline, or replaces a
+    /// selected artifact. Without a prior trigger it seals at the current edge.
+    pub fn salvage_view(&self, id: TerminalId) -> RawTerminal {
+        let mut state = locked(&self.shared.state);
+        if let Some(result) = &state.terminal_result {
+            return result.clone();
+        }
+        let ticket = self.shared.seal_locked(&mut state, self.shared.now());
+        if id != ticket.terminal_id {
+            state.terminal_contradiction = true;
+        }
+        self.shared.changed.notify_all();
+        self.shared.worker.get().expect("prepared owner").unpark();
+        let expired = self.shared.now() >= state.terminal.expect("salvage seal").deadline;
+        self.select_terminal(state, expired)
+    }
+
+    fn select_terminal(
+        &self,
+        mut state: MutexGuard<'_, SharedState>,
+        expired: bool,
+    ) -> RawTerminal {
+        let seal = state.terminal.expect("sticky seal");
+        let mut fallback = state
+            .terminal_fallback
+            .take()
+            .expect("one fallback builder");
+        let data = Arc::get_mut(&mut fallback).expect("unpublished fallback");
+        if !expired
+            && let Some((published_at, candidate)) = &state.terminal_candidate
+            && *published_at < seal.deadline
+        {
+            copy_terminal_result(candidate, data);
+            fill_terminal_shared(&state, data);
+        }
+        // Errors first recorded after cutoff are only custody diagnostics.
+        data.failures = data.failures.before(seal.deadline);
+        data.failures.merge(state.failures.before(seal.deadline));
+        if state.terminal_contradiction {
+            data.failures.record_at(
+                OwnerFailure::engine(CountOperation::Close, FailureClass::Inventory),
+                seal.submitted_at,
+            );
+        }
+        let known_empty = state.initial_empty.filter(|family| {
+            family.published_at < seal.deadline
+                && family.writer.owner_epoch == self.shared.epoch
+                && family.writer.object_sha256 == self.ready.writer_object_identity
+                && state.last_command_seq.is_none()
+                && state.last_completed_seq.is_none()
+                && state.pending_open.is_none()
+                && state.resolved_open.is_none()
+                && state.active_operation.is_none()
+                && !state.ordinary.in_flight
+                && state.frontier == ControllerFrontier::default()
+                && !state.terminal_contradiction
+                && data.manifest.is_empty()
+                && data.failures == TerminalFailures::default()
+        });
+        if expired && let Some(family) = known_empty {
+            data.host_writes_sealed = true;
+            data.writers = WriterCompletion::KnownEmpty(EmptyWitness {
+                owner_epoch: self.shared.epoch,
+                terminal_id: seal.ticket.terminal_id,
+                writer_object_identity: family.writer.object_sha256,
+                ready_published_at: family.published_at,
+                sealed_at: seal.submitted_at,
+                deadline: seal.deadline,
+            });
+        } else if expired || state.terminal_candidate.is_none() {
+            let completed_prefix = data.close_outcomes.len();
+            for record in data.manifest.iter().skip(completed_prefix) {
+                data.close_outcomes.push(LinkCloseOutcome {
+                    id: record.id,
+                    issued_at: None,
+                    returned_at: None,
+                    state: record.close_state,
+                    errno: record.close_errno,
+                });
+            }
+            if data.seal.result == StopResult::NotAttempted {
+                data.failures.record(OwnerFailure::engine(
+                    CountOperation::Stop,
+                    FailureClass::Deadline,
+                ));
+            }
+            let finished = matches!(data.writers, WriterCompletion::Finished(w) if w.established_at < seal.deadline);
+            if !finished {
+                data.writers = WriterCompletion::Unknown(QuiescenceReason::Deadline);
+            }
+            data.failures.record(OwnerFailure::engine(
+                if finished {
+                    CountOperation::Read
+                } else {
+                    CountOperation::Close
+                },
+                FailureClass::Deadline,
+            ));
+            let latest = self
+                .shared
+                .latest_progress
+                .try_lock()
+                .ok()
+                .and_then(|p| p.clone());
+            let retained = self
+                .shared
+                .controller_progress
+                .try_lock()
+                .ok()
+                .and_then(|p| p.clone());
+            data.checkpoint = latest
+                .filter(|p| p.published_at < seal.deadline)
+                .or_else(|| retained.filter(|p| p.published_at < seal.deadline));
+            if let Some(start) = state
+                .terminal_read_started
+                .filter(|start| *start < seal.deadline)
+            {
+                bind_terminal_prefix(data, start);
+            }
+            record_terminal_components(data);
+        }
+        let complete = matches!(&data.cleanup_state, CleanupState::Pending(summary) if summary.cleanup_complete)
+            && state.phase == OwnerPhase::Idle
+            && !state.cleanup_stranded;
+        let old_cleanup =
+            complete.then(|| std::mem::replace(&mut data.cleanup_state, CleanupState::Complete));
+        let result = RawTerminal(fallback);
+        state.terminal_result = Some(result.clone());
+        let candidate = state.terminal_candidate.take();
+        self.shared.changed.notify_all();
+        drop(state);
+        drop(old_cleanup);
+        drop(candidate);
+        result
     }
 
     pub fn open_window(&self, request: OpenRequest) -> CommandResult<OpenReceipt> {
@@ -637,6 +847,7 @@ impl CountEngine {
             ));
         }
         state.last_command_seq = Some(seq);
+        state.initial_empty = None;
         state.frontier.pending = Some(PendingCommandId { seq, operation });
         if let OwnerRequest::Open(open) = &request {
             state.pending_open = Some(*open);
@@ -766,6 +977,7 @@ impl CountEngine {
             ));
         }
         state.last_command_seq = Some(seq);
+        state.initial_empty = None;
         state.frontier.pending = Some(PendingCommandId {
             seq,
             operation: CountOperation::Attach,
@@ -930,6 +1142,9 @@ impl CountEngine {
         let terminal_builder =
             terminal_storage(epoch, &input, limits, &registry, deadline, hooks.domain)?;
         let fallback = terminal_storage(epoch, &input, limits, &registry, deadline, hooks.domain)?;
+        let trigger_origin = Instant::now();
+        #[cfg(test)]
+        let trigger_origin = hooks.clock.as_ref().map_or(trigger_origin, |clock| clock());
         let shared = Arc::new(Shared {
             epoch,
             barrier: Arc::clone(&input.fork_barrier),
@@ -937,6 +1152,8 @@ impl CountEngine {
             link_limit: limits.link_slots,
             target_tgid: input.target_tgid,
             abandoned: Arc::clone(&registry.abandoned),
+            trigger_origin,
+            first_trigger: AtomicU64::new(0),
             worker: OnceLock::new(),
             state: Mutex::new(SharedState {
                 ordinary,
@@ -959,12 +1176,19 @@ impl CountEngine {
                 terminal_expected: None,
                 terminal_contradiction: false,
                 terminal_fallback: Some(fallback),
+                terminal_candidate: None,
                 terminal_result: None,
                 terminal_read_started: None,
+                initial_empty: None,
+                cleanup_stranded: false,
             }),
             latest_progress: Mutex::new(None),
             controller_progress: Mutex::new(None),
             changed: Condvar::new(),
+            #[cfg(test)]
+            clock: hooks.clock.clone(),
+            #[cfg(test)]
+            seal_claim_observer: hooks.seal_claim_observer.clone(),
         });
         {
             let mut state = locked(&shared.state);
@@ -1071,6 +1295,12 @@ struct PrepareHooks {
     registry_observer: Option<Arc<dyn Fn(registry::RegistryEvent) + Send + Sync>>,
     #[cfg(test)]
     mailbox_observer: Option<Arc<dyn Fn(MailboxEvent) + Send + Sync>>,
+    #[cfg(test)]
+    clock: Option<Arc<dyn Fn() -> Instant + Send + Sync>>,
+    #[cfg(test)]
+    before_terminal_publication: Option<Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(test)]
+    seal_claim_observer: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 impl PrepareHooks {
     fn live() -> Self {
@@ -1092,6 +1322,12 @@ impl PrepareHooks {
             registry_observer: None,
             #[cfg(test)]
             mailbox_observer: None,
+            #[cfg(test)]
+            clock: None,
+            #[cfg(test)]
+            before_terminal_publication: None,
+            #[cfg(test)]
+            seal_claim_observer: None,
         }
     }
     #[cfg(test)]
@@ -1198,6 +1434,7 @@ fn owner_main<D, F>(
         }
         registry.publish_into(&mut state.resources);
         state.phase = OwnerPhase::Ready;
+        state.initial_empty = registry.initial_empty(shared.now());
         let ready = Ready {
             owner_epoch: shared.epoch,
             writer_object_identity: request.input.object_sha256,
@@ -1326,7 +1563,7 @@ fn owner_main<D, F>(
                         })
                     }
                     Err(failure) => {
-                        state.failures.record(failure);
+                        state.failures.record_at(failure, shared.now());
                         let ticket = shared.seal_locked(&mut state, attach_request.deadline);
                         state.phase = OwnerPhase::Sealing;
                         Err(CommandFailure {
@@ -1356,6 +1593,7 @@ fn owner_main<D, F>(
                 } else if successful_reply {
                     registry.journal.published(attach_request.seq);
                 }
+                shared.refresh_fallback_locked(&mut state, false);
                 shared.changed.notify_all();
             }
             Some(loaded)
@@ -1383,6 +1621,7 @@ fn owner_main<D, F>(
     {
         let mut state = locked(&shared.state);
         state.inventory = Some(inventory);
+        shared.refresh_fallback_locked(&mut state, false);
         shared.changed.notify_all();
     }
     if let Some(loaded) = loaded.as_ref() {
@@ -1403,17 +1642,41 @@ fn owner_main<D, F>(
                 .active_operation
                 .take()
                 .unwrap_or(CountOperation::Close);
-            state
-                .failures
-                .record(OwnerFailure::engine(operation, FailureClass::Panic));
+            state.failures.record_at(
+                OwnerFailure::engine(operation, FailureClass::Panic),
+                shared.now(),
+            );
+            shared.refresh_fallback_locked(&mut state, false);
         }
     }
     shared.cleanup_progress(&registry, OwnerPhase::Cleaning);
     let cleanup = catch_unwind(AssertUnwindSafe(|| registry.cleanup(&mut driver)));
+    if cleanup.is_err() {
+        let mut state = locked(&shared.state);
+        state.cleanup_stranded = true;
+        state.failures.record_at(
+            OwnerFailure::engine(CountOperation::Cleanup, FailureClass::Panic),
+            shared.now(),
+        );
+        shared.refresh_fallback_locked(&mut state, false);
+    }
     shared.cleanup_progress(&registry, OwnerPhase::Cleaning);
     let complete = cleanup.is_ok() && locked(&shared.state).resources.cleanup_complete;
     if complete {
         shared.cleanup_progress(&registry, OwnerPhase::Idle);
+    } else {
+        let mut state = locked(&shared.state);
+        state.cleanup_stranded |= state.resources.resources.iter().any(|resource| {
+            matches!(
+                resource.state,
+                ResourceState::Reserved
+                    | ResourceState::Creating
+                    | ResourceState::Held
+                    | ResourceState::CloseIssued
+            )
+        });
+        shared.refresh_fallback_locked(&mut state, false);
+        shared.changed.notify_all();
     }
     shared.barrier.cleaned(shared.epoch, complete);
     if !complete {
@@ -1477,7 +1740,7 @@ fn execute_map_command(
         }
     });
     let result = result.map_err(|failure| {
-        state.failures.record(failure);
+        state.failures.record_at(failure, shared.now());
         let ticket = shared.seal_locked(&mut state, deadline);
         state.phase = OwnerPhase::Sealing;
         CommandFailure {
@@ -1514,6 +1777,7 @@ fn execute_map_command(
     } else if successful_reply {
         registry.journal.published(seq);
     }
+    shared.refresh_fallback_locked(&mut state, false);
     shared.changed.notify_all();
 }
 
@@ -1566,12 +1830,7 @@ fn fill_terminal_shared(state: &SharedState, data: &mut RawTerminalData) {
     data.cleanup_ticket = seal.ticket;
     data.deadline = seal.deadline;
     data.last_command_seq = state.last_completed_seq;
-    for failure in state.failures.operations.iter().flatten() {
-        data.failures.record(*failure);
-    }
-    for failure in state.failures.components.iter().flatten() {
-        data.failures.record_component(*failure);
-    }
+    data.failures.merge(state.failures.before(seal.deadline));
     data.resolved_open = state.resolved_open;
     data.inventory = state
         .inventory
@@ -1602,14 +1861,11 @@ fn fill_terminal_shared(state: &SharedState, data: &mut RawTerminalData) {
         summary.cleanup_complete = state.resources.cleanup_complete;
     }
     mark_failed_cleanup(data);
-    if let Some(failure) = state.read_failure {
-        data.failures.record(failure);
-    }
     if state.terminal_contradiction || matches!(state.inventory, Some(Err(_))) {
-        data.failures.record(OwnerFailure::engine(
-            CountOperation::Close,
-            FailureClass::Inventory,
-        ));
+        data.failures.record_at(
+            OwnerFailure::engine(CountOperation::Close, FailureClass::Inventory),
+            seal.submitted_at,
+        );
     }
 }
 fn finish_terminal(
@@ -1639,6 +1895,12 @@ fn finish_terminal(
         let mut state = locked(&shared.state);
         state.phase = OwnerPhase::Sealing;
         fill_terminal_shared(&state, data);
+        // Ready's no-observation authority ends before any terminal map I/O,
+        // even if there have never been links. A late full read cannot be
+        // relabeled as the zero-I/O KnownEmpty exception.
+        if shared.now() < data.deadline && shared.first_trigger.load(Ordering::Acquire) != 1 {
+            state.initial_empty = None;
+        }
     }
     #[cfg(test)]
     {
@@ -1649,6 +1911,16 @@ fn finish_terminal(
     #[cfg(not(test))]
     let _ = hooks;
     let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if shared.first_trigger.load(Ordering::Acquire) == 1 || shared.now() >= data.deadline {
+            return SealBracket {
+                before_ns: None,
+                after_ns: None,
+                result: StopResult::Failed(OwnerFailure::engine(
+                    CountOperation::Stop,
+                    FailureClass::Deadline,
+                )),
+            };
+        }
         io::MapIo::terminal(
             shared,
             registry,
@@ -1667,16 +1939,18 @@ fn finish_terminal(
         )),
     });
     if let StopResult::Failed(failure) = data.seal.result {
-        data.failures.record(failure);
+        data.failures.record_at(failure, shared.now());
     }
     {
         let mut state = locked(&shared.state);
         state.active_operation = None;
         state.phase = OwnerPhase::Closing;
         if let StopResult::Failed(failure) = data.seal.result {
-            state.failures.record(failure);
+            state.failures.record_at(failure, shared.now());
         }
-        if let Some(fallback) = state.terminal_fallback.as_mut() {
+        if shared.now() < data.deadline
+            && let Some(fallback) = state.terminal_fallback.as_mut()
+        {
             let fallback = Arc::get_mut(fallback).expect("unpublished stop progress");
             copy_terminal_proof(data, fallback);
         }
@@ -1686,20 +1960,23 @@ fn finish_terminal(
     registry.copy_manifest(&mut data.manifest);
     for close in &data.close_outcomes {
         if close.state != ResourceState::CloseReturned || close.errno.is_some() {
-            data.failures.record(OwnerFailure {
-                operation: CountOperation::Close,
-                resource: ResourceId::Link(close.id),
-                class: if close.returned_at.is_none() {
-                    FailureClass::Panic
-                } else {
-                    FailureClass::Io
+            data.failures.record_at(
+                OwnerFailure {
+                    operation: CountOperation::Close,
+                    resource: ResourceId::Link(close.id),
+                    class: if close.returned_at.is_none() {
+                        FailureClass::Panic
+                    } else {
+                        FailureClass::Io
+                    },
+                    errno: close.errno,
                 },
-                errno: close.errno,
-            });
+                shared.now(),
+            );
         }
     }
     data.host_writes_sealed = true;
-    let now = Instant::now();
+    let now = shared.now();
     let reason = if !explicit {
         Some(QuiescenceReason::Owner)
     } else if locked(&shared.state).terminal_contradiction || data.inventory.is_none() {
@@ -1736,8 +2013,10 @@ fn finish_terminal(
             _ => None,
         };
         if let Some(class) = class {
-            data.failures
-                .record(OwnerFailure::engine(CountOperation::Close, class));
+            data.failures.record_at(
+                OwnerFailure::engine(CountOperation::Close, class),
+                shared.now(),
+            );
         }
     }
     data.writers = reason.map_or_else(
@@ -1752,8 +2031,11 @@ fn finish_terminal(
         },
         WriterCompletion::Unknown,
     );
-    if driver.now() < data.deadline && Instant::now() < data.deadline {
-        let start = Instant::now();
+    if shared.first_trigger.load(Ordering::Acquire) != 1
+        && driver.now() < data.deadline
+        && shared.now() < data.deadline
+    {
+        let start = shared.now();
         {
             let mut state = locked(&shared.state);
             state.phase = OwnerPhase::Snapshotting;
@@ -1778,9 +2060,9 @@ fn finish_terminal(
                 ),
             )
         }));
-        let completed_at = Instant::now();
+        let completed_at = shared.now();
         match read {
-            Ok(Ok(snapshot)) if completed_at <= data.deadline => {
+            Ok(Ok(snapshot)) if completed_at < data.deadline => {
                 data.snapshot_binding = Some(SnapshotBinding {
                     sequence: snapshot.sequence,
                     started_at: start,
@@ -1806,34 +2088,34 @@ fn finish_terminal(
                     Err(_) => OwnerFailure::engine(CountOperation::Read, FailureClass::Panic),
                     _ => OwnerFailure::engine(CountOperation::Read, FailureClass::Deadline),
                 };
-                data.failures.record(failure);
+                data.failures.record_at(failure, shared.now());
                 data.checkpoint = shared
                     .latest_progress
                     .try_lock()
                     .ok()
                     .and_then(|p| p.clone())
-                    .filter(|p| p.published_at <= data.deadline);
+                    .filter(|p| p.published_at < data.deadline);
                 bind_terminal_prefix(data, start);
             }
         }
     }
     record_terminal_components(data);
+    #[cfg(test)]
+    if let Some(observer) = &hooks.before_terminal_publication {
+        observer();
+    }
     {
         let mut state = locked(&shared.state);
         state.active_operation = None;
-        if let Some(failure) = state.read_failure {
-            data.failures.record(failure);
-        }
-        for failure in state.failures.components.iter().flatten() {
-            data.failures.record_component(*failure);
-        }
+        data.failures.merge(state.failures.before(data.deadline));
         if let CleanupState::Pending(summary) = &mut data.cleanup_state {
             registry.publish_into(summary);
         }
         mark_failed_cleanup(data);
         state.phase = OwnerPhase::Result;
-        if state.terminal_result.is_none() && Instant::now() <= data.deadline {
-            state.terminal_result = Some(RawTerminal(Arc::clone(builder)));
+        let published_at = shared.now();
+        if state.terminal_result.is_none() && published_at < data.deadline {
+            state.terminal_candidate = Some((published_at, RawTerminal(Arc::clone(builder))));
         }
         shared.changed.notify_all();
     }
@@ -1863,6 +2145,26 @@ fn copy_terminal_proof(source: &RawTerminalData, destination: &mut RawTerminalDa
     destination
         .close_outcomes
         .extend_from_slice(&source.close_outcomes);
+}
+
+fn copy_terminal_result(source: &RawTerminalData, destination: &mut RawTerminalData) {
+    // The second preallocated envelope becomes the canonical view. Only bounded
+    // metadata is copied; the row image and inventory remain immutable Arcs.
+    destination.owner_epoch = source.owner_epoch;
+    destination.terminal_id = source.terminal_id;
+    destination.deadline = source.deadline;
+    destination.cleanup_ticket = source.cleanup_ticket;
+    destination.last_command_seq = source.last_command_seq;
+    destination.resolved_open = source.resolved_open;
+    destination.evidence_domain = source.evidence_domain;
+    destination.writer_object_identity = source.writer_object_identity;
+    destination.inventory = source.inventory.clone();
+    destination.manifest.clear();
+    destination.manifest.extend_from_slice(&source.manifest);
+    copy_terminal_proof(source, destination);
+    destination.checkpoint = source.checkpoint.clone();
+    destination.snapshot_binding = source.snapshot_binding;
+    destination.read_status = source.read_status;
 }
 
 fn mark_failed_cleanup(data: &mut RawTerminalData) {

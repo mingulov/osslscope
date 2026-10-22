@@ -193,6 +193,28 @@ impl Registry {
         self.sealed = true;
         self.publish_progress();
     }
+    pub(super) fn initial_empty(&self, published_at: Instant) -> Option<EmptyFamily> {
+        let journal = &self.journal;
+        let pristine = journal.records.is_empty()
+            && journal.memberships.is_empty()
+            && journal.last_started.is_none()
+            && journal.last_completed.is_none()
+            && journal.last_published.is_none()
+            && journal.last_acked.is_none()
+            && journal.resolved_open.is_none()
+            && self.slots.iter().enumerate().all(|(index, slot)| {
+                slot.record.state
+                    == if index < 8 {
+                        ResourceState::Held
+                    } else {
+                        ResourceState::Unused
+                    }
+            });
+        pristine.then_some(EmptyFamily {
+            writer: journal.writer?,
+            published_at,
+        })
+    }
     fn publish_progress(&self) {
         if let Some(shared) = &self.shared {
             shared.registry_progress(self);
@@ -522,6 +544,14 @@ impl Registry {
                 self.slots[index].record.resource,
             ));
         }
+        if let Some(shared) = &self.shared {
+            let mut state = super::locked(&shared.state);
+            state.active_operation = Some(if state.phase == OwnerPhase::Cleaning {
+                CountOperation::Cleanup
+            } else {
+                CountOperation::Close
+            });
+        }
         let result = driver.close(ManuallyDrop::into_inner(fd));
         let record = &mut self.slots[index].record;
         record.errno = result.as_ref().err().and_then(std::io::Error::raw_os_error);
@@ -535,6 +565,21 @@ impl Registry {
                 entry.close_state = record.state;
                 entry.close_errno = record.errno;
             }
+        }
+        if let Some(shared) = &self.shared {
+            let mut state = super::locked(&shared.state);
+            if let Err(error) = &result {
+                let operation = if state.phase == OwnerPhase::Cleaning {
+                    CountOperation::Cleanup
+                } else {
+                    CountOperation::Close
+                };
+                state.failures.record_at(
+                    OwnerFailure::io(operation, record.resource, error),
+                    shared.now(),
+                );
+            }
+            state.active_operation = None;
         }
         self.publish_progress();
         #[cfg(test)]
@@ -561,7 +606,10 @@ impl Registry {
             if self.slots[index].fd.is_none() {
                 continue;
             }
-            let issued_at = Instant::now();
+            let issued_at = self
+                .shared
+                .as_ref()
+                .map_or_else(Instant::now, |shared| shared.now());
             let outcome = LinkCloseOutcome {
                 id,
                 issued_at: Some(issued_at),
@@ -581,7 +629,11 @@ impl Registry {
             }));
             let outcome = outcomes.last_mut().expect("reserved close outcome");
             if result.is_ok() {
-                outcome.returned_at = Some(Instant::now());
+                outcome.returned_at = Some(
+                    self.shared
+                        .as_ref()
+                        .map_or_else(Instant::now, |shared| shared.now()),
+                );
                 outcome.state = self.slots[index].record.state;
                 outcome.errno = self.slots[index].record.errno;
             }

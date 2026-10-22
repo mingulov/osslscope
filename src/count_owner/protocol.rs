@@ -319,6 +319,24 @@ pub enum OwnerPhase {
     Cleaning,
     Idle,
 }
+/// Eventual custody diagnostics are separate from the immutable capture view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CleanupStatus {
+    Pending,
+    Complete,
+    Failed,
+    Stranded,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CleanupProgress {
+    pub ticket: CleanupTicket,
+    pub actual_phase: OwnerPhase,
+    pub active_operation: Option<CountOperation>,
+    pub coordinator_finalized: bool,
+    pub status: CleanupStatus,
+    pub unresolved_resources: usize,
+    pub failures: TerminalFailures,
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForkBlocked {
     Deadline,
@@ -905,9 +923,28 @@ pub struct WriterWitness {
     pub writer_object_identity: [u8; 32],
     pub established_at: std::time::Instant,
 }
+/// The owner publishes this only at pristine Ready, before any ordinary
+/// command can be admitted. Submission permanently withdraws that authority.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct EmptyFamily {
+    pub writer: WriterIdentity,
+    pub published_at: std::time::Instant,
+}
+/// Vacuous no-writer/no-observation proof. This is neither a map read nor a
+/// source-profile authorization, and it cannot supply Available(0) components.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmptyWitness {
+    pub owner_epoch: OwnerEpoch,
+    pub terminal_id: TerminalId,
+    pub writer_object_identity: [u8; 32],
+    pub ready_published_at: std::time::Instant,
+    pub sealed_at: std::time::Instant,
+    pub deadline: std::time::Instant,
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriterCompletion {
     Finished(WriterWitness),
+    KnownEmpty(EmptyWitness),
     Unknown(QuiescenceReason),
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -941,9 +978,18 @@ pub enum CleanupState {
 pub struct TerminalFailures {
     pub operations: [Option<OwnerFailure>; 10],
     pub components: [Option<ComponentFailure>; 18],
+    operation_times: [Option<std::time::Instant>; 10],
+    component_times: [Option<std::time::Instant>; 18],
 }
 impl TerminalFailures {
     pub(super) fn record_component(&mut self, failure: ComponentFailure) {
+        self.record_component_at(failure, std::time::Instant::now());
+    }
+    pub(super) fn record_component_at(
+        &mut self,
+        failure: ComponentFailure,
+        at: std::time::Instant,
+    ) {
         let index = match (failure.map, failure.key) {
             (CountMap::Admitted, 0) => 0,
             (CountMap::Dropfail, 0) => 1,
@@ -952,12 +998,55 @@ impl TerminalFailures {
         };
         if self.components[index].is_none_or(|old| old.class.is_none()) {
             self.components[index] = Some(failure);
+            self.component_times[index] = Some(at);
         }
     }
     pub(super) fn record(&mut self, failure: OwnerFailure) {
-        let cell = &mut self.operations[failure.operation as usize];
-        if cell.is_none() {
+        self.record_at(failure, std::time::Instant::now());
+    }
+    pub(super) fn record_at(&mut self, failure: OwnerFailure, at: std::time::Instant) {
+        let index = failure.operation as usize;
+        let cell = &mut self.operations[index];
+        // A prior uncertainty must not mask an actual returned runtime error.
+        if cell.is_none_or(|old| {
+            matches!(
+                old.class,
+                FailureClass::Deadline | FailureClass::Disconnected
+            ) && !matches!(
+                failure.class,
+                FailureClass::Deadline | FailureClass::Disconnected
+            )
+        }) {
             *cell = Some(failure);
+            self.operation_times[index] = Some(at);
+        }
+    }
+    pub(super) fn before(self, cutoff: std::time::Instant) -> Self {
+        let mut result = Self::default();
+        for index in 0..10 {
+            if self.operation_times[index].is_some_and(|at| at < cutoff) {
+                result.operations[index] = self.operations[index];
+                result.operation_times[index] = self.operation_times[index];
+            }
+        }
+        for index in 0..18 {
+            if self.component_times[index].is_some_and(|at| at < cutoff) {
+                result.components[index] = self.components[index];
+                result.component_times[index] = self.component_times[index];
+            }
+        }
+        result
+    }
+    pub(super) fn merge(&mut self, other: Self) {
+        for index in 0..10 {
+            if let Some((failure, at)) = other.operations[index].zip(other.operation_times[index]) {
+                self.record_at(failure, at);
+            }
+        }
+        for index in 0..18 {
+            if let Some((failure, at)) = other.components[index].zip(other.component_times[index]) {
+                self.record_component_at(failure, at);
+            }
         }
     }
 }
@@ -1040,6 +1129,50 @@ pub fn validate_terminal(
         {
             return Err(F::Frontier);
         }
+    }
+    if let WriterCompletion::KnownEmpty(witness) = receipt.writers {
+        if witness.owner_epoch != receipt.owner_epoch
+            || witness.terminal_id != receipt.terminal_id
+            || witness.writer_object_identity != receipt.writer_object_identity
+            || witness.deadline != receipt.deadline
+            || witness.ready_published_at >= receipt.deadline
+            || witness.ready_published_at > witness.sealed_at
+            || !receipt.host_writes_sealed
+            || receipt.writer_family != CountDimensions::validated()
+            || expected.frontier != ControllerFrontier::default()
+            || receipt.last_command_seq.is_some()
+            || receipt.resolved_open.is_some()
+            || !receipt.manifest.is_empty()
+            || !receipt.close_outcomes.is_empty()
+            || receipt.seal != SealBracket::default()
+            || receipt.checkpoint.is_some()
+            || receipt.snapshot_binding.is_some()
+            || receipt.read_status != ReadStatus::NotStarted
+            || receipt.failures != TerminalFailures::default()
+        {
+            return Err(F::Writer);
+        }
+        if let Some(inventory) = &receipt.inventory {
+            inventory
+                .validate(&expected.frontier)
+                .map_err(|_| F::Inventory)?;
+            if inventory.owner_epoch != receipt.owner_epoch
+                || inventory.writer
+                    != (WriterIdentity {
+                        owner_epoch: receipt.owner_epoch,
+                        object_sha256: receipt.writer_object_identity,
+                        program: ResourceId::Program,
+                        maps: CountMap::ALL.map(ResourceId::Map),
+                    })
+                || !inventory.records.is_empty()
+                || !inventory.memberships.is_empty()
+                || inventory.last_completed.is_some()
+                || inventory.resolved_open.is_some()
+            {
+                return Err(F::Inventory);
+            }
+        }
+        return Ok(());
     }
     let inventory = receipt.inventory.as_ref().ok_or(F::Inventory)?;
     inventory
@@ -1124,7 +1257,7 @@ pub fn validate_terminal(
             }
             previous_ack = close.returned_at;
         }
-        if witness.established_at > receipt.deadline {
+        if witness.established_at >= receipt.deadline {
             return Err(F::Cutoff);
         }
     }
@@ -1134,8 +1267,8 @@ pub fn validate_terminal(
             || checkpoint.phase != OwnerPhase::Snapshotting
             || checkpoint.published_at != binding.completed_at
             || binding.started_at > binding.completed_at
-            || binding.completed_at > receipt.deadline
-            || checkpoint.published_at > receipt.deadline
+            || binding.completed_at >= receipt.deadline
+            || checkpoint.published_at >= receipt.deadline
         {
             return Err(F::Snapshot);
         }
