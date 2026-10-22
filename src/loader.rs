@@ -1982,6 +1982,216 @@ pub fn prepare(obj: &[u8], maps: &[MapSpec], progs: &[ProgSpec]) -> anyhow::Resu
     })
 }
 
+/// Data-only slots from the exclusive count owner's tracked load.
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)] // Consumed by the subsequent count-command handlers.
+pub(crate) struct CountLoadedSlots {
+    pub maps: [crate::count_owner::registry::LoadSlot; 7],
+    pub program: crate::count_owner::registry::LoadSlot,
+}
+
+pub(crate) struct CountLoadFailure {
+    pub failure: crate::count_owner::OwnerFailure,
+    // Bounded memory only. Count loading never opens a verifier spill file.
+    #[allow(dead_code)]
+    pub verifier_log: Vec<u8>,
+}
+impl From<crate::count_owner::OwnerFailure> for CountLoadFailure {
+    fn from(failure: crate::count_owner::OwnerFailure) -> Self {
+        Self {
+            failure,
+            verifier_log: Vec::new(),
+        }
+    }
+}
+
+/// Reject invocation roots that the general multi-plane preparer deliberately
+/// ignores when selecting its requested programs. Count has one reviewed root.
+pub(crate) fn validate_count_object(obj: &[u8]) -> Result<(), crate::count_owner::OwnerFailure> {
+    use crate::count_owner::{CountOperation, FailureClass, OwnerFailure};
+    let drift = || OwnerFailure::engine(CountOperation::Load, FailureClass::ObjectDrift);
+    let goblin::Object::Elf(elf) = goblin::Object::parse(obj).map_err(|_| drift())? else {
+        return Err(drift());
+    };
+    let mut roots = 0usize;
+    for (index, section) in elf.section_headers.iter().enumerate() {
+        if section.sh_flags & goblin::elf::section_header::SHF_EXECINSTR as u64 == 0 {
+            continue;
+        }
+        let name = elf.shdr_strtab.get_at(section.sh_name).ok_or_else(drift)?;
+        if name != ".text" && name != "uprobe" {
+            return Err(drift());
+        }
+        for symbol in &elf.syms {
+            if symbol.st_shndx != index || !symbol.is_function() {
+                continue;
+            }
+            if name == "uprobe" {
+                if elf.strtab.get_at(symbol.st_name) != Some("count_entry") || symbol.st_size == 0 {
+                    return Err(drift());
+                }
+                roots = roots.checked_add(1).ok_or_else(drift)?;
+            }
+        }
+    }
+    if roots != 1 {
+        return Err(drift());
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_count_prepared(
+    prep: &Prepared,
+) -> Result<(), crate::count_owner::OwnerFailure> {
+    use crate::count_owner::{CountOperation, FailureClass, OwnerFailure};
+    let drift = || OwnerFailure::engine(CountOperation::Load, FailureClass::ObjectDrift);
+    if prep.maps.len() != 7 || prep.progs.len() != 1 {
+        return Err(drift());
+    }
+    for expected in COUNT_MAPS {
+        let actual = prep
+            .maps
+            .iter()
+            .find(|m| m.name == expected.name)
+            .ok_or_else(drift)?;
+        if [
+            actual.map_type,
+            actual.key_size,
+            actual.value_size,
+            actual.max_entries,
+            actual.flags,
+        ] != [
+            expected.map_type,
+            expected.key_size,
+            expected.value_size,
+            expected.max_entries,
+            expected.flags,
+        ] {
+            return Err(drift());
+        }
+    }
+    let p = &prep.progs[0];
+    if p.name != "count_entry"
+        || p.is_return
+        || p.insns.is_empty()
+        || p.insns.len() % 8 != 0
+        || p.subprogs
+            .first()
+            .is_none_or(|s| s.name != "count_entry" || s.insn_off != 0)
+        || p.subprogs.iter().any(|s| s.is_callback)
+    {
+        return Err(drift());
+    }
+    for insn in p.insns.chunks_exact(8) {
+        // BPF_FUNC_tail_call and BPF_PSEUDO_FUNC both require new proof review.
+        if (insn[0] == 0x85 && insn[1] >> 4 == 0 && u32le(&insn[4..8]) == 12)
+            || (insn[0] == 0x18 && insn[1] >> 4 == 4)
+        {
+            return Err(drift());
+        }
+    }
+    for fixup in &p.map_fixups {
+        check_ld_imm64_site(&p.insns, fixup.insn_off, &p.name).map_err(|_| drift())?;
+        if !COUNT_MAPS.iter().any(|m| m.name == fixup.map) {
+            return Err(drift());
+        }
+    }
+    Ok(())
+}
+
+/// Count-only loading: every create is reserved and installed in the owner's
+/// preallocated registry before diagnostics or publication. The driver is an
+/// owner-private seam; neither this result nor its failure owns any descriptor.
+pub(crate) fn load_count_tracked(
+    prep: &Prepared,
+    sink: &mut impl crate::count_owner::registry::CountLoadSink,
+    driver: &mut impl crate::count_owner::io::CountIoDriver,
+    deadline: std::time::Instant,
+) -> Result<CountLoadedSlots, CountLoadFailure> {
+    use crate::count_owner::registry::{ResourceKind, preallocated};
+    use crate::count_owner::{CountMap, CountOperation, FailureClass, OwnerFailure, ResourceId};
+    validate_count_prepared(prep)?;
+    let check_deadline = |driver: &_| {
+        if crate::count_owner::io::CountIoDriver::now(driver) >= deadline {
+            Err(OwnerFailure::engine(
+                CountOperation::Load,
+                FailureClass::Deadline,
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    // Both allocations precede the first map create, including the diagnostic
+    // retry buffer. No callback BTF or temporary diagnostic FD is needed.
+    let p = &prep.progs[0];
+    let mut insns = preallocated(p.insns.len())?;
+    insns.extend_from_slice(&p.insns);
+    let mut log = preallocated(4 << 20)?;
+    log.resize(4 << 20, 0);
+    let mut maps = [None; 7];
+    for (index, expected) in COUNT_MAPS.iter().enumerate() {
+        check_deadline(driver)?;
+        let m = prep
+            .maps
+            .iter()
+            .find(|m| m.name == expected.name)
+            .expect("validated count map");
+        let slot = sink.reserve(ResourceKind::Map(CountMap::ALL[index]))?;
+        match driver.map_create(m) {
+            Ok(fd) => sink.install(slot, fd),
+            Err(error) => {
+                sink.failed(slot, error.raw_os_error());
+                return Err(OwnerFailure::io(
+                    CountOperation::Load,
+                    ResourceId::Map(CountMap::ALL[index]),
+                    &error,
+                )
+                .into());
+            }
+        }
+        maps[index] = Some(slot);
+    }
+    let maps = maps.map(|slot| slot.expect("all validated maps installed"));
+    for f in &p.map_fixups {
+        // Same validated ld_imm64 relocation and BPF_PSEUDO_MAP_FD rewrite as
+        // load_prog; all fallible shape checks ran before the first acquisition.
+        let index = COUNT_MAPS
+            .iter()
+            .position(|m| m.name == f.map)
+            .expect("validated fixup map");
+        let fd = sink.borrow(maps[index]);
+        let insn = &mut insns[f.insn_off..f.insn_off + 8];
+        insn[1] = (insn[1] & 0x0f) | (BPF_PSEUDO_MAP_FD << 4);
+        insn[4..8].copy_from_slice(&(fd.as_raw_fd() as u32).to_le_bytes());
+    }
+    check_deadline(driver)?;
+    let mut program = sink.reserve(ResourceKind::Program)?;
+    match driver.load_program(&insns, &p.name, None) {
+        Ok(fd) => sink.install(program, fd),
+        Err(error) => {
+            sink.failed(program, error.raw_os_error());
+            check_deadline(driver)?;
+            program = sink.reserve(ResourceKind::Program)?;
+            match driver.load_program(&insns, &p.name, Some(&mut log)) {
+                Ok(fd) => sink.install(program, fd),
+                Err(error) => {
+                    sink.failed(program, error.raw_os_error());
+                    return Err(CountLoadFailure {
+                        failure: OwnerFailure::io(
+                            CountOperation::Load,
+                            ResourceId::Program,
+                            &error,
+                        ),
+                        verifier_log: log,
+                    });
+                }
+            }
+        }
+    }
+    check_deadline(driver)?;
+    Ok(CountLoadedSlots { maps, program })
+}
+
 /// Load a prepared object: create maps, apply map-fd fixups (with
 /// the `BPF_PSEUDO_MAP_FD` assertion), load progs raw. Needs caps.
 /// Verifier output travels in the error on failure.

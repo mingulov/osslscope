@@ -12,6 +12,7 @@ pub mod args;
 pub mod capture;
 pub mod check;
 pub mod cli;
+pub(crate) mod count_owner;
 // T07: immutable planner identity + count session (coordinator review).
 pub mod count_session;
 pub mod discovery;
