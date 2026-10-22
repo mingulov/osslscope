@@ -72,6 +72,7 @@ fn clean_window() -> CaptureWindow {
         effective_start_ns: 0,
         effective_end_ns: 100,
         signal_cut: false,
+        count_admission: None,
     }
 }
 

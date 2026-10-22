@@ -5601,6 +5601,7 @@ struct TerminalFaults {
     fail_publication: bool,
     clock_panic_after_close: bool,
     clock: Option<Arc<ControlledClock>>,
+    seal_clock: Option<Arc<Mutex<std::collections::VecDeque<Option<u64>>>>>,
     publication_gate: Option<Arc<Probe>>,
     registry_hook: Option<Arc<dyn Fn(RegistryEvent) + Send + Sync>>,
     seal_claim_gate: Option<Arc<Probe>>,
@@ -5618,6 +5619,7 @@ impl Default for TerminalFaults {
             fail_publication: false,
             clock_panic_after_close: false,
             clock: None,
+            seal_clock: None,
             publication_gate: None,
             registry_hook: None,
             seal_claim_gate: None,
@@ -5641,6 +5643,7 @@ struct TerminalDriver {
     timeline: Arc<Mutex<Vec<(TerminalEvent, Instant)>>>,
     clock_panic_after_close: bool,
     clock: Option<Arc<ControlledClock>>,
+    seal_clock: Option<Arc<Mutex<std::collections::VecDeque<Option<u64>>>>>,
     lookup_gate: Option<(Arc<AtomicU64>, Arc<Probe>)>,
 }
 impl CountIoDriver for TerminalDriver {
@@ -5810,6 +5813,13 @@ impl CountIoDriver for TerminalDriver {
             .map_or_else(|| self.map.now(), |clock| clock.now())
     }
     fn monotonic_ns(&self) -> Option<u64> {
+        if let Some(clock) = &self.seal_clock {
+            return clock
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("explicit modeled stop sample");
+        }
         self.map.monotonic_ns()
     }
 }
@@ -5885,6 +5895,7 @@ fn terminal_engine(
                 timeline: observed,
                 clock_panic_after_close: faults.clock_panic_after_close,
                 clock: faults.clock,
+                seal_clock: faults.seal_clock,
                 lookup_gate: faults.lookup_gate,
             }
         },
@@ -8860,4 +8871,167 @@ fn g1_prefix_permit_survives_owned_fork_and_excludes_owner_acquisition() {
     .unwrap();
     engine.abandon();
     task3_cleanup(&probe, 8);
+}
+
+// Host producer/owner interleaving only. This never loads BPF or qualifies a
+// real kernel/clock domain. The independent physical ledger samples after the
+// held TARGET read, not at the controller's eventual acknowledgment.
+#[test]
+fn g1_target_read_before_seal_timestamp_after_seal_adapts_actual_terminal() {
+    use crate::capture::{
+        AdmissionMode, AdmissionProjection, count_effective_end, project_admission,
+    };
+    use crate::count_session::{CloseReason, CountSession};
+    use crate::evidence::{
+        self, CaptureWindow, ExpectedScope, FinalizeInput, LegacyCallPartition, ObjectId,
+        ObjectRecord, OpensslVersion, ScopeCoverage, TargetRecord,
+    };
+    let writer = StagedWriter::new(Some(WriterStage::TargetRead));
+    let probe = MapProbe::new();
+    let seal_clock = Arc::new(Mutex::new(std::collections::VecDeque::from([
+        Some(1500),
+        Some(1510),
+    ])));
+    let mut session = CountSession::new(
+        1,
+        session_owner_port(
+            &probe,
+            Some(Arc::clone(&writer)),
+            TerminalFaults {
+                seal_clock: Some(Arc::clone(&seal_clock)),
+                ..Default::default()
+            },
+        ),
+    );
+    // The staged producer's physical site is cookie100. Bind it through the
+    // actual session/owner attach rather than relabeling its final map key.
+    let plan = SessionPlan::new(101);
+    plan.attach(&mut session, 7);
+    assert_eq!(plan.cookie(&session, 100), 100);
+    session
+        .open_window(1000, 2000, Instant::now() + Duration::from_secs(5))
+        .unwrap();
+    let producer = writer.run_invocation(true, false, true, 1600);
+    writer.wait_at(WriterStage::TargetRead);
+    let (session, terminal) = thread::scope(|scope| {
+        let closing = scope.spawn(move || {
+            let terminal = session.terminal(crate::count_session::CloseRequest {
+                started_at: Instant::now(),
+                grace: Duration::from_secs(5),
+                reason: CloseReason::Interrupted,
+            });
+            (session, terminal)
+        });
+        probe.owner.wait(|events| {
+            events.iter().any(|(_, e)| {
+                matches!(
+                    e,
+                    Event::Registry(RegistryEvent::CloseIssued(ResourceId::Link(_)))
+                )
+            })
+        });
+        assert!(
+            seal_clock.lock().unwrap().is_empty(),
+            "both actual modeled stop samples precede the resumed writer"
+        );
+        assert_eq!(writer.ledger.admitted_calls(), 0);
+        assert!(writer.maps.lock().unwrap().rows.is_empty());
+        writer.release();
+        closing.join().unwrap()
+    });
+    producer.join().unwrap();
+    task3_cleanup(&probe.owner, 10);
+    assert!(
+        terminal.runtime_failure.is_none(),
+        "{:?}",
+        terminal.runtime_failure
+    );
+    assert_eq!(terminal.receipt.evidence_domain, EvidenceDomain::HostModel);
+    assert_eq!(terminal.receipt.seal.before_ns, Some(1500));
+    assert_eq!(terminal.receipt.seal.after_ns, Some(1510));
+    assert!(matches!(
+        terminal.receipt.writers,
+        WriterCompletion::Finished(_)
+    ));
+    assert_eq!(writer.ledger.admitted_calls(), 1);
+    assert_eq!(writer.ledger.0.lock().unwrap()[0].actual_sample_ns, 1600);
+    assert_eq!(terminal.retained_drain.total_calls(), 1);
+    assert_eq!(terminal.retained_drain.current[0].last_ns, 1600);
+    let endpoint = count_effective_end(CloseReason::Interrupted, 2000, terminal.receipt.seal, 1100);
+    assert_eq!(endpoint.end_ns, 1500);
+    assert!(!endpoint.uncertain);
+    let mut window = CaptureWindow {
+        requested_start_ns: 1100,
+        requested_end_ns: 2100,
+        effective_start_ns: 1100,
+        effective_end_ns: endpoint.end_ns,
+        signal_cut: true,
+        count_admission: None,
+    };
+    let programmed = session.programmed_admission().unwrap();
+    let projection = project_admission(
+        Some(programmed),
+        None,
+        &window,
+        &terminal.retained_drain,
+        AdmissionMode::Degraded,
+    )
+    .unwrap();
+    let AdmissionProjection::RenderBound(bound) = projection else {
+        panic!("missing actual Open projection")
+    };
+    assert_eq!((bound.start_ns, bound.deadline_ns), (1000, 2000));
+    window.count_admission = Some(bound);
+    let mut document = evidence::finalize(FinalizeInput {
+        window,
+        sites: terminal.retained_drain.current.clone(),
+        fenced: terminal.retained_drain.fenced.clone(),
+        objects: ["original-object", "provider-object"]
+            .map(|name| ObjectRecord {
+                id: ObjectId(name.into()),
+                device: 1,
+                inode: 2,
+                display_locator: "model".into(),
+            })
+            .into(),
+        coverage: vec![ScopeCoverage {
+            scope: "provider/default".into(),
+            expected: ExpectedScope::Unknown,
+            discovered: 101,
+            attached: 101,
+        }],
+        counters: terminal.retained_drain.counters.clone(),
+        fatal: None,
+        target: TargetRecord::new(1, "model".into(), String::new(), String::new()),
+        openssl: OpensslVersion::unknown(),
+        disposition: None,
+        policy: None,
+        legacy_partition: LegacyCallPartition {
+            non_legacy_exclusive: 1,
+            ..Default::default()
+        },
+        engine_observations: Vec::new(),
+        traversal: None,
+    });
+    let verdict = crate::policy::evaluate_document(
+        &[crate::policy::PolicyRule::deny_algorithm("digest")],
+        &document,
+    );
+    assert_eq!(verdict.rules[0].bounds.definite, 1);
+    assert_eq!(verdict.rules[0].bounds.possible, None);
+    document.policy = Some(crate::check::policy_record(&verdict));
+    let bytes = crate::report::render_json(&document).unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value["schema_version"], "observed-crypto-v2.2");
+    assert_eq!(value["sites"][0]["last_ns"], 1600);
+    assert_eq!(value["window"]["effective_end_ns"], 1500);
+    assert_eq!(value["window"]["count_admission"]["deadline_ns"], 2000);
+    assert!(
+        value["policy"]["rules"][0]
+            .get("possible")
+            .unwrap()
+            .is_null()
+    );
+    crate::schema::validate_v2(&value).unwrap();
+    crate::schema::check_v2_semantics(&value).unwrap();
 }

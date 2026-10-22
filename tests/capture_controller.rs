@@ -51,6 +51,7 @@ struct FakeClock {
     base: Instant,
     advanced: RefCell<Duration>,
     wall: SystemTime,
+    checked_samples: RefCell<VecDeque<Option<u64>>>,
 }
 
 impl FakeClock {
@@ -60,6 +61,7 @@ impl FakeClock {
             base: Instant::now(),
             advanced: RefCell::new(Duration::ZERO),
             wall: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+            checked_samples: RefCell::new(VecDeque::new()),
         })
     }
 
@@ -72,6 +74,12 @@ impl FakeClock {
 }
 
 impl ClockPort for FakeClock {
+    fn checked_monotonic_ns(&self) -> Option<u64> {
+        self.checked_samples
+            .borrow_mut()
+            .pop_front()
+            .unwrap_or_else(|| Some(*self.ns.borrow()))
+    }
     fn monotonic_ns(&self) -> u64 {
         *self.ns.borrow()
     }
@@ -94,6 +102,13 @@ impl ClockPort for FakeClock {
 // fires scripted executions from inside the observation.
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Copy)]
+enum OpenReplyFault {
+    CompletedLost,
+    MissingResolved,
+    MismatchedActual,
+}
+
 #[derive(Debug, Default)]
 struct SharedState {
     backend: FakeCountBackend,
@@ -104,6 +119,7 @@ struct SharedState {
     closed_at: Option<u64>,
     terminal_delay_ns: u64,
     refuse_suffix: bool,
+    open_reply_fault: Option<OpenReplyFault>,
 }
 
 #[derive(Clone)]
@@ -142,7 +158,32 @@ impl CountBackend for SharedBackend {
         let mut st = self.shared.borrow_mut();
         st.log.push("count_open".into());
         self.order.borrow_mut().push("count_open".into());
-        st.backend.open_window(request)
+        let Some(fault) = st.open_reply_fault else {
+            return st.backend.open_window(request);
+        };
+        let mut actual = request;
+        if matches!(fault, OpenReplyFault::MismatchedActual) {
+            actual.start_ns += 1;
+        }
+        let _ack = st.backend.open_window(actual)?;
+        if matches!(fault, OpenReplyFault::MissingResolved) {
+            st.backend.terminal_faults(FakeTerminalFaults {
+                omit_resolved_open: true,
+                ..Default::default()
+            });
+        }
+        Err(CommandFailure {
+            seq: request.seq,
+            completion: CommandCompletion::Unknown,
+            publication: CommandPublication::Published,
+            cleanup_ticket: None,
+            failure: OwnerFailure {
+                operation: CountOperation::Open,
+                resource: ResourceId::Engine,
+                class: FailureClass::Disconnected,
+                errno: None,
+            },
+        })
     }
     fn set_generation(&mut self, request: GenerationRequest) -> CommandResult<()> {
         let mut st = self.shared.borrow_mut();
@@ -167,6 +208,8 @@ impl CountBackend for SharedBackend {
         st.log.push("count_closed".into());
         st.closed_at = Some(self.clock.monotonic_ns());
         self.order.borrow_mut().push("count_closed".into());
+        let stop = self.clock.monotonic_ns();
+        st.backend.set_modeled_seal(Some(stop), Some(stop));
         let terminal = st.backend.terminal(request);
         self.clock.advance_ns(st.terminal_delay_ns);
         terminal
@@ -216,6 +259,7 @@ struct FakeDiscovery {
     cancel_flag: Option<Rc<Cell<bool>>>,
     polls_done: usize,
     finished: bool,
+    traversal_setup_error: bool,
 }
 
 impl DiscoveryPort for FakeDiscovery {
@@ -259,6 +303,24 @@ impl DiscoveryPort for FakeDiscovery {
         Ok(self.polls.pop_front().unwrap_or_default())
     }
 
+    fn traversal_active(&self) -> bool {
+        self.traversal_setup_error
+    }
+    fn poll_traversal(
+        &mut self,
+        _baseline: bool,
+    ) -> anyhow::Result<osslscope::capture::TraversalDelta> {
+        if self.traversal_setup_error {
+            self.clock.advance_ns(300);
+            let mut state = self.shared.borrow_mut();
+            let cookie = state.attached[0];
+            state
+                .backend
+                .fire(PID, cookie, self.clock.monotonic_ns(), 1);
+            return Err(std::io::Error::from_raw_os_error(libc::EIO).into());
+        }
+        Ok(osslscope::capture::TraversalDelta::default())
+    }
     fn snapshot(&self) -> DiscoverySnapshot {
         self.snapshot.clone()
     }
@@ -332,6 +394,7 @@ struct FakeTarget {
     /// attempts against unattached indexes record
     /// `fire-missed:no-probe` instead of firing.
     release_fires: Vec<(usize, u64)>,
+    release_timing: Option<(u64, u64)>,
     shared: Option<Rc<RefCell<SharedState>>>,
 }
 
@@ -347,6 +410,9 @@ impl TargetPort for FakeTarget {
     fn release(&mut self) -> anyhow::Result<()> {
         if self.release_err {
             anyhow::bail!("injected release failure");
+        }
+        if let Some((before, _)) = self.release_timing {
+            self.clock.advance_ns(before);
         }
         self.log.borrow_mut().released = true;
         self.order.borrow_mut().push("released".to_string());
@@ -369,6 +435,9 @@ impl TargetPort for FakeTarget {
                     }
                 }
             }
+        }
+        if let Some((_, after)) = self.release_timing {
+            self.clock.advance_ns(after);
         }
         Ok(())
     }
@@ -515,6 +584,7 @@ struct FakeProc {
     /// read-count-driven, so added settle reads cannot shift it).
     comm_settle_at_ns: Option<u64>,
     comm_settled: Option<String>,
+    comm_hook: Option<Rc<dyn Fn()>>,
     proc_log: Rc<RefCell<ProcLog>>,
     /// Scripted stats, popped in call order (F-D/A13 F3 + R20
     /// freshness): `Some(FileStat)` overrides the staged stat once
@@ -633,6 +703,9 @@ impl ProcPort for FakeProc {
     }
 
     fn read_comm(&mut self, _pid: u32) -> Option<String> {
+        if let Some(hook) = self.comm_hook.take() {
+            hook();
+        }
         if self
             .comm_settle_at_ns
             .is_some_and(|t| self.clock.monotonic_ns() >= t)
@@ -901,6 +974,7 @@ struct Harness {
     finish_recycled: bool,
     finish_final: Option<DiscoverySnapshot>,
     release_err: bool,
+    traversal_setup_error: bool,
     exit_at_ns: Option<u64>,
     exit_code: i32,
     poll_err: bool,
@@ -921,11 +995,13 @@ struct Harness {
     comm: Option<String>,
     comm_settle_at_ns: Option<u64>,
     comm_settled: Option<String>,
+    comm_hook: Option<Rc<dyn Fn()>>,
     cancelled: Rc<Cell<bool>>,
     cancel_on_poll: bool,
     /// Calls executing AT the release boundary (R20-fix finding 7),
     /// wired into the fake target's release hook.
     release_fires: Vec<(usize, u64)>,
+    release_timing: Option<(u64, u64)>,
     /// Fake ns advanced by every lifecycle poll (R20-fix round 2,
     /// F3): models a slow lifecycle scan crossing the deadline
     /// mid-round (production scans take real time).
@@ -992,6 +1068,7 @@ impl Harness {
             finish_recycled: false,
             finish_final: None,
             release_err: false,
+            traversal_setup_error: false,
             exit_at_ns: None,
             exit_code: 0,
             poll_err: false,
@@ -1015,9 +1092,11 @@ impl Harness {
             comm: None,
             comm_settle_at_ns: None,
             comm_settled: None,
+            comm_hook: None,
             cancelled: Rc::new(Cell::new(false)),
             cancel_on_poll: false,
             release_fires: Vec::new(),
+            release_timing: None,
             lifecycle_advance_ns: 0,
             cancel_hook: None,
             // Production round budget (128 MiB); R14 tests inject
@@ -1064,6 +1143,7 @@ impl Harness {
             cancel_flag: self.cancel_on_poll.then(|| self.cancelled.clone()),
             polls_done: 0,
             finished: false,
+            traversal_setup_error: self.traversal_setup_error,
         };
         let count = CountSession::new(
             PID,
@@ -1080,6 +1160,7 @@ impl Harness {
             log: self.target_log.clone(),
             order: self.order.clone(),
             release_fires: self.release_fires,
+            release_timing: self.release_timing,
             shared: Some(self.shared.clone()),
             pid: PID,
             owned: self.owned,
@@ -1114,6 +1195,7 @@ impl Harness {
             comm: self.comm,
             comm_settle_at_ns: self.comm_settle_at_ns,
             comm_settled: self.comm_settled,
+            comm_hook: self.comm_hook,
             proc_log: self.proc_log.clone(),
             stat_seq: self.stat_seq,
             read_budget: self.read_budget,
@@ -3094,21 +3176,33 @@ fn setup_failure_resolves_custody() {
 #[test]
 fn release_failure_on_dead_child_preserves_exit() {
     // Release fails but the child already died: actionable
-    // startup-gap result with the preserved status (not a fatal).
+    // typed pre-observation error with the preserved actual status.
     let mut h = Harness::fresh("dead-release");
     h.release_err = true;
     h.exit_at_ns = Some(0);
     h.exit_code = 7;
     let (out, post) = h.run();
-    let c = out.unwrap();
-    assert_eq!(c.child_exit, Some(7));
+    let error = out.unwrap_err();
+    let failure = error
+        .downcast_ref::<osslscope::capture::PreObservationFailure>()
+        .unwrap();
+    assert_eq!(
+        failure.cause,
+        osslscope::capture::PreObservationCause::NeverReleasedExit
+    );
+    assert_eq!(failure.custody.child_exit, Some(7));
     assert!(matches!(
-        c.disposition,
+        failure.custody.disposition,
         Some(target::TargetDisposition::Exited { code: 7 })
     ));
-    assert!(has_reason(&c, "startup-gap"), "{:?}", c.reasons);
-    assert!(has_reason(&c, "no-query"), "{:?}", c.reasons);
-    assert!(matches!(c.outcome, Outcome::Partial));
+    assert!(matches!(
+        failure.count,
+        osslscope::capture::PreObservationCount::Terminal(_)
+    ));
+    assert_eq!(
+        failure.release.unwrap().outcome,
+        osslscope::capture::ReleaseOutcome::Failed
+    );
     assert!(post.target_log.borrow().resolved);
 }
 
@@ -3209,19 +3303,28 @@ fn setup_discovery_failure_is_loud() {
 #[test]
 fn signal_during_setup_cuts_cleanly() {
     // Cancelled before release: the never-released child resolves
-    // (never left stopped), and the result is signal-cut PARTIAL
-    // with the SIGKILL status and disposition preserved.
+    // (never left stopped), with typed cancellation, actual SIGKILL status and retained custody.
     let h = Harness::fresh("setup-cancel");
     h.cancelled.set(true);
     let (out, post) = h.run();
-    let c = out.unwrap();
-    assert!(matches!(c.outcome, Outcome::Partial));
-    assert!(has_reason(&c, "interrupted"), "{:?}", c.reasons);
-    assert!(has_reason(&c, "startup-gap"), "{:?}", c.reasons);
-    assert_eq!(c.child_exit, Some(137));
+    let error = out.unwrap_err();
+    let failure = error
+        .downcast_ref::<osslscope::capture::PreObservationFailure>()
+        .unwrap();
+    assert_eq!(
+        failure.cause,
+        osslscope::capture::PreObservationCause::Cancelled
+    );
+    assert!(failure.failure.is_none());
+    assert!(failure.release.is_none());
+    assert_eq!(failure.custody.child_exit, Some(137));
     assert!(matches!(
-        c.disposition,
+        failure.custody.disposition,
         Some(target::TargetDisposition::Exited { code: 137 })
+    ));
+    assert!(matches!(
+        failure.count,
+        osslscope::capture::PreObservationCount::Terminal(_)
     ));
     let log = post.target_log.borrow();
     assert!(!log.released);
@@ -3235,8 +3338,18 @@ fn zero_setup_timeout_resolves_without_window() {
     let mut h = Harness::fresh("setup-timeout");
     h.cfg.harvest_timeout = Duration::ZERO;
     let (out, post) = h.run();
-    let msg = out.expect_err("zero setup timeout must fail").to_string();
-    assert!(msg.contains("setup timeout"), "{msg}");
+    let error = out.expect_err("zero setup timeout must fail");
+    let failure = error
+        .downcast_ref::<osslscope::capture::PreObservationFailure>()
+        .unwrap();
+    assert!(
+        failure
+            .failure
+            .as_ref()
+            .unwrap()
+            .detail
+            .contains("setup timeout")
+    );
     let log = post.target_log.borrow();
     assert!(!log.released);
     assert!(log.resolved);
@@ -3866,13 +3979,44 @@ fn pid_setup_outlasts_window_fails_closed() {
     h.owned = false;
     h.acquired_ns = BASE_NS - 3_000_000_000;
     h.snapshot_attached();
-    let (out, _) = h.run();
-    let err = out.unwrap_err();
-    assert!(
-        err.to_string()
-            .contains("requested window elapsed before window open"),
-        "{err:?}"
+    let (out, post) = h.run();
+    let capture = out.unwrap();
+    let w = &capture.document.window;
+    assert_eq!(w.requested_start_ns, BASE_NS - 3_000_000_000);
+    assert_eq!(w.requested_end_ns, BASE_NS - 1_000_000_000);
+    assert_eq!(w.effective_start_ns, w.requested_end_ns);
+    assert_eq!(w.effective_end_ns, w.requested_end_ns);
+    assert!(w.count_admission.is_none());
+    assert!(capture.programmed_admission.is_none());
+    assert!(capture.document.sites.is_empty());
+    assert_eq!(w.startup_gap_ns(), 2_000_000_000);
+    assert!(matches!(
+        capture.document.status,
+        Completeness::Partial { .. }
+    ));
+    let context = capture.failure_context.as_ref().unwrap();
+    assert_eq!(
+        context.custody.resolution,
+        osslscope::capture::CustodyResolution::NotOwned
     );
+    assert!(matches!(
+        context.count,
+        osslscope::capture::PreObservationCount::Terminal(_)
+    ));
+    assert!(!post.target_log.borrow().released);
+    assert!(
+        !post
+            .shared
+            .borrow()
+            .log
+            .iter()
+            .any(|line| line == "count_open")
+    );
+    let value: serde_json::Value =
+        serde_json::from_slice(&osslscope::report::render_json(&capture.document).unwrap())
+            .unwrap();
+    osslscope::schema::validate_v2(&value).unwrap();
+    osslscope::schema::check_v2_semantics(&value).unwrap();
 }
 
 #[test]
@@ -5860,6 +6004,7 @@ fn live_observe_inner(
         cancel_flag: None,
         polls_done: 0,
         finished: false,
+        traversal_setup_error: false,
     };
     let count = CountSession::new(
         pid,
@@ -5904,6 +6049,7 @@ fn live_observe_inner(
         comm: None,
         comm_settle_at_ns: None,
         comm_settled: None,
+        comm_hook: None,
         proc_log: Rc::new(RefCell::new(ProcLog::default())),
         stat_seq: VecDeque::new(),
         read_budget: 128 * 1024 * 1024,
@@ -9568,4 +9714,434 @@ fn g1_terminal_execs_never_reopen_count_generation() {
         "{:?}",
         shared.log
     );
+}
+
+/// Catches post-release/post-comm restamping: two actual early callbacks must
+/// keep their timestamps while the requested clock starts before release.
+#[test]
+fn g1_owned_release_clock_precedes_running_target() {
+    for early in [true, false] {
+        let mut h = Harness::fresh("g1-release-clock");
+        *h.clock.ns.borrow_mut() = 1000;
+        h.acquired_ns = 1000;
+        h.cfg.duration = Duration::from_nanos(1000);
+        h.poll_delay_ns.insert(0, 100);
+        h.snapshot_attached();
+        h.polls.push_back(DiscoveryDelta {
+            objects: vec![osslscope::discovery::session::DiscoveredObject {
+                dev: backing_of(&h.staged, h.off).unwrap().dev,
+                ino: h.staged.ino,
+                display_locator: h.staged.path.clone(),
+            }],
+            candidates: vec![cand(
+                "/p/provider.so",
+                backing_of(&h.staged, h.off),
+                1,
+                11,
+                "SHA-256",
+                false,
+                "ok",
+            )],
+            tables: vec![terminated(1, 0)],
+            trigger_observed: true,
+            ..DiscoveryDelta::default()
+        });
+        h.release_timing = Some((10, 10));
+        if early {
+            h.release_fires = vec![(0, 1)];
+        }
+        let clock = h.clock.clone();
+        let shared = h.shared.clone();
+        h.comm_hook = Some(Rc::new(move || {
+            clock.advance_ns(if early { 30 } else { 180 });
+            let mut st = shared.borrow_mut();
+            let cookie = st.attached[0];
+            st.backend.fire(PID, cookie, clock.monotonic_ns(), 1);
+            if early {
+                clock.advance_ns(50);
+            }
+        }));
+        let (result, _) = h.run();
+        let c = result.unwrap();
+        assert_eq!(c.programmed_admission.unwrap().start_ns(), 1000);
+        assert_eq!(c.programmed_admission.unwrap().deadline_ns(), 2000);
+        let release = c.release_attempt.unwrap();
+        assert_eq!(release.before.monotonic_ns, 1100);
+        assert_eq!(release.after_ns, Some(1120));
+        assert_eq!(
+            release.outcome,
+            osslscope::capture::ReleaseOutcome::Succeeded
+        );
+        let bounds = match_bounds(&c.document.sites, &|_| PredicateMatch::Yes);
+        assert_eq!(bounds.definite, if early { 2 } else { 1 });
+        assert_eq!(c.document.window.requested_start_ns, 1100);
+        assert_eq!(c.document.window.effective_start_ns, 1100);
+        assert_eq!(c.document.window.requested_end_ns, 2100);
+        assert_eq!(
+            c.document.sites[0].first_ns,
+            if early { 1110 } else { 1300 }
+        );
+        assert_eq!(c.document.sites[0].last_ns, if early { 1150 } else { 1300 });
+        let bytes = osslscope::report::render_json(&c.document).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        osslscope::schema::validate_v2(&json).unwrap();
+        osslscope::schema::check_v2_semantics(&json).unwrap();
+    }
+}
+
+#[test]
+fn g1_checked_release_and_open_failures_retain_terminal_custody() {
+    for (samples, stage) in [
+        (vec![None], osslscope::capture::BoundaryStage::Open),
+        (
+            vec![Some(BASE_NS), None],
+            osslscope::capture::BoundaryStage::Release,
+        ),
+    ] {
+        let h = Harness::fresh("g1-clock-failure");
+        *h.clock.checked_samples.borrow_mut() = VecDeque::from(samples);
+        let (out, post) = h.run();
+        let error = out.unwrap_err();
+        let failure = error
+            .downcast_ref::<osslscope::capture::PreObservationFailure>()
+            .unwrap();
+        assert_eq!(failure.failure.as_ref().unwrap().stage, stage);
+        assert_eq!(failure.failure.as_ref().unwrap().errno, None);
+        assert!(failure.release.is_none());
+        assert_eq!(
+            failure.custody.resolution,
+            osslscope::capture::CustodyResolution::Resolved
+        );
+        assert!(matches!(
+            failure.count,
+            osslscope::capture::PreObservationCount::Terminal(_)
+        ));
+        assert!(!post.target_log.borrow().released);
+        assert!(post.target_log.borrow().resolved);
+        if stage == osslscope::capture::BoundaryStage::Open {
+            assert!(
+                !post
+                    .shared
+                    .borrow()
+                    .log
+                    .iter()
+                    .any(|line| line == "count_open")
+            );
+        }
+    }
+    let h = Harness::fresh("g1-after-clock-failure");
+    *h.clock.checked_samples.borrow_mut() = VecDeque::from([Some(BASE_NS), Some(BASE_NS), None]);
+    let (out, post) = h.run();
+    let capture = out.unwrap();
+    assert!(post.target_log.borrow().released);
+    assert_eq!(capture.release_attempt.unwrap().after_ns, None);
+    assert_eq!(capture.document.window.requested_start_ns, BASE_NS);
+    assert!(has_counter(&capture, "count.close_time_uncertain"));
+    let value: serde_json::Value =
+        serde_json::from_slice(&osslscope::report::render_json(&capture.document).unwrap())
+            .unwrap();
+    osslscope::schema::validate_v2(&value).unwrap();
+    osslscope::schema::check_v2_semantics(&value).unwrap();
+}
+
+#[test]
+fn g1_owned_empty_overlap_keeps_full_requested_gap() {
+    let mut h = Harness::fresh("g1-empty-overlap");
+    *h.clock.ns.borrow_mut() = 1000;
+    h.acquired_ns = 1000;
+    h.cfg.duration = Duration::from_nanos(50);
+    h.poll_delay_ns.insert(0, 100);
+    let (out, _) = h.run();
+    let capture = out.unwrap();
+    let w = &capture.document.window;
+    assert_eq!((w.requested_start_ns, w.requested_end_ns), (1100, 1150));
+    assert_eq!((w.effective_start_ns, w.effective_end_ns), (1100, 1100));
+    assert_eq!(
+        (
+            capture.programmed_admission.unwrap().start_ns(),
+            capture.programmed_admission.unwrap().deadline_ns()
+        ),
+        (1000, 1050)
+    );
+    assert_eq!(w.tail_gap_ns(), 50);
+    assert!(w.count_admission.is_none());
+    assert_eq!(capture.document.total_calls(), 0);
+    assert!(matches!(
+        capture.document.status,
+        Completeness::Partial { .. }
+    ));
+    let value: serde_json::Value =
+        serde_json::from_slice(&osslscope::report::render_json(&capture.document).unwrap())
+            .unwrap();
+    osslscope::schema::validate_v2(&value).unwrap();
+    osslscope::schema::check_v2_semantics(&value).unwrap();
+}
+
+#[test]
+fn g1_binding_failure_retains_original_prefix_and_runtime_salvage() {
+    let mut h = Harness::fresh("g1-binding-prefix");
+    *h.clock.ns.borrow_mut() = 1000;
+    h.acquired_ns = 1000;
+    h.cfg.duration = Duration::from_nanos(1000);
+    h.poll_delay_ns.insert(0, 100);
+    h.snapshot_attached();
+    let backing = backing_of(&h.staged, h.off).unwrap();
+    h.polls.push_back(DiscoveryDelta {
+        objects: vec![osslscope::discovery::session::DiscoveredObject {
+            dev: backing.dev.clone(),
+            ino: h.staged.ino,
+            display_locator: h.staged.path.clone(),
+        }],
+        candidates: vec![
+            cand(
+                "/p/provider.so",
+                Some(backing.clone()),
+                1,
+                11,
+                "SHA-256",
+                false,
+                "ok",
+            ),
+            cand(
+                "/p/provider.so",
+                backing_of(&h.staged, h.off + 16),
+                1,
+                12,
+                "SHA-256",
+                false,
+                "ok",
+            ),
+        ],
+        tables: vec![terminated(1, 0)],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    let clock = h.clock.clone();
+    let shared = h.shared.clone();
+    h.comm_hook = Some(Rc::new(move || {
+        clock.advance_ns(200);
+        let mut state = shared.borrow_mut();
+        let cookies = state.attached.clone();
+        // Deliberately contradictory retained input: valid under actual Open,
+        // before requested release. The controller must refuse binding it.
+        state.backend.fire(PID, cookies[0], 1050, 1);
+        state.backend.fire(PID, cookies[1], 1300, 1);
+    }));
+    let (out, _) = h.run();
+    let error = out.unwrap_err();
+    let binding = error
+        .downcast_ref::<osslscope::capture::WindowBindingFailure>()
+        .unwrap();
+    assert_eq!(
+        binding.reason,
+        osslscope::capture::WindowBindingReason::PreRequestedRow
+    );
+    let runtime = error
+        .downcast_ref::<osslscope::capture::CaptureRuntimeFailure>()
+        .unwrap();
+    let terminal = runtime.terminal.as_ref().unwrap();
+    assert_eq!(terminal.retained_drain.total_calls(), 2);
+    assert_eq!(terminal.retained_drain.current[0].first_ns, 1050);
+    assert_eq!(runtime.capture.document.total_calls(), 1);
+    assert_eq!(runtime.capture.document.sites[0].first_ns, 1300);
+    assert!(matches!(
+        runtime.capture.document.status,
+        Completeness::Fatal {
+            kind: osslscope::evidence::FatalKind::Runtime(_),
+            ..
+        }
+    ));
+    assert_eq!(
+        runtime.capture.release_attempt.unwrap().before.monotonic_ns,
+        1100
+    );
+    assert_eq!(
+        runtime.capture.programmed_admission.unwrap().start_ns(),
+        1000
+    );
+    let context = runtime.capture.failure_context.as_ref().unwrap();
+    assert_eq!(context.rejected.known_rows, Some(2));
+    assert_eq!(context.rejected.known_calls, Some(2));
+    assert!(std::sync::Arc::ptr_eq(
+        terminal,
+        binding.terminal.as_ref().unwrap()
+    ));
+    let value: serde_json::Value =
+        serde_json::from_slice(&osslscope::report::render_json(&runtime.capture.document).unwrap())
+            .unwrap();
+    osslscope::schema::validate_v2(&value).unwrap();
+    osslscope::schema::check_v2_semantics(&value).unwrap();
+}
+
+#[test]
+fn g1_public_open_error_routes_only_actual_completed_binding() {
+    use osslscope::capture::{
+        BoundaryFailureClass, PreObservationCause, PreObservationCount, PreObservationFailure,
+    };
+    for owned in [false, true] {
+        for fault in [
+            OpenReplyFault::CompletedLost,
+            OpenReplyFault::MissingResolved,
+            OpenReplyFault::MismatchedActual,
+        ] {
+            let mut h = Harness::fresh("g1-open-error");
+            h.owned = owned;
+            h.shared.borrow_mut().open_reply_fault = Some(fault);
+            let (out, post) = h.run();
+            if !owned && matches!(fault, OpenReplyFault::CompletedLost) {
+                let capture = out.unwrap();
+                assert!(matches!(
+                    capture.document.status,
+                    Completeness::Fatal {
+                        kind: osslscope::evidence::FatalKind::Runtime(_),
+                        ..
+                    }
+                ));
+                assert_eq!(capture.programmed_admission.unwrap().start_ns(), BASE_NS);
+                assert_eq!(
+                    capture.programmed_admission.unwrap().deadline_ns(),
+                    BASE_NS + 2_000_000_000
+                );
+                assert!(capture.release_attempt.is_none());
+                let context = capture.failure_context.as_ref().unwrap();
+                assert_eq!(
+                    context.failure.as_ref().unwrap().class,
+                    BoundaryFailureClass::Disconnected
+                );
+                assert!(matches!(context.count, PreObservationCount::Terminal(_)));
+                let value: serde_json::Value = serde_json::from_slice(
+                    &osslscope::report::render_json(&capture.document).unwrap(),
+                )
+                .unwrap();
+                osslscope::schema::validate_v2(&value).unwrap();
+                osslscope::schema::check_v2_semantics(&value).unwrap();
+            } else {
+                let error = out.unwrap_err();
+                let failure = error.downcast_ref::<PreObservationFailure>().unwrap();
+                assert_eq!(failure.cause, PreObservationCause::OpenUnresolved);
+                assert!(failure.release.is_none());
+                let PreObservationCount::Terminal(terminal) = &failure.count else {
+                    panic!("missing canonical terminal")
+                };
+                assert_eq!(terminal.retained_drain.total_calls(), 0);
+                assert!(failure.failure.is_some());
+                assert!(failure.failure.as_ref().unwrap().detail.len() <= 200);
+            }
+            assert!(!post.target_log.borrow().released);
+        }
+    }
+}
+
+#[test]
+fn g1_external_completed_open_positive_before_loop_flag_salvages() {
+    let mut h = Harness::fresh("g1-external-setup-positive");
+    h.owned = false;
+    h.snapshot_attached();
+    let backing = backing_of(&h.staged, h.off).unwrap();
+    h.polls.push_back(DiscoveryDelta {
+        objects: vec![osslscope::discovery::session::DiscoveredObject {
+            dev: backing.dev.clone(),
+            ino: h.staged.ino,
+            display_locator: h.staged.path.clone(),
+        }],
+        candidates: vec![cand(
+            "/p/provider.so",
+            Some(backing),
+            1,
+            11,
+            "SHA-256",
+            false,
+            "ok",
+        )],
+        tables: vec![terminated(1, 0)],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    h.traversal_setup_error = true;
+    let (out, post) = h.run();
+    let capture = out.unwrap();
+    assert!(matches!(
+        capture.document.status,
+        Completeness::Fatal {
+            kind: osslscope::evidence::FatalKind::Runtime(_),
+            ..
+        }
+    ));
+    assert_eq!(capture.document.total_calls(), 1);
+    assert_eq!(capture.document.sites[0].last_ns, BASE_NS + 300);
+    assert_eq!(capture.programmed_admission.unwrap().start_ns(), BASE_NS);
+    assert!(capture.release_attempt.is_none());
+    assert!(!post.target_log.borrow().released);
+    let context = capture.failure_context.as_ref().unwrap();
+    let failure = context.failure.as_ref().unwrap();
+    assert_eq!(failure.stage, osslscope::capture::BoundaryStage::Traversal);
+    assert_eq!(failure.class, osslscope::capture::BoundaryFailureClass::Io);
+    assert_eq!(failure.errno, Some(libc::EIO));
+    let bounds = match_bounds(&capture.document.sites, &|_| PredicateMatch::Yes);
+    assert_eq!(bounds.definite, 1);
+    let value: serde_json::Value =
+        serde_json::from_slice(&osslscope::report::render_json(&capture.document).unwrap())
+            .unwrap();
+    osslscope::schema::validate_v2(&value).unwrap();
+    osslscope::schema::check_v2_semantics(&value).unwrap();
+}
+
+#[test]
+fn g1_owned_fulfilled_omits_projection_only_after_pre_read_reap() {
+    let mut h = Harness::fresh("g1-strict-fulfilled");
+    *h.clock.ns.borrow_mut() = 1000;
+    h.acquired_ns = 1000;
+    h.cfg.duration = Duration::from_nanos(1000);
+    h.poll_delay_ns.insert(0, 100);
+    h.exit_at_ns = Some(1500);
+    h.snapshot_attached();
+    let backing = backing_of(&h.staged, h.off).unwrap();
+    h.polls.push_back(DiscoveryDelta {
+        objects: vec![osslscope::discovery::session::DiscoveredObject {
+            dev: backing.dev.clone(),
+            ino: h.staged.ino,
+            display_locator: h.staged.path.clone(),
+        }],
+        candidates: vec![cand(
+            "/p/provider.so",
+            Some(backing),
+            1,
+            11,
+            "SHA-256",
+            false,
+            "ok",
+        )],
+        tables: vec![terminated(1, 0)],
+        trigger_observed: true,
+        ..DiscoveryDelta::default()
+    });
+    let shared = h.shared.clone();
+    let clock = h.clock.clone();
+    h.comm_hook = Some(Rc::new(move || {
+        clock.advance_ns(100);
+        let mut state = shared.borrow_mut();
+        let cookie = state.attached[0];
+        state.backend.fire(PID, cookie, clock.monotonic_ns(), 1);
+        clock.advance_ns(300);
+    }));
+    let (out, post) = h.run();
+    let capture = out.unwrap();
+    let w = &capture.document.window;
+    assert_eq!((w.requested_start_ns, w.requested_end_ns), (1100, 1500));
+    assert_eq!((w.effective_start_ns, w.effective_end_ns), (1100, 1500));
+    assert!(w.count_admission.is_none());
+    assert_eq!(capture.document.sites[0].last_ns, 1200);
+    assert_eq!(capture.programmed_admission.unwrap().deadline_ns(), 2000);
+    assert_eq!(post.target_log.borrow().reaped_at, Some(1500));
+    let order = post.order.borrow();
+    assert!(
+        order.iter().position(|e| e == "reaped").unwrap()
+            < order.iter().position(|e| e == "count_closed").unwrap()
+    );
+    let value: serde_json::Value =
+        serde_json::from_slice(&osslscope::report::render_json(&capture.document).unwrap())
+            .unwrap();
+    assert!(value["window"].get("count_admission").is_none());
+    osslscope::schema::validate_v2(&value).unwrap();
+    osslscope::schema::check_v2_semantics(&value).unwrap();
 }

@@ -312,7 +312,7 @@ pub fn run(argv: &[String]) -> ExitCode {
     // T14r4: report renders the finalized v2 capture document
     // (policy None => report shape), never the historical v1
     // projection. PRD §14.1: the live producer schema is
-    // observed-crypto-v2.1; v1 fixtures are history.
+    // observed-crypto-v2.2; v1 fixtures are history.
     let req = OutputRequest {
         format: if args.format == "json" {
             OutputFormat::Json
@@ -383,9 +383,9 @@ pub fn run(argv: &[String]) -> ExitCode {
 
 use crate::evidence::CaptureDocument;
 use crate::evidence::{
-    CandidateCoverage, Completeness, CounterKind, CounterSource, CounterUnits, DispositionOutcome,
-    EngineWindow, ExpectedScope, FatalKind, GapReason, OpensslVersionState, PolicyVerdict,
-    RuleVerdict, SiteExecution,
+    CAPTURE_SCHEMA_V2, CandidateCoverage, Completeness, CounterKind, CounterSource, CounterUnits,
+    DispositionOutcome, EngineWindow, ExpectedScope, FatalKind, GapReason, OpensslVersionState,
+    PolicyVerdict, RuleVerdict, SiteExecution,
 };
 
 /// Primary artifact format for [`OutputRequest`].
@@ -447,7 +447,7 @@ impl DeliveryResult {
     }
 }
 
-/// Render the v2 JSON artifact (`observed-crypto-v2.1`) for one
+/// Render the v2 JSON artifact (`observed-crypto-v2.2`) for one
 /// finalized document: sorted keys, pretty-printed, trailing
 /// newline. Sites carry conserved per-site counts with candidate
 /// uncertainty; target/openssl/window/coverage/losses/disposition
@@ -600,7 +600,7 @@ fn doc_json(doc: &CaptureDocument) -> serde_json::Value {
         _ => serde_json::Value::Null,
     };
     let mut out = serde_json::json!({
-        "schema_version": "observed-crypto-v2.1",
+        "schema_version": CAPTURE_SCHEMA_V2,
         "target": {
             "pid": doc.target.pid,
             "comm": doc.target.comm,
@@ -667,6 +667,12 @@ fn doc_json(doc: &CaptureDocument) -> serde_json::Value {
     });
     // Report/check convention (v1-compatible): unevaluated policy
     // and unrecorded disposition omit their sections.
+    if let Some(admission) = doc.window.count_admission {
+        out["window"]["count_admission"] = serde_json::json!({
+            "start_ns": admission.start_ns,
+            "deadline_ns": admission.deadline_ns,
+        });
+    }
     // v2.1 traversal: runs without the members backend omit the
     // section; traversal runs name the exact selected triple
     // (paths + sha256 — the same provenance doctor verifies).
@@ -807,7 +813,8 @@ fn doc_json(doc: &CaptureDocument) -> serde_json::Value {
 pub fn render_human(doc: &CaptureDocument) -> String {
     let mut s = String::new();
     s.push_str(&format!(
-        "osslscope report (observed-crypto-v2.1): pid={} ({}) window={}..{}ns effective={}..{}ns\n",
+        "osslscope report ({}): pid={} ({}) window={}..{}ns effective={}..{}ns\n",
+        CAPTURE_SCHEMA_V2,
         doc.target.pid,
         safe_display(&doc.target.comm),
         doc.window.requested_start_ns,
@@ -1531,10 +1538,7 @@ fn cbom_json(doc: &CaptureDocument) -> serde_json::Value {
         )
     };
     let mut metadata = vec![
-        prop(
-            "osslscope:schema-version",
-            "observed-crypto-v2.1".to_string(),
-        ),
+        prop("osslscope:schema-version", CAPTURE_SCHEMA_V2.to_string()),
         prop(
             "osslscope:execution-evidence-completeness",
             status_str(doc).to_string(),
@@ -1753,6 +1757,7 @@ pub fn setup_failure_document(fatal: FatalKind) -> CaptureDocument {
             effective_start_ns: 0,
             effective_end_ns: 0,
             signal_cut: false,
+            count_admission: None,
         },
         sites: Vec::new(),
         fenced: Vec::new(),
@@ -2016,7 +2021,7 @@ mod tests {
         assert!(doc.policy.is_none());
         let bytes = render_json(&doc).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(v["schema_version"], "observed-crypto-v2.1");
+        assert_eq!(v["schema_version"], "observed-crypto-v2.2");
         assert!(v.get("policy").is_none());
     }
 

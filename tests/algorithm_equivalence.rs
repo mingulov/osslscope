@@ -202,6 +202,7 @@ fn exact_window() -> CaptureWindow {
         effective_start_ns: 1_000,
         effective_end_ns: 2_000,
         signal_cut: false,
+        count_admission: None,
     }
 }
 

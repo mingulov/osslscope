@@ -102,7 +102,7 @@ violation document with one added unknown key. These source/fixture
 controls are distinct from a new live run.
 
 Compatibility is deliberate: producers emit exactly
-`observed-crypto-v2.1`, readers accept `observed-crypto-v2` and
+`observed-crypto-v2.2`, readers accept `observed-crypto-v2` and
 `observed-crypto-v2.<digits>` and reject every other major, and
 minor versions add OPTIONAL keys only. A v2.0 validator fails
 closed on v2.1 keys it does not know (upgrade the validator);
@@ -213,3 +213,11 @@ exit 11 fails pending gap triage, exit 3 + `pass` is normal),
 and read declared-vs-executed as "could run" versus "ran" -- with
 ambiguous sites and window-only absence stated explicitly. That
 packet is the v2 audit trail.
+
+The v2.2 optional count-admission bounds describe the actual completed Open
+separately from coverage time. An early-cut callback retains its real sample
+inside that original half-open interval, with PARTIAL/FATAL coverage and a
+tail gap. Strict older window readers reject the optional object; tolerant
+field readers preserve the fields they understand. Absent metadata retains
+strict effective-window containment. These source and host controls do not
+qualify live clock-domain compatibility or first-call capture.

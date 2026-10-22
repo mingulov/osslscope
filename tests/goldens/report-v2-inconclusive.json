@@ -70,7 +70,7 @@
     ],
     "verdict": "inconclusive"
   },
-  "schema_version": "observed-crypto-v2.1",
+  "schema_version": "observed-crypto-v2.2",
   "sites": [
     {
       "calls": 100,

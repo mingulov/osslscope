@@ -138,7 +138,7 @@
     "properties": [
       {
         "name": "osslscope:schema-version",
-        "value": "observed-crypto-v2.1"
+        "value": "observed-crypto-v2.2"
       },
       {
         "name": "osslscope:execution-evidence-completeness",

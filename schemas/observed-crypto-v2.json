@@ -2,13 +2,13 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://osslscope.dev/schemas/observed-crypto-v2.json",
   "title": "observed-crypto v2",
-  "description": "osslscope report/check window document (continuation R08). The counted unit is entry into a provider-dispatch callback at one physical site; candidates are sorted attribution metadata, not definite executed-algorithm identity. Producers emit observed-crypto-v2.1 today. Readers gate majors via check_version_v2 (accept v2.x, reject other majors); validators enforce this minor's schema strictly (unknown keys fail: a v2.0 validator cannot verify v2.1 keys it does not know) while field-level readers ignore unknown keys. report documents omit policy/disposition when unevaluated/unrecorded; check documents add policy. No raw argv, cmdline, environment or runtime addresses anywhere: every object forbids additional properties.",
+  "description": "osslscope report/check window document (continuation R08). The counted unit is entry into a provider-dispatch callback at one physical site; candidates are sorted attribution metadata, not definite executed-algorithm identity. Producers emit observed-crypto-v2.2 today. Readers gate majors via check_version_v2 (accept v2.x, reject other majors); validators enforce this minor's schema strictly (unknown keys fail: a v2.0 validator cannot verify v2.1 keys it does not know) while field-level readers ignore unknown keys. report documents omit policy/disposition when unevaluated/unrecorded; check documents add policy. No raw argv, cmdline, environment or runtime addresses anywhere: every object forbids additional properties.",
   "type": "object",
   "required": ["schema_version", "target", "openssl", "window", "completeness", "sites", "fenced", "objects", "coverage", "legacy_partition"],
   "additionalProperties": false,
   "properties": {
     "schema_version": {
-      "description": "Producers emit exactly observed-crypto-v2.1; readers major-gate via check_version_v2 (accept v2.x, reject other majors).",
+      "description": "Producers emit exactly observed-crypto-v2.2; readers major-gate via check_version_v2 (accept v2.x, reject other majors).",
       "type": "string",
       "minLength": 1
     },
@@ -45,7 +45,17 @@
         "requested_end_ns": { "$ref": "#/$defs/u64" },
         "effective_start_ns": { "$ref": "#/$defs/u64" },
         "effective_end_ns": { "$ref": "#/$defs/u64" },
-        "signal_cut": { "type": "boolean" }
+        "signal_cut": { "type": "boolean" },
+        "count_admission": {
+          "description": "Actual completed count Open interval; independent of conservative coverage. Absent means strict effective-window containment. Cross-field constraints are enforced by check_v2_semantics.",
+          "type": "object",
+          "required": ["start_ns", "deadline_ns"],
+          "additionalProperties": false,
+          "properties": {
+            "start_ns": { "$ref": "#/$defs/u64" },
+            "deadline_ns": { "$ref": "#/$defs/u64" }
+          }
+        }
       }
     },
     "completeness": {

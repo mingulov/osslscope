@@ -131,6 +131,7 @@ fn input_base() -> FinalizeInput {
             effective_start_ns: 0,
             effective_end_ns: 100,
             signal_cut: false,
+            count_admission: None,
         },
         sites: Vec::new(),
         fenced: Vec::new(),
@@ -275,6 +276,7 @@ fn partial_doc() -> CaptureDocument {
         effective_start_ns: 5,
         effective_end_ns: 95,
         signal_cut: false,
+        count_admission: None,
     };
     input.sites = vec![
         site_at(
@@ -447,6 +449,7 @@ fn fatal_doc() -> CaptureDocument {
         effective_start_ns: 31000,
         effective_end_ns: 31000,
         signal_cut: false,
+        count_admission: None,
     };
     input.objects = Vec::new();
     input.fatal = Some(FatalKind::Recycled);
@@ -831,7 +834,7 @@ fn schema_version_gate() {
     assert!(!check_version("observed-crypto-v2.9"));
     // Renders carry exactly the current producer version.
     for doc in [complete_doc(), violation_doc(), fatal_doc()] {
-        assert_eq!(json_of(&doc)["schema_version"], "observed-crypto-v2.1");
+        assert_eq!(json_of(&doc)["schema_version"], "observed-crypto-v2.2");
     }
 }
 
@@ -1829,7 +1832,7 @@ fn cbom_carries_same_window() {
             meta["osslscope:window-effective-end-ns"],
             doc.window.effective_end_ns.to_string()
         );
-        assert_eq!(meta["osslscope:schema-version"], "observed-crypto-v2.1");
+        assert_eq!(meta["osslscope:schema-version"], "observed-crypto-v2.2");
     }
     // PARTIAL disclaimer names the gaps.
     let meta = cbom_metadata(&cbom_of(&partial_doc()));
@@ -2382,7 +2385,7 @@ fn selected_objects_rendered_and_old_reader_safe() {
     // Additive proof: a frozen pre-key wire reader (no
     // selected_objects field) parses the new bytes.
     let back: PreR12WireDocument = serde_json::from_value(v).expect("old reader parses new bytes");
-    assert_eq!(back.schema_version, "observed-crypto-v2.1");
+    assert_eq!(back.schema_version, "observed-crypto-v2.2");
     assert_eq!(back.completeness.status, "COMPLETE");
 }
 
@@ -2950,7 +2953,7 @@ fn site_installed_at_renders_and_validates_v2() {
     doc.sites[0].installed_at = Some(5);
     assert_eq!(doc.sites[3].installed_at, None);
     let v = json_of(&doc);
-    assert_eq!(v["schema_version"], "observed-crypto-v2.1");
+    assert_eq!(v["schema_version"], "observed-crypto-v2.2");
     validate_v2(&v).expect("installed_at doc fails schema");
     check_v2_semantics(&v).expect("installed_at doc fails semantics");
     assert_eq!(v["sites"][0]["installed_at"], 5);
@@ -3864,7 +3867,7 @@ fn r12_old_reader_ignores_context() {
     );
     let back: PreR12WireDocument =
         serde_json::from_value(rendered).expect("old reader parses new bytes");
-    assert_eq!(back.schema_version, "observed-crypto-v2.1");
+    assert_eq!(back.schema_version, "observed-crypto-v2.2");
     assert_eq!(back.completeness.status, "COMPLETE");
     assert_eq!(
         back.window.requested_start_ns,
@@ -4024,7 +4027,7 @@ fn r14_refusal_diagnostics_additive_old_reader_safe() {
     );
     let back: PreRefusalWireDocument =
         serde_json::from_value(rendered).expect("old reader parses new bytes");
-    assert_eq!(back.schema_version, "observed-crypto-v2.1");
+    assert_eq!(back.schema_version, "observed-crypto-v2.2");
     assert_eq!(back.sites.len(), doc.sites.len());
     assert_eq!(back.objects.len(), doc.objects.len());
     let calls: u64 = back.sites.iter().map(|s| s.calls).sum();
@@ -4100,4 +4103,493 @@ fn r01_old_reader_rejects_ambiguous_complete_loud() {
     let site: PreR01Site =
         serde_json::from_value(v["sites"][0].clone()).expect("old reader parses unknown");
     assert_eq!(site.candidates_coverage, PreR01Coverage::Unknown);
+}
+
+/// Catches an unchanged producer stamp independently of the model's constant.
+#[test]
+fn g1_current_producer_is_minor_2_2() {
+    let v = json_of(&complete_doc());
+    validate_v2(&v).unwrap();
+    check_v2_semantics(&v).unwrap();
+    assert_eq!(v["schema_version"], "observed-crypto-v2.2");
+    assert!(render_human(&complete_doc()).contains("observed-crypto-v2.2"));
+}
+
+/// A TARGET read may precede seal and its ktime sample may follow seal.after.
+/// This positive must reject global strict-tail containment and preserve a
+/// strict lower edge, original half-open deadline, and PARTIAL tail evidence.
+#[test]
+fn g1_target_read_before_seal_timestamp_after_seal() {
+    let mut v = json_of(&complete_doc());
+    v["window"] = json!({"requested_start_ns":1100,"requested_end_ns":2100,
+        "effective_start_ns":1100,"effective_end_ns":1500,"signal_cut":true,
+        "count_admission":{"start_ns":1000,"deadline_ns":2000}});
+    v["sites"][0]["first_ns"] = json!(1110);
+    v["sites"][0]["last_ns"] = json!(1600);
+    // Other complete-fixture sites are independently inside the new interval.
+    for row in v["sites"].as_array_mut().unwrap().iter_mut().skip(1) {
+        row["first_ns"] = json!(1300);
+        row["last_ns"] = json!(1400);
+    }
+    v["completeness"]["status"] = json!("PARTIAL");
+    v["completeness"]["reasons"] = json!([{"kind":"signal-cut"},
+        {"kind":"tail-gap","missing_ns":600}]);
+    validate_v2(&v).unwrap();
+    check_v2_semantics(&v).unwrap();
+}
+
+#[test]
+fn g1_admission_semantic_tail_requires_guarded_extension() {
+    let mut v = json_of(&complete_doc());
+    v["window"]["effective_end_ns"] = json!(50);
+    v["window"]["count_admission"] = json!({"start_ns":0,"deadline_ns":100});
+    v["completeness"]["status"] = json!("PARTIAL");
+    v["completeness"]["reasons"] = json!([{ "kind":"tail-gap", "missing_ns":50 }]);
+    validate_v2(&v).unwrap();
+    check_v2_semantics(&v).unwrap();
+}
+
+fn g1_tail_document() -> CaptureDocument {
+    let mut input = complete_input();
+    input.window = CaptureWindow {
+        requested_start_ns: 1100,
+        requested_end_ns: 2100,
+        effective_start_ns: 1100,
+        effective_end_ns: 1500,
+        signal_cut: true,
+        count_admission: Some(osslscope::evidence::CountAdmissionWindow {
+            start_ns: 1000,
+            deadline_ns: 2000,
+        }),
+    };
+    for row in &mut input.sites {
+        row.first_ns = 1300;
+        row.last_ns = 1400;
+    }
+    input.sites[0].first_ns = 1110;
+    input.sites[0].last_ns = 1600;
+    // Relevant unavailable attribution keeps the upper bound unknown.
+    input.sites[3].calls = 1;
+    input.sites[3].candidates_coverage = CandidateCoverage::Unknown;
+    let mut doc = finalize_honest(input);
+    let verdict = evaluate_document(&[PolicyRule::deny_algorithm("AES-128-GCM")], &doc);
+    assert_eq!(verdict.rules[0].bounds.definite, 500);
+    assert_eq!(verdict.rules[0].bounds.possible, None);
+    doc.policy = Some(policy_record(&verdict));
+    doc
+}
+
+#[test]
+fn g1_admission_extension_is_guarded() {
+    let doc = g1_tail_document();
+    let positive = json_of(&doc);
+    assert_eq!(positive["sites"][0]["last_ns"], 1600);
+    assert_eq!(positive["window"]["effective_end_ns"], 1500);
+    assert_eq!(positive["window"]["count_admission"]["deadline_ns"], 2000);
+    assert!(
+        positive["policy"]["rules"][0]
+            .get("possible")
+            .expect("rendered upper bound")
+            .is_null()
+    );
+    assert_eq!(positive["policy"]["rules"][0]["definite"], 500);
+    validate_v2(&positive).unwrap();
+    check_v2_semantics(&positive).unwrap();
+    for kind in [
+        "missing",
+        "before",
+        "at-deadline",
+        "after-deadline",
+        "bad-start",
+        "inverted",
+        "past-request",
+        "complete",
+        "widened",
+        "no-tail",
+    ] {
+        let mut v = positive.clone();
+        match kind {
+            "missing" => {
+                v["window"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("count_admission");
+            }
+            "before" => {
+                v["sites"][0]["first_ns"] = json!(1099);
+            }
+            "at-deadline" => {
+                v["sites"][0]["last_ns"] = json!(2000);
+            }
+            "after-deadline" => {
+                v["sites"][0]["last_ns"] = json!(2001);
+            }
+            "bad-start" => {
+                v["window"]["effective_start_ns"] = json!(1200);
+            }
+            "inverted" => {
+                v["window"]["count_admission"]["start_ns"] = json!(2000);
+            }
+            "past-request" => {
+                v["window"]["count_admission"]["deadline_ns"] = json!(2101);
+            }
+            "complete" => {
+                v["completeness"]["status"] = json!("COMPLETE");
+            }
+            "widened" => {
+                v["window"]["count_admission"]["start_ns"] = json!(900);
+                v["window"]["effective_start_ns"] = json!(900);
+                v["sites"][0]["first_ns"] = json!(999);
+            }
+            "no-tail" => {
+                v["completeness"]["reasons"] = json!([{"kind":"signal-cut"}]);
+            }
+            _ => unreachable!(),
+        }
+        validate_v2(&v).unwrap_or_else(|e| panic!("{kind} is a cross-field negative: {e}"));
+        assert!(check_v2_semantics(&v).is_err(), "accepted {kind}");
+    }
+    for field in ["extra", "missing-deadline", "wrong-type"] {
+        let mut v = positive.clone();
+        match field {
+            "extra" => {
+                v["window"]["count_admission"]["unknown"] = json!(0);
+            }
+            "missing-deadline" => {
+                v["window"]["count_admission"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("deadline_ns");
+            }
+            _ => {
+                v["window"]["count_admission"]["start_ns"] = json!(-1);
+            }
+        }
+        assert!(validate_v2(&v).is_err());
+        assert!(check_v2_semantics(&v).is_err());
+    }
+    // Lower containment is unchanged even on historical artifacts; an absent
+    // extension cannot become a waiver for upper containment either.
+    for version in ["observed-crypto-v2.0", "observed-crypto-v2.1"] {
+        let mut v = json_of(&complete_doc());
+        v["schema_version"] = json!(version);
+        validate_v2(&v).unwrap();
+        check_v2_semantics(&v).unwrap();
+        v["sites"][0]["last_ns"] = json!(101);
+        assert!(check_v2_semantics(&v).is_err());
+    }
+    let human = render_human(&doc);
+    assert!(human.contains("observed-crypto-v2.2"));
+    let cbom: Value = serde_json::from_slice(&render_cbom(&doc).unwrap()).unwrap();
+    assert!(cbom.to_string().contains("observed-crypto-v2.2"));
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)]
+struct FrozenPreExtensionStrictWindow {
+    requested_start_ns: u64,
+    requested_end_ns: u64,
+    effective_start_ns: u64,
+    effective_end_ns: u64,
+    signal_cut: bool,
+}
+#[derive(Debug, serde::Deserialize)]
+#[allow(dead_code)]
+struct TolerantHistoricalWindow {
+    requested_start_ns: u64,
+    requested_end_ns: u64,
+    effective_start_ns: u64,
+    effective_end_ns: u64,
+    signal_cut: bool,
+}
+#[derive(Debug, serde::Deserialize)]
+struct TolerantHistoricalArtifact {
+    target: PreR12WireTarget,
+    window: TolerantHistoricalWindow,
+    sites: Vec<Value>,
+}
+
+#[test]
+fn g1_admission_rendered_reader_compatibility() {
+    let doc = g1_tail_document();
+    let bytes = render_json(&doc).unwrap();
+    let value: Value = serde_json::from_slice(&bytes).unwrap();
+    validate_v2(&value).unwrap();
+    check_v2_semantics(&value).unwrap();
+    assert!(
+        serde_json::from_value::<PreR12WireWindow>(value["window"].clone())
+            .unwrap_err()
+            .to_string()
+            .contains("count_admission")
+    );
+    assert!(
+        serde_json::from_value::<FrozenPreExtensionStrictWindow>(value["window"].clone())
+            .unwrap_err()
+            .to_string()
+            .contains("count_admission")
+    );
+    let old: TolerantHistoricalArtifact = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(old.target.pid, doc.target.pid);
+    assert_eq!(old.target.comm, doc.target.comm);
+    assert_eq!(old.target.container_id, doc.target.container_id);
+    assert_eq!(old.target.image_digest, doc.target.image_digest);
+    assert!(old.target.argv_redacted);
+    assert!(old.window.signal_cut);
+    assert_eq!(&old.sites, value["sites"].as_array().unwrap());
+    assert_eq!(old.window.requested_start_ns, 1100);
+    assert_eq!(old.window.requested_end_ns, 2100);
+    assert_eq!(old.window.effective_start_ns, 1100);
+    assert_eq!(old.window.effective_end_ns, 1500);
+    assert_eq!(old.sites[0]["last_ns"], 1600);
+    assert_eq!(
+        old.sites
+            .iter()
+            .map(|r| r["calls"].as_u64().unwrap())
+            .sum::<u64>(),
+        901
+    );
+    let mut fulfilled = complete_input();
+    fulfilled.window = CaptureWindow {
+        requested_start_ns: 1100,
+        requested_end_ns: 1500,
+        effective_start_ns: 1100,
+        effective_end_ns: 1500,
+        signal_cut: false,
+        count_admission: None,
+    };
+    for row in &mut fulfilled.sites {
+        row.first_ns = 1200;
+        row.last_ns = 1400;
+    }
+    let mut empty = input_base();
+    empty.window = CaptureWindow {
+        requested_start_ns: 1100,
+        requested_end_ns: 1150,
+        effective_start_ns: 1100,
+        effective_end_ns: 1100,
+        signal_cut: false,
+        count_admission: None,
+    };
+    for input in [fulfilled, empty] {
+        let doc = finalize_honest(input);
+        let bytes = render_json(&doc).unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(value["window"].get("count_admission").is_none());
+        validate_v2(&value).unwrap();
+        check_v2_semantics(&value).unwrap();
+        let _: PreR12WireWindow = serde_json::from_value(value["window"].clone()).unwrap();
+        let _: FrozenPreExtensionStrictWindow =
+            serde_json::from_value(value["window"].clone()).unwrap();
+    }
+}
+
+#[test]
+fn g1_admission_projection_modes() {
+    use osslscope::capture::{
+        AdmissionMode, AdmissionProjection, ReleaseAttempt, ReleaseOutcome, ReleaseStart,
+        WindowBindingReason, project_admission,
+    };
+    use osslscope::count_session::{
+        CountBackend, CountDrain, CountSession, FakeCountBackend, OpenOutcome, OpenReceipt,
+        OpenRequest, OpenWriteFrontier,
+    };
+    use std::time::{Duration, Instant, SystemTime};
+    let mut session = CountSession::new(7, FakeCountBackend::new());
+    session
+        .open_window(1000, 2000, Instant::now() + Duration::from_secs(1))
+        .unwrap();
+    let p = session.programmed_admission().copied().unwrap();
+    let release = ReleaseAttempt {
+        before: ReleaseStart {
+            monotonic_ns: 1100,
+            wall: SystemTime::UNIX_EPOCH,
+            instant: Instant::now(),
+        },
+        after_ns: Some(1120),
+        outcome: ReleaseOutcome::Succeeded,
+    };
+    let mut retained = CountDrain {
+        current: complete_doc().sites,
+        fenced: Vec::new(),
+        counters: Vec::new(),
+    };
+    for row in &mut retained.current {
+        row.first_ns = 1110;
+        row.last_ns = 1600;
+    }
+    let window = CaptureWindow {
+        requested_start_ns: 1100,
+        requested_end_ns: 2100,
+        effective_start_ns: 1100,
+        effective_end_ns: 1500,
+        signal_cut: true,
+        count_admission: None,
+    };
+    let projection = project_admission(
+        Some(&p),
+        Some(&release),
+        &window,
+        &retained,
+        AdmissionMode::Degraded,
+    )
+    .unwrap();
+    assert!(
+        matches!(projection,AdmissionProjection::RenderBound(bound) if bound.start_ns==1000 && bound.deadline_ns==2000)
+    );
+    assert_eq!(
+        project_admission(
+            None,
+            Some(&release),
+            &window,
+            &retained,
+            AdmissionMode::Degraded
+        )
+        .unwrap_err()
+        .reason,
+        WindowBindingReason::NoCompletedOpen
+    );
+    let mut proposed = window;
+    proposed.count_admission = Some(osslscope::evidence::CountAdmissionWindow {
+        start_ns: 1000,
+        deadline_ns: 2000,
+    });
+    assert_eq!(
+        project_admission(
+            None,
+            Some(&release),
+            &proposed,
+            &retained,
+            AdmissionMode::Degraded
+        )
+        .unwrap_err()
+        .reason,
+        WindowBindingReason::NoCompletedOpen
+    );
+    proposed.count_admission = Some(osslscope::evidence::CountAdmissionWindow {
+        start_ns: 1100,
+        deadline_ns: 2000,
+    });
+    assert_eq!(
+        project_admission(
+            Some(&p),
+            Some(&release),
+            &proposed,
+            &retained,
+            AdmissionMode::Degraded
+        )
+        .unwrap_err()
+        .reason,
+        WindowBindingReason::OpenMismatch
+    );
+    let mut wrong = window;
+    wrong.effective_start_ns = 1000;
+    assert!(
+        project_admission(
+            Some(&p),
+            Some(&release),
+            &wrong,
+            &retained,
+            AdmissionMode::Degraded
+        )
+        .is_err()
+    );
+    let ready = session.backend().ready();
+    let req = OpenRequest {
+        seq: p.open_seq(),
+        tgid: 7,
+        generation: 0,
+        start_ns: 1000,
+        deadline_ns: 2000,
+        deadline: Instant::now() + Duration::from_secs(1),
+    };
+    let exact = OpenReceipt {
+        owner_epoch: ready.owner_epoch,
+        seq: req.seq,
+        tgid: req.tgid,
+        generation: 0,
+        start_ns: 1000,
+        deadline_ns: 2000,
+        completed_writes: OpenWriteFrontier::Target,
+        outcome: OpenOutcome::Completed,
+    };
+    for forged in [
+        OpenReceipt {
+            completed_writes: OpenWriteFrontier::NoWrites,
+            ..exact
+        },
+        OpenReceipt {
+            outcome: OpenOutcome::Unknown,
+            ..exact
+        },
+        OpenReceipt {
+            start_ns: 999,
+            ..exact
+        },
+    ] {
+        assert!(
+            forged
+                .programmed_admission(ready.owner_epoch, &req)
+                .is_err()
+        );
+    }
+    let mut tiny = CountSession::new(7, FakeCountBackend::new());
+    tiny.open_window(1000, 1050, Instant::now() + Duration::from_secs(1))
+        .unwrap();
+    let p = tiny.programmed_admission().unwrap();
+    let mut empty = window;
+    empty.requested_end_ns = 1150;
+    empty.effective_end_ns = 1100;
+    empty.signal_cut = false;
+    let no_rows = CountDrain {
+        current: Vec::new(),
+        fenced: Vec::new(),
+        counters: Vec::new(),
+    };
+    assert_eq!(
+        project_admission(
+            Some(p),
+            Some(&release),
+            &empty,
+            &no_rows,
+            AdmissionMode::Ordinary
+        )
+        .unwrap(),
+        AdmissionProjection::EmptyOverlap
+    );
+    assert_eq!(
+        project_admission(
+            Some(p),
+            Some(&release),
+            &empty,
+            &retained,
+            AdmissionMode::Ordinary
+        )
+        .unwrap_err()
+        .reason,
+        WindowBindingReason::NoOverlapHasRows
+    );
+    let external = CaptureWindow {
+        requested_start_ns: 1000,
+        requested_end_ns: 2000,
+        effective_start_ns: 1300,
+        effective_end_ns: 1500,
+        signal_cut: true,
+        count_admission: None,
+    };
+    let mut external_session = CountSession::new(7, FakeCountBackend::new());
+    external_session
+        .open_window(1300, 2000, Instant::now() + Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(external.startup_gap_ns(), 300);
+    assert!(
+        project_admission(
+            external_session.programmed_admission(),
+            None,
+            &external,
+            &no_rows,
+            AdmissionMode::Degraded
+        )
+        .is_ok()
+    );
 }

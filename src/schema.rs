@@ -3,7 +3,7 @@
 //!
 //! [`check_version`] accepts historical v1.x documents; its schema is
 //! `schemas/observed-crypto-v1.json`. Live report/check producers emit
-//! `observed-crypto-v2.1`; [`check_version_v2`], [`validate_v2`] and
+//! `observed-crypto-v2.2`; [`check_version_v2`], [`validate_v2`] and
 //! [`check_v2_semantics`] own that contract. Minor additions are optional;
 //! field readers ignore unknown keys while validators stay strict.
 
@@ -583,9 +583,9 @@ pub fn check_v2_semantics(doc: &serde_json::Value) -> Result<(), String> {
         return Err(format!("doc.schema_version: rejected {version:?}"));
     }
     sweep_forbidden_keys(doc, "$")?;
-    let (effective_start, effective_end) = check_window(root)?;
+    let bounds = check_window(root)?;
     check_object_refs(root)?;
-    check_records(root, effective_start, effective_end)?;
+    check_records(root, bounds)?;
     check_legacy_partition(root)?;
     check_traversal_fingerprints(root)?;
     Ok(())
@@ -697,7 +697,15 @@ fn get_u64(
 
 /// Window consistency; returns the effective bounds for
 /// site-activity containment.
-fn check_window(root: &serde_json::Map<String, serde_json::Value>) -> Result<(u64, u64), String> {
+#[derive(Clone, Copy)]
+struct ActivityBounds {
+    start: u64,
+    effective_end: u64,
+    admission_end: Option<u64>,
+}
+fn check_window(
+    root: &serde_json::Map<String, serde_json::Value>,
+) -> Result<ActivityBounds, String> {
     let window = root
         .get("window")
         .and_then(|v| v.as_object())
@@ -718,7 +726,33 @@ fn check_window(root: &serde_json::Map<String, serde_json::Value>) -> Result<(u6
     if effective_start < requested_start || effective_end > requested_end {
         return Err("doc.window: effective window escapes the requested window".to_string());
     }
-    Ok((effective_start, effective_end))
+    let admission_end = if let Some(value) = window.get("count_admission") {
+        let admission = value
+            .as_object()
+            .ok_or("doc.window.count_admission: expected object")?;
+        if admission.len() != 2 {
+            return Err("doc.window.count_admission: expected exactly start_ns/deadline_ns".into());
+        }
+        let start = get_u64(admission, "start_ns", "doc.window.count_admission")?;
+        let deadline = get_u64(admission, "deadline_ns", "doc.window.count_admission")?;
+        if start >= deadline
+            || deadline > requested_end
+            || effective_start != start.max(requested_start)
+            || effective_end > deadline
+        {
+            return Err(
+                "doc.window.count_admission: invalid binding to requested/effective bounds".into(),
+            );
+        }
+        Some(deadline)
+    } else {
+        None
+    };
+    Ok(ActivityBounds {
+        start: effective_start,
+        effective_end,
+        admission_end,
+    })
 }
 
 /// (object, device, inode, offset, generation) → calls for every
@@ -1087,8 +1121,7 @@ fn check_object_refs(root: &serde_json::Map<String, serde_json::Value>) -> Resul
 
 fn check_records(
     root: &serde_json::Map<String, serde_json::Value>,
-    effective_start: u64,
-    effective_end: u64,
+    bounds: ActivityBounds,
 ) -> Result<(), String> {
     // OpenSSL: verified ⟺ version present and non-empty.
     let openssl = root
@@ -1226,10 +1259,43 @@ fn check_records(
         if first > last {
             return Err(format!("{ctx}: first_ns {first} is past last_ns {last}"));
         }
-        if first < effective_start || last > effective_end {
+        if first < bounds.start
+            || match bounds.admission_end {
+                Some(deadline) => last >= deadline,
+                None => last > bounds.effective_end,
+            }
+        {
             return Err(format!(
-                "{ctx}: activity [{first}, {last}] escapes the effective window [{effective_start}, {effective_end}]"
+                "{ctx}: activity [{first}, {last}] escapes the guarded window"
             ));
+        }
+        if last > bounds.effective_end {
+            let completeness = root
+                .get("completeness")
+                .and_then(|v| v.as_object())
+                .ok_or("doc.completeness: expected object")?;
+            let status = completeness.get("status").and_then(|v| v.as_str());
+            let window = root
+                .get("window")
+                .and_then(|v| v.as_object())
+                .ok_or("doc.window: expected object")?;
+            let requested_end = get_u64(window, "requested_end_ns", "doc.window")?;
+            let tail = completeness
+                .get("reasons")
+                .and_then(|v| v.as_array())
+                .is_some_and(|reasons| {
+                    reasons.iter().any(|r| {
+                        r.get("kind").and_then(|v| v.as_str()) == Some("tail-gap")
+                            && r.get("missing_ns").and_then(|v| v.as_u64())
+                                == requested_end.checked_sub(bounds.effective_end)
+                            && bounds.effective_end < requested_end
+                    })
+                });
+            if !matches!(status, Some("PARTIAL" | "FATAL")) || !tail {
+                return Err(format!(
+                    "{ctx}: admission tail requires PARTIAL/FATAL and an actual coverage tail gap"
+                ));
+            }
         }
         Ok(())
     };
@@ -1990,5 +2056,59 @@ mod tests {
         let doc: serde_json::Value = serde_json::from_str(&text).unwrap();
         validate_v2(&doc).expect("auditor golden v2: schema");
         check_v2_semantics(&doc).expect("auditor golden v2: semantics");
+    }
+}
+
+#[cfg(test)]
+mod g1_admission_reader_tests {
+    use super::*;
+
+    // Frozen pre-extension window schema; never derive it by deleting a field
+    // from the current schema, which would hide compatibility regressions.
+    const OLD_WINDOW_SCHEMA: &str = r#"{
+        "type":"object","additionalProperties":false,
+        "required":["requested_start_ns","requested_end_ns","effective_start_ns","effective_end_ns","signal_cut"],
+        "properties":{
+            "requested_start_ns":{"type":"integer","minimum":0,"maximum":18446744073709551615},
+            "requested_end_ns":{"type":"integer","minimum":0,"maximum":18446744073709551615},
+            "effective_start_ns":{"type":"integer","minimum":0,"maximum":18446744073709551615},
+            "effective_end_ns":{"type":"integer","minimum":0,"maximum":18446744073709551615},
+            "signal_cut":{"type":"boolean"}
+        }
+    }"#;
+
+    #[test]
+    fn g1_rendered_admission_rejected_by_frozen_pre_extension_validator() {
+        let mut document = crate::capture::empty_document();
+        document.window = crate::evidence::CaptureWindow {
+            requested_start_ns: 1100,
+            requested_end_ns: 2100,
+            effective_start_ns: 1100,
+            effective_end_ns: 1500,
+            signal_cut: true,
+            count_admission: Some(crate::evidence::CountAdmissionWindow {
+                start_ns: 1000,
+                deadline_ns: 2000,
+            }),
+        };
+        document.status = crate::evidence::Completeness::Partial {
+            reasons: vec![
+                crate::evidence::GapReason::SignalCut,
+                crate::evidence::GapReason::TailGap { missing_ns: 600 },
+            ],
+        };
+        let bytes = crate::report::render_json(&document).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        validate_v2(&value).unwrap();
+        check_v2_semantics(&value).unwrap();
+        let old: serde_json::Value = serde_json::from_str(OLD_WINDOW_SCHEMA).unwrap();
+        let error = validate_against(&old, &value["window"], &old, "$.window", 0).unwrap_err();
+        assert!(error.path.contains("count_admission"));
+        document.window.count_admission = None;
+        let value: serde_json::Value =
+            serde_json::from_slice(&crate::report::render_json(&document).unwrap()).unwrap();
+        validate_v2(&value).unwrap();
+        check_v2_semantics(&value).unwrap();
+        validate_against(&old, &value["window"], &old, "$.window", 0).unwrap();
     }
 }

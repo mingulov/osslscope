@@ -1963,6 +1963,7 @@ pub struct FakeCountBackend {
     terminal_view: Option<RawTerminal>,
     checkpoint: Option<RawCheckpoint>,
     faults: FakeTerminalFaults,
+    modeled_seal: Option<SealBracket>,
     initial_empty_at: Instant,
     images: [Arc<RawSnapshot>; 3],
     terminal_builder: Option<Arc<RawTerminalData>>,
@@ -2098,6 +2099,7 @@ impl FakeCountBackend {
             terminal_view: None,
             checkpoint: None,
             faults: FakeTerminalFaults::default(),
+            modeled_seal: None,
             initial_empty_at: Instant::now(),
             tgid: 0,
             generation: 0,
@@ -2115,6 +2117,20 @@ impl FakeCountBackend {
             programmed: Vec::new(),
             lat_samples: [0; 16],
         }
+    }
+
+    /// HostModel stop-operation script, independent of receipt/cleanup time.
+    /// A sticky selected terminal can never be restamped.
+    pub fn set_modeled_seal(&mut self, before_ns: Option<u64>, after_ns: Option<u64>) -> bool {
+        if self.terminal_view.is_some() {
+            return false;
+        }
+        self.modeled_seal = Some(SealBracket {
+            before_ns,
+            after_ns,
+            result: StopResult::Stopped,
+        });
+        true
     }
 
     pub fn terminal_faults(&mut self, faults: FakeTerminalFaults) {
@@ -2709,11 +2725,11 @@ impl CountBackend for FakeCountBackend {
         data.inventory = Some(inventory);
         data.last_command_seq = last_completed.map(|c| c.seq);
         data.resolved_open = resolved_open;
-        data.seal = SealBracket {
+        data.seal = self.modeled_seal.unwrap_or(SealBracket {
             before_ns: Some(1),
             after_ns: Some(2),
             result: StopResult::Stopped,
-        };
+        });
         data.writers = if finished {
             WriterCompletion::Finished(WriterWitness {
                 owner_epoch: self.ready.owner_epoch,

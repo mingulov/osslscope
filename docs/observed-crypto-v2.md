@@ -15,7 +15,7 @@ reject v2 documents and there is no dual live producer.
 
 ## Reader contract
 
-Producers emit exactly `observed-crypto-v2.1`. Readers accept
+Producers emit exactly `observed-crypto-v2.2`. Readers accept
 `observed-crypto-v2` and `observed-crypto-v2.<digits>` and reject
 every other major (`src/schema.rs` `check_version_v2`, pinned by
 `compat_matrix_v2` and `output_contract::schema_version_gate`).
@@ -29,6 +29,27 @@ the validator), but field-level readers ignore unknown keys and
 keep working. The version gate answers "is this major ours"
 (never misparse across majors); validation answers "does this
 document verify against this minor's schema".
+
+The optional v2.2 `window.count_admission` object records the actual
+completed count Open's `start_ns` and exclusive `deadline_ns`. These bounds
+are distinct from conservative effective coverage. For an earlier cut, a
+callback can read TARGET before sealing and sample its timestamp later;
+its real timestamp remains positive evidence within the original admission
+interval even when it is past `effective_end_ns`. Such a tail requires
+PARTIAL/FATAL status and a recorded coverage tail gap. Lower containment
+is unchanged: no row may precede the effective or requested start. The
+seal operation's return sample is not an upper bound on that callback.
+
+Owned requested time starts at the captured lower edge immediately before
+the successful release operation, before comm settling. The internal
+before/after bracket does not identify the exact kernel resume instant.
+External requested time retains its acquisition sample. Independently
+fulfilled owned exits and exact empty overlaps omit the optional object;
+without it every row retains strict effective-window containment. Strict
+pre-extension validators/readers reject the new object, while tolerant
+field readers can retain historical fields and ignore it. Neither the
+minor version nor these arithmetic checks prove startup, clock-domain,
+kernel-build or live count qualification; those remain unproven here.
 
 Validation has two layers, shared by the contract tests and the
 auditor v2 suite (`tests/auditor_report.rs`):
@@ -351,7 +372,7 @@ evidence refs stay explicit metadata, values verbatim from
 
 ```json
 {"metadata": {"properties": [
-  {"name": "osslscope:schema-version", "value": "observed-crypto-v2.1"},
+  {"name": "osslscope:schema-version", "value": "observed-crypto-v2.2"},
   {"name": "osslscope:execution-evidence-completeness", "value": "COMPLETE"},
   {"name": "osslscope:omitted-ambiguous-sites", "value": "1"},
   {"name": "osslscope:omitted-ambiguous-calls", "value": "100"},
@@ -380,7 +401,7 @@ Byte-verbatim `tests/goldens/report-v2-complete.txt` (golden
 shape, with recorded execution context):
 
 ```text
-osslscope report (observed-crypto-v2.1): pid=7 (demo) window=0..100ns effective=0..100ns
+osslscope report (observed-crypto-v2.2): pid=7 (demo) window=0..100ns effective=0..100ns
 duration: requested=100ns effective=100ns (monotonic; authoritative)
 kernel: 6.9.0-test
 wall: start=1700000000000000000 end=1700000030000000000 (unix-ns; context only)

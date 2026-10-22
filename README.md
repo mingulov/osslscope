@@ -21,10 +21,12 @@ installed
 ```
 
 > **Status: development (unreleased).** Current report/check output follows
-> the [v2.1 evidence contract](docs/observed-crypto-v2.md). The historical
+> the [v2.2 evidence contract](docs/observed-crypto-v2.md). The historical
 > tagged baseline is `v0.1.0`; 1.0.0 was an earlier unreleased label.
 > Current integrated live and package qualification remains open, and
-> packages built from this branch are development snapshots.
+> packages built from this branch are development snapshots. Version 2.2
+> separates count admission from conservative coverage; its source and host
+> checks do not establish live timing trust or first-call qualification.
 > Build and install locally per
 > [build](docs/build.md) and [install](docs/install.md).
 > Stack: Rust 1.88 + Aya 0.14 (raw multi-link primary).

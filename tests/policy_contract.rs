@@ -89,6 +89,7 @@ fn exact_window() -> CaptureWindow {
         effective_start_ns: 1_000,
         effective_end_ns: 2_000,
         signal_cut: false,
+        count_admission: None,
     }
 }
 
@@ -644,6 +645,7 @@ fn relevant_vs_unrelated_gaps() {
                     effective_start_ns: 1_500,
                     effective_end_ns: 2_000,
                     signal_cut: false,
+                    count_admission: None,
                 },
                 None,
             ),
@@ -659,6 +661,7 @@ fn relevant_vs_unrelated_gaps() {
                 Vec::new(),
                 CaptureWindow {
                     signal_cut: true,
+                    count_admission: None,
                     ..exact_window()
                 },
                 None,
@@ -1601,6 +1604,7 @@ fn failed_delivery_with(which: &str) -> DeliveryResult {
 fn interruption_outcomes() {
     let cut_window = CaptureWindow {
         signal_cut: true,
+        count_admission: None,
         ..exact_window()
     };
     // Definite violation on a cut window stays a violation (exit 10).
@@ -1741,6 +1745,7 @@ fn artifacts_carry_same_window() {
         effective_start_ns: 111_500,
         effective_end_ns: 222_000,
         signal_cut: false,
+        count_admission: None,
     };
     let mut d = doc(
         vec![site_at(

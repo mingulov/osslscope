@@ -20,7 +20,7 @@ use crate::scan::oracle::{Outcome, TrueT};
 use serde::{Deserialize, Serialize};
 
 /// Schema identity carried by every finalized capture document.
-pub const CAPTURE_SCHEMA_V2: &str = "observed-crypto-v2.1";
+pub const CAPTURE_SCHEMA_V2: &str = "observed-crypto-v2.2";
 
 /// Verified object fingerprint. A pathname may locate a file for display,
 /// but it never defines identity (R02).
@@ -383,12 +383,21 @@ pub enum GapReason {
 /// interval inside the requested window is a gap; starting the visible
 /// clock late cannot erase setup activity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CountAdmissionWindow {
+    pub start_ns: u64,
+    pub deadline_ns: u64,
+}
+
+/// Requested time and conservative coverage; admission is a distinct bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CaptureWindow {
     pub requested_start_ns: u64,
     pub requested_end_ns: u64,
     pub effective_start_ns: u64,
     pub effective_end_ns: u64,
     pub signal_cut: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count_admission: Option<CountAdmissionWindow>,
 }
 
 impl CaptureWindow {

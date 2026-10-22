@@ -392,6 +392,9 @@ pub struct StaleBucket {
 /// Finished capture window.
 #[derive(Debug, Clone)]
 pub struct Capture {
+    pub programmed_admission: Option<crate::count_owner::ProgrammedAdmission>,
+    pub release_attempt: Option<ReleaseAttempt>,
+    pub failure_context: Option<Arc<CaptureFailureContext>>,
     pub target_pid: u32,
     pub target_comm: String,
     pub window_planned: Duration,
@@ -463,6 +466,7 @@ pub fn empty_document() -> CaptureDocument {
             effective_start_ns: 0,
             effective_end_ns: 0,
             signal_cut: false,
+            count_admission: None,
         },
         sites: Vec::new(),
         fenced: Vec::new(),
@@ -1133,8 +1137,8 @@ pub struct LifecycleDelta {
     /// retaining accumulated events and loss; at
     /// close it is an uncovered tail and the controller records
     /// `lifecycle.drain_pending` loss. Always zero for polling
-    /// ports (their close drain is `None` — absence, not a
-    /// truncated drain).
+    /// ports (`delta: None` means polling, not a truncated drain; a
+    /// retained `Some(delta)` can still have `suffix_witness: false`).
     pub pending: u64,
 }
 
@@ -2701,9 +2705,408 @@ impl LifecyclePort for LiveLifecycle {
     }
 }
 
+/// The immutable lower edge sampled while the child is still stopped. This
+/// brackets the release operation; it is not the exact kernel resume instant.
+#[derive(Debug, Clone, Copy)]
+pub struct ReleaseStart {
+    pub monotonic_ns: u64,
+    pub wall: SystemTime,
+    pub instant: Instant,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseOutcome {
+    Succeeded,
+    Failed,
+    Unknown,
+}
+#[derive(Debug, Clone, Copy)]
+pub struct ReleaseAttempt {
+    pub before: ReleaseStart,
+    pub after_ns: Option<u64>,
+    pub outcome: ReleaseOutcome,
+}
+
+/// Proof is minted only at the controller's pre-read death/reap boundary.
+#[derive(Debug, Clone, Copy)]
+pub struct OwnedExitBeforeRead {
+    _private: (),
+}
+impl OwnedExitBeforeRead {
+    fn establish(owned: bool, reaped: bool) -> Option<Self> {
+        (owned && reaped).then_some(Self { _private: () })
+    }
+}
+#[derive(Debug, Clone, Copy)]
+pub enum AdmissionMode {
+    Ordinary,
+    Degraded,
+    OwnedFulfilled(OwnedExitBeforeRead),
+    SetupNoWindow,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionProjection {
+    RenderBound(evidence::CountAdmissionWindow),
+    StrictFulfilled,
+    EmptyOverlap,
+    NoObservation,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowBindingReason {
+    NoCompletedOpen,
+    OpenMismatch,
+    UnknownRelease,
+    PreRequestedRow,
+    InvalidEndpoint,
+    NoOverlapHasRows,
+    FulfilledTail,
+}
+/// Only bounded summaries accompany the shared canonical terminal. The row
+/// image remains in that terminal rather than being copied into this error.
+#[derive(Debug)]
+pub struct WindowBindingFailure {
+    pub reason: WindowBindingReason,
+    pub terminal: Option<Arc<crate::count_session::CountTerminal>>,
+    pub rejected: RejectedPrefix,
+}
+impl std::fmt::Display for WindowBindingFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "count window binding: {:?}", self.reason)
+    }
+}
+impl std::error::Error for WindowBindingFailure {}
+
+/// Checks output representability, never inventing an Open receipt. A caller
+/// must keep the acknowledged/resolved ProgrammedAdmission and canonical
+/// terminal when enriching a failure at the capture boundary.
+pub fn project_admission(
+    programmed: Option<&crate::count_owner::ProgrammedAdmission>,
+    release: Option<&ReleaseAttempt>,
+    window: &CaptureWindow,
+    retained: &CountDrain,
+    mode: AdmissionMode,
+) -> Result<AdmissionProjection, WindowBindingFailure> {
+    use WindowBindingReason as W;
+    let fail = |reason| WindowBindingFailure {
+        reason,
+        terminal: None,
+        rejected: RejectedPrefix::from_drain(retained),
+    };
+    let rows = || {
+        retained
+            .current
+            .iter()
+            .chain(retained.fenced.iter().flat_map(|g| &g.sites))
+    };
+    if release.is_some_and(|r| r.outcome != ReleaseOutcome::Succeeded) {
+        return Err(fail(W::UnknownRelease));
+    }
+    if matches!(mode, AdmissionMode::SetupNoWindow) {
+        if release.is_none()
+            && programmed.is_none()
+            && window.count_admission.is_none()
+            && window.effective_start_ns == window.requested_end_ns
+            && window.effective_end_ns == window.requested_end_ns
+            && !rows().any(|r| r.calls > 0)
+        {
+            return Ok(AdmissionProjection::NoObservation);
+        }
+        return Err(fail(W::OpenMismatch));
+    }
+    let p = programmed.ok_or_else(|| fail(W::NoCompletedOpen))?;
+    let bound = evidence::CountAdmissionWindow {
+        start_ns: p.start_ns(),
+        deadline_ns: p.deadline_ns(),
+    };
+    if window.count_admission.is_some_and(|a| a != bound)
+        || release.is_some_and(|r| r.before.monotonic_ns != window.requested_start_ns)
+        || window.requested_start_ns > window.requested_end_ns
+    {
+        return Err(fail(W::OpenMismatch));
+    }
+    if p.deadline_ns() <= window.requested_start_ns {
+        if !rows().any(|r| r.calls > 0) {
+            if release.is_some()
+                && window.count_admission.is_none()
+                && window.effective_start_ns == window.requested_start_ns
+                && window.effective_end_ns == window.requested_start_ns
+                && window.requested_start_ns < window.requested_end_ns
+            {
+                return Ok(AdmissionProjection::EmptyOverlap);
+            }
+            return Err(fail(W::InvalidEndpoint));
+        }
+        return Err(fail(W::NoOverlapHasRows));
+    }
+    if p.start_ns() >= p.deadline_ns()
+        || window.effective_start_ns != p.start_ns().max(window.requested_start_ns)
+        || window.effective_start_ns > window.effective_end_ns
+        || window.effective_end_ns > p.deadline_ns()
+        || window.effective_end_ns > window.requested_end_ns
+    {
+        return Err(fail(W::InvalidEndpoint));
+    }
+    for row in rows() {
+        if row.first_ns < window.effective_start_ns {
+            return Err(fail(W::PreRequestedRow));
+        }
+        if row.first_ns > row.last_ns || row.last_ns >= p.deadline_ns() {
+            return Err(fail(W::OpenMismatch));
+        }
+        if row.last_ns > window.effective_end_ns {
+            if matches!(mode, AdmissionMode::OwnedFulfilled(_)) {
+                return Err(fail(W::FulfilledTail));
+            }
+            if !matches!(mode, AdmissionMode::Degraded)
+                || window.effective_end_ns >= window.requested_end_ns
+            {
+                return Err(fail(W::InvalidEndpoint));
+            }
+        }
+    }
+    if matches!(mode, AdmissionMode::OwnedFulfilled(_)) {
+        if window.count_admission.is_some() {
+            return Err(fail(W::OpenMismatch));
+        }
+        return Ok(AdmissionProjection::StrictFulfilled);
+    }
+    if p.deadline_ns() > window.requested_end_ns {
+        return Err(fail(W::OpenMismatch));
+    }
+    Ok(AdmissionProjection::RenderBound(bound))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoverageEndpoint {
+    pub end_ns: u64,
+    pub uncertain: bool,
+}
+pub fn count_effective_end(
+    reason: crate::count_session::CloseReason,
+    original_deadline_ns: u64,
+    seal: crate::count_owner::SealBracket,
+    last_established_ns: u64,
+) -> CoverageEndpoint {
+    if reason == crate::count_session::CloseReason::Expired {
+        return CoverageEndpoint {
+            end_ns: original_deadline_ns,
+            uncertain: false,
+        };
+    }
+    match seal {
+        crate::count_owner::SealBracket {
+            before_ns: Some(before),
+            after_ns: Some(after),
+            result: crate::count_owner::StopResult::Stopped,
+        } if before <= after && before >= last_established_ns => CoverageEndpoint {
+            end_ns: before.min(original_deadline_ns),
+            uncertain: false,
+        },
+        _ => CoverageEndpoint {
+            end_ns: last_established_ns.min(original_deadline_ns),
+            uncertain: true,
+        },
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundaryStage {
+    Setup,
+    Discovery,
+    Traversal,
+    Fence,
+    Release,
+    Open,
+    WindowBinding,
+    Custody,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundaryFailureClass {
+    Io,
+    Timeout,
+    DeadlineOverflow,
+    InvalidInput,
+    Panic,
+    Disconnected,
+    Infrastructure,
+}
+#[derive(Debug, Clone)]
+pub struct BoundaryFailure {
+    pub stage: BoundaryStage,
+    pub class: BoundaryFailureClass,
+    pub errno: Option<i32>,
+    pub detail: String,
+}
+impl BoundaryFailure {
+    fn new(
+        stage: BoundaryStage,
+        class: BoundaryFailureClass,
+        errno: Option<i32>,
+        detail: &str,
+    ) -> Self {
+        Self {
+            stage,
+            class,
+            errno,
+            detail: crate::report::bound_line(detail)
+                .chars()
+                .take(200)
+                .collect(),
+        }
+    }
+    fn from_error(stage: BoundaryStage, error: &anyhow::Error) -> Self {
+        if let Some(boundary) = error.downcast_ref::<Self>() {
+            return boundary.clone();
+        }
+        if let Some(owner) = error
+            .chain()
+            .find_map(|e| e.downcast_ref::<crate::count_owner::OwnerFailure>())
+        {
+            use crate::count_owner::FailureClass as C;
+            let class = match owner.class {
+                C::Io => BoundaryFailureClass::Io,
+                C::Deadline => BoundaryFailureClass::Timeout,
+                C::DeadlineOverflow => BoundaryFailureClass::DeadlineOverflow,
+                C::InvalidInput => BoundaryFailureClass::InvalidInput,
+                C::Panic => BoundaryFailureClass::Panic,
+                C::Disconnected => BoundaryFailureClass::Disconnected,
+                _ => BoundaryFailureClass::Infrastructure,
+            };
+            return Self::new(stage, class, owner.errno, &format!("{error:#}"));
+        }
+        let io = error
+            .chain()
+            .find_map(|e| e.downcast_ref::<std::io::Error>());
+        let errno = io.and_then(|e| e.raw_os_error());
+        Self::new(
+            stage,
+            if io.is_some() {
+                BoundaryFailureClass::Io
+            } else {
+                BoundaryFailureClass::Infrastructure
+            },
+            errno,
+            &format!("{error:#}"),
+        )
+    }
+}
+impl std::fmt::Display for BoundaryFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "capture boundary {:?}/{:?}", self.stage, self.class)
+    }
+}
+impl std::error::Error for BoundaryFailure {}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreObservationCause {
+    Cancelled,
+    NeverReleasedExit,
+    SetupError,
+    ReleaseError,
+    OpenUnresolved,
+    WindowBinding,
+}
+#[derive(Debug, Clone)]
+pub enum PreObservationCount {
+    NotPrepared,
+    PrepareFailed(crate::count_owner::CountPrepareFailure),
+    Terminal(Arc<crate::count_session::CountTerminal>),
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CustodyResolution {
+    NotAcquired,
+    NotOwned,
+    Resolved,
+    Unresolved,
+}
+#[derive(Debug, Clone)]
+pub struct CustodyReceipt {
+    pub disposition: Option<target::TargetDisposition>,
+    pub child_exit: Option<i32>,
+    pub resolution: CustodyResolution,
+    pub failure: Option<BoundaryFailure>,
+}
+#[derive(Debug)]
+pub struct PreObservationFailure {
+    pub cause: PreObservationCause,
+    pub failure: Option<BoundaryFailure>,
+    pub count: PreObservationCount,
+    pub release: Option<ReleaseAttempt>,
+    pub custody: CustodyReceipt,
+    pub target: TargetRecord,
+    pub context: Option<CaptureContext>,
+}
+impl PreObservationFailure {
+    fn new(failure: Self, valid_scope: bool) -> Self {
+        assert!(
+            !valid_scope
+                && !failure
+                    .release
+                    .is_some_and(|r| r.outcome == ReleaseOutcome::Succeeded),
+            "valid requested scope requires runtime salvage"
+        );
+        failure
+    }
+}
+impl std::fmt::Display for PreObservationFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "pre-observation {:?}", self.cause)
+    }
+}
+impl std::error::Error for PreObservationFailure {}
+#[derive(Debug, Clone, Copy)]
+pub struct RejectedPrefix {
+    pub known_rows: Option<u64>,
+    pub known_calls: Option<u64>,
+    pub enumeration: crate::count_owner::EnumerationStatus,
+}
+impl RejectedPrefix {
+    fn from_drain(drain: &CountDrain) -> Self {
+        let mut known_rows = Some(0u64);
+        let mut known_calls = Some(0u64);
+        for row in drain
+            .current
+            .iter()
+            .chain(drain.fenced.iter().flat_map(|g| &g.sites))
+        {
+            known_rows = known_rows.and_then(|n| n.checked_add(1));
+            known_calls = known_calls.and_then(|n| n.checked_add(row.calls));
+        }
+        Self {
+            known_rows,
+            known_calls,
+            enumeration: crate::count_owner::EnumerationStatus::Unfinished,
+        }
+    }
+}
+#[derive(Debug)]
+pub struct CaptureFailureContext {
+    pub count: PreObservationCount,
+    pub failure: Option<BoundaryFailure>,
+    pub custody: CustodyReceipt,
+    pub rejected: RejectedPrefix,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeBoundaryKind {
+    SetupAfterOpen,
+    WindowBinding,
+    Infrastructure,
+}
+#[derive(Debug)]
+pub struct CaptureRuntimeFailure {
+    pub capture: Arc<Capture>,
+    pub terminal: Option<Arc<crate::count_session::CountTerminal>>,
+    pub kind: RuntimeBoundaryKind,
+}
+impl std::fmt::Display for CaptureRuntimeFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "capture runtime {:?}", self.kind)
+    }
+}
+impl std::error::Error for CaptureRuntimeFailure {}
+
 /// Time: monotonic nanoseconds for the kernel window program plus
 /// the requested/effective boundaries, `Instant` for loop control.
 pub trait ClockPort {
+    fn checked_monotonic_ns(&self) -> Option<u64>;
     fn monotonic_ns(&self) -> u64;
     fn now(&self) -> Instant;
     fn wall_now(&self) -> SystemTime;
@@ -2713,7 +3116,24 @@ pub trait ClockPort {
 /// Live clock: `CLOCK_MONOTONIC` for the kernel-adjacent stamps.
 pub struct LiveClock;
 
+fn checked_monotonic_raw(status: i32, seconds: i64, nanos: i64) -> Option<u64> {
+    if status != 0 || !(0..1_000_000_000).contains(&nanos) {
+        return None;
+    }
+    u64::try_from(seconds)
+        .ok()?
+        .checked_mul(1_000_000_000)?
+        .checked_add(u64::try_from(nanos).ok()?)
+}
 impl ClockPort for LiveClock {
+    fn checked_monotonic_ns(&self) -> Option<u64> {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        let status = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+        checked_monotonic_raw(status, ts.tv_sec, ts.tv_nsec)
+    }
     fn monotonic_ns(&self) -> u64 {
         let mut ts = libc::timespec {
             tv_sec: 0,
@@ -4350,7 +4770,8 @@ struct Runner<'x, D, B: CountBackend, T, L, C: ClockPort, P: ProcPort> {
     /// `LifecycleDelta.prefix_unwitnessed` (at-least-one; Loss).
     lifecycle_prefix_unwitnessed: u64,
     /// Close drains with missing evidence (non-fallback port,
-    /// `close_drain` None): the observer never proved it covered
+    /// `suffix_witness: false`, possibly retaining `Some(delta)`):
+    /// the observer never proved it covered
     /// the tail.
     lifecycle_no_witness: u64,
     /// Close-drain bounded residual (records still queued when the
@@ -4439,6 +4860,11 @@ struct Runner<'x, D, B: CountBackend, T, L, C: ClockPort, P: ProcPort> {
     /// Once set, failures salvage into fatal-Runtime captures
     /// (exit 1) instead of returning Err.
     observation_started: bool,
+    release_attempt: Option<ReleaseAttempt>,
+    owned_exit_before_read: Option<OwnedExitBeforeRead>,
+    last_established_ns: u64,
+    failure_context: Option<Arc<CaptureFailureContext>>,
+    canonical_terminal: Option<Arc<crate::count_session::CountTerminal>>,
     /// Traversal accumulator (`Some` once an active port's
     /// baseline poll ran; deepened every round, merged with the
     /// finish tail at close; discarded on recycle/no-window).
@@ -5256,6 +5682,10 @@ where
     /// observation loop this keeps the setup shape (best-effort
     /// cleanup, cleanup failures chained onto the original error);
     /// once observing, it salvages into a fatal-Runtime capture.
+    fn fail_at(self, err: anyhow::Error, stage: BoundaryStage) -> anyhow::Result<Capture> {
+        let boundary = BoundaryFailure::from_error(stage, &err);
+        self.fail(err.context(boundary))
+    }
     fn fail(mut self, err: anyhow::Error) -> anyhow::Result<Capture> {
         // Outstanding exec obligation (F3): a consumed-but-unfenced
         // witness rides into salvage as a gap (the fatal verdict
@@ -5263,12 +5693,21 @@ where
         self.lifecycle_exec_gap = self
             .lifecycle_exec_gap
             .saturating_add(std::mem::replace(&mut self.pending_exec_obligation, 0));
-        if self.observation_started {
-            let effective_end_ns = self.clock.monotonic_ns().min(self.kernel_deadline_ns);
+        if self.must_salvage_requested_window() {
+            let effective_end_ns = self
+                .clock
+                .checked_monotonic_ns()
+                .filter(|ns| *ns >= self.last_established_ns)
+                .map(|ns| ns.min(self.kernel_deadline_ns))
+                .unwrap_or(self.last_established_ns.min(self.kernel_deadline_ns));
             // R12: the single close sample, alongside the monotonic
             // end stamp — reused by the document and the Capture.
             self.wall_end = self.clock.wall_now();
-            return Ok(self.salvage(
+            self.owned_exit_before_read = OwnedExitBeforeRead::establish(
+                self.info.owned,
+                self.child_exit.is_some() && !self.expired,
+            );
+            return self.salvage(
                 SalvageSeed {
                     drain: None,
                     snapshot: None,
@@ -5276,23 +5715,12 @@ where
                     effective_end_ns,
                 },
                 err,
-            ));
+            );
         }
-        let mut err = err;
-        if let Err(e) = self.count.close_and_drain(self.cfg.grace) {
-            err = err.context(format!("setup abandon also failed to close counts: {e:#}"));
-        }
-        if let Err(e) = self.discovery.finish() {
-            err = err.context(format!(
-                "setup abandon also failed to finish discovery: {e:#}"
-            ));
-        }
-        if let Err(e) = self.target.finish_observation() {
-            err = err.context(format!(
-                "setup abandon also failed to finish observation: {e:#}"
-            ));
-        }
-        Err(err)
+        Err(self.pre_observation_failure(
+            PreObservationCause::SetupError,
+            Some(BoundaryFailure::from_error(BoundaryStage::Setup, &err)),
+        ))
     }
 
     /// Post-observation salvage (H7/B-6): every remaining close is
@@ -5300,12 +5728,13 @@ where
     /// counter, and the doc assembles from collected state with a
     /// fatal-Runtime verdict. Never fails; never retries a close the
     /// caller already attempted (a `Some` seed piece is used as-is).
-    fn salvage(mut self, seed: SalvageSeed, err: anyhow::Error) -> Capture {
+    fn salvage(mut self, seed: SalvageSeed, err: anyhow::Error) -> anyhow::Result<Capture> {
         self.reason("close-failure");
         // Traversal best-effort tail (drained-so-far survives:
         // proved facts — H7; the finish error rides inside, never
         // fails salvage).
         self.absorb_traversal_tail();
+        let boundary_failure = BoundaryFailure::from_error(BoundaryStage::Setup, &err);
         let mut failures = vec![format!("{err:#}")];
         let drain_failed: bool;
         let drain = match seed.drain {
@@ -5391,12 +5820,37 @@ where
             fenced: Vec::new(),
             counters: Vec::new(),
         });
+        let effective_end_ns = self.coverage_endpoint().end_ns;
+        let canonical = self.retained_terminal();
+        self.failure_context = Some(Arc::new(CaptureFailureContext {
+            count: canonical
+                .map(PreObservationCount::Terminal)
+                .unwrap_or(PreObservationCount::NotPrepared),
+            failure: Some(boundary_failure),
+            custody: CustodyReceipt {
+                disposition,
+                child_exit: self.child_exit,
+                resolution: if !self.info.owned {
+                    CustodyResolution::NotOwned
+                } else if disposition.is_some() {
+                    CustodyResolution::Resolved
+                } else {
+                    CustodyResolution::Unresolved
+                },
+                failure: None,
+            },
+            rejected: RejectedPrefix {
+                known_rows: Some(0),
+                known_calls: Some(0),
+                enumeration: crate::count_owner::EnumerationStatus::Unfinished,
+            },
+        }));
         let fatal = evidence::FatalKind::Runtime(crate::report::bound_line(&failures.join("; ")));
         self.assemble(
             snapshot,
             drain,
             disposition,
-            seed.effective_end_ns,
+            effective_end_ns,
             Some(SalvageContext {
                 fatal,
                 taint_evidence: drain_failed,
@@ -5404,32 +5858,57 @@ where
         )
     }
 
-    /// Setup-phase result with no window opened (fast exit, setup
-    /// cut): the whole requested window is startup gap, the exit
-    /// status rides along, and nothing claims COMPLETE.
-    fn no_window_result(mut self) -> Capture {
-        // R12: the single close sample (no window was observed, but
-        // the pair still closes here) — reused below.
-        self.wall_end = self.clock.wall_now();
-        // No window opened: nothing retained, traversal included.
-        self.traversal = None;
+    /// An external acquisition can elapse before Open. Preserve that real
+    /// request and its full gap, without inventing count admission or release.
+    fn external_no_window_result(mut self) -> anyhow::Result<Capture> {
+        assert!(!self.info.owned && self.count.programmed_admission().is_none());
+        let terminal = Arc::new(self.count.terminal(crate::count_session::CloseRequest {
+            started_at: Instant::now(),
+            grace: self.cfg.grace,
+            reason: crate::count_session::CloseReason::SetupAbort,
+        }));
+        if terminal.retained_drain.total_calls() != 0 {
+            return Err(self.pre_observation_failure(
+                PreObservationCause::WindowBinding,
+                Some(BoundaryFailure::new(
+                    BoundaryStage::WindowBinding,
+                    BoundaryFailureClass::InvalidInput,
+                    None,
+                    "positive count prefix without completed Open",
+                )),
+            ));
+        }
         let requested_end = self
-            .requested_start_ns
-            .saturating_add(duration_ns(self.cfg.duration));
+            .info
+            .acquired_ns
+            .checked_add(duration_ns(self.cfg.duration))
+            .ok_or_else(|| anyhow::anyhow!("window deadline overflow"))?;
+        self.requested_start_ns = self.info.acquired_ns;
+        self.wall_start = self.info.acquired_wall;
+        self.wall_end = self.clock.wall_now();
+        let disposition = self.target.finish_observation()?;
         let window = CaptureWindow {
-            requested_start_ns: self.requested_start_ns,
+            requested_start_ns: self.info.acquired_ns,
             requested_end_ns: requested_end,
             effective_start_ns: requested_end,
             effective_end_ns: requested_end,
-            signal_cut: self.signal_cut,
+            signal_cut: false,
+            count_admission: None,
         };
+        project_admission(
+            None,
+            None,
+            &window,
+            &terminal.retained_drain,
+            AdmissionMode::SetupNoWindow,
+        )?;
         let mut document = evidence::finalize(FinalizeInput {
             window,
             sites: Vec::new(),
             fenced: Vec::new(),
             objects: Vec::new(),
             coverage: Vec::new(),
-            counters: Vec::new(),
+            counters: terminal.retained_drain.counters.clone(),
             fatal: None,
             target: doc_target(
                 self.info.pid,
@@ -5438,33 +5917,37 @@ where
                 &self.info.image_digest,
             ),
             openssl: OpensslVersion::unknown(),
-            disposition: self.child_exit.map(DispositionRecord::exited),
+            disposition: doc_disposition(false, Some(&disposition)),
             policy: None,
             legacy_partition: LegacyCallPartition::default(),
             engine_observations: Vec::new(),
             traversal: None,
         });
-        // R12: retain the one consistently captured pair (no window
-        // was observed, but the host context is still honest context).
         document.context = Some(doc_context(
             &self.info.kernel_release,
             self.wall_start,
             self.wall_end,
         ));
+        self.failure_context = Some(Arc::new(CaptureFailureContext {
+            rejected: RejectedPrefix::from_drain(&terminal.retained_drain),
+            count: PreObservationCount::Terminal(terminal),
+            failure: Some(BoundaryFailure::new(
+                BoundaryStage::Open,
+                BoundaryFailureClass::InvalidInput,
+                None,
+                "requested window elapsed before window Open",
+            )),
+            custody: CustodyReceipt {
+                disposition: Some(disposition),
+                child_exit: None,
+                resolution: CustodyResolution::NotOwned,
+                failure: None,
+            },
+        }));
         self.emit_gap_reasons(document.reasons());
-        if !self.trigger_observed {
-            self.reason("no-query");
-        }
-        if self.signal_cut {
-            self.reason("interrupted");
-        }
-        if !self.info.owned {
-            self.reason("pid-prewindow-blind");
-        }
-        let disposition = self
-            .child_exit
-            .map(|code| target::TargetDisposition::Exited { code });
-        self.finish_capture(
+        self.reason("no-query");
+        self.reason("pid-prewindow-blind");
+        Ok(self.finish_capture(
             document,
             FinishParts {
                 outcome: Outcome::Partial,
@@ -5473,10 +5956,10 @@ where
                 counters: Counters::default(),
                 legacy: serde_json::Value::Null,
                 harvest_doc: serde_json::json!({}),
-                disposition,
+                disposition: Some(disposition),
                 window_actual: Duration::ZERO,
             },
-        )
+        ))
     }
 
     /// Mid-window recycle: best-effort close, every observation
@@ -5528,6 +6011,7 @@ where
                 effective_start_ns: recycled_start,
                 effective_end_ns: now_ns.min(requested_end).max(recycled_start),
                 signal_cut: false,
+                count_admission: None,
             },
             sites: Vec::new(),
             fenced: Vec::new(),
@@ -5597,6 +6081,54 @@ fn effective_start_ns(window_start_ns: u64, requested_start_ns: u64) -> u64 {
 }
 
 /// Run one requested observation over already-attached sessions.
+fn pre_observation_error<B: CountBackend, T: TargetPort>(
+    count: &mut CountSession<B>,
+    target: &mut T,
+    info: &TargetInfo,
+    cfg: &Config,
+    cause: PreObservationCause,
+    failure: Option<BoundaryFailure>,
+    release: Option<ReleaseAttempt>,
+) -> anyhow::Error {
+    let terminal = Arc::new(count.terminal(crate::count_session::CloseRequest {
+        started_at: Instant::now(),
+        grace: cfg.grace,
+        reason: crate::count_session::CloseReason::SetupAbort,
+    }));
+    let resolved = target.resolve_setup_failure();
+    let child_exit = target.poll_exit().ok().flatten();
+    let disposition = child_exit.map(|code| target::TargetDisposition::Exited { code });
+    let custody = CustodyReceipt {
+        disposition,
+        child_exit,
+        resolution: if !info.owned {
+            CustodyResolution::NotOwned
+        } else if resolved.is_ok() {
+            CustodyResolution::Resolved
+        } else {
+            CustodyResolution::Unresolved
+        },
+        failure: resolved
+            .err()
+            .as_ref()
+            .map(|e| BoundaryFailure::from_error(BoundaryStage::Custody, e)),
+    };
+    PreObservationFailure::new(
+        PreObservationFailure {
+            cause,
+            failure,
+            count: PreObservationCount::Terminal(terminal),
+            release,
+            custody,
+            target: doc_target(info.pid, &info.comm, &info.container_id, &info.image_digest),
+            context: (!info.owned)
+                .then(|| doc_context(&info.kernel_release, info.acquired_wall, info.acquired_wall)),
+        },
+        !info.owned && count.programmed_admission().is_some(),
+    )
+    .into()
+}
+
 /// Setup (open → baseline poll → release), the poll loop, teardown
 /// (counting closes before the final discovery drain) and
 /// finalization (status after counters) all live here; `run` wires
@@ -5640,7 +6172,22 @@ where
     // (setup already consumed part of the requested window, so
     // open + duration would admit post-requested-end executions as
     // in-window).
-    let start_ns = clock.monotonic_ns();
+    let Some(start_ns) = clock.checked_monotonic_ns() else {
+        return Err(pre_observation_error(
+            &mut count,
+            &mut target,
+            info,
+            cfg,
+            PreObservationCause::OpenUnresolved,
+            Some(BoundaryFailure::new(
+                BoundaryStage::Open,
+                BoundaryFailureClass::Infrastructure,
+                None,
+                "required monotonic Open sample unavailable",
+            )),
+            None,
+        ));
+    };
     let duration = duration_ns(cfg.duration);
     let declared_start_ns = if info.owned {
         start_ns
@@ -5651,28 +6198,36 @@ where
         let _ = target.resolve_setup_failure();
         anyhow::bail!("window deadline overflow");
     };
-    if start_ns >= kernel_deadline_ns {
-        let _ = target.resolve_setup_failure();
-        if info.owned {
-            anyhow::bail!("empty count window");
-        }
-        // Setup outlasted the requested window (or acquisition is
-        // unstamped): nothing of the declared interval is countable.
-        // Fail closed — programming open + duration would launder
-        // post-window executions as in-window evidence.
-        anyhow::bail!("requested window elapsed before window open");
+    let setup_elapsed = start_ns >= kernel_deadline_ns;
+    if setup_elapsed && info.owned {
+        return Err(pre_observation_error(
+            &mut count,
+            &mut target,
+            info,
+            cfg,
+            PreObservationCause::OpenUnresolved,
+            Some(BoundaryFailure::new(
+                BoundaryStage::Open,
+                BoundaryFailureClass::InvalidInput,
+                None,
+                "empty count window",
+            )),
+            None,
+        ));
     }
-    if let Err(e) = count.open_window(
-        start_ns,
-        kernel_deadline_ns,
-        info.acquired_instant
-            .checked_add(cfg.harvest_timeout)
-            .unwrap_or(info.acquired_instant),
-    ) {
-        let _ = count.close_and_drain(cfg.grace);
-        let _ = target.resolve_setup_failure();
-        return Err(e.context("count open_window"));
-    }
+    let open_error = if !setup_elapsed {
+        count
+            .open_window(
+                start_ns,
+                kernel_deadline_ns,
+                info.acquired_instant
+                    .checked_add(cfg.harvest_timeout)
+                    .unwrap_or(info.acquired_instant),
+            )
+            .err()
+    } else {
+        None
+    };
     // R12: the wall pair is sampled once per edge and reused —
     // this open instant is tentative (release/acquisition re-stamps
     // the start; window close stamps the end).
@@ -5724,10 +6279,18 @@ where
         expired: false,
         fallback_partial: false,
         window_start_ns: start_ns,
-        requested_start_ns: start_ns,
+        requested_start_ns: if info.owned {
+            start_ns
+        } else {
+            info.acquired_ns
+        },
         kernel_deadline_ns,
         open_instant: clock.now(),
-        wall_start: wall_open,
+        wall_start: if info.owned {
+            wall_open
+        } else {
+            info.acquired_wall
+        },
         wall_end: wall_open,
         drain_wall_us: 0,
         file_cache: HashMap::new(),
@@ -5735,9 +6298,33 @@ where
         refusal_diagnostics: BTreeSet::new(),
         unverified_reads: 0,
         observation_started: false,
+        release_attempt: None,
+        owned_exit_before_read: None,
+        last_established_ns: start_ns,
+        failure_context: None,
+        canonical_terminal: None,
         traversal: None,
     };
     runner.fallback_partial = runner.lifecycle.fallback_partial();
+    if let Some(error) = open_error {
+        // A lost Open reply can resolve Completed in this same canonical
+        // terminal. Scope routing must inspect that actual resolved binding.
+        let _ = runner.count.terminal(crate::count_session::CloseRequest {
+            started_at: Instant::now(),
+            grace: cfg.grace,
+            reason: crate::count_session::CloseReason::SetupAbort,
+        });
+        if runner.must_salvage_requested_window() {
+            return runner.fail(error.context("count Open after completed binding"));
+        }
+        return Err(runner.pre_observation_failure(
+            PreObservationCause::OpenUnresolved,
+            Some(BoundaryFailure::from_error(BoundaryStage::Open, &error)),
+        ));
+    }
+    if setup_elapsed {
+        return runner.external_no_window_result();
+    }
     runner.setup_and_run()
 }
 
@@ -5750,6 +6337,70 @@ where
     C: ClockPort,
     P: ProcPort,
 {
+    fn must_salvage_requested_window(&self) -> bool {
+        self.release_attempt
+            .is_some_and(|r| r.outcome == ReleaseOutcome::Succeeded)
+            || (!self.info.owned && self.count.programmed_admission().is_some())
+    }
+    fn pre_observation_failure(
+        mut self,
+        cause: PreObservationCause,
+        failure: Option<BoundaryFailure>,
+    ) -> anyhow::Error {
+        assert!(!self.must_salvage_requested_window());
+        pre_observation_error(
+            &mut self.count,
+            &mut self.target,
+            self.info,
+            self.cfg,
+            cause,
+            failure,
+            self.release_attempt,
+        )
+    }
+    fn retained_terminal(&mut self) -> Option<Arc<crate::count_session::CountTerminal>> {
+        if self.canonical_terminal.is_none() {
+            self.canonical_terminal = self
+                .count
+                .terminal_id()
+                .map(|id| Arc::new(self.count.salvage_view(id)));
+        }
+        self.canonical_terminal.clone()
+    }
+    fn close_reason(&self) -> crate::count_session::CloseReason {
+        use crate::count_session::CloseReason as R;
+        if self.expired {
+            R::Expired
+        } else if self.signal_cut {
+            R::Interrupted
+        } else if self.owned_exit_before_read.is_some() {
+            R::OwnedExit
+        } else {
+            R::Failure
+        }
+    }
+    fn coverage_endpoint(&mut self) -> CoverageEndpoint {
+        let seal = self
+            .retained_terminal()
+            .map(|t| t.receipt.seal)
+            .unwrap_or_default();
+        let endpoint = count_effective_end(
+            self.close_reason(),
+            self.kernel_deadline_ns,
+            seal,
+            self.last_established_ns,
+        );
+        if endpoint.uncertain {
+            self.extra_counters.push(typed_counter(
+                "count.close_time_uncertain",
+                CounterKind::Loss,
+                CounterUnits::Events,
+                CounterSource::Drain,
+                1,
+            ));
+        }
+        endpoint
+    }
     fn setup_and_run(mut self) -> anyhow::Result<Capture> {
         let pid = self.info.pid;
         let owned = self.info.owned;
@@ -5764,9 +6415,7 @@ where
                 if !owned && self.target.verify().is_err() {
                     return Ok(self.recycled());
                 }
-                let _ = self.count.close_and_drain(self.cfg.grace);
-                let _ = self.target.resolve_setup_failure();
-                return Err(e.context("setup maps read"));
+                return self.fail_at(e.context("setup maps read"), BoundaryStage::Setup);
             }
         };
         for m in &live {
@@ -5804,16 +6453,12 @@ where
                         CountFence::CandidatesChanged,
                         setup_deadline.unwrap_or_else(|| self.clock.now()),
                     ) {
-                        let _ = self.count.close_and_drain(self.cfg.grace);
-                        let _ = self.target.resolve_setup_failure();
-                        return Err(e.context("setup fence"));
+                        return self.fail_at(e.context("setup fence"), BoundaryStage::Fence);
                     }
                 }
             }
             Err(e) => {
-                let _ = self.count.close_and_drain(self.cfg.grace);
-                let _ = self.target.resolve_setup_failure();
-                return Err(e.context("setup discovery poll"));
+                return self.fail_at(e.context("setup discovery poll"), BoundaryStage::Discovery);
             }
         }
         // Traversal baseline (active ports only): drain the setup
@@ -5822,63 +6467,91 @@ where
         // seed-then-discard discipline as the discovery baseline).
         if self.discovery.traversal_active() {
             if let Err(e) = self.discovery.poll_traversal(true) {
-                let _ = self.count.close_and_drain(self.cfg.grace);
-                let _ = self.target.resolve_setup_failure();
-                return Err(e.context("setup traversal poll"));
+                return self.fail_at(e.context("setup traversal poll"), BoundaryStage::Traversal);
             }
             self.traversal = Some(TraversalCapture::default());
         }
         if (self.cancelled)() {
             self.signal_cut = true;
-            let _ = self.count.close_and_drain(self.cfg.grace);
-            let _ = self.target.resolve_setup_failure();
-            // A never-released owned child was just terminated and
-            // reaped above: preserve its status (foreign targets
-            // answer None — no disposition for a target never owned).
-            if let Ok(Some(code)) = self.target.poll_exit() {
-                self.child_exit = Some(code);
+            if self.must_salvage_requested_window() {
+                return self.close_and_finalize();
             }
-            self.requested_start_ns = self.clock.monotonic_ns();
-            // R12: the wall start is the counterpart of the requested
-            // start — re-stamped together, never the pre-setup open.
-            self.wall_start = self.clock.wall_now();
-            return Ok(self.no_window_result());
+            return Err(self.pre_observation_failure(PreObservationCause::Cancelled, None));
         }
         if setup_deadline.is_some_and(|d| self.clock.now() >= d) {
-            let _ = self.count.close_and_drain(self.cfg.grace);
-            let _ = self.target.resolve_setup_failure();
-            anyhow::bail!("setup timeout");
+            return self.fail(anyhow::anyhow!("setup timeout"));
         }
-        // Release (owned): the requested window begins here.
+        // The lower edge belongs to the operation while the child is stopped.
         if owned {
-            if let Err(e) = self.target.release() {
-                // A child that died before release keeps its exit
-                // status (never-released custody resolves around the
-                // preserved code, never by killing).
-                if let Ok(Some(code)) = self.target.poll_exit() {
-                    self.child_exit = Some(code);
-                    let _ = self.count.close_and_drain(self.cfg.grace);
-                    let _ = self.target.resolve_setup_failure();
-                    self.requested_start_ns = self.clock.monotonic_ns();
-                    // R12: wall/requested starts re-stamp together.
-                    self.wall_start = self.clock.wall_now();
-                    return Ok(self.no_window_result());
-                }
-                let _ = self.count.close_and_drain(self.cfg.grace);
-                let _ = self.target.resolve_setup_failure();
-                return Err(e.context("release"));
+            let Some(monotonic_ns) = self.clock.checked_monotonic_ns() else {
+                return Err(self.pre_observation_failure(
+                    PreObservationCause::ReleaseError,
+                    Some(BoundaryFailure::new(
+                        BoundaryStage::Release,
+                        BoundaryFailureClass::Infrastructure,
+                        None,
+                        "required before-release monotonic sample unavailable",
+                    )),
+                ));
+            };
+            if monotonic_ns
+                .checked_add(duration_ns(self.cfg.duration))
+                .is_none()
+            {
+                return Err(self.pre_observation_failure(
+                    PreObservationCause::ReleaseError,
+                    Some(BoundaryFailure::new(
+                        BoundaryStage::Release,
+                        BoundaryFailureClass::DeadlineOverflow,
+                        None,
+                        "requested release deadline overflow",
+                    )),
+                ));
             }
-            // Release performed: the target can emit from here on —
-            // per-CPU first sightings gap their prefix from now.
+            let before = ReleaseStart {
+                monotonic_ns,
+                wall: self.clock.wall_now(),
+                instant: self.clock.now(),
+            };
+            let result = self.target.release();
+            let after_ns = self.clock.checked_monotonic_ns();
+            self.release_attempt = Some(ReleaseAttempt {
+                before,
+                after_ns,
+                outcome: if result.is_ok() {
+                    ReleaseOutcome::Succeeded
+                } else {
+                    ReleaseOutcome::Failed
+                },
+            });
+            if let Err(error) = result {
+                let cause = match self.target.poll_exit() {
+                    Ok(Some(code)) => {
+                        self.child_exit = Some(code);
+                        PreObservationCause::NeverReleasedExit
+                    }
+                    _ => PreObservationCause::ReleaseError,
+                };
+                return Err(self.pre_observation_failure(
+                    cause,
+                    Some(BoundaryFailure::from_error(BoundaryStage::Release, &error)),
+                ));
+            }
+            self.requested_start_ns = before.monotonic_ns;
+            self.wall_start = before.wall;
+            self.open_instant = before.instant;
+            self.last_established_ns = before.monotonic_ns;
+            if after_ns.is_none_or(|after| after < before.monotonic_ns) {
+                self.extra_counters.push(typed_counter(
+                    "count.close_time_uncertain",
+                    CounterKind::Loss,
+                    CounterUnits::Events,
+                    CounterSource::Drain,
+                    1,
+                ));
+            }
             self.lifecycle.mark_released();
-            // Post-release comm settle: acquisition read comm while
-            // the child was stopped pre-exec (the observer's inherited
-            // comm); refresh now, and again before every reap until
-            // it differs (a slow exec settles late).
             self.settle_comm();
-            self.requested_start_ns = self.clock.monotonic_ns();
-            self.wall_start = self.clock.wall_now();
-            self.open_instant = self.clock.now();
         } else {
             self.requested_start_ns = self.info.acquired_ns;
             self.wall_start = self.info.acquired_wall;
@@ -6044,7 +6717,12 @@ where
         // programmed kernel deadline — drain time is not coverage,
         // and the loop can overshoot the clamped deadline by up to
         // one round.
-        let effective_end_ns = self.clock.monotonic_ns().min(self.kernel_deadline_ns);
+        let effective_end_ns = self
+            .clock
+            .checked_monotonic_ns()
+            .filter(|ns| *ns >= self.last_established_ns)
+            .map(|ns| ns.min(self.kernel_deadline_ns))
+            .unwrap_or(self.last_established_ns.min(self.kernel_deadline_ns));
         // R12: the single close sample, alongside the monotonic end
         // stamp (drain time is not coverage) — every consumer below
         // reuses this pair, never re-samples.
@@ -6057,12 +6735,17 @@ where
         // below, salvage assembles from this pre-state (no polls run
         // between here and finish, so it stays valid; a failed
         // finish takes the live session).
+        let original_lifecycle_edge = self.lifecycle_edge(effective_end_ns);
+        self.owned_exit_before_read = OwnedExitBeforeRead::establish(
+            self.info.owned,
+            self.child_exit.is_some() && !self.expired,
+        );
         let pre_finish = self.discovery.snapshot();
         let drain = match self.count.close_for_capture(self.cfg.grace) {
             Ok(retained) if retained.runtime_failure().is_none() => retained.into_drain(),
             Ok(retained) => {
                 let failure = retained.runtime_failure().expect("runtime failure branch");
-                return Ok(self.salvage(
+                return self.salvage(
                     SalvageSeed {
                         drain: Some(retained.into_drain()),
                         snapshot: None,
@@ -6070,10 +6753,10 @@ where
                         effective_end_ns,
                     },
                     failure.into(),
-                ));
+                );
             }
             Err(e) => {
-                return Ok(self.salvage(
+                return self.salvage(
                     SalvageSeed {
                         drain: None,
                         snapshot: None,
@@ -6081,7 +6764,7 @@ where
                         effective_end_ns,
                     },
                     e.into(),
-                ));
+                );
             }
         };
         self.drain_wall_us = self
@@ -6090,7 +6773,8 @@ where
             .checked_duration_since(drain_t0)
             .map(|d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX))
             .unwrap_or(0);
-        self.close_lifecycle(self.lifecycle_edge(effective_end_ns));
+        let effective_end_ns = self.coverage_endpoint().end_ns;
+        self.close_lifecycle(original_lifecycle_edge);
         // An owned child that already exited was reaped mid-window,
         // so its /proc entry is gone and the discovery close misreads
         // that as a pid recycle. Snapshot first: on a spurious
@@ -6135,7 +6819,7 @@ where
                         r.final_snapshot.clone().unwrap_or(pre)
                     }
                     _ => {
-                        return Ok(self.salvage(
+                        return self.salvage(
                             SalvageSeed {
                                 drain: Some(drain),
                                 snapshot: Some(pre_finish),
@@ -6143,7 +6827,7 @@ where
                                 effective_end_ns,
                             },
                             e.context("discovery finish"),
-                        ));
+                        );
                     }
                 }
             }
@@ -6151,7 +6835,7 @@ where
         let disposition = match self.target.finish_observation() {
             Ok(disposition) => disposition,
             Err(e) => {
-                return Ok(self.salvage(
+                return self.salvage(
                     SalvageSeed {
                         drain: Some(drain),
                         snapshot: Some(snapshot),
@@ -6159,7 +6843,7 @@ where
                         effective_end_ns,
                     },
                     e.context("finish_observation"),
-                ));
+                );
             }
         };
         if let target::TargetDisposition::Exited { code } = disposition {
@@ -6170,7 +6854,7 @@ where
         // join; salvage-seed paths absorb inside salvage instead,
         // so every close absorbs exactly once).
         self.absorb_traversal_tail();
-        Ok(self.assemble(snapshot, drain, Some(disposition), effective_end_ns, None))
+        self.assemble(snapshot, drain, Some(disposition), effective_end_ns, None)
     }
 
     /// Sites of one op with live probes (coverage attach census).
@@ -6202,7 +6886,7 @@ where
         disposition: Option<target::TargetDisposition>,
         effective_end_ns: u64,
         salvage: Option<SalvageContext>,
-    ) -> Capture {
+    ) -> anyhow::Result<Capture> {
         if self.cold_gap_queries > 0 {
             self.extra_counters.push(typed_counter(
                 "discovery.pre_window_queries",
@@ -6803,38 +7487,137 @@ where
             });
         }
 
-        let mut requested_end = self
+        let original_requested_end = self
             .requested_start_ns
-            .saturating_add(duration_ns(self.cfg.duration));
-        if self.child_exit.is_some() {
-            // Fulfilled by exit: the dead target cannot execute past
-            // its death, so no tail gap accrues past the close.
-            requested_end = requested_end
-                .min(effective_end_ns)
-                .max(self.requested_start_ns);
+            .checked_add(duration_ns(self.cfg.duration))
+            .ok_or_else(|| anyhow::anyhow!("requested window deadline overflow"))?;
+        let programmed = self.count.programmed_admission().copied();
+        let effective_start = programmed
+            .map(|p| p.start_ns())
+            .unwrap_or(self.window_start_ns)
+            .max(self.requested_start_ns);
+        let empty_overlap = programmed.is_some_and(|p| p.deadline_ns() <= self.requested_start_ns);
+        let effective_end_ns = if empty_overlap {
+            self.requested_start_ns
+        } else {
+            effective_end_ns.max(effective_start)
+        };
+        let mut window = CaptureWindow {
+            requested_start_ns: self.requested_start_ns,
+            requested_end_ns: original_requested_end,
+            effective_start_ns: effective_start,
+            effective_end_ns,
+            signal_cut: self.signal_cut,
+            count_admission: None,
+        };
+        let mut mode =
+            if self.signal_cut || salvage.is_some() || effective_end_ns < original_requested_end {
+                AdmissionMode::Degraded
+            } else {
+                AdmissionMode::Ordinary
+            };
+        if !empty_overlap && let Some(proof) = self.owned_exit_before_read {
+            window.requested_end_ns = effective_end_ns;
+            mode = AdmissionMode::OwnedFulfilled(proof);
         }
-        // R21-F4 (round 2, residual E): setup can outlast the
-        // requested window (accepted tiny --duration) — the kernel
-        // deadline then predates the requested start, and the
-        // capped effective end would invert the window (the
-        // semantic validator rejects inversion). Collapse honestly
-        // to the empty window at the effective start (the deadline
-        // passed during setup, so the whole requested window is
-        // tail gap; the loop also records over-budget, so COMPLETE
-        // is unreachable here). Never widens: the clamp only fires
-        // when the capped end predates the start.
-        let effective_start = effective_start_ns(self.window_start_ns, self.requested_start_ns);
-        let effective_end_ns = effective_end_ns.max(effective_start);
+        let mut projection = project_admission(
+            programmed.as_ref(),
+            self.release_attempt.as_ref(),
+            &window,
+            &drain,
+            mode,
+        );
+        if matches!(&projection, Err(failure) if failure.reason == WindowBindingReason::FulfilledTail)
+        {
+            // A retained tail cannot be hidden by fulfillment. Keep the original
+            // duration and actual Open instead of inventing a shorter interval.
+            window.requested_end_ns = original_requested_end;
+            projection = project_admission(
+                programmed.as_ref(),
+                self.release_attempt.as_ref(),
+                &window,
+                &drain,
+                AdmissionMode::Degraded,
+            );
+        }
+        let mut binding_failure = None;
+        match projection {
+            Ok(AdmissionProjection::RenderBound(bound)) => window.count_admission = Some(bound),
+            Ok(
+                AdmissionProjection::StrictFulfilled
+                | AdmissionProjection::EmptyOverlap
+                | AdmissionProjection::NoObservation,
+            ) => {}
+            Err(mut failure) => {
+                failure.terminal = self.retained_terminal();
+                // This is an explicit rejected-prefix error, never a filtered
+                // success. Representable facts still form Runtime salvage;
+                // every rejected original row remains in the canonical terminal.
+                let terminal = failure.terminal.clone();
+                self.failure_context = Some(Arc::new(CaptureFailureContext {
+                    count: terminal
+                        .map(PreObservationCount::Terminal)
+                        .unwrap_or(PreObservationCount::NotPrepared),
+                    failure: Some(BoundaryFailure::new(
+                        BoundaryStage::WindowBinding,
+                        BoundaryFailureClass::InvalidInput,
+                        None,
+                        &failure.to_string(),
+                    )),
+                    custody: CustodyReceipt {
+                        disposition,
+                        child_exit: self.child_exit,
+                        resolution: if !self.info.owned {
+                            CustodyResolution::NotOwned
+                        } else if disposition.is_some() {
+                            CustodyResolution::Resolved
+                        } else {
+                            CustodyResolution::Unresolved
+                        },
+                        failure: None,
+                    },
+                    rejected: failure.rejected,
+                }));
+                window.requested_end_ns = original_requested_end;
+                let render_bound = programmed.filter(|p| {
+                    p.start_ns() < p.deadline_ns()
+                        && p.deadline_ns() <= original_requested_end
+                        && p.deadline_ns() > effective_start
+                        && effective_end_ns <= p.deadline_ns()
+                });
+                window.count_admission = render_bound.map(|p| evidence::CountAdmissionWindow {
+                    start_ns: p.start_ns(),
+                    deadline_ns: p.deadline_ns(),
+                });
+                let representable = |row: &SiteExecution| {
+                    row.first_ns >= window.effective_start_ns
+                        && row.first_ns <= row.last_ns
+                        && match render_bound {
+                            Some(p) => row.last_ns < p.deadline_ns(),
+                            None => row.last_ns <= window.effective_end_ns,
+                        }
+                };
+                drain.current.retain(&representable);
+                for generation in &mut drain.fenced {
+                    generation.sites.retain(&representable);
+                }
+                binding_failure = Some(failure);
+            }
+        }
         // H7: a salvage fatal dominates the attach-zero
         // computation (the close failure is the verdict; zero
         // attaches stay visible in the coverage rows).
-        let fatal = salvage.as_ref().map(|s| s.fatal.clone()).or(
-            if self.attached_total == 0 && !self.adapter.emitted.is_empty() {
-                Some(evidence::FatalKind::AttachZero)
-            } else {
-                None
-            },
-        );
+        let fatal = binding_failure
+            .as_ref()
+            .map(|f| evidence::FatalKind::Runtime(f.to_string()))
+            .or_else(|| salvage.as_ref().map(|s| s.fatal.clone()))
+            .or(
+                if self.attached_total == 0 && !self.adapter.emitted.is_empty() {
+                    Some(evidence::FatalKind::AttachZero)
+                } else {
+                    None
+                },
+            );
         // H2 retrospective revision (A-6/B-3b): final evidence
         // taint (poll ∪ close) revises every claimed site —
         // current AND fenced — before the doc is built. Census
@@ -6961,13 +7744,7 @@ where
             legacy_files_for(self.cfg.resolved_provider.as_ref(), &self.adapter.objects);
         let call_partition = partition_calls(&drain.current, &drain.fenced, &legacy_files);
         let mut document = evidence::finalize(FinalizeInput {
-            window: CaptureWindow {
-                requested_start_ns: self.requested_start_ns,
-                requested_end_ns: requested_end,
-                effective_start_ns: effective_start,
-                effective_end_ns,
-                signal_cut: self.signal_cut,
-            },
+            window,
             sites: drain.current.clone(),
             fenced: drain.fenced.clone(),
             objects: self.adapter.objects.clone(),
@@ -7157,7 +7934,7 @@ where
             .clock
             .now()
             .saturating_duration_since(self.open_instant);
-        self.finish_capture(
+        let capture = self.finish_capture(
             document,
             FinishParts {
                 outcome,
@@ -7169,7 +7946,17 @@ where
                 disposition,
                 window_actual,
             },
-        )
+        );
+        if let Some(failure) = binding_failure {
+            let terminal = failure.terminal.clone();
+            return Err(anyhow::Error::new(CaptureRuntimeFailure {
+                capture: Arc::new(capture),
+                terminal,
+                kind: RuntimeBoundaryKind::WindowBinding,
+            })
+            .context(failure));
+        }
+        Ok(capture)
     }
 
     /// Cookie minted for a drained site (recorded at attach);
@@ -7244,6 +8031,9 @@ where
         let mut reasons: Vec<String> = self.reasons.into_iter().collect();
         reasons.sort();
         Capture {
+            programmed_admission: self.count.programmed_admission().copied(),
+            release_attempt: self.release_attempt,
+            failure_context: self.failure_context,
             target_pid: self.info.pid,
             target_comm: self.comm.clone(),
             window_planned: self.cfg.duration,
@@ -7350,6 +8140,7 @@ fn recycled_capture(
             effective_start_ns: requested_end,
             effective_end_ns: requested_end,
             signal_cut: false,
+            count_admission: None,
         },
         sites: Vec::new(),
         fenced: Vec::new(),
@@ -7376,6 +8167,9 @@ fn recycled_capture(
     // (the selection happened; only the window never opened).
     document.selected_objects = selected_objects.clone();
     Capture {
+        programmed_admission: None,
+        release_attempt: None,
+        failure_context: None,
         target_pid: info.pid,
         target_comm: info.comm.clone(),
         window_planned: cfg.duration,
@@ -8011,7 +8805,30 @@ fn run_inner(
     // Target-identity snapshot at acquisition (the target may be
     // dead by report time — /proc reads then would miss).
     let acq_clock = LiveClock;
-    let acq_ns = acq_clock.monotonic_ns();
+    let acq_ns = acq_clock.checked_monotonic_ns().ok_or_else(|| {
+        anyhow::Error::new(PreObservationFailure::new(
+            PreObservationFailure {
+                cause: PreObservationCause::SetupError,
+                failure: Some(BoundaryFailure::new(
+                    BoundaryStage::Setup,
+                    BoundaryFailureClass::Infrastructure,
+                    None,
+                    "required acquisition monotonic sample unavailable",
+                )),
+                count: PreObservationCount::NotPrepared,
+                release: None,
+                custody: CustodyReceipt {
+                    disposition: None,
+                    child_exit: None,
+                    resolution: CustodyResolution::NotAcquired,
+                    failure: None,
+                },
+                target: TargetRecord::unknown(),
+                context: None,
+            },
+            false,
+        ))
+    })?;
     let acq_instant = Instant::now();
     let acq_wall = SystemTime::now();
     // Offset table for target qualification (explicit file or
@@ -12162,6 +12979,9 @@ mod tests {
             wall: SystemTime,
         }
         impl ClockPort for TickClock {
+            fn checked_monotonic_ns(&self) -> Option<u64> {
+                Some(self.monotonic_ns())
+            }
             fn monotonic_ns(&self) -> u64 {
                 let v = self.ns.get();
                 self.ns.set(v.saturating_add(self.step));
@@ -12184,6 +13004,9 @@ mod tests {
         }
 
         impl ClockPort for ClockStub {
+            fn checked_monotonic_ns(&self) -> Option<u64> {
+                Some(self.monotonic_ns())
+            }
             fn monotonic_ns(&self) -> u64 {
                 self.ns.get()
             }
@@ -12283,12 +13106,26 @@ mod tests {
             cfg: &'x Config,
             info: &'x TargetInfo,
             discovery: D,
-            count: CountSession<FakeCountBackend>,
+            mut count: CountSession<FakeCountBackend>,
             clock: &'x C,
             proc: &'x mut ProcStub,
             cancelled: &'x dyn Fn() -> bool,
         ) -> Runner<'x, D, FakeCountBackend, TargetStub, LifecycleStub, C, ProcStub> {
             let wall = clock.wall_now();
+            if count.programmed_admission().is_none() {
+                count
+                    .open_window(
+                        5_000_000_000,
+                        5_000_000_000 + duration_ns(cfg.duration),
+                        Instant::now() + Duration::from_secs(5),
+                    )
+                    .expect("fixture completed Open");
+            }
+            let programmed = *count.programmed_admission().unwrap();
+            let stop = clock.checked_monotonic_ns();
+            count.backend_mut().set_modeled_seal(stop, stop);
+            let requested_start = info.acquired_ns;
+
             Runner {
                 cfg,
                 info,
@@ -12335,9 +13172,9 @@ mod tests {
                 signal_cut: false,
                 expired: false,
                 fallback_partial: false,
-                window_start_ns: 5_000_000_000,
-                requested_start_ns: 5_000_000_000,
-                kernel_deadline_ns: 7_000_000_000,
+                window_start_ns: programmed.start_ns(),
+                requested_start_ns: requested_start,
+                kernel_deadline_ns: programmed.deadline_ns(),
                 open_instant: clock.now(),
                 wall_start: wall,
                 wall_end: wall,
@@ -12347,6 +13184,11 @@ mod tests {
                 refusal_diagnostics: BTreeSet::new(),
                 unverified_reads: 0,
                 observation_started: false,
+                release_attempt: None,
+                owned_exit_before_read: None,
+                last_established_ns: programmed.start_ns().max(requested_start),
+                failure_context: None,
+                canonical_terminal: None,
                 traversal: None,
             }
         }
@@ -13040,7 +13882,8 @@ mod tests {
             // succeeded — the observed sites must survive in a
             // salvaged capture, not vanish into an Err.
             let cfg = stub_config();
-            let info = stub_info();
+            let mut info = stub_info();
+            info.acquired_ns = 1000;
             let clock = ClockStub::at(1_500);
             let mut proc = ProcStub;
             let cancelled = || false;
@@ -13092,7 +13935,8 @@ mod tests {
             // The canonical terminal retains the seven calls and immutable
             // candidate meaning; typed count loss prevents absence proof.
             let cfg = stub_config();
-            let info = stub_info();
+            let mut info = stub_info();
+            info.acquired_ns = 1000;
             let clock = ClockStub::at(1_500);
             let mut proc = ProcStub;
             let cancelled = || false;
@@ -13137,7 +13981,8 @@ mod tests {
             // The canonical terminal retains the seven calls and immutable
             // candidate meaning; typed count loss prevents absence proof.
             let cfg = stub_config();
-            let info = stub_info();
+            let mut info = stub_info();
+            info.acquired_ns = 1000;
             let clock = ClockStub::at(1_500);
             let mut proc = ProcStub;
             let cancelled = || false;
@@ -13183,7 +14028,8 @@ mod tests {
             // setup shape — Err out of setup_and_run, exit 4 at the
             // CLI — even after H7.
             let cfg = stub_config();
-            let info = stub_info();
+            let mut info = stub_info();
+            info.owned = true;
             let clock = ClockStub::at(5_000_000_000);
             let mut proc = ProcStub;
             let cancelled = || false;
@@ -13206,7 +14052,13 @@ mod tests {
                 .setup_and_run()
                 .expect_err("setup poll must stay Err");
             assert!(
-                format!("{err:#}").contains("setup discovery poll"),
+                err.downcast_ref::<PreObservationFailure>()
+                    .unwrap()
+                    .failure
+                    .as_ref()
+                    .unwrap()
+                    .detail
+                    .contains("setup discovery poll"),
                 "unexpected: {err:#}"
             );
         }
@@ -13256,7 +14108,8 @@ mod tests {
             // with a clean close claims Applicable — the baseline
             // the taint test below inverts.
             let cfg = stub_config();
-            let info = stub_info();
+            let mut info = stub_info();
+            info.acquired_ns = 1000;
             let clock = ClockStub::at(1_500);
             let mut proc = ProcStub;
             let cancelled = || false;
@@ -13289,7 +14142,8 @@ mod tests {
             // The canonical terminal retains the seven calls and immutable
             // candidate meaning; typed count loss prevents absence proof.
             let cfg = stub_config();
-            let info = stub_info();
+            let mut info = stub_info();
+            info.acquired_ns = 1000;
             let clock = ClockStub::at(1_500);
             let mut proc = ProcStub;
             let cancelled = || false;
@@ -13333,7 +14187,8 @@ mod tests {
             // setup shape — Err with cleanup failures chained, never
             // a salvaged doc.
             let cfg = stub_config();
-            let info = stub_info();
+            let mut info = stub_info();
+            info.owned = true;
             let clock = ClockStub::at(1_500);
             let mut proc = ProcStub;
             let cancelled = || false;
@@ -13356,7 +14211,13 @@ mod tests {
                 .fail(anyhow::anyhow!("poll_exit: boom"))
                 .expect_err("pre-observation fail must stay Err");
             assert!(
-                format!("{err:#}").contains("poll_exit: boom"),
+                err.downcast_ref::<PreObservationFailure>()
+                    .unwrap()
+                    .failure
+                    .as_ref()
+                    .unwrap()
+                    .detail
+                    .contains("poll_exit: boom"),
                 "unexpected: {err:#}"
             );
         }
@@ -13500,7 +14361,8 @@ mod tests {
                 object: "fp-A".to_string(),
                 class: "legacy".to_string(),
             });
-            let info = stub_info();
+            let mut info = stub_info();
+            info.acquired_ns = 1000;
             let clock = ClockStub::at(1_500);
             let mut proc = ProcStub;
             let cancelled = || false;
@@ -13559,7 +14421,8 @@ mod tests {
                 object: "fp-A".to_string(),
                 class: "default".to_string(),
             });
-            let info = stub_info();
+            let mut info = stub_info();
+            info.acquired_ns = 1000;
             let clock = ClockStub::at(1_500);
             let mut proc = ProcStub;
             let cancelled = || false;
@@ -13634,6 +14497,7 @@ mod tests {
             runner.window_start_ns = 1000;
             runner.requested_start_ns = 1000;
             runner.kernel_deadline_ns = 2000;
+            runner.last_established_ns = 1000;
         }
 
         /// Complete the stubbed discovery with the object records a
@@ -13664,7 +14528,8 @@ mod tests {
             // 10), seven calls survive, and the CBOM carries the
             // asset with an accurate disclaimer.
             let cfg = stub_config();
-            let info = stub_info();
+            let mut info = stub_info();
+            info.acquired_ns = 1000;
             let clock = ClockStub::at(1_500);
             let mut proc = ProcStub;
             let cancelled = || false;
@@ -13807,7 +14672,8 @@ mod tests {
             // inconclusive, the CBOM omits the site with accounting,
             // and the nonviolating Runtime exits 1.
             let cfg = stub_config();
-            let info = stub_info();
+            let mut info = stub_info();
+            info.acquired_ns = 1000;
             let clock = ClockStub::at(1_500);
             let mut proc = ProcStub;
             let cancelled = || false;
@@ -13932,7 +14798,8 @@ mod tests {
             // The canonical terminal retains the seven calls and immutable
             // candidate meaning; typed count loss prevents absence proof.
             let cfg = stub_config();
-            let info = stub_info();
+            let mut info = stub_info();
+            info.acquired_ns = 1000;
             let clock = ClockStub::at(1_500);
             let mut proc = ProcStub;
             let cancelled = || false;
@@ -14067,6 +14934,9 @@ mod tests {
         }
 
         impl ClockPort for WallScriptClock {
+            fn checked_monotonic_ns(&self) -> Option<u64> {
+                Some(self.monotonic_ns())
+            }
             fn monotonic_ns(&self) -> u64 {
                 self.ns.get()
             }
@@ -14190,5 +15060,196 @@ mod tests {
             );
             assert_eq!(cap.document.window.requested_start_ns, 5_000_000_000);
         }
+    }
+}
+
+#[cfg(test)]
+mod g1_count_window_tests {
+    use super::*;
+    use crate::count_owner::{SealBracket, StopResult};
+    use crate::count_session::{CloseReason, FakeCountBackend};
+
+    #[test]
+    fn g1_checked_original_clock_read_discriminates_invalid_samples() {
+        for (status, sec, nsec, want) in [
+            (0, 0, 0, Some(0)),
+            (-1, 0, 0, None),
+            (-1, 1, 2, None),
+            (0, 1, 2, Some(1_000_000_002)),
+            (0, -1, 2, None),
+            (0, 1, -2, None),
+            (0, -1, -2, None),
+            (0, 1, 1_000_000_000, None),
+            (0, 18_446_744_073, 709_551_615, Some(u64::MAX)),
+            (0, 18_446_744_073, 709_551_616, None),
+            (0, 18_446_744_074, 0, None),
+        ] {
+            assert_eq!(
+                checked_monotonic_raw(status, sec, nsec),
+                want,
+                "{status}/{sec}/{nsec}"
+            );
+        }
+    }
+
+    #[test]
+    fn g1_coverage_uses_original_deadline_actual_seal_and_unknown_fallback() {
+        let bracket = |before, after| SealBracket {
+            before_ns: before,
+            after_ns: after,
+            result: StopResult::Stopped,
+        };
+        for (reason, seal, last, want, uncertain) in [
+            (
+                CloseReason::Expired,
+                bracket(Some(2300), Some(2400)),
+                1100,
+                2000,
+                false,
+            ),
+            (
+                CloseReason::Interrupted,
+                bracket(Some(1500), Some(1510)),
+                1100,
+                1500,
+                false,
+            ),
+            (
+                CloseReason::Failure,
+                bracket(Some(2100), Some(2200)),
+                1100,
+                2000,
+                false,
+            ),
+            (
+                CloseReason::Failure,
+                bracket(None, Some(1510)),
+                1300,
+                1300,
+                true,
+            ),
+            (
+                CloseReason::Failure,
+                bracket(Some(1510), Some(1500)),
+                1300,
+                1300,
+                true,
+            ),
+            // Regression: the fake's old hardcoded [1,2] cannot prove this epoch.
+            (
+                CloseReason::Failure,
+                bracket(Some(1), Some(2)),
+                1100,
+                1100,
+                true,
+            ),
+        ] {
+            assert_eq!(
+                count_effective_end(reason, 2000, seal, last),
+                CoverageEndpoint {
+                    end_ns: want,
+                    uncertain
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn g1_strict_fulfilled_uses_pre_read_proof_and_keeps_actual_open() {
+        let mut session = CountSession::new(7, FakeCountBackend::new());
+        session
+            .open_window(1000, 2000, Instant::now() + Duration::from_secs(1))
+            .unwrap();
+        let p = session.programmed_admission().unwrap();
+        assert!(OwnedExitBeforeRead::establish(true, false).is_none());
+        assert!(OwnedExitBeforeRead::establish(false, true).is_none());
+        let proof = OwnedExitBeforeRead::establish(true, true).unwrap();
+        let window = CaptureWindow {
+            requested_start_ns: 1100,
+            requested_end_ns: 1500,
+            effective_start_ns: 1100,
+            effective_end_ns: 1500,
+            signal_cut: false,
+            count_admission: None,
+        };
+        let mut drain = CountDrain {
+            current: Vec::new(),
+            fenced: Vec::new(),
+            counters: Vec::new(),
+        };
+        assert_eq!(
+            project_admission(
+                Some(p),
+                None,
+                &window,
+                &drain,
+                AdmissionMode::OwnedFulfilled(proof)
+            )
+            .unwrap(),
+            AdmissionProjection::StrictFulfilled
+        );
+        let site = SiteExecution {
+            site: SiteKey {
+                object: ObjectId("x".into()),
+                device: 1,
+                inode: 2,
+                offset: 3,
+            },
+            generation: 0,
+            candidates: Vec::new(),
+            candidates_coverage: CandidateCoverage::Unknown,
+            calls: 1,
+            first_ns: 1200,
+            last_ns: 1600,
+            installed_at: None,
+        };
+        drain.current.push(site);
+        assert_eq!(
+            project_admission(
+                Some(p),
+                None,
+                &window,
+                &drain,
+                AdmissionMode::OwnedFulfilled(proof)
+            )
+            .unwrap_err()
+            .reason,
+            WindowBindingReason::FulfilledTail
+        );
+        let mut original = window;
+        original.requested_end_ns = 2100;
+        assert!(matches!(
+            project_admission(Some(p), None, &original, &drain, AdmissionMode::Degraded).unwrap(),
+            AdmissionProjection::RenderBound(_)
+        ));
+        assert_eq!((p.start_ns(), p.deadline_ns()), (1000, 2000));
+    }
+
+    #[test]
+    fn g1_modeled_seal_is_explicit_and_sticky() {
+        let mut session = CountSession::new(7, FakeCountBackend::new());
+        session
+            .open_window(1000, 2000, Instant::now() + Duration::from_secs(1))
+            .unwrap();
+        assert!(
+            session
+                .backend_mut()
+                .set_modeled_seal(Some(1500), Some(1510))
+        );
+        let terminal = session.terminal(crate::count_session::CloseRequest {
+            started_at: Instant::now(),
+            grace: Duration::from_secs(1),
+            reason: CloseReason::Interrupted,
+        });
+        assert_eq!(terminal.receipt.seal.before_ns, Some(1500));
+        assert_eq!(terminal.receipt.seal.after_ns, Some(1510));
+        assert!(
+            !session
+                .backend_mut()
+                .set_modeled_seal(Some(1800), Some(1900))
+        );
+        let repeated = session.salvage_view(terminal.receipt.terminal_id);
+        assert_eq!(repeated.receipt.seal, terminal.receipt.seal);
+        assert!(std::ptr::eq(&*repeated.receipt, &*terminal.receipt));
     }
 }
