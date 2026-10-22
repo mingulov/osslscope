@@ -826,9 +826,9 @@ fn changed_object_fingerprint_versions_identity() {
     assert_eq!(drain.current[0].calls, 4);
 }
 
-/// Backend double that lands one straggler increment just after the
-/// first drain scan returns: the close quiesce loop must catch it on
-/// a follow-up pass instead of losing it.
+/// Model a straggler completion before the terminal writer witness. The
+/// single terminal read must retain it under its original site meaning;
+/// this fixture does not prove completion of a held kernel writer.
 struct StragglerBackend {
     inner: FakeCountBackend,
     straggler: Option<(u32, u32, CountValue)>,
@@ -898,7 +898,7 @@ fn close_model_routes_completion_before_witness() {
     let cookie = s.cookie_for(a.device, a.ino, off).unwrap();
     s.open_window(1000, 2000, test_deadline()).unwrap();
     s.backend_mut().inner.fire(PID, cookie, 1500, 7);
-    // Admitted pre-close, landing after the first scan.
+    // Model the admitted increment completing before the terminal witness.
     s.backend_mut().straggler = Some((
         cookie,
         0,
@@ -909,7 +909,11 @@ fn close_model_routes_completion_before_witness() {
         },
     ));
     let drain = s.close_and_drain(Duration::from_secs(5)).unwrap();
-    assert_eq!(drain.total_calls(), 12, "in-flight increment quiesced");
+    assert_eq!(
+        drain.total_calls(),
+        12,
+        "modeled pre-witness completion retained"
+    );
     assert!(!s.window_open());
     assert!(s.is_closed());
 }

@@ -144,6 +144,987 @@ fn g1_session_admission_refuses_forged_object_domain_and_frontier() {
     }
 }
 
+// These controls cross the real session/owner mailbox, sealed journal and map
+// workspace. Only the underlying syscalls are modeled by the pipe FD driver.
+#[derive(Clone, Copy)]
+enum RefusePublication {
+    Before,
+    After,
+}
+struct SessionOwnerPort {
+    engine: CountEngine,
+    wait_inventory: bool,
+    requests: Vec<TerminalRequest>,
+    terminal_calls: usize,
+    generation_refusal: Option<RefusePublication>,
+    open_refusal: Option<RefusePublication>,
+    refuse_published: Arc<AtomicBool>,
+    last_failure: Option<CommandFailure>,
+    replay: Option<RawCheckpoint>,
+    late_release: Option<Arc<Probe>>,
+    progress_cutoff: Option<Instant>,
+}
+impl SessionOwnerPort {
+    fn refuse(&self, mode: Option<RefusePublication>, deadline: Instant) {
+        match mode {
+            Some(RefusePublication::Before) => {
+                self.engine.shared.seal(deadline);
+            }
+            Some(RefusePublication::After) => {
+                self.refuse_published.store(true, Ordering::Release);
+            }
+            None => {}
+        }
+    }
+    fn observe<T>(&mut self, result: CommandResult<T>) -> CommandResult<T> {
+        if let Err(failure) = result.as_ref() {
+            self.last_failure = Some(*failure);
+        }
+        result
+    }
+}
+impl crate::count_session::CountBackend for SessionOwnerPort {
+    type Link = LinkToken;
+    fn ready(&self) -> &Ready {
+        &self.engine.ready
+    }
+    fn attach(&mut self, request: AttachRequest) -> CommandResult<AttachAck<LinkToken>> {
+        let result = self.engine.attach(request);
+        self.observe(result)
+    }
+    fn open_window(&mut self, request: OpenRequest) -> CommandResult<OpenReceipt> {
+        self.refuse(self.open_refusal, request.deadline);
+        let result = self.engine.open_window(request);
+        self.observe(result)
+    }
+    fn set_generation(&mut self, request: GenerationRequest) -> CommandResult<()> {
+        self.refuse(self.generation_refusal, request.deadline);
+        let result = self.engine.set_generation(request);
+        self.observe(result)
+    }
+    fn drain(&mut self, request: ReadRequest) -> CommandResult<Arc<RawSnapshot>> {
+        let result = self.engine.drain(request);
+        if result.is_err() && self.progress_cutoff.is_some() {
+            self.progress_cutoff = Some(request.deadline);
+        }
+        if result.is_err()
+            && let Some(gate) = &self.late_release
+        {
+            gate.release();
+            task3_inventory(&self.engine).unwrap();
+        }
+        self.observe(result)
+    }
+    fn terminal_request(
+        &mut self,
+        deadline: Instant,
+        frontier: ControllerFrontier,
+    ) -> TerminalRequest {
+        if self.wait_inventory {
+            task3_inventory(&self.engine).unwrap();
+        }
+        let request = self.engine.terminal_request(
+            deadline,
+            self.engine.ready.evidence_domain,
+            self.engine.ready.writer_object_identity,
+            frontier,
+        );
+        self.requests.push(request.clone());
+        request
+    }
+    fn terminal(&mut self, request: TerminalRequest) -> RawTerminal {
+        self.terminal_calls += 1;
+        self.engine.terminal(request)
+    }
+    fn progress(&self) -> Option<RawCheckpoint> {
+        let mut checkpoint = self.replay.clone().or_else(|| self.engine.progress())?;
+        if let Some(cutoff) = self.progress_cutoff {
+            checkpoint.published_at = cutoff;
+        }
+        Some(checkpoint)
+    }
+    fn fork_permit(&self, deadline: Instant) -> Result<CountForkPermit<'_>, ForkBlocked> {
+        self.engine.fork_permit(deadline)
+    }
+}
+fn session_owner_port(
+    probe: &Arc<MapProbe>,
+    writer: Option<Arc<StagedWriter>>,
+    mut faults: TerminalFaults,
+) -> SessionOwnerPort {
+    let refuse_published = Arc::new(AtomicBool::new(false));
+    let armed = Arc::clone(&refuse_published);
+    let owner = Arc::new(OnceLock::<std::sync::Weak<Shared>>::new());
+    let published_owner = Arc::clone(&owner);
+    faults.mailbox_observer = Some(Arc::new(move |event| {
+        if matches!(event, MailboxEvent::RequestPublished(_)) && armed.swap(false, Ordering::AcqRel)
+        {
+            // The real publication already installed its identity under the
+            // mailbox lock. Cancel before the first I/O, without waking the
+            // caller until the handler publishes its actual NotEntered reply.
+            published_owner
+                .get()
+                .unwrap()
+                .upgrade()
+                .unwrap()
+                .abandoned
+                .store(true, Ordering::Release);
+        }
+    }));
+    let (engine, _) = terminal_engine(probe, writer, faults);
+    owner.set(Arc::downgrade(&engine.shared)).unwrap();
+    SessionOwnerPort {
+        engine,
+        wait_inventory: false,
+        requests: Vec::new(),
+        terminal_calls: 0,
+        generation_refusal: None,
+        open_refusal: None,
+        refuse_published,
+        last_failure: None,
+        replay: None,
+        late_release: None,
+        progress_cutoff: None,
+    }
+}
+struct SessionPlan {
+    offsets: Vec<u64>,
+    mappings: Vec<crate::discovery::maps::Mapping>,
+    files: std::collections::HashMap<String, crate::plan::FileBytes>,
+}
+impl SessionPlan {
+    fn new(positions: usize) -> Self {
+        let bytes = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+        let elf = goblin::elf::Elf::parse(&bytes).unwrap();
+        let executable = elf
+            .program_headers
+            .iter()
+            .find(|p| {
+                p.p_type == goblin::elf::program_header::PT_LOAD
+                    && p.p_flags & goblin::elf::program_header::PF_X != 0
+            })
+            .unwrap();
+        let offsets = (0..positions)
+            .map(|n| executable.p_offset + 16 + 16 * n as u64)
+            .collect();
+        // The pipe driver independently reports backing (1,2), not a path
+        // alias. File bytes/mapping/expected pin use that exact model identity.
+        let path = "/model/provider.so".to_owned();
+        Self {
+            offsets,
+            mappings: vec![crate::discovery::maps::Mapping {
+                start: 0x7000_0000,
+                end: 0x8000_0000,
+                x: true,
+                offset: 0,
+                dev: crate::plan::render_device(1),
+                ino: 2,
+                path: path.clone(),
+            }],
+            files: std::collections::HashMap::from([(
+                path,
+                crate::plan::FileBytes {
+                    bytes: bytes.into(),
+                    dev: 1,
+                    ino: 2,
+                },
+            )]),
+        }
+    }
+    fn attach(
+        &self,
+        session: &mut crate::count_session::CountSession<SessionOwnerPort>,
+        meaning: u32,
+    ) {
+        use crate::count_session::{CountDelta, DiscoveredSite};
+        use crate::evidence::{CandidateCoverage, CandidateIdentity, ObjectId, SiteKey};
+        let delta = CountDelta {
+            discovered: self
+                .offsets
+                .iter()
+                .map(|offset| DiscoveredSite {
+                    site: SiteKey {
+                        object: ObjectId("original-object".into()),
+                        device: 1,
+                        inode: 2,
+                        offset: *offset,
+                    },
+                    candidates: vec![CandidateIdentity::new(
+                        ObjectId("provider-object".into()),
+                        "default".into(),
+                        1,
+                        meaning,
+                        vec!["digest".into()],
+                        false,
+                    )],
+                    candidates_coverage: CandidateCoverage::Complete,
+                })
+                .collect(),
+            losses: Vec::new(),
+        };
+        session
+            .attach_delta(
+                &delta,
+                &self.mappings,
+                &self.files,
+                900,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap();
+    }
+    fn cookie(
+        &self,
+        session: &crate::count_session::CountSession<SessionOwnerPort>,
+        position: usize,
+    ) -> u32 {
+        session.cookie_for(1, 2, self.offsets[position]).unwrap()
+    }
+}
+fn session_close() -> crate::count_session::CloseRequest {
+    crate::count_session::CloseRequest {
+        started_at: Instant::now(),
+        grace: Duration::from_secs(5),
+        reason: crate::count_session::CloseReason::Failure,
+    }
+}
+fn session_counter(drain: &crate::count_session::CountDrain, name: &str) -> Option<u64> {
+    drain
+        .counters
+        .iter()
+        .find(|c| c.name == name)
+        .map(|c| c.value)
+}
+fn no_inventory_failure(receipt: &RawTerminal) -> bool {
+    receipt
+        .failures
+        .operations
+        .iter()
+        .flatten()
+        .all(|f| f.class != FailureClass::Inventory)
+}
+#[test]
+fn g1_fix1_fault_first_after_journal_keeps_original_frontier() {
+    for deadline_only in [false, true] {
+        let probe = MapProbe::new();
+        let faults = TerminalFaults {
+            map: MapFaults {
+                write_error: (!deadline_only).then_some(1),
+                expire_after_call: deadline_only.then_some(1),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut session =
+            crate::count_session::CountSession::new(1, session_owner_port(&probe, None, faults));
+        let plan = SessionPlan::new(1);
+        plan.attach(&mut session, 7);
+        let links = locked(&session.backend().engine.shared.state)
+            .frontier
+            .acknowledged_links
+            .clone();
+        session.backend_mut().wait_inventory = true;
+        let cutoff = Instant::now() + Duration::from_secs(5);
+        assert!(session.open_window(1000, 2000, cutoff).is_err());
+        let expected = ControllerFrontier {
+            last_acked: Some(CommandSeq::checked(1).unwrap()),
+            acknowledged_links: links,
+            pending: Some(PendingCommandId {
+                seq: CommandSeq::checked(2).unwrap(),
+                operation: CountOperation::Open,
+            }),
+        };
+        let request = session.backend().requests[0].clone();
+        assert_eq!(request.frontier, expected);
+        assert_eq!(
+            task3_inventory(&session.backend().engine)
+                .unwrap()
+                .validate(&expected),
+            Ok(())
+        );
+        let seal = locked(&session.backend().engine.shared.state)
+            .terminal
+            .unwrap();
+        let contradiction = locked(&session.backend().engine.shared.state).terminal_contradiction;
+        let terminal = session.terminal(session_close());
+        let repeat = session.terminal(session_close());
+        task3_cleanup(&probe.owner, 10);
+        assert!(
+            !contradiction,
+            "matching original session frontier became contradictory after journal publication"
+        );
+        assert!(no_inventory_failure(&terminal.receipt));
+        assert_eq!(request.id, seal.ticket.terminal_id);
+        assert_eq!(request.deadline, cutoff);
+        assert_eq!(terminal.receipt.deadline, cutoff);
+        assert_eq!(terminal.retained_drain, repeat.retained_drain);
+        assert!(std::ptr::eq(&*terminal.receipt, &*repeat.receipt));
+        assert_eq!(session.backend().terminal_calls, 1);
+        if deadline_only {
+            assert!(
+                terminal.runtime_failure.is_none(),
+                "deadline-only refusal gained Runtime: {:?}, stop {:?}",
+                terminal.runtime_failure,
+                terminal.receipt.seal.result
+            );
+        } else {
+            assert_eq!(terminal.runtime_failure.unwrap().class, FailureClass::Io);
+        }
+    }
+}
+#[test]
+fn g1_fix1_fault_first_before_journal_has_no_runtime_invention() {
+    let probe = MapProbe::new();
+    let port = session_owner_port(
+        &probe,
+        None,
+        TerminalFaults {
+            map: MapFaults {
+                hold_call: Some(1),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    let mut session = crate::count_session::CountSession::new(1, port);
+    SessionPlan::new(1).attach(&mut session, 7);
+    let cutoff = Instant::now() + Duration::from_millis(200);
+    let call = std::thread::spawn(move || {
+        assert!(session.open_window(1000, 2000, cutoff).is_err());
+        session
+    });
+    probe.wait_calls(1);
+    let mut session = call.join().unwrap();
+    assert!(
+        locked(&session.backend().engine.shared.state)
+            .inventory
+            .is_none()
+    );
+    let terminal = session.terminal(session_close());
+    let pending = session.backend().requests[0].frontier.pending;
+    probe.owner.release();
+    task3_cleanup(&probe.owner, 10);
+    assert_eq!(
+        pending,
+        Some(PendingCommandId {
+            seq: CommandSeq::checked(2).unwrap(),
+            operation: CountOperation::Open
+        })
+    );
+    assert!(no_inventory_failure(&terminal.receipt));
+    assert!(terminal.runtime_failure.is_none());
+    assert_eq!(terminal.receipt.deadline, cutoff);
+    assert_eq!(
+        session
+            .salvage_view(terminal.receipt.terminal_id)
+            .retained_drain,
+        terminal.retained_drain
+    );
+}
+#[test]
+fn g1_fix1_not_entered_generation_preserves_publication_distinction() {
+    for mode in [RefusePublication::After, RefusePublication::Before] {
+        let probe = MapProbe::new();
+        let writer = StagedWriter::new(None);
+        writer.returned.store(true, Ordering::Release);
+        let mut session = crate::count_session::CountSession::new(
+            1,
+            session_owner_port(&probe, Some(Arc::clone(&writer)), TerminalFaults::default()),
+        );
+        let plan = SessionPlan::new(1);
+        plan.attach(&mut session, 7);
+        session
+            .open_window(1000, 2000, Instant::now() + Duration::from_secs(5))
+            .unwrap();
+        let cookie = plan.cookie(&session, 0);
+        writer.maps.lock().unwrap().rows.insert(
+            osslscope_ebpf_common::make_key(cookie, 0),
+            osslscope_ebpf_common::CountValue {
+                count: 11,
+                first_ns: 1100,
+                last_ns: 1100,
+            },
+        );
+        session
+            .fence(
+                crate::count_session::FenceReason::MappingsChanged,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap();
+        writer.maps.lock().unwrap().rows.insert(
+            osslscope_ebpf_common::make_key(cookie, 1),
+            osslscope_ebpf_common::CountValue {
+                count: 7,
+                first_ns: 1200,
+                last_ns: 1300,
+            },
+        );
+        plan.attach(&mut session, 9);
+        session.backend_mut().generation_refusal = Some(mode);
+        session.backend_mut().wait_inventory = true;
+        assert!(
+            session
+                .fence(
+                    crate::count_session::FenceReason::CandidatesChanged,
+                    Instant::now() + Duration::from_secs(5)
+                )
+                .is_err()
+        );
+        let failure = session.backend().last_failure.unwrap();
+        assert_eq!(failure.completion, CommandCompletion::NotEntered);
+        assert_eq!(
+            failure.publication,
+            if matches!(mode, RefusePublication::After) {
+                CommandPublication::Published
+            } else {
+                CommandPublication::NotPublished
+            }
+        );
+        let want_pending = matches!(mode, RefusePublication::After).then_some(PendingCommandId {
+            seq: CommandSeq::checked(6).unwrap(),
+            operation: CountOperation::Generation,
+        });
+        let actual = session.backend().requests[0].frontier.pending;
+        let terminal = session.terminal(session_close());
+        task3_cleanup(&probe.owner, 10);
+        assert_eq!(
+            actual, want_pending,
+            "NotEntered discarded the published GEN identity"
+        );
+        assert!(no_inventory_failure(&terminal.receipt));
+        assert_eq!(terminal.retained_drain.total_calls(), 18);
+        assert_eq!(
+            session.generation(),
+            1,
+            "unperformed GEN committed a new meaning"
+        );
+        assert_eq!(terminal.retained_drain.current[0].candidates[0].funcid, 7);
+        assert_eq!(terminal.retained_drain.current[0].installed_at, Some(900));
+        assert_eq!(
+            terminal.receipt.inventory.as_ref().unwrap().pending,
+            want_pending
+        );
+        assert_eq!(
+            session
+                .salvage_view(terminal.receipt.terminal_id)
+                .retained_drain,
+            terminal.retained_drain
+        );
+        assert_eq!(session.backend().terminal_calls, 1);
+        assert_eq!(
+            failure.cleanup_ticket,
+            Some(terminal.receipt.cleanup_ticket)
+        );
+        assert!(!probe.calls.lock().unwrap().iter().any(|(_,call)| matches!(call,MapAction::Write(CountMap::Gen,0,value) if value.as_slice()==2u32.to_ne_bytes())));
+        let calls = probe.calls.lock().unwrap().len();
+        for _ in 0..3 {
+            assert_eq!(
+                session
+                    .salvage_view(terminal.receipt.terminal_id)
+                    .retained_drain,
+                terminal.retained_drain
+            );
+        }
+        assert_eq!(probe.calls.lock().unwrap().len(), calls);
+        assert!(
+            failure.cleanup_ticket.is_some(),
+            "both publication branches have a ticket"
+        );
+    }
+}
+#[test]
+fn g1_fix1_not_entered_open_never_admits_a_window() {
+    for mode in [RefusePublication::After, RefusePublication::Before] {
+        let probe = MapProbe::new();
+        let mut session = crate::count_session::CountSession::new(
+            1,
+            session_owner_port(&probe, None, TerminalFaults::default()),
+        );
+        SessionPlan::new(1).attach(&mut session, 7);
+        session.backend_mut().open_refusal = Some(mode);
+        session.backend_mut().wait_inventory = true;
+        assert!(
+            session
+                .open_window(1000, 2000, Instant::now() + Duration::from_secs(5))
+                .is_err()
+        );
+        let want = matches!(mode, RefusePublication::After).then_some(PendingCommandId {
+            seq: CommandSeq::checked(2).unwrap(),
+            operation: CountOperation::Open,
+        });
+        let actual = session.backend().requests[0].frontier.pending;
+        let failure = session.backend().last_failure.unwrap();
+        assert_eq!(failure.completion, CommandCompletion::NotEntered);
+        assert_eq!(
+            failure.publication,
+            if matches!(mode, RefusePublication::After) {
+                CommandPublication::Published
+            } else {
+                CommandPublication::NotPublished
+            }
+        );
+        let terminal = session.terminal(session_close());
+        task3_cleanup(&probe.owner, 10);
+        assert_eq!(
+            failure.cleanup_ticket,
+            Some(terminal.receipt.cleanup_ticket)
+        );
+        assert_eq!(
+            actual, want,
+            "NotEntered discarded the published Open request"
+        );
+        assert!(no_inventory_failure(&terminal.receipt));
+        assert!(session.programmed_admission().is_none());
+        assert!(!session.window_open());
+        assert_eq!(terminal.receipt.inventory.as_ref().unwrap().pending, want);
+        if let Some(open) = terminal.receipt.resolved_open {
+            assert_eq!(
+                (
+                    open.seq.value(),
+                    open.tgid,
+                    open.generation,
+                    open.start_ns,
+                    open.deadline_ns
+                ),
+                (2, 1, 0, 1000, 2000)
+            );
+            assert_eq!(open.completed_writes, OpenWriteFrontier::NoWrites);
+            assert_ne!(open.outcome, OpenOutcome::Completed);
+        }
+        assert!(
+            !probe.calls.lock().unwrap().iter().any(|(_, call)| matches!(
+                call,
+                MapAction::Write(CountMap::Window | CountMap::Gen, _, _)
+            ))
+        );
+        let calls = probe.calls.lock().unwrap().len();
+        for _ in 0..3 {
+            assert_eq!(
+                session
+                    .salvage_view(terminal.receipt.terminal_id)
+                    .retained_drain,
+                terminal.retained_drain
+            );
+        }
+        assert_eq!(probe.calls.lock().unwrap().len(), calls);
+    }
+}
+#[test]
+fn g1_fix1_observing_prefix_survives_blocked_ordinary_read() {
+    let probe = MapProbe::new();
+    let gate = Probe::new();
+    let writer = StagedWriter::new(None);
+    writer.returned.store(true, Ordering::Release);
+    let mut session = crate::count_session::CountSession::new(
+        1,
+        session_owner_port(
+            &probe,
+            Some(Arc::clone(&writer)),
+            TerminalFaults {
+                lookup_gate: Some((
+                    Arc::new(AtomicU64::new(osslscope_ebpf_common::make_key(2, 0))),
+                    Arc::clone(&gate),
+                )),
+                ..Default::default()
+            },
+        ),
+    );
+    let plan = SessionPlan::new(3);
+    plan.attach(&mut session, 7);
+    session
+        .open_window(1000, 2000, Instant::now() + Duration::from_secs(5))
+        .unwrap();
+    for (position, count) in [(0, 11), (1, 12), (2, 1)] {
+        writer.maps.lock().unwrap().rows.insert(
+            osslscope_ebpf_common::make_key(plan.cookie(&session, position), 0),
+            osslscope_ebpf_common::CountValue {
+                count,
+                first_ns: 1100 + position as u64 * 100,
+                last_ns: 1150 + position as u64 * 100,
+            },
+        );
+    }
+    let cutoff = Instant::now() + Duration::from_millis(200);
+    let call = std::thread::spawn(move || {
+        assert!(
+            session
+                .fence(crate::count_session::FenceReason::MappingsChanged, cutoff)
+                .is_err()
+        );
+        session
+    });
+    gate.wait(|events| {
+        events
+            .iter()
+            .any(|(_, event)| matches!(event, Event::Started))
+    });
+    let mut session = call.join().unwrap();
+    let checkpoint = session.backend().engine.progress().unwrap();
+    assert_eq!(checkpoint.phase, OwnerPhase::Observing);
+    assert!(checkpoint.published_at < cutoff);
+    assert_eq!(
+        checkpoint
+            .snapshot
+            .rows
+            .iter()
+            .map(|(_, v)| v.count)
+            .sum::<u64>(),
+        23,
+        "actual owner prefix must exist before testing consumer retention"
+    );
+    assert!(
+        locked(&session.backend().engine.shared.state)
+            .inventory
+            .is_none()
+    );
+    let terminal = session.terminal(session_close());
+    let call_count = probe.calls.lock().unwrap().len();
+    for _ in 0..3 {
+        assert_eq!(
+            session
+                .salvage_view(terminal.receipt.terminal_id)
+                .retained_drain,
+            terminal.retained_drain
+        );
+    }
+    assert_eq!(probe.calls.lock().unwrap().len(), call_count);
+    gate.release();
+    task3_cleanup(&probe.owner, 10);
+    assert_eq!(
+        terminal.retained_drain.total_calls(),
+        23,
+        "ordinary Observing prefix was lost while the journal remained unavailable"
+    );
+    assert!(terminal.runtime_failure.is_none());
+    assert_eq!(
+        session_counter(&terminal.retained_drain, "count.ledger_delta"),
+        None
+    );
+    assert_eq!(session.backend().terminal_calls, 1);
+    for (position, site) in terminal.retained_drain.current.iter().enumerate() {
+        assert_eq!(site.site.offset, plan.offsets[position]);
+        assert_eq!(site.site.device, 1);
+        assert_eq!(site.site.inode, 2);
+        assert_eq!(site.installed_at, Some(900));
+        assert_eq!(site.candidates[0].funcid, 7);
+        assert_eq!(
+            (site.first_ns, site.last_ns),
+            (1100 + position as u64 * 100, 1150 + position as u64 * 100)
+        );
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PrefixSelection {
+    Latest,
+    Stale,
+    AtCutoff,
+    AfterCutoff,
+}
+fn retained_prefix_fixture(selection: PrefixSelection) {
+    use crate::count_session::{CountSession, FenceReason};
+    let probe = MapProbe::new();
+    let gate = Probe::new();
+    let writer = StagedWriter::new(None);
+    writer.returned.store(true, Ordering::Release);
+    // Current belongs to cookie0/gen1; the next cookie is a later lookup. The
+    // post-cutoff twin instead holds current, preventing pre-cutoff publication.
+    let held_key = if selection != PrefixSelection::AfterCutoff {
+        osslscope_ebpf_common::make_key(1, 1)
+    } else {
+        osslscope_ebpf_common::make_key(0, 1)
+    };
+    let selected_key = Arc::new(AtomicU64::new(u64::MAX));
+    let mut session = CountSession::new(
+        1,
+        session_owner_port(
+            &probe,
+            Some(Arc::clone(&writer)),
+            TerminalFaults {
+                lookup_gate: Some((Arc::clone(&selected_key), Arc::clone(&gate))),
+                ..Default::default()
+            },
+        ),
+    );
+    let plan = SessionPlan::new(2);
+    plan.attach(&mut session, 7);
+    session
+        .open_window(1000, 2000, Instant::now() + Duration::from_secs(5))
+        .unwrap();
+    let cookie = plan.cookie(&session, 0);
+    assert_eq!(
+        cookie, 0,
+        "fixture's literal held key must name the bound first site"
+    );
+    writer.maps.lock().unwrap().rows.insert(
+        osslscope_ebpf_common::make_key(cookie, 0),
+        osslscope_ebpf_common::CountValue {
+            count: 11,
+            first_ns: 1100,
+            last_ns: 1100,
+        },
+    );
+    plan.attach(&mut session, 9);
+    session
+        .fence(
+            FenceReason::CandidatesChanged,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+    writer.maps.lock().unwrap().rows.insert(
+        osslscope_ebpf_common::make_key(cookie, 1),
+        osslscope_ebpf_common::CountValue {
+            count: 7,
+            first_ns: 1200,
+            last_ns: 1300,
+        },
+    );
+    // Use the same private ordinary Read path that fence consumes, through a
+    // test utility; it supplies a real owner acknowledgment and image, without
+    // inventing row data/frontier/sequence or committing an unrelated GEN.
+    let prior = crate::count_session::tests::read_for_fixture(
+        &mut session,
+        Instant::now() + Duration::from_secs(5),
+    );
+    assert_eq!(prior.current[0].calls, 7);
+    assert_eq!(prior.fenced[0].sites[0].calls, 11);
+    if selection == PrefixSelection::Stale {
+        // This is an actual earlier acknowledged image. Keeping it deliberately
+        // exercises replay under the existing bounded image retention contract.
+        session.backend_mut().replay = session.backend().engine.progress();
+    }
+    selected_key.store(held_key, Ordering::Release);
+    if selection == PrefixSelection::AtCutoff {
+        // Only timestamp metadata is controlled for the strict equality edge;
+        // the Arc rows and actual Observing phase still come from the owner.
+        session.backend_mut().progress_cutoff = Some(Instant::now());
+    }
+    writer.maps.lock().unwrap().rows.insert(
+        osslscope_ebpf_common::make_key(cookie, 1),
+        osslscope_ebpf_common::CountValue {
+            count: 12,
+            first_ns: 1200,
+            last_ns: 1600,
+        },
+    );
+    writer.maps.lock().unwrap().rows.insert(
+        osslscope_ebpf_common::make_key(plan.cookie(&session, 1), 1),
+        osslscope_ebpf_common::CountValue {
+            count: 1,
+            first_ns: 1700,
+            last_ns: 1700,
+        },
+    );
+    if selection == PrefixSelection::AfterCutoff {
+        session.backend_mut().late_release = Some(Arc::clone(&gate));
+    }
+    let cutoff = Instant::now() + Duration::from_millis(200);
+    let call = std::thread::spawn(move || {
+        assert!(session.fence(FenceReason::MappingsChanged, cutoff).is_err());
+        session
+    });
+    gate.wait(|events| events.iter().any(|(_, e)| matches!(e, Event::Started)));
+    let mut session = call.join().unwrap();
+    let actual = session.backend().engine.progress().unwrap();
+    assert_eq!(actual.phase, OwnerPhase::Observing);
+    if selection == PrefixSelection::Latest || selection == PrefixSelection::AtCutoff {
+        // Assert the actual producer prefix exists. Pinning a prior session
+        // image must not silently consume the spare needed to publish it.
+        let actual_total = actual
+            .snapshot
+            .rows
+            .iter()
+            .map(|(_, v)| v.count)
+            .sum::<u64>();
+        if actual_total != 23 {
+            gate.release();
+            task3_cleanup(&probe.owner, 10);
+        }
+        assert_eq!(
+            actual_total, 23,
+            "session retained image pinned away the owner's positive prefix"
+        );
+        assert!(actual.published_at < cutoff);
+    } else if selection == PrefixSelection::AfterCutoff {
+        assert!(
+            actual.published_at >= cutoff,
+            "late twin must exercise real post-cutoff owner publication"
+        );
+    }
+    let terminal = session.terminal(session_close());
+    let calls = probe.calls.lock().unwrap().len();
+    let closes = probe
+        .owner
+        .log
+        .lock()
+        .unwrap()
+        .events
+        .iter()
+        .filter(|(_, e)| matches!(e, Event::EnterClose))
+        .count();
+    for _ in 0..3 {
+        let salvage = session.salvage_view(terminal.receipt.terminal_id);
+        assert_eq!(salvage.retained_drain, terminal.retained_drain);
+        assert!(std::ptr::eq(&*salvage.receipt, &*terminal.receipt));
+    }
+    assert_eq!(probe.calls.lock().unwrap().len(), calls);
+    assert_eq!(
+        probe
+            .owner
+            .log
+            .lock()
+            .unwrap()
+            .events
+            .iter()
+            .filter(|(_, e)| matches!(e, Event::EnterClose))
+            .count(),
+        closes
+    );
+    gate.release();
+    task3_cleanup(&probe.owner, 10);
+    let want = if selection == PrefixSelection::Latest {
+        23
+    } else {
+        18
+    };
+    assert_eq!(terminal.retained_drain.total_calls(), want);
+    assert!(
+        terminal.runtime_failure.is_none(),
+        "{:?}",
+        terminal.runtime_failure
+    );
+    assert_eq!(
+        session_counter(&terminal.retained_drain, "count.ledger_delta"),
+        None
+    );
+    let current = &terminal.retained_drain.current[0];
+    assert_eq!(
+        (
+            current.calls,
+            current.generation,
+            current.candidates[0].funcid
+        ),
+        (want - 11, 1, 9)
+    );
+    assert_eq!(
+        (current.first_ns, current.last_ns),
+        (
+            1200,
+            if selection == PrefixSelection::Latest {
+                1600
+            } else {
+                1300
+            }
+        )
+    );
+    assert_eq!(current.site.offset, plan.offsets[0]);
+    assert_eq!((current.site.device, current.site.inode), (1, 2));
+    assert_eq!(current.installed_at, Some(900));
+    let retired = &terminal.retained_drain.fenced[0].sites[0];
+    assert_eq!(
+        (
+            retired.calls,
+            retired.generation,
+            retired.candidates[0].funcid
+        ),
+        (11, 0, 7)
+    );
+    assert_eq!((retired.first_ns, retired.last_ns), (1100, 1100));
+    assert_eq!(retired.site, current.site);
+    assert_eq!(retired.installed_at, Some(900));
+    assert_eq!(
+        session
+            .salvage_view(terminal.receipt.terminal_id)
+            .retained_drain,
+        terminal.retained_drain,
+        "late cleanup cannot replace selected facts"
+    );
+    assert_eq!(session.backend().terminal_calls, 1);
+}
+#[test]
+fn g1_fix1_current_and_fenced_prefix_uses_three_actual_images() {
+    retained_prefix_fixture(PrefixSelection::Latest);
+}
+
+#[test]
+fn g1_fix1_stale_ordinary_image_never_refolds_prior_calls() {
+    retained_prefix_fixture(PrefixSelection::Stale);
+}
+#[test]
+fn g1_fix1_prefix_observed_at_cutoff_grants_no_new_rows() {
+    retained_prefix_fixture(PrefixSelection::AtCutoff);
+}
+#[test]
+fn g1_fix1_actual_late_ordinary_prefix_grants_no_new_rows() {
+    retained_prefix_fixture(PrefixSelection::AfterCutoff);
+}
+#[test]
+fn g1_fix1_sealed_frontier_still_rejects_forged_identity() {
+    for forged in 0..4 {
+        let probe = MapProbe::new();
+        let (engine, _) = terminal_engine(
+            &probe,
+            None,
+            TerminalFaults {
+                map: MapFaults {
+                    write_error: Some(1),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let ack = engine.attach(attach_request(1, 1)).unwrap();
+        let original = ControllerFrontier {
+            last_acked: Some(ack.seq),
+            acknowledged_links: ack.value.links.iter().map(LinkToken::id).collect(),
+            pending: Some(PendingCommandId {
+                seq: CommandSeq::checked(2).unwrap(),
+                operation: CountOperation::Open,
+            }),
+        };
+        let open = open_request(2);
+        assert_eq!(
+            engine.open_window(open).unwrap_err().failure.class,
+            FailureClass::Io
+        );
+        assert_eq!(
+            task3_inventory(&engine).unwrap().validate(&original),
+            Ok(())
+        );
+        let seal = locked(&engine.shared.state).terminal.unwrap();
+        let mut frontier = original;
+        let mut domain = engine.ready.evidence_domain;
+        let mut object = engine.ready.writer_object_identity;
+        match forged {
+            0 => object = [0x88; 32],
+            1 => domain = EvidenceDomain::Live,
+            2 => {
+                frontier.pending = Some(PendingCommandId {
+                    seq: CommandSeq::checked(99).unwrap(),
+                    operation: CountOperation::Open,
+                })
+            }
+            _ => frontier = ControllerFrontier::default(),
+        }
+        let request = engine.terminal_request(
+            open.deadline + Duration::from_secs(30),
+            domain,
+            object,
+            frontier,
+        );
+        assert!(locked(&engine.shared.state).terminal_contradiction);
+        assert_eq!(request.id, seal.ticket.terminal_id);
+        assert_eq!(request.deadline, open.deadline);
+        let terminal = engine.terminal(request.clone());
+        assert!(validate_terminal(&request, &terminal).is_err());
+        assert!(!matches!(
+            terminal.writers,
+            WriterCompletion::Finished(_) | WriterCompletion::KnownEmpty(_)
+        ));
+        assert!(std::ptr::eq(&*terminal, &*engine.salvage_view(request.id)));
+        task3_cleanup(&probe.owner, 10);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MapAction {
     Write(CountMap, u32, Vec<u8>),
@@ -4622,6 +5603,8 @@ struct TerminalFaults {
     publication_gate: Option<Arc<Probe>>,
     registry_hook: Option<Arc<dyn Fn(RegistryEvent) + Send + Sync>>,
     seal_claim_gate: Option<Arc<Probe>>,
+    mailbox_observer: Option<Arc<dyn Fn(MailboxEvent) + Send + Sync>>,
+    lookup_gate: Option<(Arc<AtomicU64>, Arc<Probe>)>,
 }
 impl Default for TerminalFaults {
     fn default() -> Self {
@@ -4637,6 +5620,8 @@ impl Default for TerminalFaults {
             publication_gate: None,
             registry_hook: None,
             seal_claim_gate: None,
+            mailbox_observer: None,
+            lookup_gate: None,
         }
     }
 }
@@ -4655,6 +5640,7 @@ struct TerminalDriver {
     timeline: Arc<Mutex<Vec<(TerminalEvent, Instant)>>>,
     clock_panic_after_close: bool,
     clock: Option<Arc<ControlledClock>>,
+    lookup_gate: Option<(Arc<AtomicU64>, Arc<Probe>)>,
 }
 impl CountIoDriver for TerminalDriver {
     fn map_create(&mut self, spec: &crate::loader::MapSpecLite) -> io::Result<OwnedFd> {
@@ -4727,6 +5713,12 @@ impl CountIoDriver for TerminalDriver {
             u32::from_ne_bytes(key.try_into().unwrap()) as u64
         };
         self.map.enter(MapAction::Lookup(map, k, value.len()));
+        if let Some((held_key, gate)) = &self.lookup_gate {
+            if map == CountMap::Counts && k == held_key.load(Ordering::Acquire) {
+                gate.event(Event::Started);
+                gate.hold();
+            }
+        }
         let maps = writer.maps.lock().unwrap();
         value.fill(0);
         if map == CountMap::Counts {
@@ -4832,6 +5824,7 @@ fn terminal_engine(
     hooks.final_references = faults.references;
     hooks.writer_family = faults.family;
     hooks.fail_attach_publication = faults.fail_publication;
+    hooks.mailbox_observer = faults.mailbox_observer.clone();
     hooks.clock = faults.clock.as_ref().map(|clock| {
         let clock = Arc::clone(clock);
         Arc::new(move || clock.now()) as Arc<dyn Fn() -> Instant + Send + Sync>
@@ -4891,6 +5884,7 @@ fn terminal_engine(
                 timeline: observed,
                 clock_panic_after_close: faults.clock_panic_after_close,
                 clock: faults.clock,
+                lookup_gate: faults.lookup_gate,
             }
         },
         spawn_owner,

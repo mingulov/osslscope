@@ -351,6 +351,26 @@ fn h5_t3_every_device_site_names_one_domain() {
             "device: crate::plan::encode_device(libc::major(current.dev()), libc::minor(current.dev())),",
             1,
         ),
+        // Count owner session fixtures: PipeDriver's normalized stat backing
+        // (1,2) is rendered into the mapping and retained verbatim in SiteKey.
+        (
+            "src/count_owner/tests.rs",
+            "stat",
+            "assert_eq!((current.site.device, current.site.inode), (1, 2));",
+            1,
+        ),
+        (
+            "src/count_owner/tests.rs",
+            "stat",
+            "assert_eq!(site.site.device, 1);",
+            1,
+        ),
+        (
+            "src/count_owner/tests.rs",
+            "stat",
+            "dev: crate::plan::render_device(1),",
+            1,
+        ),
         // count_session.rs: triple keys (stat words, ×3).
         (
             "src/count_session.rs",

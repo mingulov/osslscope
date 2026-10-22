@@ -168,6 +168,7 @@ fn lost(seq: CommandSeq, operation: CountOperation) -> CommandFailure {
     CommandFailure {
         seq,
         completion: CommandCompletion::Unknown,
+        publication: CommandPublication::Published,
         cleanup_ticket: None,
         failure: OwnerFailure {
             operation,

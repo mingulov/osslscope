@@ -38,13 +38,14 @@
 use crate::count_owner::*;
 pub use crate::count_owner::{
     AttachAck, AttachRefusal, AttachRefusalReason, AttachRequest, BackingIdentity, CleanupState,
-    CleanupTicket, CommandAck, CommandCompletion, CommandFailure, CommandResult, CommandSeq,
-    Component, ComponentFailure, ControllerFrontier, CountForkBarrier, CountForkPermit, CountInput,
-    CountMap, CountOperation, CountOwnerLimits, CountPrepareFailure, EnumerationStatus,
-    EvidenceDomain, FailureClass, ForkBlocked, GenerationRequest, KernelApplicability, LinkId,
-    LinkToken, OpenOutcome, OpenReceipt, OpenRequest, OpenWriteFrontier, OwnerFailure,
-    PendingCommandId, ProgrammedAdmission, RawCheckpoint, RawSnapshot, RawTerminal, ReadRequest,
-    ReadStatus, Ready, ResourceId, StopResult, TerminalId, TerminalRequest, WriterCompletion,
+    CleanupTicket, CommandAck, CommandCompletion, CommandFailure, CommandPublication,
+    CommandResult, CommandSeq, Component, ComponentFailure, ControllerFrontier, CountForkBarrier,
+    CountForkPermit, CountInput, CountMap, CountOperation, CountOwnerLimits, CountPrepareFailure,
+    EnumerationStatus, EvidenceDomain, FailureClass, ForkBlocked, GenerationRequest,
+    KernelApplicability, LinkId, LinkToken, OpenOutcome, OpenReceipt, OpenRequest,
+    OpenWriteFrontier, OwnerFailure, PendingCommandId, ProgrammedAdmission, RawCheckpoint,
+    RawSnapshot, RawTerminal, ReadRequest, ReadStatus, Ready, ResourceId, StopResult, TerminalId,
+    TerminalRequest, WriterCompletion,
 };
 use crate::discovery::maps;
 use crate::evidence::{
@@ -419,7 +420,10 @@ pub struct CountSession<B: CountBackend> {
     pending_txn: Option<PendingCountTxn>,
     programmed: Option<ProgrammedAdmission>,
     acknowledged_open: Option<OpenReceipt>,
-    last_snapshot: Option<Arc<RawSnapshot>>,
+    // Routing needs only the checked image identity after folding. Holding
+    // the old rows here would pin a spare in the owner's three-image pool and
+    // prevent a later ordinary read from publishing its positive prefixes.
+    last_snapshot_seq: Option<SnapshotSeq>,
     terminal_view: Option<CountTerminal>,
     canonical: Option<TerminalRequest>,
     runtime_failure: Option<OwnerFailure>,
@@ -506,7 +510,7 @@ impl<B: CountBackend> CountSession<B> {
             pending_txn: None,
             programmed: None,
             acknowledged_open: None,
-            last_snapshot: None,
+            last_snapshot_seq: None,
             terminal_view: None,
             canonical: None,
             runtime_failure: None,
@@ -934,7 +938,7 @@ impl<B: CountBackend> CountSession<B> {
         }
     }
 
-    pub fn fence(&mut self, reason: FenceReason, deadline: Instant) -> anyhow::Result<()> {
+    fn read(&mut self, deadline: Instant) -> anyhow::Result<()> {
         self.ensure_active()?;
         let seq = self.next_command(deadline)?;
         let read = ReadRequest { seq, deadline };
@@ -948,6 +952,11 @@ impl<B: CountBackend> CountSession<B> {
             Ok(_) => return self.invalid_command(CountOperation::Read, deadline),
             Err(failure) => return self.command_failed(failure),
         }
+        Ok(())
+    }
+
+    pub fn fence(&mut self, reason: FenceReason, deadline: Instant) -> anyhow::Result<()> {
+        self.read(deadline)?;
         let Some(next) = self.generation.checked_add(1) else {
             return self.invalid_command(CountOperation::Generation, deadline);
         };
@@ -1109,16 +1118,25 @@ impl<B: CountBackend> CountSession<B> {
             .as_ref()
             .map(PendingCountTxn::deadline)
             .unwrap_or_else(Instant::now);
-        if failure.failure.operation == CountOperation::Read {
+        if failure.publication == CommandPublication::Published
+            && matches!(self.pending_txn, Some(PendingCountTxn::Read(read)) if read.seq == failure.seq)
+            && failure.failure.operation == CountOperation::Read
+        {
             if let Some(checkpoint) = self.backend.progress() {
+                // Ordinary Read prefixes keep the actual Ready/Observing
+                // phase. They retain positive facts under acknowledged link
+                // meanings, without granting terminal completion authority.
                 if checkpoint.published_at < deadline
-                    && checkpoint.phase == OwnerPhase::Snapshotting
+                    && matches!(
+                        checkpoint.phase,
+                        OwnerPhase::Ready | OwnerPhase::Observing | OwnerPhase::Snapshotting
+                    )
                 {
                     self.route_snapshot(checkpoint.snapshot);
                 }
             }
         }
-        if failure.completion == CommandCompletion::NotEntered {
+        if failure.publication == CommandPublication::NotPublished {
             self.pending_txn = None;
         }
         let request = self.backend.terminal_request(deadline, self.frontier());
@@ -1262,9 +1280,7 @@ impl<B: CountBackend> CountSession<B> {
         self.terminal_reconciled = finished
             && receipt.read_status == ReadStatus::Complete
             && receipt.checkpoint.as_ref().is_some_and(|c| {
-                self.last_snapshot
-                    .as_ref()
-                    .is_some_and(|s| s.sequence == c.snapshot.sequence)
+                self.last_snapshot_seq == Some(c.snapshot.sequence)
                     && matches!(c.snapshot.admitted, Component::Available(_))
                     && matches!(c.snapshot.dropfail, Component::Available(_))
                     && c.snapshot
@@ -1344,7 +1360,9 @@ impl<B: CountBackend> CountSession<B> {
                 });
             }
         }
-        if let StopResult::Failed(failure) = receipt.seal.result {
+        if let StopResult::Failed(failure) = receipt.seal.result
+            && failure.class != FailureClass::Deadline
+        {
             self.runtime_failure.get_or_insert(failure);
         }
         if !valid && !self.terminal_inventory_unavailable {
@@ -1613,7 +1631,7 @@ impl<B: CountBackend> CountSession<B> {
                 CounterKind::Activity,
                 CounterUnits::Events,
                 CounterSource::Drain,
-                u64::from(self.last_snapshot.is_some()),
+                u64::from(self.last_snapshot_seq.is_some()),
             ),
             counter(
                 "count.drain_pass_ns_total",
@@ -1776,9 +1794,8 @@ impl<B: CountBackend> CountSession<B> {
     /// make every replay data-only, without a repeat-until-equal close scan.
     fn route_snapshot(&mut self, snapshot: Arc<RawSnapshot>) -> bool {
         if self
-            .last_snapshot
-            .as_ref()
-            .is_some_and(|last| snapshot.sequence <= last.sequence)
+            .last_snapshot_seq
+            .is_some_and(|last| snapshot.sequence <= last)
         {
             return false;
         }
@@ -1901,7 +1918,7 @@ impl<B: CountBackend> CountSession<B> {
             self.enumerated = true;
             self.shortfall = self.shortfall.saturating_add(unread_keys);
         }
-        self.last_snapshot = Some(snapshot);
+        self.last_snapshot_seq = Some(snapshot.sequence);
         progress
     }
 }
@@ -2114,6 +2131,7 @@ impl FakeCountBackend {
             seq,
             failure: OwnerFailure::engine(operation, class),
             completion: CommandCompletion::NotEntered,
+            publication: CommandPublication::NotPublished,
             cleanup_ticket: self.terminal_request.as_ref().map(|r| CleanupTicket {
                 owner_epoch: r.id.owner_epoch,
                 terminal_id: r.id,
@@ -2143,6 +2161,12 @@ impl FakeCountBackend {
     }
     /// Publish one cumulative model image; used by scripted host interleavings.
     pub fn publish_checkpoint(&mut self) -> Result<Arc<RawSnapshot>, OwnerFailure> {
+        self.publish_checkpoint_in_phase(OwnerPhase::Observing)
+    }
+    fn publish_checkpoint_in_phase(
+        &mut self,
+        phase: OwnerPhase,
+    ) -> Result<Arc<RawSnapshot>, OwnerFailure> {
         let fail = || OwnerFailure::engine(CountOperation::Read, FailureClass::Capacity);
         let index = self
             .images
@@ -2212,7 +2236,7 @@ impl FakeCountBackend {
         let image = Arc::clone(&self.images[index]);
         self.checkpoint = Some(RawCheckpoint {
             snapshot: image.clone(),
-            phase: OwnerPhase::Snapshotting,
+            phase,
             published_at: Instant::now(),
         });
         Ok(image)
@@ -2559,6 +2583,7 @@ impl CountBackend for FakeCountBackend {
                 seq: request.seq,
                 failure,
                 completion: CommandCompletion::Completed,
+                publication: CommandPublication::Published,
                 cleanup_ticket: None,
             })?;
         self.last_completed = Some(PendingCommandId {
@@ -2568,6 +2593,7 @@ impl CountBackend for FakeCountBackend {
         if self.faults.read_error {
             return Err(CommandFailure {
                 completion: CommandCompletion::Completed,
+                publication: CommandPublication::Published,
                 ..self.failure(request.seq, CountOperation::Read, FailureClass::Io)
             });
         }
@@ -2702,7 +2728,7 @@ impl CountBackend for FakeCountBackend {
         let started = Instant::now();
         let mut fresh = false;
         if can_read {
-            match self.publish_checkpoint() {
+            match self.publish_checkpoint_in_phase(OwnerPhase::Snapshotting) {
                 Ok(_) => fresh = true,
                 Err(failure) => {
                     data.failures.operations[CountOperation::Read as usize] = Some(failure);
@@ -2844,8 +2870,16 @@ impl CountBackend for LiveBackend {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    pub(crate) fn read_for_fixture<B: CountBackend>(
+        session: &mut CountSession<B>,
+        deadline: Instant,
+    ) -> CountDrain {
+        session.read(deadline).unwrap();
+        session.retained_drain()
+    }
 
     #[test]
     fn fake_refuses_fourth_pinned_image() {

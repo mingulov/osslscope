@@ -421,11 +421,19 @@ pub enum CommandCompletion {
     Completed,
     Unknown,
 }
+/// Publication is independent of whether the handler entered any I/O. A
+/// rejected command may carry an existing cleanup ticket without publication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandPublication {
+    NotPublished,
+    Published,
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommandFailure {
     pub seq: CommandSeq,
     pub failure: OwnerFailure,
     pub completion: CommandCompletion,
+    pub publication: CommandPublication,
     pub cleanup_ticket: Option<CleanupTicket>,
 }
 impl CommandFailure {

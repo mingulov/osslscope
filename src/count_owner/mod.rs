@@ -800,6 +800,7 @@ impl CountEngine {
                 seq: request.seq,
                 failure: OwnerFailure::engine(CountOperation::Open, FailureClass::InvalidInput),
                 completion: CommandCompletion::NotEntered,
+                publication: CommandPublication::NotPublished,
                 cleanup_ticket: None,
             });
         }
@@ -839,6 +840,7 @@ impl CountEngine {
             seq,
             failure: OwnerFailure::engine(operation, class),
             completion,
+            publication: CommandPublication::NotPublished,
             cleanup_ticket,
         };
         if Instant::now() >= deadline {
@@ -888,12 +890,16 @@ impl CountEngine {
         }
         assert!(state.ordinary.publish_request(request).is_ok());
         self.shared.worker.get().expect("prepared owner").unpark();
+        let published_refusal = |failure, completion, cleanup_ticket| CommandFailure {
+            publication: CommandPublication::Published,
+            ..refused(failure, completion, cleanup_ticket)
+        };
         loop {
             if Instant::now() >= deadline {
                 let ticket = self.shared.seal_locked(&mut state, deadline);
                 drop(state);
                 self.shared.abandon();
-                return Err(refused(
+                return Err(published_refusal(
                     FailureClass::Deadline,
                     CommandCompletion::Unknown,
                     Some(ticket),
@@ -903,7 +909,7 @@ impl CountEngine {
                 let Some(result) = extract(reply) else {
                     let ticket = self.shared.seal_locked(&mut state, deadline);
                     self.shared.worker.get().unwrap().unpark();
-                    return Err(refused(
+                    return Err(published_refusal(
                         FailureClass::Inventory,
                         CommandCompletion::Unknown,
                         Some(ticket),
@@ -911,7 +917,7 @@ impl CountEngine {
                 };
                 let ack = result?;
                 if let Some(seal) = state.terminal {
-                    return Err(refused(
+                    return Err(published_refusal(
                         FailureClass::Disconnected,
                         CommandCompletion::Completed,
                         Some(seal.ticket),
@@ -920,7 +926,7 @@ impl CountEngine {
                 if ack.seq != seq {
                     let ticket = self.shared.seal_locked(&mut state, deadline);
                     self.shared.worker.get().unwrap().unpark();
-                    return Err(refused(
+                    return Err(published_refusal(
                         FailureClass::Inventory,
                         CommandCompletion::Unknown,
                         Some(ticket),
@@ -932,7 +938,7 @@ impl CountEngine {
                 return Ok(ack);
             }
             if let Some(seal) = state.terminal {
-                return Err(refused(
+                return Err(published_refusal(
                     FailureClass::Disconnected,
                     CommandCompletion::Unknown,
                     Some(seal.ticket),
@@ -954,6 +960,7 @@ impl CountEngine {
             seq,
             failure,
             completion,
+            publication: CommandPublication::NotPublished,
             cleanup_ticket,
         };
         request
@@ -1023,12 +1030,16 @@ impl CountEngine {
                 .is_ok()
         );
         self.shared.worker.get().expect("prepared owner").unpark();
+        let published_refusal = |failure, completion, cleanup_ticket| CommandFailure {
+            publication: CommandPublication::Published,
+            ..refused(failure, completion, cleanup_ticket)
+        };
         loop {
             if Instant::now() >= deadline {
                 let ticket = self.shared.seal_locked(&mut state, deadline);
                 drop(state);
                 self.shared.abandon();
-                return Err(refused(
+                return Err(published_refusal(
                     OwnerFailure::engine(CountOperation::Attach, FailureClass::Deadline),
                     CommandCompletion::Unknown,
                     Some(ticket),
@@ -1038,7 +1049,7 @@ impl CountEngine {
                 match result {
                     Ok(ack) => {
                         if let Some(seal) = state.terminal {
-                            return Err(refused(
+                            return Err(published_refusal(
                                 OwnerFailure::engine(
                                     CountOperation::Attach,
                                     FailureClass::Disconnected,
@@ -1048,7 +1059,7 @@ impl CountEngine {
                             ));
                         }
                         if ack.seq != seq {
-                            return Err(refused(
+                            return Err(published_refusal(
                                 OwnerFailure::engine(
                                     CountOperation::Attach,
                                     FailureClass::Inventory,
@@ -1077,7 +1088,7 @@ impl CountEngine {
                 }
             }
             if let Some(seal) = state.terminal {
-                return Err(refused(
+                return Err(published_refusal(
                     OwnerFailure::engine(CountOperation::Attach, FailureClass::Disconnected),
                     CommandCompletion::Unknown,
                     Some(seal.ticket),
@@ -1602,6 +1613,7 @@ fn owner_main<D, F>(
                         Err(CommandFailure {
                             seq: attach_request.seq,
                             failure,
+                            publication: CommandPublication::Published,
                             completion: if failure.class == FailureClass::Panic {
                                 CommandCompletion::Unknown
                             } else if entered {
@@ -1644,16 +1656,15 @@ fn owner_main<D, F>(
         }
     };
     shared.seal(active_deadline);
-    let frontier = {
+    {
         let mut state = locked(&shared.state);
         registry.journal.acknowledged(state.frontier.last_acked);
         registry.journal.resolved_open(state.resolved_open);
-        std::mem::take(&mut state.frontier)
-    };
-    let inventory = registry.journal.seal(&frontier);
-    {
-        let mut state = locked(&shared.state);
-        state.inventory = Some(inventory);
+        // The first consumer may adopt a fault-originated seal after this
+        // metadata transition. Keep its authoritative frontier in the same
+        // bounded state; moving it out would turn valid admission into a race
+        // against a default value. Sealing performs no I/O or allocation here.
+        state.inventory = Some(registry.journal.seal(&state.frontier));
         shared.refresh_fallback_locked(&mut state, false);
         shared.changed.notify_all();
     }
@@ -1779,6 +1790,7 @@ fn execute_map_command(
         CommandFailure {
             seq,
             failure,
+            publication: CommandPublication::Published,
             completion: if !returned {
                 CommandCompletion::Unknown
             } else if entered {
