@@ -9,7 +9,7 @@ macro_rules! identity {
         pub struct $name(u64);
         impl $name {
             pub fn value(self) -> u64 { self.0 }
-            pub(super) fn checked(value: u64) -> Result<Self, OwnerFailure> {
+            pub(crate) fn checked(value: u64) -> Result<Self, OwnerFailure> {
                 if value == 0 { Err(OwnerFailure::engine(CountOperation::Load, FailureClass::InvalidInput)) }
                 else { Ok(Self(value)) }
             }
@@ -790,12 +790,12 @@ impl SealedInventory {
     }
 }
 impl LinkToken {
-    pub(super) fn new(id: LinkId) -> Self {
+    pub(crate) fn new(id: LinkId) -> Self {
         Self { id }
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TerminalRequest {
     pub id: TerminalId,
     pub deadline: std::time::Instant,
@@ -1079,6 +1079,18 @@ pub struct RawTerminalData {
 }
 #[derive(Debug, Clone)]
 pub struct RawTerminal(pub(super) Arc<RawTerminalData>);
+impl RawTerminal {
+    /// Data-only construction for the in-process fixture backend. Never grants
+    /// a Live profile or lets an integration wrapper manufacture a receipt.
+    pub(crate) fn model(data: Arc<RawTerminalData>) -> Self {
+        assert_eq!(data.evidence_domain, EvidenceDomain::HostModel);
+        assert!(matches!(
+            data.kernel_profile,
+            KernelApplicability::ModelFixture | KernelApplicability::Unknown(_)
+        ));
+        Self(data)
+    }
+}
 impl std::ops::Deref for RawTerminal {
     type Target = RawTerminalData;
     fn deref(&self) -> &Self::Target {

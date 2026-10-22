@@ -588,6 +588,39 @@ impl CountEngine {
         })
     }
 
+    /// Bind the controller's interpretation before notifying the already
+    /// owning worker. A prior fault/abandonment retains its exact ID and budget.
+    pub(crate) fn terminal_request(
+        &self,
+        deadline: Instant,
+        evidence_domain: EvidenceDomain,
+        writer_object_identity: [u8; 32],
+        frontier: ControllerFrontier,
+    ) -> TerminalRequest {
+        let mut state = locked(&self.shared.state);
+        let ticket = self.shared.seal_locked(&mut state, deadline);
+        let request = TerminalRequest {
+            id: ticket.terminal_id,
+            deadline: state.terminal.expect("sticky seal").deadline,
+            evidence_domain,
+            writer_object_identity,
+            frontier,
+        };
+        if state.terminal_expected.is_none() {
+            state.terminal_contradiction = evidence_domain != self.ready.evidence_domain
+                || writer_object_identity != self.ready.writer_object_identity
+                || request.frontier != state.frontier;
+            state.terminal_expected = Some(request.clone());
+        } else if state.terminal_expected.as_ref() != Some(&request) {
+            // The selected result, if any, is already immutable. Before result
+            // selection a contradictory first consumer cannot gain authority.
+            state.terminal_contradiction = true;
+        }
+        self.shared.changed.notify_all();
+        self.shared.worker.get().expect("prepared owner").unpark();
+        request
+    }
+
     pub fn terminal(&self, request: TerminalRequest) -> RawTerminal {
         let mut state = locked(&self.shared.state);
         let ticket = self.shared.seal_locked(&mut state, request.deadline);

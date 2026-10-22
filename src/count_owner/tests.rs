@@ -10,6 +10,140 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
+#[test]
+fn g1_session_adopts_existing_canonical_terminal_budget() {
+    let probe = MapProbe::new();
+    let (engine, _) = terminal_engine(&probe, None, TerminalFaults::default());
+    let cutoff = Instant::now();
+    let ticket = engine.shared.seal(cutoff);
+    let request = engine.terminal_request(
+        cutoff + Duration::from_secs(5),
+        engine.ready.evidence_domain,
+        engine.ready.writer_object_identity,
+        ControllerFrontier::default(),
+    );
+    assert_eq!(request.id, ticket.terminal_id);
+    assert_eq!(
+        request.deadline, cutoff,
+        "consumer must adopt the first seal budget"
+    );
+}
+
+#[test]
+fn g1_session_admission_binds_first_request_before_worker() {
+    let probe = MapProbe::new();
+    let (engine, _) = terminal_engine(&probe, None, TerminalFaults::default());
+    let request = engine.terminal_request(
+        Instant::now() + Duration::from_secs(3),
+        engine.ready.evidence_domain,
+        engine.ready.writer_object_identity,
+        ControllerFrontier::default(),
+    );
+    assert_eq!(
+        locked(&engine.shared.state).terminal_expected.as_ref(),
+        Some(&request)
+    );
+    let again = engine.terminal_request(
+        Instant::now() + Duration::from_secs(30),
+        engine.ready.evidence_domain,
+        engine.ready.writer_object_identity,
+        ControllerFrontier::default(),
+    );
+    assert_eq!(again, request);
+    let receipt = engine.terminal(request.clone());
+    assert_eq!(validate_terminal(&request, &receipt), Ok(()));
+    assert_eq!(receipt.terminal_id, again.id);
+    task3_cleanup(&probe.owner, 8);
+}
+
+#[test]
+fn g1_session_admission_adopts_operation_fault_seal() {
+    let probe = MapProbe::new();
+    let (engine, _) = terminal_engine(
+        &probe,
+        None,
+        TerminalFaults {
+            map: MapFaults {
+                write_error: Some(1),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    let open = open_request(1);
+    let failure = engine.open_window(open).unwrap_err();
+    let seal = locked(&engine.shared.state)
+        .terminal
+        .expect("fault seals owner");
+    assert_eq!(failure.cleanup_ticket, Some(seal.ticket));
+    let frontier = locked(&engine.shared.state).frontier.clone();
+    let request = engine.terminal_request(
+        Instant::now() + Duration::from_secs(30),
+        engine.ready.evidence_domain,
+        engine.ready.writer_object_identity,
+        frontier,
+    );
+    assert_eq!(request.id, seal.ticket.terminal_id);
+    assert_eq!(request.deadline, open.deadline);
+    assert_eq!(request.deadline, seal.deadline);
+    let receipt = engine.terminal(request.clone());
+    assert_eq!(receipt.cleanup_ticket, seal.ticket);
+    assert_eq!(receipt.deadline, seal.deadline);
+    assert!(
+        receipt
+            .failures
+            .operations
+            .iter()
+            .flatten()
+            .any(|f| f.class == FailureClass::Io)
+    );
+    task3_cleanup(&probe.owner, 8);
+}
+
+#[test]
+fn g1_session_admission_refuses_forged_object_domain_and_frontier() {
+    for forged in 0..3 {
+        let probe = MapProbe::new();
+        let (engine, _) = terminal_engine(&probe, None, TerminalFaults::default());
+        let mut frontier = ControllerFrontier::default();
+        if forged == 2 {
+            frontier.last_acked = Some(CommandSeq::checked(99).unwrap());
+        }
+        let domain = if forged == 1 {
+            EvidenceDomain::Live
+        } else {
+            engine.ready.evidence_domain
+        };
+        let object = if forged == 0 {
+            [0x77; 32]
+        } else {
+            engine.ready.writer_object_identity
+        };
+        let request = engine.terminal_request(
+            Instant::now() + Duration::from_secs(3),
+            domain,
+            object,
+            frontier,
+        );
+        assert!(locked(&engine.shared.state).terminal_contradiction);
+        let receipt = engine.terminal(request.clone());
+        assert!(!matches!(
+            receipt.writers,
+            WriterCompletion::Finished(_) | WriterCompletion::KnownEmpty(_)
+        ));
+        assert!(
+            receipt
+                .failures
+                .operations
+                .iter()
+                .flatten()
+                .any(|f| f.class == FailureClass::Inventory)
+        );
+        assert!(validate_terminal(&request, &receipt).is_err());
+        task3_cleanup(&probe.owner, 8);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MapAction {
     Write(CountMap, u32, Vec<u8>),

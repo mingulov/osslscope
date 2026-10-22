@@ -35,6 +35,17 @@
 //! exactly, including map-full drops, so the identity, deadline and
 //! conservation contracts pin without privileges.
 
+use crate::count_owner::*;
+pub use crate::count_owner::{
+    AttachAck, AttachRefusal, AttachRefusalReason, AttachRequest, BackingIdentity, CleanupState,
+    CleanupTicket, CommandAck, CommandCompletion, CommandFailure, CommandResult, CommandSeq,
+    Component, ComponentFailure, ControllerFrontier, CountForkBarrier, CountForkPermit, CountInput,
+    CountMap, CountOperation, CountOwnerLimits, CountPrepareFailure, EnumerationStatus,
+    EvidenceDomain, FailureClass, ForkBlocked, GenerationRequest, KernelApplicability, LinkId,
+    LinkToken, OpenOutcome, OpenReceipt, OpenRequest, OpenWriteFrontier, OwnerFailure,
+    PendingCommandId, ProgrammedAdmission, RawCheckpoint, RawSnapshot, RawTerminal, ReadRequest,
+    ReadStatus, Ready, ResourceId, StopResult, TerminalId, TerminalRequest, WriterCompletion,
+};
 use crate::discovery::maps;
 use crate::evidence::{
     CandidateCoverage, CandidateIdentity, CounterKind, CounterSource, CounterUnits,
@@ -43,6 +54,10 @@ use crate::evidence::{
 use crate::plan;
 use osslscope_ebpf_common::{CountValue, make_key, split_key};
 use std::collections::{HashMap, HashSet, hash_map::Entry};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::{Duration, Instant};
 
 /// One discovered site: its physical key, the candidate identities
@@ -78,62 +93,138 @@ pub struct CountDelta {
     pub losses: Vec<GapCounter>,
 }
 
-/// Raw output of one backend drain: per-key CPU-folded totals plus
-/// the kernel drop counter and any drain shortfall. Routing (delta
-/// reads, generation split, attribution) lives in the session, not
-/// the backend, so both backends share one routing proof.
-#[derive(Debug, Clone, Default)]
-pub struct DrainedCounts {
-    /// `(COUNTS key, CPU-folded total)` rows with nonzero counts.
-    pub rows: Vec<(u64, CountValue)>,
-    /// Monotonic `DROPFAIL` total (map-full insert failures).
-    pub dropfail_total: u64,
-    /// Monotonic `ADMITTED` total (every hit past TARGET + window).
-    pub admitted_total: u64,
-    pub lat_buckets: [u64; 16],
-    /// Keys left unprocessed when the drain deadline expired.
-    pub shortfall: u64,
+/// A link token carries identity only; the backend owner keeps every FD.
+pub trait CountLink {
+    fn id(&self) -> LinkId;
+}
+impl CountLink for LinkToken {
+    fn id(&self) -> LinkId {
+        self.id()
+    }
 }
 
-/// Kernel side of the count session: attach, window programming and
-/// raw drains. [`LiveBackend`] implements this over aya; tests use
-/// [`FakeCountBackend`].
+/// Timed, data-only controller port. No count descriptor crosses this boundary.
 pub trait CountBackend {
-    /// Attached link handle, held alive by the session (RAII).
-    type Link;
-
-    /// Attach one multi-link group. Returns live links plus the
-    /// positions (into `offsets`/`cookies`) the kernel refused, in
-    /// ascending unique order. The session normalizes defensively,
-    /// so backends SHOULD return sorted indices but a valid backend
-    /// is never misread when it does not.
-    fn attach(
+    type Link: CountLink;
+    fn ready(&self) -> &Ready;
+    fn attach(&mut self, request: AttachRequest) -> CommandResult<AttachAck<Self::Link>>;
+    fn open_window(&mut self, request: OpenRequest) -> CommandResult<OpenReceipt>;
+    fn set_generation(&mut self, request: GenerationRequest) -> CommandResult<()>;
+    fn drain(&mut self, request: ReadRequest) -> CommandResult<Arc<RawSnapshot>>;
+    fn terminal_request(
         &mut self,
-        path: &str,
-        offsets: &[u64],
-        cookies: &[u64],
-    ) -> (Vec<Self::Link>, Vec<usize>);
+        deadline: Instant,
+        frontier: ControllerFrontier,
+    ) -> TerminalRequest;
+    fn terminal(&mut self, request: TerminalRequest) -> RawTerminal;
+    fn progress(&self) -> Option<RawCheckpoint>;
+    fn fork_permit(&self, deadline: Instant) -> Result<CountForkPermit<'_>, ForkBlocked>;
+}
 
-    /// Open the count window: arm `TARGET`, `GEN` and the monotonic
-    /// `[start_ns, deadline_ns)` admission interval.
-    fn open_window(
-        &mut self,
-        tgid: u64,
-        generation: u32,
-        start_ns: u64,
-        deadline_ns: u64,
-    ) -> anyhow::Result<()>;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseReason {
+    Expired,
+    Interrupted,
+    Failure,
+    OwnedExit,
+    SetupAbort,
+    IdentityRecycle,
+}
+#[derive(Debug, Clone, Copy)]
+pub struct CloseRequest {
+    pub started_at: Instant,
+    pub grace: Duration,
+    pub reason: CloseReason,
+}
+#[derive(Debug, Clone)]
+pub struct CountTerminal {
+    pub retained_drain: CountDrain,
+    pub receipt: RawTerminal,
+    pub runtime_failure: Option<OwnerFailure>,
+}
 
-    /// Program a new `GEN` epoch after a fence.
-    fn set_generation(&mut self, generation: u32) -> anyhow::Result<()>;
+/// Session-owned routed facts, checked against the canonical terminal slot.
+/// Incomplete evidence can preserve positives without claiming terminal success.
+pub struct RetainedCaptureCounts {
+    drain: CountDrain,
+    runtime_failure: Option<OwnerFailure>,
+}
+impl RetainedCaptureCounts {
+    pub fn runtime_failure(&self) -> Option<OwnerFailure> {
+        self.runtime_failure
+    }
+    pub fn into_drain(self) -> CountDrain {
+        self.drain
+    }
+}
 
-    /// Close the window in-kernel (`TARGET=0`, drop-all).
-    fn close_window(&mut self) -> anyhow::Result<()>;
+/// Checked command allocation. Terminal identities stay with the owner.
+#[derive(Debug, Default)]
+struct CountIds {
+    command: u64,
+}
+impl CountIds {
+    fn command(&mut self) -> Result<CommandSeq, OwnerFailure> {
+        let next = self
+            .command
+            .checked_add(1)
+            .ok_or_else(|| OwnerFailure::engine(CountOperation::Load, FailureClass::IdExhausted))?;
+        self.command = next;
+        CommandSeq::checked(next)
+    }
+}
 
-    /// Drain raw counts. `deadline` bounds grace drains: keys left
-    /// unread past it count exactly into
-    /// [`DrainedCounts::shortfall`].
-    fn drain(&mut self, deadline: Option<Instant>) -> anyhow::Result<DrainedCounts>;
+#[derive(Debug, Clone)]
+struct PendingAttach {
+    seq: CommandSeq,
+    backing: BackingIdentity,
+    locator: String,
+    positions: Vec<(u64, u32)>,
+    installed_at: u64,
+    deadline: Instant,
+}
+#[derive(Debug, Clone)]
+enum PendingCountTxn {
+    Attach(PendingAttach),
+    Open(OpenRequest),
+    Fence {
+        request: GenerationRequest,
+        reason: FenceReason,
+        old_generation: u32,
+        old_meanings: HashMap<u32, Provenance>,
+        new_meanings: HashMap<u32, PendingMeaning>,
+    },
+    Read(ReadRequest),
+}
+impl PendingCountTxn {
+    fn deadline(&self) -> Instant {
+        match self {
+            Self::Attach(a) => a.deadline,
+            Self::Open(r) => r.deadline,
+            Self::Fence { request, .. } => request.deadline,
+            Self::Read(r) => r.deadline,
+        }
+    }
+    fn id(&self) -> PendingCommandId {
+        match self {
+            Self::Attach(a) => PendingCommandId {
+                seq: a.seq,
+                operation: CountOperation::Attach,
+            },
+            Self::Open(r) => PendingCommandId {
+                seq: r.seq,
+                operation: CountOperation::Open,
+            },
+            Self::Fence { request, .. } => PendingCommandId {
+                seq: request.seq,
+                operation: CountOperation::Generation,
+            },
+            Self::Read(r) => PendingCommandId {
+                seq: r.seq,
+                operation: CountOperation::Read,
+            },
+        }
+    }
 }
 
 /// Why a fence generation boundary was taken. Mapping/exec reasons
@@ -188,20 +279,6 @@ fn fence_candidates_coverage(coverage: CandidateCoverage) -> CandidateCoverage {
     }
 }
 
-/// Normalize backend refuse-indices into per-position flags.
-/// Defensive: out-of-range indices are ignored, order and
-/// duplicates do not matter — a refused site must never read as
-/// attached just because a backend returned an odd list.
-fn normalize_bad(bad: Vec<usize>, n: usize) -> Vec<bool> {
-    let mut out = vec![false; n];
-    for b in bad {
-        if let Some(slot) = out.get_mut(b) {
-            *slot = true;
-        }
-    }
-    out
-}
-
 /// What one [`CountSession::attach_delta`] call did.
 #[derive(Debug, Clone)]
 pub struct AttachReport {
@@ -224,7 +301,7 @@ pub struct AttachReport {
 /// generations (each with the candidate meaning then current), and
 /// typed loss/activity counters. T08 merges window, coverage and
 /// object records around this.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CountDrain {
     pub current: Vec<SiteExecution>,
     pub fenced: Vec<FencedGeneration>,
@@ -330,18 +407,35 @@ fn fold_exec_calls(exec: &mut SiteExecution, delta: u64, first_ns: u64, last_ns:
 
 /// Immutable planner identity + count window session, generic over
 /// the [`CountBackend`]. Owns cookie provenance, generation epochs,
-/// link RAII and drain routing; T08 holds one for the whole
+/// link identities and drain routing; T08 holds one for the whole
 /// observation and feeds it deltas incrementally.
 pub struct CountSession<B: CountBackend> {
     pid: u32,
     backend: B,
     links: Vec<B::Link>,
-    /// Open-file pins behind the links (H4), one per attach call
-    /// that bound ≥1 link. Declared AFTER `links` on purpose:
-    /// fields drop in order, so links detach first and pins
-    /// release after — a pin lives at least as long as every
-    /// link bound through it ("retain until detach").
-    link_pins: Vec<std::os::fd::OwnedFd>,
+    ready: Ready,
+    ids: CountIds,
+    last_acked: Option<CommandSeq>,
+    pending_txn: Option<PendingCountTxn>,
+    programmed: Option<ProgrammedAdmission>,
+    acknowledged_open: Option<OpenReceipt>,
+    last_snapshot: Option<Arc<RawSnapshot>>,
+    terminal_view: Option<CountTerminal>,
+    canonical: Option<TerminalRequest>,
+    runtime_failure: Option<OwnerFailure>,
+    component_failures: [Option<ComponentFailure>; 18],
+    terminal_reconciled: bool,
+    terminal_complete: bool,
+    terminal_inventory_unavailable: bool,
+    lat_available: [bool; 16],
+    lat_final_available: [bool; 16],
+    admitted_available: bool,
+    dropfail_available: bool,
+    admitted_final_available: bool,
+    dropfail_final_available: bool,
+    read_duration_ns: Option<u64>,
+    enumerated: bool,
+    unread_unknown: bool,
     stable: plan::StableCookies,
     provenance: HashMap<u32, Provenance>,
     pending: HashMap<u32, PendingMeaning>,
@@ -404,9 +498,31 @@ impl<B: CountBackend> CountSession<B> {
     pub fn new(pid: u32, backend: B) -> Self {
         Self {
             pid,
+            ready: *backend.ready(),
             backend,
             links: Vec::new(),
-            link_pins: Vec::new(),
+            ids: CountIds::default(),
+            last_acked: None,
+            pending_txn: None,
+            programmed: None,
+            acknowledged_open: None,
+            last_snapshot: None,
+            terminal_view: None,
+            canonical: None,
+            runtime_failure: None,
+            component_failures: [None; 18],
+            terminal_reconciled: false,
+            terminal_complete: false,
+            terminal_inventory_unavailable: false,
+            lat_available: [false; 16],
+            lat_final_available: [false; 16],
+            admitted_available: false,
+            dropfail_available: false,
+            admitted_final_available: false,
+            dropfail_final_available: false,
+            read_duration_ns: None,
+            enumerated: false,
+            unread_unknown: false,
             stable: plan::StableCookies::default(),
             provenance: HashMap::new(),
             pending: HashMap::new(),
@@ -493,9 +609,9 @@ impl<B: CountBackend> CountSession<B> {
     /// surviving triples reuse both and skip re-attach. A changed
     /// candidate set for a live cookie stages a [`PendingMeaning`]
     /// and reports `candidates_changed` — the old meaning stands
-    /// until [`fence`](Self::fence) versions it. Every group pins
-    /// its path (open+fstat) just before attach and the backend
-    /// binds through the fd-path (H4); a pin missing the plan is
+    /// until [`fence`](Self::fence) versions it. The backend owner
+    /// pins each group's locator and checks its planned backing
+    /// before creating links; a pin missing the plan is
     /// skipped as `replaced`, loud, having bound nothing — and
     /// only bound cookies' hits attribute ([`CountSession::route`]
     /// gates on the bound set, so rejected plans' anomaly hits
@@ -510,9 +626,13 @@ impl<B: CountBackend> CountSession<B> {
         live: &[maps::Mapping],
         files: &HashMap<String, plan::FileBytes>,
         installed_at_ns: u64,
+        deadline: Instant,
     ) -> anyhow::Result<AttachReport> {
         if self.closed {
             anyhow::bail!("count session is closed");
+        }
+        for loss in &delta.losses {
+            merge_counter(&mut self.passthrough, loss.clone());
         }
         // Merge duplicate backing triples within one delta: their
         // candidate sets union (a site's aliases are simultaneous,
@@ -646,99 +766,124 @@ impl<B: CountBackend> CountSession<B> {
         // (planned); pushes below (resolve/attach failures) carry
         // their own increment instead.
         self.missed_attaches += report.missed.len() as u64;
-        // H4: attach survivors are skipped; every group pins its
-        // path (open+fstat) BEFORE the backend runs, and the
-        // backend attaches through the fd-path — the kernel binds
-        // the pinned inode, so a mid-attach path move is simply
-        // not observed (no pre/post sampling, no binding check,
-        // no rollback: the fd IS the pin). A pin whose identity
-        // misses the plan (or an unopenable path) rejects the
-        // group having bound nothing (H4-T4).
+        // The owner opens and verifies the locator. This session retains only
+        // immutable planned membership and data-only acknowledged tokens.
         for group in plan::groups(&planned) {
-            let mut offs: Vec<u64> = Vec::new();
-            let mut cks: Vec<u64> = Vec::new();
-            let mut survivors: Vec<(u64, u32)> = Vec::new();
-            for (offset, cookie) in group.offsets.iter().zip(group.cookies.iter()) {
-                let cookie = *cookie as u32;
+            let mut survivors = Vec::new();
+            for (offset, cookie) in group.offsets.iter().zip(&group.cookies) {
+                let cookie = u32::try_from(*cookie)?;
                 let Some(prov) = self.provenance.get(&cookie) else {
                     continue;
                 };
-                let key = (prov.site.device, prov.site.inode, *offset);
-                if self.attached.contains(&key) {
+                if self
+                    .attached
+                    .contains(&(prov.site.device, prov.site.inode, *offset))
+                {
                     report.reused += 1;
-                    continue;
+                } else {
+                    survivors.push((*offset, cookie));
                 }
-                survivors.push((*offset, cookie));
             }
-            if survivors.is_empty() {
-                continue;
-            }
-            let pin = match plan::resolve_pinned(&group.path) {
-                Ok(pin) => pin,
-                Err(_) => {
-                    for (offset, cookie) in &survivors {
-                        let Some(prov) = self.provenance.get(cookie) else {
-                            continue;
-                        };
-                        report.missed.push(plan::Missed {
-                            dev: plan::render_device(prov.site.device),
-                            ino: prov.site.inode,
-                            offset: *offset,
-                            reason: "unreadable",
-                        });
-                        self.missed_attaches += 1;
-                    }
-                    continue;
-                }
-            };
-            for (offset, cookie) in &survivors {
-                let Some(prov) = self.provenance.get(cookie) else {
+            for positions in survivors.chunks(8192) {
+                let Some((_, first)) = positions.first() else {
                     continue;
                 };
-                // One fstat (the pin's) serves every cookie in the
-                // group: no per-cookie re-open, no TOCTOU between
-                // cookies — the sample point is the single open.
-                if pin.device == prov.site.device && pin.ino == prov.site.inode {
-                    offs.push(*offset);
-                    cks.push(*cookie as u64);
-                } else {
-                    report.missed.push(plan::Missed {
-                        dev: plan::render_device(prov.site.device),
-                        ino: prov.site.inode,
-                        offset: *offset,
-                        reason: "replaced",
-                    });
-                    self.missed_attaches += 1;
+                let prov = &self.provenance[first];
+                let backing = BackingIdentity {
+                    device: prov.site.device,
+                    inode: prov.site.inode,
+                };
+                let seq = self.next_command(deadline)?;
+                let pending = PendingAttach {
+                    seq,
+                    backing,
+                    locator: group.path.clone(),
+                    positions: positions.to_vec(),
+                    installed_at: installed_at_ns,
+                    deadline,
+                };
+                let request = AttachRequest {
+                    seq,
+                    deadline,
+                    expected_backing: backing,
+                    locator: group.path.clone(),
+                    offsets: positions.iter().map(|p| p.0).collect(),
+                    cookies: positions.iter().map(|p| u64::from(p.1)).collect(),
+                };
+                self.pending_txn = Some(PendingCountTxn::Attach(pending.clone()));
+                let ack = match self.backend.attach(request) {
+                    Ok(ack) if ack.seq == seq => ack.value,
+                    Ok(_) => return self.invalid_command(CountOperation::Attach, deadline),
+                    Err(failure) => return self.command_failed(failure),
+                };
+                let mut previous = None;
+                for refusal in &ack.refused {
+                    if refusal.position >= positions.len()
+                        || previous.is_some_and(|p| p >= refusal.position)
+                    {
+                        return self.invalid_command(CountOperation::Attach, deadline);
+                    }
+                    previous = Some(refusal.position);
+                }
+                let ids: Vec<_> = ack.links.iter().map(CountLink::id).collect();
+                if ids.iter().enumerate().any(|(i, id)| {
+                    id.owner_epoch != self.ready.owner_epoch
+                        || ids[..i].contains(id)
+                        || self.links.iter().any(|l| l.id() == *id)
+                }) || (ack.links.is_empty() && ack.refused.len() != positions.len())
+                {
+                    return self.invalid_command(CountOperation::Attach, deadline);
+                }
+                for (i, position) in positions.iter().enumerate() {
+                    if let Some(refusal) = ack.refused.iter().find(|r| r.position == i) {
+                        match refusal.reason {
+                            AttachRefusalReason::Unreadable | AttachRefusalReason::Replaced => {
+                                report.missed.push(plan::Missed {
+                                    dev: plan::render_device(backing.device),
+                                    ino: backing.inode,
+                                    offset: position.0,
+                                    reason: if refusal.reason == AttachRefusalReason::Unreadable {
+                                        "unreadable"
+                                    } else {
+                                        "replaced"
+                                    },
+                                });
+                                self.missed_attaches = self.missed_attaches.saturating_add(1);
+                            }
+                            AttachRefusalReason::KernelRefused | AttachRefusalReason::Capacity => {
+                                report.unresolved += 1;
+                                self.unresolved = self.unresolved.saturating_add(1);
+                            }
+                        }
+                        if refusal.reason == AttachRefusalReason::Capacity {
+                            self.record_loss("count.owner_capacity", CounterSource::Attach, 1);
+                            self.runtime_failure.get_or_insert(OwnerFailure::engine(
+                                CountOperation::Attach,
+                                FailureClass::Capacity,
+                            ));
+                        }
+                    } else {
+                        self.bind_position(&pending, *position);
+                        report.attached += 1;
+                    }
+                }
+                self.links.extend(ack.links);
+                self.last_acked = Some(seq);
+                self.pending_txn = None;
+                if ack
+                    .refused
+                    .iter()
+                    .any(|r| r.reason == AttachRefusalReason::Capacity)
+                {
+                    self.closed = true;
+                    self.canonical = Some(self.backend.terminal_request(deadline, self.frontier()));
+                    return Err(OwnerFailure::engine(
+                        CountOperation::Attach,
+                        FailureClass::Capacity,
+                    )
+                    .into());
                 }
             }
-            if offs.is_empty() {
-                continue;
-            }
-            let (links, bad) = self.backend.attach(&pin.link_path(), &offs, &cks);
-            if !links.is_empty() {
-                self.link_pins.push(pin.fd);
-            }
-            self.links.extend(links);
-            let refused = normalize_bad(bad, offs.len());
-            for (j, (offset, cookie)) in offs.iter().zip(cks.iter()).enumerate() {
-                if refused[j] {
-                    report.unresolved += 1;
-                    self.unresolved += 1;
-                    continue;
-                }
-                let cookie = *cookie as u32;
-                if let Some(prov) = self.provenance.get_mut(&cookie) {
-                    self.attached
-                        .insert((prov.site.device, prov.site.inode, *offset));
-                    self.bound.insert(cookie);
-                    prov.link_path = group.path.clone();
-                    prov.installed_at = Some(installed_at_ns);
-                    report.attached += 1;
-                }
-            }
-        }
-        for loss in &delta.losses {
-            merge_counter(&mut self.passthrough, loss.clone());
         }
         Ok(report)
     }
@@ -749,44 +894,105 @@ impl<B: CountBackend> CountSession<B> {
     /// declared interval; an empty or inverted window is a
     /// fail-closed error. Called once per session, at target release
     /// (T08); attach deltas may precede or follow it.
-    pub fn open_window(&mut self, start_ns: u64, deadline_ns: u64) -> anyhow::Result<()> {
-        if self.closed {
-            anyhow::bail!("count session is closed");
+    pub fn open_window(
+        &mut self,
+        start_ns: u64,
+        deadline_ns: u64,
+        deadline: Instant,
+    ) -> anyhow::Result<()> {
+        self.ensure_active()?;
+        if self.window_open || start_ns >= deadline_ns {
+            anyhow::bail!("invalid or already open count window");
         }
-        if self.window_open {
-            anyhow::bail!("count window is already open");
+        let seq = self.next_command(deadline)?;
+        let request = OpenRequest {
+            seq,
+            deadline,
+            tgid: u64::from(self.pid),
+            generation: self.generation,
+            start_ns,
+            deadline_ns,
+        };
+        self.pending_txn = Some(PendingCountTxn::Open(request));
+        match self.backend.open_window(request) {
+            Ok(ack) if ack.seq == seq => match ack
+                .value
+                .programmed_admission(self.ready.owner_epoch, &request)
+            {
+                Ok(admission) => {
+                    self.acknowledged_open = Some(ack.value);
+                    self.programmed = Some(admission);
+                    self.window_open = true;
+                    self.last_acked = Some(seq);
+                    self.pending_txn = None;
+                    Ok(())
+                }
+                Err(_) => self.invalid_command(CountOperation::Open, deadline),
+            },
+            Ok(_) => self.invalid_command(CountOperation::Open, deadline),
+            Err(failure) => self.command_failed(failure),
         }
-        if start_ns >= deadline_ns {
-            anyhow::bail!("empty count window: start {start_ns} >= deadline {deadline_ns}");
-        }
-        self.backend
-            .open_window(self.pid as u64, self.generation, start_ns, deadline_ns)?;
-        self.window_open = true;
-        Ok(())
     }
 
-    /// Drain-then-fence: drain fully, bucket the current generation
-    /// with the candidate meaning then current, retire every known
-    /// cookie's meaning for exact straggler routing, apply staged
-    /// attribution updates to the new generation, and bump `GEN`.
-    /// The fenced bucket always exists (possibly empty) so the
-    /// generation sequence stays auditable.
-    pub fn fence(&mut self, reason: FenceReason) -> anyhow::Result<()> {
-        if self.closed {
-            anyhow::bail!("count session is closed");
+    pub fn fence(&mut self, reason: FenceReason, deadline: Instant) -> anyhow::Result<()> {
+        self.ensure_active()?;
+        let seq = self.next_command(deadline)?;
+        let read = ReadRequest { seq, deadline };
+        self.pending_txn = Some(PendingCountTxn::Read(read));
+        match self.backend.drain(read) {
+            Ok(ack) if ack.seq == seq => {
+                self.route_snapshot(ack.value);
+                self.last_acked = Some(seq);
+                self.pending_txn = None;
+            }
+            Ok(_) => return self.invalid_command(CountOperation::Read, deadline),
+            Err(failure) => return self.command_failed(failure),
         }
-        let drained = self.backend.drain(None)?;
-        let _ = self.route(drained);
-        let next = self
-            .generation
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("generation space exhausted"))?;
-        // Commit the kernel epoch BEFORE userspace state: if
-        // `set_generation` fails the session is untouched (still the
-        // old generation everywhere, current counts intact) and the
-        // fence is cleanly retryable. Committing userspace first
-        // would strand a usable session on a stale kernel epoch.
-        self.backend.set_generation(next)?;
+        let Some(next) = self.generation.checked_add(1) else {
+            return self.invalid_command(CountOperation::Generation, deadline);
+        };
+        let seq = self.next_command(deadline)?;
+        let request = GenerationRequest {
+            seq,
+            deadline,
+            generation: next,
+        };
+        self.pending_txn = Some(PendingCountTxn::Fence {
+            request,
+            reason,
+            old_generation: self.generation,
+            old_meanings: self.provenance.clone(),
+            new_meanings: self.pending.clone(),
+        });
+        match self.backend.set_generation(request) {
+            Ok(ack) if ack.seq == seq => {
+                self.last_acked = Some(seq);
+                self.commit_pending_fence();
+                Ok(())
+            }
+            Ok(_) => self.invalid_command(CountOperation::Generation, deadline),
+            Err(failure) => self.command_failed(failure),
+        }
+    }
+
+    fn commit_pending_fence(&mut self) {
+        let Some(PendingCountTxn::Fence {
+            request,
+            reason,
+            old_generation,
+            old_meanings,
+            new_meanings,
+        }) = self.pending_txn.take()
+        else {
+            return;
+        };
+        if self.generation != old_generation {
+            self.record_loss("count.reference_inventory_invalid", CounterSource::Drain, 1);
+            return;
+        }
+        let next = request.generation;
+        self.provenance = old_meanings;
+        self.pending = new_meanings;
         // Seal reads LIVE provenance (pending applies below, after
         // the seal): staged identity changes are the NEW
         // generation's meaning and must not relabel old counts.
@@ -845,50 +1051,475 @@ impl<B: CountBackend> CountSession<B> {
         // plan, and stale plans miss `replaced` per attempt.
         self.generation = next;
         self.fences += 1;
-        Ok(())
     }
 
-    /// Close future admission with `TARGET=0`, then collect bounded
-    /// count-map snapshots under the grace deadline and finalize the
-    /// [`CountDrain`]. Keys left unread at expiry contribute drain
-    /// shortfall. Up to three passes run while routed row deltas make
-    /// progress; this is not an in-flight callback completion barrier.
-    /// A zero-progress or final pass can precede a previously admitted
-    /// increment. The backend already samples the independent ADMITTED
-    /// ledger: no-shortfall drains publish `count.ledger_delta`, while
-    /// shortfall publishes unreconciled activity. Those sampled totals
-    /// do not prove terminal quiescence or eliminate post-scan tails.
-    /// Consumes the session for further attach/fence calls.
-    pub fn close_and_drain(&mut self, grace: Duration) -> anyhow::Result<CountDrain> {
-        if self.closed {
-            anyhow::bail!("count session is already drained");
+    pub fn programmed_admission(&self) -> Option<&ProgrammedAdmission> {
+        self.programmed.as_ref()
+    }
+    pub fn terminal_id(&self) -> Option<TerminalId> {
+        self.canonical.as_ref().map(|t| t.id)
+    }
+    pub fn fork_permit(&self, deadline: Instant) -> Result<CountForkPermit<'_>, ForkBlocked> {
+        self.backend.fork_permit(deadline)
+    }
+
+    fn ensure_active(&self) -> anyhow::Result<()> {
+        if self.closed || self.pending_txn.is_some() {
+            anyhow::bail!("count session is sealed or has an unresolved operation");
         }
-        self.backend.close_window()?;
+        Ok(())
+    }
+    fn next_command(&mut self, deadline: Instant) -> anyhow::Result<CommandSeq> {
+        self.ensure_active()?;
+        match self.ids.command() {
+            Ok(seq) => Ok(seq),
+            Err(failure) => {
+                self.runtime_failure = Some(failure);
+                self.terminal(CloseRequest {
+                    started_at: deadline,
+                    grace: Duration::ZERO,
+                    reason: CloseReason::Failure,
+                });
+                Err(failure.into())
+            }
+        }
+    }
+    fn invalid_command<T>(
+        &mut self,
+        operation: CountOperation,
+        deadline: Instant,
+    ) -> anyhow::Result<T> {
+        let failure = OwnerFailure::engine(operation, FailureClass::Inventory);
+        self.runtime_failure.get_or_insert(failure);
+        self.closed = true;
+        self.record_loss("count.reference_inventory_invalid", CounterSource::Drain, 1);
+        self.canonical = Some(self.backend.terminal_request(deadline, self.frontier()));
+        Err(failure.into())
+    }
+    fn command_failed<T>(&mut self, failure: CommandFailure) -> anyhow::Result<T> {
+        self.closed = true;
+        if let Some(loss) = failure.capacity_loss() {
+            merge_counter(&mut self.passthrough, loss);
+        }
+        if !matches!(failure.failure.class, FailureClass::Deadline) {
+            self.runtime_failure.get_or_insert(failure.failure);
+        }
+        let deadline = self
+            .pending_txn
+            .as_ref()
+            .map(PendingCountTxn::deadline)
+            .unwrap_or_else(Instant::now);
+        if failure.failure.operation == CountOperation::Read {
+            if let Some(checkpoint) = self.backend.progress() {
+                if checkpoint.published_at < deadline
+                    && checkpoint.phase == OwnerPhase::Snapshotting
+                {
+                    self.route_snapshot(checkpoint.snapshot);
+                }
+            }
+        }
+        if failure.completion == CommandCompletion::NotEntered {
+            self.pending_txn = None;
+        }
+        let request = self.backend.terminal_request(deadline, self.frontier());
+        self.canonical = Some(request);
+        Err(failure.failure.into())
+    }
+    fn bind_position(&mut self, pending: &PendingAttach, (offset, cookie): (u64, u32)) {
+        if let Some(prov) = self.provenance.get_mut(&cookie) {
+            if prov.site.device != pending.backing.device
+                || prov.site.inode != pending.backing.inode
+                || prov.site.offset != offset
+            {
+                return;
+            }
+            self.attached
+                .insert((prov.site.device, prov.site.inode, offset));
+            self.bound.insert(cookie);
+            if prov.installed_at.is_none() {
+                prov.link_path = pending.locator.clone();
+                prov.installed_at = Some(pending.installed_at);
+            }
+        }
+    }
+    fn record_loss(&mut self, name: &str, source: CounterSource, value: u64) {
+        // Terminal classes are flags, never multiplied by salvage or repeated components.
+        if let Some(old) = self
+            .passthrough
+            .iter_mut()
+            .find(|c| c.name == name && c.source == source)
+        {
+            old.value = old.value.max(value);
+        } else {
+            self.passthrough.push(counter(
+                name,
+                CounterKind::Loss,
+                CounterUnits::Events,
+                source,
+                value,
+            ));
+        }
+    }
+    fn frontier(&self) -> ControllerFrontier {
+        ControllerFrontier {
+            last_acked: self.last_acked,
+            acknowledged_links: self.links.iter().map(CountLink::id).collect(),
+            pending: self.pending_txn.as_ref().map(PendingCountTxn::id),
+        }
+    }
+
+    pub fn terminal(&mut self, request: CloseRequest) -> CountTerminal {
+        if let Some(view) = &self.terminal_view {
+            return view.clone();
+        }
+        self.closed = true;
         self.window_open = false;
-        let deadline = Instant::now().checked_add(grace);
-        // Bounded multi-pass drain: at most three passes, stopping
-        // on zero routed row delta, grace expiry, or shortfall
-        // (re-scanning an expired drain would recount shortfall).
-        let mut progress = true;
-        let mut passes = 0u32;
-        let mut pass_ns_total = 0u64;
-        let mut pass_ns_max = 0u64;
-        while progress && passes < 3 {
-            let t0 = Instant::now();
-            let drained = self.backend.drain(deadline)?;
-            let dt = t0.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
-            pass_ns_total = pass_ns_total.saturating_add(dt);
-            pass_ns_max = pass_ns_max.max(dt);
-            let had_shortfall = drained.shortfall > 0;
-            progress = self.route(drained);
-            passes += 1;
-            if had_shortfall {
-                break;
+        let deadline = request
+            .started_at
+            .checked_add(request.grace)
+            .unwrap_or_else(|| {
+                self.runtime_failure.get_or_insert(OwnerFailure::engine(
+                    CountOperation::Stop,
+                    FailureClass::DeadlineOverflow,
+                ));
+                request.started_at
+            });
+        let frontier = self.frontier();
+        let expected = self.backend.terminal_request(deadline, frontier.clone());
+        self.canonical = Some(expected.clone());
+        let receipt = self.backend.terminal(expected.clone());
+        self.lat_final_available = [false; 16];
+        self.admitted_final_available = false;
+        self.dropfail_final_available = false;
+        let binding_valid = expected.id.owner_epoch == self.ready.owner_epoch
+            && expected.frontier == frontier
+            && expected.evidence_domain == self.ready.evidence_domain
+            && expected.writer_object_identity == self.ready.writer_object_identity
+            && receipt.owner_epoch == self.ready.owner_epoch
+            && receipt.terminal_id == expected.id
+            && receipt.deadline == expected.deadline
+            && receipt.evidence_domain == self.ready.evidence_domain
+            && receipt.writer_object_identity == self.ready.writer_object_identity
+            && receipt.writer_family == self.ready.dimensions
+            && self
+                .acknowledged_open
+                .is_none_or(|open| receipt.resolved_open == Some(open))
+            && receipt.cleanup_ticket
+                == (CleanupTicket {
+                    owner_epoch: expected.id.owner_epoch,
+                    terminal_id: expected.id,
+                });
+        let validation = validate_terminal(&expected, &receipt);
+        self.terminal_inventory_unavailable = binding_valid
+            && validation == Err(ReceiptFailure::Inventory)
+            && receipt.inventory.is_none()
+            && matches!(
+                receipt.writers,
+                WriterCompletion::Unknown(QuiescenceReason::Deadline | QuiescenceReason::Owner)
+            )
+            && receipt
+                .failures
+                .operations
+                .iter()
+                .flatten()
+                .all(|failure| failure.class == FailureClass::Deadline);
+        let mut valid = validation.is_ok() && binding_valid;
+        if valid {
+            valid = self.resolve_pending(&receipt);
+        }
+        if valid {
+            if let Some(checkpoint) = &receipt.checkpoint {
+                if checkpoint.published_at < receipt.deadline {
+                    self.route_snapshot(checkpoint.snapshot.clone());
+                }
             }
-            if deadline.is_some_and(|d| Instant::now() >= d) {
-                break;
+            self.read_duration_ns = receipt
+                .snapshot_binding
+                .and_then(|b| b.completed_at.checked_duration_since(b.started_at))
+                .map(|d| d.as_nanos().min(u128::from(u64::MAX)) as u64);
+        } else {
+            self.record_loss("count.reference_inventory_invalid", CounterSource::Drain, 1);
+        }
+        let known_empty = valid && matches!(receipt.writers, WriterCompletion::KnownEmpty(_));
+        self.unread_unknown = !known_empty
+            && matches!(
+                receipt.read_status,
+                ReadStatus::NotStarted
+                    | ReadStatus::Incomplete {
+                        enumeration: EnumerationStatus::Unfinished
+                    }
+            );
+        let unresolved_meaning = matches!(
+            self.pending_txn,
+            Some(PendingCountTxn::Fence { .. } | PendingCountTxn::Open(_))
+        );
+        if unresolved_meaning {
+            self.record_loss("count.reference_inventory_invalid", CounterSource::Drain, 1);
+        }
+        let finished = valid
+            && !unresolved_meaning
+            && matches!(receipt.writers, WriterCompletion::Finished(_));
+        self.terminal_reconciled = finished
+            && receipt.read_status == ReadStatus::Complete
+            && receipt.checkpoint.as_ref().is_some_and(|c| {
+                self.last_snapshot
+                    .as_ref()
+                    .is_some_and(|s| s.sequence == c.snapshot.sequence)
+                    && matches!(c.snapshot.admitted, Component::Available(_))
+                    && matches!(c.snapshot.dropfail, Component::Available(_))
+                    && c.snapshot
+                        .latc
+                        .iter()
+                        .all(|v| matches!(v, Component::Available(_)))
+                    && c.snapshot.enumeration == (EnumerationStatus::Complete { unread_keys: 0 })
+            });
+        self.terminal_complete = known_empty || self.terminal_reconciled;
+        if !known_empty {
+            if !finished {
+                self.record_loss("count.quiescence_unknown", CounterSource::Drain, 1);
+            }
+            if !valid
+                || matches!(
+                    receipt.writers,
+                    WriterCompletion::Unknown(
+                        QuiescenceReason::Inventory
+                            | QuiescenceReason::References
+                            | QuiescenceReason::ObjectDrift
+                    )
+                )
+            {
+                self.record_loss("count.reference_inventory_invalid", CounterSource::Drain, 1);
+            }
+            if receipt.close_outcomes.iter().any(|c| c.errno.is_some())
+                || receipt
+                    .failures
+                    .operations
+                    .iter()
+                    .flatten()
+                    .any(|f| f.operation == CountOperation::Close)
+            {
+                self.record_loss("count.close_failed", CounterSource::Drain, 1);
+            }
+            if receipt.read_status != ReadStatus::Complete
+                || receipt.failures.components.iter().any(Option::is_some)
+            {
+                self.record_loss("count.drain_read_failed", CounterSource::Drain, 1);
+            }
+            match receipt.read_status {
+                ReadStatus::Incomplete {
+                    enumeration: EnumerationStatus::Complete { .. },
+                } => {}
+                ReadStatus::NotStarted
+                | ReadStatus::Incomplete {
+                    enumeration: EnumerationStatus::Unfinished,
+                } => self.record_loss("count.drain_unenumerated", CounterSource::Drain, 1),
+                _ => {}
+            }
+            if !matches!(receipt.seal, SealBracket { before_ns: Some(before), after_ns: Some(after), result: StopResult::Stopped } if before <= after)
+            {
+                self.record_loss("count.close_time_uncertain", CounterSource::Drain, 1);
             }
         }
+        for failure in receipt.failures.operations.iter().flatten() {
+            if !matches!(failure.class, FailureClass::Deadline) {
+                self.runtime_failure.get_or_insert(*failure);
+            }
+        }
+        for failure in receipt
+            .failures
+            .components
+            .iter()
+            .chain(self.component_failures.iter())
+            .flatten()
+        {
+            if let Some(class) = failure
+                .class
+                .filter(|class| *class != FailureClass::Deadline)
+            {
+                self.runtime_failure.get_or_insert(OwnerFailure {
+                    operation: failure.operation,
+                    resource: ResourceId::Map(failure.map),
+                    class,
+                    errno: failure.errno,
+                });
+            }
+        }
+        if let StopResult::Failed(failure) = receipt.seal.result {
+            self.runtime_failure.get_or_insert(failure);
+        }
+        if !valid && !self.terminal_inventory_unavailable {
+            self.runtime_failure.get_or_insert(OwnerFailure::engine(
+                CountOperation::Stop,
+                FailureClass::Inventory,
+            ));
+        }
+        if self.runtime_failure.is_some() {
+            self.record_loss("count.owner_failed", CounterSource::Drain, 1);
+        }
+        let view = CountTerminal {
+            retained_drain: self.retained_drain(),
+            receipt,
+            runtime_failure: self.runtime_failure,
+        };
+        self.terminal_view = Some(view.clone());
+        view
+    }
+
+    fn resolve_pending(&mut self, receipt: &RawTerminal) -> bool {
+        let Some(pending) = self.pending_txn.clone() else {
+            return true;
+        };
+        let Some(inventory) = &receipt.inventory else {
+            return true;
+        };
+        let mut valid = true;
+        match pending {
+            PendingCountTxn::Fence { request, .. } => {
+                if inventory.last_completed
+                    == Some(PendingCommandId {
+                        seq: request.seq,
+                        operation: CountOperation::Generation,
+                    })
+                    && receipt.last_command_seq == Some(request.seq)
+                    && receipt.failures.operations[CountOperation::Generation as usize].is_none()
+                    && !self
+                        .runtime_failure
+                        .is_some_and(|f| f.operation == CountOperation::Generation)
+                {
+                    self.commit_pending_fence();
+                }
+            }
+            PendingCountTxn::Open(request) => {
+                if let Some(open) = receipt.resolved_open {
+                    if let Ok(admission) =
+                        open.programmed_admission(self.ready.owner_epoch, &request)
+                    {
+                        self.acknowledged_open = Some(open);
+                        self.programmed = Some(admission);
+                        self.pending_txn = None;
+                    }
+                }
+            }
+            PendingCountTxn::Attach(attach) => {
+                for record in &receipt.manifest {
+                    if record.command != attach.seq {
+                        continue;
+                    }
+                    if record.backing != attach.backing
+                        || record.outcome != CreateOutcome::Succeeded
+                    {
+                        valid = false;
+                        self.runtime_failure.get_or_insert(OwnerFailure::engine(
+                            CountOperation::Attach,
+                            FailureClass::Inventory,
+                        ));
+                        self.record_loss(
+                            "count.reference_inventory_invalid",
+                            CounterSource::Drain,
+                            1,
+                        );
+                        continue;
+                    }
+                    for member in &inventory.memberships[record.memberships.clone()] {
+                        if let Some(position) = attach.positions.iter().find(|(off, cookie)| {
+                            *off == member.offset && u64::from(*cookie) == member.cookie
+                        }) {
+                            self.bind_position(&attach, *position);
+                        } else {
+                            valid = false;
+                            self.runtime_failure.get_or_insert(OwnerFailure::engine(
+                                CountOperation::Attach,
+                                FailureClass::Inventory,
+                            ));
+                            self.record_loss(
+                                "count.reference_inventory_invalid",
+                                CounterSource::Drain,
+                                1,
+                            );
+                        }
+                    }
+                }
+            }
+            PendingCountTxn::Read(_) => {}
+        }
+        valid
+    }
+
+    /// Pure replay of the selected envelope. No backend or clock access.
+    pub fn salvage_view(&self, terminal_id: TerminalId) -> CountTerminal {
+        let view = self
+            .terminal_view
+            .as_ref()
+            .expect("terminal must be selected before salvage");
+        assert_eq!(
+            Some(terminal_id),
+            self.terminal_id(),
+            "foreign terminal identity"
+        );
+        view.clone()
+    }
+
+    /// Pure adapter for capture's temporary bridge. It exposes only facts that
+    /// this session already routed, never rows from an unvalidated receipt.
+    pub fn retained_for_capture(
+        &self,
+        id: TerminalId,
+    ) -> Result<RetainedCaptureCounts, OwnerFailure> {
+        let fail = || OwnerFailure::engine(CountOperation::Stop, FailureClass::Inventory);
+        let expected = self.canonical.as_ref().ok_or_else(fail)?;
+        let view = self.terminal_view.as_ref().ok_or_else(fail)?;
+        if id != expected.id
+            || expected.id.owner_epoch != self.ready.owner_epoch
+            || expected.writer_object_identity != self.ready.writer_object_identity
+            || expected.evidence_domain != self.ready.evidence_domain
+        {
+            return Err(fail());
+        }
+        // Contradictory validation remains fatal. An unavailable journal at a
+        // deadline preserves prior facts with loss and no completion authority.
+        let runtime_failure = if validate_terminal(expected, &view.receipt).is_err()
+            && !self.terminal_inventory_unavailable
+        {
+            Some(view.runtime_failure.unwrap_or_else(fail))
+        } else {
+            view.runtime_failure
+        };
+        Ok(RetainedCaptureCounts {
+            drain: view.retained_drain.clone(),
+            runtime_failure,
+        })
+    }
+
+    /// Temporary structured capture adapter. Re-entry uses only the selected
+    /// session view and never samples another deadline or touches the backend.
+    pub fn close_for_capture(
+        &mut self,
+        grace: Duration,
+    ) -> Result<RetainedCaptureCounts, OwnerFailure> {
+        if self.terminal_view.is_none() {
+            self.terminal(CloseRequest {
+                started_at: Instant::now(),
+                grace,
+                reason: CloseReason::Failure,
+            });
+        }
+        self.retained_for_capture(self.terminal_id().expect("selected terminal"))
+    }
+
+    /// Temporary capture bridge; Task 10 removes it after envelope integration.
+    pub fn close_and_drain(&mut self, grace: Duration) -> anyhow::Result<CountDrain> {
+        let view = self.terminal(CloseRequest {
+            started_at: Instant::now(),
+            grace,
+            reason: CloseReason::Expired,
+        });
+        if view.runtime_failure.is_some() || !self.terminal_complete {
+            anyhow::bail!("count terminal is incomplete or unproven");
+        }
+        Ok(view.retained_drain)
+    }
+
+    fn retained_drain(&self) -> CountDrain {
         let mut current: Vec<SiteExecution> = Vec::new();
         for (cookie, total) in &self.current {
             if total.count == 0 {
@@ -982,21 +1613,21 @@ impl<B: CountBackend> CountSession<B> {
                 CounterKind::Activity,
                 CounterUnits::Events,
                 CounterSource::Drain,
-                u64::from(passes),
+                u64::from(self.last_snapshot.is_some()),
             ),
             counter(
                 "count.drain_pass_ns_total",
                 CounterKind::Activity,
                 CounterUnits::Events,
                 CounterSource::Drain,
-                pass_ns_total,
+                self.read_duration_ns.unwrap_or(0),
             ),
             counter(
                 "count.drain_pass_ns_max",
                 CounterKind::Activity,
                 CounterUnits::Events,
                 CounterSource::Drain,
-                pass_ns_max,
+                self.read_duration_ns.unwrap_or(0),
             ),
             counter(
                 "count.drain_rss_bytes",
@@ -1012,6 +1643,9 @@ impl<B: CountBackend> CountSession<B> {
         // the clamp bucket reports u64::MAX). Empty histogram
         // scores 0/0 with 0 samples (nothing measured, not "fast").
         for (k, n) in self.lat_cum.iter().enumerate() {
+            if !self.lat_available[k] || (!self.lat_final_available[k] && *n == 0) {
+                continue;
+            }
             let bucket_name = format!("count.lat_bucket_{k:02}");
             counters.push(counter(
                 bucket_name.as_str(),
@@ -1021,12 +1655,12 @@ impl<B: CountBackend> CountSession<B> {
                 *n,
             ));
         }
-        let lat_total: u64 = self.lat_cum.iter().sum();
+        let lat_total: u64 = self.lat_cum.iter().fold(0u64, |a, n| a.saturating_add(*n));
         let (mut lat_median, mut lat_p99) = (0u64, 0u64);
         if lat_total > 0 {
             let mut acc = 0u64;
             let half = lat_total.div_ceil(2);
-            let rank99 = (lat_total.saturating_mul(99)).div_ceil(100).max(1);
+            let rank99 = ((u128::from(lat_total) * 99).div_ceil(100) as u64).max(1);
             for (k, n) in self.lat_cum.iter().enumerate() {
                 acc = acc.saturating_add(*n);
                 let edge = if k >= 15 { u64::MAX } else { 1u64 << (k + 1) };
@@ -1043,6 +1677,9 @@ impl<B: CountBackend> CountSession<B> {
             ("count.lat_median_ns", lat_median),
             ("count.lat_p99_ns", lat_p99),
         ] {
+            if !self.terminal_reconciled || !self.lat_final_available.iter().all(|v| *v) {
+                continue;
+            }
             counters.push(counter(
                 name,
                 CounterKind::Activity,
@@ -1068,7 +1705,7 @@ impl<B: CountBackend> CountSession<B> {
             }
         }
         let accounted = routed.saturating_add(self.dropfail);
-        if self.shortfall == 0 {
+        if self.terminal_reconciled && self.shortfall == 0 {
             counters.push(counter(
                 "count.ledger_delta",
                 CounterKind::Loss,
@@ -1087,12 +1724,27 @@ impl<B: CountBackend> CountSession<B> {
         }
         counters.extend(self.passthrough.iter().cloned());
         counters.sort();
-        self.closed = true;
-        Ok(CountDrain {
+        if !self.admitted_available || (!self.admitted_final_available && self.admitted == 0) {
+            counters.retain(|c| {
+                c.name != "count.ledger_admitted" && c.name != "count.ledger_unreconciled"
+            });
+        }
+        if !self.dropfail_available || (!self.dropfail_final_available && self.dropfail == 0) {
+            counters.retain(|c| c.name != "count.map_insert_dropped");
+        }
+        if !self.enumerated || (self.unread_unknown && self.shortfall == 0) {
+            counters.retain(|c| c.name != "count.drain_shortfall");
+        }
+        if self.read_duration_ns.is_none() {
+            counters.retain(|c| {
+                c.name != "count.drain_pass_ns_total" && c.name != "count.drain_pass_ns_max"
+            });
+        }
+        CountDrain {
             current,
             fenced: self.fenced.clone(),
             counters,
-        })
+        }
     }
 
     /// Own-process RSS in bytes (Linux-only sampler for the c8
@@ -1120,17 +1772,35 @@ impl<B: CountBackend> CountSession<B> {
     /// and candidate meaning it never had. Every drained delta lands
     /// in exactly one bucket — current, fenced, or unattributed —
     /// so counts are conserved per generation. Returns whether any
-    /// count delta routed (the bounded close-drain loop's progress bit).
-    fn route(&mut self, drained: DrainedCounts) -> bool {
+    /// count delta routed. Snapshot identity and cumulative high-water marks
+    /// make every replay data-only, without a repeat-until-equal close scan.
+    fn route_snapshot(&mut self, snapshot: Arc<RawSnapshot>) -> bool {
+        if self
+            .last_snapshot
+            .as_ref()
+            .is_some_and(|last| snapshot.sequence <= last.sequence)
+        {
+            return false;
+        }
+        let mut keys = HashSet::new();
+        if snapshot.rows.iter().any(|(key, value)| {
+            !keys.insert(*key) || (value.count > 0 && value.first_ns > value.last_ns)
+        }) {
+            self.record_loss("count.drain_read_failed", CounterSource::Drain, 1);
+            return false;
+        }
+        let drained = &snapshot;
+
         let mut progress = false;
-        self.drained_keys += drained.rows.len() as u64;
-        for (key, total) in drained.rows {
+        self.drained_keys = self.drained_keys.saturating_add(drained.rows.len() as u64);
+        for (key, total) in &drained.rows {
             if total.count == 0 {
                 continue;
             }
-            let (cookie, generation) = split_key(key);
-            let prev = self.seen.insert((cookie, generation), total.count);
-            let delta = total.count.saturating_sub(prev.unwrap_or(0));
+            let (cookie, generation) = split_key(*key);
+            let prev = self.seen.entry((cookie, generation)).or_default();
+            let delta = total.count.saturating_sub(*prev);
+            *prev = (*prev).max(total.count);
             if delta == 0 {
                 continue;
             }
@@ -1138,7 +1808,7 @@ impl<B: CountBackend> CountSession<B> {
             if !self.known.contains(&cookie) {
                 // Unknown cookie (any generation): truly
                 // unattributable — loud loss, never silent.
-                self.unattributed += delta;
+                self.unattributed = self.unattributed.saturating_add(delta);
                 continue;
             }
             if !self.bound.contains(&cookie) {
@@ -1147,7 +1817,7 @@ impl<B: CountBackend> CountSession<B> {
                 // are backend anomalies, not evidence. Loud
                 // unattributed loss (replaces F-A/A1 quarantine's
                 // eager retract, which died with the !bound path).
-                self.unattributed += delta;
+                self.unattributed = self.unattributed.saturating_add(delta);
                 continue;
             }
             if generation == self.generation {
@@ -1166,7 +1836,7 @@ impl<B: CountBackend> CountSession<B> {
             let bucket = self.fenced.iter_mut().find(|b| b.generation == generation);
             match (retired, bucket) {
                 (Some(old), Some(bucket)) => {
-                    self.stale_events += delta;
+                    self.stale_events = self.stale_events.saturating_add(delta);
                     if let Some(exec) = bucket.sites.iter_mut().find(|s| s.site == old.site) {
                         fold_exec_calls(exec, delta, total.first_ns, total.last_ns);
                     } else {
@@ -1188,35 +1858,71 @@ impl<B: CountBackend> CountSession<B> {
                     // count is conserved as explicit unattributed
                     // loss rather than misattributed to the live
                     // meaning.
-                    self.unattributed += delta;
+                    self.unattributed = self.unattributed.saturating_add(delta);
                 }
             }
         }
-        self.dropfail += drained.dropfail_total.saturating_sub(self.last_dropfail);
-        self.last_dropfail = drained.dropfail_total;
-        self.admitted += drained.admitted_total.saturating_sub(self.last_admitted);
-        self.last_admitted = drained.admitted_total;
-        for ((cum, last), n) in self
-            .lat_cum
-            .iter_mut()
-            .zip(self.last_lat.iter_mut())
-            .zip(drained.lat_buckets.iter())
-        {
-            *cum = cum.saturating_add(n.saturating_sub(*last));
-            *last = *n;
+        if let Component::Available(n) = drained.dropfail {
+            self.dropfail = self
+                .dropfail
+                .saturating_add(n.saturating_sub(self.last_dropfail));
+            self.last_dropfail = self.last_dropfail.max(n);
+            self.dropfail_available = true;
+            self.dropfail_final_available = true;
+        } else if let Component::Unavailable(f) = drained.dropfail {
+            self.component_failures[1] = Some(f);
         }
-        self.shortfall += drained.shortfall;
+        if let Component::Available(n) = drained.admitted {
+            self.admitted = self
+                .admitted
+                .saturating_add(n.saturating_sub(self.last_admitted));
+            self.last_admitted = self.last_admitted.max(n);
+            self.admitted_available = true;
+            self.admitted_final_available = true;
+        } else if let Component::Unavailable(f) = drained.admitted {
+            self.component_failures[0] = Some(f);
+        }
+        for (k, component) in drained.latc.iter().enumerate() {
+            match component {
+                Component::Available(n) => {
+                    self.lat_cum[k] =
+                        self.lat_cum[k].saturating_add(n.saturating_sub(self.last_lat[k]));
+                    self.last_lat[k] = self.last_lat[k].max(*n);
+                    self.lat_available[k] = true;
+                    self.lat_final_available[k] = true;
+                }
+                Component::Unavailable(f) => {
+                    self.component_failures[k + 2] = Some(*f);
+                    self.lat_final_available[k] = false;
+                }
+            }
+        }
+        if let EnumerationStatus::Complete { unread_keys } = drained.enumeration {
+            self.enumerated = true;
+            self.shortfall = self.shortfall.saturating_add(unread_keys);
+        }
+        self.last_snapshot = Some(snapshot);
         progress
     }
 }
 
-/// Attached-link handle for [`FakeCountBackend`]: a plain record,
-/// held for RAII symmetry with the live backend.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FakeLink {
-    pub cookie: u32,
-    pub path: String,
-    pub offset: u64,
+/// Compatibility name; this identity token has no descriptor or destructor I/O.
+pub type FakeLink = LinkToken;
+
+/// Finite fault controls for the HostModel backend. They cannot produce Live
+/// receipts, and do not qualify kernel writer completion.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FakeTerminalFaults {
+    pub admitted_unavailable: bool,
+    pub dropfail_unavailable: bool,
+    pub latc_unavailable: [bool; 16],
+    pub enumeration: Option<EnumerationStatus>,
+    pub read_error: bool,
+    pub quiescence_unknown: bool,
+    pub forget_frontier: bool,
+    pub inventory_unavailable: bool,
+    pub omit_resolved_open: bool,
+    pub close_errno: Option<i32>,
 }
 
 /// Deterministic host double for the count kernel side. [`fire`](Self::fire)
@@ -1225,8 +1931,25 @@ pub struct FakeLink {
 /// past `capacity` fail loud into the drop counter (map-full model).
 /// The per-(cookie, generation) ledger is the test oracle: each
 /// provider mapping's executions land only under its own cookie.
-#[derive(Debug, Clone)]
 pub struct FakeCountBackend {
+    ready: Ready,
+    barrier: Arc<CountForkBarrier>,
+    pins: Vec<std::os::fd::OwnedFd>,
+    records: Vec<CreationRecord>,
+    memberships: Vec<AttachedMembership>,
+    last_completed: Option<PendingCommandId>,
+    resolved_open: Option<OpenReceipt>,
+    snapshot_seq: u64,
+    link_seq: u64,
+    terminal_seq: u64,
+    terminal_request: Option<TerminalRequest>,
+    terminal_view: Option<RawTerminal>,
+    checkpoint: Option<RawCheckpoint>,
+    faults: FakeTerminalFaults,
+    initial_empty_at: Instant,
+    images: [Arc<RawSnapshot>; 3],
+    terminal_builder: Option<Arc<RawTerminalData>>,
+    inventory_builder: Option<Arc<SealedInventory>>,
     tgid: u64,
     generation: u32,
     start_ns: u64,
@@ -1247,9 +1970,118 @@ pub struct FakeCountBackend {
     lat_samples: [u64; 16],
 }
 
+impl std::fmt::Debug for FakeCountBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FakeCountBackend")
+            .field("ready", &self.ready)
+            .field("generation", &self.generation)
+            .finish_non_exhaustive()
+    }
+}
 impl FakeCountBackend {
     pub fn new() -> Self {
+        static EPOCH: AtomicU64 = AtomicU64::new(0);
+        let epoch = EPOCH
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+            .expect("fixture epoch space exhausted")
+            + 1;
+        let ready = Ready {
+            owner_epoch: OwnerEpoch::checked(epoch).expect("nonzero epoch"),
+            writer_object_identity: [0x48; 32],
+            dimensions: CountDimensions::validated(),
+            evidence_domain: EvidenceDomain::HostModel,
+        };
+        let writer = WriterIdentity {
+            owner_epoch: ready.owner_epoch,
+            object_sha256: ready.writer_object_identity,
+            program: ResourceId::Program,
+            maps: CountMap::ALL.map(ResourceId::Map),
+        };
+        let id = TerminalId {
+            owner_epoch: ready.owner_epoch,
+            sequence: TerminalSeq::checked(1).expect("builder placeholder"),
+        };
+        let now = Instant::now();
+        let unavailable = |map, key| {
+            Component::Unavailable(ComponentFailure {
+                map,
+                key,
+                operation: CountOperation::Read,
+                class: None,
+                errno: None,
+            })
+        };
+        let images = std::array::from_fn(|_| {
+            Arc::new(RawSnapshot {
+                sequence: SnapshotSeq::checked(1).expect("builder placeholder"),
+                rows: Vec::with_capacity(8192),
+                admitted: unavailable(CountMap::Admitted, 0),
+                dropfail: unavailable(CountMap::Dropfail, 0),
+                latc: std::array::from_fn(|k| unavailable(CountMap::Latc, k as u32)),
+                enumeration: EnumerationStatus::Unfinished,
+            })
+        });
+        let inventory_builder = Arc::new(SealedInventory {
+            owner_epoch: ready.owner_epoch,
+            writer,
+            records: Vec::with_capacity(8192),
+            memberships: Vec::with_capacity(8192),
+            acknowledged_links: Vec::with_capacity(8192),
+            unpublished_links: Vec::with_capacity(8192),
+            last_acked: None,
+            pending: None,
+            last_completed: None,
+            resolved_open: None,
+        });
+        let terminal_builder = Arc::new(RawTerminalData {
+            owner_epoch: ready.owner_epoch,
+            terminal_id: id,
+            deadline: now,
+            last_command_seq: None,
+            resolved_open: None,
+            evidence_domain: EvidenceDomain::HostModel,
+            inventory: None,
+            manifest: Vec::with_capacity(8192),
+            close_outcomes: Vec::with_capacity(8192),
+            kernel_profile: KernelApplicability::ModelFixture,
+            writer_object_identity: ready.writer_object_identity,
+            writer_family: ready.dimensions,
+            host_writes_sealed: false,
+            final_references: ReferenceFinality {
+                file: true,
+                bpf_link: true,
+            },
+            seal: SealBracket::default(),
+            writers: WriterCompletion::Unknown(QuiescenceReason::Owner),
+            checkpoint: None,
+            snapshot_binding: None,
+            read_status: ReadStatus::NotStarted,
+            cleanup_ticket: CleanupTicket {
+                owner_epoch: ready.owner_epoch,
+                terminal_id: id,
+            },
+            cleanup_state: CleanupState::Complete,
+            failures: TerminalFailures::default(),
+        });
         Self {
+            ready,
+            images,
+            terminal_builder: Some(terminal_builder),
+            inventory_builder: Some(inventory_builder),
+            barrier: Arc::new(CountForkBarrier::new()),
+            pins: Vec::with_capacity(8192),
+            records: Vec::with_capacity(8192),
+            memberships: Vec::with_capacity(8192),
+            last_completed: None,
+            resolved_open: None,
+            snapshot_seq: 0,
+            link_seq: 0,
+            terminal_seq: 0,
+            terminal_request: None,
+            terminal_view: None,
+            checkpoint: None,
+            faults: FakeTerminalFaults::default(),
+            initial_empty_at: Instant::now(),
             tgid: 0,
             generation: 0,
             start_ns: 0,
@@ -1260,7 +2092,7 @@ impl FakeCountBackend {
             cpu_slots: HashMap::new(),
             dropfail: 0,
             admitted: 0,
-            capacity: usize::MAX,
+            capacity: 8192,
             poison: HashSet::new(),
             shortfall_hook: 0,
             programmed: Vec::new(),
@@ -1268,11 +2100,129 @@ impl FakeCountBackend {
         }
     }
 
+    pub fn terminal_faults(&mut self, faults: FakeTerminalFaults) {
+        self.faults = faults;
+    }
+
+    fn failure(
+        &self,
+        seq: CommandSeq,
+        operation: CountOperation,
+        class: FailureClass,
+    ) -> CommandFailure {
+        CommandFailure {
+            seq,
+            failure: OwnerFailure::engine(operation, class),
+            completion: CommandCompletion::NotEntered,
+            cleanup_ticket: self.terminal_request.as_ref().map(|r| CleanupTicket {
+                owner_epoch: r.id.owner_epoch,
+                terminal_id: r.id,
+            }),
+        }
+    }
+    fn writer(&self) -> WriterIdentity {
+        WriterIdentity {
+            owner_epoch: self.ready.owner_epoch,
+            object_sha256: self.ready.writer_object_identity,
+            program: ResourceId::Program,
+            maps: CountMap::ALL.map(ResourceId::Map),
+        }
+    }
+    fn component(&self, map: CountMap, key: u32, n: u64, missing: bool) -> Component<u64> {
+        if missing {
+            Component::Unavailable(ComponentFailure {
+                map,
+                key,
+                operation: CountOperation::Read,
+                class: None,
+                errno: None,
+            })
+        } else {
+            Component::Available(n)
+        }
+    }
+    /// Publish one cumulative model image; used by scripted host interleavings.
+    pub fn publish_checkpoint(&mut self) -> Result<Arc<RawSnapshot>, OwnerFailure> {
+        let fail = || OwnerFailure::engine(CountOperation::Read, FailureClass::Capacity);
+        let index = self
+            .images
+            .iter_mut()
+            .position(|image| Arc::get_mut(image).is_some())
+            .ok_or_else(fail)?;
+        let next = self
+            .snapshot_seq
+            .checked_add(1)
+            .ok_or_else(|| OwnerFailure::engine(CountOperation::Read, FailureClass::IdExhausted))?;
+        let admitted = self.component(
+            CountMap::Admitted,
+            0,
+            self.admitted,
+            self.faults.admitted_unavailable,
+        );
+        let dropfail = self.component(
+            CountMap::Dropfail,
+            0,
+            self.dropfail,
+            self.faults.dropfail_unavailable,
+        );
+        let latc = std::array::from_fn(|k| {
+            self.component(
+                CountMap::Latc,
+                k as u32,
+                self.lat_samples[k],
+                self.faults.latc_unavailable[k],
+            )
+        });
+        let image = Arc::get_mut(&mut self.images[index]).expect("unpublished model image");
+        image.rows.clear();
+        for ((cookie, generation), value) in &self.ledger {
+            if value.count > 0 {
+                if image.rows.len() == image.rows.capacity() {
+                    return Err(fail());
+                }
+                image.rows.push((make_key(*cookie, *generation), *value));
+            }
+        }
+        for ((_, cookie, generation), value) in &self.cpu_slots {
+            if value.count == 0 {
+                continue;
+            }
+            let key = make_key(*cookie, *generation);
+            if let Some((_, total)) = image.rows.iter_mut().find(|(k, _)| *k == key) {
+                total.fold(value);
+            } else {
+                if image.rows.len() == image.rows.capacity() {
+                    return Err(fail());
+                }
+                image.rows.push((key, *value));
+            }
+        }
+        image.rows.sort_unstable_by_key(|r| r.0);
+        image.sequence = SnapshotSeq::checked(next)?;
+        image.admitted = admitted;
+        image.dropfail = dropfail;
+        image.latc = latc;
+        image.enumeration = self
+            .faults
+            .enumeration
+            .unwrap_or(EnumerationStatus::Complete {
+                unread_keys: std::mem::take(&mut self.shortfall_hook),
+            });
+        self.snapshot_seq = next;
+        let image = Arc::clone(&self.images[index]);
+        self.checkpoint = Some(RawCheckpoint {
+            snapshot: image.clone(),
+            phase: OwnerPhase::Snapshotting,
+            published_at: Instant::now(),
+        });
+        Ok(image)
+    }
+
     /// Model a bounded `COUNTS` map: at most `cap` distinct keys;
     /// further inserts fail into the drop counter.
     pub fn with_capacity(cap: usize) -> Self {
         let mut out = Self::new();
-        out.capacity = cap;
+        out.capacity = cap.min(8192);
         out
     }
 
@@ -1431,310 +2381,465 @@ impl Default for FakeCountBackend {
 }
 
 impl CountBackend for FakeCountBackend {
-    type Link = FakeLink;
-
-    fn attach(
-        &mut self,
-        path: &str,
-        offsets: &[u64],
-        cookies: &[u64],
-    ) -> (Vec<Self::Link>, Vec<usize>) {
-        let mut links = Vec::new();
-        let mut bad = Vec::new();
-        for (i, (offset, cookie)) in offsets.iter().zip(cookies.iter()).enumerate() {
-            if self.poison.contains(offset) {
-                bad.push(i);
+    type Link = LinkToken;
+    fn ready(&self) -> &Ready {
+        &self.ready
+    }
+    fn attach(&mut self, request: AttachRequest) -> CommandResult<AttachAck<LinkToken>> {
+        if self.terminal_request.is_some() {
+            return Err(self.failure(
+                request.seq,
+                CountOperation::Attach,
+                FailureClass::Disconnected,
+            ));
+        }
+        if request.offsets.is_empty()
+            || request.offsets.len() > 8192
+            || request.offsets.len() != request.cookies.len()
+        {
+            return Err(self.failure(
+                request.seq,
+                CountOperation::Attach,
+                FailureClass::InvalidInput,
+            ));
+        }
+        let pin = plan::resolve_pinned(&request.locator);
+        let reason = match &pin {
+            Err(_) => Some(AttachRefusalReason::Unreadable),
+            Ok(p)
+                if p.device != request.expected_backing.device
+                    || p.ino != request.expected_backing.inode =>
+            {
+                Some(AttachRefusalReason::Replaced)
+            }
+            Ok(_) => None,
+        };
+        let mut ack = AttachAck {
+            links: Vec::new(),
+            refused: Vec::new(),
+        };
+        let pin_slot = self.pins.len();
+        let path = pin.as_ref().map(|p| p.link_path()).unwrap_or_default();
+        for (position, (offset, cookie)) in request.offsets.iter().zip(&request.cookies).enumerate()
+        {
+            let refusal = reason
+                .or_else(|| {
+                    self.poison
+                        .contains(offset)
+                        .then_some(AttachRefusalReason::KernelRefused)
+                })
+                .or_else(|| {
+                    (self.memberships.len() >= 8192).then_some(AttachRefusalReason::Capacity)
+                });
+            if let Some(reason) = refusal {
+                ack.refused.push(AttachRefusal { position, reason });
                 continue;
             }
-            let Ok(cookie) = u32::try_from(*cookie) else {
-                // Wider-than-u32 cookies are a userspace bug: loud
-                // drop, never silent truncation (kernel parity).
-                self.dropfail = self.dropfail.saturating_add(1);
-                bad.push(i);
-                continue;
+            let Ok(cookie32) = u32::try_from(*cookie) else {
+                return Err(self.failure(
+                    request.seq,
+                    CountOperation::Attach,
+                    FailureClass::InvalidInput,
+                ));
             };
-            self.attached.insert(cookie, (path.to_string(), *offset));
-            links.push(FakeLink {
-                cookie,
-                path: path.to_string(),
+            self.link_seq = self.link_seq.checked_add(1).ok_or_else(|| {
+                self.failure(
+                    request.seq,
+                    CountOperation::Attach,
+                    FailureClass::IdExhausted,
+                )
+            })?;
+            let id = LinkId {
+                owner_epoch: self.ready.owner_epoch,
+                serial: LinkSerial::checked(self.link_seq).expect("nonzero link"),
+            };
+            let start = self.memberships.len();
+            self.memberships.push(AttachedMembership {
                 offset: *offset,
+                cookie: *cookie,
             });
+            self.records.push(CreationRecord {
+                id,
+                command: request.seq,
+                writer: self.writer(),
+                backing: request.expected_backing,
+                pin_slot,
+                memberships: start..start + 1,
+                outcome: CreateOutcome::Succeeded,
+                publication: PublicationState::Published,
+                close_state: ResourceState::Held,
+                close_errno: None,
+            });
+            self.attached.insert(cookie32, (path.clone(), *offset));
+            ack.links.push(LinkToken::new(id));
         }
-        bad.sort_unstable();
-        (links, bad)
-    }
-
-    fn open_window(
-        &mut self,
-        tgid: u64,
-        generation: u32,
-        start_ns: u64,
-        deadline_ns: u64,
-    ) -> anyhow::Result<()> {
-        if start_ns >= deadline_ns {
-            anyhow::bail!("empty count window: start {start_ns} >= deadline {deadline_ns}");
+        if !ack.links.is_empty() {
+            self.pins.push(pin.expect("successful pin").fd);
         }
-        self.tgid = tgid;
-        self.generation = generation;
-        self.start_ns = start_ns;
-        self.deadline_ns = deadline_ns;
-        self.open = true;
-        self.programmed
-            .push((tgid, generation, start_ns, deadline_ns));
-        Ok(())
-    }
-
-    fn set_generation(&mut self, generation: u32) -> anyhow::Result<()> {
-        self.generation = generation;
-        Ok(())
-    }
-
-    fn close_window(&mut self) -> anyhow::Result<()> {
-        self.open = false;
-        Ok(())
-    }
-
-    fn drain(&mut self, _deadline: Option<Instant>) -> anyhow::Result<DrainedCounts> {
-        // Host double drains instantly; grace-expiry shortfall is
-        // scripted through `set_shortfall` instead.
-        let mut folded: HashMap<(u32, u32), CountValue> = HashMap::new();
-        for ((cookie, generation), v) in self.ledger.iter() {
-            if v.count == 0 {
-                continue;
-            }
-            folded.entry((*cookie, *generation)).or_default().fold(v);
-        }
-        for ((_, cookie, generation), v) in self.cpu_slots.iter() {
-            if v.count == 0 {
-                continue;
-            }
-            folded.entry((*cookie, *generation)).or_default().fold(v);
-        }
-        let mut rows: Vec<(u64, CountValue)> = folded
-            .into_iter()
-            .map(|((cookie, generation), v)| (make_key(cookie, generation), v))
-            .collect();
-        rows.sort_by_key(|(k, _)| *k);
-        let shortfall = std::mem::take(&mut self.shortfall_hook);
-        Ok(DrainedCounts {
-            rows,
-            dropfail_total: self.dropfail,
-            admitted_total: self.admitted,
-            lat_buckets: self.lat_samples,
-            shortfall,
+        self.last_completed = Some(PendingCommandId {
+            seq: request.seq,
+            operation: CountOperation::Attach,
+        });
+        Ok(CommandAck {
+            seq: request.seq,
+            value: ack,
         })
     }
-}
-
-/// Production backend: drives the real `osslscope-count` maps and
-/// multi-links through aya (needs BPF caps). Attach reuses
-/// [`plan::bisect_attach`] so one kernel-refused offset cannot sink
-/// good siblings; drains are the same bounded per-CPU iteration the
-/// capture engine uses, minus routing (the session routes).
-pub struct LiveBackend {
-    loaded: crate::loader::Loaded,
-    pid: u32,
-}
-
-impl LiveBackend {
-    /// Crate-sealed: both call sites load COUNT_MAPS through
-    /// `prepare`+`load`, which is what `program()`'s dim gate
-    /// assumes. Public construction would let safe callers pair
-    /// this backend with wrong-sized maps and void the unsafe
-    /// update contract.
-    pub(crate) fn new(loaded: crate::loader::Loaded, pid: u32) -> Self {
-        Self { loaded, pid }
-    }
-
-    fn program(&self, map: &str, key: u32, value: &[u8]) -> anyhow::Result<()> {
-        use anyhow::Context as _;
-        use std::os::fd::AsRawFd as _;
-        // Soundness gate for the unsafe update below: the map must
-        // be a known COUNT programmer — plain ARRAY (type 2;
-        // per-CPU value sizing follows a different rule, so only
-        // the identity-sized type passes) with exact dims. Runs
-        // before any fd use, so a mismatch fails caps-free.
-        let spec = crate::loader::COUNT_MAPS
-            .iter()
-            .find(|m| m.name == map)
-            .ok_or_else(|| anyhow::anyhow!("program {map}: unknown map"))?;
-        if spec.map_type != 2 || spec.key_size != 4 || spec.value_size as usize != value.len() {
-            anyhow::bail!(
-                "program {map}: type {}/dims {}/{} vs value len {}",
-                spec.map_type,
-                spec.key_size,
-                spec.value_size,
-                value.len()
-            );
+    fn open_window(&mut self, request: OpenRequest) -> CommandResult<OpenReceipt> {
+        if self.terminal_request.is_some()
+            || request.start_ns >= request.deadline_ns
+            || request.tgid == 0
+        {
+            return Err(self.failure(
+                request.seq,
+                CountOperation::Open,
+                FailureClass::InvalidInput,
+            ));
         }
-        let fd = self
-            .loaded
-            .maps
-            .get(map)
-            .context(format!("no {map} map"))?
-            .as_raw_fd();
-        // SAFETY: the gate above proved a plain-ARRAY COUNT map with
-        // key_size 4 (this `u32`) and value_size == value.len(), and
-        // the fd is live from `load()`.
-        unsafe {
-            ossl_bpf_sys::map_update_elem(fd, &key.to_le_bytes(), value, ossl_bpf_sys::BPF_ANY)
-        }
-        .with_context(|| format!("program {map}[{key}]"))?;
-        Ok(())
-    }
-}
-
-impl CountBackend for LiveBackend {
-    type Link = std::os::fd::OwnedFd;
-
-    fn attach(
-        &mut self,
-        path: &str,
-        offsets: &[u64],
-        cookies: &[u64],
-    ) -> (Vec<Self::Link>, Vec<usize>) {
-        use std::os::fd::AsRawFd as _;
-        let Some(prog) = self.loaded.progs.get("count_entry") else {
-            return (Vec::new(), (0..offsets.len()).collect());
+        self.tgid = request.tgid;
+        self.generation = request.generation;
+        self.start_ns = request.start_ns;
+        self.deadline_ns = request.deadline_ns;
+        self.open = true;
+        self.programmed.push((
+            request.tgid,
+            request.generation,
+            request.start_ns,
+            request.deadline_ns,
+        ));
+        let receipt = OpenReceipt {
+            owner_epoch: self.ready.owner_epoch,
+            seq: request.seq,
+            tgid: request.tgid,
+            generation: request.generation,
+            start_ns: request.start_ns,
+            deadline_ns: request.deadline_ns,
+            completed_writes: OpenWriteFrontier::Target,
+            outcome: OpenOutcome::Completed,
         };
-        let prog_fd = prog.as_raw_fd();
-        let pid = self.pid;
-        let sites: Vec<(u64, u64)> = offsets
-            .iter()
-            .zip(cookies.iter())
-            .map(|(o, c)| (*o, *c))
-            .collect();
-        plan::bisect_attach(
-            &|slice| {
-                let offs: Vec<u64> = slice.iter().map(|t| t.0).collect();
-                let cks: Vec<u64> = slice.iter().map(|t| t.1).collect();
-                plan::attach_group(prog_fd, pid, path, &offs, &cks)
+        self.resolved_open = Some(receipt);
+        self.last_completed = Some(PendingCommandId {
+            seq: request.seq,
+            operation: CountOperation::Open,
+        });
+        Ok(CommandAck {
+            seq: request.seq,
+            value: receipt,
+        })
+    }
+    fn set_generation(&mut self, request: GenerationRequest) -> CommandResult<()> {
+        if self.terminal_request.is_some() {
+            return Err(self.failure(
+                request.seq,
+                CountOperation::Generation,
+                FailureClass::Disconnected,
+            ));
+        }
+        self.generation = request.generation;
+        self.last_completed = Some(PendingCommandId {
+            seq: request.seq,
+            operation: CountOperation::Generation,
+        });
+        Ok(CommandAck {
+            seq: request.seq,
+            value: (),
+        })
+    }
+    fn drain(&mut self, request: ReadRequest) -> CommandResult<Arc<RawSnapshot>> {
+        if self.terminal_request.is_some() {
+            return Err(self.failure(
+                request.seq,
+                CountOperation::Read,
+                FailureClass::Disconnected,
+            ));
+        }
+        let image = self
+            .publish_checkpoint()
+            .map_err(|failure| CommandFailure {
+                seq: request.seq,
+                failure,
+                completion: CommandCompletion::Completed,
+                cleanup_ticket: None,
+            })?;
+        self.last_completed = Some(PendingCommandId {
+            seq: request.seq,
+            operation: CountOperation::Read,
+        });
+        if self.faults.read_error {
+            return Err(CommandFailure {
+                completion: CommandCompletion::Completed,
+                ..self.failure(request.seq, CountOperation::Read, FailureClass::Io)
+            });
+        }
+        Ok(CommandAck {
+            seq: request.seq,
+            value: image,
+        })
+    }
+    fn terminal_request(
+        &mut self,
+        deadline: Instant,
+        frontier: ControllerFrontier,
+    ) -> TerminalRequest {
+        if let Some(request) = &self.terminal_request {
+            return request.clone();
+        }
+        self.terminal_seq = self
+            .terminal_seq
+            .checked_add(1)
+            .expect("fixture terminal identity exhaustion");
+        let request = TerminalRequest {
+            id: TerminalId {
+                owner_epoch: self.ready.owner_epoch,
+                sequence: TerminalSeq::checked(self.terminal_seq).expect("nonzero terminal"),
             },
-            &sites,
-        )
+            deadline,
+            evidence_domain: self.ready.evidence_domain,
+            writer_object_identity: self.ready.writer_object_identity,
+            frontier,
+        };
+        self.terminal_request = Some(request.clone());
+        request
     }
-
-    fn open_window(
-        &mut self,
-        tgid: u64,
-        generation: u32,
-        start_ns: u64,
-        deadline_ns: u64,
-    ) -> anyhow::Result<()> {
-        use osslscope_ebpf_common::{WINDOW_DEADLINE, WINDOW_START};
-        if start_ns >= deadline_ns {
-            anyhow::bail!("empty count window: start {start_ns} >= deadline {deadline_ns}");
+    fn terminal(&mut self, request: TerminalRequest) -> RawTerminal {
+        if let Some(view) = &self.terminal_view {
+            return view.clone();
         }
-        // Program the admission interval BEFORE arming the target:
-        // the zeroed window admits nothing, so a hit can never slip
-        // in under an unprogrammed deadline.
-        self.program("WINDOW", WINDOW_START, &start_ns.to_le_bytes())?;
-        self.program("WINDOW", WINDOW_DEADLINE, &deadline_ns.to_le_bytes())?;
-        self.program("GEN", 0, &generation.to_le_bytes())?;
-        self.program("TARGET", 0, &tgid.to_le_bytes())?;
-        Ok(())
-    }
-
-    fn set_generation(&mut self, generation: u32) -> anyhow::Result<()> {
-        self.program("GEN", 0, &generation.to_le_bytes())
-    }
-
-    fn close_window(&mut self) -> anyhow::Result<()> {
-        self.program("TARGET", 0, &0u64.to_le_bytes())
-    }
-
-    fn drain(&mut self, deadline: Option<Instant>) -> anyhow::Result<DrainedCounts> {
-        // Bounded like the capture engine's drain (same code shape):
-        // past the deadline the rest counts exactly as shortfall
-        // rather than abandoned — exactness beats grace to the
-        // microsecond, and the first sub-64 slice may fold past an
-        // already-expired deadline by design. Shortfall is exact
-        // bookkeeping, not a sampling artifact.
-        use anyhow::Context as _;
-        use aya::maps::{Map, MapData};
-        let dup = |name: &str| -> anyhow::Result<Map> {
-            let fd = self
-                .loaded
-                .maps
-                .get(name)
-                .context(format!("no {name} map"))?
-                .try_clone()?;
-            let data = MapData::from_fd(fd).map_err(|e| anyhow::anyhow!("{name} mapdata: {e}"))?;
-            Map::from_map_data(data).map_err(|e| anyhow::anyhow!("{name} map: {e}"))
+        let now = Instant::now();
+        self.open = false;
+        let mut storage = self.terminal_builder.take().expect("one model envelope");
+        let data = Arc::get_mut(&mut storage).expect("private model builder");
+        data.terminal_id = request.id;
+        data.deadline = request.deadline;
+        data.host_writes_sealed = true;
+        data.cleanup_ticket = CleanupTicket {
+            owner_epoch: self.ready.owner_epoch,
+            terminal_id: request.id,
         };
-        let mut out = DrainedCounts {
-            rows: Vec::new(),
-            dropfail_total: 0,
-            admitted_total: 0,
-            lat_buckets: [0; 16],
-            shortfall: 0,
+        if self.initial_empty_at < request.deadline
+            && self.last_completed.is_none()
+            && self.records.is_empty()
+            && self.resolved_open.is_none()
+            && self.checkpoint.is_none()
+            && request.frontier == ControllerFrontier::default()
+            && self.faults == FakeTerminalFaults::default()
+        {
+            data.kernel_profile = KernelApplicability::Unknown(ProfileFailure::UnboundBuild);
+            data.writers = WriterCompletion::KnownEmpty(EmptyWitness {
+                owner_epoch: self.ready.owner_epoch,
+                terminal_id: request.id,
+                writer_object_identity: self.ready.writer_object_identity,
+                ready_published_at: self.initial_empty_at,
+                sealed_at: now,
+                deadline: request.deadline,
+            });
+            let view = RawTerminal::model(storage);
+            self.terminal_view = Some(view.clone());
+            return view;
+        }
+        let can_read = now < request.deadline;
+        let finished =
+            can_read && !self.faults.quiescence_unknown && self.faults.close_errno.is_none();
+        let last_completed = if self.faults.forget_frontier {
+            request.frontier.last_acked.map(|seq| PendingCommandId {
+                seq,
+                operation: CountOperation::Read,
+            })
+        } else {
+            self.last_completed
         };
-        let counts = dup("COUNTS")?;
-        let map = aya::maps::PerCpuHashMap::<_, u64, CountValue>::try_from(counts)
-            .map_err(|e| anyhow::anyhow!("COUNTS typed: {e}"))?;
-        let mut n = 0u64;
-        let mut expired = false;
-        for r in map.iter() {
-            let (key, per_cpu) = r.map_err(|e| anyhow::anyhow!("COUNTS iter: {e}"))?;
-            n += 1;
-            if expired {
-                // Keys-only tail: counted exactly, never folded, and
-                // never recorded — grace expiry happens at the final
-                // drain only, so no later drain re-adds.
-                out.shortfall += 1;
-                continue;
+        let mut inventory = self.inventory_builder.take().expect("one model inventory");
+        let journal = Arc::get_mut(&mut inventory).expect("private model inventory");
+        journal.last_acked = request.frontier.last_acked;
+        journal.pending = request.frontier.pending;
+        journal.last_completed = last_completed;
+        journal.resolved_open = if self.faults.omit_resolved_open {
+            None
+        } else {
+            self.resolved_open
+        };
+        journal.memberships.extend_from_slice(&self.memberships);
+        for record in &mut self.records {
+            if request.frontier.acknowledged_links.contains(&record.id) {
+                record.publication = PublicationState::Published;
+                journal.acknowledged_links.push(record.id);
+            } else {
+                record.publication = PublicationState::Unpublished;
+                journal.unpublished_links.push(record.id);
             }
-            if n % 64 == 0 {
-                if let Some(d) = deadline {
-                    if Instant::now() >= d {
-                        expired = true;
-                        out.shortfall += 1;
-                        continue;
-                    }
+            record.close_state = ResourceState::CloseReturned;
+            record.close_errno = self.faults.close_errno;
+            data.close_outcomes.push(LinkCloseOutcome {
+                id: record.id,
+                issued_at: Some(now),
+                returned_at: Some(now),
+                state: ResourceState::CloseReturned,
+                errno: record.close_errno,
+            });
+            journal.records.push(record.clone());
+            data.manifest.push(record.clone());
+        }
+        let resolved_open = journal.resolved_open;
+        data.inventory = Some(inventory);
+        data.last_command_seq = last_completed.map(|c| c.seq);
+        data.resolved_open = resolved_open;
+        data.seal = SealBracket {
+            before_ns: Some(1),
+            after_ns: Some(2),
+            result: StopResult::Stopped,
+        };
+        data.writers = if finished {
+            WriterCompletion::Finished(WriterWitness {
+                owner_epoch: self.ready.owner_epoch,
+                terminal_id: request.id,
+                last_command_seq: data.last_command_seq,
+                writer_object_identity: self.ready.writer_object_identity,
+                established_at: now,
+            })
+        } else {
+            WriterCompletion::Unknown(QuiescenceReason::Deadline)
+        };
+        let started = Instant::now();
+        let mut fresh = false;
+        if can_read {
+            match self.publish_checkpoint() {
+                Ok(_) => fresh = true,
+                Err(failure) => {
+                    data.failures.operations[CountOperation::Read as usize] = Some(failure);
                 }
             }
-            let mut total = CountValue::default();
-            for v in per_cpu.iter() {
-                total.fold(v);
+        }
+        data.checkpoint = self
+            .checkpoint
+            .clone()
+            .filter(|c| c.published_at < request.deadline);
+        data.read_status = match &data.checkpoint {
+            Some(c)
+                if fresh
+                    && !self.faults.read_error
+                    && c.snapshot.enumeration
+                        == (EnumerationStatus::Complete { unread_keys: 0 })
+                    && matches!(c.snapshot.admitted, Component::Available(_))
+                    && matches!(c.snapshot.dropfail, Component::Available(_))
+                    && c.snapshot
+                        .latc
+                        .iter()
+                        .all(|v| matches!(v, Component::Available(_))) =>
+            {
+                ReadStatus::Complete
             }
-            if total.count == 0 {
-                continue;
+            Some(c) => ReadStatus::Incomplete {
+                enumeration: c.snapshot.enumeration,
+            },
+            None => ReadStatus::NotStarted,
+        };
+        if self.faults.read_error {
+            data.failures.operations[CountOperation::Read as usize] =
+                Some(OwnerFailure::engine(CountOperation::Read, FailureClass::Io));
+        }
+        if let Some(errno) = self.faults.close_errno {
+            data.failures.operations[CountOperation::Close as usize] = Some(OwnerFailure {
+                operation: CountOperation::Close,
+                resource: ResourceId::Engine,
+                class: FailureClass::Io,
+                errno: Some(errno),
+            });
+        }
+        if let Some(c) = &data.checkpoint {
+            for (index, component) in std::iter::once(&c.snapshot.admitted)
+                .chain(std::iter::once(&c.snapshot.dropfail))
+                .chain(c.snapshot.latc.iter())
+                .enumerate()
+            {
+                if let Component::Unavailable(f) = component {
+                    data.failures.components[index] = Some(*f);
+                }
             }
-            out.rows.push((key, total));
+            data.snapshot_binding = Some(SnapshotBinding {
+                sequence: c.snapshot.sequence,
+                started_at: if fresh { started } else { c.published_at },
+                completed_at: c.published_at,
+                immutable: finished && fresh,
+            });
         }
-        let drops = dup("DROPFAIL")?;
-        let drops = aya::maps::PerCpuArray::<_, u64>::try_from(drops)
-            .map_err(|e| anyhow::anyhow!("DROPFAIL typed: {e}"))?;
-        let mut total_drop = 0u64;
-        for r in drops.iter() {
-            let per_cpu = r.map_err(|e| anyhow::anyhow!("DROPFAIL iter: {e}"))?;
-            total_drop += per_cpu.iter().sum::<u64>();
+        // If no post-witness image could be built, the old ordinary image is
+        // useful as positive evidence but cannot be an immutable final read.
+        if finished && !fresh {
+            data.checkpoint = None;
+            data.snapshot_binding = None;
+            data.read_status = ReadStatus::NotStarted;
         }
-        let admitted = dup("ADMITTED")?;
-        let admitted = aya::maps::PerCpuArray::<_, u64>::try_from(admitted)
-            .map_err(|e| anyhow::anyhow!("ADMITTED typed: {e}"))?;
-        let mut total_admitted = 0u64;
-        for r in admitted.iter() {
-            let per_cpu = r.map_err(|e| anyhow::anyhow!("ADMITTED iter: {e}"))?;
-            total_admitted += per_cpu.iter().sum::<u64>();
+        if self.faults.inventory_unavailable {
+            data.inventory = None;
+            data.writers = WriterCompletion::Unknown(QuiescenceReason::Deadline);
+            data.checkpoint = None;
+            data.snapshot_binding = None;
+            data.read_status = ReadStatus::NotStarted;
         }
-        let latc = dup("LATC")?;
-        let latc = aya::maps::PerCpuArray::<_, u64>::try_from(latc)
-            .map_err(|e| anyhow::anyhow!("LATC typed: {e}"))?;
-        let mut lat_buckets = [0u64; 16];
-        // PerCpuArray iterates keys in order (same shape as the
-        // DROPFAIL read above); scores are multiset-invariant
-        // anyway, so even a reorder could not move median/p99.
-        for (k, r) in latc.iter().enumerate() {
-            let per_cpu = r.map_err(|e| anyhow::anyhow!("LATC iter: {e}"))?;
-            if k < 16 {
-                lat_buckets[k] = per_cpu.iter().sum::<u64>();
-            }
-        }
-        out.dropfail_total = total_drop;
-        out.admitted_total = total_admitted;
-        out.lat_buckets = lat_buckets;
-        Ok(out)
+        self.pins.clear();
+        let view = RawTerminal::model(storage);
+        self.terminal_view = Some(view.clone());
+        view
+    }
+    fn progress(&self) -> Option<RawCheckpoint> {
+        self.checkpoint.clone()
+    }
+    fn fork_permit(&self, deadline: Instant) -> Result<CountForkPermit<'_>, ForkBlocked> {
+        self.barrier.prefix_permit(deadline)
+    }
+}
+
+/// Production adapter: the already-owning engine retains all count resources.
+pub struct LiveBackend {
+    engine: CountEngine,
+}
+impl LiveBackend {
+    pub fn prepare(
+        input: CountInput,
+        limits: CountOwnerLimits,
+        setup_deadline: Instant,
+    ) -> Result<Self, CountPrepareFailure> {
+        CountEngine::prepare(input, limits, setup_deadline).map(|engine| Self { engine })
+    }
+}
+impl CountBackend for LiveBackend {
+    type Link = LinkToken;
+    fn ready(&self) -> &Ready {
+        self.engine.ready()
+    }
+    fn attach(&mut self, r: AttachRequest) -> CommandResult<AttachAck<LinkToken>> {
+        self.engine.attach(r)
+    }
+    fn open_window(&mut self, r: OpenRequest) -> CommandResult<OpenReceipt> {
+        self.engine.open_window(r)
+    }
+    fn set_generation(&mut self, r: GenerationRequest) -> CommandResult<()> {
+        self.engine.set_generation(r)
+    }
+    fn drain(&mut self, r: ReadRequest) -> CommandResult<Arc<RawSnapshot>> {
+        self.engine.drain(r)
+    }
+    fn terminal_request(
+        &mut self,
+        deadline: Instant,
+        frontier: ControllerFrontier,
+    ) -> TerminalRequest {
+        let ready = self.engine.ready();
+        self.engine.terminal_request(
+            deadline,
+            ready.evidence_domain,
+            ready.writer_object_identity,
+            frontier,
+        )
+    }
+    fn terminal(&mut self, r: TerminalRequest) -> RawTerminal {
+        self.engine.terminal(r)
+    }
+    fn progress(&self) -> Option<RawCheckpoint> {
+        self.engine.progress()
+    }
+    fn fork_permit(&self, deadline: Instant) -> Result<CountForkPermit<'_>, ForkBlocked> {
+        self.engine.fork_permit(deadline)
     }
 }
 
@@ -1742,53 +2847,60 @@ impl CountBackend for LiveBackend {
 mod tests {
     use super::*;
 
-    fn empty_backend() -> LiveBackend {
-        LiveBackend {
-            loaded: crate::loader::Loaded {
-                progs: std::collections::HashMap::new(),
-                maps: std::collections::HashMap::new(),
-            },
-            pid: 0,
-        }
+    #[test]
+    fn fake_refuses_fourth_pinned_image() {
+        let mut backend = FakeCountBackend::new();
+        let a = backend.publish_checkpoint().unwrap();
+        let b = backend.publish_checkpoint().unwrap();
+        let c = backend.publish_checkpoint().unwrap();
+        let read = backend.drain(ReadRequest {
+            seq: CommandSeq::checked(1).unwrap(),
+            deadline: Instant::now() + Duration::from_secs(1),
+        });
+        assert!(
+            read.is_err(),
+            "three pinned model images must refuse a fourth allocation"
+        );
+        drop((a, b, c));
     }
 
     #[test]
-    fn program_rejects_dim_mismatch_caps_free() {
-        // GEN value is 4 bytes; an 8-byte value must fail at the
-        // dim gate (before any fd use — no caps needed), not reach
-        // the unsafe update.
-        let b = empty_backend();
-        let e = b.program("GEN", 0, &[0u8; 8]).err().expect("must fail");
-        assert!(e.to_string().contains("vs value len"), "{e:#}");
+    fn command_ids_exhaust_without_reuse() {
+        let mut ids = CountIds {
+            command: u64::MAX - 1,
+        };
+        assert_eq!(ids.command().unwrap().value(), u64::MAX);
+        assert_eq!(ids.command().unwrap_err().class, FailureClass::IdExhausted);
+        assert_eq!(ids.command().unwrap_err().class, FailureClass::IdExhausted);
     }
 
     #[test]
-    fn program_rejects_unknown_map() {
-        let b = empty_backend();
-        let e = b.program("NOPE", 0, &[]).err().expect("must fail");
-        assert!(e.to_string().contains("unknown map"), "{e:#}");
-    }
-
-    #[test]
-    fn program_passes_gate_for_valid_dims() {
-        // Correct dims pass the gate (failing later at the missing
-        // fd — caps-free proof the gate admits valid shapes).
-        let b = empty_backend();
-        let e = b
-            .program("GEN", 0, &0u32.to_le_bytes())
-            .err()
-            .expect("must fail");
-        assert!(e.to_string().contains("no GEN map"), "{e:#}");
-    }
-
-    #[test]
-    fn bad_indices_normalize_defensively() {
-        // Order, duplicates and out-of-range positions never
-        // misread: only in-range refused positions flag.
-        assert_eq!(normalize_bad(vec![], 3), vec![false, false, false]);
-        assert_eq!(normalize_bad(vec![2, 0, 2], 3), vec![true, false, true]);
-        assert_eq!(normalize_bad(vec![9], 1), vec![false]);
-        assert_eq!(normalize_bad(vec![0, 1, 2], 2), vec![true, true]);
+    fn command_exhaustion_seals_session_once() {
+        let mut session = CountSession::new(42, FakeCountBackend::new());
+        session.ids.command = u64::MAX;
+        assert!(
+            session
+                .open_window(10, 20, Instant::now() + Duration::from_secs(1))
+                .is_err()
+        );
+        assert!(session.is_closed());
+        let id = session.terminal_id().unwrap();
+        let view = session.salvage_view(id);
+        assert_eq!(
+            view.runtime_failure.unwrap().class,
+            FailureClass::IdExhausted
+        );
+        assert_eq!(
+            session
+                .terminal(CloseRequest {
+                    started_at: Instant::now(),
+                    grace: Duration::from_secs(20),
+                    reason: CloseReason::Failure
+                })
+                .receipt
+                .terminal_id,
+            id
+        );
     }
 
     #[test]

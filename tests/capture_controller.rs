@@ -15,9 +15,8 @@ use osslscope::capture::{
     ClockPort, Config, DiscoveryPort, FileStat, LifecycleDelta, LifecycleEvent, LifecycleKind,
     LifecyclePort, ProcPort, SessionSet, TargetInfo, TargetPort, observe,
 };
-use osslscope::count_session::{
-    CountBackend, CountSession, DrainedCounts, FakeCountBackend, FakeLink,
-};
+use osslscope::count_session::*;
+use osslscope::count_session::{CountBackend, CountSession, FakeCountBackend, FakeLink};
 use osslscope::discovery::maps::Mapping;
 use osslscope::discovery::session::{
     AttachEvent, AttachKind, BackingRef, CoverageState, DiscoveredCandidate, DiscoveryDelta,
@@ -107,6 +106,8 @@ struct SharedState {
 
 #[derive(Clone)]
 struct SharedBackend {
+    ready: Ready,
+    barrier: Arc<CountForkBarrier>,
     shared: Rc<RefCell<SharedState>>,
     clock: Rc<FakeClock>,
     order: Rc<RefCell<Vec<String>>>,
@@ -114,17 +115,16 @@ struct SharedBackend {
 
 impl CountBackend for SharedBackend {
     type Link = FakeLink;
-
-    fn attach(
-        &mut self,
-        path: &str,
-        offsets: &[u64],
-        cookies: &[u64],
-    ) -> (Vec<Self::Link>, Vec<usize>) {
+    fn ready(&self) -> &Ready {
+        &self.ready
+    }
+    fn attach(&mut self, request: AttachRequest) -> CommandResult<AttachAck<FakeLink>> {
         let mut st = self.shared.borrow_mut();
-        let (links, bad) = st.backend.attach(path, offsets, cookies);
+        let path = request.locator.clone();
+        let cookies = request.cookies.clone();
+        let ack = st.backend.attach(request)?;
         for (i, cookie) in cookies.iter().enumerate() {
-            if !bad.contains(&i) {
+            if !ack.value.refused.iter().any(|r| r.position == i) {
                 if let Ok(cookie) = u32::try_from(*cookie) {
                     if !st.attached.contains(&cookie) {
                         st.attached.push(cookie);
@@ -132,40 +132,46 @@ impl CountBackend for SharedBackend {
                 }
             }
         }
-        st.log.push(format!("attach:{path}:{}", links.len()));
-        (links, bad)
+        st.log
+            .push(format!("attach:{path}:{}", ack.value.links.len()));
+        Ok(ack)
     }
-
-    fn open_window(
+    fn open_window(&mut self, request: OpenRequest) -> CommandResult<OpenReceipt> {
+        let mut st = self.shared.borrow_mut();
+        st.log.push("count_open".into());
+        self.order.borrow_mut().push("count_open".into());
+        st.backend.open_window(request)
+    }
+    fn set_generation(&mut self, request: GenerationRequest) -> CommandResult<()> {
+        let mut st = self.shared.borrow_mut();
+        st.log.push(format!("gen:{}", request.generation));
+        st.backend.set_generation(request)
+    }
+    fn drain(&mut self, request: ReadRequest) -> CommandResult<Arc<RawSnapshot>> {
+        self.shared.borrow_mut().backend.drain(request)
+    }
+    fn terminal_request(
         &mut self,
-        tgid: u64,
-        generation: u32,
-        start_ns: u64,
-        deadline_ns: u64,
-    ) -> anyhow::Result<()> {
-        let mut st = self.shared.borrow_mut();
-        st.log.push("count_open".to_string());
-        self.order.borrow_mut().push("count_open".to_string());
-        st.backend
-            .open_window(tgid, generation, start_ns, deadline_ns)
+        deadline: Instant,
+        frontier: ControllerFrontier,
+    ) -> TerminalRequest {
+        self.shared
+            .borrow_mut()
+            .backend
+            .terminal_request(deadline, frontier)
     }
-
-    fn set_generation(&mut self, generation: u32) -> anyhow::Result<()> {
+    fn terminal(&mut self, request: TerminalRequest) -> RawTerminal {
         let mut st = self.shared.borrow_mut();
-        st.log.push(format!("gen:{generation}"));
-        st.backend.set_generation(generation)
-    }
-
-    fn close_window(&mut self) -> anyhow::Result<()> {
-        let mut st = self.shared.borrow_mut();
-        st.log.push("count_closed".to_string());
+        st.log.push("count_closed".into());
         st.closed_at = Some(self.clock.monotonic_ns());
-        self.order.borrow_mut().push("count_closed".to_string());
-        st.backend.close_window()
+        self.order.borrow_mut().push("count_closed".into());
+        st.backend.terminal(request)
     }
-
-    fn drain(&mut self, deadline: Option<Instant>) -> anyhow::Result<DrainedCounts> {
-        self.shared.borrow_mut().backend.drain(deadline)
+    fn progress(&self) -> Option<RawCheckpoint> {
+        self.shared.borrow().backend.progress()
+    }
+    fn fork_permit(&self, deadline: Instant) -> Result<CountForkPermit<'_>, ForkBlocked> {
+        self.barrier.prefix_permit(deadline)
     }
 }
 
@@ -1033,6 +1039,8 @@ impl Harness {
         let count = CountSession::new(
             PID,
             SharedBackend {
+                ready: *self.shared.borrow().backend.ready(),
+                barrier: Arc::new(CountForkBarrier::new()),
                 shared: self.shared.clone(),
                 clock: self.clock.clone(),
                 order: self.order.clone(),
@@ -4176,6 +4184,94 @@ fn drain_shortfall_is_partial() {
 }
 
 #[test]
+fn count_terminal_runtime_failure_keeps_positive_calls() {
+    let mut h = Harness::fresh("count-terminal-runtime");
+    h.snapshot_attached();
+    let candidate = cand(
+        "/p/provider.so",
+        backing_of(&h.staged, h.off),
+        1,
+        11,
+        "SHA-256",
+        false,
+        "ok",
+    );
+    h.polls.push_back(DiscoveryDelta::default());
+    h.polls.push_back(DiscoveryDelta {
+        candidates: vec![candidate],
+        tables: vec![terminated(1, 0)],
+        trigger_observed: true,
+        ..Default::default()
+    });
+    h.plans.insert(
+        2,
+        FirePlan {
+            fires: vec![(BASE_NS + 1_000_000_000, 4)],
+            shortfall: 0,
+            cancel: false,
+        },
+    );
+    h.shared
+        .borrow_mut()
+        .backend
+        .terminal_faults(FakeTerminalFaults {
+            read_error: true,
+            ..Default::default()
+        });
+    let (out, _) = h.run();
+    let capture = out.unwrap();
+    assert!(
+        matches!(capture.outcome, Outcome::Fatal(_)),
+        "{:?}",
+        capture.outcome
+    );
+    assert_eq!(capture.document.total_calls(), 4);
+    assert_eq!(counter_value(&capture, "count.drain_read_failed"), 1);
+    assert_eq!(counter_value(&capture, "count.owner_failed"), 1);
+    assert_eq!(
+        capture.document.sites[0].candidates_coverage,
+        CandidateCoverage::Complete
+    );
+}
+
+#[test]
+fn count_fd_admission_refuses_insufficient_and_contradictory_inventory() {
+    use osslscope::capture::CountFdAdmission;
+    for (soft_limit, non_count_open, non_count_reserved, want) in [
+        (20, 1, 1, 18),
+        (16402, 1, 1, 16400),
+        (u64::MAX, 9, 7, 16400),
+    ] {
+        assert_eq!(
+            CountFdAdmission {
+                soft_limit,
+                non_count_open,
+                non_count_reserved
+            }
+            .allowance()
+            .unwrap(),
+            want
+        );
+    }
+    for (soft_limit, non_count_open, non_count_reserved) in [
+        (19, 1, 1),
+        (0, 1, 0),
+        (u64::MAX, u64::MAX, 1),
+        (u64::MAX, 1, u64::MAX),
+    ] {
+        assert!(
+            CountFdAdmission {
+                soft_limit,
+                non_count_open,
+                non_count_reserved
+            }
+            .allowance()
+            .is_err()
+        );
+    }
+}
+
+#[test]
 fn positive_rule_on_unrelated_partial_coverage() {
     // A definite match on a complete site survives alongside an
     // unrelated unknown-coverage op: gaps PARTIAL the window without
@@ -5736,7 +5832,9 @@ fn live_observe_inner(
     let count = CountSession::new(
         pid,
         SharedBackend {
-            shared,
+            ready: *shared.borrow().backend.ready(),
+            barrier: Arc::new(CountForkBarrier::new()),
+            shared: shared.clone(),
             clock: clock.clone(),
             order: Rc::new(RefCell::new(Vec::new())),
         },
@@ -8192,7 +8290,9 @@ fn ordinary_production_capture_genuinely_observed_sleep_is_honest_noquery() {
     let count = CountSession::new(
         pid,
         SharedBackend {
-            shared,
+            ready: *shared.borrow().backend.ready(),
+            barrier: Arc::new(CountForkBarrier::new()),
+            shared: shared.clone(),
             clock: FakeClock::new(),
             order: Rc::new(RefCell::new(Vec::new())),
         },

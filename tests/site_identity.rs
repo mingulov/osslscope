@@ -17,8 +17,7 @@
 //! session's open-file verification runs against the staged paths.
 
 use osslscope::count_session::{
-    CountBackend, CountDelta, CountSession, DiscoveredSite, DrainedCounts, FakeCountBackend,
-    FakeLink, FenceReason,
+    CountBackend, CountDelta, CountSession, DiscoveredSite, FakeCountBackend, FakeLink, FenceReason,
 };
 use osslscope::discovery::maps::Mapping;
 use osslscope::evidence::{
@@ -34,6 +33,12 @@ use std::os::unix::fs::MetadataExt as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+use osslscope::count_session::*;
+
+fn test_deadline() -> std::time::Instant {
+    std::time::Instant::now() + Duration::from_secs(5)
+}
 
 const PID: u32 = 4242;
 
@@ -273,11 +278,13 @@ fn replacement_inode_gets_new_cookie() {
         "fp-A",
         vec![candidate("prov", "default", 1, 7, &["digest"], false)],
     )]);
-    let rep = s.attach_delta(&d0, &live_a, &files, ATTACH_AT).unwrap();
+    let rep = s
+        .attach_delta(&d0, &live_a, &files, ATTACH_AT, test_deadline())
+        .unwrap();
     assert_eq!(rep.attached, 1, "one site attached: {rep:?}");
     assert!(rep.missed.is_empty(), "{:?}", rep.missed);
     let old = s.cookie_for(a.device, a.ino, off).expect("old cookie");
-    s.open_window(1000, 2000).unwrap();
+    s.open_window(1000, 2000, test_deadline()).unwrap();
     fire(&mut s, old, 1500, 7);
 
     // The file is replaced: same path and offset, new inode. The old
@@ -292,7 +299,9 @@ fn replacement_inode_gets_new_cookie() {
         "fp-B",
         vec![candidate("prov", "default", 1, 7, &["digest"], false)],
     )]);
-    let rep = s.attach_delta(&d1, &live_b, &files_b, ATTACH_AT).unwrap();
+    let rep = s
+        .attach_delta(&d1, &live_b, &files_b, ATTACH_AT, test_deadline())
+        .unwrap();
     assert_eq!(rep.attached, 1, "replacement attaches fresh: {rep:?}");
     let new = s.cookie_for(b.device, b.ino, off).expect("new cookie");
     assert_ne!(old, new, "replacement inode must mint a new cookie");
@@ -334,18 +343,22 @@ fn same_inode_alias_path_dedupes() {
         "fp-A",
         vec![candidate("prov", "default", 1, 7, &["digest"], false)],
     )]);
-    let rep = s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
+    let rep = s
+        .attach_delta(&d, &live, &files, ATTACH_AT, test_deadline())
+        .unwrap();
     assert_eq!(rep.attached, 1, "one inode attaches once: {rep:?}");
     assert_eq!(s.cookie_count(), 1, "aliases share one cookie");
     let cookie = s.cookie_for(a.device, a.ino, off).unwrap();
     // A second delta describing the same site reuses the cookie and
     // re-attaches nothing (inode probes cover every mapping).
-    let rep = s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
+    let rep = s
+        .attach_delta(&d, &live, &files, ATTACH_AT, test_deadline())
+        .unwrap();
     assert_eq!(rep.attached, 0, "survivor re-attaches nothing: {rep:?}");
     assert_eq!(rep.reused, 1);
     assert_eq!(s.cookie_for(a.device, a.ino, off).unwrap(), cookie);
 
-    s.open_window(1000, 2000).unwrap();
+    s.open_window(1000, 2000, test_deadline()).unwrap();
     fire(&mut s, cookie, 1500, 11);
     let drain = s.close_and_drain(Duration::from_secs(5)).unwrap();
     assert_eq!(drain.total_calls(), 11);
@@ -380,13 +393,15 @@ fn old_mapping_keeps_old_identity() {
             vec![candidate("prov-new", "default", 1, 7, &["digest"], false)],
         ),
     ]);
-    let rep = s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
+    let rep = s
+        .attach_delta(&d, &live, &files, ATTACH_AT, test_deadline())
+        .unwrap();
     assert_eq!(rep.attached, 2, "{rep:?}");
     let old = s.cookie_for(a.device, a.ino, off).unwrap();
     let new = s.cookie_for(b.device, b.ino, off).unwrap();
     assert_ne!(old, new);
 
-    s.open_window(1000, 2000).unwrap();
+    s.open_window(1000, 2000, test_deadline()).unwrap();
     // Independent A/B provider ledgers: each mapping's executions hit
     // only its own cookie.
     fire(&mut s, old, 1200, 5);
@@ -431,9 +446,10 @@ fn changed_candidates_version_identity() {
         "fp-A",
         vec![candidate("prov", "default", 1, 7, &["digest"], false)],
     )]);
-    s.attach_delta(&d0, &live, &files, ATTACH_AT).unwrap();
+    s.attach_delta(&d0, &live, &files, ATTACH_AT, test_deadline())
+        .unwrap();
     let cookie = s.cookie_for(a.device, a.ino, off).unwrap();
-    s.open_window(1000, 3000).unwrap();
+    s.open_window(1000, 3000, test_deadline()).unwrap();
     fire(&mut s, cookie, 1500, 7);
 
     // Discovery refines the attribution set: the same physical site
@@ -448,7 +464,9 @@ fn changed_candidates_version_identity() {
             candidate("prov", "default", 1, 9, &["digest"], true),
         ],
     )]);
-    let rep = s.attach_delta(&d1, &live, &files, ATTACH_AT).unwrap();
+    let rep = s
+        .attach_delta(&d1, &live, &files, ATTACH_AT, test_deadline())
+        .unwrap();
     assert!(
         rep.candidates_changed,
         "attribution change must request a fence: {rep:?}"
@@ -457,7 +475,8 @@ fn changed_candidates_version_identity() {
     // Pre-fence provenance is untouched.
     assert_eq!(s.provenance(cookie).unwrap().candidates.len(), 1);
 
-    s.fence(FenceReason::CandidatesChanged).unwrap();
+    s.fence(FenceReason::CandidatesChanged, test_deadline())
+        .unwrap();
     assert_eq!(s.generation(), 1);
     // Post-fence provenance carries both candidates.
     assert_eq!(s.provenance(cookie).unwrap().candidates.len(), 2);
@@ -506,12 +525,14 @@ fn fence_keeps_aliases() {
             ),
         ],
     )]);
-    s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
+    s.attach_delta(&d, &live, &files, ATTACH_AT, test_deadline())
+        .unwrap();
     let cookie = s.cookie_for(a.device, a.ino, off).unwrap();
-    s.open_window(1000, 3000).unwrap();
+    s.open_window(1000, 3000, test_deadline()).unwrap();
     fire(&mut s, cookie, 1500, 6);
 
-    s.fence(FenceReason::MappingsChanged).unwrap();
+    s.fence(FenceReason::MappingsChanged, test_deadline())
+        .unwrap();
     fire(&mut s, cookie, 2500, 5);
 
     let drain = s.close_and_drain(Duration::from_secs(5)).unwrap();
@@ -567,7 +588,9 @@ fn duplicate_sites_union_candidates() {
             vec![candidate("prov", "default", 1, 9, &["cipher"], true)],
         ),
     ]);
-    let rep = s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
+    let rep = s
+        .attach_delta(&d, &live, &files, ATTACH_AT, test_deadline())
+        .unwrap();
     assert_eq!(rep.attached, 1, "{rep:?}");
     assert!(!rep.candidates_changed);
     assert_eq!(s.cookie_count(), 1);
@@ -577,7 +600,7 @@ fn duplicate_sites_union_candidates() {
     assert!(prov.candidates.iter().any(|c| c.funcid == 7));
     assert!(prov.candidates.iter().any(|c| c.weak_alias));
 
-    s.open_window(1000, 2000).unwrap();
+    s.open_window(1000, 2000, test_deadline()).unwrap();
     fire(&mut s, cookie, 1500, 4);
     let drain = s.close_and_drain(Duration::from_secs(5)).unwrap();
     assert_eq!(drain.total_calls(), 4);
@@ -626,12 +649,12 @@ fn duplicate_merge_preserves_ambiguity_in_both_orders() {
             vec![leg_ambiguous, leg_complete]
         };
         let rep = s
-            .attach_delta(&delta(legs), &live, &files, ATTACH_AT)
+            .attach_delta(&delta(legs), &live, &files, ATTACH_AT, test_deadline())
             .unwrap();
         assert_eq!(rep.attached, 1, "{tag}: {rep:?}");
         assert_eq!(s.cookie_count(), 1, "{tag}");
         let cookie = s.cookie_for(a.device, a.ino, off).unwrap();
-        s.open_window(1000, 2000).unwrap();
+        s.open_window(1000, 2000, test_deadline()).unwrap();
         fire(&mut s, cookie, 1500, 7);
         let drain = s.close_and_drain(Duration::from_secs(5)).unwrap();
         assert_eq!(drain.total_calls(), 7, "{tag}");
@@ -698,7 +721,10 @@ fn conflicting_objects_in_one_delta_fails() {
             vec![candidate("prov", "default", 1, 7, &["digest"], false)],
         ),
     ]);
-    assert!(s.attach_delta(&d, &live, &files, ATTACH_AT).is_err());
+    assert!(
+        s.attach_delta(&d, &live, &files, ATTACH_AT, test_deadline())
+            .is_err()
+    );
 }
 
 #[test]
@@ -720,21 +746,24 @@ fn staged_update_reverted_before_fence() {
         }
         delta(vec![site(&a, off, "fp-A", cands)])
     };
-    s.attach_delta(&mk(false), &live, &files, ATTACH_AT)
+    s.attach_delta(&mk(false), &live, &files, ATTACH_AT, test_deadline())
         .unwrap();
     let cookie = s.cookie_for(a.device, a.ino, off).unwrap();
-    s.open_window(1000, 3000).unwrap();
+    s.open_window(1000, 3000, test_deadline()).unwrap();
     fire(&mut s, cookie, 1200, 3);
 
-    let rep = s.attach_delta(&mk(true), &live, &files, ATTACH_AT).unwrap();
+    let rep = s
+        .attach_delta(&mk(true), &live, &files, ATTACH_AT, test_deadline())
+        .unwrap();
     assert!(rep.candidates_changed);
     // Revert: the live meaning re-affirmed, no fence requested.
     let rep = s
-        .attach_delta(&mk(false), &live, &files, ATTACH_AT)
+        .attach_delta(&mk(false), &live, &files, ATTACH_AT, test_deadline())
         .unwrap();
     assert!(!rep.candidates_changed, "revert cancels staging: {rep:?}");
 
-    s.fence(FenceReason::MappingsChanged).unwrap();
+    s.fence(FenceReason::MappingsChanged, test_deadline())
+        .unwrap();
     assert_eq!(s.provenance(cookie).unwrap().candidates.len(), 1);
     fire(&mut s, cookie, 2500, 2);
     let drain = s.close_and_drain(Duration::from_secs(5)).unwrap();
@@ -769,14 +798,14 @@ fn changed_object_fingerprint_versions_identity() {
             vec![candidate("prov", "default", 1, 7, &["digest"], false)],
         )])
     };
-    s.attach_delta(&mk("fp-A"), &live, &files, ATTACH_AT)
+    s.attach_delta(&mk("fp-A"), &live, &files, ATTACH_AT, test_deadline())
         .unwrap();
     let cookie = s.cookie_for(a.device, a.ino, off).unwrap();
-    s.open_window(1000, 3000).unwrap();
+    s.open_window(1000, 3000, test_deadline()).unwrap();
     fire(&mut s, cookie, 1500, 7);
 
     let rep = s
-        .attach_delta(&mk("fp-B"), &live, &files, ATTACH_AT)
+        .attach_delta(&mk("fp-B"), &live, &files, ATTACH_AT, test_deadline())
         .unwrap();
     assert!(
         rep.candidates_changed,
@@ -784,7 +813,8 @@ fn changed_object_fingerprint_versions_identity() {
     );
     assert_eq!(s.provenance(cookie).unwrap().site.object, obj("fp-A"));
 
-    s.fence(FenceReason::ProviderChanged).unwrap();
+    s.fence(FenceReason::ProviderChanged, test_deadline())
+        .unwrap();
     assert_eq!(s.provenance(cookie).unwrap().site.object, obj("fp-B"));
     fire(&mut s, cookie, 2500, 4);
 
@@ -806,46 +836,44 @@ struct StragglerBackend {
 
 impl CountBackend for StragglerBackend {
     type Link = FakeLink;
-
-    fn attach(
+    fn ready(&self) -> &Ready {
+        self.inner.ready()
+    }
+    fn attach(&mut self, request: AttachRequest) -> CommandResult<AttachAck<FakeLink>> {
+        self.inner.attach(request)
+    }
+    fn open_window(&mut self, request: OpenRequest) -> CommandResult<OpenReceipt> {
+        self.inner.open_window(request)
+    }
+    fn set_generation(&mut self, request: GenerationRequest) -> CommandResult<()> {
+        self.inner.set_generation(request)
+    }
+    fn drain(&mut self, request: ReadRequest) -> CommandResult<std::sync::Arc<RawSnapshot>> {
+        self.inner.drain(request)
+    }
+    fn terminal_request(
         &mut self,
-        path: &str,
-        offsets: &[u64],
-        cookies: &[u64],
-    ) -> (Vec<Self::Link>, Vec<usize>) {
-        self.inner.attach(path, offsets, cookies)
+        deadline: Instant,
+        frontier: ControllerFrontier,
+    ) -> TerminalRequest {
+        self.inner.terminal_request(deadline, frontier)
     }
-
-    fn open_window(
-        &mut self,
-        tgid: u64,
-        generation: u32,
-        start_ns: u64,
-        deadline_ns: u64,
-    ) -> anyhow::Result<()> {
-        self.inner
-            .open_window(tgid, generation, start_ns, deadline_ns)
-    }
-
-    fn set_generation(&mut self, generation: u32) -> anyhow::Result<()> {
-        self.inner.set_generation(generation)
-    }
-
-    fn close_window(&mut self) -> anyhow::Result<()> {
-        self.inner.close_window()
-    }
-
-    fn drain(&mut self, deadline: Option<Instant>) -> anyhow::Result<DrainedCounts> {
-        let out = self.inner.drain(deadline)?;
+    fn terminal(&mut self, request: TerminalRequest) -> RawTerminal {
         if let Some((cookie, generation, value)) = self.straggler.take() {
             self.inner.inject_row(cookie, generation, value);
         }
-        Ok(out)
+        self.inner.terminal(request)
+    }
+    fn progress(&self) -> Option<RawCheckpoint> {
+        self.inner.progress()
+    }
+    fn fork_permit(&self, deadline: Instant) -> Result<CountForkPermit<'_>, ForkBlocked> {
+        self.inner.fork_permit(deadline)
     }
 }
 
 #[test]
-fn close_drain_quiesces_inflight_increment() {
+fn close_model_routes_completion_before_witness() {
     let stage = Stage::fresh("quiesce");
     let bytes = self_bytes();
     let off = x_offset(&bytes);
@@ -865,9 +893,10 @@ fn close_drain_quiesces_inflight_increment() {
         "fp-A",
         vec![candidate("prov", "default", 1, 7, &["digest"], false)],
     )]);
-    s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
+    s.attach_delta(&d, &live, &files, ATTACH_AT, test_deadline())
+        .unwrap();
     let cookie = s.cookie_for(a.device, a.ino, off).unwrap();
-    s.open_window(1000, 2000).unwrap();
+    s.open_window(1000, 2000, test_deadline()).unwrap();
     s.backend_mut().inner.fire(PID, cookie, 1500, 7);
     // Admitted pre-close, landing after the first scan.
     s.backend_mut().straggler = Some((
@@ -903,9 +932,10 @@ fn future_generation_row_is_unattributed_loss() {
         "fp-A",
         vec![candidate("prov", "default", 1, 7, &["digest"], false)],
     )]);
-    s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
+    s.attach_delta(&d, &live, &files, ATTACH_AT, test_deadline())
+        .unwrap();
     let cookie = s.cookie_for(a.device, a.ino, off).unwrap();
-    s.open_window(1000, 2000).unwrap();
+    s.open_window(1000, 2000, test_deadline()).unwrap();
     s.backend_mut().inject_row(
         cookie,
         99,
@@ -948,7 +978,9 @@ fn attach_stamps_installed_at_on_first_bind() {
         "fp-A",
         vec![candidate("prov", "default", 1, 7, &["digest"], false)],
     )]);
-    let rep = s.attach_delta(&d, &live, &files, 900).unwrap();
+    let rep = s
+        .attach_delta(&d, &live, &files, 900, test_deadline())
+        .unwrap();
     assert_eq!(rep.attached, 1, "{rep:?}");
     let cookie = s.cookie_for(a.device, a.ino, off).unwrap();
     assert_eq!(
@@ -973,8 +1005,11 @@ fn reattach_keeps_first_installed_at() {
         "fp-A",
         vec![candidate("prov", "default", 1, 7, &["digest"], false)],
     )]);
-    s.attach_delta(&d, &live, &files, 900).unwrap();
-    let rep = s.attach_delta(&d, &live, &files, 1500).unwrap();
+    s.attach_delta(&d, &live, &files, 900, test_deadline())
+        .unwrap();
+    let rep = s
+        .attach_delta(&d, &live, &files, 1500, test_deadline())
+        .unwrap();
     assert_eq!(rep.reused, 1, "survivor re-attaches nothing: {rep:?}");
     let cookie = s.cookie_for(a.device, a.ino, off).unwrap();
     assert_eq!(
@@ -1003,7 +1038,9 @@ fn missed_bind_leaves_installed_at_unset() {
         "fp-A",
         vec![candidate("prov", "default", 1, 7, &["digest"], false)],
     )]);
-    let report = s.attach_delta(&d, &live, &files, 900).unwrap();
+    let report = s
+        .attach_delta(&d, &live, &files, 900, test_deadline())
+        .unwrap();
     assert_eq!(report.attached, 0);
     assert!(
         report.missed.iter().any(|m| m.reason == "replaced"),
@@ -1036,9 +1073,10 @@ fn drained_site_carries_installed_at() {
         "fp-A",
         vec![candidate("prov", "default", 1, 7, &["digest"], false)],
     )]);
-    s.attach_delta(&d, &live, &files, 900).unwrap();
+    s.attach_delta(&d, &live, &files, 900, test_deadline())
+        .unwrap();
     let cookie = s.cookie_for(a.device, a.ino, off).unwrap();
-    s.open_window(1000, 2000).unwrap();
+    s.open_window(1000, 2000, test_deadline()).unwrap();
     fire(&mut s, cookie, 1500, 7);
     let drain = s.close_and_drain(Duration::from_secs(5)).unwrap();
     assert_eq!(drain.current.len(), 1);
@@ -1070,11 +1108,13 @@ fn fenced_site_carries_installed_at() {
         "fp-A",
         vec![candidate("prov", "default", 1, 7, &["digest"], false)],
     )]);
-    s.attach_delta(&d, &live, &files, 900).unwrap();
+    s.attach_delta(&d, &live, &files, 900, test_deadline())
+        .unwrap();
     let cookie = s.cookie_for(a.device, a.ino, off).unwrap();
-    s.open_window(1000, 3000).unwrap();
+    s.open_window(1000, 3000, test_deadline()).unwrap();
     fire(&mut s, cookie, 1500, 7);
-    s.fence(FenceReason::MappingsChanged).unwrap();
+    s.fence(FenceReason::MappingsChanged, test_deadline())
+        .unwrap();
     fire(&mut s, cookie, 2500, 4);
     let drain = s.close_and_drain(Duration::from_secs(5)).unwrap();
     assert_eq!(drain.fenced.len(), 1);
@@ -1110,10 +1150,12 @@ fn straggler_bucket_carries_installed_at() {
         "fp-A",
         vec![candidate("prov", "default", 1, 7, &["digest"], false)],
     )]);
-    s.attach_delta(&d, &live, &files, 900).unwrap();
+    s.attach_delta(&d, &live, &files, 900, test_deadline())
+        .unwrap();
     let cookie = s.cookie_for(a.device, a.ino, off).unwrap();
-    s.open_window(1000, 2000).unwrap();
-    s.fence(FenceReason::MappingsChanged).unwrap();
+    s.open_window(1000, 2000, test_deadline()).unwrap();
+    s.fence(FenceReason::MappingsChanged, test_deadline())
+        .unwrap();
     s.backend_mut().inject_row(
         cookie,
         0,

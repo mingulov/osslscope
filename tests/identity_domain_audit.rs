@@ -355,13 +355,13 @@ fn h5_t3_every_device_site_names_one_domain() {
         (
             "src/count_session.rs",
             "stat",
-            ".insert((prov.site.device, prov.site.inode, *offset));",
+            ".insert((prov.site.device, prov.site.inode, offset));",
             1,
         ),
         (
             "src/count_session.rs",
             "stat",
-            "let key = (prov.site.device, prov.site.inode, *offset);",
+            ".contains(&(prov.site.device, prov.site.inode, *offset))",
             1,
         ),
         (
@@ -370,7 +370,8 @@ fn h5_t3_every_device_site_names_one_domain() {
             "let key = (site.site.device, site.site.inode, site.site.offset);",
             1,
         ),
-        // count_session.rs: plan rows render stat words (×3 + lookup ×2).
+        // count_session.rs: plan rows and owner refusals render stat words;
+        // both lookups consume the same encoded stat-domain identities.
         (
             "src/count_session.rs",
             "stat",
@@ -380,8 +381,8 @@ fn h5_t3_every_device_site_names_one_domain() {
         (
             "src/count_session.rs",
             "stat",
-            "dev: plan::render_device(prov.site.device),",
-            2,
+            "dev: plan::render_device(backing.device),",
+            1,
         ),
         (
             "src/count_session.rs",
@@ -395,11 +396,26 @@ fn h5_t3_every_device_site_names_one_domain() {
             "let Some(cookie) = self.stable.lookup(&row.dev, row.ino, row.offset) else {",
             1,
         ),
-        // count_session.rs: H4 pin (fstat) vs site triple (stat).
+        // count_session.rs: the owner request copies the immutable planned
+        // stat word; terminal survivor binding compares it with that provenance.
         (
             "src/count_session.rs",
             "stat",
-            "if pin.device == prov.site.device && pin.ino == prov.site.inode {",
+            "device: prov.site.device,",
+            1,
+        ),
+        (
+            "src/count_session.rs",
+            "stat",
+            "if prov.site.device != pending.backing.device",
+            1,
+        ),
+        // count_session.rs: the HostModel backend verifies an actual fstat pin
+        // against the request's planned stat word, like the live owner port.
+        (
+            "src/count_session.rs",
+            "stat",
+            "if p.device != request.expected_backing.device",
             1,
         ),
         // harvest.rs: legacy target dev (stat render + maps fallback + raw expected).

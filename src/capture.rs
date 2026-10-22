@@ -4829,6 +4829,7 @@ where
             ctx.live,
             ctx.files,
             self.clock.monotonic_ns(),
+            deadline.unwrap_or_else(|| self.clock.now()),
         )?;
         self.attached_total = self.attached_total.saturating_add(report.attached);
         for site in &adapted.delta.discovered {
@@ -5083,7 +5084,7 @@ where
             None
         };
         if let Some(reason) = fence_reason {
-            self.count.fence(reason)?;
+            self.count.fence(reason, deadline)?;
             // The fence consumed this round's witness (F3): one
             // fence per round covers the round's exec-ness (local
             // or snapshot-sourced — either versions the
@@ -5164,10 +5165,13 @@ where
                 drain_failed = false;
                 Some(drained)
             }
-            None => match self.count.close_and_drain(self.cfg.grace) {
-                Ok(drained) => {
+            None => match self.count.close_for_capture(self.cfg.grace) {
+                Ok(retained) => {
+                    if let Some(failure) = retained.runtime_failure() {
+                        failures.push(failure.to_string());
+                    }
                     drain_failed = false;
-                    Some(drained)
+                    Some(retained.into_drain())
                 }
                 Err(e) => {
                     self.extra_counters.push(typed_counter(
@@ -5177,7 +5181,7 @@ where
                         CounterSource::Drain,
                         1,
                     ));
-                    failures.push(format!("close_and_drain: {e:#}"));
+                    failures.push(format!("count retained view: {e}"));
                     drain_failed = true;
                     None
                 }
@@ -5509,7 +5513,13 @@ where
         // post-window executions as in-window evidence.
         anyhow::bail!("requested window elapsed before window open");
     }
-    if let Err(e) = count.open_window(start_ns, kernel_deadline_ns) {
+    if let Err(e) = count.open_window(
+        start_ns,
+        kernel_deadline_ns,
+        info.acquired_instant
+            .checked_add(cfg.harvest_timeout)
+            .unwrap_or(info.acquired_instant),
+    ) {
         let _ = count.close_and_drain(cfg.grace);
         let _ = target.resolve_setup_failure();
         return Err(e.context("count open_window"));
@@ -5635,12 +5645,15 @@ where
                 post_release: false,
                 baseline: true,
             };
-            self.apply_delta(&delta, poll_end, &ctx, None)
+            self.apply_delta(&delta, poll_end, &ctx, setup_deadline)
         })();
         match baseline_outcome {
             Ok((_, fence_candidates)) => {
                 if fence_candidates {
-                    if let Err(e) = self.count.fence(CountFence::CandidatesChanged) {
+                    if let Err(e) = self.count.fence(
+                        CountFence::CandidatesChanged,
+                        setup_deadline.unwrap_or_else(|| self.clock.now()),
+                    ) {
                         let _ = self.count.close_and_drain(self.cfg.grace);
                         let _ = self.target.resolve_setup_failure();
                         return Err(e.context("setup fence"));
@@ -5911,12 +5924,21 @@ where
         // between here and finish, so it stays valid; a failed
         // finish takes the live session).
         let pre_finish = self.discovery.snapshot();
-        let drain = match self.count.close_and_drain(self.cfg.grace) {
-            Ok(drain) => drain,
+        let drain = match self.count.close_for_capture(self.cfg.grace) {
+            Ok(retained) if retained.runtime_failure().is_none() => retained.into_drain(),
+            Ok(retained) => {
+                let failure = retained.runtime_failure().expect("runtime failure branch");
+                return Ok(self.salvage(
+                    SalvageSeed {
+                        drain: Some(retained.into_drain()),
+                        snapshot: None,
+                        disposition: None,
+                        effective_end_ns,
+                    },
+                    failure.into(),
+                ));
+            }
             Err(e) => {
-                // Discovery finish is still attempted inside salvage
-                // (None seed) — only an already-failed finish takes
-                // the pre-finish fallback.
                 return Ok(self.salvage(
                     SalvageSeed {
                         drain: None,
@@ -5924,7 +5946,7 @@ where
                         disposition: None,
                         effective_end_ns,
                     },
-                    e.context("close_and_drain"),
+                    e.into(),
                 ));
             }
         };
@@ -7718,11 +7740,99 @@ fn wrap_discovery(
     )))
 }
 
-/// Shared window setup over resolved objects (both entries funnel
-/// here after their own resolution; `traversal` selects the
-/// backend attach after discovery attaches, before release;
-/// `selected_objects` is the run-set selection the caller resolved,
-/// stamped onto the capture and its document before return).
+/// Count's process-local FD allowance after observed other-plane demand and
+/// explicit pending non-count reservations. This never changes RLIMIT_NOFILE.
+#[derive(Debug, Clone, Copy)]
+pub struct CountFdAdmission {
+    pub soft_limit: u64,
+    pub non_count_open: u64,
+    pub non_count_reserved: u64,
+}
+impl CountFdAdmission {
+    pub fn allowance(&self) -> Result<u64, crate::count_owner::OwnerFailure> {
+        use crate::count_owner::{CountOperation, FailureClass, OwnerFailure};
+        let fail = || OwnerFailure::engine(CountOperation::Load, FailureClass::Capacity);
+        let remaining = self
+            .soft_limit
+            .checked_sub(self.non_count_open)
+            .and_then(|n| n.checked_sub(self.non_count_reserved))
+            .ok_or_else(fail)?;
+        let allowance = remaining.min(16_400);
+        if allowance < 18 {
+            return Err(fail());
+        }
+        Ok(allowance)
+    }
+
+    fn snapshot(non_count_reserved: u64) -> Result<Self, crate::count_owner::OwnerFailure> {
+        use crate::count_owner::{CountOperation, FailureClass, OwnerFailure};
+        let fail = || OwnerFailure::engine(CountOperation::Load, FailureClass::Inventory);
+        let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+        // SAFETY: getrlimit initializes the supplied valid output on success.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) } != 0 {
+            return Err(fail());
+        }
+        // SAFETY: the successful getrlimit call initialized this value.
+        let limit = unsafe { limit.assume_init() };
+        if limit.rlim_cur > limit.rlim_max {
+            return Err(fail());
+        }
+        let entries = std::fs::read_dir("/proc/self/fd").map_err(|_| fail())?;
+        // read_dir itself holds exactly one descriptor, present in this proc
+        // inventory. Exclude that transient while the iterator remains alive.
+        let mut observed = HashSet::new();
+        for entry in entries {
+            let entry = entry.map_err(|_| fail())?;
+            let fd: u64 = entry
+                .file_name()
+                .to_str()
+                .ok_or_else(fail)?
+                .parse()
+                .map_err(|_| fail())?;
+            if !observed.insert(fd) {
+                return Err(fail());
+            }
+        }
+        let non_count_open = u64::try_from(observed.len())
+            .map_err(|_| fail())?
+            .checked_sub(1)
+            .ok_or_else(fail)?;
+        Ok(Self {
+            soft_limit: limit.rlim_cur,
+            non_count_open,
+            non_count_reserved,
+        })
+    }
+}
+
+fn prepare_count_backend(
+    object_bytes: &[u8],
+    target_tgid: u32,
+    fork_barrier: std::sync::Arc<crate::count_owner::CountForkBarrier>,
+    setup_deadline: Instant,
+) -> Result<crate::count_session::LiveBackend, crate::count_owner::CountPrepareFailure> {
+    use crate::count_owner::{
+        CountInput, CountOperation, CountOwnerLimits, FailureClass, OwnerFailure,
+    };
+    use sha2::Digest as _;
+    // All selected persistent planes have completed acquisition, so no such
+    // acquisition remains pending at this boundary. Later ordinary opens are
+    // not reserved by this snapshot and still take their runtime error paths.
+    let allowance = CountFdAdmission::snapshot(0)?.allowance()?;
+    let possible_cpus = aya::util::nr_cpus()
+        .map_err(|_| OwnerFailure::engine(CountOperation::Load, FailureClass::InvalidInput))?;
+    let limits = CountOwnerLimits::from_allowance(allowance, possible_cpus)?;
+    let input = CountInput {
+        object_bytes: std::sync::Arc::from(object_bytes),
+        object_sha256: sha2::Sha256::digest(object_bytes).into(),
+        target_tgid,
+        fork_barrier,
+    };
+    crate::count_session::LiveBackend::prepare(input, limits, setup_deadline)
+}
+
+/// Shared window setup over resolved objects. The selected discovery and
+/// traversal planes complete acquisition before count FD admission.
 fn run_inner(
     cfg: &Config,
     target: Target,
@@ -7740,12 +7850,7 @@ fn run_inner(
         None => onboard::read_bounded(&objects.count, onboard::MAX_OBJECT_SCAN_BYTES)
             .map_err(|e| anyhow::anyhow!("count object {}: {e}", objects.count.display()))?,
     };
-    let prep = crate::loader::prepare(
-        &obj_bytes,
-        &crate::loader::COUNT_MAPS,
-        &crate::loader::COUNT_PROGS,
-    )?;
-    let loaded = crate::loader::load(&prep).map_err(|e| anyhow::anyhow!("count load: {e:#}"))?;
+    let fork_barrier = std::sync::Arc::new(crate::count_owner::CountForkBarrier::new());
     // Target-identity snapshot at acquisition (the target may be
     // dead by report time — /proc reads then would miss).
     let acq_clock = LiveClock;
@@ -7822,8 +7927,6 @@ fn run_inner(
                 acquired_instant: acq_instant,
                 acquired_wall: acq_wall,
             };
-            let backend = crate::count_session::LiveBackend::new(loaded, pid);
-            let count = CountSession::new(pid, backend);
             let discovery = match DiscoverySession::attach(
                 &crate::discovery::session::DiscoveryConfig {
                     provider: resolved.path,
@@ -7869,6 +7972,16 @@ fn run_inner(
                     return Err(e.context(format!("traversal attach{exit_note}")));
                 }
             };
+            let lifecycle = LiveLifecycle::select(pid, false);
+            let backend = prepare_count_backend(
+                &obj_bytes,
+                pid,
+                fork_barrier,
+                info.acquired_instant
+                    .checked_add(cfg.harvest_timeout)
+                    .unwrap_or(info.acquired_instant),
+            )?;
+            let count = CountSession::new(pid, backend);
             observe(
                 &effective,
                 &info,
@@ -7876,7 +7989,7 @@ fn run_inner(
                     discovery,
                     count,
                     target: owned,
-                    lifecycle: LiveLifecycle::select(pid, false),
+                    lifecycle,
                 },
                 &LiveClock,
                 &mut LiveProc,
@@ -7904,8 +8017,6 @@ fn run_inner(
                 acquired_instant: acq_instant,
                 acquired_wall: acq_wall,
             };
-            let backend = crate::count_session::LiveBackend::new(loaded, p);
-            let count = CountSession::new(p, backend);
             let discovery = match DiscoverySession::attach(
                 &crate::discovery::session::DiscoveryConfig {
                     provider: resolved.path,
@@ -7936,6 +8047,16 @@ fn run_inner(
                 Ok(discovery) => discovery,
                 Err(e) => return Err(e.context("traversal attach")),
             };
+            let lifecycle = LiveLifecycle::select(p, true);
+            let backend = prepare_count_backend(
+                &obj_bytes,
+                p,
+                fork_barrier,
+                info.acquired_instant
+                    .checked_add(cfg.harvest_timeout)
+                    .unwrap_or(info.acquired_instant),
+            )?;
+            let count = CountSession::new(p, backend);
             observe(
                 &effective,
                 &info,
@@ -7943,7 +8064,7 @@ fn run_inner(
                     discovery,
                     count,
                     target: PinnedTarget::new(p, pin_guard),
-                    lifecycle: LiveLifecycle::select(p, true),
+                    lifecycle,
                 },
                 &LiveClock,
                 &mut LiveProc,
@@ -11875,10 +11996,18 @@ mod tests {
                 losses: Vec::new(),
             };
             count
-                .attach_delta(&delta, &live, &files, ATTACH_AT)
+                .attach_delta(
+                    &delta,
+                    &live,
+                    &files,
+                    ATTACH_AT,
+                    Instant::now() + Duration::from_secs(5),
+                )
                 .unwrap();
             let cookie = count.cookie_for(dev, ino, off).unwrap();
-            count.open_window(1000, 2000).unwrap();
+            count
+                .open_window(1000, 2000, Instant::now() + Duration::from_secs(5))
+                .unwrap();
             count.backend_mut().fire(TPID, cookie, 1500, 7);
             (seed, (dev, ino))
         }
@@ -12536,11 +12665,10 @@ mod tests {
         }
 
         #[test]
-        fn h7_close_drain_error_salvages_without_sites() {
-            // T1b (RED): close_and_drain fails (here: the session was
-            // already drained — the same Err arm a real close I/O
-            // error takes) — salvage keeps the loss explicit, with
-            // no sites (the drain is gone) and a typed loss counter.
+        fn h7_close_drain_error_preserves_retained_sites() {
+            // An actual modeled read failure follows successful observations.
+            // The canonical terminal retains the seven calls and immutable
+            // candidate meaning; typed count loss prevents absence proof.
             let cfg = stub_config();
             let info = stub_info();
             let clock = ClockStub::at(1_500);
@@ -12548,7 +12676,13 @@ mod tests {
             let cancelled = || false;
             let mut count = CountSession::new(TPID, FakeCountBackend::new());
             let _seed = seed_site(&mut count);
-            count.close_and_drain(Duration::from_secs(1)).unwrap();
+            count
+                .backend_mut()
+                .terminal_faults(crate::count_session::FakeTerminalFaults {
+                    read_error: true,
+                    ..Default::default()
+                });
+            assert!(count.close_and_drain(Duration::from_secs(1)).is_err());
             let runner = stub_runner(
                 &cfg,
                 &info,
@@ -12566,15 +12700,20 @@ mod tests {
             let cap = runner
                 .close_and_finalize()
                 .expect("H7: drain error must salvage, not Err");
-            assert!(cap.document.sites.is_empty());
-            assert_eq!(counter(&cap.document, "count.close_failed"), 1);
+            assert_eq!(cap.document.total_calls(), 7);
+            assert_eq!(
+                cap.document.sites[0].candidates_coverage,
+                CandidateCoverage::Complete
+            );
+            assert_eq!(counter(&cap.document, "count.drain_read_failed"), 1);
             assert!(cap.reasons.iter().any(|r| r == "close-failure"));
         }
 
         #[test]
         fn h7_double_close_failure_salvages_once() {
-            // T5 (RED): drain AND finish both fail — one salvaged
-            // capture, both losses recorded, no double-close cascade.
+            // An actual modeled read failure follows successful observations.
+            // The canonical terminal retains the seven calls and immutable
+            // candidate meaning; typed count loss prevents absence proof.
             let cfg = stub_config();
             let info = stub_info();
             let clock = ClockStub::at(1_500);
@@ -12582,7 +12721,13 @@ mod tests {
             let cancelled = || false;
             let mut count = CountSession::new(TPID, FakeCountBackend::new());
             let _seed = seed_site(&mut count);
-            count.close_and_drain(Duration::from_secs(1)).unwrap();
+            count
+                .backend_mut()
+                .terminal_faults(crate::count_session::FakeTerminalFaults {
+                    read_error: true,
+                    ..Default::default()
+                });
+            assert!(count.close_and_drain(Duration::from_secs(1)).is_err());
             let runner = stub_runner(
                 &cfg,
                 &info,
@@ -12600,8 +12745,12 @@ mod tests {
             let cap = runner
                 .close_and_finalize()
                 .expect("H7: double close error must salvage once, not Err");
-            assert!(cap.document.sites.is_empty());
-            assert_eq!(counter(&cap.document, "count.close_failed"), 1);
+            assert_eq!(cap.document.total_calls(), 7);
+            assert_eq!(
+                cap.document.sites[0].candidates_coverage,
+                CandidateCoverage::Complete
+            );
+            assert_eq!(counter(&cap.document, "count.drain_read_failed"), 1);
             assert_eq!(counter(&cap.document, "discovery.finish_failed"), 1);
             assert!(cap.reasons.iter().any(|r| r == "close-failure"));
         }
@@ -12713,10 +12862,10 @@ mod tests {
         }
 
         #[test]
-        fn h7_drain_error_taints_coverage_unknown() {
-            // T4 (RED): a close_and_drain error feeds H2's
-            // close-evidence taint — surviving coverage denominators
-            // go Unknown (a failed close may hide tails).
+        fn h7_drain_error_keeps_candidate_coverage_and_count_uncertainty() {
+            // An actual modeled read failure follows successful observations.
+            // The canonical terminal retains the seven calls and immutable
+            // candidate meaning; typed count loss prevents absence proof.
             let cfg = stub_config();
             let info = stub_info();
             let clock = ClockStub::at(1_500);
@@ -12724,7 +12873,13 @@ mod tests {
             let cancelled = || false;
             let mut count = CountSession::new(TPID, FakeCountBackend::new());
             let _seed = seed_site(&mut count);
-            count.close_and_drain(Duration::from_secs(1)).unwrap();
+            count
+                .backend_mut()
+                .terminal_faults(crate::count_session::FakeTerminalFaults {
+                    read_error: true,
+                    ..Default::default()
+                });
+            assert!(count.close_and_drain(Duration::from_secs(1)).is_err());
             let runner = stub_runner(
                 &cfg,
                 &info,
@@ -12742,7 +12897,12 @@ mod tests {
             let cap = runner
                 .close_and_finalize()
                 .expect("H7: drain error must salvage, not Err");
-            assert_eq!(dispatch_expected(&cap.document), ExpectedScope::Unknown);
+            assert_eq!(
+                dispatch_expected(&cap.document),
+                ExpectedScope::Applicable { sites: 1 }
+            );
+            assert_eq!(cap.document.total_calls(), 7);
+            assert_eq!(counter(&cap.document, "count.drain_read_failed"), 1);
         }
 
         #[test]
@@ -13345,20 +13505,24 @@ mod tests {
         }
 
         #[test]
-        fn runtime_lost_drain_evaluates_without_sites() {
-            // R02 control: a lost drain (pre-drained session plus a
-            // finish failure) salvages no sites; the Runtime doc still
-            // evaluates (kind-eligible) to inconclusive — absence is
-            // unprovable over a broken close — with an accurate empty
-            // CBOM and exit 1.
+        fn runtime_failed_drain_evaluates_retained_sites() {
+            // An actual modeled read failure follows successful observations.
+            // The canonical terminal retains the seven calls and immutable
+            // candidate meaning; typed count loss prevents absence proof.
             let cfg = stub_config();
             let info = stub_info();
             let clock = ClockStub::at(1_500);
             let mut proc = ProcStub;
             let cancelled = || false;
             let mut count = CountSession::new(TPID, FakeCountBackend::new());
-            let _seed = seed_site(&mut count);
-            count.close_and_drain(Duration::from_secs(1)).unwrap();
+            let (_seed, (dev, ino)) = seed_site_as(&mut count, "default");
+            count
+                .backend_mut()
+                .terminal_faults(crate::count_session::FakeTerminalFaults {
+                    read_error: true,
+                    ..Default::default()
+                });
+            assert!(count.close_and_drain(Duration::from_secs(1)).is_err());
             let mut runner = stub_runner(
                 &cfg,
                 &info,
@@ -13374,6 +13538,7 @@ mod tests {
                 &cancelled,
             );
             align_window(&mut runner);
+            push_seed_objects(&mut runner, dev, ino);
             let cap = runner
                 .close_and_finalize()
                 .expect("double close error must salvage once, not Err");
@@ -13388,8 +13553,12 @@ mod tests {
                 "want Fatal(Runtime), got {:?}",
                 cap.document.status
             );
-            assert!(cap.document.sites.is_empty());
-            assert_eq!(counter(&cap.document, "count.close_failed"), 1);
+            assert_eq!(cap.document.total_calls(), 7);
+            assert_eq!(
+                cap.document.sites[0].candidates_coverage,
+                CandidateCoverage::Complete
+            );
+            assert_eq!(counter(&cap.document, "count.drain_read_failed"), 1);
             assert_eq!(counter(&cap.document, "discovery.finish_failed"), 1);
             assert!(cap.reasons.iter().any(|r| r == "close-failure"));
             assert!(cap.document.has_usable_evidence());
@@ -13432,7 +13601,7 @@ mod tests {
             crate::schema::check_v2_semantics(&v).expect("lost-drain Runtime must validate");
             assert_eq!(v["policy"]["verdict"], "inconclusive");
             let cbom: serde_json::Value = serde_json::from_slice(&cbom_bytes).unwrap();
-            assert_eq!(cbom["components"].as_array().unwrap().len(), 0);
+            assert_eq!(cbom["components"].as_array().unwrap().len(), 1);
             let meta = cbom_props(&cbom["metadata"]["properties"]);
             assert_eq!(meta["osslscope:omitted-ambiguous-sites"], "0");
             assert_eq!(meta["osslscope:omitted-unknown-coverage-sites"], "0");

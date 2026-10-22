@@ -24,6 +24,12 @@ use std::sync::{
 };
 use std::time::Duration;
 
+use osslscope::count_session::*;
+
+fn test_deadline() -> std::time::Instant {
+    std::time::Instant::now() + Duration::from_secs(5)
+}
+
 const PID: u32 = 4242;
 
 // Incidental attach stamp for the tests that predate installed-at:
@@ -169,9 +175,10 @@ fn kernel_deadline_excludes_late_calls() {
         discovered: vec![site(&a, off, 7)],
         losses: Vec::new(),
     };
-    s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
+    s.attach_delta(&d, &live, &files, ATTACH_AT, test_deadline())
+        .unwrap();
     let cookie = s.cookie_for(a.device, a.ino, off).unwrap();
-    s.open_window(1000, 2000).unwrap();
+    s.open_window(1000, 2000, test_deadline()).unwrap();
     let fire = |s: &mut CountSession<FakeCountBackend>, tgid: u32, now: u64, n: u64| {
         s.backend_mut().fire(tgid, cookie, now, n);
     };
@@ -217,7 +224,8 @@ fn window_closed_until_open() {
         discovered: vec![site(&a, off, 7)],
         losses: Vec::new(),
     };
-    s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
+    s.attach_delta(&d, &live, &files, ATTACH_AT, test_deadline())
+        .unwrap();
     let cookie = s.cookie_for(a.device, a.ino, off).unwrap();
 
     s.backend_mut().fire(PID, cookie, 1500, 11);
@@ -225,9 +233,11 @@ fn window_closed_until_open() {
     // Isolate the zeroed interval from the target guard: armed
     // target, zeroed WINDOW — still nothing admitted.
     let mut armed = session_with(FakeCountBackend::new());
-    armed.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
+    armed
+        .attach_delta(&d, &live, &files, ATTACH_AT, test_deadline())
+        .unwrap();
     let cookie_a = armed.cookie_for(a.device, a.ino, off).unwrap();
-    armed.open_window(1000, 2000).unwrap();
+    armed.open_window(1000, 2000, test_deadline()).unwrap();
     armed.backend_mut().deprogram_window();
     armed.backend_mut().fire(PID, cookie_a, 1500, 11);
     assert_eq!(
@@ -235,14 +245,20 @@ fn window_closed_until_open() {
         0,
         "zeroed WINDOW admits nothing even while armed"
     );
-    assert!(s.open_window(2000, 2000).is_err(), "empty window rejected");
     assert!(
-        s.open_window(2000, 1000).is_err(),
+        s.open_window(2000, 2000, test_deadline()).is_err(),
+        "empty window rejected"
+    );
+    assert!(
+        s.open_window(2000, 1000, test_deadline()).is_err(),
         "inverted window rejected"
     );
     assert!(!s.window_open());
-    s.open_window(1000, 2000).unwrap();
-    assert!(s.open_window(1000, 2000).is_err(), "double open rejected");
+    s.open_window(1000, 2000, test_deadline()).unwrap();
+    assert!(
+        s.open_window(1000, 2000, test_deadline()).is_err(),
+        "double open rejected"
+    );
     s.backend_mut().fire(PID, cookie, 1500, 4);
     let drain = s.close_and_drain(Duration::from_secs(5)).unwrap();
     assert_eq!(drain.total_calls(), 4);
@@ -277,13 +293,15 @@ fn map_full_is_explicit() {
             .collect(),
         losses: Vec::new(),
     };
-    let rep = s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
+    let rep = s
+        .attach_delta(&d, &live, &files, ATTACH_AT, test_deadline())
+        .unwrap();
     assert_eq!(rep.attached, 3);
     let cookies: Vec<u32> = offs
         .iter()
         .map(|off| s.cookie_for(a.device, a.ino, *off).unwrap())
         .collect();
-    s.open_window(1000, 2000).unwrap();
+    s.open_window(1000, 2000, test_deadline()).unwrap();
     s.backend_mut().fire(PID, cookies[0], 1500, 5);
     s.backend_mut().fire(PID, cookies[1], 1500, 3);
     s.backend_mut().fire(PID, cookies[2], 1500, 9); // no room: drops
@@ -344,13 +362,14 @@ fn per_key_threaded_counts() {
             .collect(),
         losses: Vec::new(),
     };
-    s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
+    s.attach_delta(&d, &live, &files, ATTACH_AT, test_deadline())
+        .unwrap();
     let cookies: Vec<u32> = offs
         .iter()
         .map(|off| s.cookie_for(a.device, a.ino, *off).unwrap())
         .collect();
     assert_eq!(cookies.len(), KEYS);
-    s.open_window(1000, 2000).unwrap();
+    s.open_window(1000, 2000, test_deadline()).unwrap();
 
     let shared = Arc::new(Mutex::new(s));
     let mut handles = Vec::new();
@@ -438,12 +457,13 @@ fn ledger_admitted_reconciles_to_zero() {
             .collect(),
         losses: Vec::new(),
     };
-    s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
+    s.attach_delta(&d, &live, &files, ATTACH_AT, test_deadline())
+        .unwrap();
     let cookies: Vec<u32> = offs
         .iter()
         .map(|off| s.cookie_for(a.device, a.ino, *off).unwrap())
         .collect();
-    s.open_window(1000, 2000).unwrap();
+    s.open_window(1000, 2000, test_deadline()).unwrap();
     for (k, cookie) in cookies.iter().enumerate() {
         for m in 0..PER_KEY {
             let now = 1000 + ((m * 17 + k as u64 * 7) % 999);
@@ -481,9 +501,10 @@ fn ledger_delta_sounds_on_unaccounted_admission() {
         discovered: vec![site(&a, offs[0], 7)],
         losses: Vec::new(),
     };
-    s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
+    s.attach_delta(&d, &live, &files, ATTACH_AT, test_deadline())
+        .unwrap();
     let cookie = s.cookie_for(a.device, a.ino, offs[0]).unwrap();
-    s.open_window(1000, 2000).unwrap();
+    s.open_window(1000, 2000, test_deadline()).unwrap();
     s.backend_mut().fire(PID, cookie, 1500, 10);
     s.backend_mut().inject_row(
         cookie,
@@ -523,20 +544,30 @@ fn ledger_unreconciled_under_shortfall() {
         discovered: offs.iter().map(|off| site(&a, *off, 7)).collect(),
         losses: Vec::new(),
     };
-    s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
+    s.attach_delta(&d, &live, &files, ATTACH_AT, test_deadline())
+        .unwrap();
     let mut opened = false;
     for off in &offs {
         let cookie = s.cookie_for(a.device, a.ino, *off).unwrap();
         if !opened {
-            assert!(s.open_window(1000, 2000).is_ok());
+            assert!(s.open_window(1000, 2000, test_deadline()).is_ok());
             opened = true;
         } else {
-            s.open_window(1000, 2000).unwrap_or(());
+            s.open_window(1000, 2000, test_deadline()).unwrap_or(());
         }
         s.backend_mut().fire(PID, cookie, 1500, 10);
     }
     s.backend_mut().set_shortfall(2);
-    let drain = s.close_and_drain(Duration::from_secs(5)).unwrap();
+    let terminal = s.terminal(CloseRequest {
+        started_at: Instant::now(),
+        grace: Duration::from_secs(5),
+        reason: CloseReason::Expired,
+    });
+    assert!(
+        s.close_and_drain(Duration::from_secs(5)).is_err(),
+        "incomplete terminal must not pass the temporary bridge"
+    );
+    let drain = terminal.retained_drain;
     assert_eq!(counter_value(&drain, "count.drain_shortfall"), Some(2));
     assert_eq!(counter_value(&drain, "count.ledger_delta"), None);
     assert!(counter_value(&drain, "count.ledger_unreconciled").is_some());
@@ -571,12 +602,13 @@ fn hot_key_concentration_exact() {
             .collect(),
         losses: Vec::new(),
     };
-    s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
+    s.attach_delta(&d, &live, &files, ATTACH_AT, test_deadline())
+        .unwrap();
     let cookies: Vec<u32> = offs
         .iter()
         .map(|off| s.cookie_for(a.device, a.ino, *off).unwrap())
         .collect();
-    s.open_window(1000, 2000).unwrap();
+    s.open_window(1000, 2000, test_deadline()).unwrap();
     for m in 0..HOT_N {
         s.backend_mut().fire(PID, cookies[0], 1000 + (m % 999), 1);
     }
@@ -630,12 +662,13 @@ fn fanout_eight_cpus_fold_exact() {
             .collect(),
         losses: Vec::new(),
     };
-    s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
+    s.attach_delta(&d, &live, &files, ATTACH_AT, test_deadline())
+        .unwrap();
     let cookies: Vec<u32> = offs
         .iter()
         .map(|off| s.cookie_for(a.device, a.ino, *off).unwrap())
         .collect();
-    s.open_window(1000, 2000).unwrap();
+    s.open_window(1000, 2000, test_deadline()).unwrap();
     for cpu in 0..CPUS {
         for (k, cookie) in cookies.iter().enumerate() {
             for m in 0..PER_CPU_PER_KEY {
@@ -688,10 +721,11 @@ fn fanout_mixed_fire_and_fire_cpu_conserves() {
         discovered: offs.iter().map(|off| site(&a, *off, 7)).collect(),
         losses: Vec::new(),
     };
-    s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
+    s.attach_delta(&d, &live, &files, ATTACH_AT, test_deadline())
+        .unwrap();
     let c0 = s.cookie_for(a.device, a.ino, offs[0]).unwrap();
     let c1 = s.cookie_for(a.device, a.ino, offs[1]).unwrap();
-    s.open_window(1000, 2000).unwrap();
+    s.open_window(1000, 2000, test_deadline()).unwrap();
     s.backend_mut().fire(PID, c0, 1500, 40);
     s.backend_mut().fire_cpu(3, PID, c0, 1501, 60);
     s.backend_mut().fire_cpu(7, PID, c1, 1502, 25);
@@ -736,17 +770,21 @@ fn fresh_key_churn_across_fence_conserves() {
             .collect(),
         losses: Vec::new(),
     };
-    s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
+    s.attach_delta(&d, &live, &files, ATTACH_AT, test_deadline())
+        .unwrap();
     let cookies: Vec<u32> = offs
         .iter()
         .map(|off| s.cookie_for(a.device, a.ino, *off).unwrap())
         .collect();
-    s.open_window(1000, 3000).unwrap();
+    s.open_window(1000, 3000, test_deadline()).unwrap();
     for (k, cookie) in cookies.iter().enumerate() {
         s.backend_mut().fire(PID, *cookie, 1100 + k as u64, 1);
     }
-    s.fence(osslscope::count_session::FenceReason::MappingsChanged)
-        .unwrap();
+    s.fence(
+        osslscope::count_session::FenceReason::MappingsChanged,
+        test_deadline(),
+    )
+    .unwrap();
     for (k, cookie) in cookies.iter().enumerate() {
         s.backend_mut().fire(PID, *cookie, 2100 + k as u64, 1);
     }
@@ -791,20 +829,24 @@ fn per_key_conservation_across_two_fences() {
             .collect(),
         losses: Vec::new(),
     };
-    s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
+    s.attach_delta(&d, &live, &files, ATTACH_AT, test_deadline())
+        .unwrap();
     let cookies: Vec<u32> = offs
         .iter()
         .map(|off| s.cookie_for(a.device, a.ino, *off).unwrap())
         .collect();
-    s.open_window(1000, 4000).unwrap();
+    s.open_window(1000, 4000, test_deadline()).unwrap();
     for (round, n) in [10u64, 20, 30].into_iter().enumerate() {
         for (k, cookie) in cookies.iter().enumerate() {
             let now = 1100 + round as u64 * 1000 + k as u64;
             s.backend_mut().fire(PID, *cookie, now, n);
         }
         if round < 2 {
-            s.fence(osslscope::count_session::FenceReason::MappingsChanged)
-                .unwrap();
+            s.fence(
+                osslscope::count_session::FenceReason::MappingsChanged,
+                test_deadline(),
+            )
+            .unwrap();
         }
     }
     let drain = s.close_and_drain(Duration::from_secs(5)).unwrap();
@@ -855,24 +897,30 @@ fn p6_subpoll_replacement_keeps_old_meaning() {
         discovered: vec![site(&a, offs[0], 7)],
         losses: Vec::new(),
     };
-    s.attach_delta(&d0, &live, &files, ATTACH_AT).unwrap();
+    s.attach_delta(&d0, &live, &files, ATTACH_AT, test_deadline())
+        .unwrap();
     let cookie = s.cookie_for(a.device, a.ino, offs[0]).unwrap();
     let before = s.provenance(cookie).unwrap().candidates.clone();
-    s.open_window(1000, 3000).unwrap();
+    s.open_window(1000, 3000, test_deadline()).unwrap();
     s.backend_mut().fire(PID, cookie, 1500, 50);
     // Sub-poll replacement: same triple, new candidates.
     let d1 = CountDelta {
         discovered: vec![site(&a, offs[0], 9)],
         losses: Vec::new(),
     };
-    let report = s.attach_delta(&d1, &live, &files, ATTACH_AT).unwrap();
+    let report = s
+        .attach_delta(&d1, &live, &files, ATTACH_AT, test_deadline())
+        .unwrap();
     assert!(
         report.candidates_changed,
         "replacement must stage an update"
     );
     s.backend_mut().fire(PID, cookie, 1600, 30);
-    s.fence(osslscope::count_session::FenceReason::CandidatesChanged)
-        .unwrap();
+    s.fence(
+        osslscope::count_session::FenceReason::CandidatesChanged,
+        test_deadline(),
+    )
+    .unwrap();
     s.backend_mut().fire(PID, cookie, 2500, 20);
     let drain = s.close_and_drain(Duration::from_secs(5)).unwrap();
     assert_eq!(drain.fenced.len(), 1);
@@ -916,13 +964,17 @@ fn p6_stale_queued_events_keep_old_generation() {
         discovered: vec![site(&a, offs[0], 7)],
         losses: Vec::new(),
     };
-    s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
+    s.attach_delta(&d, &live, &files, ATTACH_AT, test_deadline())
+        .unwrap();
     let cookie = s.cookie_for(a.device, a.ino, offs[0]).unwrap();
     let before = s.provenance(cookie).unwrap().candidates.clone();
-    s.open_window(1000, 3000).unwrap();
+    s.open_window(1000, 3000, test_deadline()).unwrap();
     s.backend_mut().fire(PID, cookie, 1500, 40);
-    s.fence(osslscope::count_session::FenceReason::MappingsChanged)
-        .unwrap();
+    s.fence(
+        osslscope::count_session::FenceReason::MappingsChanged,
+        test_deadline(),
+    )
+    .unwrap();
     // Queued pre-fence hit lands after the fence drain.
     s.backend_mut().inject_row(
         cookie,
@@ -969,9 +1021,10 @@ fn p6_unknown_generation_stays_unattributed() {
         discovered: vec![site(&a, offs[0], 7)],
         losses: Vec::new(),
     };
-    s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
+    s.attach_delta(&d, &live, &files, ATTACH_AT, test_deadline())
+        .unwrap();
     let cookie = s.cookie_for(a.device, a.ino, offs[0]).unwrap();
-    s.open_window(1000, 2000).unwrap();
+    s.open_window(1000, 2000, test_deadline()).unwrap();
     s.backend_mut().inject_row(
         cookie,
         9,
@@ -1022,25 +1075,30 @@ fn p6_impl_only_backing_replacement_never_relabels() {
         discovered: vec![site(&a, offs[0], 7)],
         losses: Vec::new(),
     };
-    s.attach_delta(&d0, &live, &files, ATTACH_AT).unwrap();
+    s.attach_delta(&d0, &live, &files, ATTACH_AT, test_deadline())
+        .unwrap();
     let c1 = s.cookie_for(a.device, a.ino, offs[0]).unwrap();
     let meaning1 = s.provenance(c1).unwrap().clone();
-    s.open_window(1000, 3000).unwrap();
+    s.open_window(1000, 3000, test_deadline()).unwrap();
     s.backend_mut().fire(PID, c1, 1500, 40);
     // Same candidates, new backing triple (impl-only change).
     let d1 = CountDelta {
         discovered: vec![site(&b, offs[0], 7)],
         losses: Vec::new(),
     };
-    s.attach_delta(&d1, &live, &files, ATTACH_AT).unwrap();
+    s.attach_delta(&d1, &live, &files, ATTACH_AT, test_deadline())
+        .unwrap();
     let c2 = s.cookie_for(b.device, b.ino, offs[0]).unwrap();
     assert_ne!(c1, c2, "new backing triple must mint a new cookie");
     assert_ne!(
         s.provenance(c1).unwrap().site,
         s.provenance(c2).unwrap().site
     );
-    s.fence(osslscope::count_session::FenceReason::ProviderChanged)
-        .unwrap();
+    s.fence(
+        osslscope::count_session::FenceReason::ProviderChanged,
+        test_deadline(),
+    )
+    .unwrap();
     s.backend_mut().fire(PID, c2, 2500, 25);
     let drain = s.close_and_drain(Duration::from_secs(5)).unwrap();
     assert_eq!(drain.fenced.len(), 1);
@@ -1095,9 +1153,10 @@ fn lat_median_p99_from_buckets() {
         discovered: vec![site(&a, offs[0], 7)],
         losses: Vec::new(),
     };
-    s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
+    s.attach_delta(&d, &live, &files, ATTACH_AT, test_deadline())
+        .unwrap();
     let cookie = s.cookie_for(a.device, a.ino, offs[0]).unwrap();
-    s.open_window(1000, 2000).unwrap();
+    s.open_window(1000, 2000, test_deadline()).unwrap();
     s.backend_mut().fire(PID, cookie, 1500, 10);
     s.backend_mut().inject_latency(5, 90);
     s.backend_mut().inject_latency(14, 10);
@@ -1132,19 +1191,20 @@ fn drain_stats_shape_recorded() {
         discovered: offs.iter().map(|off| site(&a, *off, 7)).collect(),
         losses: Vec::new(),
     };
-    s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
+    s.attach_delta(&d, &live, &files, ATTACH_AT, test_deadline())
+        .unwrap();
     for off in &offs {
         let cookie = s.cookie_for(a.device, a.ino, *off).unwrap();
         s.backend_mut().fire(PID, cookie, 1500, 5);
     }
-    s.open_window(1000, 2000).unwrap();
+    s.open_window(1000, 2000, test_deadline()).unwrap();
     for off in &offs {
         let cookie = s.cookie_for(a.device, a.ino, *off).unwrap();
         s.backend_mut().fire(PID, cookie, 1500, 5);
     }
     let drain = s.close_and_drain(Duration::from_secs(5)).unwrap();
     assert_eq!(drain.total_calls(), 10);
-    assert_eq!(counter_value(&drain, "count.drain_passes"), Some(2));
+    assert_eq!(counter_value(&drain, "count.drain_passes"), Some(1));
     let total = counter_value(&drain, "count.drain_pass_ns_total").unwrap();
     let max = counter_value(&drain, "count.drain_pass_ns_max").unwrap();
     assert!(total >= max, "total {total} < max {max}");
@@ -1174,14 +1234,24 @@ fn drain_scan_tail_counts_exactly() {
         discovered: offs.iter().map(|off| site(&a, *off, 7)).collect(),
         losses: Vec::new(),
     };
-    s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
-    s.open_window(1000, 2000).unwrap();
+    s.attach_delta(&d, &live, &files, ATTACH_AT, test_deadline())
+        .unwrap();
+    s.open_window(1000, 2000, test_deadline()).unwrap();
     for off in &offs {
         let cookie = s.cookie_for(a.device, a.ino, *off).unwrap();
         s.backend_mut().fire(PID, cookie, 1500, 10);
     }
     s.backend_mut().set_shortfall(3);
-    let drain = s.close_and_drain(Duration::from_secs(5)).unwrap();
+    let terminal = s.terminal(CloseRequest {
+        started_at: Instant::now(),
+        grace: Duration::from_secs(5),
+        reason: CloseReason::Expired,
+    });
+    assert!(
+        s.close_and_drain(Duration::from_secs(5)).is_err(),
+        "incomplete terminal must not pass the temporary bridge"
+    );
+    let drain = terminal.retained_drain;
     assert_eq!(counter_value(&drain, "count.drain_passes"), Some(1));
     assert_eq!(counter_value(&drain, "count.drain_shortfall"), Some(3));
     assert_eq!(counter_value(&drain, "count.ledger_delta"), None);
@@ -1212,14 +1282,18 @@ fn lat_fence_partial_deltas_fold_once() {
         discovered: vec![site(&a, offs[0], 7)],
         losses: Vec::new(),
     };
-    s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
+    s.attach_delta(&d, &live, &files, ATTACH_AT, test_deadline())
+        .unwrap();
     let cookie = s.cookie_for(a.device, a.ino, offs[0]).unwrap();
-    s.open_window(1000, 2000).unwrap();
+    s.open_window(1000, 2000, test_deadline()).unwrap();
     s.backend_mut().fire(PID, cookie, 1500, 10);
     s.backend_mut().inject_latency(5, 80);
     s.backend_mut().inject_latency(14, 10);
-    s.fence(osslscope::count_session::FenceReason::MappingsChanged)
-        .unwrap();
+    s.fence(
+        osslscope::count_session::FenceReason::MappingsChanged,
+        test_deadline(),
+    )
+    .unwrap();
     s.backend_mut().fire(PID, cookie, 1500, 5);
     s.backend_mut().inject_latency(5, 20);
     let drain = s.close_and_drain(Duration::from_secs(5)).unwrap();
@@ -1274,13 +1348,11 @@ struct SwapBackend {
 
 impl CountBackend for SwapBackend {
     type Link = FakeLink;
-
-    fn attach(
-        &mut self,
-        path: &str,
-        offsets: &[u64],
-        cookies: &[u64],
-    ) -> (Vec<FakeLink>, Vec<usize>) {
+    fn ready(&self) -> &Ready {
+        self.inner.ready()
+    }
+    fn attach(&mut self, request: AttachRequest) -> CommandResult<AttachAck<FakeLink>> {
+        let ack = self.inner.attach(request);
         if let Some((p, bytes)) = self.swap.borrow_mut().take() {
             // Create-then-rename (never remove-then-recreate:
             // freed inodes are reused immediately on some
@@ -1289,33 +1361,32 @@ impl CountBackend for SwapBackend {
             std::fs::write(&tmp, &bytes).unwrap();
             std::fs::rename(&tmp, &p).unwrap();
         }
-        self.inner.attach(path, offsets, cookies)
+        ack
     }
-
-    fn open_window(
+    fn open_window(&mut self, request: OpenRequest) -> CommandResult<OpenReceipt> {
+        self.inner.open_window(request)
+    }
+    fn set_generation(&mut self, request: GenerationRequest) -> CommandResult<()> {
+        self.inner.set_generation(request)
+    }
+    fn drain(&mut self, request: ReadRequest) -> CommandResult<std::sync::Arc<RawSnapshot>> {
+        self.inner.drain(request)
+    }
+    fn terminal_request(
         &mut self,
-        tgid: u64,
-        generation: u32,
-        start_ns: u64,
-        deadline_ns: u64,
-    ) -> anyhow::Result<()> {
-        self.inner
-            .open_window(tgid, generation, start_ns, deadline_ns)
+        deadline: Instant,
+        frontier: ControllerFrontier,
+    ) -> TerminalRequest {
+        self.inner.terminal_request(deadline, frontier)
     }
-
-    fn set_generation(&mut self, generation: u32) -> anyhow::Result<()> {
-        self.inner.set_generation(generation)
+    fn terminal(&mut self, request: TerminalRequest) -> RawTerminal {
+        self.inner.terminal(request)
     }
-
-    fn close_window(&mut self) -> anyhow::Result<()> {
-        self.inner.close_window()
+    fn progress(&self) -> Option<RawCheckpoint> {
+        self.inner.progress()
     }
-
-    fn drain(
-        &mut self,
-        deadline: Option<std::time::Instant>,
-    ) -> anyhow::Result<osslscope::count_session::DrainedCounts> {
-        self.inner.drain(deadline)
+    fn fork_permit(&self, deadline: Instant) -> Result<CountForkPermit<'_>, ForkBlocked> {
+        self.inner.fork_permit(deadline)
     }
 }
 
@@ -1353,7 +1424,9 @@ fn h4_t4_rejected_resolve_attaches_nothing_drains_empty() {
         discovered: vec![site(&a, off, 7)],
         losses: Vec::new(),
     };
-    let report = s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
+    let report = s
+        .attach_delta(&d, &live, &files, ATTACH_AT, test_deadline())
+        .unwrap();
     assert!(
         report.missed.iter().any(|m| m.reason == "replaced"),
         "stale plan must not bind: {report:?}"
@@ -1365,7 +1438,7 @@ fn h4_t4_rejected_resolve_attaches_nothing_drains_empty() {
         None,
         "rejected resolve must never reach the backend"
     );
-    s.open_window(1000, 2000).unwrap();
+    s.open_window(1000, 2000, test_deadline()).unwrap();
     let drain = s.close_and_drain(Duration::from_secs(5)).unwrap();
     assert!(drain.current.is_empty());
     assert_eq!(
@@ -1400,7 +1473,9 @@ fn h4_t3_pin_survives_path_deletion_until_session_drop() {
         discovered: vec![site(&a, off, 7)],
         losses: Vec::new(),
     };
-    let report = s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
+    let report = s
+        .attach_delta(&d, &live, &files, ATTACH_AT, test_deadline())
+        .unwrap();
     assert_eq!(report.attached, 1);
     let cookie = s.cookie_for(a.device, a.ino, off).unwrap();
     let at = s
@@ -1453,7 +1528,9 @@ fn h4_t1_mid_attach_swap_binds_pinned_inode_via_fd_path() {
         discovered: vec![site(&a, off, 7)],
         losses: Vec::new(),
     };
-    let report = s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
+    let report = s
+        .attach_delta(&d, &live, &files, ATTACH_AT, test_deadline())
+        .unwrap();
     assert_eq!(report.attached, 1, "pinned attach must bind: {report:?}");
     assert!(
         report.missed.iter().all(|m| m.reason != "replaced"),
@@ -1483,7 +1560,9 @@ fn h4_t1_mid_attach_swap_binds_pinned_inode_via_fd_path() {
     );
     // Immediate re-attach: the live pinned link reuses (old
     // behavior quarantined here — the stickiness is gone).
-    let report2 = s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
+    let report2 = s
+        .attach_delta(&d, &live, &files, ATTACH_AT, test_deadline())
+        .unwrap();
     assert_eq!(report2.reused, 1, "live pin must reuse: {report2:?}");
     assert!(
         report2.missed.iter().all(|m| m.reason != "quarantined"),
@@ -1523,10 +1602,12 @@ fn h4_unbound_cookie_hits_route_unattributed() {
         discovered: vec![site(&a, off, 7)],
         losses: Vec::new(),
     };
-    let report = s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
+    let report = s
+        .attach_delta(&d, &live, &files, ATTACH_AT, test_deadline())
+        .unwrap();
     assert_eq!(report.attached, 0);
     let cookie = s.cookie_for(a.device, a.ino, off).unwrap();
-    s.open_window(1000, 2000).unwrap();
+    s.open_window(1000, 2000, test_deadline()).unwrap();
     // Backend anomaly: hits under the unbound cookie.
     s.backend_mut().fire(PID, cookie, 1500, 7);
     let drain = s.close_and_drain(Duration::from_secs(5)).unwrap();
@@ -1562,9 +1643,10 @@ fn fake_backend_folds_bounds_monotonically() {
         discovered: vec![site(&a, off, 7)],
         losses: Vec::new(),
     };
-    s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
+    s.attach_delta(&d, &live, &files, ATTACH_AT, test_deadline())
+        .unwrap();
     let cookie = s.cookie_for(a.device, a.ino, off).unwrap();
-    s.open_window(1000, 2000).unwrap();
+    s.open_window(1000, 2000, test_deadline()).unwrap();
     s.backend_mut().fire(PID, cookie, 1500, 1);
     s.backend_mut().fire(PID, cookie, 1000, 1);
     s.backend_mut().fire(PID, cookie, 1999, 1);
@@ -1613,12 +1695,16 @@ fn h4_stale_plan_misses_replaced_per_attempt() {
         discovered: vec![site(&a, off, 7)],
         losses: Vec::new(),
     };
-    let report = s.attach_delta(&stale, &live, &files, ATTACH_AT).unwrap();
+    let report = s
+        .attach_delta(&stale, &live, &files, ATTACH_AT, test_deadline())
+        .unwrap();
     assert_eq!(report.attached, 0);
     assert!(report.missed.iter().any(|m| m.reason == "replaced"));
     // Same generation, same stale row: replaced again (no
     // quarantine shadow — per-attempt re-resolve).
-    let report2 = s.attach_delta(&stale, &live, &files, ATTACH_AT).unwrap();
+    let report2 = s
+        .attach_delta(&stale, &live, &files, ATTACH_AT, test_deadline())
+        .unwrap();
     assert_eq!(report2.attached, 0);
     assert!(
         report2.missed.iter().any(|m| m.reason == "replaced"),
@@ -1629,9 +1715,12 @@ fn h4_stale_plan_misses_replaced_per_attempt() {
         "no quarantine vocabulary post-H4: {report2:?}"
     );
     // Across a fence: still replaced (recovery needs re-discovery).
-    s.open_window(1000, 2000).unwrap();
-    s.fence(FenceReason::ProviderChanged).unwrap();
-    let report3 = s.attach_delta(&stale, &live, &files, ATTACH_AT).unwrap();
+    s.open_window(1000, 2000, test_deadline()).unwrap();
+    s.fence(FenceReason::ProviderChanged, test_deadline())
+        .unwrap();
+    let report3 = s
+        .attach_delta(&stale, &live, &files, ATTACH_AT, test_deadline())
+        .unwrap();
     assert!(
         report3.missed.iter().any(|m| m.reason == "replaced"),
         "stale identity stays replaced across fences: {report3:?}"
@@ -1652,7 +1741,7 @@ fn h4_stale_plan_misses_replaced_per_attempt() {
         },
     )]);
     let report4 = s
-        .attach_delta(&fresh, &live_b, &files_b, ATTACH_AT)
+        .attach_delta(&fresh, &live_b, &files_b, ATTACH_AT, test_deadline())
         .unwrap();
     assert_eq!(report4.attached, 1, "fresh plan must bind: {report4:?}");
 }
@@ -1971,11 +2060,15 @@ fn h4_stale_retries_count_missed_once_each() {
         discovered: vec![site(&a, off, 7)],
         losses: Vec::new(),
     };
-    let report = s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
+    let report = s
+        .attach_delta(&d, &live, &files, ATTACH_AT, test_deadline())
+        .unwrap();
     assert!(report.missed.iter().any(|m| m.reason == "replaced"));
-    let report2 = s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
+    let report2 = s
+        .attach_delta(&d, &live, &files, ATTACH_AT, test_deadline())
+        .unwrap();
     assert!(report2.missed.iter().any(|m| m.reason == "replaced"));
-    s.open_window(1000, 2000).unwrap();
+    s.open_window(1000, 2000, test_deadline()).unwrap();
     let drain = s.close_and_drain(Duration::from_secs(5)).unwrap();
     assert_eq!(
         counter_value(&drain, "count.missed_attaches"),
@@ -1989,14 +2082,11 @@ fn h4_stale_retries_count_missed_once_each() {
 // R20 count-close assurance: quiesce recovery + delayed-hit countermodel.
 // ---------------------------------------------------------------------------
 
-use osslscope::count_session::DrainedCounts;
 use osslscope_ebpf_common::CountValue;
 use std::time::Instant;
 
-/// Backend that lands one admitted-pre-close hit AFTER the first
-/// drain's read (models a uprobe completion racing the drain: the
-/// hit passed TARGET+deadline admission before close but its
-/// increment lands mid-drain). Delegates everything else.
+/// Model a callback completion before the terminal writer witness. The
+/// delegated terminal performs one final read; ordinary drains stay unchanged.
 struct MidDrainBackend {
     inner: FakeCountBackend,
     cookie: u32,
@@ -2006,37 +2096,29 @@ struct MidDrainBackend {
 
 impl CountBackend for MidDrainBackend {
     type Link = FakeLink;
-
-    fn attach(
+    fn ready(&self) -> &Ready {
+        self.inner.ready()
+    }
+    fn attach(&mut self, request: AttachRequest) -> CommandResult<AttachAck<FakeLink>> {
+        self.inner.attach(request)
+    }
+    fn open_window(&mut self, request: OpenRequest) -> CommandResult<OpenReceipt> {
+        self.inner.open_window(request)
+    }
+    fn set_generation(&mut self, request: GenerationRequest) -> CommandResult<()> {
+        self.inner.set_generation(request)
+    }
+    fn drain(&mut self, request: ReadRequest) -> CommandResult<std::sync::Arc<RawSnapshot>> {
+        self.inner.drain(request)
+    }
+    fn terminal_request(
         &mut self,
-        path: &str,
-        offsets: &[u64],
-        cookies: &[u64],
-    ) -> (Vec<Self::Link>, Vec<usize>) {
-        self.inner.attach(path, offsets, cookies)
+        deadline: Instant,
+        frontier: ControllerFrontier,
+    ) -> TerminalRequest {
+        self.inner.terminal_request(deadline, frontier)
     }
-
-    fn open_window(
-        &mut self,
-        tgid: u64,
-        generation: u32,
-        start_ns: u64,
-        deadline_ns: u64,
-    ) -> anyhow::Result<()> {
-        self.inner
-            .open_window(tgid, generation, start_ns, deadline_ns)
-    }
-
-    fn set_generation(&mut self, generation: u32) -> anyhow::Result<()> {
-        self.inner.set_generation(generation)
-    }
-
-    fn close_window(&mut self) -> anyhow::Result<()> {
-        self.inner.close_window()
-    }
-
-    fn drain(&mut self, deadline: Option<Instant>) -> anyhow::Result<DrainedCounts> {
-        let out = self.inner.drain(deadline)?;
+    fn terminal(&mut self, request: TerminalRequest) -> RawTerminal {
         if !self.injected {
             self.injected = true;
             self.inner.inject_row(
@@ -2049,15 +2131,20 @@ impl CountBackend for MidDrainBackend {
                 },
             );
         }
-        Ok(out)
+        self.inner.terminal(request)
+    }
+    fn progress(&self) -> Option<RawCheckpoint> {
+        self.inner.progress()
+    }
+    fn fork_permit(&self, deadline: Instant) -> Result<CountForkPermit<'_>, ForkBlocked> {
+        self.inner.fork_permit(deadline)
     }
 }
 
 #[test]
-fn close_quiesce_recovers_row_landing_mid_drain() {
-    // Best-effort quiesce: a hit completing between the first and
-    // second drain passes is recovered by the re-scan — the close
-    // total includes it with no shortfall and no loss.
+fn close_model_includes_completion_before_terminal_witness() {
+    // Model the admitted completion before the model terminal witness.
+    // One post-witness read includes it; no equality scan is needed.
     let stage = Stage::fresh("quiesce");
     let bytes = self_bytes();
     let off = x_offsets(&bytes, 1)[0];
@@ -2084,26 +2171,30 @@ fn close_quiesce_recovers_row_landing_mid_drain() {
         discovered: vec![site(&a, off, 7)],
         losses: Vec::new(),
     };
-    s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
+    s.attach_delta(&d, &live, &files, ATTACH_AT, test_deadline())
+        .unwrap();
     let cookie = s.cookie_for(a.device, a.ino, off).unwrap();
     s.backend_mut().cookie = cookie;
-    s.open_window(1000, 2000).unwrap();
+    s.open_window(1000, 2000, test_deadline()).unwrap();
     s.backend_mut().inner.fire(PID, cookie, 1500, 5);
     let drain = s.close_and_drain(Duration::from_secs(5)).unwrap();
-    assert_eq!(drain.total_calls(), 7, "5 fired + 2 mid-drain");
+    assert_eq!(
+        drain.total_calls(),
+        7,
+        "5 fired + 2 completed before the model witness"
+    );
     assert_eq!(counter_value(&drain, "count.drain_shortfall"), Some(0));
     assert_eq!(counter_value(&drain, "count.unattributed"), Some(0));
     assert_eq!(counter_value(&drain, "count.map_insert_dropped"), Some(0));
-    // c6: the mid-drain injected row bypasses admission (5
+    // c6: the injected row bypasses admission (5
     // admitted, 7 routed) — the anomaly hook sounds the delta.
     assert_eq!(counter_value(&drain, "count.ledger_delta"), Some(2));
 }
 
 #[test]
-fn close_pending_admitted_work_completes_in_quiesce() {
-    // R20: hits admitted pre-close complete through the bounded
-    // quiesce passes — eventual completion of pending work (the
-    // positive twin of the delayed-hit countermodel below).
+fn close_model_pending_work_completes_before_witness() {
+    // Ordinary admitted model calls are present in the single terminal read.
+    // This fixture is a compatibility check, not held-writer proof.
     let stage = Stage::fresh("pending-work");
     let bytes = self_bytes();
     let off = x_offsets(&bytes, 1)[0];
@@ -2122,9 +2213,10 @@ fn close_pending_admitted_work_completes_in_quiesce() {
         discovered: vec![site(&a, off, 7)],
         losses: Vec::new(),
     };
-    s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
+    s.attach_delta(&d, &live, &files, ATTACH_AT, test_deadline())
+        .unwrap();
     let cookie = s.cookie_for(a.device, a.ino, off).unwrap();
-    s.open_window(1000, 2000).unwrap();
+    s.open_window(1000, 2000, test_deadline()).unwrap();
     s.backend_mut().fire(PID, cookie, 1500, 5);
     let drain = s.close_and_drain(Duration::from_secs(5)).unwrap();
     assert_eq!(drain.total_calls(), 5, "pending pre-close hits complete");
@@ -2134,18 +2226,9 @@ fn close_pending_admitted_work_completes_in_quiesce() {
 }
 
 #[test]
-fn close_delayed_hit_after_drain_is_uncounted_countermodel() {
-    // R20 count-close countermodel (pins the limitation, not a bug):
-    // a hit admitted pre-close but completing AFTER the final drain
-    // pass is invisible to the returned drain AND to every loss
-    // counter — the bounded quiesce passes are best-effort tail
-    // collection, not a completion barrier. The admitted barrier is
-    // death+reap (no dead thread runs a uprobe): the controller
-    // orders reap before close for owned exits (pinned by
-    // `count_close_reap_precedes_drain_for_owned_exit`), and every
-    // non-fatal close with a live target already carries an
-    // over-budget loss or a signal cut, so it cannot claim COMPLETE.
-    // Detach and arbitrary sleeps are assumed to prove nothing.
+fn terminal_model_artifact_ignores_injected_late_row() {
+    // Raw injection bypasses model admission and its writer witness. It cannot
+    // replace a selected artifact; kernel completion has separate owner tests.
     let stage = Stage::fresh("delayed-hit");
     let bytes = self_bytes();
     let off = x_offsets(&bytes, 1)[0];
@@ -2164,9 +2247,10 @@ fn close_delayed_hit_after_drain_is_uncounted_countermodel() {
         discovered: vec![site(&a, off, 7)],
         losses: Vec::new(),
     };
-    s.attach_delta(&d, &live, &files, ATTACH_AT).unwrap();
+    s.attach_delta(&d, &live, &files, ATTACH_AT, test_deadline())
+        .unwrap();
     let cookie = s.cookie_for(a.device, a.ino, off).unwrap();
-    s.open_window(1000, 2000).unwrap();
+    s.open_window(1000, 2000, test_deadline()).unwrap();
     s.backend_mut().fire(PID, cookie, 1500, 5);
     let drain = s.close_and_drain(Duration::from_secs(5)).unwrap();
     assert_eq!(drain.total_calls(), 5);
