@@ -1658,6 +1658,7 @@ struct Faults {
     hold_acquire: Option<usize>,
     hold_close: Option<usize>,
     fail_close: Option<usize>,
+    close_errors: Vec<(usize, i32)>,
     quiet_failure: bool,
 }
 struct PipeDriver {
@@ -1742,9 +1743,15 @@ impl CountIoDriver for PipeDriver {
             self.probe.hold();
         }
         let result = ossl_bpf_sys::close_owned(std::mem::ManuallyDrop::into_inner(fd));
-        let result = if self.faults.fail_close == Some(self.closes) {
+        let injected_errno = self
+            .faults
+            .close_errors
+            .iter()
+            .find_map(|(ordinal, errno)| (*ordinal == self.closes).then_some(*errno))
+            .or_else(|| (self.faults.fail_close == Some(self.closes)).then_some(libc::EINTR));
+        let result = if let Some(errno) = injected_errno {
             result.unwrap();
-            Err(io::Error::from_raw_os_error(libc::EINTR))
+            Err(io::Error::from_raw_os_error(errno))
         } else {
             result
         };
@@ -5825,6 +5832,7 @@ fn g1_terminal_late_cleanup_error_refuses_fork_after_finished_snapshot() {
         assert!(matches!(receipt.writers, WriterCompletion::Finished(_)));
         assert_eq!(receipt.read_status, ReadStatus::Complete);
         assert!(matches!(receipt.cleanup_state, CleanupState::Pending(_)));
+        let selected_cleanup = receipt.cleanup_state.clone();
         probe.owner.release();
         task3_cleanup(&probe.owner, 10);
         let summary = engine.resource_summary();
@@ -5839,6 +5847,11 @@ fn g1_terminal_late_cleanup_error_refuses_fork_after_finished_snapshot() {
             Some(ForkBlocked::Unresolved)
         );
         assert!(matches!(receipt.cleanup_state, CleanupState::Pending(_)));
+        assert_eq!(receipt.cleanup_state, selected_cleanup);
+        assert!(Arc::ptr_eq(
+            &receipt.0,
+            &engine.salvage_view(receipt.terminal_id).0
+        ));
     }
 }
 
@@ -5881,6 +5894,35 @@ fn g1_terminal_cleanup_error_observed_before_selection_is_fatal() {
         assert!(matches!(receipt.writers, WriterCompletion::Finished(_)));
         assert_eq!(receipt.read_status, ReadStatus::Complete);
         assert!(matches!(receipt.cleanup_state, CleanupState::Failed(_)));
+        let CleanupState::Failed(selected) = &receipt.cleanup_state else {
+            unreachable!()
+        };
+        let authoritative = engine.resource_summary();
+        assert_eq!(
+            selected, &authoritative,
+            "selected Failed summary discarded later checked outcomes for {resource:?}"
+        );
+        let unresolved: Vec<_> = selected
+            .resources
+            .iter()
+            .filter(|record| {
+                !matches!(
+                    record.state,
+                    ResourceState::Unused
+                        | ResourceState::CreateFailed
+                        | ResourceState::CloseReturned
+                )
+            })
+            .collect();
+        assert_eq!(unresolved.len(), 1);
+        assert_eq!(
+            (
+                unresolved[0].resource,
+                unresolved[0].state,
+                unresolved[0].errno
+            ),
+            (resource, ResourceState::ConsumedError, Some(libc::EINTR))
+        );
         let failure = receipt.failures.operations[CountOperation::Cleanup as usize].unwrap();
         assert_eq!(
             (failure.class, failure.errno, failure.resource),
@@ -5896,6 +5938,215 @@ fn g1_terminal_cleanup_error_observed_before_selection_is_fatal() {
             &receipt.0,
             &engine.salvage_view(receipt.terminal_id).0
         ));
+    }
+}
+
+#[test]
+fn g1_terminal_cleanup_multiple_errors_before_selection_keep_each_errno() {
+    let probe = MapProbe::new();
+    let (engine, _) = terminal_engine(
+        &probe,
+        None,
+        TerminalFaults {
+            close: Faults {
+                close_errors: vec![(2, libc::EINTR), (3, libc::EIO), (4, libc::EBADF)],
+                ..Faults::default()
+            },
+            ..TerminalFaults::default()
+        },
+    );
+    engine.attach(attach_request(1, 1)).unwrap();
+    let request = terminal_request(&engine, Instant::now() + Duration::from_secs(5));
+    {
+        let mut state = locked(&engine.shared.state);
+        engine.shared.seal_locked(&mut state, request.deadline);
+        state.terminal_expected = Some(request.clone());
+    }
+    engine.shared.worker.get().unwrap().unpark();
+    task3_cleanup(&probe.owner, 10);
+    let mut barrier = locked(&engine.shared.barrier.state);
+    while !barrier.sealed {
+        barrier = engine.shared.barrier.changed.wait(barrier).unwrap();
+    }
+    drop(barrier);
+    let authoritative = engine.resource_summary();
+    let receipt = engine.terminal(request.clone());
+    let CleanupState::Failed(selected) = &receipt.cleanup_state else {
+        panic!("checked errors lost their Failed status")
+    };
+    assert_eq!(
+        selected, &authoritative,
+        "same-operation errors and subsequent returns were lost"
+    );
+    for (resource, errno) in [
+        (ResourceId::Pin(0), libc::EINTR),
+        (ResourceId::Program, libc::EIO),
+        (ResourceId::Map(CountMap::Counts), libc::EBADF),
+    ] {
+        let actual = selected
+            .resources
+            .iter()
+            .find(|record| record.resource == resource)
+            .unwrap();
+        assert_eq!(
+            (actual.state, actual.errno),
+            (ResourceState::ConsumedError, Some(errno))
+        );
+    }
+    assert_eq!(
+        selected
+            .resources
+            .iter()
+            .filter(|record| record.state == ResourceState::ConsumedError)
+            .count(),
+        3
+    );
+    assert!(!selected.resources.iter().any(|record| matches!(
+        record.state,
+        ResourceState::Reserved
+            | ResourceState::Creating
+            | ResourceState::Held
+            | ResourceState::CloseIssued
+    )));
+    let first = receipt.failures.operations[CountOperation::Cleanup as usize].unwrap();
+    assert_eq!(
+        (first.resource, first.errno),
+        (ResourceId::Pin(0), Some(libc::EINTR))
+    );
+    assert_eq!(validate_terminal(&request, &receipt), Ok(()));
+    assert!(engine.fork_permit(Instant::now()).is_err());
+    assert!(Arc::ptr_eq(
+        &receipt.0,
+        &engine.salvage_view(receipt.terminal_id).0
+    ));
+}
+
+#[test]
+fn g1_terminal_manifest_refresh_has_linear_work_and_exact_states() {
+    for (links, expected_visits) in [(1, 9), (64, 72), (8192, 8200)] {
+        let epoch = OwnerEpoch::checked(1).unwrap();
+        let writer = WriterIdentity {
+            owner_epoch: epoch,
+            object_sha256: [3; 32],
+            program: ResourceId::Program,
+            maps: CountMap::ALL.map(ResourceId::Map),
+        };
+        let mut resources: Vec<_> = CountMap::ALL
+            .map(|map| ResourceRecord {
+                resource: ResourceId::Map(map),
+                state: ResourceState::Held,
+                errno: None,
+            })
+            .into_iter()
+            .collect();
+        resources.push(ResourceRecord {
+            resource: ResourceId::Program,
+            state: ResourceState::Held,
+            errno: None,
+        });
+        let mut manifest = Vec::with_capacity(links);
+        for index in 0..links {
+            // Failed attempts can leave serial gaps in otherwise ordered slots.
+            let id = LinkId {
+                owner_epoch: epoch,
+                serial: LinkSerial::checked(index as u64 * 2 + 1).unwrap(),
+            };
+            manifest.push(CreationRecord {
+                id,
+                command: CommandSeq::checked(1).unwrap(),
+                writer,
+                backing: BackingIdentity {
+                    device: 1,
+                    inode: 2,
+                },
+                pin_slot: 0,
+                memberships: index..index + 1,
+                outcome: CreateOutcome::Succeeded,
+                publication: PublicationState::Published,
+                close_state: ResourceState::Held,
+                close_errno: None,
+            });
+            resources.push(ResourceRecord {
+                resource: ResourceId::Link(id),
+                state: if index + 1 == links {
+                    ResourceState::ConsumedError
+                } else {
+                    ResourceState::CloseReturned
+                },
+                errno: (index + 1 == links).then_some(libc::EIO),
+            });
+        }
+        for index in 0..links {
+            resources.push(ResourceRecord {
+                resource: ResourceId::Pin(index),
+                state: ResourceState::Unused,
+                errno: None,
+            });
+        }
+        for index in 0..8 {
+            resources.push(ResourceRecord {
+                resource: ResourceId::Transient(index),
+                state: ResourceState::Unused,
+                errno: None,
+            });
+        }
+        let storage = (
+            manifest.as_ptr(),
+            manifest.capacity(),
+            resources.as_ptr(),
+            resources.capacity(),
+        );
+        let visits = refresh_manifest_close_states(&mut manifest, &resources);
+        assert_eq!(
+            visits, expected_visits,
+            "resource search became quadratic for {links} links"
+        );
+        assert_eq!(
+            (
+                manifest.as_ptr(),
+                manifest.capacity(),
+                resources.as_ptr(),
+                resources.capacity()
+            ),
+            storage
+        );
+        for (index, record) in manifest.iter().enumerate() {
+            assert_eq!(
+                (record.close_state, record.close_errno),
+                if index + 1 == links {
+                    (ResourceState::ConsumedError, Some(libc::EIO))
+                } else {
+                    (ResourceState::CloseReturned, None)
+                }
+            );
+        }
+        if links > 1 {
+            let missing = manifest[1].id;
+            resources.retain(|record| record.resource != ResourceId::Link(missing));
+            for record in &mut manifest {
+                record.close_state = ResourceState::Held;
+                record.close_errno = None;
+            }
+            assert_eq!(
+                refresh_manifest_close_states(&mut manifest, &resources),
+                expected_visits
+            );
+            assert_eq!(
+                (manifest[1].close_state, manifest[1].close_errno),
+                (ResourceState::Held, None)
+            );
+            assert_eq!(
+                (
+                    manifest.last().unwrap().close_state,
+                    manifest.last().unwrap().close_errno
+                ),
+                (ResourceState::ConsumedError, Some(libc::EIO))
+            );
+            assert_eq!(
+                (manifest[2].close_state, manifest[2].close_errno),
+                (ResourceState::CloseReturned, None)
+            );
+        }
     }
 }
 

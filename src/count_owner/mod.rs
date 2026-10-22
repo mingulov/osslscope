@@ -1840,19 +1840,10 @@ fn fill_terminal_shared(state: &SharedState, data: &mut RawTerminalData) {
     if let Some(inventory) = &data.inventory {
         data.manifest.clear();
         data.manifest.extend(inventory.records.iter().cloned());
-        for record in &mut data.manifest {
-            if let Some(resource) = state
-                .resources
-                .resources
-                .iter()
-                .find(|r| r.resource == ResourceId::Link(record.id))
-            {
-                record.close_state = resource.state;
-                record.close_errno = resource.errno;
-            }
-        }
+        refresh_manifest_close_states(&mut data.manifest, &state.resources.resources);
     }
-    if let CleanupState::Pending(summary) = &mut data.cleanup_state {
+    if let CleanupState::Pending(summary) | CleanupState::Failed(summary) = &mut data.cleanup_state
+    {
         summary.resources.clear();
         summary
             .resources
@@ -1867,6 +1858,40 @@ fn fill_terminal_shared(state: &SharedState, data: &mut RawTerminalData) {
             seal.submitted_at,
         );
     }
+}
+fn refresh_manifest_close_states(
+    manifest: &mut [CreationRecord],
+    resources: &[ResourceRecord],
+) -> usize {
+    // Successful link slots and the sealed manifest share creation order; a
+    // held successful slot is never reused within its epoch. Traverse those
+    // ordered slots once instead of restarting a full search per link. Keep a
+    // later serial available if an earlier resource is missing, so missing
+    // acknowledgments stay unavailable without erasing a later known outcome.
+    let mut resources = resources.iter().peekable();
+    let mut visits = 0;
+    for record in manifest {
+        while let Some(resource) = resources.peek() {
+            visits += 1;
+            match resource.resource {
+                ResourceId::Link(id) if id == record.id => {
+                    record.close_state = resource.state;
+                    record.close_errno = resource.errno;
+                    resources.next();
+                    break;
+                }
+                ResourceId::Link(id)
+                    if id.owner_epoch == record.id.owner_epoch && id.serial > record.id.serial =>
+                {
+                    break;
+                }
+                _ => {
+                    resources.next();
+                }
+            }
+        }
+    }
+    visits
 }
 fn finish_terminal(
     shared: &Shared,
@@ -2108,7 +2133,9 @@ fn finish_terminal(
         let mut state = locked(&shared.state);
         state.active_operation = None;
         data.failures.merge(state.failures.before(data.deadline));
-        if let CleanupState::Pending(summary) = &mut data.cleanup_state {
+        if let CleanupState::Pending(summary) | CleanupState::Failed(summary) =
+            &mut data.cleanup_state
+        {
             registry.publish_into(summary);
         }
         mark_failed_cleanup(data);
