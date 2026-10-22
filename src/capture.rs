@@ -5862,11 +5862,13 @@ where
     /// request and its full gap, without inventing count admission or release.
     fn external_no_window_result(mut self) -> anyhow::Result<Capture> {
         assert!(!self.info.owned && self.count.programmed_admission().is_none());
-        let terminal = Arc::new(self.count.terminal(crate::count_session::CloseRequest {
-            started_at: Instant::now(),
-            grace: self.cfg.grace,
-            reason: crate::count_session::CloseReason::SetupAbort,
-        }));
+        let terminal = self
+            .count
+            .terminal_shared(crate::count_session::CloseRequest {
+                started_at: Instant::now(),
+                grace: self.cfg.grace,
+                reason: crate::count_session::CloseReason::SetupAbort,
+            });
         if terminal.retained_drain.total_calls() != 0 {
             return Err(self.pre_observation_failure(
                 PreObservationCause::WindowBinding,
@@ -6090,11 +6092,11 @@ fn pre_observation_error<B: CountBackend, T: TargetPort>(
     failure: Option<BoundaryFailure>,
     release: Option<ReleaseAttempt>,
 ) -> anyhow::Error {
-    let terminal = Arc::new(count.terminal(crate::count_session::CloseRequest {
+    let terminal = count.terminal_shared(crate::count_session::CloseRequest {
         started_at: Instant::now(),
         grace: cfg.grace,
         reason: crate::count_session::CloseReason::SetupAbort,
-    }));
+    });
     let resolved = target.resolve_setup_failure();
     let child_exit = target.poll_exit().ok().flatten();
     let disposition = child_exit.map(|code| target::TargetDisposition::Exited { code });
@@ -6309,11 +6311,13 @@ where
     if let Some(error) = open_error {
         // A lost Open reply can resolve Completed in this same canonical
         // terminal. Scope routing must inspect that actual resolved binding.
-        let _ = runner.count.terminal(crate::count_session::CloseRequest {
-            started_at: Instant::now(),
-            grace: cfg.grace,
-            reason: crate::count_session::CloseReason::SetupAbort,
-        });
+        let _ = runner
+            .count
+            .terminal_shared(crate::count_session::CloseRequest {
+                started_at: Instant::now(),
+                grace: cfg.grace,
+                reason: crate::count_session::CloseReason::SetupAbort,
+            });
         if runner.must_salvage_requested_window() {
             return runner.fail(error.context("count Open after completed binding"));
         }
@@ -6363,7 +6367,7 @@ where
             self.canonical_terminal = self
                 .count
                 .terminal_id()
-                .map(|id| Arc::new(self.count.salvage_view(id)));
+                .map(|id| self.count.shared_terminal(id));
         }
         self.canonical_terminal.clone()
     }
@@ -13874,6 +13878,198 @@ mod tests {
             assert_eq!(v.overall(), crate::policy::PolicyOutcome::Violation);
             assert_eq!(v.rules[0].bounds.definite, 7);
             assert_eq!(v.rules[0].engine_hits.len(), 1);
+        }
+
+        // Uses the real converted session prefix: gen0 has seven calls and
+        // gen1 has three, both with actual candidate buffers and one canonical
+        // terminal. The expected pointers come from session-owned storage.
+        fn t9_i1_seed_terminal() -> (
+            CountSession<FakeCountBackend>,
+            SeedFile,
+            crate::count_session::tests::TerminalStorageIdentity,
+        ) {
+            let mut count = CountSession::new(TPID, FakeCountBackend::new());
+            let seed = seed_site(&mut count);
+            let (device, inode) = seed.identity();
+            let cookie = count
+                .cookie_for(device, inode, x_offset(&std::fs::read(&seed.path).unwrap()))
+                .unwrap();
+            count
+                .fence(
+                    CountFence::MappingsChanged,
+                    Instant::now() + Duration::from_secs(5),
+                )
+                .unwrap();
+            count.backend_mut().fire(TPID, cookie, 1600, 3);
+            count.backend_mut().set_modeled_seal(Some(1700), Some(1710));
+            let terminal = count.terminal(crate::count_session::CloseRequest {
+                started_at: Instant::now(),
+                grace: Duration::from_secs(1),
+                reason: crate::count_session::CloseReason::Failure,
+            });
+            assert_eq!(terminal.retained_drain.current.len(), 1);
+            assert_eq!(terminal.retained_drain.fenced.len(), 1);
+            assert_eq!(terminal.retained_drain.current[0].calls, 3);
+            assert_eq!(terminal.retained_drain.fenced[0].sites[0].calls, 7);
+            assert!(!terminal.retained_drain.current[0].candidates.is_empty());
+            assert!(
+                !terminal.retained_drain.fenced[0].sites[0]
+                    .candidates
+                    .is_empty()
+            );
+            let identity = crate::count_session::tests::selected_storage_identity(&count);
+            (count, seed, identity)
+        }
+
+        #[test]
+        fn t9_i1_endpoint_uses_selected_current_fenced_candidate_backing() {
+            let cfg = stub_config();
+            let mut info = stub_info();
+            info.acquired_ns = 1000;
+            let clock = ClockStub::at(1700);
+            let mut proc = ProcStub;
+            let cancelled = || false;
+            let (count, _seed, expected) = t9_i1_seed_terminal();
+            let mut runner = stub_runner(
+                &cfg,
+                &info,
+                DiscoveryStub {
+                    finish_err: false,
+                    poll_err: false,
+                    dispatch_attached: true,
+                    trip_set: None,
+                },
+                count,
+                &clock,
+                &mut proc,
+                &cancelled,
+            );
+            assert_eq!(
+                runner.coverage_endpoint(),
+                CoverageEndpoint {
+                    end_ns: 1700,
+                    uncertain: false
+                }
+            );
+            let first = runner.retained_terminal().unwrap();
+            let repeated = runner.retained_terminal().unwrap();
+            assert!(Arc::ptr_eq(&first, &repeated));
+            let selected = runner.count.shared_terminal(first.receipt.terminal_id);
+            assert!(Arc::ptr_eq(&first, &selected));
+            let reselected = runner
+                .count
+                .terminal_shared(crate::count_session::CloseRequest {
+                    started_at: Instant::now(),
+                    grace: Duration::ZERO,
+                    reason: crate::count_session::CloseReason::Expired,
+                });
+            assert!(
+                Arc::ptr_eq(&selected, &reselected),
+                "re-entry cannot select a new envelope/deadline"
+            );
+            assert_eq!(
+                crate::count_session::tests::terminal_storage_identity(&first),
+                expected,
+                "endpoint inspection copied the selected current/fenced/candidate allocations"
+            );
+            assert_eq!(
+                crate::count_session::tests::selected_storage_identity(&runner.count),
+                expected
+            );
+        }
+
+        #[test]
+        fn t9_i1_binding_failure_uses_selected_current_fenced_candidate_backing() {
+            let cfg = stub_config();
+            let mut info = stub_info();
+            info.acquired_ns = 1550;
+            let clock = ClockStub::at(1700);
+            let mut proc = ProcStub;
+            let cancelled = || false;
+            let (count, seed, expected) = t9_i1_seed_terminal();
+            let mut runner = stub_runner(
+                &cfg,
+                &info,
+                DiscoveryStub {
+                    finish_err: false,
+                    poll_err: false,
+                    dispatch_attached: true,
+                    trip_set: None,
+                },
+                count,
+                &clock,
+                &mut proc,
+                &cancelled,
+            );
+            let (device, inode) = seed.identity();
+            push_seed_objects(&mut runner, device, inode);
+            let error = runner.close_and_finalize().unwrap_err();
+            let binding = error.downcast_ref::<WindowBindingFailure>().unwrap();
+            assert_eq!(binding.reason, WindowBindingReason::PreRequestedRow);
+            let runtime = error.downcast_ref::<CaptureRuntimeFailure>().unwrap();
+            let terminal = runtime.terminal.as_ref().unwrap();
+            let PreObservationCount::Terminal(context) =
+                &runtime.capture.failure_context.as_ref().unwrap().count
+            else {
+                panic!("canonical context missing")
+            };
+            assert!(Arc::ptr_eq(terminal, context));
+            assert!(Arc::ptr_eq(terminal, binding.terminal.as_ref().unwrap()));
+            assert_eq!(runtime.capture.document.total_calls(), 3);
+            assert_eq!(terminal.retained_drain.total_calls(), 10);
+            assert_eq!(
+                crate::count_session::tests::terminal_storage_identity(terminal),
+                expected,
+                "binding error copied the selected current/fenced/candidate allocations"
+            );
+        }
+
+        #[test]
+        fn t9_i1_completed_open_setup_failure_uses_selected_backing() {
+            let cfg = stub_config();
+            let mut info = stub_info();
+            info.acquired_ns = 1000;
+            let clock = ClockStub::at(1700);
+            let mut proc = ProcStub;
+            let cancelled = || false;
+            let (count, seed, expected) = t9_i1_seed_terminal();
+            let mut runner = stub_runner(
+                &cfg,
+                &info,
+                DiscoveryStub {
+                    finish_err: false,
+                    poll_err: false,
+                    dispatch_attached: true,
+                    trip_set: None,
+                },
+                count,
+                &clock,
+                &mut proc,
+                &cancelled,
+            );
+            let (device, inode) = seed.identity();
+            push_seed_objects(&mut runner, device, inode);
+            assert!(!runner.observation_started);
+            assert!(runner.count.programmed_admission().is_some());
+            let capture = runner
+                .fail_at(
+                    std::io::Error::from_raw_os_error(libc::EIO).into(),
+                    BoundaryStage::Traversal,
+                )
+                .unwrap();
+            assert_eq!(capture.document.total_calls(), 10);
+            let context = capture.failure_context.as_ref().unwrap();
+            let failure = context.failure.as_ref().unwrap();
+            assert_eq!(failure.stage, BoundaryStage::Traversal);
+            assert_eq!(failure.errno, Some(libc::EIO));
+            let PreObservationCount::Terminal(terminal) = &context.count else {
+                panic!("canonical context missing")
+            };
+            assert_eq!(
+                crate::count_session::tests::terminal_storage_identity(terminal),
+                expected,
+                "completed-Open setup failure copied the selected current/fenced/candidate allocations"
+            );
         }
 
         #[test]

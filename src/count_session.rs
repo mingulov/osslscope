@@ -424,7 +424,7 @@ pub struct CountSession<B: CountBackend> {
     // the old rows here would pin a spare in the owner's three-image pool and
     // prevent a later ordinary read from publishing its positive prefixes.
     last_snapshot_seq: Option<SnapshotSeq>,
-    terminal_view: Option<CountTerminal>,
+    terminal_view: Option<Arc<CountTerminal>>,
     canonical: Option<TerminalRequest>,
     runtime_failure: Option<OwnerFailure>,
     component_failures: [Option<ComponentFailure>; 18],
@@ -1186,7 +1186,16 @@ impl<B: CountBackend> CountSession<B> {
         }
     }
 
+    /// Legacy owned-return adapter. New retained consumers share the selected
+    /// canonical envelope via `terminal_shared` / `shared_terminal` instead.
     pub fn terminal(&mut self, request: CloseRequest) -> CountTerminal {
+        self.terminal_shared(request).as_ref().clone()
+    }
+
+    /// Select exactly once, moving the routed converted drain into one shared
+    /// immutable canonical envelope. Re-entry shares it without another image,
+    /// close, clock sample or deadline.
+    pub fn terminal_shared(&mut self, request: CloseRequest) -> Arc<CountTerminal> {
         if let Some(view) = &self.terminal_view {
             return view.clone();
         }
@@ -1374,12 +1383,12 @@ impl<B: CountBackend> CountSession<B> {
         if self.runtime_failure.is_some() {
             self.record_loss("count.owner_failed", CounterSource::Drain, 1);
         }
-        let view = CountTerminal {
+        let view = Arc::new(CountTerminal {
             retained_drain: self.retained_drain(),
             receipt,
             runtime_failure: self.runtime_failure,
-        };
-        self.terminal_view = Some(view.clone());
+        });
+        self.terminal_view = Some(Arc::clone(&view));
         view
     }
 
@@ -1463,8 +1472,9 @@ impl<B: CountBackend> CountSession<B> {
         valid
     }
 
-    /// Pure replay of the selected envelope. No backend or clock access.
-    pub fn salvage_view(&self, terminal_id: TerminalId) -> CountTerminal {
+    /// Pure shared replay of the selected envelope. No backend or clock access,
+    /// and no converted row/candidate collection is copied.
+    pub fn shared_terminal(&self, terminal_id: TerminalId) -> Arc<CountTerminal> {
         let view = self
             .terminal_view
             .as_ref()
@@ -1474,7 +1484,13 @@ impl<B: CountBackend> CountSession<B> {
             self.terminal_id(),
             "foreign terminal identity"
         );
-        view.clone()
+        Arc::clone(view)
+    }
+
+    /// Legacy owned-return replay. Copies converted rows; Task 10 removes the
+    /// old bridge. New retained error state uses `shared_terminal` instead.
+    pub fn salvage_view(&self, terminal_id: TerminalId) -> CountTerminal {
+        self.shared_terminal(terminal_id).as_ref().clone()
     }
 
     /// Pure adapter for capture's temporary bridge. It exposes only facts that
@@ -1515,7 +1531,7 @@ impl<B: CountBackend> CountSession<B> {
         grace: Duration,
     ) -> Result<RetainedCaptureCounts, OwnerFailure> {
         if self.terminal_view.is_none() {
-            self.terminal(CloseRequest {
+            self.terminal_shared(CloseRequest {
                 started_at: Instant::now(),
                 grace,
                 reason: CloseReason::Failure,
@@ -2895,6 +2911,59 @@ pub(crate) mod tests {
     ) -> CountDrain {
         session.read(deadline).unwrap();
         session.retained_drain()
+    }
+
+    /// Test-only identity of the actual selected allocations, including nested
+    /// candidate buffers. No production accessors or allocation counters added.
+    #[derive(Debug, PartialEq, Eq)]
+    pub(crate) struct TerminalStorageIdentity {
+        id: TerminalId,
+        ticket: CleanupTicket,
+        deadline: Instant,
+        receipt: usize,
+        calls: u64,
+        allocations: Vec<usize>,
+    }
+    pub(crate) fn terminal_storage_identity(view: &CountTerminal) -> TerminalStorageIdentity {
+        let drain = &view.retained_drain;
+        let mut allocations = vec![
+            drain.current.as_ptr() as usize,
+            drain.fenced.as_ptr() as usize,
+        ];
+        for group in &drain.fenced {
+            allocations.push(group.sites.as_ptr() as usize);
+        }
+        for row in drain
+            .current
+            .iter()
+            .chain(drain.fenced.iter().flat_map(|group| &group.sites))
+        {
+            allocations.push(row.candidates.as_ptr() as usize);
+            for candidate in &row.candidates {
+                allocations.push(candidate.provider.0.as_ptr() as usize);
+                allocations.push(candidate.provider_class.as_ptr() as usize);
+                allocations.push(candidate.algorithm_classes.as_ptr() as usize);
+                allocations.extend(
+                    candidate
+                        .algorithm_classes
+                        .iter()
+                        .map(|class| class.as_ptr() as usize),
+                );
+            }
+        }
+        TerminalStorageIdentity {
+            id: view.receipt.terminal_id,
+            ticket: view.receipt.cleanup_ticket,
+            deadline: view.receipt.deadline,
+            receipt: (&*view.receipt) as *const _ as usize,
+            calls: drain.total_calls(),
+            allocations,
+        }
+    }
+    pub(crate) fn selected_storage_identity<B: CountBackend>(
+        session: &CountSession<B>,
+    ) -> TerminalStorageIdentity {
+        terminal_storage_identity(session.terminal_view.as_ref().expect("selected terminal"))
     }
 
     #[test]
