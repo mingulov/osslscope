@@ -20,6 +20,7 @@ use std::os::fd::{FromRawFd as _, IntoRawFd as _, OwnedFd, RawFd};
 pub const BPF_MAP_CREATE: u32 = 0;
 pub const BPF_MAP_LOOKUP_ELEM: u32 = 1;
 pub const BPF_MAP_UPDATE_ELEM: u32 = 2;
+pub const BPF_MAP_GET_NEXT_KEY: u32 = 4;
 pub const BPF_OBJ_GET_INFO_BY_FD: u32 = 15;
 pub const BPF_PROG_LOAD: u32 = 5;
 pub const BPF_BTF_LOAD: u32 = 18;
@@ -332,6 +333,31 @@ pub unsafe fn map_lookup_elem(map_fd: RawFd, key: &[u8], value: &mut [u8]) -> io
     attr.flags = 0;
     bpf(
         BPF_MAP_LOOKUP_ELEM,
+        std::ptr::addr_of_mut!(attr).cast(),
+        size_of::<ElemAttr>(),
+    )?;
+    Ok(())
+}
+
+/// Read the first key (`key = None`) or the key following `key`. Natural end of
+/// enumeration is ENOENT; a concurrently absent input key may restart a hash
+/// map's iteration, so callers must detect duplicate/cyclic results themselves.
+///
+/// # Safety
+///
+/// `map_fd` must name a live map. `next` and every present `key` must each have
+/// exactly that map's key size. The kernel writes the complete key into `next`.
+pub unsafe fn map_get_next_key(
+    map_fd: RawFd,
+    key: Option<&[u8]>,
+    next: &mut [u8],
+) -> io::Result<()> {
+    let mut attr: ElemAttr = zeroed();
+    attr.map_fd = map_fd as u32;
+    attr.key = key.map_or(0, |key| key.as_ptr() as u64);
+    attr.value = next.as_mut_ptr() as u64;
+    bpf(
+        BPF_MAP_GET_NEXT_KEY,
         std::ptr::addr_of_mut!(attr).cast(),
         size_of::<ElemAttr>(),
     )?;

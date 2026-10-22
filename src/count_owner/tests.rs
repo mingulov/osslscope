@@ -10,6 +10,1391 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MapAction {
+    Write(CountMap, u32, Vec<u8>),
+    Lookup(CountMap, u64, usize),
+    Next(Option<u64>),
+}
+#[derive(Default)]
+struct MapFaults {
+    keys: Vec<u64>,
+    row_error: Option<u64>,
+    absent_key: Option<u64>,
+    next_error_after: Option<usize>,
+    component_error: Option<(CountMap, u32)>,
+    write_error: Option<usize>,
+    hold_call: Option<usize>,
+    panic_call: Option<usize>,
+    expire_after_call: Option<usize>,
+    saturating: bool,
+}
+struct MapProbe {
+    owner: Arc<Probe>,
+    calls: Mutex<Vec<(ThreadId, MapAction)>>,
+    changed: Condvar,
+    expired: AtomicBool,
+    post_expiry: std::sync::atomic::AtomicUsize,
+}
+impl MapProbe {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            owner: Probe::new(),
+            calls: Mutex::new(Vec::new()),
+            changed: Condvar::new(),
+            expired: AtomicBool::new(false),
+            post_expiry: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+    fn wait_calls(&self, n: usize) {
+        let cutoff = Instant::now() + Duration::from_secs(3);
+        let mut calls = self.calls.lock().unwrap();
+        while calls.len() < n {
+            let remaining = cutoff.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "map operation did not enter: {calls:?}"
+            );
+            calls = self.changed.wait_timeout(calls, remaining).unwrap().0;
+        }
+    }
+    fn cleanup(&self) {
+        task3_cleanup(&self.owner, 8);
+        let calls = self.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .all(|(thread, _)| *thread != std::thread::current().id())
+        );
+        if let Some((owner, _)) = calls.first() {
+            assert!(calls.iter().all(|(thread, _)| thread == owner));
+        }
+    }
+}
+struct MapDriver {
+    base: PipeDriver,
+    probe: Arc<MapProbe>,
+    faults: MapFaults,
+    maps: [i32; 7],
+    map_count: usize,
+    next_position: usize,
+    writes: usize,
+    cpus: usize,
+    cutoff: Instant,
+}
+impl MapDriver {
+    fn map(&self, fd: BorrowedFd<'_>) -> CountMap {
+        CountMap::ALL[self.maps.iter().position(|f| *f == fd.as_raw_fd()).unwrap()]
+    }
+    fn enter(&mut self, action: MapAction) {
+        if self.probe.expired.load(Ordering::Acquire) {
+            self.probe.post_expiry.fetch_add(1, Ordering::Relaxed);
+        }
+        let n = {
+            let mut calls = self.probe.calls.lock().unwrap();
+            calls.push((std::thread::current().id(), action));
+            calls.len()
+        };
+        self.probe.changed.notify_all();
+        if self.faults.hold_call == Some(n) {
+            self.probe.owner.hold();
+        }
+        assert_ne!(
+            self.faults.panic_call,
+            Some(n),
+            "held map operation unwound before return"
+        );
+        if self.faults.expire_after_call == Some(n) {
+            self.probe.expired.store(true, Ordering::Release);
+        }
+    }
+}
+impl CountIoDriver for MapDriver {
+    fn map_create(&mut self, spec: &crate::loader::MapSpecLite) -> io::Result<OwnedFd> {
+        let fd = self.base.map_create(spec)?;
+        self.maps[self.map_count] = fd.as_raw_fd();
+        self.map_count += 1;
+        Ok(fd)
+    }
+    fn load_program(&mut self, i: &[u8], n: &str, l: Option<&mut [u8]>) -> io::Result<OwnedFd> {
+        self.base.load_program(i, n, l)
+    }
+    fn open_pin(&mut self, path: &CStr) -> io::Result<OwnedFd> {
+        self.base.open_pin(path)
+    }
+    fn pin_identity(&mut self, pin: BorrowedFd<'_>) -> io::Result<BackingIdentity> {
+        self.base.pin_identity(pin)
+    }
+    fn attach(
+        &mut self,
+        prog: BorrowedFd<'_>,
+        path: &CStr,
+        offsets: &[u64],
+        cookies: &[u64],
+        tgid: u32,
+    ) -> io::Result<OwnedFd> {
+        self.base.attach(prog, path, offsets, cookies, tgid)
+    }
+    unsafe fn update(&mut self, fd: BorrowedFd<'_>, key: &[u8], value: &[u8]) -> io::Result<()> {
+        let map = self.map(fd);
+        let key = u32::from_ne_bytes(key.try_into().unwrap());
+        self.enter(MapAction::Write(map, key, value.to_vec()));
+        self.writes += 1;
+        if self.faults.write_error == Some(self.writes) {
+            Err(io::Error::from_raw_os_error(libc::EIO))
+        } else {
+            Ok(())
+        }
+    }
+    unsafe fn lookup(
+        &mut self,
+        fd: BorrowedFd<'_>,
+        key: &[u8],
+        value: &mut [u8],
+    ) -> io::Result<()> {
+        let map = self.map(fd);
+        let key = if map == CountMap::Counts {
+            u64::from_ne_bytes(key.try_into().unwrap())
+        } else {
+            u32::from_ne_bytes(key.try_into().unwrap()) as u64
+        };
+        self.enter(MapAction::Lookup(map, key, value.len()));
+        if map == CountMap::Counts {
+            assert_eq!(value.len(), self.cpus * 24, "CountValue per-CPU stride");
+            if self.faults.row_error == Some(key) {
+                return Err(io::Error::from_raw_os_error(libc::EIO));
+            }
+            if self.faults.absent_key == Some(key) {
+                return Err(io::Error::from_raw_os_error(libc::ENOENT));
+            }
+            for (cpu, bytes) in value.chunks_exact_mut(24).enumerate() {
+                let count = if self.faults.saturating {
+                    if cpu == 0 { u64::MAX } else { 10 }
+                } else {
+                    key + cpu as u64
+                };
+                let first = if cpu == 0 { 100 + key } else { 90 + key };
+                let last = if cpu == 0 { 200 + key } else { 300 + key };
+                bytes[..8].copy_from_slice(&count.to_ne_bytes());
+                bytes[8..16].copy_from_slice(&first.to_ne_bytes());
+                bytes[16..24].copy_from_slice(&last.to_ne_bytes());
+            }
+        } else {
+            assert_eq!(value.len(), self.cpus * 8, "u64 per-CPU stride");
+            if self.faults.component_error == Some((map, key as u32)) {
+                return Err(io::Error::from_raw_os_error(libc::EIO));
+            }
+            for (cpu, bytes) in value.chunks_exact_mut(8).enumerate() {
+                let n: u64 = if self.faults.saturating {
+                    if cpu == 0 { u64::MAX } else { 7 }
+                } else {
+                    match map {
+                        CountMap::Admitted => {
+                            if cpu == 0 {
+                                7
+                            } else {
+                                11
+                            }
+                        }
+                        CountMap::Dropfail => {
+                            if cpu == 0 {
+                                13
+                            } else {
+                                17
+                            }
+                        }
+                        CountMap::Latc => key + cpu as u64 + 1,
+                        _ => panic!("unexpected scalar map"),
+                    }
+                };
+                bytes.copy_from_slice(&n.to_ne_bytes());
+            }
+        }
+        Ok(())
+    }
+    unsafe fn next_key(
+        &mut self,
+        fd: BorrowedFd<'_>,
+        key: Option<&[u8]>,
+        next: &mut [u8],
+    ) -> io::Result<()> {
+        assert_eq!(self.map(fd), CountMap::Counts);
+        let key = key.map(|k| u64::from_ne_bytes(k.try_into().unwrap()));
+        if key.is_none() {
+            self.next_position = 0;
+        }
+        self.enter(MapAction::Next(key));
+        if self.faults.next_error_after == Some(self.next_position) {
+            return Err(io::Error::from_raw_os_error(libc::EIO));
+        }
+        let Some(key) = self.faults.keys.get(self.next_position) else {
+            return Err(io::Error::from_raw_os_error(libc::ENOENT));
+        };
+        self.next_position += 1;
+        next.copy_from_slice(&key.to_ne_bytes());
+        Ok(())
+    }
+    fn close(&mut self, fd: OwnedFd) -> io::Result<()> {
+        self.base.close(fd)
+    }
+    fn now(&self) -> Instant {
+        if self.probe.expired.load(Ordering::Acquire) {
+            self.cutoff + Duration::from_secs(1)
+        } else {
+            Instant::now()
+        }
+    }
+    fn monotonic_ns(&self) -> Option<u64> {
+        Some(1)
+    }
+}
+fn map_engine(probe: &Arc<MapProbe>, faults: MapFaults) -> CountEngine {
+    map_engine_with_sequence(probe, faults, 0)
+}
+fn map_engine_with_sequence(probe: &Arc<MapProbe>, faults: MapFaults, last: u64) -> CountEngine {
+    let observed = Arc::clone(&probe.owner);
+    let mut hooks = PrepareHooks::host();
+    hooks.snapshot_sequence_last = last;
+    hooks.registry_observer = Some(Arc::new(move |event| {
+        observed.event(Event::Registry(event))
+    }));
+    let probe = Arc::clone(probe);
+    let cutoff = Instant::now() + Duration::from_secs(30);
+    CountEngine::prepare_with(
+        input(Arc::new(CountForkBarrier::new())),
+        CountOwnerLimits::from_allowance(18, 2).unwrap(),
+        cutoff,
+        hooks,
+        move || {
+            probe.owner.event(Event::Started);
+            MapDriver {
+                base: PipeDriver {
+                    probe: Arc::clone(&probe.owner),
+                    faults: Faults::default(),
+                    deadline: cutoff,
+                    attempts: 0,
+                    acquired: 0,
+                    closes: 0,
+                },
+                probe,
+                faults,
+                maps: [-1; 7],
+                map_count: 0,
+                next_position: 0,
+                writes: 0,
+                cpus: 2,
+                cutoff,
+            }
+        },
+        spawn_owner,
+    )
+    .unwrap()
+}
+
+#[test]
+fn g1_read_next_error_and_concurrently_absent_key() {
+    for (absent_key, next_error_after, want_enumeration, want_rows) in [
+        (
+            None,
+            Some(2),
+            EnumerationStatus::Unfinished,
+            first_two_rows(),
+        ),
+        (
+            Some(22),
+            None,
+            EnumerationStatus::Complete { unread_keys: 1 },
+            vec![
+                (
+                    11,
+                    osslscope_ebpf_common::CountValue {
+                        count: 23,
+                        first_ns: 101,
+                        last_ns: 311,
+                    },
+                ),
+                (
+                    33,
+                    osslscope_ebpf_common::CountValue {
+                        count: 67,
+                        first_ns: 123,
+                        last_ns: 333,
+                    },
+                ),
+            ],
+        ),
+        (
+            Some(22),
+            Some(2),
+            EnumerationStatus::Unfinished,
+            vec![(
+                11,
+                osslscope_ebpf_common::CountValue {
+                    count: 23,
+                    first_ns: 101,
+                    last_ns: 311,
+                },
+            )],
+        ),
+    ] {
+        let probe = MapProbe::new();
+        let engine = map_engine(
+            &probe,
+            MapFaults {
+                keys: vec![11, 22, 33],
+                absent_key,
+                next_error_after,
+                ..MapFaults::default()
+            },
+        );
+        let snapshot = engine.drain(read_request(1)).unwrap().value;
+        assert_eq!(snapshot.rows, want_rows);
+        assert_eq!(snapshot.enumeration, want_enumeration);
+        assert_eq!(snapshot.admitted, Component::Available(18));
+        drop(engine);
+        probe.cleanup();
+    }
+}
+
+#[test]
+fn g1_read_key_cycles_do_not_restart_or_claim_complete() {
+    for (keys, absent_key, want_count, want_next_calls) in [
+        (vec![11, 11, 22], None, 1, 2),
+        (vec![11, 22, 11, 33], None, 2, 3),
+        (vec![11, 22, 22, 33], Some(22), 1, 3),
+    ] {
+        let probe = MapProbe::new();
+        let engine = map_engine(
+            &probe,
+            MapFaults {
+                keys,
+                absent_key,
+                ..MapFaults::default()
+            },
+        );
+        let snapshot = engine.drain(read_request(1)).unwrap().value;
+        assert_eq!(snapshot.rows.len(), want_count);
+        assert_eq!(snapshot.enumeration, EnumerationStatus::Unfinished);
+        assert_eq!(
+            locked(&engine.shared.state).read_failure.unwrap().class,
+            FailureClass::Inventory
+        );
+        assert_eq!(
+            probe
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, c)| matches!(c, MapAction::Next(_)))
+                .count(),
+            want_next_calls
+        );
+        assert_eq!(
+            probe
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, c)| matches!(c, MapAction::Next(None)))
+                .count(),
+            1
+        );
+        drop(engine);
+        probe.cleanup();
+    }
+}
+
+#[test]
+fn g1_read_8192_rows_and_8193rd_key_are_bounded() {
+    for n in [8192, 8193] {
+        let probe = MapProbe::new();
+        let engine = map_engine(
+            &probe,
+            MapFaults {
+                keys: (0..n).collect(),
+                ..MapFaults::default()
+            },
+        );
+        let snapshot = engine.drain(read_request(1)).unwrap().value;
+        assert_eq!(snapshot.rows.len(), 8192);
+        assert_eq!(
+            snapshot.rows[8191],
+            (
+                8191,
+                osslscope_ebpf_common::CountValue {
+                    count: 16383,
+                    first_ns: 8281,
+                    last_ns: 8491
+                }
+            )
+        );
+        assert_eq!(
+            snapshot.enumeration,
+            if n == 8192 {
+                EnumerationStatus::Complete { unread_keys: 0 }
+            } else {
+                EnumerationStatus::Unfinished
+            }
+        );
+        assert_eq!(
+            probe
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, c)| matches!(c, MapAction::Lookup(CountMap::Counts, _, _)))
+                .count(),
+            8192
+        );
+        if n == 8193 {
+            assert_eq!(
+                locked(&engine.shared.state).read_failure.unwrap().class,
+                FailureClass::Capacity
+            );
+        }
+        drop(engine);
+        probe.cleanup();
+    }
+}
+
+#[test]
+fn g1_read_per_cpu_stride_and_saturation() {
+    let probe = MapProbe::new();
+    let engine = map_engine(
+        &probe,
+        MapFaults {
+            keys: vec![11],
+            saturating: true,
+            ..MapFaults::default()
+        },
+    );
+    let snapshot = engine.drain(read_request(1)).unwrap().value;
+    assert_eq!(
+        snapshot.rows,
+        vec![(
+            11,
+            osslscope_ebpf_common::CountValue {
+                count: u64::MAX,
+                first_ns: 101,
+                last_ns: 311
+            }
+        )]
+    );
+    assert_eq!(snapshot.admitted, Component::Available(u64::MAX));
+    assert_eq!(snapshot.dropfail, Component::Available(u64::MAX));
+    assert_eq!(snapshot.latc, [Component::Available(u64::MAX); 16]);
+    for (_, call) in probe.calls.lock().unwrap().iter() {
+        if let MapAction::Lookup(map, _, bytes) = call {
+            assert_eq!(*bytes, if *map == CountMap::Counts { 48 } else { 16 });
+        }
+    }
+    assert!(CountOwnerLimits::from_allowance(18, 0).is_err());
+    assert!(CountOwnerLimits::from_allowance(18, usize::MAX / 24 + 1).is_err());
+    assert!(CountOwnerLimits::from_allowance(18, isize::MAX as usize / 24 + 1).is_err());
+    drop(engine);
+    probe.cleanup();
+}
+
+#[test]
+fn g1_read_rejects_a_short_kernel_cpu_vector_before_raw_io() {
+    let limits = CountOwnerLimits::from_allowance(18, 2).unwrap();
+    assert!(limits.validate_possible_cpus(2).is_ok());
+    for actual in [0, 1, 3, usize::MAX] {
+        assert_eq!(
+            limits.validate_possible_cpus(actual).unwrap_err().class,
+            FailureClass::InvalidInput
+        );
+    }
+}
+
+#[test]
+fn g1_prepare_live_cpu_zero_mismatch_or_unavailable_acquires_nothing() {
+    type Case = (fn() -> io::Result<usize>, FailureClass, Option<i32>);
+    let cases: [Case; 5] = [
+        (|| Ok(0), FailureClass::InvalidInput, None),
+        (|| Ok(1), FailureClass::InvalidInput, None),
+        (|| Ok(3), FailureClass::InvalidInput, None),
+        (|| Ok(usize::MAX), FailureClass::InvalidInput, None),
+        (
+            || Err(io::Error::from_raw_os_error(libc::EIO)),
+            FailureClass::Io,
+            Some(libc::EIO),
+        ),
+    ];
+    for (possible_cpu_count, class, errno) in cases {
+        let probe = Probe::new();
+        let hooks = PrepareHooks {
+            possible_cpu_count,
+            ..PrepareHooks::live()
+        };
+        let error = injected(
+            Arc::clone(&probe),
+            Faults::default(),
+            Arc::new(CountForkBarrier::new()),
+            Instant::now() + Duration::from_secs(5),
+            hooks,
+        )
+        .err()
+        .expect("live CPU preflight unexpectedly acquired count resources");
+        assert_eq!(error.failure.class, class);
+        assert_eq!(error.failure.errno, errno);
+        assert_eq!(error.cleanup_ticket, None);
+        assert!(probe.log.lock().unwrap().events.is_empty());
+    }
+}
+
+#[test]
+fn g1_read_prefix_stays_immutable_while_next_lookup_is_held() {
+    let probe = MapProbe::new();
+    // Calls: next11, lookup11, next22, lookup22, next33, held lookup33.
+    let engine = Arc::new(map_engine(
+        &probe,
+        MapFaults {
+            keys: vec![11, 22, 33],
+            hold_call: Some(6),
+            ..MapFaults::default()
+        },
+    ));
+    let caller = Arc::clone(&engine);
+    let call = std::thread::spawn(move || caller.drain(read_request(1)));
+    probe.wait_calls(6);
+    let prefix = engine.progress().unwrap();
+    assert_eq!(prefix.snapshot.rows, first_two_rows());
+    assert!(matches!(
+        prefix.snapshot.admitted,
+        Component::Unavailable(ComponentFailure { class: None, .. })
+    ));
+    let sequence = prefix.snapshot.sequence;
+    let reread = engine.progress().unwrap();
+    assert!(Arc::ptr_eq(&prefix.snapshot, &reread.snapshot));
+    assert_eq!(
+        probe.calls.lock().unwrap().len(),
+        6,
+        "progress performed count I/O"
+    );
+    probe.owner.release();
+    let final_image = call.join().unwrap().unwrap().value;
+    assert!(final_image.sequence > sequence);
+    assert_eq!(final_image.rows.len(), 3);
+    assert_eq!(
+        prefix.snapshot.rows,
+        first_two_rows(),
+        "published image was mutated"
+    );
+    assert_eq!(prefix.snapshot.sequence, sequence);
+    assert!(!Arc::ptr_eq(&prefix.snapshot, &final_image));
+    assert!(Arc::ptr_eq(
+        &engine.progress().unwrap().snapshot,
+        &final_image
+    ));
+    drop(engine);
+    probe.cleanup();
+}
+
+#[test]
+fn g1_snapshot_pool_never_allocates_a_fourth_image() {
+    let probe = MapProbe::new();
+    let engine = map_engine(
+        &probe,
+        MapFaults {
+            keys: vec![11, 22],
+            ..MapFaults::default()
+        },
+    );
+    let a = engine.drain(read_request(1)).unwrap().value;
+    let b = engine.drain(read_request(2)).unwrap().value;
+    let c = engine.drain(read_request(3)).unwrap().value;
+    assert!(a.sequence < b.sequence && b.sequence < c.sequence);
+    assert!(!Arc::ptr_eq(&a, &b) && !Arc::ptr_eq(&b, &c) && !Arc::ptr_eq(&a, &c));
+    let calls = probe.calls.lock().unwrap().len();
+    let failure = engine.drain(read_request(4)).unwrap_err();
+    assert_eq!(failure.failure.class, FailureClass::Capacity);
+    assert_eq!(failure.completion, CommandCompletion::NotEntered);
+    assert_eq!(
+        probe.calls.lock().unwrap().len(),
+        calls,
+        "pinned images started another read"
+    );
+    assert_eq!(a.rows, first_two_rows());
+    assert_eq!(b.rows, first_two_rows());
+    assert_eq!(c.rows, first_two_rows());
+    assert!(Arc::ptr_eq(&engine.progress().unwrap().snapshot, &c));
+    drop(engine);
+    probe.cleanup();
+}
+
+#[test]
+fn g1_snapshot_publication_contention_uses_retained_view() {
+    let probe = MapProbe::new();
+    let engine = Arc::new(map_engine(
+        &probe,
+        MapFaults {
+            keys: vec![11, 22],
+            ..MapFaults::default()
+        },
+    ));
+    let first = engine.drain(read_request(1)).unwrap().value;
+    assert!(Arc::ptr_eq(&engine.progress().unwrap().snapshot, &first));
+    let busy = locked(&engine.shared.latest_progress);
+    let caller = Arc::clone(&engine);
+    let (send, receive) = std::sync::mpsc::channel();
+    let observer = std::thread::spawn(move || send.send(caller.progress()).unwrap());
+    let retained = receive.recv_timeout(Duration::from_millis(250));
+    // Release the mutex even if a broken blocking getter misses the deadline.
+    if retained.is_err() {
+        drop(busy);
+        observer.join().unwrap();
+        panic!("progress blocked on publication");
+    }
+    assert!(Arc::ptr_eq(&retained.unwrap().unwrap().snapshot, &first));
+    observer.join().unwrap();
+    let second = engine
+        .drain(ReadRequest {
+            deadline: Instant::now() + Duration::from_secs(1),
+            ..read_request(2)
+        })
+        .unwrap()
+        .value;
+    assert!(second.sequence > first.sequence);
+    assert_eq!(second.rows, first_two_rows());
+    assert_eq!(engine.progress().unwrap().snapshot.sequence, first.sequence);
+    drop(busy);
+    drop(engine);
+    probe.cleanup();
+}
+
+#[test]
+fn g1_snapshot_sequence_exhaustion_retains_last_published_prefix() {
+    for last in [u64::MAX - 2, u64::MAX] {
+        let probe = MapProbe::new();
+        let engine = map_engine_with_sequence(
+            &probe,
+            MapFaults {
+                keys: vec![11, 22],
+                ..MapFaults::default()
+            },
+            last,
+        );
+        let failure = engine.drain(read_request(1)).unwrap_err();
+        assert_eq!(failure.failure.class, FailureClass::IdExhausted);
+        if last == u64::MAX {
+            assert!(engine.progress().is_none());
+            assert!(probe.calls.lock().unwrap().is_empty());
+            assert_eq!(locked(&engine.shared.state).last_completed_seq, None);
+        } else {
+            let snapshot = engine.progress().unwrap().snapshot;
+            assert_eq!(snapshot.sequence.value(), u64::MAX);
+            assert_eq!(
+                snapshot.rows,
+                vec![(
+                    11,
+                    osslscope_ebpf_common::CountValue {
+                        count: 23,
+                        first_ns: 101,
+                        last_ns: 311
+                    }
+                )]
+            );
+            assert_eq!(
+                locked(&engine.shared.state).last_completed_seq,
+                Some(CommandSeq::checked(1).unwrap())
+            );
+        }
+        drop(engine);
+        probe.cleanup();
+    }
+}
+
+#[test]
+fn g1_program_held_generation_completes_its_exact_sequence() {
+    let probe = MapProbe::new();
+    let engine = Arc::new(map_engine(
+        &probe,
+        MapFaults {
+            hold_call: Some(5),
+            ..MapFaults::default()
+        },
+    ));
+    engine.open_window(open_request(1)).unwrap();
+    let request = GenerationRequest {
+        seq: CommandSeq::checked(2).unwrap(),
+        deadline: Instant::now() + Duration::from_secs(10),
+        generation: 8,
+    };
+    let caller = Arc::clone(&engine);
+    let call = std::thread::spawn(move || caller.set_generation(request));
+    probe.wait_calls(5);
+    {
+        let state = locked(&engine.shared.state);
+        assert_eq!(state.last_command_seq, Some(request.seq));
+        assert_eq!(
+            state.last_completed_seq,
+            Some(CommandSeq::checked(1).unwrap())
+        );
+    }
+    assert_eq!(
+        engine.drain(read_request(3)).unwrap_err().failure.class,
+        FailureClass::Capacity
+    );
+    engine.shared.seal(request.deadline);
+    probe.owner.release();
+    assert!(call.join().unwrap().is_err());
+    let inventory = task3_inventory(&engine).unwrap();
+    assert_eq!(
+        inventory.pending,
+        Some(PendingCommandId {
+            seq: request.seq,
+            operation: CountOperation::Generation
+        })
+    );
+    assert_eq!(
+        locked(&engine.shared.state).last_completed_seq,
+        Some(request.seq)
+    );
+    assert_eq!(probe.calls.lock().unwrap().len(), 5);
+    drop(engine);
+    probe.cleanup();
+}
+
+#[test]
+fn g1_program_mixed_commands_preserve_attach_inventory_frontier() {
+    let probe = MapProbe::new();
+    let engine = map_engine(
+        &probe,
+        MapFaults {
+            keys: vec![11, 22],
+            ..MapFaults::default()
+        },
+    );
+    let links = engine.attach(attach_request(1, 1)).unwrap().value.links;
+    engine.open_window(open_request(2)).unwrap();
+    engine
+        .set_generation(GenerationRequest {
+            seq: CommandSeq::checked(3).unwrap(),
+            deadline: Instant::now() + Duration::from_secs(10),
+            generation: 8,
+        })
+        .unwrap();
+    engine.drain(read_request(4)).unwrap();
+    let frontier = locked(&engine.shared.state).frontier.clone();
+    engine.shared.seal(Instant::now());
+    let inventory = task3_inventory(&engine).unwrap();
+    assert_eq!(inventory.last_acked, Some(CommandSeq::checked(4).unwrap()));
+    assert_eq!(inventory.pending, None);
+    assert_eq!(inventory.records.len(), 1);
+    assert_eq!(
+        inventory.records[0].command,
+        CommandSeq::checked(1).unwrap()
+    );
+    assert_eq!(inventory.acknowledged_links, vec![links[0].id()]);
+    assert!(inventory.validate(&frontier).is_ok());
+    drop(engine);
+    task3_cleanup(&probe.owner, 10);
+}
+
+#[test]
+fn g1_program_metadata_only_attach_is_a_completed_command() {
+    let probe = MapProbe::new();
+    let engine = map_engine(&probe, MapFaults::default());
+    let a = engine.attach(attach_request(1, 1)).unwrap().value.links;
+    let b = engine.attach(attach_request(2, 1)).unwrap().value.links;
+    assert_eq!(a[0].id(), b[0].id());
+    assert_eq!(
+        locked(&engine.shared.state).last_completed_seq,
+        Some(CommandSeq::checked(2).unwrap())
+    );
+    engine.shared.seal(Instant::now());
+    let inventory = task3_inventory(&engine).unwrap();
+    assert_eq!(inventory.records.len(), 1);
+    assert_eq!(inventory.last_acked, Some(CommandSeq::checked(2).unwrap()));
+    drop(engine);
+    task3_cleanup(&probe.owner, 10);
+}
+
+#[test]
+fn g1_program_panic_and_queued_refusal_never_advance_completion() {
+    for n in 1..=4 {
+        let probe = MapProbe::new();
+        let engine = map_engine(
+            &probe,
+            MapFaults {
+                panic_call: Some(n),
+                ..MapFaults::default()
+            },
+        );
+        let request = open_request(1);
+        let failure = engine.open_window(request).unwrap_err();
+        assert_eq!(failure.completion, CommandCompletion::Unknown);
+        assert_eq!(failure.failure.class, FailureClass::Panic);
+        assert_eq!(locked(&engine.shared.state).last_completed_seq, None);
+        let receipt = locked(&engine.shared.state).resolved_open.unwrap();
+        assert_eq!(
+            receipt.completed_writes,
+            [
+                OpenWriteFrontier::NoWrites,
+                OpenWriteFrontier::WindowStart,
+                OpenWriteFrontier::WindowDeadline,
+                OpenWriteFrontier::Generation
+            ][n - 1]
+        );
+        assert_eq!(receipt.outcome, OpenOutcome::Unknown);
+        assert!(
+            receipt
+                .programmed_admission(engine.ready.owner_epoch, &request)
+                .is_err()
+        );
+        drop(engine);
+        probe.cleanup();
+    }
+    let probe = MapProbe::new();
+    let engine = map_engine(&probe, MapFaults::default());
+    let request = GenerationRequest {
+        seq: CommandSeq::checked(1).unwrap(),
+        deadline: Instant::now() + Duration::from_secs(10),
+        generation: 8,
+    };
+    {
+        let mut state = locked(&engine.shared.state);
+        state.last_command_seq = Some(request.seq);
+        state.frontier.pending = Some(PendingCommandId {
+            seq: request.seq,
+            operation: CountOperation::Generation,
+        });
+        assert!(
+            state
+                .ordinary
+                .publish_request(OwnerRequest::Generation(request))
+                .is_ok()
+        );
+        engine.shared.seal_locked(&mut state, request.deadline);
+    }
+    engine.shared.worker.get().unwrap().unpark();
+    let inventory = task3_inventory(&engine).unwrap();
+    assert_eq!(
+        inventory.pending.unwrap().operation,
+        CountOperation::Generation
+    );
+    assert_eq!(locked(&engine.shared.state).last_completed_seq, None);
+    assert!(probe.calls.lock().unwrap().is_empty());
+    let Some(OwnerReply::Generated(Err(failure))) =
+        locked(&engine.shared.state).ordinary.take_reply()
+    else {
+        panic!("missing queued refusal");
+    };
+    assert_eq!(failure.completion, CommandCompletion::NotEntered);
+    drop(engine);
+    probe.cleanup();
+}
+
+#[test]
+fn g1_read_unreturned_lookup_retains_unknown_tail_and_components() {
+    let probe = MapProbe::new();
+    let engine = map_engine(
+        &probe,
+        MapFaults {
+            keys: vec![11, 22, 33],
+            panic_call: Some(6),
+            ..MapFaults::default()
+        },
+    );
+    let failure = engine.drain(read_request(1)).unwrap_err();
+    assert_eq!(failure.completion, CommandCompletion::Unknown);
+    assert_eq!(locked(&engine.shared.state).last_completed_seq, None);
+    let prefix = engine.progress().unwrap().snapshot;
+    assert_eq!(prefix.rows, first_two_rows());
+    assert_eq!(prefix.enumeration, EnumerationStatus::Unfinished);
+    assert!(matches!(
+        prefix.admitted,
+        Component::Unavailable(ComponentFailure { class: None, .. })
+    ));
+    assert!(matches!(prefix.dropfail, Component::Unavailable(_)));
+    assert!(
+        prefix
+            .latc
+            .iter()
+            .all(|c| matches!(c, Component::Unavailable(_)))
+    );
+    drop(engine);
+    probe.cleanup();
+}
+
+#[test]
+fn g1_open_lost_reply_wrong_pending_operation_is_rejected() {
+    let probe = MapProbe::new();
+    let engine = map_engine(&probe, MapFaults::default());
+    let request = open_request(1);
+    {
+        let mut state = locked(&engine.shared.state);
+        state.last_command_seq = Some(request.seq);
+        state.frontier.pending = Some(PendingCommandId {
+            seq: request.seq,
+            operation: CountOperation::Generation,
+        });
+        state.pending_open = Some(request);
+        state.resolved_open = Some(OpenReceipt::pending(engine.ready.owner_epoch, &request));
+        assert!(
+            state
+                .ordinary
+                .publish_request(OwnerRequest::Open(request))
+                .is_ok()
+        );
+    }
+    engine.shared.worker.get().unwrap().unpark();
+    probe.wait_calls(4);
+    engine.shared.seal(request.deadline);
+    assert_eq!(task3_inventory(&engine), Err(InventoryFailure::Frontier));
+    drop(engine);
+    probe.cleanup();
+}
+
+#[test]
+fn g1_snapshot_expired_before_entry_and_between_key_and_value() {
+    let probe = MapProbe::new();
+    let engine = map_engine(&probe, MapFaults::default());
+    let failure = engine
+        .drain(ReadRequest {
+            deadline: Instant::now(),
+            ..read_request(1)
+        })
+        .unwrap_err();
+    assert_eq!(failure.completion, CommandCompletion::NotEntered);
+    assert!(probe.calls.lock().unwrap().is_empty());
+    drop(engine);
+    probe.cleanup();
+
+    let probe = MapProbe::new();
+    let engine = map_engine(
+        &probe,
+        MapFaults {
+            keys: vec![11, 22],
+            expire_after_call: Some(3),
+            ..MapFaults::default()
+        },
+    );
+    let snapshot = engine.drain(read_request(1)).unwrap().value;
+    assert_eq!(probe.calls.lock().unwrap().len(), 3);
+    assert_eq!(
+        snapshot.rows,
+        vec![(
+            11,
+            osslscope_ebpf_common::CountValue {
+                count: 23,
+                first_ns: 101,
+                last_ns: 311
+            }
+        )]
+    );
+    assert_eq!(snapshot.enumeration, EnumerationStatus::Unfinished);
+    assert!(matches!(
+        snapshot.admitted,
+        Component::Unavailable(ComponentFailure {
+            class: Some(FailureClass::Deadline),
+            ..
+        })
+    ));
+    assert_eq!(probe.post_expiry.load(Ordering::Acquire), 0);
+    drop(engine);
+    probe.cleanup();
+}
+fn read_request(seq: u64) -> ReadRequest {
+    ReadRequest {
+        seq: CommandSeq::checked(seq).unwrap(),
+        deadline: Instant::now() + Duration::from_secs(10),
+    }
+}
+fn open_request(seq: u64) -> OpenRequest {
+    OpenRequest {
+        seq: CommandSeq::checked(seq).unwrap(),
+        deadline: Instant::now() + Duration::from_secs(10),
+        tgid: 1,
+        generation: 7,
+        start_ns: 101,
+        deadline_ns: 999,
+    }
+}
+fn retained_read(engine: &CountEngine, seq: u64) -> Arc<RawSnapshot> {
+    match engine.drain(read_request(seq)) {
+        Ok(ack) => ack.value,
+        Err(_) => {
+            engine
+                .progress()
+                .expect("failed read must retain its prefix")
+                .snapshot
+        }
+    }
+}
+fn first_two_rows() -> Vec<(u64, osslscope_ebpf_common::CountValue)> {
+    use osslscope_ebpf_common::CountValue;
+    vec![
+        (
+            11,
+            CountValue {
+                count: 23,
+                first_ns: 101,
+                last_ns: 311,
+            },
+        ),
+        (
+            22,
+            CountValue {
+                count: 45,
+                first_ns: 112,
+                last_ns: 322,
+            },
+        ),
+    ]
+}
+
+#[test]
+fn g1_read_error_after_two_rows() {
+    // Losing the accumulated builder on a later EIO must lose this test.
+    let probe = MapProbe::new();
+    let engine = map_engine(
+        &probe,
+        MapFaults {
+            keys: vec![11, 22, 33],
+            row_error: Some(33),
+            ..MapFaults::default()
+        },
+    );
+    let snapshot = retained_read(&engine, 1);
+    assert_eq!(snapshot.rows, first_two_rows());
+    assert_eq!(snapshot.enumeration, EnumerationStatus::Unfinished);
+    assert_eq!(snapshot.admitted, Component::Available(18));
+    assert_eq!(snapshot.dropfail, Component::Available(30));
+    drop(engine);
+    probe.cleanup();
+}
+
+#[test]
+fn g1_component_unavailable_is_not_zero() {
+    // Defaulting one failed component must fail even with other useful data.
+    for (map, key) in [
+        (CountMap::Admitted, 0),
+        (CountMap::Dropfail, 0),
+        (CountMap::Latc, 9),
+    ] {
+        let probe = MapProbe::new();
+        let engine = map_engine(
+            &probe,
+            MapFaults {
+                keys: vec![11, 22],
+                component_error: Some((map, key)),
+                ..MapFaults::default()
+            },
+        );
+        let snapshot = retained_read(&engine, 1);
+        let component = match map {
+            CountMap::Admitted => snapshot.admitted,
+            CountMap::Dropfail => snapshot.dropfail,
+            _ => snapshot.latc[9],
+        };
+        assert_eq!(
+            component,
+            Component::Unavailable(ComponentFailure {
+                map,
+                key,
+                operation: CountOperation::Read,
+                class: Some(FailureClass::Io),
+                errno: Some(libc::EIO)
+            })
+        );
+        assert_eq!(snapshot.rows, first_two_rows());
+        assert_eq!(
+            snapshot.enumeration,
+            EnumerationStatus::Complete { unread_keys: 0 }
+        );
+        assert_eq!(snapshot.latc[8], Component::Available(19));
+        assert_eq!(snapshot.latc[10], Component::Available(23));
+        if map != CountMap::Admitted {
+            assert_eq!(snapshot.admitted, Component::Available(18));
+        }
+        if map != CountMap::Dropfail {
+            assert_eq!(snapshot.dropfail, Component::Available(30));
+        }
+        drop(engine);
+        probe.cleanup();
+    }
+}
+
+#[test]
+fn g1_snapshot_deadline_has_no_tail_census() {
+    // A keys-only census or counter read after the second lookup expires fails.
+    let probe = MapProbe::new();
+    let engine = map_engine(
+        &probe,
+        MapFaults {
+            keys: vec![11, 22, 33, 44],
+            expire_after_call: Some(4),
+            ..MapFaults::default()
+        },
+    );
+    let snapshot = retained_read(&engine, 1);
+    assert_eq!(
+        probe.post_expiry.load(Ordering::Acquire),
+        0,
+        "post-expiry syscall was started"
+    );
+    assert_eq!(snapshot.rows, first_two_rows());
+    assert_eq!(snapshot.enumeration, EnumerationStatus::Unfinished);
+    assert!(matches!(snapshot.admitted, Component::Unavailable(_)));
+    assert!(matches!(snapshot.dropfail, Component::Unavailable(_)));
+    assert!(
+        snapshot
+            .latc
+            .iter()
+            .all(|c| matches!(c, Component::Unavailable(_)))
+    );
+    drop(engine);
+    probe.cleanup();
+}
+
+#[test]
+fn g1_program_order_and_frontier() {
+    let probe = MapProbe::new();
+    let engine = map_engine(&probe, MapFaults::default());
+    let request = open_request(1);
+    let receipt = engine.open_window(request).unwrap().value;
+    assert!(
+        receipt
+            .programmed_admission(engine.ready.owner_epoch, &request)
+            .is_ok()
+    );
+    engine
+        .set_generation(GenerationRequest {
+            seq: CommandSeq::checked(2).unwrap(),
+            deadline: request.deadline,
+            generation: 8,
+        })
+        .unwrap();
+    assert_eq!(
+        probe
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, call)| call.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            MapAction::Write(CountMap::Window, 0, 101u64.to_ne_bytes().to_vec()),
+            MapAction::Write(CountMap::Window, 1, 999u64.to_ne_bytes().to_vec()),
+            MapAction::Write(CountMap::Gen, 0, 7u32.to_ne_bytes().to_vec()),
+            MapAction::Write(CountMap::Target, 0, 1u64.to_ne_bytes().to_vec()),
+            MapAction::Write(CountMap::Gen, 0, 8u32.to_ne_bytes().to_vec()),
+        ]
+    );
+    assert_eq!(
+        locked(&engine.shared.state).last_completed_seq,
+        Some(CommandSeq::checked(2).unwrap())
+    );
+    drop(engine);
+    probe.cleanup();
+
+    for held in 1..=4 {
+        let probe = MapProbe::new();
+        let engine = Arc::new(map_engine(
+            &probe,
+            MapFaults {
+                hold_call: Some(held),
+                ..MapFaults::default()
+            },
+        ));
+        let request = open_request(1);
+        let caller = Arc::clone(&engine);
+        let call = std::thread::spawn(move || caller.open_window(request));
+        probe.wait_calls(held);
+        assert_eq!(locked(&engine.shared.state).last_completed_seq, None);
+        let frontier = [
+            OpenWriteFrontier::NoWrites,
+            OpenWriteFrontier::WindowStart,
+            OpenWriteFrontier::WindowDeadline,
+            OpenWriteFrontier::Generation,
+        ][held - 1];
+        assert_eq!(
+            locked(&engine.shared.state)
+                .resolved_open
+                .unwrap()
+                .completed_writes,
+            frontier
+        );
+        let concurrent = engine
+            .set_generation(GenerationRequest {
+                seq: CommandSeq::checked(2).unwrap(),
+                deadline: request.deadline,
+                generation: 8,
+            })
+            .unwrap_err();
+        assert_eq!(concurrent.failure.class, FailureClass::Capacity);
+        engine.shared.seal(request.deadline);
+        probe.owner.release();
+        assert!(call.join().unwrap().is_err());
+        task3_inventory(&engine).unwrap();
+        assert_eq!(
+            probe.calls.lock().unwrap().len(),
+            held,
+            "a new write entered after seal"
+        );
+        assert_eq!(
+            locked(&engine.shared.state).last_completed_seq,
+            Some(request.seq)
+        );
+        let receipt = locked(&engine.shared.state).resolved_open.unwrap();
+        assert_eq!(
+            receipt.outcome,
+            if held == 4 {
+                OpenOutcome::Completed
+            } else {
+                OpenOutcome::Failed
+            }
+        );
+        if held < 4 {
+            assert!(
+                receipt
+                    .programmed_admission(engine.ready.owner_epoch, &request)
+                    .is_err()
+            );
+        }
+        drop(engine);
+        probe.cleanup();
+    }
+}
+
+#[test]
+fn g1_open_receipt_binds_actual_interval() {
+    let probe = MapProbe::new();
+    let engine = map_engine(&probe, MapFaults::default());
+    let request = open_request(1);
+    // Publish the ordinary request but deliberately never consume its reply.
+    {
+        let mut state = locked(&engine.shared.state);
+        state.last_command_seq = Some(request.seq);
+        state.frontier.pending = Some(PendingCommandId {
+            seq: request.seq,
+            operation: CountOperation::Open,
+        });
+        state.pending_open = Some(request);
+        state.resolved_open = Some(OpenReceipt::pending(engine.ready.owner_epoch, &request));
+        assert!(
+            state
+                .ordinary
+                .publish_request(OwnerRequest::Open(request))
+                .is_ok()
+        );
+    }
+    engine.shared.worker.get().unwrap().unpark();
+    probe.wait_calls(4);
+    {
+        let cutoff = Instant::now() + Duration::from_secs(3);
+        let mut state = locked(&engine.shared.state);
+        while state.ordinary.reply.is_none() {
+            let remaining = cutoff.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero());
+            state = engine
+                .shared
+                .changed
+                .wait_timeout(state, remaining)
+                .unwrap()
+                .0;
+        }
+    }
+    engine.shared.seal(request.deadline);
+    let inventory = task3_inventory(&engine).unwrap();
+    assert_eq!(
+        inventory.pending,
+        Some(PendingCommandId {
+            seq: request.seq,
+            operation: CountOperation::Open
+        })
+    );
+    let receipt = locked(&engine.shared.state).resolved_open.unwrap();
+    assert_eq!(
+        locked(&engine.shared.state).last_completed_seq,
+        Some(request.seq)
+    );
+    let admission = receipt
+        .programmed_admission(engine.ready.owner_epoch, &request)
+        .unwrap();
+    assert_eq!((admission.start_ns(), admission.deadline_ns()), (101, 999));
+    for forged in [
+        OpenReceipt {
+            owner_epoch: OwnerEpoch::checked(receipt.owner_epoch.value() + 1).unwrap(),
+            ..receipt
+        },
+        OpenReceipt {
+            seq: CommandSeq::checked(2).unwrap(),
+            ..receipt
+        },
+        OpenReceipt { tgid: 2, ..receipt },
+        OpenReceipt {
+            generation: 8,
+            ..receipt
+        },
+        OpenReceipt {
+            start_ns: 100,
+            ..receipt
+        },
+        OpenReceipt {
+            deadline_ns: 1000,
+            ..receipt
+        },
+        OpenReceipt {
+            completed_writes: OpenWriteFrontier::Generation,
+            ..receipt
+        },
+        OpenReceipt {
+            outcome: OpenOutcome::Unknown,
+            ..receipt
+        },
+    ] {
+        assert!(
+            forged
+                .programmed_admission(engine.ready.owner_epoch, &request)
+                .is_err()
+        );
+    }
+    drop(engine);
+    probe.cleanup();
+
+    for failed in 1..=4 {
+        let probe = MapProbe::new();
+        let engine = map_engine(
+            &probe,
+            MapFaults {
+                write_error: Some(failed),
+                ..MapFaults::default()
+            },
+        );
+        let request = open_request(1);
+        let failure = engine.open_window(request).unwrap_err();
+        assert_eq!(failure.failure.errno, Some(libc::EIO));
+        assert_eq!(failure.completion, CommandCompletion::Completed);
+        assert_eq!(
+            locked(&engine.shared.state).last_completed_seq,
+            Some(request.seq)
+        );
+        task3_inventory(&engine).unwrap();
+        let receipt = locked(&engine.shared.state).resolved_open.unwrap();
+        assert_eq!(receipt.outcome, OpenOutcome::Failed);
+        assert_eq!(
+            receipt.completed_writes,
+            [
+                OpenWriteFrontier::NoWrites,
+                OpenWriteFrontier::WindowStart,
+                OpenWriteFrontier::WindowDeadline,
+                OpenWriteFrontier::Generation
+            ][failed - 1]
+        );
+        assert!(
+            receipt
+                .programmed_admission(engine.ready.owner_epoch, &request)
+                .is_err()
+        );
+        assert_eq!(probe.calls.lock().unwrap().len(), failed);
+        drop(engine);
+        probe.cleanup();
+    }
+}
+
 #[derive(Clone, Debug)]
 enum Event {
     Started,
@@ -2508,7 +3893,7 @@ fn g1_attach_pin_capacity_preserves_prior_fact() {
             .journal
             .bind(OwnerEpoch::checked(1).unwrap(), source.object_sha256);
         let request = attach_request(1, 1);
-        registry.journal.begin(request.seq);
+        registry.journal.begin(request.seq, CountOperation::Attach);
         let ack = registry
             .attach(
                 &mut driver,
@@ -2530,7 +3915,7 @@ fn g1_attach_pin_capacity_preserves_prior_fact() {
         driver.pin_identity(registry.borrow(spare)).unwrap();
         let mut request = attach_request(2, 1);
         request.expected_backing.inode = 99;
-        registry.journal.begin(request.seq);
+        registry.journal.begin(request.seq, CountOperation::Attach);
         let failure = registry
             .attach(
                 &mut driver,

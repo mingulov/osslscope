@@ -270,6 +270,18 @@ impl CountOwnerLimits {
     pub fn possible_cpus(&self) -> usize {
         self.possible_cpus
     }
+    pub(super) fn validate_possible_cpus(&self, actual: usize) -> Result<(), OwnerFailure> {
+        if actual == 0
+            || actual != self.possible_cpus
+            || actual.checked_mul(24) != Some(self.cpu_scratch_bytes)
+        {
+            return Err(OwnerFailure::engine(
+                CountOperation::Load,
+                FailureClass::InvalidInput,
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -411,6 +423,162 @@ impl CommandFailure {
     }
 }
 pub type CommandResult<T> = Result<CommandAck<T>, CommandFailure>;
+
+#[derive(Debug, Clone, Copy)]
+pub struct OpenRequest {
+    pub seq: CommandSeq,
+    pub deadline: std::time::Instant,
+    pub tgid: u64,
+    pub generation: u32,
+    pub start_ns: u64,
+    pub deadline_ns: u64,
+}
+#[derive(Debug, Clone, Copy)]
+pub struct GenerationRequest {
+    pub seq: CommandSeq,
+    pub deadline: std::time::Instant,
+    pub generation: u32,
+}
+#[derive(Debug, Clone, Copy)]
+pub struct ReadRequest {
+    pub seq: CommandSeq,
+    pub deadline: std::time::Instant,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenWriteFrontier {
+    NoWrites,
+    WindowStart,
+    WindowDeadline,
+    Generation,
+    Target,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenOutcome {
+    Completed,
+    Failed,
+    Unknown,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenReceipt {
+    pub owner_epoch: OwnerEpoch,
+    pub seq: CommandSeq,
+    pub tgid: u64,
+    pub generation: u32,
+    pub start_ns: u64,
+    pub deadline_ns: u64,
+    pub completed_writes: OpenWriteFrontier,
+    pub outcome: OpenOutcome,
+}
+/// Constructed only by checking the complete actual receipt against the pending
+/// request. Its fields cannot be populated from a display interval or sequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProgrammedAdmission {
+    owner_epoch: OwnerEpoch,
+    open_seq: CommandSeq,
+    tgid: u64,
+    generation: u32,
+    start_ns: u64,
+    deadline_ns: u64,
+}
+impl OpenReceipt {
+    pub(super) fn pending(owner_epoch: OwnerEpoch, request: &OpenRequest) -> Self {
+        Self {
+            owner_epoch,
+            seq: request.seq,
+            tgid: request.tgid,
+            generation: request.generation,
+            start_ns: request.start_ns,
+            deadline_ns: request.deadline_ns,
+            completed_writes: OpenWriteFrontier::NoWrites,
+            outcome: OpenOutcome::Unknown,
+        }
+    }
+    pub fn programmed_admission(
+        self,
+        owner_epoch: OwnerEpoch,
+        request: &OpenRequest,
+    ) -> Result<ProgrammedAdmission, OwnerFailure> {
+        if self.owner_epoch != owner_epoch
+            || self.seq != request.seq
+            || self.tgid != request.tgid
+            || self.generation != request.generation
+            || self.start_ns != request.start_ns
+            || self.deadline_ns != request.deadline_ns
+            || self.start_ns >= self.deadline_ns
+            || self.tgid == 0
+            || self.completed_writes != OpenWriteFrontier::Target
+            || self.outcome != OpenOutcome::Completed
+        {
+            return Err(OwnerFailure::engine(
+                CountOperation::Open,
+                FailureClass::Inventory,
+            ));
+        }
+        Ok(ProgrammedAdmission {
+            owner_epoch,
+            open_seq: self.seq,
+            tgid: self.tgid,
+            generation: self.generation,
+            start_ns: self.start_ns,
+            deadline_ns: self.deadline_ns,
+        })
+    }
+}
+impl ProgrammedAdmission {
+    pub fn owner_epoch(self) -> OwnerEpoch {
+        self.owner_epoch
+    }
+    pub fn open_seq(self) -> CommandSeq {
+        self.open_seq
+    }
+    pub fn tgid(self) -> u64 {
+        self.tgid
+    }
+    pub fn generation(self) -> u32 {
+        self.generation
+    }
+    pub fn start_ns(self) -> u64 {
+        self.start_ns
+    }
+    pub fn deadline_ns(self) -> u64 {
+        self.deadline_ns
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ComponentFailure {
+    pub map: CountMap,
+    pub key: u32,
+    pub operation: CountOperation,
+    /// None means no value has returned yet, without inventing a syscall error.
+    pub class: Option<FailureClass>,
+    pub errno: Option<i32>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Component<T> {
+    Available(T),
+    Unavailable(ComponentFailure),
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnumerationStatus {
+    Complete { unread_keys: u64 },
+    Unfinished,
+}
+#[derive(Debug, PartialEq, Eq)]
+pub struct RawSnapshot {
+    pub sequence: SnapshotSeq,
+    pub rows: Vec<(u64, osslscope_ebpf_common::CountValue)>,
+    pub admitted: Component<u64>,
+    pub dropfail: Component<u64>,
+    pub latc: [Component<u64>; 16],
+    pub enumeration: EnumerationStatus,
+}
+#[derive(Debug, Clone)]
+pub struct RawCheckpoint {
+    pub snapshot: Arc<RawSnapshot>,
+    pub phase: OwnerPhase,
+    pub published_at: std::time::Instant,
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PendingCommandId {
     pub seq: CommandSeq,

@@ -158,6 +158,16 @@ impl Registry {
             cleanup_complete: false,
         })
     }
+    /// Move the already prepared read storage before the first count FD exists.
+    /// The read owner adds the other two immutable images during preparation.
+    pub(super) fn take_read_storage(
+        &mut self,
+    ) -> (Vec<(u64, osslscope_ebpf_common::CountValue)>, Vec<u8>) {
+        (
+            std::mem::take(&mut self._raw_rows),
+            std::mem::take(&mut self._cpu_scratch),
+        )
+    }
     #[cfg(test)]
     pub(super) fn summary(&self) -> ResourceSummary {
         let mut summary = self.summary_storage().unwrap();
@@ -313,7 +323,7 @@ pub struct OwnerJournal {
     memberships: Vec<AttachedMembership>,
     attempts: Vec<AttachAttempt>,
     serials: IdCounter,
-    last_started: Option<CommandSeq>,
+    last_started: Option<PendingCommandId>,
     last_published: Option<CommandSeq>,
     last_acked: Option<CommandSeq>,
     sealed_storage: Option<SealedInventory>,
@@ -370,9 +380,9 @@ impl OwnerJournal {
             .expect("unsealed preparation")
             .writer = self.writer.unwrap();
     }
-    pub(super) fn begin(&mut self, seq: CommandSeq) {
+    pub(super) fn begin(&mut self, seq: CommandSeq, operation: CountOperation) {
         self.attempts.clear();
-        self.last_started = Some(seq);
+        self.last_started = Some(PendingCommandId { seq, operation });
     }
     pub(super) fn published(&mut self, seq: CommandSeq) {
         for record in &mut self.records {
@@ -396,11 +406,7 @@ impl OwnerJournal {
         }
         let expected_pending = self
             .last_started
-            .filter(|seq| Some(*seq) != self.last_acked)
-            .map(|seq| PendingCommandId {
-                seq,
-                operation: CountOperation::Attach,
-            });
+            .filter(|pending| Some(pending.seq) != self.last_acked);
         if expected_pending != frontier.pending {
             return Err(InventoryFailure::Frontier);
         }

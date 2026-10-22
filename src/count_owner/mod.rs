@@ -7,7 +7,7 @@
 pub(crate) mod io;
 pub(crate) mod protocol;
 pub(crate) mod registry;
-use io::{CountIoDriver, LiveCountIoDriver};
+use io::{CountIoDriver, LiveCountIoDriver, ReadWorkspace};
 pub use protocol::*;
 use registry::Registry;
 use std::sync::{
@@ -263,6 +263,9 @@ enum OwnerRequest {
         request: AttachRequest,
         ack: AttachAck<LinkToken>,
     },
+    Open(OpenRequest),
+    Generation(GenerationRequest),
+    Read(ReadRequest),
 }
 // One bounded inline reply cell exists before count acquisition. Boxing Ready
 // here would introduce a publication allocation; the 344-byte cell is intended.
@@ -270,6 +273,9 @@ enum OwnerRequest {
 enum OwnerReply {
     Prepared(Result<Ready, OwnerFailure>),
     Attached(CommandResult<AttachAck<LinkToken>>),
+    Opened(CommandResult<OpenReceipt>),
+    Generated(CommandResult<()>),
+    Read(CommandResult<Arc<RawSnapshot>>),
 }
 struct SharedState {
     ordinary: OrdinaryCells<OwnerRequest, OwnerReply>,
@@ -279,6 +285,13 @@ struct SharedState {
     phase: OwnerPhase,
     active_operation: Option<CountOperation>,
     last_command_seq: Option<CommandSeq>,
+    // The submission guard above is not evidence of returned map I/O. This
+    // frontier advances when an entered handler returns (including EIO) or a
+    // metadata-only command succeeds; queued refusal/unreturned calls do not.
+    last_completed_seq: Option<CommandSeq>,
+    pending_open: Option<OpenRequest>,
+    resolved_open: Option<OpenReceipt>,
+    read_failure: Option<OwnerFailure>,
     frontier: ControllerFrontier,
     inventory: Option<Result<SealedInventory, InventoryFailure>>,
 }
@@ -287,9 +300,12 @@ struct Shared {
     barrier: Arc<CountForkBarrier>,
     setup_deadline: Instant,
     link_limit: usize,
+    target_tgid: u32,
     abandoned: Arc<AtomicBool>,
     worker: OnceLock<thread::Thread>,
     state: Mutex<SharedState>,
+    latest_progress: Mutex<Option<RawCheckpoint>>,
+    controller_progress: Mutex<Option<RawCheckpoint>>,
     changed: Condvar,
 }
 impl Shared {
@@ -381,8 +397,193 @@ impl CountEngine {
             .barrier
             .terminal_permit(self.ready.owner_epoch, deadline)
     }
+    #[cfg(test)]
     pub fn resource_summary(&self) -> ResourceSummary {
         locked(&self.shared.state).resources.clone()
+    }
+
+    /// Nonblocking immutable observation. If publication is busy, retain the
+    /// previous controller image; no registry cloning or count I/O occurs here.
+    pub fn progress(&self) -> Option<RawCheckpoint> {
+        let mut latest = self
+            .shared
+            .latest_progress
+            .try_lock()
+            .ok()
+            .and_then(|latest| latest.clone());
+        let mut previous = None;
+        let view = {
+            let mut retained = self.shared.controller_progress.try_lock().ok()?;
+            if latest.as_ref().is_some_and(|latest| {
+                retained
+                    .as_ref()
+                    .is_none_or(|old| old.snapshot.sequence < latest.snapshot.sequence)
+            }) {
+                previous = std::mem::replace(&mut *retained, latest.take());
+            }
+            retained.clone()
+        };
+        // An owner that has finished cleanup may have dropped its pool handles.
+        // Releasing an old controller view can then free its row allocation;
+        // keep that destruction outside both publication/access mutexes.
+        drop(previous);
+        drop(latest);
+        view
+    }
+
+    pub fn open_window(&self, request: OpenRequest) -> CommandResult<OpenReceipt> {
+        if request.tgid != u64::from(self.shared.target_tgid)
+            || request.tgid == 0
+            || request.start_ns >= request.deadline_ns
+        {
+            return Err(CommandFailure {
+                seq: request.seq,
+                failure: OwnerFailure::engine(CountOperation::Open, FailureClass::InvalidInput),
+                completion: CommandCompletion::NotEntered,
+                cleanup_ticket: None,
+            });
+        }
+        self.map_command(OwnerRequest::Open(request), |reply| {
+            if let OwnerReply::Opened(result) = reply {
+                Some(result)
+            } else {
+                None
+            }
+        })
+    }
+    pub fn set_generation(&self, request: GenerationRequest) -> CommandResult<()> {
+        self.map_command(OwnerRequest::Generation(request), |reply| {
+            if let OwnerReply::Generated(result) = reply {
+                Some(result)
+            } else {
+                None
+            }
+        })
+    }
+    pub fn drain(&self, request: ReadRequest) -> CommandResult<Arc<RawSnapshot>> {
+        self.map_command(OwnerRequest::Read(request), |reply| {
+            if let OwnerReply::Read(result) = reply {
+                Some(result)
+            } else {
+                None
+            }
+        })
+    }
+    fn map_command<T>(
+        &self,
+        request: OwnerRequest,
+        extract: fn(OwnerReply) -> Option<CommandResult<T>>,
+    ) -> CommandResult<T> {
+        let (seq, deadline, operation) = map_request_identity(&request).expect("map command");
+        let refused = |class, completion, cleanup_ticket| CommandFailure {
+            seq,
+            failure: OwnerFailure::engine(operation, class),
+            completion,
+            cleanup_ticket,
+        };
+        if Instant::now() >= deadline {
+            return Err(refused(
+                FailureClass::Deadline,
+                CommandCompletion::NotEntered,
+                None,
+            ));
+        }
+        let mut state = locked(&self.shared.state);
+        if let Some(seal) = state.terminal {
+            return Err(refused(
+                FailureClass::Disconnected,
+                CommandCompletion::NotEntered,
+                Some(seal.ticket),
+            ));
+        }
+        if self.shared.abandoned.load(Ordering::Acquire)
+            || !matches!(state.phase, OwnerPhase::Ready | OwnerPhase::Observing)
+        {
+            return Err(refused(
+                FailureClass::Disconnected,
+                CommandCompletion::NotEntered,
+                None,
+            ));
+        }
+        if state.last_command_seq.is_some_and(|last| seq <= last) {
+            return Err(refused(
+                FailureClass::InvalidInput,
+                CommandCompletion::NotEntered,
+                None,
+            ));
+        }
+        if state.ordinary.in_flight {
+            return Err(refused(
+                FailureClass::Capacity,
+                CommandCompletion::NotEntered,
+                None,
+            ));
+        }
+        state.last_command_seq = Some(seq);
+        state.frontier.pending = Some(PendingCommandId { seq, operation });
+        if let OwnerRequest::Open(open) = &request {
+            state.pending_open = Some(*open);
+            state.resolved_open = Some(OpenReceipt::pending(self.ready.owner_epoch, open));
+        }
+        assert!(state.ordinary.publish_request(request).is_ok());
+        self.shared.worker.get().expect("prepared owner").unpark();
+        loop {
+            if Instant::now() >= deadline {
+                let ticket = self.shared.seal_locked(&mut state, deadline);
+                drop(state);
+                self.shared.abandon();
+                return Err(refused(
+                    FailureClass::Deadline,
+                    CommandCompletion::Unknown,
+                    Some(ticket),
+                ));
+            }
+            if let Some(reply) = state.ordinary.take_reply() {
+                let Some(result) = extract(reply) else {
+                    let ticket = self.shared.seal_locked(&mut state, deadline);
+                    self.shared.worker.get().unwrap().unpark();
+                    return Err(refused(
+                        FailureClass::Inventory,
+                        CommandCompletion::Unknown,
+                        Some(ticket),
+                    ));
+                };
+                let ack = result?;
+                if let Some(seal) = state.terminal {
+                    return Err(refused(
+                        FailureClass::Disconnected,
+                        CommandCompletion::Completed,
+                        Some(seal.ticket),
+                    ));
+                }
+                if ack.seq != seq {
+                    let ticket = self.shared.seal_locked(&mut state, deadline);
+                    self.shared.worker.get().unwrap().unpark();
+                    return Err(refused(
+                        FailureClass::Inventory,
+                        CommandCompletion::Unknown,
+                        Some(ticket),
+                    ));
+                }
+                state.frontier.last_acked = Some(seq);
+                state.frontier.pending = None;
+                self.shared.worker.get().unwrap().unpark();
+                return Ok(ack);
+            }
+            if let Some(seal) = state.terminal {
+                return Err(refused(
+                    FailureClass::Disconnected,
+                    CommandCompletion::Unknown,
+                    Some(seal.ticket),
+                ));
+            }
+            state = self
+                .shared
+                .changed
+                .wait_timeout(state, deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+        }
     }
 
     pub fn attach(&self, request: AttachRequest) -> CommandResult<AttachAck<LinkToken>> {
@@ -548,6 +749,16 @@ impl CountEngine {
         if Instant::now() >= deadline {
             return Err(preflight_failure(FailureClass::Deadline));
         }
+        if hooks.domain == EvidenceDomain::Live {
+            let actual = (hooks.possible_cpu_count)().map_err(|error| {
+                CountPrepareFailure::from(OwnerFailure::io(
+                    CountOperation::Load,
+                    ResourceId::Engine,
+                    &error,
+                ))
+            })?;
+            limits.validate_possible_cpus(actual)?;
+        }
         if input.target_tgid == 0
             || <[u8; 32]>::from(sha2::Sha256::digest(&input.object_bytes)) != input.object_sha256
         {
@@ -566,6 +777,13 @@ impl CountEngine {
             return Err(preflight_failure(FailureClass::Allocation));
         }
         let mut registry = Registry::allocate(limits)?;
+        let read_workspace = ReadWorkspace::allocate(limits, registry.take_read_storage())?;
+        #[cfg(test)]
+        let read_workspace = {
+            let mut workspace = read_workspace;
+            workspace.sequences = IdCounter::with_last(hooks.snapshot_sequence_last);
+            workspace
+        };
         let resources = registry.summary_storage()?;
         let acknowledged_links = registry::preallocated(limits.link_slots)?;
         #[cfg(test)]
@@ -597,6 +815,7 @@ impl CountEngine {
             barrier: Arc::clone(&input.fork_barrier),
             setup_deadline: deadline,
             link_limit: limits.link_slots,
+            target_tgid: input.target_tgid,
             abandoned: Arc::clone(&registry.abandoned),
             worker: OnceLock::new(),
             state: Mutex::new(SharedState {
@@ -607,12 +826,18 @@ impl CountEngine {
                 phase: OwnerPhase::Preparing,
                 active_operation: None,
                 last_command_seq: None,
+                last_completed_seq: None,
+                pending_open: None,
+                resolved_open: None,
+                read_failure: None,
                 frontier: ControllerFrontier {
                     acknowledged_links,
                     ..ControllerFrontier::default()
                 },
                 inventory: None,
             }),
+            latest_progress: Mutex::new(None),
+            controller_progress: Mutex::new(None),
             changed: Condvar::new(),
         });
         {
@@ -635,7 +860,8 @@ impl CountEngine {
         registry.shared = Some(Arc::clone(&shared));
         shared.barrier.admit(epoch, deadline)?;
         let owner_shared = Arc::clone(&shared);
-        let task = Box::new(move || owner_main(owner_shared, registry, hooks, factory));
+        let task =
+            Box::new(move || owner_main(owner_shared, registry, read_workspace, hooks, factory));
         if let Err(error) = spawner(task) {
             shared.barrier.spawn_failed(epoch);
             return Err(CountPrepareFailure::from(OwnerFailure::io(
@@ -695,9 +921,12 @@ fn spawn_owner(task: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
 // No production constructor accepts a driver or a model-evidence selector.
 struct PrepareHooks {
     domain: EvidenceDomain,
+    possible_cpu_count: fn() -> std::io::Result<usize>,
     fail_allocation: bool,
     fail_ready_publication: bool,
     fail_attach_publication: bool,
+    #[cfg(test)]
+    snapshot_sequence_last: u64,
     #[cfg(test)]
     registry_observer: Option<Arc<dyn Fn(registry::RegistryEvent) + Send + Sync>>,
     #[cfg(test)]
@@ -707,9 +936,12 @@ impl PrepareHooks {
     fn live() -> Self {
         Self {
             domain: EvidenceDomain::Live,
+            possible_cpu_count: io::possible_cpu_count,
             fail_allocation: false,
             fail_ready_publication: false,
             fail_attach_publication: false,
+            #[cfg(test)]
+            snapshot_sequence_last: 0,
             #[cfg(test)]
             registry_observer: None,
             #[cfg(test)]
@@ -724,8 +956,13 @@ impl PrepareHooks {
         }
     }
 }
-fn owner_main<D, F>(shared: Arc<Shared>, mut registry: Registry, hooks: PrepareHooks, factory: F)
-where
+fn owner_main<D, F>(
+    shared: Arc<Shared>,
+    mut registry: Registry,
+    mut read_workspace: ReadWorkspace,
+    hooks: PrepareHooks,
+    factory: F,
+) where
     D: CountIoDriver,
     F: FnOnce() -> D,
 {
@@ -848,16 +1085,38 @@ where
                     }
                     command
                 };
+                let command = match command {
+                    Some(command) => command,
+                    None => {
+                        thread::park();
+                        continue;
+                    }
+                };
+                if let Some((seq, deadline, operation)) = map_request_identity(&command) {
+                    active_deadline = deadline;
+                    registry.journal.begin(seq, operation);
+                    execute_map_command(
+                        &shared,
+                        &mut registry,
+                        &mut read_workspace,
+                        &loaded,
+                        &mut driver,
+                        command,
+                    );
+                    continue;
+                }
                 let Some(OwnerRequest::Attach {
                     request: attach_request,
                     ack,
-                }) = command
+                }) = Some(command)
                 else {
                     thread::park();
                     continue;
                 };
                 active_deadline = attach_request.deadline;
-                registry.journal.begin(attach_request.seq);
+                registry
+                    .journal
+                    .begin(attach_request.seq, CountOperation::Attach);
                 let result = catch_unwind(AssertUnwindSafe(|| {
                     let result = registry.attach(
                         &mut driver,
@@ -868,6 +1127,7 @@ where
                     );
                     (result, driver.now())
                 }));
+                let returned = result.is_ok();
                 let (result, command_finished) = match result {
                     Ok(result) => result,
                     Err(_) => {
@@ -884,6 +1144,9 @@ where
                 registry.observe_attach_storage();
                 let mut state = locked(&shared.state);
                 let entered = state.active_operation.take().is_some();
+                if returned && (entered || result.is_ok()) {
+                    state.last_completed_seq = Some(attach_request.seq);
+                }
                 let result = result.and_then(|ack| {
                     if hooks.fail_attach_publication {
                         Err(OwnerFailure::engine(
@@ -982,6 +1245,92 @@ where
     // The canonical deadline belongs to the sticky terminal identity even when
     // eventual cleanup happens later. Cleanup never replaces or extends it.
     let _canonical_deadline = locked(&shared.state).terminal.map(|seal| seal.deadline);
+}
+
+fn map_request_identity(request: &OwnerRequest) -> Option<(CommandSeq, Instant, CountOperation)> {
+    match request {
+        OwnerRequest::Open(r) => Some((r.seq, r.deadline, CountOperation::Open)),
+        OwnerRequest::Generation(r) => Some((r.seq, r.deadline, CountOperation::Generation)),
+        OwnerRequest::Read(r) => Some((r.seq, r.deadline, CountOperation::Read)),
+        _ => None,
+    }
+}
+enum MapValue {
+    Open(OpenReceipt),
+    Generation,
+    Read(Arc<RawSnapshot>),
+}
+fn execute_map_command(
+    shared: &Shared,
+    registry: &mut Registry,
+    workspace: &mut ReadWorkspace,
+    loaded: &crate::loader::CountLoadedSlots,
+    driver: &mut impl CountIoDriver,
+    request: OwnerRequest,
+) {
+    let (seq, deadline, operation) = map_request_identity(&request).expect("map command");
+    let io = io::MapIo::new(shared, registry, loaded, deadline, operation);
+    let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match request {
+        OwnerRequest::Open(request) => io.open(driver, &request).map(MapValue::Open),
+        OwnerRequest::Generation(request) => io
+            .generation(driver, request.generation)
+            .map(|()| MapValue::Generation),
+        OwnerRequest::Read(_) => workspace.read(driver, &io).map(MapValue::Read),
+        _ => unreachable!("map command identity was checked"),
+    }));
+    let returned = execution.is_ok();
+    let result =
+        execution.unwrap_or_else(|_| Err(OwnerFailure::engine(operation, FailureClass::Panic)));
+    let mut state = locked(&shared.state);
+    let entered = state.active_operation.take().is_some();
+    if returned && entered {
+        state.last_completed_seq = Some(seq);
+    }
+    let result = result.and_then(|value| {
+        if state.terminal.is_some() || shared.abandoned.load(Ordering::Acquire) {
+            Err(OwnerFailure::engine(operation, FailureClass::Disconnected))
+        } else {
+            Ok(value)
+        }
+    });
+    let result = result.map_err(|failure| {
+        let ticket = shared.seal_locked(&mut state, deadline);
+        state.phase = OwnerPhase::Sealing;
+        CommandFailure {
+            seq,
+            failure,
+            completion: if !returned {
+                CommandCompletion::Unknown
+            } else if entered {
+                CommandCompletion::Completed
+            } else {
+                CommandCompletion::NotEntered
+            },
+            cleanup_ticket: Some(ticket),
+        }
+    });
+    let successful_reply = result.is_ok();
+    let reply = match result {
+        Ok(MapValue::Open(value)) => OwnerReply::Opened(Ok(CommandAck { seq, value })),
+        Ok(MapValue::Generation) => OwnerReply::Generated(Ok(CommandAck { seq, value: () })),
+        Ok(MapValue::Read(value)) => OwnerReply::Read(Ok(CommandAck { seq, value })),
+        Err(failure) => match operation {
+            CountOperation::Open => OwnerReply::Opened(Err(failure)),
+            CountOperation::Generation => OwnerReply::Generated(Err(failure)),
+            CountOperation::Read => OwnerReply::Read(Err(failure)),
+            _ => unreachable!("map operation"),
+        },
+    };
+    if successful_reply {
+        state.phase = OwnerPhase::Observing;
+    }
+    if state.ordinary.publish_reply(reply).is_err() {
+        shared.seal_locked(&mut state, deadline);
+        state.phase = OwnerPhase::Sealing;
+    } else if successful_reply {
+        registry.journal.published(seq);
+    }
+    shared.changed.notify_all();
 }
 
 #[cfg(test)]
