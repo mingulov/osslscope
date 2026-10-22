@@ -753,7 +753,7 @@ fn validated_backing_triple<'a>(
 /// impls are covered (the original check covered only the first).
 ///
 /// What is NOT (exempt, and why): the VALUES of a VALIDATED row
-/// `backing` triple only — `backing` on a row whose location is proven
+/// `backing` triple and its bound `addr_hash` — on a row whose location is proven
 /// STRUCTURALLY (an actual element of the top-level `rows` array reached
 /// by array traversal; diagnostic paths are unescaped text and never
 /// gate the exemption), with the emitted schema (`dev`: `MM:mm` string,
@@ -768,6 +768,8 @@ fn validated_backing_triple<'a>(
 /// legitimate offset numerically EQUAL to a staged impl would still trip
 /// (a false positive, not a disclosure); first-X-LOAD p_offset near 4 KiB
 /// would need ~100x shrinkage of this binary, so theoretical only.
+/// The bound hash is derived solely from that triple, so incidental
+/// address digit runs in its hex digest also keep whole-value comparison.
 ///
 /// Fail-closed: object keys are never provenance (always scanned), and
 /// anything unvalidated — wrong location, non-object, wrong field types,
@@ -831,6 +833,18 @@ fn assert_no_raw_impl_inner(v: &serde_json::Value, impls: &[u64], path: &str, lo
                     assert_no_raw_impl_inner(vv, impls, &format!("{path}.{k}"), TraversalLoc::Else);
                     continue;
                 }
+                if k == "addr_hash" && loc == TraversalLoc::EmitRow {
+                    // Only the actual row hash bound to a validated
+                    // sibling triple is provenance; the field name or
+                    // hash-shaped text alone never permits relaxation.
+                    if m.get("backing")
+                        .and_then(|backing| validated_backing_triple(m, backing))
+                        .is_some()
+                    {
+                        assert_provenance_value(vv, impls, &format!("{path}.{k}"));
+                        continue;
+                    }
+                }
                 if k == "backing" {
                     let bpath = format!("{path}.{k}");
                     // Relaxed scanning ONLY for validated row provenance
@@ -882,7 +896,8 @@ fn assert_no_raw_impl_in_key(k: &str, impls: &[u64], path: &str) {
 }
 
 /// Whole-value comparison for validated provenance values
-/// (`backing.dev`/`.ino`/`.offset` — file identity, not runtime addresses;
+/// (`backing.dev`/`.ino`/`.offset` and their bound `addr_hash` — file
+/// identity, not runtime addresses;
 /// see `assert_no_raw_impl`). Unexpected container shapes recurse strictly
 /// as non-rows (fail-closed: never the `DocRoot` entry, so a nested
 /// `rows` array here cannot re-enter the exemption).
@@ -1012,6 +1027,129 @@ fn matcher_catches(doc: &serde_json::Value, staged: &[u64]) -> bool {
         assert_no_raw_impl(doc, staged, "$");
     }))
     .is_err()
+}
+
+/// Fixed backing/hash vector, independent of the test executable's
+/// inode, ELF layout, and runtime mappings. SHA-256's last eight bytes
+/// for `osslscope-addr-v1 || 08:01 || NUL || le64(1234) || le64(5477)`
+/// are 9f709b5c8ab41286: a genuine hash containing decimal 4128.
+fn hash_digit_run_doc() -> serde_json::Value {
+    serde_json::json!({"rows": [{
+        "provider": "t", "op": 1, "alg_class": "SHA2-256",
+        "weak": false, "status": "ok", "funcid": 7,
+        "addr_hash": "9f709b5c8ab41286", "addr_backed": true,
+        "backing": {"dev": "08:01", "ino": 1234u64, "offset": 5477u64},
+        "gen": 0,
+    }]})
+}
+
+#[test]
+fn no_raw_address_matcher_allows_hash_bound_digit_run() {
+    assert_eq!(kinds::addr_hash("08:01", 1234, 5477), "9f709b5c8ab41286");
+    let doc = hash_digit_run_doc();
+    assert!(
+        doc["rows"][0]["addr_hash"]
+            .as_str()
+            .unwrap()
+            .contains("4128")
+    );
+    assert_no_raw_impl(&doc, &[0x1000, 0x1010, 0x1020], "$");
+}
+
+#[test]
+fn no_raw_address_matcher_requires_hash_location_and_binding() {
+    let doc = hash_digit_run_doc();
+    let row = doc["rows"][0].clone();
+    let mut cases = vec![
+        ("wrong location", serde_json::json!({"debug": row.clone()})),
+        (
+            "spoofed row path",
+            serde_json::json!({"rows[0]": row.clone()}),
+        ),
+        ("non-array rows", serde_json::json!({"rows": row.clone()})),
+        ("nested rows", serde_json::json!({"debug": doc.clone()})),
+    ];
+    for (name, field, value) in [
+        ("missing backing", "backing", serde_json::Value::Null),
+        ("non-object backing", "backing", serde_json::json!([])),
+        (
+            "unbound hash shape",
+            "addr_hash",
+            serde_json::json!("0000412800000000"),
+        ),
+        (
+            "raw hash string",
+            "addr_hash",
+            serde_json::json!("impl=4096"),
+        ),
+        (
+            "hash container",
+            "addr_hash",
+            serde_json::json!(["9f709b5c8ab41286"]),
+        ),
+        (
+            "copied hash in status",
+            "status",
+            serde_json::json!("9f709b5c8ab41286"),
+        ),
+        ("extra row value", "debug", serde_json::json!("impl=4096")),
+        (
+            "address in row key",
+            "debug_0x1010",
+            serde_json::json!(true),
+        ),
+    ] {
+        let mut bad = doc.clone();
+        if value.is_null() {
+            bad["rows"][0].as_object_mut().unwrap().remove(field);
+        } else {
+            bad["rows"][0][field] = value;
+        }
+        cases.push((name, bad));
+    }
+    for (name, field, value) in [
+        ("missing backing offset", "offset", serde_json::Value::Null),
+        ("wrong backing offset", "offset", serde_json::json!(5478u64)),
+        ("string backing offset", "offset", serde_json::json!("5477")),
+        ("wrong backing inode", "ino", serde_json::json!(1235u64)),
+        (
+            "container backing inode",
+            "ino",
+            serde_json::json!([1234u64]),
+        ),
+        (
+            "malformed backing device",
+            "dev",
+            serde_json::json!("invalid"),
+        ),
+        (
+            "extra backing container",
+            "extra",
+            serde_json::json!({"rows": [row]}),
+        ),
+        (
+            "address in backing key",
+            "debug_4096",
+            serde_json::json!(true),
+        ),
+    ] {
+        let mut bad = doc.clone();
+        if value.is_null() {
+            bad["rows"][0]["backing"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+        } else {
+            bad["rows"][0]["backing"][field] = value;
+        }
+        cases.push((name, bad));
+    }
+    for (name, bad) in cases {
+        assert!(
+            matcher_catches(&bad, &[0x1000, 0x1010, 0x1020]),
+            "escaped: {name}"
+        );
+    }
 }
 
 #[test]
