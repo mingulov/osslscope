@@ -647,11 +647,36 @@ pub struct SealedInventory {
     pub unpublished_links: Vec<LinkId>,
     pub last_acked: Option<CommandSeq>,
     pub pending: Option<PendingCommandId>,
+    pub last_completed: Option<PendingCommandId>,
+    pub resolved_open: Option<OpenReceipt>,
 }
 impl SealedInventory {
     pub fn validate(&self, frontier: &ControllerFrontier) -> Result<(), InventoryFailure> {
         if self.last_acked != frontier.last_acked || self.pending != frontier.pending {
             return Err(InventoryFailure::Frontier);
+        }
+        match self.last_completed {
+            None if self.last_acked.is_some() => return Err(InventoryFailure::Frontier),
+            Some(completed)
+                if Some(completed.seq) != self.last_acked && Some(completed) != self.pending =>
+            {
+                return Err(InventoryFailure::Frontier);
+            }
+            _ => {}
+        }
+        if self
+            .pending
+            .is_some_and(|pending| self.last_acked.is_some_and(|acked| pending.seq <= acked))
+        {
+            return Err(InventoryFailure::Frontier);
+        }
+        if let Some(completed) = self.last_completed {
+            if self
+                .pending
+                .is_some_and(|pending| pending.seq == completed.seq && pending != completed)
+            {
+                return Err(InventoryFailure::Frontier);
+            }
         }
         if self.records.len() > 8192
             || self.memberships.len() > 8192
@@ -697,6 +722,20 @@ impl SealedInventory {
             {
                 return Err(InventoryFailure::Membership);
             }
+            let members = &self.memberships[record.memberships.clone()];
+            for (index, member) in members.iter().enumerate() {
+                if index > 0 && members[index - 1].offset >= member.offset {
+                    return Err(InventoryFailure::Membership);
+                }
+                if self.records[..i].iter().any(|prior| {
+                    prior.backing == record.backing
+                        && self.memberships[prior.memberships.clone()]
+                            .iter()
+                            .any(|m| m.offset == member.offset)
+                }) {
+                    return Err(InventoryFailure::Membership);
+                }
+            }
             end = record.memberships.end;
             let acknowledged = self
                 .acknowledged_links
@@ -736,4 +775,413 @@ impl LinkToken {
     pub(super) fn new(id: LinkId) -> Self {
         Self { id }
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct TerminalRequest {
+    pub id: TerminalId,
+    pub deadline: std::time::Instant,
+    pub evidence_domain: EvidenceDomain,
+    pub writer_object_identity: [u8; 32],
+    pub frontier: ControllerFrontier,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopResult {
+    NotAttempted,
+    Stopped,
+    Failed(OwnerFailure),
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SealBracket {
+    pub before_ns: Option<u64>,
+    pub after_ns: Option<u64>,
+    pub result: StopResult,
+}
+impl Default for SealBracket {
+    fn default() -> Self {
+        Self {
+            before_ns: None,
+            after_ns: None,
+            result: StopResult::NotAttempted,
+        }
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileFailure {
+    UnboundBuild,
+    UnknownVendor,
+    SourceMismatch,
+}
+/// Source tags describe the theorem's source families, never uname prefixes or
+/// permission to classify a running build as reviewed.
+pub const SOURCE_THEOREM_PINS: [(&str, &str); 4] = [
+    ("v6.9", "a38297e3fb012ddfa7ce0321a7e5a8daeb1872b6"),
+    ("v6.12", "adc218676eef25575469234709c2d87185ca223a"),
+    ("v6.18", "7d0a66e4bb9081d75c82ec4957c50034cb0ea449"),
+    ("v7.0", "028ef9c96e96197026887c0f092424679298aae8"),
+];
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct KernelBuildIdentity {
+    pub build_sha256: Option<[u8; 32]>,
+    pub config_sha256: Option<[u8; 32]>,
+    pub vendor_source_sha256: Option<[u8; 32]>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReviewedKernelProfile {
+    source_family: usize,
+    build: KernelBuildIdentity,
+    domain: EvidenceDomain,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KernelApplicability {
+    Unknown(ProfileFailure),
+    Reviewed(ReviewedKernelProfile),
+    ModelFixture,
+}
+pub fn resolve_kernel_applicability(_identity: &KernelBuildIdentity) -> KernelApplicability {
+    // Enabling a live constructor requires separately reviewed exact build,
+    // config, vendor/backport, raw-close lowering and callback-path bindings.
+    KernelApplicability::Unknown(ProfileFailure::UnboundBuild)
+}
+impl KernelApplicability {
+    pub(super) fn applicable(self, domain: EvidenceDomain) -> bool {
+        match self {
+            Self::Reviewed(p) => {
+                p.domain == domain
+                    && p.source_family < SOURCE_THEOREM_PINS.len()
+                    && p.build.build_sha256.is_some()
+                    && p.build.config_sha256.is_some()
+                    && p.build.vendor_source_sha256.is_some()
+            }
+            Self::ModelFixture => domain == EvidenceDomain::HostModel,
+            Self::Unknown(_) => false,
+        }
+    }
+    #[cfg(test)]
+    pub(super) fn reviewed_fixture(source_family: usize) -> Self {
+        Self::Reviewed(ReviewedKernelProfile {
+            source_family,
+            build: KernelBuildIdentity {
+                build_sha256: Some([1; 32]),
+                config_sha256: Some([2; 32]),
+                vendor_source_sha256: Some([3; 32]),
+            },
+            domain: EvidenceDomain::HostModel,
+        })
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReferenceFinality {
+    pub file: bool,
+    pub bpf_link: bool,
+}
+impl ReferenceFinality {
+    pub(super) fn final_owned() -> Self {
+        Self {
+            file: true,
+            bpf_link: true,
+        }
+    }
+    fn is_final(self) -> bool {
+        self.file && self.bpf_link
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuiescenceReason {
+    Deadline,
+    Inventory,
+    Stop,
+    Close,
+    References,
+    Profile,
+    ObjectDrift,
+    Owner,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriterWitness {
+    pub owner_epoch: OwnerEpoch,
+    pub terminal_id: TerminalId,
+    pub last_command_seq: Option<CommandSeq>,
+    pub writer_object_identity: [u8; 32],
+    pub established_at: std::time::Instant,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriterCompletion {
+    Finished(WriterWitness),
+    Unknown(QuiescenceReason),
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinkCloseOutcome {
+    pub id: LinkId,
+    pub issued_at: Option<std::time::Instant>,
+    pub returned_at: Option<std::time::Instant>,
+    pub state: ResourceState,
+    pub errno: Option<i32>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotBinding {
+    pub sequence: SnapshotSeq,
+    pub started_at: std::time::Instant,
+    pub completed_at: std::time::Instant,
+    pub immutable: bool,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadStatus {
+    NotStarted,
+    Complete,
+    Incomplete { enumeration: EnumerationStatus },
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CleanupState {
+    Pending(ResourceSummary),
+    Complete,
+    Failed(ResourceSummary),
+}
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TerminalFailures {
+    pub operations: [Option<OwnerFailure>; 10],
+    pub components: [Option<ComponentFailure>; 18],
+}
+impl TerminalFailures {
+    pub(super) fn record_component(&mut self, failure: ComponentFailure) {
+        let index = match (failure.map, failure.key) {
+            (CountMap::Admitted, 0) => 0,
+            (CountMap::Dropfail, 0) => 1,
+            (CountMap::Latc, key) if key < 16 => key as usize + 2,
+            _ => return,
+        };
+        if self.components[index].is_none_or(|old| old.class.is_none()) {
+            self.components[index] = Some(failure);
+        }
+    }
+    pub(super) fn record(&mut self, failure: OwnerFailure) {
+        let cell = &mut self.operations[failure.operation as usize];
+        if cell.is_none() {
+            *cell = Some(failure);
+        }
+    }
+}
+/// Both metadata envelopes and their vector capacities exist before count FD
+/// acquisition. Published views share immutable metadata, never clone vectors.
+#[derive(Debug)]
+pub struct RawTerminalData {
+    pub owner_epoch: OwnerEpoch,
+    pub terminal_id: TerminalId,
+    pub deadline: std::time::Instant,
+    pub last_command_seq: Option<CommandSeq>,
+    pub resolved_open: Option<OpenReceipt>,
+    pub evidence_domain: EvidenceDomain,
+    pub inventory: Option<Arc<SealedInventory>>,
+    pub manifest: Vec<CreationRecord>,
+    pub close_outcomes: Vec<LinkCloseOutcome>,
+    pub kernel_profile: KernelApplicability,
+    pub writer_object_identity: [u8; 32],
+    pub writer_family: CountDimensions,
+    pub host_writes_sealed: bool,
+    pub final_references: ReferenceFinality,
+    pub seal: SealBracket,
+    pub writers: WriterCompletion,
+    pub checkpoint: Option<RawCheckpoint>,
+    pub snapshot_binding: Option<SnapshotBinding>,
+    pub read_status: ReadStatus,
+    pub cleanup_ticket: CleanupTicket,
+    pub cleanup_state: CleanupState,
+    pub failures: TerminalFailures,
+}
+#[derive(Debug, Clone)]
+pub struct RawTerminal(pub(super) Arc<RawTerminalData>);
+impl std::ops::Deref for RawTerminal {
+    type Target = RawTerminalData;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReceiptFailure {
+    Identity,
+    Frontier,
+    Inventory,
+    Writer,
+    Stop,
+    Close,
+    Snapshot,
+    Cutoff,
+    Cleanup,
+}
+
+pub fn validate_terminal(
+    expected: &TerminalRequest,
+    receipt: &RawTerminal,
+) -> Result<(), ReceiptFailure> {
+    use ReceiptFailure as F;
+    if receipt.owner_epoch != expected.id.owner_epoch
+        || receipt.terminal_id != expected.id
+        || receipt.deadline != expected.deadline
+        || receipt.evidence_domain != expected.evidence_domain
+        || receipt.cleanup_ticket
+            != (CleanupTicket {
+                owner_epoch: expected.id.owner_epoch,
+                terminal_id: expected.id,
+            })
+        || receipt.writer_object_identity != expected.writer_object_identity
+    {
+        return Err(F::Identity);
+    }
+    if receipt.last_command_seq != expected.frontier.last_acked
+        && receipt.last_command_seq != expected.frontier.pending.map(|p| p.seq)
+    {
+        return Err(F::Frontier);
+    }
+    if let Some(pending) = expected.frontier.pending {
+        if expected
+            .frontier
+            .last_acked
+            .is_some_and(|seq| seq >= pending.seq)
+        {
+            return Err(F::Frontier);
+        }
+    }
+    if let Some(open) = receipt.resolved_open {
+        if open.owner_epoch != receipt.owner_epoch
+            || receipt.last_command_seq.is_some_and(|seq| open.seq > seq)
+                && open.outcome != OpenOutcome::Unknown
+            || (open.outcome == OpenOutcome::Completed
+                && open.completed_writes != OpenWriteFrontier::Target)
+        {
+            return Err(F::Frontier);
+        }
+    }
+    let inventory = receipt.inventory.as_ref().ok_or(F::Inventory)?;
+    inventory
+        .validate(&expected.frontier)
+        .map_err(|_| F::Inventory)?;
+    if receipt.last_command_seq != inventory.last_completed.map(|p| p.seq)
+        || receipt.resolved_open != inventory.resolved_open
+    {
+        return Err(F::Frontier);
+    }
+    if inventory.owner_epoch != receipt.owner_epoch
+        || inventory.writer.object_sha256 != expected.writer_object_identity
+        || inventory.writer.program != ResourceId::Program
+        || inventory.writer.maps != CountMap::ALL.map(ResourceId::Map)
+        || receipt.manifest.len() != inventory.records.len()
+        || receipt.close_outcomes.len() != inventory.records.len()
+    {
+        return Err(F::Inventory);
+    }
+    for ((record, created), close) in receipt
+        .manifest
+        .iter()
+        .zip(&inventory.records)
+        .zip(&receipt.close_outcomes)
+    {
+        if record.id != created.id
+            || record.command != created.command
+            || record.writer != created.writer
+            || record.backing != created.backing
+            || record.pin_slot != created.pin_slot
+            || record.memberships != created.memberships
+            || record.outcome != created.outcome
+            || record.publication != created.publication
+            || close.id != record.id
+        {
+            return Err(F::Inventory);
+        }
+    }
+    if let WriterCompletion::Finished(witness) = receipt.writers {
+        if witness.owner_epoch != receipt.owner_epoch
+            || witness.terminal_id != receipt.terminal_id
+            || witness.last_command_seq != receipt.last_command_seq
+            || witness.writer_object_identity != receipt.writer_object_identity
+            || !receipt.host_writes_sealed
+            || !receipt.final_references.is_final()
+            || !receipt.kernel_profile.applicable(expected.evidence_domain)
+            || receipt.writer_family != CountDimensions::validated()
+        {
+            return Err(F::Writer);
+        }
+        match receipt.seal {
+            SealBracket {
+                before_ns: Some(before),
+                after_ns: Some(after),
+                result: StopResult::Stopped,
+            } if before <= after => {}
+            _ => return Err(F::Stop),
+        }
+        let mut previous_ack = None;
+        for (record, close) in receipt.manifest.iter().zip(&receipt.close_outcomes) {
+            if previous_ack.is_some_and(|ack| close.issued_at.is_none_or(|issued| issued < ack)) {
+                return Err(F::Close);
+            }
+            if record.close_state != ResourceState::CloseReturned
+                || record.close_errno.is_some()
+                || close.state != ResourceState::CloseReturned
+                || close.errno.is_some()
+                || close
+                    .issued_at
+                    .zip(close.returned_at)
+                    .is_none_or(|(issued, returned)| {
+                        issued > returned || returned > witness.established_at
+                    })
+            {
+                return Err(F::Close);
+            }
+            previous_ack = close.returned_at;
+        }
+        if witness.established_at > receipt.deadline {
+            return Err(F::Cutoff);
+        }
+    }
+    if let Some(binding) = receipt.snapshot_binding {
+        let checkpoint = receipt.checkpoint.as_ref().ok_or(F::Snapshot)?;
+        if binding.sequence != checkpoint.snapshot.sequence
+            || checkpoint.phase != OwnerPhase::Snapshotting
+            || checkpoint.published_at != binding.completed_at
+            || binding.started_at > binding.completed_at
+            || binding.completed_at > receipt.deadline
+            || checkpoint.published_at > receipt.deadline
+        {
+            return Err(F::Snapshot);
+        }
+        if matches!(receipt.writers, WriterCompletion::Finished(_)) && !binding.immutable {
+            return Err(F::Snapshot);
+        }
+        if binding.immutable
+            && !matches!(receipt.writers, WriterCompletion::Finished(w) if w.established_at <= binding.started_at)
+        {
+            return Err(F::Snapshot);
+        }
+        match receipt.read_status {
+            ReadStatus::NotStarted => return Err(F::Snapshot),
+            ReadStatus::Complete if !snapshot_complete(&checkpoint.snapshot) => {
+                return Err(F::Snapshot);
+            }
+            ReadStatus::Incomplete { enumeration }
+                if enumeration != checkpoint.snapshot.enumeration =>
+            {
+                return Err(F::Snapshot);
+            }
+            _ => {}
+        }
+    } else if receipt.read_status != ReadStatus::NotStarted {
+        return Err(F::Snapshot);
+    }
+    if receipt.cleanup_state == CleanupState::Complete
+        && receipt
+            .close_outcomes
+            .iter()
+            .any(|c| c.state != ResourceState::CloseReturned)
+    {
+        return Err(F::Cleanup);
+    }
+    Ok(())
+}
+pub(super) fn snapshot_complete(snapshot: &RawSnapshot) -> bool {
+    snapshot.enumeration == (EnumerationStatus::Complete { unread_keys: 0 })
+        && matches!(snapshot.admitted, Component::Available(_))
+        && matches!(snapshot.dropfail, Component::Available(_))
+        && snapshot
+            .latc
+            .iter()
+            .all(|c| matches!(c, Component::Available(_)))
 }

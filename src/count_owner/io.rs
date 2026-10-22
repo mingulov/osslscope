@@ -67,6 +67,7 @@ pub(super) struct MapIo<'a> {
     loaded: &'a crate::loader::CountLoadedSlots,
     deadline: Instant,
     operation: CountOperation,
+    terminal: bool,
 }
 impl<'a> MapIo<'a> {
     pub(super) fn new(
@@ -82,6 +83,36 @@ impl<'a> MapIo<'a> {
             loaded,
             deadline,
             operation,
+            terminal: false,
+        }
+    }
+    pub(super) fn terminal(
+        shared: &'a Shared,
+        registry: &'a Registry,
+        loaded: &'a crate::loader::CountLoadedSlots,
+        deadline: Instant,
+        operation: CountOperation,
+    ) -> Self {
+        Self {
+            shared,
+            registry,
+            loaded,
+            deadline,
+            operation,
+            terminal: true,
+        }
+    }
+    pub(super) fn stop(&self, driver: &mut impl CountIoDriver) -> SealBracket {
+        let before_ns = driver.monotonic_ns();
+        let result = self.write(driver, CountMap::Target, 0, &0u64.to_ne_bytes());
+        let after_ns = driver.monotonic_ns();
+        SealBracket {
+            before_ns,
+            after_ns,
+            result: match result {
+                Ok(()) => StopResult::Stopped,
+                Err(failure) => StopResult::Failed(failure),
+            },
         }
     }
     fn failure(&self, map: CountMap, class: FailureClass) -> OwnerFailure {
@@ -97,11 +128,12 @@ impl<'a> MapIo<'a> {
             return Err(OwnerFailure::engine(self.operation, FailureClass::Deadline));
         }
         let state = locked(&self.shared.state);
-        if state.terminal.is_some()
-            || self
-                .shared
-                .abandoned
-                .load(std::sync::atomic::Ordering::Acquire)
+        if !self.terminal
+            && (state.terminal.is_some()
+                || self
+                    .shared
+                    .abandoned
+                    .load(std::sync::atomic::Ordering::Acquire))
         {
             return Err(OwnerFailure::engine(
                 self.operation,
@@ -115,11 +147,12 @@ impl<'a> MapIo<'a> {
             return Err(OwnerFailure::engine(self.operation, FailureClass::Deadline));
         }
         let mut state = locked(&self.shared.state);
-        if state.terminal.is_some()
-            || self
-                .shared
-                .abandoned
-                .load(std::sync::atomic::Ordering::Acquire)
+        if !self.terminal
+            && (state.terminal.is_some()
+                || self
+                    .shared
+                    .abandoned
+                    .load(std::sync::atomic::Ordering::Acquire))
         {
             return Err(OwnerFailure::engine(
                 self.operation,
@@ -139,6 +172,13 @@ impl<'a> MapIo<'a> {
         key: u32,
         value: &[u8],
     ) -> Result<(), OwnerFailure> {
+        if self.terminal
+            && (self.operation != CountOperation::Stop
+                || map != CountMap::Target
+                || value != 0u64.to_ne_bytes())
+        {
+            return Err(self.failure(map, FailureClass::InvalidInput));
+        }
         let spec = crate::loader::COUNT_MAPS[map.index()];
         if spec.map_type != 2
             || spec.key_size != 4
@@ -391,6 +431,7 @@ impl ReadWorkspace {
             return Ok(());
         };
         self.copy_image(index, spare);
+        let phase = locked(&shared.state).phase;
         let Ok(mut latest) = shared.latest_progress.try_lock() else {
             return Ok(());
         };
@@ -398,7 +439,7 @@ impl ReadWorkspace {
         self.image().sequence = sequence;
         *latest = Some(RawCheckpoint {
             snapshot: Arc::clone(&self.images[index]),
-            phase: OwnerPhase::Observing,
+            phase,
             published_at: Instant::now(),
         });
         self.building = Some(spare);
@@ -409,10 +450,11 @@ impl ReadWorkspace {
         self.image().sequence = sequence;
         let index = self.building.take().expect("building image");
         let snapshot = Arc::clone(&self.images[index]);
+        let phase = locked(&shared.state).phase;
         if let Ok(mut latest) = shared.latest_progress.try_lock() {
             *latest = Some(RawCheckpoint {
                 snapshot: Arc::clone(&snapshot),
-                phase: OwnerPhase::Observing,
+                phase,
                 published_at: Instant::now(),
             });
         }
@@ -450,13 +492,17 @@ impl ReadWorkspace {
                 )),
                 Err(failure) => {
                     self.record_failure(io, failure);
-                    Component::Unavailable(ComponentFailure {
+                    let component = ComponentFailure {
                         map,
                         key,
                         operation: CountOperation::Read,
                         class: Some(failure.class),
                         errno: failure.errno,
-                    })
+                    };
+                    locked(&io.shared.state)
+                        .failures
+                        .record_component(component);
+                    Component::Unavailable(component)
                 }
             };
             match map {
@@ -473,6 +519,7 @@ impl ReadWorkspace {
         if state.read_failure.is_none() {
             state.read_failure = Some(failure);
         }
+        state.failures.record(failure);
     }
     fn read_rows(
         &mut self,

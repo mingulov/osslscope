@@ -326,7 +326,9 @@ pub struct OwnerJournal {
     last_started: Option<PendingCommandId>,
     last_published: Option<CommandSeq>,
     last_acked: Option<CommandSeq>,
-    sealed_storage: Option<SealedInventory>,
+    last_completed: Option<PendingCommandId>,
+    resolved_open: Option<OpenReceipt>,
+    sealed_storage: Option<Arc<SealedInventory>>,
 }
 impl OwnerJournal {
     fn allocate(limits: CountOwnerLimits) -> Result<Self, OwnerFailure> {
@@ -347,7 +349,9 @@ impl OwnerJournal {
             last_started: None,
             last_published: None,
             last_acked: None,
-            sealed_storage: Some(SealedInventory {
+            last_completed: None,
+            resolved_open: None,
+            sealed_storage: Some(Arc::new(SealedInventory {
                 owner_epoch: epoch,
                 writer: WriterIdentity {
                     owner_epoch: epoch,
@@ -361,7 +365,9 @@ impl OwnerJournal {
                 unpublished_links: preallocated(limits.link_slots)?,
                 last_acked: None,
                 pending: None,
-            }),
+                last_completed: None,
+                resolved_open: None,
+            })),
         })
     }
     pub(super) fn bind(&mut self, epoch: OwnerEpoch, object_sha256: [u8; 32]) {
@@ -371,18 +377,22 @@ impl OwnerJournal {
             program: ResourceId::Program,
             maps: CountMap::ALL.map(ResourceId::Map),
         });
-        self.sealed_storage
-            .as_mut()
-            .expect("unsealed preparation")
+        Arc::get_mut(self.sealed_storage.as_mut().expect("unsealed preparation"))
+            .expect("unpublished inventory")
             .owner_epoch = epoch;
-        self.sealed_storage
-            .as_mut()
-            .expect("unsealed preparation")
+        Arc::get_mut(self.sealed_storage.as_mut().expect("unsealed preparation"))
+            .expect("unpublished inventory")
             .writer = self.writer.unwrap();
     }
     pub(super) fn begin(&mut self, seq: CommandSeq, operation: CountOperation) {
         self.attempts.clear();
         self.last_started = Some(PendingCommandId { seq, operation });
+    }
+    pub(super) fn completed(&mut self, seq: CommandSeq, operation: CountOperation) {
+        self.last_completed = Some(PendingCommandId { seq, operation });
+    }
+    pub(super) fn resolved_open(&mut self, open: Option<OpenReceipt>) {
+        self.resolved_open = open;
     }
     pub(super) fn published(&mut self, seq: CommandSeq) {
         for record in &mut self.records {
@@ -400,7 +410,7 @@ impl OwnerJournal {
     pub fn seal(
         &mut self,
         frontier: &ControllerFrontier,
-    ) -> Result<SealedInventory, InventoryFailure> {
+    ) -> Result<Arc<SealedInventory>, InventoryFailure> {
         if self.last_acked != frontier.last_acked {
             return Err(InventoryFailure::Frontier);
         }
@@ -414,15 +424,18 @@ impl OwnerJournal {
             .sealed_storage
             .take()
             .ok_or(InventoryFailure::AlreadySealed)?;
-        out.last_acked = frontier.last_acked;
-        out.pending = frontier.pending;
-        out.records.extend(self.records.iter().cloned());
-        out.memberships.extend_from_slice(&self.memberships);
+        let data = Arc::get_mut(&mut out).expect("unpublished inventory");
+        data.last_acked = frontier.last_acked;
+        data.pending = frontier.pending;
+        data.last_completed = self.last_completed;
+        data.resolved_open = self.resolved_open;
+        data.records.extend(self.records.iter().cloned());
+        data.memberships.extend_from_slice(&self.memberships);
         for record in &self.records {
             if frontier.acknowledged_links.contains(&record.id) {
-                out.acknowledged_links.push(record.id);
+                data.acknowledged_links.push(record.id);
             } else {
-                out.unpublished_links.push(record.id);
+                data.unpublished_links.push(record.id);
             }
         }
         out.validate(frontier)?;
@@ -501,6 +514,7 @@ impl Registry {
                 record.close_state = ResourceState::CloseIssued;
             }
         }
+        let fd = self.slots[index].fd.take().expect("issued held owner slot");
         self.publish_progress();
         #[cfg(test)]
         if let Some(observer) = &self.observer {
@@ -508,7 +522,6 @@ impl Registry {
                 self.slots[index].record.resource,
             ));
         }
-        let fd = self.slots[index].fd.take().expect("issued held owner slot");
         let result = driver.close(ManuallyDrop::into_inner(fd));
         let record = &mut self.slots[index].record;
         record.errno = result.as_ref().err().and_then(std::io::Error::raw_os_error);
@@ -531,6 +544,49 @@ impl Registry {
             ));
         }
         result
+    }
+    pub(super) fn close_writers(
+        &mut self,
+        driver: &mut impl CountIoDriver,
+        outcomes: &mut Vec<LinkCloseOutcome>,
+    ) {
+        self.sealed = true;
+        self.publish_progress();
+        // Link slots are never reused within an epoch, so their physical order
+        // is the never-wrapping successful creation serial order.
+        for index in 8..8 + self.limits.link_slots {
+            let ResourceId::Link(id) = self.slots[index].record.resource else {
+                continue;
+            };
+            if self.slots[index].fd.is_none() {
+                continue;
+            }
+            let issued_at = Instant::now();
+            let outcome = LinkCloseOutcome {
+                id,
+                issued_at: Some(issued_at),
+                returned_at: None,
+                state: ResourceState::CloseIssued,
+                errno: None,
+            };
+            assert!(outcomes.len() < outcomes.capacity());
+            outcomes.push(outcome);
+            // close_slot consumes the capability before the one syscall. A
+            // panic cannot hand an OwnedFd to destructor/replacement cleanup.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.close_slot(LoadSlot(index), driver)
+            }));
+            let outcome = outcomes.last_mut().expect("reserved close outcome");
+            if result.is_ok() {
+                outcome.returned_at = Some(Instant::now());
+                outcome.state = self.slots[index].record.state;
+                outcome.errno = self.slots[index].record.errno;
+            }
+        }
+    }
+    pub(super) fn copy_manifest(&self, destination: &mut Vec<CreationRecord>) {
+        destination.clear();
+        destination.extend(self.journal.records.iter().cloned());
     }
     fn stopped(&self, driver: &impl CountIoDriver, deadline: Instant) -> Result<(), OwnerFailure> {
         if driver.now() >= deadline {
