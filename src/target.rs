@@ -2052,7 +2052,7 @@ mod control_tests {
         __test_set_control_worker_counter, __test_set_poll_gate, __test_set_setup_delay_ms,
         Control, close_under_control, prepare_and_publish_sink, run_under_control,
     };
-    use std::os::fd::{FromRawFd as _, OwnedFd};
+    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
     use std::os::unix::fs::PermissionsExt as _;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::time::{Duration, Instant};
@@ -2149,54 +2149,85 @@ mod control_tests {
         assert!(t0.elapsed() < Duration::from_secs(5), "fail fast");
     }
 
+    fn close_test_pipe() -> (OwnedFd, OwnedFd) {
+        let mut fds = [0; 2];
+        // SAFETY: pipe2 initializes both entries with distinct owned endpoints.
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        // SAFETY: the descriptors were just returned by the successful pipe2.
+        unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
+    }
+
+    // Observe the original pipe, whose reader stays owned by this test. Other
+    // tests can reuse the closed writer's numeric descriptor immediately. Raw
+    // fork fixtures can also inherit CLOEXEC writers until they exit/exec; the
+    // bounded wait accounts for those aliases only, with no count-writer credit.
+    fn close_test_pipe_hung_up(reader: &OwnedFd, wait: Duration) -> bool {
+        let cutoff = Instant::now() + wait;
+        loop {
+            let remaining = cutoff.saturating_duration_since(Instant::now());
+            let timeout = if wait.is_zero() {
+                0
+            } else {
+                i32::try_from(remaining.as_millis())
+                    .unwrap_or(i32::MAX)
+                    .max(1)
+            };
+            let mut poll = libc::pollfd {
+                fd: reader.as_raw_fd(),
+                events: 0,
+                revents: 0,
+            };
+            // SAFETY: poll refers to one live, initialized pollfd.
+            let result = unsafe { libc::poll(&mut poll, 1, timeout) };
+            if result < 0 {
+                let error = std::io::Error::last_os_error();
+                assert!(
+                    error.raw_os_error() == Some(libc::EINTR) && Instant::now() < cutoff,
+                    "pipe poll failed: {error}"
+                );
+                continue;
+            }
+            assert_eq!(poll.revents & (libc::POLLERR | libc::POLLNVAL), 0);
+            return result == 1 && poll.revents & libc::POLLHUP != 0;
+        }
+    }
+
     #[test]
     fn control_close_confirms_on_live_setup() {
-        let mut fds = [0; 2];
-        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (reader, writer) = close_test_pipe();
+        let retained_writer = writer.try_clone().unwrap();
+        assert!(!close_test_pipe_hung_up(&reader, Duration::ZERO));
         let cancel = AtomicBool::new(false);
-        let fd = unsafe { OwnedFd::from_raw_fd(fds[1]) };
         let out =
-            close_under_control(fd, Instant::now() + Duration::from_secs(30), &cancel).unwrap();
+            close_under_control(writer, Instant::now() + Duration::from_secs(30), &cancel).unwrap();
         assert!(matches!(out, Control::Done(())));
-        let r = unsafe { libc::fcntl(fds[1], libc::F_GETFD) };
-        assert!(r < 0, "fd must be closed");
-        assert_eq!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::EBADF)
+        // Real retained-writer negative control: a close acknowledgment alone
+        // does not make this original pipe hang up while its alias is alive.
+        assert!(!close_test_pipe_hung_up(&reader, Duration::ZERO));
+        drop(retained_writer);
+        assert!(
+            close_test_pipe_hung_up(&reader, Duration::from_secs(3)),
+            "original pipe still has a writer after bounded cleanup"
         );
-        unsafe {
-            libc::close(fds[0]);
-        }
     }
 
     #[test]
     fn control_close_runs_even_on_dead_setup() {
         // F1 leak pin: disposal on an already-dead setup still closes
         // (late, on the worker) instead of leaking the fd.
-        let mut fds = [0; 2];
-        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (reader, writer) = close_test_pipe();
+        let retained_writer = writer.try_clone().unwrap();
+        assert!(!close_test_pipe_hung_up(&reader, Duration::ZERO));
         let cancel = AtomicBool::new(true);
-        let fd = unsafe { OwnedFd::from_raw_fd(fds[1]) };
         let out =
-            close_under_control(fd, Instant::now() + Duration::from_secs(30), &cancel).unwrap();
+            close_under_control(writer, Instant::now() + Duration::from_secs(30), &cancel).unwrap();
         assert!(matches!(out, Control::Cancelled));
-        // The worker closes late: poll for EBADF, bounded.
-        let end = Instant::now() + Duration::from_secs(5);
-        loop {
-            let r = unsafe { libc::fcntl(fds[1], libc::F_GETFD) };
-            if r < 0 {
-                assert_eq!(
-                    std::io::Error::last_os_error().raw_os_error(),
-                    Some(libc::EBADF)
-                );
-                break;
-            }
-            assert!(Instant::now() < end, "worker never closed");
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        unsafe {
-            libc::close(fds[0]);
-        }
+        assert!(!close_test_pipe_hung_up(&reader, Duration::ZERO));
+        drop(retained_writer);
+        assert!(
+            close_test_pipe_hung_up(&reader, Duration::from_secs(3)),
+            "original pipe still has a writer after bounded cleanup"
+        );
     }
 
     #[test]
