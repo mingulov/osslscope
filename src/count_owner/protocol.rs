@@ -1041,16 +1041,6 @@ pub fn validate_terminal(
             return Err(F::Frontier);
         }
     }
-    if let Some(open) = receipt.resolved_open {
-        if open.owner_epoch != receipt.owner_epoch
-            || receipt.last_command_seq.is_some_and(|seq| open.seq > seq)
-                && open.outcome != OpenOutcome::Unknown
-            || (open.outcome == OpenOutcome::Completed
-                && open.completed_writes != OpenWriteFrontier::Target)
-        {
-            return Err(F::Frontier);
-        }
-    }
     let inventory = receipt.inventory.as_ref().ok_or(F::Inventory)?;
     inventory
         .validate(&expected.frontier)
@@ -1060,6 +1050,12 @@ pub fn validate_terminal(
     {
         return Err(F::Frontier);
     }
+    validate_resolved_open(
+        receipt.owner_epoch,
+        receipt.resolved_open,
+        inventory.last_completed,
+        inventory.pending,
+    )?;
     if inventory.owner_epoch != receipt.owner_epoch
         || inventory.writer.object_sha256 != expected.writer_object_identity
         || inventory.writer.program != ResourceId::Program
@@ -1184,4 +1180,43 @@ pub(super) fn snapshot_complete(snapshot: &RawSnapshot) -> bool {
             .latc
             .iter()
             .all(|c| matches!(c, Component::Available(_)))
+}
+
+fn validate_resolved_open(
+    epoch: OwnerEpoch,
+    resolved: Option<OpenReceipt>,
+    completed: Option<PendingCommandId>,
+    pending: Option<PendingCommandId>,
+) -> Result<(), ReceiptFailure> {
+    let Some(open) = resolved else {
+        return Ok(());
+    };
+    if open.owner_epoch != epoch
+        || pending.is_some_and(|p| p.seq == open.seq && p.operation != CountOperation::Open)
+        || completed.is_some_and(|p| p.seq == open.seq && p.operation != CountOperation::Open)
+    {
+        return Err(ReceiptFailure::Frontier);
+    }
+    let covered = completed.is_some_and(|p| p.seq >= open.seq);
+    let pending_open = pending
+        == Some(PendingCommandId {
+            seq: open.seq,
+            operation: CountOperation::Open,
+        });
+    let valid = match open.outcome {
+        OpenOutcome::Completed => covered && open.completed_writes == OpenWriteFrontier::Target,
+        // A queued request can fail its first admission without any syscall,
+        // leaving the earlier actual completed operation unchanged.
+        OpenOutcome::Failed => {
+            covered || (pending_open && open.completed_writes == OpenWriteFrontier::NoWrites)
+        }
+        // Partial acknowledgments before an unreturned call remain explicit;
+        // they are not an admission interval or evidence of command completion.
+        OpenOutcome::Unknown => covered || pending_open,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(ReceiptFailure::Frontier)
+    }
 }

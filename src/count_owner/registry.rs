@@ -571,6 +571,9 @@ impl Registry {
             };
             assert!(outcomes.len() < outcomes.capacity());
             outcomes.push(outcome);
+            if let Some(shared) = &self.shared {
+                shared.terminal_close_progress(outcome, None);
+            }
             // close_slot consumes the capability before the one syscall. A
             // panic cannot hand an OwnedFd to destructor/replacement cleanup.
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -581,6 +584,25 @@ impl Registry {
                 outcome.returned_at = Some(Instant::now());
                 outcome.state = self.slots[index].record.state;
                 outcome.errno = self.slots[index].record.errno;
+            }
+            let failure = match result {
+                Ok(Ok(())) => None,
+                Ok(Err(ref error)) => Some(OwnerFailure::io(
+                    CountOperation::Close,
+                    ResourceId::Link(id),
+                    error,
+                )),
+                Err(_) => Some(OwnerFailure {
+                    operation: CountOperation::Close,
+                    resource: ResourceId::Link(id),
+                    class: FailureClass::Panic,
+                    errno: None,
+                }),
+            };
+            // Publish each returned failure before entering another close. A
+            // selected immutable receipt is never modified by later progress.
+            if let Some(shared) = &self.shared {
+                shared.terminal_close_progress(*outcome, failure);
             }
         }
     }

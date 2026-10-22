@@ -370,6 +370,25 @@ impl Shared {
         registry.publish_into(&mut state.resources);
         self.changed.notify_all();
     }
+    fn terminal_close_progress(&self, outcome: LinkCloseOutcome, failure: Option<OwnerFailure>) {
+        let mut state = locked(&self.state);
+        if let Some(failure) = failure {
+            state.failures.record(failure);
+        }
+        if let Some(fallback) = state.terminal_fallback.as_mut() {
+            let data = Arc::get_mut(fallback).expect("unpublished close progress");
+            if let Some(previous) = data.close_outcomes.iter_mut().find(|c| c.id == outcome.id) {
+                *previous = outcome;
+            } else {
+                assert!(data.close_outcomes.len() < data.close_outcomes.capacity());
+                data.close_outcomes.push(outcome);
+            }
+            if let Some(failure) = failure {
+                data.failures.record(failure);
+            }
+        }
+        self.changed.notify_all();
+    }
 }
 /// Ready contains data only; the worker retains every map/program/pin/link.
 pub struct CountEngine {
@@ -462,16 +481,18 @@ impl CountEngine {
                     .expect("one fallback builder");
                 let data = Arc::get_mut(&mut fallback).expect("unpublished fallback");
                 fill_terminal_shared(&state, data);
-                if data.close_outcomes.is_empty() {
-                    for record in &data.manifest {
-                        data.close_outcomes.push(LinkCloseOutcome {
-                            id: record.id,
-                            issued_at: None,
-                            returned_at: None,
-                            state: record.close_state,
-                            errno: record.close_errno,
-                        });
-                    }
+                // The owner may have published a completed prefix before
+                // blocking on another link. Preserve those actual outcomes and
+                // represent every remaining serial without inventing an ack.
+                let completed_prefix = data.close_outcomes.len();
+                for record in data.manifest.iter().skip(completed_prefix) {
+                    data.close_outcomes.push(LinkCloseOutcome {
+                        id: record.id,
+                        issued_at: None,
+                        returned_at: None,
+                        state: record.close_state,
+                        errno: record.close_errno,
+                    });
                 }
                 if data.seal.result == StopResult::NotAttempted {
                     data.failures.record(OwnerFailure::engine(
@@ -1584,7 +1605,7 @@ fn fill_terminal_shared(state: &SharedState, data: &mut RawTerminalData) {
     if let Some(failure) = state.read_failure {
         data.failures.record(failure);
     }
-    if state.terminal_contradiction {
+    if state.terminal_contradiction || matches!(state.inventory, Some(Err(_))) {
         data.failures.record(OwnerFailure::engine(
             CountOperation::Close,
             FailureClass::Inventory,
@@ -1652,6 +1673,14 @@ fn finish_terminal(
         let mut state = locked(&shared.state);
         state.active_operation = None;
         state.phase = OwnerPhase::Closing;
+        if let StopResult::Failed(failure) = data.seal.result {
+            state.failures.record(failure);
+        }
+        if let Some(fallback) = state.terminal_fallback.as_mut() {
+            let fallback = Arc::get_mut(fallback).expect("unpublished stop progress");
+            copy_terminal_proof(data, fallback);
+        }
+        shared.changed.notify_all();
     }
     registry.close_writers(driver, &mut data.close_outcomes);
     registry.copy_manifest(&mut data.manifest);

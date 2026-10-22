@@ -36,6 +36,7 @@ struct MapProbe {
     changed: Condvar,
     expired: AtomicBool,
     post_expiry: std::sync::atomic::AtomicUsize,
+    before_open_write: AtomicBool,
 }
 impl MapProbe {
     fn new() -> Arc<Self> {
@@ -45,6 +46,7 @@ impl MapProbe {
             changed: Condvar::new(),
             expired: AtomicBool::new(false),
             post_expiry: std::sync::atomic::AtomicUsize::new(0),
+            before_open_write: AtomicBool::new(false),
         })
     }
     fn wait_calls(&self, n: usize) {
@@ -1415,6 +1417,7 @@ enum Event {
     AttachCreated(usize),
     PinClose,
     PinCloseResult(Option<i32>),
+    BeforeOpenWrite,
 }
 struct InvocationLog {
     events: Vec<(ThreadId, Event)>,
@@ -4286,11 +4289,11 @@ impl StagedWriter {
             generation: std::sync::atomic::AtomicU32::new(0),
         })
     }
-    fn at(&self, stage: WriterStage) {
+    fn at(&self, stage: WriterStage, hold_enabled: bool) {
         let mut current = self.stage.lock().unwrap();
         *current = Some(stage);
         self.changed.notify_all();
-        while self.hold == Some(stage) && !self.release.load(Ordering::Acquire) {
+        while hold_enabled && self.hold == Some(stage) && !self.release.load(Ordering::Acquire) {
             current = self.changed.wait(current).unwrap();
         }
     }
@@ -4318,26 +4321,49 @@ impl StagedWriter {
         }
     }
     fn run(self: &Arc<Self>, fresh: bool, fail_insert: bool) -> thread::JoinHandle<()> {
+        self.run_invocation(fresh, fail_insert, true, 500)
+    }
+    fn run_baseline(self: &Arc<Self>) -> thread::JoinHandle<()> {
+        self.run_invocation(true, false, false, 400)
+    }
+    fn run_invocation(
+        self: &Arc<Self>,
+        fresh: bool,
+        fail_insert: bool,
+        hold_enabled: bool,
+        sample_ns: u64,
+    ) -> thread::JoinHandle<()> {
+        self.returned.store(false, Ordering::Release);
         let writer = Arc::clone(self);
         thread::spawn(move || {
-            writer.at(WriterStage::TargetRead);
+            writer.at(WriterStage::TargetRead, hold_enabled);
             // Expected calls come from the producer before ADMITTED or COUNTS.
-            writer.ledger.0.lock().unwrap().push(PhysicalAdmission {
-                invocation_id: 1,
-                site: 100,
-                generation: None,
-                actual_sample_ns: 500,
-            });
-            writer.at(WriterStage::WindowPassed);
+            let physical_index = {
+                let mut ledger = writer.ledger.0.lock().unwrap();
+                let index = ledger.len();
+                ledger.push(PhysicalAdmission {
+                    invocation_id: index as u64 + 1,
+                    site: 100,
+                    generation: None,
+                    actual_sample_ns: sample_ns,
+                });
+                index
+            };
+            writer.at(WriterStage::WindowPassed, hold_enabled);
             writer.maps.lock().unwrap().admitted += 1;
-            writer.at(WriterStage::AdmittedLedger);
+            writer.at(WriterStage::AdmittedLedger, hold_enabled);
             // GEN is sampled by this producer after ADMITTED, independently of
             // both count-map lookup and the eventual controller's routing.
             let generation = writer.generation.load(Ordering::Acquire);
-            writer.ledger.0.lock().unwrap()[0].generation = Some(generation);
-            writer.at(WriterStage::GenerationRead);
-            writer.at(WriterStage::ExistingLookup);
+            writer.ledger.0.lock().unwrap()[physical_index].generation = Some(generation);
+            writer.at(WriterStage::GenerationRead, hold_enabled);
             let key = osslscope_ebpf_common::make_key(100, generation);
+            let existing = writer.maps.lock().unwrap().rows.get(&key).is_some();
+            assert_eq!(
+                existing, !fresh,
+                "the existing branch requires a real successful lookup"
+            );
+            writer.at(WriterStage::ExistingLookup, hold_enabled);
             if fresh {
                 if !fail_insert {
                     writer
@@ -4347,26 +4373,31 @@ impl StagedWriter {
                         .rows
                         .insert(key, Default::default());
                 }
-                writer.at(WriterStage::FreshInsert);
+                writer.at(WriterStage::FreshInsert, hold_enabled);
             }
             {
                 let mut maps = writer.maps.lock().unwrap();
                 if fail_insert {
                     maps.dropfail += 1;
                 } else {
-                    let row = maps.rows.entry(key).or_default();
+                    let row = maps
+                        .rows
+                        .get_mut(&key)
+                        .expect("existing or successful fresh relookup");
+                    if row.count == 0 {
+                        row.first_ns = sample_ns;
+                    }
                     row.count += 1;
-                    row.first_ns = 500;
-                    row.last_ns = 500;
+                    row.last_ns = sample_ns;
                 }
             }
-            writer.at(WriterStage::CountOrDrop);
+            writer.at(WriterStage::CountOrDrop, hold_enabled);
             if fresh {
-                writer.at(WriterStage::BeforeLatc);
+                writer.at(WriterStage::BeforeLatc, hold_enabled);
                 writer.maps.lock().unwrap().latc += 1;
             }
-            writer.at(WriterStage::LastMutation);
-            writer.at(WriterStage::Returned);
+            writer.at(WriterStage::LastMutation, hold_enabled);
+            writer.at(WriterStage::Returned, hold_enabled);
             let _current = writer.stage.lock().unwrap();
             writer.returned.store(true, Ordering::Release);
             writer.changed.notify_all();
@@ -4459,6 +4490,7 @@ impl Default for TerminalFaults {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TerminalEvent {
     Stop,
+    StopReturned(Option<i32>),
     LinkClose,
     CloseAck,
     Snapshot,
@@ -4504,7 +4536,16 @@ impl CountIoDriver for TerminalDriver {
         }
         let map = self.map.map(fd);
         // SAFETY: forwarded exact validated slices from the owner.
-        unsafe { self.map.update(fd, key, value) }?;
+        let result = unsafe { self.map.update(fd, key, value) };
+        if map == CountMap::Target && value == 0u64.to_ne_bytes() {
+            self.timeline.lock().unwrap().push((
+                TerminalEvent::StopReturned(
+                    result.as_ref().err().and_then(io::Error::raw_os_error),
+                ),
+                Instant::now(),
+            ));
+        }
+        result?;
         if map == CountMap::Gen {
             if let Some(writer) = &self.writer {
                 writer.generation.store(
@@ -4604,6 +4645,15 @@ impl CountIoDriver for TerminalDriver {
         result
     }
     fn now(&self) -> Instant {
+        if self
+            .map
+            .probe
+            .before_open_write
+            .swap(false, Ordering::AcqRel)
+        {
+            self.map.probe.owner.event(Event::BeforeOpenWrite);
+            self.map.probe.owner.hold();
+        }
         assert!(
             !self.clock_panic_after_close || self.map.base.closes == 0,
             "terminal post-close clock unwind control"
@@ -4696,11 +4746,22 @@ fn g1_terminal_staged_writer_holds_and_no_hold_twins() {
                 let mut open = open_request(2);
                 open.generation = generation;
                 engine.open_window(open).unwrap();
+                if !fresh {
+                    // An actual unheld producer invocation supplies a separate
+                    // physical baseline and primes the successful lookup.
+                    writer.run_baseline().join().unwrap();
+                }
                 let producer = writer.run(fresh, failed);
                 if held {
                     writer.wait_at(stage);
                 } else {
                     writer.wait_returned();
+                }
+                if held && !fresh {
+                    let maps = writer.maps.lock().unwrap();
+                    let key = osslscope_ebpf_common::make_key(100, generation);
+                    assert_eq!(maps.rows.get(&key).map(|v| v.count), Some(1));
+                    assert_eq!(writer.ledger.admitted_calls(), 2);
                 }
                 engine
                     .set_generation(GenerationRequest {
@@ -4771,19 +4832,48 @@ fn g1_terminal_staged_writer_holds_and_no_hold_twins() {
                     current_calls + fenced_calls + unattributed + dropfail,
                     writer.ledger.admitted_calls()
                 );
-                assert_eq!(current_calls, u64::from(sampled_generation == 3 && !failed));
-                assert_eq!(fenced_calls, u64::from(sampled_generation != 3 && !failed));
+                let baseline_current = u64::from(!fresh && generation == 3);
+                let baseline_fenced = u64::from(!fresh && generation != 3);
+                assert_eq!(
+                    current_calls,
+                    baseline_current + u64::from(sampled_generation == 3 && !failed)
+                );
+                assert_eq!(
+                    fenced_calls,
+                    baseline_fenced + u64::from(sampled_generation != 3 && !failed)
+                );
                 assert_eq!(dropfail, u64::from(failed));
-                assert_eq!(snapshot.admitted, Component::Available(1));
+                assert_eq!(
+                    snapshot.admitted,
+                    Component::Available(if fresh { 1 } else { 2 })
+                );
                 let physical = writer.ledger.0.lock().unwrap();
+                if !fresh {
+                    assert_eq!(
+                        (
+                            physical[0].invocation_id,
+                            physical[0].generation,
+                            physical[0].actual_sample_ns
+                        ),
+                        (1, Some(generation), 400)
+                    );
+                    let row = &snapshot.rows[0].1;
+                    assert_eq!((row.count, row.first_ns, row.last_ns), (2, 400, 500));
+                }
+                let entry = physical.last().unwrap();
                 assert_eq!(
                     (
-                        physical[0].invocation_id,
-                        physical[0].site,
-                        physical[0].generation,
-                        physical[0].actual_sample_ns
+                        entry.invocation_id,
+                        entry.site,
+                        entry.generation,
+                        entry.actual_sample_ns
                     ),
-                    (1, 100, Some(sampled_generation), 500)
+                    (
+                        if fresh { 1 } else { 2 },
+                        100,
+                        Some(sampled_generation),
+                        500
+                    )
                 );
                 let events = timeline.lock().unwrap();
                 let ack = events
@@ -5690,4 +5780,358 @@ fn g1_terminal_late_cleanup_error_refuses_fork_after_finished_snapshot() {
         );
         assert!(matches!(receipt.cleanup_state, CleanupState::Pending(_)));
     }
+}
+
+#[test]
+fn g1_terminal_stop_and_close_errors_survive_a_later_blocked_close() {
+    // The third schedule also preserves a completed link's EINTR when the next
+    // link blocks. All blocks are in the owner-private host model seam.
+    for control in 0..3 {
+        let probe = MapProbe::new();
+        let links = if control == 2 { 2 } else { 1 };
+        let held_close = if control == 2 { 2 } else { 1 };
+        let (engine, timeline) = terminal_engine(
+            &probe,
+            None,
+            TerminalFaults {
+                map: MapFaults {
+                    write_error: (control == 0).then_some(1),
+                    ..MapFaults::default()
+                },
+                close: Faults {
+                    hold_close: Some(held_close),
+                    fail_close: (control == 2).then_some(1),
+                    ..Faults::default()
+                },
+                ..TerminalFaults::default()
+            },
+        );
+        engine.attach(attach_request(1, 1)).unwrap();
+        if links == 2 {
+            let mut second = attach_request(2, 1);
+            second.offsets = vec![7];
+            second.cookies = vec![107];
+            engine.attach(second).unwrap();
+        }
+        let request = terminal_request(&engine, Instant::now() + Duration::from_millis(250));
+        let receipt = thread::scope(|scope| {
+            let posted = request.clone();
+            let owner = &engine;
+            let result = scope.spawn(move || owner.terminal(posted));
+            probe.owner.wait(|events| {
+                events
+                    .iter()
+                    .filter(|(_, e)| matches!(e, Event::EnterClose))
+                    .count()
+                    == held_close
+            });
+            let stop_at = timeline
+                .lock()
+                .unwrap()
+                .iter()
+                .find_map(|(event, at)| {
+                    matches!(event, TerminalEvent::StopReturned(_)).then_some(*at)
+                })
+                .expect("actual stop returned before close");
+            assert!(stop_at < request.deadline);
+            assert!(
+                Instant::now() < request.deadline,
+                "close did not block before cutoff"
+            );
+            result.join().unwrap()
+        });
+        assert!(matches!(receipt.writers, WriterCompletion::Unknown(_)));
+        assert!(
+            engine
+                .resource_summary()
+                .resources
+                .iter()
+                .any(|r| r.state == ResourceState::CloseIssued)
+        );
+        let frozen_seal = receipt.seal;
+        let frozen_failures = receipt.failures;
+        probe.owner.release();
+        task3_cleanup(&probe.owner, 9 + links);
+        assert_eq!(receipt.seal.before_ns, Some(1));
+        assert_eq!(receipt.seal.after_ns, Some(1));
+        if control == 0 {
+            assert!(
+                matches!(receipt.seal.result, StopResult::Failed(f) if f.class == FailureClass::Io && f.errno == Some(libc::EIO))
+            );
+            assert_eq!(
+                receipt.failures.operations[CountOperation::Stop as usize]
+                    .map(|f| (f.class, f.errno)),
+                Some((FailureClass::Io, Some(libc::EIO)))
+            );
+        } else {
+            assert_eq!(receipt.seal.result, StopResult::Stopped);
+        }
+        assert_eq!(receipt.close_outcomes.len(), links);
+        assert_eq!(
+            receipt.close_outcomes[held_close - 1].state,
+            ResourceState::CloseIssued
+        );
+        if control == 2 {
+            assert_eq!(receipt.close_outcomes[0].errno, Some(libc::EINTR));
+            assert_eq!(
+                receipt.close_outcomes[0].state,
+                ResourceState::ConsumedError
+            );
+            assert_eq!(
+                receipt.failures.operations[CountOperation::Close as usize]
+                    .map(|f| (f.class, f.errno)),
+                Some((FailureClass::Io, Some(libc::EINTR)))
+            );
+        }
+        assert_eq!(
+            probe.calls.lock().unwrap().len(),
+            1,
+            "map I/O restarted after cutoff"
+        );
+        let repeated = engine.terminal(request);
+        assert!(Arc::ptr_eq(&receipt.0, &repeated.0));
+        assert_eq!(repeated.seal, frozen_seal);
+        assert_eq!(repeated.failures, frozen_failures);
+    }
+}
+
+#[test]
+fn g1_terminal_open_refused_before_first_write_keeps_real_frontiers() {
+    for prior_ack in [true, false] {
+        let probe = MapProbe::new();
+        let (engine, _) = terminal_engine(&probe, None, TerminalFaults::default());
+        if prior_ack {
+            engine.attach(attach_request(1, 1)).unwrap();
+        }
+        probe.before_open_write.store(true, Ordering::Release);
+        let open = open_request(if prior_ack { 2 } else { 1 });
+        let (request, receipt) = thread::scope(|scope| {
+            let command = scope.spawn(|| engine.open_window(open));
+            probe.owner.wait(|events| {
+                events
+                    .iter()
+                    .any(|(_, e)| matches!(e, Event::BeforeOpenWrite))
+            });
+            assert!(locked(&engine.shared.state).active_operation.is_none());
+            let request = terminal_request(&engine, Instant::now() + Duration::from_secs(5));
+            let posted = request.clone();
+            let owner = &engine;
+            let terminal = scope.spawn(move || owner.terminal(posted));
+            let mut state = locked(&engine.shared.state);
+            while state.terminal.is_none() {
+                state = engine.shared.changed.wait(state).unwrap();
+            }
+            drop(state);
+            probe.owner.release();
+            assert!(command.join().unwrap().is_err());
+            let receipt = terminal.join().unwrap();
+            (request, receipt)
+        });
+        let prior = prior_ack.then(|| CommandSeq::checked(1).unwrap());
+        assert_eq!(receipt.last_command_seq, prior);
+        assert_eq!(
+            receipt
+                .inventory
+                .as_ref()
+                .unwrap()
+                .last_completed
+                .map(|p| p.seq),
+            prior
+        );
+        let resolved = receipt.resolved_open.unwrap();
+        assert_eq!(resolved.seq, open.seq);
+        assert_eq!(resolved.outcome, OpenOutcome::Failed);
+        assert_eq!(resolved.completed_writes, OpenWriteFrontier::NoWrites);
+        assert!(matches!(receipt.writers, WriterCompletion::Finished(_)));
+        task3_cleanup(&probe.owner, if prior_ack { 10 } else { 8 });
+        assert_eq!(validate_terminal(&request, &receipt), Ok(()));
+        for (outcome, writes, expected) in [
+            (OpenOutcome::Unknown, OpenWriteFrontier::WindowStart, Ok(())),
+            (
+                OpenOutcome::Completed,
+                OpenWriteFrontier::Target,
+                Err(ReceiptFailure::Frontier),
+            ),
+            (
+                OpenOutcome::Failed,
+                OpenWriteFrontier::WindowStart,
+                Err(ReceiptFailure::Frontier),
+            ),
+        ] {
+            let changed = OpenReceipt {
+                outcome,
+                completed_writes: writes,
+                ..resolved
+            };
+            let fixture = mutate_terminal(&receipt, |d| {
+                d.resolved_open = Some(changed);
+                mutate_inventory(d, |i| i.resolved_open = Some(changed));
+            });
+            assert_eq!(validate_terminal(&request, &fixture), expected);
+        }
+    }
+}
+
+#[test]
+fn g1_terminal_open_requires_actual_operation_or_exact_pending_open() {
+    let probe = MapProbe::new();
+    let (engine, _) = terminal_engine(&probe, None, TerminalFaults::default());
+    let request = terminal_request(&engine, Instant::now() + Duration::from_secs(5));
+    let receipt = engine.terminal(request.clone());
+    task3_cleanup(&probe.owner, 8);
+    let open = OpenReceipt {
+        completed_writes: OpenWriteFrontier::Target,
+        outcome: OpenOutcome::Completed,
+        ..OpenReceipt::pending(receipt.owner_epoch, &open_request(1))
+    };
+    let forged = mutate_terminal(&receipt, |d| {
+        d.resolved_open = Some(open);
+        mutate_inventory(d, |i| i.resolved_open = Some(open));
+    });
+    assert_eq!(
+        forged.resolved_open,
+        forged.inventory.as_ref().unwrap().resolved_open
+    );
+    assert_eq!(
+        validate_terminal(&request, &forged),
+        Err(ReceiptFailure::Frontier),
+        "mutually consistent Completed Open has no actual operation"
+    );
+    for outcome in [OpenOutcome::Unknown, OpenOutcome::Failed] {
+        let pending = PendingCommandId {
+            seq: open.seq,
+            operation: CountOperation::Generation,
+        };
+        let mut expected = request.clone();
+        expected.frontier.pending = Some(pending);
+        let forged = mutate_terminal(&receipt, |d| {
+            let open = OpenReceipt {
+                outcome,
+                completed_writes: OpenWriteFrontier::NoWrites,
+                ..open
+            };
+            d.resolved_open = Some(open);
+            mutate_inventory(d, |i| {
+                i.pending = Some(pending);
+                i.resolved_open = Some(open);
+            });
+        });
+        assert_eq!(
+            validate_terminal(&expected, &forged),
+            Err(ReceiptFailure::Frontier),
+            "pending non-Open cannot explain {outcome:?}"
+        );
+    }
+}
+
+#[test]
+fn g1_terminal_completed_open_lost_reply_keeps_actual_open_completion() {
+    for prior_ack in [false, true] {
+        let probe = MapProbe::new();
+        let (engine, _) = terminal_engine(&probe, None, TerminalFaults::default());
+        if prior_ack {
+            engine.attach(attach_request(1, 1)).unwrap();
+        }
+        let open = open_request(if prior_ack { 2 } else { 1 });
+        {
+            let mut state = locked(&engine.shared.state);
+            state.last_command_seq = Some(open.seq);
+            state.frontier.pending = Some(PendingCommandId {
+                seq: open.seq,
+                operation: CountOperation::Open,
+            });
+            state.pending_open = Some(open);
+            state.resolved_open = Some(OpenReceipt::pending(engine.ready.owner_epoch, &open));
+            assert!(
+                state
+                    .ordinary
+                    .publish_request(OwnerRequest::Open(open))
+                    .is_ok()
+            );
+        }
+        engine.shared.worker.get().unwrap().unpark();
+        {
+            let cutoff = Instant::now() + Duration::from_secs(3);
+            let mut state = locked(&engine.shared.state);
+            while state.ordinary.reply.is_none() {
+                let remaining = cutoff.saturating_duration_since(Instant::now());
+                assert!(!remaining.is_zero());
+                state = engine
+                    .shared
+                    .changed
+                    .wait_timeout(state, remaining)
+                    .unwrap()
+                    .0;
+            }
+        }
+        let request = terminal_request(&engine, Instant::now() + Duration::from_secs(5));
+        let receipt = engine.terminal(request.clone());
+        assert_eq!(receipt.last_command_seq, Some(open.seq));
+        assert_eq!(
+            receipt.inventory.as_ref().unwrap().last_completed,
+            Some(PendingCommandId {
+                seq: open.seq,
+                operation: CountOperation::Open
+            })
+        );
+        assert_eq!(
+            receipt.resolved_open.unwrap().outcome,
+            OpenOutcome::Completed
+        );
+        assert_eq!(
+            receipt.resolved_open.unwrap().completed_writes,
+            OpenWriteFrontier::Target
+        );
+        assert_eq!(
+            request.frontier.last_acked,
+            prior_ack.then(|| CommandSeq::checked(1).unwrap())
+        );
+        assert!(matches!(receipt.writers, WriterCompletion::Finished(_)));
+        assert_eq!(validate_terminal(&request, &receipt), Ok(()));
+        task3_cleanup(&probe.owner, if prior_ack { 10 } else { 8 });
+    }
+}
+
+#[test]
+fn g1_terminal_close_progress_with_invalid_inventory_does_not_panic() {
+    let probe = MapProbe::new();
+    let (engine, _) = terminal_engine(
+        &probe,
+        None,
+        TerminalFaults {
+            close: Faults {
+                hold_close: Some(1),
+                ..Faults::default()
+            },
+            ..TerminalFaults::default()
+        },
+    );
+    let id = engine.attach(attach_request(1, 1)).unwrap().value.links[0].id();
+    // Contradict the actual journal without creating, aliasing or losing an FD.
+    locked(&engine.shared.state).frontier.last_acked = Some(CommandSeq::checked(2).unwrap());
+    let request = terminal_request(&engine, Instant::now() + Duration::from_millis(150));
+    let result = thread::scope(|scope| {
+        let posted = request.clone();
+        let owner = &engine;
+        let task = scope.spawn(move || owner.terminal(posted));
+        probe
+            .owner
+            .wait(|events| events.iter().any(|(_, e)| matches!(e, Event::EnterClose)));
+        task.join()
+    });
+    probe.owner.release();
+    task3_cleanup(&probe.owner, 10);
+    assert!(result.is_ok(), "invalid inventory made the fallback panic");
+    let receipt = result.unwrap();
+    assert!(receipt.inventory.is_none());
+    assert!(matches!(receipt.writers, WriterCompletion::Unknown(_)));
+    assert_eq!(receipt.close_outcomes[0].id, id);
+    assert_eq!(receipt.close_outcomes[0].state, ResourceState::CloseIssued);
+    assert_eq!(
+        receipt.failures.operations[CountOperation::Close as usize]
+            .unwrap()
+            .class,
+        FailureClass::Inventory
+    );
+    assert!(validate_terminal(&request, &receipt).is_err());
 }
