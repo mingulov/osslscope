@@ -2359,7 +2359,13 @@ fn r20fix_kernel_lifecycle_witnesses_real_fork_exec_exit() {
     )
     .unwrap();
     let pid = t.pid();
-    let mut lc = match KernelLifecycle::subscribe(pid, false) {
+    let mut lc = match KernelLifecycle::subscribe(
+        pid,
+        false,
+        &osslscope::count_session::CountForkBarrier::new()
+            .prefix_permit(Instant::now())
+            .unwrap(),
+    ) {
         Ok(lc) => lc,
         Err(e) => {
             let _ = t.resolve_setup_failure();
@@ -2409,7 +2415,22 @@ fn r20fix_kernel_lifecycle_witnesses_real_fork_exec_exit() {
     assert_eq!(dropped, 0, "no kernel drops on a quiet window");
     assert_eq!(prefix_unwitnessed, 0, "no prefix gaps on a quiet window");
     // Close drain: witnessed, complete, still lossless.
-    let tail = lc.close_drain().expect("kernel close witness");
+    let close = lc.close_drain(
+        osslscope::capture::LifecycleEdge {
+            start_ns: 0,
+            end_ns: u64::MAX,
+        },
+        Some(
+            &osslscope::count_session::CountForkBarrier::new()
+                .prefix_permit(Instant::now())
+                .unwrap(),
+        ),
+    );
+    assert!(
+        close.suffix_witness,
+        "the actual terminal watermark must witness closure"
+    );
+    let tail = close.delta.expect("kernel close witness");
     assert_eq!(tail.pending, 0, "close drain must reach the tail");
     assert_eq!(tail.loss, 0);
     assert_eq!(tail.dropped, 0);
@@ -2552,8 +2573,22 @@ fn kernel_unsubscribe_is_accepted_live() {
     if !require_clean_connector("kernel_unsubscribe_is_accepted_live") {
         return;
     }
-    let holder = KernelLifecycle::subscribe(std::process::id(), true).expect("holder subscribe");
-    let mut lc = KernelLifecycle::subscribe(std::process::id(), true).expect("subscribe");
+    let holder = KernelLifecycle::subscribe(
+        std::process::id(),
+        true,
+        &osslscope::count_session::CountForkBarrier::new()
+            .prefix_permit(Instant::now())
+            .unwrap(),
+    )
+    .expect("holder subscribe");
+    let mut lc = KernelLifecycle::subscribe(
+        std::process::id(),
+        true,
+        &osslscope::count_session::CountForkBarrier::new()
+            .prefix_permit(Instant::now())
+            .unwrap(),
+    )
+    .expect("subscribe");
     assert_ne!(
         holder.ack_token(),
         lc.ack_token(),
@@ -2577,7 +2612,14 @@ fn kernel_unsubscribe_is_accepted_live() {
     }
     lc.unsubscribe().expect("repeat unsubscribe sends");
     drop(lc);
-    let resub = KernelLifecycle::subscribe(std::process::id(), true).expect("resubscribe works");
+    let resub = KernelLifecycle::subscribe(
+        std::process::id(),
+        true,
+        &osslscope::count_session::CountForkBarrier::new()
+            .prefix_permit(Instant::now())
+            .unwrap(),
+    )
+    .expect("resubscribe works");
     drop(resub);
     drop(holder);
 }
@@ -2600,7 +2642,14 @@ fn kernel_live_target_first_sighting_gaps_prefix() {
     if !require_connector("kernel_live_target_first_sighting_gaps_prefix") {
         return;
     }
-    let mut lc = KernelLifecycle::subscribe(std::process::id(), true).expect("subscribe live");
+    let mut lc = KernelLifecycle::subscribe(
+        std::process::id(),
+        true,
+        &osslscope::count_session::CountForkBarrier::new()
+            .prefix_permit(Instant::now())
+            .unwrap(),
+    )
+    .expect("subscribe live");
     // Deterministic traffic: our own short-lived child (FORK +
     // EXIT, kernel-queued — no scheduling race).
     let child = unsafe { libc::fork() };
@@ -2664,7 +2713,14 @@ fn kernel_subscribe_watermarks_all_cpus_pre_activity() {
     )
     .unwrap();
     let pid = t.pid();
-    let mut lc = KernelLifecycle::subscribe(pid, false).expect("subscribe stopped");
+    let mut lc = KernelLifecycle::subscribe(
+        pid,
+        false,
+        &osslscope::count_session::CountForkBarrier::new()
+            .prefix_permit(Instant::now())
+            .unwrap(),
+    )
+    .expect("subscribe stopped");
     let (sought, seen) = lc.watermark_status().expect("initial watermark ran");
     assert_eq!(
         sought, online,
@@ -2700,9 +2756,31 @@ fn kernel_close_drain_establishes_terminal_watermark() {
     // `sought` counts created helpers, so seen==sought alone
     // would mask a shortfalled terminal burst.
     let online = r20_online_cpu_count();
-    let mut lc = KernelLifecycle::subscribe(std::process::id(), true).expect("subscribe");
+    let mut lc = KernelLifecycle::subscribe(
+        std::process::id(),
+        true,
+        &osslscope::count_session::CountForkBarrier::new()
+            .prefix_permit(Instant::now())
+            .unwrap(),
+    )
+    .expect("subscribe");
     let _ = lc.poll();
-    let tail = lc.close_drain().expect("kernel close witness");
+    let close = lc.close_drain(
+        osslscope::capture::LifecycleEdge {
+            start_ns: 0,
+            end_ns: u64::MAX,
+        },
+        Some(
+            &osslscope::count_session::CountForkBarrier::new()
+                .prefix_permit(Instant::now())
+                .unwrap(),
+        ),
+    );
+    assert!(
+        close.suffix_witness,
+        "the actual terminal watermark must witness closure"
+    );
+    let tail = close.delta.expect("kernel close witness");
     assert_eq!(tail.pending, 0, "close drain must reach the tail");
     let (sought, seen) = lc.watermark_status().expect("terminal watermark ran");
     assert_eq!(
@@ -3321,7 +3399,13 @@ fn helper_userns_subscribe_probe() {
                 45 // unexpected: the timeout path is unverified here
             }
         } else {
-            match osslscope::capture::KernelLifecycle::subscribe(std::process::id(), true) {
+            match osslscope::capture::KernelLifecycle::subscribe(
+                std::process::id(),
+                true,
+                &osslscope::count_session::CountForkBarrier::new()
+                    .prefix_permit(Instant::now())
+                    .unwrap(),
+            ) {
                 Ok(_) => 43, // namespace silence NOT observed — real failure
                 Err(e) => {
                     // MINOR-B: only the TIMEOUT proves the
@@ -3481,4 +3565,106 @@ fn r18_abandoned_setup_never_hangs_caller() {
         "names the bound: {msg}"
     );
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn g1_inherited_cloexec_reference_keeps_pipe_live_until_release_and_reap() {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    fn pipe(flags: i32) -> (OwnedFd, OwnedFd) {
+        let mut pair = [-1; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(pair.as_mut_ptr(), flags | libc::O_CLOEXEC) },
+            0
+        );
+        unsafe { (OwnedFd::from_raw_fd(pair[0]), OwnedFd::from_raw_fd(pair[1])) }
+    }
+    struct ExactChild(Option<libc::pid_t>);
+    impl ExactChild {
+        fn reap(&mut self) -> i32 {
+            let pid = self.0.unwrap();
+            let mut status = 0;
+            loop {
+                let r = unsafe { libc::waitpid(pid, &mut status, 0) };
+                if r == pid {
+                    self.0 = None;
+                    return status;
+                }
+                let error = std::io::Error::last_os_error().raw_os_error();
+                if r < 0 && error == Some(libc::EINTR) {
+                    continue;
+                }
+                if r < 0 && error == Some(libc::ECHILD) {
+                    self.0 = None;
+                }
+                panic!("exact child reap failed: {error:?}");
+            }
+        }
+    }
+    impl Drop for ExactChild {
+        fn drop(&mut self) {
+            if let Some(pid) = self.0 {
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+                let mut status = 0;
+                loop {
+                    let r = unsafe { libc::waitpid(pid, &mut status, 0) };
+                    if r == pid
+                        || (r < 0
+                            && std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR))
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    let (read, write) = pipe(libc::O_NONBLOCK);
+    let (release_read, release_write) = pipe(0);
+    assert_ne!(
+        unsafe { libc::fcntl(write.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+        0
+    );
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0, "host fork failed");
+    if pid == 0 {
+        // Only async-signal-safe syscalls in the raw fork child. No exec:
+        // this intentionally violates the production reference invariant.
+        unsafe {
+            libc::close(read.as_raw_fd());
+            libc::close(release_write.as_raw_fd());
+            let mut byte = 0u8;
+            loop {
+                let r = libc::read(release_read.as_raw_fd(), (&mut byte as *mut u8).cast(), 1);
+                if r >= 0 {
+                    break;
+                }
+                if *libc::__errno_location() != libc::EINTR {
+                    libc::_exit(2);
+                }
+            }
+            libc::close(write.as_raw_fd());
+            libc::close(release_read.as_raw_fd());
+            libc::_exit(0);
+        }
+    }
+    let mut child = ExactChild(Some(pid));
+    drop(write);
+    drop(release_read);
+    let mut byte = 0u8;
+    let first = unsafe { libc::read(read.as_raw_fd(), (&mut byte as *mut u8).cast(), 1) };
+    let first_errno = std::io::Error::last_os_error().raw_os_error();
+    assert_eq!(first, -1, "parent close is not reference finality");
+    assert_eq!(first_errno, Some(libc::EAGAIN));
+    drop(release_write); // EOF releases only the exact owned helper.
+    let status = child.reap();
+    assert!(libc::WIFEXITED(status));
+    assert_eq!(libc::WEXITSTATUS(status), 0);
+    assert_eq!(
+        unsafe { libc::read(read.as_raw_fd(), (&mut byte as *mut u8).cast(), 1) },
+        0,
+        "after helper release/reap the final reference is gone"
+    );
+    drop(read);
+    assert_reaped_no_zombie(pid as u32);
 }

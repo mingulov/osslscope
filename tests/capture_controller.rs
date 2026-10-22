@@ -102,6 +102,8 @@ struct SharedState {
     /// Fake-clock instant of `close_window` (R20 count-close
     /// barrier control: reap must precede this for owned exits).
     closed_at: Option<u64>,
+    terminal_delay_ns: u64,
+    refuse_suffix: bool,
 }
 
 #[derive(Clone)]
@@ -165,12 +167,17 @@ impl CountBackend for SharedBackend {
         st.log.push("count_closed".into());
         st.closed_at = Some(self.clock.monotonic_ns());
         self.order.borrow_mut().push("count_closed".into());
-        st.backend.terminal(request)
+        let terminal = st.backend.terminal(request);
+        self.clock.advance_ns(st.terminal_delay_ns);
+        terminal
     }
     fn progress(&self) -> Option<RawCheckpoint> {
         self.shared.borrow().backend.progress()
     }
     fn fork_permit(&self, deadline: Instant) -> Result<CountForkPermit<'_>, ForkBlocked> {
+        if self.shared.borrow().refuse_suffix {
+            return Err(ForkBlocked::Unresolved);
+        }
         self.barrier.prefix_permit(deadline)
     }
 }
@@ -443,6 +450,7 @@ struct FakeLifecycle {
     /// deadline mid-round (production scans take real time).
     clock: Option<Rc<FakeClock>>,
     advance_ns: u64,
+    order: Option<Rc<RefCell<Vec<String>>>>,
 }
 
 impl LifecyclePort for FakeLifecycle {
@@ -457,8 +465,29 @@ impl LifecyclePort for FakeLifecycle {
         self.fallback
     }
 
-    fn close_drain(&mut self) -> Option<LifecycleDelta> {
-        self.close_drain.clone()
+    fn timing_trust(&self) -> osslscope::capture::LifecycleTimingTrust {
+        osslscope::capture::LifecycleTimingTrust::ReviewedMonotonic
+    }
+
+    fn close_drain(
+        &mut self,
+        _edge: osslscope::capture::LifecycleEdge,
+        permit: Option<&CountForkPermit<'_>>,
+    ) -> osslscope::capture::LifecycleClose {
+        if let Some(order) = &self.order {
+            order.borrow_mut().push(
+                if permit.is_some() {
+                    "lifecycle_suffix"
+                } else {
+                    "lifecycle_prefix"
+                }
+                .into(),
+            );
+        }
+        osslscope::capture::LifecycleClose {
+            delta: self.close_drain.clone(),
+            suffix_witness: permit.is_some() && self.close_drain.is_some(),
+        }
     }
 }
 
@@ -1067,6 +1096,7 @@ impl Harness {
             close_drain: self.lifecycle_close_drain,
             clock: Some(self.clock.clone()),
             advance_ns: self.lifecycle_advance_ns,
+            order: Some(self.order.clone()),
         };
         let mut proc = FakeProc {
             clock: self.clock.clone(),
@@ -2943,10 +2973,12 @@ fn lifecycle_exec_is_fence_tracked_not_ignored() {
             LifecycleEvent {
                 kind: LifecycleKind::Fork,
                 pid: 99991,
+                timestamp_ns: Some(BASE_NS + 1),
             },
             LifecycleEvent {
                 kind: LifecycleKind::Exec,
                 pid: PID,
+                timestamp_ns: Some(BASE_NS + 1),
             },
         ],
         loss: 0,
@@ -5845,6 +5877,7 @@ fn live_observe_inner(
         close_drain: None,
         clock: None,
         advance_ns: 0,
+        order: None,
     };
     let mut files = HashMap::new();
     files.insert(
@@ -6805,6 +6838,7 @@ fn lifecycle_close_drain_folds_after_owned_exit() {
         events: vec![LifecycleEvent {
             kind: LifecycleKind::Fork,
             pid: 99991,
+            timestamp_ns: Some(BASE_NS + 1),
         }],
         loss: 0,
         dropped: 0,
@@ -7136,6 +7170,7 @@ fn lifecycle_exec_witness_fences_without_snapshot_change() {
             events: vec![LifecycleEvent {
                 kind: LifecycleKind::Exec,
                 pid: PID,
+                timestamp_ns: Some(BASE_NS + 1),
             }],
             loss: 0,
             dropped: 0,
@@ -7203,6 +7238,7 @@ fn lifecycle_close_drain_exec_withholds_complete() {
         events: vec![LifecycleEvent {
             kind: LifecycleKind::Exec,
             pid: PID,
+            timestamp_ns: Some(BASE_NS + 1),
         }],
         loss: 0,
         dropped: 0,
@@ -7965,9 +8001,10 @@ fn count_close_reap_precedes_drain_for_owned_exit() {
             "count_open".to_string(),
             "released".to_string(),
             "reaped".to_string(),
-            "count_closed".to_string()
+            "count_closed".to_string(),
+            "lifecycle_suffix".to_string()
         ],
-        "count programs before release; reap strictly precedes count close"
+        "count programs before release; reap precedes count close, then lifecycle suffix"
     );
     assert!(reap < closed);
 }
@@ -8212,9 +8249,17 @@ impl<L: LifecyclePort> LifecyclePort for SpyLifecycle<L> {
         self.inner.fallback_partial()
     }
 
-    fn close_drain(&mut self) -> Option<LifecycleDelta> {
-        let d = self.inner.close_drain();
-        if let Some(x) = &d {
+    fn timing_trust(&self) -> osslscope::capture::LifecycleTimingTrust {
+        self.inner.timing_trust()
+    }
+
+    fn close_drain(
+        &mut self,
+        edge: osslscope::capture::LifecycleEdge,
+        permit: Option<&CountForkPermit<'_>>,
+    ) -> osslscope::capture::LifecycleClose {
+        let d = self.inner.close_drain(edge, permit);
+        if let Some(x) = &d.delta {
             self.deltas.borrow_mut().push(x.clone());
         }
         d
@@ -8297,7 +8342,13 @@ fn ordinary_production_capture_genuinely_observed_sleep_is_honest_noquery() {
             order: Rc::new(RefCell::new(Vec::new())),
         },
     );
-    let lifecycle = LiveLifecycle::select(pid, false);
+    let lifecycle = LiveLifecycle::select(
+        pid,
+        false,
+        &CountForkBarrier::new()
+            .prefix_permit(Instant::now())
+            .unwrap(),
+    );
     assert!(
         !lifecycle.fallback_partial(),
         "ordinary window must select kernel signals, not the PARTIAL fallback"
@@ -8363,12 +8414,24 @@ fn ordinary_production_capture_genuinely_observed_sleep_is_honest_noquery() {
     // exited mid-window and was reaped before count close, so the
     // discovery tail join is skipped explicitly per the
     // exited-and-reaped design). Nothing else: in particular no
-    // polling fallback, no ignored activity, no exec/prefix/
-    // terminal gaps, no late attach, no over-budget.
+    // polling fallback, no definite ignored activity, no exec/prefix/
+    // terminal gaps, no late attach, no over-budget. The unreviewed
+    // producer clock retains the actual Exec as timing uncertainty.
     assert_eq!(
         c.reasons,
-        vec!["discovery-loss".to_string(), "no-query".to_string()],
+        vec![
+            "discovery-loss".to_string(),
+            "fork-exec-ignored".to_string(),
+            "no-query".to_string()
+        ],
         "exact honest reason set: {c:?}"
+    );
+    assert!(
+        c.document
+            .counters
+            .iter()
+            .any(|counter| counter.name == "lifecycle.scan_loss" && counter.value > 0),
+        "unreviewed producer clock must remain uncertain"
     );
     assert_eq!(c.document.total_calls(), 0, "genuine zero calls: {c:?}");
     assert_eq!(c.child_exit, Some(0));
@@ -8444,6 +8507,7 @@ fn exec_witness_consumed_before_deadline_return_survives_to_close() {
         events: vec![LifecycleEvent {
             kind: LifecycleKind::Exec,
             pid: PID,
+            timestamp_ns: Some(BASE_NS + 1),
         }],
         loss: 0,
         dropped: 0,
@@ -8505,6 +8569,7 @@ fn exec_witness_consumed_before_signal_cut_survives_to_close() {
         events: vec![LifecycleEvent {
             kind: LifecycleKind::Exec,
             pid: PID,
+            timestamp_ns: Some(BASE_NS + 1),
         }],
         loss: 0,
         dropped: 0,
@@ -9354,5 +9419,153 @@ fn refusal_diagnostics_unstatable_path_falls_back_to_zero_zero() {
         *entry,
         format!("dev=0 ino=0 kind=file_too_large bytes=0 allowance={budget}"),
         "unstatable path falls back to (0, 0): {entry:?}"
+    );
+}
+
+#[test]
+fn g1_initial_terminal_suffix_follows_count_cleanup() {
+    let mut h = Harness::fresh("g1-suffix-order");
+    h.exit_at_ns = Some(BASE_NS + 100_000_000);
+    let (result, post) = h.run();
+    result.expect("ordinary capture");
+    let log = post.order.borrow();
+    let count = log
+        .iter()
+        .position(|s| s == "count_closed")
+        .expect("count close");
+    let suffix = log
+        .iter()
+        .position(|s| s == "lifecycle_suffix")
+        .expect("suffix attempt");
+    assert!(
+        count < suffix,
+        "count cleanup must precede lifecycle suffix: {log:?}"
+    );
+}
+
+#[test]
+fn g1_terminal_lifecycle_uses_original_half_open_edge() {
+    let mut h = Harness::fresh("g1-original-edge");
+    h.cfg.duration = Duration::from_secs(1);
+    h.shared.borrow_mut().terminal_delay_ns = 400_000_000;
+    h.lifecycle_close_drain = Some(LifecycleDelta {
+        events: [
+            Some(BASE_NS + 900_000_000),
+            Some(BASE_NS + 1_000_000_000),
+            Some(BASE_NS + 1_300_000_000),
+            None,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, timestamp_ns)| LifecycleEvent {
+            kind: LifecycleKind::Fork,
+            pid: 6000 + i as u32,
+            timestamp_ns,
+        })
+        .collect(),
+        ..LifecycleDelta::default()
+    });
+    let (result, _) = h.run();
+    let capture = result.unwrap();
+    let value = |name: &str| {
+        capture
+            .document
+            .counters
+            .iter()
+            .find(|c| c.name == name)
+            .map(|c| c.value)
+            .unwrap_or(0)
+    };
+    assert_eq!(
+        value("lifecycle.fork_exec_ignored"),
+        1,
+        "only the original half-open interval is positive"
+    );
+    assert_eq!(
+        value("lifecycle.scan_loss"),
+        1,
+        "untimed arrivals remain uncertain"
+    );
+    assert_eq!(
+        capture.document.window.effective_end_ns,
+        BASE_NS + 1_000_000_000
+    );
+}
+
+#[test]
+fn g1_terminal_refused_suffix_keeps_lifecycle_prefix() {
+    let mut h = Harness::fresh("g1-refused-suffix");
+    h.shared.borrow_mut().refuse_suffix = true;
+    h.exit_at_ns = Some(BASE_NS + 100_000_000);
+    h.lifecycle_close_drain = Some(LifecycleDelta {
+        events: vec![LifecycleEvent {
+            kind: LifecycleKind::Fork,
+            pid: 6000,
+            timestamp_ns: Some(BASE_NS + 1),
+        }],
+        loss: 2,
+        dropped: 3,
+        prefix_unwitnessed: 4,
+        pending: 1,
+    });
+    let (result, post) = h.run();
+    let c = result.unwrap();
+    let value = |name: &str| {
+        c.document
+            .counters
+            .iter()
+            .find(|c| c.name == name)
+            .map(|c| c.value)
+            .unwrap_or(0)
+    };
+    assert_eq!(value("lifecycle.fork_exec_ignored"), 1);
+    assert_eq!(value("lifecycle.scan_loss"), 2);
+    assert_eq!(value("lifecycle.signal_dropped"), 3);
+    assert_eq!(value("lifecycle.signal_prefix_unwitnessed"), 4);
+    assert_eq!(value("lifecycle.drain_pending"), 1);
+    assert_eq!(value("lifecycle.no_witness"), 1);
+    let log = post.order.borrow();
+    assert!(!log.iter().any(|s| s == "lifecycle_suffix"), "{log:?}");
+    assert_eq!(log.iter().filter(|s| *s == "lifecycle_prefix").count(), 1);
+}
+
+#[test]
+fn g1_terminal_execs_never_reopen_count_generation() {
+    let mut h = Harness::fresh("g1-terminal-exec");
+    h.cfg.duration = Duration::from_secs(1);
+    h.lifecycle_close_drain = Some(LifecycleDelta {
+        events: [
+            Some(BASE_NS + 900_000_000),
+            Some(BASE_NS + 1_000_000_000),
+            Some(BASE_NS + 1_300_000_000),
+            None,
+        ]
+        .into_iter()
+        .map(|timestamp_ns| LifecycleEvent {
+            kind: LifecycleKind::Exec,
+            pid: PID,
+            timestamp_ns,
+        })
+        .collect(),
+        ..LifecycleDelta::default()
+    });
+    let (result, post) = h.run();
+    let c = result.unwrap();
+    let value = |name: &str| {
+        c.document
+            .counters
+            .iter()
+            .find(|c| c.name == name)
+            .map(|c| c.value)
+            .unwrap_or(0)
+    };
+    assert_eq!(value("lifecycle.exec_gap"), 1);
+    assert_eq!(value("lifecycle.scan_loss"), 1);
+    let shared = post.shared.borrow();
+    let terminal = shared.log.iter().position(|s| s == "count_closed").unwrap();
+    assert!(
+        !shared.log[terminal..].iter().any(|s| s.starts_with("gen:")),
+        "{:?}",
+        shared.log
     );
 }

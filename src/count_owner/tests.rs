@@ -2533,6 +2533,7 @@ enum Event {
     PinClose,
     PinCloseResult(Option<i32>),
     BeforeOpenWrite,
+    SuffixFork,
 }
 struct InvocationLog {
     events: Vec<(ThreadId, Event)>,
@@ -8731,4 +8732,132 @@ fn g1_panic_disconnect_retains_one_owner_unknown_create_is_stranded() {
         &receipt.0,
         &engine.salvage_view(ticket.terminal_id).0
     ));
+}
+
+#[test]
+fn g1_fork_barrier_covers_all_count_resources() {
+    struct ReleaseOnDrop(Arc<Probe>);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+    for (held_close, expected) in [
+        (1, None),
+        (2, Some(ResourceId::Pin(0))),
+        (3, Some(ResourceId::Program)),
+        (4, Some(ResourceId::Map(CountMap::Counts))),
+    ] {
+        let probe = MapProbe::new();
+        let (engine, _) = terminal_engine(
+            &probe,
+            None,
+            TerminalFaults {
+                close: Faults {
+                    hold_close: Some(held_close),
+                    ..Faults::default()
+                },
+                ..TerminalFaults::default()
+            },
+        );
+        let attached = engine.attach(attach_request(1, 1)).unwrap();
+        let expected = expected.unwrap_or(ResourceId::Link(attached.value.links[0].id()));
+        let request = terminal_request(&engine, Instant::now() + Duration::from_secs(5));
+        thread::scope(|scope| {
+            let release = ReleaseOnDrop(Arc::clone(&probe.owner));
+            let terminal = scope.spawn(|| engine.terminal(request));
+            probe.owner.wait(|events| {
+                events
+                    .iter()
+                    .filter(|(_, e)| matches!(e, Event::EnterClose))
+                    .count()
+                    == held_close
+            });
+            assert!(
+                engine
+                    .resource_summary()
+                    .resources
+                    .iter()
+                    .any(|r| r.resource == expected && r.state == ResourceState::CloseIssued)
+            );
+            // The injected suffix operation is never entered on refusal.
+            for _ in 0..2 {
+                if let Ok(_permit) = engine.fork_permit(Instant::now()) {
+                    probe.owner.event(Event::SuffixFork);
+                }
+            }
+            assert!(
+                !probe
+                    .owner
+                    .log
+                    .lock()
+                    .unwrap()
+                    .events
+                    .iter()
+                    .any(|(_, e)| matches!(e, Event::SuffixFork)),
+                "suffix while {expected:?} unresolved"
+            );
+            drop(release);
+            terminal.join().unwrap();
+        });
+        task3_cleanup(&probe.owner, 10);
+        let _permit = engine
+            .fork_permit(Instant::now() + Duration::from_secs(3))
+            .unwrap();
+        assert!(engine.resource_summary().cleanup_complete);
+        probe.owner.event(Event::SuffixFork);
+        let log = probe.owner.log.lock().unwrap();
+        let all_checked = log
+            .events
+            .iter()
+            .rposition(|(_, e)| matches!(e, Event::Registry(RegistryEvent::CloseReturned(_))))
+            .unwrap();
+        let suffix = log
+            .events
+            .iter()
+            .position(|(_, e)| matches!(e, Event::SuffixFork))
+            .unwrap();
+        assert!(all_checked < suffix, "{expected:?}: {:?}", log.events);
+    }
+}
+
+#[test]
+fn g1_prefix_permit_survives_owned_fork_and_excludes_owner_acquisition() {
+    let barrier = Arc::new(CountForkBarrier::new());
+    let permit = barrier.prefix_permit(Instant::now()).unwrap();
+    let mut child = crate::target::OwnedTarget::spawn_stopped(
+        &["/bin/true".to_string()],
+        crate::target::WorkloadDest::Null,
+    )
+    .unwrap();
+    let probe = Probe::new();
+    let failed = injected(
+        Arc::clone(&probe),
+        Faults::default(),
+        Arc::clone(&barrier),
+        Instant::now() + Duration::from_millis(20),
+        PrepareHooks::host(),
+    );
+    child.resolve_setup_failure().unwrap();
+    assert!(failed.is_err());
+    assert!(
+        !probe
+            .log
+            .lock()
+            .unwrap()
+            .events
+            .iter()
+            .any(|(_, e)| matches!(e, Event::Started | Event::EnterAcquire(_)))
+    );
+    drop(permit);
+    let engine = injected(
+        Arc::clone(&probe),
+        Faults::default(),
+        barrier,
+        Instant::now() + Duration::from_secs(3),
+        PrepareHooks::host(),
+    )
+    .unwrap();
+    engine.abandon();
+    task3_cleanup(&probe, 8);
 }
