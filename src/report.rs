@@ -334,42 +334,15 @@ pub fn run(argv: &[String]) -> ExitCode {
             ..
         }
     );
-    let c = match capture::run(&args.cfg, args.target) {
-        Ok(c) => c,
-        Err(e) => {
-            // F-E/B4: setup/environment failures still attempt
-            // every requested artifact from a typed no-evidence
-            // document instead of returning with nothing written.
-            err_line(&format!("osslscope report: {e:#}"));
-            err_line("osslscope report: run 'osslscope doctor' to diagnose environment failures");
-            let document =
-                setup_failure_document(FatalKind::Environment(bound_line(&format!("{e:#}"))));
-            let delivery = write_artifacts(&document, &req);
-            emit_diagnostics(&delivery);
-            return ExitCode::from(exit_for(
-                crate::policy::PolicyOutcome::NoVerdict,
-                None,
-                &document,
-                &delivery,
-            ));
-        }
-    };
-    let delivery = write_artifacts(&c.document, &req);
-    emit_diagnostics(&delivery);
-    // H9/R07 T4: nonzero child exit with discarded output → one
-    // diagnostic line (exit + re-run hint, never workload bytes).
-    if let Some(hint) = workload_hint(c.child_exit, workload_discarded) {
-        err_line(&hint);
-    }
-    // F-E/B3: report resolves through the shared exit table (fatal
-    // capture maps to no-verdict so it dominates at 4).
-    let outcome = match &c.outcome {
-        capture::Outcome::Fatal(_) => crate::policy::PolicyOutcome::NoVerdict,
-        capture::Outcome::Partial | capture::Outcome::Complete => {
-            crate::policy::PolicyOutcome::Pass
-        }
-    };
-    ExitCode::from(exit_for(outcome, c.child_exit, &c.document, &delivery))
+    ExitCode::from(
+        consume_capture_result(
+            capture::run(&args.cfg, args.target),
+            CaptureCommand::Report,
+            &req,
+            workload_discarded,
+        )
+        .exit_code,
+    )
 }
 
 // ---------------------------------------------------------------- v2 output
@@ -444,6 +417,356 @@ impl DeliveryResult {
     /// True when every requested artifact was delivered.
     pub fn delivered_all(&self) -> bool {
         !self.failed()
+    }
+}
+
+/// The presentation and policy requested for a single capture result.
+#[derive(Clone, Copy)]
+pub enum CaptureCommand<'a> {
+    Report,
+    Check {
+        rules: &'a [crate::policy::PolicyRule],
+    },
+}
+
+pub struct CaptureCommandResult {
+    pub document: CaptureDocument,
+    pub child_exit: Option<i32>,
+    pub disposition: Option<crate::target::TargetDisposition>,
+    pub delivery: DeliveryResult,
+    pub exit_code: u8,
+    pub diagnostics: Vec<String>,
+    pub failure_context: Option<std::sync::Arc<capture::CaptureFailureContext>>,
+}
+
+pub fn consume_capture_result(
+    result: anyhow::Result<capture::Capture>,
+    command: CaptureCommand<'_>,
+    request: &OutputRequest,
+    workload_discarded: bool,
+) -> CaptureCommandResult {
+    consume_capture_result_with_diagnostics(
+        result,
+        command,
+        request,
+        workload_discarded,
+        &mut std::io::stderr().lock(),
+    )
+}
+
+/// Retained failures are recovered through anyhow context before the bounded
+/// unknown-error fallback. No capture/custody operation is performed here.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "exact typed consumer interface; retained terminal images stay Arc shared"
+)]
+pub enum CaptureFailureClass {
+    NoObservation(capture::PreObservationFailure),
+    Runtime(capture::CaptureRuntimeFailure),
+    UntypedSetup { detail: String },
+}
+
+pub fn classify_capture_failure(error: anyhow::Error) -> CaptureFailureClass {
+    let error = match error.downcast::<capture::PreObservationFailure>() {
+        Ok(failure) => return CaptureFailureClass::NoObservation(failure),
+        Err(error) => error,
+    };
+    match error.downcast::<capture::CaptureRuntimeFailure>() {
+        Ok(failure) => CaptureFailureClass::Runtime(failure),
+        Err(error) => CaptureFailureClass::UntypedSetup {
+            detail: normalize_fatal_detail(&format!("{error:#}")),
+        },
+    }
+}
+
+/// The zero window means that no requested observation scope was established.
+/// Rejected count images remain in the separate typed failure context.
+pub fn no_observation_document(failure: &capture::PreObservationFailure) -> CaptureDocument {
+    use crate::evidence::{
+        CaptureWindow, FinalizeInput, GapCounter, LegacyCallPartition, OpensslVersion, finalize,
+    };
+    let actual = failure
+        .failure
+        .clone()
+        .or_else(|| failure.custody.failure.clone())
+        .or_else(|| failure.count.actual_failure());
+    let mut counters = match &failure.count {
+        capture::PreObservationCount::Terminal(t) => t
+            .retained_drain
+            .counters
+            .iter()
+            .filter(|c| {
+                c.kind == CounterKind::Loss
+                    && matches!(c.units, CounterUnits::Events | CounterUnits::Probes)
+            })
+            .cloned()
+            .collect::<Vec<_>>(),
+        _ => Vec::new(),
+    };
+    counters.push(GapCounter {
+        name: "capture.no_observation".into(),
+        kind: CounterKind::Loss,
+        units: CounterUnits::Events,
+        source: CounterSource::Setup,
+        value: 1,
+    });
+    let mut document = finalize(FinalizeInput {
+        window: CaptureWindow {
+            requested_start_ns: 0,
+            requested_end_ns: 0,
+            effective_start_ns: 0,
+            effective_end_ns: 0,
+            signal_cut: failure.cause == capture::PreObservationCause::Cancelled,
+            count_admission: None,
+        },
+        sites: Vec::new(),
+        fenced: Vec::new(),
+        objects: Vec::new(),
+        coverage: Vec::new(),
+        counters,
+        fatal: actual.map(|f| {
+            FatalKind::Environment(bound_line(&format!(
+                "{:?}: {:?}/{:?} errno={:?}: {}",
+                failure.cause, f.stage, f.class, f.errno, f.detail
+            )))
+        }),
+        target: failure.target.clone(),
+        openssl: OpensslVersion::unknown(),
+        disposition: failure.custody.disposition.map(|d| match d {
+            crate::target::TargetDisposition::Exited { code } => {
+                crate::evidence::DispositionRecord::exited(code)
+            }
+            crate::target::TargetDisposition::Detached { pid }
+                if failure.custody.resolution == capture::CustodyResolution::NotOwned =>
+            {
+                crate::evidence::DispositionRecord::foreign_observed(pid)
+            }
+            crate::target::TargetDisposition::Detached { pid } => {
+                crate::evidence::DispositionRecord::detached_running(pid)
+            }
+        }),
+        policy: None,
+        legacy_partition: LegacyCallPartition::default(),
+        engine_observations: Vec::new(),
+        traversal: None,
+    });
+    document.context = failure.context.clone();
+    document
+}
+
+fn failure_diagnostics(context: &capture::CaptureFailureContext, lines: &mut Vec<String>) {
+    use crate::count_owner::{CleanupState, EnumerationStatus, ResourceState};
+    let ticket = |t: crate::count_owner::CleanupTicket| {
+        format!(
+            "{}:{}",
+            t.owner_epoch.value(),
+            t.terminal_id.sequence.value()
+        )
+    };
+    match &context.count {
+        capture::PreObservationCount::Terminal(t) => {
+            let (state, unresolved) = match &t.receipt.cleanup_state {
+                CleanupState::Complete => ("complete", 0),
+                CleanupState::Pending(s) | CleanupState::Failed(s) => (
+                    if matches!(t.receipt.cleanup_state, CleanupState::Pending(_)) {
+                        "pending"
+                    } else {
+                        "failed"
+                    },
+                    s.resources
+                        .iter()
+                        .filter(|r| {
+                            !matches!(
+                                r.state,
+                                ResourceState::Unused
+                                    | ResourceState::CreateFailed
+                                    | ResourceState::CloseReturned
+                            ) || r.errno.is_some()
+                        })
+                        .count(),
+                ),
+            };
+            lines.push(format!(
+                "count terminal={} cleanup={state} unresolved-slots={unresolved}",
+                ticket(t.receipt.cleanup_ticket)
+            ));
+        }
+        capture::PreObservationCount::PrepareFailed(f) => lines.push(format!(
+            "count prepare ticket={} cleanup=unresolved unresolved-slots=unknown",
+            f.cleanup_ticket
+                .map(ticket)
+                .unwrap_or_else(|| "none".into())
+        )),
+        capture::PreObservationCount::NotPrepared => {
+            lines.push("count not-prepared cleanup=not-acquired unresolved-slots=0".into())
+        }
+    }
+    let known = |n: Option<u64>| n.map(|v| v.to_string()).unwrap_or_else(|| "unknown".into());
+    let (enumeration, tail) = match context.rejected.enumeration {
+        EnumerationStatus::Complete { unread_keys: 0 } => ("complete", "known"),
+        EnumerationStatus::Complete { .. } => ("complete", "unknown"),
+        EnumerationStatus::Unfinished => ("unknown", "unknown"),
+    };
+    lines.push(format!(
+        "rejected-prefix known-rows={} known-calls={} enumeration={enumeration} tail={tail}",
+        known(context.rejected.known_rows),
+        known(context.rejected.known_calls)
+    ));
+    lines.push(format!(
+        "custody resolution={:?} child-status={}",
+        context.custody.resolution,
+        context
+            .custody
+            .child_exit
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "unknown".into())
+    ));
+    let count_failure = context.count.actual_failure();
+    if let Some(f) = context
+        .failure
+        .as_ref()
+        .or(context.custody.failure.as_ref())
+        .or(count_failure.as_ref())
+    {
+        lines.push(format!(
+            "boundary {:?}/{:?} errno={:?}: {}",
+            f.stage, f.class, f.errno, f.detail
+        ));
+    }
+}
+
+pub fn consume_capture_result_with_diagnostics(
+    result: anyhow::Result<capture::Capture>,
+    command: CaptureCommand<'_>,
+    request: &OutputRequest,
+    workload_discarded: bool,
+    diagnostics: &mut dyn std::io::Write,
+) -> CaptureCommandResult {
+    let mut lines = Vec::new();
+    let mut unknown_setup = false;
+    let mut capture_result = None;
+    let mut no_observation = None;
+    let mut unknown_detail = None;
+    match result {
+        Ok(c) => capture_result = Some(c),
+        Err(error) => match classify_capture_failure(error) {
+            CaptureFailureClass::Runtime(f) => {
+                lines.push(format!("capture cause=runtime/{:?}", f.kind));
+                capture_result = Some(std::sync::Arc::unwrap_or_clone(f.capture));
+            }
+            CaptureFailureClass::NoObservation(f) => no_observation = Some(f),
+            CaptureFailureClass::UntypedSetup { detail } => unknown_detail = Some(detail),
+        },
+    }
+    let (mut document, legacy, child_exit, disposition, failure_context) =
+        if let Some(c) = capture_result {
+            if lines.is_empty() && c.failure_context.is_some() {
+                lines.push(
+                    if matches!(
+                        c.document.status,
+                        Completeness::Fatal {
+                            kind: FatalKind::Runtime(_),
+                            ..
+                        }
+                    ) {
+                        "capture cause=runtime/retained"
+                    } else {
+                        "capture cause=retained"
+                    }
+                    .into(),
+                );
+            }
+            (
+                c.document,
+                c.legacy,
+                c.child_exit,
+                c.disposition,
+                c.failure_context,
+            )
+        } else if let Some(f) = no_observation {
+            lines.push(format!("capture cause=no-observation/{:?}", f.cause));
+            let context = std::sync::Arc::new(capture::CaptureFailureContext {
+                rejected: capture::RejectedPrefix::from_count(&f.count),
+                count: f.count.clone(),
+                failure: f.failure.clone(),
+                custody: f.custody.clone(),
+            });
+            (
+                no_observation_document(&f),
+                serde_json::Value::Null,
+                f.custody.child_exit,
+                f.custody.disposition,
+                Some(context),
+            )
+        } else {
+            unknown_setup = true;
+            let name = match command {
+                CaptureCommand::Report => "report",
+                CaptureCommand::Check { .. } => "check",
+            };
+            let detail = unknown_detail.unwrap_or_else(|| "capture setup unavailable".into());
+            lines.push(format!("{name}: {detail}"));
+            lines.push(format!(
+                "{name}: run 'osslscope doctor' to diagnose environment failures"
+            ));
+            (
+                setup_failure_document(FatalKind::Environment(detail)),
+                serde_json::Value::Null,
+                None,
+                None,
+                None,
+            )
+        };
+    if let Some(context) = &failure_context {
+        failure_diagnostics(context, &mut lines);
+    }
+    let outcome = match command {
+        CaptureCommand::Report => {
+            document.policy = None;
+            if matches!(document.status, Completeness::Fatal { .. }) {
+                crate::policy::PolicyOutcome::NoVerdict
+            } else {
+                crate::policy::PolicyOutcome::Pass
+            }
+        }
+        CaptureCommand::Check { rules } => {
+            let (verdict, checked) =
+                crate::check::assemble_checked_document(rules, document, &legacy);
+            document = checked;
+            verdict.overall()
+        }
+    };
+    if let Some(hint) = workload_hint(child_exit, workload_discarded) {
+        lines.push(hint);
+    }
+    let delivery = write_artifacts(&document, request);
+    lines.extend(delivery.diagnostics.iter().cloned());
+    let lines: Vec<String> = lines
+        .into_iter()
+        .map(|line| normalize_fatal_detail(&line))
+        .take(8)
+        .collect();
+    for (index, line) in lines.iter().enumerate() {
+        // Preserve the established unknown-setup doctor diagnostic prefix.
+        let prefix = if unknown_setup && index < 2 {
+            "osslscope "
+        } else {
+            "osslscope: "
+        };
+        let emitted = normalize_fatal_detail(&format!("{prefix}{line}"));
+        if writeln!(diagnostics, "{emitted}").is_err() {
+            break;
+        }
+    }
+    let exit_code = exit_for(outcome, child_exit, &document, &delivery);
+    CaptureCommandResult {
+        document,
+        child_exit,
+        disposition,
+        delivery,
+        exit_code,
+        diagnostics: lines,
+        failure_context,
     }
 }
 
@@ -1741,11 +2064,9 @@ fn render_failed_outcome(dest: &OutputDest, detail: &str) -> ArtifactOutcome {
 }
 
 /// Typed no-evidence document for capture setup failures (F-E/B4).
-/// `report`/`check` convert a `capture::run` error into this fatal
-/// document and attempt every requested artifact from it, instead of
-/// returning with nothing written. Zero window (nothing was
-/// observed), unknown target/toolchain, caller attaches the policy
-/// section for the check shape.
+/// The shared consumer uses this for unknown setup errors after recovering
+/// known retained failures. Zero window, unknown target/toolchain; the caller
+/// attaches check policy and attempts every requested artifact.
 pub fn setup_failure_document(fatal: FatalKind) -> CaptureDocument {
     use crate::evidence::{
         CaptureWindow, FinalizeInput, LegacyCallPartition, OpensslVersion, TargetRecord, finalize,

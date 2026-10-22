@@ -105,3 +105,63 @@ fn h7_broken_stderr_alone_perturbs_nothing() {
         "primary artifact must still deliver: {stdout:?}"
     );
 }
+
+#[test]
+fn g1_spawned_setup_attempts_both_artifacts_with_broken_stderr() {
+    for command in ["report", "check"] {
+        for fail_primary in [false, true] {
+            let dir = std::env::temp_dir().join(format!(
+                "osslscope-g1-cli-{}-{command}-{fail_primary}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let primary = dir.join(if fail_primary {
+                "missing/primary.json"
+            } else {
+                "primary.json"
+            });
+            let cbom = dir.join(if fail_primary {
+                "cbom.json"
+            } else {
+                "missing/cbom.json"
+            });
+            let mut cmd = Command::new(bin());
+            cmd.stderr(std::fs::File::create("/dev/full").unwrap())
+                .args([
+                    command,
+                    "--format",
+                    "json",
+                    "--object",
+                    "/nonexistent-h7/probe.bpf.o",
+                    "--count-object",
+                    "/nonexistent-h7/count.bpf.o",
+                    "--out",
+                ])
+                .arg(&primary)
+                .arg("--cbom")
+                .arg(&cbom);
+            if command == "check" {
+                cmd.args(["--deny-provider", "default"]);
+            }
+            let out = cmd.args(["run", "--", "/bin/true"]).output().unwrap();
+            assert_eq!(out.status.code(), Some(4));
+            assert_eq!(primary.is_file(), !fail_primary);
+            assert_eq!(cbom.is_file(), fail_primary);
+            if !fail_primary {
+                let value: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(primary).unwrap()).unwrap();
+                osslscope::schema::validate_v2(&value).unwrap();
+                osslscope::schema::check_v2_semantics(&value).unwrap();
+                assert_eq!(value["completeness"]["fatal_kind"]["kind"], "environment");
+                if command == "check" {
+                    assert_eq!(value["policy"]["verdict"], "no-verdict");
+                }
+            } else {
+                let value: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(cbom).unwrap()).unwrap();
+                assert_eq!(value["bomFormat"], "CycloneDX");
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+}

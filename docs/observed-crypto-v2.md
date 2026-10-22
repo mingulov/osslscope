@@ -287,6 +287,27 @@ COMPLETE exclusion; counts can include self-tests. Flat legacy
 display reasons such as `no-query` and `fips-unlabeled` are not v2
 typed reasons. See [the FIPS interim rule](fips-interim.md).
 
+Before a stopped owned child is successfully released, there is no
+release-based observation interval. A cancelled or already-exited child with
+no actual setup error uses the zero requested/effective window sentinel,
+unknown wall edges, no count admission metadata, and no in-window execution
+sites. The producer adds exactly one `capture.no_observation` counter with
+kind `loss`, units `events`, source `setup`, value 1. It records that no
+observation scope was established; it does not estimate missed callbacks or
+a duration. This makes the document PARTIAL and every absence claim
+inconclusive. Cancellation also sets `signal_cut`; an already-exited child
+does not. Its actual reaped status is preserved, including status 0.
+Rejected pre-release count prefixes are retained internally, never policy
+hits. The external-target setup-elapsed case keeps its actual acquisition
+bounds and empty effective interval at requested end.
+
+Actual setup, release, count I/O or custody failures before a valid scope
+remain FATAL Environment/no-verdict. After successful release or a completed
+external Open, failures retain representable current/fenced and independent
+other-plane facts as FATAL Runtime. A binding contradiction preserves its
+original rejected terminal image separately; neither clipping timestamps nor
+reclassifying the error as setup may manufacture a clean capture.
+
 ## Policy section (`check` only)
 
 `src/policy.rs` evaluates rules; `src/check.rs` fills `PolicyRecord`
@@ -491,6 +512,29 @@ docs) > 1 usable fatal doc > 4 no-verdict > 1
 failed child / failed delivery > 11 inconclusive > `PARTIAL` 3 >
 clean 0. `DeliveryResult` preserves this priority via
 `failed()`/`delivered_all()` — it reports, never decides.
+
+Both commands pass the entire capture result through
+`consume_capture_result`; its writer-taking counterpart
+`consume_capture_result_with_diagnostics` uses the same presentation, actual
+requested check rules, artifact attempts and exit table. Known typed failures
+survive error context wrappers. The consumer performs no count close, target
+signal, wait, reap or renewed grace period. A failed diagnostic writer is
+advisory and does not change artifact outcomes or exit status.
+
+The combined diagnostic list has at most eight lines of 200 characters:
+`capture cause` names a finite cause; `count terminal=epoch:sequence` names the
+cleanup ticket, `cleanup` state and `unresolved-slots` count; `count prepare ticket` retains a preparation failure's ticket when no terminal was
+published. `rejected-prefix` labels `known-rows`/`known-calls`, enumeration and
+tail knowledge. These are retained high-water summaries, not additional
+observations or a presumed zero tail. `custody` names its resolution and
+actual or unknown child status; `boundary` preserves stage, class, errno and
+bounded observer error detail. An optional discarded-workload hint and at
+most two actual artifact failures complete the list. Raw descriptors,
+arguments, candidates, payloads and terminal debug images are never emitted.
+Count FD admission is a checked process-local snapshot of existing and
+reserved demand, not a reservation against unrelated/future opens or a
+whole-process resource guarantee. A later EMFILE still follows the retained
+fatal error route.
 
 Primary and CBOM targeting one sink is refused (stdout would
 concatenate two artifacts into unparseable bytes; one file would

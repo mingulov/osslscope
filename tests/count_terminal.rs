@@ -423,9 +423,9 @@ fn g1_unavailable_terminal_inventory_is_partial_with_prior_positives() {
         Some(1)
     );
     assert_eq!(counter(&t.retained_drain, "count.ledger_delta"), None);
-    let retained = s.close_for_capture(Duration::from_secs(60)).unwrap();
-    assert!(retained.runtime_failure().is_none());
-    assert_eq!(retained.into_drain().total_calls(), 18);
+    let retained = s.terminal_shared(close());
+    assert!(retained.runtime_failure.is_none());
+    assert_eq!(retained.retained_drain.total_calls(), 18);
     assert!(s.close_and_drain(Duration::from_secs(60)).is_err());
 }
 #[test]
@@ -677,17 +677,19 @@ fn g1_foreign_terminal_cannot_replace_retained_provenance() {
         Some(1)
     );
     assert_eq!(counter(&t.retained_drain, "count.ledger_delta"), None);
-    let retained = s.retained_for_capture(s.terminal_id().unwrap()).unwrap();
-    assert!(retained.runtime_failure().is_some());
-    assert_eq!(retained.into_drain().total_calls(), 18);
-    let again = s.close_for_capture(Duration::from_secs(60)).unwrap();
-    assert_eq!(again.into_drain().total_calls(), 18);
+    let retained = s.shared_terminal(s.terminal_id().unwrap());
+    assert!(retained.runtime_failure.is_some());
+    assert_eq!(retained.retained_drain.total_calls(), 18);
+    let again = s.terminal_shared(close());
+    assert_eq!(again.retained_drain.total_calls(), 18);
     assert_eq!(s.backend().calls.get(), 1);
     let mut other = CountSession::new(PID, FakeCountBackend::new());
     other.terminal(close());
     assert!(
-        s.retained_for_capture(other.terminal_id().unwrap())
-            .is_err()
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            || s.shared_terminal(other.terminal_id().unwrap())
+        ))
+        .is_err()
     );
 }
 #[test]

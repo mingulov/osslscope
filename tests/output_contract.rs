@@ -4593,3 +4593,103 @@ fn g1_admission_projection_modes() {
         .is_ok()
     );
 }
+
+#[test]
+fn g1_no_observation_rendered_outputs_keep_zero_scope_and_unknown_absence() {
+    use osslscope::{
+        capture::{
+            CustodyReceipt, CustodyResolution, PreObservationCause, PreObservationCount,
+            PreObservationFailure,
+        },
+        report::*,
+    };
+    for format in [OutputFormat::Json, OutputFormat::Human] {
+        let dir = std::env::temp_dir().join(format!(
+            "osslscope-g1-output-{}-{format:?}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let failure = PreObservationFailure {
+            cause: PreObservationCause::NeverReleasedExit,
+            failure: None,
+            count: PreObservationCount::NotPrepared,
+            release: None,
+            custody: CustodyReceipt {
+                disposition: Some(osslscope::target::TargetDisposition::Exited { code: 0 }),
+                child_exit: Some(0),
+                resolution: CustodyResolution::Resolved,
+                failure: None,
+            },
+            target: TargetRecord::unknown(),
+            context: None,
+        };
+        let rules = [osslscope::policy::PolicyRule::deny_provider("default")];
+        let request = OutputRequest {
+            format,
+            primary: OutputDest::File(dir.join("primary")),
+            cbom: Some(OutputDest::File(dir.join("cbom.json"))),
+        };
+        let result = consume_capture_result_with_diagnostics(
+            Err(anyhow::Error::new(failure).context("two").context("one")),
+            CaptureCommand::Check { rules: &rules },
+            &request,
+            false,
+            &mut Vec::new(),
+        );
+        assert_eq!(result.exit_code, 11);
+        assert_eq!(result.document.total_calls(), 0);
+        assert_eq!(result.document.window.requested_start_ns, 0);
+        assert_eq!(result.document.window.requested_end_ns, 0);
+        assert!(result.document.window.count_admission.is_none());
+        let value: Value = serde_json::from_slice(&render_json(&result.document).unwrap()).unwrap();
+        osslscope::schema::validate_v2(&value).unwrap();
+        osslscope::schema::check_v2_semantics(&value).unwrap();
+        assert_eq!(value["completeness"]["status"], "PARTIAL");
+        assert_eq!(value["policy"]["rules"][0]["possible"], Value::Null);
+        assert!(render_human(&result.document).contains("capture.no_observation"));
+        let actual = std::fs::read(dir.join("primary")).unwrap();
+        assert_eq!(
+            actual,
+            if format == OutputFormat::Json {
+                render_json(&result.document).unwrap()
+            } else {
+                render_human(&result.document).into_bytes()
+            }
+        );
+        let cbom: Value =
+            serde_json::from_slice(&std::fs::read(dir.join("cbom.json")).unwrap()).unwrap();
+        assert_eq!(cbom["components"].as_array().unwrap().len(), 0);
+        assert!(
+            cbom["metadata"]["properties"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p["name"] == "osslscope:completeness-disclaimer"
+                    && p["value"].as_str().unwrap().contains("PARTIAL"))
+        );
+        assert!(result.delivery.delivered_all());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[test]
+fn g1_runtime_salvage_renderers_preserve_conviction_and_physical_counts() {
+    let doc = runtime_violation_doc();
+    let bytes = osslscope::report::render_json(&doc).unwrap();
+    let value: Value = serde_json::from_slice(&bytes).unwrap();
+    osslscope::schema::validate_v2(&value).unwrap();
+    osslscope::schema::check_v2_semantics(&value).unwrap();
+    assert_eq!(value["completeness"]["fatal_kind"]["kind"], "runtime");
+    assert_eq!(value["policy"]["verdict"], "violation");
+    assert!(doc.total_calls() > 0);
+    assert!(osslscope::report::render_human(&doc).contains("runtime"));
+    let cbom = cbom_of(&doc);
+    assert!(!cbom["components"].as_array().unwrap().is_empty());
+    assert!(
+        cbom["metadata"]["properties"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["name"] == "osslscope:policy-verdict" && p["value"] == "violation")
+    );
+}

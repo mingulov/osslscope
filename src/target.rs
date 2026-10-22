@@ -116,7 +116,7 @@ fn query_child(pid: u32) -> anyhow::Result<ChildQuery> {
             if e.raw_os_error() == Some(libc::EINTR) {
                 continue;
             }
-            anyhow::bail!("waitpid {pid}: {e}");
+            return Err(anyhow::Error::new(e).context(format!("waitpid {pid}")));
         }
         if libc::WIFEXITED(status) {
             return Ok(ChildQuery::Exited(libc::WEXITSTATUS(status)));
@@ -145,7 +145,7 @@ fn reap_once(pid: u32) -> anyhow::Result<Option<i32>> {
             if e.raw_os_error() == Some(libc::EINTR) {
                 continue;
             }
-            anyhow::bail!("waitpid {pid}: {e}");
+            return Err(anyhow::Error::new(e).context(format!("waitpid {pid}")));
         }
         if libc::WIFEXITED(status) {
             return Ok(Some(libc::WEXITSTATUS(status)));
@@ -168,7 +168,7 @@ fn reap_blocking(pid: u32) -> anyhow::Result<i32> {
             if e.raw_os_error() == Some(libc::EINTR) {
                 continue;
             }
-            anyhow::bail!("waitpid {pid}: {e}");
+            return Err(anyhow::Error::new(e).context(format!("waitpid {pid}")));
         }
         if libc::WIFEXITED(status) {
             return Ok(libc::WEXITSTATUS(status));
@@ -1799,12 +1799,13 @@ impl OwnedTarget {
                 continue;
             }
             if r < 0 {
-                if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                let e = std::io::Error::last_os_error();
+                if e.raw_os_error() == Some(libc::EINTR) {
                     continue;
                 }
-                let e = std::io::Error::last_os_error();
                 let report = guard_cleanup_report(&mut guard);
-                anyhow::bail!("waitpid {pid}: {e}; owned child {pid} {report}");
+                return Err(anyhow::Error::new(e)
+                    .context(format!("waitpid {pid}; owned child {pid} {report}")));
             }
             if libc::WIFSTOPPED(status) {
                 guard.disarm();
@@ -1891,7 +1892,7 @@ impl OwnedTarget {
             self.exit_code = Some(code);
             self.state = CustodyState::Reaped;
         }
-        anyhow::bail!("SIGCONT to {}: {e}", self.pid);
+        Err(anyhow::Error::new(e).context(format!("SIGCONT to {}", self.pid)))
     }
 
     /// Non-blocking exit poll: `Ok(None)` = still owned and alive;
@@ -1966,7 +1967,9 @@ impl OwnedTarget {
     pub fn finish_observation(&mut self) -> anyhow::Result<TargetDisposition> {
         match self.state {
             CustodyState::Reaped => Ok(TargetDisposition::Exited {
-                code: self.exit_code.unwrap_or(0),
+                code: self
+                    .exit_code
+                    .ok_or_else(|| anyhow::anyhow!("reaped child missing exit status"))?,
             }),
             CustodyState::Detached => Ok(TargetDisposition::Detached { pid: self.pid }),
             CustodyState::Stopped => {
@@ -1975,7 +1978,9 @@ impl OwnedTarget {
                 // otherwise only detach a live-but-unstopped child.
                 match self.state {
                     CustodyState::Reaped => Ok(TargetDisposition::Exited {
-                        code: self.exit_code.unwrap_or(0),
+                        code: self
+                            .exit_code
+                            .ok_or_else(|| anyhow::anyhow!("reaped child missing exit status"))?,
                     }),
                     _ => Ok(TargetDisposition::Detached { pid: self.pid }),
                 }
@@ -2056,6 +2061,41 @@ mod control_tests {
     use std::os::unix::fs::PermissionsExt as _;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn g1_target_wait_errors_keep_original_errno() {
+        // The current process is never its own child. These waitpid calls
+        // return ECHILD immediately, without signals or reaping another task.
+        let own_pid = std::process::id();
+        let errors = [
+            super::reap_once(own_pid).err().unwrap(),
+            super::query_child(own_pid).err().unwrap(),
+            super::reap_blocking(own_pid).err().unwrap(),
+        ];
+        for error in errors {
+            assert_eq!(
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .and_then(|e| e.raw_os_error()),
+                Some(libc::ECHILD),
+                "the original OS error must survive wait context"
+            );
+        }
+    }
+
+    #[test]
+    fn g1_target_missing_reaped_status_never_becomes_success() {
+        let mut target = super::OwnedTarget {
+            pid: std::process::id(),
+            state: super::CustodyState::Reaped,
+            exit_code: None,
+        };
+        assert!(
+            target.finish_observation().is_err(),
+            "a missing reaped status cannot become Exited(0)"
+        );
+        assert_eq!(target.exit_code(), None);
+    }
 
     #[test]
     fn control_expired_deadline_does_not_run() {

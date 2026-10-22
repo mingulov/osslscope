@@ -144,21 +144,6 @@ pub struct CountTerminal {
     pub runtime_failure: Option<OwnerFailure>,
 }
 
-/// Session-owned routed facts, checked against the canonical terminal slot.
-/// Incomplete evidence can preserve positives without claiming terminal success.
-pub struct RetainedCaptureCounts {
-    drain: CountDrain,
-    runtime_failure: Option<OwnerFailure>,
-}
-impl RetainedCaptureCounts {
-    pub fn runtime_failure(&self) -> Option<OwnerFailure> {
-        self.runtime_failure
-    }
-    pub fn into_drain(self) -> CountDrain {
-        self.drain
-    }
-}
-
 /// Checked command allocation. Terminal identities stay with the owner.
 #[derive(Debug, Default)]
 struct CountIds {
@@ -1084,7 +1069,7 @@ impl<B: CountBackend> CountSession<B> {
             Ok(seq) => Ok(seq),
             Err(failure) => {
                 self.runtime_failure = Some(failure);
-                self.terminal(CloseRequest {
+                self.terminal_shared(CloseRequest {
                     started_at: deadline,
                     grace: Duration::ZERO,
                     reason: CloseReason::Failure,
@@ -1201,18 +1186,25 @@ impl<B: CountBackend> CountSession<B> {
         }
         self.closed = true;
         self.window_open = false;
-        let deadline = request
-            .started_at
-            .checked_add(request.grace)
-            .unwrap_or_else(|| {
-                self.runtime_failure.get_or_insert(OwnerFailure::engine(
-                    CountOperation::Stop,
-                    FailureClass::DeadlineOverflow,
-                ));
-                request.started_at
-            });
         let frontier = self.frontier();
-        let expected = self.backend.terminal_request(deadline, frontier.clone());
+        // A failed ordinary command may already have reserved the sticky
+        // terminal slot. Reuse that exact binding and original budget without
+        // resubmission or another deadline calculation.
+        let expected = if let Some(canonical) = &self.canonical {
+            canonical.clone()
+        } else {
+            let deadline = request
+                .started_at
+                .checked_add(request.grace)
+                .unwrap_or_else(|| {
+                    self.runtime_failure.get_or_insert(OwnerFailure::engine(
+                        CountOperation::Stop,
+                        FailureClass::DeadlineOverflow,
+                    ));
+                    request.started_at
+                });
+            self.backend.terminal_request(deadline, frontier.clone())
+        };
         self.canonical = Some(expected.clone());
         let receipt = self.backend.terminal(expected.clone());
         self.lat_final_available = [false; 16];
@@ -1487,60 +1479,15 @@ impl<B: CountBackend> CountSession<B> {
         Arc::clone(view)
     }
 
-    /// Legacy owned-return replay. Copies converted rows; Task 10 removes the
-    /// old bridge. New retained error state uses `shared_terminal` instead.
+    /// Legacy host-test replay; copies converted rows for older controls.
+    /// Production retained state uses `shared_terminal` and shares allocations.
     pub fn salvage_view(&self, terminal_id: TerminalId) -> CountTerminal {
         self.shared_terminal(terminal_id).as_ref().clone()
     }
 
-    /// Pure adapter for capture's temporary bridge. It exposes only facts that
-    /// this session already routed, never rows from an unvalidated receipt.
-    pub fn retained_for_capture(
-        &self,
-        id: TerminalId,
-    ) -> Result<RetainedCaptureCounts, OwnerFailure> {
-        let fail = || OwnerFailure::engine(CountOperation::Stop, FailureClass::Inventory);
-        let expected = self.canonical.as_ref().ok_or_else(fail)?;
-        let view = self.terminal_view.as_ref().ok_or_else(fail)?;
-        if id != expected.id
-            || expected.id.owner_epoch != self.ready.owner_epoch
-            || expected.writer_object_identity != self.ready.writer_object_identity
-            || expected.evidence_domain != self.ready.evidence_domain
-        {
-            return Err(fail());
-        }
-        // Contradictory validation remains fatal. An unavailable journal at a
-        // deadline preserves prior facts with loss and no completion authority.
-        let runtime_failure = if validate_terminal(expected, &view.receipt).is_err()
-            && !self.terminal_inventory_unavailable
-        {
-            Some(view.runtime_failure.unwrap_or_else(fail))
-        } else {
-            view.runtime_failure
-        };
-        Ok(RetainedCaptureCounts {
-            drain: view.retained_drain.clone(),
-            runtime_failure,
-        })
-    }
-
-    /// Temporary structured capture adapter. Re-entry uses only the selected
-    /// session view and never samples another deadline or touches the backend.
-    pub fn close_for_capture(
-        &mut self,
-        grace: Duration,
-    ) -> Result<RetainedCaptureCounts, OwnerFailure> {
-        if self.terminal_view.is_none() {
-            self.terminal_shared(CloseRequest {
-                started_at: Instant::now(),
-                grace,
-                reason: CloseReason::Failure,
-            });
-        }
-        self.retained_for_capture(self.terminal_id().expect("selected terminal"))
-    }
-
-    /// Temporary capture bridge; Task 10 removes it after envelope integration.
+    /// Strict legacy host-test adapter. Production capture uses the canonical
+    /// shared envelope, never this owned-copy view. This performs no alternate
+    /// I/O or renewed wait; it refuses incomplete evidence and actual errors.
     pub fn close_and_drain(&mut self, grace: Duration) -> anyhow::Result<CountDrain> {
         let view = self.terminal(CloseRequest {
             started_at: Instant::now(),
@@ -1956,6 +1903,8 @@ pub struct FakeTerminalFaults {
     pub inventory_unavailable: bool,
     pub omit_resolved_open: bool,
     pub close_errno: Option<i32>,
+    /// HostModel resource hold after the count snapshot, never a live profile.
+    pub cleanup_pending: bool,
 }
 
 /// Deterministic host double for the count kernel side. [`fire`](Self::fire)
@@ -2833,6 +2782,17 @@ impl CountBackend for FakeCountBackend {
             data.checkpoint = None;
             data.snapshot_binding = None;
             data.read_status = ReadStatus::NotStarted;
+        }
+        if self.faults.cleanup_pending {
+            data.cleanup_state = CleanupState::Pending(ResourceSummary {
+                resources: vec![ResourceRecord {
+                    resource: ResourceId::Map(CountMap::Counts),
+                    state: ResourceState::Held,
+                    errno: None,
+                }],
+                sealed: true,
+                cleanup_complete: false,
+            });
         }
         self.pins.clear();
         let view = RawTerminal::model(storage);

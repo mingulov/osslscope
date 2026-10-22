@@ -120,6 +120,7 @@ struct SharedState {
     terminal_delay_ns: u64,
     refuse_suffix: bool,
     open_reply_fault: Option<OpenReplyFault>,
+    attach_errno: Option<i32>,
 }
 
 #[derive(Clone)]
@@ -138,6 +139,20 @@ impl CountBackend for SharedBackend {
     }
     fn attach(&mut self, request: AttachRequest) -> CommandResult<AttachAck<FakeLink>> {
         let mut st = self.shared.borrow_mut();
+        if let Some(errno) = st.attach_errno {
+            return Err(CommandFailure {
+                seq: request.seq,
+                completion: CommandCompletion::NotEntered,
+                publication: CommandPublication::NotPublished,
+                cleanup_ticket: None,
+                failure: OwnerFailure {
+                    operation: CountOperation::Attach,
+                    resource: ResourceId::Engine,
+                    class: FailureClass::Io,
+                    errno: Some(errno),
+                },
+            });
+        }
         let path = request.locator.clone();
         let cookies = request.cookies.clone();
         let ack = st.backend.attach(request)?;
@@ -3174,9 +3189,9 @@ fn setup_failure_resolves_custody() {
 }
 
 #[test]
-fn release_failure_on_dead_child_preserves_exit() {
-    // Release fails but the child already died: actionable
-    // typed pre-observation error with the preserved actual status.
+fn known_dead_child_preserves_exit_without_release_or_resolution() {
+    // The pre-release status poll already reaped this child. Neither an
+    // attempted release nor another custody resolution is necessary.
     let mut h = Harness::fresh("dead-release");
     h.release_err = true;
     h.exit_at_ns = Some(0);
@@ -3199,11 +3214,10 @@ fn release_failure_on_dead_child_preserves_exit() {
         failure.count,
         osslscope::capture::PreObservationCount::Terminal(_)
     ));
-    assert_eq!(
-        failure.release.unwrap().outcome,
-        osslscope::capture::ReleaseOutcome::Failed
-    );
-    assert!(post.target_log.borrow().resolved);
+    assert!(failure.release.is_none());
+    assert!(failure.failure.is_none());
+    assert!(!post.target_log.borrow().released);
+    assert!(!post.target_log.borrow().resolved);
 }
 
 #[test]
@@ -3342,14 +3356,13 @@ fn zero_setup_timeout_resolves_without_window() {
     let failure = error
         .downcast_ref::<osslscope::capture::PreObservationFailure>()
         .unwrap();
-    assert!(
-        failure
-            .failure
-            .as_ref()
-            .unwrap()
-            .detail
-            .contains("setup timeout")
+    let boundary = failure.failure.as_ref().unwrap();
+    assert_eq!(boundary.stage, osslscope::capture::BoundaryStage::Setup);
+    assert_eq!(
+        boundary.class,
+        osslscope::capture::BoundaryFailureClass::Timeout
     );
+    assert_eq!(boundary.errno, None);
     let log = post.target_log.borrow();
     assert!(!log.released);
     assert!(log.resolved);
@@ -10144,4 +10157,146 @@ fn g1_owned_fulfilled_omits_projection_only_after_pre_read_reap() {
     assert!(value["window"].get("count_admission").is_none());
     osslscope::schema::validate_v2(&value).unwrap();
     osslscope::schema::check_v2_semantics(&value).unwrap();
+}
+
+#[test]
+fn g1_suffix_keeps_original_lifecycle_edge() {
+    // The salvage route after count cleanup must retain the loop edge too.
+    let mut h = Harness::fresh("g1-salvage-original-edge");
+    h.cfg.duration = Duration::from_secs(1);
+    h.finish_err = true;
+    h.shared.borrow_mut().terminal_delay_ns = 400_000_000;
+    h.lifecycle_close_drain = Some(LifecycleDelta {
+        events: [
+            Some(BASE_NS + 900_000_000),
+            Some(BASE_NS + 1_000_000_000),
+            Some(BASE_NS + 1_300_000_000),
+            None,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, timestamp_ns)| LifecycleEvent {
+            kind: LifecycleKind::Fork,
+            pid: 6000 + i as u32,
+            timestamp_ns,
+        })
+        .collect(),
+        loss: 2,
+        dropped: 3,
+        prefix_unwitnessed: 4,
+        pending: 1,
+    });
+    let (out, post) = h.run();
+    let capture = out.unwrap();
+    assert_eq!(counter_value(&capture, "lifecycle.fork_exec_ignored"), 1);
+    assert_eq!(counter_value(&capture, "lifecycle.scan_loss"), 3);
+    assert_eq!(counter_value(&capture, "lifecycle.signal_dropped"), 3);
+    assert_eq!(
+        counter_value(&capture, "lifecycle.signal_prefix_unwitnessed"),
+        4
+    );
+    assert_eq!(counter_value(&capture, "lifecycle.drain_pending"), 1);
+    assert_eq!(
+        capture.document.window.effective_end_ns,
+        BASE_NS + 1_000_000_000
+    );
+    let order = post.order.borrow();
+    assert!(
+        order.iter().position(|s| s == "count_closed").unwrap()
+            < order.iter().position(|s| s == "lifecycle_suffix").unwrap()
+    );
+    assert_eq!(
+        post.shared
+            .borrow()
+            .log
+            .iter()
+            .filter(|s| *s == "count_closed")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn g1_count_fd_admission_is_explicit() {
+    let admission = osslscope::capture::CountFdAdmission {
+        soft_limit: 16420,
+        non_count_open: 12,
+        non_count_reserved: 8,
+    };
+    assert_eq!(admission.allowance().unwrap(), 16400);
+    let mut h = Harness::fresh("g1-emfile-after-admission");
+    h.owned = false;
+    h.snapshot_attached();
+    h.shared.borrow_mut().attach_errno = Some(libc::EMFILE);
+    h.polls.push_back(DiscoveryDelta {
+        candidates: vec![cand(
+            "/p/provider.so",
+            backing_of(&h.staged, h.off),
+            1,
+            11,
+            "SHA-256",
+            false,
+            "ok",
+        )],
+        tables: vec![terminated(1, 0)],
+        trigger_observed: true,
+        ..Default::default()
+    });
+    let (out, post) = h.run();
+    let capture = out.unwrap();
+    assert!(matches!(
+        capture.document.status,
+        Completeness::Fatal {
+            kind: osslscope::evidence::FatalKind::Runtime(_),
+            ..
+        }
+    ));
+    let failure = capture
+        .failure_context
+        .as_ref()
+        .unwrap()
+        .failure
+        .as_ref()
+        .unwrap();
+    assert_eq!(failure.errno, Some(libc::EMFILE));
+    assert!(!post.target_log.borrow().released && !post.target_log.borrow().resolved);
+    let value: serde_json::Value =
+        serde_json::from_slice(&osslscope::report::render_json(&capture.document).unwrap())
+            .unwrap();
+    osslscope::schema::validate_v2(&value).unwrap();
+    osslscope::schema::check_v2_semantics(&value).unwrap();
+}
+
+#[test]
+fn g1_recycle_count_cleanup_cannot_extend_window() {
+    let mut h = Harness::fresh("g1-recycle-edge");
+    h.owned = false;
+    h.cfg.duration = Duration::from_secs(1);
+    h.verify_err_after = Some(1);
+    h.shared.borrow_mut().terminal_delay_ns = 400_000_000;
+    let (out, post) = h.run();
+    let capture = out.unwrap();
+    assert!(matches!(
+        capture.document.status,
+        Completeness::Fatal {
+            kind: osslscope::evidence::FatalKind::Recycled,
+            ..
+        }
+    ));
+    assert_eq!(
+        capture.document.window.effective_end_ns, BASE_NS,
+        "terminal cleanup time is never recycled-target coverage"
+    );
+    assert!(capture.document.sites.is_empty() && capture.document.fenced.is_empty());
+    assert!(capture.executions.is_empty());
+    assert!(!post.target_log.borrow().released && !post.target_log.borrow().resolved);
+    assert_eq!(
+        post.shared
+            .borrow()
+            .log
+            .iter()
+            .filter(|s| *s == "count_closed")
+            .count(),
+        1
+    );
 }

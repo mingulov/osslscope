@@ -9035,3 +9035,524 @@ fn g1_target_read_before_seal_timestamp_after_seal_adapts_actual_terminal() {
     crate::schema::validate_v2(&value).unwrap();
     crate::schema::check_v2_semantics(&value).unwrap();
 }
+
+#[test]
+fn g1_actual_owner_open_recovery_reaches_capture_and_cli_consumer() {
+    use crate::capture::{
+        self, ClockPort, CustodyResolution, DiscoveryPort, LifecyclePort, PreObservationCount,
+        PreObservationFailure, ProcPort, TargetPort,
+    };
+    use crate::discovery::session::{DiscoveryDelta, DiscoverySnapshot, PollBudget};
+    use crate::report::{self, CaptureCommand, OutputDest, OutputFormat, OutputRequest};
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    // The prepared owner, mailbox, actual map operation frontiers, checked
+    // resource registry, terminal selection and capture/CLI consumers are real.
+    // Existing pipe-FD I/O models the kernel; no BPF or live target is used.
+    struct OpenPort {
+        owner: SessionOwnerPort,
+        lose_reply: bool,
+        requests: Rc<Cell<usize>>,
+        terminals: Rc<Cell<usize>>,
+        selected: Rc<RefCell<Option<TerminalRequest>>>,
+    }
+    impl crate::count_session::CountBackend for OpenPort {
+        type Link = LinkToken;
+        fn ready(&self) -> &Ready {
+            &self.owner.engine.ready
+        }
+        fn attach(&mut self, r: AttachRequest) -> CommandResult<AttachAck<LinkToken>> {
+            self.owner.engine.attach(r)
+        }
+        fn set_generation(&mut self, r: GenerationRequest) -> CommandResult<()> {
+            self.owner.engine.set_generation(r)
+        }
+        fn drain(&mut self, r: ReadRequest) -> CommandResult<Arc<RawSnapshot>> {
+            self.owner.engine.drain(r)
+        }
+        fn open_window(&mut self, r: OpenRequest) -> CommandResult<OpenReceipt> {
+            if !self.lose_reply {
+                return self.owner.engine.open_window(r);
+            }
+            // Publish a real ordinary Open exactly as the existing lost-reply
+            // owner control does, then leave the actual completed reply unread.
+            let engine = &self.owner.engine;
+            {
+                let mut state = locked(&engine.shared.state);
+                state.last_command_seq = Some(r.seq);
+                state.frontier.pending = Some(PendingCommandId {
+                    seq: r.seq,
+                    operation: CountOperation::Open,
+                });
+                state.pending_open = Some(r);
+                state.resolved_open = Some(OpenReceipt::pending(engine.ready.owner_epoch, &r));
+                assert!(
+                    state
+                        .ordinary
+                        .publish_request(OwnerRequest::Open(r))
+                        .is_ok()
+                );
+            }
+            engine.shared.worker.get().unwrap().unpark();
+            let cutoff = Instant::now() + Duration::from_secs(3);
+            let mut state = locked(&engine.shared.state);
+            while state.ordinary.reply.is_none() {
+                let remaining = cutoff.saturating_duration_since(Instant::now());
+                assert!(!remaining.is_zero(), "actual owner did not complete Open");
+                state = engine
+                    .shared
+                    .changed
+                    .wait_timeout(state, remaining)
+                    .unwrap()
+                    .0;
+            }
+            assert_eq!(state.resolved_open.unwrap().outcome, OpenOutcome::Completed);
+            assert_eq!(
+                state.resolved_open.unwrap().completed_writes,
+                OpenWriteFrontier::Target
+            );
+            drop(state);
+            Err(CommandFailure {
+                seq: r.seq,
+                completion: CommandCompletion::Unknown,
+                publication: CommandPublication::Published,
+                cleanup_ticket: None,
+                failure: OwnerFailure::engine(CountOperation::Open, FailureClass::Disconnected),
+            })
+        }
+        fn terminal_request(
+            &mut self,
+            deadline: Instant,
+            frontier: ControllerFrontier,
+        ) -> TerminalRequest {
+            self.requests.set(self.requests.get() + 1);
+            let r = self.owner.engine.terminal_request(
+                deadline,
+                self.owner.engine.ready.evidence_domain,
+                self.owner.engine.ready.writer_object_identity,
+                frontier,
+            );
+            if let Some(first) = self.selected.borrow().as_ref() {
+                assert_eq!(first, &r);
+            }
+            *self.selected.borrow_mut() = Some(r.clone());
+            r
+        }
+        fn terminal(&mut self, r: TerminalRequest) -> RawTerminal {
+            self.terminals.set(self.terminals.get() + 1);
+            self.owner.engine.terminal(r)
+        }
+        fn progress(&self) -> Option<RawCheckpoint> {
+            self.owner.engine.progress()
+        }
+        fn fork_permit(&self, deadline: Instant) -> Result<CountForkPermit<'_>, ForkBlocked> {
+            self.owner.engine.fork_permit(deadline)
+        }
+    }
+    struct Clock {
+        now: Instant,
+    }
+    impl ClockPort for Clock {
+        fn checked_monotonic_ns(&self) -> Option<u64> {
+            Some(1300)
+        }
+        fn monotonic_ns(&self) -> u64 {
+            1300
+        }
+        fn now(&self) -> Instant {
+            self.now
+        }
+        fn wall_now(&self) -> std::time::SystemTime {
+            std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1700000000)
+        }
+        fn sleep(&self, _d: Duration) {
+            panic!("Open recovery must not enter the observation loop")
+        }
+    }
+    struct Discovery {
+        cancelled: bool,
+    }
+    impl DiscoveryPort for Discovery {
+        fn poll(&mut self, _b: PollBudget) -> anyhow::Result<DiscoveryDelta> {
+            assert!(self.cancelled, "Open recovery precedes baseline discovery");
+            Ok(DiscoveryDelta::default())
+        }
+        fn snapshot(&self) -> DiscoverySnapshot {
+            DiscoverySnapshot::default()
+        }
+        fn finish(&mut self) -> anyhow::Result<DiscoverySnapshot> {
+            Ok(self.snapshot())
+        }
+    }
+    struct Target {
+        owned: bool,
+        finishes: Rc<Cell<usize>>,
+        resolves: Rc<Cell<usize>>,
+    }
+    impl TargetPort for Target {
+        fn pid(&self) -> u32 {
+            1
+        }
+        fn is_owned(&self) -> bool {
+            self.owned
+        }
+        fn release(&mut self) -> anyhow::Result<()> {
+            panic!("cancelled or external target cannot be released")
+        }
+        fn poll_exit(&mut self) -> anyhow::Result<Option<i32>> {
+            assert!(self.owned, "external target cannot be waited on");
+            Ok((self.resolves.get() > 0).then_some(137))
+        }
+        fn resolve_setup_failure(&mut self) -> anyhow::Result<()> {
+            assert!(self.owned, "external target has no owned custody");
+            self.resolves.set(self.resolves.get() + 1);
+            Ok(())
+        }
+        fn finish_observation(&mut self) -> anyhow::Result<crate::target::TargetDisposition> {
+            self.finishes.set(self.finishes.get() + 1);
+            Ok(crate::target::TargetDisposition::Detached { pid: 1 })
+        }
+        fn verify(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+    struct Lifecycle;
+    impl LifecyclePort for Lifecycle {
+        fn poll(&mut self) -> capture::LifecycleDelta {
+            capture::LifecycleDelta::default()
+        }
+        fn fallback_partial(&self) -> bool {
+            false
+        }
+    }
+    struct Proc {
+        cancelled: bool,
+    }
+    impl ProcPort for Proc {
+        fn read_maps(&mut self, _p: u32) -> anyhow::Result<Vec<crate::discovery::maps::Mapping>> {
+            assert!(self.cancelled, "Open recovery precedes proc polling");
+            Ok(Vec::new())
+        }
+        fn read_file(&mut self, _p: &str) -> anyhow::Result<Vec<u8>> {
+            panic!("unexpected file read")
+        }
+        fn read_file_bound(&mut self, _p: &str, _n: usize) -> io::Result<(Arc<[u8]>, (u64, u64))> {
+            panic!("unexpected file read")
+        }
+        fn stat_file(&mut self, _p: &str) -> Option<capture::FileStat> {
+            None
+        }
+        fn read_exe(&mut self, _p: u32) -> Option<std::path::PathBuf> {
+            None
+        }
+        fn file_len(&mut self, _p: &str) -> Option<u64> {
+            None
+        }
+        fn read_comm(&mut self, _p: u32) -> Option<String> {
+            None
+        }
+    }
+    // Partial Open, completed Open with a lost reply, and cancellation
+    // followed by actual owner stop EIO, stop panic, or an expired budget.
+    for mode in 0..5 {
+        for check in [false, true] {
+            for failure in 0..3 {
+                let lost = mode == 1;
+                let cancelled = mode >= 2;
+                let probe = MapProbe::new();
+                let seal_clock = Arc::new(Mutex::new(std::collections::VecDeque::from([
+                    Some(1450),
+                    Some(1460),
+                ])));
+                let owner = session_owner_port(
+                    &probe,
+                    None,
+                    TerminalFaults {
+                        map: MapFaults {
+                            write_error: match mode {
+                                0 => Some(3),
+                                2 => Some(5),
+                                _ => None,
+                            },
+                            panic_call: (mode == 3).then_some(5),
+                            ..Default::default()
+                        },
+                        seal_clock: Some(seal_clock),
+                        ..Default::default()
+                    },
+                );
+                let epoch = owner.engine.ready.owner_epoch;
+                let requests = Rc::new(Cell::new(0));
+                let terminals = Rc::new(Cell::new(0));
+                let selected = Rc::new(RefCell::new(None));
+                let finishes = Rc::new(Cell::new(0));
+                let resolves = Rc::new(Cell::new(0));
+                let count = crate::count_session::CountSession::new(
+                    1,
+                    OpenPort {
+                        owner,
+                        lose_reply: lost,
+                        requests: requests.clone(),
+                        terminals: terminals.clone(),
+                        selected: selected.clone(),
+                    },
+                );
+                let clock = Clock {
+                    now: Instant::now(),
+                };
+                let cfg = capture::Config {
+                    harvest_object: None,
+                    count_object: None,
+                    members_object: None,
+                    provider: None,
+                    builtin: false,
+                    table: None,
+                    force_offset: None,
+                    provider_enrollment: None,
+                    resolved_provider: None,
+                    duration: Duration::from_nanos(1000),
+                    settle: Duration::ZERO,
+                    harvest_timeout: Duration::from_secs(5),
+                    grace: if mode == 4 {
+                        Duration::ZERO
+                    } else {
+                        Duration::from_secs(1)
+                    },
+                    image_digest: String::new(),
+                };
+                let info = capture::TargetInfo {
+                    pid: 1,
+                    owned: cancelled,
+                    comm: "owner-host-model".into(),
+                    cmdline: String::new(),
+                    container_id: String::new(),
+                    kernel_release: "host-model".into(),
+                    provider_build_id: String::new(),
+                    provider_path: String::new(),
+                    image_digest: String::new(),
+                    acquired_ns: 1000,
+                    acquired_instant: clock.now,
+                    acquired_wall: clock.wall_now(),
+                };
+                let result = capture::observe(
+                    &cfg,
+                    &info,
+                    capture::SessionSet {
+                        discovery: Discovery { cancelled },
+                        count,
+                        target: Target {
+                            owned: cancelled,
+                            finishes: finishes.clone(),
+                            resolves: resolves.clone(),
+                        },
+                        lifecycle: Lifecycle,
+                    },
+                    &clock,
+                    &mut Proc { cancelled },
+                    &|| cancelled,
+                );
+                let terminal = if lost {
+                    let c = result.as_ref().unwrap();
+                    assert_eq!(c.programmed_admission.unwrap().start_ns(), 1300);
+                    assert_eq!(c.document.window.requested_start_ns, 1000);
+                    assert_eq!(c.document.window.requested_end_ns, 2000);
+                    assert_eq!(c.document.window.effective_start_ns, 1300);
+                    assert_eq!(c.document.window.effective_end_ns, 1450);
+                    let PreObservationCount::Terminal(t) =
+                        &c.failure_context.as_ref().unwrap().count
+                    else {
+                        panic!("lost actual terminal")
+                    };
+                    t.clone()
+                } else {
+                    let f = result
+                        .as_ref()
+                        .err()
+                        .unwrap()
+                        .downcast_ref::<PreObservationFailure>()
+                        .unwrap();
+                    if cancelled {
+                        assert_eq!(f.cause, capture::PreObservationCause::Cancelled);
+                        assert!(f.failure.is_none());
+                        assert_eq!(f.custody.child_exit, Some(137));
+                    } else {
+                        assert_eq!(f.failure.as_ref().unwrap().errno, Some(libc::EIO));
+                    }
+                    let PreObservationCount::Terminal(t) = &f.count else {
+                        panic!("lost actual terminal")
+                    };
+                    t.clone()
+                };
+                let open = terminal.receipt.resolved_open.unwrap();
+                assert_eq!(open.owner_epoch, epoch);
+                assert_eq!(
+                    open.outcome,
+                    if mode != 0 {
+                        OpenOutcome::Completed
+                    } else {
+                        OpenOutcome::Failed
+                    }
+                );
+                assert_eq!(
+                    open.completed_writes,
+                    if mode != 0 {
+                        OpenWriteFrontier::Target
+                    } else {
+                        OpenWriteFrontier::WindowDeadline
+                    }
+                );
+                if mode == 2 || mode == 3 {
+                    let f = terminal.runtime_failure.unwrap();
+                    assert_eq!(
+                        f.class,
+                        if mode == 2 {
+                            FailureClass::Io
+                        } else {
+                            FailureClass::Panic
+                        }
+                    );
+                    if mode == 2 {
+                        assert_eq!(f.errno, Some(libc::EIO));
+                    }
+                }
+                assert_eq!(
+                    terminal.receipt.terminal_id,
+                    selected.borrow().as_ref().unwrap().id
+                );
+                assert_eq!(
+                    terminal.receipt.deadline,
+                    selected.borrow().as_ref().unwrap().deadline
+                );
+                assert_eq!(
+                    terminal.receipt.cleanup_ticket.terminal_id,
+                    terminal.receipt.terminal_id
+                );
+                let result = match result {
+                    Ok(c) => Err(anyhow::Error::new(capture::CaptureRuntimeFailure {
+                        terminal: Some(terminal.clone()),
+                        capture: Arc::new(c),
+                        kind: capture::RuntimeBoundaryKind::SetupAfterOpen,
+                    })
+                    .context("inner actual owner")
+                    .context("outer actual owner")),
+                    Err(e) => Err(e
+                        .context("inner actual owner")
+                        .context("outer actual owner")),
+                };
+                let dir = std::env::temp_dir()
+                    .join("osslscope-g1-production-consumer")
+                    .join(format!(
+                        "actual-owner-{}-{mode}-{check}-{failure}",
+                        std::process::id()
+                    ));
+                std::fs::create_dir_all(&dir).unwrap();
+                let request = OutputRequest {
+                    format: OutputFormat::Json,
+                    primary: OutputDest::File(dir.join(if failure == 1 {
+                        "missing/primary.json"
+                    } else {
+                        "primary.json"
+                    })),
+                    cbom: Some(OutputDest::File(dir.join(if failure == 2 {
+                        "missing/cbom.json"
+                    } else {
+                        "cbom.json"
+                    }))),
+                };
+                let rules = [crate::policy::PolicyRule::deny_provider("default")];
+                let consumed = report::consume_capture_result_with_diagnostics(
+                    result,
+                    if check {
+                        CaptureCommand::Check { rules: &rules }
+                    } else {
+                        CaptureCommand::Report
+                    },
+                    &request,
+                    false,
+                    &mut Vec::new(),
+                );
+                assert_eq!(consumed.exit_code, if lost || mode == 4 { 1 } else { 4 });
+                assert_eq!(consumed.delivery.primary.ok, failure != 1);
+                assert_eq!(consumed.delivery.cbom.as_ref().unwrap().ok, failure != 2);
+                assert_eq!(consumed.child_exit, cancelled.then_some(137));
+                assert_eq!(
+                    consumed.disposition,
+                    Some(if cancelled {
+                        crate::target::TargetDisposition::Exited { code: 137 }
+                    } else {
+                        crate::target::TargetDisposition::Detached { pid: 1 }
+                    })
+                );
+                let context = consumed.failure_context.as_ref().unwrap();
+                assert_eq!(
+                    context.custody.resolution,
+                    if cancelled {
+                        CustodyResolution::Resolved
+                    } else {
+                        CustodyResolution::NotOwned
+                    }
+                );
+                let PreObservationCount::Terminal(retained) = &context.count else {
+                    panic!("consumer dropped actual terminal")
+                };
+                assert!(Arc::ptr_eq(retained, &terminal));
+                if check {
+                    let policy = consumed.document.policy.as_ref().unwrap();
+                    assert_eq!(
+                        policy.verdict,
+                        if lost || mode == 4 {
+                            crate::evidence::PolicyVerdict::Inconclusive
+                        } else {
+                            crate::evidence::PolicyVerdict::NoVerdict
+                        }
+                    );
+                    if lost || mode == 4 {
+                        assert_eq!(policy.rules.len(), 1);
+                        assert_eq!(policy.rules[0].possible, None);
+                    }
+                }
+                if cancelled {
+                    assert_eq!(consumed.document.window.requested_start_ns, 0);
+                    assert_eq!(consumed.document.window.requested_end_ns, 0);
+                    assert_eq!(consumed.document.window.effective_start_ns, 0);
+                    assert_eq!(consumed.document.window.effective_end_ns, 0);
+                    assert!(consumed.document.sites.is_empty());
+                    assert!(consumed.document.fenced.is_empty());
+                    assert!(consumed.document.window.count_admission.is_none());
+                }
+                let value: serde_json::Value =
+                    serde_json::from_slice(&report::render_json(&consumed.document).unwrap())
+                        .unwrap();
+                crate::schema::validate_v2(&value).unwrap();
+                crate::schema::check_v2_semantics(&value).unwrap();
+                if failure != 1 {
+                    let actual: serde_json::Value =
+                        serde_json::from_slice(&std::fs::read(dir.join("primary.json")).unwrap())
+                            .unwrap();
+                    assert_eq!(value, actual);
+                }
+                if failure != 2 {
+                    let cbom: serde_json::Value =
+                        serde_json::from_slice(&std::fs::read(dir.join("cbom.json")).unwrap())
+                            .unwrap();
+                    assert_eq!(cbom["bomFormat"], "CycloneDX");
+                }
+                std::fs::write(
+                    dir.join("human.txt"),
+                    report::render_human(&consumed.document),
+                )
+                .unwrap();
+                assert_eq!(
+                    requests.get(),
+                    1,
+                    "one selected terminal request must not be resubmitted by capture"
+                );
+                assert_eq!(terminals.get(), 1);
+                assert_eq!(finishes.get(), usize::from(lost));
+                assert_eq!(resolves.get(), usize::from(cancelled));
+                probe.cleanup();
+            }
+        }
+    }
+}

@@ -2947,15 +2947,15 @@ impl BoundaryFailure {
             stage,
             class,
             errno,
-            detail: crate::report::bound_line(detail)
-                .chars()
-                .take(200)
-                .collect(),
+            detail: crate::report::normalize_fatal_detail(detail),
         }
     }
     fn from_error(stage: BoundaryStage, error: &anyhow::Error) -> Self {
         if let Some(boundary) = error.downcast_ref::<Self>() {
             return boundary.clone();
+        }
+        if let Some(prepare) = error.downcast_ref::<crate::count_owner::CountPrepareFailure>() {
+            return Self::from_error(stage, &anyhow::Error::new(prepare.failure));
         }
         if let Some(owner) = error
             .chain()
@@ -3010,6 +3010,23 @@ pub enum PreObservationCount {
     PrepareFailed(crate::count_owner::CountPrepareFailure),
     Terminal(Arc<crate::count_session::CountTerminal>),
 }
+impl PreObservationCount {
+    pub(crate) fn actual_failure(&self) -> Option<BoundaryFailure> {
+        let (owner, stage) = match self {
+            Self::NotPrepared => return None,
+            Self::PrepareFailed(f) => (f.failure, BoundaryStage::Setup),
+            Self::Terminal(t) => (t.runtime_failure?, BoundaryStage::Fence),
+        };
+        if owner.class == crate::count_owner::FailureClass::Deadline {
+            return None;
+        }
+        Some(BoundaryFailure::from_error(
+            stage,
+            &anyhow::Error::new(owner),
+        ))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CustodyResolution {
     NotAcquired,
@@ -3059,6 +3076,28 @@ pub struct RejectedPrefix {
     pub enumeration: crate::count_owner::EnumerationStatus,
 }
 impl RejectedPrefix {
+    pub(crate) fn from_count(count: &PreObservationCount) -> Self {
+        match count {
+            PreObservationCount::Terminal(t) => {
+                let mut summary = Self::from_drain(&t.retained_drain);
+                summary.enumeration = match t.receipt.read_status {
+                    crate::count_owner::ReadStatus::Complete => {
+                        crate::count_owner::EnumerationStatus::Complete { unread_keys: 0 }
+                    }
+                    crate::count_owner::ReadStatus::Incomplete { enumeration } => enumeration,
+                    crate::count_owner::ReadStatus::NotStarted => {
+                        crate::count_owner::EnumerationStatus::Unfinished
+                    }
+                };
+                summary
+            }
+            _ => Self {
+                known_rows: None,
+                known_calls: None,
+                enumeration: crate::count_owner::EnumerationStatus::Unfinished,
+            },
+        }
+    }
     fn from_drain(drain: &CountDrain) -> Self {
         let mut known_rows = Some(0u64);
         let mut known_calls = Some(0u64);
@@ -4697,9 +4736,9 @@ enum RoundAction {
 /// as-is (that close is never retried — no double-close, single
 /// fatal); `None` = attempt best-effort inside salvage now.
 struct SalvageSeed {
-    drain: Option<CountDrain>,
+    terminal: Option<Arc<crate::count_session::CountTerminal>>,
     snapshot: Option<DiscoverySnapshot>,
-    disposition: Option<target::TargetDisposition>,
+    custody: Option<CustodyReceipt>,
     effective_end_ns: u64,
 }
 
@@ -4854,20 +4893,21 @@ struct Runner<'x, D, B: CountBackend, T, L, C: ClockPort, P: ProcPort> {
     /// (pre/post metadata disagreed): served to nobody, loud loss
     /// at finalize, evidence-tainting (the rows miss).
     unverified_reads: u64,
-    /// Setup-vs-runtime classifier (H7/B-6): false until the
-    /// observation loop starts (the baseline poll and count fence
-    /// are setup machinery — attach phase, exit 4 on failure).
-    /// Once set, failures salvage into fatal-Runtime captures
-    /// (exit 1) instead of returning Err.
+    /// Legacy loop-transition diagnostic used by host controls. Successful
+    /// release or validated external requested-window facts establish Runtime
+    /// salvage authority independently of this late flag.
     observation_started: bool,
     release_attempt: Option<ReleaseAttempt>,
     owned_exit_before_read: Option<OwnedExitBeforeRead>,
     last_established_ns: u64,
     failure_context: Option<Arc<CaptureFailureContext>>,
     canonical_terminal: Option<Arc<crate::count_session::CountTerminal>>,
+    terminal_id: Option<crate::count_owner::TerminalId>,
+    original_lifecycle_edge: Option<LifecycleEdge>,
+    custody: Option<CustodyReceipt>,
     /// Traversal accumulator (`Some` once an active port's
     /// baseline poll ran; deepened every round, merged with the
-    /// finish tail at close; discarded on recycle/no-window).
+    /// finish tail at close; discarded only on identity recycle).
     traversal: Option<TraversalCapture>,
 }
 
@@ -5678,10 +5718,8 @@ where
         Ok(RoundAction::Continue)
     }
 
-    /// Mid-window infrastructure failure (H7/B-6): before the
-    /// observation loop this keeps the setup shape (best-effort
-    /// cleanup, cleanup failures chained onto the original error);
-    /// once observing, it salvages into a fatal-Runtime capture.
+    /// Infrastructure failure: established requested scopes salvage their
+    /// facts as Runtime; earlier failures retain one setup/custody envelope.
     fn fail_at(self, err: anyhow::Error, stage: BoundaryStage) -> anyhow::Result<Capture> {
         let boundary = BoundaryFailure::from_error(stage, &err);
         self.fail(err.context(boundary))
@@ -5707,11 +5745,12 @@ where
                 self.info.owned,
                 self.child_exit.is_some() && !self.expired,
             );
+            self.original_lifecycle_edge = Some(self.lifecycle_edge(effective_end_ns));
             return self.salvage(
                 SalvageSeed {
-                    drain: None,
+                    terminal: None,
                     snapshot: None,
-                    disposition: None,
+                    custody: None,
                     effective_end_ns,
                 },
                 err,
@@ -5726,60 +5765,28 @@ where
     /// Post-observation salvage (H7/B-6): every remaining close is
     /// attempted best-effort, every failure recorded as a typed loss
     /// counter, and the doc assembles from collected state with a
-    /// fatal-Runtime verdict. Never fails; never retries a close the
-    /// caller already attempted (a `Some` seed piece is used as-is).
+    /// fatal-Runtime verdict. A fallible binding returns its assembled Runtime
+    /// capture in the typed error; no already-attempted close is retried.
     fn salvage(mut self, seed: SalvageSeed, err: anyhow::Error) -> anyhow::Result<Capture> {
         self.reason("close-failure");
-        // Traversal best-effort tail (drained-so-far survives:
-        // proved facts — H7; the finish error rides inside, never
-        // fails salvage).
         self.absorb_traversal_tail();
         let boundary_failure = BoundaryFailure::from_error(BoundaryStage::Setup, &err);
-        let mut failures = vec![format!("{err:#}")];
-        let drain_failed: bool;
-        let drain = match seed.drain {
-            Some(drained) => {
-                drain_failed = false;
-                Some(drained)
-            }
-            None => match self.count.close_for_capture(self.cfg.grace) {
-                Ok(retained) => {
-                    if let Some(failure) = retained.runtime_failure() {
-                        failures.push(failure.to_string());
-                    }
-                    drain_failed = false;
-                    Some(retained.into_drain())
-                }
-                Err(e) => {
-                    self.extra_counters.push(typed_counter(
-                        "count.close_failed",
-                        CounterKind::Loss,
-                        CounterUnits::Events,
-                        CounterSource::Drain,
-                        1,
-                    ));
-                    failures.push(format!("count retained view: {e}"));
-                    drain_failed = true;
-                    None
-                }
-            },
-        };
-        self.close_lifecycle(self.lifecycle_edge(seed.effective_end_ns));
+        let edge = *self.original_lifecycle_edge.get_or_insert(LifecycleEdge {
+            start_ns: self.requested_start_ns,
+            end_ns: seed.effective_end_ns,
+        });
+        let terminal = seed
+            .terminal
+            .unwrap_or_else(|| self.ensure_count_terminal(self.close_reason()));
+        self.close_lifecycle(edge);
         let snapshot = match seed.snapshot {
             Some(snapshot) => snapshot,
             None => {
-                // Snapshot BEFORE attempting finish: on failure the
-                // live session is taken and only this pre-state
-                // survives for assembly.
-                // Round 3, residual D: post-reap provenance for the
-                // maps-loss exemption — captured at finish entry (a
-                // later reap during finish_observation must not
-                // backdate the close read as reaped-then-read).
                 self.reaped_before_close = self.info.owned && self.child_exit.is_some();
                 let pre = self.discovery.snapshot();
                 match self.discovery.finish() {
                     Ok(snapshot) => snapshot,
-                    Err(e) => {
+                    Err(_) => {
                         self.extra_counters.push(typed_counter(
                             "discovery.finish_failed",
                             CounterKind::Loss,
@@ -5787,73 +5794,36 @@ where
                             CounterSource::Discovery,
                             1,
                         ));
-                        failures.push(format!("discovery finish: {e:#}"));
                         pre
                     }
                 }
             }
         };
-        let disposition = match seed.disposition {
-            Some(disposition) => Some(disposition),
-            None => match self.target.finish_observation() {
-                Ok(disposition) => Some(disposition),
-                Err(e) => {
-                    self.extra_counters.push(typed_counter(
-                        "target.finish_failed",
-                        CounterKind::Loss,
-                        CounterUnits::Events,
-                        CounterSource::Lifecycle,
-                        1,
-                    ));
-                    failures.push(format!("finish_observation: {e:#}"));
-                    None
-                }
-            },
-        };
-        if let Some(target::TargetDisposition::Exited { code }) = &disposition {
-            self.child_exit = Some(*code);
-        }
-        // A lost drain means lost counts (sites gone, not zero) —
-        // assemble over an explicitly empty drain, never a forged one.
-        let drain = drain.unwrap_or(CountDrain {
-            current: Vec::new(),
-            fenced: Vec::new(),
-            counters: Vec::new(),
-        });
+        let custody = seed.custody.unwrap_or_else(|| self.finish_custody());
+        let disposition = custody.disposition;
         let effective_end_ns = self.coverage_endpoint().end_ns;
-        let canonical = self.retained_terminal();
         self.failure_context = Some(Arc::new(CaptureFailureContext {
-            count: canonical
-                .map(PreObservationCount::Terminal)
-                .unwrap_or(PreObservationCount::NotPrepared),
-            failure: Some(boundary_failure),
-            custody: CustodyReceipt {
-                disposition,
-                child_exit: self.child_exit,
-                resolution: if !self.info.owned {
-                    CustodyResolution::NotOwned
-                } else if disposition.is_some() {
-                    CustodyResolution::Resolved
-                } else {
-                    CustodyResolution::Unresolved
-                },
-                failure: None,
-            },
+            count: PreObservationCount::Terminal(terminal.clone()),
+            failure: Some(boundary_failure.clone()),
+            custody,
             rejected: RejectedPrefix {
                 known_rows: Some(0),
                 known_calls: Some(0),
                 enumeration: crate::count_owner::EnumerationStatus::Unfinished,
             },
         }));
-        let fatal = evidence::FatalKind::Runtime(crate::report::bound_line(&failures.join("; ")));
+        let fatal = evidence::FatalKind::Runtime(crate::report::bound_line(&format!(
+            "{}: {}",
+            boundary_failure, boundary_failure.detail
+        )));
         self.assemble(
             snapshot,
-            drain,
+            terminal.retained_drain.clone(),
             disposition,
             effective_end_ns,
             Some(SalvageContext {
                 fatal,
-                taint_evidence: drain_failed,
+                taint_evidence: false,
             }),
         )
     }
@@ -5862,13 +5832,7 @@ where
     /// request and its full gap, without inventing count admission or release.
     fn external_no_window_result(mut self) -> anyhow::Result<Capture> {
         assert!(!self.info.owned && self.count.programmed_admission().is_none());
-        let terminal = self
-            .count
-            .terminal_shared(crate::count_session::CloseRequest {
-                started_at: Instant::now(),
-                grace: self.cfg.grace,
-                reason: crate::count_session::CloseReason::SetupAbort,
-            });
+        let terminal = self.ensure_count_terminal(crate::count_session::CloseReason::SetupAbort);
         if terminal.retained_drain.total_calls() != 0 {
             return Err(self.pre_observation_failure(
                 PreObservationCause::WindowBinding,
@@ -5880,88 +5844,90 @@ where
                 )),
             ));
         }
-        let requested_end = self
+        let Some(requested_end) = self
             .info
             .acquired_ns
             .checked_add(duration_ns(self.cfg.duration))
-            .ok_or_else(|| anyhow::anyhow!("window deadline overflow"))?;
+        else {
+            return Err(self.pre_observation_failure(
+                PreObservationCause::OpenUnresolved,
+                Some(BoundaryFailure::new(
+                    BoundaryStage::Open,
+                    BoundaryFailureClass::DeadlineOverflow,
+                    None,
+                    "window deadline overflow",
+                )),
+            ));
+        };
         self.requested_start_ns = self.info.acquired_ns;
+        self.window_start_ns = requested_end;
+        self.last_established_ns = requested_end;
         self.wall_start = self.info.acquired_wall;
         self.wall_end = self.clock.wall_now();
-        let disposition = self.target.finish_observation()?;
-        let window = CaptureWindow {
-            requested_start_ns: self.info.acquired_ns,
-            requested_end_ns: requested_end,
-            effective_start_ns: requested_end,
-            effective_end_ns: requested_end,
-            signal_cut: false,
-            count_admission: None,
+        self.original_lifecycle_edge = Some(self.lifecycle_edge(requested_end));
+        self.close_lifecycle(self.lifecycle_edge(requested_end));
+        if self.discovery.traversal_active() && self.traversal.is_none() {
+            self.traversal = Some(TraversalCapture::default());
+        }
+        self.absorb_traversal_tail();
+        let pre = self.discovery.snapshot();
+        let (snapshot, discovery_failure) = match self.discovery.finish() {
+            Ok(snapshot) => (snapshot, None),
+            Err(error) => {
+                self.extra_counters.push(typed_counter(
+                    "discovery.finish_failed",
+                    CounterKind::Loss,
+                    CounterUnits::Events,
+                    CounterSource::Discovery,
+                    1,
+                ));
+                (
+                    pre,
+                    Some(BoundaryFailure::from_error(
+                        BoundaryStage::Discovery,
+                        &error,
+                    )),
+                )
+            }
         };
-        project_admission(
-            None,
-            None,
-            &window,
-            &terminal.retained_drain,
-            AdmissionMode::SetupNoWindow,
-        )?;
-        let mut document = evidence::finalize(FinalizeInput {
-            window,
-            sites: Vec::new(),
-            fenced: Vec::new(),
-            objects: Vec::new(),
-            coverage: Vec::new(),
-            counters: terminal.retained_drain.counters.clone(),
-            fatal: None,
-            target: doc_target(
-                self.info.pid,
-                &self.comm,
-                &self.info.container_id,
-                &self.info.image_digest,
-            ),
-            openssl: OpensslVersion::unknown(),
-            disposition: doc_disposition(false, Some(&disposition)),
-            policy: None,
-            legacy_partition: LegacyCallPartition::default(),
-            engine_observations: Vec::new(),
-            traversal: None,
-        });
-        document.context = Some(doc_context(
-            &self.info.kernel_release,
-            self.wall_start,
-            self.wall_end,
-        ));
+        let custody = self.finish_custody();
+        let disposition = custody.disposition;
+        let count = PreObservationCount::Terminal(terminal.clone());
+        let failure = count
+            .actual_failure()
+            .or(discovery_failure)
+            .or_else(|| custody.failure.clone());
+        if let Some(failure) = failure {
+            if self.must_salvage_requested_window() {
+                return self.salvage(
+                    SalvageSeed {
+                        terminal: Some(terminal),
+                        snapshot: Some(snapshot),
+                        custody: Some(custody),
+                        effective_end_ns: requested_end,
+                    },
+                    failure.into(),
+                );
+            }
+            return Err(
+                self.pre_observation_failure(PreObservationCause::SetupError, Some(failure))
+            );
+        }
         self.failure_context = Some(Arc::new(CaptureFailureContext {
-            rejected: RejectedPrefix::from_drain(&terminal.retained_drain),
-            count: PreObservationCount::Terminal(terminal),
-            failure: Some(BoundaryFailure::new(
-                BoundaryStage::Open,
-                BoundaryFailureClass::InvalidInput,
-                None,
-                "requested window elapsed before window Open",
-            )),
-            custody: CustodyReceipt {
-                disposition: Some(disposition),
-                child_exit: None,
-                resolution: CustodyResolution::NotOwned,
-                failure: None,
-            },
+            rejected: RejectedPrefix::from_count(&count),
+            count,
+            failure: None,
+            custody,
         }));
-        self.emit_gap_reasons(document.reasons());
         self.reason("no-query");
         self.reason("pid-prewindow-blind");
-        Ok(self.finish_capture(
-            document,
-            FinishParts {
-                outcome: Outcome::Partial,
-                executions: Vec::new(),
-                stale: Vec::new(),
-                counters: Counters::default(),
-                legacy: serde_json::Value::Null,
-                harvest_doc: serde_json::json!({}),
-                disposition: Some(disposition),
-                window_actual: Duration::ZERO,
-            },
-        ))
+        self.assemble(
+            snapshot,
+            terminal.retained_drain.clone(),
+            disposition,
+            requested_end,
+            None,
+        )
     }
 
     /// Mid-window recycle: best-effort close, every observation
@@ -5973,17 +5939,37 @@ where
         // Pid-scoped traversal evidence is tainted like the rest:
         // discarded, never retained.
         self.traversal = None;
-        let mut close_failed = false;
-        if self.count.close_and_drain(self.cfg.grace).is_err() {
-            self.extra_counters.push(typed_counter(
-                "count.close_failed",
-                CounterKind::Loss,
-                CounterUnits::Events,
-                CounterSource::Drain,
-                1,
-            ));
-            close_failed = true;
-        }
+        let effective_end = self.clock.monotonic_ns().min(self.kernel_deadline_ns);
+        // Freeze the observation edge before terminal cleanup can advance
+        // either clock; cleanup time does not describe target coverage.
+        self.wall_end = self.clock.wall_now();
+        self.original_lifecycle_edge = Some(self.lifecycle_edge(effective_end));
+        let terminal =
+            self.ensure_count_terminal(crate::count_session::CloseReason::IdentityRecycle);
+        let mut close_failed = terminal.runtime_failure.is_some();
+        self.extra_counters.extend(
+            terminal
+                .retained_drain
+                .counters
+                .iter()
+                .filter(|c| c.kind == CounterKind::Loss)
+                .cloned(),
+        );
+        self.failure_context = Some(Arc::new(CaptureFailureContext {
+            rejected: RejectedPrefix::from_count(&PreObservationCount::Terminal(terminal.clone())),
+            count: PreObservationCount::Terminal(terminal),
+            failure: None,
+            custody: CustodyReceipt {
+                disposition: None,
+                child_exit: self.child_exit,
+                resolution: if self.info.owned {
+                    CustodyResolution::Unresolved
+                } else {
+                    CustodyResolution::NotOwned
+                },
+                failure: None,
+            },
+        }));
         if self.discovery.finish().is_err() {
             self.extra_counters.push(typed_counter(
                 "discovery.finish_failed",
@@ -5997,10 +5983,6 @@ where
         let requested_end = self
             .requested_start_ns
             .saturating_add(duration_ns(self.cfg.duration));
-        let now_ns = self.clock.monotonic_ns();
-        // R12: the single close sample, alongside the monotonic end
-        // stamp — reused by the document and the Capture.
-        self.wall_end = self.clock.wall_now();
         // R21-F4 (round 2, residual E): same setup-overrun collapse
         // as the assembly path (a close sample predating the
         // clamped start would invert the window — collapse to the
@@ -6011,7 +5993,7 @@ where
                 requested_start_ns: self.requested_start_ns,
                 requested_end_ns: requested_end,
                 effective_start_ns: recycled_start,
-                effective_end_ns: now_ns.min(requested_end).max(recycled_start),
+                effective_end_ns: effective_end.min(requested_end).max(recycled_start),
                 signal_cut: false,
                 count_admission: None,
             },
@@ -6083,6 +6065,82 @@ fn effective_start_ns(window_start_ns: u64, requested_start_ns: u64) -> u64 {
 }
 
 /// Run one requested observation over already-attached sessions.
+fn resolve_pre_observation_custody<T: TargetPort>(
+    target: &mut T,
+    owned: bool,
+    known_exit: Option<i32>,
+) -> CustodyReceipt {
+    if !owned {
+        return CustodyReceipt {
+            disposition: Some(target::TargetDisposition::Detached { pid: target.pid() }),
+            child_exit: None,
+            resolution: CustodyResolution::NotOwned,
+            failure: None,
+        };
+    }
+    if let Some(code) = known_exit {
+        return CustodyReceipt {
+            disposition: Some(target::TargetDisposition::Exited { code }),
+            child_exit: Some(code),
+            resolution: CustodyResolution::Resolved,
+            failure: None,
+        };
+    }
+    let resolve = target.resolve_setup_failure();
+    let poll = target.poll_exit();
+    let child_exit = poll.as_ref().ok().copied().flatten();
+    let failure = resolve
+        .err()
+        .or_else(|| poll.err())
+        .map(|e| BoundaryFailure::from_error(BoundaryStage::Custody, &e));
+    CustodyReceipt {
+        disposition: child_exit.map(|code| target::TargetDisposition::Exited { code }),
+        child_exit,
+        resolution: if failure.is_none() && child_exit.is_some() {
+            CustodyResolution::Resolved
+        } else {
+            CustodyResolution::Unresolved
+        },
+        failure,
+    }
+}
+
+fn preparation_error<T: TargetPort>(
+    error: anyhow::Error,
+    target: &mut T,
+    info: &TargetInfo,
+    stage: BoundaryStage,
+) -> anyhow::Error {
+    let count = error
+        .downcast_ref::<crate::count_owner::CountPrepareFailure>()
+        .copied()
+        .map(PreObservationCount::PrepareFailed)
+        .unwrap_or(PreObservationCount::NotPrepared);
+    let failure = BoundaryFailure::from_error(stage, &error);
+    let custody = resolve_pre_observation_custody(target, info.owned, None);
+    PreObservationFailure::new(
+        PreObservationFailure {
+            cause: PreObservationCause::SetupError,
+            failure: Some(failure),
+            count,
+            release: None,
+            custody,
+            target: doc_target(info.pid, &info.comm, &info.container_id, &info.image_digest),
+            context: Some(CaptureContext {
+                kernel_release: info.kernel_release.clone(),
+                wall_start_unix_ns: (!info.owned).then(|| unix_ns(info.acquired_wall)).flatten(),
+                wall_end_unix_ns: None,
+            }),
+        },
+        false,
+    )
+    .into()
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "single setup boundary with explicit retained custody"
+)]
 fn pre_observation_error<B: CountBackend, T: TargetPort>(
     count: &mut CountSession<B>,
     target: &mut T,
@@ -6091,30 +6149,14 @@ fn pre_observation_error<B: CountBackend, T: TargetPort>(
     cause: PreObservationCause,
     failure: Option<BoundaryFailure>,
     release: Option<ReleaseAttempt>,
+    known_exit: Option<i32>,
 ) -> anyhow::Error {
     let terminal = count.terminal_shared(crate::count_session::CloseRequest {
         started_at: Instant::now(),
         grace: cfg.grace,
         reason: crate::count_session::CloseReason::SetupAbort,
     });
-    let resolved = target.resolve_setup_failure();
-    let child_exit = target.poll_exit().ok().flatten();
-    let disposition = child_exit.map(|code| target::TargetDisposition::Exited { code });
-    let custody = CustodyReceipt {
-        disposition,
-        child_exit,
-        resolution: if !info.owned {
-            CustodyResolution::NotOwned
-        } else if resolved.is_ok() {
-            CustodyResolution::Resolved
-        } else {
-            CustodyResolution::Unresolved
-        },
-        failure: resolved
-            .err()
-            .as_ref()
-            .map(|e| BoundaryFailure::from_error(BoundaryStage::Custody, e)),
-    };
+    let custody = resolve_pre_observation_custody(target, info.owned, known_exit);
     PreObservationFailure::new(
         PreObservationFailure {
             cause,
@@ -6158,8 +6200,21 @@ where
         lifecycle,
     } = sessions;
     if cfg.duration.is_zero() {
-        let _ = target.resolve_setup_failure();
-        anyhow::bail!("--duration must be > 0");
+        return Err(pre_observation_error(
+            &mut count,
+            &mut target,
+            info,
+            cfg,
+            PreObservationCause::SetupError,
+            Some(BoundaryFailure::new(
+                BoundaryStage::Setup,
+                BoundaryFailureClass::InvalidInput,
+                None,
+                "--duration must be > 0",
+            )),
+            None,
+            None,
+        ));
     }
     // Open the kernel window BEFORE release: probes arm while the
     // child is still stopped, so the happy-path startup gap is zero
@@ -6188,6 +6243,7 @@ where
                 "required monotonic Open sample unavailable",
             )),
             None,
+            None,
         ));
     };
     let duration = duration_ns(cfg.duration);
@@ -6197,8 +6253,21 @@ where
         info.acquired_ns
     };
     let Some(kernel_deadline_ns) = declared_start_ns.checked_add(duration) else {
-        let _ = target.resolve_setup_failure();
-        anyhow::bail!("window deadline overflow");
+        return Err(pre_observation_error(
+            &mut count,
+            &mut target,
+            info,
+            cfg,
+            PreObservationCause::OpenUnresolved,
+            Some(BoundaryFailure::new(
+                BoundaryStage::Open,
+                BoundaryFailureClass::DeadlineOverflow,
+                None,
+                "window deadline overflow",
+            )),
+            None,
+            None,
+        ));
     };
     let setup_elapsed = start_ns >= kernel_deadline_ns;
     if setup_elapsed && info.owned {
@@ -6214,6 +6283,7 @@ where
                 None,
                 "empty count window",
             )),
+            None,
             None,
         ));
     }
@@ -6305,19 +6375,16 @@ where
         last_established_ns: start_ns,
         failure_context: None,
         canonical_terminal: None,
+        terminal_id: None,
+        original_lifecycle_edge: None,
+        custody: None,
         traversal: None,
     };
     runner.fallback_partial = runner.lifecycle.fallback_partial();
     if let Some(error) = open_error {
         // A lost Open reply can resolve Completed in this same canonical
         // terminal. Scope routing must inspect that actual resolved binding.
-        let _ = runner
-            .count
-            .terminal_shared(crate::count_session::CloseRequest {
-                started_at: Instant::now(),
-                grace: cfg.grace,
-                reason: crate::count_session::CloseReason::SetupAbort,
-            });
+        runner.ensure_count_terminal(crate::count_session::CloseReason::SetupAbort);
         if runner.must_salvage_requested_window() {
             return runner.fail(error.context("count Open after completed binding"));
         }
@@ -6344,7 +6411,16 @@ where
     fn must_salvage_requested_window(&self) -> bool {
         self.release_attempt
             .is_some_and(|r| r.outcome == ReleaseOutcome::Succeeded)
-            || (!self.info.owned && self.count.programmed_admission().is_some())
+            || (!self.info.owned
+                && (self.count.programmed_admission().is_some()
+                    || self.in_window_lgcalls > 0
+                    || self.in_window_trip.values().any(|n| *n > 0)
+                    || self.traversal.as_ref().is_some_and(|t| {
+                        t.done.iter().any(|w| {
+                            w.event_ns >= self.requested_start_ns
+                                && w.event_ns < self.kernel_deadline_ns
+                        })
+                    })))
     }
     fn pre_observation_failure(
         mut self,
@@ -6352,22 +6428,98 @@ where
         failure: Option<BoundaryFailure>,
     ) -> anyhow::Error {
         assert!(!self.must_salvage_requested_window());
-        pre_observation_error(
-            &mut self.count,
-            &mut self.target,
-            self.info,
-            self.cfg,
-            cause,
-            failure,
-            self.release_attempt,
+        let terminal = self.ensure_count_terminal(crate::count_session::CloseReason::SetupAbort);
+        let custody = self.custody.take().unwrap_or_else(|| {
+            resolve_pre_observation_custody(&mut self.target, self.info.owned, self.child_exit)
+        });
+        PreObservationFailure::new(
+            PreObservationFailure {
+                cause,
+                failure,
+                count: PreObservationCount::Terminal(terminal),
+                release: self.release_attempt,
+                custody,
+                target: doc_target(
+                    self.info.pid,
+                    &self.comm,
+                    &self.info.container_id,
+                    &self.info.image_digest,
+                ),
+                context: Some(CaptureContext {
+                    kernel_release: self.info.kernel_release.clone(),
+                    wall_start_unix_ns: (!self.info.owned)
+                        .then(|| unix_ns(self.info.acquired_wall))
+                        .flatten(),
+                    wall_end_unix_ns: None,
+                }),
+            },
+            false,
         )
+        .into()
     }
+    fn ensure_count_terminal(
+        &mut self,
+        reason: crate::count_session::CloseReason,
+    ) -> Arc<crate::count_session::CountTerminal> {
+        if let Some(terminal) = &self.canonical_terminal {
+            return terminal.clone();
+        }
+        let terminal = self
+            .count
+            .terminal_shared(crate::count_session::CloseRequest {
+                started_at: Instant::now(),
+                grace: self.cfg.grace,
+                reason,
+            });
+        self.terminal_id = self.count.terminal_id();
+        self.canonical_terminal = Some(terminal.clone());
+        terminal
+    }
+
+    fn finish_custody(&mut self) -> CustodyReceipt {
+        if let Some(receipt) = &self.custody {
+            return receipt.clone();
+        }
+        let result = self.target.finish_observation();
+        let (disposition, failure) = match result {
+            Ok(disposition) => (Some(disposition), None),
+            Err(error) => {
+                self.extra_counters.push(typed_counter(
+                    "target.finish_failed",
+                    CounterKind::Loss,
+                    CounterUnits::Events,
+                    CounterSource::Lifecycle,
+                    1,
+                ));
+                (
+                    None,
+                    Some(BoundaryFailure::from_error(BoundaryStage::Custody, &error)),
+                )
+            }
+        };
+        if let Some(target::TargetDisposition::Exited { code }) = disposition {
+            self.child_exit = Some(code);
+        }
+        let receipt = CustodyReceipt {
+            disposition,
+            child_exit: self.child_exit,
+            resolution: if !self.info.owned {
+                CustodyResolution::NotOwned
+            } else if disposition.is_some() {
+                CustodyResolution::Resolved
+            } else {
+                CustodyResolution::Unresolved
+            },
+            failure,
+        };
+        self.custody = Some(receipt.clone());
+        receipt
+    }
+
     fn retained_terminal(&mut self) -> Option<Arc<crate::count_session::CountTerminal>> {
         if self.canonical_terminal.is_none() {
-            self.canonical_terminal = self
-                .count
-                .terminal_id()
-                .map(|id| self.count.shared_terminal(id));
+            self.terminal_id = self.count.terminal_id();
+            self.canonical_terminal = self.terminal_id.map(|id| self.count.shared_terminal(id));
         }
         self.canonical_terminal.clone()
     }
@@ -6483,7 +6635,27 @@ where
             return Err(self.pre_observation_failure(PreObservationCause::Cancelled, None));
         }
         if setup_deadline.is_some_and(|d| self.clock.now() >= d) {
-            return self.fail(anyhow::anyhow!("setup timeout"));
+            return self.fail(
+                BoundaryFailure::new(
+                    BoundaryStage::Setup,
+                    BoundaryFailureClass::Timeout,
+                    None,
+                    "setup deadline expired",
+                )
+                .into(),
+            );
+        }
+        if owned {
+            match self.target.poll_exit() {
+                Ok(Some(code)) => {
+                    self.child_exit = Some(code);
+                    return Err(
+                        self.pre_observation_failure(PreObservationCause::NeverReleasedExit, None)
+                    );
+                }
+                Ok(None) => {}
+                Err(error) => return self.fail_at(error, BoundaryStage::Custody),
+            }
         }
         // The lower edge belongs to the operation while the child is stopped.
         if owned {
@@ -6566,9 +6738,15 @@ where
             self.info.acquired_instant
         };
         let Some(loop_deadline) = args::deadline_at(requested_instant, self.cfg.duration) else {
-            let _ = self.count.close_and_drain(self.cfg.grace);
-            let _ = self.target.resolve_setup_failure();
-            anyhow::bail!("window deadline overflow");
+            return self.fail(
+                BoundaryFailure::new(
+                    BoundaryStage::Open,
+                    BoundaryFailureClass::DeadlineOverflow,
+                    None,
+                    "window deadline overflow",
+                )
+                .into(),
+            );
         };
         // Clamp the loop to the kernel deadline: the kernel window
         // opened pre-setup while the requested window starts at
@@ -6745,32 +6923,19 @@ where
             self.child_exit.is_some() && !self.expired,
         );
         let pre_finish = self.discovery.snapshot();
-        let drain = match self.count.close_for_capture(self.cfg.grace) {
-            Ok(retained) if retained.runtime_failure().is_none() => retained.into_drain(),
-            Ok(retained) => {
-                let failure = retained.runtime_failure().expect("runtime failure branch");
-                return self.salvage(
-                    SalvageSeed {
-                        drain: Some(retained.into_drain()),
-                        snapshot: None,
-                        disposition: None,
-                        effective_end_ns,
-                    },
-                    failure.into(),
-                );
-            }
-            Err(e) => {
-                return self.salvage(
-                    SalvageSeed {
-                        drain: None,
-                        snapshot: None,
-                        disposition: None,
-                        effective_end_ns,
-                    },
-                    e.into(),
-                );
-            }
-        };
+        self.original_lifecycle_edge = Some(original_lifecycle_edge);
+        let terminal = self.ensure_count_terminal(self.close_reason());
+        if let Some(failure) = terminal.runtime_failure {
+            return self.salvage(
+                SalvageSeed {
+                    terminal: Some(terminal),
+                    snapshot: None,
+                    custody: None,
+                    effective_end_ns,
+                },
+                failure.into(),
+            );
+        }
         self.drain_wall_us = self
             .clock
             .now()
@@ -6823,42 +6988,84 @@ where
                         r.final_snapshot.clone().unwrap_or(pre)
                     }
                     _ => {
+                        let failure = BoundaryFailure::from_error(
+                            BoundaryStage::Discovery,
+                            &e.context("discovery finish"),
+                        );
                         return self.salvage(
                             SalvageSeed {
-                                drain: Some(drain),
+                                terminal: Some(terminal),
                                 snapshot: Some(pre_finish),
-                                disposition: None,
+                                custody: None,
                                 effective_end_ns,
                             },
-                            e.context("discovery finish"),
+                            failure.into(),
                         );
                     }
                 }
             }
         };
-        let disposition = match self.target.finish_observation() {
-            Ok(disposition) => disposition,
-            Err(e) => {
-                return self.salvage(
-                    SalvageSeed {
-                        drain: Some(drain),
-                        snapshot: Some(snapshot),
-                        disposition: None,
-                        effective_end_ns,
-                    },
-                    e.context("finish_observation"),
-                );
-            }
-        };
-        if let target::TargetDisposition::Exited { code } = disposition {
-            self.child_exit = Some(code);
+        let custody = self.finish_custody();
+        let disposition = custody.disposition;
+        if let Some(failure) = custody.failure.clone() {
+            return self.salvage(
+                SalvageSeed {
+                    terminal: Some(terminal),
+                    snapshot: Some(snapshot),
+                    custody: Some(custody),
+                    effective_end_ns,
+                },
+                failure.into(),
+            );
         }
         // Traversal tail (last drain before assembly: the quiesce
         // slice lands here too — same class as the harvest tail
         // join; salvage-seed paths absorb inside salvage instead,
         // so every close absorbs exactly once).
         self.absorb_traversal_tail();
-        self.assemble(snapshot, drain, Some(disposition), effective_end_ns, None)
+        self.assemble(
+            snapshot,
+            terminal.retained_drain.clone(),
+            disposition,
+            effective_end_ns,
+            None,
+        )
+    }
+
+    fn retain_binding_failure(
+        &mut self,
+        failure: &mut WindowBindingFailure,
+        disposition: Option<target::TargetDisposition>,
+    ) {
+        failure.terminal = self.retained_terminal();
+        let count = failure
+            .terminal
+            .clone()
+            .map(PreObservationCount::Terminal)
+            .unwrap_or(PreObservationCount::NotPrepared);
+        failure.rejected = RejectedPrefix::from_count(&count);
+        self.failure_context = Some(Arc::new(CaptureFailureContext {
+            rejected: failure.rejected,
+            count,
+            failure: Some(BoundaryFailure::new(
+                BoundaryStage::WindowBinding,
+                BoundaryFailureClass::InvalidInput,
+                None,
+                &failure.to_string(),
+            )),
+            custody: self.custody.clone().unwrap_or(CustodyReceipt {
+                disposition,
+                child_exit: self.child_exit,
+                resolution: if !self.info.owned {
+                    CustodyResolution::NotOwned
+                } else if disposition.is_some() {
+                    CustodyResolution::Resolved
+                } else {
+                    CustodyResolution::Unresolved
+                },
+                failure: None,
+            }),
+        }));
     }
 
     /// Sites of one op with live probes (coverage attach census).
@@ -7514,12 +7721,18 @@ where
             signal_cut: self.signal_cut,
             count_admission: None,
         };
-        let mut mode =
-            if self.signal_cut || salvage.is_some() || effective_end_ns < original_requested_end {
-                AdmissionMode::Degraded
-            } else {
-                AdmissionMode::Ordinary
-            };
+        let mut mode = if programmed.is_none()
+            && !self.info.owned
+            && effective_start == original_requested_end
+            && effective_end_ns == original_requested_end
+        {
+            AdmissionMode::SetupNoWindow
+        } else if self.signal_cut || salvage.is_some() || effective_end_ns < original_requested_end
+        {
+            AdmissionMode::Degraded
+        } else {
+            AdmissionMode::Ordinary
+        };
         if !empty_overlap && let Some(proof) = self.owned_exit_before_read {
             window.requested_end_ns = effective_end_ns;
             mode = AdmissionMode::OwnedFulfilled(proof);
@@ -7531,10 +7744,14 @@ where
             &drain,
             mode,
         );
+        let mut binding_failure = None;
         if matches!(&projection, Err(failure) if failure.reason == WindowBindingReason::FulfilledTail)
         {
-            // A retained tail cannot be hidden by fulfillment. Keep the original
-            // duration and actual Open instead of inventing a shorter interval.
+            // A failed shortened fulfillment remains a Runtime boundary even
+            // when the original-duration degraded representation is valid.
+            let mut failure = projection.expect_err("fulfilled projection failure");
+            self.retain_binding_failure(&mut failure, disposition);
+            binding_failure = Some(failure);
             window.requested_end_ns = original_requested_end;
             projection = project_admission(
                 programmed.as_ref(),
@@ -7544,7 +7761,6 @@ where
                 AdmissionMode::Degraded,
             );
         }
-        let mut binding_failure = None;
         match projection {
             Ok(AdmissionProjection::RenderBound(bound)) => window.count_admission = Some(bound),
             Ok(
@@ -7553,35 +7769,9 @@ where
                 | AdmissionProjection::NoObservation,
             ) => {}
             Err(mut failure) => {
-                failure.terminal = self.retained_terminal();
-                // This is an explicit rejected-prefix error, never a filtered
-                // success. Representable facts still form Runtime salvage;
-                // every rejected original row remains in the canonical terminal.
-                let terminal = failure.terminal.clone();
-                self.failure_context = Some(Arc::new(CaptureFailureContext {
-                    count: terminal
-                        .map(PreObservationCount::Terminal)
-                        .unwrap_or(PreObservationCount::NotPrepared),
-                    failure: Some(BoundaryFailure::new(
-                        BoundaryStage::WindowBinding,
-                        BoundaryFailureClass::InvalidInput,
-                        None,
-                        &failure.to_string(),
-                    )),
-                    custody: CustodyReceipt {
-                        disposition,
-                        child_exit: self.child_exit,
-                        resolution: if !self.info.owned {
-                            CustodyResolution::NotOwned
-                        } else if disposition.is_some() {
-                            CustodyResolution::Resolved
-                        } else {
-                            CustodyResolution::Unresolved
-                        },
-                        failure: None,
-                    },
-                    rejected: failure.rejected,
-                }));
+                // Keep the rejected original image separately from every
+                // representable fact in the Runtime document.
+                self.retain_binding_failure(&mut failure, disposition);
                 window.requested_end_ns = original_requested_end;
                 let render_bound = programmed.filter(|p| {
                     p.start_ns() < p.deadline_ns()
@@ -8873,8 +9063,22 @@ fn run_inner(
                             setup_deadline,
                             &INTERRUPTED,
                         )
-                        .map_err(|e| anyhow::anyhow!("spawn: {e:#}"))?;
+                        .map_err(|e| e.context("spawn"))?;
                         let pid = owned.pid();
+                        let mut info = TargetInfo {
+                            pid,
+                            owned: true,
+                            comm: comm_of(pid),
+                            cmdline,
+                            container_id: container_id_of(pid),
+                            kernel_release: crate::doctor::uname_release(),
+                            provider_build_id: String::new(),
+                            provider_path: String::new(),
+                            image_digest: cfg.image_digest.clone(),
+                            acquired_ns: acq_ns,
+                            acquired_instant: acq_instant,
+                            acquired_wall: acq_wall,
+                        };
                         let resolved = match resolve_capture_provider(
                             AutoTarget::Spawn(&argv),
                             cfg,
@@ -8885,31 +9089,17 @@ fn run_inner(
                             Err(e) => {
                                 // Same custody rule as a discovery-attach
                                 // failure: preserve status, resolve, fail loud.
-                                let exit_note = owned
-                                    .poll_exit()
-                                    .ok()
-                                    .flatten()
-                                    .map(|code| format!(" (child status {code})"))
-                                    .unwrap_or_default();
-                                let _ = owned.resolve_setup_failure();
-                                return Err(e.context(format!("target resolution{exit_note}")));
+                                return Err(preparation_error(
+                                    e.context("target resolution"),
+                                    &mut owned,
+                                    &info,
+                                    BoundaryStage::Setup,
+                                ));
                             }
                         };
                         let effective = effective_config(cfg, &objects, &resolved);
-                        let info = TargetInfo {
-                            pid,
-                            owned: true,
-                            comm: comm_of(pid),
-                            cmdline,
-                            container_id: container_id_of(pid),
-                            kernel_release: crate::doctor::uname_release(),
-                            provider_build_id: resolved.build_id,
-                            provider_path: resolved.path.to_string_lossy().into_owned(),
-                            image_digest: cfg.image_digest.clone(),
-                            acquired_ns: acq_ns,
-                            acquired_instant: acq_instant,
-                            acquired_wall: acq_wall,
-                        };
+                        info.provider_build_id = resolved.build_id.clone();
+                        info.provider_path = resolved.path.to_string_lossy().into_owned();
                         let discovery = match DiscoverySession::attach(
                             &crate::discovery::session::DiscoveryConfig {
                                 provider: resolved.path,
@@ -8929,14 +9119,12 @@ fn run_inner(
                                 // A stopped child can only die by an outside
                                 // kill; preserve whatever status exists, resolve
                                 // custody, and fail loud (no zombie, no silence).
-                                let exit_note = owned
-                                    .poll_exit()
-                                    .ok()
-                                    .flatten()
-                                    .map(|code| format!(" (child status {code})"))
-                                    .unwrap_or_default();
-                                let _ = owned.resolve_setup_failure();
-                                return Err(e.context(format!("discovery attach{exit_note}")));
+                                return Err(preparation_error(
+                                    e.context("discovery attach"),
+                                    &mut owned,
+                                    &info,
+                                    BoundaryStage::Discovery,
+                                ));
                             }
                         };
                         // Selected traversal attaches before release (probes arm
@@ -8945,14 +9133,12 @@ fn run_inner(
                         let discovery = match wrap_discovery(discovery, traversal.as_ref(), pid) {
                             Ok(discovery) => discovery,
                             Err(e) => {
-                                let exit_note = owned
-                                    .poll_exit()
-                                    .ok()
-                                    .flatten()
-                                    .map(|code| format!(" (child status {code})"))
-                                    .unwrap_or_default();
-                                let _ = owned.resolve_setup_failure();
-                                return Err(e.context(format!("traversal attach{exit_note}")));
+                                return Err(preparation_error(
+                                    e.context("traversal attach"),
+                                    &mut owned,
+                                    &info,
+                                    BoundaryStage::Traversal,
+                                ));
                             }
                         };
                         let lifecycle = LiveLifecycle::select(pid, false, prefix);
@@ -8965,10 +9151,12 @@ fn run_inner(
                         deadline,
                     ) {
                         Ok(backend) => Ok(backend),
-                        Err(e) => {
-                            let _ = state.0.resolve_setup_failure();
-                            Err(e.into())
-                        }
+                        Err(e) => Err(preparation_error(
+                            e.into(),
+                            &mut state.0,
+                            &state.1,
+                            BoundaryStage::Setup,
+                        )),
                     },
                 )?;
             let pid = info.pid;
@@ -8989,25 +9177,35 @@ fn run_inner(
         }
         Target::Pid(p) => {
             let pin_guard = pin::pin(p).map_err(|e| anyhow::anyhow!("pin: {e:#}"))?;
-            let resolved =
-                resolve_capture_provider(AutoTarget::Pid(p), cfg, &offset_table, enrollment)
-                    .map_err(|e| e.context("target resolution"))?;
-            let effective = effective_config(cfg, &objects, &resolved);
+            let mut pinned = PinnedTarget::new(p, pin_guard);
             let raw = std::fs::read(format!("/proc/{p}/cmdline")).unwrap_or_default();
-            let info = TargetInfo {
+            let mut info = TargetInfo {
                 pid: p,
                 owned: false,
                 comm: comm_of(p),
                 cmdline: args::redact_proc_cmdline(&raw),
                 container_id: container_id_of(p),
                 kernel_release: crate::doctor::uname_release(),
-                provider_build_id: resolved.build_id,
-                provider_path: resolved.path.to_string_lossy().into_owned(),
+                provider_build_id: String::new(),
+                provider_path: String::new(),
                 image_digest: cfg.image_digest.clone(),
                 acquired_ns: acq_ns,
                 acquired_instant: acq_instant,
                 acquired_wall: acq_wall,
             };
+            let resolved =
+                resolve_capture_provider(AutoTarget::Pid(p), cfg, &offset_table, enrollment)
+                    .map_err(|e| {
+                        preparation_error(
+                            e.context("target resolution"),
+                            &mut pinned,
+                            &info,
+                            BoundaryStage::Setup,
+                        )
+                    })?;
+            let effective = effective_config(cfg, &objects, &resolved);
+            info.provider_build_id = resolved.build_id.clone();
+            info.provider_path = resolved.path.to_string_lossy().into_owned();
             let discovery = match DiscoverySession::attach(
                 &crate::discovery::session::DiscoveryConfig {
                     provider: resolved.path,
@@ -9029,23 +9227,50 @@ fn run_inner(
                     if e.downcast_ref::<Recycled>().is_some() {
                         return Ok(recycled_capture(&effective, &info, selected_objects));
                     }
-                    return Err(e.context("discovery attach"));
+                    return Err(preparation_error(
+                        e.context("discovery attach"),
+                        &mut pinned,
+                        &info,
+                        BoundaryStage::Discovery,
+                    ));
                 }
             };
             // Selected traversal uses the same pre-window attach;
             // a refusal here is an anchor/attach failure, not recycle.
             let discovery = match wrap_discovery(discovery, traversal.as_ref(), p) {
                 Ok(discovery) => discovery,
-                Err(e) => return Err(e.context("traversal attach")),
+                Err(e) => {
+                    return Err(preparation_error(
+                        e.context("traversal attach"),
+                        &mut pinned,
+                        &info,
+                        BoundaryStage::Traversal,
+                    ));
+                }
             };
-            let setup_deadline = args::deadline_at(acq_instant, cfg.harvest_timeout)
-                .ok_or_else(|| anyhow::anyhow!("setup deadline overflow"))?;
+            let setup_deadline =
+                args::deadline_at(acq_instant, cfg.harvest_timeout).ok_or_else(|| {
+                    preparation_error(
+                        BoundaryFailure::new(
+                            BoundaryStage::Setup,
+                            BoundaryFailureClass::DeadlineOverflow,
+                            None,
+                            "setup deadline overflow",
+                        )
+                        .into(),
+                        &mut pinned,
+                        &info,
+                        BoundaryStage::Setup,
+                    )
+                })?;
             let (lifecycle, backend) = prepare_after_initial_forks(
                 fork_barrier,
                 setup_deadline,
                 |prefix| Ok(LiveLifecycle::select(p, true, prefix)),
                 |_, barrier, deadline| {
-                    prepare_count_backend(&obj_bytes, p, barrier, deadline).map_err(Into::into)
+                    prepare_count_backend(&obj_bytes, p, barrier, deadline).map_err(|e| {
+                        preparation_error(e.into(), &mut pinned, &info, BoundaryStage::Setup)
+                    })
                 },
             )?;
             let count = CountSession::new(p, backend);
@@ -9055,7 +9280,7 @@ fn run_inner(
                 SessionSet {
                     discovery,
                     count,
-                    target: PinnedTarget::new(p, pin_guard),
+                    target: pinned,
                     lifecycle,
                 },
                 &LiveClock,
@@ -12917,6 +13142,167 @@ mod tests {
             assert_eq!(acc.done[0].op, crate::scan::oracle::UNKNOWN_OP);
         }
 
+        #[test]
+        fn g1_external_no_open_keeps_independent_traversal_tail() {
+            let mut cfg = stub_config();
+            cfg.duration = Duration::from_nanos(1000);
+            let mut info = stub_info();
+            info.acquired_ns = 1000;
+            let clock = ClockStub::at(2400);
+            let mut provenance = triple_prov();
+            provenance.harvest.sha256 = "a".repeat(64);
+            provenance.count.sha256 = "b".repeat(64);
+            provenance.members.sha256 = "c".repeat(64);
+            let discovery = TraversalStub::scripted(
+                Vec::new(),
+                TraversalCapture {
+                    provenance: Some(provenance),
+                    polls: 3,
+                    finish_error: Some("retained traversal tail".into()),
+                    ..Default::default()
+                },
+            );
+            let capture = observe(
+                &cfg,
+                &info,
+                SessionSet {
+                    discovery,
+                    count: CountSession::new(TPID, FakeCountBackend::new()),
+                    target: TargetStub,
+                    lifecycle: LifecycleStub,
+                },
+                &clock,
+                &mut ProcStub,
+                &|| false,
+            )
+            .unwrap();
+            let traversal = capture
+                .traversal
+                .as_ref()
+                .expect("elapsed count setup cannot clear an independent traversal tail");
+            assert_eq!(traversal.polls, 3);
+            assert_eq!(
+                traversal.finish_error.as_deref(),
+                Some("retained traversal tail")
+            );
+            assert_eq!(capture.document.window.requested_start_ns, 1000);
+            assert_eq!(capture.document.window.requested_end_ns, 2000);
+            assert_eq!(capture.document.window.effective_start_ns, 2000);
+            assert_eq!(capture.document.window.effective_end_ns, 2000);
+            assert!(capture.document.window.count_admission.is_none());
+            assert!(capture.document.sites.is_empty());
+            assert_eq!(counter(&capture.document, "traversal.finish_error"), 1);
+            let value: serde_json::Value =
+                serde_json::from_slice(&crate::report::render_json(&capture.document).unwrap())
+                    .unwrap();
+            crate::schema::validate_v2(&value).unwrap();
+            crate::schema::check_v2_semantics(&value).unwrap();
+        }
+
+        #[test]
+        fn g1_preparation_failure_retains_ticket_and_once_only_custody() {
+            struct Custody {
+                resolves: usize,
+            }
+            impl TargetPort for Custody {
+                fn pid(&self) -> u32 {
+                    TPID
+                }
+                fn is_owned(&self) -> bool {
+                    true
+                }
+                fn release(&mut self) -> anyhow::Result<()> {
+                    panic!("preparation cannot release")
+                }
+                fn poll_exit(&mut self) -> anyhow::Result<Option<i32>> {
+                    Ok(Some(137))
+                }
+                fn resolve_setup_failure(&mut self) -> anyhow::Result<()> {
+                    self.resolves += 1;
+                    Ok(())
+                }
+                fn finish_observation(&mut self) -> anyhow::Result<target::TargetDisposition> {
+                    panic!("consumer cannot finish custody")
+                }
+                fn verify(&self) -> anyhow::Result<()> {
+                    Ok(())
+                }
+            }
+            let mut session = CountSession::new(TPID, FakeCountBackend::new());
+            let terminal = session.terminal_shared(crate::count_session::CloseRequest {
+                started_at: Instant::now(),
+                grace: Duration::from_secs(1),
+                reason: crate::count_session::CloseReason::SetupAbort,
+            });
+            let ticket = terminal.receipt.cleanup_ticket;
+            for check in [false, true] {
+                let mut target = Custody { resolves: 0 };
+                let mut info = stub_info();
+                info.owned = true;
+                let prepare = crate::count_owner::CountPrepareFailure {
+                    failure: crate::count_owner::OwnerFailure {
+                        operation: crate::count_owner::CountOperation::Load,
+                        resource: crate::count_owner::ResourceId::Engine,
+                        class: crate::count_owner::FailureClass::Io,
+                        errno: Some(libc::EMFILE),
+                    },
+                    cleanup_ticket: Some(ticket),
+                };
+                let error =
+                    preparation_error(prepare.into(), &mut target, &info, BoundaryStage::Setup)
+                        .context("inner")
+                        .context("outer");
+                let failure = error.downcast_ref::<PreObservationFailure>().unwrap();
+                assert_eq!(failure.failure.as_ref().unwrap().errno, Some(libc::EMFILE));
+                assert_eq!(
+                    failure.failure.as_ref().unwrap().class,
+                    BoundaryFailureClass::Io
+                );
+                assert_eq!(target.resolves, 1);
+                let dir = std::env::temp_dir().join(format!(
+                    "osslscope-prepare-ticket-{}-{check}",
+                    std::process::id()
+                ));
+                std::fs::create_dir_all(&dir).unwrap();
+                let request = crate::report::OutputRequest {
+                    format: crate::report::OutputFormat::Json,
+                    primary: crate::report::OutputDest::File(dir.join("primary.json")),
+                    cbom: Some(crate::report::OutputDest::File(dir.join("cbom.json"))),
+                };
+                let rules = [crate::policy::PolicyRule::deny_provider("default")];
+                let result = crate::report::consume_capture_result_with_diagnostics(
+                    Err(error),
+                    if check {
+                        crate::report::CaptureCommand::Check { rules: &rules }
+                    } else {
+                        crate::report::CaptureCommand::Report
+                    },
+                    &request,
+                    true,
+                    &mut Vec::new(),
+                );
+                assert_eq!(result.exit_code, 4);
+                assert_eq!(result.child_exit, Some(137));
+                assert_eq!(target.resolves, 1);
+                let context = result.failure_context.as_ref().unwrap();
+                let PreObservationCount::PrepareFailed(retained) = context.count else {
+                    panic!("lost prepare ticket")
+                };
+                assert_eq!(retained.cleanup_ticket, Some(ticket));
+                assert_eq!(context.rejected.known_calls, None);
+                assert!(result.diagnostics.iter().any(
+                    |s| s.contains("prepare ticket=") && s.contains("unresolved-slots=unknown")
+                ));
+                let value: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(dir.join("primary.json")).unwrap())
+                        .unwrap();
+                crate::schema::validate_v2(&value).unwrap();
+                crate::schema::check_v2_semantics(&value).unwrap();
+                assert!(result.delivery.delivered_all());
+                std::fs::remove_dir_all(dir).unwrap();
+            }
+        }
+
         struct TargetStub;
         impl TargetPort for TargetStub {
             fn pid(&self) -> u32 {
@@ -13193,6 +13579,9 @@ mod tests {
                 last_established_ns: programmed.start_ns().max(requested_start),
                 failure_context: None,
                 canonical_terminal: None,
+                terminal_id: None,
+                original_lifecycle_edge: None,
+                custody: None,
                 traversal: None,
             }
         }
@@ -14144,7 +14533,16 @@ mod tests {
                     read_error: true,
                     ..Default::default()
                 });
-            assert!(count.close_and_drain(Duration::from_secs(1)).is_err());
+            assert!(
+                count
+                    .terminal_shared(crate::count_session::CloseRequest {
+                        started_at: Instant::now(),
+                        grace: Duration::from_secs(1),
+                        reason: crate::count_session::CloseReason::Failure
+                    })
+                    .runtime_failure
+                    .is_some()
+            );
             let runner = stub_runner(
                 &cfg,
                 &info,
@@ -14190,7 +14588,16 @@ mod tests {
                     read_error: true,
                     ..Default::default()
                 });
-            assert!(count.close_and_drain(Duration::from_secs(1)).is_err());
+            assert!(
+                count
+                    .terminal_shared(crate::count_session::CloseRequest {
+                        started_at: Instant::now(),
+                        grace: Duration::from_secs(1),
+                        reason: crate::count_session::CloseReason::Failure
+                    })
+                    .runtime_failure
+                    .is_some()
+            );
             let runner = stub_runner(
                 &cfg,
                 &info,
@@ -14351,7 +14758,16 @@ mod tests {
                     read_error: true,
                     ..Default::default()
                 });
-            assert!(count.close_and_drain(Duration::from_secs(1)).is_err());
+            assert!(
+                count
+                    .terminal_shared(crate::count_session::CloseRequest {
+                        started_at: Instant::now(),
+                        grace: Duration::from_secs(1),
+                        reason: crate::count_session::CloseReason::Failure
+                    })
+                    .runtime_failure
+                    .is_some()
+            );
             let runner = stub_runner(
                 &cfg,
                 &info,
@@ -15007,7 +15423,16 @@ mod tests {
                     read_error: true,
                     ..Default::default()
                 });
-            assert!(count.close_and_drain(Duration::from_secs(1)).is_err());
+            assert!(
+                count
+                    .terminal_shared(crate::count_session::CloseRequest {
+                        started_at: Instant::now(),
+                        grace: Duration::from_secs(1),
+                        reason: crate::count_session::CloseReason::Failure
+                    })
+                    .runtime_failure
+                    .is_some()
+            );
             let mut runner = stub_runner(
                 &cfg,
                 &info,

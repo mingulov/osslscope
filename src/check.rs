@@ -16,14 +16,12 @@
 //! closed); a proved violation stays exit 10 even when an artifact path
 //! is unwritable or the child failed.
 use crate::capture;
-use crate::evidence::{CaptureDocument, FatalKind, PolicyRecord, RuleVerdict};
+use crate::evidence::{CaptureDocument, PolicyRecord, RuleVerdict};
 use crate::policy::{
     PolicyOutcome, PolicyRule, PolicyVerdict, apply_legacy_engine_fallback, evaluate_document,
     executed_param_blind_ops, fips_unlabeled_calls,
 };
-use crate::report::{
-    OutputDest, OutputFormat, OutputRequest, bound_line, setup_failure_document, write_artifacts,
-};
+use crate::report::{OutputDest, OutputFormat, OutputRequest};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
@@ -566,46 +564,17 @@ pub fn run(argv: &[String]) -> ExitCode {
             ..
         }
     );
-    let c = match capture::run(&args.cfg, args.target) {
-        Ok(c) => c,
-        Err(e) => {
-            // F-E/B4: setup/environment failures still attempt
-            // every requested artifact — a fatal primary, a
-            // no-verdict policy section, and a fatal CBOM — from a
-            // typed no-evidence document. No legacy fallback: with
-            // no capture there is no tripwire evidence to fold in.
-            crate::report::err_line(&format!("osslscope check: {e:#}"));
-            crate::report::err_line(
-                "osslscope check: run 'osslscope doctor' to diagnose environment failures",
-            );
-            let mut document =
-                setup_failure_document(FatalKind::Environment(bound_line(&format!("{e:#}"))));
-            let verdict = evaluate_document(&[], &document);
-            document.policy = Some(policy_record(&verdict));
-            let delivery = write_artifacts(&document, &req);
-            crate::report::emit_diagnostics(&delivery);
-            return ExitCode::from(exit_for(verdict.overall(), None, &document, &delivery));
-        }
-    };
-    // Check assembly flows through the shared production seam
-    // (evaluate → legacy tripwire → policy attach); the controller
-    // close-failure fixture uses the same function.
-    let child_exit = c.child_exit;
-    let (verdict, document) =
-        assemble_checked_document(&policy_rules(&args.rules), c.document, &c.legacy);
-    let delivery = write_artifacts(&document, &req);
-    crate::report::emit_diagnostics(&delivery);
-    // H9/R07 T4: nonzero child exit with discarded output → one
-    // diagnostic line (exit + re-run hint, never workload bytes).
-    if let Some(hint) = crate::report::workload_hint(child_exit, workload_discarded) {
-        crate::report::err_line(&hint);
-    }
-    ExitCode::from(exit_for(
-        verdict.overall(),
-        child_exit,
-        &document,
-        &delivery,
-    ))
+    ExitCode::from(
+        crate::report::consume_capture_result(
+            capture::run(&args.cfg, args.target),
+            crate::report::CaptureCommand::Check {
+                rules: &policy_rules(&args.rules),
+            },
+            &req,
+            workload_discarded,
+        )
+        .exit_code,
+    )
 }
 
 #[cfg(test)]
