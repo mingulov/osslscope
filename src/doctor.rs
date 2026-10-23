@@ -292,6 +292,10 @@ impl std::error::Error for RingbufQueryError {}
 /// startup gating (P7 item 3+); doctor surfaces it as an
 /// informational row until then.
 pub fn probe_ringbuf_query() -> Result<(), RingbufQueryError> {
+    #[cfg(test)]
+    if tests::record_probe(tests::Probe::RingbufQuery) {
+        return Ok(());
+    }
     let map = ossl_bpf_sys::map_create(
         ossl_bpf_sys::BPF_MAP_TYPE_RINGBUF,
         0,
@@ -404,6 +408,10 @@ fn errno_of(e: &std::io::Error) -> i32 {
 }
 
 fn run_prog_load(insns: &[u8]) -> ProbeOut {
+    #[cfg(test)]
+    if let Some(result) = tests::probe_result(tests::Probe::ProgLoad) {
+        return result;
+    }
     let mut log = vec![0u8; 4096];
     let license = c"GPL";
     match ossl_bpf_sys::prog_load_kprobe(insns, license, None, &mut log, "doctorprobe", None) {
@@ -423,6 +431,15 @@ fn run_prog_load(insns: &[u8]) -> ProbeOut {
 }
 
 fn run_map_create(map_type: u32, key_size: u32, value_size: u32, max_entries: u32) -> ProbeOut {
+    #[cfg(test)]
+    if let Some(result) = tests::probe_result(tests::Probe::MapCreate(
+        map_type,
+        key_size,
+        value_size,
+        max_entries,
+    )) {
+        return result;
+    }
     match ossl_bpf_sys::map_create(
         map_type,
         key_size,
@@ -465,6 +482,10 @@ fn entry_file_offset(exe_bytes: &[u8]) -> Option<u64> {
 }
 
 fn run_multi_self() -> ProbeOut {
+    #[cfg(test)]
+    if let Some(result) = tests::probe_result(tests::Probe::MultiSelf) {
+        return result;
+    }
     let exe = match std::fs::read("/proc/self/exe") {
         Ok(b) => b,
         Err(e) => {
@@ -541,6 +562,10 @@ fn run_multi_self() -> ProbeOut {
 }
 
 fn run_token_probe() -> ProbeOut {
+    #[cfg(test)]
+    if let Some(result) = tests::probe_result(tests::Probe::Token) {
+        return result;
+    }
     // Existence probe only (6.9-floor feature row — never used for
     // privilege post-STOP#6): ENOSYS happens at dispatch (before any
     // caps/fd validation), so it alone proves absence; any other
@@ -697,6 +722,10 @@ struct PerfAttr {
 }
 
 fn run_perf_self() -> ProbeOut {
+    #[cfg(test)]
+    if let Some(result) = tests::probe_result(tests::Probe::PerfSelf) {
+        return result;
+    }
     // SOFTWARE/CONTEXT_SWITCHES on self: no PMU needed, so the result
     // purely reflects permission (paranoid>=2 wants CAP_PERFMON).
     let attr = PerfAttr {
@@ -812,6 +841,10 @@ fn can_open_maps(pid: u32) -> bool {
 /// target's maps stay readable: the 6.14+ carve-out verdict.
 /// Single-threaded CLI — fork is safe (no threads, no held locks).
 fn probe_perfmon_only(pid: u32) -> Option<bool> {
+    #[cfg(test)]
+    if tests::record_probe(tests::Probe::PerfmonFork) {
+        return Some(true);
+    }
     let mut fds = [0i32; 2];
     // SAFETY: pipe writes two fresh fds.
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
@@ -1138,6 +1171,21 @@ fn check_ima() -> Check {
     )
 }
 
+// Package refusal allows local configuration facts, but no functional probe.
+fn lsm_environment_summary(env: &Env) -> Check {
+    let active = if env.lsm.is_empty() {
+        "none".to_string()
+    } else {
+        env.lsm.join(",")
+    };
+    Check::info(
+        "lsm",
+        format!(
+            "active: {active}; functional BPF/perf denial checks not run (package admission failed)"
+        ),
+    )
+}
+
 fn check_lsm(env: &Env) -> Check {
     // Distinguished probe: BPF ops attempted above would have failed
     // with caps held iff LSM (or lockdown/seccomp) denies. Perf is
@@ -1216,6 +1264,10 @@ fn self_dumpable() -> Option<libc::c_int> {
 /// locks). The probe child is always killed and reaped (never a
 /// zombie, never left stopped).
 fn check_spawn_access() -> Check {
+    #[cfg(test)]
+    if tests::record_probe(tests::Probe::SpawnAccess) {
+        return Check::pass("spawn-access", "test-only functional probe result".into());
+    }
     let dump_txt = self_dumpable().map_or("unknown".to_string(), |d| d.to_string());
     // SAFETY: single-threaded; child only prctls/stops/_exits.
     let pid = unsafe { libc::fork() };
@@ -1844,6 +1896,13 @@ fn check_target_bytes(path: &str, bytes: &[u8], ctx: &TargetCtx) -> Vec<Check> {
 
 /// Target file checks: presence row plus the byte rows below.
 fn check_target_file(path: &str, ctx: &TargetCtx) -> Vec<Check> {
+    #[cfg(test)]
+    if tests::record_probe(tests::Probe::TargetFile(path.into())) {
+        return vec![Check::info(
+            "libcrypto-found",
+            "test-only target probe result".into(),
+        )];
+    }
     match onboard::read_bounded(Path::new(path), onboard::MAX_OBJECT_SCAN_BYTES) {
         Ok(bytes) => check_target_bytes(path, &bytes, ctx),
         Err(e) => vec![target_file_unreadable(path, &e)],
@@ -1957,6 +2016,17 @@ fn check_byte_rows(path: &str, bytes: &[u8], static_exe: bool, ctx: &TargetCtx) 
 const USAGE: &str = "usage: osslscope doctor [--pid PID | --libcrypto PATH | --exe PATH] [--table FILE] [--force-offset N] [--provider-table FILE] [--object O] [--count-object C] [--members-object M] [--format human|json]";
 
 pub fn run(args: &[String]) -> ExitCode {
+    run_with_resolver(args, crate::package::commands::resolve_command_objects)
+}
+
+fn run_with_resolver(
+    args: &[String],
+    resolve: impl FnOnce(
+        crate::package::commands::CommandKind,
+        &crate::package::commands::ObjectOverrides,
+    )
+        -> Result<crate::package::commands::AdmittedSet, crate::package::PackageError>,
+) -> ExitCode {
     let mut pid: Option<u32> = None;
     let mut libcrypto: Option<String> = None;
     let mut exe_path: Option<String> = None;
@@ -2094,11 +2164,9 @@ pub fn run(args: &[String]) -> ExitCode {
         count: count_object.map(PathBuf::from),
         members: members_object.map(PathBuf::from),
     };
-    match with_doctor_objects(
-        &overrides,
-        crate::package::commands::resolve_command_objects,
-        |objects| run_admitted_doctor(objects, tctx, pid, libcrypto, exe_path, &format),
-    ) {
+    match with_doctor_objects(&overrides, resolve, |objects| {
+        run_admitted_doctor(objects, tctx, pid, libcrypto, exe_path, &format)
+    }) {
         Ok(exit) => exit,
         Err(error) => {
             let env = gather_env();
@@ -2117,7 +2185,7 @@ pub fn run(args: &[String]) -> ExitCode {
                 check_btf(),
                 check_lockdown(&env),
                 check_ima(),
-                check_lsm(&env),
+                lsm_environment_summary(&env),
                 check_seccomp(&env),
             ];
             if format == "json" {
@@ -2477,6 +2545,187 @@ fn run_admitted_doctor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Scoped substitutes sit before the actual native probe operations. They
+    // observe the real refusal arm as well as admitted checks, without issuing
+    // BPF/perf syscalls, forking, or reading a target in these source tests.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(super) enum Probe {
+        ProgLoad,
+        MapCreate(u32, u32, u32, u32),
+        MultiSelf,
+        Token,
+        RingbufQuery,
+        PerfSelf,
+        SpawnAccess,
+        PerfmonFork,
+        TargetFile(String),
+    }
+
+    thread_local! {
+        static PROBES: std::cell::RefCell<Option<Vec<Probe>>> = const { std::cell::RefCell::new(None) };
+    }
+
+    struct ProbeScope;
+
+    impl ProbeScope {
+        fn start() -> Self {
+            PROBES.with(|probes| {
+                assert!(probes.borrow_mut().replace(Vec::new()).is_none());
+            });
+            Self
+        }
+
+        fn events(&self) -> Vec<Probe> {
+            PROBES.with(|probes| probes.borrow().as_ref().unwrap().clone())
+        }
+    }
+
+    impl Drop for ProbeScope {
+        fn drop(&mut self) {
+            PROBES.with(|probes| *probes.borrow_mut() = None);
+        }
+    }
+
+    pub(super) fn record_probe(probe: Probe) -> bool {
+        PROBES.with(|probes| match probes.borrow_mut().as_mut() {
+            Some(events) => {
+                events.push(probe);
+                true
+            }
+            None => false,
+        })
+    }
+
+    pub(super) fn probe_result(probe: Probe) -> Option<ProbeOut> {
+        record_probe(probe).then(|| out(0, ""))
+    }
+
+    fn assert_no_probe_after_refusal(error: crate::package::PackageError) {
+        for args in [
+            vec!["--format", "human"],
+            vec!["--format", "json", "--libcrypto", "/fixture/libcrypto.so"],
+        ] {
+            let scope = ProbeScope::start();
+            let args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
+            let exit = run_with_resolver(&args, |kind, _| {
+                assert_eq!(kind, crate::package::commands::CommandKind::Doctor);
+                Err(error.clone())
+            });
+            assert_eq!(exit, ExitCode::from(4));
+            assert_eq!(
+                scope.events(),
+                Vec::<Probe>::new(),
+                "failed admission must issue no functional probe"
+            );
+        }
+    }
+
+    #[test]
+    fn package_fix1_unavailable_admission_runs_no_probes() {
+        assert_no_probe_after_refusal(crate::package::PackageError::unavailable(
+            "fixture missing package",
+        ));
+    }
+
+    #[test]
+    fn package_fix1_invalid_f1_admission_runs_no_probes() {
+        assert_no_probe_after_refusal(crate::package::PackageError::invalid("fixture F1 mismatch"));
+    }
+
+    #[test]
+    fn package_fix1_invalid_shape_admission_runs_no_probes() {
+        assert_no_probe_after_refusal(crate::package::PackageError::invalid("fixture role shape"));
+    }
+
+    #[test]
+    fn package_fix1_untrusted_admission_runs_no_probes() {
+        assert_no_probe_after_refusal(crate::package::PackageError::Untrusted {
+            context: "fixture package trust".into(),
+        });
+    }
+
+    #[test]
+    fn package_fix1_missing_objects_runs_no_probes() {
+        let scope = ProbeScope::start();
+        let args = [
+            "--format",
+            "json",
+            "--object",
+            "/osslscope-doctor-missing-fixture/harvest.o",
+            "--count-object",
+            "/osslscope-doctor-missing-fixture/count.o",
+            "--libcrypto",
+            "/fixture/libcrypto.so",
+        ]
+        .map(str::to_string);
+        assert_eq!(run(&args), ExitCode::from(4));
+        assert_eq!(
+            scope.events(),
+            Vec::<Probe>::new(),
+            "actual resolver refusal must issue no functional probe"
+        );
+    }
+
+    #[test]
+    fn package_fix1_admitted_doctor_observes_functional_boundaries() {
+        let scope = ProbeScope::start();
+        let args = ["--format", "json", "--libcrypto", "/fixture/libcrypto.so"].map(str::to_string);
+        let _exit = run_with_resolver(&args, |kind, _| {
+            assert_eq!(kind, crate::package::commands::CommandKind::Doctor);
+            Ok(crate::package::commands::test_support::selection(false))
+        });
+        let events = scope.events();
+        for required in [
+            Probe::ProgLoad,
+            Probe::MapCreate(27, 0, 0, 4096),
+            Probe::MultiSelf,
+            Probe::Token,
+            Probe::RingbufQuery,
+            Probe::MapCreate(2, 4, 8, 1),
+            Probe::PerfSelf,
+            Probe::SpawnAccess,
+            Probe::TargetFile("/fixture/libcrypto.so".into()),
+        ] {
+            assert!(
+                events.contains(&required),
+                "admitted path did not reach {required:?}: {events:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn package_fix1_admitted_lsm_keeps_map_and_perf_checks() {
+        let scope = ProbeScope::start();
+        let env = Env {
+            eff: 0,
+            lockdown: "none".into(),
+            lsm: vec!["fixture-lsm".into()],
+            enforcing: vec!["fixture-lsm".into()],
+            seccomp: 0,
+            nnp: 0,
+            release: "fixture-kernel".into(),
+        };
+        let summary = lsm_environment_summary(&env);
+        assert_eq!(summary.id, "lsm");
+        assert_eq!(summary.status, Status::Info);
+        assert_eq!(
+            summary.message,
+            "active: fixture-lsm; functional BPF/perf denial checks not run (package admission failed)"
+        );
+        assert!(scope.events().is_empty());
+        let row = check_lsm(&env);
+        assert_eq!(row.id, "lsm");
+        assert_eq!(row.status, Status::Pass);
+        assert_eq!(
+            row.message,
+            "no LSM denial (BPF ops succeed; active: fixture-lsm)"
+        );
+        assert_eq!(
+            scope.events(),
+            vec![Probe::MapCreate(2, 4, 8, 1), Probe::PerfSelf]
+        );
+    }
 
     fn ctx(caps: u64, lockdown_conf: bool, lsm: &[&str], seccomp: bool) -> DenyCtx {
         DenyCtx {
