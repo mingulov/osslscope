@@ -26,7 +26,7 @@ only) on a cache miss. `CARGO_BUILD_JOBS` defaults to 2.
 - Rust 1.88.0 (host) via rustup, plus nightly-2026-05-20 with the
   `rust-src` component (BPF `-Z build-std=core`).
 - `bpf-linker` 0.10.4 on `PATH`.
-- `python3`, `sha256sum`, `file`, `readelf`.
+- `python3` (3.11 or newer), `sha256sum`, `file`, `readelf`.
 
 Check what the script sees:
 

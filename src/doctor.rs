@@ -2918,12 +2918,6 @@ mod tests {
             .expect("objects-members row present")
     }
 
-    fn built_members() -> Option<PathBuf> {
-        let cand = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("crates/ebpf/target/bpfel-unknown-none/release/osslscope-members");
-        cand.exists().then_some(cand)
-    }
-
     fn built_triple() -> Option<(PathBuf, PathBuf, PathBuf)> {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("crates/ebpf/target/bpfel-unknown-none/release");

@@ -47,7 +47,7 @@ class FramingTest(unittest.TestCase):
             with self.subTest(data=data), self.assertRaises(compare.ContractError):
                 compare.parse_response(data, [self.case])
 
-    def test_identical_wrong_probes_fail_math(self):
+    def test_distinct_wrong_probes_fail_math(self):
         with tempfile.TemporaryDirectory() as td:
             directory = pathlib.Path(td)
             vector = directory / "vectors.json"
@@ -57,17 +57,22 @@ class FramingTest(unittest.TestCase):
             for executable in (candidate, reference):
                 executable.write_text("#!/usr/bin/env python3\nimport sys\nsys.stdin.read()\nprint('OSSLBC1\\ncase_1\\ts\\t0')\n")
                 executable.chmod(0o755)
-            with self.assertRaises(compare.ContractError):
+            reference.write_text(reference.read_text() + "# independent executable bytes\n")
+            with self.assertRaisesRegex(compare.ContractError, "oracle disagreement: case_1"):
                 compare.compare(candidate, reference, vector, directory / "report.json")
 
-    def test_same_executable_identity_rejected(self):
+    def test_same_executable_path_or_bytes_rejected(self):
         with tempfile.TemporaryDirectory() as td:
             p = pathlib.Path(td) / "same"
             p.write_bytes(b"x")
+            q = pathlib.Path(td) / "same-bytes"
+            q.write_bytes(b"x")
             vector = pathlib.Path(td) / "v.json"
             vector.write_text(json.dumps({"version": 1, "cases": [self.case]}))
-            with self.assertRaises(compare.ContractError):
+            with self.assertRaisesRegex(compare.ContractError, "same executable identity"):
                 compare.compare(p, p, vector, pathlib.Path(td) / "r.json")
+            with self.assertRaisesRegex(compare.ContractError, "identical executable bytes"):
+                compare.compare(p, q, vector, pathlib.Path(td) / "r.json")
 
     def test_vector_version_and_expected_are_strict(self):
         for bad in (

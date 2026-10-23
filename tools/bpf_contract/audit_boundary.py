@@ -150,7 +150,7 @@ def inspect(product):
     counts = {name: len(names_by_bin[name]) for name in BINS}
     union = set().union(*(names_by_bin[name] for name in BINS))
     if counts != {'count': 6, 'harvest': 44, 'members': 71} or len(union | {'AlgVerdict'}) != 106:
-        errors.append(f'named surface count drift: {counts}, union_plus_qualified_AlgVerdict={len(union | {'AlgVerdict'})}')
+        errors.append(f"named surface count drift: {counts}, union_plus_qualified_AlgVerdict={len(union | {'AlgVerdict'})}")
     for name in union:
         if not re.search(r'\b' + re.escape(name) + r'\b', read('crates/bpf-contract/src/lib.rs')):
             errors.append(f'named surface missing export: {name}')

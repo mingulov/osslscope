@@ -6411,8 +6411,9 @@ fn d_warm_boundary_proof() {
     let fx1 = Fixture::build_padded(&slots1, &[], 513);
     fx1.pretouch();
     // All three fire images use disjoint WBP/WBQ/WBR names. Installing
-    // their union changes no earlier lookup: hash+length+bytes match only
-    // the currently selected fixture array, and no key is reassigned.
+    // their union changes no earlier lookup: the fixture hash+length keys
+    // are disjoint and collision-checked; reserved name bytes are not
+    // membership evidence, and duplicate keys remain rejected.
     let slots2: Vec<SlotSpec> = (0..6u32)
         .map(|j| {
             SlotSpec::live(
