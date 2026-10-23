@@ -41,7 +41,7 @@ use aya_ebpf::{
     programs::{ProbeContext, RetProbeContext},
     EbpfContext as _,
 };
-use osslscope_ebpf_common::{
+use osslscope_bpf_contract::{
     classify_alg_with, loss_for_skip_cause, make_bucket, make_call_flags, make_rcount, make_seq,
     split_bucket, split_rcount, split_seq, AlgClassValue, CtrlValue, GuardEvent, ScanAlgEvent,
     ScanCallEvent, ScanRec, ScanRetEvent, ScanRowEvent, TCacheValue, ALG_EMPTY, ALG_NOIMP,
@@ -266,7 +266,7 @@ fn classify_alg(
     buf: &[u8; ALG_WINDOW],
     len: usize,
     saturated: bool,
-) -> osslscope_ebpf_common::AlgVerdict {
+) -> osslscope_bpf_contract::AlgVerdict {
     classify_alg_with(buf, len, saturated, lookup_alg)
 }
 

@@ -91,7 +91,7 @@ use aya_ebpf::{
     programs::{ProbeContext, RetProbeContext},
     EbpfContext as _,
 };
-use osslscope_ebpf_common::{
+use osslscope_bpf_contract::{
     AlgClassValue, AlgEvent, InitRetEvent, PendQuery, RowEvent, TripClassValue, TripEvent,
     TripTaxonomy, ALG_UNREADABLE, ALG_WINDOW, KIND_ALG, KIND_INIT_RET, KIND_QUERY_RET, KIND_ROW,
     KIND_TRIP, LOSS_INIT_SCAN, LOSS_MAP_CALLS, LOSS_MAP_LGCALLS, LOSS_MAP_QUERY_NEXT,
@@ -329,7 +329,7 @@ fn classify_alg(
     buf: &[u8; ALG_WINDOW],
     len: usize,
     saturated: bool,
-) -> osslscope_ebpf_common::AlgVerdict {
+) -> osslscope_bpf_contract::AlgVerdict {
     classify_alg_with(buf, len, saturated, lookup_alg)
 }
 

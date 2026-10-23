@@ -4,6 +4,7 @@
 Product documentation. Start with the README, then:
 
 - `build.md` - reproducible source build (host + BPF), manifests, lockfiles
+- `licensing.md` - component terms and the BPF object/load license boundary
 - `install.md` - local prefix and package install, doctor-first verify, uninstall
 - `usage.md` - CLI usage (`inspect` / `report` / `check` / `doctor` /
   `alias-audit`)

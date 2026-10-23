@@ -1452,7 +1452,7 @@ fn bpf_uses_shared_wire_types_exclusively() {
         "BPF must not define its own RowEvent"
     );
     assert!(
-        src.contains("osslscope_ebpf_common"),
+        src.contains("osslscope_bpf_contract"),
         "BPF must use shared wire types"
     );
     for map in ["ALG_CLASS", "TRIP_CLASS"] {

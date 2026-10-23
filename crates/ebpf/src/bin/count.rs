@@ -16,8 +16,8 @@
 //! target memory: the cookie is an attach-time constant, counts are
 //! kernel-side.
 //!
-//! Wire format (key/value structs + `WINDOW` cells) is owned by
-//! `osslscope-ebpf-common` — shared with userspace, drift-proof.
+//! BPF wire records and `WINDOW` cells use `osslscope-bpf-contract`.
+//! Userspace retains separate ABI-compatible common types.
 #![no_std]
 #![no_main]
 
@@ -28,7 +28,7 @@ use aya_ebpf::{
     programs::ProbeContext,
     EbpfContext as _,
 };
-use osslscope_ebpf_common::{CountValue, WINDOW_CELLS, WINDOW_DEADLINE, WINDOW_START, lat_bucket, make_key};
+use osslscope_bpf_contract::{CountValue, WINDOW_CELLS, WINDOW_DEADLINE, WINDOW_START, lat_bucket, make_key};
 
 /// `BPF_NOEXIST` for `insert` (kernel UAPI; aya-ebpf exposes no const).
 const BPF_NOEXIST: u64 = 1;

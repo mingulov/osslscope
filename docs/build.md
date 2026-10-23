@@ -1,6 +1,9 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Build from source
 
+The host/common, BPF programs, and independent BPF contract have distinct
+terms and dependencies; see [component licensing](licensing.md).
+
 One reproducible entrypoint builds the host binary and three BPF
 objects (harvest, count, members) with pinned toolchains and locked
 dependencies:

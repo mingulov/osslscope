@@ -156,9 +156,11 @@ application payloads.
 
 ## License
 
-Public license: GPL-3.0-or-later - see [LICENSE](LICENSE).
-BPF sources: GPL-2.0-only - see
-[LICENSES/GPL-2.0-only.txt](LICENSES/GPL-2.0-only.txt).
-
-Per-file SPDX tags (`GPL-3.0-or-later` for userspace, docs, and scripts;
-`GPL-2.0-only` for BPF programs) remove any ambiguity.
+The host application and its host-only common code are GPL-3.0-or-later
+([LICENSE](LICENSE)). The BPF program sources are GPL-2.0-only
+([GPL-2.0-only text](LICENSES/GPL-2.0-only.txt)). The independent
+`osslscope-bpf-contract` component is GPL-2.0-or-later; its GPL-2.0
+option is selected when linked into those BPF programs. Host and BPF
+share the stated ABI, while the BPF dependency uses the independent
+contract component. See [component licensing](docs/licensing.md) for
+the source, object, and loader distinctions.
