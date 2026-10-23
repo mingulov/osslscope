@@ -1,0 +1,455 @@
+{
+  "$defs": {
+    "content": {
+      "additionalProperties": false,
+      "properties": {
+        "bytes": {
+          "maximum": 18446744073709551615,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "path": {
+          "pattern": "^(?!.*(?:^|/)\\.{1,2}(?:/|$))[^/\\\\\\x00-\\x1f\\x7f-\\x9f]+(?:/[^/\\\\\\x00-\\x1f\\x7f-\\x9f]+)*$",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "sha256",
+        "bytes"
+      ],
+      "type": "object"
+    },
+    "environment_entry": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "value": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "value"
+      ],
+      "type": "object"
+    },
+    "host": {
+      "additionalProperties": false,
+      "properties": {
+        "bytes": {
+          "maximum": 18446744073709551615,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "elf_build_id": {
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "elf_machine": {
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "path": {
+          "pattern": "^(?!.*(?:^|/)\\.{1,2}(?:/|$))[^/\\\\\\x00-\\x1f\\x7f-\\x9f]+(?:/[^/\\\\\\x00-\\x1f\\x7f-\\x9f]+)*$",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "sha256",
+        "bytes",
+        "elf_machine",
+        "elf_build_id"
+      ],
+      "type": "object"
+    },
+    "host_profile": {
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "abi_profile": {
+              "const": "linux-x86_64-gnu"
+            },
+            "target": {
+              "const": "x86_64-unknown-linux-gnu"
+            }
+          }
+        },
+        {
+          "properties": {
+            "abi_profile": {
+              "const": "linux-x86_64-musl"
+            },
+            "target": {
+              "const": "x86_64-unknown-linux-musl"
+            }
+          }
+        }
+      ],
+      "properties": {
+        "abi_floor": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "abi_profile": {
+          "enum": [
+            "linux-x86_64-gnu",
+            "linux-x86_64-musl"
+          ]
+        },
+        "target": {
+          "enum": [
+            "x86_64-unknown-linux-gnu",
+            "x86_64-unknown-linux-musl"
+          ]
+        }
+      },
+      "required": [
+        "abi_profile",
+        "target",
+        "abi_floor"
+      ],
+      "type": "object"
+    },
+    "install": {
+      "additionalProperties": false,
+      "properties": {
+        "directory_mode": {
+          "const": 493
+        },
+        "executable_mode": {
+          "const": 493
+        },
+        "file_mode": {
+          "const": 420
+        },
+        "group": {
+          "const": "root"
+        },
+        "owner": {
+          "const": "root"
+        }
+      },
+      "required": [
+        "directory_mode",
+        "executable_mode",
+        "file_mode",
+        "owner",
+        "group"
+      ],
+      "type": "object"
+    },
+    "locks": {
+      "additionalProperties": false,
+      "properties": {
+        "bpf_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "host_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "host_sha256",
+        "bpf_sha256"
+      ],
+      "type": "object"
+    },
+    "recipe": {
+      "additionalProperties": false,
+      "properties": {
+        "config_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "recipe_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "recipe_sha256",
+        "config_sha256"
+      ],
+      "type": "object"
+    },
+    "release_asset": {
+      "additionalProperties": false,
+      "properties": {
+        "bytes": {
+          "maximum": 18446744073709551615,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "path": {
+          "pattern": "^(?!.*(?:^|/)\\.{1,2}(?:/|$))[^/\\\\\\x00-\\x1f\\x7f-\\x9f]+(?:/[^/\\\\\\x00-\\x1f\\x7f-\\x9f]+)*$",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "sha256",
+        "bytes"
+      ],
+      "type": "object"
+    },
+    "release_profile": {
+      "additionalProperties": false,
+      "properties": {
+        "abi_profile": {
+          "type": "string"
+        },
+        "bundle_id": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "payload_id": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "abi_profile",
+        "payload_id",
+        "bundle_id"
+      ],
+      "type": "object"
+    },
+    "role": {
+      "additionalProperties": false,
+      "properties": {
+        "bytes": {
+          "maximum": 18446744073709551615,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "file": {
+          "pattern": "^(?!.*(?:^|/)\\.{1,2}(?:/|$))[^/\\\\\\x00-\\x1f\\x7f-\\x9f]+(?:/[^/\\\\\\x00-\\x1f\\x7f-\\x9f]+)*$",
+          "type": "string"
+        },
+        "role": {
+          "enum": [
+            "harvest",
+            "count",
+            "members"
+          ]
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "role",
+        "file",
+        "sha256",
+        "bytes"
+      ],
+      "type": "object"
+    },
+    "source": {
+      "additionalProperties": false,
+      "properties": {
+        "inventory_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "revision": {
+          "pattern": "^[0-9a-f]{40}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "revision",
+        "inventory_sha256"
+      ],
+      "type": "object"
+    },
+    "tool": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "version": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "version",
+        "sha256"
+      ],
+      "type": "object"
+    },
+    "tools": {
+      "additionalProperties": false,
+      "properties": {
+        "bpf": {
+          "$ref": "#/$defs/tool"
+        },
+        "builder": {
+          "$ref": "#/$defs/tool"
+        },
+        "components": {
+          "items": {
+            "$ref": "#/$defs/tool"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "host": {
+          "$ref": "#/$defs/tool"
+        },
+        "linker": {
+          "$ref": "#/$defs/tool"
+        },
+        "llvm": {
+          "$ref": "#/$defs/tool"
+        }
+      },
+      "required": [
+        "host",
+        "bpf",
+        "linker",
+        "llvm",
+        "builder",
+        "components"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://osslscope.org/schemas/package-payload-manifest-v1.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "build_inputs": {
+      "$ref": "#/$defs/content"
+    },
+    "bundle_id": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "contract": {
+      "$ref": "#/$defs/content"
+    },
+    "docs": {
+      "items": {
+        "$ref": "#/$defs/content"
+      },
+      "minItems": 0,
+      "type": "array"
+    },
+    "host": {
+      "$ref": "#/$defs/host"
+    },
+    "host_profile": {
+      "$ref": "#/$defs/host_profile"
+    },
+    "input_id": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "install": {
+      "$ref": "#/$defs/install"
+    },
+    "licenses": {
+      "items": {
+        "$ref": "#/$defs/content"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "locks": {
+      "$ref": "#/$defs/locks"
+    },
+    "notices": {
+      "items": {
+        "$ref": "#/$defs/content"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "product_version": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "recipe": {
+      "$ref": "#/$defs/recipe"
+    },
+    "roles": {
+      "items": {
+        "$ref": "#/$defs/role"
+      },
+      "maxItems": 3,
+      "minItems": 3,
+      "type": "array"
+    },
+    "sbom": {
+      "$ref": "#/$defs/content"
+    },
+    "schema": {
+      "const": "osslscope-payload-manifest-v1"
+    },
+    "source": {
+      "$ref": "#/$defs/source"
+    },
+    "tools": {
+      "$ref": "#/$defs/tools"
+    }
+  },
+  "required": [
+    "schema",
+    "bundle_id",
+    "contract",
+    "input_id",
+    "build_inputs",
+    "host",
+    "roles",
+    "source",
+    "product_version",
+    "host_profile",
+    "locks",
+    "recipe",
+    "tools",
+    "install",
+    "docs",
+    "licenses",
+    "notices",
+    "sbom"
+  ],
+  "title": "osslscope payload-manifest v1",
+  "type": "object"
+}

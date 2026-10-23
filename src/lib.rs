@@ -22,6 +22,7 @@ pub mod evidence;
 pub mod inspect;
 pub mod kinds;
 pub mod loader;
+pub mod package;
 pub mod pin;
 pub mod plan;
 // T01 (coordinator review): pure policy predicate primitives, no CLI wiring.
