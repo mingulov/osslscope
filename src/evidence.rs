@@ -20,7 +20,7 @@ use crate::scan::oracle::{Outcome, TrueT};
 use serde::{Deserialize, Serialize};
 
 /// Schema identity carried by every finalized capture document.
-pub const CAPTURE_SCHEMA_V2: &str = "observed-crypto-v2.2";
+pub const CAPTURE_SCHEMA_V2: &str = "observed-crypto-v2.3";
 
 /// Verified object fingerprint. A pathname may locate a file for display,
 /// but it never defines identity (R02).
@@ -791,6 +791,9 @@ impl LegacyCallPartition {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CaptureDocument {
     pub schema: String,
+    /// Observer package identity derived only from admitted retained inputs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_build: Option<crate::package::commands::PackageProvenance>,
     pub status: Completeness,
     pub window: CaptureWindow,
     pub sites: Vec<SiteExecution>,
@@ -1107,6 +1110,7 @@ pub fn finalize(mut input: FinalizeInput) -> CaptureDocument {
     };
     CaptureDocument {
         schema: CAPTURE_SCHEMA_V2.to_string(),
+        package_build: None,
         status,
         window: input.window,
         sites: input.sites,

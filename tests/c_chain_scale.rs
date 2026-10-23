@@ -268,6 +268,7 @@ fn run_leg(
     std::thread::sleep(std::time::Duration::from_secs(1));
     assert!(child.try_wait().unwrap().is_none(), "vehicle exited early");
     let cfg = osslscope::discovery::harvest::Config {
+        object_bytes: None,
         pid,
         provider: prov.clone(),
         object: object.to_path_buf(),

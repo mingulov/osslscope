@@ -550,6 +550,7 @@ fn recorded_maps_identity(
 fn harvest_cfg(pid: u32, object: PathBuf, table: PathBuf, birth: bool, settle: Duration) -> Config {
     let legacy = std::env::var("OSSL_P5D_LEGACY").unwrap_or_default() == "1";
     Config {
+        object_bytes: None,
         pid,
         provider: PathBuf::from(LIBCRYPTO),
         object,

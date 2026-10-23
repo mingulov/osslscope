@@ -1330,24 +1330,9 @@ fn check_seccomp(env: &Env) -> Check {
 
 // ---- installed objects + coverage caveats (T12/R09) ----
 
-/// Installed-object rows (both roles): explicit paths validate
-/// individually; a fully automatic pair resolves from the first
-/// trusted dir holding a complete pair — the same primitives the
-/// backend composes, so doctor agrees with `report`/`check`. A
-/// failed pair fails both rows (neither role is usable without
-/// its mate).
-fn objects_checks(harvest: Option<&str>, count: Option<&str>, members: Option<&str>) -> Vec<Check> {
-    objects_checks_in(
-        harvest,
-        count,
-        members,
-        &onboard::default_object_dirs(),
-        &onboard::TrustPolicy::production(),
-    )
-}
-
 /// Installed-object rows over explicit dirs/trust (production
 /// passes the installed defaults; tests pass fixtures).
+#[cfg(test)]
 fn objects_checks_in(
     harvest: Option<&str>,
     count: Option<&str>,
@@ -1522,6 +1507,7 @@ fn objects_checks_in(
 /// receipt-required (pass/fail); present-but-unresolvable FAILS
 /// (broken install, actionable — same fail-closed stance as the
 /// pair rows).
+#[cfg(test)]
 fn members_row(
     members: Option<&str>,
     dirs: &[PathBuf],
@@ -2103,6 +2089,61 @@ pub fn run(args: &[String]) -> ExitCode {
         return ExitCode::from(2);
     }
 
+    let overrides = crate::package::commands::ObjectOverrides {
+        harvest: object.map(PathBuf::from),
+        count: count_object.map(PathBuf::from),
+        members: members_object.map(PathBuf::from),
+    };
+    match with_doctor_objects(
+        &overrides,
+        crate::package::commands::resolve_command_objects,
+        |objects| run_admitted_doctor(objects, tctx, pid, libcrypto, exe_path, &format),
+    ) {
+        Ok(exit) => exit,
+        Err(error) => {
+            let env = gather_env();
+            let checks = vec![
+                Check::fail(
+                    "package-admission",
+                    error.to_string(),
+                    "install a complete matched package or supply explicit harvest/count objects"
+                        .into(),
+                ),
+                Check::info(
+                    "functional-probes",
+                    "not run: package admission failed (BPF/perf/fork/target checks blocked)"
+                        .into(),
+                ),
+                check_btf(),
+                check_lockdown(&env),
+                check_ima(),
+                check_lsm(&env),
+                check_seccomp(&env),
+            ];
+            if format == "json" {
+                println!(
+                    "{}",
+                    serde_json::json!({"target":null,"checks":checks.iter().map(Check::json).collect::<Vec<_>>(),"verdict":"fail-closed","exit":4})
+                );
+            } else {
+                for c in &checks {
+                    println!("[{}] {}: {}", c.status.as_str(), c.id, c.message);
+                }
+            }
+            ExitCode::from(4)
+        }
+    }
+}
+
+fn run_admitted_doctor(
+    admitted: crate::package::commands::AdmittedSet,
+    tctx: TargetCtx<'_>,
+    pid: Option<u32>,
+    libcrypto: Option<String>,
+    exe_path: Option<String>,
+    format: &str,
+) -> ExitCode {
+    let package_build = admitted.provenance();
     let env = gather_env();
     let mut checks = vec![
         check_kernel(&env),
@@ -2116,11 +2157,34 @@ pub fn run(args: &[String]) -> ExitCode {
         check_seccomp(&env),
         check_spawn_access(),
     ];
-    checks.extend(objects_checks(
-        object.as_deref(),
-        count_object.as_deref(),
-        members_object.as_deref(),
-    ));
+    if let Some(base) = &package_build.installed_base {
+        checks.push(Check::pass(
+            "package-admission",
+            format!(
+                "admitted base bundle={} payload={} input={}",
+                base.bundle_id, base.payload_id, base.input_id
+            ),
+        ));
+    } else {
+        checks.push(Check::info(
+            "package-admission",
+            "explicit operator objects: source/build provenance unknown".into(),
+        ));
+    }
+    for (role, id) in [
+        (crate::package::records::Role::Harvest, "objects-harvest"),
+        (crate::package::records::Role::Count, "objects-count"),
+        (crate::package::records::Role::Members, "objects-members"),
+    ] {
+        if let Some(snapshot) = admitted.role(role) {
+            checks.push(Check::pass(
+                id,
+                format!("{} sha256={}", snapshot.locator.display(), snapshot.sha256),
+            ));
+        } else {
+            checks.push(Check::info(id, "not selected: explicit pair only".into()));
+        }
+    }
 
     let mut target: Option<Target> = None;
     if let Some(p) = pid {
@@ -2131,12 +2195,7 @@ pub fn run(args: &[String]) -> ExitCode {
         // pre-attach execution by architecture. Degraded, never a
         // refusal — --pid stays usable; post-hoc pid-prewindow-blind
         // / cold-gap emission still applies (what-it-proves.md).
-        checks.push(Check::degraded(
-            "cold-gap-preflight",
-            "--pid windows are blind to pre-attach execution by architecture".into(),
-            "use 'run --' with warmup traffic when completeness matters (docs/what-it-proves.md)"
-                .into(),
-        ));
+        checks.push(cold_gap_preflight());
         checks.push(check_foreign_uid(p, tuid, &env));
         match crate::discovery::maps::read_maps(p) {
             Ok(maps) => {
@@ -2368,10 +2427,7 @@ pub fn run(args: &[String]) -> ExitCode {
                     "coverage-scope",
                     "automatic discovery observes the in-libcrypto default provider; file providers need explicit --provider".into(),
                 ));
-                checks.push(Check::info(
-                    "coverage-spawn",
-                    "run -- requests observation from exec; effective callback attachment follows discovery (fast or short-lived workloads may stay PARTIAL); a wrong libcrypto prediction degrades to zero-rows PARTIAL, never wrong attribution".into(),
-                ));
+                checks.push(spawn_coverage_note());
             }
         }
     }
@@ -2379,6 +2435,7 @@ pub fn run(args: &[String]) -> ExitCode {
     let failed = checks.iter().any(|c| c.status == Status::Fail);
     if format == "json" {
         let doc = serde_json::json!({
+            "package_build": package_build,
             "target": target_json(&target),
             "checks": checks.iter().map(Check::json).collect::<Vec<_>>(),
             "verdict": if failed { "fail-closed" } else { "ok" },
@@ -2972,6 +3029,8 @@ mod tests {
         let prefix = trusted_fixture("members-installed");
         let objdir = prefix.join("lib").join("osslscope");
         std::fs::create_dir_all(&objdir).unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&objdir, std::fs::Permissions::from_mode(0o755)).unwrap();
         for (name, src) in [
             ("osslscope-harvest", &h),
             ("osslscope-count", &c),
@@ -3080,6 +3139,9 @@ mod tests {
     }
 
     fn write_prefix_receipt(prefix: &Path, objdir: &Path, names: &[&str]) {
+        // This helper owns the fixture leaf; keep the trust policy unchanged.
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(objdir, std::fs::Permissions::from_mode(0o755)).unwrap();
         let rdir = prefix.join("share").join("osslscope");
         std::fs::create_dir_all(&rdir).unwrap();
         let arts: Vec<serde_json::Value> = names
@@ -3159,4 +3221,123 @@ mod tests {
         assert_eq!(m.status, Status::Fail, "{}", m.message);
         assert!(m.message.contains("bad-members.o"), "{}", m.message);
     }
+    #[test]
+    fn package_doctor_target_checks_preserve_qualification() {
+        // Target fixtures enter the real private byte-check seam after admitted
+        // selection. Functional BPF/perf/fork probes are outside this test port.
+        let dir =
+            std::env::temp_dir().join(format!("package-doctor-target-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("fixture.c");
+        std::fs::write(&source,b"const char v[]=\"OpenSSL 3.5.9-fixture\"; int OSSL_PROVIDER_available(void){return 1;} int OSSL_PROVIDER_load(void){return 1;} int OPENSSL_version_major(void){return 3;} int ENGINE_by_id(void){return 1;} int EVP_MD_fetch(void){return 1;} int ossl_provider_query_operation(void){return 1;}\n").unwrap();
+        let table = crate::discovery::builtin::shipped_table();
+        let enrollment = ProviderTable::empty();
+        let ctx = TargetCtx {
+            table: &table,
+            table_explicit: false,
+            force_offset: None,
+            enrollment: &enrollment,
+        };
+        for stripped in [false, true] {
+            let so = dir.join(if stripped {
+                "stripped.so"
+            } else {
+                "supported.so"
+            });
+            let mut cc = std::process::Command::new("gcc");
+            cc.args(["-shared", "-fPIC"]);
+            if stripped {
+                cc.args(["-s", "-Wl,--soname,OPENSSL_3.0"]);
+            } else {
+                cc.arg("-g");
+            }
+            let out = cc
+                .arg("-o")
+                .arg(&so)
+                .arg(&source)
+                .output()
+                .expect("mandatory source fixture compiler");
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let bytes = std::fs::read(&so).unwrap();
+            let rows = with_doctor_objects(
+                &crate::package::commands::ObjectOverrides::default(),
+                |kind, _| {
+                    assert_eq!(kind, crate::package::commands::CommandKind::Doctor);
+                    Ok(crate::package::commands::test_support::selection(false))
+                },
+                |_| check_target_bytes(so.to_str().unwrap(), &bytes, &ctx),
+            )
+            .unwrap();
+            let row = |id| rows.iter().find(|r| r.id == id).unwrap();
+            assert_eq!(row("arch").status, Status::Pass);
+            assert_eq!(row("flavor").status, Status::Pass);
+            let anchor = row("dispatch-anchor");
+            if stripped {
+                assert_eq!(anchor.status, Status::Fail);
+                let remedy = anchor.remediation.as_deref().unwrap();
+                assert!(remedy.contains("enroll") || remedy.contains("--table"));
+            } else {
+                assert_eq!(anchor.status, Status::Pass);
+                assert!(anchor.message.contains("symtab"));
+            }
+        }
+        let rows = check_target_bytes("fixture-script", b"#!/bin/sh\nexec /bin/true\n", &ctx);
+        let arch = rows.iter().find(|r| r.id == "arch").unwrap();
+        assert_eq!(arch.status, Status::Fail);
+        assert!(arch.message.contains("not an ELF"));
+        let dual = anchor_check(&TargetQualification::Unsupported {
+            reason: "dual-load".into(),
+            remediation: "use one libcrypto".into(),
+        });
+        assert_eq!(dual.status, Status::Fail);
+        assert!(dual.message.contains("dual-load"));
+        let cold = cold_gap_preflight();
+        assert_eq!(cold.status, Status::Degraded);
+        assert!(cold.message.contains("pre-attach"));
+        assert!(cold.remediation.unwrap().contains("run --"));
+        let spawn = spawn_coverage_note();
+        assert_eq!(spawn.status, Status::Info);
+        assert!(
+            spawn.message.contains("requests observation from exec")
+                && spawn.message.contains("effective")
+        );
+        assert!(!spawn.message.contains("no cold-start gap"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+pub(crate) fn with_doctor_objects<R>(
+    overrides: &crate::package::commands::ObjectOverrides,
+    resolve: impl FnOnce(
+        crate::package::commands::CommandKind,
+        &crate::package::commands::ObjectOverrides,
+    )
+        -> Result<crate::package::commands::AdmittedSet, crate::package::PackageError>,
+    effect: impl FnOnce(crate::package::commands::AdmittedSet) -> R,
+) -> Result<R, crate::package::PackageError> {
+    crate::package::commands::with_admitted(
+        crate::package::commands::CommandKind::Doctor,
+        overrides,
+        resolve,
+        effect,
+    )
+}
+
+fn cold_gap_preflight() -> Check {
+    Check::degraded(
+        "cold-gap-preflight",
+        "--pid windows are blind to pre-attach execution by architecture".into(),
+        "use 'run --' with warmup traffic when completeness matters (docs/what-it-proves.md)"
+            .into(),
+    )
+}
+fn spawn_coverage_note() -> Check {
+    Check::info(
+                    "coverage-spawn",
+                    "run -- requests observation from exec; effective callback attachment follows discovery (fast or short-lived workloads may stay PARTIAL); a wrong libcrypto prediction degrades to zero-rows PARTIAL, never wrong attribution".into(),
+                )
 }

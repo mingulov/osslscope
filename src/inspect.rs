@@ -26,7 +26,7 @@ pub const DEFAULT_SETTLE: Duration = Duration::from_secs(2);
 pub struct InspectArgs {
     pub pid: u32,
     pub provider: std::path::PathBuf,
-    pub object: std::path::PathBuf,
+    pub object: Option<std::path::PathBuf>,
     pub out: Option<std::path::PathBuf>,
     pub settle: Duration,
     pub timeout: Duration,
@@ -38,11 +38,15 @@ pub struct InspectArgs {
 }
 
 impl InspectArgs {
-    fn harvest_config(&self) -> harvest::Config {
+    pub(crate) fn harvest_config(
+        &self,
+        snapshot: &crate::package::resolve::RoleSnapshot,
+    ) -> harvest::Config {
         harvest::Config {
             pid: self.pid,
             provider: self.provider.clone(),
-            object: self.object.clone(),
+            object: snapshot.locator.clone(),
+            object_bytes: Some(std::sync::Arc::clone(&snapshot.bytes)),
             settle: self.settle,
             timeout: self.timeout,
             cmdline_marker: self.marker.clone(),
@@ -57,7 +61,7 @@ impl InspectArgs {
     }
 }
 
-const USAGE: &str = "usage: osslscope inspect --pid PID --provider SO --object BPF [--out FILE] [--marker M] [--settle S] [--timeout S] [--builtin [--table FILE] [--force-offset N]] [--legacy]";
+const USAGE: &str = "usage: osslscope inspect --pid PID --provider SO [--object BPF] [--out FILE] [--marker M] [--settle S] [--timeout S] [--builtin [--table FILE] [--force-offset N]] [--legacy]";
 
 /// Value-taking inspect flags (must stay in sync with [`parse`]).
 /// Help recognition skips the token after one of these, so
@@ -93,7 +97,7 @@ fn print_help() {
     println!("{USAGE}");
     println!("  --pid PID: live target to inventory (pinned against pid reuse)");
     println!("  --provider SO: provider .so (or libcrypto with --builtin)");
-    println!("  --object BPF: harvest eBPF object (built from crates/ebpf)");
+    println!("  --object BPF: optional explicit harvest object (defaults to matched package)");
     println!("  --settle S: attach-settle seconds (default 2)");
     println!("  --timeout S: trigger-wait seconds (default 60)");
     println!("  --legacy: also attach ENGINE/low-level tripwires");
@@ -149,7 +153,7 @@ pub fn parse(args: &[String]) -> Result<InspectArgs, String> {
         })();
         r?;
     }
-    let (Some(pid), Some(provider), Some(object)) = (pid, provider, object) else {
+    let (Some(pid), Some(provider)) = (pid, provider) else {
         return Err(USAGE.to_string());
     };
     // Single conversion point shared with report/check (R08 bounds;
@@ -301,19 +305,134 @@ pub fn run(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let cfg = parsed.harvest_config();
     let out = parsed.out.clone();
     let emit = |doc: &serde_json::Value| {
         let stdout = std::io::stdout();
         let mut locked = stdout.lock();
         emit_doc(doc, out.as_deref(), &mut locked)
     };
+    run_parsed_with(
+        &parsed,
+        crate::package::commands::resolve_command_objects,
+        harvest::run,
+        emit,
+    )
+}
+
+// Production calls the real admission and harvest functions. Unit fixtures
+// replace effects at this same boundary without exposing a public trust port.
+fn run_parsed_with(
+    parsed: &InspectArgs,
+    resolve: impl FnOnce(
+        crate::package::commands::CommandKind,
+        &crate::package::commands::ObjectOverrides,
+    )
+        -> Result<crate::package::commands::AdmittedSet, crate::package::PackageError>,
+    harvest: impl FnOnce(&harvest::Config) -> anyhow::Result<serde_json::Value>,
+    emit: impl FnOnce(&serde_json::Value) -> Result<(), String>,
+) -> ExitCode {
+    let admitted = match with_inspect_objects(
+        &crate::package::commands::ObjectOverrides {
+            harvest: parsed.object.clone(),
+            ..Default::default()
+        },
+        resolve,
+        |objects| objects,
+    ) {
+        Ok(objects) => objects,
+        Err(e) => {
+            crate::report::err_line(&format!("osslscope inspect: {e}"));
+            return ExitCode::from(4);
+        }
+    };
+    let Some(snapshot) = admitted.role(crate::package::records::Role::Harvest) else {
+        crate::report::err_line("osslscope inspect: invalid package selection: missing harvest");
+        return ExitCode::from(4);
+    };
+    let cfg = parsed.harvest_config(snapshot);
     run_with(
         &cfg,
-        |c| {
+        |cfg| {
             note_harvest_call();
-            harvest::run(c)
+            harvest(cfg)
         },
         emit,
     )
+}
+
+// Private resolver/effect seam shared by the real entrypoint and source fixtures.
+pub(crate) fn with_inspect_objects<R>(
+    overrides: &crate::package::commands::ObjectOverrides,
+    resolve: impl FnOnce(
+        crate::package::commands::CommandKind,
+        &crate::package::commands::ObjectOverrides,
+    )
+        -> Result<crate::package::commands::AdmittedSet, crate::package::PackageError>,
+    effect: impl FnOnce(crate::package::commands::AdmittedSet) -> R,
+) -> Result<R, crate::package::PackageError> {
+    crate::package::commands::with_admitted(
+        crate::package::commands::CommandKind::Inspect,
+        overrides,
+        resolve,
+        effect,
+    )
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn package_inspect_admitted_effect_and_cumulative_spy() {
+        use std::{cell::Cell, sync::Arc};
+        let provider =
+            std::env::temp_dir().join(format!("package-inspect-provider-{}", std::process::id()));
+        std::fs::write(&provider, vec![42u8; 4096]).unwrap();
+        let args = parse(&[
+            "--pid".into(),
+            "42".into(),
+            "--provider".into(),
+            provider.display().to_string(),
+        ])
+        .unwrap();
+        reset_harvest_calls();
+        let effects = Cell::new(0);
+        for _ in 0..2 {
+            let set = crate::package::commands::test_support::selection(false);
+            let bytes = Arc::clone(
+                &set.role(crate::package::records::Role::Harvest)
+                    .unwrap()
+                    .bytes,
+            );
+            let exit = run_parsed_with(
+                &args,
+                |kind, _| {
+                    assert_eq!(kind, crate::package::commands::CommandKind::Inspect);
+                    Ok(set)
+                },
+                |cfg| {
+                    assert!(Arc::ptr_eq(cfg.object_bytes.as_ref().unwrap(), &bytes));
+                    assert_eq!(std::fs::read(&cfg.provider)?.len(), 4096);
+                    effects.set(effects.get() + 1);
+                    Ok(serde_json::json!({"schema":"inspect-fixture"}))
+                },
+                |_| Ok(()),
+            );
+            assert_eq!(exit, ExitCode::SUCCESS);
+        }
+        assert_eq!(effects.get(), 2);
+        assert_eq!(harvest_calls(), 2);
+        let exit = run_parsed_with(
+            &args,
+            |_, _| Err(crate::package::PackageError::invalid("shape")),
+            |_| {
+                effects.set(effects.get() + 1);
+                unreachable!()
+            },
+            |_| unreachable!(),
+        );
+        assert_eq!(exit, ExitCode::from(4));
+        assert_eq!(effects.get(), 2);
+        assert_eq!(harvest_calls(), 2);
+        std::fs::remove_file(provider).unwrap();
+    }
 }

@@ -231,6 +231,8 @@ pub struct Config {
     pub pid: u32,
     pub provider: PathBuf,
     pub object: PathBuf,
+    /// Retained admitted bytes; the locator is diagnostic only.
+    pub object_bytes: Option<std::sync::Arc<[u8]>>,
     pub settle: Duration,
     pub timeout: Duration,
     /// Required cmdline marker (fixture guard), or None for any target.
@@ -518,17 +520,7 @@ pub fn run_detailed(
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "unknown".to_string())
     };
-    let session_cfg = session::DiscoveryConfig {
-        provider: cfg.provider.clone(),
-        object: cfg.object.clone(),
-        object_bytes: None,
-        builtin: cfg.builtin,
-        legacy: cfg.legacy,
-        table: cfg.table.clone(),
-        force_offset: cfg.force_offset,
-        explicit_offsets: cfg.table.is_some() || cfg.force_offset.is_some(),
-        cmdline_marker: cfg.cmdline_marker.clone(),
-    };
+    let session_cfg = session_config(cfg);
     let mut sess = match session::DiscoverySession::attach(&session_cfg, cfg.pid) {
         Ok(s) => s,
         Err(e) => {
@@ -1305,4 +1297,48 @@ mod tests {
             "diagnostics carry no pathnames: {text}"
         );
     }
+}
+
+fn session_config(cfg: &Config) -> session::DiscoveryConfig {
+    session::DiscoveryConfig {
+        provider: cfg.provider.clone(),
+        object: cfg.object.clone(),
+        object_bytes: cfg.object_bytes.clone(),
+        builtin: cfg.builtin,
+        legacy: cfg.legacy,
+        table: cfg.table.clone(),
+        force_offset: cfg.force_offset,
+        explicit_offsets: cfg.table.is_some() || cfg.force_offset.is_some(),
+        cmdline_marker: cfg.cmdline_marker.clone(),
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn package_harvest_config_retains_admitted_arc() {
+    let snapshot =
+        crate::package::commands::test_support::snapshot(crate::package::records::Role::Harvest);
+    let cfg = Config {
+        pid: 42,
+        provider: "/observer/provider".into(),
+        object: snapshot.locator.clone(),
+        object_bytes: Some(std::sync::Arc::clone(&snapshot.bytes)),
+        settle: Duration::from_secs(1),
+        timeout: Duration::from_secs(1),
+        cmdline_marker: None,
+        builtin: true,
+        legacy: false,
+        table: None,
+        force_offset: None,
+        observed_from_birth: false,
+    };
+    let session = session_config(&cfg);
+    assert!(std::sync::Arc::ptr_eq(
+        session.object_bytes.as_ref().unwrap(),
+        &snapshot.bytes
+    ));
+    session::with_harvest_snapshot(session.object_bytes.as_ref().unwrap(), |bytes| {
+        assert_eq!(bytes.as_ptr(), snapshot.bytes.as_ptr());
+        assert_eq!(bytes, b"harvest-fixture");
+    });
 }

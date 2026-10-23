@@ -81,7 +81,7 @@
     "state": "verified",
     "version": "3.5.1"
   },
-  "schema_version": "observed-crypto-v2.2",
+  "schema_version": "observed-crypto-v2.3",
   "sites": [
     {
       "calls": 500,

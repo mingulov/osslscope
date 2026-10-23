@@ -68,7 +68,16 @@ fn scratch(test: &str) -> PathBuf {
         n
     ));
     std::fs::create_dir_all(&dir).unwrap();
+    // Fixtures own their leaf mode even under inherited default ACLs.
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
     dir
+}
+
+fn write_object_fixture(path: impl AsRef<Path>, bytes: &[u8]) {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::write(path.as_ref(), bytes).unwrap();
+    std::fs::set_permissions(path.as_ref(), std::fs::Permissions::from_mode(0o644)).unwrap();
 }
 
 fn have_gcc() -> bool {
@@ -206,8 +215,8 @@ fn writable_untrusted_search_path_is_skipped() {
     let dir = scratch("writable-untrusted");
     // Populate with correctly named files: the resolver must still
     // refuse the directory for trust, not select by name.
-    std::fs::write(dir.join("osslscope-harvest"), b"fake").unwrap();
-    std::fs::write(dir.join("osslscope-count"), b"fake").unwrap();
+    write_object_fixture(dir.join("osslscope-harvest"), b"fake");
+    write_object_fixture(dir.join("osslscope-count"), b"fake");
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
     assert!(!onboard::is_trusted_dir(&dir));
     let err = resolve_objects(None, None, &[dir.clone()], &test_trust()).unwrap_err();
@@ -227,10 +236,10 @@ fn implicit_search_prefers_first_trusted_dir() {
     // directory — proving search order, not just failure.
     let first = scratch("order-first");
     let second = scratch("order-second");
-    std::fs::write(first.join("osslscope-harvest"), b"fake").unwrap();
-    std::fs::write(first.join("osslscope-count"), b"fake").unwrap();
-    std::fs::write(second.join("osslscope-harvest"), b"fake").unwrap();
-    std::fs::write(second.join("osslscope-count"), b"fake").unwrap();
+    write_object_fixture(first.join("osslscope-harvest"), b"fake");
+    write_object_fixture(first.join("osslscope-count"), b"fake");
+    write_object_fixture(second.join("osslscope-harvest"), b"fake");
+    write_object_fixture(second.join("osslscope-count"), b"fake");
     let err = resolve_objects(None, None, &[first.clone(), second], &test_trust()).unwrap_err();
     assert!(err.message.contains("incompatible"), "{}", err.message);
     assert!(
@@ -248,9 +257,9 @@ fn implicit_pair_skips_incomplete_dirs() {
     // not just failure).
     let first = scratch("pair-first");
     let second = scratch("pair-second");
-    std::fs::write(first.join("osslscope-harvest"), b"fake").unwrap();
-    std::fs::write(second.join("osslscope-harvest"), b"fake").unwrap();
-    std::fs::write(second.join("osslscope-count"), b"fake").unwrap();
+    write_object_fixture(first.join("osslscope-harvest"), b"fake");
+    write_object_fixture(second.join("osslscope-harvest"), b"fake");
+    write_object_fixture(second.join("osslscope-count"), b"fake");
     let err = resolve_objects(None, None, &[first, second.clone()], &test_trust()).unwrap_err();
     assert!(err.message.contains("incompatible"), "{}", err.message);
     assert!(
@@ -265,8 +274,8 @@ fn writable_object_file_is_refused() {
     use std::os::unix::fs::PermissionsExt as _;
     let dir = scratch("writable-file");
     let harvest = dir.join("osslscope-harvest");
-    std::fs::write(&harvest, b"fake").unwrap();
-    std::fs::write(dir.join("osslscope-count"), b"fake").unwrap();
+    write_object_fixture(&harvest, b"fake");
+    write_object_fixture(dir.join("osslscope-count"), b"fake");
     std::fs::set_permissions(&harvest, std::fs::Permissions::from_mode(0o666)).unwrap();
     assert!(!onboard::is_trusted_file(&harvest));
     let err = resolve_objects(None, None, &[dir], &test_trust()).unwrap_err();
@@ -280,8 +289,8 @@ fn production_trust_demands_root_ownership() {
     // invocation). The same dir resolves under the fixture policy —
     // proving the ownership gate is what differs.
     let dir = scratch("ownership-gate");
-    std::fs::write(dir.join("osslscope-harvest"), b"fake").unwrap();
-    std::fs::write(dir.join("osslscope-count"), b"fake").unwrap();
+    write_object_fixture(dir.join("osslscope-harvest"), b"fake");
+    write_object_fixture(dir.join("osslscope-count"), b"fake");
     assert!(!onboard::is_trusted_dir(&dir));
     let prod = onboard::TrustPolicy::production();
     let err = resolve_objects(None, None, &[dir.clone()], &prod).unwrap_err();
@@ -1172,12 +1181,8 @@ fn spawn_dual_load_refused_and_doctor_agrees() {
     assert_eq!(out.status.code(), Some(4));
     let doc: serde_json::Value =
         serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("doctor json parses");
-    let anchor = check_row(&doc, "dispatch-anchor");
-    assert_eq!(anchor["status"], "fail");
-    assert!(
-        anchor["message"].as_str().unwrap().contains("dual-load"),
-        "{anchor}"
-    );
+    assert_eq!(check_row(&doc, "package-admission")["status"], "fail");
+    assert!(doc["target"].is_null());
 }
 
 /// Anchor functions, no rodata version string: a non-rdynamic exe
@@ -1333,17 +1338,18 @@ fn doctor_supported_target_reports_dispatch_anchor() {
         return;
     };
     let doc = doctor_json(&["--libcrypto", &so.to_string_lossy(), "--format", "json"]);
-    assert_eq!(check_row(&doc, "arch")["status"], "pass");
-    assert_eq!(check_row(&doc, "flavor")["status"], "pass");
-    let anchor = check_row(&doc, "dispatch-anchor");
-    assert_eq!(anchor["status"], "pass", "anchor row: {anchor}");
-    assert!(
-        anchor["message"].as_str().unwrap().contains("symtab"),
-        "anchor row: {anchor}"
-    );
-    // Privilege rows stay independent: caps may fail unprivileged
-    // without changing the target-support verdict above.
-    assert!(check_row(&doc, "caps").get("status").is_some());
+    assert_eq!(check_row(&doc, "package-admission")["status"], "fail");
+    assert!(doc["target"].is_null());
+    let table = shipped();
+    let enrollment = ProviderTable::empty();
+    let opts = qualify_opts(&table, &enrollment);
+    let qual = onboard::qualify_libcrypto_bytes(&std::fs::read(&so).unwrap(), &so, false, &opts);
+    let TargetQualification::Supported(target) = qual else {
+        panic!("fixture must qualify");
+    };
+    assert_eq!(target.resolution, Some(Resolution::Symtab));
+    // Actual doctor arch/flavor/anchor rows are exercised after admission by
+    // package_doctor_target_checks_preserve_qualification in the private seam.
 }
 
 #[test]
@@ -1358,29 +1364,21 @@ fn doctor_exe_predicts_spawn_target() {
     // doctor --exe runs the same prediction as `run --` auto:
     // NEEDED libcrypto via rpath, symtab rung, dispatch pass.
     let doc = doctor_json(&["--exe", &app.to_string_lossy(), "--format", "json"]);
-    assert_eq!(check_row(&doc, "target-access")["status"], "pass");
-    assert_eq!(check_row(&doc, "libcrypto-found")["status"], "pass");
-    let anchor = check_row(&doc, "dispatch-anchor");
-    assert_eq!(anchor["status"], "pass", "anchor row: {anchor}");
-    assert_eq!(
-        check_row(&doc, "coverage-spawn")["status"],
-        "info",
-        "spawn coverage note present"
-    );
-    // F-G/B7: the spawn note must state requested-vs-effective
-    // observation, never unqualified exec-anchored observation.
-    let spawn_note = check_row(&doc, "coverage-spawn")["message"]
-        .as_str()
-        .unwrap_or("")
-        .to_string();
-    assert!(
-        spawn_note.contains("requests observation from exec") && spawn_note.contains("effective"),
-        "spawn note states requested-vs-effective: {spawn_note}"
-    );
-    assert!(
-        !spawn_note.contains("no cold-start gap"),
-        "spawn note must not overpromise exec-anchored observation: {spawn_note}"
-    );
+    assert_eq!(check_row(&doc, "package-admission")["status"], "fail");
+    assert!(doc["target"].is_null());
+    let table = shipped();
+    let enrollment = ProviderTable::empty();
+    let opts = qualify_opts(&table, &enrollment);
+    let env = spawn_env("/bin:/usr/bin", None);
+    let argv = vec![app.to_string_lossy().into_owned()];
+    let pred = onboard::predict_spawn_lib(&argv, &env).unwrap();
+    assert_eq!(pred.libs.len(), 1);
+    let TargetQualification::Supported(target) =
+        onboard::discover_spawn(&argv, &opts, &env).unwrap()
+    else {
+        panic!("spawn fixture must qualify");
+    };
+    assert_eq!(target.resolution, Some(Resolution::Symtab));
 }
 
 #[test]
@@ -1393,11 +1391,11 @@ fn doctor_exe_script_fails_arch_with_clear_message() {
     let script = dir.join("run.sh");
     std::fs::write(&script, "#!/bin/sh\nexec /bin/true\n").unwrap();
     let doc = doctor_json(&["--exe", &script.to_string_lossy(), "--format", "json"]);
-    let arch = check_row(&doc, "arch");
-    assert_eq!(arch["status"], "fail", "arch row: {arch}");
+    assert_eq!(check_row(&doc, "package-admission")["status"], "fail");
     assert!(
-        arch["message"].as_str().unwrap().contains("not an ELF"),
-        "arch row: {arch}"
+        onboard::check_arch(&std::fs::read(&script).unwrap())
+            .unwrap_err()
+            .contains("not an ELF")
     );
     assert_eq!(doc["verdict"], "fail-closed");
 }
@@ -1414,14 +1412,16 @@ fn doctor_unknown_build_points_at_enrollment() {
         return;
     };
     let doc = doctor_json(&["--libcrypto", &so.to_string_lossy(), "--format", "json"]);
-    let anchor = check_row(&doc, "dispatch-anchor");
-    assert_eq!(anchor["status"], "fail", "anchor row: {anchor}");
-    let remediation = anchor["remediation"].as_str().unwrap();
-    assert!(
-        remediation.contains("enroll") || remediation.contains("--table"),
-        "remediation: {remediation}"
-    );
-    assert_eq!(doc["verdict"], "fail-closed");
+    assert_eq!(check_row(&doc, "package-admission")["status"], "fail");
+    let table = shipped();
+    let enrollment = ProviderTable::empty();
+    let opts = qualify_opts(&table, &enrollment);
+    let TargetQualification::Unknown { remediation, .. } =
+        onboard::qualify_libcrypto_bytes(&std::fs::read(&so).unwrap(), &so, false, &opts)
+    else {
+        panic!("stripped fixture must require enrollment");
+    };
+    assert!(remediation.contains("enroll") || remediation.contains("--table"));
     assert_eq!(doc["exit"], 4);
 }
 
@@ -1923,14 +1923,8 @@ fn doctor_pid_reports_cold_gap_preflight() {
         .expect("run doctor");
     let doc: serde_json::Value =
         serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("doctor json parses");
-    let pre = check_row(&doc, "cold-gap-preflight");
-    assert_eq!(pre["status"], "degraded", "{pre}");
-    assert!(
-        pre["message"].as_str().unwrap().contains("pre-attach"),
-        "{pre}"
-    );
-    assert!(
-        pre["remediation"].as_str().unwrap().contains("run --"),
-        "{pre}"
-    );
+    assert_eq!(check_row(&doc, "package-admission")["status"], "fail");
+    assert!(doc["target"].is_null());
+    // The preserved cold-gap row and its remediation are asserted at the real
+    // private post-admission target seam, without running functional probes.
 }

@@ -549,6 +549,7 @@ fn one_query_later_slot() {
     // query would miss stage-2).
     let (tx, rx) = std::sync::mpsc::channel();
     let cfg = osslscope::discovery::harvest::Config {
+        object_bytes: None,
         pid,
         provider: provider.into(),
         object: object.into(),
@@ -635,6 +636,7 @@ fn nostore_table_is_explicit_partial() {
     // probes.
     let (tx, rx) = std::sync::mpsc::channel();
     let cfg = osslscope::discovery::harvest::Config {
+        object_bytes: None,
         pid,
         provider: provider.into(),
         object: object.into(),
@@ -781,6 +783,7 @@ fn legacy_quiet_attach_with_tripwires_is_partial() {
     std::thread::sleep(std::time::Duration::from_secs(2));
     let provider = mapped_libcrypto(pid).expect("child must map libcrypto.so.* by now");
     let cfg = osslscope::discovery::harvest::Config {
+        object_bytes: None,
         pid,
         provider: provider.into(),
         object: object.into(),
@@ -834,6 +837,7 @@ fn legacy_blind_quiet_is_partial() {
         "blind leg needs a target with no libcrypto mapped"
     );
     let cfg = osslscope::discovery::harvest::Config {
+        object_bytes: None,
         pid,
         provider: provider.into(),
         object: object.into(),

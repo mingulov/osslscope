@@ -3,7 +3,7 @@
 //!
 //! [`check_version`] accepts historical v1.x documents; its schema is
 //! `schemas/observed-crypto-v1.json`. Live report/check producers emit
-//! `observed-crypto-v2.2`; [`check_version_v2`], [`validate_v2`] and
+//! `observed-crypto-v2.3`; [`check_version_v2`], [`validate_v2`] and
 //! [`check_v2_semantics`] own that contract. Minor additions are optional;
 //! field readers ignore unknown keys while validators stay strict.
 
@@ -588,6 +588,7 @@ pub fn check_v2_semantics(doc: &serde_json::Value) -> Result<(), String> {
     check_records(root, bounds)?;
     check_legacy_partition(root)?;
     check_traversal_fingerprints(root)?;
+    check_package_provenance(root)?;
     Ok(())
 }
 
@@ -2111,4 +2112,147 @@ mod g1_admission_reader_tests {
         check_v2_semantics(&value).unwrap();
         validate_against(&old, &value["window"], &old, "$.window", 0).unwrap();
     }
+}
+
+// Optional observer metadata has the same closed shape even when the caller
+// invokes semantics directly, without first invoking the schema validator.
+fn check_package_provenance(
+    root: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
+    use crate::package::commands::{
+        PackageProvenance, PackageSelection, ROLE_BUFFER_LIMIT, RoleSelection,
+    };
+    let Some(value) = root.get("package_build") else {
+        return Ok(());
+    };
+    let schema: serde_json::Value =
+        serde_json::from_str(V2_SCHEMA_JSON).map_err(|e| e.to_string())?;
+    validate_against(
+        &schema["$defs"]["packageProvenance"],
+        value,
+        &schema,
+        "$.package_build",
+        0,
+    )
+    .map_err(|e| e.to_string())?;
+    let p: PackageProvenance =
+        serde_json::from_value(value.clone()).map_err(|e| format!("doc.package_build: {e}"))?;
+    let fail = || "doc.package_build: inconsistent package/selected-object provenance".to_string();
+    if let Some(base) = &p.installed_base {
+        if base.source.revision.len() != 40
+            || !base
+                .source
+                .revision
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || base.product_version.is_empty()
+            || base.host_profile.abi_floor.is_empty()
+            || base.tools.components_sha256.is_empty()
+        {
+            return Err(fail());
+        }
+        if !matches!(
+            (
+                base.host_profile.target.as_str(),
+                base.host_profile.abi_profile.as_str()
+            ),
+            ("x86_64-unknown-linux-gnu", "linux-x86_64-gnu")
+                | ("x86_64-unknown-linux-musl", "linux-x86_64-musl")
+        ) {
+            return Err(fail());
+        }
+    }
+    let Some(count) = p.roles.count.as_ref() else {
+        return Err(fail());
+    };
+    let selected = root
+        .get("selected_objects")
+        .and_then(|v| v.as_object())
+        .ok_or_else(fail)?;
+    if selected.get("members").is_some() != p.roles.members.is_some() {
+        return Err(fail());
+    }
+    let mut total = 0u64;
+    let mut explicit = 0;
+    for (name, role) in [
+        ("harvest", Some(&p.roles.harvest)),
+        ("count", Some(count)),
+        ("members", p.roles.members.as_ref()),
+    ] {
+        if let Some(role) = role {
+            total = total.checked_add(role.bytes).ok_or_else(fail)?;
+            if role.bytes == 0 || role.bytes > ROLE_BUFFER_LIMIT {
+                return Err(fail());
+            }
+            match role.selection {
+                RoleSelection::OperatorExplicit => {
+                    explicit += 1;
+                    if role.build_input_id.is_some() {
+                        return Err(fail());
+                    }
+                }
+                RoleSelection::InstalledMatched => {
+                    if role.build_input_id.is_none()
+                        || role.build_input_id != p.installed_base.as_ref().map(|b| b.input_id)
+                    {
+                        return Err(fail());
+                    }
+                }
+            }
+            let expected = role.sha256.to_string();
+            if selected
+                .get(name)
+                .and_then(|r| r.get("sha256"))
+                .and_then(|v| v.as_str())
+                != Some(expected.as_str())
+            {
+                return Err(fail());
+            }
+            if let Some(traversal) = root.get("traversal") {
+                if traversal
+                    .get(name)
+                    .and_then(|r| r.get("sha256"))
+                    .and_then(|v| v.as_str())
+                    != Some(expected.as_str())
+                {
+                    return Err(fail());
+                }
+            }
+        }
+    }
+    if total > ROLE_BUFFER_LIMIT || (root.contains_key("traversal") && p.roles.members.is_none()) {
+        return Err(fail());
+    }
+    match p.selection {
+        PackageSelection::InstalledMatched
+            if p.installed_base.is_none() || explicit != 0 || p.roles.members.is_none() =>
+        {
+            Err(fail())
+        }
+        PackageSelection::OperatorOverride if explicit == 0 => Err(fail()),
+        _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn package_frozen_v2_2_strict_reader_rejects_new_field() {
+    // Exact public schema from 72f55991; SHA-256
+    // a9a39ecf8ff99bcd85afdd998e392da1f73331ae9dcf75b5234894a93d9faefa.
+    // This preimage was frozen before the package observer extension.
+    #[path = "../tests/support/package_observer_fixtures.rs"]
+    mod fixtures;
+    let old: serde_json::Value = serde_json::from_str(include_str!(
+        "../tests/support/observed_crypto_v2_2_schema.json"
+    ))
+    .unwrap();
+    let mut v: serde_json::Value = serde_json::from_str(fixtures::HISTORICAL_V2_2).unwrap();
+    validate_against(&old, &v, &old, "$", 0).unwrap();
+    v["package_build"] = fixtures::package();
+    v["selected_objects"] = fixtures::selection();
+    let error = validate_against(&old, &v, &old, "$", 0).unwrap_err();
+    assert_eq!(error.path, "$.package_build");
+    assert!(error.message.contains("forbidden"));
+    validate_v2(&v).unwrap();
+    check_v2_semantics(&v).unwrap();
 }

@@ -1145,7 +1145,7 @@ fn golden_v2_bytes_stable() {
 fn golden_v2_exercises_branches() {
     let (_, v) = load_golden_v2();
     let o = v.as_object().unwrap();
-    assert_eq!(o["schema_version"], "observed-crypto-v2.2");
+    assert_eq!(o["schema_version"], "observed-crypto-v2.3");
     assert!(
         !o["sites"].as_array().unwrap().is_empty(),
         "v2 golden needs sites"

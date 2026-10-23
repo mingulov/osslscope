@@ -312,7 +312,7 @@ pub fn run(argv: &[String]) -> ExitCode {
     // T14r4: report renders the finalized v2 capture document
     // (policy None => report shape), never the historical v1
     // projection. PRD §14.1: the live producer schema is
-    // observed-crypto-v2.2; v1 fixtures are history.
+    // observed-crypto-v2.3; v1 fixtures are history.
     let req = OutputRequest {
         format: if args.format == "json" {
             OutputFormat::Json
@@ -336,7 +336,7 @@ pub fn run(argv: &[String]) -> ExitCode {
     );
     ExitCode::from(
         consume_capture_result(
-            capture::run(&args.cfg, args.target),
+            capture_report(&args.cfg, args.target),
             CaptureCommand::Report,
             &req,
             workload_discarded,
@@ -356,9 +356,9 @@ pub fn run(argv: &[String]) -> ExitCode {
 
 use crate::evidence::CaptureDocument;
 use crate::evidence::{
-    CAPTURE_SCHEMA_V2, CandidateCoverage, Completeness, CounterKind, CounterSource, CounterUnits,
-    DispositionOutcome, EngineWindow, ExpectedScope, FatalKind, GapReason, OpensslVersionState,
-    PolicyVerdict, RuleVerdict, SiteExecution,
+    CandidateCoverage, Completeness, CounterKind, CounterSource, CounterUnits, DispositionOutcome,
+    EngineWindow, ExpectedScope, FatalKind, GapReason, OpensslVersionState, PolicyVerdict,
+    RuleVerdict, SiteExecution,
 };
 
 /// Primary artifact format for [`OutputRequest`].
@@ -770,7 +770,7 @@ pub fn consume_capture_result_with_diagnostics(
     }
 }
 
-/// Render the v2 JSON artifact (`observed-crypto-v2.2`) for one
+/// Render the v2 JSON artifact (`observed-crypto-v2.3`) for one
 /// finalized document: sorted keys, pretty-printed, trailing
 /// newline. Sites carry conserved per-site counts with candidate
 /// uncertainty; target/openssl/window/coverage/losses/disposition
@@ -923,7 +923,7 @@ fn doc_json(doc: &CaptureDocument) -> serde_json::Value {
         _ => serde_json::Value::Null,
     };
     let mut out = serde_json::json!({
-        "schema_version": CAPTURE_SCHEMA_V2,
+        "schema_version": doc.schema,
         "target": {
             "pid": doc.target.pid,
             "comm": doc.target.comm,
@@ -1125,6 +1125,9 @@ fn doc_json(doc: &CaptureDocument) -> serde_json::Value {
     if !doc.refusal_diagnostics.is_empty() {
         out["refusal_diagnostics"] = serde_json::json!(doc.refusal_diagnostics);
     }
+    if let Some(package) = &doc.package_build {
+        out["package_build"] = serde_json::json!(package);
+    }
     out
 }
 
@@ -1137,7 +1140,7 @@ pub fn render_human(doc: &CaptureDocument) -> String {
     let mut s = String::new();
     s.push_str(&format!(
         "osslscope report ({}): pid={} ({}) window={}..{}ns effective={}..{}ns\n",
-        CAPTURE_SCHEMA_V2,
+        safe_display(&doc.schema),
         doc.target.pid,
         safe_display(&doc.target.comm),
         doc.window.requested_start_ns,
@@ -1145,6 +1148,40 @@ pub fn render_human(doc: &CaptureDocument) -> String {
         doc.window.effective_start_ns,
         doc.window.effective_end_ns,
     ));
+    if let Some(package) = &doc.package_build {
+        s.push_str(&format!(
+            "package: {}\n",
+            match package.selection {
+                crate::package::commands::PackageSelection::InstalledMatched => "installed-matched",
+                crate::package::commands::PackageSelection::OperatorOverride => "operator-override",
+            }
+        ));
+        if let Some(base) = &package.installed_base {
+            s.push_str(&format!(
+                "  base: bundle={} payload={} input={} source={} version={}\n",
+                base.bundle_id,
+                base.payload_id,
+                base.input_id,
+                safe_display(&base.source.revision),
+                safe_display(&base.product_version)
+            ));
+        }
+        for (name, role) in [
+            ("harvest", Some(&package.roles.harvest)),
+            ("count", package.roles.count.as_ref()),
+            ("members", package.roles.members.as_ref()),
+        ] {
+            if let Some(role) = role {
+                s.push_str(&format!(
+                    "  {name}: sha256={} build={}\n",
+                    role.sha256,
+                    role.build_input_id
+                        .map(|id| id.to_string())
+                        .unwrap_or_else(|| "unknown".into())
+                ));
+            }
+        }
+    }
     // R12/G08: explicit durations (monotonic window fields only —
     // authoritative for deadlines) plus kernel and wall context
     // (context only, never authoritative and never conflated with
@@ -1861,7 +1898,7 @@ fn cbom_json(doc: &CaptureDocument) -> serde_json::Value {
         )
     };
     let mut metadata = vec![
-        prop("osslscope:schema-version", CAPTURE_SCHEMA_V2.to_string()),
+        prop("osslscope:schema-version", doc.schema.clone()),
         prop(
             "osslscope:execution-evidence-completeness",
             status_str(doc).to_string(),
@@ -2342,7 +2379,7 @@ mod tests {
         assert!(doc.policy.is_none());
         let bytes = render_json(&doc).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(v["schema_version"], "observed-crypto-v2.2");
+        assert_eq!(v["schema_version"], "observed-crypto-v2.3");
         assert!(v.get("policy").is_none());
     }
 
@@ -2482,4 +2519,38 @@ mod tests {
         assert!(a.cfg.builtin);
         assert!(matches!(a.target, capture::Target::Pid(9)));
     }
+}
+
+// The real entrypoint and the four-command source fixture use this same
+// fixed-kind admission port; effects begin only after successful resolution.
+pub(crate) fn with_report_objects<R>(
+    overrides: &crate::package::commands::ObjectOverrides,
+    resolve: impl FnOnce(
+        crate::package::commands::CommandKind,
+        &crate::package::commands::ObjectOverrides,
+    )
+        -> Result<crate::package::commands::AdmittedSet, crate::package::PackageError>,
+    effect: impl FnOnce(crate::package::commands::AdmittedSet) -> R,
+) -> Result<R, crate::package::PackageError> {
+    capture::with_capture_objects(
+        crate::package::commands::CommandKind::Report,
+        overrides,
+        resolve,
+        effect,
+    )
+}
+fn capture_report(
+    cfg: &capture::Config,
+    target: capture::Target,
+) -> anyhow::Result<capture::Capture> {
+    let overrides = crate::package::commands::ObjectOverrides {
+        harvest: cfg.harvest_object.clone(),
+        count: cfg.count_object.clone(),
+        members: cfg.members_object.clone(),
+    };
+    with_report_objects(
+        &overrides,
+        crate::package::commands::resolve_command_objects,
+        |objects| capture::run_admitted(cfg, target, objects, cfg.members_object.is_none()),
+    )?
 }

@@ -2,13 +2,14 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://osslscope.dev/schemas/observed-crypto-v2.json",
   "title": "observed-crypto v2",
-  "description": "osslscope report/check window document (continuation R08). The counted unit is entry into a provider-dispatch callback at one physical site; candidates are sorted attribution metadata, not definite executed-algorithm identity. Producers emit observed-crypto-v2.2 today. Readers gate majors via check_version_v2 (accept v2.x, reject other majors); validators enforce this minor's schema strictly (unknown keys fail: a v2.0 validator cannot verify v2.1 keys it does not know) while field-level readers ignore unknown keys. report documents omit policy/disposition when unevaluated/unrecorded; check documents add policy. No raw argv, cmdline, environment or runtime addresses anywhere: every object forbids additional properties.",
+  "description": "osslscope report/check window document (continuation R08). The counted unit is entry into a provider-dispatch callback at one physical site; candidates are sorted attribution metadata, not definite executed-algorithm identity. Producers emit observed-crypto-v2.3 today. Readers gate majors via check_version_v2 (accept v2.x, reject other majors); validators enforce this minor's schema strictly (unknown keys fail: a v2.0 validator cannot verify v2.1 keys it does not know) while field-level readers ignore unknown keys. report documents omit policy/disposition when unevaluated/unrecorded; check documents add policy. No raw argv, cmdline, environment or runtime addresses anywhere: every object forbids additional properties.",
   "type": "object",
   "required": ["schema_version", "target", "openssl", "window", "completeness", "sites", "fenced", "objects", "coverage", "legacy_partition"],
   "additionalProperties": false,
   "properties": {
+    "package_build": { "$ref": "#/$defs/packageProvenance" },
     "schema_version": {
-      "description": "Producers emit exactly observed-crypto-v2.2; readers major-gate via check_version_v2 (accept v2.x, reject other majors).",
+      "description": "Producers emit exactly observed-crypto-v2.3; readers major-gate via check_version_v2 (accept v2.x, reject other majors).",
       "type": "string",
       "minLength": 1
     },
@@ -326,6 +327,281 @@
     }
   },
   "$defs": {
+    "packageToolIdentity": {
+      "type": "object",
+      "required": [
+        "host_sha256",
+        "bpf_sha256",
+        "linker_sha256",
+        "llvm_sha256",
+        "builder_sha256",
+        "components_sha256"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "host_sha256": {
+          "type": "string",
+          "minLength": 64,
+          "maxLength": 64
+        },
+        "bpf_sha256": {
+          "type": "string",
+          "minLength": 64,
+          "maxLength": 64
+        },
+        "linker_sha256": {
+          "type": "string",
+          "minLength": 64,
+          "maxLength": 64
+        },
+        "llvm_sha256": {
+          "type": "string",
+          "minLength": 64,
+          "maxLength": 64
+        },
+        "builder_sha256": {
+          "type": "string",
+          "minLength": 64,
+          "maxLength": 64
+        },
+        "components_sha256": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 64,
+            "maxLength": 64
+          }
+        }
+      }
+    },
+    "packageBuildIdentity": {
+      "type": "object",
+      "required": [
+        "bundle_id",
+        "payload_id",
+        "input_id",
+        "source",
+        "product_version",
+        "host_profile",
+        "locks",
+        "recipe",
+        "tools"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "bundle_id": {
+          "type": "string",
+          "minLength": 64,
+          "maxLength": 64
+        },
+        "payload_id": {
+          "type": "string",
+          "minLength": 64,
+          "maxLength": 64
+        },
+        "input_id": {
+          "type": "string",
+          "minLength": 64,
+          "maxLength": 64
+        },
+        "source": {
+          "type": "object",
+          "required": [
+            "revision",
+            "inventory_sha256"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "revision": {
+              "type": "string",
+              "minLength": 40,
+              "maxLength": 40
+            },
+            "inventory_sha256": {
+              "type": "string",
+              "minLength": 64,
+              "maxLength": 64
+            }
+          }
+        },
+        "product_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "host_profile": {
+          "type": "object",
+          "required": [
+            "target",
+            "abi_profile",
+            "abi_floor"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "target": {
+              "enum": [
+                "x86_64-unknown-linux-gnu",
+                "x86_64-unknown-linux-musl"
+              ]
+            },
+            "abi_profile": {
+              "enum": [
+                "linux-x86_64-gnu",
+                "linux-x86_64-musl"
+              ]
+            },
+            "abi_floor": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        "locks": {
+          "type": "object",
+          "required": [
+            "host_sha256",
+            "bpf_sha256"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "host_sha256": {
+              "type": "string",
+              "minLength": 64,
+              "maxLength": 64
+            },
+            "bpf_sha256": {
+              "type": "string",
+              "minLength": 64,
+              "maxLength": 64
+            }
+          }
+        },
+        "recipe": {
+          "type": "object",
+          "required": [
+            "recipe_sha256",
+            "config_sha256"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "recipe_sha256": {
+              "type": "string",
+              "minLength": 64,
+              "maxLength": 64
+            },
+            "config_sha256": {
+              "type": "string",
+              "minLength": 64,
+              "maxLength": 64
+            }
+          }
+        },
+        "tools": {
+          "$ref": "#/$defs/packageToolIdentity"
+        }
+      }
+    },
+    "packageRoleProvenance": {
+      "type": "object",
+      "required": [
+        "selection",
+        "sha256",
+        "bytes",
+        "build_input_id"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "selection": {
+          "enum": [
+            "installed-matched",
+            "operator-explicit"
+          ]
+        },
+        "sha256": {
+          "type": "string",
+          "minLength": 64,
+          "maxLength": 64
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 536870912
+        },
+        "build_input_id": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "string",
+              "minLength": 64,
+              "maxLength": 64
+            }
+          ]
+        }
+      }
+    },
+    "packageProvenance": {
+      "type": "object",
+      "required": [
+        "selection",
+        "installed_base",
+        "roles"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "selection": {
+          "enum": [
+            "installed-matched",
+            "operator-override"
+          ]
+        },
+        "installed_base": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/packageBuildIdentity"
+            }
+          ]
+        },
+        "roles": {
+          "type": "object",
+          "required": [
+            "harvest",
+            "count",
+            "members"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "harvest": {
+              "$ref": "#/$defs/packageRoleProvenance"
+            },
+            "count": {
+              "anyOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "$ref": "#/$defs/packageRoleProvenance"
+                }
+              ]
+            },
+            "members": {
+              "anyOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "$ref": "#/$defs/packageRoleProvenance"
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
     "traversal-object": {
       "description": "One BPF object selected for the window: path locates for display, sha256 defines identity. The sha256 is 64 lowercase hex chars: this schema carries min/maxLength only (the only string-shape keywords the embedded validator implements — 'pattern' is unsupported, so external validators accept any 64 chars), and the embedded semantic layer enforces the lowercase-hex producer guarantee.",
       "type": "object",

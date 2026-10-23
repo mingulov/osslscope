@@ -852,6 +852,18 @@ fn h5_t3_every_device_site_names_one_domain() {
         // keys, compared only against same-constructed keys —
         // raw-vs-raw, run-local, never cross-domain joined).
         ("src/target.rs", "raw", "md.dev(),", 1),
+        // Package snapshots retain raw dev_t from opened-FD metadata for
+        // same-FD before/after identity checks; no encoded/maps-domain join.
+        ("src/package/commands.rs", "raw", "dev: m.dev(),", 1),
+        // Task 2 trusted file identities use the same raw FD metadata domain.
+        ("src/package/trusted.rs", "raw", "dev: m.dev(),", 1),
+        // Executing-FD and trusted path-rebound FD devices are compared raw.
+        (
+            "src/package/trusted.rs",
+            "raw",
+            "if proc_id.dev != rebound_id.dev || proc_id.ino != rebound_id.ino {",
+            1,
+        ),
     ];
     for (file, domain, _, _) in pinned {
         assert!(

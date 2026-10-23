@@ -100,7 +100,7 @@ pub struct DiscoveryConfig {
     /// the attach loads these bytes instead of re-reading the
     /// path (no reread drift between identity and loading). The
     /// path stays for identity/diags regardless.
-    pub object_bytes: Option<Vec<u8>>,
+    pub object_bytes: Option<std::sync::Arc<[u8]>>,
     /// Builtin mode: the in-libcrypto default provider.
     pub builtin: bool,
     /// Legacy tripwires (ENGINE/meth/load/low-level + legacy query).
@@ -4891,6 +4891,7 @@ impl DiscoverySession {
                 &cfg.object,
                 crate::discovery::onboard::MAX_OBJECT_SCAN_BYTES,
             )
+            .map(std::sync::Arc::from)
             .map_err(|e| anyhow::anyhow!("harvest object {}: {e}", cfg.object.display()))?,
         };
         if pin.verify().is_err() {
@@ -4899,7 +4900,7 @@ impl DiscoverySession {
             return Err(core.recycled_err());
         }
 
-        let loaded = load_frozen(&obj_bytes)?;
+        let loaded = with_harvest_snapshot(&obj_bytes, load_frozen)?;
         let classifier_handles = crate::discovery::classifier_maps::clone_classifier_handles(
             &loaded.maps,
             crate::discovery::classifier_maps::ClassifierRole::Harvest,
@@ -8247,4 +8248,43 @@ mod tests {
         core.mark_recycled();
         assert_eq!(core.builtin_anchor(), None);
     }
+}
+
+pub(crate) fn with_harvest_snapshot<R>(
+    snapshot: &std::sync::Arc<[u8]>,
+    load: impl FnOnce(&[u8]) -> R,
+) -> R {
+    load(snapshot)
+}
+
+#[cfg(test)]
+#[test]
+fn package_classifier_gate_survives_snapshot_adaptation() {
+    use std::{cell::Cell, sync::Arc};
+    let snapshot: Arc<[u8]> = Arc::from(b"admitted-harvest".as_slice());
+    let loaded = Cell::new(0);
+    let activated = Cell::new(0);
+    for succeeds in [false, true] {
+        let result = with_harvest_snapshot(&snapshot, |bytes| {
+            assert_eq!(bytes.as_ptr(), snapshot.as_ptr());
+            assert_eq!(bytes, b"admitted-harvest");
+            loaded.set(loaded.get() + 1);
+            crate::discovery::classifier_maps::after_classifier_init(
+                || {
+                    if succeeds {
+                        Ok(())
+                    } else {
+                        Err(anyhow::anyhow!("classifier initialization refused"))
+                    }
+                },
+                || {
+                    activated.set(activated.get() + 1);
+                    Ok(())
+                },
+            )
+        });
+        assert_eq!(result.is_ok(), succeeds);
+        assert_eq!(activated.get(), usize::from(succeeds));
+    }
+    assert_eq!(loaded.get(), 2);
 }

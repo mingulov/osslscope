@@ -62,6 +62,7 @@ fn run_harvest(
     birth: bool,
 ) -> serde_json::Value {
     let cfg = osslscope::discovery::harvest::Config {
+        object_bytes: None,
         pid,
         provider: provider.to_path_buf(),
         object: object.to_path_buf(),

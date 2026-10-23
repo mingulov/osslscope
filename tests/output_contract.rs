@@ -834,7 +834,7 @@ fn schema_version_gate() {
     assert!(!check_version("observed-crypto-v2.9"));
     // Renders carry exactly the current producer version.
     for doc in [complete_doc(), violation_doc(), fatal_doc()] {
-        assert_eq!(json_of(&doc)["schema_version"], "observed-crypto-v2.2");
+        assert_eq!(json_of(&doc)["schema_version"], "observed-crypto-v2.3");
     }
 }
 
@@ -1832,7 +1832,7 @@ fn cbom_carries_same_window() {
             meta["osslscope:window-effective-end-ns"],
             doc.window.effective_end_ns.to_string()
         );
-        assert_eq!(meta["osslscope:schema-version"], "observed-crypto-v2.2");
+        assert_eq!(meta["osslscope:schema-version"], "observed-crypto-v2.3");
     }
     // PARTIAL disclaimer names the gaps.
     let meta = cbom_metadata(&cbom_of(&partial_doc()));
@@ -2385,7 +2385,7 @@ fn selected_objects_rendered_and_old_reader_safe() {
     // Additive proof: a frozen pre-key wire reader (no
     // selected_objects field) parses the new bytes.
     let back: PreR12WireDocument = serde_json::from_value(v).expect("old reader parses new bytes");
-    assert_eq!(back.schema_version, "observed-crypto-v2.2");
+    assert_eq!(back.schema_version, "observed-crypto-v2.3");
     assert_eq!(back.completeness.status, "COMPLETE");
 }
 
@@ -2953,7 +2953,7 @@ fn site_installed_at_renders_and_validates_v2() {
     doc.sites[0].installed_at = Some(5);
     assert_eq!(doc.sites[3].installed_at, None);
     let v = json_of(&doc);
-    assert_eq!(v["schema_version"], "observed-crypto-v2.2");
+    assert_eq!(v["schema_version"], "observed-crypto-v2.3");
     validate_v2(&v).expect("installed_at doc fails schema");
     check_v2_semantics(&v).expect("installed_at doc fails semantics");
     assert_eq!(v["sites"][0]["installed_at"], 5);
@@ -3867,7 +3867,7 @@ fn r12_old_reader_ignores_context() {
     );
     let back: PreR12WireDocument =
         serde_json::from_value(rendered).expect("old reader parses new bytes");
-    assert_eq!(back.schema_version, "observed-crypto-v2.2");
+    assert_eq!(back.schema_version, "observed-crypto-v2.3");
     assert_eq!(back.completeness.status, "COMPLETE");
     assert_eq!(
         back.window.requested_start_ns,
@@ -4027,7 +4027,7 @@ fn r14_refusal_diagnostics_additive_old_reader_safe() {
     );
     let back: PreRefusalWireDocument =
         serde_json::from_value(rendered).expect("old reader parses new bytes");
-    assert_eq!(back.schema_version, "observed-crypto-v2.2");
+    assert_eq!(back.schema_version, "observed-crypto-v2.3");
     assert_eq!(back.sites.len(), doc.sites.len());
     assert_eq!(back.objects.len(), doc.objects.len());
     let calls: u64 = back.sites.iter().map(|s| s.calls).sum();
@@ -4111,8 +4111,8 @@ fn g1_current_producer_is_minor_2_2() {
     let v = json_of(&complete_doc());
     validate_v2(&v).unwrap();
     check_v2_semantics(&v).unwrap();
-    assert_eq!(v["schema_version"], "observed-crypto-v2.2");
-    assert!(render_human(&complete_doc()).contains("observed-crypto-v2.2"));
+    assert_eq!(v["schema_version"], "observed-crypto-v2.3");
+    assert!(render_human(&complete_doc()).contains("observed-crypto-v2.3"));
 }
 
 /// A TARGET read may precede seal and its ktime sample may follow seal.after.
@@ -4279,9 +4279,9 @@ fn g1_admission_extension_is_guarded() {
         assert!(check_v2_semantics(&v).is_err());
     }
     let human = render_human(&doc);
-    assert!(human.contains("observed-crypto-v2.2"));
+    assert!(human.contains("observed-crypto-v2.3"));
     let cbom: Value = serde_json::from_slice(&render_cbom(&doc).unwrap()).unwrap();
-    assert!(cbom.to_string().contains("observed-crypto-v2.2"));
+    assert!(cbom.to_string().contains("observed-crypto-v2.3"));
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -4692,4 +4692,90 @@ fn g1_runtime_salvage_renderers_preserve_conviction_and_physical_counts() {
             .iter()
             .any(|p| p["name"] == "osslscope:policy-verdict" && p["value"] == "violation")
     );
+}
+
+#[test]
+fn package_v2_2_count_admission_preserved() {
+    #[path = "support/package_observer_fixtures.rs"]
+    mod package_fixtures;
+    let historical: Value = serde_json::from_str(package_fixtures::HISTORICAL_V2_2).unwrap();
+    validate_v2(&historical).unwrap();
+    check_v2_semantics(&historical).unwrap();
+    for fatal in [false, true] {
+        let mut doc = g1_tail_document();
+        doc.schema = "observed-crypto-v2.2".into();
+        if fatal {
+            doc.status = Completeness::Fatal {
+                kind: FatalKind::Runtime("fixture close failure".into()),
+                reasons: match &doc.status {
+                    Completeness::Partial { reasons } | Completeness::Fatal { reasons, .. } => {
+                        reasons.clone()
+                    }
+                    Completeness::Complete => Vec::new(),
+                },
+            };
+        }
+        doc.selected_objects = Some(serde_json::from_value(package_fixtures::selection()).unwrap());
+        let before = json_of(&doc);
+        validate_v2(&before).unwrap();
+        check_v2_semantics(&before).unwrap();
+        let verdict = evaluate_document(&[PolicyRule::deny_algorithm("AES-128-GCM")], &doc);
+        assert_eq!(verdict.rules[0].bounds.definite, 500);
+        assert_eq!(verdict.rules[0].bounds.possible, None);
+        doc.package_build = Some(serde_json::from_value(package_fixtures::package()).unwrap());
+        let mut after = json_of(&doc);
+        validate_v2(&after).unwrap();
+        check_v2_semantics(&after).unwrap();
+        assert_eq!(after["package_build"], package_fixtures::package());
+        after.as_object_mut().unwrap().remove("package_build");
+        assert_eq!(after, before, "legacy Count fields changed on decoration");
+        let with = json_of(&doc);
+        for positive in [&before, &with] {
+            for case in [
+                "missing",
+                "inverted",
+                "misbinding",
+                "deadline",
+                "out-of-range",
+                "complete",
+                "no-tail",
+            ] {
+                let mut v = positive.clone();
+                match case {
+                    "missing" => {
+                        v["window"]
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("count_admission");
+                    }
+                    "inverted" => v["window"]["count_admission"]["start_ns"] = json!(2000),
+                    "misbinding" => v["window"]["effective_start_ns"] = json!(1200),
+                    "deadline" => v["sites"][0]["last_ns"] = json!(2000),
+                    "out-of-range" => v["sites"][0]["first_ns"] = json!(1099),
+                    "complete" => v["completeness"]["status"] = json!("COMPLETE"),
+                    _ => v["completeness"]["reasons"] = json!([{"kind":"signal-cut"}]),
+                }
+                assert!(
+                    check_v2_semantics(&v).is_err(),
+                    "accepted {case} with package={}",
+                    positive.get("package_build").is_some()
+                );
+            }
+        }
+    }
+    // A normal bounded admission retains all existing execution/coverage fields.
+    let mut doc = complete_doc();
+    doc.window.count_admission = Some(osslscope::evidence::CountAdmissionWindow {
+        start_ns: 0,
+        deadline_ns: 100,
+    });
+    doc.selected_objects = Some(serde_json::from_value(package_fixtures::selection()).unwrap());
+    let before = json_of(&doc);
+    check_v2_semantics(&before).unwrap();
+    doc.package_build = Some(serde_json::from_value(package_fixtures::package()).unwrap());
+    let mut after = json_of(&doc);
+    validate_v2(&after).unwrap();
+    check_v2_semantics(&after).unwrap();
+    after.as_object_mut().unwrap().remove("package_build");
+    assert_eq!(after, before);
 }

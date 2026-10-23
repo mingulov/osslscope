@@ -1,0 +1,572 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://osslscope.dev/schemas/observed-crypto-v2.json",
+  "title": "observed-crypto v2",
+  "description": "osslscope report/check window document (continuation R08). The counted unit is entry into a provider-dispatch callback at one physical site; candidates are sorted attribution metadata, not definite executed-algorithm identity. Producers emit observed-crypto-v2.2 today. Readers gate majors via check_version_v2 (accept v2.x, reject other majors); validators enforce this minor's schema strictly (unknown keys fail: a v2.0 validator cannot verify v2.1 keys it does not know) while field-level readers ignore unknown keys. report documents omit policy/disposition when unevaluated/unrecorded; check documents add policy. No raw argv, cmdline, environment or runtime addresses anywhere: every object forbids additional properties.",
+  "type": "object",
+  "required": ["schema_version", "target", "openssl", "window", "completeness", "sites", "fenced", "objects", "coverage", "legacy_partition"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "description": "Producers emit exactly observed-crypto-v2.2; readers major-gate via check_version_v2 (accept v2.x, reject other majors).",
+      "type": "string",
+      "minLength": 1
+    },
+    "target": {
+      "description": "Safe actionability (R07): pid, comm, container/image provenance. argv is never carried; argv_redacted is always true.",
+      "type": "object",
+      "required": ["pid", "comm", "container_id", "image_digest", "argv_redacted"],
+      "additionalProperties": false,
+      "properties": {
+        "pid": { "$ref": "#/$defs/u32" },
+        "comm": { "type": "string" },
+        "container_id": { "type": "string" },
+        "image_digest": { "type": "string" },
+        "argv_redacted": { "const": true }
+      }
+    },
+    "openssl": {
+      "description": "OpenSSL version from verified object metadata, or explicitly unknown (never guessed).",
+      "type": "object",
+      "required": ["state", "version"],
+      "additionalProperties": false,
+      "properties": {
+        "state": { "enum": ["verified", "unknown"] },
+        "version": { "type": ["string", "null"] }
+      }
+    },
+    "window": {
+      "description": "Requested versus effective coverage boundaries in monotonic nanoseconds. Any unobserved interval inside the requested window is a gap; the effective window never extends past the requested one.",
+      "type": "object",
+      "required": ["requested_start_ns", "requested_end_ns", "effective_start_ns", "effective_end_ns", "signal_cut"],
+      "additionalProperties": false,
+      "properties": {
+        "requested_start_ns": { "$ref": "#/$defs/u64" },
+        "requested_end_ns": { "$ref": "#/$defs/u64" },
+        "effective_start_ns": { "$ref": "#/$defs/u64" },
+        "effective_end_ns": { "$ref": "#/$defs/u64" },
+        "signal_cut": { "type": "boolean" },
+        "count_admission": {
+          "description": "Actual completed count Open interval; independent of conservative coverage. Absent means strict effective-window containment. Cross-field constraints are enforced by check_v2_semantics.",
+          "type": "object",
+          "required": ["start_ns", "deadline_ns"],
+          "additionalProperties": false,
+          "properties": {
+            "start_ns": { "$ref": "#/$defs/u64" },
+            "deadline_ns": { "$ref": "#/$defs/u64" }
+          }
+        }
+      }
+    },
+    "completeness": {
+      "type": "object",
+      "required": ["status", "fatal_kind", "reasons", "counters"],
+      "additionalProperties": false,
+      "properties": {
+        "status": { "enum": ["COMPLETE", "PARTIAL", "FATAL"] },
+        "fatal_kind": {
+          "description": "Null unless status is FATAL; environment carries a detail string.",
+          "anyOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "required": ["kind", "detail"],
+              "additionalProperties": false,
+              "properties": {
+                "kind": { "enum": ["recycled", "attach-zero", "environment", "runtime"] },
+                "detail": { "type": ["string", "null"] }
+              }
+            }
+          ]
+        },
+        "reasons": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/reason" }
+        },
+        "counters": {
+          "description": "Source-tagged gap/activity counters with published units and kind. Only positive loss counters force PARTIAL.",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "kind", "units", "source", "value"],
+            "additionalProperties": false,
+            "properties": {
+              "name": { "type": "string", "minLength": 1 },
+              "kind": { "enum": ["loss", "activity"] },
+              "units": { "enum": ["calls", "sites", "table-rows", "events", "probes"] },
+              "source": { "enum": ["kernel-ring", "kernel-map", "discovery", "attach", "drain", "lifecycle", "setup"] },
+              "value": { "$ref": "#/$defs/u64" }
+            }
+          }
+        }
+      }
+    },
+    "sites": {
+      "description": "Current-generation physical execution records: one conserved call count per site plus sorted candidate metadata.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/site" }
+    },
+    "fenced": {
+      "description": "Conserved counts of fenced generations in the same SiteExecution shape, so fence crossings preserve candidates.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["generation", "sites"],
+        "additionalProperties": false,
+        "properties": {
+          "generation": { "$ref": "#/$defs/u32" },
+          "sites": {
+            "type": "array",
+            "items": { "$ref": "#/$defs/site" }
+          }
+        }
+      }
+    },
+    "legacy_partition": {
+      "description": "Legacy call partition (H8): counted callback executions split by candidate class and backing identity. The four buckets conserve exactly: their sum equals the sites plus fenced call total.",
+      "type": "object",
+      "required": ["legacy_exclusive_calls", "non_legacy_exclusive_calls", "shared_ambiguous_calls", "unfenced_tail_calls"],
+      "additionalProperties": false,
+      "properties": {
+        "legacy_exclusive_calls": { "$ref": "#/$defs/u64" },
+        "non_legacy_exclusive_calls": { "$ref": "#/$defs/u64" },
+        "shared_ambiguous_calls": { "$ref": "#/$defs/u64" },
+        "unfenced_tail_calls": { "$ref": "#/$defs/u64" }
+      }
+    },
+    "objects": {
+      "description": "Observed code objects: verified identity plus a display locator (provenance for operators, never identity). Every site backing object and candidate advertising provider resolves here.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "device", "inode", "display_locator"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "device": { "$ref": "#/$defs/u64" },
+          "inode": { "$ref": "#/$defs/u64" },
+          "display_locator": { "type": "string" }
+        }
+      }
+    },
+    "coverage": {
+      "description": "Per-scope instrumentation readiness: what was expected, discovered and attached. Quiet but fully attached sites are covered, not gaps.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["scope", "expected", "discovered", "attached"],
+        "additionalProperties": false,
+        "properties": {
+          "scope": { "type": "string", "minLength": 1 },
+          "expected": {
+            "type": "object",
+            "required": ["state", "sites"],
+            "additionalProperties": false,
+            "properties": {
+              "state": { "enum": ["applicable", "not-applicable", "unknown"] },
+              "sites": {
+                "type": ["integer", "null"],
+                "minimum": 0,
+                "maximum": 18446744073709551615
+              }
+            }
+          },
+          "discovered": { "$ref": "#/$defs/u64" },
+          "attached": { "$ref": "#/$defs/u64" }
+        }
+      }
+    },
+    "disposition": {
+      "description": "End-of-observation custody disposition. Omitted when never recorded.",
+      "type": "object",
+      "required": ["outcome", "code", "pid"],
+      "additionalProperties": false,
+      "properties": {
+        "outcome": { "enum": ["exited", "detached-running", "foreign-observed"] },
+        "code": {
+          "type": ["integer", "null"],
+          "minimum": -2147483648,
+          "maximum": 2147483647
+        },
+        "pid": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "maximum": 4294967295
+        }
+      }
+    },
+    "policy": {
+      "description": "Evaluated policy section (check documents only; report documents omit it). Rules are ANDed by the evaluator.",
+      "type": "object",
+      "required": ["verdict", "rules"],
+      "additionalProperties": false,
+      "properties": {
+        "verdict": { "enum": ["pass", "violation", "inconclusive", "no-verdict"] },
+        "rules": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["rule", "predicate", "result", "definite", "possible", "evidence"],
+            "additionalProperties": false,
+            "properties": {
+              "rule": { "type": "string", "minLength": 1 },
+              "predicate": { "type": "string", "minLength": 1 },
+              "result": { "enum": ["pass", "violation", "inconclusive"] },
+              "definite": { "$ref": "#/$defs/u64" },
+              "possible": {
+                "description": "Upper bound on matching calls; null means the upper bound is unknown.",
+                "type": ["integer", "null"],
+                "minimum": 0,
+                "maximum": 18446744073709551615
+              },
+              "evidence": {
+                "description": "Site evidence for definite matches; every ref resolves to a site listed in this document.",
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": ["object", "device", "inode", "offset", "generation", "calls"],
+                  "additionalProperties": false,
+                  "properties": {
+                    "object": { "type": "string", "minLength": 1 },
+                    "device": { "$ref": "#/$defs/u64" },
+                    "inode": { "$ref": "#/$defs/u64" },
+                    "offset": { "$ref": "#/$defs/u64" },
+                    "generation": { "$ref": "#/$defs/u32" },
+                    "calls": { "$ref": "#/$defs/u64" }
+                  }
+                }
+              },
+              "engine_evidence": {
+                "description": "Engine-plane evidence for definite tripwire observations (R05, optional); every ref resolves to an observation listed in this document.",
+                "type": "array",
+                "items": { "$ref": "#/$defs/engine_evidence" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "engine_observations": {
+      "description": "Typed ENGINE tripwire observations (R05, optional): the replayable engine plane. Omitted when none were observed. Never joins site call totals or the legacy partition.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/engine_observation" }
+    },
+    "context": {
+      "description": "Execution context (R12, optional): host kernel release plus the wall-clock window edges in unix nanoseconds. Omitted when unrecorded. Context only: the monotonic window fields stay authoritative for durations and deadlines; wall edges may be null (explicit unknown) and may run backward across a clock adjustment without affecting verdicts. Old field readers ignore this key; strict validators pinned to a pre-R12 schema reject documents carrying it (expected).",
+      "type": "object",
+      "required": ["kernel_release", "wall_start_unix_ns", "wall_end_unix_ns"],
+      "additionalProperties": false,
+      "properties": {
+        "kernel_release": { "type": "string" },
+        "wall_start_unix_ns": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "wall_end_unix_ns": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        }
+      }
+    },
+    "attach_diagnostics": {
+      "description": "Failed-attach diagnostic texts (R06, optional): sorted, deduped, capped producer literals (no paths/pointers) identifying failed attaches. Omitted when none failed. Diagnostic only: counters stay the exact counts; old field readers ignore this key.",
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "refusal_diagnostics": {
+      "description": "Budget-refusal diagnostic entries (R14 minor, optional): sorted, deduped, capped numeric entries (dev/ino/kind/bytes/allowance, no paths) identifying refused objects. Omitted when none refused. Diagnostic only: counters stay the exact counts; old field readers ignore this key.",
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "traversal": {
+      "description": "Traversal outcome (v2.1, optional — present iff the window ran the members backend): the exact selected triple plus record/findings/poll counts, the admitted-query census, per-record native facts, and census loss. Absent on harvest-only runs. The six triple/count keys are required; the census/entry keys are optional (additive — old readers ignore them) but always emitted by current producers.",
+      "type": "object",
+      "required": ["harvest", "count", "members", "records", "findings", "polls"],
+      "additionalProperties": false,
+      "properties": {
+        "harvest": { "$ref": "#/$defs/traversal-object" },
+        "count": { "$ref": "#/$defs/traversal-object" },
+        "members": { "$ref": "#/$defs/traversal-object" },
+        "records": { "$ref": "#/$defs/u64" },
+        "findings": { "$ref": "#/$defs/u64" },
+        "polls": { "$ref": "#/$defs/u64" },
+        "admitted": {
+          "description": "Admitted queries per op (op → count; JSON object keys are decimal op ids).",
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/u64" }
+        },
+        "entries": {
+          "description": "Per-record native facts, close order.",
+          "type": "array",
+          "items": { "$ref": "#/$defs/traversal_entry" }
+        },
+        "admitted_unknown": {
+          "description": "Ops observed (records retained) but missing from the census while increments were lost: UNKNOWN counts, never zero.",
+          "type": "array",
+          "items": { "$ref": "#/$defs/u32" }
+        },
+        "census_loss": {
+          "description": "Cumulative admitted-increment loss (CALLS map pressure).",
+          "$ref": "#/$defs/u64"
+        }
+      }
+    },
+    "selected_objects": {
+      "description": "Run-set selection provenance (v0.2, optional — recorded on every production run's document, absent on stubbed `observe` captures): the exact objects the run resolved, so doctor/report/check agree on the selection. Pair-only runs omit `members`. Additive and old-reader-safe.",
+      "type": "object",
+      "required": ["harvest", "count"],
+      "additionalProperties": false,
+      "properties": {
+        "harvest": { "$ref": "#/$defs/traversal-object" },
+        "count": { "$ref": "#/$defs/traversal-object" },
+        "members": { "$ref": "#/$defs/traversal-object" }
+      }
+    }
+  },
+  "$defs": {
+    "traversal-object": {
+      "description": "One BPF object selected for the window: path locates for display, sha256 defines identity. The sha256 is 64 lowercase hex chars: this schema carries min/maxLength only (the only string-shape keywords the embedded validator implements — 'pattern' is unsupported, so external validators accept any 64 chars), and the embedded semantic layer enforces the lowercase-hex producer guarantee.",
+      "type": "object",
+      "required": ["path", "sha256"],
+      "additionalProperties": false,
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "sha256": { "type": "string", "minLength": 64, "maxLength": 64 }
+      }
+    },
+    "traversal_entry": {
+      "description": "One traversal record's native facts (per-record summary — counts and verdicts only, never the walked arrays).",
+      "type": "object",
+      "required": ["tid", "seq", "op", "outcome", "true_t", "alg_count", "row_count", "generation"],
+      "additionalProperties": false,
+      "properties": {
+        "tid": { "$ref": "#/$defs/u32" },
+        "seq": { "$ref": "#/$defs/u64" },
+        "op": { "$ref": "#/$defs/u32" },
+        "outcome": { "$ref": "#/$defs/traversal_outcome" },
+        "true_t": { "$ref": "#/$defs/traversal_true_t" },
+        "alg_count": { "$ref": "#/$defs/u64" },
+        "row_count": { "$ref": "#/$defs/u64" },
+        "generation": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        }
+      }
+    },
+    "traversal_true_t": {
+      "description": "Terminator belief (externally-tagged enum shape: newtype variants are single-key objects, unit variants are plain strings).",
+      "anyOf": [
+        { "type": "object", "required": ["Proven"], "additionalProperties": false, "properties": { "Proven": { "$ref": "#/$defs/u64" } } },
+        { "type": "object", "required": ["Candidate"], "additionalProperties": false, "properties": { "Candidate": { "$ref": "#/$defs/u64" } } },
+        { "type": "string", "const": "EmptyTable" },
+        { "type": "string", "const": "Unknown" }
+      ]
+    },
+    "traversal_outcome": {
+      "description": "Invocation outcome (externally-tagged enum shape).",
+      "anyOf": [
+        { "type": "object", "required": ["Complete"], "additionalProperties": false, "properties": { "Complete": { "type": "object", "required": ["true_t", "cached"], "additionalProperties": false, "properties": { "true_t": { "$ref": "#/$defs/u64" }, "cached": { "type": "boolean" } } } } },
+        { "type": "object", "required": ["Partial"], "additionalProperties": false, "properties": { "Partial": { "type": "object", "required": ["reasons"], "additionalProperties": false, "properties": { "reasons": { "type": "array", "items": { "$ref": "#/$defs/traversal_partial_reason" } } } } } },
+        { "type": "object", "required": ["Skipped"], "additionalProperties": false, "properties": { "Skipped": { "type": "object", "required": ["cause"], "additionalProperties": false, "properties": { "cause": { "type": "integer", "minimum": 0, "maximum": 255 } } } } },
+        { "type": "object", "required": ["Tainted"], "additionalProperties": false, "properties": { "Tainted": { "type": "object", "required": ["by_seq"], "additionalProperties": false, "properties": { "by_seq": { "$ref": "#/$defs/u64" } } } } },
+        { "type": "object", "required": ["Abandoned"], "additionalProperties": false, "properties": { "Abandoned": { "type": "object", "required": ["reason"], "additionalProperties": false, "properties": { "reason": { "$ref": "#/$defs/traversal_abandon_reason" } } } } }
+      ]
+    },
+    "traversal_abandon_reason": {
+      "description": "Why an invocation was abandoned (unit enum — plain string).",
+      "type": "string",
+      "enum": ["SkipVictim", "Churned", "Evicted", "RetireFailed", "StaleRepaired", "Stalled", "Detached", "PreWindow", "Hung"]
+    },
+    "traversal_partial_reason": {
+      "description": "Why an invocation is partial (externally-tagged enum shape: newtype/struct variants are single-key objects, unit variants are plain strings).",
+      "anyOf": [
+        { "type": "object", "required": ["Holes"], "additionalProperties": false, "properties": { "Holes": { "type": "array", "items": { "$ref": "#/$defs/u64" } } } },
+        { "type": "object", "required": ["Unreadable"], "additionalProperties": false, "properties": { "Unreadable": { "type": "array", "items": { "$ref": "#/$defs/u64" } } } },
+        { "type": "object", "required": ["Trunc"], "additionalProperties": false, "properties": { "Trunc": { "$ref": "#/$defs/u64" } } },
+        { "type": "object", "required": ["UnobservedSlots"], "additionalProperties": false, "properties": { "UnobservedSlots": { "type": "array", "items": { "$ref": "#/$defs/u64" } } } },
+        { "type": "object", "required": ["CacheShrink"], "additionalProperties": false, "properties": { "CacheShrink": { "type": "object", "required": ["cached", "observed"], "additionalProperties": false, "properties": { "cached": { "$ref": "#/$defs/u64" }, "observed": { "$ref": "#/$defs/u64" } } } } },
+        { "type": "object", "required": ["CacheStale"], "additionalProperties": false, "properties": { "CacheStale": { "type": "object", "required": ["cached"], "additionalProperties": false, "properties": { "cached": { "$ref": "#/$defs/u64" } } } } },
+        { "type": "object", "required": ["GenStale"], "additionalProperties": false, "properties": { "GenStale": { "type": "object", "required": ["expected", "observed"], "additionalProperties": false, "properties": { "expected": { "$ref": "#/$defs/u64" }, "observed": { "$ref": "#/$defs/u64" } } } } },
+        { "type": "string", "const": "GuardError" },
+        { "type": "string", "const": "Overfull" },
+        { "type": "string", "const": "DrainLoss" },
+        { "type": "string", "const": "GuardMissing" },
+        { "type": "string", "const": "GenMixed" },
+        { "type": "string", "const": "DanglingCall" },
+        { "type": "string", "const": "TerminatorUnproven" },
+        { "type": "string", "const": "RowArrayMismatch" },
+        { "type": "string", "const": "FaultViewUncertain" }
+      ]
+    },
+    "u64": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 18446744073709551615
+    },
+    "u32": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4294967295
+    },
+    "u16": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 65535
+    },
+    "engine_observation": {
+      "description": "One typed ENGINE tripwire observation: the pinned attach identity, binding generation, frozen-registry entrypoint index with its display name, window provenance, and the untimed observed call count.",
+      "type": "object",
+      "required": ["object", "device", "inode", "offset", "generation", "entrypoint", "entrypoint_name", "window", "calls"],
+      "additionalProperties": false,
+      "properties": {
+        "object": { "type": "string", "minLength": 1 },
+        "device": { "$ref": "#/$defs/u64" },
+        "inode": { "$ref": "#/$defs/u64" },
+        "offset": { "$ref": "#/$defs/u64" },
+        "generation": { "$ref": "#/$defs/u64" },
+        "entrypoint": { "$ref": "#/$defs/u16" },
+        "entrypoint_name": { "type": "string", "minLength": 1 },
+        "window": { "enum": ["in-window", "pre-window", "untimed"] },
+        "calls": { "$ref": "#/$defs/u64" }
+      }
+    },
+    "engine_evidence": {
+      "description": "One engine-plane policy evidence ref: the exact observation key plus generation, entrypoint and the definite calls attributed there.",
+      "type": "object",
+      "required": ["object", "device", "inode", "offset", "generation", "entrypoint", "calls"],
+      "additionalProperties": false,
+      "properties": {
+        "object": { "type": "string", "minLength": 1 },
+        "device": { "$ref": "#/$defs/u64" },
+        "inode": { "$ref": "#/$defs/u64" },
+        "offset": { "$ref": "#/$defs/u64" },
+        "generation": { "$ref": "#/$defs/u64" },
+        "entrypoint": { "$ref": "#/$defs/u16" },
+        "calls": { "$ref": "#/$defs/u64" }
+      }
+    },
+    "candidate": {
+      "description": "One candidate identity that could explain entry at a site. The class list is sorted; the first class is not a canonical authority.",
+      "type": "object",
+      "required": ["provider", "provider_class", "op", "funcid", "algorithm_classes", "weak_alias"],
+      "additionalProperties": false,
+      "properties": {
+        "provider": { "type": "string", "minLength": 1 },
+        "provider_class": { "type": "string", "minLength": 1 },
+        "op": { "$ref": "#/$defs/u32" },
+        "funcid": { "$ref": "#/$defs/u32" },
+        "algorithm_classes": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "weak_alias": { "type": "boolean" }
+      }
+    },
+    "site": {
+      "description": "Physical execution record for one site in one generation: the site key, candidate metadata, and the conserved call count with first/last in-window timestamps. installed_at (v2.1, optional) is the cookie's probe-attachment wall in monotonic ns; absent when never recorded. Installed is not counted: compare against first_ns.",
+      "type": "object",
+      "required": ["object", "device", "inode", "offset", "generation", "candidates", "candidates_coverage", "calls", "first_ns", "last_ns"],
+      "additionalProperties": false,
+      "properties": {
+        "object": { "type": "string", "minLength": 1 },
+        "device": { "$ref": "#/$defs/u64" },
+        "inode": { "$ref": "#/$defs/u64" },
+        "offset": { "$ref": "#/$defs/u64" },
+        "generation": { "$ref": "#/$defs/u32" },
+        "candidates": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/candidate" }
+        },
+        "candidates_coverage": { "enum": ["complete", "ambiguous_complete", "unknown"] },
+        "calls": { "$ref": "#/$defs/u64" },
+        "first_ns": { "$ref": "#/$defs/u64" },
+        "last_ns": { "$ref": "#/$defs/u64" },
+        "installed_at": { "$ref": "#/$defs/u64" }
+      }
+    },
+    "reason": {
+      "description": "Typed reason a window is not COMPLETE.",
+      "anyOf": [
+        {
+          "type": "object",
+          "required": ["kind", "scope"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "unknown-denominator" },
+            "scope": { "type": "string", "minLength": 1 }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["kind", "scope", "missing"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "undiscovered-sites" },
+            "scope": { "type": "string", "minLength": 1 },
+            "missing": { "$ref": "#/$defs/u64" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["kind", "scope", "missing"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "unattached-sites" },
+            "scope": { "type": "string", "minLength": 1 },
+            "missing": { "$ref": "#/$defs/u64" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["kind", "counter", "source", "value"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "loss" },
+            "counter": { "type": "string", "minLength": 1 },
+            "source": { "enum": ["kernel-ring", "kernel-map", "discovery", "attach", "drain", "lifecycle", "setup"] },
+            "value": { "$ref": "#/$defs/u64" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["kind", "sites", "calls"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "unattributed-calls" },
+            "sites": { "$ref": "#/$defs/u64" },
+            "calls": { "$ref": "#/$defs/u64" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["kind", "missing_ns"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "startup-gap" },
+            "missing_ns": { "$ref": "#/$defs/u64" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["kind", "missing_ns"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "tail-gap" },
+            "missing_ns": { "$ref": "#/$defs/u64" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["kind"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "signal-cut" }
+          }
+        }
+      ]
+    }
+  }
+}

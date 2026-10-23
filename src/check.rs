@@ -566,7 +566,7 @@ pub fn run(argv: &[String]) -> ExitCode {
     );
     ExitCode::from(
         crate::report::consume_capture_result(
-            capture::run(&args.cfg, args.target),
+            capture_check(&args.cfg, args.target),
             crate::report::CaptureCommand::Check {
                 rules: &policy_rules(&args.rules),
             },
@@ -1308,4 +1308,38 @@ mod tests {
     // Delivery semantics (all-attempted, same-sink refusal,
     // diagnostics bounds) are T11's: pinned by output_contract, not
     // re-pinned here.
+}
+
+// The real entrypoint and the four-command source fixture use this same
+// fixed-kind admission port; effects begin only after successful resolution.
+pub(crate) fn with_check_objects<R>(
+    overrides: &crate::package::commands::ObjectOverrides,
+    resolve: impl FnOnce(
+        crate::package::commands::CommandKind,
+        &crate::package::commands::ObjectOverrides,
+    )
+        -> Result<crate::package::commands::AdmittedSet, crate::package::PackageError>,
+    effect: impl FnOnce(crate::package::commands::AdmittedSet) -> R,
+) -> Result<R, crate::package::PackageError> {
+    capture::with_capture_objects(
+        crate::package::commands::CommandKind::Check,
+        overrides,
+        resolve,
+        effect,
+    )
+}
+fn capture_check(
+    cfg: &capture::Config,
+    target: capture::Target,
+) -> anyhow::Result<capture::Capture> {
+    let overrides = crate::package::commands::ObjectOverrides {
+        harvest: cfg.harvest_object.clone(),
+        count: cfg.count_object.clone(),
+        members: cfg.members_object.clone(),
+    };
+    with_check_objects(
+        &overrides,
+        crate::package::commands::resolve_command_objects,
+        |objects| capture::run_admitted(cfg, target, objects, cfg.members_object.is_none()),
+    )?
 }

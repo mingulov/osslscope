@@ -94,8 +94,8 @@ pub struct Config {
     /// Explicit members object (`--members-object`): the operator
     /// asked for traversal — the triple must resolve (fail-closed,
     /// no harvest-only fallback). `None` attempts the automatic
-    /// triple (receipt-verified); pair-only installs stay
-    /// harvest-only; broken triples refuse.
+    /// matched installed triple; explicit harvest/count pairs stay
+    /// harvest-only; broken installed triples refuse.
     pub members_object: Option<PathBuf>,
     pub provider: Option<PathBuf>,
     pub builtin: bool,
@@ -8520,16 +8520,136 @@ fn resolve_capture_provider(
 /// Run a full capture window against `target` with automatic
 /// object-set selection (see [`run_with_dirs`]).
 pub fn run(cfg: &Config, target: Target) -> anyhow::Result<Capture> {
+    run_for_command(crate::package::commands::CommandKind::Report, cfg, target)
+}
+
+/// Ordinary report/check route: admit the entire selection before target,
+/// signals, forks or BPF setup. Legacy directory APIs remain explicit below.
+pub fn run_for_command(
+    kind: crate::package::commands::CommandKind,
+    cfg: &Config,
+    target: Target,
+) -> anyhow::Result<Capture> {
     if cfg.duration.is_zero() {
         anyhow::bail!("--duration must be > 0 (no --forever in v1)");
     }
-    // Full coexistence with automatic selection (Decision 8R) over
-    // the production search set (see `run_with_dirs`).
-    run_with_dirs(
-        cfg,
-        target,
-        &onboard::default_object_dirs(),
-        &onboard::TrustPolicy::production(),
+    if !matches!(
+        kind,
+        crate::package::commands::CommandKind::Report
+            | crate::package::commands::CommandKind::Check
+    ) {
+        anyhow::bail!("capture command must be report or check");
+    }
+    let overrides = crate::package::commands::ObjectOverrides {
+        harvest: cfg.harvest_object.clone(),
+        count: cfg.count_object.clone(),
+        members: cfg.members_object.clone(),
+    };
+    with_capture_objects(
+        kind,
+        &overrides,
+        crate::package::commands::resolve_command_objects,
+        |admitted| run_admitted(cfg, target, admitted, cfg.members_object.is_none()),
+    )?
+}
+pub(crate) fn with_capture_objects<R>(
+    kind: crate::package::commands::CommandKind,
+    overrides: &crate::package::commands::ObjectOverrides,
+    resolve: impl FnOnce(
+        crate::package::commands::CommandKind,
+        &crate::package::commands::ObjectOverrides,
+    )
+        -> Result<crate::package::commands::AdmittedSet, crate::package::PackageError>,
+    effect: impl FnOnce(crate::package::commands::AdmittedSet) -> R,
+) -> Result<R, crate::package::PackageError> {
+    crate::package::commands::with_admitted(kind, overrides, resolve, effect)
+}
+struct AdmittedBuffers {
+    harvest: Arc<[u8]>,
+    count: Arc<[u8]>,
+    count_sha256: [u8; 32],
+}
+pub(crate) fn run_admitted(
+    cfg: &Config,
+    target: Target,
+    admitted: crate::package::commands::AdmittedSet,
+    auto: bool,
+) -> anyhow::Result<Capture> {
+    with_capture_selection(
+        admitted,
+        auto,
+        |objects, traversal, selected, buffers, package| {
+            run_inner_with_admitted(
+                cfg,
+                target,
+                objects,
+                traversal,
+                Some(selected),
+                Some(buffers),
+                Some(package),
+            )
+        },
+    )
+}
+fn with_capture_selection<R>(
+    admitted: crate::package::commands::AdmittedSet,
+    auto: bool,
+    effect: impl FnOnce(
+        onboard::ObjectPaths,
+        Option<TraversalAttach>,
+        evidence::RunSetProvenance,
+        AdmittedBuffers,
+        crate::package::commands::PackageProvenance,
+    ) -> R,
+) -> R {
+    use crate::package::records::Role;
+    let harvest = admitted
+        .role(Role::Harvest)
+        .expect("admitted capture harvest");
+    let count = admitted.role(Role::Count).expect("admitted capture count");
+    let one = |s: &crate::package::resolve::RoleSnapshot| evidence::TraversalObject {
+        path: s.locator.display().to_string(),
+        sha256: s.sha256.to_string(),
+    };
+    let selected = evidence::RunSetProvenance {
+        harvest: one(harvest),
+        count: one(count),
+        members: admitted.role(Role::Members).map(one),
+    };
+    let traversal = admitted.role(Role::Members).map(|members| TraversalAttach {
+        members: members.locator.clone(),
+        members_bytes: Arc::clone(&members.bytes),
+        harvest_bytes: Arc::clone(&harvest.bytes),
+        count_bytes: Arc::clone(&count.bytes),
+        provenance: TripleProvenance {
+            harvest: ObjectProvenance {
+                path: harvest.locator.clone(),
+                sha256: harvest.sha256.to_string(),
+            },
+            count: ObjectProvenance {
+                path: count.locator.clone(),
+                sha256: count.sha256.to_string(),
+            },
+            members: ObjectProvenance {
+                path: members.locator.clone(),
+                sha256: members.sha256.to_string(),
+            },
+        },
+        auto,
+    });
+    effect(
+        onboard::ObjectPaths {
+            harvest: harvest.locator.clone(),
+            count: count.locator.clone(),
+        },
+        traversal,
+        selected,
+        AdmittedBuffers {
+            harvest: Arc::clone(&harvest.bytes),
+            count: Arc::clone(&count.bytes),
+            count_sha256: count.sha256.0,
+        },
+        admitted.provenance(),
     )
 }
 
@@ -8539,8 +8659,8 @@ pub fn run(cfg: &Config, target: Target) -> anyhow::Result<Capture> {
 /// traverse, pair-only prefixes stay harvest-only (unchanged),
 /// and mixed/stale/broken sets refuse exactly like doctor (never
 /// a silent harvest-only fallback where doctor rejects). `run` is
-/// this with the production default dirs + trust; lanes and
-/// custom prefixes pass their own.
+/// ordinary command path instead uses admitted package snapshots; lanes and
+/// custom developer prefixes explicitly select this legacy seam.
 pub fn run_with_dirs(
     cfg: &Config,
     target: Target,
@@ -8688,9 +8808,9 @@ pub fn run_traversal(
 /// hash and any load.
 struct TraversalAttach {
     members: PathBuf,
-    members_bytes: Vec<u8>,
-    harvest_bytes: Vec<u8>,
-    count_bytes: Vec<u8>,
+    members_bytes: Arc<[u8]>,
+    harvest_bytes: Arc<[u8]>,
+    count_bytes: Arc<[u8]>,
     provenance: TripleProvenance,
     auto: bool,
 }
@@ -8700,9 +8820,9 @@ struct TraversalAttach {
 /// backend loads, and the harvest/count loaders consume).
 #[derive(Debug)]
 struct TripleBytes {
-    harvest: Vec<u8>,
-    count: Vec<u8>,
-    members: Vec<u8>,
+    harvest: Arc<[u8]>,
+    count: Arc<[u8]>,
+    members: Arc<[u8]>,
 }
 
 /// Mint matched-set provenance for a resolved triple and retain
@@ -8747,9 +8867,9 @@ fn triple_snapshot(set: &onboard::ObjectSet) -> anyhow::Result<(TripleProvenance
             members,
         },
         TripleBytes {
-            harvest: harvest_bytes,
-            count: count_bytes,
-            members: members_bytes,
+            harvest: Arc::from(harvest_bytes),
+            count: Arc::from(count_bytes),
+            members: Arc::from(members_bytes),
         },
     ))
 }
@@ -8858,20 +8978,26 @@ fn wrap_discovery(
     // The backend loads the verified snapshot (never re-opens the
     // path) on the capture clock (WALK-DONE instants are
     // capture-ns, joining the evidence document honestly).
-    let backend = ScanBackend::attach_bytes(
-        &t.members_bytes,
-        &t.members,
-        &exe,
-        off,
-        pid,
-        &ctrl,
-        None,
-        LiveClock.monotonic_ns(),
-    )
+    let backend = with_members_snapshot(t, |bytes| {
+        ScanBackend::attach_bytes(
+            bytes,
+            &t.members,
+            &exe,
+            off,
+            pid,
+            &ctrl,
+            None,
+            LiveClock.monotonic_ns(),
+        )
+    })
     .map_err(|e| anyhow::anyhow!("members backend attach: {e:#}"))?;
     Ok(CaptureDiscovery::Traversal(Box::new(
         LiveTraversalDiscovery::new(session, backend, pid, t.provenance.clone()),
     )))
+}
+
+fn with_members_snapshot<R>(t: &TraversalAttach, load: impl FnOnce(&[u8]) -> R) -> R {
+    load(&t.members_bytes)
 }
 
 /// Count's process-local FD allowance after observed other-plane demand and
@@ -8962,29 +9088,60 @@ fn prepare_after_initial_forks<T, B>(
 }
 
 fn prepare_count_backend(
-    object_bytes: &[u8],
+    object_bytes: Arc<[u8]>,
+    object_sha256: [u8; 32],
     target_tgid: u32,
-    fork_barrier: std::sync::Arc<crate::count_owner::CountForkBarrier>,
+    fork_barrier: Arc<crate::count_owner::CountForkBarrier>,
     setup_deadline: Instant,
 ) -> Result<crate::count_session::LiveBackend, crate::count_owner::CountPrepareFailure> {
-    use crate::count_owner::{
-        CountInput, CountOperation, CountOwnerLimits, FailureClass, OwnerFailure,
-    };
-    use sha2::Digest as _;
-    // All selected persistent planes have completed acquisition, so no such
-    // acquisition remains pending at this boundary. Later ordinary opens are
-    // not reserved by this snapshot and still take their runtime error paths.
-    let allowance = CountFdAdmission::snapshot(0)?.allowance()?;
-    let possible_cpus = aya::util::nr_cpus()
-        .map_err(|_| OwnerFailure::engine(CountOperation::Load, FailureClass::InvalidInput))?;
-    let limits = CountOwnerLimits::from_allowance(allowance, possible_cpus)?;
-    let input = CountInput {
-        object_bytes: std::sync::Arc::from(object_bytes),
-        object_sha256: sha2::Sha256::digest(object_bytes).into(),
+    prepare_count_backend_with(
+        object_bytes,
+        object_sha256,
+        target_tgid,
+        fork_barrier,
+        setup_deadline,
+        || CountFdAdmission::snapshot(0),
+        || {
+            aya::util::nr_cpus().map_err(|_| {
+                crate::count_owner::OwnerFailure::engine(
+                    crate::count_owner::CountOperation::Load,
+                    crate::count_owner::FailureClass::InvalidInput,
+                )
+            })
+        },
+        crate::count_session::LiveBackend::prepare,
+    )
+}
+// The real CountInput is formed here at the existing owner boundary. Tests
+// substitute only owner preparation/host sampling, never a parallel input.
+// Five admitted input values plus isolated host-sampling and owner effect ports.
+#[allow(clippy::too_many_arguments)]
+fn prepare_count_backend_with<R>(
+    object_bytes: Arc<[u8]>,
+    object_sha256: [u8; 32],
+    target_tgid: u32,
+    fork_barrier: Arc<crate::count_owner::CountForkBarrier>,
+    setup_deadline: Instant,
+    admission: impl FnOnce() -> Result<CountFdAdmission, crate::count_owner::OwnerFailure>,
+    cpus: impl FnOnce() -> Result<usize, crate::count_owner::OwnerFailure>,
+    prepare: impl FnOnce(
+        crate::count_owner::CountInput,
+        crate::count_owner::CountOwnerLimits,
+        Instant,
+    ) -> Result<R, crate::count_owner::CountPrepareFailure>,
+) -> Result<R, crate::count_owner::CountPrepareFailure> {
+    // Persistent non-Count planes have completed acquisition. No new reserve,
+    // Count descriptor alias, or RLIMIT change is introduced by packaging.
+    let allowance = admission()?.allowance()?;
+    let possible_cpus = cpus()?;
+    let limits = crate::count_owner::CountOwnerLimits::from_allowance(allowance, possible_cpus)?;
+    let input = crate::count_owner::CountInput {
+        object_bytes,
+        object_sha256,
         target_tgid,
         fork_barrier,
     };
-    crate::count_session::LiveBackend::prepare(input, limits, setup_deadline)
+    prepare(input, limits, setup_deadline)
 }
 
 /// Shared window setup over resolved objects. The selected discovery and
@@ -8996,15 +9153,44 @@ fn run_inner(
     traversal: Option<TraversalAttach>,
     selected_objects: Option<evidence::RunSetProvenance>,
 ) -> anyhow::Result<Capture> {
+    run_inner_with_admitted(
+        cfg,
+        target,
+        objects,
+        traversal,
+        selected_objects,
+        None,
+        None,
+    )
+}
+fn run_inner_with_admitted(
+    cfg: &Config,
+    target: Target,
+    objects: onboard::ObjectPaths,
+    traversal: Option<TraversalAttach>,
+    selected_objects: Option<evidence::RunSetProvenance>,
+    buffers: Option<AdmittedBuffers>,
+    package_build: Option<crate::package::commands::PackageProvenance>,
+) -> anyhow::Result<Capture> {
     arm_signals();
-    // Triple runs load the retained count snapshot (no re-read —
-    // identity and loading share these bytes); harvest-only runs
-    // bounded-read the resolved path (a swap between resolve and
-    // load fails loud, never huge).
-    let obj_bytes = match traversal.as_ref() {
-        Some(t) => t.count_bytes.clone(),
-        None => onboard::read_bounded(&objects.count, onboard::MAX_OBJECT_SCAN_BYTES)
-            .map_err(|e| anyhow::anyhow!("count object {}: {e}", objects.count.display()))?,
+    let (obj_bytes, obj_sha256, harvest_bytes) = match buffers {
+        Some(b) => (b.count, b.count_sha256, Some(b.harvest)),
+        None => {
+            let count = match traversal.as_ref() {
+                Some(t) => Arc::clone(&t.count_bytes),
+                None => Arc::from(
+                    onboard::read_bounded(&objects.count, onboard::MAX_OBJECT_SCAN_BYTES).map_err(
+                        |e| anyhow::anyhow!("count object {}: {e}", objects.count.display()),
+                    )?,
+                ),
+            };
+            let hash = crate::package::records::sha256(&count).0;
+            (
+                count,
+                hash,
+                traversal.as_ref().map(|t| Arc::clone(&t.harvest_bytes)),
+            )
+        }
     };
     let fork_barrier = std::sync::Arc::new(crate::count_owner::CountForkBarrier::new());
     // Target-identity snapshot at acquisition (the target may be
@@ -9115,7 +9301,7 @@ fn run_inner(
                             &crate::discovery::session::DiscoveryConfig {
                                 provider: resolved.path,
                                 object: objects.harvest,
-                                object_bytes: traversal.as_ref().map(|t| t.harvest_bytes.clone()),
+                                object_bytes: harvest_bytes.clone(),
                                 builtin: resolved.builtin,
                                 legacy: true,
                                 table: cfg.table.clone(),
@@ -9156,7 +9342,8 @@ fn run_inner(
                         Ok((owned, info, effective, discovery, lifecycle))
                     },
                     |state, barrier, deadline| match prepare_count_backend(
-                        &obj_bytes,
+                        Arc::clone(&obj_bytes),
+                        obj_sha256,
                         state.1.pid,
                         barrier,
                         deadline,
@@ -9221,7 +9408,7 @@ fn run_inner(
                 &crate::discovery::session::DiscoveryConfig {
                     provider: resolved.path,
                     object: objects.harvest,
-                    object_bytes: traversal.as_ref().map(|t| t.harvest_bytes.clone()),
+                    object_bytes: harvest_bytes.clone(),
                     builtin: resolved.builtin,
                     legacy: true,
                     table: cfg.table.clone(),
@@ -9236,7 +9423,15 @@ fn run_inner(
                     // Mid-attach recycle: fatal verdict, no sessions
                     // held (the count object drops unused).
                     if e.downcast_ref::<Recycled>().is_some() {
-                        return Ok(recycled_capture(&effective, &info, selected_objects));
+                        return decorate_capture_result_with_package(
+                            Ok(recycled_capture(
+                                &effective,
+                                &info,
+                                selected_objects.clone(),
+                            )),
+                            selected_objects,
+                            package_build,
+                        );
                     }
                     return Err(preparation_error(
                         e.context("discovery attach"),
@@ -9279,9 +9474,10 @@ fn run_inner(
                 setup_deadline,
                 |prefix| Ok(LiveLifecycle::select(p, true, prefix)),
                 |_, barrier, deadline| {
-                    prepare_count_backend(&obj_bytes, p, barrier, deadline).map_err(|e| {
-                        preparation_error(e.into(), &mut pinned, &info, BoundaryStage::Setup)
-                    })
+                    prepare_count_backend(Arc::clone(&obj_bytes), obj_sha256, p, barrier, deadline)
+                        .map_err(|e| {
+                            preparation_error(e.into(), &mut pinned, &info, BoundaryStage::Setup)
+                        })
                 },
             )?;
             let count = CountSession::new(p, backend);
@@ -9300,14 +9496,22 @@ fn run_inner(
             )
         }
     };
-    decorate_capture_result(cap, selected_objects)
+    decorate_capture_result_with_package(cap, selected_objects, package_build)
 }
 
 // One production boundary for the resolved run-set metadata. Runner fixtures
 // resolve no objects; run_inner supplies the actual selection here.
+#[cfg(test)]
 fn decorate_capture_result(
     cap: anyhow::Result<Capture>,
     selected_objects: Option<evidence::RunSetProvenance>,
+) -> anyhow::Result<Capture> {
+    decorate_capture_result_with_package(cap, selected_objects, None)
+}
+fn decorate_capture_result_with_package(
+    cap: anyhow::Result<Capture>,
+    selected_objects: Option<evidence::RunSetProvenance>,
+    package_build: Option<crate::package::commands::PackageProvenance>,
 ) -> anyhow::Result<Capture> {
     let mut cap = cap;
     let capture = match &mut cap {
@@ -9329,6 +9533,7 @@ fn decorate_capture_result(
     };
     capture.selected_objects = selected_objects.clone();
     capture.document.selected_objects = selected_objects;
+    capture.document.package_build = package_build;
     cap
 }
 
@@ -9382,6 +9587,9 @@ mod tests {
         ));
         let objdir = prefix.join("lib").join("osslscope");
         std::fs::create_dir_all(&objdir).unwrap();
+        // Valid fixture leaves must not inherit group-write default ACLs.
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&objdir, std::fs::Permissions::from_mode(0o755)).unwrap();
         let dsts = [
             (objdir.join("osslscope-harvest"), &h),
             (objdir.join("osslscope-count"), &c),
@@ -9750,6 +9958,28 @@ mod tests {
                         resources.push(fd);
                         operations.borrow_mut().push(kind);
                     }
+                    let snapshot = crate::package::commands::test_support::snapshot(
+                        crate::package::records::Role::Count,
+                    );
+                    prepare_count_backend_with(
+                        snapshot.bytes,
+                        snapshot.sha256.0,
+                        42,
+                        barrier,
+                        actual_deadline,
+                        || {
+                            operations.borrow_mut().push("fd_snapshot");
+                            CountFdAdmission::snapshot(0)
+                        },
+                        || Ok(1),
+                        |input, limits, deadline| {
+                            assert!(Arc::ptr_eq(&input.fork_barrier, &observed_barrier));
+                            assert_eq!(deadline, actual_deadline);
+                            assert!(limits.reserved_fds() <= 16_400);
+                            operations.borrow_mut().push("count_handoff");
+                            Ok(())
+                        },
+                    )?;
                     Ok(resources)
                 },
             )
@@ -9768,6 +9998,15 @@ mod tests {
                 .position(|op| op.ends_with("open"))
                 .unwrap();
             assert!(last_fork < first_acquire, "{operations:?}");
+            let fd = operations
+                .iter()
+                .position(|op| *op == "fd_snapshot")
+                .unwrap();
+            let count = operations
+                .iter()
+                .position(|op| *op == "count_handoff")
+                .unwrap();
+            assert!(first_acquire < fd && fd < count, "{operations:?}");
         }
     }
 
@@ -14534,18 +14773,26 @@ mod tests {
             let selected = evidence::RunSetProvenance {
                 harvest: evidence::TraversalObject {
                     path: "/resolved/harvest.o".into(),
-                    sha256: "a".repeat(64),
+                    sha256: "ccbc7d8e3a9cdb133d089ee7d7f7b9bfeb7c432520b9ae158c6044e8c09d920d"
+                        .into(),
                 },
                 count: evidence::TraversalObject {
                     path: "/resolved/count.o".into(),
-                    sha256: "b".repeat(64),
+                    sha256: "727d5430ed3ae804ffaf8d1fe1679d95d50d266f219ebed4177fc6812dc7bfc6"
+                        .into(),
                 },
                 members: triple.then(|| evidence::TraversalObject {
                     path: "/resolved/members.o".into(),
-                    sha256: "c".repeat(64),
+                    sha256: "494a8b5f3cf0be0b6294c5f807f8f0f11af3df1cc3d2c59559fb56c2fd9e3fa4"
+                        .into(),
                 }),
             };
-            let result = decorate_capture_result(result, Some(selected.clone()));
+            let package = crate::package::commands::test_support::selection(triple).provenance();
+            let result = decorate_capture_result_with_package(
+                result,
+                Some(selected.clone()),
+                Some(package.clone()),
+            );
             let error = result.as_ref().unwrap_err();
             assert!(format!("{error:#}").contains("outer post-observation context"));
             assert_eq!(
@@ -14606,6 +14853,7 @@ mod tests {
                 true,
                 &mut Vec::new(),
             );
+            assert_eq!(consumed.document.package_build, Some(package.clone()));
             assert_eq!(consumed.document.selected_objects, Some(selected.clone()));
             assert_eq!(consumed.document.total_calls(), 3);
             assert_eq!(consumed.exit_code, if check { 10 } else { 1 });
@@ -14633,6 +14881,14 @@ mod tests {
                 rendered["selected_objects"].get("members").is_some(),
                 triple
             );
+            assert_eq!(
+                rendered["package_build"]["installed_base"]["input_id"],
+                "164714d5150c22be89e5523af0e578782f57c5cd93f7adb991f790042f360c9d"
+            );
+            assert_eq!(
+                rendered["package_build"]["installed_base"]["source"]["revision"],
+                "9d2dfbc906f0e861eab37249ce59daf31271a31c"
+            );
             crate::schema::validate_v2(&rendered).unwrap();
             crate::schema::check_v2_semantics(&rendered).unwrap();
             std::fs::remove_dir_all(dir).unwrap();
@@ -14640,6 +14896,93 @@ mod tests {
                 "FWR-I3 triple={triple} check={check}: selected objects retained, calls=3, canonical terminal/ticket/backings shared"
             );
         }
+        #[test]
+        fn package_runtime_failure_retains_admitted_provenance() {
+            for triple in [false, true] {
+                for check in [false, true] {
+                    assert_fwr_i3_runtime_selection(triple, check);
+                }
+            }
+            let package = crate::package::commands::test_support::selection(false).provenance();
+            let cfg = stub_config();
+            let info = stub_info();
+            let selected = with_capture_selection(
+                crate::package::commands::test_support::selection(false),
+                true,
+                |_, _, selected, _, _| selected,
+            );
+            // A clean finalized positive capture is decorated without copying
+            // its site storage, alongside the distinct recycled early return.
+            let mut positive_info = stub_info();
+            positive_info.acquired_ns = 1000;
+            let clock = ClockStub::at(1500);
+            let mut proc = ProcStub;
+            let cancelled = || false;
+            let mut count = CountSession::new(TPID, FakeCountBackend::new());
+            let seed = seed_site(&mut count);
+            let mut runner = stub_runner(
+                &cfg,
+                &positive_info,
+                DiscoveryStub {
+                    finish_err: false,
+                    poll_err: false,
+                    dispatch_attached: true,
+                    trip_set: None,
+                },
+                count,
+                &clock,
+                &mut proc,
+                &cancelled,
+            );
+            let (device, inode) = seed.identity();
+            push_seed_objects(&mut runner, device, inode);
+            let positive = runner.close_and_finalize().expect("clean positive capture");
+            assert_eq!(positive.document.total_calls(), 7);
+            for (capture, recycled) in [
+                (positive, false),
+                (recycled_capture(&cfg, &info, Some(selected.clone())), true),
+            ] {
+                let sites = capture.document.sites.as_ptr();
+                let calls = capture.document.total_calls();
+                let capture = decorate_capture_result_with_package(
+                    Ok(capture),
+                    Some(selected.clone()),
+                    Some(package.clone()),
+                )
+                .unwrap();
+                assert_eq!(capture.document.package_build, Some(package.clone()));
+                assert_eq!(capture.document.sites.as_ptr(), sites);
+                assert_eq!(capture.document.total_calls(), calls);
+                assert_eq!(
+                    matches!(
+                        capture.document.status,
+                        evidence::Completeness::Fatal {
+                            kind: evidence::FatalKind::Recycled,
+                            ..
+                        }
+                    ),
+                    recycled
+                );
+                let wire: serde_json::Value =
+                    serde_json::from_slice(&crate::report::render_json(&capture.document).unwrap())
+                        .unwrap();
+                assert_eq!(
+                    wire["package_build"]["installed_base"]["input_id"],
+                    "164714d5150c22be89e5523af0e578782f57c5cd93f7adb991f790042f360c9d"
+                );
+                crate::schema::validate_v2(&wire).unwrap();
+                crate::schema::check_v2_semantics(&wire).unwrap();
+            }
+            let error = decorate_capture_result_with_package(
+                Err(anyhow::anyhow!("unresolved original setup")),
+                None,
+                Some(package),
+            )
+            .unwrap_err();
+            assert_eq!(error.to_string(), "unresolved original setup");
+            assert!(error.downcast_ref::<CaptureRuntimeFailure>().is_none());
+        }
+
         #[test]
         fn fwr_i3_runtime_pair_report_selection() {
             assert_fwr_i3_runtime_selection(false, false);
@@ -16184,5 +16527,108 @@ mod g1_count_window_tests {
         let repeated = session.salvage_view(terminal.receipt.terminal_id);
         assert_eq!(repeated.receipt.seal, terminal.receipt.seal);
         assert!(std::ptr::eq(&*repeated.receipt, &*terminal.receipt));
+    }
+}
+
+#[cfg(test)]
+mod package_tests {
+    use super::*;
+    use crate::package::{
+        commands::{CommandKind, ObjectOverrides, test_support},
+        records::{Role, sha256},
+    };
+    use std::cell::Cell;
+    #[test]
+    fn package_count_snapshot_reaches_current_owner() {
+        for kind in [CommandKind::Report, CommandKind::Check] {
+            for triple in [false, true] {
+                let dir = std::env::temp_dir().join(format!(
+                    "package-consumers-{}-{kind:?}-{triple}",
+                    std::process::id()
+                ));
+                std::fs::create_dir_all(&dir).unwrap();
+                let set = test_support::selection_in(triple, &dir);
+                let originals = [Role::Harvest, Role::Count, Role::Members].map(|r| {
+                    set.role(r)
+                        .map(|s| Arc::clone(&s.bytes))
+                        .unwrap_or_else(|| Arc::from(b"members-fixture".as_slice()))
+                });
+                let role_paths =
+                    [Role::Harvest, Role::Count, Role::Members].map(|r| dir.join(r.file_name()));
+                for (path, bytes) in role_paths.iter().zip(&originals) {
+                    std::fs::write(path, bytes).unwrap();
+                }
+                // Independent observer metadata locators are also replaced after admission.
+                for name in [
+                    "build-inputs.json",
+                    "bundle-contract.json",
+                    "payload-manifest.json",
+                ] {
+                    std::fs::write(dir.join(name), b"replaced after admission").unwrap();
+                }
+                let effects = Cell::new(0);
+                with_capture_objects(kind,&ObjectOverrides::default(),|actual,_|{assert_eq!(actual,kind);Ok(set)},|set| {
+                with_capture_selection(set,true,|_,traversal,selected,buffers,package| {
+                    for path in &role_paths {std::fs::write(path,b"replacement").unwrap();}
+                    crate::discovery::session::with_harvest_snapshot(&buffers.harvest,|b|{assert_eq!(b.as_ptr(),originals[0].as_ptr());assert_eq!(b,b"harvest-fixture");effects.set(effects.get()+1);});
+                    if let Some(traversal)=traversal {with_members_snapshot(&traversal,|b|{assert_eq!(b.as_ptr(),originals[2].as_ptr());assert_eq!(b,b"members-fixture");effects.set(effects.get()+1);});}
+                    assert!(anchor_or_degrade(None,false).is_err());assert!(anchor_or_degrade(None,true).unwrap().is_none());
+                    let barrier=Arc::new(crate::count_owner::CountForkBarrier::new());let expected_barrier=Arc::clone(&barrier);let deadline=Instant::now()+Duration::from_secs(1);
+                    prepare_count_backend_with(buffers.count,buffers.count_sha256,42,barrier,deadline,||CountFdAdmission::snapshot(0),||Ok(1),|input,limits,actual_deadline| {
+                        assert!(Arc::ptr_eq(&input.object_bytes,&originals[1]));assert_eq!(&*input.object_bytes,b"count-fixture");assert_eq!(sha256(&input.object_bytes).0,input.object_sha256);
+                        assert_eq!(crate::package::records::Digest(input.object_sha256).to_string(),"727d5430ed3ae804ffaf8d1fe1679d95d50d266f219ebed4177fc6812dc7bfc6");
+                        assert_eq!(input.target_tgid,42);assert!(Arc::ptr_eq(&input.fork_barrier,&expected_barrier));assert_eq!(actual_deadline,deadline);assert!(limits.reserved_fds()<=16_400);effects.set(effects.get()+1);Ok(())
+                    }).unwrap();
+                    assert_eq!(package.installed_base.unwrap().input_id.to_string(),"164714d5150c22be89e5523af0e578782f57c5cd93f7adb991f790042f360c9d");
+                    assert_eq!(selected.count.sha256,"727d5430ed3ae804ffaf8d1fe1679d95d50d266f219ebed4177fc6812dc7bfc6");
+                });
+            }).unwrap();
+                assert_eq!(effects.get(), if triple { 3 } else { 2 });
+                std::fs::remove_dir_all(dir).unwrap();
+            }
+        }
+    }
+    #[test]
+    fn package_count_owner_order_and_fd_allowance_preserved() {
+        let baseline = CountFdAdmission::snapshot(0).unwrap();
+        let other_planes = (0..3)
+            .map(|_| std::fs::File::open("/dev/null").unwrap())
+            .collect::<Vec<_>>();
+        let after = CountFdAdmission::snapshot(0).unwrap();
+        assert_eq!(after.non_count_open, baseline.non_count_open + 3);
+        assert_eq!(after.non_count_reserved, 0);
+        for (soft, open, expected) in [
+            (100, 83, None),
+            (100, 82, Some(18)),
+            (100_000, 3, Some(16_400)),
+        ] {
+            let effects = Cell::new(0);
+            let set = test_support::snapshot(Role::Count);
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let r = prepare_count_backend_with(
+                set.bytes,
+                set.sha256.0,
+                42,
+                Arc::new(crate::count_owner::CountForkBarrier::new()),
+                deadline,
+                || {
+                    Ok(CountFdAdmission {
+                        soft_limit: soft,
+                        non_count_open: open,
+                        non_count_reserved: 0,
+                    })
+                },
+                || Ok(1),
+                |_, limits, d| {
+                    assert_eq!(d, deadline);
+                    assert_eq!(limits.reserved_fds(), expected.unwrap());
+                    effects.set(effects.get() + 1);
+                    Ok(())
+                },
+            );
+            assert_eq!(r.is_ok(), expected.is_some());
+            assert_eq!(effects.get(), usize::from(expected.is_some()));
+        }
+        drop(other_planes);
     }
 }

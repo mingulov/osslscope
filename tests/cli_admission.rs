@@ -142,9 +142,9 @@ fn inspect_usage_errors_are_exit2() {
         "/nonexistent-r07/harvest.bpf.o",
     ]);
     assert_eq!(run_inspect(&no_pid), ExitCode::from(2));
-    // Missing --object entirely.
+    // Optional --object parses; descriptor-free package admission then refuses.
     let no_object = argv(&["--pid", "1", "--provider", "/nonexistent-r07/provider.so"]);
-    assert_eq!(run_inspect(&no_object), ExitCode::from(2));
+    assert_eq!(run_inspect(&no_object), ExitCode::from(4));
 }
 
 // ------------------------------- admission-before-effects ordering
@@ -348,14 +348,10 @@ fn ordering_inspect_invalid_input_precedes_effects() {
 
 #[test]
 fn ordering_inspect_harvest_spy_fires_on_valid_stays_zero_on_invalid() {
-    // Fix-round-2 (re-review F1): production harvest-call spy.
-    // inspect emits nothing on setup failure, so the --out file spy
-    // cannot distinguish "setup ran" from "setup never reached" —
-    // both leave the file absent. This spy counts PRODUCTION
-    // harvest invocations (thread-local): it must fire exactly once
-    // for valid input (exit 4 on the bogus paths) and stay at zero
-    // for invalid input (exit 2), proving invalid input is rejected
-    // before any provider read / BPF preparation.
+    // These CLI paths deliberately lack package objects. Both valid usage
+    // (exit 4) and invalid usage (exit 2) must avoid production harvest.
+    // The admitted positive and cumulative-spy control run at the real private
+    // entry seam in inspect::package_inspect_admitted_effect_and_cumulative_spy.
     use osslscope::inspect::{harvest_calls, reset_harvest_calls};
     let invalid: &[&[&str]] = &[
         &["--timeout", "121"],
@@ -383,9 +379,7 @@ fn ordering_inspect_harvest_spy_fires_on_valid_stays_zero_on_invalid() {
     reset_harvest_calls();
     assert_eq!(run_inspect(&argv(&["--pid", "1"])), ExitCode::from(2));
     assert_eq!(harvest_calls(), 0, "missing args precede harvest setup");
-    // Positive controls: valid input reaches production harvest
-    // (exit 4 on the bogus BPF objects) and the spy fires exactly
-    // once per run.
+    // Valid usage still refuses absent package objects before harvest.
     for extra in [
         Vec::<&str>::new(),
         vec!["--timeout", "0.5", "--settle", "30"],
@@ -398,46 +392,29 @@ fn ordering_inspect_harvest_spy_fires_on_valid_stays_zero_on_invalid() {
         );
         assert_eq!(
             harvest_calls(),
-            1,
-            "inspect {extra:?}: setup ran exactly once"
+            0,
+            "inspect {extra:?}: missing package blocks harvest"
         );
     }
 }
 
 #[test]
 fn ordering_inspect_harvest_spy_is_cumulative_across_runs() {
-    // Cumulativity pin for the harvest spy (renamed in fix round 3:
-    // the round-2 name overclaimed — a forced setup attempt in one
-    // run followed by a usage rejection in the NEXT run proves the
-    // counter is cumulative, not that it would catch a genuine
-    // premature read inside the rejected invocation. That closure is
-    // ordering_inspect_no_read_syscall_before_admission below).
     use osslscope::inspect::{harvest_calls, reset_harvest_calls};
     reset_harvest_calls();
-    // Force a REAL production provider-read attempt first: valid
-    // admission reaches harvest::run, whose first effect is
-    // fs::read(&cfg.provider) (bogus here → setup exit 4).
-    assert_eq!(run_inspect(&base_inspect(&[])), ExitCode::from(4));
-    assert_eq!(harvest_calls(), 1, "the forced setup attempt fired the spy");
-    // ... followed by a normal usage rejection (which itself must
-    // fire nothing further).
+    for _ in 0..2 {
+        assert_eq!(run_inspect(&base_inspect(&[])), ExitCode::from(4));
+    }
+    assert_eq!(
+        harvest_calls(),
+        0,
+        "package refusal does not invoke harvest"
+    );
     assert_eq!(
         run_inspect(&base_inspect(&["--timeout", "121"])),
         ExitCode::from(2)
     );
-    assert_eq!(
-        harvest_calls(),
-        1,
-        "usage rejection adds no setup call, but the earlier attempt stays observed"
-    );
-    // The invalid-path control (zero spy) must FAIL now: the spy is
-    // cumulative, so the earlier setup attempt is still observed.
-    let control_holds = harvest_calls() == 0;
-    assert!(
-        !control_holds,
-        "zero-spy control must FAIL after a setup attempt (calls observed: {})",
-        harvest_calls()
-    );
+    assert_eq!(harvest_calls(), 0);
 }
 
 // ---------- premature-read boundary control (fix round 3, Linux-only)
@@ -580,7 +557,7 @@ fn ordering_inspect_no_read_syscall_before_admission() {
     // Missing required args clear the same bar.
     for args in [
         argv(&["--pid", "1"]),
-        argv(&["--pid", "1", "--provider", "/nonexistent-r07/provider.so"]),
+        argv(&["--provider", "/nonexistent-r07/provider.so"]),
     ] {
         let (rc, sc) = read_cost(|| {
             assert_eq!(run_inspect(&args), ExitCode::from(2), "{args:?}");
@@ -589,11 +566,9 @@ fn ordering_inspect_no_read_syscall_before_admission() {
         assert!(rc <= 8, "missing args read no bytes (rchar +{rc})");
     }
 
-    // Positive controls: valid admission reaches the REAL
-    // provider-read boundary (harvest::run's first effect is
-    // fs::read(&cfg.provider)) — genuine bytes move through read() —
-    // then setup fails on the bogus BPF object (exit 4). The counters
-    // observe the actual boundary, not a marker.
+    // A real provider fixture must remain unread when package admission
+    // fails. Calibration above proves that a genuine premature read moves
+    // these counters; admitted harvest effects have a private positive control.
     for extra in [
         Vec::<&str>::new(),
         vec!["--timeout", "0.5", "--settle", "30"],
@@ -604,12 +579,12 @@ fn ordering_inspect_no_read_syscall_before_admission() {
             assert_eq!(run_inspect(&args), ExitCode::from(4), "inspect {extra:?}");
         });
         assert!(
-            sc > 0,
-            "inspect {extra:?}: setup performs read() syscalls (syscr +{sc})"
+            sc == 0,
+            "inspect {extra:?}: package refusal precedes provider read() syscalls (syscr +{sc})"
         );
         assert!(
-            rc >= 4000,
-            "inspect {extra:?}: setup reads real provider bytes (rchar +{rc})"
+            rc <= 8,
+            "inspect {extra:?}: package refusal reads no provider bytes (rchar +{rc})"
         );
         let _ = std::fs::remove_file(&prov);
     }
@@ -690,6 +665,7 @@ use std::cell::Cell;
 
 fn harvest_cfg() -> HarvestConfig {
     HarvestConfig {
+        object_bytes: None,
         pid: 1,
         provider: "/nonexistent-r07/provider.so".into(),
         object: "/nonexistent-r07/harvest.bpf.o".into(),
