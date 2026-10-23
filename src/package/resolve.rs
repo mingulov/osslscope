@@ -397,7 +397,7 @@ mod tests {
     use std::{
         cell::Cell,
         fs,
-        os::unix::fs::PermissionsExt,
+        os::unix::fs::{PermissionsExt, symlink},
         sync::atomic::{AtomicUsize, Ordering},
     };
 
@@ -457,13 +457,30 @@ mod tests {
     #[test]
     fn complete_metadata_is_opened_once_before_any_role_validation() {
         let f = Fixture::new();
-        let host_path = f.0.join("bin/osslscope");
-        fs::create_dir(f.0.join("bin")).unwrap();
-        fs::set_permissions(f.0.join("bin"), fs::Permissions::from_mode(0o755)).unwrap();
+        let executing_prefix = f.0.join("executing-prefix");
+        fs::create_dir(&executing_prefix).unwrap();
+        fs::set_permissions(&executing_prefix, fs::Permissions::from_mode(0o755)).unwrap();
+        let host_path = executing_prefix.join("bin/osslscope");
+        fs::create_dir(executing_prefix.join("bin")).unwrap();
+        fs::set_permissions(
+            executing_prefix.join("bin"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
         let host_bytes = minimal_host_elf();
         fs::write(&host_path, &host_bytes).unwrap();
         fs::set_permissions(&host_path, fs::Permissions::from_mode(0o755)).unwrap();
-        let host = crate::package::trusted::test_host(&host_path).unwrap();
+        let other_prefix = f.0.join("other-prefix");
+        fs::create_dir(&other_prefix).unwrap();
+        fs::set_permissions(&other_prefix, fs::Permissions::from_mode(0o755)).unwrap();
+        let other_bin = other_prefix.join("bin");
+        fs::create_dir(&other_bin).unwrap();
+        fs::set_permissions(&other_bin, fs::Permissions::from_mode(0o755)).unwrap();
+        let invocation_alias = other_bin.join("osslscope");
+        symlink(&host_path, &invocation_alias).unwrap();
+        let host = crate::package::trusted::test_host_from_link(&invocation_alias).unwrap();
+        assert_eq!(host.prefix.path(), executing_prefix.as_path());
+        assert_eq!(host.executable.locator, host_path);
         let mut fixture = package_fixtures::records_fixture();
         let (wire, policy) = compiled_loader_identity().unwrap();
         fixture.contract.wire_abi = wire;
@@ -480,8 +497,8 @@ mod tests {
         fixture.payload.bundle_id = bundle_id;
         fixture.payload.contract.sha256 = bundle_id;
         fixture.payload.contract.bytes = embedded.len() as u64;
-        let bundle_dir = f.0.join(format!("lib/osslscope/bundles/{bundle_id}"));
-        let mut level = f.0.clone();
+        let bundle_dir = executing_prefix.join(format!("lib/osslscope/bundles/{bundle_id}"));
+        let mut level = executing_prefix.clone();
         for part in ["lib", "osslscope", "bundles", &bundle_id.to_string()] {
             level.push(part);
             fs::create_dir(&level).unwrap();
@@ -603,7 +620,7 @@ mod tests {
             &crate::package::records::canonical_bytes(&fixture.payload),
         );
         fs::remove_file(bundle_dir.join(Role::Count.file_name())).unwrap();
-        let mut alt = f.0.clone();
+        let mut alt = executing_prefix.clone();
         for part in ["lib64", "osslscope", "bundles", &bundle_id.to_string()] {
             alt.push(part);
             fs::create_dir(&alt).unwrap();
@@ -615,11 +632,40 @@ mod tests {
             fs::Permissions::from_mode(0o644),
         )
         .unwrap();
+        // A second, complete bundle sits beneath the invocation alias's
+        // prefix. The executing prefix still lacks Count.
+        let mut competitor = other_prefix.clone();
+        for part in ["lib", "osslscope", "bundles", &bundle_id.to_string()] {
+            competitor.push(part);
+            fs::create_dir(&competitor).unwrap();
+            fs::set_permissions(&competitor, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let write_competitor = |name: &str, bytes: &[u8]| {
+            let path = competitor.join(name);
+            fs::write(&path, bytes).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o644)).unwrap();
+        };
+        write_competitor("bundle-contract.json", &embedded);
+        write_competitor(
+            "payload-manifest.json",
+            &crate::package::records::canonical_bytes(&fixture.payload),
+        );
+        write_competitor("build-inputs.json", &fixture.expected_input_bytes);
+        for role in [Role::Harvest, Role::Count, Role::Members] {
+            write_competitor(role.file_name(), role.file_name().as_bytes());
+        }
+        assert_eq!(
+            fs::read(competitor.join(Role::Count.file_name())).unwrap(),
+            Role::Count.file_name().as_bytes()
+        );
         assert!(matches!(
             resolve_installed_bundle_with(
                 &host,
                 &embedded,
-                |dir, relative| dir.open_relative(relative),
+                |dir, relative| {
+                    assert_eq!(dir.path(), bundle_dir.as_path());
+                    dir.open_relative(relative)
+                },
                 |_role, _bytes| Ok(())
             ),
             Err(PackageError::Unavailable { .. })
@@ -681,6 +727,59 @@ mod tests {
             admit_roles(&oversized, |p| dir.open_relative(p), |_, _| Ok(())),
             Err(PackageError::Invalid { .. })
         ));
+    }
+
+    #[test]
+    fn aggregate_role_budget_is_checked_before_any_open_or_validation() {
+        let mut over = entries();
+        over[0].bytes = ROLE_TOTAL_LIMIT / 3;
+        over[1].bytes = ROLE_TOTAL_LIMIT / 3;
+        over[2].bytes = ROLE_TOTAL_LIMIT - over[0].bytes - over[1].bytes + 1;
+        assert!(over.iter().all(|entry| entry.bytes <= ROLE_TOTAL_LIMIT));
+        assert_eq!(
+            over.iter().map(|entry| entry.bytes).sum::<u64>(),
+            ROLE_TOTAL_LIMIT + 1
+        );
+        let opens = Cell::new(0);
+        let validations = Cell::new(0);
+        assert!(matches!(
+            admit_roles(
+                &over,
+                |_| {
+                    opens.set(opens.get() + 1);
+                    Err(PackageError::unavailable("test opener sentinel"))
+                },
+                |_, _| {
+                    validations.set(validations.get() + 1);
+                    Ok(())
+                }
+            ),
+            Err(PackageError::Invalid { .. })
+        ));
+        assert_eq!(opens.get(), 0);
+        assert_eq!(validations.get(), 0);
+
+        over[2].bytes -= 1;
+        assert_eq!(
+            over.iter().map(|entry| entry.bytes).sum::<u64>(),
+            ROLE_TOTAL_LIMIT
+        );
+        assert!(matches!(
+            admit_roles(
+                &over,
+                |_| {
+                    opens.set(opens.get() + 1);
+                    Err(PackageError::unavailable("test opener sentinel"))
+                },
+                |_, _| {
+                    validations.set(validations.get() + 1);
+                    Ok(())
+                }
+            ),
+            Err(PackageError::Unavailable { .. })
+        ));
+        assert_eq!(opens.get(), 1);
+        assert_eq!(validations.get(), 0);
     }
 
     #[test]
@@ -873,7 +972,10 @@ mod tests {
             instructions[index * 16] = 0x18;
             instructions[index * 16 + 1] = 1;
         }
-        instructions.extend_from_slice(&[0xb7, 0, 0, 0, 0, 0, 0, 0, 0x95, 0, 0, 0, 0, 0, 0, 0]);
+        // A non-relocated LD_IMM64 and exit follow the seven map sites.
+        instructions.extend_from_slice(&[0x18, 0, 0, 0, 0, 0, 0, 0]);
+        instructions.extend_from_slice(&[0; 8]);
+        instructions.extend_from_slice(&[0x95, 0, 0, 0, 0, 0, 0, 0]);
         let mut symbols = vec![0u8; (9 + usize::from(extra_root.is_some())) * 24];
         w32(&mut symbols, 24, root_name_offset as u32);
         symbols[28] = 0x12;
@@ -1029,7 +1131,18 @@ mod tests {
     #[test]
     fn package_count_tail_call_rejected_before_setup() {
         let mut prepared = prepared_count();
-        prepared.progs[0].insns[..8].copy_from_slice(&[0x85, 0, 0, 0, 12, 0, 0, 0]);
+        assert!(
+            prepared.progs[0]
+                .map_fixups
+                .iter()
+                .all(|fixup| fixup.insn_off < 112)
+        );
+        // At a non-fixup site, an ordinary helper call is accepted. Only the
+        // helper ID changes in the rejected neighbor.
+        prepared.progs[0].insns[112..120].copy_from_slice(&[0x85, 0, 0, 0, 1, 0, 0, 0]);
+        prepared.progs[0].insns[120..128].copy_from_slice(&[0xb7, 0, 0, 0, 0, 0, 0, 0]);
+        assert!(crate::discovery::onboard::validate_installed_count_prepared(&prepared).is_ok());
+        prepared.progs[0].insns[116] = 12;
         assert!(matches!(
             crate::discovery::onboard::validate_installed_count_prepared(&prepared),
             Err(PackageError::Invalid { .. })
@@ -1039,7 +1152,16 @@ mod tests {
     #[test]
     fn package_count_pseudofunction_rejected_before_setup() {
         let mut prepared = prepared_count();
-        prepared.progs[0].insns[..8].copy_from_slice(&[0x18, 0x40, 0, 0, 0, 0, 0, 0]);
+        assert!(
+            prepared.progs[0]
+                .map_fixups
+                .iter()
+                .all(|fixup| fixup.insn_off < 112)
+        );
+        assert_eq!(prepared.progs[0].insns[112], 0x18);
+        assert_eq!(prepared.progs[0].insns[113], 0);
+        assert!(crate::discovery::onboard::validate_installed_count_prepared(&prepared).is_ok());
+        prepared.progs[0].insns[113] = 0x40;
         assert!(matches!(
             crate::discovery::onboard::validate_installed_count_prepared(&prepared),
             Err(PackageError::Invalid { .. })

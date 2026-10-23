@@ -432,11 +432,21 @@ fn installed_prefix_path(path: &Path) -> Result<PathBuf, PackageError> {
 
 /// The only intentional magic-link traversal is this executable FD acquisition.
 pub fn executing_host() -> Result<HostIdentity, PackageError> {
-    let file =
-        File::open("/proc/self/exe").map_err(|e| io_error(Path::new("/proc/self/exe"), e))?;
-    let path = std::fs::read_link("/proc/self/exe")
-        .map_err(|e| io_error(Path::new("/proc/self/exe"), e))?;
-    executing_host_with(file, path, TrustPolicy::production(), OpenStrategy::Auto)
+    executing_host_at(
+        Path::new("/proc/self/exe"),
+        TrustPolicy::production(),
+        OpenStrategy::Auto,
+    )
+}
+
+fn executing_host_at(
+    executable_link: &Path,
+    policy: TrustPolicy,
+    strategy: OpenStrategy,
+) -> Result<HostIdentity, PackageError> {
+    let file = File::open(executable_link).map_err(|e| io_error(executable_link, e))?;
+    let path = std::fs::read_link(executable_link).map_err(|e| io_error(executable_link, e))?;
+    executing_host_with(file, path, policy, strategy)
 }
 
 /// Bound reads to limit+1 and compare the opened FD before and after.
@@ -528,9 +538,8 @@ pub(super) fn test_dir(path: &Path) -> Result<TrustedDir, PackageError> {
 }
 
 #[cfg(test)]
-pub(super) fn test_host(path: &Path) -> Result<HostIdentity, PackageError> {
-    let file = File::open(path).map_err(|e| io_error(path, e))?;
-    executing_host_with(file, path.to_path_buf(), test_policy(), OpenStrategy::Walk)
+pub(super) fn test_host_from_link(path: &Path) -> Result<HostIdentity, PackageError> {
+    executing_host_at(path, test_policy(), OpenStrategy::Walk)
 }
 
 #[cfg(test)]
@@ -572,15 +581,12 @@ mod tests {
         let executable = bin.join("osslscope");
         fs::write(&executable, b"host").unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
-        let link = f.0.join("other-invocation");
+        let other = f.0.join("other-prefix");
+        fs::create_dir(&other).unwrap();
+        fs::set_permissions(&other, fs::Permissions::from_mode(0o755)).unwrap();
+        let link = other.join("other-invocation");
         symlink(&executable, &link).unwrap();
-        let host = executing_host_with(
-            fs::File::open(&executable).unwrap(),
-            executable.clone(),
-            test_policy(),
-            OpenStrategy::Walk,
-        )
-        .unwrap();
+        let host = test_host_from_link(&link).unwrap();
         assert_eq!(host.prefix.path(), f.0.as_path());
         assert_eq!(
             host.executable.identity.dev,
