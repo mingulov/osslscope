@@ -118,6 +118,11 @@ mod alg_contract {
             (7, true, 3)
         );
         assert_eq!(
+            verdict(classify(b"a::::::::", false, |key| (key == A)
+                .then(|| entry(7, 0, 1, 10)))),
+            (7, true, 3)
+        );
+        assert_eq!(
             verdict(classify(b"a:b:::::::b", false, |key| match key {
                 A => Some(entry(7, 0, 1, 10)),
                 B => Some(entry(2, 0, 1, 11)),
