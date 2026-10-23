@@ -4050,31 +4050,6 @@ fn load_frozen(obj_bytes: &[u8]) -> anyhow::Result<Loaded> {
     crate::loader::load(&prep)
 }
 
-/// Populate the kernel classifier tables right after map creation,
-/// before any attach can fire. Observer-owned registry bytes only;
-/// no target memory is involved.
-fn populate_classifier_maps(maps: &HashMap<String, OwnedFd>) -> anyhow::Result<()> {
-    let put = |map: &str, key: &[u8], value: &[u8]| -> anyhow::Result<()> {
-        let fd = maps
-            .get(map)
-            .ok_or_else(|| anyhow!("missing classifier map {map}"))?;
-        // SAFETY: lengths are exact per HARVEST_MAPS — ALG_CLASS is
-        // key 8 / value 42 (`u64` key, `[u8; 42]` encoder),
-        // TRIP_CLASS is key 8 / value 22 (`u64` key, `[u8; 22]`
-        // encoder); both plain HASH maps, fd live from `load()`.
-        unsafe { ossl_bpf_sys::map_update_elem(fd.as_raw_fd(), key, value, 0) }
-            .with_context(|| format!("populate {map}"))?;
-        Ok(())
-    };
-    for (h, v) in harvest::build_alg_entries()? {
-        put("ALG_CLASS", &h.to_le_bytes(), &wire::alg_value_bytes(&v))?;
-    }
-    for (h, v) in harvest::build_trip_entries()? {
-        put("TRIP_CLASS", &h.to_le_bytes(), &wire::trip_value_bytes(&v))?;
-    }
-    Ok(())
-}
-
 /// P5-probe hook: `OSSL_JUMPS_HOLE=<idx>` leaves one jump-table
 /// slot empty so C4 can measure hole tolerance live (the chain
 /// stops at the hole with an honest advance — rate-only, never a
@@ -4925,197 +4900,210 @@ impl DiscoverySession {
         }
 
         let loaded = load_frozen(&obj_bytes)?;
-        // Classifier tables before any attach can fire: the kernel
-        // classifies every string-bearing event against these.
-        populate_classifier_maps(&loaded.maps)?;
-        // Chain jump table likewise: every query tail-calls into it.
-        populate_jump_table(&loaded)?;
-        // Owns every multi link (drop = detach, all paths).
-        let mut links = LinkSet::default();
-        let mut builtin_query_attached = false;
-        let mut builtin_query_offset = 0u64;
-        let mut resolution: Option<String> = None;
-        // F-D/A11 anchor bindings: the identities the installed
-        // links pin, plus the recipe to reinstall them.
-        let mut dispatch_spec: Option<DispatchSpec> = None;
-        let mut dispatch_binding: Option<(String, String, u64)> = None;
-        // Dispatch-blind runs preset their PARTIAL reason but still
-        // drain for legacy tripwires (dispatch and legacy observe
-        // independently).
-        let mut preset_reason: Option<String> = None;
-        if cfg.builtin {
-            let table = match &cfg.table {
-                Some(path) => {
-                    let text = std::fs::read_to_string(path)?;
-                    builtin::load_table_str(&text)?
-                }
-                None => builtin::shipped_table(),
-            };
-            // Automatic discovery uses the supported-only ladder
-            // (table hit or symtab); the anchor+delta rung needs an
-            // explicitly selected table (R09: never guessed offsets).
-            let resolved = if cfg.explicit_offsets {
-                builtin::resolve_query_offset(&elf_bytes, &table, cfg.force_offset)
-            } else {
-                builtin::resolve_supported_offset(&elf_bytes, &table)
-            };
-            match resolved {
-                Ok((off, r)) => {
-                    if r != builtin::Resolution::Table {
-                        resolution = Some(r.as_str().to_string());
+        let classifier_handles = crate::discovery::classifier_maps::clone_classifier_handles(
+            &loaded.maps,
+            crate::discovery::classifier_maps::ClassifierRole::Harvest,
+        )?;
+        crate::discovery::classifier_maps::after_classifier_init(
+            move || {
+                crate::discovery::classifier_maps::initialize_classifier_maps(
+                    &classifier_handles,
+                    crate::discovery::classifier_maps::ClassifierRole::Harvest,
+                )
+            },
+            || {
+                // Chain jump table likewise: every query tail-calls into it.
+                populate_jump_table(&loaded)?;
+                // Owns every multi link (drop = detach, all paths).
+                let mut links = LinkSet::default();
+                let mut builtin_query_attached = false;
+                let mut builtin_query_offset = 0u64;
+                let mut resolution: Option<String> = None;
+                // F-D/A11 anchor bindings: the identities the installed
+                // links pin, plus the recipe to reinstall them.
+                let mut dispatch_spec: Option<DispatchSpec> = None;
+                let mut dispatch_binding: Option<(String, String, u64)> = None;
+                // Dispatch-blind runs preset their PARTIAL reason but still
+                // drain for legacy tripwires (dispatch and legacy observe
+                // independently).
+                let mut preset_reason: Option<String> = None;
+                if cfg.builtin {
+                    let table = match &cfg.table {
+                        Some(path) => {
+                            let text = std::fs::read_to_string(path)?;
+                            builtin::load_table_str(&text)?
+                        }
+                        None => builtin::shipped_table(),
+                    };
+                    // Automatic discovery uses the supported-only ladder
+                    // (table hit or symtab); the anchor+delta rung needs an
+                    // explicitly selected table (R09: never guessed offsets).
+                    let resolved = if cfg.explicit_offsets {
+                        builtin::resolve_query_offset(&elf_bytes, &table, cfg.force_offset)
+                    } else {
+                        builtin::resolve_supported_offset(&elf_bytes, &table)
+                    };
+                    match resolved {
+                        Ok((off, r)) => {
+                            if r != builtin::Resolution::Table {
+                                resolution = Some(r.as_str().to_string());
+                            }
+                            attach_pair(
+                                &loaded,
+                                &mut links,
+                                "query_entry",
+                                "query_return",
+                                off,
+                                &prov_pin,
+                                nz.get(),
+                                0,
+                                LinkKind::Query,
+                            )?;
+                            eprintln!("INSPECT stage=builtin off={off:#x} via={}", r.as_str());
+                            builtin_query_attached = true;
+                            builtin_query_offset = off;
+                            dispatch_spec = Some(DispatchSpec::Builtin {
+                                table,
+                                force_offset: cfg.force_offset,
+                                explicit_offsets: cfg.explicit_offsets,
+                            });
+                        }
+                        Err(e) => {
+                            eprintln!("INSPECT builtin unresolved: {e:#}");
+                            preset_reason = Some("anchor-unresolved".to_string());
+                        }
                     }
-                    attach_pair(
-                        &loaded,
-                        &mut links,
-                        "query_entry",
-                        "query_return",
-                        off,
-                        &prov_pin,
-                        nz.get(),
-                        0,
-                        LinkKind::Query,
-                    )?;
-                    eprintln!("INSPECT stage=builtin off={off:#x} via={}", r.as_str());
-                    builtin_query_attached = true;
-                    builtin_query_offset = off;
-                    dispatch_spec = Some(DispatchSpec::Builtin {
-                        table,
-                        force_offset: cfg.force_offset,
-                        explicit_offsets: cfg.explicit_offsets,
-                    });
+                } else {
+                    // Init ladder: load-mandated dynsym first, debug symtab second.
+                    let init_off = elf::dynsym_file_offset(&elf_bytes, INIT_ANCHOR)
+                        .map(|off| (off, None))
+                        .or_else(|_| {
+                            elf::symtab_file_offset(&elf_bytes, INIT_ANCHOR)
+                                .map(|off| (off, Some("symtab".to_string())))
+                        });
+                    match init_off {
+                        Ok((off, res)) => {
+                            resolution = res;
+                            attach_pair(
+                                &loaded,
+                                &mut links,
+                                "init_entry",
+                                "init_return",
+                                off,
+                                &prov_pin,
+                                nz.get(),
+                                0,
+                                LinkKind::Init,
+                            )?;
+                            dispatch_spec = Some(DispatchSpec::Init);
+                            // H4: the binding is EXACT now — the pin's own
+                            // identity (the link bound through its fd-path),
+                            // not a best-effort post-attach stat.
+                            dispatch_binding = Some((
+                                cfg.provider.to_string_lossy().into_owned(),
+                                crate::plan::render_device(prov_pin.device),
+                                prov_pin.ino,
+                            ));
+                        }
+                        Err(e) => {
+                            eprintln!("INSPECT anchor unresolved: {e:#}");
+                            preset_reason = Some("anchor-unresolved".to_string());
+                        }
+                    }
+                    // Machine-readable progress on stderr (stdout stays pure
+                    // JSON): harnesses gate fixture GO lines on these.
+                    eprintln!("INSPECT stage=init attached=2");
                 }
-                Err(e) => {
-                    eprintln!("INSPECT builtin unresolved: {e:#}");
-                    preset_reason = Some("anchor-unresolved".to_string());
-                }
-            }
-        } else {
-            // Init ladder: load-mandated dynsym first, debug symtab second.
-            let init_off = elf::dynsym_file_offset(&elf_bytes, INIT_ANCHOR)
-                .map(|off| (off, None))
-                .or_else(|_| {
-                    elf::symtab_file_offset(&elf_bytes, INIT_ANCHOR)
-                        .map(|off| (off, Some("symtab".to_string())))
-                });
-            match init_off {
-                Ok((off, res)) => {
-                    resolution = res;
-                    attach_pair(
-                        &loaded,
-                        &mut links,
-                        "init_entry",
-                        "init_return",
-                        off,
-                        &prov_pin,
-                        nz.get(),
-                        0,
-                        LinkKind::Init,
-                    )?;
-                    dispatch_spec = Some(DispatchSpec::Init);
-                    // H4: the binding is EXACT now — the pin's own
-                    // identity (the link bound through its fd-path),
-                    // not a best-effort post-attach stat.
+
+                let ev_fd = loaded
+                    .maps
+                    .get("EVENTS")
+                    .context("no EVENTS map")?
+                    .try_clone()?;
+                let ev_data =
+                    MapData::from_fd(ev_fd).map_err(|e| anyhow!("EVENTS mapdata: {e}"))?;
+                let ev_map = Map::from_map_data(ev_data).map_err(|e| anyhow!("EVENTS map: {e}"))?;
+                let ring = RingBuf::try_from(ev_map)?;
+
+                let mut core =
+                    SessionCore::new(cfg.provider.clone(), canon.clone(), cfg.legacy, pid);
+                if builtin_query_attached {
+                    // H4: backing identity for the reuse comparison —
+                    // EXACT from the bootstrap pin (the builtin pair bound
+                    // through its fd-path), replacing the best-effort
+                    // post-attach stat (whose unstatable-fallback is now
+                    // unreachable — the pin opened or bootstrap failed).
+                    let pdev = crate::plan::render_device(prov_pin.device);
+                    let pino = prov_pin.ino;
                     dispatch_binding = Some((
                         cfg.provider.to_string_lossy().into_owned(),
-                        crate::plan::render_device(prov_pin.device),
-                        prov_pin.ino,
+                        pdev.clone(),
+                        pino,
                     ));
+                    core.mark_query_attached(
+                        0,
+                        builtin_query_offset,
+                        cfg.provider.to_string_lossy().into_owned(),
+                        pdev,
+                        pino,
+                    );
                 }
-                Err(e) => {
-                    eprintln!("INSPECT anchor unresolved: {e:#}");
-                    preset_reason = Some("anchor-unresolved".to_string());
-                }
-            }
-            // Machine-readable progress on stderr (stdout stays pure
-            // JSON): harnesses gate fixture GO lines on these.
-            eprintln!("INSPECT stage=init attached=2");
-        }
+                let mut env = LiveEnv {
+                    pid,
+                    provider: cfg.provider.clone(),
+                    canon,
+                    loaded,
+                    links,
+                    ring,
+                    pin,
+                    dispatch_spec,
+                    last_trip_pins: Vec::new(),
+                };
 
-        let ev_fd = loaded
-            .maps
-            .get("EVENTS")
-            .context("no EVENTS map")?
-            .try_clone()?;
-        let ev_data = MapData::from_fd(ev_fd).map_err(|e| anyhow!("EVENTS mapdata: {e}"))?;
-        let ev_map = Map::from_map_data(ev_data).map_err(|e| anyhow!("EVENTS map: {e}"))?;
-        let ring = RingBuf::try_from(ev_map)?;
-
-        let mut core = SessionCore::new(cfg.provider.clone(), canon.clone(), cfg.legacy, pid);
-        if builtin_query_attached {
-            // H4: backing identity for the reuse comparison —
-            // EXACT from the bootstrap pin (the builtin pair bound
-            // through its fd-path), replacing the best-effort
-            // post-attach stat (whose unstatable-fallback is now
-            // unreachable — the pin opened or bootstrap failed).
-            let pdev = crate::plan::render_device(prov_pin.device);
-            let pino = prov_pin.ino;
-            dispatch_binding = Some((
-                cfg.provider.to_string_lossy().into_owned(),
-                pdev.clone(),
-                pino,
-            ));
-            core.mark_query_attached(
-                0,
-                builtin_query_offset,
-                cfg.provider.to_string_lossy().into_owned(),
-                pdev,
-                pino,
-            );
-        }
-        let mut env = LiveEnv {
-            pid,
-            provider: cfg.provider.clone(),
-            canon,
-            loaded,
-            links,
-            ring,
-            pin,
-            dispatch_spec,
-            last_trip_pins: Vec::new(),
-        };
-
-        // Legacy tripwires (dispatch-independent: attach even when
-        // the dispatch anchor failed — a blind dispatch can still
-        // observe legacy calls; only a missing libcrypto mapping is
-        // truly blind). Planned now when libcrypto is already mapped
-        // and deferred to the first post-exec poll otherwise.
-        if cfg.legacy {
-            match env.current_maps() {
-                Some(maps0) if legacy::find_libcrypto(&maps0).is_some() => {
-                    if let Some(set) = env.plan_trips(&maps0)? {
-                        let note = env.install_trips(&set, pid, &maps0)?;
-                        let pins = env.last_trip_pins();
-                        core.adopt_legacy_plan(set, note);
-                        core.set_trip_pins(pins);
+                // Legacy tripwires (dispatch-independent: attach even when
+                // the dispatch anchor failed — a blind dispatch can still
+                // observe legacy calls; only a missing libcrypto mapping is
+                // truly blind). Planned now when libcrypto is already mapped
+                // and deferred to the first post-exec poll otherwise.
+                if cfg.legacy {
+                    match env.current_maps() {
+                        Some(maps0) if legacy::find_libcrypto(&maps0).is_some() => {
+                            if let Some(set) = env.plan_trips(&maps0)? {
+                                let note = env.install_trips(&set, pid, &maps0)?;
+                                let pins = env.last_trip_pins();
+                                core.adopt_legacy_plan(set, note);
+                                core.set_trip_pins(pins);
+                            }
+                        }
+                        Some(_) => {
+                            eprintln!("INSPECT stage=legacy blind=no-libcrypto-mapping");
+                        }
+                        // F-D/Am1: a failed bootstrap read defers like a
+                        // pre-exec image (the first successful poll plans),
+                        // with explicit loss — never misdiagnosed as a
+                        // missing libcrypto mapping.
+                        None => {
+                            core.tracker.note_maps_read();
+                            eprintln!("INSPECT stage=legacy blind=maps-read-failed");
+                        }
                     }
                 }
-                Some(_) => {
-                    eprintln!("INSPECT stage=legacy blind=no-libcrypto-mapping");
-                }
-                // F-D/Am1: a failed bootstrap read defers like a
-                // pre-exec image (the first successful poll plans),
-                // with explicit loss — never misdiagnosed as a
-                // missing libcrypto mapping.
-                None => {
-                    core.tracker.note_maps_read();
-                    eprintln!("INSPECT stage=legacy blind=maps-read-failed");
-                }
-            }
-        }
-        core.set_bootstrap(
-            preset_reason.is_none(),
-            preset_reason,
-            resolution,
-            dispatch_binding,
-        );
+                core.set_bootstrap(
+                    preset_reason.is_none(),
+                    preset_reason,
+                    resolution,
+                    dispatch_binding,
+                );
 
-        // Post-attach verify: every maps read and attach above
-        // resolved through /proc/<pid> — confirm the identity.
-        if env.verify_pin().is_err() {
-            core.mark_recycled();
-            return Err(core.recycled_err());
-        }
-        Ok(Self { core, env })
+                // Post-attach verify: every maps read and attach above
+                // resolved through /proc/<pid> — confirm the identity.
+                if env.verify_pin().is_err() {
+                    core.mark_recycled();
+                    return Err(core.recycled_err());
+                }
+                Ok(Self { core, env })
+            },
+        )
     }
 
     /// One bounded poll; see [`SessionCore::poll`].

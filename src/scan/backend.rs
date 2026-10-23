@@ -258,10 +258,6 @@ impl ScanBackend {
                 (sub.attached, set, sub.failed)
             }
         };
-        // Populate the member classifier from the single registry
-        // (production attachment classifies exactly like the
-        // harvest plane — legs must not hand-populate it).
-        populate_alg_class(&attached.loaded.maps)?;
         let scope = OracleScope {
             expected: attached_slots.len() as u32,
             attached: attached_slots.clone(),
@@ -1252,33 +1248,6 @@ fn write_tcache(
     val[0..8].copy_from_slice(&t.to_le_bytes());
     val[8..16].copy_from_slice(&generation.to_le_bytes());
     unsafe { ossl_bpf_sys::map_update_elem(fd, &key, &val, 0u64) }.context("T_CACHE warm")
-}
-
-/// Populate the member object's `ALG_CLASS` from the single
-/// registry (same entries the harvest plane classifies with —
-/// production attachment classifies identically; legs must not
-/// hand-populate it). Members carry no TRIP_CLASS (scan-plane
-/// only), so only the ALG arm applies.
-fn populate_alg_class(maps: &std::collections::HashMap<String, OwnedFd>) -> anyhow::Result<()> {
-    use anyhow::Context as _;
-    let fd = maps
-        .get("ALG_CLASS")
-        .context("members ALG_CLASS map missing")?;
-    for (h, v) in crate::discovery::harvest::build_alg_entries()? {
-        // SAFETY: lengths are exact per MEMBER_MAPS — ALG_CLASS is
-        // key 8 / value 42 (same encoder as the harvest plane);
-        // plain HASH map, fd live from `load()`.
-        unsafe {
-            ossl_bpf_sys::map_update_elem(
-                fd.as_raw_fd(),
-                &h.to_le_bytes(),
-                &wire::alg_value_bytes(&v),
-                0,
-            )
-        }
-        .context("populate members ALG_CLASS")?;
-    }
-    Ok(())
 }
 
 /// Drop T_CACHE[arr] (cache healing: grown tables and generation

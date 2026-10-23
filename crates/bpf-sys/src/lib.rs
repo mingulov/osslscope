@@ -24,6 +24,7 @@ pub const BPF_MAP_GET_NEXT_KEY: u32 = 4;
 pub const BPF_OBJ_GET_INFO_BY_FD: u32 = 15;
 pub const BPF_PROG_LOAD: u32 = 5;
 pub const BPF_BTF_LOAD: u32 = 18;
+pub const BPF_MAP_FREEZE: u32 = 22;
 pub const BPF_LINK_CREATE: u32 = 28;
 pub const BPF_TOKEN_CREATE: u32 = 36;
 /// `BPF_MAP_UPDATE_ELEM` flags (create-or-update / must-create).
@@ -183,6 +184,23 @@ fn bpf(cmd: u32, attr: *mut std::ffi::c_void, size: usize) -> io::Result<i32> {
 fn zeroed<T>() -> T {
     // SAFETY: all attr structs are plain-old-data (ints/arrays).
     unsafe { std::mem::zeroed() }
+}
+
+/// Freeze a map against later userspace updates. The final UAPI attribute
+/// field is map_fd alone; the kernel zero-extends any omitted union bytes.
+pub fn map_freeze(map_fd: RawFd) -> io::Result<()> {
+    map_freeze_with(map_fd, |cmd, attr, size| {
+        bpf(cmd, attr.as_mut_ptr().cast(), size)
+    })
+}
+
+fn map_freeze_with(
+    map_fd: RawFd,
+    call: impl FnOnce(u32, &mut [u8; 4], usize) -> io::Result<i32>,
+) -> io::Result<()> {
+    let mut attr = (map_fd as u32).to_ne_bytes();
+    call(BPF_MAP_FREEZE, &mut attr, 4)?;
+    Ok(())
 }
 
 /// Create a map from raw dimensions, authorized by `token` when set.
@@ -602,6 +620,35 @@ mod tests {
     use std::sync::Mutex;
 
     static G1_FD_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn map_freeze_uses_four_byte_fd_attribute_and_preserves_error() {
+        let mut calls = 0;
+        let error = map_freeze_with(313, |cmd, attr, size| {
+            calls += 1;
+            assert_eq!(cmd, 22);
+            assert_eq!(size, 4);
+            assert_eq!(*attr, 313u32.to_ne_bytes());
+            Err(io::Error::from_raw_os_error(libc::EIO))
+        })
+        .unwrap_err();
+        assert_eq!(calls, 1);
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+    }
+
+    #[test]
+    fn map_freeze_success_uses_only_selected_fd_field() {
+        let mut calls = 0;
+        map_freeze_with(0x1234, |cmd, attr, size| {
+            calls += 1;
+            assert_eq!(cmd, BPF_MAP_FREEZE);
+            assert_eq!(size, size_of::<u32>());
+            assert_eq!(u32::from_ne_bytes(*attr), 0x1234);
+            Ok(0)
+        })
+        .unwrap();
+        assert_eq!(calls, 1);
+    }
 
     fn pipe() -> (OwnedFd, OwnedFd) {
         let mut fds = [-1; 2];

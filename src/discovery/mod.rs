@@ -12,6 +12,7 @@
 //! the relocation + schema legs are mechanism-independent either way.
 
 pub mod builtin;
+pub(crate) mod classifier_maps;
 pub mod coverage;
 pub mod elf;
 pub mod flavor;

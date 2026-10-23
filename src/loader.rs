@@ -2608,79 +2608,91 @@ pub fn attach_members_subset_from_bytes(
     if !loaded.progs.contains_key("member_entry") {
         anyhow::bail!("selective attach: member_entry rejected, no census possible");
     }
-    let entry = ossl_bpf_sys::link_create_uprobe_multi(
-        loaded.progs["member_entry"].as_raw_fd(),
-        exe,
-        &[off],
-        &[osslscope_ebpf_common::MEMBER_ENTRY_COOKIE],
-        pid,
-    )
-    .context("attach member_entry")?;
-    // Keep-good attach: one link failure is recorded, the rest
-    // proceed. EXPECTED programs to the ATTACHED count (the
-    // retire equation counts attached members, not wanted ones).
-    let mut members = Vec::new();
-    let mut attached_slots = Vec::new();
-    let mut failed: Vec<FailedSlot> = load_failed
-        .into_iter()
-        .filter_map(|f| {
-            f.prog
-                .strip_prefix("member_")
-                .and_then(|s| s.parse::<u32>().ok())
-                .map(|slot| FailedSlot {
-                    slot,
-                    stage: "load",
-                    error: f.error,
-                })
-        })
-        .collect();
-    for j in want {
-        let name = format!("member_{j:03}");
-        let Some(prog) = loaded.progs.get(&name) else {
-            continue; // load rejection already recorded above
-        };
-        match ossl_bpf_sys::link_create_uretprobe_multi(
-            prog.as_raw_fd(),
-            exe,
-            &[off],
-            &[j as u64],
-            pid,
-        ) {
-            Ok(link) => {
-                members.push(link);
-                attached_slots.push(j);
-            }
-            Err(e) => failed.push(FailedSlot {
-                slot: j,
-                stage: "attach",
-                error: format!("{e:#}"),
-            }),
-        }
-    }
-    if attached_slots.is_empty() {
-        anyhow::bail!("selective attach: every wanted member failed");
-    }
-    let mut actual_ctrl = *ctrl;
-    actual_ctrl.expected = attached_slots.len() as u32;
-    program_ctrl(&loaded.maps, &actual_ctrl).context("program CTRL")?;
-    failed.sort_by_key(|f| f.slot);
-    Ok(SubsetAttached {
-        attached: MembersAttached {
-            loaded,
-            entry,
-            members,
+    let classifier_handles = crate::discovery::classifier_maps::clone_classifier_handles(
+        &loaded.maps,
+        crate::discovery::classifier_maps::ClassifierRole::Members,
+    )?;
+    crate::discovery::classifier_maps::after_classifier_init(
+        move || {
+            crate::discovery::classifier_maps::initialize_classifier_maps(
+                &classifier_handles,
+                crate::discovery::classifier_maps::ClassifierRole::Members,
+            )
         },
-        slots: attached_slots,
-        failed,
-    })
+        || {
+            let entry = ossl_bpf_sys::link_create_uprobe_multi(
+                loaded.progs["member_entry"].as_raw_fd(),
+                exe,
+                &[off],
+                &[osslscope_ebpf_common::MEMBER_ENTRY_COOKIE],
+                pid,
+            )
+            .context("attach member_entry")?;
+            // Keep-good attach: one link failure is recorded, the rest
+            // proceed. EXPECTED programs to the ATTACHED count (the
+            // retire equation counts attached members, not wanted ones).
+            let mut members = Vec::new();
+            let mut attached_slots = Vec::new();
+            let mut failed: Vec<FailedSlot> = load_failed
+                .into_iter()
+                .filter_map(|f| {
+                    f.prog
+                        .strip_prefix("member_")
+                        .and_then(|s| s.parse::<u32>().ok())
+                        .map(|slot| FailedSlot {
+                            slot,
+                            stage: "load",
+                            error: f.error,
+                        })
+                })
+                .collect();
+            for j in want {
+                let name = format!("member_{j:03}");
+                let Some(prog) = loaded.progs.get(&name) else {
+                    continue; // load rejection already recorded above
+                };
+                match ossl_bpf_sys::link_create_uretprobe_multi(
+                    prog.as_raw_fd(),
+                    exe,
+                    &[off],
+                    &[j as u64],
+                    pid,
+                ) {
+                    Ok(link) => {
+                        members.push(link);
+                        attached_slots.push(j);
+                    }
+                    Err(e) => failed.push(FailedSlot {
+                        slot: j,
+                        stage: "attach",
+                        error: format!("{e:#}"),
+                    }),
+                }
+            }
+            if attached_slots.is_empty() {
+                anyhow::bail!("selective attach: every wanted member failed");
+            }
+            let mut actual_ctrl = *ctrl;
+            actual_ctrl.expected = attached_slots.len() as u32;
+            program_ctrl(&loaded.maps, &actual_ctrl).context("program CTRL")?;
+            failed.sort_by_key(|f| f.slot);
+            Ok(SubsetAttached {
+                attached: MembersAttached {
+                    loaded,
+                    entry,
+                    members,
+                },
+                slots: attached_slots,
+                failed,
+            })
+        },
+    )
 }
 
 /// Production attach of the member chunk: fd budget → prepare →
-/// load → program CTRL → attach entry (cookie 512) + members
-/// (cookie = slot) at `off` in `exe` for `pid`. One entry point so
-/// the legs dogfood the exact production path (L7's cookie fault
-/// re-attaches a single member link surgically on top).
-/// Live-proven by every member leg (L1 first).
+/// load → program CTRL → initialize/freeze ALG_CLASS → attach entry
+/// (cookie 512) + members (cookie = slot) at `off` in `exe` for `pid`.
+/// Custom-name fixture legs use a separate synthetic immutable image.
 pub fn attach_members(
     obj: &std::path::Path,
     exe: &std::ffi::CStr,
@@ -2715,31 +2727,51 @@ pub fn attach_members_from_bytes(
     let prep = prepare(bytes, &MEMBER_MAPS, &MEMBER_PROGS).context("prepare members.o")?;
     let loaded = load(&prep).context("load members.o")?;
     program_ctrl(&loaded.maps, ctrl).context("program CTRL")?;
-    let entry = ossl_bpf_sys::link_create_uprobe_multi(
-        loaded.progs["member_entry"].as_raw_fd(),
-        exe,
-        &[off],
-        &[osslscope_ebpf_common::MEMBER_ENTRY_COOKIE],
-        pid,
+    let classifier_handles = crate::discovery::classifier_maps::clone_classifier_handles(
+        &loaded.maps,
+        crate::discovery::classifier_maps::ClassifierRole::Members,
+    )?;
+    crate::discovery::classifier_maps::after_classifier_init(
+        move || {
+            crate::discovery::classifier_maps::initialize_classifier_maps(
+                &classifier_handles,
+                crate::discovery::classifier_maps::ClassifierRole::Members,
+            )
+        },
+        || {
+            let entry = ossl_bpf_sys::link_create_uprobe_multi(
+                loaded.progs["member_entry"].as_raw_fd(),
+                exe,
+                &[off],
+                &[osslscope_ebpf_common::MEMBER_ENTRY_COOKIE],
+                pid,
+            )
+            .context("attach member_entry")?;
+            let mut members = Vec::with_capacity(512);
+            for j in 0..512u64 {
+                let name = format!("member_{j:03}");
+                let prog = loaded
+                    .progs
+                    .get(&name)
+                    .with_context(|| format!("prog {name} missing"))?;
+                members.push(
+                    ossl_bpf_sys::link_create_uretprobe_multi(
+                        prog.as_raw_fd(),
+                        exe,
+                        &[off],
+                        &[j],
+                        pid,
+                    )
+                    .with_context(|| format!("attach {name}"))?,
+                );
+            }
+            Ok(MembersAttached {
+                loaded,
+                entry,
+                members,
+            })
+        },
     )
-    .context("attach member_entry")?;
-    let mut members = Vec::with_capacity(512);
-    for j in 0..512u64 {
-        let name = format!("member_{j:03}");
-        let prog = loaded
-            .progs
-            .get(&name)
-            .with_context(|| format!("prog {name} missing"))?;
-        members.push(
-            ossl_bpf_sys::link_create_uretprobe_multi(prog.as_raw_fd(), exe, &[off], &[j], pid)
-                .with_context(|| format!("attach {name}"))?,
-        );
-    }
-    Ok(MembersAttached {
-        loaded,
-        entry,
-        members,
-    })
 }
 
 /// Strip the kernel log buffer's NUL padding (the verifier writes a

@@ -28,8 +28,9 @@
 //! and gate the harness itself.
 //!
 //! Stage D (P7 item 3, R18): member conversion, T-gate, guard,
-//! retire. Every leg attaches through the production path AND
-//! registers BIRTH (the entry skips unregistered tids — cause 1).
+//! retire. Legs with custom names use a synthetic immutable table
+//! before links; other legs retain the production attach path.
+//! Both paths register BIRTH where the leg requires admission.
 //! The drain collects CALL/RET/GUARD/ALG/ROW; legs join RET/GUARD
 //! to CALLs by (tid,seq), never by position. D retires every
 //! admitted return (SCAN absent + RCOUNT IDLE|0), so sequential
@@ -98,10 +99,9 @@ fn register(loaded: &Loaded, state: &mut BirthState, tids: &[u32]) -> Vec<(u32, 
 }
 
 /// Dogfood the production attach (fd budget → prepare → load →
-/// CTRL program → entry + member links) + self-tid BIRTH
-/// registration. Every leg attaches through here (or
-/// `attach_with_ctrl`), so the production path is live-proven
-/// along with the legs. CTRL: EXPECTED = 512 attached members,
+/// CTRL program → classifier init → entry + member links) + self-tid
+/// BIRTH registration for legs without custom classifier names.
+/// CTRL: EXPECTED = 512 attached members,
 /// epoch 1, governor = min(4MiB policy, ring/2) — live at the 4MiB
 /// policy on the item-7 16MiB ring.
 fn attach_chunk(
@@ -117,20 +117,21 @@ fn attach_chunk(
     attached
 }
 
-/// Populate the member object's `ALG_CLASS` with fixture entries
-/// (mirrors `build_alg_entries`' push: hash+len match, fail-closed
-/// on collision or over-cap names).
-fn populate_alg_class(loaded: &Loaded, entries: &[(String, u16)]) {
+/// Live fixture confinement: custom, nonsecret classifier names use a fresh
+/// synthetic table image. Build it, verify every key/value, freeze it, and
+/// verify again before creating the first classifier link. The production
+/// attach helpers remain the oracle for tests without custom classifier data.
+fn install_synthetic_alg_class(loaded: &Loaded, entries: &[(String, u16)]) {
+    use aya::maps::{HashMap as AyaHashMap, IterableMap as _, Map, MapData};
     use osslscope_ebpf_common as wire;
     let fd = loaded.maps["ALG_CLASS"].as_raw_fd();
-    let mut seen = HashSet::new();
+    let mut expected = std::collections::BTreeMap::new();
     for (name, class) in entries {
         assert!(
             name.len() <= wire::MAX_ALG_NAME,
             "fixture name over kernel cap: {name:?}"
         );
         let h = wire::fnv1a64(name.as_bytes());
-        assert!(seen.insert(h), "fixture hash collision on {name:?}");
         let mut nb = [0u8; wire::MAX_ALG_NAME];
         nb[..name.len()].copy_from_slice(name.as_bytes());
         let v = wire::AlgClassValue {
@@ -140,10 +141,137 @@ fn populate_alg_class(loaded: &Loaded, entries: &[(String, u16)]) {
             canon: 0,
             name: nb,
         };
-        unsafe {
-            ossl_bpf_sys::map_update_elem(fd, &h.to_le_bytes(), &wire::alg_value_bytes(&v), 0)
+        assert!(
+            expected
+                .insert(h.to_le_bytes(), wire::alg_value_bytes(&v))
+                .is_none(),
+            "synthetic classifier hash collision"
+        );
+    }
+    assert!(
+        expected.len() <= 1024,
+        "synthetic classifier exceeds capacity"
+    );
+    let data = MapData::from_fd(
+        loaded.maps["ALG_CLASS"]
+            .try_clone()
+            .expect("clone ALG_CLASS"),
+    )
+    .expect("ALG_CLASS mapdata");
+    let info = data.info().expect("ALG_CLASS info");
+    assert_ne!(info.id(), 0);
+    assert_eq!(info.map_type().expect("map type") as u32, 1);
+    assert_eq!(
+        (
+            info.key_size(),
+            info.value_size(),
+            info.max_entries(),
+            info.map_flags()
+        ),
+        (8, 42, 1024, 0)
+    );
+    let id = info.id();
+    let map = Map::from_map_data(data).expect("ALG_CLASS map");
+    let mut hash = AyaHashMap::<_, [u8; 8], [u8; 42]>::try_from(map).expect("ALG_CLASS hash");
+    for (key, value) in &expected {
+        hash.insert(*key, *value, 0)
+            .expect("install synthetic ALG_CLASS");
+    }
+    let check = |hash: &AyaHashMap<_, [u8; 8], [u8; 42]>| {
+        let mut seen = HashSet::new();
+        for item in hash.keys().take(1025) {
+            let key = item.expect("synthetic key iteration");
+            assert!(
+                seen.insert(key) && seen.len() <= 1024,
+                "synthetic keys repeat/overflow"
+            );
+            assert_eq!(
+                hash.get(&key, 0).expect("synthetic lookup"),
+                *expected.get(&key).expect("synthetic extra key")
+            );
         }
-        .expect("insert ALG_CLASS");
+        assert_eq!(seen.len(), expected.len(), "synthetic missing key");
+    };
+    check(&hash);
+    ossl_bpf_sys::map_freeze(fd).expect("freeze synthetic ALG_CLASS");
+    let final_info = hash.map().info().expect("final ALG_CLASS info");
+    assert_eq!(final_info.id(), id, "synthetic map identity changed");
+    assert_eq!(final_info.map_type().expect("final map type") as u32, 1);
+    assert_eq!(
+        (
+            final_info.key_size(),
+            final_info.value_size(),
+            final_info.max_entries(),
+            final_info.map_flags()
+        ),
+        (8, 42, 1024, 0),
+        "synthetic final map shape changed"
+    );
+    check(&hash);
+}
+
+/// Small full-chunk test composition over the existing load, CTRL, and link
+/// primitives. No link can observe a partial or mutable synthetic image.
+fn attach_chunk_synthetic(
+    obj: &std::path::Path,
+    exe: &std::ffi::CString,
+    off: u64,
+    entries: &[(String, u16)],
+) -> osslscope::loader::MembersAttached {
+    let ctrl = osslscope::loader::default_ctrl(512, osslscope::loader::MEMBER_RING_BYTES)
+        .expect("synthetic CTRL");
+    let attached = attach_with_ctrl_synthetic(obj, exe, off, &ctrl, entries);
+    let mut state = BirthState::new();
+    register(&attached.loaded, &mut state, &[self_tid()]);
+    attached
+}
+
+fn attach_with_ctrl_synthetic(
+    obj: &std::path::Path,
+    exe: &std::ffi::CString,
+    off: u64,
+    ctrl: &osslscope_ebpf_common::CtrlValue,
+    entries: &[(String, u16)],
+) -> osslscope::loader::MembersAttached {
+    use osslscope::loader::{MEMBER_MAPS, MEMBER_PROGS};
+    osslscope::loader::ensure_members_fd_budget().expect("synthetic fd budget");
+    let bytes = std::fs::read(obj).expect("synthetic object read");
+    assert!(
+        bytes.len() as u64 <= osslscope::discovery::onboard::MAX_OBJECT_SCAN_BYTES,
+        "synthetic object exceeds onboarding cap"
+    );
+    let prep =
+        osslscope::loader::prepare(&bytes, &MEMBER_MAPS, &MEMBER_PROGS).expect("synthetic prepare");
+    let loaded = osslscope::loader::load(&prep).expect("synthetic load");
+    osslscope::loader::program_ctrl(&loaded.maps, ctrl).expect("synthetic CTRL program");
+    install_synthetic_alg_class(&loaded, entries);
+    let pid = std::process::id();
+    let entry = ossl_bpf_sys::link_create_uprobe_multi(
+        loaded.progs["member_entry"].as_raw_fd(),
+        exe,
+        &[off],
+        &[osslscope_ebpf_common::MEMBER_ENTRY_COOKIE],
+        pid,
+    )
+    .expect("synthetic entry link");
+    let mut members = Vec::with_capacity(512);
+    for j in 0..512u64 {
+        let name = format!("member_{j:03}");
+        members.push(
+            ossl_bpf_sys::link_create_uretprobe_multi(
+                loaded.progs[&name].as_raw_fd(),
+                exe,
+                &[off],
+                &[j],
+                pid,
+            )
+            .expect("synthetic member link"),
+        );
+    }
+    osslscope::loader::MembersAttached {
+        loaded,
+        entry,
+        members,
     }
 }
 
@@ -1433,9 +1561,8 @@ fn run_e7(obj: &std::path::Path, exe: &std::ffi::CString, off: u64, cold: bool) 
     }
     fx.pretouch();
     let temp = "warm";
-    let attached = attach_chunk(obj, exe, off);
+    let attached = attach_chunk_synthetic(obj, exe, off, &fx.classes);
     let loaded = &attached.loaded;
-    populate_alg_class(loaded, &fx.classes);
     FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
     NS_VERDICT.store(0, Ordering::SeqCst);
     let t0 = Instant::now();
@@ -1548,9 +1675,8 @@ fn run_e7_pageout(obj: &std::path::Path, exe: &std::ffi::CString, off: u64, fx: 
     }
     // From here until the drain: touch nothing fixture-backed (any
     // touch re-faults and voids the cold).
-    let attached = attach_chunk(obj, exe, off);
+    let attached = attach_chunk_synthetic(obj, exe, off, &fx.classes);
     let loaded = &attached.loaded;
-    populate_alg_class(loaded, &fx.classes);
     FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
     NS_VERDICT.store(0, Ordering::SeqCst);
     fire(OP as i32, QUERIES);
@@ -1601,9 +1727,8 @@ fn run_null(obj: &std::path::Path, exe: &std::ffi::CString, off: u64) {
     use osslscope_ebpf_common as wire;
     let fx = Fixture::build(&e7_slots(), &[]);
     fx.pretouch();
-    let attached = attach_chunk(obj, exe, off);
+    let attached = attach_chunk_synthetic(obj, exe, off, &fx.classes);
     let loaded = &attached.loaded;
-    populate_alg_class(loaded, &fx.classes);
     NS_VERDICT.store(0, Ordering::SeqCst);
     // Positive control: one live query proves these links fire.
     FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
@@ -1669,9 +1794,8 @@ fn l3_boundaries() {
     {
         let fx = Fixture::build_padded(&[], &[], 513);
         fx.pretouch();
-        let attached = attach_chunk(&obj, &exe, off);
+        let attached = attach_chunk_synthetic(&obj, &exe, off, &fx.classes);
         let loaded = &attached.loaded;
-        populate_alg_class(loaded, &fx.classes);
         FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
         NS_VERDICT.store(0, Ordering::SeqCst);
         fire(OP as i32, 2);
@@ -1706,9 +1830,8 @@ fn l3_boundaries() {
         // Padded: slot-0 asserts stay exact, past-T deterministic.
         let fx = Fixture::build_padded(&slots, &[], 513);
         fx.pretouch();
-        let attached = attach_chunk(&obj, &exe, off);
+        let attached = attach_chunk_synthetic(&obj, &exe, off, &fx.classes);
         let loaded = &attached.loaded;
-        populate_alg_class(loaded, &fx.classes);
         FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
         NS_VERDICT.store(0, Ordering::SeqCst);
         fire(OP as i32, 2);
@@ -1781,11 +1904,10 @@ fn l3_boundaries() {
         // deterministic (no heap soup past the planted tail).
         let fx = Fixture::build_padded(&slots, &tail, 513);
         fx.pretouch();
-        let attached = attach_chunk(&obj, &exe, off);
-        let loaded = &attached.loaded;
         let mut entries = fx.classes.clone();
         entries.extend(tail_classes);
-        populate_alg_class(loaded, &entries);
+        let attached = attach_chunk_synthetic(&obj, &exe, off, &entries);
+        let loaded = &attached.loaded;
         FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
         NS_VERDICT.store(0, Ordering::SeqCst);
         fire(OP as i32, 2);
@@ -1877,9 +1999,8 @@ fn l3_boundaries() {
             SlotSpec::live("M3H1", 101, vec![(42, 0x4601)]),
         ];
         let fx = Fixture::build_padded(&slots, &[], 512);
-        let attached = attach_chunk(&obj, &exe, off);
+        let attached = attach_chunk_synthetic(&obj, &exe, off, &fx.classes);
         let loaded = &attached.loaded;
-        populate_alg_class(loaded, &fx.classes);
         FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
         NS_VERDICT.store(0, Ordering::SeqCst);
         let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
@@ -1932,9 +2053,8 @@ fn l4_dispatch_bounds() {
         // Zero-padded: DISPATCH-clear reflects member 0's clean walk only.
         let fx = Fixture::build_padded(&[SlotSpec::live("M4A", 100, disp)], &[], 512);
         fx.pretouch();
-        let attached = attach_chunk(&obj, &exe, off);
+        let attached = attach_chunk_synthetic(&obj, &exe, off, &fx.classes);
         let loaded = &attached.loaded;
-        populate_alg_class(loaded, &fx.classes);
         FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
         NS_VERDICT.store(0, Ordering::SeqCst);
         fire(OP as i32, 2);
@@ -1988,9 +2108,8 @@ fn l4_dispatch_bounds() {
         let disp: Vec<(u32, u64)> = (0..128u32).map(|k| (5000 + k, 0x9000 + k as u64)).collect();
         let fx = Fixture::build_padded(&[SlotSpec::live("M4E", 100, disp)], &[], 512);
         fx.pretouch();
-        let attached = attach_chunk(&obj, &exe, off);
+        let attached = attach_chunk_synthetic(&obj, &exe, off, &fx.classes);
         let loaded = &attached.loaded;
-        populate_alg_class(loaded, &fx.classes);
         FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
         NS_VERDICT.store(0, Ordering::SeqCst);
         fire(OP as i32, 2);
@@ -2047,9 +2166,8 @@ fn l4_dispatch_bounds() {
         // otherwise join the drain; the overflow bit is OR-folded).
         let fx = Fixture::build_padded(&[slot], &[], 512);
         fx.pretouch();
-        let attached = attach_chunk(&obj, &exe, off);
+        let attached = attach_chunk_synthetic(&obj, &exe, off, &fx.classes);
         let loaded = &attached.loaded;
-        populate_alg_class(loaded, &fx.classes);
         FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
         NS_VERDICT.store(0, Ordering::SeqCst);
         fire(OP as i32, 2);
@@ -2122,9 +2240,8 @@ fn l5_no_store() {
     ];
     let fx = Fixture::build(&slots, &[]);
     fx.pretouch();
-    let attached = attach_chunk(&obj, &exe, off);
+    let attached = attach_chunk_synthetic(&obj, &exe, off, &fx.classes);
     let loaded = &attached.loaded;
-    populate_alg_class(loaded, &fx.classes);
     FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
     NS_VERDICT.store(1, Ordering::SeqCst);
     fire(OP as i32, 2);
@@ -2226,9 +2343,8 @@ fn l6_full_chunk() {
         let fx = Fixture::build(&slots, &[]);
         fx.pretouch();
         eprintln!("l6a fixture temp: {}", fx.temp());
-        let attached = attach_chunk(&obj, &exe, off);
+        let attached = attach_chunk_synthetic(&obj, &exe, off, &fx.classes);
         let loaded = &attached.loaded;
-        populate_alg_class(loaded, &fx.classes);
         FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
         NS_VERDICT.store(0, Ordering::SeqCst);
         let t0 = Instant::now();
@@ -2313,9 +2429,8 @@ fn l6_full_chunk() {
             .collect();
         let fx = Fixture::build(&slots, &[]);
         fx.pretouch();
-        let attached = attach_chunk(&obj, &exe, off);
+        let attached = attach_chunk_synthetic(&obj, &exe, off, &fx.classes);
         let loaded = &attached.loaded;
-        populate_alg_class(loaded, &fx.classes);
         FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
         NS_VERDICT.store(0, Ordering::SeqCst);
         fire(OP as i32, 2);
@@ -2414,15 +2529,14 @@ fn l7_cookie_mismatch() {
     ];
     let fx = Fixture::build(&slots, &[]);
     fx.pretouch();
-    let mut attached = attach_chunk(&obj, &exe, off);
+    let mut attached = attach_chunk_synthetic(&obj, &exe, off, &fx.classes);
     let loaded = &attached.loaded;
-    populate_alg_class(loaded, &fx.classes);
     FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
     NS_VERDICT.store(0, Ordering::SeqCst);
-    // Surgical cookie fault on top of the production attach: drop
+    // Surgical cookie fault on the immutable synthetic fixture attach: drop
     // member_3's correct link (drop = detach) and re-attach the
     // same prog with cookie 7. Same code path as production for
-    // the other 512 links.
+    // the other 512 links' primitive.
     let m3 = ossl_bpf_sys::link_create_uretprobe_multi(
         loaded.progs["member_003"].as_raw_fd(),
         &exe,
@@ -2956,18 +3070,17 @@ fn c_nested_hint() {
     let off = symbol_off("osslscope_member_query_nested");
     let ctrl =
         osslscope::loader::default_ctrl(512, osslscope::loader::MEMBER_RING_BYTES).expect("CTRL");
-    let attached = attach_with_ctrl(&obj, &exe, off, &ctrl);
-    let loaded = &attached.loaded;
     let mut state = BirthState::new();
     let tid = self_tid();
-    register(loaded, &mut state, &[tid]);
     let slots = vec![
         SlotSpec::live("MNH0", 100, vec![(61, 0x6100)]),
         SlotSpec::live("MNH1", 101, vec![(62, 0x6101)]),
     ];
     let fx = Fixture::build_padded(&slots, &[], 513);
     fx.pretouch();
-    populate_alg_class(loaded, &fx.classes);
+    let attached = attach_with_ctrl_synthetic(&obj, &exe, off, &ctrl, &fx.classes);
+    let loaded = &attached.loaded;
+    register(loaded, &mut state, &[tid]);
     FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
     NS_VERDICT.store(0, Ordering::SeqCst);
     fire_nested(OP as i32, 1);
@@ -3827,8 +3940,6 @@ fn d_retire_quiet() {
     let off = query_off();
     // Clean: live E2, two quiet sequential invocations.
     {
-        let attached = attach_chunk(&obj, &exe, off);
-        let loaded = &attached.loaded;
         let tid = self_tid();
         let slots = vec![
             SlotSpec::live("MRQ0", 100, vec![(81, 0x8100)]),
@@ -3839,7 +3950,8 @@ fn d_retire_quiet() {
         // to the 128-member cliff, never exact).
         let fx = Fixture::build_padded(&slots, &[], 513);
         fx.pretouch();
-        populate_alg_class(loaded, &fx.classes);
+        let attached = attach_chunk_synthetic(&obj, &exe, off, &fx.classes);
+        let loaded = &attached.loaded;
         FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
         NS_VERDICT.store(0, Ordering::SeqCst);
         fire(OP as i32, 1);
@@ -3887,15 +3999,14 @@ fn d_retire_quiet() {
     }
     // Whole-array abort: RET still presented + retire.
     {
-        let attached = attach_chunk(&obj, &exe, off);
-        let loaded = &attached.loaded;
         let tid = self_tid();
         let slots = vec![SlotSpec::live("MRQA", 100, vec![(83, 0x8102)])];
         // Neighbor-isolated (R21 finding 8): without guards, slots
         // 128+ read the lane's neighbor mappings post-munmap.
         let fx = Fixture::build_abort_isolated(&slots);
         fx.pretouch();
-        populate_alg_class(loaded, &fx.classes);
+        let attached = attach_chunk_synthetic(&obj, &exe, off, &fx.classes);
+        let loaded = &attached.loaded;
         FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
         NS_VERDICT.store(0, Ordering::SeqCst);
         fire(OP as i32, 1);
@@ -3936,8 +4047,6 @@ fn d_retire_quiet() {
     // NOIMP@3: flag + retire (eligibility ≠ walkability's cousin —
     // NOIMP records and falls through to the epilogue).
     {
-        let attached = attach_chunk(&obj, &exe, off);
-        let loaded = &attached.loaded;
         let tid = self_tid();
         let slots = vec![
             SlotSpec::live("MRQN0", 100, vec![(84, 0x8103)]),
@@ -3950,7 +4059,8 @@ fn d_retire_quiet() {
         // falls through to the epilogue).
         let fx = Fixture::build_padded(&slots, &[], 513);
         fx.pretouch();
-        populate_alg_class(loaded, &fx.classes);
+        let attached = attach_chunk_synthetic(&obj, &exe, off, &fx.classes);
+        let loaded = &attached.loaded;
         FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
         NS_VERDICT.store(0, Ordering::SeqCst);
         fire(OP as i32, 1);
@@ -3996,7 +4106,6 @@ fn d_member_0_last() {
     };
     let exe = own_exe_cstr();
     let off = query_off();
-    let mut attached = attach_chunk(&obj, &exe, off);
     let slots = vec![
         SlotSpec::live("MMZ0", 100, vec![(91, 0x9100)]),
         SlotSpec::live("MMZ1", 101, vec![(92, 0x9101)]),
@@ -4005,10 +4114,10 @@ fn d_member_0_last() {
     // (unpadded past-T reads heap soup to the 128-member cliff).
     let fx = Fixture::build_padded(&slots, &[], 513);
     fx.pretouch();
-    populate_alg_class(&attached.loaded, &fx.classes);
+    let mut attached = attach_chunk_synthetic(&obj, &exe, off, &fx.classes);
     FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
     NS_VERDICT.store(0, Ordering::SeqCst);
-    // Run 1: production attach order.
+    // Run 1: ordinary member link order over the immutable fixture image.
     fire(OP as i32, 1);
     let d1 = drain(&attached.loaded);
     let seq1: Vec<u64> = d1.algs.iter().map(|a| a.idx).collect();
@@ -4072,8 +4181,6 @@ fn d_l3_tail_warm() {
     };
     let exe = own_exe_cstr();
     let off = query_off();
-    let attached = attach_chunk(&obj, &exe, off);
-    let loaded = &attached.loaded;
     let tid = self_tid();
     let slots: Vec<SlotSpec> = (0..3u32)
         .map(|j| {
@@ -4097,7 +4204,8 @@ fn d_l3_tail_warm() {
     entries.extend(tail.iter().map(|s| (s.name.clone(), s.class)));
     let fx = Fixture::build(&slots, &tail);
     fx.pretouch();
-    populate_alg_class(loaded, &entries);
+    let attached = attach_chunk_synthetic(&obj, &exe, off, &entries);
+    let loaded = &attached.loaded;
     FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
     NS_VERDICT.store(0, Ordering::SeqCst);
     // Inject T=3 (gen 0 = live GEN — warm). Pointee is zero, so
@@ -4184,8 +4292,6 @@ fn d_terminator_control() {
     };
     let exe = own_exe_cstr();
     let off = query_off();
-    let attached = attach_chunk(&obj, &exe, off);
-    let loaded = &attached.loaded;
     let tid = self_tid();
     let slots: Vec<SlotSpec> = (0..6u32)
         .map(|j| {
@@ -4198,7 +4304,8 @@ fn d_terminator_control() {
         .collect();
     let fx = Fixture::build(&slots, &[]);
     fx.pretouch();
-    populate_alg_class(loaded, &fx.classes);
+    let attached = attach_chunk_synthetic(&obj, &exe, off, &fx.classes);
+    let loaded = &attached.loaded;
     // Poison slot 3's names pointer (tuple stays readable — imp
     // live — so member 3 attempts the name read and fails it).
     unsafe {
@@ -4308,8 +4415,6 @@ fn d_gen_stale_smaller() {
     };
     let exe = own_exe_cstr();
     let off = query_off();
-    let attached = attach_chunk(&obj, &exe, off);
-    let loaded = &attached.loaded;
     let tid = self_tid();
     let slots: Vec<SlotSpec> = (0..6u32)
         .map(|j| {
@@ -4324,7 +4429,8 @@ fn d_gen_stale_smaller() {
     // (unpadded past-T reads heap soup to the 128-member cliff).
     let fx = Fixture::build_padded(&slots, &[], 513);
     fx.pretouch();
-    populate_alg_class(loaded, &fx.classes);
+    let attached = attach_chunk_synthetic(&obj, &exe, off, &fx.classes);
+    let loaded = &attached.loaded;
     FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
     NS_VERDICT.store(0, Ordering::SeqCst);
     // Stale entry: T=3 with generation 99 (live GEN is 0) —
@@ -4386,8 +4492,6 @@ fn d_no_store_prefix() {
     };
     let exe = own_exe_cstr();
     let off = query_off();
-    let attached = attach_chunk(&obj, &exe, off);
-    let loaded = &attached.loaded;
     let tid = self_tid();
     let slots: Vec<SlotSpec> = (0..7u32)
         .map(|j| {
@@ -4405,7 +4509,8 @@ fn d_no_store_prefix() {
     // (READ/NOIMP/NAME soup + silent aborts past member 128).
     let fx = Fixture::build_padded(&slots, &[], 512);
     fx.pretouch();
-    populate_alg_class(loaded, &fx.classes);
+    let attached = attach_chunk_synthetic(&obj, &exe, off, &fx.classes);
+    let loaded = &attached.loaded;
     FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
     // Unreadable pointee: mapped but faulting (PROT_NONE).
     let _prot_none = ProtNonePage(map_prot_none());
@@ -4571,8 +4676,6 @@ fn d_guard_cold_error() {
     };
     let exe = own_exe_cstr();
     let off = query_off();
-    let attached = attach_chunk(&obj, &exe, off);
-    let loaded = &attached.loaded;
     let tid = self_tid();
     let slots: Vec<SlotSpec> = (0..512u32)
         .map(|j| {
@@ -4590,7 +4693,8 @@ fn d_guard_cold_error() {
     // 512 and name storage, faulting name reads into WALK_NAME).
     let fx = Fixture::build_padded(&slots, &[], 640);
     fx.pretouch();
-    populate_alg_class(loaded, &fx.classes);
+    let attached = attach_chunk_synthetic(&obj, &exe, off, &fx.classes);
+    let loaded = &attached.loaded;
     let page = 4096usize;
     assert_eq!(fx.array as usize % page, 0, "array page-aligned");
     assert_eq!(640 * 32 % page, 0, "names start on page 5");
@@ -4652,12 +4756,11 @@ fn d_guard_warm_512() {
         .collect();
     // EMPTY: 512 live + term@512, warm T=512.
     {
-        let attached = attach_chunk(&obj, &exe, off);
-        let loaded = &attached.loaded;
         let tid = self_tid();
         let fx = Fixture::build(&live512, &[]);
         fx.pretouch();
-        populate_alg_class(loaded, &fx.classes);
+        let attached = attach_chunk_synthetic(&obj, &exe, off, &fx.classes);
+        let loaded = &attached.loaded;
         FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
         NS_VERDICT.store(0, Ordering::SeqCst);
         write_tcache(loaded, fx.array, 512, 0);
@@ -4676,14 +4779,13 @@ fn d_guard_warm_512() {
     }
     // VALID: 513 live, warm T=512.
     {
-        let attached = attach_chunk(&obj, &exe, off);
-        let loaded = &attached.loaded;
         let tid = self_tid();
         let mut slots513 = live512.clone();
         slots513.push(SlotSpec::live("MDH513", 612, vec![(7513, 0xA513)]));
         let fx = Fixture::build(&slots513, &[]);
         fx.pretouch();
-        populate_alg_class(loaded, &fx.classes);
+        let attached = attach_chunk_synthetic(&obj, &exe, off, &fx.classes);
+        let loaded = &attached.loaded;
         FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
         NS_VERDICT.store(0, Ordering::SeqCst);
         write_tcache(loaded, fx.array, 512, 0);
@@ -4704,14 +4806,13 @@ fn d_guard_warm_512() {
     }
     // NOIMP@511: guard still executes (eligibility ≠ walkability).
     {
-        let attached = attach_chunk(&obj, &exe, off);
-        let loaded = &attached.loaded;
         let tid = self_tid();
         let mut slots = live512.clone();
         slots[511] = SlotSpec::noimp("MDH511N", 611);
         let fx = Fixture::build(&slots, &[]);
         fx.pretouch();
-        populate_alg_class(loaded, &fx.classes);
+        let attached = attach_chunk_synthetic(&obj, &exe, off, &fx.classes);
+        let loaded = &attached.loaded;
         FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
         NS_VERDICT.store(0, Ordering::SeqCst);
         write_tcache(loaded, fx.array, 512, 0);
@@ -4758,12 +4859,11 @@ fn d_idle_record_silence() {
     };
     let exe = own_exe_cstr();
     let off = query_off();
-    let mut attached = attach_chunk(&obj, &exe, off);
     let tid = self_tid();
     let slots = vec![SlotSpec::live("MDI0", 100, vec![(95, 0x9500)])];
     let fx = Fixture::build(&slots, &[]);
     fx.pretouch();
-    populate_alg_class(&attached.loaded, &fx.classes);
+    let mut attached = attach_chunk_synthetic(&obj, &exe, off, &fx.classes);
     FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
     NS_VERDICT.store(0, Ordering::SeqCst);
     // Program the failed-delete marker: record + IDLE|0.
@@ -4922,12 +5022,11 @@ fn d_detach_stall() {
     };
     let exe = own_exe_cstr();
     let off = query_off();
-    let mut attached = attach_chunk(&obj, &exe, off);
     let tid = self_tid();
     let slots = vec![SlotSpec::live("MDD0", 100, vec![(96, 0x9600)])];
     let fx = Fixture::build(&slots, &[]);
     fx.pretouch();
-    populate_alg_class(&attached.loaded, &fx.classes);
+    let mut attached = attach_chunk_synthetic(&obj, &exe, off, &fx.classes);
     FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
     NS_VERDICT.store(0, Ordering::SeqCst);
     // Detach member 7 (EXPECTED stays 512 — the retire equation
@@ -4980,12 +5079,11 @@ fn d_bump_blocked_clean_retire() {
     };
     let exe = own_exe_cstr();
     let off = symbol_off("osslscope_member_query_blocking");
-    let attached = attach_chunk(&obj, &exe, off);
-    let loaded = &attached.loaded;
     let slots = vec![SlotSpec::live("MDB0", 100, vec![(97, 0x9700)])];
     let fx = Fixture::build(&slots, &[]);
     fx.pretouch();
-    populate_alg_class(loaded, &fx.classes);
+    let attached = attach_chunk_synthetic(&obj, &exe, off, &fx.classes);
+    let loaded = &attached.loaded;
     FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
     NS_VERDICT.store(0, Ordering::SeqCst);
     let mut fds = [0i32; 2];
@@ -5204,8 +5302,6 @@ fn d_burst_exactness() {
     let off = query_off();
     // (a) Burst: 3 full scans, no drain between.
     {
-        let attached = attach_chunk(&obj, &exe, off);
-        let loaded = &attached.loaded;
         let tid = self_tid();
         let slots: Vec<SlotSpec> = (0..512u32)
             .map(|j| {
@@ -5218,7 +5314,8 @@ fn d_burst_exactness() {
             .collect();
         let fx = Fixture::build(&slots, &[]);
         fx.pretouch();
-        populate_alg_class(loaded, &fx.classes);
+        let attached = attach_chunk_synthetic(&obj, &exe, off, &fx.classes);
+        let loaded = &attached.loaded;
         FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
         NS_VERDICT.store(0, Ordering::SeqCst);
         fire(OP as i32, 3);
@@ -5328,11 +5425,7 @@ fn d_drop_path_reservation() {
     // so the governor cannot trip (cause 4 impossible by
     // construction — drops prove reservation failure, only it).
     let ctrl = wire::ctrl_value(512, 1, osslscope::loader::MEMBER_RING_BYTES);
-    let attached = attach_with_ctrl(&obj, &exe, off, &ctrl);
-    let loaded = &attached.loaded;
     let tid = self_tid();
-    let mut births = BirthState::new();
-    register(loaded, &mut births, &[tid]);
     let slots: Vec<SlotSpec> = (0..LIVE as u32)
         .map(|j| {
             SlotSpec::live(
@@ -5346,7 +5439,10 @@ fn d_drop_path_reservation() {
     // every scan emits exactly 512 ALGs: 6 live + 506 EMPTY).
     let fx = Fixture::build_padded(&slots, &[], 512);
     fx.pretouch();
-    populate_alg_class(loaded, &fx.classes);
+    let attached = attach_with_ctrl_synthetic(&obj, &exe, off, &ctrl, &fx.classes);
+    let loaded = &attached.loaded;
+    let mut births = BirthState::new();
+    register(loaded, &mut births, &[tid]);
     FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
     NS_VERDICT.store(0, Ordering::SeqCst);
     fire_paced(OP as i32, N, 30);
@@ -5665,14 +5761,21 @@ fn d_selective_scope() {
     register(loaded, &mut state, &[self_tid()]);
     let tid = self_tid();
     let slots = vec![
-        SlotSpec::live("MS0", 101, vec![(21, 0x4200)]),
-        SlotSpec::live("MS1", 102, vec![(22, 0x4300)]),
+        SlotSpec::live(
+            osslscope::kinds::ALG_NAMES[101].name,
+            101,
+            vec![(21, 0x4200)],
+        ),
+        SlotSpec::live(
+            osslscope::kinds::ALG_NAMES[102].name,
+            102,
+            vec![(22, 0x4300)],
+        ),
     ];
     // Padded: slot 3 reads past-T zero (an unpadded array feeds
     // slot 3 names-blob bytes → UNREADABLE, not EMPTY).
     let fx = Fixture::build_padded(&slots, &[], 513);
     fx.pretouch();
-    populate_alg_class(loaded, &fx.classes);
     FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
     NS_VERDICT.store(0, Ordering::SeqCst);
     fire(OP as i32, 1);
@@ -5731,12 +5834,19 @@ fn d_selective_scope() {
         register(loaded, &mut state, &[self_tid()]);
         let tid = self_tid();
         let slots = vec![
-            SlotSpec::live("MSR0", 101, vec![(21, 0x4200)]),
-            SlotSpec::live("MSR1", 102, vec![(22, 0x4300)]),
+            SlotSpec::live(
+                osslscope::kinds::ALG_NAMES[101].name,
+                101,
+                vec![(21, 0x4200)],
+            ),
+            SlotSpec::live(
+                osslscope::kinds::ALG_NAMES[102].name,
+                102,
+                vec![(22, 0x4300)],
+            ),
         ];
         let fx = Fixture::build_padded(&slots, &[], 513);
         fx.pretouch();
-        populate_alg_class(loaded, &fx.classes);
         FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
         NS_VERDICT.store(0, Ordering::SeqCst);
         fire(OP as i32, 1);
@@ -5777,8 +5887,6 @@ fn d_drain_floor() {
     };
     let exe = own_exe_cstr();
     let off = query_off();
-    let attached = attach_chunk(&obj, &exe, off);
-    let loaded = &attached.loaded;
     let slots: Vec<SlotSpec> = (0..512u32)
         .map(|j| {
             SlotSpec::live(
@@ -5790,7 +5898,8 @@ fn d_drain_floor() {
         .collect();
     let fx = Fixture::build(&slots, &[]);
     fx.pretouch();
-    populate_alg_class(loaded, &fx.classes);
+    let attached = attach_chunk_synthetic(&obj, &exe, off, &fx.classes);
+    let loaded = &attached.loaded;
     FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
     NS_VERDICT.store(0, Ordering::SeqCst);
     let mut total_bytes: u64 = 0;
@@ -6085,8 +6194,6 @@ fn d_trunc_lossless_deltas() {
     };
     let exe = own_exe_cstr();
     let off = query_off();
-    let attached = attach_chunk(&obj, &exe, off);
-    let loaded = &attached.loaded;
     let tid = self_tid();
     let slots = vec![
         SlotSpec::live("TSG0", 100, vec![(300, 0x4400)]),
@@ -6096,7 +6203,8 @@ fn d_trunc_lossless_deltas() {
     ];
     let fx = Fixture::build_padded(&slots, &[], 513);
     fx.pretouch();
-    populate_alg_class(loaded, &fx.classes);
+    let attached = attach_chunk_synthetic(&obj, &exe, off, &fx.classes);
+    let loaded = &attached.loaded;
     FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
     NS_VERDICT.store(0, Ordering::SeqCst);
     fire(OP as i32, 1);
@@ -6184,9 +6292,8 @@ fn d_trunc_lossless_deltas() {
     // (no read-modify-write anywhere — no lost increments, no
     // stale-writer rollback, deterministically).
     {
-        let attached2 = attach_chunk(&obj, &exe, off);
+        let attached2 = attach_chunk_synthetic(&obj, &exe, off, &fx.classes);
         let loaded2 = &attached2.loaded;
-        populate_alg_class(loaded2, &fx.classes);
         FIXTURE_ARRAY.store(fx.array, Ordering::SeqCst);
         let barrier = std::sync::Barrier::new(3);
         let tids = std::sync::Mutex::new(Vec::new());
@@ -6290,8 +6397,6 @@ fn d_warm_boundary_proof() {
     };
     let exe = own_exe_cstr();
     let off = query_off();
-    let attached = attach_chunk(&obj, &exe, off);
-    let loaded = &attached.loaded;
     let tid = self_tid();
     // Cell 1: slots 0..=3 live, terminator at 4 (cached T=3).
     let slots1: Vec<SlotSpec> = (0..4u32)
@@ -6305,7 +6410,38 @@ fn d_warm_boundary_proof() {
         .collect();
     let fx1 = Fixture::build_padded(&slots1, &[], 513);
     fx1.pretouch();
-    populate_alg_class(loaded, &fx1.classes);
+    // All three fire images use disjoint WBP/WBQ/WBR names. Installing
+    // their union changes no earlier lookup: hash+length+bytes match only
+    // the currently selected fixture array, and no key is reassigned.
+    let slots2: Vec<SlotSpec> = (0..6u32)
+        .map(|j| {
+            SlotSpec::live(
+                &format!("WBQ{j}"),
+                200 + j as u16,
+                vec![(400 + j, 0x5500 + j as u64)],
+            )
+        })
+        .collect();
+    let slots3: Vec<SlotSpec> = (0..127u32)
+        .map(|j| {
+            SlotSpec::live(
+                &format!("WBR{j}"),
+                300 + (j % 200) as u16,
+                vec![(600 + j, 0x6600 + j as u64)],
+            )
+        })
+        .collect();
+    let mut union_entries = fx1.classes.clone();
+    union_entries.extend(slots2.iter().map(|s| (s.name.clone(), s.class)));
+    union_entries.extend(slots3.iter().map(|s| (s.name.clone(), s.class)));
+    let mut unique_names = HashSet::new();
+    assert!(
+        union_entries
+            .iter()
+            .all(|(name, _)| unique_names.insert(name.clone()))
+    );
+    let attached = attach_chunk_synthetic(&obj, &exe, off, &union_entries);
+    let loaded = &attached.loaded;
     FIXTURE_ARRAY.store(fx1.array, Ordering::SeqCst);
     NS_VERDICT.store(0, Ordering::SeqCst);
     write_tcache(loaded, fx1.array, 3, 0);
@@ -6332,18 +6468,8 @@ fn d_warm_boundary_proof() {
         "warm-boundary-1: TRUNC clean"
     );
     // Cell 2: slots 0..=5 live, terminator at 6 (cached T=3).
-    let slots2: Vec<SlotSpec> = (0..6u32)
-        .map(|j| {
-            SlotSpec::live(
-                &format!("WBQ{j}"),
-                200 + j as u16,
-                vec![(400 + j, 0x5500 + j as u64)],
-            )
-        })
-        .collect();
     let fx2 = Fixture::build_padded(&slots2, &[], 513);
     fx2.pretouch();
-    populate_alg_class(loaded, &fx2.classes);
     pace_fire_gap();
     clear_trunc(loaded, "warm-boundary-2");
     FIXTURE_ARRAY.store(fx2.array, Ordering::SeqCst);
@@ -6376,21 +6502,11 @@ fn d_warm_boundary_proof() {
     // with NO flag (the walked terminator at 127 stands), so a
     // valid warm table Completes instead of Partialling on a
     // phantom READ.
-    let slots3: Vec<SlotSpec> = (0..127u32)
-        .map(|j| {
-            SlotSpec::live(
-                &format!("WBR{j}"),
-                300 + (j % 200) as u16,
-                vec![(600 + j, 0x6600 + j as u64)],
-            )
-        })
-        .collect();
     // Array spans exactly 2 pages (256 cells); names/dispatch
     // live on page 2+. Unmapping page 1 takes slots 128..255
     // (T+1 inaccessible) and nothing else.
     let fx3 = Fixture::build_padded(&slots3, &[], 256);
     fx3.pretouch();
-    populate_alg_class(loaded, &fx3.classes);
     pace_fire_gap();
     clear_trunc(loaded, "warm-boundary-3");
     FIXTURE_ARRAY.store(fx3.array, Ordering::SeqCst);
