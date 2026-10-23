@@ -5431,6 +5431,7 @@ enum WriterStage {
     GenerationRead,
     ExistingLookup,
     FreshInsert,
+    CountIncremented,
     CountOrDrop,
     BeforeLatc,
     LastMutation,
@@ -5621,8 +5622,20 @@ impl StagedWriter {
                         row.first_ns = call.sample_ns;
                     }
                     row.count += 1;
-                    row.last_ns = call.sample_ns;
                 }
+            }
+            // Model bump's separate count and last-time stores. Releasing
+            // the map lock lets the real owner reader observe that interval.
+            writer.at(WriterStage::CountIncremented, hold_enabled);
+            if !call.fail_insert {
+                writer
+                    .cpu_maps(call.cpu)
+                    .lock()
+                    .unwrap()
+                    .rows
+                    .get_mut(&key)
+                    .unwrap()
+                    .last_ns = call.sample_ns;
             }
             writer.at(WriterStage::CountOrDrop, hold_enabled);
             if call.fresh {
@@ -6451,6 +6464,106 @@ fn g1_terminal_physical_sites_cpus_and_generation_routing() {
             );
         }
     }
+}
+
+fn assert_fwr_i1_equal_count_terminal(fenced: bool) {
+    let writer = StagedWriter::new(Some(WriterStage::CountIncremented));
+    let probe = MapProbe::new();
+    let mut session = crate::count_session::CountSession::new(
+        1,
+        session_owner_port(&probe, Some(Arc::clone(&writer)), TerminalFaults::default()),
+    );
+    let plan = SessionPlan::new(1);
+    plan.attach(&mut session, 7);
+    session
+        .open_window(1000, 2000, Instant::now() + Duration::from_secs(5))
+        .unwrap();
+    writer
+        .run_physical(
+            PhysicalCall {
+                site: 0,
+                cpu: 0,
+                sample_ns: 1100,
+                fresh: true,
+                fail_insert: false,
+            },
+            false,
+        )
+        .join()
+        .unwrap();
+    let producer = writer.run_physical(
+        PhysicalCall {
+            site: 0,
+            cpu: 0,
+            sample_ns: 1500,
+            fresh: false,
+            fail_insert: false,
+        },
+        true,
+    );
+    writer.wait_at(WriterStage::CountIncremented);
+    let before = crate::count_session::tests::read_for_fixture(
+        &mut session,
+        Instant::now() + Duration::from_secs(5),
+    );
+    assert_eq!(
+        (
+            before.current[0].calls,
+            before.current[0].first_ns,
+            before.current[0].last_ns
+        ),
+        (2, 1100, 1100)
+    );
+    let original_candidates = before.current[0].candidates.clone();
+    if fenced {
+        plan.attach(&mut session, 9);
+        session
+            .fence(
+                crate::count_session::FenceReason::CandidatesChanged,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap();
+    }
+    writer.release();
+    producer.join().unwrap();
+    let terminal = session.terminal_shared(session_close());
+    assert!(matches!(
+        terminal.receipt.writers,
+        WriterCompletion::Finished(_)
+    ));
+    assert_eq!(terminal.retained_drain.total_calls(), 2);
+    let rows = if fenced {
+        &terminal.retained_drain.fenced[0].sites
+    } else {
+        &terminal.retained_drain.current
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].candidates, original_candidates);
+    assert_eq!(rows[0].generation, 0);
+    assert_eq!(
+        (rows[0].calls, rows[0].first_ns, rows[0].last_ns),
+        (2, 1100, 1500),
+        "fenced={fenced}: equal count must retain the completed callback's actual last-time store"
+    );
+    assert_eq!(writer.ledger.admitted_calls(), 2);
+    assert_eq!(session.backend().terminal_calls, 1);
+    assert!(Arc::ptr_eq(
+        &terminal,
+        &session.terminal_shared(session_close())
+    ));
+    task3_cleanup(&probe.owner, 10);
+    println!(
+        "FWR-I1 fenced={fenced}: ordinary=(2,1100,1100), terminal=(2,1100,1500), original candidates retained"
+    );
+}
+
+#[test]
+fn fwr_i1_equal_count_terminal_refines_current_physical_timestamps() {
+    assert_fwr_i1_equal_count_terminal(false);
+}
+#[test]
+fn fwr_i1_equal_count_terminal_refines_fenced_physical_timestamps() {
+    assert_fwr_i1_equal_count_terminal(true);
 }
 
 #[test]

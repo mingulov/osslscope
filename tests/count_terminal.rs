@@ -159,7 +159,7 @@ struct Scripted {
     lose_open: bool,
     lose_attach: bool,
     replay: Option<Arc<RawSnapshot>>,
-    foreign: bool,
+    foreign: Option<FakeCountBackend>,
     prefixes: Vec<(u32, u32, CountValue)>,
     calls: Rc<Cell<u32>>,
     attach_sizes: Vec<usize>,
@@ -229,8 +229,7 @@ impl CountBackend for Scripted {
             self.inner.inject_row(cookie, generation, delta);
             self.inner.publish_checkpoint().unwrap();
         }
-        if self.foreign {
-            let mut foreign = FakeCountBackend::new();
+        if let Some(foreign) = self.foreign.as_mut() {
             let request = foreign.terminal_request(request.deadline, ControllerFrontier::default());
             foreign.terminal(request)
         } else {
@@ -633,6 +632,13 @@ fn g1_component_high_water_and_stale_images_never_invent_samples() {
     s.fence(FenceReason::MappingsChanged, deadline()).unwrap();
     let t = s.terminal(close());
     assert_eq!(t.retained_drain.total_calls(), 2);
+    assert_eq!(
+        (
+            t.retained_drain.fenced[0].sites[0].first_ns,
+            t.retained_drain.fenced[0].sites[0].last_ns
+        ),
+        (1100, 1100)
+    );
     assert_eq!(counter(&t.retained_drain, "count.lat_bucket_00"), Some(2));
     assert_eq!(counter(&t.retained_drain, "count.lat_bucket_07"), None);
     assert_eq!(counter(&t.retained_drain, "count.lat_bucket_01"), Some(0));
@@ -665,11 +671,60 @@ fn g1_saturated_totals_and_histogram_do_not_wrap() {
     assert_eq!(counter(&t.retained_drain, "count.ledger_delta"), Some(0));
 }
 #[test]
+fn fwr_i1_saturated_equal_count_refines_fenced_timestamp_once() {
+    let f = Fixture::new(1);
+    let mut s = CountSession::new(PID, Scripted::default());
+    f.attach(&mut s, 7).unwrap();
+    s.open_window(1000, 2000, deadline()).unwrap();
+    let cookie = f.cookie(&s, 0);
+    s.backend_mut().inner.fire(PID, cookie, 1100, u64::MAX);
+    s.fence(FenceReason::MappingsChanged, deadline()).unwrap();
+    let candidates = f.delta(7).discovered[0].candidates.clone();
+    // Cumulative count stays saturated while a newer image adds actual time.
+    s.backend_mut()
+        .inner
+        .inject_row(cookie, 0, value(1, 1050, 1500));
+    let terminal = s.terminal_shared(close());
+    assert_eq!(terminal.retained_drain.total_calls(), u64::MAX);
+    let row = &terminal.retained_drain.fenced[0].sites[0];
+    assert_eq!((row.first_ns, row.last_ns), (1050, 1500));
+    assert_eq!(row.candidates, candidates);
+    assert_eq!(
+        counter(&terminal.retained_drain, "count.stale_events"),
+        Some(0)
+    );
+    assert_eq!(
+        counter(&terminal.retained_drain, "count.ledger_delta"),
+        Some(0)
+    );
+    assert!(Arc::ptr_eq(&terminal, &s.terminal_shared(close())));
+    assert_eq!(s.backend().calls.get(), 1);
+}
+
+#[test]
 fn g1_foreign_terminal_cannot_replace_retained_provenance() {
     let f = Fixture::new(1);
     let mut s = staged_current_and_fenced(&f);
-    s.backend_mut().foreign = true;
+    let mut foreign = FakeCountBackend::new();
+    let cookie = f.cookie(&s, 0);
+    foreign.inject_row(cookie, 0, value(11, 1001, 1999));
+    foreign.inject_row(cookie, 1, value(7, 1001, 1999));
+    s.backend_mut().foreign = Some(foreign);
     let t = s.terminal(close());
+    assert_eq!(
+        (
+            t.retained_drain.fenced[0].sites[0].first_ns,
+            t.retained_drain.fenced[0].sites[0].last_ns
+        ),
+        (1100, 1100)
+    );
+    assert_eq!(
+        (
+            t.retained_drain.current[0].first_ns,
+            t.retained_drain.current[0].last_ns
+        ),
+        (1200, 1300)
+    );
     assert_eq!(t.retained_drain.total_calls(), 18);
     assert!(t.runtime_failure.is_some());
     assert_eq!(

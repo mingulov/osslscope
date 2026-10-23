@@ -5459,6 +5459,23 @@ where
         }
     }
 
+    /// Freeze the observation-loop close decision before any post-loop I/O.
+    /// The owner's later TARGET seal and count coverage remain separate facts.
+    fn freeze_lifecycle_edge(&mut self) -> LifecycleEdge {
+        if let Some(edge) = self.original_lifecycle_edge {
+            return edge;
+        }
+        let end_ns = self
+            .clock
+            .checked_monotonic_ns()
+            .filter(|ns| *ns >= self.last_established_ns)
+            .map(|ns| ns.min(self.kernel_deadline_ns))
+            .unwrap_or(self.last_established_ns.min(self.kernel_deadline_ns));
+        let edge = self.lifecycle_edge(end_ns);
+        self.original_lifecycle_edge = Some(edge);
+        edge
+    }
+
     fn fold_lifecycle(&mut self, delta: &LifecycleDelta) {
         self.fold_lifecycle_at(delta, self.lifecycle_edge(self.kernel_deadline_ns));
     }
@@ -5732,12 +5749,7 @@ where
             .lifecycle_exec_gap
             .saturating_add(std::mem::replace(&mut self.pending_exec_obligation, 0));
         if self.must_salvage_requested_window() {
-            let effective_end_ns = self
-                .clock
-                .checked_monotonic_ns()
-                .filter(|ns| *ns >= self.last_established_ns)
-                .map(|ns| ns.min(self.kernel_deadline_ns))
-                .unwrap_or(self.last_established_ns.min(self.kernel_deadline_ns));
+            let effective_end_ns = self.freeze_lifecycle_edge().end_ns;
             // R12: the single close sample, alongside the monotonic
             // end stamp — reused by the document and the Capture.
             self.wall_end = self.clock.wall_now();
@@ -5745,7 +5757,6 @@ where
                 self.info.owned,
                 self.child_exit.is_some() && !self.expired,
             );
-            self.original_lifecycle_edge = Some(self.lifecycle_edge(effective_end_ns));
             return self.salvage(
                 SalvageSeed {
                     terminal: None,
@@ -6824,6 +6835,7 @@ where
                 Err(e) => return self.fail(e),
             }
         }
+        self.freeze_lifecycle_edge();
         self.close_and_finalize()
     }
 
@@ -6861,6 +6873,7 @@ where
     }
 
     fn close_and_finalize(mut self) -> anyhow::Result<Capture> {
+        let original_lifecycle_edge = self.freeze_lifecycle_edge();
         // Last pre-reap settle: the expiry poll and the final
         // disposition below can reap, ending post-hoc comm reads.
         self.settle_comm();
@@ -6917,13 +6930,11 @@ where
         // below, salvage assembles from this pre-state (no polls run
         // between here and finish, so it stays valid; a failed
         // finish takes the live session).
-        let original_lifecycle_edge = self.lifecycle_edge(effective_end_ns);
         self.owned_exit_before_read = OwnedExitBeforeRead::establish(
             self.info.owned,
             self.child_exit.is_some() && !self.expired,
         );
         let pre_finish = self.discovery.snapshot();
-        self.original_lifecycle_edge = Some(original_lifecycle_edge);
         let terminal = self.ensure_count_terminal(self.close_reason());
         if let Some(failure) = terminal.runtime_failure {
             return self.salvage(
@@ -9289,14 +9300,36 @@ fn run_inner(
             )
         }
     };
-    // v0.2: every production run records its run-set selection —
-    // on the capture and its document alike (post-hoc: the Runner
-    // never sees it, so `observe` keeps its signature for the
-    // stubbed tests, which honestly carry `None`).
-    let mut cap = cap?;
-    cap.selected_objects = selected_objects.clone();
-    cap.document.selected_objects = selected_objects;
-    Ok(cap)
+    decorate_capture_result(cap, selected_objects)
+}
+
+// One production boundary for the resolved run-set metadata. Runner fixtures
+// resolve no objects; run_inner supplies the actual selection here.
+fn decorate_capture_result(
+    cap: anyhow::Result<Capture>,
+    selected_objects: Option<evidence::RunSetProvenance>,
+) -> anyhow::Result<Capture> {
+    let mut cap = cap;
+    let capture = match &mut cap {
+        Ok(capture) => capture,
+        Err(error) => {
+            let Some(runtime) = error.downcast_mut::<CaptureRuntimeFailure>() else {
+                // Unresolved setup has no finalized production capture.
+                return cap;
+            };
+            // assemble creates this Arc immediately before returning the typed
+            // error. Binding/failure contexts retain only the terminal Arc;
+            // run_inner has not published or cloned the Capture at this point.
+            // Refuse an unexpected publication instead of cloning growing rows.
+            let Some(capture) = Arc::get_mut(&mut runtime.capture) else {
+                return cap.context("run-set provenance unavailable: Runtime capture was shared before production decoration");
+            };
+            capture
+        }
+    };
+    capture.selected_objects = selected_objects.clone();
+    capture.document.selected_objects = selected_objects;
+    cap
 }
 
 #[cfg(test)]
@@ -14411,6 +14444,285 @@ mod tests {
                 expected,
                 "binding error copied the selected current/fenced/candidate allocations"
             );
+        }
+
+        #[test]
+        fn fwr_i1_saturated_current_timestamp_bounds_do_not_wrap() {
+            let mut session = CountSession::new(TPID, FakeCountBackend::new());
+            let _seed = seed_site(&mut session);
+            session.backend_mut().fire(TPID, 0, 1500, u64::MAX);
+            let before = crate::count_session::tests::read_for_fixture(
+                &mut session,
+                Instant::now() + Duration::from_secs(5),
+            );
+            assert_eq!(
+                (
+                    before.current[0].calls,
+                    before.current[0].first_ns,
+                    before.current[0].last_ns
+                ),
+                (u64::MAX, 1500, 1500)
+            );
+            session.backend_mut().inject_row(
+                0,
+                0,
+                osslscope_ebpf_common::CountValue {
+                    count: 1,
+                    first_ns: 1400,
+                    last_ns: 1700,
+                },
+            );
+            let request = crate::count_session::CloseRequest {
+                started_at: Instant::now(),
+                grace: Duration::from_secs(1),
+                reason: crate::count_session::CloseReason::Failure,
+            };
+            let terminal = session.terminal_shared(request);
+            assert_eq!(terminal.retained_drain.total_calls(), u64::MAX);
+            let row = &terminal.retained_drain.current[0];
+            assert_eq!((row.first_ns, row.last_ns), (1400, 1700));
+            assert_eq!(row.candidates, before.current[0].candidates);
+            for name in ["count.stale_events", "count.ledger_delta"] {
+                assert_eq!(
+                    terminal
+                        .retained_drain
+                        .counters
+                        .iter()
+                        .find(|c| c.name == name)
+                        .map(|c| c.value),
+                    Some(0)
+                );
+            }
+            assert!(Arc::ptr_eq(&terminal, &session.terminal_shared(request)));
+        }
+
+        fn assert_fwr_i3_runtime_selection(triple: bool, check: bool) {
+            let cfg = stub_config();
+            let mut info = stub_info();
+            info.acquired_ns = 1550;
+            let clock = ClockStub::at(1700);
+            let mut proc = ProcStub;
+            let cancelled = || false;
+            let (count, seed, backing) = t9_i1_seed_terminal();
+            let mut runner = stub_runner(
+                &cfg,
+                &info,
+                DiscoveryStub {
+                    finish_err: false,
+                    poll_err: false,
+                    dispatch_attached: true,
+                    trip_set: None,
+                },
+                count,
+                &clock,
+                &mut proc,
+                &cancelled,
+            );
+            let (device, inode) = seed.identity();
+            push_seed_objects(&mut runner, device, inode);
+            let result = runner
+                .close_and_finalize()
+                .context(std::io::Error::from_raw_os_error(libc::EIO))
+                .context("outer post-observation context");
+            let before = result
+                .as_ref()
+                .unwrap_err()
+                .downcast_ref::<CaptureRuntimeFailure>()
+                .unwrap();
+            let terminal = before.terminal.clone().unwrap();
+            let sites_ptr = before.capture.document.sites.as_ptr();
+            let selected = evidence::RunSetProvenance {
+                harvest: evidence::TraversalObject {
+                    path: "/resolved/harvest.o".into(),
+                    sha256: "a".repeat(64),
+                },
+                count: evidence::TraversalObject {
+                    path: "/resolved/count.o".into(),
+                    sha256: "b".repeat(64),
+                },
+                members: triple.then(|| evidence::TraversalObject {
+                    path: "/resolved/members.o".into(),
+                    sha256: "c".repeat(64),
+                }),
+            };
+            let result = decorate_capture_result(result, Some(selected.clone()));
+            let error = result.as_ref().unwrap_err();
+            assert!(format!("{error:#}").contains("outer post-observation context"));
+            assert_eq!(
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .unwrap()
+                    .raw_os_error(),
+                Some(libc::EIO)
+            );
+            assert_eq!(
+                error.downcast_ref::<WindowBindingFailure>().unwrap().reason,
+                WindowBindingReason::PreRequestedRow
+            );
+            let runtime = error.downcast_ref::<CaptureRuntimeFailure>().unwrap();
+            assert_eq!(runtime.kind, RuntimeBoundaryKind::WindowBinding);
+            assert_eq!(
+                runtime.capture.selected_objects,
+                Some(selected.clone()),
+                "production Runtime capture lost resolved pair/triple; triple={triple} check={check}"
+            );
+            assert_eq!(
+                runtime.capture.document.selected_objects,
+                Some(selected.clone())
+            );
+            assert_eq!(
+                runtime.capture.document.sites.as_ptr(),
+                sites_ptr,
+                "metadata decoration cloned positive rows"
+            );
+            assert!(Arc::ptr_eq(runtime.terminal.as_ref().unwrap(), &terminal));
+            assert_eq!(
+                crate::count_session::tests::terminal_storage_identity(&terminal),
+                backing
+            );
+            assert_eq!(runtime.capture.document.total_calls(), 3);
+            let rules = [crate::policy::PolicyRule::deny_provider("default")];
+            let policy = crate::policy::evaluate_document(&rules, &runtime.capture.document);
+            assert_eq!(policy.overall(), crate::policy::PolicyOutcome::Violation);
+            assert_eq!(policy.rules[0].bounds.definite, 3);
+            let dir = std::env::temp_dir().join(format!(
+                "osslscope-fwr-i3-{}-{triple}-{check}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let request = crate::report::OutputRequest {
+                format: crate::report::OutputFormat::Json,
+                primary: crate::report::OutputDest::File(dir.join("capture.json")),
+                cbom: Some(crate::report::OutputDest::File(dir.join("cbom.json"))),
+            };
+            let consumed = crate::report::consume_capture_result_with_diagnostics(
+                result,
+                if check {
+                    crate::report::CaptureCommand::Check { rules: &rules }
+                } else {
+                    crate::report::CaptureCommand::Report
+                },
+                &request,
+                true,
+                &mut Vec::new(),
+            );
+            assert_eq!(consumed.document.selected_objects, Some(selected.clone()));
+            assert_eq!(consumed.document.total_calls(), 3);
+            assert_eq!(consumed.exit_code, if check { 10 } else { 1 });
+            assert!(consumed.delivery.delivered_all());
+            let PreObservationCount::Terminal(retained) =
+                &consumed.failure_context.as_ref().unwrap().count
+            else {
+                panic!("lost terminal")
+            };
+            assert!(Arc::ptr_eq(retained, &terminal));
+            assert_eq!(
+                retained.receipt.cleanup_ticket,
+                terminal.receipt.cleanup_ticket
+            );
+            assert_eq!(
+                crate::count_session::tests::terminal_storage_identity(retained),
+                backing
+            );
+            let rendered: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(dir.join("capture.json")).unwrap()).unwrap();
+            let rendered_selection: evidence::RunSetProvenance =
+                serde_json::from_value(rendered["selected_objects"].clone()).unwrap();
+            assert_eq!(rendered_selection, selected);
+            assert_eq!(
+                rendered["selected_objects"].get("members").is_some(),
+                triple
+            );
+            crate::schema::validate_v2(&rendered).unwrap();
+            crate::schema::check_v2_semantics(&rendered).unwrap();
+            std::fs::remove_dir_all(dir).unwrap();
+            println!(
+                "FWR-I3 triple={triple} check={check}: selected objects retained, calls=3, canonical terminal/ticket/backings shared"
+            );
+        }
+        #[test]
+        fn fwr_i3_runtime_pair_report_selection() {
+            assert_fwr_i3_runtime_selection(false, false);
+        }
+        #[test]
+        fn fwr_i3_runtime_pair_check_selection() {
+            assert_fwr_i3_runtime_selection(false, true);
+        }
+        #[test]
+        fn fwr_i3_runtime_triple_report_selection() {
+            assert_fwr_i3_runtime_selection(true, false);
+        }
+        #[test]
+        fn fwr_i3_runtime_triple_check_selection() {
+            assert_fwr_i3_runtime_selection(true, true);
+        }
+
+        #[test]
+        fn fwr_i3_shared_capture_decoration_is_explicit_failure() {
+            let cfg = stub_config();
+            let mut info = stub_info();
+            info.acquired_ns = 1550;
+            let clock = ClockStub::at(1700);
+            let mut proc = ProcStub;
+            let cancelled = || false;
+            let (count, seed, backing) = t9_i1_seed_terminal();
+            let mut runner = stub_runner(
+                &cfg,
+                &info,
+                DiscoveryStub {
+                    finish_err: false,
+                    poll_err: false,
+                    dispatch_attached: true,
+                    trip_set: None,
+                },
+                count,
+                &clock,
+                &mut proc,
+                &cancelled,
+            );
+            let (device, inode) = seed.identity();
+            push_seed_objects(&mut runner, device, inode);
+            let result = runner.close_and_finalize();
+            let runtime = result
+                .as_ref()
+                .unwrap_err()
+                .downcast_ref::<CaptureRuntimeFailure>()
+                .unwrap();
+            let alias = Arc::clone(&runtime.capture);
+            let terminal = runtime.terminal.clone().unwrap();
+            let error =
+                decorate_capture_result(result, Some(evidence::RunSetProvenance::default()))
+                    .unwrap_err();
+            assert!(format!("{error:#}").contains("run-set provenance unavailable: Runtime capture was shared before production decoration"));
+            let runtime = error.downcast_ref::<CaptureRuntimeFailure>().unwrap();
+            assert_eq!(runtime.kind, RuntimeBoundaryKind::WindowBinding);
+            assert!(Arc::ptr_eq(&runtime.capture, &alias));
+            assert!(Arc::ptr_eq(runtime.terminal.as_ref().unwrap(), &terminal));
+            assert_eq!(
+                crate::count_session::tests::terminal_storage_identity(&terminal),
+                backing
+            );
+            assert_eq!(alias.document.total_calls(), 3);
+        }
+        #[test]
+        fn fwr_i3_unscoped_error_keeps_original_setup_context() {
+            let error = decorate_capture_result(
+                Err(
+                    anyhow::Error::new(std::io::Error::from_raw_os_error(libc::ENOENT))
+                        .context("unresolved input"),
+                ),
+                None,
+            )
+            .unwrap_err();
+            assert_eq!(
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .unwrap()
+                    .raw_os_error(),
+                Some(libc::ENOENT)
+            );
+            assert!(error.downcast_ref::<CaptureRuntimeFailure>().is_none());
+            assert!(format!("{error:#}").starts_with("unresolved input:"));
         }
 
         #[test]

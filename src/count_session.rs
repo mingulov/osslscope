@@ -1755,6 +1755,7 @@ impl<B: CountBackend> CountSession<B> {
     /// so counts are conserved per generation. Returns whether any
     /// count delta routed. Snapshot identity and cumulative high-water marks
     /// make every replay data-only, without a repeat-until-equal close scan.
+    /// New images refine existing timestamp bounds independently of call deltas.
     fn route_snapshot(&mut self, snapshot: Arc<RawSnapshot>) -> bool {
         if self
             .last_snapshot_seq
@@ -1781,10 +1782,7 @@ impl<B: CountBackend> CountSession<B> {
             let prev = self.seen.entry((cookie, generation)).or_default();
             let delta = total.count.saturating_sub(*prev);
             *prev = (*prev).max(total.count);
-            if delta == 0 {
-                continue;
-            }
-            progress = true;
+            progress |= delta > 0;
             if !self.known.contains(&cookie) {
                 // Unknown cookie (any generation): truly
                 // unattributable — loud loss, never silent.
@@ -1801,29 +1799,37 @@ impl<B: CountBackend> CountSession<B> {
                 continue;
             }
             if generation == self.generation {
-                self.current.entry(cookie).or_default().fold(&CountValue {
-                    count: delta,
-                    first_ns: total.first_ns,
-                    last_ns: total.last_ns,
-                });
+                if delta > 0 {
+                    self.current.entry(cookie).or_default().fold(&CountValue {
+                        count: delta,
+                        first_ns: total.first_ns,
+                        last_ns: total.last_ns,
+                    });
+                } else if let Some(current) = self.current.get_mut(&cookie) {
+                    // The producer increments count before storing last_ns.
+                    // A newer validated image can finish that timestamp store
+                    // without contributing another call, including saturation.
+                    current.first_ns = current.first_ns.min(total.first_ns);
+                    current.last_ns = current.last_ns.max(total.last_ns);
+                }
                 continue;
             }
             // Straggler: a known cookie's old-generation events
             // landing after their fence drain. The count stays
             // attributed under its own generation's meaning while
             // the staleness memo records the fence crossing.
-            let retired = self.retired.get(&(generation, cookie)).cloned();
+            let retired = self.retired.get(&(generation, cookie));
             let bucket = self.fenced.iter_mut().find(|b| b.generation == generation);
             match (retired, bucket) {
                 (Some(old), Some(bucket)) => {
                     self.stale_events = self.stale_events.saturating_add(delta);
                     if let Some(exec) = bucket.sites.iter_mut().find(|s| s.site == old.site) {
                         fold_exec_calls(exec, delta, total.first_ns, total.last_ns);
-                    } else {
+                    } else if delta > 0 {
                         bucket.sites.push(SiteExecution {
-                            site: old.site,
+                            site: old.site.clone(),
                             generation,
-                            candidates: old.candidates,
+                            candidates: old.candidates.clone(),
                             candidates_coverage: old.candidates_coverage,
                             calls: delta,
                             first_ns: total.first_ns,

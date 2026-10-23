@@ -600,6 +600,7 @@ struct FakeProc {
     comm_settle_at_ns: Option<u64>,
     comm_settled: Option<String>,
     comm_hook: Option<Rc<dyn Fn()>>,
+    comm_read_hook: Option<Rc<dyn Fn()>>,
     proc_log: Rc<RefCell<ProcLog>>,
     /// Scripted stats, popped in call order (F-D/A13 F3 + R20
     /// freshness): `Some(FileStat)` overrides the staged stat once
@@ -718,6 +719,9 @@ impl ProcPort for FakeProc {
     }
 
     fn read_comm(&mut self, _pid: u32) -> Option<String> {
+        if let Some(hook) = &self.comm_read_hook {
+            hook();
+        }
         if let Some(hook) = self.comm_hook.take() {
             hook();
         }
@@ -1011,6 +1015,7 @@ struct Harness {
     comm_settle_at_ns: Option<u64>,
     comm_settled: Option<String>,
     comm_hook: Option<Rc<dyn Fn()>>,
+    comm_read_hook: Option<Rc<dyn Fn()>>,
     cancelled: Rc<Cell<bool>>,
     cancel_on_poll: bool,
     /// Calls executing AT the release boundary (R20-fix finding 7),
@@ -1108,6 +1113,7 @@ impl Harness {
             comm_settle_at_ns: None,
             comm_settled: None,
             comm_hook: None,
+            comm_read_hook: None,
             cancelled: Rc::new(Cell::new(false)),
             cancel_on_poll: false,
             release_fires: Vec::new(),
@@ -1211,6 +1217,7 @@ impl Harness {
             comm_settle_at_ns: self.comm_settle_at_ns,
             comm_settled: self.comm_settled,
             comm_hook: self.comm_hook,
+            comm_read_hook: self.comm_read_hook,
             proc_log: self.proc_log.clone(),
             stat_seq: self.stat_seq,
             read_budget: self.read_budget,
@@ -6063,6 +6070,7 @@ fn live_observe_inner(
         comm_settle_at_ns: None,
         comm_settled: None,
         comm_hook: None,
+        comm_read_hook: None,
         proc_log: Rc::new(RefCell::new(ProcLog::default())),
         stat_seq: VecDeque::new(),
         read_budget: 128 * 1024 * 1024,
@@ -9649,6 +9657,101 @@ fn g1_terminal_lifecycle_uses_original_half_open_edge() {
         capture.document.window.effective_end_ns,
         BASE_NS + 1_000_000_000
     );
+}
+
+fn assert_fwr_i2_early_close_edge(finish_err: bool) {
+    let mut h = Harness::fresh("fwr-i2-early-comm");
+    h.cfg.duration = Duration::from_secs(1);
+    h.finish_err = finish_err;
+    h.comm = Some("test-target".into()); // remains unsettled at close
+    let selected_close = Rc::new(Cell::new(false));
+    let initial_comm = Rc::new(Cell::new(false));
+    let delayed_comm = Rc::new(Cell::new(false));
+    let clock = h.clock.clone();
+    h.comm_read_hook = Some(Rc::new({
+        let selected_close = selected_close.clone();
+        let initial_comm = initial_comm.clone();
+        let delayed_comm = delayed_comm.clone();
+        move || {
+            if selected_close.get() {
+                assert!(!delayed_comm.replace(true), "close comm read repeated");
+                clock.advance_ns(400);
+            } else if !initial_comm.replace(true) {
+                clock.advance_ns(100);
+            }
+        }
+    }));
+    h.cancel_hook = Some(Rc::new({
+        let selected_close = selected_close.clone();
+        move || {
+            if initial_comm.get() {
+                selected_close.set(true);
+                true
+            } else {
+                false
+            }
+        }
+    }));
+    h.lifecycle_close_drain = Some(LifecycleDelta {
+        events: [LifecycleKind::Fork, LifecycleKind::Exec]
+            .into_iter()
+            .flat_map(|kind| {
+                [99, 100, 101].into_iter().map(move |ns| LifecycleEvent {
+                    kind,
+                    pid: if kind == LifecycleKind::Exec {
+                        PID
+                    } else {
+                        6000
+                    },
+                    timestamp_ns: Some(BASE_NS + ns),
+                })
+            })
+            .collect(),
+        ..LifecycleDelta::default()
+    });
+    let (out, post) = h.run();
+    let capture = out.unwrap();
+    assert!(selected_close.get() && delayed_comm.get());
+    assert_eq!(capture.window_actual, Duration::from_nanos(500));
+    assert_eq!(
+        counter_value(&capture, "lifecycle.fork_exec_ignored"),
+        1,
+        "only the fork strictly before the loop close decision is definite; finish_err={finish_err}"
+    );
+    assert_eq!(counter_value(&capture, "lifecycle.exec_gap"), 1);
+    let shared = post.shared.borrow();
+    assert_eq!(
+        shared.log.iter().filter(|s| *s == "count_closed").count(),
+        1
+    );
+    assert_eq!(
+        shared.closed_at,
+        Some(BASE_NS + 500),
+        "actual count seal remains later than the lifecycle decision"
+    );
+    assert!(
+        !shared.log.iter().any(|s| s.starts_with("gen:")),
+        "terminal exec cannot start a generation: {:?}",
+        shared.log
+    );
+    assert_eq!(
+        capture.programmed_admission.unwrap().deadline_ns(),
+        BASE_NS + 1_000_000_000
+    );
+    assert_eq!(capture.document.total_calls(), 0);
+    println!(
+        "FWR-I2 finish_err={finish_err}: loop edge={}, delayed comm end={}, definite fork=1, exec=1",
+        BASE_NS + 100,
+        BASE_NS + 500
+    );
+}
+#[test]
+fn fwr_i2_early_close_freezes_edge_before_comm() {
+    assert_fwr_i2_early_close_edge(false);
+}
+#[test]
+fn fwr_i2_early_close_salvage_reuses_edge_before_comm() {
+    assert_fwr_i2_early_close_edge(true);
 }
 
 #[test]
