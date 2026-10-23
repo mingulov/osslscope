@@ -501,10 +501,30 @@ fn required_nullable_build_id_and_exact_payload_identity() {
 
 #[test]
 fn representable_schema_constraints_match_codec() {
+    let input_schema: Value =
+        serde_json::from_str(include_str!("../schemas/package-build-inputs-v1.json")).unwrap();
+    let bundle_schema: Value =
+        serde_json::from_str(include_str!("../schemas/package-bundle-contract-v1.json")).unwrap();
     let payload_schema: Value =
         serde_json::from_str(include_str!("../schemas/package-payload-manifest-v1.json")).unwrap();
     let release_schema: Value =
         serde_json::from_str(include_str!("../schemas/package-release-index-v1.json")).unwrap();
+    for schema in [
+        &input_schema,
+        &bundle_schema,
+        &payload_schema,
+        &release_schema,
+    ] {
+        let name = &schema["$defs"]["environment_entry"]["properties"]["name"];
+        assert_eq!(name["minLength"], json!(1));
+        assert_eq!(name["not"]["const"], json!("OSSL_PACKAGE_RECORD_DIR"));
+    }
+    let valid_inputs: BuildInputs = parse_canonical(INPUT_BYTES.as_bytes()).unwrap();
+    assert_eq!(valid_inputs.environment[0].name, "CARGO_NET_OFFLINE");
+    let reserved = edit(INPUT_BYTES.as_bytes(), |v| {
+        v["environment"][0]["name"] = json!("OSSL_PACKAGE_RECORD_DIR")
+    });
+    assert!(parse_canonical::<BuildInputs>(&reserved).is_err());
     assert_eq!(
         payload_schema["$defs"]["host"]["properties"]["elf_machine"]["const"],
         json!(62)

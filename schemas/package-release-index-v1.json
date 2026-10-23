@@ -29,6 +29,9 @@
       "properties": {
         "name": {
           "minLength": 1,
+          "not": {
+            "const": "OSSL_PACKAGE_RECORD_DIR"
+          },
           "type": "string"
         },
         "value": {
