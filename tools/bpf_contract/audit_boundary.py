@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Finite source/dependency boundary check; never an authorship certificate."""
 import argparse
+from collections import Counter, defaultdict
 import hashlib
 import json
 import re
@@ -43,6 +44,18 @@ def imports(src, crate):
     return set(re.findall(r'\b[A-Za-z_][A-Za-z_0-9]*\b', match.group(1))) if match else set()
 
 
+def lock_identity(package):
+    return (package['name'], package['version'], package.get('source'))
+
+
+def external_lock_rows(packages, local_names):
+    rows = defaultdict(Counter)
+    for package in packages:
+        if package['name'] not in local_names:
+            rows[lock_identity(package)][json.dumps(package, sort_keys=True, separators=(',', ':'))] += 1
+    return rows
+
+
 def inspect(product):
     product = Path(product)
     errors = []
@@ -56,22 +69,41 @@ def inspect(product):
     lock_text = read('crates/ebpf/Cargo.lock')
     try:
         deps = tomllib.loads(manifest)['dependencies']
-        packages = {p['name']: p for p in tomllib.loads(lock_text)['package']}
-        old_packages = {p['name']: p for p in tomllib.loads(base_text('crates/ebpf/Cargo.lock'))['package']}
-        for name, old_package in old_packages.items():
-            if name != 'osslscope-ebpf-common' and name != 'osslscope-ebpf':
-                if packages.get(name) != old_package:
-                    errors.append(f'external lock entry drift: {name}')
-        if set(packages) != (set(old_packages) - {'osslscope-ebpf-common'} | {'osslscope-bpf-contract'}):
-            errors.append('detached lock package set drift')
-        pkg = packages['osslscope-ebpf']
+        packages = tomllib.loads(lock_text)['package']
+        old_packages = tomllib.loads(base_text('crates/ebpf/Cargo.lock'))['package']
+        old_local = {'osslscope-ebpf', 'osslscope-ebpf-common'}
+        new_local = {'osslscope-ebpf', 'osslscope-bpf-contract'}
+        old_external = external_lock_rows(old_packages, old_local)
+        new_external = external_lock_rows(packages, new_local)
+        for identity in sorted(set(old_external) | set(new_external), key=str):
+            if old_external.get(identity, Counter()) != new_external.get(identity, Counter()):
+                name, version, source = identity
+                errors.append(f'external lock entry drift: {name} {version} {source or "local"}')
+        old_names = Counter(p['name'] for p in old_packages)
+        names = Counter(p['name'] for p in packages)
+        expected_names = old_names.copy()
+        expected_names['osslscope-ebpf-common'] -= 1
+        expected_names['osslscope-bpf-contract'] += 1
+        if names != expected_names:
+            errors.append('detached lock package multiplicity drift')
+        if any(names[name] != 1 for name in new_local):
+            errors.append('detached lock local package multiplicity drift')
+        pkg = next((p for p in packages if p['name'] == 'osslscope-ebpf'), {})
+        old_pkg = next(p for p in old_packages if p['name'] == 'osslscope-ebpf')
+        expected_pkg = dict(old_pkg)
+        expected_pkg['dependencies'] = [
+            'osslscope-bpf-contract' if dep == 'osslscope-ebpf-common' else dep
+            for dep in old_pkg['dependencies']
+        ]
+        if pkg != expected_pkg:
+            errors.append('BPF lock local package drift')
         if 'osslscope-ebpf-common' in deps or 'osslscope-ebpf-common' in pkg['dependencies']:
             errors.append('forbidden common dependency in detached BPF closure')
         if deps.get('osslscope-bpf-contract') != {'path': '../bpf-contract'}:
             errors.append('detached BPF dependency must be explicit path to contract')
         if 'osslscope-bpf-contract' not in pkg['dependencies']:
             errors.append('BPF lock omits contract dependency')
-        if 'osslscope-ebpf-common' in packages:
+        if names['osslscope-ebpf-common']:
             errors.append('forbidden common dependency in detached BPF lock')
         contract = tomllib.loads(read('crates/bpf-contract/Cargo.toml'))
         p = contract['package']
@@ -83,8 +115,9 @@ def inspect(product):
             errors.append('build script forbidden')
         if (product / 'crates/bpf-contract/build.rs').exists():
             errors.append('build script forbidden')
-        if packages.get('osslscope-bpf-contract', {}).get('dependencies'):
-            errors.append('contract lock dependency forbidden')
+        contract_rows = [row for row in packages if row['name'] == 'osslscope-bpf-contract']
+        if len(contract_rows) != 1 or contract_rows[0] != {'name': 'osslscope-bpf-contract', 'version': p['version']}:
+            errors.append('contract lock entry drift')
     except (ValueError, KeyError, TypeError) as e:
         errors.append(f'malformed dependency manifest/lock: {e}')
     common = (product / 'crates/ebpf-common/src/lib.rs')

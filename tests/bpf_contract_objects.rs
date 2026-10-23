@@ -35,6 +35,35 @@ fn ring_pad_negative_control() {
 }
 
 #[test]
+fn late_ring_alias_branch_is_not_treated_as_reserve_guard() {
+    let mut raw = Vec::new();
+    let mut insn = |op: u8, regs: u8, off: i16, imm: i32| {
+        raw.push(op);
+        raw.push(regs);
+        raw.extend_from_slice(&off.to_le_bytes());
+        raw.extend_from_slice(&imm.to_le_bytes());
+    };
+    insn(0xb7, 2, 0, 16);
+    insn(0x85, 0, 0, 131);
+    insn(0xbf, 0x06, 0, 0); // r6 retains the reservation pointer
+    for value in 1..=4 {
+        insn(0xb7, 7, 0, value);
+    }
+    insn(0x15, 6, 6, 0); // late null branch exits before submit
+    insn(0x62, 6, 0, 7);
+    insn(0x62, 6, 4, 0);
+    insn(0x7a, 6, 8, 0);
+    insn(0xbf, 0x61, 0, 0);
+    insn(0xb7, 2, 0, 0);
+    insn(0x85, 0, 0, 132);
+    insn(0x95, 0, 0, 0);
+    assert!(
+        std::panic::catch_unwind(|| inspect_ring_regions("fixture", "late", &raw, None)).is_err(),
+        "late pointer branch must be explored beyond the reserve-guard window"
+    );
+}
+
+#[test]
 fn extra_target_read_negative_control() {
     let read = [0x85, 0, 0, 0, 112, 0, 0, 0];
     assert!(
@@ -86,6 +115,27 @@ fn executable_coverage_negative_control() {
                 .is_err()
         );
     }
+}
+
+#[test]
+fn zero_call_must_dominate_string_read() {
+    let mut raw = Vec::new();
+    let mut insn = |op: u8, regs: u8, off: i16, imm: i32| {
+        raw.push(op);
+        raw.push(regs);
+        raw.extend_from_slice(&off.to_le_bytes());
+        raw.extend_from_slice(&imm.to_le_bytes());
+    };
+    insn(0x15, 0, 1, 0); // conditional edge skips the zero call
+    insn(0x85, 0x10, 0, 0); // zero call
+    insn(0x85, 0, 0, 114); // string read
+    insn(0x95, 0, 0, 0);
+    assert!(
+        std::panic::catch_unwind(|| assert_zero_dominates_read("fixture", "branch", &raw, 1, 2))
+            .is_err()
+    );
+    raw[2..4].copy_from_slice(&0i16.to_le_bytes());
+    assert_zero_dominates_read("fixture", "straight", &raw, 1, 2);
 }
 
 #[test]
@@ -189,7 +239,7 @@ fn field_mask(at: usize, width: usize) -> u64 {
     bits.checked_shl(at as u32).expect("ring field shift")
 }
 
-fn cfg_cycle_count(role: &str, owner: &str, raw: &[u8]) -> usize {
+fn decoded_cfg(role: &str, owner: &str, raw: &[u8]) -> (Vec<bool>, Vec<Vec<usize>>) {
     assert_eq!(raw.len() % 8, 0, "{role}:{owner}: partial instruction");
     let insns: Vec<_> = raw.chunks_exact(8).collect();
     let n = insns.len();
@@ -205,7 +255,6 @@ fn cfg_cycle_count(role: &str, owner: &str, raw: &[u8]) -> usize {
         }
     }
     let mut edges = vec![Vec::<usize>::new(); n];
-    let mut reverse = vec![Vec::<usize>::new(); n];
     for (pc, x) in insns.iter().enumerate() {
         if !valid[pc] {
             continue;
@@ -234,6 +283,17 @@ fn cfg_cycle_count(role: &str, owner: &str, raw: &[u8]) -> usize {
                 "{role}:{owner}:{pc}: invalid CFG target {target}"
             );
             edges[pc].push(target);
+        }
+    }
+    (valid, edges)
+}
+
+fn cfg_cycle_count(role: &str, owner: &str, raw: &[u8]) -> usize {
+    let (valid, edges) = decoded_cfg(role, owner, raw);
+    let n = edges.len();
+    let mut reverse = vec![Vec::<usize>::new(); n];
+    for (pc, successors) in edges.iter().enumerate() {
+        for &target in successors {
             reverse[target].push(pc);
         }
     }
@@ -742,7 +802,7 @@ fn inspect_ring_regions(
                     state.values[reg] = None;
                 }
             }
-            state.near_reserve = state.near_reserve.saturating_add(1).min(3);
+            state.near_reserve = state.near_reserve.saturating_add(1);
             let mut push = |target: usize, mut next: RingState| {
                 assert!(
                     target < insns.len(),
@@ -861,6 +921,121 @@ fn scan_instructions(
     (helpers, calls, (-min_stack) as usize)
 }
 
+type FrameState = [Option<i16>; 11];
+
+fn frame_states(role: &str, owner: &str, raw: &[u8]) -> Vec<Option<FrameState>> {
+    let (_valid, edges) = decoded_cfg(role, owner, raw);
+    let insns: Vec<_> = raw.chunks_exact(8).collect();
+    let mut at = vec![None; insns.len()];
+    let mut entry: FrameState = [None; 11];
+    entry[10] = Some(0); // BPF frame pointer
+    at[0] = Some(entry);
+    let mut queue = VecDeque::from([0]);
+    let mut steps = 0;
+    while let Some(pc) = queue.pop_front() {
+        steps += 1;
+        assert!(
+            steps <= insns.len() * 64,
+            "{role}:{owner}: frame provenance did not converge"
+        );
+        let x = insns[pc];
+        let op = x[0];
+        let dst = (x[1] & 15) as usize;
+        let src = (x[1] >> 4) as usize;
+        assert!(
+            dst <= 10 && src <= 10,
+            "{role}:{owner}:{pc}: register index"
+        );
+        let imm = i32::from_le_bytes(x[4..8].try_into().unwrap());
+        let mut out = at[pc].expect("queued frame state");
+        match op {
+            0xbf => out[dst] = out[src],
+            0x07 => {
+                out[dst] = out[dst].and_then(|base| {
+                    i16::try_from(imm)
+                        .ok()
+                        .and_then(|delta| base.checked_add(delta))
+                });
+            }
+            0x85 => {
+                for reg in &mut out[..=5] {
+                    *reg = None; // helper and local-call ABI clobbers
+                }
+            }
+            0x18 => out[dst] = None,
+            _ => match op & 7 {
+                0 | 1 | 4 | 7 => out[dst] = None,
+                3 if op & 0xe0 == 0xc0 => out[src] = None, // atomic fetch can define source
+                _ => {}
+            },
+        }
+        assert_eq!(
+            out[10],
+            Some(0),
+            "{role}:{owner}:{pc}: frame pointer changed"
+        );
+        for &next in &edges[pc] {
+            let merged = if let Some(old) = at[next] {
+                let mut meet = [None; 11];
+                for reg in 0..11 {
+                    if old[reg] == out[reg] {
+                        meet[reg] = old[reg];
+                    }
+                }
+                meet
+            } else {
+                out
+            };
+            if at[next] != Some(merged) {
+                at[next] = Some(merged);
+                queue.push_back(next);
+            }
+        }
+    }
+    at
+}
+
+fn require_frame_destination(
+    role: &str,
+    owner: &str,
+    states: &[Option<FrameState>],
+    pc: usize,
+    size: i32,
+) -> i16 {
+    let state = states[pc].unwrap_or_else(|| panic!("{role}:{owner}:{pc}: unreachable read/zero"));
+    let off =
+        state[1].unwrap_or_else(|| panic!("{role}:{owner}:{pc}: scratch stack provenance lost"));
+    assert!(
+        off >= -512 && i32::from(off) + size <= 0,
+        "{role}:{owner}:{pc}: scratch [{off}, {}) outside frame",
+        i32::from(off) + size
+    );
+    off
+}
+
+fn assert_zero_dominates_read(role: &str, owner: &str, raw: &[u8], zero: usize, read: usize) {
+    let (_valid, edges) = decoded_cfg(role, owner, raw);
+    assert!(
+        zero < read && read < edges.len(),
+        "{role}:{owner}: zero/read PC range"
+    );
+    let mut seen = vec![false; edges.len()];
+    let mut queue = VecDeque::from([0]);
+    seen[0] = true;
+    while let Some(pc) = queue.pop_front() {
+        assert_ne!(
+            pc, read,
+            "{role}:{owner}:{read}: string read bypasses zero call {zero}"
+        );
+        for &next in &edges[pc] {
+            if next != zero && !seen[next] {
+                seen[next] = true;
+                queue.push_back(next);
+            }
+        }
+    }
+}
+
 fn verify_read_helpers(
     role: &str,
     owner: &str,
@@ -870,6 +1045,15 @@ fn verify_read_helpers(
     let mut user = 0;
     let mut user_str = 0;
     let insns: Vec<_> = raw.chunks_exact(8).collect();
+    let states = if insns.iter().any(|x| {
+        x[0] == 0x85
+            && x[1] >> 4 == 0
+            && [112, 114].contains(&i32::from_le_bytes(x[4..8].try_into().unwrap()))
+    }) {
+        Some(frame_states(role, owner, raw))
+    } else {
+        None
+    };
     for (pc, insn) in insns.iter().enumerate() {
         if insn[0] != 0x85 || insn[1] >> 4 != 0 {
             continue;
@@ -890,10 +1074,16 @@ fn verify_read_helpers(
                 let size = i32::from_le_bytes(setup[stack + 2][4..8].try_into().unwrap());
                 assert!([4, 8].contains(&size), "target read size {size}");
                 assert!(off + size <= 0, "target read extends past stack frame");
+                assert_eq!(
+                    require_frame_destination(role, owner, states.as_ref().unwrap(), pc, size),
+                    off as i16,
+                    "target read actual stack provenance"
+                );
             }
             114 => {
                 user_str += 1;
                 assert!(pc >= 9, "{role}:{owner}:{pc}: short string read setup");
+                assert_zero_dominates_read(role, owner, raw, pc - 4, pc);
                 let pre = &insns[pc - 7..pc];
                 let alias = pre[0][1] >> 4;
                 assert_eq!(pre[0][0], 0xbf, "string zero destination move");
@@ -929,19 +1119,12 @@ fn verify_read_helpers(
                 assert!([32, 128].contains(&size), "string read size {size}");
                 assert_eq!(pre[6][0], 0xbf, "string read source move");
                 assert_eq!(pre[6][1] & 15, 3, "string read source r3");
-                let prefix = &insns[pc.saturating_sub(24)..pc - 7];
-                assert!(
-                    prefix.windows(2).any(|pair| {
-                        pair[0][0] == 0xbf
-                            && pair[0][1] == (0xa0 | alias)
-                            && pair[1][0] == 0x07
-                            && pair[1][1] & 15 == alias
-                            && {
-                                let off = i32::from_le_bytes(pair[1][4..8].try_into().unwrap());
-                                off <= -size && off >= -512
-                            }
-                    }),
-                    "{role}:{owner}:{pc}: string destination stack provenance"
+                let states = states.as_ref().unwrap();
+                let zero_dest = require_frame_destination(role, owner, states, pc - 4, size);
+                let read_dest = require_frame_destination(role, owner, states, pc, size);
+                assert_eq!(
+                    zero_dest, read_dest,
+                    "{role}:{owner}:{pc}: zero/read stack alias differs"
                 );
             }
             _ => {}
@@ -1517,6 +1700,59 @@ fn inspect_object(
 
 fn negative_controls(bytes: &[u8], prepared: &loader::Prepared) {
     let elf = Elf::parse(bytes).expect("members ELF");
+    let branch_owner = elf
+        .syms
+        .iter()
+        .find(|s| {
+            s.st_type() == sym::STT_FUNC && elf.strtab.get_at(s.st_name) == Some("member_001")
+        })
+        .expect("member_001 symbol");
+    let branch_at = elf.section_headers[branch_owner.st_shndx].sh_offset as usize
+        + branch_owner.st_value as usize
+        + 418 * 8;
+    let mut bad_scratch = bytes.to_vec();
+    assert_eq!(bad_scratch[branch_at], 0x05, "member_001 branch opcode");
+    assert_eq!(
+        i16::from_le_bytes(
+            bad_scratch[branch_at + 2..branch_at + 4]
+                .try_into()
+                .unwrap()
+        ),
+        257,
+        "member_001 original branch displacement"
+    );
+    bad_scratch[branch_at + 2..branch_at + 4].copy_from_slice(&4i16.to_le_bytes());
+    assert_eq!(
+        Sha256::digest(&bad_scratch)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>(),
+        "657965b9b89eea790f0bfaed167b2fc9ed9ac4c1f4773ea44b2c3fa115ebecca",
+        "reviewed scratch-bypass mutant bytes"
+    );
+    let altered = loader::prepare(&bad_scratch, &MEMBER_MAPS, &MEMBER_PROGS)
+        .expect("scratch-bypass mutant remains a prepared BPF object");
+    let section = section_bytes(&bad_scratch, &elf.section_headers[branch_owner.st_shndx]);
+    let raw = &section[branch_owner.st_value as usize
+        ..branch_owner.st_value as usize + branch_owner.st_size as usize];
+    let rejection = std::panic::catch_unwind(|| {
+        verify_read_helpers(
+            "members",
+            "member_001",
+            raw,
+            altered.progs.iter().find(|p| p.name == "member_001"),
+        )
+    })
+    .expect_err("actual-object scratch-alias CFG bypass must fail");
+    let reason = rejection
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| rejection.downcast_ref::<&str>().copied())
+        .unwrap_or("non-string panic");
+    assert!(
+        reason.contains("scratch stack provenance lost"),
+        "wrong scratch rejection: {reason}"
+    );
     let map_index = elf
         .section_headers
         .iter()

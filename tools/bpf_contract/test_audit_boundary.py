@@ -29,6 +29,44 @@ class BoundaryControls(unittest.TestCase):
         path.write_text(body.replace(before, after, 1))
         self.assertIn(needle, '\n'.join(audit.inspect(self.root)))
 
+    def syn2_block(self):
+        path = self.root / 'crates/ebpf/Cargo.lock'
+        body = path.read_text()
+        start = body.index('[[package]]\nname = "syn"\nversion = "2.0.119"')
+        end = body.find('\n[[package]]', start + 1)
+        if end < 0:
+            end = len(body)
+        return path, body, body[start:end]
+
+    def assert_syn2_drift(self, changed_block):
+        path, body, block = self.syn2_block()
+        self.assertEqual(audit.inspect(self.root), [])
+        path.write_text(body.replace(block, changed_block, 1))
+        problems = '\n'.join(audit.inspect(self.root))
+        self.assertIn('external lock entry drift: syn 2.0.119', problems)
+
+    def test_shadowed_syn2_checksum_is_rejected(self):
+        _, _, block = self.syn2_block()
+        old = '872831b642d1a07999a962a351ed35b955ea2cfc8f3862091e2a240a84f17297'
+        self.assertIn(old, block)
+        self.assert_syn2_drift(block.replace(old, '0' * 64, 1))
+
+    def test_shadowed_syn2_version_is_rejected(self):
+        _, _, block = self.syn2_block()
+        self.assert_syn2_drift(block.replace('version = "2.0.119"', 'version = "2.0.120"', 1))
+
+    def test_shadowed_syn2_source_is_rejected(self):
+        _, _, block = self.syn2_block()
+        self.assert_syn2_drift(block.replace(
+            'source = "registry+https://github.com/rust-lang/crates.io-index"',
+            'source = "registry+https://example.invalid/index"', 1))
+
+    def test_duplicate_shadowed_syn2_row_is_rejected(self):
+        path, body, block = self.syn2_block()
+        self.assertEqual(audit.inspect(self.root), [])
+        path.write_text(body + '\n' + block + '\n')
+        self.assertIn('external lock entry drift: syn 2.0.119', '\n'.join(audit.inspect(self.root)))
+
     def test_current_source_or_preswitch_dependency_is_reported(self):
         problems = '\n'.join(audit.inspect(self.root))
         self.assertTrue(not problems or 'forbidden common dependency' in problems, problems)
