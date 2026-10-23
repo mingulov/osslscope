@@ -1,68 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Ordinary host probe for the existing GPL3 host common package.
 use osslscope_ebpf_common as contract;
-use std::{
-    collections::{HashMap, HashSet},
-    io::{self, Read, Write},
-    mem::{align_of, size_of},
-};
+#[path = "../crates/bpf-contract/examples/support/probe.rs"]
+mod probe;
+use probe::{decimal, fixed, number, octets, table};
+use std::mem::{align_of, size_of};
 
-fn decimal(s: &str, bits: u32) -> Result<u64, String> {
-    if s.is_empty() || (s.len() > 1 && s.starts_with('0')) || !s.bytes().all(|b| b.is_ascii_digit())
-    {
-        return Err("decimal".into());
-    }
-    let n = s.parse::<u64>().map_err(|_| "integer width")?;
-    if bits < 64 && n >= 1u64 << bits {
-        return Err("integer width".into());
-    }
-    Ok(n)
-}
-fn octets(s: &str) -> Result<Vec<u8>, String> {
-    if s.len() % 2 != 0
-        || !s
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    {
-        return Err("hex".into());
-    }
-    s.as_bytes()
-        .chunks_exact(2)
-        .map(|p| u8::from_str_radix(std::str::from_utf8(p).unwrap(), 16).map_err(|_| "hex".into()))
-        .collect()
-}
-fn fixed<const N: usize>(s: &str) -> Result<[u8; N], String> {
-    octets(s)?.try_into().map_err(|_| "field width".into())
-}
-fn number(s: &str, width: usize) -> Result<u64, String> {
-    let b = octets(s)?;
-    if b.len() != width {
-        return Err("field width".into());
-    }
-    Ok(b.iter()
-        .enumerate()
-        .fold(0u64, |v, (i, x)| v | (u64::from(*x) << (i * 8))))
-}
-fn table(s: &str, width: usize, max: usize) -> Result<HashMap<u64, Vec<u8>>, String> {
-    let mut result = HashMap::new();
-    if s == "-" {
-        return Ok(result);
-    }
-    for item in s.split(',') {
-        if result.len() >= max {
-            return Err("table limit".into());
-        }
-        let (k, v) = item.split_once(':').ok_or("table entry")?;
-        if k.len() != 16 || v.len() != width * 2 {
-            return Err("table width".into());
-        }
-        let key = number(k, 8)?;
-        if result.insert(key, octets(v)?).is_some() {
-            return Err("duplicate table key".into());
-        }
-    }
-    Ok(result)
-}
 fn scalar(name: &str, args: &str) -> Result<String, String> {
     let cells: Vec<_> = args.split(',').collect();
     let arity = match name {
@@ -174,6 +117,13 @@ fn raw<T>(record: &T, size: usize, align: usize) -> Result<String, String> {
     }
     let bytes = unsafe { std::slice::from_raw_parts((record as *const T).cast::<u8>(), size) };
     Ok(bytes.iter().map(|x| format!("{x:02x}")).collect())
+}
+fn verify_existing_encoding(typed_hex: String, encoded: &[u8]) -> Result<String, String> {
+    let encoded_hex: String = encoded.iter().map(|byte| format!("{byte:02x}")).collect();
+    if typed_hex != encoded_hex {
+        return Err("existing host encoder disagrees with typed bytes".into());
+    }
+    Ok(typed_hex)
 }
 fn wire(name: &str, cells: &str) -> Result<String, String> {
     let f: Vec<&str> = cells.split(',').collect();
@@ -440,91 +390,44 @@ fn wire(name: &str, cells: &str) -> Result<String, String> {
         }
         "AlgClassValue" => {
             fields!(5);
-            raw(
-                &contract::AlgClassValue {
-                    class: u16f!(0),
-                    weak: u8f!(1),
-                    len: u8f!(2),
-                    canon: u16f!(3),
-                    name: fixed::<36>(f[4])?,
-                },
-                42,
-                2,
-            )
+            let value = contract::AlgClassValue {
+                class: u16f!(0),
+                weak: u8f!(1),
+                len: u8f!(2),
+                canon: u16f!(3),
+                name: fixed::<36>(f[4])?,
+            };
+            verify_existing_encoding(raw(&value, 42, 2)?, &contract::alg_value_bytes(&value))
         }
         "TripClassValue" => {
             fields!(4);
-            raw(
-                &contract::TripClassValue {
-                    engine: u16f!(0),
-                    load: u16f!(1),
-                    len: u16f!(2),
-                    name: fixed::<16>(f[3])?,
-                },
-                22,
-                2,
-            )
+            let value = contract::TripClassValue {
+                engine: u16f!(0),
+                load: u16f!(1),
+                len: u16f!(2),
+                name: fixed::<16>(f[3])?,
+            };
+            verify_existing_encoding(raw(&value, 22, 2)?, &contract::trip_value_bytes(&value))
         }
         _ => return Err("record name".into()),
     }?;
     Ok(output)
 }
-fn run() -> Result<(), String> {
-    if !cfg!(target_endian = "little") {
-        return Err("host endian".into());
-    }
-    let mut input = Vec::new();
-    io::stdin()
-        .take(256 * 1024 * 1024 + 1)
-        .read_to_end(&mut input)
-        .map_err(|_| "input read")?;
-    if input.len() > 256 * 1024 * 1024 || !input.ends_with(b"\n") || input.contains(&b'\r') {
-        return Err("input framing".into());
-    }
-    let input = std::str::from_utf8(&input).map_err(|_| "utf8")?;
-    let mut lines = input.split_terminator('\n');
-    if lines.next() != Some("OSSLBC1") {
-        return Err("version".into());
-    }
-    let mut ids = HashSet::new();
-    let mut out = String::from("OSSLBC1\n");
-    for line in lines {
-        if line.len() > 128 * 1024 {
-            return Err("line limit".into());
-        }
-        let c: Vec<&str> = line.split('\t').collect();
-        if c.len() < 2
-            || c[0].is_empty()
-            || c[0].len() > 64
-            || !c[0]
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-            || !ids.insert(c[0])
-        {
-            return Err("id".into());
-        }
-        let result = match c[1] {
-            "s" if c.len() == 4 => format!("s\t{}", scalar(c[2], c[3])?),
-            "a" if c.len() == 6 => format!("a\t{}", algorithm(&c[2..6])?),
-            "t" if c.len() == 6 => format!("t\t{}", trip(&c[2..6])?),
-            "w" if c.len() == 4 => format!("w\t{}", wire(c[2], c[3])?),
-            _ => return Err("request fields".into()),
-        };
-        out.push_str(c[0]);
-        out.push('\t');
-        out.push_str(&result);
-        out.push('\n');
-    }
-    if ids.is_empty() {
-        return Err("missing requests".into());
-    }
-    io::stdout()
-        .write_all(out.as_bytes())
-        .map_err(|_| "output write".into())
-}
 fn main() {
-    if let Err(error) = run() {
-        eprintln!("invalid contract request: {error}");
-        std::process::exit(1);
+    probe::run(probe::Backend {
+        scalar,
+        algorithm,
+        trip,
+        wire,
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::verify_existing_encoding;
+
+    #[test]
+    fn differing_existing_encoding_rejects_reference_record() {
+        assert!(verify_existing_encoding("8000".into(), &[0x80, 0x01]).is_err());
     }
 }

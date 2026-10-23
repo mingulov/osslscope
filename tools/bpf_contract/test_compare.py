@@ -135,6 +135,9 @@ class FramingTest(unittest.TestCase):
             report = d / "report.json"
             result = compare.compare(*probes, vector, report)
             self.assertIn("source_sha256", result)
+            self.assertIn(
+                "crates/bpf-contract/examples/support/probe.rs", result["source_sha256"]
+            )
             for mutation in (
                 lambda r: r.update(case_count=0),
                 lambda r: r["identities_sha256"].update(candidate="0" * 64),

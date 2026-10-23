@@ -47,6 +47,7 @@ SOURCE_PATHS = (
     "crates/bpf-contract/src/lib.rs", "crates/bpf-contract/src/scalars.rs",
     "crates/bpf-contract/src/classify.rs", "crates/bpf-contract/src/records.rs",
     "crates/bpf-contract/examples/contract_probe.rs",
+    "crates/bpf-contract/examples/support/probe.rs",
     "crates/ebpf-common/src/lib.rs", "examples/bpf_contract_reference.rs",
     "tools/bpf_contract/compare.py", "tools/bpf_contract/test_compare.py",
 )
