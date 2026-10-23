@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #![no_std]
 
+mod classify;
 mod records;
 mod scalars;
+
+pub use classify::{classify_alg_with, classify_trip_with, AlgVerdict, TripTaxonomy, TripVerdict};
 
 pub use records::{
     AlgClassValue, AlgEvent, CountValue, CtrlValue, GuardEvent, InitRetEvent, PendQuery, RowEvent,

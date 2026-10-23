@@ -1,6 +1,405 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 use osslscope_bpf_contract::*;
 
+mod alg_contract {
+    use super::*;
+    use core::cell::Cell;
+
+    // Fixed from the FNV-1a parameters, before the classifier implementation.
+    const EMPTY: u64 = 0xcbf2_9ce4_8422_2325;
+    const A: u64 = 0xaf63_dc4c_8601_ec8c;
+    const B: u64 = 0xaf63_df4c_8601_f1a5;
+    const X: u64 = 0xaf63_f54c_8602_1707;
+    const NUL: u64 = 0xaf63_bd4c_8601_b7df;
+    const A_NUL_B: u64 = 0xe5d2_9919_0426_66b2;
+    const A36: u64 = 0x621b_7399_0f1b_3bb9;
+
+    fn entry(class: u16, weak: u8, len: u8, canon: u16) -> AlgClassValue {
+        AlgClassValue {
+            class,
+            weak,
+            len,
+            canon,
+            name: [0x93; 36],
+        }
+    }
+
+    fn classify(
+        input: &[u8],
+        saturated: bool,
+        lookup: impl Fn(u64) -> Option<AlgClassValue>,
+    ) -> AlgVerdict {
+        let mut buf = [0xe7; ALG_WINDOW];
+        buf[..input.len()].copy_from_slice(input);
+        classify_alg_with(&buf, input.len(), saturated, lookup)
+    }
+
+    fn verdict(v: AlgVerdict) -> (u16, bool, u8) {
+        (v.class, v.weak, v.status)
+    }
+
+    #[test]
+    fn fixed_keys_minimum_mixed_and_shared_canon() {
+        fn copy_clone<T: Copy + Clone>() {}
+        copy_clone::<AlgVerdict>();
+        assert_eq!(
+            verdict(classify(b"a:b", false, |key| match key {
+                A => Some(entry(7, 0, 1, 10)),
+                B => Some(entry(2, 1, 1, 11)),
+                _ => None,
+            })),
+            (2, true, 5)
+        );
+        assert_eq!(
+            verdict(classify(b"b:a", false, |key| match key {
+                A => Some(entry(7, 0, 1, 10)),
+                B => Some(entry(2, 1, 1, 10)),
+                _ => None,
+            })),
+            (2, true, 0)
+        );
+    }
+
+    #[test]
+    fn unknown_weak_only_and_zero_values_remain_distinct() {
+        assert_eq!(verdict(classify(b"z", false, |_| None)), (65535, false, 1));
+        assert_eq!(
+            verdict(classify(b"x", false, |key| (key == X)
+                .then(|| entry(65535, 1, 1, 65535)))),
+            (65535, true, 1)
+        );
+        assert_eq!(
+            verdict(classify(b"z:b", false, |key| (key == B).then(|| entry(2, 1, 1, 11)))),
+            (2, true, 0)
+        );
+        assert_eq!(
+            verdict(classify(b"a:x:b", false, |key| match key {
+                A => Some(entry(7, 0, 1, 10)),
+                X => Some(entry(65535, 1, 1, 65535)),
+                B => Some(entry(2, 0, 1, 11)),
+                _ => None,
+            })),
+            (2, true, 5)
+        );
+        assert_eq!(
+            verdict(classify(b"a", false, |key| (key == A).then(|| entry(0, 0, 1, 0)))),
+            (0, false, 0)
+        );
+        assert_eq!(
+            verdict(classify(b"a:b", false, |key| match key {
+                A => Some(entry(0, 0, 1, 0)),
+                B => Some(entry(2, 0, 1, 11)),
+                _ => None,
+            })),
+            (0, false, 5)
+        );
+    }
+
+    #[test]
+    fn empty_segments_count_and_ninth_overrides_mixed() {
+        assert_eq!(
+            verdict(classify(b"", false, |key| (key == EMPTY).then(|| entry(4, 0, 0, 8)))),
+            (4, false, 0)
+        );
+        assert_eq!(
+            verdict(classify(b":a", false, |key| match key {
+                EMPTY => Some(entry(4, 0, 0, 8)),
+                A => Some(entry(7, 0, 1, 10)),
+                _ => None,
+            })),
+            (4, false, 5)
+        );
+        assert_eq!(
+            verdict(classify(b"a::::::::b", false, |key| match key {
+                A => Some(entry(7, 0, 1, 10)),
+                B => Some(entry(2, 0, 1, 11)),
+                _ => None,
+            })),
+            (7, true, 3)
+        );
+        assert_eq!(
+            verdict(classify(b"a:b:::::::b", false, |key| match key {
+                A => Some(entry(7, 0, 1, 10)),
+                B => Some(entry(2, 0, 1, 11)),
+                _ => None,
+            })),
+            (2, true, 3)
+        );
+        assert_eq!(
+            verdict(classify(b"::::::::", false, |_| None)),
+            (65535, true, 3)
+        );
+        assert_eq!(
+            verdict(classify(b"a:::::::", false, |key| (key == A)
+                .then(|| entry(7, 0, 1, 10)))),
+            (7, false, 0)
+        );
+    }
+
+    #[test]
+    fn arbitrary_octets_lengths_reserved_name_and_ignored_tail() {
+        assert_eq!(
+            verdict(classify(b"a\0b", false, |key| (key == A_NUL_B)
+                .then(|| entry(9, 0, 3, 12)))),
+            (9, false, 0)
+        );
+        assert_eq!(
+            verdict(classify(&[0], false, |key| (key == NUL).then(|| entry(6, 0, 1, 9)))),
+            (6, false, 0)
+        );
+        assert_eq!(
+            verdict(classify(&[255], false, |_| None)),
+            (65535, false, 1)
+        );
+        assert_eq!(
+            verdict(classify(&[b'a'; 36], false, |key| (key == A36)
+                .then(|| entry(3, 0, 36, 7)))),
+            (3, false, 0)
+        );
+        assert_eq!(
+            verdict(classify(&[b'a'; 37], false, |key| (key
+                == 0xcfe1_4514_ab46_b008)
+                .then(|| entry(3, 0, 37, 7)))),
+            (65535, false, 1)
+        );
+        assert_eq!(
+            verdict(classify(b"a", false, |key| (key == A).then(|| entry(3, 0, 2, 7)))),
+            (65535, false, 1)
+        );
+        assert_eq!(
+            verdict(classify(b"a", false, |key| (key == A).then(|| {
+                let mut value = entry(7, 0, 1, 10);
+                value.name = [0x01; 36];
+                value
+            }))),
+            (7, false, 0)
+        );
+        assert_eq!(
+            verdict(classify(b"a", false, |key| (key == A).then(|| {
+                let mut value = entry(7, 0, 1, 10);
+                value.name = [0xfe; 36];
+                value
+            }))),
+            (7, false, 0)
+        );
+        let mut buf = [b'z'; ALG_WINDOW];
+        buf[0] = b'a';
+        assert_eq!(
+            verdict(classify_alg_with(&buf, 1, false, |key| (key == A).then(|| entry(7, 0, 1, 10)))),
+            (7, false, 0)
+        );
+    }
+
+    #[test]
+    fn length_and_saturation_guard_before_lookup() {
+        let mut buf = [b'a'; ALG_WINDOW];
+        for len in [126, 127] {
+            assert_eq!(
+                verdict(classify_alg_with(&buf, len, false, |_| None)),
+                (65535, false, 1)
+            );
+        }
+        for len in [0, 126, 127, 128, usize::MAX] {
+            assert_eq!(
+                verdict(classify_alg_with(&buf, len, true, |_| panic!(
+                    "overlong lookup"
+                ))),
+                (65535, false, 2)
+            );
+        }
+        for len in [128, usize::MAX] {
+            assert_eq!(
+                verdict(classify_alg_with(&buf, len, false, |_| panic!(
+                    "overlong lookup"
+                ))),
+                (65535, false, 2)
+            );
+        }
+        buf[0] = b'b';
+        assert_eq!(
+            verdict(classify_alg_with(&buf, 1, false, |key| (key == B).then(|| entry(2, 1, 1, 11)))),
+            (2, true, 0)
+        );
+    }
+
+    #[test]
+    fn bounded_cost_and_corrupt_records_do_not_escape_slices() {
+        let calls = Cell::new(0);
+        let input = b"a:b:c:d:e:f:g:h:i";
+        let out = classify(input, false, |_| {
+            calls.set(calls.get() + 1);
+            None
+        });
+        assert_eq!(verdict(out), (65535, true, 3));
+        assert!(calls.get() <= 8);
+        assert_eq!(
+            verdict(classify(b"a", false, |key| (key == A)
+                .then(|| entry(9, 255, 255, 65535)))),
+            (65535, false, 1)
+        );
+    }
+}
+
+mod trip_contract {
+    use super::*;
+    use core::cell::Cell;
+
+    const EMPTY: u64 = 0xcbf2_9ce4_8422_2325;
+    const A: u64 = 0xaf63_dc4c_8601_ec8c;
+    const A16: u64 = 0xa4b1_b160_5dd8_5975;
+    const NUL: u64 = 0xaf63_bd4c_8601_b7df;
+
+    fn entry(name: &[u8], engine: u16, load: u16) -> TripClassValue {
+        let mut stored = [0; 16];
+        stored[..name.len()].copy_from_slice(name);
+        TripClassValue {
+            engine,
+            load,
+            len: name.len() as u16,
+            name: stored,
+        }
+    }
+    fn verdict(v: TripVerdict) -> (u16, u8) {
+        (v.class, v.status)
+    }
+
+    #[test]
+    fn exact_bytes_and_taxonomy_selectors() {
+        fn copy_clone<T: Copy + Clone>() {}
+        copy_clone::<TripVerdict>();
+        copy_clone::<TripTaxonomy>();
+        assert_eq!(
+            verdict(classify_trip_with(
+                b"a",
+                false,
+                TripTaxonomy::Engine,
+                |key| (key == A).then(|| entry(b"a", 0x1234, 0x5678))
+            )),
+            (0x1234, 0)
+        );
+        assert_eq!(
+            verdict(classify_trip_with(b"a", false, TripTaxonomy::Load, |key| {
+                (key == A).then(|| entry(b"a", 0x1234, 0x5678))
+            })),
+            (0x5678, 0)
+        );
+        assert_eq!(
+            verdict(classify_trip_with(b"a", false, TripTaxonomy::Load, |key| {
+                (key == A).then(|| entry(b"b", 1, 2))
+            })),
+            (0, 0)
+        );
+        assert_eq!(
+            verdict(classify_trip_with(b"a", false, TripTaxonomy::Load, |key| {
+                (key == A).then(|| entry(b"ab", 1, 2))
+            })),
+            (0, 0)
+        );
+        assert_eq!(
+            verdict(classify_trip_with(
+                b"z",
+                false,
+                TripTaxonomy::Engine,
+                |_| None
+            )),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn empty_nul_and_matching_length_boundaries() {
+        assert_eq!(
+            verdict(classify_trip_with(
+                b"",
+                false,
+                TripTaxonomy::Engine,
+                |key| (key == EMPTY).then(|| entry(b"", 9, 8))
+            )),
+            (9, 0)
+        );
+        assert_eq!(
+            verdict(classify_trip_with(
+                b"\0",
+                false,
+                TripTaxonomy::Load,
+                |key| (key == NUL).then(|| entry(b"\0", 9, 8))
+            )),
+            (8, 0)
+        );
+        assert_eq!(
+            verdict(classify_trip_with(
+                &[b'a'; 16],
+                false,
+                TripTaxonomy::Engine,
+                |key| (key == A16).then(|| entry(&[b'a'; 16], u16::MAX, 0))
+            )),
+            (u16::MAX, 0)
+        );
+        assert_eq!(
+            verdict(classify_trip_with(
+                &[b'a'; 17],
+                false,
+                TripTaxonomy::Engine,
+                |_| panic!("long readable lookup")
+            )),
+            (0, 0)
+        );
+        for len in [30, 31] {
+            assert_eq!(
+                verdict(classify_trip_with(
+                    &[b'a'; 32][..len],
+                    false,
+                    TripTaxonomy::Load,
+                    |_| panic!("long readable lookup")
+                )),
+                (0, 0)
+            );
+        }
+    }
+
+    #[test]
+    fn overlong_and_saturated_do_not_lookup() {
+        for len in [0, 16, 17, 30, 31, 32, 33] {
+            assert_eq!(
+                verdict(classify_trip_with(
+                    &[b'a'; 33][..len],
+                    true,
+                    TripTaxonomy::Engine,
+                    |_| panic!("overlong lookup")
+                )),
+                (0, 2)
+            );
+        }
+        for len in [32, 33] {
+            assert_eq!(
+                verdict(classify_trip_with(
+                    &[b'a'; 33][..len],
+                    false,
+                    TripTaxonomy::Load,
+                    |_| panic!("overlong lookup")
+                )),
+                (0, 2)
+            );
+        }
+    }
+
+    #[test]
+    fn corrupt_length_and_lookup_cost_are_bounded() {
+        let calls = Cell::new(0);
+        let out = classify_trip_with(b"a", false, TripTaxonomy::Engine, |key| {
+            calls.set(calls.get() + 1);
+            (key == A).then(|| TripClassValue {
+                engine: 9,
+                load: 8,
+                len: u16::MAX,
+                name: [0; 16],
+            })
+        });
+        assert_eq!(verdict(out), (0, 0));
+        assert!(calls.get() <= 1);
+    }
+}
+
 mod scalars {
     use super::*;
 
