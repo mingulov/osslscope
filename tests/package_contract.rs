@@ -70,10 +70,17 @@ fn canonical_parser_rejects_nested_duplicates_and_noncanonical_bytes() {
     let spaced = INPUT_BYTES.replacen(":", ": ", 1);
     assert!(parse_canonical::<BuildInputs>(spaced.as_bytes()).is_err());
     let unsorted = INPUT_BYTES.replacen(
-        "{\"argv\":",
-        "{\"schema\":\"osslscope-build-inputs-v1\",\"argv\":",
+        "{\"argv\":[\"cargo\",\"build\",\"--locked\"],\"environment\":",
+        "{\"environment\":",
         1,
     );
+    let unsorted = unsorted.replacen(
+        "\"jobs\":2,",
+        "\"argv\":[\"cargo\",\"build\",\"--locked\"],\"jobs\":2,",
+        1,
+    );
+    let unique: Value = serde_json::from_str(&unsorted).unwrap();
+    assert_eq!(unique.as_object().unwrap().len(), 14);
     assert!(parse_canonical::<BuildInputs>(unsorted.as_bytes()).is_err());
     let payload_duplicate = package_fixtures::PAYLOAD_BYTES.replacen(
         "\"version\":\"fixture-1\"",

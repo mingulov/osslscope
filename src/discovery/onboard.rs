@@ -368,6 +368,53 @@ pub fn check_object_compatible(role: ObjectRole, bytes: &[u8]) -> Result<(), Str
     r.map(|_| ()).map_err(|e| format!("{e:#}"))
 }
 
+/// Pure installed-package shape admission over retained bytes. Count's owner
+/// has additional reviewed restrictions beyond generic prepare, so it uses
+/// the same object -> prepare -> prepared sequence as the current owner.
+pub(crate) fn check_installed_role_compatible(
+    role: crate::package::records::Role,
+    bytes: &[u8],
+) -> Result<(), crate::package::PackageError> {
+    use crate::package::{PackageError, records::Role};
+    let shape = |reason: &str| PackageError::invalid(format!("{}: {reason}", role.file_name()));
+    match role {
+        Role::Harvest => crate::loader::prepare(
+            bytes,
+            &crate::loader::HARVEST_MAPS,
+            &crate::loader::HARVEST_PROGS,
+        )
+        .map(|_| ())
+        .map_err(|_| shape("harvest loader shape")),
+        Role::Count => {
+            crate::loader::validate_count_object(bytes)
+                .map_err(|_| shape("count object policy"))?;
+            let prepared = crate::loader::prepare(
+                bytes,
+                &crate::loader::COUNT_MAPS,
+                &crate::loader::COUNT_PROGS,
+            )
+            .map_err(|_| shape("count loader shape"))?;
+            validate_installed_count_prepared(&prepared)
+        }
+        Role::Members => crate::loader::prepare(
+            bytes,
+            &crate::loader::MEMBER_MAPS,
+            &crate::loader::MEMBER_PROGS,
+        )
+        .map(|_| ())
+        .map_err(|_| shape("members loader shape")),
+    }
+}
+
+/// Typed installed-admission mapping for the existing pure Count prepared
+/// validator. This does not create a Count owner or load any BPF resource.
+pub(crate) fn validate_installed_count_prepared(
+    prepared: &crate::loader::Prepared,
+) -> Result<(), crate::package::PackageError> {
+    crate::loader::validate_count_prepared(prepared)
+        .map_err(|_| crate::package::PackageError::invalid("osslscope-count: prepared policy"))
+}
+
 /// Resolve the BPF-object pair: explicit paths win per role
 /// (operator-trusted; existence + compatibility still checked); a
 /// fully automatic pair comes from the first trusted directory
