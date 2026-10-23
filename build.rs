@@ -73,8 +73,11 @@ fn main() {
     );
     inputs.validate().expect("valid build inputs");
     fs::write(out.join("bundle-contract.bin"), &contract_bytes).expect("write embedded bytes");
+    // #[used] retains the static in its object; --undefined also roots that
+    // symbol when the final host link garbage-collects unreferenced sections.
+    println!("cargo:rustc-link-arg-bin=osslscope=-Wl,--undefined=osslscope_bundle_contract_v1");
     fs::write(generated, format!(
-        "#[used]\n#[unsafe(link_section = \".osslscope.bundle_contract\")]\nstatic BUNDLE_CONTRACT: [u8; {}] = *include_bytes!(concat!(env!(\"OUT_DIR\"), \"/bundle-contract.bin\"));\npub fn contract_bytes() -> Option<&'static [u8]> {{ Some(&BUNDLE_CONTRACT) }}\n",
+        "#[used]\n#[unsafe(export_name = \"osslscope_bundle_contract_v1\")]\n#[unsafe(link_section = \".osslscope.bundle_contract\")]\nstatic BUNDLE_CONTRACT: [u8; {}] = *include_bytes!(concat!(env!(\"OUT_DIR\"), \"/bundle-contract.bin\"));\npub fn contract_bytes() -> Option<&'static [u8]> {{ Some(&BUNDLE_CONTRACT) }}\n",
         contract_bytes.len()
     )).expect("write embedding module");
 }

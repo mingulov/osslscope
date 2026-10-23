@@ -483,6 +483,85 @@ fn schema_required_fields_match_closed_rust_records() {
 }
 
 #[test]
+fn required_nullable_build_id_and_exact_payload_identity() {
+    let bytes = package_fixtures::PAYLOAD_BYTES.as_bytes();
+    let missing = edit(bytes, |value| {
+        value["host"]
+            .as_object_mut()
+            .unwrap()
+            .remove("elf_build_id");
+    });
+    assert!(parse_canonical::<PayloadManifest>(&missing).is_err());
+    let payload: PayloadManifest = parse_canonical(bytes).unwrap();
+    assert!(payload.host.elf_build_id.is_none());
+    assert_eq!(canonical_bytes(&payload), bytes);
+    let fixture = records_fixture();
+    assert_eq!(fixture.verify().unwrap().payload_id, sha256(bytes));
+}
+
+#[test]
+fn representable_schema_constraints_match_codec() {
+    let payload_schema: Value =
+        serde_json::from_str(include_str!("../schemas/package-payload-manifest-v1.json")).unwrap();
+    let release_schema: Value =
+        serde_json::from_str(include_str!("../schemas/package-release-index-v1.json")).unwrap();
+    assert_eq!(
+        payload_schema["$defs"]["host"]["properties"]["elf_machine"]["const"],
+        json!(62)
+    );
+    assert_eq!(
+        payload_schema["properties"]["build_inputs"]["allOf"][1]["properties"]["path"]["const"],
+        json!("build-inputs.json")
+    );
+    assert_eq!(
+        payload_schema["properties"]["contract"]["allOf"][1]["properties"]["path"]["const"],
+        json!("bundle-contract.json")
+    );
+    assert_eq!(
+        release_schema["$defs"]["release_profile"]["properties"]["abi_profile"]["enum"],
+        json!(["linux-x86_64-gnu", "linux-x86_64-musl"])
+    );
+    let role_cases = [
+        ("harvest", "osslscope-harvest"),
+        ("count", "osslscope-count"),
+        ("members", "osslscope-members"),
+    ];
+    for (index, (role, file)) in role_cases.into_iter().enumerate() {
+        assert_eq!(
+            payload_schema["$defs"]["role"]["oneOf"][index]["properties"]["role"]["const"],
+            json!(role)
+        );
+        assert_eq!(
+            payload_schema["$defs"]["role"]["oneOf"][index]["properties"]["file"]["const"],
+            json!(file)
+        );
+    }
+    let valid: PayloadManifest =
+        parse_canonical(package_fixtures::PAYLOAD_BYTES.as_bytes()).unwrap();
+    assert_eq!(valid.host.elf_machine, 62);
+    for changed in [
+        edit(package_fixtures::PAYLOAD_BYTES.as_bytes(), |v| {
+            v["host"]["elf_machine"] = json!(63)
+        }),
+        edit(package_fixtures::PAYLOAD_BYTES.as_bytes(), |v| {
+            v["build_inputs"]["path"] = json!("other.json")
+        }),
+        edit(package_fixtures::PAYLOAD_BYTES.as_bytes(), |v| {
+            v["contract"]["path"] = json!("other.json")
+        }),
+        edit(package_fixtures::PAYLOAD_BYTES.as_bytes(), |v| {
+            v["roles"][0]["file"] = json!("osslscope-count")
+        }),
+    ] {
+        assert!(parse_canonical::<PayloadManifest>(&changed).is_err());
+    }
+    let changed = edit(package_fixtures::INDEX_BYTES.as_bytes(), |v| {
+        v["profiles"][0]["abi_profile"] = json!("linux-arm64-gnu")
+    });
+    assert!(parse_canonical::<ReleaseIndex>(&changed).is_err());
+}
+
+#[test]
 fn release_index_is_closed_and_cannot_hash_itself() {
     let bytes = package_fixtures::INDEX_BYTES.as_bytes();
     let index: ReleaseIndex = parse_canonical(bytes).unwrap();
@@ -756,5 +835,73 @@ fn embedded_contract_is_same_static_section_bytes() {
     assert!(
         !output.status.success(),
         "incomplete descriptor directory accepted"
+    );
+}
+
+#[test]
+fn embedded_contract_survives_host_without_accessor_reference() {
+    let nonce = format!(
+        "no-accessor-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let base = std::env::var_os("OSSL_PACKAGE_TEST_PRIVATE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let records = base.join(format!("{nonce}-records"));
+    fs::create_dir_all(&records).unwrap();
+    fs::write(records.join("build-inputs.json"), INPUT_BYTES).unwrap();
+    fs::write(
+        records.join("bundle-contract.json"),
+        package_fixtures::CONTRACT_BYTES,
+    )
+    .unwrap();
+    let target_base = std::env::var_os("OSSL_PACKAGE_EMBED_TEST_TARGET")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| base.join("embedding-target"));
+    let target = target_base.join(&nonce);
+    let output = Command::new("cargo")
+        .args([
+            "+1.88.0",
+            "build",
+            "--locked",
+            "--offline",
+            "--bin",
+            "osslscope",
+        ])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .env("CARGO_NET_OFFLINE", "true")
+        .env("CARGO_BUILD_JOBS", "2")
+        .env("CARGO_TARGET_DIR", &target)
+        .env("OSSL_PACKAGE_RECORD_DIR", &records)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let host = target.join("debug/osslscope");
+    exactly_one_contract_section(&host).unwrap();
+    let dump = base.join(format!("{nonce}-extracted.bin"));
+    let output = Command::new("objcopy")
+        .arg(format!(
+            "--dump-section=.osslscope.bundle_contract={}",
+            dump.display()
+        ))
+        .arg(&host)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read(dump).unwrap(),
+        package_fixtures::CONTRACT_BYTES.as_bytes()
     );
 }

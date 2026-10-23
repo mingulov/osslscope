@@ -208,7 +208,13 @@ pub struct HostEntry {
     pub sha256: Digest,
     pub bytes: u64,
     pub elf_machine: u16,
+    #[serde(deserialize_with = "required_nullable_build_id")]
     pub elf_build_id: Option<String>,
+}
+fn required_nullable_build_id<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    Option::<String>::deserialize(deserializer)
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -615,6 +621,11 @@ pub fn parse_canonical<T: PackageRecord>(bytes: &[u8]) -> Result<T, PackageError
     let record: T =
         serde_json::from_value(value.0).map_err(|e| PackageError::invalid(e.to_string()))?;
     record.validate()?;
+    if canonical_bytes(&record) != bytes {
+        return Err(PackageError::invalid(
+            "typed record changed canonical bytes",
+        ));
+    }
     Ok(record)
 }
 

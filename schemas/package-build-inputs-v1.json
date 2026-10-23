@@ -60,9 +60,7 @@
           ]
         },
         "elf_machine": {
-          "maximum": 65535,
-          "minimum": 0,
-          "type": "integer"
+          "const": 62
         },
         "path": {
           "pattern": "^(?!.*(?:^|/)\\.{1,2}(?:/|$))[^/\\\\\\x00-\\x1f\\x7f-\\x9f]+(?:/[^/\\\\\\x00-\\x1f\\x7f-\\x9f]+)*$",
@@ -223,7 +221,10 @@
       "additionalProperties": false,
       "properties": {
         "abi_profile": {
-          "type": "string"
+          "enum": [
+            "linux-x86_64-gnu",
+            "linux-x86_64-musl"
+          ]
         },
         "bundle_id": {
           "pattern": "^[0-9a-f]{64}$",
@@ -243,6 +244,38 @@
     },
     "role": {
       "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "file": {
+              "const": "osslscope-harvest"
+            },
+            "role": {
+              "const": "harvest"
+            }
+          }
+        },
+        {
+          "properties": {
+            "file": {
+              "const": "osslscope-count"
+            },
+            "role": {
+              "const": "count"
+            }
+          }
+        },
+        {
+          "properties": {
+            "file": {
+              "const": "osslscope-members"
+            },
+            "role": {
+              "const": "members"
+            }
+          }
+        }
+      ],
       "properties": {
         "bytes": {
           "maximum": 18446744073709551615,
