@@ -367,7 +367,7 @@ impl ClassifierMapOps for NativeOps {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::os::fd::RawFd;
     use std::os::unix::net::UnixStream;
@@ -454,6 +454,41 @@ mod tests {
         fn clones_closed(&self) {
             assert_eq!(self.closed_checks, self.events.len());
         }
+    }
+
+    /// Loader host policy tests use the real initializer on its scoped
+    /// classifier handles, with only the kernel map operations modeled.
+    pub(crate) fn host_initialize_members(
+        handles: &HashMap<String, OwnedFd>,
+        fail_stage: Option<&'static str>,
+    ) -> anyhow::Result<()> {
+        let mut ops = RecordingOps::default();
+        for (name, fd) in handles {
+            assert_eq!(name, "ALG_CLASS");
+            ops.maps.insert(
+                fd.as_raw_fd(),
+                FakeMap {
+                    info: ClassifierMapInfo {
+                        id: 101,
+                        map_type: 1,
+                        key_size: 8,
+                        value_size: 42,
+                        max_entries: 1024,
+                        flags: 0,
+                    },
+                    values: BTreeMap::new(),
+                    frozen: false,
+                },
+            );
+        }
+        ops.fail = fail_stage.map(|stage| (101, stage));
+        let result = initialize_with(handles, ClassifierRole::Members, &mut ops);
+        if result.is_ok() {
+            assert_eq!(ops.maps.len(), 1);
+            assert!(ops.maps.values().all(|map| map.frozen));
+        }
+        ops.clones_closed();
+        result
     }
 
     impl ClassifierMapOps for RecordingOps {

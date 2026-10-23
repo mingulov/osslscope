@@ -12,7 +12,7 @@
 //! unknown relocs, dim mismatch, non-GPL license) is an error, and
 //! map-fd fixups assert `BPF_PSEUDO_MAP_FD` at the site.
 use std::collections::{HashMap, HashSet};
-use std::os::fd::{AsRawFd as _, OwnedFd};
+use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd};
 
 /// BPF relocation types (from `readelf -r` on the real object).
 const R_BPF_64_64: u32 = 1;
@@ -2558,6 +2558,55 @@ pub struct SubsetAttached {
     pub failed: Vec<FailedSlot>,
 }
 
+// Only the native link and CTRL operations vary in host policy tests.
+// Selection, failure handling, ownership, and the classifier gate below
+// are the same routines used by the public constructors.
+trait MemberAttachOps {
+    fn entry(&mut self, prog: BorrowedFd<'_>) -> anyhow::Result<OwnedFd>;
+    fn member(&mut self, prog: BorrowedFd<'_>, slot: u32) -> anyhow::Result<OwnedFd>;
+    fn ctrl(
+        &mut self,
+        maps: &HashMap<String, OwnedFd>,
+        value: &osslscope_ebpf_common::CtrlValue,
+    ) -> anyhow::Result<()>;
+}
+
+struct NativeMemberAttachOps<'a> {
+    exe: &'a std::ffi::CStr,
+    off: u64,
+    pid: u32,
+}
+
+impl MemberAttachOps for NativeMemberAttachOps<'_> {
+    fn entry(&mut self, prog: BorrowedFd<'_>) -> anyhow::Result<OwnedFd> {
+        Ok(ossl_bpf_sys::link_create_uprobe_multi(
+            prog.as_raw_fd(),
+            self.exe,
+            &[self.off],
+            &[osslscope_ebpf_common::MEMBER_ENTRY_COOKIE],
+            self.pid,
+        )?)
+    }
+
+    fn member(&mut self, prog: BorrowedFd<'_>, slot: u32) -> anyhow::Result<OwnedFd> {
+        Ok(ossl_bpf_sys::link_create_uretprobe_multi(
+            prog.as_raw_fd(),
+            self.exe,
+            &[self.off],
+            &[slot as u64],
+            self.pid,
+        )?)
+    }
+
+    fn ctrl(
+        &mut self,
+        maps: &HashMap<String, OwnedFd>,
+        value: &osslscope_ebpf_common::CtrlValue,
+    ) -> anyhow::Result<()> {
+        program_ctrl(maps, value)
+    }
+}
+
 pub fn attach_members_subset(
     obj: &std::path::Path,
     exe: &std::ffi::CStr,
@@ -2605,6 +2654,31 @@ pub fn attach_members_subset_from_bytes(
     let prep = prepare(bytes, &MEMBER_MAPS, &specs).context("prepare members.o subset")?;
     // Keep-good load: one rejection is recorded, the rest proceed.
     let (loaded, load_failed) = load_keep_good(&prep).context("load members.o subset")?;
+    let mut ops = NativeMemberAttachOps { exe, off, pid };
+    attach_subset_loaded(
+        loaded,
+        load_failed,
+        want,
+        ctrl,
+        |handles| {
+            crate::discovery::classifier_maps::initialize_classifier_maps(
+                handles,
+                crate::discovery::classifier_maps::ClassifierRole::Members,
+            )
+        },
+        &mut ops,
+    )
+}
+
+fn attach_subset_loaded<I: FnOnce(&HashMap<String, OwnedFd>) -> anyhow::Result<()>>(
+    loaded: Loaded,
+    load_failed: Vec<FailedProg>,
+    want: Vec<u32>,
+    ctrl: &osslscope_ebpf_common::CtrlValue,
+    initialize: I,
+    ops: &mut impl MemberAttachOps,
+) -> anyhow::Result<SubsetAttached> {
+    use anyhow::Context as _;
     if !loaded.progs.contains_key("member_entry") {
         anyhow::bail!("selective attach: member_entry rejected, no census possible");
     }
@@ -2613,21 +2687,11 @@ pub fn attach_members_subset_from_bytes(
         crate::discovery::classifier_maps::ClassifierRole::Members,
     )?;
     crate::discovery::classifier_maps::after_classifier_init(
-        move || {
-            crate::discovery::classifier_maps::initialize_classifier_maps(
-                &classifier_handles,
-                crate::discovery::classifier_maps::ClassifierRole::Members,
-            )
-        },
+        move || initialize(&classifier_handles),
         || {
-            let entry = ossl_bpf_sys::link_create_uprobe_multi(
-                loaded.progs["member_entry"].as_raw_fd(),
-                exe,
-                &[off],
-                &[osslscope_ebpf_common::MEMBER_ENTRY_COOKIE],
-                pid,
-            )
-            .context("attach member_entry")?;
+            let entry = ops
+                .entry(loaded.progs["member_entry"].as_fd())
+                .context("attach member_entry")?;
             // Keep-good attach: one link failure is recorded, the rest
             // proceed. EXPECTED programs to the ATTACHED count (the
             // retire equation counts attached members, not wanted ones).
@@ -2651,13 +2715,7 @@ pub fn attach_members_subset_from_bytes(
                 let Some(prog) = loaded.progs.get(&name) else {
                     continue; // load rejection already recorded above
                 };
-                match ossl_bpf_sys::link_create_uretprobe_multi(
-                    prog.as_raw_fd(),
-                    exe,
-                    &[off],
-                    &[j as u64],
-                    pid,
-                ) {
+                match ops.member(prog.as_fd(), j) {
                     Ok(link) => {
                         members.push(link);
                         attached_slots.push(j);
@@ -2674,7 +2732,8 @@ pub fn attach_members_subset_from_bytes(
             }
             let mut actual_ctrl = *ctrl;
             actual_ctrl.expected = attached_slots.len() as u32;
-            program_ctrl(&loaded.maps, &actual_ctrl).context("program CTRL")?;
+            ops.ctrl(&loaded.maps, &actual_ctrl)
+                .context("program CTRL")?;
             failed.sort_by_key(|f| f.slot);
             Ok(SubsetAttached {
                 attached: MembersAttached {
@@ -2726,27 +2785,38 @@ pub fn attach_members_from_bytes(
     ensure_members_fd_budget()?;
     let prep = prepare(bytes, &MEMBER_MAPS, &MEMBER_PROGS).context("prepare members.o")?;
     let loaded = load(&prep).context("load members.o")?;
-    program_ctrl(&loaded.maps, ctrl).context("program CTRL")?;
+    let mut ops = NativeMemberAttachOps { exe, off, pid };
+    attach_full_loaded(
+        loaded,
+        ctrl,
+        |handles| {
+            crate::discovery::classifier_maps::initialize_classifier_maps(
+                handles,
+                crate::discovery::classifier_maps::ClassifierRole::Members,
+            )
+        },
+        &mut ops,
+    )
+}
+
+fn attach_full_loaded<I: FnOnce(&HashMap<String, OwnedFd>) -> anyhow::Result<()>>(
+    loaded: Loaded,
+    ctrl: &osslscope_ebpf_common::CtrlValue,
+    initialize: I,
+    ops: &mut impl MemberAttachOps,
+) -> anyhow::Result<MembersAttached> {
+    use anyhow::Context as _;
+    ops.ctrl(&loaded.maps, ctrl).context("program CTRL")?;
     let classifier_handles = crate::discovery::classifier_maps::clone_classifier_handles(
         &loaded.maps,
         crate::discovery::classifier_maps::ClassifierRole::Members,
     )?;
     crate::discovery::classifier_maps::after_classifier_init(
-        move || {
-            crate::discovery::classifier_maps::initialize_classifier_maps(
-                &classifier_handles,
-                crate::discovery::classifier_maps::ClassifierRole::Members,
-            )
-        },
+        move || initialize(&classifier_handles),
         || {
-            let entry = ossl_bpf_sys::link_create_uprobe_multi(
-                loaded.progs["member_entry"].as_raw_fd(),
-                exe,
-                &[off],
-                &[osslscope_ebpf_common::MEMBER_ENTRY_COOKIE],
-                pid,
-            )
-            .context("attach member_entry")?;
+            let entry = ops
+                .entry(loaded.progs["member_entry"].as_fd())
+                .context("attach member_entry")?;
             let mut members = Vec::with_capacity(512);
             for j in 0..512u64 {
                 let name = format!("member_{j:03}");
@@ -2755,14 +2825,8 @@ pub fn attach_members_from_bytes(
                     .get(&name)
                     .with_context(|| format!("prog {name} missing"))?;
                 members.push(
-                    ossl_bpf_sys::link_create_uretprobe_multi(
-                        prog.as_raw_fd(),
-                        exe,
-                        &[off],
-                        &[j],
-                        pid,
-                    )
-                    .with_context(|| format!("attach {name}"))?,
+                    ops.member(prog.as_fd(), j as u32)
+                        .with_context(|| format!("attach {name}"))?,
                 );
             }
             Ok(MembersAttached {
@@ -2810,6 +2874,285 @@ fn spill_verifier_log(prog: &str, log: &[u8]) -> Option<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::net::UnixStream;
+
+    fn model_fd() -> OwnedFd {
+        let (fd, _peer) = UnixStream::pair().unwrap();
+        fd.into()
+    }
+
+    fn model_loaded(slots: &[u32]) -> Loaded {
+        let mut progs = HashMap::from([("member_entry".to_owned(), model_fd())]);
+        for &slot in slots {
+            progs.insert(format!("member_{slot:03}"), model_fd());
+        }
+        Loaded {
+            progs,
+            maps: HashMap::from([
+                ("ALG_CLASS".to_owned(), model_fd()),
+                ("CTRL".to_owned(), model_fd()),
+            ]),
+        }
+    }
+
+    fn model_identity(fd: &OwnedFd) -> std::path::PathBuf {
+        std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd())).unwrap()
+    }
+
+    fn loaded_identities(loaded: &Loaded) -> Vec<std::path::PathBuf> {
+        loaded
+            .progs
+            .values()
+            .chain(loaded.maps.values())
+            .map(model_identity)
+            .collect()
+    }
+
+    fn assert_identities_closed(identities: &[std::path::PathBuf]) {
+        let open: Vec<_> = std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+            .collect();
+        for identity in identities {
+            assert!(
+                !open.contains(identity),
+                "owned descriptor leaked: {identity:?}"
+            );
+        }
+    }
+
+    #[derive(Default)]
+    struct ModelMemberOps {
+        entry_calls: usize,
+        member_calls: Vec<u32>,
+        ctrl_expected: Vec<u32>,
+        fail_member: Option<u32>,
+        fail_ctrl: bool,
+        link_identities: Vec<std::path::PathBuf>,
+    }
+
+    impl ModelMemberOps {
+        fn link(&mut self) -> OwnedFd {
+            let fd = model_fd();
+            self.link_identities
+                .push(std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd())).unwrap());
+            fd
+        }
+
+        fn assert_links_closed(&self) {
+            assert_identities_closed(&self.link_identities);
+        }
+    }
+
+    impl MemberAttachOps for ModelMemberOps {
+        fn entry(&mut self, _prog: std::os::fd::BorrowedFd<'_>) -> anyhow::Result<OwnedFd> {
+            self.entry_calls += 1;
+            Ok(self.link())
+        }
+
+        fn member(
+            &mut self,
+            _prog: std::os::fd::BorrowedFd<'_>,
+            slot: u32,
+        ) -> anyhow::Result<OwnedFd> {
+            self.member_calls.push(slot);
+            if self.fail_member == Some(slot) {
+                anyhow::bail!("injected member link failure");
+            }
+            Ok(self.link())
+        }
+
+        fn ctrl(
+            &mut self,
+            maps: &HashMap<String, OwnedFd>,
+            value: &osslscope_ebpf_common::CtrlValue,
+        ) -> anyhow::Result<()> {
+            assert!(maps.contains_key("CTRL"));
+            self.ctrl_expected.push(value.expected);
+            if self.fail_ctrl {
+                anyhow::bail!("injected CTRL failure");
+            }
+            Ok(())
+        }
+    }
+
+    fn model_initialize(maps: &HashMap<String, OwnedFd>) -> anyhow::Result<()> {
+        crate::discovery::classifier_maps::tests::host_initialize_members(maps, None)
+    }
+
+    #[test]
+    fn member_postload_classifier_failure_creates_no_links() {
+        let loaded = model_loaded(&[1, 3]);
+        let identities = loaded_identities(&loaded);
+        let mut ops = ModelMemberOps::default();
+        let ctrl = osslscope_ebpf_common::ctrl_value(2, 1, 1 << 22);
+        let result = attach_subset_loaded(
+            loaded,
+            Vec::new(),
+            vec![1, 3],
+            &ctrl,
+            |maps| {
+                crate::discovery::classifier_maps::tests::host_initialize_members(
+                    maps,
+                    Some("freeze"),
+                )
+            },
+            &mut ops,
+        );
+        assert!(result.is_err());
+        assert_eq!(ops.entry_calls, 0);
+        assert!(ops.member_calls.is_empty());
+        assert!(ops.ctrl_expected.is_empty());
+        ops.assert_links_closed();
+        assert_identities_closed(&identities);
+    }
+
+    #[test]
+    fn member_postload_subset_keeps_good_and_writes_actual_expected() {
+        let loaded = model_loaded(&[1, 3]);
+        let mut ops = ModelMemberOps {
+            fail_member: Some(3),
+            ..Default::default()
+        };
+        let ctrl = osslscope_ebpf_common::ctrl_value(3, 1, 1 << 22);
+        let want = normalize_slots(&[7, 3, 1, 7]).unwrap();
+        let outcome = attach_subset_loaded(
+            loaded,
+            vec![FailedProg {
+                prog: "member_007".into(),
+                error: "verifier reject".into(),
+            }],
+            want,
+            &ctrl,
+            model_initialize,
+            &mut ops,
+        )
+        .unwrap();
+        assert_eq!(ops.entry_calls, 1);
+        assert_eq!(ops.member_calls, [1, 3]);
+        assert_eq!(ops.ctrl_expected, [1]);
+        assert_eq!(outcome.slots, [1]);
+        assert_eq!(
+            outcome
+                .failed
+                .iter()
+                .map(|f| (f.slot, f.stage))
+                .collect::<Vec<_>>(),
+            [(3, "attach"), (7, "load")]
+        );
+        assert_eq!(outcome.attached.members.len(), 1);
+        drop(outcome);
+        ops.assert_links_closed();
+    }
+
+    #[test]
+    fn member_postload_full_refuses_after_partial_links() {
+        let loaded = model_loaded(&[0, 1]);
+        let identities = loaded_identities(&loaded);
+        let unrelated = model_fd();
+        let unrelated_identity = model_identity(&unrelated);
+        let mut ops = ModelMemberOps {
+            fail_member: Some(1),
+            ..Default::default()
+        };
+        let ctrl = osslscope_ebpf_common::ctrl_value(512, 1, 1 << 22);
+        let error = attach_full_loaded(loaded, &ctrl, model_initialize, &mut ops)
+            .err()
+            .expect("full attach must refuse member failure");
+        assert!(format!("{error:#}").contains("attach member_001"));
+        assert_eq!(ops.ctrl_expected, [512]);
+        assert_eq!(ops.entry_calls, 1);
+        assert_eq!(ops.member_calls, [0, 1]);
+        assert_eq!(ops.link_identities.len(), 2);
+        ops.assert_links_closed();
+        assert_identities_closed(&identities);
+        assert_eq!(model_identity(&unrelated), unrelated_identity);
+    }
+
+    #[test]
+    fn member_postload_full_classifier_failure_creates_no_links() {
+        let loaded = model_loaded(&[]);
+        let identities = loaded_identities(&loaded);
+        let mut ops = ModelMemberOps::default();
+        let ctrl = osslscope_ebpf_common::ctrl_value(512, 1, 1 << 22);
+        assert!(
+            attach_full_loaded(
+                loaded,
+                &ctrl,
+                |maps| crate::discovery::classifier_maps::tests::host_initialize_members(
+                    maps,
+                    Some("final_keys")
+                ),
+                &mut ops,
+            )
+            .is_err()
+        );
+        assert_eq!(ops.ctrl_expected, [512]);
+        assert_eq!(ops.entry_calls, 0);
+        assert!(ops.member_calls.is_empty());
+        assert_identities_closed(&identities);
+    }
+
+    #[test]
+    fn member_postload_subset_all_failed_refuses_without_ctrl() {
+        let loaded = model_loaded(&[3]);
+        let identities = loaded_identities(&loaded);
+        let mut ops = ModelMemberOps {
+            fail_member: Some(3),
+            ..Default::default()
+        };
+        let ctrl = osslscope_ebpf_common::ctrl_value(2, 1, 1 << 22);
+        let error = attach_subset_loaded(
+            loaded,
+            vec![FailedProg {
+                prog: "member_001".into(),
+                error: "verifier reject".into(),
+            }],
+            normalize_slots(&[3, 1]).unwrap(),
+            &ctrl,
+            model_initialize,
+            &mut ops,
+        )
+        .err()
+        .expect("all failed must refuse");
+        assert!(format!("{error:#}").contains("every wanted member failed"));
+        assert_eq!(ops.member_calls, [3]);
+        assert!(ops.ctrl_expected.is_empty());
+        ops.assert_links_closed();
+        assert_identities_closed(&identities);
+    }
+
+    #[test]
+    fn member_postload_subset_ctrl_failure_closes_partial_activation() {
+        let loaded = model_loaded(&[1]);
+        let identities = loaded_identities(&loaded);
+        let unrelated = model_fd();
+        let unrelated_identity = model_identity(&unrelated);
+        let mut ops = ModelMemberOps {
+            fail_ctrl: true,
+            ..Default::default()
+        };
+        let ctrl = osslscope_ebpf_common::ctrl_value(2, 1, 1 << 22);
+        let error = attach_subset_loaded(
+            loaded,
+            vec![FailedProg {
+                prog: "member_003".into(),
+                error: "verifier reject".into(),
+            }],
+            normalize_slots(&[3, 1]).unwrap(),
+            &ctrl,
+            model_initialize,
+            &mut ops,
+        )
+        .err()
+        .expect("CTRL failure must refuse");
+        assert!(format!("{error:#}").contains("program CTRL"));
+        assert_eq!(ops.ctrl_expected, [1]);
+        assert_eq!(ops.link_identities.len(), 2);
+        ops.assert_links_closed();
+        assert_identities_closed(&identities);
+        assert_eq!(model_identity(&unrelated), unrelated_identity);
+    }
 
     fn u16(v: u16) -> [u8; 2] {
         v.to_le_bytes()
