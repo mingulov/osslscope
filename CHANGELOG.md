@@ -3,11 +3,19 @@
 
 ## Unreleased development
 
-- Current report/check emits `observed-crypto-v2.1`: conserved
+- Current report/check emits `observed-crypto-v2.2`: conserved
   physical-site counts, candidate uncertainty, typed coverage/loss/
   window gaps, argv redaction, and three-valued policy rules with
   site and optional ENGINE evidence. See
   [the current contract](docs/observed-crypto-v2.md).
+- Development count completion uses one prepared resource owner,
+  checked count-link closes, explicit partial reads and one retained
+  terminal result. v2.2 preserves programmed admission separately from
+  conservative effective coverage. Equal ledgers alone are no writer
+  witness; all live kernel/source profiles remain unqualified, and
+  grace does not establish process/resource disappearance. See
+  [the proof boundary](docs/what-it-proves.md#terminal-count-proof-in-development)
+  and [count uncertainty responses](docs/partial-runbook.md#terminal-count-uncertainty).
 - Source includes the admitted physical-count ledger, per-key
   accounting, callback-latency collection, traversal integration
   and an eleven-entry exact-build table. These implementations and

@@ -4,7 +4,7 @@
 osslscope observes OpenSSL provider-dispatch callback execution in
 supported Linux targets without changing the application or its
 configuration. Current development emits the
-[v2.1 evidence contract](observed-crypto-v2.md); integrated live and
+[v2.2 evidence contract](observed-crypto-v2.md); integrated live and
 package qualification remains open. The historical `v0.1.0` release
 has its own source-specific qualification and limitations.
 
@@ -62,6 +62,46 @@ Counts are callback entries under disclosed coverage and loss,
 without a success/error split. First/last timestamps locate counted
 entries; they are not callback-duration measurements. Algorithm
 names do not reveal key sizes or parameter-selected digests/ciphers.
+
+## Terminal count proof in development
+
+Equal count scans cannot prove that counting has finished. A callback
+can pass the window check, pause before updating the admitted ledger,
+and later add a call after two apparently equal totals were read.
+
+The development count path prepares one resource owner before acquiring
+count descriptors. At close it seals new commands, attempts to stop
+admission, explicitly closes every inventoried count link, and reads
+the retained maps. A terminal writer witness requires checked final
+close acknowledgments, exclusive link references, the exact writer
+inventory and an applicable reviewed kernel/source profile. Only after
+that witness can a complete read reconcile current, fenced,
+unattributed and known dropped calls. Attribution and coverage retain
+their separate requirements.
+
+**Current live writer proof remains unproven.** The implementation
+admits no live kernel/source profile yet. Host interleaving tests and
+analysis of selected upstream source tags do not qualify an installed
+kernel, vendor backports, actual callback selection or a genuine held
+kernel callback. Increasing grace cannot supply a missing profile.
+For a nonempty count-writer family, current live captures therefore
+disclose count uncertainty even when their observed ledger totals agree.
+
+One grace deadline bounds the coordinator's count wait. Expiry retains
+positive observations and an unknown tail with the same cleanup owner;
+eventual cleanup cannot rewrite the finalized document. A blocked owner
+can outlive that deadline. This design does not establish that the
+observer process and all resources disappear by grace expiry. Actual
+terminal latency, cleanup/recovery, callback rate and added latency,
+ordinary COMPLETE windows, platform coverage and installed-package
+qualification remain open.
+
+The v2.2 document can retain count timestamps within the acknowledged
+programmed admission interval while separately showing a conservative
+effective coverage endpoint. A later observed timestamp is preserved;
+it does not extend effective coverage or prove an unobserved tail.
+See [the contract](observed-crypto-v2.md) and
+[the PARTIAL runbook](partial-runbook.md#terminal-count-uncertainty).
 
 ## Permanent boundaries and forthcoming capabilities
 
