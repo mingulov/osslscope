@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+[package]
+name = "osslscope-bpf-contract"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.88"
+license = "GPL-2.0-or-later"
+publish = false
+
+[lib]
+name = "osslscope_bpf_contract"

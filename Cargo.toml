@@ -32,7 +32,7 @@ aya-obj = "=0.3.0"
 osslscope-ebpf-common = { path = "crates/ebpf-common" }
 
 [workspace]
-members = ["crates/ossl-discover", "crates/manifest", "crates/ebpf-common", "crates/bpf-sys"]
+members = ["crates/ossl-discover", "crates/manifest", "crates/ebpf-common", "crates/bpf-sys", "crates/bpf-contract"]
 # crates/ebpf is deliberately NOT a member: own [workspace] + nightly
 # toolchain so the bpf-target no_std bin never enters a host build
 # (p11scope Task-3 precedent: workspace membership breaks cargo test).

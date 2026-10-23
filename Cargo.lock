@@ -240,6 +240,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "osslscope-bpf-contract"
+version = "0.0.0"
+
+[[package]]
 name = "osslscope-ebpf-common"
 version = "0.1.0"
 dependencies = [
