@@ -1745,6 +1745,70 @@ fn g1_snapshot_pool_never_allocates_a_fourth_image() {
 }
 
 #[test]
+fn g1_snapshot_actual_row_buffers_keep_capacity_and_reuse_addresses() {
+    let probe = MapProbe::new();
+    let engine = map_engine(
+        &probe,
+        MapFaults {
+            keys: (0..8192).collect(),
+            ..MapFaults::default()
+        },
+    );
+    let a = engine.drain(read_request(1)).unwrap().value;
+    let b = engine.drain(read_request(2)).unwrap().value;
+    let c = engine.drain(read_request(3)).unwrap().value;
+    let buffers = [&a, &b, &c].map(|image| (image.rows.as_ptr() as usize, image.rows.capacity()));
+    assert_eq!(buffers.map(|(_, capacity)| capacity), [8192; 3]);
+    assert_ne!(buffers[0].0, buffers[1].0);
+    assert_ne!(buffers[1].0, buffers[2].0);
+    assert_ne!(buffers[0].0, buffers[2].0);
+    for image in [&a, &b, &c] {
+        assert_eq!(image.rows.len(), 8192);
+        assert_eq!(image.rows[0].1.count, 1);
+        assert_eq!(image.rows[8191].1.count, 16383);
+    }
+    println!("Task11 actual full row buffers before reuse: {buffers:?}");
+    drop(a);
+    let recycled_a = engine.drain(read_request(4)).unwrap().value;
+    assert_eq!(
+        (
+            recycled_a.rows.as_ptr() as usize,
+            recycled_a.rows.capacity()
+        ),
+        buffers[0]
+    );
+    assert_eq!(recycled_a.rows.len(), 8192);
+    drop(b);
+    let recycled_b = engine.drain(read_request(5)).unwrap().value;
+    assert_eq!(
+        (
+            recycled_b.rows.as_ptr() as usize,
+            recycled_b.rows.capacity()
+        ),
+        buffers[1]
+    );
+    assert_eq!(recycled_b.rows.len(), 8192);
+    assert_eq!(c.rows.len(), 8192);
+    assert_eq!(c.rows[8191].1.count, 16383);
+    let calls = probe.calls.lock().unwrap().len();
+    let failure = engine.drain(read_request(6)).unwrap_err();
+    assert_eq!(failure.failure.class, FailureClass::Capacity);
+    assert_eq!(failure.completion, CommandCompletion::NotEntered);
+    assert_eq!(
+        probe.calls.lock().unwrap().len(),
+        calls,
+        "all three actual buffers are pinned; a fourth read must not begin"
+    );
+    assert_eq!(recycled_a.rows[8191].1.count, 16383);
+    assert_eq!(recycled_b.rows[8191].1.count, 16383);
+    println!(
+        "Task11 reused actual buffers 0 and 1 with fixed 8192 capacities; pinned third unchanged; fourth read refused before I/O"
+    );
+    drop(engine);
+    probe.cleanup();
+}
+
+#[test]
 fn g1_snapshot_publication_contention_uses_retained_view() {
     let probe = MapProbe::new();
     let engine = Arc::new(map_engine(
@@ -5376,8 +5440,18 @@ enum WriterStage {
 struct PhysicalAdmission {
     invocation_id: u64,
     site: u32,
+    cpu: usize,
     generation: Option<u32>,
     actual_sample_ns: u64,
+    known_drop: bool,
+}
+#[derive(Clone, Copy)]
+struct PhysicalCall {
+    site: u32,
+    cpu: usize,
+    sample_ns: u64,
+    fresh: bool,
+    fail_insert: bool,
 }
 #[derive(Default)]
 struct PhysicalLedger(Mutex<Vec<PhysicalAdmission>>);
@@ -5396,6 +5470,7 @@ struct WriterMaps {
 struct StagedWriter {
     ledger: PhysicalLedger,
     maps: Mutex<WriterMaps>,
+    maps_cpu1: Mutex<WriterMaps>,
     hold: Option<WriterStage>,
     stage: Mutex<Option<WriterStage>>,
     changed: Condvar,
@@ -5408,6 +5483,7 @@ impl StagedWriter {
         Arc::new(Self {
             ledger: PhysicalLedger::default(),
             maps: Mutex::new(WriterMaps::default()),
+            maps_cpu1: Mutex::new(WriterMaps::default()),
             hold,
             stage: Mutex::new(None),
             changed: Condvar::new(),
@@ -5460,6 +5536,29 @@ impl StagedWriter {
         hold_enabled: bool,
         sample_ns: u64,
     ) -> thread::JoinHandle<()> {
+        self.run_physical(
+            PhysicalCall {
+                site: 100,
+                cpu: 0,
+                sample_ns,
+                fresh,
+                fail_insert,
+            },
+            hold_enabled,
+        )
+    }
+    fn cpu_maps(&self, cpu: usize) -> &Mutex<WriterMaps> {
+        match cpu {
+            0 => &self.maps,
+            1 => &self.maps_cpu1,
+            _ => panic!("fixture has exactly two possible CPUs"),
+        }
+    }
+    fn run_physical(
+        self: &Arc<Self>,
+        call: PhysicalCall,
+        hold_enabled: bool,
+    ) -> thread::JoinHandle<()> {
         self.returned.store(false, Ordering::Release);
         let writer = Arc::clone(self);
         thread::spawn(move || {
@@ -5470,41 +5569,48 @@ impl StagedWriter {
                 let index = ledger.len();
                 ledger.push(PhysicalAdmission {
                     invocation_id: index as u64 + 1,
-                    site: 100,
+                    site: call.site,
+                    cpu: call.cpu,
                     generation: None,
-                    actual_sample_ns: sample_ns,
+                    actual_sample_ns: call.sample_ns,
+                    known_drop: call.fail_insert,
                 });
                 index
             };
             writer.at(WriterStage::WindowPassed, hold_enabled);
-            writer.maps.lock().unwrap().admitted += 1;
+            writer.cpu_maps(call.cpu).lock().unwrap().admitted += 1;
             writer.at(WriterStage::AdmittedLedger, hold_enabled);
             // GEN is sampled by this producer after ADMITTED, independently of
             // both count-map lookup and the eventual controller's routing.
             let generation = writer.generation.load(Ordering::Acquire);
             writer.ledger.0.lock().unwrap()[physical_index].generation = Some(generation);
             writer.at(WriterStage::GenerationRead, hold_enabled);
-            let key = osslscope_ebpf_common::make_key(100, generation);
+            let key = osslscope_ebpf_common::make_key(call.site, generation);
             let existing = writer.maps.lock().unwrap().rows.get(&key).is_some();
             assert_eq!(
-                existing, !fresh,
+                existing, !call.fresh,
                 "the existing branch requires a real successful lookup"
             );
             writer.at(WriterStage::ExistingLookup, hold_enabled);
-            if fresh {
-                if !fail_insert {
-                    writer
-                        .maps
-                        .lock()
-                        .unwrap()
-                        .rows
-                        .insert(key, Default::default());
+            if call.fresh {
+                if !call.fail_insert {
+                    // A successful per-CPU hash insertion creates the key on
+                    // every CPU, including untouched zero-valued slots.
+                    for cpu in 0..2 {
+                        writer
+                            .cpu_maps(cpu)
+                            .lock()
+                            .unwrap()
+                            .rows
+                            .entry(key)
+                            .or_default();
+                    }
                 }
                 writer.at(WriterStage::FreshInsert, hold_enabled);
             }
             {
-                let mut maps = writer.maps.lock().unwrap();
-                if fail_insert {
+                let mut maps = writer.cpu_maps(call.cpu).lock().unwrap();
+                if call.fail_insert {
                     maps.dropfail += 1;
                 } else {
                     let row = maps
@@ -5512,16 +5618,16 @@ impl StagedWriter {
                         .get_mut(&key)
                         .expect("existing or successful fresh relookup");
                     if row.count == 0 {
-                        row.first_ns = sample_ns;
+                        row.first_ns = call.sample_ns;
                     }
                     row.count += 1;
-                    row.last_ns = sample_ns;
+                    row.last_ns = call.sample_ns;
                 }
             }
             writer.at(WriterStage::CountOrDrop, hold_enabled);
-            if fresh {
+            if call.fresh {
                 writer.at(WriterStage::BeforeLatc, hold_enabled);
-                writer.maps.lock().unwrap().latc += 1;
+                writer.cpu_maps(call.cpu).lock().unwrap().latc += 1;
             }
             writer.at(WriterStage::LastMutation, hold_enabled);
             writer.at(WriterStage::Returned, hold_enabled);
@@ -5723,25 +5829,33 @@ impl CountIoDriver for TerminalDriver {
                 gate.hold();
             }
         }
-        let maps = writer.maps.lock().unwrap();
+        let maps = [
+            writer.maps.lock().unwrap(),
+            writer.maps_cpu1.lock().unwrap(),
+        ];
         value.fill(0);
         if map == CountMap::Counts {
-            let row = maps
-                .rows
-                .get(&k)
-                .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
-            value[..8].copy_from_slice(&row.count.to_ne_bytes());
-            value[8..16].copy_from_slice(&row.first_ns.to_ne_bytes());
-            value[16..24].copy_from_slice(&row.last_ns.to_ne_bytes());
+            if !maps[0].rows.contains_key(&k) {
+                return Err(io::Error::from_raw_os_error(libc::ENOENT));
+            }
+            for (cpu, slot) in value.chunks_exact_mut(24).enumerate() {
+                if let Some(row) = maps[cpu].rows.get(&k) {
+                    slot[..8].copy_from_slice(&row.count.to_ne_bytes());
+                    slot[8..16].copy_from_slice(&row.first_ns.to_ne_bytes());
+                    slot[16..24].copy_from_slice(&row.last_ns.to_ne_bytes());
+                }
+            }
         } else {
-            let n = match map {
-                CountMap::Admitted => maps.admitted,
-                CountMap::Dropfail => maps.dropfail,
-                CountMap::Latc if k == 0 => maps.latc,
-                CountMap::Latc => 0,
-                _ => panic!("invalid model read"),
-            };
-            value[..8].copy_from_slice(&n.to_ne_bytes());
+            for (cpu, slot) in value.chunks_exact_mut(8).enumerate() {
+                let n = match map {
+                    CountMap::Admitted => maps[cpu].admitted,
+                    CountMap::Dropfail => maps[cpu].dropfail,
+                    CountMap::Latc if k == 0 => maps[cpu].latc,
+                    CountMap::Latc => 0,
+                    _ => panic!("invalid model read"),
+                };
+                slot.copy_from_slice(&n.to_ne_bytes());
+            }
         }
         Ok(())
     }
@@ -6079,6 +6193,323 @@ fn g1_terminal_staged_writer_holds_and_no_hold_twins() {
             }
         }
     }
+}
+
+// Reuse the staged physical producer through the actual session, mailbox,
+// reader and router. Two CPU slots contribute to one shared physical key;
+// the independently recorded invocation IDs never come from count rows.
+fn physical_session(
+    writer: &Arc<StagedWriter>,
+) -> (
+    crate::count_session::CountSession<SessionOwnerPort>,
+    Arc<MapProbe>,
+    SessionPlan,
+) {
+    let probe = MapProbe::new();
+    let mut session = crate::count_session::CountSession::new(
+        1,
+        session_owner_port(&probe, Some(Arc::clone(writer)), TerminalFaults::default()),
+    );
+    let plan = SessionPlan::new(3);
+    plan.attach(&mut session, 7);
+    for position in 0..3 {
+        assert_eq!(plan.cookie(&session, position), position as u32);
+    }
+    session
+        .open_window(1000, 2000, Instant::now() + Duration::from_secs(5))
+        .unwrap();
+    for (site, cpu, sample_ns, fresh) in
+        [(0, 0, 1100, true), (0, 1, 1120, false), (1, 1, 1130, true)]
+    {
+        writer
+            .run_physical(
+                PhysicalCall {
+                    site,
+                    cpu,
+                    sample_ns,
+                    fresh,
+                    fail_insert: false,
+                },
+                false,
+            )
+            .join()
+            .unwrap();
+    }
+    plan.attach(&mut session, 9);
+    session
+        .fence(
+            crate::count_session::FenceReason::CandidatesChanged,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+    for (cpu, sample_ns, fresh) in [(1, 1200, true), (0, 1210, false)] {
+        writer
+            .run_physical(
+                PhysicalCall {
+                    site: 0,
+                    cpu,
+                    sample_ns,
+                    fresh,
+                    fail_insert: false,
+                },
+                false,
+            )
+            .join()
+            .unwrap();
+    }
+    let retained = crate::count_session::tests::read_for_fixture(
+        &mut session,
+        Instant::now() + Duration::from_secs(5),
+    );
+    assert_eq!(retained.current.iter().map(|s| s.calls).sum::<u64>(), 2);
+    assert_eq!(
+        retained.fenced[0]
+            .sites
+            .iter()
+            .map(|s| s.calls)
+            .sum::<u64>(),
+        3
+    );
+    (session, probe, plan)
+}
+
+fn physical_equality_sample(writer: &StagedWriter) -> (bool, u64) {
+    let maps = [
+        writer.maps.lock().unwrap(),
+        writer.maps_cpu1.lock().unwrap(),
+    ];
+    let admitted = maps.iter().map(|m| m.admitted).sum::<u64>();
+    let counts = maps
+        .iter()
+        .flat_map(|m| m.rows.values())
+        .map(|v| v.count)
+        .sum::<u64>();
+    let drops = maps.iter().map(|m| m.dropfail).sum::<u64>();
+    let physical = writer.ledger.admitted_calls();
+    println!(
+        "Task11 old/faulted equality sample: admitted={admitted} counts={counts} drops={drops} equal={} physical={physical} short={}",
+        admitted == counts + drops,
+        physical.saturating_sub(counts + drops),
+    );
+    (admitted == counts + drops, counts + drops)
+}
+
+fn assert_physical_routing(
+    writer: &StagedWriter,
+    plan: &SessionPlan,
+    drain: &crate::count_session::CountDrain,
+) {
+    let physical = writer.ledger.0.lock().unwrap();
+    assert_eq!(
+        physical.iter().map(|p| p.invocation_id).collect::<Vec<_>>(),
+        [1, 2, 3, 4, 5, 6]
+    );
+    assert_eq!(
+        physical.iter().map(|p| p.cpu).collect::<Vec<_>>(),
+        [0, 1, 1, 1, 0, 1]
+    );
+    assert_eq!(
+        physical
+            .iter()
+            .map(|p| p.actual_sample_ns)
+            .collect::<Vec<_>>(),
+        [1100, 1120, 1130, 1200, 1210, 1500]
+    );
+    assert_eq!(
+        physical
+            .iter()
+            .map(|p| p.generation.unwrap())
+            .collect::<Vec<_>>(),
+        [0, 0, 0, 1, 1, 1]
+    );
+    let mut expected = std::collections::BTreeMap::<(u32, u32), (u64, u64, u64)>::new();
+    for call in physical.iter().filter(|p| !p.known_drop) {
+        let value = expected
+            .entry((call.site, call.generation.unwrap()))
+            .or_insert((0, u64::MAX, 0));
+        value.0 += 1;
+        value.1 = value.1.min(call.actual_sample_ns);
+        value.2 = value.2.max(call.actual_sample_ns);
+    }
+    let mut actual = std::collections::BTreeMap::new();
+    for site in drain
+        .current
+        .iter()
+        .chain(drain.fenced.iter().flat_map(|f| &f.sites))
+    {
+        let position = plan
+            .offsets
+            .iter()
+            .position(|offset| *offset == site.site.offset)
+            .unwrap() as u32;
+        assert!(
+            actual
+                .insert(
+                    (position, site.generation),
+                    (site.calls, site.first_ns, site.last_ns)
+                )
+                .is_none()
+        );
+        assert!(
+            site.candidates
+                .iter()
+                .all(|candidate| candidate.funcid == if site.generation == 0 { 7 } else { 9 })
+        );
+    }
+    assert_eq!(actual, expected);
+    let known_drops = physical.iter().filter(|p| p.known_drop).count() as u64;
+    assert_eq!(
+        session_counter(drain, "count.map_insert_dropped").unwrap_or(0),
+        known_drops
+    );
+    assert_eq!(session_counter(drain, "count.unattributed").unwrap_or(0), 0);
+    assert_eq!(drain.total_calls() + known_drops, physical.len() as u64);
+}
+
+#[test]
+fn g1_terminal_physical_sites_cpus_and_generation_routing() {
+    for (stage, fresh, fail_insert) in [
+        (WriterStage::WindowPassed, true, false),
+        (WriterStage::AdmittedLedger, true, false),
+        (WriterStage::ExistingLookup, false, false),
+        (WriterStage::FreshInsert, true, false),
+        (WriterStage::FreshInsert, true, true),
+        (WriterStage::BeforeLatc, true, false),
+    ] {
+        for held in [true, false] {
+            let writer = StagedWriter::new(held.then_some(stage));
+            let (mut session, probe, plan) = physical_session(&writer);
+            let producer = writer.run_physical(
+                PhysicalCall {
+                    site: if fresh { 2 } else { 0 },
+                    cpu: 1,
+                    sample_ns: 1500,
+                    fresh,
+                    fail_insert,
+                },
+                true,
+            );
+            if held {
+                writer.wait_at(stage);
+            } else {
+                writer.wait_returned();
+            }
+            let (equal, observed) = physical_equality_sample(&writer);
+            if held && stage == WriterStage::WindowPassed {
+                assert!(
+                    equal,
+                    "the equality negative must falsely complete, not return Err"
+                );
+                assert_eq!((observed, writer.ledger.admitted_calls()), (5, 6));
+            }
+            let terminal = thread::scope(|scope| {
+                let closing = scope.spawn(|| session.terminal_shared(session_close()));
+                if held {
+                    probe.owner.wait(|events| {
+                        events.iter().any(|(_, event)| {
+                            matches!(
+                                event,
+                                Event::Registry(RegistryEvent::CloseIssued(ResourceId::Link(_)))
+                            )
+                        })
+                    });
+                    assert!(!writer.returned.load(Ordering::Acquire));
+                    writer.release();
+                }
+                closing.join().unwrap()
+            });
+            producer.join().unwrap();
+            assert!(matches!(
+                terminal.receipt.writers,
+                WriterCompletion::Finished(_)
+            ));
+            assert_physical_routing(&writer, &plan, &terminal.retained_drain);
+            assert_eq!(
+                terminal
+                    .retained_drain
+                    .fenced
+                    .iter()
+                    .flat_map(|f| &f.sites)
+                    .map(|s| s.calls)
+                    .sum::<u64>(),
+                3
+            );
+            assert_eq!(
+                terminal
+                    .receipt
+                    .checkpoint
+                    .as_ref()
+                    .unwrap()
+                    .snapshot
+                    .admitted,
+                Component::Available(6)
+            );
+            assert_eq!(session.backend().terminal_calls, 1);
+            task3_cleanup(&probe.owner, 10);
+            println!(
+                "Task11 {stage:?} held={held} fresh={fresh} fail_insert={fail_insert}: physical=6 conserved after release"
+            );
+        }
+    }
+}
+
+#[test]
+fn g1_terminal_physical_pre_admitted_cutoff_cannot_finalize_equal_short() {
+    let writer = StagedWriter::new(Some(WriterStage::WindowPassed));
+    let (mut session, probe, _plan) = physical_session(&writer);
+    let producer = writer.run_physical(
+        PhysicalCall {
+            site: 2,
+            cpu: 1,
+            sample_ns: 1500,
+            fresh: true,
+            fail_insert: false,
+        },
+        true,
+    );
+    writer.wait_at(WriterStage::WindowPassed);
+    assert_eq!(physical_equality_sample(&writer), (true, 5));
+    // Keep the producer held until coordinator finalization. This makes a
+    // falsely Finished equal/short snapshot deterministic, rather than racing
+    // release against a read or using an arbitrary error as the negative.
+    let terminal = session.terminal_shared(crate::count_session::CloseRequest {
+        started_at: Instant::now(),
+        grace: Duration::from_millis(200),
+        reason: crate::count_session::CloseReason::Interrupted,
+    });
+    let held_at_finalization = !writer.returned.load(Ordering::Acquire);
+    writer.release();
+    producer.join().unwrap();
+    task3_cleanup(&probe.owner, 10);
+    assert!(held_at_finalization);
+    assert!(
+        !matches!(terminal.receipt.writers, WriterCompletion::Finished(_)),
+        "equal/short snapshot falsely Finished while physical=6, finalized={}, receipt={:?}",
+        terminal.retained_drain.total_calls(),
+        terminal.receipt.writers
+    );
+    assert_eq!(terminal.retained_drain.total_calls(), 5);
+    assert_eq!(
+        session_counter(&terminal.retained_drain, "count.quiescence_unknown"),
+        Some(1)
+    );
+    let repeated = session.shared_terminal(terminal.receipt.terminal_id);
+    assert!(Arc::ptr_eq(&terminal, &repeated));
+    assert_eq!(session.backend().terminal_calls, 1);
+    let maps = [
+        writer.maps.lock().unwrap(),
+        writer.maps_cpu1.lock().unwrap(),
+    ];
+    assert_eq!(
+        maps.iter()
+            .flat_map(|m| m.rows.values())
+            .map(|r| r.count)
+            .sum::<u64>(),
+        6
+    );
+    println!(
+        "Task11 pre-ADMITTED cutoff: held at finalization, retained=5 physical=6 unknown tail; after release physical maps=6, finalized Arc unchanged"
+    );
 }
 
 fn mutate_terminal(
