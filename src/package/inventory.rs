@@ -892,8 +892,115 @@ pub fn verify_closure(sealed: &SealedSource) -> Result<(), PackageError> {
     // Enforce the same closed, bounded JSON decoder on generated detached records.
     super::records::decode_closed_json(&expected)?;
     let source = sealed.asset_bytes(&sealed.assets.source_archive)?;
+    sealed.tree.verify_archive(source)?;
     if source.len() as u64 > MAX_ASSET_BYTES {
         return Err(PackageError::invalid("source archive exceeds bound"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+use super::{records::ToolInventory, source::seal_source};
+#[cfg(test)]
+#[path = "../../tests/support/package_source_fixtures.rs"]
+pub(crate) mod source_fixtures;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use source_fixtures::Fixture;
+
+    fn rebind_retained_archive(sealed: &mut SealedSource, archive: &[u8]) {
+        let (assets, retained, required_inputs) = collect_assets(
+            &sealed.tree,
+            &sealed.config,
+            &sealed.dependencies,
+            &sealed.recipe,
+            &sealed.recipe_bytes,
+            archive,
+        )
+        .unwrap();
+        sealed.assets = assets;
+        sealed.retained = retained;
+        sealed.required_inputs = required_inputs;
+        sealed.inputs.offline_inventory_sha256 = sealed.assets.offline_inventory.sha256;
+        sealed.input_bytes = super::super::records::canonical_bytes(&sealed.inputs);
+        assert_eq!(
+            sealed.asset_bytes(&sealed.assets.source_archive).unwrap(),
+            archive
+        );
+        assert_eq!(
+            sealed.inputs.offline_inventory_sha256,
+            sha256(
+                sealed
+                    .asset_bytes(&sealed.assets.offline_inventory)
+                    .unwrap()
+            )
+        );
+        assert_eq!(
+            parse_canonical::<BuildInputs>(&sealed.input_bytes).unwrap(),
+            sealed.inputs
+        );
+    }
+
+    #[test]
+    fn retained_source_member_mismatch_refuses_with_all_outer_identities_rebound() {
+        let fixture = Fixture::new();
+        let mut sealed = seal_source(
+            &fixture.tree(),
+            &fixture.release(),
+            &fixture.dependencies(),
+            &fixture.tool_inventory(),
+        )
+        .unwrap();
+        let original = &fixture.files["tests/fixtures/example.json"];
+        let mut archive = sealed
+            .asset_bytes(&sealed.assets.source_archive)
+            .unwrap()
+            .to_vec();
+        let offset = archive
+            .windows(original.len())
+            .position(|data| data == original)
+            .unwrap();
+        archive[offset] ^= 1;
+        assert!(
+            SourceTree::extract_archive(
+                &archive,
+                &fixture.root.parent().unwrap().join("bad-inner-manifest")
+            )
+            .is_err()
+        );
+        rebind_retained_archive(&mut sealed, &archive);
+        sealed.tree.verify().unwrap();
+        assert!(
+            verify_closure(&sealed).is_err(),
+            "retained changed member was admitted after complete outer rebinding"
+        );
+    }
+
+    #[test]
+    fn retained_source_manifest_must_match_the_admitted_inventory_after_outer_rebinding() {
+        let fixture = Fixture::new();
+        let mut sealed = fixture.seal().unwrap();
+        let path = fixture.root.join("tests/fixtures/example.json");
+        std::fs::write(&path, b"a different complete source version\n").unwrap();
+        let other = fixture.seal().unwrap();
+        let archive = other
+            .asset_bytes(&other.assets.source_archive)
+            .unwrap()
+            .to_vec();
+        std::fs::write(path, &fixture.files["tests/fixtures/example.json"]).unwrap();
+        let extracted = SourceTree::extract_archive(
+            &archive,
+            &fixture.root.parent().unwrap().join("valid-other-source"),
+        )
+        .unwrap();
+        assert_ne!(extracted.identity(), &sealed.original_source);
+        rebind_retained_archive(&mut sealed, &archive);
+        sealed.tree.verify().unwrap();
+        assert!(
+            verify_closure(&sealed).is_err(),
+            "a valid archive of another source inventory was admitted"
+        );
+    }
 }

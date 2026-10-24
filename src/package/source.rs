@@ -234,6 +234,36 @@ struct SourceManifest {
     inventory: OriginalInventory,
 }
 
+impl SourceManifest {
+    fn validate(&self) -> Result<(), PackageError> {
+        check_revision(&self.source.revision)?;
+        if self.schema != "osslscope-source-manifest-v1"
+            || self.inventory.schema != "osslscope-original-source-v1"
+            || sha256(&json_bytes(&self.inventory)?) != self.source.inventory_sha256
+        {
+            return Err(PackageError::invalid("source identity/inventory mismatch"));
+        }
+        validate_nodes(&self.inventory.files)?;
+        Ok(())
+    }
+}
+impl SourceNode {
+    fn read_bytes(&self, root: &Path) -> Result<Vec<u8>, PackageError> {
+        if !matches!(&self.node, SourceNodeKind::File) {
+            return Err(PackageError::invalid(
+                "regular archive read requires a file node",
+            ));
+        }
+        let bytes = read_regular(root, &self.path, MAX_ASSET_BYTES)?;
+        if bytes.len() as u64 != self.bytes || sha256(&bytes) != self.sha256 {
+            return Err(PackageError::Mutated {
+                context: "archive read differs from admitted source node".into(),
+            });
+        }
+        Ok(bytes)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SourceTree {
     pub(crate) root: PathBuf,
@@ -615,15 +645,7 @@ impl SourceTree {
         &self.manifest.source
     }
     pub(crate) fn verify(&self) -> Result<(), PackageError> {
-        check_revision(&self.manifest.source.revision)?;
-        if self.manifest.schema != "osslscope-source-manifest-v1"
-            || self.manifest.inventory.schema != "osslscope-original-source-v1"
-            || sha256(&json_bytes(&self.manifest.inventory)?)
-                != self.manifest.source.inventory_sha256
-        {
-            return Err(PackageError::invalid("source identity/inventory mismatch"));
-        }
-        validate_nodes(&self.manifest.inventory.files)?;
+        self.manifest.validate()?;
         for node in &self.manifest.inventory.files {
             match &node.node {
                 SourceNodeKind::File => {
@@ -675,11 +697,7 @@ impl SourceTree {
         let mut rows = Vec::new();
         for node in &self.manifest.inventory.files {
             let (data, kind, link) = match &node.node {
-                SourceNodeKind::File => (
-                    read_regular(&self.root, &node.path, MAX_ASSET_BYTES)?,
-                    b'0',
-                    "",
-                ),
+                SourceNodeKind::File => (node.read_bytes(&self.root)?, b'0', ""),
                 SourceNodeKind::Symlink { target } => (Vec::new(), b'2', target.as_str()),
             };
             rows.push((
@@ -712,47 +730,18 @@ impl SourceTree {
         output.extend_from_slice(&[0; 1024]);
         Ok(output)
     }
-    pub fn extract_archive(bytes: &[u8], destination: &Path) -> Result<Self, PackageError> {
-        let entries = read_tar(bytes)?;
-        let manifest = entries
-            .iter()
-            .find(|e| e.path == SOURCE_MANIFEST)
-            .ok_or_else(|| PackageError::invalid("missing original source identity"))?;
-        if manifest.kind != b'0' {
-            return Err(PackageError::invalid("source manifest is not regular"));
-        }
-        let parsed: SourceManifest = closed(&manifest.data)?;
-        if json_bytes(&parsed)? != manifest.data {
-            return Err(PackageError::invalid("noncanonical source manifest"));
-        }
-        validate_nodes(&parsed.inventory.files)?;
-        if entries.len() != parsed.inventory.files.len() + 1 {
+    pub(crate) fn verify_archive(&self, bytes: &[u8]) -> Result<(), PackageError> {
+        let (_, manifest) = validate_tree_archive(bytes)?;
+        if manifest != self.manifest {
             return Err(PackageError::invalid(
-                "archive inventory has extra/missing nodes",
+                "retained archive differs from admitted original inventory",
             ));
         }
-        for node in &parsed.inventory.files {
-            let entry = entries
-                .iter()
-                .find(|e| e.path == node.path.as_str())
-                .ok_or_else(|| PackageError::invalid("missing archive source node"))?;
-            let matches = match &node.node {
-                SourceNodeKind::File => {
-                    entry.kind == b'0'
-                        && entry.mode == node.mode & 0o777
-                        && entry.data.len() as u64 == node.bytes
-                        && sha256(&entry.data) == node.sha256
-                }
-                SourceNodeKind::Symlink { target } => {
-                    entry.kind == b'2' && entry.link == *target && entry.mode == 0o777
-                }
-            };
-            if !matches {
-                return Err(PackageError::invalid(
-                    "archive source node identity changed",
-                ));
-            }
-        }
+        Ok(())
+    }
+    pub fn extract_archive(bytes: &[u8], destination: &Path) -> Result<Self, PackageError> {
+        let (entries, parsed) = validate_tree_archive(bytes)?;
+        let manifest_bytes = json_bytes(&parsed)?;
         if destination.exists() {
             return Err(PackageError::invalid(
                 "extraction destination already exists",
@@ -781,13 +770,57 @@ impl SourceTree {
                         .map_err(|e| io_error(e, &entry.path))?;
                 }
             }
-            Self::from_manifest(destination, &manifest.data)
+            Self::from_manifest(destination, &manifest_bytes)
         })();
         if result.is_err() {
             let _ = fs::remove_dir_all(destination);
         }
         result
     }
+}
+
+fn validate_tree_archive(bytes: &[u8]) -> Result<(Vec<TarEntry>, SourceManifest), PackageError> {
+    let entries = read_tar(bytes)?;
+    let manifest = entries
+        .iter()
+        .find(|e| e.path == SOURCE_MANIFEST)
+        .ok_or_else(|| PackageError::invalid("missing original source identity"))?;
+    if manifest.kind != b'0' || manifest.mode != 0o644 {
+        return Err(PackageError::invalid("source manifest is not regular"));
+    }
+    let parsed: SourceManifest = closed(&manifest.data)?;
+    if json_bytes(&parsed)? != manifest.data {
+        return Err(PackageError::invalid("noncanonical source manifest"));
+    }
+    parsed.validate()?;
+    if entries.len() != parsed.inventory.files.len() + 1 {
+        return Err(PackageError::invalid(
+            "archive inventory has extra/missing nodes",
+        ));
+    }
+    for node in &parsed.inventory.files {
+        let entry = entries
+            .iter()
+            .find(|e| e.path == node.path.as_str())
+            .ok_or_else(|| PackageError::invalid("missing archive source node"))?;
+        let matches = match &node.node {
+            SourceNodeKind::File => {
+                entry.kind == b'0'
+                    && entry.mode == node.mode & 0o777
+                    && entry.data.len() as u64 == node.bytes
+                    && sha256(&entry.data) == node.sha256
+            }
+            SourceNodeKind::Symlink { target } => {
+                entry.kind == b'2' && entry.link == *target && entry.mode == 0o777
+            }
+        };
+        if !matches {
+            return Err(PackageError::invalid(
+                "archive source node identity changed",
+            ));
+        }
+    }
+    Ok((entries, parsed))
 }
 
 struct TarEntry {
@@ -1376,33 +1409,24 @@ impl ReleaseConfig {
                 "actual root Cargo/source policy binding mismatch",
             ));
         }
-        let mut expected = BTreeMap::new();
-        expected.insert("schema".into(), json!("osslscope-release-policy-v1"));
-        for (key, value) in [
-            ("package_epoch", 1_u64),
-            ("package_revision", 1),
-            ("source_epoch", SOURCE_EPOCH),
-            ("jobs", 2),
-        ] {
-            expected.insert(key.into(), json!(value));
-        }
-        for profile in &self.profiles {
-            for (key, value) in [
-                ("target", json!(profile.target)),
-                ("abi_profile", json!(profile.abi_profile)),
-                ("builder", json!(profile.builder)),
-                ("formats", json!(profile.formats)),
-            ] {
-                expected.insert(format!("profiles.{}.{key}", profile.id), value);
-            }
-        }
-        for (key, value) in serde_json::to_value(&self.artifacts)
-            .unwrap()
-            .as_object()
-            .unwrap()
-        {
-            expected.insert(format!("artifacts.{key}"), value.clone());
-        }
+        let profiles = self
+            .profiles
+            .iter()
+            .map(|profile| {
+                (
+                    profile.id.clone(),
+                    json!({
+                        "target":profile.target,"abi_profile":profile.abi_profile,
+                        "builder":profile.builder,"formats":profile.formats,
+                    }),
+                )
+            })
+            .collect::<serde_json::Map<String, Value>>();
+        let expected = json!({
+            "schema":"osslscope-release-policy-v1", "package_epoch":1,
+            "package_revision":1, "source_epoch":SOURCE_EPOCH, "jobs":2,
+            "profiles":profiles, "artifacts":self.artifacts,
+        });
         if policy_fields(&release)? != expected {
             return Err(PackageError::invalid(
                 "typed release policy differs from original TOML",
@@ -1446,120 +1470,58 @@ impl ReleaseConfig {
     }
 }
 
-fn strip_comment(line: &str) -> Result<&str, PackageError> {
-    let mut quote = None;
-    let mut escape = false;
-    for (i, c) in line.char_indices() {
-        if escape {
-            escape = false;
-            continue;
-        }
-        match (quote, c) {
-            (Some('"'), '\\') => escape = true,
-            (Some(q), c) if q == c => quote = None,
-            (None, '"' | '\'') => quote = Some(c),
-            (None, '#') => return Ok(line[..i].trim()),
-            _ => {}
-        }
+// One owning byte envelope and structural TOML1.0 parser serves both Cargo
+// and release policy. Parsing the complete document also rejects errors outside
+// the fields we consume. Do not replace this with a recoverable/partial parser.
+fn parse_toml(bytes: &[u8]) -> Result<toml::Table, PackageError> {
+    if bytes.is_empty() || bytes.len() > 1_048_576 || bytes.starts_with(b"\xef\xbb\xbf") {
+        return Err(PackageError::invalid(
+            "empty/oversized/BOM-prefixed TOML input",
+        ));
     }
-    if quote.is_some() {
-        return Err(PackageError::invalid("unsupported multiline TOML string"));
-    }
-    Ok(line.trim())
-}
-fn scalar(text: &str) -> Result<Value, PackageError> {
-    if text.starts_with('\'') && text.ends_with('\'') && text.len() >= 2 {
-        Ok(json!(&text[1..text.len() - 1]))
-    } else {
-        serde_json::from_str(text)
-            .map_err(|_| PackageError::invalid("unsupported TOML scalar in frozen policy"))
-    }
-}
-fn policy_fields(bytes: &[u8]) -> Result<BTreeMap<String, Value>, PackageError> {
     let text = std::str::from_utf8(bytes).map_err(|_| PackageError::invalid("non-UTF8 TOML"))?;
-    let mut result = BTreeMap::new();
-    let mut tables = BTreeSet::new();
-    let mut table = String::new();
-    for raw in text.lines() {
-        let line = strip_comment(raw)?;
-        if line.is_empty() {
-            continue;
-        }
-        if line.starts_with('[') {
-            if !line.ends_with(']') || line.starts_with("[[") {
-                return Err(PackageError::invalid("unsupported release TOML table"));
-            }
-            table = line[1..line.len() - 1].trim().into();
-            if !matches!(
-                table.as_str(),
-                "profiles.gnu" | "profiles.musl" | "artifacts"
-            ) || !tables.insert(table.clone())
-            {
-                return Err(PackageError::invalid(
-                    "duplicate/unknown release TOML table",
-                ));
-            }
-            continue;
-        }
-        let (key, value) = line
-            .split_once('=')
-            .ok_or_else(|| PackageError::invalid("malformed release TOML"))?;
-        let key = key.trim();
-        if key.is_empty() || !key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
-            return Err(PackageError::invalid("unsupported release TOML key"));
-        }
-        let path = if table.is_empty() {
-            key.to_owned()
-        } else {
-            format!("{table}.{key}")
-        };
-        if result.insert(path, scalar(value.trim())?).is_some() {
-            return Err(PackageError::invalid("duplicate release TOML key"));
+    text.parse::<toml::Table>()
+        .map_err(|error| PackageError::invalid(format!("invalid TOML: {error}")))
+}
+fn policy_fields(bytes: &[u8]) -> Result<Value, PackageError> {
+    fn policy_value(value: toml::Value) -> Result<Value, PackageError> {
+        match value {
+            toml::Value::String(value) => Ok(json!(value)),
+            toml::Value::Integer(value) => Ok(json!(value)),
+            toml::Value::Boolean(value) => Ok(json!(value)),
+            toml::Value::Array(values) => values
+                .into_iter()
+                .map(policy_value)
+                .collect::<Result<Vec<_>, _>>()
+                .map(Value::Array),
+            toml::Value::Table(values) => values
+                .into_iter()
+                .map(|(key, value)| Ok((key, policy_value(value)?)))
+                .collect::<Result<serde_json::Map<String, Value>, PackageError>>()
+                .map(Value::Object),
+            toml::Value::Float(_) | toml::Value::Datetime(_) => Err(PackageError::invalid(
+                "unsupported release policy value type",
+            )),
         }
     }
-    Ok(result)
+    policy_value(toml::Value::Table(parse_toml(bytes)?))
 }
 pub(crate) fn package_fields(bytes: &[u8]) -> Result<BTreeMap<String, String>, PackageError> {
-    let text =
-        std::str::from_utf8(bytes).map_err(|_| PackageError::invalid("non-UTF8 Cargo TOML"))?;
-    let mut active = false;
-    let mut seen = false;
+    let document = parse_toml(bytes)?;
+    let package = document
+        .get("package")
+        .and_then(toml::Value::as_table)
+        .ok_or_else(|| PackageError::invalid("missing actual Cargo package table"))?;
     let mut fields = BTreeMap::new();
-    let mut keys = BTreeSet::new();
-    for raw in text.lines() {
-        let line = strip_comment(raw)?;
-        if line.is_empty() {
-            continue;
-        }
-        if line.starts_with('[') {
-            active = line == "[package]";
-            if active {
-                if seen {
-                    return Err(PackageError::invalid("duplicate Cargo package table"));
-                }
-                seen = true;
-            }
-            continue;
-        }
-        if !active {
-            continue;
-        }
-        let (key, value) = line
-            .split_once('=')
-            .ok_or_else(|| PackageError::invalid("malformed Cargo package key"))?;
-        let key = key.trim();
-        if !keys.insert(key.to_owned()) {
-            return Err(PackageError::invalid("duplicate Cargo package key"));
-        }
-        if matches!(key, "name" | "version" | "license") {
-            let value = scalar(value.trim())?
+    for key in ["name", "version", "license"] {
+        if let Some(value) = package.get(key) {
+            let value = value
                 .as_str()
-                .ok_or_else(|| PackageError::invalid("Cargo package identity must be string"))?
-                .to_owned();
-            fields.insert(key.into(), value);
+                .ok_or_else(|| PackageError::invalid("Cargo package identity must be string"))?;
+            fields.insert(key.into(), value.to_owned());
         }
     }
-    if !seen || !fields.contains_key("name") || !fields.contains_key("version") {
+    if !fields.contains_key("name") || !fields.contains_key("version") {
         return Err(PackageError::invalid(
             "missing actual Cargo package identity",
         ));
@@ -1739,6 +1701,7 @@ impl BuildRecipe {
             ("bpf-cargo", "nightly-2026-05-20"),
             ("host-sysroot", "1.88.0"),
             ("bpf-sysroot", "nightly-2026-05-20"),
+            ("rust-src", "nightly-2026-05-20"),
         ] {
             if self
                 .resources
@@ -1935,4 +1898,41 @@ pub fn seal_source(
     };
     verify_closure(&sealed)?;
     Ok(sealed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::inventory::source_fixtures::Fixture;
+    use super::*;
+
+    #[test]
+    fn exact_archive_read_must_match_the_admitted_node_despite_stable_individual_reads() {
+        let fixture = Fixture::new();
+        let tree = fixture.tree();
+        let node = tree
+            .manifest
+            .inventory
+            .files
+            .iter()
+            .find(|n| n.path.as_str() == "tests/fixtures/example.json")
+            .unwrap();
+        let original = &fixture.files[node.path.as_str()];
+        assert_eq!(node.read_bytes(&tree.root).unwrap(), *original);
+        for bytes in [
+            b"another stable, independently readable source version\n".as_slice(),
+            &vec![b'x'; original.len()],
+        ] {
+            std::fs::write(tree.root.join(node.path.as_str()), bytes).unwrap();
+            assert_eq!(
+                read_regular(&tree.root, &node.path, MAX_ASSET_BYTES).unwrap(),
+                bytes
+            );
+            assert!(
+                node.read_bytes(&tree.root).is_err(),
+                "stable per-open mutation must not satisfy admitted node identity"
+            );
+            std::fs::write(tree.root.join(node.path.as_str()), original).unwrap();
+            tree.verify().unwrap();
+        }
+    }
 }
