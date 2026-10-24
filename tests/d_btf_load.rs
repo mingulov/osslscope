@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! P5b-D: loader BTF + func_info for helper-callback shapes.
 //!
 //! Live lane only (`OSSL_D_LIVE=1`, caps via setcap like the other

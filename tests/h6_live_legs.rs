@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! H6 live legs: file-provider quiet + affirmative absence, wired
 //! end to end (NOT RUN in C1: needs a privileged lane + staged
 //! harvest BPF object via OSSL_H6_LIVE=1, OSSL_H6_OBJECT=<.o>, OSSL_H6_PROV=<provider .so>).

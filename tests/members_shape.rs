@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! P7 item 2: member-object shape tests (offline, unprivileged).
 //!
 //! Pins the `osslscope-members` object contract via the pure

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! H7: failure fidelity — exit codes, diagnostics sinks, the
 //! close-flow audits, and the `runtime` fatal-kind contract.
 //!

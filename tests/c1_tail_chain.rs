@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! P5a-C1 tail-call chain probe: one query walks TWO alg slots
 //! (entry walks j, callee walks j+1, advance by 2).
 //!

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! H5-T3: identity-domain audit — every device-identity site in
 //! `src/` is pinned with the ONE domain it operates in. Any new,
 //! removed, or reworded site fails LOUDLY: the author reviews the

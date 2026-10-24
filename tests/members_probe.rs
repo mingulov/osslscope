@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! P7 item 2 live legs (privileged lane only): functional proof
 //! for the 512-member chunk — load-513 + per-prog xlated margins
 //! (L1), exact slot/dispatch contents on an E=7 fixture (L2, warm +

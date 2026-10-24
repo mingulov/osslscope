@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! P5a C2–C5: chain scale, hole tolerance, pressure completion.
 //!
 //! Live legs (NOT RUN in CI: need caps + the chain probe object via

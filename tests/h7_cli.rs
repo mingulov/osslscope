@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! H7 CLI pins (spawned binary, hermetic — onboarding fails before
 //! any side effect, so no BPF/target is ever touched).
 //!

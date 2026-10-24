@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! P5c B-chunk mechanism probe (live lane only).
 //!
 //! Answers the B-vs-A mechanism questions with N tiny single-slot
