@@ -822,7 +822,8 @@ fn measured_static_abi_requires_explicit_interpreter_absence() {
     let sealed = fixture.seal();
     assert!(
         sealed.is_ok(),
-        "explicit measured static receipt refused: {sealed:?}"
+        "explicit measured static receipt refused: {:?}",
+        sealed.err()
     );
 }
 
@@ -1505,4 +1506,87 @@ fn native_release_policy_preserves_semantic_keys_and_literal_dot_hierarchy() {
         fixture.seal().is_err(),
         "a literal key containing a dot must not become nested policy"
     );
+}
+
+// Removing mandatory executor resources or admitting a substitute original source
+// must refuse sealing even when the remaining records have internally rebound hashes.
+#[test]
+fn executor_roles_and_original_presence_required() {
+    for profile in ["gnu", "musl"] {
+        let mut fixture = Fixture::new();
+        fixture.config["selected_profile"] = json!(profile);
+        let sealed = fixture.seal().unwrap();
+        let input = serde_json::to_value(&sealed.inputs).unwrap();
+        assert_eq!(input["jobs"], 2);
+        for role in ["executor-host", "executor-layout"] {
+            let path = format!("packaging/builders/{profile}.json");
+            let original = fs::read(fixture.root.join(&path)).unwrap();
+            let recipe: Value = serde_json::from_slice(&original).unwrap();
+            let index = recipe["resources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .position(|r| r["role"] == role)
+                .unwrap();
+            for field in ["role", "identity", "acquisition", "source_component"] {
+                let mut changed = recipe.clone();
+                changed["resources"][index][field] = changed["resources"][0][field].clone();
+                fixture.source(&path, &bytes(&changed));
+                assert!(fixture.seal().is_err(), "{profile}/{role}/{field}");
+            }
+            let mut changed = recipe.clone();
+            changed["resources"].as_array_mut().unwrap().remove(index);
+            // Remove the matching inventory component too: length/identity
+            // mismatch must not mask an omitted mandatory executor role.
+            let tools = fixture.tools.clone();
+            fixture.tools["components"]
+                .as_array_mut()
+                .unwrap()
+                .remove(index - 5);
+            changed["tools"] = fixture.tools.clone();
+            fixture.source(&path, &bytes(&changed));
+            assert!(fixture.seal().is_err(), "{profile}/{role}/missing");
+            fixture.tools = tools;
+            fixture.source(&path, &original);
+        }
+        for path in [
+            "scripts/package-executor.py".to_owned(),
+            format!("packaging/builders/{profile}.layout.json"),
+        ] {
+            let original = fs::read(fixture.root.join(&path)).unwrap();
+            fs::remove_file(fixture.root.join(&path)).unwrap();
+            assert!(fixture.seal().is_err(), "{profile}/{path}/absent");
+            fixture.source(&path, &original);
+        }
+        fixture.source(
+            &format!("packaging/builders/{profile}.layout.json"),
+            b"substitute source layout\n",
+        );
+        assert!(
+            fixture.seal().is_err(),
+            "{profile}/layout original mismatch"
+        );
+    }
+}
+
+#[test]
+fn sealing_applies_shared_inner_abi_policy_after_rebinding() {
+    for profile in ["gnu", "musl"] {
+        let mut fixture = Fixture::new();
+        fixture.config["selected_profile"] = json!(profile);
+        fixture.seal().unwrap();
+        let abi_path = format!("abi/{profile}.json");
+        let original = fs::read(fixture.inputs.join(&abi_path)).unwrap();
+        let mut abi: Value = serde_json::from_slice(&original).unwrap();
+        abi["cells"][0]["symbol_versions"] = json!(["lib-unavailable.so@VERSION_1"]);
+        let replacement = fixture.input(&abi_path, &bytes(&abi));
+        let recipe_path = format!("packaging/builders/{profile}.json");
+        let mut recipe: Value = serde_json::from_slice(&fixture.files[&recipe_path]).unwrap();
+        recipe["abi_evidence"] = replacement;
+        fixture.source(&recipe_path, &bytes(&recipe));
+        assert!(
+            fixture.seal().is_err(),
+            "{profile}/unavailable ABI provider"
+        );
+    }
 }

@@ -76,6 +76,18 @@ impl Fixture {
             "scripts/package-release.py",
             b"# synthetic adapter source\n",
         );
+        fixture.source(
+            "scripts/package-executor.py",
+            b"# synthetic controller source only\n",
+        );
+        let layout =
+            bytes(&json!({"schema":"osslscope-executor-layout-v1","archives":[],"bindings":[]}));
+        for profile in ["gnu", "musl"] {
+            fixture.source(
+                &format!("packaging/builders/{profile}.layout.json"),
+                &layout,
+            );
+        }
         fixture.source("LICENSE", b"synthetic GPL3 license fixture\n");
         fixture.source(
             "LICENSES/GPL-2.0-only.txt",
@@ -149,6 +161,8 @@ impl Fixture {
             ("build-linker", "build-ld", "fixture"),
             ("build-archive", "build-ar", "fixture"),
             ("build-sysroot", "build-sysroot", "fixture"),
+            ("executor-host", "executor-host", "fixture"),
+            ("executor-layout", "executor-layout", "fixture"),
         ]
         .iter()
         .map(|(role, name, version)| {
@@ -158,10 +172,14 @@ impl Fixture {
                 "build-sysroot" => "sysroot",
                 _ => role,
             };
-            let content = fixture.input(
-                &format!("tools/{role}.bin"),
-                format!("synthetic {bytes_role} bytes\n").as_bytes(),
-            );
+            let data = match *role {
+                "executor-host" => {
+                    bytes(&json!({"schema":"osslscope-executor-host-v1","files":[],"links":[]}))
+                }
+                "executor-layout" => layout.clone(),
+                _ => format!("synthetic {bytes_role} bytes\n").into_bytes(),
+            };
+            let content = fixture.input(&format!("tools/{role}.bin"), &data);
             json!({"name":name,"version":version,"sha256":content["sha256"]})
         })
         .collect();
@@ -187,14 +205,18 @@ impl Fixture {
             "build-linker",
             "build-archive",
             "build-sysroot",
+            "executor-host",
+            "executor-layout",
         ]
         .iter()
         .enumerate()
         {
-            let archive = fixture.input(
-                &format!("acquisition/{role}.tar"),
-                &fixture_tar("input", b"synthetic input\n", b'0', ""),
-            );
+            let acquisition = if *role == "executor-layout" {
+                fixture_tar("layout.json", &layout, b'0', "")
+            } else {
+                fixture_tar("input", b"synthetic input\n", b'0', "")
+            };
+            let archive = fixture.input(&format!("acquisition/{role}.tar"), &acquisition);
             let source_archive = fixture.input(
                 &format!("sources/{role}.tar"),
                 &fixture_tar("source.c", b"/* synthetic source */\n", b'0', ""),

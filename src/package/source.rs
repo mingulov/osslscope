@@ -136,11 +136,15 @@ pub(crate) fn read_regular(
     }
     Ok(bytes)
 }
-pub(crate) fn verify_entry(root: &Path, entry: &ContentEntry) -> Result<Vec<u8>, PackageError> {
+fn verify_entry_metadata(entry: &ContentEntry) -> Result<(), PackageError> {
     check_input_path(&entry.path)?;
     if entry.bytes == 0 || entry.bytes > MAX_ASSET_BYTES {
         return Err(PackageError::invalid("empty or oversized required input"));
     }
+    Ok(())
+}
+pub(crate) fn verify_entry(root: &Path, entry: &ContentEntry) -> Result<Vec<u8>, PackageError> {
+    verify_entry_metadata(entry)?;
     let bytes = read_regular(root, &entry.path, entry.bytes)?;
     if bytes.len() as u64 != entry.bytes || sha256(&bytes) != entry.sha256 {
         return Err(PackageError::invalid(format!(
@@ -1460,6 +1464,9 @@ impl ReleaseConfig {
                 )));
             }
         }
+        let recipe_bytes = read_regular(&tree.root, &self.selected().builder, 1_048_576)?;
+        let recipe = BuildRecipe::parse_json(&recipe_bytes)?;
+        verify_executor_source_presence(tree, &recipe)?;
         Ok(())
     }
     pub(crate) fn selected(&self) -> &ProfileConfig {
@@ -1656,8 +1663,293 @@ pub(crate) struct AbiEvidence {
     pub(crate) cells: Vec<AbiCell>,
 }
 
+// Shared record policy only; actual resource bytes, corresponding source and
+// GNU selected/build equality remain the sealer/closure's separate responsibility.
+fn verify_recipe_fields(recipe: &BuildRecipe) -> Result<(), PackageError> {
+    let (target, abi, formats): (&str, &str, &[&str]) = match recipe.profile.as_str() {
+        "gnu" => (
+            "x86_64-unknown-linux-gnu",
+            "linux-x86_64-gnu",
+            &["deb", "rpm", "prefix"],
+        ),
+        "musl" => (
+            "x86_64-unknown-linux-musl",
+            "linux-x86_64-musl",
+            &["prefix"],
+        ),
+        _ => return Err(PackageError::invalid("unsupported recipe profile")),
+    };
+    if recipe.schema != "osslscope-build-recipe-v2"
+        || recipe.host_profile.target != target
+        || recipe.host_profile.abi_profile != abi
+        || recipe.host_profile.abi_floor.is_empty()
+        || recipe.formats != formats
+        || recipe.jobs != 2
+    {
+        return Err(PackageError::invalid(
+            "selected profile/recipe policy mismatch",
+        ));
+    }
+    let tools = &recipe.tools;
+    if tools.host.version != "1.88.0"
+        || tools.bpf.version != "nightly-2026-05-20"
+        || tools.linker.version != "0.10.4"
+    {
+        return Err(PackageError::invalid("unreviewed tool version"));
+    }
+    let expected: Determinism = closed(&json_bytes(
+        &json!({"locale":"C","timezone":"UTC","umask":18,"uid":0,"gid":0,"file_mode":420,"executable_mode":493,"symlink_mode":511,"mtime":SOURCE_EPOCH,"archive_order":"lexical","compression":"none","path_remap":"--remap-path-prefix=/build=."}),
+    )?)?;
+    if recipe.determinism != expected {
+        return Err(PackageError::invalid("unbound deterministic inputs"));
+    }
+    if recipe.environment != recipe_v2_environment(SOURCE_EPOCH) {
+        return Err(PackageError::invalid("unrecorded environment override"));
+    }
+    if recipe.argv != recipe_v2_argv(&recipe.host_profile.target)
+        || recipe.bpf_argv != recipe_v2_bpf_argv()
+    {
+        return Err(PackageError::invalid("unrecorded compiler argv"));
+    }
+    let identities = std::iter::once(&tools.host)
+        .chain([&tools.bpf, &tools.linker, &tools.llvm, &tools.builder])
+        .chain(&tools.components)
+        .collect::<Vec<_>>();
+    if identities.len() != recipe.resources.len() {
+        return Err(PackageError::invalid(
+            "tool component/resource closure incomplete",
+        ));
+    }
+    let mut roles = BTreeSet::new();
+    let mut names = BTreeSet::new();
+    for (resource, identity) in recipe.resources.iter().zip(identities) {
+        if &resource.identity != identity
+            || identity.sha256 != resource.content.sha256
+            || identity.name.is_empty()
+            || identity.version.is_empty()
+            || identity.name.contains(['/', '\\'])
+            || identity.version.starts_with(['/', '\\'])
+            || identity.name.chars().any(char::is_control)
+            || identity.version.chars().any(char::is_control)
+            || matches!(identity.version.as_str(), "latest" | "main" | "master")
+            || !names.insert(&identity.name)
+            || !roles.insert(resource.role.as_str())
+            || resource.source_component.is_empty()
+        {
+            return Err(PackageError::invalid(
+                "tool binary/source/component identity mismatch",
+            ));
+        }
+        verify_entry_metadata(&resource.content)?;
+        verify_entry_metadata(&resource.acquisition)?;
+    }
+    for role in [
+        "host",
+        "bpf",
+        "linker",
+        "llvm",
+        "builder",
+        "rust-src",
+        "sysroot",
+        "native-compiler",
+        "native-linker",
+        "archive",
+        "package",
+        "host-cargo",
+        "bpf-cargo",
+        "llvm-library",
+        "host-sysroot",
+        "bpf-sysroot",
+        "build-compiler",
+        "build-linker",
+        "build-archive",
+        "build-sysroot",
+        "executor-host",
+        "executor-layout",
+    ] {
+        if !roles.contains(role) {
+            return Err(PackageError::invalid(format!(
+                "missing mandatory tool role {role}"
+            )));
+        }
+    }
+    for (role, version) in [
+        ("host-cargo", "1.88.0"),
+        ("bpf-cargo", "nightly-2026-05-20"),
+        ("host-sysroot", "1.88.0"),
+        ("bpf-sysroot", "nightly-2026-05-20"),
+        ("rust-src", "nightly-2026-05-20"),
+    ] {
+        if recipe
+            .resources
+            .iter()
+            .find(|r| r.role == role)
+            .is_none_or(|r| r.identity.version != version)
+        {
+            return Err(PackageError::invalid(
+                "tool component/toolchain pin mismatch",
+            ));
+        }
+    }
+    if recipe
+        .resources
+        .iter()
+        .take(5)
+        .map(|r| r.role.as_str())
+        .collect::<Vec<_>>()
+        != ["host", "bpf", "linker", "llvm", "builder"]
+    {
+        return Err(PackageError::invalid(
+            "tool role/selected identity ordering mismatch",
+        ));
+    }
+    for role in ["executor-host", "executor-layout"] {
+        let resource = recipe
+            .resources
+            .iter()
+            .find(|r| r.role == role)
+            .expect("mandatory role checked");
+        if recipe.resources.iter().any(|other| {
+            other.role != role
+                && (other.acquisition.path == resource.acquisition.path
+                    || other.source_component == resource.source_component)
+        }) {
+            return Err(PackageError::invalid(
+                "executor acquisition/source identity is not unique",
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn verify_recipe_policy(
+    recipe: &BuildRecipe,
+    inputs: &BuildInputs,
+) -> Result<(), PackageError> {
+    // Reuse the complete closed-record validation, including source/tool shape.
+    parse_canonical::<BuildInputs>(&canonical_bytes(inputs))?;
+    if recipe.tools != inputs.tools
+        || recipe.host_profile != inputs.host_profile
+        || recipe.jobs != inputs.jobs
+        || recipe.argv != inputs.argv
+        || recipe.environment != inputs.environment
+        || inputs.source_epoch != SOURCE_EPOCH
+        || inputs.package_epoch != 1
+        || inputs.package_revision != 1
+    {
+        return Err(PackageError::invalid("recipe/build inputs policy mismatch"));
+    }
+    verify_recipe_fields(recipe)
+}
+
+fn abi_atom(atom: &str) -> bool {
+    !atom.is_empty() && !atom.contains(['@', '/', '\\']) && !atom.chars().any(char::is_control)
+}
+
+pub(crate) fn verify_abi_evidence(
+    recipe: &BuildRecipe,
+    bytes: &[u8],
+) -> Result<AbiEvidence, PackageError> {
+    if bytes.is_empty()
+        || bytes.len() > 1_048_576
+        || recipe.abi_evidence.bytes != bytes.len() as u64
+        || recipe.abi_evidence.sha256 != sha256(bytes)
+    {
+        return Err(PackageError::invalid(
+            "ABI evidence byte identity/bound mismatch",
+        ));
+    }
+    let abi: AbiEvidence = closed(bytes)?;
+    if abi.schema != "osslscope-abi-evidence-v1"
+        || abi.host_profile != recipe.host_profile
+        || recipe.required_cells.is_empty()
+        || recipe.required_cells.iter().any(String::is_empty)
+        || recipe.required_cells.iter().collect::<BTreeSet<_>>().len()
+            != recipe.required_cells.len()
+        || abi.cells.iter().map(|c| &c.name).collect::<Vec<_>>()
+            != recipe.required_cells.iter().collect::<Vec<_>>()
+        || abi.cells.iter().any(|c| {
+            c.name.is_empty()
+                || match &c.interpreter {
+                    AbiInterpreter::Static => !c.needed.is_empty() || !c.symbol_versions.is_empty(),
+                    AbiInterpreter::Dynamic { path } => {
+                        !path.starts_with('/')
+                            || path.chars().any(char::is_control)
+                            || path.contains('\\')
+                            || path[1..]
+                                .split('/')
+                                .any(|part| matches!(part, "" | "." | ".."))
+                    }
+                }
+                || !c.needed.windows(2).all(|pair| pair[0] < pair[1])
+                || c.needed.iter().any(|atom| !abi_atom(atom))
+                || !c.symbol_versions.windows(2).all(|pair| pair[0] < pair[1])
+                || c.symbol_versions.iter().any(|pair| {
+                    let Some((provider, version)) = pair.split_once('@') else {
+                        return true;
+                    };
+                    !abi_atom(provider)
+                        || !abi_atom(version)
+                        || !c.needed.iter().any(|name| name == provider)
+                })
+        })
+    {
+        return Err(PackageError::invalid(
+            "missing/mismatched measured required-cell ABI evidence",
+        ));
+    }
+    Ok(abi)
+}
+
+pub(crate) fn verify_executor_source_presence(
+    tree: &SourceTree,
+    recipe: &BuildRecipe,
+) -> Result<(), PackageError> {
+    if !matches!(recipe.profile.as_str(), "gnu" | "musl") {
+        return Err(PackageError::invalid("unsupported executor source profile"));
+    }
+    for path in [
+        "scripts/package-executor.py".to_owned(),
+        format!("packaging/builders/{}.layout.json", recipe.profile),
+    ] {
+        let node = tree
+            .manifest
+            .inventory
+            .files
+            .iter()
+            .find(|node| node.path.as_str() == path)
+            .ok_or_else(|| {
+                PackageError::invalid("executor file absent from original source inventory")
+            })?;
+        if !matches!(node.node, SourceNodeKind::File) {
+            return Err(PackageError::invalid(
+                "executor original source must be a regular file",
+            ));
+        }
+        let bytes = node.read_bytes(&tree.root)?;
+        if path.ends_with(".layout.json") {
+            let resource = recipe
+                .resources
+                .iter()
+                .find(|r| r.role == "executor-layout")
+                .ok_or_else(|| PackageError::invalid("missing executor-layout role"))?;
+            if resource.content.bytes != bytes.len() as u64
+                || resource.content.sha256 != sha256(&bytes)
+            {
+                return Err(PackageError::invalid(
+                    "executor layout differs from original selected source",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 impl BuildRecipe {
     pub fn parse_json(bytes: &[u8]) -> Result<Self, PackageError> {
+        if bytes.is_empty() || bytes.len() > 1_048_576 {
+            return Err(PackageError::invalid("empty or oversized build recipe"));
+        }
         closed(bytes)
     }
     pub(crate) fn verify(
@@ -1680,83 +1972,15 @@ impl BuildRecipe {
                 "selected profile/recipe/tool inventory mismatch",
             ));
         }
-        if tools.host.version != "1.88.0"
-            || tools.bpf.version != "nightly-2026-05-20"
-            || tools.linker.version != "0.10.4"
-        {
-            return Err(PackageError::invalid("unreviewed tool version"));
-        }
-        let expected: Determinism = closed(&json_bytes(
-            &json!({"locale":"C","timezone":"UTC","umask":18,"uid":0,"gid":0,"file_mode":420,"executable_mode":493,"symlink_mode":511,"mtime":SOURCE_EPOCH,"archive_order":"lexical","compression":"none","path_remap":"--remap-path-prefix=/build=."}),
-        )?)?;
-        if self.determinism != expected {
-            return Err(PackageError::invalid("unbound deterministic inputs"));
-        }
-        if self.environment != recipe_v2_environment(config.source_epoch) {
-            return Err(PackageError::invalid("unrecorded environment override"));
-        }
-        if self.argv != recipe_v2_argv(&selected.target) || self.bpf_argv != recipe_v2_bpf_argv() {
-            return Err(PackageError::invalid("unrecorded compiler argv"));
-        }
-        let identities = std::iter::once(&tools.host)
-            .chain([&tools.bpf, &tools.linker, &tools.llvm, &tools.builder])
-            .chain(&tools.components)
-            .collect::<Vec<_>>();
-        if identities.len() != self.resources.len() {
-            return Err(PackageError::invalid(
-                "tool component/resource closure incomplete",
-            ));
-        }
-        let mut roles = BTreeSet::new();
-        let mut names = BTreeSet::new();
-        for (resource, identity) in self.resources.iter().zip(identities) {
-            if &resource.identity != identity
-                || identity.sha256 != resource.content.sha256
-                || identity.name.is_empty()
-                || identity.version.is_empty()
-                || identity.name.contains(['/', '\\'])
-                || identity.version.starts_with(['/', '\\'])
-                || identity.name.chars().any(char::is_control)
-                || identity.version.chars().any(char::is_control)
-                || matches!(identity.version.as_str(), "latest" | "main" | "master")
-                || !names.insert(&identity.name)
-                || !roles.insert(resource.role.as_str())
-                || !deps.tool_sources.contains(&resource.source_component)
-            {
+        verify_recipe_fields(self)?;
+        for resource in &self.resources {
+            if !deps.tool_sources.contains(&resource.source_component) {
                 return Err(PackageError::invalid(
                     "tool binary/source/component identity mismatch",
                 ));
             }
             verify_entry(&deps.root, &resource.content)?;
             verify_entry(&deps.root, &resource.acquisition)?;
-        }
-        for role in [
-            "host",
-            "bpf",
-            "linker",
-            "llvm",
-            "builder",
-            "rust-src",
-            "sysroot",
-            "native-compiler",
-            "native-linker",
-            "archive",
-            "package",
-            "host-cargo",
-            "bpf-cargo",
-            "llvm-library",
-            "host-sysroot",
-            "bpf-sysroot",
-            "build-compiler",
-            "build-linker",
-            "build-archive",
-            "build-sysroot",
-        ] {
-            if !roles.contains(role) {
-                return Err(PackageError::invalid(format!(
-                    "missing mandatory tool role {role}"
-                )));
-            }
         }
         if selected.target == "x86_64-unknown-linux-gnu" {
             for (selected_role, build_role) in [
@@ -1789,62 +2013,10 @@ impl BuildRecipe {
                 }
             }
         }
-        for (role, version) in [
-            ("host-cargo", "1.88.0"),
-            ("bpf-cargo", "nightly-2026-05-20"),
-            ("host-sysroot", "1.88.0"),
-            ("bpf-sysroot", "nightly-2026-05-20"),
-            ("rust-src", "nightly-2026-05-20"),
-        ] {
-            if self
-                .resources
-                .iter()
-                .find(|r| r.role == role)
-                .is_none_or(|r| r.identity.version != version)
-            {
-                return Err(PackageError::invalid(
-                    "tool component/toolchain pin mismatch",
-                ));
-            }
+        if self.abi_evidence.bytes > 1_048_576 {
+            return Err(PackageError::invalid("oversized ABI evidence"));
         }
-        if self
-            .resources
-            .iter()
-            .take(5)
-            .map(|r| r.role.as_str())
-            .collect::<Vec<_>>()
-            != ["host", "bpf", "linker", "llvm", "builder"]
-        {
-            return Err(PackageError::invalid(
-                "tool role/selected identity ordering mismatch",
-            ));
-        }
-        let abi: AbiEvidence = closed(&verify_entry(&deps.root, &self.abi_evidence)?)?;
-        if abi.schema != "osslscope-abi-evidence-v1"
-            || abi.host_profile != self.host_profile
-            || self.required_cells.is_empty()
-            || abi.cells.iter().map(|c| &c.name).collect::<Vec<_>>()
-                != self.required_cells.iter().collect::<Vec<_>>()
-            || self.required_cells.iter().collect::<BTreeSet<_>>().len()
-                != self.required_cells.len()
-            || abi.cells.iter().any(|c| {
-                c.name.is_empty()
-                    || match &c.interpreter {
-                        AbiInterpreter::Static => !c.needed.is_empty(),
-                        AbiInterpreter::Dynamic { path } => {
-                            !path.starts_with('/')
-                                || path.chars().any(char::is_control)
-                                || path.split('/').any(|p| p == "..")
-                        }
-                    }
-                    || c.needed.iter().any(String::is_empty)
-                    || c.symbol_versions.iter().any(String::is_empty)
-            })
-        {
-            return Err(PackageError::invalid(
-                "missing/mismatched measured required-cell ABI evidence",
-            ));
-        }
+        verify_abi_evidence(self, &verify_entry(&deps.root, &self.abi_evidence)?)?;
         Ok(())
     }
 }
@@ -1952,6 +2124,7 @@ pub fn seal_source(
         environment: recipe.environment.clone(),
         offline_inventory_sha256: assets.offline_inventory.sha256,
     };
+    verify_recipe_policy(&recipe, &inputs)?;
     let input_bytes = canonical_bytes(&inputs);
     parse_canonical::<BuildInputs>(&input_bytes)?;
     let sealed = SealedSource {
@@ -1976,6 +2149,287 @@ pub fn seal_source(
 mod tests {
     use super::super::inventory::source_fixtures::Fixture;
     use super::*;
+
+    fn policy_fixture() -> (Fixture, BuildRecipe, BuildInputs) {
+        let fixture = Fixture::new();
+        let recipe =
+            BuildRecipe::parse_json(&fixture.files["packaging/builders/gnu.json"]).unwrap();
+        let inputs = fixture.seal().unwrap().inputs;
+        (fixture, recipe, inputs)
+    }
+
+    // Omitting a shared metadata bound/path check must admit one of these
+    // otherwise identical records; actual resource bytes are never allocated.
+    #[test]
+    fn pure_resource_metadata_preserves_actual_size_and_graph_path_policy() {
+        let mut admitted = Vec::new();
+        for profile in ["gnu", "musl"] {
+            let mut fixture = Fixture::new();
+            fixture.config["selected_profile"] = json!(profile);
+            let recipe_path = format!("packaging/builders/{profile}.json");
+            let recipe = BuildRecipe::parse_json(&fixture.files[&recipe_path]).unwrap();
+            let inputs = fixture.seal().unwrap().inputs;
+            verify_recipe_policy(&recipe, &inputs).unwrap();
+            for content in [true, false] {
+                let field = if content { "content" } else { "acquisition" };
+                // Metadata at the inclusive boundary is valid. The unchanged
+                // digests may describe shared bytes: no distinct-content rule.
+                let mut boundary = recipe.clone();
+                let entry = if content {
+                    &mut boundary.resources[0].content
+                } else {
+                    &mut boundary.resources[0].acquisition
+                };
+                entry.bytes = 536_870_912;
+                let mut rebound = inputs.clone();
+                rebound.recipe.recipe_sha256 = sha256(&json_bytes(&boundary).unwrap());
+                verify_recipe_policy(&boundary, &rebound).unwrap();
+                for bytes in [0, 536_870_913] {
+                    let mut changed = recipe.clone();
+                    let entry = if content {
+                        &mut changed.resources[0].content
+                    } else {
+                        &mut changed.resources[0].acquisition
+                    };
+                    entry.bytes = bytes;
+                    let mut rebound = inputs.clone();
+                    rebound.recipe.recipe_sha256 = sha256(&json_bytes(&changed).unwrap());
+                    if verify_recipe_policy(&changed, &rebound).is_ok() {
+                        admitted.push(format!("{profile}/{field}/bytes={bytes}"));
+                    }
+                }
+                for path in ["evidence/input.tar", "payload-manifest.json"] {
+                    let mut changed = recipe.clone();
+                    let entry = if content {
+                        &mut changed.resources[0].content
+                    } else {
+                        &mut changed.resources[0].acquisition
+                    };
+                    entry.path = RelativePath::new(path).unwrap();
+                    let mut rebound = inputs.clone();
+                    rebound.recipe.recipe_sha256 = sha256(&json_bytes(&changed).unwrap());
+                    if verify_recipe_policy(&changed, &rebound).is_ok() {
+                        admitted.push(format!("{profile}/{field}/path={path}"));
+                    }
+                }
+            }
+        }
+        assert!(
+            admitted.is_empty(),
+            "pure policy admitted invalid metadata: {admitted:?}"
+        );
+    }
+
+    // A dropped shared predicate would admit these internally rebound records.
+    #[test]
+    fn pure_recipe_policy_preserves_v2_checks() {
+        let (_fixture, recipe, inputs) = policy_fixture();
+        verify_recipe_policy(&recipe, &inputs).unwrap();
+        let original = serde_json::to_value(&recipe).unwrap();
+        for (field, replacement) in [
+            ("schema", json!("osslscope-build-recipe-v1")),
+            ("profile", json!("musl")),
+            ("jobs", json!(3)),
+            ("formats", json!(["prefix", "rpm", "deb"])),
+            ("argv", json!(["cargo", "build"])),
+            ("bpf_argv", json!(["cargo", "build"])),
+            ("environment", json!([])),
+            ("resources", json!([])),
+        ] {
+            let mut changed = original.clone();
+            changed[field] = replacement;
+            let changed: BuildRecipe = serde_json::from_value(changed).unwrap();
+            assert!(verify_recipe_policy(&changed, &inputs).is_err(), "{field}");
+        }
+        let mut changed = recipe.clone();
+        changed.environment.swap(0, 1);
+        let mut rebound = inputs.clone();
+        rebound.environment = changed.environment.clone();
+        assert!(verify_recipe_policy(&changed, &rebound).is_err());
+        let mut changed = recipe.clone();
+        changed.jobs = 3;
+        let mut rebound = inputs.clone();
+        rebound.jobs = 3;
+        assert!(verify_recipe_policy(&changed, &rebound).is_err());
+        let mut changed = recipe.clone();
+        changed.argv.push("--config=unreviewed".into());
+        let mut rebound = inputs.clone();
+        rebound.argv = changed.argv.clone();
+        assert!(verify_recipe_policy(&changed, &rebound).is_err());
+        let mut changed = recipe.clone();
+        changed.determinism.umask = 0;
+        assert!(verify_recipe_policy(&changed, &inputs).is_err());
+        let mut changed = recipe.clone();
+        changed.tools.host.version = "1.89.0".into();
+        changed.resources[0].identity.version = "1.89.0".into();
+        let mut rebound = inputs.clone();
+        rebound.tools = changed.tools.clone();
+        assert!(verify_recipe_policy(&changed, &rebound).is_err());
+        let mut changed = recipe.clone();
+        changed.resources.swap(0, 1);
+        assert!(verify_recipe_policy(&changed, &inputs).is_err());
+        let mut rebound = inputs.clone();
+        rebound.host_profile.abi_profile = "linux-x86_64-musl".into();
+        assert!(verify_recipe_policy(&recipe, &rebound).is_err());
+        let mut rebound = inputs.clone();
+        rebound.source_epoch += 1;
+        assert!(verify_recipe_policy(&recipe, &rebound).is_err());
+        let mut rebound = inputs.clone();
+        rebound.package_revision = 2;
+        assert!(verify_recipe_policy(&recipe, &rebound).is_err());
+        let mut rebound = inputs.clone();
+        rebound.product_version.clear();
+        assert!(verify_recipe_policy(&recipe, &rebound).is_err());
+        let mut huge = recipe.clone();
+        huge.host_profile.abi_floor = "x".repeat(1_048_577);
+        // Structurally valid JSON exceeds the envelope; syntax cannot mask it.
+        assert!(BuildRecipe::parse_json(&json_bytes(&huge).unwrap()).is_err());
+    }
+
+    #[test]
+    fn abi_provider_and_required_cell_sets_are_exact() {
+        let (_fixture, mut recipe, _) = policy_fixture();
+        recipe.required_cells = vec!["cell-a".into(), "cell-b".into()];
+        let cell = json!({"name":"cell-a","interpreter":{"kind":"dynamic","path":"/lib64/ld-linux-x86-64.so.2"},"needed":["libc.so.6","libm.so.6"],"symbol_versions":["libc.so.6@GLIBC_2.17","libm.so.6@GLIBC_2.2.5"]});
+        let mut second = cell.clone();
+        second["name"] = json!("cell-b");
+        let good = json!({"schema":"osslscope-abi-evidence-v1","host_profile":recipe.host_profile,"cells":[cell,second]});
+        let data = json_bytes(&good).unwrap();
+        recipe.abi_evidence = content("abi/gnu.json", &data).unwrap();
+        let evidence = verify_abi_evidence(&recipe, &data).unwrap();
+        assert_eq!(evidence.cells.len(), 2);
+        assert_eq!(evidence.cells[0].needed, ["libc.so.6", "libm.so.6"]);
+        assert_eq!(
+            evidence.cells[0].symbol_versions,
+            ["libc.so.6@GLIBC_2.17", "libm.so.6@GLIBC_2.2.5"]
+        );
+        assert!(verify_abi_evidence(&recipe, b"{}").is_err());
+        let mut wrong_length = recipe.clone();
+        wrong_length.abi_evidence.bytes += 1;
+        assert!(verify_abi_evidence(&wrong_length, &data).is_err());
+        let mut wrong_hash = recipe.clone();
+        wrong_hash.abi_evidence.sha256 = sha256(b"other ABI bytes");
+        assert!(verify_abi_evidence(&wrong_hash, &data).is_err());
+        for cells in [
+            vec![],
+            vec!["cell-a".to_owned(), "cell-a".to_owned()],
+            vec!["".to_owned()],
+        ] {
+            let mut changed = recipe.clone();
+            changed.required_cells = cells;
+            assert!(verify_abi_evidence(&changed, &data).is_err());
+        }
+        for (field, replacement) in [
+            ("needed", json!(["libm.so.6", "libc.so.6"])),
+            ("needed", json!(["libc.so.6", "libc.so.6"])),
+            ("needed", json!([""])),
+            ("needed", json!(["bad@soname"])),
+            ("needed", json!(["bad/soname"])),
+            ("needed", json!(["bad\\soname"])),
+            ("needed", json!(["bad\nsoname"])),
+            ("symbol_versions", json!(["libz.so.1@ZLIB_1"])),
+            (
+                "symbol_versions",
+                json!(["libc.so.6@GLIBC_2.17", "libc.so.6@GLIBC_2.17"]),
+            ),
+            ("symbol_versions", json!(["libm.so.6@V2", "libc.so.6@V1"])),
+            ("symbol_versions", json!(["libc.so.6"])),
+            ("symbol_versions", json!(["@V1"])),
+            ("symbol_versions", json!(["libc.so.6@"])),
+            ("symbol_versions", json!(["libc.so.6@bad@version"])),
+            ("symbol_versions", json!(["libc.so.6@bad/version"])),
+            ("symbol_versions", json!(["libc.so.6@bad\\version"])),
+            ("symbol_versions", json!(["libc.so.6@bad\nversion"])),
+            (
+                "interpreter",
+                json!({"kind":"dynamic","path":"relative/loader"}),
+            ),
+            (
+                "interpreter",
+                json!({"kind":"dynamic","path":"/lib/../loader"}),
+            ),
+            (
+                "interpreter",
+                json!({"kind":"dynamic","path":"/lib/loader\n"}),
+            ),
+            ("interpreter", json!({"kind":"static"})),
+        ] {
+            let mut bad = good.clone();
+            bad["cells"][0][field] = replacement;
+            let data = json_bytes(&bad).unwrap();
+            recipe.abi_evidence = content("abi/gnu.json", &data).unwrap();
+            assert!(
+                verify_abi_evidence(&recipe, &data).is_err(),
+                "{field}: {}",
+                bad["cells"][0][field]
+            );
+        }
+        for kind in ["missing", "duplicate", "reordered", "profile"] {
+            let mut bad = good.clone();
+            match kind {
+                "missing" => {
+                    bad["cells"].as_array_mut().unwrap().pop();
+                }
+                "duplicate" => bad["cells"][1] = bad["cells"][0].clone(),
+                "reordered" => bad["cells"].as_array_mut().unwrap().swap(0, 1),
+                _ => bad["host_profile"]["target"] = json!("x86_64-unknown-linux-musl"),
+            }
+            let data = json_bytes(&bad).unwrap();
+            recipe.abi_evidence = content("abi/gnu.json", &data).unwrap();
+            assert!(verify_abi_evidence(&recipe, &data).is_err(), "{kind}");
+        }
+        let mut static_abi = good.clone();
+        for cell in static_abi["cells"].as_array_mut().unwrap() {
+            cell["interpreter"] = json!({"kind":"static"});
+            cell["needed"] = json!([]);
+            cell["symbol_versions"] = json!([]);
+        }
+        let data = json_bytes(&static_abi).unwrap();
+        recipe.abi_evidence = content("abi/gnu.json", &data).unwrap();
+        verify_abi_evidence(&recipe, &data).unwrap();
+        static_abi["cells"][0]["symbol_versions"] = json!(["libc.so.6@GLIBC_2.17"]);
+        let data = json_bytes(&static_abi).unwrap();
+        recipe.abi_evidence = content("abi/gnu.json", &data).unwrap();
+        assert!(verify_abi_evidence(&recipe, &data).is_err());
+        let mut huge = good.clone();
+        huge["cells"][0]["name"] = json!("x".repeat(1_048_577));
+        let huge = json_bytes(&huge).unwrap();
+        recipe.abi_evidence = content("abi/gnu.json", &huge).unwrap();
+        assert!(verify_abi_evidence(&recipe, &huge).is_err());
+    }
+
+    #[test]
+    fn executor_presence_requires_original_regular_source_nodes() {
+        for path in [
+            "scripts/package-executor.py",
+            "packaging/builders/gnu.layout.json",
+        ] {
+            let (mut fixture, recipe, _) = policy_fixture();
+            let original = fixture.files[path].clone();
+            fs::remove_file(fixture.root.join(path)).unwrap();
+            let tree = fixture.tree();
+            fixture.source(path, &original);
+            assert!(
+                verify_executor_source_presence(&tree, &recipe).is_err(),
+                "late {path}"
+            );
+            fs::remove_file(fixture.root.join(path)).unwrap();
+            std::os::unix::fs::symlink(
+                if path.starts_with("scripts/") {
+                    "../AGENTS.md"
+                } else {
+                    "../../AGENTS.md"
+                },
+                fixture.root.join(path),
+            )
+            .unwrap();
+            let tree = fixture.tree();
+            assert!(
+                verify_executor_source_presence(&tree, &recipe).is_err(),
+                "symlink {path}"
+            );
+        }
+    }
 
     #[test]
     fn exact_archive_read_must_match_the_admitted_node_despite_stable_individual_reads() {
