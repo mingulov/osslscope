@@ -19,6 +19,7 @@ path = "src/main.rs"
 anyhow = "1"
 aya = "=0.14.0"
 goblin = "0.10"
+flate2 = { version = "=1.1.9", default-features = false, features = ["rust_backend"] }
 ossl-bpf-sys = { path = "crates/bpf-sys" }
 osslscope-ebpf-common = { path = "crates/ebpf-common", features = ["user"] }
 libc = "0.2"

@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Candidate policy only. Required builder records/resources and measured ABI
+# evidence must be supplied and verified before sealing actual build inputs.
+schema = "osslscope-release-policy-v1"
+package_epoch = 1
+package_revision = 1
+source_epoch = 1792799804
+jobs = 2
+
+[profiles.gnu]
+target = "x86_64-unknown-linux-gnu"
+abi_profile = "linux-x86_64-gnu"
+builder = "packaging/builders/gnu.json"
+formats = ["deb", "rpm", "prefix"]
+
+[profiles.musl]
+target = "x86_64-unknown-linux-musl"
+abi_profile = "linux-x86_64-musl"
+builder = "packaging/builders/musl.json"
+formats = ["prefix"]
+
+[artifacts]
+source_archive = "source.tar"
+offline_inventory = "offline-inventory.json"
+notices = "notices.json"
+license_index = "license-index.json"
+sbom = "source.spdx.json"
+source_availability = "source-availability.json"

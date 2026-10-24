@@ -605,21 +605,15 @@ pub fn canonical_bytes<T: PackageRecord>(record: &T) -> Vec<u8> {
 }
 
 pub fn parse_canonical<T: PackageRecord>(bytes: &[u8]) -> Result<T, PackageError> {
-    if bytes.is_empty() || bytes.len() > MAX_RECORD_BYTES {
-        return Err(PackageError::invalid(
-            "record length exceeds 1 MiB or is empty",
-        ));
-    }
-    let value: NoDup =
-        serde_json::from_slice(bytes).map_err(|e| PackageError::invalid(e.to_string()))?;
+    let value = decode_closed_json(bytes)?;
     let mut canonical =
-        serde_json::to_vec(&value.0).map_err(|e| PackageError::invalid(e.to_string()))?;
+        serde_json::to_vec(&value).map_err(|e| PackageError::invalid(e.to_string()))?;
     canonical.push(b'\n');
     if canonical != bytes {
         return Err(PackageError::invalid("noncanonical JSON bytes"));
     }
     let record: T =
-        serde_json::from_value(value.0).map_err(|e| PackageError::invalid(e.to_string()))?;
+        serde_json::from_value(value).map_err(|e| PackageError::invalid(e.to_string()))?;
     record.validate()?;
     if canonical_bytes(&record) != bytes {
         return Err(PackageError::invalid(
@@ -627,6 +621,19 @@ pub fn parse_canonical<T: PackageRecord>(bytes: &[u8]) -> Result<T, PackageError
         ));
     }
     Ok(record)
+}
+
+// Owning source/config parsers keep their own closed schemas and validation.
+// This helper shares only duplicate detection, the size bound and complete JSON decoding.
+pub(crate) fn decode_closed_json(bytes: &[u8]) -> Result<Value, PackageError> {
+    if bytes.is_empty() || bytes.len() > MAX_RECORD_BYTES {
+        return Err(PackageError::invalid(
+            "record length exceeds 1 MiB or is empty",
+        ));
+    }
+    let value: NoDup =
+        serde_json::from_slice(bytes).map_err(|e| PackageError::invalid(e.to_string()))?;
+    Ok(value.0)
 }
 
 #[derive(Clone, Debug)]

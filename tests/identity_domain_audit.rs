@@ -864,6 +864,9 @@ fn h5_t3_every_device_site_names_one_domain() {
             "if proc_id.dev != rebound_id.dev || proc_id.ino != rebound_id.ino {",
             1,
         ),
+        // Source reads compare before/after raw metadata from the same retained FD.
+        ("src/package/source.rs", "raw", "a.dev(),", 1),
+        ("src/package/source.rs", "raw", "b.dev(),", 1),
     ];
     for (file, domain, _, _) in pinned {
         assert!(

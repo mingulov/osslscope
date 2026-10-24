@@ -2,8 +2,10 @@
 pub mod commands;
 pub mod embedded;
 pub mod error;
+pub mod inventory;
 pub mod records;
 pub mod resolve;
+pub mod source;
 pub mod trusted;
 
 pub use error::PackageError;

@@ -650,10 +650,9 @@ impl ProcPort for FakeProc {
             .read_allowances
             .push((path.to_string(), max_bytes));
         if self.file_err.contains(path) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("injected file failure for {path}"),
-            ));
+            return Err(std::io::Error::other(format!(
+                "injected file failure for {path}"
+            )));
         }
         if let Some(seq) = self.file_read_seq.pop_front() {
             let f = seq.get(path).ok_or_else(|| {
@@ -8968,20 +8967,34 @@ fn r14_cumulative_two_file_overflow_skips_second() {
     // file-count cap.
     let mut h = Harness::fresh("r14-cumulative");
     h.snapshot_attached();
-    let elf_len = h.bytes.len();
+    // Budget inputs are validated miniature ELFs, independent of this test binary.
+    let elf = small_elf(0xE5);
+    let off = x_offset(&elf);
+    let elf_len = elf.len();
     let budget = elf_len + elf_len / 2;
-    let other = h.stage.write("a-second.so", &h.bytes.clone());
+    assert!(elf_len < budget && budget < 2 * elf_len);
+    assert!(budget < plan::MAX_OBJECT_BYTES);
+    let staged = h.stage.write("z-primary.so", &elf);
+    h.files.insert(
+        staged.path.clone(),
+        plan::FileBytes {
+            bytes: elf.clone().into(),
+            dev: staged.device,
+            ino: staged.ino,
+        },
+    );
+    let other = h.stage.write("a-second.so", &elf);
     h.files.insert(
         other.path.clone(),
         plan::FileBytes {
-            bytes: h.bytes.clone().into(),
+            bytes: elf.clone().into(),
             dev: other.device,
             ino: other.ino,
         },
     );
     h.read_budget = budget;
-    h.maps = vec![mapping(&other), mapping(&h.staged)];
-    let staged_path = h.staged.path.clone();
+    h.maps = vec![mapping(&other), mapping(&staged)];
+    let staged_path = staged.path.clone();
     let other_path = other.path.clone();
     assert!(
         other_path < staged_path,
@@ -8992,7 +9005,7 @@ fn r14_cumulative_two_file_overflow_skips_second() {
         candidates: vec![
             cand(
                 "/p/provider.so",
-                backing_of(&other, h.off),
+                backing_of(&other, off),
                 1,
                 11,
                 "SHA-256",
@@ -9001,7 +9014,7 @@ fn r14_cumulative_two_file_overflow_skips_second() {
             ),
             cand(
                 "/p/provider.so",
-                backing_of(&h.staged, h.off),
+                backing_of(&staged, off),
                 1,
                 11,
                 "SHA-256",
@@ -9178,22 +9191,27 @@ fn r14_fix_cached_payload_over_remaining_budget_skips_loud() {
     // z-old no longer fits the remainder and must be refused.
     let mut h = Harness::fresh("r14-mixed");
     h.snapshot_attached();
-    let elf_len = h.bytes.len();
+    // Budget inputs are validated miniature ELFs, independent of this test binary.
+    let elf = small_elf(0xE5);
+    let off = x_offset(&elf);
+    let elf_len = elf.len();
     let budget = elf_len + elf_len / 2;
-    let fresh = h.stage.write("a-new.so", &h.bytes.clone());
+    assert!(elf_len < budget && budget < 2 * elf_len);
+    assert!(budget < plan::MAX_OBJECT_BYTES);
+    let fresh = h.stage.write("a-new.so", &elf);
     h.files.insert(
         fresh.path.clone(),
         plan::FileBytes {
-            bytes: h.bytes.clone().into(),
+            bytes: elf.clone().into(),
             dev: fresh.device,
             ino: fresh.ino,
         },
     );
-    let old = h.stage.write("z-old.so", &h.bytes.clone());
+    let old = h.stage.write("z-old.so", &elf);
     h.files.insert(
         old.path.clone(),
         plan::FileBytes {
-            bytes: h.bytes.clone().into(),
+            bytes: elf.clone().into(),
             dev: old.device,
             ino: old.ino,
         },
@@ -9210,7 +9228,7 @@ fn r14_fix_cached_payload_over_remaining_budget_skips_loud() {
     h.polls.push_back(DiscoveryDelta {
         candidates: vec![cand(
             "/p/provider.so",
-            backing_of(&old, h.off),
+            backing_of(&old, off),
             1,
             11,
             "SHA-256",
@@ -9226,7 +9244,7 @@ fn r14_fix_cached_payload_over_remaining_budget_skips_loud() {
         candidates: vec![
             cand(
                 "/p/provider.so",
-                backing_of(&fresh, h.off),
+                backing_of(&fresh, off),
                 1,
                 11,
                 "SHA-256",
@@ -9235,7 +9253,7 @@ fn r14_fix_cached_payload_over_remaining_budget_skips_loud() {
             ),
             cand(
                 "/p/provider.so",
-                backing_of(&old, h.off),
+                backing_of(&old, off),
                 1,
                 11,
                 "SHA-256",
