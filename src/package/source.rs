@@ -1571,6 +1571,91 @@ pub struct BuildRecipe {
     pub jobs: u16,
     pub determinism: Determinism,
 }
+pub(crate) fn recipe_v2_argv(target: &str) -> Vec<String> {
+    [
+        "cargo",
+        "build",
+        "--release",
+        "--frozen",
+        "--offline",
+        "--target",
+        target,
+        "--jobs",
+        "2",
+        "--bin",
+        "osslscope",
+        "--message-format=json-render-diagnostics",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
+pub(crate) fn recipe_v2_bpf_argv() -> Vec<String> {
+    [
+        "cargo",
+        "build",
+        "--release",
+        "--frozen",
+        "--offline",
+        "-Z",
+        "build-std=core",
+        "--target",
+        "bpfel-unknown-none",
+        "--jobs",
+        "2",
+        "--bin",
+        "osslscope-harvest",
+        "--bin",
+        "osslscope-count",
+        "--bin",
+        "osslscope-members",
+        "--message-format=json-render-diagnostics",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
+pub(crate) fn recipe_v2_environment(source_epoch: u64) -> Vec<EnvironmentEntry> {
+    [
+        ("LC_ALL", "C".to_owned()),
+        ("TZ", "UTC".to_owned()),
+        ("SOURCE_DATE_EPOCH", source_epoch.to_string()),
+        ("CARGO_NET_OFFLINE", "true".to_owned()),
+        ("CARGO_BUILD_JOBS", "2".to_owned()),
+        ("RUSTFLAGS", "--remap-path-prefix=/build=.".to_owned()),
+    ]
+    .into_iter()
+    .map(|(name, value)| EnvironmentEntry {
+        name: name.into(),
+        value,
+    })
+    .collect()
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub(crate) enum AbiInterpreter {
+    Static,
+    Dynamic { path: String },
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AbiCell {
+    pub(crate) name: String,
+    pub(crate) interpreter: AbiInterpreter,
+    pub(crate) needed: Vec<String>,
+    pub(crate) symbol_versions: Vec<String>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AbiEvidence {
+    pub(crate) schema: String,
+    pub(crate) host_profile: HostProfile,
+    pub(crate) cells: Vec<AbiCell>,
+}
+
 impl BuildRecipe {
     pub fn parse_json(bytes: &[u8]) -> Result<Self, PackageError> {
         closed(bytes)
@@ -1582,7 +1667,7 @@ impl BuildRecipe {
         deps: &DependencyInventory,
     ) -> Result<(), PackageError> {
         let selected = config.selected();
-        if self.schema != "osslscope-build-recipe-v1"
+        if self.schema != "osslscope-build-recipe-v2"
             || self.profile != selected.id
             || self.host_profile.target != selected.target
             || self.host_profile.abi_profile != selected.abi_profile
@@ -1602,42 +1687,15 @@ impl BuildRecipe {
             return Err(PackageError::invalid("unreviewed tool version"));
         }
         let expected: Determinism = closed(&json_bytes(
-            &json!({"locale":"C","timezone":"UTC","umask":18,"uid":0,"gid":0,"file_mode":420,"executable_mode":493,"symlink_mode":511,"mtime":SOURCE_EPOCH,"archive_order":"lexical","compression":"none","path_remap":"--remap-path-prefix=source=."}),
+            &json!({"locale":"C","timezone":"UTC","umask":18,"uid":0,"gid":0,"file_mode":420,"executable_mode":493,"symlink_mode":511,"mtime":SOURCE_EPOCH,"archive_order":"lexical","compression":"none","path_remap":"--remap-path-prefix=/build=."}),
         )?)?;
         if self.determinism != expected {
             return Err(PackageError::invalid("unbound deterministic inputs"));
         }
-        let expected_environment: Vec<EnvironmentEntry> = closed(&json_bytes(
-            &json!([{"name":"LC_ALL","value":"C"},{"name":"TZ","value":"UTC"},{"name":"SOURCE_DATE_EPOCH","value":SOURCE_EPOCH.to_string()},{"name":"CARGO_NET_OFFLINE","value":"true"},{"name":"CARGO_BUILD_JOBS","value":"2"},{"name":"RUSTFLAGS","value":self.determinism.path_remap}]),
-        )?)?;
-        if self.environment != expected_environment {
+        if self.environment != recipe_v2_environment(config.source_epoch) {
             return Err(PackageError::invalid("unrecorded environment override"));
         }
-        let expected_argv = vec![
-            "cargo",
-            "build",
-            "--release",
-            "--frozen",
-            "--offline",
-            "--target",
-            selected.target.as_str(),
-            "--jobs",
-            "2",
-        ];
-        let expected_bpf = vec![
-            "cargo",
-            "build",
-            "--release",
-            "--frozen",
-            "--offline",
-            "-Z",
-            "build-std=core",
-            "--target",
-            "bpfel-unknown-none",
-            "--jobs",
-            "2",
-        ];
-        if self.argv != expected_argv || self.bpf_argv != expected_bpf {
+        if self.argv != recipe_v2_argv(&selected.target) || self.bpf_argv != recipe_v2_bpf_argv() {
             return Err(PackageError::invalid("unrecorded compiler argv"));
         }
         let identities = std::iter::once(&tools.host)
@@ -1689,11 +1747,46 @@ impl BuildRecipe {
             "llvm-library",
             "host-sysroot",
             "bpf-sysroot",
+            "build-compiler",
+            "build-linker",
+            "build-archive",
+            "build-sysroot",
         ] {
             if !roles.contains(role) {
                 return Err(PackageError::invalid(format!(
                     "missing mandatory tool role {role}"
                 )));
+            }
+        }
+        if selected.target == "x86_64-unknown-linux-gnu" {
+            for (selected_role, build_role) in [
+                ("native-compiler", "build-compiler"),
+                ("archive", "build-archive"),
+                ("sysroot", "build-sysroot"),
+            ] {
+                let selected_resource = self
+                    .resources
+                    .iter()
+                    .find(|resource| resource.role == selected_role)
+                    .ok_or_else(|| {
+                        PackageError::invalid(format!(
+                            "missing mandatory tool role {selected_role}"
+                        ))
+                    })?;
+                let build_resource = self
+                    .resources
+                    .iter()
+                    .find(|resource| resource.role == build_role)
+                    .ok_or_else(|| {
+                        PackageError::invalid(format!("missing mandatory tool role {build_role}"))
+                    })?;
+                let selected_bytes = verify_entry(&deps.root, &selected_resource.content)?;
+                let build_bytes = verify_entry(&deps.root, &build_resource.content)?;
+                if selected_bytes != build_bytes {
+                    return Err(PackageError::invalid(
+                        "GNU selected/build tool content mismatch",
+                    ));
+                }
             }
         }
         for (role, version) in [
@@ -1726,27 +1819,6 @@ impl BuildRecipe {
                 "tool role/selected identity ordering mismatch",
             ));
         }
-        #[derive(Deserialize)]
-        #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
-        enum Interpreter {
-            Static,
-            Dynamic { path: String },
-        }
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct AbiCell {
-            name: String,
-            interpreter: Interpreter,
-            needed: Vec<String>,
-            symbol_versions: Vec<String>,
-        }
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct AbiEvidence {
-            schema: String,
-            host_profile: HostProfile,
-            cells: Vec<AbiCell>,
-        }
         let abi: AbiEvidence = closed(&verify_entry(&deps.root, &self.abi_evidence)?)?;
         if abi.schema != "osslscope-abi-evidence-v1"
             || abi.host_profile != self.host_profile
@@ -1758,8 +1830,8 @@ impl BuildRecipe {
             || abi.cells.iter().any(|c| {
                 c.name.is_empty()
                     || match &c.interpreter {
-                        Interpreter::Static => !c.needed.is_empty(),
-                        Interpreter::Dynamic { path } => {
+                        AbiInterpreter::Static => !c.needed.is_empty(),
+                        AbiInterpreter::Dynamic { path } => {
                             !path.starts_with('/')
                                 || path.chars().any(char::is_control)
                                 || path.split('/').any(|p| p == "..")

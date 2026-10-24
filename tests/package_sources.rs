@@ -16,6 +16,302 @@ use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf};
 mod package_source_fixtures;
 use package_source_fixtures::{Fixture, bytes, fixture_tar};
 
+// Rebind every inventory/resource copy while preserving source/acquisition closure.
+fn replace_tool_content(fixture: &mut Fixture, role: &str, content: &[u8]) {
+    let replacement = fixture.input(&format!("tools/{role}.bin"), content);
+    let recipe: Value = serde_json::from_slice(
+        &fs::read(fixture.root.join("packaging/builders/gnu.json")).unwrap(),
+    )
+    .unwrap();
+    let index = recipe["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .position(|r| r["role"] == role)
+        .unwrap();
+    fixture.tools["components"][index - 5]["sha256"] = replacement["sha256"].clone();
+    for profile in ["gnu", "musl"] {
+        let path = format!("packaging/builders/{profile}.json");
+        let mut recipe: Value =
+            serde_json::from_slice(&fs::read(fixture.root.join(&path)).unwrap()).unwrap();
+        recipe["tools"] = fixture.tools.clone();
+        recipe["resources"][index]["content"] = replacement.clone();
+        recipe["resources"][index]["identity"]["sha256"] = replacement["sha256"].clone();
+        fixture.source(&path, &bytes(&recipe));
+    }
+}
+
+#[test]
+fn v2_sealing_binds_exact_commands_and_environment() {
+    let mut fixture = Fixture::new();
+    for (profile, target) in [
+        ("gnu", "x86_64-unknown-linux-gnu"),
+        ("musl", "x86_64-unknown-linux-musl"),
+    ] {
+        fixture.config["selected_profile"] = json!(profile);
+        let path = format!("packaging/builders/{profile}.json");
+        let recipe_bytes = fs::read(fixture.root.join(path)).unwrap();
+        let recipe: Value = serde_json::from_slice(&recipe_bytes).unwrap();
+        let sealed = fixture.seal().expect("closed v2 recipe must seal");
+        assert_eq!(recipe["schema"], "osslscope-build-recipe-v2");
+        assert_eq!(sealed.inputs.schema, "osslscope-build-inputs-v1");
+        assert_eq!(sealed.inputs.recipe.recipe_sha256, sha256(&recipe_bytes));
+        assert_eq!(
+            sealed.inputs.argv,
+            [
+                "cargo",
+                "build",
+                "--release",
+                "--frozen",
+                "--offline",
+                "--target",
+                target,
+                "--jobs",
+                "2",
+                "--bin",
+                "osslscope",
+                "--message-format=json-render-diagnostics"
+            ]
+        );
+        assert_eq!(
+            recipe["bpf_argv"],
+            json!([
+                "cargo",
+                "build",
+                "--release",
+                "--frozen",
+                "--offline",
+                "-Z",
+                "build-std=core",
+                "--target",
+                "bpfel-unknown-none",
+                "--jobs",
+                "2",
+                "--bin",
+                "osslscope-harvest",
+                "--bin",
+                "osslscope-count",
+                "--bin",
+                "osslscope-members",
+                "--message-format=json-render-diagnostics"
+            ])
+        );
+        let environment = serde_json::to_value(&sealed.inputs.environment).unwrap();
+        assert_eq!(
+            environment,
+            json!([{"name":"LC_ALL","value":"C"},{"name":"TZ","value":"UTC"},{"name":"SOURCE_DATE_EPOCH","value":"1792799804"},{"name":"CARGO_NET_OFFLINE","value":"true"},{"name":"CARGO_BUILD_JOBS","value":"2"},{"name":"RUSTFLAGS","value":"--remap-path-prefix=/build=."}])
+        );
+        assert!(
+            !sealed
+                .inputs
+                .environment
+                .iter()
+                .any(|e| e.name == "OSSL_PACKAGE_RECORD_DIR")
+        );
+        verify_closure(&sealed).unwrap();
+    }
+}
+
+#[test]
+fn v1_or_modified_v2_refuses() {
+    let mut fixture = Fixture::new();
+    fixture.seal().unwrap();
+    let path = "packaging/builders/gnu.json";
+    let original: Value =
+        serde_json::from_slice(&fs::read(fixture.root.join(path)).unwrap()).unwrap();
+    let mut variants = Vec::new();
+    let mut old = original.clone();
+    old["schema"] = json!("osslscope-build-recipe-v1");
+    old["argv"].as_array_mut().unwrap().truncate(9);
+    old["bpf_argv"].as_array_mut().unwrap().truncate(11);
+    old["determinism"]["path_remap"] = json!("--remap-path-prefix=source=.");
+    old["environment"][5]["value"] = json!("--remap-path-prefix=source=.");
+    old["resources"].as_array_mut().unwrap().truncate(16);
+    old["tools"]["components"]
+        .as_array_mut()
+        .unwrap()
+        .truncate(11);
+    // Keep the original v1 literals as explicit refusal input, never migrate bytes.
+    variants.push(("old v1", old));
+    for (name, field, value) in [
+        (
+            "v1 discriminator",
+            "schema",
+            json!("osslscope-build-recipe-v1"),
+        ),
+        ("unknown field", "extra", json!(true)),
+        ("jobs", "jobs", json!(1)),
+    ] {
+        let mut modified = original.clone();
+        modified[field] = value;
+        variants.push((name, modified));
+    }
+    for field in ["argv", "bpf_argv", "environment"] {
+        for change in ["extra", "missing", "reordered"] {
+            let mut modified = original.clone();
+            let entries = modified[field].as_array_mut().unwrap();
+            match change {
+                "extra" => entries.push(entries.last().unwrap().clone()),
+                "missing" => {
+                    entries.pop().unwrap();
+                }
+                _ => entries.swap(0, 1),
+            }
+            variants.push((field, modified));
+        }
+    }
+    for field in ["argv", "bpf_argv"] {
+        for change in ["extra bin", "missing bin", "reordered bin"] {
+            let mut modified = original.clone();
+            let entries = modified[field].as_array_mut().unwrap();
+            let index = entries.iter().position(|v| v == "--bin").unwrap();
+            match change {
+                "extra bin" => {
+                    entries.insert(index, json!("--bin"));
+                    entries.insert(index + 1, json!("osslscope-package"));
+                }
+                "missing bin" => {
+                    entries.drain(index..index + 2);
+                }
+                _ => {
+                    let pair: Vec<_> = entries.drain(index..index + 2).collect();
+                    entries.splice(2..2, pair);
+                }
+            }
+            variants.push((change, modified));
+        }
+    }
+    let mut old_remap = original.clone();
+    old_remap["determinism"]["path_remap"] = json!("--remap-path-prefix=source=.");
+    old_remap["environment"][5]["value"] = json!("--remap-path-prefix=source=.");
+    variants.push(("old remap", old_remap));
+    for (name, recipe) in variants {
+        fixture.source(path, &bytes(&recipe));
+        assert!(fixture.seal().is_err(), "admitted modified recipe: {name}");
+    }
+}
+
+#[test]
+fn v2_build_tools_complete_and_gnu_equal() {
+    let fixture = Fixture::new();
+    fixture
+        .seal()
+        .expect("GNU equal selected/build content must seal");
+    for role in [
+        "build-compiler",
+        "build-linker",
+        "build-archive",
+        "build-sysroot",
+    ] {
+        for profile in ["gnu", "musl"] {
+            for missing in ["role", "acquisition", "source"] {
+                let mut fixture = Fixture::new();
+                fixture.config["selected_profile"] = json!(profile);
+                let path = format!("packaging/builders/{profile}.json");
+                let mut recipe: Value =
+                    serde_json::from_slice(&fs::read(fixture.root.join(&path)).unwrap()).unwrap();
+                let index = recipe["resources"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .position(|r| r["role"] == role)
+                    .unwrap();
+                let expected = match missing {
+                    "role" => {
+                        recipe["resources"].as_array_mut().unwrap().remove(index);
+                        fixture.tools["components"]
+                            .as_array_mut()
+                            .unwrap()
+                            .remove(index - 5);
+                        recipe["tools"] = fixture.tools.clone();
+                        format!("missing mandatory tool role {role}")
+                    }
+                    "acquisition" => {
+                        fs::remove_file(
+                            fixture.inputs.join(
+                                recipe["resources"][index]["acquisition"]["path"]
+                                    .as_str()
+                                    .unwrap(),
+                            ),
+                        )
+                        .unwrap();
+                        "unavailable package metadata".into()
+                    }
+                    _ => {
+                        let source = recipe["resources"][index]["source_component"].clone();
+                        fixture.inventory["tool_sources"]
+                            .as_array_mut()
+                            .unwrap()
+                            .retain(|s| s != &source);
+                        "tool binary/source/component identity mismatch".into()
+                    }
+                };
+                fixture.source(&path, &bytes(&recipe));
+                let err = fixture
+                    .seal()
+                    .err()
+                    .expect("modified recipe must refuse")
+                    .to_string();
+                assert!(
+                    err.contains(&expected),
+                    "{profile} {role} missing {missing}: {err}"
+                );
+            }
+        }
+    }
+    for role in [
+        "native-compiler",
+        "archive",
+        "sysroot",
+        "build-compiler",
+        "build-archive",
+        "build-sysroot",
+    ] {
+        let mut fixture = Fixture::new();
+        fixture.seal().unwrap();
+        replace_tool_content(
+            &mut fixture,
+            role,
+            b"independently rebound selected/build content\n",
+        );
+        let err = fixture
+            .seal()
+            .err()
+            .expect("modified recipe must refuse")
+            .to_string();
+        assert!(
+            err.contains("GNU selected/build tool content mismatch"),
+            "{role}: {err}"
+        );
+        fixture.config["selected_profile"] = json!("musl");
+        fixture
+            .seal()
+            .expect("musl selected/build content may differ");
+    }
+    let mut fixture = Fixture::new();
+    let path = "packaging/builders/gnu.json";
+    let mut recipe: Value =
+        serde_json::from_slice(&fs::read(fixture.root.join(path)).unwrap()).unwrap();
+    let index = recipe["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .position(|r| r["role"] == "build-compiler")
+        .unwrap();
+    fixture.tools["components"][index - 5]["name"] = json!("cc");
+    recipe["tools"] = fixture.tools.clone();
+    recipe["resources"][index]["identity"]["name"] = json!("cc");
+    fixture.source(path, &bytes(&recipe));
+    assert!(
+        fixture
+            .seal()
+            .err()
+            .expect("modified recipe must refuse")
+            .to_string()
+            .contains("tool binary/source/component identity mismatch")
+    );
+}
+
 #[test]
 fn fresh_archive_identity_is_not_null() {
     let fixture = Fixture::new();
@@ -133,6 +429,10 @@ fn closure_rejects_missing_or_changed_input() {
         "tools/sysroot.bin",
         "acquisition/bpf.tar",
         "sources/rust-src.tar",
+        "sources/build-compiler.tar",
+        "sources/build-linker.tar",
+        "sources/build-archive.tar",
+        "sources/build-sysroot.tar",
         "terms/contract.txt",
         "notices/host.txt",
         "offers/bpf.txt",
@@ -275,6 +575,7 @@ fn closed_config_builder_and_source_records_refuse_unbound_values() {
         fixture.seal(),
         Err(PackageError::Unavailable { .. })
     ));
+    assert!(!builder.exists(), "missing builder must not be synthesized");
 }
 #[test]
 fn native_package_tool_seals_owned_fixtures_and_maps_unavailable() {

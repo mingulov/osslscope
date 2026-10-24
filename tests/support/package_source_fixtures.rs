@@ -145,12 +145,22 @@ impl Fixture {
             ("llvm-library", "llvm-real-library", "fixture"),
             ("host-sysroot", "rust-host-sysroot", "1.88.0"),
             ("bpf-sysroot", "rust-bpf-sysroot", "nightly-2026-05-20"),
+            ("build-compiler", "build-cc", "fixture"),
+            ("build-linker", "build-ld", "fixture"),
+            ("build-archive", "build-ar", "fixture"),
+            ("build-sysroot", "build-sysroot", "fixture"),
         ]
         .iter()
         .map(|(role, name, version)| {
+            let bytes_role = match *role {
+                "build-compiler" => "native-compiler",
+                "build-archive" => "archive",
+                "build-sysroot" => "sysroot",
+                _ => role,
+            };
             let content = fixture.input(
                 &format!("tools/{role}.bin"),
-                format!("synthetic {role} bytes\n").as_bytes(),
+                format!("synthetic {bytes_role} bytes\n").as_bytes(),
             );
             json!({"name":name,"version":version,"sha256":content["sha256"]})
         })
@@ -173,6 +183,10 @@ impl Fixture {
             "llvm-library",
             "host-sysroot",
             "bpf-sysroot",
+            "build-compiler",
+            "build-linker",
+            "build-archive",
+            "build-sysroot",
         ]
         .iter()
         .enumerate()
@@ -222,7 +236,7 @@ impl Fixture {
         ] {
             let profile = json!({"target":target,"abi_profile":abi,"abi_floor":"synthetic measured fixture only"});
             let abi_receipt = fixture.input(&format!("abi/{id}.json"), &bytes(&json!({"schema":"osslscope-abi-evidence-v1","host_profile":profile,"cells":[{"name":"synthetic-required-cell","interpreter":{"kind":"dynamic","path":"/synthetic/loader"},"needed":["libc.synthetic"],"symbol_versions":[]}]})));
-            let recipe = json!({"schema":"osslscope-build-recipe-v1","profile":id,"host_profile":profile,"tools":fixture.tools,"resources":resources,"abi_evidence":abi_receipt,"required_cells":["synthetic-required-cell"],"argv":["cargo","build","--release","--frozen","--offline","--target",target,"--jobs","2"],"bpf_argv":["cargo","build","--release","--frozen","--offline","-Z","build-std=core","--target","bpfel-unknown-none","--jobs","2"],"environment":[{"name":"LC_ALL","value":"C"},{"name":"TZ","value":"UTC"},{"name":"SOURCE_DATE_EPOCH","value":"1792799804"},{"name":"CARGO_NET_OFFLINE","value":"true"},{"name":"CARGO_BUILD_JOBS","value":"2"},{"name":"RUSTFLAGS","value":"--remap-path-prefix=source=."}],"formats":formats,"jobs":2,"determinism":{"locale":"C","timezone":"UTC","umask":18,"uid":0,"gid":0,"file_mode":420,"executable_mode":493,"symlink_mode":511,"mtime":1792799804,"archive_order":"lexical","compression":"none","path_remap":"--remap-path-prefix=source=."}});
+            let recipe = json!({"schema":"osslscope-build-recipe-v2","profile":id,"host_profile":profile,"tools":fixture.tools,"resources":resources,"abi_evidence":abi_receipt,"required_cells":["synthetic-required-cell"],"argv":["cargo","build","--release","--frozen","--offline","--target",target,"--jobs","2","--bin","osslscope","--message-format=json-render-diagnostics"],"bpf_argv":["cargo","build","--release","--frozen","--offline","-Z","build-std=core","--target","bpfel-unknown-none","--jobs","2","--bin","osslscope-harvest","--bin","osslscope-count","--bin","osslscope-members","--message-format=json-render-diagnostics"],"environment":[{"name":"LC_ALL","value":"C"},{"name":"TZ","value":"UTC"},{"name":"SOURCE_DATE_EPOCH","value":"1792799804"},{"name":"CARGO_NET_OFFLINE","value":"true"},{"name":"CARGO_BUILD_JOBS","value":"2"},{"name":"RUSTFLAGS","value":"--remap-path-prefix=/build=."}],"formats":formats,"jobs":2,"determinism":{"locale":"C","timezone":"UTC","umask":18,"uid":0,"gid":0,"file_mode":420,"executable_mode":493,"symlink_mode":511,"mtime":1792799804,"archive_order":"lexical","compression":"none","path_remap":"--remap-path-prefix=/build=."}});
             fixture.source(&format!("packaging/builders/{id}.json"), &bytes(&recipe));
         }
         fixture.inventory = json!({"schema":"osslscope-dependency-inventory-v1","locks":{"host_sha256":sha256(host_lock),"bpf_sha256":sha256(bpf_lock)},"components":components,"host":["host","common"],"bpf":["bpf","contract"],"tool_sources":resources.iter().map(|r| r["source_component"].clone()).chain(["core","compiler_builtins","stdarch","portable-simd","linker-build"].map(|s|json!(s))).collect::<Vec<_>>(),"build_std":["core","compiler_builtins","stdarch","portable-simd"],"linker_build":["linker-build"],"runtime":["native-runtime"]});
