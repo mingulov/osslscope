@@ -597,6 +597,29 @@ fn failure_diagnostics(context: &capture::CaptureFailureContext, lines: &mut Vec
                 .map(ticket)
                 .unwrap_or_else(|| "none".into())
         )),
+        capture::PreObservationCount::SetupPending(snapshot) => {
+            use capture::{CountSetupPhase as P, SetupCleanupState as C};
+            let phase = match snapshot.phase() {
+                P::Preflight => "preflight",
+                P::OwnerPublished => "owner-published",
+                P::OwnerStarted => "owner-started",
+                P::OpenPending => "open-pending",
+                P::LateReady => "late-ready",
+            };
+            let cleanup = match snapshot.cleanup() {
+                C::Pending => "pending",
+                C::Unknown => "unknown",
+            };
+            let epoch = snapshot
+                .owner_epoch()
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "unknown".into());
+            let ticket = snapshot
+                .cleanup_ticket()
+                .map(|t| format!("{}:{}", t.owner_epoch, t.terminal_sequence))
+                .unwrap_or_else(|| "unknown".into());
+            lines.push(format!("count setup phase={phase} epoch={epoch} ticket={ticket} cleanup={cleanup} unresolved-slots=unknown"));
+        }
         capture::PreObservationCount::NotPrepared => {
             lines.push("count not-prepared cleanup=not-acquired unresolved-slots=0".into())
         }

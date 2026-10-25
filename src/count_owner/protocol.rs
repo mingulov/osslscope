@@ -75,6 +75,7 @@ pub enum FailureClass {
     IdExhausted,
     InvalidInput,
     Deadline,
+    Cancelled,
     DeadlineOverflow,
     Io,
     Panic,

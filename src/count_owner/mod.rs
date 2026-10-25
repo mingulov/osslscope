@@ -7,9 +7,14 @@
 pub(crate) mod io;
 pub(crate) mod protocol;
 pub(crate) mod registry;
+mod setup;
 use io::{CountIoDriver, LiveCountIoDriver, ReadWorkspace};
 pub use protocol::*;
 use registry::Registry;
+use setup::SetupPreparation;
+pub(crate) use setup::{
+    CountPrepareControl, CountSetupJournal, CountSetupPhase, CountSetupProgress, CountSetupWatch,
+};
 use std::sync::{
     Arc, Condvar, Mutex, MutexGuard, OnceLock,
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -59,6 +64,12 @@ pub(crate) struct CountSetupAdmission {
     barrier: Arc<CountForkBarrier>,
     id: u64,
     armed: bool,
+    deadline: Instant,
+}
+impl CountSetupAdmission {
+    pub(crate) fn deadline(&self) -> Instant {
+        self.deadline
+    }
 }
 impl Drop for CountSetupAdmission {
     fn drop(&mut self) {
@@ -168,6 +179,7 @@ impl SetupBarrierLease {
             barrier: Arc::clone(&self.barrier),
             id: self.id,
             armed: true,
+            deadline,
         })
     }
 }
@@ -638,12 +650,15 @@ impl Shared {
         self.refresh_fallback_locked(state, true);
         ticket
     }
-    fn abandon(&self) {
-        let code = abandonment_code(self.now().checked_duration_since(self.trigger_origin));
+    fn claim_abandon(&self, now: Instant) {
+        let code = abandonment_code(now.checked_duration_since(self.trigger_origin));
         let _ = self
             .first_trigger
             .compare_exchange(0, code, Ordering::AcqRel, Ordering::Acquire);
         self.abandoned.store(true, Ordering::Release);
+    }
+    fn abandon(&self) {
+        self.claim_abandon(self.now());
         self.changed.notify_all();
         if let Some(worker) = self.worker.get() {
             worker.unpark();
@@ -664,6 +679,54 @@ impl Shared {
         registry.publish_into(&mut state.resources);
         self.refresh_fallback_locked(&mut state, false);
         self.changed.notify_all();
+    }
+    fn cleanup_progress_locked(&self, state: &SharedState) -> Option<CleanupProgress> {
+        let seal = state.terminal?;
+        let unresolved_resources = state
+            .resources
+            .resources
+            .iter()
+            .filter(|resource| {
+                !matches!(
+                    resource.state,
+                    ResourceState::Unused
+                        | ResourceState::CreateFailed
+                        | ResourceState::CloseReturned
+                )
+            })
+            .count();
+        let status = if state.cleanup_stranded {
+            CleanupStatus::Stranded
+        } else if state.phase == OwnerPhase::Idle && state.resources.cleanup_complete {
+            CleanupStatus::Complete
+        } else if state
+            .resources
+            .resources
+            .iter()
+            .any(|r| r.state == ResourceState::ConsumedError)
+            && !state.resources.resources.iter().any(|r| {
+                matches!(
+                    r.state,
+                    ResourceState::Reserved
+                        | ResourceState::Creating
+                        | ResourceState::Held
+                        | ResourceState::CloseIssued
+                )
+            })
+        {
+            CleanupStatus::Failed
+        } else {
+            CleanupStatus::Pending
+        };
+        Some(CleanupProgress {
+            ticket: seal.ticket,
+            actual_phase: state.phase,
+            active_operation: state.active_operation,
+            coordinator_finalized: state.terminal_result.is_some(),
+            status,
+            unresolved_resources,
+            failures: state.failures,
+        })
     }
     fn registry_progress(&self, registry: &Registry) {
         let mut state = locked(&self.state);
@@ -770,52 +833,7 @@ impl CountEngine {
     /// Nonblocking, bounded diagnostics; never a replacement capture result.
     pub fn cleanup_progress(&self) -> Option<CleanupProgress> {
         let state = self.shared.state.try_lock().ok()?;
-        let seal = state.terminal?;
-        let unresolved_resources = state
-            .resources
-            .resources
-            .iter()
-            .filter(|resource| {
-                !matches!(
-                    resource.state,
-                    ResourceState::Unused
-                        | ResourceState::CreateFailed
-                        | ResourceState::CloseReturned
-                )
-            })
-            .count();
-        let status = if state.cleanup_stranded {
-            CleanupStatus::Stranded
-        } else if state.phase == OwnerPhase::Idle && state.resources.cleanup_complete {
-            CleanupStatus::Complete
-        } else if state
-            .resources
-            .resources
-            .iter()
-            .any(|r| r.state == ResourceState::ConsumedError)
-            && !state.resources.resources.iter().any(|r| {
-                matches!(
-                    r.state,
-                    ResourceState::Reserved
-                        | ResourceState::Creating
-                        | ResourceState::Held
-                        | ResourceState::CloseIssued
-                )
-            })
-        {
-            CleanupStatus::Failed
-        } else {
-            CleanupStatus::Pending
-        };
-        Some(CleanupProgress {
-            ticket: seal.ticket,
-            actual_phase: state.phase,
-            active_operation: state.active_operation,
-            coordinator_finalized: state.terminal_result.is_some(),
-            status,
-            unresolved_resources,
-            failures: state.failures,
-        })
+        self.shared.cleanup_progress_locked(&state)
     }
 
     /// Bind the controller's interpretation before notifying the already
@@ -1346,13 +1364,98 @@ impl CountEngine {
         F: FnOnce() -> D + Send + 'static,
         S: FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
     {
+        Self::prepare_inner(input, limits, deadline, hooks, factory, spawner, None)
+    }
+    pub(crate) fn prepare_controlled(
+        input: CountInput,
+        limits: CountOwnerLimits,
+        deadline: Instant,
+        admission: CountSetupAdmission,
+        control: &CountPrepareControl,
+        journal: &CountSetupJournal,
+    ) -> Result<Self, CountPrepareFailure> {
+        Self::prepare_controlled_with(
+            input,
+            limits,
+            deadline,
+            PrepareHooks::live(),
+            || LiveCountIoDriver,
+            spawn_owner,
+            SetupPreparation {
+                admission: Some(admission),
+                control: control.clone(),
+                journal: journal.clone(),
+            },
+        )
+    }
+    fn prepare_controlled_with<D, F, S>(
+        input: CountInput,
+        limits: CountOwnerLimits,
+        deadline: Instant,
+        hooks: PrepareHooks,
+        factory: F,
+        spawner: S,
+        setup: SetupPreparation,
+    ) -> Result<Self, CountPrepareFailure>
+    where
+        D: CountIoDriver + 'static,
+        F: FnOnce() -> D + Send + 'static,
+        S: FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+    {
+        setup.journal.begin();
+        let journal = setup.journal.clone();
+        let result = Self::prepare_inner(
+            input,
+            limits,
+            deadline,
+            hooks,
+            factory,
+            spawner,
+            Some(setup),
+        );
+        if let Err(failure) = &result {
+            journal.failed(*failure);
+        }
+        result
+    }
+    fn prepare_inner<D, F, S>(
+        input: CountInput,
+        limits: CountOwnerLimits,
+        deadline: Instant,
+        hooks: PrepareHooks,
+        factory: F,
+        spawner: S,
+        mut setup: Option<SetupPreparation>,
+    ) -> Result<Self, CountPrepareFailure>
+    where
+        D: CountIoDriver + 'static,
+        F: FnOnce() -> D + Send + 'static,
+        S: FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+    {
+        let deadline = setup.as_ref().map_or(deadline, |s| {
+            deadline
+                .min(s.control.deadline())
+                .min(s.admission.as_ref().expect("setup token").deadline)
+        });
+        let check = || -> Result<(), CountPrepareFailure> {
+            if let Some(setup) = &setup {
+                setup.journal.check(&setup.control)?;
+            }
+            if Instant::now() >= deadline {
+                return Err(
+                    OwnerFailure::engine(CountOperation::Load, FailureClass::Deadline).into(),
+                );
+            }
+            Ok(())
+        };
         use sha2::Digest as _;
         let preflight_failure =
             |class| CountPrepareFailure::from(OwnerFailure::engine(CountOperation::Load, class));
-        if Instant::now() >= deadline {
-            return Err(preflight_failure(FailureClass::Deadline));
-        }
+        check()?;
         if hooks.domain == EvidenceDomain::Live {
+            #[cfg(test)]
+            hooks.stage(CountPrepareStage::OwnerCpu);
+            check()?;
             let actual = (hooks.possible_cpu_count)().map_err(|error| {
                 CountPrepareFailure::from(OwnerFailure::io(
                     CountOperation::Load,
@@ -1360,27 +1463,43 @@ impl CountEngine {
                     &error,
                 ))
             })?;
+            check()?;
             limits.validate_possible_cpus(actual)?;
         }
+        #[cfg(test)]
+        hooks.stage(CountPrepareStage::Hash);
+        check()?;
         if input.target_tgid == 0
             || <[u8; 32]>::from(sha2::Sha256::digest(&input.object_bytes)) != input.object_sha256
         {
             return Err(preflight_failure(FailureClass::ObjectDrift));
         }
+        check()?;
+        #[cfg(test)]
+        hooks.stage(CountPrepareStage::Parse);
+        check()?;
         crate::loader::validate_count_object(&input.object_bytes)
             .map_err(CountPrepareFailure::from)?;
+        check()?;
         let prepared = crate::loader::prepare(
             &input.object_bytes,
             &crate::loader::COUNT_MAPS,
             &crate::loader::COUNT_PROGS,
         )
         .map_err(|_| preflight_failure(FailureClass::ObjectDrift))?;
+        check()?;
         crate::loader::validate_count_prepared(&prepared).map_err(CountPrepareFailure::from)?;
         if hooks.fail_allocation {
             return Err(preflight_failure(FailureClass::Allocation));
         }
+        check()?;
+        #[cfg(test)]
+        hooks.stage(CountPrepareStage::Allocation);
+        check()?;
         let mut registry = Registry::allocate(limits)?;
+        check()?;
         let read_workspace = ReadWorkspace::allocate(limits, registry.take_read_storage())?;
+        check()?;
         #[cfg(test)]
         let read_workspace = {
             let mut workspace = read_workspace;
@@ -1482,19 +1601,41 @@ impl CountEngine {
             }
         }
         registry.shared = Some(Arc::clone(&shared));
-        shared.barrier.admit(epoch, deadline)?;
+        check()?;
+        if let Some(setup) = setup.as_mut() {
+            setup.journal.publish(
+                &shared,
+                setup.admission.take().expect("single setup admission"),
+                &setup.control,
+            )?;
+        } else {
+            shared.barrier.admit(epoch, deadline)?;
+        }
+        let owner_setup = setup
+            .as_ref()
+            .map(|s| (s.control.clone(), s.journal.clone()));
         let owner_shared = Arc::clone(&shared);
-        let task = Box::new(move || {
-            owner_main(
-                owner_shared,
-                registry,
-                read_workspace,
-                terminal_builder,
-                hooks,
-                factory,
-            )
-        });
+        let launch = Arc::new(OwnerLaunchState::default());
+        if let Some(setup) = &setup {
+            setup.journal.launch(Arc::clone(&launch));
+        }
+        let capture = OwnerLaunchCapture {
+            state: Arc::clone(&launch),
+            body: Some(move || {
+                owner_main(
+                    owner_shared,
+                    registry,
+                    read_workspace,
+                    terminal_builder,
+                    hooks,
+                    factory,
+                    owner_setup,
+                )
+            }),
+        };
+        let task = Box::new(move || capture.run());
         if let Err(error) = spawner(task) {
+            launch.spawn_failed.store(true, Ordering::Release);
             shared.barrier.spawn_failed(epoch);
             return Err(CountPrepareFailure::from(OwnerFailure::io(
                 CountOperation::Load,
@@ -1506,12 +1647,24 @@ impl CountEngine {
         loop {
             // A late Ready does not extend setup. Its FDs remain in the owner
             // even if this side has ceased waiting for publication.
-            if Instant::now() >= deadline {
+            let interruption = setup
+                .as_ref()
+                .and_then(|s| s.journal.check(&s.control).err())
+                .or_else(|| {
+                    (setup.is_some() && shared.abandoned.load(Ordering::Acquire)).then(|| {
+                        OwnerFailure::engine(CountOperation::Load, FailureClass::Cancelled)
+                    })
+                })
+                .or_else(|| {
+                    (Instant::now() >= deadline)
+                        .then(|| OwnerFailure::engine(CountOperation::Load, FailureClass::Deadline))
+                });
+            if let Some(failure) = interruption {
                 drop(state);
                 let ticket = shared.seal(deadline);
                 shared.abandon();
                 return Err(CountPrepareFailure {
-                    failure: OwnerFailure::engine(CountOperation::Load, FailureClass::Deadline),
+                    failure,
                     cleanup_ticket: Some(ticket),
                 });
             }
@@ -1529,7 +1682,9 @@ impl CountEngine {
                     }
                 };
             }
-            let remaining = deadline.saturating_duration_since(Instant::now());
+            let remaining = deadline
+                .saturating_duration_since(Instant::now())
+                .min(std::time::Duration::from_millis(1));
             state = shared
                 .changed
                 .wait_timeout(state, remaining)
@@ -1544,6 +1699,33 @@ impl Drop for CountEngine {
     }
 }
 
+// The launch capture proves disposal separately from a spawner's Err return.
+#[derive(Default)]
+struct OwnerLaunchState {
+    entered: AtomicBool,
+    disposed: AtomicBool,
+    spawn_failed: AtomicBool,
+}
+struct OwnerLaunchCapture<F> {
+    body: Option<F>,
+    state: Arc<OwnerLaunchState>,
+}
+impl<F: FnOnce()> OwnerLaunchCapture<F> {
+    fn run(mut self) {
+        if self.state.spawn_failed.load(Ordering::Acquire) {
+            return;
+        }
+        self.state.entered.store(true, Ordering::Release);
+        self.body.take().expect("single owner entry")();
+    }
+}
+impl<F> Drop for OwnerLaunchCapture<F> {
+    fn drop(&mut self) {
+        // Drop all actual task captures before publishing the physical receipt.
+        drop(self.body.take());
+        self.state.disposed.store(true, Ordering::Release);
+    }
+}
 fn spawn_owner(task: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
     thread::Builder::new()
         .name("osslscope-count".into())
@@ -1551,7 +1733,19 @@ fn spawn_owner(task: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
         .map(drop)
 }
 // No production constructor accepts a driver or a model-evidence selector.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CountPrepareStage {
+    FdInventory,
+    OuterCpu,
+    OwnerCpu,
+    Hash,
+    Parse,
+    Allocation,
+}
 struct PrepareHooks {
+    #[cfg(test)]
+    stage_observer: Option<Arc<dyn Fn(CountPrepareStage) + Send + Sync>>,
     domain: EvidenceDomain,
     possible_cpu_count: fn() -> std::io::Result<usize>,
     fail_allocation: bool,
@@ -1577,8 +1771,16 @@ struct PrepareHooks {
     seal_claim_observer: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 impl PrepareHooks {
+    #[cfg(test)]
+    fn stage(&self, stage: CountPrepareStage) {
+        if let Some(observer) = &self.stage_observer {
+            observer(stage);
+        }
+    }
     fn live() -> Self {
         Self {
+            #[cfg(test)]
+            stage_observer: None,
             domain: EvidenceDomain::Live,
             possible_cpu_count: io::possible_cpu_count,
             fail_allocation: false,
@@ -1619,6 +1821,7 @@ fn owner_main<D, F>(
     mut terminal_builder: Arc<RawTerminalData>,
     hooks: PrepareHooks,
     factory: F,
+    setup_observer: Option<(CountPrepareControl, CountSetupJournal)>,
 ) where
     D: CountIoDriver,
     F: FnOnce() -> D,
@@ -1626,6 +1829,9 @@ fn owner_main<D, F>(
     use std::panic::{AssertUnwindSafe, catch_unwind};
     let _ = shared.worker.set(thread::current());
     shared.barrier.started(shared.epoch);
+    if let Some((_, journal)) = &setup_observer {
+        journal.started();
+    }
     // Construct injected drivers here, after successful owner creation; no test
     // factory can create a count FD on the controller through this entry point.
     let initialization = catch_unwind(AssertUnwindSafe(|| {
@@ -1669,8 +1875,18 @@ fn owner_main<D, F>(
         if shared.abandoned.load(Ordering::Acquire) {
             return Err(OwnerFailure::engine(
                 CountOperation::Load,
-                FailureClass::Disconnected,
+                if setup_observer.is_some() {
+                    FailureClass::Cancelled
+                } else {
+                    FailureClass::Disconnected
+                },
             ));
+        }
+        if let Some((control, _)) = &setup_observer {
+            if let Err(failure) = control.check() {
+                shared.abandon();
+                return Err(failure);
+            }
         }
         let loaded = crate::loader::load_count_tracked(
             &request.prepared,
@@ -1688,7 +1904,11 @@ fn owner_main<D, F>(
         if shared.abandoned.load(Ordering::Acquire) {
             return Err(OwnerFailure::engine(
                 CountOperation::Load,
-                FailureClass::Disconnected,
+                if setup_observer.is_some() {
+                    FailureClass::Cancelled
+                } else {
+                    FailureClass::Disconnected
+                },
             ));
         }
         if hooks.fail_ready_publication {
@@ -1703,7 +1923,11 @@ fn owner_main<D, F>(
         if shared.abandoned.load(Ordering::Acquire) {
             return Err(OwnerFailure::engine(
                 CountOperation::Load,
-                FailureClass::Disconnected,
+                if setup_observer.is_some() {
+                    FailureClass::Cancelled
+                } else {
+                    FailureClass::Disconnected
+                },
             ));
         }
         registry.publish_into(&mut state.resources);
@@ -1725,7 +1949,11 @@ fn owner_main<D, F>(
                 FailureClass::Publication,
             ));
         }
+        if let Some((_, journal)) = &setup_observer {
+            journal.ready();
+        }
         shared.changed.notify_all();
+        drop(state);
         Ok(loaded)
     }));
     let mut active_deadline = shared.setup_deadline;

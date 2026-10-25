@@ -12,6 +12,7 @@ use std::time::Instant;
 
 pub(crate) const MAX_SETUP_LINKS: usize = 1024;
 const MAX_TEMPORARY_FDS: usize = 4;
+pub(crate) const COUNT_NON_COUNT_FD_RESERVE: u64 = (2 * MAX_SETUP_LINKS + MAX_TEMPORARY_FDS) as u64;
 
 #[derive(Clone)]
 pub(crate) enum SetupInterrupt {

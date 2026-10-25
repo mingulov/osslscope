@@ -5955,6 +5955,21 @@ fn terminal_engine(
     writer: Option<Arc<StagedWriter>>,
     faults: TerminalFaults,
 ) -> (CountEngine, Arc<Mutex<Vec<(TerminalEvent, Instant)>>>) {
+    terminal_engine_preparation(probe, writer, faults, None)
+}
+fn terminal_engine_preparation(
+    probe: &Arc<MapProbe>,
+    writer: Option<Arc<StagedWriter>>,
+    faults: TerminalFaults,
+    setup: Option<SetupPreparation>,
+) -> (CountEngine, Arc<Mutex<Vec<(TerminalEvent, Instant)>>>) {
+    let barrier = setup.as_ref().map_or_else(
+        || Arc::new(CountForkBarrier::new()),
+        |s| Arc::clone(&s.admission.as_ref().unwrap().barrier),
+    );
+    if let Some(s) = &setup {
+        s.journal.begin();
+    }
     let observed = Arc::clone(&probe.owner);
     let registry_hook = faults.registry_hook.clone();
     let mut hooks = PrepareHooks::host();
@@ -5991,8 +6006,8 @@ fn terminal_engine(
     let cutoff = Instant::now() + Duration::from_secs(30);
     let timeline = Arc::new(Mutex::new(Vec::new()));
     let observed = Arc::clone(&timeline);
-    let engine = CountEngine::prepare_with(
-        input(Arc::new(CountForkBarrier::new())),
+    let engine = CountEngine::prepare_inner(
+        input(barrier),
         CountOwnerLimits::from_allowance(24, 2).unwrap(),
         cutoff,
         hooks,
@@ -6027,6 +6042,7 @@ fn terminal_engine(
             }
         },
         spawn_owner,
+        setup,
     )
     .unwrap();
     (engine, timeline)
@@ -10294,5 +10310,1009 @@ fn w079_count_reservation_gap() {
     lease.close_prefix();
     let token = lease.reserve_count().unwrap();
     assert!(CountForkBarrier::new().admit_setup(token, epoch).is_err());
+    lease.complete_abort().unwrap();
+}
+
+#[test]
+fn w079_count_prepare_holds_cpu_return_cannot_start_late_owner() {
+    fn held_cpu() -> io::Result<usize> {
+        std::thread::sleep(Duration::from_millis(40));
+        Ok(2)
+    }
+    let spawned = Arc::new(AtomicBool::new(false));
+    let observed = Arc::clone(&spawned);
+    let mut hooks = PrepareHooks::live();
+    hooks.possible_cpu_count = held_cpu;
+    let failure = CountEngine::prepare_with(
+        input(Arc::new(CountForkBarrier::new())),
+        CountOwnerLimits::from_allowance(18, 2).unwrap(),
+        Instant::now() + Duration::from_millis(20),
+        hooks,
+        || -> PipeDriver { panic!("expired preflight cannot create a driver") },
+        move |_task| {
+            observed.store(true, Ordering::Release);
+            Err(io::Error::from_raw_os_error(libc::EAGAIN))
+        },
+    )
+    .err()
+    .unwrap();
+    assert_eq!(failure.failure.class, FailureClass::Deadline);
+    assert!(!spawned.load(Ordering::Acquire));
+    assert_eq!(failure.cleanup_ticket, None);
+}
+
+fn w079_progress(watch: &CountSetupWatch) -> CountSetupProgress {
+    let until = Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Some(progress) = watch.progress() {
+            return progress;
+        }
+        assert!(Instant::now() < until, "owner publication remained busy");
+        std::thread::yield_now();
+    }
+}
+fn w079_owner_disposed(watch: &CountSetupWatch) {
+    let until = Instant::now() + Duration::from_secs(3);
+    loop {
+        if watch
+            .progress()
+            .is_some_and(|p| p.owner_cleanup_acknowledged && p.owner_task_disposed)
+        {
+            return;
+        }
+        assert!(Instant::now() < until, "actual owner task did not dispose");
+        std::thread::yield_now();
+    }
+}
+// Exact held-fixture cleanup; poison recovery cannot skip releasing this gate.
+fn w079_release_held(probe: &Probe) {
+    *locked(&probe.released) = true;
+    probe.release.notify_all();
+}
+// Called only after the exact preparation/session caller has been joined.
+// No published epoch means that joined caller cannot later start an owner.
+fn w079_dispose_joined_owner(watch: &CountSetupWatch) {
+    let until = Instant::now() + Duration::from_secs(3);
+    loop {
+        if watch
+            .progress()
+            .is_some_and(|p| p.owner_epoch.is_none() || p.owner_task_disposed)
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < until,
+            "released Count owner task did not dispose"
+        );
+        std::thread::yield_now();
+    }
+}
+fn w079_snapshot(watch: &CountSetupWatch) -> crate::capture::CountSetupSnapshot {
+    crate::capture::CountSetupSnapshot::from_progress(w079_progress(watch))
+        .expect("invoked pending state")
+}
+
+fn w079_reservation(
+    deadline: Instant,
+) -> (
+    Arc<CountForkBarrier>,
+    Arc<SetupBarrierLease>,
+    CountSetupAdmission,
+) {
+    let barrier = Arc::new(CountForkBarrier::new());
+    let lease = Arc::new(barrier.reserve_setup().unwrap());
+    drop(lease.prefix_permit(deadline).unwrap());
+    lease.close_prefix();
+    let admission = lease.reserve_count().unwrap();
+    (barrier, lease, admission)
+}
+
+#[test]
+fn w079_count_prepare_holds_independent_abandon_returns_with_actual_ticket() {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let (barrier, lease, admission) = w079_reservation(deadline);
+    let journal = CountSetupJournal::new();
+    let watch = journal.watch();
+    assert_eq!(w079_progress(&watch).phase, CountSetupPhase::NotInvoked);
+    let control = CountPrepareControl::new(crate::capture_setup::SetupControl::new(
+        deadline,
+        crate::capture_setup::SetupInterrupt::Owned(Arc::new(AtomicBool::new(false))),
+    ));
+    let probe = Probe::new();
+    let owner_probe = Arc::clone(&probe);
+    let (sent, received) = std::sync::mpsc::sync_channel(1);
+    let caller = std::thread::spawn(move || {
+        let result = CountEngine::prepare_controlled_with(
+            input(barrier),
+            CountOwnerLimits::from_allowance(18, 2).unwrap(),
+            deadline,
+            PrepareHooks::host(),
+            move || {
+                owner_probe.event(Event::Started);
+                PipeDriver {
+                    probe: owner_probe,
+                    faults: Faults {
+                        hold_acquire: Some(1),
+                        ..Default::default()
+                    },
+                    deadline,
+                    attempts: 0,
+                    acquired: 0,
+                    closes: 0,
+                }
+            },
+            spawn_owner,
+            SetupPreparation {
+                admission: Some(admission),
+                control,
+                journal,
+            },
+        );
+        sent.send(result.err().unwrap()).unwrap();
+    });
+    let observations = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        probe.wait(|events| {
+            events
+                .iter()
+                .any(|(_, e)| matches!(e, Event::EnterAcquire(1)))
+        });
+        let before = w079_progress(&watch);
+        watch.abandon();
+        let result = received.recv_timeout(Duration::from_millis(100));
+        let pending_output = w079_report_count(crate::capture::PreObservationCount::SetupPending(
+            w079_snapshot(&watch),
+        ));
+        (before, result, pending_output)
+    }));
+    let abandoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| watch.abandon()));
+    w079_release_held(&probe);
+    let joined = caller.join();
+    w079_dispose_joined_owner(&watch);
+    let (before, result, pending_output) =
+        observations.unwrap_or_else(|failure| std::panic::resume_unwind(failure));
+    abandoned.unwrap_or_else(|failure| std::panic::resume_unwind(failure));
+    joined.unwrap_or_else(|failure| std::panic::resume_unwind(failure));
+    assert_eq!(before.phase, CountSetupPhase::OwnerStarted);
+    assert!(before.owner_epoch.is_some());
+    let failure = result.expect(
+        "independent abort must bound actual Prepare wait, with original deadline far away",
+    );
+    assert_eq!(failure.failure.class, FailureClass::Cancelled);
+    assert!(
+        pending_output
+            .diagnostics
+            .iter()
+            .any(|s| s.contains("phase=owner-started")
+                && s.contains("cleanup=pending unresolved-slots=unknown"))
+    );
+    let ticket = failure.cleanup_ticket.expect("actual owner was admitted");
+    assert_eq!(ticket.owner_epoch, before.owner_epoch.unwrap());
+    assert_eq!(watch.seal(deadline + Duration::from_secs(10)), Some(ticket));
+    probe.assert_cleanup(1, std::thread::current().id());
+    let until = Instant::now() + Duration::from_secs(3);
+    loop {
+        if watch
+            .progress()
+            .and_then(|p| p.cleanup)
+            .is_some_and(|p| p.status == CleanupStatus::Complete)
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < until,
+            "actual owner never acknowledged disposal"
+        );
+        std::thread::yield_now();
+    }
+    w079_owner_disposed(&watch);
+    drop(watch);
+    drop(lease);
+}
+
+#[test]
+fn w079_count_prepare_holds_preflight_stages_abort_before_next_effect() {
+    for held in [
+        CountPrepareStage::FdInventory,
+        CountPrepareStage::OuterCpu,
+        CountPrepareStage::OwnerCpu,
+        CountPrepareStage::Hash,
+        CountPrepareStage::Parse,
+        CountPrepareStage::Allocation,
+    ] {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (barrier, lease, admission) = w079_reservation(deadline);
+        let journal = CountSetupJournal::new();
+        let watch = journal.watch();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let control = CountPrepareControl::new(crate::capture_setup::SetupControl::new(
+            deadline,
+            crate::capture_setup::SetupInterrupt::Owned(cancelled.clone()),
+        ));
+        let gate = Probe::new();
+        let observed = gate.clone();
+        let stage: Arc<dyn Fn(CountPrepareStage) + Send + Sync> = Arc::new(move |actual| {
+            if actual == held {
+                observed.event(Event::Started);
+                observed.hold();
+            }
+        });
+        let fd_stage = stage.clone();
+        let cpu_stage = stage.clone();
+        let caller = std::thread::spawn(move || {
+            let mut hooks = if held == CountPrepareStage::OwnerCpu {
+                PrepareHooks::live()
+            } else {
+                PrepareHooks::host()
+            };
+            hooks.possible_cpu_count = || Ok(2);
+            hooks.stage_observer = Some(stage);
+            crate::capture::prepare_count_backend_controlled_with(
+                input(barrier),
+                deadline,
+                admission,
+                &control,
+                &journal,
+                (
+                    move || {
+                        fd_stage(CountPrepareStage::FdInventory);
+                        Ok(crate::capture::CountFdAdmission {
+                            soft_limit: 2070,
+                            non_count_open: 0,
+                            non_count_reserved: 0,
+                        })
+                    },
+                    move || {
+                        cpu_stage(CountPrepareStage::OuterCpu);
+                        Ok(2)
+                    },
+                ),
+                move |input, limits, deadline, admission, control, journal| {
+                    CountEngine::prepare_controlled_with(
+                        input,
+                        limits,
+                        deadline,
+                        hooks,
+                        || -> PipeDriver {
+                            panic!("cancelled preflight must never construct owner driver")
+                        },
+                        |_task| panic!("cancelled preflight must never spawn owner"),
+                        SetupPreparation {
+                            admission: Some(admission),
+                            control: control.clone(),
+                            journal: journal.clone(),
+                        },
+                    )
+                },
+            )
+            .err()
+            .unwrap()
+        });
+        let observations = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            gate.wait(|events| events.iter().any(|(_, e)| matches!(e, Event::Started)));
+            let pending = w079_progress(&watch);
+            let started = Instant::now();
+            watch.abandon();
+            let seal = watch.seal(deadline);
+            let snapshot = w079_snapshot(&watch);
+            (
+                pending,
+                seal,
+                snapshot,
+                started.elapsed() < Duration::from_millis(100),
+            )
+        }));
+        cancelled.store(true, Ordering::Release);
+        let abandoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| watch.abandon()));
+        w079_release_held(&gate);
+        let joined = caller.join();
+        w079_dispose_joined_owner(&watch);
+        let (pending, seal, snapshot, bounded) =
+            observations.unwrap_or_else(|failure| std::panic::resume_unwind(failure));
+        abandoned.unwrap_or_else(|failure| std::panic::resume_unwind(failure));
+        let failure = joined.unwrap_or_else(|failure| std::panic::resume_unwind(failure));
+        assert_eq!(pending.phase, CountSetupPhase::Preflight, "{held:?}");
+        assert_eq!(pending.owner_epoch, None);
+        assert_eq!(pending.cleanup_ticket, None);
+        assert_eq!(seal, None);
+        assert!(bounded, "watch must not wait on held preflight {held:?}");
+        assert_eq!(snapshot.phase(), crate::capture::CountSetupPhase::Preflight);
+        assert_eq!(failure.failure.class, FailureClass::Cancelled, "{held:?}");
+        assert_eq!(failure.cleanup_ticket, None);
+        let complete = w079_progress(&watch);
+        assert_eq!(complete.phase, CountSetupPhase::Failed);
+        assert_eq!(complete.owner_epoch, None);
+        assert_eq!(complete.known_failure, Some(failure.failure));
+        lease.abort();
+        lease.complete_abort().unwrap();
+    }
+}
+
+fn w079_report_count(
+    count: crate::capture::PreObservationCount,
+) -> crate::report::CaptureCommandResult {
+    use crate::capture::{
+        CustodyReceipt, CustodyResolution, PreObservationCause, PreObservationFailure,
+    };
+    static OUTPUT: AtomicU64 = AtomicU64::new(0);
+    let path = std::path::PathBuf::from(
+        std::env::var_os("OSSL_PACKAGE_TEST_PRIVATE_DIR").expect("leased fixture dir"),
+    )
+    .join(format!(
+        "w079-count-report-{}-{}.json",
+        std::process::id(),
+        OUTPUT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let expected_exit = if count.actual_failure().is_some() {
+        4
+    } else {
+        3
+    };
+    let failure = PreObservationFailure {
+        cause: PreObservationCause::Cancelled,
+        failure: None,
+        count,
+        release: None,
+        custody: CustodyReceipt {
+            disposition: Some(crate::target::TargetDisposition::Exited { code: 0 }),
+            child_exit: Some(0),
+            resolution: CustodyResolution::Resolved,
+            failure: None,
+        },
+        target: crate::evidence::TargetRecord::new(
+            1,
+            "count-host-control".into(),
+            String::new(),
+            String::new(),
+        ),
+        context: None,
+    };
+    let mut diagnostics = Vec::new();
+    let result = crate::report::consume_capture_result_with_diagnostics(
+        Err(anyhow::Error::new(failure)),
+        crate::report::CaptureCommand::Report,
+        &crate::report::OutputRequest {
+            format: crate::report::OutputFormat::Json,
+            primary: crate::report::OutputDest::File(path.clone()),
+            cbom: None,
+        },
+        false,
+        &mut diagnostics,
+    );
+    let emitted = std::fs::read(&path).unwrap();
+    assert!(!emitted.is_empty());
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!(result.child_exit, Some(0));
+    assert_eq!(result.document.total_calls(), 0);
+    assert!(result.document.coverage.is_empty());
+    assert!(result.document.window.count_admission.is_none());
+    assert!(result.document.window.signal_cut);
+    assert_eq!(result.exit_code, expected_exit);
+    result
+}
+
+#[test]
+fn w079_pending_count_output_actual_preflight_unknown_and_not_invoked() {
+    let journal = CountSetupJournal::new();
+    let watch = journal.watch();
+    assert!(crate::capture::CountSetupSnapshot::from_watch(&watch).is_none());
+    let absent = w079_report_count(crate::capture::PreObservationCount::NotPrepared);
+    assert!(
+        absent
+            .diagnostics
+            .iter()
+            .any(|s| s.contains("cleanup=not-acquired unresolved-slots=0"))
+    );
+    journal.begin();
+    let pending = w079_snapshot(&watch);
+    let output = w079_report_count(crate::capture::PreObservationCount::SetupPending(pending));
+    assert!(output.diagnostics.iter().any(|s| s.contains(
+        "phase=preflight epoch=unknown ticket=unknown cleanup=unknown unresolved-slots=unknown"
+    )));
+    assert!(output.diagnostics.iter().any(|s| {
+        s.contains("known-rows=unknown known-calls=unknown enumeration=unknown tail=unknown")
+    }));
+    assert!(
+        !output.diagnostics.iter().any(|s| s.contains("not-acquired")
+            || s.contains("unresolved-slots=0")
+            || s.contains("count terminal="))
+    );
+}
+
+#[test]
+fn w079_count_late_receipts_owner_published_abort_before_start() {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let (barrier, lease, admission) = w079_reservation(deadline);
+    let journal = CountSetupJournal::new();
+    let watch = journal.watch();
+    let control = CountPrepareControl::new(crate::capture_setup::SetupControl::new(
+        deadline,
+        crate::capture_setup::SetupInterrupt::Owned(Arc::new(AtomicBool::new(false))),
+    ));
+    let gate = Probe::new();
+    let held = gate.clone();
+    let probe = Probe::new();
+    let owner = probe.clone();
+    let caller = std::thread::spawn(move || {
+        CountEngine::prepare_controlled_with(
+            input(barrier),
+            CountOwnerLimits::from_allowance(18, 2).unwrap(),
+            deadline,
+            PrepareHooks::host(),
+            move || {
+                owner.event(Event::Started);
+                PipeDriver {
+                    probe: owner,
+                    faults: Faults::default(),
+                    deadline,
+                    attempts: 0,
+                    acquired: 0,
+                    closes: 0,
+                }
+            },
+            move |task| {
+                held.event(Event::Started);
+                held.hold();
+                spawn_owner(task)
+            },
+            SetupPreparation {
+                admission: Some(admission),
+                control,
+                journal,
+            },
+        )
+        .err()
+        .unwrap()
+    });
+    let observations = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        gate.wait(|events| !events.is_empty());
+        let before = w079_progress(&watch);
+        let ticket = watch.seal(deadline);
+        watch.abandon();
+        let output = w079_report_count(crate::capture::PreObservationCount::SetupPending(
+            w079_snapshot(&watch),
+        ));
+        (before, ticket, output)
+    }));
+    let abandoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| watch.abandon()));
+    w079_release_held(&gate);
+    let joined = caller.join();
+    w079_dispose_joined_owner(&watch);
+    let (before, ticket, output) =
+        observations.unwrap_or_else(|failure| std::panic::resume_unwind(failure));
+    abandoned.unwrap_or_else(|failure| std::panic::resume_unwind(failure));
+    let failure = joined.unwrap_or_else(|failure| std::panic::resume_unwind(failure));
+    let ticket = ticket.expect("actual owner admission established a seal ticket");
+    let until = Instant::now() + Duration::from_secs(3);
+    while !watch
+        .progress()
+        .and_then(|p| p.cleanup)
+        .is_some_and(|p| p.status == CleanupStatus::Complete)
+    {
+        assert!(Instant::now() < until);
+        std::thread::yield_now();
+    }
+    w079_owner_disposed(&watch);
+    assert_eq!(before.phase, CountSetupPhase::OwnerPublished);
+    assert_eq!(ticket.owner_epoch, before.owner_epoch.unwrap());
+    assert_eq!(failure.cleanup_ticket, Some(ticket));
+    assert_eq!(failure.failure.class, FailureClass::Cancelled);
+    assert!(
+        output
+            .diagnostics
+            .iter()
+            .any(|s| s.contains("phase=owner-published")
+                && s.contains("cleanup=pending unresolved-slots=unknown"))
+    );
+    assert!(
+        !probe
+            .log
+            .lock()
+            .unwrap()
+            .events
+            .iter()
+            .any(|(_, e)| matches!(e, Event::EnterAcquire(_)))
+    );
+    drop(lease);
+}
+
+#[test]
+fn w079_count_late_receipts_ready_session_canonical_terminal_once() {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let (_barrier, lease, admission) = w079_reservation(deadline);
+    let journal = CountSetupJournal::new();
+    let watch = journal.watch();
+    let control = CountPrepareControl::new(crate::capture_setup::SetupControl::new(
+        deadline,
+        crate::capture_setup::SetupInterrupt::Owned(Arc::new(AtomicBool::new(false))),
+    ));
+    let probe = MapProbe::new();
+    let (engine, _) = terminal_engine_preparation(
+        &probe,
+        None,
+        TerminalFaults::default(),
+        Some(SetupPreparation {
+            admission: Some(admission),
+            control,
+            journal,
+        }),
+    );
+    let epoch = engine.ready.owner_epoch;
+    assert_eq!(engine.shared.setup_deadline, deadline);
+    assert_eq!(w079_progress(&watch).phase, CountSetupPhase::Ready);
+    // The independent observer never owns a frontend or chooses its frontier.
+    let port = SessionOwnerPort {
+        engine,
+        wait_inventory: false,
+        requests: Vec::new(),
+        terminal_calls: 0,
+        generation_refusal: None,
+        open_refusal: None,
+        refuse_published: Arc::new(AtomicBool::new(false)),
+        last_failure: None,
+        replay: None,
+        late_release: None,
+        progress_cutoff: None,
+    };
+    let mut session = crate::count_session::CountSession::new(1, port);
+    let cutoff = Instant::now() + Duration::from_secs(1);
+    let ticket = watch.seal(cutoff).unwrap();
+    watch.abandon();
+    let snapshot = w079_snapshot(&watch);
+    let pending = w079_report_count(crate::capture::PreObservationCount::SetupPending(snapshot));
+    let close = crate::count_session::CloseRequest {
+        started_at: cutoff,
+        grace: Duration::from_secs(10),
+        reason: crate::count_session::CloseReason::SetupAbort,
+    };
+    let terminal = session.terminal_shared(close);
+    let again = session.terminal_shared(close);
+    task3_cleanup(&probe.owner, 8);
+    w079_owner_disposed(&watch);
+    assert!(Arc::ptr_eq(&terminal, &again));
+    assert_eq!(session.backend().terminal_calls, 1);
+    assert_eq!(terminal.receipt.cleanup_ticket, ticket);
+    assert_eq!(terminal.receipt.owner_epoch, epoch);
+    assert_eq!(terminal.receipt.deadline, cutoff);
+    assert!(
+        pending
+            .diagnostics
+            .iter()
+            .any(|s| s.contains("phase=late-ready") && s.contains("unresolved-slots=unknown"))
+    );
+    let output = w079_report_count(crate::capture::PreObservationCount::Terminal(terminal));
+    assert!(
+        output
+            .diagnostics
+            .iter()
+            .any(|s| s.contains("count terminal="))
+    );
+    drop(session);
+    drop(lease);
+}
+
+#[test]
+fn w079_pending_count_output_actual_open_pending_and_late_session_cleanup() {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let (_barrier, lease, admission) = w079_reservation(deadline);
+    let journal = CountSetupJournal::new();
+    let watch = journal.watch();
+    let control = CountPrepareControl::new(crate::capture_setup::SetupControl::new(
+        deadline,
+        crate::capture_setup::SetupInterrupt::Owned(Arc::new(AtomicBool::new(false))),
+    ));
+    let probe = MapProbe::new();
+    let mut caller = None;
+    // Own cleanup before constructing the owner with its armed map-I/O gate;
+    // preparation, attach, caller creation and report errors share this scope.
+    let observations = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let (engine, _) = terminal_engine_preparation(
+            &probe,
+            None,
+            TerminalFaults {
+                map: MapFaults {
+                    hold_call: Some(1),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            Some(SetupPreparation {
+                admission: Some(admission),
+                control,
+                journal,
+            }),
+        );
+        let port = SessionOwnerPort {
+            engine,
+            wait_inventory: false,
+            requests: Vec::new(),
+            terminal_calls: 0,
+            generation_refusal: None,
+            open_refusal: None,
+            refuse_published: Arc::new(AtomicBool::new(false)),
+            last_failure: None,
+            replay: None,
+            late_release: None,
+            progress_cutoff: None,
+        };
+        let mut session = crate::count_session::CountSession::new(1, port);
+        SessionPlan::new(1).attach(&mut session, 7);
+        caller = Some(std::thread::spawn(move || {
+            let result = session.open_window(1000, 2000, deadline);
+            (session, result)
+        }));
+        probe.wait_calls(1);
+        let ticket = watch.seal(Instant::now());
+        watch.abandon();
+        let before = w079_progress(&watch);
+        let snapshot = w079_snapshot(&watch);
+        // Supplied custody fixture is independent of this actual held map I/O.
+        let output = w079_report_count(crate::capture::PreObservationCount::SetupPending(snapshot));
+        let (mut session, opened) = caller
+            .take()
+            .expect("exact Open caller")
+            .join()
+            .unwrap_or_else(|failure| std::panic::resume_unwind(failure));
+        let terminal = session.terminal_shared(crate::count_session::CloseRequest {
+            started_at: Instant::now(),
+            grace: Duration::from_secs(3),
+            reason: crate::count_session::CloseReason::SetupAbort,
+        });
+        let again = session.terminal_shared(session_close());
+        let fallback_progress = w079_progress(&watch);
+        (
+            ticket,
+            before,
+            output,
+            session,
+            opened,
+            terminal,
+            again,
+            fallback_progress,
+        )
+    }));
+    let abandoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| watch.abandon()));
+    w079_release_held(&probe.owner);
+    // A pre-join observation failure must not detach this exact caller. A join
+    // failure is retained until the independently reachable owner has disposed.
+    let join_failure = caller.take().and_then(|caller| caller.join().err());
+    w079_dispose_joined_owner(&watch);
+    let (ticket, before, output, session, opened, terminal, again, fallback_progress) =
+        observations.unwrap_or_else(|failure| std::panic::resume_unwind(failure));
+    abandoned.unwrap_or_else(|failure| std::panic::resume_unwind(failure));
+    if let Some(failure) = join_failure {
+        std::panic::resume_unwind(failure);
+    }
+    let ticket = ticket.expect("actual Open owner established a seal ticket");
+    task3_cleanup(&probe.owner, 10);
+    w079_owner_disposed(&watch);
+    assert!(!fallback_progress.owner_cleanup_acknowledged);
+    assert_eq!(
+        fallback_progress.cleanup.unwrap().status,
+        CleanupStatus::Pending
+    );
+    assert!(before.open_pending);
+    assert_eq!(before.cleanup.unwrap().status, CleanupStatus::Pending);
+    assert!(opened.is_err());
+    assert!(Arc::ptr_eq(&terminal, &again));
+    assert_eq!(terminal.receipt.cleanup_ticket, ticket);
+    assert_eq!(session.backend().terminal_calls, 1);
+    assert!(
+        output
+            .diagnostics
+            .iter()
+            .any(|s| s.contains("phase=open-pending")
+                && s.contains("cleanup=pending unresolved-slots=unknown"))
+    );
+    assert!(
+        output
+            .diagnostics
+            .iter()
+            .any(|s| s.contains("known-rows=unknown known-calls=unknown"))
+    );
+    assert!(session.backend().requests[0].frontier.pending.is_some());
+    assert!(!locked(&session.backend().engine.shared.state).terminal_contradiction);
+    drop(session);
+    drop(lease);
+}
+
+#[test]
+fn w079_count_late_receipts_spawn_failure_needs_actual_capture_disposal() {
+    for retain in [false, true] {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (barrier, lease, admission) = w079_reservation(deadline);
+        let journal = CountSetupJournal::new();
+        let watch = journal.watch();
+        let control = CountPrepareControl::new(crate::capture_setup::SetupControl::new(
+            deadline,
+            crate::capture_setup::SetupInterrupt::Owned(Arc::new(AtomicBool::new(false))),
+        ));
+        let retained = Arc::new(Mutex::new(None));
+        let capture = retained.clone();
+        let failure = CountEngine::prepare_controlled_with(
+            input(barrier),
+            CountOwnerLimits::from_allowance(18, 2).unwrap(),
+            deadline,
+            PrepareHooks::host(),
+            || -> PipeDriver { panic!("failed spawn must never enter owner") },
+            move |task| {
+                if retain {
+                    *capture.lock().unwrap() = Some(task);
+                }
+                Err(io::Error::from_raw_os_error(libc::EAGAIN))
+            },
+            SetupPreparation {
+                admission: Some(admission),
+                control,
+                journal,
+            },
+        )
+        .err()
+        .unwrap();
+        let before = w079_progress(&watch);
+        let snapshot = w079_snapshot(&watch);
+        let sticky = if retain { watch.seal(deadline) } else { None };
+        let captured = retained.lock().unwrap().take();
+        drop(captured);
+        let after = w079_progress(&watch);
+        assert_eq!(failure.failure.class, FailureClass::Io);
+        assert_eq!(failure.failure.errno, Some(libc::EAGAIN));
+        assert_eq!(failure.cleanup_ticket, None);
+        assert_eq!(before.phase, CountSetupPhase::OwnerPublished);
+        assert_eq!(before.owner_cleanup_acknowledged, !retain);
+        assert!(after.owner_cleanup_acknowledged);
+        assert_eq!(after.owner_epoch, before.owner_epoch);
+        assert_eq!(after.cleanup_ticket, sticky);
+        assert!(after.owner_task_disposed);
+        assert_eq!(
+            snapshot.phase(),
+            crate::capture::CountSetupPhase::OwnerPublished
+        );
+        assert_eq!(snapshot.cleanup_ticket(), None);
+        drop(lease);
+    }
+}
+
+#[test]
+fn w079_count_prepare_preflight_failure_keeps_exact_receipt_and_reserve() {
+    assert_eq!(crate::capture_setup::COUNT_NON_COUNT_FD_RESERVE, 2052);
+    for (soft_limit, cancelled, want) in [
+        (2069, false, FailureClass::Capacity),
+        (2070, true, FailureClass::Cancelled),
+    ] {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (barrier, lease, admission) = w079_reservation(deadline);
+        let journal = CountSetupJournal::new();
+        let watch = journal.watch();
+        let control = CountPrepareControl::new(crate::capture_setup::SetupControl::new(
+            deadline,
+            crate::capture_setup::SetupInterrupt::Owned(Arc::new(AtomicBool::new(cancelled))),
+        ));
+        let failure = crate::capture::prepare_count_backend_controlled_with::<CountEngine>(
+            input(barrier),
+            deadline,
+            admission,
+            &control,
+            &journal,
+            (
+                || {
+                    Ok(crate::capture::CountFdAdmission {
+                        soft_limit,
+                        non_count_open: 0,
+                        non_count_reserved: 0,
+                    })
+                },
+                || panic!("capacity/cancel must stop before first CPU read"),
+            ),
+            |_, _, _, _, _, _| panic!("preflight refusal cannot invoke Count owner"),
+        )
+        .err()
+        .unwrap();
+        let converted =
+            crate::capture::PreObservationCount::from_setup_progress(w079_progress(&watch))
+                .unwrap();
+        let crate::capture::PreObservationCount::PrepareFailed(actual) = converted else {
+            panic!("completed preflight must keep its actual PrepareFailed receipt")
+        };
+        assert_eq!(actual, failure);
+        assert_eq!(failure.failure.class, want);
+        assert_eq!(failure.cleanup_ticket, None);
+        assert!(crate::capture::CountSetupSnapshot::from_watch(&watch).is_none());
+        lease.abort();
+        lease.complete_abort().unwrap();
+    }
+}
+
+#[test]
+fn w079_count_prepare_retains_original_token_deadline_and_valid_cpu_preflight() {
+    static OWNER_CPU_READS: AtomicU64 = AtomicU64::new(0);
+    fn cpu() -> io::Result<usize> {
+        OWNER_CPU_READS.fetch_add(1, Ordering::Relaxed);
+        Ok(2)
+    }
+    let original = Instant::now() + Duration::from_secs(2);
+    let (barrier, lease, admission) = w079_reservation(original);
+    let journal = CountSetupJournal::new();
+    let watch = journal.watch();
+    let control = CountPrepareControl::new(crate::capture_setup::SetupControl::new(
+        original + Duration::from_secs(20),
+        crate::capture_setup::SetupInterrupt::Owned(Arc::new(AtomicBool::new(false))),
+    ));
+    let outer_cpu = Arc::new(AtomicU64::new(0));
+    let reads = outer_cpu.clone();
+    let mut hooks = PrepareHooks::live();
+    hooks.possible_cpu_count = cpu;
+    let failure = crate::capture::prepare_count_backend_controlled_with(
+        input(barrier),
+        original + Duration::from_secs(30),
+        admission,
+        &control,
+        &journal,
+        (
+            || {
+                Ok(crate::capture::CountFdAdmission {
+                    soft_limit: 2070,
+                    non_count_open: 0,
+                    non_count_reserved: 0,
+                })
+            },
+            move || {
+                reads.fetch_add(1, Ordering::Relaxed);
+                Ok(2)
+            },
+        ),
+        move |input, limits, deadline, admission, control, journal| {
+            assert_eq!(deadline, original);
+            CountEngine::prepare_controlled_with(
+                input,
+                limits,
+                deadline,
+                hooks,
+                || -> PipeDriver {
+                    panic!("CPU-only preflight must not label modeled owner effects Live")
+                },
+                |_task| Err(io::Error::from_raw_os_error(libc::EAGAIN)),
+                SetupPreparation {
+                    admission: Some(admission),
+                    control: control.clone(),
+                    journal: journal.clone(),
+                },
+            )
+        },
+    )
+    .err()
+    .unwrap();
+    assert_eq!(failure.failure.errno, Some(libc::EAGAIN));
+    assert_eq!(outer_cpu.load(Ordering::Relaxed), 1);
+    assert_eq!(OWNER_CPU_READS.load(Ordering::Relaxed), 1);
+    let progress = w079_progress(&watch);
+    assert!(progress.owner_cleanup_acknowledged);
+    drop(lease);
+}
+
+#[test]
+fn w079_count_failure_classes_preserve_deadline_cancel_and_actual_io() {
+    for class in [
+        FailureClass::Deadline,
+        FailureClass::Cancelled,
+        FailureClass::Io,
+    ] {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (barrier, lease, admission) = w079_reservation(deadline);
+        let journal = CountSetupJournal::new();
+        let watch = journal.watch();
+        let control_deadline = if class == FailureClass::Deadline {
+            Instant::now()
+        } else {
+            deadline
+        };
+        let control = CountPrepareControl::new(crate::capture_setup::SetupControl::new(
+            control_deadline,
+            crate::capture_setup::SetupInterrupt::Owned(Arc::new(AtomicBool::new(
+                class == FailureClass::Cancelled,
+            ))),
+        ));
+        let probe = Probe::new();
+        let owner = probe.clone();
+        let failure = CountEngine::prepare_controlled_with(
+            input(barrier),
+            CountOwnerLimits::from_allowance(18, 2).unwrap(),
+            deadline,
+            PrepareHooks::host(),
+            move || {
+                owner.event(Event::Started);
+                PipeDriver {
+                    probe: owner,
+                    faults: Faults {
+                        fail_acquire_from: Some(1),
+                        ..Default::default()
+                    },
+                    deadline,
+                    attempts: 0,
+                    acquired: 0,
+                    closes: 0,
+                }
+            },
+            spawn_owner,
+            SetupPreparation {
+                admission: Some(admission),
+                control,
+                journal,
+            },
+        )
+        .err()
+        .unwrap();
+        let until = Instant::now() + Duration::from_secs(3);
+        if class == FailureClass::Io {
+            while !watch
+                .progress()
+                .is_some_and(|p| p.owner_cleanup_acknowledged)
+            {
+                assert!(Instant::now() < until);
+                std::thread::yield_now();
+            }
+        }
+        if class == FailureClass::Io {
+            w079_owner_disposed(&watch);
+        }
+        let converted =
+            crate::capture::PreObservationCount::from_setup_progress(w079_progress(&watch))
+                .unwrap();
+        assert_eq!(failure.failure.class, class);
+        let actual = converted.actual_failure();
+        if class == FailureClass::Deadline {
+            assert!(actual.is_none());
+        } else {
+            assert_eq!(
+                actual.unwrap().class,
+                if class == FailureClass::Io {
+                    crate::capture::BoundaryFailureClass::Io
+                } else {
+                    crate::capture::BoundaryFailureClass::Cancelled
+                }
+            );
+        }
+        if class == FailureClass::Io {
+            assert!(matches!(
+                converted,
+                crate::capture::PreObservationCount::SetupPending(_)
+            ));
+            assert_eq!(failure.failure.errno, Some(libc::EMFILE));
+            assert_eq!(w079_progress(&watch).cleanup_ticket, failure.cleanup_ticket);
+        } else {
+            assert!(matches!(
+                converted,
+                crate::capture::PreObservationCount::PrepareFailed(_)
+            ));
+            lease.abort();
+            lease.complete_abort().unwrap();
+        }
+    }
+}
+
+#[test]
+fn w079_count_actual_host_preflight_validates_before_owner_effects() {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let (barrier, lease, admission) = w079_reservation(deadline);
+    let journal = CountSetupJournal::new();
+    let watch = journal.watch();
+    let control = CountPrepareControl::new(crate::capture_setup::SetupControl::new(
+        deadline,
+        crate::capture_setup::SetupInterrupt::Owned(Arc::new(AtomicBool::new(false))),
+    ));
+    let mut input = input(barrier);
+    input.object_sha256[0] ^= 1;
+    // Real process FD inventory and both production CPU reads, then hash refusal;
+    // no Count owner can start and no BPF syscall is reachable with this input.
+    let failure = crate::capture::prepare_count_backend_controlled(
+        input, deadline, admission, &control, &journal,
+    )
+    .err()
+    .unwrap();
+    assert_eq!(failure.failure.class, FailureClass::ObjectDrift);
+    let progress = w079_progress(&watch);
+    assert_eq!(progress.phase, CountSetupPhase::Failed);
+    assert_eq!(progress.owner_epoch, None);
+    assert_eq!(failure.cleanup_ticket, None);
+    lease.abort();
     lease.complete_abort().unwrap();
 }

@@ -2818,6 +2818,17 @@ pub struct LiveBackend {
     engine: CountEngine,
 }
 impl LiveBackend {
+    pub(crate) fn prepare_controlled(
+        input: CountInput,
+        limits: CountOwnerLimits,
+        deadline: Instant,
+        admission: crate::count_owner::CountSetupAdmission,
+        control: &crate::count_owner::CountPrepareControl,
+        journal: &crate::count_owner::CountSetupJournal,
+    ) -> Result<Self, CountPrepareFailure> {
+        CountEngine::prepare_controlled(input, limits, deadline, admission, control, journal)
+            .map(|engine| Self { engine })
+    }
     pub fn prepare(
         input: CountInput,
         limits: CountOwnerLimits,

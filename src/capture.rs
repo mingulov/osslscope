@@ -2921,6 +2921,7 @@ pub enum BoundaryStage {
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BoundaryFailureClass {
+    Cancelled,
     Io,
     Timeout,
     DeadlineOverflow,
@@ -2963,6 +2964,7 @@ impl BoundaryFailure {
         {
             use crate::count_owner::FailureClass as C;
             let class = match owner.class {
+                C::Cancelled => BoundaryFailureClass::Cancelled,
                 C::Io => BoundaryFailureClass::Io,
                 C::Deadline => BoundaryFailureClass::Timeout,
                 C::DeadlineOverflow => BoundaryFailureClass::DeadlineOverflow,
@@ -3004,16 +3006,123 @@ pub enum PreObservationCause {
     OpenUnresolved,
     WindowBinding,
 }
+/// Public diagnostics contain established identities only, with no control or custody.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CountSetupPhase {
+    Preflight,
+    OwnerPublished,
+    OwnerStarted,
+    OpenPending,
+    LateReady,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetupCleanupState {
+    Pending,
+    Unknown,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SetupCleanupIdentity {
+    pub owner_epoch: u64,
+    pub terminal_sequence: u64,
+}
+#[derive(Debug, Clone)]
+pub struct CountSetupSnapshot {
+    phase: CountSetupPhase,
+    owner_epoch: Option<u64>,
+    cleanup_ticket: Option<SetupCleanupIdentity>,
+    cleanup: SetupCleanupState,
+    known_failure: Option<BoundaryFailure>,
+}
+impl CountSetupSnapshot {
+    pub fn phase(&self) -> CountSetupPhase {
+        self.phase
+    }
+    pub fn owner_epoch(&self) -> Option<u64> {
+        self.owner_epoch
+    }
+    pub fn cleanup_ticket(&self) -> Option<SetupCleanupIdentity> {
+        self.cleanup_ticket
+    }
+    pub fn cleanup(&self) -> SetupCleanupState {
+        self.cleanup
+    }
+    pub fn known_failure(&self) -> Option<&BoundaryFailure> {
+        self.known_failure.as_ref()
+    }
+    pub(crate) fn from_watch(watch: &crate::count_owner::CountSetupWatch) -> Option<Self> {
+        watch.progress().and_then(Self::from_progress)
+    }
+    pub(crate) fn from_progress(progress: crate::count_owner::CountSetupProgress) -> Option<Self> {
+        use crate::count_owner::CountSetupPhase as P;
+        if progress.phase == P::NotInvoked
+            || (progress.phase == P::Failed && progress.owner_epoch.is_none())
+        {
+            return None;
+        }
+        // A completed no-owner failure retains its PrepareFailed producer receipt.
+        let phase = if progress.open_pending {
+            CountSetupPhase::OpenPending
+        } else if progress.late_ready {
+            CountSetupPhase::LateReady
+        } else {
+            match progress.phase {
+                P::OwnerPublished => CountSetupPhase::OwnerPublished,
+                P::OwnerStarted | P::Ready => CountSetupPhase::OwnerStarted,
+                P::Preflight | P::Failed => CountSetupPhase::Preflight,
+                P::NotInvoked => unreachable!(),
+            }
+        };
+        Some(Self {
+            phase,
+            owner_epoch: progress.owner_epoch.map(|e| e.value()),
+            cleanup_ticket: progress.cleanup_ticket.map(|ticket| SetupCleanupIdentity {
+                owner_epoch: ticket.owner_epoch.value(),
+                terminal_sequence: ticket.terminal_id.sequence.value(),
+            }),
+            cleanup: if progress.cleanup.is_some() {
+                SetupCleanupState::Pending
+            } else {
+                SetupCleanupState::Unknown
+            },
+            known_failure: progress.known_failure.map(|failure| {
+                BoundaryFailure::from_error(BoundaryStage::Setup, &anyhow::Error::new(failure))
+            }),
+        })
+    }
+}
 #[derive(Debug, Clone)]
 pub enum PreObservationCount {
     NotPrepared,
+    SetupPending(CountSetupSnapshot),
     PrepareFailed(crate::count_owner::CountPrepareFailure),
     Terminal(Arc<crate::count_session::CountTerminal>),
 }
 impl PreObservationCount {
+    pub(crate) fn from_setup_watch(watch: &crate::count_owner::CountSetupWatch) -> Option<Self> {
+        Self::from_setup_progress(watch.progress()?)
+    }
+    pub(crate) fn from_setup_progress(
+        progress: crate::count_owner::CountSetupProgress,
+    ) -> Option<Self> {
+        if progress.phase == crate::count_owner::CountSetupPhase::NotInvoked {
+            return Some(Self::NotPrepared);
+        }
+        if progress.phase == crate::count_owner::CountSetupPhase::Failed
+            && progress.owner_epoch.is_none()
+        {
+            return progress.prepare_failure.map(Self::PrepareFailed);
+        }
+        CountSetupSnapshot::from_progress(progress).map(Self::SetupPending)
+    }
     pub(crate) fn actual_failure(&self) -> Option<BoundaryFailure> {
         let (owner, stage) = match self {
             Self::NotPrepared => return None,
+            Self::SetupPending(snapshot) => {
+                return snapshot
+                    .known_failure
+                    .clone()
+                    .filter(|failure| failure.class != BoundaryFailureClass::Timeout);
+            }
             Self::PrepareFailed(f) => (f.failure, BoundaryStage::Setup),
             Self::Terminal(t) => (t.runtime_failure?, BoundaryStage::Fence),
         };
@@ -9085,6 +9194,91 @@ fn prepare_after_initial_forks<T, B>(
     };
     let backend = prepare(&mut state, barrier, setup_deadline)?;
     Ok((state, backend))
+}
+
+pub(crate) fn prepare_count_backend_controlled(
+    input: crate::count_owner::CountInput,
+    setup_deadline: Instant,
+    admission: crate::count_owner::CountSetupAdmission,
+    control: &crate::count_owner::CountPrepareControl,
+    journal: &crate::count_owner::CountSetupJournal,
+) -> Result<crate::count_session::LiveBackend, crate::count_owner::CountPrepareFailure> {
+    prepare_count_backend_controlled_with(
+        input,
+        setup_deadline,
+        admission,
+        control,
+        journal,
+        (
+            || CountFdAdmission::snapshot(crate::capture_setup::COUNT_NON_COUNT_FD_RESERVE),
+            || {
+                aya::util::nr_cpus().map_err(|error| {
+                    crate::count_owner::OwnerFailure::io(
+                        crate::count_owner::CountOperation::Load,
+                        crate::count_owner::ResourceId::Engine,
+                        &error.1,
+                    )
+                })
+            },
+        ),
+        crate::count_session::LiveBackend::prepare_controlled,
+    )
+}
+// Same admitted production preflight, with the existing FD/CPU and owner effect ports.
+pub(crate) fn prepare_count_backend_controlled_with<R>(
+    input: crate::count_owner::CountInput,
+    deadline: Instant,
+    admission: crate::count_owner::CountSetupAdmission,
+    control: &crate::count_owner::CountPrepareControl,
+    journal: &crate::count_owner::CountSetupJournal,
+    sampling: (
+        impl FnOnce() -> Result<CountFdAdmission, crate::count_owner::OwnerFailure>,
+        impl FnOnce() -> Result<usize, crate::count_owner::OwnerFailure>,
+    ),
+    prepare: impl FnOnce(
+        crate::count_owner::CountInput,
+        crate::count_owner::CountOwnerLimits,
+        Instant,
+        crate::count_owner::CountSetupAdmission,
+        &crate::count_owner::CountPrepareControl,
+        &crate::count_owner::CountSetupJournal,
+    ) -> Result<R, crate::count_owner::CountPrepareFailure>,
+) -> Result<R, crate::count_owner::CountPrepareFailure> {
+    journal.begin();
+    let deadline = deadline.min(control.deadline()).min(admission.deadline());
+    let check = || -> Result<(), crate::count_owner::CountPrepareFailure> {
+        journal.check(control)?;
+        if Instant::now() >= deadline {
+            return Err(crate::count_owner::OwnerFailure::engine(
+                crate::count_owner::CountOperation::Load,
+                crate::count_owner::FailureClass::Deadline,
+            )
+            .into());
+        }
+        Ok(())
+    };
+    let result = (|| {
+        check()?;
+        let sampled = sampling.0()?;
+        check()?;
+        // Persistent native FDs remain measured, plus the full native reserve.
+        // Even injected host inventory cannot reduce the conservative reserve.
+        let allowance = CountFdAdmission {
+            non_count_reserved: sampled
+                .non_count_reserved
+                .max(crate::capture_setup::COUNT_NON_COUNT_FD_RESERVE),
+            ..sampled
+        }
+        .allowance()?;
+        let cpus = sampling.1()?;
+        check()?;
+        let limits = crate::count_owner::CountOwnerLimits::from_allowance(allowance, cpus)?;
+        prepare(input, limits, deadline, admission, control, journal)
+    })();
+    if let Err(failure) = &result {
+        journal.failed(*failure);
+    }
+    result
 }
 
 fn prepare_count_backend(
