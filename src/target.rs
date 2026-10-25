@@ -19,7 +19,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::CString;
-use std::os::fd::{AsRawFd as _, FromRawFd as _, IntoRawFd as _, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -1012,40 +1012,214 @@ where
     poll_controlled(deadline, cancel, rx, Some(abandoned.as_ref()))
 }
 
-/// Spawn the control worker and poll it. Close disposal calls this
-/// directly: a close must run (possibly late, on the detached worker)
-/// even on an already-dead setup — otherwise its fd would leak. There is
-/// deliberately NO abandonment flag here (unlike
-/// [`run_under_control`]): disposal is never skipped. The result channel
-/// is a rendezvous (fix round 2 / F1), as above.
-fn spawn_controlled<T, F>(
+// The parent borrows only the number. Disconnection of the sole sender
+// releases the worker's ownership, including on early return or unwind.
+struct SinkLease {
+    raw: RawFd,
+    release: Option<std::sync::mpsc::Sender<()>>,
+    closed: Option<std::sync::mpsc::Receiver<()>>,
+}
+
+impl SinkLease {
+    fn as_raw_fd(&self) -> RawFd {
+        self.raw
+    }
+}
+
+impl Drop for SinkLease {
+    fn drop(&mut self) {
+        drop(self.release.take());
+        drop(self.closed.take());
+    }
+}
+
+struct SinkWorkerOwner {
+    fd: Option<OwnedFd>,
+    release: std::sync::mpsc::Receiver<()>,
+    #[cfg(test)]
+    hook: SinkTestHook,
+}
+
+impl SinkWorkerOwner {
+    fn finish(&mut self) {
+        if self.fd.is_none() {
+            return;
+        }
+        // No sender ever sends a value or has a clone. Only disconnection
+        // releases the raw borrow held by the parent.
+        let _ = self.release.recv();
+        #[cfg(test)]
+        if let Some((ready, proceed)) = self.hook.close_gate.as_ref() {
+            ready.store(true, Ordering::SeqCst);
+            let end = Instant::now() + Duration::from_secs(10);
+            while !proceed.load(Ordering::SeqCst) && Instant::now() < end {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        #[cfg(test)]
+        if let Some(thread) = self.hook.close_thread.as_ref() {
+            *thread.lock().unwrap() = Some(std::thread::current().id());
+        }
+        drop(self.fd.take());
+        #[cfg(test)]
+        if let Some(count) = self.hook.close_count.as_ref() {
+            count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
+impl Drop for SinkWorkerOwner {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        if std::thread::panicking() {
+            if let Some(entered) = self.hook.unwind_entered.as_ref() {
+                entered.store(true, Ordering::SeqCst);
+            }
+        }
+        self.finish();
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Default)]
+struct SinkTestHook {
+    fail_spawn: bool,
+    spawn_attempts: Option<Arc<AtomicU32>>,
+    close_gate: Option<(Arc<AtomicBool>, Arc<AtomicBool>)>,
+    close_thread: Option<Arc<Mutex<Option<std::thread::ThreadId>>>>,
+    close_count: Option<Arc<AtomicU32>>,
+    panic_after_handoff: bool,
+    unwind_entered: Option<Arc<AtomicBool>>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static SINK_TEST_HOOK: RefCell<SinkTestHook> = const { RefCell::new(SinkTestHook {
+        fail_spawn: false,
+        spawn_attempts: None,
+        close_gate: None,
+        close_thread: None,
+        close_count: None,
+        panic_after_handoff: false,
+        unwind_entered: None,
+    }) };
+}
+
+fn spawn_sink_worker<F>(op: F) -> std::io::Result<()>
+where
+    F: FnOnce() + Send + 'static,
+{
+    #[cfg(test)]
+    {
+        let fail = SINK_TEST_HOOK.with(|h| {
+            let mut h = h.borrow_mut();
+            if let Some(attempts) = h.spawn_attempts.as_ref() {
+                attempts.fetch_add(1, Ordering::SeqCst);
+            }
+            std::mem::take(&mut h.fail_spawn)
+        });
+        if fail {
+            return Err(std::io::Error::from_raw_os_error(libc::EAGAIN));
+        }
+    }
+    std::thread::Builder::new()
+        .name("osslscope-sink-op".to_string())
+        .spawn(op)
+        .map(drop)
+}
+
+// Keep the acquisition worker as the sole FD owner through final close.
+// Generic setup ops retain run_under_control's independent value protocol.
+fn run_sink_under_control<F>(
     deadline: Instant,
     cancel: &AtomicBool,
     op: F,
-) -> anyhow::Result<Control<T>>
+    on_exit: Option<Box<dyn FnOnce() + Send + 'static>>,
+) -> anyhow::Result<Control<anyhow::Result<SinkLease>>>
 where
-    T: Send + 'static,
-    F: FnOnce() -> T + Send + 'static,
+    F: FnOnce(&AtomicBool) -> anyhow::Result<OwnedFd> + Send + 'static,
 {
+    let cancelled = cancel.load(Ordering::SeqCst);
+    let expired = Instant::now() >= deadline;
+    if cancelled || expired {
+        if let Some(f) = on_exit {
+            f();
+        }
+        return Ok(if cancelled {
+            Control::Cancelled
+        } else {
+            Control::Expired
+        });
+    }
+    let abandoned = Arc::new(AtomicBool::new(false));
+    let abandoned_c = abandoned.clone();
     let (tx, rx) = std::sync::mpsc::sync_channel(0);
     let (test_delay_ms, test_counter) = read_setup_test_hook();
-    std::thread::Builder::new()
-        .name("osslscope-setup-op".to_string())
-        .spawn(move || {
-            if test_delay_ms > 0 {
-                std::thread::sleep(Duration::from_millis(test_delay_ms));
+    #[cfg(test)]
+    let hook = SINK_TEST_HOOK.with(|h| h.borrow().clone());
+    spawn_sink_worker(move || {
+        let mut on_exit = on_exit;
+        if test_delay_ms > 0 {
+            std::thread::sleep(Duration::from_millis(test_delay_ms));
+        }
+        if !abandoned_c.load(Ordering::SeqCst) {
+            match op(abandoned_c.as_ref()) {
+                Ok(fd) => {
+                    let (release_tx, release_rx) = std::sync::mpsc::channel();
+                    // Declaration order is part of unwind safety: unsent lease,
+                    // then owner (waiting for release), then completion sender.
+                    let (closed_tx, closed_rx) = std::sync::mpsc::sync_channel(0);
+                    let mut owner = SinkWorkerOwner {
+                        fd: Some(fd),
+                        release: release_rx,
+                        #[cfg(test)]
+                        hook: hook.clone(),
+                    };
+                    let lease = SinkLease {
+                        raw: owner.fd.as_ref().unwrap().as_raw_fd(),
+                        release: Some(release_tx),
+                        closed: Some(closed_rx),
+                    };
+                    match tx.send(Ok(lease)) {
+                        Ok(()) => {
+                            if let Some(f) = on_exit.take() {
+                                f();
+                            }
+                            #[cfg(test)]
+                            if hook.panic_after_handoff {
+                                panic!("sink worker panic after handoff");
+                            }
+                            owner.finish();
+                            let _ = closed_tx.send(());
+                        }
+                        Err(unsent) => {
+                            // Drop the lease BEFORE waiting for disconnection.
+                            drop(unsent);
+                            owner.finish();
+                            if let Some(f) = on_exit.take() {
+                                f();
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    let _ = tx.send(Err(error));
+                }
             }
-            let _ = tx.send(op());
-            if let Some(c) = test_counter.as_ref() {
-                c.fetch_add(1, Ordering::SeqCst);
-            }
-        })
-        .map_err(|e| anyhow::anyhow!("setup worker thread: {e}"))?;
-    poll_controlled(deadline, cancel, rx, None)
+        }
+        if let Some(f) = on_exit {
+            f();
+        }
+        if let Some(c) = test_counter {
+            c.fetch_add(1, Ordering::SeqCst);
+        }
+    })
+    .map_err(|e| anyhow::Error::new(e).context("setup sink worker thread"))?;
+    poll_controlled(deadline, cancel, rx, Some(abandoned.as_ref()))
 }
 
 /// Poll one control worker (the waiting half of [`run_under_control`] /
-/// [`spawn_controlled`]). When `abandoned` is present, it is STORED (one
+/// [`run_sink_under_control`]). When `abandoned` is present, it is STORED (one
 /// lock-free atomic store — no mutex, no file syscalls) before returning
 /// `Cancelled` / `Expired`, so a worker that has not started its op skips
 /// it, and a worker poised at publish observes it at its final check,
@@ -1101,29 +1275,16 @@ fn read_setup_test_hook() -> (u64, Option<Arc<AtomicU32>>) {
     })
 }
 
-/// Close a parent-held sink fd under setup control (F1): the actual
-/// close runs on a worker, so a FUSE FLUSH cannot hang setup. The full
-/// [`Control`] outcome returns: on expiry the fd stays owned by the
-/// worker (closed whenever the sink answers); only a worker-thread
-/// spawn failure leaks it process-lifetime (fail-closed thread
-/// exhaustion — setup still never blocks, custody still never breaks).
+/// Release the worker's sink ownership before bounded completion polling.
+/// No spawn, FD destruction, or worker join occurs on the caller.
 fn close_under_control(
-    fd: OwnedFd,
+    mut lease: SinkLease,
     deadline: Instant,
     cancel: &AtomicBool,
 ) -> anyhow::Result<Control<()>> {
-    // Pass the fd BY NUMBER so a thread-spawn failure leaks it instead
-    // of closing it inline: dropping the closure must never run the
-    // close on this thread.
-    let raw = fd.into_raw_fd();
-    // No dead-setup pre-check (see `spawn_controlled`): the close runs
-    // even when the deadline already won — late, on the worker.
-    spawn_controlled(deadline, cancel, move || {
-        // SAFETY: `raw` is the live sink fd, moved here by number; this
-        // closure runs at most once (the worker calls it once, or never
-        // on spawn failure — a leaked number, never closed twice).
-        drop(unsafe { OwnedFd::from_raw_fd(raw) });
-    })
+    let closed = lease.closed.take().expect("live sink completion receiver");
+    drop(lease.release.take());
+    poll_controlled(deadline, cancel, closed, None)
 }
 
 /// Test-only pre-stop instrumentation (fix round 1 / F4), thread-local
@@ -1494,7 +1655,7 @@ impl OwnedTarget {
         // allocates nothing). A file sink is opened + pinned HERE
         // (never by the child), on a worker under the setup deadline +
         // cancel; an invalid fd fails HERE — no spawn.
-        let mut owned_sink: Option<OwnedFd> = None;
+        let mut owned_sink: Option<SinkLease> = None;
         let child_dest = match &dest {
             WorkloadDest::Null => ChildDest::Null,
             WorkloadDest::File(path) => {
@@ -1587,7 +1748,7 @@ impl OwnedTarget {
                 // returns clean inline via on_exit (R06-b — the worker
                 // never spawns there, so the caller owns cleanup).
                 let reg_key_w = reg_key.clone();
-                let prep = run_under_control(
+                let prep = run_sink_under_control(
                     deadline,
                     cancel,
                     move |abandoned| {
@@ -1604,7 +1765,7 @@ impl OwnedTarget {
                 )
                 .map_err(|e| {
                     admission.release();
-                    anyhow::anyhow!("{e:#} (no child spawned)")
+                    e.context("file-sink preparation (no child spawned)")
                 })?;
                 let published = match prep {
                     Control::Done(r) => {
@@ -1750,13 +1911,18 @@ impl OwnedTarget {
         // parent's sink copy is disposed (a FUSE close can block) and
         // before the wait.
         let mut guard = PrestopGuard { pid, armed: true };
-        // The parent's copy of a pinned sink closes NOW (the child
-        // inherited its own) — under setup control, with the guard
-        // already armed. If disposal itself outlives the setup, the
-        // guard-held child resolves under custody.
+        // Release the parent's raw sink borrow to its existing worker
+        // (the child inherited its own descriptor), with custody already
+        // armed. A blocked worker close cannot block setup past control.
         if let Some(sink) = owned_sink.take() {
             match close_under_control(sink, deadline, cancel) {
-                Ok(Control::Done(()) | Control::Lost) => {}
+                Ok(Control::Done(())) => {}
+                Ok(Control::Lost) => {
+                    let report = guard_cleanup_report(&mut guard);
+                    anyhow::bail!(
+                        "pre-stop setup worker lost while disposing parent sink; owned child {pid} {report}"
+                    );
+                }
                 Ok(Control::Cancelled) => {
                     let report = guard_cleanup_report(&mut guard);
                     anyhow::bail!(
@@ -1769,11 +1935,11 @@ impl OwnedTarget {
                         "pre-stop setup deadline exceeded while disposing parent sink; owned child {pid} {report}"
                     );
                 }
-                Err(_) => {
-                    // Thread exhaustion: the fd leaked (never closed
-                    // inline — see `close_under_control`); custody is
-                    // intact, so continue into the wait rather than
-                    // killing a healthy child over a local shortage.
+                Err(error) => {
+                    let report = guard_cleanup_report(&mut guard);
+                    return Err(error.context(format!(
+                        "pre-stop setup parent sink disposal failed; owned child {pid} {report}"
+                    )));
                 }
             }
         }
@@ -2232,42 +2398,788 @@ mod control_tests {
         }
     }
 
+    // These regressions detect caller-side close, post-acquisition spawning,
+    // premature raw-FD reuse, fabricated completion, and Lost accepted by the
+    // real File consumer. The pipes/files/children are ordinary HOST fixtures.
+    struct SinkHooks(super::SinkTestHook);
+
+    impl SinkHooks {
+        fn install(hook: super::SinkTestHook) -> Self {
+            Self(super::SINK_TEST_HOOK.with(|h| h.replace(hook)))
+        }
+    }
+
+    impl Drop for SinkHooks {
+        fn drop(&mut self) {
+            super::SINK_TEST_HOOK.with(|h| {
+                let current = h.replace(std::mem::take(&mut self.0));
+                if let Some((_, proceed)) = current.close_gate {
+                    proceed.store(true, Ordering::SeqCst);
+                }
+            });
+        }
+    }
+
+    fn sink_hook() -> super::SinkTestHook {
+        super::SinkTestHook {
+            spawn_attempts: Some(std::sync::Arc::new(AtomicU32::new(0))),
+            close_thread: Some(std::sync::Arc::new(std::sync::Mutex::new(None))),
+            close_count: Some(std::sync::Arc::new(AtomicU32::new(0))),
+            ..Default::default()
+        }
+    }
+
+    fn wait_until(mut condition: impl FnMut() -> bool) {
+        let end = Instant::now() + Duration::from_secs(3);
+        while !condition() {
+            assert!(Instant::now() < end, "bounded worker observation timed out");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn pipe_lease() -> (super::SinkLease, OwnedFd, OwnedFd) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let result = super::run_sink_under_control(
+            Instant::now() + Duration::from_secs(3),
+            &AtomicBool::new(false),
+            move |_| {
+                // Acquisition occurs inside the actual worker, never in a
+                // closure captured across a potentially failing spawn.
+                let (reader, writer) = close_test_pipe();
+                tx.send((reader, writer.try_clone().unwrap())).unwrap();
+                Ok(writer)
+            },
+            None,
+        )
+        .unwrap();
+        let lease = match result {
+            Control::Done(Ok(lease)) => lease,
+            _ => panic!("pipe preparation did not hand off its lease"),
+        };
+        let (reader, alias) = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        (lease, reader, alias)
+    }
+
+    fn closed_on_worker(hook: &super::SinkTestHook, reader: &OwnedFd, alias: OwnedFd) {
+        wait_until(|| hook.close_count.as_ref().unwrap().load(Ordering::SeqCst) == 1);
+        assert_ne!(
+            *hook.close_thread.as_ref().unwrap().lock().unwrap(),
+            Some(std::thread::current().id())
+        );
+        assert!(
+            !close_test_pipe_hung_up(reader, Duration::ZERO),
+            "retained alias is a negative control"
+        );
+        drop(alias);
+        assert!(close_test_pipe_hung_up(reader, Duration::from_secs(3)));
+        assert_eq!(hook.close_count.as_ref().unwrap().load(Ordering::SeqCst), 1);
+    }
+
     #[test]
     fn control_close_confirms_on_live_setup() {
-        let (reader, writer) = close_test_pipe();
-        let retained_writer = writer.try_clone().unwrap();
+        let hook = sink_hook();
+        let _hooks = SinkHooks::install(hook.clone());
+        let (lease, reader, alias) = pipe_lease();
         assert!(!close_test_pipe_hung_up(&reader, Duration::ZERO));
-        let cancel = AtomicBool::new(false);
-        let out =
-            close_under_control(writer, Instant::now() + Duration::from_secs(30), &cancel).unwrap();
+        let out = close_under_control(
+            lease,
+            Instant::now() + Duration::from_secs(3),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
         assert!(matches!(out, Control::Done(())));
-        // Real retained-writer negative control: a close acknowledgment alone
-        // does not make this original pipe hang up while its alias is alive.
-        assert!(!close_test_pipe_hung_up(&reader, Duration::ZERO));
-        drop(retained_writer);
-        assert!(
-            close_test_pipe_hung_up(&reader, Duration::from_secs(3)),
-            "original pipe still has a writer after bounded cleanup"
-        );
+        closed_on_worker(&hook, &reader, alias);
     }
 
     #[test]
     fn control_close_runs_even_on_dead_setup() {
-        // F1 leak pin: disposal on an already-dead setup still closes
-        // (late, on the worker) instead of leaking the fd.
-        let (reader, writer) = close_test_pipe();
-        let retained_writer = writer.try_clone().unwrap();
-        assert!(!close_test_pipe_hung_up(&reader, Duration::ZERO));
-        let cancel = AtomicBool::new(true);
-        let out =
-            close_under_control(writer, Instant::now() + Duration::from_secs(30), &cancel).unwrap();
-        assert!(matches!(out, Control::Cancelled));
-        assert!(!close_test_pipe_hung_up(&reader, Duration::ZERO));
-        drop(retained_writer);
-        assert!(
-            close_test_pipe_hung_up(&reader, Duration::from_secs(3)),
-            "original pipe still has a writer after bounded cleanup"
+        for cancelled in [true, false] {
+            let hook = sink_hook();
+            let _hooks = SinkHooks::install(hook.clone());
+            let (lease, reader, alias) = pipe_lease();
+            let deadline = if cancelled {
+                Instant::now() + Duration::from_secs(3)
+            } else {
+                Instant::now()
+            };
+            let out = close_under_control(lease, deadline, &AtomicBool::new(cancelled)).unwrap();
+            assert!(if cancelled {
+                matches!(out, Control::Cancelled)
+            } else {
+                matches!(out, Control::Expired)
+            });
+            closed_on_worker(&hook, &reader, alias);
+        }
+    }
+
+    #[test]
+    fn g1_sink_close_needs_no_new_thread() {
+        let hook = sink_hook();
+        let _hooks = SinkHooks::install(hook.clone());
+        let (lease, reader, alias) = pipe_lease();
+        super::SINK_TEST_HOOK.with(|h| h.borrow_mut().fail_spawn = true);
+        let attempts = hook.spawn_attempts.as_ref().unwrap();
+        let before = attempts.load(Ordering::SeqCst);
+        let out = close_under_control(
+            lease,
+            Instant::now() + Duration::from_secs(3),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(matches!(out, Control::Done(())));
+        assert_eq!(attempts.load(Ordering::SeqCst), before);
+        closed_on_worker(&hook, &reader, alias);
+        let acquired = std::sync::Arc::new(AtomicBool::new(false));
+        let acquired_w = acquired.clone();
+        let error = super::run_sink_under_control(
+            Instant::now() + Duration::from_secs(3),
+            &AtomicBool::new(false),
+            move |_| {
+                acquired_w.store(true, Ordering::SeqCst);
+                Ok(close_test_pipe().1)
+            },
+            None,
+        )
+        .err()
+        .expect("still-armed EAGAIN must be consumed");
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .raw_os_error(),
+            Some(libc::EAGAIN)
         );
+        assert!(!acquired.load(Ordering::SeqCst));
+        assert_eq!(attempts.load(Ordering::SeqCst), before + 1);
+    }
+
+    fn gated_hook() -> super::SinkTestHook {
+        super::SinkTestHook {
+            close_gate: Some((
+                std::sync::Arc::new(AtomicBool::new(false)),
+                std::sync::Arc::new(AtomicBool::new(false)),
+            )),
+            ..sink_hook()
+        }
+    }
+
+    #[test]
+    fn g1_sink_close_wait_is_bounded() {
+        for cancelled in [false, true] {
+            let hook = gated_hook();
+            let _hooks = SinkHooks::install(hook.clone());
+            let (lease, reader, alias) = pipe_lease();
+            let (ready, proceed) = hook.close_gate.as_ref().unwrap();
+            let cancel = AtomicBool::new(false);
+            let start = Instant::now();
+            let out = std::thread::scope(|scope| {
+                if cancelled {
+                    scope.spawn(|| {
+                        wait_until(|| ready.load(Ordering::SeqCst));
+                        cancel.store(true, Ordering::SeqCst);
+                    });
+                }
+                close_under_control(
+                    lease,
+                    if cancelled {
+                        Instant::now() + Duration::from_secs(30)
+                    } else {
+                        Instant::now() + Duration::from_millis(100)
+                    },
+                    &cancel,
+                )
+                .unwrap()
+            });
+            assert!(start.elapsed() < Duration::from_secs(5));
+            assert!(if cancelled {
+                matches!(out, Control::Cancelled)
+            } else {
+                matches!(out, Control::Expired)
+            });
+            assert!(ready.load(Ordering::SeqCst));
+            assert_eq!(hook.close_count.as_ref().unwrap().load(Ordering::SeqCst), 0);
+            assert!(!close_test_pipe_hung_up(&reader, Duration::ZERO));
+            proceed.store(true, Ordering::SeqCst);
+            closed_on_worker(&hook, &reader, alias);
+        }
+    }
+
+    #[test]
+    fn g1_sink_lease_drop_and_unwind() {
+        for unwind in [false, true] {
+            let hook = gated_hook();
+            let _hooks = SinkHooks::install(hook.clone());
+            let (lease, reader, alias) = pipe_lease();
+            let start = Instant::now();
+            if unwind {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                    let _lease = lease;
+                    panic!("caller unwind holding lease");
+                }));
+                assert!(result.is_err());
+            } else {
+                drop(lease);
+            }
+            assert!(start.elapsed() < Duration::from_secs(5));
+            let (ready, proceed) = hook.close_gate.as_ref().unwrap();
+            wait_until(|| ready.load(Ordering::SeqCst));
+            assert_eq!(hook.close_count.as_ref().unwrap().load(Ordering::SeqCst), 0);
+            assert!(!close_test_pipe_hung_up(&reader, Duration::ZERO));
+            proceed.store(true, Ordering::SeqCst);
+            closed_on_worker(&hook, &reader, alias);
+        }
+    }
+
+    #[test]
+    fn g1_sink_discarded_lease_closes_on_worker() {
+        let hook = sink_hook();
+        let _hooks = SinkHooks::install(hook.clone());
+        let op_done = std::sync::Arc::new(AtomicBool::new(false));
+        let proceed = std::sync::Arc::new(AtomicBool::new(false));
+        let callback = std::sync::Arc::new(AtomicBool::new(false));
+        let dir = SinkScratch::new("discarded-lease");
+        let path = dir.0.join("output");
+        let key = super::canonical_setup_key(&path).unwrap();
+        let mut admission = super::RegistryAdmission::insert(key.clone(), &path).unwrap();
+        let worker_id = admission.id();
+        let cancel = AtomicBool::new(false);
+        let (tx, rx) = std::sync::mpsc::channel();
+        __test_set_poll_gate(Some(proceed.clone()));
+        struct ClearPoll;
+        impl Drop for ClearPoll {
+            fn drop(&mut self) {
+                __test_set_poll_gate(None);
+            }
+        }
+        let _clear = ClearPoll;
+        let done_w = op_done.clone();
+        let callback_w = callback.clone();
+        let result = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                wait_until(|| op_done.load(Ordering::SeqCst));
+                cancel.store(true, Ordering::SeqCst);
+                proceed.store(true, Ordering::SeqCst);
+            });
+            super::run_sink_under_control(
+                Instant::now() + Duration::from_secs(30),
+                &cancel,
+                move |_| {
+                    let (reader, writer) = close_test_pipe();
+                    tx.send((reader, writer.try_clone().unwrap())).unwrap();
+                    done_w.store(true, Ordering::SeqCst);
+                    Ok(writer)
+                },
+                Some(Box::new(move || {
+                    super::registry_remove_if(&key, worker_id);
+                    callback_w.store(true, Ordering::SeqCst);
+                })),
+            )
+            .unwrap()
+        });
+        assert!(matches!(result, Control::Cancelled));
+        admission.disarm();
+        let (reader, alias) = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        closed_on_worker(&hook, &reader, alias);
+        wait_until(|| callback.load(Ordering::SeqCst));
+        // No caller-side registry cleanup: only the discarded-result worker
+        // can reopen admission for this real File retry.
+        drop(_clear);
+        sink_retry(&path, &dir.0.join("sentinel"));
+    }
+
+    #[test]
+    fn g1_sink_worker_unwind_waits_for_release() {
+        let unwind_entered = std::sync::Arc::new(AtomicBool::new(false));
+        let hook = super::SinkTestHook {
+            panic_after_handoff: true,
+            unwind_entered: Some(unwind_entered.clone()),
+            ..sink_hook()
+        };
+        let _hooks = SinkHooks::install(hook.clone());
+        let (lease, reader, alias) = pipe_lease();
+        // Observe the owner's actual unwinding Drop, not merely the point
+        // before panic. Keep the lease live across this observation and a
+        // bounded negative completion check: premature close/disconnection
+        // must fail before using the raw borrow.
+        wait_until(|| unwind_entered.load(Ordering::SeqCst));
+        assert!(
+            matches!(
+                lease
+                    .closed
+                    .as_ref()
+                    .unwrap()
+                    .recv_timeout(Duration::from_millis(100)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "unwinding owner must preserve a live borrow without completion or disconnection"
+        );
+        assert_eq!(hook.close_count.as_ref().unwrap().load(Ordering::SeqCst), 0);
+        let byte = [77u8];
+        assert_eq!(
+            unsafe { libc::write(lease.as_raw_fd(), byte.as_ptr().cast(), 1) },
+            1
+        );
+        let mut read = [0u8];
+        assert_eq!(
+            unsafe { libc::read(reader.as_raw_fd(), read.as_mut_ptr().cast(), 1) },
+            1
+        );
+        assert_eq!(read, byte);
+        assert_eq!(hook.close_count.as_ref().unwrap().load(Ordering::SeqCst), 0);
+        let out = close_under_control(
+            lease,
+            Instant::now() + Duration::from_secs(3),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(
+            matches!(out, Control::Lost),
+            "panic cannot fabricate close acknowledgment"
+        );
+        closed_on_worker(&hook, &reader, alias);
+        super::SINK_TEST_HOOK.with(|h| h.borrow_mut().panic_after_handoff = false);
+        let dir = SinkScratch::new("preparation-panic");
+        let path = dir.0.join("output");
+        let key = super::canonical_setup_key(&path).unwrap();
+        let mut admission = super::RegistryAdmission::insert(key.clone(), &path).unwrap();
+        let worker_id = admission.id();
+        let callback_ran = std::sync::Arc::new(AtomicBool::new(false));
+        let callback_ran_w = callback_ran.clone();
+        let out = super::run_sink_under_control(
+            Instant::now() + Duration::from_secs(3),
+            &AtomicBool::new(false),
+            |_| panic!("preparation panic"),
+            Some(Box::new(move || {
+                super::registry_remove_if(&key, worker_id);
+                callback_ran_w.store(true, Ordering::SeqCst);
+            })),
+        )
+        .unwrap();
+        assert!(matches!(out, Control::Lost));
+        assert!(!callback_ran.load(Ordering::SeqCst));
+        // This is the File consumer's Lost admission action. The real
+        // subsequent File call must acquire the same registry destination.
+        admission.release();
+        sink_retry(&path, &dir.0.join("sentinel"));
+        let (lease, reader, alias) = pipe_lease();
+        assert!(matches!(
+            close_under_control(
+                lease,
+                Instant::now() + Duration::from_secs(3),
+                &AtomicBool::new(false)
+            )
+            .unwrap(),
+            Control::Done(())
+        ));
+        drop(alias);
+        assert!(close_test_pipe_hung_up(&reader, Duration::from_secs(3)));
+    }
+
+    struct SinkScratch(std::path::PathBuf);
+    impl SinkScratch {
+        fn new(label: &str) -> Self {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let dir = std::env::temp_dir().join(format!(
+                "osslscope-sink-{label}-{}-{nonce}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&dir).unwrap();
+            Self(dir)
+        }
+    }
+    impl Drop for SinkScratch {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    fn sink_argv(sentinel: &std::path::Path) -> Vec<String> {
+        vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            r#"printf ran > "$1""#.into(),
+            "sink-test".into(),
+            sentinel.to_string_lossy().into_owned(),
+        ]
+    }
+
+    fn sink_retry(path: &std::path::Path, sentinel: &std::path::Path) {
+        let mut child = super::OwnedTarget::spawn_stopped_with_control(
+            &sink_argv(sentinel),
+            super::WorkloadDest::File(path.to_path_buf()),
+            Instant::now() + Duration::from_secs(3),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(child.state(), super::CustodyState::Stopped);
+        child.release().unwrap();
+        wait_until(|| child.poll_exit().unwrap().is_some());
+        assert_eq!(child.state(), super::CustodyState::Reaped);
+        assert_eq!(std::fs::read(sentinel).unwrap(), b"ran");
+    }
+
+    #[test]
+    fn g1_sink_spawn_failure_before_acquisition() {
+        let dir = SinkScratch::new("spawn-failure");
+        let path = dir.0.join("output");
+        let sentinel = dir.0.join("sentinel");
+        std::fs::write(&path, b"original exact bytes").unwrap();
+        let hook = super::SinkTestHook {
+            fail_spawn: true,
+            ..sink_hook()
+        };
+        let _hooks = SinkHooks::install(hook.clone());
+        let pid = std::sync::Arc::new(AtomicU32::new(0));
+        super::__test_set_prestop_pid_sink(Some(pid.clone()));
+        struct ClearPid;
+        impl Drop for ClearPid {
+            fn drop(&mut self) {
+                super::__test_set_prestop_pid_sink(None);
+            }
+        }
+        let _clear = ClearPid;
+        let result = super::OwnedTarget::spawn_stopped_with_control(
+            &sink_argv(&sentinel),
+            super::WorkloadDest::File(path.clone()),
+            Instant::now() + Duration::from_secs(3),
+            &AtomicBool::new(false),
+        );
+        let error = match result {
+            Err(error) => error,
+            Ok(mut child) => {
+                child.resolve_setup_failure().unwrap();
+                panic!("spawn fault unexpectedly acquired child");
+            }
+        };
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("sink worker thread") && message.contains("no child spawned"),
+            "{message}"
+        );
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .raw_os_error(),
+            Some(libc::EAGAIN)
+        );
+        assert_eq!(pid.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            hook.spawn_attempts.as_ref().unwrap().load(Ordering::SeqCst),
+            1
+        );
+        assert_eq!(hook.close_count.as_ref().unwrap().load(Ordering::SeqCst), 0);
+        assert_eq!(std::fs::read(&path).unwrap(), b"original exact bytes");
+        assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 1);
+        assert!(!sentinel.exists());
+        super::SINK_TEST_HOOK.with(|h| h.borrow_mut().fail_spawn = true);
+        let acquired = std::sync::Arc::new(AtomicBool::new(false));
+        let acquired_w = acquired.clone();
+        let error = super::run_sink_under_control(
+            Instant::now() + Duration::from_secs(3),
+            &AtomicBool::new(false),
+            move |_| {
+                acquired_w.store(true, Ordering::SeqCst);
+                Ok(close_test_pipe().1)
+            },
+            None,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .raw_os_error(),
+            Some(libc::EAGAIN)
+        );
+        assert!(!acquired.load(Ordering::SeqCst));
+        sink_retry(&path, &sentinel);
+        assert_eq!(hook.close_count.as_ref().unwrap().load(Ordering::SeqCst), 1);
+    }
+
+    // Independent exact-owned teardown. Probe waitpid before signalling so
+    // an already reaped/recycled PID is never treated as our child.
+    fn sink_rescue(pid: u32) -> Result<(), String> {
+        if pid == 0 {
+            return Ok(());
+        }
+        let end = Instant::now() + Duration::from_secs(3);
+        loop {
+            let mut status = 0;
+            let result = unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) };
+            if result == pid as i32 {
+                return Ok(());
+            }
+            if result < 0 {
+                match std::io::Error::last_os_error().raw_os_error() {
+                    Some(libc::ECHILD) => return Ok(()),
+                    Some(libc::EINTR) => continue,
+                    error => return Err(format!("exact-child teardown wait error: {error:?}")),
+                }
+            }
+            if unsafe { libc::kill(pid as i32, libc::SIGKILL) } < 0
+                && std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+            {
+                return Err("exact-child teardown kill failed".into());
+            }
+            if Instant::now() >= end {
+                return Err("exact-child teardown timed out".into());
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    struct SinkCallGuard {
+        worker: Option<std::thread::JoinHandle<()>>,
+        pid: std::sync::Arc<AtomicU32>,
+        cancel: std::sync::Arc<AtomicBool>,
+    }
+    impl Drop for SinkCallGuard {
+        fn drop(&mut self) {
+            self.cancel.store(true, Ordering::SeqCst);
+            let end = Instant::now() + Duration::from_secs(5);
+            while self.worker.as_ref().is_some_and(|w| !w.is_finished()) && Instant::now() < end {
+                if let Err(error) = sink_rescue(self.pid.load(Ordering::SeqCst)) {
+                    panic!("{error}");
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            sink_rescue(self.pid.load(Ordering::SeqCst)).unwrap();
+            if let Some(worker) = self.worker.take() {
+                assert!(
+                    worker.is_finished(),
+                    "File caller did not return after bounded teardown"
+                );
+                worker.join().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn g1_sink_consumer_lost_reaps_child() {
+        let dir = SinkScratch::new("lost-consumer");
+        let path = dir.0.join("output");
+        let sentinel = dir.0.join("sentinel");
+        let hook = super::SinkTestHook {
+            panic_after_handoff: true,
+            ..sink_hook()
+        };
+        let pid = std::sync::Arc::new(AtomicU32::new(0));
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let completed = std::sync::Arc::new(AtomicU32::new(0));
+        let completed_w = completed.clone();
+        let hook_w = hook.clone();
+        let pid_w = pid.clone();
+        let cancel_w = cancel.clone();
+        let path_w = path.clone();
+        let argv = sink_argv(&sentinel);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let start = Instant::now();
+        let worker = std::thread::spawn(move || {
+            let _hooks = SinkHooks::install(hook_w);
+            super::__test_set_prestop_pid_sink(Some(pid_w));
+            __test_set_control_worker_counter(Some(completed_w));
+            let mut result = super::OwnedTarget::spawn_stopped_with_control(
+                &argv,
+                super::WorkloadDest::File(path_w),
+                Instant::now() + Duration::from_secs(30),
+                &cancel_w,
+            );
+            // RED must resolve its unexpected-Ok child before asserting.
+            // Never release it: the sentinel is an independent control.
+            if let Ok(child) = result.as_mut() {
+                child.resolve_setup_failure().unwrap();
+            }
+            let _ = tx.send(result);
+            super::__test_set_prestop_pid_sink(None);
+            __test_set_control_worker_counter(None);
+        });
+        let mut guard = SinkCallGuard {
+            worker: Some(worker),
+            pid: pid.clone(),
+            cancel,
+        };
+        let result = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("File caller exceeded independent return bound");
+        assert!(start.elapsed() < Duration::from_secs(5));
+        let owned_pid = pid.load(Ordering::SeqCst);
+        assert_ne!(owned_pid, 0, "postfork disposal must be exercised");
+        let mut status = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(owned_pid as i32, &mut status, libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+        assert!(!sentinel.exists());
+        wait_until(|| hook.close_count.as_ref().unwrap().load(Ordering::SeqCst) == 1);
+        wait_until(|| guard.worker.as_ref().unwrap().is_finished());
+        guard.worker.take().unwrap().join().unwrap();
+        assert_eq!(
+            completed.load(Ordering::SeqCst),
+            0,
+            "panicking worker has no normal completion credit"
+        );
+        let message = match result {
+            Err(error) => format!("{error:#}"),
+            Ok(_) => panic!("Lost disposal was silently accepted by the File consumer"),
+        };
+        assert!(
+            message.contains("worker lost") && message.contains("killed and reaped"),
+            "{message}"
+        );
+        let _hooks = SinkHooks::install(sink_hook());
+        sink_retry(&path, &sentinel);
+    }
+
+    struct SinkSubprocess(std::process::Child);
+    impl SinkSubprocess {
+        fn finish(&mut self) -> std::io::Result<()> {
+            if self.0.try_wait()?.is_some() {
+                return Ok(());
+            }
+            if let Err(error) = self.0.kill() {
+                if self.0.try_wait()?.is_none() {
+                    return Err(error);
+                }
+            }
+            let end = Instant::now() + Duration::from_secs(3);
+            loop {
+                if self.0.try_wait()?.is_some() {
+                    return Ok(());
+                }
+                if Instant::now() >= end {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "owned subprocess did not reap",
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+    impl Drop for SinkSubprocess {
+        fn drop(&mut self) {
+            if let Err(error) = self.finish() {
+                if std::thread::panicking() {
+                    eprintln!("owned subprocess teardown failed: {error}");
+                } else {
+                    panic!("owned subprocess teardown failed: {error}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn g1_sink_reused_fd_and_successor_survive() {
+        const NAME: &str = "target::control_tests::g1_sink_reused_fd_and_successor_survive";
+        const CHILD: &str = "OSSL_SINK_REUSE_UNIT_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let mut child = SinkSubprocess(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                    .env(CHILD, "1")
+                    .spawn()
+                    .unwrap(),
+            );
+            let end = Instant::now() + Duration::from_secs(15);
+            loop {
+                if let Some(status) = child.0.try_wait().unwrap() {
+                    assert!(status.success());
+                    return;
+                }
+                if Instant::now() >= end {
+                    child.finish().unwrap();
+                    panic!("owned reuse subprocess timed out");
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        // Numeric reuse is confined to this single-test subprocess.
+        let hook = sink_hook();
+        let _hooks = SinkHooks::install(hook.clone());
+        let (lease, reader, alias) = pipe_lease();
+        let old = lease.as_raw_fd();
+        assert!(matches!(
+            close_under_control(
+                lease,
+                Instant::now() + Duration::from_secs(3),
+                &AtomicBool::new(false)
+            )
+            .unwrap(),
+            Control::Done(())
+        ));
+        closed_on_worker(&hook, &reader, alias);
+        // Occupy the old number first so neither fresh endpoint can equal it.
+        assert_eq!(
+            unsafe { libc::dup3(reader.as_raw_fd(), old, libc::O_CLOEXEC) },
+            old
+        );
+        let (fresh_reader, fresh_writer) = close_test_pipe();
+        assert_eq!(
+            unsafe { libc::dup3(fresh_writer.as_raw_fd(), old, libc::O_CLOEXEC) },
+            old
+        );
+        let replacement = unsafe { OwnedFd::from_raw_fd(old) };
+        drop(fresh_writer);
+        // Exercise late worker completion and independent token drops.
+        let (later, later_reader, later_alias) = pipe_lease();
+        drop(later);
+        wait_until(|| hook.close_count.as_ref().unwrap().load(Ordering::SeqCst) == 2);
+        drop(later_alias);
+        assert!(close_test_pipe_hung_up(
+            &later_reader,
+            Duration::from_secs(3)
+        ));
+        assert!(!close_test_pipe_hung_up(&fresh_reader, Duration::ZERO));
+        assert_eq!(
+            unsafe { libc::write(replacement.as_raw_fd(), b"X".as_ptr().cast(), 1) },
+            1
+        );
+        let mut byte = [0u8];
+        assert_eq!(
+            unsafe { libc::read(fresh_reader.as_raw_fd(), byte.as_mut_ptr().cast(), 1) },
+            1
+        );
+        assert_eq!(byte, *b"X");
+        assert_eq!(hook.close_count.as_ref().unwrap().load(Ordering::SeqCst), 2);
+        drop(replacement);
+        assert!(close_test_pipe_hung_up(
+            &fresh_reader,
+            Duration::from_secs(3)
+        ));
+        let dir = SinkScratch::new("successor");
+        let path = dir.0.join("output");
+        let successor = dir.0.join("next");
+        let hook = gated_hook();
+        let _hooks = SinkHooks::install(hook.clone());
+        let path_w = path.clone();
+        let lease = match super::run_sink_under_control(
+            Instant::now() + Duration::from_secs(3),
+            &AtomicBool::new(false),
+            move |abandoned| prepare_and_publish_sink(&path_w, abandoned, 0, None, 0, None),
+            None,
+        )
+        .unwrap()
+        {
+            Control::Done(Ok(lease)) => lease,
+            _ => panic!("file lease missing"),
+        };
+        drop(lease);
+        let (ready, proceed) = hook.close_gate.as_ref().unwrap();
+        wait_until(|| ready.load(Ordering::SeqCst));
+        std::fs::write(&successor, b"exact successor bytes").unwrap();
+        std::fs::rename(&successor, &path).unwrap();
+        proceed.store(true, Ordering::SeqCst);
+        wait_until(|| hook.close_count.as_ref().unwrap().load(Ordering::SeqCst) == 1);
+        assert_eq!(std::fs::read(&path).unwrap(), b"exact successor bytes");
     }
 
     #[test]

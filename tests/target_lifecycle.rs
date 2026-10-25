@@ -1493,8 +1493,9 @@ fn fork_failure_disposes_sink_under_control() {
     // F1: the fork-failure path must dispose the prepared sink on a
     // control worker — never by dropping it inline on the caller (a FUSE
     // FLUSH inside that drop would hang setup). The injected fork fault
-    // is deterministic; the worker counter proves a disposal worker ran
-    // beyond the preparation worker(s).
+    // is deterministic; the worker counter confirms the retained preparation
+    // worker completed after disposal. Unit tests observe actual close,
+    // closing thread, and absence of any post-acquisition spawn directly.
     let dir = r06_scratch("fork-fail-dispose");
     let log = dir.join("workload.log");
     std::fs::write(&log, b"stale\n").unwrap();
@@ -1518,18 +1519,22 @@ fn fork_failure_disposes_sink_under_control() {
     };
     assert!(msg.contains("fork"), "fork failure surfaces: {msg}");
     assert!(!sentinel.exists(), "sentinel must never execute");
-    // The disposal worker runs asynchronously: bounded poll, then the
-    // ownership assertion (fails on inline disposal: the counter never
-    // passes the preparation worker(s)).
+    // The single retained worker completes asynchronously after actual close.
+    // It receives exactly one completion count; disposal creates no worker.
     let end = Instant::now() + Duration::from_secs(5);
-    while counter.load(Ordering::SeqCst) < 2 {
+    while counter.load(Ordering::SeqCst) < 1 {
         assert!(
             Instant::now() < end,
-            "no disposal worker ran (counter {})",
+            "sink worker did not complete disposal (counter {})",
             counter.load(Ordering::SeqCst)
         );
         std::thread::sleep(Duration::from_millis(1));
     }
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        1,
+        "one real worker completed"
+    );
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
