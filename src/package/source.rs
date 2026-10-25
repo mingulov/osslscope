@@ -734,14 +734,29 @@ impl SourceTree {
         output.extend_from_slice(&[0; 1024]);
         Ok(output)
     }
+    #[expect(
+        dead_code,
+        reason = "Preserve existing standalone API; executor uses the shared-owner variant."
+    )]
     pub(crate) fn verify_archive(&self, bytes: &[u8]) -> Result<(), PackageError> {
-        let (_, manifest) = validate_tree_archive(bytes)?;
-        if manifest != self.manifest {
-            return Err(PackageError::invalid(
-                "retained archive differs from admitted original inventory",
-            ));
-        }
-        Ok(())
+        let mut owner = ArchiveAdmission::standalone();
+        self.verify_archive_in(bytes, &mut owner)
+    }
+    pub(crate) fn verify_archive_in(
+        &self,
+        bytes: &[u8],
+        owner: &mut ArchiveAdmission,
+    ) -> Result<(), PackageError> {
+        let result = (|| {
+            let (_, manifest) = validate_tree_archive_in(bytes, owner)?;
+            if manifest != self.manifest {
+                return Err(PackageError::invalid(
+                    "retained archive differs from admitted original inventory",
+                ));
+            }
+            Ok(())
+        })();
+        owner.finish(result)
     }
     pub fn extract_archive(bytes: &[u8], destination: &Path) -> Result<Self, PackageError> {
         let (entries, parsed) = validate_tree_archive(bytes)?;
@@ -784,7 +799,14 @@ impl SourceTree {
 }
 
 fn validate_tree_archive(bytes: &[u8]) -> Result<(Vec<TarEntry>, SourceManifest), PackageError> {
-    let entries = read_tar(bytes)?;
+    let mut owner = ArchiveAdmission::standalone();
+    validate_tree_archive_in(bytes, &mut owner)
+}
+fn validate_tree_archive_in(
+    bytes: &[u8],
+    owner: &mut ArchiveAdmission,
+) -> Result<(Vec<TarEntry>, SourceManifest), PackageError> {
+    let entries = read_tar_in(bytes, MAX_ASSET_BYTES, 10000, owner)?;
     let manifest = entries
         .iter()
         .find(|e| e.path == SOURCE_MANIFEST)
@@ -793,7 +815,7 @@ fn validate_tree_archive(bytes: &[u8]) -> Result<(Vec<TarEntry>, SourceManifest)
         return Err(PackageError::invalid("source manifest is not regular"));
     }
     let parsed: SourceManifest = closed(&manifest.data)?;
-    if json_bytes(&parsed)? != manifest.data {
+    if json_bytes(&parsed)?.as_slice() != manifest.data.as_ref() {
         return Err(PackageError::invalid("noncanonical source manifest"));
     }
     parsed.validate()?;
@@ -827,12 +849,418 @@ fn validate_tree_archive(bytes: &[u8]) -> Result<(Vec<TarEntry>, SourceManifest)
     Ok((entries, parsed))
 }
 
+// One finite raw acquisition reader. Policy validators below consume immutable
+// header facts and bodies; cache hits never decode or copy those bodies again.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ArchiveProfile {
+    Source,
+    Registry,
+    Tool,
+}
+#[derive(Clone, Copy)]
+pub(crate) struct ArchiveCaps {
+    pub(crate) input: u64,
+    pub(crate) member: u64,
+    pub(crate) decoded: u64,
+    pub(crate) entries: u64,
+}
+impl ArchiveCaps {
+    pub(crate) const TOOL: Self = Self {
+        input: 536870912,
+        member: 536870912,
+        decoded: 34359738368,
+        entries: 500000,
+    };
+    const SOURCE: Self = Self {
+        input: 536870912,
+        member: 536870912,
+        decoded: 536870912,
+        entries: 10000,
+    };
+}
+pub(crate) struct ArchiveNode {
+    pub(crate) header: [u8; 512],
+    pub(crate) path: String,
+    pub(crate) mode: u64,
+    pub(crate) kind: u8,
+    pub(crate) link: String,
+    pub(crate) uid: u64,
+    pub(crate) gid: u64,
+    pub(crate) mtime: u64,
+    pub(crate) uname: String,
+    pub(crate) gname: String,
+    pub(crate) major: u64,
+    pub(crate) minor: u64,
+    pub(crate) posix: bool,
+    pub(crate) strict_numbers: bool,
+    pub(crate) data: Arc<[u8]>,
+}
+pub(crate) struct DecodedArchive {
+    raw: Arc<[u8]>,
+    pub(crate) nodes: Vec<ArchiveNode>,
+    pub(crate) decoded: u64,
+    pub(crate) gzip: bool,
+    pub(crate) normalized_gzip: bool,
+}
+pub(crate) struct ArchiveAdmission {
+    binding: Vec<u8>,
+    aggregate: Option<(u64, u64)>,
+    decoded: u64,
+    entries: u64,
+    poisoned: bool,
+    cache: BTreeMap<(String, u64), Arc<DecodedArchive>>,
+    retained_rows: u64,
+}
+impl ArchiveAdmission {
+    pub(crate) fn attempt(binding: Vec<u8>) -> Self {
+        Self {
+            binding,
+            aggregate: Some((34359738368, 500000)),
+            decoded: 0,
+            entries: 0,
+            poisoned: false,
+            cache: BTreeMap::new(),
+            retained_rows: 0,
+        }
+    }
+    pub(crate) fn standalone() -> Self {
+        let mut s = Self::attempt(Vec::new());
+        s.aggregate = None;
+        s
+    }
+    #[cfg(test)]
+    pub(crate) fn for_test(binding: Vec<u8>, decoded: u64, entries: u64) -> Self {
+        let mut s = Self::attempt(binding);
+        s.aggregate = Some((decoded, entries));
+        s
+    }
+    pub(crate) fn usage(&self) -> (u64, u64) {
+        (self.decoded, self.entries)
+    }
+    #[cfg(test)]
+    pub(crate) fn decode_count(&self) -> usize {
+        self.cache.len()
+    }
+    #[cfg(test)]
+    pub(crate) fn retained_rows(&self) -> u64 {
+        self.retained_rows
+    }
+    #[cfg(test)]
+    pub(crate) fn seed_test_usage(&mut self, decoded: u64, entries: u64) {
+        self.decoded = decoded;
+        self.entries = entries;
+    }
+    pub(crate) fn finish<T>(&mut self, result: Result<T, PackageError>) -> Result<T, PackageError> {
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        if self.poisoned && result.is_ok() {
+            return Err(PackageError::invalid("archive owner poisoned"));
+        }
+        result
+    }
+    pub(crate) fn check_binding(&mut self, binding: &[u8]) -> Result<(), PackageError> {
+        let result = if !self.poisoned && self.binding == binding {
+            Ok(())
+        } else {
+            Err(PackageError::invalid(
+                "archive owner source/input/recipe binding or poison",
+            ))
+        };
+        self.finish(result)
+    }
+    fn charge(&mut self, bytes: u64, entries: u64) -> Result<(), PackageError> {
+        let max = self.aggregate.unwrap_or((u64::MAX, u64::MAX));
+        let d = self
+            .decoded
+            .checked_add(bytes)
+            .filter(|n| *n <= max.0)
+            .ok_or_else(|| PackageError::invalid("cumulative decoded archive bound"))?;
+        let e = self
+            .entries
+            .checked_add(entries)
+            .filter(|n| *n <= max.1)
+            .ok_or_else(|| PackageError::invalid("cumulative archive header bound"))?;
+        self.decoded = d;
+        self.entries = e;
+        Ok(())
+    }
+    pub(crate) fn decode(
+        &mut self,
+        raw: &[u8],
+        profile: ArchiveProfile,
+        caps: ArchiveCaps,
+    ) -> Result<Arc<DecodedArchive>, PackageError> {
+        let result = (|| {
+            if self.poisoned || raw.is_empty() || raw.len() as u64 > caps.input {
+                return Err(PackageError::invalid("poisoned/oversized acquisition"));
+            }
+            let key = (sha256(raw).to_string(), raw.len() as u64);
+            if let Some(previous) = self.cache.get(&key).cloned() {
+                if previous.raw.as_ref() != raw {
+                    return Err(PackageError::invalid("acquisition digest collision"));
+                }
+                check_archive_profile(&previous, profile, caps)?;
+                return Ok(previous);
+            }
+            let gzip = raw.starts_with(b"\x1f\x8b");
+            if profile == ArchiveProfile::Source && gzip
+                || profile == ArchiveProfile::Registry && !gzip
+            {
+                return Err(PackageError::invalid("archive compression policy"));
+            }
+            let normalized_gzip = gzip && raw.len() >= 18 && raw[2..8] == [8, 0, 0, 0, 0, 0];
+            if profile == ArchiveProfile::Tool && gzip && !normalized_gzip {
+                return Err(PackageError::invalid("normalized gzip metadata"));
+            }
+            let (nodes, decoded) = if gzip {
+                let mut decoder = flate2::bufread::GzDecoder::new(raw);
+                let value = read_acquisition(&mut decoder, self, caps)?;
+                if !decoder.into_inner().is_empty() {
+                    return Err(PackageError::invalid(
+                        "multiple gzip members/trailing compressed bytes",
+                    ));
+                }
+                value
+            } else {
+                read_acquisition(std::io::Cursor::new(raw), self, caps)?
+            };
+            let value = Arc::new(DecodedArchive {
+                raw: Arc::from(raw),
+                nodes,
+                decoded,
+                gzip,
+                normalized_gzip,
+            });
+            check_archive_profile(&value, profile, caps)?;
+            self.cache.insert(key, value.clone());
+            Ok(value)
+        })();
+        self.finish(result)
+    }
+}
+fn check_archive_profile(
+    data: &DecodedArchive,
+    profile: ArchiveProfile,
+    caps: ArchiveCaps,
+) -> Result<(), PackageError> {
+    if data.decoded > caps.decoded
+        || data.nodes.len() as u64 > caps.entries
+        || data.nodes.iter().any(|n| n.data.len() as u64 > caps.member)
+        || profile == ArchiveProfile::Source && data.gzip
+        || profile == ArchiveProfile::Registry && !data.gzip
+        || profile == ArchiveProfile::Tool && data.gzip && !data.normalized_gzip
+    {
+        return Err(PackageError::invalid(
+            "cached archive profile/limit mismatch",
+        ));
+    }
+    Ok(())
+}
+struct AcquisitionReader<'a, R> {
+    inner: R,
+    owner: &'a mut ArchiveAdmission,
+    caps: ArchiveCaps,
+    decoded: u64,
+    entries: u64,
+}
+impl<R: Read> AcquisitionReader<'_, R> {
+    fn charge_read(&mut self, n: usize) -> Result<(), PackageError> {
+        self.decoded = self
+            .decoded
+            .checked_add(n as u64)
+            .filter(|n| *n <= self.caps.decoded)
+            .ok_or_else(|| PackageError::invalid("per-archive decoded bound"))?;
+        self.owner.charge(n as u64, 0)
+    }
+    fn exact(&mut self, buf: &mut [u8]) -> Result<(), PackageError> {
+        let mut at = 0;
+        while at < buf.len() {
+            let n = self
+                .inner
+                .read(&mut buf[at..])
+                .map_err(|e| PackageError::invalid(format!("archive read: {e}")))?;
+            if n == 0 {
+                return Err(PackageError::invalid("truncated archive"));
+            }
+            self.charge_read(n)?;
+            at += n;
+        }
+        Ok(())
+    }
+    fn declared(&self, n: u64) -> Result<(), PackageError> {
+        self.decoded
+            .checked_add(n)
+            .filter(|v| *v <= self.caps.decoded)
+            .ok_or_else(|| PackageError::invalid("declared archive size bound"))?;
+        if let Some((max, _)) = self.owner.aggregate {
+            self.owner
+                .decoded
+                .checked_add(n)
+                .filter(|v| *v <= max)
+                .ok_or_else(|| PackageError::invalid("declared cumulative size bound"))?;
+        }
+        Ok(())
+    }
+}
+fn read_acquisition<R: Read>(
+    reader: R,
+    owner: &mut ArchiveAdmission,
+    caps: ArchiveCaps,
+) -> Result<(Vec<ArchiveNode>, u64), PackageError> {
+    let mut rd = AcquisitionReader {
+        inner: reader,
+        owner,
+        caps,
+        decoded: 0,
+        entries: 0,
+    };
+    let mut nodes = Vec::new();
+    loop {
+        let mut h = [0; 512];
+        rd.exact(&mut h)?;
+        if h.iter().all(|b| *b == 0) {
+            rd.exact(&mut h)?;
+            if h.iter().any(|b| *b != 0) {
+                return Err(PackageError::invalid("tar end blocks"));
+            }
+            let mut tail = [0; 65536];
+            loop {
+                let n = rd
+                    .inner
+                    .read(&mut tail)
+                    .map_err(|_| PackageError::invalid("archive trailer"))?;
+                if n == 0 {
+                    break;
+                }
+                rd.charge_read(n)?;
+                if tail[..n].iter().any(|b| *b != 0) {
+                    return Err(PackageError::invalid("hidden tar payload"));
+                }
+            }
+            if !rd.decoded.is_multiple_of(512) {
+                return Err(PackageError::invalid("tar alignment"));
+            }
+            break;
+        }
+        rd.entries = rd
+            .entries
+            .checked_add(1)
+            .filter(|n| *n <= caps.entries)
+            .ok_or_else(|| PackageError::invalid("per-archive header bound"))?;
+        rd.owner.charge(0, 1)?;
+        let sum: u64 = h
+            .iter()
+            .enumerate()
+            .map(|(i, b)| {
+                if (148..156).contains(&i) {
+                    32
+                } else {
+                    u64::from(*b)
+                }
+            })
+            .sum();
+        if octal(&h[148..156])? != sum {
+            return Err(PackageError::invalid("tar checksum"));
+        }
+        let posix = &h[257..265] == b"ustar\x0000";
+        let gnu = &h[257..265] == b"ustar  \0";
+        if !posix && !gnu
+            || posix && h[500..].iter().any(|b| *b != 0)
+            || gnu && h[345..].iter().any(|b| *b != 0)
+        {
+            return Err(PackageError::invalid("unsupported tar header/extension"));
+        }
+        let name = tar_text(&h[..100])?;
+        let prefix = if posix {
+            tar_text(&h[345..500])?
+        } else {
+            String::new()
+        };
+        let path = if prefix.is_empty() {
+            name
+        } else {
+            format!("{prefix}/{name}")
+        };
+        let size = octal(&h[124..136])?;
+        let mode = octal(&h[100..108])?;
+        let uid = octal(&h[108..116])?;
+        let gid = octal(&h[116..124])?;
+        let mtime = octal(&h[136..148])?;
+        let major = octal(&h[329..337])?;
+        let minor = octal(&h[337..345])?;
+        let link = tar_text(&h[157..257])?;
+        let uname = tar_text(&h[265..297])?;
+        let gname = tar_text(&h[297..329])?;
+        if size > caps.member || !matches!(h[156], b'0' | b'2' | b'5') {
+            return Err(PackageError::invalid("archive member size/type"));
+        }
+        let padding = (512 - size % 512) % 512;
+        rd.declared(
+            size.checked_add(padding)
+                .ok_or_else(|| PackageError::invalid("archive padding overflow"))?,
+        )?;
+        let strict_numbers = [
+            &h[100..108],
+            &h[108..116],
+            &h[116..124],
+            &h[124..136],
+            &h[136..148],
+        ]
+        .iter()
+        .all(|v| {
+            let t = std::str::from_utf8(v)
+                .unwrap_or("")
+                .trim_matches(['\0', ' ']);
+            !t.is_empty() && t.bytes().all(|b| (b'0'..=b'7').contains(&b))
+        });
+        let mut body = Vec::new();
+        let mut remaining = size;
+        let mut buf = [0; 65536];
+        while remaining > 0 {
+            let n = remaining.min(65536) as usize;
+            rd.exact(&mut buf[..n])?;
+            body.try_reserve(n)
+                .map_err(|_| PackageError::unavailable("bounded archive allocation"))?;
+            body.extend_from_slice(&buf[..n]);
+            remaining -= n as u64;
+        }
+        let mut pad = [0; 512];
+        rd.exact(&mut pad[..padding as usize])?;
+        if pad.iter().any(|b| *b != 0) {
+            return Err(PackageError::invalid("nonzero member padding"));
+        }
+        rd.owner.retained_rows = rd
+            .owner
+            .retained_rows
+            .checked_add(1)
+            .ok_or_else(|| PackageError::invalid("retained row overflow"))?;
+        nodes.push(ArchiveNode {
+            header: h,
+            path,
+            mode,
+            kind: h[156],
+            link,
+            uid,
+            gid,
+            mtime,
+            uname,
+            gname,
+            major,
+            minor,
+            posix,
+            strict_numbers,
+            data: Arc::from(body),
+        });
+    }
+    Ok((nodes, rd.decoded))
+}
 struct TarEntry {
     path: String,
     mode: u32,
     kind: u8,
     link: String,
-    data: Vec<u8>,
+    data: Arc<[u8]>,
 }
 fn octal(bytes: &[u8]) -> Result<u64, PackageError> {
     let s = std::str::from_utf8(bytes)
@@ -852,14 +1280,13 @@ fn tar_text(bytes: &[u8]) -> Result<String, PackageError> {
         .map_err(|_| PackageError::invalid("non-UTF8 tar path"))?
         .to_owned())
 }
-fn tar_entry(
-    out: &mut Vec<u8>,
+fn tar_header(
     path: &str,
     mode: u32,
     kind: u8,
     link: &str,
-    data: &[u8],
-) -> Result<(), PackageError> {
+    length: u64,
+) -> Result<[u8; 512], PackageError> {
     let mut h = [0; 512];
     let (prefix, name) = if path.len() <= 100 {
         ("", path)
@@ -877,7 +1304,7 @@ fn tar_entry(
         (100, 8, mode as u64),
         (108, 8, 0),
         (116, 8, 0),
-        (124, 12, data.len() as u64),
+        (124, 12, length),
         (136, 12, SOURCE_EPOCH),
     ] {
         let text = format!("{:0width$o}\0", value, width = width - 1);
@@ -893,167 +1320,134 @@ fn tar_entry(
     h[263..265].copy_from_slice(b"00");
     let sum: u64 = h.iter().map(|b| *b as u64).sum();
     h[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
-    out.extend_from_slice(&h);
+    Ok(h)
+}
+fn tar_entry(
+    out: &mut Vec<u8>,
+    path: &str,
+    mode: u32,
+    kind: u8,
+    link: &str,
+    data: &[u8],
+) -> Result<(), PackageError> {
+    out.extend_from_slice(&tar_header(path, mode, kind, link, data.len() as u64)?);
     out.extend_from_slice(data);
     out.resize(out.len().div_ceil(512) * 512, 0);
     Ok(())
 }
-fn read_tar(bytes: &[u8]) -> Result<Vec<TarEntry>, PackageError> {
-    read_tar_bounded(bytes, MAX_ASSET_BYTES, 10_000)
-}
-fn read_tar_bounded(
+fn read_tar_in(
     bytes: &[u8],
-    member_bytes: u64,
+    member: u64,
     members: usize,
+    owner: &mut ArchiveAdmission,
 ) -> Result<Vec<TarEntry>, PackageError> {
-    if bytes.len() as u64 > MAX_ASSET_BYTES
-        || bytes.len() < 1024
-        || !bytes.len().is_multiple_of(512)
-    {
-        return Err(PackageError::invalid("truncated/oversized tar"));
-    }
-    let mut offset = 0;
-    let mut entries = Vec::new();
-    let mut names = BTreeSet::new();
-    while offset + 512 <= bytes.len() {
-        let h = &bytes[offset..offset + 512];
-        if h.iter().all(|b| *b == 0) {
-            if bytes.len() - offset < 1024 || bytes[offset..].iter().any(|b| *b != 0) {
-                return Err(PackageError::invalid("truncated or trailing tar bytes"));
-            }
-            return Ok(entries);
-        }
-        let expected = octal(&h[148..156])?;
-        let sum: u64 = h
-            .iter()
-            .enumerate()
-            .map(|(i, b)| {
-                if (148..156).contains(&i) {
-                    b' ' as u64
-                } else {
-                    *b as u64
-                }
-            })
-            .sum();
-        if expected != sum || &h[257..263] != b"ustar\0" || &h[263..265] != b"00" {
-            return Err(PackageError::invalid("tar checksum/format mismatch"));
-        }
-        let prefix = tar_text(&h[345..500])?;
-        let name = tar_text(&h[..100])?;
-        let path = if prefix.is_empty() {
-            name
-        } else {
-            format!("{prefix}/{name}")
-        };
-        let relative = RelativePath::new(&path)?;
-        if path != SOURCE_MANIFEST {
-            check_input_path(&relative)?;
-        }
-        if entries.last().is_some_and(|e: &TarEntry| e.path >= path) {
-            return Err(PackageError::invalid(
-                "normalized tar paths are not in lexical order",
-            ));
-        }
-        if !names.insert(path.clone()) {
-            return Err(PackageError::invalid("duplicate archive path"));
-        }
-        let kind = h[156];
-        if !matches!(kind, b'0' | b'2') {
-            return Err(PackageError::invalid(
-                "unsupported archive node: links/devices/special entries refuse",
-            ));
-        }
-        let link = tar_text(&h[157..257])?;
-        let length = usize::try_from(octal(&h[124..136])?)
-            .map_err(|_| PackageError::invalid("tar length overflow"))?;
-        if length as u64 > member_bytes || entries.len() >= members {
-            return Err(PackageError::invalid(
-                "normalized tar member-size/count limit",
-            ));
-        }
-        let mode = octal(&h[100..108])? as u32;
-        if !matches!(mode, 0o644 | 0o755 | 0o777)
-            || (kind == b'2' && length != 0)
-            || (kind == b'0' && !link.is_empty())
-            || octal(&h[108..116])? != 0
-            || octal(&h[116..124])? != 0
-            || octal(&h[136..148])? != SOURCE_EPOCH
-        {
-            return Err(PackageError::invalid("non-normalized archive entry"));
-        }
-        if kind == b'2' {
-            link_destination(&path, &link)?;
-        }
-        let start = offset + 512;
-        let end = start
-            .checked_add(length)
-            .ok_or_else(|| PackageError::invalid("tar length overflow"))?;
-        let next = end
-            .checked_add(511)
-            .map(|n| n / 512 * 512)
-            .ok_or_else(|| PackageError::invalid("tar length overflow"))?;
-        if next > bytes.len() || bytes[end..next].iter().any(|b| *b != 0) {
-            return Err(PackageError::invalid("truncated tar content/padding"));
-        }
-        let mut normalized = Vec::new();
-        tar_entry(
-            &mut normalized,
-            &path,
-            mode,
-            kind,
-            &link,
-            &bytes[start..end],
+    let result = (|| {
+        let data = owner.decode(
+            bytes,
+            ArchiveProfile::Source,
+            ArchiveCaps {
+                member,
+                entries: members as u64,
+                ..ArchiveCaps::SOURCE
+            },
         )?;
-        if normalized != bytes[offset..next] {
-            return Err(PackageError::invalid("unrecorded normalized tar metadata"));
+        let mut entries = Vec::new();
+        let mut last = "";
+        for node in &data.nodes {
+            let path = &node.path;
+            let relative = RelativePath::new(path)?;
+            if path != SOURCE_MANIFEST {
+                check_input_path(&relative)?;
+            }
+            if path.as_str() <= last {
+                return Err(PackageError::invalid(
+                    "normalized tar lexical order/duplicates",
+                ));
+            }
+            last = path;
+            if !matches!(node.kind, b'0' | b'2')
+                || node.header
+                    != tar_header(
+                        path,
+                        u32::try_from(node.mode).map_err(|_| PackageError::invalid("tar mode"))?,
+                        node.kind,
+                        &node.link,
+                        node.data.len() as u64,
+                    )?
+            {
+                return Err(PackageError::invalid("unrecorded normalized tar metadata"));
+            }
+            if !matches!(node.mode, 0o644 | 0o755 | 0o777)
+                || node.kind == b'2' && !node.data.is_empty()
+                || node.kind == b'0' && !node.link.is_empty()
+            {
+                return Err(PackageError::invalid("normalized archive node"));
+            }
+            if node.kind == b'2' {
+                link_destination(path, &node.link)?;
+            }
+            entries.push(TarEntry {
+                path: path.clone(),
+                mode: node.mode as u32,
+                kind: node.kind,
+                link: node.link.clone(),
+                data: node.data.clone(),
+            });
         }
-        entries.push(TarEntry {
-            path,
-            mode,
-            kind,
-            link,
-            data: bytes[start..end].to_vec(),
-        });
-        offset = next;
-    }
-    Err(PackageError::invalid("missing tar terminator"))
+        Ok(entries)
+    })();
+    owner.finish(result)
 }
+#[expect(
+    dead_code,
+    reason = "Preserve existing standalone API; executor uses the shared-owner variant."
+)]
 pub(crate) fn validate_source_archive(bytes: &[u8]) -> Result<(), PackageError> {
-    let entries = read_tar(bytes)?;
-    if entries.is_empty() {
-        return Err(PackageError::invalid("empty source/dependency archive"));
-    }
-    let nodes: Vec<_> = entries
-        .iter()
-        .map(|e| SourceNode {
-            path: RelativePath::new(&e.path).expect("checked tar path"),
-            mode: if e.kind == b'2' {
-                0o120000
-            } else {
-                0o100000 | e.mode
-            },
-            sha256: if e.kind == b'2' {
-                sha256(e.link.as_bytes())
-            } else {
-                sha256(&e.data)
-            },
-            bytes: if e.kind == b'2' {
-                e.link.len() as u64
-            } else {
-                e.data.len() as u64
-            },
-            node: if e.kind == b'2' {
-                SourceNodeKind::Symlink {
-                    target: e.link.clone(),
-                }
-            } else {
-                SourceNodeKind::File
-            },
-        })
-        .collect();
-    let mut sorted = nodes;
-    sorted.sort_by(|a, b| a.path.as_str().cmp(b.path.as_str()));
-    validate_nodes(&sorted)
+    let mut owner = ArchiveAdmission::standalone();
+    validate_source_archive_in(bytes, &mut owner)
+}
+pub(crate) fn validate_source_archive_in(
+    bytes: &[u8],
+    owner: &mut ArchiveAdmission,
+) -> Result<(), PackageError> {
+    let result = (|| {
+        let entries = read_tar_in(bytes, MAX_ASSET_BYTES, 10000, owner)?;
+        if entries.is_empty() {
+            return Err(PackageError::invalid("empty source/dependency archive"));
+        }
+        let nodes: Vec<_> = entries
+            .iter()
+            .map(|e| SourceNode {
+                path: RelativePath::new(&e.path).expect("checked tar path"),
+                mode: if e.kind == b'2' {
+                    0o120000
+                } else {
+                    0o100000 | e.mode
+                },
+                sha256: if e.kind == b'2' {
+                    sha256(e.link.as_bytes())
+                } else {
+                    sha256(&e.data)
+                },
+                bytes: if e.kind == b'2' {
+                    e.link.len() as u64
+                } else {
+                    e.data.len() as u64
+                },
+                node: if e.kind == b'2' {
+                    SourceNodeKind::Symlink {
+                        target: e.link.clone(),
+                    }
+                } else {
+                    SourceNodeKind::File
+                },
+            })
+            .collect();
+        let mut sorted = nodes;
+        sorted.sort_by(|a, b| a.path.as_str().cmp(b.path.as_str()));
+        validate_nodes(&sorted)
+    })();
+    owner.finish(result)
 }
 
 /// Registry-domain limits. Callers may tighten, never raise, production ceilings.
@@ -1090,150 +1484,53 @@ impl RegistryArchiveLimits {
     }
 }
 
+type RegistryMembers = BTreeMap<String, (u32, Arc<[u8]>)>;
+
 // Only ordinary registry members in the supported GNU/POSIX layouts are
 // accepted. GNU extension areas are never guessed to be POSIX fields.
-fn registry_members<'a>(
-    bytes: &'a [u8],
+fn registry_members_in(
+    data: &DecodedArchive,
     root: &str,
     limits: RegistryArchiveLimits,
-) -> Result<BTreeMap<String, (u32, &'a [u8])>, PackageError> {
-    if bytes.len() < 1024
-        || !bytes.len().is_multiple_of(512)
-        || bytes.len() as u64 > limits.expanded_bytes
-    {
-        return Err(PackageError::invalid(
-            "truncated/oversized original registry tar",
-        ));
-    }
+) -> Result<RegistryMembers, PackageError> {
     let mut members = BTreeMap::new();
-    let mut offset: usize = 0;
-    loop {
-        let end = offset
-            .checked_add(512)
-            .filter(|end| *end <= bytes.len())
-            .ok_or_else(|| PackageError::invalid("missing original tar terminator"))?;
-        let h = &bytes[offset..end];
-        if h.iter().all(|b| *b == 0) {
-            if bytes.len() - offset < 1024 || bytes[offset..].iter().any(|b| *b != 0) {
-                return Err(PackageError::invalid(
-                    "truncated original tar end markers or hidden payload",
-                ));
-            }
-            break;
-        }
-        if members.len() >= limits.members {
-            return Err(PackageError::invalid(
-                "original registry member-count limit",
-            ));
-        }
-        let expected = octal(&h[148..156])?;
-        let sum: u64 = h
-            .iter()
-            .enumerate()
-            .map(|(i, b)| {
-                if (148..156).contains(&i) {
-                    b' ' as u64
-                } else {
-                    *b as u64
-                }
-            })
-            .sum();
-        if expected != sum {
-            return Err(PackageError::invalid("original tar checksum mismatch"));
-        }
-        let magic = &h[257..265];
-        let name = tar_text(&h[..100])?;
-        let full = if magic == b"ustar  \0" {
-            if h[345..512].iter().any(|b| *b != 0) {
-                return Err(PackageError::invalid("unsupported GNU extension area"));
-            }
-            name
-        } else if magic == b"ustar\x0000" {
-            if h[500..512].iter().any(|b| *b != 0) {
-                return Err(PackageError::invalid("unsupported POSIX header padding"));
-            }
-            let prefix = tar_text(&h[345..500])?;
-            if prefix.is_empty() {
-                name
-            } else {
-                format!("{prefix}/{name}")
-            }
-        } else {
-            return Err(PackageError::invalid(
-                "unsupported original GNU/POSIX tar format",
-            ));
-        };
-        RelativePath::new(&full)?;
-        let path = full
+    for node in &data.nodes {
+        let relative = RelativePath::new(&node.path)?;
+        let _ = relative;
+        let path = node
+            .path
             .strip_prefix(root)
             .filter(|p| !p.is_empty())
-            .ok_or_else(|| PackageError::invalid("original tar member outside exact crate root"))?
+            .ok_or_else(|| PackageError::invalid("original tar outside exact crate root"))?
             .to_owned();
-        let relative = RelativePath::new(&path)?;
-        check_input_path(&relative)?;
-        if h[156] != b'0' || !tar_text(&h[157..257])?.is_empty() {
-            return Err(PackageError::invalid(
-                "original registry archive contains a link/special/extension node",
-            ));
-        }
-        let mode = octal(&h[100..108])?;
-        if !matches!(mode, 0o644 | 0o755) {
-            return Err(PackageError::invalid("unsupported original source mode"));
-        }
-        for field in [&h[108..116], &h[116..124], &h[136..148]] {
-            octal(field)?;
-        }
-        tar_text(&h[265..297])?;
-        tar_text(&h[297..329])?;
-        if octal(&h[329..337])? != 0 || octal(&h[337..345])? != 0 {
-            return Err(PackageError::invalid(
-                "original registry archive has device metadata",
-            ));
-        }
-        let size = octal(&h[124..136])?;
-        if size > limits.member_bytes {
-            return Err(PackageError::invalid("original registry member-size limit"));
-        }
-        let size = usize::try_from(size)
-            .map_err(|_| PackageError::invalid("original member size overflow"))?;
-        let start = end;
-        let end = start
-            .checked_add(size)
-            .filter(|end| *end <= bytes.len())
-            .ok_or_else(|| PackageError::invalid("truncated original member body"))?;
-        let next = end
-            .checked_add(511)
-            .map(|n| n / 512 * 512)
-            .filter(|next| *next <= bytes.len())
-            .ok_or_else(|| PackageError::invalid("truncated original member padding"))?;
-        if bytes[end..next].iter().any(|b| *b != 0)
+        check_input_path(&RelativePath::new(&path)?)?;
+        if node.kind != b'0'
+            || !node.link.is_empty()
+            || !matches!(node.mode, 0o644 | 0o755)
+            || node.major != 0
+            || node.minor != 0
+            || node.data.len() as u64 > limits.member_bytes
             || members
-                .insert(path, (mode as u32, &bytes[start..end]))
+                .insert(path, (node.mode as u32, node.data.clone()))
                 .is_some()
         {
             return Err(PackageError::invalid(
-                "duplicate original source path or nonzero member padding",
+                "original registry type/mode/duplicate/member",
             ));
         }
-        offset = next;
     }
     if members.is_empty() {
-        return Err(PackageError::invalid("empty original source archive"));
+        return Err(PackageError::invalid("empty original registry archive"));
     }
     for path in members.keys() {
-        let mut parent = Path::new(path).parent();
-        while let Some(p) = parent {
-            if p.to_str().is_some_and(|p| members.contains_key(p)) {
-                return Err(PackageError::invalid(
-                    "original source file-ancestor collision",
-                ));
+        for parent in Path::new(path).ancestors().skip(1) {
+            if parent.to_str().is_some_and(|p| members.contains_key(p)) {
+                return Err(PackageError::invalid("original source file ancestor"));
             }
-            parent = p.parent();
         }
     }
     Ok(members)
 }
-
 /// Compare every original gzip member's path, type, mode and bytes with the
 /// complete normalized source set. The sealer invokes this predicate itself.
 pub fn verify_registry_source(
@@ -1243,68 +1540,81 @@ pub fn verify_registry_source(
     version: &str,
     limits: RegistryArchiveLimits,
 ) -> Result<(), PackageError> {
-    limits.validate()?;
-    if original.is_empty()
-        || original.len() as u64 > limits.compressed_bytes
-        || normalized.len() as u64 > limits.expanded_bytes
-    {
-        return Err(PackageError::invalid(
-            "compressed/normalized registry source limit",
-        ));
-    }
-    if name.is_empty()
-        || version.is_empty()
-        || name.contains(['/', '\\'])
-        || version.contains(['/', '\\'])
-    {
-        return Err(PackageError::invalid("invalid registry crate identity"));
-    }
-    let root = format!("{name}-{version}/");
-    RelativePath::new(root.trim_end_matches('/'))?;
-    let mut decoder = flate2::bufread::GzDecoder::new(original);
-    let mut expanded = Vec::new();
-    let mut buffer = [0_u8; 8192];
-    loop {
-        // A nonempty read at the exact bound still validates CRC/ISIZE and EOF.
-        let count = decoder
-            .read(&mut buffer)
-            .map_err(|e| PackageError::invalid(format!("original gzip decode: {e}")))?;
-        if count == 0 {
-            break;
+    let mut owner = ArchiveAdmission::standalone();
+    verify_registry_source_in(original, normalized, name, version, limits, &mut owner)
+}
+pub(crate) fn verify_registry_source_in(
+    original: &[u8],
+    normalized: &[u8],
+    name: &str,
+    version: &str,
+    limits: RegistryArchiveLimits,
+    owner: &mut ArchiveAdmission,
+) -> Result<(), PackageError> {
+    let result = (|| {
+        limits.validate()?;
+        if name.is_empty()
+            || version.is_empty()
+            || name.contains(['/', '\\'])
+            || version.contains(['/', '\\'])
+            || normalized.len() as u64 > limits.expanded_bytes
+        {
+            return Err(PackageError::invalid("registry identity/size"));
         }
-        let next = expanded
-            .len()
-            .checked_add(count)
-            .filter(|n| *n as u64 <= limits.expanded_bytes)
-            .ok_or_else(|| PackageError::invalid("expanded registry source limit"))?;
-        expanded
-            .try_reserve_exact(next - expanded.len())
-            .map_err(|_| PackageError::unavailable("bounded source decode allocation"))?;
-        expanded.extend_from_slice(&buffer[..count]);
-    }
-    if !decoder.into_inner().is_empty() {
-        return Err(PackageError::invalid(
-            "multiple gzip members or trailing compressed bytes",
-        ));
-    }
-    let original_members = registry_members(&expanded, &root, limits)?;
-    let normalized_members = read_tar_bounded(normalized, limits.member_bytes, limits.members)?;
-    if original_members.len() != normalized_members.len() {
-        return Err(PackageError::invalid(
-            "original/normalized source member set mismatch",
-        ));
-    }
-    for member in &normalized_members {
-        let (mode, data) = original_members
-            .get(&member.path)
-            .ok_or_else(|| PackageError::invalid("unexplained normalized source member"))?;
-        if member.kind != b'0' || member.mode != *mode || member.data.as_slice() != *data {
+        let root = format!("{name}-{version}/");
+        RelativePath::new(root.trim_end_matches('/'))?;
+        let data = owner.decode(
+            original,
+            ArchiveProfile::Registry,
+            ArchiveCaps {
+                input: limits.compressed_bytes,
+                decoded: limits.expanded_bytes,
+                member: limits.member_bytes,
+                entries: limits.members as u64,
+            },
+        )?;
+        let original = registry_members_in(&data, &root, limits)?;
+        let normalized = read_tar_in(normalized, limits.member_bytes, limits.members, owner)?;
+        if original.len() != normalized.len() {
             return Err(PackageError::invalid(
-                "original/normalized source type/mode/content mismatch",
+                "original/normalized source member set",
             ));
         }
-    }
-    Ok(())
+        for member in &normalized {
+            let (mode, data) = original
+                .get(&member.path)
+                .ok_or_else(|| PackageError::invalid("unexplained normalized source member"))?;
+            if member.kind != b'0' || member.mode != *mode || member.data.as_ref() != data.as_ref()
+            {
+                return Err(PackageError::invalid(
+                    "original/normalized type/mode/content mismatch",
+                ));
+            }
+        }
+        Ok(())
+    })();
+    owner.finish(result)
+}
+type VendorMembers = Vec<(String, u32, Arc<[u8]>)>;
+
+pub(crate) fn vendor_source_in(
+    bytes: &[u8],
+    owner: &mut ArchiveAdmission,
+) -> Result<VendorMembers, PackageError> {
+    let result = (|| {
+        let entries = read_tar_in(bytes, MAX_ASSET_BYTES, 10000, owner)?;
+        entries
+            .into_iter()
+            .map(|e| {
+                if e.kind == b'0' {
+                    Ok((e.path, e.mode, e.data))
+                } else {
+                    Err(PackageError::invalid("vendor link/special node"))
+                }
+            })
+            .collect()
+    })();
+    owner.finish(result)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

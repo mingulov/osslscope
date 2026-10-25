@@ -15,9 +15,10 @@ use super::{
         BuildInputs, ContentEntry, Digest, LockIdentity, RelativePath, parse_canonical, sha256,
     },
     source::{
-        BuildRecipe, MAX_ASSET_BYTES, RegistryArchiveLimits, ReleaseConfig, SealedSource,
-        SourceAssets, SourceTree, check_input_path, closed, content, json_bytes, package_fields,
-        read_regular, validate_source_archive, verify_entry, verify_registry_source,
+        ArchiveAdmission, BuildRecipe, MAX_ASSET_BYTES, RegistryArchiveLimits, ReleaseConfig,
+        SealedSource, SourceAssets, SourceTree, check_input_path, closed, content, json_bytes,
+        package_fields, read_regular, validate_source_archive_in, verify_entry,
+        verify_registry_source_in,
     },
 };
 
@@ -346,216 +347,230 @@ impl DependencyInventory {
         tree: &SourceTree,
         recipe: &BuildRecipe,
     ) -> Result<(), PackageError> {
-        self.validate_shape()?;
-        let host = read_regular(&tree.root, &RelativePath::new("Cargo.lock")?, 1_048_576)?;
-        let bpf = read_regular(
-            &tree.root,
-            &RelativePath::new("crates/ebpf/Cargo.lock")?,
-            1_048_576,
-        )?;
-        if sha256(&host) != self.locks.host_sha256 || sha256(&bpf) != self.locks.bpf_sha256 {
-            return Err(PackageError::invalid("original host/BPF lock changed"));
-        }
-        for (bytes, group) in [(&host, &self.host), (&bpf, &self.bpf)] {
-            let rows = lock_packages(bytes)?;
-            if rows.len() != group.len() {
-                return Err(PackageError::invalid(
-                    "lock/path/registry/git closure incomplete",
-                ));
+        let mut archives = ArchiveAdmission::standalone();
+        self.verify_in(tree, recipe, &mut archives)
+    }
+    fn verify_in(
+        &self,
+        tree: &SourceTree,
+        recipe: &BuildRecipe,
+        archives: &mut ArchiveAdmission,
+    ) -> Result<(), PackageError> {
+        let result = (|| {
+            self.validate_shape()?;
+            let host = read_regular(&tree.root, &RelativePath::new("Cargo.lock")?, 1_048_576)?;
+            let bpf = read_regular(
+                &tree.root,
+                &RelativePath::new("crates/ebpf/Cargo.lock")?,
+                1_048_576,
+            )?;
+            if sha256(&host) != self.locks.host_sha256 || sha256(&bpf) != self.locks.bpf_sha256 {
+                return Err(PackageError::invalid("original host/BPF lock changed"));
             }
-            for (row, id) in rows.iter().zip(group) {
-                let component = self.component(id)?;
-                if component.name != row.name || component.version != row.version {
+            for (bytes, group) in [(&host, &self.host), (&bpf, &self.bpf)] {
+                let rows = lock_packages(bytes)?;
+                if rows.len() != group.len() {
                     return Err(PackageError::invalid(
-                        "lock package/source component mismatch",
+                        "lock/path/registry/git closure incomplete",
                     ));
                 }
-                match (&component.source, &row.source, &row.checksum) {
-                    (ComponentSource::Path { .. }, None, None) => {}
-                    (
-                        ComponentSource::Registry {
-                            location,
-                            checksum,
-                            archive,
-                            ..
-                        },
-                        Some(source),
-                        Some(sum),
-                    ) if source == location && checksum == sum && archive.sha256 == *sum => {}
-                    (
-                        ComponentSource::Git {
-                            repository,
-                            revision,
-                            ..
-                        },
-                        Some(source),
-                        None,
-                    ) if source == &format!("git+{repository}#{revision}")
-                        && revision.len() == 40
-                        && revision
-                            .bytes()
-                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) => {}
-                    _ => {
+                for (row, id) in rows.iter().zip(group) {
+                    let component = self.component(id)?;
+                    if component.name != row.name || component.version != row.version {
                         return Err(PackageError::invalid(
-                            "original locked source/checksum mismatch",
+                            "lock package/source component mismatch",
                         ));
                     }
-                }
-                let resolved = row
-                    .dependencies
-                    .iter()
-                    .map(|dependency| {
-                        let mut words = dependency.split_whitespace();
-                        let name = words.next().unwrap_or("");
-                        let version = words.next();
-                        let matches = rows
-                            .iter()
-                            .zip(group)
-                            .filter(|(r, _)| {
-                                r.name == name && version.is_none_or(|v| v == r.version)
-                            })
-                            .map(|(_, id)| id.clone())
-                            .collect::<Vec<_>>();
-                        if matches.len() != 1 {
+                    match (&component.source, &row.source, &row.checksum) {
+                        (ComponentSource::Path { .. }, None, None) => {}
+                        (
+                            ComponentSource::Registry {
+                                location,
+                                checksum,
+                                archive,
+                                ..
+                            },
+                            Some(source),
+                            Some(sum),
+                        ) if source == location && checksum == sum && archive.sha256 == *sum => {}
+                        (
+                            ComponentSource::Git {
+                                repository,
+                                revision,
+                                ..
+                            },
+                            Some(source),
+                            None,
+                        ) if source == &format!("git+{repository}#{revision}")
+                            && revision.len() == 40
+                            && revision
+                                .bytes()
+                                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) => {}
+                        _ => {
                             return Err(PackageError::invalid(
-                                "unresolved/ambiguous original lock dependency",
+                                "original locked source/checksum mismatch",
                             ));
                         }
-                        Ok(matches[0].clone())
-                    })
-                    .collect::<Result<Vec<_>, PackageError>>()?;
-                if component.dependencies != resolved {
+                    }
+                    let resolved = row
+                        .dependencies
+                        .iter()
+                        .map(|dependency| {
+                            let mut words = dependency.split_whitespace();
+                            let name = words.next().unwrap_or("");
+                            let version = words.next();
+                            let matches = rows
+                                .iter()
+                                .zip(group)
+                                .filter(|(r, _)| {
+                                    r.name == name && version.is_none_or(|v| v == r.version)
+                                })
+                                .map(|(_, id)| id.clone())
+                                .collect::<Vec<_>>();
+                            if matches.len() != 1 {
+                                return Err(PackageError::invalid(
+                                    "unresolved/ambiguous original lock dependency",
+                                ));
+                            }
+                            Ok(matches[0].clone())
+                        })
+                        .collect::<Result<Vec<_>, PackageError>>()?;
+                    if component.dependencies != resolved {
+                        return Err(PackageError::invalid(
+                            "declared dependency relationships differ from original lock",
+                        ));
+                    }
+                }
+            }
+            if self
+                .bpf_dependency_names()?
+                .iter()
+                .any(|n| n == "osslscope-ebpf-common")
+            {
+                return Err(PackageError::invalid(
+                    "old GPL3 host common enters BPF closure",
+                ));
+            }
+            for required in ["osslscope-ebpf", "osslscope-bpf-contract"] {
+                if !self.bpf_dependency_names()?.iter().any(|n| n == required) {
                     return Err(PackageError::invalid(
-                        "declared dependency relationships differ from original lock",
+                        "accepted BPF source component missing",
                     ));
                 }
             }
-        }
-        if self
-            .bpf_dependency_names()?
-            .iter()
-            .any(|n| n == "osslscope-ebpf-common")
-        {
-            return Err(PackageError::invalid(
-                "old GPL3 host common enters BPF closure",
-            ));
-        }
-        for required in ["osslscope-ebpf", "osslscope-bpf-contract"] {
-            if !self.bpf_dependency_names()?.iter().any(|n| n == required) {
+            for required in ["core", "compiler_builtins", "stdarch", "portable-simd"] {
+                if !self
+                    .build_std
+                    .iter()
+                    .any(|id| self.component(id).is_ok_and(|c| c.name == required))
+                {
+                    return Err(PackageError::invalid(format!(
+                        "missing build-std/linker/native source class {required}"
+                    )));
+                }
+            }
+            let mut used = BTreeSet::new();
+            let mut pending = self
+                .host
+                .iter()
+                .chain(&self.bpf)
+                .chain(&self.tool_sources)
+                .chain(&self.runtime)
+                .cloned()
+                .collect::<Vec<_>>();
+            while let Some(id) = pending.pop() {
+                if used.insert(id.clone()) {
+                    pending.extend(self.component(&id)?.dependencies.clone());
+                }
+            }
+            if used.len() != self.components.len() {
                 return Err(PackageError::invalid(
-                    "accepted BPF source component missing",
+                    "unreferenced source component outside admitted closures",
                 ));
             }
-        }
-        for required in ["core", "compiler_builtins", "stdarch", "portable-simd"] {
-            if !self
-                .build_std
-                .iter()
-                .any(|id| self.component(id).is_ok_and(|c| c.name == required))
-            {
-                return Err(PackageError::invalid(format!(
-                    "missing build-std/linker/native source class {required}"
-                )));
-            }
-        }
-        let mut used = BTreeSet::new();
-        let mut pending = self
-            .host
-            .iter()
-            .chain(&self.bpf)
-            .chain(&self.tool_sources)
-            .chain(&self.runtime)
-            .cloned()
-            .collect::<Vec<_>>();
-        while let Some(id) = pending.pop() {
-            if used.insert(id.clone()) {
-                pending.extend(self.component(&id)?.dependencies.clone());
-            }
-        }
-        if used.len() != self.components.len() {
-            return Err(PackageError::invalid(
-                "unreferenced source component outside admitted closures",
-            ));
-        }
-        for component in &self.components {
-            match &component.source {
-                ComponentSource::Path { manifest } => {
-                    check_input_path(manifest)?;
-                    if !tree.contains(manifest.as_str()) {
-                        return Err(PackageError::invalid(
-                            "path dependency absent from original source",
-                        ));
+            for component in &self.components {
+                match &component.source {
+                    ComponentSource::Path { manifest } => {
+                        check_input_path(manifest)?;
+                        if !tree.contains(manifest.as_str()) {
+                            return Err(PackageError::invalid(
+                                "path dependency absent from original source",
+                            ));
+                        }
+                        let actual =
+                            package_fields(&read_regular(&tree.root, manifest, 1_048_576)?)?;
+                        if actual.get("name") != Some(&component.name)
+                            || actual.get("version") != Some(&component.version)
+                            || actual.get("license") != Some(&component.terms.spdx)
+                        {
+                            return Err(PackageError::invalid(
+                                "actual path component version/terms mismatch",
+                            ));
+                        }
                     }
-                    let actual = package_fields(&read_regular(&tree.root, manifest, 1_048_576)?)?;
-                    if actual.get("name") != Some(&component.name)
-                        || actual.get("version") != Some(&component.version)
-                        || actual.get("license") != Some(&component.terms.spdx)
-                    {
-                        return Err(PackageError::invalid(
-                            "actual path component version/terms mismatch",
-                        ));
+                    ComponentSource::Registry {
+                        location,
+                        checksum,
+                        archive,
+                        corresponding_source,
+                    } => {
+                        if !location.starts_with("registry+") || archive.sha256 != *checksum {
+                            return Err(PackageError::invalid("invalid registry source identity"));
+                        }
+                        if archive.bytes > RegistryArchiveLimits::DEFAULT.compressed_bytes
+                            || corresponding_source.bytes
+                                > RegistryArchiveLimits::DEFAULT.expanded_bytes
+                        {
+                            return Err(PackageError::invalid(
+                                "registry source size limit before input open",
+                            ));
+                        }
+                        let original = verify_entry(&self.root, archive)?;
+                        let normalized = verify_entry(&self.root, corresponding_source)?;
+                        verify_registry_source_in(
+                            &original,
+                            &normalized,
+                            &component.name,
+                            &component.version,
+                            RegistryArchiveLimits::DEFAULT,
+                            archives,
+                        )?;
+                    }
+                    ComponentSource::Git {
+                        repository,
+                        revision,
+                        archive,
+                    } => {
+                        if repository.is_empty() || revision.len() != 40 {
+                            return Err(PackageError::invalid("missing git source identity"));
+                        }
+                        validate_source_archive_in(&verify_entry(&self.root, archive)?, archives)?;
+                    }
+                    ComponentSource::Native { location, archive } => {
+                        if location.is_empty() {
+                            return Err(PackageError::invalid("missing native/tool source origin"));
+                        }
+                        validate_source_archive_in(&verify_entry(&self.root, archive)?, archives)?;
                     }
                 }
-                ComponentSource::Registry {
-                    location,
-                    checksum,
-                    archive,
-                    corresponding_source,
-                } => {
-                    if !location.starts_with("registry+") || archive.sha256 != *checksum {
-                        return Err(PackageError::invalid("invalid registry source identity"));
-                    }
-                    if archive.bytes > RegistryArchiveLimits::DEFAULT.compressed_bytes
-                        || corresponding_source.bytes
-                            > RegistryArchiveLimits::DEFAULT.expanded_bytes
-                    {
-                        return Err(PackageError::invalid(
-                            "registry source size limit before input open",
-                        ));
-                    }
-                    let original = verify_entry(&self.root, archive)?;
-                    let normalized = verify_entry(&self.root, corresponding_source)?;
-                    verify_registry_source(
-                        &original,
-                        &normalized,
-                        &component.name,
-                        &component.version,
-                        RegistryArchiveLimits::DEFAULT,
-                    )?;
-                }
-                ComponentSource::Git {
-                    repository,
-                    revision,
-                    archive,
-                } => {
-                    if repository.is_empty() || revision.len() != 40 {
-                        return Err(PackageError::invalid("missing git source identity"));
-                    }
-                    validate_source_archive(&verify_entry(&self.root, archive)?)?;
-                }
-                ComponentSource::Native { location, archive } => {
-                    if location.is_empty() {
-                        return Err(PackageError::invalid("missing native/tool source origin"));
-                    }
-                    validate_source_archive(&verify_entry(&self.root, archive)?)?;
+                for entry in component
+                    .terms
+                    .license_files
+                    .iter()
+                    .chain(&component.terms.notice_files)
+                    .chain(std::iter::once(&component.terms.source_availability))
+                {
+                    verify_entry(&self.root, entry)?;
                 }
             }
-            for entry in component
-                .terms
-                .license_files
-                .iter()
-                .chain(&component.terms.notice_files)
-                .chain(std::iter::once(&component.terms.source_availability))
-            {
-                verify_entry(&self.root, entry)?;
+            for resource in &recipe.resources {
+                if !used.contains(&resource.source_component) {
+                    return Err(PackageError::invalid("unbound tool corresponding source"));
+                }
             }
-        }
-        for resource in &recipe.resources {
-            if !used.contains(&resource.source_component) {
-                return Err(PackageError::invalid("unbound tool corresponding source"));
-            }
-        }
-        Ok(())
+            Ok(())
+        })();
+        archives.finish(result)
     }
     fn entries(&self) -> Vec<ContentEntry> {
         let mut entries = Vec::new();
@@ -802,101 +817,113 @@ fn source_sbom(tree: &SourceTree, deps: &DependencyInventory) -> Result<Vec<u8>,
 }
 
 pub fn verify_closure(sealed: &SealedSource) -> Result<(), PackageError> {
-    sealed.tree.verify()?;
-    sealed.config.verify(&sealed.tree)?;
-    let recipe_bytes = read_regular(
-        &sealed.tree.root,
-        &sealed.config.selected().builder,
-        1_048_576,
-    )?;
-    if recipe_bytes != sealed.recipe_bytes {
-        return Err(PackageError::invalid(
-            "original selected builder recipe changed",
-        ));
-    }
-    sealed
-        .recipe
-        .verify(&sealed.config, &sealed.inputs.tools, &sealed.dependencies)?;
-    sealed.dependencies.verify(&sealed.tree, &sealed.recipe)?;
-    for entry in &sealed.required_inputs {
-        let bytes = verify_entry(&sealed.dependencies.root, entry)?;
-        if sealed.asset_bytes(entry)? != bytes {
+    let mut archives = ArchiveAdmission::standalone();
+    verify_closure_in(sealed, &mut archives)
+}
+pub(crate) fn verify_closure_in(
+    sealed: &SealedSource,
+    archives: &mut ArchiveAdmission,
+) -> Result<(), PackageError> {
+    let result = (|| {
+        sealed.tree.verify()?;
+        sealed.config.verify(&sealed.tree)?;
+        let recipe_bytes = read_regular(
+            &sealed.tree.root,
+            &sealed.config.selected().builder,
+            1_048_576,
+        )?;
+        if recipe_bytes != sealed.recipe_bytes {
             return Err(PackageError::invalid(
-                "required source bytes differ from retained asset",
+                "original selected builder recipe changed",
             ));
         }
-    }
-    let inputs: BuildInputs = parse_canonical(&sealed.input_bytes)?;
-    if inputs != sealed.inputs
-        || inputs.source != sealed.original_source
-        || inputs.source != *sealed.tree.identity()
-        || inputs.locks != sealed.locks
-        || inputs.locks != sealed.dependencies.locks
-        || inputs.recipe.recipe_sha256 != sha256(&recipe_bytes)
-        || inputs.recipe.config_sha256 != sealed.config.release_toml_sha256
-        || inputs.product_version != sealed.config.product_version
-        || inputs.package_epoch != 1
-        || inputs.package_revision != 1
-        || inputs.source_epoch != sealed.config.source_epoch
-        || inputs.host_profile != sealed.recipe.host_profile
-        || inputs.jobs != 2
-        || inputs.argv != sealed.recipe.argv
-        || inputs.environment != sealed.recipe.environment
-        || inputs.offline_inventory_sha256 != sealed.assets.offline_inventory.sha256
-    {
-        return Err(PackageError::invalid(
-            "sealed BuildInputs/source/config/recipe mismatch",
-        ));
-    }
-    for entry in std::iter::once(&sealed.assets.source_archive)
-        .chain(&sealed.assets.dependency_archives)
-        .chain(&sealed.assets.tool_source_archives)
-        .chain(&sealed.assets.tool_archives)
-        .chain([
-            &sealed.assets.offline_inventory,
-            &sealed.assets.notices,
-            &sealed.assets.license_index,
-            &sealed.assets.sbom,
-            &sealed.assets.source_availability,
-        ])
-        .chain(&sealed.assets.license_texts)
-    {
-        sealed.asset_bytes(entry)?;
-    }
-    let assets = &sealed.assets;
-    let groups = AssetGroups {
-        source_archive: &assets.source_archive,
-        dependency_archives: &assets.dependency_archives,
-        tool_source_archives: &assets.tool_source_archives,
-        tool_archives: &assets.tool_archives,
-        notices: &assets.notices,
-        license_index: &assets.license_index,
-        license_texts: &assets.license_texts,
-        sbom: &assets.sbom,
-        source_availability: &assets.source_availability,
-    };
-    let expected = offline_bytes(
-        &sealed.tree,
-        &sealed.config,
-        &sealed.dependencies,
-        &sealed.recipe,
-        &recipe_bytes,
-        &groups,
-        &sealed.retained,
-    )?;
-    if expected != sealed.asset_bytes(&sealed.assets.offline_inventory)? {
-        return Err(PackageError::invalid(
-            "detached inventory differs from retained source/tool/legal closure",
-        ));
-    }
-    // Enforce the same closed, bounded JSON decoder on generated detached records.
-    super::records::decode_closed_json(&expected)?;
-    let source = sealed.asset_bytes(&sealed.assets.source_archive)?;
-    sealed.tree.verify_archive(source)?;
-    if source.len() as u64 > MAX_ASSET_BYTES {
-        return Err(PackageError::invalid("source archive exceeds bound"));
-    }
-    Ok(())
+        sealed
+            .recipe
+            .verify(&sealed.config, &sealed.inputs.tools, &sealed.dependencies)?;
+        sealed
+            .dependencies
+            .verify_in(&sealed.tree, &sealed.recipe, archives)?;
+        for entry in &sealed.required_inputs {
+            let bytes = verify_entry(&sealed.dependencies.root, entry)?;
+            if sealed.asset_bytes(entry)? != bytes {
+                return Err(PackageError::invalid(
+                    "required source bytes differ from retained asset",
+                ));
+            }
+        }
+        let inputs: BuildInputs = parse_canonical(&sealed.input_bytes)?;
+        if inputs != sealed.inputs
+            || inputs.source != sealed.original_source
+            || inputs.source != *sealed.tree.identity()
+            || inputs.locks != sealed.locks
+            || inputs.locks != sealed.dependencies.locks
+            || inputs.recipe.recipe_sha256 != sha256(&recipe_bytes)
+            || inputs.recipe.config_sha256 != sealed.config.release_toml_sha256
+            || inputs.product_version != sealed.config.product_version
+            || inputs.package_epoch != 1
+            || inputs.package_revision != 1
+            || inputs.source_epoch != sealed.config.source_epoch
+            || inputs.host_profile != sealed.recipe.host_profile
+            || inputs.jobs != 2
+            || inputs.argv != sealed.recipe.argv
+            || inputs.environment != sealed.recipe.environment
+            || inputs.offline_inventory_sha256 != sealed.assets.offline_inventory.sha256
+        {
+            return Err(PackageError::invalid(
+                "sealed BuildInputs/source/config/recipe mismatch",
+            ));
+        }
+        for entry in std::iter::once(&sealed.assets.source_archive)
+            .chain(&sealed.assets.dependency_archives)
+            .chain(&sealed.assets.tool_source_archives)
+            .chain(&sealed.assets.tool_archives)
+            .chain([
+                &sealed.assets.offline_inventory,
+                &sealed.assets.notices,
+                &sealed.assets.license_index,
+                &sealed.assets.sbom,
+                &sealed.assets.source_availability,
+            ])
+            .chain(&sealed.assets.license_texts)
+        {
+            sealed.asset_bytes(entry)?;
+        }
+        let assets = &sealed.assets;
+        let groups = AssetGroups {
+            source_archive: &assets.source_archive,
+            dependency_archives: &assets.dependency_archives,
+            tool_source_archives: &assets.tool_source_archives,
+            tool_archives: &assets.tool_archives,
+            notices: &assets.notices,
+            license_index: &assets.license_index,
+            license_texts: &assets.license_texts,
+            sbom: &assets.sbom,
+            source_availability: &assets.source_availability,
+        };
+        let expected = offline_bytes(
+            &sealed.tree,
+            &sealed.config,
+            &sealed.dependencies,
+            &sealed.recipe,
+            &recipe_bytes,
+            &groups,
+            &sealed.retained,
+        )?;
+        if expected != sealed.asset_bytes(&sealed.assets.offline_inventory)? {
+            return Err(PackageError::invalid(
+                "detached inventory differs from retained source/tool/legal closure",
+            ));
+        }
+        // Enforce the same closed, bounded JSON decoder on generated detached records.
+        super::records::decode_closed_json(&expected)?;
+        let source = sealed.asset_bytes(&sealed.assets.source_archive)?;
+        sealed.tree.verify_archive_in(source, archives)?;
+        if source.len() as u64 > MAX_ASSET_BYTES {
+            return Err(PackageError::invalid("source archive exceeds bound"));
+        }
+        Ok(())
+    })();
+    archives.finish(result)
 }
 
 #[cfg(test)]
