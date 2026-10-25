@@ -5357,6 +5357,30 @@ impl std::ops::DerefMut for PreparedDiscovery {
     }
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static OWNED_PIN_STOP: std::cell::RefCell<Option<Box<dyn FnOnce(&crate::pin::TargetPin)>>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+pub(crate) fn with_owned_pin_stop<R>(
+    observe: impl FnOnce(&crate::pin::TargetPin) + 'static,
+    run: impl FnOnce() -> R,
+) -> R {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            OWNED_PIN_STOP.with(|slot| {
+                slot.borrow_mut().take();
+            });
+        }
+    }
+    OWNED_PIN_STOP.with(|slot| {
+        assert!(slot.borrow().is_none());
+        *slot.borrow_mut() = Some(Box::new(observe));
+    });
+    let _reset = Reset;
+    run()
+}
 impl DiscoverySession {
     /// Attach a discovery session to `pid`: pin, load, populate
     /// classifiers, install dispatch anchors and (when configured)
@@ -5367,6 +5391,7 @@ impl DiscoverySession {
         Self::attach_with_links(cfg, pid, DiscoveryLinkStore::default())
     }
 
+    #[cfg(test)]
     pub(crate) fn prepare_controlled(
         cfg: &DiscoveryConfig,
         pid: u32,
@@ -5381,21 +5406,71 @@ impl DiscoverySession {
             })
     }
 
+    pub(crate) fn prepare_owned_controlled(
+        cfg: &DiscoveryConfig,
+        handoff: crate::pin::OriginalGroupHandoff,
+        control: &SetupControl,
+        links: &SetupLinks,
+    ) -> Result<PreparedDiscovery, SetupFailure> {
+        handoff.validate(links, control)?;
+        let pid = handoff.pid();
+        Self::attach_with_acquisition(
+            cfg,
+            pid,
+            DiscoveryLinkStore::preparing(links, control),
+            Some(handoff),
+        )
+        .map(|session| PreparedDiscovery { session })
+        .map_err(|error| SetupFailure::from_error(crate::capture::BoundaryStage::Discovery, error))
+    }
+
     fn attach_with_links(
         cfg: &DiscoveryConfig,
         pid: u32,
+        links: DiscoveryLinkStore,
+    ) -> anyhow::Result<Self> {
+        Self::attach_with_acquisition(cfg, pid, links, None)
+    }
+    fn attach_with_acquisition(
+        cfg: &DiscoveryConfig,
+        pid: u32,
         mut links: DiscoveryLinkStore,
+        original: Option<crate::pin::OriginalGroupHandoff>,
     ) -> anyhow::Result<Self> {
         links.check()?;
         let _temporary = links.temporary(2)?;
         let nz = NonZeroU32::new(pid).ok_or_else(|| anyhow!("pid must be non-zero"))?;
         // Pin FIRST: every later /proc/<pid> read and every
         // pid-scoped attach is verified against this identity.
-        let pinned = match links.setup_links() {
-            Some(setup) => crate::pin::pin_controlled(pid, setup),
-            None => crate::pin::pin(pid),
+        #[cfg(test)]
+        let owned = original.is_some();
+        let pinned = match original {
+            Some(handoff) => {
+                let setup = links
+                    .setup_links()
+                    .ok_or_else(|| anyhow!("owned pin missing setup"))?;
+                let control = setup
+                    .control_for_effect()
+                    .ok_or_else(|| anyhow!("owned pin missing canonical control"))?;
+                crate::pin::TargetPin::from_original_controlled(handoff, &control, setup)
+            }
+            None => match links.setup_links() {
+                Some(setup) => crate::pin::pin_controlled(pid, setup),
+                None => crate::pin::pin(pid),
+            },
         };
         let pin = links.resource(links.retain_result(pinned)?);
+        #[cfg(test)]
+        if owned && let Some(stop) = OWNED_PIN_STOP.with(|slot| slot.borrow_mut().take()) {
+            stop(&pin);
+            return Err(crate::capture_setup::SetupFailure::io(
+                crate::capture::BoundaryStage::Discovery,
+                &std::io::Error::from_raw_os_error(libc::ECANCELED),
+                "test stopped after actual original target pin",
+            )
+            .into());
+        }
+
         if let Some(marker) = &cfg.cmdline_marker {
             let _read_temporary = links.temporary(1)?;
             let cmdline = std::fs::read(format!("/proc/{pid}/cmdline"))?;

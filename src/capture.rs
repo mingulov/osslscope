@@ -1955,6 +1955,30 @@ fn watermark_burst(
     (out, shortfall)
 }
 
+// Host compatibility check of the actual watermark helper; no transport witness.
+#[cfg(test)]
+pub(crate) fn original_group_test_watermark(
+    permit: &crate::count_owner::CountForkPermit<'_>,
+) -> bool {
+    let mut affinity: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    if unsafe { libc::sched_getaffinity(0, std::mem::size_of_val(&affinity), &mut affinity) } != 0 {
+        return false;
+    }
+    let Some(cpu) =
+        (0..libc::CPU_SETSIZE as usize).find(|&cpu| unsafe { libc::CPU_ISSET(cpu, &affinity) })
+    else {
+        return false;
+    };
+    let (children, shortfall) = watermark_burst(&[cpu as u32], permit);
+    reap_sync_children(&children);
+    !shortfall
+        && children.len() == 1
+        && children.iter().all(|(pid, _)| {
+            (unsafe { libc::waitpid(*pid as i32, std::ptr::null_mut(), libc::WNOHANG) }) == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)
+        })
+}
+
 /// Graceful reap window for watermark children (R20-fix round
 /// 4, NEW-1): helpers exit immediately, so this bound is generous
 /// (normal reaps land on the first pass); a helper stopped before
@@ -10064,6 +10088,7 @@ impl<D, B: CountBackend, L> PublicationWindow<'_, D, B, L> {
 }
 
 pub(crate) struct OwnedSetupSource {
+    original: crate::pin::OriginalGroupHandoff,
     cfg: Config,
     info: TargetInfo,
     argv: Vec<String>,
@@ -10271,6 +10296,16 @@ fn prepare_live_owned_setup(
     };
     let result: Result<(), SetupFailure> =
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            source.original.validate(links, control)?;
+            let pid = source.original.pid();
+            if source.info.pid != pid {
+                return Err(SetupFailure::Boundary(BoundaryFailure::new(
+                    BoundaryStage::Setup,
+                    BoundaryFailureClass::InvalidInput,
+                    None,
+                    "owned metadata PID differs from original acquisition",
+                )));
+            }
             links.check(control, BoundaryStage::Setup)?;
             let table = match &source.cfg.table {
                 Some(path) => {
@@ -10323,7 +10358,7 @@ fn prepare_live_owned_setup(
                         anyhow::anyhow!("initial fork refused: {e:?}"),
                     )
                 })?;
-                LiveLifecycle::select_controlled(source.info.pid, &prefix, control, links)?
+                LiveLifecycle::select_controlled(pid, &prefix, control, links)?
             };
             let lifecycle = crate::capture_setup::SetupResource::guarded(
                 lifecycle,
@@ -10332,7 +10367,7 @@ fn prepare_live_owned_setup(
             );
             lease.close_prefix();
             links.check(control, BoundaryStage::Discovery)?;
-            let discovery = DiscoverySession::prepare_controlled(
+            let discovery = DiscoverySession::prepare_owned_controlled(
                 &crate::discovery::session::DiscoveryConfig {
                     provider: resolved.path,
                     object: source.objects.harvest.clone(),
@@ -10345,7 +10380,7 @@ fn prepare_live_owned_setup(
                         || source.cfg.force_offset.is_some(),
                     cmdline_marker: None,
                 },
-                source.info.pid,
+                source.original,
                 control,
                 links,
             )?;
@@ -10381,7 +10416,7 @@ fn prepare_live_owned_setup(
                             bytes: &t.members_bytes,
                             exe: &exe,
                             off,
-                            pid: source.info.pid,
+                            pid,
                             ctrl: &ctrl,
                         },
                         &t.members,
@@ -10396,7 +10431,7 @@ fn prepare_live_owned_setup(
                     discovery = CaptureDiscovery::Traversal(Box::new(LiveTraversalDiscovery {
                         inner: *inner,
                         backend: Some(LiveScanState::Preparing(backend)),
-                        tasks: crate::scan::registry::ProcTaskSource::new(source.info.pid),
+                        tasks: crate::scan::registry::ProcTaskSource::new(pid),
                         provenance: t.provenance.clone(),
                     }));
                     bundle.bootstrap = Some((discovery, lifecycle));
@@ -10411,7 +10446,7 @@ fn prepare_live_owned_setup(
                 crate::count_owner::CountInput {
                     object_bytes: source.count_bytes,
                     object_sha256: source.count_sha256,
-                    target_tgid: source.info.pid,
+                    target_tgid: pid,
                     fork_barrier: source.barrier,
                 },
                 control.deadline(),
@@ -10424,7 +10459,6 @@ fn prepare_live_owned_setup(
                 .bootstrap
                 .take()
                 .expect("real bootstrap ports retained");
-            let pid = source.info.pid;
             match prepare_owned_window(
                 effective,
                 source.info,
@@ -10811,7 +10845,24 @@ fn run_controlled_owned(
             ));
         }
     }
+    let original = match attempt
+        .target
+        .as_mut()
+        .expect("actual stopped custody")
+        .original_group_handoff(attempt.links.origin())
+    {
+        Ok(original) => original,
+        Err(error) => {
+            return Err(controlled_setup_failure(
+                &mut attempt,
+                SetupFailure::from_error(BoundaryStage::Setup, error),
+                &info,
+                cfg,
+            ));
+        }
+    };
     let source = OwnedSetupSource {
+        original,
         cfg: cfg.clone(),
         info: info.clone(),
         argv,
@@ -18357,112 +18408,155 @@ mod fix1_live_provider_tests {
     #[test]
     fn w079_fix1_live_explicit_and_auto_provider_fd_errno() {
         for explicit in [true, false] {
-            let control = SetupControl::new(
-                Instant::now() + Duration::from_secs(10),
-                SetupInterrupt::Owned(Arc::new(std::sync::atomic::AtomicBool::new(false))),
-            );
-            // Finally ownership exists before any child or reader is acquired.
-            let mut owner = Owner {
-                attempt: Attempt::admit(control).unwrap(),
-                reap: None,
-            };
-            let argv = vec!["/bin/sleep".to_string(), "1".to_string()];
-            let target = {
-                let _prefix = owner
-                    .attempt
-                    .barrier
-                    .prefix_permit(owner.attempt.control.deadline())
-                    .unwrap();
-                crate::target::OwnedTarget::spawn_stopped(&argv, crate::target::WorkloadDest::Null)
-                    .unwrap()
-            };
-            let pid = target.pid();
-            owner.attempt.target = Some(target);
-            owner.reap = Some(crate::target::hold_setup_reap(
-                owner.attempt.target.as_mut().unwrap(),
-            ));
-            let cfg = Config {
-                harvest_object: None,
-                count_object: None,
-                members_object: None,
-                provider: explicit.then(|| PathBuf::from("/")),
-                builtin: true,
-                table: None,
-                force_offset: None,
-                provider_enrollment: None,
-                resolved_provider: None,
-                duration: Duration::from_millis(25),
-                settle: Duration::ZERO,
-                harvest_timeout: Duration::from_secs(10),
-                grace: Duration::from_millis(100),
-                image_digest: String::new(),
-            };
-            let info = TargetInfo {
-                pid,
-                owned: true,
-                comm: String::new(),
-                cmdline: String::new(),
-                container_id: String::new(),
-                kernel_release: String::new(),
-                provider_build_id: String::new(),
-                provider_path: String::new(),
-                image_digest: String::new(),
-                acquired_ns: LiveClock.monotonic_ns(),
-                acquired_instant: Instant::now(),
-                acquired_wall: SystemTime::now(),
-            };
-            let source = OwnedSetupSource {
-                cfg,
-                info,
-                argv: vec!["/".to_string()],
-                objects: onboard::ObjectPaths {
-                    harvest: PathBuf::from("/not-reached"),
-                    count: PathBuf::from("/not-reached"),
-                },
-                traversal: None,
-                count_bytes: Arc::from([]),
-                count_sha256: [0; 32],
-                harvest_bytes: Some(Arc::from([])),
-                barrier: owner.attempt.fork_barrier.clone(),
-            };
-            owner
+            live_source_case(explicit, 0);
+        }
+    }
+    #[test]
+    fn g1_original_group_live_rejects_before_effects() {
+        for invalid in [1, 2] {
+            live_source_case(true, invalid);
+        }
+    }
+    fn live_source_case(explicit: bool, invalid: u8) {
+        let control = SetupControl::new(
+            Instant::now() + Duration::from_secs(10),
+            SetupInterrupt::Owned(Arc::new(std::sync::atomic::AtomicBool::new(false))),
+        );
+        // Finally ownership exists before any child or reader is acquired.
+        let mut owner = Owner {
+            attempt: Attempt::admit(control).unwrap(),
+            reap: None,
+        };
+        let argv = vec!["/bin/sleep".to_string(), "1".to_string()];
+        let target = {
+            let _prefix = owner
                 .attempt
-                .start(SetupRequest::Live(source, std::marker::PhantomData))
+                .barrier
+                .prefix_permit(owner.attempt.control.deadline())
                 .unwrap();
-            let failure = owner
-                .attempt
-                .wait()
-                .expect_err("real Live qualification fails on directory read");
-            let errno = match &failure {
-                SetupFailure::Boundary(f) => f.errno,
-                _ => None,
-            };
-            owner.attempt.abandon(failure);
-            let until = Instant::now() + Duration::from_secs(2);
-            while !owner.reap.as_ref().unwrap().entered.load(Ordering::Acquire)
-                && Instant::now() < until
-            {
-                std::thread::yield_now();
-            }
-            let fds = owner.attempt.links.test_fds();
-            let held = fds
-                .iter()
-                .flatten()
-                .all(|fd| unsafe { libc::fcntl(*fd, libc::F_GETFD) >= 0 });
-            let not_invoked = matches!(
-                owner.attempt.count_diagnostic(),
-                PreObservationCount::NotPrepared
-            );
-            owner.reap.as_ref().unwrap().release();
-            let joined = owner.attempt.join_cleanup_for_test();
-            let closed = fds
-                .iter()
-                .flatten()
-                .all(|fd| unsafe { libc::fcntl(*fd, libc::F_GETFD) == -1 });
-            let receipt = owner.attempt.await_receipt(Instant::now());
-            assert!(joined && held && closed && fds.iter().any(Option::is_some) && not_invoked);
+            crate::target::OwnedTarget::spawn_stopped(&argv, crate::target::WorkloadDest::Null)
+                .unwrap()
+        };
+        let pid = target.pid();
+        owner.attempt.target = Some(target);
+        owner.reap = Some(crate::target::hold_setup_reap(
+            owner.attempt.target.as_mut().unwrap(),
+        ));
+        let cfg = Config {
+            harvest_object: None,
+            count_object: None,
+            members_object: None,
+            provider: explicit.then(|| PathBuf::from("/")),
+            builtin: true,
+            table: (invalid != 0).then(|| PathBuf::from("/")),
+            force_offset: None,
+            provider_enrollment: None,
+            resolved_provider: None,
+            duration: Duration::from_millis(25),
+            settle: Duration::ZERO,
+            harvest_timeout: Duration::from_secs(10),
+            grace: Duration::from_millis(100),
+            image_digest: String::new(),
+        };
+        let info = TargetInfo {
+            pid: if invalid == 2 { pid + 1 } else { pid },
+            owned: true,
+            comm: String::new(),
+            cmdline: String::new(),
+            container_id: String::new(),
+            kernel_release: String::new(),
+            provider_build_id: String::new(),
+            provider_path: String::new(),
+            image_digest: String::new(),
+            acquired_ns: LiveClock.monotonic_ns(),
+            acquired_instant: Instant::now(),
+            acquired_wall: SystemTime::now(),
+        };
+        let origin = if invalid == 1 {
+            crate::capture_setup::SetupLinks::new().origin()
+        } else {
+            owner.attempt.links.origin()
+        };
+        let original = owner
+            .attempt
+            .target
+            .as_mut()
+            .unwrap()
+            .original_group_handoff(origin)
+            .unwrap();
+        let source = OwnedSetupSource {
+            original,
+            cfg,
+            info,
+            argv: vec!["/".to_string()],
+            objects: onboard::ObjectPaths {
+                harvest: PathBuf::from("/not-reached"),
+                count: PathBuf::from("/not-reached"),
+            },
+            traversal: None,
+            count_bytes: Arc::from([]),
+            count_sha256: [0; 32],
+            harvest_bytes: Some(Arc::from([])),
+            barrier: owner.attempt.fork_barrier.clone(),
+        };
+        owner
+            .attempt
+            .start(SetupRequest::Live(source, std::marker::PhantomData))
+            .unwrap();
+        let failure = owner
+            .attempt
+            .wait()
+            .expect_err("real Live qualification fails on directory read");
+        let (errno, class) = match &failure {
+            SetupFailure::Boundary(f) => (f.errno, Some(f.class)),
+            _ => (None, None),
+        };
+        owner.attempt.abandon(failure);
+        let until = Instant::now() + Duration::from_secs(2);
+        while !owner.reap.as_ref().unwrap().entered.load(Ordering::Acquire)
+            && Instant::now() < until
+        {
+            std::thread::yield_now();
+        }
+        let fds = owner.attempt.links.test_fds();
+        let held = fds
+            .iter()
+            .flatten()
+            .all(|fd| unsafe { libc::fcntl(*fd, libc::F_GETFD) >= 0 });
+        let not_invoked = matches!(
+            owner.attempt.count_diagnostic(),
+            PreObservationCount::NotPrepared
+        );
+        owner.reap.as_ref().unwrap().release();
+        let joined = owner.attempt.join_cleanup_for_test();
+        let closed = fds
+            .iter()
+            .flatten()
+            .all(|fd| unsafe { libc::fcntl(*fd, libc::F_GETFD) == -1 });
+        let receipt = owner.attempt.await_receipt(Instant::now());
+        assert!(joined && held && closed && not_invoked);
+        assert_eq!(receipt.child_exit, Some(137));
+        if invalid == 0 {
+            assert!(fds.iter().any(Option::is_some));
             assert_eq!(errno, Some(libc::EISDIR), "explicit={explicit}");
-            assert_eq!(receipt.child_exit, Some(137));
+        } else {
+            assert!(
+                fds.iter().all(Option::is_none),
+                "invalid source cannot acquire table/provider descriptors"
+            );
+            assert!(
+                owner.attempt.links.worker_context().is_none(),
+                "invalid source cannot read target context"
+            );
+            assert_eq!(errno, None);
+            assert_eq!(
+                class,
+                Some(if invalid == 1 {
+                    BoundaryFailureClass::Infrastructure
+                } else {
+                    BoundaryFailureClass::InvalidInput
+                })
+            );
         }
     }
 }

@@ -9,8 +9,131 @@
 //! `PARTIAL(pid-recycled)` + exit 4, never misattributed rows.
 //! `doctor` deliberately does NOT pin (diagnostic, not evidence);
 //! `run --` (P2) is immune (own child, no pid lookup).
+use crate::capture_setup::{SetupControl, SetupFailure, SetupLinks, SetupOrigin};
 use anyhow::Context as _;
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::sync::Arc;
+
+// Only the already successful owned-child acquisition enters this graph.
+// No Clone/raw-fd constructor is exposed by either ownership wrapper.
+pub(crate) struct OriginalGroupAcquisition {
+    file: Arc<OriginalGroupFile>,
+    origin: Option<SetupOrigin>,
+}
+struct OriginalGroupFile {
+    pid: u32,
+    fd: Option<OwnedFd>,
+    #[cfg(test)]
+    close_probe: Option<std::sync::Weak<OriginalCloseProbe>>,
+}
+impl Drop for OriginalGroupFile {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        let probe = self.close_probe.as_ref().and_then(std::sync::Weak::upgrade);
+        #[cfg(test)]
+        if let Some(probe) = &probe {
+            probe
+                .entered
+                .store(true, std::sync::atomic::Ordering::Release);
+            while probe.held.load(std::sync::atomic::Ordering::Acquire) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+        // Last physical owner, outside native/barrier locks. Record only after Drop returns.
+        drop(self.fd.take());
+        #[cfg(test)]
+        if let Some(probe) = probe {
+            probe
+                .closed
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+#[cfg(test)]
+pub(crate) struct OriginalCloseProbe {
+    held: std::sync::atomic::AtomicBool,
+    pub(crate) entered: std::sync::atomic::AtomicBool,
+    pub(crate) closed: std::sync::atomic::AtomicBool,
+}
+#[cfg(test)]
+impl OriginalCloseProbe {
+    pub(crate) fn release(&self) {
+        self.held.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+pub(crate) struct OriginalGroupHandoff {
+    file: Arc<OriginalGroupFile>,
+    origin: SetupOrigin,
+}
+impl OriginalGroupAcquisition {
+    pub(crate) fn acquired_child(acquired: crate::target::AcquiredChildPidfd) -> Self {
+        let (pid, fd) = acquired.into_parts();
+        Self {
+            file: Arc::new(OriginalGroupFile {
+                pid,
+                fd: Some(fd),
+                #[cfg(test)]
+                close_probe: None,
+            }),
+            origin: None,
+        }
+    }
+    pub(crate) fn handoff(&mut self, origin: SetupOrigin) -> anyhow::Result<OriginalGroupHandoff> {
+        if self.origin.is_some() {
+            anyhow::bail!("original group handoff already issued");
+        }
+        self.origin = Some(origin.clone());
+        Ok(OriginalGroupHandoff {
+            file: self.file.clone(),
+            origin,
+        })
+    }
+    #[cfg(test)]
+    pub(crate) fn hold_close(&mut self) -> Arc<OriginalCloseProbe> {
+        let probe = Arc::new(OriginalCloseProbe {
+            held: std::sync::atomic::AtomicBool::new(true),
+            entered: std::sync::atomic::AtomicBool::new(false),
+            closed: std::sync::atomic::AtomicBool::new(false),
+        });
+        Arc::get_mut(&mut self.file)
+            .expect("install before handoff")
+            .close_probe = Some(Arc::downgrade(&probe));
+        probe
+    }
+    #[cfg(test)]
+    pub(crate) fn test_identity(&self) -> (usize, i32) {
+        (Arc::as_ptr(&self.file) as usize, self.as_raw_fd())
+    }
+}
+impl AsRawFd for OriginalGroupAcquisition {
+    fn as_raw_fd(&self) -> i32 {
+        self.file
+            .fd
+            .as_ref()
+            .expect("live acquired file")
+            .as_raw_fd()
+    }
+}
+impl OriginalGroupHandoff {
+    pub(crate) fn pid(&self) -> u32 {
+        self.file.pid
+    }
+    pub(crate) fn validate(
+        &self,
+        links: &SetupLinks,
+        control: &SetupControl,
+    ) -> Result<(), SetupFailure> {
+        links.validate_origin(&self.origin, control)
+    }
+}
+#[cfg(test)]
+std::thread_local! {
+    static PIN_OPEN_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+#[cfg(test)]
+pub(crate) fn test_pin_open_attempts() -> usize {
+    PIN_OPEN_ATTEMPTS.get()
+}
 
 /// Pinned target identity: the pidfd keeps the ORIGINAL task
 /// referenced (operations fail once it exits); the starttime catches
@@ -18,7 +141,11 @@ use std::os::fd::{FromRawFd, OwnedFd};
 pub struct TargetPin {
     pid: u32,
     starttime: u64,
-    _pidfd: OwnedFd,
+    _pidfd: TargetPinFd,
+}
+enum TargetPinFd {
+    External { _fd: OwnedFd },
+    Original { _file: Arc<OriginalGroupFile> },
 }
 
 /// Pid recycle detected mid-run: the evidence is tainted and must be
@@ -84,6 +211,8 @@ fn pin_with(
     let stage = crate::capture::BoundaryStage::Discovery;
     let starttime = read_starttime(pid).with_context(|| format!("target {pid} gone"))?;
     // SAFETY: successful pidfd_open returns a new owned descriptor.
+    #[cfg(test)]
+    PIN_OPEN_ATTEMPTS.set(PIN_OPEN_ATTEMPTS.get() + 1);
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::c_int, 0) as libc::c_int };
     if fd < 0 {
         return Err(anyhow::Error::new(std::io::Error::last_os_error())
@@ -92,7 +221,9 @@ fn pin_with(
     let value = TargetPin {
         pid,
         starttime,
-        _pidfd: unsafe { OwnedFd::from_raw_fd(fd) },
+        _pidfd: TargetPinFd::External {
+            _fd: unsafe { OwnedFd::from_raw_fd(fd) },
+        },
     };
     #[cfg(test)]
     if let Some(links) = links {
@@ -135,6 +266,52 @@ pub(crate) fn pin_controlled_fault(
 }
 
 impl TargetPin {
+    pub(crate) fn from_original_controlled(
+        handoff: OriginalGroupHandoff,
+        control: &SetupControl,
+        links: &SetupLinks,
+    ) -> anyhow::Result<Self> {
+        handoff.validate(links, control)?;
+        let stage = crate::capture::BoundaryStage::Discovery;
+        let pid = handoff.pid();
+        let starttime = links.retain_result(
+            starttime_of(pid).with_context(|| format!("target {pid} gone")),
+            stage,
+        )?;
+        let pin = crate::capture_setup::SetupResource::guarded(
+            Self {
+                pid,
+                starttime,
+                _pidfd: TargetPinFd::Original {
+                    _file: handoff.file,
+                },
+            },
+            links,
+            stage,
+        );
+        links.retain_result(
+            (|| {
+                if starttime_of(pid)? != starttime {
+                    anyhow::bail!("target {pid} recycled during pin");
+                }
+                Ok(())
+            })(),
+            stage,
+        )?;
+        links.check_owned(stage)?;
+        Ok(pin.into_inner())
+    }
+    #[cfg(test)]
+    pub(crate) fn test_identity(&self) -> (usize, i32) {
+        match &self._pidfd {
+            TargetPinFd::External { _fd } => (0, _fd.as_raw_fd()),
+            TargetPinFd::Original { _file } => (
+                Arc::as_ptr(_file) as usize,
+                _file.fd.as_ref().expect("live acquired file").as_raw_fd(),
+            ),
+        }
+    }
+
     /// Re-verify identity. `Ok` = same task; `Err(PinError)` =
     /// recycled (caller discards all evidence).
     pub fn verify(&self) -> Result<(), PinError> {

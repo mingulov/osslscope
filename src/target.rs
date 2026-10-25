@@ -98,6 +98,16 @@ enum SetupChildState {
     Ambiguous(i32),
     Released,
 }
+// Sealed successful spawn acquisition: external/reopened pins cannot mint it.
+pub(crate) struct AcquiredChildPidfd {
+    pid: u32,
+    fd: OwnedFd,
+}
+impl AcquiredChildPidfd {
+    pub(crate) fn into_parts(self) -> (u32, OwnedFd) {
+        (self.pid, self.fd)
+    }
+}
 /// Exclusive pre-release wait custody, moved out of OwnedTarget before setup
 /// cleanup can become pending. It deliberately has no blocking Drop backstop.
 /// The setup cleanup owner retains it (and its pidfd) until custody is resolved.
@@ -105,7 +115,7 @@ pub(crate) struct OwnedSetupCleanup {
     #[cfg(test)]
     reap_hold: Option<std::sync::Weak<SetupReapHold>>,
     pid: u32,
-    pidfd: OwnedFd,
+    pidfd: crate::pin::OriginalGroupAcquisition,
     initial_stop: i32,
     state: SetupChildState,
     last_errno: Option<i32>,
@@ -118,6 +128,7 @@ struct SetupSyscallFaults {
     no_event: bool,
     signal_errno: Option<i32>,
     open_errno: Option<i32>,
+    opens: usize,
     waits: usize,
     signals: usize,
 }
@@ -153,7 +164,11 @@ fn setup_waitid(
 }
 fn setup_pidfd_open(pid: u32) -> std::io::Result<OwnedFd> {
     #[cfg(test)]
-    if let Some(errno) = SETUP_SYSCALL_FAULTS.with(|cell| cell.borrow_mut().open_errno.take()) {
+    if let Some(errno) = SETUP_SYSCALL_FAULTS.with(|cell| {
+        let mut faults = cell.borrow_mut();
+        faults.opens += 1;
+        faults.open_errno.take()
+    }) {
         return Err(std::io::Error::from_raw_os_error(errno));
     }
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
@@ -163,7 +178,11 @@ fn setup_pidfd_open(pid: u32) -> std::io::Result<OwnedFd> {
         Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) })
     }
 }
-fn setup_pidfd_signal(fd: &OwnedFd, signal: i32) -> std::io::Result<()> {
+#[cfg(test)]
+pub(crate) fn test_setup_open_attempts() -> usize {
+    SETUP_SYSCALL_FAULTS.with(|cell| cell.borrow().opens)
+}
+fn setup_pidfd_signal(fd: &impl std::os::fd::AsRawFd, signal: i32) -> std::io::Result<()> {
     #[cfg(test)]
     if let Some(errno) = SETUP_SYSCALL_FAULTS.with(|cell| {
         let mut faults = cell.borrow_mut();
@@ -2199,7 +2218,12 @@ impl OwnedTarget {
                         #[cfg(test)]
                         reap_hold: None,
                         pid,
-                        pidfd: guard.pidfd.take().expect("guard retained pidfd"),
+                        pidfd: crate::pin::OriginalGroupAcquisition::acquired_child(
+                            AcquiredChildPidfd {
+                                pid,
+                                fd: guard.pidfd.take().expect("guard retained pidfd"),
+                            },
+                        ),
                         initial_stop,
                         state: SetupChildState::Held,
                         last_errno: None,
@@ -2344,6 +2368,39 @@ impl OwnedTarget {
                 }
             }
         }
+    }
+
+    pub(crate) fn original_group_handoff(
+        &mut self,
+        origin: crate::capture_setup::SetupOrigin,
+    ) -> anyhow::Result<crate::pin::OriginalGroupHandoff> {
+        if self.state != CustodyState::Stopped {
+            anyhow::bail!("original group handoff requires stopped child custody");
+        }
+        let child = self
+            .setup
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("missing child custody"))?;
+        if child.state != SetupChildState::Held {
+            anyhow::bail!("original group handoff requires retained stop");
+        }
+        child.pidfd.handoff(origin)
+    }
+    #[cfg(test)]
+    pub(crate) fn hold_original_close(&mut self) -> Arc<crate::pin::OriginalCloseProbe> {
+        self.setup
+            .as_mut()
+            .expect("retained child")
+            .pidfd
+            .hold_close()
+    }
+    #[cfg(test)]
+    pub(crate) fn test_original_identity(&self) -> (usize, i32) {
+        self.setup
+            .as_ref()
+            .expect("retained child")
+            .pidfd
+            .test_identity()
     }
 
     /// Transfer exact pre-release child custody without running the old blocking

@@ -200,6 +200,14 @@ impl std::ops::Deref for NativeCore {
 // This is the one native custody mutex; no separate Ready/acceptance protocol.
 #[derive(Clone)]
 pub(crate) struct SetupLinks(Arc<NativeCore>);
+// Weak identity of the existing native allocation; no readiness authority.
+#[derive(Clone)]
+pub(crate) struct SetupOrigin(std::sync::Weak<NativeCore>);
+impl SetupOrigin {
+    pub(crate) fn matches(&self, links: &SetupLinks) -> bool {
+        std::sync::Weak::ptr_eq(&self.0, &Arc::downgrade(&links.0))
+    }
+}
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Publication {
     Running,
@@ -293,6 +301,35 @@ impl SetupWeak {
     }
 }
 impl SetupLinks {
+    pub(crate) fn origin(&self) -> SetupOrigin {
+        SetupOrigin(Arc::downgrade(&self.0))
+    }
+    pub(crate) fn validate_origin(
+        &self,
+        origin: &SetupOrigin,
+        control: &SetupControl,
+    ) -> Result<(), SetupFailure> {
+        let matches = origin.matches(self) && {
+            let state = locked(&self.0);
+            state.control.as_ref().is_some_and(|canonical| {
+                canonical.deadline == control.deadline
+                    && Arc::ptr_eq(&canonical.abandoned, &control.abandoned)
+                    && Arc::ptr_eq(&canonical.stage, &control.stage)
+                    && Arc::ptr_eq(&canonical.native, &control.native)
+                    && canonical
+                        .native
+                        .get()
+                        .is_some_and(|bound| std::sync::Weak::ptr_eq(bound, &origin.0))
+            })
+        };
+        if !matches {
+            return Err(infrastructure(
+                "original group setup origin/control mismatch",
+            ));
+        }
+        self.check(control, BoundaryStage::Discovery)
+    }
+
     fn commit_runtime(&self, _: &crate::capture::ReleaseCommit) {
         self.0.runtime_committed.store(true, Ordering::Release);
     }
@@ -1603,8 +1640,8 @@ fn cleanup_owned<D, B, L>(
     }
     let native = links.abandon();
     drop(native);
-    // This is an actual close-return acknowledgement. Worker-local resources
-    // cannot dispose ahead of the shared link buckets on abandonment.
+    // Native bucket destruction has returned. This permits worker-local disposal;
+    // it does not acknowledge closure of the child/session acquisition.
     locked(&links.0).native_disposed = true;
     // The exact worker may still be held in a syscall. Custody is already public.
     if let Some(worker) = locked(worker).take() {
@@ -1651,7 +1688,12 @@ fn cleanup_owned<D, B, L>(
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
+    // Count acknowledgement/task disposal and the joined worker precede the
+    // cleanup owner's final acquired-file Drop. Never close under native locks.
+    drop(child.take());
     let _ = control;
+    // Count admission may already have consumed setup; no completion is claimed
+    // in that case. Otherwise retirement follows the actual final Drop return.
     let _ = barrier.complete_abort();
 }
 
@@ -1894,6 +1936,9 @@ mod app_tests {
         ReaderError,
         RecoverableReaderError,
         CountPreflight(crate::count_owner::W079AppPrepareHold),
+        OriginalPin,
+        OriginalDiscovery,
+        OriginalTerminal,
     }
     pub(crate) struct Gate {
         entered: AtomicBool,
@@ -1930,6 +1975,9 @@ mod app_tests {
         }
     }
     struct Discovery {
+        original: Option<crate::pin::OriginalGroupHandoff>,
+        original_pin: Option<SetupResource<crate::pin::TargetPin>>,
+        original_observation: Arc<Mutex<Option<((usize, i32), usize)>>>,
         events: Option<crate::loader::Events>,
         pid: u32,
         hold: Hold,
@@ -1950,6 +1998,54 @@ mod app_tests {
     }
     impl DiscoveryPort for Discovery {
         fn poll(&mut self, _: PollBudget) -> anyhow::Result<DiscoveryDelta> {
+            if let Some(handoff) = self.original.take() {
+                let before = crate::pin::test_pin_open_attempts();
+                if self.hold == Hold::OriginalDiscovery {
+                    let observed = self.original_observation.clone();
+                    let cfg = crate::discovery::session::DiscoveryConfig {
+                        provider: "/unreachable-provider".into(),
+                        object: "/unreachable-object".into(),
+                        object_bytes: None,
+                        builtin: false,
+                        legacy: false,
+                        table: None,
+                        force_offset: None,
+                        explicit_offsets: false,
+                        cmdline_marker: None,
+                    };
+                    crate::discovery::session::with_owned_pin_stop(
+                        move |pin| {
+                            *locked(&observed) = Some((
+                                pin.test_identity(),
+                                crate::pin::test_pin_open_attempts() - before,
+                            ))
+                        },
+                        || {
+                            crate::discovery::session::DiscoverySession::prepare_owned_controlled(
+                                &cfg,
+                                handoff,
+                                &self.control,
+                                &self.links,
+                            )
+                        },
+                    )?;
+                } else {
+                    let pin = crate::pin::TargetPin::from_original_controlled(
+                        handoff,
+                        &self.control,
+                        &self.links,
+                    )?;
+                    *locked(&self.original_observation) = Some((
+                        pin.test_identity(),
+                        crate::pin::test_pin_open_attempts() - before,
+                    ));
+                    self.original_pin = Some(SetupResource::guarded(
+                        pin,
+                        &self.links,
+                        BoundaryStage::Discovery,
+                    ));
+                }
+            }
             self.polls.fetch_add(1, Ordering::AcqRel);
             if matches!(self.hold, Hold::Discovery | Hold::None)
                 && self.polls.load(Ordering::Acquire) == 1
@@ -2140,9 +2236,56 @@ mod app_tests {
             Ok(capture::TraversalDelta::default())
         }
     }
-    struct Lifecycle(Arc<AtomicUsize>);
+    #[derive(Default, Debug, Clone)]
+    struct WatermarkObservation {
+        calls: usize,
+        count_disposed_before_lookup: bool,
+        original_live: bool,
+        permit: bool,
+        helper_reaped: bool,
+    }
+    struct TerminalWatermark {
+        fd: i32,
+        watch: crate::count_owner::CountSetupWatch,
+        observation: Arc<Mutex<WatermarkObservation>>,
+    }
+    struct Lifecycle(Arc<AtomicUsize>, Option<TerminalWatermark>);
     impl LifecyclePort for Lifecycle {
         fn poll(&mut self) -> capture::LifecycleDelta {
+            if let Some(watermark) = &self.1 {
+                // Test port schedules the positive compatibility case after the
+                // real terminal cleanup/task receipts. Production keeps its
+                // existing no-wait permit lookup and refused-suffix semantics.
+                // progress() deliberately uses try_lock. A busy snapshot is
+                // unknown, not evidence that the terminal phase has not begun.
+                let until = Instant::now() + Duration::from_secs(3);
+                let phase = loop {
+                    if let Some(progress) = watermark.watch.progress() {
+                        break Some(progress);
+                    }
+                    if Instant::now() >= until {
+                        break None;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                };
+                if phase.is_some_and(|p| p.cleanup_ticket.is_some()) {
+                    let until = Instant::now() + Duration::from_secs(3);
+                    loop {
+                        if watermark
+                            .watch
+                            .progress()
+                            .is_some_and(|p| p.owner_cleanup_acknowledged && p.owner_task_disposed)
+                        {
+                            locked(&watermark.observation).count_disposed_before_lookup = true;
+                            break;
+                        }
+                        if Instant::now() >= until {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+            }
             capture::LifecycleDelta::default()
         }
         fn fallback_partial(&self) -> bool {
@@ -2150,6 +2293,22 @@ mod app_tests {
         }
         fn mark_released(&mut self) {
             self.0.fetch_add(1, Ordering::AcqRel);
+        }
+        fn close_drain(
+            &mut self,
+            _: capture::LifecycleEdge,
+            permit: Option<&crate::count_owner::CountForkPermit<'_>>,
+        ) -> capture::LifecycleClose {
+            if let Some(watermark) = &self.1 {
+                let live = unsafe { libc::fcntl(watermark.fd, libc::F_GETFD) } >= 0;
+                let helper = permit.is_some_and(capture::original_group_test_watermark);
+                let mut observed = locked(&watermark.observation);
+                observed.calls += 1;
+                observed.original_live = live;
+                observed.permit = permit.is_some();
+                observed.helper_reaped = helper;
+            }
+            capture::LifecycleClose::default()
         }
     }
     struct Proc {
@@ -2221,9 +2380,16 @@ mod app_tests {
         alias: Arc<Mutex<Option<UnixStream>>>,
         cfg: Option<capture::Config>,
         info: Option<capture::TargetInfo>,
+        original_observation: Arc<Mutex<Option<((usize, i32), usize)>>>,
+        original_identity: Option<(usize, i32)>,
+        original_close: Option<Arc<crate::pin::OriginalCloseProbe>>,
+        watermark: Arc<Mutex<WatermarkObservation>>,
     }
     impl Owned {
         fn new(hold: Hold, deadline: Duration, close_hold: bool) -> Self {
+            Self::new_inner(hold, deadline, close_hold, true)
+        }
+        fn new_inner(hold: Hold, deadline: Duration, close_hold: bool, start: bool) -> Self {
             let cancelled = Arc::new(AtomicBool::new(false));
             let control = SetupControl::new(
                 Instant::now() + deadline,
@@ -2266,6 +2432,10 @@ mod app_tests {
                 alias: Arc::new(Mutex::new(None)),
                 cfg: None,
                 info: None,
+                original_observation: Arc::new(Mutex::new(None)),
+                original_identity: None,
+                original_close: None,
+                watermark: Arc::new(Mutex::new(WatermarkObservation::default())),
             };
             let argv = vec!["/bin/sleep".to_owned(), "1".to_owned()];
             let target = {
@@ -2279,6 +2449,18 @@ mod app_tests {
             };
             owned.pid = target.pid();
             owned.attempt.target = Some(target);
+            owned.original_identity = Some(
+                owned
+                    .attempt
+                    .target
+                    .as_ref()
+                    .unwrap()
+                    .test_original_identity(),
+            );
+            if hold == Hold::OriginalPin {
+                owned.original_close =
+                    Some(owned.attempt.target.as_mut().unwrap().hold_original_close());
+            }
             let raw =
                 unsafe { libc::syscall(libc::SYS_pidfd_open, owned.pid as libc::pid_t, 0) as i32 };
             assert!(raw >= 0, "test retains exact child identity");
@@ -2367,38 +2549,60 @@ mod app_tests {
             };
             owned.cfg = Some(cfg.clone());
             owned.info = Some(info.clone());
-            owned
-                .attempt
-                .start(capture::SetupRequest::Host {
-                    cfg,
-                    info,
-                    discovery: Discovery {
-                        events: None,
-                        pid: owned.pid,
-                        hold,
-                        gate: owned.gate.clone(),
-                        polls: owned.polls.clone(),
-                        dropped: owned.dropped.clone(),
-                        delta,
-                        links: owned.attempt.links.clone(),
-                        control: owned.attempt.control.clone(),
-                        peers: owned.peers.clone(),
-                        alias: owned.alias.clone(),
-                        file: owned.file.clone(),
-                    },
-                    lifecycle: Lifecycle(owned.released.clone()),
-                    count: owned.fixture.clone(),
-                    proc: Box::new(Proc {
-                        hold,
-                        gate: owned.gate.clone(),
-                        live: capture::LiveProc,
-                        mapping,
-                        setup: owned.attempt.links.clone(),
-                    }),
-                    seed,
-                    establish_context: matches!(hold, Hold::ContextPartial | Hold::ContextReady),
-                })
-                .unwrap();
+            if start {
+                let original = owned
+                    .attempt
+                    .target
+                    .as_mut()
+                    .unwrap()
+                    .original_group_handoff(owned.attempt.links.origin())
+                    .unwrap();
+                owned
+                    .attempt
+                    .start(capture::SetupRequest::Host {
+                        cfg,
+                        info,
+                        discovery: Discovery {
+                            original: Some(original),
+                            original_pin: None,
+                            original_observation: owned.original_observation.clone(),
+                            events: None,
+                            pid: owned.pid,
+                            hold,
+                            gate: owned.gate.clone(),
+                            polls: owned.polls.clone(),
+                            dropped: owned.dropped.clone(),
+                            delta,
+                            links: owned.attempt.links.clone(),
+                            control: owned.attempt.control.clone(),
+                            peers: owned.peers.clone(),
+                            alias: owned.alias.clone(),
+                            file: owned.file.clone(),
+                        },
+                        lifecycle: Lifecycle(
+                            owned.released.clone(),
+                            (hold == Hold::OriginalTerminal).then(|| TerminalWatermark {
+                                fd: owned.original_identity.unwrap().1,
+                                watch: locked(&owned.attempt.links.0).watch.clone().unwrap(),
+                                observation: owned.watermark.clone(),
+                            }),
+                        ),
+                        count: owned.fixture.clone(),
+                        proc: Box::new(Proc {
+                            hold,
+                            gate: owned.gate.clone(),
+                            live: capture::LiveProc,
+                            mapping,
+                            setup: owned.attempt.links.clone(),
+                        }),
+                        seed,
+                        establish_context: matches!(
+                            hold,
+                            Hold::ContextPartial | Hold::ContextReady
+                        ),
+                    })
+                    .unwrap();
+            }
             owned
         }
         fn site(
@@ -2470,6 +2674,9 @@ mod app_tests {
             (Some(mapping), Some(delta))
         }
         fn settled(&mut self) -> bool {
+            if let Some(probe) = &self.original_close {
+                probe.release();
+            }
             self.gate.release();
             self.fixture.release();
             if self.attempt.cleanup.is_some() {
@@ -2523,6 +2730,323 @@ mod app_tests {
         let mut status = 0;
         (unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) }) == -1
             && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)
+    }
+
+    // Reissue, a substituted allocation/control or abandonment must refuse before pin effects.
+    #[test]
+    fn g1_original_group_one_shot_and_origin() {
+        let mut owned = Owned::new_inner(Hold::None, Duration::from_secs(10), false, false);
+        let origin = owned.attempt.links.origin();
+        let handoff = owned
+            .attempt
+            .target
+            .as_mut()
+            .unwrap()
+            .original_group_handoff(origin.clone())
+            .unwrap();
+        let canonical = handoff
+            .validate(&owned.attempt.links, &owned.attempt.control.clone())
+            .is_ok();
+        let foreign = SetupLinks::new();
+        let foreign_refused = handoff.validate(&foreign, &owned.attempt.control).is_err();
+        let fresh = SetupControl::new(
+            Instant::now() + Duration::from_secs(30),
+            SetupInterrupt::Owned(Arc::new(AtomicBool::new(false))),
+        );
+        let fresh_refused = handoff.validate(&owned.attempt.links, &fresh).is_err();
+        let mut longer = owned.attempt.control.clone();
+        longer.deadline += Duration::from_secs(1);
+        let longer_refused = handoff.validate(&owned.attempt.links, &longer).is_err();
+        let second = owned
+            .attempt
+            .target
+            .as_mut()
+            .unwrap()
+            .original_group_handoff(origin.clone())
+            .is_err();
+        owned.cancelled.store(true, Ordering::Release);
+        let before = crate::pin::test_pin_open_attempts();
+        let cancelled = crate::pin::TargetPin::from_original_controlled(
+            handoff,
+            &owned.attempt.control,
+            &owned.attempt.links,
+        )
+        .err()
+        .is_some_and(|e| {
+            matches!(
+                e.downcast_ref::<SetupFailure>(),
+                Some(SetupFailure::Cancelled { .. })
+            )
+        });
+        let cancellation_opens = crate::pin::test_pin_open_attempts() - before;
+        let after_drop = owned
+            .attempt
+            .target
+            .as_mut()
+            .unwrap()
+            .original_group_handoff(origin)
+            .is_err();
+        let count_absent = matches!(
+            owned.attempt.count_diagnostic(),
+            capture::PreObservationCount::NotPrepared
+        );
+        let settled = owned.settled();
+        let pid = owned.pid;
+        drop(owned); // Settle the fixture's retained exact-child descriptor too.
+        assert!(settled && exact_reaped(pid));
+        assert!(
+            canonical
+                && foreign_refused
+                && fresh_refused
+                && longer_refused
+                && second
+                && after_drop
+                && count_absent
+                && cancelled
+        );
+        assert_eq!(cancellation_opens, 0);
+    }
+
+    // Moving complete_abort ahead of the actual last close reopens a reserved prefix too soon.
+    #[test]
+    fn g1_original_group_abort_final_close() {
+        for started in [false, true] {
+            let mut owned =
+                Owned::new_inner(Hold::OriginalPin, Duration::from_secs(10), false, started);
+            if started {
+                owned.attempt.wait().unwrap();
+            }
+            owned
+                .attempt
+                .abandon(infrastructure("original final-close control"));
+            let probe = owned.original_close.as_ref().unwrap().clone();
+            let until = Instant::now() + Duration::from_secs(3);
+            while !probe.entered.load(Ordering::Acquire) && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let entered = probe.entered.load(Ordering::Acquire);
+            let closed_while_held = probe.closed.load(Ordering::Acquire);
+            let completed_while_held = owned.attempt.disposed.load(Ordering::Acquire);
+            let barrier_while_held = owned
+                .attempt
+                .fork_barrier
+                .prefix_permit(Instant::now())
+                .err();
+            let (native, worker_done, receipt, progress) = {
+                let state = locked(&owned.attempt.links.0);
+                (
+                    state.native_disposed,
+                    state.worker_done,
+                    state.custody.clone(),
+                    state.watch.as_ref().and_then(|w| w.progress()),
+                )
+            };
+            let count_settled = !started
+                || progress.is_some_and(|p| p.owner_cleanup_acknowledged && p.owner_task_disposed);
+            probe.release();
+            let settled = owned.settled();
+            let pid = owned.pid;
+            let count_closed = !started || owned.fixture.descriptors_closed();
+            let barrier_after = owned
+                .attempt
+                .fork_barrier
+                .prefix_permit(Instant::now())
+                .err();
+            drop(owned);
+            assert!(settled && exact_reaped(pid) && count_closed);
+            assert!(
+                entered
+                    && native
+                    && worker_done
+                    && count_settled
+                    && receipt.is_some_and(|r| r.child_exit == Some(137))
+            );
+            assert!(!closed_while_held && !completed_while_held);
+            if !started {
+                assert_eq!(
+                    barrier_while_held,
+                    Some(crate::count_owner::ForkBlocked::SetupReserved),
+                    "pre-admission setup completion must follow actual close return"
+                );
+                assert_eq!(
+                    barrier_after,
+                    Some(crate::count_owner::ForkBlocked::PrefixClosed)
+                );
+            }
+            assert!(probe.closed.load(Ordering::Acquire));
+        }
+    }
+
+    // The ordinary host port invokes the real discovery pre-BPF constructor with actual Count custody.
+    #[test]
+    fn g1_original_group_host_discovery_abort() {
+        let mut owned = Owned::new(Hold::OriginalDiscovery, Duration::from_secs(10), false);
+        let result = owned.attempt.wait();
+        let stopped = matches!(result, Err(SetupFailure::Boundary(ref f)) if f.errno == Some(libc::ECANCELED));
+        let settled = owned.settled();
+        let pid = owned.pid;
+        let count_closed = owned.fixture.descriptors_closed();
+        let observed = *locked(&owned.original_observation);
+        let expected = owned.original_identity;
+        let progress = locked(&owned.attempt.links.0)
+            .watch
+            .as_ref()
+            .and_then(|w| w.progress());
+        drop(owned);
+        assert!(settled && exact_reaped(pid) && count_closed);
+        assert!(stopped);
+        assert_eq!(observed, expected.map(|identity| (identity, 0)));
+        assert!(progress.is_some_and(|p| p.owner_cleanup_acknowledged && p.owner_task_disposed));
+    }
+
+    // A retained ordinary group file must not veto Count's legitimate terminal helper.
+    #[test]
+    fn g1_original_group_keeps_terminal_watermark() {
+        let mut owned = Owned::new(Hold::OriginalTerminal, Duration::from_secs(10), false);
+        owned.attempt.wait().expect("actual owned Ready");
+        let ready = owned.attempt.ready.as_mut().unwrap();
+        let commit = capture::commit_owned_release(
+            owned.attempt.target.as_mut().unwrap(),
+            ready.bundle.window.as_mut().unwrap(),
+            &owned.attempt.control,
+            &capture::LiveClock,
+        )
+        .unwrap();
+        let (target, mut ready) = owned.attempt.accepted(&commit);
+        let window = ready.bundle.window.take().unwrap();
+        let result = capture::resume_owned_window(
+            window,
+            target,
+            commit,
+            &capture::LiveClock,
+            &mut capture::LiveProc,
+            &|| false,
+        );
+        drop(ready);
+        let settled = owned.settled();
+        let pid = owned.pid;
+        let count_closed = owned.fixture.descriptors_closed();
+        let watermark = locked(&owned.watermark).clone();
+        let observed = *locked(&owned.original_observation);
+        let expected = owned.original_identity;
+        let releases = owned.released.load(Ordering::Acquire);
+        // Runtime's legitimate leave-running result is distinct from this
+        // fixture-only consuming child cleanup. Both settle before assertions.
+        drop(owned);
+        assert!(settled && result.is_ok() && count_closed && exact_reaped(pid));
+        assert_eq!(
+            watermark.calls, 1,
+            "one real close_drain at the terminal phase cut: {watermark:?}"
+        );
+        assert!(
+            watermark.count_disposed_before_lookup
+                && watermark.original_live
+                && watermark.permit
+                && watermark.helper_reaped,
+            "actual terminal helper must fork/reap while original acquisition remains live: {watermark:?}"
+        );
+        assert_eq!(observed, expected.map(|identity| (identity, 0)));
+        assert_eq!(releases, 1);
+    }
+
+    // Reopening at the actual owned consumer breaks same-file continuity.
+    #[test]
+    fn g1_original_group_pin_uses_original_file() {
+        let before_spawn = crate::target::test_setup_open_attempts();
+        let mut owned = Owned::new_inner(Hold::None, Duration::from_secs(10), false, false);
+        let expected = owned
+            .attempt
+            .target
+            .as_ref()
+            .unwrap()
+            .test_original_identity();
+        let spawn_opens = crate::target::test_setup_open_attempts() - before_spawn;
+        let handoff = owned
+            .attempt
+            .target
+            .as_mut()
+            .unwrap()
+            .original_group_handoff(owned.attempt.links.origin())
+            .unwrap();
+        let before = crate::pin::test_pin_open_attempts();
+        let result = crate::pin::TargetPin::from_original_controlled(
+            handoff,
+            &owned.attempt.control,
+            &owned.attempt.links,
+        );
+        let opens = crate::pin::test_pin_open_attempts() - before;
+        let identity = result.as_ref().ok().map(|pin| pin.test_identity());
+        let verified = result.as_ref().is_ok_and(|pin| pin.verify().is_ok());
+        drop(result);
+        let settled = owned.settled();
+        let pid = owned.pid;
+        drop(owned); // Settle the fixture's retained exact-child descriptor too.
+        assert!(settled && exact_reaped(pid));
+        assert!(verified);
+        assert_eq!(spawn_opens, 1, "actual spawn helper acquires once");
+        assert_eq!(opens, 0, "owned consumer must not reacquire by numeric PID");
+        assert_eq!(
+            identity,
+            Some(expected),
+            "the actual acquired file must survive"
+        );
+    }
+
+    // The real owned discovery seam must construct that same pin before provider effects.
+    #[test]
+    fn g1_original_group_reaches_owned_discovery() {
+        let mut owned = Owned::new_inner(Hold::None, Duration::from_secs(10), false, false);
+        let expected = owned
+            .attempt
+            .target
+            .as_ref()
+            .unwrap()
+            .test_original_identity();
+        let handoff = owned
+            .attempt
+            .target
+            .as_mut()
+            .unwrap()
+            .original_group_handoff(owned.attempt.links.origin())
+            .unwrap();
+        let observation = Arc::new(Mutex::new(None));
+        let observed = observation.clone();
+        let cfg = crate::discovery::session::DiscoveryConfig {
+            provider: "/unreachable-provider".into(),
+            object: "/unreachable-object".into(),
+            object_bytes: None,
+            builtin: false,
+            legacy: false,
+            table: None,
+            force_offset: None,
+            explicit_offsets: false,
+            cmdline_marker: None,
+        };
+        let before = crate::pin::test_pin_open_attempts();
+        let result = crate::discovery::session::with_owned_pin_stop(
+            move |pin| *locked(&observed) = Some(pin.test_identity()),
+            || {
+                crate::discovery::session::DiscoverySession::prepare_owned_controlled(
+                    &cfg,
+                    handoff,
+                    &owned.attempt.control,
+                    &owned.attempt.links,
+                )
+            },
+        );
+        let opens = crate::pin::test_pin_open_attempts() - before;
+        let stopped = matches!(result, Err(SetupFailure::Boundary(ref f)) if f.errno == Some(libc::ECANCELED));
+        drop(result);
+        let settled = owned.settled();
+        let pid = owned.pid;
+        drop(owned); // Settle the fixture's retained exact-child descriptor too.
+        assert!(settled && exact_reaped(pid));
+        assert!(
+            stopped,
+            "stop must follow actual pin, before missing provider is read"
+        );
+        assert_eq!(opens, 0, "owned discovery must not reopen the original");
+        assert_eq!(*locked(&observation), Some(expected));
     }
 
     #[test]
