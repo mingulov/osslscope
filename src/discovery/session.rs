@@ -72,6 +72,7 @@
 //! anchors and tripwires; the capture adapter separately reads relevant
 //! identity-bound file bytes for count planning and fingerprints.
 
+use crate::capture_setup::{DiscoveryLinkStore, SetupControl, SetupFailure, SetupLinks};
 use crate::discovery::{builtin, coverage, elf, harvest, legacy, maps};
 use crate::loader::Loaded;
 use anyhow::{Context as _, anyhow, bail};
@@ -3810,13 +3811,12 @@ pub(crate) enum LinkKind {
 ///
 /// `link`/`pin` are pure RAII guards (drop = detach/release),
 /// never read by design.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct LinkEntry {
-    link: OwnedFd,
-    pin: OwnedFd,
-    kind: LinkKind,
-    cookies: Vec<u64>,
+    pub(crate) link: OwnedFd,
+    pub(crate) pin: OwnedFd,
+    pub(crate) kind: LinkKind,
+    pub(crate) cookies: Vec<u64>,
 }
 
 /// Owned multi links with their plane records. Cookies ride
@@ -3824,23 +3824,10 @@ pub(crate) struct LinkEntry {
 /// (tripwire links carry the whole batch's cookies).
 #[derive(Default)]
 pub(crate) struct LinkSet {
-    links: Vec<LinkEntry>,
+    pub(crate) links: Vec<LinkEntry>,
 }
 
 impl LinkSet {
-    fn push(&mut self, link: OwnedFd, pin: OwnedFd, kind: LinkKind, cookies: Vec<u64>) {
-        self.links.push(LinkEntry {
-            link,
-            pin,
-            kind,
-            cookies,
-        });
-    }
-
-    fn clear(&mut self) {
-        self.links.clear();
-    }
-
     // H4 removed `truncate` with the rollback-after-attach sites:
     // rejection happens strictly before any link exists, so no
     // installed link is ever rolled back. Design:
@@ -3848,11 +3835,11 @@ impl LinkSet {
 
     /// Detach every link matching `pred` (fd close = detach;
     /// each link's pin drops with it).
-    fn remove_matching(&mut self, mut pred: impl FnMut(LinkKind, &[u64]) -> bool) {
+    pub(crate) fn remove_matching(&mut self, mut pred: impl FnMut(LinkKind, &[u64]) -> bool) {
         self.links.retain(|e| !pred(e.kind, &e.cookies));
     }
 
-    fn counts(&self) -> (u64, u64) {
+    pub(crate) fn counts(&self) -> (u64, u64) {
         let mut dispatch = 0u64;
         let mut tripwire = 0u64;
         for e in &self.links {
@@ -3926,10 +3913,56 @@ fn prog_fd(loaded: &Loaded, name: &str) -> anyhow::Result<std::os::fd::RawFd> {
         .ok_or_else(|| anyhow!("missing program {name}"))
 }
 
+fn read_attach_bounded(path: &Path, cap: u64) -> anyhow::Result<Vec<u8>> {
+    crate::discovery::onboard::read_bounded(path, cap).map_err(|error| match error {
+        crate::discovery::onboard::ReadBoundedError::Io(error) => anyhow::Error::new(error),
+        error => anyhow!(error),
+    })
+}
+// Actual native effects only: host tests substitute returned RAII descriptors,
+// while pin preparation, reservation and custody use the production body.
+trait DiscoveryAttachOps {
+    fn create(
+        &mut self,
+        ret: bool,
+        prog: i32,
+        path: &std::ffi::CStr,
+        offsets: &[u64],
+        cookies: &[u64],
+        pid: u32,
+    ) -> std::io::Result<OwnedFd>;
+}
+struct NativeDiscoveryAttachOps;
+impl DiscoveryAttachOps for NativeDiscoveryAttachOps {
+    fn create(
+        &mut self,
+        ret: bool,
+        prog: i32,
+        path: &std::ffi::CStr,
+        offsets: &[u64],
+        cookies: &[u64],
+        pid: u32,
+    ) -> std::io::Result<OwnedFd> {
+        if ret {
+            ossl_bpf_sys::link_create_uretprobe_multi(prog, path, offsets, cookies, pid)
+        } else {
+            ossl_bpf_sys::link_create_uprobe_multi(prog, path, offsets, cookies, pid)
+        }
+    }
+}
+struct PairSpec<'a> {
+    entry: &'a str,
+    ret: &'a str,
+    offset: u64,
+    pin: &'a crate::plan::PinnedFile,
+    pid: u32,
+    cookie: u64,
+    kind: LinkKind,
+}
 #[allow(clippy::too_many_arguments, reason = "one coherent attach spec")]
 fn attach_pair(
     loaded: &Loaded,
-    links: &mut LinkSet,
+    links: &mut DiscoveryLinkStore,
     entry: &str,
     ret: &str,
     offset: u64,
@@ -3938,47 +3971,151 @@ fn attach_pair(
     cookie: u64,
     kind: LinkKind,
 ) -> anyhow::Result<()> {
+    attach_pair_with_ops(
+        loaded,
+        links,
+        PairSpec {
+            entry,
+            ret,
+            offset,
+            pin,
+            pid,
+            cookie,
+            kind,
+        },
+        &mut NativeDiscoveryAttachOps,
+    )
+}
+struct PairRollback<'a> {
+    links: &'a mut DiscoveryLinkStore,
+    mark: Option<usize>,
+    committed: bool,
+    failure: Option<SetupFailure>,
+}
+impl Drop for PairRollback<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            let failure = self.failure.take().unwrap_or_else(|| {
+                SetupFailure::Boundary(crate::capture::BoundaryFailure::new(
+                    crate::capture::BoundaryStage::Discovery,
+                    crate::capture::BoundaryFailureClass::Panic,
+                    None,
+                    "native discovery attach unwound",
+                ))
+            });
+            self.links.rollback(self.mark, failure);
+        }
+    }
+}
+fn attach_pair_with_ops(
+    loaded: &Loaded,
+    links: &mut DiscoveryLinkStore,
+    spec: PairSpec<'_>,
+    ops: &mut impl DiscoveryAttachOps,
+) -> anyhow::Result<()> {
+    let PairSpec {
+        entry,
+        ret,
+        offset,
+        pin,
+        pid,
+        cookie,
+        kind,
+    } = spec;
     // H4: attach through the pin's fd-path — the kernel binds the
     // open file description, so no path move can race the attach.
     // One fd per link entry: the pin dups once per push and drops
     // with its link.
     let fd_path = pin.link_path();
     let cpath = link_path(Path::new(&fd_path))?;
-    // Both links publish only after the pair succeeds: a failed
-    // return-probe attach must not leave its entry link live (the
-    // session retries, so a leak would accumulate double-firing
-    // entry probes).
-    let entry_link = ossl_bpf_sys::link_create_uprobe_multi(
-        prog_fd(loaded, entry)?,
-        &cpath,
-        &[offset],
-        &[cookie],
-        pid,
-    )
-    .map_err(|e| anyhow!(link_attach_text(entry, offset, &e)))?;
-    let ret_link = ossl_bpf_sys::link_create_uretprobe_multi(
-        prog_fd(loaded, ret)?,
-        &cpath,
-        &[offset],
-        &[cookie],
-        pid,
-    )
-    .map_err(|e| anyhow!(link_attach_text(ret, offset, &e)))?;
-    // Dup both pins BEFORE publishing either link (a dup can only
-    // fail on fd exhaustion, but a half-published pair would
-    // strand a firing entry link — same rule as the attaches).
-    // The pair separator is `+` (a `/` would read as a pathname —
-    // diagnostics carry none).
-    let entry_pin = pin
-        .fd
-        .try_clone()
-        .map_err(|e| anyhow!("attach {entry}+{ret} pin dup failed (kind={:?})", e.kind()))?;
-    let ret_pin = pin
-        .fd
-        .try_clone()
-        .map_err(|e| anyhow!("attach {entry}+{ret} pin dup failed (kind={:?})", e.kind()))?;
-    links.push(entry_link, entry_pin, kind, vec![cookie]);
-    links.push(ret_link, ret_pin, kind, vec![cookie]);
+    // Reserve both slots and duplicate required pins before the first effect.
+    // Each returned link enters custody before the following create can block.
+    let mut reservation = links.reserve(2)?;
+    let _temporary = links.temporary(2)?;
+    let entry_pin = pin.fd.try_clone().map_err(|e| {
+        SetupFailure::io(
+            crate::capture::BoundaryStage::Discovery,
+            &e,
+            &format!("attach {entry}+{ret} pin dup failed (kind={:?})", e.kind()),
+        )
+    })?;
+    let ret_pin = pin.fd.try_clone().map_err(|e| {
+        SetupFailure::io(
+            crate::capture::BoundaryStage::Discovery,
+            &e,
+            &format!("attach {entry}+{ret} pin dup failed (kind={:?})", e.kind()),
+        )
+    })?;
+    let mark = links.mark();
+    let mut guard = PairRollback {
+        links,
+        mark,
+        committed: false,
+        failure: None,
+    };
+    let links = &mut *guard.links;
+    let result = (|| {
+        links.check()?;
+        let entry_link = ops
+            .create(
+                false,
+                prog_fd(loaded, entry)?,
+                &cpath,
+                &[offset],
+                &[cookie],
+                pid,
+            )
+            .map_err(|e| {
+                SetupFailure::io(
+                    crate::capture::BoundaryStage::Discovery,
+                    &e,
+                    &link_attach_text(entry, offset, &e),
+                )
+            })?;
+        links.push(
+            LinkEntry {
+                link: entry_link,
+                pin: entry_pin,
+                kind,
+                cookies: vec![cookie],
+            },
+            &mut reservation,
+        )?;
+        links.check()?;
+        let ret_link = ops
+            .create(
+                true,
+                prog_fd(loaded, ret)?,
+                &cpath,
+                &[offset],
+                &[cookie],
+                pid,
+            )
+            .map_err(|e| {
+                SetupFailure::io(
+                    crate::capture::BoundaryStage::Discovery,
+                    &e,
+                    &link_attach_text(ret, offset, &e),
+                )
+            })?;
+        links.push(
+            LinkEntry {
+                link: ret_link,
+                pin: ret_pin,
+                kind,
+                cookies: vec![cookie],
+            },
+            &mut reservation,
+        )
+    })();
+    if let Err(error) = &result {
+        guard.failure = Some(SetupFailure::from_error_ref(
+            crate::capture::BoundaryStage::Discovery,
+            error,
+        ));
+    }
+    result?;
+    guard.committed = true;
     Ok(())
 }
 
@@ -3990,51 +4127,118 @@ fn attach_pair(
 /// bindings instead of collapsing to the first.
 fn attach_trips(
     loaded: &Loaded,
-    links: &mut LinkSet,
+    links: &mut DiscoveryLinkStore,
     set: &legacy::ProbeSet,
     pid: u32,
 ) -> anyhow::Result<Vec<TripModulePin>> {
-    type OffsetsCookies = (Vec<u64>, Vec<u64>);
-    let mut groups: HashMap<(&str, &str), OffsetsCookies> = HashMap::new();
-    for p in &set.probes {
-        let (offs, cookies) = groups.entry((p.module.as_str(), p.program)).or_default();
-        offs.push(p.offset);
-        cookies.push(p.cookie);
+    attach_trips_with_ops(loaded, links, set, pid, &mut NativeDiscoveryAttachOps)
+}
+struct TripBatchGuard<'a> {
+    links: &'a mut DiscoveryLinkStore,
+    complete: bool,
+    failure: Option<SetupFailure>,
+}
+impl Drop for TripBatchGuard<'_> {
+    fn drop(&mut self) {
+        if !self.complete {
+            let failure = self.failure.take().unwrap_or_else(|| {
+                SetupFailure::Boundary(crate::capture::BoundaryFailure::new(
+                    crate::capture::BoundaryStage::Discovery,
+                    crate::capture::BoundaryFailureClass::Panic,
+                    None,
+                    "native trip attach unwound",
+                ))
+            });
+            // Local/direct trip batches retain their earlier groups as before.
+            // Only Preparing custody becomes abort-only; no FD closes here.
+            self.links.abort(failure);
+        }
     }
-    let mut keys: Vec<(&str, &str)> = groups.keys().copied().collect();
-    keys.sort_unstable();
-    let mut pins: Vec<TripModulePin> = Vec::new();
-    for (module, prog_name) in keys {
-        let (offsets, cookies) = &groups[&(module, prog_name)];
-        // H4: pin the module (open, bounded retries) and attach
-        // through the fd-path. Caller modules carry no planned
-        // identity (only libcrypto is plan-bound — checked by the
-        // caller pre-attach), so the pin alone fixes their
-        // attach-time TOCTOU: the link binds exactly the opened
-        // inode, deliberately. One group → one link → the pin
-        // moves in whole (no dup needed).
-        let pin = crate::plan::resolve_pinned_retry(|| crate::plan::resolve_pinned(module))
-            .map_err(|e| anyhow!("pin {module} for {prog_name}: {e}"))?;
-        let fd_path = pin.link_path();
-        let cpath = link_path(Path::new(&fd_path))?;
-        let link = ossl_bpf_sys::link_create_uprobe_multi(
-            prog_fd(loaded, prog_name)?,
-            &cpath,
-            offsets,
-            cookies,
-            pid,
-        )
-        .map_err(|e| anyhow!("attach {prog_name}@{module}+{}: {e}", offsets.len()))?;
-        pins.push(TripModulePin {
-            module: module.to_string(),
-            program: prog_name.to_string(),
-            dev: crate::plan::render_device(pin.device),
-            ino: pin.ino,
-        });
-        links.push(link, pin.fd, LinkKind::Tripwire, cookies.clone());
+}
+fn attach_trips_with_ops(
+    loaded: &Loaded,
+    links: &mut DiscoveryLinkStore,
+    set: &legacy::ProbeSet,
+    pid: u32,
+    ops: &mut impl DiscoveryAttachOps,
+) -> anyhow::Result<Vec<TripModulePin>> {
+    let mut guard = TripBatchGuard {
+        links,
+        complete: false,
+        failure: None,
+    };
+    let result = (|| {
+        let links = &mut *guard.links;
+        type OffsetsCookies = (Vec<u64>, Vec<u64>);
+        let mut groups: HashMap<(&str, &str), OffsetsCookies> = HashMap::new();
+        for p in &set.probes {
+            let (offs, cookies) = groups.entry((p.module.as_str(), p.program)).or_default();
+            offs.push(p.offset);
+            cookies.push(p.cookie);
+        }
+        let mut keys: Vec<(&str, &str)> = groups.keys().copied().collect();
+        keys.sort_unstable();
+        let mut pins: Vec<TripModulePin> = Vec::new();
+        for (module, prog_name) in keys {
+            let mut reservation = links.reserve(1)?;
+            let _temporary = links.temporary(1)?;
+            let (offsets, cookies) = &groups[&(module, prog_name)];
+            // H4: pin the module (open, bounded retries) and attach
+            // through the fd-path. Caller modules carry no planned
+            // identity (only libcrypto is plan-bound — checked by the
+            // caller pre-attach), so the pin alone fixes their
+            // attach-time TOCTOU: the link binds exactly the opened
+            // inode, deliberately. One group → one link → the pin
+            // moves in whole (no dup needed).
+            let pin = crate::plan::resolve_pinned_retry(|| crate::plan::resolve_pinned(module))
+                .map_err(|e| anyhow!("pin {module} for {prog_name}: {e}"))?;
+            let fd_path = pin.link_path();
+            let cpath = link_path(Path::new(&fd_path))?;
+            links.check()?;
+            let link = ops
+                .create(
+                    false,
+                    prog_fd(loaded, prog_name)?,
+                    &cpath,
+                    offsets,
+                    cookies,
+                    pid,
+                )
+                .map_err(|e| {
+                    SetupFailure::io(
+                        crate::capture::BoundaryStage::Discovery,
+                        &e,
+                        &format!("attach {prog_name}@{module}+{}: {e}", offsets.len()),
+                    )
+                })?;
+            let identity = (crate::plan::render_device(pin.device), pin.ino);
+            links.push(
+                LinkEntry {
+                    link,
+                    pin: pin.fd,
+                    kind: LinkKind::Tripwire,
+                    cookies: cookies.clone(),
+                },
+                &mut reservation,
+            )?;
+            pins.push(TripModulePin {
+                module: module.to_string(),
+                program: prog_name.to_string(),
+                dev: identity.0,
+                ino: identity.1,
+            });
+        }
+        pins.sort_by(|a, b| (&a.module, &a.program).cmp(&(&b.module, &b.program)));
+        Ok(pins)
+    })();
+    if let Err(error) = &result {
+        guard.failure = Some(SetupFailure::from_error_ref(
+            crate::capture::BoundaryStage::Discovery,
+            error,
+        ));
     }
-    pins.sort_by(|a, b| (&a.module, &a.program).cmp(&(&b.module, &b.program)));
-    Ok(pins)
+    guard.complete = result.is_ok();
+    result
 }
 
 /// Load the frozen harvest shape: `prepare` asserts dims vs the
@@ -4368,7 +4572,7 @@ pub struct LiveEnv {
     provider: PathBuf,
     canon: String,
     loaded: Loaded,
-    links: LinkSet,
+    links: DiscoveryLinkStore,
     ring: RingBuf<MapData>,
     pin: crate::pin::TargetPin,
     /// Retained dispatch anchor recipe (F-D/A11): reinstall
@@ -4463,6 +4667,7 @@ impl SessionEnv for LiveEnv {
         // (T14r4-2b) against fresh maps. NOTE the domain bridge:
         // `expected` is raw (dev_t, ino) per the trait, the pin
         // is encoded — the comparison encodes explicitly.
+        let _temporary = self.links.temporary(1)?;
         let path_str = path.to_string_lossy();
         let pin =
             crate::plan::resolve_pinned_retry(|| crate::plan::resolve_pinned(path_str.as_ref()))
@@ -4511,6 +4716,7 @@ impl SessionEnv for LiveEnv {
         if let Some((lc_path, (enc, ino))) = set.libcrypto.as_ref().and_then(|(path, dev, ino)| {
             crate::plan::device_id_of_dev_str(dev).map(|enc| (path, (enc, *ino)))
         }) {
+            let _temporary = self.links.temporary(1)?;
             let pin = crate::plan::resolve_pinned_retry(|| crate::plan::resolve_pinned(lc_path))
                 .map_err(|e| {
                     std::io::Error::new(
@@ -4539,15 +4745,19 @@ impl SessionEnv for LiveEnv {
                 // unattributed, documented edge); attach failures
                 // stay loud in-doc (executed_queries would read a
                 // false 0) while the run continues for tripwires.
+                let _temporary = self.links.temporary(1)?;
                 let pin = match crate::plan::resolve_pinned_retry(|| {
                     crate::plan::resolve_pinned(cand.to_string_lossy().as_ref())
                 }) {
                     Ok(pin) => pin,
                     Err(_) => continue,
                 };
-                let off = std::fs::read(pin.link_path())
-                    .ok()
-                    .and_then(|b| elf::dynsym_file_offset(&b, INIT_ANCHOR).ok());
+                let off = read_attach_bounded(
+                    Path::new(&pin.link_path()),
+                    crate::discovery::onboard::MAX_OBJECT_SCAN_BYTES,
+                )
+                .ok()
+                .and_then(|b| elf::dynsym_file_offset(&b, INIT_ANCHOR).ok());
                 if let Some(off) = off
                     && let Err(e) = attach_pair(
                         &self.loaded,
@@ -4574,6 +4784,7 @@ impl SessionEnv for LiveEnv {
     }
 
     fn plan_trips(&mut self, maps: &[maps::Mapping]) -> anyhow::Result<Option<legacy::ProbeSet>> {
+        let _temporary = self.links.temporary(1)?;
         let Some(entry) = libcrypto_entry(maps) else {
             return Ok(None);
         };
@@ -4616,7 +4827,11 @@ impl SessionEnv for LiveEnv {
         let mut mod_bytes: Vec<(String, Vec<u8>)> = Vec::new();
         let mut unreadable: Vec<String> = Vec::new();
         for path in legacy::target_modules(maps, &lc_path) {
-            match std::fs::read(&path) {
+            self.links.check()?;
+            match read_attach_bounded(
+                Path::new(&path),
+                crate::discovery::onboard::MAX_OBJECT_SCAN_BYTES,
+            ) {
                 Ok(bytes) => mod_bytes.push((path, bytes)),
                 Err(_) => unreadable.push(path),
             }
@@ -4748,6 +4963,7 @@ impl SessionEnv for LiveEnv {
         // current file (no maps entry to compare — the pin IS the
         // binding; the spike proved the kernel accepts this and
         // arms on first map). Only a missing file stays a retry.
+        let _temporary = self.links.temporary(1)?;
         let pin = crate::plan::resolve_pinned_retry(|| crate::plan::resolve_pinned(&prov_path))
             .map_err(|e| {
                 std::io::Error::new(
@@ -4755,12 +4971,15 @@ impl SessionEnv for LiveEnv {
                     format!("provider {prov_path} unopenable during reinstall: {e}"),
                 )
             })?;
+        self.links.check()?;
+        let read_temporary = self.links.temporary(1)?;
         let bound = crate::plan::read_file_bound(&pin.link_path()).map_err(|e| {
             std::io::Error::new(
                 e.kind(),
                 format!("dispatch provider read failed (kind={:?})", e.kind()),
             )
         })?;
+        drop(read_temporary);
         // H5 (was F-D/A11 mixed-domain): the bound read binds the
         // CURRENT file at the provider path; the maps entry backs
         // the file the TARGET still maps. Ino (domain-agnostic)
@@ -4853,6 +5072,29 @@ pub struct DiscoverySession {
     env: LiveEnv,
 }
 
+/// A real discovery session whose links remain in shared pre-release custody.
+/// Task4 uses the existing port methods through Deref until final publication.
+pub(crate) struct PreparedDiscovery {
+    session: DiscoverySession,
+}
+impl PreparedDiscovery {
+    pub(crate) fn finish(mut self, links: LinkSet) -> DiscoverySession {
+        self.session.env.links = DiscoveryLinkStore::Local(links);
+        self.session
+    }
+}
+impl std::ops::Deref for PreparedDiscovery {
+    type Target = DiscoverySession;
+    fn deref(&self) -> &Self::Target {
+        &self.session
+    }
+}
+impl std::ops::DerefMut for PreparedDiscovery {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.session
+    }
+}
+
 impl DiscoverySession {
     /// Attach a discovery session to `pid`: pin, load, populate
     /// classifiers, install dispatch anchors and (when configured)
@@ -4860,11 +5102,36 @@ impl DiscoverySession {
     /// still attach when tripwires can observe — the preset reason
     /// travels in the snapshot.
     pub fn attach(cfg: &DiscoveryConfig, pid: u32) -> anyhow::Result<Self> {
+        Self::attach_with_links(cfg, pid, DiscoveryLinkStore::default())
+    }
+
+    pub(crate) fn prepare_controlled(
+        cfg: &DiscoveryConfig,
+        pid: u32,
+        control: &SetupControl,
+        links: &SetupLinks,
+    ) -> Result<PreparedDiscovery, SetupFailure> {
+        control.check(crate::capture::BoundaryStage::Discovery)?;
+        Self::attach_with_links(cfg, pid, DiscoveryLinkStore::preparing(links, control))
+            .map(|session| PreparedDiscovery { session })
+            .map_err(|error| {
+                SetupFailure::from_error(crate::capture::BoundaryStage::Discovery, error)
+            })
+    }
+
+    fn attach_with_links(
+        cfg: &DiscoveryConfig,
+        pid: u32,
+        mut links: DiscoveryLinkStore,
+    ) -> anyhow::Result<Self> {
+        links.check()?;
+        let _temporary = links.temporary(2)?;
         let nz = NonZeroU32::new(pid).ok_or_else(|| anyhow!("pid must be non-zero"))?;
         // Pin FIRST: every later /proc/<pid> read and every
         // pid-scoped attach is verified against this identity.
         let pin = crate::pin::pin(pid)?;
         if let Some(marker) = &cfg.cmdline_marker {
+            let _read_temporary = links.temporary(1)?;
             let cmdline = std::fs::read(format!("/proc/{pid}/cmdline"))?;
             let m = marker.as_bytes();
             if !cmdline.windows(m.len()).any(|w| w == m) {
@@ -4878,7 +5145,14 @@ impl DiscoverySession {
         let prov_path_str = cfg.provider.to_string_lossy().into_owned();
         let prov_pin =
             crate::plan::resolve_pinned_retry(|| crate::plan::resolve_pinned(&prov_path_str))?;
-        let elf_bytes = std::fs::read(prov_pin.link_path())?;
+        links.check()?;
+        let elf_bytes = {
+            let _read_temporary = links.temporary(1)?;
+            read_attach_bounded(
+                Path::new(&prov_pin.link_path()),
+                crate::discovery::onboard::MAX_OBJECT_SCAN_BYTES,
+            )?
+        };
         let canon = std::fs::canonicalize(&cfg.provider)
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
@@ -4887,12 +5161,15 @@ impl DiscoverySession {
         // otherwise a bounded path read (never unbounded).
         let obj_bytes = match &cfg.object_bytes {
             Some(snapshot) => snapshot.clone(),
-            None => crate::discovery::onboard::read_bounded(
-                &cfg.object,
-                crate::discovery::onboard::MAX_OBJECT_SCAN_BYTES,
-            )
-            .map(std::sync::Arc::from)
-            .map_err(|e| anyhow::anyhow!("harvest object {}: {e}", cfg.object.display()))?,
+            None => {
+                let _read_temporary = links.temporary(1)?;
+                crate::discovery::onboard::read_bounded(
+                    &cfg.object,
+                    crate::discovery::onboard::MAX_OBJECT_SCAN_BYTES,
+                )
+                .map(std::sync::Arc::from)
+                .map_err(|e| anyhow::anyhow!("harvest object {}: {e}", cfg.object.display()))?
+            }
         };
         if pin.verify().is_err() {
             let mut core = SessionCore::new(cfg.provider.clone(), canon, cfg.legacy, pid);
@@ -4900,23 +5177,28 @@ impl DiscoverySession {
             return Err(core.recycled_err());
         }
 
+        links.check()?;
         let loaded = with_harvest_snapshot(&obj_bytes, load_frozen)?;
+        let classifier_temporary = links.temporary(2)?;
         let classifier_handles = crate::discovery::classifier_maps::clone_classifier_handles(
             &loaded.maps,
             crate::discovery::classifier_maps::ClassifierRole::Harvest,
         )?;
         crate::discovery::classifier_maps::after_classifier_init(
             move || {
-                crate::discovery::classifier_maps::initialize_classifier_maps(
+                let result = crate::discovery::classifier_maps::initialize_classifier_maps(
                     &classifier_handles,
                     crate::discovery::classifier_maps::ClassifierRole::Harvest,
-                )
+                );
+                drop(classifier_handles);
+                drop(classifier_temporary);
+                result
             },
             || {
                 // Chain jump table likewise: every query tail-calls into it.
+                links.check()?;
                 populate_jump_table(&loaded)?;
                 // Owns every multi link (drop = detach, all paths).
-                let mut links = LinkSet::default();
                 let mut builtin_query_attached = false;
                 let mut builtin_query_offset = 0u64;
                 let mut resolution: Option<String> = None;
@@ -4931,7 +5213,12 @@ impl DiscoverySession {
                 if cfg.builtin {
                     let table = match &cfg.table {
                         Some(path) => {
-                            let text = std::fs::read_to_string(path)?;
+                            links.check()?;
+                            let _read_temporary = links.temporary(1)?;
+                            let text = String::from_utf8(read_attach_bounded(
+                                path,
+                                crate::discovery::onboard::MAX_TABLE_FILE_BYTES,
+                            )?)?;
                             builtin::load_table_str(&text)?
                         }
                         None => builtin::shipped_table(),
@@ -5016,6 +5303,7 @@ impl DiscoverySession {
                     eprintln!("INSPECT stage=init attached=2");
                 }
 
+                let ring_temporary = links.temporary(1)?;
                 let ev_fd = loaded
                     .maps
                     .get("EVENTS")
@@ -5025,6 +5313,7 @@ impl DiscoverySession {
                     MapData::from_fd(ev_fd).map_err(|e| anyhow!("EVENTS mapdata: {e}"))?;
                 let ev_map = Map::from_map_data(ev_data).map_err(|e| anyhow!("EVENTS map: {e}"))?;
                 let ring = RingBuf::try_from(ev_map)?;
+                drop(ring_temporary);
 
                 let mut core =
                     SessionCore::new(cfg.provider.clone(), canon.clone(), cfg.legacy, pid);
@@ -5049,6 +5338,9 @@ impl DiscoverySession {
                         pino,
                     );
                 }
+                links.check()?;
+                drop(prov_pin);
+                drop(_temporary);
                 let mut env = LiveEnv {
                     pid,
                     provider: cfg.provider.clone(),
@@ -5136,6 +5428,595 @@ impl DiscoverySession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::os::unix::net::UnixStream;
+    use std::sync::{Arc, Mutex, atomic::AtomicBool, mpsc::sync_channel};
+    use std::time::{Duration, Instant};
+    fn native_test_control() -> SetupControl {
+        SetupControl::new(
+            Instant::now() + Duration::from_secs(15),
+            crate::capture_setup::SetupInterrupt::Owned(Arc::new(AtomicBool::new(false))),
+        )
+    }
+    fn native_test_loaded() -> Loaded {
+        let progs = ["entry", "ret", "trip_a", "trip_b"]
+            .into_iter()
+            .map(|name| {
+                let (fd, _) = UnixStream::pair().unwrap();
+                (name.to_owned(), fd.into())
+            })
+            .collect();
+        Loaded {
+            progs,
+            maps: HashMap::new(),
+        }
+    }
+    fn native_peer_closed(peer: &UnixStream) -> bool {
+        use std::io::Read;
+        let mut peer = peer;
+        match peer.read(&mut [0]) {
+            Ok(0) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => false,
+            result => panic!("sentinel read {result:?}"),
+        }
+    }
+    struct HeldDiscoveryOps {
+        peers: Arc<Mutex<Vec<UnixStream>>>,
+        ordinal: usize,
+        hold: usize,
+        entered: std::sync::mpsc::SyncSender<()>,
+        resume: std::sync::mpsc::Receiver<()>,
+    }
+    impl DiscoveryAttachOps for HeldDiscoveryOps {
+        fn create(
+            &mut self,
+            _: bool,
+            _: i32,
+            path: &std::ffi::CStr,
+            _: &[u64],
+            _: &[u64],
+            _: u32,
+        ) -> std::io::Result<OwnedFd> {
+            assert!(path.to_bytes().starts_with(b"/proc/self/fd/"));
+            let (fd, peer) = UnixStream::pair().unwrap();
+            peer.set_nonblocking(true).unwrap();
+            self.peers.lock().unwrap().push(peer);
+            if self.ordinal == self.hold {
+                self.entered.send(()).unwrap();
+                self.resume.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            self.ordinal += 1;
+            Ok(fd.into())
+        }
+    }
+    #[test]
+    fn w079_native_discovery_entry_return_and_trip_custody() {
+        for trips in [false, true] {
+            for hold in [0, 1] {
+                let ledger = SetupLinks::new();
+                let control = native_test_control();
+                let mut store = DiscoveryLinkStore::preparing(&ledger, &control);
+                let peers = Arc::new(Mutex::new(Vec::new()));
+                let (entered_tx, entered_rx) = sync_channel(1);
+                let (resume_tx, resume_rx) = sync_channel(1);
+                let mut ops = HeldDiscoveryOps {
+                    peers: peers.clone(),
+                    ordinal: 0,
+                    hold,
+                    entered: entered_tx,
+                    resume: resume_rx,
+                };
+                let worker = std::thread::spawn(move || {
+                    let loaded = native_test_loaded();
+                    if trips {
+                        let set = legacy::ProbeSet {
+                            probes: ["trip_a", "trip_b"]
+                                .into_iter()
+                                .enumerate()
+                                .map(|(i, program)| legacy::Probe {
+                                    cookie: i as u64,
+                                    symbol: "ENGINE_init".into(),
+                                    offset: 1,
+                                    module: "/proc/self/exe".into(),
+                                    family: None,
+                                    str_arg: None,
+                                    program,
+                                })
+                                .collect(),
+                            ..Default::default()
+                        };
+                        attach_trips_with_ops(&loaded, &mut store, &set, 1, &mut ops).map(|_| ())
+                    } else {
+                        let pin = crate::plan::resolve_pinned("/proc/self/exe").unwrap();
+                        attach_pair_with_ops(
+                            &loaded,
+                            &mut store,
+                            PairSpec {
+                                entry: "entry",
+                                ret: "ret",
+                                offset: 1,
+                                pin: &pin,
+                                pid: 1,
+                                cookie: 7,
+                                kind: LinkKind::Query,
+                            },
+                            &mut ops,
+                        )
+                    }
+                });
+                let entered = entered_rx.recv_timeout(Duration::from_secs(5));
+                let custody = ledger.abandon();
+                drop(custody);
+                let during: Vec<_> = peers
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(native_peer_closed)
+                    .collect();
+                let _ = resume_tx.send(());
+                let result = worker.join().unwrap();
+                assert!(entered.is_ok());
+                assert!(result.is_err());
+                assert_eq!(during.len(), hold + 1);
+                assert!(
+                    during[..hold].iter().all(|closed| *closed),
+                    "prior native discovery result must be in independently drainable custody"
+                );
+                assert!(!during[hold]);
+                assert!(peers.lock().unwrap().iter().all(native_peer_closed));
+            }
+        }
+    }
+    #[test]
+    fn w079_native_discovery_control_rejects_before_pin_or_file_effects() {
+        let cfg = DiscoveryConfig {
+            provider: PathBuf::from("/missing-provider"),
+            object: PathBuf::from("/missing-object"),
+            object_bytes: None,
+            builtin: false,
+            legacy: false,
+            table: None,
+            force_offset: None,
+            explicit_offsets: false,
+            cmdline_marker: None,
+        };
+        let control = native_test_control();
+        control.abandon();
+        let ledger = SetupLinks::new();
+        assert!(matches!(
+            DiscoverySession::prepare_controlled(&cfg, 0, &control, &ledger),
+            Err(SetupFailure::Cancelled {
+                stage: crate::capture::BoundaryStage::Discovery
+            })
+        ));
+    }
+    struct ReturnFailureOps {
+        peer: Option<UnixStream>,
+        panic_return: bool,
+        calls: usize,
+    }
+    impl DiscoveryAttachOps for ReturnFailureOps {
+        fn create(
+            &mut self,
+            ret: bool,
+            _: i32,
+            _: &std::ffi::CStr,
+            _: &[u64],
+            _: &[u64],
+            _: u32,
+        ) -> std::io::Result<OwnedFd> {
+            self.calls += 1;
+            if ret {
+                if self.panic_return {
+                    panic!("native return effect unwind");
+                }
+                return Err(std::io::Error::from_raw_os_error(libc::EPERM));
+            }
+            let (fd, peer) = UnixStream::pair().unwrap();
+            peer.set_nonblocking(true).unwrap();
+            self.peer = Some(peer);
+            Ok(fd.into())
+        }
+    }
+    #[test]
+    fn w079_native_discovery_pair_rollback_unwind_errno_and_capacity() {
+        let loaded = native_test_loaded();
+        let pin = crate::plan::resolve_pinned("/proc/self/exe").unwrap();
+        for preparing in [false, true] {
+            for panic_return in [false, true] {
+                let ledger = SetupLinks::new();
+                let control = native_test_control();
+                let mut store = if preparing {
+                    DiscoveryLinkStore::preparing(&ledger, &control)
+                } else {
+                    DiscoveryLinkStore::default()
+                };
+                let mut ops = ReturnFailureOps {
+                    peer: None,
+                    panic_return,
+                    calls: 0,
+                };
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    attach_pair_with_ops(
+                        &loaded,
+                        &mut store,
+                        PairSpec {
+                            entry: "entry",
+                            ret: "ret",
+                            offset: 1,
+                            pin: &pin,
+                            pid: 1,
+                            cookie: 7,
+                            kind: LinkKind::Query,
+                        },
+                        &mut ops,
+                    )
+                }));
+                if !panic_return {
+                    let failure = SetupFailure::from_error(
+                        crate::capture::BoundaryStage::Setup,
+                        outcome.unwrap().unwrap_err(),
+                    );
+                    assert!(matches!(
+                        failure,
+                        SetupFailure::Boundary(crate::capture::BoundaryFailure {
+                            errno: Some(libc::EPERM),
+                            ..
+                        })
+                    ));
+                } else {
+                    assert!(outcome.is_err());
+                }
+                assert_eq!(ops.calls, 2);
+                if preparing {
+                    assert!(
+                        ledger
+                            .reserve(&control, crate::capture::BoundaryStage::Discovery, 1)
+                            .is_err(),
+                        "partial controlled pairs are abort-only, including unwind"
+                    );
+                    let next = ledger
+                        .reserve(&control, crate::capture::BoundaryStage::Discovery, 1)
+                        .err()
+                        .unwrap();
+                    if panic_return {
+                        assert!(matches!(
+                            next,
+                            SetupFailure::Boundary(crate::capture::BoundaryFailure {
+                                class: crate::capture::BoundaryFailureClass::Panic,
+                                ..
+                            })
+                        ));
+                    } else {
+                        assert!(
+                            matches!(
+                                next,
+                                SetupFailure::Boundary(crate::capture::BoundaryFailure {
+                                    errno: Some(libc::EPERM),
+                                    ..
+                                })
+                            ),
+                            "sealed native custody preserves its original failure, rather than converting it to cancellation"
+                        );
+                    }
+                }
+                assert_eq!(store.counts(), if preparing { (1, 0) } else { (0, 0) });
+                assert_eq!(native_peer_closed(ops.peer.as_ref().unwrap()), !preparing);
+                drop(ledger.abandon());
+                assert!(native_peer_closed(ops.peer.as_ref().unwrap()));
+            }
+        }
+        let ledger = SetupLinks::new();
+        let control = native_test_control();
+        let held = ledger
+            .reserve(&control, crate::capture::BoundaryStage::Discovery, 1023)
+            .unwrap();
+        let mut store = DiscoveryLinkStore::preparing(&ledger, &control);
+        let mut ops = ReturnFailureOps {
+            peer: None,
+            panic_return: false,
+            calls: 0,
+        };
+        assert!(
+            attach_pair_with_ops(
+                &loaded,
+                &mut store,
+                PairSpec {
+                    entry: "entry",
+                    ret: "ret",
+                    offset: 1,
+                    pin: &pin,
+                    pid: 1,
+                    cookie: 7,
+                    kind: LinkKind::Query
+                },
+                &mut ops
+            )
+            .is_err()
+        );
+        assert_eq!(ops.calls, 0);
+        drop(held);
+        let ledger = SetupLinks::new();
+        let mut store = DiscoveryLinkStore::preparing(&ledger, &control);
+        let temporary = ledger
+            .temporary(&control, crate::capture::BoundaryStage::Discovery, 3)
+            .unwrap();
+        assert!(
+            attach_pair_with_ops(
+                &loaded,
+                &mut store,
+                PairSpec {
+                    entry: "entry",
+                    ret: "ret",
+                    offset: 1,
+                    pin: &pin,
+                    pid: 1,
+                    cookie: 7,
+                    kind: LinkKind::Query
+                },
+                &mut ops
+            )
+            .is_err()
+        );
+        assert_eq!(ops.calls, 0);
+        drop(temporary);
+    }
+
+    fn assert_fix1_native_cause(error: SetupFailure, panic: bool) {
+        match error {
+            SetupFailure::Boundary(failure) => {
+                assert_eq!(failure.stage, crate::capture::BoundaryStage::Discovery);
+                assert_eq!(
+                    failure.class,
+                    if panic {
+                        crate::capture::BoundaryFailureClass::Panic
+                    } else {
+                        crate::capture::BoundaryFailureClass::Io
+                    }
+                );
+                assert_eq!(failure.errno, if panic { None } else { Some(libc::EPERM) });
+                assert!(!failure.detail.is_empty());
+            }
+            other => panic!("recorded native cause was replaced: {other:?}"),
+        }
+    }
+    #[test]
+    fn w079_fix1_recorded_native_cause_precedes_later_control() {
+        use crate::capture_setup::SetupInterrupt;
+        use std::sync::atomic::Ordering;
+        for panic_return in [false, true] {
+            for later in ["interrupt", "abandon", "expired"] {
+                let ledger = SetupLinks::new();
+                let original = native_test_control();
+                let mut store = DiscoveryLinkStore::preparing(&ledger, &original);
+                let loaded = native_test_loaded();
+                let pin = crate::plan::resolve_pinned("/proc/self/exe").unwrap();
+                let mut ops = ReturnFailureOps {
+                    peer: None,
+                    panic_return,
+                    calls: 0,
+                };
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    attach_pair_with_ops(
+                        &loaded,
+                        &mut store,
+                        PairSpec {
+                            entry: "entry",
+                            ret: "ret",
+                            offset: 1,
+                            pin: &pin,
+                            pid: 1,
+                            cookie: 7,
+                            kind: LinkKind::Query,
+                        },
+                        &mut ops,
+                    )
+                }));
+                if panic_return {
+                    assert!(outcome.is_err());
+                } else {
+                    assert!(outcome.unwrap().is_err());
+                }
+                assert_eq!(ops.calls, 2);
+                assert!(!native_peer_closed(ops.peer.as_ref().unwrap()));
+                let flag = Arc::new(AtomicBool::new(false));
+                let control = SetupControl::new(
+                    if later == "expired" {
+                        Instant::now()
+                    } else {
+                        Instant::now() + Duration::from_secs(15)
+                    },
+                    SetupInterrupt::Owned(flag.clone()),
+                );
+                if later == "interrupt" {
+                    flag.store(true, Ordering::Release);
+                }
+                if later == "abandon" {
+                    control.abandon();
+                }
+                let store = DiscoveryLinkStore::preparing(&ledger, &control);
+                assert_fix1_native_cause(
+                    SetupFailure::from_error(
+                        crate::capture::BoundaryStage::Setup,
+                        store.check().unwrap_err(),
+                    ),
+                    panic_return,
+                );
+                assert_fix1_native_cause(
+                    ledger
+                        .reserve(&control, crate::capture::BoundaryStage::Traversal, 1)
+                        .err()
+                        .expect("recorded failure refuses reserve"),
+                    panic_return,
+                );
+                assert_fix1_native_cause(
+                    ledger
+                        .temporary(&control, crate::capture::BoundaryStage::Traversal, 1)
+                        .err()
+                        .expect("recorded failure refuses temporary"),
+                    panic_return,
+                );
+                assert_eq!(ops.calls, 2, "later admission creates no native effect");
+                drop(ledger.abandon());
+                assert!(native_peer_closed(ops.peer.as_ref().unwrap()));
+            }
+        }
+        // No recorded cause: otherwise-running native admission keeps
+        // cancellation before deadline, consistently across all three paths.
+        let ledger = SetupLinks::new();
+        let control = SetupControl::new(
+            Instant::now(),
+            SetupInterrupt::Owned(Arc::new(AtomicBool::new(true))),
+        );
+        let store = DiscoveryLinkStore::preparing(&ledger, &control);
+        assert!(matches!(
+            store.check().unwrap_err().downcast_ref::<SetupFailure>(),
+            Some(SetupFailure::Cancelled { .. })
+        ));
+        assert!(matches!(
+            ledger.reserve(&control, crate::capture::BoundaryStage::Traversal, 1),
+            Err(SetupFailure::Cancelled { .. })
+        ));
+        assert!(matches!(
+            ledger.temporary(&control, crate::capture::BoundaryStage::Traversal, 1),
+            Err(SetupFailure::Cancelled { .. })
+        ));
+    }
+
+    struct TripBatchFailureOps {
+        failure: u8,
+        calls: usize,
+        peers: Vec<UnixStream>,
+    }
+    impl DiscoveryAttachOps for TripBatchFailureOps {
+        fn create(
+            &mut self,
+            ret: bool,
+            _: i32,
+            path: &std::ffi::CStr,
+            _: &[u64],
+            _: &[u64],
+            _: u32,
+        ) -> std::io::Result<OwnedFd> {
+            assert!(!ret);
+            assert!(path.to_bytes().starts_with(b"/proc/self/fd/"));
+            self.calls += 1;
+            if self.calls == 2 {
+                if self.failure == 1 {
+                    return Err(std::io::Error::from_raw_os_error(libc::EPERM));
+                }
+                assert_ne!(self.failure, 2, "native trip second-group unwind");
+            }
+            let (fd, peer) = UnixStream::pair().unwrap();
+            peer.set_nonblocking(true).unwrap();
+            self.peers.push(peer);
+            Ok(fd.into())
+        }
+    }
+    #[test]
+    fn w079_fix1_trip_batch_error_unwind_and_local_success_controls() {
+        let loaded = native_test_loaded();
+        let set = legacy::ProbeSet {
+            probes: ["trip_a", "trip_b"]
+                .into_iter()
+                .enumerate()
+                .map(|(i, program)| legacy::Probe {
+                    cookie: i as u64,
+                    symbol: "ENGINE_init".into(),
+                    offset: 1,
+                    module: "/proc/self/exe".into(),
+                    family: None,
+                    str_arg: None,
+                    program,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        for preparing in [false, true] {
+            for failure in [0, 1, 2] {
+                let ledger = SetupLinks::new();
+                let control = native_test_control();
+                let mut store = if preparing {
+                    DiscoveryLinkStore::preparing(&ledger, &control)
+                } else {
+                    DiscoveryLinkStore::default()
+                };
+                let mut ops = TripBatchFailureOps {
+                    failure,
+                    calls: 0,
+                    peers: Vec::new(),
+                };
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    attach_trips_with_ops(&loaded, &mut store, &set, 1, &mut ops)
+                }));
+                if failure == 2 {
+                    assert!(outcome.is_err());
+                } else if failure == 1 {
+                    assert!(outcome.unwrap().is_err());
+                } else {
+                    assert_eq!(outcome.unwrap().unwrap().len(), 2);
+                }
+                assert_eq!(ops.calls, 2);
+                assert_eq!(store.counts(), (0, if failure == 0 { 2 } else { 1 }));
+                assert!(
+                    ops.peers.iter().all(|peer| !native_peer_closed(peer)),
+                    "earlier trip FDs remain owned after error or unwind"
+                );
+                if preparing && failure != 0 {
+                    assert_fix1_native_cause(
+                        SetupFailure::from_error(
+                            crate::capture::BoundaryStage::Setup,
+                            store.check().unwrap_err(),
+                        ),
+                        failure == 2,
+                    );
+                    assert_fix1_native_cause(
+                        ledger
+                            .reserve(&control, crate::capture::BoundaryStage::Traversal, 1)
+                            .err()
+                            .expect("partial trip batch is abort-only"),
+                        failure == 2,
+                    );
+                    let mut next = TripBatchFailureOps {
+                        failure: 0,
+                        calls: 0,
+                        peers: Vec::new(),
+                    };
+                    assert!(
+                        attach_trips_with_ops(&loaded, &mut store, &set, 1, &mut next).is_err()
+                    );
+                    assert_eq!(
+                        next.calls, 0,
+                        "sealed trip failure prevents the next actual create"
+                    );
+                    assert!(ops.peers.iter().all(|peer| !native_peer_closed(peer)));
+                    drop(ledger.abandon());
+                } else {
+                    store.check().unwrap();
+                    let mut next = TripBatchFailureOps {
+                        failure: 0,
+                        calls: 0,
+                        peers: Vec::new(),
+                    };
+                    assert_eq!(
+                        attach_trips_with_ops(&loaded, &mut store, &set, 1, &mut next)
+                            .unwrap()
+                            .len(),
+                        2
+                    );
+                    assert_eq!(next.calls, 2);
+                    assert!(next.peers.iter().all(|peer| !native_peer_closed(peer)));
+                    if preparing {
+                        drop(ledger.abandon());
+                    } else {
+                        store.clear();
+                    }
+                    assert!(next.peers.iter().all(native_peer_closed));
+                }
+                assert!(ops.peers.iter().all(native_peer_closed));
+            }
+        }
+    }
 
     /// Round 2, residual F: each diagnostic producer's exact text.
     /// The live attach paths are unconstructible on host (BPF

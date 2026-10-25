@@ -2775,6 +2775,45 @@ pub fn attach_members_from_bytes(
     pid: u32,
     ctrl: &osslscope_ebpf_common::CtrlValue,
 ) -> anyhow::Result<MembersAttached> {
+    let mut links = crate::capture_setup::MemberLinkStore::local();
+    let loaded = prepare_members_from_bytes(bytes, exe, off, pid, ctrl, &mut links)?;
+    let links = links.take_local();
+    Ok(MembersAttached {
+        loaded,
+        entry: links.entry.expect("full entry attached"),
+        members: links.members,
+    })
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct FullMemberInput<'a> {
+    pub(crate) bytes: &'a [u8],
+    pub(crate) exe: &'a std::ffi::CStr,
+    pub(crate) off: u64,
+    pub(crate) pid: u32,
+    pub(crate) ctrl: &'a osslscope_ebpf_common::CtrlValue,
+}
+pub(crate) fn prepare_full_members(
+    input: FullMemberInput<'_>,
+    links: &mut crate::capture_setup::MemberLinkStore,
+) -> anyhow::Result<Loaded> {
+    prepare_members_from_bytes(
+        input.bytes,
+        input.exe,
+        input.off,
+        input.pid,
+        input.ctrl,
+        links,
+    )
+}
+fn prepare_members_from_bytes(
+    bytes: &[u8],
+    exe: &std::ffi::CStr,
+    off: u64,
+    pid: u32,
+    ctrl: &osslscope_ebpf_common::CtrlValue,
+    links: &mut crate::capture_setup::MemberLinkStore,
+) -> anyhow::Result<Loaded> {
     use anyhow::Context as _;
     if bytes.len() as u64 > crate::discovery::onboard::MAX_OBJECT_SCAN_BYTES {
         anyhow::bail!(
@@ -2782,8 +2821,11 @@ pub fn attach_members_from_bytes(
             bytes.len()
         );
     }
+    links.check()?;
     ensure_members_fd_budget()?;
+    links.check()?;
     let prep = prepare(bytes, &MEMBER_MAPS, &MEMBER_PROGS).context("prepare members.o")?;
+    links.check()?;
     let loaded = load(&prep).context("load members.o")?;
     let mut ops = NativeMemberAttachOps { exe, off, pid };
     attach_full_loaded(
@@ -2796,46 +2838,149 @@ pub fn attach_members_from_bytes(
             )
         },
         &mut ops,
+        links,
     )
 }
 
-fn attach_full_loaded<I: FnOnce(&HashMap<String, OwnedFd>) -> anyhow::Result<()>>(
+#[cfg(test)]
+fn attach_full_local<I: FnOnce(&HashMap<String, OwnedFd>) -> anyhow::Result<()>>(
     loaded: Loaded,
     ctrl: &osslscope_ebpf_common::CtrlValue,
     initialize: I,
     ops: &mut impl MemberAttachOps,
 ) -> anyhow::Result<MembersAttached> {
-    use anyhow::Context as _;
-    ops.ctrl(&loaded.maps, ctrl).context("program CTRL")?;
-    let classifier_handles = crate::discovery::classifier_maps::clone_classifier_handles(
-        &loaded.maps,
-        crate::discovery::classifier_maps::ClassifierRole::Members,
-    )?;
-    crate::discovery::classifier_maps::after_classifier_init(
-        move || initialize(&classifier_handles),
-        || {
-            let entry = ops
-                .entry(loaded.progs["member_entry"].as_fd())
-                .context("attach member_entry")?;
-            let mut members = Vec::with_capacity(512);
-            for j in 0..512u64 {
-                let name = format!("member_{j:03}");
-                let prog = loaded
-                    .progs
-                    .get(&name)
-                    .with_context(|| format!("prog {name} missing"))?;
-                members.push(
-                    ops.member(prog.as_fd(), j as u32)
-                        .with_context(|| format!("attach {name}"))?,
-                );
-            }
-            Ok(MembersAttached {
-                loaded,
-                entry,
-                members,
-            })
-        },
+    let mut links = crate::capture_setup::MemberLinkStore::local();
+    let loaded = attach_full_loaded(loaded, ctrl, initialize, ops, &mut links)?;
+    let links = links.take_local();
+    Ok(MembersAttached {
+        loaded,
+        entry: links.entry.expect("full entry attached"),
+        members: links.members,
+    })
+}
+struct MemberAttachGuard<'a> {
+    links: &'a mut crate::capture_setup::MemberLinkStore,
+    complete: bool,
+    failure: Option<crate::capture_setup::SetupFailure>,
+}
+impl Drop for MemberAttachGuard<'_> {
+    fn drop(&mut self) {
+        if !self.complete {
+            let failure = self.failure.take().unwrap_or_else(|| {
+                crate::capture_setup::SetupFailure::Boundary(crate::capture::BoundaryFailure::new(
+                    crate::capture::BoundaryStage::Traversal,
+                    crate::capture::BoundaryFailureClass::Panic,
+                    None,
+                    "native member attach unwound",
+                ))
+            });
+            self.links.abort(failure);
+        }
+    }
+}
+fn attach_full_loaded<I: FnOnce(&HashMap<String, OwnedFd>) -> anyhow::Result<()>>(
+    loaded: Loaded,
+    ctrl: &osslscope_ebpf_common::CtrlValue,
+    initialize: I,
+    ops: &mut impl MemberAttachOps,
+    links: &mut crate::capture_setup::MemberLinkStore,
+) -> anyhow::Result<Loaded> {
+    let mut guard = MemberAttachGuard {
+        links,
+        complete: false,
+        failure: None,
+    };
+    let result = (|| {
+        let links = &mut *guard.links;
+        use anyhow::Context as _;
+        links.check()?;
+        ops.ctrl(&loaded.maps, ctrl).context("program CTRL")?;
+        let classifier_temporary = links.temporary(1)?;
+        let classifier_handles = crate::discovery::classifier_maps::clone_classifier_handles(
+            &loaded.maps,
+            crate::discovery::classifier_maps::ClassifierRole::Members,
+        )?;
+        links.check()?;
+        let loaded = crate::discovery::classifier_maps::after_classifier_init(
+            move || {
+                let result = initialize(&classifier_handles);
+                drop(classifier_handles);
+                drop(classifier_temporary);
+                result
+            },
+            || {
+                let mut reservation = links.reserve()?;
+                let entry = ops
+                    .entry(loaded.progs["member_entry"].as_fd())
+                    .context("attach member_entry")?;
+                links.push(None, entry, &mut reservation)?;
+                attach_member_slots_with_ops(&loaded, &(0..512).collect::<Vec<_>>(), links, ops)?;
+                Ok(loaded)
+            },
+        )?;
+        Ok(loaded)
+    })();
+    if let Err(error) = &result {
+        guard.failure = Some(crate::capture_setup::SetupFailure::from_error_ref(
+            crate::capture::BoundaryStage::Traversal,
+            error,
+        ));
+    }
+    guard.complete = result.is_ok();
+    result
+}
+
+pub(crate) fn attach_member_slots(
+    loaded: &Loaded,
+    exe: &std::ffi::CStr,
+    off: u64,
+    pid: u32,
+    slots: &[u32],
+    links: &mut crate::capture_setup::MemberLinkStore,
+) -> anyhow::Result<()> {
+    attach_member_slots_with_ops(
+        loaded,
+        slots,
+        links,
+        &mut NativeMemberAttachOps { exe, off, pid },
     )
+}
+fn attach_member_slots_with_ops(
+    loaded: &Loaded,
+    slots: &[u32],
+    links: &mut crate::capture_setup::MemberLinkStore,
+    ops: &mut impl MemberAttachOps,
+) -> anyhow::Result<()> {
+    let mut guard = MemberAttachGuard {
+        links,
+        complete: false,
+        failure: None,
+    };
+    let result = (|| {
+        let links = &mut *guard.links;
+        use anyhow::Context as _;
+        for &slot in slots {
+            let name = format!("member_{slot:03}");
+            let prog = loaded
+                .progs
+                .get(&name)
+                .with_context(|| format!("prog {name} missing"))?;
+            let mut reservation = links.reserve()?;
+            let link = ops
+                .member(prog.as_fd(), slot)
+                .with_context(|| format!("attach {name}"))?;
+            links.push(Some(slot), link, &mut reservation)?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = &result {
+        guard.failure = Some(crate::capture_setup::SetupFailure::from_error_ref(
+            crate::capture::BoundaryStage::Traversal,
+            error,
+        ));
+    }
+    guard.complete = result.is_ok();
+    result
 }
 
 /// Strip the kernel log buffer's NUL padding (the verifier writes a
@@ -2980,6 +3125,226 @@ mod tests {
         crate::discovery::classifier_maps::tests::host_initialize_members(maps, None)
     }
 
+    struct HeldMemberOps {
+        peers: std::sync::Arc<std::sync::Mutex<Vec<UnixStream>>>,
+        ordinal: usize,
+        hold: usize,
+        panic_at: Option<usize>,
+        entered: std::sync::mpsc::SyncSender<()>,
+        resume: std::sync::mpsc::Receiver<()>,
+    }
+    impl HeldMemberOps {
+        fn link(&mut self) -> OwnedFd {
+            let (fd, peer) = UnixStream::pair().unwrap();
+            peer.set_nonblocking(true).unwrap();
+            self.peers.lock().unwrap().push(peer);
+            assert_ne!(
+                Some(self.ordinal),
+                self.panic_at,
+                "native member effect unwind"
+            );
+            if self.ordinal == self.hold {
+                self.entered.send(()).unwrap();
+                self.resume
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+            }
+            self.ordinal += 1;
+            fd.into()
+        }
+    }
+    impl MemberAttachOps for HeldMemberOps {
+        fn entry(&mut self, _: BorrowedFd<'_>) -> anyhow::Result<OwnedFd> {
+            Ok(self.link())
+        }
+        fn member(&mut self, _: BorrowedFd<'_>, _: u32) -> anyhow::Result<OwnedFd> {
+            Ok(self.link())
+        }
+        fn ctrl(
+            &mut self,
+            _: &HashMap<String, OwnedFd>,
+            _: &osslscope_ebpf_common::CtrlValue,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+    fn sentinel_closed(peer: &UnixStream) -> bool {
+        use std::io::Read;
+        let mut peer = peer;
+        match peer.read(&mut [0]) {
+            Ok(0) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => false,
+            result => panic!("sentinel read {result:?}"),
+        }
+    }
+    #[test]
+    fn w079_native_member_first_and_late_custody_at_actual_effects() {
+        use crate::capture_setup::{MemberLinkStore, SetupControl, SetupInterrupt, SetupLinks};
+        use std::sync::{Arc, Mutex, atomic::AtomicBool, mpsc::sync_channel};
+        use std::time::{Duration, Instant};
+        // Entry, member0, middle and511 are genuine NativeMemberAttachOps
+        // boundaries; selection/classifier/ownership are the production body.
+        for hold in [0, 1, 257, 512] {
+            let links = SetupLinks::new();
+            let control = SetupControl::new(
+                Instant::now() + Duration::from_secs(15),
+                SetupInterrupt::Owned(Arc::new(AtomicBool::new(false))),
+            );
+            let peers = Arc::new(Mutex::new(Vec::new()));
+            let (entered_tx, entered_rx) = sync_channel(1);
+            let (resume_tx, resume_rx) = sync_channel(1);
+            let mut ops = HeldMemberOps {
+                peers: peers.clone(),
+                ordinal: 0,
+                hold,
+                panic_at: None,
+                entered: entered_tx,
+                resume: resume_rx,
+            };
+            let mut store = MemberLinkStore::preparing(&links, &control);
+            let worker = std::thread::spawn(move || {
+                let loaded = model_loaded(&(0..512).collect::<Vec<_>>());
+                let ctrl = osslscope_ebpf_common::ctrl_value(512, 1, 1 << 22);
+                attach_full_loaded(loaded, &ctrl, model_initialize, &mut ops, &mut store)
+                    .map(|_| ())
+            });
+            let entered = entered_rx.recv_timeout(Duration::from_secs(5));
+            let custody = links.abandon();
+            let before = peers
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|peer| !sentinel_closed(peer));
+            drop(custody);
+            let during: Vec<_> = peers.lock().unwrap().iter().map(sentinel_closed).collect();
+            let _ = resume_tx.send(());
+            let result = worker.join().unwrap();
+            assert!(entered.is_ok());
+            assert!(before);
+            assert_eq!(during.len(), hold + 1);
+            assert!(
+                during[..hold].iter().all(|closed| *closed),
+                "prior returned links must be independently disposable before the held effect resumes"
+            );
+            assert!(!during[hold], "in-flight native result stays worker-owned");
+            assert!(result.is_err());
+            assert!(peers.lock().unwrap().iter().all(sentinel_closed));
+        }
+    }
+    #[test]
+    fn w079_native_member_dynamic_and_unwind_retain_actual_custody() {
+        use crate::capture_setup::{MemberLinkStore, SetupControl, SetupInterrupt, SetupLinks};
+        use std::sync::{Arc, Mutex, atomic::AtomicBool, mpsc::sync_channel};
+        use std::time::{Duration, Instant};
+        for panic_at in [None, Some(1)] {
+            let links = SetupLinks::new();
+            let control = SetupControl::new(
+                Instant::now() + Duration::from_secs(15),
+                SetupInterrupt::Owned(Arc::new(AtomicBool::new(false))),
+            );
+            let peers = Arc::new(Mutex::new(Vec::new()));
+            let (entered_tx, entered_rx) = sync_channel(1);
+            let (resume_tx, resume_rx) = sync_channel(1);
+            let mut ops = HeldMemberOps {
+                peers: peers.clone(),
+                ordinal: 0,
+                hold: 1,
+                panic_at,
+                entered: entered_tx,
+                resume: resume_rx,
+            };
+            let mut store = MemberLinkStore::preparing(&links, &control);
+            let worker = std::thread::spawn(move || {
+                attach_member_slots_with_ops(
+                    &model_loaded(&[0, 256, 511]),
+                    &[0, 256, 511],
+                    &mut store,
+                    &mut ops,
+                )
+            });
+            if panic_at.is_none() {
+                let entered = entered_rx.recv_timeout(Duration::from_secs(5));
+                links.retire_members();
+                let during: Vec<_> = peers.lock().unwrap().iter().map(sentinel_closed).collect();
+                let custody = links.abandon();
+                drop(custody);
+                let after_drain: Vec<_> =
+                    peers.lock().unwrap().iter().map(sentinel_closed).collect();
+                let _ = resume_tx.send(());
+                let result = worker.join().unwrap();
+                assert!(entered.is_ok());
+                assert_eq!(during, [false, false]);
+                assert_eq!(after_drain, [true, false]);
+                assert!(result.is_err());
+            } else {
+                assert!(worker.join().is_err());
+                assert!(
+                    links
+                        .reserve(&control, crate::capture::BoundaryStage::Traversal, 1)
+                        .is_err(),
+                    "member unwind leaves abort-only native custody"
+                );
+                assert_eq!(
+                    peers
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .map(sentinel_closed)
+                        .collect::<Vec<_>>(),
+                    [false, true]
+                );
+                drop(links.abandon());
+            }
+            assert!(peers.lock().unwrap().iter().all(sentinel_closed));
+        }
+    }
+
+    #[test]
+    fn w079_native_member_full_positive_and_capacity_before_effect() {
+        use crate::capture_setup::{MemberLinkStore, SetupControl, SetupInterrupt, SetupLinks};
+        use std::sync::{Arc, atomic::AtomicBool};
+        use std::time::{Duration, Instant};
+        let links = SetupLinks::new();
+        let control = SetupControl::new(
+            Instant::now() + Duration::from_secs(15),
+            SetupInterrupt::Owned(Arc::new(AtomicBool::new(false))),
+        );
+        let mut store = MemberLinkStore::preparing(&links, &control);
+        let mut ops = ModelMemberOps::default();
+        let ctrl = osslscope_ebpf_common::ctrl_value(512, 1, 1 << 22);
+        let loaded = attach_full_loaded(
+            model_loaded(&(0..512).collect::<Vec<_>>()),
+            &ctrl,
+            model_initialize,
+            &mut ops,
+            &mut store,
+        )
+        .unwrap();
+        assert_eq!(ops.entry_calls, 1);
+        assert_eq!(ops.member_calls, (0..512).collect::<Vec<_>>());
+        assert_eq!(ops.link_identities.len(), 513);
+        drop(links.abandon());
+        ops.assert_links_closed();
+        drop(loaded);
+        let links = SetupLinks::new();
+        let held = links
+            .reserve(&control, crate::capture::BoundaryStage::Traversal, 1024)
+            .unwrap();
+        let mut store = MemberLinkStore::preparing(&links, &control);
+        let mut ops = ModelMemberOps::default();
+        let result = attach_full_loaded(
+            model_loaded(&[0]),
+            &ctrl,
+            model_initialize,
+            &mut ops,
+            &mut store,
+        );
+        assert!(result.is_err());
+        assert_eq!(ops.entry_calls, 0);
+        assert!(ops.member_calls.is_empty());
+        drop(held);
+    }
+
     #[test]
     fn member_postload_classifier_failure_creates_no_links() {
         let loaded = model_loaded(&[1, 3]);
@@ -3056,7 +3421,7 @@ mod tests {
             ..Default::default()
         };
         let ctrl = osslscope_ebpf_common::ctrl_value(512, 1, 1 << 22);
-        let error = attach_full_loaded(loaded, &ctrl, model_initialize, &mut ops)
+        let error = attach_full_local(loaded, &ctrl, model_initialize, &mut ops)
             .err()
             .expect("full attach must refuse member failure");
         assert!(format!("{error:#}").contains("attach member_001"));
@@ -3076,7 +3441,7 @@ mod tests {
         let mut ops = ModelMemberOps::default();
         let ctrl = osslscope_ebpf_common::ctrl_value(512, 1, 1 << 22);
         assert!(
-            attach_full_loaded(
+            attach_full_local(
                 loaded,
                 &ctrl,
                 |maps| crate::discovery::classifier_maps::tests::host_initialize_members(

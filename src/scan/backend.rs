@@ -18,6 +18,7 @@
 
 use super::governor::{DutyThrottle, StormAction, StormDetector, ThrottleAction};
 use super::registry::BirthState;
+use crate::capture_setup::{MemberLinkStore, MemberLinks, SetupControl, SetupFailure, SetupLinks};
 use crate::loader::{Loaded, MembersAttached};
 use crate::scan::oracle::{
     AbandonReason, Correction, Finding, Oracle, OracleScope, ScanBatch, TrueT, WalkDone,
@@ -141,7 +142,7 @@ pub struct BackendSnapshot {
 pub struct ScanBackend {
     cfg: BackendConfig,
     loaded: Loaded,
-    links: Option<BackendLinks>,
+    links: Option<MemberLinkStore>,
     /// Tier-3 storm cut: member links dropped + SKIP_ALL set; the
     /// entry link stays (the ATTEMPT census stays live, so the
     /// re-attach gate observes the real rate — a full detach
@@ -187,12 +188,27 @@ pub struct ScanBackend {
     last_admitted: BTreeMap<u32, u64>,
 }
 
-/// Owned link fds (never read — the fds ARE the attachment;
-/// drop detaches).
-#[allow(dead_code)]
-struct BackendLinks {
-    entry: OwnedFd,
-    members: Vec<OwnedFd>,
+/// Real backend state that keeps using the shared link sink during baseline.
+/// Task4 promotes it only with the ledger's final member-link bucket.
+pub(crate) struct PreparedScanBackend {
+    backend: ScanBackend,
+}
+impl PreparedScanBackend {
+    pub(crate) fn finish(mut self, links: MemberLinks) -> ScanBackend {
+        self.backend.links = Some(MemberLinkStore::Local(links));
+        self.backend
+    }
+}
+impl std::ops::Deref for PreparedScanBackend {
+    type Target = ScanBackend;
+    fn deref(&self) -> &Self::Target {
+        &self.backend
+    }
+}
+impl std::ops::DerefMut for PreparedScanBackend {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.backend
+    }
 }
 
 impl ScanBackend {
@@ -258,14 +274,75 @@ impl ScanBackend {
                 (sub.attached, set, sub.failed)
             }
         };
+        let links = MemberLinkStore::Local(MemberLinks {
+            entry: Some(attached.entry),
+            members: attached.members,
+        });
+        Self::from_loaded(
+            attached.loaded,
+            links,
+            BackendConfig {
+                obj: obj.to_path_buf(),
+                exe: exe.clone(),
+                off,
+                pid,
+                ctrl: *ctrl,
+                slots: attached_slots.into_iter().collect(),
+            },
+            clock_base_ns,
+            failed,
+        )
+    }
+
+    pub(crate) fn prepare_controlled(
+        input: crate::loader::FullMemberInput<'_>,
+        obj: &Path,
+        clock_base_ns: u64,
+        control: &SetupControl,
+        links: &SetupLinks,
+    ) -> Result<PreparedScanBackend, SetupFailure> {
+        let stage = crate::capture::BoundaryStage::Traversal;
+        control.check(stage)?;
+        let mut store = MemberLinkStore::preparing(links, control);
+        let loaded = crate::loader::prepare_full_members(input, &mut store)
+            .map_err(|e| SetupFailure::from_error(stage, e))?;
+        control.check(stage)?;
+        Self::from_loaded(
+            loaded,
+            store,
+            BackendConfig {
+                obj: obj.to_path_buf(),
+                exe: input.exe.to_owned(),
+                off: input.off,
+                pid: input.pid,
+                ctrl: *input.ctrl,
+                slots: (0..512).collect(),
+            },
+            clock_base_ns,
+            Vec::new(),
+        )
+        .map(|backend| PreparedScanBackend { backend })
+        .map_err(|e| SetupFailure::from_error(stage, e))
+    }
+
+    // Existing backend construction is shared by public direct and controlled
+    // full-member attachment; the supplied snapshot is never re-read.
+    fn from_loaded(
+        loaded: Loaded,
+        links: MemberLinkStore,
+        cfg: BackendConfig,
+        clock_base_ns: u64,
+        failed: Vec<crate::loader::FailedSlot>,
+    ) -> anyhow::Result<Self> {
         let scope = OracleScope {
-            expected: attached_slots.len() as u32,
-            attached: attached_slots.clone(),
-            epoch: ctrl.epoch,
+            expected: cfg.slots.len() as u32,
+            attached: cfg.slots.iter().copied().collect(),
+            epoch: cfg.ctrl.epoch,
             known_t: BTreeMap::new(),
         };
-        let ring_fd = attached
-            .loaded
+        links.check()?;
+        let _temporary = links.temporary(1)?;
+        let ring_fd = loaded
             .maps
             .get("EVENTS")
             .context("members EVENTS map")?
@@ -274,22 +351,10 @@ impl ScanBackend {
         let data = aya::maps::MapData::from_fd(ring_fd).context("EVENTS mapdata")?;
         let map = aya::maps::Map::from_map_data(data).context("EVENTS map")?;
         let ring = aya::maps::RingBuf::try_from(map).context("EVENTS ringbuf")?;
-        let mut sorted: Vec<u32> = attached_slots.into_iter().collect();
-        sorted.sort_unstable();
         Ok(Self {
-            cfg: BackendConfig {
-                obj: obj.to_path_buf(),
-                exe: exe.clone(),
-                off,
-                pid,
-                ctrl: *ctrl,
-                slots: sorted,
-            },
-            loaded: attached.loaded,
-            links: Some(BackendLinks {
-                entry: attached.entry,
-                members: attached.members,
-            }),
+            cfg,
+            loaded,
+            links: Some(links),
             storm_detached: false,
             finishing: false,
             ring,
@@ -700,7 +765,7 @@ impl ScanBackend {
     /// instead of half-observed). The loaded object stays.
     fn detach(&mut self) -> anyhow::Result<()> {
         if let Some(links) = self.links.as_mut() {
-            links.members.clear();
+            links.clear_members();
         }
         self.storm_detached = true;
         self.set_skip_all(true)
@@ -711,27 +776,28 @@ impl ScanBackend {
     /// release SKIP_ALL unless tier-2 still holds it.
     fn reattach(&mut self) -> anyhow::Result<()> {
         use anyhow::Context as _;
-        let mut members = Vec::with_capacity(self.cfg.slots.len());
-        for j in self.cfg.slots.clone() {
-            let name = format!("member_{j:03}");
-            let prog = self
-                .loaded
-                .progs
-                .get(&name)
-                .with_context(|| format!("prog {name} missing"))?;
-            members.push(
-                ossl_bpf_sys::link_create_uretprobe_multi(
-                    prog.as_raw_fd(),
-                    &self.cfg.exe,
-                    &[self.cfg.off],
-                    &[u64::from(j)],
-                    self.cfg.pid,
-                )
-                .with_context(|| format!("re-attach {name}"))?,
-            );
-        }
         let links = self.links.as_mut().context("entry link retained")?;
-        links.members = members;
+        // Direct callers preserve all-or-fail replacement. Preparing callers
+        // immediately register every native result in the shared ledger.
+        let mut local = if matches!(links, MemberLinkStore::Local(_)) {
+            Some(MemberLinkStore::local())
+        } else {
+            None
+        };
+        let sink = local.as_mut().unwrap_or(links);
+        crate::loader::attach_member_slots(
+            &self.loaded,
+            &self.cfg.exe,
+            self.cfg.off,
+            self.cfg.pid,
+            &self.cfg.slots,
+            sink,
+        )?;
+        if let Some(local) = local {
+            if let Some(MemberLinkStore::Local(links)) = self.links.as_mut() {
+                links.members = local.take_local().members;
+            }
+        }
         self.storm_detached = false;
         if !self.throttle.throttled() {
             self.set_skip_all(false)?;
@@ -1799,6 +1865,38 @@ mod tests {
         );
         let (deltas0, high0) = fold_loss_deltas(&BTreeMap::new(), &[]);
         assert!(deltas0.is_empty() && high0.is_empty());
+    }
+
+    #[test]
+    fn w079_native_backend_control_rejects_before_load() {
+        use crate::capture_setup::{SetupControl, SetupFailure, SetupInterrupt, SetupLinks};
+        use std::sync::{Arc, atomic::AtomicBool};
+        use std::time::Duration;
+        let control = SetupControl::new(
+            Instant::now() + Duration::from_secs(15),
+            SetupInterrupt::Owned(Arc::new(AtomicBool::new(true))),
+        );
+        let ctrl = wire::ctrl_value(512, 1, 1 << 22);
+        let exe = CString::new("/missing-exe").unwrap();
+        let input = crate::loader::FullMemberInput {
+            bytes: b"not an object",
+            exe: &exe,
+            off: 0,
+            pid: 0,
+            ctrl: &ctrl,
+        };
+        assert!(matches!(
+            ScanBackend::prepare_controlled(
+                input,
+                Path::new("/missing-object"),
+                0,
+                &control,
+                &SetupLinks::new()
+            ),
+            Err(SetupFailure::Cancelled {
+                stage: crate::capture::BoundaryStage::Traversal
+            })
+        ));
     }
 
     #[test]

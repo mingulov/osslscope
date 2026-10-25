@@ -544,7 +544,7 @@ fn h5_t3_every_device_site_names_one_domain() {
         (
             "src/discovery/session.rs",
             "stat",
-            "dev: crate::plan::render_device(pin.device),",
+            "let identity = (crate::plan::render_device(pin.device), pin.ino);",
             1,
         ),
         (

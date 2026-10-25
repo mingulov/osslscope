@@ -10,6 +10,7 @@ pub mod aliases;
 // safe CLI arguments; placement is alphabetical, no other movement.
 pub mod args;
 pub mod capture;
+pub(crate) mod capture_setup;
 pub mod check;
 pub mod cli;
 pub(crate) mod count_owner;

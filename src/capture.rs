@@ -2937,7 +2937,7 @@ pub struct BoundaryFailure {
     pub detail: String,
 }
 impl BoundaryFailure {
-    fn new(
+    pub(crate) fn new(
         stage: BoundaryStage,
         class: BoundaryFailureClass,
         errno: Option<i32>,
@@ -2950,7 +2950,7 @@ impl BoundaryFailure {
             detail: crate::report::normalize_fatal_detail(detail),
         }
     }
-    fn from_error(stage: BoundaryStage, error: &anyhow::Error) -> Self {
+    pub(crate) fn from_error(stage: BoundaryStage, error: &anyhow::Error) -> Self {
         if let Some(boundary) = error.downcast_ref::<Self>() {
             return boundary.clone();
         }
