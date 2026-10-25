@@ -2609,6 +2609,8 @@ struct Probe {
     changed: Condvar,
     released: Mutex<bool>,
     release: Condvar,
+    hold_deadline: Mutex<Option<Instant>>,
+    hold_expired: AtomicBool,
 }
 impl Probe {
     fn new() -> Arc<Self> {
@@ -2620,6 +2622,8 @@ impl Probe {
             changed: Condvar::new(),
             released: Mutex::new(false),
             release: Condvar::new(),
+            hold_deadline: Mutex::new(None),
+            hold_expired: AtomicBool::new(false),
         })
     }
     fn event(&self, event: Event) {
@@ -2645,8 +2649,18 @@ impl Probe {
     }
     fn hold(&self) {
         let mut released = self.released.lock().unwrap();
+        let deadline = *locked(&self.hold_deadline);
         while !*released {
-            released = self.release.wait(released).unwrap();
+            if let Some(deadline) = deadline {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    self.hold_expired.store(true, Ordering::Release);
+                    break;
+                }
+                released = self.release.wait_timeout(released, remaining).unwrap().0;
+            } else {
+                released = self.release.wait(released).unwrap();
+            }
         }
     }
     fn release(&self) {
@@ -10050,7 +10064,16 @@ fn g1_actual_owner_open_recovery_reaches_capture_and_cli_consumer() {
                     false,
                     &mut Vec::new(),
                 );
-                assert_eq!(consumed.exit_code, if lost || mode == 4 { 1 } else { 4 });
+                assert_eq!(
+                    consumed.exit_code,
+                    if lost || (mode == 4 && failure != 0) {
+                        1
+                    } else if mode == 4 {
+                        if check { 11 } else { 3 }
+                    } else {
+                        4
+                    }
+                );
                 assert_eq!(consumed.delivery.primary.ok, failure != 1);
                 assert_eq!(consumed.delivery.cbom.as_ref().unwrap().ok, failure != 2);
                 assert_eq!(consumed.child_exit, cancelled.then_some(137));
@@ -11259,7 +11282,7 @@ fn w079_count_failure_classes_preserve_deadline_cancel_and_actual_io() {
                 .unwrap();
         assert_eq!(failure.failure.class, class);
         let actual = converted.actual_failure();
-        if class == FailureClass::Deadline {
+        if matches!(class, FailureClass::Deadline | FailureClass::Cancelled) {
             assert!(actual.is_none());
         } else {
             assert_eq!(
@@ -11315,4 +11338,318 @@ fn w079_count_actual_host_preflight_validates_before_owner_effects() {
     assert_eq!(failure.cleanup_ticket, None);
     lease.abort();
     lease.complete_abort().unwrap();
+}
+
+// The app keeps actual file pins/identity while existing host drivers model
+// only Count kernel effects. Every file remains registered with the real owner.
+struct W079AppDriver(TerminalDriver);
+impl CountIoDriver for W079AppDriver {
+    fn map_create(&mut self, spec: &crate::loader::MapSpecLite) -> io::Result<OwnedFd> {
+        self.0.map_create(spec)
+    }
+    fn load_program(&mut self, i: &[u8], n: &str, l: Option<&mut [u8]>) -> io::Result<OwnedFd> {
+        self.0.load_program(i, n, l)
+    }
+    fn open_pin(&mut self, path: &CStr) -> io::Result<OwnedFd> {
+        let pin = LiveCountIoDriver.open_pin(path)?;
+        self.0
+            .map
+            .base
+            .probe
+            .event(Event::PinOpened(pin.as_raw_fd()));
+        Ok(pin)
+    }
+    fn pin_identity(&mut self, pin: BorrowedFd<'_>) -> io::Result<BackingIdentity> {
+        LiveCountIoDriver.pin_identity(pin)
+    }
+    fn attach(
+        &mut self,
+        prog: BorrowedFd<'_>,
+        path: &CStr,
+        offsets: &[u64],
+        cookies: &[u64],
+        pid: u32,
+    ) -> io::Result<OwnedFd> {
+        self.0.attach(prog, path, offsets, cookies, pid)
+    }
+    unsafe fn update(&mut self, fd: BorrowedFd<'_>, key: &[u8], value: &[u8]) -> io::Result<()> {
+        unsafe { self.0.update(fd, key, value) }
+    }
+    unsafe fn lookup(
+        &mut self,
+        fd: BorrowedFd<'_>,
+        key: &[u8],
+        value: &mut [u8],
+    ) -> io::Result<()> {
+        unsafe { self.0.lookup(fd, key, value) }
+    }
+    unsafe fn next_key(
+        &mut self,
+        fd: BorrowedFd<'_>,
+        key: Option<&[u8]>,
+        next: &mut [u8],
+    ) -> io::Result<()> {
+        unsafe { self.0.next_key(fd, key, next) }
+    }
+    fn close(&mut self, fd: OwnedFd) -> io::Result<()> {
+        self.0.close(fd)
+    }
+    fn now(&self) -> Instant {
+        self.0.now()
+    }
+    fn monotonic_ns(&self) -> Option<u64> {
+        self.0.monotonic_ns()
+    }
+}
+// Narrow application fixture bridge: the same owner, mailbox, controlled token,
+// map driver, FD sentinels and physical cleanup observations used above.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum W079AppPrepareHold {
+    FdInventory,
+    OuterCpu,
+    OwnerCpu,
+    Hash,
+    Parse,
+    Allocation,
+    OwnerStart,
+    PrepareReply,
+}
+pub(crate) struct W079AppCountFixture {
+    probe: Arc<MapProbe>,
+    open_fault: std::sync::atomic::AtomicU8,
+    hold_map_call: Option<usize>,
+    hold_close: bool,
+    hold_attach: bool,
+    prepare_hold: Option<W079AppPrepareHold>,
+    prepare_entered: Arc<AtomicBool>,
+}
+impl W079AppCountFixture {
+    pub(crate) fn new(
+        hold_map_call: Option<usize>,
+        hold_close: bool,
+        hold_attach: bool,
+        prepare_hold: Option<W079AppPrepareHold>,
+    ) -> Self {
+        let probe = MapProbe::new();
+        *locked(&probe.owner.hold_deadline) = Some(Instant::now() + Duration::from_secs(10));
+        Self {
+            probe,
+            open_fault: std::sync::atomic::AtomicU8::new(0),
+            hold_map_call,
+            hold_close,
+            hold_attach,
+            prepare_hold,
+            prepare_entered: Arc::new(AtomicBool::new(false)),
+        }
+    }
+    pub(crate) fn fail_open(&self, unwind: bool) {
+        self.open_fault
+            .store(if unwind { 2 } else { 1 }, Ordering::Release);
+    }
+    pub(crate) fn prepare_entered(&self) -> bool {
+        if self.prepare_hold == Some(W079AppPrepareHold::PrepareReply) {
+            return locked(&self.probe.owner.log)
+                .events
+                .iter()
+                .any(|(_, event)| matches!(event, Event::EnterAcquire(8)));
+        }
+        self.prepare_entered.load(Ordering::Acquire)
+    }
+    fn stage(&self, stage: W079AppPrepareHold) {
+        if self.prepare_hold == Some(stage) {
+            self.prepare_entered.store(true, Ordering::Release);
+            self.probe.owner.hold();
+        }
+    }
+    pub(crate) fn release(&self) {
+        self.probe.owner.release();
+    }
+    pub(crate) fn wait_map_call(&self, n: usize) {
+        self.probe.wait_calls(n);
+    }
+    pub(crate) fn attach_entered(&self) -> bool {
+        locked(&self.probe.owner.log)
+            .events
+            .iter()
+            .any(|(_, event)| matches!(event, Event::EnterAcquire(9)))
+    }
+    pub(crate) fn close_entered(&self) -> bool {
+        locked(&self.probe.owner.log)
+            .events
+            .iter()
+            .any(|(_, event)| matches!(event, Event::EnterClose))
+    }
+    pub(crate) fn open_target_writes(&self) -> usize {
+        locked(&self.probe.calls)
+            .iter()
+            .filter(|(_, action)| {
+                matches!(action,
+            MapAction::Write(CountMap::Target, _, value) if value.iter().any(|byte| *byte != 0))
+            })
+            .count()
+    }
+    pub(crate) fn descriptors_closed(&self) -> bool {
+        let log = locked(&self.probe.owner.log);
+        let acquired = log
+            .events
+            .iter()
+            .filter(|(_, e)| matches!(e, Event::Acquired(_)))
+            .count();
+        let closed = log
+            .events
+            .iter()
+            .filter(|(_, e)| matches!(e, Event::Closed(_)))
+            .count();
+        let pins = log
+            .events
+            .iter()
+            .filter(|(_, e)| matches!(e, Event::PinOpened(_)))
+            .count();
+        (acquired >= 8 || self.prepare_hold.is_some())
+            && closed == acquired + pins
+            && !self.probe.owner.hold_expired.load(Ordering::Acquire)
+    }
+    pub(crate) fn prepare(
+        &self,
+        pid: u32,
+        admission: CountSetupAdmission,
+        control: &CountPrepareControl,
+        journal: &CountSetupJournal,
+    ) -> Result<CountEngine, CountPrepareFailure> {
+        let mut input = input(admission.barrier.clone());
+        input.target_tgid = pid;
+        let probe = self.probe.clone();
+        let observed = probe.owner.clone();
+        let mut hooks = if self.prepare_hold == Some(W079AppPrepareHold::OwnerCpu) {
+            PrepareHooks::live()
+        } else {
+            PrepareHooks::host()
+        };
+        hooks.possible_cpu_count = || Ok(2);
+        let stage_hold = self.prepare_hold;
+        let stage_entered = self.prepare_entered.clone();
+        let stage_probe = probe.owner.clone();
+        hooks.stage_observer = Some(Arc::new(move |stage| {
+            let stage = match stage {
+                CountPrepareStage::OwnerCpu => Some(W079AppPrepareHold::OwnerCpu),
+                CountPrepareStage::Hash => Some(W079AppPrepareHold::Hash),
+                CountPrepareStage::Parse => Some(W079AppPrepareHold::Parse),
+                CountPrepareStage::Allocation => Some(W079AppPrepareHold::Allocation),
+                _ => None,
+            };
+            if stage.is_some() && stage == stage_hold {
+                stage_entered.store(true, Ordering::Release);
+                stage_probe.hold();
+            }
+        }));
+        hooks.kernel_profile = KernelApplicability::reviewed_fixture(1);
+        hooks.registry_observer = Some(Arc::new(move |event| {
+            observed.event(Event::Registry(event))
+        }));
+        let cutoff = control.deadline();
+        let hold_map_call = self.hold_map_call;
+        let open_fault = self.open_fault.load(Ordering::Acquire);
+        let hold_close = self.hold_close;
+        let hold_attach = self.hold_attach;
+        let prepare_hold = self.prepare_hold;
+        let spawn_probe = probe.owner.clone();
+        let spawn_entered = self.prepare_entered.clone();
+        crate::capture::prepare_count_backend_controlled_with(
+            input,
+            cutoff,
+            admission,
+            control,
+            journal,
+            (
+                || {
+                    self.stage(W079AppPrepareHold::FdInventory);
+                    let mut sampled = crate::capture::CountFdAdmission::snapshot(
+                        crate::capture_setup::COUNT_NON_COUNT_FD_RESERVE,
+                    )?;
+                    // Existing host model uses a conservative24-FD owner allowance;
+                    // the real inventory is measured and the2052 reserve unchanged.
+                    sampled.soft_limit = sampled
+                        .soft_limit
+                        .min(sampled.non_count_open + sampled.non_count_reserved + 24);
+                    Ok(sampled)
+                },
+                || {
+                    self.stage(W079AppPrepareHold::OuterCpu);
+                    let _actual = aya::util::nr_cpus().map_err(|error| {
+                        OwnerFailure::io(CountOperation::Load, ResourceId::Engine, &error.1)
+                    })?;
+                    Ok(2) // explicit existing two-CPU HostModel driver, not live qualification
+                },
+            ),
+            move |input, limits, cutoff, admission, control, journal| {
+                CountEngine::prepare_controlled_with(
+                    input,
+                    limits,
+                    cutoff,
+                    hooks,
+                    move || {
+                        probe.owner.event(Event::Started);
+                        W079AppDriver(TerminalDriver {
+                            map: MapDriver {
+                                base: PipeDriver {
+                                    probe: probe.owner.clone(),
+                                    faults: Faults {
+                                        hold_close: hold_close.then_some(1),
+                                        hold_acquire: if prepare_hold
+                                            == Some(W079AppPrepareHold::PrepareReply)
+                                        {
+                                            Some(8)
+                                        } else {
+                                            hold_attach.then_some(9)
+                                        },
+                                        ..Faults::default()
+                                    },
+                                    deadline: cutoff,
+                                    attempts: 0,
+                                    acquired: 0,
+                                    closes: 0,
+                                },
+                                probe,
+                                faults: MapFaults {
+                                    hold_call: hold_map_call,
+                                    write_error: (open_fault == 1).then_some(5),
+                                    panic_call: (open_fault == 2).then_some(5),
+                                    ..MapFaults::default()
+                                },
+                                maps: [-1; 7],
+                                map_count: 0,
+                                next_position: 0,
+                                writes: 0,
+                                cpus: 2,
+                                cutoff,
+                            },
+                            writer: None,
+                            links: Vec::with_capacity(4),
+                            timeline: Arc::new(Mutex::new(Vec::new())),
+                            clock_panic_after_close: false,
+                            clock: None,
+                            seal_clock: None,
+                            lookup_gate: None,
+                        })
+                    },
+                    move |task| {
+                        if prepare_hold == Some(W079AppPrepareHold::OwnerStart) {
+                            spawn_owner(Box::new(move || {
+                                spawn_entered.store(true, Ordering::Release);
+                                spawn_probe.hold();
+                                task();
+                            }))
+                        } else {
+                            spawn_owner(task)
+                        }
+                    },
+                    SetupPreparation {
+                        admission: Some(admission),
+                        control: control.clone(),
+                        journal: journal.clone(),
+                    },
+                )
+            },
+        )
+    }
 }

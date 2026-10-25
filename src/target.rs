@@ -102,6 +102,8 @@ enum SetupChildState {
 /// cleanup can become pending. It deliberately has no blocking Drop backstop.
 /// The setup cleanup owner retains it (and its pidfd) until custody is resolved.
 pub(crate) struct OwnedSetupCleanup {
+    #[cfg(test)]
+    reap_hold: Option<std::sync::Weak<SetupReapHold>>,
     pid: u32,
     pidfd: OwnedFd,
     initial_stop: i32,
@@ -185,6 +187,37 @@ fn setup_pidfd_signal(fd: &OwnedFd, signal: i32) -> std::io::Result<()> {
         Err(std::io::Error::last_os_error())
     }
 }
+#[cfg(test)]
+pub(crate) struct SetupReapHold {
+    held: std::sync::atomic::AtomicBool,
+    pub(crate) entered: std::sync::atomic::AtomicBool,
+}
+#[cfg(test)]
+impl SetupReapHold {
+    pub(crate) fn release(&self) {
+        self.held.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+#[cfg(test)]
+impl Drop for SetupReapHold {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+#[cfg(test)]
+pub(crate) fn hold_setup_reap(target: &mut OwnedTarget) -> std::sync::Arc<SetupReapHold> {
+    let hold = std::sync::Arc::new(SetupReapHold {
+        held: std::sync::atomic::AtomicBool::new(true),
+        entered: std::sync::atomic::AtomicBool::new(false),
+    });
+    target
+        .setup
+        .as_mut()
+        .expect("exact retained pre-release child")
+        .reap_hold = Some(std::sync::Arc::downgrade(&hold));
+    hold
+}
+
 impl OwnedSetupCleanup {
     pub(crate) fn step(&mut self) -> anyhow::Result<SetupCleanupProgress> {
         use SetupChildState::*;
@@ -205,6 +238,15 @@ impl OwnedSetupCleanup {
             _ => {}
         }
         let consuming = matches!(self.state, ExitObserved(_));
+        #[cfg(test)]
+        if consuming && let Some(hold) = self.reap_hold.as_ref().and_then(std::sync::Weak::upgrade)
+        {
+            hold.entered
+                .store(true, std::sync::atomic::Ordering::Release);
+            if hold.held.load(std::sync::atomic::Ordering::Acquire) {
+                return Ok(SetupCleanupProgress::Pending);
+            }
+        }
         let options = libc::WNOHANG
             | libc::WEXITED
             | if consuming {
@@ -2154,6 +2196,8 @@ impl OwnedTarget {
                     state: CustodyState::Stopped,
                     exit_code: None,
                     setup: Some(OwnedSetupCleanup {
+                        #[cfg(test)]
+                        reap_hold: None,
                         pid,
                         pidfd: guard.pidfd.take().expect("guard retained pidfd"),
                         initial_stop,

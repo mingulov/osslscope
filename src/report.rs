@@ -485,11 +485,7 @@ pub fn no_observation_document(failure: &capture::PreObservationFailure) -> Capt
     use crate::evidence::{
         CaptureWindow, FinalizeInput, GapCounter, LegacyCallPartition, OpensslVersion, finalize,
     };
-    let actual = failure
-        .failure
-        .clone()
-        .or_else(|| failure.custody.failure.clone())
-        .or_else(|| failure.count.actual_failure());
+    let actual = failure.output_failure();
     let mut counters = match &failure.count {
         capture::PreObservationCount::Terminal(t) => t
             .retained_drain
@@ -667,6 +663,8 @@ pub fn consume_capture_result_with_diagnostics(
 ) -> CaptureCommandResult {
     let mut lines = Vec::new();
     let mut unknown_setup = false;
+    let mut observer_cancelled_child = false;
+    let mut setup_internal_panic = false;
     let mut capture_result = None;
     let mut no_observation = None;
     let mut unknown_detail = None;
@@ -677,7 +675,24 @@ pub fn consume_capture_result_with_diagnostics(
                 lines.push(format!("capture cause=runtime/{:?}", f.kind));
                 capture_result = Some(std::sync::Arc::unwrap_or_clone(f.capture));
             }
-            CaptureFailureClass::NoObservation(f) => no_observation = Some(f),
+            CaptureFailureClass::NoObservation(f) => {
+                let actual = f.output_failure();
+                setup_internal_panic =
+                    actual.as_ref().is_some_and(|failure| {
+                        failure.class == capture::BoundaryFailureClass::Panic
+                    }) && f.failure.as_ref().is_some_and(|failure| {
+                        failure.class == capture::BoundaryFailureClass::Panic
+                    }) && f.custody.failure.is_none()
+                        && f.count.actual_failure().is_none();
+                observer_cancelled_child = f.cause == capture::PreObservationCause::Cancelled
+                    && actual.is_none()
+                    && f.release.is_none_or(|release| {
+                        release.outcome != capture::ReleaseOutcome::Succeeded
+                    })
+                    && f.custody.resolution == capture::CustodyResolution::Resolved
+                    && f.custody.child_exit == Some(137);
+                no_observation = Some(f);
+            }
             CaptureFailureClass::UntypedSetup { detail } => unknown_detail = Some(detail),
         },
     }
@@ -759,7 +774,7 @@ pub fn consume_capture_result_with_diagnostics(
             verdict.overall()
         }
     };
-    if let Some(hint) = workload_hint(child_exit, workload_discarded) {
+    if let Some(hint) = workload_hint(child_exit, workload_discarded && !observer_cancelled_child) {
         lines.push(hint);
     }
     let delivery = write_artifacts(&document, request);
@@ -781,7 +796,19 @@ pub fn consume_capture_result_with_diagnostics(
             break;
         }
     }
-    let exit_code = exit_for(outcome, child_exit, &document, &delivery);
+    let exit_child = if observer_cancelled_child {
+        None
+    } else {
+        child_exit
+    };
+    let exit_code = if setup_internal_panic
+        && matches!(command, CaptureCommand::Report)
+        && outcome != crate::policy::PolicyOutcome::Violation
+    {
+        1
+    } else {
+        exit_for(outcome, exit_child, &document, &delivery)
+    };
     CaptureCommandResult {
         document,
         child_exit,

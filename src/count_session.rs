@@ -2818,6 +2818,11 @@ pub struct LiveBackend {
     engine: CountEngine,
 }
 impl LiveBackend {
+    #[cfg(test)]
+    pub(crate) fn from_setup_fixture(engine: CountEngine) -> Self {
+        Self { engine }
+    }
+
     pub(crate) fn prepare_controlled(
         input: CountInput,
         limits: CountOwnerLimits,

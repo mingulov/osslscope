@@ -330,16 +330,85 @@ impl std::fmt::Display for ReadBoundedError {
 }
 
 pub fn read_bounded(path: &Path, max: u64) -> Result<Vec<u8>, ReadBoundedError> {
+    let mut file = std::fs::File::open(path).map_err(ReadBoundedError::Io)?;
+    read_bounded_reader(&mut file, max)
+}
+fn read_bounded_reader(
+    reader: &mut impl std::io::Read,
+    max: u64,
+) -> Result<Vec<u8>, ReadBoundedError> {
     use std::io::Read as _;
-    let f = std::fs::File::open(path).map_err(ReadBoundedError::Io)?;
     let mut buf = Vec::new();
-    f.take(max + 1)
+    reader
+        .take(max + 1)
         .read_to_end(&mut buf)
         .map_err(ReadBoundedError::Io)?;
     if buf.len() as u64 > max {
         return Err(ReadBoundedError::TooLarge(max));
     }
     Ok(buf)
+}
+pub(crate) fn read_bounded_controlled(
+    path: &Path,
+    max: u64,
+    links: &crate::capture_setup::SetupLinks,
+    stage: crate::capture::BoundaryStage,
+    fatal: bool,
+) -> Result<Vec<u8>, ReadBoundedError> {
+    let file = std::fs::File::open(path).map_err(|error| {
+        if fatal {
+            links.seal(crate::capture_setup::SetupFailure::io(
+                stage,
+                &error,
+                "setup bounded file open failed",
+            ));
+        }
+        ReadBoundedError::Io(error)
+    })?;
+    #[cfg(test)]
+    links.test_retained_fd(std::os::fd::AsRawFd::as_raw_fd(&file));
+    let mut file = crate::capture_setup::SetupResource::guarded(file, links, stage);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        read_bounded_reader(&mut *file, max)
+    }));
+    match result {
+        Ok(result) => {
+            if let Err(error) = &result
+                && fatal
+            {
+                let failure = match error {
+                    ReadBoundedError::Io(error) => crate::capture_setup::SetupFailure::io(
+                        stage,
+                        error,
+                        "setup bounded file read failed",
+                    ),
+                    error => crate::capture_setup::SetupFailure::Boundary(
+                        crate::capture::BoundaryFailure::new(
+                            stage,
+                            crate::capture::BoundaryFailureClass::InvalidInput,
+                            None,
+                            &error.to_string(),
+                        ),
+                    ),
+                };
+                links.seal(failure);
+            }
+            links.before_dispose(stage);
+            result
+        }
+        Err(panic) => {
+            links.seal(crate::capture_setup::SetupFailure::Boundary(
+                crate::capture::BoundaryFailure::new(
+                    stage,
+                    crate::capture::BoundaryFailureClass::Panic,
+                    None,
+                    "setup bounded file read unwound",
+                ),
+            ));
+            links.before_dispose(stage);
+            std::panic::resume_unwind(panic)
+        }
+    }
 }
 
 /// Loader-shape compatibility: the same frozen `prepare` check the
@@ -1728,6 +1797,13 @@ pub struct SpawnPrediction {
 /// `incomplete`. Content verdicts (ELF shape, flavor, anchors)
 /// belong to qualification — prediction only fails on I/O.
 pub fn predict_spawn_lib(argv: &[String], env: &SpawnEnv) -> Result<SpawnPrediction, OnboardError> {
+    predict_spawn_lib_with(argv, env, &mut |path, max, _| read_bounded(path, max))
+}
+fn predict_spawn_lib_with(
+    argv: &[String],
+    env: &SpawnEnv,
+    read: &mut impl FnMut(&Path, u64, bool) -> Result<Vec<u8>, ReadBoundedError>,
+) -> Result<SpawnPrediction, OnboardError> {
     use std::collections::{HashSet, VecDeque};
     let argv0 = argv.first().map(String::as_str).unwrap_or("");
     if argv0.is_empty() {
@@ -1737,7 +1813,7 @@ pub fn predict_spawn_lib(argv: &[String], env: &SpawnEnv) -> Result<SpawnPredict
         ));
     }
     let exe = resolve_spawn_exe(argv0, env);
-    let exe_bytes = read_bounded(&exe, MAX_OBJECT_SCAN_BYTES).map_err(|e| {
+    let exe_bytes = read(&exe, MAX_OBJECT_SCAN_BYTES, true).map_err(|e| {
         OnboardError::new(
             format!("cannot read spawn executable {}: {e}", exe.display()),
             "check the command exists and is readable".to_string(),
@@ -1783,7 +1859,7 @@ pub fn predict_spawn_lib(argv: &[String], env: &SpawnEnv) -> Result<SpawnPredict
         files_visited += 1;
         let (bytes, rpath, runpath) = match bytes_opt {
             Some(b) => (b, rpath, runpath),
-            None => match read_bounded(&file, MAX_OBJECT_SCAN_BYTES) {
+            None => match read(&file, MAX_OBJECT_SCAN_BYTES, false) {
                 Ok(b) => {
                     bytes_read += b.len() as u64;
                     let (rp, run) = elf::rpath_runpath(&b).unwrap_or((None, None));
@@ -1861,7 +1937,15 @@ pub fn discover_spawn(
     opts: &QualifyOpts,
     env: &SpawnEnv,
 ) -> Result<TargetQualification, OnboardError> {
-    let pred = predict_spawn_lib(argv, env)?;
+    discover_spawn_with(argv, opts, env, &mut |path, max, _| read_bounded(path, max))
+}
+fn discover_spawn_with(
+    argv: &[String],
+    opts: &QualifyOpts,
+    env: &SpawnEnv,
+    read: &mut impl FnMut(&Path, u64, bool) -> Result<Vec<u8>, ReadBoundedError>,
+) -> Result<TargetQualification, OnboardError> {
+    let pred = predict_spawn_lib_with(argv, env, read)?;
     if !pred.exe_bytes.starts_with(b"\x7fELF") {
         return Ok(TargetQualification::Unknown {
             reason: format!(
@@ -1914,7 +1998,7 @@ pub fn discover_spawn(
             });
         }
         let path = &pred.libs[0];
-        let bytes = read_bounded(path, MAX_OBJECT_SCAN_BYTES).map_err(|e| {
+        let bytes = read(path, MAX_OBJECT_SCAN_BYTES, true).map_err(|e| {
             OnboardError::new(
                 format!("predicted libcrypto {} unreadable: {e}", path.display()),
                 "check permissions on the library file".to_string(),
@@ -1937,6 +2021,55 @@ pub fn discover_spawn(
         true,
         opts,
     ))
+}
+
+pub(crate) fn read_error(error: ReadBoundedError) -> anyhow::Error {
+    match error {
+        ReadBoundedError::Io(error) => error.into(),
+        ReadBoundedError::TooLarge(max) => {
+            anyhow::anyhow!("file exceeds {} MiB scan bound", max >> 20)
+        }
+    }
+}
+pub(crate) fn discover_spawn_controlled(
+    argv: &[String],
+    opts: &QualifyOpts,
+    env: &SpawnEnv,
+    links: &crate::capture_setup::SetupLinks,
+) -> anyhow::Result<TargetQualification> {
+    let stage = crate::capture::BoundaryStage::Setup;
+    let mut fatal = None;
+    let result = discover_spawn_with(argv, opts, env, &mut |path, max, is_fatal| {
+        links
+            .check_owned(stage)
+            .map_err(|failure| ReadBoundedError::Io(std::io::Error::other(failure)))?;
+        let result = read_bounded_controlled(path, max, links, stage, is_fatal);
+        if let Err(error) = &result {
+            if is_fatal {
+                fatal = Some(match error {
+                    ReadBoundedError::Io(error) => crate::capture_setup::SetupFailure::io(
+                        stage,
+                        error,
+                        "spawn qualification read failed",
+                    ),
+                    error => crate::capture_setup::SetupFailure::Boundary(
+                        crate::capture::BoundaryFailure::new(
+                            stage,
+                            crate::capture::BoundaryFailureClass::InvalidInput,
+                            None,
+                            &error.to_string(),
+                        ),
+                    ),
+                });
+            }
+        }
+        result
+    });
+    result.map_err(|error| {
+        fatal
+            .map(anyhow::Error::new)
+            .unwrap_or_else(|| anyhow::Error::new(error))
+    })
 }
 
 #[cfg(test)]

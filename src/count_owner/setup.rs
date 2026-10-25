@@ -38,7 +38,24 @@ pub(crate) enum CountSetupPhase {
     Ready,
     Failed,
 }
+// One-way physical-disposal permission; it has no edge back to app state.
+pub(crate) struct DisposalHold(AtomicBool);
+impl DisposalHold {
+    fn new() -> Self {
+        Self(AtomicBool::new(false))
+    }
+    pub(super) fn permitted(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+    pub(crate) fn release_commit(&self, _: &crate::capture::ReleaseCommit) {
+        self.permit();
+    }
+    fn permit(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
 struct JournalState {
+    disposal: Option<Arc<DisposalHold>>,
     phase: CountSetupPhase,
     shared: Option<Arc<Shared>>,
     abandoned: bool,
@@ -66,6 +83,7 @@ pub(crate) struct CountSetupProgress {
 impl CountSetupJournal {
     pub(crate) fn new() -> Self {
         Self(Arc::new(Mutex::new(JournalState {
+            disposal: None,
             phase: CountSetupPhase::NotInvoked,
             shared: None,
             abandoned: false,
@@ -73,6 +91,14 @@ impl CountSetupJournal {
             failure: None,
             launch: None,
         })))
+    }
+    pub(crate) fn new_held() -> Self {
+        let journal = Self::new();
+        locked(&journal.0).disposal = Some(Arc::new(DisposalHold::new()));
+        journal
+    }
+    pub(crate) fn disposal_hold(&self) -> Option<Arc<DisposalHold>> {
+        locked(&self.0).disposal.clone()
     }
     pub(crate) fn watch(&self) -> CountSetupWatch {
         CountSetupWatch(self.clone())
@@ -153,6 +179,18 @@ impl CountSetupJournal {
     }
 }
 impl CountSetupWatch {
+    pub(crate) fn child_receipt(&self, receipt: &crate::capture::CustodyReceipt) {
+        if matches!(
+            receipt.resolution,
+            crate::capture::CustodyResolution::Resolved
+                | crate::capture::CustodyResolution::NotAcquired
+        ) {
+            if let Some(hold) = self.0.disposal_hold() {
+                hold.permit();
+            }
+        }
+    }
+
     pub(crate) fn abandon(&self) {
         // Claim the real Shared flag in the same publication critical section.
         // Timestamp sampling and wake syscalls stay outside this lock.

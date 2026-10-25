@@ -76,7 +76,7 @@ use crate::capture_setup::{DiscoveryLinkStore, SetupControl, SetupFailure, Setup
 use crate::discovery::{builtin, coverage, elf, harvest, legacy, maps};
 use crate::loader::Loaded;
 use anyhow::{Context as _, anyhow, bail};
-use aya::maps::{Map, MapData, RingBuf};
+use aya::maps::{Map, MapData};
 use osslscope_ebpf_common as wire;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::CString;
@@ -3913,8 +3913,23 @@ fn prog_fd(loaded: &Loaded, name: &str) -> anyhow::Result<std::os::fd::RawFd> {
         .ok_or_else(|| anyhow!("missing program {name}"))
 }
 
-fn read_attach_bounded(path: &Path, cap: u64) -> anyhow::Result<Vec<u8>> {
-    crate::discovery::onboard::read_bounded(path, cap).map_err(|error| match error {
+fn read_attach_bounded(
+    path: &Path,
+    cap: u64,
+    setup: Option<&SetupLinks>,
+    fatal: bool,
+) -> anyhow::Result<Vec<u8>> {
+    match setup {
+        Some(setup) => crate::discovery::onboard::read_bounded_controlled(
+            path,
+            cap,
+            setup,
+            crate::capture::BoundaryStage::Discovery,
+            fatal,
+        ),
+        None => crate::discovery::onboard::read_bounded(path, cap),
+    }
+    .map_err(|error| match error {
         crate::discovery::onboard::ReadBoundedError::Io(error) => anyhow::Error::new(error),
         error => anyhow!(error),
     })
@@ -4027,25 +4042,31 @@ fn attach_pair_with_ops(
     // One fd per link entry: the pin dups once per push and drops
     // with its link.
     let fd_path = pin.link_path();
-    let cpath = link_path(Path::new(&fd_path))?;
+    let cpath = links.retain_result(link_path(Path::new(&fd_path)))?;
     // Reserve both slots and duplicate required pins before the first effect.
     // Each returned link enters custody before the following create can block.
     let mut reservation = links.reserve(2)?;
     let _temporary = links.temporary(2)?;
     let entry_pin = pin.fd.try_clone().map_err(|e| {
-        SetupFailure::io(
+        let failure = SetupFailure::io(
             crate::capture::BoundaryStage::Discovery,
             &e,
             &format!("attach {entry}+{ret} pin dup failed (kind={:?})", e.kind()),
-        )
+        );
+        links.abort(failure.clone());
+        failure
     })?;
+    let entry_pin = links.resource(entry_pin);
     let ret_pin = pin.fd.try_clone().map_err(|e| {
-        SetupFailure::io(
+        let failure = SetupFailure::io(
             crate::capture::BoundaryStage::Discovery,
             &e,
             &format!("attach {entry}+{ret} pin dup failed (kind={:?})", e.kind()),
-        )
+        );
+        links.abort(failure.clone());
+        failure
     })?;
+    let ret_pin = links.resource(ret_pin);
     let mark = links.mark();
     let mut guard = PairRollback {
         links,
@@ -4059,23 +4080,25 @@ fn attach_pair_with_ops(
         let entry_link = ops
             .create(
                 false,
-                prog_fd(loaded, entry)?,
+                links.retain_result(prog_fd(loaded, entry))?,
                 &cpath,
                 &[offset],
                 &[cookie],
                 pid,
             )
             .map_err(|e| {
-                SetupFailure::io(
+                let failure = SetupFailure::io(
                     crate::capture::BoundaryStage::Discovery,
                     &e,
                     &link_attach_text(entry, offset, &e),
-                )
+                );
+                links.abort(failure.clone());
+                failure
             })?;
         links.push(
             LinkEntry {
                 link: entry_link,
-                pin: entry_pin,
+                pin: entry_pin.into_inner(),
                 kind,
                 cookies: vec![cookie],
             },
@@ -4085,23 +4108,25 @@ fn attach_pair_with_ops(
         let ret_link = ops
             .create(
                 true,
-                prog_fd(loaded, ret)?,
+                links.retain_result(prog_fd(loaded, ret))?,
                 &cpath,
                 &[offset],
                 &[cookie],
                 pid,
             )
             .map_err(|e| {
-                SetupFailure::io(
+                let failure = SetupFailure::io(
                     crate::capture::BoundaryStage::Discovery,
                     &e,
                     &link_attach_text(ret, offset, &e),
-                )
+                );
+                links.abort(failure.clone());
+                failure
             })?;
         links.push(
             LinkEntry {
                 link: ret_link,
-                pin: ret_pin,
+                pin: ret_pin.into_inner(),
                 kind,
                 cookies: vec![cookie],
             },
@@ -4190,32 +4215,42 @@ fn attach_trips_with_ops(
             // attach-time TOCTOU: the link binds exactly the opened
             // inode, deliberately. One group → one link → the pin
             // moves in whole (no dup needed).
-            let pin = crate::plan::resolve_pinned_retry(|| crate::plan::resolve_pinned(module))
-                .map_err(|e| anyhow!("pin {module} for {prog_name}: {e}"))?;
+            let pin = links.retain_result(
+                match links.setup_links() {
+                    Some(setup) => crate::plan::resolve_pinned_controlled(module, setup),
+                    None => {
+                        crate::plan::resolve_pinned_retry(|| crate::plan::resolve_pinned(module))
+                    }
+                }
+                .map_err(|e| anyhow!("pin {module} for {prog_name}: {e}")),
+            )?;
+            let pin = links.resource(pin);
             let fd_path = pin.link_path();
-            let cpath = link_path(Path::new(&fd_path))?;
+            let cpath = links.retain_result(link_path(Path::new(&fd_path)))?;
             links.check()?;
             let link = ops
                 .create(
                     false,
-                    prog_fd(loaded, prog_name)?,
+                    links.retain_result(prog_fd(loaded, prog_name))?,
                     &cpath,
                     offsets,
                     cookies,
                     pid,
                 )
                 .map_err(|e| {
-                    SetupFailure::io(
+                    let failure = SetupFailure::io(
                         crate::capture::BoundaryStage::Discovery,
                         &e,
                         &format!("attach {prog_name}@{module}+{}: {e}", offsets.len()),
-                    )
+                    );
+                    links.abort(failure.clone());
+                    failure
                 })?;
             let identity = (crate::plan::render_device(pin.device), pin.ino);
             links.push(
                 LinkEntry {
                     link,
-                    pin: pin.fd,
+                    pin: pin.into_inner().fd,
                     kind: LinkKind::Tripwire,
                     cookies: cookies.clone(),
                 },
@@ -4414,11 +4449,37 @@ where
 /// failed (setup or iteration). Every map reads checked, so a
 /// failed snapshot becomes explicit snapshot loss, never a silent
 /// "no truncation / no loss" read.
-fn read_kv_checked<K, V>(maps: &HashMap<String, OwnedFd>, name: &str) -> (Vec<(K, V)>, bool)
+fn read_kv_checked<K, V>(
+    maps: &HashMap<String, OwnedFd>,
+    name: &str,
+    setup: Option<&crate::capture_setup::SetupLinks>,
+) -> (Vec<(K, V)>, bool)
 where
     K: aya::Pod + Eq + std::hash::Hash,
     V: aya::Pod,
 {
+    if let Some(setup) = setup {
+        return match setup
+            .check_owned(crate::capture::BoundaryStage::Discovery)
+            .map_err(anyhow::Error::new)
+            .and_then(|_| {
+                crate::loader::borrowed_rows::<K, V>(
+                    maps,
+                    name,
+                    false,
+                    setup,
+                    crate::capture::BoundaryStage::Discovery,
+                )
+            }) {
+            Ok(rows) => (
+                rows.into_iter()
+                    .map(|(key, values)| (key, values[0]))
+                    .collect(),
+                false,
+            ),
+            Err(_) => (Vec::new(), true),
+        };
+    }
     let Ok(map) = open_hash::<K, V>(maps, name) else {
         return (Vec::new(), true);
     };
@@ -4470,10 +4531,33 @@ fn read_percpu_checked<K>(
     maps: &HashMap<String, OwnedFd>,
     name: &str,
     fold: fn(&[u64]) -> u64,
+    setup: Option<&crate::capture_setup::SetupLinks>,
 ) -> (Vec<(K, u64)>, bool)
 where
     K: aya::Pod + Eq + std::hash::Hash,
 {
+    if let Some(setup) = setup {
+        return match setup
+            .check_owned(crate::capture::BoundaryStage::Discovery)
+            .map_err(anyhow::Error::new)
+            .and_then(|_| {
+                crate::loader::borrowed_rows::<K, u64>(
+                    maps,
+                    name,
+                    true,
+                    setup,
+                    crate::capture::BoundaryStage::Discovery,
+                )
+            }) {
+            Ok(rows) => (
+                rows.into_iter()
+                    .map(|(key, values)| (key, fold(&values)))
+                    .collect(),
+                false,
+            ),
+            Err(_) => (Vec::new(), true),
+        };
+    }
     let Ok(map) = open_percpu_hash::<K>(maps, name) else {
         return (Vec::new(), true);
     };
@@ -4571,10 +4655,10 @@ pub struct LiveEnv {
     pid: u32,
     provider: PathBuf,
     canon: String,
-    loaded: Loaded,
+    loaded: crate::capture_setup::SetupResource<Loaded>,
     links: DiscoveryLinkStore,
-    ring: RingBuf<MapData>,
-    pin: crate::pin::TargetPin,
+    ring: crate::capture_setup::SetupResource<crate::loader::Events>,
+    pin: crate::capture_setup::SetupResource<crate::pin::TargetPin>,
     /// Retained dispatch anchor recipe (F-D/A11): reinstall
     /// re-resolves with the same flavor/table/flags as attach.
     /// `None` when attach installed no dispatch anchor.
@@ -4610,27 +4694,49 @@ impl SessionEnv for LiveEnv {
         // single-writer slots); the loader folds to scalars here
         // so the snapshot shape — and every downstream join —
         // is unchanged.
-        let (trunc, trunc_failed) = read_percpu_checked(&self.loaded.maps, "TRUNC", fold_percpu_or);
-        let (termd, termd_failed) = read_kv_checked(&self.loaded.maps, "TERMD");
-        let (losses, losses_failed) =
-            read_percpu_checked(&self.loaded.maps, "LOSS", fold_percpu_sum);
+        let (trunc, trunc_failed) = read_percpu_checked(
+            &self.loaded.maps,
+            "TRUNC",
+            fold_percpu_or,
+            self.loaded.setup_links(),
+        );
+        let (termd, termd_failed) =
+            read_kv_checked(&self.loaded.maps, "TERMD", self.loaded.setup_links());
+        let (losses, losses_failed) = read_percpu_checked(
+            &self.loaded.maps,
+            "LOSS",
+            fold_percpu_sum,
+            self.loaded.setup_links(),
+        );
         // Call volume from the CALLS map (`None` only when the map
         // itself is absent — the core falls back to the QUERY_RET
         // event count then). All counter maps read checked: a
         // failed iteration is explicit snapshot loss, never a
         // silent partial sum (the core's high-water baselines
         // additionally ignore the dip).
-        let (call_rows, calls_failed): (Vec<(u32, u64)>, bool) =
-            read_percpu_checked(&self.loaded.maps, "CALLS", fold_percpu_sum);
+        let (call_rows, calls_failed): (Vec<(u32, u64)>, bool) = read_percpu_checked(
+            &self.loaded.maps,
+            "CALLS",
+            fold_percpu_sum,
+            self.loaded.setup_links(),
+        );
         let calls = if call_rows.is_empty() && !self.loaded.maps.contains_key("CALLS") {
             None
         } else {
             Some(call_rows.iter().map(|(_, n)| n).sum())
         };
-        let (trip, trip_failed): (Vec<(u64, u64)>, bool) =
-            read_percpu_checked(&self.loaded.maps, "TRIP", fold_percpu_sum);
-        let (lg_rows, lgcalls_failed): (Vec<(u32, u64)>, bool) =
-            read_percpu_checked(&self.loaded.maps, "LGCALLS", fold_percpu_sum);
+        let (trip, trip_failed): (Vec<(u64, u64)>, bool) = read_percpu_checked(
+            &self.loaded.maps,
+            "TRIP",
+            fold_percpu_sum,
+            self.loaded.setup_links(),
+        );
+        let (lg_rows, lgcalls_failed): (Vec<(u32, u64)>, bool) = read_percpu_checked(
+            &self.loaded.maps,
+            "LGCALLS",
+            fold_percpu_sum,
+            self.loaded.setup_links(),
+        );
         let lgcalls: u64 = lg_rows.iter().map(|(_, n)| n).sum();
         MapSnapshots {
             trunc,
@@ -4752,9 +4858,12 @@ impl SessionEnv for LiveEnv {
                     Ok(pin) => pin,
                     Err(_) => continue,
                 };
+                let pin = self.links.resource(pin);
                 let off = read_attach_bounded(
                     Path::new(&pin.link_path()),
                     crate::discovery::onboard::MAX_OBJECT_SCAN_BYTES,
+                    self.links.setup_links(),
+                    false,
                 )
                 .ok()
                 .and_then(|b| elf::dynsym_file_offset(&b, INIT_ANCHOR).ok());
@@ -4803,7 +4912,17 @@ impl SessionEnv for LiveEnv {
         // next poll as a transient, without latching blind);
         // unmapped-race (gone between find and read) → Ok(None);
         // other IO errors propagate (pre-existing posture).
-        let bound = match crate::plan::read_file_bound(&lc_path) {
+        let bound_read = match self.links.setup_links() {
+            Some(setup) => crate::plan::read_file_bounded_controlled(
+                &lc_path,
+                crate::plan::MAX_OBJECT_BYTES,
+                setup,
+                crate::capture::BoundaryStage::Discovery,
+                false,
+            ),
+            None => crate::plan::read_file_bound(&lc_path),
+        };
+        let bound = match bound_read {
             Ok(fb) => fb,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e.into()),
@@ -4831,6 +4950,8 @@ impl SessionEnv for LiveEnv {
             match read_attach_bounded(
                 Path::new(&path),
                 crate::discovery::onboard::MAX_OBJECT_SCAN_BYTES,
+                self.links.setup_links(),
+                false,
             ) {
                 Ok(bytes) => mod_bytes.push((path, bytes)),
                 Err(_) => unreadable.push(path),
@@ -4971,9 +5092,20 @@ impl SessionEnv for LiveEnv {
                     format!("provider {prov_path} unopenable during reinstall: {e}"),
                 )
             })?;
+        let pin = self.links.resource(pin);
         self.links.check()?;
         let read_temporary = self.links.temporary(1)?;
-        let bound = crate::plan::read_file_bound(&pin.link_path()).map_err(|e| {
+        let bound = match self.links.setup_links() {
+            Some(setup) => crate::plan::read_file_bounded_controlled(
+                &pin.link_path(),
+                crate::plan::MAX_OBJECT_BYTES,
+                setup,
+                crate::capture::BoundaryStage::Discovery,
+                false,
+            ),
+            None => crate::plan::read_file_bound(&pin.link_path()),
+        }
+        .map_err(|e| {
             std::io::Error::new(
                 e.kind(),
                 format!("dispatch provider read failed (kind={:?})", e.kind()),
@@ -5078,8 +5210,24 @@ pub(crate) struct PreparedDiscovery {
     session: DiscoverySession,
 }
 impl PreparedDiscovery {
-    pub(crate) fn finish(mut self, links: LinkSet) -> DiscoverySession {
-        self.session.env.links = DiscoveryLinkStore::Local(links);
+    pub(crate) fn finish(
+        mut self,
+        links: LinkSet,
+        displaced: &mut crate::capture_setup::SetupDisplaced,
+    ) -> DiscoverySession {
+        if let Some(guard) = self.session.env.loaded.take_setup() {
+            displaced.guards.push(guard);
+        }
+        if let Some(guard) = self.session.env.pin.take_setup() {
+            displaced.guards.push(guard);
+        }
+        if let Some(guard) = self.session.env.ring.take_setup() {
+            displaced.guards.push(guard);
+        }
+        displaced.discovery.push(std::mem::replace(
+            &mut self.session.env.links,
+            DiscoveryLinkStore::Local(links),
+        ));
         self.session
     }
 }
@@ -5129,7 +5277,11 @@ impl DiscoverySession {
         let nz = NonZeroU32::new(pid).ok_or_else(|| anyhow!("pid must be non-zero"))?;
         // Pin FIRST: every later /proc/<pid> read and every
         // pid-scoped attach is verified against this identity.
-        let pin = crate::pin::pin(pid)?;
+        let pinned = match links.setup_links() {
+            Some(setup) => crate::pin::pin_controlled(pid, setup),
+            None => crate::pin::pin(pid),
+        };
+        let pin = links.resource(links.retain_result(pinned)?);
         if let Some(marker) = &cfg.cmdline_marker {
             let _read_temporary = links.temporary(1)?;
             let cmdline = std::fs::read(format!("/proc/{pid}/cmdline"))?;
@@ -5143,14 +5295,24 @@ impl DiscoverySession {
         // every bootstrap pair binds through its fd-path. Named
         // `prov_pin`: `pin` is the target (pid) pin above.
         let prov_path_str = cfg.provider.to_string_lossy().into_owned();
-        let prov_pin =
-            crate::plan::resolve_pinned_retry(|| crate::plan::resolve_pinned(&prov_path_str))?;
+        let prov_pin = links.retain_result(
+            match links.setup_links() {
+                Some(setup) => crate::plan::resolve_pinned_controlled(&prov_path_str, setup),
+                None => crate::plan::resolve_pinned_retry(|| {
+                    crate::plan::resolve_pinned(&prov_path_str)
+                }),
+            }
+            .map_err(anyhow::Error::new),
+        )?;
+        let prov_pin = links.resource(prov_pin);
         links.check()?;
         let elf_bytes = {
             let _read_temporary = links.temporary(1)?;
             read_attach_bounded(
                 Path::new(&prov_pin.link_path()),
                 crate::discovery::onboard::MAX_OBJECT_SCAN_BYTES,
+                links.setup_links(),
+                true,
             )?
         };
         let canon = std::fs::canonicalize(&cfg.provider)
@@ -5163,10 +5325,19 @@ impl DiscoverySession {
             Some(snapshot) => snapshot.clone(),
             None => {
                 let _read_temporary = links.temporary(1)?;
-                crate::discovery::onboard::read_bounded(
-                    &cfg.object,
-                    crate::discovery::onboard::MAX_OBJECT_SCAN_BYTES,
-                )
+                match links.setup_links() {
+                    Some(setup) => crate::discovery::onboard::read_bounded_controlled(
+                        &cfg.object,
+                        crate::discovery::onboard::MAX_OBJECT_SCAN_BYTES,
+                        setup,
+                        crate::capture::BoundaryStage::Discovery,
+                        true,
+                    ),
+                    None => crate::discovery::onboard::read_bounded(
+                        &cfg.object,
+                        crate::discovery::onboard::MAX_OBJECT_SCAN_BYTES,
+                    ),
+                }
                 .map(std::sync::Arc::from)
                 .map_err(|e| anyhow::anyhow!("harvest object {}: {e}", cfg.object.display()))?
             }
@@ -5174,30 +5345,65 @@ impl DiscoverySession {
         if pin.verify().is_err() {
             let mut core = SessionCore::new(cfg.provider.clone(), canon, cfg.legacy, pid);
             core.mark_recycled();
-            return Err(core.recycled_err());
+            return links.retain_result(Err(core.recycled_err()));
         }
 
         links.check()?;
-        let loaded = with_harvest_snapshot(&obj_bytes, load_frozen)?;
+        let loaded = with_harvest_snapshot(&obj_bytes, |bytes| match links.setup_links() {
+            Some(setup) => {
+                let prep = crate::loader::prepare(
+                    bytes,
+                    &crate::loader::HARVEST_MAPS,
+                    &crate::loader::HARVEST_PROGS,
+                )?;
+                crate::loader::load_controlled(
+                    &prep,
+                    setup,
+                    crate::capture::BoundaryStage::Discovery,
+                )
+            }
+            None => load_frozen(bytes),
+        })?;
+        let loaded = std::cell::RefCell::new(Some(links.resource(loaded)));
+        let initialize_loaded = &loaded;
         let classifier_temporary = links.temporary(2)?;
-        let classifier_handles = crate::discovery::classifier_maps::clone_classifier_handles(
-            &loaded.maps,
-            crate::discovery::classifier_maps::ClassifierRole::Harvest,
-        )?;
+        let classifier_setup = links.setup_links().cloned();
         crate::discovery::classifier_maps::after_classifier_init(
             move || {
-                let result = crate::discovery::classifier_maps::initialize_classifier_maps(
-                    &classifier_handles,
-                    crate::discovery::classifier_maps::ClassifierRole::Harvest,
-                );
-                drop(classifier_handles);
+                let result = {
+                    let loaded = initialize_loaded.borrow();
+                    let maps = &loaded.as_ref().expect("loaded map owner").maps;
+                    match &classifier_setup {
+                        Some(setup) => {
+                            crate::discovery::classifier_maps::initialize_classifier_maps_controlled(
+                                maps,
+                                crate::discovery::classifier_maps::ClassifierRole::Harvest,
+                                setup,
+                            )
+                        }
+                        None => crate::discovery::classifier_maps::initialize_classifier_maps(
+                            maps,
+                            crate::discovery::classifier_maps::ClassifierRole::Harvest,
+                        ),
+                    }
+                };
+                let result = match &classifier_setup {
+                    Some(setup) => {
+                        setup.retain_result(result, crate::capture::BoundaryStage::Discovery)
+                    }
+                    None => result,
+                };
                 drop(classifier_temporary);
                 result
             },
             || {
+                let loaded = loaded
+                    .borrow_mut()
+                    .take()
+                    .expect("activation takes the original loaded owner once");
                 // Chain jump table likewise: every query tail-calls into it.
                 links.check()?;
-                populate_jump_table(&loaded)?;
+                links.retain_result(populate_jump_table(&loaded))?;
                 // Owns every multi link (drop = detach, all paths).
                 let mut builtin_query_attached = false;
                 let mut builtin_query_offset = 0u64;
@@ -5215,11 +5421,16 @@ impl DiscoverySession {
                         Some(path) => {
                             links.check()?;
                             let _read_temporary = links.temporary(1)?;
-                            let text = String::from_utf8(read_attach_bounded(
-                                path,
-                                crate::discovery::onboard::MAX_TABLE_FILE_BYTES,
-                            )?)?;
-                            builtin::load_table_str(&text)?
+                            let text = links.retain_result(
+                                String::from_utf8(read_attach_bounded(
+                                    path,
+                                    crate::discovery::onboard::MAX_TABLE_FILE_BYTES,
+                                    links.setup_links(),
+                                    true,
+                                )?)
+                                .map_err(anyhow::Error::new),
+                            )?;
+                            links.retain_result(builtin::load_table_str(&text))?
                         }
                         None => builtin::shipped_table(),
                     };
@@ -5304,15 +5515,13 @@ impl DiscoverySession {
                 }
 
                 let ring_temporary = links.temporary(1)?;
-                let ev_fd = loaded
-                    .maps
-                    .get("EVENTS")
-                    .context("no EVENTS map")?
-                    .try_clone()?;
-                let ev_data =
-                    MapData::from_fd(ev_fd).map_err(|e| anyhow!("EVENTS mapdata: {e}"))?;
-                let ev_map = Map::from_map_data(ev_data).map_err(|e| anyhow!("EVENTS map: {e}"))?;
-                let ring = RingBuf::try_from(ev_map)?;
+                let ring = links.retain_result(crate::loader::Events::prepare(
+                    &loaded.maps,
+                    links.setup_links(),
+                    crate::capture::BoundaryStage::Discovery,
+                    crate::loader::HARVEST_MAPS[0].max_entries,
+                ))?;
+                let ring = links.resource(ring);
                 drop(ring_temporary);
 
                 let mut core =
@@ -5361,8 +5570,10 @@ impl DiscoverySession {
                 if cfg.legacy {
                     match env.current_maps() {
                         Some(maps0) if legacy::find_libcrypto(&maps0).is_some() => {
-                            if let Some(set) = env.plan_trips(&maps0)? {
-                                let note = env.install_trips(&set, pid, &maps0)?;
+                            let planned = env.plan_trips(&maps0);
+                            if let Some(set) = env.links.retain_result(planned)? {
+                                let installed = env.install_trips(&set, pid, &maps0);
+                                let note = env.links.retain_result(installed)?;
                                 let pins = env.last_trip_pins();
                                 core.adopt_legacy_plan(set, note);
                                 core.set_trip_pins(pins);
@@ -5392,11 +5603,19 @@ impl DiscoverySession {
                 // resolved through /proc/<pid> — confirm the identity.
                 if env.verify_pin().is_err() {
                     core.mark_recycled();
-                    return Err(core.recycled_err());
+                    let error = core.recycled_err();
+                    return env.links.retain_result(Err(error));
                 }
                 Ok(Self { core, env })
             },
         )
+    }
+
+    pub(crate) fn take_local_links(&mut self) -> LinkSet {
+        match std::mem::take(&mut self.env.links) {
+            DiscoveryLinkStore::Local(links) => links,
+            DiscoveryLinkStore::Preparing { .. } => LinkSet::default(),
+        }
     }
 
     /// One bounded poll; see [`SessionCore::poll`].

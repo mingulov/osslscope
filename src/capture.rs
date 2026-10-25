@@ -683,11 +683,32 @@ pub trait DiscoveryPort {
 /// Live discovery engine behind the port: `DiscoverySession::close`
 /// consumes, so the wrapper holds it by option and takes it at
 /// finish (RAII detaches on the drop paths).
-pub struct LiveDiscovery(Option<DiscoverySession>);
+enum LiveDiscoveryState {
+    Active(DiscoverySession),
+    Preparing(crate::discovery::session::PreparedDiscovery),
+}
+impl std::ops::Deref for LiveDiscoveryState {
+    type Target = DiscoverySession;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Active(s) => s,
+            Self::Preparing(s) => s,
+        }
+    }
+}
+impl std::ops::DerefMut for LiveDiscoveryState {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Active(s) => s,
+            Self::Preparing(s) => s,
+        }
+    }
+}
+pub struct LiveDiscovery(Option<LiveDiscoveryState>);
 
 impl LiveDiscovery {
     pub fn new(session: DiscoverySession) -> Self {
-        Self(Some(session))
+        Self(Some(LiveDiscoveryState::Active(session)))
     }
 }
 
@@ -708,8 +729,77 @@ impl DiscoveryPort for LiveDiscovery {
 
     fn finish(&mut self) -> anyhow::Result<DiscoverySnapshot> {
         match self.0.take() {
-            Some(session) => session.close(),
+            Some(LiveDiscoveryState::Active(session)) => session.close(),
+            Some(LiveDiscoveryState::Preparing(_)) => {
+                anyhow::bail!("pre-release discovery cannot finish before custody")
+            }
             None => anyhow::bail!("discovery session already finished"),
+        }
+    }
+}
+
+impl LiveDiscovery {
+    fn preparing(session: crate::discovery::session::PreparedDiscovery) -> Self {
+        Self(Some(LiveDiscoveryState::Preparing(session)))
+    }
+    fn promote(
+        &mut self,
+        links: crate::discovery::session::LinkSet,
+        displaced: &mut crate::capture_setup::SetupDisplaced,
+    ) {
+        self.0 = match self.0.take() {
+            Some(LiveDiscoveryState::Preparing(session)) => {
+                Some(LiveDiscoveryState::Active(session.finish(links, displaced)))
+            }
+            other => {
+                displaced
+                    .discovery
+                    .push(crate::capture_setup::DiscoveryLinkStore::Local(links));
+                other
+            }
+        };
+    }
+}
+
+impl LiveDiscovery {
+    fn take_local_links(&mut self) -> crate::discovery::session::LinkSet {
+        match self.0.as_mut() {
+            Some(LiveDiscoveryState::Active(session)) => session.take_local_links(),
+            _ => crate::discovery::session::LinkSet::default(),
+        }
+    }
+}
+impl Drop for LiveDiscovery {
+    fn drop(&mut self) {
+        let discovery = self.take_local_links();
+        drop(crate::capture_setup::SetupLinkCustody::active(
+            discovery,
+            crate::capture_setup::MemberLinks {
+                entry: None,
+                members: Vec::new(),
+            },
+        ));
+    }
+}
+
+enum LiveScanState {
+    Active(ScanBackend),
+    Preparing(crate::scan::backend::PreparedScanBackend),
+}
+impl std::ops::Deref for LiveScanState {
+    type Target = ScanBackend;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Active(s) => s,
+            Self::Preparing(s) => s,
+        }
+    }
+}
+impl std::ops::DerefMut for LiveScanState {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Active(s) => s,
+            Self::Preparing(s) => s,
         }
     }
 }
@@ -769,7 +859,7 @@ fn traversal_reasons(
 /// the production backend.
 pub struct LiveTraversalDiscovery {
     inner: LiveDiscovery,
-    backend: ScanBackend,
+    backend: Option<LiveScanState>,
     tasks: crate::scan::registry::ProcTaskSource,
     provenance: TripleProvenance,
 }
@@ -783,10 +873,26 @@ impl LiveTraversalDiscovery {
     ) -> Self {
         Self {
             inner: LiveDiscovery::new(session),
-            backend,
+            backend: Some(LiveScanState::Active(backend)),
             tasks: crate::scan::registry::ProcTaskSource::new(pid),
             provenance,
         }
+    }
+}
+
+impl Drop for LiveTraversalDiscovery {
+    fn drop(&mut self) {
+        let discovery = self.inner.take_local_links();
+        let members = match self.backend.as_mut() {
+            Some(LiveScanState::Active(backend)) => backend.take_local_links(),
+            _ => crate::capture_setup::MemberLinks {
+                entry: None,
+                members: Vec::new(),
+            },
+        };
+        drop(crate::capture_setup::SetupLinkCustody::active(
+            discovery, members,
+        ));
     }
 }
 
@@ -812,15 +918,25 @@ impl DiscoveryPort for LiveTraversalDiscovery {
         };
         // BIRTH registration failure is a HARD error (the run
         // fails loud, never silently unregistered).
-        self.backend.register(&tids)?;
+        self.backend
+            .as_mut()
+            .expect("active traversal backend")
+            .register(&tids)?;
         if baseline {
             // Seed-then-discard (fence order lives in the
             // backend — pre-window news never becomes
             // in-window evidence).
-            self.backend.baseline()?;
+            self.backend
+                .as_mut()
+                .expect("active traversal backend")
+                .baseline()?;
             return Ok(TraversalDelta::default());
         }
-        let delta = self.backend.poll()?;
+        let delta = self
+            .backend
+            .as_mut()
+            .expect("active traversal backend")
+            .poll()?;
         let reasons = traversal_reasons(&delta.actions, &delta.done, &delta.findings);
         let (storm, throttled) = traversal_gate_flags(&delta.actions);
         Ok(TraversalDelta {
@@ -845,7 +961,12 @@ impl DiscoveryPort for LiveTraversalDiscovery {
         };
         // Settle + backstop (trailing queries close here —
         // RET-joined evaluate, RET-less dangle — never dropped).
-        match self.backend.finish() {
+        match self
+            .backend
+            .as_mut()
+            .expect("active traversal backend")
+            .finish()
+        {
             Ok(delta) => {
                 out.done = delta.done;
                 out.findings = delta.findings;
@@ -856,26 +977,42 @@ impl DiscoveryPort for LiveTraversalDiscovery {
             }
             Err(e) => {
                 out.finish_error = Some(format!("{e:#}"));
-                let (done, findings) = self.backend.take_completed();
+                let (done, findings) = self
+                    .backend
+                    .as_mut()
+                    .expect("active traversal backend")
+                    .take_completed();
                 out.done = done;
                 out.findings = findings;
                 // Salvage corrections too (pending rewrites for
                 // already-held verdicts — the merge below
                 // applies them; dropping them would strand a
                 // false verdict while saving everything else).
-                out.corrections = self.backend.take_corrections();
+                out.corrections = self
+                    .backend
+                    .as_mut()
+                    .expect("active traversal backend")
+                    .take_corrections();
                 // R34/I1: the census does not default on the
                 // failure path — propagate the backend's loss
                 // high-water + unknown set over the salvaged
                 // records, so uncounted ops render with their
                 // known loss.
-                let (admitted, unknown, loss) = self.backend.salvage_census(&out.done);
+                let (admitted, unknown, loss) = self
+                    .backend
+                    .as_mut()
+                    .expect("active traversal backend")
+                    .salvage_census(&out.done);
                 out.admitted_by_op = admitted;
                 out.admitted_unknown_by_op = unknown;
                 out.census_loss = loss;
             }
         }
-        let snap = self.backend.snapshot();
+        let snap = self
+            .backend
+            .as_mut()
+            .expect("active traversal backend")
+            .snapshot();
         out.throttled = snap.throttled;
         out.detached = snap.detached;
         out
@@ -886,7 +1023,10 @@ impl DiscoveryPort for LiveTraversalDiscovery {
     }
 
     fn note_provider_turnover(&mut self) -> anyhow::Result<()> {
-        self.backend.note_provider_turnover()
+        self.backend
+            .as_mut()
+            .expect("active traversal backend")
+            .note_provider_turnover()
     }
 }
 
@@ -945,6 +1085,72 @@ impl DiscoveryPort for CaptureDiscovery {
         match self {
             CaptureDiscovery::HarvestOnly(d) => d.note_provider_turnover(),
             CaptureDiscovery::Traversal(d) => d.note_provider_turnover(),
+        }
+    }
+}
+
+impl CaptureDiscovery {
+    fn take_local_custody(&mut self) -> crate::capture_setup::SetupLinkCustody {
+        match self {
+            Self::HarvestOnly(discovery) => crate::capture_setup::SetupLinkCustody::active(
+                discovery.take_local_links(),
+                crate::capture_setup::MemberLinks {
+                    entry: None,
+                    members: Vec::new(),
+                },
+            ),
+            Self::Traversal(discovery) => {
+                let links = discovery.inner.take_local_links();
+                let members = match discovery.backend.as_mut() {
+                    Some(LiveScanState::Active(backend)) => backend.take_local_links(),
+                    _ => crate::capture_setup::MemberLinks {
+                        entry: None,
+                        members: Vec::new(),
+                    },
+                };
+                crate::capture_setup::SetupLinkCustody::active(links, members)
+            }
+        }
+    }
+
+    fn ready_compatible(&self) -> bool {
+        match self {
+            Self::HarvestOnly(d) => matches!(d.0, Some(LiveDiscoveryState::Preparing(_))),
+            Self::Traversal(d) => {
+                matches!(d.inner.0, Some(LiveDiscoveryState::Preparing(_)))
+                    && matches!(d.backend, Some(LiveScanState::Preparing(_)))
+            }
+        }
+    }
+    // A sealed, crate-owned data move: complete bodies of the called helpers
+    // only replace stores and return displaced guards. No port trait callback.
+    fn install_ready(
+        &mut self,
+        discovery: crate::discovery::session::LinkSet,
+        members: crate::capture_setup::MemberLinks,
+        displaced: &mut crate::capture_setup::SetupDisplaced,
+    ) {
+        match self {
+            Self::HarvestOnly(d) => {
+                d.promote(discovery, displaced);
+                displaced
+                    .members
+                    .push(crate::capture_setup::MemberLinkStore::Local(members));
+            }
+            Self::Traversal(d) => {
+                d.inner.promote(discovery, displaced);
+                d.backend = match d.backend.take() {
+                    Some(LiveScanState::Preparing(backend)) => {
+                        Some(LiveScanState::Active(backend.finish(members, displaced)))
+                    }
+                    other => {
+                        displaced
+                            .members
+                            .push(crate::capture_setup::MemberLinkStore::Local(members));
+                        other
+                    }
+                };
+            }
         }
     }
 }
@@ -1846,7 +2052,7 @@ fn reap_sweep(pending: &mut Vec<u32>, deadline: Instant) {
 /// non-target) and every close carries a terminal per-CPU
 /// watermark — prefix/suffix gaps are explicit, never silent.
 pub struct KernelLifecycle {
-    fd: OwnedFd,
+    fd: crate::capture_setup::SetupResource<OwnedFd>,
     sock_inode: u64,
     target_pid: u32,
     target_tgid: u32,
@@ -1912,8 +2118,24 @@ impl KernelLifecycle {
         activity_started: bool,
         prefix: &crate::count_owner::CountForkPermit<'_>,
     ) -> anyhow::Result<Self> {
+        Self::subscribe_with_setup(target, activity_started, prefix, None)
+    }
+    fn subscribe_with_setup(
+        target: u32,
+        activity_started: bool,
+        prefix: &crate::count_owner::CountForkPermit<'_>,
+        setup: Option<&crate::capture_setup::SetupLinks>,
+    ) -> anyhow::Result<Self> {
+        let check = || -> anyhow::Result<()> {
+            if let Some(setup) = setup {
+                setup.check_owned(BoundaryStage::Setup)?;
+            }
+            Ok(())
+        };
+        check()?;
         let tgid = tgid_of(target)
             .ok_or_else(|| anyhow::anyhow!("target {target} has no readable Tgid"))?;
+        check()?;
         let raw = unsafe {
             libc::socket(
                 libc::AF_NETLINK,
@@ -1925,6 +2147,13 @@ impl KernelLifecycle {
             anyhow::bail!("connector socket: {}", std::io::Error::last_os_error());
         }
         let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        let fd = match setup {
+            Some(setup) => {
+                crate::capture_setup::SetupResource::guarded(fd, setup, BoundaryStage::Setup)
+            }
+            None => crate::capture_setup::SetupResource::local(fd),
+        };
+        check()?;
         let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
         if flags < 0
             || unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
@@ -1952,6 +2181,7 @@ impl KernelLifecycle {
         // multicast, not unicast).
         addr.nl_pid = 0;
         addr.nl_groups = CN_IDX_PROC;
+        check()?;
         let bound = unsafe {
             libc::bind(
                 fd.as_raw_fd(),
@@ -1972,8 +2202,10 @@ impl KernelLifecycle {
         // Baseline BEFORE the LISTEN send: drops during the
         // acceptance wait are already our loss (the subscription may
         // activate mid-wait), and must not hide inside the baseline.
+        check()?;
         let drops_baseline = socket_drops(sock_inode);
         let mcast_ack = next_ack_token();
+        check()?;
         send_connector(&fd, &mcast_msg(PROC_CN_MCAST_LISTEN, mcast_ack))
             .map_err(|e| e.context("connector listen"))?;
         // Acceptance wait (bounded): a sent LISTEN is not coverage.
@@ -2018,8 +2250,10 @@ impl KernelLifecycle {
         for bytes in &stash {
             this.ingest_datagram(bytes, &mut delta0, None);
         }
+        check()?;
         let cpus = online_cpus();
         this.watermark_cpus = cpus.clone();
+        check()?;
         let (sync_pids, shortfall) = watermark_burst(&cpus, prefix);
         let mut watch = SyncWatch::new(&sync_pids);
         this.drain_await_sync(
@@ -2501,6 +2735,7 @@ impl Drop for KernelLifecycle {
     /// stay enabled after the observer exits). Best-effort: a failed
     /// send is loud on stderr, never a panic.
     fn drop(&mut self) {
+        self.fd.before_dispose();
         if let Err(e) = self.unsubscribe() {
             eprintln!("lifecycle: connector unsubscribe failed ({e:#})");
         }
@@ -2644,6 +2879,26 @@ pub fn connector_facility() -> ConnectorFacility {
 }
 
 impl LiveLifecycle {
+    fn select_controlled(
+        target: u32,
+        prefix: &crate::count_owner::CountForkPermit<'_>,
+        control: &crate::capture_setup::SetupControl,
+        links: &crate::capture_setup::SetupLinks,
+    ) -> Result<Self, crate::capture_setup::SetupFailure> {
+        links.check(control, BoundaryStage::Setup)?;
+        let selected = KernelLifecycle::subscribe_with_setup(target, false, prefix, Some(links));
+        links.check(control, BoundaryStage::Setup)?;
+        Ok(match selected {
+            Ok(kernel) => Self::Kernel(kernel),
+            Err(error) => {
+                eprintln!(
+                    "lifecycle: kernel signals unavailable ({error:#}); explicit polling fallback (PARTIAL)"
+                );
+                Self::Polling(PollingLifecycle::new(target))
+            }
+        })
+    }
+
     /// `activity_started` threads through to
     /// [`KernelLifecycle::subscribe`]: `false` for owned children
     /// stopped pre-activity, `true` for live targets.
@@ -2975,6 +3230,9 @@ impl BoundaryFailure {
             };
             return Self::new(stage, class, owner.errno, &format!("{error:#}"));
         }
+        if let Some(failure) = error.downcast_ref::<crate::capture_setup::SetupFailure>() {
+            return setup_boundary(failure);
+        }
         let io = error
             .chain()
             .find_map(|e| e.downcast_ref::<std::io::Error>());
@@ -3034,6 +3292,15 @@ pub struct CountSetupSnapshot {
     known_failure: Option<BoundaryFailure>,
 }
 impl CountSetupSnapshot {
+    pub(crate) fn unknown() -> Self {
+        Self {
+            phase: CountSetupPhase::Preflight,
+            owner_epoch: None,
+            cleanup_ticket: None,
+            cleanup: SetupCleanupState::Unknown,
+            known_failure: None,
+        }
+    }
     pub fn phase(&self) -> CountSetupPhase {
         self.phase
     }
@@ -3099,6 +3366,9 @@ pub enum PreObservationCount {
 }
 impl PreObservationCount {
     pub(crate) fn from_setup_watch(watch: &crate::count_owner::CountSetupWatch) -> Option<Self> {
+        if let Some(snapshot) = CountSetupSnapshot::from_watch(watch) {
+            return Some(Self::SetupPending(snapshot));
+        }
         Self::from_setup_progress(watch.progress()?)
     }
     pub(crate) fn from_setup_progress(
@@ -3115,24 +3385,79 @@ impl PreObservationCount {
         CountSetupSnapshot::from_progress(progress).map(Self::SetupPending)
     }
     pub(crate) fn actual_failure(&self) -> Option<BoundaryFailure> {
+        use crate::count_owner::{
+            CountOperation, FailureClass, OwnerFailure, ResourceId, StopResult,
+        };
+        let environmental = |failure: &OwnerFailure| {
+            !matches!(
+                failure.class,
+                FailureClass::Deadline | FailureClass::Cancelled
+            )
+        };
         let (owner, stage) = match self {
             Self::NotPrepared => return None,
             Self::SetupPending(snapshot) => {
-                return snapshot
-                    .known_failure
-                    .clone()
-                    .filter(|failure| failure.class != BoundaryFailureClass::Timeout);
+                return snapshot.known_failure.clone().filter(|failure| {
+                    !matches!(
+                        failure.class,
+                        BoundaryFailureClass::Timeout | BoundaryFailureClass::Cancelled
+                    )
+                });
             }
-            Self::PrepareFailed(f) => (f.failure, BoundaryStage::Setup),
-            Self::Terminal(t) => (t.runtime_failure?, BoundaryStage::Fence),
+            Self::PrepareFailed(failure) => (failure.failure, BoundaryStage::Setup),
+            Self::Terminal(terminal) => {
+                // Cancellation is retained in the raw terminal. It cannot mask
+                // another established operation/component/cleanup error.
+                let owner = terminal
+                    .runtime_failure
+                    .filter(environmental)
+                    .or_else(|| {
+                        terminal
+                            .receipt
+                            .failures
+                            .operations
+                            .iter()
+                            .flatten()
+                            .copied()
+                            .find(environmental)
+                    })
+                    .or_else(|| {
+                        terminal
+                            .receipt
+                            .failures
+                            .components
+                            .iter()
+                            .flatten()
+                            .find_map(|failure| {
+                                let class = failure.class?;
+                                let owner = OwnerFailure {
+                                    operation: failure.operation,
+                                    resource: ResourceId::Map(failure.map),
+                                    class,
+                                    errno: failure.errno,
+                                };
+                                environmental(&owner).then_some(owner)
+                            })
+                    })
+                    .or_else(|| match terminal.receipt.seal.result {
+                        StopResult::Failed(failure) if environmental(&failure) => Some(failure),
+                        _ => None,
+                    })
+                    .or_else(|| {
+                        terminal.receipt.close_outcomes.iter().find_map(|outcome| {
+                            outcome.errno.map(|errno| OwnerFailure {
+                                operation: CountOperation::Close,
+                                resource: ResourceId::Link(outcome.id),
+                                class: FailureClass::Io,
+                                errno: Some(errno),
+                            })
+                        })
+                    })?;
+                (owner, BoundaryStage::Fence)
+            }
         };
-        if owner.class == crate::count_owner::FailureClass::Deadline {
-            return None;
-        }
-        Some(BoundaryFailure::from_error(
-            stage,
-            &anyhow::Error::new(owner),
-        ))
+        environmental(&owner)
+            .then(|| BoundaryFailure::from_error(stage, &anyhow::Error::new(owner)))
     }
 }
 
@@ -3161,6 +3486,32 @@ pub struct PreObservationFailure {
     pub context: Option<CaptureContext>,
 }
 impl PreObservationFailure {
+    pub(crate) fn output_failure(&self) -> Option<BoundaryFailure> {
+        let count = self.count.actual_failure();
+        let failures = [
+            self.failure.as_ref(),
+            self.custody.failure.as_ref(),
+            count.as_ref(),
+        ];
+        failures
+            .into_iter()
+            .flatten()
+            .find(|failure| {
+                !matches!(
+                    failure.class,
+                    BoundaryFailureClass::Cancelled | BoundaryFailureClass::Panic
+                )
+            })
+            .cloned()
+            .or_else(|| {
+                failures
+                    .into_iter()
+                    .flatten()
+                    .find(|failure| failure.class == BoundaryFailureClass::Panic)
+                    .cloned()
+            })
+    }
+
     fn new(failure: Self, valid_scope: bool) -> Self {
         assert!(
             !valid_scope
@@ -3351,6 +3702,53 @@ pub trait ProcPort {
     fn read_comm(&mut self, pid: u32) -> Option<String>;
 }
 
+struct PreparingProc<'a> {
+    links: &'a crate::capture_setup::SetupLinks,
+    control: &'a crate::capture_setup::SetupControl,
+}
+impl ProcPort for PreparingProc<'_> {
+    fn read_maps(&mut self, pid: u32) -> anyhow::Result<Vec<maps::Mapping>> {
+        self.links.check(self.control, BoundaryStage::Setup)?;
+        let _read = self
+            .links
+            .temporary(self.control, BoundaryStage::Setup, 1)?;
+        self.links
+            .retain_result(LiveProc.read_maps(pid), BoundaryStage::Setup)
+    }
+    fn read_file(&mut self, path: &str) -> anyhow::Result<Vec<u8>> {
+        let (bytes, _) = self.read_file_bound(path, plan::MAX_OBJECT_BYTES)?;
+        Ok(bytes.to_vec())
+    }
+    fn read_file_bound(
+        &mut self,
+        path: &str,
+        max: usize,
+    ) -> std::io::Result<(Arc<[u8]>, (u64, u64))> {
+        let stage = BoundaryStage::Discovery;
+        self.links
+            .check(self.control, stage)
+            .map_err(std::io::Error::other)?;
+        let _read = self
+            .links
+            .temporary(self.control, stage, 1)
+            .map_err(std::io::Error::other)?;
+        plan::read_file_bounded_controlled(path, max, self.links, stage, false)
+            .map(|file| (file.bytes, (file.dev, file.ino)))
+    }
+    fn stat_file(&mut self, path: &str) -> Option<FileStat> {
+        LiveProc.stat_file(path)
+    }
+    fn read_exe(&mut self, pid: u32) -> Option<PathBuf> {
+        LiveProc.read_exe(pid)
+    }
+    fn file_len(&mut self, path: &str) -> Option<u64> {
+        LiveProc.file_len(path)
+    }
+    fn read_comm(&mut self, pid: u32) -> Option<String> {
+        LiveProc.read_comm(pid)
+    }
+}
+
 /// Identity + freshness of one filesystem path (R20): (dev, ino)
 /// is the file identity (same encoding domain as
 /// [`plan::read_file_bound`]), (size, mtime_ns) its freshness. The
@@ -3369,6 +3767,38 @@ pub struct FileStat {
 }
 
 /// Live /proc + filesystem reads.
+#[cfg(test)]
+impl ProcPort for Box<dyn ProcPort + Send> {
+    fn read_maps(&mut self, pid: u32) -> anyhow::Result<Vec<maps::Mapping>> {
+        (**self).read_maps(pid)
+    }
+    fn read_file(&mut self, path: &str) -> anyhow::Result<Vec<u8>> {
+        (**self).read_file(path)
+    }
+    fn read_file_bound(
+        &mut self,
+        path: &str,
+        max: usize,
+    ) -> std::io::Result<(Arc<[u8]>, (u64, u64))> {
+        (**self).read_file_bound(path, max)
+    }
+    fn stat_file(&mut self, path: &str) -> Option<FileStat> {
+        (**self).stat_file(path)
+    }
+    fn read_budget(&self) -> usize {
+        (**self).read_budget()
+    }
+    fn read_exe(&mut self, pid: u32) -> Option<PathBuf> {
+        (**self).read_exe(pid)
+    }
+    fn file_len(&mut self, path: &str) -> Option<u64> {
+        (**self).file_len(path)
+    }
+    fn read_comm(&mut self, pid: u32) -> Option<String> {
+        (**self).read_comm(pid)
+    }
+}
+
 pub struct LiveProc;
 
 impl ProcPort for LiveProc {
@@ -4874,16 +5304,14 @@ struct CachedFile {
 /// The session-driven observation: owns both sessions, target
 /// custody, lifecycle, accumulation and finalization for one
 /// requested window.
-struct Runner<'x, D, B: CountBackend, T, L, C: ClockPort, P: ProcPort> {
-    cfg: &'x Config,
-    info: &'x TargetInfo,
+/// The real capture ports and accumulators, independent of child custody or
+/// borrowed controller inputs. Preparation and observation move this one state.
+struct RunnerState<D, B: CountBackend, L> {
     discovery: D,
     count: CountSession<B>,
-    target: T,
     lifecycle: L,
-    clock: &'x C,
-    proc: &'x mut P,
-    cancelled: &'x dyn Fn() -> bool,
+    setup_control: Option<crate::capture_setup::SetupControl>,
+    native_custody: Option<crate::capture_setup::SetupLinkCustody>,
     reasons: HashSet<String>,
     adapter: AdapterState,
     activity: Vec<GapCounter>,
@@ -5018,6 +5446,30 @@ struct Runner<'x, D, B: CountBackend, T, L, C: ClockPort, P: ProcPort> {
     /// baseline poll ran; deepened every round, merged with the
     /// finish tail at close; discarded only on identity recycle).
     traversal: Option<TraversalCapture>,
+}
+struct Runner<'x, D, B: CountBackend, T, L, C: ClockPort, P: ProcPort> {
+    cfg: &'x Config,
+    info: &'x TargetInfo,
+    target: T,
+    clock: &'x C,
+    proc: &'x mut P,
+    cancelled: &'x dyn Fn() -> bool,
+    state: RunnerState<D, B, L>,
+}
+impl<D, B: CountBackend, T, L, C: ClockPort, P: ProcPort> std::ops::Deref
+    for Runner<'_, D, B, T, L, C, P>
+{
+    type Target = RunnerState<D, B, L>;
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
+}
+impl<D, B: CountBackend, T, L, C: ClockPort, P: ProcPort> std::ops::DerefMut
+    for Runner<'_, D, B, T, L, C, P>
+{
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.state
+    }
 }
 
 /// Maximum distinct file paths read per discovery poll
@@ -5161,7 +5613,7 @@ where
     P: ProcPort,
 {
     fn reason(&mut self, r: &str) {
-        self.reasons.insert(r.to_string());
+        self.state.reasons.insert(r.to_string());
     }
 
     /// Merge the traversal finish tail into the accumulator and
@@ -5170,10 +5622,10 @@ where
     /// incomplete/unjoined tail records). No-op when traversal
     /// never ran.
     fn absorb_traversal_tail(&mut self) {
-        if self.traversal.is_none() {
+        if self.state.traversal.is_none() {
             return;
         }
-        let tail = self.discovery.finish_traversal();
+        let tail = self.state.discovery.finish_traversal();
         if tail.detached {
             self.reason("traversal-storm");
         }
@@ -5193,7 +5645,7 @@ where
         if !tail.findings.is_empty() {
             self.reason("traversal-unjoined");
         }
-        if let Some(t) = self.traversal.as_mut() {
+        if let Some(t) = self.state.traversal.as_mut() {
             t.merge(tail);
         }
     }
@@ -5206,11 +5658,12 @@ where
     /// keeps no post-hoc read). No-op once settled, after a known
     /// exit, on foreign targets, or when /proc is unreadable.
     fn settle_comm(&mut self) {
-        if !self.info.owned || self.child_exit.is_some() || self.comm != self.info.comm {
+        if !self.info.owned || self.state.child_exit.is_some() || self.state.comm != self.info.comm
+        {
             return;
         }
         if let Some(comm) = self.proc.read_comm(self.info.pid) {
-            self.comm = comm;
+            self.state.comm = comm;
         }
     }
 
@@ -5230,7 +5683,8 @@ where
         &mut self,
         delta: &DiscoveryDelta,
         live: &[maps::Mapping],
-    ) -> HashMap<String, plan::FileBytes> {
+    ) -> anyhow::Result<HashMap<String, plan::FileBytes>> {
+        self.check_setup(BoundaryStage::Discovery)?;
         let (relevant, mut dropped) = relevant_paths(delta, live);
         // R14: the round's byte budget binds BEFORE any read —
         // every read carries the remaining allowance (capped per
@@ -5245,6 +5699,7 @@ where
         let mut out_bytes: usize = 0;
         let mut remaining = relevant.len() as u64;
         for p in &relevant {
+            self.check_setup(BoundaryStage::Discovery)?;
             remaining -= 1;
             // Bytes cap: stop past the round budget. Skipped paths
             // join the dropped count: their rows miss "unreadable"
@@ -5261,13 +5716,14 @@ where
                 .unwrap_or_default()
                 .min(plan::MAX_OBJECT_BYTES);
             let current = self.proc.stat_file(p);
+            self.check_setup(BoundaryStage::Discovery)?;
             // Identity + freshness (R20): an in-place content change
             // keeps (dev, ino) but moves size and/or mtime, so
             // identity-only validation would serve stale bytes under
             // a stale fingerprint indefinitely (P6 implementation-only
             // replacement). Any mismatch re-reads.
             let hit = matches!(
-                (&current, self.file_cache.get(p)),
+                (&current, self.state.file_cache.get(p)),
                 (Some(cur), Some(cached))
                     if cached.file.dev == cur.dev
                         && cached.file.ino == cur.ino
@@ -5312,12 +5768,13 @@ where
                         // legacy serve-uncached shape — no mutation
                         // of the read bytes was proven there.
                         if raced {
-                            self.unverified_reads = self.unverified_reads.saturating_add(1);
-                            self.file_cache.remove(p);
+                            self.state.unverified_reads =
+                                self.state.unverified_reads.saturating_add(1);
+                            self.state.file_cache.remove(p);
                             continue;
                         }
                         if let Some(cur) = verified {
-                            self.file_cache.insert(
+                            self.state.file_cache.insert(
                                 p.clone(),
                                 CachedFile {
                                     file: read.clone(),
@@ -5340,17 +5797,17 @@ where
                     // (rows miss "unreadable"; the loss counter
                     // says why).
                     Err(e) if e.kind() == std::io::ErrorKind::FileTooLarge => {
-                        self.file_cache.remove(p);
+                        self.state.file_cache.remove(p);
                         dropped = dropped.saturating_add(1);
                         let (dev, ino) = refusal_tag(std::path::Path::new(p));
                         let len = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
-                        self.refusal_diagnostics.insert(format!(
+                        self.state.refusal_diagnostics.insert(format!(
                             "dev={dev} ino={ino} kind=file_too_large bytes={len} allowance={allowance}"
                         ));
                         continue;
                     }
                     Err(_) => {
-                        self.file_cache.remove(p);
+                        self.state.file_cache.remove(p);
                         continue;
                     }
                 }
@@ -5360,15 +5817,16 @@ where
             // loud like a fresh-read refusal (a fresh read always
             // fits: the reader refuses past `allowance` first).
             if let Some(cached) = self
+                .state
                 .file_cache
                 .get(p)
                 .filter(|c| c.file.bytes.len() <= allowance)
             {
                 out_bytes = out_bytes.saturating_add(cached.file.bytes.len());
                 out.insert(p.clone(), cached.file.clone());
-            } else if self.file_cache.contains_key(p) {
+            } else if self.state.file_cache.contains_key(p) {
                 let entry = {
-                    let cached = self.file_cache.get(p).expect("contains_key");
+                    let cached = self.state.file_cache.get(p).expect("contains_key");
                     format!(
                         "dev={} ino={} kind=over_allowance bytes={} allowance={allowance}",
                         cached.file.dev,
@@ -5376,14 +5834,14 @@ where
                         cached.file.bytes.len()
                     )
                 };
-                self.refusal_diagnostics.insert(entry);
+                self.state.refusal_diagnostics.insert(entry);
                 dropped = dropped.saturating_add(1);
                 continue;
             }
         }
-        self.relevance_capped = self.relevance_capped.saturating_add(dropped);
+        self.state.relevance_capped = self.state.relevance_capped.saturating_add(dropped);
         self.prune_file_cache(live, &relevant);
-        out
+        Ok(out)
     }
 
     /// Cache bounds enforcement (F-D/A13): unmapped entries never
@@ -5393,13 +5851,21 @@ where
     /// re-reads fresh bytes — a perf event, never a loss).
     fn prune_file_cache(&mut self, live: &[maps::Mapping], relevant: &BTreeSet<String>) {
         let mapped: HashSet<&str> = live.iter().map(|m| m.path.as_str()).collect();
-        self.file_cache.retain(|p, _| mapped.contains(p.as_str()));
-        let cached_bytes: usize = self.file_cache.values().map(|f| f.file.bytes.len()).sum();
-        if self.file_cache.len() <= MAX_CACHED_FILES && cached_bytes <= MAX_CACHED_BYTES {
+        self.state
+            .file_cache
+            .retain(|p, _| mapped.contains(p.as_str()));
+        let cached_bytes: usize = self
+            .state
+            .file_cache
+            .values()
+            .map(|f| f.file.bytes.len())
+            .sum();
+        if self.state.file_cache.len() <= MAX_CACHED_FILES && cached_bytes <= MAX_CACHED_BYTES {
             return;
         }
-        self.file_cache.retain(|p, _| relevant.contains(p));
+        self.state.file_cache.retain(|p, _| relevant.contains(p));
         let mut survivors: Vec<(String, usize)> = self
+            .state
             .file_cache
             .iter()
             .map(|(p, f)| (p.clone(), f.file.bytes.len()))
@@ -5410,7 +5876,7 @@ where
             if bytes <= MAX_CACHED_BYTES {
                 break;
             }
-            if self.file_cache.remove(p).is_some() {
+            if self.state.file_cache.remove(p).is_some() {
                 bytes = bytes.saturating_sub(*s);
             }
         }
@@ -5421,7 +5887,9 @@ where
     /// measures the POLL, never the file reads + adapt work after
     /// it (A10's "poll completing at/after the edge").
     fn poll_discovery(&mut self) -> anyhow::Result<(DiscoveryDelta, Instant)> {
-        let delta = self.discovery.poll(PollBudget::default())?;
+        self.check_setup(BoundaryStage::Discovery)?;
+        let delta = self.state.discovery.poll(PollBudget::default())?;
+        self.check_setup(BoundaryStage::Discovery)?;
         let poll_end = self.clock.now();
         Ok((delta, poll_end))
     }
@@ -5444,17 +5912,18 @@ where
         deadline: Option<Instant>,
     ) -> anyhow::Result<(bool, bool)> {
         let exhausted = delta.budget_exhausted;
-        let adapted = adapt_delta(&mut self.adapter, delta, ctx);
+        let adapted = adapt_delta(&mut self.state.adapter, delta, ctx);
         // R05: snapshot the live binding's probe meanings + pins
         // through the shared collector (absent bindings consume
         // nothing — see `EngineCollector`).
-        self.engine_collector.snapshot_binding(
+        self.state.engine_collector.snapshot_binding(
             delta.trip_generation,
-            self.discovery.snapshot().legacy.set,
+            self.state.discovery.snapshot().legacy.set,
             &delta.trip_module_pins,
         );
-        self.activity.extend(adapted.activity);
-        self.cold_gap_queries = self
+        self.state.activity.extend(adapted.activity);
+        self.state.cold_gap_queries = self
+            .state
             .cold_gap_queries
             .saturating_add(adapted.pre_window_queries);
         if let Some(trip) = adapted.tripwire {
@@ -5466,26 +5935,28 @@ where
             let straddled = deadline.is_some_and(|d| poll_end >= d);
             if straddled {
                 for (cookie, n) in trip.counter_deltas {
-                    let slot = self.straddling_trip.entry(cookie).or_default();
+                    let slot = self.state.straddling_trip.entry(cookie).or_default();
                     *slot = slot.saturating_add(n);
                 }
-                self.straddling_lgcalls = self
+                self.state.straddling_lgcalls = self
+                    .state
                     .straddling_lgcalls
                     .saturating_add(trip.executed_legacy_queries_delta);
             } else {
                 for (cookie, n) in &trip.counter_deltas {
-                    let slot = self.in_window_trip.entry(*cookie).or_default();
+                    let slot = self.state.in_window_trip.entry(*cookie).or_default();
                     *slot = slot.saturating_add(*n);
                 }
                 // R05: the same evidence through the shared
                 // collector for the typed ENGINE plane.
-                self.engine_collector.accumulate(
+                self.state.engine_collector.accumulate(
                     adapted.trip_generation,
                     &trip.counter_deltas,
                     &[],
                 );
-                self.in_window_hits.extend(trip.hits.iter());
-                self.in_window_lgcalls = self
+                self.state.in_window_hits.extend(trip.hits.iter());
+                self.state.in_window_lgcalls = self
+                    .state
                     .in_window_lgcalls
                     .saturating_add(trip.executed_legacy_queries_delta);
             }
@@ -5499,39 +5970,41 @@ where
             let straddled = deadline.is_some_and(|d| poll_end >= d);
             if straddled {
                 for r in &adapted.retired_trip {
-                    let slot = self.straddling_trip.entry(r.cookie).or_default();
+                    let slot = self.state.straddling_trip.entry(r.cookie).or_default();
                     *slot = slot.saturating_add(r.count);
                 }
             } else {
                 for r in &adapted.retired_trip {
-                    let slot = self.in_window_trip.entry(r.cookie).or_default();
+                    let slot = self.state.in_window_trip.entry(r.cookie).or_default();
                     *slot = slot.saturating_add(r.count);
                 }
-                self.engine_collector.accumulate(
+                self.state.engine_collector.accumulate(
                     adapted.trip_generation,
                     &[],
                     &adapted.retired_trip,
                 );
             }
         }
-        self.trigger_observed |= adapted.trigger_observed;
-        let report = self.count.attach_delta(
+        self.state.trigger_observed |= adapted.trigger_observed;
+        self.check_setup(BoundaryStage::Discovery)?;
+        let report = self.state.count.attach_delta(
             &adapted.delta,
             ctx.live,
             ctx.files,
             self.clock.monotonic_ns(),
             deadline.unwrap_or_else(|| self.clock.now()),
         )?;
-        self.attached_total = self.attached_total.saturating_add(report.attached);
+        self.state.attached_total = self.state.attached_total.saturating_add(report.attached);
         for site in &adapted.delta.discovered {
             if let Some(cookie) =
-                self.count
+                self.state
+                    .count
                     .cookie_for(site.site.device, site.site.inode, site.site.offset)
             {
-                self.site_cookies.insert(site.site.clone(), cookie);
-                if let Some(prov) = self.count.provenance(cookie) {
+                self.state.site_cookies.insert(site.site.clone(), cookie);
+                if let Some(prov) = self.state.count.provenance(cookie) {
                     if !prov.link_path.is_empty() {
-                        self.planned_paths.insert(prov.link_path.clone());
+                        self.state.planned_paths.insert(prov.link_path.clone());
                     }
                 }
             }
@@ -5542,7 +6015,9 @@ where
     /// Build typed ENGINE observations (R05) through the shared
     /// collector over the adapter's fingerprinted objects.
     fn build_engine_observations(&self) -> (Vec<EngineObservation>, u64) {
-        self.engine_collector.build(&self.adapter.objects)
+        self.state
+            .engine_collector
+            .build(&self.state.adapter.objects)
     }
 
     /// Exec witnesses in one lifecycle delta: the target's own
@@ -5555,7 +6030,7 @@ where
             .iter()
             .filter(|e| {
                 e.kind == LifecycleKind::Exec
-                    && classify_event(e, edge, self.lifecycle.timing_trust())
+                    && classify_event(e, edge, self.state.lifecycle.timing_trust())
                         == LifecyclePlacement::InWindow
             })
             .count() as u64
@@ -5563,7 +6038,7 @@ where
 
     fn lifecycle_edge(&self, end_ns: u64) -> LifecycleEdge {
         LifecycleEdge {
-            start_ns: self.requested_start_ns,
+            start_ns: self.state.requested_start_ns,
             end_ns,
         }
     }
@@ -5571,22 +6046,26 @@ where
     /// Freeze the observation-loop close decision before any post-loop I/O.
     /// The owner's later TARGET seal and count coverage remain separate facts.
     fn freeze_lifecycle_edge(&mut self) -> LifecycleEdge {
-        if let Some(edge) = self.original_lifecycle_edge {
+        if let Some(edge) = self.state.original_lifecycle_edge {
             return edge;
         }
         let end_ns = self
             .clock
             .checked_monotonic_ns()
-            .filter(|ns| *ns >= self.last_established_ns)
-            .map(|ns| ns.min(self.kernel_deadline_ns))
-            .unwrap_or(self.last_established_ns.min(self.kernel_deadline_ns));
+            .filter(|ns| *ns >= self.state.last_established_ns)
+            .map(|ns| ns.min(self.state.kernel_deadline_ns))
+            .unwrap_or(
+                self.state
+                    .last_established_ns
+                    .min(self.state.kernel_deadline_ns),
+            );
         let edge = self.lifecycle_edge(end_ns);
-        self.original_lifecycle_edge = Some(edge);
+        self.state.original_lifecycle_edge = Some(edge);
         edge
     }
 
     fn fold_lifecycle(&mut self, delta: &LifecycleDelta) {
-        self.fold_lifecycle_at(delta, self.lifecycle_edge(self.kernel_deadline_ns));
+        self.fold_lifecycle_at(delta, self.lifecycle_edge(self.state.kernel_deadline_ns));
     }
 
     /// Fold one lifecycle delta (round sweep, final sweep, or
@@ -5597,13 +6076,13 @@ where
     /// separately from host scan loss so the two sources stay
     /// attributable.
     fn fold_lifecycle_at(&mut self, delta: &LifecycleDelta, edge: LifecycleEdge) {
-        self.fork_exec_ignored = self.fork_exec_ignored.saturating_add(
+        self.state.fork_exec_ignored = self.state.fork_exec_ignored.saturating_add(
             delta
                 .events
                 .iter()
                 .filter(|e| {
                     e.kind == LifecycleKind::Fork
-                        && classify_event(e, edge, self.lifecycle.timing_trust())
+                        && classify_event(e, edge, self.state.lifecycle.timing_trust())
                             == LifecyclePlacement::InWindow
                 })
                 .count() as u64,
@@ -5612,16 +6091,18 @@ where
             .events
             .iter()
             .filter(|e| {
-                classify_event(e, edge, self.lifecycle.timing_trust())
+                classify_event(e, edge, self.state.lifecycle.timing_trust())
                     == LifecyclePlacement::Uncertain
             })
             .count() as u64;
-        self.lifecycle_loss = self
+        self.state.lifecycle_loss = self
+            .state
             .lifecycle_loss
             .saturating_add(delta.loss)
             .saturating_add(uncertain);
-        self.lifecycle_dropped = self.lifecycle_dropped.saturating_add(delta.dropped);
-        self.lifecycle_prefix_unwitnessed = self
+        self.state.lifecycle_dropped = self.state.lifecycle_dropped.saturating_add(delta.dropped);
+        self.state.lifecycle_prefix_unwitnessed = self
+            .state
             .lifecycle_prefix_unwitnessed
             .saturating_add(delta.prefix_unwitnessed);
     }
@@ -5640,19 +6121,19 @@ where
                     // Last-gasp settle before the reap below.
                     self.settle_comm();
                     if let Ok(Some(code)) = self.target.poll_exit() {
-                        self.child_exit = Some(code);
+                        self.state.child_exit = Some(code);
                         return Ok(RoundAction::Closed);
                     }
                 } else if self.target.verify().is_err() {
                     return Ok(RoundAction::Recycled);
                 }
-                self.maps_read_failed += 1;
+                self.state.maps_read_failed += 1;
                 return Ok(RoundAction::Continue);
             }
         };
         if self.clock.now().saturating_duration_since(t0) > POLL_BUDGET {
             // Overruns skip the round (§5): the deadline still binds.
-            self.scan_budget_exhaustions += 1;
+            self.state.scan_budget_exhaustions += 1;
             return Ok(RoundAction::Continue);
         }
         if self.clock.now() >= deadline {
@@ -5672,7 +6153,7 @@ where
         // a raw waitpid outside OwnedTarget.
         if live.is_empty() && owned {
             if let Ok(Some(code)) = self.target.poll_exit() {
-                self.child_exit = Some(code);
+                self.state.child_exit = Some(code);
                 return Ok(RoundAction::Closed);
             }
             let waited_from = self.clock.now();
@@ -5682,7 +6163,7 @@ where
                 // on this poll, ending post-hoc comm reads.
                 self.settle_comm();
                 if let Ok(Some(code)) = self.target.poll_exit() {
-                    self.child_exit = Some(code);
+                    self.state.child_exit = Some(code);
                     return Ok(RoundAction::Closed);
                 }
             }
@@ -5693,32 +6174,32 @@ where
             // strings; a same-ino x-device swap reads fresh,
             // correctly — it IS a new file).
             let ident = (crate::discovery::session::backing_dev(m), m.ino);
-            if self.seen_backings.insert(ident.clone()) {
+            if self.state.seen_backings.insert(ident.clone()) {
                 fresh.insert(ident);
             }
         }
         let exe = self.proc.read_exe(pid);
         let mut sizes = HashMap::new();
-        for p in &self.planned_paths {
+        for p in &self.state.planned_paths {
             sizes.insert(p.clone(), self.proc.file_len(p));
         }
-        let planned: Vec<String> = self.planned_paths.iter().cloned().collect();
+        let planned: Vec<String> = self.state.planned_paths.iter().cloned().collect();
         let next = snapshot(exe, &live, &planned, &sizes);
-        let mut kinds = detect_fence(&self.snapshot, &next);
-        self.snapshot = next;
-        self.last_live = live.clone();
+        let mut kinds = detect_fence(&self.state.snapshot, &next);
+        self.state.snapshot = next;
+        self.state.last_live = live.clone();
         // Fork/exec detection: every NEW child counted once. Only
         // Fork events count as ignored: the target's own execs are
         // fence-tracked by the snapshot generation (counting them
         // here double-books the observed spawn-exec as ignored).
-        let sweep = self.lifecycle.poll();
+        let sweep = self.state.lifecycle.poll();
         self.fold_lifecycle(&sweep);
         // Witness-driven exec fence (R20-fix): a kernel Exec witness
         // fences even when the exe snapshot cannot see it (same-path
         // exec with unchanged mappings). The snapshot arm above
         // already flagged genuine exe-link flips, so this OR-ing
         // never double-fences — one fence per round either way.
-        if self.exec_witnesses(&sweep, self.lifecycle_edge(self.kernel_deadline_ns)) > 0
+        if self.exec_witnesses(&sweep, self.lifecycle_edge(self.state.kernel_deadline_ns)) > 0
             && !kinds.contains(&FenceKind::Exec)
         {
             kinds.push(FenceKind::Exec);
@@ -5728,8 +6209,8 @@ where
         // survive a cancellation/deadline return to the close
         // drain (which converts it to an exec gap) — a round-local
         // would evaporate with `kinds`.
-        self.pending_exec_obligation = self.pending_exec_obligation.saturating_add(
-            self.exec_witnesses(&sweep, self.lifecycle_edge(self.kernel_deadline_ns)),
+        self.state.pending_exec_obligation = self.state.pending_exec_obligation.saturating_add(
+            self.exec_witnesses(&sweep, self.lifecycle_edge(self.state.kernel_deadline_ns)),
         );
         // Slow metadata work above (fence snapshots, lifecycle
         // scan — file reads moved per-poll below, F-D/A13) may have
@@ -5753,7 +6234,7 @@ where
             // reads follow the poll so only this delta's paths
             // are touched (verified-identity cache across polls).
             let (delta, poll_end) = self.poll_discovery()?;
-            let files = self.read_relevant_files(&delta, &live);
+            let files = self.read_relevant_files(&delta, &live)?;
             let pinned = self.cfg.resolved_provider.clone();
             let ctx = AdapterCtx {
                 live: &live,
@@ -5774,7 +6255,7 @@ where
             }
             catches += 1;
             if catches >= MAX_CATCHUP_POLLS {
-                self.scan_budget_exhaustions += 1;
+                self.state.scan_budget_exhaustions += 1;
                 break;
             }
             if (self.cancelled)() || self.clock.now() >= deadline {
@@ -5785,11 +6266,11 @@ where
         // harvest-only default no-ops): fold records/findings and
         // the PARTIAL reasons this round earned. Errors propagate
         // to salvage like any mid-window infrastructure failure.
-        if self.discovery.traversal_active() {
-            let tdelta = self.discovery.poll_traversal(false)?;
-            if let Some(t) = self.traversal.as_mut() {
+        if self.state.discovery.traversal_active() {
+            let tdelta = self.state.discovery.poll_traversal(false)?;
+            if let Some(t) = self.state.traversal.as_mut() {
                 for r in tdelta.partial_reasons {
-                    self.reasons.insert(r);
+                    self.state.reasons.insert(r);
                 }
                 t.done.extend(tdelta.done);
                 t.findings.extend(tdelta.findings);
@@ -5824,22 +6305,22 @@ where
             None
         };
         if let Some(reason) = fence_reason {
-            self.count.fence(reason, deadline)?;
+            self.state.count.fence(reason, deadline)?;
             // The fence consumed this round's witness (F3): one
             // fence per round covers the round's exec-ness (local
             // or snapshot-sourced — either versions the
             // generation), so the persisted obligation clears.
             if kinds.contains(&FenceKind::Exec) {
-                self.pending_exec_obligation = 0;
+                self.state.pending_exec_obligation = 0;
             }
         }
         if kinds.contains(&FenceKind::ProviderChanged) {
-            self.provider_changed_fences += 1;
+            self.state.provider_changed_fences += 1;
             // The discovery generation turned over: the traversal
             // backend retires its GEN/cache epoch with it
             // (in-flight opens abandon as Churned — their arrays
             // may be freed/reused by the new provider).
-            self.discovery.note_provider_turnover()?;
+            self.state.discovery.note_provider_turnover()?;
         }
         Ok(RoundAction::Continue)
     }
@@ -5854,17 +6335,21 @@ where
         // Outstanding exec obligation (F3): a consumed-but-unfenced
         // witness rides into salvage as a gap (the fatal verdict
         // dominates, but the lost transition stays exact).
-        self.lifecycle_exec_gap = self
-            .lifecycle_exec_gap
-            .saturating_add(std::mem::replace(&mut self.pending_exec_obligation, 0));
+        self.state.lifecycle_exec_gap =
+            self.state
+                .lifecycle_exec_gap
+                .saturating_add(std::mem::replace(
+                    &mut self.state.pending_exec_obligation,
+                    0,
+                ));
         if self.must_salvage_requested_window() {
             let effective_end_ns = self.freeze_lifecycle_edge().end_ns;
             // R12: the single close sample, alongside the monotonic
             // end stamp — reused by the document and the Capture.
-            self.wall_end = self.clock.wall_now();
-            self.owned_exit_before_read = OwnedExitBeforeRead::establish(
+            self.state.wall_end = self.clock.wall_now();
+            self.state.owned_exit_before_read = OwnedExitBeforeRead::establish(
                 self.info.owned,
-                self.child_exit.is_some() && !self.expired,
+                self.state.child_exit.is_some() && !self.state.expired,
             );
             return self.salvage(
                 SalvageSeed {
@@ -5891,10 +6376,13 @@ where
         self.reason("close-failure");
         self.absorb_traversal_tail();
         let boundary_failure = BoundaryFailure::from_error(BoundaryStage::Setup, &err);
-        let edge = *self.original_lifecycle_edge.get_or_insert(LifecycleEdge {
-            start_ns: self.requested_start_ns,
-            end_ns: seed.effective_end_ns,
-        });
+        let edge = *self
+            .state
+            .original_lifecycle_edge
+            .get_or_insert(LifecycleEdge {
+                start_ns: self.state.requested_start_ns,
+                end_ns: seed.effective_end_ns,
+            });
         let terminal = seed
             .terminal
             .unwrap_or_else(|| self.ensure_count_terminal(self.close_reason()));
@@ -5902,12 +6390,12 @@ where
         let snapshot = match seed.snapshot {
             Some(snapshot) => snapshot,
             None => {
-                self.reaped_before_close = self.info.owned && self.child_exit.is_some();
-                let pre = self.discovery.snapshot();
-                match self.discovery.finish() {
+                self.state.reaped_before_close = self.info.owned && self.state.child_exit.is_some();
+                let pre = self.state.discovery.snapshot();
+                match self.state.discovery.finish() {
                     Ok(snapshot) => snapshot,
                     Err(_) => {
-                        self.extra_counters.push(typed_counter(
+                        self.state.extra_counters.push(typed_counter(
                             "discovery.finish_failed",
                             CounterKind::Loss,
                             CounterUnits::Events,
@@ -5922,7 +6410,7 @@ where
         let custody = seed.custody.unwrap_or_else(|| self.finish_custody());
         let disposition = custody.disposition;
         let effective_end_ns = self.coverage_endpoint().end_ns;
-        self.failure_context = Some(Arc::new(CaptureFailureContext {
+        self.state.failure_context = Some(Arc::new(CaptureFailureContext {
             count: PreObservationCount::Terminal(terminal.clone()),
             failure: Some(boundary_failure.clone()),
             custody,
@@ -5951,7 +6439,7 @@ where
     /// An external acquisition can elapse before Open. Preserve that real
     /// request and its full gap, without inventing count admission or release.
     fn external_no_window_result(mut self) -> anyhow::Result<Capture> {
-        assert!(!self.info.owned && self.count.programmed_admission().is_none());
+        assert!(!self.info.owned && self.state.count.programmed_admission().is_none());
         let terminal = self.ensure_count_terminal(crate::count_session::CloseReason::SetupAbort);
         if terminal.retained_drain.total_calls() != 0 {
             return Err(self.pre_observation_failure(
@@ -5979,22 +6467,22 @@ where
                 )),
             ));
         };
-        self.requested_start_ns = self.info.acquired_ns;
-        self.window_start_ns = requested_end;
-        self.last_established_ns = requested_end;
-        self.wall_start = self.info.acquired_wall;
-        self.wall_end = self.clock.wall_now();
-        self.original_lifecycle_edge = Some(self.lifecycle_edge(requested_end));
+        self.state.requested_start_ns = self.info.acquired_ns;
+        self.state.window_start_ns = requested_end;
+        self.state.last_established_ns = requested_end;
+        self.state.wall_start = self.info.acquired_wall;
+        self.state.wall_end = self.clock.wall_now();
+        self.state.original_lifecycle_edge = Some(self.lifecycle_edge(requested_end));
         self.close_lifecycle(self.lifecycle_edge(requested_end));
-        if self.discovery.traversal_active() && self.traversal.is_none() {
-            self.traversal = Some(TraversalCapture::default());
+        if self.state.discovery.traversal_active() && self.state.traversal.is_none() {
+            self.state.traversal = Some(TraversalCapture::default());
         }
         self.absorb_traversal_tail();
-        let pre = self.discovery.snapshot();
-        let (snapshot, discovery_failure) = match self.discovery.finish() {
+        let pre = self.state.discovery.snapshot();
+        let (snapshot, discovery_failure) = match self.state.discovery.finish() {
             Ok(snapshot) => (snapshot, None),
             Err(error) => {
-                self.extra_counters.push(typed_counter(
+                self.state.extra_counters.push(typed_counter(
                     "discovery.finish_failed",
                     CounterKind::Loss,
                     CounterUnits::Events,
@@ -6033,7 +6521,7 @@ where
                 self.pre_observation_failure(PreObservationCause::SetupError, Some(failure))
             );
         }
-        self.failure_context = Some(Arc::new(CaptureFailureContext {
+        self.state.failure_context = Some(Arc::new(CaptureFailureContext {
             rejected: RejectedPrefix::from_count(&count),
             count,
             failure: None,
@@ -6058,16 +6546,16 @@ where
         // failures stay visible as typed counters + reason).
         // Pid-scoped traversal evidence is tainted like the rest:
         // discarded, never retained.
-        self.traversal = None;
-        let effective_end = self.clock.monotonic_ns().min(self.kernel_deadline_ns);
+        self.state.traversal = None;
+        let effective_end = self.clock.monotonic_ns().min(self.state.kernel_deadline_ns);
         // Freeze the observation edge before terminal cleanup can advance
         // either clock; cleanup time does not describe target coverage.
-        self.wall_end = self.clock.wall_now();
-        self.original_lifecycle_edge = Some(self.lifecycle_edge(effective_end));
+        self.state.wall_end = self.clock.wall_now();
+        self.state.original_lifecycle_edge = Some(self.lifecycle_edge(effective_end));
         let terminal =
             self.ensure_count_terminal(crate::count_session::CloseReason::IdentityRecycle);
         let mut close_failed = terminal.runtime_failure.is_some();
-        self.extra_counters.extend(
+        self.state.extra_counters.extend(
             terminal
                 .retained_drain
                 .counters
@@ -6075,13 +6563,13 @@ where
                 .filter(|c| c.kind == CounterKind::Loss)
                 .cloned(),
         );
-        self.failure_context = Some(Arc::new(CaptureFailureContext {
+        self.state.failure_context = Some(Arc::new(CaptureFailureContext {
             rejected: RejectedPrefix::from_count(&PreObservationCount::Terminal(terminal.clone())),
             count: PreObservationCount::Terminal(terminal),
             failure: None,
             custody: CustodyReceipt {
                 disposition: None,
-                child_exit: self.child_exit,
+                child_exit: self.state.child_exit,
                 resolution: if self.info.owned {
                     CustodyResolution::Unresolved
                 } else {
@@ -6090,8 +6578,8 @@ where
                 failure: None,
             },
         }));
-        if self.discovery.finish().is_err() {
-            self.extra_counters.push(typed_counter(
+        if self.state.discovery.finish().is_err() {
+            self.state.extra_counters.push(typed_counter(
                 "discovery.finish_failed",
                 CounterKind::Loss,
                 CounterUnits::Events,
@@ -6101,16 +6589,18 @@ where
             close_failed = true;
         }
         let requested_end = self
+            .state
             .requested_start_ns
             .saturating_add(duration_ns(self.cfg.duration));
         // R21-F4 (round 2, residual E): same setup-overrun collapse
         // as the assembly path (a close sample predating the
         // clamped start would invert the window — collapse to the
         // empty window at the effective start instead).
-        let recycled_start = effective_start_ns(self.window_start_ns, self.requested_start_ns);
+        let recycled_start =
+            effective_start_ns(self.state.window_start_ns, self.state.requested_start_ns);
         let mut document = evidence::finalize(FinalizeInput {
             window: CaptureWindow {
-                requested_start_ns: self.requested_start_ns,
+                requested_start_ns: self.state.requested_start_ns,
                 requested_end_ns: requested_end,
                 effective_start_ns: recycled_start,
                 effective_end_ns: effective_end.min(requested_end).max(recycled_start),
@@ -6121,11 +6611,11 @@ where
             fenced: Vec::new(),
             objects: Vec::new(),
             coverage: Vec::new(),
-            counters: self.extra_counters.clone(),
+            counters: self.state.extra_counters.clone(),
             fatal: Some(evidence::FatalKind::Recycled),
             target: doc_target(
                 self.info.pid,
-                &self.comm,
+                &self.state.comm,
                 &self.info.container_id,
                 &self.info.image_digest,
             ),
@@ -6140,10 +6630,10 @@ where
         // observations are discarded, but the host context stands).
         document.context = Some(doc_context(
             &self.info.kernel_release,
-            self.wall_start,
-            self.wall_end,
+            self.state.wall_start,
+            self.state.wall_end,
         ));
-        self.reasons.clear();
+        self.state.reasons.clear();
         self.reason("pid-recycled");
         if close_failed {
             self.reason("close-failure");
@@ -6151,7 +6641,7 @@ where
         let window_actual = self
             .clock
             .now()
-            .saturating_duration_since(self.open_instant);
+            .saturating_duration_since(self.state.open_instant);
         self.finish_capture(
             document,
             FinishParts {
@@ -6257,42 +6747,6 @@ fn preparation_error<T: TargetPort>(
     .into()
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "single setup boundary with explicit retained custody"
-)]
-fn pre_observation_error<B: CountBackend, T: TargetPort>(
-    count: &mut CountSession<B>,
-    target: &mut T,
-    info: &TargetInfo,
-    cfg: &Config,
-    cause: PreObservationCause,
-    failure: Option<BoundaryFailure>,
-    release: Option<ReleaseAttempt>,
-    known_exit: Option<i32>,
-) -> anyhow::Error {
-    let terminal = count.terminal_shared(crate::count_session::CloseRequest {
-        started_at: Instant::now(),
-        grace: cfg.grace,
-        reason: crate::count_session::CloseReason::SetupAbort,
-    });
-    let custody = resolve_pre_observation_custody(target, info.owned, known_exit);
-    PreObservationFailure::new(
-        PreObservationFailure {
-            cause,
-            failure,
-            count: PreObservationCount::Terminal(terminal),
-            release,
-            custody,
-            target: doc_target(info.pid, &info.comm, &info.container_id, &info.image_digest),
-            context: (!info.owned)
-                .then(|| doc_context(&info.kernel_release, info.acquired_wall, info.acquired_wall)),
-        },
-        !info.owned && count.programmed_admission().is_some(),
-    )
-    .into()
-}
-
 /// Setup (open → baseline poll → release), the poll loop, teardown
 /// (counting closes before the final discovery drain) and
 /// finalization (status after counters) all live here; `run` wires
@@ -6315,125 +6769,150 @@ where
 {
     let SessionSet {
         discovery,
-        mut count,
-        mut target,
-        lifecycle,
-    } = sessions;
-    if cfg.duration.is_zero() {
-        return Err(pre_observation_error(
-            &mut count,
-            &mut target,
-            info,
-            cfg,
-            PreObservationCause::SetupError,
-            Some(BoundaryFailure::new(
-                BoundaryStage::Setup,
-                BoundaryFailureClass::InvalidInput,
-                None,
-                "--duration must be > 0",
-            )),
-            None,
-            None,
-        ));
-    }
-    // Open the kernel window BEFORE release: probes arm while the
-    // child is still stopped, so the happy-path startup gap is zero
-    // (release instant ≥ programmed start saturates the gap). The
-    // setup slice this steals from the requested window reports as
-    // tail gap: the loop clamps to the kernel deadline and the
-    // effective end caps there (never hidden, never drained).
-    // F-D/A10: the kernel admission deadline measures from the
-    // DECLARED window start — window open for owned spawns (the
-    // child is stopped, so the setup slice counts nothing and the
-    // clamped loop ends at this same edge), acquisition for --pid
-    // (setup already consumed part of the requested window, so
-    // open + duration would admit post-requested-end executions as
-    // in-window).
-    let Some(start_ns) = clock.checked_monotonic_ns() else {
-        return Err(pre_observation_error(
-            &mut count,
-            &mut target,
-            info,
-            cfg,
-            PreObservationCause::OpenUnresolved,
-            Some(BoundaryFailure::new(
-                BoundaryStage::Open,
-                BoundaryFailureClass::Infrastructure,
-                None,
-                "required monotonic Open sample unavailable",
-            )),
-            None,
-            None,
-        ));
-    };
-    let duration = duration_ns(cfg.duration);
-    let declared_start_ns = if info.owned {
-        start_ns
-    } else {
-        info.acquired_ns
-    };
-    let Some(kernel_deadline_ns) = declared_start_ns.checked_add(duration) else {
-        return Err(pre_observation_error(
-            &mut count,
-            &mut target,
-            info,
-            cfg,
-            PreObservationCause::OpenUnresolved,
-            Some(BoundaryFailure::new(
-                BoundaryStage::Open,
-                BoundaryFailureClass::DeadlineOverflow,
-                None,
-                "window deadline overflow",
-            )),
-            None,
-            None,
-        ));
-    };
-    let setup_elapsed = start_ns >= kernel_deadline_ns;
-    if setup_elapsed && info.owned {
-        return Err(pre_observation_error(
-            &mut count,
-            &mut target,
-            info,
-            cfg,
-            PreObservationCause::OpenUnresolved,
-            Some(BoundaryFailure::new(
-                BoundaryStage::Open,
-                BoundaryFailureClass::InvalidInput,
-                None,
-                "empty count window",
-            )),
-            None,
-            None,
-        ));
-    }
-    let open_error = if !setup_elapsed {
-        count
-            .open_window(
-                start_ns,
-                kernel_deadline_ns,
-                info.acquired_instant
-                    .checked_add(cfg.harvest_timeout)
-                    .unwrap_or(info.acquired_instant),
-            )
-            .err()
-    } else {
-        None
-    };
-    // R12: the wall pair is sampled once per edge and reused —
-    // this open instant is tentative (release/acquisition re-stamps
-    // the start; window close stamps the end).
-    let wall_open = clock.wall_now();
-    let mut runner = Runner {
-        cfg,
-        info,
-        discovery,
         count,
         target,
         lifecycle,
+    } = sessions;
+    let (state, opened) = open_runner_state(cfg, info, discovery, count, lifecycle, clock, None);
+    let mut runner = Runner {
+        cfg,
+        info,
+        target,
         clock,
         proc,
         cancelled,
+        state,
+    };
+    match opened {
+        Err((cause, failure)) => {
+            runner.ensure_count_terminal(crate::count_session::CloseReason::SetupAbort);
+            if runner.must_salvage_requested_window() {
+                return runner.fail(failure.into());
+            }
+            Err(runner.pre_observation_failure(cause, Some(failure)))
+        }
+        Ok(true) => runner.external_no_window_result(),
+        Ok(false) => runner.setup_and_run(),
+    }
+}
+
+// Shared actual Open algorithm. Errors return the same ports and accumulators;
+// the controlled caller never enters a synchronous target-cleanup constructor.
+fn open_runner_state<D, B: CountBackend, L: LifecyclePort, C: ClockPort>(
+    cfg: &Config,
+    info: &TargetInfo,
+    discovery: D,
+    mut count: CountSession<B>,
+    lifecycle: L,
+    clock: &C,
+    control: Option<crate::capture_setup::SetupControl>,
+) -> (
+    RunnerState<D, B, L>,
+    Result<bool, (PreObservationCause, BoundaryFailure)>,
+) {
+    let mut start_ns = 0;
+    let mut kernel_deadline_ns = 0;
+    let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let failed = |stage, class, detail| {
+            (
+                PreObservationCause::OpenUnresolved,
+                BoundaryFailure::new(stage, class, None, detail),
+            )
+        };
+        if cfg.duration.is_zero() {
+            return Err((
+                PreObservationCause::SetupError,
+                BoundaryFailure::new(
+                    BoundaryStage::Setup,
+                    BoundaryFailureClass::InvalidInput,
+                    None,
+                    "--duration must be > 0",
+                ),
+            ));
+        }
+        if let Some(control) = &control {
+            control.check(BoundaryStage::Open).map_err(|e| {
+                (
+                    if matches!(e, crate::capture_setup::SetupFailure::Cancelled { .. }) {
+                        PreObservationCause::Cancelled
+                    } else {
+                        PreObservationCause::SetupError
+                    },
+                    setup_boundary(&e),
+                )
+            })?;
+        }
+        start_ns = clock.checked_monotonic_ns().ok_or_else(|| {
+            failed(
+                BoundaryStage::Open,
+                BoundaryFailureClass::Infrastructure,
+                "required monotonic Open sample unavailable",
+            )
+        })?;
+        let declared_start_ns = if info.owned {
+            start_ns
+        } else {
+            info.acquired_ns
+        };
+        kernel_deadline_ns = declared_start_ns
+            .checked_add(duration_ns(cfg.duration))
+            .ok_or_else(|| {
+                failed(
+                    BoundaryStage::Open,
+                    BoundaryFailureClass::DeadlineOverflow,
+                    "window deadline overflow",
+                )
+            })?;
+        let setup_elapsed = start_ns >= kernel_deadline_ns;
+        if setup_elapsed && info.owned {
+            return Err(failed(
+                BoundaryStage::Open,
+                BoundaryFailureClass::InvalidInput,
+                "empty count window",
+            ));
+        }
+        if !setup_elapsed {
+            count
+                .open_window(
+                    start_ns,
+                    kernel_deadline_ns,
+                    control.as_ref().map_or_else(
+                        || {
+                            info.acquired_instant
+                                .checked_add(cfg.harvest_timeout)
+                                .unwrap_or(info.acquired_instant)
+                        },
+                        |control| control.deadline(),
+                    ),
+                )
+                .map_err(|e| {
+                    (
+                        PreObservationCause::OpenUnresolved,
+                        BoundaryFailure::from_error(BoundaryStage::Open, &e),
+                    )
+                })?;
+        }
+        Ok(setup_elapsed)
+    }))
+    .unwrap_or_else(|_| {
+        Err((
+            PreObservationCause::OpenUnresolved,
+            BoundaryFailure::new(
+                BoundaryStage::Open,
+                BoundaryFailureClass::Panic,
+                None,
+                "Count Open unwound",
+            ),
+        ))
+    });
+    // This pair belongs to the actual Open return, before baseline and release.
+    let wall_open = clock.wall_now();
+    let mut state = RunnerState {
+        discovery,
+        count,
+        lifecycle,
+        setup_control: control,
+        native_custody: None,
         reasons: HashSet::new(),
         adapter: AdapterState::default(),
         activity: Vec::new(),
@@ -6500,23 +6979,310 @@ where
         custody: None,
         traversal: None,
     };
-    runner.fallback_partial = runner.lifecycle.fallback_partial();
-    if let Some(error) = open_error {
-        // A lost Open reply can resolve Completed in this same canonical
-        // terminal. Scope routing must inspect that actual resolved binding.
-        runner.ensure_count_terminal(crate::count_session::CloseReason::SetupAbort);
-        if runner.must_salvage_requested_window() {
-            return runner.fail(error.context("count Open after completed binding"));
+    state.fallback_partial = state.lifecycle.fallback_partial();
+    (state, opened)
+}
+
+pub(crate) struct PreparedOwnedWindow<D, B: CountBackend, L> {
+    pub(crate) cfg: Config,
+    pub(crate) info: TargetInfo,
+    state: RunnerState<D, B, L>,
+}
+pub(crate) struct OwnedPreparationFailure<D, B: CountBackend, L> {
+    pub(crate) window: PreparedOwnedWindow<D, B, L>,
+    pub(crate) cause: PreObservationCause,
+    pub(crate) failure: BoundaryFailure,
+}
+struct PreparationTarget;
+impl TargetPort for PreparationTarget {
+    fn pid(&self) -> u32 {
+        unreachable!("target-free preparation")
+    }
+    fn is_owned(&self) -> bool {
+        unreachable!("target-free preparation")
+    }
+    fn release(&mut self) -> anyhow::Result<()> {
+        unreachable!("preparation cannot release")
+    }
+    fn poll_exit(&mut self) -> anyhow::Result<Option<i32>> {
+        unreachable!("preparation cannot wait")
+    }
+    fn resolve_setup_failure(&mut self) -> anyhow::Result<()> {
+        unreachable!("preparation has no child")
+    }
+    fn finish_observation(&mut self) -> anyhow::Result<target::TargetDisposition> {
+        unreachable!("preparation has no child")
+    }
+    fn verify(&self) -> anyhow::Result<()> {
+        unreachable!("preparation has no child")
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one target-free preparation boundary"
+)]
+pub(crate) fn prepare_owned_window<D, B, L, C, P>(
+    cfg: Config,
+    info: TargetInfo,
+    discovery: D,
+    count: CountSession<B>,
+    lifecycle: L,
+    control: &crate::capture_setup::SetupControl,
+    clock: &C,
+    proc: &mut P,
+) -> Result<PreparedOwnedWindow<D, B, L>, OwnedPreparationFailure<D, B, L>>
+where
+    D: DiscoveryPort,
+    B: CountBackend,
+    L: LifecyclePort,
+    C: ClockPort,
+    P: ProcPort,
+{
+    let (state, opened) = open_runner_state(
+        &cfg,
+        &info,
+        discovery,
+        count,
+        lifecycle,
+        clock,
+        Some(control.clone()),
+    );
+    let mut runner = Runner {
+        cfg: &cfg,
+        info: &info,
+        state,
+        target: PreparationTarget,
+        clock,
+        proc,
+        cancelled: &|| false,
+    };
+    let failure = match opened {
+        Err(failure) => Some(failure),
+        Ok(_) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runner.prepare_baseline(Some(control.deadline()))
+        }))
+        .unwrap_or_else(|_| {
+            Err(BoundaryFailure::new(
+                control.stage(),
+                BoundaryFailureClass::Panic,
+                None,
+                "owned baseline unwound",
+            )
+            .into())
+        })
+        .err()
+        .map(|error| {
+            let failure =
+                crate::capture_setup::SetupFailure::from_error(BoundaryStage::Setup, error);
+            (
+                if matches!(
+                    failure,
+                    crate::capture_setup::SetupFailure::Cancelled { .. }
+                ) {
+                    PreObservationCause::Cancelled
+                } else {
+                    PreObservationCause::SetupError
+                },
+                setup_boundary(&failure),
+            )
+        }),
+    };
+    let state = runner.state;
+    let window = PreparedOwnedWindow { cfg, info, state };
+    match failure {
+        Some((cause, failure)) => Err(OwnedPreparationFailure {
+            window,
+            cause,
+            failure,
+        }),
+        None => Ok(window),
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ReleaseCommit(ReleaseAttempt);
+pub(crate) fn commit_owned_release<D, B: CountBackend, L>(
+    target: &mut target::OwnedTarget,
+    window: &mut PreparedOwnedWindow<D, B, L>,
+    control: &crate::capture_setup::SetupControl,
+    clock: &LiveClock,
+) -> Result<ReleaseCommit, crate::capture_setup::SetupFailure> {
+    use crate::capture_setup::SetupFailure;
+    control.check(BoundaryStage::Release)?;
+    match target
+        .poll_exit()
+        .map_err(|e| SetupFailure::from_error(BoundaryStage::Custody, e))?
+    {
+        Some(_) => {
+            return Err(SetupFailure::Boundary(BoundaryFailure::new(
+                BoundaryStage::Custody,
+                BoundaryFailureClass::Infrastructure,
+                None,
+                "owned target exited before release",
+            )));
         }
-        return Err(runner.pre_observation_failure(
-            PreObservationCause::OpenUnresolved,
-            Some(BoundaryFailure::from_error(BoundaryStage::Open, &error)),
+        None => {}
+    }
+    let monotonic_ns = clock.checked_monotonic_ns().ok_or_else(|| {
+        SetupFailure::Boundary(BoundaryFailure::new(
+            BoundaryStage::Release,
+            BoundaryFailureClass::Infrastructure,
+            None,
+            "required before-release monotonic sample unavailable",
+        ))
+    })?;
+    monotonic_ns
+        .checked_add(duration_ns(window.cfg.duration))
+        .ok_or_else(|| {
+            SetupFailure::Boundary(BoundaryFailure::new(
+                BoundaryStage::Release,
+                BoundaryFailureClass::DeadlineOverflow,
+                None,
+                "requested release deadline overflow",
+            ))
+        })?;
+    let before = ReleaseStart {
+        monotonic_ns,
+        wall: clock.wall_now(),
+        instant: clock.now(),
+    };
+    control.check(BoundaryStage::Release)?;
+    let result = target.release();
+    let attempt = ReleaseAttempt {
+        before,
+        after_ns: clock.checked_monotonic_ns(),
+        outcome: if result.is_ok() {
+            ReleaseOutcome::Succeeded
+        } else {
+            ReleaseOutcome::Failed
+        },
+    };
+    window.state.release_attempt = Some(attempt);
+    result.map_err(|error| SetupFailure::from_error(BoundaryStage::Release, error))?;
+    Ok(ReleaseCommit(attempt))
+}
+
+pub(crate) fn resume_owned_window<D, B, L, C, P>(
+    prepared: PreparedOwnedWindow<D, B, L>,
+    target: target::OwnedTarget,
+    commit: ReleaseCommit,
+    clock: &C,
+    proc: &mut P,
+    cancelled: &dyn Fn() -> bool,
+) -> anyhow::Result<Capture>
+where
+    D: DiscoveryPort,
+    B: CountBackend,
+    L: LifecyclePort,
+    C: ClockPort,
+    P: ProcPort,
+{
+    let PreparedOwnedWindow {
+        cfg,
+        info,
+        mut state,
+    } = prepared;
+    state.setup_control = None;
+    let before = commit.0.before;
+    state.release_attempt = Some(commit.0);
+    state.requested_start_ns = before.monotonic_ns;
+    state.wall_start = before.wall;
+    state.open_instant = before.instant;
+    state.last_established_ns = before.monotonic_ns;
+    if commit
+        .0
+        .after_ns
+        .is_none_or(|after| after < before.monotonic_ns)
+    {
+        state.extra_counters.push(typed_counter(
+            "count.close_time_uncertain",
+            CounterKind::Loss,
+            CounterUnits::Events,
+            CounterSource::Drain,
+            1,
         ));
     }
-    if setup_elapsed {
-        return runner.external_no_window_result();
+    let mut runner = Runner {
+        cfg: &cfg,
+        info: &info,
+        state,
+        target,
+        clock,
+        proc,
+        cancelled,
+    };
+    let resumed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runner.state.lifecycle.mark_released();
+        runner.settle_comm();
+    }));
+    if resumed.is_err() {
+        return runner.fail(
+            BoundaryFailure::new(
+                BoundaryStage::Release,
+                BoundaryFailureClass::Panic,
+                None,
+                "released owned continuation unwound",
+            )
+            .into(),
+        );
     }
-    runner.setup_and_run()
+    runner.resume_window()
+}
+
+impl<D: 'static, B: CountBackend, L> PreparedOwnedWindow<D, B, L> {
+    pub(crate) fn dispose_native(&mut self) {
+        let mut custody = self.state.native_custody.take().unwrap_or_default();
+        if let Some(discovery) =
+            (&mut self.state.discovery as &mut dyn std::any::Any).downcast_mut::<CaptureDiscovery>()
+        {
+            custody.append(&mut discovery.take_local_custody());
+        }
+        // All active/retired native link closes precede all of their pins and
+        // the subsequent real session/map/ring owners' destruction.
+        drop(custody);
+    }
+}
+
+impl<D, B: CountBackend, L> PreparedOwnedWindow<D, B, L> {
+    pub(crate) fn terminalize(
+        &mut self,
+        started_at: Instant,
+    ) -> Arc<crate::count_session::CountTerminal> {
+        if let Some(terminal) = &self.state.canonical_terminal {
+            return terminal.clone();
+        }
+        let terminal = self
+            .state
+            .count
+            .terminal_shared(crate::count_session::CloseRequest {
+                started_at,
+                grace: self.cfg.grace,
+                reason: crate::count_session::CloseReason::SetupAbort,
+            });
+        self.state.terminal_id = self.state.count.terminal_id();
+        self.state.canonical_terminal = Some(terminal.clone());
+        terminal
+    }
+}
+
+fn setup_boundary(failure: &crate::capture_setup::SetupFailure) -> BoundaryFailure {
+    use crate::capture_setup::SetupFailure;
+    match failure {
+        SetupFailure::Boundary(f) => f.clone(),
+        SetupFailure::Cancelled { stage } => BoundaryFailure::new(
+            *stage,
+            BoundaryFailureClass::Cancelled,
+            None,
+            "setup cancelled",
+        ),
+        SetupFailure::Resource { stage } => BoundaryFailure::new(
+            *stage,
+            BoundaryFailureClass::Infrastructure,
+            None,
+            "setup resource capacity exhausted",
+        ),
+    }
 }
 
 impl<D, B, T, L, C, P> Runner<'_, D, B, T, L, C, P>
@@ -6529,16 +7295,17 @@ where
     P: ProcPort,
 {
     fn must_salvage_requested_window(&self) -> bool {
-        self.release_attempt
+        self.state
+            .release_attempt
             .is_some_and(|r| r.outcome == ReleaseOutcome::Succeeded)
             || (!self.info.owned
-                && (self.count.programmed_admission().is_some()
-                    || self.in_window_lgcalls > 0
-                    || self.in_window_trip.values().any(|n| *n > 0)
-                    || self.traversal.as_ref().is_some_and(|t| {
+                && (self.state.count.programmed_admission().is_some()
+                    || self.state.in_window_lgcalls > 0
+                    || self.state.in_window_trip.values().any(|n| *n > 0)
+                    || self.state.traversal.as_ref().is_some_and(|t| {
                         t.done.iter().any(|w| {
-                            w.event_ns >= self.requested_start_ns
-                                && w.event_ns < self.kernel_deadline_ns
+                            w.event_ns >= self.state.requested_start_ns
+                                && w.event_ns < self.state.kernel_deadline_ns
                         })
                     })))
     }
@@ -6549,19 +7316,23 @@ where
     ) -> anyhow::Error {
         assert!(!self.must_salvage_requested_window());
         let terminal = self.ensure_count_terminal(crate::count_session::CloseReason::SetupAbort);
-        let custody = self.custody.take().unwrap_or_else(|| {
-            resolve_pre_observation_custody(&mut self.target, self.info.owned, self.child_exit)
+        let custody = self.state.custody.take().unwrap_or_else(|| {
+            resolve_pre_observation_custody(
+                &mut self.target,
+                self.info.owned,
+                self.state.child_exit,
+            )
         });
         PreObservationFailure::new(
             PreObservationFailure {
                 cause,
                 failure,
                 count: PreObservationCount::Terminal(terminal),
-                release: self.release_attempt,
+                release: self.state.release_attempt,
                 custody,
                 target: doc_target(
                     self.info.pid,
-                    &self.comm,
+                    &self.state.comm,
                     &self.info.container_id,
                     &self.info.image_digest,
                 ),
@@ -6581,30 +7352,31 @@ where
         &mut self,
         reason: crate::count_session::CloseReason,
     ) -> Arc<crate::count_session::CountTerminal> {
-        if let Some(terminal) = &self.canonical_terminal {
+        if let Some(terminal) = &self.state.canonical_terminal {
             return terminal.clone();
         }
         let terminal = self
+            .state
             .count
             .terminal_shared(crate::count_session::CloseRequest {
                 started_at: Instant::now(),
                 grace: self.cfg.grace,
                 reason,
             });
-        self.terminal_id = self.count.terminal_id();
-        self.canonical_terminal = Some(terminal.clone());
+        self.state.terminal_id = self.state.count.terminal_id();
+        self.state.canonical_terminal = Some(terminal.clone());
         terminal
     }
 
     fn finish_custody(&mut self) -> CustodyReceipt {
-        if let Some(receipt) = &self.custody {
+        if let Some(receipt) = &self.state.custody {
             return receipt.clone();
         }
         let result = self.target.finish_observation();
         let (disposition, failure) = match result {
             Ok(disposition) => (Some(disposition), None),
             Err(error) => {
-                self.extra_counters.push(typed_counter(
+                self.state.extra_counters.push(typed_counter(
                     "target.finish_failed",
                     CounterKind::Loss,
                     CounterUnits::Events,
@@ -6618,11 +7390,11 @@ where
             }
         };
         if let Some(target::TargetDisposition::Exited { code }) = disposition {
-            self.child_exit = Some(code);
+            self.state.child_exit = Some(code);
         }
         let receipt = CustodyReceipt {
             disposition,
-            child_exit: self.child_exit,
+            child_exit: self.state.child_exit,
             resolution: if !self.info.owned {
                 CustodyResolution::NotOwned
             } else if disposition.is_some() {
@@ -6632,24 +7404,27 @@ where
             },
             failure,
         };
-        self.custody = Some(receipt.clone());
+        self.state.custody = Some(receipt.clone());
         receipt
     }
 
     fn retained_terminal(&mut self) -> Option<Arc<crate::count_session::CountTerminal>> {
-        if self.canonical_terminal.is_none() {
-            self.terminal_id = self.count.terminal_id();
-            self.canonical_terminal = self.terminal_id.map(|id| self.count.shared_terminal(id));
+        if self.state.canonical_terminal.is_none() {
+            self.state.terminal_id = self.state.count.terminal_id();
+            self.state.canonical_terminal = self
+                .state
+                .terminal_id
+                .map(|id| self.state.count.shared_terminal(id));
         }
-        self.canonical_terminal.clone()
+        self.state.canonical_terminal.clone()
     }
     fn close_reason(&self) -> crate::count_session::CloseReason {
         use crate::count_session::CloseReason as R;
-        if self.expired {
+        if self.state.expired {
             R::Expired
-        } else if self.signal_cut {
+        } else if self.state.signal_cut {
             R::Interrupted
-        } else if self.owned_exit_before_read.is_some() {
+        } else if self.state.owned_exit_before_read.is_some() {
             R::OwnedExit
         } else {
             R::Failure
@@ -6662,12 +7437,12 @@ where
             .unwrap_or_default();
         let endpoint = count_effective_end(
             self.close_reason(),
-            self.kernel_deadline_ns,
+            self.state.kernel_deadline_ns,
             seal,
-            self.last_established_ns,
+            self.state.last_established_ns,
         );
         if endpoint.uncertain {
-            self.extra_counters.push(typed_counter(
+            self.state.extra_counters.push(typed_counter(
                 "count.close_time_uncertain",
                 CounterKind::Loss,
                 CounterUnits::Events,
@@ -6677,36 +7452,37 @@ where
         }
         endpoint
     }
-    fn setup_and_run(mut self) -> anyhow::Result<Capture> {
+    fn check_setup(&self, stage: BoundaryStage) -> anyhow::Result<()> {
+        if let Some(control) = &self.state.setup_control {
+            control.check_effect(stage)?;
+        }
+        Ok(())
+    }
+    fn prepare_baseline(&mut self, setup_deadline: Option<Instant>) -> anyhow::Result<()> {
         let pid = self.info.pid;
-        let owned = self.info.owned;
-        let setup_deadline = args::deadline_at(self.clock.now(), self.cfg.harvest_timeout);
         // Baseline poll: seed maps/snapshot, attach the first delta,
         // and baseline tripwire counters at the declared window
         // boundary (pre-window tripwire/query news never becomes
         // in-window evidence).
-        let live = match self.proc.read_maps(pid) {
-            Ok(live) => live,
-            Err(e) => {
-                if !owned && self.target.verify().is_err() {
-                    return Ok(self.recycled());
-                }
-                return self.fail_at(e.context("setup maps read"), BoundaryStage::Setup);
-            }
-        };
+        self.check_setup(BoundaryStage::Setup)?;
+        let live = self.proc.read_maps(pid).map_err(|e| {
+            BoundaryFailure::from_error(BoundaryStage::Setup, &e.context("setup maps read"))
+        })?;
         for m in &live {
-            self.seen_backings
+            self.state
+                .seen_backings
                 .insert((crate::discovery::session::backing_dev(m), m.ino));
         }
+        self.check_setup(BoundaryStage::Setup)?;
         let exe = self.proc.read_exe(pid);
-        self.snapshot = snapshot(exe, &live, &[], &HashMap::new());
-        self.last_live = live.clone();
+        self.state.snapshot = snapshot(exe, &live, &[], &HashMap::new());
+        self.state.last_live = live.clone();
         let fresh = HashSet::new();
         // Poll → read-relevant → apply (F-D/A13), like the round
         // loop: the baseline poll reads only its delta's paths.
         let baseline_outcome: anyhow::Result<(bool, bool)> = (|| {
             let (delta, poll_end) = self.poll_discovery()?;
-            let files = self.read_relevant_files(&delta, &live);
+            let files = self.read_relevant_files(&delta, &live)?;
             let pinned = self.cfg.resolved_provider.clone();
             let ctx = AdapterCtx {
                 live: &live,
@@ -6725,30 +7501,64 @@ where
         match baseline_outcome {
             Ok((_, fence_candidates)) => {
                 if fence_candidates {
-                    if let Err(e) = self.count.fence(
+                    self.check_setup(BoundaryStage::Fence)?;
+                    if let Err(e) = self.state.count.fence(
                         CountFence::CandidatesChanged,
                         setup_deadline.unwrap_or_else(|| self.clock.now()),
                     ) {
-                        return self.fail_at(e.context("setup fence"), BoundaryStage::Fence);
+                        return Err(BoundaryFailure::from_error(
+                            BoundaryStage::Fence,
+                            &e.context("setup fence"),
+                        )
+                        .into());
                     }
                 }
             }
             Err(e) => {
-                return self.fail_at(e.context("setup discovery poll"), BoundaryStage::Discovery);
+                return Err(crate::capture_setup::SetupFailure::from_error(
+                    BoundaryStage::Discovery,
+                    e.context("setup discovery poll"),
+                )
+                .into());
             }
         }
         // Traversal baseline (active ports only): drain the setup
         // slice and fence pre-window opens — pre-window traversal
         // news never becomes in-window evidence (same
         // seed-then-discard discipline as the discovery baseline).
-        if self.discovery.traversal_active() {
-            if let Err(e) = self.discovery.poll_traversal(true) {
-                return self.fail_at(e.context("setup traversal poll"), BoundaryStage::Traversal);
+        self.check_setup(BoundaryStage::Traversal)?;
+        if self.state.discovery.traversal_active() {
+            if let Err(e) = self.state.discovery.poll_traversal(true) {
+                return Err(BoundaryFailure::from_error(
+                    BoundaryStage::Traversal,
+                    &e.context("setup traversal poll"),
+                )
+                .into());
             }
-            self.traversal = Some(TraversalCapture::default());
+            self.state.traversal = Some(TraversalCapture::default());
+        }
+        self.check_setup(BoundaryStage::Setup)?;
+        Ok(())
+    }
+
+    fn setup_and_run(mut self) -> anyhow::Result<Capture> {
+        let owned = self.info.owned;
+        let setup_deadline = args::deadline_at(
+            if owned {
+                self.info.acquired_instant
+            } else {
+                self.clock.now()
+            },
+            self.cfg.harvest_timeout,
+        );
+        if let Err(error) = self.prepare_baseline(setup_deadline) {
+            if !owned && self.target.verify().is_err() {
+                return Ok(self.recycled());
+            }
+            return self.fail(error);
         }
         if (self.cancelled)() {
-            self.signal_cut = true;
+            self.state.signal_cut = true;
             if self.must_salvage_requested_window() {
                 return self.close_and_finalize();
             }
@@ -6768,7 +7578,7 @@ where
         if owned {
             match self.target.poll_exit() {
                 Ok(Some(code)) => {
-                    self.child_exit = Some(code);
+                    self.state.child_exit = Some(code);
                     return Err(
                         self.pre_observation_failure(PreObservationCause::NeverReleasedExit, None)
                     );
@@ -6811,7 +7621,7 @@ where
             };
             let result = self.target.release();
             let after_ns = self.clock.checked_monotonic_ns();
-            self.release_attempt = Some(ReleaseAttempt {
+            self.state.release_attempt = Some(ReleaseAttempt {
                 before,
                 after_ns,
                 outcome: if result.is_ok() {
@@ -6823,7 +7633,7 @@ where
             if let Err(error) = result {
                 let cause = match self.target.poll_exit() {
                     Ok(Some(code)) => {
-                        self.child_exit = Some(code);
+                        self.state.child_exit = Some(code);
                         PreObservationCause::NeverReleasedExit
                     }
                     _ => PreObservationCause::ReleaseError,
@@ -6833,12 +7643,12 @@ where
                     Some(BoundaryFailure::from_error(BoundaryStage::Release, &error)),
                 ));
             }
-            self.requested_start_ns = before.monotonic_ns;
-            self.wall_start = before.wall;
-            self.open_instant = before.instant;
-            self.last_established_ns = before.monotonic_ns;
+            self.state.requested_start_ns = before.monotonic_ns;
+            self.state.wall_start = before.wall;
+            self.state.open_instant = before.instant;
+            self.state.last_established_ns = before.monotonic_ns;
             if after_ns.is_none_or(|after| after < before.monotonic_ns) {
-                self.extra_counters.push(typed_counter(
+                self.state.extra_counters.push(typed_counter(
                     "count.close_time_uncertain",
                     CounterKind::Loss,
                     CounterUnits::Events,
@@ -6846,14 +7656,19 @@ where
                     1,
                 ));
             }
-            self.lifecycle.mark_released();
+            self.state.lifecycle.mark_released();
             self.settle_comm();
         } else {
-            self.requested_start_ns = self.info.acquired_ns;
-            self.wall_start = self.info.acquired_wall;
+            self.state.requested_start_ns = self.info.acquired_ns;
+            self.state.wall_start = self.info.acquired_wall;
         }
+        self.resume_window()
+    }
+
+    fn resume_window(mut self) -> anyhow::Result<Capture> {
+        let owned = self.info.owned;
         let requested_instant = if owned {
-            self.open_instant
+            self.state.open_instant
         } else {
             self.info.acquired_instant
         };
@@ -6876,7 +7691,10 @@ where
         // setup slice then reports as tail gap via the capped
         // effective end below. (--pid requested starts predate the
         // kernel open, so the clamp is a no-op there.)
-        let setup_ns = self.requested_start_ns.saturating_sub(self.window_start_ns);
+        let setup_ns = self
+            .state
+            .requested_start_ns
+            .saturating_sub(self.state.window_start_ns);
         let setup = Duration::from_nanos(setup_ns.min(duration_ns(self.cfg.duration)));
         let loop_deadline = loop_deadline.checked_sub(setup).unwrap_or(loop_deadline);
         let settle_end =
@@ -6885,16 +7703,16 @@ where
         // H7/B-6: observation starts here — everything above is
         // setup (baseline poll included: it seeds pre-window state,
         // never evidence). From this point failures salvage.
-        self.observation_started = true;
+        self.state.observation_started = true;
         // Poll loop: expiry / signal / death / fence.
         loop {
             let now = self.clock.now();
             if now >= loop_deadline {
-                self.expired = true;
+                self.state.expired = true;
                 break;
             }
             if (self.cancelled)() {
-                self.signal_cut = true;
+                self.state.signal_cut = true;
                 break;
             }
             // Pre-reap settle: this poll may reap, ending post-hoc
@@ -6903,7 +7721,7 @@ where
             if owned {
                 match self.target.poll_exit() {
                     Ok(Some(code)) => {
-                        self.child_exit = Some(code);
+                        self.state.child_exit = Some(code);
                         break;
                     }
                     Ok(None) => {}
@@ -6924,7 +7742,7 @@ where
             if owned {
                 match self.target.poll_exit() {
                     Ok(Some(code)) => {
-                        self.child_exit = Some(code);
+                        self.state.child_exit = Some(code);
                         break;
                     }
                     Ok(None) => {}
@@ -6936,7 +7754,7 @@ where
             match self.round(loop_deadline, settle_end) {
                 Ok(RoundAction::Continue) => {}
                 Ok(RoundAction::Expired) => {
-                    self.expired = true;
+                    self.state.expired = true;
                     break;
                 }
                 Ok(RoundAction::Closed) => break,
@@ -6949,36 +7767,43 @@ where
     }
 
     fn close_lifecycle(&mut self, edge: LifecycleEdge) {
-        if self.lifecycle_closed {
+        if self.state.lifecycle_closed {
             return;
         }
-        self.lifecycle_closed = true;
-        if self.child_exit.is_none() {
-            let sweep = self.lifecycle.poll();
+        self.state.lifecycle_closed = true;
+        if self.state.child_exit.is_none() {
+            let sweep = self.state.lifecycle.poll();
             self.fold_lifecycle_at(&sweep, edge);
-            self.lifecycle_exec_gap = self
+            self.state.lifecycle_exec_gap = self
+                .state
                 .lifecycle_exec_gap
                 .saturating_add(self.exec_witnesses(&sweep, edge));
         }
         // A selected count terminal can still have pending cleanup. Ask the
         // actual shared owner barrier, without a new wait budget or epoch.
         let close = {
-            let permit = self.count.fork_permit(Instant::now()).ok();
-            self.lifecycle.close_drain(edge, permit.as_ref())
+            let permit = self.state.count.fork_permit(Instant::now()).ok();
+            self.state.lifecycle.close_drain(edge, permit.as_ref())
         };
-        if !self.fallback_partial && !close.suffix_witness {
-            self.lifecycle_no_witness = self.lifecycle_no_witness.saturating_add(1);
+        if !self.state.fallback_partial && !close.suffix_witness {
+            self.state.lifecycle_no_witness = self.state.lifecycle_no_witness.saturating_add(1);
         }
         if let Some(delta) = close.delta {
             self.fold_lifecycle_at(&delta, edge);
-            self.lifecycle_pending = self.lifecycle_pending.saturating_add(delta.pending);
-            self.lifecycle_exec_gap = self
+            self.state.lifecycle_pending =
+                self.state.lifecycle_pending.saturating_add(delta.pending);
+            self.state.lifecycle_exec_gap = self
+                .state
                 .lifecycle_exec_gap
                 .saturating_add(self.exec_witnesses(&delta, edge));
         }
-        self.lifecycle_exec_gap = self
-            .lifecycle_exec_gap
-            .saturating_add(std::mem::replace(&mut self.pending_exec_obligation, 0));
+        self.state.lifecycle_exec_gap =
+            self.state
+                .lifecycle_exec_gap
+                .saturating_add(std::mem::replace(
+                    &mut self.state.pending_exec_obligation,
+                    0,
+                ));
     }
 
     fn close_and_finalize(mut self) -> anyhow::Result<Capture> {
@@ -6993,13 +7818,13 @@ where
         // broke on the deadline, never observing death — the exit
         // may postdate it), so the reap is kept for custody/status
         // but never negates the loss (fail-closed).
-        if self.expired {
+        if self.state.expired {
             if self.info.owned {
                 if let Ok(Some(code)) = self.target.poll_exit() {
-                    self.child_exit = Some(code);
+                    self.state.child_exit = Some(code);
                 }
             }
-            self.extra_counters.push(typed_counter(
+            self.state.extra_counters.push(typed_counter(
                 "capture.over_budget",
                 CounterKind::Loss,
                 CounterUnits::Events,
@@ -7024,13 +7849,17 @@ where
         let effective_end_ns = self
             .clock
             .checked_monotonic_ns()
-            .filter(|ns| *ns >= self.last_established_ns)
-            .map(|ns| ns.min(self.kernel_deadline_ns))
-            .unwrap_or(self.last_established_ns.min(self.kernel_deadline_ns));
+            .filter(|ns| *ns >= self.state.last_established_ns)
+            .map(|ns| ns.min(self.state.kernel_deadline_ns))
+            .unwrap_or(
+                self.state
+                    .last_established_ns
+                    .min(self.state.kernel_deadline_ns),
+            );
         // R12: the single close sample, alongside the monotonic end
         // stamp (drain time is not coverage) — every consumer below
         // reuses this pair, never re-samples.
-        self.wall_end = self.clock.wall_now();
+        self.state.wall_end = self.clock.wall_now();
         // Counting closes BEFORE the final discovery drain
         // (in-kernel TARGET=0 inside: no userspace delay can extend
         // counting past this point).
@@ -7039,11 +7868,11 @@ where
         // below, salvage assembles from this pre-state (no polls run
         // between here and finish, so it stays valid; a failed
         // finish takes the live session).
-        self.owned_exit_before_read = OwnedExitBeforeRead::establish(
+        self.state.owned_exit_before_read = OwnedExitBeforeRead::establish(
             self.info.owned,
-            self.child_exit.is_some() && !self.expired,
+            self.state.child_exit.is_some() && !self.state.expired,
         );
-        let pre_finish = self.discovery.snapshot();
+        let pre_finish = self.state.discovery.snapshot();
         let terminal = self.ensure_count_terminal(self.close_reason());
         if let Some(failure) = terminal.runtime_failure {
             return self.salvage(
@@ -7056,7 +7885,7 @@ where
                 failure.into(),
             );
         }
-        self.drain_wall_us = self
+        self.state.drain_wall_us = self
             .clock
             .now()
             .checked_duration_since(drain_t0)
@@ -7072,15 +7901,15 @@ where
         // child cannot execute past its death) survives instead of
         // losing the whole capture. Foreign targets keep the loud
         // recycle verdict — their pids really can be reused.
-        let pre_close =
-            (self.info.owned && self.child_exit.is_some()).then(|| self.discovery.snapshot());
+        let pre_close = (self.info.owned && self.state.child_exit.is_some())
+            .then(|| self.state.discovery.snapshot());
         // Round 3, residual D: post-reap provenance for the
         // maps-loss exemption — captured at finish entry (the
         // same mid-window-reap fact arming the pre-close arm
         // above; a later reap during finish_observation must not
         // backdate the close read as reaped-then-read).
-        self.reaped_before_close = self.info.owned && self.child_exit.is_some();
-        let snapshot = match self.discovery.finish() {
+        self.state.reaped_before_close = self.info.owned && self.state.child_exit.is_some();
+        let snapshot = match self.state.discovery.finish() {
             Ok(snapshot) => snapshot,
             Err(e) => {
                 let recycled = e.downcast_ref::<Recycled>();
@@ -7093,7 +7922,7 @@ where
                         // window is fulfilled through the exit; the
                         // pre-close arm only exists with a known
                         // child exit).
-                        self.extra_counters.push(typed_counter(
+                        self.state.extra_counters.push(typed_counter(
                             "discovery.close_join_skipped",
                             CounterKind::Activity,
                             CounterUnits::Events,
@@ -7164,7 +7993,7 @@ where
             .map(PreObservationCount::Terminal)
             .unwrap_or(PreObservationCount::NotPrepared);
         failure.rejected = RejectedPrefix::from_count(&count);
-        self.failure_context = Some(Arc::new(CaptureFailureContext {
+        self.state.failure_context = Some(Arc::new(CaptureFailureContext {
             rejected: failure.rejected,
             count,
             failure: Some(BoundaryFailure::new(
@@ -7173,9 +8002,9 @@ where
                 None,
                 &failure.to_string(),
             )),
-            custody: self.custody.clone().unwrap_or(CustodyReceipt {
+            custody: self.state.custody.clone().unwrap_or(CustodyReceipt {
                 disposition,
-                child_exit: self.child_exit,
+                child_exit: self.state.child_exit,
                 resolution: if !self.info.owned {
                     CustodyResolution::NotOwned
                 } else if disposition.is_some() {
@@ -7191,10 +8020,11 @@ where
     /// Sites of one op with live probes (coverage attach census).
     fn op_attached(&self, op: u32) -> u64 {
         let mut attached = 0u64;
-        if let Some(triples) = self.adapter.op_triples.get(&op) {
+        if let Some(triples) = self.state.adapter.op_triples.get(&op) {
             for triple in triples {
-                if let Some(cookie) = self.count.cookie_for(triple.0, triple.1, triple.2) {
+                if let Some(cookie) = self.state.count.cookie_for(triple.0, triple.1, triple.2) {
                     if self
+                        .state
                         .count
                         .provenance(cookie)
                         .is_some_and(|p| !p.link_path.is_empty())
@@ -7218,76 +8048,76 @@ where
         effective_end_ns: u64,
         salvage: Option<SalvageContext>,
     ) -> anyhow::Result<Capture> {
-        if self.cold_gap_queries > 0 {
-            self.extra_counters.push(typed_counter(
+        if self.state.cold_gap_queries > 0 {
+            self.state.extra_counters.push(typed_counter(
                 "discovery.pre_window_queries",
                 CounterKind::Loss,
                 CounterUnits::Events,
                 CounterSource::Discovery,
-                self.cold_gap_queries,
+                self.state.cold_gap_queries,
             ));
         }
-        if self.fork_exec_ignored > 0 {
-            self.extra_counters.push(typed_counter(
+        if self.state.fork_exec_ignored > 0 {
+            self.state.extra_counters.push(typed_counter(
                 "lifecycle.fork_exec_ignored",
                 CounterKind::Loss,
                 CounterUnits::Events,
                 CounterSource::Lifecycle,
-                self.fork_exec_ignored,
+                self.state.fork_exec_ignored,
             ));
         }
-        if self.lifecycle_loss > 0 {
-            self.extra_counters.push(typed_counter(
+        if self.state.lifecycle_loss > 0 {
+            self.state.extra_counters.push(typed_counter(
                 "lifecycle.scan_loss",
                 CounterKind::Loss,
                 CounterUnits::Events,
                 CounterSource::Lifecycle,
-                self.lifecycle_loss,
+                self.state.lifecycle_loss,
             ));
         }
-        if self.lifecycle_dropped > 0 {
-            self.extra_counters.push(typed_counter(
+        if self.state.lifecycle_dropped > 0 {
+            self.state.extra_counters.push(typed_counter(
                 "lifecycle.signal_dropped",
                 CounterKind::Loss,
                 CounterUnits::Events,
                 CounterSource::Lifecycle,
-                self.lifecycle_dropped,
+                self.state.lifecycle_dropped,
             ));
         }
-        if self.lifecycle_prefix_unwitnessed > 0 {
-            self.extra_counters.push(typed_counter(
+        if self.state.lifecycle_prefix_unwitnessed > 0 {
+            self.state.extra_counters.push(typed_counter(
                 "lifecycle.signal_prefix_unwitnessed",
                 CounterKind::Loss,
                 CounterUnits::Events,
                 CounterSource::Lifecycle,
-                self.lifecycle_prefix_unwitnessed,
+                self.state.lifecycle_prefix_unwitnessed,
             ));
         }
-        if self.lifecycle_no_witness > 0 {
-            self.extra_counters.push(typed_counter(
+        if self.state.lifecycle_no_witness > 0 {
+            self.state.extra_counters.push(typed_counter(
                 "lifecycle.no_witness",
                 CounterKind::Loss,
                 CounterUnits::Events,
                 CounterSource::Lifecycle,
-                self.lifecycle_no_witness,
+                self.state.lifecycle_no_witness,
             ));
         }
-        if self.lifecycle_pending > 0 {
-            self.extra_counters.push(typed_counter(
+        if self.state.lifecycle_pending > 0 {
+            self.state.extra_counters.push(typed_counter(
                 "lifecycle.drain_pending",
                 CounterKind::Loss,
                 CounterUnits::Events,
                 CounterSource::Lifecycle,
-                self.lifecycle_pending,
+                self.state.lifecycle_pending,
             ));
         }
-        if self.lifecycle_exec_gap > 0 {
-            self.extra_counters.push(typed_counter(
+        if self.state.lifecycle_exec_gap > 0 {
+            self.state.extra_counters.push(typed_counter(
                 "lifecycle.exec_gap",
                 CounterKind::Loss,
                 CounterUnits::Events,
                 CounterSource::Lifecycle,
-                self.lifecycle_exec_gap,
+                self.state.lifecycle_exec_gap,
             ));
         }
         // H3: mixed-withheld sites are ambiguity, not loss —
@@ -7295,9 +8125,9 @@ where
         // withheld). Distinct triples ever marked mixed; absent
         // (zero) on clean runs. Deliberately NOT a taint input:
         // mixed hides no sites and misses no evidence.
-        let mixed_sites = self.adapter.sites_mixed.len() as u64;
+        let mixed_sites = self.state.adapter.sites_mixed.len() as u64;
         if mixed_sites > 0 {
-            self.activity.push(typed_counter(
+            self.state.activity.push(typed_counter(
                 "discovery.mixed_classes",
                 CounterKind::Activity,
                 CounterUnits::Sites,
@@ -7305,8 +8135,8 @@ where
                 mixed_sites,
             ));
         }
-        if self.fallback_partial {
-            self.extra_counters.push(typed_counter(
+        if self.state.fallback_partial {
+            self.state.extra_counters.push(typed_counter(
                 "lifecycle.polling_fallback",
                 CounterKind::Loss,
                 CounterUnits::Events,
@@ -7314,31 +8144,31 @@ where
                 1,
             ));
         }
-        if self.maps_read_failed > 0 {
-            self.extra_counters.push(typed_counter(
+        if self.state.maps_read_failed > 0 {
+            self.state.extra_counters.push(typed_counter(
                 "discovery.maps_read_failed",
                 CounterKind::Loss,
                 CounterUnits::Events,
                 CounterSource::Discovery,
-                self.maps_read_failed,
+                self.state.maps_read_failed,
             ));
         }
-        if self.relevance_capped > 0 {
-            self.extra_counters.push(typed_counter(
+        if self.state.relevance_capped > 0 {
+            self.state.extra_counters.push(typed_counter(
                 "discovery.relevance_capped",
                 CounterKind::Loss,
                 CounterUnits::Sites,
                 CounterSource::Discovery,
-                self.relevance_capped,
+                self.state.relevance_capped,
             ));
         }
-        if self.unverified_reads > 0 {
-            self.extra_counters.push(typed_counter(
+        if self.state.unverified_reads > 0 {
+            self.state.extra_counters.push(typed_counter(
                 "discovery.unverified_read",
                 CounterKind::Loss,
                 CounterUnits::Sites,
                 CounterSource::Discovery,
-                self.unverified_reads,
+                self.state.unverified_reads,
             ));
         }
         // Post-exit maps reads miss nothing (the target is reaped,
@@ -7352,7 +8182,13 @@ where
         // the close-tail residual lands here, exactly once.
         let mut loss_residual_any = false;
         for (source, total) in &snapshot.losses {
-            let adapted = self.adapter.loss_sums.get(source).copied().unwrap_or(0);
+            let adapted = self
+                .state
+                .adapter
+                .loss_sums
+                .get(source)
+                .copied()
+                .unwrap_or(0);
             if let Some(residual) = total.checked_sub(adapted) {
                 if residual > 0 {
                     // R21-F1 (round 2) + round-3 D provenance: only
@@ -7372,7 +8208,7 @@ where
                     // disposition never relabels it.
                     let mut close_part = 0;
                     if target_exited
-                        && self.reaped_before_close
+                        && self.state.reaped_before_close
                         && *source == coverage::HOST_MAPS_READ
                     {
                         close_part = snapshot.maps_loss_close.min(residual);
@@ -7380,11 +8216,13 @@ where
                     if close_part > 0 {
                         let mut benign = classify_loss(*source, close_part);
                         benign.kind = CounterKind::Activity;
-                        self.extra_counters.push(benign);
+                        self.state.extra_counters.push(benign);
                     }
                     let loss_part = residual - close_part;
                     if loss_part > 0 {
-                        self.extra_counters.push(classify_loss(*source, loss_part));
+                        self.state
+                            .extra_counters
+                            .push(classify_loss(*source, loss_part));
                         // H2/T5: mid-run maps failures rode the
                         // deltas (op None → poll-global taint
                         // already fired); only the proven
@@ -7398,7 +8236,7 @@ where
             }
         }
         if snapshot.lossy_slots > 0 {
-            self.extra_counters.push(typed_counter(
+            self.state.extra_counters.push(typed_counter(
                 "discovery.lossy_slots",
                 CounterKind::Loss,
                 CounterUnits::TableRows,
@@ -7407,7 +8245,7 @@ where
             ));
         }
         if !snapshot.truncated_ops.is_empty() {
-            self.extra_counters.push(typed_counter(
+            self.state.extra_counters.push(typed_counter(
                 "discovery.truncated_walk",
                 CounterKind::Loss,
                 CounterUnits::Events,
@@ -7416,7 +8254,7 @@ where
             ));
         }
         if !snapshot.dispatch.attach_failures.is_empty() {
-            self.extra_counters.push(typed_counter(
+            self.state.extra_counters.push(typed_counter(
                 "discovery.unresolved_stage2",
                 CounterKind::Loss,
                 CounterUnits::Probes,
@@ -7427,7 +8265,8 @@ where
             // diagnostics (same set, same dedup — the close drain
             // identifies itself too).
             for failure in &snapshot.dispatch.attach_failures {
-                self.adapter
+                self.state
+                    .adapter
                     .attach_diagnostics
                     .insert(failure.error.clone());
             }
@@ -7435,7 +8274,7 @@ where
         // Retained epoch gaps stay PARTIAL even when every live table
         // terminates (rows survive; completion does not).
         for reason in &snapshot.retained_reasons {
-            self.extra_counters.push(typed_counter(
+            self.state.extra_counters.push(typed_counter(
                 &format!("discovery.retained_{}", reason.replace('-', "_")),
                 CounterKind::Loss,
                 CounterUnits::Events,
@@ -7449,7 +8288,7 @@ where
             .iter()
             .fold(0u64, |acc, (_, n)| acc.saturating_add(*n));
         if reloads > 0 {
-            self.activity.push(typed_counter(
+            self.state.activity.push(typed_counter(
                 "discovery.provider_reloads",
                 CounterKind::Activity,
                 CounterUnits::Events,
@@ -7459,11 +8298,11 @@ where
         }
         if let Some(tail) = snapshot
             .queries_observed
-            .checked_sub(self.adapter.queries_observed)
+            .checked_sub(self.state.adapter.queries_observed)
         {
             if tail > 0 {
                 // Post-count-close arrivals: activity, never cold gap.
-                self.activity.push(typed_counter(
+                self.state.activity.push(typed_counter(
                     "discovery.queries_observed",
                     CounterKind::Activity,
                     CounterUnits::Events,
@@ -7478,11 +8317,12 @@ where
         // subtracted from the close-tail residual below so each
         // increment counts exactly once.
         let straddling_trip: u64 = self
+            .state
             .straddling_trip
             .values()
             .fold(0u64, |a, &b| a.saturating_add(b));
         if straddling_trip > 0 {
-            self.extra_counters.push(typed_counter(
+            self.state.extra_counters.push(typed_counter(
                 "legacy.straddling_poll_trip",
                 CounterKind::Loss,
                 CounterUnits::Events,
@@ -7490,13 +8330,13 @@ where
                 straddling_trip,
             ));
         }
-        if self.straddling_lgcalls > 0 {
-            self.extra_counters.push(typed_counter(
+        if self.state.straddling_lgcalls > 0 {
+            self.state.extra_counters.push(typed_counter(
                 "legacy.straddling_poll_lgcalls",
                 CounterKind::Loss,
                 CounterUnits::Events,
                 CounterSource::Discovery,
-                self.straddling_lgcalls,
+                self.state.straddling_lgcalls,
             ));
         }
         // Close-tail legacy reconcile: the final join covers TRIP
@@ -7507,9 +8347,15 @@ where
         // never a silent drop.
         let mut tail_trip = 0u64;
         for (cookie, total) in &snapshot.legacy.trip {
-            let base = self.adapter.baseline_trip.get(cookie).copied().unwrap_or(0);
-            let in_window = self.in_window_trip.get(cookie).copied().unwrap_or(0);
-            let straddling = self.straddling_trip.get(cookie).copied().unwrap_or(0);
+            let base = self
+                .state
+                .adapter
+                .baseline_trip
+                .get(cookie)
+                .copied()
+                .unwrap_or(0);
+            let in_window = self.state.in_window_trip.get(cookie).copied().unwrap_or(0);
+            let straddling = self.state.straddling_trip.get(cookie).copied().unwrap_or(0);
             if let Some(after_base) = total.checked_sub(base)
                 && let Some(after_window) = after_base.checked_sub(in_window)
                 && let Some(tail) = after_window.checked_sub(straddling)
@@ -7518,7 +8364,7 @@ where
             }
         }
         if tail_trip > 0 {
-            self.extra_counters.push(typed_counter(
+            self.state.extra_counters.push(typed_counter(
                 "legacy.close_tail_trip",
                 CounterKind::Loss,
                 CounterUnits::Events,
@@ -7529,12 +8375,12 @@ where
         if let Some(after_base) = snapshot
             .legacy
             .executed_queries
-            .checked_sub(self.adapter.baseline_lgcalls)
-            && let Some(after_window) = after_base.checked_sub(self.in_window_lgcalls)
-            && let Some(tail_lgcalls) = after_window.checked_sub(self.straddling_lgcalls)
+            .checked_sub(self.state.adapter.baseline_lgcalls)
+            && let Some(after_window) = after_base.checked_sub(self.state.in_window_lgcalls)
+            && let Some(tail_lgcalls) = after_window.checked_sub(self.state.straddling_lgcalls)
             && tail_lgcalls > 0
         {
-            self.extra_counters.push(typed_counter(
+            self.state.extra_counters.push(typed_counter(
                 "legacy.close_tail_lgcalls",
                 CounterKind::Loss,
                 CounterUnits::Events,
@@ -7555,7 +8401,7 @@ where
             })
             .unwrap_or((0, 0, 0));
         if engine_un > 0 {
-            self.extra_counters.push(typed_counter(
+            self.state.extra_counters.push(typed_counter(
                 "legacy.engine_uninstrumented",
                 CounterKind::Loss,
                 CounterUnits::Sites,
@@ -7564,7 +8410,7 @@ where
             ));
         }
         if meth_un > 0 {
-            self.extra_counters.push(typed_counter(
+            self.state.extra_counters.push(typed_counter(
                 "legacy.meth_uninstrumented",
                 CounterKind::Loss,
                 CounterUnits::Sites,
@@ -7573,7 +8419,7 @@ where
             ));
         }
         if low_un > 0 {
-            self.extra_counters.push(typed_counter(
+            self.state.extra_counters.push(typed_counter(
                 "legacy.lowlevel_uninstrumented",
                 CounterKind::Loss,
                 CounterUnits::Sites,
@@ -7623,10 +8469,10 @@ where
             || snapshot.lossy_slots > 0
             || !snapshot.dispatch.attach_failures.is_empty()
             || !snapshot.retained_reasons.is_empty()
-            || self.relevance_capped > 0
-            || self.unverified_reads > 0
+            || self.state.relevance_capped > 0
+            || self.state.unverified_reads > 0
             || drain_shortfall > 0
-            || self.maps_read_failed > 0
+            || self.state.maps_read_failed > 0
             || salvage.as_ref().is_some_and(|s| s.taint_evidence);
         // Close-candidate reconcile (P6 §6ii sol blocker 2):
         // candidates first joined (or refreshed) by close's tail
@@ -7692,7 +8538,7 @@ where
             close_backings.insert((*ino, *offset));
         }
         if !snapshot.close_remembered.is_empty() {
-            self.extra_counters.push(typed_counter(
+            self.state.extra_counters.push(typed_counter(
                 "discovery.close_remembered",
                 CounterKind::Loss,
                 CounterUnits::Sites,
@@ -7701,7 +8547,7 @@ where
             ));
         }
         if close_joined > 0 {
-            self.extra_counters.push(typed_counter(
+            self.state.extra_counters.push(typed_counter(
                 "discovery.close_candidates",
                 CounterKind::Loss,
                 CounterUnits::Sites,
@@ -7710,7 +8556,7 @@ where
             ));
         }
         if close_unbacked > 0 {
-            self.extra_counters.push(typed_counter(
+            self.state.extra_counters.push(typed_counter(
                 "discovery.unbacked_candidate",
                 CounterKind::Loss,
                 CounterUnits::Sites,
@@ -7720,27 +8566,27 @@ where
         }
         // Census taint (denominators Unknown, emitted+proven sites
         // stand — all site evidence is in-window by construction).
-        let close_census_global = self.cold_gap_queries > 0
-            || self.lifecycle_loss > 0
-            || self.lifecycle_dropped > 0
-            || self.lifecycle_prefix_unwitnessed > 0
-            || self.lifecycle_no_witness > 0
-            || self.lifecycle_pending > 0
-            || self.lifecycle_exec_gap > 0
-            || self.fallback_partial;
+        let close_census_global = self.state.cold_gap_queries > 0
+            || self.state.lifecycle_loss > 0
+            || self.state.lifecycle_dropped > 0
+            || self.state.lifecycle_prefix_unwitnessed > 0
+            || self.state.lifecycle_no_witness > 0
+            || self.state.lifecycle_pending > 0
+            || self.state.lifecycle_exec_gap > 0
+            || self.state.fallback_partial;
         let mut coverage = Vec::new();
-        for op in self.adapter.ops() {
+        for op in self.state.adapter.ops() {
             let terminated = snap_term
                 .get(&op)
                 .copied()
-                .unwrap_or_else(|| self.adapter.op_closed(op));
-            let discovered = self.adapter.op_discovered(op);
+                .unwrap_or_else(|| self.state.adapter.op_closed(op));
+            let discovered = self.state.adapter.op_discovered(op);
             let attached = self.op_attached(op);
             // A7: a tainted op's discovered count is no denominator
             // (a lost ROW may hide a site or an identity).
             // H2: final taint (poll ∪ close, evidence ∪ census).
             let known = terminated
-                && !self.adapter.loss_tainted(op)
+                && !self.state.adapter.loss_tainted(op)
                 && !close_evidence_global
                 && !close_evidence_ops.contains(&op)
                 && !close_census_global;
@@ -7776,7 +8622,7 @@ where
                     attached: 0,
                 });
             }
-        } else if legacy::find_libcrypto(&self.last_live).is_some() {
+        } else if legacy::find_libcrypto(&self.state.last_live).is_some() {
             coverage.push(ScopeCoverage {
                 scope: "legacy".to_string(),
                 expected: ExpectedScope::Unknown,
@@ -7797,7 +8643,7 @@ where
         // global evidence taint (poll ∪ close) means it was not
         // fully observed. Op-localized truncation leaves the
         // dispatch anchor claim standing.
-        let dispatch_known = !self.adapter.taint_global && !close_evidence_global;
+        let dispatch_known = !self.state.adapter.taint_global && !close_evidence_global;
         if snapshot.dispatch.attached {
             coverage.push(ScopeCoverage {
                 scope: "dispatch".to_string(),
@@ -7819,26 +8665,28 @@ where
         }
 
         let original_requested_end = self
+            .state
             .requested_start_ns
             .checked_add(duration_ns(self.cfg.duration))
             .ok_or_else(|| anyhow::anyhow!("requested window deadline overflow"))?;
-        let programmed = self.count.programmed_admission().copied();
+        let programmed = self.state.count.programmed_admission().copied();
         let effective_start = programmed
             .map(|p| p.start_ns())
-            .unwrap_or(self.window_start_ns)
-            .max(self.requested_start_ns);
-        let empty_overlap = programmed.is_some_and(|p| p.deadline_ns() <= self.requested_start_ns);
+            .unwrap_or(self.state.window_start_ns)
+            .max(self.state.requested_start_ns);
+        let empty_overlap =
+            programmed.is_some_and(|p| p.deadline_ns() <= self.state.requested_start_ns);
         let effective_end_ns = if empty_overlap {
-            self.requested_start_ns
+            self.state.requested_start_ns
         } else {
             effective_end_ns.max(effective_start)
         };
         let mut window = CaptureWindow {
-            requested_start_ns: self.requested_start_ns,
+            requested_start_ns: self.state.requested_start_ns,
             requested_end_ns: original_requested_end,
             effective_start_ns: effective_start,
             effective_end_ns,
-            signal_cut: self.signal_cut,
+            signal_cut: self.state.signal_cut,
             count_admission: None,
         };
         let mut mode = if programmed.is_none()
@@ -7847,19 +8695,21 @@ where
             && effective_end_ns == original_requested_end
         {
             AdmissionMode::SetupNoWindow
-        } else if self.signal_cut || salvage.is_some() || effective_end_ns < original_requested_end
+        } else if self.state.signal_cut
+            || salvage.is_some()
+            || effective_end_ns < original_requested_end
         {
             AdmissionMode::Degraded
         } else {
             AdmissionMode::Ordinary
         };
-        if !empty_overlap && let Some(proof) = self.owned_exit_before_read {
+        if !empty_overlap && let Some(proof) = self.state.owned_exit_before_read {
             window.requested_end_ns = effective_end_ns;
             mode = AdmissionMode::OwnedFulfilled(proof);
         }
         let mut projection = project_admission(
             programmed.as_ref(),
-            self.release_attempt.as_ref(),
+            self.state.release_attempt.as_ref(),
             &window,
             &drain,
             mode,
@@ -7875,7 +8725,7 @@ where
             window.requested_end_ns = original_requested_end;
             projection = project_admission(
                 programmed.as_ref(),
-                self.release_attempt.as_ref(),
+                self.state.release_attempt.as_ref(),
                 &window,
                 &drain,
                 AdmissionMode::Degraded,
@@ -7926,7 +8776,7 @@ where
             .map(|f| evidence::FatalKind::Runtime(f.to_string()))
             .or_else(|| salvage.as_ref().map(|s| s.fatal.clone()))
             .or(
-                if self.attached_total == 0 && !self.adapter.emitted.is_empty() {
+                if self.state.attached_total == 0 && !self.state.adapter.emitted.is_empty() {
                     Some(evidence::FatalKind::AttachZero)
                 } else {
                     None
@@ -7940,14 +8790,14 @@ where
         // revision: Capture carries no adapter — the doc's sites
         // come from this drain alone.)
         {
-            let poll_global = self.adapter.taint_global;
+            let poll_global = self.state.adapter.taint_global;
             let site_tainted = |site: &SiteExecution| {
                 close_evidence_global
                     || poll_global
                     || close_backings.contains(&(site.site.inode, site.site.offset))
                     || site.candidates.iter().any(|c| {
                         close_evidence_ops.contains(&c.op)
-                            || self.adapter.tainted_ops.contains(&c.op)
+                            || self.state.adapter.tainted_ops.contains(&c.op)
                     })
             };
             for site in drain
@@ -7974,8 +8824,8 @@ where
         // reports natively; the inventory below carries only
         // count-observed executions.
         let mut counters = drain.counters.clone();
-        counters.extend(self.activity.iter().cloned());
-        counters.extend(self.extra_counters.iter().cloned());
+        counters.extend(self.state.activity.iter().cloned());
+        counters.extend(self.state.extra_counters.iter().cloned());
         // R05: typed ENGINE observations join the finalized
         // document once, from the same in-window tripwire evidence
         // the legacy block below renders. Unjoinable increments
@@ -7997,7 +8847,7 @@ where
         // with named reasons). Observed records are preserved
         // untouched (done/findings flow to the traversal section
         // as before — only the gaps are newly typed).
-        if let Some(t) = self.traversal.as_ref() {
+        if let Some(t) = self.state.traversal.as_ref() {
             if t.storm_polls > 0 {
                 counters.push(typed_counter(
                     "traversal.storm",
@@ -8054,20 +8904,22 @@ where
         // candidates, never calls, so pre-finalize values equal the
         // document's). One computation feeds both the v2 document
         // field and the v1 legacy section below.
-        let legacy_files =
-            legacy_files_for(self.cfg.resolved_provider.as_ref(), &self.adapter.objects);
+        let legacy_files = legacy_files_for(
+            self.cfg.resolved_provider.as_ref(),
+            &self.state.adapter.objects,
+        );
         let call_partition = partition_calls(&drain.current, &drain.fenced, &legacy_files);
         let mut document = evidence::finalize(FinalizeInput {
             window,
             sites: drain.current.clone(),
             fenced: drain.fenced.clone(),
-            objects: self.adapter.objects.clone(),
+            objects: self.state.adapter.objects.clone(),
             coverage,
             counters,
             fatal,
             target: doc_target(
                 self.info.pid,
-                &self.comm,
+                &self.state.comm,
                 &self.info.container_id,
                 &self.info.image_digest,
             ),
@@ -8076,19 +8928,20 @@ where
             policy: None,
             legacy_partition: evidence_partition(call_partition),
             engine_observations,
-            traversal: self.traversal.as_ref().and_then(traversal_record),
+            traversal: self.state.traversal.as_ref().and_then(traversal_record),
         });
         // R12: retain the one consistently captured pair
         // (monotonic fields stay authoritative).
         document.context = Some(doc_context(
             &self.info.kernel_release,
-            self.wall_start,
-            self.wall_end,
+            self.state.wall_start,
+            self.state.wall_end,
         ));
         // R06: failed-attach diagnostics ride the document (sorted
         // set take, capped — deterministic; the counters stay the
         // exact counts regardless).
         document.attach_diagnostics = self
+            .state
             .adapter
             .attach_diagnostics
             .iter()
@@ -8098,6 +8951,7 @@ where
         // R14 minor: refusal diagnostics ride the document (sorted
         // + deduped + capped upstream, same rule as attach_diagnostics).
         document.refusal_diagnostics = self
+            .state
             .refusal_diagnostics
             .iter()
             .take(REFUSAL_DIAGNOSTICS_CAP)
@@ -8117,16 +8971,16 @@ where
             .collect();
         let legacy_doc = legacy::section(&legacy::SectionInputs {
             set,
-            trip: &self.in_window_trip,
-            trip_hits: &self.in_window_hits,
-            legacy_queries: self.in_window_lgcalls,
-            legacy_classes: self.adapter.legacy_classes.iter().cloned().collect(),
+            trip: &self.state.in_window_trip,
+            trip_hits: &self.state.in_window_hits,
+            legacy_queries: self.state.in_window_lgcalls,
+            legacy_classes: self.state.adapter.legacy_classes.iter().cloned().collect(),
             extra_findings: &extra,
             call_partition,
         });
 
         self.emit_gap_reasons(document.reasons());
-        if !self.trigger_observed {
+        if !self.state.trigger_observed {
             self.reason("no-query");
         } else if document.sites.is_empty() && document.fenced.iter().all(|g| g.sites.is_empty()) {
             self.reason("empty-inventory");
@@ -8151,7 +9005,7 @@ where
         }
 
         let outcome = match &document.status {
-            Completeness::Complete if self.reasons.is_empty() => Outcome::Complete,
+            Completeness::Complete if self.state.reasons.is_empty() => Outcome::Complete,
             Completeness::Fatal { kind, .. } => Outcome::Fatal(match kind {
                 evidence::FatalKind::Recycled => FatalKind::Recycled,
                 evidence::FatalKind::AttachZero => FatalKind::AttachZero,
@@ -8225,13 +9079,13 @@ where
             missed_attaches: counter_value("count.missed_attaches"),
             unresolved_offsets: counter_value("count.unresolved_offsets"),
             table_staleness_events: counter_value("count.stale_events"),
-            cold_gap_calls: self.cold_gap_queries,
-            provider_changed: self.provider_changed_fences,
-            scan_budget_exhaustions: self.scan_budget_exhaustions,
+            cold_gap_calls: self.state.cold_gap_queries,
+            provider_changed: self.state.provider_changed_fences,
+            scan_budget_exhaustions: self.state.scan_budget_exhaustions,
             engine_fallback_uninstrumented: engine_un,
             drain_shortfall: counter_value("count.drain_shortfall"),
             uninstrumented_ops: uninstrumented,
-            fork_exec_ignored: self.fork_exec_ignored,
+            fork_exec_ignored: self.state.fork_exec_ignored,
             over_budget: counter_value("capture.over_budget"),
         };
         let status = match &outcome {
@@ -8241,13 +9095,13 @@ where
         };
         let harvest_doc = serde_json::json!({
             "status": status,
-            "trigger_observed": self.trigger_observed,
+            "trigger_observed": self.state.trigger_observed,
             "rows": [],
         });
         let window_actual = self
             .clock
             .now()
-            .saturating_duration_since(self.open_instant);
+            .saturating_duration_since(self.state.open_instant);
         let capture = self.finish_capture(
             document,
             FinishParts {
@@ -8277,7 +9131,8 @@ where
     /// defensive sentinel on miss — evidence is preserved, never
     /// dropped for a bookkeeping gap.
     fn cookie_for_site(&self, site: &SiteExecution) -> u32 {
-        self.site_cookies
+        self.state
+            .site_cookies
             .get(&site.site)
             .copied()
             .unwrap_or_else(|| {
@@ -8342,14 +9197,14 @@ where
     }
 
     fn finish_capture(self, document: CaptureDocument, parts: FinishParts) -> Capture {
-        let mut reasons: Vec<String> = self.reasons.into_iter().collect();
+        let mut reasons: Vec<String> = self.state.reasons.into_iter().collect();
         reasons.sort();
         Capture {
-            programmed_admission: self.count.programmed_admission().copied(),
-            release_attempt: self.release_attempt,
-            failure_context: self.failure_context,
+            programmed_admission: self.state.count.programmed_admission().copied(),
+            release_attempt: self.state.release_attempt,
+            failure_context: self.state.failure_context,
             target_pid: self.info.pid,
-            target_comm: self.comm.clone(),
+            target_comm: self.state.comm.clone(),
             window_planned: self.cfg.duration,
             window_actual: parts.window_actual,
             outcome: parts.outcome,
@@ -8357,12 +9212,12 @@ where
             executions: parts.executions,
             stale: parts.stale,
             counters: parts.counters,
-            child_exit: self.child_exit,
-            drain_wall_us: self.drain_wall_us,
+            child_exit: self.state.child_exit,
+            drain_wall_us: self.state.drain_wall_us,
             harvest_doc: parts.harvest_doc,
             legacy: parts.legacy,
-            window_start_wall: self.wall_start,
-            window_end_wall: self.wall_end,
+            window_start_wall: self.state.wall_start,
+            window_end_wall: self.state.wall_end,
             kernel_release: self.info.kernel_release.clone(),
             target_cmdline: self.info.cmdline.clone(),
             target_container_id: self.info.container_id.clone(),
@@ -8371,7 +9226,7 @@ where
             image_digest: self.info.image_digest.clone(),
             document,
             disposition: parts.disposition,
-            traversal: self.traversal,
+            traversal: self.state.traversal,
             // `run_inner` stamps the resolved selection post-hoc
             // (the Runner never sees it, so `observe` keeps its
             // signature); stubbed captures honestly carry `None`.
@@ -8560,6 +9415,15 @@ fn resolve_capture_provider(
     offset_table: &crate::discovery::builtin::Table,
     enrollment: &ProviderTable,
 ) -> anyhow::Result<ResolvedProvider> {
+    resolve_capture_provider_with(auto, cfg, offset_table, enrollment, None)
+}
+fn resolve_capture_provider_with(
+    auto: AutoTarget,
+    cfg: &Config,
+    offset_table: &crate::discovery::builtin::Table,
+    enrollment: &ProviderTable,
+    setup: Option<&crate::capture_setup::SetupLinks>,
+) -> anyhow::Result<ResolvedProvider> {
     let builtin = cfg.builtin || cfg.provider.is_none();
     let opts = onboard::QualifyOpts {
         offset_table,
@@ -8570,8 +9434,19 @@ fn resolve_capture_provider(
     };
     let qual = match &cfg.provider {
         Some(p) => {
-            let bytes = onboard::read_bounded(p, onboard::MAX_OBJECT_SCAN_BYTES)
-                .map_err(|e| anyhow::anyhow!("provider {} unreadable: {e}", p.display()))?;
+            let bytes = match setup {
+                Some(links) => onboard::read_bounded_controlled(
+                    p,
+                    onboard::MAX_OBJECT_SCAN_BYTES,
+                    links,
+                    BoundaryStage::Setup,
+                    true,
+                )
+                .map_err(onboard::read_error)
+                .with_context(|| format!("provider {} unreadable", p.display()))?,
+                None => onboard::read_bounded(p, onboard::MAX_OBJECT_SCAN_BYTES)
+                    .map_err(|e| anyhow::anyhow!("provider {} unreadable: {e}", p.display()))?,
+            };
             if builtin {
                 onboard::qualify_libcrypto_bytes(&bytes, p, false, &opts)
             } else {
@@ -8589,11 +9464,23 @@ fn resolve_capture_provider(
             };
             let qual = match auto {
                 AutoTarget::Pid(p) => onboard::discover_pid(p, &opts),
-                AutoTarget::Spawn(argv) => onboard::discover_spawn(argv, &opts, &spenv),
+                AutoTarget::Spawn(argv) => {
+                    if let Some(links) = setup {
+                        return onboard::discover_spawn_controlled(argv, &opts, &spenv, links)
+                            .and_then(|qualification| resolve_qualification(qualification, cfg));
+                    }
+                    onboard::discover_spawn(argv, &opts, &spenv)
+                }
             };
             qual.map_err(|e| anyhow::anyhow!("target discovery: {}", e.full()))?
         }
     };
+    resolve_qualification(qual, cfg)
+}
+fn resolve_qualification(
+    qual: onboard::TargetQualification,
+    cfg: &Config,
+) -> anyhow::Result<ResolvedProvider> {
     match qual {
         onboard::TargetQualification::Supported(t) => {
             if cfg.provider.is_none() {
@@ -9109,6 +9996,444 @@ fn with_members_snapshot<R>(t: &TraversalAttach, load: impl FnOnce(&[u8]) -> R) 
     load(&t.members_bytes)
 }
 
+pub(crate) struct SetupBundle<D, B: CountBackend, L> {
+    pub(crate) window: Option<PreparedOwnedWindow<D, B, L>>,
+    // Bootstrap ports are retained even if Count preparation refuses.
+    bootstrap: Option<(D, L)>,
+}
+pub(crate) enum PublicationWindow<'a, D, B: CountBackend, L> {
+    Live(&'a mut LiveSetupBundle),
+    Host(&'a mut SetupBundle<D, B, L>),
+}
+impl<D, B: CountBackend, L> PublicationWindow<'_, D, B, L> {
+    pub(crate) fn compatible(&self) -> bool {
+        match self {
+            Self::Live(bundle) => bundle
+                .window
+                .as_ref()
+                .is_some_and(|window| window.state.discovery.ready_compatible()),
+            Self::Host(bundle) => bundle.window.is_some(),
+        }
+    }
+    pub(crate) fn install(
+        &mut self,
+        mut custody: crate::capture_setup::SetupLinkCustody,
+        member_pool: &mut Vec<OwnedFd>,
+        displaced: &mut crate::capture_setup::SetupDisplaced,
+    ) {
+        match self {
+            Self::Live(bundle) => {
+                if let Some(window) = bundle.window.as_mut() {
+                    let (discovery, members) = custody.split_ready(member_pool);
+                    window
+                        .state
+                        .discovery
+                        .install_ready(discovery, members, displaced);
+                    if let LiveLifecycle::Kernel(kernel) = &mut window.state.lifecycle {
+                        if let Some(guard) = kernel.fd.take_setup() {
+                            displaced.guards.push(guard);
+                        }
+                    }
+                    if let Some(control) = window.state.setup_control.take() {
+                        displaced.controls.push(control);
+                    }
+                    if let Some(old) = window.state.native_custody.replace(custody) {
+                        displaced.custody.push(old);
+                    }
+                } else {
+                    displaced.custody.push(custody);
+                }
+            }
+            Self::Host(bundle) => {
+                // Injected ordinary effect ports have no Preparing native-store
+                // representation. The real Count/session state and all ledger
+                // descriptors still move atomically into that actual window.
+                if let Some(window) = bundle.window.as_mut() {
+                    if let Some(control) = window.state.setup_control.take() {
+                        displaced.controls.push(control);
+                    }
+                    if let Some(old) = window.state.native_custody.replace(custody) {
+                        displaced.custody.push(old);
+                    }
+                } else {
+                    displaced.custody.push(custody);
+                }
+            }
+        }
+    }
+}
+
+pub(crate) struct OwnedSetupSource {
+    cfg: Config,
+    info: TargetInfo,
+    argv: Vec<String>,
+    objects: onboard::ObjectPaths,
+    traversal: Option<TraversalAttach>,
+    count_bytes: Arc<[u8]>,
+    count_sha256: [u8; 32],
+    harvest_bytes: Option<Arc<[u8]>>,
+    barrier: Arc<crate::count_owner::CountForkBarrier>,
+}
+pub(crate) enum SetupRequest<D, B: CountBackend, L> {
+    Live(
+        OwnedSetupSource,
+        std::marker::PhantomData<fn() -> (D, B, L)>,
+    ),
+    #[cfg(test)]
+    Host {
+        cfg: Config,
+        info: TargetInfo,
+        discovery: D,
+        lifecycle: L,
+        count: Arc<crate::count_owner::W079AppCountFixture>,
+        proc: Box<dyn ProcPort + Send>,
+        seed: Option<(
+            crate::count_session::CountDelta,
+            crate::discovery::maps::Mapping,
+            plan::FileBytes,
+        )>,
+    },
+}
+
+impl<D, B: CountBackend, L> SetupRequest<D, B, L> {
+    pub(crate) fn grace(&self) -> Duration {
+        match self {
+            Self::Live(source, _) => source.cfg.grace,
+            #[cfg(test)]
+            Self::Host { cfg, .. } => cfg.grace,
+        }
+    }
+}
+
+pub(crate) fn prepare_setup_request<D, B, L>(
+    request: SetupRequest<D, B, L>,
+    control: &crate::capture_setup::SetupControl,
+    links: &crate::capture_setup::SetupLinks,
+    lease: &crate::count_owner::SetupBarrierLease,
+    journal: &crate::count_owner::CountSetupJournal,
+) -> (
+    Box<dyn std::any::Any + Send>,
+    Option<crate::capture_setup::SetupFailure>,
+)
+where
+    D: DiscoveryPort + Send + 'static,
+    B: CountBackend + Send + 'static,
+    B::Link: Send,
+    L: LifecyclePort + Send + 'static,
+{
+    match request {
+        SetupRequest::Live(source, _) => {
+            // The production constructor admits this exact port type. The
+            // coordinator checks its registered payload type before accepting.
+            let (bundle, failure) =
+                prepare_live_owned_setup(source, control, links, lease, journal);
+            (Box::new(bundle), failure)
+        }
+        #[cfg(test)]
+        SetupRequest::Host {
+            cfg,
+            info,
+            discovery,
+            lifecycle,
+            count,
+            mut proc,
+            seed,
+        } => {
+            lease.close_prefix();
+            let backend = lease
+                .reserve_count()
+                .map_err(crate::count_owner::CountPrepareFailure::from)
+                .and_then(|token| {
+                    count.prepare(
+                        info.pid,
+                        token,
+                        &crate::count_owner::CountPrepareControl::new(control.clone()),
+                        journal,
+                    )
+                })
+                .map(crate::count_session::LiveBackend::from_setup_fixture);
+            match backend {
+                Ok(backend) => {
+                    let mut count = CountSession::new(info.pid, backend);
+                    let seed_failure = seed.and_then(|(delta, mapping, file)| {
+                        let files = HashMap::from([(mapping.path.clone(), file)]);
+                        count
+                            .attach_delta(
+                                &delta,
+                                &[mapping],
+                                &files,
+                                LiveClock.monotonic_ns(),
+                                control.deadline(),
+                            )
+                            .err()
+                    });
+                    if let Some(error) = &seed_failure {
+                        links.seal(crate::capture_setup::SetupFailure::from_error_ref(
+                            BoundaryStage::Setup,
+                            error,
+                        ));
+                        control.abandon();
+                    }
+                    match prepare_owned_window(
+                        cfg,
+                        info.clone(),
+                        discovery,
+                        count,
+                        lifecycle,
+                        control,
+                        &LiveClock,
+                        &mut proc,
+                    ) {
+                        Ok(window) => (
+                            Box::new(SetupBundle {
+                                window: Some(window),
+                                bootstrap: None,
+                            }),
+                            None,
+                        ),
+                        Err(failure) => (
+                            Box::new(SetupBundle {
+                                window: Some(failure.window),
+                                bootstrap: None,
+                            }),
+                            Some(seed_failure.map_or(
+                                crate::capture_setup::SetupFailure::Boundary(failure.failure),
+                                |error| {
+                                    crate::capture_setup::SetupFailure::from_error(
+                                        BoundaryStage::Setup,
+                                        error,
+                                    )
+                                },
+                            )),
+                        ),
+                    }
+                }
+                Err(failure) => (
+                    Box::new(SetupBundle::<D, crate::count_session::LiveBackend, L> {
+                        window: None,
+                        bootstrap: Some((discovery, lifecycle)),
+                    }),
+                    Some(crate::capture_setup::SetupFailure::from_error(
+                        BoundaryStage::Setup,
+                        failure.into(),
+                    )),
+                ),
+            }
+        }
+    }
+}
+
+pub(crate) type LiveSetupBundle =
+    SetupBundle<CaptureDiscovery, crate::count_session::LiveBackend, LiveLifecycle>;
+fn prepare_live_owned_setup(
+    mut source: OwnedSetupSource,
+    control: &crate::capture_setup::SetupControl,
+    links: &crate::capture_setup::SetupLinks,
+    lease: &crate::count_owner::SetupBarrierLease,
+    journal: &crate::count_owner::CountSetupJournal,
+) -> (LiveSetupBundle, Option<crate::capture_setup::SetupFailure>) {
+    use crate::capture_setup::SetupFailure;
+    let mut bundle = SetupBundle {
+        window: None,
+        bootstrap: None,
+    };
+    let result: Result<(), SetupFailure> =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            links.check(control, BoundaryStage::Setup)?;
+            let table = match &source.cfg.table {
+                Some(path) => {
+                    let _read = links.temporary(control, BoundaryStage::Setup, 1)?;
+                    let bytes = onboard::read_bounded_controlled(
+                        path,
+                        onboard::MAX_TABLE_FILE_BYTES,
+                        links,
+                        BoundaryStage::Setup,
+                        true,
+                    )
+                    .map_err(|e| {
+                        SetupFailure::from_error(
+                            BoundaryStage::Setup,
+                            match e {
+                                onboard::ReadBoundedError::Io(error) => anyhow::Error::new(error),
+                                error => anyhow::anyhow!(error),
+                            },
+                        )
+                    })?;
+                    let text = String::from_utf8(bytes)
+                        .map_err(|e| SetupFailure::from_error(BoundaryStage::Setup, e.into()))?;
+                    crate::discovery::builtin::load_table_str(&text)
+                        .map_err(|e| SetupFailure::from_error(BoundaryStage::Setup, e))?
+                }
+                None => crate::discovery::builtin::shipped_table(),
+            };
+            links.check(control, BoundaryStage::Setup)?;
+            source.info.comm = comm_of(source.info.pid);
+            links.check(control, BoundaryStage::Setup)?;
+            source.info.container_id = container_id_of(source.info.pid);
+            links.check(control, BoundaryStage::Setup)?;
+            source.info.kernel_release = crate::doctor::uname_release();
+            links.check(control, BoundaryStage::Setup)?;
+            let empty = ProviderTable::empty();
+            let enrollment = source.cfg.provider_enrollment.as_ref().unwrap_or(&empty);
+            let resolved = resolve_capture_provider_with(
+                AutoTarget::Spawn(&source.argv),
+                &source.cfg,
+                &table,
+                enrollment,
+                Some(links),
+            )
+            .map_err(|e| {
+                SetupFailure::from_error(BoundaryStage::Setup, e.context("target resolution"))
+            })?;
+            let effective = effective_config(&source.cfg, &source.objects, &resolved);
+            source.info.provider_build_id = resolved.build_id.clone();
+            source.info.provider_path = resolved.path.to_string_lossy().into_owned();
+            links.check(control, BoundaryStage::Setup)?;
+            let lifecycle = {
+                let prefix = lease.prefix_permit(control.deadline()).map_err(|e| {
+                    SetupFailure::from_error(
+                        BoundaryStage::Setup,
+                        anyhow::anyhow!("initial fork refused: {e:?}"),
+                    )
+                })?;
+                LiveLifecycle::select_controlled(source.info.pid, &prefix, control, links)?
+            };
+            let lifecycle = crate::capture_setup::SetupResource::guarded(
+                lifecycle,
+                links,
+                BoundaryStage::Setup,
+            );
+            lease.close_prefix();
+            links.check(control, BoundaryStage::Discovery)?;
+            let discovery = DiscoverySession::prepare_controlled(
+                &crate::discovery::session::DiscoveryConfig {
+                    provider: resolved.path,
+                    object: source.objects.harvest.clone(),
+                    object_bytes: source.harvest_bytes.clone(),
+                    builtin: resolved.builtin,
+                    legacy: true,
+                    table: source.cfg.table.clone(),
+                    force_offset: source.cfg.force_offset,
+                    explicit_offsets: source.cfg.table.is_some()
+                        || source.cfg.force_offset.is_some(),
+                    cmdline_marker: None,
+                },
+                source.info.pid,
+                control,
+                links,
+            )?;
+            let mut discovery =
+                CaptureDiscovery::HarvestOnly(Box::new(LiveDiscovery::preparing(discovery)));
+            // Retain the earlier live session while traversal preparation is held or
+            // fails; its actual shared link sink remains Preparing through baseline.
+            bundle.bootstrap = Some((discovery, lifecycle.into_inner()));
+            if let Some(t) = source.traversal.as_ref() {
+                links.check(control, BoundaryStage::Traversal)?;
+                let inner = match &bundle.bootstrap.as_ref().expect("bootstrap retained").0 {
+                    CaptureDiscovery::HarvestOnly(inner) => inner,
+                    _ => unreachable!("traversal attaches once"),
+                };
+                let anchor = inner.0.as_ref().expect("prepared discovery").query_anchor();
+                if let Some((path, off)) = anchor_or_degrade(anchor, t.auto)
+                    .map_err(|e| SetupFailure::from_error(BoundaryStage::Traversal, e))?
+                {
+                    let exe = std::ffi::CString::new(path.to_str().ok_or_else(|| {
+                        SetupFailure::Boundary(BoundaryFailure::new(
+                            BoundaryStage::Traversal,
+                            BoundaryFailureClass::InvalidInput,
+                            None,
+                            "traversal anchor path is not UTF-8",
+                        ))
+                    })?)
+                    .map_err(|e| SetupFailure::from_error(BoundaryStage::Traversal, e.into()))?;
+                    let ctrl =
+                        crate::loader::default_ctrl(512, crate::loader::MEMBER_RING_BYTES)
+                            .map_err(|e| SetupFailure::from_error(BoundaryStage::Traversal, e))?;
+                    let backend = ScanBackend::prepare_controlled(
+                        crate::loader::FullMemberInput {
+                            bytes: &t.members_bytes,
+                            exe: &exe,
+                            off,
+                            pid: source.info.pid,
+                            ctrl: &ctrl,
+                        },
+                        &t.members,
+                        LiveClock.monotonic_ns(),
+                        control,
+                        links,
+                    )?;
+                    let (earlier, lifecycle) = bundle.bootstrap.take().expect("bootstrap retained");
+                    let CaptureDiscovery::HarvestOnly(inner) = earlier else {
+                        unreachable!()
+                    };
+                    discovery = CaptureDiscovery::Traversal(Box::new(LiveTraversalDiscovery {
+                        inner: *inner,
+                        backend: Some(LiveScanState::Preparing(backend)),
+                        tasks: crate::scan::registry::ProcTaskSource::new(source.info.pid),
+                        provenance: t.provenance.clone(),
+                    }));
+                    bundle.bootstrap = Some((discovery, lifecycle));
+                }
+            }
+            // Native first cause must win before Count is invoked or admitted.
+            links.check(control, BoundaryStage::Setup)?;
+            let admission = lease.reserve_count().map_err(|failure| {
+                SetupFailure::from_error(BoundaryStage::Setup, anyhow::Error::new(failure))
+            })?;
+            let backend = prepare_count_backend_controlled(
+                crate::count_owner::CountInput {
+                    object_bytes: source.count_bytes,
+                    object_sha256: source.count_sha256,
+                    target_tgid: source.info.pid,
+                    fork_barrier: source.barrier,
+                },
+                control.deadline(),
+                admission,
+                &crate::count_owner::CountPrepareControl::new(control.clone()),
+                journal,
+            )
+            .map_err(|e| SetupFailure::from_error(BoundaryStage::Setup, e.into()))?;
+            let (discovery, lifecycle) = bundle
+                .bootstrap
+                .take()
+                .expect("real bootstrap ports retained");
+            let pid = source.info.pid;
+            match prepare_owned_window(
+                effective,
+                source.info,
+                discovery,
+                CountSession::new(pid, backend),
+                lifecycle,
+                control,
+                &LiveClock,
+                &mut PreparingProc { links, control },
+            ) {
+                Ok(window) => bundle.window = Some(window),
+                Err(failure) => {
+                    let error = if failure.cause == PreObservationCause::Cancelled {
+                        SetupFailure::Cancelled {
+                            stage: failure.failure.stage,
+                        }
+                    } else {
+                        SetupFailure::Boundary(failure.failure)
+                    };
+                    bundle.window = Some(failure.window);
+                    return Err(error);
+                }
+            }
+            Ok(())
+        }))
+        .unwrap_or_else(|_| {
+            Err(SetupFailure::Boundary(BoundaryFailure::new(
+                control.stage(),
+                BoundaryFailureClass::Panic,
+                None,
+                "owned bootstrap unwound",
+            )))
+        });
+    (bundle, result.err())
+}
+
 /// Count's process-local FD allowance after observed other-plane demand and
 /// explicit pending non-count reservations. This never changes RLIMIT_NOFILE.
 #[derive(Debug, Clone, Copy)]
@@ -9133,7 +10458,9 @@ impl CountFdAdmission {
         Ok(allowance)
     }
 
-    fn snapshot(non_count_reserved: u64) -> Result<Self, crate::count_owner::OwnerFailure> {
+    pub(crate) fn snapshot(
+        non_count_reserved: u64,
+    ) -> Result<Self, crate::count_owner::OwnerFailure> {
         use crate::count_owner::{CountOperation, FailureClass, OwnerFailure};
         let fail = || OwnerFailure::engine(CountOperation::Load, FailureClass::Inventory);
         let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
@@ -9357,6 +10684,226 @@ fn run_inner(
         None,
     )
 }
+#[allow(
+    clippy::too_many_arguments,
+    reason = "owned snapshots of one admitted capture"
+)]
+fn run_controlled_owned(
+    cfg: &Config,
+    argv: Vec<String>,
+    workload: target::WorkloadDest,
+    objects: onboard::ObjectPaths,
+    traversal: Option<TraversalAttach>,
+    count_bytes: Arc<[u8]>,
+    count_sha256: [u8; 32],
+    harvest_bytes: Option<Arc<[u8]>>,
+    acq_ns: u64,
+    acquired_instant: Instant,
+    acquired_wall: SystemTime,
+) -> anyhow::Result<Capture> {
+    use crate::capture_setup::{SetupAttempt, SetupControl, SetupFailure, SetupInterrupt};
+    let deadline = args::deadline_at(acquired_instant, cfg.harvest_timeout).ok_or_else(|| {
+        BoundaryFailure::new(
+            BoundaryStage::Setup,
+            BoundaryFailureClass::DeadlineOverflow,
+            None,
+            "spawn setup deadline overflow",
+        )
+    })?;
+    let mut info = TargetInfo {
+        pid: 0,
+        owned: true,
+        comm: String::new(),
+        cmdline: args::redact_spawn_argv(&argv),
+        container_id: String::new(),
+        kernel_release: String::new(),
+        provider_build_id: String::new(),
+        provider_path: String::new(),
+        image_digest: cfg.image_digest.clone(),
+        acquired_ns: acq_ns,
+        acquired_instant,
+        acquired_wall,
+    };
+    let mut attempt = match SetupAttempt::<
+        CaptureDiscovery,
+        crate::count_session::LiveBackend,
+        LiveLifecycle,
+    >::admit(SetupControl::new(
+        deadline,
+        SetupInterrupt::Static(&INTERRUPTED),
+    )) {
+        Ok(attempt) => attempt,
+        Err(failure) => {
+            return Err(PreObservationFailure::new(
+                PreObservationFailure {
+                    cause: if matches!(failure, SetupFailure::Cancelled { .. }) {
+                        PreObservationCause::Cancelled
+                    } else {
+                        PreObservationCause::SetupError
+                    },
+                    failure: Some(setup_boundary(&failure)),
+                    count: PreObservationCount::NotPrepared,
+                    release: None,
+                    custody: CustodyReceipt {
+                        disposition: None,
+                        child_exit: None,
+                        resolution: CustodyResolution::NotAcquired,
+                        failure: None,
+                    },
+                    target: doc_target(
+                        info.pid,
+                        &info.comm,
+                        &info.container_id,
+                        &info.image_digest,
+                    ),
+                    context: None,
+                },
+                false,
+            )
+            .into());
+        }
+    };
+    let spawned = {
+        let _prefix = attempt
+            .barrier
+            .prefix_permit(deadline)
+            .map_err(|e| anyhow::anyhow!("spawn prefix refused: {e:?}"))?;
+        target::OwnedTarget::spawn_stopped_with_control(&argv, workload, deadline, &INTERRUPTED)
+    };
+    match spawned {
+        Ok(target) => {
+            info.pid = target.pid();
+            attempt.target = Some(target);
+        }
+        Err(error) => {
+            return Err(controlled_setup_failure(
+                &mut attempt,
+                SetupFailure::from_error(BoundaryStage::Setup, error.context("spawn")),
+                &info,
+                cfg,
+            ));
+        }
+    }
+    let source = OwnedSetupSource {
+        cfg: cfg.clone(),
+        info: info.clone(),
+        argv,
+        objects,
+        traversal,
+        count_bytes,
+        count_sha256,
+        harvest_bytes,
+        barrier: attempt.fork_barrier.clone(),
+    };
+    if let Err(failure) = attempt.start(SetupRequest::Live(source, std::marker::PhantomData)) {
+        return Err(controlled_setup_failure(&mut attempt, failure, &info, cfg));
+    }
+    if let Err(failure) = attempt.wait() {
+        return Err(controlled_setup_failure(&mut attempt, failure, &info, cfg));
+    }
+    let ready = attempt.ready.as_mut().expect("actual Ready transferred");
+    let window = ready
+        .bundle
+        .window
+        .as_mut()
+        .expect("Ready owns full prepared window");
+    let commit = match commit_owned_release(
+        attempt.target.as_mut().expect("release custody"),
+        window,
+        &attempt.control,
+        &LiveClock,
+    ) {
+        Ok(commit) => commit,
+        Err(failure) => return Err(controlled_setup_failure(&mut attempt, failure, &info, cfg)),
+    };
+    // Successful signal is irreversible. From this exact point cancellation and
+    // all failures use ordinary runtime salvage and leave-running custody.
+    let (target, mut ready) = attempt.accepted(&commit);
+    let prepared = ready
+        .bundle
+        .window
+        .take()
+        .expect("one actual prepared window");
+    resume_owned_window(
+        prepared,
+        target,
+        commit,
+        &LiveClock,
+        &mut LiveProc,
+        &interrupted,
+    )
+}
+
+pub(crate) fn controlled_setup_failure<D, B, L>(
+    attempt: &mut crate::capture_setup::SetupAttempt<D, B, L>,
+    failure: crate::capture_setup::SetupFailure,
+    info: &TargetInfo,
+    cfg: &Config,
+) -> anyhow::Error
+where
+    D: DiscoveryPort + Send + 'static,
+    B: CountBackend + Send + 'static,
+    B::Link: Send,
+    L: LifecyclePort + Send + 'static,
+{
+    let cause = if attempt
+        .target
+        .as_ref()
+        .and_then(target::OwnedTarget::exit_code)
+        .is_some()
+    {
+        PreObservationCause::NeverReleasedExit
+    } else if matches!(
+        failure,
+        crate::capture_setup::SetupFailure::Cancelled { .. }
+    ) || setup_boundary(&failure).class == BoundaryFailureClass::Cancelled
+    {
+        PreObservationCause::Cancelled
+    } else if setup_boundary(&failure).stage == BoundaryStage::Release {
+        PreObservationCause::ReleaseError
+    } else {
+        PreObservationCause::SetupError
+    };
+    let release = attempt
+        .ready
+        .as_ref()
+        .and_then(|ready| ready.bundle.window.as_ref())
+        .and_then(|window| window.state.release_attempt);
+    attempt.abandon(failure.clone());
+    let failure_instant = attempt.failure_instant();
+    let custody = match failure_instant.checked_add(cfg.grace) {
+        Some(deadline) => attempt.await_receipt(deadline),
+        None => CustodyReceipt {
+            disposition: None,
+            child_exit: None,
+            resolution: CustodyResolution::Unresolved,
+            failure: Some(BoundaryFailure::new(
+                BoundaryStage::Custody,
+                BoundaryFailureClass::DeadlineOverflow,
+                None,
+                "setup cleanup deadline overflow",
+            )),
+        },
+    };
+    PreObservationFailure::new(
+        PreObservationFailure {
+            cause,
+            failure: Some(setup_boundary(&failure)),
+            count: attempt.count_diagnostic(),
+            release,
+            custody,
+            target: doc_target(info.pid, &info.comm, &info.container_id, &info.image_digest),
+            context: Some(CaptureContext {
+                kernel_release: info.kernel_release.clone(),
+                wall_start_unix_ns: None,
+                wall_end_unix_ns: None,
+            }),
+        },
+        false,
+    )
+    .into()
+}
+
 fn run_inner_with_admitted(
     cfg: &Config,
     target: Target,
@@ -9416,158 +10963,35 @@ fn run_inner_with_admitted(
     })?;
     let acq_instant = Instant::now();
     let acq_wall = SystemTime::now();
-    // Offset table for target qualification (explicit file or
-    // shipped; the CLI pre-validated an explicit file, so a failure
-    // here is a mid-run environment change, not a usage error).
-    let offset_table = match &cfg.table {
-        Some(p) => onboard::load_offset_table_file(p)
-            .map_err(|e| anyhow::anyhow!("offset table: {}", e.full()))?,
-        None => crate::discovery::builtin::shipped_table(),
-    };
     let empty_enrollment = ProviderTable::empty();
     let enrollment = cfg
         .provider_enrollment
         .as_ref()
         .unwrap_or(&empty_enrollment);
     let cap = match target {
-        Target::Spawn { argv, workload } => {
-            let cmdline = args::redact_spawn_argv(&argv);
-            // R06/F07: pre-stop setup runs under the checked
-            // harvest-timeout deadline and the live SIGINT/SIGTERM
-            // flag — a blocking workload destination or a lost stop
-            // can neither hang setup nor orphan a child: every
-            // failure kills + reaps only this never-released owned
-            // child. (observe() bounds its own post-spawn setup
-            // slice separately with the same timeout.)
-            let setup_deadline = match args::deadline_at(acq_instant, cfg.harvest_timeout) {
-                Some(d) => d,
-                None => anyhow::bail!("spawn: setup deadline overflow"),
-            };
-            let ((owned, info, effective, discovery, lifecycle), backend) =
-                prepare_after_initial_forks(
-                    fork_barrier,
-                    setup_deadline,
-                    |prefix| {
-                        let mut owned = target::OwnedTarget::spawn_stopped_with_control(
-                            &argv,
-                            workload,
-                            setup_deadline,
-                            &INTERRUPTED,
-                        )
-                        .map_err(|e| e.context("spawn"))?;
-                        let pid = owned.pid();
-                        let mut info = TargetInfo {
-                            pid,
-                            owned: true,
-                            comm: comm_of(pid),
-                            cmdline,
-                            container_id: container_id_of(pid),
-                            kernel_release: crate::doctor::uname_release(),
-                            provider_build_id: String::new(),
-                            provider_path: String::new(),
-                            image_digest: cfg.image_digest.clone(),
-                            acquired_ns: acq_ns,
-                            acquired_instant: acq_instant,
-                            acquired_wall: acq_wall,
-                        };
-                        let resolved = match resolve_capture_provider(
-                            AutoTarget::Spawn(&argv),
-                            cfg,
-                            &offset_table,
-                            enrollment,
-                        ) {
-                            Ok(r) => r,
-                            Err(e) => {
-                                // Same custody rule as a discovery-attach
-                                // failure: preserve status, resolve, fail loud.
-                                return Err(preparation_error(
-                                    e.context("target resolution"),
-                                    &mut owned,
-                                    &info,
-                                    BoundaryStage::Setup,
-                                ));
-                            }
-                        };
-                        let effective = effective_config(cfg, &objects, &resolved);
-                        info.provider_build_id = resolved.build_id.clone();
-                        info.provider_path = resolved.path.to_string_lossy().into_owned();
-                        let discovery = match DiscoverySession::attach(
-                            &crate::discovery::session::DiscoveryConfig {
-                                provider: resolved.path,
-                                object: objects.harvest,
-                                object_bytes: harvest_bytes.clone(),
-                                builtin: resolved.builtin,
-                                legacy: true,
-                                table: cfg.table.clone(),
-                                force_offset: cfg.force_offset,
-                                explicit_offsets: cfg.table.is_some() || cfg.force_offset.is_some(),
-                                cmdline_marker: None,
-                            },
-                            pid,
-                        ) {
-                            Ok(discovery) => discovery,
-                            Err(e) => {
-                                // A stopped child can only die by an outside
-                                // kill; preserve whatever status exists, resolve
-                                // custody, and fail loud (no zombie, no silence).
-                                return Err(preparation_error(
-                                    e.context("discovery attach"),
-                                    &mut owned,
-                                    &info,
-                                    BoundaryStage::Discovery,
-                                ));
-                            }
-                        };
-                        // Selected traversal attaches before release (probes arm
-                        // while the child is still stopped, like every other
-                        // plane); refusal custody mirrors discovery.
-                        let discovery = match wrap_discovery(discovery, traversal.as_ref(), pid) {
-                            Ok(discovery) => discovery,
-                            Err(e) => {
-                                return Err(preparation_error(
-                                    e.context("traversal attach"),
-                                    &mut owned,
-                                    &info,
-                                    BoundaryStage::Traversal,
-                                ));
-                            }
-                        };
-                        let lifecycle = LiveLifecycle::select(pid, false, prefix);
-                        Ok((owned, info, effective, discovery, lifecycle))
-                    },
-                    |state, barrier, deadline| match prepare_count_backend(
-                        Arc::clone(&obj_bytes),
-                        obj_sha256,
-                        state.1.pid,
-                        barrier,
-                        deadline,
-                    ) {
-                        Ok(backend) => Ok(backend),
-                        Err(e) => Err(preparation_error(
-                            e.into(),
-                            &mut state.0,
-                            &state.1,
-                            BoundaryStage::Setup,
-                        )),
-                    },
-                )?;
-            let pid = info.pid;
-            let count = CountSession::new(pid, backend);
-            observe(
-                &effective,
-                &info,
-                SessionSet {
-                    discovery,
-                    count,
-                    target: owned,
-                    lifecycle,
-                },
-                &LiveClock,
-                &mut LiveProc,
-                &interrupted,
-            )
-        }
+        Target::Spawn { argv, workload } => run_controlled_owned(
+            cfg,
+            argv,
+            workload,
+            objects,
+            traversal,
+            obj_bytes,
+            obj_sha256,
+            harvest_bytes,
+            acq_ns,
+            acq_instant,
+            acq_wall,
+        ),
         Target::Pid(p) => {
+            // Offset table for target qualification (explicit file or
+            // shipped; the CLI pre-validated an explicit file, so a failure
+            // here is a mid-run environment change, not a usage error).
+            let offset_table = match &cfg.table {
+                Some(p) => onboard::load_offset_table_file(p)
+                    .map_err(|e| anyhow::anyhow!("offset table: {}", e.full()))?,
+                None => crate::discovery::builtin::shipped_table(),
+            };
+
             let pin_guard = pin::pin(p).map_err(|e| anyhow::anyhow!("pin: {e:#}"))?;
             let mut pinned = PinnedTarget::new(p, pin_guard);
             let raw = std::fs::read(format!("/proc/{p}/cmdline")).unwrap_or_default();
@@ -10043,7 +11467,7 @@ mod tests {
         let fd = unsafe { OwnedFd::from_raw_fd(libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY)) };
         assert!(fd.as_raw_fd() >= 0, "/dev/null must open");
         KernelLifecycle {
-            fd,
+            fd: crate::capture_setup::SetupResource::local(fd),
             sock_inode: 0,
             target_pid: 100,
             target_tgid: 100,
@@ -10243,7 +11667,7 @@ mod tests {
         use std::os::unix::net::UnixDatagram;
         let (send, recv) = UnixDatagram::pair().unwrap();
         let mut lc = ingest_fixture(HashSet::from([100]), SeqState::default(), false);
-        lc.fd = recv.into();
+        lc.fd = crate::capture_setup::SetupResource::local(recv.into());
         lc.pending_delta.loss = 7;
         lc.pending_delta.dropped = 3;
         lc.pending_delta.pending = 1; // historical backlog, now consumed below
@@ -10292,7 +11716,7 @@ mod tests {
         assert_eq!(delta.pending, 1);
         assert!(delta.loss >= 7);
         // Give the ordinary Drop a connected stand-in; there was no LISTEN.
-        lc.fd = socket.into();
+        lc.fd = crate::capture_setup::SetupResource::local(socket.into());
         drop(lc);
         drop(peer);
     }
@@ -10322,7 +11746,7 @@ mod tests {
         use std::os::unix::net::UnixDatagram;
         let (send, recv) = UnixDatagram::pair().unwrap();
         let mut lc = ingest_fixture(HashSet::from([100]), SeqState::default(), false);
-        lc.fd = recv.into();
+        lc.fd = crate::capture_setup::SetupResource::local(recv.into());
         let fork = cn_datagram_seq(&proc_event(PROC_EVENT_FORK, &[100, 100, 200, 200]), 1, 0);
         let exec = cn_datagram_seq(&proc_event(PROC_EVENT_EXEC, &[100, 100]), 3, 0);
         send.send(&fork).unwrap();
@@ -13947,6 +15371,38 @@ mod tests {
             }
         }
 
+        #[test]
+        fn w079_pre_release_original_deadline() {
+            // Renewing the baseline budget after acquisition would release this
+            // already-expired owned window. No requested window may begin.
+            let mut cfg = stub_config();
+            cfg.harvest_timeout = Duration::from_millis(100);
+            let clock = ClockStub::at(5_000_000_000);
+            let mut info = stub_info();
+            info.owned = true;
+            info.acquired_instant = clock.now() - Duration::from_secs(1);
+            let result = observe(
+                &cfg,
+                &info,
+                SessionSet {
+                    discovery: DiscoveryStub {
+                        finish_err: false,
+                        poll_err: false,
+                        dispatch_attached: true,
+                        trip_set: None,
+                    },
+                    count: CountSession::new(TPID, FakeCountBackend::default()),
+                    target: TargetStub,
+                    lifecycle: LifecycleStub,
+                },
+                &clock,
+                &mut ProcStub,
+                &|| false,
+            );
+            let error = result.expect_err("expired original setup must never release");
+            assert!(error.downcast_ref::<PreObservationFailure>().is_some());
+        }
+
         #[allow(clippy::too_many_arguments)]
         type StubRunner<'x> = Runner<
             'x,
@@ -13985,70 +15441,74 @@ mod tests {
             Runner {
                 cfg,
                 info,
-                discovery,
-                count,
                 target: TargetStub,
-                lifecycle: LifecycleStub,
                 clock,
                 proc,
                 cancelled,
-                reasons: HashSet::new(),
-                adapter: AdapterState::default(),
-                activity: Vec::new(),
-                extra_counters: Vec::new(),
-                in_window_trip: HashMap::new(),
-                in_window_hits: Vec::new(),
-                in_window_lgcalls: 0,
-                engine_collector: EngineCollector::new(),
-                straddling_trip: HashMap::new(),
-                straddling_lgcalls: 0,
-                trigger_observed: false,
-                attached_total: 0,
-                cold_gap_queries: 0,
-                fork_exec_ignored: 0,
-                lifecycle_loss: 0,
-                lifecycle_dropped: 0,
-                lifecycle_prefix_unwitnessed: 0,
-                lifecycle_no_witness: 0,
-                lifecycle_pending: 0,
-                lifecycle_closed: false,
-                lifecycle_exec_gap: 0,
-                pending_exec_obligation: 0,
-                maps_read_failed: 0,
-                scan_budget_exhaustions: 0,
-                provider_changed_fences: 0,
-                planned_paths: HashSet::new(),
-                site_cookies: HashMap::new(),
-                seen_backings: HashSet::new(),
-                snapshot: Snapshot::default(),
-                last_live: Vec::new(),
-                comm: info.comm.clone(),
-                child_exit: None,
-                reaped_before_close: false,
-                signal_cut: false,
-                expired: false,
-                fallback_partial: false,
-                window_start_ns: programmed.start_ns(),
-                requested_start_ns: requested_start,
-                kernel_deadline_ns: programmed.deadline_ns(),
-                open_instant: clock.now(),
-                wall_start: wall,
-                wall_end: wall,
-                drain_wall_us: 0,
-                file_cache: HashMap::new(),
-                relevance_capped: 0,
-                refusal_diagnostics: BTreeSet::new(),
-                unverified_reads: 0,
-                observation_started: false,
-                release_attempt: None,
-                owned_exit_before_read: None,
-                last_established_ns: programmed.start_ns().max(requested_start),
-                failure_context: None,
-                canonical_terminal: None,
-                terminal_id: None,
-                original_lifecycle_edge: None,
-                custody: None,
-                traversal: None,
+                state: RunnerState {
+                    discovery,
+                    count,
+                    lifecycle: LifecycleStub,
+                    setup_control: None,
+                    native_custody: None,
+                    reasons: HashSet::new(),
+                    adapter: AdapterState::default(),
+                    activity: Vec::new(),
+                    extra_counters: Vec::new(),
+                    in_window_trip: HashMap::new(),
+                    in_window_hits: Vec::new(),
+                    in_window_lgcalls: 0,
+                    engine_collector: EngineCollector::new(),
+                    straddling_trip: HashMap::new(),
+                    straddling_lgcalls: 0,
+                    trigger_observed: false,
+                    attached_total: 0,
+                    cold_gap_queries: 0,
+                    fork_exec_ignored: 0,
+                    lifecycle_loss: 0,
+                    lifecycle_dropped: 0,
+                    lifecycle_prefix_unwitnessed: 0,
+                    lifecycle_no_witness: 0,
+                    lifecycle_pending: 0,
+                    lifecycle_closed: false,
+                    lifecycle_exec_gap: 0,
+                    pending_exec_obligation: 0,
+                    maps_read_failed: 0,
+                    scan_budget_exhaustions: 0,
+                    provider_changed_fences: 0,
+                    planned_paths: HashSet::new(),
+                    site_cookies: HashMap::new(),
+                    seen_backings: HashSet::new(),
+                    snapshot: Snapshot::default(),
+                    last_live: Vec::new(),
+                    comm: info.comm.clone(),
+                    child_exit: None,
+                    reaped_before_close: false,
+                    signal_cut: false,
+                    expired: false,
+                    fallback_partial: false,
+                    window_start_ns: programmed.start_ns(),
+                    requested_start_ns: requested_start,
+                    kernel_deadline_ns: programmed.deadline_ns(),
+                    open_instant: clock.now(),
+                    wall_start: wall,
+                    wall_end: wall,
+                    drain_wall_us: 0,
+                    file_cache: HashMap::new(),
+                    relevance_capped: 0,
+                    refusal_diagnostics: BTreeSet::new(),
+                    unverified_reads: 0,
+                    observation_started: false,
+                    release_attempt: None,
+                    owned_exit_before_read: None,
+                    last_established_ns: programmed.start_ns().max(requested_start),
+                    failure_context: None,
+                    canonical_terminal: None,
+                    terminal_id: None,
+                    original_lifecycle_edge: None,
+                    custody: None,
+                    traversal: None,
+                },
             }
         }
 
@@ -16824,5 +18284,135 @@ mod package_tests {
             assert_eq!(effects.get(), usize::from(expected.is_some()));
         }
         drop(other_planes);
+    }
+}
+
+#[cfg(test)]
+mod fix1_live_provider_tests {
+    use super::*;
+    use crate::capture_setup::{SetupAttempt, SetupControl, SetupFailure, SetupInterrupt};
+    type Attempt = SetupAttempt<CaptureDiscovery, crate::count_session::LiveBackend, LiveLifecycle>;
+    struct Owner {
+        attempt: Attempt,
+        reap: Option<Arc<crate::target::SetupReapHold>>,
+    }
+    impl Drop for Owner {
+        fn drop(&mut self) {
+            if let Some(reap) = &self.reap {
+                reap.release();
+            }
+            let _ = self.attempt.join_cleanup_for_test();
+        }
+    }
+    #[test]
+    fn w079_fix1_live_explicit_and_auto_provider_fd_errno() {
+        for explicit in [true, false] {
+            let control = SetupControl::new(
+                Instant::now() + Duration::from_secs(10),
+                SetupInterrupt::Owned(Arc::new(std::sync::atomic::AtomicBool::new(false))),
+            );
+            // Finally ownership exists before any child or reader is acquired.
+            let mut owner = Owner {
+                attempt: Attempt::admit(control).unwrap(),
+                reap: None,
+            };
+            let argv = vec!["/bin/sleep".to_string(), "1".to_string()];
+            let target = {
+                let _prefix = owner
+                    .attempt
+                    .barrier
+                    .prefix_permit(owner.attempt.control.deadline())
+                    .unwrap();
+                crate::target::OwnedTarget::spawn_stopped(&argv, crate::target::WorkloadDest::Null)
+                    .unwrap()
+            };
+            let pid = target.pid();
+            owner.attempt.target = Some(target);
+            owner.reap = Some(crate::target::hold_setup_reap(
+                owner.attempt.target.as_mut().unwrap(),
+            ));
+            let cfg = Config {
+                harvest_object: None,
+                count_object: None,
+                members_object: None,
+                provider: explicit.then(|| PathBuf::from("/")),
+                builtin: true,
+                table: None,
+                force_offset: None,
+                provider_enrollment: None,
+                resolved_provider: None,
+                duration: Duration::from_millis(25),
+                settle: Duration::ZERO,
+                harvest_timeout: Duration::from_secs(10),
+                grace: Duration::from_millis(100),
+                image_digest: String::new(),
+            };
+            let info = TargetInfo {
+                pid,
+                owned: true,
+                comm: String::new(),
+                cmdline: String::new(),
+                container_id: String::new(),
+                kernel_release: String::new(),
+                provider_build_id: String::new(),
+                provider_path: String::new(),
+                image_digest: String::new(),
+                acquired_ns: LiveClock.monotonic_ns(),
+                acquired_instant: Instant::now(),
+                acquired_wall: SystemTime::now(),
+            };
+            let source = OwnedSetupSource {
+                cfg,
+                info,
+                argv: vec!["/".to_string()],
+                objects: onboard::ObjectPaths {
+                    harvest: PathBuf::from("/not-reached"),
+                    count: PathBuf::from("/not-reached"),
+                },
+                traversal: None,
+                count_bytes: Arc::from([]),
+                count_sha256: [0; 32],
+                harvest_bytes: Some(Arc::from([])),
+                barrier: owner.attempt.fork_barrier.clone(),
+            };
+            owner
+                .attempt
+                .start(SetupRequest::Live(source, std::marker::PhantomData))
+                .unwrap();
+            let failure = owner
+                .attempt
+                .wait()
+                .expect_err("real Live qualification fails on directory read");
+            let errno = match &failure {
+                SetupFailure::Boundary(f) => f.errno,
+                _ => None,
+            };
+            owner.attempt.abandon(failure);
+            let until = Instant::now() + Duration::from_secs(2);
+            while !owner.reap.as_ref().unwrap().entered.load(Ordering::Acquire)
+                && Instant::now() < until
+            {
+                std::thread::yield_now();
+            }
+            let fds = owner.attempt.links.test_fds();
+            let held = fds
+                .iter()
+                .flatten()
+                .all(|fd| unsafe { libc::fcntl(*fd, libc::F_GETFD) >= 0 });
+            let not_invoked = matches!(
+                owner.attempt.count_diagnostic(),
+                PreObservationCount::NotPrepared
+            );
+            owner.reap.as_ref().unwrap().release();
+            let joined = owner.attempt.join_cleanup_for_test();
+            let closed = fds
+                .iter()
+                .flatten()
+                .all(|fd| unsafe { libc::fcntl(*fd, libc::F_GETFD) == -1 });
+            let receipt = owner.attempt.await_receipt(Instant::now());
+            assert!(joined && held && closed && fds.iter().any(Option::is_some) && not_invoked);
+            assert_eq!(errno, Some(libc::EISDIR), "explicit={explicit}");
+            assert_eq!(receipt.child_exit, Some(137));
+        }
     }
 }

@@ -1177,14 +1177,14 @@ fn g1_no_observation_cli_consumer_preserves_cause_and_custody() {
     use osslscope::capture::{PreObservationCount, PreObservationFailure};
     use osslscope::report::*;
     for (scenario, want_report, want_check, status) in [
-        (Cancelled, 1, 1, 137),
+        (Cancelled, 3, 11, 137),
         (Exit(7), 1, 1, 7),
         (Exit(0), 3, 11, 0),
         (SetupIo, 4, 4, 137),
         (ReleaseIo, 4, 4, 137),
         (CustodyIo, 4, 4, 137),
         (CountIo, 4, 4, 137),
-        (Pending, 1, 1, 137),
+        (Pending, 3, 11, 137),
     ] {
         for check in [false, true] {
             let run = g1_host::run(scenario);

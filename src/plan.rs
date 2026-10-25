@@ -229,13 +229,84 @@ impl PinnedFile {
 /// identity; on mismatch drop the plan (loud `replaced`) having
 /// bound nothing.
 pub fn resolve_pinned(path: &str) -> std::io::Result<PinnedFile> {
-    use std::os::unix::fs::MetadataExt as _;
     let file = std::fs::File::open(path)?;
     let meta = file.metadata()?;
-    Ok(PinnedFile {
+    Ok(pinned_from_metadata(file, meta))
+}
+
+fn pinned_from_metadata(file: std::fs::File, meta: std::fs::Metadata) -> PinnedFile {
+    use std::os::unix::fs::MetadataExt as _;
+    PinnedFile {
         fd: file.into(),
         device: encode_device(libc::major(meta.dev()), libc::minor(meta.dev())),
         ino: meta.ino(),
+    }
+}
+
+pub(crate) fn resolve_pinned_controlled(
+    path: &str,
+    links: &crate::capture_setup::SetupLinks,
+) -> std::io::Result<PinnedFile> {
+    resolve_pinned_controlled_with(path, links, std::fs::File::metadata)
+}
+fn resolve_pinned_controlled_with(
+    path: &str,
+    links: &crate::capture_setup::SetupLinks,
+    mut metadata: impl FnMut(&std::fs::File) -> std::io::Result<std::fs::Metadata>,
+) -> std::io::Result<PinnedFile> {
+    use crate::capture::BoundaryStage;
+    use crate::capture_setup::{SetupFailure, SetupResource};
+    let stage = BoundaryStage::Discovery;
+    // The caller reserves the successful pin's one slot. Retain at most two
+    // failed candidates plus the current attempt within the same four-slot cap.
+    let control = links.control_for_effect();
+    let _extra = match &control {
+        Some(control) => Some(
+            links
+                .temporary(control, stage, (PIN_OPEN_ATTEMPTS - 1) as usize)
+                .map_err(std::io::Error::other)?,
+        ),
+        None => None,
+    };
+    let mut retained = Vec::with_capacity(PIN_OPEN_ATTEMPTS as usize);
+    let mut last = None;
+    for _ in 0..PIN_OPEN_ATTEMPTS {
+        links.check_owned(stage).map_err(std::io::Error::other)?;
+        match std::fs::File::open(path) {
+            Err(error) => last = Some(error),
+            Ok(file) => {
+                #[cfg(test)]
+                links.test_retained_fd(std::os::fd::AsRawFd::as_raw_fd(&file));
+                let file = SetupResource::guarded(file, links, stage);
+                match metadata(&file) {
+                    Ok(meta) => {
+                        links.check_owned(stage).map_err(std::io::Error::other)?;
+                        return Ok(pinned_from_metadata(file.into_inner(), meta));
+                    }
+                    Err(error) => {
+                        last = Some(error);
+                        retained.push(file);
+                    }
+                }
+            }
+        }
+    }
+    let error = last.expect("PIN_OPEN_ATTEMPTS >= 1");
+    links.seal(SetupFailure::io(
+        stage,
+        &error,
+        "setup pin metadata/open failed",
+    ));
+    links.before_dispose(stage);
+    Err(error)
+}
+#[cfg(test)]
+pub(crate) fn resolve_pinned_controlled_fault(
+    path: &str,
+    links: &crate::capture_setup::SetupLinks,
+) -> std::io::Result<PinnedFile> {
+    resolve_pinned_controlled_with(path, links, |_| {
+        Err(std::io::Error::from_raw_os_error(libc::EIO))
     })
 }
 
@@ -370,6 +441,12 @@ pub fn read_bounded_from<S: ReadBoundedSource>(
     mut src: S,
     max_bytes: usize,
 ) -> std::io::Result<FileBytes> {
+    read_bounded_source(&mut src, max_bytes)
+}
+fn read_bounded_source<S: ReadBoundedSource>(
+    src: &mut S,
+    max_bytes: usize,
+) -> std::io::Result<FileBytes> {
     use std::io::Read as _;
     let (dev, ino, advertised) = src.bound_identity()?;
     // BEFORE: a huge advertised length refuses without reading a
@@ -391,7 +468,7 @@ pub fn read_bounded_from<S: ReadBoundedSource>(
         })?;
     let mut bytes = Vec::new();
     // Borrowed take: the source stays owned for the after-fstat.
-    (&mut src).take(limit).read_to_end(&mut bytes)?;
+    (&mut *src).take(limit).read_to_end(&mut bytes)?;
     if bytes.len() > max_bytes {
         return Err(too_large(max_bytes));
     }
@@ -422,6 +499,56 @@ pub fn read_file_bounded(path: &str, max_bytes: usize) -> std::io::Result<FileBy
     let file = std::fs::File::open(path)?;
     read_bounded_from(file, max_bytes)
         .map_err(|e| std::io::Error::new(e.kind(), format!("{path}: {e}")))
+}
+
+pub(crate) fn read_file_bounded_controlled(
+    path: &str,
+    max_bytes: usize,
+    links: &crate::capture_setup::SetupLinks,
+    stage: crate::capture::BoundaryStage,
+    fatal: bool,
+) -> std::io::Result<FileBytes> {
+    let file = std::fs::File::open(path).map_err(|error| {
+        if fatal {
+            links.seal(crate::capture_setup::SetupFailure::io(
+                stage,
+                &error,
+                "setup identity-bound file open failed",
+            ));
+        }
+        error
+    })?;
+    let mut file = crate::capture_setup::SetupResource::guarded(file, links, stage);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        read_bounded_source(&mut *file, max_bytes)
+    }));
+    match result {
+        Ok(result) => {
+            if let Err(error) = &result
+                && fatal
+            {
+                links.seal(crate::capture_setup::SetupFailure::io(
+                    stage,
+                    error,
+                    "setup identity-bound file read failed",
+                ));
+            }
+            links.before_dispose(stage);
+            result.map_err(|e| std::io::Error::new(e.kind(), format!("{path}: {e}")))
+        }
+        Err(panic) => {
+            links.seal(crate::capture_setup::SetupFailure::Boundary(
+                crate::capture::BoundaryFailure::new(
+                    stage,
+                    crate::capture::BoundaryFailureClass::Panic,
+                    None,
+                    "setup identity-bound file read unwound",
+                ),
+            ));
+            links.before_dispose(stage);
+            std::panic::resume_unwind(panic)
+        }
+    }
 }
 
 /// Identity-bound file read (F-A/A3): open once, fstat/read/fstat —
@@ -1190,5 +1317,45 @@ mod tests {
         assert_eq!(p2.entries.len(), 1);
         assert_eq!(p2.entries[0].cookie, 1);
         assert_eq!(stable.lookup("08:01", 99, x_off), Some(0));
+    }
+}
+
+#[cfg(test)]
+mod fix1_pin_retry_tests {
+    use super::*;
+    #[test]
+    fn w079_fix1_real_file_retry_then_success() {
+        use std::os::fd::AsRawFd as _;
+        let links = crate::capture_setup::SetupLinks::new();
+        let mut calls = 0;
+        let pinned = resolve_pinned_controlled_with("/dev/null", &links, |file| {
+            calls += 1;
+            if calls < PIN_OPEN_ATTEMPTS {
+                Err(std::io::Error::from_raw_os_error(libc::EIO))
+            } else {
+                file.metadata()
+            }
+        })
+        .unwrap();
+        let fds = links.test_fds();
+        let successes = fds
+            .iter()
+            .flatten()
+            .filter(|fd| **fd == pinned.fd.as_raw_fd())
+            .count();
+        assert_eq!(calls, PIN_OPEN_ATTEMPTS);
+        assert_eq!(successes, 1);
+        assert!(
+            fds.iter()
+                .flatten()
+                .filter(|fd| **fd != pinned.fd.as_raw_fd())
+                .all(|fd| unsafe { libc::fcntl(*fd, libc::F_GETFD) == -1 })
+        );
+        drop(pinned);
+        assert!(
+            fds.iter()
+                .flatten()
+                .all(|fd| unsafe { libc::fcntl(*fd, libc::F_GETFD) == -1 })
+        );
     }
 }

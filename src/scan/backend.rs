@@ -141,7 +141,7 @@ pub struct BackendSnapshot {
 /// The production traversal backend.
 pub struct ScanBackend {
     cfg: BackendConfig,
-    loaded: Loaded,
+    loaded: crate::capture_setup::SetupResource<Loaded>,
     links: Option<MemberLinkStore>,
     /// Tier-3 storm cut: member links dropped + SKIP_ALL set; the
     /// entry link stays (the ATTEMPT census stays live, so the
@@ -157,7 +157,7 @@ pub struct ScanBackend {
     /// being storm-abandoned). End-state flags report the last
     /// in-window tier state.
     finishing: bool,
-    ring: aya::maps::RingBuf<aya::maps::MapData>,
+    ring: crate::capture_setup::SetupResource<crate::loader::Events>,
     oracle: Oracle,
     throttle: DutyThrottle,
     storm: StormDetector,
@@ -194,8 +194,20 @@ pub(crate) struct PreparedScanBackend {
     backend: ScanBackend,
 }
 impl PreparedScanBackend {
-    pub(crate) fn finish(mut self, links: MemberLinks) -> ScanBackend {
-        self.backend.links = Some(MemberLinkStore::Local(links));
+    pub(crate) fn finish(
+        mut self,
+        links: MemberLinks,
+        displaced: &mut crate::capture_setup::SetupDisplaced,
+    ) -> ScanBackend {
+        if let Some(guard) = self.backend.loaded.take_setup() {
+            displaced.guards.push(guard);
+        }
+        if let Some(guard) = self.backend.ring.take_setup() {
+            displaced.guards.push(guard);
+        }
+        if let Some(old) = self.backend.links.replace(MemberLinkStore::Local(links)) {
+            displaced.members.push(old);
+        }
         self.backend
     }
 }
@@ -212,6 +224,16 @@ impl std::ops::DerefMut for PreparedScanBackend {
 }
 
 impl ScanBackend {
+    pub(crate) fn take_local_links(&mut self) -> MemberLinks {
+        match self.links.take() {
+            Some(MemberLinkStore::Local(links)) => links,
+            _ => MemberLinks {
+                entry: None,
+                members: Vec::new(),
+            },
+        }
+    }
+
     /// Attach the members object (full 512 when `slots` is None,
     /// else exactly `slots` with `ctrl.expected == slots.len()`)
     /// and build the oracle scope over the attached set.
@@ -306,9 +328,10 @@ impl ScanBackend {
         let mut store = MemberLinkStore::preparing(links, control);
         let loaded = crate::loader::prepare_full_members(input, &mut store)
             .map_err(|e| SetupFailure::from_error(stage, e))?;
-        control.check(stage)?;
+        let loaded = crate::capture_setup::SetupResource::guarded(loaded, links, stage);
+        links.check(control, stage)?;
         Self::from_loaded(
-            loaded,
+            loaded.into_inner(),
             store,
             BackendConfig {
                 obj: obj.to_path_buf(),
@@ -334,6 +357,7 @@ impl ScanBackend {
         clock_base_ns: u64,
         failed: Vec<crate::loader::FailedSlot>,
     ) -> anyhow::Result<Self> {
+        let loaded = links.resource(loaded);
         let scope = OracleScope {
             expected: cfg.slots.len() as u32,
             attached: cfg.slots.iter().copied().collect(),
@@ -342,15 +366,13 @@ impl ScanBackend {
         };
         links.check()?;
         let _temporary = links.temporary(1)?;
-        let ring_fd = loaded
-            .maps
-            .get("EVENTS")
-            .context("members EVENTS map")?
-            .try_clone()
-            .context("clone EVENTS")?;
-        let data = aya::maps::MapData::from_fd(ring_fd).context("EVENTS mapdata")?;
-        let map = aya::maps::Map::from_map_data(data).context("EVENTS map")?;
-        let ring = aya::maps::RingBuf::try_from(map).context("EVENTS ringbuf")?;
+        let ring = links.retain_result(crate::loader::Events::prepare(
+            &loaded.maps,
+            links.setup_links(),
+            crate::capture::BoundaryStage::Traversal,
+            crate::loader::MEMBER_MAPS[0].max_entries,
+        ))?;
+        let ring = links.resource(ring);
         Ok(Self {
             cfg,
             loaded,
@@ -490,7 +512,7 @@ impl ScanBackend {
         // (a storm-detach would abandon the trailing evidence
         // the backstop is about to close WITH that evidence; a
         // reattach would reactivate members past the close).
-        let attempts = read_attempt_total(&self.loaded.maps)?;
+        let attempts = read_attempt_total_preparing(&self.loaded.maps, self.loaded.setup_links())?;
         if !self.finishing {
             match self.storm.observe(now_ns, attempts) {
                 Some(StormAction::Detach) if !self.storm_detached => {
@@ -529,7 +551,7 @@ impl ScanBackend {
         let maps = &self.loaded.maps;
         let oracle = &mut self.oracle;
         let (fresh_admitted, fresh, fresh_findings) = take_after_census(
-            || read_calls_by_op(maps),
+            || read_calls_preparing(maps, self.loaded.setup_links()),
             || (oracle.take_done(), oracle.take_findings()),
         )?;
         // R34: refresh the salvage snapshot on every successful
@@ -644,7 +666,7 @@ impl ScanBackend {
                         .push(BackendAction::CacheUpdated { arr: w.arr, t });
                 }
                 Some(Healing::Invalidate) => {
-                    delete_tcache(&self.loaded.maps, w.arr)?;
+                    delete_tcache_preparing(&self.loaded.maps, w.arr, self.loaded.setup_links())?;
                     self.oracle.note_invalidate(w.arr);
                     delta
                         .actions
@@ -738,8 +760,8 @@ impl ScanBackend {
     /// the next scans re-probe cold).
     pub fn note_provider_turnover(&mut self) -> anyhow::Result<()> {
         self.oracle.abandon_all(AbandonReason::Churned);
-        clear_u64_map(&self.loaded.maps, "GEN")?;
-        clear_tcache(&self.loaded.maps)?;
+        clear_map_preparing(&self.loaded.maps, "GEN", 8, self.loaded.setup_links())?;
+        clear_map_preparing(&self.loaded.maps, "T_CACHE", 16, self.loaded.setup_links())?;
         self.oracle.reset_beliefs();
         Ok(())
     }
@@ -752,9 +774,26 @@ impl ScanBackend {
     }
 
     fn set_skip_all(&mut self, on: bool) -> anyhow::Result<()> {
-        let mut ctrl = crate::loader::read_ctrl(&self.loaded.maps)?;
+        let preparing = self.loaded.setup_links().is_some();
+        let mut ctrl = if preparing {
+            crate::loader::borrowed_ctrl(
+                &self.loaded.maps,
+                None,
+                self.loaded.setup_links().expect("preparing branch"),
+            )?
+        } else {
+            crate::loader::read_ctrl(&self.loaded.maps)?
+        };
         ctrl.skip_all = u8::from(on);
-        crate::loader::program_ctrl(&self.loaded.maps, &ctrl)?;
+        if preparing {
+            crate::loader::borrowed_ctrl(
+                &self.loaded.maps,
+                Some(&ctrl),
+                self.loaded.setup_links().expect("preparing branch"),
+            )?;
+        } else {
+            crate::loader::program_ctrl(&self.loaded.maps, &ctrl)?;
+        }
         self.cfg.ctrl.skip_all = u8::from(on);
         Ok(())
     }
@@ -825,21 +864,26 @@ impl ScanBackend {
         // re-readable snapshots, never already-drained ring
         // items, and a failed ring decode leaves every baseline
         // pristine for the next poll.
-        for (tid, v) in read_u64_all(&self.loaded.maps, "RCOUNT")? {
+        for (tid, v) in
+            read_u64_all_preparing(&self.loaded.maps, "RCOUNT", self.loaded.setup_links())?
+        {
             b.rcount.insert(tid, split_rcount_checked(v)?);
         }
-        for (tid, v) in read_u64_all(&self.loaded.maps, "SEQ")? {
+        for (tid, v) in read_u64_all_preparing(&self.loaded.maps, "SEQ", self.loaded.setup_links())?
+        {
             let (birth, ctr) = wire::split_seq(v);
             b.seq.insert(tid, (birth, ctr));
         }
-        let mut loss_rows = read_percpu_all(&self.loaded.maps, "LOSS", false)?;
+        let mut loss_rows =
+            read_percpu_all_preparing(&self.loaded.maps, "LOSS", false, self.loaded.setup_links())?;
         // TRUNC is sticky bits (OR-fold) plus the per-op
         // flag-event generation: fresh bits report, repeats
         // re-report on generation advance, quiet re-drains
         // report nothing — and nothing is ever cleared, so no
         // concurrent flag can be erased in any producer order.
         // Snapshots read here; consumption defers past the drain.
-        let (mut trunc_snap, mut trunc_seq) = snapshot_trunc(&self.loaded.maps)?;
+        let (mut trunc_snap, mut trunc_seq) =
+            snapshot_trunc_preparing(&self.loaded.maps, self.loaded.setup_links())?;
         while let Some(item) = self.ring.next() {
             let bytes = item.to_vec();
             decode_ring_record(&bytes, &mut b)?;
@@ -867,11 +911,12 @@ impl ScanBackend {
         // quiet-batch rule covers the cross-CPU-visibility
         // residual on the take path.
         let mut fault_view_uncertain = false;
-        match read_percpu_all(&self.loaded.maps, "LOSS", false) {
+        match read_percpu_all_preparing(&self.loaded.maps, "LOSS", false, self.loaded.setup_links())
+        {
             Ok(post_rows) => union_loss_rows(&mut loss_rows, post_rows),
             Err(_) => fault_view_uncertain = true,
         }
-        match snapshot_trunc(&self.loaded.maps) {
+        match snapshot_trunc_preparing(&self.loaded.maps, self.loaded.setup_links()) {
             Ok((post_snap, post_seq)) => {
                 union_trunc_snap(&mut trunc_snap, &mut trunc_seq, post_snap, post_seq);
             }
@@ -958,6 +1003,28 @@ fn decode_ring_record(bytes: &[u8], b: &mut ScanBatch) -> anyhow::Result<()> {
 
 /// Read every row of a u32→u64 hash (RCOUNT/SEQ): checked
 /// iteration (any failed row errors the poll).
+fn read_u64_all_preparing(
+    maps: &std::collections::HashMap<String, OwnedFd>,
+    name: &str,
+    setup: Option<&SetupLinks>,
+) -> anyhow::Result<Vec<(u32, u64)>> {
+    if let Some(setup) = setup {
+        setup.check_owned(crate::capture::BoundaryStage::Traversal)?;
+    }
+    if setup.is_none() {
+        return read_u64_all(maps, name);
+    }
+    Ok(crate::loader::borrowed_rows::<u32, u64>(
+        maps,
+        name,
+        false,
+        setup.expect("preparing branch"),
+        crate::capture::BoundaryStage::Traversal,
+    )?
+    .into_iter()
+    .map(|(key, values)| (key, values[0]))
+    .collect())
+}
 fn read_u64_all(
     maps: &std::collections::HashMap<String, OwnedFd>,
     name: &str,
@@ -982,6 +1049,36 @@ fn read_u64_all(
 
 /// Fold every row of a u32→u64 percpu hash (LOSS sums, TRUNC
 /// ORs): checked iteration (any failed row errors the poll).
+fn read_percpu_all_preparing(
+    maps: &std::collections::HashMap<String, OwnedFd>,
+    name: &str,
+    or: bool,
+    setup: Option<&SetupLinks>,
+) -> anyhow::Result<Vec<(u32, u64)>> {
+    if let Some(setup) = setup {
+        setup.check_owned(crate::capture::BoundaryStage::Traversal)?;
+    }
+    if setup.is_none() {
+        return read_percpu_all(maps, name, or);
+    }
+    Ok(crate::loader::borrowed_rows::<u32, u64>(
+        maps,
+        name,
+        true,
+        setup.expect("preparing branch"),
+        crate::capture::BoundaryStage::Traversal,
+    )?
+    .into_iter()
+    .map(|(key, values)| {
+        (
+            key,
+            values
+                .into_iter()
+                .fold(0, |a, b| if or { a | b } else { a.wrapping_add(b) }),
+        )
+    })
+    .collect())
+}
 fn read_percpu_all(
     maps: &std::collections::HashMap<String, OwnedFd>,
     name: &str,
@@ -1009,6 +1106,26 @@ fn read_percpu_all(
 }
 
 /// ATTEMPT total (percpu array, single key 0).
+fn read_attempt_total_preparing(
+    maps: &std::collections::HashMap<String, OwnedFd>,
+    setup: Option<&SetupLinks>,
+) -> anyhow::Result<u64> {
+    if setup.is_none() {
+        return read_attempt_total(maps);
+    }
+    let map = crate::loader::BorrowedMap::checked(
+        std::os::fd::AsFd::as_fd(maps.get("ATTEMPT").context("ATTEMPT missing")?),
+        setup.expect("preparing branch"),
+        crate::capture::BoundaryStage::Traversal,
+    )?;
+    map.shape(&[6], 4, 8)?;
+    let cpus = aya::util::nr_cpus().map_err(|(_, error)| error)?;
+    let mut values = vec![0; 8 * cpus];
+    map.lookup(&0u32.to_ne_bytes(), &mut values)?;
+    Ok(values.chunks_exact(8).fold(0u64, |a, v| {
+        a.wrapping_add(u64::from_ne_bytes(v.try_into().unwrap()))
+    }))
+}
 fn read_attempt_total(maps: &std::collections::HashMap<String, OwnedFd>) -> anyhow::Result<u64> {
     use anyhow::Context as _;
     let fd = maps
@@ -1065,6 +1182,18 @@ fn accumulate_trunc(
 /// zero ONLY while the census never lost an increment (see
 /// [`census_unknown_ops`]); past CALLS map pressure the count
 /// for an observed-but-missing op is UNKNOWN, never zero.
+fn read_calls_preparing(
+    maps: &std::collections::HashMap<String, OwnedFd>,
+    setup: Option<&SetupLinks>,
+) -> anyhow::Result<BTreeMap<u32, u64>> {
+    if setup.is_none() {
+        return read_calls_by_op(maps);
+    }
+    Ok(read_percpu_all_preparing(maps, "CALLS", false, setup)?
+        .into_iter()
+        .filter(|(_, value)| *value != 0)
+        .collect())
+}
 fn read_calls_by_op(
     maps: &std::collections::HashMap<String, OwnedFd>,
 ) -> anyhow::Result<BTreeMap<u32, u64>> {
@@ -1229,6 +1358,65 @@ fn union_loss_rows(rows: &mut Vec<(u32, u64)>, post_rows: Vec<(u32, u64)>) {
 /// the destructive ring drain. Consumption stays deferred:
 /// [`accumulate_trunc`] runs only after the drain decodes clean
 /// (a failed drain must not consume deltas it drops).
+fn snapshot_trunc_preparing(
+    maps: &std::collections::HashMap<String, OwnedFd>,
+    setup: Option<&SetupLinks>,
+) -> anyhow::Result<(BTreeMap<u32, u64>, BTreeMap<u32, u64>)> {
+    if setup.is_none() {
+        return snapshot_trunc(maps);
+    }
+    Ok((
+        read_percpu_all_preparing(maps, "TRUNC", true, setup)?
+            .into_iter()
+            .collect(),
+        read_percpu_all_preparing(maps, "TRUNC_SEQ", false, setup)?
+            .into_iter()
+            .collect(),
+    ))
+}
+fn clear_map_preparing(
+    maps: &std::collections::HashMap<String, OwnedFd>,
+    name: &str,
+    value_size: usize,
+    setup: Option<&SetupLinks>,
+) -> anyhow::Result<()> {
+    if setup.is_none() {
+        return if name == "T_CACHE" {
+            clear_tcache(maps)
+        } else {
+            clear_u64_map(maps, name)
+        };
+    }
+    let map = crate::loader::BorrowedMap::checked(
+        std::os::fd::AsFd::as_fd(maps.get(name).context("map missing")?),
+        setup.expect("preparing branch"),
+        crate::capture::BoundaryStage::Traversal,
+    )?;
+    map.shape(&[1], 8, value_size)?;
+    for key in map.keys(map.info.max_entries)? {
+        map.delete(&key)?;
+    }
+    Ok(())
+}
+fn delete_tcache_preparing(
+    maps: &std::collections::HashMap<String, OwnedFd>,
+    key: u64,
+    setup: Option<&SetupLinks>,
+) -> anyhow::Result<()> {
+    if setup.is_none() {
+        return delete_tcache(maps, key);
+    }
+    let map = crate::loader::BorrowedMap::checked(
+        std::os::fd::AsFd::as_fd(maps.get("T_CACHE").context("T_CACHE missing")?),
+        setup.expect("preparing branch"),
+        crate::capture::BoundaryStage::Traversal,
+    )?;
+    map.shape(&[1], 8, 16)?;
+    match map.delete(&key.to_ne_bytes()) {
+        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => Ok(()),
+        result => result.map_err(Into::into),
+    }
+}
 fn snapshot_trunc(
     maps: &std::collections::HashMap<String, OwnedFd>,
 ) -> anyhow::Result<(BTreeMap<u32, u64>, BTreeMap<u32, u64>)> {

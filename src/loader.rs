@@ -2203,6 +2203,10 @@ fn load_prog(
     p: &PreparedProg,
     maps: &HashMap<String, OwnedFd>,
     spill: bool,
+    setup: Option<(
+        &crate::capture_setup::SetupLinks,
+        crate::capture::BoundaryStage,
+    )>,
 ) -> anyhow::Result<OwnedFd> {
     use anyhow::Context as _;
     let mut insns = p.insns.clone();
@@ -2232,8 +2236,14 @@ fn load_prog(
     // prog loads BTF-less exactly as before. The BTF fd outlives
     // both load attempts (drop closes it; loaded progs hold
     // their own refs).
-    let mut btf_fd: Option<std::os::fd::OwnedFd> = None;
+    let mut btf_fd = match setup {
+        Some((links, stage)) => crate::capture_setup::SetupResource::guarded(None, links, stage),
+        None => crate::capture_setup::SetupResource::local(None),
+    };
     let mut func_info_bytes: Vec<u8> = Vec::new();
+    if let Some((links, stage)) = setup {
+        links.check_owned(stage)?;
+    }
     if p.subprogs.iter().any(|s| s.is_callback) {
         let (btf, info) =
             synth_btf(&p.subprogs).with_context(|| format!("synth_btf {}", p.name))?;
@@ -2249,7 +2259,7 @@ fn load_prog(
                 .collect::<String>();
             anyhow::anyhow!("btf_load {}: {e}\n{detail}", p.name)
         })?;
-        btf_fd = Some(fd);
+        *btf_fd = Some(fd);
     }
     let prog_btf = |fd: &Option<std::os::fd::OwnedFd>| -> Option<ossl_bpf_sys::ProgBtf<'_>> {
         fd.as_ref().map(|f| ossl_bpf_sys::ProgBtf {
@@ -2264,6 +2274,9 @@ fn load_prog(
     // verifier's report (a 4 MiB buffer: failure explorations
     // run to ~0.9 MiB, and an overflowed buffer would eat the
     // very diagnostics the retry exists for).
+    if let Some((links, stage)) = setup {
+        links.check_owned(stage)?;
+    }
     let fd = match ossl_bpf_sys::prog_load_kprobe_quiet(
         &insns,
         license,
@@ -2273,6 +2286,9 @@ fn load_prog(
     ) {
         Ok(fd) => fd,
         Err(_) => {
+            if let Some((links, stage)) = setup {
+                links.check_owned(stage)?;
+            }
             let mut log = vec![0u8; 4 << 20];
             match ossl_bpf_sys::prog_load_kprobe(
                 &insns,
@@ -2291,14 +2307,27 @@ fn load_prog(
                         .collect::<String>();
                     // Keep-good loads cap verifier-log spills (a pathological
                     // all-rejected object must not fill the temp dir).
-                    let spill = spill.then(|| spill_verifier_log(&p.name, full)).flatten();
-                    return Err(anyhow::anyhow!(
+                    if let Some((links, stage)) = setup {
+                        links.seal(crate::capture_setup::SetupFailure::io(
+                            stage,
+                            &e,
+                            "native program load failed",
+                        ));
+                    }
+                    let spill = (spill && setup.is_none())
+                        .then(|| spill_verifier_log(&p.name, full))
+                        .flatten();
+                    let error = anyhow::anyhow!(
                         "prog_load {}: {e}\n{detail}{}",
                         p.name,
                         spill
                             .map(|p| format!("\n(full verifier log: {})", p.display()))
                             .unwrap_or_default()
-                    ));
+                    );
+                    return match setup {
+                        Some((links, stage)) => links.retain_result(Err(error), stage),
+                        None => Err(error),
+                    };
                 }
             }
         }
@@ -2307,26 +2336,80 @@ fn load_prog(
 }
 
 pub fn load(prep: &Prepared) -> anyhow::Result<Loaded> {
+    load_with_custody(prep, None)
+}
+pub(crate) fn load_controlled(
+    prep: &Prepared,
+    links: &crate::capture_setup::SetupLinks,
+    stage: crate::capture::BoundaryStage,
+) -> anyhow::Result<Loaded> {
+    load_with_custody(prep, Some((links, stage)))
+}
+fn load_with_custody(
+    prep: &Prepared,
+    setup: Option<(
+        &crate::capture_setup::SetupLinks,
+        crate::capture::BoundaryStage,
+    )>,
+) -> anyhow::Result<Loaded> {
     use anyhow::Context as _;
-    let mut maps = HashMap::new();
-    for m in &prep.maps {
-        let fd = ossl_bpf_sys::map_create(
-            m.map_type,
-            m.key_size,
-            m.value_size,
-            m.max_entries,
-            None,
-            &m.name,
-        )
-        .with_context(|| format!("map_create {}", m.name))?;
-        maps.insert(m.name.clone(), fd);
+    let loaded = Loaded {
+        maps: HashMap::with_capacity(prep.maps.len()),
+        progs: HashMap::with_capacity(prep.progs.len()),
+    };
+    let mut loaded = match setup {
+        Some((links, stage)) => crate::capture_setup::SetupResource::guarded(loaded, links, stage),
+        None => crate::capture_setup::SetupResource::local(loaded),
+    };
+    // The transaction remains outside the fallible/unwinding operation scope.
+    // Every returned FD enters it before another effect can begin.
+    let result =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> anyhow::Result<()> {
+            for m in &prep.maps {
+                if let Some((links, stage)) = setup {
+                    links.check_owned(stage)?;
+                }
+                let fd = ossl_bpf_sys::map_create(
+                    m.map_type,
+                    m.key_size,
+                    m.value_size,
+                    m.max_entries,
+                    None,
+                    &m.name,
+                )
+                .with_context(|| format!("map_create {}", m.name))?;
+                loaded.maps.insert(m.name.clone(), fd);
+            }
+            for p in &prep.progs {
+                if let Some((links, stage)) = setup {
+                    links.check_owned(stage)?;
+                }
+                let fd = load_prog(p, &loaded.maps, true, setup)?;
+                loaded.progs.insert(p.name.clone(), fd);
+            }
+            Ok(())
+        }));
+    match result {
+        Ok(Ok(())) => Ok(loaded.into_inner()),
+        Ok(Err(error)) => match setup {
+            Some((links, stage)) => links.retain_result(Err(error), stage),
+            None => Err(error),
+        },
+        Err(panic) => {
+            if let Some((links, stage)) = setup {
+                links.seal(crate::capture_setup::SetupFailure::Boundary(
+                    crate::capture::BoundaryFailure::new(
+                        stage,
+                        crate::capture::BoundaryFailureClass::Panic,
+                        None,
+                        "native load transaction unwound",
+                    ),
+                ));
+                links.before_dispose(stage);
+            }
+            std::panic::resume_unwind(panic)
+        }
     }
-    let mut progs = HashMap::new();
-    for p in &prep.progs {
-        let fd = load_prog(p, &maps, true)?;
-        progs.insert(p.name.clone(), fd);
-    }
-    Ok(Loaded { progs, maps })
 }
 
 /// One rejected program under keep-good loading (the slot is
@@ -2362,7 +2445,7 @@ pub fn load_keep_good(prep: &Prepared) -> anyhow::Result<(Loaded, Vec<FailedProg
     let mut progs = HashMap::new();
     let mut failed = Vec::new();
     for p in &prep.progs {
-        match load_prog(p, &maps, failed.len() < 8) {
+        match load_prog(p, &maps, failed.len() < 8, None) {
             Ok(fd) => {
                 progs.insert(p.name.clone(), fd);
             }
@@ -2572,6 +2655,7 @@ trait MemberAttachOps {
 }
 
 struct NativeMemberAttachOps<'a> {
+    setup: Option<crate::capture_setup::SetupLinks>,
     exe: &'a std::ffi::CStr,
     off: u64,
     pid: u32,
@@ -2603,7 +2687,11 @@ impl MemberAttachOps for NativeMemberAttachOps<'_> {
         maps: &HashMap<String, OwnedFd>,
         value: &osslscope_ebpf_common::CtrlValue,
     ) -> anyhow::Result<()> {
-        program_ctrl(maps, value)
+        if let Some(setup) = &self.setup {
+            borrowed_ctrl(maps, Some(value), setup).map(|_| ())
+        } else {
+            program_ctrl(maps, value)
+        }
     }
 }
 
@@ -2654,7 +2742,12 @@ pub fn attach_members_subset_from_bytes(
     let prep = prepare(bytes, &MEMBER_MAPS, &specs).context("prepare members.o subset")?;
     // Keep-good load: one rejection is recorded, the rest proceed.
     let (loaded, load_failed) = load_keep_good(&prep).context("load members.o subset")?;
-    let mut ops = NativeMemberAttachOps { exe, off, pid };
+    let mut ops = NativeMemberAttachOps {
+        exe,
+        off,
+        pid,
+        setup: None,
+    };
     attach_subset_loaded(
         loaded,
         load_failed,
@@ -2822,20 +2915,50 @@ fn prepare_members_from_bytes(
         );
     }
     links.check()?;
-    ensure_members_fd_budget()?;
+    if links.setup_links().is_some() {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        if !members_fd_budget_ok(limit.rlim_cur) {
+            anyhow::bail!("NOFILE below the full-member budget");
+        }
+    } else {
+        ensure_members_fd_budget()?;
+    }
     links.check()?;
     let prep = prepare(bytes, &MEMBER_MAPS, &MEMBER_PROGS).context("prepare members.o")?;
     links.check()?;
-    let loaded = load(&prep).context("load members.o")?;
-    let mut ops = NativeMemberAttachOps { exe, off, pid };
+    let loaded = match links.setup_links() {
+        Some(setup) => load_controlled(&prep, setup, crate::capture::BoundaryStage::Traversal),
+        None => load(&prep),
+    }
+    .context("load members.o")?;
+    let setup = links.setup_links().cloned();
+    let mut ops = NativeMemberAttachOps {
+        exe,
+        off,
+        pid,
+        setup: setup.clone(),
+    };
     attach_full_loaded(
         loaded,
         ctrl,
-        |handles| {
-            crate::discovery::classifier_maps::initialize_classifier_maps(
+        |handles| match &setup {
+            Some(setup) => {
+                crate::discovery::classifier_maps::initialize_classifier_maps_controlled(
+                    handles,
+                    crate::discovery::classifier_maps::ClassifierRole::Members,
+                    setup,
+                )
+            }
+            None => crate::discovery::classifier_maps::initialize_classifier_maps(
                 handles,
                 crate::discovery::classifier_maps::ClassifierRole::Members,
-            )
+            ),
         },
         &mut ops,
         links,
@@ -2885,6 +3008,7 @@ fn attach_full_loaded<I: FnOnce(&HashMap<String, OwnedFd>) -> anyhow::Result<()>
     ops: &mut impl MemberAttachOps,
     links: &mut crate::capture_setup::MemberLinkStore,
 ) -> anyhow::Result<Loaded> {
+    let loaded = links.resource(loaded);
     let mut guard = MemberAttachGuard {
         links,
         complete: false,
@@ -2894,31 +3018,43 @@ fn attach_full_loaded<I: FnOnce(&HashMap<String, OwnedFd>) -> anyhow::Result<()>
         let links = &mut *guard.links;
         use anyhow::Context as _;
         links.check()?;
-        ops.ctrl(&loaded.maps, ctrl).context("program CTRL")?;
+        links.retain_result(ops.ctrl(&loaded.maps, ctrl).context("program CTRL"))?;
         let classifier_temporary = links.temporary(1)?;
-        let classifier_handles = crate::discovery::classifier_maps::clone_classifier_handles(
-            &loaded.maps,
-            crate::discovery::classifier_maps::ClassifierRole::Members,
-        )?;
+        // Members has exactly one classifier handle: an unsuccessful clone
+        // returns no partial set. Keep its existing exact initializer input.
+        let classifier_handles = links.resource(links.retain_result(
+            crate::discovery::classifier_maps::clone_classifier_handles(
+                &loaded.maps,
+                crate::discovery::classifier_maps::ClassifierRole::Members,
+            ),
+        )?);
+        let classifier_setup = links.setup_links().cloned();
         links.check()?;
-        let loaded = crate::discovery::classifier_maps::after_classifier_init(
-            move || {
+        crate::discovery::classifier_maps::after_classifier_init(
+            || {
                 let result = initialize(&classifier_handles);
+                let result = match &classifier_setup {
+                    Some(setup) => {
+                        setup.retain_result(result, crate::capture::BoundaryStage::Traversal)
+                    }
+                    None => result,
+                };
                 drop(classifier_handles);
                 drop(classifier_temporary);
                 result
             },
             || {
                 let mut reservation = links.reserve()?;
-                let entry = ops
-                    .entry(loaded.progs["member_entry"].as_fd())
-                    .context("attach member_entry")?;
+                let entry = links.retain_result(
+                    ops.entry(loaded.progs["member_entry"].as_fd())
+                        .context("attach member_entry"),
+                )?;
                 links.push(None, entry, &mut reservation)?;
                 attach_member_slots_with_ops(&loaded, &(0..512).collect::<Vec<_>>(), links, ops)?;
-                Ok(loaded)
+                Ok(())
             },
         )?;
-        Ok(loaded)
+        Ok(())
     })();
     if let Err(error) = &result {
         guard.failure = Some(crate::capture_setup::SetupFailure::from_error_ref(
@@ -2927,7 +3063,10 @@ fn attach_full_loaded<I: FnOnce(&HashMap<String, OwnedFd>) -> anyhow::Result<()>
         ));
     }
     guard.complete = result.is_ok();
-    result
+    if let Err(error) = result {
+        return guard.links.retain_result(Err(error));
+    }
+    Ok(loaded.into_inner())
 }
 
 pub(crate) fn attach_member_slots(
@@ -2942,7 +3081,12 @@ pub(crate) fn attach_member_slots(
         loaded,
         slots,
         links,
-        &mut NativeMemberAttachOps { exe, off, pid },
+        &mut NativeMemberAttachOps {
+            exe,
+            off,
+            pid,
+            setup: None,
+        },
     )
 }
 fn attach_member_slots_with_ops(
@@ -5092,5 +5236,684 @@ mod tests {
         assert!(attach_members_subset(obj, &exe, 0, 1, &ctrl4, &[]).is_err());
         assert!(attach_members_subset(obj, &exe, 0, 1, &ctrl4, &[0, 512]).is_err());
         assert!(attach_members_subset(obj, &exe, 0, 1, &ctrl5, &[0, 1, 2, 3]).is_err());
+    }
+}
+
+// Controlled ring consumption follows Aya 0.14.0 maps/ring_buf.rs.
+// Copyright (c) 2021 Alessandro Decina
+//
+// Permission is hereby granted, free of charge, to any person obtaining
+// a copy of this software and associated documentation files (the
+// "Software"), to deal in the Software without restriction, including
+// without limitation the rights to use, copy, modify, merge, publish,
+// distribute, sublicense, and/or sell copies of the Software, and to
+// permit persons to whom the Software is furnished to do so, subject to
+// the following conditions:
+//
+// The above copyright notice and this permission notice shall be
+// included in all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+// EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+// NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+// LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+// OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+// WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+//
+
+/// Borrowed map operations never manufacture an owning Aya descriptor.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BorrowedMapInfo {
+    pub(crate) map_type: u32,
+    pub(crate) id: u32,
+    pub(crate) key_size: u32,
+    pub(crate) value_size: u32,
+    pub(crate) max_entries: u32,
+    pub(crate) flags: u32,
+}
+pub(crate) struct BorrowedMap<'a> {
+    fd: BorrowedFd<'a>,
+    pub(crate) info: BorrowedMapInfo,
+    setup: Option<(
+        &'a crate::capture_setup::SetupLinks,
+        crate::capture::BoundaryStage,
+    )>,
+}
+impl<'a> BorrowedMap<'a> {
+    pub(crate) fn new(fd: BorrowedFd<'a>) -> std::io::Result<Self> {
+        #[repr(C)]
+        struct Attr {
+            fd: u32,
+            len: u32,
+            info: u64,
+        }
+        let mut bytes = [0u32; 64];
+        let mut attr = Attr {
+            fd: fd.as_raw_fd() as u32,
+            len: std::mem::size_of_val(&bytes) as u32,
+            info: bytes.as_mut_ptr() as u64,
+        };
+        // SAFETY: the complete zeroed map-info buffer and fixed UAPI attribute
+        // remain live through this borrowed-FD syscall; it creates no owner.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_bpf,
+                ossl_bpf_sys::BPF_OBJ_GET_INFO_BY_FD,
+                &mut attr,
+                std::mem::size_of::<Attr>(),
+            )
+        };
+        if result < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self {
+            fd,
+            setup: None,
+            info: BorrowedMapInfo {
+                map_type: bytes[0],
+                id: bytes[1],
+                key_size: bytes[2],
+                value_size: bytes[3],
+                max_entries: bytes[4],
+                flags: bytes[5],
+            },
+        })
+    }
+    pub(crate) fn checked(
+        fd: BorrowedFd<'a>,
+        setup: &'a crate::capture_setup::SetupLinks,
+        stage: crate::capture::BoundaryStage,
+    ) -> anyhow::Result<Self> {
+        setup.check_owned(stage)?;
+        let mut map = Self::new(fd)?;
+        map.setup = Some((setup, stage));
+        Ok(map)
+    }
+    fn check(&self) -> std::io::Result<()> {
+        if let Some((setup, stage)) = self.setup {
+            setup.check_owned(stage).map_err(std::io::Error::other)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn shape(&self, types: &[u32], key: usize, value: usize) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            types.contains(&self.info.map_type)
+                && self.info.key_size as usize == key
+                && self.info.value_size as usize == value,
+            "borrowed map shape mismatch"
+        );
+        Ok(())
+    }
+    pub(crate) fn lookup(&self, key: &[u8], values: &mut [u8]) -> std::io::Result<()> {
+        self.check()?;
+        if key.len() != self.info.key_size as usize {
+            return Err(std::io::Error::other("map key size mismatch"));
+        }
+        let expected = if matches!(self.info.map_type, 5 | 6) {
+            let cpus = aya::util::nr_cpus().map_err(|(_, error)| error)?;
+            (self.info.value_size as usize)
+                .next_multiple_of(8)
+                .checked_mul(cpus)
+                .ok_or_else(|| std::io::Error::other("per-CPU value size overflow"))?
+        } else {
+            self.info.value_size as usize
+        };
+        if values.len() != expected {
+            return Err(std::io::Error::other("map value size mismatch"));
+        }
+        // SAFETY: sizes were checked against immutable metadata of this exact FD.
+        unsafe { ossl_bpf_sys::map_lookup_elem(self.fd.as_raw_fd(), key, values) }
+    }
+    pub(crate) fn update(&self, key: &[u8], value: &[u8]) -> std::io::Result<()> {
+        self.check()?;
+        if key.len() != self.info.key_size as usize
+            || value.len() != self.info.value_size as usize
+            || matches!(self.info.map_type, 5 | 6)
+        {
+            return Err(std::io::Error::other("map update shape mismatch"));
+        }
+        // SAFETY: non-per-CPU key/value lengths match this exact FD.
+        unsafe { ossl_bpf_sys::map_update_elem(self.fd.as_raw_fd(), key, value, 0) }
+    }
+    pub(crate) fn keys(&self, capacity: u32) -> std::io::Result<Vec<Vec<u8>>> {
+        let mut out = Vec::new();
+        let mut previous: Option<Vec<u8>> = None;
+        let mut seen = HashSet::new();
+        loop {
+            self.check()?;
+            let mut next = vec![0; self.info.key_size as usize];
+            // SAFETY: both key buffers match the exact immutable map key size.
+            match unsafe {
+                ossl_bpf_sys::map_get_next_key(self.fd.as_raw_fd(), previous.as_deref(), &mut next)
+            } {
+                Err(error) if error.raw_os_error() == Some(libc::ENOENT) => return Ok(out),
+                Err(error) => return Err(error),
+                Ok(()) => {}
+            }
+            if out.len() >= capacity as usize || !seen.insert(next.clone()) {
+                return Err(std::io::Error::other(
+                    "map key iteration repeats or exceeds capacity",
+                ));
+            }
+            previous = Some(next.clone());
+            out.push(next);
+        }
+    }
+    pub(crate) fn delete(&self, key: &[u8]) -> std::io::Result<()> {
+        self.check()?;
+        if key.len() != self.info.key_size as usize {
+            return Err(std::io::Error::other("map key size mismatch"));
+        }
+        #[repr(C)]
+        struct Attr {
+            fd: u32,
+            pad: u32,
+            key: u64,
+            value: u64,
+            flags: u64,
+        }
+        let attr = Attr {
+            fd: self.fd.as_raw_fd() as u32,
+            pad: 0,
+            key: key.as_ptr() as u64,
+            value: 0,
+            flags: 0,
+        };
+        // SAFETY: BPF_MAP_DELETE_ELEM reads only the checked live key.
+        let result = unsafe { libc::syscall(libc::SYS_bpf, 3, &attr, std::mem::size_of::<Attr>()) };
+        if result < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+}
+pub(crate) fn pod_bytes<T: aya::Pod>(value: &T) -> &[u8] {
+    // SAFETY: Pod has no uninitialized padding and is valid as bytes.
+    unsafe { std::slice::from_raw_parts((value as *const T).cast(), std::mem::size_of::<T>()) }
+}
+fn pod_value<T: aya::Pod>(bytes: &[u8]) -> T {
+    assert_eq!(bytes.len(), std::mem::size_of::<T>());
+    // SAFETY: Pod admits every initialized bit pattern; unaligned copy owns T.
+    unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<T>()) }
+}
+pub(crate) fn borrowed_rows<K: aya::Pod, V: aya::Pod>(
+    maps: &HashMap<String, OwnedFd>,
+    name: &str,
+    percpu: bool,
+    setup: &crate::capture_setup::SetupLinks,
+    stage: crate::capture::BoundaryStage,
+) -> anyhow::Result<Vec<(K, Vec<V>)>> {
+    use anyhow::Context as _;
+    let map = BorrowedMap::checked(maps.get(name).context("map missing")?.as_fd(), setup, stage)?;
+    map.shape(
+        if percpu { &[5][..] } else { &[1][..] },
+        std::mem::size_of::<K>(),
+        std::mem::size_of::<V>(),
+    )?;
+    let cpus = if percpu {
+        aya::util::nr_cpus().map_err(|(_, error)| error)?
+    } else {
+        1
+    };
+    let stride = if percpu {
+        std::mem::size_of::<V>().next_multiple_of(8)
+    } else {
+        std::mem::size_of::<V>()
+    };
+    let mut values = vec![0u8; stride.checked_mul(cpus).context("per-CPU size overflow")?];
+    let mut out = Vec::new();
+    for key in map.keys(map.info.max_entries)? {
+        match map.lookup(&key, &mut values) {
+            Ok(()) => out.push((
+                pod_value(&key),
+                values
+                    .chunks_exact(stride)
+                    .map(|value| pod_value(&value[..std::mem::size_of::<V>()]))
+                    .collect(),
+            )),
+            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(out)
+}
+pub(crate) fn borrowed_ctrl(
+    maps: &HashMap<String, OwnedFd>,
+    value: Option<&osslscope_ebpf_common::CtrlValue>,
+    setup: &crate::capture_setup::SetupLinks,
+) -> anyhow::Result<osslscope_ebpf_common::CtrlValue> {
+    use anyhow::Context as _;
+    let map = BorrowedMap::checked(
+        maps.get("CTRL").context("CTRL missing")?.as_fd(),
+        setup,
+        crate::capture::BoundaryStage::Traversal,
+    )?;
+    map.shape(
+        &[2],
+        4,
+        std::mem::size_of::<osslscope_ebpf_common::CtrlValue>(),
+    )?;
+    let key = 0u32.to_ne_bytes();
+    if let Some(value) = value {
+        map.update(&key, pod_bytes(value))?;
+        return Ok(*value);
+    }
+    let mut bytes = vec![0; map.info.value_size as usize];
+    map.lookup(&key, &mut bytes)?;
+    Ok(pod_value(&bytes))
+}
+
+struct EventMapping {
+    address: usize,
+    len: usize,
+    owner: crate::capture_setup::SetupWeak,
+    stage: crate::capture::BoundaryStage,
+    #[cfg(test)]
+    cleanup_hold: Option<std::sync::Arc<crate::capture_setup::NativeTestGate>>,
+}
+impl EventMapping {
+    fn new(
+        fd: BorrowedFd<'_>,
+        len: usize,
+        prot: i32,
+        offset: usize,
+        links: &crate::capture_setup::SetupLinks,
+        stage: crate::capture::BoundaryStage,
+    ) -> std::io::Result<Self> {
+        // SAFETY: the OS creates an independent mapping; its sole owner unmaps it.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                prot,
+                libc::MAP_SHARED,
+                fd.as_raw_fd(),
+                offset as libc::off_t,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self {
+            address: ptr as usize,
+            len,
+            owner: links.weak(),
+            stage,
+            #[cfg(test)]
+            cleanup_hold: links.test_mapping_cleanup_hold(),
+        })
+    }
+    fn position(&self) -> &std::sync::atomic::AtomicUsize {
+        assert_ne!(self.address, 0, "EVENTS position has a non-null mapping");
+        // SAFETY: mmap is page-aligned and its first word is the ring position;
+        // kernel and userspace use the documented atomic ring protocol.
+        unsafe { &*(self.address as *const std::sync::atomic::AtomicUsize) }
+    }
+}
+impl Drop for EventMapping {
+    fn drop(&mut self) {
+        // A failed unmap is unresolved ownership, never a successful Drop ack.
+        loop {
+            #[cfg(test)]
+            let hold = self.cleanup_hold.take();
+            let address = self.address;
+            #[cfg(test)]
+            let address = if hold.is_some() { address + 1 } else { address };
+            if unsafe { libc::munmap(address as *mut libc::c_void, self.len) } == 0 {
+                break;
+            }
+            let error = std::io::Error::last_os_error();
+            self.owner.disposal_error(self.stage, &error);
+            #[cfg(test)]
+            if let Some(hold) = hold {
+                hold.hold();
+            }
+            std::thread::park_timeout(std::time::Duration::from_millis(1));
+        }
+    }
+}
+#[derive(Default)]
+struct EventConstruction {
+    consumer: Option<EventMapping>,
+    producer: Option<EventMapping>,
+}
+enum EventInit {
+    Kernel,
+    #[cfg(test)]
+    Host(u8),
+}
+pub(crate) struct OwnedEvents {
+    consumer: EventMapping,
+    producer: EventMapping,
+    position: usize,
+    producer_cache: usize,
+    needs_wakeup: bool,
+    page: usize,
+    mask: usize,
+}
+impl OwnedEvents {
+    fn prepare(
+        fd: BorrowedFd<'_>,
+        bytes: u32,
+        links: &crate::capture_setup::SetupLinks,
+        stage: crate::capture::BoundaryStage,
+    ) -> anyhow::Result<Self> {
+        Self::prepare_with(fd, bytes, links, stage, EventInit::Kernel)
+    }
+    fn prepare_with(
+        fd: BorrowedFd<'_>,
+        bytes: u32,
+        links: &crate::capture_setup::SetupLinks,
+        stage: crate::capture::BoundaryStage,
+        mode: EventInit,
+    ) -> anyhow::Result<Self> {
+        let mut transaction = crate::capture_setup::SetupResource::guarded(
+            EventConstruction::default(),
+            links,
+            stage,
+        );
+        let result = (|| {
+            links.check_owned(stage)?;
+            let (info, fault) = match mode {
+                EventInit::Kernel => (BorrowedMap::new(fd)?.info, 0),
+                #[cfg(test)]
+                EventInit::Host(fault) => (
+                    BorrowedMapInfo {
+                        map_type: 27,
+                        id: 0,
+                        key_size: 0,
+                        value_size: 0,
+                        max_entries: bytes,
+                        flags: 0,
+                    },
+                    fault,
+                ),
+            };
+            anyhow::ensure!(
+                info.map_type == 27
+                    && info.key_size == 0
+                    && info.value_size == 0
+                    && info.max_entries == bytes,
+                "EVENTS shape mismatch"
+            );
+            let result = Self::map_parts(fd, bytes, &mut transaction, fault, links, stage);
+            result
+        })();
+        let (page, position, producer_cache) = links.retain_result(result, stage)?;
+        let parts = transaction.into_inner();
+        Ok(Self {
+            consumer: parts.consumer.expect("consumer mapped"),
+            producer: parts.producer.expect("producer mapped"),
+            position,
+            producer_cache,
+            needs_wakeup: false,
+            page,
+            mask: bytes as usize - 1,
+        })
+    }
+    fn map_parts(
+        fd: BorrowedFd<'_>,
+        bytes: u32,
+        transaction: &mut EventConstruction,
+        fault: u8,
+        links: &crate::capture_setup::SetupLinks,
+        stage: crate::capture::BoundaryStage,
+    ) -> anyhow::Result<(usize, usize, usize)> {
+        let raw_page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        anyhow::ensure!(raw_page > 0, "page size unavailable");
+        let page = raw_page as usize;
+        anyhow::ensure!(
+            bytes.is_power_of_two() && bytes as usize >= page && bytes as usize % page == 0,
+            "EVENTS ring size invalid"
+        );
+        links.check_owned(stage)?;
+        transaction.consumer = Some(EventMapping::new(
+            fd,
+            page,
+            libc::PROT_READ | libc::PROT_WRITE,
+            0,
+            links,
+            stage,
+        )?);
+        #[cfg(test)]
+        {
+            let mapping = transaction.consumer.as_ref().unwrap();
+            links.test_retained_mapping(mapping.address, mapping.len);
+            if fault == 2 {
+                panic!("EVENTS constructor unwound after consumer mmap");
+            }
+        }
+        #[cfg(not(test))]
+        let _ = links;
+        let position = transaction
+            .consumer
+            .as_ref()
+            .unwrap()
+            .position()
+            .load(std::sync::atomic::Ordering::Acquire);
+        let len = (bytes as usize)
+            .checked_mul(2)
+            .and_then(|n| n.checked_add(page))
+            .ok_or_else(|| anyhow::anyhow!("EVENTS mapping length overflow"))?;
+        let offset = if fault == 1 { 1 } else { page };
+        links.check_owned(stage)?;
+        transaction.producer = Some(EventMapping::new(
+            fd,
+            len,
+            libc::PROT_READ,
+            offset,
+            links,
+            stage,
+        )?);
+        #[cfg(test)]
+        {
+            let mapping = transaction.producer.as_ref().unwrap();
+            links.test_retained_mapping(mapping.address, mapping.len);
+        }
+        links.check_owned(stage)?;
+        let producer_cache = transaction
+            .producer
+            .as_ref()
+            .unwrap()
+            .position()
+            .load(std::sync::atomic::Ordering::Acquire);
+        Ok((page, position, producer_cache))
+    }
+    fn consume(&mut self, len: usize) {
+        self.position = self.position.wrapping_add((8 + len).next_multiple_of(8));
+        self.consumer
+            .position()
+            .store(self.position, std::sync::atomic::Ordering::Release);
+        self.needs_wakeup = true;
+    }
+    fn next(&mut self) -> Option<OwnedEvent<'_>> {
+        use std::sync::atomic::{AtomicU32, Ordering, fence};
+        loop {
+            if self.position == self.producer_cache {
+                if self.needs_wakeup {
+                    fence(Ordering::SeqCst);
+                    self.needs_wakeup = false;
+                }
+                self.producer_cache = self.producer.position().load(Ordering::Acquire);
+            }
+            if self.position == self.producer_cache {
+                return None;
+            }
+            let offset = self.position & self.mask;
+            let start = self.page + offset;
+            assert!(start + 8 <= self.producer.len);
+            // SAFETY: headers are 8-byte aligned and bounded in this mapping.
+            let header = unsafe { &*((self.producer.address + start) as *const AtomicU32) }
+                .load(Ordering::Acquire);
+            if header & (1 << 31) != 0 {
+                if !self.needs_wakeup {
+                    return None;
+                }
+                fence(Ordering::SeqCst);
+                self.needs_wakeup = false;
+                continue;
+            }
+            let len = (header as usize) & self.mask;
+            if header & (1 << 30) != 0 {
+                self.consume(len);
+                continue;
+            }
+            assert!(start + 8 + len <= self.producer.len);
+            return Some(OwnedEvent {
+                ring: self,
+                start: start + 8,
+                len,
+            });
+        }
+    }
+}
+pub(crate) struct OwnedEvent<'a> {
+    ring: &'a mut OwnedEvents,
+    start: usize,
+    len: usize,
+}
+impl std::ops::Deref for OwnedEvent<'_> {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        // SAFETY: next checked bounds; the exclusive consumer borrow prevents
+        // consumption/reuse until this item's Drop publishes its new position.
+        unsafe {
+            std::slice::from_raw_parts(
+                (self.ring.producer.address + self.start) as *const u8,
+                self.len,
+            )
+        }
+    }
+}
+impl Drop for OwnedEvent<'_> {
+    fn drop(&mut self) {
+        self.ring.consume(self.len);
+    }
+}
+pub(crate) enum Events {
+    Direct(aya::maps::RingBuf<aya::maps::MapData>),
+    Controlled(OwnedEvents),
+}
+pub(crate) enum Event<'a> {
+    Direct(aya::maps::ring_buf::RingBufItem<'a>),
+    Controlled(OwnedEvent<'a>),
+}
+impl std::ops::Deref for Event<'_> {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Direct(item) => item,
+            Self::Controlled(item) => item,
+        }
+    }
+}
+impl Events {
+    pub(crate) fn prepare(
+        maps: &HashMap<String, OwnedFd>,
+        setup: Option<&crate::capture_setup::SetupLinks>,
+        stage: crate::capture::BoundaryStage,
+        bytes: u32,
+    ) -> anyhow::Result<Self> {
+        use anyhow::Context as _;
+        let fd = maps.get("EVENTS").context("EVENTS missing")?;
+        if let Some(links) = setup {
+            return OwnedEvents::prepare(fd.as_fd(), bytes, links, stage).map(Self::Controlled);
+        }
+        let map = aya::maps::MapData::from_fd(fd.try_clone()?)?;
+        Ok(Self::Direct(aya::maps::RingBuf::try_from(
+            aya::maps::Map::from_map_data(map)?,
+        )?))
+    }
+    pub(crate) fn next(&mut self) -> Option<Event<'_>> {
+        match self {
+            Self::Direct(ring) => ring.next().map(Event::Direct),
+            Self::Controlled(ring) => ring.next().map(Event::Controlled),
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn prepare_host_events(
+    fd: BorrowedFd<'_>,
+    links: &crate::capture_setup::SetupLinks,
+    fault: u8,
+) -> anyhow::Result<Events> {
+    OwnedEvents::prepare_with(
+        fd,
+        4096,
+        links,
+        crate::capture::BoundaryStage::Discovery,
+        EventInit::Host(fault),
+    )
+    .map(Events::Controlled)
+}
+
+#[cfg(test)]
+mod fix1_event_tests {
+    use super::*;
+    use std::os::fd::FromRawFd as _;
+    fn memory() -> OwnedFd {
+        let fd = unsafe { libc::memfd_create(c"events-layout".as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(fd >= 0);
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        assert_eq!(unsafe { libc::ftruncate(fd.as_raw_fd(), 4096 * 4) }, 0);
+        fd
+    }
+    fn write(fd: BorrowedFd<'_>, offset: usize, bytes: &[u8]) {
+        assert_eq!(
+            unsafe {
+                libc::pwrite(
+                    fd.as_raw_fd(),
+                    bytes.as_ptr().cast(),
+                    bytes.len(),
+                    offset as libc::off_t,
+                )
+            },
+            bytes.len() as isize
+        );
+    }
+    fn position(fd: BorrowedFd<'_>) -> usize {
+        let mut bytes = [0; std::mem::size_of::<usize>()];
+        assert_eq!(
+            unsafe { libc::pread(fd.as_raw_fd(), bytes.as_mut_ptr().cast(), bytes.len(), 0) },
+            bytes.len() as isize
+        );
+        usize::from_ne_bytes(bytes)
+    }
+    #[test]
+    fn w079_fix1_real_events_busy_discard_wrap_and_release() {
+        let fd = memory();
+        let links = crate::capture_setup::SetupLinks::new();
+        write(fd.as_fd(), 4096, &16usize.to_ne_bytes());
+        write(fd.as_fd(), 8192, &((1u32 << 31) | 3).to_ne_bytes());
+        let mut ring = prepare_host_events(fd.as_fd(), &links, 0).unwrap();
+        assert!(ring.next().is_none());
+        assert_eq!(position(fd.as_fd()), 0);
+        write(fd.as_fd(), 8192 + 8, b"abc");
+        write(fd.as_fd(), 8192, &3u32.to_ne_bytes());
+        {
+            let item = ring.next().unwrap();
+            assert_eq!(&*item, b"abc");
+            assert_eq!(position(fd.as_fd()), 0);
+        }
+        assert_eq!(position(fd.as_fd()), 16);
+        write(fd.as_fd(), 8192 + 16, &((1u32 << 30) | 4).to_ne_bytes());
+        write(fd.as_fd(), 4096, &32usize.to_ne_bytes());
+        assert!(ring.next().is_none());
+        assert_eq!(position(fd.as_fd()), 32);
+        drop(ring);
+        write(fd.as_fd(), 0, &4088usize.to_ne_bytes());
+        write(fd.as_fd(), 4096, &4112usize.to_ne_bytes());
+        write(fd.as_fd(), 8192 + 4088, &12u32.to_ne_bytes());
+        write(fd.as_fd(), 8192 + 4096, b"abcdefghijkl");
+        let mut ring = prepare_host_events(fd.as_fd(), &links, 0).unwrap();
+        {
+            let item = ring.next().unwrap();
+            assert_eq!(&*item, b"abcdefghijkl");
+        }
+        assert_eq!(position(fd.as_fd()), 4112);
+        assert!(ring.next().is_none());
     }
 }

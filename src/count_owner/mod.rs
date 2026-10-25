@@ -14,6 +14,7 @@ use registry::Registry;
 use setup::SetupPreparation;
 pub(crate) use setup::{
     CountPrepareControl, CountSetupJournal, CountSetupPhase, CountSetupProgress, CountSetupWatch,
+    DisposalHold,
 };
 use std::sync::{
     Arc, Condvar, Mutex, MutexGuard, OnceLock,
@@ -560,6 +561,8 @@ struct Shared {
     // arbitrates explicit admission versus flag-only Drop, without waiting for
     // an initializer or taking the owner publication mutex in Drop.
     first_trigger: AtomicU64,
+    controlled_setup: bool,
+    disposal_hold: Option<Arc<setup::DisposalHold>>,
     worker: OnceLock<thread::Thread>,
     state: Mutex<SharedState>,
     latest_progress: Mutex<Option<RawCheckpoint>>,
@@ -571,6 +574,29 @@ struct Shared {
     seal_claim_observer: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 impl Shared {
+    fn permit_physical_close(&self, terminal: bool) {
+        loop {
+            let mut state = locked(&self.state);
+            let held = self
+                .disposal_hold
+                .as_ref()
+                .is_some_and(|hold| !hold.permitted())
+                && (terminal || state.terminal.is_some() || self.abandoned.load(Ordering::Acquire));
+            if !held {
+                state.active_operation = Some(if state.phase == OwnerPhase::Cleaning {
+                    CountOperation::Cleanup
+                } else {
+                    CountOperation::Close
+                });
+                return;
+            }
+            // The real seal/error/frontier is observable before this owner waits.
+            self.refresh_fallback_locked(&mut state, false);
+            drop(state);
+            self.changed.notify_all();
+            thread::park_timeout(std::time::Duration::from_millis(1));
+        }
+    }
     fn now(&self) -> Instant {
         #[cfg(test)]
         if let Some(clock) = &self.clock {
@@ -649,6 +675,28 @@ impl Shared {
         });
         self.refresh_fallback_locked(state, true);
         ticket
+    }
+    fn abandonment_class(&self) -> FailureClass {
+        // The sticky first-trigger distinguishes an actual setup abandonment
+        // from a prior operation/explicit seal followed by later abandonment.
+        let trigger = self.first_trigger.load(Ordering::Acquire);
+        if self.controlled_setup
+            && self.abandoned.load(Ordering::Acquire)
+            && trigger != 0
+            && trigger != u64::MAX
+        {
+            FailureClass::Cancelled
+        } else {
+            FailureClass::Disconnected
+        }
+    }
+    fn control_failure(&self, mut failure: OwnerFailure) -> OwnerFailure {
+        // Registry/map guard disconnection has no errno. Driver/cleanup I/O,
+        // panic, resource and publication failures keep their original data.
+        if failure.class == FailureClass::Disconnected && failure.errno.is_none() {
+            failure.class = self.abandonment_class();
+        }
+        failure
     }
     fn claim_abandon(&self, now: Instant) {
         let code = abandonment_code(now.checked_duration_since(self.trigger_origin));
@@ -1101,16 +1149,21 @@ impl CountEngine {
         let mut state = locked(&self.shared.state);
         if let Some(seal) = state.terminal {
             return Err(refused(
-                FailureClass::Disconnected,
+                self.shared.abandonment_class(),
                 CommandCompletion::NotEntered,
                 Some(seal.ticket),
             ));
         }
-        if self.shared.abandoned.load(Ordering::Acquire)
-            || !matches!(state.phase, OwnerPhase::Ready | OwnerPhase::Observing)
-        {
+        if !matches!(state.phase, OwnerPhase::Ready | OwnerPhase::Observing) {
             return Err(refused(
                 FailureClass::Disconnected,
+                CommandCompletion::NotEntered,
+                None,
+            ));
+        }
+        if self.shared.abandoned.load(Ordering::Acquire) {
+            return Err(refused(
+                self.shared.abandonment_class(),
                 CommandCompletion::NotEntered,
                 None,
             ));
@@ -1166,7 +1219,7 @@ impl CountEngine {
                 let ack = result?;
                 if let Some(seal) = state.terminal {
                     return Err(published_refusal(
-                        FailureClass::Disconnected,
+                        self.shared.abandonment_class(),
                         CommandCompletion::Completed,
                         Some(seal.ticket),
                     ));
@@ -1187,7 +1240,7 @@ impl CountEngine {
             }
             if let Some(seal) = state.terminal {
                 return Err(published_refusal(
-                    FailureClass::Disconnected,
+                    self.shared.abandonment_class(),
                     CommandCompletion::Unknown,
                     Some(seal.ticket),
                 ));
@@ -1236,16 +1289,21 @@ impl CountEngine {
         let mut state = locked(&self.shared.state);
         if let Some(seal) = state.terminal {
             return Err(refused(
-                OwnerFailure::engine(CountOperation::Attach, FailureClass::Disconnected),
+                OwnerFailure::engine(CountOperation::Attach, self.shared.abandonment_class()),
                 CommandCompletion::NotEntered,
                 Some(seal.ticket),
             ));
         }
-        if self.shared.abandoned.load(Ordering::Acquire)
-            || !matches!(state.phase, OwnerPhase::Ready | OwnerPhase::Observing)
-        {
+        if !matches!(state.phase, OwnerPhase::Ready | OwnerPhase::Observing) {
             return Err(refused(
                 OwnerFailure::engine(CountOperation::Attach, FailureClass::Disconnected),
+                CommandCompletion::NotEntered,
+                None,
+            ));
+        }
+        if self.shared.abandoned.load(Ordering::Acquire) {
+            return Err(refused(
+                OwnerFailure::engine(CountOperation::Attach, self.shared.abandonment_class()),
                 CommandCompletion::NotEntered,
                 None,
             ));
@@ -1300,7 +1358,7 @@ impl CountEngine {
                             return Err(published_refusal(
                                 OwnerFailure::engine(
                                     CountOperation::Attach,
-                                    FailureClass::Disconnected,
+                                    self.shared.abandonment_class(),
                                 ),
                                 CommandCompletion::Completed,
                                 Some(seal.ticket),
@@ -1337,7 +1395,7 @@ impl CountEngine {
             }
             if let Some(seal) = state.terminal {
                 return Err(published_refusal(
-                    OwnerFailure::engine(CountOperation::Attach, FailureClass::Disconnected),
+                    OwnerFailure::engine(CountOperation::Attach, self.shared.abandonment_class()),
                     CommandCompletion::Unknown,
                     Some(seal.ticket),
                 ));
@@ -1547,6 +1605,10 @@ impl CountEngine {
             abandoned: Arc::clone(&registry.abandoned),
             trigger_origin,
             first_trigger: AtomicU64::new(0),
+            controlled_setup: setup.is_some(),
+            disposal_hold: setup
+                .as_ref()
+                .and_then(|setup| setup.journal.disposal_hold()),
             worker: OnceLock::new(),
             state: Mutex::new(SharedState {
                 ordinary,
@@ -2056,6 +2118,7 @@ fn owner_main<D, F>(
                         Ok(ack)
                     }
                 });
+                let result = result.map_err(|failure| shared.control_failure(failure));
                 let response = match result {
                     Ok(ack) => {
                         state.phase = OwnerPhase::Observing;
@@ -2102,7 +2165,7 @@ fn owner_main<D, F>(
             Some(loaded)
         }
         Ok(Err(failure)) => {
-            shared.failed(failure);
+            shared.failed(shared.control_failure(failure));
             None
         }
         Err(_) => {
@@ -2242,6 +2305,7 @@ fn execute_map_command(
         }
     });
     let result = result.map_err(|failure| {
+        let failure = shared.control_failure(failure);
         state.failures.record_at(failure, shared.now());
         let ticket = shared.seal_locked(&mut state, deadline);
         state.phase = OwnerPhase::Sealing;
@@ -2286,6 +2350,8 @@ fn execute_map_command(
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(crate) use tests::{W079AppCountFixture, W079AppPrepareHold};
 
 fn terminal_storage(
     epoch: OwnerEpoch,

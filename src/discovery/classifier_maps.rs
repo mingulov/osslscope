@@ -54,6 +54,72 @@ pub(crate) fn initialize_classifier_maps(
     initialize_with(maps, role, &mut NativeOps)
 }
 
+pub(crate) fn initialize_classifier_maps_controlled(
+    maps: &HashMap<String, OwnedFd>,
+    role: ClassifierRole,
+    links: &crate::capture_setup::SetupLinks,
+) -> anyhow::Result<()> {
+    let stage = match role {
+        ClassifierRole::Harvest => crate::capture::BoundaryStage::Discovery,
+        ClassifierRole::Members => crate::capture::BoundaryStage::Traversal,
+    };
+    initialize_with(maps, role, &mut BorrowedNativeOps(links, stage))
+}
+struct BorrowedNativeOps<'a>(
+    &'a crate::capture_setup::SetupLinks,
+    crate::capture::BoundaryStage,
+);
+impl ClassifierMapOps for BorrowedNativeOps<'_> {
+    fn info(&mut self, fd: BorrowedFd<'_>) -> anyhow::Result<ClassifierMapInfo> {
+        self.0.check_owned(self.1)?;
+        let info = crate::loader::BorrowedMap::checked(fd, self.0, self.1)?.info;
+        Ok(ClassifierMapInfo {
+            id: info.id,
+            map_type: info.map_type,
+            key_size: info.key_size,
+            value_size: info.value_size,
+            max_entries: info.max_entries,
+            flags: info.flags,
+        })
+    }
+    fn update(&mut self, fd: BorrowedFd<'_>, key: &[u8; 8], value: &[u8]) -> anyhow::Result<()> {
+        self.0.check_owned(self.1)?;
+        let map = crate::loader::BorrowedMap::checked(fd, self.0, self.1)?;
+        map.shape(&[1], 8, value.len())?;
+        map.update(key, value)?;
+        Ok(())
+    }
+    fn lookup(
+        &mut self,
+        fd: BorrowedFd<'_>,
+        key: &[u8; 8],
+        value_size: usize,
+    ) -> anyhow::Result<Vec<u8>> {
+        self.0.check_owned(self.1)?;
+        let map = crate::loader::BorrowedMap::checked(fd, self.0, self.1)?;
+        map.shape(&[1], 8, value_size)?;
+        let mut value = vec![0; value_size];
+        map.lookup(key, &mut value)?;
+        Ok(value)
+    }
+    fn keys(&mut self, fd: BorrowedFd<'_>, capacity: u32) -> anyhow::Result<Vec<[u8; 8]>> {
+        self.0.check_owned(self.1)?;
+        let map = crate::loader::BorrowedMap::checked(fd, self.0, self.1)?;
+        anyhow::ensure!(map.info.key_size == 8, "classifier key size");
+        map.keys(capacity)?
+            .into_iter()
+            .map(|key| {
+                key.try_into()
+                    .map_err(|_| anyhow::anyhow!("classifier key size"))
+            })
+            .collect()
+    }
+    fn freeze(&mut self, fd: BorrowedFd<'_>) -> anyhow::Result<()> {
+        self.0.check_owned(self.1)?;
+        ossl_bpf_sys::map_freeze(fd.as_raw_fd()).context("BPF_MAP_FREEZE")
+    }
+}
+
 /// Scoped handles let an activation closure move the existing Loaded owner
 /// while initialization still addresses the same kernel map identities.
 pub(crate) fn clone_classifier_handles(

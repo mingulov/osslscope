@@ -529,6 +529,9 @@ impl Registry {
         slot: LoadSlot,
         driver: &mut impl CountIoDriver,
     ) -> std::io::Result<()> {
+        if let Some(shared) = &self.shared {
+            shared.permit_physical_close(self.sealed);
+        }
         let index = slot.0;
         self.slots[index].record.state = ResourceState::CloseIssued;
         if let ResourceId::Link(id) = self.slots[index].record.resource {
@@ -605,6 +608,9 @@ impl Registry {
             };
             if self.slots[index].fd.is_none() {
                 continue;
+            }
+            if let Some(shared) = &self.shared {
+                shared.permit_physical_close(true);
             }
             let issued_at = self
                 .shared

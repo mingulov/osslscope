@@ -67,30 +67,70 @@ pub fn starttime_of(pid: u32) -> anyhow::Result<u64> {
 /// today's dead-target reads) when the pid is already gone; needs no
 /// privileges (pidfd_open is caps-free for live tasks).
 pub fn pin(pid: u32) -> anyhow::Result<TargetPin> {
-    let starttime = starttime_of(pid).with_context(|| format!("target {pid} gone"))?;
-    // SAFETY: raw pidfd_open(2) returns an owned fd on success,
-    // -1 with errno on error (libc has no pidfd_open wrapper).
-    let pidfd = unsafe {
-        let fd = libc::syscall(libc::SYS_pidfd_open, pid as libc::c_int, 0) as libc::c_int;
-        if fd < 0 {
-            anyhow::bail!(
-                "target {pid} gone (pidfd_open: {})",
-                std::io::Error::last_os_error()
-            );
-        }
-        OwnedFd::from_raw_fd(fd)
-    };
-    // Re-read under the pin: the task seen by stat may have exited
-    // between the stat and pidfd_open (pidfd then refers to nothing
-    // usable — fail rather than pin a ghost).
-    let again = starttime_of(pid)?;
-    if again != starttime {
-        anyhow::bail!("target {pid} recycled during pin");
+    pin_with(pid, None, starttime_of)
+}
+
+pub(crate) fn pin_controlled(
+    pid: u32,
+    links: &crate::capture_setup::SetupLinks,
+) -> anyhow::Result<TargetPin> {
+    pin_with(pid, Some(links), starttime_of)
+}
+fn pin_with(
+    pid: u32,
+    links: Option<&crate::capture_setup::SetupLinks>,
+    mut read_starttime: impl FnMut(u32) -> anyhow::Result<u64>,
+) -> anyhow::Result<TargetPin> {
+    let stage = crate::capture::BoundaryStage::Discovery;
+    let starttime = read_starttime(pid).with_context(|| format!("target {pid} gone"))?;
+    // SAFETY: successful pidfd_open returns a new owned descriptor.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::c_int, 0) as libc::c_int };
+    if fd < 0 {
+        return Err(anyhow::Error::new(std::io::Error::last_os_error())
+            .context(format!("target {pid} gone (pidfd_open)")));
     }
-    Ok(TargetPin {
+    let value = TargetPin {
         pid,
         starttime,
-        _pidfd: pidfd,
+        _pidfd: unsafe { OwnedFd::from_raw_fd(fd) },
+    };
+    #[cfg(test)]
+    if let Some(links) = links {
+        links.test_retained_fd(fd);
+    }
+    // Own the actual descriptor before the second fallible identity observation.
+    let pin = match links {
+        Some(links) => crate::capture_setup::SetupResource::guarded(value, links, stage),
+        None => crate::capture_setup::SetupResource::local(value),
+    };
+    let result = (|| {
+        let again = read_starttime(pid)?;
+        if again != starttime {
+            anyhow::bail!("target {pid} recycled during pin");
+        }
+        Ok(())
+    })();
+    if let Some(links) = links {
+        links.retain_result(result, stage)?;
+        links.check_owned(stage)?;
+    } else {
+        result?;
+    }
+    Ok(pin.into_inner())
+}
+#[cfg(test)]
+pub(crate) fn pin_controlled_fault(
+    pid: u32,
+    links: &crate::capture_setup::SetupLinks,
+) -> anyhow::Result<TargetPin> {
+    let mut calls = 0;
+    pin_with(pid, Some(links), |pid| {
+        calls += 1;
+        if calls == 2 {
+            Err(std::io::Error::from_raw_os_error(libc::EIO).into())
+        } else {
+            starttime_of(pid)
+        }
     })
 }
 

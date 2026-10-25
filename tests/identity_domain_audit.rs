@@ -114,6 +114,43 @@ fn h5_t3_every_device_site_names_one_domain() {
         "stat", "maps", "raw", "agnostic", "fallback", "display", "local",
     ];
     let pinned: &[(&str, &str, &str, u32)] = &[
+        (
+            "src/capture.rs",
+            "stat",
+            ".map(|file| (file.bytes, (file.dev, file.ino)))",
+            1,
+        ),
+        (
+            "src/capture_setup.rs",
+            "stat",
+            ".map(|file| (file.bytes, (file.dev, file.ino)));",
+            1,
+        ),
+        ("src/capture_setup.rs", "stat", "device: file.dev,", 1),
+        (
+            "src/capture_setup.rs",
+            "stat",
+            "let device = crate::plan::encode_device(",
+            1,
+        ),
+        (
+            "src/capture_setup.rs",
+            "stat",
+            "let dev = crate::plan::render_device(device);",
+            1,
+        ),
+        (
+            "src/capture_setup.rs",
+            "raw",
+            "libc::major(metadata.dev()),",
+            1,
+        ),
+        (
+            "src/capture_setup.rs",
+            "raw",
+            "libc::minor(metadata.dev()),",
+            1,
+        ),
         // capture.rs: file-cache identity validation (R20: both
         // fstat-sourced encoded words — cached read identity vs
         // current FileStat).
