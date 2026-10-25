@@ -2803,7 +2803,7 @@ fn host_elf(bytes: &[u8]) -> R<HostElf<'_>> {
     } else if !dyn_sections.is_empty()
         || sections
             .iter()
-            .any(|s| matches!(s.kind, 0x6ffffffe | 0x6ffffffd | 0x6fffffff))
+            .any(|s| matches!(s.kind, 0x6ffffffd..=0x6fffffff))
     {
         return Err(invalid("ELF orphan dynamic/version sections"));
     }
