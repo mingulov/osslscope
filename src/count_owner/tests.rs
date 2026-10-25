@@ -8823,6 +8823,18 @@ fn g1_zero_grace_candidate_first_observed_at_cutoff_cannot_promote() {
 
 #[test]
 fn g1_panic_disconnect_retains_one_owner_first_abandonment_edge() {
+    struct ReleaseOnPanic<'a> {
+        engine: &'a CountEngine,
+        owner: &'a Probe,
+    }
+    impl Drop for ReleaseOnPanic<'_> {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                self.engine.abandon();
+                self.owner.release();
+            }
+        }
+    }
     let probe = MapProbe::new();
     let clock = ControlledClock::new();
     let (engine, _) = terminal_engine(
@@ -8838,6 +8850,11 @@ fn g1_panic_disconnect_retains_one_owner_first_abandonment_edge() {
         },
     );
     thread::scope(|scope| {
+        // Drop before the scope's implicit join if any assertion unwinds.
+        let _release_on_panic = ReleaseOnPanic {
+            engine: &engine,
+            owner: &probe.owner,
+        };
         let ordinary = scope.spawn(|| {
             engine.set_generation(GenerationRequest {
                 seq: CommandSeq::checked(1).unwrap(),
@@ -8858,6 +8875,11 @@ fn g1_panic_disconnect_retains_one_owner_first_abandonment_edge() {
             receipt.deadline, first_edge,
             "salvage manufactured a later abandonment budget"
         );
+        // Resolve the ordinary caller's publication-lock access while the raw owner stays held.
+        assert_eq!(
+            ordinary.join().unwrap().err().unwrap().cleanup_ticket,
+            Some(receipt.cleanup_ticket)
+        );
         assert_eq!(
             engine.cleanup_progress().unwrap().active_operation,
             Some(CountOperation::Generation)
@@ -8865,10 +8887,6 @@ fn g1_panic_disconnect_retains_one_owner_first_abandonment_edge() {
         assert!(engine.fork_permit(Instant::now()).is_err());
         assert_eq!(probe.calls.lock().unwrap().len(), 1);
         probe.owner.release();
-        assert_eq!(
-            ordinary.join().unwrap().err().unwrap().cleanup_ticket,
-            Some(receipt.cleanup_ticket)
-        );
         task3_cleanup(&probe.owner, 8);
         engine
             .fork_permit(Instant::now() + Duration::from_secs(3))
