@@ -857,6 +857,9 @@ fn h5_t3_every_device_site_names_one_domain() {
         // Package snapshots retain raw dev_t from opened-FD metadata for
         // same-FD before/after identity checks; no encoded/maps-domain join.
         ("src/package/commands.rs", "raw", "dev: m.dev(),", 1),
+        // Retained artifacts compare raw fstat metadata before/after reads;
+        // their identity never joins encoded or maps device domains.
+        ("src/package/build.rs", "raw", "dev: m.dev(),", 1),
         // Task 2 trusted file identities use the same raw FD metadata domain.
         ("src/package/trusted.rs", "raw", "dev: m.dev(),", 1),
         // Executing-FD and trusted path-rebound FD devices are compared raw.
