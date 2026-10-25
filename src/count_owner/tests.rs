@@ -10118,3 +10118,181 @@ fn g1_actual_owner_open_recovery_reaches_capture_and_cli_consumer() {
         }
     }
 }
+
+#[test]
+fn w079_setup_barrier_all_exits() {
+    // Borrowed ordinary prefix users retain their old contract.
+    let borrowed = CountForkBarrier::new();
+    drop(borrowed.prefix_permit(Instant::now()).unwrap());
+    assert!(borrowed.prefix_permit(Instant::now()).is_ok());
+    for outcome in ["provider", "lifecycle", "cancel", "panic", "disconnect"] {
+        let barrier = Arc::new(CountForkBarrier::new());
+        let lease = Arc::new(barrier.reserve_setup().unwrap());
+        let worker = Arc::clone(&lease);
+        let held_permit = lease
+            .prefix_permit(Instant::now() + Duration::from_secs(2))
+            .unwrap();
+        let worker_result = std::panic::catch_unwind(|| -> Result<(), &'static str> {
+            let _phase = worker.prefix_phase();
+            let permit = worker
+                .prefix_permit(Instant::now() + Duration::from_secs(2))
+                .unwrap();
+            drop(permit);
+            match outcome {
+                "panic" => panic!("controlled setup worker panic"),
+                "disconnect" => {
+                    let (tx, rx) = std::sync::mpsc::channel::<()>();
+                    drop(rx);
+                    tx.send(()).map_err(|_| "disconnected")
+                }
+                "cancel" => {
+                    let cancelled = AtomicBool::new(true);
+                    if cancelled.load(Ordering::SeqCst) {
+                        Err("cancelled")
+                    } else {
+                        Ok(())
+                    }
+                }
+                "provider" => Err("provider failure"),
+                "lifecycle" => Err("lifecycle failure"),
+                _ => unreachable!(),
+            }
+        });
+        assert_eq!(worker_result.is_err(), outcome == "panic");
+        assert!(barrier.prefix_permit(Instant::now()).is_err(), "{outcome}");
+        assert!(worker.prefix_permit(Instant::now()).is_err(), "{outcome}");
+        assert!(
+            lease.reserve_count().is_err(),
+            "in-flight fork still owns permit"
+        );
+        assert!(
+            barrier
+                .admit(OwnerEpoch::checked(800).unwrap(), Instant::now())
+                .is_err()
+        );
+        lease.abort(); // Independent controller abandonment is idempotent.
+        drop(held_permit);
+        assert!(lease.reserve_count().is_err());
+        // Worker/cleanup disposal are still held: dropping a scoped permit
+        // must not reopen admission, and dropping the last lease fails closed.
+        drop(worker);
+        drop(lease);
+        assert_eq!(
+            barrier.prefix_permit(Instant::now()).err(),
+            Some(ForkBlocked::Unresolved)
+        );
+        assert!(
+            barrier
+                .admit(OwnerEpoch::checked(801).unwrap(), Instant::now())
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn w079_count_reservation_gap() {
+    let barrier = Arc::new(CountForkBarrier::new());
+    let lease = barrier.reserve_setup().unwrap();
+    let permit = lease
+        .prefix_permit(Instant::now() + Duration::from_secs(2))
+        .unwrap();
+    lease.close_prefix();
+    assert!(lease.reserve_count().is_err());
+    drop(permit);
+    let token = lease.reserve_count().unwrap();
+    assert!(
+        lease.reserve_count().is_err(),
+        "only one Count reservation may exist"
+    );
+    let epoch = OwnerEpoch::checked(987).unwrap();
+    assert!(
+        barrier
+            .admit(epoch, Instant::now() + Duration::from_secs(1))
+            .is_err(),
+        "ordinary Count admission stole held setup preflight"
+    );
+    assert!(barrier.prefix_permit(Instant::now()).is_err());
+    assert!(lease.prefix_permit(Instant::now()).is_err());
+    assert!(barrier.terminal_permit(epoch, Instant::now()).is_err());
+    barrier.admit_setup(token, epoch).unwrap();
+    assert!(barrier.admit(epoch, Instant::now()).is_err());
+    assert!(
+        barrier.terminal_permit(epoch, Instant::now()).is_err(),
+        "admission is not an actual Count cleanup receipt"
+    );
+    barrier.spawn_failed(epoch);
+    assert!(
+        barrier.prefix_permit(Instant::now()).is_err(),
+        "spawn failure reopened prefix"
+    );
+    assert!(
+        barrier.terminal_permit(epoch, Instant::now()).is_err(),
+        "spawn failure invented cleanup"
+    );
+    drop(lease);
+
+    for drop_token in [true, false] {
+        let barrier = Arc::new(CountForkBarrier::new());
+        let lease = barrier.reserve_setup().unwrap();
+        drop(
+            lease
+                .prefix_permit(Instant::now() + Duration::from_secs(2))
+                .unwrap(),
+        );
+        lease.close_prefix();
+        let token = lease.reserve_count().unwrap();
+        if drop_token {
+            drop(token); // Fallible preflight unwinds before admission.
+        } else {
+            lease.abort(); // A late worker cannot admit after controller cancel.
+            assert!(barrier.admit_setup(token, epoch).is_err());
+        }
+        assert!(lease.reserve_count().is_err());
+        lease.complete_abort().unwrap();
+        assert!(
+            barrier.reserve_setup().is_err(),
+            "completed abort reused barrier"
+        );
+        assert!(barrier.admit(epoch, Instant::now()).is_err());
+        assert!(barrier.prefix_permit(Instant::now()).is_err());
+    }
+    // Admission checks the original deadline after preflight and wrong barriers
+    // cannot consume a reservation belonging to this barrier.
+    let barrier = Arc::new(CountForkBarrier::new());
+    let lease = barrier.reserve_setup().unwrap();
+    let first_deadline = Instant::now() + Duration::from_secs(60);
+    drop(lease.prefix_permit(first_deadline).unwrap());
+    // A later lifecycle scope cannot replace the original spawn deadline.
+    drop(
+        lease
+            .prefix_permit(Instant::now() + Duration::from_secs(120))
+            .unwrap(),
+    );
+    assert_eq!(
+        locked(&barrier.state).setup.as_ref().unwrap().deadline,
+        Some(first_deadline)
+    );
+    lease.close_prefix();
+    let token = lease.reserve_count().unwrap();
+    // Expire only after preflight reservation: scheduling cannot prevent the
+    // test from reaching the intended late-admission branch.
+    locked(&barrier.state).setup.as_mut().unwrap().deadline =
+        Some(Instant::now().checked_sub(Duration::from_secs(1)).unwrap());
+    assert_eq!(
+        barrier.admit_setup(token, epoch).unwrap_err().class,
+        FailureClass::Deadline
+    );
+    lease.complete_abort().unwrap();
+
+    let barrier = Arc::new(CountForkBarrier::new());
+    let lease = barrier.reserve_setup().unwrap();
+    drop(
+        lease
+            .prefix_permit(Instant::now() + Duration::from_secs(1))
+            .unwrap(),
+    );
+    lease.close_prefix();
+    let token = lease.reserve_count().unwrap();
+    assert!(CountForkBarrier::new().admit_setup(token, epoch).is_err());
+    lease.complete_abort().unwrap();
+}

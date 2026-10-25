@@ -63,71 +63,248 @@ pub struct OwnedTarget {
     state: CustodyState,
     /// Set when entering `Reaped`.
     exit_code: Option<i32>,
+    setup: Option<OwnedSetupCleanup>,
 }
 
-/// Kernel state letter from `/proc/<pid>/stat` (after the last ')').
-/// Level-triggered (unlike `waitpid` stop reports, which are consumed
-/// on first read): the initial stop was already consumed by
-/// `spawn_stopped`, so this is the only reliable stopped check.
-fn stat_state(pid: u32) -> Option<char> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let after = stat.rsplit_once(')')?.1;
-    after.split_whitespace().next()?.chars().next()
+/// A nonblocking custody receipt. A signal or exit observation alone is never
+/// `Resolved(Exited)`: only this owner's matching consuming wait grants that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SetupCleanupProgress {
+    Pending,
+    Resolved(TargetDisposition),
 }
-
-/// Stopped vs running for a waitpid-confirmed-alive child.
-enum ChildQuery {
-    Stopped,
-    Exited(i32),
-    Running,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChildExitReceipt {
+    reason: i32,
+    status: i32,
 }
-
-/// Query a not-yet-reaped owned child: a zombie reaps here with its
-/// status; otherwise `/proc` state distinguishes a stopped child (`T`,
-/// or `t` under a tracer) from a running one. A fresh stop is also
-/// visible via `WUNTRACED`, which serves as the fallback when `/proc`
-/// is unreadable; anything still unclassified answers `Running` (the
-/// kill paths must not signal what might be running). EINTR retries.
-fn query_child(pid: u32) -> anyhow::Result<ChildQuery> {
-    if let Some(code) = reap_once(pid)? {
-        return Ok(ChildQuery::Exited(code));
-    }
-    match stat_state(pid) {
-        Some('T' | 't') => return Ok(ChildQuery::Stopped),
-        Some(_) => return Ok(ChildQuery::Running),
-        None => {}
-    }
-    // /proc unreadable for a live pid: fall back to the edge-triggered
-    // stop report (catches a stop no waitpid has consumed yet).
-    loop {
-        let mut status = 0;
-        let r = unsafe {
-            libc::waitpid(
-                pid as libc::pid_t,
-                &mut status,
-                libc::WNOHANG | libc::WUNTRACED,
-            )
-        };
-        if r == 0 {
-            return Ok(ChildQuery::Running);
+impl ChildExitReceipt {
+    fn code(self) -> i32 {
+        if self.reason == libc::CLD_EXITED {
+            self.status
+        } else {
+            128 + self.status
         }
-        if r < 0 {
-            let e = std::io::Error::last_os_error();
-            if e.raw_os_error() == Some(libc::EINTR) {
-                continue;
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetupChildState {
+    Held,
+    Continued,
+    KillRequested,
+    ExitObserved(ChildExitReceipt),
+    Reaped(i32),
+    Detached,
+    Ambiguous(i32),
+    Released,
+}
+/// Exclusive pre-release wait custody, moved out of OwnedTarget before setup
+/// cleanup can become pending. It deliberately has no blocking Drop backstop.
+/// The setup cleanup owner retains it (and its pidfd) until custody is resolved.
+pub(crate) struct OwnedSetupCleanup {
+    pid: u32,
+    pidfd: OwnedFd,
+    initial_stop: i32,
+    state: SetupChildState,
+    last_errno: Option<i32>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct SetupSyscallFaults {
+    wait_errno: Option<i32>,
+    no_event: bool,
+    signal_errno: Option<i32>,
+    open_errno: Option<i32>,
+    waits: usize,
+    signals: usize,
+}
+#[cfg(test)]
+thread_local! {
+    static SETUP_SYSCALL_FAULTS: RefCell<SetupSyscallFaults> = RefCell::new(SetupSyscallFaults::default());
+}
+fn setup_waitid(
+    kind: libc::idtype_t,
+    id: libc::id_t,
+    options: i32,
+) -> std::io::Result<libc::siginfo_t> {
+    #[cfg(test)]
+    if let Some(result) = SETUP_SYSCALL_FAULTS.with(|cell| {
+        let mut faults = cell.borrow_mut();
+        faults.waits += 1;
+        if let Some(errno) = faults.wait_errno.take() {
+            Some(Err(std::io::Error::from_raw_os_error(errno)))
+        } else if std::mem::take(&mut faults.no_event) {
+            Some(Ok(unsafe { std::mem::zeroed() }))
+        } else {
+            None
+        }
+    }) {
+        return result;
+    }
+    let mut info = unsafe { std::mem::zeroed() };
+    if unsafe { libc::waitid(kind, id, &mut info, options) } == 0 {
+        Ok(info)
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+fn setup_pidfd_open(pid: u32) -> std::io::Result<OwnedFd> {
+    #[cfg(test)]
+    if let Some(errno) = SETUP_SYSCALL_FAULTS.with(|cell| cell.borrow_mut().open_errno.take()) {
+        return Err(std::io::Error::from_raw_os_error(errno));
+    }
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if fd < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) })
+    }
+}
+fn setup_pidfd_signal(fd: &OwnedFd, signal: i32) -> std::io::Result<()> {
+    #[cfg(test)]
+    if let Some(errno) = SETUP_SYSCALL_FAULTS.with(|cell| {
+        let mut faults = cell.borrow_mut();
+        faults.signals += 1;
+        faults.signal_errno.take()
+    }) {
+        return Err(std::io::Error::from_raw_os_error(errno));
+    }
+    if unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            fd.as_raw_fd(),
+            signal,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    } == 0
+    {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+impl OwnedSetupCleanup {
+    pub(crate) fn step(&mut self) -> anyhow::Result<SetupCleanupProgress> {
+        use SetupChildState::*;
+        match self.state {
+            Reaped(code) => {
+                return Ok(SetupCleanupProgress::Resolved(TargetDisposition::Exited {
+                    code,
+                }));
             }
-            return Err(anyhow::Error::new(e).context(format!("waitpid {pid}")));
+            Detached => {
+                return Ok(SetupCleanupProgress::Resolved(
+                    TargetDisposition::Detached { pid: self.pid },
+                ));
+            }
+            Ambiguous(libc::ECHILD) => {
+                return Err(std::io::Error::from_raw_os_error(libc::ECHILD).into());
+            }
+            _ => {}
         }
-        if libc::WIFEXITED(status) {
-            return Ok(ChildQuery::Exited(libc::WEXITSTATUS(status)));
+        let consuming = matches!(self.state, ExitObserved(_));
+        let options = libc::WNOHANG
+            | libc::WEXITED
+            | if consuming {
+                0
+            } else {
+                libc::WSTOPPED | libc::WCONTINUED | libc::WNOWAIT
+            };
+        let info = match setup_waitid(libc::P_PIDFD, self.pidfd.as_raw_fd() as u32, options) {
+            Ok(info) => info,
+            Err(error) => {
+                let errno = error.raw_os_error().unwrap_or(libc::EIO);
+                self.last_errno = Some(errno);
+                if errno == libc::EINTR {
+                    return Ok(SetupCleanupProgress::Pending);
+                }
+                self.state = Ambiguous(errno);
+                return Err(anyhow::Error::new(error).context(format!(
+                    "setup waitid pidfd for {} (initial stop {})",
+                    self.pid, self.initial_stop
+                )));
+            }
+        };
+        let observed_pid = unsafe { info.si_pid() };
+        if observed_pid == 0 {
+            if self.state == Continued || self.state == Released {
+                self.state = Detached;
+                return Ok(SetupCleanupProgress::Resolved(
+                    TargetDisposition::Detached { pid: self.pid },
+                ));
+            }
+            return Ok(SetupCleanupProgress::Pending);
         }
-        if libc::WIFSIGNALED(status) {
-            return Ok(ChildQuery::Exited(128 + libc::WTERMSIG(status)));
+        if observed_pid != self.pid as i32 {
+            self.state = Ambiguous(libc::ECHILD);
+            anyhow::bail!("setup waitid returned a different child identity");
         }
-        if libc::WIFSTOPPED(status) {
-            return Ok(ChildQuery::Stopped);
+        if matches!(
+            info.si_code,
+            libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED
+        ) {
+            let receipt = ChildExitReceipt {
+                reason: info.si_code,
+                status: unsafe { info.si_status() },
+            };
+            if let ExitObserved(expected) = self.state {
+                if expected != receipt {
+                    self.state = Ambiguous(libc::ECHILD);
+                    anyhow::bail!("setup consuming exit did not match retained receipt");
+                }
+                self.state = Reaped(receipt.code());
+                return Ok(SetupCleanupProgress::Resolved(TargetDisposition::Exited {
+                    code: receipt.code(),
+                }));
+            }
+            self.state = ExitObserved(receipt);
+            return Ok(SetupCleanupProgress::Pending);
         }
-        return Ok(ChildQuery::Running);
+        if consuming {
+            self.state = Ambiguous(libc::ECHILD);
+            anyhow::bail!("setup consuming exit returned a non-exit event");
+        }
+        match self.state {
+            Held | Continued => match info.si_code {
+                libc::CLD_STOPPED | libc::CLD_TRAPPED => {
+                    self.state = Held;
+                    match setup_pidfd_signal(&self.pidfd, libc::SIGKILL) {
+                        Ok(()) => self.state = KillRequested,
+                        Err(error) => {
+                            let errno = error.raw_os_error().unwrap_or(libc::EIO);
+                            self.last_errno = Some(errno);
+                            // Only interrupted delivery may retry, and only after
+                            // another fresh stopped query. Never retry numeric PID.
+                            if errno != libc::EINTR {
+                                self.state = Ambiguous(errno);
+                            }
+                            return Err(anyhow::Error::new(error)
+                                .context(format!("setup pidfd SIGKILL for {}", self.pid)));
+                        }
+                    }
+                }
+                libc::CLD_CONTINUED if self.state == Continued => {
+                    self.state = Detached;
+                    return Ok(SetupCleanupProgress::Resolved(
+                        TargetDisposition::Detached { pid: self.pid },
+                    ));
+                }
+                libc::CLD_CONTINUED => self.state = Continued,
+                _ => {}
+            },
+            Released => {
+                self.state = Detached;
+                return Ok(SetupCleanupProgress::Resolved(
+                    TargetDisposition::Detached { pid: self.pid },
+                ));
+            }
+            // KillRequested and permanent signal failures only query for an exit.
+            KillRequested | Ambiguous(_) => {}
+            _ => unreachable!("terminal/exit state handled above"),
+        }
+        Ok(SetupCleanupProgress::Pending)
     }
 }
 
@@ -154,30 +331,6 @@ fn reap_once(pid: u32) -> anyhow::Result<Option<i32>> {
             return Ok(Some(128 + libc::WTERMSIG(status)));
         }
         return Ok(None);
-    }
-}
-
-/// Blocking reap for a child known to be dying (SIGKILL was sent):
-/// the only owner waits until it is gone. EINTR retries.
-fn reap_blocking(pid: u32) -> anyhow::Result<i32> {
-    loop {
-        let mut status = 0;
-        let r = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
-        if r < 0 {
-            let e = std::io::Error::last_os_error();
-            if e.raw_os_error() == Some(libc::EINTR) {
-                continue;
-            }
-            return Err(anyhow::Error::new(e).context(format!("waitpid {pid}")));
-        }
-        if libc::WIFEXITED(status) {
-            return Ok(libc::WEXITSTATUS(status));
-        }
-        if libc::WIFSIGNALED(status) {
-            return Ok(128 + libc::WTERMSIG(status));
-        }
-        // No WUNTRACED: stops are not reported; anything else means
-        // keep waiting for the death we caused.
     }
 }
 
@@ -1440,6 +1593,7 @@ pub fn __test_set_rename_hold_ready(ready: Option<Arc<AtomicBool>>) {
 struct PrestopGuard {
     pid: u32,
     armed: bool,
+    pidfd: Option<OwnedFd>,
 }
 
 /// How long the pre-stop guard waits to reap a SIGKILLed child before
@@ -1497,9 +1651,9 @@ impl PrestopGuard {
     /// kill failure) and reap errors propagate — nothing dissolves into
     /// `None`.
     fn kill_and_reap(&mut self) -> anyhow::Result<GuardCleanup> {
-        let killed = unsafe { libc::kill(self.pid as libc::pid_t, libc::SIGKILL) } == 0;
-        if !killed {
-            let e = std::io::Error::last_os_error();
+        let signal = self.kill();
+        let killed = signal.is_ok();
+        if let Err(e) = signal {
             if e.raw_os_error() != Some(libc::ESRCH) {
                 anyhow::bail!("SIGKILL to owned child {} failed: {e}", self.pid);
             }
@@ -1562,6 +1716,18 @@ impl PrestopGuard {
         }
     }
 
+    fn kill(&self) -> std::io::Result<()> {
+        if let Some(pidfd) = &self.pidfd {
+            setup_pidfd_signal(pidfd, libc::SIGKILL)
+        } else if unsafe { libc::kill(self.pid as libc::pid_t, libc::SIGKILL) } == 0 {
+            // Only the guarded pidfd-open failure path lacks a pidfd. This is
+            // the pre-existing confirmed failure cleanup, never an adapter
+            // fallback after an identity-bound wait or signal has failed.
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
     fn disarm(&mut self) {
         self.armed = false;
     }
@@ -1573,9 +1739,7 @@ impl Drop for PrestopGuard {
             return;
         }
         self.armed = false;
-        unsafe {
-            libc::kill(self.pid as libc::pid_t, libc::SIGKILL);
-        }
+        let _ = self.kill();
         let end = Instant::now() + Duration::from_millis(200);
         while Instant::now() < end {
             match reap_once(self.pid) {
@@ -1910,7 +2074,20 @@ impl OwnedTarget {
         // Custody starts IMMEDIATELY at the fork return — before the
         // parent's sink copy is disposed (a FUSE close can block) and
         // before the wait.
-        let mut guard = PrestopGuard { pid, armed: true };
+        let mut guard = PrestopGuard {
+            pid,
+            armed: true,
+            pidfd: None,
+        };
+        match setup_pidfd_open(pid) {
+            Ok(fd) => guard.pidfd = Some(fd),
+            Err(error) => {
+                let report = guard_cleanup_report(&mut guard);
+                return Err(anyhow::Error::new(error).context(format!(
+                    "pidfd_open owned child {pid}; owned child {pid} {report}"
+                )));
+            }
+        };
         // Release the parent's raw sink borrow to its existing worker
         // (the child inherited its own descriptor), with custody already
         // armed. A blocked worker close cannot block setup past control.
@@ -1952,45 +2129,72 @@ impl OwnedTarget {
                 let report = guard_cleanup_report(&mut guard);
                 anyhow::bail!("pre-stop setup deadline exceeded; owned child {pid} {report}");
             }
-            let mut status = 0;
-            let r = unsafe {
-                libc::waitpid(
-                    pid as libc::pid_t,
-                    &mut status,
-                    libc::WNOHANG | libc::WUNTRACED,
-                )
+            let info = match setup_waitid(
+                libc::P_PID,
+                pid,
+                libc::WSTOPPED | libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            ) {
+                Ok(info) => info,
+                Err(error) if error.raw_os_error() == Some(libc::EINTR) => continue,
+                Err(error) => {
+                    let report = guard_cleanup_report(&mut guard);
+                    return Err(anyhow::Error::new(error)
+                        .context(format!("waitid {pid}; owned child {pid} {report}")));
+                }
             };
-            if r == 0 {
+            if unsafe { info.si_pid() } == 0 {
                 std::thread::sleep(Duration::from_millis(1));
                 continue;
             }
-            if r < 0 {
-                let e = std::io::Error::last_os_error();
-                if e.raw_os_error() == Some(libc::EINTR) {
-                    continue;
-                }
-                let report = guard_cleanup_report(&mut guard);
-                return Err(anyhow::Error::new(e)
-                    .context(format!("waitpid {pid}; owned child {pid} {report}")));
-            }
-            if libc::WIFSTOPPED(status) {
+            if matches!(info.si_code, libc::CLD_STOPPED | libc::CLD_TRAPPED) {
+                let initial_stop = unsafe { info.si_status() };
                 guard.disarm();
                 return Ok(OwnedTarget {
                     pid,
                     state: CustodyState::Stopped,
                     exit_code: None,
+                    setup: Some(OwnedSetupCleanup {
+                        pid,
+                        pidfd: guard.pidfd.take().expect("guard retained pidfd"),
+                        initial_stop,
+                        state: SetupChildState::Held,
+                        last_errno: None,
+                    }),
                 });
             }
-            // Reaped by this waitpid: disarm (nothing left to kill)
-            // and report the status.
-            guard.disarm();
-            let code = if libc::WIFEXITED(status) {
-                libc::WEXITSTATUS(status)
-            } else if libc::WIFSIGNALED(status) {
-                128 + libc::WTERMSIG(status)
-            } else {
-                status
+            let receipt = ChildExitReceipt {
+                reason: info.si_code,
+                status: unsafe { info.si_status() },
             };
+            // Exit observation is not reap. Consume the exact identity/status
+            // while guarded; a failed consume never fabricates a receipt.
+            let consumed = match setup_waitid(
+                libc::P_PIDFD,
+                guard
+                    .pidfd
+                    .as_ref()
+                    .expect("guard retained pidfd")
+                    .as_raw_fd() as u32,
+                libc::WEXITED | libc::WNOHANG,
+            ) {
+                Ok(consumed) => consumed,
+                Err(error) if error.raw_os_error() == Some(libc::EINTR) => continue,
+                Err(error) => {
+                    let report = guard_cleanup_report(&mut guard);
+                    return Err(anyhow::Error::new(error).context(format!(
+                        "consume initial exit {pid}; owned child {pid} {report}"
+                    )));
+                }
+            };
+            if unsafe { consumed.si_pid() } != pid as i32
+                || consumed.si_code != receipt.reason
+                || unsafe { consumed.si_status() } != receipt.status
+            {
+                let report = guard_cleanup_report(&mut guard);
+                anyhow::bail!("initial child exit receipt changed; owned child {pid} {report}");
+            }
+            guard.disarm();
+            let code = receipt.code();
             // H9: 126 is ours alone (stdio setup failure — nothing
             // else exits pre-stop with it). Name the destination:
             // never silent null when the operator asked for the log.
@@ -2048,12 +2252,29 @@ impl OwnedTarget {
         if self.state != CustodyState::Stopped {
             anyhow::bail!("release: not stopped (state {:?})", self.state);
         }
-        let r = unsafe { libc::kill(self.pid as libc::pid_t, libc::SIGCONT) };
-        if r == 0 {
+        let setup = self
+            .setup
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("release missing child identity"))?;
+        let info = setup_waitid(
+            libc::P_PIDFD,
+            setup.pidfd.as_raw_fd() as u32,
+            libc::WEXITED | libc::WSTOPPED | libc::WCONTINUED | libc::WNOHANG | libc::WNOWAIT,
+        )?;
+        if unsafe { info.si_pid() } != self.pid as i32
+            || !matches!(info.si_code, libc::CLD_STOPPED | libc::CLD_TRAPPED)
+        {
+            // The final check owns this child's wait slot, and does not turn
+            // silence or a historical stop into authority to release it.
+            let _ = self.poll_exit()?;
+            anyhow::bail!("release: child no longer has a retained stopped receipt");
+        }
+        let signal = setup_pidfd_signal(&setup.pidfd, libc::SIGCONT);
+        if signal.is_ok() {
             self.state = CustodyState::Released;
             return Ok(());
         }
-        let e = std::io::Error::last_os_error();
+        let e = signal.unwrap_err();
         if let Ok(Some(code)) = reap_once(self.pid) {
             self.exit_code = Some(code);
             self.state = CustodyState::Reaped;
@@ -2081,6 +2302,24 @@ impl OwnedTarget {
         }
     }
 
+    /// Transfer exact pre-release child custody without running the old blocking
+    /// cleanup path. The cleanup worker must retain Pending and error outcomes.
+    pub(crate) fn into_setup_cleanup(mut self) -> OwnedSetupCleanup {
+        let mut cleanup = self
+            .setup
+            .take()
+            .expect("spawned target retains pidfd custody");
+        cleanup.state = match self.state {
+            CustodyState::Stopped => cleanup.state,
+            CustodyState::Released => SetupChildState::Released,
+            CustodyState::Reaped => SetupChildState::Reaped(self.exit_code.expect("reaped status")),
+            CustodyState::Detached => SetupChildState::Detached,
+        };
+        // Self's backstop no longer owns the child; the adapter alone does.
+        self.state = CustodyState::Detached;
+        cleanup
+    }
+
     /// Resolve custody after a setup failure: a never-released child
     /// is terminated and reaped (`Stopped` → `Reaped`); a released
     /// child is reaped when already exited, else detached and left
@@ -2102,25 +2341,23 @@ impl OwnedTarget {
                 }
                 Ok(())
             }
-            CustodyState::Stopped => match query_child(self.pid)? {
-                ChildQuery::Stopped => {
-                    unsafe {
-                        libc::kill(self.pid as libc::pid_t, libc::SIGKILL);
+            CustodyState::Stopped => loop {
+                let progress = self
+                    .setup
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("missing setup child custody"))?
+                    .step()?;
+                match progress {
+                    SetupCleanupProgress::Pending => std::thread::sleep(Duration::from_millis(1)),
+                    SetupCleanupProgress::Resolved(TargetDisposition::Exited { code }) => {
+                        self.exit_code = Some(code);
+                        self.state = CustodyState::Reaped;
+                        return Ok(());
                     }
-                    let code = reap_blocking(self.pid)?;
-                    self.exit_code = Some(code);
-                    self.state = CustodyState::Reaped;
-                    Ok(())
-                }
-                ChildQuery::Exited(code) => {
-                    self.exit_code = Some(code);
-                    self.state = CustodyState::Reaped;
-                    Ok(())
-                }
-                // Alive but not stopped: leave it running.
-                ChildQuery::Running => {
-                    self.state = CustodyState::Detached;
-                    Ok(())
+                    SetupCleanupProgress::Resolved(TargetDisposition::Detached { .. }) => {
+                        self.state = CustodyState::Detached;
+                        return Ok(());
+                    }
                 }
             },
         }
@@ -2182,32 +2419,28 @@ impl Drop for OwnedTarget {
                 }
             }
             CustodyState::Stopped => {
-                // Only a kernel-confirmed stopped child is signaled; a
-                // running child is left alone, an error (ECHILD: reaped
-                // elsewhere) has nothing left to do.
-                match query_child(self.pid) {
-                    Ok(ChildQuery::Exited(code)) => {
-                        self.exit_code = Some(code);
-                        self.state = CustodyState::Reaped;
-                    }
-                    Ok(ChildQuery::Stopped) => {
-                        unsafe {
-                            libc::kill(self.pid as libc::pid_t, libc::SIGKILL);
+                let end = Instant::now() + Duration::from_millis(200);
+                while Instant::now() < end {
+                    let Some(cleanup) = self.setup.as_mut() else {
+                        return;
+                    };
+                    match cleanup.step() {
+                        Ok(SetupCleanupProgress::Resolved(TargetDisposition::Exited { code })) => {
+                            self.exit_code = Some(code);
+                            self.state = CustodyState::Reaped;
+                            return;
                         }
-                        let end = Instant::now() + Duration::from_millis(200);
-                        while Instant::now() < end {
-                            match reap_once(self.pid) {
-                                Ok(Some(code)) => {
-                                    self.exit_code = Some(code);
-                                    self.state = CustodyState::Reaped;
-                                    return;
-                                }
-                                Ok(None) => std::thread::sleep(Duration::from_millis(1)),
-                                Err(_) => return,
-                            }
+                        Ok(SetupCleanupProgress::Resolved(TargetDisposition::Detached {
+                            ..
+                        })) => {
+                            self.state = CustodyState::Detached;
+                            return;
                         }
+                        Ok(SetupCleanupProgress::Pending) => {
+                            std::thread::sleep(Duration::from_millis(1))
+                        }
+                        Err(_) => return,
                     }
-                    _ => {}
                 }
             }
             CustodyState::Reaped | CustodyState::Detached => {}
@@ -2230,13 +2463,20 @@ mod control_tests {
 
     #[test]
     fn g1_target_wait_errors_keep_original_errno() {
-        // The current process is never its own child. These waitpid calls
+        // The current process is never its own child. These wait calls
         // return ECHILD immediately, without signals or reaping another task.
         let own_pid = std::process::id();
         let errors = [
             super::reap_once(own_pid).err().unwrap(),
-            super::query_child(own_pid).err().unwrap(),
-            super::reap_blocking(own_pid).err().unwrap(),
+            anyhow::Error::from(
+                super::setup_waitid(
+                    libc::P_PID,
+                    own_pid,
+                    libc::WEXITED | libc::WSTOPPED | libc::WNOHANG | libc::WNOWAIT,
+                )
+                .err()
+                .unwrap(),
+            ),
         ];
         for error in errors {
             assert_eq!(
@@ -2255,6 +2495,7 @@ mod control_tests {
             pid: std::process::id(),
             state: super::CustodyState::Reaped,
             exit_code: None,
+            setup: None,
         };
         assert!(
             target.finish_observation().is_err(),
@@ -3683,5 +3924,332 @@ mod control_tests {
         super::registry_remove_if(&key, id);
         let id2 = super::registry_try_insert(&key).expect("double reclaim must stay idempotent");
         super::registry_remove_if(&key, id2);
+    }
+}
+
+#[cfg(test)]
+mod setup_cleanup_tests {
+    use super::*;
+
+    // Test custody is independent of the component under test: even an
+    // assertion unwind settles only this child's retained pidfd and wait slot.
+    struct Child(OwnedSetupCleanup);
+    impl Child {
+        fn spawn() -> Self {
+            SETUP_SYSCALL_FAULTS.with(|f| *f.borrow_mut() = SetupSyscallFaults::default());
+            Self(
+                OwnedTarget::spawn_stopped(&["/bin/sleep".into(), "30".into()], WorkloadDest::Null)
+                    .unwrap()
+                    .into_setup_cleanup(),
+            )
+        }
+        fn signal(&self, signal: i32) {
+            let r = unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    self.0.pidfd.as_raw_fd(),
+                    signal,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                )
+            };
+            assert_eq!(r, 0, "exact-owned test signal");
+        }
+        fn event(&self, code: i32) {
+            let end = Instant::now() + Duration::from_secs(2);
+            loop {
+                let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+                let r = unsafe {
+                    libc::waitid(
+                        libc::P_PIDFD,
+                        self.0.pidfd.as_raw_fd() as u32,
+                        &mut info,
+                        libc::WEXITED
+                            | libc::WSTOPPED
+                            | libc::WCONTINUED
+                            | libc::WNOWAIT
+                            | libc::WNOHANG,
+                    )
+                };
+                assert_eq!(r, 0);
+                if unsafe { info.si_pid() } != 0 && info.si_code == code {
+                    return;
+                }
+                assert!(Instant::now() < end, "child event {code} not observed");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        fn resolve(&mut self) -> TargetDisposition {
+            let end = Instant::now() + Duration::from_secs(2);
+            loop {
+                match self.0.step().unwrap() {
+                    SetupCleanupProgress::Resolved(receipt) => return receipt,
+                    SetupCleanupProgress::Pending => {}
+                }
+                assert!(Instant::now() < end, "child cleanup did not resolve");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+    impl Drop for Child {
+        fn drop(&mut self) {
+            SETUP_SYSCALL_FAULTS.with(|f| *f.borrow_mut() = SetupSyscallFaults::default());
+            // Both signal and consuming wait use the retained pidfd, including
+            // after another waiter has already consumed this child's exit.
+            unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    self.0.pidfd.as_raw_fd(),
+                    libc::SIGKILL,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                );
+            }
+            let end = Instant::now() + Duration::from_secs(2);
+            loop {
+                let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+                let r = unsafe {
+                    libc::waitid(
+                        libc::P_PIDFD,
+                        self.0.pidfd.as_raw_fd() as u32,
+                        &mut info,
+                        libc::WEXITED | libc::WNOHANG,
+                    )
+                };
+                if (r == 0 && unsafe { info.si_pid() } != 0)
+                    || (r < 0
+                        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD))
+                {
+                    return;
+                }
+                if Instant::now() >= end {
+                    eprintln!("UNRESOLVED exact-owned test child {}", self.0.pid);
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+    fn calls() -> (usize, usize) {
+        SETUP_SYSCALL_FAULTS.with(|f| {
+            let f = f.borrow();
+            (f.waits, f.signals)
+        })
+    }
+    fn reset_calls() {
+        SETUP_SYSCALL_FAULTS.with(|f| {
+            f.borrow_mut().waits = 0;
+            f.borrow_mut().signals = 0;
+        });
+    }
+    #[test]
+    fn w079_retained_stop_and_cleanup_table() {
+        let mut child = Child::spawn();
+        let foreign = Child::spawn();
+        assert_eq!(child.0.initial_stop, libc::SIGSTOP);
+        for _ in 0..3 {
+            child.event(libc::CLD_STOPPED);
+        }
+        reset_calls();
+        assert_eq!(child.0.step().unwrap(), SetupCleanupProgress::Pending);
+        assert_eq!(child.0.state, SetupChildState::KillRequested);
+        assert_eq!(calls(), (1, 1));
+        assert_eq!(child.resolve(), TargetDisposition::Exited { code: 137 });
+        let before = calls();
+        for _ in 0..3 {
+            assert_eq!(
+                child.0.step().unwrap(),
+                SetupCleanupProgress::Resolved(TargetDisposition::Exited { code: 137 })
+            );
+        }
+        assert_eq!(calls(), before, "terminal receipt performs no syscall");
+        foreign.event(libc::CLD_STOPPED); // Cleanup never touched a foreign child.
+        drop((child, foreign));
+
+        // Silence and interrupted waits do not turn a historical stop into
+        // current signal authority; one step performs at most one query.
+        let mut child = Child::spawn();
+        for errno in [None, Some(libc::EINTR)] {
+            SETUP_SYSCALL_FAULTS.with(|f| {
+                let mut f = f.borrow_mut();
+                f.no_event = errno.is_none();
+                f.wait_errno = errno;
+            });
+            reset_calls();
+            assert_eq!(child.0.step().unwrap(), SetupCleanupProgress::Pending);
+            assert_eq!(calls(), (1, 0));
+            assert_eq!(child.0.state, SetupChildState::Held);
+        }
+        assert_eq!(child.resolve(), TargetDisposition::Exited { code: 137 });
+        drop(child);
+
+        // No kill retry follows successful delivery, even if another stopped
+        // record is returned while death is pending.
+        let mut child = Child::spawn();
+        child.0.state = SetupChildState::KillRequested;
+        reset_calls();
+        assert_eq!(child.0.step().unwrap(), SetupCleanupProgress::Pending);
+        assert_eq!(calls(), (1, 0));
+        child.signal(libc::SIGKILL);
+        child.event(libc::CLD_KILLED);
+        assert_eq!(child.0.step().unwrap(), SetupCleanupProgress::Pending);
+        assert!(matches!(child.0.state, SetupChildState::ExitObserved(_)));
+        for errno in [None, Some(libc::EINTR)] {
+            SETUP_SYSCALL_FAULTS.with(|f| {
+                let mut f = f.borrow_mut();
+                f.no_event = errno.is_none();
+                f.wait_errno = errno;
+            });
+            assert_eq!(child.0.step().unwrap(), SetupCleanupProgress::Pending);
+            assert!(matches!(child.0.state, SetupChildState::ExitObserved(_)));
+        }
+        assert_eq!(child.resolve(), TargetDisposition::Exited { code: 137 });
+    }
+    #[test]
+    fn w079_continued_recheck_includes_new_stop() {
+        for restop in [false, true] {
+            let mut child = Child::spawn();
+            child.signal(libc::SIGCONT);
+            child.event(libc::CLD_CONTINUED);
+            assert_eq!(child.0.step().unwrap(), SetupCleanupProgress::Pending);
+            assert_eq!(child.0.state, SetupChildState::Continued);
+            if restop {
+                child.signal(libc::SIGSTOP);
+                child.event(libc::CLD_STOPPED);
+                assert_eq!(child.0.step().unwrap(), SetupCleanupProgress::Pending);
+                assert_eq!(child.0.state, SetupChildState::KillRequested);
+                assert_eq!(child.resolve(), TargetDisposition::Exited { code: 137 });
+            } else {
+                assert_eq!(
+                    child.0.step().unwrap(),
+                    SetupCleanupProgress::Resolved(TargetDisposition::Detached {
+                        pid: child.0.pid
+                    })
+                );
+                let before = calls();
+                assert_eq!(
+                    child.0.step().unwrap(),
+                    SetupCleanupProgress::Resolved(TargetDisposition::Detached {
+                        pid: child.0.pid
+                    })
+                );
+                assert_eq!(calls(), before);
+            }
+        }
+    }
+    #[test]
+    fn w079_natural_exit_is_observed_then_exactly_consumed() {
+        let target = OwnedTarget::spawn_stopped(
+            &["/bin/sh".into(), "-c".into(), "exit 23".into()],
+            WorkloadDest::Null,
+        )
+        .unwrap();
+        let mut child = Child(target.into_setup_cleanup());
+        child.signal(libc::SIGCONT);
+        child.event(libc::CLD_EXITED);
+        reset_calls();
+        assert_eq!(child.0.step().unwrap(), SetupCleanupProgress::Pending);
+        assert_eq!(
+            child.0.state,
+            SetupChildState::ExitObserved(ChildExitReceipt {
+                reason: libc::CLD_EXITED,
+                status: 23,
+            })
+        );
+        assert_eq!(calls(), (1, 0));
+        assert_eq!(
+            child.0.step().unwrap(),
+            SetupCleanupProgress::Resolved(TargetDisposition::Exited { code: 23 })
+        );
+        assert_eq!(calls(), (2, 0));
+    }
+    #[test]
+    fn w079_signal_faults_keep_identity_and_errno() {
+        for errno in [libc::ESRCH, libc::EINTR, libc::EPERM] {
+            let mut child = Child::spawn();
+            SETUP_SYSCALL_FAULTS.with(|f| f.borrow_mut().signal_errno = Some(errno));
+            reset_calls();
+            let error = child.0.step().unwrap_err();
+            assert_eq!(
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .unwrap()
+                    .raw_os_error(),
+                Some(errno)
+            );
+            assert_eq!(child.0.last_errno, Some(errno));
+            assert_eq!(calls(), (1, 1));
+            assert_ne!(child.0.state, SetupChildState::KillRequested);
+            child.event(libc::CLD_STOPPED);
+            reset_calls();
+            assert_eq!(child.0.step().unwrap(), SetupCleanupProgress::Pending);
+            assert_eq!(calls(), (1, usize::from(errno == libc::EINTR)));
+            if errno != libc::EINTR {
+                child.signal(libc::SIGKILL);
+            }
+            assert_eq!(child.resolve(), TargetDisposition::Exited { code: 137 });
+        }
+    }
+    #[test]
+    fn w079_echild_never_signals_or_fabricates_status() {
+        let mut child = Child::spawn();
+        // An actual competing wait consumer reaps this exact child first.
+        child.signal(libc::SIGKILL);
+        child.event(libc::CLD_KILLED);
+        let mut status = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(child.0.pid as i32, &mut status, libc::WNOHANG) },
+            child.0.pid as i32
+        );
+        reset_calls();
+        for _ in 0..2 {
+            let error = child.0.step().unwrap_err();
+            assert_eq!(
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .unwrap()
+                    .raw_os_error(),
+                Some(libc::ECHILD)
+            );
+        }
+        assert_eq!(calls(), (1, 0));
+        assert_eq!(child.0.state, SetupChildState::Ambiguous(libc::ECHILD));
+    }
+    #[test]
+    fn w079_pidfd_open_failure_remains_guarded() {
+        let pid = Arc::new(AtomicU32::new(0));
+        __test_set_prestop_pid_sink(Some(Arc::clone(&pid)));
+        SETUP_SYSCALL_FAULTS.with(|f| f.borrow_mut().open_errno = Some(libc::EMFILE));
+        let result =
+            OwnedTarget::spawn_stopped(&["/bin/sleep".into(), "30".into()], WorkloadDest::Null);
+        __test_set_prestop_pid_sink(None);
+        // Always settle an unexpected success before checking the result.
+        let error = match result {
+            Ok(target) => {
+                drop(Child(target.into_setup_cleanup()));
+                None
+            }
+            Err(error) => Some(error),
+        };
+        let error = error.expect("pidfd-open failure must not return an app target");
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .raw_os_error(),
+            Some(libc::EMFILE)
+        );
+        assert!(format!("{error:#}").contains("killed and reaped"));
+        let pid = pid.load(Ordering::SeqCst);
+        assert_ne!(pid, 0);
+        let mut status = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
     }
 }

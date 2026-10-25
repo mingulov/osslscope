@@ -339,6 +339,8 @@ pub struct CleanupProgress {
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForkBlocked {
+    SetupReserved,
+    PrefixClosed,
     Deadline,
     ActiveEpoch,
     PrefixAfterEpoch,

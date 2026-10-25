@@ -3673,3 +3673,41 @@ fn g1_inherited_cloexec_reference_keeps_pipe_live_until_release_and_reap() {
     drop(read);
     assert_reaped_no_zombie(pid as u32);
 }
+
+#[test]
+fn w079_retained_stop_and_cleanup_table() {
+    let mut child =
+        OwnedTarget::spawn_stopped(&["/bin/sleep".into(), "30".into()], WorkloadDest::Null)
+            .unwrap();
+    let pid = child.pid();
+    let mut stops = Vec::new();
+    for _ in 0..3 {
+        let poll = child.poll_exit();
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let r = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid,
+                &mut info,
+                libc::WSTOPPED | libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        stops.push((poll.ok().flatten(), r, info.si_code, unsafe {
+            info.si_pid()
+        }));
+    }
+    // Settle the exact owned child before any assertion can unwind.
+    let cleanup = child.resolve_setup_failure();
+    let reaped = child.exit_code();
+    drop(child);
+    assert!(cleanup.is_ok(), "{cleanup:?}");
+    assert_eq!(reaped, Some(137));
+    for receipt in stops {
+        assert_eq!(
+            receipt,
+            (None, 0, libc::CLD_STOPPED, pid as i32),
+            "spawn/poll must leave the initial stop available as fresh kernel evidence"
+        );
+    }
+    assert_reaped_no_zombie(pid);
+}

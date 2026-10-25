@@ -30,6 +30,163 @@ struct BarrierState {
     retired: Option<OwnerEpoch>,
     sealed: bool,
     unresolved: bool,
+    prefix_closed: bool,
+    setup_serial: u64,
+    setup: Option<SetupReservation>,
+}
+struct SetupReservation {
+    id: u64,
+    deadline: Option<Instant>,
+    prefix_closed: bool,
+    count_reserved: bool,
+    aborted: bool,
+}
+/// Retained exclusion for one owned setup, independent of scoped fork permits.
+/// The controller and worker retain Arcs until both have disposed their custody.
+pub(crate) struct SetupBarrierLease {
+    barrier: Arc<CountForkBarrier>,
+    id: u64,
+}
+/// A worker scope seals prefix admission on error, cancellation or unwind.
+pub(crate) struct SetupPrefixPhase<'a>(&'a SetupBarrierLease);
+impl Drop for SetupPrefixPhase<'_> {
+    fn drop(&mut self) {
+        self.0.close_prefix();
+    }
+}
+/// Non-clone reservation held across fallible Count preflight.
+pub(crate) struct CountSetupAdmission {
+    barrier: Arc<CountForkBarrier>,
+    id: u64,
+    armed: bool,
+}
+impl Drop for CountSetupAdmission {
+    fn drop(&mut self) {
+        if self.armed {
+            let mut state = locked(&self.barrier.state);
+            if let Some(setup) = state.setup.as_mut().filter(|s| s.id == self.id) {
+                setup.aborted = true;
+                setup.count_reserved = false;
+            }
+            self.barrier.changed.notify_all();
+        }
+    }
+}
+impl SetupBarrierLease {
+    pub(crate) fn prefix_phase(&self) -> SetupPrefixPhase<'_> {
+        SetupPrefixPhase(self)
+    }
+    pub(crate) fn prefix_permit(
+        &self,
+        deadline: Instant,
+    ) -> Result<CountForkPermit<'_>, ForkBlocked> {
+        let mut state = locked(&self.barrier.state);
+        if state.unresolved {
+            return Err(ForkBlocked::Unresolved);
+        }
+        let setup = state
+            .setup
+            .as_mut()
+            .filter(|s| s.id == self.id)
+            .ok_or(ForkBlocked::SetupReserved)?;
+        if setup.prefix_closed || setup.aborted {
+            return Err(ForkBlocked::PrefixClosed);
+        }
+        // The first real fork establishes the attempt's acquisition deadline;
+        // later scopes may shorten it but can never extend it.
+        setup.deadline = Some(setup.deadline.map_or(deadline, |prior| prior.min(deadline)));
+        let deadline = setup.deadline.expect("deadline just stored");
+        if Instant::now() >= deadline {
+            return Err(ForkBlocked::Deadline);
+        }
+        state.permits = state
+            .permits
+            .checked_add(1)
+            .ok_or(ForkBlocked::IdExhausted)?;
+        Ok(CountForkPermit {
+            barrier: &self.barrier,
+        })
+    }
+    pub(crate) fn close_prefix(&self) {
+        let mut state = locked(&self.barrier.state);
+        if let Some(setup) = state.setup.as_mut().filter(|s| s.id == self.id) {
+            setup.prefix_closed = true;
+            state.prefix_closed = true;
+        }
+        self.barrier.changed.notify_all();
+    }
+    pub(crate) fn abort(&self) {
+        let mut state = locked(&self.barrier.state);
+        if let Some(setup) = state.setup.as_mut().filter(|s| s.id == self.id) {
+            setup.prefix_closed = true;
+            setup.aborted = true;
+            state.prefix_closed = true;
+        }
+        self.barrier.changed.notify_all();
+    }
+    /// Called only after worker and cleanup disposal have both acknowledged.
+    /// Retirement never grants this barrier another setup or Count attempt.
+    pub(crate) fn complete_abort(&self) -> Result<(), OwnerFailure> {
+        let mut state = locked(&self.barrier.state);
+        let setup = state
+            .setup
+            .as_ref()
+            .filter(|s| s.id == self.id)
+            .ok_or_else(setup_capacity)?;
+        if !setup.aborted || setup.count_reserved || state.permits != 0 {
+            return Err(setup_capacity());
+        }
+        state.setup = None;
+        state.prefix_closed = true;
+        self.barrier.changed.notify_all();
+        Ok(())
+    }
+    pub(crate) fn reserve_count(&self) -> Result<CountSetupAdmission, OwnerFailure> {
+        let mut state = locked(&self.barrier.state);
+        if state.unresolved || state.permits != 0 {
+            return Err(setup_capacity());
+        }
+        let setup = state
+            .setup
+            .as_mut()
+            .filter(|s| s.id == self.id)
+            .ok_or_else(setup_capacity)?;
+        if !setup.prefix_closed || setup.aborted || setup.count_reserved {
+            return Err(setup_capacity());
+        }
+        let deadline = setup.deadline.ok_or_else(|| {
+            OwnerFailure::engine(CountOperation::Load, FailureClass::InvalidInput)
+        })?;
+        if Instant::now() >= deadline {
+            return Err(OwnerFailure::engine(
+                CountOperation::Load,
+                FailureClass::Deadline,
+            ));
+        }
+        setup.count_reserved = true;
+        Ok(CountSetupAdmission {
+            barrier: Arc::clone(&self.barrier),
+            id: self.id,
+            armed: true,
+        })
+    }
+}
+impl Drop for SetupBarrierLease {
+    fn drop(&mut self) {
+        let mut state = locked(&self.barrier.state);
+        if state.setup.as_ref().is_some_and(|s| s.id == self.id) {
+            state.prefix_closed = true;
+            state.unresolved = true;
+            if let Some(setup) = state.setup.as_mut() {
+                setup.aborted = true;
+                setup.prefix_closed = true;
+            }
+            self.barrier.changed.notify_all();
+        }
+    }
+}
+fn setup_capacity() -> OwnerFailure {
+    OwnerFailure::engine(CountOperation::Load, FailureClass::Capacity)
 }
 /// Allocate before the product's prefix forks and share with the later engine.
 #[derive(Default)]
@@ -50,6 +207,69 @@ impl Drop for CountForkPermit<'_> {
 impl CountForkBarrier {
     pub fn new() -> Self {
         Self::default()
+    }
+    pub(crate) fn reserve_setup(self: &Arc<Self>) -> Result<SetupBarrierLease, ForkBlocked> {
+        let mut state = locked(&self.state);
+        if state.unresolved {
+            return Err(ForkBlocked::Unresolved);
+        }
+        if state.prefix_closed || state.ever_started {
+            return Err(ForkBlocked::PrefixClosed);
+        }
+        if state.setup.is_some() || state.active.is_some() || state.permits != 0 {
+            return Err(ForkBlocked::SetupReserved);
+        }
+        state.setup_serial = state
+            .setup_serial
+            .checked_add(1)
+            .ok_or(ForkBlocked::IdExhausted)?;
+        let id = state.setup_serial;
+        state.setup = Some(SetupReservation {
+            id,
+            deadline: None,
+            prefix_closed: false,
+            count_reserved: false,
+            aborted: false,
+        });
+        Ok(SetupBarrierLease {
+            barrier: Arc::clone(self),
+            id,
+        })
+    }
+    pub(crate) fn admit_setup(
+        &self,
+        mut token: CountSetupAdmission,
+        epoch: OwnerEpoch,
+    ) -> Result<(), OwnerFailure> {
+        if !std::ptr::eq(self, Arc::as_ptr(&token.barrier)) {
+            return Err(setup_capacity());
+        }
+        let mut state = locked(&self.state);
+        let setup = state
+            .setup
+            .as_ref()
+            .filter(|s| s.id == token.id)
+            .ok_or_else(setup_capacity)?;
+        if state.unresolved
+            || state.active.is_some()
+            || state.permits != 0
+            || !setup.count_reserved
+            || setup.aborted
+            || !setup.prefix_closed
+        {
+            return Err(setup_capacity());
+        }
+        if Instant::now() >= setup.deadline.ok_or_else(setup_capacity)? {
+            return Err(OwnerFailure::engine(
+                CountOperation::Load,
+                FailureClass::Deadline,
+            ));
+        }
+        state.setup = None;
+        state.active = Some(epoch);
+        state.sealed = false;
+        token.armed = false;
+        Ok(())
     }
     pub fn prefix_permit(&self, deadline: Instant) -> Result<CountForkPermit<'_>, ForkBlocked> {
         self.permit(None, deadline)
@@ -73,6 +293,12 @@ impl CountForkBarrier {
             }
             if state.unresolved {
                 return Err(ForkBlocked::Unresolved);
+            }
+            if state.setup.is_some() {
+                return Err(ForkBlocked::SetupReserved);
+            }
+            if epoch.is_none() && state.prefix_closed {
+                return Err(ForkBlocked::PrefixClosed);
             }
             let allowed = if let Some(epoch) = epoch {
                 state.active.is_none() && state.retired == Some(epoch) && state.sealed
@@ -100,7 +326,11 @@ impl CountForkBarrier {
     fn admit(&self, epoch: OwnerEpoch, deadline: Instant) -> Result<(), OwnerFailure> {
         let mut state = locked(&self.state);
         loop {
-            if state.active.is_some() || state.unresolved {
+            if state.active.is_some()
+                || state.unresolved
+                || state.setup.is_some()
+                || state.prefix_closed
+            {
                 return Err(OwnerFailure::engine(
                     CountOperation::Load,
                     FailureClass::Capacity,
