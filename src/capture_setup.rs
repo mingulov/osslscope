@@ -207,13 +207,21 @@ enum Publication {
     Accepted,
     Abandoned,
 }
+pub(crate) struct WorkerContext {
+    pub(crate) comm: String,
+    pub(crate) container_id: String,
+    pub(crate) kernel_release: String,
+}
 struct NativeState {
+    worker_context: Option<Arc<WorkerContext>>,
     #[cfg(test)]
     retained_fd_probe: [Option<i32>; 4],
     #[cfg(test)]
     retained_mapping_probe: [Option<(usize, usize)>; 2],
     #[cfg(test)]
     mapping_cleanup_hold: Option<Arc<NativeTestGate>>,
+    #[cfg(test)]
+    context_comm_hold: Option<Arc<NativeTestGate>>,
     phase: Publication,
     payload_type: Option<std::any::TypeId>,
     payload: Option<Box<dyn std::any::Any + Send>>,
@@ -322,6 +330,27 @@ impl SetupLinks {
     pub(crate) fn test_mapping_cleanup_hold(&self) -> Option<Arc<NativeTestGate>> {
         locked(&self.0).mapping_cleanup_hold.take()
     }
+    #[cfg(test)]
+    pub(crate) fn context_comm_test_hold(&self) {
+        let gate = locked(&self.0).context_comm_hold.take();
+        if let Some(gate) = gate {
+            gate.hold();
+        }
+    }
+    pub(crate) fn publish_context(&self, info: &crate::capture::TargetInfo) {
+        // Existing capture fields only. Linux comm, container IDs and utsname
+        // have finite limits; prepare bounded owned data before the arbiter.
+        let context = Arc::new(WorkerContext {
+            comm: info.comm.chars().take(64).collect(),
+            container_id: info.container_id.chars().take(64).collect(),
+            kernel_release: info.kernel_release.chars().take(64).collect(),
+        });
+        let displaced = { locked(&self.0).worker_context.replace(context) };
+        drop(displaced);
+    }
+    pub(crate) fn worker_context(&self) -> Option<Arc<WorkerContext>> {
+        locked(&self.0).worker_context.clone()
+    }
     pub(crate) fn coordinated(&self) -> bool {
         locked(&self.0).payload_type.is_some()
     }
@@ -382,12 +411,15 @@ impl SetupLinks {
         Self(Arc::new(NativeCore {
             runtime_committed: AtomicBool::new(false),
             state: Mutex::new(NativeState {
+                worker_context: None,
                 #[cfg(test)]
                 retained_fd_probe: [None; 4],
                 #[cfg(test)]
                 retained_mapping_probe: [None; 2],
                 #[cfg(test)]
                 mapping_cleanup_hold: None,
+                #[cfg(test)]
+                context_comm_hold: None,
                 phase: Publication::Running,
                 payload_type: None,
                 payload: None,
@@ -1839,6 +1871,16 @@ mod app_tests {
         ResourceUnwind,
         CountError,
         CountUnwind,
+        PrepareLoadError,
+        PrepareLoadUnwind,
+        ContextPartial,
+        ContextReady,
+        Stage2PinError,
+        Stage2PinCancel,
+        Stage2PinUnwind,
+        BirthError,
+        BirthCancel,
+        BirthUnwind,
         DiagnosticTimeout,
         DiagnosticError,
         PidPinError,
@@ -1955,6 +1997,39 @@ mod app_tests {
                 }
                 MATERIALIZATION_HOLD.with(|slot| *slot.borrow_mut() = Some(self.gate.clone()));
                 self.links.check_owned(BoundaryStage::Discovery)?;
+            }
+            if matches!(
+                self.hold,
+                Hold::Stage2PinError | Hold::Stage2PinCancel | Hold::Stage2PinUnwind
+            ) {
+                let mode = match self.hold {
+                    Hold::Stage2PinError => 1,
+                    Hold::Stage2PinUnwind => 2,
+                    _ => 0,
+                };
+                let _effect = crate::plan::pin_metadata_test(mode, self.gate.clone(), &self.links);
+                if self.hold == Hold::Stage2PinError {
+                    crate::discovery::session::w079_bootstrap_pin_boundary(
+                        &self.links,
+                        &self.control,
+                    )?;
+                } else {
+                    crate::discovery::session::w079_stage2_pin_boundary(
+                        &self.links,
+                        &self.control,
+                    )?;
+                }
+            }
+            if matches!(
+                self.hold,
+                Hold::BirthError | Hold::BirthCancel | Hold::BirthUnwind
+            ) {
+                crate::scan::registry::w079_birth_boundary(
+                    &self.links,
+                    &self.control,
+                    self.gate.clone(),
+                    if self.hold == Hold::BirthUnwind { 2 } else { 0 },
+                )?;
             }
             if self.hold == Hold::PidPinError {
                 let _slot = self
@@ -2171,6 +2246,9 @@ mod app_tests {
             if matches!(hold, Hold::CountError | Hold::CountUnwind) {
                 fixture.fail_open(hold == Hold::CountUnwind);
             }
+            if matches!(hold, Hold::PrepareLoadError | Hold::PrepareLoadUnwind) {
+                fixture.fail_prepare_load(hold == Hold::PrepareLoadUnwind);
+            }
             let gate = Gate::new();
             // Establish the unwind owner before the first actual child effect.
             let mut owned = Self {
@@ -2221,10 +2299,17 @@ mod app_tests {
                 grace: Duration::from_millis(100),
                 image_digest: String::new(),
             };
+            if hold == Hold::ContextPartial {
+                locked(&owned.attempt.links.0).context_comm_hold = Some(owned.gate.clone());
+            }
             let info = capture::TargetInfo {
                 pid: owned.pid,
                 owned: true,
-                comm: "held".into(),
+                comm: if matches!(hold, Hold::ContextPartial | Hold::ContextReady) {
+                    String::new()
+                } else {
+                    "held".into()
+                },
                 cmdline: String::new(),
                 container_id: String::new(),
                 kernel_release: String::new(),
@@ -2311,6 +2396,7 @@ mod app_tests {
                         setup: owned.attempt.links.clone(),
                     }),
                     seed,
+                    establish_context: matches!(hold, Hold::ContextPartial | Hold::ContextReady),
                 })
                 .unwrap();
             owned
@@ -3222,6 +3308,306 @@ mod app_tests {
                 crate::schema::validate_v2(&value).unwrap();
                 crate::schema::check_v2_semantics(&value).unwrap();
             }
+        }
+    }
+
+    #[test]
+    fn w079_fullplan_pending_owner_error_wins_cancel() {
+        for hold in [Hold::PrepareLoadError, Hold::PrepareLoadUnwind] {
+            for check in [false, true] {
+                let mut owned = Owned::new(hold, Duration::from_secs(10), false);
+                let until = Instant::now() + Duration::from_secs(2);
+                while !owned.fixture.load_entered() && Instant::now() < until {
+                    std::thread::yield_now();
+                }
+                let entered = owned.fixture.load_entered();
+                owned.cancelled.store(true, Ordering::Release);
+                let failure = owned
+                    .attempt
+                    .wait()
+                    .expect_err("cancel actual held Prepare");
+                owned.attempt.abandon(failure.clone());
+                // Actual owner returns EIO/Panic only AFTER the real Cancelled Prepare reply.
+                let settled = owned.settled();
+                let count = owned.attempt.count_diagnostic();
+                let error = capture::controlled_setup_failure(
+                    &mut owned.attempt,
+                    failure,
+                    owned.info.as_ref().unwrap(),
+                    owned.cfg.as_ref().unwrap(),
+                );
+                let original_cause = error
+                    .downcast_ref::<capture::PreObservationFailure>()
+                    .unwrap()
+                    .cause;
+                let path = std::path::PathBuf::from(
+                    std::env::var_os("OSSL_PACKAGE_TEST_PRIVATE_DIR").unwrap(),
+                )
+                .join(format!("fullplan-pending-{}-{check}.json", owned.pid));
+                let rules = [crate::policy::PolicyRule::deny_weak()];
+                let result = crate::report::consume_capture_result_with_diagnostics(
+                    Err(error),
+                    if check {
+                        crate::report::CaptureCommand::Check { rules: &rules }
+                    } else {
+                        crate::report::CaptureCommand::Report
+                    },
+                    &crate::report::OutputRequest {
+                        format: crate::report::OutputFormat::Json,
+                        primary: crate::report::OutputDest::File(path.clone()),
+                        cbom: None,
+                    },
+                    true,
+                    &mut Vec::new(),
+                );
+                let emitted = std::fs::read(&path);
+                let _ = std::fs::remove_file(path);
+                assert!(
+                    entered
+                        && settled
+                        && exact_reaped(owned.pid)
+                        && owned.fixture.descriptors_closed()
+                );
+                assert!(emitted.is_ok() && result.delivery.delivered_all());
+                assert_eq!(
+                    result.exit_code, 4,
+                    "{hold:?} check={check} pending={count:?}"
+                );
+                assert_eq!(result.child_exit, Some(137));
+                let context = result.failure_context.as_ref().unwrap();
+                assert_eq!(original_cause, capture::PreObservationCause::Cancelled);
+                assert_eq!(
+                    context.failure.as_ref().unwrap().class,
+                    BoundaryFailureClass::Cancelled
+                );
+                assert_eq!(
+                    context.count.actual_failure().unwrap().class,
+                    if hold == Hold::PrepareLoadError {
+                        BoundaryFailureClass::Io
+                    } else {
+                        BoundaryFailureClass::Panic
+                    }
+                );
+                let capture::PreObservationCount::SetupPending(snapshot) = count else {
+                    panic!("actual pending Prepare");
+                };
+                let watch = locked(&owned.attempt.links.0).watch.clone().unwrap();
+                let progress = watch.progress().unwrap();
+                let raw = progress.prepare_failure.expect("real Prepare failure");
+                assert_eq!(
+                    snapshot.owner_epoch(),
+                    progress.owner_epoch.map(|e| e.value())
+                );
+                assert_eq!(progress.cleanup_ticket, raw.cleanup_ticket);
+                assert_eq!(
+                    raw.failure.class,
+                    crate::count_owner::FailureClass::Cancelled
+                );
+                let independent = snapshot.known_failure().expect("actual owner failure");
+                assert_eq!(
+                    independent.class,
+                    if hold == Hold::PrepareLoadError {
+                        BoundaryFailureClass::Io
+                    } else {
+                        BoundaryFailureClass::Panic
+                    }
+                );
+                assert_eq!(
+                    independent.errno,
+                    if hold == Hold::PrepareLoadError {
+                        Some(libc::EIO)
+                    } else {
+                        None
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn w079_fullplan_worker_context_survives_failure() {
+        for hold in [Hold::ContextReady, Hold::ContextPartial] {
+            let mut owned = Owned::new(hold, Duration::from_secs(10), false);
+            let expected_comm = std::fs::read_to_string(format!("/proc/{}/comm", owned.pid))
+                .unwrap()
+                .trim()
+                .to_owned();
+            assert!(!expected_comm.is_empty());
+            assert!(
+                owned.info.as_ref().unwrap().comm.is_empty()
+                    && owned.info.as_ref().unwrap().kernel_release.is_empty()
+            );
+            let failure = if hold == Hold::ContextPartial {
+                let until = Instant::now() + Duration::from_secs(2);
+                while !owned.gate.entered.load(Ordering::Acquire) && Instant::now() < until {
+                    std::thread::yield_now();
+                }
+                owned.cancelled.store(true, Ordering::Release);
+                owned
+                    .attempt
+                    .wait()
+                    .expect_err("partial context cancellation")
+            } else {
+                owned.attempt.wait().expect("actual prepared Ready");
+                let window = owned
+                    .attempt
+                    .ready
+                    .as_mut()
+                    .unwrap()
+                    .bundle
+                    .window
+                    .as_mut()
+                    .unwrap();
+                // Exercise the actual release-failure branch after Ready. The
+                // existing duration-overflow validation guarantees no SIGCONT.
+                window.cfg.duration = Duration::MAX;
+                match capture::commit_owned_release(
+                    owned.attempt.target.as_mut().unwrap(),
+                    window,
+                    &owned.attempt.control,
+                    &capture::LiveClock,
+                ) {
+                    Err(failure) => failure,
+                    Ok(_) => unreachable!("u64 monotonic + maximal duration cannot fit"),
+                }
+            };
+            let error = capture::controlled_setup_failure(
+                &mut owned.attempt,
+                failure,
+                owned.info.as_ref().unwrap(),
+                owned.cfg.as_ref().unwrap(),
+            );
+            let settled = owned.settled();
+            assert!(settled && exact_reaped(owned.pid));
+            if hold == Hold::ContextReady {
+                assert!(owned.fixture.descriptors_closed());
+            } else {
+                assert!(matches!(
+                    owned.attempt.count_diagnostic(),
+                    capture::PreObservationCount::NotPrepared
+                ));
+            }
+            let context = error
+                .downcast_ref::<capture::PreObservationFailure>()
+                .unwrap();
+            assert_eq!(
+                context.target.comm, expected_comm,
+                "worker comm already obtained at {hold:?}"
+            );
+            let kernel = &context.context.as_ref().unwrap().kernel_release;
+            if hold == Hold::ContextReady {
+                assert!(!kernel.is_empty());
+            } else {
+                assert!(kernel.is_empty(), "unobtained kernel remains unknown");
+            }
+        }
+    }
+
+    #[test]
+    fn w079_fullplan_stage2_pin_child_custody() {
+        for hold in [
+            Hold::Stage2PinError,
+            Hold::Stage2PinCancel,
+            Hold::Stage2PinUnwind,
+        ] {
+            let mut owned = Owned::new(hold, Duration::from_secs(10), false);
+            let reap = crate::target::hold_setup_reap(owned.attempt.target.as_mut().unwrap());
+            let until = Instant::now() + Duration::from_secs(2);
+            while !owned.gate.entered.load(Ordering::Acquire) && Instant::now() < until {
+                std::thread::yield_now();
+            }
+            let entered = owned.gate.entered.load(Ordering::Acquire);
+            let failure = if hold == Hold::Stage2PinCancel {
+                owned.cancelled.store(true, Ordering::Release);
+                owned
+                    .attempt
+                    .wait()
+                    .expect_err("cancel while real File is held")
+            } else {
+                owned.gate.release();
+                owned
+                    .attempt
+                    .wait()
+                    .expect_err("real metadata failure/unwind")
+            };
+            owned.attempt.abandon(failure);
+            owned.gate.release();
+            let until = Instant::now() + Duration::from_secs(2);
+            while !reap.entered.load(Ordering::Acquire) && Instant::now() < until {
+                std::thread::yield_now();
+            }
+            std::thread::sleep(Duration::from_millis(30));
+            let fds = owned.attempt.links.test_fds();
+            let retained = fds
+                .iter()
+                .flatten()
+                .all(|fd| unsafe { libc::fcntl(*fd, libc::F_GETFD) } >= 0);
+            let pending = locked(&owned.attempt.links.0).custody.is_none();
+            let reap_entered = reap.entered.load(Ordering::Acquire);
+            reap.release();
+            let settled = owned.settled();
+            assert!(settled && exact_reaped(owned.pid) && owned.fixture.descriptors_closed());
+            assert!(
+                entered && reap_entered && pending && fds.iter().any(Option::is_some) && retained,
+                "real stage2 File must outlive consuming reap at {hold:?}"
+            );
+            assert!(
+                fds.iter()
+                    .flatten()
+                    .all(|fd| unsafe { libc::fcntl(*fd, libc::F_GETFD) } == -1)
+            );
+        }
+    }
+
+    #[test]
+    fn w079_fullplan_birth_map_child_custody() {
+        for hold in [Hold::BirthError, Hold::BirthCancel, Hold::BirthUnwind] {
+            let mut owned = Owned::new(hold, Duration::from_secs(10), false);
+            let reap = crate::target::hold_setup_reap(owned.attempt.target.as_mut().unwrap());
+            let until = Instant::now() + Duration::from_secs(2);
+            while !owned.gate.entered.load(Ordering::Acquire) && Instant::now() < until {
+                std::thread::yield_now();
+            }
+            let entered = owned.gate.entered.load(Ordering::Acquire);
+            let failure = if hold == Hold::BirthCancel {
+                owned.cancelled.store(true, Ordering::Release);
+                owned
+                    .attempt
+                    .wait()
+                    .expect_err("cancel while real BIRTH map FD is held")
+            } else {
+                owned.gate.release();
+                owned
+                    .attempt
+                    .wait()
+                    .expect_err("real map-info failure/unwind")
+            };
+            owned.attempt.abandon(failure);
+            owned.gate.release();
+            let until = Instant::now() + Duration::from_secs(2);
+            while !reap.entered.load(Ordering::Acquire) && Instant::now() < until {
+                std::thread::yield_now();
+            }
+            std::thread::sleep(Duration::from_millis(30));
+            let fds = owned.attempt.links.test_fds();
+            let retained = fds
+                .iter()
+                .flatten()
+                .all(|fd| unsafe { libc::fcntl(*fd, libc::F_GETFD) } >= 0);
+            let pending = locked(&owned.attempt.links.0).custody.is_none();
+            let reap_entered = reap.entered.load(Ordering::Acquire);
+            reap.release();
+            let settled = owned.settled();
+            assert!(settled && exact_reaped(owned.pid) && owned.fixture.descriptors_closed());
+            assert!(
+                entered && reap_entered && pending && fds.iter().any(Option::is_some) && retained,
+                "real BIRTH map FD must outlive consuming reap at {hold:?}"
+            );
+            assert!(
+                fds.iter()
+                    .flatten()
+                    .all(|fd| unsafe { libc::fcntl(*fd, libc::F_GETFD) } == -1)
+            );
         }
     }
 

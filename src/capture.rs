@@ -10092,6 +10092,7 @@ pub(crate) enum SetupRequest<D, B: CountBackend, L> {
             crate::discovery::maps::Mapping,
             plan::FileBytes,
         )>,
+        establish_context: bool,
     },
 }
 
@@ -10132,13 +10133,25 @@ where
         #[cfg(test)]
         SetupRequest::Host {
             cfg,
-            info,
+            mut info,
             discovery,
             lifecycle,
             count,
             mut proc,
             seed,
+            establish_context,
         } => {
+            if establish_context {
+                if let Err(failure) = read_owned_setup_context(&mut info, control, links) {
+                    return (
+                        Box::new(SetupBundle::<D, crate::count_session::LiveBackend, L> {
+                            window: None,
+                            bootstrap: Some((discovery, lifecycle)),
+                        }),
+                        Some(failure),
+                    );
+                }
+            }
             lease.close_prefix();
             let backend = lease
                 .reserve_count()
@@ -10223,6 +10236,25 @@ where
     }
 }
 
+fn read_owned_setup_context(
+    info: &mut TargetInfo,
+    control: &crate::capture_setup::SetupControl,
+    links: &crate::capture_setup::SetupLinks,
+) -> Result<(), crate::capture_setup::SetupFailure> {
+    info.comm = comm_of(info.pid);
+    links.publish_context(info);
+    #[cfg(test)]
+    links.context_comm_test_hold();
+    links.check(control, BoundaryStage::Setup)?;
+    info.container_id = container_id_of(info.pid);
+    links.publish_context(info);
+    links.check(control, BoundaryStage::Setup)?;
+    info.kernel_release = crate::doctor::uname_release();
+    links.publish_context(info);
+    links.check(control, BoundaryStage::Setup)?;
+    Ok(())
+}
+
 pub(crate) type LiveSetupBundle =
     SetupBundle<CaptureDiscovery, crate::count_session::LiveBackend, LiveLifecycle>;
 fn prepare_live_owned_setup(
@@ -10267,12 +10299,7 @@ fn prepare_live_owned_setup(
                 None => crate::discovery::builtin::shipped_table(),
             };
             links.check(control, BoundaryStage::Setup)?;
-            source.info.comm = comm_of(source.info.pid);
-            links.check(control, BoundaryStage::Setup)?;
-            source.info.container_id = container_id_of(source.info.pid);
-            links.check(control, BoundaryStage::Setup)?;
-            source.info.kernel_release = crate::doctor::uname_release();
-            links.check(control, BoundaryStage::Setup)?;
+            read_owned_setup_context(&mut source.info, control, links)?;
             let empty = ProviderTable::empty();
             let enrollment = source.cfg.provider_enrollment.as_ref().unwrap_or(&empty);
             let resolved = resolve_capture_provider_with(
@@ -10846,6 +10873,29 @@ where
     B::Link: Send,
     L: LifecyclePort + Send + 'static,
 {
+    // Snapshot before returning accepted ownership to cleanup. Prepared data is
+    // authoritative; otherwise use the last actual incremental worker snapshot.
+    let prepared = attempt
+        .ready
+        .as_ref()
+        .and_then(|r| r.bundle.window.as_ref())
+        .map(|w| &w.info);
+    let worker = attempt.links.worker_context();
+    let comm = prepared
+        .map(|i| i.comm.as_str())
+        .or_else(|| worker.as_ref().map(|i| i.comm.as_str()))
+        .unwrap_or(&info.comm)
+        .to_owned();
+    let container = prepared
+        .map(|i| i.container_id.as_str())
+        .or_else(|| worker.as_ref().map(|i| i.container_id.as_str()))
+        .unwrap_or(&info.container_id)
+        .to_owned();
+    let kernel = prepared
+        .map(|i| i.kernel_release.as_str())
+        .or_else(|| worker.as_ref().map(|i| i.kernel_release.as_str()))
+        .unwrap_or(&info.kernel_release)
+        .to_owned();
     let cause = if attempt
         .target
         .as_ref()
@@ -10892,9 +10942,9 @@ where
             count: attempt.count_diagnostic(),
             release,
             custody,
-            target: doc_target(info.pid, &info.comm, &info.container_id, &info.image_digest),
+            target: doc_target(info.pid, &comm, &container, &info.image_digest),
             context: Some(CaptureContext {
-                kernel_release: info.kernel_release.clone(),
+                kernel_release: kernel,
                 wall_start_unix_ns: None,
                 wall_end_unix_ns: None,
             }),

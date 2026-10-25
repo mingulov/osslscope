@@ -993,6 +993,27 @@ pub struct TerminalFailures {
     component_times: [Option<std::time::Instant>; 18],
 }
 impl TerminalFailures {
+    // Pure bounded-data selection, shared with pending setup diagnostics.
+    pub(crate) fn independent_failure(&self) -> Option<OwnerFailure> {
+        let independent =
+            |f: &OwnerFailure| !matches!(f.class, FailureClass::Cancelled | FailureClass::Deadline);
+        self.operations
+            .iter()
+            .flatten()
+            .copied()
+            .find(independent)
+            .or_else(|| {
+                self.components.iter().flatten().find_map(|f| {
+                    let owner = OwnerFailure {
+                        operation: f.operation,
+                        resource: ResourceId::Map(f.map),
+                        class: f.class?,
+                        errno: f.errno,
+                    };
+                    independent(&owner).then_some(owner)
+                })
+            })
+    }
     pub(super) fn record_component(&mut self, failure: ComponentFailure) {
         self.record_component_at(failure, std::time::Instant::now());
     }

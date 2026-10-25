@@ -416,7 +416,11 @@ impl ScanBackend {
     /// unregistered).
     pub fn register(&mut self, tids: &[u32]) -> anyhow::Result<Vec<(u32, u16)>> {
         let rows = self.births.poll(tids);
-        super::registry::program_births(&self.loaded.maps, &rows)?;
+        super::registry::program_births_preparing(
+            &self.loaded.maps,
+            &rows,
+            self.loaded.setup_links(),
+        )?;
         Ok(rows)
     }
 

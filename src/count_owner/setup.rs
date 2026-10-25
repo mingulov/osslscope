@@ -257,9 +257,74 @@ impl CountSetupWatch {
                     .resolved_open
                     .is_none_or(|open| open.outcome == OpenOutcome::Unknown);
             progress.late_ready |= state.phase == OwnerPhase::Ready && abandoned;
-            progress.known_failure = progress
-                .known_failure
+            // Prepare's real control receipt remains separate. Established owner
+            // operation/component/cleanup errors take precedence over it.
+            progress.known_failure = state
+                .failures
+                .independent_failure()
+                .or_else(|| {
+                    state
+                        .terminal_result
+                        .as_ref()
+                        .and_then(|data| data.failures.independent_failure())
+                })
+                .or_else(|| {
+                    state
+                        .terminal_candidate
+                        .as_ref()
+                        .and_then(|(_, data)| data.failures.independent_failure())
+                })
+                .or_else(|| {
+                    state
+                        .terminal_fallback
+                        .as_ref()
+                        .and_then(|data| data.failures.independent_failure())
+                })
+                .or_else(|| {
+                    state.read_failure.filter(|f| {
+                        !matches!(f.class, FailureClass::Cancelled | FailureClass::Deadline)
+                    })
+                })
+                .or_else(|| {
+                    state.resources.resources.iter().find_map(|r| {
+                        (r.state == ResourceState::ConsumedError).then_some(OwnerFailure {
+                            operation: CountOperation::Cleanup,
+                            resource: r.resource,
+                            class: FailureClass::Io,
+                            errno: r.errno,
+                        })
+                    })
+                })
+                .or(progress.known_failure)
                 .or_else(|| state.failures.operations.iter().flatten().copied().next());
+            drop(state);
+            // Published read components are also already-established Shared
+            // data. Never wait on the owner or nest its publication locks.
+            let component = shared.latest_progress.try_lock().ok().and_then(|slot| {
+                let snapshot = &slot.as_ref()?.snapshot;
+                [snapshot.admitted, snapshot.dropfail]
+                    .into_iter()
+                    .chain(snapshot.latc)
+                    .find_map(|value| {
+                        let Component::Unavailable(f) = value else {
+                            return None;
+                        };
+                        let class = f.class?;
+                        (!matches!(class, FailureClass::Cancelled | FailureClass::Deadline))
+                            .then_some(OwnerFailure {
+                                operation: f.operation,
+                                resource: ResourceId::Map(f.map),
+                                class,
+                                errno: f.errno,
+                            })
+                    })
+            });
+            if progress
+                .known_failure
+                .is_none_or(|f| matches!(f.class, FailureClass::Cancelled | FailureClass::Deadline))
+            {
+                progress.known_failure = component.or(progress.known_failure);
+            }
         }
         Some(progress)
     }

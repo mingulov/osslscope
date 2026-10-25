@@ -2848,6 +2848,7 @@ impl Probe {
 #[derive(Clone, Default)]
 struct Faults {
     fail_acquire_from: Option<usize>,
+    acquire_failure: Option<i32>,
     expire_after: Option<usize>,
     hold_acquire: Option<usize>,
     hold_close: Option<usize>,
@@ -2876,7 +2877,9 @@ impl PipeDriver {
             .fail_acquire_from
             .is_some_and(|n| self.attempts >= n)
         {
-            return Err(io::Error::from_raw_os_error(libc::EMFILE));
+            return Err(io::Error::from_raw_os_error(
+                self.faults.acquire_failure.unwrap_or(libc::EMFILE),
+            ));
         }
         self.acquired += 1;
         Ok(self.probe.acquire(self.acquired))
@@ -11417,6 +11420,7 @@ pub(crate) enum W079AppPrepareHold {
 pub(crate) struct W079AppCountFixture {
     probe: Arc<MapProbe>,
     open_fault: std::sync::atomic::AtomicU8,
+    load_fault: std::sync::atomic::AtomicU8,
     hold_map_call: Option<usize>,
     hold_close: bool,
     hold_attach: bool,
@@ -11435,12 +11439,26 @@ impl W079AppCountFixture {
         Self {
             probe,
             open_fault: std::sync::atomic::AtomicU8::new(0),
+            load_fault: std::sync::atomic::AtomicU8::new(0),
             hold_map_call,
             hold_close,
             hold_attach,
             prepare_hold,
             prepare_entered: Arc::new(AtomicBool::new(false)),
         }
+    }
+    pub(crate) fn fail_prepare_load(&self, unwind: bool) {
+        self.load_fault
+            .store(if unwind { 2 } else { 1 }, Ordering::Release);
+    }
+    pub(crate) fn load_entered(&self) -> bool {
+        if self.load_fault.load(Ordering::Acquire) == 2 {
+            return self.prepare_entered.load(Ordering::Acquire);
+        }
+        locked(&self.probe.owner.log)
+            .events
+            .iter()
+            .any(|(_, e)| matches!(e, Event::EnterAcquire(1)))
     }
     pub(crate) fn fail_open(&self, unwind: bool) {
         self.open_fault
@@ -11505,7 +11523,9 @@ impl W079AppCountFixture {
             .iter()
             .filter(|(_, e)| matches!(e, Event::PinOpened(_)))
             .count();
-        (acquired >= 8 || self.prepare_hold.is_some())
+        (acquired >= 8
+            || self.prepare_hold.is_some()
+            || self.load_fault.load(Ordering::Acquire) != 0)
             && closed == acquired + pins
             && !self.probe.owner.hold_expired.load(Ordering::Acquire)
     }
@@ -11549,11 +11569,13 @@ impl W079AppCountFixture {
         let cutoff = control.deadline();
         let hold_map_call = self.hold_map_call;
         let open_fault = self.open_fault.load(Ordering::Acquire);
+        let load_fault = self.load_fault.load(Ordering::Acquire);
         let hold_close = self.hold_close;
         let hold_attach = self.hold_attach;
         let prepare_hold = self.prepare_hold;
         let spawn_probe = probe.owner.clone();
         let spawn_entered = self.prepare_entered.clone();
+        let factory_entered = self.prepare_entered.clone();
         crate::capture::prepare_count_backend_controlled_with(
             input,
             cutoff,
@@ -11589,13 +11611,24 @@ impl W079AppCountFixture {
                     hooks,
                     move || {
                         probe.owner.event(Event::Started);
+                        if load_fault == 2 {
+                            factory_entered.store(true, Ordering::Release);
+                            probe.owner.hold();
+                            panic!(
+                                "actual owner Load initialization unwind before first syscall seam"
+                            );
+                        }
                         W079AppDriver(TerminalDriver {
                             map: MapDriver {
                                 base: PipeDriver {
                                     probe: probe.owner.clone(),
                                     faults: Faults {
                                         hold_close: hold_close.then_some(1),
-                                        hold_acquire: if prepare_hold
+                                        fail_acquire_from: (load_fault == 1).then_some(1),
+                                        acquire_failure: Some(libc::EIO),
+                                        hold_acquire: if load_fault != 0 {
+                                            Some(1)
+                                        } else if prepare_hold
                                             == Some(W079AppPrepareHold::PrepareReply)
                                         {
                                             Some(8)
@@ -11652,4 +11685,41 @@ impl W079AppCountFixture {
             },
         )
     }
+}
+
+#[test]
+fn w079_fullplan_pending_selector_checks_all_independent_data() {
+    let mut failures = TerminalFailures::default();
+    failures.record(OwnerFailure::engine(
+        CountOperation::Load,
+        FailureClass::Cancelled,
+    ));
+    assert!(failures.independent_failure().is_none());
+    let io = OwnerFailure::io(
+        CountOperation::Cleanup,
+        ResourceId::Engine,
+        &io::Error::from_raw_os_error(libc::EIO),
+    );
+    failures.record(io);
+    assert_eq!(
+        failures.independent_failure(),
+        Some(io),
+        "early control slot must not mask cleanup"
+    );
+    let mut component = TerminalFailures::default();
+    component.record(OwnerFailure::engine(
+        CountOperation::Load,
+        FailureClass::Deadline,
+    ));
+    component.record_component(ComponentFailure {
+        operation: CountOperation::Read,
+        map: CountMap::Latc,
+        key: 3,
+        class: Some(FailureClass::Panic),
+        errno: None,
+    });
+    assert_eq!(
+        component.independent_failure().unwrap().class,
+        FailureClass::Panic
+    );
 }

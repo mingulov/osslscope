@@ -1112,7 +1112,7 @@ pub fn load_offset_table_file(path: &Path) -> Result<builtin::Table, OnboardErro
     let text = read_table_text("--table", path)?;
     builtin::load_table_str(&text).map_err(|e| {
         OnboardError::new(
-            format!("--table {} invalid: {e:#}", path.display()),
+            format!("--table invalid: {e:#} (file {})", path.display()),
             "fix the JSON (table_version 1; entries need build_id, \
              query_offset, anchor, anchor_offset)"
                 .to_string(),
@@ -1126,7 +1126,7 @@ pub fn load_enrollment_file(path: &Path) -> Result<ProviderTable, OnboardError> 
     let text = read_table_text("--provider-table", path)?;
     provider::load_table_str(&text).map_err(|e| {
         OnboardError::new(
-            format!("--provider-table {} invalid: {e:#}", path.display()),
+            format!("--provider-table invalid: {e:#} (file {})", path.display()),
             "fix the JSON (table_version 1; entries need build_id and \
              provider_class default|legacy|fips|third-party)"
                 .to_string(),

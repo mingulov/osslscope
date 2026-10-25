@@ -4463,7 +4463,7 @@ where
             .check_owned(crate::capture::BoundaryStage::Discovery)
             .map_err(anyhow::Error::new)
             .and_then(|_| {
-                crate::loader::borrowed_rows::<K, V>(
+                crate::loader::borrowed_rows_partial::<K, V>(
                     maps,
                     name,
                     false,
@@ -4471,11 +4471,11 @@ where
                     crate::capture::BoundaryStage::Discovery,
                 )
             }) {
-            Ok(rows) => (
+            Ok((rows, failed)) => (
                 rows.into_iter()
                     .map(|(key, values)| (key, values[0]))
                     .collect(),
-                false,
+                failed,
             ),
             Err(_) => (Vec::new(), true),
         };
@@ -4541,7 +4541,7 @@ where
             .check_owned(crate::capture::BoundaryStage::Discovery)
             .map_err(anyhow::Error::new)
             .and_then(|_| {
-                crate::loader::borrowed_rows::<K, u64>(
+                crate::loader::borrowed_rows_partial::<K, u64>(
                     maps,
                     name,
                     true,
@@ -4549,11 +4549,11 @@ where
                     crate::capture::BoundaryStage::Discovery,
                 )
             }) {
-            Ok(rows) => (
+            Ok((rows, failed)) => (
                 rows.into_iter()
                     .map(|(key, values)| (key, fold(&values)))
                     .collect(),
-                false,
+                failed,
             ),
             Err(_) => (Vec::new(), true),
         };
@@ -4590,9 +4590,42 @@ where
     }
 }
 
+fn borrowed_discovery_hash<'a, K: aya::Pod, V: aya::Pod>(
+    maps: &'a HashMap<String, OwnedFd>,
+    name: &str,
+    setup: &'a SetupLinks,
+) -> anyhow::Result<crate::loader::BorrowedMap<'a>> {
+    use std::os::fd::AsFd as _;
+    let map = crate::loader::BorrowedMap::checked(
+        maps.get(name).context("map missing")?.as_fd(),
+        setup,
+        crate::capture::BoundaryStage::Discovery,
+    )?;
+    map.shape(&[1], std::mem::size_of::<K>(), std::mem::size_of::<V>())?;
+    Ok(map)
+}
+fn borrowed_delete<K: aya::Pod>(
+    map: &crate::loader::BorrowedMap<'_>,
+    key: &K,
+) -> anyhow::Result<()> {
+    match map.delete(crate::loader::pod_bytes(key)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Evict one array's `TERMD` proof: a sticky proof from a retired
 /// incarnation must never satisfy the next one.
-fn evict_termd(maps: &HashMap<String, OwnedFd>, arr: u64) -> anyhow::Result<()> {
+fn evict_termd(
+    maps: &HashMap<String, OwnedFd>,
+    arr: u64,
+    setup: Option<&SetupLinks>,
+) -> anyhow::Result<()> {
+    if let Some(setup) = setup {
+        let table = borrowed_discovery_hash::<u64, u64>(maps, "TERMD", setup)?;
+        return borrowed_delete(&table, &arr);
+    }
     let mut termd = open_hash::<u64, u64>(maps, "TERMD")?;
     delete_elem(&mut termd, &arr).context("evict TERMD")
 }
@@ -4600,7 +4633,15 @@ fn evict_termd(maps: &HashMap<String, OwnedFd>, arr: u64) -> anyhow::Result<()> 
 /// Delete one array's `GEN` entry (F-H/H1): the retired
 /// incarnation's cookie must not validate any later record. An
 /// absent entry succeeds (same tolerance as `TERMD`).
-fn evict_gen(maps: &HashMap<String, OwnedFd>, arr: u64) -> anyhow::Result<()> {
+fn evict_gen(
+    maps: &HashMap<String, OwnedFd>,
+    arr: u64,
+    setup: Option<&SetupLinks>,
+) -> anyhow::Result<()> {
+    if let Some(setup) = setup {
+        let table = borrowed_discovery_hash::<u64, u64>(maps, "GEN", setup)?;
+        return borrowed_delete(&table, &arr);
+    }
     let mut table = open_hash::<u64, u64>(maps, "GEN")?;
     delete_elem(&mut table, &arr).context("evict GEN")
 }
@@ -4608,7 +4649,21 @@ fn evict_gen(maps: &HashMap<String, OwnedFd>, arr: u64) -> anyhow::Result<()> {
 /// Install one array's incarnation generation (F-H/H1): BPF
 /// stamps every record the array produces with this value until
 /// the next bump or eviction.
-fn install_gen(maps: &HashMap<String, OwnedFd>, arr: u64, gen_value: u64) -> anyhow::Result<()> {
+fn install_gen(
+    maps: &HashMap<String, OwnedFd>,
+    arr: u64,
+    gen_value: u64,
+    setup: Option<&SetupLinks>,
+) -> anyhow::Result<()> {
+    if let Some(setup) = setup {
+        let table = borrowed_discovery_hash::<u64, u64>(maps, "GEN", setup)?;
+        return table
+            .update(
+                crate::loader::pod_bytes(&arr),
+                crate::loader::pod_bytes(&gen_value),
+            )
+            .map_err(Into::into);
+    }
     let mut table = open_hash::<u64, u64>(maps, "GEN")?;
     table
         .insert(arr, gen_value, 0)
@@ -4618,7 +4673,33 @@ fn install_gen(maps: &HashMap<String, OwnedFd>, arr: u64, gen_value: u64) -> any
 /// Evict one array's `QUERY_NEXT` cursors across all threads (low
 /// key half is the array base): the next incarnation's walk
 /// restarts at slot 0 instead of resuming mid-array.
-fn evict_cursors(maps: &HashMap<String, OwnedFd>, arr: u64) -> anyhow::Result<()> {
+fn evict_cursors(
+    maps: &HashMap<String, OwnedFd>,
+    arr: u64,
+    setup: Option<&SetupLinks>,
+) -> anyhow::Result<()> {
+    if let Some(setup) = setup {
+        let cursors = borrowed_discovery_hash::<u128, u64>(maps, "QUERY_NEXT", setup)?;
+        let mut victims = Vec::new();
+        for key in cursors.keys(cursors.info.max_entries)? {
+            let k = u128::from_ne_bytes(key.try_into().expect("checked u128 shape"));
+            let mut value = [0u8; 8];
+            // Like Aya's iterator, skip a concurrently removed row; other
+            // lookup/iteration failures abort eviction and remain handled loss.
+            match cursors.lookup(crate::loader::pod_bytes(&k), &mut value) {
+                Err(e) if e.raw_os_error() == Some(libc::ENOENT) => continue,
+                Err(e) => return Err(e.into()),
+                Ok(()) => {}
+            }
+            if k as u64 == arr {
+                victims.push(k);
+            }
+        }
+        for key in victims {
+            borrowed_delete(&cursors, &key)?;
+        }
+        return Ok(());
+    }
     let mut cursors = open_hash::<u128, u64>(maps, "QUERY_NEXT")?;
     // Collect first: deleting during iteration races concurrent
     // kernel inserts.
@@ -4649,9 +4730,72 @@ fn stat_dev_string(path: &Path) -> Option<(String, u64)> {
     Some((crate::plan::render_stat_dev(md.dev()), md.ino()))
 }
 
+fn open_discovery_pin(
+    path: &str,
+    links: &DiscoveryLinkStore,
+    fatal: bool,
+) -> std::io::Result<crate::capture_setup::SetupResource<crate::plan::PinnedFile>> {
+    match links.setup_links() {
+        Some(setup) => crate::plan::resolve_pinned_preparing(path, setup, fatal),
+        None => crate::plan::resolve_pinned_retry(|| crate::plan::resolve_pinned(path))
+            .map(crate::capture_setup::SetupResource::local),
+    }
+}
+fn pin_stage2_target(
+    path: &Path,
+    expected: Option<(u64, u64)>,
+    links: &DiscoveryLinkStore,
+) -> anyhow::Result<crate::capture_setup::SetupResource<crate::plan::PinnedFile>> {
+    let path_str = path.to_string_lossy();
+    let pin = open_discovery_pin(path_str.as_ref(), links, false).map_err(|e| {
+        let text = stage2_pin_open_text(&e);
+        anyhow::Error::new(e).context(text)
+    })?;
+    let matches = expected.is_some_and(|(raw_dev, ino)| {
+        let enc = crate::plan::encode_device(
+            libc::major(raw_dev as libc::dev_t),
+            libc::minor(raw_dev as libc::dev_t),
+        );
+        pin.device == enc && pin.ino == ino
+    });
+    links.check()?;
+    if !matches {
+        bail!("stage-2 pin misses the resolve-time identity (cookie retries next poll)");
+    }
+    Ok(pin)
+}
+
+fn pin_bound_libcrypto(
+    path: &str,
+    enc: u64,
+    ino: u64,
+    links: &DiscoveryLinkStore,
+    fatal: bool,
+) -> anyhow::Result<crate::capture_setup::SetupResource<crate::plan::PinnedFile>> {
+    let pin = open_discovery_pin(path, links, fatal).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("tripwire install: bound libcrypto unopenable ({path}): {e}"),
+        )
+    })?;
+    if pin.device != enc || pin.ino != ino {
+        let error = std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "tripwire install: bound libcrypto replaced since plan",
+        );
+        return if fatal {
+            links.retain_result(Err(error.into()))
+        } else {
+            Err(error.into())
+        };
+    }
+    Ok(pin)
+}
+
 /// The privileged [`SessionEnv`]: real ring, maps, links, pin, and
 /// `/proc` reads. Owned by [`DiscoverySession`] until session drop.
 pub struct LiveEnv {
+    bootstrap: bool,
     pid: u32,
     provider: PathBuf,
     canon: String,
@@ -4774,20 +4918,7 @@ impl SessionEnv for LiveEnv {
         // `expected` is raw (dev_t, ino) per the trait, the pin
         // is encoded — the comparison encodes explicitly.
         let _temporary = self.links.temporary(1)?;
-        let path_str = path.to_string_lossy();
-        let pin =
-            crate::plan::resolve_pinned_retry(|| crate::plan::resolve_pinned(path_str.as_ref()))
-                .map_err(|e| anyhow!(stage2_pin_open_text(&e)))?;
-        let matches = expected.is_some_and(|(raw_dev, ino)| {
-            let enc = crate::plan::encode_device(
-                libc::major(raw_dev as libc::dev_t),
-                libc::minor(raw_dev as libc::dev_t),
-            );
-            pin.device == enc && pin.ino == ino
-        });
-        if !matches {
-            bail!("stage-2 pin misses the resolve-time identity (cookie retries next poll)");
-        }
+        let pin = pin_stage2_target(path, expected, &self.links)?;
         attach_pair(
             &self.loaded,
             &mut self.links,
@@ -4823,20 +4954,7 @@ impl SessionEnv for LiveEnv {
             crate::plan::device_id_of_dev_str(dev).map(|enc| (path, (enc, *ino)))
         }) {
             let _temporary = self.links.temporary(1)?;
-            let pin = crate::plan::resolve_pinned_retry(|| crate::plan::resolve_pinned(lc_path))
-                .map_err(|e| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("tripwire install: bound libcrypto unopenable ({lc_path}): {e}"),
-                    )
-                })?;
-            if pin.device != enc || pin.ino != ino {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "tripwire install: bound libcrypto replaced since plan",
-                )
-                .into());
-            }
+            let _pin = pin_bound_libcrypto(lc_path, enc, ino, &self.links, self.bootstrap)?;
         }
         let pins = attach_trips(&self.loaded, &mut self.links, set, pid)?;
         self.last_trip_pins = pins;
@@ -4852,13 +4970,11 @@ impl SessionEnv for LiveEnv {
                 // stay loud in-doc (executed_queries would read a
                 // false 0) while the run continues for tripwires.
                 let _temporary = self.links.temporary(1)?;
-                let pin = match crate::plan::resolve_pinned_retry(|| {
-                    crate::plan::resolve_pinned(cand.to_string_lossy().as_ref())
-                }) {
-                    Ok(pin) => pin,
-                    Err(_) => continue,
-                };
-                let pin = self.links.resource(pin);
+                let pin =
+                    match open_discovery_pin(cand.to_string_lossy().as_ref(), &self.links, false) {
+                        Ok(pin) => pin,
+                        Err(_) => continue,
+                    };
                 let off = read_attach_bounded(
                     Path::new(&pin.link_path()),
                     crate::discovery::onboard::MAX_OBJECT_SCAN_BYTES,
@@ -4996,14 +5112,14 @@ impl SessionEnv for LiveEnv {
     }
 
     fn evict_array_state(&mut self, arr: u64) -> anyhow::Result<()> {
-        evict_termd(&self.loaded.maps, arr)?;
-        evict_cursors(&self.loaded.maps, arr)?;
-        evict_gen(&self.loaded.maps, arr)?;
+        evict_termd(&self.loaded.maps, arr, self.links.setup_links())?;
+        evict_cursors(&self.loaded.maps, arr, self.links.setup_links())?;
+        evict_gen(&self.loaded.maps, arr, self.links.setup_links())?;
         Ok(())
     }
 
     fn install_generation(&mut self, arr: u64, generation: u64) -> anyhow::Result<()> {
-        install_gen(&self.loaded.maps, arr, generation)
+        install_gen(&self.loaded.maps, arr, generation, self.links.setup_links())
     }
 
     fn verify_pin(&self) -> anyhow::Result<()> {
@@ -5085,14 +5201,12 @@ impl SessionEnv for LiveEnv {
         // binding; the spike proved the kernel accepts this and
         // arms on first map). Only a missing file stays a retry.
         let _temporary = self.links.temporary(1)?;
-        let pin = crate::plan::resolve_pinned_retry(|| crate::plan::resolve_pinned(&prov_path))
-            .map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("provider {prov_path} unopenable during reinstall: {e}"),
-                )
-            })?;
-        let pin = self.links.resource(pin);
+        let pin = open_discovery_pin(&prov_path, &self.links, false).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("provider {prov_path} unopenable during reinstall: {e}"),
+            )
+        })?;
         self.links.check()?;
         let read_temporary = self.links.temporary(1)?;
         let bound = match self.links.setup_links() {
@@ -5551,6 +5665,7 @@ impl DiscoverySession {
                 drop(prov_pin);
                 drop(_temporary);
                 let mut env = LiveEnv {
+                    bootstrap: true,
                     pid,
                     provider: cfg.provider.clone(),
                     canon,
@@ -5606,6 +5721,7 @@ impl DiscoverySession {
                     let error = core.recycled_err();
                     return env.links.retain_result(Err(error));
                 }
+                env.bootstrap = false;
                 Ok(Self { core, env })
             },
         )
@@ -5645,8 +5761,69 @@ impl DiscoverySession {
 }
 
 #[cfg(test)]
+pub(crate) use tests::{w079_bootstrap_pin_boundary, w079_stage2_pin_boundary};
+
+#[cfg(test)]
 mod tests {
+    pub(crate) fn w079_stage2_pin_boundary(
+        links: &SetupLinks,
+        control: &SetupControl,
+    ) -> anyhow::Result<()> {
+        use std::os::unix::fs::MetadataExt as _;
+        let meta = std::fs::metadata("/dev/null")?;
+        let store = DiscoveryLinkStore::preparing(links, control);
+        let _slot = store.temporary(1)?;
+        pin_stage2_target(
+            Path::new("/dev/null"),
+            Some((meta.dev(), meta.ino())),
+            &store,
+        )
+        .map(|_| ())
+    }
+    pub(crate) fn w079_bootstrap_pin_boundary(
+        links: &SetupLinks,
+        control: &SetupControl,
+    ) -> anyhow::Result<()> {
+        use std::os::unix::fs::MetadataExt as _;
+        let meta = std::fs::metadata("/dev/null")?;
+        let store = DiscoveryLinkStore::preparing(links, control);
+        let _slot = store.temporary(1)?;
+        pin_bound_libcrypto(
+            "/dev/null",
+            crate::plan::encode_device(libc::major(meta.dev()), libc::minor(meta.dev())),
+            meta.ino(),
+            &store,
+            true,
+        )
+        .map(|_| ())
+    }
+
     use super::*;
+    #[test]
+    fn w079_fullplan_discovery_map_errors_stay_recoverable() {
+        let setup = SetupLinks::new();
+        let maps: HashMap<String, OwnedFd> = ["GEN", "TERMD", "QUERY_NEXT"]
+            .into_iter()
+            .map(|name| {
+                (
+                    name.to_owned(),
+                    std::fs::File::open("/dev/null").unwrap().into(),
+                )
+            })
+            .collect();
+        // Ordinary FDs cannot pass real map-info/shape qualification. Both
+        // branches report failure; preparing's borrowed operations must not
+        // seal a handled discovery error or manufacture an Aya owner.
+        for preparing in [Some(&setup), None] {
+            assert!(install_gen(&maps, 1, 2, preparing).is_err());
+            assert!(evict_termd(&maps, 1, preparing).is_err());
+            assert!(evict_gen(&maps, 1, preparing).is_err());
+            assert!(evict_cursors(&maps, 1, preparing).is_err());
+            setup
+                .check_owned(crate::capture::BoundaryStage::Discovery)
+                .unwrap();
+        }
+    }
 
     use std::os::unix::net::UnixStream;
     use std::sync::{Arc, Mutex, atomic::AtomicBool, mpsc::sync_channel};

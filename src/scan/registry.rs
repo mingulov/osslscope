@@ -131,6 +131,8 @@ pub fn program_births(maps: &HashMap<String, OwnedFd>, rows: &[(u32, u16)]) -> a
         .context("BIRTH map missing")?
         .try_clone()
         .context("clone BIRTH")?;
+    #[cfg(test)]
+    birth_boundary_effect(std::os::fd::AsRawFd::as_raw_fd(&fd));
     let data = MapData::from_fd(fd).context("BIRTH mapdata")?;
     let map = Map::from_map_data(data).context("BIRTH map")?;
     let mut births =
@@ -141,6 +143,86 @@ pub fn program_births(maps: &HashMap<String, OwnedFd>, rows: &[(u32, u16)]) -> a
             .with_context(|| format!("insert BIRTH[{tid}] (map full = hard error)"))?;
     }
     Ok(())
+}
+
+pub(crate) fn program_births_preparing(
+    maps: &HashMap<String, OwnedFd>,
+    rows: &[(u32, u16)],
+    setup: Option<&crate::capture_setup::SetupLinks>,
+) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    use std::os::fd::AsFd as _;
+    let Some(setup) = setup else {
+        return program_births(maps, rows);
+    };
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let result = (|| {
+        let fd = maps.get("BIRTH").context("BIRTH map missing")?;
+        #[cfg(test)]
+        birth_boundary_effect(std::os::fd::AsRawFd::as_raw_fd(fd));
+        let map = crate::loader::BorrowedMap::checked(
+            fd.as_fd(),
+            setup,
+            crate::capture::BoundaryStage::Traversal,
+        )?;
+        map.shape(&[1], 4, 2)?;
+        for (tid, birth) in rows {
+            map.update(
+                crate::loader::pod_bytes(tid),
+                crate::loader::pod_bytes(birth),
+            )
+            .with_context(|| format!("insert BIRTH[{tid}] (map full = hard error)"))?;
+        }
+        Ok(())
+    })();
+    // BIRTH is a hard baseline failure, unlike handled discovery map loss.
+    setup.retain_result(result, crate::capture::BoundaryStage::Traversal)
+}
+#[cfg(test)]
+std::thread_local! { static BIRTH_BOUNDARY_TEST: std::cell::RefCell<Option<(u8, std::sync::Arc<crate::capture_setup::NativeTestGate>, crate::capture_setup::SetupLinks)>> = const { std::cell::RefCell::new(None) }; }
+#[cfg(test)]
+fn birth_boundary_effect(fd: i32) {
+    BIRTH_BOUNDARY_TEST.with(|slot| {
+        if let Some((mode, gate, links)) = slot.borrow().as_ref() {
+            links.test_retained_fd(fd);
+            gate.hold();
+            assert_ne!(*mode, 2, "actual BIRTH map-info unwind");
+        }
+    });
+}
+#[cfg(test)]
+pub(crate) fn w079_birth_boundary(
+    links: &crate::capture_setup::SetupLinks,
+    control: &crate::capture_setup::SetupControl,
+    gate: std::sync::Arc<crate::capture_setup::NativeTestGate>,
+    mode: u8,
+) -> anyhow::Result<()> {
+    use crate::capture::BoundaryStage;
+    use crate::capture_setup::SetupResource;
+    let _slot = links.temporary(control, BoundaryStage::Traversal, 1)?;
+    // This is the actual map FD owner; the old helper duplicates this FD into
+    // Aya. The controlled helper must instead borrow this guarded owner.
+    let maps = SetupResource::guarded(
+        HashMap::from([("BIRTH".to_owned(), std::fs::File::open("/dev/null")?.into())]),
+        links,
+        BoundaryStage::Traversal,
+    );
+    struct Scope;
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            BIRTH_BOUNDARY_TEST.with(|s| {
+                s.borrow_mut().take();
+            });
+        }
+    }
+    BIRTH_BOUNDARY_TEST.with(|s| *s.borrow_mut() = Some((mode, gate, links.clone())));
+    let _scope = Scope;
+    links.retain_result(
+        program_births_preparing(&maps, &[(1, 0)], Some(links)),
+        BoundaryStage::Traversal,
+    )
 }
 
 #[cfg(test)]

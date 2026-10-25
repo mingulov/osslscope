@@ -5479,6 +5479,130 @@ pub(crate) fn borrowed_rows<K: aya::Pod, V: aya::Pod>(
     }
     Ok(out)
 }
+pub(crate) fn borrowed_rows_partial<K: aya::Pod, V: aya::Pod>(
+    maps: &HashMap<String, OwnedFd>,
+    name: &str,
+    percpu: bool,
+    setup: &crate::capture_setup::SetupLinks,
+    stage: crate::capture::BoundaryStage,
+) -> anyhow::Result<(Vec<(K, Vec<V>)>, bool)> {
+    use anyhow::Context as _;
+    let map = BorrowedMap::checked(maps.get(name).context("map missing")?.as_fd(), setup, stage)?;
+    map.shape(
+        if percpu { &[5][..] } else { &[1][..] },
+        std::mem::size_of::<K>(),
+        std::mem::size_of::<V>(),
+    )?;
+    let cpus = if percpu {
+        aya::util::nr_cpus().map_err(|(_, e)| e)?
+    } else {
+        1
+    };
+    let stride = if percpu {
+        std::mem::size_of::<V>().next_multiple_of(8)
+    } else {
+        std::mem::size_of::<V>()
+    };
+    stride.checked_mul(cpus).context("per-CPU size overflow")?;
+    Ok(read_partial_rows(
+        map.info.max_entries,
+        stride,
+        cpus,
+        |previous, key| {
+            map.check()?;
+            // SAFETY: the key buffers match the checked map shape and remain live.
+            unsafe { ossl_bpf_sys::map_get_next_key(map.fd.as_raw_fd(), previous, key) }
+        },
+        |key, value| map.lookup(key, value),
+    ))
+}
+
+// Discovery tolerates read loss; traversal above deliberately stays all-or-error.
+fn read_partial_rows<K: aya::Pod, V: aya::Pod>(
+    capacity: u32,
+    stride: usize,
+    cpus: usize,
+    mut next: impl FnMut(Option<&[u8]>, &mut [u8]) -> std::io::Result<()>,
+    mut lookup: impl FnMut(&[u8], &mut [u8]) -> std::io::Result<()>,
+) -> (Vec<(K, Vec<V>)>, bool) {
+    let mut rows = Vec::new();
+    let mut previous: Option<Vec<u8>> = None;
+    let mut seen = HashSet::new();
+    let mut failed = false;
+    let mut values = vec![0; stride * cpus];
+    loop {
+        let mut key = vec![0; std::mem::size_of::<K>()];
+        match next(previous.as_deref(), &mut key) {
+            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => break,
+            Err(_) => {
+                failed = true;
+                break;
+            }
+            Ok(()) => {}
+        }
+        if seen.len() >= capacity as usize || !seen.insert(key.clone()) {
+            failed = true;
+            break;
+        }
+        previous = Some(key.clone());
+        match lookup(&key, &mut values) {
+            Ok(()) => rows.push((
+                pod_value(&key),
+                values
+                    .chunks_exact(stride)
+                    .map(|value| pod_value(&value[..std::mem::size_of::<V>()]))
+                    .collect(),
+            )),
+            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {}
+            Err(_) => {
+                failed = true;
+            }
+        }
+    }
+    (rows, failed)
+}
+
+#[cfg(test)]
+mod partial_row_tests {
+    #[test]
+    fn w079_fullplan_discovery_partial_rows() {
+        for failure in [0, 1, 2] {
+            let mut n = 0u32;
+            let (rows, failed) = super::read_partial_rows::<u32, u64>(
+                8,
+                8,
+                1,
+                |_, key| {
+                    n += 1;
+                    if n == 3 {
+                        return Err(std::io::Error::from_raw_os_error(if failure == 1 {
+                            libc::EIO
+                        } else {
+                            libc::ENOENT
+                        }));
+                    }
+                    key.copy_from_slice(&n.to_ne_bytes());
+                    Ok(())
+                },
+                |key, value| {
+                    if key == 2u32.to_ne_bytes() && failure == 2 {
+                        return Err(std::io::Error::from_raw_os_error(libc::EIO));
+                    }
+                    value.copy_from_slice(&42u64.to_ne_bytes());
+                    Ok(())
+                },
+            );
+            assert_eq!(failed, failure != 0);
+            assert_eq!(
+                rows.first(),
+                Some(&(1, vec![42])),
+                "learned row survives read loss {failure}"
+            );
+            assert_eq!(rows.len(), if failure == 2 { 1 } else { 2 });
+        }
+    }
+}
+
 pub(crate) fn borrowed_ctrl(
     maps: &HashMap<String, OwnedFd>,
     value: Option<&osslscope_ebpf_common::CtrlValue>,

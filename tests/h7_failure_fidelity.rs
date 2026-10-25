@@ -355,65 +355,69 @@ fn c3_config_value_never_publishes_raw() {
     // configuration value reaches any render (JSON + human
     // carry the fixed diagnostic; CBOM carries the kind word
     // only).
-    let dir = std::env::temp_dir().join(format!("osslscope-c3-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("table.json");
-    std::fs::write(
-        &path,
-        r#"{"table_version":1,"entries":[],
-            "fallback":[{"openssl":"unexpected-config-value",
-                         "anchor":"OSSL_PROVIDER_available","delta":8}]}"#,
-    )
-    .unwrap();
-    let err = osslscope::discovery::onboard::load_offset_table_file(&path).unwrap_err();
-    std::fs::remove_file(&path).ok();
-    std::fs::remove_dir(&dir).ok();
-    // Capture's environment-failure route wraps the preserved
-    // chain (capture.rs `offset table: {full}`).
-    let detail = format!("offset table: {}", err.full());
-    assert!(
-        !detail.contains("unexpected-config-value"),
-        "raw configuration value must not survive the chain: {detail}"
-    );
-    let doc = setup_failure_document(FatalKind::Environment(detail));
-    let bytes = render_json(&doc).unwrap();
-    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    let published = v["completeness"]["fatal_kind"]["detail"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    assert!(
-        published.contains("bad fallback version (want numeric major.minor)"),
-        "JSON detail must carry the fixed diagnostic: {published}"
-    );
-    assert!(
-        !published.contains("unexpected-config-value"),
-        "JSON detail must not carry the raw value: {published}"
-    );
-    osslscope::schema::validate_v2(&v).unwrap();
-    osslscope::schema::check_v2_semantics(&v).unwrap();
-    let text = render_human(&doc);
-    assert!(
-        text.contains("bad fallback version (want numeric major.minor)"),
-        "human detail must carry the fixed diagnostic:\n{text}"
-    );
-    assert!(
-        !text.contains("unexpected-config-value"),
-        "human detail must not carry the raw value:\n{text}"
-    );
-    // CBOM carries the kind word only — neither the detail nor
-    // the raw value appears.
-    let cbom: serde_json::Value =
-        serde_json::from_slice(&osslscope::report::render_cbom(&doc).unwrap()).unwrap();
-    let flat = serde_json::to_string(&cbom).unwrap();
-    assert!(
-        flat.contains("environment"),
-        "CBOM must carry the kind word: {flat}"
-    );
-    assert!(
-        !flat.contains("unexpected-config-value") && !flat.contains("bad fallback version"),
-        "CBOM must not carry detail at all: {flat}"
-    );
+    for suffix in ["short".to_owned(), "long".repeat(48)] {
+        let dir =
+            std::env::temp_dir().join(format!("osslscope-c3-{}-{suffix}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("table.json");
+        std::fs::write(
+            &path,
+            r#"{"table_version":1,"entries":[],
+                "fallback":[{"openssl":"unexpected-config-value",
+                             "anchor":"OSSL_PROVIDER_available","delta":8}]}"#,
+        )
+        .unwrap();
+        let err = osslscope::discovery::onboard::load_offset_table_file(&path).unwrap_err();
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir(&dir).ok();
+        // Capture's environment-failure route wraps the preserved
+        // chain (capture.rs `offset table: {full}`).
+        let detail = format!("offset table: {}", err.full());
+        assert!(
+            !detail.contains("unexpected-config-value"),
+            "raw configuration value must not survive the chain: {detail}"
+        );
+        let doc = setup_failure_document(FatalKind::Environment(detail));
+        let bytes = render_json(&doc).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let published = v["completeness"]["fatal_kind"]["detail"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(published.chars().count() <= 200 && !published.contains(['\n', '\r']));
+        assert!(
+            published.contains("bad fallback version (want numeric major.minor)"),
+            "JSON detail must carry the fixed diagnostic: {published}"
+        );
+        assert!(
+            !published.contains("unexpected-config-value"),
+            "JSON detail must not carry the raw value: {published}"
+        );
+        osslscope::schema::validate_v2(&v).unwrap();
+        osslscope::schema::check_v2_semantics(&v).unwrap();
+        let text = render_human(&doc);
+        assert!(
+            text.contains("bad fallback version (want numeric major.minor)"),
+            "human detail must carry the fixed diagnostic:\n{text}"
+        );
+        assert!(
+            !text.contains("unexpected-config-value"),
+            "human detail must not carry the raw value:\n{text}"
+        );
+        // CBOM carries the kind word only — neither the detail nor
+        // the raw value appears.
+        let cbom: serde_json::Value =
+            serde_json::from_slice(&osslscope::report::render_cbom(&doc).unwrap()).unwrap();
+        let flat = serde_json::to_string(&cbom).unwrap();
+        assert!(
+            flat.contains("environment"),
+            "CBOM must carry the kind word: {flat}"
+        );
+        assert!(
+            !flat.contains("unexpected-config-value") && !flat.contains("bad fallback version"),
+            "CBOM must not carry detail at all: {flat}"
+        );
+    }
 }
 
 #[test]

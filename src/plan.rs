@@ -230,8 +230,49 @@ impl PinnedFile {
 /// bound nothing.
 pub fn resolve_pinned(path: &str) -> std::io::Result<PinnedFile> {
     let file = std::fs::File::open(path)?;
-    let meta = file.metadata()?;
+    let meta = pin_metadata(&file)?;
     Ok(pinned_from_metadata(file, meta))
+}
+
+fn pin_metadata(file: &std::fs::File) -> std::io::Result<std::fs::Metadata> {
+    #[cfg(test)]
+    return PIN_METADATA_TEST.with(|slot| {
+        if let Some((mode, gate, links)) = slot.borrow().as_ref() {
+            let raw = std::os::fd::AsRawFd::as_raw_fd(file);
+            if !links.test_fds().contains(&Some(raw)) {
+                links.test_retained_fd(raw);
+            }
+            gate.hold();
+            if *mode == 1 {
+                return Err(std::io::Error::from_raw_os_error(libc::EIO));
+            }
+            assert_ne!(*mode, 2, "actual pin metadata unwind");
+        }
+        file.metadata()
+    });
+    #[cfg(not(test))]
+    file.metadata()
+}
+#[cfg(test)]
+std::thread_local! { static PIN_METADATA_TEST: std::cell::RefCell<Option<(u8, std::sync::Arc<crate::capture_setup::NativeTestGate>, crate::capture_setup::SetupLinks)>> = const { std::cell::RefCell::new(None) }; }
+#[cfg(test)]
+pub(crate) struct PinMetadataTestScope;
+#[cfg(test)]
+impl Drop for PinMetadataTestScope {
+    fn drop(&mut self) {
+        PIN_METADATA_TEST.with(|slot| {
+            slot.borrow_mut().take();
+        });
+    }
+}
+#[cfg(test)]
+pub(crate) fn pin_metadata_test(
+    mode: u8,
+    gate: std::sync::Arc<crate::capture_setup::NativeTestGate>,
+    links: &crate::capture_setup::SetupLinks,
+) -> PinMetadataTestScope {
+    PIN_METADATA_TEST.with(|slot| *slot.borrow_mut() = Some((mode, gate, links.clone())));
+    PinMetadataTestScope
 }
 
 fn pinned_from_metadata(file: std::fs::File, meta: std::fs::Metadata) -> PinnedFile {
@@ -247,11 +288,32 @@ pub(crate) fn resolve_pinned_controlled(
     path: &str,
     links: &crate::capture_setup::SetupLinks,
 ) -> std::io::Result<PinnedFile> {
-    resolve_pinned_controlled_with(path, links, std::fs::File::metadata)
+    resolve_pinned_controlled_with(path, links, pin_metadata)
 }
 fn resolve_pinned_controlled_with(
     path: &str,
     links: &crate::capture_setup::SetupLinks,
+    metadata: impl FnMut(&std::fs::File) -> std::io::Result<std::fs::Metadata>,
+) -> std::io::Result<PinnedFile> {
+    resolve_pinned_with_policy(path, links, true, metadata)
+}
+pub(crate) fn resolve_pinned_preparing(
+    path: &str,
+    links: &crate::capture_setup::SetupLinks,
+    fatal: bool,
+) -> std::io::Result<crate::capture_setup::SetupResource<PinnedFile>> {
+    resolve_pinned_with_policy(path, links, fatal, pin_metadata).map(|pin| {
+        crate::capture_setup::SetupResource::guarded(
+            pin,
+            links,
+            crate::capture::BoundaryStage::Discovery,
+        )
+    })
+}
+fn resolve_pinned_with_policy(
+    path: &str,
+    links: &crate::capture_setup::SetupLinks,
+    fatal: bool,
     mut metadata: impl FnMut(&std::fs::File) -> std::io::Result<std::fs::Metadata>,
 ) -> std::io::Result<PinnedFile> {
     use crate::capture::BoundaryStage;
@@ -292,11 +354,18 @@ fn resolve_pinned_controlled_with(
         }
     }
     let error = last.expect("PIN_OPEN_ATTEMPTS >= 1");
-    links.seal(SetupFailure::io(
-        stage,
-        &error,
-        "setup pin metadata/open failed",
-    ));
+    if fatal {
+        links.seal(SetupFailure::io(
+            stage,
+            &error,
+            "setup pin metadata/open failed",
+        ));
+    }
+    // On a handled failure the healthy worker may complete its temporary I/O.
+    // A cancel/deadline/unwind instead seals BEFORE any acquired File drops.
+    if !fatal {
+        links.check_owned(stage).map_err(std::io::Error::other)?;
+    }
     links.before_dispose(stage);
     Err(error)
 }
@@ -1323,6 +1392,50 @@ mod tests {
 #[cfg(test)]
 mod fix1_pin_retry_tests {
     use super::*;
+    #[test]
+    fn w079_fullplan_recoverable_pin_retry_policy() {
+        use std::os::fd::AsRawFd as _;
+        let links = crate::capture_setup::SetupLinks::new();
+        let mut calls = 0;
+        let failure = resolve_pinned_with_policy("/dev/null", &links, false, |_| {
+            calls += 1;
+            Err(std::io::Error::from_raw_os_error(
+                if calls == PIN_OPEN_ATTEMPTS {
+                    libc::ENOENT
+                } else {
+                    libc::EIO
+                },
+            ))
+        })
+        .err()
+        .unwrap();
+        assert_eq!(calls, PIN_OPEN_ATTEMPTS);
+        assert_eq!(
+            failure.raw_os_error(),
+            Some(libc::ENOENT),
+            "last actual error retained"
+        );
+        links
+            .check_owned(crate::capture::BoundaryStage::Discovery)
+            .unwrap();
+        let fds = links.test_fds();
+        assert_eq!(fds.iter().flatten().count(), PIN_OPEN_ATTEMPTS as usize);
+        assert!(
+            fds.iter()
+                .flatten()
+                .all(|fd| unsafe { libc::fcntl(*fd, libc::F_GETFD) } == -1)
+        );
+        let healthy = crate::capture_setup::SetupLinks::new();
+        let pin = resolve_pinned_preparing("/dev/null", &healthy, false).unwrap();
+        let fd = pin.fd.as_raw_fd();
+        assert!(unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0);
+        drop(pin);
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+        healthy
+            .check_owned(crate::capture::BoundaryStage::Discovery)
+            .unwrap();
+    }
+
     #[test]
     fn w079_fix1_real_file_retry_then_success() {
         use std::os::fd::AsRawFd as _;
