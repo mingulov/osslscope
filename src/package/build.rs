@@ -1352,11 +1352,3182 @@ fn vendor_config_data(sealed: &SealedSource, layout: &mut ExecutorLayout) -> R<V
     })
 }
 
+// Retained artifact buffers carry content identity, never an execution receipt.
+// The only production constructor is the fd-anchored reader below.
+#[derive(Clone, Debug)]
+pub struct RetainedBinary {
+    bytes: Arc<[u8]>,
+    sha256: Digest,
+    length: u64,
+}
+impl RetainedBinary {
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+    pub fn sha256(&self) -> Digest {
+        self.sha256
+    }
+    pub fn length(&self) -> u64 {
+        self.length
+    }
+}
+const ARTIFACT_LIMIT: u64 = 536_870_912;
+const BUILD_RECORD_LIMIT: usize = 1_048_576;
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ArtifactIdentity {
+    dev: u64,
+    ino: u64,
+    mode: u32,
+    links: u64,
+    uid: u32,
+    gid: u32,
+    size: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+impl ArtifactIdentity {
+    fn of(m: &fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            dev: m.dev(),
+            ino: m.ino(),
+            mode: m.mode(),
+            links: m.nlink(),
+            uid: m.uid(),
+            gid: m.gid(),
+            size: m.len(),
+            mtime: (m.mtime(), m.mtime_nsec()),
+            ctime: (m.ctime(), m.ctime_nsec()),
+        }
+    }
+    fn regular(&self) -> bool {
+        self.mode & libc::S_IFMT == libc::S_IFREG
+            && self.links == 1
+            && self.size > 0
+            && self.size <= ARTIFACT_LIMIT
+    }
+}
+// Filled only by the owned broker after its actual child/reap/readonly barrier.
+// No production constructor or caller-supplied freshness/success flag exists.
+struct CurrentArtifactSet {
+    tree: PathBuf,
+    directory: fs::File,
+    files: BTreeMap<String, ArtifactIdentity>,
+    cargo_sha256: Digest,
+    completion: std::process::ExitStatus,
+}
+struct ArtifactRequest {
+    phase: Phase,
+    package: String,
+    version: String,
+    bins: BTreeSet<String>,
+    target: String,
+    tree: PathBuf,
+}
+impl ArtifactRequest {
+    fn derive(sealed: &SealedSource, phase: Phase, paths: &BuildPaths) -> R<Self> {
+        let (manifest, bins, target, tree) = match phase {
+            Phase::Bootstrap => (
+                "Cargo.toml",
+                vec!["osslscope-package"],
+                "x86_64-unknown-linux-gnu".to_owned(),
+                paths.work_root.join("target/bootstrap"),
+            ),
+            Phase::Host => (
+                "Cargo.toml",
+                vec!["osslscope"],
+                sealed.recipe.host_profile.target.clone(),
+                paths.host_target.clone(),
+            ),
+            Phase::Bpf => (
+                "crates/ebpf/Cargo.toml",
+                vec!["osslscope-harvest", "osslscope-count", "osslscope-members"],
+                "bpfel-unknown-none".to_owned(),
+                paths.bpf_target.clone(),
+            ),
+            _ => return Err(invalid("not a Cargo artifact phase")),
+        };
+        let bytes = source::read_regular(
+            &sealed.tree.root,
+            &RelativePath::new(manifest)?,
+            BUILD_RECORD_LIMIT as u64,
+        )?;
+        let doc: toml::Table = std::str::from_utf8(&bytes)
+            .map_err(|_| invalid("artifact manifest encoding"))?
+            .parse()
+            .map_err(|_| invalid("artifact manifest TOML"))?;
+        let package = doc
+            .get("package")
+            .ok_or_else(|| invalid("artifact package"))?;
+        let string = |key| {
+            package
+                .get(key)
+                .and_then(toml::Value::as_str)
+                .map(str::to_owned)
+                .ok_or_else(|| invalid("artifact package identity"))
+        };
+        let result = Self {
+            phase,
+            package: string("name")?,
+            version: string("version")?,
+            bins: bins.into_iter().map(str::to_owned).collect(),
+            target,
+            tree,
+        };
+        if (phase == Phase::Bpf && result.package != "osslscope-ebpf")
+            || (phase != Phase::Bpf
+                && (result.package != "osslscope"
+                    || result.version != sealed.inputs.product_version))
+        {
+            return Err(invalid("artifact manifest selected identity"));
+        }
+        Ok(result)
+    }
+}
+fn snapshot_artifact(
+    file: &fs::File,
+    expected: &ArtifactIdentity,
+    reader: &mut impl std::io::Read,
+) -> R<RetainedBinary> {
+    use std::io::Read;
+    let before = ArtifactIdentity::of(&file.metadata().map_err(|_| invalid("artifact metadata"))?);
+    if &before != expected || !before.regular() {
+        return Err(invalid("artifact identity/type/link/size"));
+    }
+    let mut bytes = Vec::new();
+    reader
+        .take(before.size + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| invalid("artifact read"))?;
+    let after = ArtifactIdentity::of(&file.metadata().map_err(|_| invalid("artifact metadata"))?);
+    if before != after || bytes.len() as u64 != before.size {
+        return Err(invalid("artifact mutated during read"));
+    }
+    let bytes: Arc<[u8]> = Arc::from(bytes);
+    let hash = sha256(&bytes);
+    Ok(RetainedBinary {
+        length: bytes.len() as u64,
+        bytes,
+        sha256: hash,
+    })
+}
+fn artifact_open(root: &fs::File, path: &RelativePath) -> R<fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let mut directory = root.try_clone().map_err(|_| invalid("artifact root fd"))?;
+    let parts = path.as_str().split('/').collect::<Vec<_>>();
+    for (i, part) in parts.iter().enumerate() {
+        let name = std::ffi::CString::new(*part).map_err(|_| invalid("artifact path NUL"))?;
+        let flags = libc::O_RDONLY
+            | libc::O_CLOEXEC
+            | libc::O_NOFOLLOW
+            | libc::O_NONBLOCK
+            | if i + 1 < parts.len() {
+                libc::O_DIRECTORY
+            } else {
+                0
+            };
+        let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(invalid("artifact no-follow open"));
+        }
+        directory = unsafe { fs::File::from_raw_fd(fd) };
+    }
+    Ok(directory)
+}
+fn retain_artifacts(
+    log: &[u8],
+    request: &ArtifactRequest,
+    current: &CurrentArtifactSet,
+) -> R<BTreeMap<String, RetainedBinary>> {
+    if log.is_empty()
+        || log.len() > BUILD_RECORD_LIMIT
+        || log.last() != Some(&b'\n')
+        || !current.completion.success()
+        || sha256(log) != current.cargo_sha256
+        || request.tree != current.tree
+        || !current
+            .directory
+            .metadata()
+            .map_err(|_| invalid("artifact root"))?
+            .is_dir()
+    {
+        return Err(invalid("Cargo invocation custody"));
+    }
+    let mut artifacts = BTreeMap::new();
+    let mut finished = false;
+    let mut total = 0u64;
+    let source = if request.target == "bpfel-unknown-none" {
+        "path+file:///build/source/crates/ebpf"
+    } else {
+        "path+file:///build/source"
+    };
+    let package_id = format!("{source}#{}@{}", request.package, request.version);
+    for line in log[..log.len() - 1].split(|b| *b == b'\n') {
+        // Parse each row with a duplicate-key rejecting visitor via a closed
+        // canonical wrapper. Cargo itself need not emit canonical key order.
+        let value: serde_json::Value =
+            serde_json::from_slice(line).map_err(|_| invalid("Cargo JSON row"))?;
+        let compact = source::json_bytes(&value)?;
+        // The existing record parser exposes no generic duplicate visitor; this
+        // local visitor rejects duplicates recursively before typed inspection.
+        let unique: CargoJson =
+            serde_json::from_slice(line).map_err(|_| invalid("duplicate Cargo JSON field"))?;
+        if source::json_bytes(&unique.0)? != compact || finished {
+            return Err(invalid("Cargo framing/trailing row"));
+        }
+        let object = value
+            .as_object()
+            .ok_or_else(|| invalid("Cargo object row"))?;
+        let reason = object
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| invalid("Cargo reason"))?;
+        match reason {
+            "build-finished" => {
+                if value["success"] != true {
+                    return Err(invalid("Cargo failed build"));
+                }
+                finished = true;
+            }
+            "compiler-message" | "build-script-executed" => {}
+            "compiler-artifact" => {
+                let name = value["target"]["name"]
+                    .as_str()
+                    .ok_or_else(|| invalid("Cargo target name"))?;
+                let selected = request.bins.contains(name);
+                let id = value["package_id"]
+                    .as_str()
+                    .ok_or_else(|| invalid("Cargo package ID"))?;
+                if id != package_id {
+                    if selected {
+                        return Err(invalid("Cargo selected package/version/source"));
+                    }
+                    continue;
+                }
+                if value["target"]["kind"] != serde_json::json!(["bin"]) {
+                    if selected {
+                        return Err(invalid("Cargo selected target kind"));
+                    }
+                    continue;
+                }
+                if !selected
+                    || value["target"]["crate_types"] != serde_json::json!(["bin"])
+                    || value["profile"]["test"] != false
+                    || value["fresh"] != false
+                {
+                    return Err(invalid("Cargo extra/noncurrent bin"));
+                }
+                let executable = value["executable"]
+                    .as_str()
+                    .ok_or_else(|| invalid("Cargo executable absent"))?;
+                let relative = RelativePath::new(format!("{}/release/{name}", request.target))?;
+                let expected_path = format!(
+                    "/build/target/{}/{}",
+                    request.phase.name(),
+                    relative.as_str()
+                );
+                let (manifest, source_path) = match (request.phase, name) {
+                    (Phase::Bootstrap, "osslscope-package") => (
+                        "/build/source/Cargo.toml",
+                        "/build/source/src/bin/osslscope-package.rs",
+                    ),
+                    (Phase::Host, "osslscope") => {
+                        ("/build/source/Cargo.toml", "/build/source/src/main.rs")
+                    }
+                    (Phase::Bpf, "osslscope-harvest") => (
+                        "/build/source/crates/ebpf/Cargo.toml",
+                        "/build/source/crates/ebpf/src/bin/harvest.rs",
+                    ),
+                    (Phase::Bpf, "osslscope-count") => (
+                        "/build/source/crates/ebpf/Cargo.toml",
+                        "/build/source/crates/ebpf/src/bin/count.rs",
+                    ),
+                    (Phase::Bpf, "osslscope-members") => (
+                        "/build/source/crates/ebpf/Cargo.toml",
+                        "/build/source/crates/ebpf/src/bin/members.rs",
+                    ),
+                    _ => return Err(invalid("Cargo selected phase/bin identity")),
+                };
+                if executable != expected_path
+                    || value["manifest_path"] != manifest
+                    || value["target"]["src_path"] != source_path
+                    || value["filenames"] != serde_json::json!([expected_path])
+                    || artifacts.contains_key(name)
+                {
+                    return Err(invalid("Cargo artifact path/duplicate"));
+                }
+                let identity = current
+                    .files
+                    .get(relative.as_str())
+                    .ok_or_else(|| invalid("artifact not current invocation output"))?;
+                total = total
+                    .checked_add(identity.size)
+                    .ok_or_else(|| invalid("artifact total overflow"))?;
+                if total > ARTIFACT_LIMIT {
+                    return Err(invalid("artifact total bound"));
+                }
+                let file = artifact_open(&current.directory, &relative)?;
+                let binary = snapshot_artifact(&file, identity, &mut &file)?;
+                artifacts.insert(name.to_owned(), binary);
+            }
+            _ => return Err(invalid("unexpected Cargo row")),
+        }
+    }
+    if !finished || artifacts.keys().collect::<BTreeSet<_>>() != request.bins.iter().collect() {
+        return Err(invalid("missing Cargo artifacts/completion"));
+    }
+    Ok(artifacts)
+}
+struct CargoJson(serde_json::Value);
+impl<'de> Deserialize<'de> for CargoJson {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = serde_json::Value;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("JSON without duplicate fields")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut a: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut result = serde_json::Map::new();
+                while let Some((k, v)) = a.next_entry::<String, CargoJson>()? {
+                    if result.insert(k, v.0).is_some() {
+                        return Err(serde::de::Error::custom("duplicate field"));
+                    }
+                }
+                Ok(result.into())
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut a: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut v = vec![];
+                while let Some(n) = a.next_element::<CargoJson>()? {
+                    v.push(n.0);
+                }
+                Ok(v.into())
+            }
+            fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<Self::Value, E> {
+                Ok(v.into())
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(v.into())
+            }
+            fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
+                Ok(v.into())
+            }
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                Ok(v.into())
+            }
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
+                Ok(v.into())
+            }
+            fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Self::Value, E> {
+                serde_json::Number::from_f64(v)
+                    .map(Into::into)
+                    .ok_or_else(|| E::custom("number"))
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(serde_json::Value::Null)
+            }
+        }
+        d.deserialize_any(Visitor).map(Self)
+    }
+}
+fn validate_triple(roles: &BTreeMap<super::records::Role, RetainedBinary>) -> R<()> {
+    use super::records::Role;
+    if roles.len() != 3 {
+        return Err(invalid("complete artifact triple required"));
+    }
+    let mut total = 0u64;
+    for role in [Role::Harvest, Role::Count, Role::Members] {
+        let binary = roles
+            .get(&role)
+            .ok_or_else(|| invalid("missing retained role"))?;
+        total = total
+            .checked_add(binary.length)
+            .ok_or_else(|| invalid("retained triple total overflow"))?;
+        if binary.length == 0
+            || binary.length > ARTIFACT_LIMIT
+            || binary.length != binary.bytes.len() as u64
+            || total > ARTIFACT_LIMIT
+            || binary.sha256 != sha256(binary.bytes())
+        {
+            return Err(invalid("retained triple identity/bound"));
+        }
+        // Count goes through object -> real prepare -> installed prepared ->
+        // count prepared policy, exactly as its owner. No BPF syscall occurs.
+        crate::discovery::onboard::check_installed_role_compatible(role, binary.bytes())?;
+    }
+    Ok(())
+}
+fn make_contract(
+    inputs: &super::records::BuildInputs,
+    roles: &BTreeMap<super::records::Role, RetainedBinary>,
+) -> R<super::records::BundleContract> {
+    use super::records::{BundleContract, PackageRecord, Role, RoleEntry, canonical_bytes};
+    inputs.validate()?;
+    validate_triple(roles)?;
+    let (wire_abi, loader_contract_sha256) = super::resolve::compiled_loader_identity()?;
+    let result = BundleContract {
+        schema: "osslscope-bundle-contract-v1".into(),
+        input_id: sha256(&canonical_bytes(inputs)),
+        source: inputs.source.clone(),
+        product_version: inputs.product_version.clone(),
+        host_profile: inputs.host_profile.clone(),
+        wire_abi,
+        loader_contract_sha256,
+        roles: [Role::Harvest, Role::Count, Role::Members]
+            .into_iter()
+            .map(|role| RoleEntry {
+                role,
+                file: RelativePath::new(role.file_name()).expect("fixed role path"),
+                sha256: roles[&role].sha256(),
+                bytes: roles[&role].length(),
+            })
+            .collect(),
+    };
+    result.validate()?;
+    Ok(result)
+}
+
+fn elf_range(bytes: &[u8], offset: u64, length: u64) -> R<&[u8]> {
+    let end = offset
+        .checked_add(length)
+        .ok_or_else(|| invalid("ELF range overflow"))?;
+    let start = usize::try_from(offset).map_err(|_| invalid("ELF offset"))?;
+    let end = usize::try_from(end).map_err(|_| invalid("ELF end"))?;
+    bytes
+        .get(start..end)
+        .ok_or_else(|| invalid("ELF range outside retained buffer"))
+}
+fn elf_u16(bytes: &[u8], at: usize) -> R<u16> {
+    Ok(u16::from_le_bytes(
+        elf_range(bytes, at as u64, 2)?.try_into().unwrap(),
+    ))
+}
+fn elf_u32(bytes: &[u8], at: usize) -> R<u32> {
+    Ok(u32::from_le_bytes(
+        elf_range(bytes, at as u64, 4)?.try_into().unwrap(),
+    ))
+}
+fn elf_u64(bytes: &[u8], at: usize) -> R<u64> {
+    Ok(u64::from_le_bytes(
+        elf_range(bytes, at as u64, 8)?.try_into().unwrap(),
+    ))
+}
+// Long NUL-delimited regions are scanned and UTF-8 checked once, including
+// when consumers reference overlapping suffixes. Short regions cost at most
+// 64 bytes per reference and do not create a cache node for every short string.
+const SHORT_ELF_STRING: usize = 64;
+#[derive(Clone, Copy)]
+struct ElfString<'a> {
+    value: &'a str,
+    is_atom: bool,
+}
+#[derive(Clone, Copy)]
+struct ElfAtom<'a> {
+    value: &'a str,
+    key: usize,
+}
+struct StringRegion<'a> {
+    end: usize,
+    valid_start: usize,
+    valid_suffix: &'a str,
+    last_forbidden: Option<usize>,
+}
+impl<'a> StringRegion<'a> {
+    fn at(&self, offset: usize) -> R<ElfString<'a>> {
+        let relative = offset
+            .checked_sub(self.valid_start)
+            .ok_or_else(|| invalid("ELF string encoding"))?;
+        let value = self
+            .valid_suffix
+            .get(relative..)
+            .ok_or_else(|| invalid("ELF string UTF-8 boundary"))?;
+        Ok(ElfString {
+            value,
+            is_atom: !value.is_empty() && self.last_forbidden.is_none_or(|bad| bad < offset),
+        })
+    }
+}
+struct ElfStrings<'a> {
+    bytes: &'a [u8],
+    regions: BTreeMap<usize, StringRegion<'a>>,
+    // Length precedes text so distinct overlapping suffixes never cause long
+    // shared-text comparisons. Repeated long offsets use numeric keys only.
+    interns: BTreeMap<(usize, &'a str), usize>,
+    long_ids: BTreeMap<usize, usize>,
+    #[cfg(test)]
+    scanned_bytes: usize,
+}
+impl<'a> ElfStrings<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self {
+            bytes,
+            regions: BTreeMap::new(),
+            interns: BTreeMap::new(),
+            long_ids: BTreeMap::new(),
+            #[cfg(test)]
+            scanned_bytes: 0,
+        }
+    }
+    fn lookup(&mut self, offset: u64) -> R<ElfString<'a>> {
+        let offset = usize::try_from(offset).map_err(|_| invalid("ELF string offset"))?;
+        let byte = *self
+            .bytes
+            .get(offset)
+            .ok_or_else(|| invalid("ELF string range"))?;
+        if byte == 0 {
+            return Ok(ElfString {
+                value: "",
+                is_atom: false,
+            });
+        }
+        if let Some((_, region)) = self.regions.range(..=offset).next_back() {
+            if offset < region.end {
+                return region.at(offset);
+            }
+        }
+        let start = self.bytes[..offset]
+            .iter()
+            .rposition(|b| *b == 0)
+            .map_or(0, |p| p + 1);
+        let end = offset
+            + self.bytes[offset..]
+                .iter()
+                .position(|b| *b == 0)
+                .ok_or_else(|| invalid("ELF string terminator"))?;
+        #[cfg(test)]
+        {
+            self.scanned_bytes += end - start + 1;
+        }
+        let mut valid_start = start;
+        let valid_suffix = loop {
+            match std::str::from_utf8(&self.bytes[valid_start..end]) {
+                Ok(value) => {
+                    #[cfg(test)]
+                    {
+                        self.scanned_bytes += end - valid_start;
+                    }
+                    break value;
+                }
+                Err(error) => {
+                    let advance = error.valid_up_to()
+                        + error
+                            .error_len()
+                            .unwrap_or(end - valid_start - error.valid_up_to());
+                    #[cfg(test)]
+                    {
+                        self.scanned_bytes += advance;
+                    }
+                    valid_start += advance;
+                }
+            }
+        };
+        #[cfg(test)]
+        {
+            self.scanned_bytes += valid_suffix.len();
+        }
+        let last_forbidden = valid_suffix
+            .char_indices()
+            .rev()
+            .find(|(_, c)| matches!(c, '@' | '/' | '\\') || c.is_control())
+            .map(|(i, _)| valid_start + i);
+        let region = StringRegion {
+            end,
+            valid_start,
+            valid_suffix,
+            last_forbidden,
+        };
+        let result = region.at(offset);
+        if end - start > SHORT_ELF_STRING {
+            self.regions.insert(start, region);
+        }
+        result
+    }
+    fn atom(&mut self, offset: u64) -> R<ElfAtom<'a>> {
+        let value = self.lookup(offset)?;
+        if !value.is_atom {
+            return Err(invalid("ELF invalid provider/version atom"));
+        }
+        let offset = usize::try_from(offset).map_err(|_| invalid("ELF string offset"))?;
+        if value.value.len() > SHORT_ELF_STRING {
+            if let Some(key) = self.long_ids.get(&offset) {
+                return Ok(ElfAtom {
+                    value: value.value,
+                    key: *key,
+                });
+            }
+        }
+        let next = self.interns.len();
+        let key = *self
+            .interns
+            .entry((value.value.len(), value.value))
+            .or_insert(next);
+        if value.value.len() > SHORT_ELF_STRING {
+            self.long_ids.insert(offset, key);
+        }
+        Ok(ElfAtom {
+            value: value.value,
+            key,
+        })
+    }
+}
+#[derive(Clone)]
+struct HostSection<'a> {
+    name: &'a str,
+    kind: u32,
+    flags: u64,
+    address: u64,
+    offset: u64,
+    size: u64,
+    link: u32,
+    info: u32,
+    entry: u64,
+    alignment: u64,
+}
+#[derive(Clone)]
+struct HostSegment {
+    kind: u32,
+    offset: u64,
+    address: u64,
+    files: u64,
+    memory: u64,
+}
+struct HostElf<'a> {
+    contract: Option<&'a [u8]>,
+    interpreter: Option<&'a str>,
+    needed: Vec<&'a str>,
+    versions: Vec<(&'a str, &'a str)>,
+    build_id: Option<Vec<u8>>,
+}
+// One interval per structural record/header, never one tree node per byte.
+fn disjoint_ranges(ranges: &mut Vec<(u64, u64)>) -> R<()> {
+    if ranges.iter().any(|(start, end)| start > end) {
+        return Err(invalid("ELF reversed interval"));
+    }
+    ranges.retain(|(start, end)| start != end);
+    ranges.sort_unstable();
+    if ranges.windows(2).any(|pair| pair[0].1 > pair[1].0) {
+        return Err(invalid("ELF overlapping intervals"));
+    }
+    Ok(())
+}
+struct NoteGroup {
+    start: u64,
+    end: u64,
+    boundaries: Vec<u64>,
+}
+fn note_groups(mut views: Vec<(u64, u64)>) -> R<Vec<NoteGroup>> {
+    if views.iter().any(|(start, end)| start > end) {
+        return Err(invalid("ELF reversed note view"));
+    }
+    views.retain(|(start, end)| start != end);
+    views.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
+    views.dedup();
+    let mut groups: Vec<NoteGroup> = vec![];
+    let mut stack = vec![];
+    for (start, end) in views {
+        while stack.last().is_some_and(|prior| *prior <= start) {
+            stack.pop();
+        }
+        if let Some(parent) = stack.last() {
+            if end > *parent {
+                return Err(invalid("ELF partially overlapping note views"));
+            }
+        } else {
+            groups.push(NoteGroup {
+                start,
+                end,
+                boundaries: vec![],
+            });
+        }
+        stack.push(end);
+        let group = groups.last_mut().expect("nonempty note group");
+        group.boundaries.extend([start, end]);
+    }
+    for group in &mut groups {
+        group.boundaries.sort_unstable();
+        group.boundaries.dedup();
+    }
+    Ok(groups)
+}
+// Exactly one bit per table byte, with at most ceil(table_bytes/64) words.
+// Version record sizes are constant, so overlap checks have constant work per
+// record and the gap scan is linear in the already bounded retained table.
+struct TableCoverage {
+    length: usize,
+    words: Vec<u64>,
+}
+impl TableCoverage {
+    fn new(length: usize) -> Self {
+        Self {
+            length,
+            words: vec![0; length / 64 + usize::from(length % 64 != 0)],
+        }
+    }
+    fn claim(&mut self, start: usize, length: usize) -> R<()> {
+        let end = start
+            .checked_add(length)
+            .filter(|end| *end <= self.length)
+            .ok_or_else(|| invalid("ELF table coverage range"))?;
+        for i in start..end {
+            let bit = 1u64 << (i % 64);
+            let word = &mut self.words[i / 64];
+            if *word & bit != 0 {
+                return Err(invalid("ELF overlapping version records"));
+            }
+            *word |= bit;
+        }
+        Ok(())
+    }
+    fn zero_gaps(&self, data: &[u8]) -> R<()> {
+        if data.len() != self.length
+            || data
+                .iter()
+                .enumerate()
+                .any(|(i, byte)| *byte != 0 && self.words[i / 64] & (1u64 << (i % 64)) == 0)
+        {
+            return Err(invalid("ELF unclaimed version table data"));
+        }
+        Ok(())
+    }
+}
+fn validate_sysv_hash(data: &[u8], symbol_count: u64) -> R<()> {
+    let buckets = elf_u32(data, 0)? as u64;
+    let chains = elf_u32(data, 4)? as u64;
+    let length = 8u64
+        .checked_add(
+            buckets
+                .checked_add(chains)
+                .and_then(|n| n.checked_mul(4))
+                .ok_or_else(|| invalid("ELF SysV hash array overflow"))?,
+        )
+        .ok_or_else(|| invalid("ELF SysV hash size overflow"))?;
+    if buckets == 0 || chains == 0 || chains != symbol_count || length != data.len() as u64 {
+        return Err(invalid("ELF SysV hash count/size"));
+    }
+    let bucket_data = elf_range(data, 8, buckets * 4)?;
+    let chain_data = elf_range(data, 8 + buckets * 4, chains * 4)?;
+    for entry in bucket_data
+        .chunks_exact(4)
+        .chain(chain_data.chunks_exact(4))
+    {
+        if elf_u32(entry, 0)? as u64 >= chains {
+            return Err(invalid("ELF SysV hash symbol index"));
+        }
+    }
+    if elf_u32(chain_data, 0)? != 0 {
+        return Err(invalid("ELF SysV null symbol chain"));
+    }
+    let mut states = vec![0u8; chains as usize];
+    states[0] = 2;
+    for start in 1..chains as usize {
+        let mut i = start;
+        while states[i] == 0 {
+            states[i] = 1;
+            i = elf_u32(chain_data, i * 4)? as usize;
+        }
+        if states[i] == 1 {
+            return Err(invalid("ELF cyclic SysV hash chain"));
+        }
+        i = start;
+        while states[i] == 1 {
+            states[i] = 2;
+            i = elf_u32(chain_data, i * 4)? as usize;
+        }
+    }
+    Ok(())
+}
+fn validate_gnu_hash(data: &[u8], symbol_count: u64) -> R<()> {
+    let buckets = elf_u32(data, 0)? as u64;
+    let first = elf_u32(data, 4)? as u64;
+    let bloom = elf_u32(data, 8)? as u64;
+    let shift = elf_u32(data, 12)?;
+    if buckets == 0 || !bloom.is_power_of_two() || shift >= u32::BITS || first > symbol_count {
+        return Err(invalid("ELF GNU hash header/symbol offset"));
+    }
+    let bucket_offset = 16u64
+        .checked_add(
+            bloom
+                .checked_mul(8)
+                .ok_or_else(|| invalid("ELF GNU bloom overflow"))?,
+        )
+        .ok_or_else(|| invalid("ELF GNU hash header overflow"))?;
+    let chain_offset = bucket_offset
+        .checked_add(
+            buckets
+                .checked_mul(4)
+                .ok_or_else(|| invalid("ELF GNU bucket overflow"))?,
+        )
+        .ok_or_else(|| invalid("ELF GNU hash arrays overflow"))?;
+    let end = chain_offset
+        .checked_add(
+            (symbol_count - first)
+                .checked_mul(4)
+                .ok_or_else(|| invalid("ELF GNU chain overflow"))?,
+        )
+        .ok_or_else(|| invalid("ELF GNU hash size overflow"))?;
+    if end != data.len() as u64 {
+        return Err(invalid("ELF GNU hash full array bound"));
+    }
+    elf_range(data, 16, bloom * 8)?;
+    let mut starts = vec![];
+    for row in elf_range(data, bucket_offset, buckets * 4)?.chunks_exact(4) {
+        let symbol = elf_u32(row, 0)? as u64;
+        if symbol != 0 {
+            if symbol < first || symbol >= symbol_count {
+                return Err(invalid("ELF GNU bucket symbol index"));
+            }
+            // There cannot be more nonempty bucket roots than hashed symbols.
+            // Refuse repeated roots before retaining an attacker-sized vector.
+            if starts.len() as u64 >= symbol_count - first {
+                return Err(invalid("ELF GNU excessive bucket roots"));
+            }
+            starts.push(symbol);
+        }
+    }
+    starts.sort_unstable();
+    if starts.windows(2).any(|p| p[0] == p[1])
+        || first < symbol_count && starts.first() != Some(&first)
+        || first == symbol_count && !starts.is_empty()
+    {
+        return Err(invalid("ELF GNU hash symbol coverage"));
+    }
+    for (i, start) in starts.iter().copied().enumerate() {
+        let end = starts.get(i + 1).copied().unwrap_or(symbol_count);
+        for symbol in start..end {
+            let value = elf_u32(data, (chain_offset + (symbol - first) * 4) as usize)?;
+            if (value & 1 != 0) != (symbol + 1 == end) {
+                return Err(invalid("ELF GNU hash chain termination"));
+            }
+        }
+    }
+    Ok(())
+}
+fn host_elf(bytes: &[u8]) -> R<HostElf<'_>> {
+    if bytes.is_empty()
+        || bytes.len() as u64 > ARTIFACT_LIMIT
+        || elf_range(bytes, 0, 7)? != b"\x7fELF\x02\x01\x01"
+        || !matches!(elf_u16(bytes, 16)?, 2 | 3)
+        || elf_u16(bytes, 18)? != 62
+        || elf_u32(bytes, 20)? != 1
+        || elf_u16(bytes, 52)? != 64
+    {
+        return Err(invalid(
+            "ELF64 little-endian x86_64 executable/PIE required",
+        ));
+    }
+    let phoff = elf_u64(bytes, 32)?;
+    let phnum = elf_u16(bytes, 56)? as u64;
+    let shoff = elf_u64(bytes, 40)?;
+    let shnum = elf_u16(bytes, 60)? as u64;
+    let names_index = elf_u16(bytes, 62)? as u64;
+    if phnum == 0
+        || phnum == 0xffff
+        || shnum < 2
+        || names_index == 0
+        || names_index >= shnum
+        || elf_u16(bytes, 54)? != 56
+        || elf_u16(bytes, 58)? != 64
+        || phoff < 64
+        || shoff < 64
+    {
+        return Err(invalid("ELF full header tables required"));
+    }
+    let phbytes = elf_range(bytes, phoff, phnum * 56)?;
+    let shbytes = elf_range(bytes, shoff, shnum * 64)?;
+    let overlaps = |a: u64, n: u64, b: u64, m: u64| n != 0 && m != 0 && a < b + m && b < a + n;
+    if overlaps(phoff, phnum * 56, shoff, shnum * 64) || shbytes[..64].iter().any(|b| *b != 0) {
+        return Err(invalid("ELF table overlap/null section"));
+    }
+    let names_header = &shbytes[names_index as usize * 64..(names_index as usize + 1) * 64];
+    if elf_u32(names_header, 4)? != 3 {
+        return Err(invalid("ELF section-name table type"));
+    }
+    let names = elf_range(
+        bytes,
+        elf_u64(names_header, 24)?,
+        elf_u64(names_header, 32)?,
+    )?;
+    if names.first() != Some(&0) || names.last() != Some(&0) {
+        return Err(invalid("ELF section-name framing"));
+    }
+    let mut names = ElfStrings::new(names);
+    let mut section_ranges = vec![
+        (0, 64),
+        (phoff, phoff + phnum * 56),
+        (shoff, shoff + shnum * 64),
+    ];
+    let mut sections: Vec<HostSection<'_>> = vec![];
+    let mut seen = BTreeSet::new();
+    for row in shbytes[64..].chunks_exact(64) {
+        let name = names.lookup(elf_u32(row, 0)? as u64)?.value;
+        if name.is_empty() || !seen.insert((name.len(), name)) {
+            return Err(invalid("ELF duplicate/empty section name"));
+        }
+        let section = HostSection {
+            name,
+            kind: elf_u32(row, 4)?,
+            flags: elf_u64(row, 8)?,
+            address: elf_u64(row, 16)?,
+            offset: elf_u64(row, 24)?,
+            size: elf_u64(row, 32)?,
+            link: elf_u32(row, 40)?,
+            info: elf_u32(row, 44)?,
+            alignment: elf_u64(row, 48)?,
+            entry: elf_u64(row, 56)?,
+        };
+        if section.link as u64 >= shnum
+            || section.alignment > 1 && !section.alignment.is_power_of_two()
+            || section.entry != 0 && section.size % section.entry != 0
+        {
+            return Err(invalid("ELF section link/alignment/entry"));
+        }
+        if section.kind != 8 {
+            elf_range(bytes, section.offset, section.size)?;
+            section_ranges.push((section.offset, section.offset + section.size));
+        }
+        section
+            .address
+            .checked_add(section.size)
+            .ok_or_else(|| invalid("ELF section address overflow"))?;
+        sections.push(section);
+    }
+    disjoint_ranges(&mut section_ranges)?;
+    let section_data = |s: &HostSection<'_>| elf_range(bytes, s.offset, s.size);
+    let mut segments: Vec<HostSegment> = vec![];
+    let mut unique_segments = BTreeSet::new();
+    for row in phbytes.chunks_exact(56) {
+        let segment = HostSegment {
+            kind: elf_u32(row, 0)?,
+            offset: elf_u64(row, 8)?,
+            address: elf_u64(row, 16)?,
+            files: elf_u64(row, 32)?,
+            memory: elf_u64(row, 40)?,
+        };
+        let align = elf_u64(row, 48)?;
+        elf_range(bytes, segment.offset, segment.files)?;
+        segment
+            .address
+            .checked_add(segment.memory)
+            .ok_or_else(|| invalid("ELF segment address overflow"))?;
+        if segment.files > segment.memory
+            || align > 1 && !align.is_power_of_two()
+            || segment.kind == 1 && align > 1 && segment.address % align != segment.offset % align
+        {
+            return Err(invalid("ELF segment sizes/alignment"));
+        }
+        if matches!(segment.kind, 2 | 3) && !unique_segments.insert(segment.kind) {
+            return Err(invalid("ELF duplicate dynamic/interpreter segment"));
+        }
+        segments.push(segment);
+    }
+    let mut loads = segments
+        .iter()
+        .filter(|s| s.kind == 1 && s.memory != 0)
+        .collect::<Vec<_>>();
+    loads.sort_unstable_by_key(|p| p.address);
+    let mut load_ranges = loads
+        .iter()
+        .map(|p| (p.address, p.address + p.memory))
+        .collect::<Vec<_>>();
+    disjoint_ranges(&mut load_ranges)?;
+    if loads.is_empty() {
+        return Err(invalid("ELF load segment absent"));
+    }
+    for s in &sections {
+        if s.flags & 2 != 0 && s.size > 0 {
+            let owner = loads
+                .partition_point(|p| p.address <= s.address)
+                .checked_sub(1)
+                .and_then(|i| loads.get(i))
+                .ok_or_else(|| invalid("ELF allocated section outside unique load"))?;
+            if s.address + s.size > owner.address + owner.memory
+                || s.kind != 8
+                    && (s.offset < owner.offset
+                        || s.address - owner.address != s.offset - owner.offset
+                        || s.offset + s.size > owner.offset + owner.files)
+            {
+                return Err(invalid("ELF allocated section outside unique load"));
+            }
+        }
+    }
+    let mapped = |address: u64, length: u64| -> R<&[u8]> {
+        let end = address
+            .checked_add(length)
+            .ok_or_else(|| invalid("ELF mapped range overflow"))?;
+        let p = loads
+            .partition_point(|p| p.address <= address)
+            .checked_sub(1)
+            .and_then(|i| loads.get(i))
+            .ok_or_else(|| invalid("ELF unmapped virtual range"))?;
+        if end > p.address + p.files {
+            return Err(invalid("ELF unmapped virtual range"));
+        }
+        elf_range(bytes, p.offset + (address - p.address), length)
+    };
+    let mut string_tables: BTreeMap<u32, ElfStrings<'_>> = BTreeMap::new();
+    for s in &sections {
+        match s.kind {
+            2 | 11 => {
+                if s.entry != 24 || s.link == 0 || sections[(s.link - 1) as usize].kind != 3 {
+                    return Err(invalid("ELF symbol table framing/link"));
+                }
+                let bytes = section_data(&sections[(s.link - 1) as usize])?;
+                let strings = string_tables
+                    .entry(s.link)
+                    .or_insert_with(|| ElfStrings::new(bytes));
+                for sym in section_data(s)?.chunks_exact(24) {
+                    strings.lookup(elf_u32(sym, 0)? as u64)?;
+                    let index = elf_u16(sym, 6)?;
+                    if index < 0xff00 && index as u64 >= shnum {
+                        return Err(invalid("ELF symbol section index"));
+                    }
+                }
+            }
+            4 | 9 => {
+                let width = if s.kind == 4 { 24 } else { 16 };
+                if s.entry != width
+                    || s.link == 0
+                    || !matches!(sections[(s.link - 1) as usize].kind, 2 | 11)
+                    || s.info as u64 >= shnum
+                {
+                    return Err(invalid("ELF relocation framing/link"));
+                }
+                let count = sections[(s.link - 1) as usize].size / 24;
+                for rel in section_data(s)?.chunks_exact(width as usize) {
+                    if elf_u64(rel, 8)? >> 32 >= count {
+                        return Err(invalid("ELF relocation symbol index"));
+                    }
+                }
+            }
+            0x6fffffff => {
+                if s.entry != 2
+                    || s.link == 0
+                    || sections[(s.link - 1) as usize].kind != 11
+                    || s.size / 2 != sections[(s.link - 1) as usize].size / 24
+                {
+                    return Err(invalid("ELF version-symbol bounds/link"));
+                }
+            }
+            _ => {}
+        }
+    }
+    for kind in [0x6ffffffe, 0x6ffffffd, 0x6fffffff] {
+        if sections.iter().filter(|s| s.kind == kind).count() > 1 {
+            return Err(invalid("ELF ambiguous version tables"));
+        }
+    }
+    let mut result = HostElf {
+        contract: None,
+        interpreter: None,
+        needed: vec![],
+        versions: vec![],
+        build_id: None,
+    };
+    if let Some(s) = sections
+        .iter()
+        .find(|s| s.name == ".osslscope.bundle_contract")
+    {
+        if s.kind != 1 || s.flags != 2 || s.size == 0 || s.size > BUILD_RECORD_LIMIT as u64 {
+            return Err(invalid("ELF contract section shape/bound"));
+        }
+        let data = section_data(s)?;
+        super::records::parse_canonical::<super::records::BundleContract>(data)?;
+        result.contract = Some(data);
+    }
+    let interp_section = sections.iter().find(|s| s.name == ".interp");
+    if let Some(p) = segments.iter().find(|s| s.kind == 3) {
+        let data = elf_range(bytes, p.offset, p.files)?;
+        let name = ElfStrings::new(data).lookup(0)?.value;
+        let s = interp_section.ok_or_else(|| invalid("ELF interpreter section absent"))?;
+        if data.len() != name.len() + 1
+            || name.is_empty()
+            || !name.starts_with('/')
+            || name[1..].split('/').any(|p| matches!(p, "" | "." | ".."))
+            || name.chars().any(char::is_control)
+            || name.contains('\\')
+            || s.kind != 1
+            || s.flags & 2 == 0
+            || s.offset != p.offset
+            || s.size != p.files
+            || mapped(p.address, p.files)? != data
+        {
+            return Err(invalid("ELF interpreter shape/mapping"));
+        }
+        result.interpreter = Some(name);
+    } else if interp_section.is_some() {
+        return Err(invalid("ELF orphan interpreter section"));
+    }
+    let dyn_sections = sections.iter().filter(|s| s.kind == 6).collect::<Vec<_>>();
+    if dyn_sections.len() > 1 {
+        return Err(invalid("ELF ambiguous dynamic sections"));
+    }
+    let mut tags = BTreeMap::<u64, u64>::new();
+    let mut needed_offsets = vec![];
+    if let Some(p) = segments.iter().find(|s| s.kind == 2) {
+        let s = dyn_sections
+            .first()
+            .ok_or_else(|| invalid("ELF dynamic section absent"))?;
+        if s.offset != p.offset
+            || s.size != p.files
+            || s.entry != 16
+            || s.size == 0
+            || s.size % 16 != 0
+            || s.link == 0
+            || sections[(s.link - 1) as usize].kind != 3
+            || mapped(p.address, p.files)? != section_data(s)?
+        {
+            return Err(invalid("ELF dynamic framing/mapping"));
+        }
+        let mut terminated = false;
+        for row in section_data(s)?.chunks_exact(16) {
+            let tag = elf_u64(row, 0)?;
+            let value = elf_u64(row, 8)?;
+            if terminated {
+                if tag != 0 || value != 0 {
+                    return Err(invalid("ELF dynamic data after null"));
+                }
+                continue;
+            }
+            if tag == 0 {
+                if value != 0 {
+                    return Err(invalid("ELF dynamic null value"));
+                }
+                terminated = true;
+                continue;
+            }
+            if matches!(tag, 15 | 29 | 0x7ffffffd | 0x7fffffff) {
+                return Err(invalid("ELF unsupported dynamic lookup mechanism"));
+            }
+            if tag == 1 {
+                needed_offsets.push(value);
+            } else if tags.insert(tag, value).is_some() {
+                return Err(invalid("ELF duplicate dynamic tag"));
+            }
+        }
+        if !terminated {
+            return Err(invalid("ELF unterminated dynamic table"));
+        }
+        let strings = &sections[(s.link - 1) as usize];
+        if tags.get(&5) != Some(&strings.address) || tags.get(&10) != Some(&strings.size) {
+            return Err(invalid("ELF dynamic string table disagreement"));
+        }
+        let string_bytes = mapped(strings.address, strings.size)?;
+        if !std::ptr::eq(section_data(strings)?, string_bytes) {
+            return Err(invalid("ELF dynamic string section/mapping identity"));
+        }
+        if string_bytes.first() != Some(&0) || string_bytes.last() != Some(&0) {
+            return Err(invalid("ELF dynamic strings framing"));
+        }
+        let strings = string_tables
+            .entry(s.link)
+            .or_insert_with(|| ElfStrings::new(string_bytes));
+        if !std::ptr::eq(strings.bytes, string_bytes) {
+            return Err(invalid("ELF dynamic string cache identity"));
+        }
+        let mut needed_ids = BTreeSet::new();
+        for offset in needed_offsets {
+            let name = strings.atom(offset)?;
+            if !needed_ids.insert(name.key) {
+                return Err(invalid("ELF duplicate/invalid needed provider"));
+            }
+            result.needed.push(name.value);
+        }
+        let associated = |address: u64,
+                          length: u64,
+                          kind: u32,
+                          entry: Option<u64>,
+                          link: Option<u32>|
+         -> R<&HostSection<'_>> {
+            if address == 0 {
+                return Err(invalid("ELF zero dynamic table address"));
+            }
+            let mut matches = sections.iter().filter(|section| {
+                section.kind == kind
+                    && section.address == address
+                    && section.size == length
+                    && section.flags & 2 != 0
+                    && entry.is_none_or(|width| section.entry == width)
+                    && link.is_none_or(|index| section.link == index)
+            });
+            let section = matches
+                .next()
+                .ok_or_else(|| invalid("ELF dynamic table section association"))?;
+            if matches.next().is_some() || mapped(address, length)? != section_data(section)? {
+                return Err(invalid("ELF ambiguous dynamic table association"));
+            }
+            Ok(section)
+        };
+        let dynamic_symbols = match (tags.get(&6), tags.get(&11)) {
+            (Some(address), Some(24)) => {
+                let mut candidates = sections
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, section)| section.kind == 11 && section.address == *address);
+                let (index, section) = candidates
+                    .next()
+                    .ok_or_else(|| invalid("ELF dynamic symbols absent"))?;
+                if candidates.next().is_some() {
+                    return Err(invalid("ELF ambiguous dynamic symbols"));
+                }
+                associated(*address, section.size, 11, Some(24), Some(s.link))?;
+                Some((index as u32 + 1, section.size / 24))
+            }
+            (None, None) => None,
+            _ => return Err(invalid("ELF partial dynamic symbol table")),
+        };
+        for (tag, kind) in [(4, 5), (0x6ffffef5, 0x6ffffff6)] {
+            let mut candidates = sections.iter().filter(|section| section.kind == kind);
+            let hash = candidates.next();
+            if candidates.next().is_some() {
+                return Err(invalid("ELF ambiguous dynamic hash sections"));
+            }
+            match (tags.get(&tag), hash) {
+                (Some(address), Some(section)) => {
+                    let (index, count) = dynamic_symbols
+                        .ok_or_else(|| invalid("ELF hash without dynamic symbols"))?;
+                    associated(
+                        *address,
+                        section.size,
+                        kind,
+                        if tag == 4 { Some(4) } else { None },
+                        Some(index),
+                    )?;
+                    let data = mapped(*address, section.size)?;
+                    if tag == 4 {
+                        validate_sysv_hash(data, count)?;
+                    } else {
+                        validate_gnu_hash(data, count)?;
+                    }
+                }
+                (None, None) => {}
+                _ => return Err(invalid("ELF partial/orphan dynamic hash table")),
+            }
+        }
+        for (pointer, size, entry, kind, width) in [(7, 8, 9, 4, 24), (17, 18, 19, 9, 16)] {
+            match (tags.get(&pointer), tags.get(&size)) {
+                (Some(address), Some(length)) => {
+                    if tags.get(&entry) != Some(&width) || length % width != 0 {
+                        return Err(invalid("ELF dynamic relocation entry size"));
+                    }
+                    let (index, _) = dynamic_symbols
+                        .ok_or_else(|| invalid("ELF relocations without dynamic symbols"))?;
+                    associated(*address, *length, kind, Some(width), Some(index))?;
+                }
+                (None, None) => {}
+                _ => return Err(invalid("ELF partial dynamic relocation table")),
+            }
+        }
+        match (tags.get(&23), tags.get(&2), tags.get(&20)) {
+            (Some(address), Some(length), Some(discriminator)) => {
+                let (kind, width) = match discriminator {
+                    7 => (4, 24),
+                    17 => (9, 16),
+                    _ => return Err(invalid("ELF invalid PLT relocation discriminator")),
+                };
+                if length % width != 0 {
+                    return Err(invalid("ELF PLT relocation width"));
+                }
+                let (index, _) =
+                    dynamic_symbols.ok_or_else(|| invalid("ELF PLT without dynamic symbols"))?;
+                associated(*address, *length, kind, Some(width), Some(index))?;
+            }
+            (None, None, None) => {}
+            _ => return Err(invalid("ELF partial PLT relocation table")),
+        }
+        for (pointer, size, kind) in [(25, 27, 14), (26, 28, 15), (32, 33, 16)] {
+            match (tags.get(&pointer), tags.get(&size)) {
+                (Some(address), Some(length)) => {
+                    if length % 8 != 0 {
+                        return Err(invalid("ELF dynamic pointer-array width"));
+                    }
+                    associated(*address, *length, kind, Some(8), None)?;
+                }
+                (None, None) => {}
+                _ => return Err(invalid("ELF partial dynamic pointer array")),
+            }
+        }
+        for pointer in [12, 13, 0x6ffffff0] {
+            if let Some(address) = tags.get(&pointer) {
+                if *address != 0 {
+                    mapped(*address, 1)?;
+                }
+            }
+        }
+        let mut version_indices = BTreeSet::new();
+        let mut version_pairs = BTreeSet::new();
+        let verneed = sections.iter().find(|s| s.kind == 0x6ffffffe);
+        match (tags.get(&0x6ffffffe), tags.get(&0x6fffffff), verneed) {
+            (Some(address), Some(count), Some(v)) => {
+                if *address != v.address
+                    || *count == 0
+                    || *count != v.info as u64
+                    || v.link != s.link
+                {
+                    return Err(invalid("ELF version need identity/count/link"));
+                }
+                let data = mapped(*address, v.size)?;
+                let mut at = 0usize;
+                let mut occupied = TableCoverage::new(data.len());
+                let mut providers = BTreeSet::new();
+                for i in 0..*count {
+                    let row = elf_range(data, at as u64, 16)?;
+                    occupied.claim(at, 16)?;
+                    if elf_u16(row, 0)? != 1 {
+                        return Err(invalid("ELF version need format"));
+                    }
+                    let provider = strings.atom(elf_u32(row, 4)? as u64)?;
+                    if !needed_ids.contains(&provider.key) || !providers.insert(provider.key) {
+                        return Err(invalid("ELF version need provider"));
+                    }
+                    let aux_count = elf_u16(row, 2)? as usize;
+                    let aux = elf_u32(row, 8)? as usize;
+                    if aux_count == 0 || aux < 16 {
+                        return Err(invalid("ELF version auxiliaries absent"));
+                    }
+                    let mut pos = at
+                        .checked_add(aux)
+                        .ok_or_else(|| invalid("ELF version aux overflow"))?;
+                    for j in 0..aux_count {
+                        let aux = elf_range(data, pos as u64, 16)?;
+                        occupied.claim(pos, 16)?;
+                        let index = elf_u16(aux, 6)? & 0x7fff;
+                        if index < 2 || !version_indices.insert(index) {
+                            return Err(invalid("ELF reserved/duplicate external version index"));
+                        }
+                        let version = strings.atom(elf_u32(aux, 8)? as u64)?;
+                        if !version_pairs.insert((provider.key, version.key)) {
+                            return Err(invalid("ELF duplicate/invalid version requirement"));
+                        }
+                        result.versions.push((provider.value, version.value));
+                        let next = elf_u32(aux, 12)? as usize;
+                        if (j + 1 == aux_count) != (next == 0) || next != 0 && next < 16 {
+                            return Err(invalid("ELF version aux chain"));
+                        }
+                        pos = pos
+                            .checked_add(next)
+                            .ok_or_else(|| invalid("ELF version aux overflow"))?;
+                    }
+                    let next = elf_u32(row, 12)? as usize;
+                    if (i + 1 == *count) != (next == 0) || next != 0 && next < 16 {
+                        return Err(invalid("ELF version need chain"));
+                    }
+                    at = at
+                        .checked_add(next)
+                        .ok_or_else(|| invalid("ELF version need overflow"))?;
+                }
+                occupied.zero_gaps(data)?;
+            }
+            (None, None, None) => {}
+            _ => return Err(invalid("ELF partial/orphan version need")),
+        }
+        // Executables with exported version definitions remain supported, with
+        // every forward/aux range validated rather than delegated to strings.
+        let verdef = sections.iter().find(|s| s.kind == 0x6ffffffd);
+        match (tags.get(&0x6ffffffc), tags.get(&0x6ffffffd), verdef) {
+            (Some(address), Some(count), Some(v)) => {
+                if *address != v.address
+                    || *count == 0
+                    || *count != v.info as u64
+                    || v.link != s.link
+                {
+                    return Err(invalid("ELF version definition identity/count"));
+                }
+                let data = mapped(*address, v.size)?;
+                let mut at = 0usize;
+                let mut occupied = TableCoverage::new(data.len());
+                for i in 0..*count {
+                    let row = elf_range(data, at as u64, 20)?;
+                    occupied.claim(at, 20)?;
+                    if elf_u16(row, 0)? != 1 {
+                        return Err(invalid("ELF version definition format"));
+                    }
+                    let index = elf_u16(row, 4)? & 0x7fff;
+                    if index == 0 || !version_indices.insert(index) {
+                        return Err(invalid("ELF reserved/duplicate version definition index"));
+                    }
+                    let n = elf_u16(row, 6)? as usize;
+                    let aux = elf_u32(row, 12)? as usize;
+                    if n == 0 || aux < 20 {
+                        return Err(invalid("ELF version definition auxiliaries"));
+                    }
+                    let mut pos = at
+                        .checked_add(aux)
+                        .ok_or_else(|| invalid("ELF version overflow"))?;
+                    for j in 0..n {
+                        let a = elf_range(data, pos as u64, 8)?;
+                        occupied.claim(pos, 8)?;
+                        strings.atom(elf_u32(a, 0)? as u64)?;
+                        let next = elf_u32(a, 4)? as usize;
+                        if (j + 1 == n) != (next == 0) || next != 0 && next < 8 {
+                            return Err(invalid("ELF definition aux chain"));
+                        }
+                        pos = pos
+                            .checked_add(next)
+                            .ok_or_else(|| invalid("ELF definition overflow"))?;
+                    }
+                    let next = elf_u32(row, 16)? as usize;
+                    if (i + 1 == *count) != (next == 0) || next != 0 && next < 20 {
+                        return Err(invalid("ELF definition chain"));
+                    }
+                    at = at
+                        .checked_add(next)
+                        .ok_or_else(|| invalid("ELF definition overflow"))?;
+                }
+                occupied.zero_gaps(data)?;
+            }
+            (None, None, None) => {}
+            _ => return Err(invalid("ELF partial/orphan version definitions")),
+        }
+        let versym = sections.iter().find(|s| s.kind == 0x6fffffff);
+        match (tags.get(&0x6ffffff0), versym) {
+            (Some(address), Some(section)) => {
+                if *address != section.address {
+                    return Err(invalid("ELF version-symbol address mismatch"));
+                }
+                for index in mapped(*address, section.size)?.chunks_exact(2) {
+                    let index = elf_u16(index, 0)? & 0x7fff;
+                    if index > 1 && !version_indices.contains(&index) {
+                        return Err(invalid("ELF unknown symbol version index"));
+                    }
+                }
+            }
+            (None, None) => {}
+            _ => return Err(invalid("ELF partial version-symbol table")),
+        }
+    } else if !dyn_sections.is_empty()
+        || sections
+            .iter()
+            .any(|s| matches!(s.kind, 0x6ffffffe | 0x6ffffffd | 0x6fffffff))
+    {
+        return Err(invalid("ELF orphan dynamic/version sections"));
+    }
+    let views = sections
+        .iter()
+        .filter(|s| s.kind == 7)
+        .map(|s| (s.offset, s.offset + s.size))
+        .chain(
+            segments
+                .iter()
+                .filter(|s| s.kind == 4)
+                .map(|s| (s.offset, s.offset + s.files)),
+        )
+        .collect();
+    for group in note_groups(views)? {
+        let offset = group.start;
+        let size = group.end - group.start;
+        let data = elf_range(bytes, offset, size)?;
+        let mut at = 0usize;
+        let mut boundary_index = 1;
+        while at < data.len() {
+            let row = elf_range(data, at as u64, 12)?;
+            let ns = elf_u32(row, 0)? as usize;
+            let ds = elf_u32(row, 4)? as usize;
+            let typ = elf_u32(row, 8)?;
+            let no = at + 12;
+            let name = elf_range(data, no as u64, ns as u64)?;
+            if !name.is_empty() && name.last() != Some(&0) {
+                return Err(invalid("ELF unterminated note owner"));
+            }
+            let desc_at = no
+                .checked_add(ns)
+                .and_then(|n| n.checked_add(3))
+                .ok_or_else(|| invalid("ELF note overflow"))?
+                & !3;
+            let desc = elf_range(data, desc_at as u64, ds as u64)?;
+            let end = desc_at
+                .checked_add(ds)
+                .and_then(|n| n.checked_add(3))
+                .ok_or_else(|| invalid("ELF note overflow"))?
+                & !3;
+            if data
+                .get(no + ns..desc_at)
+                .ok_or_else(|| invalid("ELF note padding"))?
+                .iter()
+                .chain(
+                    data.get(desc_at + ds..end)
+                        .ok_or_else(|| invalid("ELF note padding"))?,
+                )
+                .any(|b| *b != 0)
+            {
+                return Err(invalid("ELF nonzero note padding"));
+            }
+            if typ == 3 && name == b"GNU\0" {
+                if ds == 0 || ds > 64 || result.build_id.is_some() {
+                    return Err(invalid("ELF absent/duplicate/oversized build ID"));
+                }
+                result.build_id = Some(desc.to_vec());
+            }
+            at = end;
+            let boundary = offset + at as u64;
+            while group
+                .boundaries
+                .get(boundary_index)
+                .is_some_and(|wanted| *wanted <= boundary)
+            {
+                if group.boundaries[boundary_index] != boundary {
+                    return Err(invalid("ELF note view cuts a record"));
+                }
+                boundary_index += 1;
+            }
+        }
+        if boundary_index != group.boundaries.len() {
+            return Err(invalid("ELF note boundary range"));
+        }
+    }
+    Ok(result)
+}
+fn host_contract_bytes(bytes: &[u8]) -> R<&[u8]> {
+    host_elf(bytes)?
+        .contract
+        .ok_or_else(|| invalid("unique canonical host contract absent"))
+}
+/// Extract a structurally valid canonical contract from one retained host ELF.
+/// This alone does not admit provenance, source identity, ABI cells or a payload.
+pub fn extract_host_contract(bytes: &[u8]) -> R<super::records::BundleContract> {
+    super::records::parse_canonical(host_contract_bytes(bytes)?)
+}
+fn validate_host_abi(bytes: &[u8], evidence: &source::AbiEvidence) -> R<()> {
+    let elf = host_elf(bytes)?;
+    if evidence.schema != "osslscope-abi-evidence-v1" || evidence.cells.is_empty() {
+        return Err(invalid("ABI evidence cells absent"));
+    }
+    for cell in &evidence.cells {
+        match &cell.interpreter {
+            source::AbiInterpreter::Static => {
+                if elf.interpreter.is_some()
+                    || !elf.needed.is_empty()
+                    || !elf.versions.is_empty()
+                    || !cell.needed.is_empty()
+                    || !cell.symbol_versions.is_empty()
+                {
+                    return Err(invalid("static ABI contains dynamic requirements"));
+                }
+            }
+            source::AbiInterpreter::Dynamic { path } => {
+                let needed = cell
+                    .needed
+                    .iter()
+                    .map(|value| (value.len(), value.as_str()))
+                    .collect::<BTreeSet<_>>();
+                let versions = cell
+                    .symbol_versions
+                    .iter()
+                    .map(|value| {
+                        let (provider, version) = value
+                            .split_once('@')
+                            .ok_or_else(|| invalid("ABI provider/version pair"))?;
+                        Ok((provider.len(), version.len(), provider, version))
+                    })
+                    .collect::<R<BTreeSet<_>>>()?;
+                if elf.interpreter != Some(path.as_str())
+                    || elf
+                        .needed
+                        .iter()
+                        .any(|name| !needed.contains(&(name.len(), *name)))
+                    || elf.versions.iter().any(|(provider, version)| {
+                        !versions.contains(&(provider.len(), version.len(), *provider, *version))
+                    })
+                {
+                    return Err(invalid("host ABI unsupported by required measured cell"));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+fn inspect_bootstrap(bytes: &[u8], layout: &ExecutorLayout) -> R<()> {
+    let elf = host_elf(bytes)?;
+    if elf.contract.is_some() || elf.interpreter != Some("/lib64/ld-linux-x86-64.so.2") {
+        return Err(invalid("bootstrap must be GNU and descriptor-free"));
+    }
+    let mut tree = None;
+    for bytes in layout.documents.values() {
+        let value: serde_json::Value =
+            serde_json::from_slice(bytes).map_err(|_| invalid("retained layout document"))?;
+        if value["schema"] == "osslscope-executor-host-v1" {
+            if tree.is_some() {
+                return Err(invalid("duplicate retained host manifest"));
+            }
+            tree = Some(host_tree(bytes)?);
+        }
+    }
+    let tree = tree.ok_or_else(|| invalid("retained bootstrap host tree absent"))?;
+    if !matches!(
+        tree.resolve("lib64/ld-linux-x86-64.so.2")?,
+        ToolNode::File { mode: 0o755, .. }
+    ) {
+        return Err(invalid("bootstrap GNU interpreter unavailable"));
+    }
+    for name in elf.needed {
+        let mut identities = BTreeSet::new();
+        for prefix in [
+            "lib/x86_64-linux-gnu",
+            "usr/lib/x86_64-linux-gnu",
+            "lib64",
+            "usr/lib64",
+            "lib",
+            "usr/lib",
+        ] {
+            if let Ok(ToolNode::File { sha256, bytes, .. }) =
+                tree.resolve(&format!("{prefix}/{name}"))
+            {
+                identities.insert((sha256.0, *bytes));
+            }
+        }
+        if identities.len() != 1 {
+            return Err(invalid(
+                "bootstrap dependency missing/ambiguous in retained GNU rootfs",
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::inventory::source_fixtures::Fixture;
     use super::*;
     use serde_json::json;
+    mod retained {
+        use super::*;
+        use crate::package::records::{BundleContract, Role, parse_canonical};
+        use crate::package::source::{AbiCell, AbiEvidence, AbiInterpreter};
+        use std::os::unix::{fs::symlink, process::ExitStatusExt};
+        fn w16(b: &mut [u8], at: usize, n: u16) {
+            b[at..at + 2].copy_from_slice(&n.to_le_bytes());
+        }
+        fn w32(b: &mut [u8], at: usize, n: u32) {
+            b[at..at + 4].copy_from_slice(&n.to_le_bytes());
+        }
+        fn w64(b: &mut [u8], at: usize, n: u64) {
+            b[at..at + 8].copy_from_slice(&n.to_le_bytes());
+        }
+        // Independent section/symbol assembler: no production policy table is read.
+        type Section = (&'static str, u32, u64, Vec<u8>, u32, u32, u64);
+        fn image(
+            machine: u16,
+            kind: u16,
+            mut sections: Vec<Section>,
+            phnum: usize,
+        ) -> (Vec<u8>, BTreeMap<String, (usize, usize)>, usize) {
+            let mut names = vec![0];
+            let mut no = vec![0];
+            for s in &sections {
+                no.push(names.len());
+                names.extend(s.0.as_bytes());
+                names.push(0);
+            }
+            no.push(names.len());
+            names.extend(b".shstrtab\0");
+            sections.push((".shstrtab", 3, 0, names, 0, 0, 0));
+            let mut b = vec![0; 64 + phnum * 56];
+            b[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+            w16(&mut b, 16, kind);
+            w16(&mut b, 18, machine);
+            w32(&mut b, 20, 1);
+            w16(&mut b, 52, 64);
+            if phnum > 0 {
+                w64(&mut b, 32, 64);
+                w16(&mut b, 54, 56);
+                w16(&mut b, 56, phnum as u16);
+            }
+            w16(&mut b, 58, 64);
+            w16(&mut b, 60, (sections.len() + 1) as u16);
+            w16(&mut b, 62, sections.len() as u16);
+            let mut spans = BTreeMap::new();
+            for s in &sections {
+                while b.len() % 8 != 0 {
+                    b.push(0);
+                }
+                spans.insert(s.0.to_string(), (b.len(), s.3.len()));
+                b.extend(&s.3);
+            }
+            while b.len() % 8 != 0 {
+                b.push(0);
+            }
+            let sh = b.len();
+            w64(&mut b, 40, sh as u64);
+            b.resize(sh + 64 * (sections.len() + 1), 0);
+            for (i, s) in sections.iter().enumerate() {
+                let at = sh + (i + 1) * 64;
+                let (off, len) = spans[s.0];
+                w32(&mut b, at, no[i + 1] as u32);
+                w32(&mut b, at + 4, s.1);
+                w64(&mut b, at + 8, s.2);
+                if s.2 & 2 != 0 {
+                    w64(&mut b, at + 16, 0x400000 + off as u64);
+                }
+                w64(&mut b, at + 24, off as u64);
+                w64(&mut b, at + 32, len as u64);
+                w32(&mut b, at + 40, s.4);
+                w32(&mut b, at + 44, s.5);
+                w64(&mut b, at + 48, 8);
+                w64(&mut b, at + 56, s.6);
+            }
+            (b, spans, sh)
+        }
+        fn contract() -> Vec<u8> {
+            source::json_bytes(&json!({"schema":"osslscope-bundle-contract-v1","input_id":"11".repeat(32),"source":{"revision":"a".repeat(40),"inventory_sha256":"22".repeat(32)},"product_version":"0.1.0","host_profile":{"target":"x86_64-unknown-linux-gnu","abi_profile":"linux-x86_64-gnu","abi_floor":"fixture"},"wire_abi":2,"loader_contract_sha256":"33".repeat(32),"roles":[{"role":"harvest","file":"osslscope-harvest","bytes":1,"sha256":"44".repeat(32)},{"role":"count","file":"osslscope-count","bytes":2,"sha256":"55".repeat(32)},{"role":"members","file":"osslscope-members","bytes":3,"sha256":"66".repeat(32)}]})).unwrap()
+        }
+        fn host(
+            dynamic: bool,
+            descriptor: bool,
+        ) -> (Vec<u8>, BTreeMap<String, (usize, usize)>, usize) {
+            host_needed(dynamic, descriptor, &[1])
+        }
+        fn host_needed(
+            dynamic: bool,
+            descriptor: bool,
+            needed: &[u64],
+        ) -> (Vec<u8>, BTreeMap<String, (usize, usize)>, usize) {
+            let mut sections = vec![];
+            if descriptor {
+                sections.push((".osslscope.bundle_contract", 1, 2, contract(), 0, 0, 0));
+            }
+            if dynamic {
+                sections.push((
+                    ".interp",
+                    1,
+                    2,
+                    b"/lib64/ld-linux-x86-64.so.2\0".to_vec(),
+                    0,
+                    0,
+                    0,
+                ));
+                sections.push((
+                    ".dynstr",
+                    3,
+                    2,
+                    b"\0libc.so.6\0GLIBC_2.17\0".to_vec(),
+                    0,
+                    0,
+                    0,
+                ));
+                let mut ver = vec![0; 32];
+                w16(&mut ver, 0, 1);
+                w16(&mut ver, 2, 1);
+                w32(&mut ver, 4, 1);
+                w32(&mut ver, 8, 16);
+                w16(&mut ver, 22, 2);
+                w32(&mut ver, 24, 11);
+                let stridx = sections.len() as u32;
+                sections.push((".gnu.version_r", 0x6ffffffe, 2, ver, stridx, 1, 0));
+                sections.push((
+                    ".dynamic",
+                    6,
+                    3,
+                    vec![0; (5 + needed.len()) * 16],
+                    stridx,
+                    0,
+                    16,
+                ));
+            }
+            let (mut b, spans, sh) = image(62, 3, sections, if dynamic { 3 } else { 1 });
+            let len = b.len() as u64;
+            w32(&mut b, 64, 1);
+            w32(&mut b, 68, 5);
+            w64(&mut b, 80, 0x400000);
+            w64(&mut b, 88, 0x400000);
+            w64(&mut b, 96, len);
+            w64(&mut b, 104, len);
+            w64(&mut b, 112, 0x1000);
+            if dynamic {
+                for (i, (typ, name)) in [(3, ".interp"), (2, ".dynamic")].iter().enumerate() {
+                    let at = 120 + i * 56;
+                    let (off, len) = spans[*name];
+                    w32(&mut b, at, *typ);
+                    w32(&mut b, at + 4, 4);
+                    w64(&mut b, at + 8, off as u64);
+                    w64(&mut b, at + 16, 0x400000 + off as u64);
+                    w64(&mut b, at + 32, len as u64);
+                    w64(&mut b, at + 40, len as u64);
+                    w64(&mut b, at + 48, 8);
+                }
+                let d = spans[".dynamic"].0;
+                let mut entries = vec![
+                    (5, 0x400000 + spans[".dynstr"].0 as u64),
+                    (10, spans[".dynstr"].1 as u64),
+                ];
+                entries.extend(needed.iter().map(|offset| (1, *offset)));
+                entries.extend([
+                    (0x6ffffffe, 0x400000 + spans[".gnu.version_r"].0 as u64),
+                    (0x6fffffff, 1),
+                    (0, 0),
+                ]);
+                for (i, (tag, val)) in entries.into_iter().enumerate() {
+                    w64(&mut b, d + i * 16, tag);
+                    w64(&mut b, d + i * 16 + 8, val);
+                }
+            }
+            (b, spans, sh)
+        }
+        fn abi(dynamic: bool) -> AbiEvidence {
+            serde_json::from_value(json!({"schema":"osslscope-abi-evidence-v1","host_profile":{"target":if dynamic {"x86_64-unknown-linux-gnu"}else{"x86_64-unknown-linux-musl"},"abi_profile":if dynamic {"linux-x86_64-gnu"}else{"linux-x86_64-musl"},"abi_floor":"fixture"},"cells":[{"name":"one","interpreter":if dynamic {json!({"kind":"dynamic","path":"/lib64/ld-linux-x86-64.so.2"})}else{json!({"kind":"static"})},"needed":if dynamic {vec!["libc.so.6"]}else{vec![]},"symbol_versions":if dynamic {vec!["libc.so.6@GLIBC_2.17"]}else{vec![]}}]})).unwrap()
+        }
+        fn retained_bytes(bytes: Vec<u8>) -> RetainedBinary {
+            let length = bytes.len() as u64;
+            let hash = sha256(&bytes);
+            RetainedBinary {
+                bytes: Arc::from(bytes),
+                sha256: hash,
+                length,
+            }
+        }
+        // Literal independent maps: (name,type,key,value,maximum,flags).
+        fn maps(role: Role) -> Vec<(&'static str, [u32; 5])> {
+            match role {
+                Role::Count => vec![
+                    ("COUNTS", [5, 8, 24, 8192, 0]),
+                    ("ADMITTED", [6, 4, 8, 1, 0]),
+                    ("LATC", [6, 4, 8, 16, 0]),
+                    ("GEN", [2, 4, 4, 1, 0]),
+                    ("TARGET", [2, 4, 8, 1, 0]),
+                    ("WINDOW", [2, 4, 8, 2, 0]),
+                    ("DROPFAIL", [6, 4, 8, 1, 0]),
+                ],
+                Role::Harvest => vec![
+                    ("EVENTS", [27, 0, 0, 2097152, 0]),
+                    ("PENDING_INIT", [1, 8, 8, 1024, 0]),
+                    ("PENDING_QUERY", [1, 8, 16, 1024, 0]),
+                    ("TERMD", [1, 8, 8, 1024, 0]),
+                    ("GEN", [1, 8, 8, 1024, 0]),
+                    ("LOSS", [5, 4, 8, 32, 0]),
+                    ("QUERY_NEXT", [1, 16, 8, 4096, 0]),
+                    ("TRUNC", [5, 4, 8, 64, 0]),
+                    ("CALLS", [5, 4, 8, 64, 0]),
+                    ("TRIP", [5, 8, 8, 128, 0]),
+                    ("LGCALLS", [5, 4, 8, 64, 0]),
+                    ("ALG_CLASS", [1, 8, 42, 1024, 0]),
+                    ("TRIP_CLASS", [1, 8, 22, 64, 0]),
+                    ("JUMPS", [3, 4, 4, 8, 0]),
+                ],
+                Role::Members => vec![
+                    ("EVENTS", [27, 0, 0, 16777216, 0]),
+                    ("BUCKET", [1, 4, 8, 4096, 0]),
+                    ("GEN", [1, 8, 8, 1024, 0]),
+                    ("LOSS", [5, 4, 8, 32, 0]),
+                    ("TRUNC", [5, 4, 8, 64, 0]),
+                    ("CALLS", [5, 4, 8, 64, 0]),
+                    ("ALG_CLASS", [1, 8, 42, 1024, 0]),
+                    ("SCAN", [9, 4, 40, 1024, 0]),
+                    ("SEQ", [1, 4, 8, 4096, 0]),
+                    ("BIRTH", [1, 4, 2, 4096, 0]),
+                    ("RCOUNT", [1, 4, 8, 4096, 0]),
+                    ("T_CACHE", [1, 8, 16, 1024, 0]),
+                    ("CTRL", [2, 4, 24, 1, 0]),
+                    ("ATTEMPT", [6, 4, 8, 1, 0]),
+                    ("TRUNC_SEQ", [5, 4, 8, 64, 0]),
+                ],
+            }
+        }
+        fn bpf(role: Role) -> Vec<u8> {
+            bpf_variant(role, None, false)
+        }
+        fn bpf_variant(role: Role, extra: Option<Section>, callback: bool) -> Vec<u8> {
+            let maps = maps(role);
+            let mut roots: Vec<(String, bool)> = match role {
+                Role::Count => vec![("count_entry".into(), false)],
+                Role::Harvest => vec![
+                    ("init_entry".into(), false),
+                    ("init_return".into(), true),
+                    ("query_entry".into(), false),
+                    ("query_return".into(), true),
+                    ("trip_count".into(), false),
+                    ("trip_str0".into(), false),
+                    ("trip_str1".into(), false),
+                ],
+                Role::Members => vec![("member_entry".into(), false)],
+            };
+            if role == Role::Harvest {
+                for i in 0..8 {
+                    roots.push((format!("c{i}"), true));
+                }
+            }
+            if role == Role::Members {
+                for i in 0..512 {
+                    roots.push((format!("member_{i:03}"), true));
+                }
+            }
+            let mut strings = vec![0];
+            let mut symbols = vec![0; 24];
+            let mut defs = vec![];
+            let mut up = vec![];
+            let mut ret = vec![];
+            let mut rel = vec![];
+            for (name, dims) in &maps {
+                let nameoff = strings.len();
+                strings.extend(name.as_bytes());
+                strings.push(0);
+                let at = symbols.len();
+                symbols.resize(at + 24, 0);
+                w32(&mut symbols, at, nameoff as u32);
+                symbols[at + 4] = 0x11;
+                w16(&mut symbols, at + 6, 3);
+                w64(&mut symbols, at + 8, defs.len() as u64);
+                w64(&mut symbols, at + 16, 28);
+                for d in dims.iter().copied().chain([0, 0]) {
+                    defs.extend(d.to_le_bytes());
+                }
+            }
+            for (name, is_return) in roots {
+                let code = if is_return { &mut ret } else { &mut up };
+                let offset = code.len();
+                if role == Role::Count {
+                    for i in 0..7 {
+                        let pos = code.len();
+                        code.extend([0x18, 1, 0, 0, 0, 0, 0, 0]);
+                        code.extend([0; 8]);
+                        rel.extend((pos as u64).to_le_bytes());
+                        rel.extend((((i + 1) as u64) << 32 | 1).to_le_bytes());
+                    }
+                }
+                if callback {
+                    code.extend([0x18, 1, 0, 0, 0, 0, 0, 0]);
+                    code.extend([0; 8]);
+                    rel.extend((112u64).to_le_bytes());
+                    rel.extend(((9u64 << 32) | 1).to_le_bytes());
+                }
+                code.extend([0x95, 0, 0, 0, 0, 0, 0, 0]);
+                let nameoff = strings.len();
+                strings.extend(name.as_bytes());
+                strings.push(0);
+                let at = symbols.len();
+                symbols.resize(at + 24, 0);
+                w32(&mut symbols, at, nameoff as u32);
+                symbols[at + 4] = 0x12;
+                w16(&mut symbols, at + 6, if is_return { 5 } else { 4 });
+                w64(&mut symbols, at + 8, offset as u64);
+                w64(&mut symbols, at + 16, (code.len() - offset) as u64);
+            }
+            if callback {
+                let off = strings.len();
+                strings.extend(b"callback\0");
+                let at = symbols.len();
+                symbols.resize(at + 24, 0);
+                w32(&mut symbols, at, off as u32);
+                symbols[at + 4] = 0x12;
+                w16(&mut symbols, at + 6, 7);
+                w64(&mut symbols, at + 16, 8);
+            }
+            let mut sections = vec![
+                (".strtab", 3, 0, strings, 0, 0, 0),
+                (".symtab", 2, 0, symbols, 1, 1, 24),
+                ("maps", 1, 0, defs, 0, 0, 0),
+                ("uprobe", 1, 6, up, 0, 0, 0),
+                (
+                    "uretprobe",
+                    1,
+                    if role == Role::Count { 0 } else { 6 },
+                    ret,
+                    0,
+                    0,
+                    0,
+                ),
+                (".reluprobe", 9, 0, rel, 2, 4, 16),
+            ];
+            if callback {
+                sections.push((".text", 1, 6, vec![0x95, 0, 0, 0, 0, 0, 0, 0], 0, 0, 0));
+            }
+            if let Some(extra) = extra {
+                sections.push(extra);
+            }
+            image(247, 1, sections, 0).0
+        }
+        fn triple() -> BTreeMap<Role, RetainedBinary> {
+            [Role::Harvest, Role::Count, Role::Members]
+                .into_iter()
+                .map(|r| (r, retained_bytes(bpf(r))))
+                .collect()
+        }
+        #[test]
+        fn triple_real_prepare_positive() {
+            let roles = triple();
+            validate_triple(&roles).unwrap();
+            let (_f, sealed) = super::layout_fixture("gnu");
+            let c = make_contract(&sealed.inputs, &roles).unwrap();
+            assert_eq!(c.roles.len(), 3);
+            assert_eq!(c.roles[2].bytes, roles[&Role::Members].length());
+            assert_eq!(
+                (c.wire_abi, c.loader_contract_sha256),
+                crate::package::resolve::compiled_loader_identity().unwrap()
+            );
+            for role in [Role::Harvest, Role::Count, Role::Members] {
+                let mut pair = triple();
+                pair.remove(&role);
+                assert!(validate_triple(&pair).is_err());
+            }
+        }
+        #[test]
+        fn count_full_chain_negatives() {
+            let valid = bpf(Role::Count);
+            crate::discovery::onboard::check_installed_role_compatible(Role::Count, &valid)
+                .unwrap();
+            let parsed = goblin::elf::Elf::parse(&valid).unwrap();
+            let up = parsed
+                .section_headers
+                .iter()
+                .find(|s| parsed.shdr_strtab.get_at(s.sh_name) == Some("uprobe"))
+                .unwrap()
+                .sh_offset as usize;
+            let mut tail = valid.clone();
+            tail[up + 112] = 0x85;
+            w32(&mut tail, up + 116, 12);
+            assert!(
+                crate::loader::prepare(
+                    &tail,
+                    &crate::loader::COUNT_MAPS,
+                    &crate::loader::COUNT_PROGS
+                )
+                .is_ok()
+            );
+            let mut roles = triple();
+            roles.insert(Role::Count, retained_bytes(tail));
+            assert!(validate_triple(&roles).is_err());
+            for mutation in 0..5 {
+                let mut p = crate::loader::prepare(
+                    &valid,
+                    &crate::loader::COUNT_MAPS,
+                    &crate::loader::COUNT_PROGS,
+                )
+                .unwrap();
+                match mutation {
+                    0 => p.progs[0].subprogs[0].is_callback = true,
+                    1 => p.progs[0].subprogs[0].insn_off = 1,
+                    2 => p.progs[0].map_fixups[0].map = "UNREVIEWED".into(),
+                    3 => p.progs[0].map_fixups[0].insn_off = 1,
+                    _ => {
+                        p.progs[0].insns[1] = 0x40;
+                    }
+                }
+                assert!(crate::discovery::onboard::validate_installed_count_prepared(&p).is_err());
+            }
+            let mut renamed = valid.clone();
+            let at = renamed
+                .windows(12)
+                .position(|b| b == b"count_entry\0")
+                .unwrap();
+            renamed[at] = b'x';
+            let mut roles = triple();
+            roles.insert(Role::Count, retained_bytes(renamed));
+            assert!(validate_triple(&roles).is_err());
+        }
+        #[test]
+        fn host_section_unique_canonical_ranges() {
+            let (b, spans, sh) = host(true, true);
+            assert_eq!(host_contract_bytes(&b).unwrap(), contract());
+            assert_eq!(
+                extract_host_contract(&b).unwrap(),
+                parse_canonical::<BundleContract>(&contract()).unwrap()
+            );
+            let mut bad = b.clone();
+            w64(&mut bad, sh + 64 + 24, u64::MAX);
+            assert!(extract_host_contract(&bad).is_err());
+            let mut bad = b.clone();
+            bad[spans[".osslscope.bundle_contract"].0] = b' ';
+            assert!(extract_host_contract(&bad).is_err());
+            let mut bad = b.clone();
+            w32(&mut bad, sh + 128, 1);
+            assert!(extract_host_contract(&bad).is_err());
+            let mut bad = b.clone();
+            w64(
+                &mut bad,
+                sh + 128 + 24,
+                spans[".osslscope.bundle_contract"].0 as u64,
+            );
+            assert!(extract_host_contract(&bad).is_err());
+            assert!(extract_host_contract(&b[..b.len() - 1]).is_err());
+            assert!(extract_host_contract(&host(false, false).0).is_err());
+            for off in [4, 5, 18, 16] {
+                let mut bad = b.clone();
+                bad[off] = 0;
+                assert!(extract_host_contract(&bad).is_err());
+            }
+        }
+        #[test]
+        fn abi_every_cell_and_provider() {
+            let (b, spans, sh) = host(true, true);
+            validate_host_abi(&b, &abi(true)).unwrap();
+            validate_host_abi(&host(false, true).0, &abi(false)).unwrap();
+            let mut a = abi(true);
+            a.cells.push(AbiCell {
+                name: "second".into(),
+                interpreter: AbiInterpreter::Dynamic {
+                    path: "/wrong/loader".into(),
+                },
+                needed: vec!["libc.so.6".into()],
+                symbol_versions: vec!["libc.so.6@GLIBC_2.17".into()],
+            });
+            assert!(validate_host_abi(&b, &a).is_err());
+            for mutation in 0..4 {
+                let mut a = abi(true);
+                match mutation {
+                    0 => a.cells[0].needed.clear(),
+                    1 => a.cells[0].symbol_versions = vec!["libother.so@GLIBC_2.17".into()],
+                    2 => a.cells[0].symbol_versions = vec!["libc.so.6@GLIBC_2.9".into()],
+                    _ => a.cells[0].interpreter = AbiInterpreter::Static,
+                };
+                assert!(validate_host_abi(&b, &a).is_err());
+            }
+            for tag in [15u64, 29, 0x7ffffffd, 0x7fffffff] {
+                let mut bad = b.clone();
+                w64(&mut bad, spans[".dynamic"].0 + 32, tag);
+                assert!(validate_host_abi(&bad, &abi(true)).is_err());
+            }
+            let mut bad = b.clone();
+            w32(&mut bad, spans[".gnu.version_r"].0 + 8, u32::MAX);
+            assert!(validate_host_abi(&bad, &abi(true)).is_err());
+            let mut bad = b.clone();
+            w64(&mut bad, sh + 4 * 64 + 24, 0);
+            assert!(validate_host_abi(&bad, &abi(true)).is_err());
+            assert!(validate_host_abi(&b, &abi(false)).is_err());
+            assert!(validate_host_abi(&host(false, true).0, &abi(true)).is_err());
+        }
+        #[test]
+        fn genuine_callback_and_generic_policy_refusals() {
+            let extra = bpf_variant(
+                Role::Count,
+                Some(("extra_exec", 1, 6, vec![0x95, 0, 0, 0, 0, 0, 0, 0], 0, 0, 0)),
+                false,
+            );
+            assert!(
+                crate::loader::prepare(
+                    &extra,
+                    &crate::loader::COUNT_MAPS,
+                    &crate::loader::COUNT_PROGS
+                )
+                .is_ok()
+            );
+            let mut roles = triple();
+            roles.insert(Role::Count, retained_bytes(extra));
+            assert!(validate_triple(&roles).is_err());
+            let callback = bpf_variant(Role::Count, None, true);
+            let p = crate::loader::prepare(
+                &callback,
+                &crate::loader::COUNT_MAPS,
+                &crate::loader::COUNT_PROGS,
+            )
+            .unwrap();
+            assert!(p.progs[0].subprogs.iter().any(|s| s.is_callback));
+            assert!(
+                p.progs[0]
+                    .insns
+                    .chunks_exact(8)
+                    .any(|i| i[0] == 0x18 && i[1] >> 4 == 4)
+            );
+            let mut roles = triple();
+            roles.insert(Role::Count, retained_bytes(callback));
+            assert!(validate_triple(&roles).is_err());
+            for role in [Role::Harvest, Role::Count, Role::Members] {
+                for license in [b"GPL\0".as_slice(), b"Dual BSD/GPL\0".as_slice()] {
+                    let mut roles = triple();
+                    roles.insert(
+                        role,
+                        retained_bytes(bpf_variant(
+                            role,
+                            Some((".license", 1, 0, license.to_vec(), 0, 0, 0)),
+                            false,
+                        )),
+                    );
+                    validate_triple(&roles).unwrap();
+                }
+                for extra in [
+                    (".license", 1, 0, b"MIT\0".to_vec(), 0, 0, 0),
+                    (".BTF", 1, 0, vec![0; 8], 0, 0, 0),
+                    (".BTF.ext", 1, 0, vec![0; 8], 0, 0, 0),
+                ] {
+                    let mut roles = triple();
+                    roles.insert(role, retained_bytes(bpf_variant(role, Some(extra), false)));
+                    assert!(validate_triple(&roles).is_err());
+                }
+                let mut bytes = bpf(role);
+                let elf = goblin::elf::Elf::parse(&bytes).unwrap();
+                let map = elf
+                    .section_headers
+                    .iter()
+                    .find(|s| elf.shdr_strtab.get_at(s.sh_name) == Some("maps"))
+                    .unwrap()
+                    .sh_offset as usize;
+                w32(&mut bytes, map + 12, 1);
+                let mut roles = triple();
+                roles.insert(role, retained_bytes(bytes));
+                assert!(validate_triple(&roles).is_err());
+            }
+        }
+        #[test]
+        fn artifact_requests_derive_source_version_and_fixed_roles() {
+            for profile in ["gnu", "musl"] {
+                let (_f, sealed) = super::layout_fixture(profile);
+                let paths = BuildPaths {
+                    work_root: "/build".into(),
+                    host_target: "/build/target/host".into(),
+                    bpf_target: "/build/target/bpf".into(),
+                    cache_root: "/build/cache".into(),
+                    output_root: "/output".into(),
+                };
+                let b = ArtifactRequest::derive(&sealed, Phase::Bpf, &paths).unwrap();
+                assert_eq!(
+                    (
+                        b.package.as_str(),
+                        b.version.as_str(),
+                        b.target.as_str(),
+                        b.bins.len()
+                    ),
+                    ("osslscope-ebpf", "0.0.0", "bpfel-unknown-none", 3)
+                );
+                let b = ArtifactRequest::derive(&sealed, Phase::Bootstrap, &paths).unwrap();
+                assert_eq!(
+                    (b.target.as_str(), b.tree, b.bins),
+                    (
+                        "x86_64-unknown-linux-gnu",
+                        PathBuf::from("/build/target/bootstrap"),
+                        BTreeSet::from(["osslscope-package".into()])
+                    )
+                );
+                let h = ArtifactRequest::derive(&sealed, Phase::Host, &paths).unwrap();
+                assert_eq!(h.version, sealed.inputs.product_version);
+                assert_eq!(
+                    h.target,
+                    if profile == "gnu" {
+                        "x86_64-unknown-linux-gnu"
+                    } else {
+                        "x86_64-unknown-linux-musl"
+                    }
+                );
+                assert!(ArtifactRequest::derive(&sealed, Phase::Native, &paths).is_err());
+            }
+        }
+        fn note(name: &[u8; 4], kind: u32) -> Vec<u8> {
+            let mut b = vec![0; 24];
+            w32(&mut b, 0, 4);
+            w32(&mut b, 4, 8);
+            w32(&mut b, 8, kind);
+            b[12..16].copy_from_slice(name);
+            b[16..].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+            b
+        }
+        fn noted_host(duplicate: bool) -> Vec<u8> {
+            let (mut b, spans, _) = image(
+                62,
+                3,
+                vec![
+                    (".osslscope.bundle_contract", 1, 2, contract(), 0, 0, 0),
+                    (".note.gnu.build-id", 7, 2, note(b"GNU\0", 3), 0, 0, 0),
+                    (
+                        ".note.other",
+                        7,
+                        2,
+                        if duplicate {
+                            note(b"GNU\0", 3)
+                        } else {
+                            note(b"XYZ\0", 1)
+                        },
+                        0,
+                        0,
+                        0,
+                    ),
+                ],
+                2,
+            );
+            let len = b.len() as u64;
+            w32(&mut b, 64, 1);
+            w64(&mut b, 80, 0x400000);
+            w64(&mut b, 96, len);
+            w64(&mut b, 104, len);
+            w64(&mut b, 112, 0x1000);
+            w32(&mut b, 120, 4);
+            let off = spans[".note.gnu.build-id"].0 as u64;
+            w64(&mut b, 128, off);
+            w64(&mut b, 136, 0x400000 + off);
+            w64(&mut b, 152, 48);
+            w64(&mut b, 160, 48);
+            w64(&mut b, 168, 4);
+            b
+        }
+        #[test]
+        fn malformed_note_owner() {
+            let mut b = noted_host(false);
+            let off = u64::from_le_bytes(b[128..136].try_into().unwrap()) as usize;
+            b[off + 15] = b'x';
+            assert!(extract_host_contract(&b).is_err());
+        }
+        #[test]
+        fn reserved_external_version_index() {
+            let (mut b, spans, _) = host(true, true);
+            w16(&mut b, spans[".gnu.version_r"].0 + 22, 0);
+            assert!(validate_host_abi(&b, &abi(true)).is_err());
+        }
+        #[test]
+        fn host_notes_exact_identity_and_shared_views() {
+            let b = noted_host(false);
+            assert_eq!(
+                host_elf(&b).unwrap().build_id,
+                Some(vec![1, 2, 3, 4, 5, 6, 7, 8])
+            );
+            assert_eq!(host_elf(&host(false, true).0).unwrap().build_id, None);
+            assert!(extract_host_contract(&noted_host(true)).is_err());
+            let mut truncated = b.clone();
+            let off = u64::from_le_bytes(b[128..136].try_into().unwrap()) as usize;
+            w32(&mut truncated, off + 4, u32::MAX);
+            assert!(extract_host_contract(&truncated).is_err());
+            let mut partial = b;
+            w64(&mut partial, 128, (off + 4) as u64);
+            assert!(extract_host_contract(&partial).is_err());
+        }
+        #[test]
+        fn fixed_logical_cargo_paths_use_distinct_physical_custody() {
+            let physical = root();
+            let paths = BuildPaths {
+                work_root: physical.clone(),
+                host_target: physical.join("target/host"),
+                bpf_target: physical.join("target/bpf"),
+                cache_root: physical.join("cache"),
+                output_root: physical.join("output"),
+            };
+            for profile in ["gnu", "musl"] {
+                let (_f, sealed) = super::layout_fixture(profile);
+                for (phase, logical, manifest, sources) in [
+                    (
+                        Phase::Bootstrap,
+                        "/build/target/bootstrap",
+                        "/build/source/Cargo.toml",
+                        vec![(
+                            "osslscope-package",
+                            "/build/source/src/bin/osslscope-package.rs",
+                        )],
+                    ),
+                    (
+                        Phase::Bpf,
+                        "/build/target/bpf",
+                        "/build/source/crates/ebpf/Cargo.toml",
+                        vec![
+                            (
+                                "osslscope-harvest",
+                                "/build/source/crates/ebpf/src/bin/harvest.rs",
+                            ),
+                            (
+                                "osslscope-count",
+                                "/build/source/crates/ebpf/src/bin/count.rs",
+                            ),
+                            (
+                                "osslscope-members",
+                                "/build/source/crates/ebpf/src/bin/members.rs",
+                            ),
+                        ],
+                    ),
+                    (
+                        Phase::Host,
+                        "/build/target/host",
+                        "/build/source/Cargo.toml",
+                        vec![("osslscope", "/build/source/src/main.rs")],
+                    ),
+                ] {
+                    let req = ArtifactRequest::derive(&sealed, phase, &paths).unwrap();
+                    let mut files = BTreeMap::new();
+                    let mut rows = vec![];
+                    for (name, source) in sources {
+                        let rel = format!("{}/release/{name}", req.target);
+                        let path = req.tree.join(&rel);
+                        fs::create_dir_all(path.parent().unwrap()).unwrap();
+                        fs::write(&path, name).unwrap();
+                        files.insert(
+                            rel.clone(),
+                            ArtifactIdentity::of(&fs::metadata(path).unwrap()),
+                        );
+                        let source_id = if phase == Phase::Bpf {
+                            "path+file:///build/source/crates/ebpf"
+                        } else {
+                            "path+file:///build/source"
+                        };
+                        rows.push(json!({"reason":"compiler-artifact","package_id":format!("{source_id}#{}@{}",req.package,req.version),"manifest_path":manifest,"target":{"name":name,"src_path":source,"kind":["bin"],"crate_types":["bin"]},"profile":{"test":false},"fresh":false,"executable":format!("{logical}/{rel}"),"filenames":[format!("{logical}/{rel}")]}));
+                    }
+                    rows.push(json!({"reason":"build-finished","success":true}));
+                    let log_of = |rows: &[serde_json::Value]| {
+                        rows.iter()
+                            .flat_map(|row| {
+                                let mut b = serde_json::to_vec(row).unwrap();
+                                b.push(b'\n');
+                                b
+                            })
+                            .collect::<Vec<_>>()
+                    };
+                    let log = log_of(&rows);
+                    let mut ctx = CurrentArtifactSet {
+                        tree: req.tree.clone(),
+                        directory: fs::File::open(&req.tree).unwrap(),
+                        files,
+                        cargo_sha256: sha256(&log),
+                        completion: std::process::ExitStatus::from_raw(0),
+                    };
+                    assert_eq!(
+                        retain_artifacts(&log, &req, &ctx).unwrap().len(),
+                        req.bins.len(),
+                        "{phase:?}"
+                    );
+                    for mutation in 0..5 {
+                        let mut wrong = rows.clone();
+                        let name = wrong[0]["target"]["name"].as_str().unwrap().to_owned();
+                        match mutation {
+                            0 => {
+                                let p = req.tree.join(format!("{}/release/{name}", req.target));
+                                wrong[0]["executable"] = json!(p);
+                                wrong[0]["filenames"] = json!([p]);
+                            }
+                            1 => {
+                                let p =
+                                    format!("/build/target/foreign/{}/release/{name}", req.target);
+                                wrong[0]["executable"] = json!(p);
+                                wrong[0]["filenames"] = json!([p]);
+                            }
+                            2 => wrong[0]["manifest_path"] = json!(physical.join("Cargo.toml")),
+                            3 => {
+                                wrong[0]["target"]["src_path"] = json!(physical.join("src/main.rs"))
+                            }
+                            _ => {
+                                let p = format!("{logical}//{}/release/{name}", req.target);
+                                wrong[0]["executable"] = json!(p);
+                                wrong[0]["filenames"] = json!([p]);
+                            }
+                        }
+                        let wrong = log_of(&wrong);
+                        ctx.cargo_sha256 = sha256(&wrong);
+                        assert!(
+                            retain_artifacts(&wrong, &req, &ctx).is_err(),
+                            "{phase:?} mutation {mutation}"
+                        );
+                    }
+                }
+            }
+            fs::remove_dir_all(physical).unwrap();
+        }
+        fn dynamic_tables(
+            hash_mode: u8,
+            plt_rela: bool,
+        ) -> (Vec<u8>, BTreeMap<String, (usize, usize)>, usize) {
+            let mut symbols = vec![0; 48];
+            w32(&mut symbols, 24, 1);
+            symbols[28] = 0x12;
+            let mut sections = vec![
+                (".osslscope.bundle_contract", 1, 2, contract(), 0, 0, 0),
+                (
+                    ".interp",
+                    1,
+                    2,
+                    b"/lib64/ld-linux-x86-64.so.2\0".to_vec(),
+                    0,
+                    0,
+                    0,
+                ),
+                (".dynstr", 3, 2, b"\0foo\0".to_vec(), 0, 0, 0),
+                (".dynsym", 11, 2, symbols, 3, 1, 24),
+            ];
+            if hash_mode != 1 {
+                let mut b = vec![0; 20];
+                for (i, v) in [1, 2, 1, 0, 0].into_iter().enumerate() {
+                    w32(&mut b, i * 4, v);
+                }
+                sections.push((".hash", 5, 2, b, 4, 0, 4));
+            }
+            if hash_mode != 0 {
+                let mut b = vec![0; 32];
+                for (i, v) in [1, 1, 1, 5].into_iter().enumerate() {
+                    w32(&mut b, i * 4, v);
+                }
+                w64(&mut b, 16, 0x10000200);
+                w32(&mut b, 24, 1);
+                w32(&mut b, 28, 0x0b887389);
+                sections.push((".gnu.hash", 0x6ffffff6, 2, b, 4, 0, 0));
+            }
+            for (name, kind, width) in [
+                (".rela.dyn", 4, 24),
+                (".rel.dyn", 9, 16),
+                (".rela.plt", 4, 24),
+                (".rel.plt", 9, 16),
+            ] {
+                let mut b = vec![0; width];
+                w64(&mut b, 8, (1u64 << 32) | 7);
+                sections.push((name, kind, 2, b, 4, 0, width as u64));
+            }
+            for (name, kind) in [
+                (".init_array", 14),
+                (".fini_array", 15),
+                (".preinit_array", 16),
+            ] {
+                sections.push((name, kind, 3, vec![0; 8], 0, 0, 8));
+            }
+            let tag_count = if hash_mode == 2 { 22 } else { 21 };
+            sections.push((".dynamic", 6, 3, vec![0; tag_count * 16], 3, 0, 16));
+            let (mut b, spans, sh) = image(62, 3, sections, 3);
+            let len = b.len() as u64;
+            w32(&mut b, 64, 1);
+            w32(&mut b, 68, 5);
+            w64(&mut b, 80, 0x400000);
+            w64(&mut b, 96, len);
+            w64(&mut b, 104, len);
+            w64(&mut b, 112, 0x1000);
+            for (i, (kind, name)) in [(3, ".interp"), (2, ".dynamic")].iter().enumerate() {
+                let at = 120 + i * 56;
+                let (off, len) = spans[*name];
+                w32(&mut b, at, *kind);
+                w64(&mut b, at + 8, off as u64);
+                w64(&mut b, at + 16, 0x400000 + off as u64);
+                w64(&mut b, at + 32, len as u64);
+                w64(&mut b, at + 40, len as u64);
+                w64(&mut b, at + 48, 8);
+            }
+            let mut tags = vec![
+                (5, 0x400000 + spans[".dynstr"].0 as u64),
+                (10, 5),
+                (6, 0x400000 + spans[".dynsym"].0 as u64),
+                (11, 24),
+            ];
+            for (tag, name) in [(4, ".hash"), (0x6ffffef5, ".gnu.hash")] {
+                if let Some((off, _)) = spans.get(name) {
+                    tags.push((tag, 0x400000 + *off as u64));
+                }
+            }
+            for (tag, size, entry, name, width) in
+                [(7, 8, 9, ".rela.dyn", 24), (17, 18, 19, ".rel.dyn", 16)]
+            {
+                tags.extend([
+                    (tag, 0x400000 + spans[name].0 as u64),
+                    (size, width),
+                    (entry, width),
+                ]);
+            }
+            let plt = if plt_rela { ".rela.plt" } else { ".rel.plt" };
+            tags.extend([
+                (23, 0x400000 + spans[plt].0 as u64),
+                (2, spans[plt].1 as u64),
+                (20, if plt_rela { 7 } else { 17 }),
+            ]);
+            for (tag, size, name) in [
+                (25, 27, ".init_array"),
+                (26, 28, ".fini_array"),
+                (32, 33, ".preinit_array"),
+            ] {
+                tags.extend([(tag, 0x400000 + spans[name].0 as u64), (size, 8)]);
+            }
+            tags.push((0, 0));
+            assert_eq!(tags.len(), tag_count);
+            let d = spans[".dynamic"].0;
+            for (i, (tag, value)) in tags.into_iter().enumerate() {
+                w64(&mut b, d + i * 16, tag);
+                w64(&mut b, d + i * 16 + 8, value);
+            }
+            (b, spans, sh)
+        }
+        fn tag_value(b: &[u8], spans: &BTreeMap<String, (usize, usize)>, tag: u64) -> usize {
+            let (at, n) = spans[".dynamic"];
+            (at..at + n)
+                .step_by(16)
+                .find(|i| u64::from_le_bytes(b[*i..*i + 8].try_into().unwrap()) == tag)
+                .unwrap()
+                + 8
+        }
+        #[test]
+        fn complete_dynamic_hash_and_pointer_tables() {
+            let mut accepted = vec![];
+            for hash_mode in 0..3 {
+                for rela in [false, true] {
+                    let (b, spans, sh) = dynamic_tables(hash_mode, rela);
+                    extract_host_contract(&b).unwrap();
+                    for (tag, name) in [(4, ".hash"), (0x6ffffef5, ".gnu.hash")] {
+                        if let Some((off, _)) = spans.get(name) {
+                            for mutation in 0..9 {
+                                let mut bad = b.clone();
+                                match mutation {
+                                    0 => {
+                                        let at = tag_value(&bad, &spans, tag);
+                                        w64(&mut bad, at, 0);
+                                    }
+                                    1 => {
+                                        let at = tag_value(&bad, &spans, tag);
+                                        w64(&mut bad, at, 0x400000 + b.len() as u64 - 1);
+                                    }
+                                    2 => w32(&mut bad, *off, u32::MAX),
+                                    3 => {
+                                        let bucket = if tag == 4 { *off + 8 } else { *off + 24 };
+                                        w32(&mut bad, bucket, 2);
+                                    }
+                                    5 => w32(&mut bad, *off + 4, 3),
+                                    6 => {
+                                        if tag == 4 {
+                                            w32(&mut bad, *off + 16, 1);
+                                        } else {
+                                            w32(&mut bad, *off + 28, 0x0b887388);
+                                        }
+                                    }
+                                    7 => {
+                                        if tag == 4 {
+                                            w32(&mut bad, *off, 0);
+                                        } else {
+                                            w32(&mut bad, *off + 8, 0);
+                                        }
+                                    }
+                                    8 => {
+                                        if tag == 4 {
+                                            w32(&mut bad, *off + 4, u32::MAX);
+                                        } else {
+                                            w32(&mut bad, *off + 8, u32::MAX);
+                                        }
+                                    }
+                                    _ => {
+                                        let sec =
+                                            (1..u16::from_le_bytes(b[60..62].try_into().unwrap())
+                                                as usize)
+                                                .find(|i| {
+                                                    u64::from_le_bytes(
+                                                        b[sh + i * 64 + 24..sh + i * 64 + 32]
+                                                            .try_into()
+                                                            .unwrap(),
+                                                    ) == *off as u64
+                                                })
+                                                .unwrap();
+                                        w32(&mut bad, sh + sec * 64 + 40, 3);
+                                    }
+                                }
+                                if extract_host_contract(&bad).is_ok() {
+                                    accepted.push(format!(
+                                        "hash{tag:x} mode{hash_mode} rela{rela} mutation{mutation}"
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    for mutation in 0..8 {
+                        let mut bad = b.clone();
+                        let (tag, value) = match mutation {
+                            0 => (20, 8),
+                            1 => (2, 1),
+                            2 => (23, 0x400000 + spans[".dynstr"].0 as u64),
+                            3 => (27, 7),
+                            4 => (28, 7),
+                            5 => (33, 7),
+                            6 => (25, 0x400000 + spans[".dynstr"].0 as u64),
+                            _ => (7, 0x400000 + spans[".init_array"].0 as u64),
+                        };
+                        let at = tag_value(&bad, &spans, tag);
+                        w64(&mut bad, at, value);
+                        if extract_host_contract(&bad).is_ok() {
+                            accepted.push(format!(
+                                "pointer mode{hash_mode} rela{rela} mutation{mutation}"
+                            ));
+                        }
+                    }
+                }
+            }
+            assert!(
+                accepted.is_empty(),
+                "accepted malformed metadata: {accepted:?}"
+            );
+        }
+        #[test]
+        fn symbol_seeded_dynamic_strings_require_exact_mapped_view() {
+            fn fixture(other_view: bool, other: &[u8]) -> Vec<u8> {
+                let (mut bytes, spans, sh) = image(
+                    62,
+                    3,
+                    vec![
+                        (".osslscope.bundle_contract", 1, 2, contract(), 0, 0, 0),
+                        (
+                            ".interp",
+                            1,
+                            2,
+                            b"/lib64/ld-linux-x86-64.so.2\0".to_vec(),
+                            0,
+                            0,
+                            0,
+                        ),
+                        (".dynstr", 3, 0, b"\0liba.so\0".to_vec(), 0, 0, 0),
+                        (".runtime_strings", 1, 2, other.to_vec(), 0, 0, 0),
+                        // The real symbol pass creates the linked string cache,
+                        // including when the only symbol references empty offset0.
+                        (".symtab", 2, 0, vec![0; 24], 3, 1, 24),
+                        (".dynamic", 6, 3, vec![0; 64], 3, 0, 16),
+                    ],
+                    3,
+                );
+                let len = bytes.len() as u64;
+                w32(&mut bytes, 64, 1);
+                w32(&mut bytes, 68, 5);
+                w64(&mut bytes, 80, 0x400000);
+                w64(&mut bytes, 96, len);
+                w64(&mut bytes, 104, len);
+                w64(&mut bytes, 112, 0x1000);
+                for (i, (kind, name)) in [(3, ".interp"), (2, ".dynamic")].iter().enumerate() {
+                    let at = 120 + i * 56;
+                    let (off, len) = spans[*name];
+                    w32(&mut bytes, at, *kind);
+                    w64(&mut bytes, at + 8, off as u64);
+                    w64(&mut bytes, at + 16, 0x400000 + off as u64);
+                    w64(&mut bytes, at + 32, len as u64);
+                    w64(&mut bytes, at + 40, len as u64);
+                    w64(&mut bytes, at + 48, 8);
+                }
+                let address = 0x400000
+                    + spans[if other_view {
+                        ".runtime_strings"
+                    } else {
+                        ".dynstr"
+                    }]
+                    .0 as u64;
+                w64(&mut bytes, sh + 3 * 64 + 16, address);
+                let d = spans[".dynamic"].0;
+                for (i, (tag, value)) in [(5, address), (10, 9), (1, 1), (0, 0)]
+                    .into_iter()
+                    .enumerate()
+                {
+                    w64(&mut bytes, d + i * 16, tag);
+                    w64(&mut bytes, d + i * 16 + 8, value);
+                }
+                bytes
+            }
+            let mut a = abi(true);
+            a.cells[0].needed = vec!["liba.so".into()];
+            a.cells[0].symbol_versions.clear();
+            let mut b = abi(true);
+            b.cells[0].needed = vec!["libb.so".into()];
+            b.cells[0].symbol_versions.clear();
+            let matching = fixture(false, b"\0libb.so\0");
+            assert_eq!(host_elf(&matching).unwrap().needed, vec!["liba.so"]);
+            validate_host_abi(&matching, &a).unwrap();
+            assert!(validate_host_abi(&matching, &b).is_err());
+            for other in [b"\0libb.so\0".as_slice(), b"\0liba.so\0".as_slice()] {
+                let contradictory = fixture(true, other);
+                assert_eq!(
+                    [
+                        host_elf(&contradictory).is_ok(),
+                        validate_host_abi(&contradictory, &a).is_ok(),
+                        validate_host_abi(&contradictory, &b).is_ok()
+                    ],
+                    [false; 3],
+                    "section/mapped correspondence must precede cache reuse"
+                );
+            }
+        }
+        #[test]
+        fn bounded_string_regions_repeated_offsets_and_overlapping_suffixes() {
+            let mut bytes = vec![b'a'; 129];
+            bytes.push(0);
+            let mut strings = ElfStrings::new(&bytes);
+            assert_eq!(strings.lookup(0).unwrap().value.len(), 129);
+            let first_work = strings.scanned_bytes;
+            for _ in 0..4 {
+                for offset in 0..129 {
+                    assert_eq!(
+                        strings.lookup(offset).unwrap().value.len(),
+                        129 - offset as usize
+                    );
+                }
+            }
+            assert_eq!(strings.scanned_bytes, first_work);
+            assert!(first_work <= bytes.len() * 3);
+            assert_eq!(strings.regions.len(), 1);
+            let mut short = vec![b'b'; 64];
+            short.push(0);
+            let mut strings = ElfStrings::new(&short);
+            strings.lookup(0).unwrap();
+            strings.lookup(0).unwrap();
+            assert!(strings.regions.is_empty());
+            assert!(strings.scanned_bytes <= 2 * (3 * 64 + 1));
+            let mut long = vec![b'c'; 65];
+            long.push(0);
+            let mut strings = ElfStrings::new(&long);
+            let name = strings.atom(0).unwrap();
+            let work = strings.scanned_bytes;
+            for _ in 0..32 {
+                assert_eq!(strings.atom(0).unwrap().key, name.key);
+            }
+            assert_eq!(strings.scanned_bytes, work);
+            assert_eq!(strings.long_ids.len(), 1);
+            assert_eq!(strings.interns.len(), 1);
+            assert!(strings.lookup(long.len() as u64).is_err());
+            assert!(strings.lookup(u64::MAX).is_err());
+            assert!(ElfStrings::new(b"unterminated").lookup(0).is_err());
+        }
+        #[test]
+        fn string_suffix_utf8_atom_and_content_identity_semantics() {
+            let mut strings = ElfStrings::new(b"\0\xff\xc3\xa9ok\0");
+            assert_eq!(strings.lookup(2).unwrap().value, "éok");
+            assert_eq!(strings.lookup(4).unwrap().value, "ok");
+            assert!(strings.lookup(1).is_err());
+            assert!(strings.lookup(3).is_err());
+            assert_eq!(strings.lookup(0).unwrap().value, "");
+            assert!(strings.atom(0).is_err());
+            let mut bytes = vec![0];
+            let a = bytes.len();
+            bytes.extend(b"liba.so\0");
+            let prefix = bytes.len();
+            bytes.extend(b"prefixliba.so\0");
+            let duplicate = bytes.len();
+            bytes.extend(b"liba.so\0");
+            let mut strings = ElfStrings::new(&bytes);
+            let a = strings.atom(a as u64).unwrap();
+            let suffix = strings.atom((prefix + 6) as u64).unwrap();
+            let duplicate = strings.atom(duplicate as u64).unwrap();
+            assert_eq!(a.key, suffix.key);
+            assert_eq!(a.key, duplicate.key);
+            assert_ne!(strings.atom(prefix as u64).unwrap().key, a.key);
+            let mut bytes = vec![0xff];
+            bytes.extend([b'a'; 70]);
+            bytes.extend(b"/valid\0");
+            let mut strings = ElfStrings::new(&bytes);
+            assert!(strings.atom(1).is_err());
+            assert_eq!(strings.atom(72).unwrap().value, "valid");
+            assert!(strings.lookup(0).is_err());
+        }
+        #[test]
+        fn symbol_names_share_referenced_valid_suffixes() {
+            let mut strings = vec![0, 0xff];
+            strings.extend([b'x'; 129]);
+            strings.push(0);
+            let mut symbols = vec![0; 33 * 24];
+            for i in 1..33 {
+                w32(
+                    &mut symbols,
+                    i * 24,
+                    if i % 2 == 0 { 2 } else { 2 + i as u32 },
+                );
+                symbols[i * 24 + 4] = 0x12;
+            }
+            let (mut bytes, _, _) = image(
+                62,
+                3,
+                vec![
+                    (".osslscope.bundle_contract", 1, 2, contract(), 0, 0, 0),
+                    (".strtab", 3, 0, strings, 0, 0, 0),
+                    (".symtab", 2, 0, symbols, 2, 1, 24),
+                ],
+                1,
+            );
+            let len = bytes.len() as u64;
+            w32(&mut bytes, 64, 1);
+            w32(&mut bytes, 68, 5);
+            w64(&mut bytes, 80, 0x400000);
+            w64(&mut bytes, 96, len);
+            w64(&mut bytes, 104, len);
+            w64(&mut bytes, 112, 0x1000);
+            extract_host_contract(&bytes).unwrap();
+        }
+        #[test]
+        fn needed_order_and_exact_duplicate_names_survive_indexing() {
+            let bytes = host_needed(true, true, &[11, 1]).0;
+            let elf = host_elf(&bytes).unwrap();
+            assert_eq!(elf.needed, vec!["GLIBC_2.17", "libc.so.6"]);
+            assert_eq!(elf.versions, vec![("libc.so.6", "GLIBC_2.17")]);
+            assert!(host_elf(&host_needed(true, true, &[1, 1]).0).is_err());
+            let bytes = host_needed(true, true, &[1, 11]).0;
+            let elf = host_elf(&bytes).unwrap();
+            assert_eq!(elf.needed, vec!["libc.so.6", "GLIBC_2.17"]);
+        }
+        fn bloom_table(words: u32, shift: u32) -> Vec<u8> {
+            let mut bytes = vec![0; 16 + words as usize * 8 + 8];
+            for (i, value) in [1, 1, words, shift].into_iter().enumerate() {
+                w32(&mut bytes, i * 4, value);
+            }
+            w32(&mut bytes, 16 + words as usize * 8, 1);
+            w32(&mut bytes, 20 + words as usize * 8, 0x0b887389);
+            bytes
+        }
+        #[test]
+        fn gnu_bloom_geometry_and_hash_shift_width() {
+            for words in [1, 2, 4] {
+                for shift in [0, 5, 31] {
+                    validate_gnu_hash(&bloom_table(words, shift), 2).unwrap();
+                }
+            }
+            for (words, shift) in [(3, 5), (2, 32), (2, u32::MAX)] {
+                assert!(
+                    validate_gnu_hash(&bloom_table(words, shift), 2).is_err(),
+                    "words={words} shift={shift}"
+                );
+            }
+        }
+        #[test]
+        fn admitted_musl_static_evidence_uses_supported_profile_literal() {
+            let fixture = abi(false);
+            assert_eq!(fixture.host_profile.abi_profile, "linux-x86_64-musl");
+            let mut recipe = super::recipe("musl");
+            assert_eq!(
+                recipe.host_profile.abi_profile,
+                fixture.host_profile.abi_profile
+            );
+            recipe.required_cells = vec!["one".into()];
+            let bytes=source::json_bytes(&json!({"schema":"osslscope-abi-evidence-v1","host_profile":recipe.host_profile,"cells":[{"name":"one","interpreter":{"kind":"static"},"needed":[],"symbol_versions":[]}]})).unwrap();
+            recipe.abi_evidence.bytes = bytes.len() as u64;
+            recipe.abi_evidence.sha256 = sha256(&bytes);
+            let admitted = source::verify_abi_evidence(&recipe, &bytes).unwrap();
+            validate_host_abi(&host(false, true).0, &admitted).unwrap();
+        }
+        #[test]
+        fn structural_work_and_compact_coverage_boundaries() {
+            let mut spans = (0..256)
+                .rev()
+                .map(|i| (i * 8, i * 8 + 4))
+                .collect::<Vec<_>>();
+            disjoint_ranges(&mut spans).unwrap();
+            assert_eq!(spans.len(), 256);
+            let mut overlap = vec![(0, 4), (3, 8)];
+            assert!(disjoint_ranges(&mut overlap).is_err());
+            let groups =
+                note_groups(vec![(0, 100), (0, 20), (20, 40), (40, 100), (100, 124)]).unwrap();
+            assert_eq!(groups.len(), 2);
+            assert_eq!(groups[0].boundaries, vec![0, 20, 40, 100]);
+            assert!(note_groups(vec![(0, 100), (10, 60), (20, 70)]).is_err());
+            let mut coverage = TableCoverage::new(129);
+            assert_eq!(coverage.words.len(), 3);
+            coverage.claim(0, 64).unwrap();
+            coverage.claim(64, 64).unwrap();
+            coverage.claim(128, 1).unwrap();
+            assert!(coverage.claim(129, 1).is_err());
+            assert!(coverage.claim(63, 2).is_err());
+            coverage.zero_gaps(&[0; 129]).unwrap();
+            let mut gaps = TableCoverage::new(129);
+            gaps.claim(0, 16).unwrap();
+            gaps.claim(64, 16).unwrap();
+            let mut data = [0; 129];
+            data[80] = 1;
+            assert!(gaps.zero_gaps(&data).is_err());
+            data[80] = 0;
+            gaps.zero_gaps(&data).unwrap();
+        }
+        fn request(root: &Path) -> ArtifactRequest {
+            ArtifactRequest {
+                phase: Phase::Bpf,
+                package: "osslscope-ebpf".into(),
+                version: "0.0.0".into(),
+                bins: ["osslscope-harvest", "osslscope-count", "osslscope-members"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+                target: "bpfel-unknown-none".into(),
+                tree: root.to_path_buf(),
+            }
+        }
+        fn logs(_root: &Path) -> Vec<u8> {
+            let mut data = vec![];
+            for name in ["osslscope-harvest", "osslscope-count", "osslscope-members"] {
+                let v = json!({"reason":"compiler-artifact","package_id":"path+file:///build/source/crates/ebpf#osslscope-ebpf@0.0.0","manifest_path":"/build/source/crates/ebpf/Cargo.toml","target":{"kind":["bin"],"crate_types":["bin"],"name":name,"src_path":format!("/build/source/crates/ebpf/src/bin/{}.rs",name.strip_prefix("osslscope-").unwrap()),"edition":"2021","doc":true,"doctest":false,"test":true},"profile":{"opt_level":"3","debuginfo":0,"debug_assertions":false,"overflow_checks":false,"test":false},"features":[],"filenames":[format!("/build/target/bpf/bpfel-unknown-none/release/{name}")],"executable":format!("/build/target/bpf/bpfel-unknown-none/release/{name}"),"fresh":false});
+                data.extend(serde_json::to_vec(&v).unwrap());
+                data.push(b'\n');
+            }
+            data.extend(b"{\"reason\":\"build-finished\",\"success\":true}\n");
+            data
+        }
+        fn custody(root: &Path, log: &[u8]) -> CurrentArtifactSet {
+            let dir = fs::File::open(root).unwrap();
+            let mut files = BTreeMap::new();
+            for name in ["osslscope-harvest", "osslscope-count", "osslscope-members"] {
+                let rel = RelativePath::new(format!("bpfel-unknown-none/release/{name}")).unwrap();
+                files.insert(
+                    rel.as_str().to_owned(),
+                    ArtifactIdentity::of(
+                        &fs::metadata(root.join("bpfel-unknown-none/release").join(name)).unwrap(),
+                    ),
+                );
+            }
+            CurrentArtifactSet {
+                tree: root.to_path_buf(),
+                directory: dir,
+                files,
+                cargo_sha256: sha256(log),
+                completion: std::process::ExitStatus::from_raw(0),
+            }
+        }
+        fn root() -> PathBuf {
+            let base = std::env::var_os("OSSL_PACKAGE_TEST_PRIVATE_DIR").unwrap();
+            let root = PathBuf::from(base).join(format!(
+                "retained-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir_all(root.join("bpfel-unknown-none/release")).unwrap();
+            for name in ["osslscope-harvest", "osslscope-count", "osslscope-members"] {
+                fs::write(
+                    root.join("bpfel-unknown-none/release").join(name),
+                    name.as_bytes(),
+                )
+                .unwrap();
+            }
+            root
+        }
+        #[test]
+        fn unique_current_cargo_artifacts() {
+            let root = root();
+            let log = logs(&root);
+            let current = custody(&root, &log);
+            let req = request(&root);
+            let r = retain_artifacts(&log, &req, &current).unwrap();
+            assert_eq!(r.len(), 3);
+            assert_eq!(r["osslscope-count"].bytes(), b"osslscope-count");
+            let rows: Vec<serde_json::Value> = log
+                .split(|b| *b == b'\n')
+                .filter(|b| !b.is_empty())
+                .map(|b| serde_json::from_slice(b).unwrap())
+                .collect();
+            for mutation in 0..13 {
+                let mut rows = rows.clone();
+                match mutation {
+                    0 => {
+                        rows.remove(0);
+                    }
+                    1 => {
+                        rows.truncate(1);
+                    }
+                    2 => {
+                        let row = rows[0].clone();
+                        rows.insert(0, row);
+                    }
+                    3 => rows[0]["target"]["name"] = "fourth-bin".into(),
+                    4 => {
+                        rows[0]["package_id"] =
+                            "path+file:///build/source/crates/ebpf#other@0.0.0".into()
+                    }
+                    5 => {
+                        rows[0]["package_id"] =
+                            "path+file:///build/source/crates/ebpf#osslscope-ebpf@9.0.0".into()
+                    }
+                    6 => rows[0]["target"]["kind"] = json!(["lib"]),
+                    7 => rows[0]["executable"] = serde_json::Value::Null,
+                    8 => rows[0]["fresh"] = true.into(),
+                    9 => {
+                        rows[0]["executable"] = root
+                            .join("x86_64-unknown-linux-gnu/release/osslscope-harvest")
+                            .to_string_lossy()
+                            .as_ref()
+                            .into()
+                    }
+                    10 => rows[0]["executable"] = "/outside/osslscope-harvest".into(),
+                    11 => rows.last_mut().unwrap()["success"] = false.into(),
+                    _ => rows[0]["target"]["crate_types"] = json!(["lib"]),
+                }
+                let log = rows
+                    .iter()
+                    .flat_map(|v| {
+                        let mut b = serde_json::to_vec(v).unwrap();
+                        b.push(b'\n');
+                        b
+                    })
+                    .collect::<Vec<_>>();
+                let mut current = custody(&root, &log);
+                if mutation == 8 {
+                    current.files.clear();
+                }
+                assert!(
+                    retain_artifacts(&log, &req, &current).is_err(),
+                    "mutation {mutation}"
+                );
+            }
+            let mut failed = custody(&root, &log);
+            failed.completion = std::process::ExitStatus::from_raw(256);
+            assert!(retain_artifacts(&log, &req, &failed).is_err());
+            let malformed = b"{bad}\n";
+            let malformed_current = custody(&root, malformed);
+            assert!(retain_artifacts(malformed, &req, &malformed_current).is_err());
+            assert!(retain_artifacts(&vec![b' '; 1048577], &req, &current).is_err());
+            let duplicate = log
+                .windows(1)
+                .enumerate()
+                .find(|(_, b)| *b == b"{")
+                .unwrap()
+                .0;
+            let mut dup = log.clone();
+            dup.splice(
+                duplicate + 1..duplicate + 1,
+                b"\"reason\":\"compiler-artifact\",".iter().copied(),
+            );
+            let dup_current = custody(&root, &dup);
+            assert!(retain_artifacts(&dup, &req, &dup_current).is_err());
+            let mut preexisting = custody(&root, &log);
+            preexisting.files.clear();
+            assert!(retain_artifacts(&log, &req, &preexisting).is_err());
+            let path = root.join("bpfel-unknown-none/release/osslscope-count");
+            let alternate = root.join("alternate");
+            fs::rename(&path, &alternate).unwrap();
+            symlink(&alternate, &path).unwrap();
+            assert!(retain_artifacts(&log, &req, &current).is_err());
+            fs::remove_file(&path).unwrap();
+            fs::hard_link(&alternate, &path).unwrap();
+            assert!(retain_artifacts(&log, &req, &current).is_err());
+            fs::remove_dir_all(root).unwrap();
+        }
+        #[test]
+        fn retained_bytes_survive_path_replacement() {
+            let root = root();
+            let log = logs(&root);
+            let current = custody(&root, &log);
+            let retained = retain_artifacts(&log, &request(&root), &current).unwrap();
+            let old = &retained["osslscope-count"];
+            let path = root.join("bpfel-unknown-none/release/osslscope-count");
+            fs::rename(&path, root.join("old")).unwrap();
+            fs::write(&path, b"replacement").unwrap();
+            assert_eq!(old.bytes(), b"osslscope-count");
+            assert_eq!(old.sha256(), sha256(b"osslscope-count"));
+            assert_eq!(old.length(), 15);
+            assert!(retain_artifacts(&log, &request(&root), &current).is_err());
+            // Deterministic interleaving exercises the same snapshot reader, no race timing.
+            let fd = fs::File::open(&path).unwrap();
+            let identity = ArtifactIdentity::of(&fd.metadata().unwrap());
+            struct MutatingReader<'a> {
+                fd: &'a fs::File,
+                path: &'a Path,
+            }
+            impl std::io::Read for MutatingReader<'_> {
+                fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+                    let n = std::io::Read::read(&mut self.fd, b)?;
+                    fs::write(self.path, b"mutation!!!")?;
+                    Ok(n)
+                }
+            }
+            let result = snapshot_artifact(
+                &fd,
+                &identity,
+                &mut MutatingReader {
+                    fd: &fd,
+                    path: &path,
+                },
+            );
+            assert!(result.is_err());
+            fs::remove_dir_all(root).unwrap();
+        }
+        #[test]
+        fn bootstrap_gnu_without_descriptor() {
+            let (_f, sealed) = super::layout_fixture("musl");
+            let mut layout = verify_executor_assets(&sealed).unwrap();
+            let hostdoc = json!({"schema":"osslscope-executor-host-v1","files":[{"path":"/lib/x86_64-linux-gnu/libc.so.6","sha256":sha256(b"libc"),"bytes":4,"mode":493},{"path":"/lib64/ld-linux-x86-64.so.2","sha256":sha256(b"ld"),"bytes":2,"mode":493},{"path":"/usr/bin/bwrap","sha256":sha256(b"bwrap"),"bytes":5,"mode":493},{"path":"/usr/bin/python3.11","sha256":sha256(b"python"),"bytes":6,"mode":493}],"links":[]});
+            let key = layout
+                .documents
+                .iter()
+                .find(|(_, v)| {
+                    serde_json::from_slice::<serde_json::Value>(v).unwrap()["schema"]
+                        == "osslscope-executor-host-v1"
+                })
+                .unwrap()
+                .0
+                .clone();
+            layout
+                .documents
+                .insert(key, Arc::from(source::json_bytes(&hostdoc).unwrap()));
+            inspect_bootstrap(&host(true, false).0, &layout).unwrap();
+            assert!(inspect_bootstrap(&host(true, true).0, &layout).is_err());
+            assert!(inspect_bootstrap(&host(false, false).0, &layout).is_err());
+            let mut b = host(true, false).0;
+            let at = b
+                .windows(b"/lib64/ld-linux-x86-64.so.2\0".len())
+                .position(|x| x == b"/lib64/ld-linux-x86-64.so.2\0")
+                .unwrap();
+            b[at + 7] = b'x';
+            assert!(inspect_bootstrap(&b, &layout).is_err());
+        }
+    }
     #[test]
     fn descriptor_layout_fix1_i6_shared_owner_before_retention() {
         let nodes = vec![file("a", b"a")];
