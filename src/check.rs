@@ -21,32 +21,11 @@ use crate::policy::{
     PolicyOutcome, PolicyRule, PolicyVerdict, apply_legacy_engine_fallback, evaluate_document,
     executed_param_blind_ops, fips_unlabeled_calls,
 };
+use crate::policy_config::RuleSet;
 use crate::report::{OutputDest, OutputFormat, OutputRequest};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
-
-/// Parsed rule set (repeatable flags accumulate).
-#[derive(Debug, Default)]
-pub(crate) struct RuleSet {
-    pub require_provider: Vec<String>,
-    pub deny_provider: Vec<String>,
-    pub deny_engine: bool,
-    pub deny_algorithm: Vec<String>,
-    pub deny_weak: bool,
-    pub require_executed: Vec<String>,
-}
-
-impl RuleSet {
-    fn is_empty(&self) -> bool {
-        self.require_provider.is_empty()
-            && self.deny_provider.is_empty()
-            && !self.deny_engine
-            && self.deny_algorithm.is_empty()
-            && !self.deny_weak
-            && self.require_executed.is_empty()
-    }
-}
 
 /// Map CLI rules to typed policy rules through the single
 /// [`PolicyRule`] constructors (evaluation order below).
@@ -119,6 +98,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
     let mut workload_out: Option<String> = None;
     let mut workload_out_fd: Option<String> = None;
     let mut rules = RuleSet::default();
+    let mut policy_path: Option<String> = None;
     let mut i = 0;
     while i < argv.len() {
         let a = argv[i].as_str();
@@ -132,6 +112,19 @@ fn parse(argv: &[String]) -> Result<Args, String> {
                 .ok_or_else(|| format!("{k} needs a value"))
         };
         match a {
+            "--policy" => {
+                if policy_path.is_some() {
+                    return Err("--policy may occur only once".into());
+                }
+                let path = val(a)?;
+                if path.is_empty()
+                    || path.starts_with("--")
+                    || matches!(path.as_str(), "run" | "-h")
+                {
+                    return Err("--policy needs a value".into());
+                }
+                policy_path = Some(path);
+            }
             "--duration" => duration_raw = Some(val(a)?),
             "--format" => format = val(a)?,
             "--out" => out = Some(val(a)?),
@@ -224,6 +217,13 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         Some(s) => crate::args::parse_seconds("--grace", s)?,
         None => Duration::from_secs(5),
     };
+    let force_offset = match &force_offset_raw {
+        Some(s) => Some(crate::args::parse_force_offset(s)?),
+        None => None,
+    };
+    if let Some(path) = policy_path {
+        rules = crate::policy_config::merge(crate::policy_config::load(Path::new(&path))?, rules)?;
+    }
     // Algorithm names are exact frozen-registry matches: unknown
     // names are config errors, never silent non-matches. Provider
     // classes stay unvalidated: third-party opaque ids are open-ended,
@@ -255,10 +255,6 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         Some(p) => Some(
             crate::discovery::onboard::load_enrollment_file(Path::new(p)).map_err(|e| e.full())?,
         ),
-        None => None,
-    };
-    let force_offset = match &force_offset_raw {
-        Some(s) => Some(crate::args::parse_force_offset(s)?),
         None => None,
     };
     Ok(Args {
@@ -516,7 +512,7 @@ pub(crate) fn assemble_checked_document(
 }
 
 const USAGE: [&str; 2] = [
-    "usage: check [--duration S] [--provider P] [--object O] [--count-object C] [--members-object M] [--table F] [--force-offset N] [--provider-table F] [rules] [--format human|json] [--out F] [--cbom FILE] [--builtin] [--settle S] [--timeout S] [--grace S] [--image-digest D] [--workload-out F] [--workload-out-fd N] {--pid P | run -- <cmd>}",
+    "usage: check [--policy FILE] [--duration S] [--provider P] [--object O] [--count-object C] [--members-object M] [--table F] [--force-offset N] [--provider-table F] [rules] [--format human|json] [--out F] [--cbom FILE] [--builtin] [--settle S] [--timeout S] [--grace S] [--image-digest D] [--workload-out F] [--workload-out-fd N] {--pid P | run -- <cmd>}",
     "rules: [--require-provider P] [--deny-provider P] [--deny-engine] [--deny-algorithm X] [--deny-weak] [--require-executed X] (repeatable; at least one required)",
 ];
 
@@ -724,6 +720,167 @@ mod tests {
             mapped[5].rule,
             Rule::Require(Predicate::AlgorithmParamAware(_))
         ));
+    }
+
+    #[test]
+    fn policy_file_and_cli_build_exact_rules_and_preserve_truth() {
+        let path = std::env::temp_dir().join(format!(
+            "osslscope-check-policy-{}.toml",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            r#"version=1
+require-provider=["default"]
+deny-provider=["legacy"]
+deny-engine=true
+deny-algorithm=["MD5"]
+deny-weak=true
+require-executed=["SHA2-256"]
+"#,
+        )
+        .unwrap();
+        let file_args: Vec<String> = vec![
+            "--policy".into(),
+            path.to_string_lossy().into_owned(),
+            "--require-provider".into(),
+            "default".into(),
+            "--deny-algorithm".into(),
+            "DES".into(),
+            "run".into(),
+            "--".into(),
+            "workload".into(),
+            "--policy".into(),
+            "target-argument".into(),
+        ];
+        let parsed = parse(&file_args).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert!(matches!(parsed.target, capture::Target::Spawn { argv, .. }
+            if argv == ["workload", "--policy", "target-argument"]));
+        let actual = policy_rules(&parsed.rules);
+        let expected = vec![
+            PolicyRule::require_provider("default"),
+            PolicyRule::require_provider("default"),
+            PolicyRule::deny_provider("legacy"),
+            PolicyRule::deny_engine(),
+            PolicyRule::deny_algorithm("MD5"),
+            PolicyRule::deny_algorithm("DES"),
+            PolicyRule::deny_weak(),
+            PolicyRule::require_executed("SHA2-256"),
+        ];
+        assert_eq!(actual, expected);
+        let cli: Vec<String> = [
+            "--pid",
+            "9",
+            "--require-provider",
+            "default",
+            "--require-provider",
+            "default",
+            "--deny-provider",
+            "legacy",
+            "--deny-engine",
+            "--deny-algorithm",
+            "MD5",
+            "--deny-algorithm",
+            "DES",
+            "--deny-weak",
+            "--require-executed",
+            "SHA2-256",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        assert_eq!(actual, policy_rules(&parse(&cli).unwrap().rules));
+        for (document, outcome, exit) in [
+            (
+                doc(vec![site(
+                    1,
+                    2,
+                    vec![cand("p", "default", 1, 1, &["SHA2-256"], false)],
+                )]),
+                PolicyOutcome::Pass,
+                0,
+            ),
+            (
+                doc(vec![site(
+                    1,
+                    2,
+                    vec![cand("p", "default", 1, 1, &["MD5"], true)],
+                )]),
+                PolicyOutcome::Violation,
+                10,
+            ),
+            (
+                doc(vec![site(
+                    1,
+                    2,
+                    vec![cand("p", "unknown", 1, 1, &["other"], false)],
+                )]),
+                PolicyOutcome::Inconclusive,
+                11,
+            ),
+        ] {
+            let verdict = evaluate_document(&actual, &document);
+            assert_eq!(verdict.overall(), outcome);
+            assert_eq!(
+                exit_for(verdict.overall(), Some(0), &document, &ok_delivery()),
+                exit
+            );
+        }
+    }
+
+    #[test]
+    fn policy_path_is_loaded_only_after_argument_shape_validation() {
+        let args: Vec<String> = [
+            "--policy",
+            "/nonexistent-policy",
+            "--pid",
+            "9",
+            "--duration",
+            "NaN",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        assert!(parse(&args).err().unwrap().contains("--duration"));
+        let args: Vec<String> = [
+            "--policy",
+            "/nonexistent-policy",
+            "--pid",
+            "9",
+            "--force-offset",
+            "bad",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        assert!(parse(&args).err().unwrap().contains("--force-offset"));
+        for args in [
+            vec!["--policy"],
+            vec!["--policy", "--pid", "9"],
+            vec!["--policy", "", "--pid", "9"],
+        ] {
+            let args: Vec<String> = args.into_iter().map(String::from).collect();
+            assert!(
+                parse(&args)
+                    .err()
+                    .unwrap()
+                    .contains("--policy needs a value")
+            );
+        }
+        // File-mode contradictions must not change established CLI-only admission.
+        let cli: Vec<String> = [
+            "--pid",
+            "9",
+            "--require-provider",
+            "default",
+            "--deny-provider",
+            "default",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        assert!(parse(&cli).is_ok());
     }
 
     #[test]

@@ -3,6 +3,12 @@
 
 ## Unreleased development
 
+- `check --policy FILE` admits reusable bounded TOML policies before
+  target or output effects, adds CLI constraints, and rejects impossible
+  file-mode conjunctions. One-shot rules remain fixed for the window;
+  live/service reload and exact-package qualification remain open. See
+  [policy files](docs/usage.md#reusable-policy-files).
+
 - Current report/check emits `observed-crypto-v2.2`: conserved
   physical-site counts, candidate uncertainty, typed coverage/loss/
   window gaps, argv redaction, and three-valued policy rules with

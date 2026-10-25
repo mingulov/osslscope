@@ -135,6 +135,67 @@ remain inconclusive. Deny rules violate on definite use and pass
 only on proved relevant absence. Read `policy.rules[]` bounds and
 evidence as well as the [exit precedence](#exit-codes).
 
+### Reusable policy files
+
+Use one UTF-8 TOML file with `--policy FILE`:
+
+```sh
+osslscope check --policy policy.toml run -- ./my-app
+```
+
+```toml
+version = 1
+require-provider = ["default"]
+deny-provider = ["legacy"]
+deny-engine = true
+deny-algorithm = ["MD5"]
+deny-weak = true
+require-executed = ["SHA2-256"]
+```
+
+`version` must be integer `1`. Omitted arrays default to empty and
+omitted booleans to false; the file must contain at least one active
+rule. Only the seven keys shown are accepted. Provider names are
+nonempty, opaque and case-sensitive. Algorithm names and semantic
+aliases use the same frozen registry as CLI rules. Unknown names,
+unknown or duplicate keys, invalid types, encoding and syntax are
+configuration errors.
+
+CLI rules add constraints to file rules. Arrays retain repetitions,
+with file entries before CLI entries within each rule kind; booleans
+combine by OR. Evaluation retains the rule-kind order listed above.
+When a file is used, the merged policy permits at most 1,024 rule
+instances, counting each array entry and each true boolean. CLI flags
+cannot disable or replace file rules. Exactly one `--policy` is
+accepted; arguments after `run --` belong to the workload.
+
+File mode rejects a provider that is both required and denied,
+required `engine` with `deny-engine`, an algorithm both required and
+denied (including semantic aliases), and a registry-weak algorithm
+required with `deny-weak`. Distinct required providers and repeated
+requirements remain valid existential AND rules. No additional
+provider/algorithm relationship or FIPS guarantee is inferred.
+CLI-only admission behavior is unchanged.
+
+The file must resolve to a regular file of at most 65,536 bytes;
+ordinary symlinks to regular files are allowed. FIFOs and devices are
+rejected without waiting for input. Admission opens the file once and
+reads a bounded snapshot through that retained descriptor. Read and
+validation failures exit 2 before target inspection/setup, workload
+spawn, output creation or BPF activity. Diagnostics identify static
+fields and array indexes, or syntax line/column, without copying raw
+input, rejected values or arbitrary unknown keys. Accepted provider
+matchers remain visible in the effective policy records. Policy
+verdicts, evidence and exit precedence are unchanged.
+
+A one-shot check retains its validated rules for the whole window;
+later edits affect the next invocation. Prefer atomic file replacement
+for updates. Future service integration must validate a complete
+replacement between windows and switch atomically. A rejected
+replacement prevents a new window under the requested policy; it
+must not silently retain stale rules or change an in-flight window.
+Service reload and a file watcher are not delivered by this feature.
+
 ## doctor — environment diagnosis
 
 ```sh
