@@ -575,6 +575,11 @@ mod tests {
         produce_contract(&input, &root).unwrap();
         let cb = fs::read(root.join("bundle-contract.json")).unwrap();
         let c: BundleContractV2 = parse_canonical(&cb).unwrap();
+        fixtures::check_complete_schema(
+            include_str!("../../schemas/package-bundle-contract-v2.json"),
+            &cb,
+            true,
+        );
         assert_eq!(c.roles.len(), 4);
         assert_eq!(c.input_id, sha256(&bytes));
         for name in ["host", "observer_sha256", "payload_id", "contract_id"] {
@@ -632,6 +637,11 @@ mod tests {
         finalize(&root).unwrap();
         let record = fs::read(root.join("dev-admission.json")).unwrap();
         let d: DevAdmissionV2 = parse_canonical(&record).unwrap();
+        fixtures::check_complete_schema(
+            include_str!("../../schemas/dev-admission-v2.json"),
+            &record,
+            true,
+        );
         assert_eq!(d.contract.sha256, sha256(&cb));
         assert_eq!(d.host.sha256, sha256(&observer));
         let directory = Root::open(&root).unwrap();
@@ -793,6 +803,11 @@ mod tests {
         host_entry.path = RelativePath::new("bin/osslscope").unwrap();
         payload["host"] = serde_json::to_value(host_entry).unwrap();
         let payload: PayloadManifestV2 = serde_json::from_value(payload).unwrap();
+        fixtures::check_complete_schema(
+            include_str!("../../schemas/package-payload-manifest-v2.json"),
+            &canonical_bytes(&payload),
+            true,
+        );
         fs::write(
             bundle.join("payload-manifest.json"),
             canonical_bytes(&payload),

@@ -454,6 +454,7 @@ fn schema_required_fields_match_closed_rust_records() {
     for (schema_bytes, record_bytes) in cases {
         let schema: Value = serde_json::from_str(schema_bytes).unwrap();
         let record: Value = serde_json::from_str(record_bytes).unwrap();
+        package_fixtures::check_complete_schema(schema_bytes, record_bytes.as_bytes(), true);
         assert_eq!(schema["additionalProperties"], json!(false));
         let required: std::collections::BTreeSet<_> = schema["required"]
             .as_array()
@@ -1055,6 +1056,18 @@ fn identity_v2_closed_graph_and_v1_controls() {
             "{field}"
         );
     }
+    let mut host = p.host.clone();
+    host.path = RelativePath::new("osslscope").unwrap();
+    let dev = DevAdmissionV2 {
+        schema: "osslscope-dev-admission-v2".into(),
+        build_inputs: p.build_inputs.clone(),
+        contract: p.contract.clone(),
+        host,
+        custody_host: c.custody_host.clone(),
+        roles: c.roles.clone(),
+    };
+    let db = canonical_bytes(&dev);
+    parse_canonical::<DevAdmissionV2>(&db).unwrap();
     for (schema, record) in [
         (include_str!("../schemas/package-build-inputs-v2.json"), ib),
         (
@@ -1065,6 +1078,7 @@ fn identity_v2_closed_graph_and_v1_controls() {
             include_str!("../schemas/package-payload-manifest-v2.json"),
             pb,
         ),
+        (include_str!("../schemas/dev-admission-v2.json"), db),
     ] {
         let s: Value = serde_json::from_str(schema).unwrap();
         let r: Value = serde_json::from_slice(&record).unwrap();
@@ -1078,5 +1092,23 @@ fn identity_v2_closed_graph_and_v1_controls() {
             .collect();
         assert_eq!(required, expected);
         assert_eq!(s["additionalProperties"], json!(false));
+        package_fixtures::check_complete_schema(schema, &record, true);
+        if r.get("roles").is_some() {
+            for case in ["missing", "duplicate", "wrong-name", "v1", "mixed"] {
+                let changed = edit(&record, |v| match case {
+                    "missing" => {
+                        v["roles"].as_array_mut().unwrap().pop();
+                    }
+                    "duplicate" => v["roles"][0] = v["roles"][3].clone(),
+                    "wrong-name" => v["roles"][3]["file"] = json!("osslscope-members"),
+                    "v1" => {
+                        v["schema"] = json!(v["schema"].as_str().unwrap().replace("-v2", "-v1"))
+                    }
+                    "mixed" => v["roles"][3]["role"] = json!("members"),
+                    _ => unreachable!(),
+                });
+                package_fixtures::check_complete_schema(schema, &changed, false);
+            }
+        }
     }
 }

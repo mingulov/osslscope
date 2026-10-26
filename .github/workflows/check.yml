@@ -10,6 +10,12 @@ jobs:
           components: rustfmt, clippy
       - run: cargo fmt --check
       - run: cargo check --workspace --locked
+      # Whole-schema Rust integration controls use the established Python
+      # validator; keep its environment outside the source tree.
+      - run: |
+          python3 -m venv "$RUNNER_TEMP/osslscope-schema"
+          "$RUNNER_TEMP/osslscope-schema/bin/python" -m pip install jsonschema==4.19.2
+          echo "$RUNNER_TEMP/osslscope-schema/bin" >> "$GITHUB_PATH"
       - run: cargo test --workspace --locked
       - run: cargo clippy --workspace --locked -- -D warnings
   bpf:

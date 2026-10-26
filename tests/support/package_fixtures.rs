@@ -272,3 +272,54 @@ pub fn identity_v2_inputs() -> BuildInputsV2 {
     value["identity_profile_sha256"] = serde_json::json!("77".repeat(32));
     serde_json::from_value(value).unwrap()
 }
+
+/// Run the entire advertised schema with the established JSON Schema validator.
+/// This is a HOST test prerequisite; absence is an explicit failure, never skip.
+pub fn check_complete_schema(schema: &str, record: &[u8], valid: bool) {
+    use std::{
+        io::Write,
+        process::{Command, Stdio},
+    };
+    let document = json!({"schema": serde_json::from_str::<serde_json::Value>(schema).unwrap(), "record": serde_json::from_slice::<serde_json::Value>(record).unwrap()});
+    let mut child = Command::new("python3")
+        .args([
+            "-c",
+            r#"
+import json, sys
+try:
+    from jsonschema import Draft202012Validator
+except ImportError:
+    sys.exit("HOST schema tests require python3 jsonschema (CI provisions 4.19.2)")
+x = json.load(sys.stdin)
+Draft202012Validator.check_schema(x['schema'])
+errors = list(Draft202012Validator(x['schema']).iter_errors(x['record']))
+for error in errors[:8]:
+    print('/'.join(map(str, error.absolute_path)) + ': ' + error.message, file=sys.stderr)
+sys.exit(1 if errors else 0)
+"#,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("python3 JSON Schema validator");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&serde_json::to_vec(&document).unwrap())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(if valid { 0 } else { 1 }),
+        "full-schema expected valid={valid}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if !valid {
+        assert!(
+            !output.stderr.is_empty(),
+            "negative control must contain validator errors"
+        );
+    }
+}
