@@ -53,6 +53,11 @@ pub(crate) fn host_main() {
         "host-child-unreported",
         "host-restore-failure",
         "host-helper-control-eof",
+        "host-supervisor-control-eof-passive",
+        "host-supervisor-buffered-reaped-hup",
+        "host-supervisor-buffered-done-hup",
+        "host-supervisor-buffered-child-reaped-hup",
+        "host-supervisor-empty-receive-reaped-hup",
         "host-failed-ready-target",
         "host-failed-construction-target",
         "host-domain-rechecks",
@@ -90,6 +95,13 @@ pub(crate) fn host_main() {
 fn host_case(case: &str) {
     let t0 = Instant::now();
     match case {
+        "host-supervisor-control-eof-passive" => return host_supervisor_eof_passive(),
+        "host-supervisor-buffered-reaped-hup"
+        | "host-supervisor-buffered-done-hup"
+        | "host-supervisor-buffered-child-reaped-hup"
+        | "host-supervisor-empty-receive-reaped-hup" => {
+            return host_supervisor_buffered_hup(case);
+        }
         "host-audit-target-race" => return host_audit_target_race(),
         "host-stop-before-close" => return host_stop_before_close(),
         "host-child-unreported" | "host-restore-failure" | "host-helper-control-eof" => {
@@ -1283,4 +1295,308 @@ fn host_domain_rechecks() {
             .state,
         ProducerShutdownState::Complete
     );
+}
+
+fn host_supervisor_eof_passive() {
+    let started = Instant::now();
+    let runtime =
+        unsafe { LifecycleRuntime::bootstrap_early(started + Duration::from_secs(2), None) }
+            .unwrap();
+    let handle = runtime.handle();
+    // Signal and observe the original pidfd without consuming launcher wait ownership.
+    let stopped_signal = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            handle.0.pidfd,
+            libc::SIGSTOP,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    };
+    let end = Instant::now() + Duration::from_secs(1);
+    let mut stopped = false;
+    while Instant::now() < end {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let r = unsafe {
+            libc::waitid(
+                libc::P_PIDFD,
+                handle.0.pidfd as libc::id_t,
+                &mut info,
+                libc::WSTOPPED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if r == 0
+            && unsafe { info.si_pid() } == handle.0.launcher
+            && info.si_code == libc::CLD_STOPPED
+        {
+            stopped = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let read_shutdown = unsafe { libc::shutdown(handle.0.endpoint, libc::SHUT_RD) };
+    let end = Instant::now() + Duration::from_secs(1);
+    while HOST_SUPERVISOR_EOF.load(Ordering::Acquire) == 0 && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let eof_observed = HOST_SUPERVISOR_EOF.load(Ordering::Acquire) > 0;
+    let snapshot = || {
+        [
+            HOST_SUPERVISOR_RECEIVES.load(Ordering::Acquire),
+            HOST_SUPERVISOR_POLLS.load(Ordering::Acquire),
+            HOST_SUPERVISOR_LOOPS.load(Ordering::Acquire),
+        ]
+    };
+    let deadline = Instant::now() + Duration::from_millis(100);
+    let ticket = runtime.request_shutdown(deadline);
+    let before = snapshot();
+    std::thread::sleep(Duration::from_millis(100));
+    let after = snapshot();
+    let delta = std::array::from_fn::<_, 3, _>(|i| after[i] - before[i]);
+    let pending = ticket.wait().state;
+    let original_deadline = ticket.deadline == deadline
+        && runtime
+            .request_shutdown(Instant::now() + Duration::from_secs(2))
+            .deadline
+            == deadline;
+    let retained = !handle.0.host_disposed.load(Ordering::Acquire)
+        && unsafe { libc::fcntl(handle.0.endpoint, libc::F_GETFD) } >= 0
+        && unsafe { libc::fcntl(handle.0.pidfd, libc::F_GETFD) } >= 0;
+    // Always settle the stopped launcher before asserting the semantic oracle.
+    let killed = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            handle.0.pidfd,
+            libc::SIGKILL,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    };
+    host_wait_until(Instant::now() + Duration::from_secs(2), || {
+        handle.0.host_disposed.load(Ordering::Acquire)
+    });
+    let waited = HOST_LAUNCHER_WAIT.load(Ordering::Acquire);
+    let endpoint_closed = unsafe { libc::fcntl(handle.0.endpoint, libc::F_GETFD) } == -1
+        && io::Error::last_os_error().raw_os_error() == Some(libc::EBADF);
+    let pidfd_closed = unsafe { libc::fcntl(handle.0.pidfd, libc::F_GETFD) } == -1
+        && io::Error::last_os_error().raw_os_error() == Some(libc::EBADF);
+    let sticky = runtime
+        .shutdown(Instant::now() + Duration::from_secs(2))
+        .state;
+    eprintln!(
+        "HOST supervisor EOF stopped={stopped} actual-eof={eof_observed} delta-recv-poll-loop={delta:?} pending={pending:?} original-deadline={original_deadline} retained={retained} positive-wait={waited} endpoint-closed={endpoint_closed} pidfd-closed={pidfd_closed} sticky={sticky:?}"
+    );
+    assert_eq!(stopped_signal, 0);
+    assert!(stopped);
+    assert_eq!(read_shutdown, 0);
+    assert!(eof_observed);
+    assert_eq!(killed, 0);
+    assert_eq!(waited, libc::SIGKILL);
+    assert!(endpoint_closed && pidfd_closed);
+    assert_eq!(pending, ProducerShutdownState::Pending);
+    assert_eq!(sticky, ProducerShutdownState::Pending);
+    assert!(original_deadline && retained);
+    assert_eq!(handle.0.slot.lock().unwrap().shutdown, Some(deadline));
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(
+        delta.iter().all(|n| *n <= 2),
+        "terminal EOF must passively await the launcher: recv/poll/loop delta={delta:?}"
+    );
+}
+
+fn host_supervisor_buffered_hup(case: &str) {
+    let started = Instant::now();
+    let end = started + Duration::from_secs(3);
+    let queued_child = case == "host-supervisor-buffered-child-reaped-hup";
+    let late_reaped = case == "host-supervisor-empty-receive-reaped-hup";
+    let reaped = case == "host-supervisor-buffered-reaped-hup" || queued_child || late_reaped;
+    launcher::HOST_RESTORE_FAILURE.store(queued_child, Ordering::Release);
+    HOST_RECEIVE_BEFORE_CHILD.store(queued_child, Ordering::Release);
+    launcher::HOST_HELPER_HOLD.store(reaped, Ordering::Release);
+    let runtime = unsafe { LifecycleRuntime::bootstrap_early(end, None) }.unwrap();
+    let handle = runtime.handle();
+    let guard = runtime.install().unwrap();
+    HOST_RECEIVE_HOLD.store(!late_reaped, Ordering::Release);
+    HOST_EMPTY_RECEIVE_HOLD.store(late_reaped, Ordering::Release);
+    let mut lease = if reaped {
+        let mut lease = handle
+            .begin(BurstPhase::Initial, end, launcher::monotonic())
+            .unwrap();
+        lease.spawn(first_cpu()).unwrap();
+        Some(lease)
+    } else {
+        None
+    };
+    // The queued-child case gates immediately after actual SPAWN delivery,
+    // before the first CHILD receive. Other cases gate after CHILD/SHUTDOWN.
+    // All packets and helper/launcher settlement still come from the real launcher.
+    let ticket = if reaped {
+        None
+    } else {
+        Some(runtime.request_shutdown(end))
+    };
+    host_wait_until(end, || {
+        if late_reaped {
+            HOST_EMPTY_RECEIVE_HELD.load(Ordering::Acquire)
+        } else {
+            HOST_RECEIVE_HELD.load(Ordering::Acquire)
+        }
+    });
+    let empty_before_shutdown = late_reaped
+        && HOST_RECEIVE_WOULD_BLOCK.load(Ordering::Acquire)
+        && HOST_EMPTY_RECEIVE_HELD.load(Ordering::Acquire);
+    let waits_before = HOST_LAUNCHER_WAIT_CALLS.load(Ordering::Acquire);
+    let child_before_receive = handle.0.host_child.lock().unwrap().map(|f| f.arg0);
+    let helper_held = child_before_receive
+        .and_then(|pid| std::fs::read_to_string(format!("/proc/{pid}/stat")).ok())
+        .is_some_and(|state| {
+            matches!(
+                state[state.rfind(')').unwrap() + 2..].as_bytes()[0],
+                b'R' | b'S'
+            )
+        });
+    let write_shutdown = if reaped && !queued_child {
+        unsafe { libc::shutdown(handle.0.endpoint, libc::SHUT_WR) }
+    } else {
+        0
+    };
+    let ticket = if late_reaped {
+        None
+    } else {
+        Some(ticket.unwrap_or_else(|| runtime.request_shutdown(end)))
+    };
+    let mut observed = [
+        libc::pollfd {
+            fd: handle.0.endpoint,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: handle.0.pidfd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    let mut buffered_hup = false;
+    while Instant::now() < end {
+        unsafe {
+            libc::poll(observed.as_mut_ptr(), 2, 0);
+        }
+        if observed[0].revents & (libc::POLLIN | libc::POLLHUP) == libc::POLLIN | libc::POLLHUP
+            && observed[1].revents & libc::POLLIN != 0
+        {
+            buffered_hup = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // Leave the actual buffered cleanup packet available to the supervisor.
+    // Peek verifies its kind without consuming any protocol or wait ownership.
+    let mut bytes = [0u8; 65];
+    let length = unsafe {
+        libc::recv(
+            handle.0.endpoint,
+            bytes.as_mut_ptr().cast(),
+            bytes.len(),
+            libc::MSG_PEEK | libc::MSG_DONTWAIT | libc::MSG_TRUNC,
+        )
+    };
+    let buffered = (length == 64)
+        .then(|| Frame::decode(&bytes[..64]))
+        .flatten();
+    let child = if queued_child {
+        buffered.filter(|f| f.kind == CHILD).map(|f| f.arg0)
+    } else {
+        child_before_receive
+    };
+    let retained = !handle.0.host_disposed.load(Ordering::Acquire)
+        && unsafe { libc::fcntl(handle.0.endpoint, libc::F_GETFD) } >= 0
+        && unsafe { libc::fcntl(handle.0.pidfd, libc::F_GETFD) } >= 0;
+    // For the late-REAPED schedule the real empty receive precedes helper
+    // settlement/launcher exit; only now seal and release the caller lease.
+    let ticket = ticket.unwrap_or_else(|| runtime.request_shutdown(end));
+    drop(lease.take());
+    HOST_RECEIVE_HOLD.store(false, Ordering::Release);
+    HOST_EMPTY_RECEIVE_HOLD.store(false, Ordering::Release);
+    host_wait_until(Instant::now() + Duration::from_secs(2), || {
+        handle.0.host_disposed.load(Ordering::Acquire)
+            || ((queued_child || late_reaped) && handle.0.slot.lock().unwrap().receipt.is_some())
+    });
+    let receipt = ticket.wait();
+    let actual_wait = HOST_LAUNCHER_WAIT.load(Ordering::Acquire);
+    let actual_reaped = handle
+        .0
+        .slot
+        .lock()
+        .unwrap()
+        .reply
+        .filter(|f| f.kind == REAPED);
+    let endpoint_closed = unsafe { libc::fcntl(handle.0.endpoint, libc::F_GETFD) } == -1
+        && io::Error::last_os_error().raw_os_error() == Some(libc::EBADF);
+    let pidfd_closed = unsafe { libc::fcntl(handle.0.pidfd, libc::F_GETFD) } == -1
+        && io::Error::last_os_error().raw_os_error() == Some(libc::EBADF);
+    // In semantic RED the true launcher wait happened, but the owning loop
+    // parked with REAPED still queued. Peeking diagnoses it without replacing
+    // the missing production receipt or manually closing supervisor FDs.
+    let leftover_length =
+        if (queued_child || late_reaped) && !handle.0.host_disposed.load(Ordering::Acquire) {
+            unsafe {
+                libc::recv(
+                    handle.0.endpoint,
+                    bytes.as_mut_ptr().cast(),
+                    bytes.len(),
+                    libc::MSG_PEEK | libc::MSG_DONTWAIT | libc::MSG_TRUNC,
+                )
+            }
+        } else {
+            -1
+        };
+    let leftover = (leftover_length == 64)
+        .then(|| Frame::decode(&bytes[..64]))
+        .flatten();
+    drop(guard);
+    eprintln!(
+        "HOST buffered case={case} HUP-and-pidfd-ready={buffered_hup} packet={buffered:?} child={child:?} actual-reaped={actual_reaped:?} actual-wait={actual_wait} retained={retained} endpoint-closed={endpoint_closed} pidfd-closed={pidfd_closed} receipt={receipt:?} child-before-receive={child_before_receive:?} leftover={leftover:?} actual-empty-before-shutdown={empty_before_shutdown} helper-held={helper_held} wait-calls-before={waits_before} wait-calls-after={}",
+        HOST_LAUNCHER_WAIT_CALLS.load(Ordering::Acquire)
+    );
+    // GREEN requires production receipt/wait/disposal. On queued-child RED,
+    // actor process exit settles the retained FDs; no successful disposal is claimed.
+    assert_eq!(write_shutdown, 0);
+    assert!(buffered_hup && retained);
+    assert_eq!(
+        buffered.unwrap().kind,
+        if queued_child {
+            CHILD
+        } else if reaped {
+            REAPED
+        } else {
+            DONE
+        }
+    );
+    if queued_child {
+        assert!(child_before_receive.is_none());
+    }
+    if late_reaped {
+        assert!(empty_before_shutdown && helper_held);
+        assert_eq!(waits_before, 0);
+        assert_eq!(HOST_LAUNCHER_WAIT_CALLS.load(Ordering::Acquire), 1);
+    }
+    assert!(endpoint_closed && pidfd_closed);
+    assert_eq!(receipt.launcher_status, Some(actual_wait));
+    if reaped {
+        assert_eq!(actual_reaped.unwrap().arg0, child.unwrap());
+        assert!(libc::WIFSIGNALED(actual_reaped.unwrap().arg1 as i32));
+        assert_eq!(
+            libc::WTERMSIG(actual_reaped.unwrap().arg1 as i32),
+            libc::SIGKILL
+        );
+        assert_eq!(actual_wait, (if queued_child { 133 } else { 138 }) << 8);
+        assert_eq!(receipt.state, ProducerShutdownState::Unknown);
+        assert!(receipt.failure.is_some());
+    } else {
+        assert_eq!(actual_wait, 0);
+        assert_eq!(receipt.state, ProducerShutdownState::Complete);
+        assert!(receipt.failure.is_none());
+    }
+    assert!(started.elapsed() < Duration::from_secs(5));
 }

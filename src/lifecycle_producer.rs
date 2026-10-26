@@ -986,7 +986,21 @@ fn send_frame(fd: i32, frame: Frame) -> Result<(), ProducerFailure> {
         Ok(())
     }
 }
-fn recv_frame(fd: i32) -> Result<Option<Frame>, ProducerFailure> {
+struct ReceiveFailure {
+    failure: ProducerFailure,
+    terminal: bool,
+}
+enum ReceiveOutcome {
+    Frame(Frame),
+    Idle,
+    Interrupted,
+}
+fn recv_frame(fd: i32) -> Result<ReceiveOutcome, ReceiveFailure> {
+    #[cfg(test)]
+    {
+        HOST_RECEIVE_WOULD_BLOCK.store(false, Ordering::Release);
+        HOST_SUPERVISOR_RECEIVES.fetch_add(1, Ordering::AcqRel);
+    }
     let mut b = [0u8; 65];
     let r = unsafe {
         libc::recv(
@@ -996,16 +1010,33 @@ fn recv_frame(fd: i32) -> Result<Option<Frame>, ProducerFailure> {
             libc::MSG_DONTWAIT | libc::MSG_TRUNC,
         )
     };
+    #[cfg(test)]
+    if r == 0 {
+        HOST_SUPERVISOR_EOF.fetch_add(1, Ordering::AcqRel);
+    }
     if r < 0 {
         let e = io::Error::last_os_error();
-        if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::Interrupted {
-            return Ok(None);
+        #[cfg(test)]
+        if e.kind() == io::ErrorKind::WouldBlock {
+            HOST_RECEIVE_WOULD_BLOCK.store(true, Ordering::Release);
         }
-        return Err(os_failure("producer receive failed"));
+        if e.kind() == io::ErrorKind::WouldBlock {
+            return Ok(ReceiveOutcome::Idle);
+        }
+        if e.kind() == io::ErrorKind::Interrupted {
+            return Ok(ReceiveOutcome::Interrupted);
+        }
+        return Err(ReceiveFailure {
+            failure: os_failure("producer receive failed"),
+            terminal: true,
+        });
     }
     Frame::decode(&b[..(r as usize).min(65)])
-        .map(Some)
-        .ok_or_else(|| failure("producer EOF or malformed frame"))
+        .map(ReceiveOutcome::Frame)
+        .ok_or_else(|| ReceiveFailure {
+            failure: failure("producer EOF or malformed frame"),
+            terminal: r == 0,
+        })
 }
 struct RetainedSupervisor {
     _shared: Arc<Shared>,
@@ -1059,6 +1090,28 @@ static HOST_OBSERVED_SENT: AtomicUsize = AtomicUsize::new(0);
 static HOST_ABORT_SENT: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
 static HOST_SUPERVISOR_WAIT_HOLD: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static HOST_SUPERVISOR_RECEIVES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static HOST_SUPERVISOR_POLLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static HOST_SUPERVISOR_LOOPS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static HOST_SUPERVISOR_EOF: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static HOST_RECEIVE_HOLD: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static HOST_RECEIVE_HELD: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static HOST_RECEIVE_BEFORE_CHILD: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static HOST_RECEIVE_WOULD_BLOCK: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static HOST_EMPTY_RECEIVE_HOLD: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static HOST_EMPTY_RECEIVE_HELD: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static HOST_LAUNCHER_WAIT_CALLS: AtomicUsize = AtomicUsize::new(0);
 fn supervise(
     shared: Arc<Shared>,
     descriptors: &mut Option<(OwnedFd, OwnedFd)>,
@@ -1089,7 +1142,10 @@ fn supervise(
     let mut last_completion: Option<Frame> = None;
     let mut launcher_checked = false;
     let mut launcher_wake = false;
+    let mut receive_closed = false;
     loop {
+        #[cfg(test)]
+        HOST_SUPERVISOR_LOOPS.fetch_add(1, Ordering::AcqRel);
         #[cfg(test)]
         if HOST_SUPERVISOR_PANIC.swap(false, Ordering::AcqRel) {
             panic!("HOST supervisor unwind fault");
@@ -1199,8 +1255,24 @@ fn supervise(
             }
             shared.wake.notify_all();
         }
-        match recv_frame(fd) {
-            Ok(Some(f)) => {
+        #[cfg(test)]
+        if child
+            || shutdown_sent
+            || (HOST_RECEIVE_BEFORE_CHILD.load(Ordering::Acquire)
+                && current.is_some_and(|f| f.kind == SPAWN))
+        {
+            while HOST_RECEIVE_HOLD.load(Ordering::Acquire) {
+                HOST_RECEIVE_HELD.store(true, Ordering::Release);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        let received = if receive_closed {
+            Ok(ReceiveOutcome::Idle)
+        } else {
+            recv_frame(fd)
+        };
+        match received {
+            Ok(ReceiveOutcome::Frame(f)) => {
                 let mut s = shared.slot.lock().unwrap_or_else(|e| e.into_inner());
                 reconcile(&shared, &mut s);
                 if last_completion == Some(f) {
@@ -1302,17 +1374,38 @@ fn supervise(
                     }
                 }
                 shared.wake.notify_all();
+                // CHILD and its matching REAPED can already be queued when
+                // the launcher exits. Drain before any irreversible disposition;
+                // the next pass still reconciles revocation and dispatches ABORT.
+                continue;
             }
-            Ok(None) => {}
+            // EINTR proves nothing about queued receipts. Return to owning
+            // reconciliation/deadline/ABORT handling before the next attempt.
+            Ok(ReceiveOutcome::Interrupted) => continue,
+            Ok(ReceiveOutcome::Idle) => {
+                #[cfg(test)]
+                if child && !receive_closed && HOST_RECEIVE_WOULD_BLOCK.load(Ordering::Acquire) {
+                    while HOST_EMPTY_RECEIVE_HOLD.load(Ordering::Acquire) {
+                        HOST_EMPTY_RECEIVE_HELD.store(true, Ordering::Release);
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+            }
             Err(e) => {
+                receive_closed = e.terminal;
                 if !done {
                     let mut s = shared.slot.lock().unwrap_or_else(|e| e.into_inner());
                     reconcile(&shared, &mut s);
-                    s.failure.get_or_insert(e);
+                    s.failure.get_or_insert(e.failure);
                     poisoned = true;
                     shared.sealed.store(true, Ordering::Release);
                     shared.wake.notify_all();
                 }
+                // Reconcile the new seal and dispatch required abandonment
+                // before blocking. A consumed malformed packet must also allow
+                // queued valid receipts to drain before terminal disposition.
+                // A condvar notification cannot wake the poll below.
+                continue;
             }
         }
         // Only the supervisor consumes this exact owned launcher, never foreign children.
@@ -1335,6 +1428,8 @@ fn supervise(
                 launcher_checked = true;
                 launcher_wake = false;
                 let mut status = 0;
+                #[cfg(test)]
+                HOST_LAUNCHER_WAIT_CALLS.fetch_add(1, Ordering::AcqRel);
                 let r = unsafe { libc::waitpid(shared.launcher, &mut status, libc::WNOHANG) };
                 if r == shared.launcher {
                     #[cfg(test)]
@@ -1344,7 +1439,11 @@ fn supervise(
                     );
                     #[cfg(test)]
                     HOST_LAUNCHER_WAIT.store(status, Ordering::Release);
-                    waited = Some((true, status))
+                    waited = Some((true, status));
+                    // The earlier empty receive preceded this final send boundary.
+                    // Drain again through the owning receive/binding path before
+                    // retention or disposal; the cached wait is never repeated.
+                    continue;
                 } else if r < 0 && io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
                     waited = Some((false, 0))
                 }
@@ -1419,10 +1518,14 @@ fn supervise(
                 return;
             }
         }
-        let passive = poisoned || current.is_some_and(|f| launcher::monotonic() >= f.deadline);
+        let passive = receive_closed
+            || poisoned
+            || current.is_some_and(|f| launcher::monotonic() >= f.deadline);
         let mut p = [
             libc::pollfd {
-                fd,
+                // Retain descriptor custody, but terminal receive can no longer
+                // advance it. Queued frames were consumed before EOF was latched.
+                fd: if receive_closed { -1 } else { fd },
                 events: libc::POLLIN,
                 revents: 0,
             },
@@ -1432,6 +1535,8 @@ fn supervise(
                 revents: 0,
             },
         ];
+        #[cfg(test)]
+        HOST_SUPERVISOR_POLLS.fetch_add(1, Ordering::AcqRel);
         unsafe {
             libc::poll(p.as_mut_ptr(), 2, if passive { -1 } else { 1 });
         }
