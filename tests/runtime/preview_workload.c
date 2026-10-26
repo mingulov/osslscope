@@ -172,7 +172,7 @@ int main(int argc, char **argv) {
         puts("OK quiet");
         return 0;
     }
-    int sha = !strcmp(mode, "sha") || !strcmp(mode, "both")
+    int sha = !strcmp(mode, "sha") || !strcmp(mode, "sha-fail") || !strcmp(mode, "both")
         || !strcmp(mode, "worker") || !strcmp(mode, "forked") || !strcmp(mode, "mixed-fork");
     int aes = !strcmp(mode, "aes") || !strcmp(mode, "both")
         || !strcmp(mode, "worker") || !strcmp(mode, "forked") || !strcmp(mode, "mixed-fork");
@@ -192,5 +192,5 @@ int main(int argc, char **argv) {
     if (foreign > 0 && !wait_success(foreign)) ok = 0;
     if (!ok) { fputs("workload validation failed\n", stderr); return 1; }
     printf("OK sha=%lu aes=%lu foreign=%d\n", sha ? n : 0, aes ? n : 0, foreign > 0);
-    return 0;
+    return !strcmp(mode, "sha-fail") ? 7 : 0;
 }

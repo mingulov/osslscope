@@ -25,7 +25,7 @@ are:
 
 | Mode | SHA-256 NEWCTX | AES-256-GCM NEWCTX | Shared GCM UPDATE |
 | --- | ---: | ---: | ---: |
-| `sha` | N | 0 | 0 |
+| `sha`, `sha-fail` | N | 0 | 0 |
 | `aes` | 0 | N | N |
 | `both`, `worker`, `mixed-fork` | N | N | N |
 | `forked`, `quiet` | 0 | 0 | 0 |
@@ -49,6 +49,8 @@ does that from a worker; the preview documents possible coverage loss at
 nonleader exec, so this mode has no promised positive-count total. Use an
 absolute workload path for these exec controls. `quiet` performs no EVP work
 and sleeps for two seconds, also providing a bounded signal/deadline control.
+`sha-fail` verifies the SHA loop, then intentionally exits 7 to exercise child
+failure and definite-policy-violation exit precedence with positive evidence.
 
 Run the installed app using its documented [usage](../../docs/usage.md), for
 example `report ... run -- "$OSSL_PREVIEW_WORKLOAD" both`. An observer needs
