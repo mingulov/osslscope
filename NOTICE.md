@@ -11,9 +11,17 @@ its GPL-2.0 option is selected for use with those BPF programs. The
 [GPL-2.0 text](LICENSES/GPL-2.0-only.txt) applies to that option. The
 contract retains its original GPL-2.0-or-later expression.
 
-These are first-party source facts, not a complete release notice set.
-Actual dependency/tool-source terms, notices and source availability must
-be retained and reviewed before conveying a release. Declared SPDX
-expressions and hashes do not establish authorship or conveyance rights.
+The source-only preview archive contains this project's source, fixtures,
+catalogue metadata, schemas, documentation, scripts and both Cargo lockfiles.
+It contains no prebuilt host/BPF binaries, vendored Rust dependencies, OpenSSL
+library, kernel image or compiler/linker source bundle. Build prerequisites
+and locked registry dependencies are obtained separately under their own terms.
+
+These notices describe the source archive's first-party components. They are
+not a transitive dependency/toolchain notice set for a later binary or vendored
+distribution. Any separately conveyed dependency, tool source or binary needs
+its applicable terms, notices and source availability reviewed for that
+inventory. Declared SPDX expressions and hashes do not establish authorship
+or conveyance rights.
 See [the source license index](LICENSES/README.md) and
 [licensing details](docs/licensing.md).

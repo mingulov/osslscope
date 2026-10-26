@@ -1,6 +1,12 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Overhead and support matrix
 
+The v0.2.0 foreground preview has no current runtime/overhead qualification yet.
+Its release requires matched SHA-256/AES-GCM measurements on the exact enrolled
+candidate, including count loss and measurement limits. The historical budgets
+below belong to the broader product track; they are not inherited preview
+results. See the [roadmap](../ROADMAP.md).
+
 The tables below preserve historical fixture-era results, separate
 from current integrated v2 qualification. They are source/kernel/
 workload-specific medians from repeated fixture-provider runs on

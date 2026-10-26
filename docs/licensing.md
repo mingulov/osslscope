@@ -29,3 +29,20 @@ terms. A source and dependency review, an actual-object inspection, and
 separate runtime qualification are needed before claims about a particular
 release artifact. Metadata and the kernel load argument alone do not
 establish source provenance or conveyance rights.
+
+## Source-only preview inventory
+
+The preview's source archive is produced from the tracked product repository.
+It includes the project components above, both lockfiles, source fixtures,
+catalogue metadata, schemas, scripts and documentation. It excludes private
+workspace material, generated outputs, compiled host/BPF binaries and vendored
+third-party source. OpenSSL, the kernel, registry dependencies and the pinned
+Rust/linker prerequisites are separate build/runtime inputs under their own
+terms; they are not bundled into this source archive.
+
+The [source component notices](../NOTICE.md) and
+[license index](../LICENSES/README.md) describe that conveyed inventory. The
+lockfiles pin external versions, registry locations and checksums, not an
+aggregate license determination. Later distribution of compiled binaries,
+vendored dependencies or copied tool sources needs a notice/source review for
+those actual contents. Advanced binary/package distribution remains deferred.
