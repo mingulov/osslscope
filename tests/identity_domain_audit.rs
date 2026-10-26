@@ -909,6 +909,49 @@ fn h5_t3_every_device_site_names_one_domain() {
         // Source reads compare before/after raw metadata from the same retained FD.
         ("src/package/source.rs", "raw", "a.dev(),", 1),
         ("src/package/source.rs", "raw", "b.dev(),", 1),
+        // The actual-source HOST driver makes capture's test module visible.
+        // These fixtures keep normalized stat words in SiteKey/ObjectRecord;
+        // rendering or decoding the fixture does not change its caller domain.
+        (
+            "src/capture.rs",
+            "stat",
+            "&crate::plan::render_device(dev),",
+            1,
+        ),
+        (
+            "src/capture.rs",
+            "stat",
+            "assert_eq!(o.key.device, device);",
+            1,
+        ),
+        (
+            "src/capture.rs",
+            "stat",
+            "assert_eq!(site.site.device, device);",
+            1,
+        ),
+        // SeedFile metadata starts as raw dev_t, then major/minor encode it
+        // into the same stat word used by the seeded file and mapping.
+        (
+            "src/capture.rs",
+            "raw",
+            "crate::plan::encode_device(libc::major(meta.dev()), libc::minor(meta.dev())),",
+            1,
+        ),
+        (
+            "src/capture.rs",
+            "stat",
+            "let device = plan::device_id_of_dev_str(\"08:01\").unwrap();",
+            7,
+        ),
+        // Namespace FD identities compare raw MetadataExt dev_t/inode tuples
+        // only with other namespace FD identities, never maps/encoded devices.
+        (
+            "src/lifecycle_producer.rs",
+            "raw",
+            "namespaces.push((m.dev(), m.ino()));",
+            1,
+        ),
     ];
     for (file, domain, _, _) in pinned {
         assert!(

@@ -34,3 +34,47 @@ pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
         }
     }
 }
+
+/// A parsed and fully admitted command. Preparation performs no acquisition.
+pub enum PreparedCommand {
+    Immediate(std::process::ExitCode),
+    Report(crate::report::Prepared),
+    Check(crate::check::Prepared),
+}
+impl PreparedCommand {
+    pub fn setup_deadline(&self) -> Option<std::time::Instant> {
+        match self {
+            Self::Report(p) => p.setup_deadline(),
+            Self::Check(p) => p.setup_deadline(),
+            Self::Immediate(_) => None,
+        }
+    }
+    pub fn workload_fd(&self) -> std::io::Result<Option<std::os::fd::BorrowedFd<'_>>> {
+        match self {
+            Self::Report(p) => p.workload_fd(),
+            Self::Check(p) => p.workload_fd(),
+            Self::Immediate(_) => Ok(None),
+        }
+    }
+    pub fn execute(self) -> Result<crate::report::CaptureCommandResult, std::process::ExitCode> {
+        match self {
+            Self::Report(p) => Ok(p.execute()),
+            Self::Check(p) => Ok(p.execute()),
+            Self::Immediate(code) => Err(code),
+        }
+    }
+}
+pub fn prepare(args: impl Iterator<Item = String>) -> PreparedCommand {
+    let argv: Vec<_> = args.collect();
+    match argv.first().map(String::as_str) {
+        Some("report") => match crate::report::prepare(&argv[1..]) {
+            Ok(p) => PreparedCommand::Report(p),
+            Err(e) => PreparedCommand::Immediate(e),
+        },
+        Some("check") => match crate::check::prepare(&argv[1..]) {
+            Ok(p) => PreparedCommand::Check(p),
+            Err(e) => PreparedCommand::Immediate(e),
+        },
+        _ => PreparedCommand::Immediate(run(argv.into_iter())),
+    }
+}

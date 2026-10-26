@@ -1490,6 +1490,12 @@ impl CountEngine {
         F: FnOnce() -> D + Send + 'static,
         S: FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
     {
+        crate::lifecycle_producer::note_acquisition().map_err(|_| {
+            CountPrepareFailure::from(OwnerFailure::engine(
+                CountOperation::Load,
+                FailureClass::InvalidInput,
+            ))
+        })?;
         let deadline = setup.as_ref().map_or(deadline, |s| {
             deadline
                 .min(s.control.deadline())

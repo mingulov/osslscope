@@ -8447,6 +8447,12 @@ fn real_kernel_release() -> String {
 
 #[test]
 fn ordinary_production_capture_genuinely_observed_sleep_is_honest_noquery() {
+    run_connector_driver(
+        "connector-controller:ordinary_production_capture_genuinely_observed_sleep_is_honest_noquery",
+    );
+}
+pub(crate) fn connector_body_ordinary_production_capture_genuinely_observed_sleep_is_honest_noquery()
+ {
     // F1-shape (round 3 composition pin — NOT the F1
     // qualification; see the live lane in target_lifecycle.rs).
     // A plain `/bin/sleep 1` runs the production loop with real
@@ -10420,4 +10426,19 @@ fn g1_recycle_count_cleanup_cannot_extend_window() {
             .count(),
         1
     );
+}
+
+#[path = "support/lifecycle_driver.rs"]
+mod lifecycle_driver;
+use lifecycle_driver::run_connector_driver;
+
+pub(crate) fn connector_dispatch(case: &str) -> i32 {
+    match case {
+        "connector-controller:ordinary_production_capture_genuinely_observed_sleep_is_honest_noquery" =>
+        {
+            connector_body_ordinary_production_capture_genuinely_observed_sleep_is_honest_noquery();
+            0
+        }
+        _ => panic!("unknown connector test case"),
+    }
 }

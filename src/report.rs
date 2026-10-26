@@ -291,6 +291,12 @@ pub(crate) fn grouped(n: u64) -> String {
 const USAGE: &str = "usage: report [--duration S] [--provider P] [--object O] [--count-object C] [--members-object M] [--table F] [--force-offset N] [--provider-table F] [--format human|json] [--out F] [--cbom FILE] [--builtin] [--settle S] [--timeout S] [--grace S] [--image-digest D] [--workload-out F] [--workload-out-fd N] {--pid P | run -- <cmd>}";
 
 pub fn run(argv: &[String]) -> ExitCode {
+    match prepare(argv) {
+        Ok(p) => ExitCode::from(p.execute().exit_code),
+        Err(code) => code,
+    }
+}
+pub(crate) fn prepare(argv: &[String]) -> Result<Prepared, ExitCode> {
     // --help anywhere on the osslscope side (a target command after
     // run -- may legitimately contain --help).
     if argv
@@ -299,50 +305,125 @@ pub fn run(argv: &[String]) -> ExitCode {
         .any(|a| a == "--help" || a == "-h")
     {
         println!("{USAGE}");
-        return ExitCode::from(0);
+        return Err(ExitCode::from(0));
     }
     let args = match parse(argv) {
         Ok(a) => a,
         Err(e) => {
             err_line(&format!("osslscope report: {e}"));
             err_line(USAGE);
-            return ExitCode::from(2);
+            return Err(ExitCode::from(2));
         }
     };
     // T14r4: report renders the finalized v2 capture document
     // (policy None => report shape), never the historical v1
     // projection. PRD §14.1: the live producer schema is
     // observed-crypto-v2.3; v1 fixtures are history.
-    let req = OutputRequest {
-        format: if args.format == "json" {
-            OutputFormat::Json
-        } else {
-            OutputFormat::Human
-        },
-        primary: match args.out {
-            None => OutputDest::Stdout,
-            Some(path) => OutputDest::File(path.into()),
-        },
-        cbom: args.cbom.map(|path| OutputDest::File(path.into())),
+    let overrides = crate::package::commands::ObjectOverrides {
+        harvest: args.cfg.harvest_object.clone(),
+        count: args.cfg.count_object.clone(),
+        members: args.cfg.members_object.clone(),
     };
-    // H9: captured before the target moves into capture (the T4
-    // hint needs to know the workload was discarded post-run).
-    let workload_discarded = matches!(
-        &args.target,
-        capture::Target::Spawn {
-            workload: crate::target::WorkloadDest::Null,
-            ..
+    let objects = match with_report_objects(
+        &overrides,
+        crate::package::commands::resolve_command_objects,
+        |objects| objects,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            let req = OutputRequest {
+                format: if args.format == "json" {
+                    OutputFormat::Json
+                } else {
+                    OutputFormat::Human
+                },
+                primary: args
+                    .out
+                    .as_ref()
+                    .map_or(OutputDest::Stdout, |p| OutputDest::File(p.into())),
+                cbom: args.cbom.as_ref().map(|p| OutputDest::File(p.into())),
+            };
+            let discarded = matches!(
+                &args.target,
+                capture::Target::Spawn {
+                    workload: crate::target::WorkloadDest::Null,
+                    ..
+                }
+            );
+            let result = crate::report::consume_capture_result(
+                Err(e.into()),
+                CaptureCommand::Report,
+                &req,
+                discarded,
+            );
+            return Err(ExitCode::from(result.exit_code));
         }
-    );
-    ExitCode::from(
+    };
+    let setup_deadline = std::time::Instant::now()
+        .checked_add(args.cfg.harvest_timeout)
+        .ok_or_else(|| {
+            crate::report::err_line("setup deadline overflow");
+            ExitCode::from(2)
+        })?;
+    Ok(Prepared {
+        args,
+        objects,
+        setup_deadline,
+    })
+}
+pub struct Prepared {
+    setup_deadline: std::time::Instant,
+    args: Args,
+    objects: crate::package::commands::AdmittedSet,
+}
+impl Prepared {
+    pub(crate) fn setup_deadline(&self) -> Option<std::time::Instant> {
+        Some(self.setup_deadline)
+    }
+    pub(crate) fn workload_fd(&self) -> std::io::Result<Option<std::os::fd::BorrowedFd<'_>>> {
+        match &self.args.target {
+            capture::Target::Spawn { workload, .. } => {
+                crate::target::validate_workload_fd(workload)
+            }
+            _ => Ok(None),
+        }
+    }
+    pub(crate) fn execute(self) -> crate::report::CaptureCommandResult {
+        let args = self.args;
+        let req = OutputRequest {
+            format: if args.format == "json" {
+                OutputFormat::Json
+            } else {
+                OutputFormat::Human
+            },
+            primary: match args.out {
+                None => OutputDest::Stdout,
+                Some(path) => OutputDest::File(path.into()),
+            },
+            cbom: args.cbom.map(|path| OutputDest::File(path.into())),
+        };
+        // H9: captured before the target moves into capture (the T4
+        // hint needs to know the workload was discarded post-run).
+        let workload_discarded = matches!(
+            &args.target,
+            capture::Target::Spawn {
+                workload: crate::target::WorkloadDest::Null,
+                ..
+            }
+        );
         consume_capture_result(
-            capture_report(&args.cfg, args.target),
+            capture::run_admitted_before(
+                &args.cfg,
+                args.target,
+                self.objects,
+                args.cfg.members_object.is_none(),
+                Some(self.setup_deadline),
+            ),
             CaptureCommand::Report,
             &req,
             workload_discarded,
         )
-        .exit_code,
-    )
+    }
 }
 
 // ---------------------------------------------------------------- v2 output
@@ -2589,18 +2670,34 @@ pub(crate) fn with_report_objects<R>(
         effect,
     )
 }
-fn capture_report(
-    cfg: &capture::Config,
-    target: capture::Target,
-) -> anyhow::Result<capture::Capture> {
-    let overrides = crate::package::commands::ObjectOverrides {
-        harvest: cfg.harvest_object.clone(),
-        count: cfg.count_object.clone(),
-        members: cfg.members_object.clone(),
-    };
-    with_report_objects(
-        &overrides,
-        crate::package::commands::resolve_command_objects,
-        |objects| capture::run_admitted(cfg, target, objects, cfg.members_object.is_none()),
-    )?
+
+/// Add producer custody without changing observation, delivery, or policy facts.
+pub fn apply_producer_shutdown(
+    result: &mut CaptureCommandResult,
+    receipt: &crate::lifecycle_producer::ProducerShutdownReceipt,
+    diagnostics: &mut dyn std::io::Write,
+) {
+    if receipt.state == crate::lifecycle_producer::ProducerShutdownState::Complete {
+        return;
+    }
+    if matches!(result.exit_code, 0 | 3 | 11) {
+        result.exit_code = 1
+    }
+    let line: String = format!(
+        "lifecycle producer cleanup {:?}; launcher-wait={:?}; {}",
+        receipt.state,
+        receipt.launcher_status,
+        receipt
+            .failure
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_default()
+    )
+    .chars()
+    .take(200)
+    .collect();
+    let _ = writeln!(diagnostics, "{line}");
+    if result.diagnostics.len() < 9 {
+        result.diagnostics.push(line)
+    }
 }

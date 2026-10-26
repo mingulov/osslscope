@@ -517,6 +517,12 @@ const USAGE: [&str; 2] = [
 ];
 
 pub fn run(argv: &[String]) -> ExitCode {
+    match prepare(argv) {
+        Ok(p) => ExitCode::from(p.execute().exit_code),
+        Err(code) => code,
+    }
+}
+pub(crate) fn prepare(argv: &[String]) -> Result<Prepared, ExitCode> {
     // --help anywhere on the osslscope side (a target command after
     // run -- may legitimately contain --help).
     if argv
@@ -527,7 +533,7 @@ pub fn run(argv: &[String]) -> ExitCode {
         for l in USAGE {
             println!("{l}");
         }
-        return ExitCode::from(0);
+        return Err(ExitCode::from(0));
     }
     let args = match parse(argv) {
         Ok(a) => a,
@@ -536,41 +542,118 @@ pub fn run(argv: &[String]) -> ExitCode {
             for l in USAGE {
                 crate::report::err_line(l);
             }
-            return ExitCode::from(2);
+            return Err(ExitCode::from(2));
         }
     };
-    let req = OutputRequest {
-        format: if args.format == "json" {
-            OutputFormat::Json
-        } else {
-            OutputFormat::Human
-        },
-        primary: match args.out {
-            None => OutputDest::Stdout,
-            Some(path) => OutputDest::File(path.into()),
-        },
-        cbom: args.cbom.map(|path| OutputDest::File(path.into())),
+    let overrides = crate::package::commands::ObjectOverrides {
+        harvest: args.cfg.harvest_object.clone(),
+        count: args.cfg.count_object.clone(),
+        members: args.cfg.members_object.clone(),
     };
-    // H9: captured before the target moves into capture (the T4
-    // hint needs to know the workload was discarded post-run).
-    let workload_discarded = matches!(
-        &args.target,
-        capture::Target::Spawn {
-            workload: crate::target::WorkloadDest::Null,
-            ..
+    let objects = match with_check_objects(
+        &overrides,
+        crate::package::commands::resolve_command_objects,
+        |objects| objects,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            let req = OutputRequest {
+                format: if args.format == "json" {
+                    OutputFormat::Json
+                } else {
+                    OutputFormat::Human
+                },
+                primary: args
+                    .out
+                    .as_ref()
+                    .map_or(OutputDest::Stdout, |p| OutputDest::File(p.into())),
+                cbom: args.cbom.as_ref().map(|p| OutputDest::File(p.into())),
+            };
+            let discarded = matches!(
+                &args.target,
+                capture::Target::Spawn {
+                    workload: crate::target::WorkloadDest::Null,
+                    ..
+                }
+            );
+            let result = crate::report::consume_capture_result(
+                Err(e.into()),
+                crate::report::CaptureCommand::Check {
+                    rules: &policy_rules(&args.rules),
+                },
+                &req,
+                discarded,
+            );
+            return Err(ExitCode::from(result.exit_code));
         }
-    );
-    ExitCode::from(
+    };
+    let setup_deadline = std::time::Instant::now()
+        .checked_add(args.cfg.harvest_timeout)
+        .ok_or_else(|| {
+            crate::report::err_line("setup deadline overflow");
+            ExitCode::from(2)
+        })?;
+    Ok(Prepared {
+        args,
+        objects,
+        setup_deadline,
+    })
+}
+pub struct Prepared {
+    setup_deadline: std::time::Instant,
+    args: Args,
+    objects: crate::package::commands::AdmittedSet,
+}
+impl Prepared {
+    pub(crate) fn setup_deadline(&self) -> Option<std::time::Instant> {
+        Some(self.setup_deadline)
+    }
+    pub(crate) fn workload_fd(&self) -> std::io::Result<Option<std::os::fd::BorrowedFd<'_>>> {
+        match &self.args.target {
+            capture::Target::Spawn { workload, .. } => {
+                crate::target::validate_workload_fd(workload)
+            }
+            _ => Ok(None),
+        }
+    }
+    pub(crate) fn execute(self) -> crate::report::CaptureCommandResult {
+        let args = self.args;
+        let req = OutputRequest {
+            format: if args.format == "json" {
+                OutputFormat::Json
+            } else {
+                OutputFormat::Human
+            },
+            primary: match args.out {
+                None => OutputDest::Stdout,
+                Some(path) => OutputDest::File(path.into()),
+            },
+            cbom: args.cbom.map(|path| OutputDest::File(path.into())),
+        };
+        // H9: captured before the target moves into capture (the T4
+        // hint needs to know the workload was discarded post-run).
+        let workload_discarded = matches!(
+            &args.target,
+            capture::Target::Spawn {
+                workload: crate::target::WorkloadDest::Null,
+                ..
+            }
+        );
         crate::report::consume_capture_result(
-            capture_check(&args.cfg, args.target),
+            capture::run_admitted_before(
+                &args.cfg,
+                args.target,
+                self.objects,
+                args.cfg.members_object.is_none(),
+                Some(self.setup_deadline),
+            ),
             crate::report::CaptureCommand::Check {
                 rules: &policy_rules(&args.rules),
             },
             &req,
             workload_discarded,
         )
-        .exit_code,
-    )
+    }
 }
 
 #[cfg(test)]
@@ -1484,19 +1567,4 @@ pub(crate) fn with_check_objects<R>(
         resolve,
         effect,
     )
-}
-fn capture_check(
-    cfg: &capture::Config,
-    target: capture::Target,
-) -> anyhow::Result<capture::Capture> {
-    let overrides = crate::package::commands::ObjectOverrides {
-        harvest: cfg.harvest_object.clone(),
-        count: cfg.count_object.clone(),
-        members: cfg.members_object.clone(),
-    };
-    with_check_objects(
-        &overrides,
-        crate::package::commands::resolve_command_objects,
-        |objects| capture::run_admitted(cfg, target, objects, cfg.members_object.is_none()),
-    )?
 }

@@ -453,6 +453,20 @@ pub enum WorkloadDest {
 /// same 126 marker, so operators keep one vocabulary.
 pub const WORKLOAD_SETUP_EXIT: i32 = 126;
 
+pub(crate) fn validate_workload_fd(
+    dest: &WorkloadDest,
+) -> std::io::Result<Option<std::os::fd::BorrowedFd<'_>>> {
+    match dest {
+        WorkloadDest::Fd(fd) => {
+            if unsafe { libc::fcntl(*fd, libc::F_GETFD) } < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(Some(unsafe { std::os::fd::BorrowedFd::borrow_raw(*fd) }))
+        }
+        _ => Ok(None),
+    }
+}
+
 /// Redirect a fork child's stdout+stderr onto its workload
 /// destination (H9/R07 output policy, R06 custody): a spawned
 /// workload must never share the observer's stdout artifact channel
@@ -1515,6 +1529,12 @@ fn close_under_control(
 /// uses only its stack copy (a plain integer + nanosleep — no
 /// allocation, no TLS access post-fork). Production callers must never
 /// arm this.
+#[cfg(test)]
+pub(crate) static HOST_BEFORE_PRODUCER_CLOSE_STOP: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+pub(crate) static HOST_PRODUCER_STOP_HOLD: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+pub(crate) static HOST_PRODUCER_STOP_PID: AtomicU32 = AtomicU32::new(0);
 struct PrestopTestHook {
     stall_ms: u64,
     pid_sink: Option<Arc<AtomicU32>>,
@@ -1655,6 +1675,7 @@ struct PrestopGuard {
     pid: u32,
     armed: bool,
     pidfd: Option<OwnedFd>,
+    producer_alias: Option<crate::lifecycle_producer::ProducerTargetLease>,
 }
 
 /// How long the pre-stop guard waits to reap a SIGKILLed child before
@@ -1730,6 +1751,9 @@ impl PrestopGuard {
                     } else {
                         128 + libc::WTERMSIG(status)
                     };
+                    if let Some(alias) = self.producer_alias.as_mut() {
+                        alias.closed();
+                    }
                     self.disarm();
                     return Ok(if killed {
                         GuardCleanup::KilledAndReaped(code)
@@ -1804,7 +1828,13 @@ impl Drop for PrestopGuard {
         let end = Instant::now() + Duration::from_millis(200);
         while Instant::now() < end {
             match reap_once(self.pid) {
-                Ok(Some(_)) | Err(_) => return,
+                Ok(Some(_)) => {
+                    if let Some(alias) = self.producer_alias.as_mut() {
+                        alias.closed();
+                    }
+                    return;
+                }
+                Err(_) => return,
                 Ok(None) => std::thread::sleep(Duration::from_millis(1)),
             }
         }
@@ -1852,6 +1882,22 @@ impl OwnedTarget {
         deadline: Instant,
         cancel: &AtomicBool,
     ) -> anyhow::Result<Self> {
+        Self::spawn_stopped_with_producer_close(argv, dest, deadline, cancel, None)
+    }
+    pub(crate) fn spawn_stopped_with_producer_close(
+        argv: &[String],
+        dest: WorkloadDest,
+        deadline: Instant,
+        cancel: &AtomicBool,
+        close: Option<crate::lifecycle_producer::ProducerChildCloseSet>,
+    ) -> anyhow::Result<Self> {
+        crate::lifecycle_producer::note_acquisition()?;
+        let producer = crate::lifecycle_producer::target_registration()?;
+        let mut producer_alias = producer.as_ref().map(|p| p.target_lease()).transpose()?;
+        let close = match close {
+            Some(close) => Some(close),
+            None => producer.as_ref().map(|p| p.child_close_set()).transpose()?,
+        };
         use anyhow::Context as _;
         if argv.is_empty() {
             anyhow::bail!("run -- needs a command");
@@ -2056,6 +2102,8 @@ impl OwnedTarget {
         // inert (`false`) for every production caller.
         let fail_fork =
             SETUP_TEST_HOOK.with(|h| std::mem::replace(&mut h.borrow_mut().fail_fork, false));
+        #[cfg(test)]
+        let stop_before_producer_close = HOST_BEFORE_PRODUCER_CLOSE_STOP.load(Ordering::Acquire);
         let pid = if fail_fork {
             -1
         } else {
@@ -2079,6 +2127,17 @@ impl OwnedTarget {
         }
         if pid == 0 {
             unsafe {
+                #[cfg(test)]
+                if stop_before_producer_close {
+                    libc::raise(libc::SIGSTOP);
+                }
+                if let Some(close) = close {
+                    for fd in close.0 {
+                        if libc::close(fd) != 0 {
+                            libc::_exit(126);
+                        }
+                    }
+                }
                 // F-CAPS-1: a filecaps observer (cap_bpf+cap_perfmon)
                 // is born non-dumpable, and the forked child inherits
                 // that — same-uid /proc/PID/maps reads then fail with
@@ -2135,10 +2194,14 @@ impl OwnedTarget {
         // Custody starts IMMEDIATELY at the fork return — before the
         // parent's sink copy is disposed (a FUSE close can block) and
         // before the wait.
+        if let Some(alias) = producer_alias.as_mut() {
+            alias.inherited();
+        }
         let mut guard = PrestopGuard {
             pid,
             armed: true,
             pidfd: None,
+            producer_alias,
         };
         match setup_pidfd_open(pid) {
             Ok(fd) => guard.pidfd = Some(fd),
@@ -2209,6 +2272,21 @@ impl OwnedTarget {
             }
             if matches!(info.si_code, libc::CLD_STOPPED | libc::CLD_TRAPPED) {
                 let initial_stop = unsafe { info.si_status() };
+                #[cfg(test)]
+                if HOST_PRODUCER_STOP_HOLD.load(Ordering::Acquire) {
+                    HOST_PRODUCER_STOP_PID.store(pid, Ordering::Release);
+                    while HOST_PRODUCER_STOP_HOLD.load(Ordering::Acquire) {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+                if let Some(alias) = guard.producer_alias.as_mut() {
+                    if let Err(error) = alias.confirm_closed(pid, deadline) {
+                        let report = guard_cleanup_report(&mut guard);
+                        anyhow::bail!(
+                            "pre-stop producer closure not proven: {error}; owned child {pid} {report}"
+                        );
+                    }
+                }
                 guard.disarm();
                 return Ok(OwnedTarget {
                     pid,
@@ -2260,6 +2338,9 @@ impl OwnedTarget {
             {
                 let report = guard_cleanup_report(&mut guard);
                 anyhow::bail!("initial child exit receipt changed; owned child {pid} {report}");
+            }
+            if let Some(alias) = guard.producer_alias.as_mut() {
+                alias.closed();
             }
             guard.disarm();
             let code = receipt.code();

@@ -2340,6 +2340,9 @@ fn r20_exec_replaces_image_custody_survives() {
 
 #[test]
 fn r20fix_kernel_lifecycle_witnesses_real_fork_exec_exit() {
+    run_connector_driver("connector-target:r20fix_kernel_lifecycle_witnesses_real_fork_exec_exit");
+}
+pub(crate) fn connector_body_r20fix_kernel_lifecycle_witnesses_real_fork_exec_exit() {
     // Real-kernel control (no fakes, no privileges): subscribe BEFORE
     // release — the stopped child cannot act until released, so no
     // activity can precede the subscription — then release a workload
@@ -2566,6 +2569,9 @@ fn await_none_ack(
 
 #[test]
 fn kernel_unsubscribe_is_accepted_live() {
+    run_connector_driver("connector-target:kernel_unsubscribe_is_accepted_live");
+}
+pub(crate) fn connector_body_kernel_unsubscribe_is_accepted_live() {
     // NEW (balanced registration): IGNORE must be ACCEPTED by the
     // kernel (err 0 on the echoed NONE ack — a wrong op would answer
     // EINVAL and leak the listener count). A holder keeps the global
@@ -2637,6 +2643,9 @@ fn kernel_unsubscribe_is_accepted_live() {
 
 #[test]
 fn kernel_live_target_first_sighting_gaps_prefix() {
+    run_connector_driver("connector-target:kernel_live_target_first_sighting_gaps_prefix");
+}
+pub(crate) fn connector_body_kernel_live_target_first_sighting_gaps_prefix() {
     // F2 RED (live): subscribing to a LIVE target — activity
     // possible throughout, so no first sighting is preceded by a
     // proven-quiet interval — must not silently baseline per-CPU
@@ -2697,6 +2706,9 @@ fn r20_online_cpu_count() -> u32 {
 
 #[test]
 fn kernel_subscribe_watermarks_all_cpus_pre_activity() {
+    run_connector_driver("connector-target:kernel_subscribe_watermarks_all_cpus_pre_activity");
+}
+pub(crate) fn connector_body_kernel_subscribe_watermarks_all_cpus_pre_activity() {
     // F2 (live): subscribing to a STOPPED owned child watermarks
     // every online CPU pre-activity — each CPU delivers a
     // baseline while the target provably cannot emit, so later
@@ -2747,6 +2759,9 @@ fn kernel_subscribe_watermarks_all_cpus_pre_activity() {
 
 #[test]
 fn kernel_close_drain_establishes_terminal_watermark() {
+    run_connector_driver("connector-target:kernel_close_drain_establishes_terminal_watermark");
+}
+pub(crate) fn connector_body_kernel_close_drain_establishes_terminal_watermark() {
     // F2 (live): close establishes a terminal per-CPU watermark —
     // successors on every online CPU prove the suffix (any
     // pre-close loss surfaces as an interior hole when its
@@ -3211,6 +3226,14 @@ fn f1_v258_fenced_aware_expectation_pins_red_and_green_shapes() {
 #[test]
 #[ignore = "live lane only (OSSL_R20_LIVE=1 + root + BPF objects)"]
 fn ordinary_production_run_counts_real_crypto_free_of_polling_fallback() {
+    if r20_live_gated().is_none() {
+        return;
+    }
+    run_connector_driver(
+        "connector-target:ordinary_production_run_counts_real_crypto_free_of_polling_fallback",
+    );
+}
+pub(crate) fn connector_body_ordinary_production_run_counts_real_crypto_free_of_polling_fallback() {
     // F1 (round 4): the qualified ordinary supported production
     // window. `openssl speed -seconds 1 aes-128-cbc` (real
     // libcrypto queries) runs through PRODUCTION `capture::run`:
@@ -3383,12 +3406,18 @@ const USERNS_PROBE_ENV: &str = "R20_USERNS_PROBE";
 
 #[test]
 fn helper_userns_subscribe_probe() {
+    if std::env::var(USERNS_PROBE_ENV).as_deref() != Ok("1") {
+        return;
+    }
+    run_connector_driver("connector-target:helper_userns_subscribe_probe");
+}
+pub(crate) fn connector_body_helper_userns_subscribe_probe() -> i32 {
     // Hidden probe worker for `kernel_subscribe_in_user_namespace_
     // fails_closed` (re-executed in a child test-binary process —
     // never forked in-process, so no post-fork lock hazard). No-op
     // in normal suite runs.
     if std::env::var(USERNS_PROBE_ENV).as_deref() != Ok("1") {
-        return;
+        return 0;
     }
     let code = unsafe {
         if libc::unshare(libc::CLONE_NEWUSER) != 0 {
@@ -3428,11 +3457,14 @@ fn helper_userns_subscribe_probe() {
             }
         }
     };
-    std::process::exit(code);
+    code
 }
 
 #[test]
 fn kernel_subscribe_in_user_namespace_fails_closed() {
+    run_connector_driver("connector-target:kernel_subscribe_in_user_namespace_fails_closed");
+}
+pub(crate) fn connector_body_kernel_subscribe_in_user_namespace_fails_closed() {
     // F2 (unsupported-namespace registration failure): the kernel
     // ignores LISTEN from non-init namespaces with SILENCE (no ack)
     // — subscribe must bail (loud fallback), never manufacture a
@@ -3443,11 +3475,9 @@ fn kernel_subscribe_in_user_namespace_fails_closed() {
     if !require_connector("kernel_subscribe_in_user_namespace_fails_closed") {
         return;
     }
-    let exe = std::env::current_exe().expect("test exe");
+    let exe = std::env::var_os("OSSL_LIFECYCLE_TEST_DRIVER").expect("explicit current driver");
     let mut child = std::process::Command::new(exe)
-        .arg("--exact")
-        .arg("helper_userns_subscribe_probe")
-        .arg("--nocapture")
+        .arg("connector-target:helper_userns_subscribe_probe")
         .env(USERNS_PROBE_ENV, "1")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -3710,4 +3740,45 @@ fn w079_retained_stop_and_cleanup_table() {
         );
     }
     assert_reaped_no_zombie(pid);
+}
+
+#[path = "support/lifecycle_driver.rs"]
+mod lifecycle_driver;
+use lifecycle_driver::run_connector_driver;
+
+pub(crate) fn connector_dispatch(case: &str) -> i32 {
+    match case {
+        "connector-target:r20fix_kernel_lifecycle_witnesses_real_fork_exec_exit" => {
+            connector_body_r20fix_kernel_lifecycle_witnesses_real_fork_exec_exit();
+            0
+        }
+        "connector-target:kernel_unsubscribe_is_accepted_live" => {
+            connector_body_kernel_unsubscribe_is_accepted_live();
+            0
+        }
+        "connector-target:kernel_live_target_first_sighting_gaps_prefix" => {
+            connector_body_kernel_live_target_first_sighting_gaps_prefix();
+            0
+        }
+        "connector-target:kernel_subscribe_watermarks_all_cpus_pre_activity" => {
+            connector_body_kernel_subscribe_watermarks_all_cpus_pre_activity();
+            0
+        }
+        "connector-target:kernel_close_drain_establishes_terminal_watermark" => {
+            connector_body_kernel_close_drain_establishes_terminal_watermark();
+            0
+        }
+        "connector-target:kernel_subscribe_in_user_namespace_fails_closed" => {
+            connector_body_kernel_subscribe_in_user_namespace_fails_closed();
+            0
+        }
+        "connector-target:ordinary_production_run_counts_real_crypto_free_of_polling_fallback" => {
+            connector_body_ordinary_production_run_counts_real_crypto_free_of_polling_fallback();
+            0
+        }
+        "connector-target:helper_userns_subscribe_probe" => {
+            connector_body_helper_userns_subscribe_probe()
+        }
+        _ => panic!("unknown connector test case"),
+    }
 }

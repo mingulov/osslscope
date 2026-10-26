@@ -292,6 +292,11 @@ impl std::error::Error for RingbufQueryError {}
 /// startup gating (P7 item 3+); doctor surfaces it as an
 /// informational row until then.
 pub fn probe_ringbuf_query() -> Result<(), RingbufQueryError> {
+    crate::lifecycle_producer::note_acquisition().map_err(|e| RingbufQueryError {
+        stage: "bootstrap",
+        errno: -1,
+        log: e.to_string(),
+    })?;
     #[cfg(test)]
     if tests::record_probe(tests::Probe::RingbufQuery) {
         return Ok(());
@@ -408,6 +413,13 @@ fn errno_of(e: &std::io::Error) -> i32 {
 }
 
 fn run_prog_load(insns: &[u8]) -> ProbeOut {
+    if let Err(e) = crate::lifecycle_producer::note_acquisition() {
+        return ProbeOut {
+            ok: false,
+            errno: -1,
+            log: e.to_string(),
+        };
+    }
     #[cfg(test)]
     if let Some(result) = tests::probe_result(tests::Probe::ProgLoad) {
         return result;
@@ -431,6 +443,13 @@ fn run_prog_load(insns: &[u8]) -> ProbeOut {
 }
 
 fn run_map_create(map_type: u32, key_size: u32, value_size: u32, max_entries: u32) -> ProbeOut {
+    if let Err(e) = crate::lifecycle_producer::note_acquisition() {
+        return ProbeOut {
+            ok: false,
+            errno: -1,
+            log: e.to_string(),
+        };
+    }
     #[cfg(test)]
     if let Some(result) = tests::probe_result(tests::Probe::MapCreate(
         map_type,
@@ -482,6 +501,13 @@ fn entry_file_offset(exe_bytes: &[u8]) -> Option<u64> {
 }
 
 fn run_multi_self() -> ProbeOut {
+    if let Err(e) = crate::lifecycle_producer::note_acquisition() {
+        return ProbeOut {
+            ok: false,
+            errno: -1,
+            log: e.to_string(),
+        };
+    }
     #[cfg(test)]
     if let Some(result) = tests::probe_result(tests::Probe::MultiSelf) {
         return result;
@@ -562,6 +588,13 @@ fn run_multi_self() -> ProbeOut {
 }
 
 fn run_token_probe() -> ProbeOut {
+    if let Err(e) = crate::lifecycle_producer::note_acquisition() {
+        return ProbeOut {
+            ok: false,
+            errno: -1,
+            log: e.to_string(),
+        };
+    }
     #[cfg(test)]
     if let Some(result) = tests::probe_result(tests::Probe::Token) {
         return result;
@@ -722,6 +755,13 @@ struct PerfAttr {
 }
 
 fn run_perf_self() -> ProbeOut {
+    if let Err(e) = crate::lifecycle_producer::note_acquisition() {
+        return ProbeOut {
+            ok: false,
+            errno: -1,
+            log: e.to_string(),
+        };
+    }
     #[cfg(test)]
     if let Some(result) = tests::probe_result(tests::Probe::PerfSelf) {
         return result;
@@ -841,6 +881,7 @@ fn can_open_maps(pid: u32) -> bool {
 /// target's maps stay readable: the 6.14+ carve-out verdict.
 /// Single-threaded CLI — fork is safe (no threads, no held locks).
 fn probe_perfmon_only(pid: u32) -> Option<bool> {
+    crate::lifecycle_producer::note_acquisition().ok()?;
     #[cfg(test)]
     if tests::record_probe(tests::Probe::PerfmonFork) {
         return Some(true);
@@ -2211,6 +2252,10 @@ fn run_admitted_doctor(
     exe_path: Option<String>,
     format: &str,
 ) -> ExitCode {
+    if let Err(e) = crate::lifecycle_producer::note_acquisition() {
+        crate::report::err_line(&e.to_string());
+        return ExitCode::from(1);
+    }
     let package_build = admitted.provenance();
     let env = gather_env();
     let mut checks = vec![

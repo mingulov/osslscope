@@ -22,6 +22,7 @@ pub mod doctor;
 pub mod evidence;
 pub mod inspect;
 pub mod kinds;
+pub mod lifecycle_producer;
 pub mod loader;
 pub mod package;
 pub mod pin;

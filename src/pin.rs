@@ -208,6 +208,7 @@ fn pin_with(
     links: Option<&crate::capture_setup::SetupLinks>,
     mut read_starttime: impl FnMut(u32) -> anyhow::Result<u64>,
 ) -> anyhow::Result<TargetPin> {
+    crate::lifecycle_producer::note_acquisition()?;
     let stage = crate::capture::BoundaryStage::Discovery;
     let starttime = read_starttime(pid).with_context(|| format!("target {pid} gone"))?;
     // SAFETY: successful pidfd_open returns a new owned descriptor.

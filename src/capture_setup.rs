@@ -1156,6 +1156,13 @@ where
     }
 
     fn admit_inner(control: SetupControl, fail_cleanup_start: bool) -> Result<Self, SetupFailure> {
+        crate::lifecycle_producer::note_acquisition()
+            .map_err(|e| infrastructure(&e.to_string()))?;
+        if let Some(producer) = crate::lifecycle_producer::registered() {
+            producer
+                .setup_admission()
+                .map_err(|e| infrastructure(&e.to_string()))?;
+        }
         control.check(BoundaryStage::Setup)?;
         if SETUP_ADMITTED
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)

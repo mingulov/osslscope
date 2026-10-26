@@ -11,6 +11,7 @@
 //! object. Fail-closed throughout: any shape drift (BTF sections,
 //! unknown relocs, dim mismatch, non-GPL license) is an error, and
 //! map-fd fixups assert `BPF_PSEUDO_MAP_FD` at the site.
+type BorrowedRows<K, V> = (Vec<(K, Vec<V>)>, bool);
 use std::collections::{HashMap, HashSet};
 use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd};
 
@@ -2110,6 +2111,8 @@ pub(crate) fn load_count_tracked(
 ) -> Result<CountLoadedSlots, CountLoadFailure> {
     use crate::count_owner::registry::{ResourceKind, preallocated};
     use crate::count_owner::{CountMap, CountOperation, FailureClass, OwnerFailure, ResourceId};
+    crate::lifecycle_producer::note_acquisition()
+        .map_err(|_| OwnerFailure::engine(CountOperation::Load, FailureClass::InvalidInput))?;
     validate_count_prepared(prep)?;
     let check_deadline = |driver: &_| {
         if crate::count_owner::io::CountIoDriver::now(driver) >= deadline {
@@ -2345,6 +2348,54 @@ pub(crate) fn load_controlled(
 ) -> anyhow::Result<Loaded> {
     load_with_custody(prep, Some((links, stage)))
 }
+#[cfg(test)]
+thread_local! {static HOST_NATIVE_MAP:std::cell::RefCell<Option<OwnedFd>>=const {std::cell::RefCell::new(None)};}
+fn create_native_map(m: &MapSpecLite) -> std::io::Result<OwnedFd> {
+    #[cfg(test)]
+    if let Some(fd) = HOST_NATIVE_MAP.with(|v| v.borrow_mut().take()) {
+        return Ok(fd);
+    }
+    ossl_bpf_sys::map_create(
+        m.map_type,
+        m.key_size,
+        m.value_size,
+        m.max_entries,
+        None,
+        &m.name,
+    )
+}
+#[cfg(test)]
+pub(crate) fn host_acquisition_history(blocked: bool) {
+    use std::os::fd::AsRawFd;
+    let sentinel = std::fs::File::open("/dev/null").unwrap();
+    let raw = sentinel.as_raw_fd();
+    HOST_NATIVE_MAP.with(|v| *v.borrow_mut() = Some(sentinel.into()));
+    let prep = Prepared {
+        progs: Vec::new(),
+        maps: vec![MapSpecLite {
+            name: "host-sentinel".into(),
+            map_type: 0,
+            key_size: 0,
+            value_size: 0,
+            max_entries: 0,
+            flags: 0,
+        }],
+    };
+    let result = load(&prep);
+    if blocked {
+        assert!(result.is_err());
+        assert!(
+            HOST_NATIVE_MAP.with(|v| v.borrow().is_some()),
+            "Starting must refuse before the actual create seam consumes an owned descriptor"
+        );
+        drop(HOST_NATIVE_MAP.with(|v| v.borrow_mut().take()));
+        return;
+    }
+    let loaded = result.unwrap();
+    assert_eq!(loaded.maps["host-sentinel"].as_raw_fd(), raw);
+    drop(loaded);
+    assert_eq!(unsafe { libc::fcntl(raw, libc::F_GETFD) }, -1);
+}
 fn load_with_custody(
     prep: &Prepared,
     setup: Option<(
@@ -2352,6 +2403,7 @@ fn load_with_custody(
         crate::capture::BoundaryStage,
     )>,
 ) -> anyhow::Result<Loaded> {
+    crate::lifecycle_producer::note_acquisition()?;
     use anyhow::Context as _;
     let loaded = Loaded {
         maps: HashMap::with_capacity(prep.maps.len()),
@@ -2369,15 +2421,7 @@ fn load_with_custody(
                 if let Some((links, stage)) = setup {
                     links.check_owned(stage)?;
                 }
-                let fd = ossl_bpf_sys::map_create(
-                    m.map_type,
-                    m.key_size,
-                    m.value_size,
-                    m.max_entries,
-                    None,
-                    &m.name,
-                )
-                .with_context(|| format!("map_create {}", m.name))?;
+                let fd = create_native_map(m).with_context(|| format!("map_create {}", m.name))?;
                 loaded.maps.insert(m.name.clone(), fd);
             }
             for p in &prep.progs {
@@ -2428,6 +2472,7 @@ pub struct FailedProg {
 /// all-rejected object must not fill the temp dir; every failure
 /// still carries its 2000-char summary in `error`).
 pub fn load_keep_good(prep: &Prepared) -> anyhow::Result<(Loaded, Vec<FailedProg>)> {
+    crate::lifecycle_producer::note_acquisition()?;
     use anyhow::Context as _;
     let mut maps = HashMap::new();
     for m in &prep.maps {
@@ -5485,7 +5530,7 @@ pub(crate) fn borrowed_rows_partial<K: aya::Pod, V: aya::Pod>(
     percpu: bool,
     setup: &crate::capture_setup::SetupLinks,
     stage: crate::capture::BoundaryStage,
-) -> anyhow::Result<(Vec<(K, Vec<V>)>, bool)> {
+) -> anyhow::Result<BorrowedRows<K, V>> {
     use anyhow::Context as _;
     let map = BorrowedMap::checked(maps.get(name).context("map missing")?.as_fd(), setup, stage)?;
     map.shape(
@@ -5524,7 +5569,7 @@ fn read_partial_rows<K: aya::Pod, V: aya::Pod>(
     cpus: usize,
     mut next: impl FnMut(Option<&[u8]>, &mut [u8]) -> std::io::Result<()>,
     mut lookup: impl FnMut(&[u8], &mut [u8]) -> std::io::Result<()>,
-) -> (Vec<(K, Vec<V>)>, bool) {
+) -> BorrowedRows<K, V> {
     let mut rows = Vec::new();
     let mut previous: Option<Vec<u8>> = None;
     let mut seen = HashSet::new();
@@ -5762,8 +5807,7 @@ impl OwnedEvents {
                     && info.max_entries == bytes,
                 "EVENTS shape mismatch"
             );
-            let result = Self::map_parts(fd, bytes, &mut transaction, fault, links, stage);
-            result
+            Self::map_parts(fd, bytes, &mut transaction, fault, links, stage)
         })();
         let (page, position, producer_cache) = links.retain_result(result, stage)?;
         let parts = transaction.into_inner();

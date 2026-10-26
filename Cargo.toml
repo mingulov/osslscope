@@ -44,3 +44,8 @@ members = ["crates/ossl-discover", "crates/manifest", "crates/ebpf-common", "cra
 # toolchain so the bpf-target no_std bin never enters a host build
 # (p11scope Task-3 precedent: workspace membership breaks cargo test).
 exclude = ["crates/ebpf", "spike"]
+
+[[test]]
+name = "lifecycle_producer_host"
+path = "tests/lifecycle_producer_host.rs"
+harness = false

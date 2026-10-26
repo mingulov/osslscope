@@ -577,15 +577,14 @@ pub(crate) fn read_file_bounded_controlled(
     stage: crate::capture::BoundaryStage,
     fatal: bool,
 ) -> std::io::Result<FileBytes> {
-    let file = std::fs::File::open(path).map_err(|error| {
+    let file = std::fs::File::open(path).inspect_err(|error| {
         if fatal {
             links.seal(crate::capture_setup::SetupFailure::io(
                 stage,
-                &error,
+                error,
                 "setup identity-bound file open failed",
             ));
         }
-        error
     })?;
     let mut file = crate::capture_setup::SetupResource::guarded(file, links, stage);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -854,6 +853,7 @@ pub fn attach_group(
     offsets: &[u64],
     cookies: &[u64],
 ) -> std::io::Result<OwnedFd> {
+    crate::lifecycle_producer::note_acquisition().map_err(std::io::Error::other)?;
     let cpath = CString::new(path)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in link path"))?;
     ossl_bpf_sys::link_create_uprobe_multi(prog_fd, &cpath, offsets, cookies, pid)

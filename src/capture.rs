@@ -59,7 +59,7 @@ use crate::scan::registry::TidSource as _;
 use crate::{args, kinds, pin, plan, target};
 use anyhow::Context as _;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
-use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+use std::os::fd::{AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -1788,6 +1788,73 @@ fn scan_ack(buf: &[u8], our_ack: u32) -> AckScan {
     }
 }
 
+/// The kernel-returned address authenticates origin; payload port IDs do not.
+#[derive(Debug, PartialEq, Eq)]
+pub enum KernelReceive {
+    Bytes(usize),
+    Rejected,
+}
+pub fn recv_kernel_datagram(fd: BorrowedFd<'_>, buf: &mut [u8]) -> std::io::Result<KernelReceive> {
+    let mut peer: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of_val(&peer) as libc::socklen_t;
+    let n = unsafe {
+        libc::recvfrom(
+            fd.as_raw_fd(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            libc::MSG_DONTWAIT | libc::MSG_TRUNC,
+            &mut peer as *mut _ as *mut libc::sockaddr,
+            &mut len,
+        )
+    };
+    if n < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(validate_kernel_peer(n as usize, buf.len(), &peer, len))
+}
+#[cfg(test)]
+fn recv_scripted_kernel_datagram(
+    fd: BorrowedFd<'_>,
+    buf: &mut [u8],
+) -> std::io::Result<KernelReceive> {
+    let n = unsafe {
+        libc::recv(
+            fd.as_raw_fd(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            libc::MSG_DONTWAIT | libc::MSG_TRUNC,
+        )
+    };
+    if n < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut peer: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+    peer.nl_family = libc::AF_NETLINK as u16;
+    Ok(validate_kernel_peer(
+        n as usize,
+        buf.len(),
+        &peer,
+        std::mem::size_of_val(&peer) as libc::socklen_t,
+    ))
+}
+fn validate_kernel_peer(
+    n: usize,
+    capacity: usize,
+    peer: &libc::sockaddr_nl,
+    len: libc::socklen_t,
+) -> KernelReceive {
+    if n == 0
+        || len as usize != std::mem::size_of_val(peer)
+        || peer.nl_family != libc::AF_NETLINK as u16
+        || peer.nl_pid != 0
+        || n > capacity
+    {
+        KernelReceive::Rejected
+    } else {
+        KernelReceive::Bytes(n)
+    }
+}
+
 /// Drops-table fold: `(new_baseline, fresh_drops, blind)`. An
 /// unreadable table is accounting blindness (loss, never assumed
 /// zero); a first read after subscribe-time blindness re-anchors
@@ -1813,7 +1880,21 @@ fn drops_delta(baseline: Option<u64>, cur: Option<u64>) -> (Option<u64>, u64, bo
 /// another lane (its intended lane stays unwitnessed and gaps
 /// honestly, while the arrival lane genuinely advanced past the
 /// burst — either way the per-lane proof is exact).
+#[derive(Clone, Copy)]
+struct Candidate {
+    pid: u32,
+    parent: u32,
+    cpu: u32,
+    timestamp: u64,
+    kind: crate::lifecycle_producer::WitnessKind,
+}
+const _: () = assert!(std::mem::size_of::<Candidate>() <= 32);
 struct SyncWatch {
+    producer_lane: Option<(u32, u32)>,
+    binding: Option<(u32, u64)>,
+    candidates: Vec<Candidate>,
+    overflow: bool,
+    witness: Option<crate::lifecycle_producer::WitnessKind>,
     sought: HashMap<u32, u32>,
     lanes: HashSet<u32>,
     seen: HashSet<u32>,
@@ -1822,12 +1903,52 @@ struct SyncWatch {
 impl SyncWatch {
     fn new(pids: &[(u32, u32)]) -> Self {
         Self {
+            producer_lane: None,
+            binding: None,
+            candidates: Vec::new(),
+            overflow: false,
+            witness: None,
             sought: pids.iter().copied().collect(),
             lanes: pids.iter().map(|(_, cpu)| *cpu).collect(),
             seen: HashSet::new(),
         }
     }
 
+    fn producer(cpu: u32, parent: u32) -> Self {
+        let mut w = Self::new(&[]);
+        w.producer_lane = Some((cpu, parent));
+        w.lanes.insert(cpu);
+        w
+    }
+    fn candidate(&mut self, c: Candidate) {
+        let Some((lane, parent)) = self.producer_lane else {
+            self.note(c.pid, c.cpu);
+            return;
+        };
+        if let Some((pid, birth)) = self.binding {
+            if c.cpu == lane
+                && c.pid == pid
+                && c.timestamp >= birth
+                && (matches!(c.kind, crate::lifecycle_producer::WitnessKind::Exit)
+                    || c.parent == parent)
+            {
+                self.seen.insert(lane);
+                self.witness = Some(c.kind);
+            }
+        } else if self.candidates.len() < 256 {
+            self.candidates.push(c)
+        } else {
+            self.overflow = true
+        }
+    }
+    fn bind(&mut self, pid: u32, birth: u64) {
+        self.binding = Some((pid, birth));
+        self.sought.insert(pid, self.producer_lane.unwrap().0);
+        let pending = std::mem::take(&mut self.candidates);
+        for c in pending {
+            self.candidate(c)
+        }
+    }
     fn note(&mut self, pid: u32, cpu: u32) {
         if self.sought.contains_key(&pid) && self.lanes.contains(&cpu) {
             self.seen.insert(cpu);
@@ -1838,10 +1959,12 @@ impl SyncWatch {
         self.lanes.iter().all(|c| self.seen.contains(c))
     }
 
+    #[cfg(test)]
     fn sought_count(&self) -> u32 {
         self.sought.len() as u32
     }
 
+    #[cfg(test)]
     fn seen_count(&self) -> u32 {
         self.seen.len() as u32
     }
@@ -1851,11 +1974,46 @@ impl SyncWatch {
 /// count is unreadable (the burst still runs; unwatermarked CPUs
 /// gap honestly — fail-closed).
 fn online_cpus() -> Vec<u32> {
-    let n = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
-    if n <= 0 {
-        return vec![0];
+    use std::io::Read;
+    let mut data = Vec::new();
+    let Ok(file) = std::fs::File::open("/sys/devices/system/cpu/online") else {
+        return Vec::new();
+    };
+    if file.take(4097).read_to_end(&mut data).is_err() || data.len() > 4096 {
+        return Vec::new();
     }
-    (0..n as u32).collect()
+    let Ok(text) = std::str::from_utf8(&data) else {
+        return Vec::new();
+    };
+    parse_online_cpus(text).unwrap_or_default()
+}
+fn parse_online_cpus(text: &str) -> Option<Vec<u32>> {
+    let text = text.strip_suffix('\n').unwrap_or(text);
+    if text.is_empty() || text.bytes().any(|b| b.is_ascii_whitespace()) {
+        return None;
+    }
+    let mut out = Vec::new();
+    for item in text.split(',') {
+        let (a, b) = item.split_once('-').unwrap_or((item, item));
+        let canonical = |v: &str| {
+            !v.is_empty()
+                && v.bytes().all(|b| b.is_ascii_digit())
+                && (v == "0" || !v.starts_with('0'))
+        };
+        if !canonical(a) || !canonical(b) {
+            return None;
+        }
+        let (a, b) = (a.parse::<u32>().ok()?, b.parse::<u32>().ok()?);
+        if a > b
+            || b >= 1024
+            || (item.contains('-') && a == b)
+            || out.last().is_some_and(|last| *last >= a)
+        {
+            return None;
+        }
+        out.extend(a..=b);
+    }
+    Some(out)
 }
 
 /// Close-time per-CPU watermark plan (R20-fix round 4, F2a): the
@@ -1906,6 +2064,11 @@ fn plan_close_cpus(subscribed: &[u32], current: &[u32]) -> CloseCpuPlan {
 /// is restored before returning (every iteration and at the end).
 /// Children must stay unreaped until their messages are awaited
 /// (see [`SyncWatch`); reap with `reap_sync_children` after).
+#[cfg(test)]
+static WATERMARK_TEST_HOLD: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
 fn watermark_burst(
     cpus: &[u32],
     _permit: &crate::count_owner::CountForkPermit<'_>,
@@ -1945,6 +2108,12 @@ fn watermark_burst(
         if pid < 0 {
             shortfall = true;
         } else if pid == 0 {
+            #[cfg(test)]
+            if WATERMARK_TEST_HOLD.load(std::sync::atomic::Ordering::Relaxed) {
+                unsafe {
+                    libc::usleep(200_000);
+                }
+            }
             unsafe { libc::_exit(0) };
         } else {
             out.push((pid as u32, cpu));
@@ -1984,13 +2153,16 @@ pub(crate) fn original_group_test_watermark(
 /// (normal reaps land on the first pass); a helper stopped before
 /// `_exit` exhausts it and escalates to SIGKILL below instead of
 /// blocking subscription or close indefinitely.
+#[cfg(test)]
 const SYNC_REAP_GRACE: Duration = Duration::from_secs(2);
 /// Post-SIGKILL reap window: a SIGKILLed helper is already dead —
 /// this only bounds the zombie's collection (essentially instant;
 /// the bound is belt-and-braces against pid-namespace pathologies).
+#[cfg(test)]
 const SYNC_KILL_REAP_GRACE: Duration = Duration::from_secs(1);
 /// Reap-poll nap between WNOHANG sweeps (bounded loops only —
 /// every path below terminates at its deadline).
+#[cfg(test)]
 const SYNC_REAP_NAP: Duration = Duration::from_millis(5);
 
 /// Reap watermark children — the bounded cleanup owner (after
@@ -2004,12 +2176,14 @@ const SYNC_REAP_NAP: Duration = Duration::from_millis(5);
 /// (a stuck zombie is transient hygiene until process exit, never
 /// an observation gap — and never an unbounded block). Worst-case
 /// added latency per burst: grace + kill window (normal: instant).
+#[cfg(test)]
 fn reap_sync_children(pids: &[(u32, u32)]) {
     reap_sync_children_grace(pids, SYNC_REAP_GRACE, SYNC_KILL_REAP_GRACE)
 }
 
 /// Bounded reap with explicit windows (the production path above
 /// delegates; tests drive short windows directly).
+#[cfg(test)]
 fn reap_sync_children_grace(pids: &[(u32, u32)], grace: Duration, kill_grace: Duration) {
     let mut pending: Vec<u32> = pids.iter().map(|(pid, _)| *pid).collect();
     reap_sweep(&mut pending, Instant::now() + grace);
@@ -2036,6 +2210,7 @@ fn reap_sync_children_grace(pids: &[(u32, u32)], grace: Duration, kill_grace: Du
 /// WNOHANG reap sweeps until `pending` empties or `deadline`
 /// passes. EINTR retries; ECHILD counts as reaped; other errors
 /// drop the pid loud (unreapable is hygiene, never a block).
+#[cfg(test)]
 fn reap_sweep(pending: &mut Vec<u32>, deadline: Instant) {
     while !pending.is_empty() && Instant::now() < deadline {
         pending.retain(|pid| {
@@ -2076,6 +2251,13 @@ fn reap_sweep(pending: &mut Vec<u32>, deadline: Instant) {
 /// non-target) and every close carries a terminal per-CPU
 /// watermark — prefix/suffix gaps are explicit, never silent.
 pub struct KernelLifecycle {
+    #[cfg(test)]
+    scripted_kernel_peer: bool,
+    #[cfg(test)]
+    host_online: Option<Vec<u32>>,
+    producer: Option<crate::lifecycle_producer::ProducerHandle>,
+    _subscription: Option<crate::lifecycle_producer::ProducerSubscription>,
+    close_deadline: Option<Instant>,
     fd: crate::capture_setup::SetupResource<OwnedFd>,
     sock_inode: u64,
     target_pid: u32,
@@ -2142,13 +2324,31 @@ impl KernelLifecycle {
         activity_started: bool,
         prefix: &crate::count_owner::CountForkPermit<'_>,
     ) -> anyhow::Result<Self> {
-        Self::subscribe_with_setup(target, activity_started, prefix, None)
+        let producer = crate::lifecycle_producer::installed()?;
+        Self::subscribe_with_producer(target, activity_started, prefix, &producer)
+    }
+    pub fn subscribe_with_producer(
+        target: u32,
+        activity_started: bool,
+        prefix: &crate::count_owner::CountForkPermit<'_>,
+        producer: &crate::lifecycle_producer::ProducerHandle,
+    ) -> anyhow::Result<Self> {
+        Self::subscribe_with_setup(
+            target,
+            activity_started,
+            prefix,
+            None,
+            producer,
+            Instant::now() + SUBSCRIBE_ACK_TIMEOUT,
+        )
     }
     fn subscribe_with_setup(
         target: u32,
         activity_started: bool,
         prefix: &crate::count_owner::CountForkPermit<'_>,
         setup: Option<&crate::capture_setup::SetupLinks>,
+        producer: &crate::lifecycle_producer::ProducerHandle,
+        deadline: Instant,
     ) -> anyhow::Result<Self> {
         let check = || -> anyhow::Result<()> {
             if let Some(setup) = setup {
@@ -2156,10 +2356,13 @@ impl KernelLifecycle {
             }
             Ok(())
         };
+        let deadline = deadline.min(Instant::now() + SYNC_WATERMARK_TIMEOUT);
+        let subscription = producer.subscribe()?;
         check()?;
         let tgid = tgid_of(target)
             .ok_or_else(|| anyhow::anyhow!("target {target} has no readable Tgid"))?;
         check()?;
+        let domain_audit = producer.domain_audit(deadline)?;
         let raw = unsafe {
             libc::socket(
                 libc::AF_NETLINK,
@@ -2171,6 +2374,7 @@ impl KernelLifecycle {
             anyhow::bail!("connector socket: {}", std::io::Error::last_os_error());
         }
         let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        drop(domain_audit);
         let fd = match setup {
             Some(setup) => {
                 crate::capture_setup::SetupResource::guarded(fd, setup, BoundaryStage::Setup)
@@ -2236,7 +2440,13 @@ impl KernelLifecycle {
         // Any wait failure cleans up best-effort (the LISTEN may
         // have registered before its ack was lost — balance it)
         // before bailing to loud fallback.
-        let (stash, wait_enobufs) = match Self::await_acceptance(&fd, mcast_ack.wrapping_add(1)) {
+        let (stash, wait_enobufs, origin_loss) = match Self::await_acceptance_with_check(
+            &fd,
+            mcast_ack.wrapping_add(1),
+            deadline.saturating_duration_since(Instant::now()),
+            |buf| recv_kernel_datagram(unsafe { BorrowedFd::borrow_raw(fd.as_raw_fd()) }, buf),
+            &check,
+        ) {
             Ok(prefix) => prefix,
             Err(e) => {
                 let _ = send_connector(&fd, &mcast_msg(PROC_CN_MCAST_IGNORE, mcast_ack));
@@ -2246,6 +2456,13 @@ impl KernelLifecycle {
         let mut known = HashSet::new();
         known.insert(tgid);
         let mut this = Self {
+            #[cfg(test)]
+            scripted_kernel_peer: false,
+            #[cfg(test)]
+            host_online: None,
+            producer: Some(producer.clone()),
+            _subscription: Some(subscription),
+            close_deadline: None,
             fd,
             sock_inode,
             target_pid: target,
@@ -2278,28 +2495,21 @@ impl KernelLifecycle {
         let cpus = online_cpus();
         this.watermark_cpus = cpus.clone();
         check()?;
-        let (sync_pids, shortfall) = watermark_burst(&cpus, prefix);
-        let mut watch = SyncWatch::new(&sync_pids);
-        this.drain_await_sync(
+        let _ = prefix; // Kept for source compatibility; construction proves private-table origin.
+        delta0.loss = delta0.loss.saturating_add(origin_loss);
+        let seen = this.producer_burst(
+            &cpus,
+            crate::lifecycle_producer::BurstPhase::Initial,
+            deadline,
             &mut delta0,
-            &mut watch,
-            Instant::now() + SYNC_WATERMARK_TIMEOUT,
+            setup,
         );
-        reap_sync_children(&sync_pids);
-        this.last_watermark = Some((watch.sought_count(), watch.seen_count()));
-        this.subscribe_shortfall = shortfall;
+        let shortfall = seen != cpus.len() as u32 || cpus.is_empty();
         if shortfall {
-            // Diagnostic, fail-closed: the burst could not cover
-            // every CPU (affinity/fork) — unwatermarked CPUs gap
-            // honestly on first sighting and at the terminal.
-            delta0.loss += 1;
+            delta0.loss = delta0.loss.saturating_add(1)
         }
-        if this.dead {
-            // A socket dead at birth proves nothing — loud
-            // fallback, like any other subscribe failure.
-            let _ = send_connector(&this.fd, &mcast_msg(PROC_CN_MCAST_IGNORE, mcast_ack));
-            anyhow::bail!("connector died during subscribe drain");
-        }
+        this.last_watermark = Some((cpus.len() as u32, seen));
+        this.subscribe_shortfall = shortfall;
         this.pending_delta = delta0;
         Ok(this)
     }
@@ -2314,25 +2524,45 @@ impl KernelLifecycle {
     /// the ack itself stays stashed so per-CPU continuity observes
     /// the unbroken stream). A storm past the stash caps bails (an
     /// unwitnessable prefix must not become a clean baseline).
-    fn await_acceptance(fd: &OwnedFd, our_ack: u32) -> anyhow::Result<(VecDeque<Vec<u8>>, bool)> {
-        Self::await_acceptance_timeout(fd, our_ack, SUBSCRIBE_ACK_TIMEOUT)
-    }
-
     /// Bounded acceptance wait with an explicit timeout (the
     /// timeout is a parameter so the wait path itself — poll loop
     /// plus timeout accounting, not just ack parsing — carries a
     /// true timeout control).
+    #[cfg(test)]
     fn await_acceptance_timeout(
         fd: &OwnedFd,
         our_ack: u32,
         timeout: Duration,
-    ) -> anyhow::Result<(VecDeque<Vec<u8>>, bool)> {
+    ) -> anyhow::Result<(VecDeque<Vec<u8>>, bool, u64)> {
+        Self::await_acceptance_with(fd, our_ack, timeout, |buf| {
+            recv_kernel_datagram(unsafe { BorrowedFd::borrow_raw(fd.as_raw_fd()) }, buf)
+        })
+    }
+    #[cfg(test)]
+    fn await_acceptance_with(
+        fd: &OwnedFd,
+        our_ack: u32,
+        timeout: Duration,
+        receive: impl FnMut(&mut [u8]) -> std::io::Result<KernelReceive>,
+    ) -> anyhow::Result<(VecDeque<Vec<u8>>, bool, u64)> {
+        Self::await_acceptance_with_check(fd, our_ack, timeout, receive, || Ok(()))
+    }
+    fn await_acceptance_with_check(
+        fd: &OwnedFd,
+        our_ack: u32,
+        timeout: Duration,
+        mut receive: impl FnMut(&mut [u8]) -> std::io::Result<KernelReceive>,
+        mut check: impl FnMut() -> anyhow::Result<()>,
+    ) -> anyhow::Result<(VecDeque<Vec<u8>>, bool, u64)> {
         let mut stash: VecDeque<Vec<u8>> = VecDeque::new();
         let mut stashed_bytes = 0usize;
         let mut wait_enobufs = false;
+        let mut origin_loss = 0u64;
+        let mut records = 0;
         let mut buf = vec![0u8; 65536];
         let t0 = Instant::now();
         'wait: loop {
+            check()?;
             if t0.elapsed() > timeout {
                 anyhow::bail!(
                     "connector subscribe not acknowledged within {timeout:?} \
@@ -2344,7 +2574,7 @@ impl KernelLifecycle {
                 events: libc::POLLIN,
                 revents: 0,
             };
-            let pr = unsafe { libc::poll(&mut pfd, 1, 50) };
+            let pr = unsafe { libc::poll(&mut pfd, 1, 1) };
             if pr < 0 {
                 let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
                 if e == libc::EINTR {
@@ -2356,29 +2586,35 @@ impl KernelLifecycle {
                 continue;
             }
             loop {
-                let r = unsafe {
-                    libc::recv(
-                        fd.as_raw_fd(),
-                        buf.as_mut_ptr() as *mut libc::c_void,
-                        buf.len(),
-                        libc::MSG_DONTWAIT,
-                    )
-                };
-                if r < 0 {
-                    let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-                    if e == libc::EAGAIN || e == libc::EWOULDBLOCK {
-                        break;
+                check()?;
+                if t0.elapsed() >= timeout || records >= 256 {
+                    anyhow::bail!("connector acceptance budget exhausted")
+                }
+                let received = receive(&mut buf);
+                let n = match received {
+                    Ok(KernelReceive::Bytes(n)) => n,
+                    Ok(KernelReceive::Rejected) => {
+                        records += 1;
+                        origin_loss = origin_loss.saturating_add(1);
+                        continue;
                     }
-                    if e == libc::ENOBUFS {
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(e) if e.raw_os_error() == Some(libc::ENOBUFS) => {
+                        records += 1;
                         wait_enobufs = true;
                         continue;
                     }
-                    anyhow::bail!("connector accept recv: {}", std::io::Error::last_os_error());
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e.into()),
+                };
+                records += 1;
+                stashed_bytes += n;
+                if stash.len() + 1 > SUBSCRIBE_STASH_MAX_MSGS
+                    || stashed_bytes > SUBSCRIBE_STASH_MAX_BYTES
+                {
+                    anyhow::bail!("connector subscribe storm during acceptance wait")
                 }
-                if r == 0 {
-                    break;
-                }
-                let bytes = buf[..r as usize].to_vec();
+                let bytes = buf[..n].to_vec();
                 match scan_ack(&bytes, our_ack) {
                     AckScan::Ours(0) => {
                         stash.push_back(bytes);
@@ -2391,7 +2627,6 @@ impl KernelLifecycle {
                         anyhow::bail!("connector subscribe transport error ({e})");
                     }
                     AckScan::Absent => {
-                        stashed_bytes += bytes.len();
                         stash.push_back(bytes);
                         if stash.len() > SUBSCRIBE_STASH_MAX_MSGS
                             || stashed_bytes > SUBSCRIBE_STASH_MAX_BYTES
@@ -2402,7 +2637,7 @@ impl KernelLifecycle {
                 }
             }
         }
-        Ok((stash, wait_enobufs))
+        Ok((stash, wait_enobufs, origin_loss))
     }
 
     /// Unsubscribe (IGNORE): balances the LISTEN registration count
@@ -2442,6 +2677,10 @@ impl KernelLifecycle {
     /// online set — never a fresh set from the current count
     /// alone (an offlined CPU would silently lose its lane).
     fn close_cpu_plan(&self) -> CloseCpuPlan {
+        #[cfg(test)]
+        if let Some(cpus) = &self.host_online {
+            return plan_close_cpus(&self.watermark_cpus, cpus);
+        }
         plan_close_cpus(&self.watermark_cpus, &online_cpus())
     }
 
@@ -2509,7 +2748,13 @@ impl KernelLifecycle {
                     return;
                 };
                 if let Some(w) = sync {
-                    w.note(child_pid, cpu);
+                    w.candidate(Candidate {
+                        pid: child_pid,
+                        parent: parent_tgid,
+                        cpu,
+                        timestamp: timestamp_ns,
+                        kind: crate::lifecycle_producer::WitnessKind::Fork,
+                    });
                 }
                 if parent_tgid == self.target_tgid || self.known.contains(&parent_tgid) {
                     if child_tgid == parent_tgid {
@@ -2554,7 +2799,13 @@ impl KernelLifecycle {
                     return;
                 }
                 if let (Some(pid), Some(w)) = (le_u32_at(ev, PROC_EVENT_HDRLEN), sync) {
-                    w.note(pid, cpu);
+                    w.candidate(Candidate {
+                        pid,
+                        parent: 0,
+                        cpu,
+                        timestamp: timestamp_ns,
+                        kind: crate::lifecycle_producer::WitnessKind::Exit,
+                    });
                 }
             }
             _ => {}
@@ -2626,6 +2877,16 @@ impl KernelLifecycle {
         max_records: usize,
         sync: Option<&mut SyncWatch>,
     ) {
+        self.drain_into_until(delta, max_records, sync, None, None)
+    }
+    fn drain_into_until(
+        &mut self,
+        delta: &mut LifecycleDelta,
+        max_records: usize,
+        sync: Option<&mut SyncWatch>,
+        deadline: Option<Instant>,
+        setup: Option<&crate::capture_setup::SetupLinks>,
+    ) {
         if self.dead {
             delta.loss += 1;
             return;
@@ -2637,37 +2898,61 @@ impl KernelLifecycle {
         let mut records = 0usize;
         let mut buf = vec![0u8; 65536];
         let mut enobufs = false;
+        let mut budget_exhausted = false;
         loop {
+            if deadline.is_some_and(|d| Instant::now() >= d)
+                || setup.is_some_and(|s| s.check_owned(BoundaryStage::Setup).is_err())
+            {
+                budget_exhausted = true;
+                break;
+            }
             if records >= max_records {
                 break;
             }
-            let r = unsafe {
-                libc::recv(
-                    self.fd.as_raw_fd(),
-                    buf.as_mut_ptr() as *mut libc::c_void,
-                    buf.len(),
-                    libc::MSG_DONTWAIT,
-                )
-            };
-            if r < 0 {
-                let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-                if e == libc::EAGAIN || e == libc::EWOULDBLOCK {
-                    break;
+            let received = {
+                #[cfg(test)]
+                {
+                    if self.scripted_kernel_peer {
+                        recv_scripted_kernel_datagram(
+                            unsafe { BorrowedFd::borrow_raw(self.fd.as_raw_fd()) },
+                            &mut buf,
+                        )
+                    } else {
+                        recv_kernel_datagram(
+                            unsafe { BorrowedFd::borrow_raw(self.fd.as_raw_fd()) },
+                            &mut buf,
+                        )
+                    }
                 }
-                if e == libc::ENOBUFS {
-                    // In-band overrun tripwire: the Drops delta
-                    // below counts it; keep draining.
-                    enobufs = true;
+                #[cfg(not(test))]
+                {
+                    recv_kernel_datagram(
+                        unsafe { BorrowedFd::borrow_raw(self.fd.as_raw_fd()) },
+                        &mut buf,
+                    )
+                }
+            };
+            let n = match received {
+                Ok(KernelReceive::Bytes(n)) => n,
+                Ok(KernelReceive::Rejected) => {
+                    records += 1;
+                    delta.loss = delta.loss.saturating_add(1);
                     continue;
                 }
-                self.dead = true;
-                delta.loss += 1;
-                break;
-            }
-            if r == 0 {
-                break;
-            }
-            self.ingest_datagram(&buf[..r as usize], delta, sync.as_deref_mut());
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) if e.raw_os_error() == Some(libc::ENOBUFS) => {
+                    enobufs = true;
+                    records += 1;
+                    continue;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => break,
+                Err(_) => {
+                    self.dead = true;
+                    delta.loss = delta.loss.saturating_add(1);
+                    break;
+                }
+            };
+            self.ingest_datagram(&buf[..n], delta, sync.as_deref_mut());
             records += 1;
         }
         let (baseline, fresh, blind) =
@@ -2683,7 +2968,7 @@ impl KernelLifecycle {
             // or a wait-period overrun): at-least-one.
             delta.dropped = delta.dropped.saturating_add(1);
         }
-        if records >= max_records && socket_has_pending(&self.fd) {
+        if (records >= max_records || budget_exhausted) && socket_has_pending(&self.fd) {
             delta.pending = 1;
         }
     }
@@ -2712,44 +2997,104 @@ impl KernelLifecycle {
     /// unwitnessed watermark — explicit loss (fail-closed), never
     /// an assumed baseline or suffix. A dead socket breaks early
     /// (its loss already recorded; close reports no-witness).
-    fn drain_await_sync(
+    fn producer_burst(
         &mut self,
-        delta: &mut LifecycleDelta,
-        watch: &mut SyncWatch,
+        cpus: &[u32],
+        phase: crate::lifecycle_producer::BurstPhase,
         deadline: Instant,
-    ) {
-        loop {
-            if self.dead || watch.complete() {
+        delta: &mut LifecycleDelta,
+        setup: Option<&crate::capture_setup::SetupLinks>,
+    ) -> u32 {
+        use crate::lifecycle_producer::{AbortReason, ProducerReply};
+        let Some(producer) = self.producer.clone() else {
+            return 0;
+        };
+        let Some(floor) = LiveClock.checked_monotonic_ns() else {
+            delta.loss += 1;
+            return 0;
+        };
+        let Ok(mut lease) = producer.begin(phase, deadline, floor) else {
+            delta.loss += 1;
+            return 0;
+        };
+        let mut seen = 0;
+        for &cpu in cpus {
+            if self.dead
+                || Instant::now() >= deadline
+                || setup.is_some_and(|s| s.check_owned(BoundaryStage::Setup).is_err())
+            {
                 break;
             }
-            self.drain_into(delta, MAX_LIFECYCLE_DRAIN, Some(&mut *watch));
-            if watch.complete() || Instant::now() >= deadline {
+            let mut watch = SyncWatch::producer(cpu, producer.launcher_pid());
+            if lease.spawn(cpu).is_err() {
+                delta.loss += 1;
                 break;
             }
-            let mut pfd = libc::pollfd {
-                fd: self.fd.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            let pr = unsafe { libc::poll(&mut pfd, 1, 50) };
-            if pr < 0 {
-                let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-                if e == libc::EINTR {
-                    continue;
+            let mut pid = None;
+            let mut observed = false;
+            let mut reaped = false;
+            while Instant::now() < deadline && !self.dead && !watch.overflow {
+                if setup.is_some_and(|s| s.check_owned(BoundaryStage::Setup).is_err()) {
+                    break;
                 }
-                self.dead = true;
+                self.drain_into_until(
+                    delta,
+                    MAX_LIFECYCLE_DRAIN,
+                    Some(&mut watch),
+                    Some(deadline),
+                    setup,
+                );
+                match lease.poll() {
+                    Ok(Some(ProducerReply::Child {
+                        pid: child,
+                        cpu: lane,
+                        birth_floor_ns,
+                    })) if lane == cpu => {
+                        pid = Some(child);
+                        watch.bind(child, birth_floor_ns)
+                    }
+                    Ok(Some(ProducerReply::Reaped { pid: child, status })) => {
+                        reaped = pid == Some(child) && status == 0;
+                        break;
+                    }
+                    Ok(Some(ProducerReply::Failed(error))) => {
+                        eprintln!("{error}");
+                        break;
+                    }
+                    Ok(None) => {}
+                    _ => break,
+                }
+                if !observed && watch.complete() && !watch.overflow {
+                    if lease.observed(cpu, watch.witness.unwrap()).is_err() {
+                        break;
+                    }
+                    observed = true;
+                }
+                let mut fds = [
+                    libc::pollfd {
+                        fd: self.fd.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                    libc::pollfd {
+                        fd: producer.child_close_set().map(|s| s.0[0]).unwrap_or(-1),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                ];
+                unsafe {
+                    libc::poll(fds.as_mut_ptr(), 2, 1);
+                }
+            }
+            if observed && reaped && !watch.overflow {
+                seen += 1
+            } else {
+                let _ = lease.abort(AbortReason::Abandoned);
                 delta.loss += 1;
                 break;
             }
         }
-        if !watch.complete() && !self.dead {
-            delta.loss += 1;
-            eprintln!(
-                "lifecycle: sync watermark incomplete ({}/{} CPUs witnessed)",
-                watch.seen_count(),
-                watch.sought_count(),
-            );
-        }
+        seen
     }
 }
 
@@ -2760,6 +3105,10 @@ impl Drop for KernelLifecycle {
     /// send is loud on stderr, never a panic.
     fn drop(&mut self) {
         self.fd.before_dispose();
+        #[cfg(test)]
+        if self.scripted_kernel_peer {
+            return;
+        }
         if let Err(e) = self.unsubscribe() {
             eprintln!("lifecycle: connector unsubscribe failed ({e:#})");
         }
@@ -2788,44 +3137,27 @@ impl LifecyclePort for KernelLifecycle {
         edge: LifecycleEdge,
         permit: Option<&crate::count_owner::CountForkPermit<'_>>,
     ) -> LifecycleClose {
-        let Some(permit) = permit.filter(|_| !self.dead) else {
-            // Missing evidence: the controller records no-witness
-            // loss (a dead stream proves nothing about the tail).
+        let _ = permit; // Observer fork permission is deliberately irrelevant to private-table helpers.
+        if self.dead || self.producer.is_none() {
             return self.drain_prefix_without_fork(edge);
-        };
-        // The subscribe drain rides first when no poll ever ran
-        // (a window that closed before its first round still
-        // reports its initial watermark outcome).
+        }
+        let deadline = *self
+            .close_deadline
+            .get_or_insert_with(|| Instant::now() + SYNC_WATERMARK_TIMEOUT);
         let mut delta = std::mem::take(&mut self.pending_delta);
-        // Terminal per-CPU watermark (R20-fix round 3, F2):
-        // successors on every online CPU prove the suffix — any
-        // pre-close loss surfaces as an interior hole when its
-        // successor ingests, and a lost final message without a
-        // successor is impossible once every lane advanced past
-        // the close. An incomplete watermark gaps explicit. The
-        // required lane set is preserved across the window (round
-        // 4, F2a): required-but-offlined lanes gap explicitly as
-        // topology changes that prevent closure — never vanish.
         let plan = self.close_cpu_plan();
-        if !plan.offlined.is_empty() {
-            eprintln!(
-                "lifecycle: watermark lane(s) offlined mid-window, gap explicit: {:?}",
-                plan.offlined
-            );
-            delta.loss += 1;
-        }
-        let (sync_pids, shortfall) = watermark_burst(&plan.burst, permit);
-        let mut watch = SyncWatch::new(&sync_pids);
-        self.drain_await_sync(
+        let seen = self.producer_burst(
+            &plan.burst,
+            crate::lifecycle_producer::BurstPhase::Terminal,
+            deadline,
             &mut delta,
-            &mut watch,
-            Instant::now() + SYNC_WATERMARK_TIMEOUT,
+            None,
         );
-        reap_sync_children(&sync_pids);
-        self.last_watermark = Some((watch.sought_count(), watch.seen_count()));
-        if shortfall {
-            delta.loss += 1;
+        let shortfall = plan.required.is_empty() || seen != plan.required.len() as u32;
+        if shortfall || !plan.offlined.is_empty() {
+            delta.loss += 1
         }
+        self.last_watermark = Some((plan.required.len() as u32, seen));
         for _ in 0..CLOSE_DRAIN_ROUNDS {
             if self.dead {
                 // Drained prefix survives (events preserved, loss
@@ -2833,17 +3165,14 @@ impl LifecyclePort for KernelLifecycle {
                 break;
             }
             delta.pending = 0;
-            self.drain_into(&mut delta, MAX_LIFECYCLE_DRAIN, None);
+            self.drain_into_until(&mut delta, MAX_LIFECYCLE_DRAIN, None, Some(deadline), None);
             if delta.pending == 0 {
                 break;
             }
         }
         LifecycleClose {
             delta: Some(delta),
-            suffix_witness: watch.complete()
-                && !shortfall
-                && !self.dead
-                && plan.offlined.is_empty(),
+            suffix_witness: !shortfall && !self.dead && plan.offlined.is_empty(),
         }
     }
 }
@@ -2853,7 +3182,7 @@ impl LifecyclePort for KernelLifecycle {
 /// otherwise (never silent — the fallback announces on stderr and
 /// the polling-fallback loss withholds COMPLETE downstream).
 pub enum LiveLifecycle {
-    Kernel(KernelLifecycle),
+    Kernel(Box<KernelLifecycle>),
     Polling(PollingLifecycle),
 }
 
@@ -2878,11 +3207,26 @@ pub struct ConnectorFacility {
 /// Probe the connector facility once (balanced: the probe
 /// subscription unsubscribes on drop).
 pub fn connector_facility() -> ConnectorFacility {
+    match crate::lifecycle_producer::installed() {
+        Ok(producer) => connector_facility_with_producer(&producer),
+        Err(e) => {
+            eprintln!("{e}; connector facility unavailable before explicit installation");
+            ConnectorFacility {
+                subscribes: false,
+                drops_readable: false,
+                watermark_clean: false,
+            }
+        }
+    }
+}
+pub fn connector_facility_with_producer(
+    producer: &crate::lifecycle_producer::ProducerHandle,
+) -> ConnectorFacility {
     let barrier = crate::count_owner::CountForkBarrier::new();
     let prefix = barrier
         .prefix_permit(Instant::now())
         .expect("unused probe barrier");
-    match KernelLifecycle::subscribe(std::process::id(), true, &prefix) {
+    match KernelLifecycle::subscribe_with_producer(std::process::id(), true, &prefix, producer) {
         Ok(lc) => {
             let drops_readable = socket_drops(lc.sock_inode).is_some();
             let online = online_cpus().len() as u32;
@@ -2908,12 +3252,20 @@ impl LiveLifecycle {
         prefix: &crate::count_owner::CountForkPermit<'_>,
         control: &crate::capture_setup::SetupControl,
         links: &crate::capture_setup::SetupLinks,
+        producer: &crate::lifecycle_producer::ProducerHandle,
     ) -> Result<Self, crate::capture_setup::SetupFailure> {
         links.check(control, BoundaryStage::Setup)?;
-        let selected = KernelLifecycle::subscribe_with_setup(target, false, prefix, Some(links));
+        let selected = KernelLifecycle::subscribe_with_setup(
+            target,
+            false,
+            prefix,
+            Some(links),
+            producer,
+            control.deadline(),
+        );
         links.check(control, BoundaryStage::Setup)?;
         Ok(match selected {
-            Ok(kernel) => Self::Kernel(kernel),
+            Ok(kernel) => Self::Kernel(Box::new(kernel)),
             Err(error) => {
                 eprintln!(
                     "lifecycle: kernel signals unavailable ({error:#}); explicit polling fallback (PARTIAL)"
@@ -2923,6 +3275,44 @@ impl LiveLifecycle {
         })
     }
 
+    pub fn select_with_producer(
+        target: u32,
+        activity_started: bool,
+        prefix: &crate::count_owner::CountForkPermit<'_>,
+        producer: &crate::lifecycle_producer::ProducerHandle,
+    ) -> Self {
+        Self::select_before(
+            target,
+            activity_started,
+            prefix,
+            producer,
+            Instant::now() + SUBSCRIBE_ACK_TIMEOUT,
+        )
+    }
+    fn select_before(
+        target: u32,
+        activity_started: bool,
+        prefix: &crate::count_owner::CountForkPermit<'_>,
+        producer: &crate::lifecycle_producer::ProducerHandle,
+        deadline: Instant,
+    ) -> Self {
+        match KernelLifecycle::subscribe_with_setup(
+            target,
+            activity_started,
+            prefix,
+            None,
+            producer,
+            deadline,
+        ) {
+            Ok(k) => Self::Kernel(Box::new(k)),
+            Err(e) => {
+                eprintln!(
+                    "lifecycle: kernel signals unavailable ({e}); explicit polling fallback (PARTIAL)"
+                );
+                Self::Polling(PollingLifecycle::new(target))
+            }
+        }
+    }
     /// `activity_started` threads through to
     /// [`KernelLifecycle::subscribe`]: `false` for owned children
     /// stopped pre-activity, `true` for live targets.
@@ -2932,7 +3322,7 @@ impl LiveLifecycle {
         prefix: &crate::count_owner::CountForkPermit<'_>,
     ) -> Self {
         match KernelLifecycle::subscribe(target, activity_started, prefix) {
-            Ok(kernel) => LiveLifecycle::Kernel(kernel),
+            Ok(kernel) => LiveLifecycle::Kernel(Box::new(kernel)),
             Err(e) => {
                 eprintln!(
                     "lifecycle: kernel signals unavailable ({e:#}); explicit polling fallback (PARTIAL)"
@@ -6822,6 +7212,10 @@ where
 
 // Shared actual Open algorithm. Errors return the same ports and accumulators;
 // the controlled caller never enters a synchronous target-cleanup constructor.
+type RunnerOpenResult<D, B, L> = (
+    RunnerState<D, B, L>,
+    Result<bool, (PreObservationCause, BoundaryFailure)>,
+);
 fn open_runner_state<D, B: CountBackend, L: LifecyclePort, C: ClockPort>(
     cfg: &Config,
     info: &TargetInfo,
@@ -6830,10 +7224,7 @@ fn open_runner_state<D, B: CountBackend, L: LifecyclePort, C: ClockPort>(
     lifecycle: L,
     clock: &C,
     control: Option<crate::capture_setup::SetupControl>,
-) -> (
-    RunnerState<D, B, L>,
-    Result<bool, (PreObservationCause, BoundaryFailure)>,
-) {
+) -> RunnerOpenResult<D, B, L> {
     let mut start_ns = 0;
     let mut kernel_deadline_ns = 0;
     let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -7042,6 +7433,8 @@ impl TargetPort for PreparationTarget {
     }
 }
 
+type OwnedPreparationResult<D, B, L> =
+    Result<PreparedOwnedWindow<D, B, L>, Box<OwnedPreparationFailure<D, B, L>>>;
 #[allow(
     clippy::too_many_arguments,
     reason = "one target-free preparation boundary"
@@ -7055,7 +7448,7 @@ pub(crate) fn prepare_owned_window<D, B, L, C, P>(
     control: &crate::capture_setup::SetupControl,
     clock: &C,
     proc: &mut P,
-) -> Result<PreparedOwnedWindow<D, B, L>, OwnedPreparationFailure<D, B, L>>
+) -> OwnedPreparationResult<D, B, L>
 where
     D: DiscoveryPort,
     B: CountBackend,
@@ -7115,11 +7508,11 @@ where
     let state = runner.state;
     let window = PreparedOwnedWindow { cfg, info, state };
     match failure {
-        Some((cause, failure)) => Err(OwnedPreparationFailure {
+        Some((cause, failure)) => Err(Box::new(OwnedPreparationFailure {
             window,
             cause,
             failure,
-        }),
+        })),
         None => Ok(window),
     }
 }
@@ -7134,19 +7527,17 @@ pub(crate) fn commit_owned_release<D, B: CountBackend, L>(
 ) -> Result<ReleaseCommit, crate::capture_setup::SetupFailure> {
     use crate::capture_setup::SetupFailure;
     control.check(BoundaryStage::Release)?;
-    match target
+    if target
         .poll_exit()
         .map_err(|e| SetupFailure::from_error(BoundaryStage::Custody, e))?
+        .is_some()
     {
-        Some(_) => {
-            return Err(SetupFailure::Boundary(BoundaryFailure::new(
-                BoundaryStage::Custody,
-                BoundaryFailureClass::Infrastructure,
-                None,
-                "owned target exited before release",
-            )));
-        }
-        None => {}
+        return Err(SetupFailure::Boundary(BoundaryFailure::new(
+            BoundaryStage::Custody,
+            BoundaryFailureClass::Infrastructure,
+            None,
+            "owned target exited before release",
+        )));
     }
     let monotonic_ns = clock.checked_monotonic_ns().ok_or_else(|| {
         SetupFailure::Boundary(BoundaryFailure::new(
@@ -9543,6 +9934,47 @@ pub fn run(cfg: &Config, target: Target) -> anyhow::Result<Capture> {
     run_for_command(crate::package::commands::CommandKind::Report, cfg, target)
 }
 
+pub fn run_with_producer(
+    cfg: &Config,
+    target: Target,
+    producer: &crate::lifecycle_producer::ProducerHandle,
+) -> anyhow::Result<Capture> {
+    run_for_command_with_producer(
+        crate::package::commands::CommandKind::Report,
+        cfg,
+        target,
+        producer,
+    )
+}
+pub fn run_for_command_with_producer(
+    kind: crate::package::commands::CommandKind,
+    cfg: &Config,
+    target: Target,
+    producer: &crate::lifecycle_producer::ProducerHandle,
+) -> anyhow::Result<Capture> {
+    let _guard = producer.install_for_call()?;
+    run_for_command(kind, cfg, target)
+}
+pub fn run_with_dirs_and_producer(
+    cfg: &Config,
+    target: Target,
+    dirs: &[PathBuf],
+    trust: &onboard::TrustPolicy,
+    producer: &crate::lifecycle_producer::ProducerHandle,
+) -> anyhow::Result<Capture> {
+    let _guard = producer.install_for_call()?;
+    run_with_dirs(cfg, target, dirs, trust)
+}
+pub fn run_traversal_with_producer(
+    cfg: &Config,
+    target: Target,
+    req: &TraversalRequest,
+    producer: &crate::lifecycle_producer::ProducerHandle,
+) -> anyhow::Result<Capture> {
+    let _guard = producer.install_for_call()?;
+    run_traversal(cfg, target, req)
+}
+
 /// Ordinary report/check route: admit the entire selection before target,
 /// signals, forks or BPF setup. Legacy directory APIs remain explicit below.
 pub fn run_for_command(
@@ -9585,6 +10017,7 @@ pub(crate) fn with_capture_objects<R>(
     crate::package::commands::with_admitted(kind, overrides, resolve, effect)
 }
 struct AdmittedBuffers {
+    setup_deadline: Option<Instant>,
     harvest: Arc<[u8]>,
     count: Arc<[u8]>,
     count_sha256: [u8; 32],
@@ -9595,10 +10028,20 @@ pub(crate) fn run_admitted(
     admitted: crate::package::commands::AdmittedSet,
     auto: bool,
 ) -> anyhow::Result<Capture> {
+    run_admitted_before(cfg, target, admitted, auto, None)
+}
+pub(crate) fn run_admitted_before(
+    cfg: &Config,
+    target: Target,
+    admitted: crate::package::commands::AdmittedSet,
+    auto: bool,
+    setup_deadline: Option<Instant>,
+) -> anyhow::Result<Capture> {
     with_capture_selection(
         admitted,
         auto,
-        |objects, traversal, selected, buffers, package| {
+        |objects, traversal, selected, mut buffers, package| {
+            buffers.setup_deadline = setup_deadline;
             run_inner_with_admitted(
                 cfg,
                 target,
@@ -9665,6 +10108,7 @@ fn with_capture_selection<R>(
         traversal,
         selected,
         AdmittedBuffers {
+            setup_deadline: None,
             harvest: Arc::clone(&harvest.bytes),
             count: Arc::clone(&count.bytes),
             count_sha256: count.sha256.0,
@@ -10098,12 +10542,11 @@ pub(crate) struct OwnedSetupSource {
     count_sha256: [u8; 32],
     harvest_bytes: Option<Arc<[u8]>>,
     barrier: Arc<crate::count_owner::CountForkBarrier>,
+    producer: Option<crate::lifecycle_producer::ProducerHandle>,
 }
+type SetupMarker<D, B, L> = std::marker::PhantomData<fn() -> (D, B, L)>;
 pub(crate) enum SetupRequest<D, B: CountBackend, L> {
-    Live(
-        OwnedSetupSource,
-        std::marker::PhantomData<fn() -> (D, B, L)>,
-    ),
+    Live(OwnedSetupSource, SetupMarker<D, B, L>),
     #[cfg(test)]
     Host {
         cfg: Config,
@@ -10229,21 +10672,24 @@ where
                             }),
                             None,
                         ),
-                        Err(failure) => (
-                            Box::new(SetupBundle {
-                                window: Some(failure.window),
-                                bootstrap: None,
-                            }),
-                            Some(seed_failure.map_or(
-                                crate::capture_setup::SetupFailure::Boundary(failure.failure),
-                                |error| {
-                                    crate::capture_setup::SetupFailure::from_error(
-                                        BoundaryStage::Setup,
-                                        error,
-                                    )
-                                },
-                            )),
-                        ),
+                        Err(failure) => {
+                            let failure = *failure;
+                            (
+                                Box::new(SetupBundle {
+                                    window: Some(failure.window),
+                                    bootstrap: None,
+                                }),
+                                Some(seed_failure.map_or(
+                                    crate::capture_setup::SetupFailure::Boundary(failure.failure),
+                                    |error| {
+                                        crate::capture_setup::SetupFailure::from_error(
+                                            BoundaryStage::Setup,
+                                            error,
+                                        )
+                                    },
+                                )),
+                            )
+                        }
                     }
                 }
                 Err(failure) => (
@@ -10358,7 +10804,18 @@ fn prepare_live_owned_setup(
                         anyhow::anyhow!("initial fork refused: {e:?}"),
                     )
                 })?;
-                LiveLifecycle::select_controlled(pid, &prefix, control, links)?
+                LiveLifecycle::select_controlled(
+                    pid,
+                    &prefix,
+                    control,
+                    links,
+                    source.producer.as_ref().ok_or_else(|| {
+                        SetupFailure::from_error(
+                            BoundaryStage::Setup,
+                            anyhow::anyhow!("missing producer"),
+                        )
+                    })?,
+                )?
             };
             let lifecycle = crate::capture_setup::SetupResource::guarded(
                 lifecycle,
@@ -10471,6 +10928,7 @@ fn prepare_live_owned_setup(
             ) {
                 Ok(window) => bundle.window = Some(window),
                 Err(failure) => {
+                    let failure = *failure;
                     let error = if failure.cause == PreObservationCause::Cancelled {
                         SetupFailure::Cancelled {
                             stage: failure.failure.stage,
@@ -10761,6 +11219,7 @@ fn run_controlled_owned(
     acq_ns: u64,
     acquired_instant: Instant,
     acquired_wall: SystemTime,
+    setup_ceiling: Option<Instant>,
 ) -> anyhow::Result<Capture> {
     use crate::capture_setup::{SetupAttempt, SetupControl, SetupFailure, SetupInterrupt};
     let deadline = args::deadline_at(acquired_instant, cfg.harvest_timeout).ok_or_else(|| {
@@ -10771,6 +11230,7 @@ fn run_controlled_owned(
             "spawn setup deadline overflow",
         )
     })?;
+    let deadline = deadline.min(setup_ceiling.unwrap_or(deadline));
     let mut info = TargetInfo {
         pid: 0,
         owned: true,
@@ -10871,6 +11331,7 @@ fn run_controlled_owned(
         count_bytes,
         count_sha256,
         harvest_bytes,
+        producer: Some(crate::lifecycle_producer::installed()?),
         barrier: attempt.fork_barrier.clone(),
     };
     if let Err(failure) = attempt.start(SetupRequest::Live(source, std::marker::PhantomData)) {
@@ -11014,6 +11475,15 @@ fn run_inner_with_admitted(
     buffers: Option<AdmittedBuffers>,
     package_build: Option<crate::package::commands::PackageProvenance>,
 ) -> anyhow::Result<Capture> {
+    let producer = crate::lifecycle_producer::installed().map_err(|e| {
+        anyhow::Error::new(BoundaryFailure::new(
+            BoundaryStage::Setup,
+            BoundaryFailureClass::Infrastructure,
+            None,
+            &e.to_string(),
+        ))
+    })?;
+    let setup_ceiling = buffers.as_ref().and_then(|b| b.setup_deadline);
     arm_signals();
     let (obj_bytes, obj_sha256, harvest_bytes) = match buffers {
         Some(b) => (b.count, b.count_sha256, Some(b.harvest)),
@@ -11082,6 +11552,7 @@ fn run_inner_with_admitted(
             acq_ns,
             acq_instant,
             acq_wall,
+            setup_ceiling,
         ),
         Target::Pid(p) => {
             // Offset table for target qualification (explicit file or
@@ -11188,10 +11659,19 @@ fn run_inner_with_admitted(
                         BoundaryStage::Setup,
                     )
                 })?;
+            let setup_deadline = setup_deadline.min(setup_ceiling.unwrap_or(setup_deadline));
             let (lifecycle, backend) = prepare_after_initial_forks(
                 fork_barrier,
                 setup_deadline,
-                |prefix| Ok(LiveLifecycle::select(p, true, prefix)),
+                |prefix| {
+                    Ok(LiveLifecycle::select_before(
+                        p,
+                        true,
+                        prefix,
+                        &producer,
+                        setup_deadline,
+                    ))
+                },
                 |_, barrier, deadline| {
                     prepare_count_backend(Arc::clone(&obj_bytes), obj_sha256, p, barrier, deadline)
                         .map_err(|e| {
@@ -11257,7 +11737,7 @@ fn decorate_capture_result_with_package(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::discovery::session::{
         AttachEvent, AttachKind, BackingRef, DiscoveredCandidate, DiscoveredObject, TableCoverage,
@@ -11568,6 +12048,11 @@ mod tests {
         let fd = unsafe { OwnedFd::from_raw_fd(libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY)) };
         assert!(fd.as_raw_fd() >= 0, "/dev/null must open");
         KernelLifecycle {
+            scripted_kernel_peer: true,
+            host_online: None,
+            producer: None,
+            _subscription: None,
+            close_deadline: None,
             fd: crate::capture_setup::SetupResource::local(fd),
             sock_inode: 0,
             target_pid: 100,
@@ -11727,6 +12212,220 @@ mod tests {
                 .unwrap();
             assert!(first_acquire < fd && fd < count, "{operations:?}");
         }
+    }
+
+    pub(crate) fn host_producer_consumer(producer: &crate::lifecycle_producer::ProducerHandle) {
+        use std::os::unix::net::UnixDatagram;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let mut affinity: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::sched_getaffinity(0, std::mem::size_of_val(&affinity), &mut affinity) },
+            0
+        );
+        let cpu = (0..1024)
+            .find(|&cpu| unsafe { libc::CPU_ISSET(cpu, &affinity) })
+            .unwrap() as u32;
+        let (send, recv) = UnixDatagram::pair().unwrap();
+        let mut lc = ingest_fixture(HashSet::from([100]), SeqState::default(), false);
+        lc.fd = crate::capture_setup::SetupResource::local(recv.into());
+        lc.producer = Some(producer.clone());
+        lc._subscription = Some(producer.subscribe().unwrap());
+        lc.watermark_cpus = vec![cpu];
+        lc.host_online = Some(vec![cpu]);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_sender = stop.clone();
+        let source = producer.clone();
+        let thread = std::thread::spawn(move || {
+            let mut last = 0;
+            let mut seq = 0;
+            while !stop_sender.load(Ordering::Acquire) {
+                if let Some((pid, cpu, birth)) = source.host_child() {
+                    if pid != last {
+                        last = pid;
+                        seq += 1;
+                        let mut ev = proc_event(
+                            PROC_EVENT_FORK,
+                            &[source.launcher_pid(), source.launcher_pid(), pid, pid],
+                        );
+                        ev[4..8].copy_from_slice(&cpu.to_le_bytes());
+                        ev[8..16].copy_from_slice(&birth.to_le_bytes());
+                        send.send(&cn_datagram_seq(&ev, seq, 0)).unwrap();
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        let sentinel = std::fs::File::open("/dev/null").unwrap();
+        let mut initial = LifecycleDelta::default();
+        let seen = lc.producer_burst(
+            &[cpu],
+            crate::lifecycle_producer::BurstPhase::Initial,
+            Instant::now() + Duration::from_secs(2),
+            &mut initial,
+            None,
+        );
+        assert_eq!(
+            seen, 1,
+            "real producer child and scripted HOST-origin event must be positively reaped"
+        );
+        let close = lc.close_drain(
+            LifecycleEdge {
+                start_ns: 0,
+                end_ns: 1,
+            },
+            None,
+        );
+        stop.store(true, Ordering::Release);
+        thread.join().unwrap();
+        assert!(
+            close.suffix_witness,
+            "terminal helper is independent of denied observer permit"
+        );
+        assert!(unsafe { libc::fcntl(sentinel.as_raw_fd(), libc::F_GETFD) } >= 0);
+    }
+
+    #[test]
+    fn lifecycle_producer_ingress_origin_precedes_acceptance_and_live_ingest() {
+        let mut peer: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+        peer.nl_family = libc::AF_NETLINK as u16;
+        let len = std::mem::size_of_val(&peer) as libc::socklen_t;
+        assert_eq!(
+            validate_kernel_peer(64, 64, &peer, len),
+            KernelReceive::Bytes(64)
+        );
+        for defect in 0..4 {
+            let mut p = peer;
+            let mut n = 64;
+            let mut l = len;
+            match defect {
+                0 => p.nl_pid = 1,
+                1 => p.nl_family = libc::AF_UNIX as u16,
+                2 => l -= 1,
+                _ => n = 65,
+            };
+            assert_eq!(validate_kernel_peer(n, 64, &p, l), KernelReceive::Rejected);
+        }
+        use std::os::unix::net::UnixDatagram;
+        let (send, recv) = UnixDatagram::pair().unwrap();
+        let fd: OwnedFd = recv.into();
+        send.send(&cn_datagram_seq(&proc_event(PROC_EVENT_NONE, &[0]), 1, 0))
+            .unwrap();
+        let mut b = [0; 256];
+        assert_eq!(
+            recv_kernel_datagram(unsafe { BorrowedFd::borrow_raw(fd.as_raw_fd()) }, &mut b)
+                .unwrap(),
+            KernelReceive::Rejected
+        );
+        let mut lc = ingest_fixture(HashSet::from([100]), SeqState::default(), false);
+        lc.fd = crate::capture_setup::SetupResource::local(fd);
+        lc.scripted_kernel_peer = false;
+        send.send(&cn_datagram_seq(
+            &proc_event(PROC_EVENT_FORK, &[100, 100, 200, 200]),
+            1,
+            0,
+        ))
+        .unwrap();
+        let mut delta = LifecycleDelta::default();
+        lc.drain_into(&mut delta, 256, None);
+        assert!(delta.events.is_empty());
+        assert!(delta.loss > 0);
+        assert!(!lc.known.contains(&200));
+    }
+    #[test]
+    fn lifecycle_producer_rejected_ack_cannot_accept_or_stash() {
+        use std::os::unix::net::UnixDatagram;
+        let (send, recv) = UnixDatagram::pair().unwrap();
+        let fd: OwnedFd = recv.into();
+        let ack = cn_datagram_seq(&proc_event(PROC_EVENT_NONE, &[0]), 2, TEST_OUR_ACK);
+        send.send(&ack).unwrap();
+        let started = Instant::now();
+        let error = KernelLifecycle::await_acceptance_timeout(
+            &fd,
+            TEST_OUR_ACK,
+            Duration::from_millis(100),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("not acknowledged"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let fork = cn_datagram_seq(&proc_event(PROC_EVENT_FORK, &[100, 100, 200, 200]), 1, 0);
+        send.send(&ack).unwrap();
+        send.send(&fork).unwrap();
+        send.send(&ack).unwrap();
+        let mut calls = 0;
+        let (stash, enobufs, loss) = KernelLifecycle::await_acceptance_with(
+            &fd,
+            TEST_OUR_ACK,
+            Duration::from_millis(100),
+            |buf| {
+                calls += 1;
+                if calls == 1 {
+                    recv_kernel_datagram(unsafe { BorrowedFd::borrow_raw(fd.as_raw_fd()) }, buf)
+                } else {
+                    recv_scripted_kernel_datagram(
+                        unsafe { BorrowedFd::borrow_raw(fd.as_raw_fd()) },
+                        buf,
+                    )
+                }
+            },
+        )
+        .unwrap();
+        assert!(!enobufs);
+        assert_eq!(loss, 1);
+        assert_eq!(
+            stash.into_iter().collect::<Vec<_>>(),
+            vec![fork, ack],
+            "only authenticated fixture bytes retain arrival order, once"
+        );
+    }
+
+    #[test]
+    fn lifecycle_producer_topology_is_sparse_bounded_and_canonical() {
+        assert_eq!(
+            parse_online_cpus("0-2,8,10-11\n"),
+            Some(vec![0, 1, 2, 8, 10, 11])
+        );
+        for malformed in [
+            "", "0-0", "00", "1,1", "2-1", "0-1024", "0, 2", "0-1,1-2", "-1", "0\n\n",
+        ] {
+            assert!(parse_online_cpus(malformed).is_none(), "{malformed:?}");
+        }
+    }
+
+    #[test]
+    fn lifecycle_producer_stale_migrated_and_overflow_cannot_witness() {
+        use crate::lifecycle_producer::WitnessKind;
+        let mut watch = SyncWatch::producer(3, 80);
+        for (pid, parent, cpu, timestamp) in [(9, 80, 3, 99), (9, 81, 3, 101), (9, 80, 4, 101)] {
+            watch.candidate(Candidate {
+                pid,
+                parent,
+                cpu,
+                timestamp,
+                kind: WitnessKind::Fork,
+            });
+        }
+        watch.bind(9, 100);
+        assert!(!watch.complete());
+        watch.candidate(Candidate {
+            pid: 9,
+            parent: 80,
+            cpu: 3,
+            timestamp: 100,
+            kind: WitnessKind::Fork,
+        });
+        assert!(watch.complete());
+        let mut overflow = SyncWatch::producer(3, 80);
+        for _ in 0..257 {
+            overflow.candidate(Candidate {
+                pid: 9,
+                parent: 80,
+                cpu: 3,
+                timestamp: 100,
+                kind: WitnessKind::Exit,
+            });
+        }
+        assert!(overflow.overflow);
+        assert_eq!(overflow.candidates.len(), 256);
     }
 
     #[test]
@@ -12630,6 +13329,11 @@ mod tests {
 
     #[test]
     fn kernel_concurrent_subscribes_use_distinct_tokens() {
+        crate::lifecycle_producer::tests::run_connector_driver(
+            "connector-lib:kernel_concurrent_subscribes_use_distinct_tokens",
+        );
+    }
+    pub(crate) fn connector_body_kernel_concurrent_subscribes_use_distinct_tokens() {
         // NEW-ACK RED (live): two concurrent same-process
         // subscriptions must hold distinct operation tokens (one
         // shared process-ID token lets either wait consume the
@@ -12697,6 +13401,11 @@ mod tests {
 
     #[test]
     fn kernel_select_uses_signals_or_falls_back_loud() {
+        crate::lifecycle_producer::tests::run_connector_driver(
+            "connector-lib:kernel_select_uses_signals_or_falls_back_loud",
+        );
+    }
+    pub(crate) fn connector_body_kernel_select_uses_signals_or_falls_back_loud() {
         // No such pid: tgid unreadable → explicit polling fallback
         // (deterministic contract — unconditional).
         let polled = LiveLifecycle::select(
@@ -18497,6 +19206,7 @@ mod fix1_live_provider_tests {
             count_bytes: Arc::from([]),
             count_sha256: [0; 32],
             harvest_bytes: Some(Arc::from([])),
+            producer: None,
             barrier: owner.attempt.fork_barrier.clone(),
         };
         owner
