@@ -2731,6 +2731,61 @@ fn delivery_same_file_path_refuses_cbom() {
 }
 
 #[test]
+fn delivery_file_aliases_preserve_primary() {
+    let base = temp_path("output-aliases");
+    std::fs::create_dir_all(base.join("sub")).unwrap();
+    let primary = base.join("report.json");
+    let doc = complete_doc();
+    for kind in ["relative", "parent", "hardlink", "symlink"] {
+        let alias = match kind {
+            "relative" => {
+                let mut relative = PathBuf::new();
+                for _ in std::env::current_dir().unwrap().components().skip(1) {
+                    relative.push("..");
+                }
+                relative.join(primary.strip_prefix("/").unwrap())
+            }
+            "parent" => base.join("sub/../report.json"),
+            "hardlink" => {
+                std::fs::write(&primary, b"old report").unwrap();
+                let alias = base.join("hardlink.json");
+                std::fs::hard_link(&primary, &alias).unwrap();
+                alias
+            }
+            "symlink" => {
+                let alias = base.join("symlink.json");
+                std::os::unix::fs::symlink(&primary, &alias).unwrap();
+                alias
+            }
+            _ => unreachable!(),
+        };
+        let result = write_artifacts(
+            &doc,
+            &OutputRequest {
+                format: OutputFormat::Json,
+                primary: OutputDest::File(primary.clone()),
+                cbom: Some(OutputDest::File(alias.clone())),
+            },
+        );
+        let saved = std::fs::read(&primary).unwrap();
+        if matches!(kind, "hardlink" | "symlink") {
+            std::fs::remove_file(&alias).unwrap();
+        }
+        std::fs::remove_file(&primary).unwrap();
+        assert!(result.primary.ok, "{kind}: {result:?}");
+        let cbom = result.cbom.as_ref().unwrap();
+        assert!(!cbom.ok, "{kind}: aliased CBOM must refuse: {result:?}");
+        assert!(cbom.error.as_deref().unwrap().contains("same sink"));
+        assert_eq!(
+            saved,
+            render_json(&doc).unwrap(),
+            "{kind}: primary survives"
+        );
+    }
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
 fn semantics_rejects_status_reasons_mismatch() {
     // F3: COMPLETE lists no gaps; PARTIAL always names one.
     let mut v = json_of(&complete_doc());

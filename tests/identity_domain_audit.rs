@@ -982,6 +982,14 @@ fn h5_t3_every_device_site_names_one_domain() {
         // Source reads compare before/after raw metadata from the same retained FD.
         ("src/package/source.rs", "raw", "a.dev(),", 1),
         ("src/package/source.rs", "raw", "b.dev(),", 1),
+        // Artifact aliases compare two raw stat identities, never maps or
+        // encoded callback devices, before a second output can overwrite one.
+        (
+            "src/report.rs",
+            "raw",
+            "(Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),",
+            1,
+        ),
         // The actual-source HOST driver makes capture's test module visible.
         // These fixtures keep normalized stat words in SiteKey/ObjectRecord;
         // rendering or decoding the fixture does not change its caller domain.

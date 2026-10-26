@@ -2223,6 +2223,21 @@ fn dest_display(dest: &OutputDest) -> String {
     }
 }
 
+fn same_artifact_sink(primary: &OutputDest, other: &OutputDest) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    if primary == other {
+        return true;
+    }
+    let metadata = |dest: &OutputDest| match dest {
+        OutputDest::Stdout => std::fs::metadata("/proc/self/fd/1"),
+        OutputDest::File(path) => std::fs::metadata(path),
+    };
+    match (metadata(primary), metadata(other)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    }
+}
+
 fn write_dest(dest: &OutputDest, bytes: &[u8]) -> ArtifactOutcome {
     let display = dest_display(dest);
     let result = match dest {
@@ -2298,8 +2313,8 @@ pub fn setup_failure_document(fatal: FatalKind) -> CaptureDocument {
 pub fn write_artifacts(doc: &CaptureDocument, req: &OutputRequest) -> DeliveryResult {
     // Primary + CBOM to the same sink would concatenate (stdout)
     // or overwrite (same file): refuse the CBOM side while the
-    // primary still delivers. Path comparison is lexical; distinct
-    // spellings of one file are the caller's responsibility.
+    // primary still delivers. Recheck actual file identity after the primary
+    // write: a new file or a previously dangling alias is now resolvable.
     let same_sink = match &req.cbom {
         None => false,
         Some(dest) => req.primary == *dest,
@@ -2308,7 +2323,7 @@ pub fn write_artifacts(doc: &CaptureDocument, req: &OutputRequest) -> DeliveryRe
         OutputFormat::Human => Ok(render_human(doc).into_bytes()),
         OutputFormat::Json => render_json(doc).map_err(|e| format!("render failed: {e:#}")),
     };
-    let cbom_render: Option<Result<Vec<u8>, String>> = match (&req.cbom, same_sink) {
+    let mut cbom_render: Option<Result<Vec<u8>, String>> = match (&req.cbom, same_sink) {
         (Some(_), false) => Some(render_cbom(doc).map_err(|e| format!("render failed: {e:#}"))),
         _ => None,
     };
@@ -2316,6 +2331,13 @@ pub fn write_artifacts(doc: &CaptureDocument, req: &OutputRequest) -> DeliveryRe
         Ok(bytes) => write_dest(&req.primary, &bytes),
         Err(detail) => render_failed_outcome(&req.primary, &detail),
     };
+    if req
+        .cbom
+        .as_ref()
+        .is_some_and(|dest| same_artifact_sink(&req.primary, dest))
+    {
+        cbom_render = None;
+    }
     let cbom = match (&req.cbom, cbom_render) {
         (None, _) => None,
         (Some(dest), None) => Some(ArtifactOutcome {
