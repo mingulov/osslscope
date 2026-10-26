@@ -1988,6 +1988,8 @@ pub struct FakeTerminalFaults {
     pub enumeration: Option<EnumerationStatus>,
     pub read_error: bool,
     pub quiescence_unknown: bool,
+    /// Model the live owner's unbound completion theorem, never a reviewed one.
+    pub unbound_profile: bool,
     pub forget_frontier: bool,
     pub inventory_unavailable: bool,
     pub omit_resolved_open: bool,
@@ -2734,8 +2736,10 @@ impl CountBackend for FakeCountBackend {
             return view;
         }
         let can_read = now < request.deadline;
-        let finished =
-            can_read && !self.faults.quiescence_unknown && self.faults.close_errno.is_none();
+        let finished = can_read
+            && !self.faults.quiescence_unknown
+            && !self.faults.unbound_profile
+            && self.faults.close_errno.is_none();
         let last_completed = if self.faults.forget_frontier {
             request.frontier.last_acked.map(|seq| PendingCommandId {
                 seq,
@@ -2840,6 +2844,13 @@ impl CountBackend for FakeCountBackend {
                 class: FailureClass::Io,
                 errno: Some(errno),
             });
+        }
+        if self.faults.unbound_profile {
+            data.kernel_profile = KernelApplicability::Unknown(ProfileFailure::UnboundBuild);
+            data.writers = WriterCompletion::Unknown(QuiescenceReason::Profile);
+            data.failures.operations[CountOperation::Close as usize].get_or_insert(
+                OwnerFailure::engine(CountOperation::Close, FailureClass::Profile),
+            );
         }
         if let Some(c) = &data.checkpoint {
             for (index, component) in std::iter::once(&c.snapshot.admitted)

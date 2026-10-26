@@ -166,6 +166,78 @@ struct RunContext<'a> {
     cancelled: &'a dyn Fn() -> bool,
 }
 
+/// The preview accepts unknown final-writer coverage, never a false completion
+/// witness. Only this sole, expected capability gap is nonfatal; the immutable
+/// terminal and every loss counter remain unchanged. Scan all channels because
+/// runtime_failure retains only the first failure.
+fn only_unreviewed_completion(terminal: &crate::count_session::CountTerminal) -> bool {
+    use crate::count_owner::{
+        CleanupState, CountOperation, FailureClass, KernelApplicability, OwnerFailure,
+        ProfileFailure, QuiescenceReason, ReadStatus, ResourceId, ResourceState, SealBracket,
+        StopResult, WriterCompletion,
+    };
+    let expected = OwnerFailure::engine(CountOperation::Close, FailureClass::Profile);
+    let receipt = &terminal.receipt;
+    terminal.runtime_failure == Some(expected)
+        && receipt.kernel_profile == KernelApplicability::Unknown(ProfileFailure::UnboundBuild)
+        && receipt.writers == WriterCompletion::Unknown(QuiescenceReason::Profile)
+        && receipt.failures.operations[CountOperation::Close as usize] == Some(expected)
+        && receipt
+            .failures
+            .operations
+            .iter()
+            .flatten()
+            .all(|f| *f == expected)
+        && receipt.failures.components.iter().all(Option::is_none)
+        && matches!(receipt.seal, SealBracket { before_ns: Some(before), after_ns: Some(after), result: StopResult::Stopped } if before <= after)
+        && receipt.host_writes_sealed
+        && receipt.final_references.file
+        && receipt.final_references.bpf_link
+        && receipt.read_status == ReadStatus::Complete
+        && receipt.checkpoint.is_some()
+        && receipt
+            .snapshot_binding
+            .is_some_and(|binding| !binding.immutable)
+        && receipt.manifest.len() == receipt.close_outcomes.len()
+        && receipt
+            .manifest
+            .iter()
+            .zip(&receipt.close_outcomes)
+            .all(|(record, close)| {
+                record.id == close.id
+                    && record.close_state == ResourceState::CloseReturned
+                    && record.close_errno.is_none()
+                    && close.state == ResourceState::CloseReturned
+                    && close.errno.is_none()
+                    && close
+                        .issued_at
+                        .zip(close.returned_at)
+                        .is_some_and(|(issued, returned)| {
+                            issued <= returned && returned < receipt.deadline
+                        })
+            })
+        && match &receipt.cleanup_state {
+            CleanupState::Complete => true,
+            CleanupState::Failed(_) => false,
+            CleanupState::Pending(summary) => {
+                summary.sealed
+                    && summary.resources.iter().all(|r| {
+                        r.errno.is_none()
+                            && (matches!(
+                                r.state,
+                                ResourceState::Unused | ResourceState::CloseReturned
+                            ) || (r.state == ResourceState::Held
+                                && !matches!(r.resource, ResourceId::Link(_))))
+                    })
+            }
+        }
+        && !terminal
+            .retained_drain
+            .counters
+            .iter()
+            .any(|c| c.name == "count.reference_inventory_invalid" && c.value != 0)
+}
+
 fn observe_profiled<T: TargetPort, B: CountBackend, C: ClockPort>(
     ctx: &RunContext<'_>,
     target: &mut T,
@@ -290,7 +362,7 @@ fn observe_profiled<T: TargetPort, B: CountBackend, C: ClockPort>(
         terminal.receipt.seal,
         last_established,
     );
-    if terminal.runtime_failure.is_some() {
+    if terminal.runtime_failure.is_some() && !only_unreviewed_completion(&terminal) {
         failure.get_or_insert("preview count owner failed");
     }
     let disposition = match target.finish_observation() {
@@ -486,6 +558,10 @@ mod tests {
         UnknownTail,
         InvalidTimestamp,
         CloseFailure,
+        UnboundProfile,
+        UnboundReadFailure,
+        UnboundComponentFailure,
+        UnboundInventoryFailure,
     }
 
     struct TracedBackend {
@@ -655,6 +731,16 @@ mod tests {
                 close_errno: Some(libc::EIO),
                 ..Default::default()
             }),
+            ModelCase::UnboundProfile
+            | ModelCase::UnboundReadFailure
+            | ModelCase::UnboundComponentFailure
+            | ModelCase::UnboundInventoryFailure => inner.terminal_faults(FakeTerminalFaults {
+                unbound_profile: true,
+                read_error: matches!(fault, ModelCase::UnboundReadFailure),
+                admitted_unavailable: matches!(fault, ModelCase::UnboundComponentFailure),
+                forget_frontier: matches!(fault, ModelCase::UnboundInventoryFailure),
+                ..Default::default()
+            }),
             _ => {}
         }
         let mut count = CountSession::new(
@@ -820,6 +906,69 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn unbound_completion_profile_preserves_partial_evidence_and_original_receipt() {
+        use crate::count_owner::{
+            KernelApplicability, ProfileFailure, QuiescenceReason, WriterCompletion,
+        };
+        let (result, _, count) = run_model(false, false, false, false, ModelCase::UnboundProfile);
+        let capture = result.unwrap();
+        assert_eq!(capture.document.total_calls(), 32);
+        assert!(matches!(
+            capture.document.status,
+            Completeness::Partial { .. }
+        ));
+        let terminal = count.shared_terminal(count.terminal_id().unwrap());
+        assert_eq!(
+            terminal.receipt.kernel_profile,
+            KernelApplicability::Unknown(ProfileFailure::UnboundBuild)
+        );
+        assert_eq!(
+            terminal.receipt.writers,
+            WriterCompletion::Unknown(QuiescenceReason::Profile)
+        );
+        assert!(terminal.runtime_failure.is_some());
+        for name in [
+            "count.quiescence_unknown",
+            "count.close_failed",
+            "count.owner_failed",
+        ] {
+            assert!(
+                capture
+                    .document
+                    .counters
+                    .iter()
+                    .any(|c| c.name == name && c.value == 1),
+                "retain {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn unbound_profile_never_masks_read_component_or_inventory_failure() {
+        for fault in [
+            ModelCase::UnboundReadFailure,
+            ModelCase::UnboundComponentFailure,
+            ModelCase::UnboundInventoryFailure,
+        ] {
+            let (result, events, count) = run_model(false, false, false, false, fault);
+            assert!(events.contains(&"release") && events.contains(&"close"));
+            let terminal = count.shared_terminal(count.terminal_id().unwrap());
+            assert!(terminal.runtime_failure.is_some());
+            match result {
+                Ok(capture) => assert!(matches!(
+                    capture.document.status,
+                    Completeness::Fatal { .. }
+                )),
+                Err(error) => assert!(
+                    error
+                        .downcast_ref::<super::super::WindowBindingFailure>()
+                        .is_some()
+                ),
+            }
+        }
     }
 
     #[test]

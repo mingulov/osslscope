@@ -56,6 +56,13 @@ normal degraded tails and runtime failures; typed loss/cleanup reasons remain
 visible. Equal scans do not prove writer completion, and successful close calls
 alone do not establish a universal terminal-writer theorem.
 
+The preview keeps a missing terminal-writer guarantee as PARTIAL when link
+closes and reads succeeded and it is the sole limitation. The strict Count
+receipt still retains `count.quiescence_unknown`, `count.close_failed` and
+`count.owner_failed` for that missing completion certification. No completion
+witness or counters are rewritten. Additional close, read, inventory or cleanup
+failures remain runtime failures.
+
 Normal setup and signal paths resolve stopped children and owned resources.
 A released live workload stays running at observation end. SIGKILL/crash during
 the stopped pre-exec interval can strand the child: crash-safe startup custody
