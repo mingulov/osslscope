@@ -37,9 +37,17 @@ explicit Count override is operator-trusted code and inherits no privacy claim.
 - Normal setup/signal paths clean owned resources. Released live workloads
   remain running at observation end. Observer SIGKILL/crash before child exec
   can strand the stopped child; startup crash recovery is deferred.
+- Handled setup cancellation disposes the stopped child even while a Count
+  operation remains pending. Its late resources remain with the owner;
+  this does not promise a hard deadline for arbitrary blocked kernel cleanup.
+  The killed child's wait status stays with that owner until delayed Count
+  work closes, preserving its PID identity through late attachment.
 - Tight loops pay material overhead. Read the actual
   [matched timings and sampling limits](overhead-matrix.md); no historical
   production performance budget is claimed.
+- The explicitly empty deferred `--image-digest ""` flag is currently ignored.
+  It supplies no image attribution; nonempty values are rejected. This minor
+  validation inconsistency is deferred.
 
 General discovery, foreign-PID attach, additional profiles/providers, containers,
 services/export, per-call tracing/latency, stronger completeness, DEB/RPM and

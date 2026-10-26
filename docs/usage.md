@@ -58,6 +58,10 @@ bounds and typed gaps. `count_object` records the selected Count digest/length
 and trust selection. Provider labels describe compiled candidates, not runtime
 provider activation. All formats carry the profile's unknown-denominator gap.
 
+Choose distinct primary and CBOM destinations. If both resolve to the same
+file or stdout, CBOM delivery fails and the primary artifact is preserved.
+This includes relative/absolute path aliases, hard links and symlinks.
+
 ## Algorithm rules and policy files
 
 At least one active rule is required by `check`:

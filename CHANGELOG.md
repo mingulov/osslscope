@@ -14,6 +14,10 @@
   mismatched inputs, outputs/policies, signals, deadlines and attach failure.
   Fixed a retired-owner setup wait and preserved usable positive evidence when
   the sole missing capability is the terminal-writer completion theorem.
+- Setup cancellation reaches pending Count load/attach/open waits without
+  releasing the stopped workload. Late owner cleanup retains its original
+  deadline and resource custody. Primary/CBOM output aliases refuse the CBOM
+  delivery and preserve the report instead of silently replacing it.
 - Every capture remains PARTIAL; no absence, crypto-success or complete-window
   claim. Pre-exec observer crash can strand a stopped child. Tight loops have
   material overhead; [measured limits](docs/overhead-matrix.md) apply.
