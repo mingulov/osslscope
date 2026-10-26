@@ -1133,6 +1133,7 @@ enum MapAction {
 }
 #[derive(Default)]
 struct MapFaults {
+    setup_interrupt: Option<Arc<AtomicBool>>,
     keys: Vec<u64>,
     row_error: Option<u64>,
     absent_key: Option<u64>,
@@ -1375,6 +1376,10 @@ fn map_engine(probe: &Arc<MapProbe>, faults: MapFaults) -> CountEngine {
 fn map_engine_with_sequence(probe: &Arc<MapProbe>, faults: MapFaults, last: u64) -> CountEngine {
     let observed = Arc::clone(&probe.owner);
     let mut hooks = PrepareHooks::host();
+    hooks.setup_interrupt = faults
+        .setup_interrupt
+        .as_ref()
+        .map(|flag| crate::capture_setup::SetupInterrupt::Owned(Arc::clone(flag)));
     hooks.snapshot_sequence_last = last;
     hooks.registry_observer = Some(Arc::new(move |event| {
         observed.event(Event::Registry(event))
@@ -1410,6 +1415,252 @@ fn map_engine_with_sequence(probe: &Arc<MapProbe>, faults: MapFaults, last: u64)
         spawn_owner,
     )
     .unwrap()
+}
+
+#[test]
+fn preview_setup_cancel_returns_while_load_is_held() {
+    let probe = Probe::new();
+    let interrupted = Arc::new(AtomicBool::new(false));
+    let observed = Arc::clone(&probe);
+    let mut hooks = PrepareHooks::host();
+    hooks.setup_interrupt = Some(crate::capture_setup::SetupInterrupt::Owned(Arc::clone(
+        &interrupted,
+    )));
+    let (send, receive) = std::sync::mpsc::channel();
+    let caller = std::thread::spawn(move || {
+        let result = injected(
+            observed,
+            Faults {
+                hold_acquire: Some(1),
+                ..Default::default()
+            },
+            Arc::new(CountForkBarrier::new()),
+            Instant::now() + Duration::from_secs(30),
+            hooks,
+        );
+        let _ = send.send(result);
+    });
+    probe.wait(|events| {
+        events
+            .iter()
+            .any(|(_, e)| matches!(e, Event::EnterAcquire(1)))
+    });
+    interrupted.store(true, Ordering::Release);
+    let result = receive.recv_timeout(Duration::from_millis(300));
+    probe.release();
+    caller.join().unwrap();
+    let failure = result
+        .expect("caller must return while the load gate is still held")
+        .err()
+        .expect("cancelled preparation cannot become Ready");
+    assert_eq!(failure.failure.class, FailureClass::Cancelled);
+    assert!(failure.cleanup_ticket.is_some());
+    task3_cleanup(&probe, 1);
+}
+
+#[test]
+fn preview_setup_cancel_returns_while_attach_is_held() {
+    let probe = Probe::new();
+    let interrupted = Arc::new(AtomicBool::new(false));
+    let mut hooks = PrepareHooks::host();
+    hooks.setup_interrupt = Some(crate::capture_setup::SetupInterrupt::Owned(Arc::clone(
+        &interrupted,
+    )));
+    let engine = Arc::new(
+        injected(
+            Arc::clone(&probe),
+            Faults {
+                hold_acquire: Some(10),
+                ..Default::default()
+            },
+            Arc::new(CountForkBarrier::new()),
+            Instant::now() + Duration::from_secs(30),
+            hooks,
+        )
+        .unwrap(),
+    );
+    let request = attach_request(1, 1);
+    let original_deadline = request.deadline;
+    let observed = Arc::clone(&engine);
+    let (send, receive) = std::sync::mpsc::channel();
+    let caller = std::thread::spawn(move || {
+        let _ = send.send(observed.attach(request));
+    });
+    probe.wait(|events| {
+        events
+            .iter()
+            .any(|(_, e)| matches!(e, Event::EnterAcquire(10)))
+    });
+    interrupted.store(true, Ordering::Release);
+    let result = receive.recv_timeout(Duration::from_millis(300));
+    let prompt = result.is_ok();
+    let terminal = prompt.then(|| {
+        let frontier = locked(&engine.shared.state).frontier.clone();
+        engine.terminal_request(
+            Instant::now() + Duration::from_secs(1),
+            engine.ready.evidence_domain,
+            engine.ready.writer_object_identity,
+            frontier,
+        )
+    });
+    let terminal_started = Instant::now();
+    let receipt = terminal
+        .as_ref()
+        .map(|request| engine.terminal(request.clone()));
+    let terminal_elapsed = terminal_started.elapsed();
+    probe.release();
+    caller.join().unwrap();
+    let failure = result
+        .expect("caller must return while the attach gate is still held")
+        .err()
+        .expect("cancelled attachment cannot be acknowledged");
+    assert_eq!(failure.failure.class, FailureClass::Cancelled);
+    assert_eq!(failure.publication, CommandPublication::Published);
+    assert_eq!(failure.completion, CommandCompletion::Unknown);
+    assert_eq!(terminal.unwrap().deadline, original_deadline);
+    assert!(terminal_elapsed < Duration::from_millis(300));
+    let receipt = receipt.unwrap();
+    assert_eq!(receipt.deadline, original_deadline);
+    assert_ne!(receipt.cleanup_state, CleanupState::Complete);
+    assert!(matches!(receipt.writers, WriterCompletion::Unknown(_)));
+    assert!(
+        receipt
+            .failures
+            .operations
+            .iter()
+            .flatten()
+            .all(|failure| { failure.class != FailureClass::Deadline })
+    );
+    task3_cleanup(&probe, 10);
+}
+
+#[test]
+fn preview_setup_cancel_returns_while_open_is_held() {
+    let probe = MapProbe::new();
+    let interrupted = Arc::new(AtomicBool::new(false));
+    let engine = Arc::new(map_engine(
+        &probe,
+        MapFaults {
+            hold_call: Some(1),
+            setup_interrupt: Some(Arc::clone(&interrupted)),
+            ..Default::default()
+        },
+    ));
+    let observed = Arc::clone(&engine);
+    let (send, receive) = std::sync::mpsc::channel();
+    let caller = std::thread::spawn(move || {
+        let _ = send.send(observed.open_window(open_request(1)));
+    });
+    probe.wait_calls(1);
+    interrupted.store(true, Ordering::Release);
+    let result = receive.recv_timeout(Duration::from_millis(300));
+    probe.owner.release();
+    caller.join().unwrap();
+    let failure = result
+        .expect("caller must return while the open gate is still held")
+        .err()
+        .expect("cancelled opening cannot release the workload");
+    assert_eq!(failure.failure.class, FailureClass::Cancelled);
+    assert_eq!(failure.publication, CommandPublication::Published);
+    assert_eq!(failure.completion, CommandCompletion::Unknown);
+    drop(engine);
+    task3_cleanup(&probe.owner, 8);
+}
+
+#[test]
+fn preview_setup_cancel_retains_child_wait_slot_until_owner_cleanup() {
+    let child = crate::target::OwnedTarget::spawn_stopped(
+        &["/bin/true".into()],
+        crate::target::WorkloadDest::Null,
+    )
+    .unwrap();
+    let pid = child.pid();
+    let probe = Probe::new();
+    let interrupted = Arc::new(AtomicBool::new(false));
+    let mut hooks = PrepareHooks::host();
+    hooks.setup_interrupt = Some(crate::capture_setup::SetupInterrupt::Owned(Arc::clone(
+        &interrupted,
+    )));
+    let mut actual_input = input(Arc::new(CountForkBarrier::new()));
+    actual_input.target_tgid = pid;
+    let engine = Arc::new(
+        injected_target(
+            actual_input,
+            Arc::clone(&probe),
+            Faults {
+                hold_acquire: Some(10),
+                ..Default::default()
+            },
+            Instant::now() + Duration::from_secs(30),
+            hooks,
+        )
+        .unwrap(),
+    );
+    let observed = Arc::clone(&engine);
+    let (send, receive) = std::sync::mpsc::channel();
+    let caller = std::thread::spawn(move || {
+        let _ = send.send(observed.attach(attach_request(1, 1)));
+    });
+    probe.wait(|events| {
+        events
+            .iter()
+            .any(|(_, e)| matches!(e, Event::EnterAcquire(10)))
+    });
+    interrupted.store(true, Ordering::Release);
+    let result = receive.recv_timeout(Duration::from_millis(300));
+    let retained = engine.retain_setup_target(child).is_ok();
+    let mut exit_observed = false;
+    let until = Instant::now() + Duration::from_millis(300);
+    while Instant::now() < until {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let got = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if got == 0 && unsafe { info.si_pid() } == pid as i32 {
+            exit_observed = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // The child is dead but still waitable while the delayed attach can resume;
+    // its numeric PID cannot be assigned to a foreign process in that interval.
+    probe.release();
+    caller.join().unwrap();
+    assert!(
+        result.is_ok(),
+        "cancelled caller must return before the hold opens"
+    );
+    assert!(retained);
+    assert!(
+        exit_observed,
+        "kill child promptly without consuming its wait slot"
+    );
+    task3_cleanup(&probe, 10);
+    let until = Instant::now() + Duration::from_secs(3);
+    loop {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let got = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if got == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD) {
+            break;
+        }
+        assert!(
+            Instant::now() < until,
+            "owner must reap after Count cleanup"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }
 
 #[test]
@@ -2983,6 +3234,15 @@ fn injected(
     faults: Faults,
     barrier: Arc<CountForkBarrier>,
     deadline: Instant,
+    hooks: PrepareHooks,
+) -> Result<CountEngine, CountPrepareFailure> {
+    injected_target(input(barrier), probe, faults, deadline, hooks)
+}
+fn injected_target(
+    input: CountInput,
+    probe: Arc<Probe>,
+    faults: Faults,
+    deadline: Instant,
     mut hooks: PrepareHooks,
 ) -> Result<CountEngine, CountPrepareFailure> {
     let observed = Arc::clone(&probe);
@@ -2992,7 +3252,7 @@ fn injected(
     let observed = Arc::clone(&probe);
     hooks.mailbox_observer = Some(Arc::new(move |event| observed.event(Event::Mailbox(event))));
     CountEngine::prepare_with(
-        input(barrier),
+        input,
         CountOwnerLimits::from_allowance(18, 2).unwrap(),
         deadline,
         hooks,

@@ -239,6 +239,9 @@ pub(crate) fn hold_setup_reap(target: &mut OwnedTarget) -> std::sync::Arc<SetupR
 
 impl OwnedSetupCleanup {
     pub(crate) fn step(&mut self) -> anyhow::Result<SetupCleanupProgress> {
+        self.step_with_reap(true)
+    }
+    fn step_with_reap(&mut self, allow_reap: bool) -> anyhow::Result<SetupCleanupProgress> {
         use SetupChildState::*;
         match self.state {
             Reaped(code) => {
@@ -256,7 +259,7 @@ impl OwnedSetupCleanup {
             }
             _ => {}
         }
-        let consuming = matches!(self.state, ExitObserved(_));
+        let consuming = allow_reap && matches!(self.state, ExitObserved(_));
         #[cfg(test)]
         if consuming && let Some(hold) = self.reap_hold.as_ref().and_then(std::sync::Weak::upgrade)
         {
@@ -310,7 +313,7 @@ impl OwnedSetupCleanup {
                 reason: info.si_code,
                 status: unsafe { info.si_status() },
             };
-            if let ExitObserved(expected) = self.state {
+            if consuming && let ExitObserved(expected) = self.state {
                 if expected != receipt {
                     self.state = Ambiguous(libc::ECHILD);
                     anyhow::bail!("setup consuming exit did not match retained receipt");
@@ -2597,6 +2600,33 @@ impl OwnedTarget {
                 }
             },
         }
+    }
+
+    /// Move the one wait slot; the original handle becomes inert. A Count
+    /// owner can retain this guard until a late attachment can no longer run.
+    pub(crate) fn take_setup_target(&mut self) -> Option<Self> {
+        if !matches!(self.state, CustodyState::Stopped | CustodyState::Released) {
+            return None;
+        }
+        let setup = self.setup.take()?;
+        let state = self.state;
+        self.state = CustodyState::Detached;
+        Some(Self {
+            pid: self.pid,
+            state,
+            exit_code: self.exit_code.take(),
+            setup: Some(setup),
+        })
+    }
+
+    pub(crate) fn request_setup_abort(&mut self) -> anyhow::Result<()> {
+        if self.state == CustodyState::Stopped {
+            self.setup
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("missing setup child custody"))?
+                .step_with_reap(false)?;
+        }
+        Ok(())
     }
 
     /// End-of-observation disposition: a stopped child is terminated

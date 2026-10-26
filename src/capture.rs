@@ -1182,6 +1182,9 @@ pub trait TargetPort {
     /// Resolve custody after a setup failure (never leaves a stopped
     /// child; never kills a running application).
     fn resolve_setup_failure(&mut self) -> anyhow::Result<()>;
+    fn take_setup_target(&mut self) -> Option<target::OwnedTarget> {
+        None
+    }
     /// End-of-observation disposition: reaped status or detached pid.
     fn finish_observation(&mut self) -> anyhow::Result<target::TargetDisposition>;
     /// Identity intact (foreign pin check; owned targets are
@@ -1190,6 +1193,9 @@ pub trait TargetPort {
 }
 
 impl TargetPort for target::OwnedTarget {
+    fn take_setup_target(&mut self) -> Option<target::OwnedTarget> {
+        target::OwnedTarget::take_setup_target(self)
+    }
     fn pid(&self) -> u32 {
         target::OwnedTarget::pid(self)
     }
@@ -11163,6 +11169,24 @@ fn prepare_count_backend(
     fork_barrier: Arc<crate::count_owner::CountForkBarrier>,
     setup_deadline: Instant,
 ) -> Result<crate::count_session::LiveBackend, crate::count_owner::CountPrepareFailure> {
+    prepare_count_backend_interruptible(
+        object_bytes,
+        object_sha256,
+        target_tgid,
+        fork_barrier,
+        setup_deadline,
+        None,
+    )
+}
+
+fn prepare_count_backend_interruptible(
+    object_bytes: Arc<[u8]>,
+    object_sha256: [u8; 32],
+    target_tgid: u32,
+    fork_barrier: Arc<crate::count_owner::CountForkBarrier>,
+    setup_deadline: Instant,
+    interrupted: Option<&'static AtomicBool>,
+) -> Result<crate::count_session::LiveBackend, crate::count_owner::CountPrepareFailure> {
     prepare_count_backend_with(
         object_bytes,
         object_sha256,
@@ -11178,7 +11202,12 @@ fn prepare_count_backend(
                 )
             })
         },
-        crate::count_session::LiveBackend::prepare,
+        |input, limits, deadline| match interrupted {
+            Some(flag) => crate::count_session::LiveBackend::prepare_interruptible(
+                input, limits, deadline, flag,
+            ),
+            None => crate::count_session::LiveBackend::prepare(input, limits, deadline),
+        },
     )
 }
 // The real CountInput is formed here at the existing owner boundary. Tests

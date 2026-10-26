@@ -522,6 +522,7 @@ enum OwnerReply {
     Read(CommandResult<Arc<RawSnapshot>>),
 }
 struct SharedState {
+    retained_setup_target: Option<crate::target::OwnedTarget>,
     ordinary: OrdinaryCells<OwnerRequest, OwnerReply>,
     terminal: Option<Seal>,
     terminal_ids: protocol::IdCounter,
@@ -562,6 +563,8 @@ struct Shared {
     // an initializer or taking the owner publication mutex in Drop.
     first_trigger: AtomicU64,
     controlled_setup: bool,
+    setup_interrupt: Option<crate::capture_setup::SetupInterrupt>,
+    setup_complete: AtomicBool,
     disposal_hold: Option<Arc<setup::DisposalHold>>,
     worker: OnceLock<thread::Thread>,
     state: Mutex<SharedState>,
@@ -574,6 +577,32 @@ struct Shared {
     seal_claim_observer: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 impl Shared {
+    fn setup_cancelled(&self) -> bool {
+        !self.setup_complete.load(Ordering::Acquire)
+            && self
+                .setup_interrupt
+                .as_ref()
+                .is_some_and(|flag| flag.raised())
+    }
+    fn wait_duration(&self, remaining: std::time::Duration) -> std::time::Duration {
+        if self.setup_interrupt.is_some() && !self.setup_complete.load(Ordering::Acquire) {
+            remaining.min(std::time::Duration::from_millis(1))
+        } else {
+            remaining
+        }
+    }
+    fn cancel_locked(
+        &self,
+        state: &mut SharedState,
+        operation: CountOperation,
+        deadline: Instant,
+    ) -> CleanupTicket {
+        state.failures.record_at(
+            OwnerFailure::engine(operation, FailureClass::Cancelled),
+            self.now(),
+        );
+        self.seal_locked(state, deadline)
+    }
     fn permit_physical_close(&self, terminal: bool) {
         loop {
             let mut state = locked(&self.state);
@@ -680,10 +709,11 @@ impl Shared {
         // The sticky first-trigger distinguishes an actual setup abandonment
         // from a prior operation/explicit seal followed by later abandonment.
         let trigger = self.first_trigger.load(Ordering::Acquire);
-        if self.controlled_setup
-            && self.abandoned.load(Ordering::Acquire)
-            && trigger != 0
-            && trigger != u64::MAX
+        if self.setup_cancelled()
+            || (self.controlled_setup
+                && self.abandoned.load(Ordering::Acquire)
+                && trigger != 0
+                && trigger != u64::MAX)
         {
             FailureClass::Cancelled
         } else {
@@ -818,6 +848,47 @@ pub struct CountEngine {
     ready: Ready,
 }
 impl CountEngine {
+    pub(crate) fn retain_setup_target(
+        &self,
+        mut target: crate::target::OwnedTarget,
+    ) -> Result<anyhow::Result<()>, crate::target::OwnedTarget> {
+        if target.pid() != self.shared.target_tgid {
+            return Err(target);
+        }
+        self.shared.abandon();
+        let termination = target.request_setup_abort();
+        let mut state = locked(&self.shared.state);
+        if (state.phase == OwnerPhase::Idle && state.resources.cleanup_complete)
+            || state.retained_setup_target.is_some()
+        {
+            drop(state);
+            return Err(target);
+        }
+        // No new actor or descriptor copy: the existing owner keeps the
+        // killed child's wait slot, preventing PID reuse by a late syscall.
+        state.retained_setup_target = Some(target);
+        drop(state);
+        self.shared.worker.get().expect("prepared owner").unpark();
+        Ok(termination)
+    }
+
+    pub(crate) fn prepare_interruptible(
+        input: CountInput,
+        limits: CountOwnerLimits,
+        setup_deadline: Instant,
+        interrupted: &'static AtomicBool,
+    ) -> Result<Self, CountPrepareFailure> {
+        let mut hooks = PrepareHooks::live();
+        hooks.setup_interrupt = Some(crate::capture_setup::SetupInterrupt::Static(interrupted));
+        Self::prepare_with(
+            input,
+            limits,
+            setup_deadline,
+            hooks,
+            || LiveCountIoDriver,
+            spawn_owner,
+        )
+    }
     pub fn prepare(
         input: CountInput,
         limits: CountOwnerLimits,
@@ -942,13 +1013,21 @@ impl CountEngine {
             let retired = state.phase == OwnerPhase::Idle
                 && state.resources.cleanup_complete
                 && !state.cleanup_stranded;
-            if expired || state.terminal_candidate.is_some() || retired {
+            if expired
+                || state.terminal_candidate.is_some()
+                || retired
+                || self.shared.setup_cancelled()
+            {
                 return self.select_terminal(state, expired);
             }
             state = self
                 .shared
                 .changed
-                .wait_timeout(state, seal.deadline.saturating_duration_since(observed_at))
+                .wait_timeout(
+                    state,
+                    self.shared
+                        .wait_duration(seal.deadline.saturating_duration_since(observed_at)),
+                )
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .0;
         }
@@ -986,6 +1065,10 @@ impl CountEngine {
             && state.phase == OwnerPhase::Idle
             && state.resources.cleanup_complete
             && !state.cleanup_stranded;
+        // A handled setup signal may stop waiting while the owner still holds
+        // a syscall. Keep its actual pending custody and sticky deadline;
+        // neither an elapsed deadline nor completed cleanup is established.
+        let cancelled = !expired && self.shared.setup_cancelled();
         let mut fallback = state
             .terminal_fallback
             .take()
@@ -1048,12 +1131,16 @@ impl CountEngine {
             if !retired && data.seal.result == StopResult::NotAttempted {
                 data.failures.record(OwnerFailure::engine(
                     CountOperation::Stop,
-                    FailureClass::Deadline,
+                    if cancelled {
+                        FailureClass::Cancelled
+                    } else {
+                        FailureClass::Deadline
+                    },
                 ));
             }
             let finished = matches!(data.writers, WriterCompletion::Finished(w) if w.established_at < seal.deadline);
             if !finished {
-                data.writers = WriterCompletion::Unknown(if retired {
+                data.writers = WriterCompletion::Unknown(if retired || cancelled {
                     QuiescenceReason::Owner
                 } else {
                     QuiescenceReason::Deadline
@@ -1066,7 +1153,11 @@ impl CountEngine {
                     } else {
                         CountOperation::Close
                     },
-                    FailureClass::Deadline,
+                    if cancelled {
+                        FailureClass::Cancelled
+                    } else {
+                        FailureClass::Deadline
+                    },
                 ));
             }
             let latest = self
@@ -1120,13 +1211,19 @@ impl CountEngine {
                 cleanup_ticket: None,
             });
         }
-        self.map_command(OwnerRequest::Open(request), |reply| {
+        let result = self.map_command(OwnerRequest::Open(request), |reply| {
             if let OwnerReply::Opened(result) = reply {
                 Some(result)
             } else {
                 None
             }
-        })
+        });
+        if result.is_ok() {
+            // Capture interruption after Open uses the ordinary close/read
+            // grace, preserving positive evidence instead of aborting startup.
+            self.shared.setup_complete.store(true, Ordering::Release);
+        }
+        result
     }
     pub fn set_generation(&self, request: GenerationRequest) -> CommandResult<()> {
         self.map_command(OwnerRequest::Generation(request), |reply| {
@@ -1159,6 +1256,17 @@ impl CountEngine {
             publication: CommandPublication::NotPublished,
             cleanup_ticket,
         };
+        if self.shared.setup_cancelled() {
+            let mut state = locked(&self.shared.state);
+            let ticket = self.shared.cancel_locked(&mut state, operation, deadline);
+            drop(state);
+            self.shared.abandon();
+            return Err(refused(
+                FailureClass::Cancelled,
+                CommandCompletion::NotEntered,
+                Some(ticket),
+            ));
+        }
         if Instant::now() >= deadline {
             return Err(refused(
                 FailureClass::Deadline,
@@ -1216,6 +1324,16 @@ impl CountEngine {
             ..refused(failure, completion, cleanup_ticket)
         };
         loop {
+            if self.shared.setup_cancelled() {
+                let ticket = self.shared.cancel_locked(&mut state, operation, deadline);
+                drop(state);
+                self.shared.abandon();
+                return Err(published_refusal(
+                    FailureClass::Cancelled,
+                    CommandCompletion::Unknown,
+                    Some(ticket),
+                ));
+            }
             if Instant::now() >= deadline {
                 let ticket = self.shared.seal_locked(&mut state, deadline);
                 drop(state);
@@ -1268,7 +1386,11 @@ impl CountEngine {
             state = self
                 .shared
                 .changed
-                .wait_timeout(state, deadline.saturating_duration_since(Instant::now()))
+                .wait_timeout(
+                    state,
+                    self.shared
+                        .wait_duration(deadline.saturating_duration_since(Instant::now())),
+                )
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .0;
         }
@@ -1287,6 +1409,19 @@ impl CountEngine {
         request
             .validate()
             .map_err(|failure| refused(failure, CommandCompletion::NotEntered, None))?;
+        if self.shared.setup_cancelled() {
+            let mut state = locked(&self.shared.state);
+            let ticket = self
+                .shared
+                .cancel_locked(&mut state, CountOperation::Attach, deadline);
+            drop(state);
+            self.shared.abandon();
+            return Err(refused(
+                OwnerFailure::engine(CountOperation::Attach, FailureClass::Cancelled),
+                CommandCompletion::NotEntered,
+                Some(ticket),
+            ));
+        }
         if Instant::now() >= deadline {
             return Err(refused(
                 OwnerFailure::engine(CountOperation::Attach, FailureClass::Deadline),
@@ -1361,6 +1496,18 @@ impl CountEngine {
             ..refused(failure, completion, cleanup_ticket)
         };
         loop {
+            if self.shared.setup_cancelled() {
+                let ticket =
+                    self.shared
+                        .cancel_locked(&mut state, CountOperation::Attach, deadline);
+                drop(state);
+                self.shared.abandon();
+                return Err(published_refusal(
+                    OwnerFailure::engine(CountOperation::Attach, FailureClass::Cancelled),
+                    CommandCompletion::Unknown,
+                    Some(ticket),
+                ));
+            }
             if Instant::now() >= deadline {
                 let ticket = self.shared.seal_locked(&mut state, deadline);
                 drop(state);
@@ -1423,7 +1570,11 @@ impl CountEngine {
             state = self
                 .shared
                 .changed
-                .wait_timeout(state, deadline.saturating_duration_since(Instant::now()))
+                .wait_timeout(
+                    state,
+                    self.shared
+                        .wait_duration(deadline.saturating_duration_since(Instant::now())),
+                )
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .0;
         }
@@ -1524,6 +1675,15 @@ impl CountEngine {
         let check = || -> Result<(), CountPrepareFailure> {
             if let Some(setup) = &setup {
                 setup.journal.check(&setup.control)?;
+            }
+            if hooks
+                .setup_interrupt
+                .as_ref()
+                .is_some_and(|flag| flag.raised())
+            {
+                return Err(
+                    OwnerFailure::engine(CountOperation::Load, FailureClass::Cancelled).into(),
+                );
             }
             if Instant::now() >= deadline {
                 return Err(
@@ -1632,11 +1792,14 @@ impl CountEngine {
             trigger_origin,
             first_trigger: AtomicU64::new(0),
             controlled_setup: setup.is_some(),
+            setup_interrupt: hooks.setup_interrupt.clone(),
+            setup_complete: AtomicBool::new(false),
             disposal_hold: setup
                 .as_ref()
                 .and_then(|setup| setup.journal.disposal_hold()),
             worker: OnceLock::new(),
             state: Mutex::new(SharedState {
+                retained_setup_target: None,
                 ordinary,
                 terminal: None,
                 terminal_ids: protocol::IdCounter::default(),
@@ -1739,6 +1902,11 @@ impl CountEngine {
                 .as_ref()
                 .and_then(|s| s.journal.check(&s.control).err())
                 .or_else(|| {
+                    shared.setup_cancelled().then(|| {
+                        OwnerFailure::engine(CountOperation::Load, FailureClass::Cancelled)
+                    })
+                })
+                .or_else(|| {
                     (setup.is_some() && shared.abandoned.load(Ordering::Acquire)).then(|| {
                         OwnerFailure::engine(CountOperation::Load, FailureClass::Cancelled)
                     })
@@ -1832,6 +2000,7 @@ enum CountPrepareStage {
     Allocation,
 }
 struct PrepareHooks {
+    setup_interrupt: Option<crate::capture_setup::SetupInterrupt>,
     #[cfg(test)]
     stage_observer: Option<Arc<dyn Fn(CountPrepareStage) + Send + Sync>>,
     domain: EvidenceDomain,
@@ -1867,6 +2036,7 @@ impl PrepareHooks {
     }
     fn live() -> Self {
         Self {
+            setup_interrupt: None,
             #[cfg(test)]
             stage_observer: None,
             domain: EvidenceDomain::Live,
@@ -2255,6 +2425,18 @@ fn owner_main<D, F>(
     let complete = cleanup.is_ok() && locked(&shared.state).resources.cleanup_complete;
     if complete {
         shared.cleanup_progress(&registry, OwnerPhase::Idle);
+        let target = locked(&shared.state).retained_setup_target.take();
+        if let Some(mut target) = target
+            && let Err(error) = target.resolve_setup_failure()
+        {
+            let failure = error.downcast_ref::<std::io::Error>().map_or_else(
+                || OwnerFailure::engine(CountOperation::Cleanup, FailureClass::Io),
+                |error| OwnerFailure::io(CountOperation::Cleanup, ResourceId::Engine, error),
+            );
+            locked(&shared.state)
+                .failures
+                .record_at(failure, shared.now());
+        }
     } else {
         let mut state = locked(&shared.state);
         state.cleanup_stranded |= state.resources.resources.iter().any(|resource| {

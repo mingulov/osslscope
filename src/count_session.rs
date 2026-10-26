@@ -151,6 +151,12 @@ impl CountLink for LinkToken {
 /// Timed, data-only controller port. No count descriptor crosses this boundary.
 pub trait CountBackend {
     type Link: CountLink;
+    fn retain_setup_target(
+        &mut self,
+        target: crate::target::OwnedTarget,
+    ) -> Result<anyhow::Result<()>, crate::target::OwnedTarget> {
+        Err(target)
+    }
     fn ready(&self) -> &Ready;
     fn attach(&mut self, request: AttachRequest) -> CommandResult<AttachAck<Self::Link>>;
     fn open_window(&mut self, request: OpenRequest) -> CommandResult<OpenReceipt>;
@@ -2912,6 +2918,16 @@ pub struct LiveBackend {
     engine: CountEngine,
 }
 impl LiveBackend {
+    pub(crate) fn prepare_interruptible(
+        input: CountInput,
+        limits: CountOwnerLimits,
+        deadline: Instant,
+        interrupted: &'static std::sync::atomic::AtomicBool,
+    ) -> Result<Self, CountPrepareFailure> {
+        CountEngine::prepare_interruptible(input, limits, deadline, interrupted)
+            .map(|engine| Self { engine })
+    }
+
     #[cfg(test)]
     pub(crate) fn from_setup_fixture(engine: CountEngine) -> Self {
         Self { engine }
@@ -2938,6 +2954,12 @@ impl LiveBackend {
 }
 impl CountBackend for LiveBackend {
     type Link = LinkToken;
+    fn retain_setup_target(
+        &mut self,
+        target: crate::target::OwnedTarget,
+    ) -> Result<anyhow::Result<()>, crate::target::OwnedTarget> {
+        self.engine.retain_setup_target(target)
+    }
     fn ready(&self) -> &Ready {
         self.engine.ready()
     }

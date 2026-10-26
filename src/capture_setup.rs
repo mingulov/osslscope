@@ -21,7 +21,7 @@ pub(crate) enum SetupInterrupt {
     Owned(Arc<AtomicBool>),
 }
 impl SetupInterrupt {
-    fn raised(&self) -> bool {
+    pub(crate) fn raised(&self) -> bool {
         match self {
             Self::Static(flag) => flag.load(Ordering::Acquire),
             #[cfg(test)]

@@ -114,12 +114,13 @@ pub(crate) fn run_profiled_before(
         crate::profile::admit_child_pid_namespace(child.pid())?;
         profile.verify_backing()?;
         check()?;
-        super::prepare_count_backend(
+        super::prepare_count_backend_interruptible(
             Arc::clone(&count.object_bytes),
             count.object_sha256,
             child.pid(),
             Arc::new(crate::count_owner::CountForkBarrier::new()),
             deadline,
+            Some(&super::INTERRUPTED),
         )
         .map_err(anyhow::Error::from)
     })();
@@ -308,9 +309,20 @@ fn observe_profiled<T: TargetPort, B: CountBackend, C: ClockPort>(
                 grace: ctx.cfg.grace,
                 reason: CloseReason::SetupAbort,
             });
-            target
-                .resolve_setup_failure()
-                .context("preview setup child cleanup failed")?;
+            if let Some(owned) = target.take_setup_target() {
+                match count.backend_mut().retain_setup_target(owned) {
+                    Ok(termination) => {
+                        termination.context("preview setup child termination failed")?
+                    }
+                    Err(mut owned) => owned
+                        .resolve_setup_failure()
+                        .context("preview setup child cleanup failed")?,
+                }
+            } else {
+                target
+                    .resolve_setup_failure()
+                    .context("preview setup child cleanup failed")?;
+            }
             return Err(error);
         }
     };
