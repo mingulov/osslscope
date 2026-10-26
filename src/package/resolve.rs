@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Complete, retained installed bundle admission.
 
+pub use super::dev::{
+    AdmittedIdentity, CustodyArtifactSnapshot, VerifiedDevelopment, resolve_dev_bundle,
+};
 use super::{
     PackageError,
     records::{
@@ -52,20 +55,39 @@ impl VerifiedBundle {
 
 fn admit_roles<O, V>(
     entries: &[RoleEntry],
-    mut open: O,
-    mut validate: V,
+    open: O,
+    validate: V,
 ) -> Result<BTreeMap<Role, RoleSnapshot>, PackageError>
 where
     O: FnMut(&RelativePath) -> Result<OpenedFile, PackageError>,
     V: FnMut(Role, &[u8]) -> Result<(), PackageError>,
 {
-    if entries.len() != 3 {
+    admit_roles_version(entries, open, validate, super::records::RecordVersion::V1)
+}
+fn admit_roles_version<O, V>(
+    entries: &[RoleEntry],
+    mut open: O,
+    mut validate: V,
+    version: super::records::RecordVersion,
+) -> Result<BTreeMap<Role, RoleSnapshot>, PackageError>
+where
+    O: FnMut(&RelativePath) -> Result<OpenedFile, PackageError>,
+    V: FnMut(Role, &[u8]) -> Result<(), PackageError>,
+{
+    if entries.len()
+        != if version == super::records::RecordVersion::V1 {
+            3
+        } else {
+            4
+        }
+    {
         return Err(PackageError::invalid("v1 requires exactly three roles"));
     }
     let mut seen = std::collections::BTreeSet::new();
     let mut declared_total = 0u64;
     for entry in entries {
-        if !seen.insert(entry.role)
+        if (version == super::records::RecordVersion::V1 && entry.role == Role::Identity)
+            || !seen.insert(entry.role)
             || entry.file.as_str() != entry.role.file_name()
             || entry.bytes == 0
             || entry.bytes > ROLE_TOTAL_LIMIT
@@ -197,7 +219,7 @@ where
         ));
     }
 
-    let (wire_abi, policy_digest) = compiled_loader_identity()?;
+    let (wire_abi, policy_digest) = compiled_loader_identity(super::records::RecordVersion::V1)?;
     if contract.wire_abi != wire_abi || contract.loader_contract_sha256 != policy_digest {
         return Err(PackageError::invalid(
             "compiled wire/loader policy identity mismatch",
@@ -222,7 +244,9 @@ where
     })
 }
 
-pub(crate) fn compiled_loader_identity() -> Result<(u32, Digest), PackageError> {
+pub fn compiled_loader_identity(
+    version: super::records::RecordVersion,
+) -> Result<(u32, Digest), PackageError> {
     let count = osslscope_ebpf_common::COUNT_ABI_VERSION;
     let discovery = osslscope_ebpf_common::DISCOVERY_ABI_VERSION;
     if count == 0 || count != discovery {
@@ -230,7 +254,10 @@ pub(crate) fn compiled_loader_identity() -> Result<(u32, Digest), PackageError> 
             "compiled Count/Discovery wire ABI disagreement",
         ));
     }
-    let bytes = canonical_inventory_bytes()?;
+    let bytes = match version {
+        super::records::RecordVersion::V1 => canonical_inventory_bytes()?,
+        super::records::RecordVersion::V2 => canonical_json_bytes(&inventory_v2()?)?,
+    };
     Ok((count, sha256(&bytes)))
 }
 
@@ -275,6 +302,7 @@ fn role_inventory(
         Role::Harvest => "harvest",
         Role::Count => "count",
         Role::Members => "members",
+        Role::Identity => "identity",
     };
     Ok(json!({
         "role": role_name, "file": role.file_name(),
@@ -381,6 +409,51 @@ fn inventory_value() -> Result<serde_json::Value, PackageError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn identity_v2_policy_inventory_and_shapes() {
+        let value = inventory_v2().unwrap();
+        assert_eq!(value["identity_abi"], 4);
+        assert_eq!(value["wire_abi"], osslscope_ebpf_common::COUNT_ABI_VERSION);
+        for (i, want) in [20, 13, 21, 6].into_iter().enumerate() {
+            assert_eq!(value["roles"][i]["maps"].as_array().unwrap().len(), want);
+        }
+        assert_eq!(value["roles"][3]["program_type"], 17);
+        assert_eq!(value["roles"][3]["programs"].as_array().unwrap().len(), 4);
+        assert_eq!(value["read_helper_guard"]["structural_reads"], 9);
+        assert_eq!(value["read_helper_guard"]["structural_bytes"], 68);
+        assert_eq!(value["read_helper_guard"]["profile_before_read"], true);
+        let policy = compiled_loader_identity(crate::package::records::RecordVersion::V2).unwrap();
+        assert_eq!(policy.1, sha256(&canonical_json_bytes(&value).unwrap()));
+        for role in [Role::Harvest, Role::Count, Role::Members, Role::Identity] {
+            let bytes = package_fixtures::identity_v2_bpf(role);
+            crate::discovery::onboard::check_v2_role_compatible(role, &bytes).unwrap();
+            assert!(
+                crate::discovery::onboard::check_installed_role_compatible(role, &bytes).is_err()
+            );
+        }
+        let bytes = package_fixtures::identity_v2_bpf(Role::Identity);
+        let elf = goblin::elf::Elf::parse(&bytes).unwrap();
+        let maps = elf
+            .section_headers
+            .iter()
+            .find(|s| elf.shdr_strtab.get_at(s.sh_name) == Some("maps"))
+            .unwrap()
+            .sh_offset as usize;
+        let mut changed = bytes.clone();
+        changed[maps + 8] = 64;
+        assert!(
+            crate::discovery::onboard::check_v2_role_compatible(Role::Identity, &changed).is_err()
+        );
+        assert!(
+            crate::loader::prepare(
+                &bytes,
+                &crate::loader::IDENTITY_MAPS,
+                &crate::loader::IDENTITY_PROGS
+            )
+            .is_err()
+        );
+    }
+
     #[allow(dead_code)]
     mod package_fixtures {
         use crate as osslscope;
@@ -482,7 +555,8 @@ mod tests {
         assert_eq!(host.prefix.path(), executing_prefix.as_path());
         assert_eq!(host.executable.locator, host_path);
         let mut fixture = package_fixtures::records_fixture();
-        let (wire, policy) = compiled_loader_identity().unwrap();
+        let (wire, policy) =
+            compiled_loader_identity(crate::package::records::RecordVersion::V1).unwrap();
         fixture.contract.wire_abi = wire;
         fixture.contract.loader_contract_sha256 = policy;
         for role in &mut fixture.contract.roles {
@@ -670,6 +744,11 @@ mod tests {
             ),
             Err(PackageError::Unavailable { .. })
         ));
+        let selected = crate::package::commands::AdmittedSet::Installed(Box::new(admitted));
+        assert!(
+            selected.role(Role::Identity).is_none(),
+            "v1 has no identity role"
+        );
     }
 
     #[test]
@@ -784,7 +863,8 @@ mod tests {
 
     #[test]
     fn compiled_identity_covers_all_current_role_tables_and_wire() {
-        let (wire, digest) = compiled_loader_identity().unwrap();
+        let (wire, digest) =
+            compiled_loader_identity(crate::package::records::RecordVersion::V1).unwrap();
         assert_eq!(wire, 2);
         let bytes = canonical_inventory_bytes().unwrap();
         assert_eq!(sha256(&bytes), digest);
@@ -1186,4 +1266,140 @@ mod tests {
         ));
         assert!(crate::discovery::onboard::validate_installed_count_prepared(&valid).is_ok());
     }
+}
+
+fn inventory_v2() -> Result<serde_json::Value, PackageError> {
+    use serde_json::json;
+    let mut value = inventory_value()?;
+    value["schema"] = json!("osslscope-loader-policy-v2");
+    value["identity_abi"] = json!(4);
+    value["custody_protocol"] = json!(1);
+    value["generic"]["programs"]["selection"] = json!("EXACT_TABLE_ROOTS");
+    value["generic"]["programs"]["unknown_executable_sections"] = json!("REJECT");
+    value["generic"]["programs"]["raw_sections"] = json!({"role":"identity","exact":["raw_tracepoint/task_newtask","raw_tracepoint/sched_process_exit","raw_tracepoint/sys_enter","raw_tracepoint/sched_process_exec"],"other_roles":"FORBIDDEN"});
+    value["read_helper_guard"] = json!({"structural_reads":9,"structural_bytes":68,"profile_before_read":true,"identity_activation":"UNAVAILABLE"});
+    for (index, role) in [Role::Harvest, Role::Count, Role::Members]
+        .into_iter()
+        .enumerate()
+    {
+        value["roles"][index]["maps"]=json!(crate::loader::v2_maps(role).iter().map(|m|json!({"name":m.name,"map_type":m.map_type,"key_size":m.key_size,"value_size":m.value_size,"max_entries":m.max_entries,"flags":m.flags})).collect::<Vec<_>>());
+    }
+    value["roles"][1]["extra"]["map_count"] = json!(13);
+    let identity = json!({"role":"identity","file":"osslscope-identity","program_type":17,"maps":crate::loader::IDENTITY_MAPS.iter().map(|m|json!({"name":m.name,"map_type":m.map_type,"key_size":m.key_size,"value_size":m.value_size,"max_entries":m.max_entries,"flags":m.flags})).collect::<Vec<_>>(),"programs":crate::loader::IDENTITY_PROGS.iter().map(|p|json!({"name":p.name,"section":p.section})).collect::<Vec<_>>(),"extra":{"shared_maps":6,"identity_abi":4,"custody_protocol":1,"service_custody_import":"FORBIDDEN"}});
+    value["roles"].as_array_mut().unwrap().push(identity);
+    Ok(value)
+}
+
+/// Installed v2 retains all four roles under the same executing-host trust root.
+pub struct VerifiedIdentityBundle {
+    pub(crate) metadata: AdmittedMetadata,
+    pub(crate) data: super::dev::VerifiedDevelopment,
+}
+pub fn resolve_installed_identity_bundle(
+    host: &HostIdentity,
+    embedded: &[u8],
+) -> Result<VerifiedIdentityBundle, PackageError> {
+    use super::records::{BundleContractV2, PayloadManifestV2, verify_metadata_v2};
+    let contract: BundleContractV2 = parse_canonical(embedded)?;
+    if contract.product_version != env!("CARGO_PKG_VERSION")
+        || contract.host_profile.target != env!("OSSL_PACKAGE_HOST_TARGET")
+    {
+        return Err(PackageError::invalid(
+            "installed v2 executing profile mismatch",
+        ));
+    }
+    let id = sha256(embedded);
+    let bundle = host
+        .prefix
+        .open_dir_relative(&RelativePath::new(format!("lib/osslscope/bundles/{id}"))?)?;
+    let read = |name: &str, limit| -> Result<_, PackageError> {
+        let f = bundle.open_relative(&RelativePath::new(name)?)?;
+        let s = snapshot(&f, limit)?;
+        Ok((f.locator, s))
+    };
+    let (_, on_disk) = read("bundle-contract.json", RECORD_LIMIT)?;
+    if on_disk.bytes.as_ref() != embedded {
+        return Err(PackageError::invalid(
+            "installed v2 embedded/contract mismatch",
+        ));
+    }
+    let (_, payload) = read("payload-manifest.json", RECORD_LIMIT)?;
+    let payload: PayloadManifestV2 = parse_canonical(&payload.bytes)?;
+    let (_, input) = read("build-inputs.json", RECORD_LIMIT)?;
+    let metadata = verify_metadata_v2(&contract, &payload, input.bytes)?;
+    let (wire, digest) = compiled_loader_identity(super::records::RecordVersion::V2)?;
+    if contract.wire_abi != wire || contract.loader_contract_sha256 != digest {
+        return Err(PackageError::invalid("compiled v2 loader policy mismatch"));
+    }
+    if payload.host.path.as_str() != "bin/osslscope" || payload.host.bytes > HOST_LIMIT {
+        return Err(PackageError::invalid("installed v2 host path/bound"));
+    }
+    let current = snapshot(&host.executable, HOST_LIMIT)?;
+    if current.sha256 != payload.host.sha256 || current.bytes.len() as u64 != payload.host.bytes {
+        return Err(PackageError::invalid(
+            "executing v2 host length/hash mismatch",
+        ));
+    }
+    let elf = goblin::elf::Elf::parse(&current.bytes)
+        .map_err(|_| PackageError::invalid("executing v2 host ELF"))?;
+    if elf.header.e_machine != payload.host.elf_machine
+        || elf.header.e_machine != 62
+        || crate::discovery::elf::read_build_id(&current.bytes) != payload.host.elf_build_id
+        || crate::package::build::extract_host_contract(&current.bytes)?
+            != super::records::AdmittedContract::V2(contract.clone())
+    {
+        return Err(PackageError::invalid(
+            "executing v2 host identity/embedding mismatch",
+        ));
+    }
+    let (locator, custody) = read("osslscope-identity-custodian", HOST_LIMIT)?;
+    let e = &contract.custody_host;
+    if custody.sha256 != e.sha256 || custody.bytes.len() as u64 != e.bytes {
+        return Err(PackageError::invalid(
+            "installed custody hash/length mismatch",
+        ));
+    }
+    let elf = goblin::elf::Elf::parse(&custody.bytes)
+        .map_err(|_| PackageError::invalid("installed custody ELF"))?;
+    if elf.header.e_machine != e.elf_machine
+        || crate::discovery::elf::read_build_id(&custody.bytes) != e.elf_build_id
+        || elf
+            .section_headers
+            .iter()
+            .any(|s| elf.shdr_strtab.get_at(s.sh_name) == Some(".osslscope.bundle_contract"))
+    {
+        return Err(PackageError::invalid(
+            "installed custody ELF identity/descriptor mismatch",
+        ));
+    }
+    let artifact = super::dev::CustodyArtifactSnapshot {
+        locator,
+        identity: custody.after,
+        sha256: custody.sha256,
+        length: custody.bytes.len() as u64,
+    };
+    drop(custody.bytes);
+    let custody = artifact;
+    let roles = admit_roles_version(
+        &contract.roles,
+        |relative| bundle.open_relative(relative),
+        crate::discovery::onboard::check_v2_role_compatible,
+        super::records::RecordVersion::V2,
+    )?;
+    let object = &roles[&Role::Identity];
+    let identity = super::dev::AdmittedIdentity {
+        object_bytes: Arc::clone(&object.bytes),
+        object_sha256: object.sha256,
+        profile_sha256: contract.identity_profile_sha256,
+        custody,
+        custody_protocol: contract.custody_protocol,
+    };
+    Ok(VerifiedIdentityBundle {
+        metadata,
+        data: super::dev::VerifiedDevelopment {
+            contract: Box::new(contract),
+            identity: Box::new(identity),
+            roles,
+        },
+    })
 }

@@ -152,6 +152,7 @@ pub enum Role {
     Harvest,
     Count,
     Members,
+    Identity,
 }
 impl Role {
     pub fn file_name(self) -> &'static str {
@@ -159,6 +160,7 @@ impl Role {
             Self::Harvest => "osslscope-harvest",
             Self::Count => "osslscope-count",
             Self::Members => "osslscope-members",
+            Self::Identity => "osslscope-identity",
         }
     }
 }
@@ -347,7 +349,8 @@ fn check_roles(roles: &[RoleEntry]) -> Result<(), PackageError> {
         return Err(PackageError::invalid("v1 requires exactly three roles"));
     }
     for entry in roles {
-        if !seen.insert(entry.role)
+        if entry.role == Role::Identity
+            || !seen.insert(entry.role)
             || entry.file.as_str() != entry.role.file_name()
             || entry.bytes == 0
         {
@@ -684,5 +687,335 @@ pub fn verify_metadata(
         input_id,
         contract_id,
         payload_id: sha256(&canonical_bytes(payload)),
+    })
+}
+
+// V2 identity admission records; recipe versions remain independent.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuildInputsV2 {
+    pub schema: String,
+    pub source: SourceIdentity,
+    pub product_version: String,
+    pub package_epoch: u32,
+    pub package_revision: u32,
+    pub source_epoch: u64,
+    pub host_profile: HostProfile,
+    pub locks: LockIdentity,
+    pub recipe: RecipeIdentity,
+    pub tools: ToolInventory,
+    pub jobs: u16,
+    pub argv: Vec<String>,
+    pub environment: Vec<EnvironmentEntry>,
+    pub offline_inventory_sha256: Digest,
+    pub identity_abi: u32,
+    pub custody_protocol: u32,
+    pub identity_profile_sha256: Digest,
+}
+impl BuildInputsV2 {
+    pub fn legacy_fields(&self) -> BuildInputs {
+        BuildInputs {
+            schema: "osslscope-build-inputs-v1".into(),
+            source: self.source.clone(),
+            product_version: self.product_version.clone(),
+            package_epoch: self.package_epoch,
+            package_revision: self.package_revision,
+            source_epoch: self.source_epoch,
+            host_profile: self.host_profile.clone(),
+            locks: self.locks.clone(),
+            recipe: self.recipe.clone(),
+            tools: self.tools.clone(),
+            jobs: self.jobs,
+            argv: self.argv.clone(),
+            environment: self.environment.clone(),
+            offline_inventory_sha256: self.offline_inventory_sha256,
+        }
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BundleContractV2 {
+    pub schema: String,
+    pub input_id: Digest,
+    pub source: SourceIdentity,
+    pub product_version: String,
+    pub host_profile: HostProfile,
+    pub wire_abi: u32,
+    pub loader_contract_sha256: Digest,
+    pub roles: Vec<RoleEntry>,
+    pub identity_abi: u32,
+    pub custody_protocol: u32,
+    pub identity_profile_sha256: Digest,
+    pub custody_host: HostEntry,
+}
+impl BundleContractV2 {
+    pub fn legacy_fields(&self) -> BundleContract {
+        BundleContract {
+            schema: "osslscope-bundle-contract-v1".into(),
+            input_id: self.input_id,
+            source: self.source.clone(),
+            product_version: self.product_version.clone(),
+            host_profile: self.host_profile.clone(),
+            wire_abi: self.wire_abi,
+            loader_contract_sha256: self.loader_contract_sha256,
+            roles: self
+                .roles
+                .iter()
+                .filter(|e| e.role != Role::Identity)
+                .cloned()
+                .collect(),
+        }
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PayloadManifestV2 {
+    pub schema: String,
+    pub bundle_id: Digest,
+    pub contract: ContentEntry,
+    pub input_id: Digest,
+    pub build_inputs: ContentEntry,
+    pub host: HostEntry,
+    pub roles: Vec<RoleEntry>,
+    pub source: SourceIdentity,
+    pub product_version: String,
+    pub host_profile: HostProfile,
+    pub locks: LockIdentity,
+    pub recipe: RecipeIdentity,
+    pub tools: ToolInventory,
+    pub install: InstallDeclaration,
+    pub docs: Vec<ContentEntry>,
+    pub licenses: Vec<ContentEntry>,
+    pub notices: Vec<ContentEntry>,
+    pub sbom: ContentEntry,
+    pub identity_abi: u32,
+    pub custody_protocol: u32,
+    pub identity_profile_sha256: Digest,
+    pub custody_host: HostEntry,
+}
+impl PayloadManifestV2 {
+    pub fn legacy_fields(&self) -> PayloadManifest {
+        PayloadManifest {
+            schema: "osslscope-payload-manifest-v1".into(),
+            bundle_id: self.bundle_id,
+            contract: self.contract.clone(),
+            input_id: self.input_id,
+            build_inputs: self.build_inputs.clone(),
+            host: self.host.clone(),
+            roles: self
+                .roles
+                .iter()
+                .filter(|e| e.role != Role::Identity)
+                .cloned()
+                .collect(),
+            source: self.source.clone(),
+            product_version: self.product_version.clone(),
+            host_profile: self.host_profile.clone(),
+            locks: self.locks.clone(),
+            recipe: self.recipe.clone(),
+            tools: self.tools.clone(),
+            install: self.install.clone(),
+            docs: self.docs.clone(),
+            licenses: self.licenses.clone(),
+            notices: self.notices.clone(),
+            sbom: self.sbom.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DevAdmissionV2 {
+    pub schema: String,
+    pub build_inputs: ContentEntry,
+    pub contract: ContentEntry,
+    pub host: HostEntry,
+    pub custody_host: HostEntry,
+    pub roles: Vec<RoleEntry>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecordVersion {
+    V1,
+    V2,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum AdmittedContract {
+    V1(BundleContract),
+    V2(BundleContractV2),
+}
+impl sealed::Sealed for AdmittedContract {}
+impl PackageRecord for AdmittedContract {
+    fn validate(&self) -> Result<(), PackageError> {
+        match self {
+            Self::V1(c) => c.validate(),
+            Self::V2(c) => c.validate(),
+        }
+    }
+}
+impl AdmittedContract {
+    pub fn version(&self) -> RecordVersion {
+        match self {
+            Self::V1(_) => RecordVersion::V1,
+            Self::V2(_) => RecordVersion::V2,
+        }
+    }
+}
+fn identity_fields(abi: u32, protocol: u32) -> Result<(), PackageError> {
+    if abi != 4 || protocol != 1 {
+        return Err(PackageError::invalid(
+            "unsupported identity ABI/custody protocol",
+        ));
+    }
+    Ok(())
+}
+fn check_roles_v2(roles: &[RoleEntry]) -> Result<(), PackageError> {
+    if roles.len() != 4 || !roles.iter().any(|r| r.role == Role::Identity) {
+        return Err(PackageError::invalid("v2 requires exactly four roles"));
+    }
+    let legacy: Vec<_> = roles
+        .iter()
+        .filter(|r| r.role != Role::Identity)
+        .cloned()
+        .collect();
+    check_roles(&legacy)?;
+    let identity = roles.iter().find(|r| r.role == Role::Identity).unwrap();
+    if identity.file.as_str() != Role::Identity.file_name() || identity.bytes == 0 {
+        return Err(PackageError::invalid("invalid identity role"));
+    }
+    Ok(())
+}
+fn check_custody(host: &HostEntry) -> Result<(), PackageError> {
+    if host.path.as_str() != "osslscope-identity-custodian"
+        || host.bytes == 0
+        || host.elf_machine != 62
+    {
+        return Err(PackageError::invalid("invalid custody host"));
+    }
+    Ok(())
+}
+impl sealed::Sealed for BuildInputsV2 {}
+impl PackageRecord for BuildInputsV2 {
+    fn validate(&self) -> Result<(), PackageError> {
+        check_schema(&self.schema, "osslscope-build-inputs-v2")?;
+        identity_fields(self.identity_abi, self.custody_protocol)?;
+        self.legacy_fields().validate()
+    }
+}
+impl sealed::Sealed for BundleContractV2 {}
+impl PackageRecord for BundleContractV2 {
+    fn validate(&self) -> Result<(), PackageError> {
+        check_schema(&self.schema, "osslscope-bundle-contract-v2")?;
+        identity_fields(self.identity_abi, self.custody_protocol)?;
+        check_roles_v2(&self.roles)?;
+        check_custody(&self.custody_host)?;
+        self.legacy_fields().validate()
+    }
+}
+impl sealed::Sealed for PayloadManifestV2 {}
+impl PackageRecord for PayloadManifestV2 {
+    fn validate(&self) -> Result<(), PackageError> {
+        check_schema(&self.schema, "osslscope-payload-manifest-v2")?;
+        identity_fields(self.identity_abi, self.custody_protocol)?;
+        check_roles_v2(&self.roles)?;
+        check_custody(&self.custody_host)?;
+        let legacy = self.legacy_fields();
+        legacy.validate()?;
+        let mut paths = HashSet::new();
+        for path in std::iter::once(self.contract.path.as_str())
+            .chain(std::iter::once(self.build_inputs.path.as_str()))
+            .chain(std::iter::once(self.host.path.as_str()))
+            .chain(std::iter::once(self.custody_host.path.as_str()))
+            .chain(self.roles.iter().map(|r| r.file.as_str()))
+            .chain(
+                self.docs
+                    .iter()
+                    .chain(&self.licenses)
+                    .chain(&self.notices)
+                    .map(|e| e.path.as_str()),
+            )
+            .chain(std::iter::once(self.sbom.path.as_str()))
+        {
+            if !paths.insert(path) {
+                return Err(PackageError::invalid("v2 payload repeats path"));
+            }
+        }
+        Ok(())
+    }
+}
+impl sealed::Sealed for DevAdmissionV2 {}
+impl PackageRecord for DevAdmissionV2 {
+    fn validate(&self) -> Result<(), PackageError> {
+        check_schema(&self.schema, "osslscope-dev-admission-v2")?;
+        check_content(&self.build_inputs)?;
+        check_content(&self.contract)?;
+        check_custody(&self.custody_host)?;
+        check_roles_v2(&self.roles)?;
+        if self.build_inputs.path.as_str() != "build-inputs.json"
+            || self.contract.path.as_str() != "bundle-contract.json"
+            || self.host.path.as_str() != "osslscope"
+            || self.host.bytes == 0
+            || self.host.elf_machine != 62
+        {
+            return Err(PackageError::invalid("invalid dev admission paths/host"));
+        }
+        Ok(())
+    }
+}
+pub fn verify_contract_v2(
+    c: &BundleContractV2,
+    i: &BuildInputsV2,
+    input_bytes: &[u8],
+) -> Result<(), PackageError> {
+    c.validate()?;
+    i.validate()?;
+    if c.input_id != sha256(input_bytes)
+        || c.source != i.source
+        || c.product_version != i.product_version
+        || c.host_profile != i.host_profile
+        || c.identity_abi != i.identity_abi
+        || c.custody_protocol != i.custody_protocol
+        || c.identity_profile_sha256 != i.identity_profile_sha256
+    {
+        return Err(PackageError::invalid("v2 input/contract binding mismatch"));
+    }
+    Ok(())
+}
+pub fn verify_metadata_v2(
+    c: &BundleContractV2,
+    p: &PayloadManifestV2,
+    input_bytes: Arc<[u8]>,
+) -> Result<AdmittedMetadata, PackageError> {
+    let i: BuildInputsV2 = parse_canonical(&input_bytes)?;
+    verify_contract_v2(c, &i, &input_bytes)?;
+    p.validate()?;
+    let cb = canonical_bytes(c);
+    let id = sha256(&cb);
+    if p.input_id != c.input_id
+        || p.build_inputs.sha256 != c.input_id
+        || p.build_inputs.bytes != input_bytes.len() as u64
+        || p.bundle_id != id
+        || p.contract.sha256 != id
+        || p.contract.bytes != cb.len() as u64
+        || p.source != i.source
+        || p.product_version != i.product_version
+        || p.host_profile != i.host_profile
+        || p.locks != i.locks
+        || p.recipe != i.recipe
+        || p.tools != i.tools
+        || p.roles != c.roles
+        || p.custody_host != c.custody_host
+        || p.identity_abi != c.identity_abi
+        || p.custody_protocol != c.custody_protocol
+        || p.identity_profile_sha256 != c.identity_profile_sha256
+    {
+        return Err(PackageError::invalid("v2 payload binding mismatch"));
+    }
+    Ok(AdmittedMetadata {
+        input_bytes,
+        inputs: i.legacy_fields(),
+        input_id: c.input_id,
+        contract_id: id,
+        payload_id: sha256(&canonical_bytes(p)),
     })
 }

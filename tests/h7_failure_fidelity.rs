@@ -1054,6 +1054,7 @@ mod g1_host {
             harvest_object: None,
             count_object: None,
             members_object: None,
+            dev_bundle: None,
             provider: None,
             builtin: false,
             table: None,

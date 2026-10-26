@@ -69,6 +69,136 @@ impl ProgSpec {
     }
 }
 
+/// Adopted v4 shared declarations. Admission only; no load/attach authority.
+pub const IDENTITY_MAPS: [MapSpec; 6] = [
+    MapSpec {
+        name: "ID_CONTROL",
+        map_type: 2,
+        key_size: 4,
+        value_size: 128,
+        max_entries: 1,
+        flags: 1024,
+    },
+    MapSpec {
+        name: "ID_GROUP",
+        map_type: 1,
+        key_size: 16,
+        value_size: 64,
+        max_entries: 2,
+        flags: 0,
+    },
+    MapSpec {
+        name: "ID_CLAIM",
+        map_type: 1,
+        key_size: 8,
+        value_size: 32,
+        max_entries: 8192,
+        flags: 0,
+    },
+    MapSpec {
+        name: "ID_TASK",
+        map_type: 1,
+        key_size: 8,
+        value_size: 64,
+        max_entries: 8192,
+        flags: 0,
+    },
+    MapSpec {
+        name: "ID_IMAGE",
+        map_type: 1,
+        key_size: 8,
+        value_size: 64,
+        max_entries: 8192,
+        flags: 0,
+    },
+    MapSpec {
+        name: "ID_AUDIT",
+        map_type: 2,
+        key_size: 4,
+        value_size: 64,
+        max_entries: 1,
+        flags: 0,
+    },
+];
+pub const IDENTITY_PROGS: [ProgSpec; 4] = [
+    ProgSpec {
+        name: "identity_newtask",
+        section: "raw_tracepoint/task_newtask",
+    },
+    ProgSpec {
+        name: "identity_exit",
+        section: "raw_tracepoint/sched_process_exit",
+    },
+    ProgSpec {
+        name: "identity_sys_enter",
+        section: "raw_tracepoint/sys_enter",
+    },
+    ProgSpec {
+        name: "identity_exec",
+        section: "raw_tracepoint/sched_process_exec",
+    },
+];
+pub(crate) fn v2_maps(role: crate::package::records::Role) -> Vec<MapSpec> {
+    use crate::package::records::Role;
+    let mut maps = match role {
+        Role::Harvest => HARVEST_MAPS.to_vec(),
+        Role::Count => COUNT_MAPS.to_vec(),
+        Role::Members => MEMBER_MAPS.to_vec(),
+        Role::Identity => Vec::new(),
+    };
+    maps.extend(IDENTITY_MAPS);
+    maps
+}
+pub(crate) fn prepare_identity_role(
+    role: crate::package::records::Role,
+    obj: &[u8],
+) -> anyhow::Result<Prepared> {
+    use crate::package::records::Role;
+    let programs: &[ProgSpec] = match role {
+        Role::Harvest => &HARVEST_PROGS,
+        Role::Count => &COUNT_PROGS,
+        Role::Members => &MEMBER_PROGS,
+        Role::Identity => &IDENTITY_PROGS,
+    };
+    let raw = role == Role::Identity;
+    if role == Role::Count {
+        validate_count_object(obj)?;
+    }
+    let elf = goblin::elf::Elf::parse(obj)?;
+    for section in &elf.section_headers {
+        let name = elf.shdr_strtab.get_at(section.sh_name).unwrap_or("");
+        if section.sh_flags & 4 != 0
+            && name != ".text"
+            && !programs.iter().any(|p| p.section == name)
+        {
+            anyhow::bail!("v2 unselected executable section");
+        }
+    }
+    for symbol in &elf.syms {
+        if !symbol.is_function() {
+            continue;
+        }
+        let Some(section) = elf.section_headers.get(symbol.st_shndx) else {
+            anyhow::bail!("v2 function section");
+        };
+        let section = elf.shdr_strtab.get_at(section.sh_name).unwrap_or("");
+        if section != ".text"
+            && !programs
+                .iter()
+                .any(|p| p.section == section && elf.strtab.get_at(symbol.st_name) == Some(p.name))
+        {
+            anyhow::bail!("v2 unselected program root");
+        }
+    }
+    let prepared = prepare_sections(obj, &v2_maps(role), programs, raw)?;
+    if role == Role::Count {
+        validate_count_prepared_v2(&prepared)?;
+    }
+    Ok(prepared)
+}
+fn validate_count_prepared_v2(p: &Prepared) -> anyhow::Result<()> {
+    validate_count_prepared_policy(p, true).map_err(Into::into)
+}
 /// Frozen harvest shape (keyed-design §1): dims asserted vs the
 /// object by `prepare`, fail-closed on drift. Proven by the P2
 /// task-0 spike (spike-uret.sh GREEN 3/3). T02 adds the two
@@ -1531,6 +1661,14 @@ pub fn synth_btf(subprogs: &[SubprogInfo]) -> anyhow::Result<SynthBtf> {
 /// Pure preparation: parse, assert shape, relocate (map fds stay
 /// symbolic — applied by `load()`).
 pub fn prepare(obj: &[u8], maps: &[MapSpec], progs: &[ProgSpec]) -> anyhow::Result<Prepared> {
+    prepare_sections(obj, maps, progs, false)
+}
+fn prepare_sections(
+    obj: &[u8],
+    maps: &[MapSpec],
+    progs: &[ProgSpec],
+    raw_identity: bool,
+) -> anyhow::Result<Prepared> {
     let elf = goblin::Object::parse(obj).map_err(|e| anyhow::anyhow!("elf parse: {e}"))?;
     let goblin::Object::Elf(elf) = elf else {
         anyhow::bail!("not an ELF object");
@@ -1545,6 +1683,11 @@ pub fn prepare(obj: &[u8], maps: &[MapSpec], progs: &[ProgSpec]) -> anyhow::Resu
         let n = &elf.shdr_strtab[s.sh_name];
         if n == ".BTF" || n == ".BTF.ext" {
             anyhow::bail!("frozen shape forbids {n} (BTF-disabled objects only)");
+        }
+        if n.starts_with("raw_tracepoint")
+            && !(raw_identity && IDENTITY_PROGS.iter().any(|p| p.section == n))
+        {
+            anyhow::bail!("raw sections are exclusive to the four identity programs");
         }
     }
     // License: .license governs when present (must be GPL-compatible),
@@ -1618,7 +1761,10 @@ pub fn prepare(obj: &[u8], maps: &[MapSpec], progs: &[ProgSpec]) -> anyhow::Resu
     let mut funcs: HashMap<String, Vec<(usize, usize, String)>> = HashMap::new();
     for (i, s) in elf.section_headers.iter().enumerate() {
         let n = &elf.shdr_strtab[s.sh_name];
-        if n == "uprobe" || n == "uretprobe" {
+        if n == "uprobe"
+            || n == "uretprobe"
+            || (raw_identity && IDENTITY_PROGS.iter().any(|p| p.section == n))
+        {
             let mut v = Vec::new();
             for f in syms.iter().filter(|f| f.is_func && f.shndx == i) {
                 v.push((f.value, f.value + f.size, f.name.clone()));
@@ -1703,6 +1849,7 @@ pub fn prepare(obj: &[u8], maps: &[MapSpec], progs: &[ProgSpec]) -> anyhow::Resu
         let is_return = match p.section {
             "uprobe" => false,
             "uretprobe" => true,
+            s if raw_identity && IDENTITY_PROGS.iter().any(|p| p.section == s) => false,
             s => anyhow::bail!("prog {}: bad section {s}", p.name),
         };
         let sec = sec_bytes(&elf, obj, p.section)?;
@@ -2044,9 +2191,15 @@ pub(crate) fn validate_count_object(obj: &[u8]) -> Result<(), crate::count_owner
 pub(crate) fn validate_count_prepared(
     prep: &Prepared,
 ) -> Result<(), crate::count_owner::OwnerFailure> {
+    validate_count_prepared_policy(prep, false)
+}
+fn validate_count_prepared_policy(
+    prep: &Prepared,
+    v2: bool,
+) -> Result<(), crate::count_owner::OwnerFailure> {
     use crate::count_owner::{CountOperation, FailureClass, OwnerFailure};
     let drift = || OwnerFailure::engine(CountOperation::Load, FailureClass::ObjectDrift);
-    if prep.maps.len() != 7 || prep.progs.len() != 1 {
+    if prep.maps.len() != (if v2 { 13 } else { 7 }) || prep.progs.len() != 1 {
         return Err(drift());
     }
     for expected in COUNT_MAPS {
@@ -2093,7 +2246,9 @@ pub(crate) fn validate_count_prepared(
     }
     for fixup in &p.map_fixups {
         check_ld_imm64_site(&p.insns, fixup.insn_off, &p.name).map_err(|_| drift())?;
-        if !COUNT_MAPS.iter().any(|m| m.name == fixup.map) {
+        if !(COUNT_MAPS.iter().any(|m| m.name == fixup.map)
+            || v2 && IDENTITY_MAPS.iter().any(|m| m.name == fixup.map))
+        {
             return Err(drift());
         }
     }

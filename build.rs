@@ -9,12 +9,30 @@ mod package {
     }
 }
 use package::records::{
-    BuildInputs, BundleContract, PackageRecord, canonical_bytes, parse_canonical, sha256,
+    AdmittedContract, BuildInputs, BuildInputsV2, PackageRecord, canonical_bytes, parse_canonical,
+    sha256, verify_contract_v2,
 };
-use std::{env, fs, path::PathBuf};
+use std::{
+    env, fs,
+    io::Read,
+    path::{Path, PathBuf},
+};
+fn read_record(path: &Path) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    fs::File::open(path)
+        .expect("required package record")
+        .take(1_048_577)
+        .read_to_end(&mut bytes)
+        .expect("read bounded package record");
+    bytes
+}
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!(
+        "cargo:rustc-env=OSSL_PACKAGE_HOST_TARGET={}",
+        env::var("TARGET").expect("TARGET")
+    );
     println!("cargo:rerun-if-changed=src/package/error.rs");
     println!("cargo:rerun-if-changed=src/package/records.rs");
     println!("cargo:rerun-if-env-changed=OSSL_PACKAGE_RECORD_DIR");
@@ -33,11 +51,26 @@ fn main() {
     let contract_path = directory.join("bundle-contract.json");
     println!("cargo:rerun-if-changed={}", input_path.display());
     println!("cargo:rerun-if-changed={}", contract_path.display());
-    let input_bytes = fs::read(&input_path).expect("required canonical build-inputs.json");
-    let contract_bytes = fs::read(&contract_path).expect("required canonical bundle-contract.json");
-    let inputs: BuildInputs = parse_canonical(&input_bytes).expect("canonical build input");
-    let contract: BundleContract =
+    let input_bytes = read_record(&input_path);
+    let contract_bytes = read_record(&contract_path);
+    let admitted: AdmittedContract =
         parse_canonical(&contract_bytes).expect("canonical bundle contract");
+    let (inputs, contract, symbol) = match &admitted {
+        AdmittedContract::V1(c) => (
+            parse_canonical::<BuildInputs>(&input_bytes).expect("canonical v1 inputs"),
+            c.clone(),
+            "osslscope_bundle_contract_v1",
+        ),
+        AdmittedContract::V2(c) => {
+            let inputs: BuildInputsV2 = parse_canonical(&input_bytes).expect("canonical v2 inputs");
+            verify_contract_v2(c, &inputs, &input_bytes).expect("v2 input/contract graph");
+            (
+                inputs.legacy_fields(),
+                c.legacy_fields(),
+                "osslscope_bundle_contract_v2",
+            )
+        }
+    };
     let target = env::var("TARGET").expect("TARGET");
     assert_eq!(
         inputs.host_profile.target, target,
@@ -68,16 +101,16 @@ fn main() {
     );
     assert_eq!(
         contract_bytes,
-        canonical_bytes(&contract),
+        canonical_bytes(&admitted),
         "contract changed during parse"
     );
     inputs.validate().expect("valid build inputs");
     fs::write(out.join("bundle-contract.bin"), &contract_bytes).expect("write embedded bytes");
     // #[used] retains the static in its object; --undefined also roots that
     // symbol when the final host link garbage-collects unreferenced sections.
-    println!("cargo:rustc-link-arg-bin=osslscope=-Wl,--undefined=osslscope_bundle_contract_v1");
+    println!("cargo:rustc-link-arg-bin=osslscope=-Wl,--undefined={symbol}");
     fs::write(generated, format!(
-        "#[used]\n#[unsafe(export_name = \"osslscope_bundle_contract_v1\")]\n#[unsafe(link_section = \".osslscope.bundle_contract\")]\nstatic BUNDLE_CONTRACT: [u8; {}] = *include_bytes!(concat!(env!(\"OUT_DIR\"), \"/bundle-contract.bin\"));\npub fn contract_bytes() -> Option<&'static [u8]> {{ Some(&BUNDLE_CONTRACT) }}\n",
+        "#[used]\n#[unsafe(export_name = \"{symbol}\")]\n#[unsafe(link_section = \".osslscope.bundle_contract\")]\nstatic BUNDLE_CONTRACT: [u8; {}] = *include_bytes!(concat!(env!(\"OUT_DIR\"), \"/bundle-contract.bin\"));\npub fn contract_bytes() -> Option<&'static [u8]> {{ Some(&BUNDLE_CONTRACT) }}\n",
         contract_bytes.len()
     )).expect("write embedding module");
 }

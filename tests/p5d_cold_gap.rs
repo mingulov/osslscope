@@ -956,6 +956,7 @@ fn capture_spawn_counts_executions() {
         harvest_object: Some(harvest_object),
         count_object: Some(count_object),
         members_object: None,
+        dev_bundle: None,
         provider: Some(PathBuf::from(LIBCRYPTO)),
         builtin: true,
         table: Some(table.path()),

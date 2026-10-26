@@ -2204,6 +2204,7 @@ fn run_with_resolver(
         harvest: object.map(PathBuf::from),
         count: count_object.map(PathBuf::from),
         members: members_object.map(PathBuf::from),
+        dev_bundle: None,
     };
     match with_doctor_objects(&overrides, resolve, |objects| {
         run_admitted_doctor(objects, tctx, pid, libcrypto, exe_path, &format)

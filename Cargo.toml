@@ -15,6 +15,10 @@ path = "src/lib.rs"
 name = "osslscope"
 path = "src/main.rs"
 
+[[bin]]
+name = "osslscope-dev-admission"
+path = "src/bin/osslscope-dev-admission.rs"
+
 [dependencies]
 anyhow = "1"
 aya = "=0.14.0"

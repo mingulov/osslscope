@@ -97,6 +97,7 @@ pub struct Config {
     /// matched installed triple; explicit harvest/count pairs stay
     /// harvest-only; broken installed triples refuse.
     pub members_object: Option<PathBuf>,
+    pub dev_bundle: Option<PathBuf>,
     pub provider: Option<PathBuf>,
     pub builtin: bool,
     /// Explicit local offset table (`--table`), or None for the
@@ -9996,6 +9997,7 @@ pub fn run_for_command(
         harvest: cfg.harvest_object.clone(),
         count: cfg.count_object.clone(),
         members: cfg.members_object.clone(),
+        dev_bundle: cfg.dev_bundle.clone(),
     };
     with_capture_objects(
         kind,
@@ -10021,6 +10023,7 @@ struct AdmittedBuffers {
     harvest: Arc<[u8]>,
     count: Arc<[u8]>,
     count_sha256: [u8; 32],
+    identity: Option<Arc<[u8]>>,
 }
 pub(crate) fn run_admitted(
     cfg: &Config,
@@ -10037,11 +10040,17 @@ pub(crate) fn run_admitted_before(
     auto: bool,
     setup_deadline: Option<Instant>,
 ) -> anyhow::Result<Capture> {
+    if let Some(identity) = admitted.identity() {
+        identity.require_activation()?;
+    }
     with_capture_selection(
         admitted,
         auto,
         |objects, traversal, selected, mut buffers, package| {
             buffers.setup_deadline = setup_deadline;
+            if buffers.identity.is_some() {
+                return Err(anyhow::anyhow!("identity activation unavailable"));
+            }
             run_inner_with_admitted(
                 cfg,
                 target,
@@ -10112,6 +10121,7 @@ fn with_capture_selection<R>(
             harvest: Arc::clone(&harvest.bytes),
             count: Arc::clone(&count.bytes),
             count_sha256: count.sha256.0,
+            identity: admitted.identity().map(|i| Arc::clone(i.object_bytes())),
         },
         admitted.provenance(),
     )
@@ -16150,6 +16160,7 @@ pub(crate) mod tests {
                 harvest_object: None,
                 count_object: None,
                 members_object: None,
+                dev_bundle: None,
                 provider: None,
                 builtin: false,
                 table: None,
@@ -19155,6 +19166,7 @@ mod fix1_live_provider_tests {
             harvest_object: None,
             count_object: None,
             members_object: None,
+            dev_bundle: None,
             provider: explicit.then(|| PathBuf::from("/")),
             builtin: true,
             table: (invalid != 0).then(|| PathBuf::from("/")),

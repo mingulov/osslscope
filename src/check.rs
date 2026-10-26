@@ -86,6 +86,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
     let mut object: Option<String> = None;
     let mut count_object: Option<String> = None;
     let mut members_object: Option<String> = None;
+    let mut dev_bundle: Option<String> = None;
     let mut table_raw: Option<String> = None;
     let mut force_offset_raw: Option<String> = None;
     let mut provider_table_raw: Option<String> = None;
@@ -138,6 +139,12 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             "--object" => object = Some(val(a)?),
             "--count-object" => count_object = Some(val(a)?),
             "--members-object" => members_object = Some(val(a)?),
+            "--dev-bundle" => {
+                if dev_bundle.is_some() {
+                    return Err("--dev-bundle may occur only once".into());
+                }
+                dev_bundle = Some(val(a)?);
+            }
             "--table" => table_raw = Some(val(a)?),
             "--force-offset" => force_offset_raw = Some(val(a)?),
             "--provider-table" => provider_table_raw = Some(val(a)?),
@@ -262,6 +269,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             harvest_object: object.map(PathBuf::from),
             count_object: count_object.map(PathBuf::from),
             members_object: members_object.map(PathBuf::from),
+            dev_bundle: dev_bundle.map(PathBuf::from),
             provider: provider.map(PathBuf::from),
             builtin,
             table,
@@ -512,7 +520,7 @@ pub(crate) fn assemble_checked_document(
 }
 
 const USAGE: [&str; 2] = [
-    "usage: check [--policy FILE] [--duration S] [--provider P] [--object O] [--count-object C] [--members-object M] [--table F] [--force-offset N] [--provider-table F] [rules] [--format human|json] [--out F] [--cbom FILE] [--builtin] [--settle S] [--timeout S] [--grace S] [--image-digest D] [--workload-out F] [--workload-out-fd N] {--pid P | run -- <cmd>}",
+    "usage: check [--policy FILE] [--duration S] [--provider P] [--object O] [--count-object C] [--members-object M] [--dev-bundle DIR] [--table F] [--force-offset N] [--provider-table F] [rules] [--format human|json] [--out F] [--cbom FILE] [--builtin] [--settle S] [--timeout S] [--grace S] [--image-digest D] [--workload-out F] [--workload-out-fd N] {--pid P | run -- <cmd>}",
     "rules: [--require-provider P] [--deny-provider P] [--deny-engine] [--deny-algorithm X] [--deny-weak] [--require-executed X] (repeatable; at least one required)",
 ];
 
@@ -549,6 +557,7 @@ pub(crate) fn prepare(argv: &[String]) -> Result<Prepared, ExitCode> {
         harvest: args.cfg.harvest_object.clone(),
         count: args.cfg.count_object.clone(),
         members: args.cfg.members_object.clone(),
+        dev_bundle: args.cfg.dev_bundle.clone(),
     };
     let objects = match with_check_objects(
         &overrides,
@@ -1567,4 +1576,18 @@ pub(crate) fn with_check_objects<R>(
         resolve,
         effect,
     )
+}
+
+#[cfg(test)]
+#[test]
+fn identity_v2_prepare_selection() {
+    let args = [
+        "--dev-bundle",
+        "/missing/identity-v2",
+        "--pid",
+        "1",
+        "--deny-weak",
+    ]
+    .map(String::from);
+    assert!(parse(&args).is_ok(), "must select the dev admission route");
 }

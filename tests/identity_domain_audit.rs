@@ -891,6 +891,35 @@ fn h5_t3_every_device_site_names_one_domain() {
         // keys, compared only against same-constructed keys —
         // raw-vs-raw, run-local, never cross-domain joined).
         ("src/target.rs", "raw", "md.dev(),", 1),
+        // Development-bundle selectors carry directory paths, with no device
+        // comparison or conversion. Their .dev substring is pathname plumbing.
+        (
+            "src/capture.rs",
+            "agnostic",
+            "dev_bundle: cfg.dev_bundle.clone(),",
+            1,
+        ),
+        (
+            "src/check.rs",
+            "agnostic",
+            "dev_bundle: args.cfg.dev_bundle.clone(),",
+            1,
+        ),
+        (
+            "src/report.rs",
+            "agnostic",
+            "dev_bundle: args.cfg.dev_bundle.clone(),",
+            1,
+        ),
+        (
+            "src/package/commands.rs",
+            "agnostic",
+            "if let Some(dir) = &overrides.dev_bundle {",
+            1,
+        ),
+        // Development snapshots compare raw fstat dev_t only before/after
+        // reads of that same opened FD, as the other package snapshots do.
+        ("src/package/dev.rs", "raw", "dev: m.dev(),", 1),
         // Package snapshots retain raw dev_t from opened-FD metadata for
         // same-FD before/after identity checks; no encoded/maps-domain join.
         ("src/package/commands.rs", "raw", "dev: m.dev(),", 1),

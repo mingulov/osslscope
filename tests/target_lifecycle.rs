@@ -3272,6 +3272,7 @@ pub(crate) fn connector_body_ordinary_production_run_counts_real_crypto_free_of_
         grace: Duration::from_secs(5),
         image_digest: String::new(),
         members_object: None,
+        dev_bundle: None,
     };
     let cap = osslscope::capture::run(
         &cfg,

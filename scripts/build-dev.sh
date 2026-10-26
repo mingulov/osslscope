@@ -21,6 +21,7 @@
 #
 # Usage:
 #   scripts/build-dev.sh [--host-only|--bpf-only] [--offline|--online]
+#                        [--identity-v2-inputs FILE --identity-v2-dir DIR]
 #                        [--release] [--manifest PATH] [--jobs N] [--check-only]
 #
 # Exit codes: 0 ok; 2 usage error; 3 missing prerequisite (environment);
@@ -41,6 +42,8 @@ PROFILE="dev"      # dev (host) — BPF always builds --release
 MANIFEST=""        # default: <repo>/target/dev-build-manifest.json
 JOBS="${CARGO_BUILD_JOBS:-2}"
 CHECK_ONLY=0
+IDENTITY_INPUTS=""
+IDENTITY_DIR=""
 
 usage() {
     sed -n '2,20p' "$0"
@@ -49,6 +52,8 @@ usage() {
 
 while [ $# -gt 0 ]; do
     case "$1" in
+        --identity-v2-inputs) [ $# -ge 2 ] || { echo "error: --identity-v2-inputs needs FILE" >&2; exit 2; }; IDENTITY_INPUTS="$2"; shift 2 ;;
+        --identity-v2-dir) [ $# -ge 2 ] || { echo "error: --identity-v2-dir needs DIR" >&2; exit 2; }; IDENTITY_DIR="$2"; shift 2 ;;
         --host-only) MODE="host"; shift ;;
         --bpf-only) MODE="bpf"; shift ;;
         --offline) NET="offline"; shift ;;
@@ -63,6 +68,16 @@ while [ $# -gt 0 ]; do
         *) echo "error: unknown argument: $1" >&2; usage >&2; exit 2 ;;
     esac
 done
+
+if [ -n "$IDENTITY_INPUTS" ] || [ -n "$IDENTITY_DIR" ]; then
+    [ -n "$IDENTITY_INPUTS" ] && [ -n "$IDENTITY_DIR" ] && [ "$MODE" = "both" ] || { echo "error: identity v2 requires both --identity-v2-inputs FILE and --identity-v2-dir DIR in full mode" >&2; exit 2; }
+    [ -f "$IDENTITY_INPUTS" ] || { echo "error: identity v2 inputs absent" >&2; exit 2; }
+    IDENTITY_INPUTS="$(cd "$(dirname "$IDENTITY_INPUTS")" && pwd)/$(basename "$IDENTITY_INPUTS")"
+    mkdir -p "$IDENTITY_DIR"
+    IDENTITY_DIR="$(cd "$IDENTITY_DIR" && pwd)"
+    [ ! -e "$IDENTITY_DIR/dev-admission.json" ] || { echo "error: use a fresh identity v2 output directory" >&2; exit 2; }
+    unset OSSL_PACKAGE_RECORD_DIR
+fi
 
 case "$JOBS" in
     ''|*[!0-9]*) echo "error: --jobs must be a positive integer, got: $JOBS" >&2; exit 2 ;;
@@ -269,7 +284,54 @@ if [ "$CHECK_ONLY" -eq 1 ]; then
 else
     mkdir -p "$SCRATCH"
     : >"$CARGO_LOG"
-    if [ "$MODE" != "bpf" ]; then
+    if [ -n "$IDENTITY_INPUTS" ]; then
+        # Freeze custody and all four real objects descriptor-free. Missing
+        # future bins refuse here; neither placeholder bytes nor stale output
+        # become an admitted artifact.
+        _cwd="$(pwd)"
+        cd "$REPO"
+        CARGO_STDOUT="$SCRATCH/custody-stdout.jsonl"
+        if ! run_cargo_locked "$HOST_TOOLCHAIN" build --bin osslscope-identity-custodian "$MSG_FMT"; then
+            echo "error: identity v2 requires the actual custody producer" >&2; exit 1
+        fi
+        _custody="$(extract_artifact "$CARGO_STDOUT" osslscope-identity-custodian)"
+        cp --remove-destination "$_custody" "$IDENTITY_DIR/osslscope-identity-custodian"
+        cd "$REPO/crates/ebpf"
+        CARGO_STDOUT="$SCRATCH/identity-bpf-stdout.jsonl"
+        if ! run_cargo_locked "$BPF_TOOLCHAIN" build -Z build-std=core --target "$BPF_TARGET" --release --bin osslscope-harvest --bin osslscope-count --bin osslscope-members --bin osslscope-identity "$MSG_FMT"; then
+            echo "error: identity v2 requires four real reader/identity objects" >&2; exit 1
+        fi
+        BPF_BIN_PATHS=""
+        for _role in osslscope-harvest osslscope-count osslscope-members osslscope-identity; do
+            _object="$(extract_artifact "$CARGO_STDOUT" "$_role")"
+            cp --remove-destination "$_object" "$IDENTITY_DIR/$_role"
+            BPF_BIN_PATHS="$BPF_BIN_PATHS
+$_object"
+        done
+        cd "$REPO"
+        # One Rust canonical serializer and policy, bootstrapped separately.
+        _saved_target="${CARGO_TARGET_DIR-}"
+        export CARGO_TARGET_DIR="$SCRATCH/admission-target"
+        CARGO_STDOUT="$SCRATCH/admission-stdout.jsonl"
+        run_cargo_locked "$HOST_TOOLCHAIN" build --bin osslscope-dev-admission "$MSG_FMT" || exit 1
+        _admission="$(extract_artifact "$CARGO_STDOUT" osslscope-dev-admission)"
+        "$_admission" contract --inputs "$IDENTITY_INPUTS" --root "$IDENTITY_DIR" || exit 1
+        if [ -n "$_saved_target" ]; then export CARGO_TARGET_DIR="$_saved_target"; else unset CARGO_TARGET_DIR; fi
+        CARGO_STDOUT="$SCRATCH/host-stdout.jsonl"
+        export OSSL_PACKAGE_RECORD_DIR="$IDENTITY_DIR"
+        if [ "$PROFILE" = "release" ]; then
+            run_cargo_locked "$HOST_TOOLCHAIN" build --release --bin osslscope "$MSG_FMT" || exit 1
+        else
+            run_cargo_locked "$HOST_TOOLCHAIN" build --bin osslscope "$MSG_FMT" || exit 1
+        fi
+        unset OSSL_PACKAGE_RECORD_DIR
+        HOST_BIN="$(extract_artifact "$CARGO_STDOUT" osslscope)"
+        cp --remove-destination "$HOST_BIN" "$IDENTITY_DIR/osslscope"
+        "$_admission" finalize --root "$IDENTITY_DIR" || exit 1
+        HOST_CMD="identity-v2: frozen custody/four roles, descriptor-free helper, observer-only embedded build, atomic dev admission"
+        BPF_CMD="four identity-v2 BPF bins --locked"
+        cd "$_cwd"
+    elif [ "$MODE" != "bpf" ]; then
         if [ "$PROFILE" = "release" ]; then
             HOST_CMD="cargo +$HOST_TOOLCHAIN build --locked --release $MSG_FMT"
             _args="build --release $MSG_FMT"
@@ -293,7 +355,7 @@ else
             || { echo "error: built host binary path unknown (see $CARGO_LOG)" >&2; exit 1; }
         [ -x "$HOST_BIN" ] || { echo "error: expected host binary missing: $HOST_BIN" >&2; exit 1; }
     fi
-    if [ "$MODE" != "host" ]; then
+    if [ "$MODE" != "host" ] && [ -z "$IDENTITY_INPUTS" ]; then
         BPF_CMD="cargo +$BPF_TOOLCHAIN build --locked -Z build-std=core --target $BPF_TARGET --release --bin osslscope-harvest --bin osslscope-count --bin osslscope-members $MSG_FMT (in crates/ebpf)"
         # No subshell: run_cargo_locked must propagate OFFLINE_USED to the manifest.
         _cwd="$(pwd)"

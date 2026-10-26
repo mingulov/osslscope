@@ -25,6 +25,7 @@ pub struct ObjectOverrides {
     pub harvest: Option<PathBuf>,
     pub count: Option<PathBuf>,
     pub members: Option<PathBuf>,
+    pub dev_bundle: Option<PathBuf>,
 }
 impl ObjectOverrides {
     fn path(&self, role: Role) -> Option<&Path> {
@@ -32,6 +33,7 @@ impl ObjectOverrides {
             Role::Harvest => self.harvest.as_deref(),
             Role::Count => self.count.as_deref(),
             Role::Members => self.members.as_deref(),
+            Role::Identity => None,
         }
     }
     fn any(&self) -> bool {
@@ -145,24 +147,39 @@ pub struct OperatorSet {
 pub enum AdmittedSet {
     Installed(Box<VerifiedBundle>),
     Operator(OperatorSet),
+    Development(super::dev::VerifiedDevelopment),
+    InstalledV2(Box<super::resolve::VerifiedIdentityBundle>),
 }
 impl AdmittedSet {
+    pub fn identity(&self) -> Option<&super::dev::AdmittedIdentity> {
+        match self {
+            Self::Development(d) => Some(&d.identity),
+            Self::InstalledV2(b) => Some(&b.data.identity),
+            _ => None,
+        }
+    }
     pub fn role(&self, role: Role) -> Option<&RoleSnapshot> {
         match self {
-            Self::Installed(b) => Some(b.role(role)),
+            Self::Installed(b) => b.roles().get(&role),
             Self::Operator(o) => o.roles.get(&role).map(|(s, _)| s),
+            Self::Development(d) => d.roles.get(&role),
+            Self::InstalledV2(b) => b.data.roles.get(&role),
         }
     }
     pub fn provenance(&self) -> PackageProvenance {
         let metadata = match self {
             Self::Installed(b) => Some(&b.metadata),
             Self::Operator(o) => o.base.as_deref(),
+            Self::Development(_) => None,
+            Self::InstalledV2(b) => Some(&b.metadata),
         };
         let one = |role| {
             self.role(role).map(|s| {
                 let selection = match self {
                     Self::Installed(_) => RoleSelection::InstalledMatched,
                     Self::Operator(o) => o.roles[&role].1,
+                    Self::Development(_) => RoleSelection::OperatorExplicit,
+                    Self::InstalledV2(_) => RoleSelection::InstalledMatched,
                 };
                 PackageRoleProvenance {
                     selection,
@@ -201,10 +218,29 @@ pub fn resolve_command_objects(
 ) -> Result<AdmittedSet, PackageError> {
     #[cfg(test)]
     RESOLVER_CALLS.with(|calls| calls.set(calls.get() + 1));
+    let embedded = super::embedded::contract_bytes();
+    if let Some(dir) = &overrides.dev_bundle {
+        if !matches!(kind, CommandKind::Report | CommandKind::Check) || overrides.any() {
+            return Err(PackageError::invalid(
+                "dev v2 requires Report/Check without role overrides",
+            ));
+        }
+        return super::resolve::resolve_dev_bundle(dir, embedded);
+    }
+    if let Some(bytes) = embedded {
+        if let super::records::AdmittedContract::V2(_) = super::records::parse_canonical(bytes)? {
+            if overrides.any() {
+                return Err(PackageError::invalid("embedded v2 forbids role overrides"));
+            }
+            let host = super::trusted::executing_host()?;
+            return super::resolve::resolve_installed_identity_bundle(&host, bytes)
+                .map(|b| AdmittedSet::InstalledV2(Box::new(b)));
+        }
+    }
     resolve_with(
         kind,
         overrides,
-        super::embedded::contract_bytes(),
+        embedded,
         |contract| {
             let host = super::trusted::executing_host()?;
             super::resolve::resolve_installed_bundle(&host, contract)
@@ -262,6 +298,9 @@ fn retained_base(bundle: AdmittedSet, overrides: &ObjectOverrides) -> OperatorSe
         base: match bundle {
             AdmittedSet::Installed(b) => Some(Box::new(b.metadata)),
             AdmittedSet::Operator(o) => o.base,
+            AdmittedSet::Development(_) | AdmittedSet::InstalledV2(_) => {
+                unreachable!("v2 overrides refused before retention")
+            }
         },
     }
 }
@@ -387,7 +426,13 @@ pub(crate) fn with_admitted<R>(
     resolve: impl FnOnce(CommandKind, &ObjectOverrides) -> Result<AdmittedSet, PackageError>,
     effect: impl FnOnce(AdmittedSet) -> R,
 ) -> Result<R, PackageError> {
-    resolve(kind, overrides).map(effect)
+    let admitted = resolve(kind, overrides)?;
+    if matches!(kind, CommandKind::Report | CommandKind::Check) {
+        if let Some(identity) = admitted.identity() {
+            identity.require_activation()?;
+        }
+    }
+    Ok(effect(admitted))
 }
 
 #[cfg(test)]
@@ -401,6 +446,7 @@ pub(crate) mod test_support {
             Role::Harvest => b"harvest-fixture",
             Role::Count => b"count-fixture",
             Role::Members => b"members-fixture",
+            Role::Identity => b"identity-fixture",
         };
         RoleSnapshot {
             locator: std::env::temp_dir().join(role.file_name()),
@@ -618,6 +664,7 @@ mod tests {
             harvest: Some("h".into()),
             count: Some("c".into()),
             members: None,
+            dev_bundle: None,
         };
         for kind in [CommandKind::Doctor, CommandKind::Report, CommandKind::Check] {
             let set = select_operator(kind, &pair, empty(), explicit).unwrap();
@@ -910,6 +957,7 @@ mod tests {
             harvest: Some("h".into()),
             count: Some("c".into()),
             members: None,
+            dev_bundle: None,
         };
         let set = select_operator(CommandKind::Report, &pair, empty, |r, _, _| {
             let mut s = snapshot(r);

@@ -447,6 +447,7 @@ pub(crate) fn check_installed_role_compatible(
     use crate::package::{PackageError, records::Role};
     let shape = |reason: &str| PackageError::invalid(format!("{}: {reason}", role.file_name()));
     match role {
+        Role::Identity => Err(shape("v1 forbids identity")),
         Role::Harvest => crate::loader::prepare(
             bytes,
             &crate::loader::HARVEST_MAPS,
@@ -2213,4 +2214,19 @@ mod tests {
         let maps = vec![mapping("00:00", 0, "/mem/libcrypto.so.3")];
         assert_eq!(libcrypto_from_maps(&maps), LibcryptoMaps::None);
     }
+}
+
+/// Pure v2 shape validation. This never loads a program or grants activation.
+pub(crate) fn check_v2_role_compatible(
+    role: crate::package::records::Role,
+    bytes: &[u8],
+) -> Result<(), crate::package::PackageError> {
+    crate::loader::prepare_identity_role(role, bytes)
+        .map(|_| ())
+        .map_err(|e| {
+            crate::package::PackageError::invalid(format!(
+                "{}: v2 loader shape: {e}",
+                role.file_name()
+            ))
+        })
 }

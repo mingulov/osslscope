@@ -1770,7 +1770,8 @@ fn make_contract(
     use super::records::{BundleContract, PackageRecord, Role, RoleEntry, canonical_bytes};
     inputs.validate()?;
     validate_triple(roles)?;
-    let (wire_abi, loader_contract_sha256) = super::resolve::compiled_loader_identity()?;
+    let (wire_abi, loader_contract_sha256) =
+        super::resolve::compiled_loader_identity(crate::package::records::RecordVersion::V1)?;
     let result = BundleContract {
         schema: "osslscope-bundle-contract-v1".into(),
         input_id: sha256(&canonical_bytes(inputs)),
@@ -2437,7 +2438,7 @@ fn host_elf(bytes: &[u8]) -> R<HostElf<'_>> {
             return Err(invalid("ELF contract section shape/bound"));
         }
         let data = section_data(s)?;
-        super::records::parse_canonical::<super::records::BundleContract>(data)?;
+        super::records::parse_canonical::<super::records::AdmittedContract>(data)?;
         result.contract = Some(data);
     }
     let interp_section = sections.iter().find(|s| s.name == ".interp");
@@ -2889,7 +2890,7 @@ fn host_contract_bytes(bytes: &[u8]) -> R<&[u8]> {
 }
 /// Extract a structurally valid canonical contract from one retained host ELF.
 /// This alone does not admit provenance, source identity, ABI cells or a payload.
-pub fn extract_host_contract(bytes: &[u8]) -> R<super::records::BundleContract> {
+pub fn extract_host_contract(bytes: &[u8]) -> R<super::records::AdmittedContract> {
     super::records::parse_canonical(host_contract_bytes(bytes)?)
 }
 fn validate_host_abi(bytes: &[u8], evidence: &source::AbiEvidence) -> R<()> {
@@ -3182,6 +3183,7 @@ mod tests {
         // Literal independent maps: (name,type,key,value,maximum,flags).
         fn maps(role: Role) -> Vec<(&'static str, [u32; 5])> {
             match role {
+                Role::Identity => panic!("v1 fixture excludes identity"),
                 Role::Count => vec![
                     ("COUNTS", [5, 8, 24, 8192, 0]),
                     ("ADMITTED", [6, 4, 8, 1, 0]),
@@ -3232,6 +3234,7 @@ mod tests {
         fn bpf_variant(role: Role, extra: Option<Section>, callback: bool) -> Vec<u8> {
             let maps = maps(role);
             let mut roots: Vec<(String, bool)> = match role {
+                Role::Identity => panic!("v1 fixture excludes identity"),
                 Role::Count => vec![("count_entry".into(), false)],
                 Role::Harvest => vec![
                     ("init_entry".into(), false),
@@ -3355,7 +3358,10 @@ mod tests {
             assert_eq!(c.roles[2].bytes, roles[&Role::Members].length());
             assert_eq!(
                 (c.wire_abi, c.loader_contract_sha256),
-                crate::package::resolve::compiled_loader_identity().unwrap()
+                crate::package::resolve::compiled_loader_identity(
+                    crate::package::records::RecordVersion::V1
+                )
+                .unwrap()
             );
             for role in [Role::Harvest, Role::Count, Role::Members] {
                 let mut pair = triple();
@@ -3423,7 +3429,9 @@ mod tests {
             assert_eq!(host_contract_bytes(&b).unwrap(), contract());
             assert_eq!(
                 extract_host_contract(&b).unwrap(),
-                parse_canonical::<BundleContract>(&contract()).unwrap()
+                crate::package::records::AdmittedContract::V1(
+                    parse_canonical::<BundleContract>(&contract()).unwrap()
+                )
             );
             let mut bad = b.clone();
             w64(&mut bad, sh + 64 + 24, u64::MAX);
@@ -5086,7 +5094,10 @@ mod tests {
     }
     #[test]
     fn descriptor_layout_literal_loader_inventory_including_count_extras() {
-        let (wire, digest) = super::super::resolve::compiled_loader_identity().unwrap();
+        let (wire, digest) = super::super::resolve::compiled_loader_identity(
+            crate::package::records::RecordVersion::V1,
+        )
+        .unwrap();
         assert_eq!(wire, 2);
         assert_eq!(
             digest.to_string(),

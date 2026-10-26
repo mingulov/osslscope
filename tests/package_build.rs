@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#[path = "support/package_fixtures.rs"]
+mod fixtures;
 use osslscope::package::build::extract_host_contract;
 use osslscope::package::records::{BundleContract, parse_canonical};
 // Literal contract fixture is independent of the ELF parser and policy generator.
@@ -61,7 +63,9 @@ fn public_extraction_unique_canonical_contract() {
     let b = host(".osslscope.bundle_contract", CONTRACT.as_bytes(), false);
     assert_eq!(
         extract_host_contract(&b).unwrap(),
-        parse_canonical::<BundleContract>(CONTRACT.as_bytes()).unwrap()
+        osslscope::package::records::AdmittedContract::V1(
+            parse_canonical::<BundleContract>(CONTRACT.as_bytes()).unwrap()
+        )
     );
 }
 #[test]
@@ -121,7 +125,68 @@ fn public_extraction_from_independent_host_compile_fixture() {
     let bytes = std::fs::read(root.join("fixture")).unwrap();
     assert_eq!(
         extract_host_contract(&bytes).unwrap(),
-        parse_canonical::<BundleContract>(CONTRACT.as_bytes()).unwrap()
+        osslscope::package::records::AdmittedContract::V1(
+            parse_canonical::<BundleContract>(CONTRACT.as_bytes()).unwrap()
+        )
     );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn identity_v2_graph_and_embedding() {
+    let mut value: serde_json::Value = serde_json::from_str(CONTRACT).unwrap();
+    value["schema"] = serde_json::json!("osslscope-bundle-contract-v2");
+    value["identity_abi"] = serde_json::json!(4);
+    value["custody_protocol"] = serde_json::json!(1);
+    value["identity_profile_sha256"] = serde_json::json!("77".repeat(32));
+    value["custody_host"] = serde_json::json!({"path":"osslscope-identity-custodian","bytes":1,"sha256":"88".repeat(32),"elf_machine":62,"elf_build_id":null});
+    value["roles"].as_array_mut().unwrap().push(serde_json::json!({"role":"identity","file":"osslscope-identity","bytes":1,"sha256":"99".repeat(32)}));
+    let mut bytes = serde_json::to_vec(&value).unwrap();
+    bytes.push(b'\n');
+    let elf = host(".osslscope.bundle_contract", &bytes, false);
+    assert!(
+        extract_host_contract(&elf).is_ok(),
+        "actual host extraction must admit canonical flat v2 contract"
+    );
+    assert!(extract_host_contract(&host(".osslscope.bundle_contract", &bytes, true)).is_err());
+}
+
+#[test]
+fn identity_v2_real_dev_producer_refuses_missing_elf() {
+    use osslscope::package::records::*;
+    let base = std::path::PathBuf::from(std::env::var_os("OSSL_PACKAGE_TEST_PRIVATE_DIR").unwrap());
+    let root = base.join(format!("v2-missing-{}", std::process::id()));
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(
+        root.join("seed.json"),
+        canonical_bytes(&fixtures::identity_v2_inputs()),
+    )
+    .unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_osslscope-dev-admission"))
+        .args(["contract", "--inputs"])
+        .arg(root.join("seed.json"))
+        .arg("--root")
+        .arg(&root)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(4));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("development artifact"));
+    assert!(!root.join("bundle-contract.json").exists());
+    assert!(!root.join("dev-admission.json").exists());
+    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/build-dev.sh");
+    for mode in ["--host-only", "--bpf-only"] {
+        let out = std::process::Command::new("sh")
+            .arg(&script)
+            .arg(mode)
+            .arg("--identity-v2-inputs")
+            .arg(root.join("seed.json"))
+            .arg("--identity-v2-dir")
+            .arg(root.join("unused"))
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("full mode"));
+        assert!(!root.join("unused").exists());
+    }
     std::fs::remove_dir_all(root).unwrap();
 }

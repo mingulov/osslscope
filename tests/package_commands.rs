@@ -265,3 +265,22 @@ fn read_syscalls() -> u64 {
         .parse()
         .unwrap()
 }
+
+#[test]
+fn identity_v2_selected_dev_and_installed() {
+    use std::process::Command;
+    for verb in ["report", "check"] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_osslscope"));
+        command.args([verb, "--dev-bundle", "/missing/identity-v2", "--pid", "1"]);
+        if verb == "check" {
+            command.arg("--deny-weak");
+        }
+        let out = command.output().unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(4),
+            "{verb} must select dev admission before effects: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}

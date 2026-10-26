@@ -932,3 +932,151 @@ fn embedded_contract_survives_host_without_accessor_reference() {
         package_fixtures::CONTRACT_BYTES.as_bytes()
     );
 }
+
+#[test]
+fn identity_v2_graph_input_schema() {
+    let bytes = edit(INPUT_BYTES.as_bytes(), |v| {
+        v["schema"] = json!("osslscope-build-inputs-v2");
+        v["identity_abi"] = json!(4);
+        v["custody_protocol"] = json!(1);
+        v["identity_profile_sha256"] = json!("77".repeat(32));
+    });
+    // The existing public parser is the baseline consumer. The implementation
+    // replaces this v1 type with its strict versioned v2 counterpart.
+    assert!(
+        parse_canonical::<BuildInputsV2>(&bytes).is_ok(),
+        "canonical flat v2 inputs must be admitted"
+    );
+}
+
+#[test]
+fn identity_v2_closed_graph_and_v1_controls() {
+    let inputs = package_fixtures::identity_v2_inputs();
+    let ib = canonical_bytes(&inputs);
+    assert_eq!(parse_canonical::<BuildInputsV2>(&ib).unwrap(), inputs);
+    assert!(parse_canonical::<BuildInputs>(&ib).is_err());
+    for (field, value) in [
+        ("identity_abi", json!(3)),
+        ("custody_protocol", json!(2)),
+        ("identity_profile_sha256", json!("A".repeat(64))),
+        ("host_sha256", json!("11".repeat(32))),
+        ("input_id", json!("11".repeat(32))),
+    ] {
+        assert!(
+            parse_canonical::<BuildInputsV2>(&edit(&ib, |v| v[field] = value)).is_err(),
+            "{field}"
+        );
+    }
+    let fixture = records_fixture();
+    let mut value = serde_json::to_value(&fixture.contract).unwrap();
+    value["schema"] = json!("osslscope-bundle-contract-v2");
+    value["input_id"] = json!(sha256(&ib));
+    value["identity_abi"] = json!(4);
+    value["custody_protocol"] = json!(1);
+    value["identity_profile_sha256"] = json!(inputs.identity_profile_sha256);
+    value["custody_host"] = json!({"path":"osslscope-identity-custodian","bytes":4,"sha256":"88".repeat(32),"elf_machine":62,"elf_build_id":null});
+    value["roles"].as_array_mut().unwrap().push(
+        json!({"role":"identity","file":"osslscope-identity","bytes":4,"sha256":"99".repeat(32)}),
+    );
+    let c: BundleContractV2 = serde_json::from_value(value).unwrap();
+    let cb = canonical_bytes(&c);
+    verify_contract_v2(&c, &inputs, &ib).unwrap();
+    assert!(matches!(
+        parse_canonical::<AdmittedContract>(&cb).unwrap(),
+        AdmittedContract::V2(_)
+    ));
+    for field in ["host", "observer_sha256", "payload_id", "contract_id"] {
+        assert!(serde_json::to_value(&c).unwrap().get(field).is_none());
+        assert!(serde_json::to_value(&inputs).unwrap().get(field).is_none());
+    }
+    for mutation in [
+        edit(&cb, |v| {
+            v["roles"]
+                .as_array_mut()
+                .unwrap()
+                .pop()
+                .map(|_| ())
+                .unwrap()
+        }),
+        edit(&cb, |v| v["roles"][3] = v["roles"][0].clone()),
+        edit(&cb, |v| v["schema"] = json!("osslscope-bundle-contract-v1")),
+        edit(&cb, |v| v["host"] = json!("forbidden")),
+    ] {
+        assert!(parse_canonical::<AdmittedContract>(&mutation).is_err());
+    }
+    let mut p = serde_json::to_value(fixture.payload).unwrap();
+    p["schema"] = json!("osslscope-payload-manifest-v2");
+    p["identity_abi"] = json!(4);
+    p["custody_protocol"] = json!(1);
+    p["identity_profile_sha256"] = json!(inputs.identity_profile_sha256);
+    p["custody_host"] = serde_json::to_value(&c.custody_host).unwrap();
+    p["roles"] = serde_json::to_value(&c.roles).unwrap();
+    p["input_id"] = json!(c.input_id);
+    p["build_inputs"]["sha256"] = json!(c.input_id);
+    p["build_inputs"]["bytes"] = json!(ib.len());
+    p["bundle_id"] = json!(sha256(&cb));
+    p["contract"]["sha256"] = json!(sha256(&cb));
+    p["contract"]["bytes"] = json!(cb.len());
+    let p: PayloadManifestV2 = serde_json::from_value(p).unwrap();
+    let pb = canonical_bytes(&p);
+    let metadata = verify_metadata_v2(&c, &p, ib.clone().into()).unwrap();
+    assert_eq!(metadata.payload_id, sha256(&pb));
+    for field in [
+        "identity_abi",
+        "custody_protocol",
+        "identity_profile_sha256",
+        "custody_host",
+        "source",
+        "product_version",
+        "host_profile",
+        "locks",
+        "recipe",
+        "tools",
+        "roles",
+    ] {
+        let changed = edit(&pb, |v| match field {
+            "identity_abi" => v[field] = json!(3),
+            "custody_protocol" => v[field] = json!(2),
+            "identity_profile_sha256" => v[field] = json!("33".repeat(32)),
+            "custody_host" => v[field]["sha256"] = json!("33".repeat(32)),
+            "source" => v[field]["revision"] = json!("b".repeat(40)),
+            "product_version" => v[field] = json!("other"),
+            "host_profile" => v[field]["abi_floor"] = json!("other"),
+            "locks" => v[field]["host_sha256"] = json!("33".repeat(32)),
+            "recipe" => v[field]["config_sha256"] = json!("33".repeat(32)),
+            "tools" => v[field]["host"]["version"] = json!("other"),
+            "roles" => v[field][3]["sha256"] = json!("33".repeat(32)),
+            _ => unreachable!(),
+        });
+        assert!(
+            parse_canonical::<PayloadManifestV2>(&changed)
+                .and_then(|p| verify_metadata_v2(&c, &p, ib.clone().into()))
+                .is_err(),
+            "{field}"
+        );
+    }
+    for (schema, record) in [
+        (include_str!("../schemas/package-build-inputs-v2.json"), ib),
+        (
+            include_str!("../schemas/package-bundle-contract-v2.json"),
+            cb,
+        ),
+        (
+            include_str!("../schemas/package-payload-manifest-v2.json"),
+            pb,
+        ),
+    ] {
+        let s: Value = serde_json::from_str(schema).unwrap();
+        let r: Value = serde_json::from_slice(&record).unwrap();
+        let expected: std::collections::BTreeSet<_> =
+            r.as_object().unwrap().keys().map(String::as_str).collect();
+        let required: std::collections::BTreeSet<_> = s["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(required, expected);
+        assert_eq!(s["additionalProperties"], json!(false));
+    }
+}

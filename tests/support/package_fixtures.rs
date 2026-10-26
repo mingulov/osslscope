@@ -80,3 +80,195 @@ impl RecordFixture {
             .into_bytes()
     }
 }
+
+fn literal_maps_v1(role: Role) -> Vec<(&'static str, [u32; 5])> {
+    match role {
+        Role::Identity => panic!("v1 fixture excludes identity"),
+        Role::Count => vec![
+            ("COUNTS", [5, 8, 24, 8192, 0]),
+            ("ADMITTED", [6, 4, 8, 1, 0]),
+            ("LATC", [6, 4, 8, 16, 0]),
+            ("GEN", [2, 4, 4, 1, 0]),
+            ("TARGET", [2, 4, 8, 1, 0]),
+            ("WINDOW", [2, 4, 8, 2, 0]),
+            ("DROPFAIL", [6, 4, 8, 1, 0]),
+        ],
+        Role::Harvest => vec![
+            ("EVENTS", [27, 0, 0, 2097152, 0]),
+            ("PENDING_INIT", [1, 8, 8, 1024, 0]),
+            ("PENDING_QUERY", [1, 8, 16, 1024, 0]),
+            ("TERMD", [1, 8, 8, 1024, 0]),
+            ("GEN", [1, 8, 8, 1024, 0]),
+            ("LOSS", [5, 4, 8, 32, 0]),
+            ("QUERY_NEXT", [1, 16, 8, 4096, 0]),
+            ("TRUNC", [5, 4, 8, 64, 0]),
+            ("CALLS", [5, 4, 8, 64, 0]),
+            ("TRIP", [5, 8, 8, 128, 0]),
+            ("LGCALLS", [5, 4, 8, 64, 0]),
+            ("ALG_CLASS", [1, 8, 42, 1024, 0]),
+            ("TRIP_CLASS", [1, 8, 22, 64, 0]),
+            ("JUMPS", [3, 4, 4, 8, 0]),
+        ],
+        Role::Members => vec![
+            ("EVENTS", [27, 0, 0, 16777216, 0]),
+            ("BUCKET", [1, 4, 8, 4096, 0]),
+            ("GEN", [1, 8, 8, 1024, 0]),
+            ("LOSS", [5, 4, 8, 32, 0]),
+            ("TRUNC", [5, 4, 8, 64, 0]),
+            ("CALLS", [5, 4, 8, 64, 0]),
+            ("ALG_CLASS", [1, 8, 42, 1024, 0]),
+            ("SCAN", [9, 4, 40, 1024, 0]),
+            ("SEQ", [1, 4, 8, 4096, 0]),
+            ("BIRTH", [1, 4, 2, 4096, 0]),
+            ("RCOUNT", [1, 4, 8, 4096, 0]),
+            ("T_CACHE", [1, 8, 16, 1024, 0]),
+            ("CTRL", [2, 4, 24, 1, 0]),
+            ("ATTEMPT", [6, 4, 8, 1, 0]),
+            ("TRUNC_SEQ", [5, 4, 8, 64, 0]),
+        ],
+    }
+}
+
+/// Independent HOST shape fixture, never a production identity artifact/proof.
+pub fn identity_v2_bpf(role: Role) -> Vec<u8> {
+    let mut maps = if role == Role::Identity {
+        Vec::new()
+    } else {
+        literal_maps_v1(role)
+    };
+    maps.extend([
+        ("ID_CONTROL", [2, 4, 128, 1, 1024]),
+        ("ID_GROUP", [1, 16, 64, 2, 0]),
+        ("ID_CLAIM", [1, 8, 32, 8192, 0]),
+        ("ID_TASK", [1, 8, 64, 8192, 0]),
+        ("ID_IMAGE", [1, 8, 64, 8192, 0]),
+        ("ID_AUDIT", [2, 4, 64, 1, 0]),
+    ]);
+    let mut programs: Vec<(String, &str)> = match role {
+        Role::Identity => vec![
+            ("identity_newtask".into(), "raw_tracepoint/task_newtask"),
+            ("identity_exit".into(), "raw_tracepoint/sched_process_exit"),
+            ("identity_sys_enter".into(), "raw_tracepoint/sys_enter"),
+            ("identity_exec".into(), "raw_tracepoint/sched_process_exec"),
+        ],
+        Role::Count => vec![("count_entry".into(), "uprobe")],
+        Role::Harvest => vec![
+            ("init_entry".into(), "uprobe"),
+            ("init_return".into(), "uretprobe"),
+            ("query_entry".into(), "uprobe"),
+            ("query_return".into(), "uretprobe"),
+            ("trip_count".into(), "uprobe"),
+            ("trip_str0".into(), "uprobe"),
+            ("trip_str1".into(), "uprobe"),
+        ],
+        Role::Members => vec![("member_entry".into(), "uprobe")],
+    };
+    if role == Role::Harvest {
+        for i in 0..8 {
+            programs.push((format!("c{i}"), "uretprobe"));
+        }
+    }
+    if role == Role::Members {
+        for i in 0..512 {
+            programs.push((format!("member_{i:03}"), "uretprobe"));
+        }
+    }
+    fn put(b: &mut [u8], at: usize, value: u64, width: usize) {
+        b[at..at + width].copy_from_slice(&value.to_le_bytes()[..width]);
+    }
+    let mut strings = vec![0];
+    let mut symbols = vec![0; 24];
+    let mut defs = Vec::new();
+    for (name, dims) in maps {
+        let off = strings.len();
+        strings.extend(name.as_bytes());
+        strings.push(0);
+        let at = symbols.len();
+        symbols.resize(at + 24, 0);
+        put(&mut symbols, at, off as u64, 4);
+        symbols[at + 4] = 0x11;
+        put(&mut symbols, at + 6, 3, 2);
+        put(&mut symbols, at + 8, defs.len() as u64, 8);
+        put(&mut symbols, at + 16, 28, 8);
+        for d in dims.into_iter().chain([0, 0]) {
+            defs.extend(d.to_le_bytes());
+        }
+    }
+    let mut sections: Vec<(&str, u32, u64, Vec<u8>, u32, u32, u64)> = vec![
+        (".strtab", 3, 0, Vec::new(), 0, 0, 0),
+        (".symtab", 2, 0, Vec::new(), 1, 1, 24),
+        ("maps", 1, 0, defs, 0, 0, 0),
+    ];
+    for (name, section) in programs {
+        let idx = if let Some(idx) = sections.iter().position(|s| s.0 == section) {
+            idx
+        } else {
+            sections.push((section, 1, 6, Vec::new(), 0, 0, 0));
+            sections.len() - 1
+        };
+        let offset = sections[idx].3.len();
+        sections[idx].3.extend([0x95, 0, 0, 0, 0, 0, 0, 0]);
+        let off = strings.len();
+        strings.extend(name.as_bytes());
+        strings.push(0);
+        let at = symbols.len();
+        symbols.resize(at + 24, 0);
+        put(&mut symbols, at, off as u64, 4);
+        symbols[at + 4] = 0x12;
+        put(&mut symbols, at + 6, (idx + 1) as u64, 2);
+        put(&mut symbols, at + 8, offset as u64, 8);
+        put(&mut symbols, at + 16, 8, 8);
+    }
+    sections[0].3 = strings;
+    sections[1].3 = symbols;
+    let mut names = vec![0];
+    let mut offsets = Vec::new();
+    for s in &sections {
+        offsets.push(names.len());
+        names.extend(s.0.as_bytes());
+        names.push(0);
+    }
+    let shname = names.len();
+    names.extend(b".shstrtab\0");
+    offsets.push(shname);
+    sections.push((".shstrtab", 3, 0, names, 0, 0, 0));
+    let mut elf = vec![0; 64];
+    elf[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+    put(&mut elf, 16, 1, 2);
+    put(&mut elf, 18, 247, 2);
+    put(&mut elf, 20, 1, 4);
+    put(&mut elf, 52, 64, 2);
+    put(&mut elf, 58, 64, 2);
+    put(&mut elf, 60, (sections.len() + 1) as u64, 2);
+    put(&mut elf, 62, sections.len() as u64, 2);
+    let mut headers = vec![0; 64];
+    for (i, s) in sections.iter().enumerate() {
+        let offset = elf.len();
+        elf.extend(&s.3);
+        let at = headers.len();
+        headers.resize(at + 64, 0);
+        put(&mut headers, at, offsets[i] as u64, 4);
+        put(&mut headers, at + 4, s.1 as u64, 4);
+        put(&mut headers, at + 8, s.2, 8);
+        put(&mut headers, at + 24, offset as u64, 8);
+        put(&mut headers, at + 32, s.3.len() as u64, 8);
+        put(&mut headers, at + 40, s.4 as u64, 4);
+        put(&mut headers, at + 44, s.5 as u64, 4);
+        put(&mut headers, at + 56, s.6, 8);
+    }
+    while elf.len() % 8 != 0 {
+        elf.push(0);
+    }
+    let offset = elf.len();
+    put(&mut elf, 40, offset as u64, 8);
+    elf.extend(headers);
+    elf
+}
+pub fn identity_v2_inputs() -> BuildInputsV2 {
+    let mut value: serde_json::Value = serde_json::from_str(INPUT_BYTES).unwrap();
+    value["schema"] = serde_json::json!("osslscope-build-inputs-v2");
+    value["identity_abi"] = serde_json::json!(4);
+    value["custody_protocol"] = serde_json::json!(1);
+    value["identity_profile_sha256"] = serde_json::json!("77".repeat(32));
+    serde_json::from_value(value).unwrap()
+}
