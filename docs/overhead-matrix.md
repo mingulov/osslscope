@@ -7,6 +7,12 @@ candidate, including count loss and measurement limits. The historical budgets
 below belong to the broader product track; they are not inherited preview
 results. See the [roadmap](../ROADMAP.md).
 
+The current `count.lat_*` diagnostic counters sample the Count map's insertion
+path. Repeated hits on existing keys are not sampled. Their median and p99
+describe those samples, exclude the uprobe trap cost, and do not measure
+per-callback overhead across the window. Preview performance claims need
+matched workload timings and count-loss checks with these limits recorded.
+
 The tables below preserve historical fixture-era results, separate
 from current integrated v2 qualification. They are source/kernel/
 workload-specific medians from repeated fixture-provider runs on
