@@ -12,9 +12,9 @@ use super::{
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
-    fs::File,
+    fs::{File, OpenOptions},
     io::Read,
-    os::unix::fs::MetadataExt,
+    os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -382,9 +382,15 @@ fn snapshot_explicit_with(
     remaining: u64,
     validate: impl FnOnce(Role, &[u8]) -> Result<(), PackageError>,
 ) -> Result<RoleSnapshot, PackageError> {
-    let mut file = File::open(path).map_err(|_| {
-        PackageError::unavailable(format!("explicit {} object unreadable", role.file_name()))
-    })?;
+    // Special files must reach the regular-file check without waiting for a
+    // peer. O_NONBLOCK does not change reads from admitted regular objects.
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|_| {
+            PackageError::unavailable(format!("explicit {} object unreadable", role.file_name()))
+        })?;
     let before = file_identity(&file)?;
     if before.size == 0 || before.size > remaining {
         return Err(PackageError::invalid(
@@ -971,6 +977,63 @@ mod tests {
         .unwrap();
         assert_eq!(set.provenance().roles.harvest.bytes, 536_870_911);
     }
+    #[test]
+    fn package_explicit_snapshot_rejects_fifo_without_writer() {
+        use std::ffi::CString;
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "osslscope-profile-fifo-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("count");
+        let cpath = CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
+        let (send, receive) = mpsc::channel();
+        let reader_path = path.clone();
+        let reader = std::thread::spawn(move || {
+            let rejected = snapshot_explicit_with(Role::Count, &reader_path, 1024, |_, _| {
+                panic!("non-regular input reached object validation")
+            })
+            .is_err();
+            let _ = send.send(rejected);
+        });
+        let observed = receive.recv_timeout(Duration::from_millis(300));
+        // Unblock the old blocking-open behavior before failing the assertion;
+        // even the RED run must not leave a thread or FIFO behind.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut unblocked = false;
+        if observed.is_err() {
+            while !reader.is_finished() && Instant::now() < deadline {
+                if let Ok(writer) = std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&path)
+                {
+                    drop(writer);
+                    unblocked = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        if observed.is_ok() || unblocked || reader.is_finished() {
+            reader.join().unwrap();
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(
+            matches!(observed, Ok(true)),
+            "explicit object admission waited for a FIFO writer: {observed:?}"
+        );
+    }
+
     #[test]
     fn package_explicit_snapshot_retains_read_buffer_and_identity() {
         use std::os::unix::fs::{MetadataExt, symlink};
