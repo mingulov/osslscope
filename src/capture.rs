@@ -37,6 +37,8 @@
 //! `tests/capture_controller.rs` suite drives the real [`observe`]
 //! loop with scripted sessions, an injected clock and failing I/O —
 //! no timing sleeps, no privileges.
+pub(crate) mod profiled;
+
 use crate::count_session::{
     CountBackend, CountDelta, CountDrain, CountSession, DiscoveredSite, FenceReason as CountFence,
 };
@@ -1168,6 +1170,11 @@ pub trait TargetPort {
     /// Non-blocking exit poll: `Ok(None)` = alive. Foreign targets
     /// are never waited on and always answer `None`.
     fn poll_exit(&mut self) -> anyhow::Result<Option<i32>>;
+    /// Optional non-consuming wait observation. Preview capture requires this;
+    /// legacy target ports keep their existing consuming poll behavior.
+    fn peek_exit(&self) -> anyhow::Result<Option<i32>> {
+        anyhow::bail!("non-consuming owned-child wait is unavailable")
+    }
     /// Resolve custody after a setup failure (never leaves a stopped
     /// child; never kills a running application).
     fn resolve_setup_failure(&mut self) -> anyhow::Result<()>;
@@ -1193,6 +1200,10 @@ impl TargetPort for target::OwnedTarget {
 
     fn poll_exit(&mut self) -> anyhow::Result<Option<i32>> {
         target::OwnedTarget::poll_exit(self)
+    }
+
+    fn peek_exit(&self) -> anyhow::Result<Option<i32>> {
+        target::OwnedTarget::peek_exit(self)
     }
 
     fn resolve_setup_failure(&mut self) -> anyhow::Result<()> {

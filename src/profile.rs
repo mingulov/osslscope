@@ -17,6 +17,7 @@ pub(crate) struct AdmittedProfile {
     backing: File,
     identity: FileIdentity,
     pub profile_id: String,
+    pub kernel_release: String,
     pub object: crate::evidence::ObjectRecord,
     pub sites: Vec<crate::count_session::DiscoveredSite>,
     /// The owner may run in a different process. Refer to the observer's
@@ -62,6 +63,7 @@ pub(crate) fn admit(libcrypto: &Path) -> anyhow::Result<AdmittedProfile> {
         backing,
         identity,
         profile_id: catalogue.id,
+        kernel_release: catalogue.kernel_release,
         object,
         sites,
         locator,

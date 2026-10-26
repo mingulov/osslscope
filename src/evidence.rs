@@ -794,6 +794,10 @@ pub struct CaptureDocument {
     /// Observer package identity derived only from admitted retained inputs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub package_build: Option<crate::package::commands::PackageProvenance>,
+    /// Retained Count bytes for the foreground preview, which resolves no
+    /// harvest/members set. Reuses the existing per-role provenance record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count_object: Option<crate::package::commands::PackageRoleProvenance>,
     pub status: Completeness,
     pub window: CaptureWindow,
     pub sites: Vec<SiteExecution>,
@@ -1111,6 +1115,7 @@ pub fn finalize(mut input: FinalizeInput) -> CaptureDocument {
     CaptureDocument {
         schema: CAPTURE_SCHEMA_V2.to_string(),
         package_build: None,
+        count_object: None,
         status,
         window: input.window,
         sites: input.sites,

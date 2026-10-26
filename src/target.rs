@@ -2431,6 +2431,49 @@ impl OwnedTarget {
         Err(anyhow::Error::new(e).context(format!("SIGCONT to {}", self.pid)))
     }
 
+    /// Observe exit without consuming the waitable child. Count-only capture
+    /// keeps its original group waitable until count admission and links close.
+    pub fn peek_exit(&self) -> anyhow::Result<Option<i32>> {
+        match self.state {
+            CustodyState::Reaped => return Ok(self.exit_code),
+            CustodyState::Detached => anyhow::bail!("peek: target already detached"),
+            CustodyState::Stopped | CustodyState::Released => {}
+        }
+        let setup = self
+            .setup
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("peek missing child identity"))?;
+        let info = loop {
+            match setup_waitid(
+                libc::P_PIDFD,
+                setup.pidfd.as_raw_fd() as u32,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            ) {
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                result => break result?,
+            }
+        };
+        let pid = unsafe { info.si_pid() };
+        if pid == 0 {
+            return Ok(None);
+        }
+        if pid != self.pid as i32
+            || !matches!(
+                info.si_code,
+                libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED
+            )
+        {
+            anyhow::bail!("peek received an inconsistent owned-child exit");
+        }
+        Ok(Some(
+            ChildExitReceipt {
+                reason: info.si_code,
+                status: unsafe { info.si_status() },
+            }
+            .code(),
+        ))
+    }
+
     /// Non-blocking exit poll: `Ok(None)` = still owned and alive;
     /// `Ok(Some(code))` = reaped (state `Reaped`, idempotent — the
     /// stored status is returned again). Polling a detached target is

@@ -2970,7 +2970,7 @@ impl CountBackend for LiveBackend {
 pub(crate) mod tests {
     use super::*;
 
-    fn preplanned_fixture() -> (std::fs::File, std::path::PathBuf, DiscoveredSite) {
+    pub(crate) fn preplanned_fixture() -> (std::fs::File, std::path::PathBuf, DiscoveredSite) {
         use std::os::{fd::AsRawFd, unix::fs::MetadataExt};
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
