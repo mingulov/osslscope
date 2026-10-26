@@ -9,35 +9,41 @@ and kernel identities in the [catalogue](../profiles/stock-openssl3-v1.json).
 Other kernel builds/libraries refuse admission. See
 [release notes](release-v0.2.0.md) for scope and lifecycle limits.
 
-Five alternating baseline/observed pairs per family on the development
-candidate used the [finite workload](../tests/runtime/README.md), N100000,
-default debug host and release BPF, root privileges for both legs, no concurrent
-builds/tests and no CPU pinning. Each observed SHA run counted100000 context
-entries; each AES run counted 100000 context entries and 100000 shared updates.
-All workloads exited 0 and reports remained PARTIAL/exit 3.
+The final fix candidate repeated one baseline/observed pair per family using
+the [finite workload](../tests/runtime/README.md), N100000, default debug host
+and release BPF. Both legs ran as root, without CPU pinning or concurrent
+builds/tests. Elapsed time ends at pidfd exit readiness, avoiding timed-wait
+polling in the controller. This is a single-pair check, not a statistical SLO.
 
-| Workload | Baseline median | Observed median | Median paired wall ratio |
-| --- | ---: | ---: | ---: |
-| SHA-256 | about 0.016s | about 0.36s | about 23x |
-| AES-256-GCM | about 0.064s | about 0.72s | about 11x |
+| Workload | Baseline | Observed | Whole-command ratio | Observed enrolled entries |
+| --- | ---: | ---: | ---: | --- |
+| SHA-256 | 0.0112s | 0.322s | 28.7x | 100000 context entries |
+| AES-256-GCM | 0.0588s | 0.687s | 11.7x | 100000 context entries + 100000 shared updates |
 
-These whole-command times include startup, library hashing, load/attach,
-drain/rendering and controller polling (up to 50ms per timed wait). The rounded
-numbers and ratios reflect this measurement limit. Tiny messages and fresh contexts make this a
-stress case, not a paced production workload. The wall difference is not an
-isolated probe or callback latency. Bounded inventory runs complete in under a
-second here, but tight loops pay material overhead. There is no production
-low-overhead, 100k/s, 4us or 2x guarantee.
+All workloads exited 0, counts matched the independent expectations, and reports
+remained PARTIAL/exit 3. The measured host SHA-256 is
+`7ae235a6a0653ae8200596daab68839a49403a2c50c97ac3af6999fb3bc36922`;
+the exact Count SHA is recorded in the [release notes](release-v0.2.0.md).
+Other builds and workloads need their own measurements.
 
-The installed 0.2.0 candidate repeated one pair per family with the same Count
-bytes and exact expected totals: SHA about 0.016/0.36s and AES about 0.064/0.77s
-baseline/observed. This is a version-check repeat, not a new five-pair median.
+Whole-command time includes startup, library hashing, load/attach and
+drain/rendering. Tiny messages and fresh contexts make this a stress case,
+without a production-rate pacer. The wall difference is not isolated probe or
+callback latency. Bounded inventory runs finish in under a second here, while
+tight loops pay material overhead. No production low-overhead, 100k/s, 4us or
+2x guarantee is claimed.
 
-Observed count delta was zero in these finite controls, with no map insertion,
+Five earlier development pairs per family used controller waits with up to
+50ms polling: rounded medians were SHA about 0.016/0.36s and AES about
+0.064/0.72s baseline/observed. One earlier version check and the final pair above
+make seven pairs per family in total. Those earlier approximate measurements
+are separate from the final artifact check.
+
+Observed count delta was zero in the finite controls, with no map insertion,
 attach, drain-shortfall or unattributed-count loss. The strict receipt still
 records `count.close_failed`, `count.owner_failed` and
-`count.quiescence_unknown` as1 for the unreviewed terminal-writer guarantee.
-That limitation and the unknown global denominator remain visible; this is no
+`count.quiescence_unknown` as 1 for the unreviewed terminal-writer guarantee.
+That limitation and the unknown global denominator stay visible; this is no
 general zero-loss/finality claim. See [closure semantics](what-it-proves.md).
 
 The current `count.lat_*` diagnostic counters sample the Count map's insertion
@@ -51,7 +57,7 @@ from current integrated v2 qualification. They are source/kernel/
 workload-specific medians from repeated fixture-provider runs on
 VM or bare-metal kernels, not standing support or performance
 certification for the current tree. Historical `v0.1.0` release
-credit remains on its recorded terms; current live, overhead,
+credit remains on its recorded terms; broader live/overhead matrix,
 COMPLETE-window and exact-package acceptance remains open.
 An enrollment-only profile is listed separately from performance.
 
