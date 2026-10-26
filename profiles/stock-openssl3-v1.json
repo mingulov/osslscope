@@ -1,0 +1,101 @@
+{
+  "format_version": 1,
+  "id": "ubuntu2604-openssl355-v1",
+  "kernel_release": "7.0.0-38-generic",
+  "kernel_build_id": "338e542e384c46228f7a378babc0f9bb2b6a5997",
+  "libcrypto_sha256": "5385f0436ac2e284ba8c5fb1488874057c29c04be72dea32add832694f381e28",
+  "libcrypto_build_id": "0ebcfeaee273dc860b29e067d255def704185b41",
+  "libcrypto_size": 6386528,
+  "sites": [
+    {
+      "offset": 4187904,
+      "complete": true,
+      "candidates": [
+        {
+          "op": 2,
+          "funcid": 1,
+          "algorithm_classes": [
+            "2.16.840.1.101.3.4.1.46"
+          ],
+          "weak_alias": false
+        }
+      ]
+    },
+    {
+      "offset": 4266320,
+      "complete": true,
+      "candidates": [
+        {
+          "op": 1,
+          "funcid": 1,
+          "algorithm_classes": [
+            "2.16.840.1.101.3.4.2.1"
+          ],
+          "weak_alias": false
+        }
+      ]
+    },
+    {
+      "offset": 4664256,
+      "complete": true,
+      "candidates": [
+        {
+          "op": 2,
+          "funcid": 4,
+          "algorithm_classes": [
+            "2.16.840.1.101.3.4.1.46"
+          ],
+          "weak_alias": false
+        },
+        {
+          "op": 2,
+          "funcid": 4,
+          "algorithm_classes": [
+            "2.16.840.1.101.3.4.1.26"
+          ],
+          "weak_alias": false
+        },
+        {
+          "op": 2,
+          "funcid": 4,
+          "algorithm_classes": [
+            "2.16.840.1.101.3.4.1.6"
+          ],
+          "weak_alias": false
+        },
+        {
+          "op": 2,
+          "funcid": 4,
+          "algorithm_classes": [
+            "1.2.410.200046.1.1.36"
+          ],
+          "weak_alias": false
+        },
+        {
+          "op": 2,
+          "funcid": 4,
+          "algorithm_classes": [
+            "1.2.410.200046.1.1.35"
+          ],
+          "weak_alias": false
+        },
+        {
+          "op": 2,
+          "funcid": 4,
+          "algorithm_classes": [
+            "1.2.410.200046.1.1.34"
+          ],
+          "weak_alias": false
+        },
+        {
+          "op": 2,
+          "funcid": 4,
+          "algorithm_classes": [
+            "1.2.156.10197.1.104.8"
+          ],
+          "weak_alias": false
+        }
+      ]
+    }
+  ]
+}

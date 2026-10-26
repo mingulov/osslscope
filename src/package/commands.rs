@@ -212,6 +212,76 @@ impl AdmittedSet {
     }
 }
 
+/// Count-only preview selection. Explicit objects retain the existing
+/// operator-trust boundary; compatibility and a digest do not authenticate code.
+pub(crate) struct ProfiledCount {
+    pub object_bytes: Arc<[u8]>,
+    pub object_sha256: [u8; 32],
+    pub selection: RoleSelection,
+}
+
+pub(crate) fn resolve_profiled_count(
+    override_path: Option<&Path>,
+) -> Result<ProfiledCount, PackageError> {
+    resolve_profiled_count_with(override_path, installed_profiled_count, snapshot_explicit)
+}
+
+fn resolve_profiled_count_with(
+    override_path: Option<&Path>,
+    installed: impl FnOnce() -> Result<RoleSnapshot, PackageError>,
+    explicit: impl FnOnce(Role, &Path, u64) -> Result<RoleSnapshot, PackageError>,
+) -> Result<ProfiledCount, PackageError> {
+    let (snapshot, selection) = match override_path {
+        Some(path) => (
+            explicit(Role::Count, path, ROLE_BUFFER_LIMIT)?,
+            RoleSelection::OperatorExplicit,
+        ),
+        None => (installed()?, RoleSelection::InstalledMatched),
+    };
+    Ok(ProfiledCount {
+        object_bytes: snapshot.bytes,
+        object_sha256: snapshot.sha256.0,
+        selection,
+    })
+}
+
+fn installed_profiled_count() -> Result<RoleSnapshot, PackageError> {
+    use crate::discovery::onboard;
+    for dir in onboard::default_object_dirs() {
+        if !onboard::is_trusted_dir(&dir) {
+            continue;
+        }
+        let path = dir.join(onboard::COUNT_OBJECT_NAME);
+        if !path.exists() {
+            continue;
+        }
+        if !onboard::is_trusted_file(&path) {
+            return Err(PackageError::Untrusted {
+                context: "installed Count object owner, mode or ancestry".into(),
+            });
+        }
+        let snapshot = snapshot_explicit(Role::Count, &path, ROLE_BUFFER_LIMIT)?;
+        if snapshot.identity.uid != 0 || snapshot.identity.mode & 0o022 != 0 {
+            return Err(PackageError::Untrusted {
+                context: "installed Count object owner or mode changed".into(),
+            });
+        }
+        let receipt_bytes = onboard::verify_role_receipt_bytes(onboard::ObjectRole::Count, &path)
+            .map_err(|_| {
+            PackageError::invalid("installed Count receipt verification failed")
+        })?;
+        if receipt_bytes.as_slice() != snapshot.bytes.as_ref() {
+            return Err(PackageError::Mutated {
+                context: "installed Count changed during receipt verification".into(),
+            });
+        }
+        return Ok(snapshot);
+    }
+    Err(PackageError::unavailable(
+        "no trusted installed Count object; pass --count-object for a local build",
+    ))
+}
+
 pub fn resolve_command_objects(
     kind: CommandKind,
     overrides: &ObjectOverrides,
@@ -521,6 +591,46 @@ mod tests {
     use super::test_support::*;
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn profile_count_never_resolves_reader_roles() {
+        let old_calls = RESOLVER_CALLS.with(Cell::get);
+        let calls = Cell::new(0);
+        let selected = resolve_profiled_count_with(
+            Some(Path::new("count-only")),
+            || panic!("explicit Count must not resolve an installed bundle"),
+            |role, path, limit| {
+                calls.set(calls.get() + 1);
+                assert_eq!(role, Role::Count);
+                assert_eq!(path, Path::new("count-only"));
+                assert_eq!(limit, ROLE_BUFFER_LIMIT);
+                Ok(snapshot(role))
+            },
+        )
+        .unwrap();
+        assert_eq!(calls.get(), 1);
+        assert_eq!(&*selected.object_bytes, b"count-fixture");
+        assert_eq!(selected.object_sha256, sha256(b"count-fixture").0);
+        assert_eq!(selected.selection, RoleSelection::OperatorExplicit);
+        assert_eq!(RESOLVER_CALLS.with(Cell::get), old_calls);
+
+        let installed = resolve_profiled_count_with(
+            None,
+            || Ok(snapshot(Role::Count)),
+            |_, _, _| panic!("implicit Count must not use explicit selection"),
+        )
+        .unwrap();
+        assert_eq!(installed.selection, RoleSelection::InstalledMatched);
+        assert_eq!(&*installed.object_bytes, b"count-fixture");
+        assert_eq!(RESOLVER_CALLS.with(Cell::get), old_calls);
+    }
+
+    #[test]
+    fn profile_count_bad_abi_stops_before_any_command_effect() {
+        let old_calls = RESOLVER_CALLS.with(Cell::get);
+        assert!(resolve_profiled_count(Some(&std::env::current_exe().unwrap())).is_err());
+        assert_eq!(RESOLVER_CALLS.with(Cell::get), old_calls);
+    }
     #[test]
     fn package_command_adapters_share_admitted_snapshots() {
         let effects = Cell::new(0);
