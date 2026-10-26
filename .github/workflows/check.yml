@@ -32,7 +32,15 @@ jobs:
               output.write("OSSL_PACKAGE_TEST_PRIVATE_DIR=" + root + "/osslscope-package-fixtures\n")
               output.write("OSSL_LIFECYCLE_TEST_DRIVER=" + artifacts[0] + "\nRUST_TEST_THREADS=1\n")
           PY
-      - run: cargo test --workspace --locked
+      - name: Run workspace tests without inherited runner descriptors
+        # The pre-thread lifecycle driver rejects unexpected open FDs. Keep
+        # runner-owned handles outside Cargo; test-created descriptor controls
+        # and the production bootstrap checks remain unchanged.
+        run: |
+          python3 - <<'PY'
+          import subprocess
+          subprocess.run(["cargo", "test", "--workspace", "--locked"], check=True, close_fds=True)
+          PY
       - run: cargo clippy --workspace --locked -- -D warnings
   bpf:
     # Detached BPF build (T05): crates/ebpf is its own workspace on a pinned
