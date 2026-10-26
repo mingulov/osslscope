@@ -1,8 +1,9 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Source component notices
 
-The root `osslscope` package, `ossl-bpf-sys`, `ossl-discover`,
-`osslscope-ebpf-common` and `osslscope-manifest` declare version 0.1.0 and
+The root `osslscope` package declares version 0.2.0.
+`ossl-bpf-sys`, `ossl-discover`, `osslscope-ebpf-common` and
+`osslscope-manifest` remain internal version 0.1.0. All declare
 GPL-3.0-or-later. Their license text is in [LICENSE](LICENSE).
 
 `osslscope-ebpf` declares version 0.0.0 and GPL-2.0-only. The independent

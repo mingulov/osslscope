@@ -66,7 +66,12 @@ impl Fixture {
         ] {
             fixture.source(path, format!("[package]\nname = \"{name}\"\nversion = \"{version}\"\nlicense = \"{license}\"\n").as_bytes());
         }
-        let host_lock = b"version = 4\n[[package]]\nname = \"osslscope\"\nversion = \"0.1.0\"\n[[package]]\nname = \"osslscope-ebpf-common\"\nversion = \"0.1.0\"\n";
+        let host_lock = concat!(
+            "version = 4\n[[package]]\nname = \"osslscope\"\nversion = \"",
+            env!("CARGO_PKG_VERSION"),
+            "\"\n[[package]]\nname = \"osslscope-ebpf-common\"\nversion = \"0.1.0\"\n",
+        )
+        .as_bytes();
         let bpf_lock = b"version = 4\n[[package]]\nname = \"osslscope-ebpf\"\nversion = \"0.0.0\"\n[[package]]\nname = \"osslscope-bpf-contract\"\nversion = \"0.0.0\"\n";
         fixture.source("Cargo.lock", host_lock);
         fixture.source("crates/ebpf/Cargo.lock", bpf_lock);
@@ -111,7 +116,7 @@ impl Fixture {
             (
                 "host",
                 "osslscope",
-                "0.1.0",
+                env!("CARGO_PKG_VERSION"),
                 "Cargo.toml",
                 "GPL-3.0-or-later",
             ),

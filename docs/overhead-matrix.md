@@ -1,11 +1,39 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Overhead and support matrix
 
-The v0.2.0 foreground preview has no current runtime/overhead qualification yet.
-Its release requires matched SHA-256/AES-GCM measurements on the exact enrolled
-candidate, including count loss and measurement limits. The historical budgets
-below belong to the broader product track; they are not inherited preview
-results. See the [roadmap](../ROADMAP.md).
+## v0.2.0 foreground preview
+
+Native checks cover Ubuntu 26.04.1 amd64, kernel `7.0.0-38-generic`
+(`7.0.0-38.38`), and stock OpenSSL `3.5.5-1ubuntu3.7`, with the exact library
+and kernel identities in the [catalogue](../profiles/stock-openssl3-v1.json).
+Other kernel builds/libraries refuse admission. See
+[release notes](release-v0.2.0.md) for scope and lifecycle limits.
+
+Five alternating baseline/observed pairs per family on the development
+candidate used the [finite workload](../tests/runtime/README.md), N100000,
+default debug host and release BPF, root privileges for both legs, no concurrent
+builds/tests and no CPU pinning. Each observed SHA run counted100000 context
+entries; each AES run counted100000 context entries and100000 shared updates.
+All workloads exited0 and reports remained PARTIAL3.
+
+| Workload | Baseline median | Observed median | Median paired wall ratio |
+| --- | ---: | ---: | ---: |
+| SHA-256 | 0.015865s | 0.364560s | 22.98x |
+| AES-256-GCM | 0.064000s | 0.715125s | 11.18x |
+
+These whole-command times include startup, library hashing, load/attach,
+drain/rendering and polling. Tiny messages and fresh contexts make this a
+stress case, not a paced production workload. The wall difference is not an
+isolated probe or callback latency. Bounded inventory runs complete in under a
+second here, but tight loops pay material overhead. There is no production
+low-overhead, 100k/s, 4us or2x guarantee.
+
+Observed count delta was zero in these finite controls, with no map insertion,
+attach, drain-shortfall or unattributed-count loss. The strict receipt still
+records `count.close_failed`, `count.owner_failed` and
+`count.quiescence_unknown` as1 for the unreviewed terminal-writer guarantee.
+That limitation and the unknown global denominator remain visible; this is no
+general zero-loss/finality claim. See [closure semantics](what-it-proves.md).
 
 The current `count.lat_*` diagnostic counters sample the Count map's insertion
 path. Repeated hits on existing keys are not sampled. Their median and p99
@@ -22,9 +50,9 @@ credit remains on its recorded terms; current live, overhead,
 COMPLETE-window and exact-package acceptance remains open.
 An enrollment-only profile is listed separately from performance.
 
-## Budgets
+## Historical broader-product budgets
 
-Two absolute budgets, both must hold:
+Two historical absolute budgets for the broader product track:
 
 - At most 4.0 us median added latency per intercepted call.
 - At most 2.0x wall-clock at realistic rates (paced to 100k ops/s).
@@ -76,10 +104,9 @@ correctness gates, including keyed exactness, passed there; that
 does not prove current correctness or establish a new kernel-floor
 exclusion. Re-measure the exact current target/kernel/observer.
 
-Practical guidance: pin overhead-sensitive gates to 6.12+
-runners as a starting point, then measure both budgets. `doctor`
-has no overhead qualification probe; a functional admission pass
-does not establish latency, rate or wall-clock acceptance.
+`doctor` has no overhead qualification probe; a functional admission pass
+does not establish latency, rate or wall-clock acceptance. The preview accepts
+only its exact enrolled kernel build, regardless of these historical rows.
 
 ## Support matrix
 
@@ -125,7 +152,7 @@ Recorded historical fixture checks across that matrix:
   and remains unclaimed; no current enabled-state success follows
   from these tables. AlmaLinux is not an actual RHEL 10 receipt.
 
-Current qualification must use the exact integrated artifacts and
+Broader-product qualification must use the exact integrated artifacts and
 actual required platforms, including actual RHEL 10 and enabled
 Secure Boot/lockdown/enforcing SELinux states with the required
 controls preserved. A disabled-state control or approved alternative
@@ -134,8 +161,8 @@ PARTIAL windows remain in completeness denominators; exclude only
 predeclared expected-PARTIAL negatives. See
 [the promotion checklist](promotion-checklist.md).
 
-Current unsupported shapes include pre-6.9 kernels and non-x86-64
-targets. Unknown stripped builds need explicit admission, not
-guessed offsets. Always-on service operation is forthcoming and
-current COMPLETE-window gating is unqualified; see
+The preview's only supported shape is the exact x86-64 profile at the top.
+Unknown builds require future enrollment, never guessed offsets. Always-on
+service operation is forthcoming and current COMPLETE-window gating is
+unqualified; see
 [who should NOT adopt](what-it-proves.md).

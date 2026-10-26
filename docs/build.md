@@ -1,9 +1,10 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Build from source
 
-The current target is the source-built v0.2.0 foreground preview. Runtime
-qualification is open; compile success is not an installed count/confinement
-pass. The existing recipe still builds three development BPF objects; supported
+The current target is the source-built v0.2.0 foreground preview. Native
+qualification covers the [exact enrolled profile](release-v0.2.0.md); compile
+success alone grants no support for other profiles. The existing recipe still
+builds three development BPF objects; supported
 commands resolve/load only Count. No hermetic builder, v2 bundle, DEB/RPM or
 broader matrix is required for this milestone. See [usage](usage.md) and the
 [exact catalogue](../profiles/README.md).

@@ -3,7 +3,7 @@
 
 | Actual text | Applicable source components |
 | --- | --- |
-| [Root LICENSE](../LICENSE), GPL-3.0 | `osslscope`, `ossl-bpf-sys`, `ossl-discover`, `osslscope-ebpf-common`, `osslscope-manifest`, each 0.1.0 with GPL-3.0-or-later expressions |
+| [Root LICENSE](../LICENSE), GPL-3.0 | `osslscope` 0.2.0; internal `ossl-bpf-sys`, `ossl-discover`, `osslscope-ebpf-common`, `osslscope-manifest` 0.1.0; all GPL-3.0-or-later |
 | [GPL-2.0-only.txt](GPL-2.0-only.txt) | `osslscope-ebpf` 0.0.0 under GPL-2.0-only; the selected GPL-2.0 option of `osslscope-bpf-contract` 0.0.0, whose expression remains GPL-2.0-or-later |
 
 The first-party declarations are indexed in [NOTICE.md](../NOTICE.md).

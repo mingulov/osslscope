@@ -6,9 +6,10 @@ uprobes, without changing application code, libraries or configuration.
 Counts stay attached to physical code sites; shared candidates retain their
 uncertainty and each entry is counted once.
 
-**Status: unreleased v0.2.0 development.** The foreground count-only route is
-implemented; installed runtime, cleanup and overhead qualification remain open.
-Source tests do not establish runtime support. Reports use the
+**Status: v0.2.0 source preview candidate.** The foreground count-only route
+has native count, isolation, policy and lifecycle checks on the exact profile
+below. This is a bounded inventory tool with material overhead on tight loops;
+see [measured limits](docs/overhead-matrix.md). Reports use the
 [observed-crypto-v2.3 contract](docs/observed-crypto-v2.md).
 
 ## The foreground preview
@@ -18,8 +19,8 @@ library and kernel `7.0.0-38-generic` build. Admission checks the actual library
 SHA-256/build ID, protected file backing, kernel build ID and initial PID
 namespace. The [catalogue](profiles/README.md) documents the three callback
 sites: definite SHA-256 and AES-256-GCM context creation entries, plus a shared
-GCM update with seven possible algorithm meanings. This is an enrollment
-candidate awaiting live qualification, not broad OpenSSL or Linux support.
+GCM update with seven possible algorithm meanings. Qualification covers this
+exact profile; additional OpenSSL and Linux builds need separate enrollment.
 
 Supported commands are `doctor`, `report`, `check` and offline `alias-audit`.
 `report` and `check` launch one owned foreground process and observe its threads.
@@ -100,6 +101,7 @@ startup custody.
 - [Output contract](docs/observed-crypto-v2.md)
 - [Roadmap](ROADMAP.md), [documentation index](docs/README.md)
 - [Component licensing](docs/licensing.md)
+- [v0.2.0 source release notes](docs/release-v0.2.0.md)
 
 Permanent boundaries: no keys, passwords, plaintext or application payload
 capture; no TLS interception or interposition. The broader discovery/package

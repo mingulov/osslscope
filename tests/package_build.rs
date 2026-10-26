@@ -157,11 +157,9 @@ fn identity_v2_real_dev_producer_refuses_missing_elf() {
     let base = std::path::PathBuf::from(std::env::var_os("OSSL_PACKAGE_TEST_PRIVATE_DIR").unwrap());
     let root = base.join(format!("v2-missing-{}", std::process::id()));
     std::fs::create_dir(&root).unwrap();
-    std::fs::write(
-        root.join("seed.json"),
-        canonical_bytes(&fixtures::identity_v2_inputs()),
-    )
-    .unwrap();
+    let mut inputs = fixtures::identity_v2_inputs();
+    inputs.product_version = env!("CARGO_PKG_VERSION").into();
+    std::fs::write(root.join("seed.json"), canonical_bytes(&inputs)).unwrap();
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_osslscope-dev-admission"))
         .args(["contract", "--inputs"])
         .arg(root.join("seed.json"))
@@ -170,7 +168,11 @@ fn identity_v2_real_dev_producer_refuses_missing_elf() {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(4));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("development artifact"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("development artifact"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(!root.join("bundle-contract.json").exists());
     assert!(!root.join("dev-admission.json").exists());
     let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/build-dev.sh");

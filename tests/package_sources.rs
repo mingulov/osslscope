@@ -462,7 +462,7 @@ fn legal_inventory_names_actual_components() {
     assert_eq!(sbom["spdxVersion"], "SPDX-2.3");
     let packages = sbom["packages"].as_array().unwrap();
     for (name, version, license) in [
-        ("osslscope", "0.1.0", "GPL-3.0-or-later"),
+        ("osslscope", env!("CARGO_PKG_VERSION"), "GPL-3.0-or-later"),
         ("osslscope-ebpf", "0.0.0", "GPL-2.0-only"),
         ("osslscope-bpf-contract", "0.0.0", "GPL-2.0-or-later"),
         ("osslscope-ebpf-common", "0.1.0", "GPL-3.0-or-later"),

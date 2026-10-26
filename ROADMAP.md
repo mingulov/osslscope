@@ -1,16 +1,16 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Roadmap
 
-osslscope is in development. This roadmap describes planned releases; the
-current tree has not qualified these workflows for release.
+osslscope is in development. The v0.2.0 source preview has one qualified
+foreground workflow. Broader features remain planned releases.
 
 ## v0.2.0: a usable foreground preview
 
-The next milestone concentrates on running one unchanged application and
+This milestone concentrates on running one unchanged application and
 answering a useful question: which enrolled OpenSSL implementation callbacks
 actually executed?
 
-Implementation scope (installed/runtime qualification remains open):
+Implemented and exercised on the exact enrolled profile:
 
 - Build from source, install into a local prefix and check the environment with
   `doctor`.
@@ -27,12 +27,12 @@ entries do not prove cryptographic success, runtime provider activation or
 complete application coverage. Unsupported modes and unmatched enrolled OpenSSL libraries will
 be rejected. The CLI enforces these restrictions before target/BPF acquisition.
 
-The initial distribution will be source plus a documented, tested local
-build/install workflow. A release requires an actual installed positive-count
-workflow, independent count/confinement controls, policy/output checks, normal
-cleanup and measured overhead on the advertised profile. Source tests alone do
-not establish runtime support. Full binary-package and cross-platform
-qualification is later work.
+The initial distribution is source plus a documented local build/install
+workflow. Native installed checks cover positive counts, foreign/forked group
+exclusion, policy/output behavior and normal cleanup, with
+[measured overhead and limits](docs/overhead-matrix.md). The pre-exec observer
+crash limitation remains explicit. See [release notes](docs/release-v0.2.0.md).
+Full binary-package and cross-platform qualification is later work.
 
 ## After v0.2.0
 

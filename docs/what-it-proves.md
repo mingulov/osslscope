@@ -5,8 +5,9 @@ The v0.2.0 foreground route observes entries into a finite set of compiled
 OpenSSL implementation callbacks in one exact enrolled library/kernel profile.
 It launches one unchanged application, counts its original thread group and
 threads, and produces the existing
-[observed-crypto-v2.3 document](observed-crypto-v2.md). Live release qualification
-is still open; source tests and catalogue enrollment do not qualify runtime use.
+[observed-crypto-v2.3 document](observed-crypto-v2.md). Native qualification
+covers the [one advertised profile](release-v0.2.0.md); source tests and
+catalogue enrollment alone do not qualify another runtime environment.
 
 ## What a positive entry establishes
 

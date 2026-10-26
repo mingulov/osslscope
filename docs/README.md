@@ -13,7 +13,8 @@ preview's enforced CLI scope.
 - `install.md` - local prefix and package install, doctor-first verify, uninstall
 - `usage.md` - scoped foreground CLI (`report` / `check` / `doctor` / offline `alias-audit`)
 - `what-it-proves.md` - claim chain, non-goals, who-should-NOT-adopt
-- `overhead-matrix.md` - overhead and support matrix (worst cells)
+- `release-v0.2.0.md` - source preview scope, native checks and limits
+- `overhead-matrix.md` - measured preview timings and historical broader matrix
 - `auditor-story.md` - end-to-end auditor walk: evidence to verdict
 - `ci-recipes.md` - CI gate recipes (`check` in spawn mode)
 - `partial-runbook.md` - PARTIAL runbook: per-reason response

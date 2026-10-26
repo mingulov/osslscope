@@ -1,7 +1,32 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Changelog
 
-## Unreleased development
+## 0.2.0 source preview
+
+- Count-only foreground `doctor` / `report` / `check` workflow for one owned
+  process and its threads, using a finite reviewed catalogue and native kernel
+  group confinement before exec. One exact Ubuntu amd64/OpenSSL3.5.5/kernel
+  build is enrolled and exercised; unmatched profiles refuse.
+- Definite SHA-256 and AES-256-GCM context observations plus a shared GCM update.
+  Human/JSON (`observed-crypto-v2.3`), definite-only CBOM and CLI/TOML algorithm
+  policies retain shared counts, unknown coverage and partial absence semantics.
+- Installed native controls cover known counts, worker/exec/fork/foreign groups,
+  mismatched inputs, outputs/policies, signals, deadlines and attach failure.
+  Fixed a retired-owner setup wait and preserved usable positive evidence when
+  the sole missing capability is the terminal-writer completion theorem.
+- Every capture remains PARTIAL; no absence, crypto-success or complete-window
+  claim. Pre-exec observer crash can strand a stopped child. Tight loops have
+  material overhead; [measured limits](docs/overhead-matrix.md) apply.
+- Source distribution with pinned tools/lockfiles and local-prefix installation.
+  No bundled binaries/dependencies; root package0.2.0, internal helper crates
+  retain their existing versions. General discovery, external attach, broader
+  profiles, services and DEB/RPM remain later work. See
+  [release notes](docs/release-v0.2.0.md) and [roadmap](ROADMAP.md).
+
+## Earlier development history (broader product track)
+
+The entries in this section record earlier source work, including deferred
+features. The scoped0.2.0 workflow and its qualification are described above.
 
 - `check --policy FILE` admits reusable bounded TOML policies before
   target or output effects, adds CLI constraints, and rejects impossible
@@ -38,9 +63,8 @@
   observation exclusions remain unchanged; see
   [what it proves](docs/what-it-proves.md).
 
-This is not a new release. `v0.1.0` remains the historical tagged
-baseline; its source-specific results below do not qualify the
-current development tree.
+`v0.1.0` remains the historical tagged baseline until owner publication of the
+source preview. Its source-specific results below do not qualify later builds.
 
 ## 0.1.0 (2026-10-18)
 

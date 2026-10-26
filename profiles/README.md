@@ -1,8 +1,9 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Preview callback catalogue
 
-This built-in data is static enrollment, not runtime qualification. The
-foreground preview and its release gates remain in development.
+This built-in data establishes static enrollment. Separate native checks of the
+foreground preview cover the [advertised profile](../docs/release-v0.2.0.md);
+the catalogue itself grants no broader runtime support.
 
 The current catalogue matches Ubuntu OpenSSL `3.5.5-1ubuntu3.7`, amd64, using
 exact library SHA-256/GNU build ID and matching debug symbols. Kernel release
