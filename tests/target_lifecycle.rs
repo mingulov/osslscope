@@ -3583,6 +3583,8 @@ fn r18_abandoned_setup_never_hangs_caller() {
     let log = dir.join("workload.log");
     let argv = r06_sentinel_argv(&dir.join("SENTINEL"));
     let cancel = AtomicBool::new(false);
+    let completed = Arc::new(AtomicU32::new(0));
+    __test_set_control_worker_counter(Some(completed.clone()));
     __test_set_setup_delay_ms(30_000);
     let t0 = Instant::now();
     let res = OwnedTarget::spawn_stopped_with_control(
@@ -3592,6 +3594,7 @@ fn r18_abandoned_setup_never_hangs_caller() {
         &cancel,
     );
     __test_set_setup_delay_ms(0);
+    __test_set_control_worker_counter(None);
     let err = res.err().expect("deadline-bound setup must fail");
     let elapsed = t0.elapsed();
     assert!(elapsed < Duration::from_secs(10), "bounded: {elapsed:?}");
@@ -3600,6 +3603,14 @@ fn r18_abandoned_setup_never_hangs_caller() {
         msg.contains("deadline") || msg.contains("expir") || msg.contains("cancel"),
         "names the bound: {msg}"
     );
+    // The caller's bound was checked above. Retain the parent directory until
+    // its delayed worker unregisters: ext4 can otherwise recycle the inode for
+    // the next test while the abandoned worker still owns that registry key.
+    let cleanup_end = Instant::now() + Duration::from_secs(45);
+    while completed.load(Ordering::SeqCst) < 1 {
+        assert!(Instant::now() < cleanup_end, "setup worker never finished");
+        std::thread::sleep(Duration::from_millis(5));
+    }
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
