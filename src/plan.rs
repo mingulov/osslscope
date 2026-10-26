@@ -106,7 +106,7 @@ pub struct StableCookies {
 }
 
 impl StableCookies {
-    fn cookie_for(&mut self, dev: &str, ino: u64, offset: u64) -> anyhow::Result<u32> {
+    pub(crate) fn cookie_for(&mut self, dev: &str, ino: u64, offset: u64) -> anyhow::Result<u32> {
         if let Some(&c) = self.ids.get(&(dev.to_string(), ino, offset)) {
             return Ok(c);
         }

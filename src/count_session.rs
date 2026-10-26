@@ -83,6 +83,50 @@ impl DiscoveredSite {
     }
 }
 
+fn normalize_sites(sites: &[DiscoveredSite]) -> anyhow::Result<Vec<DiscoveredSite>> {
+    // Merge duplicate backing triples within one delta: their
+    // candidate sets union (a site's aliases are simultaneous,
+    // never competing updates) and coverage merges
+    // conservatively — the weakest claim wins in either input
+    // order (Unknown over AmbiguousComplete over Complete;
+    // ambiguity is contagious). Conflicting object fingerprints
+    // for one triple are a producer contradiction: fail closed
+    // rather than silently keeping the first.
+    let mut merged: HashMap<(u64, u64, u64), DiscoveredSite> = HashMap::new();
+    for mut site in sites.iter().cloned() {
+        site.normalize();
+        let key = (site.site.device, site.site.inode, site.site.offset);
+        match merged.get_mut(&key) {
+            None => {
+                merged.insert(key, site);
+            }
+            Some(prior) => {
+                if prior.site.object != site.site.object {
+                    anyhow::bail!("conflicting object identity for one backing triple");
+                }
+                prior.candidates.extend(site.candidates);
+                prior.candidates_coverage =
+                    match (prior.candidates_coverage, site.candidates_coverage) {
+                        (CandidateCoverage::Unknown, _) | (_, CandidateCoverage::Unknown) => {
+                            CandidateCoverage::Unknown
+                        }
+                        (CandidateCoverage::AmbiguousComplete, _)
+                        | (_, CandidateCoverage::AmbiguousComplete) => {
+                            CandidateCoverage::AmbiguousComplete
+                        }
+                        _ => CandidateCoverage::Complete,
+                    };
+            }
+        }
+    }
+    let mut normalized: Vec<DiscoveredSite> = merged.into_values().collect();
+    for site in &mut normalized {
+        site.normalize();
+    }
+    normalized.sort_by(|a, b| a.site.cmp(&b.site));
+    Ok(normalized)
+}
+
 /// Consumer-side discovery delta: full per-site replacement sets
 /// for every touched site (capture accumulates these from the
 /// producer's incremental candidates — a delta never partially
@@ -471,6 +515,7 @@ pub struct CountSession<B: CountBackend> {
     last_lat: [u64; 16],
     generation: u32,
     window_open: bool,
+    preplanned: bool,
     closed: bool,
     passthrough: Vec<GapCounter>,
     dropfail: u64,
@@ -529,6 +574,7 @@ impl<B: CountBackend> CountSession<B> {
             last_lat: [0; 16],
             generation: 0,
             window_open: false,
+            preplanned: false,
             closed: false,
             passthrough: Vec::new(),
             dropfail: 0,
@@ -617,52 +663,13 @@ impl<B: CountBackend> CountSession<B> {
         installed_at_ns: u64,
         deadline: Instant,
     ) -> anyhow::Result<AttachReport> {
-        if self.closed {
-            anyhow::bail!("count session is closed");
+        if self.closed || self.preplanned {
+            anyhow::bail!("count session is closed or has an immutable preplanned catalogue");
         }
         for loss in &delta.losses {
             merge_counter(&mut self.passthrough, loss.clone());
         }
-        // Merge duplicate backing triples within one delta: their
-        // candidate sets union (a site's aliases are simultaneous,
-        // never competing updates) and coverage merges
-        // conservatively — the weakest claim wins in either input
-        // order (Unknown over AmbiguousComplete over Complete;
-        // ambiguity is contagious). Conflicting object fingerprints
-        // for one triple are a producer contradiction: fail closed
-        // rather than silently keeping the first.
-        let mut merged: HashMap<(u64, u64, u64), DiscoveredSite> = HashMap::new();
-        for mut site in delta.discovered.clone() {
-            site.normalize();
-            let key = (site.site.device, site.site.inode, site.site.offset);
-            match merged.get_mut(&key) {
-                None => {
-                    merged.insert(key, site);
-                }
-                Some(prior) => {
-                    if prior.site.object != site.site.object {
-                        anyhow::bail!("conflicting object identity for one backing triple");
-                    }
-                    prior.candidates.extend(site.candidates);
-                    prior.candidates_coverage =
-                        match (prior.candidates_coverage, site.candidates_coverage) {
-                            (CandidateCoverage::Unknown, _) | (_, CandidateCoverage::Unknown) => {
-                                CandidateCoverage::Unknown
-                            }
-                            (CandidateCoverage::AmbiguousComplete, _)
-                            | (_, CandidateCoverage::AmbiguousComplete) => {
-                                CandidateCoverage::AmbiguousComplete
-                            }
-                            _ => CandidateCoverage::Complete,
-                        };
-                }
-            }
-        }
-        let mut normalized: Vec<DiscoveredSite> = merged.into_values().collect();
-        for site in &mut normalized {
-            site.normalize();
-        }
-        normalized.sort_by(|a, b| a.site.cmp(&b.site));
+        let normalized = normalize_sites(&delta.discovered)?;
         let rows: Vec<plan::PlanRow> = normalized
             .iter()
             .map(|s| plan::PlanRow {
@@ -673,6 +680,82 @@ impl<B: CountBackend> CountSession<B> {
             })
             .collect();
         let planned = plan::plan_rows(&rows, live, files, self.generation, &mut self.stable)?;
+        self.attach_planned(&normalized, &rows, planned, installed_at_ns, deadline)
+    }
+
+    /// Attach the admitted file catalogue before exec maps the library. The
+    /// caller retains the reviewed backing; the owner verifies its dev/inode
+    /// from this locator before binding the same nonzero original target.
+    /// Exactly one immutable batch is allowed, before window programming.
+    pub fn attach_preplanned(
+        &mut self,
+        sites: &[DiscoveredSite],
+        locator: &std::path::Path,
+        installed_at_ns: u64,
+        deadline: Instant,
+    ) -> anyhow::Result<AttachReport> {
+        if self.pid == 0
+            || self.closed
+            || self.preplanned
+            || self.window_open
+            || !self.stable.is_empty()
+        {
+            anyhow::bail!("preplanned count requires a fresh session and nonzero original PID");
+        }
+        let locator = locator
+            .to_str()
+            .filter(|p| !p.is_empty() && p.len() <= 4095 && !p.as_bytes().contains(&0))
+            .ok_or_else(|| anyhow::anyhow!("invalid pinned catalogue locator"))?;
+        let normalized = normalize_sites(sites)?;
+        let Some(first) = normalized.first() else {
+            anyhow::bail!("preplanned catalogue is empty");
+        };
+        if normalized.len() > 64
+            || normalized.iter().any(|s| {
+                s.site.device != first.site.device
+                    || s.site.inode != first.site.inode
+                    || s.site.object != first.site.object
+            })
+        {
+            anyhow::bail!("preplanned catalogue exceeds one bounded file backing");
+        }
+        let mut rows = Vec::with_capacity(normalized.len());
+        let mut planned = plan::Plan {
+            generation: self.generation,
+            ..Default::default()
+        };
+        for site in &normalized {
+            let dev = plan::render_device(site.site.device);
+            let id = canonical_identity(&site.candidates, site.site.offset);
+            let cookie = self
+                .stable
+                .cookie_for(&dev, site.site.inode, site.site.offset)?;
+            rows.push(plan::PlanRow {
+                dev,
+                ino: site.site.inode,
+                offset: site.site.offset,
+                id: id.clone(),
+            });
+            planned.entries.push(plan::Entry {
+                path: locator.to_owned(),
+                offset: site.site.offset,
+                cookie,
+                id,
+                aliases: Vec::new(),
+            });
+        }
+        self.preplanned = true;
+        self.attach_planned(&normalized, &rows, planned, installed_at_ns, deadline)
+    }
+
+    fn attach_planned(
+        &mut self,
+        normalized: &[DiscoveredSite],
+        rows: &[plan::PlanRow],
+        planned: plan::Plan,
+        installed_at_ns: u64,
+        deadline: Instant,
+    ) -> anyhow::Result<AttachReport> {
         let mut report = AttachReport {
             attached: 0,
             reused: 0,
@@ -2886,6 +2969,162 @@ impl CountBackend for LiveBackend {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    fn preplanned_fixture() -> (std::fs::File, std::path::PathBuf, DiscoveredSite) {
+        use std::os::{fd::AsRawFd, unix::fs::MetadataExt};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "osslscope-preplanned-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        std::fs::remove_file(path).unwrap();
+        file.set_len(4096).unwrap();
+        let m = file.metadata().unwrap();
+        let locator = std::path::PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+        let object = crate::evidence::ObjectId("fixture-library".into());
+        let site = DiscoveredSite {
+            site: SiteKey {
+                object: object.clone(),
+                device: plan::encode_device(libc::major(m.dev()), libc::minor(m.dev())),
+                inode: m.ino(),
+                offset: 128,
+            },
+            candidates: vec![CandidateIdentity::new(
+                object,
+                "default".into(),
+                1,
+                1,
+                vec!["SHA256".into()],
+                false,
+            )],
+            candidates_coverage: CandidateCoverage::Complete,
+        };
+        (file, locator, site)
+    }
+
+    #[test]
+    fn preplanned_attach_does_not_require_live_mapping() {
+        let (_backing, locator, site) = preplanned_fixture();
+        let mut session = CountSession::new(42, FakeCountBackend::new());
+        let report = session
+            .attach_preplanned(
+                &[site.clone()],
+                &locator,
+                1,
+                Instant::now() + Duration::from_secs(2),
+            )
+            .unwrap();
+        assert_eq!(report.attached, 1);
+        assert!(report.missed.is_empty());
+        let cookie = session
+            .cookie_for(site.site.device, site.site.inode, site.site.offset)
+            .unwrap();
+        assert_eq!(session.provenance(cookie).unwrap().site, site.site);
+    }
+
+    #[test]
+    fn preplanned_aliases_count_once() {
+        let (_backing, locator, site) = preplanned_fixture();
+        let mut alias = site.clone();
+        alias.candidates[0].algorithm_classes = vec!["AES-256-GCM".into()];
+        alias.candidates_coverage = CandidateCoverage::Unknown;
+        let mut session = CountSession::new(42, FakeCountBackend::new());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let report = session
+            .attach_preplanned(&[site, alias], &locator, 1, deadline)
+            .unwrap();
+        assert_eq!(report.attached, 1);
+        assert_eq!(session.cookie_count(), 1);
+        let cookie = session.cookies()[0];
+        let p = session.provenance(cookie).unwrap();
+        assert_eq!(p.candidates.len(), 2);
+        assert_eq!(p.candidates_coverage, CandidateCoverage::Unknown);
+        session.open_window(10, 100, deadline).unwrap();
+        session.backend_mut().fire(42, cookie, 20, 32);
+        session.backend_mut().fire(43, cookie, 20, 100);
+        let terminal = session.terminal(CloseRequest {
+            started_at: Instant::now(),
+            grace: Duration::from_secs(1),
+            reason: CloseReason::Expired,
+        });
+        assert_eq!(terminal.retained_drain.total_calls(), 32);
+        assert_eq!(terminal.retained_drain.current[0].candidates.len(), 2);
+    }
+
+    #[test]
+    fn preplanned_attach_requires_nonzero_original_pid() {
+        let (_backing, locator, site) = preplanned_fixture();
+        let mut session = CountSession::new(0, FakeCountBackend::new());
+        assert!(
+            session
+                .attach_preplanned(
+                    &[site],
+                    &locator,
+                    1,
+                    Instant::now() + Duration::from_secs(2)
+                )
+                .is_err()
+        );
+        assert_eq!(session.cookie_count(), 0);
+    }
+
+    #[test]
+    fn preplanned_attach_closes_without_rebinding() {
+        let (_backing, locator, site) = preplanned_fixture();
+        let mut session = CountSession::new(42, FakeCountBackend::new());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        session
+            .attach_preplanned(&[site.clone()], &locator, 1, deadline)
+            .unwrap();
+        session.open_window(10, 100, deadline).unwrap();
+        assert!(
+            session
+                .attach_preplanned(&[site.clone()], &locator, 2, deadline)
+                .is_err()
+        );
+        assert!(
+            session
+                .attach_delta(&CountDelta::default(), &[], &HashMap::new(), 2, deadline)
+                .is_err()
+        );
+        session.terminal(CloseRequest {
+            started_at: Instant::now(),
+            grace: Duration::from_secs(1),
+            reason: CloseReason::Expired,
+        });
+        assert!(
+            session
+                .attach_preplanned(&[site], &locator, 2, deadline)
+                .is_err()
+        );
+        assert_eq!(session.pid(), 42);
+        assert_eq!(session.cookie_count(), 1);
+    }
+
+    #[test]
+    fn preplanned_attach_refuses_replaced_backing() {
+        let (_backing, locator, mut site) = preplanned_fixture();
+        site.site.inode += 1;
+        let mut session = CountSession::new(42, FakeCountBackend::new());
+        let report = session
+            .attach_preplanned(
+                &[site],
+                &locator,
+                1,
+                Instant::now() + Duration::from_secs(2),
+            )
+            .unwrap();
+        assert_eq!(report.attached, 0);
+        assert_eq!(report.missed.len(), 1);
+        assert_eq!(report.missed[0].reason, "replaced");
+    }
 
     pub(crate) fn read_for_fixture<B: CountBackend>(
         session: &mut CountSession<B>,
