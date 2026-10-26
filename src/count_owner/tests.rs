@@ -5367,6 +5367,73 @@ fn g1_attach_system_fd_exhaustion_is_runtime_failure() {
 }
 
 #[test]
+fn late_terminal_after_failed_initial_attach_returns_after_cleanup() {
+    let probe = Probe::new();
+    let engine = attach_engine(
+        &probe,
+        AttachFaults {
+            attach_errno: Some(libc::EMFILE),
+            ..Default::default()
+        },
+        3,
+        false,
+    );
+    let mut attach = attach_request(1, 3);
+    attach.deadline = Instant::now() + Duration::from_secs(1);
+    let original_deadline = attach.deadline;
+    let failure = engine.attach(attach).unwrap_err();
+    task3_cleanup(&probe, 9);
+    drop(
+        engine
+            .fork_permit(Instant::now() + Duration::from_secs(1))
+            .unwrap(),
+    );
+    let frontier = {
+        let state = locked(&engine.shared.state);
+        assert_eq!(state.phase, OwnerPhase::Idle);
+        assert!(state.resources.cleanup_complete);
+        assert!(state.terminal_candidate.is_none());
+        state.frontier.clone()
+    };
+    let request = engine.terminal_request(
+        Instant::now() + Duration::from_secs(5),
+        engine.ready().evidence_domain,
+        engine.ready().writer_object_identity,
+        frontier,
+    );
+    let started = Instant::now();
+    let receipt = engine.terminal(request.clone());
+    assert!(
+        started.elapsed() < Duration::from_millis(300),
+        "finished owner waited for the setup deadline"
+    );
+    assert_eq!(receipt.deadline, original_deadline);
+    assert_eq!(
+        receipt.terminal_id,
+        failure.cleanup_ticket.unwrap().terminal_id
+    );
+    assert_eq!(receipt.cleanup_state, CleanupState::Complete);
+    assert_eq!(
+        receipt.writers,
+        WriterCompletion::Unknown(QuiescenceReason::Owner)
+    );
+    assert_eq!(
+        receipt.failures.operations[CountOperation::Attach as usize],
+        Some(failure.failure)
+    );
+    assert!(
+        !receipt
+            .failures
+            .operations
+            .iter()
+            .flatten()
+            .any(|f| f.class == FailureClass::Deadline)
+    );
+    assert!(validate_terminal(&request, &receipt).is_ok());
+    assert!(Arc::ptr_eq(&receipt.0, &engine.terminal(request).0));
+}
+
+#[test]
 fn g1_attach_system_fd_exhaustion_preserves_prior_positive() {
     let probe = Probe::new();
     let engine = attach_engine(

@@ -939,7 +939,10 @@ impl CountEngine {
             // not coordinator observation, and equality is already too late.
             let observed_at = self.shared.now();
             let expired = observed_at >= seal.deadline;
-            if expired || state.terminal_candidate.is_some() {
+            let retired = state.phase == OwnerPhase::Idle
+                && state.resources.cleanup_complete
+                && !state.cleanup_stranded;
+            if expired || state.terminal_candidate.is_some() || retired {
                 return self.select_terminal(state, expired);
             }
             state = self
@@ -974,6 +977,15 @@ impl CountEngine {
         expired: bool,
     ) -> RawTerminal {
         let seal = state.terminal.expect("sticky seal");
+        // A pre-open fault can finish cleanup before its first consumer binds.
+        // No candidate can arrive from that retired worker. Select its existing
+        // data now, retaining the original budget and actual failure, without
+        // inventing an elapsed deadline or a writer-completion witness.
+        let retired = !expired
+            && state.terminal_candidate.is_none()
+            && state.phase == OwnerPhase::Idle
+            && state.resources.cleanup_complete
+            && !state.cleanup_stranded;
         let mut fallback = state
             .terminal_fallback
             .take()
@@ -1010,7 +1022,9 @@ impl CountEngine {
                 && data.manifest.is_empty()
                 && data.failures == TerminalFailures::default()
         });
-        if expired && let Some(family) = known_empty {
+        if (expired || retired)
+            && let Some(family) = known_empty
+        {
             data.host_writes_sealed = true;
             data.writers = WriterCompletion::KnownEmpty(EmptyWitness {
                 owner_epoch: self.shared.epoch,
@@ -1031,7 +1045,7 @@ impl CountEngine {
                     errno: record.close_errno,
                 });
             }
-            if data.seal.result == StopResult::NotAttempted {
+            if !retired && data.seal.result == StopResult::NotAttempted {
                 data.failures.record(OwnerFailure::engine(
                     CountOperation::Stop,
                     FailureClass::Deadline,
@@ -1039,16 +1053,22 @@ impl CountEngine {
             }
             let finished = matches!(data.writers, WriterCompletion::Finished(w) if w.established_at < seal.deadline);
             if !finished {
-                data.writers = WriterCompletion::Unknown(QuiescenceReason::Deadline);
-            }
-            data.failures.record(OwnerFailure::engine(
-                if finished {
-                    CountOperation::Read
+                data.writers = WriterCompletion::Unknown(if retired {
+                    QuiescenceReason::Owner
                 } else {
-                    CountOperation::Close
-                },
-                FailureClass::Deadline,
-            ));
+                    QuiescenceReason::Deadline
+                });
+            }
+            if !retired {
+                data.failures.record(OwnerFailure::engine(
+                    if finished {
+                        CountOperation::Read
+                    } else {
+                        CountOperation::Close
+                    },
+                    FailureClass::Deadline,
+                ));
+            }
             let latest = self
                 .shared
                 .latest_progress
