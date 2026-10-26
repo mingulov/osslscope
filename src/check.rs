@@ -54,6 +54,8 @@ fn policy_rules(rules: &RuleSet) -> Vec<PolicyRule> {
 
 struct Args {
     cfg: capture::Config,
+    libcrypto: Option<PathBuf>,
+    settle_explicit: bool,
     target: capture::Target,
     format: String,
     out: Option<String>,
@@ -85,11 +87,10 @@ fn parse(argv: &[String]) -> Result<Args, String> {
     let mut builtin = false;
     let mut object: Option<String> = None;
     let mut count_object: Option<String> = None;
+    let mut libcrypto: Option<String> = None;
     let mut members_object: Option<String> = None;
     let mut dev_bundle: Option<String> = None;
-    let mut table_raw: Option<String> = None;
     let mut force_offset_raw: Option<String> = None;
-    let mut provider_table_raw: Option<String> = None;
     let mut settle_raw: Option<String> = None;
     let mut timeout_raw: Option<String> = None;
     let mut grace_raw: Option<String> = None;
@@ -138,6 +139,12 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             }
             "--object" => object = Some(val(a)?),
             "--count-object" => count_object = Some(val(a)?),
+            "--libcrypto" => {
+                if libcrypto.is_some() {
+                    return Err("--libcrypto may occur only once".into());
+                }
+                libcrypto = Some(val(a)?);
+            }
             "--members-object" => members_object = Some(val(a)?),
             "--dev-bundle" => {
                 if dev_bundle.is_some() {
@@ -145,9 +152,10 @@ fn parse(argv: &[String]) -> Result<Args, String> {
                 }
                 dev_bundle = Some(val(a)?);
             }
-            "--table" => table_raw = Some(val(a)?),
+            "--table" | "--provider-table" => {
+                return Err("table enrollment is deferred beyond v0.2".into());
+            }
             "--force-offset" => force_offset_raw = Some(val(a)?),
-            "--provider-table" => provider_table_raw = Some(val(a)?),
             "--settle" => settle_raw = Some(val(a)?),
             "--timeout" => timeout_raw = Some(val(a)?),
             "--grace" => grace_raw = Some(val(a)?),
@@ -246,25 +254,9 @@ fn parse(argv: &[String]) -> Result<Args, String> {
                 .to_string(),
         );
     }
-    // T12 onboarding: explicit tables are validated here (usage
-    // errors, exit 2, before any target/BPF side effect); objects
-    // and the target provider resolve inside capture (environment
-    // errors there exit 4, never 2).
-    let table: Option<PathBuf> = match &table_raw {
-        Some(p) => {
-            let path = PathBuf::from(p);
-            crate::discovery::onboard::load_offset_table_file(&path).map_err(|e| e.full())?;
-            Some(path)
-        }
-        None => None,
-    };
-    let provider_enrollment = match &provider_table_raw {
-        Some(p) => Some(
-            crate::discovery::onboard::load_enrollment_file(Path::new(p)).map_err(|e| e.full())?,
-        ),
-        None => None,
-    };
     Ok(Args {
+        libcrypto: libcrypto.map(PathBuf::from),
+        settle_explicit: settle_raw.is_some(),
         cfg: capture::Config {
             harvest_object: object.map(PathBuf::from),
             count_object: count_object.map(PathBuf::from),
@@ -272,9 +264,9 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             dev_bundle: dev_bundle.map(PathBuf::from),
             provider: provider.map(PathBuf::from),
             builtin,
-            table,
+            table: None,
             force_offset,
-            provider_enrollment,
+            provider_enrollment: None,
             resolved_provider: None,
             duration,
             settle,
@@ -520,8 +512,8 @@ pub(crate) fn assemble_checked_document(
 }
 
 const USAGE: [&str; 2] = [
-    "usage: check [--policy FILE] [--duration S] [--provider P] [--object O] [--count-object C] [--members-object M] [--dev-bundle DIR] [--table F] [--force-offset N] [--provider-table F] [rules] [--format human|json] [--out F] [--cbom FILE] [--builtin] [--settle S] [--timeout S] [--grace S] [--image-digest D] [--workload-out F] [--workload-out-fd N] {--pid P | run -- <cmd>}",
-    "rules: [--require-provider P] [--deny-provider P] [--deny-engine] [--deny-algorithm X] [--deny-weak] [--require-executed X] (repeatable; at least one required)",
+    "usage: check --libcrypto PATH [--count-object PATH] [--policy FILE] [--duration S] [--format human|json] [--out FILE] [--cbom FILE] [--timeout S] [--grace S] [--workload-out FILE | --workload-out-fd N] [rules] run -- COMMAND",
+    "rules: --require-executed ALGORITHM | --deny-algorithm ALGORITHM (repeatable; at least one required)",
 ];
 
 pub fn run(argv: &[String]) -> ExitCode {
@@ -553,49 +545,56 @@ pub(crate) fn prepare(argv: &[String]) -> Result<Prepared, ExitCode> {
             return Err(ExitCode::from(2));
         }
     };
-    let overrides = crate::package::commands::ObjectOverrides {
-        harvest: args.cfg.harvest_object.clone(),
-        count: args.cfg.count_object.clone(),
-        members: args.cfg.members_object.clone(),
-        dev_bundle: args.cfg.dev_bundle.clone(),
-    };
-    let objects = match with_check_objects(
-        &overrides,
-        crate::package::commands::resolve_command_objects,
-        |objects| objects,
+    if let Err(error) = args.rules.require_preview() {
+        crate::report::err_line(&format!("osslscope check: {error}"));
+        return Err(ExitCode::from(2));
+    }
+    let preview = match capture::profiled::ProfiledConfig::for_command(
+        args.libcrypto.clone(),
+        &args.cfg,
+        &args.target,
+        args.settle_explicit,
     ) {
-        Ok(v) => v,
-        Err(e) => {
-            let req = OutputRequest {
-                format: if args.format == "json" {
-                    OutputFormat::Json
-                } else {
-                    OutputFormat::Human
-                },
-                primary: args
-                    .out
-                    .as_ref()
-                    .map_or(OutputDest::Stdout, |p| OutputDest::File(p.into())),
-                cbom: args.cbom.as_ref().map(|p| OutputDest::File(p.into())),
-            };
-            let discarded = matches!(
-                &args.target,
-                capture::Target::Spawn {
-                    workload: crate::target::WorkloadDest::Null,
-                    ..
-                }
-            );
-            let result = crate::report::consume_capture_result(
-                Err(e.into()),
-                crate::report::CaptureCommand::Check {
-                    rules: &policy_rules(&args.rules),
-                },
-                &req,
-                discarded,
-            );
-            return Err(ExitCode::from(result.exit_code));
+        Ok(config) => config,
+        Err(error) => {
+            crate::report::err_line(&format!("osslscope check: {error}"));
+            return Err(ExitCode::from(2));
         }
     };
+    let objects =
+        match crate::package::commands::resolve_profiled_count(preview.count_object.as_deref()) {
+            Ok(v) => v,
+            Err(e) => {
+                let req = OutputRequest {
+                    format: if args.format == "json" {
+                        OutputFormat::Json
+                    } else {
+                        OutputFormat::Human
+                    },
+                    primary: args
+                        .out
+                        .as_ref()
+                        .map_or(OutputDest::Stdout, |p| OutputDest::File(p.into())),
+                    cbom: args.cbom.as_ref().map(|p| OutputDest::File(p.into())),
+                };
+                let discarded = matches!(
+                    &args.target,
+                    capture::Target::Spawn {
+                        workload: crate::target::WorkloadDest::Null,
+                        ..
+                    }
+                );
+                let result = crate::report::consume_capture_result(
+                    Err(e.into()),
+                    crate::report::CaptureCommand::Check {
+                        rules: &policy_rules(&args.rules),
+                    },
+                    &req,
+                    discarded,
+                );
+                return Err(ExitCode::from(result.exit_code));
+            }
+        };
     let setup_deadline = std::time::Instant::now()
         .checked_add(args.cfg.harvest_timeout)
         .ok_or_else(|| {
@@ -604,6 +603,7 @@ pub(crate) fn prepare(argv: &[String]) -> Result<Prepared, ExitCode> {
         })?;
     Ok(Prepared {
         args,
+        preview,
         objects,
         setup_deadline,
     })
@@ -611,7 +611,8 @@ pub(crate) fn prepare(argv: &[String]) -> Result<Prepared, ExitCode> {
 pub struct Prepared {
     setup_deadline: std::time::Instant,
     args: Args,
-    objects: crate::package::commands::AdmittedSet,
+    objects: crate::package::commands::ProfiledCount,
+    preview: capture::profiled::ProfiledConfig,
 }
 impl Prepared {
     pub(crate) fn setup_deadline(&self) -> Option<std::time::Instant> {
@@ -649,11 +650,10 @@ impl Prepared {
             }
         );
         crate::report::consume_capture_result(
-            capture::run_admitted_before(
-                &args.cfg,
+            capture::profiled::run_profiled_before(
+                &self.preview,
                 args.target,
                 self.objects,
-                args.cfg.members_object.is_none(),
                 Some(self.setup_deadline),
             ),
             crate::report::CaptureCommand::Check {
@@ -667,6 +667,76 @@ impl Prepared {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(test)]
+    mod preview_admission_tests {
+        use super::*;
+        fn words(args: &[&str]) -> Vec<String> {
+            args.iter().map(|s| (*s).into()).collect()
+        }
+
+        fn preview_exit(rule: PolicyRule) -> u8 {
+            let document = crate::capture::profiled::preview_document_for_test(true);
+            let (verdict, document) =
+                assemble_checked_document(&[rule], document, &serde_json::Value::Null);
+            let delivery = crate::report::DeliveryResult {
+                primary: crate::report::ArtifactOutcome {
+                    dest: "stdout".into(),
+                    ok: true,
+                    bytes: 1,
+                    error: None,
+                },
+                cbom: None,
+                diagnostics: Vec::new(),
+            };
+            crate::report::exit_for(verdict.overall(), Some(0), &document, &delivery)
+        }
+        #[test]
+        fn partial_positive_require_is_3() {
+            assert_eq!(preview_exit(PolicyRule::require_executed("SHA256")), 3);
+        }
+        #[test]
+        fn definite_deny_is_10() {
+            assert_eq!(preview_exit(PolicyRule::deny_algorithm("SHA256")), 10);
+        }
+        #[test]
+        fn unobserved_known_algorithm_is_11() {
+            assert_eq!(
+                preview_exit(PolicyRule::require_executed("AES-256-GCM")),
+                11
+            );
+            assert_eq!(preview_exit(PolicyRule::deny_algorithm("AES-256-GCM")), 11);
+        }
+
+        #[test]
+        fn preview_requires_libcrypto() {
+            let args = words(&[
+                "--require-executed",
+                "SHA256",
+                "--count-object",
+                "/missing-count",
+                "run",
+                "--",
+                "/bin/true",
+            ]);
+            assert!(matches!(prepare(&args), Err(code) if code == ExitCode::from(2)));
+        }
+
+        #[test]
+        fn valid_preview_flags_reach_count_abi_admission() {
+            let args = words(&[
+                "--libcrypto",
+                "/missing-library",
+                "--require-executed",
+                "SHA256",
+                "--count-object",
+                "/missing-count",
+                "run",
+                "--",
+                "/bin/true",
+            ]);
+            assert!(matches!(prepare(&args), Err(code) if code == ExitCode::from(4)));
+        }
+    }
     use super::*;
     use crate::evidence::{
         CandidateCoverage, CandidateIdentity, CaptureWindow, CounterKind, CounterSource,
@@ -1561,6 +1631,7 @@ require-executed=["SHA2-256"]
 
 // The real entrypoint and the four-command source fixture use this same
 // fixed-kind admission port; effects begin only after successful resolution.
+#[cfg(test)]
 pub(crate) fn with_check_objects<R>(
     overrides: &crate::package::commands::ObjectOverrides,
     resolve: impl FnOnce(

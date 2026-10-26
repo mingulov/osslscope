@@ -1,179 +1,75 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
-# What osslscope proves (and what it does not)
+# Observation meaning and limits
 
-osslscope observes OpenSSL provider-dispatch callback execution in
-supported Linux targets without changing the application or its
-configuration. Current development emits the
-[v2.2 evidence contract](observed-crypto-v2.md); integrated live and
-package qualification remains open. The historical `v0.1.0` release
-has its own source-specific qualification and limitations.
+The v0.2.0 foreground route observes entries into a finite set of compiled
+OpenSSL implementation callbacks in one exact enrolled library/kernel profile.
+It launches one unchanged application, counts its original thread group and
+threads, and produces the existing
+[observed-crypto-v2.3 document](observed-crypto-v2.md). Live release qualification
+is still open; source tests and catalogue enrollment do not qualify runtime use.
 
-## The claim chain
+## What a positive entry establishes
 
-```text
-installed
-    != loaded
-    != advertised by provider
-    != fetched
-    != selected
-    != EXECUTED
-```
+Each site has a verified backing object/device/inode/file offset and a static
+compiled candidate set. One physical entry contributes one call. A definite
+algorithm classification requires a complete candidate set whose meanings agree;
+a shared site's N entries remain N, with uncertainty preserved.
 
-The counted unit is entry into a physical `OSSL_DISPATCH` callback,
-identified by backing object, device, inode, file offset and
-generation. Candidate metadata describes possible provider,
-operation, algorithm-class and function identities. A shared site
-with N calls contributes N calls once; it does not prove N calls
-for each candidate. Fetch/selection stages supply context only.
-Hardware variants selected inside one callback remain unobservable.
+The initial catalogue includes SHA-256 NEWCTX, AES-256-GCM NEWCTX and one shared
+AES/ARIA/SM4 GCM UPDATE. NEWCTX observes context creation attempts; UPDATE may
+handle AAD, empty input or a failed operation. Entry counts and first/last entry
+timestamps do not establish message count, callback duration, processing success,
+key size, provider activation or FIPS state. Provider metadata describes compiled
+candidates, not the runtime instance that advertised or selected them.
 
-Every report states its target and requested/effective window.
-"None observed in window" never means "not present / never used".
+## Incomplete coverage stays explicit
 
-## COMPLETE vs PARTIAL
+Every capture has `UnknownDenominator` for its finite profile and remains
+PARTIAL. Other algorithms, objects, sites, process groups and periods are
+unobserved. A missing observation cannot become an absence proof. Positive
+requirements may succeed under partial coverage; definite deny evidence can
+violate policy. Unobserved known algorithms remain inconclusive.
 
-Count conservation, attribution certainty and observation coverage
-are separate axes:
+Human, JSON and definite-only CBOM outputs describe the same finalized document.
+A shared/unknown candidate set produces no definite CBOM asset. The selected
+Count bytes/hash/trust selection are recorded separately from library identity;
+no harvest/members bundle or authenticated build-input record is fabricated.
 
-- `COMPLETE` requires no fatal failure, no instrumentation coverage
-  gap, no positive loss counter, no executed unknown-coverage
-  candidate set, and full requested/effective window coverage
-  without a signal cut. Fully attached quiet sites are covered.
-  Nonzero activity counters and ambiguous complete candidate sets
-  are compatible with COMPLETE.
-- `PARTIAL` carries typed `completeness.reasons[]` describing
-  coverage, loss, attribution or window gaps. Its observations
-  remain useful under those limits; missing observations cannot
-  be turned into absence proofs where a gap is relevant.
-- `FATAL` describes a tool or target failure. Runtime failures
-  remain eligible for policy evaluation, even with zero calls.
-  AttachZero is eligible only with proved in-window ENGINE
-  evidence. Environment, Recycled and bare AttachZero are
-  unusable and yield no policy verdict. Eligibility alone proves
-  no rule; see [exit handling](usage.md#exit-codes).
+## Count and target identity
 
-A missing provider query is harvest context, not an independent
-v2 completeness rule. Read the actual coverage and typed reasons;
-do not translate legacy `no-query` text into a COMPLETE-zero or
-PARTIAL conclusion without them. See [the PARTIAL runbook](partial-runbook.md)
-and `src/evidence.rs` (`finalize`).
+The observer pins and hashes the protected stock library. Before release it
+attaches the enrolled file offsets through the existing Count owner using the
+owned child's nonzero PID and the selected kernel's native retained-group filter.
+Observer/child initial PID namespace and matching procfs are required. There is
+no PID-zero fallback, numeric rebinding or target-memory discovery.
 
-Counts are callback entries under disclosed coverage and loss,
-without a success/error split. First/last timestamps locate counted
-entries; they are not callback-duration measurements. Algorithm
-names do not reveal key sizes or parameter-selected digests/ciphers.
+Counts aggregate across the original process lifetime. Forked groups are outside
+scope. Leader retirement/nonleader exec can lose coverage, so there is no
+seamless-follow or per-image guarantee. The library/catalogue and native kernel
+behavior require the actual installed qualification controls.
 
-## Terminal count proof in development
+## Closure, custody and privacy
 
-Equal count scans cannot prove that counting has finished. A callback
-can pass the window check, pause before updating the admitted ledger,
-and later add a call after two apparently equal totals were read.
+Child exit is observed without consuming its wait status. The existing count
+terminal is selected before final reap/detach. Available positive counts survive
+normal degraded tails and runtime failures; typed loss/cleanup reasons remain
+visible. Equal scans do not prove writer completion, and successful close calls
+alone do not establish a universal terminal-writer theorem.
 
-The development count path prepares one resource owner before acquiring
-count descriptors. At close it seals new commands, attempts to stop
-admission, explicitly closes every inventoried count link, and reads
-the retained maps. A terminal writer witness requires checked final
-close acknowledgments, exclusive link references, the exact writer
-inventory and an applicable reviewed kernel/source profile. Only after
-that witness can a complete read reconcile current, fenced,
-unattributed and known dropped calls. Attribution and coverage retain
-their separate requirements.
+Normal setup and signal paths resolve stopped children and owned resources.
+A released live workload stays running at observation end. SIGKILL/crash during
+the stopped pre-exec interval can strand the child: crash-safe startup custody
+is deferred. There is no final report guarantee after observer death.
 
-**Current live writer proof remains unproven.** The implementation
-admits no live kernel/source profile yet. Host interleaving tests and
-analysis of selected upstream source tags do not qualify an installed
-kernel, vendor backports, actual callback selection or a genuine held
-kernel callback. Increasing grace cannot supply a missing profile.
-For a nonempty count-writer family, current live captures therefore
-disclose count uncertainty even when their observed ledger totals agree.
+The qualified Count program reads no target arguments, strings, payloads, keys
+or return values. The app records a safe target token rather than argv/comm.
+An explicit Count override remains operator-trusted code; compatibility/hash
+admission does not authenticate arbitrary instructions. Privacy/release claims
+attach to the exact source-built object actually inspected and qualified.
+Privileged in-place library updates, deliberate code patching/JIT, provider
+injection and privileged process/FD tampering are outside the preview model.
 
-One grace deadline bounds the coordinator's count wait. Expiry retains
-positive observations and an unknown tail with the same cleanup owner;
-eventual cleanup cannot rewrite the finalized document. A blocked owner
-can outlive that deadline. This design does not establish that the
-observer process and all resources disappear by grace expiry. Actual
-terminal latency, cleanup/recovery, callback rate and added latency,
-ordinary COMPLETE windows, platform coverage and installed-package
-qualification remain open.
-
-The v2.2 document can retain count timestamps within the acknowledged
-programmed admission interval while separately showing a conservative
-effective coverage endpoint. A later observed timestamp is preserved;
-it does not extend effective coverage or prove an unobserved tail.
-See [the contract](observed-crypto-v2.md) and
-[the PARTIAL runbook](partial-runbook.md#terminal-count-uncertainty).
-
-## Permanent boundaries and forthcoming capabilities
-
-No TLS/libssl tracing, handshake observation, cipher-suite inventory,
-PCAP, network tracing, plaintext/key extraction, passwords, or
-application payload capture. Pre-3.0 OpenSSL method-table observation
-is outside the provider-dispatch surface. The
-[capture allowlist](privacy/allowlist-v1.md) remains binding.
-
-Current capture is bounded and targets one process. Metadata-only
-per-call trace, latency histograms, cgroup/multiple-target capture,
-executable-based observation/following and a service posture are
-forthcoming capabilities; they are not implemented by these docs.
-`doctor --exe` already preflights executable discovery, which is
-distinct from an executable-based capture mode.
-
-## Who should NOT adopt (read before installing)
-
-**CI gating on COMPLETE status: not qualified.** Current integrated
-COMPLETE-window qualification is open. A real structural gap remains
-for address-taken taxonomy imports using `R_X86_64_GLOB_DAT`: even
-uniquely resolved imports have no instrumented PLT stub. Affected
-low-level imports produce a typed `loss` reason with counter
-`legacy.lowlevel_uninstrumented` (`src/discovery/legacy.rs`,
-`src/capture.rs`; pinned by `tests/provider_coverage.rs`). This can
-make affected TLS workloads PARTIAL, but does not prove that every
-TLS workload has the same imports or that COMPLETE is universally
-unreachable. Duration/grace changes cannot instrument a missing
-site. Gate on actual policy results and disclosed gaps per
-[the CI recipes](ci-recipes.md); do not assume every TLS run exits 3.
-
-**Kernels below 6.9 and non-x86-64 targets: unsupported.** Admission
-uses functional feature probes and target ELF checks, not a kernel
-version string alone. The historical matrix includes a 6.9 lane;
-it does not qualify every current artifact on every newer kernel.
-See [the scoped matrix](overhead-matrix.md).
-
-**Secure Boot qualification: not claimed.** Enabled-state
-qualification remains open. Keep Secure Boot, lockdown and SELinux
-controls in the required state; a disabled-state or alternative-host
-success does not qualify the enabled environment. `doctor` supplies
-environment admission evidence, not platform certification.
-
-**Stripped/static targets need an admitted anchor.** Supported
-symtab resolution can admit unstripped builds, including static
-targets in `--builtin` mode. Unknown stripped builds need explicit
-exact-binary enrollment; otherwise report/check refuse, while inspect
-can expose zero-row blindness. No guessed offset is an inventory.
-See [the built-in runbook](builtin-runbook.md).
-
-**Live-process attachment misses history.** `--pid` cannot observe
-pre-attach execution and carries startup coverage limits. `run --`
-improves custody and enables pre-exec setup; it and warmup do not
-guarantee first-call or COMPLETE coverage. Inspect effective window
-edges and the typed startup/loss reasons.
-
-**Rebuilt OpenSSL must be rechecked.** Rebuilds can change build-id
-and offsets. Pin exact bytes and repeat admission after a rebuild.
-The current table contains eleven exact-build entries; an unknown
-build with a supported symtab route need not gain a table row,
-whereas an unknown stripped build needs explicit enrollment.
-Enrollment is not live or performance qualification.
-
-**FIPS counts need manual interpretation.** There is no KAT
-discriminator and no FIPS certification inference. A COMPLETE
-coverage status does not exclude self-tests from counts. See
-[the FIPS interim rule](fips-interim.md).
-
-## Further reading
-
-- [Overhead and support matrix](overhead-matrix.md): historical
-  fixture results and current qualification boundaries.
-- [CI recipes](ci-recipes.md): runner choice, gate wiring, timeouts.
-- [Privacy residuals](privacy/residuals.md): limits beyond the allowlist.
-- [The OSSL_TRACE gap](trace-gap.md): observation-surface comparison.
+See [usage](usage.md#exit-codes), [catalogue provenance](../profiles/README.md)
+and the [later roadmap](../ROADMAP.md) before applying broader developer
+references. General providers, foreign attach, services, tracing/export,
+stronger completeness guarantees and broader platforms are later work.

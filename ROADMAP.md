@@ -10,7 +10,7 @@ The next milestone concentrates on running one unchanged application and
 answering a useful question: which enrolled OpenSSL implementation callbacks
 actually executed?
 
-Planned scope:
+Implementation scope (installed/runtime qualification remains open):
 
 - Build from source, install into a local prefix and check the environment with
   `doctor`.
@@ -21,12 +21,11 @@ Planned scope:
   observed algorithm use with command-line rules or a policy file.
 - Keep shared-site counts, ambiguity and incomplete coverage explicit.
 
-Capture will use a limited reviewed callback catalogue and the count program.
-Ordinary results will be PARTIAL: absence does not prove non-use. Callback
+Capture uses a limited reviewed callback catalogue and the count program.
+Ordinary results remain PARTIAL: absence does not prove non-use. Callback
 entries do not prove cryptographic success, runtime provider activation or
 complete application coverage. Unsupported modes and unmatched enrolled OpenSSL libraries will
-be rejected. These restrictions will be enforced in the release, rather than
-merely suggested in documentation.
+be rejected. The CLI enforces these restrictions before target/BPF acquisition.
 
 The initial distribution will be source plus a documented, tested local
 build/install workflow. A release requires an actual installed positive-count

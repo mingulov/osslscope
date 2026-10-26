@@ -1424,6 +1424,13 @@ struct ArtifactRequest {
     target: String,
     tree: PathBuf,
 }
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Deferred owned package builder source-sealed selection; retained host regressions exercise this method"
+    )
+)]
 impl ArtifactRequest {
     fn derive(sealed: &SealedSource, phase: Phase, paths: &BuildPaths) -> R<Self> {
         let (manifest, bins, target, tree) = match phase {
@@ -1534,6 +1541,13 @@ fn artifact_open(root: &fs::File, path: &RelativePath) -> R<fs::File> {
     }
     Ok(directory)
 }
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Deferred owned package builder Cargo output retention; retained host regressions exercise this item"
+    )
+)]
 fn retain_artifacts(
     log: &[u8],
     request: &ArtifactRequest,
@@ -1763,6 +1777,13 @@ fn validate_triple(roles: &BTreeMap<super::records::Role, RetainedBinary>) -> R<
     }
     Ok(())
 }
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Deferred owned package builder v1 contract construction; retained host regressions exercise this item"
+    )
+)]
 fn make_contract(
     inputs: &super::records::BuildInputs,
     roles: &BTreeMap<super::records::Role, RetainedBinary>,
@@ -2893,6 +2914,13 @@ fn host_contract_bytes(bytes: &[u8]) -> R<&[u8]> {
 pub fn extract_host_contract(bytes: &[u8]) -> R<super::records::AdmittedContract> {
     super::records::parse_canonical(host_contract_bytes(bytes)?)
 }
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Deferred owned package builder measured host ABI admission; retained host regressions exercise this item"
+    )
+)]
 fn validate_host_abi(bytes: &[u8], evidence: &source::AbiEvidence) -> R<()> {
     let elf = host_elf(bytes)?;
     if evidence.schema != "osslscope-abi-evidence-v1" || evidence.cells.is_empty() {
@@ -2942,6 +2970,13 @@ fn validate_host_abi(bytes: &[u8], evidence: &source::AbiEvidence) -> R<()> {
     }
     Ok(())
 }
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Deferred owned package builder bootstrap admission; retained host regressions exercise this item"
+    )
+)]
 fn inspect_bootstrap(bytes: &[u8], layout: &ExecutorLayout) -> R<()> {
     let elf = host_elf(bytes)?;
     if elf.contract.is_some() || elf.interpreter != Some("/lib64/ld-linux-x86-64.so.2") {

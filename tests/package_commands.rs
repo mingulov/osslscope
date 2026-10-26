@@ -35,17 +35,21 @@ fn inspect_object_is_optional_after_usage_admission() {
 fn package_admission_failure_precedes_effects() {
     use std::process::Command;
     let bin = env!("CARGO_BIN_EXE_osslscope");
-    for verb in ["doctor", "inspect", "report", "check"] {
-        let mut args = vec![verb, "--object", "/missing/package/harvest"];
-        if verb == "inspect" {
-            args.extend(["--pid", "1", "--provider", "/missing/package/provider"]);
-        } else if verb == "doctor" {
+    for verb in ["doctor", "report", "check"] {
+        let mut args = vec![
+            verb,
+            "--libcrypto",
+            "/missing/package/libcrypto.so.3",
+            "--count-object",
+            "/missing/package/count",
+        ];
+        if verb == "doctor" {
             args.extend(["--format", "json"]);
         } else {
-            args.extend(["--pid", "1"]);
-        }
-        if verb == "check" {
-            args.push("--deny-weak");
+            if verb == "check" {
+                args.extend(["--require-executed", "SHA256"]);
+            }
+            args.extend(["run", "--", "/bin/true"]);
         }
         let out = Command::new(bin).args(&args).output().unwrap();
         assert_eq!(
@@ -59,19 +63,26 @@ fn package_admission_failure_precedes_effects() {
             assert_eq!(v["exit"], 4);
             assert!(v["target"].is_null());
             let rows = v["checks"].as_array().unwrap();
-            let blocked = rows
-                .iter()
-                .find(|r| r["id"] == "functional-probes")
-                .unwrap();
-            assert_eq!(blocked["status"], "info");
-            assert!(blocked["message"].as_str().unwrap().contains("not run"));
+            assert!(
+                rows.iter()
+                    .any(|r| r["id"] == "count-object" && r["status"] == "fail")
+            );
+            assert!(
+                rows.iter()
+                    .any(|r| r["id"] == "runtime-permissions" && r["status"] == "degraded")
+            );
             assert!(
                 !rows
                     .iter()
-                    .any(|r| r["id"] == "kernel" || r["id"] == "caps" || r["id"] == "spawn-access")
+                    .any(|r| r["id"] == "functional-probes" || r["id"] == "spawn-access")
             );
         }
     }
+    let out = Command::new(bin)
+        .args(["inspect", "--help"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
     for (verb, args) in [
         (
             "inspect",
@@ -278,8 +289,8 @@ fn identity_v2_selected_dev_and_installed() {
         let out = command.output().unwrap();
         assert_eq!(
             out.status.code(),
-            Some(4),
-            "{verb} must select dev admission before effects: {}",
+            Some(2),
+            "{verb} must reject deferred dev admission before effects: {}",
             String::from_utf8_lossy(&out.stderr)
         );
     }

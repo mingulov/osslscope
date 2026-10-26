@@ -7,19 +7,29 @@ pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
     let argv: Vec<String> = args.collect();
     let cmd = argv.first().map(String::as_str).unwrap_or("help");
     match cmd {
-        "doctor" => crate::doctor::run(&argv[1..]),
-        "inspect" => crate::inspect::run(&argv[1..]),
+        "doctor" => crate::doctor::profiled::run(&argv[1..]),
+        "inspect" => {
+            crate::report::err_line(
+                "osslscope inspect: deferred beyond v0.2; use report --libcrypto PATH run -- COMMAND",
+            );
+            ExitCode::from(2)
+        }
         "alias-audit" => crate::aliases::run(&argv[1..]),
         "report" => crate::report::run(&argv[1..]),
         "check" => crate::check::run(&argv[1..]),
         "help" | "--help" | "-h" => {
             println!("osslscope — non-interposing OpenSSL observer");
-            println!("usage: osslscope <doctor|inspect|report|check|alias-audit> [args]");
-            println!("  doctor       preflight: kernel, caps, LSM, target suitability");
-            println!("  inspect      dispatch inventory of a live --pid target");
-            println!("  report       keyed execution counts over a window (--pid or run --)");
+            println!("usage: osslscope <doctor|report|check|alias-audit> [args]");
+            println!(
+                "  doctor       preflight for one exact library/kernel profile and Count object"
+            );
+            println!("  report       count enrolled callbacks in an owned foreground run");
             println!("  check        policy gate over a window (CI use; exits 10 on violation)");
             println!("  alias-audit  group a harvest doc's rows by shared address");
+            println!(
+                "  report/check require --libcrypto PATH and run -- COMMAND; coverage is PARTIAL"
+            );
+            println!("  live inspect, foreign PID and dynamic providers are deferred beyond v0.2");
             ExitCode::SUCCESS
         }
         "--version" | "-V" => {
@@ -76,5 +86,17 @@ pub fn prepare(args: impl Iterator<Item = String>) -> PreparedCommand {
             Err(e) => PreparedCommand::Immediate(e),
         },
         _ => PreparedCommand::Immediate(run(argv.into_iter())),
+    }
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::*;
+    #[test]
+    fn live_inspect_is_explicitly_deferred() {
+        let args = ["inspect", "--help"].map(String::from);
+        assert!(
+            matches!(prepare(args.into_iter()), PreparedCommand::Immediate(code) if code == ExitCode::from(2))
+        );
     }
 }

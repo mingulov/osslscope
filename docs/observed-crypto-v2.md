@@ -13,9 +13,25 @@ Every example below is verbatim test output (goldens under
 goldens, the v1 auditor suite) are frozen history: old readers
 reject v2 documents and there is no dual live producer.
 
+## Foreground preview
+
+The count-only foreground producer retains the same v2.3 report/check family.
+It always records an unknown-denominator profile scope and stays PARTIAL.
+Candidate/provider labels describe compiled callback membership; entry counts
+prove neither provider activation nor crypto/message success.
+
+Its optional `count_object` uses the existing per-role provenance fields:
+`selection` (`operator-explicit` or `installed-matched`), lowercase-hex `sha256`,
+`bytes` (1 through 536870912), and `build_input_id` (null). It records the actual
+retained Count bytes and operator trust selection. A Count-only document cannot
+also claim a harvest/members `selected_objects`, traversal or full package build.
+The digest is identity, not runtime authentication or proof that arbitrary BPF
+contains no readers. The current source-built object still needs actual live
+qualification. Human and CBOM metadata carry the same Count identity/profile gap.
+
 ## Reader contract
 
-Producers emit exactly `observed-crypto-v2.2`. Readers accept
+Producers emit exactly `observed-crypto-v2.3`. Readers accept
 `observed-crypto-v2` and `observed-crypto-v2.<digits>` and reject
 every other major (`src/schema.rs` `check_version_v2`, pinned by
 `compat_matrix_v2` and `output_contract::schema_version_gate`).

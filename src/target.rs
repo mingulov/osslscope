@@ -2398,6 +2398,15 @@ impl OwnedTarget {
     /// reaps when the child is already dead (recording `Reaped`) and
     /// still errors, so the caller never assumes a running child.
     pub fn release(&mut self) -> anyhow::Result<()> {
+        self.release_with_reap(true)
+    }
+
+    /// The preview closes Count before consuming even a failed release's exit.
+    pub(crate) fn release_retaining_exit(&mut self) -> anyhow::Result<()> {
+        self.release_with_reap(false)
+    }
+
+    fn release_with_reap(&mut self, reap_errors: bool) -> anyhow::Result<()> {
         if self.state != CustodyState::Stopped {
             anyhow::bail!("release: not stopped (state {:?})", self.state);
         }
@@ -2415,7 +2424,9 @@ impl OwnedTarget {
         {
             // The final check owns this child's wait slot, and does not turn
             // silence or a historical stop into authority to release it.
-            let _ = self.poll_exit()?;
+            if reap_errors {
+                let _ = self.poll_exit()?;
+            }
             anyhow::bail!("release: child no longer has a retained stopped receipt");
         }
         let signal = setup_pidfd_signal(&setup.pidfd, libc::SIGCONT);
@@ -2424,7 +2435,7 @@ impl OwnedTarget {
             return Ok(());
         }
         let e = signal.unwrap_err();
-        if let Ok(Some(code)) = reap_once(self.pid) {
+        if reap_errors && let Ok(Some(code)) = reap_once(self.pid) {
             self.exit_code = Some(code);
             self.state = CustodyState::Reaped;
         }
@@ -4477,4 +4488,31 @@ mod setup_cleanup_tests {
             Some(libc::ECHILD)
         );
     }
+}
+
+#[cfg(test)]
+#[test]
+fn preview_release_failure_retains_exit_until_count_close() {
+    let mut child = OwnedTarget::spawn_stopped(&["/bin/true".into()], WorkloadDest::Null).unwrap();
+    let pid = child.pid();
+    assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) }, 0);
+    let end = Instant::now() + Duration::from_secs(2);
+    loop {
+        if child.peek_exit().unwrap().is_some() {
+            break;
+        }
+        assert!(Instant::now() < end, "owned exit was not observed");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(child.release_retaining_exit().is_err());
+    assert_eq!(child.state(), CustodyState::Stopped);
+    assert_eq!(child.peek_exit().unwrap(), Some(128 + libc::SIGKILL));
+    assert!(std::fs::metadata(format!("/proc/{pid}")).is_ok());
+    // The caller performs its count terminal before this consuming disposition.
+    assert_eq!(
+        child.finish_observation().unwrap(),
+        TargetDisposition::Exited {
+            code: 128 + libc::SIGKILL
+        }
+    );
 }

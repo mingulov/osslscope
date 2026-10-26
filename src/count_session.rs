@@ -2988,7 +2988,7 @@ pub(crate) mod tests {
         file.set_len(4096).unwrap();
         let m = file.metadata().unwrap();
         let locator = std::path::PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
-        let object = crate::evidence::ObjectId("fixture-library".into());
+        let object = crate::evidence::ObjectId("11".repeat(32));
         let site = DiscoveredSite {
             site: SiteKey {
                 object: object.clone(),

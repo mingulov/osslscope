@@ -18,6 +18,17 @@ pub(crate) struct RuleSet {
 }
 
 impl RuleSet {
+    pub(crate) fn require_preview(&self) -> Result<(), String> {
+        if !self.require_provider.is_empty()
+            || !self.deny_provider.is_empty()
+            || self.deny_engine
+            || self.deny_weak
+        {
+            return Err("v0.2 supports only --require-executed and --deny-algorithm rules; provider, ENGINE and weak predicates are deferred".into());
+        }
+        Ok(())
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.require_provider.is_empty()
             && self.deny_provider.is_empty()
@@ -362,4 +373,24 @@ require-executed = ["SHA2-256"]
         assert!(load(&dir.join("missing")).is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }
+}
+
+#[cfg(test)]
+#[test]
+fn preview_provider_or_engine_policy_file_refuses() {
+    for field in [
+        "require-provider = [\"default\"]",
+        "deny-provider = [\"legacy\"]",
+        "deny-engine = true",
+        "deny-weak = true",
+    ] {
+        let input = format!("version = 1\n{field}\n");
+        let rules = admit(input.as_bytes()).unwrap();
+        assert!(rules.require_preview().is_err());
+    }
+    let allowed = admit(
+        b"version = 1\nrequire-executed = [\"SHA256\"]\ndeny-algorithm = [\"AES-256-GCM\"]\n",
+    )
+    .unwrap();
+    assert!(allowed.require_preview().is_ok());
 }

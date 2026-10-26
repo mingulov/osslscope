@@ -589,6 +589,7 @@ pub fn check_v2_semantics(doc: &serde_json::Value) -> Result<(), String> {
     check_legacy_partition(root)?;
     check_traversal_fingerprints(root)?;
     check_package_provenance(root)?;
+    check_preview_count_provenance(root)?;
     Ok(())
 }
 
@@ -2116,6 +2117,34 @@ mod g1_admission_reader_tests {
 
 // Optional observer metadata has the same closed shape even when the caller
 // invokes semantics directly, without first invoking the schema validator.
+fn check_preview_count_provenance(
+    root: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
+    let Some(value) = root.get("count_object") else {
+        return Ok(());
+    };
+    let schema: serde_json::Value =
+        serde_json::from_str(V2_SCHEMA_JSON).map_err(|e| e.to_string())?;
+    validate_against(
+        &schema["$defs"]["packageRoleProvenance"],
+        value,
+        &schema,
+        "$.count_object",
+        0,
+    )
+    .map_err(|e| e.to_string())?;
+    let count: crate::package::commands::PackageRoleProvenance =
+        serde_json::from_value(value.clone()).map_err(|e| format!("doc.count_object: {e}"))?;
+    if count.build_input_id.is_some()
+        || root.contains_key("package_build")
+        || root.contains_key("selected_objects")
+        || root.contains_key("traversal")
+    {
+        return Err("doc.count_object: count-only preview cannot claim a full bundle or authenticated build-input identity".into());
+    }
+    Ok(())
+}
+
 fn check_package_provenance(
     root: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<(), String> {

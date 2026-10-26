@@ -265,12 +265,13 @@ fn host_case(case: &str) {
             (
                 vec![
                     "report",
-                    "--object",
-                    "/nonexistent-lifecycle.o",
+                    "--libcrypto",
+                    "/nonexistent-libcrypto.so",
                     "--count-object",
                     "/nonexistent-count.o",
-                    "--pid",
-                    "1",
+                    "run",
+                    "--",
+                    "/bin/true",
                 ],
                 4,
             ),

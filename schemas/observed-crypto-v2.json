@@ -8,6 +8,7 @@
   "additionalProperties": false,
   "properties": {
     "package_build": { "$ref": "#/$defs/packageProvenance" },
+    "count_object": { "$ref": "#/$defs/packageRoleProvenance", "description": "Count-only foreground preview: retained bytes/hash and operator-explicit or trusted-installed selection. No harvest/members bundle or build-input authentication is implied." },
     "schema_version": {
       "description": "Producers emit exactly observed-crypto-v2.3; readers major-gate via check_version_v2 (accept v2.x, reject other majors).",
       "type": "string",

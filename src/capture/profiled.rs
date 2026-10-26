@@ -29,6 +29,40 @@ pub(crate) struct ProfiledConfig {
 }
 
 impl ProfiledConfig {
+    pub(crate) fn for_command(
+        libcrypto: Option<PathBuf>,
+        cfg: &super::Config,
+        target: &Target,
+        settle_explicit: bool,
+    ) -> Result<Self, String> {
+        if !matches!(target, Target::Spawn { .. })
+            || cfg.harvest_object.is_some()
+            || cfg.members_object.is_some()
+            || cfg.dev_bundle.is_some()
+            || cfg.provider.is_some()
+            || cfg.builtin
+            || cfg.table.is_some()
+            || cfg.force_offset.is_some()
+            || cfg.provider_enrollment.is_some()
+            || settle_explicit
+            || !cfg.image_digest.is_empty()
+        {
+            return Err("v0.2 supports count-only run; PID, discovery/provider, bundle and settle modes are deferred".into());
+        }
+        let libcrypto = libcrypto.ok_or("v0.2 requires --libcrypto PATH")?;
+        let config = Self {
+            libcrypto,
+            count_object: cfg.count_object.clone(),
+            duration: cfg.duration,
+            timeout: cfg.harvest_timeout,
+            grace: cfg.grace,
+        };
+        config
+            .validate()
+            .map_err(|_| "invalid preview duration, timeout or grace")?;
+        Ok(config)
+    }
+
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
         if self.duration.is_zero()
             || self.duration > Duration::from_secs(3600)
@@ -186,7 +220,7 @@ fn observe_profiled<T: TargetPort, B: CountBackend, C: ClockPort>(
             .monotonic_ns
             .checked_add(duration_ns(ctx.cfg.duration))
             .context("preview requested window overflow")?;
-        target.release()?;
+        target.release_retaining_exit()?;
         let release = ReleaseAttempt {
             before,
             after_ns: clock.checked_monotonic_ns(),
@@ -426,6 +460,11 @@ fn observe_profiled<T: TargetPort, B: CountBackend, C: ClockPort>(
 }
 
 #[cfg(test)]
+pub(crate) fn preview_document_for_test(definite: bool) -> crate::evidence::CaptureDocument {
+    tests::preview_document(definite)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::count_session::*;
@@ -441,7 +480,8 @@ mod tests {
 
     // Thin instrumentation around the existing owner model, not another owner.
     #[derive(Clone, Copy)]
-    enum ModelFault {
+    enum ModelCase {
+        DefiniteSite,
         None,
         UnknownTail,
         InvalidTimestamp,
@@ -582,7 +622,7 @@ mod tests {
         fail_wait: bool,
         remains_alive: bool,
         signal: bool,
-        fault: ModelFault,
+        fault: ModelCase,
     ) -> (
         anyhow::Result<Capture>,
         Vec<&'static str>,
@@ -592,8 +632,10 @@ mod tests {
         // Two possible meanings, one physical site. Unknown must stay unknown.
         let mut alias = site.candidates[0].clone();
         alias.algorithm_classes = vec!["AES-256-GCM".into()];
-        site.candidates.push(alias);
-        site.candidates_coverage = CandidateCoverage::Unknown;
+        if !matches!(fault, ModelCase::DefiniteSite) {
+            site.candidates.push(alias);
+            site.candidates_coverage = CandidateCoverage::Unknown;
+        }
         let object = ObjectRecord {
             id: site.site.object.clone(),
             device: site.site.device,
@@ -605,11 +647,11 @@ mod tests {
         let mut inner = FakeCountBackend::new();
         inner.set_modeled_seal(Some(5_000_100), Some(5_000_101));
         match fault {
-            ModelFault::UnknownTail => inner.terminal_faults(FakeTerminalFaults {
+            ModelCase::UnknownTail => inner.terminal_faults(FakeTerminalFaults {
                 quiescence_unknown: true,
                 ..Default::default()
             }),
-            ModelFault::CloseFailure => inner.terminal_faults(FakeTerminalFaults {
+            ModelCase::CloseFailure => inner.terminal_faults(FakeTerminalFaults {
                 close_errno: Some(libc::EIO),
                 ..Default::default()
             }),
@@ -620,7 +662,7 @@ mod tests {
             TracedBackend {
                 inner,
                 log: Rc::clone(&log),
-                invalid_timestamp: matches!(fault, ModelFault::InvalidTimestamp),
+                invalid_timestamp: matches!(fault, ModelCase::InvalidTimestamp),
             },
         );
         let mut child = Child {
@@ -666,9 +708,26 @@ mod tests {
         log.borrow().contains(&"peek")
     }
 
+    pub(crate) fn preview_document(definite: bool) -> crate::evidence::CaptureDocument {
+        run_model(
+            false,
+            false,
+            false,
+            false,
+            if definite {
+                ModelCase::DefiniteSite
+            } else {
+                ModelCase::None
+            },
+        )
+        .0
+        .unwrap()
+        .document
+    }
+
     #[test]
     fn owned_exit_is_not_reaped_before_count_close() {
-        let (result, events, _) = run_model(false, false, false, false, ModelFault::None);
+        let (result, events, _) = run_model(false, false, false, false, ModelCase::None);
         let capture = result.unwrap();
         let pos = |s| events.iter().position(|x| *x == s).unwrap();
         assert!(pos("open") < pos("release"));
@@ -679,7 +738,7 @@ mod tests {
 
     #[test]
     fn count_only_never_constructs_discovery() {
-        let (result, _, _) = run_model(false, false, false, false, ModelFault::None);
+        let (result, _, _) = run_model(false, false, false, false, ModelCase::None);
         let capture = result.unwrap();
         assert!(capture.traversal.is_none() && capture.selected_objects.is_none());
         assert_eq!(capture.harvest_doc, serde_json::Value::Null);
@@ -691,7 +750,7 @@ mod tests {
 
     #[test]
     fn exec_keeps_original_group_and_partial_scope() {
-        let (result, events, count) = run_model(false, false, false, false, ModelFault::None);
+        let (result, events, count) = run_model(false, false, false, false, ModelCase::None);
         let capture = result.unwrap();
         assert!(events.contains(&"exec"));
         assert_eq!(count.backend().inner.programmed().len(), 1);
@@ -709,7 +768,7 @@ mod tests {
 
     #[test]
     fn release_failure_closes_count_before_setup_cleanup() {
-        let (result, events, _) = run_model(true, false, false, false, ModelFault::None);
+        let (result, events, _) = run_model(true, false, false, false, ModelCase::None);
         assert!(result.is_err());
         let close = events.iter().position(|x| *x == "close").unwrap();
         let cleanup = events.iter().position(|x| *x == "cleanup").unwrap();
@@ -719,7 +778,7 @@ mod tests {
 
     #[test]
     fn wait_failure_keeps_positive_evidence() {
-        let (result, _, _) = run_model(false, true, false, false, ModelFault::None);
+        let (result, _, _) = run_model(false, true, false, false, ModelCase::None);
         let capture = result.unwrap();
         assert_eq!(capture.document.total_calls(), 32);
         assert!(matches!(
@@ -733,7 +792,7 @@ mod tests {
 
     #[test]
     fn unknown_tail_keeps_positive_counts_and_explicit_loss() {
-        let (result, _, _) = run_model(false, false, false, false, ModelFault::UnknownTail);
+        let (result, _, _) = run_model(false, false, false, false, ModelCase::UnknownTail);
         let capture = result.unwrap();
         assert_eq!(capture.document.total_calls(), 32);
         assert!(
@@ -751,7 +810,7 @@ mod tests {
 
     #[test]
     fn failed_close_keeps_positive_counts_and_runtime_failure() {
-        let (result, _, _) = run_model(false, false, false, false, ModelFault::CloseFailure);
+        let (result, _, _) = run_model(false, false, false, false, ModelCase::CloseFailure);
         let capture = result.unwrap();
         assert_eq!(capture.document.total_calls(), 32);
         assert!(matches!(
@@ -766,7 +825,7 @@ mod tests {
     #[test]
     fn invalid_window_binding_retains_canonical_count() {
         let (result, events, _) =
-            run_model(false, false, false, false, ModelFault::InvalidTimestamp);
+            run_model(false, false, false, false, ModelCase::InvalidTimestamp);
         let error = result
             .err()
             .expect("pre-request rows must refuse publication");
@@ -791,7 +850,7 @@ mod tests {
     #[test]
     fn signal_and_expiry_close_then_leave_live_child_running() {
         for signal in [false, true] {
-            let (result, events, _) = run_model(false, false, true, signal, ModelFault::None);
+            let (result, events, _) = run_model(false, false, true, signal, ModelCase::None);
             let capture = result.unwrap();
             assert_eq!(
                 capture.disposition,

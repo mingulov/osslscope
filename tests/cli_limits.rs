@@ -19,10 +19,8 @@ fn argv(words: &[&str]) -> Vec<String> {
 /// parser, before target/BPF side effects.
 fn base_report(extra: &[&str]) -> Vec<String> {
     let mut v = vec![
-        "--provider",
-        "p",
-        "--object",
-        "/nonexistent-o.so",
+        "--libcrypto",
+        "/nonexistent-libcrypto.so",
         "--count-object",
         "/nonexistent-c.so",
     ];
@@ -145,18 +143,18 @@ fn checked_deadline_helpers() {
 #[test]
 fn report_rejects_bad_numerics_with_exit2_before_side_effects() {
     for extra in [
-        vec!["--duration", "1e30", "--pid", "1"],
-        vec!["--duration", "NaN", "--pid", "1"],
-        vec!["--duration", "inf", "--pid", "1"],
-        vec!["--duration", "-5", "--pid", "1"],
-        vec!["--duration", "0", "--pid", "1"],
-        vec!["--duration", "3601", "--pid", "1"],
-        vec!["--duration", "1e-300", "--pid", "1"],
-        vec!["--settle", "31", "--pid", "1"],
-        vec!["--settle", "-1", "--pid", "1"],
-        vec!["--timeout", "121", "--pid", "1"],
-        vec!["--grace", "31", "--pid", "1"],
-        vec!["--grace", "-1", "--pid", "1"],
+        vec!["--duration", "1e30", "run", "--", "/bin/true"],
+        vec!["--duration", "NaN", "run", "--", "/bin/true"],
+        vec!["--duration", "inf", "run", "--", "/bin/true"],
+        vec!["--duration", "-5", "run", "--", "/bin/true"],
+        vec!["--duration", "0", "run", "--", "/bin/true"],
+        vec!["--duration", "3601", "run", "--", "/bin/true"],
+        vec!["--duration", "1e-300", "run", "--", "/bin/true"],
+        vec!["--settle", "31", "run", "--", "/bin/true"],
+        vec!["--settle", "-1", "run", "--", "/bin/true"],
+        vec!["--timeout", "121", "run", "--", "/bin/true"],
+        vec!["--grace", "31", "run", "--", "/bin/true"],
+        vec!["--grace", "-1", "run", "--", "/bin/true"],
     ] {
         let code = osslscope::report::run(&base_report(&extra));
         assert_eq!(code, ExitCode::from(2), "report {extra:?}");
@@ -164,9 +162,9 @@ fn report_rejects_bad_numerics_with_exit2_before_side_effects() {
     // Boundary-accepted values parse, then fail loading the bogus
     // BPF object (exit 4) — proving the parser accepted them.
     for extra in [
-        vec!["--duration", "3600", "--pid", "1"],
-        vec!["--grace", "0", "--pid", "1"],
-        vec!["--settle", "30", "--timeout", "120", "--pid", "1"],
+        vec!["--duration", "3600", "run", "--", "/bin/true"],
+        vec!["--grace", "0", "run", "--", "/bin/true"],
+        vec!["--timeout", "120", "run", "--", "/bin/true"],
     ] {
         let code = osslscope::report::run(&base_report(&extra));
         assert_eq!(code, ExitCode::from(4), "report {extra:?}");
@@ -177,14 +175,46 @@ fn report_rejects_bad_numerics_with_exit2_before_side_effects() {
 fn check_rejects_bad_numerics_with_exit2_before_side_effects() {
     // Audit reproducer: `check --duration 1e30 --deny-weak ... --pid 1`
     // panicked (exit 101); now exit 2 with no capture attempted.
-    let mut bad = base_report(&["--duration", "1e30", "--deny-weak", "--pid", "1"]);
+    let mut bad = base_report(&[
+        "--duration",
+        "1e30",
+        "--require-executed",
+        "SHA256",
+        "run",
+        "--",
+        "/bin/true",
+    ]);
     assert_eq!(osslscope::check::run(&bad), ExitCode::from(2));
-    bad = base_report(&["--duration", "3601", "--deny-weak", "--pid", "1"]);
+    bad = base_report(&[
+        "--duration",
+        "3601",
+        "--require-executed",
+        "SHA256",
+        "run",
+        "--",
+        "/bin/true",
+    ]);
     assert_eq!(osslscope::check::run(&bad), ExitCode::from(2));
-    bad = base_report(&["--grace", "-1", "--deny-weak", "--pid", "1"]);
+    bad = base_report(&[
+        "--grace",
+        "-1",
+        "--require-executed",
+        "SHA256",
+        "run",
+        "--",
+        "/bin/true",
+    ]);
     assert_eq!(osslscope::check::run(&bad), ExitCode::from(2));
     // Accepted values reach capture and fail on the bogus objects.
-    bad = base_report(&["--duration", "3600", "--deny-weak", "--pid", "1"]);
+    bad = base_report(&[
+        "--duration",
+        "3600",
+        "--require-executed",
+        "SHA256",
+        "run",
+        "--",
+        "/bin/true",
+    ]);
     assert_eq!(osslscope::check::run(&bad), ExitCode::from(4));
 }
 
@@ -218,7 +248,8 @@ fn h9_t6_workload_dest_flags_rejected_with_exit2() {
     let touch = format!("touch {}", sentinel.display());
     for verb in ["report", "check"] {
         let args = base_report(&[
-            "--deny-weak",
+            "--require-executed",
+            "SHA256",
             "--workload-out",
             "/tmp/h9-x.log",
             "--workload-out-fd",
@@ -229,9 +260,11 @@ fn h9_t6_workload_dest_flags_rejected_with_exit2() {
             "-c",
             &touch,
         ]);
-        // --deny-weak is check-only: strip for report.
+        // Algorithm rules are check-only: strip the flag and matcher for report.
         let args = if verb == "report" {
-            args.into_iter().filter(|a| a != "--deny-weak").collect()
+            args.into_iter()
+                .filter(|a| a != "--require-executed" && a != "SHA256")
+                .collect()
         } else {
             args
         };
@@ -253,7 +286,8 @@ fn h9_t6_workload_dest_flags_rejected_with_exit2() {
         (
             "check",
             vec![
-                "--deny-weak",
+                "--require-executed",
+                "SHA256",
                 "--workload-out-fd",
                 "seven",
                 "run",
@@ -278,7 +312,14 @@ fn h9_t6_workload_dest_flags_rejected_with_exit2() {
         ),
         (
             "check",
-            vec!["--deny-weak", "--workload-out-fd", "7", "--pid", "1"],
+            vec![
+                "--require-executed",
+                "SHA256",
+                "--workload-out-fd",
+                "7",
+                "--pid",
+                "1",
+            ],
         ),
     ] {
         let args = base_report(&extra);
@@ -299,7 +340,8 @@ fn h9_t6_workload_dest_flags_rejected_with_exit2() {
         (
             "check",
             vec![
-                "--deny-weak",
+                "--require-executed",
+                "SHA256",
                 "--workload-out-fd",
                 "7",
                 "run",

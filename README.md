@@ -1,172 +1,112 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # osslscope
 
-Observe which OpenSSL provider-dispatch callbacks execute in supported
-Linux targets, with physical-site counts and explicit candidate
-uncertainty -- **without changing the application or its configuration**.
+Observe entries into enrolled OpenSSL implementation callbacks with eBPF
+uprobes, without changing application code, libraries or configuration.
+Counts stay attached to physical code sites; shared candidates retain their
+uncertainty and each entry is counted once.
 
-`osslscope` is a non-interposing OpenSSL execution observer
-built on eBPF uprobes. It traces the provider architecture down to the
-actually executed `OSSL_DISPATCH` implementation callback, so a
-migration or audit can distinguish what merely *could* run from what
-*really* ran:
+**Status: unreleased v0.2.0 development.** The foreground count-only route is
+implemented; installed runtime, cleanup and overhead qualification remain open.
+Source tests do not establish runtime support. Reports use the
+[observed-crypto-v2.3 contract](docs/observed-crypto-v2.md).
 
-```text
-installed
-    != loaded
-    != advertised by provider
-    != fetched
-    != selected
-    != EXECUTED
-```
+## The foreground preview
 
-> **Status: development (unreleased).** Current report/check output follows
-> the [v2.2 evidence contract](docs/observed-crypto-v2.md). The historical
-> tagged baseline is `v0.1.0`; 1.0.0 was an earlier unreleased label.
-> Current integrated live and package qualification remains open, and
-> packages built from this branch are development snapshots. Version 2.2
-> separates count admission from conservative coverage; its source and host
-> checks do not establish live timing trust or first-call qualification.
-> Build and install locally per
-> [build](docs/build.md) and [install](docs/install.md).
-> Stack: Rust 1.88 + Aya 0.14 (raw multi-link primary).
-> Specs appear under `docs/`; see `docs/README.md`.
+The initial enrollment is one exact Ubuntu OpenSSL `3.5.5-1ubuntu3.7` amd64
+library and kernel `7.0.0-38-generic` build. Admission checks the actual library
+SHA-256/build ID, protected file backing, kernel build ID and initial PID
+namespace. The [catalogue](profiles/README.md) documents the three callback
+sites: definite SHA-256 and AES-256-GCM context creation entries, plus a shared
+GCM update with seven possible algorithm meanings. This is an enrollment
+candidate awaiting live qualification, not broad OpenSSL or Linux support.
 
-The next milestone is the [v0.2.0 foreground preview](ROADMAP.md), with a smaller
-supported workflow and broader features scheduled later. This is planned scope;
-the new count-only route and its release qualification are still to be completed.
+Supported commands are `doctor`, `report`, `check` and offline `alias-audit`.
+`report` and `check` launch one owned foreground process and observe its threads.
+They require `--libcrypto PATH` and load only the Count object. There are no
+target-memory discovery readers in this route.
 
-## Why
+Captures remain **PARTIAL** because the small catalogue has an unknown global
+denominator. Positive definite entries are useful; absence is inconclusive.
+Callback entry does not establish message processing, crypto success, key size,
+runtime provider activation or FIPS state. Shared counts are not duplicated
+across candidate algorithms. CBOM exports contain definite assets only.
 
-- **Migration verification** -- "We moved this app to PQC. Is it really
-  performing ML-KEM / ML-DSA, or is some old RSA/ECDSA/ECDH path still
-  executing somewhere?"
-- **Runtime crypto inventory / CBOM** -- physical callback entries with
-  candidate (operation, algorithm, provider) identities. Counts are
-  conserved once per site; CBOM assets require definite attribution.
-  There is no success/error split.
-- **Legacy-path detection** -- "You think the app migrated to providers,
-  but this code path still drops into an old `ENGINE` or the legacy
-  provider." (OpenSSL 3.x; `ENGINE` was removed in 4.x.)
+Foreign `--pid`, live `inspect`, dynamic provider discovery, reader-object
+selection, provider/ENGINE policy rules, services and process following are
+deferred. See the [roadmap](ROADMAP.md) for later releases.
 
-Built-in `OSSL_TRACE` cannot answer these: it needs app cooperation,
-ships inert on stock builds, and never proves per-call execution.
-See [the side-by-side gap matrix](docs/trace-gap.md).
+## Build and try the development route
 
-## Docs
-
-- [Roadmap](ROADMAP.md) -- v0.2.0 preview and later release tracks
-
-- [What it proves (and what it does not)](docs/what-it-proves.md) --
-  claim chain, non-goals, who should NOT adopt
-- [Overhead and support matrix](docs/overhead-matrix.md) --
-  budgets, historical fixture results and qualification limits
-- [CI gate recipes](docs/ci-recipes.md) --
-  runner choice, gate wiring, timeouts, artifacts
-- [PARTIAL runbook](docs/partial-runbook.md) -- per-reason response
-- [Attach failures](docs/attach-failures.md) -- exit-4 decision tree
-- [Violation triage](docs/violation-triage.md) --
-  from violation to fix to re-verify
-- [Auditor story](docs/auditor-story.md) --
-  evidence to verdict, worked example
-- [Staging deploy](docs/staging-deploy.md) --
-  debug-container observation, gate-disable procedure
-- [FIPS interim rule](docs/fips-interim.md) --
-  manual triage with historical self-test measurements
-- [Promotion checklist](docs/promotion-checklist.md) --
-  staging to production
-- [Operator's guide](docs/usage.md) -- CLI usage for all commands
-- [Build from source](docs/build.md) -- host + BPF entrypoint, manifests, lockfiles
-- [Install](docs/install.md) -- local prefix and packages, file caps, doctor-first verify
-- [Built-in provider runbook](docs/builtin-runbook.md) --
-  stripped/unknown libcrypto
-- [osslscope vs OSSL_TRACE](docs/trace-gap.md) -- gap matrix
-- [Capture allowlist](docs/privacy/allowlist-v1.md) --
-  what may be observed
-- [Privacy residuals](docs/privacy/residuals.md) --
-  what the guarantee does not cover
-
-## Build and install (development)
-
-Prerequisites: Linux x86-64, kernel >= 6.9, Rust 1.88 plus
-nightly-2026-05-20 with `rust-src` and `bpf-linker` 0.10.4 — see
-[build](docs/build.md). One entrypoint builds the host plus the
-harvest, count and members BPF objects:
+Use the pinned Rust/BPF tools and [build recipe](docs/build.md). The existing
+build/install tools still prepare three development objects; the preview loads
+only `osslscope-count`.
 
 ```sh
-./scripts/build-dev.sh                # writes target/dev-build-manifest.json
-./scripts/install-dev.sh              # installs into $HOME/.local (default prefix)
+./scripts/build-dev.sh
+./scripts/install-dev.sh --prefix "$HOME/.local"
 ```
 
-First run (one-time setup, then least-privilege runs):
+Grant BPF/perf rights using the [installation instructions](docs/install.md).
+The app does not change privileges or host settings itself. Then select the
+enrolled library and the actual locally built Count object:
 
 ```sh
-sudo setcap 'cap_bpf,cap_perfmon=ep' "$HOME/.local/bin/osslscope"
-"$HOME/.local/bin/osslscope" doctor \
-  --object "$HOME/.local/lib/osslscope/osslscope-harvest" \
-  --count-object "$HOME/.local/lib/osslscope/osslscope-count" \
-  --members-object "$HOME/.local/lib/osslscope/osslscope-members"
-# preflight; must print verdict: ok
+OSSL_PREVIEW_LIBCRYPTO=/usr/lib/x86_64-linux-gnu/libcrypto.so.3
+OSSL_PREVIEW_PREFIX="$HOME/.local"
+
+"$OSSL_PREVIEW_PREFIX/bin/osslscope" doctor \
+  --libcrypto "$OSSL_PREVIEW_LIBCRYPTO" \
+  --count-object "$OSSL_PREVIEW_PREFIX/lib/osslscope/osslscope-count"
+
+"$OSSL_PREVIEW_PREFIX/bin/osslscope" report \
+  --libcrypto "$OSSL_PREVIEW_LIBCRYPTO" \
+  --count-object "$OSSL_PREVIEW_PREFIX/lib/osslscope/osslscope-count" \
+  --duration 5 --format json --out report.json --cbom bom.json \
+  run -- openssl dgst -sha256 /dev/null
+
+"$OSSL_PREVIEW_PREFIX/bin/osslscope" check \
+  --libcrypto "$OSSL_PREVIEW_LIBCRYPTO" \
+  --count-object "$OSSL_PREVIEW_PREFIX/lib/osslscope/osslscope-count" \
+  --require-executed SHA256 --duration 5 \
+  run -- openssl dgst -sha256 /dev/null
 ```
 
-The prefix layout is `$PREFIX/bin/osslscope` plus three BPF objects
-under `$PREFIX/lib/osslscope/`. A user-owned prefix is never
-trusted implicitly, so `report`/`check` (and `doctor`) need the
-explicit flags below. Trusted system locations support automatic
-selection. A fully automatic triple requires a matching install
-receipt, not just three copied files. The implicit members role needs a
-matching receipt; explicit roles are operator-trusted. Legacy
-implicit harvest/count roles may be receiptless; when a receipt is
-present, implicit roles must match it and stale/mismatched entries
-refuse. Explicit members with a legacy receiptless implicit pair is
-supported without receipt-backed matching provenance (see
-[install](docs/install.md)). Deliberate harvest/count-only installs
-remain valid without traversal:
+A normal report, or a satisfied positive rule with partial coverage, exits **3**.
+A definite deny violation exits **10**; an unobserved known algorithm is
+inconclusive (**11**). Usage errors exit **2**, setup/environment refusals **4**.
+See [usage](docs/usage.md) for failure precedence, policy files and output sinks.
+Doctor checks metadata, namespaces, Count compatibility and capability bits;
+it explicitly labels runtime permission/attachment as unprobed. Report/check
+validate load and attachment before releasing the workload.
 
-```sh
-"$HOME/.local/bin/osslscope" report --provider /path/to/libcrypto.so.3 --builtin \
-    --object "$HOME/.local/lib/osslscope/osslscope-harvest" \
-    --count-object "$HOME/.local/lib/osslscope/osslscope-count" \
-    --members-object "$HOME/.local/lib/osslscope/osslscope-members" \
-    run -- my-app --serve
-```
+Explicit `--count-object` is operator-trusted code. Compatibility checks and a
+hash do not authenticate arbitrary BPF or establish its privacy. No-reader and
+release claims apply to the exact source-built object actually qualified.
+Implicit selection is limited to trusted installed Count locations and retains
+the existing install-receipt checks.
 
-Gate a window in CI (one rule minimum; `--help` lists all rules):
+A released live workload is left running at observation end. Normal setup and
+signal cleanup handle owned resources. A crash/SIGKILL while the child is held
+stopped before exec can strand it; this preview does not provide crash-safe
+startup custody.
 
-```sh
-"$HOME/.local/bin/osslscope" check --provider /path/to/libcrypto.so.3 --builtin \
-    --object "$HOME/.local/lib/osslscope/osslscope-harvest" \
-    --count-object "$HOME/.local/lib/osslscope/osslscope-count" \
-    --members-object "$HOME/.local/lib/osslscope/osslscope-members" \
-    --deny-weak --deny-provider legacy --format json --out gate.json \
-    run -- my-app --smoke-test
-echo $?  # see docs/usage.md: 10 violation dominates; 1 also covers usable fatal evidence
-```
+## Documentation
 
-Explicit traversal requires a resolved builtin query anchor. For
-file-provider mode (`--provider /path/to/provider.so`, no `--builtin`),
-omit `--members-object`; automatic installed selection can retain
-the triple's provenance while using harvest-only discovery.
+- [Build](docs/build.md) and [install](docs/install.md)
+- [CLI and policy files](docs/usage.md)
+- [Observation meaning and limits](docs/what-it-proves.md)
+- [Catalogue provenance](profiles/README.md)
+- [Output contract](docs/observed-crypto-v2.md)
+- [Roadmap](ROADMAP.md), [documentation index](docs/README.md)
+- [Component licensing](docs/licensing.md)
 
-System packages (deb/rpm): build per
-[packaging/README.md](packaging/README.md), then follow
-[docs/install.md](docs/install.md) (doctor-first). Packages from
-this branch are development snapshots, not final distributables.
-
-## What it will NOT do
-
-No `SSL_read`/`SSL_write` tracing, no TLS handshake observation, no
-cipher-suite inventory, no PCAP, no network tracing, no generic libssl
-observability -- and no secrets: never plaintext, keys, passwords, or
-application payloads.
+Permanent boundaries: no keys, passwords, plaintext or application payload
+capture; no TLS interception or interposition. The broader discovery/package
+source and its developer references remain for later releases.
 
 ## License
 
-The host application and its host-only common code are GPL-3.0-or-later
-([LICENSE](LICENSE)). The BPF program sources are GPL-2.0-only
-([GPL-2.0-only text](LICENSES/GPL-2.0-only.txt)). The independent
-`osslscope-bpf-contract` component is GPL-2.0-or-later; its GPL-2.0
-option is selected when linked into those BPF programs. Host and BPF
-share the stated ABI, while the BPF dependency uses the independent
-contract component. See [component licensing](docs/licensing.md) for
-the source, object, and loader distinctions.
+GPL-3.0-or-later for the host, documentation and scripts. BPF/common and
+independent contract components have distinct terms; see
+[component licensing](docs/licensing.md) and [LICENSES](LICENSES/README.md).

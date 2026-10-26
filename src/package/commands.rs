@@ -593,6 +593,30 @@ mod tests {
     use std::cell::Cell;
 
     #[test]
+    fn preview_commands_never_call_trio_resolver() {
+        let before = RESOLVER_CALLS.with(Cell::get);
+        let args = [
+            "--libcrypto",
+            "/missing-library",
+            "--count-object",
+            "/missing-count",
+            "run",
+            "--",
+            "/bin/true",
+        ]
+        .map(String::from);
+        assert!(
+            matches!(crate::report::prepare(&args), Err(code) if code == std::process::ExitCode::from(4))
+        );
+        let mut checked = vec!["--require-executed".into(), "SHA256".into()];
+        checked.extend(args);
+        assert!(
+            matches!(crate::check::prepare(&checked), Err(code) if code == std::process::ExitCode::from(4))
+        );
+        assert_eq!(RESOLVER_CALLS.with(Cell::get), before);
+    }
+
+    #[test]
     fn profile_count_never_resolves_reader_roles() {
         let old_calls = RESOLVER_CALLS.with(Cell::get);
         let calls = Cell::new(0);

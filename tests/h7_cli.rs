@@ -15,14 +15,60 @@ fn bin() -> &'static str {
 }
 
 #[test]
+fn preview_deferred_tables_refuse_without_opening_fifo() {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let dir = std::env::temp_dir().join(format!("osslscope-deferred-fifo-{}", std::process::id()));
+    std::fs::create_dir(&dir).unwrap();
+    let fifo = dir.join("table");
+    let name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    for verb in ["report", "check"] {
+        for flag in ["--table", "--provider-table"] {
+            let mut command = Command::new(bin());
+            command
+                .args([verb, "--libcrypto", "/missing", flag])
+                .arg(&fifo);
+            if verb == "check" {
+                command.args(["--require-executed", "SHA256"]);
+            }
+            let mut child = command
+                .args(["run", "--", "/bin/true"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let timely = child.try_wait().unwrap().is_some();
+            if !timely {
+                child.kill().unwrap();
+            }
+            let output = child.wait_with_output().unwrap();
+            if !timely {
+                std::fs::remove_dir_all(&dir).unwrap();
+            }
+            assert!(timely, "{verb} {flag} waited for a FIFO writer");
+            assert_eq!(output.status.code(), Some(2));
+            assert!(output.stdout.is_empty());
+            assert!(String::from_utf8_lossy(&output.stderr).contains("deferred"));
+        }
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn h7_setup_failure_bad_object_exits_4() {
     // T2 (PIN, green now): missing BPF objects fail onboarding —
     // typed no-evidence doc, exit 4, doctor hint on stderr.
     let out = Command::new(bin())
         .args([
             "report",
-            "--object",
-            "/nonexistent-h7/probe.bpf.o",
+            "--libcrypto",
+            "/nonexistent-h7/libcrypto.so.3",
             "--count-object",
             "/nonexistent-h7/count.bpf.o",
             "run",
@@ -56,8 +102,8 @@ fn h7_broken_stderr_keeps_exit_table() {
         .stderr(full)
         .args([
             "report",
-            "--object",
-            "/nonexistent-h7/probe.bpf.o",
+            "--libcrypto",
+            "/nonexistent-h7/libcrypto.so.3",
             "--count-object",
             "/nonexistent-h7/count.bpf.o",
             "--out",
@@ -85,8 +131,8 @@ fn h7_broken_stderr_alone_perturbs_nothing() {
         .stderr(full)
         .args([
             "report",
-            "--object",
-            "/nonexistent-h7/probe.bpf.o",
+            "--libcrypto",
+            "/nonexistent-h7/libcrypto.so.3",
             "--count-object",
             "/nonexistent-h7/count.bpf.o",
             "run",
@@ -133,8 +179,8 @@ fn g1_spawned_setup_attempts_both_artifacts_with_broken_stderr() {
                     command,
                     "--format",
                     "json",
-                    "--object",
-                    "/nonexistent-h7/probe.bpf.o",
+                    "--libcrypto",
+                    "/nonexistent-h7/libcrypto.so.3",
                     "--count-object",
                     "/nonexistent-h7/count.bpf.o",
                     "--out",
@@ -143,7 +189,7 @@ fn g1_spawned_setup_attempts_both_artifacts_with_broken_stderr() {
                 .arg("--cbom")
                 .arg(&cbom);
             if command == "check" {
-                cmd.args(["--deny-provider", "default"]);
+                cmd.args(["--require-executed", "SHA256"]);
             }
             let out = cmd.args(["run", "--", "/bin/true"]).output().unwrap();
             assert_eq!(out.status.code(), Some(4));

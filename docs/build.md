@@ -1,6 +1,13 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Build from source
 
+The current target is the source-built v0.2.0 foreground preview. Runtime
+qualification is open; compile success is not an installed count/confinement
+pass. The existing recipe still builds three development BPF objects; supported
+commands resolve/load only Count. No hermetic builder, v2 bundle, DEB/RPM or
+broader matrix is required for this milestone. See [usage](usage.md) and the
+[exact catalogue](../profiles/README.md).
+
 The host/common, BPF programs, and independent BPF contract have distinct
 terms and dependencies; see [component licensing](licensing.md).
 
@@ -103,10 +110,9 @@ file target/debug/osslscope \
 
 expecting an x86-64 ELF executable plus three eBPF relocatables.
 The installer consumes all three roles from a normal manifest.
-A deliberate harvest/count-only install stays valid without
-traversal; automatic traversal uses a selected triple whose
-implicit roles match the install receipt. Explicit flags are
-operator-trusted overrides, not a matched-package qualification.
+For a user prefix, pass its Count file explicitly along with `--libcrypto`.
+The preview needs no harvest/members runtime selection; explicit role overrides
+are operator-trusted code, not matched-package or reader-free qualification.
 
 ## Known linker warning
 
@@ -120,3 +126,37 @@ upgrade toolchains for it.
 
 Install the built tree into a local prefix with
 `scripts/install-dev.sh` — see [install](install.md).
+
+## Host regression setup
+
+The retained host suites use owned temporary directories, serial tests and the
+actual Cargo-built lifecycle host driver. These are existing test inputs, not
+runtime dependencies of the count-only app. The three deferred embedded-host
+recompilation fixtures are opt-in:
+
+```sh
+cargo +1.88.0 test --locked --test package_contract -- --ignored
+cargo +1.88.0 test --locked --lib package::dev::tests::identity_v2_real_producer_selected_retained_and_embedded -- --ignored
+```
+
+For the default suite, prepare the four inputs once for the current source:
+
+```sh
+OSSL_TEST_ROOT="$(mktemp -d)"
+mkdir "$OSSL_TEST_ROOT/tmp" "$OSSL_TEST_ROOT/package"
+export TMPDIR="$OSSL_TEST_ROOT/tmp"
+export OSSL_PACKAGE_TEST_PRIVATE_DIR="$OSSL_TEST_ROOT/package"
+export RUST_TEST_THREADS=1
+cargo +1.88.0 test --locked --test lifecycle_producer_host --no-run --message-format=json > "$OSSL_TEST_ROOT/driver.jsonl"
+export OSSL_LIFECYCLE_TEST_DRIVER="$(python3 -c 'import json,sys; a=[r["executable"] for line in open(sys.argv[1]) if (r:=json.loads(line)).get("reason")=="compiler-artifact" and r["target"]["name"]=="lifecycle_producer_host" and r.get("executable")]; assert len(a)==1; print(a[0])' "$OSSL_TEST_ROOT/driver.jsonl")"
+cargo +1.88.0 fmt --all -- --check
+cargo +1.88.0 check --workspace --locked
+cargo +1.88.0 test --workspace --locked
+cargo +1.88.0 clippy --workspace --locked -- -D warnings
+```
+
+Rebuild the driver after source changes. The enrolled-host metadata admission
+control is separately opt-in; it reads metadata/namespaces and loads no BPF:
+`cargo +1.88.0 test --locked --lib profile::tests::enrolled_host_metadata_admission -- --ignored`.
+Live capture checks require an authorized matching host. Hosted CI on other
+kernels does not establish the preview's runtime qualification.

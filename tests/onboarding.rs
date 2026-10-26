@@ -1178,11 +1178,8 @@ fn spawn_dual_load_refused_and_doctor_agrees() {
         .env_remove("LD_LIBRARY_PATH")
         .output()
         .expect("run doctor");
-    assert_eq!(out.status.code(), Some(4));
-    let doc: serde_json::Value =
-        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("doctor json parses");
-    assert_eq!(check_row(&doc, "package-admission")["status"], "fail");
-    assert!(doc["target"].is_null());
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
 }
 
 /// Anchor functions, no rodata version string: a non-rdynamic exe
@@ -1317,6 +1314,16 @@ fn doctor_json(args: &[&str]) -> serde_json::Value {
     serde_json::from_str(&stdout).expect("doctor --format json parses")
 }
 
+fn doctor_usage_refused(args: &[&str]) {
+    let out = Command::new(env!("CARGO_BIN_EXE_osslscope"))
+        .arg("doctor")
+        .args(args)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+}
+
 fn check_row<'a>(doc: &'a serde_json::Value, id: &str) -> &'a serde_json::Value {
     doc["checks"]
         .as_array()
@@ -1338,7 +1345,7 @@ fn doctor_supported_target_reports_dispatch_anchor() {
         return;
     };
     let doc = doctor_json(&["--libcrypto", &so.to_string_lossy(), "--format", "json"]);
-    assert_eq!(check_row(&doc, "package-admission")["status"], "fail");
+    assert_eq!(check_row(&doc, "profile")["status"], "fail");
     assert!(doc["target"].is_null());
     let table = shipped();
     let enrollment = ProviderTable::empty();
@@ -1363,9 +1370,7 @@ fn doctor_exe_predicts_spawn_target() {
     };
     // doctor --exe runs the same prediction as `run --` auto:
     // NEEDED libcrypto via rpath, symtab rung, dispatch pass.
-    let doc = doctor_json(&["--exe", &app.to_string_lossy(), "--format", "json"]);
-    assert_eq!(check_row(&doc, "package-admission")["status"], "fail");
-    assert!(doc["target"].is_null());
+    doctor_usage_refused(&["--exe", &app.to_string_lossy(), "--format", "json"]);
     let table = shipped();
     let enrollment = ProviderTable::empty();
     let opts = qualify_opts(&table, &enrollment);
@@ -1390,14 +1395,12 @@ fn doctor_exe_script_fails_arch_with_clear_message() {
     let dir = scratch("doctor-exe-script");
     let script = dir.join("run.sh");
     std::fs::write(&script, "#!/bin/sh\nexec /bin/true\n").unwrap();
-    let doc = doctor_json(&["--exe", &script.to_string_lossy(), "--format", "json"]);
-    assert_eq!(check_row(&doc, "package-admission")["status"], "fail");
+    doctor_usage_refused(&["--exe", &script.to_string_lossy(), "--format", "json"]);
     assert!(
         onboard::check_arch(&std::fs::read(&script).unwrap())
             .unwrap_err()
             .contains("not an ELF")
     );
-    assert_eq!(doc["verdict"], "fail-closed");
 }
 
 #[test]
@@ -1412,7 +1415,7 @@ fn doctor_unknown_build_points_at_enrollment() {
         return;
     };
     let doc = doctor_json(&["--libcrypto", &so.to_string_lossy(), "--format", "json"]);
-    assert_eq!(check_row(&doc, "package-admission")["status"], "fail");
+    assert_eq!(check_row(&doc, "profile")["status"], "fail");
     let table = shipped();
     let enrollment = ProviderTable::empty();
     let opts = qualify_opts(&table, &enrollment);
@@ -1909,22 +1912,7 @@ fn fix2_run_set_explicit_pair_provenance_kept() {
 
 #[test]
 fn doctor_pid_reports_cold_gap_preflight() {
-    // v0.2 cold-gap preflight: doctor --pid must surface the
-    // late-attach blindness warning (degraded, never a refusal).
-    let bin = env!("CARGO_BIN_EXE_osslscope");
-    let out = Command::new(bin)
-        .arg("doctor")
-        .arg("--pid")
-        .arg(format!("{}", std::process::id()))
-        .arg("--format")
-        .arg("json")
-        .env_remove("LD_LIBRARY_PATH")
-        .output()
-        .expect("run doctor");
-    let doc: serde_json::Value =
-        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("doctor json parses");
-    assert_eq!(check_row(&doc, "package-admission")["status"], "fail");
-    assert!(doc["target"].is_null());
-    // The preserved cold-gap row and its remediation are asserted at the real
-    // private post-admission target seam, without running functional probes.
+    // Foreign attach is deferred in the preview. Lower-level cold-gap rows
+    // remain covered by the existing private post-admission target tests.
+    doctor_usage_refused(&["--pid", "1", "--format", "json"]);
 }

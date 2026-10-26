@@ -521,14 +521,14 @@ SETCAP_STATE="not-requested"
 if [ "$SETCAP" -eq 1 ]; then
     if ! command -v setcap >/dev/null 2>&1; then
         echo "error: --setcap requested but setcap not found." >&2
-        echo "hint: install libcap2-bin (Debian/Ubuntu) or libcap (Fedora/RHEL), then re-run with --setcap; or run sudo setcap cap_bpf,cap_perfmon+ep '$PREFIX/bin/osslscope' then '$PREFIX/bin/osslscope doctor'." >&2
+        echo "hint: install libcap2-bin (Debian/Ubuntu) or libcap (Fedora/RHEL), then re-run with --setcap; or run sudo setcap cap_bpf,cap_perfmon+ep '$PREFIX/bin/osslscope' then '$PREFIX/bin/osslscope' doctor --libcrypto /usr/lib/x86_64-linux-gnu/libcrypto.so.3 --count-object '$PREFIX/lib/osslscope/osslscope-count'." >&2
         exit 3
     fi
     if setcap cap_bpf,cap_perfmon+ep "$PREFIX/bin/osslscope" 2>/dev/null; then
         SETCAP_STATE="applied"
     else
         echo "error: setcap failed on $PREFIX/bin/osslscope." >&2
-        echo "hint: fallback (labeled sudo): run sudo setcap cap_bpf,cap_perfmon+ep '$PREFIX/bin/osslscope' then '$PREFIX/bin/osslscope doctor'." >&2
+        echo "hint: fallback (labeled sudo): run sudo setcap cap_bpf,cap_perfmon+ep '$PREFIX/bin/osslscope' then '$PREFIX/bin/osslscope' doctor --libcrypto /usr/lib/x86_64-linux-gnu/libcrypto.so.3 --count-object '$PREFIX/lib/osslscope/osslscope-count'." >&2
         exit 1
     fi
 fi
@@ -656,6 +656,6 @@ if [ "$SETCAP" -eq 1 ]; then
 else
     echo "next: grant caps once (needs privilege), then verify:"
     echo "  sudo setcap cap_bpf,cap_perfmon+ep '$PREFIX/bin/osslscope'"
-    echo "  '$PREFIX/bin/osslscope' doctor"
+    echo "  '$PREFIX/bin/osslscope' doctor --libcrypto /usr/lib/x86_64-linux-gnu/libcrypto.so.3 --count-object '$PREFIX/lib/osslscope/osslscope-count'"
 fi
 echo "done."

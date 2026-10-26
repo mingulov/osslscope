@@ -1167,6 +1167,10 @@ pub trait TargetPort {
     /// Release a stopped owned child (strictly once); a foreign
     /// target ignores this (never signaled).
     fn release(&mut self) -> anyhow::Result<()>;
+    /// Count-only capture keeps a failed release's exit waitable until close.
+    fn release_retaining_exit(&mut self) -> anyhow::Result<()> {
+        self.release()
+    }
     /// Non-blocking exit poll: `Ok(None)` = alive. Foreign targets
     /// are never waited on and always answer `None`.
     fn poll_exit(&mut self) -> anyhow::Result<Option<i32>>;
@@ -1196,6 +1200,10 @@ impl TargetPort for target::OwnedTarget {
 
     fn release(&mut self) -> anyhow::Result<()> {
         target::OwnedTarget::release(self)
+    }
+
+    fn release_retaining_exit(&mut self) -> anyhow::Result<()> {
+        target::OwnedTarget::release_retaining_exit(self)
     }
 
     fn poll_exit(&mut self) -> anyhow::Result<Option<i32>> {

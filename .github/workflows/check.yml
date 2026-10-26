@@ -16,6 +16,22 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/osslscope-schema"
           "$RUNNER_TEMP/osslscope-schema/bin/python" -m pip install jsonschema==4.19.2
           echo "$RUNNER_TEMP/osslscope-schema/bin" >> "$GITHUB_PATH"
+      # Existing host-fixture inputs: isolated owned paths, serial fd controls,
+      # and the exact compiler-artifact driver from this source build.
+      - name: Prepare host regression inputs
+        run: |
+          mkdir -m 700 "$RUNNER_TEMP/osslscope-test-tmp" "$RUNNER_TEMP/osslscope-package-fixtures"
+          cargo test --locked --test lifecycle_producer_host --no-run --message-format=json > "$RUNNER_TEMP/osslscope-driver.jsonl"
+          python3 - <<'PY'
+          import json, os
+          root = os.environ["RUNNER_TEMP"]
+          artifacts = [r["executable"] for line in open(root + "/osslscope-driver.jsonl") if (r := json.loads(line)).get("reason") == "compiler-artifact" and r["target"]["name"] == "lifecycle_producer_host" and r.get("executable")]
+          assert len(artifacts) == 1
+          with open(os.environ["GITHUB_ENV"], "a") as output:
+              output.write("TMPDIR=" + root + "/osslscope-test-tmp\n")
+              output.write("OSSL_PACKAGE_TEST_PRIVATE_DIR=" + root + "/osslscope-package-fixtures\n")
+              output.write("OSSL_LIFECYCLE_TEST_DRIVER=" + artifacts[0] + "\nRUST_TEST_THREADS=1\n")
+          PY
       - run: cargo test --workspace --locked
       - run: cargo clippy --workspace --locked -- -D warnings
   bpf:
@@ -68,26 +84,6 @@ jobs:
             echo "SKIP(live-capability): suite $s requires a privileged BPF lane; not run in CI"
           done
           echo "SKIP(live-capability): live-known-n workflow is dispatch-only on an owned runner (lane pending)"
-  beachhead:
-    # P1 exit-6: stock ubuntu-24.04 + sudo file-caps bootstrap, then a
-    # least-priv doctor run (exit 0). Ubuntu-class behaves like lanes
-    # B/C (green), not Debian-class. Procedure proven identical on
-    # 6.9/6.12/7.0 lane kernels (spike-filecaps.sh gate evidence).
-    # Doctor also requires BPF objects for verdict ok, so the job
-    # builds them and stages copies into root-owned
-    # /usr/local/lib/osslscope, which implicit object discovery trusts.
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.88.0
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: nightly-2026-05-20
-          components: rust-src
-      - run: cargo install bpf-linker --locked --version 0.10.4
-      - run: cargo build --locked --bin osslscope
-      - run: cd crates/ebpf && cargo +nightly-2026-05-20 build --locked -Z build-std=core --target bpfel-unknown-none --release --bin osslscope-harvest --bin osslscope-count
-      - run: sudo mkdir -p /usr/local/lib/osslscope && sudo cp crates/ebpf/target/bpfel-unknown-none/release/osslscope-harvest crates/ebpf/target/bpfel-unknown-none/release/osslscope-count /usr/local/lib/osslscope/
-      - run: sudo setcap 'cap_bpf,cap_perfmon=ep' target/debug/osslscope
-      - run: ./target/debug/osslscope doctor | tee doctor.log; test ${PIPESTATUS[0]} -eq 0
-      - run: "grep -q 'verdict: ok' doctor.log && ! grep -E 'can_issue|cap_mint_ok' doctor.log"
+  # The former hosted-24.04 doctor beachhead exercised the broader discovery
+  # route on an unenrolled kernel. It is not a v0.2 release prerequisite.
+  # Qualify the installed count-only app on its exact enrolled host separately.

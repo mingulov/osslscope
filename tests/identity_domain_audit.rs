@@ -114,6 +114,62 @@ fn h5_t3_every_device_site_names_one_domain() {
         "stat", "maps", "raw", "agnostic", "fallback", "display", "local",
     ];
     let pinned: &[(&str, &str, &str, u32)] = &[
+        // Preview: raw Metadata dev_t is encoded once, then joins use stat words.
+        (
+            "src/capture/profiled.rs",
+            "stat",
+            ".cookie_for(s.site.device, s.site.inode, s.site.offset)",
+            1,
+        ),
+        (
+            "src/capture/profiled.rs",
+            "local",
+            "|| cfg.dev_bundle.is_some()",
+            1,
+        ),
+        (
+            "src/count_session.rs",
+            "stat",
+            ".cookie_for(site.site.device, site.site.inode, site.site.offset)",
+            1,
+        ),
+        (
+            "src/count_session.rs",
+            "raw",
+            "device: plan::encode_device(libc::major(m.dev()), libc::minor(m.dev())),",
+            1,
+        ),
+        (
+            "src/count_session.rs",
+            "stat",
+            "let dev = plan::render_device(site.site.device);",
+            1,
+        ),
+        (
+            "src/count_session.rs",
+            "stat",
+            "s.site.device != first.site.device",
+            1,
+        ),
+        ("src/profile.rs", "raw", "dev: m.dev(),", 1),
+        (
+            "src/profile.rs",
+            "stat",
+            "let device = crate::plan::encode_device(",
+            1,
+        ),
+        (
+            "src/profile.rs",
+            "raw",
+            "libc::major(identity.dev as libc::dev_t),",
+            1,
+        ),
+        (
+            "src/profile.rs",
+            "raw",
+            "libc::minor(identity.dev as libc::dev_t),",
+            1,
+        ),
         (
             "src/capture.rs",
             "stat",
@@ -897,18 +953,6 @@ fn h5_t3_every_device_site_names_one_domain() {
             "src/capture.rs",
             "agnostic",
             "dev_bundle: cfg.dev_bundle.clone(),",
-            1,
-        ),
-        (
-            "src/check.rs",
-            "agnostic",
-            "dev_bundle: args.cfg.dev_bundle.clone(),",
-            1,
-        ),
-        (
-            "src/report.rs",
-            "agnostic",
-            "dev_bundle: args.cfg.dev_bundle.clone(),",
             1,
         ),
         (

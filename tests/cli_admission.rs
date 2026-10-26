@@ -30,10 +30,8 @@ fn base_inspect(extra: &[&str]) -> Vec<String> {
 /// 2-vs-4 discriminator.
 fn base_capture(extra: &[&str]) -> Vec<String> {
     let mut v = vec![
-        "--provider",
-        "p",
-        "--object",
-        "/nonexistent-r07-o.so",
+        "--libcrypto",
+        "/nonexistent-r07-libcrypto.so",
         "--count-object",
         "/nonexistent-r07-c.so",
     ];
@@ -101,17 +99,41 @@ fn cross_verb_timeout_settle_matrix() {
     ];
     for (flag, accepted, rejected) in matrix {
         for value in *accepted {
-            let r = run_report(&base_capture(&[flag, value, "--pid", "1"]));
-            assert_eq!(r, ExitCode::from(4), "report {flag} {value} accepted");
-            let c = run_check(&base_capture(&[flag, value, "--deny-weak", "--pid", "1"]));
-            assert_eq!(c, ExitCode::from(4), "check {flag} {value} accepted");
+            let r = run_report(&base_capture(&[flag, value, "run", "--", "/bin/true"]));
+            assert_eq!(
+                r,
+                ExitCode::from(if *flag == "--settle" { 2 } else { 4 }),
+                "report {flag} {value} accepted"
+            );
+            let c = run_check(&base_capture(&[
+                flag,
+                value,
+                "--require-executed",
+                "SHA256",
+                "run",
+                "--",
+                "/bin/true",
+            ]));
+            assert_eq!(
+                c,
+                ExitCode::from(if *flag == "--settle" { 2 } else { 4 }),
+                "check {flag} {value} accepted"
+            );
             let i = run_inspect(&base_inspect(&[flag, value]));
             assert_eq!(i, ExitCode::from(4), "inspect {flag} {value} accepted");
         }
         for value in *rejected {
-            let r = run_report(&base_capture(&[flag, value, "--pid", "1"]));
+            let r = run_report(&base_capture(&[flag, value, "run", "--", "/bin/true"]));
             assert_eq!(r, ExitCode::from(2), "report {flag} {value:?} rejected");
-            let c = run_check(&base_capture(&[flag, value, "--deny-weak", "--pid", "1"]));
+            let c = run_check(&base_capture(&[
+                flag,
+                value,
+                "--require-executed",
+                "SHA256",
+                "run",
+                "--",
+                "/bin/true",
+            ]));
             assert_eq!(c, ExitCode::from(2), "check {flag} {value:?} rejected");
             let i = run_inspect(&base_inspect(&[flag, value]));
             assert_eq!(i, ExitCode::from(2), "inspect {flag} {value:?} rejected");
@@ -207,12 +229,12 @@ fn capture_with_spy(extra: &[&str], spy: &std::path::Path) -> Vec<String> {
 fn ordering_report_invalid_input_precedes_setup() {
     // Explicit verb: report::run only.
     let invalid: &[&[&str]] = &[
-        &["--timeout", "121", "--pid", "1"],
-        &["--timeout", "NaN", "--pid", "1"],
-        &["--timeout", "1e-300", "--pid", "1"],
-        &["--settle", "31", "--pid", "1"],
-        &["--settle", "1e30", "--pid", "1"],
-        &["--bogus", "1", "--pid", "1"],
+        &["--timeout", "121", "run", "--", "/bin/true"],
+        &["--timeout", "NaN", "run", "--", "/bin/true"],
+        &["--timeout", "1e-300", "run", "--", "/bin/true"],
+        &["--settle", "31", "run", "--", "/bin/true"],
+        &["--settle", "1e30", "run", "--", "/bin/true"],
+        &["--bogus", "1", "run", "--", "/bin/true"],
         // Spawn-target shape: `run --` with an invalid numeric still
         // rejects before setup (child creation lives inside setup).
         &["--timeout", "121", "run", "--", "/bin/true"],
@@ -232,16 +254,8 @@ fn ordering_report_invalid_input_precedes_setup() {
     // bogus BPF objects) AND writes the spy artifact — the spy
     // mechanism fires when setup runs.
     for extra in [
-        vec!["--timeout", "60", "--pid", "1"],
-        vec![
-            "--timeout",
-            "0.5",
-            "--settle",
-            "30",
-            "run",
-            "--",
-            "/bin/true",
-        ],
+        vec!["--timeout", "60", "run", "--", "/bin/true"],
+        vec!["--timeout", "0.5", "run", "--", "/bin/true"],
     ] {
         let spy = spy_path("report-valid");
         let code = run_report(&capture_with_spy(&extra, &spy));
@@ -258,20 +272,59 @@ fn ordering_report_invalid_input_precedes_setup() {
 #[test]
 fn ordering_check_invalid_input_precedes_setup() {
     // Explicit verb: check::run only. Every invalid-numeric case
-    // carries a valid rule (--deny-weak) so the numeric is the ONLY
+    // carries a supported algorithm rule so the numeric is the ONLY
     // possible usage error: removing numeric validation flips the
     // case to exit 4 + spy file (coupling proof by mutation).
     let invalid: &[&[&str]] = &[
-        &["--deny-weak", "--timeout", "121", "--pid", "1"],
-        &["--deny-weak", "--timeout", "NaN", "--pid", "1"],
-        &["--deny-weak", "--settle", "31", "--pid", "1"],
-        &["--deny-weak", "--settle", "1e30", "--pid", "1"],
-        &["--deny-weak", "--timeout", "121", "run", "--", "/bin/true"],
-        // Empty provider matchers are admission errors too (matcher
-        // guard coupling: removing the guard admits the rule and
-        // reaches setup).
-        &["--deny-provider", "", "--pid", "1"],
-        &["--require-provider", "", "--pid", "1"],
+        &[
+            "--require-executed",
+            "SHA256",
+            "--timeout",
+            "121",
+            "run",
+            "--",
+            "/bin/true",
+        ],
+        &[
+            "--require-executed",
+            "SHA256",
+            "--timeout",
+            "NaN",
+            "run",
+            "--",
+            "/bin/true",
+        ],
+        &[
+            "--require-executed",
+            "SHA256",
+            "--settle",
+            "31",
+            "run",
+            "--",
+            "/bin/true",
+        ],
+        &[
+            "--require-executed",
+            "SHA256",
+            "--settle",
+            "1e30",
+            "run",
+            "--",
+            "/bin/true",
+        ],
+        &[
+            "--require-executed",
+            "SHA256",
+            "--timeout",
+            "121",
+            "run",
+            "--",
+            "/bin/true",
+        ],
+        // Provider predicates are deferred regardless of matcher content.
+        // Their pure parsing tests remain in the library.
+        &["--deny-provider", "", "run", "--", "/bin/true"],
+        &["--require-provider", "", "run", "--", "/bin/true"],
         &["--deny-provider", "", "run", "--", "/bin/true"],
     ];
     for extra in invalid {
@@ -287,9 +340,23 @@ fn ordering_check_invalid_input_precedes_setup() {
     // Positive controls: valid input + valid rule reaches setup
     // (exit 4) and writes the spy.
     for extra in [
-        vec!["--deny-weak", "--timeout", "60", "--pid", "1"],
-        vec!["--deny-weak", "run", "--", "/bin/true"],
-        vec!["--require-provider", "third-party:deadbeef", "--pid", "1"],
+        vec![
+            "--require-executed",
+            "SHA256",
+            "--timeout",
+            "60",
+            "run",
+            "--",
+            "/bin/true",
+        ],
+        vec!["--require-executed", "SHA256", "run", "--", "/bin/true"],
+        vec![
+            "--require-executed",
+            "AES-256-GCM",
+            "run",
+            "--",
+            "/bin/true",
+        ],
     ] {
         let spy = spy_path("check-valid");
         let code = run_check(&capture_with_spy(&extra, &spy));
@@ -616,9 +683,8 @@ fn provider_matchers_reject_empty_on_every_occurrence() {
 
 #[test]
 fn provider_matchers_accept_nonempty_third_party() {
-    // Opaque third-party ids (open-ended, never enumerated) parse and
-    // reach setup (exit 4 on the bogus objects). A bare space is
-    // nonempty: matchers are NOT trimmed.
+    // Provider predicates are deferred in the preview, including nonempty
+    // third-party IDs. Their lower-level parser/registry tests remain.
     for extra in [
         vec!["--require-provider", "third-party:deadbeef"],
         vec!["--deny-provider", "third-party:deadbeef"],
@@ -633,10 +699,9 @@ fn provider_matchers_accept_nonempty_third_party() {
         ],
     ] {
         let mut full = extra.clone();
-        full.push("--pid");
-        full.push("1");
+        full.extend(["run", "--", "/bin/true"]);
         let code = run_check(&base_capture(&full));
-        assert_eq!(code, ExitCode::from(4), "check {extra:?}");
+        assert_eq!(code, ExitCode::from(2), "check {extra:?}");
     }
 }
 

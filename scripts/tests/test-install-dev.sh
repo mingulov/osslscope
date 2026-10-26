@@ -1160,7 +1160,7 @@ if STUB_SETCAP_EXIT=1 PATH="$T/stubbin:$PATH" "$SH_BIN" "$INSTALL" \
         --manifest "$T/manifest.json" --prefix "$T/pfx7" --setcap >"$T/out" 2>&1; then
     bad "--setcap with failing setcap fails (got exit 0)"
 else
-    grep -q 'labeled sudo' "$T/out" && grep -q 'osslscope doctor' "$T/out" \
+    grep -q 'labeled sudo' "$T/out" && grep -q 'doctor --libcrypto .* --count-object' "$T/out" \
         && ok "--setcap with failing setcap fails with labeled-sudo + doctor fallback" \
         || bad "--setcap with failing setcap fails with labeled-sudo + doctor fallback"
 fi

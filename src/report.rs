@@ -1,25 +1,10 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
-//! Provisional P2 `report` (JSON doc + minimal human table; P3
-//! freezes the schema, adds `check`, and narrows exits).
-//!
-//! `report [--duration S] [--format human|json] [--out FILE]
-//! [--provider P] [--builtin] [--object O] [--count-object C]
-//! [--table F] [--force-offset N] [--provider-table F]
-//! [--settle S] [--timeout S] [--grace S] {--pid P | run -- <cmd>}`
-//!
-//! Normal discovery is automatic: BPF objects resolve from trusted
-//! installed locations and the target's libcrypto from its live
-//! mappings (builtin mode). `--provider`/`--object`/`--count-object`
-//! are explicit overrides; `--table`/`--force-offset`/
-//! `--provider-table` are explicit local enrollment (R09).
-//!
-//! Exit precedence (PRD §6 proposal): child non-zero → 1 (with
-//! `child_exit` in the doc — the subject failed, evidence rides
-//! along); fatal (recycled / zero-attached / environment) → 4;
-//! PARTIAL → 3; clean COMPLETE → 0; usage → 2. Violation (10) and
-//! inconclusive (11) arrive with `check` at P3.
+//! Foreground count-only report with the shared v2.3 output/exit pipeline.
+//! `--libcrypto PATH` selects the enrolled profile; `--count-object PATH`
+//! explicitly selects operator-trusted Count bytes. Broader discovery modes
+//! are deferred. See docs/usage.md for the supported flags and exit precedence.
 use crate::capture;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -31,6 +16,8 @@ pub(crate) const DEFAULT_DURATION_SECS: f64 = 30.0;
 
 struct Args {
     cfg: capture::Config,
+    libcrypto: Option<PathBuf>,
+    settle_explicit: bool,
     target: capture::Target,
     format: String,
     out: Option<String>,
@@ -47,11 +34,10 @@ fn parse(argv: &[String]) -> Result<Args, String> {
     let mut builtin = false;
     let mut object: Option<String> = None;
     let mut count_object: Option<String> = None;
+    let mut libcrypto: Option<String> = None;
     let mut members_object: Option<String> = None;
     let mut dev_bundle: Option<String> = None;
-    let mut table_raw: Option<String> = None;
     let mut force_offset_raw: Option<String> = None;
-    let mut provider_table_raw: Option<String> = None;
     let mut settle_raw: Option<String> = None;
     let mut timeout_raw: Option<String> = None;
     let mut grace_raw: Option<String> = None;
@@ -85,6 +71,12 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             }
             "--object" => object = Some(val(a)?),
             "--count-object" => count_object = Some(val(a)?),
+            "--libcrypto" => {
+                if libcrypto.is_some() {
+                    return Err("--libcrypto may occur only once".into());
+                }
+                libcrypto = Some(val(a)?);
+            }
             "--members-object" => members_object = Some(val(a)?),
             "--dev-bundle" => {
                 if dev_bundle.is_some() {
@@ -92,9 +84,10 @@ fn parse(argv: &[String]) -> Result<Args, String> {
                 }
                 dev_bundle = Some(val(a)?);
             }
-            "--table" => table_raw = Some(val(a)?),
+            "--table" | "--provider-table" => {
+                return Err("table enrollment is deferred beyond v0.2".into());
+            }
             "--force-offset" => force_offset_raw = Some(val(a)?),
-            "--provider-table" => provider_table_raw = Some(val(a)?),
             "--settle" => settle_raw = Some(val(a)?),
             "--timeout" => timeout_raw = Some(val(a)?),
             "--grace" => grace_raw = Some(val(a)?),
@@ -154,29 +147,13 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         Some(s) => crate::args::parse_seconds("--grace", s)?,
         None => Duration::from_secs(5),
     };
-    // T12 onboarding: explicit tables are validated here (usage
-    // errors, exit 2, before any target/BPF side effect); objects
-    // and the target provider resolve inside capture (environment
-    // errors there exit 4, never 2).
-    let table: Option<PathBuf> = match &table_raw {
-        Some(p) => {
-            let path = PathBuf::from(p);
-            crate::discovery::onboard::load_offset_table_file(&path).map_err(|e| e.full())?;
-            Some(path)
-        }
-        None => None,
-    };
-    let provider_enrollment = match &provider_table_raw {
-        Some(p) => Some(
-            crate::discovery::onboard::load_enrollment_file(Path::new(p)).map_err(|e| e.full())?,
-        ),
-        None => None,
-    };
     let force_offset = match &force_offset_raw {
         Some(s) => Some(crate::args::parse_force_offset(s)?),
         None => None,
     };
     Ok(Args {
+        libcrypto: libcrypto.map(PathBuf::from),
+        settle_explicit: settle_raw.is_some(),
         cfg: capture::Config {
             harvest_object: object.map(PathBuf::from),
             count_object: count_object.map(PathBuf::from),
@@ -184,9 +161,9 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             dev_bundle: dev_bundle.map(PathBuf::from),
             provider: provider.map(PathBuf::from),
             builtin,
-            table,
+            table: None,
             force_offset,
-            provider_enrollment,
+            provider_enrollment: None,
             resolved_provider: None,
             duration,
             settle,
@@ -296,7 +273,7 @@ pub(crate) fn grouped(n: u64) -> String {
     out
 }
 
-const USAGE: &str = "usage: report [--duration S] [--provider P] [--object O] [--count-object C] [--members-object M] [--dev-bundle DIR] [--table F] [--force-offset N] [--provider-table F] [--format human|json] [--out F] [--cbom FILE] [--builtin] [--settle S] [--timeout S] [--grace S] [--image-digest D] [--workload-out F] [--workload-out-fd N] {--pid P | run -- <cmd>}";
+const USAGE: &str = "usage: report --libcrypto PATH [--count-object PATH] [--duration S] [--format human|json] [--out FILE] [--cbom FILE] [--timeout S] [--grace S] [--workload-out FILE | --workload-out-fd N] run -- COMMAND";
 
 pub fn run(argv: &[String]) -> ExitCode {
     match prepare(argv) {
@@ -327,47 +304,50 @@ pub(crate) fn prepare(argv: &[String]) -> Result<Prepared, ExitCode> {
     // (policy None => report shape), never the historical v1
     // projection. PRD §14.1: the live producer schema is
     // observed-crypto-v2.3; v1 fixtures are history.
-    let overrides = crate::package::commands::ObjectOverrides {
-        harvest: args.cfg.harvest_object.clone(),
-        count: args.cfg.count_object.clone(),
-        members: args.cfg.members_object.clone(),
-        dev_bundle: args.cfg.dev_bundle.clone(),
-    };
-    let objects = match with_report_objects(
-        &overrides,
-        crate::package::commands::resolve_command_objects,
-        |objects| objects,
+    let preview = match capture::profiled::ProfiledConfig::for_command(
+        args.libcrypto.clone(),
+        &args.cfg,
+        &args.target,
+        args.settle_explicit,
     ) {
-        Ok(v) => v,
-        Err(e) => {
-            let req = OutputRequest {
-                format: if args.format == "json" {
-                    OutputFormat::Json
-                } else {
-                    OutputFormat::Human
-                },
-                primary: args
-                    .out
-                    .as_ref()
-                    .map_or(OutputDest::Stdout, |p| OutputDest::File(p.into())),
-                cbom: args.cbom.as_ref().map(|p| OutputDest::File(p.into())),
-            };
-            let discarded = matches!(
-                &args.target,
-                capture::Target::Spawn {
-                    workload: crate::target::WorkloadDest::Null,
-                    ..
-                }
-            );
-            let result = crate::report::consume_capture_result(
-                Err(e.into()),
-                CaptureCommand::Report,
-                &req,
-                discarded,
-            );
-            return Err(ExitCode::from(result.exit_code));
+        Ok(config) => config,
+        Err(error) => {
+            crate::report::err_line(&format!("osslscope report: {error}"));
+            return Err(ExitCode::from(2));
         }
     };
+    let objects =
+        match crate::package::commands::resolve_profiled_count(preview.count_object.as_deref()) {
+            Ok(v) => v,
+            Err(e) => {
+                let req = OutputRequest {
+                    format: if args.format == "json" {
+                        OutputFormat::Json
+                    } else {
+                        OutputFormat::Human
+                    },
+                    primary: args
+                        .out
+                        .as_ref()
+                        .map_or(OutputDest::Stdout, |p| OutputDest::File(p.into())),
+                    cbom: args.cbom.as_ref().map(|p| OutputDest::File(p.into())),
+                };
+                let discarded = matches!(
+                    &args.target,
+                    capture::Target::Spawn {
+                        workload: crate::target::WorkloadDest::Null,
+                        ..
+                    }
+                );
+                let result = crate::report::consume_capture_result(
+                    Err(e.into()),
+                    CaptureCommand::Report,
+                    &req,
+                    discarded,
+                );
+                return Err(ExitCode::from(result.exit_code));
+            }
+        };
     let setup_deadline = std::time::Instant::now()
         .checked_add(args.cfg.harvest_timeout)
         .ok_or_else(|| {
@@ -376,6 +356,7 @@ pub(crate) fn prepare(argv: &[String]) -> Result<Prepared, ExitCode> {
         })?;
     Ok(Prepared {
         args,
+        preview,
         objects,
         setup_deadline,
     })
@@ -383,7 +364,8 @@ pub(crate) fn prepare(argv: &[String]) -> Result<Prepared, ExitCode> {
 pub struct Prepared {
     setup_deadline: std::time::Instant,
     args: Args,
-    objects: crate::package::commands::AdmittedSet,
+    objects: crate::package::commands::ProfiledCount,
+    preview: capture::profiled::ProfiledConfig,
 }
 impl Prepared {
     pub(crate) fn setup_deadline(&self) -> Option<std::time::Instant> {
@@ -421,11 +403,10 @@ impl Prepared {
             }
         );
         consume_capture_result(
-            capture::run_admitted_before(
-                &args.cfg,
+            capture::profiled::run_profiled_before(
+                &self.preview,
                 args.target,
                 self.objects,
-                args.cfg.members_object.is_none(),
                 Some(self.setup_deadline),
             ),
             CaptureCommand::Report,
@@ -835,7 +816,7 @@ pub fn consume_capture_result_with_diagnostics(
             let detail = unknown_detail.unwrap_or_else(|| "capture setup unavailable".into());
             lines.push(format!("{name}: {detail}"));
             lines.push(format!(
-                "{name}: run 'osslscope doctor' to diagnose environment failures"
+                "{name}: run 'osslscope doctor --help' for the required preflight options"
             ));
             (
                 setup_failure_document(FatalKind::Environment(detail)),
@@ -1268,6 +1249,9 @@ fn doc_json(doc: &CaptureDocument) -> serde_json::Value {
     if let Some(package) = &doc.package_build {
         out["package_build"] = serde_json::json!(package);
     }
+    if let Some(count) = &doc.count_object {
+        out["count_object"] = serde_json::json!(count);
+    }
     out
 }
 
@@ -1276,8 +1260,24 @@ fn doc_json(doc: &CaptureDocument) -> serde_json::Value {
 /// attribution, verified-or-unknown OpenSSL version, coverage,
 /// source-tagged losses, disposition and safe actionability
 /// (`argv_redacted`, no raw argv or addresses).
+fn count_selection(selection: crate::package::commands::RoleSelection) -> &'static str {
+    match selection {
+        crate::package::commands::RoleSelection::InstalledMatched => "installed-matched",
+        crate::package::commands::RoleSelection::OperatorExplicit => "operator-explicit",
+    }
+}
+
 pub fn render_human(doc: &CaptureDocument) -> String {
     let mut s = String::new();
+    if let Some(count) = &doc.count_object {
+        s.push_str(&format!(
+            "count object: selection={} sha256={} bytes={}\n",
+            count_selection(count.selection),
+            count.sha256,
+            count.bytes
+        ));
+        s.push_str("observation: enrolled compiled callback entries; no provider-activation, message-count or crypto-success claim\n");
+    }
     s.push_str(&format!(
         "osslscope report ({}): pid={} ({}) window={}..{}ns effective={}..{}ns\n",
         safe_display(&doc.schema),
@@ -2061,6 +2061,25 @@ fn cbom_json(doc: &CaptureDocument) -> serde_json::Value {
         ),
         prop("osslscope:omitted-evidence-refs", refs_value),
     ];
+    if let Some(count) = &doc.count_object {
+        metadata.push(prop(
+            "osslscope:count-object-sha256",
+            count.sha256.to_string(),
+        ));
+        metadata.push(prop(
+            "osslscope:count-object-selection",
+            count_selection(count.selection).into(),
+        ));
+        metadata.push(prop(
+            "osslscope:count-object-bytes",
+            count.bytes.to_string(),
+        ));
+        metadata.push(prop(
+            "osslscope:observation-surface",
+            "enrolled compiled callback entry; no provider-activation or crypto-success claim"
+                .into(),
+        ));
+    }
     // R05: ENGINE-plane metadata renders only when observations
     // exist (old-shaped CBOMs keep their exact bytes). Counts, not
     // components: the CBOM stays definite-algorithm-assets-only.
@@ -2377,6 +2396,106 @@ pub fn err_line(text: &str) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(test)]
+    mod preview_admission_tests {
+        use super::*;
+        fn words(args: &[&str]) -> Vec<String> {
+            args.iter().map(|s| (*s).into()).collect()
+        }
+
+        #[test]
+        fn preview_count_provenance_has_closed_bounded_semantics() {
+            let document = crate::capture::profiled::preview_document_for_test(true);
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&render_json(&document).unwrap()).unwrap();
+            value["count_object"] = serde_json::json!(document.count_object.as_ref().unwrap());
+            crate::schema::check_v2_semantics(&value).unwrap();
+            for (key, invalid) in [
+                ("sha256", serde_json::json!("x".repeat(64))),
+                ("bytes", serde_json::json!(0)),
+                ("selection", serde_json::json!("unchecked")),
+                ("build_input_id", serde_json::json!("55".repeat(32))),
+                ("unknown", serde_json::json!(true)),
+            ] {
+                let mut bad = value.clone();
+                bad["count_object"][key] = invalid;
+                assert!(
+                    crate::schema::check_v2_semantics(&bad).is_err(),
+                    "accepted invalid {key}"
+                );
+            }
+            let mut mixed = value;
+            mixed["selected_objects"] = serde_json::json!({"harvest":{"path":"harvest","sha256":"11".repeat(32)},"count":{"path":"count","sha256":"48".repeat(32)},"members":null});
+            assert!(crate::schema::check_v2_semantics(&mixed).is_err());
+        }
+
+        #[test]
+        fn human_json_cbom_share_profile_gap_and_count_identity() {
+            let document = crate::capture::profiled::preview_document_for_test(true);
+            let json: serde_json::Value =
+                serde_json::from_slice(&render_json(&document).unwrap()).unwrap();
+            crate::schema::validate_v2(&json).unwrap();
+            crate::schema::check_v2_semantics(&json).unwrap();
+            assert_eq!(json["count_object"]["sha256"], "48".repeat(32));
+            let human = render_human(&document);
+            let cbom: serde_json::Value =
+                serde_json::from_slice(&render_cbom(&document).unwrap()).unwrap();
+            for text in [human, json.to_string(), cbom.to_string()] {
+                assert!(text.contains("profile:fixture-preview"));
+                assert!(text.contains(&"48".repeat(32)));
+            }
+            assert_eq!(cbom["components"].as_array().unwrap().len(), 1);
+        }
+
+        #[test]
+        fn preview_shared_site_stays_one_observation_without_definite_cbom_asset() {
+            let document = crate::capture::profiled::preview_document_for_test(false);
+            assert_eq!(document.total_calls(), 32);
+            let cbom: serde_json::Value =
+                serde_json::from_slice(&render_cbom(&document).unwrap()).unwrap();
+            assert!(cbom["components"].as_array().unwrap().is_empty());
+        }
+
+        #[test]
+        fn preview_requires_libcrypto() {
+            let args = words(&["--count-object", "/missing-count", "run", "--", "/bin/true"]);
+            assert!(matches!(prepare(&args), Err(code) if code == ExitCode::from(2)));
+        }
+
+        #[test]
+        fn deferred_mode_refuses_before_effects() {
+            for flags in [
+                vec!["--pid", "42"],
+                vec!["--provider", "p", "run", "--", "/bin/true"],
+                vec!["--builtin", "run", "--", "/bin/true"],
+                vec!["--object", "/missing-harvest", "run", "--", "/bin/true"],
+                vec!["--settle", "2", "run", "--", "/bin/true"],
+            ] {
+                let mut args = words(&[
+                    "--libcrypto",
+                    "/missing-library",
+                    "--count-object",
+                    "/missing-count",
+                ]);
+                args.extend(words(&flags));
+                assert!(matches!(prepare(&args), Err(code) if code == ExitCode::from(2)));
+            }
+        }
+
+        #[test]
+        fn valid_preview_flags_reach_count_abi_admission() {
+            let args = words(&[
+                "--libcrypto",
+                "/missing-library",
+                "--count-object",
+                "/missing-count",
+                "run",
+                "--",
+                "/bin/true",
+            ]);
+            assert!(matches!(prepare(&args), Err(code) if code == ExitCode::from(4)));
+        }
+    }
     use super::*;
 
     #[test]
@@ -2630,7 +2749,7 @@ mod tests {
         assert!(auto.cfg.provider.is_none());
         assert!(auto.cfg.harvest_object.is_none());
         assert!(auto.cfg.count_object.is_none());
-        // Explicit enrollment validates at parse time (exit 2).
+        // Deferred enrollment refuses at parse time, without opening a file.
         let mut bad_table = vec!["--pid", "9"];
         bad_table.extend(["--table", "/nonexistent-table.json"]);
         assert!(parse(&v(bad_table)).is_err());
@@ -2663,6 +2782,7 @@ mod tests {
 
 // The real entrypoint and the four-command source fixture use this same
 // fixed-kind admission port; effects begin only after successful resolution.
+#[cfg(test)]
 pub(crate) fn with_report_objects<R>(
     overrides: &crate::package::commands::ObjectOverrides,
     resolve: impl FnOnce(
