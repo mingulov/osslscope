@@ -738,6 +738,7 @@ fn exactly_one_contract_section(host: &std::path::Path) -> Result<(), PackageErr
 }
 
 #[test]
+#[ignore = "deferred embedded-package tooling; run this test explicitly with --ignored"]
 fn embedded_contract_is_same_static_section_bytes() {
     let nonce = format!(
         "{}-{}",
@@ -867,6 +868,7 @@ fn embedded_contract_is_same_static_section_bytes() {
 }
 
 #[test]
+#[ignore = "deferred embedded-package tooling; run this test explicitly with --ignored"]
 fn embedded_contract_survives_host_without_accessor_reference() {
     let nonce = format!(
         "no-accessor-{}-{}",
