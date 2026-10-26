@@ -32,6 +32,10 @@ installed
 > Stack: Rust 1.88 + Aya 0.14 (raw multi-link primary).
 > Specs appear under `docs/`; see `docs/README.md`.
 
+The next milestone is the [v0.2.0 foreground preview](ROADMAP.md), with a smaller
+supported workflow and broader features scheduled later. This is planned scope;
+the new count-only route and its release qualification are still to be completed.
+
 ## Why
 
 - **Migration verification** -- "We moved this app to PQC. Is it really
@@ -50,6 +54,8 @@ ships inert on stock builds, and never proves per-call execution.
 See [the side-by-side gap matrix](docs/trace-gap.md).
 
 ## Docs
+
+- [Roadmap](ROADMAP.md) -- v0.2.0 preview and later release tracks
 
 - [What it proves (and what it does not)](docs/what-it-proves.md) --
   claim chain, non-goals, who should NOT adopt

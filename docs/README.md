@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # docs
 
-Product documentation. Start with the README, then:
+Product documentation. Start with the README and [release roadmap](../ROADMAP.md), then:
 
 - `build.md` - reproducible source build (host + BPF), manifests, lockfiles
 - `licensing.md` - component terms and the BPF object/load license boundary
